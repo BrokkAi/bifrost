@@ -18,9 +18,7 @@
 
 use super::results::{CodeQueryGuard, CodeQueryResultRef, DetailedCodeQueryKey};
 use super::semantic::SemanticProcedureValue;
-use crate::analyzer::semantic::{
-    EvidenceCompleteness, GuardFact, GuardId, GuardPredicate, LengthDelimitedDigest, ProofStatus,
-};
+use crate::analyzer::semantic::{GuardFact, GuardId, GuardPredicate, LengthDelimitedDigest};
 use crate::analyzer::{ProjectFile, Range};
 
 /// One guard row travelling through the pipeline.
@@ -251,22 +249,8 @@ pub(super) fn public_guard(value: &GuardValue) -> CodeQueryGuard {
         true_target_id,
         false_edge_id,
         false_target_id,
-        proof: proof_label(&evidence.proof),
-        completeness: completeness_label(&evidence.completeness),
-    }
-}
-
-const fn proof_label(proof: &ProofStatus) -> &'static str {
-    match proof {
-        ProofStatus::Proven => "proven",
-        ProofStatus::Unproven(_) => "unproven",
-    }
-}
-
-const fn completeness_label(completeness: &EvidenceCompleteness) -> &'static str {
-    match completeness {
-        EvidenceCompleteness::Complete => "complete",
-        EvidenceCompleteness::Partial(_) => "partial",
+        proof: evidence.proof.label(),
+        completeness: evidence.completeness.label(),
     }
 }
 
@@ -283,11 +267,11 @@ pub(super) fn detailed_key(value: &GuardValue) -> DetailedCodeQueryKey {
 
 /// The row's own source anchor: the decision point the condition sits on.
 pub(super) fn anchor(value: &GuardValue) -> (ProjectFile, Range) {
-    let point = value
-        .procedure
-        .point_value(value.fact().point)
-        .expect("a validated procedure owns the point its own guard names");
-    (value.procedure.file().clone(), point.source_range())
+    super::procedure_point_anchor(
+        &value.procedure,
+        value.fact().point,
+        "a validated procedure owns the point its own guard names",
+    )
 }
 
 /// The trace reference of one guard row.
@@ -304,12 +288,8 @@ pub(super) fn guard_ref(value: &GuardValue) -> CodeQueryResultRef {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::analyzer::semantic::GuardPredicate;
 
-    /// The row's `predicate` column and the IR enum it projects are one
-    /// vocabulary, so a predicate added to the IR cannot reach the row surface
-    /// without a label.
     #[test]
     fn every_guard_predicate_publishes_a_row_label() {
         for predicate in [
@@ -356,38 +336,5 @@ mod tests {
             );
         }
         assert_eq!(GuardPredicate::LABELS.len(), 11);
-    }
-
-    /// A constant condition proves one arm cannot execute, and which arm that
-    /// is depends on the constant, not on which edge happens to be present.
-    #[test]
-    fn a_constant_guard_names_the_arm_its_value_excludes() {
-        use crate::analyzer::semantic::{ControlEdgeId, ProgramPointId, SourceMappingId};
-        let guard = |value: bool| GuardFact {
-            id: GuardId::new(0),
-            point: ProgramPointId::new(0),
-            subject: None,
-            predicate: GuardPredicate::ConstantBoolean { value },
-            true_edge: Some(ControlEdgeId::new(1)),
-            false_edge: Some(ControlEdgeId::new(2)),
-            source: SourceMappingId::new(0),
-            evidence: crate::analyzer::semantic::EvidenceId::new(0),
-        };
-        assert_eq!(guard(true).infeasible_edge(), Some(ControlEdgeId::new(2)));
-        assert_eq!(guard(false).infeasible_edge(), Some(ControlEdgeId::new(1)));
-
-        // A folded arm leaves nothing to exclude: the edge is already gone.
-        let folded = GuardFact {
-            true_edge: None,
-            ..guard(false)
-        };
-        assert_eq!(folded.infeasible_edge(), None);
-
-        // A predicate that proves no constant excludes nothing at all.
-        let opaque = GuardFact {
-            predicate: GuardPredicate::NullComparison { null_on_true: true },
-            ..guard(true)
-        };
-        assert_eq!(opaque.infeasible_edge(), None);
     }
 }

@@ -53,14 +53,17 @@ use std::path::{Path, PathBuf};
 
 use brokk_bifrost_analysis::analyzer::semantic_model::{
     ActivationSelector, AuthoredPayload, AuthoredProcedureSummary, AuthoredProcedureTarget,
-    AuthoredSemanticModelPack, AuthoredShard, AuthoredSummaryTransfer, Compatibility,
-    CompilerOptions, Completeness, MemberFact, NameSelector, Producer, Provenance, RelationFact,
-    Safety, SourceFormat, TypeFact, VersionConstraint, compile_source,
+    AuthoredSemanticModelPack, AuthoredShard, AuthoredSummaryTransfer, Compatibility, Completeness,
+    MemberFact, NameSelector, Provenance, RelationFact, TypeFact, VersionConstraint,
+};
+#[cfg(test)]
+use brokk_bifrost_analysis::analyzer::semantic_model::{
+    CompilerOptions, SourceFormat, compile_source,
 };
 use serde::{Deserialize, Serialize};
 
-use super::FOUNDRY_PRODUCER_VERSION;
 use super::sanitizer_pack::summary_id;
+use super::serialize_pack;
 
 /// The audit-report format tag. Bump it when a consumer must read the file
 /// differently, not when a field is added.
@@ -82,12 +85,6 @@ pub const GOLDEN_DECLARATIONS_FILE_NAME: &str = "declarations.json";
 
 /// The producer name recorded in the generated pack.
 const PRODUCER_NAME: &str = "bifrost-golden-foundry";
-
-/// The authored golden content is Bifrost's own claim, not a slice of the JDK
-/// or of CPython. New Bifrost-owned public packs use the public project
-/// license; retained packs may declare their own provenance and license in
-/// their checked-in metadata.
-const PACK_LICENSE: &str = "Apache-2.0";
 
 /// The toolchain a realm's single shard activation selector pins, combined
 /// into one field so a realm cannot declare a name without a requirement or
@@ -447,55 +444,35 @@ pub fn write_golden_packs(
     conversion: &GoldenConversion,
     output_root: &Path,
 ) -> Result<Vec<PathBuf>, GoldenPackError> {
-    let mut written = Vec::new();
-    for pack in &conversion.packs {
-        let path = output_root.join(&pack.relative_path);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|error| GoldenPackError::ReadDir {
-                path: parent.to_owned(),
-                message: error.to_string(),
-            })?;
+    let audit_json = serialize_audit(&conversion.audit);
+    super::write_foundry_outputs(
+        output_root,
+        conversion
+            .packs
+            .iter()
+            .map(|pack| (pack.relative_path.as_path(), pack.source_json.as_str())),
+        GOLDEN_AUDIT_FILE_NAME,
+        &audit_json,
+    )
+    .map_err(|error| match error {
+        super::FoundryOutputError::CreateDirectory { path, message } => {
+            GoldenPackError::ReadDir { path, message }
         }
-        fs::write(&path, pack.source_json.as_bytes()).map_err(|error| {
-            GoldenPackError::ReadFile {
-                path: path.clone(),
-                message: error.to_string(),
-            }
-        })?;
-        written.push(path);
-    }
-    let audit_path = output_root.join(GOLDEN_AUDIT_FILE_NAME);
-    fs::write(&audit_path, serialize_audit(&conversion.audit).as_bytes()).map_err(|error| {
-        GoldenPackError::ReadFile {
-            path: audit_path.clone(),
-            message: error.to_string(),
+        super::FoundryOutputError::WriteFile { path, message } => {
+            GoldenPackError::ReadFile { path, message }
         }
-    })?;
-    written.push(audit_path);
-    written.sort();
-    Ok(written)
+    })
 }
 
 /// Read the candidate files in a stable order. Files are read in sorted name
 /// order; entry order within a file is preserved. The declarations file is
 /// read separately, so it is skipped here.
 fn read_candidates(candidates_dir: &Path) -> Result<Vec<GoldenCandidate>, GoldenPackError> {
-    let mut files = Vec::new();
-    let read_dir = fs::read_dir(candidates_dir).map_err(|error| GoldenPackError::ReadDir {
-        path: candidates_dir.to_owned(),
-        message: error.to_string(),
-    })?;
-    for entry in read_dir {
-        let entry = entry.map_err(|error| GoldenPackError::ReadDir {
+    let files =
+        super::json_candidate_paths(candidates_dir).map_err(|error| GoldenPackError::ReadDir {
             path: candidates_dir.to_owned(),
             message: error.to_string(),
         })?;
-        let path = entry.path();
-        if path.extension().and_then(|extension| extension.to_str()) == Some("json") {
-            files.push(path);
-        }
-    }
-    files.sort();
 
     let mut all = Vec::new();
     for path in files {
@@ -701,6 +678,7 @@ fn build_summary(candidate: GoldenCandidate, realm: GoldenRealm) -> AuthoredProc
         transfer_partitions: Vec::new(),
         effects: Vec::new(),
         concurrency_effects: Vec::new(),
+        returned_callables: Vec::new(),
         declared_effects: Vec::new(),
         preconditions: None,
         result_contracts: Vec::new(),
@@ -858,6 +836,7 @@ fn build_pack(
         collection_flows: None,
         deferred_yields: None,
         conditional_type_refinements: None,
+        callable_values: None,
     }];
     if let Some(declarations) = declarations {
         shards.push(AuthoredShard {
@@ -873,20 +852,16 @@ fn build_pack(
             collection_flows: None,
             deferred_yields: None,
             conditional_type_refinements: None,
+            callable_values: None,
         });
     }
-    AuthoredSemanticModelPack {
-        schema_version:
-            brokk_bifrost_analysis::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
-        pack_id: realm.pack_id.to_owned(),
-        version: realm.content_version.to_owned(),
-        producer: Producer {
-            name: PRODUCER_NAME.to_owned(),
-            version: FOUNDRY_PRODUCER_VERSION.to_owned(),
-        },
-        language: realm.language.to_owned(),
-        ecosystem: realm.ecosystem.to_owned(),
-        compatibility: Compatibility {
+    super::authored_pack(
+        realm.pack_id.to_owned(),
+        realm.content_version.to_owned(),
+        PRODUCER_NAME.to_owned(),
+        realm.language.to_owned(),
+        realm.ecosystem.to_owned(),
+        Compatibility {
             bifrost: None,
             toolchains: realm
                 .toolchain
@@ -898,21 +873,13 @@ fn build_pack(
                 })
                 .unwrap_or_default(),
         },
-        provenance: Provenance {
+        Provenance {
             source: realm.provenance_source.to_owned(),
             revision: Some(realm.provenance_revision.to_owned()),
         },
-        license: PACK_LICENSE.to_owned(),
         completeness,
-        safety: Safety {
-            generated_code_only: false,
-            review_required: true,
-        },
-        carried_sources: Vec::new(),
-        cpp_portability: None,
-        python_correspondence: None,
         shards,
-    }
+    )
 }
 
 /// The activation selector every shard of one realm's pack carries.
@@ -938,56 +905,34 @@ fn assert_ids_unique(
     summaries: &[AuthoredProcedureSummary],
     realm: GoldenRealm,
 ) -> Result<(), GoldenPackError> {
-    let mut seen = std::collections::HashSet::new();
-    for summary in summaries {
-        if !seen.insert(summary.id.as_str()) {
-            return Err(GoldenPackError::DuplicateSummaryId {
-                pack_id: realm.pack_id.to_owned(),
-                id: summary.id.clone(),
-            });
-        }
+    if let Some(id) = super::duplicate_summary_id(summaries.iter()) {
+        return Err(GoldenPackError::DuplicateSummaryId {
+            pack_id: realm.pack_id.to_owned(),
+            id: id.to_owned(),
+        });
     }
     Ok(())
-}
-
-/// Serialize a pack to canonical pretty JSON with a trailing newline. serde
-/// serializes struct fields in declaration order and vectors in order, so the
-/// bytes are deterministic for the same input.
-fn serialize_pack(pack: &AuthoredSemanticModelPack) -> String {
-    let mut json = serde_json::to_string_pretty(pack).expect("a pack is serializable");
-    json.push('\n');
-    json
 }
 
 /// Compile the generated pack through the production compiler. A failure after
 /// the per-candidate rejects were removed is a converter bug, not a candidate
 /// reject, so it is raised rather than recorded.
 fn compile_check(source_json: &str, realm: GoldenRealm) -> Result<(), GoldenPackError> {
-    compile_source(
-        SourceFormat::Json,
-        source_json.as_bytes(),
-        &CompilerOptions::default(),
-    )
-    .map(|_| ())
-    .map_err(|diagnostics| GoldenPackError::CompileFailed {
+    super::compile_pack_source(source_json).map_err(|diagnostics| GoldenPackError::CompileFailed {
         pack_id: realm.pack_id.to_owned(),
-        diagnostics: diagnostics
-            .iter()
-            .map(|diagnostic| format!("{diagnostic:?}"))
-            .collect(),
+        diagnostics,
     })
 }
 
 /// Serialize the audit report to canonical pretty JSON with a trailing newline.
 pub fn serialize_audit(audit: &GoldenAuditReport) -> String {
-    let mut json = serde_json::to_string_pretty(audit).expect("the audit report is serializable");
-    json.push('\n');
-    json
+    super::serialize_pretty_json_line(audit)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
 
     /// Write one candidate file into a fresh directory and convert it.
     fn convert(files: &[(&str, &str)]) -> GoldenConversion {
@@ -1000,51 +945,6 @@ mod tests {
             fs::write(dir.path().join(name), body).expect("write candidate file");
         }
         convert_golden_candidates(dir.path(), realm).expect("conversion")
-    }
-
-    const STRING_CONCAT: &str = r#"[{
-      "target": {
-        "path": "java.base/java/lang/String.java",
-        "symbol": "java.lang.String.concat(java.lang.String)",
-        "has_receiver": true,
-        "parameter_count": 1
-      },
-      "completeness": "complete",
-      "transfers": [
-        {"input": {"kind": "receiver"}, "exit_kind": "normal", "output": {"kind": "normal_return"}},
-        {"input": {"kind": "parameter", "ordinal": 0}, "exit_kind": "normal", "output": {"kind": "normal_return"}}
-      ],
-      "rationale": "flow", "provenance": "hand", "confidence": "high", "citations": "javadoc"
-    }]"#;
-
-    #[test]
-    fn a_flow_through_candidate_ships_as_a_pinned_jdk_summary() {
-        let conversion = convert(&[("string.json", STRING_CONCAT)]);
-        assert_eq!(conversion.audit.candidates_total, 1);
-        assert_eq!(conversion.audit.shipped_summaries, 1);
-        assert_eq!(conversion.audit.rejected, 0);
-        let pack = &conversion.packs[0];
-        assert_eq!(pack.pack_id, "bifrost.jdk-golden-summaries");
-        assert!(
-            pack.pinned,
-            "the golden pack is pinned by the jdk toolchain"
-        );
-        assert_eq!(
-            pack.relative_path,
-            PathBuf::from("bifrost.jdk-golden-summaries.json")
-        );
-        // A golden summary carries transfers and no effects.
-        let value: serde_json::Value = serde_json::from_str(&pack.source_json).unwrap();
-        let summary = &value["shards"][0]["payload"]["summaries"][0];
-        assert_eq!(summary["effects"], serde_json::json!([]));
-        assert_eq!(summary["transfers"].as_array().unwrap().len(), 2);
-        // The generated pack compiles through the production compiler.
-        compile_source(
-            SourceFormat::Json,
-            pack.source_json.as_bytes(),
-            &CompilerOptions::default(),
-        )
-        .expect("the golden pack compiles");
     }
 
     #[test]
@@ -1076,18 +976,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn conversion_is_deterministic() {
-        let first = convert(&[("string.json", STRING_CONCAT)]);
-        let second = convert(&[("string.json", STRING_CONCAT)]);
-        assert_eq!(first, second);
-    }
-
     /// A Java static candidate preserves its authored receiverless semantic
     /// shape even though the call spells its owner. An instance target keeps a
     /// receiver, while a constructor remains receiverless and makes no
     /// overrides claim.
     #[test]
+    #[hardwon("#2737: qualified Java static method calls must not acquire an instance receiver")]
     fn java_static_and_instance_targets_preserve_semantic_receiver_shapes() {
         let statics = r#"[
           {
@@ -1157,8 +1051,63 @@ mod tests {
         );
     }
 
-    /// The realm is the only language-shaped input: the same candidate shape
-    /// ships as a Python-toolchain-pinned pack under the CPython realm.
+    const STRING_CONCAT: &str = r#"[{
+      "target": {
+        "path": "java.base/java/lang/String.java",
+        "symbol": "java.lang.String.concat(java.lang.String)",
+        "has_receiver": true,
+        "parameter_count": 1
+      },
+      "completeness": "complete",
+      "transfers": [
+        {"input": {"kind": "receiver"}, "exit_kind": "normal", "output": {"kind": "normal_return"}},
+        {"input": {"kind": "parameter", "ordinal": 0}, "exit_kind": "normal", "output": {"kind": "normal_return"}}
+      ],
+      "rationale": "flow", "provenance": "hand", "confidence": "high", "citations": "javadoc"
+    }]"#;
+
+    #[test]
+    fn a_flow_through_candidate_ships_as_a_pinned_jdk_summary() {
+        let conversion = convert(&[("string.json", STRING_CONCAT)]);
+        assert_eq!(conversion.audit.candidates_total, 1);
+        assert_eq!(conversion.audit.shipped_summaries, 1);
+        assert_eq!(conversion.audit.rejected, 0);
+        let pack = &conversion.packs[0];
+        assert_eq!(pack.pack_id, "bifrost.jdk-golden-summaries");
+        assert!(
+            pack.pinned,
+            "the golden pack is pinned by the jdk toolchain"
+        );
+        assert_eq!(
+            pack.relative_path,
+            PathBuf::from("bifrost.jdk-golden-summaries.json")
+        );
+        // A golden summary carries transfers and no effects.
+        let value: serde_json::Value = serde_json::from_str(&pack.source_json).unwrap();
+        let summary = &value["shards"][0]["payload"]["summaries"][0];
+        assert_eq!(summary["effects"], serde_json::json!([]));
+        assert_eq!(summary["transfers"].as_array().unwrap().len(), 2);
+        // The generated pack compiles through the production compiler.
+        compile_source(
+            SourceFormat::Json,
+            pack.source_json.as_bytes(),
+            &CompilerOptions::default(),
+        )
+        .expect("the golden pack compiles");
+    }
+
+    #[test]
+    fn conversion_is_deterministic() {
+        let first = convert(&[("string.json", STRING_CONCAT)]);
+        let second = convert(&[("string.json", STRING_CONCAT)]);
+        assert_eq!(first, second);
+    }
+
+    /// A Java static candidate preserves its authored receiverless semantic
+    /// shape even though the call spells its owner. An instance target keeps a
+    /// receiver, while a constructor remains receiverless and makes no
+    /// overrides claim.
+
     #[test]
     fn the_python_realm_ships_a_python_pinned_pack_from_the_same_converter() {
         let unquote = r#"[{
@@ -1247,7 +1196,11 @@ mod tests {
     /// target must say `has_receiver: false` or it never matches the canonical
     /// binding key. It also ships unpinned, because `cargo` discovery mints no
     /// toolchain evidence.
+
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2600+#2607: Rust summary targets stay receiverless and unpinned"
+    )]
     fn the_rust_realm_ships_receiverless_unpinned_targets() {
         let from_utf8 = r#"[{
           "target": {"path": "library/core/src/str/converts.rs", "symbol": "std.str.from_utf8", "has_receiver": false, "parameter_count": 1},
@@ -1277,7 +1230,11 @@ mod tests {
     /// Everything the summaries claim -- targets, receivers, transfers, ids --
     /// is identical, which is what makes one authored candidate set honest for
     /// both languages.
+
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2599+#2600+#2608: shared JS/TS summary candidates retain each realm identity"
+    )]
     fn one_candidate_directory_ships_both_the_javascript_and_typescript_realms() {
         let json_parse = r#"[{
           "target": {"path": "ecma262/json.js", "symbol": "JSON.parse", "has_receiver": true, "parameter_count": 1},

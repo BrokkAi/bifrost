@@ -1,20 +1,22 @@
-//! Java access refines visibility only; source/classpath coverage stays on the
+//! JVM access refines visibility only; source/classpath coverage stays on the
 //! selected binding paths. This policy retains no source collections.
 
 use super::*;
 use crate::analyzer::resolution::{
-    DeclarationAccessDecision, DeclarationAccessRequest, DeclarationAccessRow, FactPageVisitor,
-    SelectedDeclarationAccessSource, SelectedTypedFactSource, TypedFactReadOutcome,
-    TypedFactRequest,
+    CompanionTypeRelation, DeclarationAccessDecision, DeclarationAccessRequest,
+    DeclarationAccessRow, FactPageVisitor, JavaAccessEndpoint, JvmAccessEndpoint,
+    JvmDeclarationAccessRules, SelectedDeclarationAccessSource, SelectedTypedFactSource,
+    SubclassAccessContext, TypedFactReadOutcome, TypedFactRequest,
+    language_jvm_declaration_access_rules,
 };
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 
 #[derive(Debug)]
-pub(super) struct JavaAccessPolicy {
+pub(super) struct JvmAccessPolicy {
     pub(super) identity: SemanticId,
 }
 
-impl SelectedDeclarationAccessSource for JavaAccessPolicy {
+impl SelectedDeclarationAccessSource for JvmAccessPolicy {
     fn identity(&self) -> SemanticId {
         self.identity
     }
@@ -33,15 +35,43 @@ impl SelectedDeclarationAccessSource for JavaAccessPolicy {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        let Some(endpoints) = facts.java_access_endpoints(&semantics, cancellation)? else {
+        let Some(jvm_endpoints) = facts.jvm_access_endpoints(&semantics, cancellation)? else {
             return Ok(TypedFactReadOutcome::cancelled(
                 ResolutionCompletion::Complete,
             ));
         };
-        let endpoints = endpoints
-            .into_iter()
-            .map(|row| (row.semantic, row))
-            .collect::<HashMap<_, _>>();
+        let Some(java_endpoints) = facts.java_access_endpoints(&semantics, cancellation)? else {
+            return Ok(TypedFactReadOutcome::cancelled(
+                ResolutionCompletion::Complete,
+            ));
+        };
+        let mut endpoints = HashMap::<SemanticId, JvmAccessEndpoint>::default();
+        for endpoint in jvm_endpoints {
+            if endpoint.language == brokk_bifrost_core::analyzer::Language::Scala {
+                assert!(endpoints.insert(endpoint.semantic, endpoint).is_none());
+            }
+        }
+        for JavaAccessEndpoint {
+            semantic,
+            package,
+            outermost_type,
+        } in java_endpoints
+        {
+            assert!(
+                endpoints
+                    .insert(
+                        semantic,
+                        JvmAccessEndpoint {
+                            semantic,
+                            language: brokk_bifrost_core::analyzer::Language::Java,
+                            package,
+                            enclosing_templates: Vec::new(),
+                            outermost_type,
+                        },
+                    )
+                    .is_none()
+            );
+        }
         let definitions = requests
             .as_slice()
             .iter()
@@ -90,6 +120,49 @@ impl SelectedDeclarationAccessSource for JavaAccessPolicy {
                 ));
             }
         }
+        let templates = endpoints
+            .values()
+            .flat_map(|endpoint| endpoint.enclosing_templates.iter().copied())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut companions = HashSet::default();
+        for chunk in templates.chunks(MAX_SOURCE_ROWS_PER_BATCH) {
+            let mut collect = |rows: &[crate::analyzer::resolution::SelectedTypedRow<
+                CompanionTypeRelation,
+            >]| {
+                for row in rows {
+                    companions.insert((row.row().enclosing_type(), row.row().companion_type()));
+                }
+                Ok(!cancellation.is_cancelled())
+            };
+            let mut nested = match visitor.resolution_session() {
+                Some(session) => FactPageVisitor::with_maximum_rows_in_session(
+                    &mut collect,
+                    MAX_SOURCE_ROWS_PER_BATCH,
+                    session,
+                ),
+                None => FactPageVisitor::new(&mut collect),
+            };
+            let outcome = facts.visit_companion_relation_pages_for_enclosing_types(
+                TypedFactRequest::new(chunk),
+                cancellation,
+                &mut nested,
+            )?;
+            if outcome.is_cancelled() || cancellation.is_cancelled() {
+                return Ok(TypedFactReadOutcome::cancelled(
+                    ResolutionCompletion::Complete,
+                ));
+            }
+            let (terminal, completion) = outcome.into_parts();
+            if terminal != crate::analyzer::resolution::TypedFactReadTerminal::Exhausted
+                || completion != ResolutionCompletion::Complete
+            {
+                return Err(StoreError::new(
+                    "JVM access companion relation read did not exhaust its exact request",
+                ));
+            }
+        }
         let mut rows = Vec::with_capacity(requests.as_slice().len());
         for request in requests.as_slice() {
             if cancellation.is_cancelled() {
@@ -97,42 +170,87 @@ impl SelectedDeclarationAccessSource for JavaAccessPolicy {
                     ResolutionCompletion::Complete,
                 ));
             }
-            let decision = match (
-                endpoints.get(&request.reference),
-                endpoints.get(&request.definition),
-            ) {
-                (Some(reference), Some(target)) => {
-                    let same_package = reference
-                        .package
-                        .as_ref()
-                        .zip(target.package.as_ref())
-                        .map(|(a, b)| a == b);
-                    let same_nest = reference
-                        .outermost_type
-                        .zip(target.outermost_type)
-                        .map(|(a, b)| a == b);
-                    // Qualifier lookup owns enclosing-type accessibility.
-                    // An inherited public member may be named through an
-                    // accessible subtype of an inaccessible declaring class.
-                    match visibilities.get(&request.definition) {
-                        Some(DeclaredVisibility::Public) => DeclarationAccessDecision::Allowed,
-                        Some(DeclaredVisibility::Private) => match same_nest {
-                            Some(true) => DeclarationAccessDecision::Allowed,
-                            Some(false) => DeclarationAccessDecision::Denied,
-                            None => DeclarationAccessDecision::Unknown,
-                        },
-                        Some(DeclaredVisibility::PackagePrivate) => match same_package {
-                            Some(true) => DeclarationAccessDecision::Allowed,
-                            Some(false) => DeclarationAccessDecision::Denied,
-                            None => DeclarationAccessDecision::Unknown,
-                        },
-                        Some(DeclaredVisibility::Protected) if same_package == Some(true) => {
+            let reference = endpoints.get(&request.reference);
+            let target = endpoints.get(&request.definition);
+            let visibility = visibilities.get(&request.definition).copied();
+            let rules = target
+                .and_then(|endpoint| language_jvm_declaration_access_rules(endpoint.language));
+            let mut visibility_applies = false;
+            let mut subclass_access = None;
+            let decision = match (reference, target, visibility, rules) {
+                (Some(_), Some(_), Some(DeclaredVisibility::Public), _) => {
+                    DeclarationAccessDecision::Allowed
+                }
+                (
+                    Some(reference),
+                    Some(target),
+                    Some(DeclaredVisibility::Private),
+                    Some(JvmDeclarationAccessRules::Java),
+                ) => match reference.outermost_type.zip(target.outermost_type) {
+                    Some((caller, owner)) if caller == owner => DeclarationAccessDecision::Allowed,
+                    Some(_) => DeclarationAccessDecision::Denied,
+                    None => DeclarationAccessDecision::Unknown,
+                },
+                (
+                    Some(reference),
+                    Some(target),
+                    Some(DeclaredVisibility::PackagePrivate),
+                    Some(JvmDeclarationAccessRules::Java),
+                ) => match reference.package.as_ref().zip(target.package.as_ref()) {
+                    Some((caller, owner)) if caller == owner => DeclarationAccessDecision::Allowed,
+                    Some(_) => DeclarationAccessDecision::Denied,
+                    None => DeclarationAccessDecision::Unknown,
+                },
+                (
+                    Some(reference),
+                    Some(target),
+                    Some(DeclaredVisibility::Protected),
+                    Some(JvmDeclarationAccessRules::Java),
+                ) if reference.package == target.package => DeclarationAccessDecision::Allowed,
+                (
+                    Some(reference),
+                    Some(target),
+                    Some(DeclaredVisibility::Private),
+                    Some(JvmDeclarationAccessRules::Scala),
+                ) => {
+                    visibility_applies = true;
+                    match target.enclosing_templates.first().copied() {
+                        Some(owner)
+                            if reference.enclosing_templates.iter().any(|caller| {
+                                *caller == owner
+                                    || companions.contains(&(owner, *caller))
+                                    || companions.contains(&(*caller, owner))
+                            }) =>
+                        {
                             DeclarationAccessDecision::Allowed
                         }
-                        // Cross-package protected access needs subclass and
-                        // qualifying receiver evidence, not import rules.
-                        _ => DeclarationAccessDecision::Unknown,
+                        Some(_) => DeclarationAccessDecision::Denied,
+                        None => DeclarationAccessDecision::Unknown,
                     }
+                }
+                (
+                    Some(reference),
+                    Some(target),
+                    Some(DeclaredVisibility::Protected),
+                    Some(JvmDeclarationAccessRules::Scala),
+                ) => {
+                    visibility_applies = true;
+                    if let Some(owner) = target.enclosing_templates.first().copied() {
+                        subclass_access = Some(SubclassAccessContext {
+                            enclosing_templates: reference.enclosing_templates.clone(),
+                            declaration_template: owner,
+                        });
+                    }
+                    DeclarationAccessDecision::Unknown
+                }
+                (
+                    Some(_),
+                    Some(_),
+                    Some(DeclaredVisibility::Protected),
+                    Some(JvmDeclarationAccessRules::Java),
+                ) => DeclarationAccessDecision::Unknown,
+                (Some(_), Some(_), _, Some(JvmDeclarationAccessRules::Kotlin)) => {
+                    DeclarationAccessDecision::Unknown
                 }
                 _ => DeclarationAccessDecision::Unknown,
             };
@@ -140,6 +258,8 @@ impl SelectedDeclarationAccessSource for JavaAccessPolicy {
                 request: *request,
                 decision,
                 activation_reason: None,
+                visibility_applies,
+                subclass_access,
             });
         }
         Ok(if cancellation.is_cancelled() {

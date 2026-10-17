@@ -18,6 +18,16 @@ pub trait DispatchOracle {
         call: &CallSiteHandle,
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<DispatchResult>, SemanticProviderError>;
+    /// Resolve under an exact bounded caller suffix. Providers that do not
+    /// consume contextual proof retain their context-independent answer.
+    fn resolve_call_in_context(
+        &self,
+        call: &CallSiteHandle,
+        _context: &OracleCallContext,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<DispatchResult>, SemanticProviderError> {
+        self.resolve_call(call, request)
+    }
 }
 
 /// Procedure-local and candidate-specific value-flow answers.

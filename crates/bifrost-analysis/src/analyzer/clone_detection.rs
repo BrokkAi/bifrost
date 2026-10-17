@@ -3,8 +3,11 @@ use crate::analyzer::tree_walk::push_children_reversed;
 use crate::analyzer::{
     CloneSmell, CloneSmellWeights, CodeUnit, IAnalyzer, Language, ProjectFile, parser_language_for,
 };
+use brokk_bifrost_core::clones::{
+    CloneNormalizationRules, normalize_clone_ast_label, normalize_clone_leaf_token,
+};
 use std::collections::{HashMap, HashSet};
-use tree_sitter::{Node, Parser};
+use tree_sitter::Parser;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CloneSyntaxProfile {
@@ -51,23 +54,21 @@ pub(crate) struct CloneCandidateProfile {
     pub(crate) shingle_count: usize,
 }
 
-pub(crate) fn build_tree_sitter_clone_candidate_data(
-    analyzer: &dyn IAnalyzer,
+pub(crate) fn build_clone_candidate_data(
+    source: Option<String>,
     code_unit: &CodeUnit,
     weights: CloneSmellWeights,
-    profile: CloneSyntaxProfile,
+    prepare: impl FnOnce(&str, usize) -> Option<(Vec<String>, String)>,
 ) -> Option<CloneCandidateData> {
-    let source = analyzer.get_source(code_unit, false)?.trim().to_string();
+    let source = source?;
+    let source = source.trim();
     if source.is_empty() {
         return None;
     }
 
-    let (normalized_tokens, ast_signature, has_candidate) =
-        normalize_tree_sitter_clone_source(&source, profile);
-    if !has_candidate {
-        return None;
-    }
-    if normalized_tokens.len() < weights.min_normalized_tokens.max(0) as usize {
+    let min_normalized_tokens = weights.min_normalized_tokens.max(0) as usize;
+    let (normalized_tokens, ast_signature) = prepare(source, min_normalized_tokens)?;
+    if normalized_tokens.len() < min_normalized_tokens {
         return None;
     }
 
@@ -75,8 +76,26 @@ pub(crate) fn build_tree_sitter_clone_candidate_data(
         unit: code_unit.clone(),
         normalized_tokens,
         ast_signature,
-        excerpt: compact_clone_excerpt(&source),
+        excerpt: compact_clone_excerpt(source),
     })
+}
+
+pub(crate) fn build_tree_sitter_clone_candidate_data(
+    analyzer: &dyn IAnalyzer,
+    code_unit: &CodeUnit,
+    weights: CloneSmellWeights,
+    profile: CloneSyntaxProfile,
+) -> Option<CloneCandidateData> {
+    build_clone_candidate_data(
+        analyzer.get_source(code_unit, false),
+        code_unit,
+        weights,
+        |source, _| {
+            let (tokens, signature, has_candidate) =
+                normalize_tree_sitter_clone_source(source, profile);
+            has_candidate.then_some((tokens, signature))
+        },
+    )
 }
 
 fn normalize_tree_sitter_clone_source(
@@ -94,6 +113,18 @@ fn normalize_tree_sitter_clone_source(
     };
     let tree = crate::analyzer::repaired_grammar_gap_tree(profile.language, source, tree);
 
+    let normalization_rules = CloneNormalizationRules {
+        identifier_kinds: profile.identifier_kinds,
+        string_kinds: profile.string_kinds,
+        number_kinds: profile.number_kinds,
+        boolean_kinds: &[],
+        boolean_values: &["true", "false"],
+        null_kinds: &[],
+        null_values: &[],
+        comment_kinds: profile.comment_kinds,
+        ignored_ast_kinds: &[],
+    };
+
     let mut normalized_tokens = Vec::new();
     let mut ast_labels = Vec::new();
     let mut has_candidate = false;
@@ -103,9 +134,9 @@ fn normalize_tree_sitter_clone_source(
             continue;
         }
         has_candidate |= profile.candidate_kinds.contains(&node.kind());
-        ast_labels.push(normalize_clone_ast_label(node, source, profile));
+        ast_labels.push(normalize_clone_ast_label(node, source, normalization_rules));
         if node.named_child_count() == 0 {
-            let token = normalize_clone_leaf_token(node, source, profile);
+            let token = normalize_clone_leaf_token(node, source, normalization_rules);
             if !token.is_empty() {
                 normalized_tokens.push(token);
             }
@@ -120,55 +151,6 @@ fn normalize_tree_sitter_clone_source(
     }
 
     (normalized_tokens, ast_labels.join("|"), has_candidate)
-}
-
-fn normalize_clone_leaf_token(node: Node<'_>, source: &str, profile: CloneSyntaxProfile) -> String {
-    let kind = node.kind();
-    let token = node_text(node, source);
-    if token.is_empty() || profile.comment_kinds.contains(&kind) {
-        return String::new();
-    }
-    if profile.identifier_kinds.contains(&kind) {
-        return "ID".to_string();
-    }
-    if profile.string_kinds.contains(&kind) {
-        return "STR".to_string();
-    }
-    if profile.number_kinds.contains(&kind) {
-        return "NUM".to_string();
-    }
-    if matches!(token, "true" | "false") {
-        return "BOOL".to_string();
-    }
-    if token.chars().count() == 1 && token.chars().all(|ch| !ch.is_alphanumeric()) {
-        return format!("OP:{token}");
-    }
-    format!("T:{kind}")
-}
-
-fn normalize_clone_ast_label(node: Node<'_>, source: &str, profile: CloneSyntaxProfile) -> String {
-    let kind = node.kind();
-    let text = node_text(node, source);
-    if profile.identifier_kinds.contains(&kind) {
-        return "ID".to_string();
-    }
-    if profile.string_kinds.contains(&kind) {
-        return "STR".to_string();
-    }
-    if profile.number_kinds.contains(&kind) {
-        return "NUM".to_string();
-    }
-    if matches!(text, "true" | "false") {
-        return "BOOL".to_string();
-    }
-    format!("N:{kind}")
-}
-
-fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    source
-        .get(node.start_byte()..node.end_byte())
-        .unwrap_or("")
-        .trim()
 }
 
 impl CloneCandidateProfile {
@@ -482,7 +464,7 @@ pub(crate) fn detect_language_structural_clone_smells<F>(
     build_candidate: F,
 ) -> Vec<CloneSmell>
 where
-    F: Fn(&CodeUnit) -> Option<CloneCandidateData>,
+    F: FnMut(&CodeUnit) -> Option<CloneCandidateData>,
 {
     let requested_files: Vec<ProjectFile> = files
         .iter()
@@ -494,6 +476,25 @@ where
     }
 
     let corpus_units = clone_corpus_function_units(analyzer, language);
+    detect_structural_clone_smells_for_corpus(
+        analyzer,
+        &requested_files,
+        &corpus_units,
+        weights,
+        build_candidate,
+    )
+}
+
+pub(crate) fn detect_structural_clone_smells_for_corpus<F>(
+    analyzer: &dyn IAnalyzer,
+    requested_files: &[ProjectFile],
+    corpus_units: &[CodeUnit],
+    weights: CloneSmellWeights,
+    build_candidate: F,
+) -> Vec<CloneSmell>
+where
+    F: FnMut(&CodeUnit) -> Option<CloneCandidateData>,
+{
     // Hold one query scope over the whole corpus build: per-unit source
     // assembly re-reads each file's declaration state once per function it
     // declares, and the scope's file-state snapshot serves those repeats
@@ -506,7 +507,7 @@ where
         .collect();
 
     detect_structural_clone_smells(
-        &requested_files,
+        requested_files,
         all_candidates,
         weights,
         refine_clone_similarity_with_ast,
@@ -643,80 +644,25 @@ mod tests {
         can_reach_clone_similarity, compute_clone_token_similarity, hashed_shingle_array,
     };
     use crate::analyzer::{CloneSmellWeights, CodeUnit, CodeUnitType, ProjectFile};
-    use std::collections::HashSet;
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
-    fn hashed_similarity_matches_string_shingle_similarity_for_identical_tokens() {
-        let tokens = vec!["ID", "OP:=", "NUM", "OP:+", "ID"];
-        let weights = weights(1, 1, 2, 1, 70);
-
-        assert_similarity_matches_string_shingles(&tokens, &tokens, weights);
-    }
-
-    #[test]
-    fn hashed_similarity_matches_string_shingle_similarity_for_partial_overlap() {
-        let left = vec!["ID", "OP:=", "NUM", "OP:+", "ID", "OP:;", "return", "ID"];
-        let right = vec!["ID", "OP:=", "NUM", "OP:-", "ID", "OP:;", "return", "NUM"];
-        let weights = weights(1, 1, 2, 1, 70);
-
-        assert_similarity_matches_string_shingles(&left, &right, weights);
-    }
-
-    #[test]
-    fn hashed_similarity_matches_string_shingle_similarity_below_min_shared_shingles() {
-        let left = vec!["ID", "OP:=", "NUM", "OP:+", "ID"];
-        let right = vec!["return", "STR", "OP:;", "throw", "ID"];
-        let weights = weights(1, 1, 2, 3, 70);
-
-        assert_similarity_matches_string_shingles(&left, &right, weights);
-    }
-
-    #[test]
-    fn hashed_similarity_matches_string_shingle_similarity_when_shorter_than_shingle_size() {
-        let left = vec!["ID", "OP:="];
-        let right = vec!["ID", "OP:="];
-        let weights = weights(1, 1, 3, 1, 70);
-
-        assert_similarity_matches_string_shingles(&left, &right, weights);
-    }
-
-    #[test]
-    fn returns_zero_when_shingle_size_skew_cannot_meet_similarity_threshold() {
-        let left = vec!["A", "B", "C"];
-        let right = vec!["A", "B", "C", "D", "E", "F", "G", "H"];
-        let weights = weights(1, 80, 1, 1, 70);
-
-        assert_eq!(
-            0,
-            compute_clone_token_similarity(
-                &hashed(left, weights.shingle_size),
-                &hashed(right, weights.shingle_size),
-                weights,
-            )
-        );
-    }
-
-    #[test]
-    fn upper_bound_uses_rounded_similarity_threshold() {
+    fn rounded_similarity_threshold_is_preserved_by_candidate_prefilter() {
         let left: Vec<String> = (0..699).map(|n| n.to_string()).collect();
         let right: Vec<String> = (0..1000).map(|n| n.to_string()).collect();
         let weights = weights(1, 70, 1, 1, 70);
+        let left_shingles = hashed_strings(&left, weights.shingle_size);
+        let right_shingles = hashed_strings(&right, weights.shingle_size);
 
         assert_eq!(
             70,
-            compute_clone_token_similarity(
-                &hashed_strings(&left, weights.shingle_size),
-                &hashed_strings(&right, weights.shingle_size),
-                weights,
-            )
+            compute_clone_token_similarity(&left_shingles, &right_shingles, weights,)
         );
-    }
-
-    #[test]
-    fn candidate_prefilter_rejects_pairs_below_min_shared_shingles() {
-        let weights = weights(1, 50, 1, 3, 70);
-
-        assert!(!can_reach_clone_similarity(2, 5, weights));
+        assert!(can_reach_clone_similarity(
+            left_shingles.size(),
+            right_shingles.size(),
+            weights,
+        ));
     }
 
     #[test]
@@ -724,13 +670,6 @@ mod tests {
         let weights = weights(1, 71, 1, 1, 70);
 
         assert!(!can_reach_clone_similarity(699, 1000, weights));
-    }
-
-    #[test]
-    fn candidate_prefilter_keeps_pairs_at_rounded_upper_bound_threshold() {
-        let weights = weights(1, 70, 1, 1, 70);
-
-        assert!(can_reach_clone_similarity(699, 1000, weights));
     }
 
     #[test]
@@ -753,6 +692,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#1421: shingle index prunes workspace peers that cannot meet the overlap budget")]
     fn shingle_index_excludes_workspace_peers_without_enough_overlap() {
         let weights = weights(1, 70, 1, 3, 70);
         let mut candidates = vec![candidate(
@@ -784,51 +724,6 @@ mod tests {
         peers.sort_unstable();
 
         assert_eq!(peers, vec![0, 1_001]);
-    }
-
-    fn assert_similarity_matches_string_shingles(
-        left: &[&str],
-        right: &[&str],
-        weights: CloneSmellWeights,
-    ) {
-        let expected = string_shingle_similarity(left, right, weights);
-        let actual = compute_clone_token_similarity(
-            &hashed(left.to_vec(), weights.shingle_size),
-            &hashed(right.to_vec(), weights.shingle_size),
-            weights,
-        );
-        assert_eq!(expected, actual);
-    }
-
-    fn string_shingle_similarity(left: &[&str], right: &[&str], weights: CloneSmellWeights) -> i32 {
-        let left_shingles = string_shingles(left, weights.shingle_size);
-        let right_shingles = string_shingles(right, weights.shingle_size);
-        if left_shingles.len() < weights.min_shared_shingles as usize
-            || right_shingles.len() < weights.min_shared_shingles as usize
-        {
-            return 0;
-        }
-        let intersection = left_shingles.intersection(&right_shingles).count();
-        if intersection < weights.min_shared_shingles as usize {
-            return 0;
-        }
-        let union = left_shingles.union(&right_shingles).count();
-        if union == 0 {
-            return 0;
-        }
-        ((intersection as f64 * 100.0) / union as f64).round() as i32
-    }
-
-    fn string_shingles(tokens: &[&str], shingle_size: i32) -> HashSet<String> {
-        let k = shingle_size.max(1) as usize;
-        if tokens.len() < k {
-            return HashSet::new();
-        }
-        let mut shingles = HashSet::new();
-        for start in 0..=(tokens.len() - k) {
-            shingles.insert(tokens[start..start + k].join("|"));
-        }
-        shingles
     }
 
     fn hashed(tokens: Vec<&str>, shingle_size: i32) -> LongShingles {

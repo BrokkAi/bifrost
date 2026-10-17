@@ -29,13 +29,12 @@
 //! and receivers whose type cannot be established from structured declarations
 //! remain a recall gap rather than producing a guessed edge.
 
-use super::resolver::node_text;
+use super::resolver::{is_bare_constant_reference, is_object_creation_type_name, node_text};
 use super::syntax::{
     assignment_value_type_fq_name, captured_local_scope_bindings, declared_instance_callable,
-    declared_instance_field, direct_variable_receiver_type_fq_names,
-    instance_receiver_type_fq_name, instanceof_type_node, is_local_scope, object_creation_type,
-    seed_assignment_binding, seed_parameter_types, static_member_parts, static_scope_type_fq_name,
-    variable_identifier,
+    declared_instance_field, direct_receiver_union_member, instance_receiver_type_fq_name,
+    instanceof_type_node, is_local_scope, object_creation_type, seed_assignment_binding,
+    seed_parameter_types, static_member_parts, static_scope_type_fq_name, variable_identifier,
 };
 use crate::aliases::{
     PhpCallableCandidates, PhpFileContextIndex, resolve_php_constant, resolve_php_function,
@@ -43,14 +42,14 @@ use crate::aliases::{
 };
 use crate::graph::PhpGraphSource;
 use crate::graph_support::PhpSource;
+use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::usages::inverted_edges::{
-    ClassRangeIndex, FileEdgeScanInput, PerFileEdges, classify_reference_node,
+    ClassRangeIndex, FileEdgeScanInput, PerFileEdges,
 };
 use brokk_bifrost_core::analyzer::usages::local_inference::{
     LocalInferenceConfig, LocalInferenceEngine,
 };
 use brokk_bifrost_core::analyzer::usages::same_owner::route_same_owner;
-use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use tree_sitter::Node;
 
 /// Resolve every reference in one already-parsed PHP file.
@@ -127,13 +126,7 @@ impl PhpScan<'_> {
     }
 
     fn record(&mut self, callee: String, node: Node<'_>) {
-        self.edges.record_kind(
-            self.input,
-            callee,
-            classify_reference_node(node),
-            node.start_byte(),
-            node.end_byte(),
-        );
+        self.edges.record_reference(self.input, callee, node);
     }
 }
 
@@ -185,7 +178,7 @@ fn record_reference(
         // `new X` type lives under `object_creation_expression` and is handled
         // above, so skip it here to avoid double counting.
         "named_type" => {
-            if !is_in_object_creation(node)
+            if !is_object_creation_type_name(node)
                 && let Some(fqn) = scan.resolve_type_reference_fqn(node)
             {
                 scan.record(fqn, node);
@@ -306,7 +299,9 @@ fn record_reference(
                             declared_instance_callable(scan.php, scan.analyzer, &owner, method)
                         })
                         .or_else(|| {
-                            direct_receiver_union_member(object, scan, bindings, method, true)
+                            direct_receiver_union_member(object, scan.source, bindings, |owner| {
+                                declared_instance_callable(scan.php, scan.analyzer, owner, method)
+                            })
                         });
                     if let Some(callable) = callable {
                         scan.record(callable.fq_name(), name_node);
@@ -353,7 +348,9 @@ fn record_reference(
                             declared_instance_field(scan.php, scan.analyzer, &owner, member)
                         })
                         .or_else(|| {
-                            direct_receiver_union_member(object, scan, bindings, member, false)
+                            direct_receiver_union_member(object, scan.source, bindings, |owner| {
+                                declared_instance_field(scan.php, scan.analyzer, owner, member)
+                            })
                         });
                     if let Some(field) = field {
                         scan.record(field.fq_name(), name_node);
@@ -414,35 +411,6 @@ fn receiver_type_fqn(
     )
 }
 
-fn direct_receiver_union_member(
-    object: Node<'_>,
-    scan: &PhpScan<'_>,
-    bindings: &LocalInferenceEngine<String>,
-    member: &str,
-    callable: bool,
-) -> Option<CodeUnit> {
-    let owners = direct_variable_receiver_type_fq_names(object, scan.source, bindings);
-    if owners.len() < 2 {
-        return None;
-    }
-    let mut candidates = owners
-        .into_iter()
-        .filter_map(|owner| {
-            if callable {
-                declared_instance_callable(scan.php, scan.analyzer, &owner, member)
-            } else {
-                declared_instance_field(scan.php, scan.analyzer, &owner, member)
-            }
-        })
-        .collect::<Vec<_>>();
-    candidates.sort();
-    candidates.dedup();
-    let [candidate] = candidates.as_slice() else {
-        return None;
-    };
-    Some(candidate.clone())
-}
-
 /// Seed parameter types into the binding scope: a `simple_parameter` with a type
 /// hint that resolves to a class fqn becomes a precise binding; an untyped
 /// parameter is a shadow so its name is not later read as a static type.
@@ -492,46 +460,10 @@ fn seed_assignment(
     });
 }
 
-/// True when `node` is the type name inside a `new X(..)` expression (so the
-/// generic type-reference case skips it to avoid double counting a construction).
-fn is_in_object_creation(node: Node<'_>) -> bool {
-    node.parent()
-        .is_some_and(|parent| parent.kind() == "object_creation_expression")
-}
-
 fn is_instanceof_type_name(node: Node<'_>) -> bool {
     node.parent()
         .and_then(instanceof_type_node)
         .is_some_and(|right| {
             right.start_byte() <= node.start_byte() && node.end_byte() <= right.end_byte()
         })
-}
-
-/// True when a `name` node is a bare constant reference (not a call target, not a
-/// member/scoped access name, not a declaration name).
-fn is_bare_constant_reference(node: Node<'_>) -> bool {
-    let Some(parent) = node.parent() else {
-        return false;
-    };
-    !matches!(
-        parent.kind(),
-        "function_call_expression"
-            | "member_access_expression"
-            | "member_call_expression"
-            | "scoped_call_expression"
-            | "class_constant_access_expression"
-            | "named_type"
-            | "object_creation_expression"
-            | "function_definition"
-            | "method_declaration"
-            | "const_element"
-            | "namespace_use_clause"
-            | "namespace_definition"
-            | "class_declaration"
-            | "interface_declaration"
-            | "trait_declaration"
-            | "qualified_name"
-            | "base_clause"
-            | "class_interface_clause"
-    )
 }

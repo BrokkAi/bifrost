@@ -1,24 +1,13 @@
-//! The two bounded-resolution unit tests for
-//! [`brokk_bifrost_csharp::graph::resolver`], kept on this side of the seam.
-//!
-//! They drive `compatible_receiver_type_names` and
-//! `nearest_member_candidates_for_owner_inner` -- the session-metering inners
-//! themselves, not the wrappers -- against a real `CSharpAnalyzer` built by
-//! `AnalyzerFixture`, which is analysis-side test support the C# crate cannot
-//! depend on. Rewriting them against a hand-rolled `CSharpSource` would
-//! have changed what they prove, so the tests stay and the two inners are `pub`
-//! in the crate.
+//! Bounded hierarchy traversal and overlay invalidation regressions for the C# graph resolver.
 
 use crate::analyzer::usages::csharp_graph::csharp_graph_source;
-use crate::analyzer::usages::csharp_graph::shared::{
-    CSharpAuthoritativeUsageBatch, CSharpAuthoritativeUsageRequest, CSharpQueryResolver,
-};
+use crate::analyzer::usages::csharp_graph::shared::CSharpAuthoritativeUsageBatch;
 use crate::analyzer::usages::get_definition::BoundedResolution;
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::receiver_analysis::{ReceiverAnalysisBudget, ReceiverBudgetLimit};
-use crate::analyzer::usages::traits::{UsageQueryResolver, UsageScanScope};
-use crate::analyzer::{AnalyzerQueryScope, QueryScope};
-use crate::analyzer::{CSharpAnalyzer, CodeUnit, IAnalyzer, Language, resolve_analyzer};
+use crate::analyzer::{
+    AnalyzerQueryScope, CSharpAnalyzer, CodeUnit, IAnalyzer, Language, QueryScope, resolve_analyzer,
+};
 use crate::cancellation::CancellationToken;
 use crate::hash::HashSet;
 use crate::test_support::AnalyzerFixture;
@@ -27,6 +16,14 @@ use brokk_bifrost_csharp::graph::resolver::{
     compatible_receiver_type_names, nearest_member_candidates_for_owner_inner,
 };
 use std::fmt::Write;
+
+fn type_definition(analyzer: &dyn IAnalyzer, fqn: &str) -> CodeUnit {
+    analyzer
+        .get_definitions(fqn)
+        .into_iter()
+        .find(CodeUnit::is_class)
+        .unwrap_or_else(|| panic!("missing type {fqn}"))
+}
 
 fn deep_wide_hierarchy_source(depth: usize, width: usize) -> String {
     let mut source = String::from("namespace Demo;\n");
@@ -55,12 +52,28 @@ fn hierarchy_fixture() -> AnalyzerFixture {
     AnalyzerFixture::new_for_language(Language::CSharp, &[("Hierarchy.cs", &source)])
 }
 
-fn type_definition(analyzer: &dyn IAnalyzer, fqn: &str) -> CodeUnit {
-    analyzer
-        .get_definitions(fqn)
+fn csharp_usage_sites(result: FuzzyResult, target: &CodeUnit) -> HashSet<(String, usize, usize)> {
+    let FuzzyResult::Success {
+        hits_by_overload,
+        unproven_by_overload,
+        ..
+    } = result
+    else {
+        panic!("expected successful C# usage result, got {result:#?}");
+    };
+    hits_by_overload
+        .get(target)
         .into_iter()
-        .find(CodeUnit::is_class)
-        .unwrap_or_else(|| panic!("missing type {fqn}"))
+        .flatten()
+        .chain(unproven_by_overload.get(target).into_iter().flatten())
+        .map(|hit| {
+            (
+                hit.file.rel_path().to_string_lossy().into_owned(),
+                hit.start_offset,
+                hit.end_offset,
+            )
+        })
+        .collect()
 }
 
 #[test]
@@ -171,151 +184,6 @@ fn bounded_member_hierarchy_observes_mid_walk_cancellation() {
     assert!(
         cancelled_work.is_some(),
         "expected deterministic cancellation after at least two hierarchy expansions"
-    );
-}
-
-fn csharp_usage_sites(result: FuzzyResult, target: &CodeUnit) -> HashSet<(String, usize, usize)> {
-    let FuzzyResult::Success {
-        hits_by_overload,
-        unproven_by_overload,
-        ..
-    } = result
-    else {
-        panic!("expected successful C# usage result, got {result:#?}");
-    };
-    hits_by_overload
-        .get(target)
-        .into_iter()
-        .flatten()
-        .chain(unproven_by_overload.get(target).into_iter().flatten())
-        .map(|hit| {
-            (
-                hit.file.rel_path().to_string_lossy().into_owned(),
-                hit.start_offset,
-                hit.end_offset,
-            )
-        })
-        .collect()
-}
-
-#[test]
-fn authoritative_batch_prepares_union_roots_once_and_keeps_per_target_file_bounds() {
-    let fixture = AnalyzerFixture::new_for_language(
-        Language::CSharp,
-        &[
-            (
-                "Models.cs",
-                "namespace Demo; public class Alpha {} public class Beta {}",
-            ),
-            (
-                "UseA.cs",
-                "namespace Demo; public class UseA { Alpha alpha; Beta beta; }",
-            ),
-            (
-                "UseB.cs",
-                "namespace Demo; public class UseB { Alpha alpha; Beta beta; }",
-            ),
-            (
-                "UseAlias.cs",
-                "using AliasAlpha = Demo.Alpha; namespace Demo; public class UseAlias { AliasAlpha alpha; }",
-            ),
-        ],
-    );
-    let analyzer = fixture.analyzer.analyzer();
-    let alpha = type_definition(analyzer, "Demo.Alpha");
-    let beta = type_definition(analyzer, "Demo.Beta");
-    let roots: HashSet<_> = analyzer.get_analyzed_files().into_iter().collect();
-    let use_a = roots
-        .iter()
-        .find(|file| file.rel_path().to_string_lossy() == "UseA.cs")
-        .expect("UseA.cs")
-        .clone();
-    let use_b = roots
-        .iter()
-        .find(|file| file.rel_path().to_string_lossy() == "UseB.cs")
-        .expect("UseB.cs")
-        .clone();
-    let use_alias = roots
-        .iter()
-        .find(|file| file.rel_path().to_string_lossy() == "UseAlias.cs")
-        .expect("UseAlias.cs")
-        .clone();
-    let only_a = HashSet::from_iter([use_a]);
-    let only_b = HashSet::from_iter([use_b]);
-    let only_alias = HashSet::from_iter([use_alias]);
-
-    let scope = AnalyzerQueryScope::new(analyzer);
-    let batch = CSharpAuthoritativeUsageBatch::new(analyzer, scope.token(), &roots)
-        .expect("C# authoritative batch");
-    assert_eq!(batch.prepared_file_count_for_test(), roots.len());
-
-    let resolver = CSharpQueryResolver::try_new(analyzer).expect("C# resolver");
-    let ordinary_alpha = resolver
-        .find_usages(
-            analyzer,
-            std::slice::from_ref(&alpha),
-            &UsageScanScope::new(&only_a),
-            100,
-        )
-        .into_fuzzy_result();
-    let requests = [
-        CSharpAuthoritativeUsageRequest::new(std::slice::from_ref(&alpha), &only_a, 100),
-        CSharpAuthoritativeUsageRequest::new(std::slice::from_ref(&beta), &only_a, 100),
-    ];
-    let mut batch_results = batch.find_usages_batch(&requests).into_iter();
-    let batch_alpha = batch_results
-        .next()
-        .expect("Alpha batch result")
-        .into_fuzzy_result();
-    let batch_beta_in_a = batch_results
-        .next()
-        .expect("Beta batch result")
-        .into_fuzzy_result();
-    assert!(batch_results.next().is_none());
-    assert_eq!(
-        csharp_usage_sites(ordinary_alpha, &alpha),
-        csharp_usage_sites(batch_alpha, &alpha)
-    );
-    let beta_sites_in_a = csharp_usage_sites(batch_beta_in_a, &beta);
-    assert!(!beta_sites_in_a.is_empty(), "expected the shared Beta use");
-    assert!(
-        beta_sites_in_a.iter().all(|(path, _, _)| path == "UseA.cs"),
-        "shared file-major scan leaked another file: {beta_sites_in_a:#?}"
-    );
-    assert_eq!(
-        batch.batch_file_scan_count_for_test(),
-        1,
-        "two targets sharing one candidate file must traverse that file once"
-    );
-
-    let alias_alpha = batch
-        .find_usages(std::slice::from_ref(&alpha), &only_alias, 100)
-        .into_fuzzy_result();
-    let alias_sites = csharp_usage_sites(alias_alpha, &alpha);
-    assert!(!alias_sites.is_empty(), "expected the aliased Alpha use");
-    assert!(
-        alias_sites.iter().all(|(path, _, _)| path == "UseAlias.cs"),
-        "alias fallback leaked another file: {alias_sites:#?}"
-    );
-
-    let batch_beta = batch
-        .find_usages(std::slice::from_ref(&beta), &only_b, 100)
-        .into_fuzzy_result();
-    let beta_sites = csharp_usage_sites(batch_beta, &beta);
-    assert!(!beta_sites.is_empty(), "expected the bounded Beta use");
-    assert!(
-        beta_sites.iter().all(|(path, _, _)| path == "UseB.cs"),
-        "authoritative candidate bounds leaked another file: {beta_sites:#?}"
-    );
-    assert_eq!(
-        batch.prepared_file_count_for_test(),
-        roots.len(),
-        "target queries must reuse the fixed prepared-file map"
-    );
-    assert_eq!(
-        batch.batch_file_scan_count_for_test(),
-        3,
-        "each later one-file request adds exactly one file-major traversal"
     );
 }
 

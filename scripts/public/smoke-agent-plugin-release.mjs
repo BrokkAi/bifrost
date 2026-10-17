@@ -10,7 +10,7 @@ import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 import { toolInventoryFromMarkdown, unavailableSkillTools } from "./skill-tool-contract.mjs";
-import { required } from "./cli-argument-helpers.mjs";
+import { parseCamelCaseArgs, required } from "./cli-argument-helpers.mjs";
 import { roundTrip, waitForSpawn, writeMessage } from "./mcp-smoke-transport.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -59,21 +59,21 @@ async function smokeLaunch(label, launch, launcherCacheDir, includeCodexSandbox)
   };
 
   const prepared = await prepare(launch.command, os.tmpdir(), launcherEnv, binaryPath ? "explicit" : "installed");
-  const version = await execFileAsync(prepared.binaryPath, ["--version"], { env: launcherEnv });
-  const coreWithoutRules = /^bifrost 0\.13\.0(?:\s|$)/u.test(version.stdout);
-  if (coreWithoutRules) {
-    // This is the core/transport smoke. External acquisition and activation
-    // have their own exact-profile acceptance job.
-    launcherEnv.BIFROST_OPEN_PACKS_OFFLINE = "1";
-    delete launcherEnv.BIFROST_OPEN_POLICY_PACK_ROOT;
-  }
+  await execFileAsync(prepared.binaryPath, ["--version"], { env: launcherEnv });
+  // The engine ships no product rules, so the host-supplied catalog contract
+  // applies to every staged core, not one exact version. This core/transport
+  // smoke stays offline and independent of any inherited external pack
+  // configuration; external acquisition and activation have their own
+  // exact-profile acceptance job.
+  launcherEnv.BIFROST_OPEN_PACKS_OFFLINE = "1";
+  delete launcherEnv.BIFROST_OPEN_POLICY_PACK_ROOT;
   if (includeCodexSandbox) {
     await withDisposableSmokeWorkspace((workspace) =>
       assertCodexSandboxWorkspaceBinding(launch, workspace, launcherEnv)
     );
   }
   await withDisposableSmokeWorkspace((workspace) =>
-    assertMcpRootsWorkspaceBinding(launch, workspace, launcherEnv, coreWithoutRules)
+    assertMcpRootsWorkspaceBinding(launch, workspace, launcherEnv)
   );
   await assertNoPluginWorkspaceCache(pluginDir);
   console.log(`Passed ${label} MCP launch smoke.`);
@@ -94,24 +94,15 @@ function validateRecordedCodexHandshake(fixture) {
 }
 
 function parseArgs(args) {
-  const options = {};
-  for (let index = 0; index < args.length; index += 2) {
-    const key = args[index];
-    const value = args[index + 1];
-    if (!key?.startsWith("--") || value === undefined) {
-      throw new Error(
-        "Usage: smoke-agent-plugin-release.mjs --plugin-dir <dir> --cache-dir <empty-dir> " +
-        "[--binary-path <bifrost>]"
-      );
-    }
-    options[key.slice(2).replace(/-([a-z])/g, (_match, letter) => letter.toUpperCase())] = value;
-  }
-  return options;
+  return parseCamelCaseArgs(
+    args,
+    "Usage: smoke-agent-plugin-release.mjs --plugin-dir <dir> --cache-dir <empty-dir> " +
+      "[--binary-path <bifrost>]",
+  );
 }
 
 async function requiredDirectory(value, name) {
-  const directory = path.resolve(required(value, name));
-  const stat = await fs.stat(directory);
+  const { target: directory, stat } = await requiredPathStat(value, name);
   if (!stat.isDirectory()) {
     throw new Error(`--${name} must be a directory: ${directory}`);
   }
@@ -119,12 +110,16 @@ async function requiredDirectory(value, name) {
 }
 
 async function requiredFile(value, name) {
-  const file = path.resolve(required(value, name));
-  const stat = await fs.stat(file);
+  const { target: file, stat } = await requiredPathStat(value, name);
   if (!stat.isFile()) {
     throw new Error(`--${name} must be a file: ${file}`);
   }
   return file;
+}
+
+async function requiredPathStat(value, name) {
+  const target = path.resolve(required(value, name));
+  return { target, stat: await fs.stat(target) };
 }
 
 async function resolvePortablePluginLaunch(pluginRoot) {
@@ -152,8 +147,7 @@ async function resolvePortablePluginLaunch(pluginRoot) {
   );
   assert.deepEqual(server.args, ["--mcp", "symbol|extended"]);
   const command = path.resolve(pluginRoot, server.command);
-  await fs.access(command);
-  return { command, cwd: pluginRoot, args: server.args, manifestPath, mcpConfigPath };
+  return resolvedPluginLaunch(pluginRoot, command, server.args, manifestPath, mcpConfigPath);
 }
 
 async function resolveCodexPluginLaunch(pluginRoot) {
@@ -184,14 +178,7 @@ async function resolveCodexPluginLaunch(pluginRoot) {
   assert.equal(server.tool_timeout_sec, 300);
   const installedPackageRoot = path.resolve(pluginRoot, server.cwd);
   const command = path.resolve(installedPackageRoot, server.command);
-  await fs.access(command);
-  return {
-    command,
-    cwd: pluginRoot,
-    args: server.args,
-    manifestPath,
-    mcpConfigPath,
-  };
+  return resolvedPluginLaunch(pluginRoot, command, server.args, manifestPath, mcpConfigPath);
 }
 
 async function resolveClaudePluginLaunch(pluginRoot) {
@@ -213,8 +200,12 @@ async function resolveClaudePluginLaunch(pluginRoot) {
   );
   assert.deepEqual(server.args, ["--mcp", "symbol|extended"]);
   const command = path.join(pluginRoot, "bin", "bifrost-launcher.mjs");
+  return resolvedPluginLaunch(pluginRoot, command, server.args, manifestPath, mcpConfigPath);
+}
+
+async function resolvedPluginLaunch(pluginRoot, command, args, manifestPath, mcpConfigPath) {
   await fs.access(command);
-  return { command, cwd: pluginRoot, args: server.args, manifestPath, mcpConfigPath };
+  return { command, cwd: pluginRoot, args, manifestPath, mcpConfigPath };
 }
 
 async function assertEmptyCache(directory) {
@@ -334,7 +325,7 @@ async function assertCodexSandboxWorkspaceBinding(codexLaunch, workspaceRoot, en
   await assertWorkspaceCache(workspaceRoot, "Codex sandbox metadata");
 }
 
-async function assertMcpRootsWorkspaceBinding(codexLaunch, workspaceRoot, env, coreWithoutRules = false) {
+async function assertMcpRootsWorkspaceBinding(codexLaunch, workspaceRoot, env) {
   const { logs } = await withMcpServer(codexLaunch, env, async ({ child, reader }) => {
     const initialize = await roundTrip(child, reader, {
       jsonrpc: "2.0",
@@ -387,79 +378,32 @@ async function assertMcpRootsWorkspaceBinding(codexLaunch, workspaceRoot, env, c
     assert.equal(catalogContent?.schema_version, 2);
     const packs = catalogContent?.packs;
     assert.ok(Array.isArray(packs), "MCP list_policies returned the wrong catalog envelope");
-    if (coreWithoutRules) {
-      assert.deepEqual(packs, [], "v0.13 core MCP implicitly supplied product rules");
-      await assert.rejects(roundTrip(child, reader, {
-        jsonrpc: "2.0", id: 4, method: "tools/call",
-        params: { name: "run_policy", arguments: {
-          policy_ids: ["bifrost.correctness.dynamic-evaluation"],
-          evaluation_date: "2026-07-28", fail_on: "never",
-        } },
-      }), /MCP tools\/call failed:.*"code":-32602.*unknown built-in policy id.*bifrost\.correctness\.dynamic-evaluation/u,
-      "core MCP must reject an absent product rule as an invalid selector");
-      // Exercise the evaluator through an explicit host-authored file while
-      // keeping the core catalog empty. This is not pack-release admission.
-      await fs.writeFile(path.join(workspaceRoot, "host-smoke.rqlp"), `(policy
-        :schema-version 1 :id "host.smoke.dynamic-evaluation"
-        :name "Host smoke" :message "Review dynamic evaluation" :severity warning
-        :analysis (analysis :type match :selector
-          (rql :schema-version 1 (language python (call :callee (name "eval"))))))\n`);
-      const explicit = await roundTrip(child, reader, {
-        jsonrpc: "2.0", id: 5, method: "tools/call",
-        params: { name: "run_policy", arguments: {
-          policy_files: ["host-smoke.rqlp"], evaluation_date: "2026-07-28", fail_on: "never",
-        } },
-      });
-      assert.equal(explicit.result?.isError, false, `explicit host policy failed: ${JSON.stringify(explicit)}`);
-      assert.equal(explicit.result?.structuredContent?.report?.runs?.[0]?.findings?.[0]?.primary?.path, "BifrostPolicySmoke.py");
-      return;
-    }
-    const codeSmells = packs.find((pack) => pack.id === "bifrost.code-smells");
-    const security = packs.find((pack) => pack.id === "bifrost.security");
-    assert.ok(codeSmells, "MCP list_policies omitted bifrost.code-smells");
-    assert.ok(security, "MCP list_policies omitted bifrost.security");
-    assert.ok(
-      Array.isArray(codeSmells.policies) && codeSmells.policies.length > 0,
-      "MCP list_policies returned no code-smell policies",
-    );
-    assert.ok(
-      Array.isArray(security.policies) && security.policies.length > 0,
-      "MCP list_policies returned no security policies",
-    );
-    assert.ok(
-      security.policies.some((entry) => entry.id === "bifrost.security.java.servlet-parameter-to-jdbc"),
-      "MCP list_policies omitted the Servlet-to-JDBC security policy",
-    );
-    assert.ok(
-      security.policies.some((entry) => entry.id === "bifrost.security.java.system-getenv-to-runtime-exec"),
-      "MCP list_policies omitted the environment-to-command security policy",
-    );
-    const policies = codeSmells.policies;
-    const policyIds = policies.map((entry) => entry.id);
-    assert.equal(new Set(policyIds).size, policyIds.length, "MCP list_policies returned duplicate policy IDs");
-    assert.ok(
-      policyIds.includes("bifrost.correctness.dynamic-evaluation"),
-      `MCP list_policies omitted the policy exercised by this smoke: ${JSON.stringify(policyIds)}`
-    );
-    const policy = await roundTrip(child, reader, {
-      jsonrpc: "2.0",
-      id: 4,
-      method: "tools/call",
-      params: {
-        name: "run_policy",
-        arguments: {
-          policy_ids: ["bifrost.correctness.dynamic-evaluation"],
-          evaluation_date: "2026-07-28",
-          fail_on: "never",
-        },
-      },
+    // The engine ships no product rules, so the core catalog is empty for every
+    // staged version; hosts supply a verified external catalog.
+    assert.deepEqual(packs, [], "core MCP implicitly supplied product rules");
+    await assert.rejects(roundTrip(child, reader, {
+      jsonrpc: "2.0", id: 4, method: "tools/call",
+      params: { name: "run_policy", arguments: {
+        policy_ids: ["bifrost.correctness.dynamic-evaluation"],
+        evaluation_date: "2026-07-28", fail_on: "never",
+      } },
+    }), /MCP tools\/call failed:.*"code":-32602.*unknown built-in policy id.*bifrost\.correctness\.dynamic-evaluation/u,
+    "core MCP must reject an absent product rule as an invalid selector");
+    // Exercise the evaluator through an explicit host-authored file while
+    // keeping the core catalog empty. This is not pack-release admission.
+    await fs.writeFile(path.join(workspaceRoot, "host-smoke.rqlp"), `(policy
+      :schema-version 1 :id "host.smoke.dynamic-evaluation"
+      :name "Host smoke" :message "Review dynamic evaluation" :severity warning
+      :analysis (analysis :type match :selector
+        (rql :schema-version 1 (language python (call :callee (name "eval"))))))\n`);
+    const explicit = await roundTrip(child, reader, {
+      jsonrpc: "2.0", id: 5, method: "tools/call",
+      params: { name: "run_policy", arguments: {
+        policy_files: ["host-smoke.rqlp"], evaluation_date: "2026-07-28", fail_on: "never",
+      } },
     });
-    assert.equal(policy.result?.isError, false, `MCP built-in policy run returned an error: ${JSON.stringify(policy)}`);
-    assert.equal(policy.result?.structuredContent?.status, "clean");
-    assert.equal(
-      policy.result?.structuredContent?.report?.runs?.[0]?.findings?.[0]?.primary?.path,
-      "BifrostPolicySmoke.py"
-    );
+    assert.equal(explicit.result?.isError, false, `explicit host policy failed: ${JSON.stringify(explicit)}`);
+    assert.equal(explicit.result?.structuredContent?.report?.runs?.[0]?.findings?.[0]?.primary?.path, "BifrostPolicySmoke.py");
   });
 
   assert.match(logs, /source=roots\/list/);

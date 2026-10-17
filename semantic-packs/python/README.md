@@ -1,8 +1,19 @@
 # Python standard-library semantic packs
 
+> Legacy transition copy: product pack authoring belongs in `bifrost-packs`
+> or the private premium pack repository. Follow [the placement policy](../../CONTRIBUTING.md#release-process).
+> Sources here are frozen pending verified v0.13.0 release and dependency migration.
+> The technical notes below describe retained contracts and test tooling.
+
+The reviewed socket and XML sink declarations are documented in
+[`README-security-sinks.md`](README-security-sinks.md).
+
 This directory pins the source inputs used to build Bifrost's published Python
-standard-library declaration and reviewed assertion packs. Generated manifests
-and shards are release assets; they are not checked into Git.
+standard-library declaration and reviewed assertion packs. The generated
+Typeshed manifests and shards are release assets; they are not checked into
+Git. Bifrost's narrower reviewed API declaration packs are compiled into the
+legacy checked-in embedded registry, retained during the transition.
+This is not permission to author or register new product packs here.
 
 The pinned-spec schema is ecosystem neutral and is documented in
 `semantic-packs/jvm/README.md`. This directory adds the first `python_stub`
@@ -12,7 +23,7 @@ typeshed revision.
 ## The pinned slice
 
 `typeshed-stdlib-2026.8.31.json` pins typeshed revision
-`1620e225476597f34177351ef913dc8390dade30` and lists 53 stub files. The
+`1620e225476597f34177351ef913dc8390dade30` and lists 63 stub files. The
 slice is deliberately bounded to common runtime and standard-library surfaces:
 
 | Module | Pinned stub files |
@@ -36,6 +47,8 @@ slice is deliberately bounded to common runtime and standard-library surfaces:
 | `errno` | `errno.pyi` |
 | `functools` | `functools.pyi` |
 | `gettext` | `gettext.pyi` |
+| `hashlib` | `hashlib.pyi` |
+| `hmac` | `hmac.pyi` |
 | `importlib` | `importlib/__init__.pyi`, `importlib/metadata/__init__.pyi` |
 | `inspect` | `inspect.pyi` |
 | `io` | `io.pyi` |
@@ -48,6 +61,8 @@ slice is deliberately bounded to common runtime and standard-library surfaces:
 | `random` | `random.pyi` |
 | `shlex` | `shlex.pyi` |
 | `shutil` | `shutil.pyi` |
+| `socket` | `socket.pyi` |
+| `ssl` | `ssl.pyi` |
 | `stat` | `stat.pyi` |
 | `struct` | `struct.pyi` |
 | `sys` | `sys/__init__.pyi` |
@@ -59,6 +74,31 @@ slice is deliberately bounded to common runtime and standard-library surfaces:
 | `unittest` | `unittest/__init__.pyi`, `unittest/async_case.pyi`, `unittest/case.pyi` |
 | `warnings` | `warnings.pyi` |
 | `weakref` | `weakref.pyi` |
+| `xml` | `xml/__init__.pyi` |
+| `xml.dom` | `xml/dom/__init__.pyi`, `xml/dom/minidom.pyi` |
+| `xml.etree` | `xml/etree/__init__.pyi`, `xml/etree/ElementTree.pyi` |
+| `xml.sax` | `xml/sax/__init__.pyi` |
+
+The embedded reviewed declaration packs add reviewed callable declarations
+used by security policies: `os.chmod/open/mkdir/makedirs`, `ssl.wrap_socket` on
+CPython 3.10-3.11, `hmac.new`, `hashlib.md5/sha1/sha256`, the `re` functions
+`compile`, `match`, `search`, `fullmatch`, `sub`, `split`, `findall`, and
+`finditer`, `re.Pattern.search`, `textwrap.shorten`, the standard-library
+`logging` module functions and `logging.Logger` methods, `builtins.print`,
+`json.dump`, `pickle.dump`, `marshal.dump`, `io.TextIOWrapper.write`,
+`pathlib.Path.chmod/write_text/write_bytes`, `smtplib.SMTP.login`,
+`ftplib.FTP.login`, `socket.socket.bind`, and the three XML parser entry
+points, and `urllib.parse.urlparse` with its `ParseResult.netloc` and
+`ParseResult.hostname` fields. The socket, XML, regex, logging, file-output,
+credential, and URL-control declaration facts are paired with reviewed
+security-sink summaries where external effects apply; regex input transfers
+remain used by polynomial ReDoS analysis. These embedded packs declare only
+the named callable families; the generated Typeshed pack carries the wider
+stub surface. A reviewed complete declaration can include positional or
+keyword rest formals, while call-site spreads remain incomplete because their
+expanded actuals are unknown. Overlapping partial Typeshed candidates can also
+make an exact binding query incomplete; the Python sensitive-data fixtures
+keep pinned only the cases whose evidence still has those gaps.
 
 The pack is one slice of the standard library, not the standard library. It
 publishes nothing about the other standard-library modules

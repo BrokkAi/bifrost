@@ -1,25 +1,27 @@
 mod adapter;
 mod artifact;
+pub(crate) mod build_evidence;
 mod cache;
 mod clones;
 pub(crate) mod dependency_discovery;
 pub(crate) mod diagnostics;
+mod external_field_memory;
+mod failure_handlers;
 mod handler_dispatch;
 mod imports;
-#[cfg(any(test, feature = "test-support"))]
 pub(super) mod native_call_relations;
-#[cfg(any(test, feature = "test-support"))]
+pub(super) mod native_graph;
+pub(super) mod native_outgoing;
 pub(super) mod native_points;
 #[cfg(test)]
 mod native_qualifier_tests;
-#[cfg(any(test, feature = "test-support"))]
 pub(super) mod native_rename;
-#[cfg(any(test, feature = "test-support"))]
 pub(super) mod native_usages;
+pub(crate) mod package_function_value;
 pub(crate) mod package_identity;
-#[cfg(any(test, feature = "test-support"))]
 pub(super) mod selected_reverse;
 mod semantic;
+mod source_identity;
 pub(crate) mod source_publication;
 pub(crate) mod source_storage;
 pub(crate) mod type_identity_proof;
@@ -29,20 +31,25 @@ use brokk_bifrost_core::analyzer::query_token::QueryToken;
 
 use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
+mod call_applicability;
+
 use crate::analyzer::languages::{
     BoundedReceiverQuery, DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof,
     DeadCodeRouting, DeadCodeSupport, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx,
     LanguageEdgeFailure, LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport,
-    StructuralReceiverResolver, analyzable_file_count, fqn_bulk_nodes,
+    ModeledExternalPackageIdentity, PredeclaredBuiltinQueryStep, StablePackageFunctionValueProof,
+    StructuralReceiverResolver, fqn_bulk_nodes, ready_preflight,
 };
 use crate::analyzer::store::LimitedQueryRows;
+#[cfg(test)]
+use crate::analyzer::type_relations::TypeRelationKind;
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_go_bounded,
 };
 use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_go_type_bounded};
+use crate::analyzer::usages::go_graph::build_go_usage_edge_weights;
 use crate::analyzer::usages::go_graph::{
-    GoUsageGraphStrategy, build_go_usage_edge_weights, build_go_usage_edges,
-    go_implicit_entry_point,
+    GoUsageGraphStrategy, build_go_usage_edges, go_implicit_entry_point,
 };
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::{
@@ -54,45 +61,89 @@ use crate::analyzer::{
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
 
 pub(crate) use adapter::GoAdapter;
 pub use artifact::{GoDependencyPackAdapter, GoModulePackProducer, GoPinnedPackage};
+pub use brokk_bifrost_go::structural::{GoCallResultUseIndex, go_call_result_use};
+pub use external_field_memory::{
+    GoAggregateOperand, GoAggregateSourceBinding, GoExternalField, GoExternalFieldGap,
+    GoExternalFieldMemory, GoExternalFieldQuery, GoFieldReplayRoute,
+    bind_go_aggregate_operand_source, bind_go_external_field_source,
+    go_aggregate_object_is_singleton, observe_go_aggregate_object, resolve_go_external_field,
+};
+pub use failure_handlers::go_failure_handler_body_shapes;
 pub use handler_dispatch::{
     GoHttpHandlerDispatch, GoHttpHandlerOpenReason, go_http_handler_dispatch,
+};
+pub use source_identity::{
+    GoAnonymousCallableIdentityBindingError, GoBoundAnonymousCallableIdentity,
+    GoCatalogAnonymousCallableBindingError, GoDeclaredTypeShape, GoDeclaredTypeUnknown,
+    GoFunctionParameterShape, GoFunctionTypeShape, GoOuterTypeShape, GoReceiverOwnerUnknown,
+    GoReceiverTypeOwner, GoSourceAnchor, GoSourceByteRange, GoSourceDeclarationIdentity,
+    GoSourceDeclarationKind, GoSourceIdentityAnalysis, GoSourceIdentityGap,
+    GoSourceIdentityGapKind, GoSourceName, GoSourceTypeNode, GoStructFieldIdentity,
+    analyze_go_package_source_identities, bind_catalog_go_anonymous_callable_target,
+    bind_go_anonymous_callable_identity,
 };
 // The Go declaration walk lives in the go crate; the rest of analysis (artifact,
 // semantic) still reaches its helpers through `super::declarations::`.
 pub(crate) use brokk_bifrost_go::declarations;
 pub(crate) use brokk_bifrost_go::declarations::{
-    determine_go_package_name, go_structured_type_identity_bounded,
+    determine_go_package_name, go_structured_type_identity_bounded, try_determine_go_package_name,
 };
+use brokk_bifrost_go::graph::resolver::GoEdgeIndex;
 use brokk_bifrost_go::graph::resolver::{
-    GoEdgeIndex, GoGraphBuildError, GoGraphSource, GoPackageClauseProvider, GoWorkspaceIndexes,
+    GoGraphBuildError, GoGraphSource, GoPackageClauseProvider, GoWorkspaceIndexes,
     build_go_workspace_indexes,
 };
 use brokk_bifrost_go::hierarchy::GoHierarchyIndex;
 pub(crate) use brokk_bifrost_go::packages;
-pub(crate) use brokk_bifrost_go::packages::GO_MODULE_SCOPE_SEGMENT;
+pub(crate) use brokk_bifrost_go::packages::{GO_MODULE_SCOPE_SEGMENT, is_go_module_field};
 use brokk_bifrost_go::packages::{canonical_go_package_name, invalidate_nearest_go_module_cache};
 use brokk_bifrost_go::test_detection::detect_go_test_assertion_smells;
 use cache::GoMemoCaches;
 use clones::build_go_clone_candidate_data;
 pub use dependency_discovery::resolve_go_semantic_pack_dependencies;
 pub use semantic::{
+    GoCallableCaptureBindingError, GoCaptureSlot, GoCaptureSlotPlan,
+    GoMaterializedAnonymousCallable, materialize_go_anonymous_callable,
     reference_assertion_payload_type_is_exact, workspace_reference_assertion_accepts_payload,
 };
 pub use type_identity_proof::{
     GO_MODELED_RESULT_BINDING_TYPE_PROOF_MAX_SOURCE_BYTES,
     GO_MODELED_RESULT_BINDING_TYPE_PROOF_MAX_STEPS,
     go_modeled_result_binding_type_identity_is_exact,
-    go_modeled_result_binding_type_identity_proof_work,
+    go_modeled_result_binding_type_identity_proof_work, go_native_error_function_value_obligation,
+    go_native_error_result_obligation, go_native_obligation_exclusion,
 };
 
 pub struct GoAnalyzer {
     inner: TreeSitterAnalyzer<GoAdapter>,
     memo_caches: GoMemoCaches,
     native_context_profile: std::sync::RwLock<Option<[u8; 32]>>,
+}
+
+pub(super) fn go_import_binding_pairs(
+    root: tree_sitter::Node<'_>,
+    source: &str,
+    mut package_name: impl FnMut(&str) -> Option<String>,
+) -> Vec<(String, String)> {
+    declarations::collect_go_import_infos(root, source)
+        .into_iter()
+        .filter_map(|info| {
+            let path = info.path.as_ref()?.render_segments("/");
+            if path.is_empty() {
+                return None;
+            }
+            let local = info
+                .alias
+                .or_else(|| package_name(&path))
+                .or(info.identifier)?;
+            (!matches!(local.as_str(), "_" | ".")).then_some((local, path))
+        })
+        .collect()
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -107,6 +158,33 @@ pub fn persist_live_go_sources_for_test(analyzer: &GoAnalyzer) {
             "persist selected Go source facts for {file}"
         );
     }
+    // Re-persistence withdraws summaries that depended on the replaced blobs.
+    // Reconcile under the same selected snapshot and profile as production.
+    let snapshots = analyzer.inner.selected_workspace_snapshots();
+    let snapshot = snapshots.get("go").expect("selected Go snapshot");
+    let profile = analyzer
+        .native_context_profile()
+        .expect("selected Go native context profile");
+    let store = analyzer.inner.analyzer_store();
+    let context = store
+        .selected_go_context(snapshot, &profile)
+        .expect("read selected Go context")
+        .expect("selected Go package context");
+    let report = store
+        .reconcile_unit_summaries(
+            snapshot,
+            crate::analyzer::store::go_unit_summaries::GoUnitSummaries {
+                context_id: context.context_id,
+                profile,
+            },
+            &crate::CancellationToken::new(),
+        )
+        .expect("reconcile summaries after persisting selected Go sources");
+    assert!(
+        report.failed.is_empty(),
+        "selected Go summary reconciliation failed: {:?}",
+        report.failed
+    );
 }
 
 impl Clone for GoAnalyzer {
@@ -133,6 +211,28 @@ impl brokk_bifrost_go::source_facts::GoSourceFactProvider for GoAnalyzer {
 }
 
 impl GoAnalyzer {
+    pub(crate) fn update_all_with_progress(
+        &self,
+        progress: Option<crate::analyzer::BuildProgress>,
+    ) -> Self {
+        invalidate_nearest_go_module_cache();
+        let inner = self.inner.update_all_with_progress(progress);
+        Self {
+            inner,
+            memo_caches: GoMemoCaches::new(self.memo_caches.budget_bytes()),
+            native_context_profile: std::sync::RwLock::new(self.native_context_profile()),
+        }
+        .with_source_inventory()
+    }
+
+    /// The selected Go snapshot the unit-summary differential test reads.
+    #[cfg(test)]
+    pub(crate) fn selected_snapshot_for_test(
+        &self,
+    ) -> Option<crate::analyzer::store::WorkspaceSnapshotId> {
+        self.inner.selected_workspace_snapshots().get("go").cloned()
+    }
+
     pub(crate) fn native_context_profile(&self) -> Option<[u8; 32]> {
         *self
             .native_context_profile
@@ -174,8 +274,36 @@ impl GoAnalyzer {
             self.inner.project().root(),
             &crate::CancellationToken::new(),
         )? {
-            GoContextPublicationOutcome::Published(_) => {
+            GoContextPublicationOutcome::Published(identity) => {
                 assert!(self.activate_native_context_profile(&snapshot, profile));
+                // The summaries of this publication's units, after the head is
+                // published and before any request reads them.
+                // Optional by design: a failure leaves readers on their fallback
+                // and must not fail the publication that already succeeded.
+                let timing =
+                    crate::profiling::scope("go.unit_summaries.reconcile.source_inventory");
+                let reconciliation = self.inner.analyzer_store().reconcile_unit_summaries(
+                    &snapshot,
+                    crate::analyzer::store::go_unit_summaries::GoUnitSummaries {
+                        context_id: identity.context_id,
+                        profile,
+                    },
+                    &crate::CancellationToken::new(),
+                );
+                drop(timing);
+                crate::profiling::note_with(|| {
+                    format!("go.unit_summaries source_inventory reconciled={reconciliation:?}")
+                });
+                match &reconciliation {
+                    Ok(reconciliation) if reconciliation.failed.is_empty() => {}
+                    Ok(reconciliation) => eprintln!(
+                        "go.unit_summary_failed: Go unit summaries were not published for {:?}",
+                        reconciliation.failed
+                    ),
+                    Err(error) => eprintln!(
+                        "go.unit_summary_failed: Go unit summaries were not reconciled: {error}"
+                    ),
+                }
             }
             GoContextPublicationOutcome::InputsChanged | GoContextPublicationOutcome::Cancelled => {
             }
@@ -219,20 +347,24 @@ impl GoAnalyzer {
         store_context: AnalyzerStoreContext,
         progress: Option<BuildProgress>,
     ) -> Result<Self, crate::analyzer::store::StoreError> {
-        let memo_budget = config.memo_cache_budget_bytes();
-        invalidate_nearest_go_module_cache();
-        let inner = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
-            project,
-            GoAdapter,
+        let analyzer = TreeSitterAnalyzer::try_wrap_with_config(
             config,
-            store_context,
-            progress,
+            |config| {
+                invalidate_nearest_go_module_cache();
+                TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
+                    project,
+                    GoAdapter,
+                    config,
+                    store_context,
+                    progress,
+                )
+            },
+            |inner, memo_budget| Self {
+                inner,
+                memo_caches: GoMemoCaches::new(memo_budget),
+                native_context_profile: std::sync::RwLock::new(None),
+            },
         )?;
-        let analyzer = Self {
-            inner,
-            memo_caches: GoMemoCaches::new(memo_budget),
-            native_context_profile: std::sync::RwLock::new(None),
-        };
         analyzer.refresh_source_inventory()?;
         Ok(analyzer)
     }
@@ -250,18 +382,8 @@ impl GoAnalyzer {
         limit: usize,
         continue_query: impl FnMut() -> bool,
     ) -> LimitedQueryRows<CodeUnit> {
-        let Some(identifier) = fqn.rsplit('.').next().filter(|name| !name.is_empty()) else {
-            return LimitedQueryRows::complete(Vec::new(), 0);
-        };
-        let mut candidates =
-            self.inner
-                .lookup_declarations_by_identifier_limited(identifier, limit, continue_query);
-        if candidates.complete {
-            candidates
-                .rows
-                .retain(|candidate| candidate.fq_name() == fqn);
-        }
-        candidates
+        self.inner
+            .lookup_declarations_by_fqn_limited(fqn, limit, continue_query)
     }
 
     pub(crate) fn member_candidates_for_owner_limited(
@@ -272,15 +394,8 @@ impl GoAnalyzer {
         continue_query: impl FnMut() -> bool,
     ) -> LimitedQueryRows<CodeUnit> {
         let exact_fqn = format!("{owner_fqn}.{name}");
-        let mut candidates =
-            self.inner
-                .lookup_declarations_by_identifier_limited(name, limit, continue_query);
-        if candidates.complete {
-            candidates
-                .rows
-                .retain(|candidate| candidate.fq_name() == exact_fqn);
-        }
-        candidates
+        self.inner
+            .lookup_declarations_by_fqn_limited(&exact_fqn, limit, continue_query)
     }
 
     pub(crate) fn import_info_limited(
@@ -292,20 +407,20 @@ impl GoAnalyzer {
         self.inner.import_info_of_limited(token, file, limit)
     }
 
-    pub(crate) fn signature_metadata_limited(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        pub(crate) fn signature_metadata_limited(
         &self,
         code_unit: &CodeUnit,
         limit: usize,
-    ) -> LimitedQueryRows<SignatureMetadata> {
-        self.inner.signature_metadata_limited(code_unit, limit)
+    ) -> LimitedQueryRows<SignatureMetadata>;
     }
 
-    pub(crate) fn signatures_limited(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        pub(crate) fn signatures_limited(
         &self,
         code_unit: &CodeUnit,
         limit: usize,
-    ) -> LimitedQueryRows<String> {
-        self.inner.signatures_limited(code_unit, limit)
+    ) -> LimitedQueryRows<String>;
     }
 
     pub(crate) fn ranges_limited(
@@ -326,14 +441,14 @@ impl GoAnalyzer {
         canonical_go_package_name(file, &declared)
     }
 
-    #[doc(hidden)]
-    pub fn reset_full_hydration_count_for_test(&self) {
-        self.inner.reset_full_hydration_count_for_test();
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        #[doc(hidden)]
+        pub fn reset_full_hydration_count_for_test(&self);
     }
 
-    #[doc(hidden)]
-    pub fn full_hydration_count_for_test(&self) -> usize {
-        self.inner.full_hydration_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        #[doc(hidden)]
+        pub fn full_hydration_count_for_test(&self) -> usize;
     }
 
     #[doc(hidden)]
@@ -356,6 +471,10 @@ impl GoAnalyzer {
         })
     }
 
+    pub(crate) fn same_module(&self, left: &ProjectFile, right: &ProjectFile) -> bool {
+        self.workspace_path_index().same_module(left, right)
+    }
+
     pub(crate) fn workspace_package_inventory_complete(&self) -> bool {
         self.inner.workspace_package_inventory_complete()
     }
@@ -364,8 +483,62 @@ impl GoAnalyzer {
         self.inner.workspace_declaration_identities_authoritative()
     }
 
+    /// Whether an indexed Go package-scope declaration shadows a predeclared
+    /// builtin, returning `None` when the declaration index cannot prove an
+    /// answer. The lookup is bounded and hydrates only rows for `name`.
+    /// Check whether a same-package declaration shadows a predeclared builtin.
+    ///
+    /// `None` means the bounded declaration lookup could not prove absence or
+    /// presence. `continue_query` lets workspace consumers charge and cancel
+    /// candidate visits using their own query budget.
+    pub fn predeclared_builtin_shadow_status_limited(
+        &self,
+        relative_path: &str,
+        name: &str,
+        limit: usize,
+        continue_query: impl FnMut() -> bool,
+    ) -> Option<bool> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return None;
+        }
+        let file = self
+            .inner
+            .project()
+            .file_by_rel_path(Path::new(relative_path))?;
+        let declared_package = self.package_clause_of(&file)?;
+        let package = self
+            .workspace_path_index()
+            .canonical_package_name(&file, &declared_package);
+        let candidates =
+            self.inner
+                .lookup_declarations_by_identifier_limited(name, limit, continue_query);
+        let has_package_declaration = candidates.rows.iter().any(|candidate| {
+            if candidate.terminal_name() != name || candidate.package_name() != package {
+                return false;
+            }
+            let top_level_function =
+                candidate.is_function() && candidate.declaration_segment_count() == 1;
+            let top_level_type = candidate.is_class() && candidate.declaration_segment_count() == 1;
+            let package_variable_or_type = (candidate.is_field() || candidate.is_class())
+                && candidate.declaration_segment_count() == 2
+                && candidate
+                    .fq_segment_texts()
+                    .get(candidate.package_segment_count())
+                    .is_some_and(|segment| segment == GO_MODULE_SCOPE_SEGMENT);
+            top_level_function || top_level_type || package_variable_or_type
+        });
+        if has_package_declaration {
+            Some(true)
+        } else if candidates.complete {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn graph_inventory_complete(&self) -> bool {
-        self.inner.indexed_source_inventory_complete()
+        self.workspace_path_index().is_complete()
+            && self.inner.indexed_source_inventory_complete()
             && self.workspace_declaration_identities_authoritative()
     }
 
@@ -429,11 +602,6 @@ impl GoAnalyzer {
     pub(crate) fn usage_edge_index(&self) -> Result<Arc<GoEdgeIndex>, GoGraphBuildError> {
         self.workspace_indexes()
             .map(|indexes| Arc::clone(&indexes.edges))
-    }
-
-    #[doc(hidden)]
-    pub fn usage_edge_index_build_count_for_test(&self) -> usize {
-        self.memo_caches.workspace_indexes_build_count()
     }
 
     /// Build count for the shared source-authoritative hierarchy/edge product.
@@ -598,10 +766,8 @@ pub fn go_member_family(
     member: &CodeUnit,
     cancellation: Option<&crate::cancellation::CancellationToken>,
 ) -> crate::analyzer::usages::MemberFamilyAnswer {
-    use crate::analyzer::structural::resolution::{
-        MemberFamilyCapability, MemberFamilyOutcome, MemberFamilyReason, MethodFamilyRelation,
-    };
-    use crate::analyzer::usages::{MemberFamilyAnswer, MemberFamilyEdge};
+    use crate::analyzer::structural::resolution::{MemberFamilyCapability, MemberFamilyReason};
+    use crate::analyzer::usages::MemberFamilyAnswer;
     use brokk_bifrost_go::hierarchy::{GoMemberFamily, GoMemberFamilyEdge};
 
     let capability = go_member_family_capability(member);
@@ -640,37 +806,16 @@ pub fn go_member_family(
 
     // Go promotion and satisfaction match whole method keys, and Go has no
     // overloading, so a member is singled out by structure alone.
-    let edge = |edge: GoMemberFamilyEdge, relation: MethodFamilyRelation| MemberFamilyEdge {
-        target: edge.member,
-        owner: edge.owner,
-        relation,
-        depth: 1,
-        arity_unique: true,
-    };
-    let roots = if implements.is_empty() {
-        vec![member.clone()]
-    } else {
-        let mut roots: Vec<CodeUnit> = implements.iter().map(|edge| edge.member.clone()).collect();
-        roots.sort();
-        roots.dedup();
-        roots
-    };
-    let edges = implements
-        .into_iter()
-        .map(|value| edge(value, MethodFamilyRelation::Implements))
-        .chain(
-            implemented_by
-                .into_iter()
-                .map(|value| edge(value, MethodFamilyRelation::ImplementedBy)),
-        )
-        .collect();
-    MemberFamilyAnswer {
+    crate::analyzer::usages::member_family::proven_member_family_answer(
         capability,
-        outcome: MemberFamilyOutcome::Proven,
-        reason: None,
-        edges,
-        roots,
-    }
+        member,
+        implements
+            .into_iter()
+            .map(|edge: GoMemberFamilyEdge| (edge.member, edge.owner)),
+        implemented_by
+            .into_iter()
+            .map(|edge: GoMemberFamilyEdge| (edge.member, edge.owner)),
+    )
 }
 
 impl TestDetectionProvider for GoAnalyzer {}
@@ -678,70 +823,69 @@ impl TestDetectionProvider for GoAnalyzer {}
 use crate::analyzer::CodeUnitIndex;
 
 impl CodeUnitIndex for GoAnalyzer {
-    /// Forwarded so the request-scoped memo on the inner analyzer answers
-    /// (#2679); the trait default would rebuild uncached per call.
-    fn class_range_index(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        /// Forwarded so the request-scoped memo on the inner analyzer answers
+        /// (#2679); the trait default would rebuild uncached per call.
+        fn class_range_index(
         &self,
         file: &ProjectFile,
-    ) -> std::sync::Arc<brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex> {
-        self.inner.class_range_index(file)
+    ) -> std::sync::Arc<brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex>;
     }
 
-    fn enclosing_code_unit(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn enclosing_code_unit(
         &self,
         file: &ProjectFile,
         range: &crate::analyzer::Range,
-    ) -> Option<CodeUnit> {
-        self.inner.enclosing_code_unit(file, range)
+    ) -> Option<CodeUnit>;
     }
 
-    fn enclosing_code_unit_for_lines(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn enclosing_code_unit_for_lines(
+            &self,
+            file: &ProjectFile,
+            start_line: usize,
+            end_line: usize,
+        ) -> Option<CodeUnit>;
+    }
+
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit>;
+    }
+
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn summary_file_projection(
         &self,
         file: &ProjectFile,
-        start_line: usize,
-        end_line: usize,
-    ) -> Option<CodeUnit> {
-        self.inner
-            .enclosing_code_unit_for_lines(file, start_line, end_line)
+    ) -> Option<Arc<crate::analyzer::SummaryFileProjection>>;
     }
 
-    fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
-        self.inner.top_level_declarations(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn analyzed_files(&self) -> Vec<ProjectFile>;
     }
 
-    fn summary_file_projection(
-        &self,
-        file: &ProjectFile,
-    ) -> Option<Arc<crate::analyzer::SummaryFileProjection>> {
-        self.inner.summary_file_projection(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn indexed_source(&self, file: &ProjectFile) -> Option<String>;
     }
 
-    fn analyzed_files(&self) -> Vec<ProjectFile> {
-        self.inner.analyzed_files()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn location_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit>;
     }
 
-    fn indexed_source(&self, file: &ProjectFile) -> Option<String> {
-        self.inner.indexed_source(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn location_ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range>;
     }
 
-    fn location_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
-        self.inner.location_declarations(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn indexed_source_matches(&self, file: &ProjectFile, source: &str) -> bool;
     }
 
-    fn location_ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
-        self.inner.location_ranges(code_unit)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn is_analyzed(&self, file: &ProjectFile) -> bool;
     }
 
-    fn indexed_source_matches(&self, file: &ProjectFile, source: &str) -> bool {
-        self.inner.indexed_source_matches(file, source)
-    }
-
-    fn is_analyzed(&self, file: &ProjectFile) -> bool {
-        self.inner.is_analyzed(file)
-    }
-
-    fn retain_analyzed(&self, candidates: &[ProjectFile]) -> Vec<ProjectFile> {
-        self.inner.retain_analyzed(candidates)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn retain_analyzed(&self, candidates: &[ProjectFile]) -> Vec<ProjectFile>;
     }
 
     fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
@@ -755,28 +899,28 @@ impl CodeUnitIndex for GoAnalyzer {
         self.inner.declarations_of_files(files)
     }
 
-    fn declarations_sharing_name(&self, unit: &CodeUnit) -> Vec<CodeUnit> {
-        self.inner.declarations_sharing_name(unit)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn declarations_sharing_name(&self, unit: &CodeUnit) -> Vec<CodeUnit>;
     }
 
-    fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
-        self.inner.declarations(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit>;
     }
 
     fn definitions(&self, fq_name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         self.inner.definitions(fq_name)
     }
 
-    fn prefetch_definitions(&self, fq_names: &[String]) {
-        self.inner.prefetch_definitions(fq_names);
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn prefetch_definitions(&self, fq_names: &[String]);
     }
 
-    fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        self.inner.direct_children(code_unit)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit>;
     }
 
-    fn ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
-        self.inner.ranges(code_unit)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range>;
     }
 
     fn ranges_with_limit(
@@ -793,51 +937,32 @@ impl CodeUnitIndex for GoAnalyzer {
         self.inner.signatures(code_unit)
     }
 
-    fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
-        self.inner.signature_metadata(code_unit)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata>;
     }
 
-    fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
-        self.inner.get_analyzed_files()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn languages(&self) -> BTreeSet<Language>;
     }
 
-    fn languages(&self) -> BTreeSet<Language> {
-        self.inner.languages()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn project(&self) -> &dyn Project;
     }
 
-    fn project(&self) -> &dyn Project {
-        self.inner.project()
-    }
-
-    fn get_all_declarations(&self) -> Vec<CodeUnit> {
-        self.inner.get_all_declarations()
-    }
-
-    fn get_definitions(&self, fq_name: &str) -> Vec<CodeUnit> {
-        self.inner.get_definitions(fq_name)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn get_all_declarations(&self) -> Vec<CodeUnit>;
     }
 
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
-        let skeleton = self.inner.get_skeleton(code_unit)?;
-        if code_unit.is_class() && !skeleton.trim_start().starts_with("type ") {
-            Some(format!("type {skeleton}"))
-        } else {
-            Some(skeleton)
-        }
+        self.inner
+            .get_skeleton(code_unit)
+            .map(|skeleton| go_type_skeleton(code_unit, skeleton))
     }
 
     fn get_skeleton_header(&self, code_unit: &CodeUnit) -> Option<String> {
-        let skeleton = self.inner.get_skeleton_header(code_unit)?;
-        if code_unit.is_class() && !skeleton.trim_start().starts_with("type ") {
-            Some(format!("type {skeleton}"))
-        } else {
-            Some(skeleton)
-        }
-    }
-
-    fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String> {
-        let sources = self.get_sources(code_unit, include_comments);
-        (!sources.is_empty()).then(|| sources.into_iter().collect::<Vec<_>>().join("\n\n"))
+        self.inner
+            .get_skeleton_header(code_unit)
+            .map(|skeleton| go_type_skeleton(code_unit, skeleton))
     }
 
     fn render_source_fragment(
@@ -892,26 +1017,25 @@ impl CodeUnitIndex for GoAnalyzer {
             .collect()
     }
 
-    fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit> {
-        self.inner.search_definitions(pattern, auto_quote)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit>;
     }
 
-    fn search_definitions_by_suffix_pattern(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn search_definitions_by_suffix_pattern(
         &self,
         pattern: &str,
         terminal_identifiers: &[String],
         language: Language,
-    ) -> BTreeSet<CodeUnit> {
-        self.inner
-            .search_definitions_by_suffix_pattern(pattern, terminal_identifiers, language)
+    ) -> BTreeSet<CodeUnit>;
     }
 
-    fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit> {
-        self.inner.lookup_candidates_by_short_name(symbol)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit>;
     }
 
-    fn has_complete_symbol_lookup_index(&self) -> bool {
-        self.inner.has_complete_symbol_lookup_index()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn has_complete_symbol_lookup_index(&self) -> bool;
     }
 
     fn lookup_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
@@ -920,6 +1044,8 @@ impl CodeUnitIndex for GoAnalyzer {
 }
 
 impl IAnalyzer for GoAnalyzer {
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_procedure_fact_methods!();
+
     crate::analyzer::i_analyzer::forward_relational_definition_batch!();
 
     #[cfg(any(test, feature = "test-support"))]
@@ -949,30 +1075,30 @@ impl IAnalyzer for GoAnalyzer {
         self.inner.end_query(context);
     }
 
-    fn prefetch_definitions(&self, fq_names: &[String]) {
-        self.inner.prefetch_definitions(fq_names);
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn prefetch_definitions(&self, fq_names: &[String]);
     }
 
-    fn record_query_failure(&self, error: crate::analyzer::store::StoreError) {
-        self.inner.record_query_failure(error);
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn record_query_failure(&self, error: crate::analyzer::store::StoreError);
     }
 
-    fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
-        self.inner.workspace_file_index_cell()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell>;
     }
 
-    fn definition_lookup_memo(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn definition_lookup_memo(
         &self,
-    ) -> Option<std::sync::Arc<crate::analyzer::DefinitionLookupMemo>> {
-        self.inner.definition_lookup_memo()
+    ) -> Option<std::sync::Arc<crate::analyzer::DefinitionLookupMemo>>;
     }
 
-    fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
-        self.inner.import_statements(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn import_statements(&self, file: &ProjectFile) -> Vec<String>;
     }
 
-    fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
-        self.inner.compute_cognitive_complexities(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)>;
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
@@ -991,14 +1117,7 @@ impl IAnalyzer for GoAnalyzer {
     }
 
     fn update_all(&self) -> Self {
-        invalidate_nearest_go_module_cache();
-        let inner = self.inner.update_all();
-        Self {
-            inner,
-            memo_caches: GoMemoCaches::new(self.memo_caches.budget_bytes()),
-            native_context_profile: std::sync::RwLock::new(self.native_context_profile()),
-        }
-        .with_source_inventory()
+        self.update_all_with_progress(None)
     }
 
     fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
@@ -1018,23 +1137,22 @@ impl IAnalyzer for GoAnalyzer {
         diagnostics::collect_go_semantic_diagnostics(self, token, file, source)
     }
 
-    fn extract_call_receiver(&self, reference: &str) -> Option<String> {
-        self.inner.extract_call_receiver(reference)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn extract_call_receiver(&self, reference: &str) -> Option<String>;
     }
 
-    fn is_access_expression(&self, file: &ProjectFile, start_byte: usize, end_byte: usize) -> bool {
-        self.inner.is_access_expression(file, start_byte, end_byte)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn is_access_expression(&self, file: &ProjectFile, start_byte: usize, end_byte: usize) -> bool;
     }
 
-    fn find_nearest_declaration(
-        &self,
-        file: &ProjectFile,
-        start_byte: usize,
-        end_byte: usize,
-        ident: &str,
-    ) -> Option<crate::analyzer::DeclarationInfo> {
-        self.inner
-            .find_nearest_declaration(file, start_byte, end_byte, ident)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn find_nearest_declaration(
+            &self,
+            file: &ProjectFile,
+            start_byte: usize,
+            end_byte: usize,
+            ident: &str,
+        ) -> Option<crate::analyzer::DeclarationInfo>;
     }
 
     fn search_symbol_candidates(
@@ -1065,30 +1183,30 @@ impl IAnalyzer for GoAnalyzer {
         Some(self)
     }
 
-    fn structural_fact_providers(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn structural_fact_providers(
         &self,
-    ) -> Vec<&dyn crate::analyzer::structural::StructuralFactProvider> {
-        self.inner.structural_fact_providers()
+    ) -> Vec<&dyn crate::analyzer::structural::StructuralFactProvider>;
     }
 
     fn snapshot_caches(&self) -> Option<&crate::analyzer::AnalyzerSnapshotCaches> {
         Some(self.inner.snapshot_caches())
     }
 
-    fn workspace_content_identities(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn workspace_content_identities(
         &self,
-    ) -> Option<crate::analyzer::content_identity::WorkspaceContentIdentities> {
-        self.inner.workspace_content_identities()
+    ) -> Option<crate::analyzer::content_identity::WorkspaceContentIdentities>;
     }
 
-    fn workspace_fact_indexes(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn workspace_fact_indexes(
         &self,
-    ) -> Vec<&dyn crate::analyzer::read_verification::WorkspaceFactIndex> {
-        self.inner.workspace_fact_indexes()
+    ) -> Vec<&dyn crate::analyzer::read_verification::WorkspaceFactIndex>;
     }
 
-    fn contains_tests(&self, file: &ProjectFile) -> bool {
-        self.inner.contains_tests(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn contains_tests(&self, file: &ProjectFile) -> bool;
     }
 
     fn in_test_region(&self, code_unit: &crate::analyzer::CodeUnit) -> bool {
@@ -1188,16 +1306,12 @@ impl crate::analyzer::AnalyzerTestHooks for GoAnalyzer {
             .semantic_materialization_census_for_test()
     }
 
-    fn reset_relational_definition_batch_call_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_relational_definition_batch_call_count_for_test();
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn reset_relational_definition_batch_call_count_for_test(&self);
     }
 
-    fn relational_definition_batch_call_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .relational_definition_batch_call_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn relational_definition_batch_call_count_for_test(&self) -> usize;
     }
 
     fn record_resolve_definition_batch_with_source_call_for_test(&self) {
@@ -1218,56 +1332,136 @@ impl crate::analyzer::AnalyzerTestHooks for GoAnalyzer {
             .resolve_definition_batch_with_source_call_count_for_test()
     }
 
-    fn reset_definition_candidates_query_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_definition_candidates_query_count_for_test();
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn reset_definition_candidates_query_count_for_test(&self);
     }
 
-    fn definition_candidates_query_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .definition_candidates_query_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn definition_candidates_query_count_for_test(&self) -> usize;
     }
 
-    fn reset_definition_prefetch_batch_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_definition_prefetch_batch_count_for_test();
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn reset_definition_prefetch_batch_count_for_test(&self);
     }
 
-    fn definition_prefetch_batch_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .definition_prefetch_batch_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn definition_prefetch_batch_count_for_test(&self) -> usize;
     }
 
-    fn reset_full_declaration_scan_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_full_declaration_scan_count_for_test();
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn reset_full_declaration_scan_count_for_test(&self);
     }
 
-    fn full_declaration_scan_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .full_declaration_scan_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn full_declaration_scan_count_for_test(&self) -> usize;
     }
 
     fn reset_candidate_hydration_count_for_test(&self) {
         self.inner.reset_full_hydration_count_for_test();
     }
 
-    fn candidate_hydration_count_for_test(&self) -> usize {
-        self.inner.full_hydration_count_for_test() + self.inner.bulk_hydration_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn full_candidate_hydration_count_for_test(&self) -> usize;
+    }
+
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn bulk_candidate_hydration_count_for_test(&self) -> usize;
     }
 }
 
 static GO_USAGE_STRATEGY: GoUsageGraphStrategy = GoUsageGraphStrategy::new();
+static GO_NATIVE_USAGE_STRATEGY: native_usages::GoNativeUsageStrategy =
+    native_usages::GoNativeUsageStrategy::new();
+
+/// Whether Go consumers route to the native resolver.
+///
+/// Production keeps the incumbent resolver until the Go flip lands. Native
+/// answers only in this crate's own unit tests (`cfg(test)`) and when
+/// `BIFROST_TRIAL_NATIVE_GO` is set, for measurement runs of a production build.
+/// `test-support` does not select native: the root suites link this crate with
+/// that feature and pin the incumbent unless the trial flag is set.
+pub(crate) fn native_go_selected() -> bool {
+    static SELECTED: OnceLock<bool> = OnceLock::new();
+    *SELECTED.get_or_init(|| cfg!(test) || std::env::var_os("BIFROST_TRIAL_NATIVE_GO").is_some())
+}
 
 pub(crate) struct GoSupport;
 
+fn go_type_skeleton(code_unit: &CodeUnit, skeleton: String) -> String {
+    if code_unit.is_class() && !skeleton.trim_start().starts_with("type ") {
+        format!("type {skeleton}")
+    } else {
+        skeleton
+    }
+}
+
 impl LanguageSupport for GoSupport {
+    fn native_member_attribution(
+        &self,
+        context: &crate::analyzer::store::resolution_operation::ProjectedNativeMemberContext,
+        outcome: crate::analyzer::structural::CandidateOutcome,
+    ) -> Option<crate::analyzer::languages::NativeMemberAttribution> {
+        use crate::analyzer::structural::{HierarchyRelation, MemberDispatchTier, PrecedenceTier};
+        // Go's existing callable-applicability rows carry no member route;
+        // member-selection and wrong-declaration-space rows retain theirs.
+        if matches!(
+            outcome,
+            crate::analyzer::structural::CandidateOutcome::Rejected(
+                crate::analyzer::structural::RejectionReason::CallableApplicabilityDeferred
+            )
+        ) {
+            return None;
+        }
+        let interface_owner = context.go_interface_owner?;
+        let depth = context.owner_path.len() - 1;
+        Some(crate::analyzer::languages::NativeMemberAttribution {
+            dispatch_tier: if interface_owner {
+                MemberDispatchTier::TraitOrInterface
+            } else if depth == 0 {
+                MemberDispatchTier::InherentOrDirect
+            } else {
+                MemberDispatchTier::InheritedOrPromoted
+            },
+            relation: HierarchyRelation::Embedded,
+            precedence_tier: if depth == 0 {
+                PrecedenceTier::OwnMember
+            } else {
+                PrecedenceTier::InheritedMember
+            },
+        })
+    }
+
+    fn modeled_external_package_identity(
+        &self,
+        overlay: &crate::analyzer::semantic_model::SemanticModelOverlay,
+        import_path: &str,
+    ) -> Option<ModeledExternalPackageIdentity> {
+        let identity = package_identity::GoOverlayPackages::new(Some(overlay))
+            .modeled_package_identity(import_path)?;
+        Some(ModeledExternalPackageIdentity {
+            package_name: identity.package_name,
+            symbol_id: identity.symbol_id,
+            pack_id: identity.pack_id,
+            pack_digest: identity.pack_digest,
+            record_id: identity.record_id,
+        })
+    }
+
+    fn materialize_callable_factory(
+        &self,
+        oracle: &crate::analyzer::semantic::WorkspaceSemanticOracle<'_>,
+        call: &crate::analyzer::semantic::CallSiteHandle,
+        proof: &crate::analyzer::usages::get_definition::ExactExternalCallProof,
+        request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<
+        Option<
+            crate::analyzer::semantic::SemanticOutcome<crate::analyzer::semantic::DispatchResult>,
+        >,
+        crate::analyzer::semantic::SemanticProviderError,
+    > {
+        oracle.materialize_go_callable_factory(call, proof, request)
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     fn native_rollout_points(
         &self,
@@ -1286,6 +1480,64 @@ impl LanguageSupport for GoSupport {
         Language::Go
     }
 
+    fn call_may_apply_value(&self) -> bool {
+        true
+    }
+
+    fn call_applicability_adapter(
+        &self,
+    ) -> Option<&'static dyn crate::analyzer::resolution::CallApplicabilityAdapter> {
+        Some(&call_applicability::GO_CALL_APPLICABILITY_ADAPTER)
+    }
+
+    fn stable_package_function_value_proof(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        variable: &CodeUnit,
+        declaring_source: &str,
+    ) -> Option<Result<StablePackageFunctionValueProof, String>> {
+        package_function_value::prove_stable_package_function_value(
+            analyzer,
+            variable,
+            declaring_source,
+        )
+        .map(|proof| {
+            proof.map(|proof| StablePackageFunctionValueProof {
+                initializer_start: proof.initializer_start,
+                initializer_end: proof.initializer_end,
+                references: proof.references,
+                scope: proof.scope,
+            })
+        })
+    }
+
+    fn virtual_dispatch_target_is_applicable(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        declaration: &CodeUnit,
+        target_file: &ProjectFile,
+    ) -> bool {
+        resolve_analyzer::<GoAnalyzer>(analyzer)
+            .is_some_and(|go| go.same_module(declaration.source(), target_file))
+    }
+
+    fn predeclared_builtin_shadow_status_limited(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        relative_path: &str,
+        name: &str,
+        limit: usize,
+        query_step: &mut dyn FnMut(PredeclaredBuiltinQueryStep) -> bool,
+    ) -> Option<bool> {
+        let go = resolve_analyzer::<GoAnalyzer>(analyzer)?;
+        if !query_step(PredeclaredBuiltinQueryStep::BeginLookup) {
+            return None;
+        }
+        go.predeclared_builtin_shadow_status_limited(relative_path, name, limit, || {
+            query_step(PredeclaredBuiltinQueryStep::VisitCandidate)
+        })
+    }
+
     fn procedure_syntax_roles(&self) -> Option<crate::analyzer::languages::ProcedureSyntaxRoles> {
         Some(semantic::PROCEDURE_SYNTAX_ROLES)
     }
@@ -1300,8 +1552,9 @@ impl LanguageSupport for GoSupport {
         unit: &CodeUnit,
         limit: usize,
     ) -> Option<LimitedQueryRows<SignatureMetadata>> {
-        resolve_analyzer::<GoAnalyzer>(analyzer)
-            .map(|go| go.signature_metadata_limited(unit, limit))
+        crate::analyzer::languages::with_resolved_analyzer::<GoAnalyzer, _>(analyzer, |go| {
+            go.signature_metadata_limited(unit, limit)
+        })
     }
 
     fn signatures_limited(
@@ -1319,7 +1572,9 @@ impl LanguageSupport for GoSupport {
         unit: &CodeUnit,
         limit: usize,
     ) -> Option<LimitedQueryRows<Range>> {
-        resolve_analyzer::<GoAnalyzer>(analyzer).map(|go| go.ranges_limited(unit, limit))
+        crate::analyzer::languages::with_resolved_analyzer::<GoAnalyzer, _>(analyzer, |go| {
+            go.ranges_limited(unit, limit)
+        })
     }
 
     fn forward_query_provider<'a>(
@@ -1333,8 +1588,22 @@ impl LanguageSupport for GoSupport {
         UsageEcosystem::Go
     }
 
-    fn reference_plugin(&self) -> crate::analyzer::languages::ReferenceLanguagePlugin {
-        crate::analyzer::languages::ReferenceLanguagePlugin::new(&GO_USAGE_STRATEGY, &GoEdgePass)
+    fn reference_usage_strategy(&self) -> &'static dyn crate::analyzer::usages::GraphUsageAnalyzer {
+        if native_go_selected() {
+            &GO_NATIVE_USAGE_STRATEGY
+        } else {
+            &GO_USAGE_STRATEGY
+        }
+    }
+
+    fn reference_graph_backend(&self) -> crate::analyzer::languages::LanguageGraphBackend {
+        if native_go_selected() {
+            crate::analyzer::languages::LanguageGraphBackend::Native(
+                &native_graph::GoNativeWorkspaceGraphProvider,
+            )
+        } else {
+            crate::analyzer::languages::LanguageGraphBackend::Legacy(&GoEdgePass)
+        }
     }
 
     fn dead_code(&self) -> DeadCodeSupport {
@@ -1345,7 +1614,41 @@ impl LanguageSupport for GoSupport {
     }
 
     fn structural_receiver(&self) -> Option<&'static dyn StructuralReceiverResolver> {
-        Some(&GoSupport)
+        if native_go_selected() {
+            Some(&native_points::GoNativeRolloutPoints)
+        } else {
+            Some(&GoSupport)
+        }
+    }
+
+    fn call_relation_provider(
+        &self,
+    ) -> Option<&'static dyn crate::analyzer::usages::call_relations::CallRelationProvider> {
+        if native_go_selected() {
+            Some(&native_call_relations::GoNativeCallRelations)
+        } else {
+            None
+        }
+    }
+
+    fn rename_provider(&self) -> Option<&'static dyn crate::symbol_rename::RenameProvider> {
+        if native_go_selected() {
+            Some(&native_rename::GoNativeRenameProvider)
+        } else {
+            None
+        }
+    }
+
+    fn selected_inverse_reference_provider(
+        &self,
+    ) -> Option<
+        &'static dyn crate::analyzer::structural::reference_edges::SelectedInverseReferenceProvider,
+    > {
+        if native_go_selected() {
+            Some(&selected_reverse::GoNativeSelectedInverseProvider)
+        } else {
+            None
+        }
     }
 
     fn parser_language(&self, _flavor: crate::analyzer::ParserFlavor) -> tree_sitter::Language {
@@ -1476,10 +1779,7 @@ impl DeadCodeBulkProof for GoDeadCodeBulk {
     }
 
     fn preflight(&self, analyzer: &dyn IAnalyzer) -> DeadCodeBulkPreflight {
-        DeadCodeBulkPreflight::Ready {
-            label: "Go",
-            files: analyzable_file_count(analyzer, Language::Go),
-        }
+        ready_preflight(analyzer, Language::Go, "Go")
     }
 
     /// Module-level variables count as callers as well as declarations: a package-level
@@ -1494,7 +1794,7 @@ impl DeadCodeBulkProof for GoDeadCodeBulk {
         let nodes = fqn_bulk_nodes(
             analyzer,
             Language::Go,
-            |unit| unit.is_function() || unit.is_class() || go_module_level_field(unit),
+            |unit| unit.is_function() || unit.is_class() || is_go_module_field(unit),
             candidates,
         );
         match build_go_usage_edges(analyzer, token, &nodes, |_| true) {
@@ -1504,22 +1804,22 @@ impl DeadCodeBulkProof for GoDeadCodeBulk {
     }
 }
 
-fn go_module_level_field(unit: &CodeUnit) -> bool {
-    unit.is_field() && unit.short_name().starts_with("_module_.")
-}
-
 #[cfg(test)]
 mod hierarchy_tests {
     //! Lives here rather than beside the builder in `brokk-bifrost-go`: the
     //! fixture needs a real `GoAnalyzer` to supply the `CodeUnitIndex` and
     //! `ImportAnalysisProvider` the hierarchy is built from.
     use super::*;
-    use crate::analyzer::type_relations::TypeRelationKind;
     use crate::analyzer::{OverlayProject, Project, TestProject};
+    use crate::hash::HashSet;
     use crate::inline_project::InlineTestProject;
     use std::fs;
     use std::sync::Arc;
     use tempfile::tempdir;
+
+    fn status(analyzer: &GoAnalyzer, path: &str, name: &str) -> Option<bool> {
+        analyzer.predeclared_builtin_shadow_status_limited(path, name, 64, || true)
+    }
 
     fn analyzer(files: &[(&str, &str)]) -> GoAnalyzer {
         let temp = tempdir().unwrap();
@@ -1625,7 +1925,7 @@ mod hierarchy_tests {
 
     #[test]
     fn usage_graph_keeps_cross_file_receiver_method_in_canonical_inventory() {
-        use crate::analyzer::usages::{GoUsageGraphStrategy, UsageAnalyzer};
+        use crate::analyzer::usages::UsageAnalyzer;
 
         let project = InlineTestProject::with_language(Language::Go)
             .file("go.mod", "module example.com/app\n\ngo 1.24\n")
@@ -1649,7 +1949,7 @@ mod hierarchy_tests {
             .find(|unit| unit.fq_name() == "example.com/app/api.Worker.Run")
             .expect("receiver method should be indexed in its defining file");
         let candidates = analyzer.get_analyzed_files().into_iter().collect();
-        let hits = GoUsageGraphStrategy::new()
+        let hits = GO_USAGE_STRATEGY
             .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 100)
             .into_either()
             .expect("cross-file receiver method should have a complete graph");
@@ -1658,6 +1958,109 @@ mod hierarchy_tests {
         let hit = hits.first().expect("one caller hit");
         assert_eq!(hit.file, project.file("caller.go"));
         assert_eq!(hit.enclosing.identifier(), "call");
+    }
+
+    #[test]
+    fn legacy_go_edge_and_dead_code_proofs_build_workspace_edges() {
+        let analyzer = analyzer(&[
+            ("api.go", "package app\nfunc Target() {}\n"),
+            ("caller.go", "package app\nfunc Run() { Target() }\n"),
+        ]);
+        let declarations = analyzer.get_all_declarations();
+        let target = declarations
+            .iter()
+            .find(|unit| unit.is_function() && unit.identifier() == "Target")
+            .expect("target declaration");
+        let caller = declarations
+            .iter()
+            .find(|unit| unit.is_function() && unit.identifier() == "Run")
+            .expect("caller declaration");
+        let nodes: HashSet<_> = [target.fq_name(), caller.fq_name()].into_iter().collect();
+        let scoped_callers = HashSet::default();
+        let keep_file = |_: &ProjectFile| true;
+        let pass = GoEdgePass;
+
+        let site_context = EdgeSiteScanCtx {
+            analyzer: &analyzer,
+            fqns: &nodes,
+            scoped_callers: &scoped_callers,
+            keep_file: &keep_file,
+        };
+        let Some(LanguageEdgeSites::Fqn(site_edges)) = pass.edge_sites(&site_context) else {
+            panic!("complete Go input must build site edges");
+        };
+        assert!(
+            site_edges
+                .edges
+                .contains_key(&(caller.fq_name(), target.fq_name()))
+        );
+
+        let weight_context = EdgeWeightScanCtx {
+            analyzer: &analyzer,
+            fqns: &nodes,
+            scoped_nodes: &scoped_callers,
+            keep_file: &keep_file,
+        };
+        let Some(LanguageEdgeWeights::Fqn(weights)) = pass.edge_weights(&weight_context) else {
+            panic!("complete Go input must build edge weights");
+        };
+        assert!(
+            weights
+                .edges
+                .contains_key(&(caller.fq_name(), target.fq_name()))
+        );
+
+        let Some(DeadCodeBulkEdges::Fqn(bulk_edges)) =
+            GoDeadCodeBulk.build(&analyzer, std::slice::from_ref(target))
+        else {
+            panic!("complete Go input must build dead-code edges");
+        };
+        assert!(
+            bulk_edges
+                .edges
+                .contains_key(&(caller.fq_name(), target.fq_name()))
+        );
+    }
+
+    #[test]
+    fn legacy_go_edge_pass_reports_unavailable_canonical_input() {
+        let analyzer = analyzer(&[("broken.go", "func Broken() {}\n")]);
+        let broken = analyzer
+            .get_analyzed_files()
+            .into_iter()
+            .next()
+            .expect("broken Go source is analyzed");
+        let request_files = vec![broken.clone()];
+        let pass = GoEdgePass;
+        let failure = pass
+            .input_failure(&analyzer, &request_files)
+            .expect("missing package clause makes canonical graph input unavailable");
+        assert_eq!(failure.files, request_files);
+
+        let nodes = HashSet::default();
+        let scoped_callers = HashSet::default();
+        let keep_file = |_: &ProjectFile| true;
+        let site_context = EdgeSiteScanCtx {
+            analyzer: &analyzer,
+            fqns: &nodes,
+            scoped_callers: &scoped_callers,
+            keep_file: &keep_file,
+        };
+        assert!(matches!(
+            pass.edge_sites(&site_context),
+            Some(LanguageEdgeSites::Unavailable(failure)) if failure.files.contains(&broken)
+        ));
+
+        let weight_context = EdgeWeightScanCtx {
+            analyzer: &analyzer,
+            fqns: &nodes,
+            scoped_nodes: &scoped_callers,
+            keep_file: &keep_file,
+        };
+        assert!(matches!(
+            pass.edge_weights(&weight_context),
+            Some(LanguageEdgeWeights::Unavailable(failure)) if failure.files.contains(&broken)
+        ));
     }
 
     #[test]
@@ -1823,26 +2226,6 @@ mod hierarchy_tests {
     }
 
     #[test]
-    fn a_method_of_the_same_name_and_a_different_signature_is_not_an_implementor() {
-        let analyzer = analyzer(&[(
-            "service.go",
-            "package app\n\
-             type Runner interface { Run(id int) error }\n\
-             type Worker struct{}\n\
-             func (Worker) Run(id int) error { return nil }\n\
-             type NearMiss struct{}\n\
-             func (NearMiss) Run(name string) error { return nil }\n\
-             type WrongResult struct{}\n\
-             func (WrongResult) Run(id int) {}\n",
-        )]);
-        let declaration = member(&analyzer, "Runner", "Run");
-        assert_eq!(
-            implementors(&analyzer, &declaration),
-            vec!["Worker.Run".to_string()]
-        );
-    }
-
-    #[test]
     fn a_type_that_satisfies_an_interface_by_embedding_reports_the_embedded_method() {
         let analyzer = analyzer(&[(
             "service.go",
@@ -1880,45 +2263,6 @@ mod hierarchy_tests {
             implementors(&analyzer, &member(&analyzer, "Runner", "Run")),
             vec!["Worker.Run".to_string()]
         );
-    }
-
-    #[test]
-    fn a_method_in_another_file_of_the_same_package_still_implements() {
-        let analyzer = analyzer(&[
-            (
-                "api/service.go",
-                "package api\ntype Runner interface { Run() error }\ntype Worker struct{}\n",
-            ),
-            (
-                "api/worker.go",
-                "package api\nfunc (Worker) Run() error { return nil }\n",
-            ),
-        ]);
-        assert_eq!(
-            implementors(&analyzer, &member(&analyzer, "Runner", "Run")),
-            vec!["Worker.Run".to_string()],
-            "a Go method lives in a file of its own, so the family join must \
-             not be per-file"
-        );
-    }
-
-    #[test]
-    fn a_top_level_function_states_a_complete_answer_with_no_family() {
-        use crate::analyzer::structural::resolution::{MemberFamilyOutcome, MemberFamilyReason};
-        use crate::analyzer::usages::MemberFamilyProvider;
-        let analyzer = analyzer(&[(
-            "service.go",
-            "package app\ntype Runner interface { Run() error }\nfunc Run() error { return nil }\n",
-        )]);
-        let function = analyzer
-            .get_all_declarations()
-            .into_iter()
-            .find(|unit| unit.is_function() && analyzer.parent_of(unit).is_none())
-            .expect("a top-level function");
-        let answer = analyzer.member_family(&function, None);
-        assert_eq!(answer.outcome, MemberFamilyOutcome::NoFamily);
-        assert_eq!(answer.reason, Some(MemberFamilyReason::NotAMethod));
-        assert!(answer.edges.is_empty());
     }
 
     #[test]
@@ -1993,5 +2337,41 @@ mod hierarchy_tests {
             vec!["Worker.Run".to_string()],
             "an unrelated interface in the same workspace still answers"
         );
+    }
+
+    #[test]
+    fn package_scope_lookup_finds_sibling_functions_variables_and_types() {
+        let project = InlineTestProject::with_language(Language::Go)
+            .file("go.mod", "module example.com/app\n\ngo 1.24\n")
+            .file(
+                "main.go",
+                "package app\nfunc Run() { _ = max(1, 2); _ = min(1, 2); _ = len([]int{}) }\n",
+            )
+            .file(
+                "util.go",
+                "package app\nfunc max(a, b int) int { return a }\nvar min func(int, int) int\ntype len []int\n",
+            )
+            .build();
+        let analyzer = GoAnalyzer::new(project.project_dyn());
+
+        assert_eq!(status(&analyzer, "main.go", "max"), Some(true));
+        assert_eq!(status(&analyzer, "main.go", "min"), Some(true));
+        assert_eq!(status(&analyzer, "main.go", "len"), Some(true));
+    }
+
+    #[test]
+    fn package_scope_lookup_proves_absence_for_a_single_file_package() {
+        let project = InlineTestProject::with_language(Language::Go)
+            .file("go.mod", "module example.com/app\n\ngo 1.24\n")
+            .file(
+                "main.go",
+                "package app\nfunc Run() { _ = max(1, 2); _ = min(1, 2); _ = len([]int{}) }\n",
+            )
+            .build();
+        let analyzer = GoAnalyzer::new(project.project_dyn());
+
+        assert_eq!(status(&analyzer, "main.go", "max"), Some(false));
+        assert_eq!(status(&analyzer, "main.go", "min"), Some(false));
+        assert_eq!(status(&analyzer, "main.go", "len"), Some(false));
     }
 }

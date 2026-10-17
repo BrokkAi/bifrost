@@ -1,9 +1,10 @@
-//! Structural and semantic conformance checks for CSMI v0.1.
+//! Structural and semantic conformance checks for CSMI core schemas 0.1, 0.2, and 0.3.
 
 use super::canonical::{
     canonical_digest, canonical_json, canonical_pack_manifest, canonical_semantic_document,
     sha256_hex,
 };
+use super::identity::{GO_SOURCE_IDENTITY_SCHEME, GO_SOURCE_IDENTITY_VERSION, go_source_symbol_id};
 use super::model::*;
 use super::pack::{
     CsmiResourceError, CsmiResourceResolver, validate_resource_path, verify_resources,
@@ -18,6 +19,8 @@ const CSMI_SCHEMA_JSON: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/src/analyzer/semantic_model/csmi/schema.json"
 ));
+const CSMI_SCHEMA_V0_2_JSON: &str = include_str!("schema-v0.2.json");
+const CSMI_SCHEMA_V0_3_JSON: &str = include_str!("schema-v0.3.json");
 
 const JAVASCRIPT_TYPESCRIPT_SCHEMA_JSON: &str =
     include_str!("profiles/javascript-typescript.schema.json");
@@ -41,6 +44,10 @@ const COLLECTION_FLOW_SCHEMA_JSON: &str = include_str!("profiles/collection-flow
 const CONDITIONAL_TYPE_REFINEMENT_SCHEMA_JSON: &str =
     include_str!("profiles/conditional-type-refinement.schema.json");
 const DEFERRED_YIELD_SCHEMA_JSON: &str = include_str!("profiles/deferred-yield.schema.json");
+const CALLABLE_VALUES_SCHEMA_JSON: &str = include_str!("profiles/callable-values.schema.json");
+
+const CSMI_STRUCTURED_LOCATIONS_SCHEME: &str = "csmi.structured-locations";
+const CSMI_STRUCTURED_LOCATIONS_VERSION: &str = "0.1.0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CsmiDiagnosticSeverity {
@@ -235,7 +242,8 @@ pub fn parse_csmi_document(bytes: &[u8]) -> CsmiDocumentValidation {
             )],
         };
     };
-    let schema_violations = csmi_schema_validator()
+    let schema_uri = value.get("schema").and_then(Value::as_str);
+    let schema_violations = csmi_schema_validator(schema_uri)
         .iter_errors(&value)
         .map(|violation| {
             CsmiDiagnostic::error(
@@ -362,13 +370,32 @@ pub fn parse_csmi_document(bytes: &[u8]) -> CsmiDocumentValidation {
     }
 }
 
-fn csmi_schema_validator() -> &'static jsonschema::Validator {
-    static VALIDATOR: OnceLock<jsonschema::Validator> = OnceLock::new();
-    VALIDATOR.get_or_init(|| {
-        let schema: Value =
-            serde_json::from_str(CSMI_SCHEMA_JSON).expect("pinned CSMI schema is valid JSON");
-        jsonschema::draft202012::new(&schema).expect("pinned CSMI schema is valid Draft 2020-12")
-    })
+fn csmi_schema_validator(schema_uri: Option<&str>) -> &'static jsonschema::Validator {
+    if schema_uri == Some(CSMI_SCHEMA_URI) {
+        static VALIDATOR_V0_3: OnceLock<jsonschema::Validator> = OnceLock::new();
+        VALIDATOR_V0_3.get_or_init(|| {
+            let schema: Value = serde_json::from_str(CSMI_SCHEMA_V0_3_JSON)
+                .expect("pinned CSMI v0.3 schema is valid JSON");
+            jsonschema::draft202012::new(&schema)
+                .expect("pinned CSMI v0.3 schema is valid Draft 2020-12")
+        })
+    } else if schema_uri == Some(CSMI_SCHEMA_URI_V0_2) {
+        static VALIDATOR_V0_2: OnceLock<jsonschema::Validator> = OnceLock::new();
+        VALIDATOR_V0_2.get_or_init(|| {
+            let schema: Value = serde_json::from_str(CSMI_SCHEMA_V0_2_JSON)
+                .expect("pinned CSMI v0.2 schema is valid JSON");
+            jsonschema::draft202012::new(&schema)
+                .expect("pinned CSMI v0.2 schema is valid Draft 2020-12")
+        })
+    } else {
+        static VALIDATOR_V0_1: OnceLock<jsonschema::Validator> = OnceLock::new();
+        VALIDATOR_V0_1.get_or_init(|| {
+            let schema: Value = serde_json::from_str(CSMI_SCHEMA_JSON)
+                .expect("pinned CSMI v0.1 schema is valid JSON");
+            jsonschema::draft202012::new(&schema)
+                .expect("pinned CSMI v0.1 schema is valid Draft 2020-12")
+        })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -426,6 +453,13 @@ const KNOWN_PROFILES: &[KnownProfile] = &[
         version: CSMI_DEFERRED_YIELD_PROFILE_VERSION,
         schema: CSMI_DEFERRED_YIELD_PROFILE_SCHEMA,
         schema_json: DEFERRED_YIELD_SCHEMA_JSON,
+        payload_definitions: &["$root"],
+    },
+    KnownProfile {
+        identifier: CSMI_CALLABLE_VALUES_PROFILE_ID,
+        version: CSMI_CALLABLE_VALUES_PROFILE_VERSION,
+        schema: CSMI_CALLABLE_VALUES_PROFILE_SCHEMA,
+        schema_json: CALLABLE_VALUES_SCHEMA_JSON,
         payload_definitions: &["$root"],
     },
     KnownProfile {
@@ -646,7 +680,8 @@ fn validate_profile_schemas(
                     schema: use_.schema.clone(),
                     recognized: false,
                     structural_valid: true,
-                    semantically_supported: support.supports(
+                    semantically_supported: profile_semantically_supported(
+                        support,
                         &use_.identifier,
                         &use_.version,
                         &use_.schema,
@@ -721,7 +756,8 @@ fn validate_profile_schemas(
                 schema: use_.schema.clone(),
                 recognized,
                 structural_valid,
-                semantically_supported: support.supports(
+                semantically_supported: profile_semantically_supported(
+                    support,
                     &use_.identifier,
                     &use_.version,
                     &use_.schema,
@@ -730,6 +766,21 @@ fn validate_profile_schemas(
         }
     }
     outcomes
+}
+
+fn profile_semantically_supported(
+    support: &CsmiVocabularySupport,
+    identifier: &str,
+    version: &str,
+    schema: &str,
+) -> bool {
+    // The structural contract is registered, but no native callable-values
+    // interpreter exists yet. A caller-provided vocabulary allowlist cannot
+    // turn schema recognition into semantic interpretation.
+    !(identifier == CSMI_CALLABLE_VALUES_PROFILE_ID
+        && version == CSMI_CALLABLE_VALUES_PROFILE_VERSION
+        && schema == CSMI_CALLABLE_VALUES_PROFILE_SCHEMA)
+        && support.supports(identifier, version, schema)
 }
 
 /// Revalidate a retained Python profile fact after native pack decoding.
@@ -794,8 +845,12 @@ pub fn validate_csmi_document(
             CsmiDocument::Manifest(_) => true,
         };
         for profile in &mut result.profiles {
-            profile.semantically_supported =
-                support.supports(&profile.identifier, &profile.version, &profile.schema);
+            profile.semantically_supported = profile_semantically_supported(
+                support,
+                &profile.identifier,
+                &profile.version,
+                &profile.schema,
+            );
         }
     }
     sort_diagnostics(&mut result.diagnostics);
@@ -948,12 +1003,15 @@ fn validate_semantic_document_shape(
         );
         valid = false;
     }
-    if document.schema != CSMI_SCHEMA_URI {
+    if !matches!(
+        document.schema.as_str(),
+        CSMI_SCHEMA_URI_V0_1 | CSMI_SCHEMA_URI_V0_2 | CSMI_SCHEMA_URI
+    ) {
         error(
             diagnostics,
             "structural.schema_identifier",
             "$.schema",
-            "must use the pinned CSMI v0.1 schema URI",
+            "must use a supported pinned CSMI v0.1, v0.2, or v0.3 schema URI",
         );
         valid = false;
     }
@@ -2059,12 +2117,15 @@ fn validate_manifest_shape(
         );
         valid = false;
     }
-    if manifest.schema != CSMI_SCHEMA_URI {
+    if !matches!(
+        manifest.schema.as_str(),
+        CSMI_SCHEMA_URI_V0_1 | CSMI_SCHEMA_URI_V0_2 | CSMI_SCHEMA_URI
+    ) {
         error(
             diagnostics,
             "structural.schema_identifier",
             "$.schema",
-            "must use the pinned CSMI v0.1 schema URI",
+            "must use a supported pinned CSMI v0.1, v0.2, or v0.3 schema URI",
         );
         valid = false;
     }
@@ -2200,7 +2261,12 @@ fn validate_interpretability(
     for (model_index, model) in document.semantic_models.iter().enumerate() {
         for (use_index, use_) in model.vocabulary_uses.iter().enumerate() {
             if use_.requirement == CsmiVocabularyRequirement::Required
-                && !support.supports(&use_.identifier, &use_.version, &use_.schema)
+                && !profile_semantically_supported(
+                    support,
+                    &use_.identifier,
+                    &use_.version,
+                    &use_.schema,
+                )
             {
                 error(
                     diagnostics,
@@ -2216,6 +2282,180 @@ fn validate_interpretability(
         }
     }
     interpretable
+}
+
+fn validate_go_source_identity_symbol(
+    symbol: &CsmiSymbolDefinition,
+    model_selectors: &[CsmiArtifactSelector],
+    path: &str,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> bool {
+    let mut valid = true;
+    let report = |diagnostics: &mut Vec<CsmiDiagnostic>, field: &str, message: &str| {
+        error(
+            diagnostics,
+            "semantic.go_source_identity",
+            format!("{path}.{field}"),
+            message,
+        );
+    };
+    if symbol.scheme_version != GO_SOURCE_IDENTITY_VERSION {
+        report(
+            diagnostics,
+            "schemeVersion",
+            "the provisional Go source identity scheme supports version 0.1 only",
+        );
+        valid = false;
+    }
+    if symbol.stability != CsmiStability::ArtifactLocal {
+        report(
+            diagnostics,
+            "stability",
+            "Go source declaration identities must be artifact-local",
+        );
+        valid = false;
+    }
+    let selectors = symbol.artifact_selectors.as_deref().unwrap_or_default();
+    if selectors.len() != 1 {
+        report(
+            diagnostics,
+            "artifactSelectors",
+            "Go source identity requires exactly one exact artifact selector",
+        );
+        valid = false;
+    }
+    let selector_valid = selectors.len() == 1
+        && selectors.iter().all(|selector| {
+            selector.version_range.is_none()
+                && selector.purl.starts_with("pkg:golang/")
+                && selector
+                    .purl
+                    .strip_prefix("pkg:golang/")
+                    .and_then(|coordinate| coordinate.split_once('@'))
+                    .is_some_and(|(package, version)| {
+                        !package.is_empty()
+                            && !version.is_empty()
+                            && !version.contains('@')
+                            && !package.contains(['?', '#'])
+                            && !version.contains(['?', '#'])
+                    })
+                && selector.digests.len() == 1
+                && selector.digests[0].algorithm == CsmiDigestAlgorithm::Sha256
+                && selector.digests[0].canonicalization.is_none()
+                && !selector.digests[0].coverage.is_empty()
+                && selector.digests[0].value.len() == 64
+                && selector.digests[0]
+                    .value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        });
+    if !selector_valid {
+        report(
+            diagnostics,
+            "artifactSelectors",
+            "Go source identity requires one versioned pkg:golang selector with one lowercase SHA-256 digest and nonempty coverage",
+        );
+        valid = false;
+    } else if !model_selectors
+        .iter()
+        .any(|candidate| candidate == &selectors[0])
+    {
+        report(
+            diagnostics,
+            "artifactSelectors",
+            "Go source identity selector must be an exact selector of its semantic model",
+        );
+        valid = false;
+    }
+    let descriptors = &symbol.descriptors;
+    let path_name = |descriptor: &CsmiDescriptor| {
+        descriptor
+            .name
+            .as_deref()
+            .is_some_and(crate::analyzer::semantic_model::is_canonical_relative_path)
+    };
+    let nonempty_name = |descriptor: &CsmiDescriptor| {
+        descriptor
+            .name
+            .as_deref()
+            .is_some_and(|name| !name.is_empty())
+    };
+    let descriptor_shape = match descriptors.as_slice() {
+        [file, source_type] => {
+            file.role == CsmiDescriptorRole::Meta
+                && path_name(file)
+                && matches!(
+                    source_type.role,
+                    CsmiDescriptorRole::Namespace | CsmiDescriptorRole::Type
+                )
+                && nonempty_name(source_type)
+                && source_type
+                    .disambiguator
+                    .as_deref()
+                    .is_some_and(|value| value.starts_with("go-type-0.1:"))
+        }
+        [first, second, declaration] if declaration.role == CsmiDescriptorRole::Callable => {
+            if declaration
+                .disambiguator
+                .as_deref()
+                .is_some_and(|value| value.starts_with("go-anonymous-callable-0.1:"))
+            {
+                first.role == CsmiDescriptorRole::Namespace
+                    && nonempty_name(first)
+                    && second.role == CsmiDescriptorRole::Meta
+                    && path_name(second)
+                    && declaration.name.is_none()
+            } else {
+                first.role == CsmiDescriptorRole::Meta
+                    && path_name(first)
+                    && second.role == CsmiDescriptorRole::Meta
+                    && second
+                        .disambiguator
+                        .as_deref()
+                        .is_some_and(|value| value.starts_with("go-owner:"))
+                    && declaration
+                        .disambiguator
+                        .as_deref()
+                        .is_some_and(|value| value.starts_with("go-member-0.1:"))
+                    && nonempty_name(declaration)
+            }
+        }
+        [file, owner, declaration] if declaration.role == CsmiDescriptorRole::Term => {
+            file.role == CsmiDescriptorRole::Meta
+                && path_name(file)
+                && owner.role == CsmiDescriptorRole::Meta
+                && owner
+                    .disambiguator
+                    .as_deref()
+                    .is_some_and(|value| value.starts_with("go-owner:"))
+                && declaration
+                    .disambiguator
+                    .as_deref()
+                    .is_some_and(|value| value.starts_with("go-member-0.1:"))
+                && nonempty_name(declaration)
+        }
+        _ => false,
+    };
+    if !descriptor_shape {
+        report(
+            diagnostics,
+            "descriptors",
+            "Go source identity descriptors do not match a supported type, member, or anonymous-callable recipe",
+        );
+        valid = false;
+    }
+    if selector_valid
+        && valid
+        && !go_source_symbol_id(selectors, descriptors).is_ok_and(|expected| expected == symbol.id)
+    {
+        report(
+            diagnostics,
+            "id",
+            "Go source symbol ID does not match its exact artifact selector and scheme descriptors",
+        );
+        valid = false;
+    }
+    valid
 }
 
 fn validate_model(
@@ -2241,6 +2481,18 @@ fn validate_model(
             &format!("{prefix}.artifactSelectors[{index}]"),
             diagnostics,
         ) {
+            valid = false;
+        }
+    }
+    for (index, symbol) in model.symbols.iter().enumerate() {
+        if symbol.scheme == GO_SOURCE_IDENTITY_SCHEME
+            && !validate_go_source_identity_symbol(
+                symbol,
+                &model.artifact_selectors,
+                &format!("{prefix}.symbols[{index}]"),
+                diagnostics,
+            )
+        {
             valid = false;
         }
     }
@@ -2352,6 +2604,38 @@ fn validate_model(
     for declaration in &model.declarations {
         if let Some(shape) = &declaration.callable {
             callable_declarations.insert(declaration.symbol.clone(), shape);
+        }
+    }
+    for (index, declaration) in model.declarations.iter().enumerate() {
+        let Some(shape) = &declaration.callable else {
+            continue;
+        };
+        if shape.return_classes.is_empty() {
+            continue;
+        }
+        let callable_kind = matches!(
+            shape.kind,
+            CsmiCallableKind::Function
+                | CsmiCallableKind::Method
+                | CsmiCallableKind::Accessor
+                | CsmiCallableKind::Operator
+        );
+        let mut classes = HashSet::new();
+        let exact_classes = shape.return_classes.iter().all(|class| {
+            let CsmiTypeExpression::Reference(reference) = class else {
+                return false;
+            };
+            declaration_categories.get(&reference.symbol) == Some(&CsmiDeclarationCategory::Type)
+                && classes.insert(reference.symbol.as_str())
+        });
+        if !callable_kind || shape.results.is_empty() || !exact_classes {
+            error(
+                diagnostics,
+                "semantic.exact_return_classes",
+                format!("{prefix}.declarations[{index}].callable.returnClasses"),
+                "exact return classes require a supported callable with a result and unique references to local type declarations",
+            );
+            valid = false;
         }
     }
     for (index, relationship) in model.relationships.iter().enumerate() {
@@ -2587,10 +2871,788 @@ fn validate_model(
     ) {
         valid = false;
     }
+    if !validate_callable_values_semantics(
+        model,
+        document,
+        &prefix,
+        &symbols,
+        &declaration_categories,
+        &callable_declarations,
+        diagnostics,
+    ) {
+        valid = false;
+    }
     if !validate_transfer_partition_semantics(model, &prefix, &callable_declarations, diagnostics) {
         valid = false;
     }
     valid
+}
+
+fn validate_callable_values_semantics(
+    model: &CsmiSemanticModel,
+    document: &CsmiSemanticDocument,
+    prefix: &str,
+    symbols: &HashSet<String>,
+    declaration_categories: &HashMap<String, CsmiDeclarationCategory>,
+    callable_declarations: &HashMap<String, &CsmiCallableShape>,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> bool {
+    let uses: Vec<(usize, &CsmiVocabularyUse)> = model
+        .vocabulary_uses
+        .iter()
+        .enumerate()
+        .filter(|(_, use_)| use_.identifier == CSMI_CALLABLE_VALUES_PROFILE_ID)
+        .collect();
+    let facts: Vec<(usize, &CsmiExtensionFact)> = model
+        .extension_facts
+        .iter()
+        .enumerate()
+        .filter(|(_, fact)| fact.vocabulary == CSMI_CALLABLE_VALUES_PROFILE_ID)
+        .collect();
+    let completeness: Vec<(usize, &CsmiCompletenessStatement)> = model
+        .completeness_statements
+        .iter()
+        .enumerate()
+        .filter(|(_, statement)| {
+            statement.vocabulary.as_deref() == Some(CSMI_CALLABLE_VALUES_PROFILE_ID)
+        })
+        .collect();
+    if uses.is_empty() && facts.is_empty() && completeness.is_empty() {
+        return true;
+    }
+
+    let mut valid = true;
+    let mut required_affects = HashSet::new();
+    for (index, use_) in &uses {
+        let path = format!("{prefix}.vocabularyUses[{index}]");
+        if use_.version != CSMI_CALLABLE_VALUES_PROFILE_VERSION
+            || use_.schema != CSMI_CALLABLE_VALUES_PROFILE_SCHEMA
+        {
+            error(
+                diagnostics,
+                "semantic.callable_values_profile_identity",
+                &path,
+                "callable-values requires exact version 0.1.0 and schema URI",
+            );
+            valid = false;
+            continue;
+        }
+        if use_.requirement != CsmiVocabularyRequirement::Required {
+            error(
+                diagnostics,
+                "semantic.callable_values_required_use",
+                format!("{path}.requirement"),
+                "callable-values facts require a required vocabulary use",
+            );
+            valid = false;
+        }
+        for (affect_index, affect) in use_.affects.iter().enumerate() {
+            let affect_path = format!("{path}.affects[{affect_index}]");
+            let CsmiAffectedUnit::FactFamily(family) = affect else {
+                error(
+                    diagnostics,
+                    "semantic.callable_values_affect_kind",
+                    affect_path,
+                    "callable-values uses affect exact fact families only",
+                );
+                valid = false;
+                continue;
+            };
+            let callable = family.scope.get("callable").and_then(Value::as_str);
+            let exact_scope = callable.map(|id| serde_json::json!({"callable": id}));
+            if family.kind != CsmiAffectedFactFamilyKind::FactFamily
+                || !matches!(
+                    family.family.as_str(),
+                    CSMI_CALLABLE_VALUES_RETURNED_CALLABLES_FAMILY
+                        | CSMI_CALLABLE_VALUES_CALLBACK_INVOCATIONS_FAMILY
+                )
+                || exact_scope.as_ref() != Some(&family.scope)
+            {
+                error(
+                    diagnostics,
+                    "semantic.callable_values_affect_scope",
+                    affect_path,
+                    "callable-values affects must name one supported family and exactly one callable",
+                );
+                valid = false;
+                continue;
+            }
+            let callable = callable.expect("exact callable scope");
+            if declaration_categories.get(callable) != Some(&CsmiDeclarationCategory::Callable)
+                || !callable_declarations.contains_key(callable)
+            {
+                error(
+                    diagnostics,
+                    "semantic.callable_values_affect_callable",
+                    format!("{affect_path}.scope.callable"),
+                    "affected callable must have a callable declaration and shape",
+                );
+                valid = false;
+            }
+            if use_.requirement == CsmiVocabularyRequirement::Required {
+                required_affects.insert((family.family.clone(), canonical_scope(&family.scope)));
+            }
+        }
+    }
+
+    let mut uncertain_callback_scopes = HashSet::new();
+    let mut uncertain_returned_scopes = HashSet::new();
+    for (index, fact) in &facts {
+        let path = format!("{prefix}.extensionFacts[{index}]");
+        if fact.version != CSMI_CALLABLE_VALUES_PROFILE_VERSION {
+            error(
+                diagnostics,
+                "semantic.callable_values_profile_identity",
+                format!("{path}.version"),
+                "callable-values facts require version 0.1.0",
+            );
+            valid = false;
+        }
+        if !matches!(
+            fact.family.as_str(),
+            CSMI_CALLABLE_VALUES_RETURNED_CALLABLES_FAMILY
+                | CSMI_CALLABLE_VALUES_CALLBACK_INVOCATIONS_FAMILY
+        ) {
+            error(
+                diagnostics,
+                "semantic.callable_values_family",
+                format!("{path}.family"),
+                "callable-values fact family is not supported by version 0.1.0",
+            );
+            valid = false;
+            continue;
+        }
+        let callable = fact.scope.get("callable").and_then(Value::as_str);
+        let exact_scope = callable.map(|id| serde_json::json!({"callable": id}));
+        if exact_scope.as_ref() != Some(&fact.scope) {
+            error(
+                diagnostics,
+                "semantic.callable_values_scope",
+                format!("{path}.scope"),
+                "callable-values fact scope must contain exactly its callable symbol",
+            );
+            valid = false;
+            continue;
+        }
+        let callable = callable.expect("exact callable scope");
+        let Some(enclosing_shape) = callable_declarations.get(callable).filter(|_| {
+            declaration_categories.get(callable) == Some(&CsmiDeclarationCategory::Callable)
+        }) else {
+            error(
+                diagnostics,
+                "semantic.callable_values_callable",
+                format!("{path}.scope.callable"),
+                "fact scope must name a declared callable with a complete shape",
+            );
+            valid = false;
+            continue;
+        };
+        if !required_affects.contains(&(fact.family.clone(), canonical_scope(&fact.scope))) {
+            error(
+                diagnostics,
+                "semantic.callable_values_affects",
+                &path,
+                "fact family and exact callable scope must be declared by a required vocabulary use",
+            );
+            valid = false;
+        }
+        let mut uncertain = false;
+        if !callable_values_reference_evidence(
+            model,
+            document,
+            callable,
+            &fact.provenance,
+            &format!("{path}.scope.callable"),
+            diagnostics,
+        ) {
+            uncertain = true;
+        }
+        let payload =
+            match serde_json::from_value::<CsmiCallableValuesPayload>(fact.payload.clone()) {
+                Ok(payload) => payload,
+                Err(cause) => {
+                    error(
+                        diagnostics,
+                        "semantic.callable_values_payload",
+                        format!("{path}.payload"),
+                        format!("invalid callable-values payload: {cause}"),
+                    );
+                    valid = false;
+                    continue;
+                }
+            };
+        match (fact.family.as_str(), payload) {
+            (
+                CSMI_CALLABLE_VALUES_RETURNED_CALLABLES_FAMILY,
+                CsmiCallableValuesPayload::ReturnedCallable {
+                    callable: payload_callable,
+                    result,
+                    target,
+                },
+            ) => {
+                if payload_callable != callable {
+                    error(
+                        diagnostics,
+                        "semantic.callable_values_payload_callable",
+                        format!("{path}.payload.callable"),
+                        "payload callable must equal the exact fact scope callable",
+                    );
+                    valid = false;
+                }
+                if result as usize >= enclosing_shape.results.len() {
+                    error(
+                        diagnostics,
+                        "semantic.callable_values_result",
+                        format!("{path}.payload.result"),
+                        "factory result position is outside the callable's normal result shape",
+                    );
+                    valid = false;
+                }
+                let Some(_) = callable_declarations.get(&target).filter(|_| {
+                    declaration_categories.get(&target) == Some(&CsmiDeclarationCategory::Callable)
+                }) else {
+                    error(
+                        diagnostics,
+                        "semantic.callable_values_target",
+                        format!("{path}.payload.target"),
+                        "returned target must be a declared callable with a complete shape",
+                    );
+                    valid = false;
+                    continue;
+                };
+                if !callable_values_reference_evidence(
+                    model,
+                    document,
+                    &target,
+                    &fact.provenance,
+                    &format!("{path}.payload.target"),
+                    diagnostics,
+                ) {
+                    uncertain = true;
+                }
+                if uncertain {
+                    uncertain_returned_scopes.insert(callable.to_owned());
+                }
+            }
+            (
+                CSMI_CALLABLE_VALUES_CALLBACK_INVOCATIONS_FAMILY,
+                CsmiCallableValuesPayload::CallbackInvocation {
+                    callable: payload_callable,
+                    callback,
+                    shape,
+                    arguments,
+                    timing: _,
+                    modality: _,
+                },
+            ) => {
+                if payload_callable != callable {
+                    error(
+                        diagnostics,
+                        "semantic.callable_values_payload_callable",
+                        format!("{path}.payload.callable"),
+                        "payload callable must equal the exact fact scope callable",
+                    );
+                    valid = false;
+                }
+                if arguments.len() != shape.parameters as usize {
+                    error(
+                        diagnostics,
+                        "semantic.callable_values_argument_arity",
+                        format!("{path}.payload.arguments"),
+                        "arguments must have exactly one entry for each callback parameter",
+                    );
+                    valid = false;
+                }
+                // Missing callback-shape proof below makes this observation
+                // uncertain regardless of the location's separate uncertainty.
+                let (callback_valid, _) = validate_callable_values_location(
+                    model,
+                    document,
+                    &callback,
+                    enclosing_shape,
+                    symbols,
+                    &fact.provenance,
+                    &format!("{path}.payload.callback"),
+                    diagnostics,
+                );
+                valid &= callback_valid;
+                if callback.projection.is_some() {
+                    // Core field declarations prove the member and owner, but
+                    // not the field's value type or callable arity. Until a
+                    // typed ecosystem adapter supplies that link, this fact
+                    // cannot support complete callback-invocation coverage.
+                    error(
+                        diagnostics,
+                        "interpretability.callable_values_callback_shape_unknown",
+                        format!("{path}.payload.callback"),
+                        "core field declarations do not prove the projected callback value's callable shape",
+                    );
+                    uncertain = true;
+                } else {
+                    // A core input root proves where the value came from, not
+                    // that it has the callback arity asserted by this fact.
+                    error(
+                        diagnostics,
+                        "interpretability.callable_values_callback_shape_unknown",
+                        format!("{path}.payload.callback.root"),
+                        "core input roots do not prove the callback value's callable shape",
+                    );
+                    uncertain = true;
+                }
+                if matches!(&callback.root, CsmiInputBoundaryRoot::Capture(_)) {
+                    uncertain = true;
+                }
+                for (argument_index, argument) in arguments.iter().enumerate() {
+                    match argument {
+                        CsmiCallableValuesArgument::Input { source } => {
+                            let (source_valid, source_uncertain) =
+                                validate_callable_values_location(
+                                    model,
+                                    document,
+                                    source,
+                                    enclosing_shape,
+                                    symbols,
+                                    &fact.provenance,
+                                    &format!("{path}.payload.arguments[{argument_index}].source"),
+                                    diagnostics,
+                                );
+                            valid &= source_valid;
+                            uncertain |= source_uncertain;
+                            if matches!(&source.root, CsmiInputBoundaryRoot::Capture(_)) {
+                                uncertain = true;
+                            }
+                        }
+                        CsmiCallableValuesArgument::Unknown { .. } => uncertain = true,
+                    }
+                }
+                if uncertain {
+                    uncertain_callback_scopes.insert(callable.to_owned());
+                }
+            }
+            _ => {
+                error(
+                    diagnostics,
+                    "semantic.callable_values_family_payload",
+                    format!("{path}.payload.kind"),
+                    "payload kind must match its exact callable-values family",
+                );
+                valid = false;
+            }
+        }
+    }
+
+    for (index, statement) in completeness {
+        let path = format!("{prefix}.completenessStatements[{index}]");
+        if statement.vocabulary.as_deref() != Some(CSMI_CALLABLE_VALUES_PROFILE_ID)
+            || statement.version.as_deref() != Some(CSMI_CALLABLE_VALUES_PROFILE_VERSION)
+        {
+            error(
+                diagnostics,
+                "semantic.callable_values_completeness_identity",
+                &path,
+                "callable-values completeness requires exact vocabulary and version",
+            );
+            valid = false;
+        }
+        if !matches!(
+            statement.family.as_str(),
+            CSMI_CALLABLE_VALUES_RETURNED_CALLABLES_FAMILY
+                | CSMI_CALLABLE_VALUES_CALLBACK_INVOCATIONS_FAMILY
+        ) {
+            error(
+                diagnostics,
+                "semantic.callable_values_completeness_family",
+                format!("{path}.family"),
+                "callable-values completeness family is not supported by version 0.1.0",
+            );
+            valid = false;
+            continue;
+        }
+        let callable = statement.scope.get("callable").and_then(Value::as_str);
+        let exact_scope = callable.map(|id| serde_json::json!({"callable": id}));
+        if exact_scope.as_ref() != Some(&statement.scope) {
+            error(
+                diagnostics,
+                "semantic.callable_values_completeness_scope",
+                format!("{path}.scope"),
+                "callable-values completeness scope must contain exactly one callable symbol",
+            );
+            valid = false;
+            continue;
+        }
+        let callable = callable.expect("exact callable scope");
+        if declaration_categories.get(callable) != Some(&CsmiDeclarationCategory::Callable)
+            || !callable_declarations.contains_key(callable)
+        {
+            error(
+                diagnostics,
+                "semantic.callable_values_completeness_callable",
+                format!("{path}.scope.callable"),
+                "completeness scope must name a declared callable with a complete shape",
+            );
+            valid = false;
+        }
+        if !callable_values_reference_evidence(
+            model,
+            document,
+            callable,
+            &statement.provenance,
+            &format!("{path}.scope.callable"),
+            diagnostics,
+        ) {
+            if statement.family == CSMI_CALLABLE_VALUES_CALLBACK_INVOCATIONS_FAMILY {
+                uncertain_callback_scopes.insert(callable.to_owned());
+            } else {
+                uncertain_returned_scopes.insert(callable.to_owned());
+            }
+        }
+        if !required_affects
+            .contains(&(statement.family.clone(), canonical_scope(&statement.scope)))
+        {
+            error(
+                diagnostics,
+                "semantic.callable_values_completeness_affects",
+                &path,
+                "completeness family and exact callable scope must be declared by a required vocabulary use",
+            );
+            valid = false;
+        }
+        if statement.status == CsmiCoverageStatus::Complete
+            && statement.family == CSMI_CALLABLE_VALUES_CALLBACK_INVOCATIONS_FAMILY
+            && uncertain_callback_scopes.contains(callable)
+        {
+            // This family closes only input-observed during-call contracts.
+            // It says nothing about deferred or post-return invocation.
+            error(
+                diagnostics,
+                "semantic.callable_values_complete_uncertain",
+                &path,
+                "during-call callback completeness cannot include unknown arguments, captures, or unproven member identity",
+            );
+            valid = false;
+        }
+        if statement.status == CsmiCoverageStatus::Complete
+            && statement.family == CSMI_CALLABLE_VALUES_RETURNED_CALLABLES_FAMILY
+            && uncertain_returned_scopes.contains(callable)
+        {
+            error(
+                diagnostics,
+                "semantic.callable_values_complete_uncertain",
+                &path,
+                "returned-callables completeness cannot include unresolved target identity or artifact provenance",
+            );
+            valid = false;
+        }
+    }
+    valid
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_callable_values_location(
+    model: &CsmiSemanticModel,
+    document: &CsmiSemanticDocument,
+    location: &CsmiInputLocation,
+    enclosing_shape: &CsmiCallableShape,
+    symbols: &HashSet<String>,
+    fact_provenance: &[LocalId],
+    path: &str,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> (bool, bool) {
+    let mut valid = validate_input_location(location, enclosing_shape, symbols, path, diagnostics);
+    let mut uncertain = false;
+    if let CsmiInputBoundaryRoot::Capture(root) = &location.root
+        && !callable_values_reference_evidence(
+            model,
+            document,
+            &root.symbol,
+            fact_provenance,
+            &format!("{path}.root.symbol"),
+            diagnostics,
+        )
+    {
+        uncertain = true;
+    }
+    let Some(projection) = &location.projection else {
+        return (valid, uncertain);
+    };
+    if projection.scheme != CSMI_STRUCTURED_LOCATIONS_SCHEME
+        || projection.scheme_version != CSMI_STRUCTURED_LOCATIONS_VERSION
+        || projection.steps.is_empty()
+        || projection.steps.len() > 16
+    {
+        error(
+            diagnostics,
+            "semantic.callable_values_projection",
+            format!("{path}.projection"),
+            "callable-values requires one through sixteen structured-locations 0.1.0 steps",
+        );
+        return (false, true);
+    }
+    let mut current_type = callable_values_input_root_type(location, enclosing_shape, model);
+    if current_type.is_none() {
+        error(
+            diagnostics,
+            "interpretability.callable_values_root_type_unknown",
+            format!("{path}.root"),
+            "the input root has no core type proof for validating a member owner",
+        );
+        uncertain = true;
+    }
+    for (index, step) in projection.steps.iter().enumerate() {
+        let step_path = format!("{path}.projection.steps[{index}]");
+        let field_id = step
+            .args
+            .as_ref()
+            .and_then(|args| args.get("symbol"))
+            .and_then(Value::as_str);
+        if step.kind != "field" || field_id.is_none() {
+            error(
+                diagnostics,
+                "semantic.callable_values_projection_step",
+                &step_path,
+                "callable-values projection steps require a field and its exact symbol",
+            );
+            valid = false;
+            uncertain = true;
+            continue;
+        }
+        let field_id = field_id.expect("validated field projection symbol");
+        let Some(field_declaration) = model
+            .declarations
+            .iter()
+            .find(|declaration| declaration.symbol == field_id)
+        else {
+            error(
+                diagnostics,
+                "semantic.callable_values_field_declaration",
+                format!("{step_path}.args.symbol"),
+                "field symbol must resolve to a declaration",
+            );
+            valid = false;
+            uncertain = true;
+            continue;
+        };
+        if field_declaration.category != CsmiDeclarationCategory::Value {
+            error(
+                diagnostics,
+                "semantic.callable_values_field_category",
+                format!("{step_path}.args.symbol"),
+                "field projection symbol must be a value declaration",
+            );
+            valid = false;
+        }
+        let Some(owner) = field_declaration.owner.as_deref() else {
+            error(
+                diagnostics,
+                "interpretability.callable_values_field_owner_unknown",
+                format!("{step_path}.args.symbol"),
+                "field declaration has no symbol-backed owner proof",
+            );
+            uncertain = true;
+            current_type = None;
+            continue;
+        };
+        let owner_category = model
+            .declarations
+            .iter()
+            .find(|declaration| declaration.symbol == owner)
+            .map(|declaration| declaration.category);
+        if owner_category != Some(CsmiDeclarationCategory::Type) {
+            error(
+                diagnostics,
+                "semantic.callable_values_field_owner",
+                format!("{step_path}.args.symbol"),
+                "field owner must resolve to a declared type symbol",
+            );
+            valid = false;
+        }
+        if let Some(expected_owner) = current_type.as_deref() {
+            if owner != expected_owner {
+                error(
+                    diagnostics,
+                    "semantic.callable_values_field_owner_mismatch",
+                    format!("{step_path}.args.symbol"),
+                    "field owner does not equal the proven input-root or preceding field type",
+                );
+                valid = false;
+            } else if !callable_values_same_artifact(model, field_id, owner) {
+                error(
+                    diagnostics,
+                    "interpretability.callable_values_field_artifact_unknown",
+                    format!("{step_path}.args.symbol"),
+                    "field and owner do not carry the same exact artifact selectors",
+                );
+                uncertain = true;
+            }
+        } else {
+            error(
+                diagnostics,
+                "interpretability.callable_values_owner_chain_incomplete",
+                format!("{step_path}.args.symbol"),
+                "the preceding input value type is unavailable, so this field owner cannot be proven",
+            );
+            uncertain = true;
+        }
+        if !callable_values_reference_evidence(
+            model,
+            document,
+            field_id,
+            fact_provenance,
+            &format!("{step_path}.args.symbol"),
+            diagnostics,
+        ) || !callable_values_reference_evidence(
+            model,
+            document,
+            owner,
+            fact_provenance,
+            &format!("{step_path}.args.symbol.owner"),
+            diagnostics,
+        ) {
+            uncertain = true;
+        }
+        // Core declarations do not carry a value type for fields. A following
+        // projection step therefore cannot inherit a guessed owner type.
+        current_type = None;
+    }
+    (valid, uncertain)
+}
+
+fn callable_values_input_root_type(
+    location: &CsmiInputLocation,
+    enclosing_shape: &CsmiCallableShape,
+    model: &CsmiSemanticModel,
+) -> Option<String> {
+    let expression = match &location.root {
+        CsmiInputBoundaryRoot::Receiver(_) => enclosing_shape
+            .receiver
+            .as_ref()
+            .and_then(|receiver| receiver.receiver_type.as_ref()),
+        CsmiInputBoundaryRoot::Parameter(root) => enclosing_shape
+            .parameters
+            .get(root.position as usize)
+            .and_then(|parameter| parameter.parameter_type.as_ref()),
+        CsmiInputBoundaryRoot::Capture(_) => None,
+    }?;
+    callable_values_type_symbol(expression, model)
+}
+
+fn callable_values_type_symbol(
+    expression: &CsmiTypeExpression,
+    model: &CsmiSemanticModel,
+) -> Option<String> {
+    let mut current = expression;
+    let mut visited = HashSet::new();
+    loop {
+        let CsmiTypeExpression::Reference(reference) = current else {
+            return None;
+        };
+        if !visited.insert(reference.symbol.as_str()) {
+            return None;
+        }
+        let declaration = model
+            .declarations
+            .iter()
+            .find(|declaration| declaration.symbol == reference.symbol)?;
+        match declaration.category {
+            CsmiDeclarationCategory::Type => return Some(reference.symbol.clone()),
+            CsmiDeclarationCategory::TypeAlias => {
+                current = declaration.alias_target.as_ref()?;
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn callable_values_reference_evidence(
+    model: &CsmiSemanticModel,
+    document: &CsmiSemanticDocument,
+    symbol_id: &str,
+    fact_provenance: &[LocalId],
+    path: &str,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> bool {
+    let Some(symbol) = model.symbols.iter().find(|symbol| symbol.id == symbol_id) else {
+        error(
+            diagnostics,
+            "interpretability.callable_values_symbol_identity_unknown",
+            path,
+            "referenced symbol has no symbol definition",
+        );
+        return false;
+    };
+    let Some(declaration) = model
+        .declarations
+        .iter()
+        .find(|declaration| declaration.symbol == symbol_id)
+    else {
+        error(
+            diagnostics,
+            "interpretability.callable_values_declaration_unknown",
+            path,
+            "referenced symbol has no declaration proof",
+        );
+        return false;
+    };
+    let selectors = symbol
+        .artifact_selectors
+        .as_deref()
+        .unwrap_or(&model.artifact_selectors);
+    let mut provenance_ids = Vec::new();
+    provenance_ids.extend(fact_provenance);
+    provenance_ids.extend(symbol.provenance.iter());
+    provenance_ids.extend(declaration.provenance.iter());
+    if provenance_ids.is_empty()
+        && let Some(default) = &document.default_provenance
+    {
+        provenance_ids.push(default);
+    }
+    let selectors_bound = !selectors.is_empty()
+        && selectors.iter().all(|selector| {
+            !selector.digests.is_empty()
+                && selector.digests.iter().any(|digest| {
+                    provenance_ids.iter().any(|provenance_id| {
+                        document
+                            .provenance_records
+                            .iter()
+                            .find(|record| record.id.as_str() == provenance_id.as_str())
+                            .is_some_and(|record| {
+                                record.inputs.iter().any(|input| {
+                                    input.purl.as_deref() == Some(selector.purl.as_str())
+                                        && input.digest.as_ref() == Some(digest)
+                                })
+                            })
+                    })
+                })
+        });
+    if !selectors_bound {
+        error(
+            diagnostics,
+            "interpretability.callable_values_artifact_provenance_unknown",
+            path,
+            "referenced symbol lacks matching digest-backed artifact applicability and provenance",
+        );
+        false
+    } else {
+        true
+    }
+}
+
+fn callable_values_same_artifact(model: &CsmiSemanticModel, left_id: &str, right_id: &str) -> bool {
+    let Some(left) = model.symbols.iter().find(|symbol| symbol.id == left_id) else {
+        return false;
+    };
+    let Some(right) = model.symbols.iter().find(|symbol| symbol.id == right_id) else {
+        return false;
+    };
+    let left = left
+        .artifact_selectors
+        .as_deref()
+        .unwrap_or(&model.artifact_selectors);
+    let right = right
+        .artifact_selectors
+        .as_deref()
+        .unwrap_or(&model.artifact_selectors);
+    left.len() == right.len() && left.iter().all(|selector| right.contains(selector))
 }
 
 fn validate_transfer_partition_semantics(
@@ -3926,14 +4988,11 @@ fn validate_deferred_yield_retention(
     path: &str,
     diagnostics: &mut Vec<CsmiDiagnostic>,
 ) -> bool {
-    match retention {
-        CsmiDeferredYieldRetention::Mode(_) => true,
-        CsmiDeferredYieldRetention::Uncertain(uncertainty) => validate_profile_limitation(
-            &uncertainty.limitation,
-            &format!("{path}.limitation"),
-            diagnostics,
-        ),
-    }
+    let limitation = match retention {
+        CsmiDeferredYieldRetention::Mode(_) => None,
+        CsmiDeferredYieldRetention::Uncertain(uncertainty) => Some(&uncertainty.limitation),
+    };
+    validate_optional_profile_limitation(limitation, path, diagnostics)
 }
 
 fn validate_deferred_yield_validity(
@@ -3979,14 +5038,21 @@ fn validate_deferred_yield_delivery(
     path: &str,
     diagnostics: &mut Vec<CsmiDiagnostic>,
 ) -> bool {
-    match delivery {
-        CsmiDeferredYieldDelivery::Mode(_) => true,
-        CsmiDeferredYieldDelivery::Uncertain(uncertainty) => validate_profile_limitation(
-            &uncertainty.limitation,
-            &format!("{path}.limitation"),
-            diagnostics,
-        ),
-    }
+    let limitation = match delivery {
+        CsmiDeferredYieldDelivery::Mode(_) => None,
+        CsmiDeferredYieldDelivery::Uncertain(uncertainty) => Some(&uncertainty.limitation),
+    };
+    validate_optional_profile_limitation(limitation, path, diagnostics)
+}
+
+fn validate_optional_profile_limitation(
+    limitation: Option<&CsmiProfileLimitation>,
+    path: &str,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> bool {
+    limitation.is_none_or(|limitation| {
+        validate_profile_limitation(limitation, &format!("{path}.limitation"), diagnostics)
+    })
 }
 
 fn deferred_yield_payload_uncertain(payload: &CsmiDeferredYieldPayload) -> bool {
@@ -6074,17 +7140,13 @@ fn validate_input_location(
             );
             false
         }
-        CsmiInputBoundaryRoot::Parameter(root)
-            if root.position as usize >= shape.parameters.len() =>
-        {
-            error(
-                diagnostics,
-                "semantic.parameter_root",
-                path,
-                "input parameter position is outside callable shape",
-            );
-            false
-        }
+        CsmiInputBoundaryRoot::Parameter(root) => validate_parameter_location(
+            root.position,
+            shape.parameters.len(),
+            "input",
+            path,
+            diagnostics,
+        ),
         CsmiInputBoundaryRoot::Capture(root) => {
             require_id(symbols, &root.symbol, path, "capture symbol", diagnostics)
         }
@@ -6111,17 +7173,13 @@ fn validate_output_location(
             );
             false
         }
-        CsmiOutputBoundaryRoot::Parameter(root)
-            if root.position as usize >= shape.parameters.len() =>
-        {
-            error(
-                diagnostics,
-                "semantic.parameter_root",
-                path,
-                "output parameter position is outside callable shape",
-            );
-            false
-        }
+        CsmiOutputBoundaryRoot::Parameter(root) => validate_parameter_location(
+            root.position,
+            shape.parameters.len(),
+            "output",
+            path,
+            diagnostics,
+        ),
         CsmiOutputBoundaryRoot::Result(root) if root.position as usize >= shape.results.len() => {
             error(
                 diagnostics,
@@ -6136,6 +7194,25 @@ fn validate_output_location(
         }
         _ => true,
     }
+}
+
+fn validate_parameter_location(
+    position: u32,
+    parameter_count: usize,
+    boundary: &str,
+    path: &str,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> bool {
+    if (position as usize) < parameter_count {
+        return true;
+    }
+    error(
+        diagnostics,
+        "semantic.parameter_root",
+        path,
+        format!("{boundary} parameter position is outside callable shape"),
+    );
+    false
 }
 
 fn validate_provenance_ids(
@@ -6588,9 +7665,11 @@ fn validate_conditional_type_target(
 #[cfg(test)]
 mod scope_key_tests {
     use super::canonical_scope;
+    use brokk_bifrost_test_macros::hardwon;
     use serde_json::Value;
 
     #[test]
+    #[hardwon("#3211: scope identity treated object member order like array order")]
     fn scope_keys_ignore_nested_object_order_but_preserve_array_order() {
         let left: Value = serde_json::from_str(
             r#"{"kind":"yield","items":[{"factory":"f","resume":"r"},"next"]}"#,

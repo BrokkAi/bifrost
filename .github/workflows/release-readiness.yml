@@ -389,14 +389,7 @@ jobs:
         shell: bash
         env:
           RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
-        run: |
-          target=x86_64-unknown-linux-gnu
-          stage="${BIN_NAME}-${RELEASE_TAG}-${target}"
-          mkdir -p "dist/${stage}"
-          cp "target/${target}/release/${BIN_NAME}" "dist/${stage}/"
-          cp LICENSE.md README.md licenses/THIRD_PARTY_LICENSES.html licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt "dist/${stage}/"
-          tar -C dist -czf "dist/${stage}.tar.gz" "${stage}"
-          (cd dist && shasum -a 256 "${stage}.tar.gz" > "${stage}.tar.gz.sha256")
+        run: bash scripts/public/stage-unix-release-archive.sh "target/x86_64-unknown-linux-gnu/release/${BIN_NAME}" x86_64-unknown-linux-gnu "$RELEASE_TAG"
       - name: Upload exact binary archive
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
@@ -548,13 +541,7 @@ jobs:
         shell: bash
         env:
           RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
-        run: |
-          stage="${BIN_NAME}-${RELEASE_TAG}-${{ matrix.target }}"
-          mkdir -p "dist/${stage}"
-          cp "target/${{ matrix.target }}/release/${BIN_NAME}" "dist/${stage}/"
-          cp LICENSE.md README.md licenses/THIRD_PARTY_LICENSES.html licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt "dist/${stage}/"
-          tar -C dist -czf "dist/${stage}.tar.gz" "${stage}"
-          (cd dist && shasum -a 256 "${stage}.tar.gz" > "${stage}.tar.gz.sha256")
+        run: bash scripts/public/stage-unix-release-archive.sh "target/${{ matrix.target }}/release/${BIN_NAME}" "${{ matrix.target }}" "$RELEASE_TAG"
       - name: Stage Windows archive
         if: matrix.archive == 'zip'
         shell: pwsh
@@ -781,23 +768,7 @@ jobs:
         shell: bash
         env:
           EXPECTED_VERSION: ${{ needs.preflight.outputs.version }}
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          artifacts=(dist/*.whl dist/*.tar.gz)
-          test "${#artifacts[@]}" -gt 0
-          for artifact in "${artifacts[@]}"; do
-            case "$(basename "$artifact")" in
-              *-"${EXPECTED_VERSION}"-*|*-"${EXPECTED_VERSION}".tar.gz) ;;
-              *) echo "Unexpected distribution version: $artifact" >&2; exit 1 ;;
-            esac
-          done
-          python_wheels=(dist/brokk_bifrost_searchtools-*.whl)
-          cli_wheels=(dist/brokk_bifrost-*.whl)
-          sdists=(dist/brokk_bifrost_searchtools-*.tar.gz)
-          test "${#python_wheels[@]}" -eq 5
-          test "${#cli_wheels[@]}" -eq 5
-          test "${#sdists[@]}" -eq 1
+        run: bash scripts/public/check-distribution-versions.sh dist "$EXPECTED_VERSION" 5 5 1
 
   agent-plugin-package:
     name: package agent plugin
@@ -842,14 +813,7 @@ jobs:
         shell: bash
         env:
           RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
-        run: |
-          set -euo pipefail
-          package_root="${RUNNER_TEMP}/bifrost-agent-package"
-          mkdir -p "$package_root" dist
-          cp -R plugins/bifrost-agent "$package_root/bifrost-agent"
-          cp LICENSE.md "$package_root/bifrost-agent/"
-          tar -C "$package_root" -czf "dist/bifrost-agent-${RELEASE_TAG}.tar.gz" bifrost-agent
-          sha256sum "dist/bifrost-agent-${RELEASE_TAG}.tar.gz" > "dist/bifrost-agent-${RELEASE_TAG}.tar.gz.sha256"
+        run: bash scripts/public/package-agent-plugin.sh "$RELEASE_TAG" "${RUNNER_TEMP}/bifrost-agent-package"
       - name: Upload exact agent plugin archive
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
@@ -893,19 +857,7 @@ jobs:
         env:
           BINARY_DIR: ${{ runner.temp }}/bifrost-linux-release
           PLUGIN_DIR: ${{ runner.temp }}/bifrost-agent-release
-        run: |
-          set -euo pipefail
-          archive="$(find "$BINARY_DIR" -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"
-          test -n "$archive"
-          tar -C "$BINARY_DIR" -xzf "$archive"
-          binary="$(find "$BINARY_DIR" -type f -name "$BIN_NAME" -print -quit)"
-          test -n "$binary"
-          chmod +x "$binary"
-          plugin_archive="$(find "$PLUGIN_DIR" -maxdepth 1 -type f -name 'bifrost-agent-*.tar.gz' -print -quit)"
-          test -n "$plugin_archive"
-          tar -C "$PLUGIN_DIR" -xzf "$plugin_archive"
-          echo "binary=$binary" >> "$GITHUB_OUTPUT"
-          echo "plugin=$PLUGIN_DIR/bifrost-agent" >> "$GITHUB_OUTPUT"
+        run: bash scripts/public/stage-agent-plugin-smoke.sh "$BINARY_DIR" "$PLUGIN_DIR" "$BIN_NAME"
       - name: Run real Codex and Claude list_policies smoke
         shell: bash
         run: >
@@ -988,18 +940,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          "$STAGED_BIFROST" pack-engine-profile > "${RUNNER_TEMP}/pack-engine-profile.json"
-          profile_sha256="$(sha256sum "${RUNNER_TEMP}/pack-engine-profile.json" | awk '{print $1}')"
-          [[ "$profile_sha256" =~ ^[0-9a-f]{64}$ ]]
-          echo "sha256=$profile_sha256" >> "$GITHUB_OUTPUT"
+          "$STAGED_BIFROST" prepare-open-packs \
+            --cache-dir "${RUNNER_TEMP}/open-packs-cache" --identity-only \
+            > "${RUNNER_TEMP}/open-packs-identity.json"
+          identity="$(jq -er '.identity | select(test("^[0-9a-f]{64}$"))' "${RUNNER_TEMP}/open-packs-identity.json")"
+          echo "identity=$identity" >> "$GITHUB_OUTPUT"
       - name: Restore verified open-pack cache for this engine profile
         if: ${{ inputs.qualify_open_content || needs.preflight.outputs.version != '0.13.0' }}
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/open-packs-cache
-          key: bifrost-open-packs-v1-${{ steps.pack-profile.outputs.sha256 }}-receipt-pending
+          key: bifrost-open-packs-v1-${{ steps.pack-profile.outputs.identity }}-receipt-pending
           restore-keys: |
-            bifrost-open-packs-v1-${{ steps.pack-profile.outputs.sha256 }}-
+            bifrost-open-packs-v1-${{ steps.pack-profile.outputs.identity }}-
       - name: Acquire eligible integrity-verified Bifrost-packs release
         if: ${{ inputs.qualify_open_content || needs.preflight.outputs.version != '0.13.0' }}
         id: open-packs
@@ -1009,8 +962,7 @@ jobs:
           receipt="${RUNNER_TEMP}/open-packs-receipt.json"
           env_file="${RUNNER_TEMP}/open-packs.env.json"
           rm -f "$receipt" "$env_file"
-          node scripts/public/prepare-open-packs.mjs \
-            --binary "$STAGED_BIFROST" \
+          "$STAGED_BIFROST" prepare-open-packs \
             --cache-dir "${RUNNER_TEMP}/open-packs-cache" \
             --receipt-path "$receipt" \
             --env-path "$env_file"
@@ -1071,7 +1023,7 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/open-packs-cache
-          key: bifrost-open-packs-v1-${{ steps.pack-profile.outputs.sha256 }}-${{ steps.open-packs.outputs.receipt_sha256 }}
+          key: bifrost-open-packs-v1-${{ steps.pack-profile.outputs.identity }}-${{ steps.open-packs.outputs.receipt_sha256 }}
       - name: Record typed policy smoke status
         if: ${{ inputs.qualify_open_content || needs.preflight.outputs.version != '0.13.0' }}
         shell: bash
@@ -1180,15 +1132,7 @@ jobs:
           --release-tag "${{ needs.preflight.outputs.tag }}"
           --assets "${{ github.workspace }}/release-assets"
       - name: Inspect npm tarballs
-        shell: bash
-        run: |
-          set -euo pipefail
-          for tarball in npm/dist/*.tgz; do
-            if tar -tzf "$tarball" | grep -E '(^|/)([.]npmrc|[.]git|id_rsa|credentials)($|/)'; then
-              echo "unexpected sensitive path in $tarball" >&2
-              exit 1
-            fi
-          done
+        run: bash scripts/public/check-npm-tarballs.sh npm/dist
       - name: Smoke exact Linux npm installation
         run: npm run test-release --prefix npm -- --dist dist --release-tag "${{ needs.preflight.outputs.tag }}"
       - name: Upload exact npm tarballs

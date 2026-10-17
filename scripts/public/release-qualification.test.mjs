@@ -7,6 +7,7 @@ import { test } from "node:test";
 import { promisify } from "node:util";
 
 import { buildIdentity } from "./write-qualification-identity.mjs";
+import { createQualificationBundle } from "./qualification-test-helpers.mjs";
 import {
   classifyArtifact,
   generateManifest,
@@ -397,13 +398,13 @@ test("selection rejects a successful run from another repository", () => {
 });
 
 async function preparedBundle() {
-  const temp = await fs.mkdtemp(path.join(os.tmpdir(), "bifrost-qualification-"));
-  const bundle = path.join(temp, "bundle");
-  await fs.mkdir(bundle);
-  await fs.writeFile(path.join(bundle, "cli.tar.gz"), "release");
-  const output = path.join(bundle, "release-qualification.json");
-  generateManifest({ bundleDir: bundle, identity, outputPath: output });
-  return { bundle, output };
+  const fixture = await createQualificationBundle({
+    prefix: "bifrost-qualification-",
+    files: { "cli.tar.gz": "release" },
+    identity,
+    generateManifest,
+  });
+  return { bundle: fixture.bundleDir, output: fixture.manifestPath };
 }
 
 function readinessRun(id) {

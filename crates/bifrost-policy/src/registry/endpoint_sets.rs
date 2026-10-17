@@ -79,6 +79,13 @@ impl EndpointSetClosure {
                 &mut endpoint.origins,
             )?;
         }
+        for barrier in &mut spec.barriers {
+            let path = dependency_path(format!(
+                "/analysis/barriers/entries/{}",
+                json_pointer_segment(barrier.id.as_str())
+            ))?;
+            self.extend_origins_at(&path, &mut barrier.origins);
+        }
         for endpoint in &mut spec.sanitizers {
             self.extend_origins(&endpoint.selector_path, &mut endpoint.origins)?;
         }
@@ -107,7 +114,12 @@ impl EndpointSetClosure {
             .strip_suffix("/selector")
             .expect("entry selector has the structured selector suffix");
         let path = dependency_path(base)?;
-        if let Some(sources) = self.origins.get(&path) {
+        self.extend_origins_at(&path, origins);
+        Ok(())
+    }
+
+    fn extend_origins_at(&self, path: &PolicyDependencyPath, origins: &mut Vec<EndpointOrigin>) {
+        if let Some(sources) = self.origins.get(path) {
             origins.extend(
                 sources
                     .iter()
@@ -119,7 +131,6 @@ impl EndpointSetClosure {
             origins.sort();
             origins.dedup();
         }
-        Ok(())
     }
 }
 
@@ -155,6 +166,7 @@ impl PolicyRegistry {
         locators: LocatorResolution<'_>,
     ) -> Result<EndpointSetClosure, PolicyRegistryError> {
         self.ensure_local_retained_bytes(source_bytes)?;
+        let locators = locators.endpoints();
         let mut closure = EndpointSetClosure {
             cache: self.endpoint_set_cache.clone(),
             retained_bytes: source_bytes,
@@ -196,6 +208,7 @@ impl PolicyRegistry {
         let mut ids: HashSet<TaintEntryId> = all_entries(spec, flow)
             .into_iter()
             .map(|(_, id, _)| id.clone())
+            .chain(spec.barriers.entries.iter().map(|entry| entry.id.clone()))
             .collect();
         let mut selected_dependency_paths = HashSet::new();
         let parsed = Arc::new(parsed.clone());
@@ -271,7 +284,7 @@ impl PolicyRegistry {
                     resolve_selector_locators(selector, locators)?;
                     let source_path = selector_path(format!(
                         "/set/entries/{}/selector",
-                        pointer_segment(id.as_str())
+                        json_pointer_segment(id.as_str())
                     ))?;
                     let loaded = resolve_parsed_selector(
                         Some(root),
@@ -292,7 +305,7 @@ impl PolicyRegistry {
                     let mut resolved = loaded.selector;
                     let base = format!(
                         "/analysis/{segment}/entries/{}",
-                        pointer_segment(id.as_str())
+                        json_pointer_segment(id.as_str())
                     );
                     resolved.path = selector_path(format!("{base}/selector"))?;
                     selector_values.push(json!({"id": id.as_str(), "selector": crate::canonical_loaded::resolved_selector_to_json(&resolved)}));
@@ -304,6 +317,38 @@ impl PolicyRegistry {
                         .or_default()
                         .push(document.identity().clone());
                     closure.selectors.insert(resolved.path.clone(), resolved);
+                }
+                for barrier in &typed.spec.barriers.entries {
+                    if !ids.insert(barrier.id.clone()) {
+                        return Err(import_error(
+                            &frame,
+                            "duplicate-endpoint-set-entry",
+                            format!(
+                                "duplicate endpoint entry ID `{}` in the policy dependency closure",
+                                barrier.id
+                            ),
+                        ));
+                    }
+                    if ids.len() > self.limits.max_endpoint_set_entries {
+                        return Err(import_error(
+                            &frame,
+                            "endpoint-set-entry-limit",
+                            format!(
+                                "endpoint-set closure exceeds {} entries",
+                                self.limits.max_endpoint_set_entries
+                            ),
+                        ));
+                    }
+                    let path = dependency_path(format!(
+                        "/analysis/barriers/entries/{}",
+                        json_pointer_segment(barrier.id.as_str())
+                    ))?;
+                    paths.push(path.clone());
+                    closure
+                        .origins
+                        .entry(path)
+                        .or_default()
+                        .push(document.identity().clone());
                 }
                 let mut catalog_selectors = BTreeMap::new();
                 let mut catalog_dependencies = BTreeMap::new();
@@ -606,7 +651,7 @@ impl PolicyRegistry {
         {
             let path = selector_path(format!(
                 "/analysis/stores/entries/{}/selector",
-                pointer_segment(id.as_str())
+                json_pointer_segment(id.as_str())
             ))?;
             let mut retained = closure.retained_bytes;
             let resolved = self.resolve_imported_selector(
@@ -744,6 +789,7 @@ fn import_references(
             &spec.external_models.include_files,
         ),
         (EndpointSetKind::Stores, &spec.store_include_files),
+        (EndpointSetKind::Barriers, &spec.barriers.include_files),
     ];
     let mut references: Vec<_> = families
         .into_iter()
@@ -763,10 +809,24 @@ fn clear_imports(spec: &mut TaintPolicySpec) {
     spec.sources.include_files.clear();
     spec.sinks.include_files.clear();
     spec.sanitizers.include_files.clear();
+    spec.barriers.include_files.clear();
     spec.transforms.include_files.clear();
     spec.entry_points.include_files.clear();
     spec.external_models.include_files.clear();
     spec.store_include_files.clear();
+}
+
+macro_rules! for_each_entry_collection {
+    ($spec:ident, $segments:ident, $add:ident) => {
+        $add!($segments.sources, $spec.sources.entries);
+        $add!($segments.sinks, $spec.sinks.entries);
+        $add!($segments.sanitizers, $spec.sanitizers.entries);
+        $add!($segments.transforms, $spec.transforms.entries);
+        $add!($segments.entry_points, $spec.entry_points.entries);
+        $add!($segments.external_models, $spec.external_models.entries);
+        $add!($segments.stores, $spec.store_writes);
+        $add!($segments.stores, $spec.store_reads);
+    };
 }
 
 fn all_entries(
@@ -788,14 +848,7 @@ fn all_entries(
             );
         };
     }
-    add!(segments.sources, spec.sources.entries);
-    add!(segments.sinks, spec.sinks.entries);
-    add!(segments.sanitizers, spec.sanitizers.entries);
-    add!(segments.transforms, spec.transforms.entries);
-    add!(segments.entry_points, spec.entry_points.entries);
-    add!(segments.external_models, spec.external_models.entries);
-    add!(segments.stores, spec.store_writes);
-    add!(segments.stores, spec.store_reads);
+    for_each_entry_collection!(spec, segments, add);
     entries
 }
 
@@ -818,14 +871,7 @@ fn all_entries_mut(
             );
         };
     }
-    add!(segments.sources, spec.sources.entries);
-    add!(segments.sinks, spec.sinks.entries);
-    add!(segments.sanitizers, spec.sanitizers.entries);
-    add!(segments.transforms, spec.transforms.entries);
-    add!(segments.entry_points, spec.entry_points.entries);
-    add!(segments.external_models, spec.external_models.entries);
-    add!(segments.stores, spec.store_writes);
-    add!(segments.stores, spec.store_reads);
+    for_each_entry_collection!(spec, segments, add);
     entries
 }
 
@@ -846,6 +892,7 @@ fn merge_spec(target: &mut TaintPolicySpec, source: TaintPolicySpec) {
     merge_set!(sources);
     merge_set!(sinks);
     merge_set!(sanitizers);
+    merge_set!(barriers);
     merge_set!(transforms);
     merge_set!(entry_points);
     merge_set!(external_models);
@@ -862,6 +909,7 @@ fn sort_entries(spec: &mut TaintPolicySpec) {
     sort!(spec.sources.entries);
     sort!(spec.sinks.entries);
     sort!(spec.sanitizers.entries);
+    sort!(spec.barriers.entries);
     sort!(spec.transforms.entries);
     sort!(spec.entry_points.entries);
     sort!(spec.external_models.entries);

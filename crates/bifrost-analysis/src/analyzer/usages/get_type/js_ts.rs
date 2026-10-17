@@ -9,7 +9,6 @@ use crate::analyzer::semantic_model::{
 };
 use crate::analyzer::usages::get_definition::{BoundedResolution, ResolutionSession};
 use crate::analyzer::usages::js_ts_graph::compute_jsts_import_binder;
-use crate::analyzer::usages::model::ImportKind;
 use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
 use crate::analyzer::usages::reference_site::{
     ResolvedReferenceSite, smallest_named_node_covering,
@@ -19,13 +18,12 @@ use crate::analyzer::{
     AliasResolver, BoundedDefinitionLookup, CodeUnit, IAnalyzer, Language, ProjectFile,
 };
 use crate::cancellation::CancellationToken;
-use brokk_bifrost_js_ts::imports::{
-    resolve_js_ts_direct_import_candidates, resolve_js_ts_module_binding_candidates,
-};
 use brokk_bifrost_js_ts::providers::JsTsSource;
-use brokk_bifrost_js_ts::syntax::JsTsImportBinder;
+use brokk_bifrost_js_ts::scope_source::is_core_binding_scope;
+use brokk_bifrost_js_ts::syntax::{JsTsImportBinder, pattern_binder_identifiers};
 use brokk_bifrost_js_ts::ts_owners::{
-    ts_function_return_property_owners, ts_receiver_owner_candidates_at_byte,
+    jsts_identifier_candidates_unfiltered, node_text_matches, ts_function_return_property_owners,
+    ts_namespace_import_member_candidates, ts_receiver_owner_candidates_at_byte,
     ts_resolve_type_text_to_property_owners,
 };
 use brokk_bifrost_js_ts::type_text::{jsts_type_space_candidates, ts_type_annotation_text};
@@ -48,13 +46,10 @@ pub(crate) fn resolve_js_ts_type_bounded(
     budget: ReceiverAnalysisBudget,
     cancellation: Option<&CancellationToken>,
 ) -> BoundedResolution<TypeLookupOutcome> {
-    let session = ResolutionSession::bounded(budget, cancellation);
-    let charged = SessionChargedLookup {
-        support,
-        session: &session,
-    };
-    let outcome = resolve_js_ts_type(analyzer, &charged, file, language, source, tree, site);
-    session.finish(outcome)
+    ResolutionSession::run_bounded(budget, cancellation, |session| {
+        let charged = SessionChargedLookup { support, session };
+        resolve_js_ts_type(analyzer, &charged, file, language, source, tree, site)
+    })
 }
 
 /// Charges every [`BoundedDefinitionLookup`] question to a resolution session.
@@ -64,6 +59,12 @@ pub(crate) fn resolve_js_ts_type_bounded(
 struct SessionChargedLookup<'a> {
     support: &'a dyn BoundedDefinitionLookup,
     session: &'a ResolutionSession,
+}
+
+impl SessionChargedLookup<'_> {
+    fn query_bool(&self, query: impl FnOnce() -> bool) -> bool {
+        self.session.query(query).unwrap_or(false)
+    }
 }
 
 impl BoundedDefinitionLookup for SessionChargedLookup<'_> {
@@ -82,9 +83,7 @@ impl BoundedDefinitionLookup for SessionChargedLookup<'_> {
     }
 
     fn package_exists_in_any_language(&self, package: &str) -> bool {
-        self.session
-            .query(|| self.support.package_exists_in_any_language(package))
-            .unwrap_or(false)
+        self.query_bool(|| self.support.package_exists_in_any_language(package))
     }
 
     fn types_in_package(&self, package: &str, simple: &str) -> Vec<CodeUnit> {
@@ -130,15 +129,11 @@ impl BoundedDefinitionLookup for SessionChargedLookup<'_> {
     }
 
     fn package_exists(&self, package: &str) -> bool {
-        self.session
-            .query(|| self.support.package_exists(package))
-            .unwrap_or(false)
+        self.query_bool(|| self.support.package_exists(package))
     }
 
     fn package_exists_in_language(&self, package: &str, language: Language) -> bool {
-        self.session
-            .query(|| self.support.package_exists_in_language(package, language))
-            .unwrap_or(false)
+        self.query_bool(|| self.support.package_exists_in_language(package, language))
     }
 
     fn fqn_prefix_exists(&self, prefix: &str) -> bool {
@@ -359,27 +354,15 @@ fn resolve_declared_type_text(
         return candidates_outcome_with_target_kind(type_name, candidates, target_kind);
     }
 
-    if let Some(type_name) = leading_type_identifier(&type_text) {
-        let candidates = identifier_candidates(
-            host,
-            support,
-            file,
-            Language::TypeScript,
-            imports,
-            aliases,
-            type_name,
-            false,
-        );
-        if !candidates.is_empty() {
-            return candidates_outcome_with_target_kind(
-                type_name.to_string(),
-                candidates,
-                target_kind,
-            );
-        }
-        if let Some(outcome) = model_type_outcome(analyzer, file, type_name, target_kind.clone()) {
-            return outcome;
-        }
+    if let Some((type_name, candidates)) =
+        named_type_candidates(host, support, file, imports, aliases, &type_text)
+    {
+        return candidates_outcome_with_target_kind(type_name, candidates, target_kind);
+    }
+    if let Some(type_name) = leading_type_identifier(&type_text)
+        && let Some(outcome) = model_type_outcome(analyzer, file, type_name, target_kind.clone())
+    {
+        return outcome;
     }
 
     let owners = ts_resolve_type_text_to_property_owners(
@@ -462,23 +445,16 @@ fn identifier_candidates(
     name: &str,
     value_position: bool,
 ) -> Vec<CodeUnit> {
-    let mut candidates = resolve_js_ts_direct_import_candidates(
+    let mut candidates = jsts_identifier_candidates_unfiltered(
         host,
         support,
         language,
         file,
         imports,
+        aliases,
         name,
-        Some(aliases),
         value_position,
-    )
-    .unwrap_or_else(|| {
-        if imports.binding(name).is_some() {
-            Vec::new()
-        } else {
-            support.file_identifier(file, name)
-        }
-    });
+    );
     if !value_position {
         candidates = jsts_type_space_candidates(host, candidates);
     }
@@ -531,9 +507,7 @@ fn is_callable_declaration_name(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
-    parent
-        .child_by_field_name("name")
-        .is_some_and(|name| name.id() == node.id())
+    brokk_bifrost_core::analyzer::tree_walk::is_field_child(parent, node, "name")
         && matches!(
             parent.kind(),
             "function_declaration"
@@ -609,15 +583,7 @@ fn nearest_binding_scope(mut node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn is_binding_scope(node: Node<'_>) -> bool {
-    matches!(
-        node.kind(),
-        "program"
-            | "statement_block"
-            | "function_declaration"
-            | "function_expression"
-            | "arrow_function"
-            | "method_definition"
-    )
+    is_core_binding_scope(node)
 }
 
 fn ancestor_ids(mut node: Node<'_>) -> Vec<usize> {
@@ -705,11 +671,7 @@ fn binding_declaration_matches(node: Node<'_>, source: &str, name: &str) -> bool
         "required_parameter"
         | "optional_parameter"
         | "formal_parameter"
-        | "variable_declarator" => {
-            child_text_matches(node, "name", source, name)
-                || declaration_pattern_node(node)
-                    .is_some_and(|pattern| pattern_binds_name(pattern, source, name))
-        }
+        | "variable_declarator" => declaration_name_matches(node, source, name),
         "assignment_expression" => node
             .child_by_field_name("left")
             .is_some_and(|left| identifier_text(left, source) == Some(name)),
@@ -806,8 +768,7 @@ fn identifier_text<'source>(node: Node<'_>, source: &'source str) -> Option<&'so
 
 fn child_text_matches(node: Node<'_>, field: &str, source: &str, expected: &str) -> bool {
     node.child_by_field_name(field)
-        .and_then(|child| source.get(child.start_byte()..child.end_byte()))
-        .is_some_and(|text| text.trim() == expected)
+        .is_some_and(|child| node_text_matches(child, source, expected))
 }
 
 fn declaration_name_matches(node: Node<'_>, source: &str, expected: &str) -> bool {
@@ -1023,25 +984,37 @@ fn arm_type_candidates(
         return Some(qualified);
     }
     let arm_text = ts_type_annotation_text(arm, source);
-    if let Some(type_name) = leading_type_identifier(&arm_text) {
-        let candidates = identifier_candidates(
-            host,
-            support,
-            file,
-            Language::TypeScript,
-            imports,
-            aliases,
-            type_name,
-            false,
-        );
-        if !candidates.is_empty() {
-            return Some((type_name.to_string(), candidates));
-        }
+    if let Some(candidates) =
+        named_type_candidates(host, support, file, imports, aliases, &arm_text)
+    {
+        return Some(candidates);
     }
     let owners = prefer_type_definitions(ts_resolve_type_text_to_property_owners(
         host, support, file, source, imports, aliases, &arm_text, 0,
     ));
     (!owners.is_empty()).then(|| (type_lookup_name(&owners, &arm_text), owners))
+}
+
+fn named_type_candidates(
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    imports: &JsTsImportBinder,
+    aliases: &AliasResolver,
+    type_text: &str,
+) -> Option<(String, Vec<CodeUnit>)> {
+    let type_name = leading_type_identifier(type_text)?;
+    let candidates = identifier_candidates(
+        host,
+        support,
+        file,
+        Language::TypeScript,
+        imports,
+        aliases,
+        type_name,
+        false,
+    );
+    (!candidates.is_empty()).then(|| (type_name.to_string(), candidates))
 }
 
 fn leading_type_identifier(text: &str) -> Option<&str> {
@@ -1068,23 +1041,10 @@ fn qualified_imported_type_candidates(
     if namespace == type_name {
         return None;
     }
-    let binding = imports.binding(namespace.as_str())?;
-    if !matches!(
-        binding.kind,
-        ImportKind::Namespace | ImportKind::CommonJsRequire
-    ) {
-        return None;
-    }
-    let candidates = resolve_js_ts_module_binding_candidates(
-        host,
-        support,
-        Language::TypeScript,
-        file,
-        &binding.module_specifier,
-        type_name,
-        Some(aliases),
-        false,
-    );
+    let binding = imports.binding(namespace)?;
+    let candidates = ts_namespace_import_member_candidates(
+        host, support, file, binding, aliases, type_name, false,
+    )?;
     (!candidates.is_empty()).then_some((type_name.clone(), candidates))
 }
 
@@ -1129,11 +1089,9 @@ fn prefer_type_definitions(owners: Vec<CodeUnit>) -> Vec<CodeUnit> {
 }
 
 fn pattern_binds_name(node: Node<'_>, source: &str, name: &str) -> bool {
-    identifier_text(node, source).is_some_and(|text| text == name) || {
-        let mut cursor = node.walk();
-        node.named_children(&mut cursor)
-            .any(|child| pattern_binds_name(child, source, name))
-    }
+    pattern_binder_identifiers(node)
+        .into_iter()
+        .any(|binder| identifier_text(binder, source) == Some(name))
 }
 
 fn object_type_property_type_node<'tree>(

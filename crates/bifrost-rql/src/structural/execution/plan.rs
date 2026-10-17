@@ -1,20 +1,18 @@
 use std::fmt;
 
 use serde::Serialize;
-use serde_json::{Map, Value, json};
+use serde_json::Value;
 
 use crate::hash::HashMap;
 
-use crate::query::schema::{
-    configuration_member_role_label, configuration_provenance_label,
-    configuration_scalar_kind_label,
-};
 use crate::structural::derived_cache::DerivedLayerRequest;
 use brokk_bifrost_rql::schema::QuerySemanticFacet;
 use brokk_bifrost_rql::{
     BindingSeed, CodeQuery, CodeQueryPlan, CodeQueryPlanSource, CodeQuerySeed,
-    ConfigurationFactsSeed, ExportSeed, GenerationSiteSeed, OccurrenceSeed, PathSeed, QueryError,
-    QueryStep, QueryValueKind, ScopeSeed, SetOperator,
+    ConfigurationFactsSeed, CrossDomainRelation, DependencyEvidenceSeed, ExportSeed,
+    GenerationSiteSeed, OccurrenceSeed, PathSeed, QueryError, QueryRowPredicate,
+    QueryRowPredicateOperand, QueryRowProjectionColumn, QueryStep, QueryValueKind, ScopeSeed,
+    SetOperator,
 };
 
 /// A dense, plan-local identifier for one logical operator.
@@ -47,6 +45,7 @@ pub(crate) enum LogicalQueryOperator {
     ExportSeed(Box<ExportSeed>),
     PathSeed(Box<PathSeed>),
     ConfigurationFactsSeed(Box<ConfigurationFactsSeed>),
+    DependencyEvidenceSeed(Box<DependencyEvidenceSeed>),
     Step {
         input: LogicalQueryNodeId,
         step: QueryStep,
@@ -58,6 +57,22 @@ pub(crate) enum LogicalQueryOperator {
     Set {
         op: SetOperator,
         inputs: Box<[LogicalQueryNodeId]>,
+    },
+    /// Pair code rows (`inputs[0]`) with configuration facts (`inputs[1]`)
+    /// through one registered relation.
+    Correlate {
+        relation: CrossDomainRelation,
+        inputs: [LogicalQueryNodeId; 2],
+        /// The configuration input's seeds. A declared document outside
+        /// every seed's `where` and format scope can never produce a fact,
+        /// so the relation reports it rather than reading its absence as an
+        /// unbound key.
+        configuration_seeds: Box<[ConfigurationFactsSeed]>,
+    },
+    /// Require code rows (`inputs[0]`) and configuration facts (`inputs[1]`)
+    /// without relating them.
+    RequireBoth {
+        inputs: [LogicalQueryNodeId; 2],
     },
     Limit {
         input: LogicalQueryNodeId,
@@ -75,9 +90,10 @@ impl LogicalQueryOperator {
             | Self::GenerationSiteSeed(_)
             | Self::ExportSeed(_) => &[],
             Self::PathSeed(_) => &[],
-            Self::ConfigurationFactsSeed(_) => &[],
+            Self::DependencyEvidenceSeed(_) | Self::ConfigurationFactsSeed(_) => &[],
             Self::Step { input, .. } | Self::Limit { input, .. } => std::slice::from_ref(input),
             Self::Set { inputs, .. } => inputs,
+            Self::Correlate { inputs, .. } | Self::RequireBoth { inputs } => inputs,
         }
     }
 }
@@ -139,6 +155,22 @@ impl LogicalQueryPlan {
 
     pub(crate) const fn root(&self) -> LogicalQueryNodeId {
         self.root
+    }
+
+    /// Locate the source prefix below a validated outer suffix. Lowering adds
+    /// one unary step per suffix operation and one root limit.
+    fn suffix_input(&self, suffix_steps: usize) -> LogicalQueryNodeId {
+        let LogicalQueryOperator::Limit { input, .. } = self.node(self.root).operator() else {
+            unreachable!("the logical root is a limit")
+        };
+        let mut node = *input;
+        for _ in 0..suffix_steps {
+            let LogicalQueryOperator::Step { input, .. } = self.node(node).operator() else {
+                unreachable!("a validated outer suffix consists of unary steps")
+            };
+            node = *input;
+        }
+        node
     }
 
     fn validate_dependency_order(&self) -> Result<(), LogicalPlanValidationError> {
@@ -302,6 +334,13 @@ impl LogicalQueryPlanBuilder {
                     (id, QueryValueKind::QualifiedPath)
                 }
             }
+            CodeQueryPlanSource::DependencyEvidence(seed) => {
+                let id = self.push_node(
+                    LogicalQueryOperator::DependencyEvidenceSeed(seed.clone()),
+                    QueryValueKind::DependencyEvidence,
+                );
+                (id, QueryValueKind::DependencyEvidence)
+            }
             CodeQueryPlanSource::ConfigurationFacts(seed) => {
                 let id = self.push_node(
                     LogicalQueryOperator::ConfigurationFactsSeed(seed.clone()),
@@ -314,19 +353,51 @@ impl LogicalQueryPlanBuilder {
                     .iter()
                     .map(|branch| self.lower_authored_plan(branch))
                     .collect::<Vec<_>>();
+                // A union may combine branches of different row kinds
+                // (#5352); its rows keep their own kinds, and the node reports
+                // the first branch's kind, as the validator does.
                 let output_kind = lowered
                     .first()
                     .expect("validated set operations contain at least two branches")
                     .1;
                 let inputs = lowered
                     .into_iter()
-                    .map(|(input, branch_kind)| {
-                        debug_assert_eq!(branch_kind, output_kind);
-                        input
-                    })
+                    .map(|(input, _)| input)
                     .collect::<Box<[_]>>();
                 let id = self.push_node(LogicalQueryOperator::Set { op: *op, inputs }, output_kind);
                 (id, output_kind)
+            }
+            CodeQueryPlanSource::Correlate(correlation) => {
+                let (code, _) = self.lower_authored_plan(&correlation.code);
+                let (configuration, _) = self.lower_authored_plan(&correlation.configuration);
+                let mut configuration_seeds = Vec::new();
+                let mut pending = vec![&correlation.configuration];
+                while let Some(plan) = pending.pop() {
+                    if let CodeQueryPlanSource::ConfigurationFacts(seed) = &plan.source {
+                        configuration_seeds.push(seed.as_ref().clone());
+                    }
+                    pending.extend(plan.source.child_plans());
+                }
+                let id = self.push_node(
+                    LogicalQueryOperator::Correlate {
+                        relation: correlation.relation.clone(),
+                        inputs: [code, configuration],
+                        configuration_seeds: configuration_seeds.into_boxed_slice(),
+                    },
+                    QueryValueKind::CrossDomain,
+                );
+                (id, QueryValueKind::CrossDomain)
+            }
+            CodeQueryPlanSource::RequireBoth(requirement) => {
+                let (code, _) = self.lower_authored_plan(&requirement.code);
+                let (configuration, _) = self.lower_authored_plan(&requirement.configuration);
+                let id = self.push_node(
+                    LogicalQueryOperator::RequireBoth {
+                        inputs: [code, configuration],
+                    },
+                    QueryValueKind::CrossDomain,
+                );
+                (id, QueryValueKind::CrossDomain)
             }
         };
 
@@ -399,11 +470,14 @@ pub(crate) enum PhysicalQueryOperator {
     ExportScan,
     PathScan,
     ConfigurationFactsScan,
+    DependencyEvidenceScan,
     PipelineStep,
     SequentialUnion,
     ParallelUnion,
     SequentialIntersection,
     SequentialExcept,
+    CrossDomainCorrelate,
+    CrossDomainRequireBoth,
     Limit,
 }
 
@@ -415,9 +489,14 @@ pub(crate) struct PhysicalQueryNode {
     dependencies: Box<[PhysicalQueryNodeId]>,
     derived_layer_request: Option<DerivedLayerRequest>,
     semantic_request: Option<CodeQuerySemanticRequest>,
+    diagnostic_relation_predicates: Vec<QueryRowPredicate>,
 }
 
 impl PhysicalQueryNode {
+    pub(crate) fn diagnostic_relation_predicates(&self) -> &[QueryRowPredicate] {
+        &self.diagnostic_relation_predicates
+    }
+
     pub(crate) const fn logical_node(&self) -> LogicalQueryNodeId {
         self.logical_node
     }
@@ -439,6 +518,66 @@ impl PhysicalQueryNode {
     }
 }
 
+/// Only a unique row-local suffix can establish relevance for a producer's
+/// diagnostics. Never use outcome, proof or completeness to discharge unknowns.
+fn diagnostic_relation_predicates(
+    logical: &LogicalQueryPlan,
+    consumers: &[Vec<LogicalQueryNodeId>],
+    producer: LogicalQueryNodeId,
+    boundary: Option<LogicalQueryNodeId>,
+) -> Vec<QueryRowPredicate> {
+    let mut predicates = Vec::new();
+    let mut projection: Vec<QueryRowProjectionColumn> = Vec::new();
+    let mut current = producer;
+    while let [consumer] = consumers[current.index()].as_slice() {
+        if Some(current) == boundary {
+            break;
+        }
+        let source = |field: &str| {
+            projection
+                .iter()
+                .find(|column| column.name == field)
+                .map_or_else(|| field.to_string(), |column| column.source.clone())
+        };
+        match logical.node(*consumer).operator() {
+            LogicalQueryOperator::Step {
+                step: QueryStep::Filter(filters),
+                ..
+            } => {
+                for predicate in filters {
+                    if source(&predicate.field) != "relation" {
+                        continue;
+                    }
+                    let mut predicate = predicate.clone();
+                    predicate.field = "relation".to_string();
+                    if let QueryRowPredicateOperand::Field(field) = &mut predicate.operand {
+                        if source(field) != "relation" {
+                            continue;
+                        }
+                        *field = "relation".to_string();
+                    }
+                    predicates.push(predicate);
+                }
+            }
+            LogicalQueryOperator::Step {
+                step: QueryStep::Project(columns),
+                ..
+            } => {
+                projection = columns
+                    .iter()
+                    .map(|column| QueryRowProjectionColumn {
+                        source: source(&column.source),
+                        name: column.name.clone(),
+                    })
+                    .collect();
+            }
+            _ => break,
+        }
+        current = *consumer;
+    }
+    predicates
+}
+
 /// A one-to-one physical implementation of a logical query DAG.
 #[derive(Debug, Clone)]
 pub(crate) struct PhysicalQueryPlan {
@@ -450,17 +589,26 @@ pub(crate) struct PhysicalQueryPlan {
 impl PhysicalQueryPlan {
     #[cfg(test)]
     pub(crate) fn select(logical: LogicalQueryPlan) -> Self {
-        Self::select_with_parallel_union(logical, None)
+        Self::select_with_parallel_union(logical, None, 0)
     }
 
     pub(crate) fn select_with_parallel_union(
         logical: LogicalQueryPlan,
         parallel_union: Option<LogicalQueryNodeId>,
+        inherited_suffix_steps: usize,
     ) -> Self {
         logical
             .validate_dependency_order()
             .expect("logical plan lowering establishes dependency order");
 
+        let diagnostic_boundary =
+            (inherited_suffix_steps > 0).then(|| logical.suffix_input(inherited_suffix_steps));
+        let mut consumers = vec![Vec::new(); logical.nodes.len()];
+        for (index, node) in logical.nodes.iter().enumerate() {
+            for dependency in node.operator().dependencies() {
+                consumers[dependency.index()].push(LogicalQueryNodeId::from_index(index));
+            }
+        }
         let nodes = logical
             .nodes
             .iter()
@@ -479,6 +627,9 @@ impl PhysicalQueryPlan {
                     }
                     LogicalQueryOperator::ExportSeed(_) => PhysicalQueryOperator::ExportScan,
                     LogicalQueryOperator::PathSeed(_) => PhysicalQueryOperator::PathScan,
+                    LogicalQueryOperator::DependencyEvidenceSeed(_) => {
+                        PhysicalQueryOperator::DependencyEvidenceScan
+                    }
                     LogicalQueryOperator::ConfigurationFactsSeed(_) => {
                         PhysicalQueryOperator::ConfigurationFactsScan
                     }
@@ -491,6 +642,12 @@ impl PhysicalQueryPlan {
                         SetOperator::Intersect => PhysicalQueryOperator::SequentialIntersection,
                         SetOperator::Except => PhysicalQueryOperator::SequentialExcept,
                     },
+                    LogicalQueryOperator::Correlate { .. } => {
+                        PhysicalQueryOperator::CrossDomainCorrelate
+                    }
+                    LogicalQueryOperator::RequireBoth { .. } => {
+                        PhysicalQueryOperator::CrossDomainRequireBoth
+                    }
                     LogicalQueryOperator::Limit { .. } => PhysicalQueryOperator::Limit,
                 };
                 let dependencies = node
@@ -519,6 +676,18 @@ impl PhysicalQueryPlan {
                     dependencies,
                     derived_layer_request,
                     semantic_request,
+                    diagnostic_relation_predicates: match node.operator() {
+                        LogicalQueryOperator::Step {
+                            step: QueryStep::PythonFormatIssues,
+                            ..
+                        } => diagnostic_relation_predicates(
+                            &logical,
+                            &consumers,
+                            logical_node,
+                            diagnostic_boundary,
+                        ),
+                        _ => Vec::new(),
+                    },
                 }
             })
             .collect();
@@ -532,6 +701,10 @@ impl PhysicalQueryPlan {
 
     pub(crate) const fn root(&self) -> PhysicalQueryNodeId {
         self.root
+    }
+
+    pub(crate) fn suffix_input(&self, suffix_steps: usize) -> PhysicalQueryNodeId {
+        PhysicalQueryNodeId::from_logical(self.logical.suffix_input(suffix_steps))
     }
 
     /// How many operators this plan holds. Node ids are dense over this range,
@@ -631,6 +804,9 @@ enum LogicalQueryOperatorExplain {
     PathSeed {
         seed: serde_json::Value,
     },
+    DependencyEvidenceSeed {
+        seed: serde_json::Value,
+    },
     ConfigurationFactsSeed {
         seed: serde_json::Value,
     },
@@ -641,6 +817,10 @@ enum LogicalQueryOperatorExplain {
     Set {
         op: &'static str,
     },
+    Correlate {
+        relation: serde_json::Value,
+    },
+    RequireBoth,
     Limit {
         count: usize,
     },
@@ -670,8 +850,11 @@ impl LogicalQueryOperatorExplain {
             LogicalQueryOperator::PathSeed(seed) => Self::PathSeed {
                 seed: seed.to_canonical_json(),
             },
+            LogicalQueryOperator::DependencyEvidenceSeed(seed) => Self::DependencyEvidenceSeed {
+                seed: Value::Object(crate::query::dependency_evidence_seed_to_json(seed)),
+            },
             LogicalQueryOperator::ConfigurationFactsSeed(seed) => Self::ConfigurationFactsSeed {
-                seed: configuration_facts_seed_to_json(seed),
+                seed: Value::Object(crate::query::configuration_facts_seed_to_json(seed)),
             },
             LogicalQueryOperator::Step {
                 step,
@@ -682,160 +865,30 @@ impl LogicalQueryOperatorExplain {
                 final_in_authored_suffix: *final_in_authored_suffix,
             },
             LogicalQueryOperator::Set { op, .. } => Self::Set { op: op.label() },
+            LogicalQueryOperator::Correlate { relation, .. } => Self::Correlate {
+                relation: match relation {
+                    CrossDomainRelation::ConfigurationKey(relation) => serde_json::json!({
+                        "configuration_key": { "documents": relation.documents },
+                    }),
+                    CrossDomainRelation::ConfigurationCode(relation) => serde_json::json!({
+                        "configuration_code": {
+                            "match": relation.match_kind.label(),
+                            "absence": relation.absence,
+                        },
+                    }),
+                    CrossDomainRelation::DependencyConfiguration(relation) => serde_json::json!({
+                        "dependency_configuration": {
+                            "owner": relation.owner, "ecosystem": relation.ecosystem,
+                            "version_ranges": relation.version_ranges, "documents": relation.documents,
+                            "overrides": relation.overrides, "values": relation.values,
+                        },
+                    }),
+                },
+            },
+            LogicalQueryOperator::RequireBoth { .. } => Self::RequireBoth,
             LogicalQueryOperator::Limit { count, .. } => Self::Limit { count: *count },
         }
     }
-}
-
-fn configuration_facts_seed_to_json(seed: &ConfigurationFactsSeed) -> Value {
-    let mut object = Map::new();
-    if !seed.where_globs.is_empty() {
-        let scope = if seed.where_globs.groups().len() == 1 {
-            json!(
-                seed.where_globs.groups()[0]
-                    .iter()
-                    .map(|glob| glob.as_str())
-                    .collect::<Vec<_>>()
-            )
-        } else {
-            json!(
-                seed.where_globs
-                    .groups()
-                    .iter()
-                    .map(|group| group.iter().map(|glob| glob.as_str()).collect::<Vec<_>>())
-                    .collect::<Vec<_>>()
-            )
-        };
-        object.insert("where".to_string(), scope);
-    }
-    object.insert(
-        "configuration_facts".to_string(),
-        Value::Object(configuration_facts_filter_to_json(&seed.filter)),
-    );
-    Value::Object(object)
-}
-
-fn configuration_facts_filter_to_json(
-    filter: &crate::query::ConfigurationFactsFilter,
-) -> Map<String, Value> {
-    let labels = |values: &[crate::query::domain::ConfigurationFormat]| {
-        Value::Array(values.iter().map(|value| json!(value.label())).collect())
-    };
-    let mut object = Map::new();
-    if !filter.formats.is_empty() {
-        object.insert("formats".to_string(), labels(&filter.formats));
-    }
-    if !filter.node_kinds.is_empty() {
-        object.insert(
-            "node_kinds".to_string(),
-            Value::Array(
-                filter
-                    .node_kinds
-                    .iter()
-                    .map(|kind| json!(kind.label()))
-                    .collect(),
-            ),
-        );
-    }
-    if !filter.roles.is_empty() {
-        object.insert(
-            "roles".to_string(),
-            Value::Array(
-                filter
-                    .roles
-                    .iter()
-                    .map(|role| json!(configuration_member_role_label(*role)))
-                    .collect(),
-            ),
-        );
-    }
-    if !filter.scalar_kinds.is_empty() {
-        object.insert(
-            "scalar_kinds".to_string(),
-            Value::Array(
-                filter
-                    .scalar_kinds
-                    .iter()
-                    .map(|kind| json!(configuration_scalar_kind_label(*kind)))
-                    .collect(),
-            ),
-        );
-    }
-    if !filter.keys.is_empty() {
-        object.insert(
-            "keys".to_string(),
-            Value::Array(filter.keys.iter().map(|key| json!(key)).collect()),
-        );
-    }
-    if !filter.routes.is_empty() {
-        object.insert(
-            "routes".to_string(),
-            Value::Array(
-                filter
-                    .routes
-                    .iter()
-                    .map(|route| {
-                        Value::Array(
-                            route
-                                .0
-                                .iter()
-                                .map(|segment| match segment {
-                                    crate::query::ConfigurationRouteSegmentFilter::Key(key) => {
-                                        json!({ "kind": "key", "key": key })
-                                    }
-                                    crate::query::ConfigurationRouteSegmentFilter::Index(
-                                        ordinal,
-                                    ) => {
-                                        json!({ "kind": "index", "ordinal": ordinal })
-                                    }
-                                    crate::query::ConfigurationRouteSegmentFilter::Any => {
-                                        json!({ "kind": "any" })
-                                    }
-                                })
-                                .collect(),
-                        )
-                    })
-                    .collect(),
-            ),
-        );
-    }
-    if !filter.fact_ordinals.is_empty() {
-        object.insert(
-            "fact_ordinals".to_string(),
-            Value::Array(
-                filter
-                    .fact_ordinals
-                    .iter()
-                    .map(|ordinal| json!(ordinal))
-                    .collect(),
-            ),
-        );
-    }
-    if !filter.provenances.is_empty() {
-        object.insert(
-            "provenances".to_string(),
-            Value::Array(
-                filter
-                    .provenances
-                    .iter()
-                    .map(|provenance| json!(configuration_provenance_label(*provenance)))
-                    .collect(),
-            ),
-        );
-    }
-    if !filter.completenesses.is_empty() {
-        object.insert(
-            "completenesses".to_string(),
-            Value::Array(
-                filter
-                    .completenesses
-                    .iter()
-                    .map(|completeness| json!(completeness.label()))
-                    .collect(),
-            ),
-        );
-    }
-    object
 }
 
 /// Stable, versioned explanation of a parsed query and its selected plan.
@@ -969,9 +1022,12 @@ pub enum CodeQueryLogicalOperation {
     GenerationSiteSeed { seed: serde_json::Value },
     ExportSeed { seed: serde_json::Value },
     PathSeed { seed: serde_json::Value },
+    DependencyEvidenceSeed { seed: serde_json::Value },
     ConfigurationFactsSeed { seed: serde_json::Value },
     Step { step: serde_json::Value },
     Set { op: &'static str },
+    Correlate { relation: serde_json::Value },
+    RequireBoth,
     Limit { count: usize },
 }
 
@@ -987,11 +1043,16 @@ impl CodeQueryLogicalOperation {
             }
             LogicalQueryOperatorExplain::ExportSeed { seed } => Self::ExportSeed { seed },
             LogicalQueryOperatorExplain::PathSeed { seed } => Self::PathSeed { seed },
+            LogicalQueryOperatorExplain::DependencyEvidenceSeed { seed } => {
+                Self::DependencyEvidenceSeed { seed }
+            }
             LogicalQueryOperatorExplain::ConfigurationFactsSeed { seed } => {
                 Self::ConfigurationFactsSeed { seed }
             }
             LogicalQueryOperatorExplain::Step { step, .. } => Self::Step { step },
             LogicalQueryOperatorExplain::Set { op } => Self::Set { op },
+            LogicalQueryOperatorExplain::Correlate { relation } => Self::Correlate { relation },
+            LogicalQueryOperatorExplain::RequireBoth => Self::RequireBoth,
             LogicalQueryOperatorExplain::Limit { count } => Self::Limit { count },
         }
     }
@@ -1047,7 +1108,6 @@ impl CodeQuerySemanticRequest {
                 QuerySemanticFacet::Typestate => request.typestate = true,
                 QuerySemanticFacet::ValueFlow => request.value_flow = true,
                 QuerySemanticFacet::Taint => request.taint = true,
-                QuerySemanticFacet::Concurrency => {}
             }
         }
         Some(request)
@@ -1065,11 +1125,14 @@ pub enum CodeQueryPhysicalOperator {
     ExportScan,
     PathScan,
     ConfigurationFactsScan,
+    DependencyEvidenceScan,
     PipelineStep,
     SequentialUnion,
     ParallelUnion,
     SequentialIntersection,
     SequentialExcept,
+    CrossDomainCorrelate,
+    CrossDomainRequireBoth,
     Limit,
 }
 
@@ -1083,12 +1146,15 @@ impl CodeQueryPhysicalOperator {
             PhysicalQueryOperator::GenerationSiteScan => Self::GenerationSiteScan,
             PhysicalQueryOperator::ExportScan => Self::ExportScan,
             PhysicalQueryOperator::PathScan => Self::PathScan,
+            PhysicalQueryOperator::DependencyEvidenceScan => Self::DependencyEvidenceScan,
             PhysicalQueryOperator::ConfigurationFactsScan => Self::ConfigurationFactsScan,
             PhysicalQueryOperator::PipelineStep => Self::PipelineStep,
             PhysicalQueryOperator::SequentialUnion => Self::SequentialUnion,
             PhysicalQueryOperator::ParallelUnion => Self::ParallelUnion,
             PhysicalQueryOperator::SequentialIntersection => Self::SequentialIntersection,
             PhysicalQueryOperator::SequentialExcept => Self::SequentialExcept,
+            PhysicalQueryOperator::CrossDomainCorrelate => Self::CrossDomainCorrelate,
+            PhysicalQueryOperator::CrossDomainRequireBoth => Self::CrossDomainRequireBoth,
             PhysicalQueryOperator::Limit => Self::Limit,
         }
     }
@@ -1325,6 +1391,181 @@ mod tests {
     }
 
     #[test]
+    fn physical_selection_can_choose_parallel_union_independently() {
+        let logical = LogicalQueryPlan::lower(&query(CodeQueryPlan {
+            source: CodeQueryPlanSource::Set {
+                op: SetOperator::Union,
+                branches: vec![
+                    branch(seed("First"), Vec::new()),
+                    branch(seed("Second"), Vec::new()),
+                    branch(seed("Third"), Vec::new()),
+                ],
+            },
+            steps: Vec::new(),
+        }))
+        .expect("query should lower");
+        let LogicalQueryOperator::Limit { input: union, .. } =
+            logical.node(logical.root()).operator()
+        else {
+            panic!("root should be a limit");
+        };
+        let union = *union;
+        let physical =
+            PhysicalQueryPlan::select_with_parallel_union(logical.clone(), Some(union), 0);
+
+        assert_eq!(
+            physical
+                .node(PhysicalQueryNodeId::from_logical(union))
+                .operator(),
+            PhysicalQueryOperator::ParallelUnion
+        );
+        let public = physical.public_explain(
+            &query(CodeQueryPlan {
+                source: CodeQueryPlanSource::Set {
+                    op: SetOperator::Union,
+                    branches: vec![
+                        branch(seed("First"), Vec::new()),
+                        branch(seed("Second"), Vec::new()),
+                        branch(seed("Third"), Vec::new()),
+                    ],
+                },
+                steps: Vec::new(),
+            }),
+            7,
+        );
+        assert_eq!(
+            public.scheduling,
+            CodeQueryExplainScheduling {
+                policy: CodeQuerySchedulingPolicy::Auto,
+                selected: CodeQuerySelectedScheduling::Parallel,
+                max_concurrency: 3,
+            }
+        );
+        let sequential = PhysicalQueryPlan::select(logical);
+        assert_eq!(
+            sequential
+                .node(PhysicalQueryNodeId::from_logical(union))
+                .operator(),
+            PhysicalQueryOperator::SequentialUnion
+        );
+    }
+
+    #[test]
+    fn only_complete_reverse_import_traversal_requests_a_derived_layer() {
+        let logical = LogicalQueryPlan::lower(&query(branch(
+            seed("AnyDeclaration"),
+            vec![
+                QueryStep::FileOf,
+                QueryStep::ImportersOf,
+                QueryStep::ImportsOf,
+            ],
+        )))
+        .expect("query should lower");
+        let physical = PhysicalQueryPlan::select(logical);
+
+        let importer_node = physical
+            .nodes
+            .iter()
+            .find(|node| {
+                matches!(
+                    physical.logical.node(node.logical_node()).operator(),
+                    LogicalQueryOperator::Step {
+                        step: QueryStep::ImportersOf,
+                        ..
+                    }
+                )
+            })
+            .expect("physical plan should contain importers_of");
+        let request = importer_node
+            .derived_layer_request()
+            .expect("reverse imports require the complete direct import topology");
+        assert_eq!(
+            request,
+            DerivedLayerRequest::complete_direct_import_topology()
+        );
+
+        let imports_node = physical
+            .nodes
+            .iter()
+            .find(|node| {
+                matches!(
+                    physical.logical.node(node.logical_node()).operator(),
+                    LogicalQueryOperator::Step {
+                        step: QueryStep::ImportsOf,
+                        ..
+                    }
+                )
+            })
+            .expect("physical plan should contain imports_of");
+        assert_eq!(imports_node.derived_layer_request(), None);
+    }
+
+    #[test]
+    fn semantically_distinct_same_topology_queries_have_distinct_explains() {
+        let baseline = query(branch(
+            seed("Callable"),
+            vec![
+                QueryStep::EnclosingDecl,
+                QueryStep::Callers(CallTraversalFilter::default()),
+            ],
+        ));
+        let different_seed = query(branch(
+            seed("OtherCallable"),
+            vec![
+                QueryStep::EnclosingDecl,
+                QueryStep::Callers(CallTraversalFilter::default()),
+            ],
+        ));
+        let different_step = query(branch(
+            seed("Callable"),
+            vec![
+                QueryStep::EnclosingDecl,
+                QueryStep::Callers(CallTraversalFilter {
+                    depth: std::num::NonZeroUsize::new(2).expect("two is non-zero"),
+                    proof: None,
+                    completeness: CallTraversalCompleteness::Exhaustive,
+                }),
+            ],
+        ));
+        let mut different_limit = baseline.clone();
+        different_limit.limit = 21;
+
+        let baseline = explain(&baseline);
+        assert_ne!(baseline, explain(&different_seed));
+        assert_ne!(baseline, explain(&different_step));
+        assert_ne!(baseline, explain(&different_limit));
+    }
+
+    #[test]
+    fn json_and_rql_frontends_select_the_same_physical_plan() {
+        let json_query = CodeQuery::from_json(&json!({
+            "union": [
+                {
+                    "match": { "kind": "class", "name": "Legacy" },
+                    "steps": [{ "op": "enclosing_decl" }]
+                },
+                {
+                    "match": { "kind": "class", "name": "Replacement" },
+                    "steps": [{ "op": "enclosing_decl" }]
+                }
+            ],
+            "steps": [{ "op": "file_of" }],
+            "limit": 20
+        }))
+        .expect("JSON query should parse");
+        let rql_query = CodeQuery::from_sexp(
+            r#"(limit 20
+              (file-of
+                (union
+                  (enclosing-decl (class :name "Legacy"))
+                  (enclosing-decl (class :name "Replacement")))))"#,
+        )
+        .expect("RQL query should parse");
+
+        assert_eq!(explain(&json_query), explain(&rql_query));
+    }
+
+    #[test]
     fn physical_selection_uses_sequential_union() {
         let logical = LogicalQueryPlan::lower(&query(CodeQueryPlan {
             source: CodeQueryPlanSource::Set {
@@ -1478,66 +1719,6 @@ mod tests {
     }
 
     #[test]
-    fn public_explain_reports_result_contract_projection_and_use_facets() {
-        let query = query(branch(
-            seed("Open"),
-            vec![
-                QueryStep::CallShape,
-                QueryStep::ResultContractCalls,
-                QueryStep::CallResultContracts,
-                QueryStep::ResultContractUses,
-                QueryStep::ResultContractOperationUses,
-            ],
-        ));
-        let public = PhysicalQueryPlan::select(
-            LogicalQueryPlan::lower(&query).expect("result-contract query should lower"),
-        )
-        .public_explain(&query, 1);
-        let requests = public
-            .physical_plan
-            .nodes
-            .iter()
-            .filter_map(|node| node.semantic_request)
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            requests,
-            vec![
-                CodeQuerySemanticRequest {
-                    procedures: true,
-                    dispatch: true,
-                    program_points: true,
-                    control_edges: true,
-                    switch_facts: false,
-                    typestate: false,
-                    value_flow: false,
-                    taint: false,
-                },
-                CodeQuerySemanticRequest {
-                    procedures: true,
-                    dispatch: true,
-                    program_points: true,
-                    control_edges: true,
-                    switch_facts: false,
-                    typestate: false,
-                    value_flow: false,
-                    taint: false,
-                },
-                CodeQuerySemanticRequest {
-                    procedures: true,
-                    dispatch: true,
-                    program_points: true,
-                    control_edges: true,
-                    switch_facts: false,
-                    typestate: false,
-                    value_flow: false,
-                    taint: false,
-                },
-            ]
-        );
-    }
-
-    #[test]
     fn public_explain_reports_typestate_without_resolving_a_registration() {
         let query = query(branch(
             seed("lifecycle"),
@@ -1633,215 +1814,5 @@ mod tests {
                 },
             ]
         );
-    }
-
-    #[test]
-    fn physical_selection_can_choose_parallel_union_independently() {
-        let logical = LogicalQueryPlan::lower(&query(CodeQueryPlan {
-            source: CodeQueryPlanSource::Set {
-                op: SetOperator::Union,
-                branches: vec![
-                    branch(seed("First"), Vec::new()),
-                    branch(seed("Second"), Vec::new()),
-                    branch(seed("Third"), Vec::new()),
-                ],
-            },
-            steps: Vec::new(),
-        }))
-        .expect("query should lower");
-        let LogicalQueryOperator::Limit { input: union, .. } =
-            logical.node(logical.root()).operator()
-        else {
-            panic!("root should be a limit");
-        };
-        let union = *union;
-        let physical = PhysicalQueryPlan::select_with_parallel_union(logical.clone(), Some(union));
-
-        assert_eq!(
-            physical
-                .node(PhysicalQueryNodeId::from_logical(union))
-                .operator(),
-            PhysicalQueryOperator::ParallelUnion
-        );
-        let public = physical.public_explain(
-            &query(CodeQueryPlan {
-                source: CodeQueryPlanSource::Set {
-                    op: SetOperator::Union,
-                    branches: vec![
-                        branch(seed("First"), Vec::new()),
-                        branch(seed("Second"), Vec::new()),
-                        branch(seed("Third"), Vec::new()),
-                    ],
-                },
-                steps: Vec::new(),
-            }),
-            7,
-        );
-        assert_eq!(
-            public.scheduling,
-            CodeQueryExplainScheduling {
-                policy: CodeQuerySchedulingPolicy::Auto,
-                selected: CodeQuerySelectedScheduling::Parallel,
-                max_concurrency: 3,
-            }
-        );
-        let sequential = PhysicalQueryPlan::select(logical);
-        assert_eq!(
-            sequential
-                .node(PhysicalQueryNodeId::from_logical(union))
-                .operator(),
-            PhysicalQueryOperator::SequentialUnion
-        );
-    }
-
-    #[test]
-    fn only_complete_reverse_import_traversal_requests_a_derived_layer() {
-        let logical = LogicalQueryPlan::lower(&query(branch(
-            seed("AnyDeclaration"),
-            vec![
-                QueryStep::FileOf,
-                QueryStep::ImportersOf,
-                QueryStep::ImportsOf,
-            ],
-        )))
-        .expect("query should lower");
-        let physical = PhysicalQueryPlan::select(logical);
-
-        let importer_node = physical
-            .nodes
-            .iter()
-            .find(|node| {
-                matches!(
-                    physical.logical.node(node.logical_node()).operator(),
-                    LogicalQueryOperator::Step {
-                        step: QueryStep::ImportersOf,
-                        ..
-                    }
-                )
-            })
-            .expect("physical plan should contain importers_of");
-        let request = importer_node
-            .derived_layer_request()
-            .expect("reverse imports require the complete direct import topology");
-        assert_eq!(
-            request,
-            DerivedLayerRequest::complete_direct_import_topology()
-        );
-
-        let imports_node = physical
-            .nodes
-            .iter()
-            .find(|node| {
-                matches!(
-                    physical.logical.node(node.logical_node()).operator(),
-                    LogicalQueryOperator::Step {
-                        step: QueryStep::ImportsOf,
-                        ..
-                    }
-                )
-            })
-            .expect("physical plan should contain imports_of");
-        assert_eq!(imports_node.derived_layer_request(), None);
-    }
-
-    #[test]
-    fn derived_layer_request_is_visible_in_physical_explain() {
-        let query = query(branch(
-            seed("AnyDeclaration"),
-            vec![QueryStep::FileOf, QueryStep::ImportersOf],
-        ));
-        let physical =
-            PhysicalQueryPlan::select(LogicalQueryPlan::lower(&query).expect("query should lower"));
-        let explained = serde_json::to_value(physical.explain()).expect("explain should serialize");
-        let importer_node = explained["nodes"]
-            .as_array()
-            .expect("explain nodes should be an array")
-            .iter()
-            .find(|node| node["logical_operator"]["step"]["op"] == "importers_of")
-            .expect("explain should contain importers_of");
-        assert_eq!(
-            importer_node["derived_layer_request"],
-            serde_json::to_value(DerivedLayerRequest::complete_direct_import_topology())
-                .expect("request should serialize")
-        );
-        assert!(
-            explained["nodes"]
-                .as_array()
-                .expect("explain nodes should be an array")
-                .iter()
-                .filter(|node| node["logical_operator"]["step"]["op"] != "importers_of")
-                .all(|node| node.get("derived_layer_request").is_none()),
-            "unannotated operators should not gain a null derived-layer field"
-        );
-
-        let public = serde_json::to_string(&physical.public_explain(&query, 2))
-            .expect("public explain should serialize");
-        assert!(!public.contains("derived_layer_request"));
-        assert!(!public.contains("final_in_authored_suffix"));
-    }
-
-    #[test]
-    fn semantically_distinct_same_topology_queries_have_distinct_explains() {
-        let baseline = query(branch(
-            seed("Callable"),
-            vec![
-                QueryStep::EnclosingDecl,
-                QueryStep::Callers(CallTraversalFilter::default()),
-            ],
-        ));
-        let different_seed = query(branch(
-            seed("OtherCallable"),
-            vec![
-                QueryStep::EnclosingDecl,
-                QueryStep::Callers(CallTraversalFilter::default()),
-            ],
-        ));
-        let different_step = query(branch(
-            seed("Callable"),
-            vec![
-                QueryStep::EnclosingDecl,
-                QueryStep::Callers(CallTraversalFilter {
-                    depth: std::num::NonZeroUsize::new(2).expect("two is non-zero"),
-                    proof: None,
-                    completeness: CallTraversalCompleteness::Exhaustive,
-                }),
-            ],
-        ));
-        let mut different_limit = baseline.clone();
-        different_limit.limit = 21;
-
-        let baseline = explain(&baseline);
-        assert_ne!(baseline, explain(&different_seed));
-        assert_ne!(baseline, explain(&different_step));
-        assert_ne!(baseline, explain(&different_limit));
-    }
-
-    #[test]
-    fn json_and_rql_frontends_select_the_same_physical_plan() {
-        let json_query = CodeQuery::from_json(&json!({
-            "union": [
-                {
-                    "match": { "kind": "class", "name": "Legacy" },
-                    "steps": [{ "op": "enclosing_decl" }]
-                },
-                {
-                    "match": { "kind": "class", "name": "Replacement" },
-                    "steps": [{ "op": "enclosing_decl" }]
-                }
-            ],
-            "steps": [{ "op": "file_of" }],
-            "limit": 20
-        }))
-        .expect("JSON query should parse");
-        let rql_query = CodeQuery::from_sexp(
-            r#"(limit 20
-              (file-of
-                (union
-                  (enclosing-decl (class :name "Legacy"))
-                  (enclosing-decl (class :name "Replacement")))))"#,
-        )
-        .expect("RQL query should parse");
-
-        assert_eq!(explain(&json_query), explain(&rql_query));
     }
 }

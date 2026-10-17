@@ -72,7 +72,8 @@ impl RustCargoManifestDocument {
         self.content_oid
     }
 
-    pub(crate) fn get(&self, key: &str) -> Option<&toml::Value> {
+    /// Borrow a structured field from the exact retained manifest.
+    pub fn get(&self, key: &str) -> Option<&toml::Value> {
         self.value.get(key)
     }
 
@@ -113,15 +114,6 @@ impl RustCargoManifestDocument {
     /// field a reader starts consuming later is covered without a change
     /// here.
     pub fn topology_digest(&self) -> [u8; 32] {
-        use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
-
-        #[derive(Clone, Copy)]
-        enum Table {
-            Root,
-            Package,
-            Workspace,
-            Other,
-        }
         const PUBLISHING: &[&str] = &[
             "authors",
             "categories",
@@ -141,54 +133,70 @@ impl RustCargoManifestDocument {
             "rust-version",
             "version",
         ];
-        let inert = |table: Table, key: &str| match table {
-            Table::Root => matches!(key, "profile" | "badges"),
-            Table::Package => PUBLISHING.contains(&key),
-            Table::Workspace => key == "metadata",
-            Table::Other => false,
-        };
-        let mut hasher = CanonicalHasher::new(b"cargo manifest topology");
-        let mut stack = vec![(Table::Root, &self.value)];
-        while let Some((table, value)) = stack.pop() {
-            match value {
-                toml::Value::Table(entries) => {
-                    let mut keys = entries
-                        .keys()
-                        .filter(|key| !inert(table, key))
-                        .collect::<Vec<_>>();
-                    keys.sort();
-                    hasher.field("table", &(keys.len() as u64).to_be_bytes());
-                    for key in &keys {
-                        hasher.value(key.as_bytes());
-                    }
-                    // Pushed in reverse so they are hashed in key order.
-                    for key in keys.into_iter().rev() {
-                        let child = match (table, key.as_str()) {
-                            (Table::Root, "package") => Table::Package,
-                            (Table::Root, "workspace") => Table::Workspace,
-                            (Table::Workspace, "package") => Table::Package,
-                            _ => Table::Other,
-                        };
-                        stack.push((child, &entries[key.as_str()]));
-                    }
+        canonical_toml_digest(
+            b"cargo manifest topology",
+            &self.value,
+            |table, key| match table {
+                [] => matches!(key, "profile" | "badges"),
+                ["package"] | ["workspace", "package"] => PUBLISHING.contains(&key),
+                ["workspace"] => key == "metadata",
+                _ => false,
+            },
+        )
+    }
+}
+
+/// Digest of a parsed TOML document under `domain`. It hashes the parsed
+/// value, so comments, formatting and table key order do not reach it.
+///
+/// `inert(table, key)` leaves `key` out of the table at key path `table`. It
+/// is asked about tables reached through tables only: everything inside an
+/// array counts.
+pub(crate) fn canonical_toml_digest(
+    domain: &[u8],
+    value: &toml::Value,
+    inert: impl Fn(&[&str], &str) -> bool,
+) -> [u8; 32] {
+    use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
+
+    let mut hasher = CanonicalHasher::new(domain);
+    let mut stack = vec![(Some(Vec::new()), value)];
+    while let Some((table, value)) = stack.pop() {
+        match value {
+            toml::Value::Table(entries) => {
+                let mut keys = entries
+                    .keys()
+                    .filter(|key| table.as_ref().is_none_or(|table| !inert(table, key)))
+                    .collect::<Vec<_>>();
+                keys.sort();
+                hasher.field("table", &(keys.len() as u64).to_be_bytes());
+                for key in &keys {
+                    hasher.value(key.as_bytes());
                 }
-                toml::Value::Array(items) => {
-                    hasher.field("array", &(items.len() as u64).to_be_bytes());
-                    stack.extend(items.iter().rev().map(|item| (Table::Other, item)));
-                }
-                toml::Value::String(text) => hasher.field("string", text.as_bytes()),
-                toml::Value::Integer(number) => hasher.field("integer", &number.to_be_bytes()),
-                toml::Value::Float(number) => {
-                    hasher.field("float", &number.to_bits().to_be_bytes())
-                }
-                toml::Value::Boolean(flag) => hasher.field("boolean", &[u8::from(*flag)]),
-                toml::Value::Datetime(datetime) => {
-                    hasher.field("datetime", datetime.to_string().as_bytes())
+                // Pushed in reverse so they are hashed in key order.
+                for key in keys.into_iter().rev() {
+                    let child = table.as_ref().map(|table| {
+                        let mut child = table.clone();
+                        child.push(key.as_str());
+                        child
+                    });
+                    stack.push((child, &entries[key.as_str()]));
                 }
             }
+            toml::Value::Array(items) => {
+                hasher.field("array", &(items.len() as u64).to_be_bytes());
+                stack.extend(items.iter().rev().map(|item| (None, item)));
+            }
+            toml::Value::String(text) => hasher.field("string", text.as_bytes()),
+            toml::Value::Integer(number) => hasher.field("integer", &number.to_be_bytes()),
+            toml::Value::Float(number) => hasher.field("float", &number.to_bits().to_be_bytes()),
+            toml::Value::Boolean(flag) => hasher.field("boolean", &[u8::from(*flag)]),
+            toml::Value::Datetime(datetime) => {
+                hasher.field("datetime", datetime.to_string().as_bytes())
+            }
         }
-        hasher.finish()
     }
+    hasher.finish()
 }
 
 pub(crate) fn normalize_crate_name(name: &str) -> String {
@@ -218,17 +226,6 @@ mod tests {
             document.content_oid(),
             Oid::hash_object(ObjectType::Blob, &source).unwrap()
         );
-    }
-
-    #[test]
-    fn retained_bytes_must_match_their_content_oid() {
-        let source = b"[package]\nname = \"one\"\n".to_vec().into_boxed_slice();
-        let other = b"[package]\nname = \"two\"\n".to_vec().into_boxed_slice();
-        let oid = Oid::hash_object(ObjectType::Blob, &source).expect("source oid");
-
-        let error = RustCargoManifestDocument::from_retained_source(oid, other)
-            .expect_err("mismatched retained bytes");
-        assert!(error.contains("expected"), "{error}");
     }
 
     const TOPOLOGY_BASE: &str = "[package]\nname = \"app\"\nedition = \"2021\"\n\
@@ -292,5 +289,16 @@ mod tests {
         ] {
             assert_ne!(topology_digest(&edited), base, "{edited}");
         }
+    }
+
+    #[test]
+    fn retained_bytes_must_match_their_content_oid() {
+        let source = b"[package]\nname = \"one\"\n".to_vec().into_boxed_slice();
+        let other = b"[package]\nname = \"two\"\n".to_vec().into_boxed_slice();
+        let oid = Oid::hash_object(ObjectType::Blob, &source).expect("source oid");
+
+        let error = RustCargoManifestDocument::from_retained_source(oid, other)
+            .expect_err("mismatched retained bytes");
+        assert!(error.contains("expected"), "{error}");
     }
 }

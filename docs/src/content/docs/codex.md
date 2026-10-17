@@ -5,7 +5,17 @@ description: Install and validate Bifrost in Codex.
 
 Codex can use Bifrost through the Agent Plugins v1 package or through a manual
 MCP server entry. The package path is preferred because it includes skills, MCP
-configuration, and a launcher that resolves the Bifrost binary.
+configuration, and a launcher that resolves the Bifrost binary. For Codex, the
+package provides:
+
+- the `bifrost` MCP server with the `symbol|extended` toolsets;
+- four skills in its `skills/` directory: `bifrost-code-navigation`,
+  `bifrost-code-reading`, `bifrost-codebase-search`, and
+  `bifrost-policy-checking`. The Codex manifest does not list them, so Codex
+  loads them only if its plugin convention reads `skills/`.
+
+It provides no subagents for Codex. See [Packaged agent
+plugin](/mcp/#packaged-agent-plugin) for what each skill does.
 
 ## Agent Plugins v1 Install
 
@@ -70,7 +80,7 @@ new session. This follows Codex's
 The packaged MCP server uses `symbol|extended`, so it exposes both symbol navigation
 and `query_code`.
 
-Installing the plugin automatically registers its packaged MCP server. Do not add a second manual Bifrost MCP entry for the same plugin. The launcher keeps package command resolution separate from analyzer scope: without an explicit override, Bifrost prefers standard MCP roots. On a rootless connection whose client did not advertise roots, Bifrost offers the `codex/sandbox-state-meta` extension. Current Codex accepts that capability and supplies the active task directory on each analyzer tool call. Bifrost binds that exact directory, follows later task-directory changes, and never analyzes the plugin cache. `BIFROST_WORKSPACE_ROOT` remains an authoritative explicit override for fixed-project or older-host configurations.
+Installing the plugin automatically registers its packaged MCP server. Do not add a second manual Bifrost MCP entry for the same plugin. The launcher keeps package command resolution separate from analyzer scope: without an explicit override, Bifrost prefers standard MCP roots. On a rootless connection whose client did not advertise roots, Bifrost offers the `codex/sandbox-state-meta` extension. Current Codex accepts that capability and supplies the active task directory on each analyzer tool call. Bifrost binds that exact directory, follows later task-directory changes, and never analyzes the plugin cache. For a fixed project or an older host, set `BIFROST_WORKSPACE_ROOT` in the environment of the MCP server. The launcher reads it and passes it to Bifrost as `--root`, which overrides roots and sandbox metadata. The `bifrost` binary itself does not read this variable.
 
 If the first launch needs to download the pinned Bifrost release, prepare it from a normal host shell before opening that fresh session:
 
@@ -108,15 +118,24 @@ include the MCP result and forbid shell, text-search, and direct-file
 substitutes. The check passes only when the result identifies that declaration
 at a project-relative path inside the active workspace.
 
-For a Bifrost checkout, this deterministic request is:
+For strong evidence, add a temporary declaration whose name is unique to the
+check:
 
-```json
-{"patterns":["reconcile_codex_sandbox_workspace"]}
+```rust
+// src/codex_bifrost_host_probe_4f6f2b7.rs
+pub fn codex_bifrost_host_probe_4f6f2b7() {}
 ```
 
-The expected hit is `mcp_common.reconcile_codex_sandbox_workspace` in
-`src/mcp_common.rs`. A path under the installed plugin or launcher cache is a
-failure even if the symbol name looks plausible.
+Then request:
+
+```json
+{"patterns":["codex_bifrost_host_probe_4f6f2b7"]}
+```
+
+The check passes when the result names
+`src/codex_bifrost_host_probe_4f6f2b7.rs`. A path under the installed plugin or
+launcher cache is a failure even if the symbol name looks plausible. Remove the
+temporary declaration after you keep the evidence.
 
 Use the failure boundary to decide what to inspect next:
 

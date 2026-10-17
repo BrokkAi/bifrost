@@ -38,6 +38,7 @@ download = [
     "dep:tempfile",
     "dep:flate2",
     "dep:tar",
+    "dep:zip",
     "dep:ureq",
 ]
 
@@ -47,8 +48,8 @@ path = "src/bin/bifrost-semantic-pack.rs"
 required-features = ["release-tooling"]
 
 [dependencies]
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.13.0" }
-brokk-bifrost-flow = { path = "../bifrost-flow", version = "=0.13.0" }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.13.1" }
+brokk-bifrost-flow = { path = "../bifrost-flow", version = "=0.13.1" }
 semver = { version = "1.0.28", optional = true }
 serde = { version = "1.0.228", features = ["derive"], optional = true }
 serde_json = { version = "1.0.145", optional = true }
@@ -60,10 +61,14 @@ tempfile = { version = "3.23.0", optional = true }
 flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"], optional = true }
 tar = { version = "0.4.44", default-features = false, optional = true }
 ureq = { version = "3.4.0", default-features = false, features = ["rustls"], optional = true }
+zip = { version = "9.0.3", default-features = false, features = ["deflate-flate2", "deflate-zopfli"], optional = true }
 
 [dev-dependencies]
+brokk-bifrost-test-macros = { path = "../bifrost-test-macros" }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.13.1", features = ["test-support"] }
+jsonschema = { version = "0.48.0", default-features = false }
 tempfile = "3.23.0"
-zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.3", default-features = false, features = ["deflate-flate2", "deflate-zopfli"] }
 
 [lints]
 workspace = true

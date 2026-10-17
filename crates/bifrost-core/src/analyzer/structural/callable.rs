@@ -83,6 +83,8 @@ labelled_enum! {
     /// How much of the call shape the analyzer could actually see.
     ///
     /// - `Exact`: every group and argument is read from source structure.
+    /// - `ExactMacroDerived`: the language adapter read a macro token tree
+    ///   and recorded the complete argument shape implied by its lowering.
     /// - `Partial`: some groups or arguments are known, but the shape is not
     ///   complete (for example, one argument's structure is unreadable).
     /// - `UnknownMacroDerived`: the argument list is produced by a macro or
@@ -95,6 +97,15 @@ labelled_enum! {
         Partial => "partial",
         UnknownMacroDerived => "unknown_macro_derived",
         UnknownDynamic => "unknown_dynamic",
+        ExactMacroDerived => "exact_macro_derived",
+    }
+}
+
+impl CallShapeCoverage {
+    /// Whether the complete ordered argument shape is available to shared
+    /// call-shape and binding algorithms.
+    pub const fn is_exact(self) -> bool {
+        matches!(self, Self::Exact | Self::ExactMacroDerived)
     }
 }
 
@@ -254,11 +265,7 @@ impl CallSiteFacts {
     /// site per call node. Chain [`CallSiteFacts::continuing`] off this to
     /// refine only the argument-list sequence.
     pub const fn unrefined() -> Self {
-        Self {
-            call_kind: None,
-            coverage: CallShapeCoverage::Exact,
-            continues_callee_groups: false,
-        }
+        Self::of_coverage(CallShapeCoverage::Exact)
     }
 
     /// A site whose kind the grammar names exactly, with readable arguments.
@@ -333,46 +340,18 @@ impl CallSiteContext {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashSet;
+#[test]
+fn callable_vocabularies_are_unique_and_round_trip() {
+    super::assert_vocabulary_round_trip!(ALL_CALL_KINDS, CallKind);
+    super::assert_vocabulary_round_trip!(ALL_ARGUMENT_LIST_KINDS, ArgumentListKind);
+    super::assert_vocabulary_round_trip!(ALL_CALL_SHAPE_COVERAGES, CallShapeCoverage);
+    super::assert_vocabulary_round_trip!(ALL_APPLICABILITY_VERDICTS, ApplicabilityVerdict);
+    super::assert_vocabulary_round_trip!(ALL_CALLABLE_REJECTION_REASONS, CallableRejectionReason);
+    super::assert_vocabulary_round_trip!(ALL_SELECTION_RESOLUTIONS, SelectionResolution);
+    super::assert_vocabulary_round_trip!(ALL_RECEIVER_CONTRACTS, ReceiverContract);
+    super::assert_vocabulary_round_trip!(ALL_SIGNATURE_COVERAGES, SignatureCoverage);
+    super::assert_vocabulary_round_trip!(ALL_DECLARATION_ROLES, DeclarationRole);
 
-    /// Every vocabulary must have unique labels that round-trip through both
-    /// `label()`/`from_label` and serde, so the persisted contract and the
-    /// rendered surface never disagree about a name.
-    #[test]
-    fn callable_vocabularies_are_unique_and_round_trip() {
-        macro_rules! check {
-            ($all:expr, $type:ty) => {{
-                let mut labels = HashSet::new();
-                for &value in $all {
-                    assert!(labels.insert(value.label()), "duplicate label {value:?}");
-                    assert_eq!(<$type>::from_label(value.label()), Some(value));
-                    let json = serde_json::to_value(value).expect("serialize");
-                    assert_eq!(
-                        json,
-                        serde_json::Value::String(value.label().to_owned()),
-                        "serde label diverges from label() for {value:?}"
-                    );
-                    let back: $type = serde_json::from_value(json).expect("deserialize");
-                    assert_eq!(back, value);
-                }
-                assert_eq!(labels.len(), $all.len());
-            }};
-        }
-
-        check!(ALL_CALL_KINDS, CallKind);
-        check!(ALL_ARGUMENT_LIST_KINDS, ArgumentListKind);
-        check!(ALL_CALL_SHAPE_COVERAGES, CallShapeCoverage);
-        check!(ALL_APPLICABILITY_VERDICTS, ApplicabilityVerdict);
-        check!(ALL_CALLABLE_REJECTION_REASONS, CallableRejectionReason);
-        check!(ALL_SELECTION_RESOLUTIONS, SelectionResolution);
-        check!(ALL_RECEIVER_CONTRACTS, ReceiverContract);
-        check!(ALL_SIGNATURE_COVERAGES, SignatureCoverage);
-        check!(ALL_DECLARATION_ROLES, DeclarationRole);
-
-        assert!(CallKind::from_label("not_a_kind").is_none());
-        assert!(CallableRejectionReason::from_label("not_a_reason").is_none());
-    }
+    assert!(CallKind::from_label("not_a_kind").is_none());
+    assert!(CallableRejectionReason::from_label("not_a_reason").is_none());
 }

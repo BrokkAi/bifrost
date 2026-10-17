@@ -110,14 +110,6 @@ require_archive_file brokk-bifrost-jvm resources/treesitter/java/identifiers.scm
 require_archive_file brokk-bifrost-jvm resources/treesitter/java/imports.scm
 require_archive_file brokk-bifrost-jvm resources/treesitter/scala/definitions.scm
 require_archive_file brokk-bifrost-jvm resources/treesitter/scala/imports.scm
-# The Scala parser is vendored: archive-only consumers need the C build inputs,
-# and downstream redistributors need its license and regeneration provenance.
-for grammar_file in LICENSE README.md build.rs grammar.js tree-sitter.json \
-  queries/highlights.scm src/parser.c src/scanner.c src/grammar.json \
-  src/node-types.json src/tree_sitter/alloc.h src/tree_sitter/array.h \
-  src/tree_sitter/parser.h; do
-  require_archive_file brokk-bifrost-jvm "src/scala/grammar/$grammar_file"
-done
 require_archive_file brokk-bifrost-jvm resources/treesitter/kotlin/highlights.scm
 require_archive_file brokk-bifrost-php resources/treesitter/php/definitions.scm
 require_archive_file brokk-bifrost-php resources/treesitter/php/imports.scm
@@ -187,7 +179,12 @@ require_archive_file brokk-bifrost-semantic-packs embedded/node-runtime-values-t
 require_archive_file brokk-bifrost-semantic-packs embedded/python-process-inputs/manifest.json
 require_archive_file brokk-bifrost-semantic-packs embedded/python-process-inputs/shards/runtime.python-process-inputs.deflate
 require_archive_file brokk-bifrost-semantic-packs embedded/python-os-command-declarations/manifest.json
-require_archive_file brokk-bifrost-semantic-packs embedded/python-os-command-declarations/shards/declarations.python-os-system.json
+require_archive_file brokk-bifrost-semantic-packs embedded/python-os-command-declarations/shards/declarations.python-os-commands.deflate
+require_archive_file brokk-bifrost-semantic-packs embedded/python-security-sink-declarations/manifest.json
+require_archive_file brokk-bifrost-semantic-packs embedded/python-security-sink-declarations/shards/declarations.python-security-sink-apis.deflate
+require_archive_file brokk-bifrost-semantic-packs embedded/python-stdlib-api-declarations/manifest.json
+require_archive_file brokk-bifrost-semantic-packs embedded/python-stdlib-api-declarations/shards/declarations.python-stdlib-security-apis.deflate
+require_archive_file brokk-bifrost-semantic-packs embedded/python-stdlib-api-declarations/shards/declarations.python-ssl-legacy-api.deflate
 require_archive_file brokk-bifrost-semantic-packs embedded/python-os-command-summaries/manifest.json
 require_archive_file brokk-bifrost-semantic-packs embedded/python-os-command-summaries/shards/summaries.python-os-system.json
 require_archive_file brokk-bifrost-runtime src/extension/mod.rs
@@ -210,11 +207,24 @@ for policy_manifest in "$repo_root"/crates/bifrost-policy/policy-packs/*/manifes
 done
 
 require_archive_file brokk-bifrost-mcp resources/agent-guidance/bifrost-agents.md
-require_archive_file brokk-bifrost schemas/semantic-model-pack-v2.schema.json
-require_archive_file brokk-bifrost schemas/semantic-model-pack-v3.schema.json
-require_archive_file brokk-bifrost schemas/semantic-model-pack-v4.schema.json
-require_archive_file brokk-bifrost schemas/semantic-model-pack-v5.schema.json
-require_archive_file brokk-bifrost schemas/semantic-model-pack-v8.schema.json
+# Use the reader's supported versions; schema seven has no published JSON
+# Schema resource. Do not infer the contract from files present in the archive.
+semantic_model_schema_versions=$(node --input-type=module <<'EOF'
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+
+const model = readFileSync("crates/bifrost-analysis/src/analyzer/semantic_model/model.rs", "utf8");
+const declaration = model.match(/pub const SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS: &\[u32\]\s*=\s*&\[([\d,\s]+)\];/u);
+assert(declaration, "cannot read SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS");
+const versions = JSON.parse(`[${declaration[1].replace(/,\s*$/u, "")}]`);
+assert(versions.length > 0, "supported semantic-model schema versions must not be empty");
+console.log(versions.filter(version => version !== 7).join(" "));
+EOF
+)
+read -r -a published_schema_versions <<<"$semantic_model_schema_versions"
+for schema_version in "${published_schema_versions[@]}"; do
+  require_archive_file brokk-bifrost "schemas/semantic-model-pack-v${schema_version}.schema.json"
+done
 require_archive_file brokk-bifrost schemas/workspace-packs-v1.schema.json
 
 root_archive=$(archive_for brokk-bifrost)

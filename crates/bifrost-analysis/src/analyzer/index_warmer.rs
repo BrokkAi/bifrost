@@ -157,6 +157,7 @@ mod tests {
     use super::{IndexWarmer, spawn_index_warm};
     use crate::analyzer::AnalyzerConfig;
     use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_test_macros::hardwon;
     use rayon::prelude::*;
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, mpsc};
@@ -191,6 +192,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "c5c11b710c78: a background warm panic left the index warmer permanently unavailable"
+    )]
     fn background_warm_panic_resets_for_the_next_schedule() {
         let project = InlineTestProject::new()
             .file(

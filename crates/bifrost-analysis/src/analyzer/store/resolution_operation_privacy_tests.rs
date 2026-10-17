@@ -3,15 +3,15 @@ use super::*;
 use std::path::Path;
 
 use crate::analyzer::resolution::{
-    BindingNodeId, FactPageVisitor, LoweredSemanticRole, SelectedResolutionMountOrdinal,
-    SelectedTypedFactSource, TypedFactRequest,
+    BindingNodeId, DeclarationAccessDecision, DeclarationAccessRequest, FactPageVisitor,
+    LoweredSemanticRole, SelectedDeclarationAccessSource, SelectedResolutionMountOrdinal,
+    SelectedTypedFactSource, SemanticId, SharedNameId, TypedFactRequest,
 };
 use brokk_bifrost_core::analyzer::resolution_facts::{
     FileResolutionFacts, ResolutionIdentifierRole, ResolutionNamespace, ResolutionSiteId,
 };
 use brokk_bifrost_core::analyzer::rust_facts::RustVisibility;
-use brokk_bifrost_core::analyzer::source_facts::SourceDeclarationId;
-use rusqlite::params;
+use brokk_bifrost_test_macros::hardwon;
 
 fn persisted_target_authority_request(
     operation: &SelectedResolutionOperation<'_, '_>,
@@ -109,68 +109,6 @@ fn persisted_provider_blob_id(fixture: &RustRootResolutionOperationFixture) -> i
 }
 
 #[test]
-fn persisted_node_authority_follows_semantic_site_bridge_and_property() {
-    let fixture = RustRootResolutionOperationFixture::new();
-    let cancellation = CancellationToken::default();
-    let operation = fixture.open_ready(&cancellation);
-    let (mount, node, source_site, blob_id) =
-        persisted_target_authority_request(&operation, &fixture.provider_facts);
-
-    // The interior translates the export's definition node to the source site
-    // the authority chain admits; the persisted row keeps that chain.
-    let translated = operation
-        .ready
-        .lexical_source()
-        .definition_source_site(mount, node, &CancellationToken::default())
-        .expect("interior definition source site")
-        .expect("uncancelled interior read")
-        .expect("a persisted export definition node declares a source site");
-    assert_eq!(translated, source_site);
-    let authorities = read_selected_rust_declaration_authority_with_cancellation(
-        &operation.ready.inventory,
-        &[(mount, translated)],
-        &CancellationToken::default(),
-        None,
-    )
-    .expect("persisted Rust declaration authority")
-    .expect("uncancelled authority read");
-    assert_eq!(authorities.len(), 1);
-    let authority = &authorities[0];
-
-    let (stored_site, stored_declaration, stored_visibility): (i64, i64, String) = operation
-        .ready
-        .inventory
-        .connection()
-        .query_row(
-            "SELECT semantic.source_site, native.declaration_id, property.visibility
-               FROM resolution_semantic_sites AS semantic
-               JOIN source_native_declaration_bridges AS native
-                 ON native.blob_id = semantic.blob_id
-                AND native.source_site = semantic.source_site
-               JOIN source_rust_declaration_properties AS property
-                 ON property.blob_id = native.blob_id
-                AND property.declaration_id = native.declaration_id
-              WHERE semantic.blob_id = ?1
-                AND semantic.source_site = ?2
-                AND semantic.semantic_role = 'definition'",
-            params![blob_id, source_site.get()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .expect("canonical persisted source authority row");
-    assert_eq!(
-        authority.source_site,
-        ResolutionSiteId::new(stored_site as u32)
-    );
-    assert_eq!(authority.source_site, source_site);
-    assert_eq!(
-        authority.declaration,
-        SourceDeclarationId::new(stored_declaration as u32)
-    );
-    assert_eq!(authority.visibility, RustVisibility::Public);
-    assert_eq!(stored_visibility, "public");
-}
-
-#[test]
 fn persisted_node_authority_cancellation_returns_none_then_retries() {
     let fixture = RustRootResolutionOperationFixture::new();
     let open_cancellation = CancellationToken::default();
@@ -199,101 +137,6 @@ fn persisted_node_authority_cancellation_returns_none_then_retries() {
     .expect("retried persisted authority")
     .expect("uncancelled authority read");
     assert_eq!(retried.len(), 1);
-}
-
-#[test]
-fn persisted_node_authority_rejects_missing_native_bridge() {
-    let fixture = RustRootResolutionOperationFixture::new();
-    let source_site = persisted_target_source_site(&fixture);
-    let blob_id = persisted_provider_blob_id(&fixture);
-    fixture
-        .store
-        .conn
-        .execute(move |connection| {
-            connection
-                .execute_batch(
-                    "DROP TRIGGER source_native_declaration_bridges_no_delete_after_seal",
-                )
-                .expect("allow missing-bridge fixture mutation");
-            connection.execute(
-                "DELETE FROM source_native_declaration_bridges
-              WHERE blob_id = ?1 AND source_site = ?2",
-                params![blob_id, source_site.get()],
-            )
-        })
-        .expect("remove native bridge test row before opening operation");
-    let cancellation = CancellationToken::default();
-    let operation = fixture.open_ready(&cancellation);
-    let (mount, _, requested_site, _) =
-        persisted_target_authority_request(&operation, &fixture.provider_facts);
-
-    let error = read_selected_rust_declaration_authority_with_cancellation(
-        &operation.ready.inventory,
-        &[(mount, requested_site)],
-        &CancellationToken::default(),
-        None,
-    )
-    .expect_err("missing native bridge must fail closed");
-    assert!(
-        error
-            .to_string()
-            .contains("incomplete Rust declaration authority"),
-        "unexpected missing-bridge diagnostic: {error}"
-    );
-}
-
-#[test]
-fn persisted_node_authority_rejects_missing_rust_property() {
-    let fixture = RustRootResolutionOperationFixture::new();
-    let source_site = persisted_target_source_site(&fixture);
-    let blob_id = persisted_provider_blob_id(&fixture);
-    let declaration: i64 = fixture
-        .store
-        .conn
-        .execute(move |connection| {
-            connection.query_row(
-                "SELECT declaration_id
-                   FROM source_native_declaration_bridges
-                  WHERE blob_id = ?1 AND source_site = ?2",
-                params![blob_id, source_site.get()],
-                |row| row.get(0),
-            )
-        })
-        .expect("native declaration for property deletion");
-    fixture
-        .store
-        .conn
-        .execute(move |connection| {
-            connection
-                .execute_batch(
-                    "DROP TRIGGER source_rust_declaration_properties_no_delete_after_seal",
-                )
-                .expect("allow missing-property fixture mutation");
-            connection.execute(
-                "DELETE FROM source_rust_declaration_properties
-              WHERE blob_id = ?1 AND declaration_id = ?2",
-                params![blob_id, declaration],
-            )
-        })
-        .expect("remove Rust property test row before opening operation");
-    let cancellation = CancellationToken::default();
-    let operation = fixture.open_ready(&cancellation);
-    let (mount, _, requested_site, _) =
-        persisted_target_authority_request(&operation, &fixture.provider_facts);
-
-    let error = read_selected_rust_declaration_authority_with_cancellation(
-        &operation.ready.inventory,
-        &[(mount, requested_site)],
-        &CancellationToken::default(),
-        None,
-    )
-    .expect_err("missing Rust property must fail closed");
-    assert!(
-        error
-            .to_string()
-            .contains("incomplete Rust declaration authority"),
-        "unexpected missing-property diagnostic: {error}"
-    );
 }
 
 #[test]
@@ -413,6 +256,294 @@ fn persisted_raw_reference_and_declaration_authority_cancel_then_retry() {
     assert_eq!(
         declaration_rows[0].row().visibility(),
         Some(&RustVisibility::Public)
+    );
+}
+
+#[test]
+#[hardwon("#4453: shared Rust target candidates have no declaration-authority membership")]
+fn rust_access_policy_skips_authority_reads_for_shared_candidates() {
+    let fixture = RustRootResolutionOperationFixture::new();
+    let cancellation = CancellationToken::default();
+    let operation = fixture.open_ready(&cancellation);
+    let reference_site = site_for_identifier(
+        &fixture.consumer_facts,
+        "alias",
+        ResolutionIdentifierRole::Reference,
+        ResolutionNamespace::Value,
+    );
+    let lexical = operation.ready.lexical_source();
+    let crate::analyzer::store::resolution_lexical::SelectedSemanticLookupOutcome::Found(found) =
+        lexical
+            .lookup_semantic_sites(
+                &SelectedSemanticLocator::new(
+                    "rust",
+                    RUST_ROOT_CONSUMER_PATH,
+                    reference_site,
+                    LoweredSemanticRole::Reference,
+                ),
+                &cancellation,
+                &ResolutionSession::unbounded(),
+            )
+            .expect("locate canonical selected reference")
+    else {
+        panic!("Rust access fixture reference must be selected")
+    };
+    assert_eq!(found.len(), 1);
+    let reference = found[0].semantic();
+    let definition = SemanticId::shared_name(SharedNameId::interned(0));
+    let policy =
+        crate::analyzer::store::resolution_operation::rust_crate_access::RustCrateAccessPolicy {
+            crate_keys: Vec::new(),
+            base_blobs: Vec::new(),
+            identity: SemanticId::for_test(b"shared-rust-access-candidate"),
+        };
+    let source = operation.ready.typed_source();
+    let mut access_rows = Vec::new();
+    let mut collect = |rows: &[crate::analyzer::resolution::DeclarationAccessRow]| {
+        access_rows.extend_from_slice(rows);
+        Ok(true)
+    };
+    let outcome = policy
+        .visit_access_pages(
+            &source,
+            TypedFactRequest::new(&[DeclarationAccessRequest {
+                reference,
+                definition,
+            }]),
+            &cancellation,
+            &mut FactPageVisitor::new(&mut collect),
+        )
+        .expect("shared candidate needs no persisted Rust declaration authority");
+
+    assert!(outcome.is_exhausted());
+    assert_eq!(access_rows.len(), 1);
+    assert_eq!(access_rows[0].request.definition, definition);
+    assert_eq!(access_rows[0].decision, DeclarationAccessDecision::Denied);
+}
+
+#[test]
+fn persisted_rust_authority_batch_order_is_request_order_independent() {
+    use crate::analyzer::resolution::{SemanticId, TypedFactRequest};
+    let mut fixture = RustRootResolutionOperationFixture::new();
+    fixture.replace_persisted_consumer_source(
+        "pub fn first() {} pub fn second() {} pub fn caller() { first(); second(); }",
+    );
+    let cancellation = CancellationToken::new();
+    let operation = fixture.open_ready(&cancellation);
+    let (ordinal,blob)=operation.ready.inventory.connection().query_row("SELECT m.mount_ordinal,m.blob_id FROM temp.selected_resolution_mounts m WHERE (SELECT count(*) FROM resolution_rust_reference_contexts r WHERE r.blob_id=m.blob_id)>=2 AND (SELECT count(*) FROM resolution_rust_declaration_authorities d WHERE d.blob_id=m.blob_id)>=2 ORDER BY m.mount_ordinal LIMIT 1",[],|row| Ok((row.get::<_,u32>(0)?,row.get::<_,i64>(1)?))).unwrap();
+    let typed = operation.ready.typed_source();
+    for table in [
+        "resolution_rust_reference_contexts",
+        "resolution_rust_declaration_authorities",
+    ] {
+        let keys = operation
+            .ready
+            .inventory
+            .connection()
+            .prepare(&format!(
+                "SELECT semantic_key FROM {table} WHERE blob_id=?1 ORDER BY semantic_key LIMIT 2"
+            ))
+            .unwrap()
+            .query_map([blob], |row| row.get::<_, u32>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let expected = keys
+            .iter()
+            .map(|key| SemanticId::local(ordinal, *key))
+            .collect::<Vec<_>>();
+        assert!(
+            std::panic::catch_unwind(|| {
+                let duplicate = [expected[0], expected[0]];
+                let _request = TypedFactRequest::new(&duplicate);
+            })
+            .is_err(),
+            "duplicate typed request keys are rejected at construction"
+        );
+        for requested in [vec![expected[1], expected[0]], expected.clone()] {
+            let mut observed = Vec::new();
+            if table == "resolution_rust_reference_contexts" {
+                typed
+                    .visit_rust_reference_context_pages(
+                        TypedFactRequest::new(&requested),
+                        &cancellation,
+                        &mut FactPageVisitor::new(&mut |rows| {
+                            observed.extend(rows.iter().map(|row| row.row().reference()));
+                            Ok(true)
+                        }),
+                    )
+                    .unwrap();
+            } else {
+                typed
+                    .visit_rust_declaration_authority_pages(
+                        TypedFactRequest::new(&requested),
+                        &cancellation,
+                        &mut FactPageVisitor::new(&mut |rows| {
+                            observed.extend(rows.iter().map(|row| row.row().definition()));
+                            Ok(true)
+                        }),
+                    )
+                    .unwrap();
+            }
+            assert_eq!(observed, expected);
+        }
+    }
+}
+
+#[test]
+fn persisted_node_authority_follows_semantic_site_bridge_and_property() {
+    let fixture = RustRootResolutionOperationFixture::new();
+    let cancellation = CancellationToken::default();
+    let operation = fixture.open_ready(&cancellation);
+    let (mount, node, source_site, blob_id) =
+        persisted_target_authority_request(&operation, &fixture.provider_facts);
+
+    // The interior translates the export's definition node to the source site
+    // the authority chain admits; the persisted row keeps that chain.
+    let translated = operation
+        .ready
+        .lexical_source()
+        .definition_source_site(mount, node, &CancellationToken::default())
+        .expect("interior definition source site")
+        .expect("uncancelled interior read")
+        .expect("a persisted export definition node declares a source site");
+    assert_eq!(translated, source_site);
+    let authorities = read_selected_rust_declaration_authority_with_cancellation(
+        &operation.ready.inventory,
+        &[(mount, translated)],
+        &CancellationToken::default(),
+        None,
+    )
+    .expect("persisted Rust declaration authority")
+    .expect("uncancelled authority read");
+    assert_eq!(authorities.len(), 1);
+    let authority = &authorities[0];
+
+    let (stored_site, stored_declaration, stored_visibility): (i64, i64, String) = operation
+        .ready
+        .inventory
+        .connection()
+        .query_row(
+            "SELECT semantic.source_site, native.declaration_id, property.visibility
+               FROM resolution_semantic_sites AS semantic
+               JOIN source_native_declaration_bridges AS native
+                 ON native.blob_id = semantic.blob_id
+                AND native.source_site = semantic.source_site
+               JOIN source_rust_declaration_properties AS property
+                 ON property.blob_id = native.blob_id
+                AND property.declaration_id = native.declaration_id
+              WHERE semantic.blob_id = ?1
+                AND semantic.source_site = ?2
+                AND semantic.semantic_role = 'definition'",
+            params![blob_id, source_site.get()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("canonical persisted source authority row");
+    assert_eq!(
+        authority.source_site,
+        ResolutionSiteId::new(stored_site as u32)
+    );
+    assert_eq!(authority.source_site, source_site);
+    assert_eq!(
+        authority.declaration,
+        SourceDeclarationId::new(stored_declaration as u32)
+    );
+    assert_eq!(authority.visibility, RustVisibility::Public);
+    assert_eq!(stored_visibility, "public");
+}
+
+#[test]
+fn persisted_node_authority_rejects_missing_native_bridge() {
+    let fixture = RustRootResolutionOperationFixture::new();
+    let source_site = persisted_target_source_site(&fixture);
+    let blob_id = persisted_provider_blob_id(&fixture);
+    fixture
+        .store
+        .conn
+        .execute(move |connection| {
+            connection
+                .execute_batch(
+                    "DROP TRIGGER source_native_declaration_bridges_no_delete_after_seal",
+                )
+                .expect("allow missing-bridge fixture mutation");
+            connection.execute(
+                "DELETE FROM source_native_declaration_bridges
+              WHERE blob_id = ?1 AND source_site = ?2",
+                params![blob_id, source_site.get()],
+            )
+        })
+        .expect("remove native bridge test row before opening operation");
+    let cancellation = CancellationToken::default();
+    let operation = fixture.open_ready(&cancellation);
+    let (mount, _, requested_site, _) =
+        persisted_target_authority_request(&operation, &fixture.provider_facts);
+
+    let error = read_selected_rust_declaration_authority_with_cancellation(
+        &operation.ready.inventory,
+        &[(mount, requested_site)],
+        &CancellationToken::default(),
+        None,
+    )
+    .expect_err("missing native bridge must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("incomplete Rust declaration authority"),
+        "unexpected missing-bridge diagnostic: {error}"
+    );
+}
+
+#[test]
+fn persisted_node_authority_rejects_missing_rust_property() {
+    let fixture = RustRootResolutionOperationFixture::new();
+    let source_site = persisted_target_source_site(&fixture);
+    let blob_id = persisted_provider_blob_id(&fixture);
+    let declaration: i64 = fixture
+        .store
+        .conn
+        .execute(move |connection| {
+            connection.query_row(
+                "SELECT declaration_id
+                   FROM source_native_declaration_bridges
+                  WHERE blob_id = ?1 AND source_site = ?2",
+                params![blob_id, source_site.get()],
+                |row| row.get(0),
+            )
+        })
+        .expect("native declaration for property deletion");
+    fixture
+        .store
+        .conn
+        .execute(move |connection| {
+            connection
+                .execute_batch(
+                    "DROP TRIGGER source_rust_declaration_properties_no_delete_after_seal",
+                )
+                .expect("allow missing-property fixture mutation");
+            connection.execute(
+                "DELETE FROM source_rust_declaration_properties
+              WHERE blob_id = ?1 AND declaration_id = ?2",
+                params![blob_id, declaration],
+            )
+        })
+        .expect("remove Rust property test row before opening operation");
+    let cancellation = CancellationToken::default();
+    let operation = fixture.open_ready(&cancellation);
+    let (mount, _, requested_site, _) =
+        persisted_target_authority_request(&operation, &fixture.provider_facts);
+
+    let error = read_selected_rust_declaration_authority_with_cancellation(
+        &operation.ready.inventory,
+        &[(mount, requested_site)],
+        &CancellationToken::default(),
+        None,
+    )
+    .expect_err("missing Rust property must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("incomplete Rust declaration authority"),
+        "unexpected missing-property diagnostic: {error}"
     );
 }
 
@@ -540,75 +671,6 @@ fn persisted_rust_authority_keeps_nested_module_parent_and_cfg() {
         target.cfg_condition(),
         &RustCfgCondition::Atom("feature = \"enabled\"".to_owned())
     );
-}
-
-#[test]
-fn persisted_rust_authority_batch_order_is_request_order_independent() {
-    use crate::analyzer::resolution::{SemanticId, TypedFactRequest};
-    let mut fixture = RustRootResolutionOperationFixture::new();
-    fixture.replace_persisted_consumer_source(
-        "pub fn first() {} pub fn second() {} pub fn caller() { first(); second(); }",
-    );
-    let cancellation = CancellationToken::new();
-    let operation = fixture.open_ready(&cancellation);
-    let (ordinal,blob)=operation.ready.inventory.connection().query_row("SELECT m.mount_ordinal,m.blob_id FROM temp.selected_resolution_mounts m WHERE (SELECT count(*) FROM resolution_rust_reference_contexts r WHERE r.blob_id=m.blob_id)>=2 AND (SELECT count(*) FROM resolution_rust_declaration_authorities d WHERE d.blob_id=m.blob_id)>=2 ORDER BY m.mount_ordinal LIMIT 1",[],|row| Ok((row.get::<_,u32>(0)?,row.get::<_,i64>(1)?))).unwrap();
-    let typed = operation.ready.typed_source();
-    for table in [
-        "resolution_rust_reference_contexts",
-        "resolution_rust_declaration_authorities",
-    ] {
-        let keys = operation
-            .ready
-            .inventory
-            .connection()
-            .prepare(&format!(
-                "SELECT semantic_key FROM {table} WHERE blob_id=?1 ORDER BY semantic_key LIMIT 2"
-            ))
-            .unwrap()
-            .query_map([blob], |row| row.get::<_, u32>(0))
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        let expected = keys
-            .iter()
-            .map(|key| SemanticId::local(ordinal, *key))
-            .collect::<Vec<_>>();
-        assert!(
-            std::panic::catch_unwind(|| {
-                let duplicate = [expected[0], expected[0]];
-                let _request = TypedFactRequest::new(&duplicate);
-            })
-            .is_err(),
-            "duplicate typed request keys are rejected at construction"
-        );
-        for requested in [vec![expected[1], expected[0]], expected.clone()] {
-            let mut observed = Vec::new();
-            if table == "resolution_rust_reference_contexts" {
-                typed
-                    .visit_rust_reference_context_pages(
-                        TypedFactRequest::new(&requested),
-                        &cancellation,
-                        &mut FactPageVisitor::new(&mut |rows| {
-                            observed.extend(rows.iter().map(|row| row.row().reference()));
-                            Ok(true)
-                        }),
-                    )
-                    .unwrap();
-            } else {
-                typed
-                    .visit_rust_declaration_authority_pages(
-                        TypedFactRequest::new(&requested),
-                        &cancellation,
-                        &mut FactPageVisitor::new(&mut |rows| {
-                            observed.extend(rows.iter().map(|row| row.row().definition()));
-                            Ok(true)
-                        }),
-                    )
-                    .unwrap();
-            }
-            assert_eq!(observed, expected);
-        }
-    }
 }
 
 #[test]

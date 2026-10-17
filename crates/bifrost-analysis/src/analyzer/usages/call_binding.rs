@@ -52,11 +52,13 @@
 //! `default_range`, and never re-derives receiver evidence.
 
 use crate::analyzer::lexical_definitions::{FormalParameterLayout, FormalParameterSlot};
-use crate::analyzer::semantic::LengthDelimitedDigest;
+use crate::analyzer::semantic::{
+    ArgumentDomain, CallArgumentExpansion, LengthDelimitedDigest, SemanticCallArgument,
+};
 use crate::analyzer::usages::call_conversion::{CallArgumentConversion, ConversionUnknown};
 use crate::analyzer::usages::call_shape::CallShapeReport;
-use crate::analyzer::{CodeUnit, ProjectFile, Range};
-use brokk_bifrost_core::analyzer::structural::callable::{ArgumentListKind, CallShapeCoverage};
+use crate::analyzer::{CodeUnit, Language, ProjectFile, Range};
+use brokk_bifrost_core::analyzer::structural::callable::ArgumentListKind;
 
 /// Domain separator for one actual-to-formal binding row id.
 const CALL_BINDING_ID_DOMAIN: &[u8] = b"bifrost.code_query.call_binding.v1";
@@ -102,6 +104,8 @@ call_binding_enum! {
     /// - `Named`: an actual matched by the parameter name written at the call.
     /// - `Defaulted`: a formal with no source actual, bound by its declared
     ///   default. Not emitted in the first slice.
+    /// - `MissingRequired`: a Python required formal that no actual supplied,
+    ///   after the call's exact actual partition was established.
     /// - `Variadic`: an actual absorbed by a repeating formal.
     /// - `Spread`: an actual that expands a pack (`*args`, `xs: _*`, `...xs`).
     ///   The pack's members are not individually known, so the mapping status
@@ -114,6 +118,7 @@ call_binding_enum! {
         Positional => "positional",
         Named => "named",
         Defaulted => "defaulted",
+        MissingRequired => "missing_required",
         Variadic => "variadic",
         Spread => "spread",
         Receiver => "receiver",
@@ -148,12 +153,15 @@ call_binding_enum! {
     /// - `Exhaustive`: every actual of this call is bound exactly. A call that
     ///   passes no arguments is exhaustive.
     /// - `Partial`: some actuals are bound exactly and some are not.
+    /// - `Incomplete`: the actuals bind against one selected source candidate,
+    ///   but the resolver's candidate frontier remains open.
     /// - `Unknown`: no actual could be bound, because the callee or its formals
     ///   could not be established.
     /// - `Unsupported`: the call's own argument structure is unreadable.
     CallBindingCoverage, ALL_CALL_BINDING_COVERAGES {
         Exhaustive => "exhaustive",
         Partial => "partial",
+        Incomplete => "incomplete",
         Unknown => "unknown",
         Unsupported => "unsupported",
     }
@@ -166,10 +174,13 @@ call_binding_enum! {
     ///   `Exact`, so its arguments were never enumerated.
     /// - `CalleeUnresolved`: no callee declaration could be named for the site.
     /// - `CalleeAmbiguous`: the callee reference named several declarations.
+    /// - `CalleeIncomplete`: the callee frontier stayed open with zero or one retained candidate.
     /// - `FormalsUnrecorded`: the callee resolves, but nothing recorded its
     ///   formal parameter list.
     /// - `NoMatchingFormal`: this actual matched no formal slot -- an arity or
     ///   name mismatch against the bound callable.
+    /// - `UnknownKeyword`: this Python keyword actual names no formal and the
+    ///   callable has no `**kwargs` slot that accepts it.
     /// - `SpreadNotExpanded`: this actual expands a pack whose members are not
     ///   statically known.
     /// - `ReceiverBindingUnsupported`: the language binds a receiver into the
@@ -179,8 +190,10 @@ call_binding_enum! {
         ShapeUnreadable => "shape_unreadable",
         CalleeUnresolved => "callee_unresolved",
         CalleeAmbiguous => "callee_ambiguous",
+        CalleeIncomplete => "callee_incomplete",
         FormalsUnrecorded => "formals_unrecorded",
         NoMatchingFormal => "no_matching_formal",
+        UnknownKeyword => "unknown_keyword",
         SpreadNotExpanded => "spread_not_expanded",
         ReceiverBindingUnsupported => "receiver_binding_unsupported",
     }
@@ -268,6 +281,15 @@ pub enum CallBindingTarget {
         layout: FormalParameterLayout,
         receiver: CallReceiverBinding,
     },
+    /// The selected-native resolver retained one source candidate, but its
+    /// binding frontier remains open. Rows keep the candidate's formal
+    /// positions; the site coverage records that the overall binding is
+    /// incomplete.
+    ResolvedIncomplete {
+        unit: CodeUnit,
+        layout: FormalParameterLayout,
+        receiver: CallReceiverBinding,
+    },
     /// The callee is an exact structured target outside the source workspace.
     ///
     /// A model-backed target can still publish a complete formal layout, but
@@ -280,8 +302,15 @@ pub enum CallBindingTarget {
     },
     /// The callee resolves, but nothing recorded its formal parameter list.
     FormalsUnrecorded { unit: CodeUnit },
+    /// An exact external callee resolves, but nothing recorded its formal
+    /// parameter list.
+    FormalsUnrecordedExternal,
     /// The callee reference named several declarations.
     Ambiguous,
+    /// The callee lookup stayed incomplete. A single retained source candidate
+    /// remains visible, but neither it nor an empty frontier is treated as
+    /// resolved.
+    Incomplete { unit: Option<CodeUnit> },
     /// No callee declaration could be named for this site.
     Unresolved,
     /// The language binds a receiver into the declared parameter list, and the
@@ -383,7 +412,7 @@ pub fn call_binding_report(
 
     // An unreadable shape enumerated no argument, so there is nothing to bind
     // and nothing to claim. The mandatory row says exactly that.
-    if outcome.coverage != CallShapeCoverage::Exact {
+    if !outcome.coverage.is_exact() {
         return base(
             None,
             CallBindingCoverage::Unsupported,
@@ -399,16 +428,35 @@ pub fn call_binding_report(
     }
 
     let actual_count = shape.arguments.len();
-    let (unit, layout, receiver) = match target {
+    let (unit, layout, receiver, target_incomplete) = match target {
         CallBindingTarget::Resolved {
             unit,
             layout,
             receiver,
-        } => (Some(unit), layout, receiver),
-        CallBindingTarget::ResolvedExternal { layout, receiver } => (None, layout, receiver),
+        } => (Some(unit), layout, receiver, false),
+        CallBindingTarget::ResolvedIncomplete {
+            unit,
+            layout,
+            receiver,
+        } => (Some(unit), layout, receiver, true),
+        CallBindingTarget::ResolvedExternal { layout, receiver } => (None, layout, receiver, false),
         CallBindingTarget::FormalsUnrecorded { unit } => {
             return base(
                 Some(unit),
+                CallBindingCoverage::Unknown,
+                actual_count,
+                0,
+                vec![terminal_row(
+                    &site_id,
+                    outcome.range,
+                    CallBindingMapping::Incomplete,
+                    Some(CallBindingReason::FormalsUnrecorded),
+                )],
+            );
+        }
+        CallBindingTarget::FormalsUnrecordedExternal => {
+            return base(
+                None,
                 CallBindingCoverage::Unknown,
                 actual_count,
                 0,
@@ -445,6 +493,20 @@ pub fn call_binding_report(
                     outcome.range,
                     CallBindingMapping::Ambiguous,
                     Some(CallBindingReason::CalleeAmbiguous),
+                )],
+            );
+        }
+        CallBindingTarget::Incomplete { unit } => {
+            return base(
+                unit,
+                CallBindingCoverage::Incomplete,
+                actual_count,
+                0,
+                vec![terminal_row(
+                    &site_id,
+                    outcome.range,
+                    CallBindingMapping::Incomplete,
+                    Some(CallBindingReason::CalleeIncomplete),
                 )],
             );
         }
@@ -518,7 +580,18 @@ pub fn call_binding_report(
                         CallBindingKind::Positional
                     },
                     CallBindingMapping::Incomplete,
-                    Some(CallBindingReason::NoMatchingFormal),
+                    Some(
+                        if unit
+                            .as_ref()
+                            .is_some_and(|unit| unit.source().language() == Language::Python)
+                            && named
+                            && argument.name.is_some()
+                        {
+                            CallBindingReason::UnknownKeyword
+                        } else {
+                            CallBindingReason::NoMatchingFormal
+                        },
+                    ),
                 )
             };
             rows.push(CallBindingRow {
@@ -548,7 +621,9 @@ pub fn call_binding_report(
     // facts about this call that no written actual accounts for, so counting
     // them here would make `exhaustive` mean something different depending on
     // the language's calling convention.
-    let coverage = if bound_count == actual_count {
+    let coverage = if target_incomplete {
+        CallBindingCoverage::Incomplete
+    } else if bound_count == actual_count {
         CallBindingCoverage::Exhaustive
     } else if bound_count == 0 {
         CallBindingCoverage::Unknown
@@ -587,6 +662,46 @@ pub fn call_binding_report(
                 conversion: None,
                 conversion_reason: None,
                 range: default_range,
+                terminal: false,
+            });
+        }
+    }
+
+    // Python source calls can also prove that a required formal received no
+    // value. This is separate from `coverage`, which describes written
+    // actuals: the call may map every actual exactly and still omit a required
+    // parameter. A spread or unmatched actual makes the partition nonexact,
+    // so it suppresses this absence claim.
+    if coverage == CallBindingCoverage::Exhaustive
+        && unit
+            .as_ref()
+            .is_some_and(|unit| unit.source().language() == Language::Python)
+    {
+        for (index, slot) in slots.slots() {
+            if slot.default_range.is_some()
+                || slot.variadic.is_some()
+                || bound_slots.contains(index)
+            {
+                continue;
+            }
+            rows.push(CallBindingRow {
+                id: row_id(&site_id, RowAnchor::MissingRequiredFormal(*index)),
+                site_id: site_id.clone(),
+                group_id: None,
+                argument_id: None,
+                actual_index: None,
+                actual_name: None,
+                formal_index: Some(*index),
+                formal_name: slot
+                    .names
+                    .first()
+                    .map(|name| canonical_parameter_name(name)),
+                binding_kind: Some(CallBindingKind::MissingRequired),
+                mapping: CallBindingMapping::Exact,
+                reason: None,
+                conversion: None,
+                conversion_reason: None,
+                range: outcome.range,
                 terminal: false,
             });
         }
@@ -679,6 +794,8 @@ enum RowAnchor<'a> {
     Argument(&'a str),
     /// A formal with no source actual: the defaulted rows.
     Formal(usize),
+    /// A required formal with no source actual, proven by an exhaustive call.
+    MissingRequiredFormal(usize),
     Receiver,
     Terminal,
 }
@@ -693,6 +810,10 @@ fn row_id(site_id: &str, anchor: RowAnchor<'_>) -> String {
         }
         RowAnchor::Formal(index) => {
             digest.push(b"formal");
+            digest.push(&index.to_le_bytes());
+        }
+        RowAnchor::MissingRequiredFormal(index) => {
+            digest.push(b"missing-required-formal");
             digest.push(&index.to_le_bytes());
         }
         RowAnchor::Receiver => digest.push(b"receiver"),
@@ -814,6 +935,75 @@ impl<'a> OrdinaryFormalSlots<'a> {
     }
 }
 
+/// Bind one structured semantic call's direct actuals with the same slot
+/// matcher used by call-binding rows and call-input relations. Spreads,
+/// unknown argument shapes, duplicate bindings, and unbound required formals
+/// remain incomplete.
+pub(crate) fn bind_semantic_call_arguments(
+    arguments: &[SemanticCallArgument],
+    layout: &FormalParameterLayout,
+) -> Option<Box<[u32]>> {
+    if layout.slots.iter().any(|slot| slot.receiver) {
+        return None;
+    }
+    let formals = OrdinaryFormalSlots::of(layout, false);
+    let mut supplied = vec![false; formals.slots().len()];
+    let mut actual_to_formal = Vec::with_capacity(arguments.len());
+    let mut positional_index = 0usize;
+    let mut saw_keyword = false;
+
+    for argument in arguments {
+        let (name, position) = match (&argument.expansion, argument.keyword.as_deref()) {
+            (CallArgumentExpansion::Direct(ArgumentDomain::Positional), None) => {
+                if saw_keyword {
+                    return None;
+                }
+                let position = positional_index;
+                positional_index += 1;
+                (None, Some(position))
+            }
+            (CallArgumentExpansion::Direct(ArgumentDomain::Positional), Some(_)) => return None,
+            (CallArgumentExpansion::Direct(ArgumentDomain::Keyword), Some(name)) => {
+                saw_keyword = true;
+                (Some(name), None)
+            }
+            (CallArgumentExpansion::Direct(ArgumentDomain::PositionalOrKeyword), name) => {
+                if let Some(name) = name {
+                    saw_keyword = true;
+                    (Some(name), None)
+                } else {
+                    if saw_keyword {
+                        return None;
+                    }
+                    let position = positional_index;
+                    positional_index += 1;
+                    (None, Some(position))
+                }
+            }
+            (CallArgumentExpansion::Direct(ArgumentDomain::Keyword), None)
+            | (CallArgumentExpansion::Direct(ArgumentDomain::LanguageDefined(_)), _)
+            | (CallArgumentExpansion::Spread(_), _)
+            | (CallArgumentExpansion::Unclassified, _) => return None,
+        };
+        let (formal, slot) = formals.slot_for(name, position, false)?;
+        let bound = supplied.get_mut(formal)?;
+        if *bound && slot.variadic.is_none() {
+            return None;
+        }
+        *bound = true;
+        actual_to_formal.push(u32::try_from(formal).expect("formal slot count fits u32"));
+    }
+
+    formals
+        .slots()
+        .iter()
+        .zip(supplied)
+        .all(|((_, slot), supplied)| {
+            supplied || slot.default_range.is_some() || slot.variadic.is_some()
+        })
+        .then(|| actual_to_formal.into_boxed_slice())
+}
+
 pub(crate) fn names_match(formal: &str, argument: &str) -> bool {
     formal == argument
         || formal.strip_prefix('$') == Some(argument)
@@ -828,8 +1018,8 @@ pub(crate) fn canonical_parameter_name(name: &str) -> String {
 mod tests {
     use super::*;
     use crate::analyzer::lexical_definitions::{FormalParameterPassingMode, FormalVariadicKind};
+    use crate::analyzer::structural::FileFacts;
     use crate::analyzer::structural::extract::extract_file_facts;
-    use crate::analyzer::structural::{FileFacts, NormalizedKind};
     use crate::analyzer::usages::call_shape::call_shape_for_call;
     use brokk_bifrost_core::analyzer::model::CodeUnitType;
     use brokk_bifrost_jvm::java::structural::JAVA_STRUCTURAL_SPEC;
@@ -845,19 +1035,7 @@ mod tests {
     }
 
     fn shape_for(source: &str, facts: &FileFacts, call_text: &str) -> CallShapeReport {
-        let start = source.rfind(call_text).expect("call text exists");
-        let end = start + call_text.len();
-        let call_id = facts
-            .nodes()
-            .iter()
-            .enumerate()
-            .find(|(_, node)| {
-                node.kind == NormalizedKind::Call
-                    && node.range.start_byte == start
-                    && node.range.end_byte == end
-            })
-            .map(|(id, _)| u32::try_from(id).expect("node id fits u32"))
-            .expect("call node exists at the text span");
+        let call_id = crate::analyzer::usages::test_support::call_node_id(source, facts, call_text);
         call_shape_for_call(facts, &file("Main.java"), call_id).expect("call shape")
     }
 
@@ -913,56 +1091,147 @@ mod tests {
         );
     }
 
-    /// Every positional actual of an ordinary Java call binds the formal at its
-    /// own ordinal, and the site's partition is exhaustive.
     #[test]
-    fn positional_actuals_bind_their_ordinal_formals() {
+    fn shared_call_matcher_binds_defaulted_formals_and_rejects_unknown_shapes() {
+        let mut formals = layout(&["text", "parser", "handler"]);
+        formals.slots[1].default_range = Some(zero_range());
+        formals.slots[2].passing_mode =
+            crate::analyzer::lexical_definitions::FormalParameterPassingMode::NamedOnly;
+        let actuals = [
+            SemanticCallArgument::direct(
+                crate::analyzer::semantic::ValueId::new(0),
+                ArgumentDomain::Positional,
+            ),
+            SemanticCallArgument::keyword(crate::analyzer::semantic::ValueId::new(1), "handler"),
+        ];
+        assert_eq!(
+            bind_semantic_call_arguments(&actuals, &formals).as_deref(),
+            Some([0, 2].as_slice())
+        );
+        assert!(
+            bind_semantic_call_arguments(&actuals[..1], &formals).is_none(),
+            "the required named-only formal cannot be omitted"
+        );
+
+        let unknown_keyword = [
+            actuals[0].clone(),
+            actuals[1].clone(),
+            SemanticCallArgument::keyword(crate::analyzer::semantic::ValueId::new(2), "mystery"),
+        ];
+        assert!(bind_semantic_call_arguments(&unknown_keyword, &formals).is_none());
+
+        let spread = [
+            actuals[0].clone(),
+            SemanticCallArgument {
+                value: crate::analyzer::semantic::ValueId::new(3),
+                expansion: CallArgumentExpansion::Spread(ArgumentDomain::Positional),
+                keyword: None,
+            },
+            actuals[1].clone(),
+        ];
+        assert!(bind_semantic_call_arguments(&spread, &formals).is_none());
+    }
+
+    #[test]
+    fn semantic_call_binding_repeats_direct_actuals_at_positional_rest_formal() {
+        let mut formals = layout(&["value", "rest", "flag"]);
+        formals.slots[1].variadic = Some(FormalVariadicKind::Positional);
+        formals.slots[1].passing_mode = FormalParameterPassingMode::PositionalOnly;
+        formals.slots[2].passing_mode = FormalParameterPassingMode::NamedOnly;
+        formals.slots[2].default_range = Some(zero_range());
+        let actuals = [
+            SemanticCallArgument::direct(
+                crate::analyzer::semantic::ValueId::new(0),
+                ArgumentDomain::Positional,
+            ),
+            SemanticCallArgument::direct(
+                crate::analyzer::semantic::ValueId::new(1),
+                ArgumentDomain::Positional,
+            ),
+            SemanticCallArgument::direct(
+                crate::analyzer::semantic::ValueId::new(2),
+                ArgumentDomain::Positional,
+            ),
+            SemanticCallArgument::keyword(crate::analyzer::semantic::ValueId::new(3), "flag"),
+        ];
+
+        assert_eq!(
+            bind_semantic_call_arguments(&actuals, &formals).as_deref(),
+            Some([0, 1, 1, 2].as_slice())
+        );
+        assert_eq!(
+            bind_semantic_call_arguments(&actuals[..1], &formals).as_deref(),
+            Some([0].as_slice()),
+            "an unpassed rest formal denotes its empty collection"
+        );
+    }
+
+    #[test]
+    fn semantic_call_binding_routes_unmatched_keywords_to_keyword_rest_only() {
+        let mut formals = layout(&["value", "options"]);
+        formals.slots[1].variadic = Some(FormalVariadicKind::Keyword);
+        formals.slots[1].passing_mode = FormalParameterPassingMode::NamedOnly;
+        let actuals = [
+            SemanticCallArgument::direct(
+                crate::analyzer::semantic::ValueId::new(0),
+                ArgumentDomain::Positional,
+            ),
+            SemanticCallArgument::keyword(crate::analyzer::semantic::ValueId::new(1), "color"),
+            SemanticCallArgument::keyword(crate::analyzer::semantic::ValueId::new(2), "size"),
+        ];
+        assert_eq!(
+            bind_semantic_call_arguments(&actuals, &formals).as_deref(),
+            Some([0, 1, 1].as_slice())
+        );
+
+        let no_keyword_rest = layout(&["value"]);
+        assert!(bind_semantic_call_arguments(&actuals[1..], &no_keyword_rest).is_none());
+    }
+
+    #[test]
+    fn semantic_call_binding_keeps_call_site_spreads_incomplete() {
+        let mut formals = layout(&["rest"]);
+        formals.slots[0].variadic = Some(FormalVariadicKind::Both);
+        let positional_spread = [SemanticCallArgument {
+            value: crate::analyzer::semantic::ValueId::new(0),
+            expansion: CallArgumentExpansion::Spread(ArgumentDomain::Positional),
+            keyword: None,
+        }];
+        let keyword_spread = [SemanticCallArgument {
+            value: crate::analyzer::semantic::ValueId::new(1),
+            expansion: CallArgumentExpansion::Spread(ArgumentDomain::Keyword),
+            keyword: None,
+        }];
+        assert!(bind_semantic_call_arguments(&positional_spread, &formals).is_none());
+        assert!(bind_semantic_call_arguments(&keyword_spread, &formals).is_none());
+    }
+
+    /// An incomplete selected-native target still supplies candidate formal
+    /// positions, but its open candidate frontier keeps site coverage
+    /// incomplete.
+    #[test]
+    fn incomplete_selected_target_keeps_candidate_bindings_without_closing_coverage() {
         let source =
-            "class App { static void target(int a, int b) {} static void run() { target(1, 2); } }";
+            "class App { static void target(int value) {} static void run() { target(1); } }";
         let facts = java_facts(source);
-        let shape = shape_for(source, &facts, "target(1, 2)");
+        let shape = shape_for(source, &facts, "target(1)");
         let report = call_binding_report(
             &file("Main.java"),
             &shape,
-            CallBindingTarget::Resolved {
+            CallBindingTarget::ResolvedIncomplete {
                 unit: unit("App.target"),
-                layout: layout(&["a", "b"]),
+                layout: layout(&["value"]),
                 receiver: CallReceiverBinding::Absent,
             },
         );
 
-        assert_eq!(report.coverage, CallBindingCoverage::Exhaustive);
-        assert_eq!(report.actual_count, 2);
-        assert_eq!(report.bound_count, 2);
-        assert_eq!(report.rows.len(), 2);
-        assert_eq!(
-            report
-                .rows
-                .iter()
-                .map(|row| (row.formal_index, row.formal_name.as_deref(), row.mapping))
-                .collect::<Vec<_>>(),
-            [
-                (Some(0), Some("a"), CallBindingMapping::Exact),
-                (Some(1), Some("b"), CallBindingMapping::Exact),
-            ]
-        );
-        assert!(report.rows.iter().all(|row| !row.terminal));
-        assert!(
-            report
-                .rows
-                .iter()
-                .all(|row| row.binding_kind == Some(CallBindingKind::Positional))
-        );
-        // Every row joins the call-shape rows it came from.
-        for row in &report.rows {
-            assert_eq!(row.site_id, shape.outcome.site_id);
-            assert!(
-                shape
-                    .arguments
-                    .iter()
-                    .any(|argument| Some(&argument.id) == row.argument_id.as_ref())
-            );
-        }
+        assert_eq!(report.coverage, CallBindingCoverage::Incomplete);
+        assert_eq!(report.actual_count, 1);
+        assert_eq!(report.bound_count, 1);
+        assert_eq!(report.rows.len(), 1);
+        assert_eq!(report.rows[0].formal_index, Some(0));
+        assert_eq!(report.rows[0].formal_name.as_deref(), Some("value"));
+        assert_eq!(report.rows[0].mapping, CallBindingMapping::Exact);
     }
 
     /// An actual the callable's parameter list cannot accept is reported as an
@@ -1037,6 +1306,27 @@ mod tests {
         assert_eq!(report.coverage, CallBindingCoverage::Unknown);
         assert_eq!(report.actual_count, 1);
         assert_eq!(report.bound_count, 0);
+    }
+
+    #[test]
+    fn an_external_callee_without_recorded_formals_uses_the_existing_reason() {
+        let source = "class App { static void run() { target(1); } }";
+        let facts = java_facts(source);
+        let shape = shape_for(source, &facts, "target(1)");
+        let report = call_binding_report(
+            &file("Main.java"),
+            &shape,
+            CallBindingTarget::FormalsUnrecordedExternal,
+        );
+
+        assert!(report.target.is_none());
+        assert_eq!(report.rows.len(), 1);
+        assert_eq!(report.rows[0].mapping, CallBindingMapping::Incomplete);
+        assert_eq!(
+            report.rows[0].reason,
+            Some(CallBindingReason::FormalsUnrecorded)
+        );
+        assert_eq!(report.coverage, CallBindingCoverage::Unknown);
     }
 
     /// A receiver row is a fact about the call that no written actual accounts
@@ -1260,29 +1550,5 @@ mod tests {
             .map(|row| row.id.clone())
             .collect::<std::collections::HashSet<_>>();
         assert_eq!(ids.len(), report.rows.len());
-    }
-
-    /// The declared vocabularies round-trip through their labels, so a policy
-    /// spelling is never a second source of truth.
-    #[test]
-    fn every_declared_label_round_trips() {
-        for kind in ALL_CALL_BINDING_KINDS {
-            assert_eq!(CallBindingKind::from_label(kind.label()), Some(*kind));
-        }
-        for mapping in ALL_CALL_BINDING_MAPPINGS {
-            assert_eq!(
-                CallBindingMapping::from_label(mapping.label()),
-                Some(*mapping)
-            );
-        }
-        for coverage in ALL_CALL_BINDING_COVERAGES {
-            assert_eq!(
-                CallBindingCoverage::from_label(coverage.label()),
-                Some(*coverage)
-            );
-        }
-        for reason in ALL_CALL_BINDING_REASONS {
-            assert_eq!(CallBindingReason::from_label(reason.label()), Some(*reason));
-        }
     }
 }

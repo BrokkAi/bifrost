@@ -1,15 +1,15 @@
 use std::{collections::BTreeSet, error::Error, fmt, mem::size_of_val, sync::Arc};
 
 use crate::analyzer::semantic::{
-    ProcedureHandle, ProgramPointHandle, SemanticArtifactKey, SemanticLocator,
+    OracleCallContext, ProcedureHandle, ProgramPointHandle, SemanticArtifactKey, SemanticLocator,
 };
 use crate::dataflow::{
     PathQualityFrontier, SummaryEntry, SummaryWitness, SummaryWitnessError, SummaryWitnessStep,
     WitnessReconstructionLimits, WitnessTruncationCause,
 };
 use crate::value_flow::{
-    AuthoredArmClosure, ValueFlowCarrierKey, ValueFlowEventKey, ValueFlowSinkId,
-    semantic_locator_heap_bytes,
+    AuthoredArmClosure, ValueFlowCarrier, ValueFlowCarrierKey, ValueFlowEventKey,
+    ValueFlowObservationPhase, ValueFlowSinkId, semantic_locator_heap_bytes,
 };
 
 use super::{
@@ -89,9 +89,23 @@ pub struct TaintOriginFindingEvidence {
     /// Classes observed at the sink after every intervening transform.
     reached_classes: TaintClassSet,
     witnesses: Box<[Arc<SummaryWitness>]>,
+    certain_path: bool,
+    authored_arm_closures: Box<[AuthoredArmClosure]>,
+    /// The phase and carrier of a source that a composition matched on its
+    /// frontier, which the plan does not hold. `None` for a source of the
+    /// plan, whose specification the plan answers.
+    frontier_source: Option<(ValueFlowObservationPhase, ValueFlowCarrier)>,
 }
 
 impl TaintOriginFindingEvidence {
+    /// The phase and carrier of a source matched on a composition's frontier;
+    /// `None` when the plan holds the source's specification.
+    pub fn frontier_source(&self) -> Option<(ValueFlowObservationPhase, &ValueFlowCarrier)> {
+        self.frontier_source
+            .as_ref()
+            .map(|(phase, carrier)| (*phase, carrier))
+    }
+
     pub const fn origin(&self) -> &SourceEventKey {
         &self.origin
     }
@@ -106,6 +120,19 @@ impl TaintOriginFindingEvidence {
 
     pub const fn witnesses(&self) -> &[Arc<SummaryWitness>] {
         &self.witnesses
+    }
+
+    /// A concrete retained path that is proven and complete at every hop,
+    /// counting a complete, exactly bound authored summary from an active
+    /// pack as closing its call (#5218). The authored dependencies it rests
+    /// on are in `authored_arm_closures`.
+    pub const fn has_certain_path(&self) -> bool {
+        self.certain_path
+    }
+
+    /// Authored dependencies associated with this source occurrence's paths.
+    pub fn authored_arm_closures(&self) -> &[AuthoredArmClosure] {
+        &self.authored_arm_closures
     }
 }
 
@@ -323,6 +350,16 @@ impl TaintFindingReport {
                                             .saturating_add(
                                                 evidence.reached_classes.retained_heap_bytes(),
                                             )
+                                            .saturating_add(size_of_val(
+                                                &*evidence.authored_arm_closures,
+                                            ))
+                                            .saturating_add(
+                                                evidence
+                                                    .authored_arm_closures
+                                                    .iter()
+                                                    .map(AuthoredArmClosure::retained_heap_bytes)
+                                                    .fold(0usize, usize::saturating_add),
+                                            )
                                             .saturating_add(size_of_val(&*evidence.witnesses))
                                             .saturating_add(
                                                 evidence
@@ -386,6 +423,155 @@ struct CollectionBudget {
     witness_expansions: usize,
     retained_witness_bytes: usize,
     truncated: bool,
+}
+
+/// Constructors for a report composed over partial flows instead of solved
+/// by the IDE kernel. The public shape of the report is unchanged.
+impl TaintOriginFindingEvidence {
+    pub(crate) fn composed(
+        origin: SourceEventKey,
+        classes: TaintClassSet,
+        reached_classes: TaintClassSet,
+        witnesses: Vec<Arc<SummaryWitness>>,
+        certain_path: bool,
+        authored_arm_closures: Vec<AuthoredArmClosure>,
+        frontier_source: Option<(ValueFlowObservationPhase, ValueFlowCarrier)>,
+    ) -> Self {
+        Self {
+            origin,
+            classes,
+            reached_classes,
+            witnesses: witnesses.into_boxed_slice(),
+            certain_path,
+            authored_arm_closures: authored_arm_closures.into_boxed_slice(),
+            frontier_source,
+        }
+    }
+}
+
+impl TaintOriginStatus {
+    /// `evidence` holds one entry per distinct origin, sorted by origin.
+    pub(crate) fn composed(
+        evidence: Vec<TaintOriginFindingEvidence>,
+        witness_unavailable: bool,
+    ) -> Self {
+        assert!(
+            evidence
+                .windows(2)
+                .all(|pair| pair[0].origin < pair[1].origin),
+            "composed origin evidence is sorted and distinct"
+        );
+        Self {
+            origins: evidence
+                .iter()
+                .map(|evidence| evidence.origin.clone())
+                .collect(),
+            evidence: evidence.into_boxed_slice(),
+            origin_truncated: false,
+            witness_truncated: false,
+            witness_truncation_cause: None,
+            witness_unavailable,
+        }
+    }
+}
+
+impl TaintFinding {
+    /// A finding at `sink` whose entry is the zero fact at the entry of the
+    /// sink's procedure.
+    pub(crate) fn composed(
+        plan: &TaintAnalysisPlan,
+        sink: ValueFlowSinkId,
+        classes: TaintClassSet,
+        path_qualities: PathQualityFrontier,
+        proven: bool,
+        complete: bool,
+        origins: TaintOriginStatus,
+    ) -> Result<Self, TaintFindingError> {
+        let sink_spec = plan
+            .value_flow()
+            .sink(sink)
+            .ok_or(TaintFindingError::InvalidResult)?;
+        let procedure = sink_spec.point().procedure().clone();
+        let point = procedure
+            .point_handle(procedure.semantics().entry_point())
+            .ok_or(TaintFindingError::InvalidResult)?;
+        let fact = super::TaintFact::zero();
+        let key = TaintFindingKey {
+            universe: plan.universe().hash(),
+            snapshot: plan.value_flow().root().artifact().key().clone(),
+            sink: sink_spec.key().clone(),
+            entry: point_locator(&point)?,
+            entry_carrier: None,
+            entry_uncertain: false,
+            meeting_site: sink_spec.key().site().clone(),
+            meeting_uncertain: !path_qualities.has_proven_complete_path(),
+        };
+        Ok(Self {
+            key,
+            sink,
+            classes,
+            entry: TaintFindingEntry {
+                procedure,
+                point,
+                fact,
+            },
+            path_qualities,
+            proven,
+            complete,
+            origins,
+        })
+    }
+}
+
+impl TaintFindingReport {
+    /// Per-pair envelopes retain the first collection's incompleteness without
+    /// copying its complete IDE graph for every source/sink pair.
+    pub(crate) fn refined_pair(
+        &self,
+        result: TaintSummaryResult,
+        findings: Vec<TaintFinding>,
+        incomplete: bool,
+    ) -> Self {
+        let mut report = Self::composed(result, findings);
+        report.collection_truncated = self.collection_truncated || incomplete;
+        report.omitted_findings_lower_bound = self.omitted_findings_lower_bound;
+        report
+    }
+
+    /// Move the first solve's coverage into the final report. Its original
+    /// unfiltered values cannot be used to reconstruct removed origins.
+    pub(crate) fn into_refined_findings(
+        self,
+        findings: Vec<TaintFinding>,
+        incomplete: bool,
+    ) -> Self {
+        let mut report = Self::composed(self.result.without_observed_values(), findings);
+        report.collection_truncated = self.collection_truncated || incomplete;
+        report.omitted_findings_lower_bound = self.omitted_findings_lower_bound;
+        report
+    }
+
+    pub(crate) fn composed(result: TaintSummaryResult, mut findings: Vec<TaintFinding>) -> Self {
+        findings.sort_by(|left, right| left.key.cmp(&right.key));
+        let witnesses = findings
+            .iter()
+            .flat_map(|finding| finding.origins.evidence.iter())
+            .flat_map(|evidence| evidence.witnesses.iter())
+            .collect::<Vec<_>>();
+        Self {
+            result,
+            collection_truncated: false,
+            omitted_findings_lower_bound: 0,
+            retained_witnesses: witnesses.len(),
+            retained_witness_steps: witnesses.iter().map(|witness| witness.steps().len()).sum(),
+            witness_expansions: 0,
+            retained_witness_bytes: witnesses
+                .iter()
+                .map(|witness| witness.retained_bytes())
+                .fold(0usize, usize::saturating_add),
+            findings: findings.into_boxed_slice(),
+        }
+    }
 }
 
 pub fn collect_taint_findings(
@@ -505,18 +691,35 @@ pub fn collect_taint_findings_with_limits(
             witness_limits,
             &mut budget,
         )?;
+        let certain_path = !fact.is_uncertain()
+            && result.termination().is_fixed_point()
+            && origins.is_complete()
+            && !origins.evidence().is_empty()
+            && origins
+                .evidence()
+                .iter()
+                .all(|origin| origin.has_certain_path());
         let finding = TaintFinding {
             key,
             sink,
             classes,
             entry,
             path_qualities: point_value.path_qualities(),
+            // A derived-complete run has discharged every unproven or partial
+            // edge it retained -- an abort-only exceptional return carries no
+            // value, and a fully modeled call's continuation is modeled -- so
+            // none of them can weaken this finding's proven path. Counting
+            // them raw left every Rust finding possible, because Rust lowers
+            // its implicit aborts as exactly such edges.
             proven: !fact.is_uncertain()
                 && result.termination().is_fixed_point()
-                && result.coverage().unproven_edges().is_empty()
-                && result.coverage().partial_edges().is_empty()
-                && point_value.path_qualities().has_proven_path(),
-            complete: result.is_complete() && point_value.path_qualities().has_complete_path(),
+                && (result.is_complete()
+                    || (result.coverage().unproven_edges().is_empty()
+                        && result.coverage().partial_edges().is_empty()))
+                && point_value.path_qualities().has_proven_path()
+                || certain_path,
+            complete: (result.is_complete() && point_value.path_qualities().has_complete_path())
+                || certain_path,
             origins,
         };
         // Distinct summary entries can reach one sink with identical facts --
@@ -610,6 +813,7 @@ fn collect_step_origins(
     problem: &super::TaintFlowProblem<'_>,
     classes: &TaintClassSet,
     limit: usize,
+    call_context: &OracleCallContext,
     steps: &[SummaryWitnessStep],
     witness: &Arc<SummaryWitness>,
     origins: &mut BTreeSet<SourceEventKey>,
@@ -645,7 +849,8 @@ fn collect_step_origins(
                 .source(source.source())
                 .is_some_and(|spec| spec.point() == step.source())
         }) {
-            let immediate = problem.source_contribution(source.source(), output, step);
+            let immediate =
+                problem.source_contribution(source.source(), output, call_context, step);
             let mut contribution = plan.universe().empty_set();
             let mut reached_classes = plan.universe().empty_set();
             for (reached, required_here) in &demanded {
@@ -685,7 +890,8 @@ fn collect_step_origins(
                 *origin_truncated = true;
             }
         }
-        let preimages = problem.witness_step_preimages(input, output, step, &demanded);
+        let preimages =
+            problem.witness_step_preimages(input, output, call_context, step, &demanded);
         for ((_, classes), preimage) in demanded.iter_mut().zip(preimages) {
             *classes = preimage;
         }
@@ -702,6 +908,12 @@ fn reconstruct_origins(
     witness_limits: WitnessReconstructionLimits,
     budget: &mut CollectionBudget,
 ) -> Result<TaintOriginStatus, TaintFindingError> {
+    let sink = result
+        .fact_result()
+        .fact(point_value.fact())
+        .and_then(|fact| fact.sink())
+        .and_then(|sink| plan.value_flow().sink(sink))
+        .ok_or(TaintFindingError::InvalidResult)?;
     let reached = result
         .fact_result()
         .reached()
@@ -804,6 +1016,7 @@ fn reconstruct_origins(
                         &problem,
                         classes,
                         limit,
+                        reached.entry().call_context(),
                         witness.steps(),
                         &witness,
                         &mut origins,
@@ -944,6 +1157,7 @@ fn reconstruct_origins(
                         &problem,
                         classes,
                         limit,
+                        incoming.caller().call_context(),
                         &composed.steps()[..call_steps.min(composed.steps().len())],
                         &composed,
                         &mut origins,
@@ -962,20 +1176,78 @@ fn reconstruct_origins(
         }
     }
     evidence.sort_by(|left, right| left.0.cmp(&right.0));
+    let evidence = evidence
+        .into_iter()
+        .map(|(origin, classes, reached_classes, witnesses)| {
+            let mut closures = Vec::new();
+            let source = plan
+                .sources()
+                .iter()
+                .find(|source| source.origin() == &origin)
+                .and_then(|source| plan.value_flow().source(source.source()))
+                .expect("reconstructed origin names a live source");
+            let mut certain_path = !witnesses.is_empty();
+            for witness in &witnesses {
+                for closure in plan
+                    .value_flow()
+                    .witness_arm_closures(witness, source.point())
+                {
+                    if !closures.contains(&closure) {
+                        closures.push(closure);
+                    }
+                }
+                if let Some(certain) = plan.value_flow().certain_witness_closures(
+                    result.fact_result(),
+                    witness,
+                    source,
+                    sink,
+                ) {
+                    for closure in certain {
+                        if !closures.contains(&closure) {
+                            closures.push(closure);
+                        }
+                    }
+                } else {
+                    certain_path = false;
+                }
+            }
+            let closure_bytes = size_of_val(closures.as_slice()).saturating_add(
+                closures
+                    .iter()
+                    .map(AuthoredArmClosure::retained_heap_bytes)
+                    .fold(0usize, usize::saturating_add),
+            );
+            if closure_bytes
+                > budget
+                    .limits
+                    .max_retained_witness_bytes
+                    .saturating_sub(budget.retained_witness_bytes)
+            {
+                closures.clear();
+                certain_path = false;
+                witness_truncated = true;
+                witness_truncation_cause = witness_truncation_cause
+                    .or(Some(TaintWitnessTruncationCause::CollectionBudget));
+                budget.truncated = true;
+            } else {
+                budget.retained_witness_bytes =
+                    budget.retained_witness_bytes.saturating_add(closure_bytes);
+            }
+            TaintOriginFindingEvidence {
+                origin,
+                classes,
+                reached_classes,
+                witnesses: witnesses.into_boxed_slice(),
+                certain_path,
+                authored_arm_closures: closures.into_boxed_slice(),
+                frontier_source: None,
+            }
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
     Ok(TaintOriginStatus {
         origins: origins.into_iter().collect::<Vec<_>>().into_boxed_slice(),
-        evidence: evidence
-            .into_iter()
-            .map(
-                |(origin, classes, reached_classes, witnesses)| TaintOriginFindingEvidence {
-                    origin,
-                    classes,
-                    reached_classes,
-                    witnesses: witnesses.into_boxed_slice(),
-                },
-            )
-            .collect::<Vec<_>>()
-            .into_boxed_slice(),
+        evidence,
         origin_truncated,
         witness_truncated,
         witness_truncation_cause,
@@ -986,16 +1258,14 @@ fn reconstruct_origins(
 fn point_locator(
     point: &crate::analyzer::semantic::ProgramPointHandle,
 ) -> Result<SemanticLocator, TaintFindingError> {
-    let row = point
+    let _row = point
         .procedure()
         .semantics()
         .point(point.id())
         .ok_or(TaintFindingError::InvalidResult)?;
     point
-        .procedure()
-        .semantics()
-        .source_mapping(row.source)
-        .map(|mapping| mapping.locator.clone())
+        .locator()
+        .cloned()
         .ok_or(TaintFindingError::InvalidResult)
 }
 

@@ -9,15 +9,14 @@ For Antigravity's underlying host conventions, see the official [MCP](https://an
 
 ## Configure MCP
 
-Install the release verified with this setup and record its absolute path:
+Install Bifrost and record the absolute path of the binary. See
+[Install](/install/) for every method. With Cargo:
 
 ```bash
-cargo install brokk-bifrost --version 0.8.9 --locked --force
+cargo install brokk-bifrost --locked --force
 command -v bifrost
 bifrost --version
 ```
-
-The version check should print `bifrost 0.8.9`.
 
 ### One fixed workspace
 

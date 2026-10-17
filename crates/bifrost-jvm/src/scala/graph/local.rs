@@ -61,8 +61,5 @@ pub fn precise_scala_binding(
     bindings: &LocalInferenceEngine<ScalaLocalBinding>,
     name: &str,
 ) -> Option<ScalaLocalBinding> {
-    let precise = bindings.resolve_symbol_ref(name)?.as_precise()?;
-    (precise.len() == 1)
-        .then(|| precise.iter().next().cloned())
-        .flatten()
+    brokk_bifrost_core::analyzer::usages::inverted_edges::unique_precise(bindings, name)
 }

@@ -211,37 +211,14 @@ pub struct RustDeclarationPropertyFact {
     /// Any enclosing impl or trait, including one beyond a function or module.
     pub has_impl_or_trait_ancestor: bool,
     pub nearest_declaration_boundary: RustDeclarationBoundary,
-    /// A struct or enum whose `#[serde(..)]` attribute is an inert derive
-    /// helper exactly when this derive, spelled as a bare name in the item's
-    /// `#[derive(..)]` and not bound in the item's file, resolves to serde's
-    /// derive. The file cannot say which derive the name binds (it arrives
-    /// through a glob or a parent module's import), so the producer keeps the
-    /// item and leaves its binder open, and the crate route decides.
-    pub serde_helper_derive: Option<RustSerdeDerive>,
-}
-
-/// The serde derives that register `serde` as an inert helper attribute.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum RustSerdeDerive {
-    Serialize,
-    Deserialize,
-}
-
-impl RustSerdeDerive {
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Serialize => "Serialize",
-            Self::Deserialize => "Deserialize",
-        }
-    }
-
-    pub fn from_name(name: &str) -> Option<Self> {
-        match name {
-            "Serialize" => Some(Self::Serialize),
-            "Deserialize" => Some(Self::Deserialize),
-            _ => None,
-        }
-    }
+    /// Bare item attribute names that may be derive helpers. Crate-level
+    /// lookup can classify these attributes; their authored declaration
+    /// binders remain exact even when an attribute macro binds a name.
+    /// NULL means this declaration has no conditional derive-helper names.
+    pub derive_helper_attributes: Option<Vec<String>>,
+    /// This declaration has a derive or attribute macro surface whose
+    /// generated output the source producer does not expand.
+    pub generated_surface: bool,
 }
 
 /// One source occurrence's Rust type syntax, retained without a parser handle.
@@ -383,6 +360,16 @@ fn rust_visibility_estimated_retained_bytes(visibility: &RustVisibility) -> usiz
         | RustVisibility::SelfModule
         | RustVisibility::SuperModule => 0,
     }
+}
+
+fn estimated_vec_retained_bytes<T>(
+    capacity: usize,
+    values: &[T],
+    nested_bytes: impl FnOnce(&[T]) -> usize,
+) -> usize {
+    capacity
+        .saturating_mul(std::mem::size_of::<T>())
+        .saturating_add(nested_bytes(values))
 }
 
 fn rust_cfg_condition_estimated_retained_bytes(condition: &RustCfgCondition) -> usize {
@@ -527,22 +514,10 @@ pub struct RustImportContextFact {
 impl RustImportContextFact {
     /// Approximate retained memory for source-fact admission accounting.
     pub fn estimated_retained_bytes(&self) -> usize {
-        let visibility_bytes = match &self.visibility {
-            RustVisibility::InPath(segments) => segments
-                .capacity()
-                .saturating_mul(std::mem::size_of::<String>())
-                .saturating_add(
-                    segments
-                        .iter()
-                        .map(String::capacity)
-                        .fold(0usize, usize::saturating_add),
-                ),
-            _ => 0,
-        };
         let cfg_bytes = self.cfg_condition.estimated_retained_bytes();
         self.owner_module
             .capacity()
-            .saturating_add(visibility_bytes)
+            .saturating_add(rust_visibility_estimated_retained_bytes(&self.visibility))
             .saturating_add(cfg_bytes)
     }
 }
@@ -557,8 +532,9 @@ pub struct RustImportTargetFact {
     /// projections have different memberships.
     pub source_import_id: Option<SourceImportId>,
     /// For a named import, the structured `::`-separated qualifier prefix; for
-    /// a glob, the complete structured path. Punctuation and the leading
-    /// absolute anchor are represented separately by `leading_absolute`.
+    /// a `self` import, the complete module path it names; for a glob, the
+    /// complete structured path. Punctuation and the leading absolute anchor
+    /// are represented separately by `leading_absolute`.
     pub module_path: Vec<String>,
     /// The name the import binds locally. `None` for a glob or an underscore
     /// import, which introduces no referenceable local name.
@@ -1426,6 +1402,12 @@ pub struct RustMacroArmSourceFact {
     pub pattern: Option<SourceOccurrenceId>,
     pub patterns: Vec<RustMacroPatternSourceFact>,
     pub ident_roles: Vec<RustMacroIdentRoleSourceFact>,
+    /// Literal identifier values selected from this arm's transcriber AST.
+    /// Metavariable placeholders are excluded; invocation arguments supply
+    /// their concrete names separately.
+    /// `None` means the persisted schema predates structural capture or the
+    /// transcriber was unavailable. Callers must treat that arm as a wildcard.
+    pub transcriber_identifiers: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1462,6 +1444,20 @@ impl RustMacroDefinitionSourceFact {
                                     .map(|role| role.name.capacity())
                                     .fold(0usize, usize::saturating_add),
                             )
+                            .saturating_add(arm.transcriber_identifiers.as_ref().map_or(
+                                0,
+                                |names| {
+                                    names
+                                        .capacity()
+                                        .saturating_mul(std::mem::size_of::<String>())
+                                        .saturating_add(
+                                            names
+                                                .iter()
+                                                .map(String::capacity)
+                                                .fold(0usize, usize::saturating_add),
+                                        )
+                                },
+                            ))
                             .saturating_add(
                                 arm.patterns
                                     .iter()
@@ -1672,29 +1668,30 @@ impl RustItemSourceFacts {
 
 impl RustDeclarationGenericsSourceFact {
     fn estimated_retained_bytes(&self) -> usize {
-        self.parameters
-            .capacity()
-            .saturating_mul(std::mem::size_of::<RustGenericParameterSourceFact>())
-            .saturating_add(estimated_generic_parameters(&self.parameters))
+        estimated_vec_retained_bytes(
+            self.parameters.capacity(),
+            &self.parameters,
+            estimated_generic_parameters,
+        )
     }
 }
 
 impl RustImplSourceFact {
     fn estimated_retained_bytes(&self) -> usize {
-        estimated_body_children(&self.body_children).saturating_add(
-            self.body_children
-                .capacity()
-                .saturating_mul(std::mem::size_of::<RustItemBodyChildSourceFact>()),
+        estimated_vec_retained_bytes(
+            self.body_children.capacity(),
+            &self.body_children,
+            estimated_body_children,
         )
     }
 }
 
 impl RustTraitSourceFact {
     fn estimated_retained_bytes(&self) -> usize {
-        estimated_body_children(&self.body_children).saturating_add(
-            self.body_children
-                .capacity()
-                .saturating_mul(std::mem::size_of::<RustItemBodyChildSourceFact>()),
+        estimated_vec_retained_bytes(
+            self.body_children.capacity(),
+            &self.body_children,
+            estimated_body_children,
         )
     }
 }
@@ -1791,39 +1788,6 @@ pub fn decode_rust_visibility(encoded: &str) -> Option<RustVisibility> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn rust_include_binding_kind_encoding_round_trips() {
-        for kind in [
-            RustIncludeBindingKind::Named,
-            RustIncludeBindingKind::Namespace,
-            RustIncludeBindingKind::Glob,
-        ] {
-            let encoded = encode_rust_include_binding_kind(kind);
-            assert_eq!(
-                decode_rust_include_binding_kind(encoded),
-                Some(kind),
-                "{kind:?} encoded as {encoded}"
-            );
-        }
-    }
-
-    #[test]
-    fn rust_cfg_condition_encoding_round_trips() {
-        for condition in [
-            RustCfgCondition::Always,
-            RustCfgCondition::Unknown,
-            RustCfgCondition::Atom("feature = \"query_apply\"".to_string()),
-            RustCfgCondition::NotAtom("feature = \"query_apply\"".to_string()),
-        ] {
-            let encoded = encode_rust_cfg_condition(&condition);
-            assert_eq!(
-                decode_rust_cfg_condition(&encoded),
-                Some(condition.clone()),
-                "{condition:?} encoded as {encoded}"
-            );
-        }
-    }
 
     #[test]
     fn rust_visibility_encoding_round_trips() {

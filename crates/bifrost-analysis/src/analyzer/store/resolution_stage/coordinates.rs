@@ -110,6 +110,9 @@ impl PreparedStageCoordinates {
                 semantic_cells(row.reference)
                     .0
                     .expect("package reference is local"),
+                semantic_cells(row.choice.expect("package choice is lowered"))
+                    .0
+                    .expect("package choice is local"),
                 row.source_site.get(),
                 codec::encode_node(row.root_scope),
                 row.namespace.label(),
@@ -226,8 +229,9 @@ SELECT
  AND NOT EXISTS(SELECT 1 FROM json_each(?6) expected
  LEFT JOIN temp.selected_resolution_stage_package_references actual
  ON actual.producer_id=?1 AND actual.token_key=expected.value->>0 AND actual.reference_key=expected.value->>2
- WHERE actual.domain_shared IS NOT expected.value->>1 OR actual.source_site IS NOT expected.value->>3
- OR actual.root_scope_key IS NOT expected.value->>4 OR actual.namespace IS NOT expected.value->>5 OR actual.lookup_shared IS NOT expected.value->>6)
+ WHERE actual.domain_shared IS NOT expected.value->>1 OR actual.choice_key IS NOT expected.value->>3
+ OR actual.source_site IS NOT expected.value->>4 OR actual.root_scope_key IS NOT expected.value->>5
+ OR actual.namespace IS NOT expected.value->>6 OR actual.lookup_shared IS NOT expected.value->>7)
  AND (SELECT count(*) FROM temp.selected_resolution_stage_package_members WHERE producer_id=?1)=json_array_length(?7)
  AND NOT EXISTS(SELECT 1 FROM json_each(?7) expected
  LEFT JOIN temp.selected_resolution_stage_package_members actual
@@ -255,18 +259,11 @@ SELECT
                 "INSERT INTO temp.selected_resolution_stage_go_package_imports(host_ordinal,producer_id,definition_key,source_site,file_scope_key,spelling_choice_key,start_byte,end_byte,kind) SELECT ?1,?2,value->>0,value->>1,value->>2,value->>3,value->>4,value->>5,value->>6 FROM json_each(?3)"
             )?.execute(params![host.get(), producer, self.go_package_imports])?;
         }
-        for (table, target, rows) in [
-            (
-                "selected_resolution_stage_package_references",
-                "reference_key",
-                &self.package_references,
-            ),
-            (
-                "selected_resolution_stage_package_members",
-                "definition_key",
-                &self.package_members,
-            ),
-        ] {
+        for (table, target, rows) in [(
+            "selected_resolution_stage_package_members",
+            "definition_key",
+            &self.package_members,
+        )] {
             // Most generated fragments (including Rust contexts) have no
             // package authority. Avoid preparing two no-op INSERT statements
             // for every such projection; replay checks still verify absence.
@@ -279,6 +276,13 @@ SELECT
             connection
                 .prepare_cached(&sql)?
                 .execute(params![host.get(), producer, rows])?;
+        }
+        if self.package_references != "[]" {
+            connection
+                .prepare_cached(
+                    "INSERT INTO temp.selected_resolution_stage_package_references(host_ordinal,producer_id,token_key,domain_shared,reference_key,choice_key,source_site,root_scope_key,namespace,lookup_shared) SELECT ?1,?2,value->>0,value->>1,value->>2,value->>3,value->>4,value->>5,value->>6,value->>7 FROM json_each(?3)",
+                )?
+                .execute(params![host.get(), producer, self.package_references])?;
         }
         connection
             .prepare_cached(
@@ -342,8 +346,17 @@ mod tests {
             nodes: json!([[runtime + 1, digest, 6]]).to_string(),
             paths: json!([[runtime + 2, digest]]).to_string(),
             variables: json!([[runtime + 3, digest]]).to_string(),
-            package_references: json!([[runtime + 10, 41, runtime, 7, runtime + 1, "type", 42]])
-                .to_string(),
+            package_references: json!([[
+                runtime + 10,
+                41,
+                runtime,
+                runtime + 5,
+                7,
+                runtime + 1,
+                "type",
+                42
+            ]])
+            .to_string(),
             package_members: json!([[runtime + 11, 41, runtime + 12, 8, runtime + 1, "type", 42]])
                 .to_string(),
             go_package_imports: json!([[

@@ -123,9 +123,9 @@ impl RubyGemSurface for UnacquiredRubyGems {
 }
 
 fn unknown_dependency_reason() -> SemanticDiagnosticIncompleteReason {
-    SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery {
-        boundary: BoundaryStatus::ExternalUnknown,
-    }
+    SemanticDiagnosticIncompleteReason::missing_dependency_discovery(
+        BoundaryStatus::ExternalUnknown,
+    )
 }
 
 /// Collect Ruby semantic diagnostics and the proof or suppression behind each.
@@ -325,7 +325,11 @@ impl RubyDiagnosticCollector<'_> {
                 }
             }
             "string" | "comment" => {}
-            _ => push_named_children(stack, node),
+            _ => brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed_as(
+                node,
+                stack,
+                ScanFrame::Node,
+            ),
         }
     }
 
@@ -503,14 +507,6 @@ impl RubyDiagnosticCollector<'_> {
             ));
         }
         None
-    }
-}
-
-fn push_named_children<'tree>(stack: &mut Vec<ScanFrame<'tree>>, node: Node<'tree>) {
-    let mut cursor = node.walk();
-    let children: Vec<_> = node.named_children(&mut cursor).collect();
-    for child in children.into_iter().rev() {
-        stack.push(ScanFrame::Node(child));
     }
 }
 

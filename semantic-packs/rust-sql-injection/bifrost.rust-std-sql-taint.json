@@ -1,0 +1,649 @@
+{
+  "schema_version": 2,
+  "pack_id": "bifrost.rust-std-sql-taint",
+  "version": "0.1.0",
+  "producer": {
+    "name": "bifrost-reviewed-rust-sql-models",
+    "version": "0.1.0"
+  },
+  "language": "rust",
+  "ecosystem": "cargo",
+  "compatibility": {
+    "bifrost": ">=0.12.0, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "Rust standard library inputs and value carriers reviewed for SQL-injection taint: std::env::var, std::env::args, std::io::stdin, Stdin::read_line, Args::nth, and the Result and Option unwrap methods. The str, String, Result, and Option operations the engine's in-code std fact table covers (to_owned, len, Ok, Err, Some, String::new) are not repeated here.",
+    "revision": "rust-std-1.100"
+  },
+  "license": "Apache-2.0",
+  "completeness": "complete",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "declarations.rust-sql.std",
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {
+            "id": "type.rust-sql.std",
+            "name": "std",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/lib.rs",
+              "symbol": "std"
+            }
+          },
+          {
+            "id": "type.rust-sql.std-result",
+            "name": "std.result",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/core/src/result.rs",
+              "symbol": "std.result"
+            }
+          },
+          {
+            "id": "type.rust-sql.std-result-result",
+            "name": "std.result.Result",
+            "type_kind": "enum",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/core/src/result.rs",
+              "symbol": "std.result.Result"
+            }
+          },
+          {
+            "id": "type.rust-sql.std-option",
+            "name": "std.option",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/core/src/option.rs",
+              "symbol": "std.option"
+            }
+          },
+          {
+            "id": "type.rust-sql.std-option-option",
+            "name": "std.option.Option",
+            "type_kind": "enum",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/core/src/option.rs",
+              "symbol": "std.option.Option"
+            }
+          },
+          {
+            "id": "type.rust-sql.std-env",
+            "name": "std.env",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/env.rs",
+              "symbol": "std.env"
+            }
+          },
+          {
+            "id": "type.rust-sql.std-env-args",
+            "name": "std.env.Args",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/env.rs",
+              "symbol": "std.env.Args"
+            }
+          },
+          {
+            "id": "type.rust-sql.std-io",
+            "name": "std.io",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/io/mod.rs",
+              "symbol": "std.io"
+            }
+          },
+          {
+            "id": "type.rust-sql.std-io-stdin",
+            "name": "std.io.Stdin",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/io/stdio.rs",
+              "symbol": "std.io.Stdin"
+            }
+          }
+        ],
+        "members": [
+          {
+            "id": "member.cq01.rust-std-env-args-os",
+            "owner": "type.rust-sql.std-env",
+            "name": "args_os",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "std.env.ArgsOs"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/env.rs",
+              "symbol": "std.env.args_os"
+            }
+          },
+          {
+            "id": "member.cq01.rust-std-env-current-dir",
+            "owner": "type.rust-sql.std-env",
+            "name": "current_dir",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/env.rs",
+              "symbol": "std.env.current_dir"
+            }
+          },
+          {
+            "id": "member.cq01.rust-std-env-current-exe",
+            "owner": "type.rust-sql.std-env",
+            "name": "current_exe",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/env.rs",
+              "symbol": "std.env.current_exe"
+            }
+          },
+          {
+            "id": "member.cq01.rust-std-env-home-dir",
+            "owner": "type.rust-sql.std-env",
+            "name": "home_dir",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "std.option.Option"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/env.rs",
+              "symbol": "std.env.home_dir"
+            }
+          },
+          {
+            "id": "member.cq01.rust-std-env-var-os",
+            "owner": "type.rust-sql.std-env",
+            "name": "var_os",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "key",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.option.Option"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/env.rs",
+              "symbol": "std.env.var_os"
+            }
+          },
+          {
+            "id": "member.cq01.rust-std-env-vars",
+            "owner": "type.rust-sql.std-env",
+            "name": "vars",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "std.env.Vars"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/env.rs",
+              "symbol": "std.env.vars"
+            }
+          },
+          {
+            "id": "member.cq01.rust-std-env-vars-os",
+            "owner": "type.rust-sql.std-env",
+            "name": "vars_os",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "std.env.VarsOs"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/env.rs",
+              "symbol": "std.env.vars_os"
+            }
+          },
+          {
+            "id": "member.cq01.rust-std-io-stdin-lock",
+            "owner": "type.rust-sql.std-io-stdin",
+            "name": "lock",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "std.io.StdinLock"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/io/stdio.rs",
+              "symbol": "std.io.Stdin.lock"
+            }
+          },
+          {
+            "id": "member.rust-sql.std-env-args.nth",
+            "owner": "type.rust-sql.std-env-args",
+            "name": "nth",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "n",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.option.Option"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/env.rs",
+              "symbol": "std.env.Args.nth"
+            }
+          },
+          {
+            "id": "member.rust-sql.std-env.args",
+            "owner": "type.rust-sql.std-env",
+            "name": "args",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "std.env.Args"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/env.rs",
+              "symbol": "std.env.args"
+            }
+          },
+          {
+            "id": "member.rust-sql.std-env.var",
+            "owner": "type.rust-sql.std-env",
+            "name": "var",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "key",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/env.rs",
+              "symbol": "std.env.var"
+            }
+          },
+          {
+            "id": "member.rust-sql.std-io-stdin.read-line",
+            "owner": "type.rust-sql.std-io-stdin",
+            "name": "read_line",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "buf",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.io.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/io/stdio.rs",
+              "symbol": "std.io.Stdin.read_line"
+            }
+          },
+          {
+            "id": "member.rust-sql.std-io.stdin",
+            "owner": "type.rust-sql.std-io",
+            "name": "stdin",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "std.io.Stdin"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/io/stdio.rs",
+              "symbol": "std.io.stdin"
+            }
+          },
+          {
+            "id": "member.rust-sql.std-option-option.unwrap",
+            "owner": "type.rust-sql.std-option-option",
+            "name": "unwrap",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": []
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/core/src/option.rs",
+              "symbol": "std.option.Option.unwrap"
+            }
+          },
+          {
+            "id": "member.rust-sql.std-result-result.unwrap",
+            "owner": "type.rust-sql.std-result-result",
+            "name": "unwrap",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": []
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/core/src/result.rs",
+              "symbol": "std.result.Result.unwrap"
+            }
+          }
+        ],
+        "relations": []
+      }
+    },
+    {
+      "id": "summaries.rust-sql.std",
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "summary.rust-sql.std-result-result.unwrap",
+            "target": {
+              "path": "library/core/src/result.rs",
+              "symbol": "std.result.Result.unwrap",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-sql.std-option-option.unwrap",
+            "target": {
+              "path": "library/core/src/option.rs",
+              "symbol": "std.option.Option.unwrap",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-sql.std-env.var",
+            "target": {
+              "path": "library/std/src/env.rs",
+              "symbol": "std.env.var",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.rust-sql.std-env.var.result",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.rust-sql.std-env.args",
+            "target": {
+              "path": "library/std/src/env.rs",
+              "symbol": "std.env.args",
+              "has_receiver": false,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.rust-sql.std-env.args.result",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.rust-sql.std-env-args.nth",
+            "target": {
+              "path": "library/std/src/env.rs",
+              "symbol": "std.env.Args.nth",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-sql.std-io.stdin",
+            "target": {
+              "path": "library/std/src/io/stdio.rs",
+              "symbol": "std.io.stdin",
+              "has_receiver": false,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.rust-sql.std-io.stdin.result",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.rust-sql.std-io-stdin.read-line",
+            "target": {
+              "path": "library/std/src/io/stdio.rs",
+              "symbol": "std.io.Stdin.read_line",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.rust-sql.std-io-stdin.read-line.result",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

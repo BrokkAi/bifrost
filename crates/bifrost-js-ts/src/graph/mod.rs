@@ -18,6 +18,10 @@ pub mod receiver_analysis;
 pub mod resolver;
 pub mod source;
 
+fn is_name_shadowed_in_scopes(scopes: &[HashSet<String>], name: &str) -> bool {
+    scopes.iter().rev().any(|scope| scope.contains(name))
+}
+
 use crate::graph::extractor::scan_files_for_seeds;
 use crate::graph::resolver::{JsTsUsageIndex, is_static_member, member_name};
 use crate::graph::source::declaration_ids_for_unit;
@@ -208,7 +212,15 @@ fn target_seeds(
 }
 
 fn target_seed_identifier(analyzer: &dyn CodeUnitIndex, target: &CodeUnit) -> String {
-    if let Some(parent) = analyzer.parent_of(target)
+    let parent = analyzer.parent_of(target);
+    target_seed_identifier_from_owner(target, parent.as_ref())
+}
+
+pub(super) fn target_seed_identifier_from_owner(
+    target: &CodeUnit,
+    owner: Option<&CodeUnit>,
+) -> String {
+    if let Some(parent) = owner
         && !parent.is_module()
         && !parent.is_file_scope()
     {

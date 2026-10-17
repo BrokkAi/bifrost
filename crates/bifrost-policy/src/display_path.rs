@@ -4,9 +4,10 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use brokk_bifrost_analysis::analyzer::WorkspaceAnalyzer;
+use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
 use brokk_bifrost_analysis::analyzer::semantic::{IcfgEdgeKind, SemanticLocator};
 use brokk_bifrost_flow::dataflow::{SummaryWitness, SummaryWitnessStepKind};
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 
 use crate::finding::PolicySourceLocation;
 use crate::finding_identity::WitnessId;
@@ -14,6 +15,16 @@ use crate::finding_identity::WitnessId;
 const MAX_DISPLAY_PATH_ROWS: usize = 12;
 const MAX_DISPLAY_LABEL_BYTES: usize = 160;
 const TRUNCATED_LABEL_SUFFIX: &str = "...";
+
+pub(crate) fn serialize_workspace_relative_path<S>(
+    path: &WorkspaceRelativePath,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(path.as_str())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]

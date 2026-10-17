@@ -77,12 +77,6 @@ fn kotlin_is_labeled_jump(node: Node<'_>) -> bool {
 
 /// The receiver spelled before the final `.` of a Kotlin call reference.
 pub fn kotlin_extract_call_receiver(reference: &str) -> Option<String> {
-    let trimmed = reference.trim();
-    let before_args = trimmed
-        .split_once('(')
-        .map(|(head, _)| head)
-        .unwrap_or(trimmed);
-    before_args
-        .rsplit_once('.')
+    brokk_bifrost_core::analyzer::common::extract_call_reference_parts(reference, &["."])
         .map(|(receiver, _)| receiver.to_string())
 }

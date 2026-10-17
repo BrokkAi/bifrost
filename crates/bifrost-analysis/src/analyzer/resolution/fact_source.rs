@@ -10,15 +10,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::hash::Hash;
 
 use brokk_bifrost_core::analyzer::resolution_facts::{
-    DeclarationTypeRole, ResolutionConstructionRequirementKind, ResolutionMemberAccess,
-    ResolutionMemberKind, ResolutionMemberQualifierCompatibility, ResolutionSiteId,
-    ResolutionSupertypeKind, ResolutionTypeComponentKind,
+    DeclarationTypeRole, IntrinsicTypeKind, ResolutionConstructionRequirementKind,
+    ResolutionMemberAccess, ResolutionMemberKind, ResolutionMemberQualifierCompatibility,
+    ResolutionNamespace, ResolutionSiteId, ResolutionSupertypeKind, ResolutionTypeComponentKind,
 };
 use brokk_bifrost_core::analyzer::rust_facts::RustVisibility;
 use brokk_bifrost_core::analyzer::source_facts::{SourceDeclarationId, SourceOccurrenceId};
 use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
 
 use crate::CancellationToken;
+use crate::analyzer::Language;
 use crate::analyzer::store::{Result as StoreResult, StoreError};
 use crate::hash::HashSet;
 
@@ -32,10 +33,12 @@ use super::seam_profile::{self, SeamMethod};
 use super::typed_fact_lowering::{
     LoweredBindingProjection, LoweredCallApplicabilityObligation, LoweredCallableSignatureProperty,
     LoweredConstructionRequirementProperty, LoweredDeclarationTypeProperty,
-    LoweredDeclarationVisibilityProperty, LoweredDefinitionPropertyGap, LoweredIntrinsicSeed,
-    LoweredMemberOwnerProperty, LoweredMemberScopeProperty, LoweredQualifiedSeededRoute,
-    LoweredSupertypeProperty, LoweredTypeComponent, LoweredTypeTransfer, LoweredTypedFrontier,
-    LoweredUnderlyingType,
+    LoweredDeclarationVisibilityProperty, LoweredDeclaredTypeArgument,
+    LoweredDefinitionPropertyGap, LoweredGenericFormal, LoweredGenericFormalDefault,
+    LoweredGenericTypeAliasParameter, LoweredIntrinsicSeed, LoweredMemberOwnerProperty,
+    LoweredMemberScopeProperty, LoweredQualifiedSeededRoute, LoweredSupertypeProperty,
+    LoweredTypeArgument, LoweredTypeComponent, LoweredTypeProduction, LoweredTypeTransfer,
+    LoweredTypedFrontier, LoweredUnderlyingType,
 };
 
 /// Hard upper bound on identities in one typed-fact source request.
@@ -72,11 +75,31 @@ pub enum DeclarationAccessDecision {
     InactiveActivation,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DeclarationAccessRow {
     pub request: DeclarationAccessRequest,
     pub decision: DeclarationAccessDecision,
     pub activation_reason: Option<SemanticId>,
+    /// The policy supplies visibility for this declaration even when its
+    /// producer has no visibility gap to refine.
+    pub visibility_applies: bool,
+    /// Some JVM access rules require an enclosing type to inherit the
+    /// declaration's owner.
+    pub subclass_access: Option<SubclassAccessContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SubclassAccessContext {
+    pub enclosing_templates: Vec<SemanticId>,
+    pub declaration_template: SemanticId,
+}
+
+/// A selected lowering-gap reason and the Rust declaration whose declaration
+/// site produced it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReasonOwnerRow {
+    pub reason: SemanticId,
+    pub definition: SemanticId,
 }
 
 /// Selected lexical ownership used by Java declaration access. Values live for
@@ -88,6 +111,26 @@ pub struct JavaAccessEndpoint {
     pub outermost_type: Option<SemanticId>,
 }
 
+/// Selected lexical templates and package for visibility decisions over JVM
+/// declarations. The ordered owners are the exact enclosing type scopes from
+/// the declaration/reference up to its outermost type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JvmAccessEndpoint {
+    pub semantic: SemanticId,
+    pub language: Language,
+    pub package: Option<String>,
+    pub enclosing_templates: Vec<SemanticId>,
+    pub outermost_type: Option<SemanticId>,
+}
+
+/// Candidate admission evidence, never a binding or applicability answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferredMemberOwnerProof {
+    Matches,
+    DoesNotMatch,
+    Unknown,
+}
+
 /// Exact selected Go member metadata, retained only for the current query.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GoMemberDeclaration {
@@ -97,9 +140,16 @@ pub struct GoMemberDeclaration {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GoMemberDeclarationKind {
-    Interface,
+    Interface { methods: Vec<GoInterfaceMethod> },
     Struct { fields: Vec<GoStructField> },
     Method { pointer_receiver: Option<bool> },
+}
+
+/// One declared Go interface method, projected from selected source facts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoInterfaceMethod {
+    pub callable_lookup: SemanticId,
+    pub definition: Option<SemanticId>,
 }
 
 /// All source fields participate in selector shadowing, including ordinary
@@ -113,11 +163,49 @@ pub struct GoStructField {
     pub value_type: Option<SemanticId>,
 }
 
+/// The selected descriptor shared by every intrinsic seed that names one
+/// semantic type identity. This projection avoids returning each seed's
+/// unrelated source value when the caller only needs the type descriptor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoweredIntrinsicTypeDescriptor {
+    identity: SemanticId,
+    kind: IntrinsicTypeKind,
+    spelling: Box<str>,
+}
+
+impl LoweredIntrinsicTypeDescriptor {
+    pub fn new(
+        identity: SemanticId,
+        kind: IntrinsicTypeKind,
+        spelling: impl Into<Box<str>>,
+    ) -> Self {
+        let spelling = spelling.into();
+        Self {
+            identity,
+            kind,
+            spelling,
+        }
+    }
+
+    pub const fn identity(&self) -> SemanticId {
+        self.identity
+    }
+
+    pub const fn kind(&self) -> IntrinsicTypeKind {
+        self.kind
+    }
+
+    pub fn spelling(&self) -> &str {
+        &self.spelling
+    }
+}
+
 /// Selected Java declaration properties needed before inheriting a method.
 /// Missing properties remain unknown; they are never inferred from a signature label.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JavaInheritanceDeclaration {
     pub definition: SemanticId,
+    pub name: String,
     pub package: Option<String>,
     pub kind: JavaInheritanceDeclarationKind,
 }
@@ -126,6 +214,9 @@ pub struct JavaInheritanceDeclaration {
 pub enum JavaInheritanceDeclarationKind {
     Type {
         is_interface: bool,
+        /// A Scala `object`: the declaration's last identity segment is a
+        /// companion segment.
+        is_singleton: bool,
     },
     Method {
         is_abstract: Option<bool>,
@@ -147,6 +238,22 @@ pub enum RustImplementedTraits {
     /// answer, so an empty answer here would be a guess.
     Unplaced,
     Cancelled,
+}
+
+/// Exact positioned label fact read from the selected source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NamedArgumentLabelRead {
+    Found(NamedArgumentLabel),
+    Missing,
+    Cancelled,
+}
+
+/// A named argument label and the call obligation that owns its reference site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedArgumentLabel {
+    pub call: SemanticId,
+    pub callee_reference: Option<SemanticId>,
+    pub spelling: String,
 }
 
 /// Immutable selected-context access policy, not a name resolver. Implementors
@@ -174,6 +281,22 @@ pub(crate) trait SelectedDeclarationAccessSource: Send + Sync {
         cancellation: &CancellationToken,
         visitor: &mut FactPageVisitor<DeclarationAccessRow>,
     ) -> StoreResult<TypedFactReadOutcome>;
+
+    /// Visit the declaration authority at the source site of each selected
+    /// reason. Languages without declaration activation leave ownership empty.
+    fn visit_reason_owners(
+        &self,
+        _facts: &dyn SelectedTypedFactSource,
+        _reasons: TypedFactRequest<SemanticId>,
+        cancellation: &CancellationToken,
+        _visitor: &mut FactPageVisitor<ReasonOwnerRow>,
+    ) -> StoreResult<TypedFactReadOutcome> {
+        Ok(if cancellation.is_cancelled() {
+            TypedFactReadOutcome::cancelled(ResolutionCompletion::Complete)
+        } else {
+            TypedFactReadOutcome::exhausted(ResolutionCompletion::Complete)
+        })
+    }
 }
 
 /// A unique, bounded set of lookup identities for one source read.
@@ -244,6 +367,14 @@ pub struct TypedFactPageVisitor<'a, T> {
 /// Storage-neutral page visitor shared by typed and Java placement sources.
 pub type FactPageVisitor<'a, T> = TypedFactPageVisitor<'a, T>;
 
+fn empty_rust_traits_or_cancelled(cancellation: &CancellationToken) -> RustImplementedTraits {
+    if cancellation.is_cancelled() {
+        RustImplementedTraits::Cancelled
+    } else {
+        RustImplementedTraits::Traits(Vec::new())
+    }
+}
+
 impl<'a, T> TypedFactPageVisitor<'a, T> {
     pub fn new(callback: &'a mut dyn FnMut(&[T]) -> StoreResult<bool>) -> Self {
         Self {
@@ -274,14 +405,9 @@ impl<'a, T> TypedFactPageVisitor<'a, T> {
         maximum_rows: usize,
         resolution_session: &'a ResolutionSession,
     ) -> Self {
-        assert!((1..=MAX_TYPED_FACT_ROWS_PER_PAGE).contains(&maximum_rows));
-        Self {
-            callback,
-            resolution_session: Some(resolution_session),
-            maximum_rows,
-            stopped: false,
-            counted: None,
-        }
+        let mut visitor = Self::with_maximum_rows(callback, maximum_rows);
+        visitor.resolution_session = Some(resolution_session);
+        visitor
     }
 
     /// Attribute the rows this visitor sees to one seam method, or to none.
@@ -326,7 +452,7 @@ impl<'a, T> TypedFactPageVisitor<'a, T> {
 
     pub(crate) fn charge_source_rows(&self, count: usize) -> bool {
         self.resolution_session
-            .is_none_or(|session| (0..count).all(|_| session.scope_step()))
+            .is_none_or(|session| session.scope_steps(count))
     }
 
     pub(crate) fn source_lookahead_limit(&self) -> usize {
@@ -416,10 +542,94 @@ impl TypedFactReadOutcome {
     }
 }
 
-/// One typed parent row together with its exact selected fragment owner.
+pub(crate) fn visit_mapped_typed_pages<T, U: Copy>(
+    rows: &[T],
+    page_rows: usize,
+    cancellation: &CancellationToken,
+    mut project: impl FnMut(&T) -> U,
+    visitor: &mut TypedFactPageVisitor<'_, U>,
+) -> StoreResult<TypedFactReadOutcome> {
+    assert!((1..=visitor.maximum_rows()).contains(&page_rows));
+    if cancellation.is_cancelled() {
+        return Ok(TypedFactReadOutcome::cancelled(
+            ResolutionCompletion::Complete,
+        ));
+    }
+    for chunk in rows.chunks(page_rows) {
+        let mut page = Vec::with_capacity(chunk.len());
+        for row in chunk {
+            if cancellation.is_cancelled() {
+                return Ok(TypedFactReadOutcome::cancelled(
+                    ResolutionCompletion::Complete,
+                ));
+            }
+            page.push(project(row));
+        }
+        let keep_going = visitor.visit_page(&page)?;
+        if cancellation.is_cancelled() {
+            return Ok(TypedFactReadOutcome::cancelled(
+                ResolutionCompletion::Complete,
+            ));
+        }
+        if !keep_going {
+            return Ok(TypedFactReadOutcome::stopped(
+                ResolutionCompletion::Complete,
+            ));
+        }
+    }
+    Ok(if cancellation.is_cancelled() {
+        TypedFactReadOutcome::cancelled(ResolutionCompletion::Complete)
+    } else {
+        TypedFactReadOutcome::exhausted(ResolutionCompletion::Complete)
+    })
+}
+
+/// Inventory coordinates of one externally enumerated type. These are
+/// provider content and declaration names, not workspace source locators.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ExternalOwnerIdentity {
+    pub provider_id: std::sync::Arc<str>,
+    pub owner_fqn: std::sync::Arc<str>,
+}
+
+/// One member row in its provider's durable owner inventory. A callable
+/// family locator is dispatch evidence, not this per-overload identity.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ExternalMemberIdentity {
+    pub owner: ExternalOwnerIdentity,
+    pub ordinal: u32,
+}
+
+/// The identity carried by a selected typed row. Its payload supplies the
+/// selected declaration semantic for a source row. External rows never carry
+/// a fabricated source fragment, locator, or producer declaration ID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectedTypedRowIdentity {
+    SelectedSource {
+        fragment: BindingFragmentId,
+    },
+    External {
+        owner: ExternalOwnerIdentity,
+    },
+    ExternalMember {
+        owner: ExternalOwnerIdentity,
+        ordinal: u32,
+    },
+}
+
+/// Compact query-local interner key. External declaration semantics are
+/// interned from their provider/owner/member coordinates, so they remain
+/// distinct without copying strings into the row-family membership indexes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SelectedTypedRowKey {
+    SelectedSource(BindingFragmentId),
+    External,
+}
+
+/// One typed parent row and its honest selected-source or external identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectedTypedRow<T> {
-    fragment: BindingFragmentId,
+    identity: SelectedTypedRowIdentity,
     row: T,
 }
 
@@ -531,6 +741,25 @@ pub(crate) struct RustReferenceContextSource {
     cfg_condition: RustCfgCondition,
 }
 
+const fn rust_reference_context_fields(
+    source_site: ResolutionSiteId,
+    source_occurrence: SourceOccurrenceId,
+    module_context: SourceOccurrenceId,
+    module_declaration: Option<SourceDeclarationId>,
+) -> (
+    ResolutionSiteId,
+    SourceOccurrenceId,
+    SourceOccurrenceId,
+    Option<SourceDeclarationId>,
+) {
+    (
+        source_site,
+        source_occurrence,
+        module_context,
+        module_declaration,
+    )
+}
+
 /// Compact transient source identity for a native Rust declaration bridge.
 /// The declaration is retained alongside the source site so a later lowered
 /// semantic cannot silently join through a name or parser-unit key.
@@ -581,6 +810,13 @@ impl RustReferenceContextSource {
         module_context: SourceOccurrenceId,
         module_declaration: Option<SourceDeclarationId>,
     ) -> Self {
+        let (source_site, source_occurrence, module_context, module_declaration) =
+            rust_reference_context_fields(
+                source_site,
+                source_occurrence,
+                module_context,
+                module_declaration,
+            );
         Self {
             source_site,
             source_occurrence,
@@ -623,6 +859,13 @@ impl LoweredRustReferenceContext {
         module_context: SourceOccurrenceId,
         module_declaration: Option<SourceDeclarationId>,
     ) -> Self {
+        let (source_site, source_occurrence, module_context, module_declaration) =
+            rust_reference_context_fields(
+                source_site,
+                source_occurrence,
+                module_context,
+                module_declaration,
+            );
         Self {
             reference,
             source_site,
@@ -664,7 +907,7 @@ impl LoweredRustReferenceContext {
 
 impl SelectedTypedRow<LoweredRustReferenceContext> {
     pub const fn natural_identity(&self) -> (BindingFragmentId, SemanticId) {
-        (self.fragment, self.row.reference())
+        selected_row_natural_identity(self.fragment(), self.row.reference())
     }
 }
 
@@ -677,31 +920,79 @@ pub type SelectedFactRow<T> = SelectedTypedRow<T>;
 
 impl<T> SelectedTypedRow<T> {
     pub const fn new(fragment: BindingFragmentId, row: T) -> Self {
-        Self { fragment, row }
+        Self {
+            identity: SelectedTypedRowIdentity::SelectedSource { fragment },
+            row,
+        }
+    }
+
+    pub fn external_owner(owner: ExternalOwnerIdentity, row: T) -> Self {
+        Self {
+            identity: SelectedTypedRowIdentity::External { owner },
+            row,
+        }
+    }
+
+    pub fn external_member(owner: ExternalOwnerIdentity, ordinal: u32, row: T) -> Self {
+        Self {
+            identity: SelectedTypedRowIdentity::ExternalMember { owner, ordinal },
+            row,
+        }
+    }
+
+    pub const fn identity(&self) -> &SelectedTypedRowIdentity {
+        &self.identity
+    }
+
+    pub const fn identity_key(&self) -> SelectedTypedRowKey {
+        match self.identity {
+            SelectedTypedRowIdentity::SelectedSource { fragment } => {
+                SelectedTypedRowKey::SelectedSource(fragment)
+            }
+            SelectedTypedRowIdentity::External { .. }
+            | SelectedTypedRowIdentity::ExternalMember { .. } => SelectedTypedRowKey::External,
+        }
     }
 
     pub const fn fragment(&self) -> BindingFragmentId {
-        self.fragment
+        match self.identity {
+            SelectedTypedRowIdentity::SelectedSource { fragment } => fragment,
+            _ => panic!("external typed rows have inventory coordinates, not source fragments"),
+        }
     }
 
     pub const fn row(&self) -> &T {
         &self.row
     }
 
+    pub fn with_row<U>(&self, row: U) -> SelectedTypedRow<U> {
+        SelectedTypedRow {
+            identity: self.identity.clone(),
+            row,
+        }
+    }
+
     pub fn into_parts(self) -> (BindingFragmentId, T) {
-        (self.fragment, self.row)
+        (self.fragment(), self.row)
     }
 }
 
 impl SelectedTypedRow<LoweredTypedFrontier> {
     pub const fn natural_identity(&self) -> (BindingFragmentId, SemanticId) {
-        (self.fragment, self.row.slot())
+        selected_row_natural_identity(self.fragment(), self.row.slot())
     }
+}
+
+const fn selected_row_natural_identity(
+    fragment: BindingFragmentId,
+    semantic: SemanticId,
+) -> (BindingFragmentId, SemanticId) {
+    (fragment, semantic)
 }
 
 impl SelectedTypedRow<LoweredTypeTransfer> {
     pub const fn natural_identity(&self) -> (BindingFragmentId, SemanticId) {
-        (self.fragment, self.row.rule().semantic())
+        (self.fragment(), self.row.rule().semantic())
     }
 
     /// Query-planning key for source-slot access.
@@ -710,7 +1001,7 @@ impl SelectedTypedRow<LoweredTypeTransfer> {
     /// deterministic duplicate-free storage cursor.
     pub const fn source_access_order(&self) -> (BindingFragmentId, SemanticId, SemanticId) {
         (
-            self.fragment,
+            self.fragment(),
             self.row.source_slot(),
             self.row.rule().semantic(),
         )
@@ -722,10 +1013,16 @@ impl SelectedTypedRow<LoweredTypeTransfer> {
     /// deterministic duplicate-free storage cursor.
     pub const fn target_access_order(&self) -> (BindingFragmentId, SemanticId, SemanticId) {
         (
-            self.fragment,
+            self.fragment(),
             self.row.rule().target_slot(),
             self.row.rule().semantic(),
         )
+    }
+}
+
+impl SelectedTypedRow<LoweredTypeProduction> {
+    pub const fn natural_identity(&self) -> (BindingFragmentId, SemanticId) {
+        (self.fragment(), self.row.output)
     }
 }
 
@@ -733,63 +1030,132 @@ impl SelectedTypedRow<LoweredTypeComponent> {
     pub const fn natural_identity(
         &self,
     ) -> (BindingFragmentId, SemanticId, ResolutionTypeComponentKind) {
-        (self.fragment, self.row.container(), self.row.kind())
+        (self.fragment(), self.row.container(), self.row.kind())
+    }
+}
+
+impl SelectedTypedRow<LoweredDeclaredTypeArgument> {
+    pub const fn natural_identity(&self) -> (BindingFragmentId, SemanticId, u32) {
+        (self.fragment(), self.row.owner(), self.row.position())
+    }
+}
+
+impl SelectedTypedRow<LoweredTypeArgument> {
+    pub const fn natural_identity(&self) -> (BindingFragmentId, SemanticId, u32, SemanticId) {
+        (
+            self.fragment(),
+            self.row.application(),
+            self.row.ordinal(),
+            self.row.argument(),
+        )
+    }
+}
+
+impl SelectedTypedRow<LoweredGenericTypeAliasParameter> {
+    pub const fn natural_identity(
+        &self,
+    ) -> (BindingFragmentId, SemanticId, u32, SemanticId, SemanticId) {
+        (
+            self.fragment(),
+            self.row.alias(),
+            self.row.ordinal(),
+            self.row.parameter(),
+            self.row.target(),
+        )
+    }
+}
+
+impl SelectedTypedRow<LoweredGenericFormal> {
+    pub const fn natural_identity(&self) -> (BindingFragmentId, SemanticId, u32, SemanticId) {
+        (
+            self.fragment(),
+            self.row.owner(),
+            self.row.ordinal(),
+            self.row.parameter(),
+        )
+    }
+}
+
+impl SelectedTypedRow<LoweredGenericFormalDefault> {
+    pub const fn natural_identity(&self) -> (BindingFragmentId, SemanticId, u32, SemanticId) {
+        (
+            self.fragment(),
+            self.row.owner(),
+            self.row.ordinal(),
+            self.row.default(),
+        )
     }
 }
 
 impl SelectedTypedRow<LoweredUnderlyingType> {
     pub const fn natural_identity(&self) -> (BindingFragmentId, SemanticId) {
-        (self.fragment, self.row.definition())
+        (self.fragment(), self.row.definition())
     }
 }
 
 impl SelectedTypedRow<LoweredIntrinsicSeed> {
     pub const fn natural_identity(&self) -> (BindingFragmentId, SemanticId) {
-        (self.fragment, self.row.frontier().slot())
+        (self.fragment(), self.row.frontier().slot())
     }
 }
 
 impl SelectedTypedRow<LoweredBindingProjection> {
     pub const fn natural_identity(&self) -> (BindingFragmentId, SemanticId) {
-        (self.fragment, self.row.reference())
+        (self.fragment(), self.row.reference())
     }
 }
 
 impl SelectedTypedRow<LoweredDeclarationTypeProperty> {
     pub const fn natural_identity(&self) -> (BindingFragmentId, SemanticId, DeclarationTypeRole) {
-        (self.fragment, self.row.definition(), self.row.role())
+        (self.fragment(), self.row.definition(), self.row.role())
     }
 }
 
 impl SelectedTypedRow<LoweredDeclarationVisibilityProperty> {
     pub const fn natural_identity(&self) -> (BindingFragmentId, SemanticId) {
-        (self.fragment, self.row.definition())
+        (self.fragment(), self.row.definition())
     }
 }
 
 impl SelectedTypedRow<LoweredMemberScopeProperty> {
-    pub const fn natural_identity(&self) -> (BindingFragmentId, SemanticId) {
-        (self.fragment, self.row.definition())
+    pub const fn natural_identity(
+        &self,
+    ) -> (SelectedTypedRowKey, SemanticId, Option<BindingNodeId>) {
+        (
+            self.identity_key(),
+            self.row.definition(),
+            self.row.source_scope_head(),
+        )
+    }
+}
+
+impl SelectedTypedRow<CompanionTypeRelation> {
+    pub(crate) const fn natural_identity(&self) -> (BindingFragmentId, SemanticId, SemanticId) {
+        (
+            self.fragment(),
+            self.row.enclosing_type(),
+            self.row.companion_type(),
+        )
     }
 }
 
 impl SelectedTypedRow<LoweredMemberOwnerProperty> {
-    pub const fn natural_identity(
+    pub fn natural_identity(
         &self,
     ) -> (
-        BindingFragmentId,
+        SelectedTypedRowKey,
         SemanticId,
         SemanticId,
-        BindingNodeId,
+        Option<BindingNodeId>,
         ResolutionMemberKind,
         ResolutionMemberAccess,
         ResolutionMemberQualifierCompatibility,
     ) {
         (
-            self.fragment,
+            self.identity_key(),
             self.row.definition(),
             self.row.owner_definition(),
-            self.row.owner_scope_head(),
+            self.row.source_owner_scope_head(),
             self.row.kind(),
             self.row.access(),
             self.row.qualifier_compatibility(),
@@ -810,7 +1176,7 @@ impl SelectedTypedRow<LoweredDeferredMemberOwner> {
         ResolutionMemberQualifierCompatibility,
     ) {
         (
-            self.fragment,
+            self.fragment(),
             self.row.definition(),
             self.row.owner_frontier(),
             self.row.lookup(),
@@ -831,7 +1197,7 @@ impl SelectedTypedRow<LoweredConstructionRequirementProperty> {
         SemanticId,
     ) {
         (
-            self.fragment,
+            self.fragment(),
             self.row.definition(),
             self.row.kind(),
             self.row.required_owner_definition(),
@@ -843,16 +1209,16 @@ impl SelectedTypedRow<LoweredSupertypeProperty> {
     pub const fn natural_identity(
         &self,
     ) -> (
-        BindingFragmentId,
+        SelectedTypedRowKey,
         SemanticId,
-        ResolutionSupertypeKind,
+        Option<ResolutionSupertypeKind>,
         SemanticId,
         SemanticId,
     ) {
         (
-            self.fragment,
+            self.identity_key(),
             self.row.definition(),
-            self.row.kind(),
+            self.row.source_kind(),
             self.row.reference(),
             self.row.frontier(),
         )
@@ -864,7 +1230,7 @@ impl SelectedTypedRow<LoweredDefinitionPropertyGap> {
         &self,
     ) -> (BindingFragmentId, SemanticId, SemanticId, SemanticId) {
         (
-            self.fragment,
+            self.fragment(),
             self.row.definition(),
             self.row.reason_semantic(),
             self.row.frontier(),
@@ -874,13 +1240,13 @@ impl SelectedTypedRow<LoweredDefinitionPropertyGap> {
 
 impl SelectedTypedRow<LoweredCallApplicabilityObligation> {
     pub const fn natural_identity(&self) -> (BindingFragmentId, SemanticId) {
-        (self.fragment, self.row.call())
+        (self.fragment(), self.row.call())
     }
 }
 
 impl SelectedTypedRow<LoweredCallableSignatureProperty> {
     pub const fn natural_identity(&self) -> (BindingFragmentId, SemanticId) {
-        (self.fragment, self.row.definition())
+        (self.fragment(), self.row.definition())
     }
 }
 
@@ -924,7 +1290,7 @@ impl SelectedQualifiedRoute {
     /// The exact persisted route key includes the independently produced output.
     pub const fn natural_identity(self) -> (BindingFragmentId, SemanticId, u32, SemanticId) {
         (
-            self.fragment,
+            self.fragment(),
             self.row.reference(),
             self.row.precedence_ordinal(),
             self.row.projection_output_slot(),
@@ -938,7 +1304,7 @@ impl SelectedQualifiedRoute {
         BindingNodeId,
         LoweredQualifiedSeededRoute,
     ) {
-        (self.fragment, self.reference_node, self.row)
+        (self.fragment(), self.reference_node, self.row)
     }
 }
 
@@ -983,7 +1349,7 @@ impl SelectedGapReasonProvenance {
     }
 
     pub const fn natural_identity(self) -> (BindingFragmentId, SemanticId) {
-        (self.fragment, self.reason)
+        (self.fragment(), self.reason)
     }
 }
 
@@ -1021,12 +1387,20 @@ impl SelectedTypeFrontierCompletion {
     }
 
     pub const fn natural_identity(&self) -> (BindingFragmentId, SemanticId) {
-        (self.fragment, self.frontier)
+        (self.fragment(), self.frontier)
     }
 
     pub fn into_parts(self) -> (BindingFragmentId, SemanticId, ResolutionCompletion) {
-        (self.fragment, self.frontier, self.completion)
+        (self.fragment(), self.frontier, self.completion)
     }
+}
+
+/// An invocation role carried by an exact selected head reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectedInvocationRole {
+    pub reference: SemanticId,
+    pub language: Language,
+    pub role: brokk_bifrost_core::analyzer::resolution_facts::ResolutionInvocationRole,
 }
 
 /// Composite key used by exact qualified-route candidate discovery.
@@ -1034,6 +1408,34 @@ impl SelectedTypeFrontierCompletion {
 pub struct QualifiedRouteSlotLookup {
     qualifier_slot: SemanticId,
     lookup: SemanticId,
+}
+
+/// A persisted companion declaration paired with the type that encloses it.
+///
+/// The storage table is site keyed; the selected reader joins those sites to
+/// their semantic definitions so the shared resolver can add the companion's
+/// actual member scope to an enclosing type lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompanionTypeRelation {
+    enclosing_type: SemanticId,
+    companion_type: SemanticId,
+}
+
+impl CompanionTypeRelation {
+    pub(crate) const fn new(enclosing_type: SemanticId, companion_type: SemanticId) -> Self {
+        Self {
+            enclosing_type,
+            companion_type,
+        }
+    }
+
+    pub(crate) const fn enclosing_type(self) -> SemanticId {
+        self.enclosing_type
+    }
+
+    pub(crate) const fn companion_type(self) -> SemanticId {
+        self.companion_type
+    }
 }
 
 /// Shared member-name key used to enumerate candidate impl subjects before
@@ -1103,6 +1505,38 @@ impl QualifiedRouteSlotLookup {
 /// access shapes. Implementations must not satisfy them with per-identity
 /// point reads or by hydrating every selected fragment first.
 pub trait SelectedTypedFactSource {
+    /// Selected source language capability for one positioned reference.
+    fn generated_items_cannot_shadow_bindings(
+        &self,
+        _reference: SemanticId,
+        _cancellation: &CancellationToken,
+    ) -> StoreResult<bool> {
+        Ok(false)
+    }
+
+    /// Read the exact positioned named-argument label at `reference`.
+    fn named_argument_label_for_reference(
+        &self,
+        _reference: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<NamedArgumentLabelRead> {
+        Ok(if cancellation.is_cancelled() {
+            NamedArgumentLabelRead::Cancelled
+        } else {
+            NamedArgumentLabelRead::Missing
+        })
+    }
+
+    /// Find the unique parameter of the selected callable with this label.
+    fn callable_parameter_for_label(
+        &self,
+        _callable: SemanticId,
+        _label: &str,
+        _cancellation: &CancellationToken,
+    ) -> StoreResult<Option<SemanticId>> {
+        Ok(None)
+    }
+
     /// Evaluate exact source authority against one persisted crate selection.
     fn rust_crate_access(
         &self,
@@ -1142,11 +1576,7 @@ pub trait SelectedTypedFactSource {
         _reference: SemanticId,
         cancellation: &CancellationToken,
     ) -> StoreResult<RustImplementedTraits> {
-        Ok(if cancellation.is_cancelled() {
-            RustImplementedTraits::Cancelled
-        } else {
-            RustImplementedTraits::Traits(Vec::new())
-        })
+        Ok(empty_rust_traits_or_cancelled(cancellation))
     }
 
     /// Whether the reference can name this specific Rust trait, independent of its implementor.
@@ -1176,11 +1606,17 @@ pub trait SelectedTypedFactSource {
         _member: SemanticId,
         cancellation: &CancellationToken,
     ) -> StoreResult<RustImplementedTraits> {
-        Ok(if cancellation.is_cancelled() {
-            RustImplementedTraits::Cancelled
-        } else {
-            RustImplementedTraits::Traits(Vec::new())
-        })
+        Ok(empty_rust_traits_or_cancelled(cancellation))
+    }
+
+    /// The persisted namespace of a shared lookup recipe. An absent recipe
+    /// cannot authorize splitting a widened lexical head into namespaces.
+    fn lookup_namespace(
+        &self,
+        _lookup: SemanticId,
+        _cancellation: &CancellationToken,
+    ) -> StoreResult<Option<ResolutionNamespace>> {
+        Ok(None)
     }
 
     /// Whether the selection can contain Java semantics at all. A source
@@ -1188,6 +1624,61 @@ pub trait SelectedTypedFactSource {
     /// only permits Java-specific work; it never skips any.
     fn selection_has_java_semantics(&self) -> bool {
         true
+    }
+
+    /// Whether the selection can contain JVM semantics at all. Without its
+    /// own selection metadata, a source follows the Java selection answer.
+    fn selection_has_jvm_semantics(&self) -> bool {
+        self.selection_has_java_semantics()
+    }
+
+    /// Exact selected external callable result types keyed by their external
+    /// member identities. Results are present only for named types whose owner
+    /// has one identity in the selected provider set; unresolved and
+    /// non-nominal signatures remain absent.
+    fn external_callable_result_type_identities(
+        &self,
+        _definitions: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<(SemanticId, SemanticId)>>> {
+        Ok((!cancellation.is_cancelled()).then(Vec::new))
+    }
+
+    /// Selection rank of one independently identified callee route. Stored
+    /// ordinals stay unique even when a language joins namespaces in one family.
+    fn fragment_call_target_precedence(
+        &self,
+        _fragment: BindingFragmentId,
+        _namespace: ResolutionNamespace,
+        ordinal: u32,
+    ) -> StoreResult<u32> {
+        Ok(ordinal)
+    }
+
+    /// Source language of one selected fragment, read from immutable mount
+    /// metadata. Unknown metadata cannot authorize language-specific member
+    /// inheritance refinement.
+    fn fragment_language(&self, _fragment: BindingFragmentId) -> StoreResult<Language> {
+        Ok(Language::None)
+    }
+
+    /// Whether a type-object qualifier written in `fragment` also searches its
+    /// companion object's members. Only a source that knows each fragment's
+    /// language can answer `true`, so a source without that metadata answers
+    /// `false`. A workspace-wide answer would charge every fragment with the
+    /// companion read, including fragments of languages without companions.
+    fn fragment_type_qualifiers_search_companion_members(
+        &self,
+        _fragment: BindingFragmentId,
+    ) -> StoreResult<bool> {
+        Ok(false)
+    }
+
+    /// Whether reverse intrinsic lookups are keyed only by shared type names.
+    /// Sources with that index shape cannot answer fragment-local identities;
+    /// source-backed implementations may support both kinds.
+    fn intrinsic_reverse_index_uses_shared_type_names(&self) -> bool {
+        false
     }
 
     /// Exact selected Java source properties for the requested declarations.
@@ -1200,6 +1691,16 @@ pub trait SelectedTypedFactSource {
         Ok((!cancellation.is_cancelled()).then(Vec::new))
     }
 
+    /// Exact selected JVM endpoints for language visibility rules. An omitted
+    /// declaration has no selected JVM metadata; None is cancellation.
+    fn jvm_access_endpoints(
+        &self,
+        _semantics: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<JvmAccessEndpoint>>> {
+        Ok((!cancellation.is_cancelled()).then(Vec::new))
+    }
+
     /// Translate selected Go value/callable lookup recipes into the shared
     /// callable spelling space used for field/method shadowing. Omitted names
     /// have no available Go recipe; None reports cancellation.
@@ -1209,6 +1710,55 @@ pub trait SelectedTypedFactSource {
         cancellation: &CancellationToken,
     ) -> StoreResult<Option<Vec<(SemanticId, SemanticId)>>> {
         Ok((!cancellation.is_cancelled()).then(Vec::new))
+    }
+
+    /// Invocation roles keyed on the requested positioned reference sites.
+    /// References without a role are omitted; None reports cancellation.
+    fn invocation_roles_for_references(
+        &self,
+        _references: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<SelectedInvocationRole>>> {
+        Ok((!cancellation.is_cancelled()).then(Vec::new))
+    }
+
+    /// The subset of `lookups` whose recipe spells no member name of the
+    /// implicit root supertype of the recipe's own JVM language
+    /// ([`language_implicit_root_member_names`]). Such a lookup cannot reach a
+    /// member the implicit root declares, so an inherited walk that is sealed
+    /// apart from that root has an exhaustive negative answer for it. A lookup
+    /// with no recipe, or of a language with no modelled implicit root, is
+    /// omitted, never reported as outside the root. None reports cancellation.
+    fn lookups_outside_implicit_root(
+        &self,
+        _lookups: &[(BindingFragmentId, SemanticId)],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<SemanticId>>> {
+        Ok((!cancellation.is_cancelled()).then(Vec::new))
+    }
+
+    /// Requested identities proven to denote lexical type parameters by
+    /// existing source declarations. Missing source metadata proves nothing.
+    fn generic_parameter_declarations(
+        &self,
+        _definitions: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<SemanticId>>> {
+        Ok((!cancellation.is_cancelled()).then(Vec::new))
+    }
+
+    /// Admission proof for exact deferred members against a complete receiver
+    /// promotion set. Unknown preserves the ordinary name-based demand path.
+    /// Each candidate is (definition, owner frontier); preserve input order.
+    /// Implementations and their immutable read reuse live for one request.
+    fn deferred_member_owner_proofs(
+        &self,
+        _owners: &[SemanticId],
+        candidates: &[(SemanticId, SemanticId)],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<DeferredMemberOwnerProof>>> {
+        Ok((!cancellation.is_cancelled())
+            .then(|| vec![DeferredMemberOwnerProof::Unknown; candidates.len()]))
     }
 
     /// Missing declarations have unavailable Go metadata. A returned struct
@@ -1230,6 +1780,8 @@ pub trait SelectedTypedFactSource {
         cancellation: &CancellationToken,
     ) -> StoreResult<Option<Vec<(SemanticId, BindingNodeId)>>>;
 
+    /// Selected JVM type and callable properties for lexical hierarchy replay.
+    /// Omitted declarations have no available metadata; None is cancellation.
     fn java_inheritance_declarations(
         &self,
         _definitions: &[SemanticId],
@@ -1371,11 +1923,53 @@ pub trait SelectedTypedFactSource {
         visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredTypeTransfer>>,
     ) -> StoreResult<TypedFactReadOutcome>;
 
+    fn visit_type_production_pages_for_outputs(
+        &self,
+        outputs: TypedFactRequest<'_, SemanticId>,
+        cancellation: &CancellationToken,
+        visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredTypeProduction>>,
+    ) -> StoreResult<TypedFactReadOutcome>;
+
     fn visit_type_component_pages_for_containers(
         &self,
         containers: TypedFactRequest<'_, SemanticId>,
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredTypeComponent>>,
+    ) -> StoreResult<TypedFactReadOutcome>;
+
+    fn visit_declared_type_argument_pages_for_owners(
+        &self,
+        owners: TypedFactRequest<'_, SemanticId>,
+        cancellation: &CancellationToken,
+        visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredDeclaredTypeArgument>>,
+    ) -> StoreResult<TypedFactReadOutcome>;
+
+    fn visit_type_argument_pages_for_applications(
+        &self,
+        applications: TypedFactRequest<'_, SemanticId>,
+        cancellation: &CancellationToken,
+        visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredTypeArgument>>,
+    ) -> StoreResult<TypedFactReadOutcome>;
+
+    fn visit_generic_type_alias_parameter_pages_for_definitions(
+        &self,
+        definitions: TypedFactRequest<'_, SemanticId>,
+        cancellation: &CancellationToken,
+        visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredGenericTypeAliasParameter>>,
+    ) -> StoreResult<TypedFactReadOutcome>;
+
+    fn visit_generic_formal_pages_for_owners(
+        &self,
+        owners: TypedFactRequest<'_, SemanticId>,
+        cancellation: &CancellationToken,
+        visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredGenericFormal>>,
+    ) -> StoreResult<TypedFactReadOutcome>;
+
+    fn visit_generic_formal_default_pages_for_owners(
+        &self,
+        owners: TypedFactRequest<'_, SemanticId>,
+        cancellation: &CancellationToken,
+        visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredGenericFormalDefault>>,
     ) -> StoreResult<TypedFactReadOutcome>;
 
     fn visit_underlying_type_pages_for_definitions(
@@ -1397,6 +1991,16 @@ pub trait SelectedTypedFactSource {
         type_identities: TypedFactRequest<'_, SemanticId>,
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredIntrinsicSeed>>,
+    ) -> StoreResult<TypedFactReadOutcome>;
+
+    /// Visit distinct selected `(identity, kind, spelling)` rows for the
+    /// requested intrinsic type identities. Conflicting descriptor tuples
+    /// remain separate rows so the caller can reject inconsistent facts.
+    fn visit_intrinsic_type_descriptor_pages_for_type_identities(
+        &self,
+        type_identities: TypedFactRequest<'_, SemanticId>,
+        cancellation: &CancellationToken,
+        visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredIntrinsicTypeDescriptor>>,
     ) -> StoreResult<TypedFactReadOutcome>;
 
     fn visit_binding_projection_pages_for_references(
@@ -1489,6 +2093,23 @@ pub trait SelectedTypedFactSource {
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredMemberScopeProperty>>,
     ) -> StoreResult<TypedFactReadOutcome>;
+
+    /// Visit companion declarations enclosed by selected type definitions.
+    ///
+    /// A companion relation is consumed beside member-scope reads, where the
+    /// shared lookup can select the companion's own persisted scope.
+    fn visit_companion_relation_pages_for_enclosing_types(
+        &self,
+        _enclosing_types: TypedFactRequest<'_, SemanticId>,
+        cancellation: &CancellationToken,
+        _visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<CompanionTypeRelation>>,
+    ) -> StoreResult<TypedFactReadOutcome> {
+        Ok(if cancellation.is_cancelled() {
+            TypedFactReadOutcome::cancelled(ResolutionCompletion::Complete)
+        } else {
+            TypedFactReadOutcome::exhausted(ResolutionCompletion::Complete)
+        })
+    }
 
     fn visit_member_scope_pages_for_heads(
         &self,
@@ -1618,6 +2239,333 @@ pub trait SelectedTypedFactSource {
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, SelectedGapReasonProvenance>,
     ) -> StoreResult<TypedFactReadOutcome>;
+
+    /// Visit persisted Rust declaration ownership for lowering-gap reasons.
+    /// Other sources have no Rust declaration-authority join and return empty.
+    fn visit_rust_reason_owners(
+        &self,
+        _reasons: TypedFactRequest<'_, SemanticId>,
+        cancellation: &CancellationToken,
+        _visitor: &mut TypedFactPageVisitor<'_, (SemanticId, SemanticId)>,
+    ) -> StoreResult<TypedFactReadOutcome> {
+        Ok(if cancellation.is_cancelled() {
+            TypedFactReadOutcome::cancelled(ResolutionCompletion::Complete)
+        } else {
+            TypedFactReadOutcome::exhausted(ResolutionCompletion::Complete)
+        })
+    }
+}
+
+/// Whether one selected semantic language uses the JVM resolution rules.
+pub(crate) const fn language_has_jvm_semantics(language: Language) -> bool {
+    matches!(
+        language,
+        Language::Java | Language::Kotlin | Language::Scala
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JvmDeclarationAccessRules {
+    Java,
+    Kotlin,
+    Scala,
+}
+
+impl JvmDeclarationAccessRules {
+    pub(crate) const fn contextual_visibility_without_gap(self) -> bool {
+        matches!(self, Self::Scala)
+    }
+
+    /// Namespace of a source owner whose authored members have JVM static
+    /// access. Kotlin requires its explicit JVM aliases: singleton instance
+    /// members alone do not establish a Java static entry point.
+    pub(crate) const fn java_static_import_owner_namespace(self) -> Option<ResolutionNamespace> {
+        match self {
+            Self::Java => Some(ResolutionNamespace::Type),
+            Self::Scala => Some(ResolutionNamespace::Value),
+            Self::Kotlin => None,
+        }
+    }
+
+    /// Java public members remain inherited through a superclass the caller
+    /// cannot name. Direct type references and final members keep access checks.
+    pub(crate) const fn inherited_member_requires_accessible_owner(self) -> bool {
+        !matches!(self, Self::Java)
+    }
+}
+
+/// The declared-visibility rules selected for one JVM declaration language.
+pub(crate) const fn language_jvm_declaration_access_rules(
+    language: Language,
+) -> Option<JvmDeclarationAccessRules> {
+    match language {
+        Language::Java => Some(JvmDeclarationAccessRules::Java),
+        Language::Kotlin => Some(JvmDeclarationAccessRules::Kotlin),
+        Language::Scala => Some(JvmDeclarationAccessRules::Scala),
+        _ => None,
+    }
+}
+
+/// An implicit provider that can make a bare JVM name visible without an
+/// explicit import in the source file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JvmImplicitRootProvider {
+    Package(&'static str),
+    ScalaPredef,
+}
+
+const JAVA_IMPLICIT_ROOT_PROVIDERS: &[JvmImplicitRootProvider] =
+    &[JvmImplicitRootProvider::Package("java.lang")];
+const KOTLIN_IMPLICIT_ROOT_PROVIDERS: &[JvmImplicitRootProvider] = &[
+    JvmImplicitRootProvider::Package("kotlin"),
+    JvmImplicitRootProvider::Package("kotlin.annotation"),
+    JvmImplicitRootProvider::Package("kotlin.collections"),
+    JvmImplicitRootProvider::Package("kotlin.comparisons"),
+    JvmImplicitRootProvider::Package("kotlin.io"),
+    JvmImplicitRootProvider::Package("kotlin.ranges"),
+    JvmImplicitRootProvider::Package("kotlin.sequences"),
+    JvmImplicitRootProvider::Package("kotlin.text"),
+    JvmImplicitRootProvider::Package("kotlin.jvm"),
+    JvmImplicitRootProvider::Package("java.lang"),
+];
+const SCALA_IMPLICIT_ROOT_PROVIDERS: &[JvmImplicitRootProvider] = &[
+    JvmImplicitRootProvider::Package("java.lang"),
+    JvmImplicitRootProvider::Package("scala"),
+    JvmImplicitRootProvider::ScalaPredef,
+];
+
+/// The implicit package and singleton providers whose missing inventory keeps
+/// a bare-name lookup open for one JVM language.
+pub(crate) const fn language_implicit_root_providers(
+    language: Language,
+) -> &'static [JvmImplicitRootProvider] {
+    match language {
+        Language::Java => JAVA_IMPLICIT_ROOT_PROVIDERS,
+        Language::Kotlin => KOTLIN_IMPLICIT_ROOT_PROVIDERS,
+        Language::Scala => SCALA_IMPLICIT_ROOT_PROVIDERS,
+        _ => &[],
+    }
+}
+
+/// Whether call applicability may close an interface's implicit Object frontier.
+///
+/// An interface with no superinterface implicitly declares the public methods
+/// of `java.lang.Object` (JLS 9.2), so a directly declared interface method is
+/// a complete candidate when the only possible inherited names are Object
+/// methods. Java states that rule itself and Kotlin follows it through Java
+/// interop. Scala's interop remains conservative.
+pub(crate) const fn language_can_close_interface_object_frontier(language: Language) -> bool {
+    matches!(language, Language::Java | Language::Kotlin)
+}
+
+/// The identity namespace shared by declarations visible to one language.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum ResolutionIdentityDomain {
+    Jvm,
+    Language(Language),
+}
+
+impl ResolutionIdentityDomain {
+    pub(crate) fn identity_label(self) -> &'static str {
+        match self {
+            Self::Jvm => "jvm",
+            Self::Language(language) => language.config_label(),
+        }
+    }
+}
+
+/// Map a selected language to the namespace used for declaration lookup keys.
+pub(crate) const fn language_identity_domain(language: Language) -> ResolutionIdentityDomain {
+    if language_has_jvm_semantics(language) {
+        ResolutionIdentityDomain::Jvm
+    } else {
+        ResolutionIdentityDomain::Language(language)
+    }
+}
+
+/// The origin rank carried by a proven lexical declaration. Scala orders its
+/// local declarations before imported and package alternatives. An unresolved
+/// lexical continuation has no such proof and therefore keeps no origin rank.
+/// Other languages retain their existing scope-choice ordering.
+pub(crate) const fn language_lexical_binder_origin(
+    language: Language,
+) -> Option<super::model::BindingOrigin> {
+    match language {
+        Language::Scala => Some(super::model::BindingOrigin::LocalOrInherited),
+        _ => None,
+    }
+}
+
+/// Whether qualified callable routes search inherited overloads past the nearest owner.
+///
+/// Java deliberately keeps nearest-owner replay: renaming `Base.oldName` to a
+/// name declared on `Child` must see `child.oldName()` rebind to `Child`'s
+/// method, so native rename refuses at its counterfactual capture check.
+pub(crate) const fn language_uses_qualified_callable_hierarchy_replay(language: Language) -> bool {
+    matches!(language, Language::Kotlin)
+}
+
+/// Whether an explicit import outranks a package-scope declaration of the same name.
+///
+/// Kotlin ranks an explicit import above every declaration in the current
+/// package, including a declaration in the same file. Those declarations are
+/// package members, so their package-scope binders take the package tier. Scala
+/// ranks same-unit definitions above explicit imports, and Java rejects a
+/// single-type import that clashes with a same-unit top-level type, so both keep
+/// the lexical rank.
+pub(crate) const fn language_explicit_imports_outrank_package_binders(language: Language) -> bool {
+    matches!(language, Language::Kotlin)
+}
+
+/// Whether an unqualified call in a class body can select a companion member.
+pub(crate) const fn language_uses_enclosing_companion_members(language: Language) -> bool {
+    matches!(language, Language::Kotlin)
+}
+
+/// Whether a type-object qualifier also searches its companion object's
+/// members, as in `Host.respond()` for `class Host { companion object { fun
+/// respond() } }`. The qualifier's own hierarchy does not contain that member,
+/// so the companion joins the hierarchy roots. Only Kotlin is wired.
+pub(crate) const fn language_type_qualifiers_search_companion_members(language: Language) -> bool {
+    matches!(language, Language::Kotlin)
+}
+
+/// Whether a Callable declaration also occupies the Value namespace.
+///
+/// Scala's term namespace holds vals, vars, objects and defs, so a bare
+/// `ready` that names a `def ready: Boolean` is a term reference, while the
+/// def itself is a Callable declaration that a Value lookup never meets.
+/// Publishing the def in both namespaces keeps one lookup symbol per
+/// reference, which the hierarchy replay requires, and lets the scope
+/// precedence of the nearer declaration decide between a def and a val of the
+/// same name. Java, Kotlin and Go keep fields and methods in separate
+/// namespaces, and Rust files its functions under Value already.
+pub(crate) const fn language_callables_occupy_value_namespace(language: Language) -> bool {
+    matches!(language, Language::Scala)
+}
+
+/// Additional member kinds which can carry a value-namespace binding. The
+/// hierarchy still requires a balanced lexical path in that namespace;
+/// admitting a kind never invents an alias for a class declaration.
+pub(crate) const fn language_value_member_aliases(
+    language: Language,
+) -> &'static [ResolutionMemberKind] {
+    match language {
+        Language::Scala => &[ResolutionMemberKind::NestedType],
+        _ => &[],
+    }
+}
+
+/// Scala import owner steps can bind a singleton term and continue in its
+/// proven module type. Other JVM languages keep type-only owner steps.
+pub(crate) const fn language_import_owner_steps_bind_singletons(language: Language) -> bool {
+    matches!(language, Language::Scala)
+}
+
+/// Instance-method proof for override selection. Scala's module methods use
+/// type-access metadata for singleton access but belong to the module instance.
+/// Java static hiding is supplied separately by its language hook.
+pub(crate) fn language_method_is_instance_for_override(
+    language: Language,
+    access: Option<ResolutionMemberAccess>,
+    owner: Option<&JavaInheritanceDeclarationKind>,
+) -> Option<bool> {
+    match access {
+        Some(ResolutionMemberAccess::Instance) => Some(true),
+        Some(ResolutionMemberAccess::Type) if language == Language::Scala => match owner {
+            Some(JavaInheritanceDeclarationKind::Type { is_singleton, .. }) => Some(*is_singleton),
+            _ => None,
+        },
+        Some(_) => Some(false),
+        None => None,
+    }
+}
+
+/// Exact selection alone does not close Scala ancestors. Its bounded hierarchy
+/// must already be sealed before a resolved edge placeholder can be discharged.
+/// Other languages retain their existing exact-call dominance theorem.
+pub(crate) const fn language_exact_call_closes_ancestor_frontier(language: Language) -> bool {
+    !matches!(language, Language::Scala)
+}
+
+/// Applied singleton members include indexed parents in Scala. Kotlin's
+/// result `invoke` lookup retains its declared-member contract.
+pub(crate) const fn language_applied_members_search_hierarchy(language: Language) -> bool {
+    matches!(language, Language::Scala)
+}
+
+/// Whether a JVM query requires the selected source package to match the file's
+/// directory in a manifest-free project. Scala packages are declared by package
+/// clauses (SLS 9.2), including package objects and successive package clauses.
+/// Kotlin likewise takes membership from its package declaration rather than its
+/// source directory. Keep Java and foreign-language admission rules unchanged.
+pub(crate) const fn language_jvm_package_requires_directory_agreement(
+    query_language: Language,
+    source_language: Language,
+) -> bool {
+    !matches!(
+        (query_language, source_language),
+        (Language::Scala, Language::Scala) | (Language::Kotlin, Language::Kotlin)
+    )
+}
+
+/// The declared extractor members a language uses for this pattern-head role.
+pub(crate) const fn language_extractor_member_names(
+    language: Language,
+    role: brokk_bifrost_core::analyzer::resolution_facts::ResolutionInvocationRole,
+) -> &'static [&'static str] {
+    use brokk_bifrost_core::analyzer::resolution_facts::ResolutionInvocationRole;
+    match (language, role) {
+        (Language::Scala, ResolutionInvocationRole::Unapply) => &["unapply", "unapplySeq"],
+        (Language::Scala, ResolutionInvocationRole::UnapplySeq) => &["unapplySeq"],
+        _ => &[],
+    }
+}
+
+/// The member names that every type of a JVM language has through its implicit
+/// root supertype, whether or not the type declares a supertype.
+///
+/// A type with no declared supertype still answers these names: Java's
+/// `Object` members, Scala's `Any` and `AnyRef` members (`==`, `##`, `eq`,
+/// `synchronized` and the like), and Kotlin's `Any` members. An import owner
+/// that declares no supertype has a complete member set for every other name.
+pub(crate) const fn language_implicit_root_member_names(
+    language: Language,
+) -> &'static [&'static str] {
+    match language {
+        Language::Java => &[
+            "getClass",
+            "hashCode",
+            "equals",
+            "clone",
+            "toString",
+            "notify",
+            "notifyAll",
+            "wait",
+            "finalize",
+        ],
+        Language::Kotlin => &["equals", "hashCode", "toString"],
+        Language::Scala => &[
+            "==",
+            "!=",
+            "equals",
+            "hashCode",
+            "toString",
+            "##",
+            "isInstanceOf",
+            "asInstanceOf",
+            "getClass",
+            "eq",
+            "ne",
+            "synchronized",
+            "wait",
+            "notify",
+            "notifyAll",
+            "clone",
+            "finalize",
+        ],
+        _ => &[],
+    }
 }
 
 /// One source that supplies both lexical stitching and selected typed facts.
@@ -1653,129 +2601,7 @@ mod tests {
     use crate::analyzer::resolution::model::{
         ResolutionIncompleteReason, TypeTransferRule, TypeTransferValueTransform,
     };
-
-    fn fragment(name: &str) -> BindingFragmentId {
-        BindingFragmentId::for_test(name)
-    }
-
-    fn semantic(name: &str) -> SemanticId {
-        SemanticId::for_test(name)
-    }
-
-    fn selected_transfer(
-        owner: BindingFragmentId,
-        rule_semantic: SemanticId,
-        source_slot: SemanticId,
-        target_slot: SemanticId,
-    ) -> SelectedTypedRow<LoweredTypeTransfer> {
-        SelectedTypedRow::new(
-            owner,
-            LoweredTypeTransfer::new(
-                source_slot,
-                ResolutionTypeTransferKind::Assignment,
-                TypeTransferRule::new(
-                    rule_semantic,
-                    target_slot,
-                    0,
-                    TypeTransferValueTransform::Preserve,
-                    ResolutionCompletion::Complete,
-                ),
-            ),
-        )
-    }
-
-    #[test]
-    fn request_and_page_boundaries_accept_the_general_empty_and_maximum_cases() {
-        let empty = TypedFactRequest::<u16>::new(&[]);
-        assert!(empty.is_empty());
-
-        let identities = (0..MAX_TYPED_FACT_REQUESTS_PER_BATCH)
-            .map(|identity| u16::try_from(identity).expect("request bound fits u16"))
-            .collect::<Vec<_>>();
-        let maximum = TypedFactRequest::new(&identities);
-        assert_eq!(maximum.len(), MAX_TYPED_FACT_REQUESTS_PER_BATCH);
-
-        let rows = vec![0_u8; MAX_TYPED_FACT_ROWS_PER_PAGE];
-        let mut visited = 0_usize;
-        let mut callback = |page: &[u8]| {
-            visited += page.len();
-            Ok(true)
-        };
-        {
-            let mut visitor = TypedFactPageVisitor::new(&mut callback);
-            assert!(
-                visitor
-                    .visit_page(&rows)
-                    .expect("test visitor is infallible")
-            );
-            assert!(!visitor.stopped());
-        }
-        assert_eq!(visited, MAX_TYPED_FACT_ROWS_PER_PAGE);
-    }
-
-    #[test]
-    #[should_panic(expected = "typed-fact request identities must be unique")]
-    fn request_boundary_rejects_duplicate_identities() {
-        let _ = TypedFactRequest::new(&[1_u8, 1_u8]);
-    }
-
-    #[test]
-    #[should_panic(expected = "typed-fact pages must not be empty")]
-    fn page_boundary_rejects_empty_pages() {
-        let mut callback = |_page: &[u8]| Ok(true);
-        let mut visitor = TypedFactPageVisitor::new(&mut callback);
-        let _ = visitor.visit_page(&[]);
-    }
-
-    #[test]
-    fn source_returned_cancellation_is_exact_and_moves_prior_evidence_unchanged() {
-        let prior = ResolutionIncompleteReason::UnsupportedSemantic(semantic("prior-gap"));
-        let evidence = ResolutionCompletion::incomplete([prior]);
-        let outcome = TypedFactReadOutcome::cancelled(evidence.clone());
-
-        assert_eq!(outcome.terminal(), TypedFactReadTerminal::Cancelled);
-        assert!(outcome.is_cancelled());
-        assert_eq!(outcome.evidence(), &evidence);
-    }
-
-    #[test]
-    fn every_terminal_moves_semantic_evidence_unchanged() {
-        let evidence =
-            ResolutionCompletion::incomplete([ResolutionIncompleteReason::UnsupportedSemantic(
-                semantic("terminal-gap"),
-            )]);
-        for outcome in [
-            TypedFactReadOutcome::exhausted(evidence.clone()),
-            TypedFactReadOutcome::stopped(evidence.clone()),
-            TypedFactReadOutcome::cancelled(evidence.clone()),
-        ] {
-            assert_eq!(outcome.evidence(), &evidence);
-        }
-    }
-
-    #[test]
-    fn qualified_route_identity_and_selected_reference_node_are_exact() {
-        let fragment = fragment("qualified-route-fragment");
-        let reference = semantic("qualified-route-reference");
-        let reference_node = BindingNodeId::for_test(b"reference-node");
-        let row = LoweredQualifiedSeededRoute::new(
-            reference,
-            semantic("qualifier-slot"),
-            semantic("lookup"),
-            ResolutionNamespace::Value,
-            7,
-            semantic("projection-output"),
-            BindingProjectionKind::TargetDeclaredValueType,
-            semantic("coarse-gap"),
-        );
-        let selected = SelectedQualifiedRoute::new(fragment, reference_node, row);
-
-        assert_eq!(
-            selected.natural_identity(),
-            (fragment, reference, 7, semantic("projection-output"))
-        );
-        assert_eq!(selected.reference_node(), reference_node);
-    }
+    use crate::analyzer::resolution::test_support::{fragment, selected_transfer, semantic};
 
     #[test]
     fn transfer_stable_identity_is_distinct_from_directional_stream_order() {
@@ -1843,13 +2669,5 @@ mod tests {
                 .map(SelectedTypedRow::<LoweredTypeTransfer>::natural_identity)
                 .collect::<BTreeSet<_>>()
         );
-    }
-
-    #[test]
-    fn selected_source_traits_are_object_safe() {
-        let typed: Option<&dyn SelectedTypedFactSource> = None;
-        let composite: Option<&dyn FactResolutionSource> = None;
-        assert!(typed.is_none());
-        assert!(composite.is_none());
     }
 }

@@ -17,7 +17,7 @@
 //! [`brokk_bifrost_core::analyzer::CodeUnitIndex`] plus the memoized C++
 //! products the language logic resolves through. `analyzer/cpp/` in
 //! `brokk-bifrost-analysis` keeps the shim: the `CppAnalyzer` struct with its
-//! five moka caches, three `OnceLock` cells, one `PoolSafeMemo` and six
+//! bounded moka caches, three `OnceLock` cells, one `PoolSafeMemo` and six
 //! `test-support` counters, the `CodeUnitIndex` impl carrying the #1134
 //! reconciliation overlay, the `IAnalyzer` impl, the `CppAdapter` forwarding
 //! shell, the SPI block, and the downcasts that produce the arguments.

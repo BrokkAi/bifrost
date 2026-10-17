@@ -8,9 +8,7 @@
 //! `scan_usages` and `usage_graph` ask for. And the `RustAnalyzer` methods
 //! that are the outside world's way in.
 //!
-//! Until ExecPlan Milestone 5 (`.agents/plans/rust-usage-index-v2.md`) this
-//! file also held a workspace-wide index of seventeen maps that every one of
-//! those answers was read out of. There is no index any more: the per-file
+//! The former workspace-wide usage index is gone. The per-file
 //! facts are rows in the store (`facts.rs`, read by `usage_queries.rs`) and
 //! the cross-file composition is a memoized walk (`usage_walks.rs`), so
 //! nothing workspace-sized is built or retained.
@@ -62,6 +60,9 @@ pub enum RustImportEdgeKind {
 #[derive(Debug, Clone)]
 pub struct RustImportEdge {
     pub importer: ProjectFile,
+    /// Position of the structured import binding in this file. This is the
+    /// same ordinal used by candidate-dependency rows.
+    pub import_ordinal: u32,
     pub importer_module: ModuleKey,
     pub extent: RustImportExtent,
     /// The exact structured path of the `use` leaf that produced this edge.
@@ -369,6 +370,8 @@ pub struct RustUnnamedImportVisibility {
 
 #[derive(Debug, Clone)]
 pub struct RustOriginRoute {
+    /// Import binding that introduced the route in the importing file.
+    pub import_ordinal: u32,
     pub importer_module: ModuleKey,
     pub extent: RustImportExtent,
     pub path: Vec<String>,
@@ -378,6 +381,8 @@ pub struct RustOriginRoute {
     pub namespace: RustSymbolNamespace,
     pub origin: RustSymbolIdentity,
     pub domain: Domain,
+    /// Files visited while following the re-export route to `origin`.
+    pub route_files: Vec<ProjectFile>,
     pub provenance: RustRouteProvenance,
     pub cfg_condition: RustCfgCondition,
 }
@@ -517,6 +522,16 @@ impl RustBindingSeeds {
             .collect();
         if selected.len() != candidates.len() {
             return RustMacroInvocationResolution::Unresolved;
+        }
+        // A macro visible through textual/import scope shadows a same-named
+        // prelude macro. Keep distinct non-prelude routes ambiguous, but do
+        // not make ordinary lexical shadowing look like resolver uncertainty.
+        if selected
+            .iter()
+            .any(|candidate| candidate.route != RustMacroInvocationRoute::SelectedPrelude)
+        {
+            selected
+                .retain(|candidate| candidate.route != RustMacroInvocationRoute::SelectedPrelude);
         }
         selected.sort_by(|left, right| {
             left.identity
@@ -1602,9 +1617,20 @@ pub fn usage_importers(
     token: QueryToken<'_>,
     seeds: &RustBindingSeeds,
 ) -> Result<HashSet<ProjectFile>, RustCargoRouteError> {
-    RustUsageWalks::new(analyzer, token)?
-        .importers_of_seeds_while(seeds, &|| true)?
+    usage_candidate_files_from_binding_seeds_while(analyzer, token, seeds, &|| true)?
         .ok_or(RustCargoRouteError::Cancelled)
+}
+
+fn usage_walks_while<'analyzer>(
+    analyzer: &'analyzer dyn RustFactSource,
+    token: QueryToken<'analyzer>,
+    keep_going: &'analyzer (impl Fn() -> bool + Sync),
+) -> Result<Option<RustUsageWalks<'analyzer>>, RustCargoRouteError> {
+    let walks = RustUsageWalks::new_while(analyzer, token, keep_going)?;
+    if !keep_going() {
+        return Ok(None);
+    }
+    Ok(Some(walks))
 }
 
 pub fn usage_candidate_files_while(
@@ -1613,10 +1639,9 @@ pub fn usage_candidate_files_while(
     roots: &BTreeSet<CodeUnit>,
     keep_going: &(impl Fn() -> bool + Sync),
 ) -> Result<Option<HashSet<ProjectFile>>, RustCargoRouteError> {
-    let walks = RustUsageWalks::new_while(analyzer, token, keep_going)?;
-    if !keep_going() {
+    let Some(walks) = usage_walks_while(analyzer, token, keep_going)? else {
         return Ok(None);
-    }
+    };
     let Some(seeds) = walks.binding_seeds_while(analyzer, roots, keep_going)? else {
         return Ok(None);
     };
@@ -1637,10 +1662,9 @@ pub fn usage_candidate_files_from_binding_seeds_while(
     seeds: &RustBindingSeeds,
     keep_going: &(impl Fn() -> bool + Sync),
 ) -> Result<Option<HashSet<ProjectFile>>, RustCargoRouteError> {
-    let walks = RustUsageWalks::new_while(analyzer, token, keep_going)?;
-    if !keep_going() {
+    let Some(walks) = usage_walks_while(analyzer, token, keep_going)? else {
         return Ok(None);
-    }
+    };
     walks.importers_of_seeds_while(seeds, keep_going)
 }
 
@@ -1650,10 +1674,9 @@ pub fn usage_binding_seeds_while(
     roots: &BTreeSet<CodeUnit>,
     keep_going: &(impl Fn() -> bool + Sync),
 ) -> Result<Option<RustBindingSeeds>, RustCargoRouteError> {
-    let walks = RustUsageWalks::new_while(analyzer, token, keep_going)?;
-    if !keep_going() {
+    let Some(walks) = usage_walks_while(analyzer, token, keep_going)? else {
         return Ok(None);
-    }
+    };
     walks.binding_seeds_while(analyzer, roots, keep_going)
 }
 
@@ -2053,12 +2076,7 @@ fn visible_namespace_module_routes(
     let leading_absolute_local =
         leading_absolute && walks.cargo_routes().file_uses_rust_2015_edition(file);
     let admitted = |provenance| {
-        !leading_absolute
-            || matches!(
-                provenance,
-                RustRouteProvenance::CurrentLibrary | RustRouteProvenance::Dependency
-            )
-            || (leading_absolute_local && provenance == RustRouteProvenance::Local)
+        rust_route_provenance_is_admitted(provenance, leading_absolute, leading_absolute_local)
     };
     for (scope_start, binder) in
         visible_import_binders_with_scopes_in_tree(syntax.tree().root_node(), syntax.source(), byte)
@@ -2163,6 +2181,19 @@ fn visible_namespace_module_routes(
         }
     }
     Ok(None)
+}
+
+fn rust_route_provenance_is_admitted(
+    provenance: RustRouteProvenance,
+    leading_absolute: bool,
+    leading_absolute_local: bool,
+) -> bool {
+    !leading_absolute
+        || matches!(
+            provenance,
+            RustRouteProvenance::CurrentLibrary | RustRouteProvenance::Dependency
+        )
+        || (leading_absolute_local && provenance == RustRouteProvenance::Local)
 }
 
 /// The seed identities a resolved module route can name under `terminal`.
@@ -2394,12 +2425,7 @@ pub fn usage_reference_at_with_walks(
         }
     }
     let absolute_route_admitted = |provenance| {
-        !leading_absolute
-            || matches!(
-                provenance,
-                RustRouteProvenance::CurrentLibrary | RustRouteProvenance::Dependency
-            )
-            || (leading_absolute_local && provenance == RustRouteProvenance::Local)
+        rust_route_provenance_is_admitted(provenance, leading_absolute, leading_absolute_local)
     };
     let file_origin_routes = walks.origin_routes_of(file)?;
     let origin_routes = file_origin_routes
@@ -2923,12 +2949,11 @@ fn unique_seed_identity_for_fqn(
         return Ok(None);
     };
     let importer_module = &importer_module;
-    let mut matches = Vec::new();
-    for identity in &seeds.identities {
+    unique_canonical_seed_identity(seeds, |identity| {
         if identity.fq_name() != resolved_fqn || !identity.namespace.accepts(namespace) {
-            continue;
+            return Ok(false);
         }
-        if !seed_identity_admitted_at(
+        Ok(seed_identity_admitted_at(
             analyzer,
             token,
             importer,
@@ -2936,21 +2961,30 @@ fn unique_seed_identity_for_fqn(
             seeds,
             identity,
             dependency_roots,
-        )? || !seeds.identity_domains.get(identity).is_none_or(|domains| {
+        )? && seeds.identity_domains.get(identity).is_none_or(|domains| {
             domains
                 .iter()
                 .any(|domain| domain.contains_module(importer_module))
-        }) {
-            continue;
+        }))
+    })
+}
+
+fn unique_canonical_seed_identity(
+    seeds: &RustBindingSeeds,
+    mut eligible: impl FnMut(&RustSymbolIdentity) -> Result<bool, RustCargoRouteError>,
+) -> Result<Option<RustSymbolIdentity>, RustCargoRouteError> {
+    let mut matches = Vec::new();
+    for identity in &seeds.identities {
+        if eligible(identity)? {
+            matches.extend(
+                seeds
+                    .canonical_identities
+                    .get(identity)
+                    .into_iter()
+                    .flatten()
+                    .cloned(),
+            );
         }
-        matches.extend(
-            seeds
-                .canonical_identities
-                .get(identity)
-                .into_iter()
-                .flatten()
-                .cloned(),
-        );
     }
     matches.sort_by(|left, right| {
         left.file
@@ -3077,14 +3111,13 @@ fn unique_seed_identity_for_import_targets(
     };
     let importer_module = &importer_module;
     let walks = RustUsageWalks::new(analyzer, token)?;
-    let mut matches = Vec::new();
-    for identity in &seeds.identities {
+    unique_canonical_seed_identity(seeds, |identity| {
         if !identity.namespace.accepts(namespace)
             || !targets
                 .iter()
                 .any(|(file, name)| identity.file == *file && identity.name == *name)
         {
-            continue;
+            return Ok(false);
         }
         // The visible forward binder already returned a query root as
         // an exact target. Auxiliary Cargo and inferred-module domains
@@ -3112,41 +3145,23 @@ fn unique_seed_identity_for_import_targets(
                 == Some(true);
             root_admitted = visible_root && (same_owner || related_target);
         }
-        let admitted = if root_admitted {
-            true
-        } else {
-            seed_identity_admitted_at(
-                analyzer,
-                token,
-                importer,
-                byte,
-                seeds,
-                identity,
-                dependency_roots,
-            )? && seeds.identity_domains.get(identity).is_none_or(|domains| {
-                domains
-                    .iter()
-                    .any(|domain| domain.contains_module(importer_module))
-            })
-        };
-        if admitted {
-            matches.extend(
-                seeds
-                    .canonical_identities
-                    .get(identity)
-                    .into_iter()
-                    .flatten()
-                    .cloned(),
-            );
+        if root_admitted {
+            return Ok(true);
         }
-    }
-    matches.sort_by(|left, right| {
-        left.file
-            .cmp(&right.file)
-            .then_with(|| left.name.cmp(&right.name))
-    });
-    matches.dedup();
-    Ok((matches.len() == 1).then(|| matches.remove(0)))
+        Ok(seed_identity_admitted_at(
+            analyzer,
+            token,
+            importer,
+            byte,
+            seeds,
+            identity,
+            dependency_roots,
+        )? && seeds.identity_domains.get(identity).is_none_or(|domains| {
+            domains
+                .iter()
+                .any(|domain| domain.contains_module(importer_module))
+        }))
+    })
 }
 
 fn seed_identity_admitted_at(
@@ -3236,16 +3251,21 @@ pub fn edge_target_matches_exact_module(edge: &RustImportEdge, crate_root_packag
 
 #[cfg(test)]
 mod unnamed_guard_tests {
+    use brokk_bifrost_test_macros::hardwon;
+
     use super::{
         Domain, HashMap, HashSet, ModuleKey, ProjectFile, RustBindingSeeds, RustCfgCondition,
         RustImportExtent, RustMacroInvocationCandidate, RustMacroInvocationResolution,
-        RustMacroInvocationRoute, RustMacroInvocationTarget, RustRouteProvenance,
-        RustSymbolIdentity, RustSymbolNamespace, RustUnnamedImportVisibility,
+        RustMacroInvocationRoute, RustMacroInvocationTarget, RustMacroScopeKey,
+        RustRouteProvenance, RustSymbolIdentity, RustSymbolNamespace, RustUnnamedImportVisibility,
         combine_rust_cfg_conditions,
     };
     use std::collections::BTreeSet;
 
     #[test]
+    #[hardwon(
+        "#3080+75d44cf79d6d: contradictory cfg guards must not prove unnamed-import visibility"
+    )]
     fn guard_conjunction_rejects_internal_and_cross_set_contradictions() {
         let yes = RustCfgCondition::Atom("feature = a".into());
         let no = RustCfgCondition::NotAtom("feature = a".into());
@@ -3259,6 +3279,7 @@ mod unnamed_guard_tests {
     }
 
     #[test]
+    #[hardwon("#3080+75d44cf79d6d: unnamed imports require exact target, scope, and known guards")]
     fn unnamed_visibility_requires_known_guards_exact_identity_and_scope() {
         let root = tempfile::tempdir().expect("temporary root");
         let file = ProjectFile::new(root.path().to_path_buf(), "lib.rs");
@@ -3345,6 +3366,7 @@ mod unnamed_guard_tests {
     }
 
     #[test]
+    #[hardwon("#3363: only a selected macro route may produce an exact invocation target")]
     fn selected_macro_use_route_is_exact_but_unselected_is_unresolved() {
         let target = macro_candidate("target", "target-crate", RustRouteProvenance::Dependency);
         let other = macro_candidate("other", "other-crate", RustRouteProvenance::Dependency);
@@ -3366,6 +3388,7 @@ mod unnamed_guard_tests {
     }
 
     #[test]
+    #[hardwon("#3363: distinct selected macro targets must remain ambiguous")]
     fn two_selected_macro_routes_remain_ambiguous() {
         let left = macro_candidate("target", "left", RustRouteProvenance::Dependency);
         let right = macro_candidate("target", "right", RustRouteProvenance::Dependency);
@@ -3383,6 +3406,7 @@ mod unnamed_guard_tests {
     }
 
     #[test]
+    #[hardwon("#3363: an unselected visible macro must block selected-prelude exactness")]
     fn an_unselected_visible_macro_prevents_selected_prelude_exactness() {
         let prelude = macro_candidate("vec", "std", RustRouteProvenance::CurrentLibrary);
         let local = macro_candidate("vec", "consumer", RustRouteProvenance::Local);
@@ -3392,6 +3416,31 @@ mod unnamed_guard_tests {
         assert_eq!(
             seeds.resolve_macro_invocation_targets(&[prelude, local]),
             RustMacroInvocationResolution::Unresolved,
+        );
+    }
+
+    #[test]
+    fn a_selected_visible_macro_shadows_a_selected_prelude_macro() {
+        let mut prelude = macro_candidate("format", "std", RustRouteProvenance::CurrentLibrary);
+        prelude.route = RustMacroInvocationRoute::SelectedPrelude;
+        let mut local = macro_candidate("format", "consumer", RustRouteProvenance::Local);
+        local.route = RustMacroInvocationRoute::LocalModule {
+            scope: RustMacroScopeKey {
+                file: local.identity.file.clone(),
+                module: local.identity.module.clone(),
+            },
+        };
+        let mut seeds = empty_seeds();
+        seeds.root_origins.insert(prelude.identity.clone());
+        seeds.root_origins.insert(local.identity.clone());
+
+        assert_eq!(
+            seeds.resolve_macro_invocation_targets(&[prelude, local.clone()]),
+            RustMacroInvocationResolution::Exact(RustMacroInvocationTarget {
+                identity: local.identity,
+                route: local.route,
+                provenance: RustRouteProvenance::Local,
+            }),
         );
     }
 }

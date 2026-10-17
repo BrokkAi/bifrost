@@ -22,10 +22,10 @@ use brokk_bifrost_core::analyzer::resolution_facts::{
     ResolutionMemberOwnerFact, ResolutionMemberQualifierCompatibility, ResolutionNameId,
     ResolutionNamespace, ResolutionScopeFact, ResolutionScopeId, ResolutionScopeInheritance,
     ResolutionScopeKind, ResolutionSiteFact, ResolutionSiteId, ResolutionSiteKind,
-    ResolutionSupertypeFact, ResolutionSupertypeKind, ResolutionTypeComponentFact,
-    ResolutionTypeComponentKind, ResolutionTypeConstructorKind, ResolutionTypeSlotFact,
-    ResolutionTypeSlotId, ResolutionTypeSlotRole, ResolutionTypeTransferFact,
-    ResolutionTypeTransferKind, ResolutionTypeTransferValueTransform,
+    ResolutionSupertypeFact, ResolutionSupertypeKind, ResolutionTypeArgumentFact,
+    ResolutionTypeComponentFact, ResolutionTypeComponentKind, ResolutionTypeConstructorKind,
+    ResolutionTypeSlotFact, ResolutionTypeSlotId, ResolutionTypeSlotRole,
+    ResolutionTypeTransferFact, ResolutionTypeTransferKind, ResolutionTypeTransferValueTransform,
 };
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 
@@ -33,19 +33,26 @@ use crate::hash::{HashMap, HashSet};
 
 use super::common_fact_lowering::{LoweredDeferredMemberOwner, member_lookup_namespace};
 use super::fact_lowering::{
-    LoweringGapOrigin, definition_semantic, definition_semantic_identity, gap_reason_semantic,
-    gap_reason_semantic_identity, lookup_routes, lookup_semantic, mounted_site_semantic,
-    reference_node_identity, reference_semantic, reference_semantic_identity, scope_head_node,
-    scope_head_node_identity, site_type_frontier_semantic, site_type_frontier_semantic_identity,
-    type_slot_semantic, type_slot_semantic_identity,
+    LoweringGapOrigin, call_target_lookup_routes, definition_semantic,
+    definition_semantic_identity, gap_reason_semantic, gap_reason_semantic_identity, lookup_routes,
+    lookup_semantic, mounted_site_semantic, reference_node_identity, reference_semantic,
+    reference_semantic_identity, scope_head_node, scope_head_node_identity,
+    site_type_frontier_semantic, type_slot_semantic, type_slot_semantic_identity,
 };
+use super::fact_source::language_identity_domain;
+use super::fact_source::{JvmDeclarationAccessRules, language_jvm_declaration_access_rules};
 use super::local_identity::{ResolutionIdentityCatalogBuilder, ResolutionSemanticIdentity};
 use super::model::{
     BindingFragmentId, BindingNodeId, ResolutionCompletion, ResolutionIncompleteReason,
     ResolutionSlotValue, ResolutionTypeRef, SemanticId, TypeTransferRule,
     TypeTransferValueTransform, TypedFrontierState, clone_completion_with_poll,
 };
-use super::{binder_namespace_is_declared, never_cancelled};
+use super::{
+    binder_namespace_is_declared, binding_projection_kind_rank, declaration_type_role_rank,
+    never_cancelled, qualifier_compatibility_rank, required_resolution_name,
+    required_resolution_scope,
+};
+use super::{required_positioned_identifier, resolution_member_kind_rank as member_kind_rank};
 
 /// One source-slot association for an immutable copy rule.
 ///
@@ -59,6 +66,15 @@ pub struct LoweredTypeTransfer {
     source_slot: SemanticId,
     kind: ResolutionTypeTransferKind,
     rule: TypeTransferRule,
+}
+
+/// One value-producing constructor, evaluated only in the requesting query.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LoweredTypeProduction {
+    pub output: SemanticId,
+    pub element: SemanticId,
+    pub constructor: ResolutionTypeConstructorKind,
+    pub length: Option<String>,
 }
 
 /// One persisted structural type component edge. Both endpoints are blob
@@ -104,11 +120,197 @@ impl LoweredTypeComponent {
     }
 }
 
+/// One positional generic argument on a declared type slot. The query reads
+/// rows only for an owner slot reached by its current receiver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LoweredDeclaredTypeArgument {
+    owner: SemanticId,
+    position: u32,
+    argument: SemanticId,
+}
+
+impl LoweredDeclaredTypeArgument {
+    pub const fn new(owner: SemanticId, position: u32, argument: SemanticId) -> Self {
+        Self {
+            owner,
+            position,
+            argument,
+        }
+    }
+
+    pub const fn owner(&self) -> SemanticId {
+        self.owner
+    }
+
+    pub const fn position(&self) -> u32 {
+        self.position
+    }
+
+    pub const fn argument(&self) -> SemanticId {
+        self.argument
+    }
+}
+
+/// One ordered actual type argument for a generic application head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LoweredTypeArgument {
+    application: SemanticId,
+    ordinal: u32,
+    argument: SemanticId,
+    indirection_delta: i8,
+    reference_indirection_delta: i8,
+}
+
+impl LoweredTypeArgument {
+    pub const fn new(
+        application: SemanticId,
+        ordinal: u32,
+        argument: SemanticId,
+        indirection_delta: i8,
+        reference_indirection_delta: i8,
+    ) -> Self {
+        Self {
+            application,
+            ordinal,
+            argument,
+            indirection_delta,
+            reference_indirection_delta,
+        }
+    }
+
+    pub const fn application(&self) -> SemanticId {
+        self.application
+    }
+    pub const fn ordinal(&self) -> u32 {
+        self.ordinal
+    }
+    pub const fn argument(&self) -> SemanticId {
+        self.argument
+    }
+    pub const fn indirection_delta(&self) -> i8 {
+        self.indirection_delta
+    }
+    pub const fn reference_indirection_delta(&self) -> i8 {
+        self.reference_indirection_delta
+    }
+}
+
 /// The declared underlying syntax slot of one named type declaration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LoweredUnderlyingType {
     definition: SemanticId,
     slot: SemanticId,
+}
+
+/// One generic alias formal, its ordinal, and the alias's target type
+/// expression. The repeated target fields keep every alias-to-formal mapping
+/// available as relational rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LoweredGenericTypeAliasParameter {
+    alias: SemanticId,
+    ordinal: u32,
+    parameter: SemanticId,
+    target: SemanticId,
+    indirection_delta: i8,
+    reference_indirection_delta: i8,
+}
+
+/// One declaration's type-parameter identity and source position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LoweredGenericFormal {
+    owner: SemanticId,
+    ordinal: u32,
+    parameter: SemanticId,
+}
+
+impl LoweredGenericFormal {
+    pub const fn new(owner: SemanticId, ordinal: u32, parameter: SemanticId) -> Self {
+        Self {
+            owner,
+            ordinal,
+            parameter,
+        }
+    }
+
+    pub const fn owner(&self) -> SemanticId {
+        self.owner
+    }
+
+    pub const fn ordinal(&self) -> u32 {
+        self.ordinal
+    }
+
+    pub const fn parameter(&self) -> SemanticId {
+        self.parameter
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LoweredGenericFormalDefault {
+    owner: SemanticId,
+    ordinal: u32,
+    default: SemanticId,
+}
+
+impl LoweredGenericFormalDefault {
+    pub const fn new(owner: SemanticId, ordinal: u32, default: SemanticId) -> Self {
+        Self {
+            owner,
+            ordinal,
+            default,
+        }
+    }
+
+    pub const fn owner(&self) -> SemanticId {
+        self.owner
+    }
+
+    pub const fn ordinal(&self) -> u32 {
+        self.ordinal
+    }
+
+    pub const fn default(&self) -> SemanticId {
+        self.default
+    }
+}
+
+impl LoweredGenericTypeAliasParameter {
+    pub const fn new(
+        alias: SemanticId,
+        ordinal: u32,
+        parameter: SemanticId,
+        target: SemanticId,
+        indirection_delta: i8,
+        reference_indirection_delta: i8,
+    ) -> Self {
+        Self {
+            alias,
+            ordinal,
+            parameter,
+            target,
+            indirection_delta,
+            reference_indirection_delta,
+        }
+    }
+
+    pub const fn alias(&self) -> SemanticId {
+        self.alias
+    }
+    pub const fn ordinal(&self) -> u32 {
+        self.ordinal
+    }
+    pub const fn parameter(&self) -> SemanticId {
+        self.parameter
+    }
+    pub const fn target(&self) -> SemanticId {
+        self.target
+    }
+    pub const fn indirection_delta(&self) -> i8 {
+        self.indirection_delta
+    }
+    pub const fn reference_indirection_delta(&self) -> i8 {
+        self.reference_indirection_delta
+    }
 }
 
 impl LoweredUnderlyingType {
@@ -258,7 +460,8 @@ impl LoweredTypedFrontier {
 /// reference. The combined service may discharge `coarse_gap_reason` only
 /// when it consumes this row and explores the qualifier frontier, owner member
 /// scope, and exact effective lookup key. `precedence_ordinal` is the same
-/// TypeOrValue route ordering encoded by lexical lowering.
+/// namespace route ordering encoded by lexical lowering. Scala call targets
+/// put Callable before the Value and Type alternatives.
 /// `lookup` and `namespace` select typed members; `source_lookup` retains the
 /// lexical demand used by root routes and reexports before member selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -469,17 +672,82 @@ impl LoweredDeclarationVisibilityProperty {
 }
 
 /// The binding-node entry point for members declared by one type.
+/// Absence evidence belongs to each member namespace, not an owner as a whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ExternalMemberCoverage {
+    pub callables_complete: bool,
+    pub values_complete: bool,
+    pub types_complete: bool,
+    pub supertypes_complete: bool,
+}
+
+impl ExternalMemberCoverage {
+    pub fn covers(self, namespace: ResolutionNamespace) -> bool {
+        self.supertypes_complete
+            && match namespace {
+                ResolutionNamespace::Callable => self.callables_complete,
+                ResolutionNamespace::Value | ResolutionNamespace::Constant => self.values_complete,
+                ResolutionNamespace::Type => self.types_complete,
+                ResolutionNamespace::TypeOrValue => self.types_complete && self.values_complete,
+                _ => false,
+            }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LoweredMemberScopeProperty {
     definition: SemanticId,
-    scope_head: BindingNodeId,
+    scope_head: Option<BindingNodeId>,
+    external_coverage: Option<ExternalMemberCoverage>,
+    scope_kind: ResolutionScopeKind,
 }
 
 impl LoweredMemberScopeProperty {
     pub const fn new(definition: SemanticId, scope_head: BindingNodeId) -> Self {
+        Self::owned(definition, scope_head, ResolutionScopeKind::TypeBody)
+    }
+
+    pub const fn owned(
+        definition: SemanticId,
+        scope_head: BindingNodeId,
+        scope_kind: ResolutionScopeKind,
+    ) -> Self {
+        assert!(matches!(
+            scope_kind,
+            ResolutionScopeKind::TypeBody | ResolutionScopeKind::Executable
+        ));
         Self {
             definition,
-            scope_head,
+            scope_head: Some(scope_head),
+            external_coverage: None,
+            scope_kind,
+        }
+    }
+
+    pub const fn scope_kind(&self) -> ResolutionScopeKind {
+        self.scope_kind
+    }
+
+    pub const fn is_type_body(&self) -> bool {
+        matches!(self.scope_kind, ResolutionScopeKind::TypeBody)
+    }
+
+    pub const fn scope_kind_label(&self) -> &'static str {
+        match self.scope_kind {
+            ResolutionScopeKind::TypeBody => "type_body",
+            ResolutionScopeKind::Executable => "executable",
+            _ => panic!("only type bodies and executable scopes have published owners"),
+        }
+    }
+
+    pub fn with_scope_kind_label(self, label: &str) -> Self {
+        Self {
+            scope_kind: match label {
+                "type_body" => ResolutionScopeKind::TypeBody,
+                "executable" => ResolutionScopeKind::Executable,
+                _ => panic!("invalid published scope kind: {label}"),
+            },
+            ..self
         }
     }
 
@@ -488,6 +756,24 @@ impl LoweredMemberScopeProperty {
     }
 
     pub const fn scope_head(&self) -> BindingNodeId {
+        match self.scope_head {
+            Some(head) => head,
+            None => panic!("external owners have no source scope"),
+        }
+    }
+
+    pub const fn external(definition: SemanticId, coverage: ExternalMemberCoverage) -> Self {
+        Self {
+            definition,
+            scope_head: None,
+            external_coverage: Some(coverage),
+            scope_kind: ResolutionScopeKind::TypeBody,
+        }
+    }
+    pub const fn external_coverage(&self) -> Option<ExternalMemberCoverage> {
+        self.external_coverage
+    }
+    pub const fn source_scope_head(&self) -> Option<BindingNodeId> {
         self.scope_head
     }
 }
@@ -497,21 +783,25 @@ impl LoweredMemberScopeProperty {
 /// `owner_scope_head` repeats the selected owner's normalized member-scope
 /// entry point intentionally: a resolved member can seed the next qualified
 /// lookup without reconstructing a scope ID or reading source.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoweredMemberOwnerProperty {
     definition: SemanticId,
     owner_definition: SemanticId,
-    owner_scope_head: BindingNodeId,
+    owner_scope_head: Option<BindingNodeId>,
+    member_name: Box<str>,
     kind: ResolutionMemberKind,
     access: ResolutionMemberAccess,
     qualifier_compatibility: ResolutionMemberQualifierCompatibility,
+    external_lookup: Option<[SemanticId; 15]>,
+    external_visibility: Option<DeclaredVisibility>,
 }
 
 impl LoweredMemberOwnerProperty {
-    pub const fn new(
+    pub fn new(
         definition: SemanticId,
         owner_definition: SemanticId,
         owner_scope_head: BindingNodeId,
+        member_name: impl Into<Box<str>>,
         kind: ResolutionMemberKind,
         access: ResolutionMemberAccess,
         qualifier_compatibility: ResolutionMemberQualifierCompatibility,
@@ -519,10 +809,13 @@ impl LoweredMemberOwnerProperty {
         Self {
             definition,
             owner_definition,
-            owner_scope_head,
+            owner_scope_head: Some(owner_scope_head),
+            member_name: member_name.into(),
             kind,
             access,
             qualifier_compatibility,
+            external_lookup: None,
+            external_visibility: None,
         }
     }
 
@@ -534,8 +827,47 @@ impl LoweredMemberOwnerProperty {
         self.owner_definition
     }
 
+    pub fn member_name(&self) -> &str {
+        &self.member_name
+    }
+
     pub const fn owner_scope_head(&self) -> BindingNodeId {
+        match self.owner_scope_head {
+            Some(head) => head,
+            None => panic!("external members have no source scope"),
+        }
+    }
+    pub const fn source_owner_scope_head(&self) -> Option<BindingNodeId> {
         self.owner_scope_head
+    }
+    pub const fn external_lookup(&self) -> Option<[SemanticId; 15]> {
+        self.external_lookup
+    }
+    pub const fn external_visibility(&self) -> Option<DeclaredVisibility> {
+        self.external_visibility
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn external(
+        definition: SemanticId,
+        owner_definition: SemanticId,
+        member_name: impl Into<Box<str>>,
+        kind: ResolutionMemberKind,
+        access: ResolutionMemberAccess,
+        qualifier_compatibility: ResolutionMemberQualifierCompatibility,
+        lookup: [SemanticId; 15],
+        visibility: DeclaredVisibility,
+    ) -> Self {
+        Self {
+            definition,
+            owner_definition,
+            owner_scope_head: None,
+            member_name: member_name.into(),
+            kind,
+            access,
+            qualifier_compatibility,
+            external_lookup: Some(lookup),
+            external_visibility: Some(visibility),
+        }
     }
 
     pub const fn kind(&self) -> ResolutionMemberKind {
@@ -589,13 +921,23 @@ impl LoweredConstructionRequirementProperty {
     }
 }
 
-/// A declared hierarchy edge whose target remains an unresolved reference.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A hierarchy target is either a selected source reference or an external
+/// provider coordinate. The latter has no source-reference locator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoweredSupertypeTarget {
+    SelectedReference(SemanticId),
+    External(super::ExternalOwnerIdentity),
+}
+
+/// A declared hierarchy edge and its honest source or external target.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoweredSupertypeProperty {
     definition: SemanticId,
     reference: SemanticId,
     frontier: SemanticId,
-    kind: ResolutionSupertypeKind,
+    kind: Option<ResolutionSupertypeKind>,
+    parent_ordinal: u32,
+    target: LoweredSupertypeTarget,
 }
 
 impl LoweredSupertypeProperty {
@@ -604,13 +946,37 @@ impl LoweredSupertypeProperty {
         reference: SemanticId,
         frontier: SemanticId,
         kind: ResolutionSupertypeKind,
+        parent_ordinal: u32,
     ) -> Self {
         Self {
             definition,
             reference,
             frontier,
-            kind,
+            kind: Some(kind),
+            parent_ordinal,
+            target: LoweredSupertypeTarget::SelectedReference(reference),
         }
+    }
+
+    pub fn external(
+        definition: SemanticId,
+        reference: SemanticId,
+        frontier: SemanticId,
+        parent_ordinal: u32,
+        target: super::ExternalOwnerIdentity,
+    ) -> Self {
+        Self {
+            definition,
+            reference,
+            frontier,
+            kind: None,
+            parent_ordinal,
+            target: LoweredSupertypeTarget::External(target),
+        }
+    }
+
+    pub const fn target(&self) -> &LoweredSupertypeTarget {
+        &self.target
     }
 
     pub const fn definition(&self) -> SemanticId {
@@ -626,7 +992,17 @@ impl LoweredSupertypeProperty {
     }
 
     pub const fn kind(&self) -> ResolutionSupertypeKind {
+        match self.kind {
+            Some(kind) => kind,
+            None => panic!("external inventory does not fabricate a source edge kind"),
+        }
+    }
+    pub const fn source_kind(&self) -> Option<ResolutionSupertypeKind> {
         self.kind
+    }
+
+    pub const fn parent_ordinal(&self) -> u32 {
+        self.parent_ordinal
     }
 }
 
@@ -657,10 +1033,13 @@ pub struct LoweredDefinitionPropertyGap {
 pub struct LoweredCallApplicabilityObligation {
     call: SemanticId,
     callee_reference: SemanticId,
+    language: Language,
     receiver_slot: Option<SemanticId>,
     result_slot: SemanticId,
     extra_result_slots: Box<[SemanticId]>,
     argument_slots: Box<[SemanticId]>,
+    arguments: Box<[LoweredCallArgumentProperty]>,
+    argument_lists: Box<[u32]>,
     /// The explicit type arguments' value slots, in position order.
     type_argument_slots: Box<[SemanticId]>,
     /// The value slots of the type arguments written on the path's type
@@ -691,13 +1070,30 @@ impl LoweredCallApplicabilityObligation {
         applicability_reason: SemanticId,
         completion: ResolutionCompletion,
     ) -> Self {
+        let argument_slots = argument_slots.into();
+        let arguments = argument_slots
+            .iter()
+            .enumerate()
+            .map(|(ordinal, &slot)| {
+                LoweredCallArgumentProperty::new(
+                    0,
+                    u32::try_from(ordinal).expect("call argument count fits u32"),
+                    slot,
+                    None,
+                )
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         Self {
             call,
             callee_reference,
+            language: Language::None,
             receiver_slot,
             result_slot,
             extra_result_slots: Box::new([]),
-            argument_slots: argument_slots.into(),
+            argument_slots,
+            arguments,
+            argument_lists: Box::new([0]),
             type_argument_slots: Box::new([]),
             owner_type_argument_slots: Box::new([]),
             owner_type_segment: None,
@@ -707,6 +1103,60 @@ impl LoweredCallApplicabilityObligation {
             applicability_reason,
             completion,
         }
+    }
+
+    /// Replace the compatibility positional shape with the source call's
+    /// structured argument lists, labels, and call-site language.
+    pub fn with_argument_shape(
+        mut self,
+        language: Language,
+        arguments: impl Into<Box<[LoweredCallArgumentProperty]>>,
+        argument_lists: impl Into<Box<[u32]>>,
+    ) -> Self {
+        let mut arguments = arguments.into().into_vec();
+        let argument_lists = argument_lists.into();
+        arguments.sort_unstable_by_key(LoweredCallArgumentProperty::ordinal);
+        assert_eq!(
+            arguments.len(),
+            self.argument_slots.len(),
+            "structured call arguments match the compatibility slot sequence"
+        );
+        assert!(
+            arguments
+                .iter()
+                .zip(self.argument_slots.iter())
+                .all(|(argument, slot)| argument.slot() == *slot),
+            "structured call argument slots match the compatibility slot sequence"
+        );
+        assert!(
+            argument_lists
+                .iter()
+                .enumerate()
+                .all(|(expected, ordinal)| { usize::try_from(*ordinal).ok() == Some(expected) }),
+            "call argument-list ordinals are dense from zero: {argument_lists:?}"
+        );
+        assert!(
+            arguments
+                .iter()
+                .all(|argument| { argument_lists.contains(&argument.list_ordinal()) })
+        );
+        assert!(
+            arguments
+                .windows(2)
+                .all(|pair| pair[0].ordinal() < pair[1].ordinal()),
+            "call argument ordinals are unique and ordered"
+        );
+        self.language = language;
+        self.arguments = arguments.into_boxed_slice();
+        self.argument_lists = argument_lists;
+        self
+    }
+
+    /// Record the language when a persisted reader has only the positional
+    /// compatibility shape for this call.
+    pub fn with_language(mut self, language: Language) -> Self {
+        self.language = language;
+        self
     }
 
     /// This obligation with its explicit type arguments' value slots.
@@ -774,6 +1224,10 @@ impl LoweredCallApplicabilityObligation {
         self.callee_reference
     }
 
+    pub const fn language(&self) -> Language {
+        self.language
+    }
+
     pub const fn receiver_slot(&self) -> Option<SemanticId> {
         self.receiver_slot
     }
@@ -784,6 +1238,14 @@ impl LoweredCallApplicabilityObligation {
 
     pub fn argument_slots(&self) -> &[SemanticId] {
         &self.argument_slots
+    }
+
+    pub fn arguments(&self) -> &[LoweredCallArgumentProperty] {
+        &self.arguments
+    }
+
+    pub fn argument_lists(&self) -> &[u32] {
+        &self.argument_lists
     }
 
     pub fn eligible_rules(&self) -> &[ResolutionEngineRuleKind] {
@@ -800,6 +1262,43 @@ impl LoweredCallApplicabilityObligation {
 
     pub const fn completion(&self) -> &ResolutionCompletion {
         &self.completion
+    }
+}
+
+/// One source argument in its explicit call list, including a named label
+/// selected by the producer from the syntax tree.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LoweredCallArgumentProperty {
+    list_ordinal: u32,
+    ordinal: u32,
+    slot: SemanticId,
+    label: Option<Box<str>>,
+}
+
+impl LoweredCallArgumentProperty {
+    pub fn new(list_ordinal: u32, ordinal: u32, slot: SemanticId, label: Option<Box<str>>) -> Self {
+        Self {
+            list_ordinal,
+            ordinal,
+            slot,
+            label,
+        }
+    }
+
+    pub const fn list_ordinal(&self) -> u32 {
+        self.list_ordinal
+    }
+
+    pub const fn ordinal(&self) -> u32 {
+        self.ordinal
+    }
+
+    pub const fn slot(&self) -> SemanticId {
+        self.slot
+    }
+
+    pub fn label(&self) -> Option<&str> {
+        self.label.as_deref()
     }
 }
 
@@ -841,6 +1340,55 @@ impl LoweredCallableParameterProperty {
 
     pub const fn repeated(&self) -> bool {
         self.repeated
+    }
+}
+
+/// Source parameter metadata used when mapping one call shape to this
+/// signature. The label remains structured data produced by the frontend.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LoweredCallableParameterApplicability {
+    ordinal: u32,
+    list_ordinal: u32,
+    label: Option<Box<str>>,
+    has_default: bool,
+    semantics_known: bool,
+}
+
+impl LoweredCallableParameterApplicability {
+    pub fn new(
+        ordinal: u32,
+        list_ordinal: u32,
+        label: Option<Box<str>>,
+        has_default: bool,
+        semantics_known: bool,
+    ) -> Self {
+        Self {
+            ordinal,
+            list_ordinal,
+            label,
+            has_default,
+            semantics_known,
+        }
+    }
+
+    pub const fn ordinal(&self) -> u32 {
+        self.ordinal
+    }
+
+    pub const fn list_ordinal(&self) -> u32 {
+        self.list_ordinal
+    }
+
+    pub fn label(&self) -> Option<&str> {
+        self.label.as_deref()
+    }
+
+    pub const fn has_default(&self) -> bool {
+        self.has_default
+    }
+
+    pub const fn semantics_known(&self) -> bool {
+        self.semantics_known
     }
 }
 
@@ -886,6 +1434,10 @@ pub struct LoweredCallableSignatureProperty {
     definition: SemanticId,
     type_parameter_count: u32,
     parameters: Box<[LoweredCallableParameterProperty]>,
+    parameter_lists: Box<[u32]>,
+    contextual_parameter_lists: Box<[u32]>,
+    parameter_applicability: Box<[LoweredCallableParameterApplicability]>,
+    extension_receiver: Option<SemanticId>,
     result_types: Box<[LoweredCallableResultTypeProperty]>,
     /// The parameters whose arguments decide the result type, by ordinal.
     result_bindings: Box<[LoweredCallableResultBinding]>,
@@ -1016,6 +1568,9 @@ impl LoweredCallableSignatureProperty {
         bindings.sort_unstable_by_key(|binding| binding.ordinal);
         let result_type_parameter = self.result_type_parameter;
         let result_owner_type_parameter = self.result_owner_type_parameter;
+        let parameter_lists = self.parameter_lists.clone();
+        let parameter_applicability = self.parameter_applicability.clone();
+        let extension_receiver = self.extension_receiver;
         let Some(signature) = Self::from_canonical_parts_with_poll(
             self.definition,
             self.type_parameter_count,
@@ -1031,6 +1586,7 @@ impl LoweredCallableSignatureProperty {
         signature
             .with_result_type_parameter(result_type_parameter)
             .with_result_owner_type_parameter(result_owner_type_parameter)
+            .with_applicability_shape(parameter_lists, parameter_applicability, extension_receiver)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1048,6 +1604,8 @@ impl LoweredCallableSignatureProperty {
         P: FnMut() -> bool,
     {
         let mut parameter_definitions = HashSet::default();
+        // Repeated-last is checked on the source facts, before parameter-list
+        // boundaries are intentionally flattened out of this signature.
         for (expected, parameter) in parameters.iter().enumerate() {
             if cancelled() {
                 return None;
@@ -1062,13 +1620,6 @@ impl LoweredCallableSignatureProperty {
                 "callable {definition:?} repeats parameter definition {:?}",
                 parameter.definition
             );
-            if parameter.repeated {
-                assert_eq!(
-                    expected + 1,
-                    parameters.len(),
-                    "repeated parameter must be last in callable {definition:?}"
-                );
-            }
         }
         assert!(
             result_bindings
@@ -1094,6 +1645,22 @@ impl LoweredCallableSignatureProperty {
         Some(Self {
             definition,
             type_parameter_count,
+            parameter_lists: Box::new([0]),
+            contextual_parameter_lists: Box::default(),
+            parameter_applicability: parameters
+                .iter()
+                .map(|parameter| {
+                    LoweredCallableParameterApplicability::new(
+                        parameter.ordinal(),
+                        0,
+                        None,
+                        false,
+                        false,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            extension_receiver: None,
             parameters,
             result_types,
             result_bindings,
@@ -1139,6 +1706,12 @@ impl LoweredCallableSignatureProperty {
             signature
                 .with_result_type_parameter(self.result_type_parameter)
                 .with_result_owner_type_parameter(self.result_owner_type_parameter)
+                .with_applicability_shape(
+                    self.parameter_lists.clone(),
+                    self.parameter_applicability.clone(),
+                    self.extension_receiver,
+                )
+                .with_contextual_parameter_lists(self.contextual_parameter_lists.clone())
         })
     }
 
@@ -1152,6 +1725,70 @@ impl LoweredCallableSignatureProperty {
 
     pub fn parameters(&self) -> &[LoweredCallableParameterProperty] {
         &self.parameters
+    }
+
+    /// Explicit parameter-list ordinals, including empty lists.
+    pub fn parameter_lists(&self) -> &[u32] {
+        &self.parameter_lists
+    }
+
+    pub fn contextual_parameter_lists(&self) -> &[u32] {
+        &self.contextual_parameter_lists
+    }
+
+    /// Label and default facts in the same global ordinal order as
+    /// `parameters()`.
+    pub fn parameter_applicability(&self) -> &[LoweredCallableParameterApplicability] {
+        &self.parameter_applicability
+    }
+
+    pub const fn extension_receiver(&self) -> Option<SemanticId> {
+        self.extension_receiver
+    }
+
+    /// Attach source-owned list, label, default, and extension-receiver facts.
+    pub fn with_applicability_shape(
+        mut self,
+        parameter_lists: impl Into<Box<[u32]>>,
+        parameter_applicability: impl Into<Box<[LoweredCallableParameterApplicability]>>,
+        extension_receiver: Option<SemanticId>,
+    ) -> Self {
+        let parameter_lists = parameter_lists.into();
+        let mut parameter_applicability = parameter_applicability.into().into_vec();
+        parameter_applicability
+            .sort_unstable_by_key(LoweredCallableParameterApplicability::ordinal);
+        assert!(
+            parameter_lists
+                .iter()
+                .enumerate()
+                .all(|(expected, ordinal)| { usize::try_from(*ordinal).ok() == Some(expected) }),
+            "callable parameter-list ordinals are dense from zero: {parameter_lists:?}"
+        );
+        assert_eq!(
+            parameter_applicability.len(),
+            self.parameters.len(),
+            "each callable parameter has one applicability row"
+        );
+        for (parameter, applicability) in self.parameters.iter().zip(&parameter_applicability) {
+            assert_eq!(parameter.ordinal(), applicability.ordinal());
+            assert!(parameter_lists.contains(&applicability.list_ordinal()));
+        }
+        self.parameter_lists = parameter_lists;
+        self.parameter_applicability = parameter_applicability.into_boxed_slice();
+        self.extension_receiver = extension_receiver;
+        self
+    }
+
+    pub fn with_contextual_parameter_lists(mut self, lists: impl Into<Box<[u32]>>) -> Self {
+        let lists = lists.into();
+        assert!(lists.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(
+            lists
+                .iter()
+                .all(|ordinal| self.parameter_lists.contains(ordinal))
+        );
+        self.contextual_parameter_lists = lists;
+        self
     }
 
     pub fn result_bindings(&self) -> &[LoweredCallableResultBinding] {
@@ -1213,7 +1850,13 @@ pub struct LoweredTypedFragment {
     frontiers: Vec<LoweredTypedFrontier>,
     transfers: Vec<LoweredTypeTransfer>,
     type_components: Vec<LoweredTypeComponent>,
+    type_productions: Vec<LoweredTypeProduction>,
+    declared_type_arguments: Vec<LoweredDeclaredTypeArgument>,
+    type_arguments: Vec<LoweredTypeArgument>,
     underlying_types: Vec<LoweredUnderlyingType>,
+    generic_type_alias_parameters: Vec<LoweredGenericTypeAliasParameter>,
+    generic_formals: Vec<LoweredGenericFormal>,
+    generic_formal_defaults: Vec<LoweredGenericFormalDefault>,
     intrinsic_seeds: Vec<LoweredIntrinsicSeed>,
     projections: Vec<LoweredBindingProjection>,
     qualified_routes: Vec<LoweredQualifiedSeededRoute>,
@@ -1251,6 +1894,8 @@ impl LoweredTypedFragment {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
+            Vec::new(),
         )
     }
 
@@ -1262,7 +1907,16 @@ impl LoweredTypedFragment {
         self.frontiers.extend(added.frontiers);
         self.transfers.extend(added.transfers);
         self.type_components.extend(added.type_components);
+        self.type_productions.extend(added.type_productions);
+        self.declared_type_arguments
+            .extend(added.declared_type_arguments);
+        self.type_arguments.extend(added.type_arguments);
         self.underlying_types.extend(added.underlying_types);
+        self.generic_type_alias_parameters
+            .extend(added.generic_type_alias_parameters);
+        self.generic_formals.extend(added.generic_formals);
+        self.generic_formal_defaults
+            .extend(added.generic_formal_defaults);
         self.intrinsic_seeds.extend(added.intrinsic_seeds);
         self.projections.extend(added.projections);
         self.qualified_routes.extend(added.qualified_routes);
@@ -1285,7 +1939,9 @@ impl LoweredTypedFragment {
             std::mem::take(&mut self.frontiers),
             std::mem::take(&mut self.transfers),
             std::mem::take(&mut self.type_components),
+            std::mem::take(&mut self.type_arguments),
             std::mem::take(&mut self.underlying_types),
+            std::mem::take(&mut self.generic_type_alias_parameters),
             std::mem::take(&mut self.intrinsic_seeds),
             std::mem::take(&mut self.projections),
             std::mem::take(&mut self.qualified_routes),
@@ -1299,7 +1955,11 @@ impl LoweredTypedFragment {
             std::mem::take(&mut self.property_gaps),
             std::mem::take(&mut self.call_obligations),
             std::mem::take(&mut self.callable_signatures),
-        );
+        )
+        .with_type_productions(std::mem::take(&mut self.type_productions))
+        .with_declared_type_arguments(std::mem::take(&mut self.declared_type_arguments))
+        .with_generic_formal_defaults(std::mem::take(&mut self.generic_formal_defaults))
+        .with_generic_formals(std::mem::take(&mut self.generic_formals));
     }
 
     /// Rebuild one immutable typed fragment from normalized persisted rows.
@@ -1335,6 +1995,8 @@ impl LoweredTypedFragment {
             transfers,
             Vec::new(),
             Vec::new(),
+            Vec::new(),
+            Vec::new(),
             intrinsic_seeds,
             projections,
             qualified_routes,
@@ -1358,7 +2020,9 @@ impl LoweredTypedFragment {
         mut frontiers: Vec<LoweredTypedFrontier>,
         mut transfers: Vec<LoweredTypeTransfer>,
         mut type_components: Vec<LoweredTypeComponent>,
+        mut type_arguments: Vec<LoweredTypeArgument>,
         mut underlying_types: Vec<LoweredUnderlyingType>,
+        mut generic_type_alias_parameters: Vec<LoweredGenericTypeAliasParameter>,
         mut intrinsic_seeds: Vec<LoweredIntrinsicSeed>,
         mut projections: Vec<LoweredBindingProjection>,
         mut qualified_routes: Vec<LoweredQualifiedSeededRoute>,
@@ -1377,7 +2041,9 @@ impl LoweredTypedFragment {
         frontiers.sort_by_key(frontier_sort_key);
         transfers.sort_by_key(transfer_sort_key);
         type_components.sort_unstable();
+        type_arguments.sort_unstable();
         underlying_types.sort_unstable();
+        generic_type_alias_parameters.sort_unstable();
         intrinsic_seeds.sort_by_key(intrinsic_sort_key);
         projections.sort_by_key(projection_sort_key);
         qualified_routes.sort_by_key(qualified_route_sort_key);
@@ -1407,7 +2073,13 @@ impl LoweredTypedFragment {
             frontiers,
             transfers,
             type_components,
+            declared_type_arguments: Vec::new(),
+            type_productions: Vec::new(),
+            type_arguments,
             underlying_types,
+            generic_type_alias_parameters,
+            generic_formals: Vec::new(),
+            generic_formal_defaults: Vec::new(),
             intrinsic_seeds,
             projections,
             qualified_routes,
@@ -1424,6 +2096,114 @@ impl LoweredTypedFragment {
         };
         lowered.assert_normalized_graph();
         lowered
+    }
+
+    pub(crate) fn with_declared_type_arguments(
+        mut self,
+        mut arguments: Vec<LoweredDeclaredTypeArgument>,
+    ) -> Self {
+        arguments.sort_unstable();
+        let inventory = self
+            .frontiers
+            .iter()
+            .map(|frontier| (frontier.slot, frontier.role))
+            .collect::<HashMap<_, _>>();
+        let mut previous = None;
+        let mut expected_position = 0_u32;
+        let mut current_owner = None;
+        for argument in &arguments {
+            assert_eq!(
+                inventory.get(&argument.owner),
+                Some(&ResolutionTypeSlotRole::TargetTypeIdentity),
+                "a declared generic owner must have a target type-identity frontier"
+            );
+            assert_eq!(
+                inventory.get(&argument.argument),
+                Some(&ResolutionTypeSlotRole::TargetTypeIdentity),
+                "a declared generic argument must have a target type-identity frontier"
+            );
+            let key = (argument.owner, argument.position);
+            assert_ne!(
+                previous,
+                Some(key),
+                "one declared generic owner has one argument at each position"
+            );
+            if current_owner == Some(argument.owner()) {
+                assert_eq!(
+                    argument.position(),
+                    expected_position,
+                    "declared generic argument positions are dense from zero"
+                );
+            } else {
+                assert_eq!(
+                    argument.position(),
+                    0,
+                    "first declared type argument is position zero"
+                );
+                current_owner = Some(argument.owner());
+            }
+            expected_position = argument
+                .position()
+                .checked_add(1)
+                .expect("declared type argument position fits u32");
+            previous = Some(key);
+        }
+        self.declared_type_arguments = arguments;
+        self
+    }
+
+    pub(crate) fn with_generic_formal_defaults(
+        mut self,
+        mut rows: Vec<LoweredGenericFormalDefault>,
+    ) -> Self {
+        rows.sort_unstable();
+        assert!(
+            rows.windows(2)
+                .all(|pair| (pair[0].owner(), pair[0].ordinal())
+                    != (pair[1].owner(), pair[1].ordinal())),
+            "one generic_formal_defaults row per key and ordinal"
+        );
+        self.generic_formal_defaults = rows;
+        self
+    }
+
+    pub fn generic_formal_defaults(&self) -> &[LoweredGenericFormalDefault] {
+        &self.generic_formal_defaults
+    }
+
+    pub(crate) fn with_generic_formals(mut self, mut formals: Vec<LoweredGenericFormal>) -> Self {
+        formals.sort_unstable();
+        let mut previous = None;
+        let mut parameters = HashSet::default();
+        for formal in &formals {
+            let key = (formal.owner(), formal.ordinal());
+            assert_ne!(
+                previous,
+                Some(key),
+                "one generic owner has one formal per ordinal"
+            );
+            assert!(
+                parameters.insert(formal.parameter()),
+                "one declaration is one generic formal"
+            );
+            // Written applications skip lifetimes but reserve const positions.
+            // Producers may therefore publish sparse type-formal ordinals.
+            previous = Some(key);
+        }
+        self.generic_formals = formals;
+        let formal_definitions = self
+            .generic_formals
+            .iter()
+            .map(LoweredGenericFormal::parameter)
+            .collect::<HashSet<_>>();
+        assert!(
+            self.property_gaps
+                .iter()
+                .filter(|gap| gap.kind() == ResolutionGapKind::UnsupportedExpressionType)
+                .all(|gap| formal_definitions.contains(&gap.definition())),
+            "unsupported type property gaps must name a generic formal"
+        );
+        self
     }
 
     fn assert_normalized_graph(&self) {
@@ -1459,21 +2239,75 @@ impl LoweredTypedFragment {
                     "one structural type slot has one constructor kind"
                 );
             }
-            assert!(
-                component_kinds_by_container.insert((component.container, component.kind)),
-                "one structural type slot has one component of each kind"
-            );
-            assert!(matches!(
-                (component.constructor, component.kind),
+            match (component.constructor, component.kind) {
                 (
                     ResolutionTypeConstructorKind::Sequence
-                        | ResolutionTypeConstructorKind::Channel,
-                    ResolutionTypeComponentKind::Element
-                ) | (
-                    ResolutionTypeConstructorKind::Map,
-                    ResolutionTypeComponentKind::Key | ResolutionTypeComponentKind::Value
+                    | ResolutionTypeConstructorKind::Slice
+                    | ResolutionTypeConstructorKind::Array
+                    | ResolutionTypeConstructorKind::Channel,
+                    ResolutionTypeComponentKind::Element,
                 )
-            ));
+                | (
+                    ResolutionTypeConstructorKind::Map,
+                    ResolutionTypeComponentKind::Key | ResolutionTypeComponentKind::Value,
+                ) => {
+                    assert!(
+                        component_kinds_by_container.insert((component.container, component.kind))
+                    );
+                }
+                invalid => panic!("invalid type component shape: {invalid:?}"),
+            }
+        }
+        let mut type_arguments_by_application = HashMap::<SemanticId, Vec<u32>>::default();
+        for argument in &self.type_arguments {
+            assert_eq!(
+                inventory.get(&argument.application),
+                Some(&ResolutionTypeSlotRole::TargetTypeIdentity),
+                "a generic application must have a target type-identity frontier"
+            );
+            assert_eq!(
+                inventory.get(&argument.argument),
+                Some(&ResolutionTypeSlotRole::TargetTypeIdentity),
+                "a generic type argument must have a target type-identity frontier"
+            );
+            type_arguments_by_application
+                .entry(argument.application)
+                .or_default()
+                .push(argument.ordinal);
+        }
+        for ordinals in type_arguments_by_application.values_mut() {
+            ordinals.sort_unstable();
+            assert_eq!(
+                ordinals.iter().copied().collect::<HashSet<_>>().len(),
+                ordinals.len(),
+                "one type argument per generic application ordinal is required"
+            );
+            // Unsupported arguments leave positional holes. Keeping later
+            // source ordinals prevents them from binding to the wrong formal.
+        }
+        let mut alias_parameters_by_alias = HashMap::<SemanticId, Vec<u32>>::default();
+        for parameter in &self.generic_type_alias_parameters {
+            assert_eq!(
+                inventory.get(&parameter.target),
+                Some(&ResolutionTypeSlotRole::TargetTypeIdentity),
+                "a generic alias target must have a target type-identity frontier"
+            );
+            alias_parameters_by_alias
+                .entry(parameter.alias)
+                .or_default()
+                .push(parameter.ordinal);
+        }
+        for ordinals in alias_parameters_by_alias.values_mut() {
+            ordinals.sort_unstable();
+            assert_eq!(
+                ordinals.iter().copied().collect::<HashSet<_>>().len(),
+                ordinals.len(),
+                "one generic alias formal per ordinal is required"
+            );
+            assert!(
+                ordinals.iter().copied().eq(0..ordinals.len() as u32),
+                "generic alias formals must have contiguous type ordinals: {ordinals:?}"
+            );
         }
         assert!(
             self.underlying_types
@@ -1563,6 +2397,23 @@ impl LoweredTypedFragment {
                     ),
                     "initialization transfer input must retain the initializer's produced value"
                 ),
+                ResolutionTypeTransferKind::Contextual => assert!(
+                    matches!(
+                        source_role,
+                        ResolutionTypeSlotRole::DeclaredValue
+                            | ResolutionTypeSlotRole::ExpressionValue
+                            | ResolutionTypeSlotRole::CallResult
+                    ),
+                    "contextual type transfer input must retain a proven surrounding value type"
+                ),
+                ResolutionTypeTransferKind::ExpressionResult => assert!(
+                    matches!(
+                        source_role,
+                        ResolutionTypeSlotRole::ExpressionValue
+                            | ResolutionTypeSlotRole::CallResult
+                    ),
+                    "expression-result transfer input must retain an operand value type"
+                ),
                 ResolutionTypeTransferKind::ComponentElement
                 | ResolutionTypeTransferKind::ComponentKey
                 | ResolutionTypeTransferKind::ComponentValue => assert!(
@@ -1649,8 +2500,9 @@ impl LoweredTypedFragment {
                         transfer.rule.value_transform(),
                         TypeTransferValueTransform::Preserve
                             | TypeTransferValueTransform::AddressableRuntimeOnly
+                            | TypeTransferValueTransform::ToRuntime { addressable: false }
                     ),
-                    "initialization must preserve runtime category or admit an addressable runtime value"
+                    "initialization must preserve runtime category, admit an addressable runtime value, or default an untyped value"
                 );
             }
             if transfer.kind == ResolutionTypeTransferKind::Unwrap {
@@ -1728,7 +2580,7 @@ impl LoweredTypedFragment {
                 "qualified route must name its exact binding projection"
             );
         }
-        assert_source_lowerable_qualified_routes(&self.qualified_routes);
+        assert_source_lowerable_qualified_routes(&self.qualified_routes, self.language);
 
         for property in &self.declaration_types {
             let role =
@@ -1780,6 +2632,7 @@ impl LoweredTypedFragment {
             let type_definitions = self
                 .member_scopes
                 .iter()
+                .filter(|property| property.is_type_body())
                 .map(|property| property.definition)
                 .collect::<HashSet<_>>();
             let visibility_definitions = declaration_visibilities
@@ -1821,7 +2674,8 @@ impl LoweredTypedFragment {
                         | ResolutionGapKind::UnsupportedVisibility
                         | ResolutionGapKind::UnexpandedItemMacro
                         | ResolutionGapKind::UnexpandedImplMacro
-                ),
+                        | ResolutionGapKind::GeneratedItemSurface
+                ) || gap.kind == ResolutionGapKind::UnsupportedExpressionType,
                 "definition property gap kind is not source-lowerable"
             );
             // "only a synthetic site property gap may omit a typed-frontier
@@ -1880,17 +2734,43 @@ impl LoweredTypedFragment {
                 .map(|gap| (gap.source_site, gap.reason_semantic))
                 .collect::<HashSet<_>>();
             // Java's scoped Unknown visibility (local and anonymous types)
-            // is decided by lexical scope and carries no gap; every other
-            // non-public visibility, in any language, carries exactly one.
+            // and Kotlin's file-private visibility can be decided by lexical
+            // scope. A private nested Kotlin type may have no member-owner
+            // row, so the typed fragment cannot distinguish it from a
+            // top-level private declaration here; the producer makes that
+            // distinction from its exact scope.
+            let file_private_kotlin = self.language == Language::Kotlin
+                && property.visibility == DeclaredVisibility::Private
+                && !self
+                    .member_owners
+                    .iter()
+                    .any(|owner| owner.definition() == property.definition);
+            let contextual_jvm_visibility = language_jvm_declaration_access_rules(self.language)
+                .is_some_and(JvmDeclarationAccessRules::contextual_visibility_without_gap)
+                && matches!(
+                    property.visibility,
+                    DeclaredVisibility::Private | DeclaredVisibility::Protected
+                );
             let requires_gap = match property.visibility {
                 DeclaredVisibility::Public => false,
                 DeclaredVisibility::Unknown => self.language != Language::Java,
+                DeclaredVisibility::Private if file_private_kotlin => false,
+                DeclaredVisibility::Private | DeclaredVisibility::Protected
+                    if contextual_jvm_visibility =>
+                {
+                    false
+                }
                 _ => true,
             };
-            assert_eq!(
-                gap_sources.len(),
-                usize::from(requires_gap),
-                "non-public declaration requires one exact visibility gap provenance, except Java's scoped unknown visibility"
+            let valid_gap_count = if file_private_kotlin {
+                gap_sources.len() <= 1
+            } else {
+                gap_sources.len() == usize::from(requires_gap)
+            };
+            assert!(
+                valid_gap_count,
+                "restricted declaration requires exact visibility gap provenance unless its lexical or file scope decides access: visibility={:?}, gaps={gap_sources:?}",
+                property.visibility
             );
         }
         for obligation in &self.call_obligations {
@@ -1944,8 +2824,12 @@ impl LoweredTypedFragment {
                 );
             }
             assert!(
-                projection_outputs.contains(&(obligation.callee_reference, obligation.result_slot)),
-                "call applicability obligation requires its result binding projection"
+                projection_outputs.contains(&(obligation.callee_reference, obligation.result_slot))
+                    || self
+                        .transfers
+                        .iter()
+                        .any(|transfer| { transfer.rule.target_slot() == obligation.result_slot }),
+                "call applicability obligation requires its result producer"
             );
             assert!(
                 obligation.completion.contains_reason(
@@ -1995,11 +2879,12 @@ impl LoweredTypedFragment {
         let member_scopes = self
             .member_scopes
             .iter()
-            .map(|property| (property.definition, property.scope_head))
+            .filter(|property| property.is_type_body())
+            .map(|property| (property.definition, property.scope_head()))
             .collect::<HashSet<_>>();
         for owner in &self.member_owners {
             assert!(
-                member_scopes.contains(&(owner.owner_definition, owner.owner_scope_head)),
+                member_scopes.contains(&(owner.owner_definition, owner.owner_scope_head())),
                 "member owner must name its declaring type's exact member scope"
             );
         }
@@ -2050,8 +2935,63 @@ impl LoweredTypedFragment {
         &self.transfers
     }
 
+    pub fn type_productions(&self) -> &[LoweredTypeProduction] {
+        &self.type_productions
+    }
+
+    pub fn with_type_productions(mut self, mut rows: Vec<LoweredTypeProduction>) -> Self {
+        rows.sort_unstable();
+        for row in &rows {
+            assert!(matches!(
+                row.constructor,
+                ResolutionTypeConstructorKind::Slice | ResolutionTypeConstructorKind::Array
+            ));
+            assert_eq!(
+                row.length.is_some(),
+                row.constructor == ResolutionTypeConstructorKind::Array
+            );
+            assert!(
+                self.frontiers
+                    .iter()
+                    .any(|frontier| frontier.slot() == row.output
+                        && frontier.role() == ResolutionTypeSlotRole::TargetTypeIdentity)
+            );
+            assert!(
+                self.frontiers
+                    .iter()
+                    .any(|frontier| frontier.slot() == row.element
+                        && frontier.role() == ResolutionTypeSlotRole::TargetTypeIdentity)
+            );
+            assert!(
+                !self
+                    .intrinsic_seeds
+                    .iter()
+                    .any(|seed| seed.frontier().slot() == row.output)
+            );
+        }
+        assert!(rows.windows(2).all(|pair| pair[0].output != pair[1].output));
+        self.type_productions = rows;
+        self
+    }
+
     pub fn type_components(&self) -> &[LoweredTypeComponent] {
         &self.type_components
+    }
+
+    pub fn declared_type_arguments(&self) -> &[LoweredDeclaredTypeArgument] {
+        &self.declared_type_arguments
+    }
+
+    pub fn type_arguments(&self) -> &[LoweredTypeArgument] {
+        &self.type_arguments
+    }
+
+    pub fn generic_type_alias_parameters(&self) -> &[LoweredGenericTypeAliasParameter] {
+        &self.generic_type_alias_parameters
+    }
+
+    pub fn generic_formals(&self) -> &[LoweredGenericFormal] {
+        &self.generic_formals
     }
 
     pub fn underlying_types(&self) -> &[LoweredUnderlyingType] {
@@ -2120,12 +3060,31 @@ struct LoweredDefinitionProperties {
     property_gaps: Vec<LoweredDefinitionPropertyGap>,
 }
 
-/// Lower the typed relations of one immutable file-local fact set.
-///
-/// The operation does not inspect source and cannot choose a cross-file
-/// target. It validates the dense fact graph first, then derives every output
-/// identity solely from the fragment and stable source IDs. Output vectors are
-/// canonical under arbitrary input-row permutation.
+/// Group rows by site and require their ordinals to be contiguous from zero.
+fn group_by_site_and_ordinal<T>(
+    rows: impl IntoIterator<Item = T>,
+    site: impl Fn(&T) -> ResolutionSiteId,
+    ordinal: impl Fn(&T) -> u32,
+    group_name: &str,
+    row_name: &str,
+) -> HashMap<ResolutionSiteId, Vec<T>> {
+    let mut by_site = HashMap::<_, Vec<_>>::default();
+    for row in rows {
+        by_site.entry(site(&row)).or_default().push(row);
+    }
+    for (&site, rows) in &mut by_site {
+        rows.sort_unstable_by_key(|row| ordinal(row));
+        for (expected, row) in rows.iter().enumerate() {
+            assert_eq!(
+                usize::try_from(ordinal(row)).expect("u32 ordinal fits usize"),
+                expected,
+                "{group_name} {site} {row_name} ordinals must be contiguous from zero"
+            );
+        }
+    }
+    by_site
+}
+
 /// One call family's type arguments grouped by call, in position order. Each
 /// slot is a DeclaredValue slot at its call, and the positions of one call
 /// are contiguous from zero.
@@ -2133,29 +3092,29 @@ fn call_type_arguments_by_call(
     arguments: &[ResolutionCallTypeArgumentFact],
     index: &TypedFactIndex<'_>,
 ) -> HashMap<ResolutionSiteId, Vec<ResolutionCallTypeArgumentFact>> {
-    let mut by_call = HashMap::<_, Vec<_>>::default();
-    for argument in arguments {
-        let value = index.slot(argument.value);
-        assert_eq!(
-            value.site, argument.call,
-            "a call type argument slot is its call's"
-        );
-        assert_eq!(value.role, ResolutionTypeSlotRole::DeclaredValue);
-        by_call.entry(argument.call).or_default().push(*argument);
-    }
-    for (call, arguments) in &mut by_call {
-        arguments.sort_unstable_by_key(|argument| argument.ordinal);
-        for (expected, argument) in arguments.iter().enumerate() {
+    group_by_site_and_ordinal(
+        arguments.iter().map(|argument| {
+            let value = index.slot(argument.value);
             assert_eq!(
-                usize::try_from(argument.ordinal).expect("u32 ordinal fits usize"),
-                expected,
-                "call {call} type argument ordinals must be contiguous from zero"
+                value.site, argument.call,
+                "a call type argument slot is its call's"
             );
-        }
-    }
-    by_call
+            assert_eq!(value.role, ResolutionTypeSlotRole::DeclaredValue);
+            *argument
+        }),
+        |argument| argument.call,
+        |argument| argument.ordinal,
+        "call",
+        "type argument",
+    )
 }
 
+/// Lower the typed relations of one immutable file-local fact set.
+///
+/// The operation does not inspect source and cannot choose a cross-file
+/// target. It validates the dense fact graph first, then derives every output
+/// identity solely from the fragment and stable source IDs. Output vectors are
+/// canonical under arbitrary input-row permutation.
 pub(super) fn lower_typed_resolution_facts_with_identities(
     identities: &mut ResolutionIdentityCatalogBuilder,
     language: Language,
@@ -2185,6 +3144,22 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
                 assert_eq!(identifier.role, ResolutionIdentifierRole::Reference);
                 call.callee
             })
+        })
+        .collect::<HashSet<_>>();
+    let generic_callable_owners = facts
+        .generic_formals
+        .iter()
+        .map(|formal| formal.owner)
+        .collect::<HashSet<_>>();
+    let generic_callable_result_slots = facts
+        .callable_signatures
+        .iter()
+        .filter(|signature| generic_callable_owners.contains(&signature.callable))
+        .flat_map(|signature| {
+            signature
+                .result_types
+                .iter()
+                .map(|result| result.value_type)
         })
         .collect::<HashSet<_>>();
     let projected_outputs = facts
@@ -2238,6 +3213,113 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
             )
         })
         .collect::<Vec<_>>();
+    let declared_type_arguments = facts
+        .declared_type_arguments
+        .iter()
+        .map(|fact| {
+            let owner = index.slot(fact.owner);
+            let argument = index.slot(fact.argument);
+            assert_eq!(owner.role, ResolutionTypeSlotRole::TargetTypeIdentity);
+            assert_eq!(argument.role, ResolutionTypeSlotRole::TargetTypeIdentity);
+            LoweredDeclaredTypeArgument::new(
+                identities.semantic(type_slot_semantic_identity(fact.owner)),
+                fact.ordinal,
+                identities.semantic(type_slot_semantic_identity(fact.argument)),
+            )
+        })
+        .collect::<Vec<_>>();
+    let type_arguments = facts
+        .type_arguments
+        .iter()
+        .map(|fact| {
+            let application = index.slot(fact.application);
+            let argument = index.slot(fact.argument);
+            assert_eq!(application.role, ResolutionTypeSlotRole::TargetTypeIdentity);
+            assert_eq!(argument.role, ResolutionTypeSlotRole::TargetTypeIdentity);
+            LoweredTypeArgument::new(
+                identities.semantic(type_slot_semantic_identity(fact.application)),
+                fact.ordinal,
+                identities.semantic(type_slot_semantic_identity(fact.argument)),
+                fact.indirection_delta,
+                fact.reference_indirection_delta,
+            )
+        })
+        .collect::<Vec<_>>();
+    let generic_type_alias_parameters = facts
+        .generic_type_alias_parameters
+        .iter()
+        .map(|fact| {
+            let alias = index.site(fact.alias);
+            assert_eq!(alias.kind, ResolutionSiteKind::TypeAliasDeclaration);
+            assert_eq!(
+                index.definition_identifier(fact.alias).namespace,
+                ResolutionNamespace::Type
+            );
+            assert_eq!(
+                index.definition_identifier(fact.parameter).namespace,
+                ResolutionNamespace::Type
+            );
+            let target = index.slot(fact.target);
+            assert_eq!(target.role, ResolutionTypeSlotRole::TargetTypeIdentity);
+            LoweredGenericTypeAliasParameter::new(
+                identities.source_definition_semantic(fact.alias),
+                fact.ordinal,
+                identities.source_definition_semantic(fact.parameter),
+                identities.semantic(type_slot_semantic_identity(fact.target)),
+                fact.indirection_delta,
+                fact.reference_indirection_delta,
+            )
+        })
+        .collect::<Vec<_>>();
+    let generic_formals = facts
+        .generic_formals
+        .iter()
+        .map(|fact| {
+            let owner = index.site(fact.owner);
+            assert!(matches!(
+                owner.kind,
+                ResolutionSiteKind::TypeDeclaration
+                    | ResolutionSiteKind::TypeAliasDeclaration
+                    | ResolutionSiteKind::CallableDeclaration
+            ));
+            assert!(matches!(
+                index.definition_identifier(fact.owner).namespace,
+                ResolutionNamespace::Type | ResolutionNamespace::Callable
+            ));
+            assert_eq!(
+                index.site(fact.parameter).kind,
+                ResolutionSiteKind::TypeDeclaration
+            );
+            assert_eq!(
+                index.definition_identifier(fact.parameter).namespace,
+                ResolutionNamespace::Type
+            );
+            LoweredGenericFormal::new(
+                identities.source_definition_semantic(fact.owner),
+                fact.ordinal,
+                identities.source_definition_semantic(fact.parameter),
+            )
+        })
+        .collect::<Vec<_>>();
+    let generic_formal_defaults = facts
+        .generic_formal_defaults
+        .iter()
+        .map(|fact| {
+            assert!(
+                facts
+                    .generic_formals
+                    .iter()
+                    .any(|formal| formal.owner == fact.owner && formal.ordinal == fact.ordinal)
+            );
+            assert_eq!(facts.type_slots[fact.default.index()].id, fact.default);
+            LoweredGenericFormalDefault::new(
+                identities.source_definition_semantic(fact.owner),
+                fact.ordinal,
+                identities.semantic(type_slot_semantic_identity(fact.default)),
+            )
+        })
+        .collect();
+
     let mut underlying_types = Vec::new();
     for relation in facts
         .declared_type_relations
@@ -2278,6 +3360,10 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
         // evidence. Input-frontier uncertainty still propagates normally.
         let callee_sites = &callee_sites;
         let argument_independent_calls = &argument_independent_calls;
+        let generic_callable_result_slots = &generic_callable_result_slots;
+        let generic_callable_result = language == Language::Go
+            && fact.kind == ResolutionTypeTransferKind::DeclaredType
+            && generic_callable_result_slots.contains(&fact.output);
         let completion = completion_for_gaps(
             identities,
             [input.site, output.site].into_iter().flat_map(|site| {
@@ -2290,8 +3376,9 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
                             && (callee_sites.contains(&site)
                                 || (fact.kind == ResolutionTypeTransferKind::Receiver
                                     && site == output.site
-                                    && argument_independent_calls.contains(&site)))))
-                        .then_some((site, kind))
+                                    && argument_independent_calls.contains(&site))
+                                || (generic_callable_result && site == output.site))))
+                            .then_some((site, kind))
                     })
             }),
         );
@@ -2343,7 +3430,7 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
                 )),
             ),
         };
-        let mut completion = completion_for_sites(identities, &gaps_by_site, [output.site]);
+        let mut completion = completion_for_site_iter(identities, &gaps_by_site, [output.site]);
         if let Some(reason) = unsupported_role {
             completion = completion.combine(&ResolutionCompletion::incomplete([reason]));
         }
@@ -2386,9 +3473,20 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
     // instead. Splitting them here is what lets one producer fact carry both.
     let mut eligible_rules_by_call = HashMap::<_, Vec<_>>::default();
     let mut open_member_surfaces = HashSet::default();
+    let mut closed_macro_member_surfaces = HashSet::default();
     for eligibility in &facts.engine_rule_eligibilities {
         if eligibility.rule == ResolutionEngineRuleKind::OpenMemberSurface {
             open_member_surfaces.insert(eligibility.site);
+            continue;
+        }
+        if eligibility.rule == ResolutionEngineRuleKind::ClosedMacroMemberSurface {
+            assert!(
+                gaps_by_site.get(&eligibility.site).is_some_and(|kinds| {
+                    kinds.contains(&ResolutionGapKind::UnexpandedItemMacro)
+                }),
+                "a closed macro member surface must name an unexpanded item invocation"
+            );
+            closed_macro_member_surfaces.insert(eligibility.site);
             continue;
         }
         eligible_rules_by_call
@@ -2397,29 +3495,8 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
             .push(eligibility.rule);
     }
 
-    let go_root_type_or_value_sites = if language == Language::Go {
-        facts
-            .root_references
-            .iter()
-            .filter_map(|reference| {
-                index
-                    .identifiers
-                    .get(&reference.reference)
-                    .filter(|identifier| identifier.namespace == ResolutionNamespace::TypeOrValue)
-                    .map(|_| reference.reference)
-            })
-            .collect::<HashSet<_>>()
-    } else {
-        HashSet::default()
-    };
     let mut qualified_routes = Vec::new();
     for identifier in index.identifiers.values() {
-        if go_root_type_or_value_sites.contains(&identifier.site) {
-            // An ambiguous Go package-qualified terminal is resolved by its
-            // root route. Its receiver slot names the package qualifier, not
-            // a runtime or type value for the ordinary member evaluator.
-            continue;
-        }
         let Some(qualifier) = identifier.qualifier else {
             continue;
         };
@@ -2435,16 +3512,21 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
                 identifier.site,
                 LoweringGapOrigin::QualifiedReference,
             ));
-            let route_namespace =
-                if projection.kind == BindingProjectionKind::TargetCallableResultType {
-                    ResolutionNamespace::Callable
-                } else {
-                    identifier.namespace
-                };
+            let route_namespace = if projection.kind.is_callable_result() {
+                ResolutionNamespace::Callable
+            } else {
+                identifier.namespace
+            };
+            let call_target_routes =
+                call_target_lookup_routes(language, callee_sites.contains(&identifier.site));
             // Rust associated functions inhabit the value namespace even when
             // used without a call. Keep the ordinary value route for constants
             // and constructors; a callable alternative admits method items.
-            let member_routes = if language == Language::Rust
+            let member_routes = if let Some(call_routes) = call_target_routes
+                && projection.kind == BindingProjectionKind::TargetCallableResultType
+            {
+                call_routes
+            } else if language == Language::Rust
                 && route_namespace == ResolutionNamespace::Value
                 && projection.kind == BindingProjectionKind::TargetDeclaredValueType
             {
@@ -2452,8 +3534,20 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
             } else {
                 lookup_routes(route_namespace)
             };
-            for &(precedence_ordinal, namespace) in member_routes {
-                let source_namespace = if identifier.namespace == ResolutionNamespace::TypeOrValue {
+            let identity_domain = language_identity_domain(language);
+            for (route_index, &(rank, namespace)) in member_routes.iter().enumerate() {
+                // Stored route ordinals are identities, unique per output.
+                // A language can give several routes the same selection rank.
+                let precedence_ordinal = if call_target_routes.is_some()
+                    && projection.kind == BindingProjectionKind::TargetCallableResultType
+                {
+                    u32::try_from(route_index).expect("callee route ordinal fits u32")
+                } else {
+                    rank
+                };
+                let source_namespace = if identifier.namespace == ResolutionNamespace::TypeOrValue
+                    || (call_target_routes.is_some() && namespace != ResolutionNamespace::Callable)
+                {
                     namespace
                 } else {
                     identifier.namespace
@@ -2461,10 +3555,14 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
                 qualified_routes.push(LoweredQualifiedSeededRoute::new_with_source_lookup(
                     reference,
                     identities.semantic(type_slot_semantic_identity(qualifier)),
-                    identities.lookup_semantic(language, namespace, index.name(identifier.name)),
+                    identities.lookup_semantic_in_domain(
+                        identity_domain,
+                        namespace,
+                        index.name(identifier.name),
+                    ),
                     namespace,
-                    identities.lookup_semantic(
-                        language,
+                    identities.lookup_semantic_in_domain(
+                        identity_domain,
                         source_namespace,
                         index.name(identifier.name),
                     ),
@@ -2501,8 +3599,14 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
     let member_scopes = lower_member_scope_properties(identities, &index);
     let deferred_member_owners =
         lower_deferred_member_owner_properties(identities, language, facts, &index);
-    let definition_properties =
-        lower_definition_properties_with_index(identities, language, facts, &index, &member_scopes);
+    let definition_properties = lower_definition_properties_with_index(
+        identities,
+        language,
+        facts,
+        &index,
+        &member_scopes,
+        &closed_macro_member_surfaces,
+    );
     let LoweredDefinitionProperties {
         declaration_visibilities,
         member_owners,
@@ -2512,6 +3616,29 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
     } = definition_properties;
 
     let arguments_by_call = normalized_call_arguments(facts, &index);
+    let mut argument_lists_by_call = HashMap::<ResolutionSiteId, Vec<u32>>::default();
+    for list in &facts.call_argument_lists {
+        argument_lists_by_call
+            .entry(list.call)
+            .or_default()
+            .push(list.list_ordinal);
+    }
+    for (&call, arguments) in &arguments_by_call {
+        let lists = argument_lists_by_call.entry(call).or_default();
+        lists.extend(arguments.iter().map(|argument| argument.list_ordinal));
+    }
+    if language != Language::Scala {
+        for call in &facts.calls {
+            let lists = argument_lists_by_call.entry(call.call).or_default();
+            if lists.is_empty() {
+                lists.push(0);
+            }
+        }
+    }
+    for lists in argument_lists_by_call.values_mut() {
+        lists.sort_unstable();
+        lists.dedup();
+    }
     let mut type_arguments_by_call =
         call_type_arguments_by_call(&facts.call_type_arguments, &index);
     let mut owner_type_arguments_by_call =
@@ -2551,6 +3678,7 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
     let mut call_obligations = Vec::with_capacity(facts.calls.len());
     for call in &facts.calls {
         let Some(callee_identifier) = index.identifiers.get(&call.callee).copied() else {
+            argument_lists_by_call.remove(&call.call);
             assert!(
                 gaps_by_site.contains_key(&call.callee),
                 "call without a reference callee requires explicit extracted gap evidence: {call:?}"
@@ -2567,6 +3695,19 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
             .get(&call.call)
             .map(Vec::as_slice)
             .unwrap_or_default();
+        let structured_arguments = arguments
+            .iter()
+            .map(|argument| {
+                LoweredCallArgumentProperty::new(
+                    argument.list_ordinal,
+                    argument.ordinal,
+                    identities.semantic(type_slot_semantic_identity(argument.value)),
+                    argument
+                        .label
+                        .map(|label| index.name(label).to_owned().into_boxed_str()),
+                )
+            })
+            .collect::<Vec<_>>();
         let argument_slots = arguments
             .iter()
             .map(|argument| identities.semantic(type_slot_semantic_identity(argument.value)))
@@ -2624,9 +3765,17 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
             .with_extra_result_slots(extra_result_slots)
             .with_type_argument_slots(type_argument_slots)
             .with_owner_type_arguments(owner_type_segment, owner_type_argument_slots)
-            .with_expected_result_slot(expected_result_slot),
+            .with_expected_result_slot(expected_result_slot)
+            .with_argument_shape(
+                language,
+                structured_arguments,
+                argument_lists_by_call
+                    .remove(&call.call)
+                    .unwrap_or_default(),
+            ),
         );
     }
+    assert!(argument_lists_by_call.is_empty());
     assert!(
         type_arguments_by_call.is_empty()
             && owner_type_arguments_by_call.is_empty()
@@ -2642,6 +3791,72 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
     );
 
     let parameters_by_callable = normalized_callable_parameters(facts, &index);
+    let mut parameter_lists_by_callable = HashMap::<ResolutionSiteId, Vec<u32>>::default();
+    let mut contextual_lists_by_callable = HashMap::<ResolutionSiteId, Vec<u32>>::default();
+    for list in &facts.callable_parameter_lists {
+        parameter_lists_by_callable
+            .entry(list.callable)
+            .or_default()
+            .push(list.list_ordinal);
+        if list.contextual {
+            contextual_lists_by_callable
+                .entry(list.callable)
+                .or_default()
+                .push(list.list_ordinal);
+        }
+    }
+    for (&callable, parameters) in &parameters_by_callable {
+        let lists = parameter_lists_by_callable.entry(callable).or_default();
+        lists.extend(parameters.iter().map(|parameter| parameter.list_ordinal));
+    }
+    if language != Language::Scala {
+        for header in &facts.callable_signatures {
+            let lists = parameter_lists_by_callable
+                .entry(header.callable)
+                .or_default();
+            if lists.is_empty() {
+                lists.push(0);
+            }
+        }
+    }
+    for lists in parameter_lists_by_callable.values_mut() {
+        lists.sort_unstable();
+        lists.dedup();
+    }
+    let mut parameter_semantics_by_position = HashMap::default();
+    for semantics in &facts.callable_parameter_semantics {
+        assert!(
+            parameter_semantics_by_position
+                .insert(
+                    (
+                        semantics.callable,
+                        semantics.list_ordinal,
+                        semantics.ordinal,
+                    ),
+                    semantics,
+                )
+                .is_none(),
+            "one callable parameter semantics row per list position"
+        );
+    }
+    let mut extension_receivers_by_callable = HashMap::default();
+    for receiver in &facts.extension_receivers {
+        let slot = index.slot(receiver.receiver_type);
+        assert_eq!(
+            slot.role,
+            ResolutionTypeSlotRole::TargetTypeIdentity,
+            "an extension receiver contributes its structured receiver type"
+        );
+        assert!(
+            extension_receivers_by_callable
+                .insert(
+                    receiver.callable,
+                    identities.semantic(type_slot_semantic_identity(receiver.receiver_type)),
+                )
+                .is_none(),
+            "one extension receiver per callable"
+        );
+    }
     let mut result_bindings_by_callable = HashMap::<_, Vec<_>>::default();
     for binding in &facts.callable_result_bindings {
         let parameters = parameters_by_callable
@@ -2716,6 +3931,24 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
                 )
             })
             .collect::<Vec<_>>();
+        let parameter_applicability = parameters
+            .iter()
+            .map(|parameter| {
+                let semantics = parameter_semantics_by_position.remove(&(
+                    callable,
+                    parameter.list_ordinal,
+                    parameter.ordinal,
+                ));
+                let semantics_known = semantics.is_some();
+                LoweredCallableParameterApplicability::new(
+                    parameter.ordinal,
+                    parameter.list_ordinal,
+                    semantics.map(|row| index.name(row.label).to_owned().into_boxed_str()),
+                    semantics.is_some_and(|row| row.has_default),
+                    semantics_known,
+                )
+            })
+            .collect::<Vec<_>>();
         let lowered_result_types = header
             .result_types
             .iter()
@@ -2754,6 +3987,18 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
             .with_result_type_parameter(result_type_parameters_by_callable.remove(&callable))
             .with_result_owner_type_parameter(
                 result_owner_type_parameters_by_callable.remove(&callable),
+            )
+            .with_applicability_shape(
+                parameter_lists_by_callable
+                    .remove(&callable)
+                    .unwrap_or_default(),
+                parameter_applicability,
+                extension_receivers_by_callable.remove(&callable),
+            )
+            .with_contextual_parameter_lists(
+                contextual_lists_by_callable
+                    .remove(&callable)
+                    .unwrap_or_default(),
             ),
         );
     }
@@ -2763,6 +4008,10 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
         "every result type parameter names a callable with a signature header: \
          {result_type_parameters_by_callable:?} {result_owner_type_parameters_by_callable:?}"
     );
+    assert!(parameter_lists_by_callable.is_empty());
+    assert!(contextual_lists_by_callable.is_empty());
+    assert!(parameter_semantics_by_position.is_empty());
+    assert!(extension_receivers_by_callable.is_empty());
     assert!(
         receivers_by_callable.is_empty(),
         "every receiver form names a callable with a signature header: {receivers_by_callable:?}"
@@ -2778,7 +4027,9 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
         frontiers,
         transfers,
         type_components,
+        type_arguments,
         underlying_types,
+        generic_type_alias_parameters,
         intrinsic_seeds,
         projections,
         qualified_routes,
@@ -2793,6 +4044,21 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
         call_obligations,
         callable_signatures,
     )
+    .with_type_productions(
+        facts
+            .type_productions
+            .iter()
+            .map(|fact| LoweredTypeProduction {
+                output: identities.semantic(type_slot_semantic_identity(fact.output)),
+                element: identities.semantic(type_slot_semantic_identity(fact.element)),
+                constructor: fact.constructor,
+                length: fact.length.clone(),
+            })
+            .collect(),
+    )
+    .with_declared_type_arguments(declared_type_arguments)
+    .with_generic_formal_defaults(generic_formal_defaults)
+    .with_generic_formals(generic_formals)
 }
 
 fn lower_deferred_member_owner_properties(
@@ -2864,6 +4130,27 @@ fn lower_member_scope_properties(
             )
         })
         .collect::<Vec<_>>();
+    for scope in index
+        .scopes
+        .values()
+        .filter(|scope| scope.kind == ResolutionScopeKind::Executable)
+    {
+        let Some(owner) = scope.owner else {
+            continue;
+        };
+        if !index
+            .identifiers
+            .get(&owner)
+            .is_some_and(|identifier| identifier.role == ResolutionIdentifierRole::Declaration)
+        {
+            continue;
+        }
+        properties.push(LoweredMemberScopeProperty::owned(
+            identities.source_definition_semantic(owner),
+            identities.source_scope_node(scope.id),
+            ResolutionScopeKind::Executable,
+        ));
+    }
     properties.sort_unstable();
     properties
 }
@@ -2952,16 +4239,21 @@ fn lower_definition_properties_with_index(
     facts: &FileResolutionFacts,
     index: &TypedFactIndex<'_>,
     member_scopes: &[LoweredMemberScopeProperty],
+    closed_macro_member_surfaces: &HashSet<ResolutionSiteId>,
 ) -> LoweredDefinitionProperties {
     let declaration_visibilities =
         lower_declaration_visibility_properties(identities, language, facts, index);
     let member_scope_by_definition = member_scopes
         .iter()
-        .map(|property| (property.definition, property.scope_head))
+        .filter(|property| property.is_type_body())
+        .map(|property| (property.definition, property.scope_head()))
         .collect::<HashMap<_, _>>();
     assert_eq!(
         member_scope_by_definition.len(),
-        member_scopes.len(),
+        member_scopes
+            .iter()
+            .filter(|property| property.is_type_body())
+            .count(),
         "one member scope per type definition is required"
     );
 
@@ -2981,6 +4273,7 @@ fn lower_definition_properties_with_index(
             identities.source_definition_semantic(fact.member),
             owner_definition,
             owner_scope_head,
+            index.name(index.definition_identifier(fact.member).name),
             fact.kind,
             fact.access,
             fact.qualifier_compatibility,
@@ -3017,6 +4310,7 @@ fn lower_definition_properties_with_index(
             identities.source_reference_semantic(fact.supertype_reference),
             identities.semantic(type_slot_semantic_identity(fact.supertype_slot)),
             fact.kind,
+            fact.parent_ordinal,
         ));
     }
     supertypes.sort_by_key(supertype_sort_key);
@@ -3033,24 +4327,44 @@ fn lower_definition_properties_with_index(
         .iter()
         .map(|owner| owner.member)
         .collect::<HashSet<_>>();
+    let generic_formal_sites = facts
+        .generic_formals
+        .iter()
+        .map(|formal| formal.parameter)
+        .collect::<HashSet<_>>();
     let mut property_gaps = Vec::new();
     for gap in &facts.gaps {
         if matches!(
             gap.kind,
-            ResolutionGapKind::UnexpandedItemMacro | ResolutionGapKind::UnexpandedImplMacro
+            ResolutionGapKind::UnexpandedItemMacro
+                | ResolutionGapKind::UnexpandedImplMacro
+                | ResolutionGapKind::GeneratedItemSurface
         ) {
+            if closed_macro_member_surfaces.contains(&gap.site) {
+                continue;
+            }
             // The expansion can add impls to every type its scope declares,
             // so each of them carries the invocation's reason as a
             // member-surface property. The property is positioned on the
             // type's own declaration, which keeps one owner per source
             // provenance while one invocation reaches several types.
-            let scope = index.site(gap.site).scope;
+            let gap_site = index.site(gap.site);
+            let scope = gap_site.scope;
             let reason_semantic = identities.semantic(gap_reason_semantic_identity(
                 gap.site,
                 LoweringGapOrigin::Extracted(gap.kind),
             ));
             for site in &facts.sites {
                 if site.kind != ResolutionSiteKind::TypeDeclaration || site.scope != scope {
+                    continue;
+                }
+                // An attribute's gap spans its annotated item, whose named
+                // declaration is a separate site. Item-position macros can
+                // add impls to every type in their scope; an annotation keeps
+                // its own type's generated member surface open.
+                if gap.kind == ResolutionGapKind::GeneratedItemSurface
+                    && (site.start_byte < gap_site.start_byte || site.end_byte > gap_site.end_byte)
+                {
                     continue;
                 }
                 validate_type_definition(site.id, index);
@@ -3101,6 +4415,15 @@ fn lower_definition_properties_with_index(
                 }
                 Some(gap.site)
             }
+            ResolutionGapKind::UnsupportedExpressionType
+                if generic_formal_sites.contains(&gap.site) =>
+            {
+                // A generic formal has a stable placeholder identity even
+                // while its concrete type is unknown. Retain this exact
+                // frontier gap as a definition property so a query that has
+                // positional actuals can discharge only this formal's gap.
+                Some(gap.site)
+            }
             _ => None,
         };
         let Some(owner) = owner else {
@@ -3139,6 +4462,9 @@ struct TypedFactIndex<'facts> {
     slots: HashMap<ResolutionTypeSlotId, ResolutionTypeSlotFact>,
     slots_by_site: HashMap<ResolutionSiteId, Vec<ResolutionTypeSlotId>>,
     type_body_scope_by_owner: HashMap<ResolutionSiteId, ResolutionScopeId>,
+    /// Namespaces a producer declares for a definition beyond what its site
+    /// kind and primary namespace give it.
+    additional_namespaces: HashSet<(ResolutionSiteId, ResolutionNamespace)>,
 }
 
 impl<'facts> TypedFactIndex<'facts> {
@@ -3213,6 +4539,75 @@ impl<'facts> TypedFactIndex<'facts> {
             );
             slots_by_site.entry(slot.site).or_default().push(slot.id);
         }
+        let mut type_argument_ordinals = HashMap::<ResolutionTypeSlotId, Vec<u32>>::default();
+        for argument in &facts.type_arguments {
+            let application = *slots
+                .get(&argument.application)
+                .unwrap_or_else(|| panic!("unknown type argument application: {argument:?}"));
+            let value = *slots
+                .get(&argument.argument)
+                .unwrap_or_else(|| panic!("unknown type argument value: {argument:?}"));
+            assert_eq!(application.role, ResolutionTypeSlotRole::TargetTypeIdentity);
+            assert_eq!(value.role, ResolutionTypeSlotRole::TargetTypeIdentity);
+            assert!(argument.indirection_delta >= 0);
+            assert!(argument.reference_indirection_delta >= 0);
+            type_argument_ordinals
+                .entry(argument.application)
+                .or_default()
+                .push(argument.ordinal);
+        }
+        for (application, ordinals) in &mut type_argument_ordinals {
+            ordinals.sort_unstable();
+            assert_eq!(
+                ordinals.iter().copied().collect::<HashSet<_>>().len(),
+                ordinals.len(),
+                "one type argument per application ordinal is required for {application}"
+            );
+        }
+        let mut alias_parameter_ordinals = HashMap::<ResolutionSiteId, Vec<u32>>::default();
+        for parameter in &facts.generic_type_alias_parameters {
+            assert_eq!(
+                sites
+                    .get(&parameter.alias)
+                    .unwrap_or_else(|| panic!("unknown generic alias site: {parameter:?}"))
+                    .kind,
+                ResolutionSiteKind::TypeAliasDeclaration
+            );
+            assert!(
+                identifiers.get(&parameter.alias).is_some_and(|identifier| {
+                    identifier.role == ResolutionIdentifierRole::Declaration
+                        && identifier.namespace == ResolutionNamespace::Type
+                }) && identifiers
+                    .get(&parameter.parameter)
+                    .is_some_and(|identifier| {
+                        identifier.role == ResolutionIdentifierRole::Declaration
+                            && identifier.namespace == ResolutionNamespace::Type
+                    }),
+                "generic alias and formal parameter are type declarations: {parameter:?}"
+            );
+            assert_eq!(
+                slots
+                    .get(&parameter.target)
+                    .unwrap_or_else(|| panic!("unknown generic alias target: {parameter:?}"))
+                    .role,
+                ResolutionTypeSlotRole::TargetTypeIdentity
+            );
+            assert!(parameter.indirection_delta >= 0);
+            assert!(parameter.reference_indirection_delta >= 0);
+            alias_parameter_ordinals
+                .entry(parameter.alias)
+                .or_default()
+                .push(parameter.ordinal);
+        }
+        for (alias, ordinals) in &mut alias_parameter_ordinals {
+            ordinals.sort_unstable();
+            assert_eq!(
+                ordinals.iter().copied().collect::<HashSet<_>>().len(),
+                ordinals.len(),
+                "one generic alias parameter per ordinal is required for {alias}"
+            );
+            assert!(ordinals.iter().copied().eq(0..ordinals.len() as u32));
+        }
         for values in slots_by_site.values_mut() {
             values.sort_unstable();
         }
@@ -3263,28 +4658,30 @@ impl<'facts> TypedFactIndex<'facts> {
             slots,
             slots_by_site,
             type_body_scope_by_owner,
+            additional_namespaces: facts
+                .additional_definition_namespaces
+                .iter()
+                .map(|fact| (fact.declaration, fact.namespace))
+                .collect(),
         }
     }
 
+    /// Whether a type declaration occupies `namespace`: a type declaration
+    /// binds the Type namespace, and a producer can instead declare the term
+    /// namespace for a singleton (a Scala `object` is a term that owns a member
+    /// scope; it is not a type).
+    fn type_declaration_namespace_is_declared(
+        &self,
+        site: ResolutionSiteId,
+        namespace: ResolutionNamespace,
+    ) -> bool {
+        namespace == ResolutionNamespace::Type
+            || (namespace == ResolutionNamespace::Value
+                && self.additional_namespaces.contains(&(site, namespace)))
+    }
+
     fn validate_scope_forest(&self) {
-        for scope in self.scopes.values() {
-            if let Some(parent) = scope.parent {
-                let parent = self
-                    .scopes
-                    .get(&parent)
-                    .unwrap_or_else(|| panic!("scope {} names unknown parent {parent}", scope.id));
-                assert!(
-                    parent.start_byte <= scope.start_byte && scope.end_byte <= parent.end_byte,
-                    "child scope must be contained by its parent: {scope:?}, {parent:?}"
-                );
-            }
-            let mut cursor = Some(scope.id);
-            let mut visited = HashSet::default();
-            while let Some(id) = cursor {
-                assert!(visited.insert(id), "resolution scope parent cycle at {id}");
-                cursor = self.scope(id).parent;
-            }
-        }
+        super::common_fact_lowering::validate_scope_forest(&self.scopes);
     }
 
     fn validate_remaining_typed_relations(&self, facts: &FileResolutionFacts) {
@@ -3320,8 +4717,11 @@ impl<'facts> TypedFactIndex<'facts> {
                 assert!(
                     facts.binding_projections.iter().any(|projection| {
                         projection.reference == call.callee && projection.output == call.result
-                    }),
-                    "supported call lacks its result projection: {call:?}"
+                    }) || facts
+                        .type_transfers
+                        .iter()
+                        .any(|transfer| transfer.output == call.result),
+                    "supported call lacks its result producer: {call:?}"
                 );
             }
             let result = self.slot(call.result);
@@ -3366,11 +4766,12 @@ impl<'facts> TypedFactIndex<'facts> {
         let mut expected_signature_headers = callable_definitions;
         for header in &facts.callable_signatures {
             let callable = self.site(header.callable);
-            if callable.kind == ResolutionSiteKind::ValueDeclaration {
-                assert!(
-                    !header.result_types.is_empty(),
-                    "a value signature carries a function result type: {header:?}"
-                );
+            if matches!(
+                callable.kind,
+                ResolutionSiteKind::ValueDeclaration
+                    | ResolutionSiteKind::TypeDeclaration
+                    | ResolutionSiteKind::TypeAliasDeclaration
+            ) {
                 expected_signature_headers.insert(header.callable);
             } else {
                 assert!(matches!(
@@ -3398,7 +4799,10 @@ impl<'facts> TypedFactIndex<'facts> {
             let callable = self.site(parameter.callable);
             assert!(matches!(
                 callable.kind,
-                ResolutionSiteKind::CallableDeclaration
+                ResolutionSiteKind::ValueDeclaration
+                    | ResolutionSiteKind::TypeDeclaration
+                    | ResolutionSiteKind::TypeAliasDeclaration
+                    | ResolutionSiteKind::CallableDeclaration
                     | ResolutionSiteKind::ConstructorDeclaration
             ));
             self.definition_identifier(parameter.callable);
@@ -3438,24 +4842,15 @@ impl<'facts> TypedFactIndex<'facts> {
     }
 
     fn name(&self, id: ResolutionNameId) -> &str {
-        self.names
-            .get(&id)
-            .copied()
-            .unwrap_or_else(|| panic!("unknown resolution name {id}"))
+        required_resolution_name(&self.names, id)
     }
 
     fn scope(&self, id: ResolutionScopeId) -> ResolutionScopeFact {
-        *self
-            .scopes
-            .get(&id)
-            .unwrap_or_else(|| panic!("unknown resolution scope {id}"))
+        required_resolution_scope(&self.scopes, id)
     }
 
     fn site(&self, id: ResolutionSiteId) -> ResolutionSiteFact {
-        *self
-            .sites
-            .get(&id)
-            .unwrap_or_else(|| panic!("unknown resolution site {id}"))
+        super::required_resolution_site(&self.sites, id)
     }
 
     fn slot(&self, id: ResolutionTypeSlotId) -> ResolutionTypeSlotFact {
@@ -3466,21 +4861,18 @@ impl<'facts> TypedFactIndex<'facts> {
     }
 
     fn identifier(&self, site: ResolutionSiteId) -> &'facts PositionedIdentifierFact {
-        self.identifiers
-            .get(&site)
-            .copied()
-            .unwrap_or_else(|| panic!("site {site} has no positioned identifier"))
+        required_positioned_identifier(self.identifiers.get(&site).copied(), site)
     }
 
     fn definition_identifier(&self, site: ResolutionSiteId) -> &'facts PositionedIdentifierFact {
         let identifier = self.identifier(site);
-        assert_eq!(identifier.role, ResolutionIdentifierRole::Declaration);
+        super::common_fact_lowering::assert_declaration_identifier(identifier);
         identifier
     }
 
     fn reference_identifier(&self, site: ResolutionSiteId) -> &'facts PositionedIdentifierFact {
         let identifier = self.identifier(site);
-        assert_eq!(identifier.role, ResolutionIdentifierRole::Reference);
+        super::assert_reference_identifier(identifier);
         identifier
     }
 
@@ -3497,9 +4889,7 @@ impl<'facts> TypedFactIndex<'facts> {
                     .map(|&slot| identities.semantic(type_slot_semantic_identity(slot)))
                     .collect()
             })
-            .unwrap_or_else(|| {
-                vec![identities.semantic(site_type_frontier_semantic_identity(site))]
-            })
+            .unwrap_or_else(|| vec![site_type_frontier_semantic(identities, site)])
     }
 
     fn type_member_scopes(&self) -> Vec<(ResolutionSiteId, ResolutionScopeId)> {
@@ -3536,11 +4926,63 @@ impl<'facts> TypedFactIndex<'facts> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TypedOutputProducerFamily {
+    ExpressionResult,
     UnaryIndirection,
     Transfer,
     TypeUnion,
     Intrinsic,
     Projection,
+}
+
+fn validate_output_producer_rows<Slot>(
+    transfers: impl IntoIterator<Item = (Slot, ResolutionTypeTransferKind)>,
+    intrinsic_seeds: impl IntoIterator<Item = Slot>,
+    projections: impl IntoIterator<Item = Slot>,
+    mut validate_slot: impl FnMut(Slot),
+    description: &str,
+    format_slot: impl Fn(Slot) -> String,
+) where
+    Slot: Copy + Eq + std::hash::Hash,
+{
+    let mut producers = HashMap::default();
+    let mut register = |slot: Slot, family: TypedOutputProducerFamily| {
+        validate_slot(slot);
+        if let Some(previous) = producers.insert(slot, family)
+            && (previous != family
+                || !matches!(
+                    family,
+                    TypedOutputProducerFamily::ExpressionResult
+                        | TypedOutputProducerFamily::TypeUnion
+                        | TypedOutputProducerFamily::UnaryIndirection
+                ))
+        {
+            panic!(
+                "{description} {} has multiple output producers: {previous:?} and {family:?}",
+                format_slot(slot)
+            );
+        }
+    };
+    for (slot, kind) in transfers {
+        register(
+            slot,
+            match kind {
+                ResolutionTypeTransferKind::TypeUnion => TypedOutputProducerFamily::TypeUnion,
+                ResolutionTypeTransferKind::UnaryIndirection => {
+                    TypedOutputProducerFamily::UnaryIndirection
+                }
+                ResolutionTypeTransferKind::ExpressionResult => {
+                    TypedOutputProducerFamily::ExpressionResult
+                }
+                _ => TypedOutputProducerFamily::Transfer,
+            },
+        );
+    }
+    for slot in intrinsic_seeds {
+        register(slot, TypedOutputProducerFamily::Intrinsic);
+    }
+    for slot in projections {
+        register(slot, TypedOutputProducerFamily::Projection);
+    }
 }
 
 /// A unary star has exactly two disjoint category alternatives over one input.
@@ -3575,9 +5017,9 @@ fn validate_indirection_producers<Slot: Copy + Eq + std::hash::Hash + std::fmt::
     }
 }
 
-/// A typed slot has one affirmative producer. TypeUnion combines declared
-/// inputs; UnaryIndirection combines its validated disjoint category pair.
-/// Every other producer remains exclusive, including same-family duplicates.
+/// A typed slot has one affirmative producer. TypeUnion and ExpressionResult
+/// combine their declared inputs; UnaryIndirection combines its validated
+/// disjoint category pair. Every other producer remains exclusive.
 fn validate_output_producers(facts: &FileResolutionFacts, index: &TypedFactIndex<'_>) {
     validate_indirection_producers(
         facts
@@ -3594,93 +5036,67 @@ fn validate_output_producers(facts: &FileResolutionFacts, index: &TypedFactIndex
                 )
             }),
     );
-    let mut producers = HashMap::default();
-    let mut register = |slot: ResolutionTypeSlotId, family: TypedOutputProducerFamily| {
-        index.slot(slot);
-        if let Some(previous) = producers.insert(slot, family)
-            && (previous != family
-                || !matches!(
-                    family,
-                    TypedOutputProducerFamily::TypeUnion
-                        | TypedOutputProducerFamily::UnaryIndirection
-                ))
-        {
-            panic!("typed slot {slot} has multiple output producers: {previous:?} and {family:?}");
-        }
-    };
-    for transfer in &facts.type_transfers {
-        register(
-            transfer.output,
-            match transfer.kind {
-                ResolutionTypeTransferKind::TypeUnion => TypedOutputProducerFamily::TypeUnion,
-                ResolutionTypeTransferKind::UnaryIndirection => {
-                    TypedOutputProducerFamily::UnaryIndirection
-                }
-                _ => TypedOutputProducerFamily::Transfer,
-            },
-        );
-    }
-    for intrinsic in &facts.intrinsic_type_seeds {
-        register(intrinsic.output, TypedOutputProducerFamily::Intrinsic);
-    }
-    for projection in &facts.binding_projections {
-        register(projection.output, TypedOutputProducerFamily::Projection);
-    }
+    validate_output_producer_rows(
+        facts
+            .type_transfers
+            .iter()
+            .map(|transfer| (transfer.output, transfer.kind)),
+        facts.intrinsic_type_seeds.iter().map(|seed| seed.output),
+        facts
+            .binding_projections
+            .iter()
+            .map(|projection| projection.output),
+        |slot| {
+            index.slot(slot);
+        },
+        "typed slot",
+        |slot| slot.to_string(),
+    );
 }
 
 fn normalized_call_arguments<'facts>(
     facts: &'facts FileResolutionFacts,
     index: &TypedFactIndex<'_>,
 ) -> HashMap<ResolutionSiteId, Vec<&'facts ResolutionCallArgumentFact>> {
-    let mut by_call: HashMap<_, Vec<_>> = HashMap::default();
-    for argument in &facts.call_arguments {
-        index.slot(argument.value);
-        by_call.entry(argument.call).or_default().push(argument);
-    }
-    for (&call, arguments) in &mut by_call {
-        arguments.sort_unstable_by_key(|argument| argument.ordinal);
-        for (expected, argument) in arguments.iter().enumerate() {
-            assert_eq!(
-                usize::try_from(argument.ordinal).expect("u32 ordinal fits usize"),
-                expected,
-                "call {call} argument ordinals must be contiguous from zero"
-            );
-        }
-    }
-    by_call
+    group_by_site_and_ordinal(
+        facts.call_arguments.iter().inspect(|argument| {
+            index.slot(argument.value);
+        }),
+        |argument| argument.call,
+        |argument| argument.ordinal,
+        "call",
+        "argument",
+    )
 }
 
 fn normalized_callable_parameters<'facts>(
     facts: &'facts FileResolutionFacts,
     index: &TypedFactIndex<'_>,
 ) -> HashMap<ResolutionSiteId, Vec<&'facts ResolutionCallableParameterFact>> {
-    let mut by_callable: HashMap<_, Vec<_>> = HashMap::default();
-    for parameter in &facts.callable_parameters {
-        index.slot(parameter.value_type);
-        by_callable
-            .entry(parameter.callable)
-            .or_default()
-            .push(parameter);
-    }
+    let mut by_callable = group_by_site_and_ordinal(
+        facts.callable_parameters.iter().inspect(|parameter| {
+            index.slot(parameter.value_type);
+        }),
+        |parameter| parameter.callable,
+        |parameter| parameter.ordinal,
+        "callable",
+        "parameter",
+    );
     for (&callable, parameters) in &mut by_callable {
-        parameters.sort_unstable_by_key(|parameter| parameter.ordinal);
         let mut definitions = HashSet::default();
         for (expected, parameter) in parameters.iter().enumerate() {
-            assert_eq!(
-                usize::try_from(parameter.ordinal).expect("u32 ordinal fits usize"),
-                expected,
-                "callable {callable} parameter ordinals must be contiguous from zero"
-            );
             assert!(
                 definitions.insert(parameter.parameter),
                 "callable {callable} repeats parameter definition {}",
                 parameter.parameter
             );
             if parameter.repeated {
-                assert_eq!(
-                    expected + 1,
-                    parameters.len(),
-                    "repeated parameter must be last in callable {callable}"
+                assert!(
+                    parameters
+                        .iter()
+                        .skip(expected + 1)
+                        .all(|later| later.list_ordinal != parameter.list_ordinal),
+                    "repeated parameter must be last in its parameter list in callable {callable}"
                 );
             }
         }
@@ -3722,6 +5138,22 @@ fn validate_transfer_roles(
                 ResolutionTypeSlotRole::CallResult | ResolutionTypeSlotRole::ExpressionValue
             ),
             "initialization transfer input must retain the initializer's produced value: {fact:?}"
+        ),
+        ResolutionTypeTransferKind::Contextual => assert!(
+            matches!(
+                input,
+                ResolutionTypeSlotRole::DeclaredValue
+                    | ResolutionTypeSlotRole::ExpressionValue
+                    | ResolutionTypeSlotRole::CallResult
+            ),
+            "contextual type transfer input must retain a proven surrounding value type: {fact:?}"
+        ),
+        ResolutionTypeTransferKind::ExpressionResult => assert!(
+            matches!(
+                input,
+                ResolutionTypeSlotRole::ExpressionValue | ResolutionTypeSlotRole::CallResult
+            ),
+            "expression-result transfer input must retain an operand value type: {fact:?}"
         ),
         ResolutionTypeTransferKind::Unwrap => assert!(
             matches!(
@@ -3798,8 +5230,9 @@ fn validate_transfer_roles(
                 fact.value_transform,
                 ResolutionTypeTransferValueTransform::Preserve
                     | ResolutionTypeTransferValueTransform::AddressableRuntimeOnly
+                    | ResolutionTypeTransferValueTransform::ToRuntime { addressable: false }
             ),
-            "initialization must preserve runtime category or admit an addressable runtime value: {fact:?}"
+            "initialization must preserve runtime category, admit an addressable runtime value, or default an untyped value: {fact:?}"
         );
     }
     if fact.kind == ResolutionTypeTransferKind::Unwrap {
@@ -3849,6 +5282,8 @@ fn transfer_accepts_output_role(
         | ResolutionTypeTransferKind::TypeAlias => ResolutionTypeSlotRole::TargetTypeIdentity,
         ResolutionTypeTransferKind::DeclaredType => ResolutionTypeSlotRole::DeclaredValue,
         ResolutionTypeTransferKind::Initialization => ResolutionTypeSlotRole::DeclaredValue,
+        ResolutionTypeTransferKind::Contextual => ResolutionTypeSlotRole::ExpressionValue,
+        ResolutionTypeTransferKind::ExpressionResult => ResolutionTypeSlotRole::ExpressionValue,
         ResolutionTypeTransferKind::ComponentElement
         | ResolutionTypeTransferKind::ComponentKey
         | ResolutionTypeTransferKind::ComponentValue => {
@@ -3868,8 +5303,12 @@ fn transfer_accepts_output_role(
         ResolutionTypeTransferKind::Receiver => ResolutionTypeSlotRole::Receiver,
         ResolutionTypeTransferKind::Argument => ResolutionTypeSlotRole::Argument,
         ResolutionTypeTransferKind::Return => ResolutionTypeSlotRole::ReturnValue,
-        ResolutionTypeTransferKind::UnaryIndirection | ResolutionTypeTransferKind::AddressOf => {
-            ResolutionTypeSlotRole::ExpressionValue
+        ResolutionTypeTransferKind::UnaryIndirection => ResolutionTypeSlotRole::ExpressionValue,
+        ResolutionTypeTransferKind::AddressOf => {
+            return matches!(
+                output,
+                ResolutionTypeSlotRole::ExpressionValue | ResolutionTypeSlotRole::CallResult
+            );
         }
     };
     output == expected
@@ -3908,24 +5347,43 @@ fn validate_projection(
     let reference_site = index.site(fact.reference);
     let output = index.slot(fact.output);
     let (namespace, role) = projection_contract(fact.kind);
-    let callable_value_reference = fact.kind == BindingProjectionKind::TargetCallableResultType
+    let callable_value_reference = fact.kind.is_callable_result()
         && reference.namespace == ResolutionNamespace::Value
         && matches!(
             reference_site.kind,
             ResolutionSiteKind::CallableReference | ResolutionSiteKind::MemberReference
         );
-    let callable_type_or_value_reference = fact.kind
-        == BindingProjectionKind::TargetCallableResultType
+    let callable_type_or_value_reference = fact.kind.is_callable_result()
         && reference.namespace == ResolutionNamespace::TypeOrValue
         && reference_site.kind == ResolutionSiteKind::CallableReference;
+    let non_invoking_constructor_reference = fact.kind
+        == BindingProjectionKind::NonInvokingMemberReference
+        && reference.namespace == ResolutionNamespace::Constructor;
+    if fact.kind == BindingProjectionKind::NonInvokingMemberReference {
+        assert_eq!(output.site, fact.reference);
+        assert!(matches!(
+            reference_site.kind,
+            ResolutionSiteKind::CallableReference
+                | ResolutionSiteKind::MemberReference
+                | ResolutionSiteKind::ConstructorReference
+        ));
+        assert_eq!(
+            reference_site.kind == ResolutionSiteKind::ConstructorReference,
+            non_invoking_constructor_reference
+        );
+        assert!(facts.calls.iter().all(|call| call.callee != fact.reference));
+    }
     assert!(
         reference.namespace == namespace
+            || non_invoking_constructor_reference
             || callable_value_reference
             || callable_type_or_value_reference,
         "binding projection namespace does not match its contract: {fact:?}"
     );
     assert_eq!(output.role, role);
-    if fact.kind == BindingProjectionKind::TargetConstructorOwnerType {
+    if fact.kind == BindingProjectionKind::TargetConstructorOwnerType
+        || non_invoking_constructor_reference
+    {
         let qualifier = reference
             .qualifier
             .expect("constructor projection requires its constructed-type qualifier");
@@ -3938,6 +5396,7 @@ fn validate_projection(
     if matches!(
         fact.kind,
         BindingProjectionKind::TargetCallableResultType
+            | BindingProjectionKind::TargetCallableLaterResultType
             | BindingProjectionKind::TargetConstructorOwnerType
     ) {
         assert!(
@@ -3964,13 +5423,18 @@ const fn projection_contract(
             ResolutionNamespace::Value,
             ResolutionTypeSlotRole::ExpressionValue,
         ),
-        BindingProjectionKind::TargetCallableResultType => (
+        BindingProjectionKind::TargetCallableResultType
+        | BindingProjectionKind::TargetCallableLaterResultType => (
             ResolutionNamespace::Callable,
             ResolutionTypeSlotRole::CallResult,
         ),
         BindingProjectionKind::TargetConstructorOwnerType => (
             ResolutionNamespace::Constructor,
             ResolutionTypeSlotRole::CallResult,
+        ),
+        BindingProjectionKind::NonInvokingMemberReference => (
+            ResolutionNamespace::Callable,
+            ResolutionTypeSlotRole::ExpressionValue,
         ),
         BindingProjectionKind::TargetTypeOrDeclaredValueType => (
             ResolutionNamespace::TypeOrValue,
@@ -4006,7 +5470,7 @@ fn validate_declaration_type(fact: DeclarationTypeSlotFact, index: &TypedFactInd
         DeclarationTypeRole::Value | DeclarationTypeRole::Parameter => {
             assert_eq!(declaration.kind, ResolutionSiteKind::ValueDeclaration);
         }
-        DeclarationTypeRole::Return => {
+        DeclarationTypeRole::Return | DeclarationTypeRole::CallableFirstResult => {
             assert_eq!(declaration.kind, ResolutionSiteKind::CallableDeclaration);
         }
     }
@@ -4047,8 +5511,17 @@ fn validate_member_owner(fact: ResolutionMemberOwnerFact, index: &TypedFactIndex
             ResolutionNamespace::Type,
         ),
     };
-    assert_eq!(member.kind, site_kind);
-    assert_eq!(identifier.namespace, namespace);
+    // A Scala object is a singleton term whose declared type is its module class.
+    let term_type_field = fact.kind == ResolutionMemberKind::Field
+        && member.kind == ResolutionSiteKind::TypeDeclaration
+        && identifier.namespace == ResolutionNamespace::Value
+        && index.type_declaration_namespace_is_declared(fact.member, ResolutionNamespace::Value);
+    assert!(member.kind == site_kind || term_type_field);
+    if fact.kind == ResolutionMemberKind::NestedType {
+        assert!(index.type_declaration_namespace_is_declared(fact.member, identifier.namespace));
+    } else {
+        assert_eq!(identifier.namespace, namespace);
+    }
 }
 
 fn validate_construction_requirement(
@@ -4103,9 +5576,12 @@ fn validate_member_scope_owner(site: ResolutionSiteId, index: &TypedFactIndex<'_
 
 fn validate_type_definition(site: ResolutionSiteId, index: &TypedFactIndex<'_>) {
     assert_eq!(index.site(site).kind, ResolutionSiteKind::TypeDeclaration);
-    assert_eq!(
-        index.definition_identifier(site).namespace,
-        ResolutionNamespace::Type
+    assert!(
+        index.type_declaration_namespace_is_declared(
+            site,
+            index.definition_identifier(site).namespace
+        ),
+        "a type definition occupies the Type namespace or a declared term namespace: {site:?}"
     );
 }
 
@@ -4162,14 +5638,6 @@ fn gaps_by_site(facts: &FileResolutionFacts) -> HashMap<ResolutionSiteId, Vec<Re
         kinds.sort_unstable();
     }
     gaps
-}
-
-fn completion_for_sites<const N: usize>(
-    identities: &mut ResolutionIdentityCatalogBuilder,
-    gaps_by_site: &HashMap<ResolutionSiteId, Vec<ResolutionGapKind>>,
-    sites: [ResolutionSiteId; N],
-) -> ResolutionCompletion {
-    completion_for_site_iter(identities, gaps_by_site, sites)
 }
 
 fn completion_for_site_iter(
@@ -4287,11 +5755,14 @@ const RUST_VALUE_MEMBER_ROUTES: &[(u32, ResolutionNamespace)] = &[
     (1, ResolutionNamespace::Callable),
 ];
 
-fn assert_source_lowerable_qualified_routes(routes: &[LoweredQualifiedSeededRoute]) {
+fn assert_source_lowerable_qualified_routes(
+    routes: &[LoweredQualifiedSeededRoute],
+    language: Language,
+) {
     let mut routes_by_projection: HashMap<_, Vec<_>> = HashMap::default();
     for route in routes {
         assert!(
-            route.projection_kind == BindingProjectionKind::TargetCallableResultType
+            route.projection_kind.is_callable_result()
                 || route.requires_type_qualifier()
                 || route.source_lookup == route.lookup,
             "only callable result or method-value projections may separate source and member lookup"
@@ -4312,17 +5783,46 @@ fn assert_source_lowerable_qualified_routes(routes: &[LoweredQualifiedSeededRout
             .map(|route| (route.precedence_ordinal, route.namespace))
             .collect::<Vec<_>>();
         actual_shape.sort_unstable();
-        let expected_shape = if projection_routes
+        let expected_ranks = if projection_routes
             .iter()
             .any(|route| route.requires_type_qualifier())
         {
             RUST_VALUE_MEMBER_ROUTES
+        } else if language == Language::Scala
+            && kind == BindingProjectionKind::TargetCallableResultType
+        {
+            call_target_lookup_routes(language, true)
+                .expect("Scala publishes callee term-family routes")
+        } else if kind == BindingProjectionKind::NonInvokingMemberReference {
+            // Callable and constructor references share binding-only projection
+            // semantics; the producer's namespace is the language hook.
+            assert!(matches!(
+                projection_routes[0].namespace,
+                ResolutionNamespace::Callable | ResolutionNamespace::Constructor
+            ));
+            lookup_routes(projection_routes[0].namespace)
         } else {
             lookup_routes(projection_contract(kind).0)
         };
+        let expected_shape = if call_target_lookup_routes(language, true).is_some()
+            && kind == BindingProjectionKind::TargetCallableResultType
+        {
+            expected_ranks
+                .iter()
+                .enumerate()
+                .map(|(index, &(_, namespace))| {
+                    (
+                        u32::try_from(index).expect("callee route ordinal fits u32"),
+                        namespace,
+                    )
+                })
+                .collect::<Vec<_>>()
+        } else {
+            expected_ranks.to_vec()
+        };
         assert_eq!(
             actual_shape.as_slice(),
-            expected_shape,
+            expected_shape.as_slice(),
             "qualified routes for projection ({reference:?}, {output_slot:?}, {kind:?}) must have the exact source-lowerable namespace and precedence shape"
         );
 
@@ -4356,42 +5856,16 @@ fn validate_lowered_output_producers(
                 )
             }),
     );
-    let mut producers = HashMap::default();
-    let mut register = |slot: SemanticId, family: TypedOutputProducerFamily| {
-        if let Some(previous) = producers.insert(slot, family)
-            && (previous != family
-                || !matches!(
-                    family,
-                    TypedOutputProducerFamily::TypeUnion
-                        | TypedOutputProducerFamily::UnaryIndirection
-                ))
-        {
-            panic!(
-                "typed frontier {slot:?} has multiple output producers: {previous:?} and {family:?}"
-            );
-        }
-    };
-    for transfer in transfers {
-        register(
-            transfer.rule.target_slot(),
-            match transfer.kind {
-                ResolutionTypeTransferKind::TypeUnion => TypedOutputProducerFamily::TypeUnion,
-                ResolutionTypeTransferKind::UnaryIndirection => {
-                    TypedOutputProducerFamily::UnaryIndirection
-                }
-                _ => TypedOutputProducerFamily::Transfer,
-            },
-        );
-    }
-    for seed in intrinsic_seeds {
-        register(seed.frontier.slot(), TypedOutputProducerFamily::Intrinsic);
-    }
-    for projection in projections {
-        register(
-            projection.output_slot,
-            TypedOutputProducerFamily::Projection,
-        );
-    }
+    validate_output_producer_rows(
+        transfers
+            .iter()
+            .map(|transfer| (transfer.rule.target_slot(), transfer.kind)),
+        intrinsic_seeds.iter().map(|seed| seed.frontier.slot()),
+        projections.iter().map(|projection| projection.output_slot),
+        |_| {},
+        "typed frontier",
+        |slot| format!("{slot:?}"),
+    );
 }
 
 fn assert_unique_lowered_rows(fragment: &LoweredTypedFragment) {
@@ -4472,7 +5946,7 @@ fn assert_unique_lowered_rows(fragment: &LoweredTypedFragment) {
     let mut member_scope_heads = HashSet::default();
     for property in &fragment.member_scopes {
         assert!(
-            member_scope_definitions.insert(property.definition),
+            !property.is_type_body() || member_scope_definitions.insert(property.definition),
             "one member scope per type definition is required"
         );
         assert!(
@@ -4571,7 +6045,7 @@ fn intrinsic_sort_key(row: &LoweredIntrinsicSeed) -> (SemanticId, u8) {
 fn projection_sort_key(row: &LoweredBindingProjection) -> (SemanticId, u8, SemanticId) {
     (
         row.reference,
-        projection_kind_rank(row.kind),
+        binding_projection_kind_rank(row.kind),
         row.output_slot,
     )
 }
@@ -4608,14 +6082,15 @@ fn qualified_route_sort_key(
 
 fn member_owner_sort_key(
     row: &LoweredMemberOwnerProperty,
-) -> (SemanticId, u8, u8, u8, SemanticId, BindingNodeId) {
+) -> (SemanticId, String, u8, u8, u8, SemanticId, BindingNodeId) {
     (
         row.definition,
+        row.member_name().to_owned(),
         member_kind_rank(row.kind),
         member_access_rank(row.access),
-        member_qualifier_compatibility_rank(row.qualifier_compatibility),
+        qualifier_compatibility_rank(row.qualifier_compatibility),
         row.owner_definition,
-        row.owner_scope_head,
+        row.owner_scope_head(),
     )
 }
 
@@ -4629,10 +6104,13 @@ fn construction_requirement_sort_key(
     )
 }
 
-fn supertype_sort_key(row: &LoweredSupertypeProperty) -> (SemanticId, u8, SemanticId, SemanticId) {
+fn supertype_sort_key(
+    row: &LoweredSupertypeProperty,
+) -> (SemanticId, u32, u8, SemanticId, SemanticId) {
     (
         row.definition,
-        supertype_kind_rank(row.kind),
+        row.parent_ordinal,
+        supertype_kind_rank(row.kind()),
         row.reference,
         row.frontier,
     )
@@ -4658,10 +6136,12 @@ fn callable_signature_sort_key(row: &LoweredCallableSignatureProperty) -> Semant
     row.definition
 }
 
-pub(super) fn call_semantic_identity(call: ResolutionSiteId) -> ResolutionSemanticIdentity {
-    let mut hasher = CanonicalHasher::new(b"bifrost-resolution-call-semantic-local:v2");
-    hasher.field("call", &call.get().to_be_bytes());
-    ResolutionSemanticIdentity::fragment_local(hasher.finish())
+pub(crate) fn call_semantic_identity(call: ResolutionSiteId) -> ResolutionSemanticIdentity {
+    ResolutionSemanticIdentity::fragment_local(super::fact_lowering::site_identity_digest(
+        b"bifrost-resolution-call-semantic-local:v2",
+        "call",
+        call,
+    ))
 }
 
 fn transfer_rule_semantic_identity(fact: ResolutionTypeTransferFact) -> ResolutionSemanticIdentity {
@@ -4715,18 +6195,6 @@ fn unsupported_intrinsic_role_semantic_identity(
     ResolutionSemanticIdentity::fragment_local(hasher.finish())
 }
 
-const fn projection_kind_rank(kind: BindingProjectionKind) -> u8 {
-    match kind {
-        BindingProjectionKind::TargetTypeIdentity => 0,
-        BindingProjectionKind::TargetDeclaredValueType => 1,
-        BindingProjectionKind::TargetCallableResultType => 2,
-        BindingProjectionKind::TargetConstructorOwnerType => 3,
-        BindingProjectionKind::TargetTypeOrDeclaredValueType => 4,
-        BindingProjectionKind::TargetMemberOwnerType => 5,
-        BindingProjectionKind::TargetNominalTypeIdentity => 6,
-    }
-}
-
 const fn namespace_rank(namespace: ResolutionNamespace) -> u8 {
     match namespace {
         ResolutionNamespace::Type => 0,
@@ -4762,6 +6230,8 @@ const fn transfer_kind_rank(kind: ResolutionTypeTransferKind) -> u8 {
         ResolutionTypeTransferKind::ComponentElement => 13,
         ResolutionTypeTransferKind::ComponentKey => 14,
         ResolutionTypeTransferKind::ComponentValue => 15,
+        ResolutionTypeTransferKind::Contextual => 16,
+        ResolutionTypeTransferKind::ExpressionResult => 17,
     }
 }
 
@@ -4775,40 +6245,10 @@ const fn intrinsic_kind_rank(kind: IntrinsicTypeKind) -> u8 {
     }
 }
 
-const fn declaration_type_role_rank(role: DeclarationTypeRole) -> u8 {
-    match role {
-        DeclarationTypeRole::Value => 0,
-        DeclarationTypeRole::Parameter => 1,
-        DeclarationTypeRole::Return => 2,
-        DeclarationTypeRole::Identity => 3,
-        DeclarationTypeRole::NominalIdentity => 4,
-    }
-}
-
-const fn member_kind_rank(kind: ResolutionMemberKind) -> u8 {
-    match kind {
-        ResolutionMemberKind::NestedType => 0,
-        ResolutionMemberKind::Method => 1,
-        ResolutionMemberKind::Constructor => 2,
-        ResolutionMemberKind::Field => 3,
-        ResolutionMemberKind::AssociatedType => 4,
-    }
-}
-
 const fn member_access_rank(access: ResolutionMemberAccess) -> u8 {
     match access {
         ResolutionMemberAccess::Instance => 0,
         ResolutionMemberAccess::Type => 1,
-    }
-}
-
-const fn member_qualifier_compatibility_rank(
-    compatibility: ResolutionMemberQualifierCompatibility,
-) -> u8 {
-    match compatibility {
-        ResolutionMemberQualifierCompatibility::RuntimeOnly => 0,
-        ResolutionMemberQualifierCompatibility::TypeOnly => 1,
-        ResolutionMemberQualifierCompatibility::RuntimeOrType => 2,
     }
 }
 
@@ -4824,6 +6264,7 @@ const fn supertype_kind_rank(kind: ResolutionSupertypeKind) -> u8 {
         ResolutionSupertypeKind::Interface => 1,
         ResolutionSupertypeKind::GoInterfaceElement => 2,
         ResolutionSupertypeKind::ImplicitSuperclass => 3,
+        ResolutionSupertypeKind::SelfType => 4,
     }
 }
 
@@ -4863,6 +6304,7 @@ const fn gap_kind_rank(kind: ResolutionGapKind) -> u8 {
         ResolutionGapKind::MacroArgument => 18,
         ResolutionGapKind::UnexpandedItemMacro => 19,
         ResolutionGapKind::UnexpandedImplMacro => 20,
+        ResolutionGapKind::UnsupportedExpressionType => 21,
     }
 }
 
@@ -4872,6 +6314,7 @@ mod tests {
         definition_semantic, gap_reason_semantic, reference_semantic, scope_head_node,
         site_type_frontier_semantic, type_slot_semantic,
     };
+    use crate::analyzer::resolution::test_support::{identifier, name, scope, site, slot};
 
     use brokk_bifrost_core::analyzer::resolution_facts::{
         BindingProjectionFact, DeclarationTypeSlotFact, IntrinsicTypeSeedFact,
@@ -4879,8 +6322,9 @@ mod tests {
         ResolutionDeclarationVisibilityFact, ResolutionGapFact, ResolutionIdentifierRole,
         ResolutionMemberOwnerFact, ResolutionNameFact, ResolutionNameId, ResolutionScopeFact,
         ResolutionScopeId, ResolutionScopeInheritance, ResolutionScopeKind, ResolutionSiteFact,
-        ResolutionSiteId, ResolutionSiteKind, ResolutionSupertypeFact, ResolutionTypeSlotFact,
-        ResolutionTypeSlotId, ResolutionTypeTransferFact, ResolutionVisibilityEligibilityFact,
+        ResolutionSiteId, ResolutionSiteKind, ResolutionSupertypeFact, ResolutionTypeArgumentFact,
+        ResolutionTypeSlotFact, ResolutionTypeSlotId, ResolutionTypeTransferFact,
+        ResolutionVisibilityEligibilityFact,
     };
 
     use super::super::model::TypeTransferApplication;
@@ -4890,64 +6334,121 @@ mod tests {
         BindingFragmentId::for_test(b"typed-fact-lowering-test-fragment")
     }
 
-    fn name(id: u32, spelling: &str) -> ResolutionNameFact {
-        ResolutionNameFact {
-            id: ResolutionNameId::new(id),
-            spelling: spelling.into(),
-        }
+    #[test]
+    fn executable_scope_owner_projection_preserves_multiple_heads_and_remounts_kind() {
+        let facts = FileResolutionFacts {
+            names: vec![name(0, "function")],
+            scopes: vec![
+                scope(0, None, None, ResolutionScopeKind::CompilationUnit, 0, 100),
+                scope(1, Some(0), Some(0), ResolutionScopeKind::Executable, 10, 90),
+                scope(2, Some(1), Some(0), ResolutionScopeKind::Executable, 20, 80),
+            ],
+            sites: vec![site(0, 0, ResolutionSiteKind::CallableDeclaration, 1)],
+            identifiers: vec![identifier(
+                0,
+                0,
+                ResolutionIdentifierRole::Declaration,
+                ResolutionNamespace::Callable,
+                None,
+            )],
+            callable_signatures: vec![ResolutionCallableSignatureFact {
+                callable: ResolutionSiteId::new(0),
+                type_parameter_count: 0,
+                result_types: Vec::new(),
+            }],
+            ..FileResolutionFacts::default()
+        };
+        let lowered =
+            crate::analyzer::resolution::lower_for_test(fragment(), Language::Rust, &facts);
+        let owners = lowered.typed().member_scopes();
+        assert_eq!(owners.len(), 2);
+        assert_eq!(owners[0].definition(), owners[1].definition());
+        assert_ne!(owners[0].scope_head(), owners[1].scope_head());
+        assert!(
+            owners
+                .iter()
+                .all(|owner| owner.scope_kind() == ResolutionScopeKind::Executable)
+        );
+        assert_eq!(hydrated_clone(lowered.typed()), *lowered.typed());
+        let source =
+            crate::analyzer::resolution::PreloadedFactResolutionService::from_lowered_fragments(
+                [lowered.lexical().clone()],
+                [lowered.typed().clone()],
+            );
+        let heads = owners
+            .iter()
+            .map(|owner| owner.scope_head())
+            .collect::<Vec<_>>();
+        let selected =
+            crate::analyzer::resolution::BatchResolutionFragmentSource::scope_owners_for_heads(
+                &source,
+                &heads,
+                &crate::CancellationToken::default(),
+            )
+            .unwrap();
+        assert_eq!(selected, owners);
     }
 
-    fn scope(
-        id: u32,
-        parent: Option<u32>,
-        owner: Option<u32>,
-        kind: ResolutionScopeKind,
-        start_byte: usize,
-        end_byte: usize,
-    ) -> ResolutionScopeFact {
-        ResolutionScopeFact {
-            id: ResolutionScopeId::new(id),
-            parent: parent.map(ResolutionScopeId::new),
-            owner: owner.map(ResolutionSiteId::new),
-            kind,
-            inheritance: ResolutionScopeInheritance::Lexical,
-            start_byte,
-            end_byte,
-        }
-    }
+    #[test]
+    fn sparse_generic_type_argument_ordinals_survive_typed_fact_lowering() {
+        // This is the typed-fact shape produced by
+        // `Pair<[Vec<u8>; 4], String>`: argument 0 is unsupported and has an
+        // explicit gap, while String retains its source ordinal 1.
+        let facts = FileResolutionFacts {
+            names: vec![name(0, "Pair"), name(1, "String")],
+            scopes: vec![scope(
+                0,
+                None,
+                None,
+                ResolutionScopeKind::CompilationUnit,
+                0,
+                80,
+            )],
+            sites: vec![
+                site(0, 0, ResolutionSiteKind::TypeReference, 1),
+                site(1, 0, ResolutionSiteKind::TypeReference, 35),
+                site(2, 0, ResolutionSiteKind::UnsupportedExpression, 8),
+            ],
+            identifiers: vec![
+                identifier(
+                    0,
+                    0,
+                    ResolutionIdentifierRole::Reference,
+                    ResolutionNamespace::Type,
+                    None,
+                ),
+                identifier(
+                    1,
+                    1,
+                    ResolutionIdentifierRole::Reference,
+                    ResolutionNamespace::Type,
+                    None,
+                ),
+            ],
+            type_slots: vec![
+                slot(0, 0, ResolutionTypeSlotRole::TargetTypeIdentity),
+                slot(1, 1, ResolutionTypeSlotRole::TargetTypeIdentity),
+            ],
+            type_arguments: vec![ResolutionTypeArgumentFact {
+                application: ResolutionTypeSlotId::new(0),
+                ordinal: 1,
+                argument: ResolutionTypeSlotId::new(1),
+                indirection_delta: 0,
+                reference_indirection_delta: 0,
+            }],
+            gaps: vec![ResolutionGapFact {
+                site: ResolutionSiteId::new(2),
+                kind: ResolutionGapKind::UnsupportedTypeSyntax,
+            }],
+            ..FileResolutionFacts::default()
+        };
 
-    fn site(id: u32, scope: u32, kind: ResolutionSiteKind, position: usize) -> ResolutionSiteFact {
-        ResolutionSiteFact {
-            id: ResolutionSiteId::new(id),
-            scope: ResolutionScopeId::new(scope),
-            kind,
-            start_byte: position,
-            end_byte: position + 1,
-        }
-    }
+        let typed = crate::analyzer::resolution::lower_for_test(fragment(), Language::Rust, &facts)
+            .typed()
+            .clone();
 
-    fn identifier(
-        site: u32,
-        name: u32,
-        role: ResolutionIdentifierRole,
-        namespace: ResolutionNamespace,
-        qualifier: Option<u32>,
-    ) -> PositionedIdentifierFact {
-        PositionedIdentifierFact {
-            site: ResolutionSiteId::new(site),
-            name: ResolutionNameId::new(name),
-            role,
-            namespace,
-            qualifier: qualifier.map(ResolutionTypeSlotId::new),
-        }
-    }
-
-    fn slot(id: u32, site: u32, role: ResolutionTypeSlotRole) -> ResolutionTypeSlotFact {
-        ResolutionTypeSlotFact {
-            id: ResolutionTypeSlotId::new(id),
-            site: ResolutionSiteId::new(site),
-            role,
-        }
+        assert_eq!(typed.type_arguments().len(), 1);
+        assert_eq!(typed.type_arguments()[0].ordinal(), 1);
     }
 
     fn transfer(
@@ -4957,14 +6458,13 @@ mod tests {
         delta: i8,
         value_transform: ResolutionTypeTransferValueTransform,
     ) -> ResolutionTypeTransferFact {
-        ResolutionTypeTransferFact {
-            input: ResolutionTypeSlotId::new(input),
-            output: ResolutionTypeSlotId::new(output),
+        crate::analyzer::resolution::test_support::transfer(
+            input,
+            output,
             kind,
-            indirection_delta: delta,
-            reference_indirection_delta: 0,
+            delta,
             value_transform,
-        }
+        )
     }
 
     fn visibility_eligibilities(
@@ -5386,41 +6886,6 @@ mod tests {
         }
     }
 
-    #[test]
-    #[should_panic(
-        expected = "qualified route (reference, output slot, precedence ordinal) must be unique"
-    )]
-    fn source_lookup_does_not_create_a_second_identity_for_the_same_qualified_route() {
-        let mut lowered = crate::analyzer::resolution::lower_for_test(
-            fragment(),
-            Language::Rust,
-            &qualified_callable_facts(ResolutionNamespace::Value),
-        )
-        .typed()
-        .clone();
-        let mut conflicting = lowered.qualified_routes[0];
-        conflicting.source_lookup = conflicting.lookup;
-        assert_ne!(conflicting, lowered.qualified_routes[0]);
-        lowered.qualified_routes.push(conflicting);
-        let _ = renormalize_hydrated(lowered);
-    }
-
-    #[test]
-    #[should_panic(
-        expected = "only callable result or method-value projections may separate source and member lookup"
-    )]
-    fn constructor_route_cannot_invent_a_different_source_lookup() {
-        let mut lowered = crate::analyzer::resolution::lower_for_test(
-            fragment(),
-            Language::Java,
-            &constructor_facts(),
-        )
-        .typed()
-        .clone();
-        lowered.qualified_routes[0].source_lookup = SemanticId::for_test(b"wrong-source-lookup");
-        let _ = renormalize_hydrated(lowered);
-    }
-
     fn hierarchy_facts() -> FileResolutionFacts {
         FileResolutionFacts {
             names: vec![name(0, "Sub"), name(1, "Base")],
@@ -5456,6 +6921,7 @@ mod tests {
             }],
             supertypes: vec![ResolutionSupertypeFact {
                 subtype: ResolutionSiteId::new(0),
+                parent_ordinal: 0,
                 supertype_reference: ResolutionSiteId::new(1),
                 supertype_slot: ResolutionTypeSlotId::new(0),
                 kind: ResolutionSupertypeKind::Superclass,
@@ -5477,30 +6943,6 @@ mod tests {
             visibility_eligibilities: visibility_eligibilities([0]),
             ..FileResolutionFacts::default()
         }
-    }
-
-    #[test]
-    #[should_panic(expected = "visibility row must name a supported type")]
-    fn source_visibility_requires_producer_eligibility() {
-        let mut facts = hierarchy_facts();
-        facts.visibility_eligibilities.clear();
-        let _ = crate::analyzer::resolution::lower_for_test(fragment(), Language::Java, &facts)
-            .typed()
-            .clone();
-    }
-
-    #[test]
-    #[should_panic(expected = "one visibility eligibility row per declaration")]
-    fn source_visibility_eligibility_is_unique() {
-        let mut facts = hierarchy_facts();
-        facts
-            .visibility_eligibilities
-            .push(ResolutionVisibilityEligibilityFact {
-                declaration: ResolutionSiteId::new(0),
-            });
-        let _ = crate::analyzer::resolution::lower_for_test(fragment(), Language::Java, &facts)
-            .typed()
-            .clone();
     }
 
     fn call_applicability_facts() -> FileResolutionFacts {
@@ -5551,18 +6993,23 @@ mod tests {
         facts.call_arguments = vec![
             ResolutionCallArgumentFact {
                 call: ResolutionSiteId::new(4),
+                list_ordinal: 0,
                 ordinal: 1,
                 value: ResolutionTypeSlotId::new(5),
+                label: None,
             },
             ResolutionCallArgumentFact {
                 call: ResolutionSiteId::new(4),
+                list_ordinal: 0,
                 ordinal: 0,
                 value: ResolutionTypeSlotId::new(4),
+                label: None,
             },
         ];
         facts.callable_parameters = vec![
             ResolutionCallableParameterFact {
                 callable: ResolutionSiteId::new(1),
+                list_ordinal: 0,
                 ordinal: 1,
                 parameter: ResolutionSiteId::new(6),
                 value_type: ResolutionTypeSlotId::new(3),
@@ -5570,6 +7017,7 @@ mod tests {
             },
             ResolutionCallableParameterFact {
                 callable: ResolutionSiteId::new(1),
+                list_ordinal: 0,
                 ordinal: 0,
                 parameter: ResolutionSiteId::new(5),
                 value_type: ResolutionTypeSlotId::new(2),
@@ -5635,7 +7083,7 @@ mod tests {
     }
 
     fn hydrated_clone(lowered: &LoweredTypedFragment) -> LoweredTypedFragment {
-        LoweredTypedFragment::new(
+        LoweredTypedFragment::new_with_type_relations(
             lowered.fragment(),
             lowered.language(),
             reversed(
@@ -5647,6 +7095,22 @@ mod tests {
             reversed(lowered.transfers().iter().map(|row| {
                 LoweredTypeTransfer::new(row.source_slot(), row.kind(), row.rule().clone())
             })),
+            reversed(lowered.type_components().iter().map(|row| {
+                LoweredTypeComponent::new(
+                    row.container(),
+                    row.constructor(),
+                    row.kind(),
+                    row.component(),
+                )
+            })),
+            reversed(lowered.type_arguments().iter().copied()),
+            reversed(
+                lowered
+                    .underlying_types()
+                    .iter()
+                    .map(|row| LoweredUnderlyingType::new(row.definition(), row.slot())),
+            ),
+            reversed(lowered.generic_type_alias_parameters().iter().copied()),
             reversed(lowered.intrinsic_seeds().iter().map(|row| {
                 LoweredIntrinsicSeed::new(row.kind(), row.spelling(), row.frontier().clone())
             })),
@@ -5673,17 +7137,19 @@ mod tests {
             reversed(lowered.declaration_visibilities().iter().map(|row| {
                 LoweredDeclarationVisibilityProperty::new(row.definition(), row.visibility())
             })),
-            reversed(
-                lowered
-                    .member_scopes()
-                    .iter()
-                    .map(|row| LoweredMemberScopeProperty::new(row.definition(), row.scope_head())),
-            ),
+            reversed(lowered.member_scopes().iter().map(|row| {
+                LoweredMemberScopeProperty::owned(
+                    row.definition(),
+                    row.scope_head(),
+                    row.scope_kind(),
+                )
+            })),
             reversed(lowered.member_owners().iter().map(|row| {
                 LoweredMemberOwnerProperty::new(
                     row.definition(),
                     row.owner_definition(),
                     row.owner_scope_head(),
+                    row.member_name(),
                     row.kind(),
                     row.access(),
                     row.qualifier_compatibility(),
@@ -5713,6 +7179,7 @@ mod tests {
                     row.reference(),
                     row.frontier(),
                     row.kind(),
+                    row.parent_ordinal(),
                 )
             })),
             reversed(lowered.property_gaps().iter().map(|row| {
@@ -5725,6 +7192,17 @@ mod tests {
                 )
             })),
             reversed(lowered.call_obligations().iter().map(|row| {
+                let arguments = reversed(row.arguments().iter().map(|argument| {
+                    LoweredCallArgumentProperty::new(
+                        argument.list_ordinal(),
+                        argument.ordinal(),
+                        argument.slot(),
+                        argument
+                            .label()
+                            .map(str::to_owned)
+                            .map(String::into_boxed_str),
+                    )
+                }));
                 LoweredCallApplicabilityObligation::new(
                     row.call(),
                     row.callee_reference(),
@@ -5735,6 +7213,18 @@ mod tests {
                     row.explicit_type_argument_count(),
                     row.applicability_reason(),
                     row.completion().clone(),
+                )
+                .with_extra_result_slots(row.extra_result_slots().to_vec())
+                .with_type_argument_slots(row.type_argument_slots().to_vec())
+                .with_owner_type_arguments(
+                    row.owner_type_segment(),
+                    row.owner_type_argument_slots().to_vec(),
+                )
+                .with_expected_result_slot(row.expected_result_slot())
+                .with_argument_shape(
+                    row.language(),
+                    arguments,
+                    row.argument_lists().to_vec(),
                 )
             })),
             reversed(lowered.callable_signatures().iter().map(|row| {
@@ -5752,8 +7242,23 @@ mod tests {
                     parameters,
                     row.completion().clone(),
                 )
+                .with_result_types(reversed(row.result_types().iter().map(|result| {
+                    LoweredCallableResultTypeProperty::new(result.ordinal(), result.slot())
+                })))
+                .with_result_bindings(row.result_bindings())
+                .with_receiver(row.receiver())
+                .with_result_type_parameter(row.result_type_parameter())
+                .with_result_owner_type_parameter(row.result_owner_type_parameter())
+                .with_applicability_shape(
+                    row.parameter_lists().to_vec(),
+                    row.parameter_applicability().to_vec(),
+                    row.extension_receiver(),
+                )
             })),
         )
+        .with_generic_formal_defaults(reversed(lowered.generic_formal_defaults().iter().copied()))
+        .with_generic_formals(reversed(lowered.generic_formals().iter().copied()))
+        .with_type_productions(reversed(lowered.type_productions().iter().cloned()))
     }
 
     fn renormalize_hydrated(lowered: LoweredTypedFragment) -> LoweredTypedFragment {
@@ -5762,8 +7267,14 @@ mod tests {
             language,
             frontiers,
             transfers,
+            type_productions,
             type_components,
+            declared_type_arguments,
+            type_arguments,
             underlying_types,
+            generic_type_alias_parameters,
+            generic_formals,
+            generic_formal_defaults,
             intrinsic_seeds,
             projections,
             qualified_routes,
@@ -5784,7 +7295,9 @@ mod tests {
             frontiers,
             transfers,
             type_components,
+            type_arguments,
             underlying_types,
+            generic_type_alias_parameters,
             intrinsic_seeds,
             projections,
             qualified_routes,
@@ -5799,6 +7312,10 @@ mod tests {
             call_obligations,
             callable_signatures,
         )
+        .with_declared_type_arguments(declared_type_arguments)
+        .with_generic_formal_defaults(generic_formal_defaults)
+        .with_generic_formals(generic_formals)
+        .with_type_productions(type_productions)
     }
 
     fn assert_all_row_slots_are_in_the_inventory(
@@ -5816,8 +7333,23 @@ mod tests {
             assert_present(transfer.source_slot());
             assert_present(transfer.rule().target_slot());
         }
+        for production in lowered.type_productions() {
+            assert_present(production.output);
+            assert_present(production.element);
+        }
+        for argument in lowered.type_arguments() {
+            assert_present(argument.application());
+            assert_present(argument.argument());
+        }
+        for parameter in lowered.generic_type_alias_parameters() {
+            assert_present(parameter.target());
+        }
         for seed in lowered.intrinsic_seeds() {
             assert_present(seed.frontier().slot());
+        }
+        for argument in lowered.type_arguments() {
+            assert_present(argument.application());
+            assert_present(argument.argument());
         }
         for projection in lowered.projections() {
             assert_present(projection.output_slot());
@@ -5943,199 +7475,6 @@ mod tests {
     }
 
     #[test]
-    fn unproduced_type_slots_remain_explicit_with_their_exact_roles() {
-        let facts = FileResolutionFacts {
-            scopes: vec![scope(
-                0,
-                None,
-                None,
-                ResolutionScopeKind::CompilationUnit,
-                0,
-                20,
-            )],
-            sites: vec![site(0, 0, ResolutionSiteKind::Literal, 1)],
-            type_slots: vec![
-                slot(1, 0, ResolutionTypeSlotRole::Receiver),
-                slot(0, 0, ResolutionTypeSlotRole::ExpressionValue),
-            ],
-            ..FileResolutionFacts::default()
-        };
-
-        let lowered =
-            crate::analyzer::resolution::lower_for_test(fragment(), Language::Java, &facts)
-                .typed()
-                .clone();
-        let roles = lowered
-            .frontiers()
-            .iter()
-            .map(|frontier| (frontier.slot(), frontier.role()))
-            .collect::<HashMap<_, _>>();
-        assert_eq!(
-            roles,
-            HashMap::from_iter([
-                (
-                    type_slot_semantic(fragment(), ResolutionTypeSlotId::new(0)),
-                    ResolutionTypeSlotRole::ExpressionValue,
-                ),
-                (
-                    type_slot_semantic(fragment(), ResolutionTypeSlotId::new(1)),
-                    ResolutionTypeSlotRole::Receiver,
-                ),
-            ])
-        );
-        assert!(lowered.transfers().is_empty());
-        assert!(lowered.intrinsic_seeds().is_empty());
-        assert!(lowered.projections().is_empty());
-    }
-
-    #[test]
-    fn every_real_slot_reference_is_declared_in_the_frontier_inventory() {
-        let mut calls = call_applicability_facts();
-        calls
-            .type_slots
-            .push(slot(6, 4, ResolutionTypeSlotRole::Receiver));
-        calls.calls[0].receiver = Some(ResolutionTypeSlotId::new(6));
-
-        for facts in [declared_and_observed_facts(), calls, hierarchy_facts()] {
-            let lowered =
-                crate::analyzer::resolution::lower_for_test(fragment(), Language::Java, &facts)
-                    .typed()
-                    .clone();
-            assert_all_row_slots_are_in_the_inventory(&facts, &lowered);
-        }
-    }
-
-    #[test]
-    fn hydration_constructors_round_trip_and_canonicalize_every_row_family() {
-        for facts in [
-            declared_and_observed_facts(),
-            call_applicability_facts(),
-            hierarchy_facts(),
-            nested_constructor_facts(),
-        ] {
-            let expected =
-                crate::analyzer::resolution::lower_for_test(fragment(), Language::Java, &facts)
-                    .typed()
-                    .clone();
-            assert_eq!(hydrated_clone(&expected), expected);
-        }
-    }
-
-    #[test]
-    fn non_java_source_visibility_inventory_uses_the_common_property_family() {
-        let facts = constructor_facts();
-        let lowered = crate::analyzer::resolution::lower_for_test(fragment(), Language::Go, &facts)
-            .typed()
-            .clone();
-        assert_eq!(
-            lowered.declaration_visibilities().len(),
-            facts.declaration_visibilities.len()
-        );
-    }
-
-    #[test]
-    fn non_java_hydrated_visibility_inventory_uses_the_common_property_family() {
-        let mut hydrated = crate::analyzer::resolution::lower_for_test(
-            fragment(),
-            Language::Java,
-            &constructor_facts(),
-        )
-        .typed()
-        .clone();
-        hydrated.language = Language::Go;
-        let expected_count = hydrated.declaration_visibilities().len();
-        let normalized = renormalize_hydrated(hydrated);
-        assert_eq!(normalized.language(), Language::Go);
-        assert_eq!(normalized.declaration_visibilities().len(), expected_count);
-    }
-
-    #[test]
-    #[should_panic(expected = "one typed frontier per stable slot is required")]
-    fn hydration_rejects_duplicate_frontier_rows() {
-        let frontier = LoweredTypedFrontier::new(
-            SemanticId::for_test(b"duplicate-frontier"),
-            ResolutionTypeSlotRole::ExpressionValue,
-        );
-        let _ =
-            minimal_hydrated_fragment(vec![frontier, frontier], Vec::new(), Vec::new(), Vec::new());
-    }
-
-    #[test]
-    #[should_panic(expected = "type-transfer target names undeclared typed frontier")]
-    fn hydration_rejects_a_row_owned_slot_missing_from_the_inventory() {
-        let source = SemanticId::for_test(b"declared-source");
-        let target = SemanticId::for_test(b"missing-target");
-        let transfer = LoweredTypeTransfer::new(
-            source,
-            ResolutionTypeTransferKind::Assignment,
-            TypeTransferRule::new(
-                SemanticId::for_test(b"transfer"),
-                target,
-                0,
-                TypeTransferValueTransform::Preserve,
-                ResolutionCompletion::Complete,
-            ),
-        );
-        let _ = minimal_hydrated_fragment(
-            vec![LoweredTypedFrontier::new(
-                source,
-                ResolutionTypeSlotRole::ExpressionValue,
-            )],
-            vec![transfer],
-            Vec::new(),
-            Vec::new(),
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "multiple output producers")]
-    fn hydration_rejects_multiple_affirmative_producers_for_one_frontier() {
-        let source = SemanticId::for_test(b"producer-source");
-        let output = SemanticId::for_test(b"producer-output");
-        let transfer = LoweredTypeTransfer::new(
-            source,
-            ResolutionTypeTransferKind::Assignment,
-            TypeTransferRule::new(
-                SemanticId::for_test(b"producer-transfer"),
-                output,
-                0,
-                TypeTransferValueTransform::Preserve,
-                ResolutionCompletion::Complete,
-            ),
-        );
-        let projection = LoweredBindingProjection::new(
-            SemanticId::for_test(b"producer-reference"),
-            output,
-            BindingProjectionKind::TargetTypeIdentity,
-        );
-        let _ = minimal_hydrated_fragment(
-            vec![
-                LoweredTypedFrontier::new(source, ResolutionTypeSlotRole::ExpressionValue),
-                LoweredTypedFrontier::new(output, ResolutionTypeSlotRole::AssignmentValue),
-            ],
-            vec![transfer],
-            Vec::new(),
-            vec![projection],
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "parameter ordinals must be contiguous from zero")]
-    fn hydration_rejects_a_noncanonical_signature_parameter_set() {
-        let _ = LoweredCallableSignatureProperty::new(
-            SemanticId::for_test(b"callable"),
-            0,
-            vec![LoweredCallableParameterProperty::new(
-                1,
-                SemanticId::for_test(b"parameter"),
-                SemanticId::for_test(b"parameter-slot"),
-                false,
-            )],
-            ResolutionCompletion::Complete,
-        );
-    }
-
-    #[test]
     fn callable_signature_polled_clone_matches_canonical_construction_and_cancels_atomically() {
         let parameters = (0_u32..300)
             .map(|ordinal| {
@@ -6208,54 +7547,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "qualified route must name its exact binding projection")]
-    fn hydration_rejects_a_qualified_route_without_its_projection() {
-        let mut lowered = crate::analyzer::resolution::lower_for_test(
-            fragment(),
-            Language::Java,
-            &constructor_facts(),
-        )
-        .typed()
-        .clone();
-        lowered.projections.clear();
-        let _ = renormalize_hydrated(lowered);
-    }
-
-    #[test]
-    #[should_panic(expected = "member owner must name its declaring type's exact member scope")]
-    fn hydration_rejects_a_member_owner_without_its_scope_property() {
-        let mut lowered = crate::analyzer::resolution::lower_for_test(
-            fragment(),
-            Language::Java,
-            &constructor_facts(),
-        )
-        .typed()
-        .clone();
-        let removed_type = lowered.member_scopes[0].definition();
-        lowered.member_scopes.clear();
-        lowered
-            .declaration_visibilities
-            .retain(|property| property.definition() != removed_type);
-        let _ = renormalize_hydrated(lowered);
-    }
-
-    #[test]
-    #[should_panic(
-        expected = "call applicability completion must retain its declared applicability reason"
-    )]
-    fn hydration_rejects_a_call_without_its_applicability_reason() {
-        let mut lowered = crate::analyzer::resolution::lower_for_test(
-            fragment(),
-            Language::Java,
-            &call_applicability_facts(),
-        )
-        .typed()
-        .clone();
-        lowered.call_obligations[0].completion = ResolutionCompletion::Complete;
-        let _ = renormalize_hydrated(lowered);
-    }
-
-    #[test]
     #[should_panic(
         expected = "intrinsic type seed completion cannot persist operation-local cancellation"
     )]
@@ -6272,23 +7563,6 @@ mod tests {
             seed.frontier.slot(),
             seed.frontier.possible_values().to_vec(),
             ResolutionCompletion::incomplete([ResolutionIncompleteReason::Cancelled]),
-        );
-        let _ = renormalize_hydrated(lowered);
-    }
-
-    #[test]
-    #[should_panic(expected = "incomplete completion requires at least one reason")]
-    fn hydration_rejects_an_empty_incomplete_completion() {
-        let mut lowered = crate::analyzer::resolution::lower_for_test(
-            fragment(),
-            Language::Java,
-            &declared_and_observed_facts(),
-        )
-        .typed()
-        .clone();
-        set_first_intrinsic_completion(
-            &mut lowered,
-            ResolutionCompletion::Incomplete(Vec::new().into_boxed_slice().into()),
         );
         let _ = renormalize_hydrated(lowered);
     }
@@ -6337,77 +7611,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(
-        expected = "TargetTypeIdentity intrinsic seed must contain exactly one TypeObject value"
-    )]
-    fn hydration_rejects_a_complete_empty_supported_intrinsic_seed() {
-        let _ = hydrated_intrinsic_fragment(
-            ResolutionTypeSlotRole::TargetTypeIdentity,
-            Vec::new(),
-            ResolutionCompletion::Complete,
-        );
-    }
-
-    #[test]
-    #[should_panic(
-        expected = "TargetTypeIdentity intrinsic seed must contain exactly one TypeObject value"
-    )]
-    fn hydration_rejects_an_intrinsic_value_category_that_disagrees_with_its_role() {
-        let ty = ResolutionTypeRef::new(SemanticId::for_test(b"runtime-not-type-object"), 0);
-        let _ = hydrated_intrinsic_fragment(
-            ResolutionTypeSlotRole::TargetTypeIdentity,
-            vec![ResolutionSlotValue::runtime(ty, false)],
-            ResolutionCompletion::Complete,
-        );
-    }
-
-    #[test]
-    #[should_panic(
-        expected = "TargetTypeIdentity intrinsic seed must contain exactly one TypeObject value"
-    )]
-    fn hydration_rejects_multiple_intrinsic_values() {
-        let _ = hydrated_intrinsic_fragment(
-            ResolutionTypeSlotRole::TargetTypeIdentity,
-            vec![
-                ResolutionSlotValue::type_object(ResolutionTypeRef::new(
-                    SemanticId::for_test(b"first-intrinsic-type"),
-                    0,
-                )),
-                ResolutionSlotValue::type_object(ResolutionTypeRef::new(
-                    SemanticId::for_test(b"second-intrinsic-type"),
-                    0,
-                )),
-            ],
-            ResolutionCompletion::Complete,
-        );
-    }
-
-    #[test]
-    #[should_panic(
-        expected = "ExpressionValue intrinsic seed must contain exactly one non-addressable Runtime value"
-    )]
-    fn hydration_rejects_an_addressable_intrinsic_expression_value() {
-        let ty = ResolutionTypeRef::new(SemanticId::for_test(b"addressable-intrinsic"), 0);
-        let _ = hydrated_intrinsic_fragment(
-            ResolutionTypeSlotRole::ExpressionValue,
-            vec![ResolutionSlotValue::runtime(ty, true)],
-            ResolutionCompletion::Complete,
-        );
-    }
-
-    #[test]
-    #[should_panic(
-        expected = "unsupported intrinsic seed role AssignmentValue must remain incomplete"
-    )]
-    fn hydration_rejects_a_complete_unsupported_intrinsic_role() {
-        let _ = hydrated_intrinsic_fragment(
-            ResolutionTypeSlotRole::AssignmentValue,
-            Vec::new(),
-            ResolutionCompletion::Complete,
-        );
-    }
-
-    #[test]
     fn hydration_accepts_an_empty_incomplete_unsupported_intrinsic_role() {
         let reason = SemanticId::for_test(b"unsupported-intrinsic-role");
         let lowered = hydrated_intrinsic_fragment(
@@ -6427,518 +7630,6 @@ mod tests {
             lowered.intrinsic_seeds()[0].frontier().completion(),
             ResolutionCompletion::Incomplete(_)
         ));
-    }
-
-    #[test]
-    #[should_panic(expected = "type-transfer kind and output role disagree")]
-    fn hydration_rejects_a_transfer_output_with_the_wrong_role() {
-        let mut lowered = crate::analyzer::resolution::lower_for_test(
-            fragment(),
-            Language::Java,
-            &declared_and_observed_facts(),
-        )
-        .typed()
-        .clone();
-        let target = lowered
-            .transfers
-            .iter()
-            .find(|transfer| transfer.kind == ResolutionTypeTransferKind::Assignment)
-            .expect("assignment transfer")
-            .rule
-            .target_slot();
-        set_frontier_role(&mut lowered, target, ResolutionTypeSlotRole::ReturnValue);
-        let _ = renormalize_hydrated(lowered);
-    }
-
-    #[test]
-    #[should_panic(expected = "declared-type transfer input must retain a type object")]
-    fn hydration_rejects_a_declared_type_transfer_from_a_runtime_role() {
-        let mut lowered = crate::analyzer::resolution::lower_for_test(
-            fragment(),
-            Language::Java,
-            &declared_and_observed_facts(),
-        )
-        .typed()
-        .clone();
-        let source = lowered
-            .transfers
-            .iter()
-            .find(|transfer| transfer.kind == ResolutionTypeTransferKind::DeclaredType)
-            .expect("declared-type transfer")
-            .source_slot;
-        set_frontier_role(
-            &mut lowered,
-            source,
-            ResolutionTypeSlotRole::ExpressionValue,
-        );
-        let _ = renormalize_hydrated(lowered);
-    }
-
-    #[test]
-    #[should_panic(expected = "binding projection kind and output role disagree")]
-    fn hydration_rejects_a_projection_output_with_the_wrong_role() {
-        let mut lowered = crate::analyzer::resolution::lower_for_test(
-            fragment(),
-            Language::Java,
-            &hierarchy_facts(),
-        )
-        .typed()
-        .clone();
-        let output = lowered.projections[0].output_slot;
-        set_frontier_role(
-            &mut lowered,
-            output,
-            ResolutionTypeSlotRole::ExpressionValue,
-        );
-        let _ = renormalize_hydrated(lowered);
-    }
-
-    #[test]
-    #[should_panic(expected = "declaration type property must retain its declared category")]
-    fn hydration_rejects_a_declaration_property_with_the_wrong_slot_role() {
-        let mut lowered = crate::analyzer::resolution::lower_for_test(
-            fragment(),
-            Language::Java,
-            &call_applicability_facts(),
-        )
-        .typed()
-        .clone();
-        let slot = lowered.declaration_types[0].slot;
-        set_frontier_role(&mut lowered, slot, ResolutionTypeSlotRole::AssignmentValue);
-        let _ = renormalize_hydrated(lowered);
-    }
-
-    #[test]
-    #[should_panic(expected = "supertype property must name a TargetTypeIdentity frontier")]
-    fn hydration_rejects_a_supertype_with_the_wrong_frontier_role() {
-        let mut lowered = crate::analyzer::resolution::lower_for_test(
-            fragment(),
-            Language::Java,
-            &hierarchy_facts(),
-        )
-        .typed()
-        .clone();
-        let frontier = SemanticId::for_test(b"wrong-role-supertype-frontier");
-        lowered.frontiers.push(LoweredTypedFrontier::new(
-            frontier,
-            ResolutionTypeSlotRole::ExpressionValue,
-        ));
-        lowered.supertypes[0].frontier = frontier;
-        let _ = renormalize_hydrated(lowered);
-    }
-
-    #[test]
-    #[should_panic(
-        expected = "supertype property requires its exact TargetTypeIdentity projection"
-    )]
-    fn hydration_rejects_a_supertype_without_its_exact_projection() {
-        let mut lowered = crate::analyzer::resolution::lower_for_test(
-            fragment(),
-            Language::Java,
-            &hierarchy_facts(),
-        )
-        .typed()
-        .clone();
-        lowered.projections.clear();
-        let _ = renormalize_hydrated(lowered);
-    }
-
-    #[test]
-    #[should_panic(expected = "call result must name a CallResult frontier")]
-    fn hydration_rejects_a_call_result_with_the_wrong_role() {
-        let mut lowered = crate::analyzer::resolution::lower_for_test(
-            fragment(),
-            Language::Java,
-            &call_applicability_facts(),
-        )
-        .typed()
-        .clone();
-        let obligation = &lowered.call_obligations[0];
-        let callee = obligation.callee_reference;
-        let result = obligation.result_slot;
-        lowered
-            .projections
-            .retain(|projection| projection.reference != callee);
-        lowered
-            .qualified_routes
-            .retain(|route| route.reference != callee);
-        set_frontier_role(
-            &mut lowered,
-            result,
-            ResolutionTypeSlotRole::ExpressionValue,
-        );
-        let _ = renormalize_hydrated(lowered);
-    }
-
-    #[test]
-    #[should_panic(expected = "call receiver must name a Receiver frontier")]
-    fn hydration_rejects_a_call_receiver_with_the_wrong_role() {
-        let mut facts = call_applicability_facts();
-        facts
-            .type_slots
-            .push(slot(6, 4, ResolutionTypeSlotRole::Receiver));
-        facts.calls[0].receiver = Some(ResolutionTypeSlotId::new(6));
-        let mut lowered =
-            crate::analyzer::resolution::lower_for_test(fragment(), Language::Java, &facts)
-                .typed()
-                .clone();
-        let receiver = lowered.call_obligations[0]
-            .receiver_slot
-            .expect("receiver slot");
-        set_frontier_role(
-            &mut lowered,
-            receiver,
-            ResolutionTypeSlotRole::ExpressionValue,
-        );
-        let _ = renormalize_hydrated(lowered);
-    }
-
-    #[test]
-    #[should_panic(expected = "call argument must name an Argument frontier")]
-    fn hydration_rejects_a_call_argument_with_the_wrong_role() {
-        let mut lowered = crate::analyzer::resolution::lower_for_test(
-            fragment(),
-            Language::Java,
-            &call_applicability_facts(),
-        )
-        .typed()
-        .clone();
-        let argument = lowered.call_obligations[0].argument_slots[0];
-        set_frontier_role(
-            &mut lowered,
-            argument,
-            ResolutionTypeSlotRole::ExpressionValue,
-        );
-        let _ = renormalize_hydrated(lowered);
-    }
-
-    #[test]
-    #[should_panic(
-        expected = "call applicability obligation requires its result binding projection"
-    )]
-    fn hydration_rejects_a_call_without_its_result_projection() {
-        let mut lowered = crate::analyzer::resolution::lower_for_test(
-            fragment(),
-            Language::Java,
-            &call_applicability_facts(),
-        )
-        .typed()
-        .clone();
-        let callee = lowered.call_obligations[0].callee_reference;
-        lowered
-            .projections
-            .retain(|projection| projection.reference != callee);
-        lowered
-            .qualified_routes
-            .retain(|route| route.reference != callee);
-        let _ = renormalize_hydrated(lowered);
-    }
-
-    #[test]
-    #[should_panic(expected = "callable parameter must name a DeclaredValue frontier")]
-    fn hydration_rejects_a_callable_parameter_with_the_wrong_slot_role() {
-        let mut lowered = crate::analyzer::resolution::lower_for_test(
-            fragment(),
-            Language::Java,
-            &call_applicability_facts(),
-        )
-        .typed()
-        .clone();
-        let parameter = lowered.callable_signatures[0].parameters[0];
-        lowered.declaration_types.retain(|property| {
-            (property.definition, property.slot) != (parameter.definition, parameter.slot)
-        });
-        set_frontier_role(
-            &mut lowered,
-            parameter.slot,
-            ResolutionTypeSlotRole::AssignmentValue,
-        );
-        let _ = renormalize_hydrated(lowered);
-    }
-
-    #[test]
-    #[should_panic(
-        expected = "callable parameter's Parameter declaration type property must name its slot"
-    )]
-    fn hydration_rejects_a_callable_parameter_whose_declaration_property_names_another_slot() {
-        let mut lowered = crate::analyzer::resolution::lower_for_test(
-            fragment(),
-            Language::Java,
-            &call_applicability_facts(),
-        )
-        .typed()
-        .clone();
-        let first = lowered.callable_signatures[0].parameters[0];
-        let second = lowered.callable_signatures[0].parameters[1];
-        for property in &mut lowered.declaration_types {
-            if (property.definition, property.slot) == (first.definition, first.slot) {
-                property.slot = second.slot;
-            } else if (property.definition, property.slot) == (second.definition, second.slot) {
-                property.slot = first.slot;
-            }
-        }
-        let _ = renormalize_hydrated(lowered);
-    }
-
-    /// An unnamed parameter (Rust `_`) binds no definition, so its row names a
-    /// slot that no declaration type property carries.
-    #[test]
-    fn hydration_accepts_an_unnamed_callable_parameter_without_a_declaration_property() {
-        let mut lowered = crate::analyzer::resolution::lower_for_test(
-            fragment(),
-            Language::Java,
-            &call_applicability_facts(),
-        )
-        .typed()
-        .clone();
-        let parameter = lowered.callable_signatures[0].parameters[0];
-        lowered.declaration_types.retain(|property| {
-            (property.definition, property.slot) != (parameter.definition, parameter.slot)
-        });
-        let _ = renormalize_hydrated(lowered);
-    }
-
-    #[test]
-    #[should_panic(expected = "callable parameter definition may belong to only one signature")]
-    fn hydration_rejects_one_parameter_definition_shared_by_two_signatures() {
-        let mut lowered = crate::analyzer::resolution::lower_for_test(
-            fragment(),
-            Language::Java,
-            &call_applicability_facts(),
-        )
-        .typed()
-        .clone();
-        let parameter = lowered.callable_signatures[0].parameters[0];
-        lowered
-            .callable_signatures
-            .push(LoweredCallableSignatureProperty::new(
-                SemanticId::for_test(b"second-callable"),
-                0,
-                vec![LoweredCallableParameterProperty::new(
-                    0,
-                    parameter.definition,
-                    parameter.slot,
-                    false,
-                )],
-                ResolutionCompletion::Complete,
-            ));
-        let _ = renormalize_hydrated(lowered);
-    }
-
-    #[test]
-    #[should_panic(expected = "construction requirement requires matching nested-type ownership")]
-    fn hydration_rejects_a_construction_requirement_without_nested_type_ownership() {
-        let mut lowered = crate::analyzer::resolution::lower_for_test(
-            fragment(),
-            Language::Java,
-            &nested_constructor_facts(),
-        )
-        .typed()
-        .clone();
-        lowered
-            .member_owners
-            .retain(|owner| owner.kind != ResolutionMemberKind::NestedType);
-        let _ = renormalize_hydrated(lowered);
-    }
-
-    #[test]
-    #[should_panic(
-        expected = "must have the exact source-lowerable namespace and precedence shape"
-    )]
-    fn hydration_rejects_an_ordinary_projection_route_with_the_wrong_shape() {
-        let mut lowered = crate::analyzer::resolution::lower_for_test(
-            fragment(),
-            Language::Java,
-            &constructor_facts(),
-        )
-        .typed()
-        .clone();
-        lowered.qualified_routes[0].namespace = ResolutionNamespace::Value;
-        let _ = renormalize_hydrated(lowered);
-    }
-
-    #[test]
-    #[should_panic(
-        expected = "must have the exact source-lowerable namespace and precedence shape"
-    )]
-    fn hydration_rejects_an_incomplete_type_or_value_route_pair() {
-        let mut lowered = crate::analyzer::resolution::lower_for_test(
-            fragment(),
-            Language::Java,
-            &constructor_facts(),
-        )
-        .typed()
-        .clone();
-        let reference = lowered.qualified_routes[0].reference;
-        let projection = lowered
-            .projections
-            .iter_mut()
-            .find(|projection| projection.reference == reference)
-            .expect("qualified projection");
-        projection.kind = BindingProjectionKind::TargetTypeOrDeclaredValueType;
-        let output = projection.output_slot;
-        let route = &mut lowered.qualified_routes[0];
-        route.projection_kind = BindingProjectionKind::TargetTypeOrDeclaredValueType;
-        route.namespace = ResolutionNamespace::Value;
-        route.precedence_ordinal = 0;
-        set_frontier_role(
-            &mut lowered,
-            output,
-            ResolutionTypeSlotRole::ExpressionValue,
-        );
-        let _ = renormalize_hydrated(lowered);
-    }
-
-    #[test]
-    #[should_panic(expected = "constructor projection qualifier must retain a type object")]
-    fn hydration_rejects_a_constructor_route_with_a_runtime_qualifier_role() {
-        let mut lowered = crate::analyzer::resolution::lower_for_test(
-            fragment(),
-            Language::Java,
-            &constructor_facts(),
-        )
-        .typed()
-        .clone();
-        let qualifier = lowered.qualified_routes[0].qualifier_slot;
-        lowered
-            .projections
-            .retain(|projection| projection.output_slot != qualifier);
-        set_frontier_role(
-            &mut lowered,
-            qualifier,
-            ResolutionTypeSlotRole::ExpressionValue,
-        );
-        let _ = renormalize_hydrated(lowered);
-    }
-
-    #[test]
-    #[should_panic(expected = "type-transfer rule semantic must be unique within a fragment")]
-    fn hydration_rejects_duplicate_transfer_rule_semantics() {
-        let mut lowered = crate::analyzer::resolution::lower_for_test(
-            fragment(),
-            Language::Java,
-            &declared_and_observed_facts(),
-        )
-        .typed()
-        .clone();
-        let semantic = lowered.transfers[0].rule.semantic();
-        let replacement = {
-            let duplicate = &lowered.transfers[1];
-            LoweredTypeTransfer::new(
-                duplicate.source_slot,
-                duplicate.kind,
-                TypeTransferRule::new_with_reference_indirection(
-                    semantic,
-                    duplicate.rule.target_slot(),
-                    duplicate.rule.indirection_delta(),
-                    duplicate.rule.reference_indirection_delta(),
-                    duplicate.rule.value_transform(),
-                    duplicate.rule.completion().clone(),
-                ),
-            )
-        };
-        lowered.transfers[1] = replacement;
-        let _ = renormalize_hydrated(lowered);
-    }
-
-    #[test]
-    #[should_panic(
-        expected = "qualified route (reference, output slot, precedence ordinal) must be unique"
-    )]
-    fn hydration_rejects_duplicate_qualified_route_ordinals() {
-        let mut lowered = crate::analyzer::resolution::lower_for_test(
-            fragment(),
-            Language::Java,
-            &constructor_facts(),
-        )
-        .typed()
-        .clone();
-        let duplicate = lowered.qualified_routes[0];
-        lowered.qualified_routes.push(duplicate);
-        let _ = renormalize_hydrated(lowered);
-    }
-
-    #[test]
-    #[should_panic(
-        expected = "qualified-route coarse gap reason may belong to only one reference per fragment"
-    )]
-    fn hydration_rejects_one_coarse_gap_reason_reused_by_two_references() {
-        let mut lowered = crate::analyzer::resolution::lower_for_test(
-            fragment(),
-            Language::Java,
-            &constructor_facts(),
-        )
-        .typed()
-        .clone();
-        let mut second_reference = lowered.qualified_routes[0];
-        second_reference.reference = SemanticId::for_test(b"second-qualified-reference");
-        lowered.qualified_routes.push(second_reference);
-        let _ = renormalize_hydrated(lowered);
-    }
-
-    #[test]
-    #[should_panic(expected = "member-scope head may belong to only one type definition")]
-    fn hydration_rejects_a_member_scope_head_shared_by_two_definitions() {
-        let mut lowered = crate::analyzer::resolution::lower_for_test(
-            fragment(),
-            Language::Java,
-            &nested_constructor_facts(),
-        )
-        .typed()
-        .clone();
-        assert!(lowered.member_scopes.len() >= 2);
-        let shared_head = lowered.member_scopes[0].scope_head;
-        lowered.member_scopes[1].scope_head = shared_head;
-        let _ = renormalize_hydrated(lowered);
-    }
-
-    #[test]
-    #[should_panic(expected = "definition property-gap SQL identity must be unique")]
-    fn hydration_rejects_duplicate_property_gap_sql_identities() {
-        let mut lowered = crate::analyzer::resolution::lower_for_test(
-            fragment(),
-            Language::Java,
-            &hierarchy_facts(),
-        )
-        .typed()
-        .clone();
-        let mut duplicate = lowered.property_gaps[0];
-        duplicate.source_site = ResolutionSiteId::new(99);
-        duplicate.kind = ResolutionGapKind::MalformedSyntax;
-        lowered.property_gaps.push(duplicate);
-        let _ = renormalize_hydrated(lowered);
-    }
-
-    #[test]
-    #[should_panic(
-        expected = "one definition owner per property-gap source provenance is required"
-    )]
-    fn hydration_rejects_conflicting_property_gap_owners() {
-        let mut lowered = crate::analyzer::resolution::lower_for_test(
-            fragment(),
-            Language::Java,
-            &hierarchy_facts(),
-        )
-        .typed()
-        .clone();
-        let mut conflicting = lowered.property_gaps[0];
-        conflicting.definition = SemanticId::for_test(b"conflicting-property-gap-owner");
-        lowered.property_gaps.push(conflicting);
-        let _ = renormalize_hydrated(lowered);
-    }
-
-    #[test]
-    #[should_panic(expected = "definition property gap kind is not source-lowerable")]
-    fn hydration_rejects_an_unsupported_definition_property_gap_kind() {
-        let mut lowered = crate::analyzer::resolution::lower_for_test(
-            fragment(),
-            Language::Java,
-            &hierarchy_facts(),
-        )
-        .typed()
-        .clone();
-        lowered.property_gaps[0].kind = ResolutionGapKind::UnsupportedExpression;
-        let _ = renormalize_hydrated(lowered);
     }
 
     #[test]
@@ -7129,73 +7820,6 @@ mod tests {
     }
 
     #[test]
-    fn call_and_signature_rows_preserve_order_without_claiming_applicability() {
-        let facts = call_applicability_facts();
-        let lowered =
-            crate::analyzer::resolution::lower_for_test(fragment(), Language::Java, &facts)
-                .typed()
-                .clone();
-        let obligation = &lowered.call_obligations()[0];
-        // The call's own semantic is not a site's, so it has no number of its
-        // own to recompute; what the row has to satisfy is that it is this
-        // mount's and is not the callee's.
-        assert_eq!(obligation.call().ordinal(), Some(fragment().ordinal()));
-        assert_ne!(obligation.call(), obligation.callee_reference());
-        assert_eq!(
-            obligation.callee_reference(),
-            reference_semantic(fragment(), ResolutionSiteId::new(3))
-        );
-        assert_eq!(obligation.receiver_slot(), None);
-        assert_eq!(
-            obligation.result_slot(),
-            type_slot_semantic(fragment(), ResolutionTypeSlotId::new(1))
-        );
-        assert_eq!(
-            obligation.argument_slots(),
-            &[
-                type_slot_semantic(fragment(), ResolutionTypeSlotId::new(4)),
-                type_slot_semantic(fragment(), ResolutionTypeSlotId::new(5)),
-            ]
-        );
-        assert_eq!(obligation.explicit_type_argument_count(), 2);
-        assert_eq!(
-            obligation.applicability_reason(),
-            gap_reason_semantic(
-                fragment(),
-                ResolutionSiteId::new(3),
-                LoweringGapOrigin::Extracted(ResolutionGapKind::UnsupportedCallApplicability,),
-            )
-        );
-        assert!(matches!(
-            obligation.completion(),
-            ResolutionCompletion::Incomplete(reasons)
-                if reasons.contains(&ResolutionIncompleteReason::UnsupportedSemantic(
-                    obligation.applicability_reason()
-                ))
-        ));
-
-        let signature = lowered
-            .callable_signatures()
-            .iter()
-            .find(|signature| {
-                signature.definition() == definition_semantic(fragment(), ResolutionSiteId::new(1))
-            })
-            .expect("constructor signature");
-        assert_eq!(signature.type_parameter_count(), 3);
-        assert_eq!(
-            signature
-                .parameters()
-                .iter()
-                .map(LoweredCallableParameterProperty::ordinal)
-                .collect::<Vec<_>>(),
-            vec![0, 1]
-        );
-        assert!(!signature.parameters()[0].repeated());
-        assert!(signature.parameters()[1].repeated());
-        assert_eq!(signature.completion(), &ResolutionCompletion::Complete);
-    }
-
-    #[test]
     fn intrinsic_seed_category_is_explicit_and_unsupported_roles_are_incomplete() {
         let mut facts = declared_and_observed_facts();
         facts
@@ -7247,63 +7871,6 @@ mod tests {
             unsupported.frontier().completion(),
             ResolutionCompletion::Incomplete(_)
         ));
-    }
-
-    #[test]
-    fn signed_pointer_delta_is_a_rule_not_a_precomputed_value() {
-        let mut facts = FileResolutionFacts {
-            names: vec![name(0, "T")],
-            scopes: vec![scope(
-                0,
-                None,
-                None,
-                ResolutionScopeKind::CompilationUnit,
-                0,
-                20,
-            )],
-            sites: vec![site(0, 0, ResolutionSiteKind::Literal, 1)],
-            type_slots: vec![
-                slot(0, 0, ResolutionTypeSlotRole::ExpressionValue),
-                slot(1, 0, ResolutionTypeSlotRole::AssignmentValue),
-            ],
-            type_transfers: vec![transfer(
-                0,
-                1,
-                ResolutionTypeTransferKind::Assignment,
-                -1,
-                ResolutionTypeTransferValueTransform::Preserve,
-            )],
-            intrinsic_type_seeds: vec![IntrinsicTypeSeedFact {
-                output: ResolutionTypeSlotId::new(0),
-                name: ResolutionNameId::new(0),
-                kind: IntrinsicTypeKind::LanguageBuiltin,
-                indirection: 2,
-            }],
-            ..FileResolutionFacts::default()
-        };
-        let lowered = crate::analyzer::resolution::lower_for_test(fragment(), Language::Go, &facts)
-            .typed()
-            .clone();
-        let rule = lowered.transfers()[0].rule();
-        assert_eq!(rule.indirection_delta(), -1);
-        let input = lowered.intrinsic_seeds()[0].frontier().possible_values()[0];
-        let TypeTransferApplication::Value(decremented) = rule.apply(input) else {
-            panic!("2 - 1 is representable")
-        };
-        assert_eq!(decremented.ty().indirection(), 1);
-
-        facts.type_transfers[0].indirection_delta = 1;
-        let incremented =
-            crate::analyzer::resolution::lower_for_test(fragment(), Language::Go, &facts)
-                .typed()
-                .clone();
-        assert_eq!(incremented.transfers()[0].rule().indirection_delta(), 1);
-        let TypeTransferApplication::Value(incremented_value) =
-            incremented.transfers()[0].rule().apply(input)
-        else {
-            panic!("2 + 1 is representable")
-        };
-        assert_eq!(incremented_value.ty().indirection(), 3);
     }
 
     #[test]
@@ -7442,7 +8009,7 @@ mod tests {
             .last_mut()
             .unwrap()
             .value_transform =
-            ResolutionTypeTransferValueTransform::ToRuntime { addressable: false };
+            ResolutionTypeTransferValueTransform::ToRuntime { addressable: true };
         let mut wrong_source_role = valid.clone();
         wrong_source_role.type_transfers.last_mut().unwrap().input = ResolutionTypeSlotId::new(0);
         let mut wrong_target_role = valid.clone();
@@ -7514,7 +8081,7 @@ mod tests {
                 prior.target_slot(),
                 0,
                 0,
-                TypeTransferValueTransform::ToRuntime { addressable: false },
+                TypeTransferValueTransform::ToRuntime { addressable: true },
                 prior.completion().clone(),
             );
         let mut wrong_source_role = valid.clone();
@@ -7548,155 +8115,6 @@ mod tests {
             assert!(
                 std::panic::catch_unwind(|| renormalize_hydrated(invalid)).is_err(),
                 "invalid hydrated initialization transfer must be rejected"
-            );
-        }
-    }
-
-    #[test]
-    fn unwrap_transfer_contract_is_enforced_at_source() {
-        let valid = unwrap_facts();
-        let lowered =
-            crate::analyzer::resolution::lower_for_test(fragment(), Language::Rust, &valid)
-                .typed()
-                .clone();
-        let unwrap = lowered
-            .transfers()
-            .iter()
-            .find(|transfer| transfer.kind() == ResolutionTypeTransferKind::Unwrap)
-            .expect("lowered unwrap transfer");
-        assert_eq!(unwrap.rule().indirection_delta(), -1);
-        assert_eq!(unwrap.rule().reference_indirection_delta(), 0);
-        assert_eq!(
-            unwrap.rule().value_transform(),
-            TypeTransferValueTransform::Preserve
-        );
-
-        let unwrap_index = valid
-            .type_transfers
-            .iter()
-            .position(|transfer| transfer.kind == ResolutionTypeTransferKind::Unwrap)
-            .expect("source unwrap transfer");
-        // A positive delta would add a layer the encoding never wrote.
-        let mut positive_delta = valid.clone();
-        positive_delta.type_transfers[unwrap_index].indirection_delta = 1;
-        // A reference delta would claim the discharged layer was a borrow.
-        let mut reference_delta = valid.clone();
-        reference_delta.type_transfers[unwrap_index].reference_indirection_delta = -1;
-        let mut wrong_category = valid.clone();
-        wrong_category.type_transfers[unwrap_index].value_transform =
-            ResolutionTypeTransferValueTransform::ToRuntime { addressable: false };
-        // A type object is not an unwrappable operand.
-        let mut wrong_source_role = valid.clone();
-        wrong_source_role.type_transfers[unwrap_index].input = ResolutionTypeSlotId::new(0);
-        // The output must be a call result, so `Initialization` can take it.
-        let mut wrong_target_role = valid.clone();
-        wrong_target_role.type_slots[3] = slot(3, 5, ResolutionTypeSlotRole::ExpressionValue);
-
-        for invalid in [
-            positive_delta,
-            reference_delta,
-            wrong_category,
-            wrong_source_role,
-            wrong_target_role,
-        ] {
-            assert!(
-                std::panic::catch_unwind(|| {
-                    crate::analyzer::resolution::lower_for_test(
-                        fragment(),
-                        Language::Rust,
-                        &invalid,
-                    )
-                    .typed()
-                    .clone()
-                })
-                .is_err(),
-                "invalid source unwrap transfer must be rejected"
-            );
-        }
-    }
-
-    #[test]
-    fn unwrap_transfer_contract_is_enforced_after_hydration() {
-        let valid = crate::analyzer::resolution::lower_for_test(
-            fragment(),
-            Language::Rust,
-            &unwrap_facts(),
-        )
-        .typed()
-        .clone();
-        let unwrap_index = valid
-            .transfers
-            .iter()
-            .position(|transfer| transfer.kind == ResolutionTypeTransferKind::Unwrap)
-            .expect("lowered unwrap transfer");
-        let rebuilt = |fragment: &LoweredTypedFragment,
-                       delta: i64,
-                       reference_delta: i64,
-                       transform: TypeTransferValueTransform,
-                       target: SemanticId| {
-            let prior = fragment.transfers[unwrap_index].rule().clone();
-            TypeTransferRule::new_with_reference_indirection(
-                prior.semantic(),
-                target,
-                delta,
-                reference_delta,
-                transform,
-                prior.completion().clone(),
-            )
-        };
-
-        let mut positive_delta = valid.clone();
-        let target = positive_delta.transfers[unwrap_index].rule().target_slot();
-        positive_delta.transfers[unwrap_index].rule = rebuilt(
-            &positive_delta,
-            1,
-            0,
-            TypeTransferValueTransform::Preserve,
-            target,
-        );
-        let mut reference_delta = valid.clone();
-        reference_delta.transfers[unwrap_index].rule = rebuilt(
-            &reference_delta,
-            -1,
-            -1,
-            TypeTransferValueTransform::Preserve,
-            target,
-        );
-        let mut wrong_category = valid.clone();
-        wrong_category.transfers[unwrap_index].rule = rebuilt(
-            &wrong_category,
-            -1,
-            0,
-            TypeTransferValueTransform::ToRuntime { addressable: false },
-            target,
-        );
-        let mut wrong_source_role = valid.clone();
-        wrong_source_role.transfers[unwrap_index].source_slot =
-            type_slot_semantic(fragment(), ResolutionTypeSlotId::new(0));
-        let mut wrong_target_role = valid.clone();
-        let invalid_target = SemanticId::for_test(b"invalid-unwrap-target-role");
-        wrong_target_role.frontiers.push(LoweredTypedFrontier::new(
-            invalid_target,
-            ResolutionTypeSlotRole::ExpressionValue,
-        ));
-        wrong_target_role.transfers[unwrap_index].rule = rebuilt(
-            &wrong_target_role,
-            -1,
-            0,
-            TypeTransferValueTransform::Preserve,
-            invalid_target,
-        );
-
-        for invalid in [
-            positive_delta,
-            reference_delta,
-            wrong_category,
-            wrong_source_role,
-            wrong_target_role,
-        ] {
-            assert!(
-                std::panic::catch_unwind(|| renormalize_hydrated(invalid)).is_err(),
-                "invalid hydrated unwrap transfer must be rejected"
             );
         }
     }
@@ -7743,58 +8161,6 @@ mod tests {
             .frontier()
             .possible_values()[0];
         assert_eq!(rule.apply(input), TypeTransferApplication::NoValue);
-    }
-
-    #[test]
-    fn implicit_constructor_and_hierarchy_gaps_are_owned_properties() {
-        let mut facts = hierarchy_facts();
-        facts.declaration_visibilities[0].visibility = DeclaredVisibility::PackagePrivate;
-        facts.gaps.push(ResolutionGapFact {
-            site: ResolutionSiteId::new(0),
-            kind: ResolutionGapKind::UnsupportedVisibility,
-        });
-        let lowered =
-            crate::analyzer::resolution::lower_for_test(fragment(), Language::Java, &facts)
-                .typed()
-                .clone();
-        let subtype = definition_semantic(fragment(), ResolutionSiteId::new(0));
-        let implicit = lowered
-            .property_gaps()
-            .iter()
-            .find(|gap| gap.kind() == ResolutionGapKind::ImplicitConstructor)
-            .expect("implicit constructor property gap");
-        assert_eq!(implicit.definition(), subtype);
-        assert_eq!(
-            implicit.frontier(),
-            site_type_frontier_semantic(fragment(), ResolutionSiteId::new(0))
-        );
-        let hierarchy = lowered
-            .property_gaps()
-            .iter()
-            .find(|gap| gap.kind() == ResolutionGapKind::UnsupportedHierarchyTraversal)
-            .expect("hierarchy property gap");
-        assert_eq!(hierarchy.definition(), subtype);
-        assert_eq!(
-            hierarchy.frontier(),
-            type_slot_semantic(fragment(), ResolutionTypeSlotId::new(0))
-        );
-        let supertype = lowered.supertypes()[0];
-        assert_eq!(supertype.definition(), subtype);
-        assert_eq!(
-            supertype.reference(),
-            reference_semantic(fragment(), ResolutionSiteId::new(1))
-        );
-        assert_eq!(supertype.frontier(), hierarchy.frontier());
-        let visibility = lowered
-            .property_gaps()
-            .iter()
-            .find(|gap| gap.kind() == ResolutionGapKind::UnsupportedVisibility)
-            .expect("visibility property gap");
-        assert_eq!(visibility.definition(), subtype);
-        assert_eq!(
-            visibility.frontier(),
-            site_type_frontier_semantic(fragment(), ResolutionSiteId::new(0))
-        );
     }
 
     #[test]
@@ -7856,68 +8222,13 @@ mod tests {
         );
     }
 
-    #[test]
-    #[should_panic(expected = "unknown resolution type slot")]
-    fn malformed_projection_slot_is_rejected_at_construction() {
-        let mut facts = hierarchy_facts();
-        facts.binding_projections[0].output = ResolutionTypeSlotId::new(99);
-        let _ = crate::analyzer::resolution::lower_for_test(fragment(), Language::Java, &facts)
-            .typed()
-            .clone();
-    }
-
-    #[test]
-    #[should_panic(expected = "multiple output producers")]
-    fn intrinsic_and_projection_cannot_produce_the_same_slot() {
-        let mut facts = hierarchy_facts();
-        facts.intrinsic_type_seeds.push(IntrinsicTypeSeedFact {
-            output: ResolutionTypeSlotId::new(0),
-            name: ResolutionNameId::new(1),
-            kind: IntrinsicTypeKind::LanguageBuiltin,
-            indirection: 0,
-        });
-        let _ = crate::analyzer::resolution::lower_for_test(fragment(), Language::Java, &facts)
-            .typed()
-            .clone();
-    }
-
-    #[test]
-    #[should_panic(expected = "multiple output producers")]
-    fn projection_and_transfer_cannot_produce_the_same_slot() {
-        let mut facts = constructor_facts();
-        facts.type_transfers.push(transfer(
-            0,
-            1,
-            ResolutionTypeTransferKind::Construction,
-            0,
-            ResolutionTypeTransferValueTransform::ToRuntime { addressable: false },
-        ));
-        let _ = crate::analyzer::resolution::lower_for_test(fragment(), Language::Java, &facts)
-            .typed()
-            .clone();
-    }
-
-    #[test]
-    #[should_panic(expected = "one declaration type slot per (definition, role)")]
-    fn declaration_definition_role_has_one_type_slot() {
-        let mut facts = declared_and_observed_facts();
-        facts
-            .type_slots
-            .push(slot(7, 1, ResolutionTypeSlotRole::DeclaredValue));
-        facts.declaration_type_slots.push(DeclarationTypeSlotFact {
-            declaration: ResolutionSiteId::new(1),
-            slot: ResolutionTypeSlotId::new(7),
-            role: DeclarationTypeRole::Value,
-        });
-        let _ = crate::analyzer::resolution::lower_for_test(fragment(), Language::Java, &facts)
-            .typed()
-            .clone();
-    }
-
     /// A hierarchy gap on a type reference that no supertype property names is
     /// a frontier-owned incompleteness: a trait's abstract `Self`, or a `dyn`,
     /// `impl Trait` or bounded head. It lowers without a definition property
     /// row rather than being rejected.
+    #[brokk_bifrost_test_macros::hardwon(
+        "6a9b710f7dc8: frontier-owned hierarchy gaps were rejected without a definition owner"
+    )]
     #[test]
     fn frontier_owned_hierarchy_gap_lowers_without_a_definition_property() {
         let mut facts = hierarchy_facts();
@@ -7973,6 +8284,7 @@ mod tests {
         });
         facts.supertypes = vec![ResolutionSupertypeFact {
             subtype: ResolutionSiteId::new(0),
+            parent_ordinal: 0,
             supertype_reference: ResolutionSiteId::new(5),
             supertype_slot: ResolutionTypeSlotId::new(2),
             kind: hierarchy.supertypes[0].kind,

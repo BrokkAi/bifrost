@@ -11,15 +11,51 @@ use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
 use brokk_bifrost_core::analyzer::resolution_facts::{
     ResolutionNamespace, ResolutionScopeId, ResolutionSiteId,
 };
+use std::collections::hash_map::Entry;
 
 use crate::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 
 use super::fact_lowering::LoweredSemanticRole;
+use super::fact_source::{ResolutionIdentityDomain, language_identity_domain};
 use super::model::{
     BindingFragmentId, BindingNodeId, MOUNT_ORDINAL_LIMIT, PartialPathId, PrecedenceStep,
     SemanticId, SharedNameId, StackVariableId, UNMOUNTED_ORDINAL,
 };
+
+fn shared_name_digest(
+    shared_name_digests: &HashMap<SharedNameId, [u8; 32]>,
+    name: SharedNameId,
+) -> [u8; 32] {
+    shared_name_digests
+        .get(&name)
+        .copied()
+        .unwrap_or_else(|| panic!("a shared name this blob mentions carries its digest: {name}"))
+}
+
+fn semantic_identity_hash_bytes(
+    shared_name_digests: &HashMap<SharedNameId, [u8; 32]>,
+    identity: ResolutionSemanticIdentity,
+) -> [u8; 32] {
+    match identity {
+        ResolutionSemanticIdentity::FragmentLocal(digest)
+        | ResolutionSemanticIdentity::GapReason(digest) => digest,
+        ResolutionSemanticIdentity::Shared(name) => shared_name_digest(shared_name_digests, name),
+    }
+}
+
+fn record_site_value<Value>(
+    values: &mut HashMap<ResolutionSiteId, Value>,
+    site: ResolutionSiteId,
+    value: Value,
+    invariant: &str,
+) where
+    Value: Copy + Eq + std::fmt::Debug,
+{
+    if let Some(previous) = values.insert(site, value) {
+        assert_eq!(previous, value, "{invariant}: {site:?}");
+    }
+}
 
 /// Derive the content key of one exact selected workspace mount.
 ///
@@ -88,6 +124,7 @@ pub(crate) struct SelectedSemanticLocator {
     relative_path: String,
     address: SelectedSemanticAddress,
     role: LoweredSemanticRole,
+    reference_namespace: Option<ResolutionNamespace>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -119,6 +156,7 @@ impl SelectedSemanticLocator {
             relative_path,
             address: SelectedSemanticAddress::SourceSite(source_site),
             role,
+            reference_namespace: None,
         }
     }
 
@@ -145,15 +183,35 @@ impl SelectedSemanticLocator {
             !relative_path.is_empty(),
             "a selected semantic locator needs a persisted relative path"
         );
-        Self {
+        Self::for_range(
             storage_language,
             relative_path,
-            address: SelectedSemanticAddress::ReferenceRange {
+            SelectedSemanticAddress::ReferenceRange {
                 start_byte,
                 end_byte,
             },
-            role: LoweredSemanticRole::Reference,
-        }
+            LoweredSemanticRole::Reference,
+        )
+    }
+
+    /// Address one exact reference namespace when source syntax admits more
+    /// than one native reference over the same token, as Java construction
+    /// syntax does for its type and constructor name.
+    pub(crate) fn for_reference_range_in_namespace(
+        storage_language: impl Into<String>,
+        relative_path: impl Into<String>,
+        start_byte: usize,
+        end_byte: usize,
+        namespace: ResolutionNamespace,
+    ) -> Self {
+        let mut locator =
+            Self::for_reference_range(storage_language, relative_path, start_byte, end_byte);
+        locator.reference_namespace = Some(namespace);
+        locator
+    }
+
+    pub(crate) const fn reference_namespace(&self) -> Option<ResolutionNamespace> {
+        self.reference_namespace
     }
 
     /// Address the name of a native declaration, independently of references.
@@ -168,14 +226,29 @@ impl SelectedSemanticLocator {
         let relative_path = relative_path.into();
         assert!(!storage_language.is_empty());
         assert!(!relative_path.is_empty());
-        Self {
+        Self::for_range(
             storage_language,
             relative_path,
-            address: SelectedSemanticAddress::DeclarationRange {
+            SelectedSemanticAddress::DeclarationRange {
                 start_byte,
                 end_byte,
             },
-            role: LoweredSemanticRole::Definition,
+            LoweredSemanticRole::Definition,
+        )
+    }
+
+    fn for_range(
+        storage_language: String,
+        relative_path: String,
+        address: SelectedSemanticAddress,
+        role: LoweredSemanticRole,
+    ) -> Self {
+        Self {
+            storage_language,
+            relative_path,
+            address,
+            role,
+            reference_namespace: None,
         }
     }
 
@@ -251,6 +324,10 @@ impl ResolutionLocalKey {
 
     pub(crate) const fn get(self) -> i64 {
         self.0
+    }
+
+    pub(crate) fn try_u32(self) -> Option<u32> {
+        u32::try_from(self.0).ok()
     }
 }
 
@@ -342,11 +419,7 @@ impl SelectedSemanticProvenance {
         local_key: ResolutionLocalKey,
         identity: ResolutionSemanticIdentity,
     ) -> Self {
-        Self::FragmentLocal(SelectedLocalIdentityProvenance {
-            mount,
-            local_key,
-            identity,
-        })
+        Self::FragmentLocal(local_identity_provenance(mount, local_key, identity))
     }
 }
 
@@ -372,11 +445,19 @@ impl SelectedNodeProvenance {
         local_key: ResolutionLocalKey,
         identity: ResolutionNodeIdentity,
     ) -> Self {
-        Self::FragmentLocal(SelectedLocalIdentityProvenance {
-            mount,
-            local_key,
-            identity,
-        })
+        Self::FragmentLocal(local_identity_provenance(mount, local_key, identity))
+    }
+}
+
+const fn local_identity_provenance<Identity>(
+    mount: SelectedResolutionMount,
+    local_key: ResolutionLocalKey,
+    identity: Identity,
+) -> SelectedLocalIdentityProvenance<Identity> {
+    SelectedLocalIdentityProvenance {
+        mount,
+        local_key,
+        identity,
     }
 }
 
@@ -995,14 +1076,15 @@ impl MountRebaser {
     pub(crate) fn register_context_owned_semantic(
         &mut self,
         semantic: SemanticId,
+        content_digest: [u8; 32],
         names: &dyn SharedNameInterner,
     ) {
-        // The interner keys on a 32-byte digest, which is what a shared name
-        // is interned by. A context-owned reason is not a name any blob
-        // published, so what it needs is a key no blob's name can collide
-        // with; its own eight bytes in an otherwise zero digest are that.
-        let mut key = [0; 32];
-        key[24..].copy_from_slice(&semantic.as_bytes());
+        // This private interner key is derived from the reason's content in a
+        // separate domain. It cannot inherit the context's encounter order.
+        let key = brokk_bifrost_core::analyzer::canonical_hash::hash_domain_bytes(
+            b"bifrost-resolution-context-reason-interner:v1",
+            &content_digest,
+        );
         let name = names.intern(key);
         assert!(
             !name.is_interned(),
@@ -1189,8 +1271,9 @@ impl MountRebaser {
 /// it. The conversion is written once so that a key that does not fit fails
 /// here rather than silently truncating into an identity.
 fn local_key_u32(local_key: ResolutionLocalKey) -> u32 {
-    u32::try_from(local_key.get())
-        .unwrap_or_else(|_| panic!("a storage-local key fits u32: {}", local_key.get()))
+    local_key
+        .try_u32()
+        .unwrap_or_else(|| panic!("a storage-local key fits u32: {}", local_key.get()))
 }
 
 fn register_bijection<Left, Right>(
@@ -1359,6 +1442,11 @@ pub(crate) fn test_shared_names() -> &'static dyn SharedNameInterner {
 #[derive(Debug, Default)]
 pub(crate) struct TestSharedNames {
     ids: std::sync::Mutex<HashMap<[u8; 32], SharedNameId>>,
+    digests: std::sync::Mutex<Vec<[u8; 32]>>,
+}
+
+fn per_request_shared_name_id(ordinal: usize, overflow: &'static str) -> SharedNameId {
+    SharedNameId::per_request(u32::try_from(ordinal).unwrap_or_else(|_| panic!("{overflow}")))
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1368,10 +1456,30 @@ impl SharedNameInterner for TestSharedNames {
             .ids
             .lock()
             .expect("the test shared-name table is not poisoned");
+        if let Some(&id) = ids.get(&digest) {
+            return id;
+        }
+        let mut digests = self
+            .digests
+            .lock()
+            .expect("the test shared-name digest table is not poisoned");
         let next =
-            u32::try_from(ids.len()).expect("a test binary mints fewer names than u32 holds");
-        *ids.entry(digest)
-            .or_insert_with(|| SharedNameId::per_request(next))
+            per_request_shared_name_id(ids.len(), "a test binary mints fewer names than u32 holds");
+        assert_eq!(digests.len(), ids.len());
+        digests.push(digest);
+        *ids.entry(digest).or_insert(next)
+    }
+
+    fn digest_for_id(&self, id: SharedNameId) -> Option<[u8; 32]> {
+        if id.is_interned() {
+            return None;
+        }
+        let ordinal = usize::try_from(id.get() - SharedNameId::PER_REQUEST_BASE).ok()?;
+        self.digests
+            .lock()
+            .expect("the test shared-name digest table is not poisoned")
+            .get(ordinal)
+            .copied()
     }
 }
 
@@ -1389,6 +1497,13 @@ impl SharedNameInterner for TestSharedNames {
 pub trait SharedNameInterner: std::fmt::Debug {
     /// The id of one shared name, by the 32-byte digest that names it.
     fn intern(&self, digest: [u8; 32]) -> SharedNameId;
+
+    /// Return a digest already associated with an identity in this interner.
+    /// This does not perform store I/O; store-backed interners may leave a
+    /// durable identity unknown until its digest is requested from SQLite.
+    fn digest_for_id(&self, _id: SharedNameId) -> Option<[u8; 32]> {
+        None
+    }
 
     /// Decode a stored name into the request's established identity.
     ///
@@ -1455,12 +1570,19 @@ impl SharedNameInterner for PerRequestSharedNames {
             return id;
         }
         let mut digests = self.digests.borrow_mut();
-        let id = SharedNameId::per_request(
-            u32::try_from(digests.len()).expect("a per-request shared name ordinal fits u32"),
-        );
+        let id =
+            per_request_shared_name_id(digests.len(), "a per-request shared name ordinal fits u32");
         digests.push(digest);
         self.names.borrow_mut().insert(digest, id);
         id
+    }
+
+    fn digest_for_id(&self, id: SharedNameId) -> Option<[u8; 32]> {
+        if id.is_interned() {
+            return None;
+        }
+        let ordinal = usize::try_from(id.get() - SharedNameId::PER_REQUEST_BASE).ok()?;
+        self.digests.borrow().get(ordinal).copied()
     }
 }
 
@@ -1472,7 +1594,7 @@ impl SharedNameInterner for PerRequestSharedNames {
 /// relation without trying to invert an opaque semantic digest.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct ResolutionLookupSemanticRecipe {
-    semantic_language: String,
+    identity_domain: ResolutionIdentityDomain,
     namespace: ResolutionNamespace,
     spelling: String,
 }
@@ -1481,19 +1603,25 @@ impl ResolutionLookupSemanticRecipe {
     /// The heap this recipe owns beyond its own inline size.
     pub(crate) fn owned_bytes(&self) -> usize {
         let Self {
-            semantic_language,
+            identity_domain: _,
             namespace: _,
             spelling,
         } = self;
-        semantic_language
-            .capacity()
-            .saturating_add(spelling.capacity())
+        spelling.capacity()
     }
 
     pub(crate) fn new(language: Language, namespace: ResolutionNamespace, spelling: &str) -> Self {
+        Self::new_in_domain(language_identity_domain(language), namespace, spelling)
+    }
+
+    pub(crate) fn new_in_domain(
+        identity_domain: ResolutionIdentityDomain,
+        namespace: ResolutionNamespace,
+        spelling: &str,
+    ) -> Self {
         assert_ne!(
-            language,
-            Language::None,
+            identity_domain,
+            ResolutionIdentityDomain::Language(Language::None),
             "a resolution lookup recipe needs a semantic language"
         );
         assert!(
@@ -1514,14 +1642,14 @@ impl ResolutionLookupSemanticRecipe {
             "a resolution lookup recipe needs a nonempty spelling"
         );
         Self {
-            semantic_language: language.config_label().to_owned(),
+            identity_domain,
             namespace,
             spelling: spelling.to_owned(),
         }
     }
 
-    pub(crate) fn semantic_language(&self) -> &str {
-        &self.semantic_language
+    pub(crate) const fn identity_domain(&self) -> ResolutionIdentityDomain {
+        self.identity_domain
     }
 
     pub(crate) const fn namespace(&self) -> ResolutionNamespace {
@@ -1538,18 +1666,22 @@ impl ResolutionLookupSemanticRecipe {
     /// creates the row whose id the recipe then is.
     pub(crate) fn name_digest(&self) -> [u8; 32] {
         let mut hasher = CanonicalHasher::new(b"bifrost-resolution-effective-lookup-key:v1");
-        hasher.field("language", self.semantic_language.as_bytes());
+        hasher.field("language", self.identity_domain.identity_label().as_bytes());
         hasher.field("namespace", self.namespace.identity_label().as_bytes());
         hasher.field("spelling", self.spelling.as_bytes());
         hasher.finish()
     }
 
     pub(crate) fn identity(&self, names: &dyn SharedNameInterner) -> ResolutionSemanticIdentity {
-        ResolutionSemanticIdentity::shared(names.intern(self.name_digest()))
+        ResolutionSemanticIdentity::shared(self.shared_name_id(names))
     }
 
     pub(crate) fn semantic(&self, names: &dyn SharedNameInterner) -> SemanticId {
-        SemanticId::shared_name(names.intern(self.name_digest()))
+        SemanticId::shared_name(self.shared_name_id(names))
+    }
+
+    fn shared_name_id(&self, names: &dyn SharedNameInterner) -> SharedNameId {
+        names.intern(self.name_digest())
     }
 }
 
@@ -1635,6 +1767,10 @@ pub(crate) struct ResolutionIdentityCatalogBuilder<'a> {
     site_semantics: HashMap<ResolutionSiteId, SemanticId>,
     site_nodes: HashMap<ResolutionSiteId, BindingNodeId>,
     source_scope_ordinals: HashMap<BindingNodeId, ResolutionScopeId>,
+    // One blob's lowering reuses a scope across lexical, typed and common
+    // paths. Memoize before hashing; this map is dropped when finish seals
+    // the catalog and is never retained by a mounted selection.
+    source_scope_nodes: HashMap<ResolutionScopeId, BindingNodeId>,
     paths: HashMap<PartialPathId, ResolutionPathIdentity>,
     paths_by_identity: HashMap<ResolutionPathIdentity, PartialPathId>,
     stack_variables: HashMap<StackVariableId, ResolutionStackVariableIdentity>,
@@ -1650,6 +1786,39 @@ pub(crate) struct ResolutionIdentityCatalogBuilder<'a> {
     /// it ended up at. That is why `rekey_dense`'s translation is total in this
     /// stage where it used to be partial.
     provisional: [u32; 4],
+}
+
+fn next_identity_provisional(provisional: &mut [u32; 4], kind: usize) -> u32 {
+    let key = provisional[kind];
+    provisional[kind] = key
+        .checked_add(1)
+        .unwrap_or_else(|| panic!("a blob's identity catalog fits u32: {key}"));
+    key
+}
+
+fn intern_identity<Mounted, Identity>(
+    by_mounted: &mut HashMap<Mounted, Identity>,
+    by_identity: &mut HashMap<Identity, Mounted>,
+    identity: Identity,
+    make_mounted: impl FnOnce() -> Mounted,
+    label: &str,
+) -> Mounted
+where
+    Mounted: Copy + std::fmt::Debug + Eq + std::hash::Hash,
+    Identity: Copy + std::fmt::Debug + Eq + std::hash::Hash,
+{
+    match by_identity.entry(identity) {
+        Entry::Occupied(entry) => *entry.get(),
+        Entry::Vacant(entry) => {
+            let mounted = make_mounted();
+            assert!(
+                by_mounted.insert(mounted, identity).is_none(),
+                "mounted resolution {label} has conflicting local identities: {mounted:?}"
+            );
+            entry.insert(mounted);
+            mounted
+        }
+    }
 }
 
 impl<'a> ResolutionIdentityCatalogBuilder<'a> {
@@ -1670,6 +1839,7 @@ impl<'a> ResolutionIdentityCatalogBuilder<'a> {
             site_semantics: HashMap::default(),
             site_nodes: HashMap::default(),
             source_scope_ordinals: HashMap::default(),
+            source_scope_nodes: HashMap::default(),
             paths: HashMap::default(),
             paths_by_identity: HashMap::default(),
             stack_variables: HashMap::default(),
@@ -1681,11 +1851,7 @@ impl<'a> ResolutionIdentityCatalogBuilder<'a> {
     /// The next provisional key of one kind: semantics 0, nodes 1, paths 2,
     /// stack variables 3.
     fn next_provisional(&mut self, kind: usize) -> u32 {
-        let key = self.provisional[kind];
-        self.provisional[kind] = key
-            .checked_add(1)
-            .unwrap_or_else(|| panic!("a blob's identity catalog fits u32: {key}"));
-        key
+        next_identity_provisional(&mut self.provisional, kind)
     }
 
     pub(crate) const fn fragment(&self) -> BindingFragmentId {
@@ -1707,28 +1873,24 @@ impl<'a> ResolutionIdentityCatalogBuilder<'a> {
         // number is a counter, so the memo is what gives it back, and without
         // it the second ask mints a second id and the catalog's own bijection
         // assertion fires.
-        if let Some(mounted) = self.semantics_by_identity.get(&identity) {
-            return *mounted;
-        }
-        let mounted = identity.mounted(UNMOUNTED_ORDINAL, self.next_provisional(0));
-        register_identity(
-            &mut self.semantics,
-            &mut self.semantics_by_identity,
-            mounted,
+        let Self {
+            semantics,
+            semantics_by_identity,
+            provisional,
+            ..
+        } = self;
+        intern_identity(
+            semantics,
+            semantics_by_identity,
             identity,
+            || identity.mounted(UNMOUNTED_ORDINAL, next_identity_provisional(provisional, 0)),
             "semantic",
-        );
-        mounted
+        )
     }
 
     /// The digest that names one shared name this blob mentions.
     pub(crate) fn shared_name_digest(&self, name: SharedNameId) -> [u8; 32] {
-        self.shared_name_digests
-            .get(&name)
-            .copied()
-            .unwrap_or_else(|| {
-                panic!("a shared name this blob mentions carries its digest: {name}")
-            })
+        shared_name_digest(&self.shared_name_digests, name)
     }
 
     /// The bytes one registered semantic identity contributes to a lowered
@@ -1739,11 +1901,7 @@ impl<'a> ResolutionIdentityCatalogBuilder<'a> {
     /// property of one store's interning table, and a lowered digest that
     /// moved with it would differ between two caches holding the same file.
     pub(crate) fn identity_hash_bytes(&self, identity: ResolutionSemanticIdentity) -> [u8; 32] {
-        match identity {
-            ResolutionSemanticIdentity::FragmentLocal(digest)
-            | ResolutionSemanticIdentity::GapReason(digest) => digest,
-            ResolutionSemanticIdentity::Shared(name) => self.shared_name_digest(name),
-        }
+        semantic_identity_hash_bytes(&self.shared_name_digests, identity)
     }
 
     /// One shared name, interned, as the semantic every mount meets it by.
@@ -1764,7 +1922,17 @@ impl<'a> ResolutionIdentityCatalogBuilder<'a> {
         namespace: ResolutionNamespace,
         spelling: &str,
     ) -> SemanticId {
-        let recipe = ResolutionLookupSemanticRecipe::new(language, namespace, spelling);
+        self.lookup_semantic_in_domain(language_identity_domain(language), namespace, spelling)
+    }
+
+    pub(crate) fn lookup_semantic_in_domain(
+        &mut self,
+        identity_domain: ResolutionIdentityDomain,
+        namespace: ResolutionNamespace,
+        spelling: &str,
+    ) -> SemanticId {
+        let recipe =
+            ResolutionLookupSemanticRecipe::new_in_domain(identity_domain, namespace, spelling);
         let semantic = self.shared_name(recipe.name_digest());
         register_lookup_recipe(
             &mut self.lookup_recipes,
@@ -1818,25 +1986,30 @@ impl<'a> ResolutionIdentityCatalogBuilder<'a> {
 
     pub(crate) fn node(&mut self, identity: ResolutionNodeIdentity) -> BindingNodeId {
         // One identity, one id. See `Self::semantic`.
-        if let Some(mounted) = self.nodes_by_identity.get(&identity) {
-            return *mounted;
-        }
-        let mounted = identity.mounted(UNMOUNTED_ORDINAL, self.next_provisional(1));
-        register_identity(
-            &mut self.nodes,
-            &mut self.nodes_by_identity,
-            mounted,
+        let Self {
+            nodes,
+            nodes_by_identity,
+            provisional,
+            ..
+        } = self;
+        intern_identity(
+            nodes,
+            nodes_by_identity,
             identity,
+            || identity.mounted(UNMOUNTED_ORDINAL, next_identity_provisional(provisional, 1)),
             "node",
-        );
-        mounted
+        )
     }
 
     pub(crate) fn source_scope_node(&mut self, scope: ResolutionScopeId) -> BindingNodeId {
+        if let Some(&mounted) = self.source_scope_nodes.get(&scope) {
+            return mounted;
+        }
         let mounted = self.node(super::fact_lowering::scope_head_node_identity(scope));
         if let Some(previous) = self.source_scope_ordinals.insert(mounted, scope) {
             assert_eq!(previous, scope, "source scope node has one ordinal");
         }
+        assert!(self.source_scope_nodes.insert(scope, mounted).is_none());
         mounted
     }
 
@@ -1844,66 +2017,83 @@ impl<'a> ResolutionIdentityCatalogBuilder<'a> {
     /// semantic goes through this or [`Self::source_definition_semantic`], so
     /// that `finish` can give the site its own catalog position.
     pub(crate) fn source_reference_semantic(&mut self, site: ResolutionSiteId) -> SemanticId {
-        let mounted = self.semantic(super::fact_lowering::reference_semantic_identity(site));
-        self.record_site_semantic(site, mounted);
-        mounted
+        self.source_semantic(
+            site,
+            super::fact_lowering::reference_semantic_identity(site),
+        )
     }
 
     /// The semantic of one definition site. See
     /// [`Self::source_reference_semantic`].
     pub(crate) fn source_definition_semantic(&mut self, site: ResolutionSiteId) -> SemanticId {
-        let mounted = self.semantic(super::fact_lowering::definition_semantic_identity(site));
+        self.source_semantic(
+            site,
+            super::fact_lowering::definition_semantic_identity(site),
+        )
+    }
+
+    fn source_semantic(
+        &mut self,
+        site: ResolutionSiteId,
+        identity: ResolutionSemanticIdentity,
+    ) -> SemanticId {
+        let mounted = self.semantic(identity);
         self.record_site_semantic(site, mounted);
         mounted
     }
 
     fn record_site_semantic(&mut self, site: ResolutionSiteId, semantic: SemanticId) {
-        if let Some(previous) = self.site_semantics.insert(site, semantic) {
-            assert_eq!(
-                previous, semantic,
-                "a resolution site has one semantic, so that its site, semantic \
-                 and node can share one number: {site:?}"
-            );
-        }
+        record_site_value(
+            &mut self.site_semantics,
+            site,
+            semantic,
+            "a resolution site has one semantic, so that its site, semantic and node can share one number",
+        );
     }
 
     fn record_site_node(&mut self, site: ResolutionSiteId, node: BindingNodeId) {
         self.source_site_nodes.insert(node);
-        if let Some(previous) = self.site_nodes.insert(site, node) {
-            assert_eq!(
-                previous, node,
-                "a resolution site has one node, so that its site, semantic and \
-                 node can share one number: {site:?}"
-            );
-        }
+        record_site_value(
+            &mut self.site_nodes,
+            site,
+            node,
+            "a resolution site has one node, so that its site, semantic and node can share one number",
+        );
     }
 
     pub(crate) fn source_reference_node(&mut self, site: ResolutionSiteId) -> BindingNodeId {
-        let mounted = self.node(super::fact_lowering::reference_node_identity(site));
-        self.record_site_node(site, mounted);
-        mounted
+        self.source_node(site, super::fact_lowering::reference_node_identity(site))
     }
 
     pub(crate) fn source_definition_node(&mut self, site: ResolutionSiteId) -> BindingNodeId {
-        let mounted = self.node(super::fact_lowering::definition_node_identity(site));
+        self.source_node(site, super::fact_lowering::definition_node_identity(site))
+    }
+
+    fn source_node(
+        &mut self,
+        site: ResolutionSiteId,
+        identity: ResolutionNodeIdentity,
+    ) -> BindingNodeId {
+        let mounted = self.node(identity);
         self.record_site_node(site, mounted);
         mounted
     }
 
     pub(crate) fn path(&mut self, identity: ResolutionPathIdentity) -> PartialPathId {
         // One identity, one id. See `Self::semantic`.
-        if let Some(mounted) = self.paths_by_identity.get(&identity) {
-            return *mounted;
-        }
-        let mounted = identity.mounted(UNMOUNTED_ORDINAL, self.next_provisional(2));
-        register_identity(
-            &mut self.paths,
-            &mut self.paths_by_identity,
-            mounted,
+        let Self {
+            paths,
+            paths_by_identity,
+            provisional,
+            ..
+        } = self;
+        intern_identity(
+            paths,
+            paths_by_identity,
             identity,
+            || identity.mounted(UNMOUNTED_ORDINAL, next_identity_provisional(provisional, 2)),
             "path",
-        );
-        mounted
+        )
     }
 
     pub(crate) fn stack_variable(
@@ -1911,18 +2101,19 @@ impl<'a> ResolutionIdentityCatalogBuilder<'a> {
         identity: ResolutionStackVariableIdentity,
     ) -> StackVariableId {
         // One identity, one id. See `Self::semantic`.
-        if let Some(mounted) = self.stack_variables_by_identity.get(&identity) {
-            return *mounted;
-        }
-        let mounted = identity.mounted(UNMOUNTED_ORDINAL, self.next_provisional(3));
-        register_identity(
-            &mut self.stack_variables,
-            &mut self.stack_variables_by_identity,
-            mounted,
+        let Self {
+            stack_variables,
+            stack_variables_by_identity,
+            provisional,
+            ..
+        } = self;
+        intern_identity(
+            stack_variables,
+            stack_variables_by_identity,
             identity,
+            || identity.mounted(UNMOUNTED_ORDINAL, next_identity_provisional(provisional, 3)),
             "stack variable",
-        );
-        mounted
+        )
     }
 
     pub(crate) fn semantic_identity(
@@ -1972,10 +2163,8 @@ impl<'a> ResolutionIdentityCatalogBuilder<'a> {
         // above the sites. A persisted local key is the catalog position
         // (`ResolutionLocalKeys`), so this numbering is what lets the schema's
         // sites table hold one b-tree entry per site instead of three
-        // (`.agents/docs/stack-graph-schema-draft-2026-09-18.md`, section 3).
-        // About a quarter of a blob's sites mint neither a semantic nor a node
-        // (expression sites with no positioned identifier); their positions are
-        // held by fillers so that every other site is still its own number.
+        // Sites without a positioned identifier mint neither a semantic nor a
+        // node; fillers hold their positions so every other site keeps its number.
         let site_span = self
             .site_semantics
             .keys()
@@ -2096,30 +2285,6 @@ fn register_lookup_recipe(
     }
     by_semantic.insert(semantic, recipe.clone());
     by_recipe.insert(recipe, semantic);
-}
-
-fn register_identity<Mounted, Identity>(
-    by_mounted: &mut HashMap<Mounted, Identity>,
-    by_identity: &mut HashMap<Identity, Mounted>,
-    mounted: Mounted,
-    identity: Identity,
-    label: &str,
-) where
-    Mounted: Copy + std::fmt::Debug + Eq + std::hash::Hash,
-    Identity: Copy + std::fmt::Debug + Eq + std::hash::Hash,
-{
-    if let Some(previous) = by_mounted.insert(mounted, identity) {
-        assert_eq!(
-            previous, identity,
-            "mounted resolution {label} has conflicting local identities: {mounted:?}"
-        );
-    }
-    if let Some(previous) = by_identity.insert(identity, mounted) {
-        assert_eq!(
-            previous, mounted,
-            "resolution {label} local identity has conflicting mounted values: {identity:?}"
-        );
-    }
 }
 
 fn canonical_entries<Mounted, Identity>(
@@ -2427,7 +2592,55 @@ pub(crate) trait ResolutionIdentityTranslation {
     fn operation_local_reason(
         &self,
         reason: &super::model::ResolutionIncompleteReason,
-    ) -> super::model::ResolutionIncompleteReason;
+    ) -> super::model::ResolutionIncompleteReason {
+        use super::model::ResolutionIncompleteReason as Reason;
+        match reason {
+            Reason::CyclicPrefixDependency(id) => {
+                Reason::CyclicPrefixDependency(self.semantic(*id))
+            }
+            Reason::ReceiverBudgetExhausted(id) => {
+                Reason::ReceiverBudgetExhausted(self.semantic(*id))
+            }
+            Reason::TimeBudgetExceeded(id) => Reason::TimeBudgetExceeded(self.semantic(*id)),
+            Reason::UnmountedFile { fragment } => Reason::UnmountedFile {
+                fragment: self.fragment(*fragment),
+            },
+            other => panic!("only an operation-local reason reaches this arm: {other:?}"),
+        }
+    }
+}
+
+fn required_identity_mapping<Key, Value>(
+    mappings: &HashMap<Key, Value>,
+    key: Key,
+    missing: impl FnOnce(Key) -> String,
+) -> Value
+where
+    Key: Copy + Eq + std::hash::Hash,
+    Value: Copy,
+{
+    mappings
+        .get(&key)
+        .copied()
+        .unwrap_or_else(|| panic!("{}", missing(key)))
+}
+
+fn required_node_mapping(
+    mappings: &HashMap<BindingNodeId, BindingNodeId>,
+    node: BindingNodeId,
+    missing: impl FnOnce(BindingNodeId) -> String,
+) -> BindingNodeId {
+    if node == BindingNodeId::universal_root() {
+        return node;
+    }
+    required_identity_mapping(mappings, node, missing)
+}
+
+fn impossible_operation_local_reason(
+    reason: &super::model::ResolutionIncompleteReason,
+    prefix: &str,
+) -> ! {
+    panic!("{prefix}{reason:?}")
 }
 
 /// The ids one operation assigned to the identities of an artifact it
@@ -2488,43 +2701,37 @@ impl ResolutionIdentityTranslation for ResolutionRegisteredIdentities {
     }
 
     fn semantic(&self, semantic: SemanticId) -> SemanticId {
-        self.semantics
-            .get(&semantic)
-            .copied()
-            .unwrap_or_else(|| panic!("semantic {semantic} was not registered for this overlay"))
+        required_identity_mapping(&self.semantics, semantic, |semantic| {
+            format!("semantic {semantic} was not registered for this overlay")
+        })
     }
 
     fn node(&self, node: BindingNodeId) -> BindingNodeId {
-        if node == BindingNodeId::universal_root() {
-            return node;
-        }
-        self.nodes
-            .get(&node)
-            .copied()
-            .unwrap_or_else(|| panic!("node {node} was not registered for this overlay"))
+        required_node_mapping(&self.nodes, node, |node| {
+            format!("node {node} was not registered for this overlay")
+        })
     }
 
     fn path(&self, path: PartialPathId) -> PartialPathId {
-        self.paths
-            .get(&path)
-            .copied()
-            .unwrap_or_else(|| panic!("path {path} was not registered for this overlay"))
+        required_identity_mapping(&self.paths, path, |path| {
+            format!("path {path} was not registered for this overlay")
+        })
     }
 
     fn stack_variable(&self, variable: StackVariableId) -> StackVariableId {
-        self.stack_variables
-            .get(&variable)
-            .copied()
-            .unwrap_or_else(|| {
-                panic!("stack variable {variable} was not registered for this overlay")
-            })
+        required_identity_mapping(&self.stack_variables, variable, |variable| {
+            format!("stack variable {variable} was not registered for this overlay")
+        })
     }
 
     fn operation_local_reason(
         &self,
         reason: &super::model::ResolutionIncompleteReason,
     ) -> super::model::ResolutionIncompleteReason {
-        panic!("a lowered overlay cannot carry an operation-local reason: {reason:?}")
+        impossible_operation_local_reason(
+            reason,
+            "a lowered overlay cannot carry an operation-local reason: ",
+        )
     }
 }
 
@@ -2550,36 +2757,27 @@ impl ResolutionIdentityTranslation for ResolutionMountTranslation {
     }
 
     fn semantic(&self, semantic: SemanticId) -> SemanticId {
-        self.semantics
-            .get(&semantic)
-            .copied()
-            .unwrap_or_else(|| panic!("semantic {semantic} is missing from the remount catalog"))
+        required_identity_mapping(&self.semantics, semantic, |semantic| {
+            format!("semantic {semantic} is missing from the remount catalog")
+        })
     }
 
     fn node(&self, node: BindingNodeId) -> BindingNodeId {
-        if node == BindingNodeId::universal_root() {
-            return node;
-        }
-        self.nodes
-            .get(&node)
-            .copied()
-            .unwrap_or_else(|| panic!("node {node} is missing from the remount catalog"))
+        required_node_mapping(&self.nodes, node, |node| {
+            format!("node {node} is missing from the remount catalog")
+        })
     }
 
     fn path(&self, path: PartialPathId) -> PartialPathId {
-        self.paths
-            .get(&path)
-            .copied()
-            .unwrap_or_else(|| panic!("path {path} is missing from the remount catalog"))
+        required_identity_mapping(&self.paths, path, |path| {
+            format!("path {path} is missing from the remount catalog")
+        })
     }
 
     fn stack_variable(&self, variable: StackVariableId) -> StackVariableId {
-        self.stack_variables
-            .get(&variable)
-            .copied()
-            .unwrap_or_else(|| {
-                panic!("stack variable {variable} is missing from the remount catalog")
-            })
+        required_identity_mapping(&self.stack_variables, variable, |variable| {
+            format!("stack variable {variable} is missing from the remount catalog")
+        })
     }
 
     /// Each of these three reasons is minted while one operation runs, against
@@ -2589,7 +2787,10 @@ impl ResolutionIdentityTranslation for ResolutionMountTranslation {
         &self,
         reason: &super::model::ResolutionIncompleteReason,
     ) -> super::model::ResolutionIncompleteReason {
-        panic!("an operation-local reason cannot appear in a lowered artifact: {reason:?}")
+        impossible_operation_local_reason(
+            reason,
+            "an operation-local reason cannot appear in a lowered artifact: ",
+        )
     }
 }
 
@@ -2984,11 +3185,7 @@ impl ResolutionIdentityCatalog {
     /// The bytes one registered semantic identity contributes to a lowered
     /// digest. See [`ResolutionIdentityCatalogBuilder::identity_hash_bytes`].
     pub(crate) fn identity_hash_bytes(&self, identity: ResolutionSemanticIdentity) -> [u8; 32] {
-        match identity {
-            ResolutionSemanticIdentity::FragmentLocal(digest)
-            | ResolutionSemanticIdentity::GapReason(digest) => digest,
-            ResolutionSemanticIdentity::Shared(name) => self.shared_name_digest(name),
-        }
+        semantic_identity_hash_bytes(&self.shared_name_digests, identity)
     }
 
     /// Every shared name this blob mentions, as the digests the store interns
@@ -3010,12 +3207,7 @@ impl ResolutionIdentityCatalog {
 
     /// The digest that names one shared name in `resolution_identities`.
     pub(crate) fn shared_name_digest(&self, name: SharedNameId) -> [u8; 32] {
-        self.shared_name_digests
-            .get(&name)
-            .copied()
-            .unwrap_or_else(|| {
-                panic!("a shared name this blob mentions carries its digest: {name}")
-            })
+        shared_name_digest(&self.shared_name_digests, name)
     }
 
     pub(crate) fn lookup_recipe(
@@ -3417,59 +3609,30 @@ impl ResolutionIdentityCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native_resolution_test_support::fixture_fragment as fragment;
+    use brokk_bifrost_test_macros::hardwon;
+    use std::cell::Cell;
+    use std::hash::{Hash, Hasher};
 
-    #[test]
-    fn dense_persisted_membership_and_request_registrations_are_exact() {
-        for count in [0_usize, 1, 2048] {
-            let mut first = MountRebaser::for_persisted_mount_count(count);
-            let second = MountRebaser::for_persisted_mount_count(count);
-            for raw in 0..u32::try_from(count + 2).unwrap() {
-                let ordinal = SelectedResolutionMountOrdinal::new(raw);
-                assert_eq!(first.mount(ordinal).is_some(), (raw as usize) < count);
-                assert_eq!(
-                    first
-                        .mount_for_fragment(BindingFragmentId::at_ordinal(raw))
-                        .is_some(),
-                    (raw as usize) < count
-                );
-            }
-            let transient = SelectedResolutionMountOrdinal::new(u32::try_from(count + 1).unwrap());
-            assert_eq!(first.register_mount(transient).ordinal(), transient);
-            assert_eq!(first.register_mount(transient).ordinal(), transient);
-            assert_eq!(first.mount_count(), count + 1);
-            assert!(
-                second.mount(transient).is_none(),
-                "another request never inherits registrations"
-            );
-            assert!(
-                first
-                    .mount(SelectedResolutionMountOrdinal::new(UNMOUNTED_ORDINAL))
-                    .is_none()
-            );
+    thread_local! {
+        static IDENTITY_KEY_HASHES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct HashCountedIdentity(u16);
+
+    impl Hash for HashCountedIdentity {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            IDENTITY_KEY_HASHES.with(|count| count.set(count.get() + 1));
+            self.0.hash(state);
         }
     }
 
-    fn fragment(label: &[u8]) -> BindingFragmentId {
-        BindingFragmentId::for_test(label)
-    }
-
-    /// A catalog position is a persisted local key, so it cannot depend on an
-    /// interned id.
-    ///
-    /// This is the pin for the bug stage 1a shipped and a fixture caught: the
-    /// semantic catalog was ordered by identity, a shared identity became an
-    /// id, and the order followed the order this store happened to intern
-    /// names in. Every local key moved, the interior digest moved with them,
-    /// and a byte-identical replacement stopped meeting the persisted blob it
-    /// replaces. Two caches would have disagreed the same way.
-    ///
-    /// Lowering the same file twice in one process would not catch it: one
-    /// interner gives one answer. Nor would two interners that meet the same
-    /// names in the same order, because their ids then differ by a constant
-    /// and sort the same way. Two interners that meet them in *opposite*
-    /// orders is what two caches built from different workspaces are, and that
-    /// is what this builds.
+    /// Persisted catalog positions belong to local recipes, not transient
+    /// shared-name IDs. Opposite interning orders model independently built
+    /// caches that must still agree on the same mounted keys.
     #[test]
+    #[hardwon("545d3fe66956: persisted catalog positions changed with interner order")]
     fn a_catalog_position_does_not_depend_on_an_interned_id() {
         let names = ["alpha", "beta", "gamma", "delta"].map(|name| {
             let mut digest = [0; 32];
@@ -3528,125 +3691,6 @@ mod tests {
     }
 
     #[test]
-    fn canonical_catalog_order_depends_on_local_recipes_not_mounts() {
-        let first = ResolutionSemanticIdentity::fragment_local([1; 32]);
-        let second = ResolutionSemanticIdentity::fragment_local([2; 32]);
-        let shared_digest = [3; 32];
-        let shared = ResolutionSemanticIdentity::shared(
-            crate::analyzer::resolution::test_shared_names().intern(shared_digest),
-        );
-        let fragments = [fragment(b"catalog-a"), fragment(b"catalog-b")];
-        let catalogs = fragments.map(|fragment| {
-            let mut builder = ResolutionIdentityCatalogBuilder::new(
-                fragment,
-                crate::analyzer::resolution::test_shared_names(),
-            );
-            builder.semantic(second);
-            builder.shared_name(shared_digest);
-            builder.semantic(first);
-            builder.semantic(first);
-            builder.finish()
-        });
-
-        let recipes = catalogs.each_ref().map(|catalog| {
-            catalog
-                .semantics()
-                .iter()
-                .map(|&(_, identity)| identity)
-                .collect::<Vec<_>>()
-        });
-        assert_eq!(recipes[0], vec![first, second, shared]);
-        assert_eq!(
-            recipes[0], recipes[1],
-            "a catalog's order is its recipes' order and nothing about its mount"
-        );
-        // A local identity occupies the same position in both catalogs and
-        // gets the same number from both, because a builder mints unmounted;
-        // it becomes a different runtime id in each when it is spliced into
-        // that catalog's mount, because a local id is the ordinal and the
-        // position. A shared name is the same id in both and stays the same
-        // through either mount: it belongs to no mount.
-        let local_positions = catalogs.each_ref().map(|catalog| {
-            catalog
-                .semantics()
-                .iter()
-                .position(|&(_, identity)| identity == first)
-                .expect("the catalog holds the identity it was given")
-        });
-        assert_eq!(local_positions[0], local_positions[1]);
-        assert_eq!(
-            catalogs[0].semantics()[local_positions[0]].0,
-            catalogs[1].semantics()[local_positions[1]].0
-        );
-        assert_ne!(
-            catalogs[0].semantics()[local_positions[0]]
-                .0
-                .at_ordinal(fragments[0].ordinal()),
-            catalogs[1].semantics()[local_positions[1]]
-                .0
-                .at_ordinal(fragments[1].ordinal())
-        );
-        let shared_ids = catalogs.each_ref().map(|catalog| {
-            catalog
-                .semantics()
-                .iter()
-                .find(|&&(_, identity)| identity == shared)
-                .expect("the catalog holds the shared name it was given")
-                .0
-        });
-        assert_eq!(shared_ids[0], shared_ids[1]);
-        for catalog in &catalogs {
-            for &(mounted, identity) in catalog.semantics() {
-                assert_eq!(catalog.semantic_identity(mounted), Some(identity));
-            }
-        }
-    }
-
-    #[test]
-    fn lookup_recipe_fields_are_separate_and_canonically_ordered() {
-        let recipes = [
-            (Language::Java, ResolutionNamespace::Type, "Name"),
-            (Language::Go, ResolutionNamespace::Type, "Name"),
-            (Language::Java, ResolutionNamespace::Value, "Name"),
-            (Language::Java, ResolutionNamespace::Type, "Other"),
-        ];
-        let mut builder = ResolutionIdentityCatalogBuilder::new(
-            fragment(b"lookup-recipes"),
-            crate::analyzer::resolution::test_shared_names(),
-        );
-        let semantics = recipes.map(|(language, namespace, spelling)| {
-            builder.lookup_semantic(language, namespace, spelling)
-        });
-        builder.lookup_semantic(Language::Java, ResolutionNamespace::Type, "Name");
-        let catalog = builder.finish();
-
-        assert_eq!(
-            semantics
-                .into_iter()
-                .collect::<std::collections::BTreeSet<_>>()
-                .len(),
-            4
-        );
-        assert_eq!(catalog.lookup_recipes().len(), 4);
-        assert!(catalog.lookup_recipes().windows(2).all(|pair| {
-            let (semantic_a, recipe_a) = &pair[0];
-            let (semantic_b, recipe_b) = &pair[1];
-            (recipe_a, semantic_a) < (recipe_b, semantic_b)
-        }));
-        for &(semantic, ref recipe) in catalog.lookup_recipes() {
-            assert_eq!(
-                recipe.semantic(crate::analyzer::resolution::test_shared_names()),
-                semantic
-            );
-            assert_eq!(catalog.lookup_recipe(semantic), Some(recipe));
-            assert_eq!(
-                catalog.semantic_identity(semantic),
-                Some(recipe.identity(crate::analyzer::resolution::test_shared_names()))
-            );
-        }
-    }
-
-    #[test]
     fn lookup_recipes_are_permutation_stable_and_mount_independent() {
         let recipes = [
             (Language::Java, ResolutionNamespace::Callable, "run"),
@@ -3672,7 +3716,7 @@ mod tests {
 
         assert_eq!(catalogs[0].lookup_recipes(), catalogs[1].lookup_recipes());
         for &(semantic, ref recipe) in catalogs[0].lookup_recipes() {
-            assert_eq!(recipe.semantic_language(), "java");
+            assert_eq!(recipe.identity_domain(), ResolutionIdentityDomain::Jvm);
             assert_eq!(
                 recipe.semantic(crate::analyzer::resolution::test_shared_names()),
                 semantic
@@ -3686,6 +3730,30 @@ mod tests {
                     "a shared name is the same id in every catalog that holds it"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn jvm_lookup_recipes_share_identity_while_non_jvm_digests_keep_language_salts() {
+        let namespace = ResolutionNamespace::Callable;
+        let java = ResolutionLookupSemanticRecipe::new(Language::Java, namespace, "execute");
+        let kotlin = ResolutionLookupSemanticRecipe::new(Language::Kotlin, namespace, "execute");
+        let scala = ResolutionLookupSemanticRecipe::new(Language::Scala, namespace, "execute");
+        assert_eq!(java, kotlin);
+        assert_eq!(java, scala);
+
+        for language in [Language::Rust, Language::Go] {
+            let recipe = ResolutionLookupSemanticRecipe::new(language, namespace, "execute");
+            let mut previous_digest =
+                CanonicalHasher::new(b"bifrost-resolution-effective-lookup-key:v1");
+            previous_digest.field("language", language.config_label().as_bytes());
+            previous_digest.field("namespace", namespace.identity_label().as_bytes());
+            previous_digest.field("spelling", b"execute");
+            assert_eq!(
+                recipe.name_digest(),
+                previous_digest.finish(),
+                "non-JVM lookup digests retain their existing language key"
+            );
         }
     }
 
@@ -3733,105 +3801,10 @@ mod tests {
     }
 
     #[test]
-    fn a_local_runtime_id_is_its_mount_ordinal_and_its_catalog_position() {
-        // This replaces the pin on the representation it succeeds. A runtime
-        // id used to be a 32-byte digest whose first eight bytes were its
-        // mount's prefix and whose tail was its identity's; the mount was
-        // recovered by comparing prefixes and the key by decoding the tail.
-        // It is `(ordinal, catalog position)` in one u64 now, and both halves
-        // are read back rather than decoded.
-        let first = 3_u32;
-        let second = 4_u32;
-        macro_rules! pin_local_layout {
-            ($name:ident) => {{
-                let id = $name::local(first, 7);
-                let other = $name::local(second, 7);
-                assert_eq!(
-                    id.kind(),
-                    super::super::model::ResolutionIdentityKind::Local
-                );
-                assert_eq!(id.ordinal(), Some(first));
-                assert_eq!(id.local_key(), Some(7));
-                assert_ne!(id, other, "the ordinal separates two mounts of one key");
-                assert_eq!(other.ordinal(), Some(second));
-                assert_eq!(id.at_ordinal(second), other, "a splice is the ordinal");
-            }};
-        }
-        pin_local_layout!(BindingNodeId);
-        pin_local_layout!(PartialPathId);
-        pin_local_layout!(StackVariableId);
-        pin_local_layout!(SemanticId);
-        assert_ne!(
-            SemanticId::local(first, 7),
-            SemanticId::local(first, 8),
-            "the catalog position separates two identities of one mount"
-        );
-
-        // An identity that belongs to no file has no ordinal and no position.
-        let operation = SemanticId::operation_local(5);
-        assert_eq!(
-            operation.kind(),
-            super::super::model::ResolutionIdentityKind::Operation
-        );
-        assert_eq!(operation.ordinal(), None);
-        assert_eq!(operation.local_key(), None);
-        assert!(!operation.is_context_local());
-        let context = SemanticId::context_local(5);
-        assert!(context.is_context_local());
-        assert_ne!(
-            operation, context,
-            "an operation and a context number from disjoint halves"
-        );
-    }
-
-    #[test]
-    fn shared_name_default_conversions_preserve_only_stored_correspondence() {
-        let names = PerRequestSharedNames::new();
-        let request = names.intern([17; 32]);
-        let stored = SharedNameId::interned(19);
-        assert_eq!(names.to_persisted(request), None);
-        assert_eq!(names.to_persisted(stored), Some(stored));
-        assert_eq!(names.from_persisted(stored), stored);
-        assert_eq!(names.intern([17; 32]), request);
-    }
-
-    #[test]
     #[should_panic(expected = "a persisted shared name must be interned")]
+    #[hardwon("6c35203a7760: persisted decoding accepted a request-domain shared name")]
     fn shared_name_default_decode_rejects_request_domain_input() {
         PerRequestSharedNames::new().from_persisted(SharedNameId::per_request(0));
-    }
-
-    #[test]
-    fn shared_semantics_are_their_interned_id_on_every_mount() {
-        let name = SharedNameId::per_request(46);
-        let mounted = ResolutionSemanticIdentity::shared(name).mounted(3, 11);
-
-        assert_eq!(mounted, SemanticId::shared_name(name));
-        assert_eq!(mounted.shared_name_id(), Some(name));
-        assert_eq!(
-            mounted,
-            ResolutionSemanticIdentity::shared(name).mounted(4, 12),
-            "a shared name belongs to no mount, so neither the ordinal nor \
-             the position it was offered changes it"
-        );
-    }
-
-    #[test]
-    fn a_persisted_local_key_is_the_runtime_id_and_needs_no_decoding() {
-        // The three `persisted_*_identity` helpers and
-        // `decode_persisted_local_key` are gone with this pin's predecessor.
-        // A row's storage-local key is the position its identity occupies in
-        // its blob's catalog, and a local runtime id is the mount ordinal and
-        // that position, so the key *is* the id and there is nothing to
-        // invent and nothing to decode.
-        let ordinal = 9_u32;
-        for key in [0_u32, 1, 7, 4096, u32::MAX] {
-            assert_eq!(BindingNodeId::local(ordinal, key).local_key(), Some(key));
-            assert_eq!(PartialPathId::local(ordinal, key).local_key(), Some(key));
-            assert_eq!(StackVariableId::local(ordinal, key).local_key(), Some(key));
-            assert_eq!(SemanticId::local(ordinal, key).local_key(), Some(key));
-            assert_eq!(BindingNodeId::local(ordinal, key).ordinal(), Some(ordinal));
-        }
     }
 
     #[test]
@@ -4070,30 +4043,6 @@ mod tests {
     // prefix, nothing to collide, and `register_mount` takes only the ordinal.
 
     #[test]
-    #[should_panic(expected = "cannot replace the universal root")]
-    fn mount_rebaser_rejects_reclassifying_the_universal_root() {
-        MountRebaser::new().register_context_boundary(BindingNodeId::universal_root());
-    }
-
-    #[test]
-    #[should_panic(expected = "conflicting local identities")]
-    fn conflicting_mounted_identity_fails_closed() {
-        let mut forward = HashMap::default();
-        let mut reverse = HashMap::default();
-        register_identity(&mut forward, &mut reverse, 1_u8, 2_u8, "test");
-        register_identity(&mut forward, &mut reverse, 1_u8, 3_u8, "test");
-    }
-
-    #[test]
-    #[should_panic(expected = "conflicting mounted values")]
-    fn conflicting_recipe_identity_fails_closed() {
-        let mut forward = HashMap::default();
-        let mut reverse = HashMap::default();
-        register_identity(&mut forward, &mut reverse, 1_u8, 2_u8, "test");
-        register_identity(&mut forward, &mut reverse, 3_u8, 2_u8, "test");
-    }
-
-    #[test]
     #[should_panic(expected = "conflicting canonical recipes")]
     fn same_lookup_digest_with_different_recipe_fails_closed() {
         let mut by_semantic = HashMap::default();
@@ -4114,42 +4063,244 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "conflicting shared semantics")]
-    fn same_lookup_recipe_with_different_digest_fails_closed() {
-        let mut by_semantic = HashMap::default();
-        let mut by_recipe = HashMap::default();
-        let recipe =
-            ResolutionLookupSemanticRecipe::new(Language::Java, ResolutionNamespace::Type, "Name");
-        register_lookup_recipe(
-            &mut by_semantic,
-            &mut by_recipe,
-            SemanticId::for_test(b"digest-8"),
-            recipe.clone(),
-        );
-        register_lookup_recipe(
-            &mut by_semantic,
-            &mut by_recipe,
-            SemanticId::for_test(b"digest-9"),
-            recipe,
-        );
+    #[hardwon("e626e7259df4: request-local registrations leaked into persisted catalog membership")]
+    fn dense_persisted_membership_and_request_registrations_are_exact() {
+        for count in [0_usize, 1, 2048] {
+            let mut first = MountRebaser::for_persisted_mount_count(count);
+            let second = MountRebaser::for_persisted_mount_count(count);
+            for raw in 0..u32::try_from(count + 2).unwrap() {
+                let ordinal = SelectedResolutionMountOrdinal::new(raw);
+                assert_eq!(first.mount(ordinal).is_some(), (raw as usize) < count);
+                assert_eq!(
+                    first
+                        .mount_for_fragment(BindingFragmentId::at_ordinal(raw))
+                        .is_some(),
+                    (raw as usize) < count
+                );
+            }
+            let transient = SelectedResolutionMountOrdinal::new(u32::try_from(count + 1).unwrap());
+            assert_eq!(first.register_mount(transient).ordinal(), transient);
+            assert_eq!(first.register_mount(transient).ordinal(), transient);
+            assert_eq!(first.mount_count(), count + 1);
+            assert!(
+                second.mount(transient).is_none(),
+                "another request never inherits registrations"
+            );
+            assert!(
+                first
+                    .mount(SelectedResolutionMountOrdinal::new(UNMOUNTED_ORDINAL))
+                    .is_none()
+            );
+        }
     }
 
     #[test]
-    #[should_panic(expected = "does not derive its registered shared name")]
-    fn catalog_completion_rejects_forged_lookup_recipe_identity() {
+    fn canonical_catalog_order_depends_on_local_recipes_not_mounts() {
+        let first = ResolutionSemanticIdentity::fragment_local([1; 32]);
+        let second = ResolutionSemanticIdentity::fragment_local([2; 32]);
+        let shared_digest = [3; 32];
+        let shared = ResolutionSemanticIdentity::shared(
+            crate::analyzer::resolution::test_shared_names().intern(shared_digest),
+        );
+        let fragments = [fragment(b"catalog-a"), fragment(b"catalog-b")];
+        let catalogs = fragments.map(|fragment| {
+            let mut builder = ResolutionIdentityCatalogBuilder::new(
+                fragment,
+                crate::analyzer::resolution::test_shared_names(),
+            );
+            builder.semantic(second);
+            builder.shared_name(shared_digest);
+            builder.semantic(first);
+            builder.semantic(first);
+            builder.finish()
+        });
+
+        let recipes = catalogs.each_ref().map(|catalog| {
+            catalog
+                .semantics()
+                .iter()
+                .map(|&(_, identity)| identity)
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(recipes[0], vec![first, second, shared]);
+        assert_eq!(
+            recipes[0], recipes[1],
+            "a catalog's order is its recipes' order and nothing about its mount"
+        );
+        // A local identity occupies the same position in both catalogs and
+        // gets the same number from both, because a builder mints unmounted;
+        // it becomes a different runtime id in each when it is spliced into
+        // that catalog's mount, because a local id is the ordinal and the
+        // position. A shared name is the same id in both and stays the same
+        // through either mount: it belongs to no mount.
+        let local_positions = catalogs.each_ref().map(|catalog| {
+            catalog
+                .semantics()
+                .iter()
+                .position(|&(_, identity)| identity == first)
+                .expect("the catalog holds the identity it was given")
+        });
+        assert_eq!(local_positions[0], local_positions[1]);
+        assert_eq!(
+            catalogs[0].semantics()[local_positions[0]].0,
+            catalogs[1].semantics()[local_positions[1]].0
+        );
+        assert_ne!(
+            catalogs[0].semantics()[local_positions[0]]
+                .0
+                .at_ordinal(fragments[0].ordinal()),
+            catalogs[1].semantics()[local_positions[1]]
+                .0
+                .at_ordinal(fragments[1].ordinal())
+        );
+        let shared_ids = catalogs.each_ref().map(|catalog| {
+            catalog
+                .semantics()
+                .iter()
+                .find(|&&(_, identity)| identity == shared)
+                .expect("the catalog holds the shared name it was given")
+                .0
+        });
+        assert_eq!(shared_ids[0], shared_ids[1]);
+        for catalog in &catalogs {
+            for &(mounted, identity) in catalog.semantics() {
+                assert_eq!(catalog.semantic_identity(mounted), Some(identity));
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon("#4504: semantic interning repeated a map lookup for each new identity")]
+    fn identity_interning_reduces_hash_work_vs_lookup_then_insert() {
+        IDENTITY_KEY_HASHES.with(|count| count.set(0));
+        let mut mounted_by_identity = HashMap::default();
+        let mut identity_by_mounted = HashMap::default();
+        let mut next_mounted = 0u16;
+
+        for ordinal in 0..=u8::MAX {
+            let identity = HashCountedIdentity(u16::from(ordinal));
+            let mounted = intern_identity(
+                &mut mounted_by_identity,
+                &mut identity_by_mounted,
+                identity,
+                || {
+                    let mounted = next_mounted;
+                    next_mounted += 1;
+                    mounted
+                },
+                "test",
+            );
+            assert_eq!(mounted, u16::from(ordinal));
+            assert_eq!(
+                intern_identity(
+                    &mut mounted_by_identity,
+                    &mut identity_by_mounted,
+                    identity,
+                    || panic!("an interned identity does not allocate a mounted id"),
+                    "test",
+                ),
+                mounted
+            );
+        }
+
+        let intern_hashes = IDENTITY_KEY_HASHES.with(Cell::get);
+        assert_eq!(mounted_by_identity.len(), 256);
+        assert_eq!(identity_by_mounted.len(), 256);
+
+        IDENTITY_KEY_HASHES.with(|count| count.set(0));
+        let mut legacy_mounted_by_identity = HashMap::default();
+        let mut legacy_identity_by_mounted = HashMap::default();
+        let mut next_legacy_mounted = 0u16;
+        for ordinal in 0..=u8::MAX {
+            let identity = HashCountedIdentity(u16::from(ordinal));
+            let mounted = if let Some(mounted) = legacy_identity_by_mounted.get(&identity) {
+                *mounted
+            } else {
+                let mounted = next_legacy_mounted;
+                next_legacy_mounted += 1;
+                assert!(
+                    legacy_mounted_by_identity
+                        .insert(mounted, identity)
+                        .is_none()
+                );
+                assert!(
+                    legacy_identity_by_mounted
+                        .insert(identity, mounted)
+                        .is_none()
+                );
+                mounted
+            };
+            assert_eq!(mounted, u16::from(ordinal));
+
+            let mounted = legacy_identity_by_mounted
+                .get(&identity)
+                .copied()
+                .expect("the identity was just interned");
+            assert_eq!(mounted, u16::from(ordinal));
+        }
+
+        let lookup_then_insert_hashes = IDENTITY_KEY_HASHES.with(Cell::get);
+        assert!(
+            intern_hashes < lookup_then_insert_hashes,
+            "entry interning used {intern_hashes} identity hashes; lookup then insert used {lookup_then_insert_hashes}"
+        );
+        assert_eq!(legacy_mounted_by_identity.len(), 256);
+        assert_eq!(legacy_identity_by_mounted.len(), 256);
+    }
+
+    #[test]
+    #[hardwon("31860580f52a: distinct canonical lookup recipes collapsed during lowering")]
+    fn lookup_recipe_fields_are_separate_and_canonically_ordered() {
+        let recipes = [
+            (Language::Java, ResolutionNamespace::Type, "Name"),
+            (Language::Go, ResolutionNamespace::Type, "Name"),
+            (Language::Java, ResolutionNamespace::Value, "Name"),
+            (Language::Java, ResolutionNamespace::Type, "Other"),
+        ];
         let mut builder = ResolutionIdentityCatalogBuilder::new(
-            fragment(b"forged-recipe"),
+            fragment(b"lookup-recipes"),
             crate::analyzer::resolution::test_shared_names(),
         );
-        // A shared name that is not the recipe's own, which is what `finish`
-        // rejects.
-        let semantic = builder.shared_name([10; 32]);
-        register_lookup_recipe(
-            &mut builder.lookup_recipes,
-            &mut builder.lookup_semantics_by_recipe,
-            semantic,
-            ResolutionLookupSemanticRecipe::new(Language::Java, ResolutionNamespace::Type, "Name"),
+        let semantics = recipes.map(|(language, namespace, spelling)| {
+            builder.lookup_semantic(language, namespace, spelling)
+        });
+        builder.lookup_semantic(Language::Java, ResolutionNamespace::Type, "Name");
+        let catalog = builder.finish();
+
+        assert_eq!(
+            semantics
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            4
         );
-        builder.finish();
+        assert_eq!(catalog.lookup_recipes().len(), 4);
+        assert!(catalog.lookup_recipes().windows(2).all(|pair| {
+            let (semantic_a, recipe_a) = &pair[0];
+            let (semantic_b, recipe_b) = &pair[1];
+            (recipe_a, semantic_a) < (recipe_b, semantic_b)
+        }));
+        for &(semantic, ref recipe) in catalog.lookup_recipes() {
+            assert_eq!(
+                recipe.semantic(crate::analyzer::resolution::test_shared_names()),
+                semantic
+            );
+            assert_eq!(catalog.lookup_recipe(semantic), Some(recipe));
+            assert_eq!(
+                catalog.semantic_identity(semantic),
+                Some(recipe.identity(crate::analyzer::resolution::test_shared_names()))
+            );
+        }
+    }
+
+    #[test]
+    fn shared_name_default_conversions_preserve_only_stored_correspondence() {
+        let names = PerRequestSharedNames::new();
+        let request = names.intern([17; 32]);
+        let stored = SharedNameId::interned(19);
+        assert_eq!(names.to_persisted(request), None);
+        assert_eq!(names.to_persisted(stored), Some(stored));
+        assert_eq!(names.from_persisted(stored), stored);
+        assert_eq!(names.intern([17; 32]), request);
     }
 }

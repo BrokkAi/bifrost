@@ -15,6 +15,7 @@ use brokk_bifrost_core::analyzer::config::{
     PythonDeclaredLaunchSemantics, PythonDeclaredNativeExtensionMode, PythonDeclaredRootRole,
     PythonDeclaredRootSlot, PythonDeclaredSiteStartupMode,
 };
+use brokk_bifrost_core::path_normalization::NormalizePath;
 use rusqlite::{OptionalExtension, Row, Transaction, TransactionBehavior, params};
 
 use crate::CancellationToken;
@@ -339,6 +340,45 @@ pub(crate) const PYTHON_RUNTIME_ARTIFACTS_FOR_ENVIRONMENT_SQL: &str =
      FROM python_runtime_artifacts INDEXED BY python_runtime_artifacts_by_environment
      WHERE environment_id = ?1 AND acquisition_id = ?2
      ORDER BY artifact_id";
+
+/// Installed roots that belong to both a declared environment and an
+/// archive-verified artifact in one acquisition. The acquisition has already
+/// been tied to the selected Python snapshot by
+/// `with_python_runtime_acquisition`.
+pub(crate) const PYTHON_RUNTIME_DECLARED_ARCHIVE_VERIFIED_INSTALLED_ROOTS_SQL: &str =
+    "SELECT DISTINCT artifact.installed_root
+     FROM python_runtime_environments AS environment
+       INDEXED BY python_runtime_environments_by_scope
+     JOIN python_runtime_artifacts AS artifact
+       INDEXED BY python_runtime_artifacts_by_environment
+       ON artifact.environment_id = environment.environment_id
+      AND artifact.acquisition_id = environment.acquisition_id
+     JOIN python_runtime_declared_environments AS declared
+       INDEXED BY python_runtime_declared_environments_by_environment
+       ON declared.environment_id = environment.environment_id
+      AND declared.acquisition_id = environment.acquisition_id
+     WHERE environment.acquisition_id = ?1
+       AND environment.status = 'archive_verified'
+       AND artifact.status = 'archive_verified'
+     ORDER BY artifact.installed_root";
+
+/// Read only roots backed by a declared, archive-verified environment in the
+/// selected acquisition. Normalize their path identity to match ProjectFile's
+/// roots, including Windows verbatim prefixes; stored evidence stays unchanged.
+/// The returned rows belong to the caller's query.
+pub(crate) fn python_runtime_declared_archive_verified_installed_roots(
+    tx: &Transaction<'_>,
+    acquisition_id: PythonRuntimeAcquisitionId,
+) -> Result<Vec<PathBuf>> {
+    let mut statement =
+        tx.prepare_cached(PYTHON_RUNTIME_DECLARED_ARCHIVE_VERIFIED_INSTALLED_ROOTS_SQL)?;
+    Ok(statement
+        .query_map([acquisition_id.get()], |row| {
+            row.get::<_, String>(0)
+                .map(|path| PathBuf::from(path).normalize())
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
 
 /// Complete inventory for independent archive and installed-byte
 /// revalidation. This is intentionally an indexed point/range query per
@@ -1982,6 +2022,9 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#4488: verified installed roots kept Windows verbatim prefixes"
+    )]
     fn populated_provider_publication_reads_back_exact_artifact_member_candidate() {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let workspace_id = WorkspaceId("f".repeat(64));
@@ -1992,6 +2035,8 @@ mod tests {
         );
         let archive_sha256 = "c".repeat(64);
         let member_sha256 = "a".repeat(64);
+        let installed_directory = tempfile::tempdir().unwrap();
+        let installed_root = installed_directory.path().canonicalize().unwrap();
         let (declared_environment, project_config) = declared_environment_fixture();
         let publication = store
             .publish_python_runtime_providers(
@@ -2007,7 +2052,7 @@ mod tests {
                         raw_version: Some("1.2".to_owned()),
                         archive_sha256: Some(archive_sha256.clone()),
                         archive_path: PathBuf::from("/archives/example-1.2.whl"),
-                        installed_root: PathBuf::from("/venv/site-packages"),
+                        installed_root: installed_root.clone(),
                         status: PythonRuntimeStatus::ArchiveVerified,
                         diagnostic: None,
                         members: vec![PythonRuntimeMemberInput {
@@ -2040,7 +2085,7 @@ mod tests {
         let generation = selected_snapshot.generation.0;
         let revision = selected_snapshot.revision;
 
-        let (candidate, reconstructed) = store
+        let (candidate, reconstructed, installed_roots) = store
             .with_python_runtime_acquisition(publication.acquisition_id, &selected_snapshot, |tx| {
                 let environment = tx.query_row(
                     PYTHON_RUNTIME_SCOPE_AT_PATH_SQL,
@@ -2071,7 +2116,11 @@ mod tests {
                     environment.environment_id,
                 )?;
                 assert!(cross_acquisition.is_none());
-                Ok((candidate, reconstructed))
+                let installed_roots = python_runtime_declared_archive_verified_installed_roots(
+                    tx,
+                    publication.acquisition_id,
+                )?;
+                Ok((candidate, reconstructed, installed_roots))
             })
             .unwrap();
 
@@ -2083,6 +2132,8 @@ mod tests {
             Some(archive_sha256.as_str())
         );
         assert_eq!(candidate.artifact_status, "archive_verified");
+        assert_eq!(candidate.installed_root, installed_root.to_string_lossy());
+        assert_eq!(installed_roots, vec![installed_root.normalize()]);
         assert_eq!(candidate.archive_member_path.as_deref(), Some("pkg/mod.py"));
         assert_eq!(
             candidate.installed_path.as_deref(),

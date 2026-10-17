@@ -1,4 +1,5 @@
 use super::*;
+use crate::analyzer::Language;
 use crate::analyzer::resolution::{
     BindingFragmentId, BindingNodeId, PartialPathId, ResolutionRegisteredIdentities,
     SelectedResolutionMountOrdinal, StackVariableId, lower_resolution_facts_for_selection,
@@ -218,6 +219,7 @@ fn ordinary_identity_lookup_preserves_late_shared_alias() {
         selection.requested_mount_rows(),
         selection.persisted_mount_count(),
         selection.authority_validations(),
+        selection.authority_request_memo(),
     );
     let live = CancellationToken::new();
     let identity = ResolutionSemanticIdentity::shared(request);
@@ -393,7 +395,7 @@ fn empty_producer_and_closed_reason_have_distinct_coverage_effects() {
 #[test]
 fn authenticated_capsule_admission_replays_variables_and_rolls_back_cancelled_assignment() {
     use crate::analyzer::store::WorkspaceSnapshots;
-    use crate::analyzer::store::resolution_operation::with_dense_selected_macro_fixture;
+    use crate::analyzer::store::resolution_operation::DenseSelectedMacroFixture;
     use crate::analyzer::store::resolution_publication::{
         ResolutionContentPublicationOutcome, prepare_resolution_capsule,
     };
@@ -401,7 +403,9 @@ fn authenticated_capsule_admission_replays_variables_and_rolls_back_cancelled_as
         SelectedResolutionLanguage, SelectedResolutionMountInventoryOutcome,
     };
 
-    with_dense_selected_macro_fixture(|store, owner, fixtures| {
+    // #5375: item inputs retain name/member frontiers, not a closable
+    // invocation-wide argument gap. Exercise closure with expression inputs.
+    DenseSelectedMacroFixture::with_expression_inputs(|store, owner, fixtures| {
         let live = CancellationToken::new();
         let mut cases = Vec::new();
         for mut fixture in fixtures.into_iter().take(2) {
@@ -1037,6 +1041,7 @@ fn ordinary_lookup_families_preserve_missing_and_late_shared_aliases() {
             selection.requested_mount_rows(),
             selection.persisted_mount_count(),
             selection.authority_validations(),
+            selection.authority_request_memo(),
         );
         let semantic = SemanticId::shared_name(request);
         assert_eq!(

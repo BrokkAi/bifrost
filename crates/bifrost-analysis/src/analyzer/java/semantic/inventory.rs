@@ -21,15 +21,15 @@ impl ReceiverCaptureSpec for ProcedureSpec<'_> {
     }
 
     fn relays_receiver_capture(&self) -> bool {
-        self.kind == ProcedureKind::Lambda
+        crate::analyzer::semantic::procedure_relays_receiver_capture(self.kind)
     }
 
     fn captures_receiver(&self) -> bool {
         self.captures_receiver
     }
 
-    fn require_receiver_capture(&mut self) {
-        self.captures_receiver = true;
+    fn captures_receiver_mut(&mut self) -> &mut bool {
+        &mut self.captures_receiver
     }
 }
 
@@ -148,21 +148,13 @@ pub(super) fn enumerate_procedures<'tree>(
     Ok(inventory.complete(specs))
 }
 
-enum JavaCaptureInventoryStop {
-    Budget(ProcedureInventoryStop),
-    Cancelled,
-}
+use crate::analyzer::semantic::inventory::ProcedureInventoryPrepassStop as JavaCaptureInventoryStop;
 
 fn charge_capture_inventory(
     inventory: &mut ProcedureInventoryBuilder<'_>,
     cancellation: &CancellationToken,
 ) -> Result<(), JavaCaptureInventoryStop> {
-    if cancellation.is_cancelled() {
-        return Err(JavaCaptureInventoryStop::Cancelled);
-    }
-    inventory
-        .charge_traversal_entry()
-        .map_err(JavaCaptureInventoryStop::Budget)
+    crate::analyzer::semantic::inventory::charge_prepass(inventory, cancellation)
 }
 
 fn populate_lexical_captures<'tree>(

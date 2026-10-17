@@ -15,6 +15,7 @@ use crate::analyzer::semantic_model::{
     compile_source, decide_runtime_contract_activation, decode_shard,
     resolve_active_semantic_models,
 };
+use brokk_bifrost_test_macros::hardwon;
 use semver::Version;
 use serde_json::{Value, json};
 use std::path::Path;
@@ -50,6 +51,339 @@ const GENERATOR_RULES_JSON: &[u8] =
 
 fn diagnostics_contain(diagnostics: &[CsmiDiagnostic], code: &str) -> bool {
     diagnostics.iter().any(|diagnostic| diagnostic.code == code)
+}
+
+fn callable_values_profile_support() -> CsmiVocabularySupport {
+    CsmiVocabularySupport::support(
+        CSMI_CALLABLE_VALUES_PROFILE_ID,
+        CSMI_CALLABLE_VALUES_PROFILE_VERSION,
+        CSMI_CALLABLE_VALUES_PROFILE_SCHEMA,
+    )
+}
+
+fn callable_values_document() -> Value {
+    let mut value: Value =
+        serde_json::from_slice(VALID_PROCEDURE_SUMMARY).expect("valid procedure JSON");
+    let model = &mut value["semanticModels"][0];
+    model["vocabularyUses"]
+        .as_array_mut()
+        .expect("vocabulary uses are an array")
+        .push(json!({
+            "identifier": CSMI_CALLABLE_VALUES_PROFILE_ID,
+            "version": CSMI_CALLABLE_VALUES_PROFILE_VERSION,
+            "schema": CSMI_CALLABLE_VALUES_PROFILE_SCHEMA,
+            "requirement": "required",
+            "affects": [{
+                "kind": "fact-family",
+                "family": CSMI_CALLABLE_VALUES_CALLBACK_INVOCATIONS_FAMILY,
+                "scope": {"callable": "normalize"}
+            }]
+        }));
+    model["extensionFacts"]
+        .as_array_mut()
+        .expect("extension facts are an array")
+        .push(json!({
+            "vocabulary": CSMI_CALLABLE_VALUES_PROFILE_ID,
+            "version": CSMI_CALLABLE_VALUES_PROFILE_VERSION,
+            "family": CSMI_CALLABLE_VALUES_CALLBACK_INVOCATIONS_FAMILY,
+            "scope": {"callable": "normalize"},
+            "payload": {
+                "kind": "callback-invocation",
+                "callable": "normalize",
+                "callback": {
+                    "root": {"phase": "input", "role": "parameter", "position": 0}
+                },
+                "shape": {"parameters": 1, "results": 1},
+                "arguments": [{
+                    "kind": "input",
+                    "source": {
+                        "root": {"phase": "input", "role": "parameter", "position": 0}
+                    }
+                }],
+                "timing": "during-call",
+                "modality": "may"
+            }
+        }));
+    value
+}
+
+fn validate_callable_values_document(value: &Value) -> CsmiDocumentValidation {
+    let bytes = canonical_json_value(value).expect("callable-values document canonicalizes");
+    validate_csmi_document(&bytes, &callable_values_profile_support())
+}
+
+fn go_test_type(id: &str, name: &str, kind: TypeKind, symbol: &str) -> TypeFact {
+    TypeFact {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        type_kind: kind,
+        visibility: Visibility::Public,
+        is_abstract: false,
+        is_sealed: false,
+        callable_surface_complete: false,
+        has_explicit_type_terms: false,
+        type_parameters: Vec::new(),
+        type_parameter_constraints: Vec::new(),
+        underlying_type: None,
+        value_semantics: None,
+        jvm_inventory: None,
+        runtime_bases: None,
+        ambient_use: None,
+        embedded_types: Vec::new(),
+        hierarchy: Vec::new(),
+        aliases: Vec::new(),
+        extension_surfaces: Vec::new(),
+        guard: None,
+        locator: Locator::Artifact {
+            path: "api.go".to_owned(),
+            symbol: symbol.to_owned(),
+        },
+    }
+}
+
+fn go_test_member(
+    id: &str,
+    owner: &str,
+    name: &str,
+    kind: MemberKind,
+    source_symbol: &str,
+    parameters: Vec<crate::analyzer::semantic_model::Parameter>,
+    returns: Option<crate::analyzer::semantic_model::TypeRef>,
+) -> crate::analyzer::semantic_model::MemberFact {
+    crate::analyzer::semantic_model::MemberFact {
+        id: id.to_owned(),
+        owner: owner.to_owned(),
+        name: name.to_owned(),
+        member_kind: kind,
+        visibility: Visibility::Public,
+        is_static: kind == MemberKind::Function,
+        is_abstract: false,
+        is_virtual: false,
+        non_overridable: None,
+        implicit_operation: None,
+        explicit_operation: None,
+        ambient_use: None,
+        value_type: None,
+        proxied_type: None,
+        callable_family_complete: false,
+        exact_return_classes: Vec::new(),
+        signature: Some(crate::analyzer::semantic_model::Signature {
+            type_parameters: Vec::new(),
+            parameters,
+            returns,
+        }),
+        receiver: None,
+        extension_receiver: None,
+        extension_receiver_constraints: Vec::new(),
+        aliases: Vec::new(),
+        guard: None,
+        locator: Locator::Artifact {
+            path: "api.go".to_owned(),
+            symbol: source_symbol.to_owned(),
+        },
+    }
+}
+
+fn go_callable_values_fixture() -> (AuthoredSemanticModelPack, CsmiArtifactEvidence) {
+    use crate::analyzer::semantic_model::{
+        CallableValuesCoverage, CallableValuesFact, CallableValuesFamily, CallableValuesPayload,
+        TypeRef,
+    };
+
+    let mut pack: AuthoredSemanticModelPack =
+        serde_json::from_slice(DECLARATIONS_JSON).expect("declaration fixture is valid");
+    pack.schema_version = 10;
+    pack.language = "go".to_owned();
+    pack.ecosystem = "golang".to_owned();
+    pack.compatibility.bifrost = None;
+    pack.compatibility.toolchains = vec![crate::analyzer::semantic_model::VersionConstraint {
+        name: "go".to_owned(),
+        requirement: "=1.26.0".to_owned(),
+    }];
+    pack.shards.truncate(1);
+    let activation = &mut pack.shards[0].activation[0];
+    activation.package = None;
+    activation.module = Some(crate::analyzer::semantic_model::NameSelector {
+        name: "example.com/acme".to_owned(),
+        version: Some("=1.2.0".to_owned()),
+    });
+    activation.toolchain = Some(crate::analyzer::semantic_model::NameSelector {
+        name: "go".to_owned(),
+        version: Some("=1.26.0".to_owned()),
+    });
+    activation.targets = vec!["go".to_owned()];
+    activation.configurations.clear();
+    let AuthoredPayload::DeclarationFacts {
+        types,
+        members,
+        relations,
+    } = &mut pack.shards[0].payload
+    else {
+        panic!("declaration fixture has no declaration facts");
+    };
+    types.clear();
+    types.push(go_test_type(
+        "go.package",
+        "example.com/acme",
+        TypeKind::Module,
+        "example.com/acme",
+    ));
+    types.push(go_test_type(
+        "go.widget",
+        "example.com/acme.Widget",
+        TypeKind::Struct,
+        "example.com/acme.Widget",
+    ));
+    members.clear();
+    members.push(go_test_member(
+        "go.factory",
+        "go.package",
+        "NewCallback",
+        MemberKind::Function,
+        "NewCallback",
+        Vec::new(),
+        Some(TypeRef::Unknown),
+    ));
+    members.push(go_test_member(
+        "go.invoke",
+        "go.package",
+        "Invoke",
+        MemberKind::Function,
+        "Invoke",
+        vec![crate::analyzer::semantic_model::Parameter {
+            name: None,
+            r#type: TypeRef::Unknown,
+            optional: false,
+            variadic: false,
+            role: None,
+            passing_mode: Default::default(),
+        }],
+        None,
+    ));
+    members.push(go_test_member(
+        "go.field",
+        "go.widget",
+        "Callback",
+        MemberKind::Field,
+        "example.com/acme.Widget.Callback",
+        Vec::new(),
+        Some(TypeRef::Unknown),
+    ));
+    relations.clear();
+
+    let artifact =
+        CsmiArtifactEvidence::new("pkg:golang/example.com/acme@v1.2.0", artifact_digest());
+    for selector in &mut pack.shards[0].activation {
+        selector.artifact_sha256 = Some(artifact.sha256.clone());
+    }
+    let parameter_root = || {
+        CsmiInputBoundaryRoot::Parameter(CsmiInputParameterRoot {
+            phase: CsmiInputPhase::Input,
+            role: CsmiParameterRootRole::Parameter,
+            position: 0,
+        })
+    };
+    pack.shards[0].callable_values = Some(CallableValuesPayload {
+        facts: vec![
+            CallableValuesFact {
+                payload: CsmiCallableValuesPayload::ReturnedCallable {
+                    callable: "go.factory".to_owned(),
+                    result: 0,
+                    target: "go.literal.callback".to_owned(),
+                },
+                provenance: Vec::new(),
+            },
+            CallableValuesFact {
+                payload: CsmiCallableValuesPayload::CallbackInvocation {
+                    callable: "go.invoke".to_owned(),
+                    callback: CsmiInputLocation {
+                        root: parameter_root(),
+                        projection: Some(CsmiProjection {
+                            scheme: "csmi.structured-locations".to_owned(),
+                            scheme_version: "0.1.0".to_owned(),
+                            steps: vec![CsmiProjectionStep {
+                                kind: "field".to_owned(),
+                                args: Some(json!({"symbol": "go.field"})),
+                            }],
+                        }),
+                    },
+                    shape: CsmiCallableValuesShape {
+                        parameters: 1,
+                        results: 0,
+                    },
+                    arguments: vec![CsmiCallableValuesArgument::Input {
+                        source: CsmiInputLocation {
+                            root: parameter_root(),
+                            projection: None,
+                        },
+                    }],
+                    timing: CsmiCallableValuesTiming::DuringCall,
+                    modality: CsmiCallableValuesModality::May,
+                },
+                provenance: Vec::new(),
+            },
+        ],
+        coverage: vec![
+            CallableValuesCoverage {
+                family: CallableValuesFamily::ReturnedCallables,
+                callable: "go.factory".to_owned(),
+                status: CsmiCoverageStatus::Partial,
+                limitations: vec![CsmiLimitation {
+                    kind: "coverage-limited".to_owned(),
+                    diagnostic: None,
+                }],
+                provenance: Vec::new(),
+            },
+            CallableValuesCoverage {
+                family: CallableValuesFamily::CallbackInvocations,
+                callable: "go.invoke".to_owned(),
+                status: CsmiCoverageStatus::Unknown,
+                limitations: Vec::new(),
+                provenance: Vec::new(),
+            },
+        ],
+        anonymous_callables: vec![crate::analyzer::semantic_model::AnonymousCallableIdentity {
+            id: "go.literal.callback".to_owned(),
+            artifact_sha256: artifact.sha256.clone(),
+            package_identity: "example.com/acme".to_owned(),
+            anchor: crate::analyzer::semantic_model::SourceAnchor {
+                file: "api.go".to_owned(),
+                byte_range: crate::analyzer::semantic_model::SourceByteRange {
+                    start: 80,
+                    end: 130,
+                },
+                kind: crate::analyzer::semantic_model::SourceDeclarationKind::FunctionLiteral,
+            },
+            lexical_owner_chain: vec![crate::analyzer::semantic_model::SourceAnchor {
+                file: "api.go".to_owned(),
+                byte_range: crate::analyzer::semantic_model::SourceByteRange { start: 0, end: 200 },
+                kind: crate::analyzer::semantic_model::SourceDeclarationKind::Function,
+            }],
+            signature: crate::analyzer::semantic_model::SourceCallableShape {
+                function_type: crate::analyzer::semantic_model::SourceTypeNode {
+                    file: "api.go".to_owned(),
+                    byte_range: crate::analyzer::semantic_model::SourceByteRange {
+                        start: 80,
+                        end: 118,
+                    },
+                },
+                parameters: vec![crate::analyzer::semantic_model::SourceParameterShape {
+                    type_node: crate::analyzer::semantic_model::SourceTypeNode {
+                        file: "api.go".to_owned(),
+                        byte_range: crate::analyzer::semantic_model::SourceByteRange {
+                            start: 105,
+                            end: 110,
+                        },
+                    },
+                    variadic: false,
+                    arity: 1,
+                }],
+                results: Vec::new(),
+                declaration_chain: Vec::new(),
+            },
+        }],
+    });
+    (pack, artifact)
 }
 
 #[test]
@@ -206,39 +540,7 @@ fn runtime_values_profile_support() -> CsmiVocabularySupport {
 }
 
 fn runtime_values_fixture_pack() -> CsmiLogicalPack {
-    let semantic_bytes =
-        canonical_json_bytes(VALID_RUNTIME_VALUES).expect("runtime-values fixture canonicalizes");
-    let path = "models/runtime-values.csmi.json".to_owned();
-    let resources = InMemoryCsmiResourceResolver::new([(path.clone(), semantic_bytes.clone())])
-        .expect("runtime-values fixture resource path is valid");
-    CsmiLogicalPack::new(
-        CsmiPackManifest {
-            document_type: "pack-manifest".to_owned(),
-            schema: CSMI_SCHEMA_URI.to_owned(),
-            pack_format_version: CSMI_PACK_FORMAT_VERSION.to_owned(),
-            assembler: CsmiProducerIdentity {
-                identifier: "https://example.org/tools/csmi-pack".to_owned(),
-                version: "1.0.0".to_owned(),
-            },
-            license: "Apache-2.0".to_owned(),
-            created_at: None,
-            resources: vec![CsmiResourceDescriptor {
-                path,
-                role: CsmiResourceRole::SemanticDocument,
-                media_type: CSMI_SEMANTIC_DOCUMENT_MEDIA_TYPE.to_owned(),
-                size: semantic_bytes.len() as u64,
-                digest: CsmiContentDigest {
-                    algorithm: CsmiContentDigestAlgorithm::Sha256,
-                    value: sha256_hex(&semantic_bytes),
-                },
-                license: None,
-                schema_identifier: None,
-                license_reference: None,
-            }],
-            derived_from: Vec::new(),
-        },
-        resources,
-    )
+    logical_pack_from_semantic_at(VALID_RUNTIME_VALUES, "models/runtime-values.csmi.json")
 }
 
 fn runtime_values_fixture_with<F>(mutate: F) -> CsmiLogicalPack
@@ -249,80 +551,17 @@ where
         serde_json::from_slice(VALID_RUNTIME_VALUES).expect("runtime-values fixture is JSON");
     mutate(&mut value);
     let bytes = canonical_json_value(&value).expect("mutated runtime-values fixture canonicalizes");
-    let path = "models/runtime-values.csmi.json".to_owned();
-    let resources = InMemoryCsmiResourceResolver::new([(path.clone(), bytes.clone())])
-        .expect("runtime-values fixture resource path is valid");
-    CsmiLogicalPack::new(
-        CsmiPackManifest {
-            document_type: "pack-manifest".to_owned(),
-            schema: CSMI_SCHEMA_URI.to_owned(),
-            pack_format_version: CSMI_PACK_FORMAT_VERSION.to_owned(),
-            assembler: CsmiProducerIdentity {
-                identifier: "https://example.org/tools/csmi-pack".to_owned(),
-                version: "1.0.0".to_owned(),
-            },
-            license: "Apache-2.0".to_owned(),
-            created_at: None,
-            resources: vec![CsmiResourceDescriptor {
-                path,
-                role: CsmiResourceRole::SemanticDocument,
-                media_type: CSMI_SEMANTIC_DOCUMENT_MEDIA_TYPE.to_owned(),
-                size: bytes.len() as u64,
-                digest: CsmiContentDigest {
-                    algorithm: CsmiContentDigestAlgorithm::Sha256,
-                    value: sha256_hex(&bytes),
-                },
-                license: None,
-                schema_identifier: None,
-                license_reference: None,
-            }],
-            derived_from: Vec::new(),
-        },
-        resources,
-    )
+    logical_pack_from_canonical_semantic_bytes(bytes, "models/runtime-values.csmi.json")
 }
 
 fn runtime_contract_profile_support() -> CsmiVocabularySupport {
-    CsmiVocabularySupport::support(
-        CSMI_RUNTIME_VALUES_PROFILE_ID,
-        CSMI_RUNTIME_CONTRACTS_PROFILE_VERSION,
-        CSMI_RUNTIME_CONTRACTS_PROFILE_SCHEMA,
-    )
+    crate::test_support::runtime_contract_profile_support()
 }
 
 fn runtime_contract_fixture_pack() -> CsmiLogicalPack {
-    let semantic_bytes = canonical_json_bytes(VALID_RUNTIME_CONTRACTS)
-        .expect("runtime-contract fixture canonicalizes");
-    let path = "models/runtime-contracts.csmi.json".to_owned();
-    let resources = InMemoryCsmiResourceResolver::new([(path.clone(), semantic_bytes.clone())])
-        .expect("runtime-contract fixture resource path is valid");
-    CsmiLogicalPack::new(
-        CsmiPackManifest {
-            document_type: "pack-manifest".to_owned(),
-            schema: CSMI_SCHEMA_URI.to_owned(),
-            pack_format_version: CSMI_PACK_FORMAT_VERSION.to_owned(),
-            assembler: CsmiProducerIdentity {
-                identifier: "https://example.org/tools/csmi-pack".to_owned(),
-                version: "1.0.0".to_owned(),
-            },
-            license: "Apache-2.0".to_owned(),
-            created_at: None,
-            resources: vec![CsmiResourceDescriptor {
-                path,
-                role: CsmiResourceRole::SemanticDocument,
-                media_type: CSMI_SEMANTIC_DOCUMENT_MEDIA_TYPE.to_owned(),
-                size: semantic_bytes.len() as u64,
-                digest: CsmiContentDigest {
-                    algorithm: CsmiContentDigestAlgorithm::Sha256,
-                    value: sha256_hex(&semantic_bytes),
-                },
-                license: None,
-                schema_identifier: None,
-                license_reference: None,
-            }],
-            derived_from: Vec::new(),
-        },
-        resources,
+    logical_pack_from_semantic_at(
+        VALID_RUNTIME_CONTRACTS,
+        "models/runtime-contracts.csmi.json",
     )
 }
 
@@ -683,20 +922,6 @@ fn canonical_json_uses_rfc_8785_number_and_key_encoding() {
 }
 
 #[test]
-fn canonical_set_duplicates_normalize_like_reordered_sets() {
-    let with_duplicates = json!({
-        "symbols": [{"id": "type.a"}, {"id": "type.a"}, {"id": "type.b"}]
-    });
-    let without_duplicates = json!({
-        "symbols": [{"id": "type.b"}, {"id": "type.a"}]
-    });
-    assert_eq!(
-        canonical_json_value(&with_duplicates).unwrap(),
-        canonical_json_value(&without_duplicates).unwrap()
-    );
-}
-
-#[test]
 fn supported_upstream_fixtures_are_classified_as_valid() {
     for (name, bytes) in [
         ("procedure-summary", VALID_PROCEDURE_SUMMARY),
@@ -860,42 +1085,23 @@ fn upstream_semantic_invalid_fixtures_remain_structurally_readable_but_invalid()
 }
 
 fn logical_fixture_pack() -> CsmiLogicalPack {
-    let semantic_bytes = canonical_json_bytes(VALID_PROCEDURE_SUMMARY)
-        .expect("procedure summary fixture canonicalizes");
-    let path = "models/normalize.csmi.json".to_owned();
-    let resources = InMemoryCsmiResourceResolver::new([(path.clone(), semantic_bytes.clone())])
-        .expect("fixture resource path is valid");
-    let manifest = CsmiPackManifest {
-        document_type: "pack-manifest".to_owned(),
-        schema: CSMI_SCHEMA_URI.to_owned(),
-        pack_format_version: CSMI_PACK_FORMAT_VERSION.to_owned(),
-        assembler: CsmiProducerIdentity {
-            identifier: "https://example.org/tools/csmi-pack".to_owned(),
-            version: "1.0.0".to_owned(),
-        },
-        license: "Apache-2.0".to_owned(),
-        created_at: None,
-        resources: vec![CsmiResourceDescriptor {
-            path,
-            role: CsmiResourceRole::SemanticDocument,
-            media_type: CSMI_SEMANTIC_DOCUMENT_MEDIA_TYPE.to_owned(),
-            size: semantic_bytes.len() as u64,
-            digest: CsmiContentDigest {
-                algorithm: CsmiContentDigestAlgorithm::Sha256,
-                value: sha256_hex(&semantic_bytes),
-            },
-            license: None,
-            schema_identifier: None,
-            license_reference: None,
-        }],
-        derived_from: Vec::new(),
-    };
-    CsmiLogicalPack::new(manifest, resources)
+    logical_pack_from_semantic_at(VALID_PROCEDURE_SUMMARY, "models/normalize.csmi.json")
 }
 
 pub(crate) fn logical_pack_from_semantic(bytes: &[u8]) -> CsmiLogicalPack {
+    logical_pack_from_semantic_at(bytes, "models/profile.csmi.json")
+}
+
+fn logical_pack_from_semantic_at(bytes: &[u8], path: &str) -> CsmiLogicalPack {
     let semantic_bytes = canonical_json_bytes(bytes).expect("semantic fixture canonicalizes");
-    let path = "models/profile.csmi.json".to_owned();
+    logical_pack_from_canonical_semantic_bytes(semantic_bytes, path)
+}
+
+fn logical_pack_from_canonical_semantic_bytes(
+    semantic_bytes: Vec<u8>,
+    path: &str,
+) -> CsmiLogicalPack {
+    let path = path.to_owned();
     let resources = InMemoryCsmiResourceResolver::new([(path.clone(), semantic_bytes.clone())])
         .expect("fixture resource path is valid");
     CsmiLogicalPack::new(
@@ -1217,7 +1423,7 @@ fn importer_rejects_ambiguous_maven_digests() {
 }
 
 #[test]
-fn importer_rejects_unresolved_unknown_intrinsic_and_multi_result_shapes() {
+fn importer_rejects_unresolved_intrinsic_and_multi_result_shapes() {
     let pack = exported_import_fixture();
     let unresolved = import_error_after_mutation(&pack, |value| {
         let callable_symbol = value["semanticModels"][0]["declarations"]
@@ -1246,14 +1452,6 @@ fn importer_rejects_unresolved_unknown_intrinsic_and_multi_result_shapes() {
     assert!(
         matches!(&unresolved, CsmiImportError::Identity(message) if message.contains("unresolved type symbol") && message.contains("declarations.callable.parameters[0].type")),
         "unexpected unresolved-symbol error: {unresolved:?}"
-    );
-
-    let unknown = import_error_after_mutation(&pack, |value| {
-        let callable = first_callable_mut(value);
-        callable["callable"]["parameters"][0]["type"] = json!({"kind": "unknown"});
-    });
-    assert!(
-        matches!(unknown, CsmiImportError::Unsupported { semantic, .. } if semantic.contains("unknown type"))
     );
 
     let intrinsic = import_error_after_mutation(&pack, |value| {
@@ -1289,21 +1487,95 @@ fn importer_rejects_unresolved_unknown_intrinsic_and_multi_result_shapes() {
         matches!(multiple_results, CsmiImportError::Unsupported { semantic, .. } if semantic.contains("multiple result"))
     );
 
-    let missing_parameter_type = import_error_after_mutation(&pack, |value| {
-        first_callable_mut(value)["callable"]["parameters"][0]
-            .as_object_mut()
-            .expect("parameter is an object")
-            .remove("type");
-    });
-    assert!(
-        matches!(missing_parameter_type, CsmiImportError::Unsupported { semantic, .. } if semantic.contains("missing its type"))
-    );
-
     let unsupported_kind = import_error_after_mutation(&pack, |value| {
         first_callable_mut(value)["callable"]["kind"] = json!("operator");
     });
     assert!(
         matches!(unsupported_kind, CsmiImportError::Unsupported { semantic, .. } if semantic.contains("callable kind"))
+    );
+}
+
+#[test]
+fn importer_preserves_missing_and_explicit_unknown_callable_types() {
+    let pack = exported_import_fixture();
+    for explicit_unknown in [false, true] {
+        let mutated = pack_with_semantic_value(&pack, |value| {
+            let callable = &mut first_callable_mut(value)["callable"];
+            if explicit_unknown {
+                callable["parameters"][0]["type"] = json!({"kind": "unknown"});
+                callable["results"][0]["type"] = json!({"kind": "unknown"});
+            } else {
+                callable["parameters"][0]
+                    .as_object_mut()
+                    .expect("parameter is an object")
+                    .remove("type");
+                callable["results"][0]
+                    .as_object_mut()
+                    .expect("result is an object")
+                    .remove("type");
+            }
+        });
+        let imported = import_logical_csmi_pack(
+            &mutated,
+            &CsmiVocabularySupport::empty(),
+            &CompilerOptions::default(),
+        )
+        .expect("untyped and explicitly unknown ports have a native representation");
+        let member = imported
+            .pack
+            .shards
+            .iter()
+            .find_map(|shard| match &shard.payload {
+                AuthoredPayload::DeclarationFacts { members, .. } => members.first(),
+                _ => None,
+            })
+            .expect("callable declaration imports");
+        assert_eq!(
+            member.signature.as_ref().unwrap().parameters[0].r#type,
+            crate::analyzer::semantic_model::TypeRef::Unknown
+        );
+        assert_eq!(
+            member.signature.as_ref().unwrap().returns,
+            Some(crate::analyzer::semantic_model::TypeRef::Unknown)
+        );
+    }
+}
+
+#[test]
+fn callable_parameter_request_role_round_trips() {
+    let pack = exported_import_fixture();
+    let with_request_role = pack_with_semantic_value(&pack, |value| {
+        first_callable_mut(value)["callable"]["parameters"][0]["role"] = json!("request");
+    });
+    let imported = import_logical_csmi_pack(
+        &with_request_role,
+        &CsmiVocabularySupport::empty(),
+        &CompilerOptions::default(),
+    )
+    .expect("request role imports as a structured parameter fact");
+    let member = imported
+        .pack
+        .shards
+        .iter()
+        .find_map(|shard| match &shard.payload {
+            AuthoredPayload::DeclarationFacts { members, .. } => members.first(),
+            _ => None,
+        })
+        .expect("callable declaration imports");
+    assert_eq!(
+        member.signature.as_ref().unwrap().parameters[0].role,
+        Some(crate::analyzer::semantic_model::ParameterRole::Request)
+    );
+
+    let compiled = compile_pack(&imported.pack, &CompilerOptions::default())
+        .expect("request role survives native compilation");
+    let artifact = CsmiArtifactEvidence::new("pkg:maven/com.acme/widget@1.2.0", artifact_digest());
+    let exported = export_csmi_pack(&compiled, &artifact, &CsmiExportOptions::default())
+        .expect("request role exports");
+    let mut semantic = semantic_value(&exported);
+    assert_eq!(
+        first_callable_mut(&mut semantic)["callable"]["parameters"][0]["role"],
+        json!("request")
     );
 }
 
@@ -1320,6 +1592,8 @@ fn authored_exact_pack() -> AuthoredSemanticModelPack {
     };
     relations.clear();
     types.push(TypeFact {
+        jvm_inventory: None,
+        runtime_bases: None,
         ambient_use: None,
         id: "type.java.lang.string".to_owned(),
         name: "java.lang.String".to_owned(),
@@ -1345,6 +1619,7 @@ fn authored_exact_pack() -> AuthoredSemanticModelPack {
     });
     let activation = pack.shards[0].activation.clone();
     pack.shards.push(AuthoredShard {
+        callable_values: None,
         id: "summaries.widget".to_owned(),
         activation,
         payload: AuthoredPayload::ProcedureSummaries {
@@ -1356,6 +1631,7 @@ fn authored_exact_pack() -> AuthoredSemanticModelPack {
                     has_receiver: false,
                     variadic: false,
                     parameter_count: 1,
+                    formals: Vec::new(),
                 },
                 completeness: Completeness::Complete,
                 ordinary_heap_unchanged: false,
@@ -1373,6 +1649,7 @@ fn authored_exact_pack() -> AuthoredSemanticModelPack {
                 transfer_partitions: Vec::new(),
                 effects: Vec::new(),
                 concurrency_effects: Vec::new(),
+                returned_callables: Vec::new(),
                 declared_effects: Vec::new(),
                 preconditions: None,
                 result_contracts: Vec::new(),
@@ -1504,6 +1781,7 @@ fn authored_declarations_and_summary_round_trip_through_csmi() {
 }
 
 #[test]
+#[hardwon("#2854: complete empty summaries were exported as partial or missing evidence")]
 fn complete_empty_summary_exports_without_licensing_partial_or_missing_evidence() {
     let artifact = CsmiArtifactEvidence::new("pkg:maven/com.acme/widget@1.2.0", artifact_digest());
     let options = CsmiExportOptions::default();
@@ -2361,6 +2639,339 @@ fn recognized_profile_payload_schema_violations_are_structural() {
 }
 
 #[test]
+fn go_callable_values_export_remaps_named_and_anonymous_ids_with_scoped_coverage() {
+    let (authored, artifact) = go_callable_values_fixture();
+    let compiled = compile_pack(&authored, &CompilerOptions::default())
+        .expect("Go declarations and callable-values companion compile");
+    let exported = export_csmi_pack(&compiled, &artifact, &CsmiExportOptions::default())
+        .expect("exact Go declarations and callable-values facts export");
+    let manifest = exported
+        .canonical_manifest_bytes()
+        .expect("exported manifest canonicalizes");
+    let validation = validate_csmi_pack(
+        &manifest,
+        &exported.resources,
+        &CsmiVocabularySupport::empty(),
+    );
+    assert!(
+        validation.valid(),
+        "export diagnostics: {:#?}",
+        validation.diagnostics
+    );
+    assert!(
+        !validation.interpretable,
+        "callable-values execution remains unsupported"
+    );
+    let model = &validation.semantic_documents[0].semantic_models[0];
+    let use_ = model
+        .vocabulary_uses
+        .iter()
+        .find(|use_| use_.identifier == CSMI_CALLABLE_VALUES_PROFILE_ID)
+        .expect("callable-values transport is declared");
+    assert_eq!(use_.affects.len(), 2);
+    assert!(use_.affects.iter().any(|affect| matches!(
+        affect,
+        CsmiAffectedUnit::FactFamily(family)
+            if family.family == CSMI_CALLABLE_VALUES_RETURNED_CALLABLES_FAMILY
+                && family.scope == json!({"callable": model.declarations.iter().find(|decl| {
+                    decl.category == CsmiDeclarationCategory::Callable
+                        && decl.callable.as_ref().is_some_and(|shape| shape.results.len() == 1)
+                }).unwrap().symbol})
+    )));
+
+    let callback_fact = model
+        .extension_facts
+        .iter()
+        .find(|fact| fact.family == CSMI_CALLABLE_VALUES_CALLBACK_INVOCATIONS_FAMILY)
+        .expect("callback invocation alternative is retained");
+    let callback_payload: CsmiCallableValuesPayload =
+        serde_json::from_value(callback_fact.payload.clone())
+            .expect("callback payload remains typed");
+    let CsmiCallableValuesPayload::CallbackInvocation { callback, .. } = callback_payload else {
+        panic!("callback family carries callback-invocation payload");
+    };
+    let field_symbol = callback.projection.as_ref().unwrap().steps[0]
+        .args
+        .as_ref()
+        .unwrap()
+        .get("symbol")
+        .and_then(Value::as_str)
+        .expect("field projection carries a symbol");
+    let field_declaration = model
+        .declarations
+        .iter()
+        .find(|declaration| declaration.symbol == field_symbol)
+        .expect("native field ID remaps to a declared CSMI value");
+    assert_eq!(field_declaration.category, CsmiDeclarationCategory::Value);
+    let returned_fact = model
+        .extension_facts
+        .iter()
+        .find(|fact| fact.family == CSMI_CALLABLE_VALUES_RETURNED_CALLABLES_FAMILY)
+        .expect("returned callable alternative is retained");
+    let returned_payload: CsmiCallableValuesPayload =
+        serde_json::from_value(returned_fact.payload.clone())
+            .expect("returned callable payload remains typed");
+    let CsmiCallableValuesPayload::ReturnedCallable { target, .. } = returned_payload else {
+        panic!("returned-callables family carries returned-callable payload");
+    };
+    let literal_symbol = model
+        .symbols
+        .iter()
+        .find(|symbol| symbol.id == target)
+        .expect("anonymous identity is declared as the returned target");
+    assert_eq!(
+        literal_symbol.scheme,
+        super::identity::GO_SOURCE_IDENTITY_SCHEME
+    );
+    assert_eq!(literal_symbol.stability, CsmiStability::ArtifactLocal);
+    assert!(literal_symbol.descriptors.iter().any(|descriptor| {
+        descriptor
+            .disambiguator
+            .as_deref()
+            .is_some_and(|value| value.starts_with("go-anonymous-callable-0.1:"))
+    }));
+
+    let returned_coverage = model
+        .completeness_statements
+        .iter()
+        .find(|statement| {
+            statement.vocabulary.as_deref() == Some(CSMI_CALLABLE_VALUES_PROFILE_ID)
+                && statement.family == CSMI_CALLABLE_VALUES_RETURNED_CALLABLES_FAMILY
+        })
+        .expect("factory coverage stays independently scoped");
+    let callback_coverage = model
+        .completeness_statements
+        .iter()
+        .find(|statement| {
+            statement.vocabulary.as_deref() == Some(CSMI_CALLABLE_VALUES_PROFILE_ID)
+                && statement.family == CSMI_CALLABLE_VALUES_CALLBACK_INVOCATIONS_FAMILY
+        })
+        .expect("callback coverage stays independently scoped");
+    assert_eq!(returned_coverage.status, CsmiCoverageStatus::Partial);
+    assert_eq!(callback_coverage.status, CsmiCoverageStatus::Unknown);
+
+    let runtime_error =
+        export_runtime_contracts_csmi_pack(&compiled, &CsmiExportOptions::default())
+            .expect_err("runtime-contract export must reject the incompatible carrier");
+    assert!(matches!(runtime_error, CsmiExportError::Unsupported { .. }));
+}
+
+#[test]
+fn callable_values_partial_fact_is_valid_but_not_interpretable_without_typed_shape() {
+    let result = validate_callable_values_document(&callable_values_document());
+    assert!(
+        result.structural_valid,
+        "diagnostics: {:#?}",
+        result.diagnostics
+    );
+    assert!(
+        result.semantic_valid,
+        "diagnostics: {:#?}",
+        result.diagnostics
+    );
+    assert!(!result.interpretable);
+    assert!(diagnostics_contain(
+        &result.diagnostics,
+        "interpretability.callable_values_callback_shape_unknown"
+    ));
+    let profile = result
+        .profiles
+        .iter()
+        .find(|profile| profile.identifier == CSMI_CALLABLE_VALUES_PROFILE_ID)
+        .expect("callable-values profile is recognized");
+    assert!(profile.recognized);
+    assert!(!profile.semantically_supported);
+}
+
+#[test]
+fn callable_values_rejects_non_exact_fact_scope_and_argument_arity() {
+    let mut wrong_scope = callable_values_document();
+    wrong_scope["semanticModels"][0]["extensionFacts"][1]["scope"]["extra"] =
+        json!("not part of the exact callable scope");
+    let result = validate_callable_values_document(&wrong_scope);
+    assert!(
+        result.structural_valid,
+        "diagnostics: {:#?}",
+        result.diagnostics
+    );
+    assert!(!result.semantic_valid);
+    assert!(diagnostics_contain(
+        &result.diagnostics,
+        "semantic.callable_values_scope"
+    ));
+
+    let mut wrong_arity = callable_values_document();
+    wrong_arity["semanticModels"][0]["extensionFacts"][1]["payload"]["arguments"] = json!([]);
+    let result = validate_callable_values_document(&wrong_arity);
+    assert!(
+        result.structural_valid,
+        "diagnostics: {:#?}",
+        result.diagnostics
+    );
+    assert!(!result.semantic_valid);
+    assert!(diagnostics_contain(
+        &result.diagnostics,
+        "semantic.callable_values_argument_arity"
+    ));
+}
+
+#[test]
+fn callable_values_complete_callback_coverage_requires_typed_shape_proof() {
+    let mut value = callable_values_document();
+    value["semanticModels"][0]["completenessStatements"]
+        .as_array_mut()
+        .expect("completeness statements are an array")
+        .push(json!({
+            "vocabulary": CSMI_CALLABLE_VALUES_PROFILE_ID,
+            "version": CSMI_CALLABLE_VALUES_PROFILE_VERSION,
+            "family": CSMI_CALLABLE_VALUES_CALLBACK_INVOCATIONS_FAMILY,
+            "scope": {"callable": "normalize"},
+            "status": "complete"
+        }));
+    let result = validate_callable_values_document(&value);
+    assert!(
+        result.structural_valid,
+        "diagnostics: {:#?}",
+        result.diagnostics
+    );
+    assert!(!result.semantic_valid);
+    assert!(diagnostics_contain(
+        &result.diagnostics,
+        "semantic.callable_values_complete_uncertain"
+    ));
+}
+
+#[test]
+fn callable_values_fact_requires_matching_required_family_affect() {
+    let mut value = callable_values_document();
+    value["semanticModels"][0]["vocabularyUses"][1]["affects"] = json!([{
+        "kind": "fact-family",
+        "family": CSMI_CALLABLE_VALUES_RETURNED_CALLABLES_FAMILY,
+        "scope": {"callable": "normalize"}
+    }]);
+    let result = validate_callable_values_document(&value);
+    assert!(
+        result.structural_valid,
+        "diagnostics: {:#?}",
+        result.diagnostics
+    );
+    assert!(!result.semantic_valid);
+    assert!(diagnostics_contain(
+        &result.diagnostics,
+        "semantic.callable_values_affects"
+    ));
+}
+
+#[test]
+fn callable_values_missing_digest_provenance_is_uncertain_not_invalid() {
+    let mut value = callable_values_document();
+    // Keep the source-analysis record structurally valid, but remove the
+    // digest match needed to prove applicability to this artifact.
+    value["provenanceRecords"][0]["inputs"][0]["digest"]["value"] = json!("2".repeat(64));
+    let result = validate_callable_values_document(&value);
+    assert!(
+        result.structural_valid,
+        "diagnostics: {:#?}",
+        result.diagnostics
+    );
+    assert!(
+        result.semantic_valid,
+        "diagnostics: {:#?}",
+        result.diagnostics
+    );
+    assert!(!result.interpretable);
+    assert!(diagnostics_contain(
+        &result.diagnostics,
+        "interpretability.callable_values_artifact_provenance_unknown"
+    ));
+}
+
+#[test]
+fn callable_values_type_alias_cycle_terminates_as_interpretability_unknown() {
+    let mut value = callable_values_document();
+    let model = &mut value["semanticModels"][0];
+    model["symbols"].as_array_mut().unwrap().extend([
+        json!({
+            "id": "alias-a",
+            "scheme": "org.example.test",
+            "schemeVersion": "1",
+            "stability": "portable",
+            "descriptors": [{"role": "type", "name": "AliasA"}]
+        }),
+        json!({
+            "id": "alias-b",
+            "scheme": "org.example.test",
+            "schemeVersion": "1",
+            "stability": "portable",
+            "descriptors": [{"role": "type", "name": "AliasB"}]
+        }),
+        json!({
+            "id": "field-owner",
+            "scheme": "org.example.test",
+            "schemeVersion": "1",
+            "stability": "portable",
+            "descriptors": [{"role": "type", "name": "FieldOwner"}]
+        }),
+        json!({
+            "id": "field-value",
+            "scheme": "org.example.test",
+            "schemeVersion": "1",
+            "stability": "portable",
+            "descriptors": [{"role": "meta", "name": "field"}]
+        }),
+    ]);
+    model["declarations"].as_array_mut().unwrap().extend([
+        json!({
+            "symbol": "alias-a",
+            "category": "type-alias",
+            "aliasTarget": {"kind": "reference", "symbol": "alias-b"}
+        }),
+        json!({
+            "symbol": "alias-b",
+            "category": "type-alias",
+            "aliasTarget": {"kind": "reference", "symbol": "alias-a"}
+        }),
+        json!({
+            "symbol": "field-owner",
+            "category": "type"
+        }),
+        json!({
+            "symbol": "field-value",
+            "category": "value",
+            "owner": "field-owner"
+        }),
+    ]);
+    model["declarations"][1]["callable"]["parameters"][0]["type"] =
+        json!({"kind": "reference", "symbol": "alias-a"});
+    let fact = &mut model["extensionFacts"][1]["payload"]["callback"];
+    fact["projection"] = json!({
+        "scheme": "csmi.structured-locations",
+        "schemeVersion": "0.1.0",
+        "steps": [{"kind": "field", "args": {"symbol": "field-value"}}]
+    });
+    let result = validate_callable_values_document(&value);
+    assert!(
+        result.structural_valid,
+        "diagnostics: {:#?}",
+        result.diagnostics
+    );
+    assert!(
+        result.semantic_valid,
+        "diagnostics: {:#?}",
+        result.diagnostics
+    );
+    assert!(!result.interpretable);
+    assert!(diagnostics_contain(
+        &result.diagnostics,
+        "interpretability.callable_values_root_type_unknown"
+    ));
+    assert!(diagnostics_contain(
+        &result.diagnostics,
+        "interpretability.callable_values_owner_chain_incomplete"
+    ));
+}
+
+#[test]
 fn known_profile_with_wrong_schema_fails_at_profile_recognition_boundary() {
     let mut value: Value = serde_json::from_slice(VALID_JAVASCRIPT_TYPESCRIPT_NODE)
         .expect("profile fixture is valid JSON");
@@ -2493,6 +3104,61 @@ fn conditional_type_refinement_round_trip_retains_target_arguments() {
                 .refinements[0]
                 .coverage,
             coverage
+        );
+    }
+}
+
+#[test]
+fn python_runtime_bases_export_refuses_even_an_explicit_empty_root_claim() {
+    let mut support = CsmiVocabularySupport::support(
+        CSMI_PYTHON_PROFILE_ID,
+        CSMI_PYTHON_PROFILE_VERSION,
+        CSMI_PYTHON_PROFILE_SCHEMA,
+    );
+    support.add(
+        CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_ID,
+        CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_VERSION,
+        CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_SCHEMA,
+    );
+    let imported = import_logical_csmi_pack(
+        &logical_pack_from_semantic(include_bytes!("fixtures/python-runtime-refinement.json")),
+        &support,
+        &CompilerOptions::default(),
+    )
+    .unwrap();
+    let artifact = CsmiArtifactEvidence::new(
+        "pkg:generic/python-runtime@3.12.0?component=stdlib&implementation=cpython",
+        "a".repeat(64),
+    );
+    export_authored_csmi_pack(&imported.pack, &artifact, &CsmiExportOptions::default())
+        .expect("nonclaiming baseline remains exportable");
+    for bases in [
+        Vec::new(),
+        vec![crate::analyzer::semantic_model::TypeRef::Named {
+            name: "builtins.object".to_owned(),
+            arguments: Vec::new(),
+            nullable: false,
+        }],
+    ] {
+        let mut pack = imported.pack.clone();
+        pack.schema_version = crate::analyzer::semantic_model::RUNTIME_BASES_MIN_SCHEMA_VERSION;
+        let fact = pack
+            .shards
+            .iter_mut()
+            .find_map(|shard| match &mut shard.payload {
+                AuthoredPayload::DeclarationFacts { types, .. } => types
+                    .iter_mut()
+                    .find(|fact| fact.type_kind == TypeKind::Class),
+                _ => None,
+            })
+            .expect("fixture contains a class");
+        fact.runtime_bases = Some(bases);
+        let error = export_authored_csmi_pack(&pack, &artifact, &CsmiExportOptions::default())
+            .expect_err("portable profile must never drop runtime ancestry claims");
+        assert!(
+            matches!(error, CsmiExportError::Unsupported { ref semantic, .. }
+            if semantic.contains("runtime_bases")),
+            "{error:?}"
         );
     }
 }
@@ -2877,7 +3543,7 @@ pub(crate) fn rewrite_raw_declaration_shard(
 ) {
     use crate::analyzer::semantic_model::artifact::{
         canonical_json, content_digest, manifest_content_digest, manifest_semantic_digest,
-        semantic_digest, stored_digest,
+        semantic_digest,
     };
     use crate::analyzer::semantic_model::{CompiledPayload, DecodeLimits, decode_shard};
     let shard = compiled
@@ -2899,7 +3565,7 @@ pub(crate) fn rewrite_raw_declaration_shard(
     shard.descriptor.stored_size = raw.len() as u64;
     shard.descriptor.semantic_sha256 = semantic_digest(&decoded).unwrap();
     shard.descriptor.content_sha256 = content_digest(&raw);
-    shard.descriptor.stored_sha256 = stored_digest(&raw);
+    shard.descriptor.stored_sha256 = content_digest(&raw);
     shard.bytes = raw;
     let descriptor = compiled
         .manifest
@@ -3199,12 +3865,15 @@ fn python_distribution_round_trip_retains_resolver_facts_and_provenance() {
 }
 
 #[test]
+#[hardwon(
+    "#4327+fbe7303f9ac5: CSMI import dropped callable formals needed for exact binding, and a complete Python callable shape incorrectly closed the native callable family"
+)]
 fn python_distribution_round_trip_preserves_formal_binding_slots() {
     let mut original: Value = serde_json::from_slice(include_bytes!(
         "fixtures/python-distribution-beautifulsoup4.json"
     ))
     .unwrap();
-    let parameters = [
+    let mut parameters = [
         ("positional-only", "first"),
         ("positional-or-named", "second"),
         ("variadic-positional", "args"),
@@ -3223,7 +3892,14 @@ fn python_distribution_round_trip_preserves_formal_binding_slots() {
         })
     })
     .collect::<Vec<_>>();
+    parameters[0]
+        .as_object_mut()
+        .expect("first parameter is an object")
+        .remove("type");
+    parameters[1]["type"] = json!({"kind": "unknown"});
     original["semanticModels"][0]["declarations"][2]["callable"]["parameters"] = json!(parameters);
+    original["semanticModels"][0]["declarations"][2]["callable"]["results"][0]["type"] =
+        json!({"kind": "unknown"});
     original["semanticModels"][0]["procedureSummaries"][0]["transfers"][0]["source"]["root"]["position"] =
         json!(3);
     let source = serde_json::to_vec(&original).unwrap();
@@ -3238,15 +3914,76 @@ fn python_distribution_round_trip_preserves_formal_binding_slots() {
         &CompilerOptions::default(),
     )
     .expect("all five formal binding kinds import structurally");
+    let summary = imported
+        .pack
+        .shards
+        .iter()
+        .find_map(|shard| match &shard.payload {
+            AuthoredPayload::ProcedureSummaries { summaries } => summaries.first(),
+            _ => None,
+        })
+        .expect("CSMI procedure summary remains present");
+    let formals = &summary.target.formals;
+    assert_eq!(
+        formals.len(),
+        5,
+        "every CSMI formal is carried to the summary"
+    );
+    assert_eq!(formals[0].name, "first");
+    assert!(!formals[0].optional);
+    assert_eq!(
+        formals[0].passing_mode,
+        crate::analyzer::semantic_model::AuthoredProcedureFormalPassingMode::PositionalOnly
+    );
+    assert_eq!(formals[1].name, "second");
+    assert!(!formals[1].optional);
+    assert_eq!(
+        formals[1].passing_mode,
+        crate::analyzer::semantic_model::AuthoredProcedureFormalPassingMode::PositionalOrNamed
+    );
+    assert_eq!(formals[2].name, "args");
+    assert!(formals[2].optional);
+    assert_eq!(
+        formals[2].variadic_kind,
+        Some(crate::analyzer::semantic_model::AuthoredProcedureFormalVariadicKind::Positional)
+    );
+    assert_eq!(formals[3].name, "option");
+    assert!(formals[3].optional);
+    assert_eq!(
+        formals[3].passing_mode,
+        crate::analyzer::semantic_model::AuthoredProcedureFormalPassingMode::NamedOnly
+    );
+    assert_eq!(formals[4].name, "kwargs");
+    assert!(formals[4].optional);
+    assert_eq!(
+        formals[4].variadic_kind,
+        Some(crate::analyzer::semantic_model::AuthoredProcedureFormalVariadicKind::Keyword)
+    );
     let native_member = imported
         .pack
         .shards
         .iter()
         .find_map(|shard| match &shard.payload {
-            AuthoredPayload::DeclarationFacts { members, .. } => members.first(),
+            AuthoredPayload::DeclarationFacts { members, .. } => {
+                members.iter().find(|member| member.name == "parse")
+            }
             _ => None,
         })
         .unwrap();
+    let signature = native_member
+        .signature
+        .as_ref()
+        .expect("callable declaration retains its signature");
+    assert_eq!(
+        signature.parameters[2].passing_mode,
+        crate::analyzer::semantic_model::ParameterPassingMode::PositionalOnly,
+        "CSMI *args remains positional-only in the imported signature"
+    );
+    assert_eq!(
+        signature.parameters[4].passing_mode,
+        crate::analyzer::semantic_model::ParameterPassingMode::NamedOnly,
+        "CSMI **kwargs remains keyword-only in the imported signature"
+    );
     assert!(
         !native_member.callable_family_complete,
         "one complete CSMI shape does not close a native variadic callable family"
@@ -3256,6 +3993,8 @@ fn python_distribution_round_trip_preserves_formal_binding_slots() {
         export_authored_csmi_pack(&imported.pack, &artifact, &CsmiExportOptions::default())
             .expect("formal binding kinds export without positional reinterpretation");
     let output = semantic_value(&exported);
+    let mut canonical_parameters = parameters;
+    canonical_parameters[0]["type"] = json!({"kind": "unknown"});
     let exported_callable = output["semanticModels"][0]["declarations"]
         .as_array()
         .unwrap()
@@ -3264,11 +4003,103 @@ fn python_distribution_round_trip_preserves_formal_binding_slots() {
         .unwrap();
     assert_eq!(
         exported_callable["callable"]["parameters"],
-        original["semanticModels"][0]["declarations"][2]["callable"]["parameters"]
+        json!(canonical_parameters)
+    );
+    assert_eq!(
+        exported_callable["callable"]["results"][0]["type"],
+        json!({"kind": "unknown"})
     );
     assert_eq!(
         output["semanticModels"][0]["procedureSummaries"][0]["transfers"],
         original["semanticModels"][0]["procedureSummaries"][0]["transfers"]
+    );
+    let restored = import_logical_csmi_pack(
+        &exported,
+        &CsmiVocabularySupport::support(
+            CSMI_PYTHON_PROFILE_ID,
+            CSMI_PYTHON_PROFILE_VERSION,
+            CSMI_PYTHON_PROFILE_SCHEMA,
+        ),
+        &CompilerOptions::default(),
+    )
+    .expect("canonical unknown-port representation imports again");
+    let restored_member = restored
+        .pack
+        .shards
+        .iter()
+        .find_map(|shard| match &shard.payload {
+            AuthoredPayload::DeclarationFacts { members, .. } => members.first(),
+            _ => None,
+        })
+        .expect("round-tripped callable remains present");
+    let signature = restored_member.signature.as_ref().unwrap();
+    assert_eq!(
+        signature.parameters[0].r#type,
+        crate::analyzer::semantic_model::TypeRef::Unknown
+    );
+    assert_eq!(
+        signature.parameters[1].r#type,
+        crate::analyzer::semantic_model::TypeRef::Unknown
+    );
+    assert_eq!(
+        signature.returns,
+        Some(crate::analyzer::semantic_model::TypeRef::Unknown)
+    );
+    let mut zero_result = original.clone();
+    zero_result["semanticModels"][0]["declarations"][2]["callable"]["results"] = json!([]);
+    zero_result["semanticModels"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("procedureSummaries");
+    let zero_result_import = import_logical_csmi_pack(
+        &logical_pack_from_semantic(&serde_json::to_vec(&zero_result).unwrap()),
+        &support,
+        &CompilerOptions::default(),
+    )
+    .expect("a callable with no result ports remains distinct from an unknown result");
+    let zero_result_member = zero_result_import
+        .pack
+        .shards
+        .iter()
+        .find_map(|shard| match &shard.payload {
+            AuthoredPayload::DeclarationFacts { members, .. } => members.first(),
+            _ => None,
+        })
+        .expect("zero-result callable remains present");
+    assert_eq!(zero_result_member.signature.as_ref().unwrap().returns, None);
+    let zero_result_export = export_authored_csmi_pack(
+        &zero_result_import.pack,
+        &artifact,
+        &CsmiExportOptions::default(),
+    )
+    .expect("zero-result callable exports with no result ports");
+    let zero_result_output = semantic_value(&zero_result_export);
+    let zero_result_callable = zero_result_output["semanticModels"][0]["declarations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|declaration| declaration["symbol"] == "parse")
+        .unwrap();
+    assert_eq!(zero_result_callable["callable"]["results"], json!([]));
+    let zero_result_restored =
+        import_logical_csmi_pack(&zero_result_export, &support, &CompilerOptions::default())
+            .expect("canonical zero-result shape imports again");
+    let zero_result_restored_member = zero_result_restored
+        .pack
+        .shards
+        .iter()
+        .find_map(|shard| match &shard.payload {
+            AuthoredPayload::DeclarationFacts { members, .. } => members.first(),
+            _ => None,
+        })
+        .expect("round-tripped zero-result callable remains present");
+    assert_eq!(
+        zero_result_restored_member
+            .signature
+            .as_ref()
+            .unwrap()
+            .returns,
+        None
     );
 
     let mut changed = imported.pack.clone();
@@ -3908,6 +4739,9 @@ fn python_distribution_catalog_admission_checks_rebuilt_hash_carrier_mutations()
 }
 
 #[test]
+#[hardwon(
+    "fbe7303f9ac5: a complete Python callable shape incorrectly closed the native callable family"
+)]
 fn python_core_transfer_round_trips_without_closing_partial_callable() {
     let mut value: Value =
         serde_json::from_slice(include_bytes!("fixtures/python-runtime-refinement.json")).unwrap();
@@ -4289,6 +5123,7 @@ fn export_does_not_silently_drop_callable_inventory_coverage() {
 }
 
 #[test]
+#[hardwon("#3713: Java export dropped non-overridable dispatch evidence")]
 fn export_does_not_silently_drop_non_overridable_evidence() {
     let mut authored: AuthoredSemanticModelPack =
         serde_json::from_slice(DECLARATIONS_JSON).unwrap();
@@ -4309,4 +5144,71 @@ fn export_does_not_silently_drop_non_overridable_evidence() {
     assert!(
         matches!(error, CsmiExportError::Unsupported { path, .. } if path.ends_with("non_overridable"))
     );
+}
+
+#[test]
+fn callable_values_import_cannot_discard_a_declared_profile() {
+    let original = exported_import_fixture();
+    let pack = pack_with_semantic_value(&original, |value| {
+        let model = &mut value["semanticModels"][0];
+        let callable = model["declarations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|declaration| declaration["category"] == "callable")
+            .unwrap()["symbol"]
+            .clone();
+        model["vocabularyUses"] = json!([{
+            "identifier": CSMI_CALLABLE_VALUES_PROFILE_ID,
+            "version": CSMI_CALLABLE_VALUES_PROFILE_VERSION,
+            "schema": CSMI_CALLABLE_VALUES_PROFILE_SCHEMA,
+            "requirement": "required",
+            "affects": [{
+                "kind": "fact-family",
+                "family": CSMI_CALLABLE_VALUES_RETURNED_CALLABLES_FAMILY,
+                "scope": {"callable": callable}
+            }]
+        }]);
+    });
+    let support = CsmiVocabularySupport::support(
+        CSMI_CALLABLE_VALUES_PROFILE_ID,
+        CSMI_CALLABLE_VALUES_PROFILE_VERSION,
+        CSMI_CALLABLE_VALUES_PROFILE_SCHEMA,
+    );
+    let error = import_logical_csmi_pack(&pack, &support, &CompilerOptions::default())
+        .expect_err("declaring vocabulary support cannot silently discard callback semantics");
+    assert!(matches!(
+        error,
+        CsmiImportError::Uninterpretable(diagnostics)
+            if diagnostics_contain(
+                &diagnostics,
+                "interpretability.unsupported_required_vocabulary"
+            )
+    ));
+}
+
+#[test]
+fn canonical_set_duplicates_normalize_like_reordered_sets() {
+    let with_duplicates = json!({
+        "symbols": [{"id": "type.a"}, {"id": "type.a"}, {"id": "type.b"}]
+    });
+    let without_duplicates = json!({
+        "symbols": [{"id": "type.b"}, {"id": "type.a"}]
+    });
+    assert_eq!(
+        canonical_json_value(&with_duplicates).unwrap(),
+        canonical_json_value(&without_duplicates).unwrap()
+    );
+}
+
+#[test]
+fn jvm_identity_does_not_name_an_unknown_type() {
+    let result = super::identity::type_expression_name(
+        &crate::analyzer::semantic_model::TypeRef::Unknown,
+        &std::collections::HashMap::new(),
+    );
+    assert!(matches!(
+        result,
+        Err(super::identity::IdentityError::UnsupportedType(_))
+    ));
 }

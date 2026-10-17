@@ -12,6 +12,25 @@ use crate::analyzer::{CodeUnit, Language, ProjectFile};
 use crate::cancellation::CancellationToken;
 use std::path::Path;
 
+/// Qualify `name` with a dot-separated namespace or package prefix.
+pub fn qualify_dotted_name(prefix: &str, name: &str) -> String {
+    if prefix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{prefix}.{name}")
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_range(start_byte: usize) -> crate::analyzer::Range {
+    crate::analyzer::Range {
+        start_byte,
+        end_byte: start_byte + 1,
+        start_line: 1,
+        end_line: 1,
+    }
+}
+
 /// The byte span a tree-sitter node covers, in the shared structural span
 /// shape. Adapters use this to record token anchors (e.g. an import's binder
 /// token) on parser-derived models.
@@ -22,12 +41,55 @@ pub fn node_span(node: Node<'_>) -> Span {
     }
 }
 
+pub fn span_from_nodes(first: Node<'_>, last: Node<'_>) -> Span {
+    Span {
+        start_byte: first.start_byte(),
+        end_byte: last.end_byte(),
+    }
+}
+
+pub fn packed_bits_is_empty(words: &[u64]) -> bool {
+    words.iter().all(|word| *word == 0)
+}
+
+pub fn packed_bits_len(words: &[u64]) -> usize {
+    words.iter().map(|word| word.count_ones() as usize).sum()
+}
+
 pub fn language_for_target(target: &CodeUnit) -> Language {
     declaration_language_for_file(target.source())
 }
 
 pub fn language_for_file(file: &ProjectFile) -> Language {
     file.language()
+}
+
+pub(crate) fn estimated_string_vec_bytes(values: &[String], capacity: usize) -> usize {
+    capacity
+        .saturating_mul(std::mem::size_of::<String>())
+        .saturating_add(
+            values
+                .iter()
+                .map(String::capacity)
+                .fold(0usize, usize::saturating_add),
+        )
+}
+
+/// Select the workspace delegate needed for source or static dependency input.
+/// Metadata activates its reader without becoming a programming-language file.
+/// Admission and refresh must use the same rule for files-only workspaces.
+pub fn workspace_language_for_file(file: &ProjectFile) -> Language {
+    match file.rel_path().file_name().and_then(|name| name.to_str()) {
+        Some("Cargo.toml" | "Cargo.lock") => Language::Rust,
+        Some(
+            "package.json"
+            | "package-lock.json"
+            | "npm-shrinkwrap.json"
+            | "pnpm-lock.yaml"
+            | "yarn.lock",
+        ) => Language::JavaScript,
+        _ => language_for_file(file),
+    }
 }
 
 /// The single language whose adapter adopts files by include inference
@@ -87,24 +149,8 @@ pub(crate) fn declaration_language_of(language: Language, unclaimed_extension: b
     }
 }
 
-/// Whether no analyzable language claims this file's extension.
-///
-/// This is the eligibility rule for include-driven language inference (#1837):
-/// an analyzer may adopt a workspace file its own sources reference only when
-/// the static extension registry leaves that file unowned, so inference can
-/// never take a file away from the language whose extension list names it.
-/// A file with no extension at all qualifies, because no extension list can
-/// name it.
-///
-/// [`Language::is_source_extension`] is the whole registry, reference-only
-/// sibling extensions included, so a `.vue` or `.razor` file stays unclaimable
-/// even though no analyzer parses it directly.
-pub fn has_unclaimed_extension(file: &ProjectFile) -> bool {
-    file.has_unclaimed_extension()
-}
-
-/// The extension-list half of [`has_unclaimed_extension`], for a caller that
-/// has the extension rather than a file.
+/// The extension-list half of [`ProjectFile::has_unclaimed_extension`], for a
+/// caller that has the extension rather than a file.
 pub(crate) fn unclaimed_extension(extension: Option<&str>) -> bool {
     extension.is_none_or(|extension| !Language::is_source_extension(extension))
 }
@@ -129,7 +175,7 @@ pub fn languages_may_analyze(
     file: &ProjectFile,
 ) -> bool {
     languages.contains(&language_for_file(file))
-        || (languages.contains(&INCLUDE_CLAIMING_LANGUAGE) && has_unclaimed_extension(file))
+        || (languages.contains(&INCLUDE_CLAIMING_LANGUAGE) && file.has_unclaimed_extension())
 }
 
 /// Default longest single line a source file may contain before tree-sitter parsing is
@@ -185,6 +231,25 @@ pub fn collapse_whitespace(text: &str) -> String {
     out
 }
 
+/// Split a language-specific call reference into its receiver and member.
+///
+/// The first parenthesis begins the argument list. Separators are tried in
+/// order, and the last occurrence of the first matching separator is used.
+pub fn extract_call_reference_parts<'a>(
+    reference: &'a str,
+    separators: &[&str],
+) -> Option<(&'a str, &'a str)> {
+    debug_assert!(separators.iter().all(|separator| !separator.is_empty()));
+    let trimmed = reference.trim();
+    let before_args = trimmed
+        .split_once('(')
+        .map(|(head, _)| head)
+        .unwrap_or(trimmed);
+    separators
+        .iter()
+        .find_map(|separator| before_args.rsplit_once(*separator))
+}
+
 /// Verbatim source text spanned by `node`, or `""` when the byte range is not a
 /// valid `str` boundary (adversarial or partially-parsed input).
 ///
@@ -198,12 +263,23 @@ pub fn node_source_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     source.get(node.byte_range()).unwrap_or("")
 }
 
+/// The UTF-8 source text spanned by `node`, or `None` when its range is invalid
+/// for `source`.
+pub fn try_node_source_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
+    node.utf8_text(source.as_bytes()).ok()
+}
+
 /// [`node_source_text`] with leading/trailing whitespace trimmed. Trimming is
 /// load-bearing on the usages side, where a "name" node can span a compound
 /// token whose canonical text is the trimmed inner identifier; declaration-side
 /// callers that must preserve exact spans use [`node_source_text`] instead.
 pub fn node_source_text_trimmed<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     node_source_text(node, source).trim()
+}
+
+pub fn nonempty_node_source_text(node: Node<'_>, source: &str) -> Option<String> {
+    let text = node_source_text_trimmed(node, source);
+    (!text.is_empty()).then(|| text.to_string())
 }
 
 /// Per-language identifier sigil: which tree-sitter node kinds are single
@@ -329,7 +405,7 @@ pub fn parse_source_ranges_with_cancellation(
         point = end_point;
         previous_end = end;
     }
-    parse_source_included_ranges(language, source, &ts_ranges, cancellation)
+    parse_source_with_cancellation(language, source, Some(&ts_ranges), cancellation)
 }
 
 /// Parse one parser-provided source range without recomputing its points.
@@ -346,20 +422,15 @@ pub fn parse_source_range_with_cancellation(
     {
         return None;
     }
-    parse_source_included_ranges(language, source, &[range], cancellation)
+    parse_source_with_cancellation(language, source, Some(&[range]), cancellation)
 }
 
-/// The parser-driving core [`parse_source_range_with_cancellation`] and
-/// [`parse_source_ranges_with_cancellation`] share once their included
-/// ranges are validated and built: set the language and the included
-/// ranges, then run a cancellation-aware parse. Every caller has already
-/// validated `ranges` (non-empty, in bounds, in order); this function trusts
-/// that and only re-checks cancellation, which can change between
-/// validation and this call.
-fn parse_source_included_ranges(
+/// Parse source with an optional set of validated tree-sitter ranges, stopping
+/// promptly when cancellation is requested.
+pub fn parse_source_with_cancellation(
     language: &tree_sitter::Language,
     source: &str,
-    ranges: &[tree_sitter::Range],
+    included_ranges: Option<&[tree_sitter::Range]>,
     cancellation: Option<&CancellationToken>,
 ) -> Option<tree_sitter::Tree> {
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -367,7 +438,9 @@ fn parse_source_included_ranges(
     }
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(language).ok()?;
-    parser.set_included_ranges(ranges).ok()?;
+    if let Some(ranges) = included_ranges {
+        parser.set_included_ranges(ranges).ok()?;
+    }
     if let Some(cancellation) = cancellation {
         let mut read = |offset: usize, _| &source.as_bytes()[offset..];
         let mut progress = |_: &tree_sitter::ParseState| cancellation.is_cancelled();

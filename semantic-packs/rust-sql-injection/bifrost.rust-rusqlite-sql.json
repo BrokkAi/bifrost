@@ -1,0 +1,298 @@
+{
+  "schema_version": 2,
+  "pack_id": "bifrost.rust-rusqlite-sql",
+  "version": "0.1.0",
+  "producer": {
+    "name": "bifrost-reviewed-rust-sql-models",
+    "version": "0.1.0"
+  },
+  "language": "rust",
+  "ecosystem": "cargo",
+  "compatibility": {
+    "bifrost": ">=0.12.0, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "rusqlite crate API shape: rusqlite::Connection SQL entry points and rusqlite::Statement execution. The SQL text is parameter 0 of the Connection methods; bound values are a separate parameter and reach neither the result nor the receiver. Connection::query_row takes a row callback and is deliberately not modeled.",
+    "revision": "api-shape"
+  },
+  "license": "Apache-2.0",
+  "completeness": "complete",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "declarations.rust-sql.rusqlite",
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {
+            "id": "type.rust-sql.rusqlite",
+            "name": "rusqlite",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/lib.rs",
+              "symbol": "rusqlite"
+            }
+          },
+          {
+            "id": "type.rust-sql.rusqlite-connection",
+            "name": "rusqlite.Connection",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/lib.rs",
+              "symbol": "rusqlite.Connection"
+            }
+          },
+          {
+            "id": "type.rust-sql.rusqlite-statement",
+            "name": "rusqlite.Statement",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/statement.rs",
+              "symbol": "rusqlite.Statement"
+            }
+          }
+        ],
+        "members": [
+          {
+            "id": "member.rust-sql.rusqlite-connection.execute",
+            "owner": "type.rust-sql.rusqlite-connection",
+            "name": "execute",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "sql",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                },
+                {
+                  "name": "params",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/lib.rs",
+              "symbol": "rusqlite.Connection.execute"
+            }
+          },
+          {
+            "id": "member.rust-sql.rusqlite-connection.execute-batch",
+            "owner": "type.rust-sql.rusqlite-connection",
+            "name": "execute_batch",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "sql",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/lib.rs",
+              "symbol": "rusqlite.Connection.execute_batch"
+            }
+          },
+          {
+            "id": "member.rust-sql.rusqlite-connection.prepare",
+            "owner": "type.rust-sql.rusqlite-connection",
+            "name": "prepare",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "sql",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/lib.rs",
+              "symbol": "rusqlite.Connection.prepare"
+            }
+          },
+          {
+            "id": "member.rust-sql.rusqlite-statement.execute",
+            "owner": "type.rust-sql.rusqlite-statement",
+            "name": "execute",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "params",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/statement.rs",
+              "symbol": "rusqlite.Statement.execute"
+            }
+          }
+        ],
+        "relations": []
+      }
+    },
+    {
+      "id": "summaries.rust-sql.rusqlite",
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "summary.rust-sql.rusqlite-connection.execute",
+            "target": {
+              "path": "src/lib.rs",
+              "symbol": "rusqlite.Connection.execute",
+              "has_receiver": true,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.rust-sql.rusqlite-connection.execute.result",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.rust-sql.rusqlite-connection.execute-batch",
+            "target": {
+              "path": "src/lib.rs",
+              "symbol": "rusqlite.Connection.execute_batch",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.rust-sql.rusqlite-connection.execute-batch.result",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.rust-sql.rusqlite-connection.prepare",
+            "target": {
+              "path": "src/lib.rs",
+              "symbol": "rusqlite.Connection.prepare",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.rust-sql.rusqlite-connection.prepare.result",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.rust-sql.rusqlite-statement.execute",
+            "target": {
+              "path": "src/statement.rs",
+              "symbol": "rusqlite.Statement.execute",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.rust-sql.rusqlite-statement.execute.result",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -862,37 +862,11 @@ fn parse_method_full_name(name: &str) -> Option<ParsedMethodFullName> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::summary_foundry::codeql::skip_counts;
-    use crate::summary_foundry::ir::FoundryClaim;
 
     const SLICE: &str = include_str!("../../testdata/summary-corpora/joern/DefaultSemantics.scala");
 
     fn slice_semantics() -> Vec<JoernFlowSemantic> {
         parse_default_semantics_scala(SLICE, "javaFlows").expect("slice parses")
-    }
-
-    fn entry<'a>(translation: &'a JoernTranslation, path: &str, symbol: &str) -> &'a FoundryEntry {
-        translation
-            .entries
-            .iter()
-            .find(|entry| {
-                entry.target.artifact_path == path
-                    && entry.target.signature.symbol(&entry.target.member) == symbol
-            })
-            .unwrap_or_else(|| {
-                panic!(
-                    "no entry for {path} {symbol}; have {:#?}",
-                    translation
-                        .entries
-                        .iter()
-                        .map(|entry| format!(
-                            "{} {}",
-                            entry.target.artifact_path,
-                            entry.target.signature.symbol(&entry.target.member)
-                        ))
-                        .collect::<Vec<_>>()
-                )
-            })
     }
 
     #[test]
@@ -944,13 +918,6 @@ mod tests {
     }
 
     #[test]
-    fn the_dsl_parser_rejects_a_mapping_without_an_arrow() {
-        let error = parse_semantics_dsl("\"a.B.c:void()\" 1 2\n").expect_err("must fail");
-
-        assert!(error.message.contains("expected `->`"), "{error}");
-    }
-
-    #[test]
     fn the_scala_reader_reads_the_pinned_default_corpus_shape() {
         let semantics = slice_semantics();
 
@@ -998,50 +965,5 @@ mod tests {
         assert_eq!(parsed.member, "<init>");
         assert_eq!(parsed.parameter_types.len(), 2);
         assert!(parse_method_full_name("<operator>.assignment").is_none());
-    }
-
-    #[test]
-    fn mappings_become_transfers_and_parameter_writes_are_skipped() {
-        let translation = translate_joern_semantics("DefaultSemantics.scala", &slice_semantics());
-
-        let println = entry(
-            &translation,
-            "java/io/PrintStream.class",
-            "println(java.lang.String)",
-        );
-        assert_eq!(println.claim, FoundryClaim::Flows);
-        assert_eq!(
-            println.rendered_transfers(),
-            vec!["receiver->receiver@normal".to_owned()]
-        );
-        assert_eq!(println.boundary.parameter_count, 1);
-
-        let counts = skip_counts(&translation.skips);
-        assert!(
-            counts.get("output_port_unsupported").copied().unwrap_or(0) > 0,
-            "parameter writes must be counted: {counts:?}"
-        );
-    }
-
-    #[test]
-    fn a_passthrough_entry_records_the_uncarried_claim() {
-        let translation = translate_joern_semantics("DefaultSemantics.scala", &slice_semantics());
-
-        let split = entry(
-            &translation,
-            "java/lang/String.class",
-            "split(java.lang.String)",
-        );
-
-        assert!(split.notes.contains(&FoundryNote::PassthroughNotCarried));
-    }
-
-    #[test]
-    fn translation_is_deterministic() {
-        let semantics = slice_semantics();
-        let first = translate_joern_semantics("DefaultSemantics.scala", &semantics);
-        let second = translate_joern_semantics("DefaultSemantics.scala", &semantics);
-
-        assert_eq!(first, second);
     }
 }

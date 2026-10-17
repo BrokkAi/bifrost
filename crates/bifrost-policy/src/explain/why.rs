@@ -244,14 +244,16 @@ pub(super) fn coverage_node(completion: &PolicyRunCompletion) -> RawNode {
         PolicyRunCompletion::Complete
         | PolicyRunCompletion::ProvenSubset { .. }
         | PolicyRunCompletion::ProvenBySummary => (ExplanationOutcome::Satisfied, Vec::new()),
-        PolicyRunCompletion::Inconclusive { reasons } => {
+        PolicyRunCompletion::Inconclusive { reasons, .. } => {
             (ExplanationOutcome::Unknown, reasons.clone())
         }
         PolicyRunCompletion::Unsupported { .. } => (
             ExplanationOutcome::Unknown,
             vec![PolicyIncompleteReason::CapabilityIncomplete],
         ),
-        PolicyRunCompletion::Failed { .. } => (ExplanationOutcome::Unknown, Vec::new()),
+        PolicyRunCompletion::NotRun { .. } | PolicyRunCompletion::Failed { .. } => {
+            (ExplanationOutcome::Unknown, Vec::new())
+        }
     };
     RawNode::new(
         ExplanationNodeKind::CoverageObligation,
@@ -259,19 +261,8 @@ pub(super) fn coverage_node(completion: &PolicyRunCompletion) -> RawNode {
         "run_completion",
     )
     .with_expected("the run's selector coverage licenses this finding")
-    .with_actual(completion_label(completion))
+    .with_actual(completion.label())
     .with_reasons(reasons)
-}
-
-fn completion_label(completion: &PolicyRunCompletion) -> &'static str {
-    match completion {
-        PolicyRunCompletion::Complete => "complete",
-        PolicyRunCompletion::ProvenSubset { .. } => "proven_subset",
-        PolicyRunCompletion::ProvenBySummary => "proven_by_summary",
-        PolicyRunCompletion::Inconclusive { .. } => "inconclusive",
-        PolicyRunCompletion::Unsupported { .. } => "unsupported",
-        PolicyRunCompletion::Failed { .. } => "failed",
-    }
 }
 
 /// The exact location a retained row reference carries.
@@ -288,10 +279,60 @@ pub(super) fn ref_location(value: &PolicyQueryResultRef) -> Option<PolicySourceL
 /// A short, deterministic rendering of one retained row reference.
 pub(super) fn describe_ref(value: &PolicyQueryResultRef) -> String {
     match value {
+        PolicyQueryResultRef::DependencyEvidence {
+            package,
+            exact_version,
+            source,
+            ..
+        } => format!(
+            "dependency_evidence {package} {} {}",
+            exact_version.as_deref().unwrap_or("unresolved"),
+            source.as_deref().unwrap_or("unresolved")
+        ),
         PolicyQueryResultRef::ConfigurationFact { id, fact_id, .. } => {
             format!("configuration_fact {id} {fact_id}")
         }
+        PolicyQueryResultRef::GenerationSite {
+            id, ast_id, kind, ..
+        } => format!(
+            "generation_site {kind} {id} {}",
+            ast_id.as_deref().unwrap_or("without-ast-id")
+        ),
+        PolicyQueryResultRef::Export {
+            id,
+            form,
+            exported_name,
+            target_fq_name,
+            local_definition,
+            ..
+        } => format!(
+            "export {form} {exported_name} {} {} {id}",
+            target_fq_name.as_deref().unwrap_or("unresolved"),
+            match local_definition {
+                Some(crate::finding::PolicyExportLocalDefinition::Defined {
+                    binding_name,
+                    binding_kind,
+                    ..
+                }) => format!("defined:{binding_kind}:{binding_name}"),
+                Some(crate::finding::PolicyExportLocalDefinition::Undefined) => "undefined".into(),
+                Some(crate::finding::PolicyExportLocalDefinition::Unknown) => "unknown".into(),
+                None => "unspecified".into(),
+            }
+        ),
+        PolicyQueryResultRef::CrossDomain {
+            id,
+            operator,
+            domain,
+            ..
+        } => format!("cross_domain {operator} {domain} {id}"),
         PolicyQueryResultRef::StructuralMatch { kind, .. } => format!("structural_match {kind}"),
+        PolicyQueryResultRef::Binding { id, name, .. } => format!("binding {name} {id}"),
+        PolicyQueryResultRef::LexicalScope { id, index, .. } => {
+            format!("lexical_scope {index} {id}")
+        }
+        PolicyQueryResultRef::Occurrence {
+            id, class, role, ..
+        } => format!("occurrence {class} {role} {id}"),
         PolicyQueryResultRef::Declaration { kind, fq_name, .. } => {
             format!("declaration {kind} {fq_name}")
         }

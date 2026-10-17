@@ -6,13 +6,14 @@
 //! read are `test-support`-gated in the crate and reachable here because this
 //! crate's dev-dependency on it turns that feature on.
 
-use crate::analyzer::usages::cpp_graph::CppDispatch;
+use crate::analyzer::usages::cpp_graph::{CppAuthoritativeUsageBatch, CppDispatch};
+use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::{
-    AnalyzerTestHooks, CodeUnit, CodeUnitIndex, CodeUnitType, CppAnalyzer, ProjectFile, QueryScope,
-    QueryToken, resolve_analyzer,
+    CodeUnit, CodeUnitIndex, CodeUnitType, CppAnalyzer, ProjectFile, QueryScope, QueryToken,
+    resolve_analyzer,
 };
 use brokk_bifrost_core::analyzer::model::{
-    CallableArity, CppTemplateExpression, CppTemplateParameterMetadata, CppTemplateTerm,
+    CppTemplateExpression, CppTemplateParameterMetadata, CppTemplateTerm,
 };
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use brokk_bifrost_cpp::declarations::node_text;
@@ -27,10 +28,12 @@ use tree_sitter::{Node, Parser};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::analyzer::AnalyzerTestHooks;
     use crate::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
-    use crate::analyzer::usages::cpp_graph::shared::CppAuthoritativeUsageBatch;
-    use crate::analyzer::usages::model::FuzzyResult;
+    use brokk_bifrost_core::analyzer::model::CallableArity;
     use brokk_bifrost_core::analyzer::model::CppTemplateParameterKind;
+    use brokk_bifrost_test_macros::hardwon;
     use std::fs;
 
     fn structured_cpp_unit(
@@ -55,6 +58,37 @@ mod tests {
                 text: text.to_string(),
             },
         }
+    }
+
+    fn assert_macro_environment_checkpoint_budget(
+        visibility: &VisibilityIndex<'_>,
+        event_count: usize,
+        included_event_count: usize,
+        initial_events: usize,
+        checkpoint_message: &str,
+        replay_message: &str,
+    ) {
+        let requests = visibility
+            .macro_environment_request_count
+            .load(Ordering::Relaxed);
+        let applications = visibility
+            .macro_event_application_count
+            .load(Ordering::Relaxed);
+        let bound = event_count
+            + included_event_count
+            + initial_events
+            + requests * MACRO_ENVIRONMENT_CHECKPOINT_STRIDE;
+        assert_eq!(
+            visibility
+                .macro_environment_checkpoint_build_count
+                .load(Ordering::Relaxed),
+            1,
+            "{checkpoint_message}"
+        );
+        assert!(
+            applications <= bound,
+            "{replay_message}: {requests} requests applied {applications} events, above {bound}"
+        );
     }
 
     #[test]
@@ -94,6 +128,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "19d67be8be9c: Operation-count regression ensures repeated lookups within a small macro event frontier reuse work instead of replaying it"
+    )]
     fn repeated_small_macro_frontier_requests_need_no_replay() {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical temp dir");
@@ -182,49 +219,6 @@ mod tests {
             resolve("UNKNOWN", unknown_start),
             OrdinaryMacroReferenceResolution::Ambiguous
         ));
-    }
-
-    #[test]
-    fn ordinary_macro_resolution_deduplicates_one_physical_c_definition() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        let source = "#define NUMPRI 5\nint pending[NUMPRI];\n";
-        fs::write(root.join("duplicate-reading.c"), source).expect("write macro fixture");
-        let file = ProjectFile::new(root.clone(), "duplicate-reading.c");
-        let cpp = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
-            root,
-            crate::analyzer::Language::Cpp,
-        ));
-        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&cpp);
-        let token = query_scope.token();
-        let graph = CppGraphSource::from_source(&cpp, token);
-        let visibility =
-            VisibilityIndex::build(&cpp, token, &graph, &HashSet::from_iter([file.clone()]));
-        let candidates = visibility
-            .visible_identifier_candidates(&file, "NUMPRI")
-            .filter(|candidate| candidate.is_macro())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            candidates.len(),
-            1,
-            "the C and C++ readings of one physical directive must publish one candidate"
-        );
-
-        let prepared = cpp
-            .prepared_syntax(token, &file)
-            .expect("prepared macro source");
-        let reference = source.rfind("NUMPRI").expect("macro reference");
-        let node = prepared
-            .tree()
-            .root_node()
-            .descendant_for_byte_range(reference, reference + "NUMPRI".len())
-            .expect("macro reference node");
-        let OrdinaryMacroReferenceResolution::Resolved(target) =
-            visibility.resolve_ordinary_macro_reference(&graph, &file, node, prepared.source())
-        else {
-            panic!("one physical macro definition must resolve once");
-        };
-        assert_eq!(target.signature(), Some("#define NUMPRI 5"));
     }
 
     #[test]
@@ -431,90 +425,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn type_target_spec_scan_keys_collapse_logical_redeclarations() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        let logical_type = |path: &str| {
-            CodeUnit::with_signature(
-                ProjectFile::new(root.clone(), path),
-                CodeUnitType::Class,
-                "gfx",
-                "Size",
-                Some("class Size".to_string()),
-                false,
-            )
-        };
-        let first_type = logical_type("first.h");
-        let duplicate_type = logical_type("duplicate.h");
-        let first_type_spec = TargetSpec::new(
-            first_type.clone(),
-            TargetKind::Type,
-            Some(first_type),
-            "Size".to_string(),
-            None,
-            None,
-        );
-        let duplicate_type_spec = TargetSpec::new(
-            duplicate_type.clone(),
-            TargetKind::Type,
-            Some(duplicate_type),
-            "Size".to_string(),
-            None,
-            None,
-        );
-        assert_eq!(
-            first_type_spec.type_scan_key(),
-            duplicate_type_spec.type_scan_key()
-        );
-
-        let divergent_signature = CodeUnit::with_signature(
-            ProjectFile::new(root.clone(), "definition.h"),
-            CodeUnitType::Class,
-            "gfx",
-            "Size",
-            Some("<typename Value>".to_string()),
-            false,
-        );
-        let divergent_signature_spec = TargetSpec::new(
-            divergent_signature.clone(),
-            TargetKind::Type,
-            Some(divergent_signature),
-            "Size".to_string(),
-            None,
-            None,
-        );
-        assert_ne!(
-            first_type_spec.type_scan_key(),
-            divergent_signature_spec.type_scan_key(),
-            "#803 requires each divergent physical target spec to remain independently scanned"
-        );
-
-        let other_namespace = CodeUnit::with_signature(
-            ProjectFile::new(root, "other_namespace.h"),
-            CodeUnitType::Class,
-            "other",
-            "Size",
-            Some("class Size".to_string()),
-            false,
-        );
-        let other_namespace_spec = TargetSpec::new(
-            other_namespace.clone(),
-            TargetKind::Type,
-            Some(other_namespace),
-            "Size".to_string(),
-            None,
-            None,
-        );
-        assert_ne!(
-            first_type_spec.type_scan_key(),
-            other_namespace_spec.type_scan_key(),
-            "same-short-name Types with distinct FQNs must retain separate scans"
-        );
-    }
-
     #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
+    #[hardwon(
+        "a72b5d43660a: Complex Abseil-style conditional header fixture checks alternate same-FQN candidates are accepted only with single-source-file evidence and complementary guards"
+    )]
     fn alternate_same_fqn_type_candidates_require_one_source_file() {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical temp dir");
@@ -660,7 +575,777 @@ ABSL_NAMESPACE_END
         ));
     }
 
+    #[test]
+    #[hardwon(
+        "214260884c3e: Checks dependency traversal deduplicates a shared declaration dependency across lookup paths"
+    )]
+    fn bounded_visibility_walks_shared_declaration_dependencies_once() {
+        const ROOT_COUNT: usize = 8;
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        fs::write(
+            root.join("types.h"),
+            "struct Leaf {};\nstruct Selected { Leaf value; };\n",
+        )
+        .expect("write shared declarations");
+        let mut roots = HashSet::default();
+        for index in 0..ROOT_COUNT {
+            let file = ProjectFile::new(root.clone(), format!("consumer_{index}.cpp"));
+            file.write(format!("#include \"types.h\"\nSelected value_{index};\n"))
+                .expect("write consumer");
+            roots.insert(file);
+        }
+
+        let cpp = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
+            root,
+            crate::analyzer::Language::Cpp,
+        ));
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&cpp);
+        let query_token = query_scope.token();
+        let graph = CppGraphSource::from_source(&cpp, query_token);
+
+        reset_bounded_visibility_dependency_ast_node_count_for_test();
+        let one_root = HashSet::from_iter([roots.iter().next().expect("one root").clone()]);
+        let one_visibility = VisibilityIndex::build(&cpp, query_token, &graph, &one_root);
+        let one_root_nodes = bounded_visibility_dependency_ast_node_count_for_test();
+        assert_eq!(
+            one_visibility
+                .visible_identifier_candidates(one_root.iter().next().unwrap(), "Leaf")
+                .count(),
+            1
+        );
+        assert!(
+            one_root_nodes > 0,
+            "the fixture must walk dependency syntax"
+        );
+
+        reset_bounded_visibility_dependency_ast_node_count_for_test();
+        reset_bounded_visibility_declaration_read_count_for_test();
+        let all_visibility = VisibilityIndex::build(&cpp, query_token, &graph, &roots);
+        let all_root_nodes = bounded_visibility_dependency_ast_node_count_for_test();
+        for file in &roots {
+            assert_eq!(
+                all_visibility
+                    .visible_identifier_candidates(file, "Leaf")
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(
+            all_root_nodes, one_root_nodes,
+            "dependency syntax is a property of the selected CodeUnit, not of each root that sees it"
+        );
+        assert_eq!(
+            bounded_visibility_declaration_read_count_for_test(),
+            ROOT_COUNT + 1,
+            "each root and the shared donor source must be read once per visibility build"
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#1707+b2cb8b9315c2: Ensures field-source candidates are indexed for type visibility without incorrectly requiring global linkage"
+    )]
+    fn visible_identifier_index_skips_linkage_for_reachable_field_sources() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let left = ProjectFile::new(root.clone(), "left.cpp");
+        let right = ProjectFile::new(root.clone(), "right.cpp");
+        let shared = ProjectFile::new(root.clone(), "shared.h");
+        let local = CodeUnit::new(shared.clone(), CodeUnitType::Field, "", "local_value");
+        let external = CodeUnit::new(shared.clone(), CodeUnitType::Field, "", "shared_value");
+        let visible = HashSet::from_iter([local.clone(), external.clone()]);
+        let visible_by_file =
+            HashMap::from_iter([(left.clone(), visible.clone()), (right.clone(), visible)]);
+        let visible_source_files_by_root = HashMap::from_iter([
+            (
+                left.clone(),
+                HashSet::from_iter([left.clone(), local.source().clone()]),
+            ),
+            (
+                right.clone(),
+                HashSet::from_iter([right.clone(), local.source().clone()]),
+            ),
+        ]);
+        let cpp = visibility_analyzer(&visible_by_file);
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&cpp);
+        let query_token = query_scope.token();
+        let (by_identifier, classification_count) =
+            with_cpp_global_field_internal_linkage_classification_counter_for_test(|| {
+                build_visible_identifier_index(
+                    &CppGraphSource::from_source(&cpp, query_token),
+                    &visible_by_file,
+                    &visible_source_files_by_root,
+                    &mut HashMap::default(),
+                )
+            });
+
+        assert_eq!(
+            classification_count, 0,
+            "a field from a reachable source does not need linkage classification"
+        );
+        // issue_1184 exercises the authoritative internal-linkage/root-isolation behavior.
+        // This fixture only guards that sharing the cache across roots preserves the buckets.
+        for root in [&left, &right] {
+            let bucket = by_identifier
+                .get(root)
+                .expect("visible identifier bucket for root");
+            assert_eq!(
+                bucket
+                    .get("local_value")
+                    .expect("shared field bucket")
+                    .len(),
+                1,
+                "sharing the classification cache must not change the per-root local_value bucket"
+            );
+            assert_eq!(
+                bucket
+                    .get("shared_value")
+                    .expect("shared field bucket")
+                    .len(),
+                1,
+                "sharing the classification cache must not change the per-root shared_value bucket"
+            );
+        }
+    }
+
+    /// Owns the analyzer the borrowed index points at; keep it alive for as
+    /// long as the returned index is used.
+    fn visibility_analyzer(
+        visible_by_file: &HashMap<ProjectFile, HashSet<CodeUnit>>,
+    ) -> CppAnalyzer {
+        let root = visible_by_file
+            .keys()
+            .next()
+            .expect("test visibility needs at least one file")
+            .root()
+            .to_path_buf();
+        CppAnalyzer::new(Arc::new(crate::analyzer::TestProject::new(
+            root,
+            crate::analyzer::Language::Cpp,
+        )))
+    }
+
+    fn visibility_index<'a>(
+        cpp: &'a CppAnalyzer,
+        token: QueryToken<'a>,
+        visible_by_file: HashMap<ProjectFile, HashSet<CodeUnit>>,
+    ) -> VisibilityIndex<'a> {
+        VisibilityIndex::from_visible_files_for_test(cpp, token, visible_by_file)
+    }
+
+    #[test]
+    #[hardwon(
+        "4c36b5b86e83: Checks template-id lookup keeps the resolved primary template when specialization metadata is absent"
+    )]
+    fn template_id_without_specialization_metadata_keeps_resolved_primary() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let consumer = ProjectFile::new(root.clone(), "consumer.cpp");
+        let legacy = CodeUnit::new(
+            ProjectFile::new(root, "legacy.h"),
+            CodeUnitType::Class,
+            "",
+            "legacy",
+        );
+        let visible_by_file =
+            HashMap::from_iter([(consumer.clone(), HashSet::from_iter([legacy.clone()]))]);
+        let cpp = visibility_analyzer(&visible_by_file);
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&cpp);
+        let query_token = query_scope.token();
+        let visibility = visibility_index(&cpp, query_token, visible_by_file);
+        let source = "legacy<int> value;";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .expect("set C++ grammar");
+        let tree = parser.parse(source, None).expect("parse template-id");
+        let mut stack = vec![tree.root_node()];
+        let mut type_node = None;
+        while let Some(node) = stack.pop() {
+            if node.kind() == "template_type" {
+                type_node = Some(node);
+                break;
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        assert_eq!(
+            visibility.resolve_type_node_result(
+                &consumer,
+                type_node.expect("template type node"),
+                source,
+            ),
+            Ok(Some(legacy))
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "4c36b5b86e83: Five hundred twelve nested terms must unify and substitute without recursive stack growth; no parser integration exercises these hand-built deep terms"
+    )]
+    fn deeply_nested_cpp_template_terms_use_stack_safe_matching_and_substitution() {
+        let mut pattern = CppTemplateTerm::Parameter("T".to_string());
+        let mut argument = CppTemplateTerm::Atom {
+            kind: "primitive_type".to_string(),
+            text: "int".to_string(),
+        };
+        for _ in 0..512 {
+            pattern = CppTemplateTerm::Node {
+                kind: "template_argument".to_string(),
+                children: vec![pattern],
+            };
+            argument = CppTemplateTerm::Node {
+                kind: "template_argument".to_string(),
+                children: vec![argument],
+            };
+        }
+
+        let parameters = std::iter::once("T").collect::<HashSet<_>>();
+        let mut bindings = HashMap::default();
+        assert!(cpp_unify_template_term(
+            &pattern,
+            &argument,
+            &parameters,
+            &mut bindings,
+        ));
+        let substituted =
+            cpp_substitute_template_term(&pattern, &bindings).expect("bound deep template term");
+        assert!(cpp_unify_template_term(
+            &substituted,
+            &argument,
+            &HashSet::default(),
+            &mut HashMap::default(),
+        ));
+    }
+
+    #[test]
+    #[hardwon(
+        "#1496: Concurrent readers must share one macro checkpoint build, verified through counts and returned arities"
+    )]
+    fn concurrent_macro_arity_scans_share_one_checkpoint_build() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = ProjectFile::new(root.clone(), "consumer.cpp");
+        let exact_header = ProjectFile::new(root.clone(), "exact.h");
+        exact_header
+            .write("#pragma once\n#define PAIR(value) value, value\n")
+            .expect("write exact macro header");
+        let conditional_header = ProjectFile::new(root.clone(), "conditional.h");
+        conditional_header
+            .write("#pragma once\n#define MAYBE_PAIR(value) value, value\n")
+            .expect("write conditional macro header");
+        file.write(
+            "#include \"exact.h\"\n\
+             #if ENABLE_CONDITIONAL\n\
+             #include \"conditional.h\"\n\
+             #endif\n\
+             int target(int left, int right);\n\
+             void use() {\n\
+               target(PAIR(0));\n\
+               target(MAYBE_PAIR(0));\n\
+             }\n",
+        )
+        .expect("write macro consumer");
+
+        let project = Arc::new(crate::analyzer::TestProject::new(
+            &root,
+            crate::analyzer::Language::Cpp,
+        ));
+        let workspace = crate::analyzer::WorkspaceAnalyzer::build_ephemeral_footgun(
+            project,
+            crate::analyzer::AnalyzerConfig::default(),
+        )
+        .expect("ephemeral workspace should build");
+        let cpp = resolve_analyzer::<CppAnalyzer>(workspace.analyzer()).expect("C++ analyzer");
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(workspace.analyzer());
+        let query_token = query_scope.token();
+        let roots = HashSet::from_iter([file.clone()]);
+        let visibility = VisibilityIndex::build(
+            cpp,
+            query_token,
+            &CppDispatch::new(workspace.analyzer(), query_token).source(),
+            &roots,
+        );
+
+        // Two workers race for the same file's macro environment. The checkpoint vector that
+        // replaced the per-worker forward cursors is immutable once built, so both must reach
+        // the same exact and fail-closed evidence off one build, one prepared tree, and one
+        // parsed replacement.
+        const WORKER_COUNT: usize = 2;
+        let start = std::sync::Barrier::new(WORKER_COUNT);
+        let evidence_by_worker = std::thread::scope(|scope| {
+            let workers = (0..WORKER_COUNT)
+                .map(|_| {
+                    let worker_file = &file;
+                    let worker_visibility = &visibility;
+                    let start = &start;
+                    scope.spawn(move || {
+                        let prepared = cpp
+                            .prepared_syntax(query_token, worker_file)
+                            .expect("prepared macro consumer");
+                        let mut stack = vec![prepared.tree().root_node()];
+                        let mut calls = Vec::new();
+                        while let Some(node) = stack.pop() {
+                            if node.kind() == "call_expression"
+                                && node
+                                    .child_by_field_name("function")
+                                    .is_some_and(|function| {
+                                        node_text(function, prepared.source()) == "target"
+                                    })
+                            {
+                                calls.push(node);
+                            }
+                            for index in (0..node.named_child_count()).rev() {
+                                if let Some(child) = node.named_child(index) {
+                                    stack.push(child);
+                                }
+                            }
+                        }
+                        calls.sort_by_key(Node::start_byte);
+                        start.wait();
+                        calls
+                            .into_iter()
+                            .map(|call| {
+                                worker_visibility.call_arity_evidence(
+                                    worker_file,
+                                    call,
+                                    prepared.source(),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect::<Vec<_>>();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().expect("macro arity worker"))
+                .collect::<Vec<_>>()
+        });
+
+        let expected = vec![CallArityEvidence::Exact(2), CallArityEvidence::Unknown];
+        for evidence in &evidence_by_worker {
+            assert_eq!(
+                evidence, &expected,
+                "a shared checkpoint vector must preserve exact and fail-closed evidence"
+            );
+        }
+        assert_eq!(
+            cpp.prepared_syntax_parse_count_for_test(&file),
+            1,
+            "concurrent macro replay must retain the request-scoped prepared tree"
+        );
+        assert_eq!(
+            visibility
+                .macro_environment_checkpoint_build_count
+                .load(Ordering::Relaxed),
+            1,
+            "racing workers must share one checkpoint build per file, not one per worker"
+        );
+    }
+
+    /// The cost contract the checkpoints exist for: however the requested
+    /// positions jump around, one file costs its own event count once plus at
+    /// most one stride of replay per request (#1496).
+    #[test]
+    #[hardwon(
+        "#1496: Checks random macro positions replay no more than one stride each rather than rescanning event history"
+    )]
+    fn random_macro_environment_positions_replay_at_most_one_stride_each() {
+        const EVENT_COUNT: usize = 256;
+        const INCLUDED_EVENT_COUNT: usize = 40;
+        const REQUEST_COUNT: usize = 300;
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let header = ProjectFile::new(root.clone(), "bank.h");
+        let mut header_source = String::from("#pragma once\n");
+        for index in 0..INCLUDED_EVENT_COUNT {
+            header_source.push_str(&format!("#define BANK_{index} {index}\n"));
+        }
+        header.write(&header_source).expect("write macro bank");
+        let file = ProjectFile::new(root.clone(), "positions.cpp");
+        let mut source = String::from("#include \"bank.h\"\n");
+        for index in 0..EVENT_COUNT {
+            source.push_str(&format!("#define EVENT_{index} {index}\n"));
+        }
+        file.write(&source).expect("write macro fixture");
+
+        let project = Arc::new(crate::analyzer::TestProject::new(
+            &root,
+            crate::analyzer::Language::Cpp,
+        ));
+        let workspace = crate::analyzer::WorkspaceAnalyzer::build_ephemeral_footgun(
+            project,
+            crate::analyzer::AnalyzerConfig::default(),
+        )
+        .expect("ephemeral workspace should build");
+        let cpp = resolve_analyzer::<CppAnalyzer>(workspace.analyzer()).expect("C++ analyzer");
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(workspace.analyzer());
+        let query_token = query_scope.token();
+        let roots = HashSet::from_iter([file.clone()]);
+        let visibility = VisibilityIndex::build(
+            cpp,
+            query_token,
+            &CppDispatch::new(workspace.analyzer(), query_token).source(),
+            &roots,
+        );
+
+        let event_bytes = {
+            let cell = visibility.macro_event_cell(&file);
+            drop(visibility.macro_environment(&file, 0));
+            cell.get()
+                .expect("prepared macro events")
+                .iter()
+                .map(MacroEvent::byte)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(event_bytes.len(), EVENT_COUNT + 1);
+
+        // A fixed linear congruential sequence, so the positions jump both ways
+        // and the pin replays identically on every run.
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        for _ in 0..REQUEST_COUNT {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let position = (state >> 33) as usize % event_bytes.len();
+            drop(visibility.macro_environment(&file, event_bytes[position] + 1));
+        }
+
+        assert_macro_environment_checkpoint_budget(
+            &visibility,
+            EVENT_COUNT,
+            INCLUDED_EVENT_COUNT,
+            1,
+            "the checkpoint vector must be built once for the requested file",
+            "random-position requests must replay at most one stride each",
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#1707+b2cb8b9315c2: Checks unconditional include reachability is reused across separately built visibility indexes"
+    )]
+    fn unconditional_include_reachability_is_reused_across_visibility_indexes() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let consumer = ProjectFile::new(root.clone(), "consumer.cpp");
+        let bridge = ProjectFile::new(root.clone(), "bridge.h");
+        let donor = ProjectFile::new(root.clone(), "donor.h");
+        consumer
+            .write("#include \"bridge.h\"\nint consume() { return target(); }\n")
+            .expect("write consumer");
+        bridge
+            .write("#include \"donor.h\"\n")
+            .expect("write bridge");
+        donor.write("int target();\n").expect("write donor");
+
+        let analyzer = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
+            root,
+            crate::analyzer::Language::Cpp,
+        ));
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+        let query_token = query_scope.token();
+        let roots = HashSet::from_iter([consumer.clone()]);
+        let first = VisibilityIndex::build(
+            &analyzer,
+            query_token,
+            &CppGraphSource::from_source(&analyzer, query_token),
+            &roots,
+        );
+        let prepared = analyzer
+            .prepared_syntax(query_token, &consumer)
+            .expect("prepared consumer");
+        assert!(
+            first
+                .include_activation_for_source(&analyzer, &consumer, prepared.as_ref(), &donor)
+                .is_some(),
+            "the direct include must reach the donor through the bridge"
+        );
+
+        let second = VisibilityIndex::build(
+            &analyzer,
+            query_token,
+            &CppGraphSource::from_source(&analyzer, query_token),
+            &roots,
+        );
+        assert!(
+            second
+                .include_activation_for_source(&analyzer, &consumer, prepared.as_ref(), &donor)
+                .is_some(),
+            "the shared analyzer cache must preserve the include activation"
+        );
+        assert_eq!(
+            analyzer.unconditional_include_reachability_cache_len_for_test(),
+            1,
+            "separate visibility indexes must reuse one reachability result"
+        );
+    }
+
+    /// #2365: one guarded root include that fans out through a header diamond
+    /// reaches `target.h` with both `{A}` and `{A, B}` guard sets at the same
+    /// activation byte. Consumers only ask existence questions that are
+    /// monotone in the guard set, so the index must keep only the
+    /// inclusion-minimal set. Dense `#ifdef` lattices otherwise enumerate the
+    /// powerset of path-union guard sets, which is what hung the QMK C
+    /// forward differential with memory growing without bound.
+    #[test]
+    #[hardwon(
+        "#2365: Checks guard projection removes supersets while preserving minimal conditions needed for visibility"
+    )]
+    fn conditional_include_projection_index_keeps_only_minimal_guard_sets() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let consumer = ProjectFile::new(root.clone(), "consumer.cpp");
+        let mid = ProjectFile::new(root.clone(), "mid.h");
+        let x = ProjectFile::new(root.clone(), "x.h");
+        let target = ProjectFile::new(root.clone(), "target.h");
+        consumer
+            .write("#if defined(A)\n#include \"mid.h\"\n#endif\n")
+            .expect("write consumer");
+        mid.write("#include \"x.h\"\n#if defined(B)\n#include \"target.h\"\n#endif\n")
+            .expect("write mid");
+        x.write("#include \"target.h\"\n").expect("write x");
+        target.write("struct Target {};\n").expect("write target");
+
+        let analyzer = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
+            root,
+            crate::analyzer::Language::Cpp,
+        ));
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+        let query_token = query_scope.token();
+        let roots = HashSet::from_iter([consumer.clone()]);
+        let visibility = VisibilityIndex::build(
+            &analyzer,
+            query_token,
+            &CppGraphSource::from_source(&analyzer, query_token),
+            &roots,
+        );
+        let prepared = analyzer
+            .prepared_syntax(query_token, &consumer)
+            .expect("prepared consumer");
+
+        let target_projections = visibility.conditional_include_projections_for_source(
+            &consumer,
+            prepared.as_ref(),
+            &target,
+        );
+        assert_eq!(
+            target_projections.len(),
+            1,
+            "the subsumed {{A, B}} path must be evicted by its {{A}} subset"
+        );
+        assert_eq!(
+            target_projections[0].required_guards,
+            HashSet::from_iter([PreprocessorGuard::Defined("A".to_string())]),
+        );
+        assert_eq!(
+            visibility
+                .conditional_include_projections_for_source(&consumer, prepared.as_ref(), &x)
+                .len(),
+            1
+        );
+        assert_eq!(
+            visibility.conditional_include_projection_work_counts_for_test(),
+            (1, 4),
+            "one traversal: mid, x, target with {{A, B}} (later evicted), target with {{A}}"
+        );
+    }
+
     #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
+    #[test]
+    #[hardwon(
+        "#1707+b2cb8b9315c2: Ensures shared include reachability does not merge distinct C and C++ compilation contexts"
+    )]
+    fn unconditional_include_reachability_keeps_c_and_cpp_contexts_separate() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let c_consumer = ProjectFile::new(root.clone(), "consumer.c");
+        let cpp_consumer = ProjectFile::new(root.clone(), "consumer.cpp");
+        let immutable_consumer = ProjectFile::new(root.clone(), "immutable.cpp");
+        let mutated_consumer = ProjectFile::new(root.clone(), "mutated.cpp");
+        let bridge = ProjectFile::new(root.clone(), "bridge.h");
+        let donor = ProjectFile::new(root.clone(), "donor.h");
+        c_consumer
+            .write("#include \"bridge.h\"\nint consume_c() { return 0; }\n")
+            .expect("write C consumer");
+        cpp_consumer
+            .write("#include \"bridge.h\"\nint consume_cpp() { return target(); }\n")
+            .expect("write C++ consumer");
+        immutable_consumer
+            .write("#include \"bridge.h\"\nint consume_immutable() { return target(); }\n")
+            .expect("write immutable C++ consumer");
+        mutated_consumer
+            .write(
+                "#undef __cplusplus\n#include \"bridge.h\"\nint consume_mutated() { return target(); }\n",
+            )
+            .expect("write mutated C++ consumer");
+        bridge
+            .write("#ifdef __cplusplus\n#include \"donor.h\"\n#endif\n")
+            .expect("write bridge");
+        donor.write("int target();\n").expect("write donor");
+
+        let analyzer = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
+            root,
+            crate::analyzer::Language::Cpp,
+        ));
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+        let query_token = query_scope.token();
+        for (consumer, reaches) in [(c_consumer, false), (cpp_consumer, true)] {
+            let roots = HashSet::from_iter([consumer.clone()]);
+            let visibility = VisibilityIndex::build(
+                &analyzer,
+                query_token,
+                &CppGraphSource::from_source(&analyzer, query_token),
+                &roots,
+            );
+            let prepared = analyzer
+                .prepared_syntax(query_token, &consumer)
+                .expect("prepared consumer");
+            assert_eq!(
+                visibility
+                    .include_activation_for_source(&analyzer, &consumer, prepared.as_ref(), &donor)
+                    .is_some(),
+                reaches,
+                "the include closure must respect the reference language"
+            );
+        }
+        assert_eq!(
+            analyzer.unconditional_include_reachability_cache_len_for_test(),
+            2,
+            "the cache must not reuse a C result for a C++ reference"
+        );
+        for (consumer, reaches) in [(&mutated_consumer, false), (&immutable_consumer, true)] {
+            let roots = HashSet::from_iter([consumer.clone()]);
+            let visibility = VisibilityIndex::build(
+                &analyzer,
+                query_token,
+                &CppGraphSource::from_source(&analyzer, query_token),
+                &roots,
+            );
+            let prepared = analyzer
+                .prepared_syntax(query_token, consumer)
+                .expect("prepared shared-bridge consumer");
+            assert_eq!(
+                visibility
+                    .include_activation_for_source(&analyzer, consumer, prepared.as_ref(), &donor,)
+                    .is_some(),
+                reaches,
+                "the shared bridge must retain the consumer's mutation proof"
+            );
+        }
+        assert_eq!(
+            analyzer.unconditional_include_reachability_cache_len_for_test(),
+            4,
+            "each consumer retains its immutable root guard context"
+        );
+    }
+
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
+    #[test]
+    #[hardwon(
+        "1c570a35813e: Real declaration/definition pair verifies a header default argument applies to the body target’s callable arity"
+    )]
+    fn cpp_callable_arity_applies_defaulted_header_to_definition_target() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let definition_file = ProjectFile::new(root.clone(), "api.cpp");
+        let header_file = ProjectFile::new(root.clone(), "api.hpp");
+        fs::write(
+            header_file.abs_path(),
+            "#define API\n".to_string()
+                + "class XMLNode; class XMLElement;\n"
+                + "class API XMLElement : public XMLNode {\n"
+                + "public:\n"
+                + "  const char* Name() const { return Value(); }\n"
+                + "  const char* Attribute(const char* name, const char* value = 0) const;\n"
+                + "};\n}\n",
+        )
+        .expect("write declaration fixture");
+        fs::write(
+            root.join("api.cpp"),
+            "#include \"api.hpp\"\n".to_string()
+                + "const char* XMLElement::Attribute(const char* name, const char* value) const {\n"
+                + "  return value ? value : name;\n"
+                + "}\n",
+        )
+        .expect("write definition fixture");
+        let consumer_file = ProjectFile::new(root.clone(), "consumer.cpp");
+        fs::write(
+            consumer_file.abs_path(),
+            "#include \"api.hpp\"\n".to_string()
+                + "const char* consume(const XMLElement* element) {\n"
+                + "  return element->Attribute(\"name\");\n"
+                + "}\n",
+        )
+        .expect("write consumer fixture");
+        let analyzer = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
+            &root,
+            crate::analyzer::Language::Cpp,
+        ));
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+        let query_token = query_scope.token();
+        let target = analyzer
+            .get_all_declarations()
+            .into_iter()
+            .find(|unit| {
+                unit.is_function()
+                    && unit.identifier() == "Attribute"
+                    && unit.source() == &definition_file
+            })
+            .expect("out-of-line definition");
+        let header_attribute = analyzer
+            .get_all_declarations()
+            .into_iter()
+            .find(|unit| {
+                unit.is_function()
+                    && unit.identifier() == "Attribute"
+                    && unit.source() == &header_file
+            })
+            .expect("header declaration");
+        assert_eq!(
+            header_attribute.fq_name(),
+            "XMLElement.Attribute",
+            "fragmented export-macro members keep their recovered class owner"
+        );
+        let roots = HashSet::from_iter([consumer_file.clone()]);
+        let visibility = VisibilityIndex::build(
+            &analyzer,
+            query_token,
+            &CppGraphSource::from_source(&analyzer, query_token),
+            &roots,
+        );
+        let prepared = analyzer
+            .prepared_syntax(query_token, &consumer_file)
+            .expect("prepared consumer");
+        let spec = TargetSpec::from_target(
+            &CppGraphSource::from_source(&analyzer, query_token),
+            &target,
+        )
+        .expect("target spec")
+        .with_visible_callable_arities(
+            &CppGraphSource::from_source(&analyzer, query_token),
+            &analyzer,
+            &visibility,
+            &consumer_file,
+            prepared.as_ref(),
+        )
+        .into_owned();
+        let arity = spec.callable_arity_at(usize::MAX).expect("callable arity");
+        assert!(
+            arity.accepts(1),
+            "header default must remain callable: {arity:?}"
+        );
+        assert!(
+            arity.accepts(2),
+            "full parameter list must remain callable: {arity:?}"
+        );
+        assert!(
+            !arity.accepts(0),
+            "required parameter must remain enforced: {arity:?}"
+        );
+    }
+
     #[test]
     fn const_global_with_extern_peer_remains_external_with_exact_fqn_peer_bound() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -849,7 +1534,6 @@ ABSL_NAMESPACE_END
         );
     }
 
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn bounded_visibility_does_not_hydrate_unreachable_same_name_donors() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -910,7 +1594,6 @@ ABSL_NAMESPACE_END
         );
     }
 
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn bounded_visibility_batches_many_names_from_one_donor_read() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -951,71 +1634,6 @@ ABSL_NAMESPACE_END
         );
     }
 
-    #[test]
-    fn bounded_visibility_walks_shared_declaration_dependencies_once() {
-        const ROOT_COUNT: usize = 8;
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        fs::write(
-            root.join("types.h"),
-            "struct Leaf {};\nstruct Selected { Leaf value; };\n",
-        )
-        .expect("write shared declarations");
-        let mut roots = HashSet::default();
-        for index in 0..ROOT_COUNT {
-            let file = ProjectFile::new(root.clone(), format!("consumer_{index}.cpp"));
-            file.write(format!("#include \"types.h\"\nSelected value_{index};\n"))
-                .expect("write consumer");
-            roots.insert(file);
-        }
-
-        let cpp = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
-            root,
-            crate::analyzer::Language::Cpp,
-        ));
-        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&cpp);
-        let query_token = query_scope.token();
-        let graph = CppGraphSource::from_source(&cpp, query_token);
-
-        reset_bounded_visibility_dependency_ast_node_count_for_test();
-        let one_root = HashSet::from_iter([roots.iter().next().expect("one root").clone()]);
-        let one_visibility = VisibilityIndex::build(&cpp, query_token, &graph, &one_root);
-        let one_root_nodes = bounded_visibility_dependency_ast_node_count_for_test();
-        assert_eq!(
-            one_visibility
-                .visible_identifier_candidates(one_root.iter().next().unwrap(), "Leaf")
-                .count(),
-            1
-        );
-        assert!(
-            one_root_nodes > 0,
-            "the fixture must walk dependency syntax"
-        );
-
-        reset_bounded_visibility_dependency_ast_node_count_for_test();
-        reset_bounded_visibility_declaration_read_count_for_test();
-        let all_visibility = VisibilityIndex::build(&cpp, query_token, &graph, &roots);
-        let all_root_nodes = bounded_visibility_dependency_ast_node_count_for_test();
-        for file in &roots {
-            assert_eq!(
-                all_visibility
-                    .visible_identifier_candidates(file, "Leaf")
-                    .count(),
-                1
-            );
-        }
-        assert_eq!(
-            all_root_nodes, one_root_nodes,
-            "dependency syntax is a property of the selected CodeUnit, not of each root that sees it"
-        );
-        assert_eq!(
-            bounded_visibility_declaration_read_count_for_test(),
-            ROOT_COUNT + 1,
-            "each root and the shared donor source must be read once per visibility build"
-        );
-    }
-
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn bounded_visibility_ignores_ordinary_identifiers_in_selected_function_bodies() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -1060,6 +1678,9 @@ ABSL_NAMESPACE_END
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "f56ae0812886: bounded C++ visibility dropped the included alias right-hand-side type"
+    )]
     fn bounded_visibility_retains_included_alias_rhs_type() {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical temp dir");
@@ -1220,7 +1841,6 @@ ABSL_NAMESPACE_END
         );
     }
 
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn compile_proven_include_guard_skips_reference_macro_environment() {
         fn run_case(
@@ -1387,7 +2007,6 @@ ABSL_NAMESPACE_END
         ));
     }
 
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn raw_reference_guards_gate_macro_environment_hydration() {
         fn run_case(
@@ -1476,7 +2095,6 @@ ABSL_NAMESPACE_END
         );
     }
 
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn shared_authoritative_batch_keeps_same_named_anonymous_namespace_globals_root_local() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -1559,174 +2177,6 @@ ABSL_NAMESPACE_END
             !visibility.is_visible(&right, &left_global),
             "shared authoritative visibility must not treat a sibling anonymous-namespace global as visible by logical name alone"
         );
-    }
-
-    #[test]
-    fn visible_identifier_index_skips_linkage_for_reachable_field_sources() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        let left = ProjectFile::new(root.clone(), "left.cpp");
-        let right = ProjectFile::new(root.clone(), "right.cpp");
-        let shared = ProjectFile::new(root.clone(), "shared.h");
-        let local = CodeUnit::new(shared.clone(), CodeUnitType::Field, "", "local_value");
-        let external = CodeUnit::new(shared.clone(), CodeUnitType::Field, "", "shared_value");
-        let visible = HashSet::from_iter([local.clone(), external.clone()]);
-        let visible_by_file =
-            HashMap::from_iter([(left.clone(), visible.clone()), (right.clone(), visible)]);
-        let visible_source_files_by_root = HashMap::from_iter([
-            (
-                left.clone(),
-                HashSet::from_iter([left.clone(), local.source().clone()]),
-            ),
-            (
-                right.clone(),
-                HashSet::from_iter([right.clone(), local.source().clone()]),
-            ),
-        ]);
-        let cpp = visibility_analyzer(&visible_by_file);
-        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&cpp);
-        let query_token = query_scope.token();
-        let (by_identifier, classification_count) =
-            with_cpp_global_field_internal_linkage_classification_counter_for_test(|| {
-                build_visible_identifier_index(
-                    &CppGraphSource::from_source(&cpp, query_token),
-                    &visible_by_file,
-                    &visible_source_files_by_root,
-                    &mut HashMap::default(),
-                )
-            });
-
-        assert_eq!(
-            classification_count, 0,
-            "a field from a reachable source does not need linkage classification"
-        );
-        // issue_1184 exercises the authoritative internal-linkage/root-isolation behavior.
-        // This fixture only guards that sharing the cache across roots preserves the buckets.
-        for root in [&left, &right] {
-            let bucket = by_identifier
-                .get(root)
-                .expect("visible identifier bucket for root");
-            assert_eq!(
-                bucket
-                    .get("local_value")
-                    .expect("shared field bucket")
-                    .len(),
-                1,
-                "sharing the classification cache must not change the per-root local_value bucket"
-            );
-            assert_eq!(
-                bucket
-                    .get("shared_value")
-                    .expect("shared field bucket")
-                    .len(),
-                1,
-                "sharing the classification cache must not change the per-root shared_value bucket"
-            );
-        }
-    }
-
-    /// Owns the analyzer the borrowed index points at; keep it alive for as
-    /// long as the returned index is used.
-    fn visibility_analyzer(
-        visible_by_file: &HashMap<ProjectFile, HashSet<CodeUnit>>,
-    ) -> CppAnalyzer {
-        let root = visible_by_file
-            .keys()
-            .next()
-            .expect("test visibility needs at least one file")
-            .root()
-            .to_path_buf();
-        CppAnalyzer::new(Arc::new(crate::analyzer::TestProject::new(
-            root,
-            crate::analyzer::Language::Cpp,
-        )))
-    }
-
-    fn visibility_index<'a>(
-        cpp: &'a CppAnalyzer,
-        token: QueryToken<'a>,
-        visible_by_file: HashMap<ProjectFile, HashSet<CodeUnit>>,
-    ) -> VisibilityIndex<'a> {
-        VisibilityIndex::from_visible_files_for_test(cpp, token, visible_by_file)
-    }
-
-    #[test]
-    fn template_id_without_specialization_metadata_keeps_resolved_primary() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        let consumer = ProjectFile::new(root.clone(), "consumer.cpp");
-        let legacy = CodeUnit::new(
-            ProjectFile::new(root, "legacy.h"),
-            CodeUnitType::Class,
-            "",
-            "legacy",
-        );
-        let visible_by_file =
-            HashMap::from_iter([(consumer.clone(), HashSet::from_iter([legacy.clone()]))]);
-        let cpp = visibility_analyzer(&visible_by_file);
-        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&cpp);
-        let query_token = query_scope.token();
-        let visibility = visibility_index(&cpp, query_token, visible_by_file);
-        let source = "legacy<int> value;";
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_cpp::LANGUAGE.into())
-            .expect("set C++ grammar");
-        let tree = parser.parse(source, None).expect("parse template-id");
-        let mut stack = vec![tree.root_node()];
-        let mut type_node = None;
-        while let Some(node) = stack.pop() {
-            if node.kind() == "template_type" {
-                type_node = Some(node);
-                break;
-            }
-            let mut cursor = node.walk();
-            stack.extend(node.named_children(&mut cursor));
-        }
-        assert_eq!(
-            visibility.resolve_type_node_result(
-                &consumer,
-                type_node.expect("template type node"),
-                source,
-            ),
-            Ok(Some(legacy))
-        );
-    }
-
-    #[test]
-    fn deeply_nested_cpp_template_terms_use_stack_safe_matching_and_substitution() {
-        let mut pattern = CppTemplateTerm::Parameter("T".to_string());
-        let mut argument = CppTemplateTerm::Atom {
-            kind: "primitive_type".to_string(),
-            text: "int".to_string(),
-        };
-        for _ in 0..512 {
-            pattern = CppTemplateTerm::Node {
-                kind: "template_argument".to_string(),
-                children: vec![pattern],
-            };
-            argument = CppTemplateTerm::Node {
-                kind: "template_argument".to_string(),
-                children: vec![argument],
-            };
-        }
-
-        let parameters = std::iter::once("T").collect::<HashSet<_>>();
-        let mut bindings = HashMap::default();
-        assert!(cpp_unify_template_term(
-            &pattern,
-            &argument,
-            &parameters,
-            &mut bindings,
-        ));
-        let substituted =
-            cpp_substitute_template_term(&pattern, &bindings).expect("bound deep template term");
-        assert!(cpp_unify_template_term(
-            &substituted,
-            &argument,
-            &HashSet::default(),
-            &mut HashMap::default(),
-        ));
     }
 
     #[test]
@@ -2034,7 +2484,6 @@ ABSL_NAMESPACE_END
         ));
     }
 
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn class_strength_reuses_one_prepared_tree_for_qgis_sized_sibling_set() {
         const SIBLING_COUNT: usize = 113;
@@ -2137,8 +2586,10 @@ ABSL_NAMESPACE_END
         );
     }
 
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#925: the C++ macro environment cache grew with call sites instead of shared event frontiers"
+    )]
     fn macro_environment_cache_scales_with_event_frontiers_not_call_sites() {
         const REPEATED_CALL_COUNT: usize = 1_000;
         const EVENT_COUNT: usize = 1_000;
@@ -2223,242 +2674,25 @@ ABSL_NAMESPACE_END
         }
         assert_eq!(
             visibility
-                .macro_environment_checkpoint_build_count
-                .load(Ordering::Relaxed),
-            1,
-            "the file's events must be applied once into one shared checkpoint vector"
-        );
-        assert_eq!(
-            visibility
                 .macro_replacement_parse_count
                 .load(Ordering::Relaxed),
             1,
             "repeated uses of one macro binding must share one parsed replacement"
         );
-        let requests = visibility
-            .macro_environment_request_count
-            .load(Ordering::Relaxed);
-        let applications = visibility
-            .macro_event_application_count
-            .load(Ordering::Relaxed);
-        let bound =
-            INCLUDED_EVENT_COUNT + EVENT_COUNT + 2 + requests * MACRO_ENVIRONMENT_CHECKPOINT_STRIDE;
-        assert!(
-            applications <= bound,
-            "the include closure must replay once into the checkpoints and each of the {requests} requests must replay at most one stride: {applications} applications exceed {bound}"
+        assert_macro_environment_checkpoint_budget(
+            &visibility,
+            EVENT_COUNT,
+            INCLUDED_EVENT_COUNT,
+            2,
+            "the file's events must be applied once into one shared checkpoint vector",
+            "the include closure and each request must replay within the checkpoint stride bound",
         );
     }
 
     #[test]
-    fn concurrent_macro_arity_scans_share_one_checkpoint_build() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        let file = ProjectFile::new(root.clone(), "consumer.cpp");
-        let exact_header = ProjectFile::new(root.clone(), "exact.h");
-        exact_header
-            .write("#pragma once\n#define PAIR(value) value, value\n")
-            .expect("write exact macro header");
-        let conditional_header = ProjectFile::new(root.clone(), "conditional.h");
-        conditional_header
-            .write("#pragma once\n#define MAYBE_PAIR(value) value, value\n")
-            .expect("write conditional macro header");
-        file.write(
-            "#include \"exact.h\"\n\
-             #if ENABLE_CONDITIONAL\n\
-             #include \"conditional.h\"\n\
-             #endif\n\
-             int target(int left, int right);\n\
-             void use() {\n\
-               target(PAIR(0));\n\
-               target(MAYBE_PAIR(0));\n\
-             }\n",
-        )
-        .expect("write macro consumer");
-
-        let project = Arc::new(crate::analyzer::TestProject::new(
-            &root,
-            crate::analyzer::Language::Cpp,
-        ));
-        let workspace = crate::analyzer::WorkspaceAnalyzer::build_ephemeral_footgun(
-            project,
-            crate::analyzer::AnalyzerConfig::default(),
-        )
-        .expect("ephemeral workspace should build");
-        let cpp = resolve_analyzer::<CppAnalyzer>(workspace.analyzer()).expect("C++ analyzer");
-        let query_scope = crate::analyzer::AnalyzerQueryScope::new(workspace.analyzer());
-        let query_token = query_scope.token();
-        let roots = HashSet::from_iter([file.clone()]);
-        let visibility = VisibilityIndex::build(
-            cpp,
-            query_token,
-            &CppDispatch::new(workspace.analyzer(), query_token).source(),
-            &roots,
-        );
-
-        // Two workers race for the same file's macro environment. The checkpoint vector that
-        // replaced the per-worker forward cursors is immutable once built, so both must reach
-        // the same exact and fail-closed evidence off one build, one prepared tree, and one
-        // parsed replacement.
-        const WORKER_COUNT: usize = 2;
-        let start = std::sync::Barrier::new(WORKER_COUNT);
-        let evidence_by_worker = std::thread::scope(|scope| {
-            let workers = (0..WORKER_COUNT)
-                .map(|_| {
-                    let worker_file = &file;
-                    let worker_visibility = &visibility;
-                    let start = &start;
-                    scope.spawn(move || {
-                        let prepared = cpp
-                            .prepared_syntax(query_token, worker_file)
-                            .expect("prepared macro consumer");
-                        let mut stack = vec![prepared.tree().root_node()];
-                        let mut calls = Vec::new();
-                        while let Some(node) = stack.pop() {
-                            if node.kind() == "call_expression"
-                                && node
-                                    .child_by_field_name("function")
-                                    .is_some_and(|function| {
-                                        node_text(function, prepared.source()) == "target"
-                                    })
-                            {
-                                calls.push(node);
-                            }
-                            for index in (0..node.named_child_count()).rev() {
-                                if let Some(child) = node.named_child(index) {
-                                    stack.push(child);
-                                }
-                            }
-                        }
-                        calls.sort_by_key(Node::start_byte);
-                        start.wait();
-                        calls
-                            .into_iter()
-                            .map(|call| {
-                                worker_visibility.call_arity_evidence(
-                                    worker_file,
-                                    call,
-                                    prepared.source(),
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .collect::<Vec<_>>();
-            workers
-                .into_iter()
-                .map(|worker| worker.join().expect("macro arity worker"))
-                .collect::<Vec<_>>()
-        });
-
-        let expected = vec![CallArityEvidence::Exact(2), CallArityEvidence::Unknown];
-        for evidence in &evidence_by_worker {
-            assert_eq!(
-                evidence, &expected,
-                "a shared checkpoint vector must preserve exact and fail-closed evidence"
-            );
-        }
-        assert_eq!(
-            cpp.prepared_syntax_parse_count_for_test(&file),
-            1,
-            "concurrent macro replay must retain the request-scoped prepared tree"
-        );
-        assert_eq!(
-            visibility
-                .macro_environment_checkpoint_build_count
-                .load(Ordering::Relaxed),
-            1,
-            "racing workers must share one checkpoint build per file, not one per worker"
-        );
-    }
-
-    /// The cost contract the checkpoints exist for: however the requested
-    /// positions jump around, one file costs its own event count once plus at
-    /// most one stride of replay per request (#1496).
-    #[test]
-    fn random_macro_environment_positions_replay_at_most_one_stride_each() {
-        const EVENT_COUNT: usize = 256;
-        const INCLUDED_EVENT_COUNT: usize = 40;
-        const REQUEST_COUNT: usize = 300;
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        let header = ProjectFile::new(root.clone(), "bank.h");
-        let mut header_source = String::from("#pragma once\n");
-        for index in 0..INCLUDED_EVENT_COUNT {
-            header_source.push_str(&format!("#define BANK_{index} {index}\n"));
-        }
-        header.write(&header_source).expect("write macro bank");
-        let file = ProjectFile::new(root.clone(), "positions.cpp");
-        let mut source = String::from("#include \"bank.h\"\n");
-        for index in 0..EVENT_COUNT {
-            source.push_str(&format!("#define EVENT_{index} {index}\n"));
-        }
-        file.write(&source).expect("write macro fixture");
-
-        let project = Arc::new(crate::analyzer::TestProject::new(
-            &root,
-            crate::analyzer::Language::Cpp,
-        ));
-        let workspace = crate::analyzer::WorkspaceAnalyzer::build_ephemeral_footgun(
-            project,
-            crate::analyzer::AnalyzerConfig::default(),
-        )
-        .expect("ephemeral workspace should build");
-        let cpp = resolve_analyzer::<CppAnalyzer>(workspace.analyzer()).expect("C++ analyzer");
-        let query_scope = crate::analyzer::AnalyzerQueryScope::new(workspace.analyzer());
-        let query_token = query_scope.token();
-        let roots = HashSet::from_iter([file.clone()]);
-        let visibility = VisibilityIndex::build(
-            cpp,
-            query_token,
-            &CppDispatch::new(workspace.analyzer(), query_token).source(),
-            &roots,
-        );
-
-        let event_bytes = {
-            let cell = visibility.macro_event_cell(&file);
-            drop(visibility.macro_environment(&file, 0));
-            cell.get()
-                .expect("prepared macro events")
-                .iter()
-                .map(MacroEvent::byte)
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(event_bytes.len(), EVENT_COUNT + 1);
-
-        // A fixed linear congruential sequence, so the positions jump both ways
-        // and the pin replays identically on every run.
-        let mut state = 0x2545_f491_4f6c_dd1du64;
-        for _ in 0..REQUEST_COUNT {
-            state = state
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            let position = (state >> 33) as usize % event_bytes.len();
-            drop(visibility.macro_environment(&file, event_bytes[position] + 1));
-        }
-
-        let requests = visibility
-            .macro_environment_request_count
-            .load(Ordering::Relaxed);
-        let applications = visibility
-            .macro_event_application_count
-            .load(Ordering::Relaxed);
-        let bound =
-            EVENT_COUNT + INCLUDED_EVENT_COUNT + 1 + requests * MACRO_ENVIRONMENT_CHECKPOINT_STRIDE;
-        assert!(
-            applications <= bound,
-            "{requests} requests at random positions applied {applications} events, above the {bound} the checkpoints promise"
-        );
-        assert_eq!(
-            visibility
-                .macro_environment_checkpoint_build_count
-                .load(Ordering::Relaxed),
-            1,
-            "the checkpoint vector must be built once for the requested file"
-        );
-    }
-
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#925: include-guard cache reuse ignored the one covering outer guard"
+    )]
     fn include_guard_cache_requires_one_outer_file_covering_guard() {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical temp dir");
@@ -2550,7 +2784,6 @@ ABSL_NAMESPACE_END
         );
     }
 
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn callable_targets_without_differing_redeclarations_skip_include_activation_work() {
         const TARGET_COUNT: usize = 128;
@@ -2622,64 +2855,6 @@ ABSL_NAMESPACE_END
         );
     }
 
-    #[test]
-    fn unconditional_include_reachability_is_reused_across_visibility_indexes() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        let consumer = ProjectFile::new(root.clone(), "consumer.cpp");
-        let bridge = ProjectFile::new(root.clone(), "bridge.h");
-        let donor = ProjectFile::new(root.clone(), "donor.h");
-        consumer
-            .write("#include \"bridge.h\"\nint consume() { return target(); }\n")
-            .expect("write consumer");
-        bridge
-            .write("#include \"donor.h\"\n")
-            .expect("write bridge");
-        donor.write("int target();\n").expect("write donor");
-
-        let analyzer = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
-            root,
-            crate::analyzer::Language::Cpp,
-        ));
-        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
-        let query_token = query_scope.token();
-        let roots = HashSet::from_iter([consumer.clone()]);
-        let first = VisibilityIndex::build(
-            &analyzer,
-            query_token,
-            &CppGraphSource::from_source(&analyzer, query_token),
-            &roots,
-        );
-        let prepared = analyzer
-            .prepared_syntax(query_token, &consumer)
-            .expect("prepared consumer");
-        assert!(
-            first
-                .include_activation_for_source(&analyzer, &consumer, prepared.as_ref(), &donor)
-                .is_some(),
-            "the direct include must reach the donor through the bridge"
-        );
-
-        let second = VisibilityIndex::build(
-            &analyzer,
-            query_token,
-            &CppGraphSource::from_source(&analyzer, query_token),
-            &roots,
-        );
-        assert!(
-            second
-                .include_activation_for_source(&analyzer, &consumer, prepared.as_ref(), &donor)
-                .is_some(),
-            "the shared analyzer cache must preserve the include activation"
-        );
-        assert_eq!(
-            analyzer.unconditional_include_reachability_cache_len_for_test(),
-            1,
-            "separate visibility indexes must reuse one reachability result"
-        );
-    }
-
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn conditional_include_projection_index_walks_each_guard_state_once_for_all_donors() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -2782,126 +2957,10 @@ ABSL_NAMESPACE_END
         );
     }
 
-    /// #2365: one guarded root include that fans out through a header diamond
-    /// reaches `target.h` with both `{A}` and `{A, B}` guard sets at the same
-    /// activation byte. Consumers only ask existence questions that are
-    /// monotone in the guard set, so the index must keep only the
-    /// inclusion-minimal set. Dense `#ifdef` lattices otherwise enumerate the
-    /// powerset of path-union guard sets, which is what hung the QMK C
-    /// forward differential with memory growing without bound.
     #[test]
-    fn conditional_include_projection_index_keeps_only_minimal_guard_sets() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        let consumer = ProjectFile::new(root.clone(), "consumer.cpp");
-        let mid = ProjectFile::new(root.clone(), "mid.h");
-        let x = ProjectFile::new(root.clone(), "x.h");
-        let target = ProjectFile::new(root.clone(), "target.h");
-        consumer
-            .write("#if defined(A)\n#include \"mid.h\"\n#endif\n")
-            .expect("write consumer");
-        mid.write("#include \"x.h\"\n#if defined(B)\n#include \"target.h\"\n#endif\n")
-            .expect("write mid");
-        x.write("#include \"target.h\"\n").expect("write x");
-        target.write("struct Target {};\n").expect("write target");
-
-        let analyzer = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
-            root,
-            crate::analyzer::Language::Cpp,
-        ));
-        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
-        let query_token = query_scope.token();
-        let roots = HashSet::from_iter([consumer.clone()]);
-        let visibility = VisibilityIndex::build(
-            &analyzer,
-            query_token,
-            &CppGraphSource::from_source(&analyzer, query_token),
-            &roots,
-        );
-        let prepared = analyzer
-            .prepared_syntax(query_token, &consumer)
-            .expect("prepared consumer");
-
-        let target_projections = visibility.conditional_include_projections_for_source(
-            &consumer,
-            prepared.as_ref(),
-            &target,
-        );
-        assert_eq!(
-            target_projections.len(),
-            1,
-            "the subsumed {{A, B}} path must be evicted by its {{A}} subset"
-        );
-        assert_eq!(
-            target_projections[0].required_guards,
-            HashSet::from_iter([PreprocessorGuard::Defined("A".to_string())]),
-        );
-        assert_eq!(
-            visibility
-                .conditional_include_projections_for_source(&consumer, prepared.as_ref(), &x)
-                .len(),
-            1
-        );
-        assert_eq!(
-            visibility.conditional_include_projection_work_counts_for_test(),
-            (1, 4),
-            "one traversal: mid, x, target with {{A, B}} (later evicted), target with {{A}}"
-        );
-    }
-
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[test]
-    fn unconditional_include_reachability_keeps_c_and_cpp_contexts_separate() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        let c_consumer = ProjectFile::new(root.clone(), "consumer.c");
-        let cpp_consumer = ProjectFile::new(root.clone(), "consumer.cpp");
-        let bridge = ProjectFile::new(root.clone(), "bridge.h");
-        let donor = ProjectFile::new(root.clone(), "donor.h");
-        c_consumer
-            .write("#include \"bridge.h\"\nint consume_c() { return 0; }\n")
-            .expect("write C consumer");
-        cpp_consumer
-            .write("#include \"bridge.h\"\nint consume_cpp() { return target(); }\n")
-            .expect("write C++ consumer");
-        bridge
-            .write("#ifdef __cplusplus\n#include \"donor.h\"\n#endif\n")
-            .expect("write bridge");
-        donor.write("int target();\n").expect("write donor");
-
-        let analyzer = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
-            root,
-            crate::analyzer::Language::Cpp,
-        ));
-        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
-        let query_token = query_scope.token();
-        for (consumer, reaches) in [(c_consumer, false), (cpp_consumer, true)] {
-            let roots = HashSet::from_iter([consumer.clone()]);
-            let visibility = VisibilityIndex::build(
-                &analyzer,
-                query_token,
-                &CppGraphSource::from_source(&analyzer, query_token),
-                &roots,
-            );
-            let prepared = analyzer
-                .prepared_syntax(query_token, &consumer)
-                .expect("prepared consumer");
-            assert_eq!(
-                visibility
-                    .include_activation_for_source(&analyzer, &consumer, prepared.as_ref(), &donor)
-                    .is_some(),
-                reaches,
-                "the include closure must respect the reference language"
-            );
-        }
-        assert_eq!(
-            analyzer.unconditional_include_reachability_cache_len_for_test(),
-            2,
-            "the cache must not reuse a C result for a C++ reference"
-        );
-    }
-
-    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#932: C++ callable arity changed with the order of incompatible default-argument donors"
+    )]
     fn callable_arity_keeps_compatible_defaults_independent_of_incompatible_donor_order() {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical temp dir");
@@ -2952,109 +3011,10 @@ ABSL_NAMESPACE_END
         }
     }
 
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
-    fn cpp_callable_arity_applies_defaulted_header_to_definition_target() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        let definition_file = ProjectFile::new(root.clone(), "api.cpp");
-        let header_file = ProjectFile::new(root.clone(), "api.hpp");
-        fs::write(
-            header_file.abs_path(),
-            "#define API\n".to_string()
-                + "class XMLNode; class XMLElement;\n"
-                + "class API XMLElement : public XMLNode {\n"
-                + "public:\n"
-                + "  const char* Name() const { return Value(); }\n"
-                + "  const char* Attribute(const char* name, const char* value = 0) const;\n"
-                + "};\n}\n",
-        )
-        .expect("write declaration fixture");
-        fs::write(
-            root.join("api.cpp"),
-            "#include \"api.hpp\"\n".to_string()
-                + "const char* XMLElement::Attribute(const char* name, const char* value) const {\n"
-                + "  return value ? value : name;\n"
-                + "}\n",
-        )
-        .expect("write definition fixture");
-        let consumer_file = ProjectFile::new(root.clone(), "consumer.cpp");
-        fs::write(
-            consumer_file.abs_path(),
-            "#include \"api.hpp\"\n".to_string()
-                + "const char* consume(const XMLElement* element) {\n"
-                + "  return element->Attribute(\"name\");\n"
-                + "}\n",
-        )
-        .expect("write consumer fixture");
-        let analyzer = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
-            &root,
-            crate::analyzer::Language::Cpp,
-        ));
-        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
-        let query_token = query_scope.token();
-        let target = analyzer
-            .get_all_declarations()
-            .into_iter()
-            .find(|unit| {
-                unit.is_function()
-                    && unit.identifier() == "Attribute"
-                    && unit.source() == &definition_file
-            })
-            .expect("out-of-line definition");
-        let header_attribute = analyzer
-            .get_all_declarations()
-            .into_iter()
-            .find(|unit| {
-                unit.is_function()
-                    && unit.identifier() == "Attribute"
-                    && unit.source() == &header_file
-            })
-            .expect("header declaration");
-        assert_eq!(
-            header_attribute.fq_name(),
-            "XMLElement.Attribute",
-            "fragmented export-macro members keep their recovered class owner"
-        );
-        let roots = HashSet::from_iter([consumer_file.clone()]);
-        let visibility = VisibilityIndex::build(
-            &analyzer,
-            query_token,
-            &CppGraphSource::from_source(&analyzer, query_token),
-            &roots,
-        );
-        let prepared = analyzer
-            .prepared_syntax(query_token, &consumer_file)
-            .expect("prepared consumer");
-        let spec = TargetSpec::from_target(
-            &CppGraphSource::from_source(&analyzer, query_token),
-            &target,
-        )
-        .expect("target spec")
-        .with_visible_callable_arities(
-            &CppGraphSource::from_source(&analyzer, query_token),
-            &analyzer,
-            &visibility,
-            &consumer_file,
-            prepared.as_ref(),
-        )
-        .into_owned();
-        let arity = spec.callable_arity_at(usize::MAX).expect("callable arity");
-        assert!(
-            arity.accepts(1),
-            "header default must remain callable: {arity:?}"
-        );
-        assert!(
-            arity.accepts(2),
-            "full parameter list must remain callable: {arity:?}"
-        );
-        assert!(
-            !arity.accepts(0),
-            "required parameter must remain enforced: {arity:?}"
-        );
-    }
-
-    #[test]
+    #[hardwon(
+        "cc3ba5988555: C++ callable lookup scanned global fields instead of stored comparable-name candidates"
+    )]
     fn same_logical_callable_uses_stored_comparable_name_candidates() {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical temp dir");

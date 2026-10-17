@@ -31,6 +31,8 @@ crate including `mcp_wire_schema`. Running it again in the Node step would doubl
 the crate's compile and test time for no new information. Default mode (no flags)
 does run it, so a local `run.mjs` is the complete gate; a missing
 `mcp_wire_schema` target is a failure in default mode.
+The optional Rust test subprocess defaults `BIFROST_OPEN_PACKS_DISABLE` to `1`
+only when the variable is unset. Explicit `0` and empty values are preserved.
 
 The server binary is `$CARGO_TARGET_DIR/debug/bifrost-mcp-test-server` (or
 `target/debug/...`), built on demand. Override with `BIFROST_MCP_SERVER_BIN`.

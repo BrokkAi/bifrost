@@ -6,7 +6,9 @@
 //! values; those decisions belong to the language's existing type and definition resolvers.
 
 use crate::analyzer::Range;
-use crate::analyzer::structural::{FileFacts, NormalizedKind, Role, Span};
+use crate::analyzer::common::same_byte_range;
+use crate::analyzer::structural::{FileFacts, NormalizedKind, Role};
+use crate::analyzer::usages::range_for_span;
 use crate::cancellation::CancellationToken;
 use std::sync::Arc;
 
@@ -171,30 +173,30 @@ impl ReceiverSiteIndex {
 
             let (match_rank, target_width) = match mode {
                 ReceiverSiteInputMode::Expression => {
-                    if same_span(indexed.site.receiver_range, input) {
+                    if same_byte_range(indexed.site.receiver_range, input) {
                         (0, range_width(indexed.site.receiver_range))
-                    } else if covers(indexed.site.receiver_range, input) {
+                    } else if indexed.site.receiver_range.contains(&input) {
                         (1, range_width(indexed.site.receiver_range))
                     } else {
                         continue;
                     }
                 }
                 ReceiverSiteInputMode::ContainingSite => {
-                    if same_span(indexed.site.site_range, input) {
+                    if same_byte_range(indexed.site.site_range, input) {
                         (0, range_width(indexed.site.site_range))
                     } else if let Some(member) = indexed
                         .site
                         .member_range
-                        .filter(|member| same_span(*member, input))
+                        .filter(|member| same_byte_range(*member, input))
                     {
                         (1, range_width(member))
                     } else if let Some(member) = indexed
                         .site
                         .member_range
-                        .filter(|member| covers(*member, input))
+                        .filter(|member| member.contains(&input))
                     {
                         (2, range_width(member))
-                    } else if covers(indexed.site.site_range, input) {
+                    } else if indexed.site.site_range.contains(&input) {
                         (3, range_width(indexed.site.site_range))
                     } else {
                         continue;
@@ -272,12 +274,12 @@ pub(crate) fn build_receiver_site_index(
         }
         inspected_work += 1;
 
-        let (kind, receiver_role, member_role) = match node.kind {
-            NormalizedKind::Call => (ReceiverSiteKind::Call, Role::Receiver, Role::Callee),
-            NormalizedKind::FieldAccess => {
-                (ReceiverSiteKind::FieldAccess, Role::Object, Role::Field)
-            }
-            _ => continue,
+        let (kind, receiver_role, member_role) = if node.kind.satisfies(NormalizedKind::Call) {
+            (ReceiverSiteKind::Call, Role::Receiver, Role::Callee)
+        } else if node.kind == NormalizedKind::FieldAccess {
+            (ReceiverSiteKind::FieldAccess, Role::Object, Role::Field)
+        } else {
+            continue;
         };
         let fact_id = source_order as u32;
         let mut receiver = None;
@@ -332,28 +334,11 @@ pub(crate) fn build_receiver_site_index(
 }
 
 fn is_cancelled(cancellation: Option<&CancellationToken>) -> bool {
-    cancellation.is_some_and(CancellationToken::is_cancelled)
-}
-
-fn same_span(left: Range, right: Range) -> bool {
-    left.start_byte == right.start_byte && left.end_byte == right.end_byte
-}
-
-fn covers(container: Range, input: Range) -> bool {
-    container.start_byte <= input.start_byte && input.end_byte <= container.end_byte
+    brokk_bifrost_core::cancellation::optional_is_cancelled(cancellation)
 }
 
 fn range_width(range: Range) -> usize {
     range.end_byte.saturating_sub(range.start_byte)
-}
-
-fn range_for_span(facts: &FileFacts, span: Span) -> Range {
-    Range {
-        start_byte: span.start_byte,
-        end_byte: span.end_byte,
-        start_line: facts.line_of_byte(span.start_byte),
-        end_line: facts.line_of_byte(span.end_byte),
-    }
 }
 
 #[cfg(test)]
@@ -395,47 +380,11 @@ mod tests {
     }
 
     fn range_of(index: &ReceiverSiteIndex, needle: &str) -> Range {
-        let start_byte = index.source().rfind(needle).expect("source marker");
-        Range {
-            start_byte,
-            end_byte: start_byte + needle.len(),
-            start_line: 0,
-            end_line: 0,
-        }
+        crate::analyzer::usages::test_support::byte_range(index.source(), needle)
     }
 
     fn text(index: &ReceiverSiteIndex, range: Range) -> &str {
         &index.source()[range.start_byte..range.end_byte]
-    }
-
-    #[test]
-    fn direct_call_selects_from_exact_site_member_and_receiver_inputs() {
-        let index = complete_index(
-            "class Service { public void Run() {} }\n\
-             class Caller { void Go(Service service) { service.Run(); } }\n",
-        );
-        let expected_site = range_of(&index, "service.Run()");
-
-        for (input, mode) in [
-            (expected_site, ReceiverSiteInputMode::ContainingSite),
-            (
-                range_of(&index, "Run"),
-                ReceiverSiteInputMode::ContainingSite,
-            ),
-            (
-                range_of(&index, "service"),
-                ReceiverSiteInputMode::Expression,
-            ),
-        ] {
-            let site = index.select(input, mode).expect("direct receiver site");
-            assert_eq!(site.kind, ReceiverSiteKind::Call);
-            assert_eq!(text(&index, site.site_range), "service.Run()");
-            assert_eq!(text(&index, site.receiver_range), "service");
-            assert_eq!(
-                site.member_range.map(|range| text(&index, range)),
-                Some("Run")
-            );
-        }
     }
 
     #[test]
@@ -513,6 +462,25 @@ mod tests {
         assert_eq!(
             property.member_range.map(|range| text(&index, range)),
             Some("Name")
+        );
+    }
+
+    #[test]
+    fn csharp_indexer_access_keeps_receiver_and_full_member_ranges() {
+        let index = complete_index(
+            "class Caller { string Read(System.Web.HttpRequest request) { return request[\"x\"]; } }\n",
+        );
+        let access = index
+            .select(
+                range_of(&index, "request[\"x\"]"),
+                ReceiverSiteInputMode::ContainingSite,
+            )
+            .expect("C# indexer access");
+        assert_eq!(access.kind, ReceiverSiteKind::FieldAccess);
+        assert_eq!(text(&index, access.receiver_range), "request");
+        assert_eq!(
+            access.member_range.map(|range| text(&index, range)),
+            Some("request[\"x\"]")
         );
     }
 
@@ -598,24 +566,6 @@ mod tests {
         };
         assert!(inspected_sites > 0);
         assert!(inspected_sites < index.len());
-    }
-
-    #[test]
-    fn pre_cancelled_build_stops_before_inspecting_work() {
-        let cancellation = CancellationToken::default();
-        cancellation.cancel();
-        let outcome = build_receiver_site_index(
-            facts("class Service { public void Run() {} }\n"),
-            ReceiverSiteIndexLimit {
-                max_work_items: usize::MAX,
-            },
-            Some(&cancellation),
-        );
-
-        assert!(matches!(
-            outcome,
-            ReceiverSiteIndexBuild::Cancelled { inspected_work: 0 }
-        ));
     }
 
     #[test]

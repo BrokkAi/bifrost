@@ -7,6 +7,7 @@ use std::path::Path;
 use git2::{ObjectType, Oid};
 use rusqlite::{OptionalExtension, params};
 
+use super::go_unit_summaries::go_unit_key;
 use super::{AnalyzerStore, Result, WorkspaceConfigurationInput, WorkspaceSnapshotId};
 use crate::CancellationToken;
 use crate::analyzer::canonical_hash::CanonicalHasher;
@@ -14,9 +15,11 @@ use crate::analyzer::go::dependency_discovery::GoPackageDiscovery;
 use crate::analyzer::{Language, Project};
 use brokk_bifrost_core::analyzer::go_facts::GO_BUILD_SELECTION_FACTS_VERSION;
 
-pub(crate) const DERIVATION_VERSION: i64 = 4;
+/// Version 7 retains source-inventory placements for files without tool records
+/// after a failed discovery run, preserving explicit tool admission/exclusion.
+pub(crate) const DERIVATION_VERSION: i64 = 7;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct GoContextIdentity {
     pub selection_id: i64,
     pub context_id: i64,
@@ -305,6 +308,30 @@ struct PackageRows {
     imports: std::collections::BTreeMap<(&'static str, String), Option<String>>,
 }
 
+struct GoSourceInventoryRows {
+    packages: Vec<PackageRows>,
+    digest: [u8; 32],
+    gaps: String,
+}
+
+/// The unit key a package row stores, with the source role its summaries name:
+/// `go` for a package that is not a test variant, otherwise `xtest` when the
+/// variant has external test files and `test` when it does not.
+fn go_package_unit_key(
+    import_path: &str,
+    for_test: &str,
+    files: &[(i64, &'static str)],
+) -> [u8; 32] {
+    let role = if for_test.is_empty() {
+        "go"
+    } else if files.iter().any(|(_, role)| *role == "xtest") {
+        "xtest"
+    } else {
+        "test"
+    };
+    go_unit_key(import_path, for_test, role)
+}
+
 impl AnalyzerStore {
     /// Consume one canonical tool result after matching before/after input
     /// observations. All normalization collections die with this publication.
@@ -362,6 +389,43 @@ impl AnalyzerStore {
             .filter(|pair| pair[0].import_path == pair[1].import_path)
             .map(|pair| pair[0].import_path.clone())
             .collect::<BTreeSet<_>>();
+        // File authority is local to each record. Descriptive test files are
+        // known but not admitted unless a selected test variant compiles them.
+        let recorded_paths = discovery
+            .packages
+            .iter()
+            .flat_map(|package| {
+                package
+                    .go_files
+                    .iter()
+                    .chain(&package.cgo_files)
+                    .chain(&package.ignored_go_files)
+                    .chain(&package.test_go_files)
+                    .chain(&package.x_test_go_files)
+                    .map(|path| package.dir.join(path))
+            })
+            .collect::<BTreeSet<_>>();
+        let failed_roots = discovery
+            .packages
+            .iter()
+            .filter_map(|package| {
+                let error = package.error.as_ref()?;
+                let directory = if !package.dir.as_os_str().is_empty() {
+                    package.dir.clone()
+                } else if discovery.workspace_patterns.contains(&package.import_path) {
+                    root.clone()
+                } else {
+                    return None;
+                };
+                Some((
+                    directory,
+                    json!({"code":"build_selection_unavailable", "evidence":{
+                        "package":package.import_path,"error":error.err,"position":error.pos,
+                        "import_stack":error.import_stack
+                    }}),
+                ))
+            })
+            .collect::<Vec<_>>();
         let mut normalized = Vec::new();
         let mut publication = CanonicalHasher::new(b"bifrost-go-context-publication:v1");
         publication.field("profile", &profile);
@@ -376,6 +440,15 @@ impl AnalyzerStore {
                 );
                 continue;
             }
+            // A failed pattern is invocation evidence, not a nameless
+            // package provider. Inventory supplies the same package rows as
+            // the unavailable-tool path for this root.
+            if package.error.is_some()
+                && package.name.is_empty()
+                && discovery.workspace_patterns.contains(&package.import_path)
+            {
+                continue;
+            }
             let provider_kind = if package.standard {
                 "standard"
             } else if package.module.as_ref().is_some_and(|module| !module.main) {
@@ -388,6 +461,7 @@ impl AnalyzerStore {
             let provider_module_version =
                 package.module.as_ref().map(|module| module.version.clone());
             let mut gaps = Vec::new();
+            let mut dependency_gaps = Vec::new();
             if !source_less_provider && !package.cgo_files.is_empty() {
                 gaps.push(
                     json!({"code":"cgo_build_selection_unavailable", "evidence":package.cgo_files}),
@@ -397,10 +471,17 @@ impl AnalyzerStore {
                 gaps.push(json!({"code":"tool_package_error", "evidence":{"error":error.err,"position":error.pos,"import_stack":error.import_stack}}));
             }
             for error in &package.deps_errors {
-                gaps.push(json!({"code":"tool_dependency_error", "evidence":{"error":error.err,"position":error.pos,"import_stack":error.import_stack}}));
+                dependency_gaps.push(json!({"code":"tool_dependency_error", "evidence":{"error":error.err,"position":error.pos,"import_stack":error.import_stack}}));
             }
             if package.incomplete {
-                gaps.push(json!({"code":"tool_incomplete", "evidence":package.import_path}));
+                let evidence = json!({"code":"tool_incomplete", "evidence":package.import_path});
+                // Incomplete propagates up the tool's dependency graph. Only an
+                // own Error or an unexplained Incomplete limits this provider.
+                if package.error.is_some() || package.deps_errors.is_empty() {
+                    gaps.push(evidence);
+                } else {
+                    dependency_gaps.push(evidence);
+                }
             }
             if package.name.is_empty() {
                 gaps.push(json!({"code":"missing_package_name", "evidence":package.import_path}));
@@ -495,7 +576,16 @@ impl AnalyzerStore {
             if members.is_empty() && !source_less_provider {
                 gaps.push(json!({"code":"missing_selected_package_source", "evidence":package.import_path}));
             }
+            // Keep dependency evidence, but consume its incompleteness only
+            // through imports of the failed providers. Unrelated declarations
+            // in this package still have complete own-source coverage.
             let complete = gaps.is_empty() && context_gaps.is_empty();
+            gaps.extend(dependency_gaps);
+            // `go list` reports DepsErrors in a different order on every run, and
+            // the gap text is part of the publication and provider digests and of
+            // every unit summary derived from it. Canonical order makes an
+            // unchanged tree republish to the same digests.
+            gaps.sort_by_cached_key(serde_json::Value::to_string);
             let gaps_json = serde_json::to_string(&gaps).expect("Go gap evidence is JSON");
             publication.field("package", package.import_path.as_bytes());
             publication.field("name", package.name.as_bytes());
@@ -510,6 +600,7 @@ impl AnalyzerStore {
             }
             publication.field("provider", &provider);
             publication.field("gaps", gaps_json.as_bytes());
+            publication.field("complete", &[u8::from(complete)]);
             let admitted_roles = members
                 .iter()
                 .map(|(_, role)| *role)
@@ -549,6 +640,80 @@ impl AnalyzerStore {
                 files: members,
                 imports,
             });
+        }
+        if !failed_roots.is_empty() {
+            let Some(inventory) =
+                self.derive_go_source_context(&snapshot, &root, cancellation, &|path| {
+                    !recorded_paths.contains(path)
+                        && failed_roots
+                            .iter()
+                            .any(|(directory, _)| path.starts_with(directory))
+                })?
+            else {
+                return Ok(GoContextPublicationOutcome::Cancelled);
+            };
+            publication.field("source-inventory", &inventory.digest);
+            context_gaps.extend(
+                serde_json::from_str::<Vec<serde_json::Value>>(&inventory.gaps)
+                    .expect("Go source inventory gap evidence is JSON"),
+            );
+            for mut package in inventory.packages {
+                let failures = failed_roots
+                    .iter()
+                    .filter(|(directory, _)| package.directory.starts_with(directory))
+                    .map(|(_, gap)| gap.clone())
+                    .collect::<Vec<_>>();
+                if failures.is_empty() {
+                    continue;
+                }
+                for ((_, spelling), target) in &mut package.imports {
+                    if target.is_none()
+                        && normalized.iter().any(|tool| tool.import_path == *spelling)
+                    {
+                        *target = Some(spelling.clone());
+                    }
+                }
+                // A failed tool run has exactly the source-only epistemic
+                // state. Keep inventory completeness and package gaps intact;
+                // build selection uncertainty belongs to context evidence.
+                context_gaps.extend(failures);
+                if let Some(tool) = normalized
+                    .iter_mut()
+                    .find(|tool| tool.import_path == package.import_path)
+                {
+                    tool.files.extend(package.files);
+                    tool.complete &= package.complete;
+                    tool.gaps.extend(package.gaps);
+                    tool.gaps.sort_by_cached_key(serde_json::Value::to_string);
+                    for (key, target) in package.imports {
+                        tool.imports.entry(key).or_insert(target);
+                    }
+                } else {
+                    normalized.push(package);
+                }
+            }
+        }
+        context_gaps.sort_by_cached_key(serde_json::Value::to_string);
+        context_gaps.dedup();
+        // Include final normalized rows, including supplemented inventory, in
+        // the reusable publication identity.
+        for package in &normalized {
+            publication.field("final-package", package.import_path.as_bytes());
+            publication.field("final-provider", &package.provider);
+            publication.field("final-complete", &[u8::from(package.complete)]);
+            publication.field(
+                "final-gaps",
+                serde_json::to_string(&package.gaps)
+                    .expect("Go gap evidence is JSON")
+                    .as_bytes(),
+            );
+            for ((role, spelling), target) in &package.imports {
+                publication.field("final-import-role", role.as_bytes());
+                publication.field("final-import", spelling.as_bytes());
+                if let Some(target) = target {
+                    publication.field("final-target", target.as_bytes());
+                }
+            }
         }
         let context_complete = {
             let providers = normalized
@@ -620,8 +785,9 @@ impl AnalyzerStore {
                 for row in &normalized {
                     if cancellation.is_cancelled() { return Ok(GoContextPublicationOutcome::Cancelled); }
                     let gaps = serde_json::to_string(&row.gaps).expect("Go package gap evidence is JSON");
-                    tx.execute("INSERT INTO go_package_instances(context_id,tool_import_path,package_name,for_test,provider_directory,provider_digest,complete,gaps,provider_kind,provider_module_path,provider_module_version,provider_provenance) VALUES(?1,?2,?3,?4,?5,?6,?7,jsonb(?8),?9,?10,?11,?12)",
-                        params![context_id,row.import_path,row.name,row.for_test,row.directory.to_string_lossy(),row.provider,row.complete,gaps,row.provider_kind,row.provider_module_path,row.provider_module_version,row.provider_provenance])?;
+                    let unit_key = go_package_unit_key(&row.import_path, &row.for_test, &row.files);
+                    tx.execute("INSERT INTO go_package_instances(context_id,tool_import_path,package_name,for_test,provider_directory,provider_digest,complete,gaps,provider_kind,provider_module_path,provider_module_version,provider_provenance,unit_key) VALUES(?1,?2,?3,?4,?5,?6,?7,jsonb(?8),?9,?10,?11,?12,?13)",
+                        params![context_id,row.import_path,row.name,row.for_test,row.directory.to_string_lossy(),row.provider,row.complete,gaps,row.provider_kind,row.provider_module_path,row.provider_module_version,row.provider_provenance,unit_key.as_slice()])?;
                     let package_id = tx.last_insert_rowid();
                     for (file,role) in &row.files { tx.execute("INSERT INTO go_package_files(package_id,file_version_id,source_role) VALUES(?1,?2,?3)",params![package_id,file,role])?; }
                 }
@@ -673,13 +839,38 @@ impl AnalyzerStore {
         root: &Path,
         cancellation: &CancellationToken,
     ) -> Result<GoContextPublicationOutcome> {
-        use serde_json::json;
-        use std::collections::{BTreeMap, BTreeSet};
         if cancellation.is_cancelled() {
             return Ok(GoContextPublicationOutcome::Cancelled);
         }
         let profile = source_inventory_profile();
         let expected = self.selected_go_context(&snapshot, &profile)?;
+        let Some(inventory) =
+            self.derive_go_source_context(&snapshot, root, cancellation, &|_| true)?
+        else {
+            return Ok(GoContextPublicationOutcome::Cancelled);
+        };
+        self.publish_normalized_go_context(
+            snapshot,
+            profile,
+            expected,
+            inventory.packages,
+            inventory.digest,
+            false,
+            inventory.gaps,
+            cancellation,
+        )
+    }
+
+    fn derive_go_source_context(
+        &self,
+        snapshot: &WorkspaceSnapshotId,
+        root: &Path,
+        cancellation: &CancellationToken,
+        admits: &impl Fn(&Path) -> bool,
+    ) -> Result<Option<GoSourceInventoryRows>> {
+        use serde_json::json;
+        use std::collections::{BTreeMap, BTreeSet};
+        let profile = source_inventory_profile();
         let conn = self.read_conn()?;
         let mut publication = CanonicalHasher::new(b"bifrost-go-source-inventory-publication:v2");
         publication.field("profile", &profile);
@@ -697,10 +888,13 @@ impl AnalyzerStore {
         ])?;
         while let Some(file) = files.next()? {
             if cancellation.is_cancelled() {
-                return Ok(GoContextPublicationOutcome::Cancelled);
+                return Ok(None);
             }
             let id: i64 = file.get(0)?;
             let path: String = file.get(1)?;
+            if !admits(&root.join(&path)) {
+                continue;
+            }
             let oid: String = file.get(2)?;
             let anchor: Option<String> = file.get(3)?;
             let blob: Option<i64> = file.get(4)?;
@@ -764,19 +958,12 @@ impl AnalyzerStore {
                 }
             });
             if file_has_build_constraints {
-                package.complete = false;
-                package.gaps.push(json!({
-                    "code":"source_file_build_selection_unavailable",
-                    "evidence":{"path":path}
-                }));
+                // The selected package profile determines which constrained
+                // files participate. Their presence in this source inventory
+                // is not itself a missing provider.
                 publication.field("build-constrained-file", path.as_bytes());
             }
             if build_selection_facts_version != GO_BUILD_SELECTION_FACTS_VERSION {
-                package.complete = false;
-                package.gaps.push(json!({
-                    "code":"source_build_constraint_facts_unavailable",
-                    "evidence":{"path":path,"version":build_selection_facts_version}
-                }));
                 publication.field(
                     "build-selection-facts-version",
                     &build_selection_facts_version.to_le_bytes(),
@@ -787,7 +974,7 @@ impl AnalyzerStore {
                 !cancellation.is_cancelled()
             })?
             else {
-                return Ok(GoContextPublicationOutcome::Cancelled);
+                return Ok(None);
             };
             for import in imports {
                 let Some(import_path) = import.path.filter(|path| !path.segments.is_empty()) else {
@@ -830,7 +1017,7 @@ impl AnalyzerStore {
         ])?;
         while let Some(row) = rows.next()? {
             if cancellation.is_cancelled() {
-                return Ok(GoContextPublicationOutcome::Cancelled);
+                return Ok(None);
             }
             publication.field("configuration-path", row.get::<_, String>(0)?.as_bytes());
             publication.field("configuration-oid", row.get::<_, String>(1)?.as_bytes());
@@ -865,16 +1052,11 @@ impl AnalyzerStore {
         }
         let digest = publication.finish();
         drop(conn);
-        self.publish_normalized_go_context(
-            snapshot,
-            profile,
-            expected,
-            packages.into_values().collect(),
+        Ok(Some(GoSourceInventoryRows {
+            packages: packages.into_values().collect(),
             digest,
-            false,
             gaps,
-            cancellation,
-        )
+        }))
     }
 }
 
@@ -996,6 +1178,102 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#5020: failed Go tool roots erased inventory placements while explicit exclusions must survive"
+    )]
+    fn failed_tool_root_keeps_inventory_without_overriding_file_records() {
+        let fixture = Fixture::from_project(
+            InlineTestProject::with_language(Language::Go)
+                .file("go.mod", "module example.test/root\n\ngo 1.22\n")
+                .file("consumer/use.go", "package consumer\nvar Use int\n")
+                .file("provider/item.go", "package provider\ntype Item struct{}\n")
+                .file(
+                    "provider/ignored.go",
+                    "//go:build ignore\n\npackage provider\nimport _ \"not-selected.test/ignored\"\nvar Ignored int\n",
+                )
+                .file(
+                    "provider/item_test.go",
+                    "package provider\nvar TestOnly int\n",
+                )
+                .build(),
+        );
+        let mut discovery = fixture.discovery();
+        discovery.workspace_patterns = vec!["./...".into()];
+        discovery.packages.remove(0);
+        discovery.packages[0]
+            .ignored_go_files
+            .push("ignored.go".into());
+        discovery.packages[0]
+            .test_go_files
+            .push("item_test.go".into());
+        discovery.packages.push(
+            serde_json::from_value(json!({
+                "ImportPath":"./...", "Dir":fixture.project.root(),
+                "Error":{"Err":"root package discovery failed"}, "Incomplete":true
+            }))
+            .unwrap(),
+        );
+        let identity = fixture.publish(discovery, None);
+        let conn = fixture.store().read_conn().unwrap();
+        let placements = conn
+            .prepare(
+                "SELECT f.rel_path,p.provider_provenance,p.complete,json(p.gaps)
+             FROM go_package_instances p JOIN go_package_files pf USING(package_id)
+             JOIN workspace_file_versions f USING(file_version_id)
+             WHERE p.context_id=?1 ORDER BY f.rel_path",
+            )
+            .unwrap()
+            .query_map([identity.context_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            placements
+                .iter()
+                .map(|row| row.0.as_str())
+                .collect::<Vec<_>>(),
+            ["consumer/use.go", "provider/item.go"]
+        );
+        assert_eq!(placements[0].1, "source_inventory");
+        assert!(
+            placements[0].2,
+            "root failure keeps the source-only provider completeness"
+        );
+        assert_eq!(placements[0].3, "[]");
+        let (failure_rows, context_evidence): (i64, String) = conn.query_row(
+            "SELECT (SELECT count(*) FROM go_package_instances WHERE context_id=?1 AND tool_import_path='./...'), json(gaps)
+             FROM go_context_publications WHERE context_id=?1",
+            [identity.context_id], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        assert_eq!(
+            failure_rows, 0,
+            "a failed root pattern is not a package provider"
+        );
+        assert!(context_evidence.contains("build_selection_unavailable"));
+        assert!(context_evidence.contains("root package discovery failed"));
+        let excluded_imports: i64 = conn.query_row(
+            "SELECT count(*) FROM go_package_imports WHERE context_id=?1 AND source_spelling='not-selected.test/ignored'",
+            [identity.context_id], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(
+            excluded_imports, 0,
+            "an excluded file cannot contribute import rows"
+        );
+        assert_eq!(placements[1].1, "go_tool");
+        assert!(
+            placements[1].2,
+            "another failed root must not poison a file the tool placed"
+        );
+    }
+
+    #[test]
     fn go_context_canonical_test_variants_use_compiled_files_and_exact_package_clauses() {
         let fixture = test_variant_fixture();
         let mut discovery = fixture.discovery();
@@ -1071,6 +1349,69 @@ mod tests {
         assert_eq!(mapped.1, "example.test/root/consumer");
         let description_only: i64 = conn.query_row("SELECT count(*) FROM go_package_imports WHERE context_id=?1 AND source_spelling='not-selected.test/description-only'",[identity.context_id],|row|row.get(0)).unwrap();
         assert_eq!(description_only, 0);
+        // The reverse qualified-import read seeks packages by this stored key, so
+        // it must be the key the summaries hash for the same package and role.
+        let mut keys = conn
+            .prepare("SELECT p.tool_import_path,p.for_test,p.unit_key,(SELECT group_concat(f.source_role) FROM go_package_files f WHERE f.package_id=p.package_id) FROM go_package_instances p WHERE p.context_id=?1")
+            .unwrap();
+        let stored = keys
+            .query_map([identity.context_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(stored.len() >= 3, "{stored:?}");
+        for (import_path, for_test, unit_key, roles) in stored {
+            let roles = roles.unwrap_or_default();
+            let role = if for_test.is_empty() {
+                "go"
+            } else if roles.split(',').any(|role| role == "xtest") {
+                "xtest"
+            } else {
+                "test"
+            };
+            assert_eq!(
+                unit_key,
+                go_unit_key(&import_path, &for_test, role).to_vec(),
+                "{import_path} [{for_test}] {role}"
+            );
+        }
+    }
+
+    #[brokk_bifrost_test_macros::hardwon(
+        "4ac3ba049d81: go list ordered DepsErrors differently on every run, so an unchanged tree republished with new digests"
+    )]
+    #[test]
+    fn go_context_publication_does_not_depend_on_the_tool_order_of_dependency_errors() {
+        let fixture = Fixture::new();
+        let errors = |order: [&str; 2]| {
+            let mut discovery = fixture.discovery();
+            discovery.packages[0].deps_errors = order
+                .into_iter()
+                .map(|err| {
+                    serde_json::from_value(
+                        json!({"Err": err, "ImportStack": ["example.test/root/consumer", err]}),
+                    )
+                    .unwrap()
+                })
+                .collect();
+            discovery
+        };
+        let first = fixture.publish(errors(["first failure", "second failure"]), None);
+        let second = fixture.publish(
+            errors(["second failure", "first failure"]),
+            Some(first.clone()),
+        );
+        assert_eq!(
+            first.publication_digest, second.publication_digest,
+            "the order of the tool's dependency errors is not an input"
+        );
     }
 
     #[test]
@@ -1317,7 +1658,10 @@ mod tests {
     }
 
     #[test]
-    fn go_source_inventory_keeps_known_files_when_build_selection_is_constrained() {
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2771: build-constrained Go files must not mark a provider inventory incomplete"
+    )]
+    fn go_source_inventory_keeps_build_constrained_files_without_an_inventory_gap() {
         let fixture = Fixture::from_project(
             InlineTestProject::with_language(Language::Go)
                 .file("go.mod", "module example.test/root\n\ngo 1.22\n")
@@ -1344,10 +1688,10 @@ mod tests {
             )
             .unwrap();
         assert!(
-            !constrained_complete,
-            "one constrained file opens its package inventory"
+            constrained_complete,
+            "selected package build constraints do not make the provider unavailable"
         );
-        assert!(constrained_gaps.contains("source_file_build_selection_unavailable"));
+        assert!(!constrained_gaps.contains("source_file_build_selection_unavailable"));
         let constrained_files: Vec<String> = conn
             .prepare(
                 "SELECT file.rel_path FROM go_context_source_files source JOIN workspace_file_versions file USING(file_version_id) JOIN go_package_instances package USING(package_id) WHERE source.context_id=?1 AND package.tool_import_path='example.test/root/pkg' ORDER BY file.rel_path",
@@ -1522,149 +1866,6 @@ mod tests {
         wrong.revision += 1;
         assert!(!go.activate_native_context_profile(&wrong, second_profile));
         assert_eq!(go.native_context_profile(), Some(first_profile));
-    }
-
-    #[test]
-    fn go_context_maps_source_spelling_and_keeps_missing_provider_partial() {
-        let fixture = Fixture::new();
-        let mut discovery = fixture.discovery();
-        discovery.packages[0].import_map.insert(
-            "visible/provider".into(),
-            "example.test/root/provider".into(),
-        );
-        discovery.packages[0]
-            .imports
-            .push("external/missing".into());
-        let identity = fixture.publish(discovery, None);
-        let conn = fixture.store().read_conn().unwrap();
-        let target: (String,bool) = conn.query_row("SELECT target.package_name,i.complete FROM go_package_imports i JOIN go_package_instances target ON target.package_id=i.target_package_id WHERE i.context_id=?1 AND i.source_spelling='visible/provider'",[identity.context_id],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
-        assert_eq!(target, ("provider".into(), true));
-        let missing: (Option<i64>,bool,String) = conn.query_row("SELECT target_package_id,complete,json(gaps) FROM go_package_imports WHERE context_id=?1 AND source_spelling='external/missing'",[identity.context_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
-        assert_eq!(missing.0, None);
-        assert!(!missing.1);
-        assert!(missing.2.contains("incomplete_import_provider"));
-        let member_count: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM go_context_source_files WHERE context_id=?1",
-                [identity.context_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(member_count, 2);
-    }
-
-    #[test]
-    fn go_context_publishes_fileless_standard_and_module_import_targets() {
-        let fixture = Fixture::new();
-        let mut discovery = fixture.discovery();
-        discovery.packages[0].imports = vec!["strings".into(), "example.com/dep/pkg".into()];
-        let standard_dir = fixture.project.root().join("external/stdlib/strings");
-        let module_dir = fixture.project.root().join("external/module-cache/dep/pkg");
-        discovery.packages.push(
-            serde_json::from_value(json!({
-                "ImportPath": "strings",
-                "Name": "strings",
-                "Dir": standard_dir,
-                "Standard": true,
-                "GoFiles": ["strings.go"]
-            }))
-            .unwrap(),
-        );
-        discovery.packages.push(
-            serde_json::from_value(json!({
-                "ImportPath": "example.com/dep/pkg",
-                "Name": "pkg",
-                "Dir": module_dir,
-                "Module": {
-                    "Path": "example.com/dep",
-                    "Version": "v1.2.3",
-                    "Sum": "h1:dep",
-                    "Dir": fixture.project.root().join("external/module-cache/dep"),
-                    "GoMod": fixture.project.root().join("external/module-cache/dep/go.mod"),
-                    "Main": false
-                },
-                "GoFiles": ["dep.go"]
-            }))
-            .unwrap(),
-        );
-
-        let identity = fixture.publish(discovery, None);
-        let conn = fixture.store().read_conn().unwrap();
-        let providers = conn
-            .prepare("SELECT tool_import_path,package_name,provider_kind,provider_module_path,provider_module_version,complete,json(gaps) FROM go_package_instances WHERE context_id=?1 AND provider_kind<>'workspace' ORDER BY tool_import_path")
-            .unwrap()
-            .query_map([identity.context_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, bool>(5)?,
-                    row.get::<_, String>(6)?,
-                ))
-            })
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        assert_eq!(
-            providers,
-            vec![
-                (
-                    "example.com/dep/pkg".into(),
-                    "pkg".into(),
-                    "module".into(),
-                    Some("example.com/dep".into()),
-                    Some("v1.2.3".into()),
-                    true,
-                    "[]".into(),
-                ),
-                (
-                    "strings".into(),
-                    "strings".into(),
-                    "standard".into(),
-                    None,
-                    None,
-                    true,
-                    "[]".into(),
-                ),
-            ]
-        );
-        let external_file_count: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM go_package_files files JOIN go_package_instances packages USING(package_id) WHERE packages.context_id=?1 AND packages.provider_kind<>'workspace'",
-                [identity.context_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(external_file_count, 0);
-        let complete: bool = conn
-            .query_row(
-                "SELECT complete FROM go_context_publications WHERE context_id=?1",
-                [identity.context_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(complete);
-        for spelling in ["strings", "example.com/dep/pkg"] {
-            let (name, import_path, complete): (String, String, bool) = conn
-                .query_row(
-                    "SELECT target.package_name,target.tool_import_path,imports.complete FROM go_package_imports imports JOIN go_package_instances target ON target.package_id=imports.target_package_id WHERE imports.context_id=?1 AND imports.source_spelling=?2",
-                    rusqlite::params![identity.context_id, spelling],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .unwrap();
-            assert!(complete, "{spelling}");
-            assert_eq!(
-                name,
-                if spelling == "strings" {
-                    "strings"
-                } else {
-                    "pkg"
-                }
-            );
-            assert_eq!(import_path, spelling);
-        }
     }
 
     #[test]
@@ -1883,5 +2084,148 @@ mod tests {
         assert!(
             matches!(result,Err(rusqlite::Error::SqliteFailure(error,_)) if error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY)
         );
+    }
+
+    #[test]
+    fn go_context_maps_source_spelling_and_keeps_missing_provider_partial() {
+        let fixture = Fixture::new();
+        let mut discovery = fixture.discovery();
+        discovery.packages[0].import_map.insert(
+            "visible/provider".into(),
+            "example.test/root/provider".into(),
+        );
+        discovery.packages[0]
+            .imports
+            .push("external/missing".into());
+        let identity = fixture.publish(discovery, None);
+        let conn = fixture.store().read_conn().unwrap();
+        let target: (String,bool) = conn.query_row("SELECT target.package_name,i.complete FROM go_package_imports i JOIN go_package_instances target ON target.package_id=i.target_package_id WHERE i.context_id=?1 AND i.source_spelling='visible/provider'",[identity.context_id],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
+        assert_eq!(target, ("provider".into(), true));
+        let missing: (Option<i64>,bool,String) = conn.query_row("SELECT target_package_id,complete,json(gaps) FROM go_package_imports WHERE context_id=?1 AND source_spelling='external/missing'",[identity.context_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+        assert_eq!(missing.0, None);
+        assert!(!missing.1);
+        assert!(missing.2.contains("incomplete_import_provider"));
+        let member_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM go_context_source_files WHERE context_id=?1",
+                [identity.context_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(member_count, 2);
+    }
+
+    #[test]
+    fn go_context_publishes_fileless_standard_and_module_import_targets() {
+        let fixture = Fixture::new();
+        let mut discovery = fixture.discovery();
+        discovery.packages[0].imports = vec!["strings".into(), "example.com/dep/pkg".into()];
+        let standard_dir = fixture.project.root().join("external/stdlib/strings");
+        let module_dir = fixture.project.root().join("external/module-cache/dep/pkg");
+        discovery.packages.push(
+            serde_json::from_value(json!({
+                "ImportPath": "strings",
+                "Name": "strings",
+                "Dir": standard_dir,
+                "Standard": true,
+                "GoFiles": ["strings.go"]
+            }))
+            .unwrap(),
+        );
+        discovery.packages.push(
+            serde_json::from_value(json!({
+                "ImportPath": "example.com/dep/pkg",
+                "Name": "pkg",
+                "Dir": module_dir,
+                "Module": {
+                    "Path": "example.com/dep",
+                    "Version": "v1.2.3",
+                    "Sum": "h1:dep",
+                    "Dir": fixture.project.root().join("external/module-cache/dep"),
+                    "GoMod": fixture.project.root().join("external/module-cache/dep/go.mod"),
+                    "Main": false
+                },
+                "GoFiles": ["dep.go"]
+            }))
+            .unwrap(),
+        );
+
+        let identity = fixture.publish(discovery, None);
+        let conn = fixture.store().read_conn().unwrap();
+        let providers = conn
+            .prepare("SELECT tool_import_path,package_name,provider_kind,provider_module_path,provider_module_version,complete,json(gaps) FROM go_package_instances WHERE context_id=?1 AND provider_kind<>'workspace' ORDER BY tool_import_path")
+            .unwrap()
+            .query_map([identity.context_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, bool>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            providers,
+            vec![
+                (
+                    "example.com/dep/pkg".into(),
+                    "pkg".into(),
+                    "module".into(),
+                    Some("example.com/dep".into()),
+                    Some("v1.2.3".into()),
+                    true,
+                    "[]".into(),
+                ),
+                (
+                    "strings".into(),
+                    "strings".into(),
+                    "standard".into(),
+                    None,
+                    None,
+                    true,
+                    "[]".into(),
+                ),
+            ]
+        );
+        let external_file_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM go_package_files files JOIN go_package_instances packages USING(package_id) WHERE packages.context_id=?1 AND packages.provider_kind<>'workspace'",
+                [identity.context_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(external_file_count, 0);
+        let complete: bool = conn
+            .query_row(
+                "SELECT complete FROM go_context_publications WHERE context_id=?1",
+                [identity.context_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(complete);
+        for spelling in ["strings", "example.com/dep/pkg"] {
+            let (name, import_path, complete): (String, String, bool) = conn
+                .query_row(
+                    "SELECT target.package_name,target.tool_import_path,imports.complete FROM go_package_imports imports JOIN go_package_instances target ON target.package_id=imports.target_package_id WHERE imports.context_id=?1 AND imports.source_spelling=?2",
+                    rusqlite::params![identity.context_id, spelling],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert!(complete, "{spelling}");
+            assert_eq!(
+                name,
+                if spelling == "strings" {
+                    "strings"
+                } else {
+                    "pkg"
+                }
+            );
+            assert_eq!(import_path, spelling);
+        }
     }
 }

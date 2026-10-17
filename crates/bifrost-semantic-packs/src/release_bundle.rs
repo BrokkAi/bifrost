@@ -72,6 +72,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::{NamedTempFile, tempdir};
 
+#[cfg(test)]
+use brokk_bifrost_analysis::analyzer::semantic_model::{NameSelector, VersionConstraint};
+
 #[cfg(feature = "download")]
 use brokk_bifrost_analysis::analyzer::semantic_model::AcquisitionReceiptRequest;
 
@@ -502,6 +505,12 @@ pub(crate) struct VerifiedReleaseBundle {
     generated_packs: Vec<Option<CompiledSemanticModelPack>>,
 }
 
+struct VerifiedBundleHeader {
+    index: ReleaseBundleIndex,
+    generated_reuse: Vec<GeneratedProductionReuse>,
+    rejects: ReleaseBundleRejects,
+}
+
 /// Acquisition verified the whole release envelope, but decoded only packs
 /// that can satisfy this exact request. It cannot be passed to the exhaustive
 /// release installer or used as a proof for another request.
@@ -585,6 +594,102 @@ pub struct ReleaseLookupMeasurement {
     pub records: u64,
 }
 
+#[cfg(test)]
+pub(crate) fn jdk_generated_bundle_input(
+    fixture_root: &Path,
+    version: &str,
+    activation_requirement: &str,
+) -> (BundleInput, String) {
+    let artifact_path = fixture_root.join("src.zip");
+    crate::zip_test_support::write_zip_unwrap(
+        &artifact_path,
+        &[
+            (
+                "java.base/module-info.java",
+                "module java.base { exports java.lang; }",
+            ),
+            (
+                "java.base/java/lang/Object.java",
+                "package java.lang; public class Object { public int hashCode() { return 0; } }",
+            ),
+        ],
+        zip::write::SimpleFileOptions::default(),
+    );
+    fs::write(fixture_root.join("NOTICE.txt"), "fixture notice\n").unwrap();
+    let (artifact_sha256, _) = sha256_file(&artifact_path).unwrap();
+    let activation = ActivationSelector {
+        package: None,
+        module: None,
+        toolchain: Some(NameSelector {
+            name: "jdk".to_owned(),
+            version: Some(activation_requirement.to_owned()),
+        }),
+        targets: vec!["jvm".to_owned()],
+        configurations: Vec::new(),
+        artifact_sha256: None,
+    };
+    let measurement_activation = ActivationSelector {
+        package: None,
+        module: Some(NameSelector {
+            name: "java.base".to_owned(),
+            version: None,
+        }),
+        toolchain: Some(NameSelector {
+            name: "jdk".to_owned(),
+            version: Some(format!("={version}")),
+        }),
+        targets: vec!["jvm".to_owned()],
+        configurations: Vec::new(),
+        artifact_sha256: None,
+    };
+    let pinned = PinnedPackSpec {
+        schema_version: PACK_SPEC_SCHEMA_VERSION,
+        pack_id: "bifrost.jdk".to_owned(),
+        pack_version: version.to_owned(),
+        ecosystem: "jdk".to_owned(),
+        kind: PinnedPackKind::JdkSourceZip {
+            layout: PinnedJdkSourceLayout::ModulePrefixed,
+        },
+        artifact: PinnedArtifact {
+            file_name: "src.zip".to_owned(),
+            sha256: artifact_sha256.clone(),
+            url: Some("https://example.invalid/src.zip".to_owned()),
+            container: None,
+        },
+        compatibility: Compatibility {
+            bifrost: None,
+            toolchains: vec![VersionConstraint {
+                name: "jdk".to_owned(),
+                requirement: format!("={version}"),
+            }],
+        },
+        activation: vec![activation],
+        provenance: Provenance {
+            source: "fixture".to_owned(),
+            revision: Some("fixture-v1".to_owned()),
+        },
+        license: "GPL-2.0-only WITH Classpath-exception-2.0".to_owned(),
+        safety: Safety {
+            generated_code_only: false,
+            review_required: false,
+        },
+        notices: vec!["NOTICE.txt".to_owned()],
+        measurement_activation,
+        measurement_queries: vec![PinnedLookupQuery::Type {
+            name: "java.lang.Object".to_owned(),
+        }],
+    };
+    let spec_path = fixture_root.join("temurin-jdk.json");
+    fs::write(&spec_path, serde_json::to_vec_pretty(&pinned).unwrap()).unwrap();
+    (
+        BundleInput {
+            spec_path,
+            artifact_path,
+        },
+        artifact_sha256,
+    )
+}
+
 struct RuntimeMeasurement {
     activation_micros: u64,
     activation_selection_nanos: u64,
@@ -629,7 +734,7 @@ impl BundleError {
 
 impl Display for BundleError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+        crate::fmt_string_error(&self.0, formatter)
     }
 }
 
@@ -712,7 +817,7 @@ pub fn generate_release_bundle(
         &json_bytes(&measurements)?,
     )?;
     write_checksums(output_root, &index)?;
-    verify_current_release_bundle(output_root)
+    verify_release_bundle_for_generation(output_root, GENERATED_PRODUCTION_CACHE_VERSION)
 }
 
 fn read_and_validate_spec(spec_path: &Path) -> Result<PinnedPackSpec, BundleError> {
@@ -1902,7 +2007,12 @@ fn measure_runtime(
             toolchain: selector.toolchain.as_ref().map(catalog_coordinate),
             target,
             configuration,
-            artifact_sha256: Some(spec.artifact.sha256.clone()),
+            artifact_sha256: Some(
+                selector
+                    .artifact_sha256
+                    .clone()
+                    .unwrap_or_else(|| spec.artifact.sha256.clone()),
+            ),
         })
         .collect();
     let request = SemanticModelActivationRequest {
@@ -2086,7 +2196,7 @@ fn lookup_record_count(active: &ResolvedActiveSemanticModels, query: &PinnedLook
 }
 
 pub fn verify_release_bundle(output_root: &Path) -> Result<ReleaseBundle, BundleError> {
-    verify_current_release_bundle(output_root)
+    verify_release_bundle_for_generation(output_root, GENERATED_PRODUCTION_CACHE_VERSION)
 }
 
 #[cfg(test)]
@@ -2100,21 +2210,11 @@ fn verify_release_bundle_for_cache_version(
     output_root: &Path,
     current_cache_version: u32,
 ) -> Result<VerifiedReleaseBundle, BundleError> {
-    assert!(
-        current_cache_version > 0,
-        "generated cache version is nonzero"
-    );
-    let index = read_release_bundle_index(output_root)?;
-    // The compatibility decision is index-level and runs beside the gates
-    // above, before any asset is read: a bundle whose generated schema this
-    // build cannot decode fails here, without the whole-bundle checksum pass
-    // or any manifest and shard decode (#3364).
-    let generated_reuse =
-        generated_production_reuse(&index.generated_productions, current_cache_version)?;
-    verify_checksums(output_root, &index)?;
-    let rejects = verify_rejects(output_root, &index)?;
-    let measurements_path = safe_asset_path(output_root, Path::new("measurements.json"))?;
-    verify_measurements(&measurements_path, &index)?;
+    let VerifiedBundleHeader {
+        index,
+        generated_reuse,
+        rejects,
+    } = verify_release_bundle_header(output_root, current_cache_version)?;
     let mut curated_packs = Vec::with_capacity(index.packs.len());
     for pack in &index.packs {
         let compiled =
@@ -2147,15 +2247,11 @@ pub(crate) fn verify_release_bundle_for_acquisition(
     output_root: &Path,
     request: &AcquisitionReceiptRequest,
 ) -> Result<VerifiedAcquisitionBundle, BundleError> {
-    let index = read_release_bundle_index(output_root)?;
-    let generated_reuse = generated_production_reuse(
-        &index.generated_productions,
-        GENERATED_PRODUCTION_CACHE_VERSION,
-    )?;
-    verify_checksums(output_root, &index)?;
-    let rejects = verify_rejects(output_root, &index)?;
-    let measurements_path = safe_asset_path(output_root, Path::new("measurements.json"))?;
-    verify_measurements(&measurements_path, &index)?;
+    let VerifiedBundleHeader {
+        index,
+        generated_reuse,
+        rejects,
+    } = verify_release_bundle_header(output_root, GENERATED_PRODUCTION_CACHE_VERSION)?;
 
     let mut curated_packs = Vec::new();
     for (position, pack) in index.packs.iter().enumerate() {
@@ -2316,8 +2412,28 @@ fn generated_production_reuse(
         .collect()
 }
 
-fn verify_current_release_bundle(output_root: &Path) -> Result<ReleaseBundle, BundleError> {
-    verify_release_bundle_for_generation(output_root, GENERATED_PRODUCTION_CACHE_VERSION)
+fn verify_release_bundle_header(
+    output_root: &Path,
+    current_cache_version: u32,
+) -> Result<VerifiedBundleHeader, BundleError> {
+    assert!(
+        current_cache_version > 0,
+        "generated cache version is nonzero"
+    );
+    let index = read_release_bundle_index(output_root)?;
+    // This compatibility decision and the shared integrity gates run before
+    // any manifest or shard decode (#3364).
+    let generated_reuse =
+        generated_production_reuse(&index.generated_productions, current_cache_version)?;
+    verify_checksums(output_root, &index)?;
+    let rejects = verify_rejects(output_root, &index)?;
+    let measurements_path = safe_asset_path(output_root, Path::new("measurements.json"))?;
+    verify_measurements(&measurements_path, &index)?;
+    Ok(VerifiedBundleHeader {
+        index,
+        generated_reuse,
+        rejects,
+    })
 }
 
 fn verify_release_bundle_for_generation(
@@ -2675,7 +2791,7 @@ fn verify_generated_production_identity(
         &generated.pack_version,
         &generated.rejects,
     )?;
-    let extraction = generated_extraction_accounting(generated);
+    let extraction = extraction_accounting(&generated.rejects, generated.suppressed_rejects);
     if !pack_rejects_are_warning_only(&extraction) {
         return Err(BundleError::new(
             "generated production has error-grade extraction rejects",
@@ -2740,9 +2856,11 @@ fn verify_generated_manifest_metadata(
         || manifest.semantic_sha256 != generated.manifest_semantic_sha256
         || manifest.content_sha256 != generated.manifest_content_sha256
         || manifest.completeness != generated.completeness
-        || manifest.producer.name != generated.producer_name
-        || manifest.producer.version != generated.producer_version
-        || manifest.schema_version != generated.schema_version
+        || !manifest.matches_generated_identity(
+            &generated.producer_name,
+            &generated.producer_version,
+            generated.schema_version,
+        )
     {
         return Err(BundleError::new(
             "generated production index metadata does not match its manifest",
@@ -2788,7 +2906,8 @@ fn verify_rejects(
     }
     for (pack, pack_rejects) in index.packs.iter().zip(&rejects.packs) {
         validate_release_reject_subjects(&pack.pack_id, &pack.pack_version, &pack_rejects.rejects)?;
-        let extraction = release_extraction_accounting(pack_rejects);
+        let extraction =
+            extraction_accounting(&pack_rejects.rejects, pack_rejects.suppressed_rejects);
         if !pack_rejects_are_warning_only(&extraction) {
             return Err(BundleError::new(format!(
                 "release pack {}@{} has error-grade extraction rejects",
@@ -2845,16 +2964,6 @@ fn require_canonical_source_entry(source_entry: &str) -> Result<(), BundleError>
         )));
     }
     Ok(())
-}
-
-fn release_extraction_accounting(rejects: &ReleasePackRejects) -> PackExtractionAccounting {
-    extraction_accounting(&rejects.rejects, rejects.suppressed_rejects)
-}
-
-fn generated_extraction_accounting(
-    generated: &ReleaseGeneratedProduction,
-) -> PackExtractionAccounting {
-    extraction_accounting(&generated.rejects, generated.suppressed_rejects)
 }
 
 fn extraction_accounting(
@@ -2995,7 +3104,7 @@ pub(crate) fn install_verified_acquisition_bundle(
                 release,
                 &compiled,
                 &source,
-                &release_extraction_accounting(rejects),
+                &extraction_accounting(&rejects.rejects, rejects.suppressed_rejects),
             )
             .map_err(|error| {
                 BundleError::new(format!(
@@ -3029,7 +3138,7 @@ pub(crate) fn install_verified_acquisition_bundle(
                 &key,
                 &compiled,
                 &source,
-                &generated_extraction_accounting(generated),
+                &extraction_accounting(&generated.rejects, generated.suppressed_rejects),
             )
             .map_err(|error| {
                 BundleError::new(format!(
@@ -3066,7 +3175,7 @@ fn install_verified_release_bundle(
         .zip(&bundle.rejects.packs)
         .zip(curated_packs)
         .map(|((pack, rejects), compiled)| {
-            let extraction = release_extraction_accounting(rejects);
+            let extraction = extraction_accounting(&rejects.rejects, rejects.suppressed_rejects);
             let source = DurablePackSource {
                 kind: DurablePackSourceKind::PreShipped,
                 source_id: format!(
@@ -3136,7 +3245,7 @@ fn install_verified_release_bundle(
                 generated.production_digest
             ),
         };
-        let extraction = generated_extraction_accounting(generated);
+        let extraction = extraction_accounting(&generated.rejects, generated.suppressed_rejects);
         let (installation, generated_sources) = if let Some(release) = receipt_release {
             let (installation, sources) = catalog
                 .install_release_generated_for_receipt(
@@ -3670,7 +3779,7 @@ fn sha256_file(path: &Path) -> Result<(String, u64), BundleError> {
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    brokk_bifrost_analysis::analyzer::semantic_model::csmi::sha256_hex(bytes)
 }
 
 fn json_bytes(value: &impl Serialize) -> Result<Vec<u8>, BundleError> {
@@ -3693,8 +3802,10 @@ mod tests {
     use super::*;
     use brokk_bifrost_analysis::analyzer::semantic_model::AuthoredPayload;
     use brokk_bifrost_analysis::analyzer::semantic_model::{NameSelector, VersionConstraint};
+    use brokk_bifrost_analysis::test_support::ruby_gem_archive;
+    use brokk_bifrost_analysis::test_support::write_zip;
+    use brokk_bifrost_test_macros::hardwon;
     use tempfile::tempdir;
-    use zip::write::SimpleFileOptions;
 
     fn selector(package: &str, toolchain: &str, version: &str) -> ActivationSelector {
         ActivationSelector {
@@ -3894,96 +4005,69 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#3543: release measurement ignored the selector's pinned artifact digest")]
+    fn authored_model_measurement_uses_external_artifact_pin() {
+        let mut spec: PinnedPackSpec = serde_json::from_str(include_str!(
+            "../../../semantic-packs/python/unittest-assertions-2026.9.7.spec.json"
+        ))
+        .unwrap();
+        let mut authored: AuthoredSemanticModelPack = serde_json::from_slice(include_bytes!(
+            "../../../semantic-packs/python/unittest-assertions-2026.9.7.json"
+        ))
+        .unwrap();
+        let external_artifact_sha256 = "a".repeat(64);
+        spec.activation[0].artifact_sha256 = Some(external_artifact_sha256.clone());
+        spec.measurement_activation.artifact_sha256 = Some(external_artifact_sha256.clone());
+        for shard in &mut authored.shards {
+            shard.activation = spec.activation.clone();
+        }
+        let authored_bytes = serde_json::to_vec_pretty(&authored).unwrap();
+        spec.artifact.file_name = "external-artifact-model.json".to_owned();
+        spec.artifact.sha256 = sha256_bytes(&authored_bytes);
+        spec.notices = vec!["NOTICE.txt".to_owned()];
+        assert_ne!(spec.artifact.sha256, external_artifact_sha256);
+
+        let fixture = tempdir().unwrap();
+        fs::write(fixture.path().join("NOTICE.txt"), "fixture notice\n").unwrap();
+        let artifact_path = fixture.path().join(&spec.artifact.file_name);
+        fs::write(&artifact_path, authored_bytes).unwrap();
+        let spec_path = fixture.path().join("external-artifact-model.spec.json");
+        fs::write(&spec_path, serde_json::to_vec_pretty(&spec).unwrap()).unwrap();
+
+        let bundle = generate_release_bundle(
+            &fixture.path().join("bundle"),
+            &[BundleInput {
+                spec_path,
+                artifact_path,
+            }],
+        )
+        .unwrap();
+        assert_eq!(bundle.index.packs.len(), 1);
+        let measurements: ReleaseBundleMeasurements = serde_json::from_slice(
+            &fs::read(fixture.path().join("bundle/measurements.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(measurements.packs.len(), 1);
+        assert!(
+            measurements.packs[0]
+                .lookups
+                .iter()
+                .all(|lookup| lookup.records > 0)
+        );
+    }
+
+    #[test]
     fn jdk_generated_production_is_deterministic_verifiable_and_installable() {
         let fixture = tempdir().unwrap();
-        let artifact = fixture.path().join("src.zip");
-        write_zip(
-            &artifact,
-            &[
-                (
-                    "java.base/module-info.java",
-                    "module java.base { exports java.lang; }",
-                ),
-                (
-                    "java.base/java/lang/Object.java",
-                    "package java.lang; public class Object { public int hashCode() { return 0; } }",
-                ),
-            ],
-        );
-        fs::write(fixture.path().join("NOTICE.txt"), "fixture notice\n").unwrap();
-        let (artifact_sha256, _) = sha256_file(&artifact).unwrap();
-        let artifact_path = artifact.clone();
         let version = "21.0.8";
-        let activation = ActivationSelector {
-            package: None,
-            module: None,
-            toolchain: Some(NameSelector {
-                name: "jdk".to_owned(),
-                version: Some(format!("={version}")),
-            }),
-            targets: vec!["jvm".to_owned()],
-            configurations: Vec::new(),
-            artifact_sha256: None,
-        };
-        let spec = fixture.path().join("temurin-jdk.json");
-        let pinned = PinnedPackSpec {
-            schema_version: PACK_SPEC_SCHEMA_VERSION,
-            pack_id: "bifrost.jdk".to_owned(),
-            pack_version: version.to_owned(),
-            ecosystem: "jdk".to_owned(),
-            kind: PinnedPackKind::JdkSourceZip {
-                layout: PinnedJdkSourceLayout::ModulePrefixed,
-            },
-            artifact: PinnedArtifact {
-                file_name: "src.zip".to_owned(),
-                sha256: artifact_sha256.clone(),
-                url: Some("https://example.invalid/src.zip".to_owned()),
-                container: None,
-            },
-            compatibility: Compatibility {
-                bifrost: None,
-                toolchains: vec![VersionConstraint {
-                    name: "jdk".to_owned(),
-                    requirement: format!("={version}"),
-                }],
-            },
-            activation: vec![ActivationSelector {
-                toolchain: Some(NameSelector {
-                    name: "jdk".to_owned(),
-                    version: Some(">=21.0.0, <22.0.0".to_owned()),
-                }),
-                ..activation.clone()
-            }],
-            provenance: Provenance {
-                source: "fixture".to_owned(),
-                revision: Some("fixture-v1".to_owned()),
-            },
-            license: "GPL-2.0-only WITH Classpath-exception-2.0".to_owned(),
-            safety: Safety {
-                generated_code_only: false,
-                review_required: false,
-            },
-            notices: vec!["NOTICE.txt".to_owned()],
-            measurement_activation: ActivationSelector {
-                module: Some(NameSelector {
-                    name: "java.base".to_owned(),
-                    version: None,
-                }),
-                ..activation
-            },
-            measurement_queries: vec![PinnedLookupQuery::Type {
-                name: "java.lang.Object".to_owned(),
-            }],
-        };
-        fs::write(&spec, serde_json::to_vec_pretty(&pinned).unwrap()).unwrap();
-        let input = BundleInput {
-            spec_path: spec,
-            artifact_path: artifact,
-        };
+        let (input, artifact_sha256) =
+            jdk_generated_bundle_input(fixture.path(), version, ">=21.0.0, <22.0.0");
+        let pinned = read_and_validate_spec(&input.spec_path).unwrap();
+        let artifact_path = input.artifact_path.clone();
         let first = fixture.path().join("first");
         let second = fixture.path().join("second");
         let first_bundle = generate_release_bundle(&first, std::slice::from_ref(&input)).unwrap();
-        let second_bundle = generate_release_bundle(&second, &[input]).unwrap();
+        let second_bundle = generate_release_bundle(&second, std::slice::from_ref(&input)).unwrap();
         assert_deterministic_and_installable(&first, &second, &first_bundle, &second_bundle);
         let measurements: ReleaseBundleMeasurements =
             serde_json::from_slice(&fs::read(first.join("measurements.json")).unwrap()).unwrap();
@@ -4003,7 +4087,8 @@ mod tests {
         // rejects than that would ship with suppressed rejects and fewer
         // named gaps than the reject count -- exactly the shape
         // `warning_only_and_fully_accounted` exists to catch.
-        let generated_accounting = generated_extraction_accounting(generated);
+        let generated_accounting =
+            extraction_accounting(&generated.rejects, generated.suppressed_rejects);
         assert_eq!(generated_accounting.suppressed_reject_count, 0);
         assert_eq!(
             generated_accounting.gaps.len() as u64,
@@ -4453,6 +4538,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#3364: incompatible generated schemas must fail before any release asset is read")]
     fn an_undecodable_generated_schema_is_reported_before_any_asset_is_read() {
         let (_guard, root) = index_only_bundle(
             SEMANTIC_MODEL_SCHEMA_VERSION + 1,
@@ -4468,6 +4554,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#3364: stale generated productions must be rejected before asset reads")]
     fn a_stale_generated_production_is_reported_before_any_asset_is_read() {
         let (_guard, root) = index_only_bundle(
             SEMANTIC_MODEL_SCHEMA_VERSION,
@@ -4487,6 +4574,7 @@ mod tests {
     /// index-level currency gate, the same bundle paid that decode and then
     /// failed the manifest cross-check.
     #[test]
+    #[hardwon("#3364: verification must not decode stale generated artifacts")]
     fn a_stale_generated_production_is_not_decoded_during_verification() {
         let fixture = tempdir().unwrap();
         let artifact = fixture.path().join("src.zip");
@@ -4631,6 +4719,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#2756+#2761+243a9c9ad553: rejected source entries must remain fully accounted before a curated pack activates"
+    )]
     fn partial_curated_pack_with_an_unnamed_reject_fails_the_activability_gate() {
         // A warning that the JDK source producer cannot attach an accountable
         // declaration or source-entry identity
@@ -4783,37 +4874,19 @@ mod tests {
         assert_eq!(first_bundle.rejects.packs.len(), 1);
         assert!(first_bundle.rejects.packs[0].rejects.is_empty());
         assert_eq!(first_bundle.rejects.packs[0].suppressed_rejects, 0);
-        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
-        let installed = install_release_bundle(&first, &catalog).unwrap();
-        assert_eq!(installed.len(), 1);
-        let SemanticModelResolutionOutcome::Ready(active) = resolve_active_semantic_models(
-            &catalog,
-            &SemanticModelActivationRequest {
-                bifrost_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
-                evidence: vec![SemanticModelActivationEvidence {
-                    language: "scala".to_owned(),
-                    ecosystem: "maven".to_owned(),
-                    package: Some(CatalogCoordinate {
-                        name: "org.scala-lang:scala-library".to_owned(),
-                        version: Some(Version::parse("2.13.16").unwrap()),
-                    }),
-                    module: None,
-                    toolchain: Some(CatalogCoordinate {
-                        name: "scala".to_owned(),
-                        version: Some(Version::parse("2.13.16").unwrap()),
-                    }),
-                    target: Some("jvm".to_owned()),
-                    configuration: None,
-                    artifact_sha256: Some(first_bundle.index.packs[0].artifact.sha256.clone()),
-                }],
-                controls: Vec::new(),
-                limits: Default::default(),
-            },
-            &CancellationToken::default(),
-        ) else {
-            panic!("installed release pack must resolve through normal activation");
-        };
-        assert_eq!(active.types_named("scala.Any").records.len(), 1);
+        assert_installed_bundle_resolves_type(
+            &first,
+            package_activation_request(
+                "scala",
+                "maven",
+                "org.scala-lang:scala-library",
+                "scala",
+                "2.13.16",
+                Some("jvm"),
+                Some(first_bundle.index.packs[0].artifact.sha256.clone()),
+            ),
+            "scala.Any",
+        );
         fs::write(first.join("SHA256SUMS"), "invalid\n").unwrap();
         assert!(verify_release_bundle(&first).is_err());
     }
@@ -5017,6 +5090,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "2788d5cb274e: the release measurement selector must activate every selected configuration shard"
+    )]
     fn reviewed_typescript_measurement_enables_all_selected_configuration_shards() {
         let fixture = tempdir().unwrap();
         let root = fixture.path().join("typescript-7.0.2");
@@ -5183,6 +5259,7 @@ mod tests {
     /// authored semantic-model pack with its `.spec.json`, so "every JSON file
     /// is a pinned spec" is not true there.
     #[test]
+    #[hardwon("#3465: shipped pack specs must use bounded compatible version ranges")]
     fn checked_in_pinned_specs_parse_and_validate_through_release_tooling() {
         let semantic_packs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../semantic-packs");
         for ecosystem in ["jvm", "php", "typescript", "rust"] {
@@ -5209,6 +5286,55 @@ mod tests {
                 validate_spec(&spec, &path)
                     .unwrap_or_else(|error| panic!("validate {}: {error}", path.display()));
             }
+        }
+    }
+
+    fn assert_installed_bundle_resolves_type(
+        output_root: &Path,
+        request: SemanticModelActivationRequest,
+        type_name: &str,
+    ) {
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let installed = install_release_bundle(output_root, &catalog).unwrap();
+        assert_eq!(installed.len(), 1);
+        let SemanticModelResolutionOutcome::Ready(active) =
+            resolve_active_semantic_models(&catalog, &request, &CancellationToken::default())
+        else {
+            panic!("installed release pack must resolve through normal activation");
+        };
+        assert_eq!(active.types_named(type_name).records.len(), 1);
+    }
+
+    fn package_activation_request(
+        language: &str,
+        ecosystem: &str,
+        package: &str,
+        toolchain: &str,
+        version: &str,
+        target: Option<&str>,
+        artifact_sha256: Option<String>,
+    ) -> SemanticModelActivationRequest {
+        let version = Version::parse(version).unwrap();
+        SemanticModelActivationRequest {
+            bifrost_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
+            evidence: vec![SemanticModelActivationEvidence {
+                language: language.to_owned(),
+                ecosystem: ecosystem.to_owned(),
+                package: Some(CatalogCoordinate {
+                    name: package.to_owned(),
+                    version: Some(version.clone()),
+                }),
+                module: None,
+                toolchain: Some(CatalogCoordinate {
+                    name: toolchain.to_owned(),
+                    version: Some(version),
+                }),
+                target: target.map(str::to_owned),
+                configuration: None,
+                artifact_sha256,
+            }],
+            controls: Vec::new(),
+            limits: Default::default(),
         }
     }
 
@@ -5312,37 +5438,19 @@ mod tests {
         let pack = &first_bundle.index.packs[0];
         assert_eq!(pack.language, "ruby");
         assert_eq!(pack.completeness, Completeness::Complete);
-        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
-        let installed = install_release_bundle(&first, &catalog).unwrap();
-        assert_eq!(installed.len(), 1);
-        let SemanticModelResolutionOutcome::Ready(active) = resolve_active_semantic_models(
-            &catalog,
-            &SemanticModelActivationRequest {
-                bifrost_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
-                evidence: vec![SemanticModelActivationEvidence {
-                    language: "ruby".to_owned(),
-                    ecosystem: "rubygems".to_owned(),
-                    package: Some(CatalogCoordinate {
-                        name: "widget".to_owned(),
-                        version: Some(Version::parse("1.2.3").unwrap()),
-                    }),
-                    module: None,
-                    toolchain: Some(CatalogCoordinate {
-                        name: "ruby".to_owned(),
-                        version: Some(Version::parse("1.2.3").unwrap()),
-                    }),
-                    target: Some("ruby".to_owned()),
-                    configuration: None,
-                    artifact_sha256: Some(first_bundle.index.packs[0].artifact.sha256.clone()),
-                }],
-                controls: Vec::new(),
-                limits: Default::default(),
-            },
-            &CancellationToken::default(),
-        ) else {
-            panic!("installed Ruby gem pack must resolve through normal activation");
-        };
-        assert_eq!(active.types_named("Widget").records.len(), 1);
+        assert_installed_bundle_resolves_type(
+            &first,
+            package_activation_request(
+                "ruby",
+                "rubygems",
+                "widget",
+                "ruby",
+                "1.2.3",
+                Some("ruby"),
+                Some(first_bundle.index.packs[0].artifact.sha256.clone()),
+            ),
+            "Widget",
+        );
     }
 
     #[test]
@@ -5410,37 +5518,19 @@ mod tests {
         let pack = &first_bundle.index.packs[0];
         assert_eq!(pack.language, "typescript");
         assert_eq!(pack.completeness, Completeness::Complete);
-        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
-        let installed = install_release_bundle(&first, &catalog).unwrap();
-        assert_eq!(installed.len(), 1);
-        let SemanticModelResolutionOutcome::Ready(active) = resolve_active_semantic_models(
-            &catalog,
-            &SemanticModelActivationRequest {
-                bifrost_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
-                evidence: vec![SemanticModelActivationEvidence {
-                    language: "typescript".to_owned(),
-                    ecosystem: "npm".to_owned(),
-                    package: Some(CatalogCoordinate {
-                        name: "widget".to_owned(),
-                        version: Some(Version::parse("1.2.3").unwrap()),
-                    }),
-                    module: None,
-                    toolchain: Some(CatalogCoordinate {
-                        name: "node".to_owned(),
-                        version: Some(Version::parse("1.2.3").unwrap()),
-                    }),
-                    target: None,
-                    configuration: None,
-                    artifact_sha256: Some(artifact_sha256),
-                }],
-                controls: Vec::new(),
-                limits: Default::default(),
-            },
-            &CancellationToken::default(),
-        ) else {
-            panic!("installed npm declaration pack must resolve through normal activation");
-        };
-        assert_eq!(active.types_named("widget.Widget").records.len(), 1);
+        assert_installed_bundle_resolves_type(
+            &first,
+            package_activation_request(
+                "typescript",
+                "npm",
+                "widget",
+                "node",
+                "1.2.3",
+                None,
+                Some(artifact_sha256),
+            ),
+            "widget.Widget",
+        );
     }
 
     #[test]
@@ -5503,42 +5593,18 @@ mod tests {
         let pack = &first_bundle.index.packs[0];
         assert_eq!(pack.language, "go");
         assert_eq!(pack.completeness, Completeness::Complete);
-        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
-        let installed = install_release_bundle(&first, &catalog).unwrap();
-        assert_eq!(installed.len(), 1);
-        let SemanticModelResolutionOutcome::Ready(active) = resolve_active_semantic_models(
-            &catalog,
-            &SemanticModelActivationRequest {
-                bifrost_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
-                evidence: vec![SemanticModelActivationEvidence {
-                    language: "go".to_owned(),
-                    ecosystem: "go".to_owned(),
-                    package: Some(CatalogCoordinate {
-                        name: "example.com/widget".to_owned(),
-                        version: Some(Version::parse("1.2.3").unwrap()),
-                    }),
-                    module: None,
-                    toolchain: Some(CatalogCoordinate {
-                        name: "go".to_owned(),
-                        version: Some(Version::parse("1.2.3").unwrap()),
-                    }),
-                    target: None,
-                    configuration: None,
-                    artifact_sha256: Some(artifact_sha256),
-                }],
-                controls: Vec::new(),
-                limits: Default::default(),
-            },
-            &CancellationToken::default(),
-        ) else {
-            panic!("installed Go module pack must resolve through normal activation");
-        };
-        assert_eq!(
-            active
-                .types_named("example.com/widget.Widget")
-                .records
-                .len(),
-            1
+        assert_installed_bundle_resolves_type(
+            &first,
+            package_activation_request(
+                "go",
+                "go",
+                "example.com/widget",
+                "go",
+                "1.2.3",
+                None,
+                Some(artifact_sha256),
+            ),
+            "example.com/widget.Widget",
         );
     }
 
@@ -5601,40 +5667,23 @@ mod tests {
         let pack = &first_bundle.index.packs[0];
         assert_eq!(pack.language, "php");
         assert_eq!(pack.completeness, Completeness::Complete);
-        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
-        let installed = install_release_bundle(&first, &catalog).unwrap();
-        assert_eq!(installed.len(), 1);
-        let SemanticModelResolutionOutcome::Ready(active) = resolve_active_semantic_models(
-            &catalog,
-            &SemanticModelActivationRequest {
-                bifrost_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
-                evidence: vec![SemanticModelActivationEvidence {
-                    language: "php".to_owned(),
-                    ecosystem: "composer".to_owned(),
-                    package: Some(CatalogCoordinate {
-                        name: "vendor/widget".to_owned(),
-                        version: Some(Version::parse("1.2.3").unwrap()),
-                    }),
-                    module: None,
-                    toolchain: Some(CatalogCoordinate {
-                        name: "php".to_owned(),
-                        version: Some(Version::parse("1.2.3").unwrap()),
-                    }),
-                    target: None,
-                    configuration: None,
-                    artifact_sha256: Some(artifact_sha256),
-                }],
-                controls: Vec::new(),
-                limits: Default::default(),
-            },
-            &CancellationToken::default(),
-        ) else {
-            panic!("installed Composer package pack must resolve through normal activation");
-        };
-        assert_eq!(active.types_named("Vendor.Widget.Widget").records.len(), 1);
+        assert_installed_bundle_resolves_type(
+            &first,
+            package_activation_request(
+                "php",
+                "composer",
+                "vendor/widget",
+                "php",
+                "1.2.3",
+                None,
+                Some(artifact_sha256),
+            ),
+            "Vendor.Widget.Widget",
+        );
     }
 
     #[test]
+    #[hardwon("#2761: accountable Kotlin source rejects must not leave the pack inactive")]
     fn kotlin_source_entry_reject_verifies_installs_and_activates() {
         let fixture = tempdir().unwrap();
         let artifact = fixture.path().join("kotlin-fixture-sources.jar");
@@ -5693,7 +5742,8 @@ mod tests {
         assert_eq!(pack_rejects.suppressed_rejects, 0);
         assert_eq!(verify_release_bundle(&output).unwrap(), bundle);
 
-        let accounting = release_extraction_accounting(pack_rejects);
+        let accounting =
+            extraction_accounting(&pack_rejects.rejects, pack_rejects.suppressed_rejects);
         assert!(accounting.warning_only_and_fully_accounted());
         assert!(accounting.gaps.is_empty());
         assert_eq!(accounting.source_entries.len(), 1);
@@ -5810,94 +5860,6 @@ mod tests {
     }
 
     #[test]
-    fn spec_validation_rejects_unknown_family_and_missing_or_placeholder_license() {
-        let fixture = tempdir().unwrap();
-        fs::write(fixture.path().join("NOTICE.txt"), "fixture notice\n").unwrap();
-        let artifact = fixture.path().join("artifact.jar");
-        write_zip(
-            &artifact,
-            &[("scala/Core.scala", "package scala\ntrait Any\n")],
-        );
-        let (artifact_sha256, _) = sha256_file(&artifact).unwrap();
-        let valid = pinned_spec(
-            "fixture",
-            "1.0.0",
-            "maven",
-            PinnedPackKind::ScalaSourceJar,
-            PinnedArtifact {
-                file_name: "artifact.jar".to_owned(),
-                sha256: artifact_sha256,
-                url: Some("https://example.invalid/artifact.jar".to_owned()),
-                container: None,
-            },
-            "scala",
-            "org.scala-lang:scala-library",
-            vec![PinnedLookupQuery::Type {
-                name: "scala.Any".to_owned(),
-            }],
-        );
-        let generate_with = |name: &str, spec_json: &serde_json::Value| {
-            let spec_path = fixture.path().join(name);
-            fs::write(&spec_path, serde_json::to_vec_pretty(spec_json).unwrap()).unwrap();
-            generate_release_bundle(
-                &fixture.path().join("out").join(name),
-                &[BundleInput {
-                    spec_path,
-                    artifact_path: artifact.clone(),
-                }],
-            )
-        };
-        let valid_json = serde_json::to_value(&valid).unwrap();
-
-        let mut pinned_engine_gate = valid_json.clone();
-        pinned_engine_gate["compatibility"]["bifrost"] = serde_json::json!("=0.12.0");
-        let error = generate_with("engine-gated-generated.json", &pinned_engine_gate).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("must omit compatibility.bifrost"),
-            "{error}"
-        );
-
-        let mut unknown_family = valid_json.clone();
-        unknown_family["kind"] = serde_json::json!({ "artifact_kind": "nuget_package" });
-        let error = generate_with("unknown-family.json", &unknown_family).unwrap_err();
-        assert!(error.to_string().contains("parse spec"), "{error}");
-
-        let mut missing_license = valid_json.clone();
-        missing_license
-            .as_object_mut()
-            .unwrap()
-            .remove("license")
-            .unwrap();
-        let error = generate_with("missing-license.json", &missing_license).unwrap_err();
-        assert!(error.to_string().contains("license"), "{error}");
-
-        let mut placeholder_license = valid_json.clone();
-        placeholder_license["license"] = serde_json::json!("NOASSERTION");
-        let error = generate_with("placeholder-license.json", &placeholder_license).unwrap_err();
-        assert!(error.to_string().contains("SPDX"), "{error}");
-
-        let mut empty_provenance = valid_json.clone();
-        empty_provenance["provenance"]["source"] = serde_json::json!("");
-        let error = generate_with("empty-provenance.json", &empty_provenance).unwrap_err();
-        assert!(error.to_string().contains("provenance"), "{error}");
-
-        let mut empty_stubs = valid_json.clone();
-        empty_stubs["kind"] = serde_json::json!({ "artifact_kind": "python_stub", "stubs": [] });
-        let error = generate_with("empty-stubs.json", &empty_stubs).unwrap_err();
-        assert!(error.to_string().contains("stub"), "{error}");
-
-        let mut non_stub_source = valid_json.clone();
-        non_stub_source["kind"] = serde_json::json!({
-            "artifact_kind": "python_stub",
-            "stubs": ["module.py"]
-        });
-        let error = generate_with("non-stub-source.json", &non_stub_source).unwrap_err();
-        assert!(error.to_string().contains(".pyi"), "{error}");
-    }
-
-    #[test]
     fn verifier_rejects_tampered_content_addressed_asset() {
         let fixture = tempdir().unwrap();
         let asset = ReleaseAsset {
@@ -5937,22 +5899,6 @@ mod tests {
         .unwrap();
         let error = verify_asset(fixture.path(), &asset).unwrap_err();
         assert!(error.to_string().contains("symbolic-link"), "{error}");
-    }
-
-    #[test]
-    fn release_notice_validation_rejects_unsafe_duplicate_and_unsorted_sources() {
-        let asset = ReleaseAsset {
-            path: "notices/example.txt".to_owned(),
-            sha256: sha256_bytes(b"notice"),
-            bytes: 6,
-        };
-        let notice = |source_path: &str| ReleaseNotice {
-            source_path: source_path.to_owned(),
-            asset: asset.clone(),
-        };
-        assert!(validate_release_notices(&[notice("../NOTICE.txt")]).is_err());
-        assert!(validate_release_notices(&[notice("z.txt"), notice("a.txt")]).is_err());
-        assert!(validate_release_notices(&[notice("NOTICE.txt"), notice("NOTICE.txt")]).is_err());
     }
 
     #[test]
@@ -6114,46 +6060,107 @@ mod tests {
         assert!(verify_release_bundle(&scala_bundle).is_err());
     }
 
-    fn write_zip(path: &Path, entries: &[(&str, &str)]) {
-        let mut writer = zip::ZipWriter::new(File::create(path).unwrap());
-        for (entry_name, source) in entries {
-            writer
-                .start_file(*entry_name, SimpleFileOptions::default())
-                .unwrap();
-            writer.write_all(source.as_bytes()).unwrap();
-        }
-        writer.finish().unwrap();
+    #[test]
+    fn spec_validation_rejects_unknown_family_and_missing_or_placeholder_license() {
+        let fixture = tempdir().unwrap();
+        fs::write(fixture.path().join("NOTICE.txt"), "fixture notice\n").unwrap();
+        let artifact = fixture.path().join("artifact.jar");
+        write_zip(
+            &artifact,
+            &[("scala/Core.scala", "package scala\ntrait Any\n")],
+        );
+        let (artifact_sha256, _) = sha256_file(&artifact).unwrap();
+        let valid = pinned_spec(
+            "fixture",
+            "1.0.0",
+            "maven",
+            PinnedPackKind::ScalaSourceJar,
+            PinnedArtifact {
+                file_name: "artifact.jar".to_owned(),
+                sha256: artifact_sha256,
+                url: Some("https://example.invalid/artifact.jar".to_owned()),
+                container: None,
+            },
+            "scala",
+            "org.scala-lang:scala-library",
+            vec![PinnedLookupQuery::Type {
+                name: "scala.Any".to_owned(),
+            }],
+        );
+        let generate_with = |name: &str, spec_json: &serde_json::Value| {
+            let spec_path = fixture.path().join(name);
+            fs::write(&spec_path, serde_json::to_vec_pretty(spec_json).unwrap()).unwrap();
+            generate_release_bundle(
+                &fixture.path().join("out").join(name),
+                &[BundleInput {
+                    spec_path,
+                    artifact_path: artifact.clone(),
+                }],
+            )
+        };
+        let valid_json = serde_json::to_value(&valid).unwrap();
+
+        let mut pinned_engine_gate = valid_json.clone();
+        pinned_engine_gate["compatibility"]["bifrost"] = serde_json::json!("=0.12.0");
+        let error = generate_with("engine-gated-generated.json", &pinned_engine_gate).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("must omit compatibility.bifrost"),
+            "{error}"
+        );
+
+        let mut unknown_family = valid_json.clone();
+        unknown_family["kind"] = serde_json::json!({ "artifact_kind": "nuget_package" });
+        let error = generate_with("unknown-family.json", &unknown_family).unwrap_err();
+        assert!(error.to_string().contains("parse spec"), "{error}");
+
+        let mut missing_license = valid_json.clone();
+        missing_license
+            .as_object_mut()
+            .unwrap()
+            .remove("license")
+            .unwrap();
+        let error = generate_with("missing-license.json", &missing_license).unwrap_err();
+        assert!(error.to_string().contains("license"), "{error}");
+
+        let mut placeholder_license = valid_json.clone();
+        placeholder_license["license"] = serde_json::json!("NOASSERTION");
+        let error = generate_with("placeholder-license.json", &placeholder_license).unwrap_err();
+        assert!(error.to_string().contains("SPDX"), "{error}");
+
+        let mut empty_provenance = valid_json.clone();
+        empty_provenance["provenance"]["source"] = serde_json::json!("");
+        let error = generate_with("empty-provenance.json", &empty_provenance).unwrap_err();
+        assert!(error.to_string().contains("provenance"), "{error}");
+
+        let mut empty_stubs = valid_json.clone();
+        empty_stubs["kind"] = serde_json::json!({ "artifact_kind": "python_stub", "stubs": [] });
+        let error = generate_with("empty-stubs.json", &empty_stubs).unwrap_err();
+        assert!(error.to_string().contains("stub"), "{error}");
+
+        let mut non_stub_source = valid_json.clone();
+        non_stub_source["kind"] = serde_json::json!({
+            "artifact_kind": "python_stub",
+            "stubs": ["module.py"]
+        });
+        let error = generate_with("non-stub-source.json", &non_stub_source).unwrap_err();
+        assert!(error.to_string().contains(".pyi"), "{error}");
     }
 
-    /// Build a `.gem` archive: an outer tar containing one `data.tar.gz`
-    /// entry, itself a gzip-compressed tar of the gem's declaration files.
-    fn ruby_gem_archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
-        let mut compressed = Vec::new();
-        {
-            let encoder =
-                flate2::write::GzEncoder::new(&mut compressed, flate2::Compression::default());
-            let mut data = tar::Builder::new(encoder);
-            for (path, bytes) in entries {
-                let mut header = tar::Header::new_gnu();
-                header.set_size(bytes.len() as u64);
-                header.set_mode(0o644);
-                header.set_cksum();
-                data.append_data(&mut header, path, *bytes).unwrap();
-            }
-            data.into_inner().unwrap().finish().unwrap();
-        }
-        let mut gem = Vec::new();
-        {
-            let mut outer = tar::Builder::new(&mut gem);
-            let mut header = tar::Header::new_gnu();
-            header.set_size(compressed.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            outer
-                .append_data(&mut header, "data.tar.gz", compressed.as_slice())
-                .unwrap();
-            outer.finish().unwrap();
-        }
-        gem
+    #[test]
+    fn release_notice_validation_rejects_unsafe_duplicate_and_unsorted_sources() {
+        let asset = ReleaseAsset {
+            path: "notices/example.txt".to_owned(),
+            sha256: sha256_bytes(b"notice"),
+            bytes: 6,
+        };
+        let notice = |source_path: &str| ReleaseNotice {
+            source_path: source_path.to_owned(),
+            asset: asset.clone(),
+        };
+        assert!(validate_release_notices(&[notice("../NOTICE.txt")]).is_err());
+        assert!(validate_release_notices(&[notice("z.txt"), notice("a.txt")]).is_err());
+        assert!(validate_release_notices(&[notice("NOTICE.txt"), notice("NOTICE.txt")]).is_err());
     }
 }

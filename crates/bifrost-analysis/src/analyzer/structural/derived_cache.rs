@@ -1,4 +1,5 @@
 use serde::{Serialize, Serializer};
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::mem::size_of;
 use std::sync::{Arc, Mutex};
@@ -20,6 +21,7 @@ use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
 use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
+use brokk_bifrost_core::util::elapsed_ns;
 
 /// The semantic family of one reusable, immutable query-execution layer.
 ///
@@ -554,19 +556,44 @@ pub struct DirectImportTopology {
     retained_bytes: u64,
 }
 
+fn outgoing_files(graph: &CompactDirectedGraph<ProjectFile>, source: u32) -> Vec<ProjectFile> {
+    graph
+        .outgoing(source)
+        .iter()
+        .map(|target| graph.nodes()[*target as usize].clone())
+        .collect()
+}
+
+fn incoming_files(graph: &CompactDirectedGraph<ProjectFile>, target: u32) -> Vec<ProjectFile> {
+    graph
+        .incoming(target)
+        .iter()
+        .map(|source| graph.nodes()[*source as usize].clone())
+        .collect()
+}
+
+fn incoming_file_count(graph: &CompactDirectedGraph<ProjectFile>, file: &ProjectFile) -> usize {
+    graph
+        .node_id(file)
+        .map_or(0, |target| graph.incoming(target).len())
+}
+
+fn sorted_languages_for_files<'a>(files: impl Iterator<Item = &'a ProjectFile>) -> Vec<Language> {
+    let mut languages = files
+        .map(crate::analyzer::common::language_for_file)
+        .collect::<Vec<_>>();
+    languages.sort();
+    languages.dedup();
+    languages
+}
+
 impl DirectImportTopology {
     pub fn imports_of(&self, file: &ProjectFile) -> Option<Vec<ProjectFile>> {
         let source = self.graph.node_id(file)?;
         if !self.supported_sources[source as usize] {
             return None;
         }
-        Some(
-            self.graph
-                .outgoing(source)
-                .iter()
-                .map(|target| self.graph.nodes()[*target as usize].clone())
-                .collect(),
-        )
+        Some(outgoing_files(&self.graph, source))
     }
 
     #[cfg(test)]
@@ -581,11 +608,7 @@ impl DirectImportTopology {
         let Some(target) = self.graph.node_id(file) else {
             return Vec::new();
         };
-        self.graph
-            .incoming(target)
-            .iter()
-            .map(|source| self.graph.nodes()[*source as usize].clone())
-            .collect()
+        incoming_files(&self.graph, target)
     }
 
     pub fn import_count(&self, file: &ProjectFile) -> Option<usize> {
@@ -594,9 +617,7 @@ impl DirectImportTopology {
     }
 
     pub fn known_importer_count(&self, file: &ProjectFile) -> usize {
-        self.graph
-            .node_id(file)
-            .map_or(0, |target| self.graph.incoming(target).len())
+        incoming_file_count(&self.graph, file)
     }
 
     pub fn reverse_relation_complete(&self) -> bool {
@@ -604,17 +625,13 @@ impl DirectImportTopology {
     }
 
     pub fn unsupported_languages(&self) -> Vec<Language> {
-        let mut languages = self
+        let files = self
             .graph
             .nodes()
             .iter()
             .zip(&self.supported_sources)
-            .filter(|(_, supported)| !**supported)
-            .map(|(file, _)| crate::analyzer::common::language_for_file(file))
-            .collect::<Vec<_>>();
-        languages.sort();
-        languages.dedup();
-        languages
+            .filter_map(|(file, supported)| (!*supported).then_some(file));
+        sorted_languages_for_files(files)
     }
 
     pub fn resolved_files(&self) -> usize {
@@ -769,6 +786,18 @@ pub fn build_direct_import_topology(
             fallback: Some(request_graph),
         };
     }
+    if let Err(error) = request_graph.publish_persisted_import_graph(analyzer) {
+        metrics.elapsed_ns = elapsed_ns(started);
+        return DirectImportTopologyBuild {
+            outcome: DerivedLayerBuildOutcome::Unavailable {
+                reason: format!("publishing persistent import graph failed: {error}"),
+                over_budget: false,
+                rejection_scope: None,
+                metrics,
+            },
+            fallback: Some(request_graph),
+        };
+    }
     let topology = request_graph.into_topology(retained_bytes);
     DirectImportTopologyBuild {
         outcome: DerivedLayerBuildOutcome::Complete {
@@ -784,14 +813,19 @@ pub fn build_direct_import_topology(
 #[derive(Debug, Default)]
 pub struct RequestLocalDirectImportGraph {
     forward: HashMap<ProjectFile, Vec<ProjectFile>>,
+    persisted_import_edges: Vec<crate::analyzer::PersistedImportEdge>,
+    resolution_dependencies: HashMap<ProjectFile, crate::analyzer::ImportResolutionDependencies>,
     compact: Option<CompactDirectedGraph<ProjectFile>>,
     unsupported: HashSet<ProjectFile>,
     budget_omitted: HashSet<ProjectFile>,
     all_files: Vec<ProjectFile>,
     analyzed: HashSet<ProjectFile>,
     attempted_files: usize,
+    attempted_imports: usize,
     attempted_edges: usize,
     retained_edges: usize,
+    provenance_bytes: u64,
+    resolution_dependency_bytes: u64,
     forward_target_capacity: usize,
     complete: bool,
 }
@@ -812,7 +846,7 @@ impl RequestLocalDirectImportGraph {
         Self::from_files(all_files)
     }
 
-    fn from_files(all_files: Vec<ProjectFile>) -> Self {
+    pub(crate) fn from_files(all_files: Vec<ProjectFile>) -> Self {
         let analyzed = all_files.iter().cloned().collect();
         Self {
             all_files,
@@ -853,6 +887,16 @@ impl RequestLocalDirectImportGraph {
                 (self.forward_target_capacity as u64)
                     .saturating_mul(size_of::<ProjectFile>() as u64),
             )
+            .saturating_add(self.provenance_bytes)
+            .saturating_add(self.resolution_dependency_bytes)
+            .saturating_add(
+                (self.persisted_import_edges.capacity() as u64)
+                    .saturating_mul(size_of::<crate::analyzer::PersistedImportEdge>() as u64),
+            )
+            .saturating_add(
+                (self.retained_edges as u64)
+                    .saturating_mul(size_of::<(ProjectFile, Vec<serde_json::Value>)>() as u64),
+            )
             .saturating_add(
                 self.compact
                     .as_ref()
@@ -892,6 +936,55 @@ impl RequestLocalDirectImportGraph {
         }
     }
 
+    pub(crate) fn persisted_edges(&self) -> Vec<crate::analyzer::PersistedImportEdge> {
+        let mut edges = self.persisted_import_edges.clone();
+        edges.sort_by(|left, right| {
+            left.importer
+                .cmp(&right.importer)
+                .then_with(|| left.import_ordinal.cmp(&right.import_ordinal))
+                .then_with(|| left.target.cmp(&right.target))
+        });
+        edges
+    }
+
+    pub(crate) fn persisted_resolution_dependencies(
+        &self,
+    ) -> Vec<crate::analyzer::PersistedImportDependencies> {
+        let mut dependencies = self
+            .resolution_dependencies
+            .iter()
+            .map(
+                |(importer, facts)| crate::analyzer::PersistedImportDependencies {
+                    importer: importer.clone(),
+                    facts: facts.clone(),
+                },
+            )
+            .collect::<Vec<_>>();
+        dependencies.sort_by(|left, right| left.importer.cmp(&right.importer));
+        dependencies
+    }
+
+    pub(crate) fn has_resolution_dependencies(&self, file: &ProjectFile) -> bool {
+        self.resolution_dependencies.contains_key(file)
+    }
+
+    pub fn publish_persisted_import_graph(
+        &self,
+        analyzer: &dyn IAnalyzer,
+    ) -> Result<bool, crate::analyzer::store::StoreError> {
+        if !self.reverse_relation_complete() {
+            return Ok(false);
+        }
+        let Some(content_identity) = analyzer.workspace_content_identity() else {
+            return Ok(false);
+        };
+        if !analyzer.workspace_content_matches(content_identity) {
+            return Ok(false);
+        }
+        let edges = self.persisted_edges();
+        analyzer.publish_persisted_import_graph(content_identity, &self.all_files, &edges)
+    }
+
     fn freeze(&mut self) {
         if self.compact.is_some() {
             return;
@@ -925,10 +1018,7 @@ impl RequestLocalDirectImportGraph {
         if let Some(compact) = &self.compact {
             return compact
                 .node_id(file)
-                .into_iter()
-                .flat_map(|source| compact.outgoing(source))
-                .map(|target| compact.nodes()[*target as usize].clone())
-                .collect();
+                .map_or_else(Vec::new, |source| outgoing_files(compact, source));
         }
         self.forward.get(file).cloned().unwrap_or_default()
     }
@@ -943,19 +1033,13 @@ impl RequestLocalDirectImportGraph {
         };
         compact
             .node_id(file)
-            .into_iter()
-            .flat_map(|target| compact.incoming(target))
-            .map(|source| compact.nodes()[*source as usize].clone())
-            .collect()
+            .map_or_else(Vec::new, |target| incoming_files(compact, target))
     }
 
     pub fn importer_count(&self, file: &ProjectFile) -> usize {
-        let Some(compact) = &self.compact else {
-            return 0;
-        };
-        compact
-            .node_id(file)
-            .map_or(0, |target| compact.incoming(target).len())
+        self.compact
+            .as_ref()
+            .map_or(0, |compact| incoming_file_count(compact, file))
     }
 
     pub fn forward_relation_complete(&self, files: &[ProjectFile]) -> bool {
@@ -981,18 +1065,15 @@ impl RequestLocalDirectImportGraph {
     }
 
     pub fn unsupported_languages(&self) -> Vec<Language> {
-        let mut languages = self
-            .unsupported
-            .iter()
-            .map(crate::analyzer::common::language_for_file)
-            .collect::<Vec<_>>();
-        languages.sort();
-        languages.dedup();
-        languages
+        sorted_languages_for_files(self.unsupported.iter())
     }
 
     pub fn resolved_files(&self) -> usize {
         self.attempted_files
+    }
+
+    pub fn resolved_imports(&self) -> usize {
+        self.attempted_imports
     }
 
     pub fn resolved_edges(&self) -> usize {
@@ -1011,11 +1092,9 @@ impl RequestLocalDirectImportGraph {
             self.freeze();
             return false;
         }
-        let files = self.all_files.clone();
-        let (exhausted, _) = self.ensure_forward_inner(
+        let (exhausted, _) = self.resolve_all_canonical_files(
             analyzer,
             token,
-            &files,
             RequestImportResolutionLimits {
                 max_files,
                 max_edges,
@@ -1031,6 +1110,16 @@ impl RequestLocalDirectImportGraph {
         exhausted
     }
 
+    fn resolve_all_canonical_files(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        token: QueryToken<'_>,
+        limits: RequestImportResolutionLimits<'_>,
+    ) -> (bool, bool) {
+        let files = self.all_files.clone();
+        self.ensure_forward_inner(analyzer, token, &files, None, limits)
+    }
+
     fn resolve_complete_for_snapshot(
         &mut self,
         analyzer: &dyn IAnalyzer,
@@ -1043,11 +1132,9 @@ impl RequestLocalDirectImportGraph {
         if self.complete {
             return (false, false);
         }
-        let files = self.all_files.clone();
-        let outcome = self.ensure_forward_inner(
+        let outcome = self.resolve_all_canonical_files(
             analyzer,
             token,
-            &files,
             RequestImportResolutionLimits {
                 max_files,
                 max_edges,
@@ -1075,6 +1162,35 @@ impl RequestLocalDirectImportGraph {
             analyzer,
             token,
             files,
+            None,
+            RequestImportResolutionLimits {
+                max_files,
+                max_edges,
+                cancellation,
+                maximum_working_bytes: None,
+                files_are_canonical: false,
+            },
+        )
+        .0
+    }
+
+    // These inputs identify distinct demand and snapshot state; an envelope would add indirection.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn ensure_forward_selected(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        token: QueryToken<'_>,
+        files: &[ProjectFile],
+        selected_ordinals: &HashMap<ProjectFile, Vec<u32>>,
+        max_files: usize,
+        max_edges: usize,
+        cancellation: Option<&CancellationToken>,
+    ) -> bool {
+        self.ensure_forward_inner(
+            analyzer,
+            token,
+            files,
+            Some(selected_ordinals),
             RequestImportResolutionLimits {
                 max_files,
                 max_edges,
@@ -1091,6 +1207,7 @@ impl RequestLocalDirectImportGraph {
         analyzer: &dyn IAnalyzer,
         token: QueryToken<'_>,
         files: &[ProjectFile],
+        selected_import_ordinals: Option<&HashMap<ProjectFile, Vec<u32>>>,
         limits: RequestImportResolutionLimits<'_>,
     ) -> (bool, bool) {
         let RequestImportResolutionLimits {
@@ -1162,63 +1279,216 @@ impl RequestLocalDirectImportGraph {
                 continue;
             }
             let bulk_infos = provider.import_infos_for_files(grouped_files);
+            let selected_for_group =
+                selected_import_ordinals.map_or_else(HashMap::default, |selected| {
+                    grouped_files
+                        .iter()
+                        .filter_map(|file| {
+                            selected
+                                .get(file)
+                                .map(|ordinals| (file.clone(), ordinals.clone()))
+                        })
+                        .collect()
+                });
             // The provider has now materialized import information for the
             // whole canonical batch. Charge that real work even if a later
             // edge-budget check prevents retaining some resolved relations.
             self.attempted_files = self.attempted_files.saturating_add(grouped_files.len());
-            for file in grouped_files.iter() {
-                if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                    return (true, false);
-                }
-                if self.attempted_edges >= max_edges {
-                    exhausted = true;
-                    self.budget_omitted.insert(file.clone());
+            let visited_files = Cell::new(0usize);
+            let byte_budget_exhausted = Cell::new(false);
+            let mut visit_facts =
+                |file: &ProjectFile, facts: Vec<crate::analyzer::ImportedFileEdgeFacts>| {
+                    let file_index = visited_files.get();
+                    visited_files.set(file_index + 1);
+                    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                        return false;
+                    }
+                    self.attempted_imports = self.attempted_imports.saturating_add(facts.len());
+                    let mut targets = HashSet::default();
+                    let mut persisted = Vec::new();
+                    let mut provenance_bytes = 0_u64;
+                    for fact in facts {
+                        for (target, provenance) in fact.edges {
+                            if !self.analyzed.contains(&target) {
+                                continue;
+                            }
+                            targets.insert(target.clone());
+                            let provenance_json = serde_json::to_string(&provenance)
+                                .expect("JSON import provenance serializes");
+                            provenance_bytes = provenance_bytes.saturating_add(
+                                u64::try_from(provenance_json.len()).unwrap_or(u64::MAX),
+                            );
+                            let mut route_dependencies = HashSet::default();
+                            route_dependencies.insert(rel_path_string(file));
+                            route_dependencies.insert(rel_path_string(&target));
+                            for route_file in provenance
+                                .iter()
+                                .filter_map(|record| record.get("route_files"))
+                                .filter_map(serde_json::Value::as_array)
+                                .flatten()
+                                .filter_map(serde_json::Value::as_str)
+                            {
+                                route_dependencies.insert(route_file.to_owned());
+                            }
+                            let mut route_dependencies =
+                                route_dependencies.into_iter().collect::<Vec<_>>();
+                            route_dependencies.sort_unstable();
+                            persisted.push(crate::analyzer::PersistedImportEdge {
+                                importer: file.clone(),
+                                import_ordinal: fact.import_ordinal,
+                                target,
+                                provenance_json,
+                                route_dependencies,
+                            });
+                        }
+                    }
+                    let edge_work = persisted.len();
+                    self.attempted_edges = self.attempted_edges.saturating_add(edge_work);
+                    let mut targets = targets.into_iter().collect::<Vec<_>>();
+                    canonicalize_project_files(&mut targets);
+
+                    let transient_target_bytes = (targets.capacity() as u64)
+                        .saturating_mul(size_of::<ProjectFile>() as u64)
+                        .saturating_mul(2);
+                    if maximum_working_bytes.is_some_and(|maximum| {
+                        self.estimated_working_bytes()
+                            .saturating_add(transient_target_bytes)
+                            .saturating_add(provenance_bytes)
+                            > maximum
+                    }) {
+                        self.budget_omitted.insert(file.clone());
+                        self.compact = None;
+                        byte_budget_exhausted.set(true);
+                        return false;
+                    }
+
+                    let available_edges =
+                        max_edges.saturating_sub(self.attempted_edges.saturating_sub(edge_work));
+                    if edge_work > available_edges {
+                        exhausted = true;
+                        self.budget_omitted.insert(file.clone());
+                        self.budget_omitted
+                            .extend(grouped_files.iter().skip(file_index + 1).cloned());
+                        self.compact = None;
+                        return false;
+                    }
+                    self.provenance_bytes = self.provenance_bytes.saturating_add(provenance_bytes);
+                    self.persisted_import_edges.extend(persisted);
+                    self.retained_edges = self.retained_edges.saturating_add(targets.len());
+                    self.forward_target_capacity = self
+                        .forward_target_capacity
+                        .saturating_add(targets.capacity());
+                    self.forward.insert(file.clone(), targets);
+                    self.compact = None;
+                    if maximum_working_bytes
+                        .is_some_and(|maximum| self.estimated_working_bytes() > maximum)
+                    {
+                        byte_budget_exhausted.set(true);
+                        return false;
+                    }
+                    true
+                };
+            let streamed = provider.for_each_import_edge_facts_from_infos(
+                grouped_files,
+                bulk_infos.as_ref(),
+                &selected_for_group,
+                cancellation,
+                &mut visit_facts,
+            );
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return (true, false);
+            }
+            if byte_budget_exhausted.get() {
+                return (true, true);
+            }
+            if streamed.is_none() {
+                assert_eq!(visited_files.get(), 0);
+                if !selected_for_group.is_empty() {
+                    self.unsupported.extend(grouped_files.iter().cloned());
                     self.compact = None;
                     continue;
                 }
-                let owned_imports;
-                let imports =
-                    if let Some(imports) = bulk_infos.as_ref().and_then(|infos| infos.get(file)) {
+                for file in grouped_files.iter() {
+                    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                        return (true, false);
+                    }
+                    let owned_imports;
+                    let imports = if let Some(imports) =
+                        bulk_infos.as_ref().and_then(|infos| infos.get(file))
+                    {
                         imports.as_slice()
                     } else {
                         owned_imports = provider.import_info_of(token, file);
                         &owned_imports
                     };
-                let mut targets =
-                    crate::analyzer::resolve_imported_files_from_infos(provider, file, imports)
-                        .into_iter()
-                        .filter(|target| self.analyzed.contains(target))
-                        .collect::<Vec<_>>();
-                canonicalize_project_files(&mut targets);
-
-                let transient_target_bytes = (targets.capacity() as u64)
-                    .saturating_mul(size_of::<ProjectFile>() as u64)
-                    .saturating_mul(2);
-                self.attempted_edges = self.attempted_edges.saturating_add(targets.len());
-                if maximum_working_bytes.is_some_and(|maximum| {
-                    self.estimated_working_bytes()
-                        .saturating_add(transient_target_bytes)
-                        > maximum
-                }) {
-                    self.budget_omitted.insert(file.clone());
-                    self.compact = None;
-                    return (true, true);
+                    let imported_edges = provider
+                        .imported_file_edge_provenance_from_infos(file, imports)
+                        .unwrap_or_else(|| {
+                            let targets = crate::analyzer::resolve_imported_files_from_infos(
+                                provider, file, imports,
+                            );
+                            let provenance = if imports.is_empty() {
+                                serde_json::json!({ "kind": "provider_resolved_import_edge" })
+                            } else {
+                                serde_json::json!({
+                                    "kind": "structured_import_facts",
+                                    "facts": imports
+                                })
+                            };
+                            targets
+                                .into_iter()
+                                .map(|target| (target, vec![provenance.clone()]))
+                                .collect()
+                        });
+                    if !visit_facts(
+                        file,
+                        vec![crate::analyzer::ImportedFileEdgeFacts {
+                            import_ordinal: u32::MAX,
+                            edges: imported_edges,
+                        }],
+                    ) {
+                        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                            return (true, false);
+                        }
+                        if byte_budget_exhausted.get() {
+                            return (true, true);
+                        }
+                        break;
+                    }
                 }
-
-                let available_edges =
-                    max_edges.saturating_sub(self.attempted_edges.saturating_sub(targets.len()));
-                if targets.len() > available_edges {
-                    exhausted = true;
-                    self.budget_omitted.insert(file.clone());
-                    self.compact = None;
-                    continue;
+            }
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return (true, false);
+            }
+            if let Some(dependencies) = provider.import_resolution_dependencies_for_ordinals(
+                grouped_files,
+                bulk_infos.as_ref(),
+                &selected_for_group,
+                cancellation,
+            ) {
+                for file in grouped_files {
+                    if let Some(facts) = dependencies.get(file) {
+                        let bytes = facts
+                            .lookups
+                            .iter()
+                            .map(|lookup| {
+                                rel_path_string(&lookup.consulted_file).len()
+                                    + lookup.name.len()
+                                    + size_of::<crate::analyzer::ImportLookupDependency>()
+                            })
+                            .sum::<usize>()
+                            + facts
+                                .missing_module_path_keys
+                                .iter()
+                                .map(|(_, key)| key.len() + size_of::<String>() + size_of::<u32>())
+                                .sum::<usize>();
+                        self.resolution_dependency_bytes = self
+                            .resolution_dependency_bytes
+                            .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+                        self.resolution_dependencies
+                            .insert(file.clone(), facts.clone());
+                    }
                 }
-                self.retained_edges = self.retained_edges.saturating_add(targets.len());
-                self.forward_target_capacity = self
-                    .forward_target_capacity
-                    .saturating_add(targets.capacity());
-                self.forward.insert(file.clone(), targets);
-                self.compact = None;
                 if maximum_working_bytes
                     .is_some_and(|maximum| self.estimated_working_bytes() > maximum)
                 {
@@ -1240,24 +1510,16 @@ fn canonicalize_project_files(files: &mut Vec<ProjectFile>) {
     files.extend(keyed.into_iter().map(|(_, file)| file));
 }
 
-fn elapsed_ns(started: Instant) -> u64 {
-    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::structural::test_support::content_identity as content;
     use crate::analyzer::{AnalyzerQueryScope, QueryScope};
     use crate::analyzer::{JavaAnalyzer, PhpAnalyzer, RubyAnalyzer, TestProject};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::thread;
-    use std::time::{Duration, Instant};
-
-    fn content(seed: u64) -> WorkspaceContentIdentity {
-        WorkspaceContentIdentity::for_test(seed)
-    }
 
     fn complete_layer(retained_bytes: u64) -> DerivedLayerBuildOutcome {
         let file = ProjectFile::new(std::env::temp_dir(), "bifrost-derived-layer-test.ts");
@@ -1578,14 +1840,10 @@ mod tests {
     }
 
     fn wait_for_follower(cache: &SnapshotDerivedLayerCache) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while cache.waiting_count_for_test() == 0 {
-            assert!(
-                Instant::now() < deadline,
-                "same-key derived request did not enter the single-flight wait"
-            );
-            thread::yield_now();
-        }
+        brokk_bifrost_core::test_support::wait_for_nonzero_count(
+            || cache.waiting_count_for_test(),
+            "same-key derived request did not enter the single-flight wait",
+        );
     }
 
     #[test]
@@ -1764,8 +2022,8 @@ mod tests {
     }
 
     impl crate::analyzer::CodeUnitIndex for AnalyzerWithUnclaimedFile {
-        fn project(&self) -> &dyn crate::analyzer::Project {
-            self.inner.project()
+        crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+            fn project(&self) -> &dyn crate::analyzer::Project;
         }
 
         fn languages(&self) -> std::collections::BTreeSet<Language> {
@@ -1934,41 +2192,6 @@ mod tests {
     }
 
     #[test]
-    fn topology_limits_reject_without_returning_partial_edges() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical root");
-        ProjectFile::new(root.clone(), PathBuf::from("bench/Target.java"))
-            .write("package bench; public class Target {}\n")
-            .expect("write target");
-        ProjectFile::new(root.clone(), PathBuf::from("bench/Consumer.java"))
-            .write("package bench; import bench.Target; public class Consumer {}\n")
-            .expect("write consumer");
-        let analyzer = JavaAnalyzer::from_project(TestProject::new(root, Language::Java));
-
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        let token = scope.token();
-        let outcome = build_direct_import_topology(
-            &analyzer,
-            token,
-            &CancellationToken::default(),
-            DirectImportTopologyLimits {
-                max_files: 100,
-                max_edges: 0,
-                max_retained_bytes: 1024 * 1024,
-            },
-        );
-
-        assert!(matches!(
-            outcome.outcome,
-            DerivedLayerBuildOutcome::Unavailable {
-                over_budget: true,
-                ..
-            }
-        ));
-        assert!(outcome.fallback.is_some());
-    }
-
-    #[test]
     fn topology_construction_preflights_fixed_memory_before_resolution() {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical root");
@@ -2003,5 +2226,40 @@ mod tests {
             }
         ));
         assert!(build.fallback.is_none());
+    }
+
+    #[test]
+    fn topology_limits_reject_without_returning_partial_edges() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), PathBuf::from("bench/Target.java"))
+            .write("package bench; public class Target {}\n")
+            .expect("write target");
+        ProjectFile::new(root.clone(), PathBuf::from("bench/Consumer.java"))
+            .write("package bench; import bench.Target; public class Consumer {}\n")
+            .expect("write consumer");
+        let analyzer = JavaAnalyzer::from_project(TestProject::new(root, Language::Java));
+
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
+        let outcome = build_direct_import_topology(
+            &analyzer,
+            token,
+            &CancellationToken::default(),
+            DirectImportTopologyLimits {
+                max_files: 100,
+                max_edges: 0,
+                max_retained_bytes: 1024 * 1024,
+            },
+        );
+
+        assert!(matches!(
+            outcome.outcome,
+            DerivedLayerBuildOutcome::Unavailable {
+                over_budget: true,
+                ..
+            }
+        ));
+        assert!(outcome.fallback.is_some());
     }
 }

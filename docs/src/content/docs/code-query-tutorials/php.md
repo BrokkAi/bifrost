@@ -3,9 +3,9 @@ title: PHP
 description: Query PHP named arguments, attributes, imports, and nullsafe calls with query_code.
 ---
 
-> Last verified end to end: 2026-07-14 (`query_code` schema version 1).
+> Last verified end to end: 2026-10-01 (`query_code` schema version 1).
 
-For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](../reference-traversal/).
+For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](/code-query-tutorials/reference-traversal/).
 
 PHP exposes instance, static, nullsafe, and object-creation calls; named arguments through `kwargs`; attributes through `decorators`; and namespace imports separately from trait composition.
 

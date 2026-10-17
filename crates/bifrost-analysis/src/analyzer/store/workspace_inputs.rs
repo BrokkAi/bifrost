@@ -46,6 +46,58 @@ impl WorkspaceConfigurationInput {
                 inputs.insert(toolchains);
             }
         }
+        if language == Language::Rust {
+            let mut directories = BTreeSet::from([std::path::PathBuf::new()]);
+            for input in inputs.iter() {
+                if input
+                    .rel_path()
+                    .file_name()
+                    .is_some_and(|n| n == "Cargo.toml")
+                {
+                    let mut directory = input.rel_path().parent();
+                    while let Some(path) = directory {
+                        directories.insert(path.to_path_buf());
+                        directory = path.parent();
+                    }
+                }
+            }
+            for directory in directories {
+                for name in ["Cargo.lock", ".cargo/config.toml", ".cargo/config"] {
+                    let file = ProjectFile::new(root, directory.join(name));
+                    if file.abs_path().try_exists()? {
+                        inputs.insert(file);
+                    }
+                }
+            }
+        }
+        if matches!(language, Language::JavaScript | Language::TypeScript) {
+            let mut directories = BTreeSet::from([std::path::PathBuf::new()]);
+            for input in inputs.iter().filter(|file| {
+                file.rel_path()
+                    .file_name()
+                    .is_some_and(|n| n == "package.json")
+            }) {
+                let mut directory = input.rel_path().parent();
+                while let Some(path) = directory {
+                    directories.insert(path.to_path_buf());
+                    directory = path.parent();
+                }
+            }
+            for directory in directories {
+                for name in [
+                    "package.json",
+                    "package-lock.json",
+                    "npm-shrinkwrap.json",
+                    "pnpm-lock.yaml",
+                    "yarn.lock",
+                ] {
+                    let file = ProjectFile::new(root, directory.join(name));
+                    if file.abs_path().try_exists()? {
+                        inputs.insert(file);
+                    }
+                }
+            }
+        }
         if language == Language::Go {
             // Go reads metadata beside its module/workspace manifests even
             // when ignore rules omit checksums or vendor metadata from listing.
@@ -436,15 +488,14 @@ pub(super) fn publish_workspace_input_changes(
             revision
         }
     };
-    Ok((
-        WorkspaceSnapshotId {
-            workspace_id: workspace_id.clone(),
-            lang: lang.to_owned(),
-            generation,
-            revision,
-        },
-        inserted,
-    ))
+    let snapshot = WorkspaceSnapshotId {
+        workspace_id: workspace_id.clone(),
+        lang: lang.to_owned(),
+        generation,
+        revision,
+    };
+    super::dependency_file_evidence::publish(tx, &snapshot)?;
+    Ok((snapshot, inserted))
 }
 
 #[cfg(test)]

@@ -29,6 +29,21 @@ use crate::path_utils::rel_path_string;
 pub type DefinitionLookupAccess<'a> =
     dyn Fn(&mut dyn FnMut(&dyn BoundedDefinitionLookup)) + Sync + 'a;
 
+/// Run a one-shot consumer through an analyzer's deferred definition lookup.
+pub fn with_usage_definitions_once<R>(
+    provide: impl FnOnce(&mut dyn FnMut(&dyn BoundedDefinitionLookup)),
+    read: impl FnOnce(&dyn BoundedDefinitionLookup) -> R,
+) -> R {
+    let mut read = Some(read);
+    let mut result = None;
+    provide(&mut |lookup| {
+        if let Some(read) = read.take() {
+            result = Some(read(lookup));
+        }
+    });
+    result.expect("definition lookup access must invoke its consumer exactly once")
+}
+
 /// One mounted relational identity: a workspace-derived prefix plus the
 /// content-derived tail persisted with a parsed blob.
 ///
@@ -194,6 +209,21 @@ pub enum RelationalDefinitionValue {
 /// causing another query on every replay.
 pub trait RelationalDefinitionFrontier: Send + Sync {
     fn ask(&self, question: &RelationalDefinitionQuestion) -> RelationalDefinitionValue;
+
+    /// Direct children of `owner` named `identifier`, in the workspace.
+    fn structural_members(&self, owner: &FqName, identifier: &str) -> Vec<CodeUnit> {
+        let question = RelationalDefinitionQuestion {
+            language_scope: DefinitionLanguageScope::Workspace,
+            name: RelationalName::stable(owner.clone()),
+            query: RelationalDefinitionQuery::StructuralMembers {
+                identifier: identifier.to_string(),
+            },
+        };
+        match self.ask(&question) {
+            RelationalDefinitionValue::Definitions(units) => units,
+            _ => panic!("a structural-member question returned the wrong shape"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -448,19 +478,15 @@ pub trait BoundedDefinitionLookup {
 
     fn file_identifier(&self, file: &ProjectFile, ident: &str) -> Vec<CodeUnit>;
     fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit>;
-    fn fqn_exists(&self, fqn: &str) -> bool;
+    fn fqn_exists(&self, fqn: &str) -> bool {
+        !self.fqn(fqn).is_empty()
+    }
     fn package_exists(&self, package: &str) -> bool;
     fn package_exists_in_language(&self, package: &str, language: Language) -> bool;
     fn fqn_prefix_exists(&self, prefix: &str) -> bool;
 
     fn fqn_candidates(&self, fqns: Vec<String>) -> Vec<CodeUnit> {
-        let mut candidates = fqns
-            .into_iter()
-            .flat_map(|fqn| self.fqn(&fqn))
-            .collect::<Vec<_>>();
-        sort_units(&mut candidates);
-        candidates.dedup();
-        candidates
+        collect_fqn_candidates(fqns, |fqn| self.fqn(fqn))
     }
 
     fn file_identifier_in_files(&self, files: &[ProjectFile], ident: &str) -> Vec<CodeUnit> {
@@ -468,9 +494,7 @@ pub trait BoundedDefinitionLookup {
         for file in files {
             out.extend(self.file_identifier(file, ident));
         }
-        sort_units(&mut out);
-        out.dedup();
-        out
+        sort_dedup_units(out)
     }
 }
 
@@ -486,60 +510,29 @@ pub fn sort_units(units: &mut [CodeUnit]) {
     });
 }
 
+/// Sort definition candidates canonically and remove duplicate units.
+pub fn sort_dedup_units(mut units: Vec<CodeUnit>) -> Vec<CodeUnit> {
+    sort_units(&mut units);
+    units.dedup();
+    units
+}
+
+/// Gather candidates for several FQNs, then sort and deduplicate them.
+pub fn collect_fqn_candidates(
+    fqns: impl IntoIterator<Item = String>,
+    mut candidates_for_fqn: impl FnMut(&str) -> Vec<CodeUnit>,
+) -> Vec<CodeUnit> {
+    sort_dedup_units(
+        fqns.into_iter()
+            .flat_map(|fqn| candidates_for_fqn(&fqn))
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod relational_tests {
     use super::*;
     use crate::analyzer::fq_name::{SegmentKind, segment_interner};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    struct EchoBatch {
-        calls: AtomicUsize,
-    }
-
-    impl RelationalDefinitionLookup for EchoBatch {
-        fn batch(
-            &self,
-            requests: &[RelationalDefinitionRequest],
-            _cancellation: &CancellationToken,
-        ) -> RelationalBatchOutcome {
-            self.calls.fetch_add(1, Ordering::Relaxed);
-            RelationalBatchOutcome::Complete(
-                requests
-                    .iter()
-                    .map(|request| RelationalDefinitionResult {
-                        ordinal: request.ordinal,
-                        value: RelationalDefinitionValue::Definitions(Vec::new()),
-                    })
-                    .collect(),
-            )
-        }
-    }
-
-    fn request() -> RelationalDefinitionRequest {
-        let mut name = FqName::new();
-        name.push(segment_interner().intern("Widget", SegmentKind::Type));
-        RelationalDefinitionRequest {
-            ordinal: 17,
-            language_scope: DefinitionLanguageScope::Language(Language::Java),
-            name: RelationalName::stable(name),
-            query: RelationalDefinitionQuery::ExactName,
-        }
-    }
-
-    #[test]
-    fn point_contract_delegates_to_one_batch_call() {
-        let lookup = EchoBatch {
-            calls: AtomicUsize::new(0),
-        };
-        assert_eq!(
-            lookup.point(&request(), &CancellationToken::new()),
-            RelationalPointOutcome::Complete(RelationalDefinitionResult {
-                ordinal: 17,
-                value: RelationalDefinitionValue::Definitions(Vec::new()),
-            })
-        );
-        assert_eq!(lookup.calls.load(Ordering::Relaxed), 1);
-    }
 
     #[test]
     fn relational_parent_preserves_the_anchor_boundary() {
@@ -563,11 +556,5 @@ mod relational_tests {
         assert!(root.prefix().is_empty());
         assert!(root.tail().is_empty());
         assert!(root.parent().is_none());
-    }
-
-    #[test]
-    #[should_panic(expected = "must explain the failure")]
-    fn batch_errors_cannot_be_empty() {
-        let _ = RelationalBatchError::new("   ");
     }
 }

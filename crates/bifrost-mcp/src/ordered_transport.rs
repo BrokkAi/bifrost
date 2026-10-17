@@ -265,6 +265,10 @@ mod tests {
     use rmcp::model::ClientJsonRpcMessage;
     use tokio::sync::oneshot;
 
+    fn successful_close<Error>() -> std::future::Ready<Result<(), Error>> {
+        std::future::ready(Ok(()))
+    }
+
     /// A transport that replays a fixed script, so the ordering rule can be
     /// checked without a real client.
     struct ScriptedTransport(std::collections::VecDeque<ClientJsonRpcMessage>);
@@ -284,7 +288,7 @@ mod tests {
         }
 
         fn close(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
-            std::future::ready(Ok(()))
+            successful_close()
         }
     }
 
@@ -318,7 +322,7 @@ mod tests {
         }
 
         fn close(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
-            std::future::ready(Ok(()))
+            successful_close()
         }
     }
 
@@ -363,25 +367,11 @@ mod tests {
             "a request that arrived after a revocation always observes it"
         );
     }
+    use brokk_bifrost_test_macros::hardwon;
 
-    #[tokio::test]
-    async fn unrelated_traffic_does_not_revoke() {
-        let revocations = Arc::new(RootsRevocations::default());
-        let mut transport = RootsOrderedTransport::new(
-            ScriptedTransport(
-                [parse(serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "method": "notifications/initialized"
-                }))]
-                .into_iter()
-                .collect(),
-            ),
-            Arc::clone(&revocations),
-        );
-        transport.receive().await.expect("the notification");
-        assert_eq!(revocations.observed(), 0);
-    }
-
+    #[hardwon(
+        "#1491: response timings must remain armed across unrelated sends and be consumed by matching delivery"
+    )]
     #[tokio::test]
     async fn an_armed_response_timing_is_consumed_by_the_send_that_delivers_it() {
         let timings = Arc::new(OutboundResponseTimings::default());
@@ -399,6 +389,18 @@ mod tests {
         transport
             .send(rmcp::model::JsonRpcMessage::response(
                 rmcp::model::ServerResult::empty(()),
+                RequestId::Number(8),
+            ))
+            .await
+            .expect("send an unrelated response");
+        assert_eq!(
+            timings.armed_len(),
+            1,
+            "an unrelated delivery must leave the armed timing alone"
+        );
+        transport
+            .send(rmcp::model::JsonRpcMessage::response(
+                rmcp::model::ServerResult::empty(()),
                 RequestId::Number(7),
             ))
             .await
@@ -409,7 +411,7 @@ mod tests {
             "delivery must consume the armed timing so the map cannot grow"
         );
     }
-
+    #[hardwon("#1491: an error response also consumes its armed timing")]
     #[tokio::test]
     async fn an_error_response_also_consumes_its_armed_timing() {
         let timings = Arc::new(OutboundResponseTimings::default());
@@ -468,26 +470,7 @@ mod tests {
             .expect("second send task")
             .expect("second send");
     }
-
-    #[tokio::test]
-    async fn an_unrelated_outbound_message_leaves_armed_timings_alone() {
-        let timings = Arc::new(OutboundResponseTimings::default());
-        timings.arm(RequestId::Number(3), "query_code".to_string(), None);
-
-        let mut transport = ResponseTimingTransport::new(
-            ScriptedTransport(std::collections::VecDeque::new()),
-            Arc::clone(&timings),
-        );
-        transport
-            .send(rmcp::model::JsonRpcMessage::response(
-                rmcp::model::ServerResult::empty(()),
-                RequestId::Number(4),
-            ))
-            .await
-            .expect("send a different response");
-        assert_eq!(timings.armed_len(), 1);
-    }
-
+    #[hardwon("#1491: arming beyond the bound drops the new timing not the map")]
     #[test]
     fn arming_beyond_the_bound_drops_the_new_timing_not_the_map() {
         let timings = OutboundResponseTimings::default();
@@ -501,6 +484,26 @@ mod tests {
         assert_eq!(timings.armed_len(), MAX_ARMED_RESPONSE_TIMINGS);
     }
 
+    #[tokio::test]
+    async fn unrelated_traffic_does_not_revoke() {
+        let revocations = Arc::new(RootsRevocations::default());
+        let mut transport = RootsOrderedTransport::new(
+            ScriptedTransport(
+                [parse(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized"
+                }))]
+                .into_iter()
+                .collect(),
+            ),
+            Arc::clone(&revocations),
+        );
+        transport.receive().await.expect("the notification");
+        assert_eq!(revocations.observed(), 0);
+    }
+    #[hardwon(
+        "#1491: the rmcp host omitted required response delivery phase labels and correlation ids"
+    )]
     #[test]
     fn transport_phase_labels_match_the_hand_written_host_format() {
         assert_eq!(

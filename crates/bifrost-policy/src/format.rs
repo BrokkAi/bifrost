@@ -7,13 +7,10 @@
 use std::fmt;
 use std::ops::Range;
 
-use brokk_bifrost_rql::sexp::{Expr, ExprKind, SexpParseLimits, parse_sexp_with_limits};
+use brokk_bifrost_rql::sexp::{Expr, ExprKind, comments_in, flat_expr};
 
 use super::schema::{PolicyRecord, RecordLayout, lookup_field, records_from_label};
-use super::source::{
-    MAX_RQLP_SEXP_DEPTH, MAX_RQLP_SEXP_NODES, MAX_RQLP_SOURCE_BYTES, PolicySourceDiagnostic,
-    PolicySourceDiagnosticSeverity, PolicySourceError,
-};
+use super::source::PolicySourceError;
 
 pub const DEFAULT_RQLP_FORMAT_WIDTH: usize = 100;
 pub const MIN_RQLP_FORMAT_WIDTH: usize = 80;
@@ -105,54 +102,7 @@ fn source_line_ending(source: &str) -> &'static str {
 }
 
 fn parse_for_formatting(source: &str) -> Result<Expr, PolicySourceError> {
-    if source.len() > MAX_RQLP_SOURCE_BYTES {
-        return Err(format_error(
-            "source-too-large",
-            0..source.len(),
-            format!(
-                "RQLP source is too large: {} bytes exceeds {}",
-                source.len(),
-                MAX_RQLP_SOURCE_BYTES
-            ),
-        ));
-    }
-
-    let parsed = parse_sexp_with_limits(
-        source,
-        SexpParseLimits::new(MAX_RQLP_SEXP_DEPTH, MAX_RQLP_SEXP_NODES),
-    )
-    .map_err(|error| format_error("invalid-s-expression", error.range, error.message))?;
-    if let Some(error) = parsed.incomplete {
-        return Err(format_error(
-            "incomplete-s-expression",
-            error.range,
-            error.message,
-        ));
-    }
-    parsed.expr.ok_or_else(|| {
-        format_error(
-            "missing-document",
-            source.len()..source.len(),
-            "expected one `(policy ...)`, `(endpoint ...)`, or `(endpoint-set-document ...)` document",
-        )
-    })
-}
-
-fn format_error(
-    code: &'static str,
-    range: Range<usize>,
-    message: impl Into<String>,
-) -> PolicySourceError {
-    PolicySourceError {
-        diagnostic: PolicySourceDiagnostic {
-            code,
-            severity: PolicySourceDiagnosticSeverity::Error,
-            message: message.into(),
-            range,
-            fix: None,
-            related: Vec::new(),
-        },
-    }
+    super::source::parse_rqlp_expr(source)
 }
 
 struct PolicyFormatter<'a> {
@@ -164,7 +114,7 @@ impl PolicyFormatter<'_> {
     /// Render an expression at `depth`. `first_line_extra` reserves width for
     /// a field keyword that will be prepended to this expression's first line.
     fn render_expr(&self, expr: &Expr, depth: usize, first_line_extra: usize) -> Vec<String> {
-        if let Some(flat) = self.flat(expr)
+        if let Some(flat) = flat_expr(self.source, expr)
             && self.indent_width(depth) + first_line_extra + width(&flat) <= self.max_width
         {
             return vec![format!("{}{}", self.indent(depth), flat)];
@@ -187,11 +137,9 @@ impl PolicyFormatter<'_> {
         }
 
         let content_start = expr.range.start + 1;
-        let head_is_atom = is_atom(&items[0]);
+        let head_is_atom = items[0].is_atom();
         let keep_head = head_is_atom
-            && self
-                .comments_in(content_start..items[0].range.start)
-                .is_empty();
+            && comments_in(self.source, content_start..items[0].range.start).is_empty();
         let records = record_candidates(items);
         let mut lines = Vec::new();
         let mut item_index;
@@ -221,7 +169,7 @@ impl PolicyFormatter<'_> {
                 GroupKind::RegisteredField | GroupKind::GenericKeyword => {
                     let keyword = &items[item_index];
                     let value = &items[item_index + 1];
-                    let comments = self.comments_in(keyword.range.end..value.range.start);
+                    let comments = comments_in(self.source, keyword.range.end..value.range.start);
                     if comments.is_empty() {
                         lines.extend(self.render_keyword_value(keyword, value, depth + 1));
                     } else {
@@ -264,7 +212,7 @@ impl PolicyFormatter<'_> {
             } else {
                 items[index - 1].range.end
             };
-            let comments = self.comments_in(trivia_start..item.range.start);
+            let comments = comments_in(self.source, trivia_start..item.range.start);
             if !comments.is_empty() {
                 flush_packed_line(&mut lines, &mut packed_line);
                 self.push_comment_values(&mut lines, comments, depth + 1);
@@ -273,7 +221,7 @@ impl PolicyFormatter<'_> {
             if is_registered_record(item) {
                 flush_packed_line(&mut lines, &mut packed_line);
                 lines.extend(self.render_expr(item, depth + 1, 0));
-            } else if let Some(flat) = self.flat(item) {
+            } else if let Some(flat) = flat_expr(self.source, item) {
                 let indent = self.indent(depth + 1);
                 let candidate = match &packed_line {
                     Some(line) => format!("{line} {flat}"),
@@ -284,7 +232,7 @@ impl PolicyFormatter<'_> {
                 } else {
                     flush_packed_line(&mut lines, &mut packed_line);
                     let item_line = format!("{indent}{flat}");
-                    if width(&item_line) <= self.max_width || is_atom(item) {
+                    if width(&item_line) <= self.max_width || item.is_atom() {
                         packed_line = Some(item_line);
                     } else {
                         lines.extend(self.render_expr(item, depth + 1, 0));
@@ -313,7 +261,7 @@ impl PolicyFormatter<'_> {
     ) -> Vec<String> {
         let content_start = expr.range.start + open.len_utf8();
         let content_end = expr.range.end.saturating_sub(close.len_utf8());
-        let comments = self.comments_in(content_start..content_end);
+        let comments = comments_in(self.source, content_start..content_end);
         if comments.is_empty() {
             return vec![format!("{}{open}{close}", self.indent(depth))];
         }
@@ -366,51 +314,8 @@ impl PolicyFormatter<'_> {
         }
     }
 
-    fn flat(&self, expr: &Expr) -> Option<String> {
-        match &expr.kind {
-            ExprKind::List(items) => self.flat_sequence(expr, items, '(', ')'),
-            ExprKind::Vector(items) => self.flat_sequence(expr, items, '[', ']'),
-            _ => Some(self.source[expr.range.clone()].to_string()),
-        }
-    }
-
-    fn flat_sequence(
-        &self,
-        expr: &Expr,
-        items: &[Expr],
-        open: char,
-        close: char,
-    ) -> Option<String> {
-        let mut cursor = expr.range.start + open.len_utf8();
-        let mut output = String::new();
-        output.push(open);
-        for (index, item) in items.iter().enumerate() {
-            if !self.comments_in(cursor..item.range.start).is_empty() {
-                return None;
-            }
-            if index > 0 {
-                output.push(' ');
-            }
-            output.push_str(&self.flat(item)?);
-            cursor = item.range.end;
-        }
-        let closing_start = expr.range.end.saturating_sub(close.len_utf8());
-        if !self.comments_in(cursor..closing_start).is_empty() {
-            return None;
-        }
-        output.push(close);
-        Some(output)
-    }
-
-    fn comments_in(&self, range: Range<usize>) -> Vec<&str> {
-        self.source[range]
-            .lines()
-            .filter_map(|line| line.find(';').map(|start| line[start..].trim_end()))
-            .collect()
-    }
-
     fn push_comments(&self, lines: &mut Vec<String>, range: Range<usize>, depth: usize) {
-        let comments = self.comments_in(range);
+        let comments = comments_in(self.source, range);
         self.push_comment_values(lines, comments, depth);
     }
 
@@ -428,7 +333,7 @@ impl PolicyFormatter<'_> {
     }
 
     fn indent_width(&self, depth: usize) -> usize {
-        depth.saturating_mul(2)
+        brokk_bifrost_rql::sexp::indent_width(depth, 2)
     }
 }
 
@@ -458,10 +363,6 @@ fn keyword_label(expr: &Expr) -> Option<&str> {
     expr.as_symbol()?.strip_prefix(':')
 }
 
-fn is_atom(expr: &Expr) -> bool {
-    !matches!(expr.kind, ExprKind::List(_) | ExprKind::Vector(_))
-}
-
 fn flush_packed_line(lines: &mut Vec<String>, packed_line: &mut Option<String>) {
     if let Some(line) = packed_line.take() {
         lines.push(line);
@@ -475,22 +376,11 @@ fn width(value: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::source::{MAX_RQLP_SEXP_DEPTH, MAX_RQLP_SEXP_NODES, MAX_RQLP_SOURCE_BYTES};
 
     fn at_width(source: &str, max_width: usize) -> String {
         format_rqlp_source_with_options(source, &PolicyFormatOptions::new(max_width).unwrap())
             .unwrap()
-    }
-
-    #[test]
-    fn format_width_is_validated_and_defaults_to_one_hundred() {
-        assert_eq!(PolicyFormatOptions::default().max_width(), 100);
-        assert_eq!(PolicyFormatOptions::new(80).unwrap().max_width(), 80);
-        assert_eq!(PolicyFormatOptions::new(120).unwrap().max_width(), 120);
-        assert_eq!(PolicyFormatOptions::new(79).unwrap_err().max_width(), 79);
-        assert_eq!(
-            PolicyFormatOptions::new(121).unwrap_err().to_string(),
-            "RQLP format width must be from 80 through 120, found 121"
-        );
     }
 
     #[test]

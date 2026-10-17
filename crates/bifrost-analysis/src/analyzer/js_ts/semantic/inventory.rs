@@ -34,15 +34,15 @@ impl ReceiverCaptureSpec for ProcedureSpec<'_> {
     }
 
     fn relays_receiver_capture(&self) -> bool {
-        self.kind == ProcedureKind::Lambda
+        crate::analyzer::semantic::procedure_relays_receiver_capture(self.kind)
     }
 
     fn captures_receiver(&self) -> bool {
         self.captures_receiver
     }
 
-    fn require_receiver_capture(&mut self) {
-        self.captures_receiver = true;
+    fn captures_receiver_mut(&mut self) -> &mut bool {
+        &mut self.captures_receiver
     }
 }
 
@@ -75,21 +75,13 @@ pub(super) struct JsTsProcedureInventory<'tree> {
 pub(super) type ProcedureEnumeration<'tree> =
     ProcedureInventoryOutcome<JsTsProcedureInventory<'tree>>;
 
-enum JsTsInventoryPrepassStop {
-    Budget(ProcedureInventoryStop),
-    Cancelled,
-}
+use crate::analyzer::semantic::inventory::ProcedureInventoryPrepassStop as JsTsInventoryPrepassStop;
 
 fn charge_js_ts_inventory_prepass(
     inventory: &mut ProcedureInventoryBuilder<'_>,
     cancellation: &CancellationToken,
 ) -> Result<(), JsTsInventoryPrepassStop> {
-    if cancellation.is_cancelled() {
-        return Err(JsTsInventoryPrepassStop::Cancelled);
-    }
-    inventory
-        .charge_traversal_entry()
-        .map_err(JsTsInventoryPrepassStop::Budget)
+    crate::analyzer::semantic::inventory::charge_prepass(inventory, cancellation)
 }
 
 #[derive(Clone, Copy)]

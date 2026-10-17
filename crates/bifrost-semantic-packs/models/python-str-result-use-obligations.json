@@ -1,0 +1,199 @@
+{
+  "schema_version": 5,
+  "pack_id": "bifrost.python.str-result-use-obligations",
+  "version": "1.0.0",
+  "producer": { "name": "bifrost-reviewed-python-models", "version": "0.1.0" },
+  "language": "python",
+  "ecosystem": "python",
+  "compatibility": {
+    "bifrost": ">=0.12.0, <1.0.0",
+    "toolchains": [{ "name": "cpython", "requirement": ">=3.10.0, <3.15.0" }]
+  },
+  "provenance": {
+    "source": "CPython builtins.str reference and typeshed; reviewed pure transformations strip, lower, upper, and replace",
+    "revision": "typeshed 1620e225476597f34177351ef913dc8390dade30; CPython v3.13.5; assumption: annotated or inferred builtins.str receivers use the builtin implementation and builtin methods are not replaced; subclass and open flows remain outside this claim"
+  },
+  "license": "PSF-2.0",
+  "completeness": "complete",
+  "safety": { "generated_code_only": false, "review_required": false },
+  "shards": [
+    {
+      "id": "python.str.reviewed-declarations",
+      "activation": [
+        {
+          "toolchain": { "name": "cpython", "version": ">=3.10.0, <3.15.0" },
+          "targets": []
+        }
+      ],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {
+            "id": "type.python.builtins.str",
+            "name": "builtins.str",
+            "type_kind": "class",
+            "visibility": "public",
+            "aliases": ["str"],
+            "locator": { "kind": "artifact", "path": "builtins.pyi", "symbol": "str" }
+          }
+        ],
+        "members": [
+          {
+            "id": "member.python.builtins.str.strip",
+            "owner": "type.python.builtins.str",
+            "name": "strip",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": { "kind": "named", "name": "builtins.str" }
+            },
+            "locator": { "kind": "artifact", "path": "builtins.pyi", "symbol": "str.strip" }
+          },
+          {
+            "id": "member.python.builtins.str.lower",
+            "owner": "type.python.builtins.str",
+            "name": "lower",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": { "kind": "named", "name": "builtins.str" }
+            },
+            "locator": { "kind": "artifact", "path": "builtins.pyi", "symbol": "str.lower" }
+          },
+          {
+            "id": "member.python.builtins.str.upper",
+            "owner": "type.python.builtins.str",
+            "name": "upper",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": { "kind": "named", "name": "builtins.str" }
+            },
+            "locator": { "kind": "artifact", "path": "builtins.pyi", "symbol": "str.upper" }
+          },
+          {
+            "id": "member.python.builtins.str.replace",
+            "owner": "type.python.builtins.str",
+            "name": "replace",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                { "name": "old", "type": { "kind": "named", "name": "builtins.str" } },
+                { "name": "new", "type": { "kind": "named", "name": "builtins.str" } }
+              ],
+              "returns": { "kind": "named", "name": "builtins.str" }
+            },
+            "locator": { "kind": "artifact", "path": "builtins.pyi", "symbol": "str.replace" }
+          }
+        ],
+        "relations": []
+      }
+    },
+    {
+      "id": "python.str.reviewed-result-use",
+      "activation": [
+        {
+          "toolchain": { "name": "cpython", "version": ">=3.10.0, <3.15.0" },
+          "targets": []
+        }
+      ],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "python.builtins.str.strip.result-use",
+            "target": {
+              "path": "builtins.pyi",
+              "symbol": "builtins.str.strip()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "ordinary_heap_unchanged": true,
+            "covers_overrides": true,
+            "normal_result_count": 1,
+            "transfers": [
+              { "input": { "kind": "receiver" }, "exit_kind": "normal", "output": { "kind": "normal_return" } }
+            ],
+            "effects": [],
+            "result_use_obligations": [
+              { "result_ordinal": 0, "kind": "pure_transformation_value" }
+            ]
+          },
+          {
+            "id": "python.builtins.str.lower.result-use",
+            "target": {
+              "path": "builtins.pyi",
+              "symbol": "builtins.str.lower()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "ordinary_heap_unchanged": true,
+            "covers_overrides": true,
+            "normal_result_count": 1,
+            "transfers": [
+              { "input": { "kind": "receiver" }, "exit_kind": "normal", "output": { "kind": "normal_return" } }
+            ],
+            "effects": [],
+            "result_use_obligations": [
+              { "result_ordinal": 0, "kind": "pure_transformation_value" }
+            ]
+          },
+          {
+            "id": "python.builtins.str.upper.result-use",
+            "target": {
+              "path": "builtins.pyi",
+              "symbol": "builtins.str.upper()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "ordinary_heap_unchanged": true,
+            "covers_overrides": true,
+            "normal_result_count": 1,
+            "transfers": [
+              { "input": { "kind": "receiver" }, "exit_kind": "normal", "output": { "kind": "normal_return" } }
+            ],
+            "effects": [],
+            "result_use_obligations": [
+              { "result_ordinal": 0, "kind": "pure_transformation_value" }
+            ]
+          },
+          {
+            "id": "python.builtins.str.replace.result-use",
+            "target": {
+              "path": "builtins.pyi",
+              "symbol": "builtins.str.replace(old, new)",
+              "has_receiver": true,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "ordinary_heap_unchanged": true,
+            "covers_overrides": true,
+            "normal_result_count": 1,
+            "transfers": [
+              { "input": { "kind": "receiver" }, "exit_kind": "normal", "output": { "kind": "normal_return" } }
+            ],
+            "effects": [],
+            "result_use_obligations": [
+              { "result_ordinal": 0, "kind": "pure_transformation_value" }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

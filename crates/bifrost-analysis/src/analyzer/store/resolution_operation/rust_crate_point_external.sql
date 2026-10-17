@@ -8,18 +8,21 @@
 -- rule the export lookup applies to a declaration.
 SELECT DISTINCT mount.mount_ordinal, json_extract(binding.end_fixed_key,'$[#-2][0]')
  FROM targets
- CROSS JOIN rust_crate_gaps AS gap
-  ON gap.topology_id=targets.topology_id AND gap.gap_kind='external_dependency'
+ CROSS JOIN selected_rust_unit_summaries AS unit ON unit.topology_id=targets.topology_id
+ CROSS JOIN main.rust_resolution_unit_summary_gaps AS gap
+  ON gap.summary_id=unit.summary_id AND gap.gap_kind='external_dependency'
   AND gap.subject=targets.module_path || '::' || targets.name
  CROSS JOIN json_each(gap.detail, '$.evidence') AS evidence
- CROSS JOIN rust_crate_container_sources AS source
-  ON source.topology_id=targets.topology_id AND source.container_path=targets.module_path
+ CROSS JOIN main.rust_resolution_unit_summary_placements AS source
+  ON source.summary_id=unit.summary_id AND source.module_path=targets.module_path
+ CROSS JOIN main.resolution_unit_summary_members AS member
+  ON member.summary_id=source.summary_id AND member.member_ordinal=source.member_ordinal
  CROSS JOIN source_rust_import_targets AS import
-  ON import.blob_id=source.blob_id AND import.ordinal=evidence.value ->> 'import_ordinal'
+  ON import.blob_id=member.blob_id AND import.ordinal=evidence.value ->> 'import_ordinal'
   AND import.bound_name=targets.name
  CROSS JOIN temp.selected_resolution_mounts AS mount
   ON mount.blob_id=import.blob_id AND mount.storage_language='rust'
-  AND mount.persisted_relative_path=source.rel_path
+  AND mount.persisted_relative_path=member.rel_path
  CROSS JOIN resolution_node_catalog AS scope
   ON scope.blob_id=import.blob_id AND scope.source_scope=import.native_scope
  CROSS JOIN resolution_paths AS binding

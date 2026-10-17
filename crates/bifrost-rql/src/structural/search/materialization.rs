@@ -13,15 +13,16 @@
 //! that no active configuration is known. An empty answer is never silently a
 //! complete one.
 
-use super::super::materialization::MaterializationAxis;
+use super::super::materialization::{MaterializationAxis, SourceExportLocalDefinition};
 use super::super::materialization_rows::{
     DeclarationStateRow, ExportRow, GenerationSiteRow, MaterializationCompleteness,
     MaterializationFileResult, MaterializationIncompleteReason, materialization_for_file,
 };
 use super::results::{
     CodeQueryDeclarationState, CodeQueryDiagnostic, CodeQueryDiagnosticCode,
-    CodeQueryDiagnosticImpact, CodeQueryExport, CodeQueryGeneratedDeclaration,
-    CodeQueryGenerationSite, CodeQueryRange,
+    CodeQueryDiagnosticImpact, CodeQueryExport, CodeQueryExportBinding,
+    CodeQueryExportLocalDefinition, CodeQueryGeneratedDeclaration, CodeQueryGenerationSite,
+    CodeQueryRange,
 };
 use crate::analyzer::semantic::LengthDelimitedDigest;
 use crate::analyzer::{IAnalyzer, Language, ProjectFile};
@@ -93,6 +94,7 @@ impl MaterializationTraversalCache {
                     continue;
                 }
                 diagnostics.push(CodeQueryDiagnostic {
+                    source: None,
                     code,
                     impact: CodeQueryDiagnosticImpact::Incomplete,
                     branch: Vec::new(),
@@ -103,6 +105,7 @@ impl MaterializationTraversalCache {
                         axis.label()
                     ),
                 exhausted_roots: Vec::new(),
+                    withheld_rows_path: None,
                 });
                 continue;
             }
@@ -110,6 +113,7 @@ impl MaterializationTraversalCache {
                 continue;
             }
             diagnostics.push(CodeQueryDiagnostic {
+                source: None,
                 code,
                 impact: CodeQueryDiagnosticImpact::Incomplete,
                 branch: Vec::new(),
@@ -125,6 +129,7 @@ impl MaterializationTraversalCache {
                     axis.label()
                 ),
             exhausted_roots: Vec::new(),
+                withheld_rows_path: None,
             });
         }
     }
@@ -137,6 +142,15 @@ fn incomplete_reason_label(reason: &MaterializationIncompleteReason) -> &'static
         MaterializationIncompleteReason::FactsUnavailable => "no structural facts",
         MaterializationIncompleteReason::DynamicGenerationPresent => {
             "a generation site has dynamic inputs"
+        }
+        MaterializationIncompleteReason::DynamicExportSurface => {
+            "the Python export surface has dynamic inputs"
+        }
+        MaterializationIncompleteReason::DynamicExportDefinition => {
+            "Python module definitions may be dynamic"
+        }
+        MaterializationIncompleteReason::ExportSyntaxUnavailable => {
+            "Python export syntax is unavailable"
         }
         MaterializationIncompleteReason::NoActiveConfiguration => {
             "no active preprocessing configuration is known"
@@ -350,19 +364,45 @@ pub(super) fn public_generation_site(
 }
 
 /// The public projection of one export row.
-pub(super) fn public_export(value: &ExportValue, range: CodeQueryRange) -> CodeQueryExport {
+pub(super) fn public_export(
+    value: &ExportValue,
+    range: CodeQueryRange,
+    binding_range: Option<CodeQueryRange>,
+) -> CodeQueryExport {
     let row = value.row();
+    let metadata = super::public_source_metadata(&row.file, row.range, range);
+    let local_definition = row
+        .local_definition
+        .as_ref()
+        .map(|definition| match definition {
+            SourceExportLocalDefinition::Defined { binding } => {
+                let range =
+                    binding_range.expect("defined export binding has a rendered source range");
+                CodeQueryExportLocalDefinition::Defined {
+                    binding: CodeQueryExportBinding {
+                        name: binding.name.clone(),
+                        kind: binding.kind.label().to_owned(),
+                        start_byte: binding.range.start_byte,
+                        end_byte: binding.range.end_byte,
+                        range,
+                    },
+                }
+            }
+            SourceExportLocalDefinition::Undefined => CodeQueryExportLocalDefinition::Undefined,
+            SourceExportLocalDefinition::Unknown => CodeQueryExportLocalDefinition::Unknown,
+        });
     CodeQueryExport {
         id: value.id(),
         ast_id: row.ast_id(),
-        path: super::rel_path_string(&row.file),
-        language: crate::analyzer::common::language_for_file(&row.file).config_label(),
-        range,
-        start_byte: row.range.start_byte,
-        end_byte: row.range.end_byte,
+        path: metadata.path,
+        language: metadata.language,
+        range: metadata.range,
+        start_byte: metadata.start_byte,
+        end_byte: metadata.end_byte,
         form: row.form.label(),
         exported_name: row.exported_name.clone(),
         target_fq_name: row.target.as_ref().map(|unit| unit.fq_name().to_string()),
+        local_definition,
     }
 }
 
@@ -391,185 +431,31 @@ pub(super) fn public_declaration_state(
 #[cfg(test)]
 mod tests {
     use super::super::execute_with_limits;
-    use super::super::results::CodeQueryResultValue;
-    use crate::analyzer::{
-        AnalyzerConfig, Language, Project, ProjectFile, TestProject, WorkspaceAnalyzer,
-    };
+    use crate::analyzer::Language;
     use crate::structural::{CodeQuery, CodeQueryExecutionLimits};
-    use std::path::PathBuf;
-    use std::sync::Arc;
-    use tempfile::TempDir;
+    use brokk_bifrost_analysis::test_support::AnalyzerFixture;
 
     struct Fixture {
-        _temp: TempDir,
-        workspace: WorkspaceAnalyzer,
+        analyzer: AnalyzerFixture,
     }
 
     impl Fixture {
         fn new(language: Language, relative_path: &str, source: &str) -> Self {
-            let temp = tempfile::tempdir().expect("temp dir");
-            let root: PathBuf = temp.path().canonicalize().expect("canonical root");
-            let file = ProjectFile::new(root.clone(), relative_path);
-            file.write(source).expect("write fixture source");
-            let project = TestProject::new(root, language);
-            let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
-                Arc::new(project) as Arc<dyn Project>,
-                AnalyzerConfig::default(),
-            )
-            .expect("ephemeral workspace should build");
             Self {
-                _temp: temp,
-                workspace,
+                analyzer: AnalyzerFixture::new_for_language(language, &[(relative_path, source)]),
             }
         }
 
         fn run(&self, rql: &str) -> super::super::results::CodeQueryResult {
             let query = CodeQuery::from_sexp(rql).expect("query should parse");
             execute_with_limits(
-                self.workspace.analyzer(),
+                self.analyzer.analyzer().analyzer(),
                 &query,
                 CodeQueryExecutionLimits::default(),
             )
         }
     }
 
-    /// End to end over the RQL surface: a literal Ruby generation site is one
-    /// row with an exact generated set, and `generates` joins it to the
-    /// declaration-state rows of what it materialized.
-    #[test]
-    fn generation_sites_execute_end_to_end() {
-        let fixture = Fixture::new(
-            Language::Ruby,
-            "widget.rb",
-            "class Widget\n  attr_accessor :name\nend\n",
-        );
-
-        let result = fixture.run("(generation-sites :kind accessor_macro)");
-        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
-        assert_eq!(result.results.len(), 1, "{:?}", result.results);
-        let CodeQueryResultValue::GenerationSite { value } = &result.results[0].value else {
-            panic!(
-                "expected a generation-site row: {:?}",
-                result.results[0].value
-            );
-        };
-        assert_eq!(value.kind, "accessor_macro");
-        assert_eq!(value.input, "literal");
-        assert_eq!(value.generated_count, 3);
-        assert!(value.ast_id.is_some(), "a Ruby macro call is a fact");
-
-        let result = fixture.run("(generates (generation-sites :kind accessor_macro))");
-        let origins: Vec<_> = result
-            .results
-            .iter()
-            .map(|row| match &row.value {
-                CodeQueryResultValue::DeclarationState { value } => {
-                    (value.fq_name.clone(), value.origin)
-                }
-                other => panic!("expected declaration-state rows: {other:?}"),
-            })
-            .collect();
-        assert_eq!(
-            origins,
-            vec![
-                ("Widget.@name".to_string(), "generated"),
-                ("Widget.name".to_string(), "generated"),
-                ("Widget.name=".to_string(), "generated"),
-            ]
-        );
-    }
-
-    /// A dynamic site stays visible and the run says the generated sets are
-    /// not the whole answer.
-    #[test]
-    fn dynamic_generation_reports_incomplete() {
-        let fixture = Fixture::new(
-            Language::Ruby,
-            "dynamic.rb",
-            "class Widget\n  attr_reader label.to_sym\nend\n",
-        );
-        let result = fixture.run("(generation-sites)");
-        assert_eq!(result.results.len(), 1);
-        let CodeQueryResultValue::GenerationSite { value } = &result.results[0].value else {
-            panic!("expected a generation-site row");
-        };
-        assert_eq!(value.input, "dynamic");
-        assert_eq!(value.generated_count, 0);
-        assert!(
-            result.diagnostics.iter().any(|diagnostic| matches!(
-                diagnostic.code,
-                super::CodeQueryDiagnosticCode::MaterializationDerivationIncomplete
-            )),
-            "{:?}",
-            result.diagnostics
-        );
-    }
-
-    /// Export rows execute with their forms, and `export-target` projects the
-    /// synthetic default unit as a declaration.
-    #[test]
-    fn exports_execute_end_to_end() {
-        let fixture = Fixture::new(
-            Language::JavaScript,
-            "exports.js",
-            "export const answer = 42;\nexport default { greet: 'hi' };\n",
-        );
-        let result = fixture.run("(exports :form default_anonymous)");
-        assert_eq!(result.results.len(), 1, "{:?}", result.results);
-        let CodeQueryResultValue::Export { value } = &result.results[0].value else {
-            panic!("expected an export row");
-        };
-        assert_eq!(value.exported_name, "default");
-        assert_eq!(value.target_fq_name.as_deref(), Some("default"));
-
-        let result = fixture.run("(export-target (exports :form default_anonymous))");
-        assert_eq!(result.results.len(), 1, "{:?}", result.results);
-        assert!(matches!(
-            &result.results[0].value,
-            CodeQueryResultValue::Declaration { .. }
-        ));
-    }
-
-    /// The inverse linkage step (#1660): an implementation answers with
-    /// exactly its own declaration-only stub state rows, walking the same
-    /// link rows `implementation-of` walks forward.
-    #[test]
-    fn stubs_of_executes_end_to_end() {
-        let fixture = Fixture::new(
-            Language::Python,
-            "over.py",
-            "from typing import overload\n\
-             @overload\n\
-             def parse(value: int) -> int: ...\n\
-             @overload\n\
-             def parse(value: str) -> str: ...\n\
-             def parse(value):\n    return value\n",
-        );
-        let result = fixture.run("(stubs-of (enclosing-decl (function)))");
-        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
-        let stubs: Vec<_> = result
-            .results
-            .iter()
-            .map(|row| match &row.value {
-                CodeQueryResultValue::DeclarationState { value } => {
-                    (value.fq_name.clone(), value.declaration_only)
-                }
-                other => panic!("expected declaration-state rows: {other:?}"),
-            })
-            .collect();
-        assert_eq!(
-            stubs,
-            vec![
-                ("over.parse".to_string(), true),
-                ("over.parse".to_string(), true),
-            ],
-            "{:?}",
-            result.results
-        );
-    }
-
-    /// The unclaimed-language abstention arrives as a typed diagnostic, never
-    /// as a silently empty complete answer.
     #[test]
     fn unclaimed_language_reports_axis_unsupported() {
         let fixture = Fixture::new(Language::Go, "main.go", "package main\nfunc main() {}\n");

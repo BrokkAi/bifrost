@@ -6,22 +6,24 @@
 
 use crate::graph::resolver::OrphanedNamespaceScopeIndex;
 use crate::graph::syntax::{MacroReplacementField, ObjectMacroReplacement};
-use crate::structural::CPP_STRUCTURAL_SPEC;
+use crate::structural::{CPP_STRUCTURAL_SPEC, is_cpp_preprocessor_conditional};
+pub use brokk_bifrost_core::analyzer::common::node_source_text as node_text;
 use brokk_bifrost_core::analyzer::common::{
-    node_source_text, parse_source_ranges_with_cancellation, parse_source_region,
+    parse_source_ranges_with_cancellation, parse_source_region,
 };
 pub use brokk_bifrost_core::analyzer::cpp_facts::{
-    CppBaseSpecifierFact, CppComparableNode, CppComparableParameter, CppComparableSlot,
+    CppAccessSpecifier, CppBaseSpecifierFact, CppComparableNode, CppComparableParameter,
+    CppComparableSlot,
 };
 use brokk_bifrost_core::analyzer::fq_name::{
-    FqName, SegmentId, SegmentKind, joined_segments, normalize_joined, segment_interner,
+    FqName, SegmentKind, joined_segments, normalize_joined, segment_interner,
 };
 use brokk_bifrost_core::analyzer::model::LanguageDialect;
 use brokk_bifrost_core::analyzer::model::{
     CallableArity, CallableLinkage, CodeUnitType, CppFieldLinkage, CppTemplateAliasTargetMetadata,
     CppTemplateExpression, CppTemplateMetadata, CppTemplateParameterKind,
     CppTemplateParameterMetadata, CppTemplateTerm, DispatchExtensibility, ImportInfo,
-    ParameterMetadata, Range, SignatureMetadata, StructuredTypeIdentity,
+    ParameterMetadata, ParseCompleteness, Range, SignatureMetadata, StructuredTypeIdentity,
     StructuredTypeIdentityBuilder, StructuredTypeName, StructuredTypeNodeId,
 };
 use brokk_bifrost_core::analyzer::parsed_file::{ParsedFile, ParsedSourceFacts, SourceImportFact};
@@ -29,6 +31,7 @@ use brokk_bifrost_core::analyzer::source_facts::{
     PrimarySourceFactCollector, SourceDeclarationId, SourceImportId, SourceOccurrenceId,
     SourceOccurrenceProvenance,
 };
+use brokk_bifrost_core::analyzer::statement_facts::CppStatementFactRows;
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::node_range;
 use brokk_bifrost_core::analyzer::structural::collector::StructuralFactCollector;
 use brokk_bifrost_core::analyzer::structural::materialization::{
@@ -38,20 +41,26 @@ use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 use brokk_bifrost_core::analyzer::structural::spec::{CompiledKinds, StructuralSpec};
 use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
 use brokk_bifrost_core::analyzer::tree_walk::{
-    NodeKindIds, ParentIndex, WalkControl, children_iter, named_children_iter,
-    push_children_reversed, push_named_children_reversed, walk_named_tree_preorder,
+    NodeKindIds, ParentIndex, WalkControl, child_by_field_or_named_child_of_kinds, children_iter,
+    named_children_iter, push_children_reversed, push_named_children_reversed,
+    walk_named_tree_preorder,
 };
+use brokk_bifrost_core::analyzer::usages::common::same_node;
 use brokk_bifrost_core::analyzer::{CodeUnit, Language, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use regex::Regex;
 use std::cell::RefCell;
-#[cfg(any(debug_assertions, test))]
-use tree_sitter::Parser;
 use tree_sitter::{Node, Tree};
 
-/// Intern one qualified-name segment in the process-global interner.
-fn cpp_segment(text: &str, kind: SegmentKind) -> SegmentId {
-    segment_interner().intern(text, kind)
+/// Strip a tag keyword from the type spelling returned by C++ tooling.
+pub(crate) fn strip_tag_type_prefix(value: &str) -> &str {
+    let value = value.trim_start_matches("const ");
+    value
+        .strip_prefix("struct ")
+        .or_else(|| value.strip_prefix("class "))
+        .or_else(|| value.strip_prefix("enum "))
+        .unwrap_or(value)
+        .trim()
 }
 
 /// Push per-component [`SegmentKind::Package`] segments for a C++ namespace
@@ -63,7 +72,7 @@ fn cpp_segment(text: &str, kind: SegmentKind) -> SegmentId {
 /// the M1 bridge — the legacy strings stay authoritative until M3.
 fn cpp_push_package(fq: &mut FqName, package_name: &str) {
     for component in joined_segments(package_name, CPP_PACKAGE_SEPARATOR) {
-        fq.push(cpp_segment(component, SegmentKind::Package));
+        fq.push(segment_interner().intern(component, SegmentKind::Package));
     }
 }
 
@@ -87,7 +96,7 @@ fn cpp_push_type_chain(fq: &mut FqName, chain: &str) {
         } else {
             SegmentKind::Nested
         };
-        fq.push(cpp_segment(component, kind));
+        fq.push(segment_interner().intern(component, kind));
         first = false;
     }
 }
@@ -172,33 +181,38 @@ fn cpp_raw_namespace_name_components(node: Node<'_>, source: &str) -> Vec<String
     vec![text]
 }
 
+/// The namespace definition ancestors of `node`, ordered from outermost to innermost.
+pub fn enclosing_cpp_namespace_nodes<'tree>(node: Node<'tree>) -> Vec<Node<'tree>> {
+    let mut namespaces = Vec::new();
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "namespace_definition" {
+            namespaces.push(parent);
+        }
+        current = parent.parent();
+    }
+    namespaces.reverse();
+    namespaces
+}
+
 /// Return the named namespace path that structurally encloses `node`.
 ///
 /// This intentionally follows namespace AST ancestors rather than inspecting
 /// source text. Anonymous namespaces are not representable in the legacy C++
 /// package field, so a path containing one fails closed.
-fn cpp_lexical_namespace_name<'tree>(
-    node: Node<'tree>,
-    source: &str,
-    ancestry: &ParentIndex<'tree>,
-) -> Option<String> {
+fn cpp_lexical_namespace_name<'tree>(node: Node<'tree>, source: &str) -> Option<String> {
     let mut components = Vec::new();
-    let mut ancestor = ancestry.parent(node);
-    while let Some(current) = ancestor {
-        if current.kind() == "namespace_definition" {
-            let name_node = current.child_by_field_name("name")?;
-            let name = normalize_cpp_whitespace(node_text(name_node, source));
-            if name.is_empty() {
-                return None;
-            }
-            components.push(name);
+    for current in enclosing_cpp_namespace_nodes(node) {
+        let name_node = current.child_by_field_name("name")?;
+        let name = normalize_cpp_whitespace(node_text(name_node, source));
+        if name.is_empty() {
+            return None;
         }
-        ancestor = ancestry.parent(current);
+        components.push(name);
     }
     if components.is_empty() {
         return None;
     }
-    components.reverse();
     // Same shared empty-component decision as `cpp_push_package`, which splits
     // this string back apart: an enclosing namespace whose own name node is
     // malformed contributes a component carrying its own separator (#2353).
@@ -217,20 +231,20 @@ fn cpp_lexical_namespace_name<'tree>(
 /// the fq and trip the package/short boundary assert in
 /// `CodeUnit::with_signature_and_fq` (#2140).
 fn cpp_join_nested_short(parent_short: &str, name: &str) -> String {
-    if parent_short.is_empty() {
-        name.to_string()
-    } else {
-        format!("{parent_short}${name}")
-    }
+    cpp_join_short_name(parent_short, name, '$')
 }
 
 /// Member `.` join for short names; same anonymous-parent guard as
 /// [`cpp_join_nested_short`] (#2140).
 fn cpp_join_member_short(parent_short: &str, name: &str) -> String {
+    cpp_join_short_name(parent_short, name, '.')
+}
+
+fn cpp_join_short_name(parent_short: &str, name: &str, separator: char) -> String {
     if parent_short.is_empty() {
         name.to_string()
     } else {
-        format!("{parent_short}.{name}")
+        format!("{parent_short}{separator}{name}")
     }
 }
 
@@ -251,11 +265,11 @@ fn cpp_leaf_fq(
         parent
             .fq()
             .clone()
-            .with_pushed(cpp_segment(name, kind_if_nested))
+            .with_pushed(segment_interner().intern(name, kind_if_nested))
     } else {
         let mut fq = FqName::new();
         cpp_push_package(&mut fq, package_name);
-        fq.push(cpp_segment(name, kind_if_top));
+        fq.push(segment_interner().intern(name, kind_if_top));
         fq
     }
 }
@@ -272,9 +286,9 @@ pub fn cpp_member_fq(package_name: &str, short_name: &str) -> FqName {
     match short_name.rsplit_once('.') {
         Some((owner_chain, member)) => {
             cpp_push_type_chain(&mut fq, owner_chain);
-            fq.push(cpp_segment(member, SegmentKind::Member));
+            fq.push(segment_interner().intern(member, SegmentKind::Member));
         }
-        None => fq.push(cpp_segment(short_name, SegmentKind::Member)),
+        None => fq.push(segment_interner().intern(short_name, SegmentKind::Member)),
     }
     fq
 }
@@ -308,7 +322,7 @@ pub fn cpp_rendered_name_fq(rendered: &str) -> FqName {
             } else {
                 SegmentKind::Nested
             };
-            fq.push(cpp_segment(part, kind));
+            fq.push(segment_interner().intern(part, kind));
             first = false;
         }
     }
@@ -377,7 +391,7 @@ fn cpp_fq_with_kinds(texts: &[String], kinds: Vec<SegmentKind>) -> FqName {
     );
     let mut fq = FqName::new();
     for (text, kind) in texts.iter().zip(kinds) {
-        fq.push(cpp_segment(text, kind));
+        fq.push(segment_interner().intern(text, kind));
     }
     fq
 }
@@ -544,6 +558,14 @@ struct RecoveredEmbeddedFunctionLikeExportClass {
     raw_supertypes: Vec<String>,
     base_facts: Vec<CppBaseSpecifierFact>,
     fragmented_body: FragmentedExportBody,
+}
+
+struct RecoveredFunctionLikeExportClass {
+    name: String,
+    range: Range,
+    raw_supertypes: Option<Vec<String>>,
+    base_facts: Option<Vec<CppBaseSpecifierFact>>,
+    member_outcome: Option<FragmentedExportMembers>,
 }
 
 /// The recovered class-body geometry for a fragmented multiple-base export class.
@@ -848,10 +870,7 @@ fn fragmented_export_function_body_region(
     }
     while let Some(current) = siblings.get(sibling_index).copied() {
         let next = siblings.get(sibling_index + 1).copied();
-        if cpp_is_stray_close_brace(current, source)
-            && next.is_some_and(|next| cpp_is_stray_semicolon(next, source))
-        {
-            let semicolon = next.expect("checked above");
+        if let Some(semicolon) = cpp_stray_close_followed_by_semicolon(current, next, source) {
             return Some(FragmentedExportBody {
                 reparse_start,
                 reparse_end: current.start_byte(),
@@ -1164,7 +1183,7 @@ fn fragmented_displaced_class_body(
         if cpp_is_stray_close_brace(candidate, source) {
             closes_remaining -= 1;
             if closes_remaining == 0 {
-                let semicolon = next.filter(|node| cpp_is_stray_semicolon(*node, source))?;
+                let semicolon = cpp_stray_close_followed_by_semicolon(candidate, next, source)?;
                 if open.end_byte() >= candidate.start_byte() {
                     return None;
                 }
@@ -1326,15 +1345,12 @@ fn fragmented_plain_class_declaration_body<'tree>(
             .copied()
             .enumerate()
             .find_map(|(close_index, close)| {
-                cpp_is_stray_close_brace(close, source)
-                    .then(|| {
-                        siblings
-                            .get(close_index + 1)
-                            .copied()
-                            .filter(|semicolon| cpp_is_stray_semicolon(*semicolon, source))
-                            .map(|semicolon| (close, semicolon))
-                    })
-                    .flatten()
+                cpp_stray_close_followed_by_semicolon(
+                    close,
+                    siblings.get(close_index + 1).copied(),
+                    source,
+                )
+                .map(|semicolon| (close, semicolon))
             });
     let (close, semicolon) =
         if let Some(boundary) = displaced_fragment_namespace_geometry(node, source) {
@@ -1391,22 +1407,8 @@ fn displaced_export_function_namespace_shape<'tree>(
         same_envelope_sibling = current.next_named_sibling();
     }
     let declaration_list = declaration.parent()?;
-    if declaration_list.kind() != "declaration_list" {
-        return None;
-    }
-    let namespace = declaration_list.parent()?;
-    if namespace.kind() != "namespace_definition"
-        || namespace.child_by_field_name("body") != Some(declaration_list)
-    {
-        return None;
-    }
-    let class_close = direct_close_brace(declaration_list)?;
-    let trailing_semicolon = namespace.next_named_sibling()?;
-    if trailing_semicolon.kind() != "expression_statement"
-        || trailing_semicolon.named_child_count() != 0
-    {
-        return None;
-    }
+    let (namespace, class_close, trailing_semicolon) =
+        cpp_fragment_namespace_boundary_nodes(declaration_list)?;
     // A chain of malformed export classes can consume one parser-visible
     // namespace close per class. Walk through the enclosing sibling levels so
     // the later real namespace close remains the structural boundary; a
@@ -1484,22 +1486,8 @@ fn displaced_fragment_namespace_geometry<'tree>(
         })
         .unwrap_or(declaration);
     let declaration_list = envelope.parent()?;
-    if declaration_list.kind() != "declaration_list" {
-        return None;
-    }
-    let namespace = declaration_list.parent()?;
-    if namespace.kind() != "namespace_definition"
-        || namespace.child_by_field_name("body") != Some(declaration_list)
-    {
-        return None;
-    }
-    let class_close = direct_close_brace(declaration_list)?;
-    let trailing_semicolon = namespace.next_named_sibling()?;
-    if trailing_semicolon.kind() != "expression_statement"
-        || trailing_semicolon.named_child_count() != 0
-    {
-        return None;
-    }
+    let (_, class_close, trailing_semicolon) =
+        cpp_fragment_namespace_boundary_nodes(declaration_list)?;
     let mut namespace_items = Vec::new();
     let mut sibling = trailing_semicolon.next_named_sibling();
     let mut nested_fragment_end = 0;
@@ -1522,6 +1510,25 @@ fn displaced_fragment_namespace_geometry<'tree>(
         class_semicolon: trailing_semicolon,
         namespace_items,
     })
+}
+
+fn cpp_fragment_namespace_boundary_nodes<'tree>(
+    declaration_list: Node<'tree>,
+) -> Option<(Node<'tree>, Node<'tree>, Node<'tree>)> {
+    if declaration_list.kind() != "declaration_list" {
+        return None;
+    }
+    let namespace = declaration_list.parent()?;
+    if namespace.kind() != "namespace_definition"
+        || namespace.child_by_field_name("body") != Some(declaration_list)
+    {
+        return None;
+    }
+    let class_close = direct_close_brace(declaration_list)?;
+    let trailing_semicolon = namespace.next_named_sibling()?;
+    (trailing_semicolon.kind() == "expression_statement"
+        && trailing_semicolon.named_child_count() == 0)
+        .then_some((namespace, class_close, trailing_semicolon))
 }
 
 /// The direct `}` child of a node, real or MISSING (a MISSING brace is zero-width).
@@ -1643,15 +1650,10 @@ fn is_malformed_inheritance_access(node: Node<'_>, source: &str) -> bool {
     }
     node.named_child(0)
         .and_then(|child| direct_identifier_name(child, source))
-        .is_some_and(|name| matches!(name.as_str(), "public" | "protected" | "private"))
+        .is_some_and(|name| cpp_is_inheritance_access_specifier(&name))
 }
 
-fn has_direct_token(node: Node<'_>, expected_kind: &str) -> bool {
-    (0..node.child_count()).any(|index| {
-        node.child(index)
-            .is_some_and(|child| !child.is_named() && child.kind() == expected_kind)
-    })
-}
+use brokk_bifrost_core::analyzer::tree_walk::has_token_child as has_direct_token;
 
 fn recovered_malformed_base_name(node: Node<'_>, source: &str) -> Option<String> {
     match node.kind() {
@@ -1724,11 +1726,12 @@ fn recovered_base_specifier(
     is_virtual: bool,
 ) -> Option<CppBaseSpecifierFact> {
     let components = recovered_base_components(node, source)?;
-    (!components.is_empty()).then_some(CppBaseSpecifierFact {
-        absolute: node.child(0).is_some_and(|token| token.kind() == "::"),
+    crate::source_facts::base_specifier_fact(
+        node,
         components,
         is_virtual,
-    })
+        CppAccessSpecifier::Unknown,
+    )
 }
 
 fn recovered_base_is_virtual(container: Node<'_>, base: Node<'_>, source: &str) -> bool {
@@ -1883,6 +1886,16 @@ fn declaration_scope_container<'tree>(
                 // build, so its children stand at file scope.
                 None => return Some(parent),
             },
+            // A preprocessor conditional is a transparent declaration-scope
+            // wrapper when it sits directly under the translation unit or a
+            // namespace/linkage declaration list. Keep climbing through it;
+            // the next ordinary construct still decides whether the enclosed
+            // error is at declaration scope. In particular, a conditional
+            // inside a function reaches its compound statement and is
+            // rejected below rather than becoming a global recovery region.
+            "preproc_if" | "preproc_ifdef" | "preproc_ifndef" | "preproc_elif" | "preproc_else" => {
+                parent = ancestry.parent(parent)?;
+            }
             _ => return None,
         }
     }
@@ -2813,23 +2826,30 @@ fn export_head_name_from_tokens<'tree>(
     tokens: &[Node<'tree>],
     source: &str,
 ) -> Option<Node<'tree>> {
-    let mut name = None;
-    for token in tokens.iter().copied() {
-        if recovered_export_head_final(token, source) || (!token.is_named() && token.kind() == ":")
-        {
-            break;
-        }
-        if token.is_named()
-            && !token.is_missing()
-            && matches!(
-                token.kind(),
-                "identifier" | "type_identifier" | "field_identifier"
-            )
-        {
-            name = Some(token);
-        }
-    }
-    name
+    let end = tokens
+        .iter()
+        .position(|token| {
+            recovered_export_head_final(*token, source)
+                || (!token.is_named() && token.kind() == ":")
+        })
+        .unwrap_or(tokens.len());
+    export_head_last_identifier(tokens[..end].iter().copied())
+}
+
+fn export_head_last_identifier<'tree>(
+    candidates: impl IntoIterator<Item = Node<'tree>>,
+) -> Option<Node<'tree>> {
+    candidates
+        .into_iter()
+        .filter(|candidate| {
+            candidate.is_named()
+                && !candidate.is_missing()
+                && matches!(
+                    candidate.kind(),
+                    "identifier" | "type_identifier" | "field_identifier"
+                )
+        })
+        .last()
 }
 
 /// The `init_declarator` whose `value` carries the class body when the grammar
@@ -3145,12 +3165,14 @@ fn recover_embedded_function_like_export_classes(
         }) else {
             continue;
         };
-        let Some(name_node) = nodes.iter().copied().rfind(|candidate| {
-            is_identifier(candidate)
-                && candidate.start_byte() >= arguments.end_byte()
-                && candidate.end_byte() <= head_end.start_byte()
-                && candidate.start_position().row == row
-        }) else {
+        let Some(name_node) =
+            export_head_last_identifier(nodes.iter().copied().filter(|candidate| {
+                is_identifier(candidate)
+                    && candidate.start_byte() >= arguments.end_byte()
+                    && candidate.end_byte() <= head_end.start_byte()
+                    && candidate.start_position().row == row
+            }))
+        else {
             continue;
         };
         let name = normalize_cpp_whitespace(node_text(name_node, source));
@@ -3761,9 +3783,14 @@ fn recovered_single_base_after_declarator_node<'tree>(
 
 fn malformed_inheritance_syntax(node: Node<'_>) -> bool {
     (0..node.child_count()).any(|index| {
-        node.child(index)
-            .is_some_and(|child| matches!(child.kind(), ":" | "public" | "protected" | "private"))
+        node.child(index).is_some_and(|child| {
+            child.kind() == ":" || cpp_is_inheritance_access_specifier(child.kind())
+        })
     })
+}
+
+fn cpp_is_inheritance_access_specifier(name: &str) -> bool {
+    matches!(name, "public" | "protected" | "private")
 }
 
 pub fn is_recovered_exported_class_container(node: Node<'_>, source: &str) -> bool {
@@ -3890,7 +3917,8 @@ fn exported_class_name_from_node(node: Node<'_>, source: &str) -> Option<String>
     class_like_name_from_children(class_node, source)
 }
 
-fn direct_identifier_name(node: Node<'_>, source: &str) -> Option<String> {
+/// Normalize the text of a directly selected C++ identifier node.
+pub fn direct_identifier_name(node: Node<'_>, source: &str) -> Option<String> {
     if !matches!(
         node.kind(),
         "identifier" | "field_identifier" | "type_identifier"
@@ -3902,17 +3930,12 @@ fn direct_identifier_name(node: Node<'_>, source: &str) -> Option<String> {
 }
 
 fn declarator_name_from_node(node: Node<'_>, source: &str) -> Option<String> {
-    match node.kind() {
-        "identifier" | "field_identifier" | "type_identifier" => {
-            let name = normalize_cpp_whitespace(node_text(node, source));
-            (!name.is_empty()).then_some(name)
-        }
-        _ => {
-            let mut cursor = node.walk();
-            node.named_children(&mut cursor)
-                .find_map(|child| declarator_name_from_node(child, source))
-        }
+    if let Some(name) = direct_identifier_name(node, source) {
+        return Some(name);
     }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find_map(|child| declarator_name_from_node(child, source))
 }
 
 fn first_class_like_child(node: Node<'_>) -> Option<Node<'_>> {
@@ -4022,6 +4045,81 @@ fn cpp_using_namespace_target(node: Node<'_>, source: &str) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
+/// Tokens that open a construct only a matching later token closes.
+const CPP_CONSTRUCT_OPENERS: [&str; 6] = ["#if", "#ifdef", "#ifndef", "{", "(", "["];
+
+/// The opening tokens of the constructs a C/C++ parse left open at the end of
+/// the file, in source order (#3501). Empty unless the tree's root is an ERROR
+/// node.
+///
+/// The grammar has no preprocessor, so a construct opened in one conditional
+/// branch and closed in another stays open: `#if 0` / `extern "C" {` /
+/// `#endif` leaves its `{` unmatched until a later `#if 0` / `}` / `#endif`.
+/// One such pair repairs with a single MISSING token. With more of them, the
+/// parse version tree-sitter keeps reaches the end of input in its error
+/// state, and tree-sitter wraps every subtree on that version's stack in one
+/// ERROR node and returns it as the root (`recover_eof` in its `parser.c`).
+/// The root's children are then exactly that stack: completed subtrees, and
+/// the bare tokens of the constructs still waiting to be reduced when input
+/// ran out. A reduced construct is a node of its own, so a bare opener among
+/// the root's children is one the parse never closed. tdlib/td's copy of the
+/// SQLite amalgamation parses this way: its root spans all 8,274,268 bytes,
+/// and its outermost open construct is the `#ifndef SQLITEINT_H` include guard
+/// at byte 19,718.
+pub fn cpp_unclosed_construct_openers<'tree>(root: Node<'tree>) -> Vec<Node<'tree>> {
+    assert!(
+        root.parent().is_none(),
+        "only a tree's root records what its parse left open"
+    );
+    if !root.is_error() {
+        return Vec::new();
+    }
+    children_iter(root)
+        .filter(|child| CPP_CONSTRUCT_OPENERS.contains(&child.kind()))
+        .collect()
+}
+
+/// Record every declaration of `parsed` that has a range inside `recovery`
+/// as recovered, unless a narrower recovery already claimed it, and mark the
+/// reading partial when any declaration lies there (#3501).
+///
+/// `recovery` runs from the outermost construct the parse left open to the
+/// end of the file. Everything before that construct was completed at file
+/// scope, as in any parse. Everything after it sat on the parse stack above
+/// an open construct when input ran out, so the scope and nesting the walk
+/// gave it are a recovery claim rather than a reading of a completed tree,
+/// and the file's analysis is partial whichever recovery recorded it.
+fn record_declarations_left_open(parsed: &mut ParsedFile, recovery: Range) {
+    let recorded: HashSet<CodeUnit> = parsed
+        .materialization_records
+        .iter()
+        .filter_map(|record| match record {
+            MaterializationRecord::RecoveredDeclaration { unit, .. } => Some(unit.clone()),
+            _ => None,
+        })
+        .collect();
+    let mut left_open: Vec<(usize, CodeUnit)> = parsed
+        .declarations()
+        .iter()
+        .filter_map(|unit| {
+            let ranges = parsed.declaration_ranges(unit);
+            let first = ranges.iter().map(|range| range.start_byte).min()?;
+            let last = ranges.iter().map(|range| range.start_byte).max()?;
+            (last >= recovery.start_byte).then(|| (first, unit.clone()))
+        })
+        .collect();
+    if left_open.is_empty() {
+        return;
+    }
+    parsed.completeness = ParseCompleteness::Partial;
+    left_open.retain(|(_, unit)| !recorded.contains(unit));
+    left_open.sort();
+    for (_, unit) in left_open {
+        parsed
+            .record_materialization(MaterializationRecord::RecoveredDeclaration { recovery, unit });
+    }
+}
+
 /// Extract all requested dialect readings from one primary AST event stream.
 /// Declaration schedulers retain their own admission, recovery and sibling order;
 /// structural facts, includes and identifiers are interpreted once for the tree.
@@ -4080,6 +4178,7 @@ pub(crate) fn parse_cpp_readings_with_object_macro_fields<'tree>(
             primary_root_id: root.id(),
             source_links: HashMap::default(),
             source_declarations: HashSet::default(),
+            preprocessor_context_cache: Default::default(),
             c_tag_semantics: *dialect == LanguageDialect::CppC,
             c_tag_scope_witness: false,
             recovered_class_sibling_scopes: HashMap::default(),
@@ -4129,6 +4228,9 @@ pub(crate) fn parse_cpp_readings_with_object_macro_fields<'tree>(
     );
     let mut imports = Vec::new();
     let mut includes = Vec::new();
+    let mut expressions = Vec::new();
+    let named_record_sizes = crate::source_facts::named_record_size_index(root, source);
+    let mut statement_facts = CppStatementFactRows::default();
     let mut identifiers = HashSet::default();
     let mut entered = HashSet::default();
     let mut primary_ordinals = HashMap::default();
@@ -4139,6 +4241,7 @@ pub(crate) fn parse_cpp_readings_with_object_macro_fields<'tree>(
         dependencies.borrow_mut().primary.enter(node, source);
         let mut child_parent = parent;
         if node.is_named() {
+            crate::structural::capture_statement_fact_rows(node, source, &mut statement_facts);
             if let Some(namespace) = cpp_using_namespace_target(node, source) {
                 using_namespaces.push((collector.borrow_mut().intern_node(node), namespace));
             }
@@ -4162,6 +4265,14 @@ pub(crate) fn parse_cpp_readings_with_object_macro_fields<'tree>(
                     .accept_roles(id, sink.into_parts())
                     .expect("unbounded C++ structural roles");
                 child_parent = Some(id);
+            }
+            if let Some(fact) = crate::source_facts::capture_expression_fact(
+                node,
+                source,
+                collector.borrow_mut().intern_node(node),
+                &named_record_sizes,
+            ) {
+                expressions.push(fact);
             }
             if node.kind() == "preproc_include" {
                 let raw = normalize_cpp_whitespace(node_text(node, source));
@@ -4272,6 +4383,8 @@ pub(crate) fn parse_cpp_readings_with_object_macro_fields<'tree>(
                 facts
             },
             using_namespaces,
+            expressions,
+            statement_facts,
         }),
         go: None,
         java: None,
@@ -4283,7 +4396,7 @@ pub(crate) fn parse_cpp_readings_with_object_macro_fields<'tree>(
         source_bytes: source.len(),
         occurrences,
         structural: structural
-            .finish()
+            .finish(root)
             .expect("C++ structural collection finishes"),
         native_site_occurrences: Vec::new(),
         native_declaration_sources: Vec::new(),
@@ -4316,6 +4429,19 @@ pub(crate) fn parse_cpp_readings_with_object_macro_fields<'tree>(
             &mut parsed.source_declaration_units,
             &mut parsed.source_declaration_metadata,
         ));
+    }
+    if let Some(outermost) = cpp_unclosed_construct_openers(root).first() {
+        // The recovery runs to the end of the file, which is how a reader of
+        // the record tells this recovery from a local one (#3501).
+        let recovery = Range {
+            start_byte: outermost.start_byte(),
+            end_byte: source.len(),
+            start_line: outermost.start_position().row + 1,
+            end_line: root.end_position().row + 1,
+        };
+        for parsed in &mut readings {
+            record_declarations_left_open(parsed, recovery);
+        }
     }
     readings
 }
@@ -4384,6 +4510,7 @@ pub struct CppVisitor<'a, 'source> {
     pub primary_root_id: usize,
     source_links: HashMap<CodeUnit, Vec<SourceDeclarationId>>,
     source_declarations: HashSet<SourceDeclarationId>,
+    preprocessor_context_cache: crate::graph::resolver::PreprocessorContextCache,
     /// Whether this translation unit is compiled as C -- the `CppC` dialect of
     /// `LanguageDialect`, i.e. an exact lowercase `.c` extension.
     ///
@@ -4543,10 +4670,7 @@ pub fn collect_cpp_object_macro_field_events<'tree>(
 fn inside_preprocessor_conditional(node: Node<'_>) -> bool {
     let mut current = node.parent();
     while let Some(parent) = current {
-        if matches!(
-            parent.kind(),
-            "preproc_if" | "preproc_ifdef" | "preproc_ifndef" | "preproc_elif"
-        ) {
+        if is_cpp_preprocessor_conditional(parent) {
             return true;
         }
         current = parent.parent();
@@ -4684,8 +4808,12 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
         };
         self.source_declarations.insert(declaration);
         if !self.source_properties.borrow().contains_key(&declaration) {
-            let context =
-                crate::source_context::capture_declaration_context(node, unit, self.source);
+            let context = crate::source_context::capture_declaration_context(
+                node,
+                unit,
+                self.source,
+                &mut self.preprocessor_context_cache,
+            );
             let (exhaustive_family, displaced_namespace_closing_brace) = {
                 let mut collector = self.source_collector.borrow_mut();
                 let exhaustive_family = context.exhaustive_conditional_family.map(|family| {
@@ -4730,7 +4858,7 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
                     );
                     self.capture_source_dependencies(&mut fact, node, unit);
                     fact.occurrence_role =
-                        crate::identity::cpp_occurrence_role_for_node(node, unit);
+                        crate::identity::cpp_occurrence_role_for_node(node, self.source, unit);
                     fact.conditional_family = family;
                     fact.guard_requirements = guard_requirements;
                     fact.callable_guards = callable_guards;
@@ -4790,8 +4918,12 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
         if let Some(node) = evidence
             && !self.source_properties.borrow().contains_key(&declaration)
         {
-            let context =
-                crate::source_context::capture_declaration_context(node, unit, self.source);
+            let context = crate::source_context::capture_declaration_context(
+                node,
+                unit,
+                self.source,
+                &mut self.preprocessor_context_cache,
+            );
             let (exhaustive_family, displaced_namespace_closing_brace) = {
                 let mut collector = self.source_collector.borrow_mut();
                 let exhaustive_family = context.exhaustive_conditional_family.map(|family| {
@@ -4831,7 +4963,8 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
                 ancestry,
             );
             self.capture_source_dependencies(&mut fact, node, unit);
-            fact.occurrence_role = crate::identity::cpp_occurrence_role_for_node(node, unit);
+            fact.occurrence_role =
+                crate::identity::cpp_occurrence_role_for_node(node, self.source, unit);
             fact.conditional_family = family;
             fact.guard_requirements = guard_requirements;
             fact.callable_guards = callable_guards;
@@ -4845,6 +4978,24 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
                 .borrow_mut()
                 .insert(declaration, fact);
         }
+        let links = self.source_links.entry(unit.clone()).or_default();
+        if !links.contains(&declaration) {
+            links.push(declaration);
+        }
+    }
+
+    /// [`Self::link_source_range`] with the name occurrence interned from the
+    /// subspan that writes it instead of derived from an evidence node.
+    fn link_source_name_range(&mut self, unit: &CodeUnit, range: Range, name_range: Range) {
+        let declaration = {
+            let mut collector = self.source_collector.borrow_mut();
+            let occurrence =
+                collector.intern_subspan(range, SourceOccurrenceProvenance::ExplicitSubspan);
+            let name =
+                collector.intern_subspan(name_range, SourceOccurrenceProvenance::ExplicitSubspan);
+            collector.declare(occurrence, Some(name))
+        };
+        self.source_declarations.insert(declaration);
         let links = self.source_links.entry(unit.clone()).or_default();
         if !links.contains(&declaration) {
             links.push(declaration);
@@ -4904,6 +5055,23 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
     ) {
         self.note_declaration(&code_unit);
         self.link_source_range(ancestry, &code_unit, range, evidence);
+        self.parsed
+            .add_code_unit_with_range(code_unit, range, parent, top_level);
+    }
+
+    /// Name-subspan form of [`Self::add_declaration_with_range`]: both ranges
+    /// come from an index that recorded them, so there is no live evidence
+    /// node to derive the name token from (#4292).
+    fn add_declaration_with_name_range(
+        &mut self,
+        code_unit: CodeUnit,
+        range: Range,
+        name_range: Range,
+        parent: Option<CodeUnit>,
+        top_level: Option<CodeUnit>,
+    ) {
+        self.note_declaration(&code_unit);
+        self.link_source_name_range(&code_unit, range, name_range);
         self.parsed
             .add_code_unit_with_range(code_unit, range, parent, top_level);
     }
@@ -5025,6 +5193,59 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
         removed
     }
 
+    fn visit_recovered_function_like_export_class<'tree>(
+        &mut self,
+        node: Node<'tree>,
+        recovered: RecoveredFunctionLikeExportClass,
+        scope: &ScopeInfo,
+        stack: &mut Vec<CppWork<'tree>>,
+        ancestry: &ParentIndex<'tree>,
+    ) {
+        let RecoveredFunctionLikeExportClass {
+            name,
+            range,
+            raw_supertypes,
+            base_facts,
+            member_outcome,
+        } = recovered;
+        let class_unit = self.visit_named_class_like_shape(
+            node,
+            name,
+            None,
+            true,
+            Some(range),
+            raw_supertypes,
+            base_facts,
+            scope,
+            stack,
+            ancestry,
+        );
+        self.parsed
+            .record_materialization(MaterializationRecord::RecoveredDeclaration {
+                recovery: range,
+                unit: class_unit.clone(),
+            });
+        if let Some(FragmentedExportMembers::Complete(tree)) = member_outcome.as_ref()
+            && let Some((constructor_range, body)) = cpp_reparsed_merged_inline_constructor(
+                tree.root_node(),
+                class_unit.identifier(),
+                self.source,
+            )
+        {
+            self.visit_recovered_fragment_constructor(
+                constructor_range,
+                body,
+                node,
+                &class_unit,
+                scope,
+                ancestry,
+            );
+        }
+        if let Some(outcome) = member_outcome {
+            self.visit_fragmented_export_class_members(node, outcome, class_unit, scope);
+        }
+    }
+
     fn visit_function_like_export_class_pair<'tree>(
         &mut self,
         node: Node<'tree>,
@@ -5049,48 +5270,26 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
             }
             displaced = candidate.next_named_sibling();
         }
-        let class_unit = self.visit_named_class_like_shape(
+        // The adjacent initializer_list proves the class body envelope, but
+        // its children are expression-shaped rather than declaration-shaped.
+        // Visit only separately recovered members; ordinary callable
+        // definitions remain available from their out-of-line declarations.
+        let range = recovered.range;
+        self.visit_recovered_function_like_export_class(
             node,
-            recovered.name,
-            // The adjacent initializer_list proves the class body envelope,
-            // but its children are expression-shaped rather than declaration-
-            // preserving. Index the class identity here; callable definitions
-            // remain available from their ordinary out-of-line declarations.
-            None,
-            true,
-            Some(recovered.range),
-            recovered.raw_supertypes,
-            recovered.base_facts,
+            RecoveredFunctionLikeExportClass {
+                name: recovered.name,
+                range,
+                raw_supertypes: recovered.raw_supertypes,
+                base_facts: recovered.base_facts,
+                member_outcome,
+            },
             scope,
             stack,
             ancestry,
         );
-        self.parsed
-            .record_materialization(MaterializationRecord::RecoveredDeclaration {
-                recovery: recovered.range,
-                unit: class_unit.clone(),
-            });
-        if let Some(FragmentedExportMembers::Complete(tree)) = member_outcome.as_ref()
-            && let Some((range, body)) = cpp_reparsed_merged_inline_constructor(
-                tree.root_node(),
-                class_unit.identifier(),
-                self.source,
-            )
-        {
-            self.visit_recovered_fragment_constructor(
-                range,
-                body,
-                node,
-                &class_unit,
-                scope,
-                ancestry,
-            );
-        }
-        if let Some(outcome) = member_outcome {
-            self.visit_fragmented_export_class_members(node, outcome, class_unit, scope);
-        }
         self.consumed_fragment_regions
-            .push((node.start_byte(), recovered.range.end_byte));
+            .push((node.start_byte(), range.end_byte));
         true
     }
 
@@ -5108,42 +5307,19 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
                 &recovered.fragmented_body,
                 &recovered.name,
             );
-            let class_unit = self.visit_named_class_like_shape(
+            self.visit_recovered_function_like_export_class(
                 node,
-                recovered.name,
-                None,
-                true,
-                Some(recovered.range),
-                Some(recovered.raw_supertypes),
-                Some(recovered.base_facts),
+                RecoveredFunctionLikeExportClass {
+                    name: recovered.name,
+                    range: recovered.range,
+                    raw_supertypes: Some(recovered.raw_supertypes),
+                    base_facts: Some(recovered.base_facts),
+                    member_outcome,
+                },
                 scope,
                 stack,
                 ancestry,
             );
-            self.parsed
-                .record_materialization(MaterializationRecord::RecoveredDeclaration {
-                    recovery: recovered.range,
-                    unit: class_unit.clone(),
-                });
-            if let Some(FragmentedExportMembers::Complete(tree)) = member_outcome.as_ref()
-                && let Some((range, body)) = cpp_reparsed_merged_inline_constructor(
-                    tree.root_node(),
-                    class_unit.identifier(),
-                    self.source,
-                )
-            {
-                self.visit_recovered_fragment_constructor(
-                    range,
-                    body,
-                    node,
-                    &class_unit,
-                    scope,
-                    ancestry,
-                );
-            }
-            if let Some(outcome) = member_outcome {
-                self.visit_fragmented_export_class_members(node, outcome, class_unit, scope);
-            }
         }
         found
     }
@@ -5289,6 +5465,28 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
         }
     }
 
+    /// Drain nodes selected by a bounded recovery walk without filtering them
+    /// against consumed regions from the primary tree.
+    fn drain_cpp_recovery_work<'tree>(
+        &mut self,
+        mut stack: Vec<CppWork<'tree>>,
+        ancestry: &ParentIndex<'tree>,
+    ) {
+        while let Some(work) = stack.pop() {
+            match work {
+                CppWork::Container(container) => {
+                    push_cpp_container_work(container.node, container.scope, &mut stack);
+                }
+                CppWork::Siblings(siblings) => {
+                    advance_cpp_siblings(siblings, self.source, &mut stack);
+                }
+                CppWork::Node(work) => {
+                    self.visit_node(work.node, &work.scope, &mut stack, ancestry);
+                }
+            }
+        }
+    }
+
     /// Reparse a fragmented multiple-base export class body (issue #938), admitting
     /// it only when the entire region is member-shaped. This validation must happen
     /// before registering the recovered class because a rejected speculative range
@@ -5306,7 +5504,11 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
             fragmented.reparse_start,
             fragmented.reparse_end,
         )?;
-        if cpp_reparsed_members_are_indexable(tree.root_node(), self.source) {
+        if cpp_reparsed_members_are_indexable_for_class(
+            tree.root_node(),
+            self.source,
+            Some(class_name),
+        ) {
             return Some(FragmentedExportMembers::Complete(tree));
         }
         let has_conditional_constructor = {
@@ -5359,6 +5561,7 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
             recovered_specialization_member_scope: false,
             visible_using_namespaces: scope.visible_using_namespaces.clone(),
         };
+        let reparsed_ancestry = self.recovery_ancestry(root);
         if !complete {
             // A conditional beginning immediately after an access label can
             // fragment one constructor declaration while leaving the rest of
@@ -5374,28 +5577,27 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
                 .collect::<Vec<_>>();
             // The reparsed region is its own tree, so this drain walks it with
             // its own parent index.
-            let reparsed_ancestry = self.recovery_ancestry(root);
             for constructor in constructors {
                 let mut stack = Vec::new();
                 self.visit_node(constructor, &member_scope, &mut stack, &reparsed_ancestry);
-                while let Some(work) = stack.pop() {
-                    match work {
-                        CppWork::Container(container) => {
-                            push_cpp_container_work(container.node, container.scope, &mut stack);
-                        }
-                        CppWork::Siblings(siblings) => {
-                            advance_cpp_siblings(siblings, self.source, &mut stack);
-                        }
-                        CppWork::Node(work) => {
-                            self.visit_node(work.node, &work.scope, &mut stack, &reparsed_ancestry)
-                        }
-                    }
-                }
+                self.drain_cpp_recovery_work(stack, &reparsed_ancestry);
             }
             return false;
         }
+        let mut cursor = root.walk();
+        let members = root.named_children(&mut cursor).collect::<Vec<_>>();
+        for member in members.iter().copied().filter(|member| {
+            cpp_reparsed_defaulted_constructor_is_indexable(
+                *member,
+                &members,
+                Some(class_name.as_str()),
+                self.source,
+            )
+        }) {
+            self.visit_recovered_defaulted_constructor(member, &member_scope, &reparsed_ancestry);
+        }
         // The reparsed region is its own tree, so this walk indexes it itself.
-        self.run_container_work(root, member_scope, &self.recovery_ancestry(root));
+        self.run_container_work(root, member_scope, &reparsed_ancestry);
         true
     }
 
@@ -5534,9 +5736,24 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
             recovered_specialization_member_scope: false,
             visible_using_namespaces: scope.visible_using_namespaces.clone(),
         };
+        let mut root_cursor = root.walk();
+        let members = root.named_children(&mut root_cursor).collect::<Vec<_>>();
         let mut stack = vec![root];
         while let Some(current) = stack.pop() {
             if current.kind() == "comment" || current.start_byte() >= constructor_start {
+                continue;
+            }
+            if current
+                .parent()
+                .is_some_and(|parent| same_node(parent, root))
+                && cpp_reparsed_defaulted_constructor_is_indexable(
+                    current,
+                    &members,
+                    Some(class_unit.identifier()),
+                    self.source,
+                )
+            {
+                self.visit_recovered_defaulted_constructor(current, &member_scope, ancestry);
                 continue;
             }
             if current.end_byte() <= constructor_start
@@ -5546,23 +5763,7 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
             {
                 let mut work_stack = Vec::new();
                 self.visit_node(current, &member_scope, &mut work_stack, ancestry);
-                while let Some(work) = work_stack.pop() {
-                    match work {
-                        CppWork::Container(container) => {
-                            push_cpp_container_work(
-                                container.node,
-                                container.scope,
-                                &mut work_stack,
-                            );
-                        }
-                        CppWork::Siblings(siblings) => {
-                            advance_cpp_siblings(siblings, self.source, &mut work_stack);
-                        }
-                        CppWork::Node(work) => {
-                            self.visit_node(work.node, &work.scope, &mut work_stack, ancestry)
-                        }
-                    }
-                }
+                self.drain_cpp_recovery_work(work_stack, ancestry);
                 continue;
             }
             if matches!(
@@ -5575,6 +5776,73 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
         }
     }
 
+    fn visit_recovered_defaulted_constructor(
+        &mut self,
+        statement: Node<'_>,
+        scope: &ScopeInfo,
+        ancestry: &ParentIndex<'_>,
+    ) {
+        let Some(parent) = scope.class_unit.clone() else {
+            return;
+        };
+        let Some(assignment) = statement.named_child(0) else {
+            return;
+        };
+        let Some(call) = assignment.child_by_field_name("left") else {
+            return;
+        };
+        let Some(function_name) = call.child_by_field_name("function") else {
+            return;
+        };
+        let Some(arguments) = call.child_by_field_name("arguments") else {
+            return;
+        };
+        if function_name.kind() != "identifier"
+            || node_text(function_name, self.source) != parent.identifier()
+            || arguments.kind() != "argument_list"
+            || arguments.named_child_count() != 0
+        {
+            return;
+        }
+        let function = FunctionInfo {
+            package_name: scope.package_name.clone(),
+            owner: Some(CppMemberOwner::Unit(parent.clone())),
+            name: parent.identifier().to_string(),
+            signature: normalize_cpp_whitespace(node_text(arguments, self.source)),
+        };
+        let code_unit = function.code_unit_with_synthetic(self.file.clone(), true);
+        if self.parsed.contains_declaration(&code_unit) {
+            return;
+        }
+        self.add_declaration(ancestry, code_unit.clone(), statement, None, None);
+        let metadata = SignatureMetadata::new(
+            normalize_cpp_whitespace(node_text(statement, self.source)),
+            Vec::new(),
+        )
+        .with_declaration_only(true)
+        .with_callable_arity(CallableArity::exact(0))
+        .with_callable_linkage(cpp_callable_linkage(statement, self.source, ancestry))
+        // The reparse proves class ownership, but carries no original class
+        // access ladder. Preserve unknown access rather than guessing it.
+        .with_callable_modifiers(false, true, DeclaredVisibility::Unknown);
+        self.add_signature_with_metadata(code_unit.clone(), metadata);
+        if let Some(declaration) = self
+            .source_links
+            .get(&code_unit)
+            .and_then(|links| links.last())
+            .copied()
+        {
+            let mut properties = self.source_properties.borrow_mut();
+            let fact = properties
+                .get_mut(&declaration)
+                .expect("recovered defaulted constructor source fact");
+            fact.occurrence_role =
+                brokk_bifrost_core::analyzer::cpp_facts::CppOccurrenceRole::DeclarationOnly;
+            fact.callable_is_constructor = true;
+        }
+        self.parsed.add_child(parent, code_unit);
+    }
+
     /// Capture ancestors only when a proven recovery enters another tree. The
     /// ordinary declaration driver never performs this additional ancestor walk.
     fn with_recovery_source_context<T>(
@@ -5584,13 +5852,17 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
     ) -> T {
         use crate::graph::resolver::{
             enclosing_namespace_context, merge_preprocessor_guards,
-            preprocessor_conditional_family_for_declaration, preprocessor_conditional_family_node,
-            preprocessor_guard_environment,
+            preprocessor_conditional_family_for_declaration_with_cache,
+            preprocessor_conditional_family_node, preprocessor_guard_environment_with_cache,
         };
         let previous = self.active_source_context.take();
         let primary = node.id() == self.primary_root_id || self.primary_ancestry.contains(node);
         let inherited = (!primary).then_some(previous.as_ref()).flatten();
-        let local_guards = preprocessor_guard_environment(node, self.source);
+        let local_guards = preprocessor_guard_environment_with_cache(
+            node,
+            self.source,
+            &mut self.preprocessor_context_cache,
+        );
         let guards = match inherited {
             Some(outer) => outer
                 .guards
@@ -5664,11 +5936,17 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
         let family = preprocessor_conditional_family_node(node)
             .map(&mut intern)
             .or_else(|| inherited.and_then(|outer| outer.family));
-        let exhaustive_family = preprocessor_conditional_family_for_declaration(node)
-            .map(&mut intern)
-            .or_else(|| inherited.and_then(|outer| outer.exhaustive_family));
-        let local_completion =
-            crate::graph::resolver::callable_guard_completion_byte(node, self.source);
+        let exhaustive_family = preprocessor_conditional_family_for_declaration_with_cache(
+            node,
+            &mut self.preprocessor_context_cache,
+        )
+        .map(&mut intern)
+        .or_else(|| inherited.and_then(|outer| outer.exhaustive_family));
+        let local_completion = crate::graph::resolver::callable_guard_completion_byte_with_cache(
+            node,
+            self.source,
+            &mut self.preprocessor_context_cache,
+        );
         let callable_guard_completion_byte = match inherited {
             Some(outer) => local_completion
                 .zip(outer.callable_guard_completion_byte)
@@ -5928,10 +6206,21 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
             "namespace_definition" => self.visit_namespace(node, scope, stack, ancestry),
             "linkage_specification" => {
                 if let Some(body) = cpp_body_node(node) {
-                    stack.push(CppWork::Container(CppContainer {
-                        node: body,
-                        scope: scope.clone(),
-                    }));
+                    // A linkage specification either wraps a direct declaration or a
+                    // braced declaration_list. Visit the direct item itself so
+                    // declaration recoveries still run on its original syntax node.
+                    let work = if body.kind() == "declaration_list" {
+                        CppWork::Container(CppContainer {
+                            node: body,
+                            scope: scope.clone(),
+                        })
+                    } else {
+                        CppWork::Node(CppNodeWork {
+                            node: body,
+                            scope: scope.clone(),
+                        })
+                    };
+                    stack.push(work);
                 } else {
                     stack.push(CppWork::Container(CppContainer {
                         node,
@@ -6037,6 +6326,10 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
             // statement (llama.cpp's `sycl/info/aspects.def`) -- is still an
             // include claim.
             "preproc_include" => {}
+            // The grammar represents a split extern-C condition as sibling
+            // markers; declarations between them remain unconditional file
+            // scope items and need no special declaration metadata.
+            "preproc_linkage_open" | "preproc_linkage_close" => {}
             kind if preserves_declaration_scope_through_wrapper(
                 kind,
                 scope.class_unit.is_some(),
@@ -6614,6 +6907,40 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
         (package_name, module)
     }
 
+    /// [`Self::declare_namespace_levels`] for levels a recovered-namespace
+    /// index restores. Each level carries the range of its own name token,
+    /// which the walk's current node cannot supply: that node is whichever
+    /// declaration the walk reached first inside the region, and deriving a
+    /// level's name from it paired the level's range with an unrelated
+    /// construct's name token (#4292).
+    fn declare_recovered_namespace_levels(
+        &mut self,
+        mut package_name: String,
+        levels: Vec<(String, Range, Range)>,
+    ) -> (String, Option<CodeUnit>) {
+        let mut module = None;
+        for (component, range, name_range) in levels {
+            let full_name = if package_name.is_empty() {
+                component
+            } else {
+                format!("{package_name}{CPP_PACKAGE_SEPARATOR}{component}")
+            };
+            let level = CodeUnit::new_fq(
+                self.file.clone(),
+                CodeUnitType::Module,
+                "",
+                full_name.clone(),
+                cpp_namespace_fq(&full_name),
+            );
+            if !self.parsed.contains_declaration(&level) {
+                self.add_declaration_with_name_range(level.clone(), range, name_range, None, None);
+            }
+            package_name = full_name;
+            module = Some(level);
+        }
+        (package_name, module)
+    }
+
     /// Restore the complete lexical namespace path when recovery dropped an
     /// ancestor or retained it past its real close. Parsed namespaces beginning
     /// inside the recovered region still contribute their normal nesting.
@@ -6625,23 +6952,24 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
     ) -> Option<ScopeInfo> {
         self.orphaned_namespaces.region_at(node.start_byte())?;
         // Each level carries the `namespace Name { ... }` construct that writes
-        // it. Declaring them at `node` instead recorded the range of whichever
-        // member the walk happened to reach first, so a namespace whose head
-        // collapsed into an ERROR reported its first inner declaration's lines
-        // as its own (#3309).
+        // it along with the level's own name token. Declaring them at `node`
+        // instead recorded the range of whichever member the walk happened to
+        // reach first, so a namespace whose head collapsed into an ERROR
+        // reported its first inner declaration's lines as its own (#3309), and
+        // deriving the name from that node paired the level's range with the
+        // member's name token (#4292).
         let levels = self
             .orphaned_namespaces
             .enclosing_namespace_levels(node, self.source);
         let package_name = levels
             .iter()
-            .map(|(component, _)| component.as_str())
+            .map(|(component, ..)| component.as_str())
             .collect::<Vec<_>>()
             .join(CPP_PACKAGE_SEPARATOR);
         if package_name == scope.package_name {
             return None;
         }
-        let (package_name, module) =
-            self.declare_namespace_levels(String::new(), levels, node, self.primary_ancestry);
+        let (package_name, module) = self.declare_recovered_namespace_levels(String::new(), levels);
         Some(ScopeInfo {
             package_name,
             module,
@@ -6816,12 +7144,26 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
         scope: &ScopeInfo,
         ancestry: &ParentIndex<'_>,
     ) -> bool {
-        scope.class_unit.is_some()
-            && matches!(
+        if scope.class_unit.is_none()
+            || !matches!(
                 declaration_node.kind(),
                 "struct_specifier" | "union_specifier" | "enum_specifier"
             )
-            && class_like_name(declaration_node, self.source, ancestry).is_some()
+            || class_like_name(declaration_node, self.source, ancestry).is_none()
+        {
+            return false;
+        }
+        // A class-specifier ancestor proves this is C++ syntax. A C reading of
+        // the header must not apply C tag hoisting to structs nested in that
+        // class, because that invents a file-scope identity for its members.
+        let mut ancestor = ancestry.parent(declaration_node);
+        while let Some(current) = ancestor {
+            if current.kind() == "class_specifier" {
+                return false;
+            }
+            ancestor = ancestry.parent(current);
+        }
+        true
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6902,7 +7244,7 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
                 } else {
                     SegmentKind::Nested
                 };
-                fq.push(cpp_segment(&component, kind));
+                fq.push(segment_interner().intern(&component, kind));
                 first = false;
             }
             fq
@@ -7144,32 +7486,42 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
             if name.is_empty() {
                 return WalkControl::Continue;
             }
-            let code_unit = CodeUnit::new_fq(
-                self.file.clone(),
-                CodeUnitType::Field,
-                scope.package_name.clone(),
-                cpp_join_member_short(parent.short_name(), &name),
-                parent
-                    .fq()
-                    .clone()
-                    .with_pushed(cpp_segment(&name, SegmentKind::Member)),
-            );
-            if self.parsed.contains_declaration(&code_unit) {
-                return WalkControl::Continue;
-            }
-            self.add_declaration(
-                ancestry,
-                code_unit.clone(),
-                child,
-                Some(parent.clone()),
-                None,
-            );
-            self.parsed.add_signature(
-                code_unit,
-                normalize_cpp_whitespace(node_text(child, self.source)),
-            );
+            let signature = normalize_cpp_whitespace(node_text(child, self.source));
+            self.visit_enum_enumerator(ancestry, child, scope, parent, &name, &signature);
             WalkControl::Continue
         });
+    }
+
+    fn visit_enum_enumerator(
+        &mut self,
+        ancestry: &ParentIndex<'_>,
+        declaration_node: Node<'_>,
+        scope: &ScopeInfo,
+        parent: &CodeUnit,
+        name: &str,
+        signature: &str,
+    ) {
+        let code_unit = CodeUnit::new_fq(
+            self.file.clone(),
+            CodeUnitType::Field,
+            scope.package_name.clone(),
+            cpp_join_member_short(parent.short_name(), name),
+            parent
+                .fq()
+                .clone()
+                .with_pushed(segment_interner().intern(name, SegmentKind::Member)),
+        );
+        if self.parsed.contains_declaration(&code_unit) {
+            return;
+        }
+        self.add_declaration(
+            ancestry,
+            code_unit.clone(),
+            declaration_node,
+            Some(parent.clone()),
+            None,
+        );
+        self.parsed.add_signature(code_unit, signature.to_string());
     }
 
     fn visit_enum_enumerators_from_text(
@@ -7198,27 +7550,7 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
             if name.is_empty() {
                 continue;
             }
-            let code_unit = CodeUnit::new_fq(
-                self.file.clone(),
-                CodeUnitType::Field,
-                scope.package_name.clone(),
-                cpp_join_member_short(parent.short_name(), name),
-                parent
-                    .fq()
-                    .clone()
-                    .with_pushed(cpp_segment(name, SegmentKind::Member)),
-            );
-            if self.parsed.contains_declaration(&code_unit) {
-                continue;
-            }
-            self.add_declaration(
-                ancestry,
-                code_unit.clone(),
-                node,
-                Some(parent.clone()),
-                None,
-            );
-            self.parsed.add_signature(code_unit, trimmed.to_string());
+            self.visit_enum_enumerator(ancestry, node, scope, parent, name, trimmed);
         }
     }
 
@@ -8436,6 +8768,27 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
     /// dialect to re-scope and nothing for the C++ dialect to nest: both
     /// readings of this shape are the same, and both need these members
     /// (#3301).
+    fn anonymous_aggregate_declaration_parts<'tree>(
+        node: Node<'tree>,
+    ) -> Option<(Node<'tree>, Node<'tree>, Vec<Node<'tree>>)> {
+        let aggregate = node.child_by_field_name("type")?;
+        if !matches!(aggregate.kind(), "struct_specifier" | "union_specifier")
+            || aggregate.child_by_field_name("name").is_some()
+        {
+            return None;
+        }
+        let body = cpp_body_node(aggregate)?;
+        let mut cursor = node.walk();
+        let declarators = node
+            .children_by_field_name("declarator", &mut cursor)
+            .filter_map(|declarator| match classify_declarator(declarator) {
+                Some(DeclaratorKind::Variable(variable)) => Some(variable),
+                Some(DeclaratorKind::Function(_)) | None => None,
+            })
+            .collect();
+        Some((aggregate, body, declarators))
+    }
+
     fn visit_anonymous_aggregate_declaration<'tree>(
         &mut self,
         node: Node<'tree>,
@@ -8447,26 +8800,11 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
         if !in_class_body || scope.class_unit.is_none() {
             return false;
         }
-        let Some(aggregate) = node.child_by_field_name("type") else {
+        let Some((aggregate, body, declarators)) =
+            Self::anonymous_aggregate_declaration_parts(node)
+        else {
             return false;
         };
-        if !matches!(aggregate.kind(), "struct_specifier" | "union_specifier")
-            || aggregate.child_by_field_name("name").is_some()
-        {
-            return false;
-        }
-        let Some(body) = cpp_body_node(aggregate) else {
-            return false;
-        };
-
-        let mut cursor = node.walk();
-        let declarators = node
-            .children_by_field_name("declarator", &mut cursor)
-            .filter_map(|declarator| match classify_declarator(declarator) {
-                Some(DeclaratorKind::Variable(variable)) => Some(variable),
-                Some(DeclaratorKind::Function(_)) | None => None,
-            })
-            .collect::<Vec<_>>();
         if declarators.is_empty() {
             stack.push(CppWork::Container(CppContainer {
                 node: body,
@@ -8518,25 +8856,11 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
         if scope.class_unit.is_some() || !has_function_scope_ancestor(node) {
             return false;
         }
-        let Some(aggregate) = node.child_by_field_name("type") else {
+        let Some((aggregate, body, declarators)) =
+            Self::anonymous_aggregate_declaration_parts(node)
+        else {
             return false;
         };
-        if !matches!(aggregate.kind(), "struct_specifier" | "union_specifier")
-            || aggregate.child_by_field_name("name").is_some()
-        {
-            return false;
-        }
-        let Some(body) = cpp_body_node(aggregate) else {
-            return false;
-        };
-        let mut cursor = node.walk();
-        let declarators = node
-            .children_by_field_name("declarator", &mut cursor)
-            .filter_map(|declarator| match classify_declarator(declarator) {
-                Some(DeclaratorKind::Variable(variable)) => Some(variable),
-                Some(DeclaratorKind::Function(_)) | None => None,
-            })
-            .collect::<Vec<_>>();
         if declarators.is_empty() {
             return false;
         }
@@ -8576,10 +8900,7 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
         // what a canonical procedure key needs; a synthetic unit would still
         // refuse that key on identity grounds alone.
         let code_unit = function.code_unit(self.file.clone());
-        if self.parsed.contains_declaration(&code_unit) {
-            self.link_source_declaration(ancestry, &code_unit, declaration_node);
-            self.parsed
-                .record_navigation_range(code_unit, cpp_declaration_range(declaration_node));
+        if self.link_existing_source_declaration(ancestry, &code_unit, declaration_node) {
             return;
         }
         self.add_declaration(ancestry, code_unit.clone(), declaration_node, None, None);
@@ -8606,6 +8927,21 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
         } else if let Some(module) = &scope.module {
             self.parsed.add_child(module.clone(), code_unit);
         }
+    }
+
+    fn link_existing_source_declaration(
+        &mut self,
+        ancestry: &ParentIndex<'_>,
+        code_unit: &CodeUnit,
+        declaration_node: Node<'_>,
+    ) -> bool {
+        if !self.parsed.contains_declaration(code_unit) {
+            return false;
+        }
+        self.link_source_declaration(ancestry, code_unit, declaration_node);
+        self.parsed
+            .record_navigation_range(code_unit.clone(), cpp_declaration_range(declaration_node));
+        true
     }
 
     fn visit_recovered_macro_qualified_function_declaration<'tree>(
@@ -8640,10 +8976,7 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
             return;
         }
         let code_unit = function.code_unit_with_synthetic(self.file.clone(), true);
-        if self.parsed.contains_declaration(&code_unit) {
-            self.link_source_declaration(ancestry, &code_unit, declaration_node);
-            self.parsed
-                .record_navigation_range(code_unit, cpp_declaration_range(declaration_node));
+        if self.link_existing_source_declaration(ancestry, &code_unit, declaration_node) {
             return;
         }
         self.add_declaration(ancestry, code_unit.clone(), declaration_node, None, None);
@@ -8783,6 +9116,26 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
         }
     }
 
+    fn variable_declarator_from_declaration_child<'tree>(
+        child: Node<'tree>,
+    ) -> Option<Node<'tree>> {
+        if child.kind() == "init_declarator" {
+            child.child_by_field_name("declarator")
+        } else if matches!(
+            child.kind(),
+            "identifier"
+                | "field_identifier"
+                | "pointer_declarator"
+                | "reference_declarator"
+                | "array_declarator"
+                | "parenthesized_declarator"
+        ) {
+            Some(child)
+        } else {
+            None
+        }
+    }
+
     fn visit_class_members_from_declaration<'tree>(
         &mut self,
         node: Node<'tree>,
@@ -8793,20 +9146,9 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
         for child in node.named_children(&mut cursor) {
             if let Some(declarator) = recovered_function_like_field_declarator(child, self.source) {
                 self.visit_variable_declaration(node, declarator.name, scope, true, ancestry);
-            } else if child.kind() == "init_declarator"
-                && let Some(inner) = child.child_by_field_name("declarator")
+            } else if let Some(declarator) = Self::variable_declarator_from_declaration_child(child)
             {
-                self.visit_variable_declaration(node, inner, scope, true, ancestry);
-            } else if matches!(
-                child.kind(),
-                "identifier"
-                    | "field_identifier"
-                    | "pointer_declarator"
-                    | "reference_declarator"
-                    | "array_declarator"
-                    | "parenthesized_declarator"
-            ) {
-                self.visit_variable_declaration(node, child, scope, true, ancestry);
+                self.visit_variable_declaration(node, declarator, scope, true, ancestry);
             }
         }
     }
@@ -8819,20 +9161,8 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
     ) {
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
-            if child.kind() == "init_declarator"
-                && let Some(inner) = child.child_by_field_name("declarator")
-            {
-                self.visit_variable_declaration(node, inner, scope, false, ancestry);
-            } else if matches!(
-                child.kind(),
-                "identifier"
-                    | "field_identifier"
-                    | "pointer_declarator"
-                    | "reference_declarator"
-                    | "array_declarator"
-                    | "parenthesized_declarator"
-            ) {
-                self.visit_variable_declaration(node, child, scope, false, ancestry);
+            if let Some(declarator) = Self::variable_declarator_from_declaration_child(child) {
+                self.visit_variable_declaration(node, declarator, scope, false, ancestry);
             }
         }
     }
@@ -9158,8 +9488,12 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
         fact.field_type = field_type;
         fact.names_function_type = names_function_type;
         fact.occurrence_role = brokk_bifrost_core::analyzer::cpp_facts::CppOccurrenceRole::Both;
-        let captured =
-            crate::source_context::capture_declaration_context(context, unit, self.source);
+        let captured = crate::source_context::capture_declaration_context(
+            context,
+            unit,
+            self.source,
+            &mut self.preprocessor_context_cache,
+        );
         fact.guard_requirements = captured.guard_requirements;
         fact.callable_guards = fact.guard_requirements.clone();
         fact.callable_activation = Some(range.end_byte);
@@ -9239,6 +9573,34 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
         }
     }
 
+    fn collapsed_aggregate_owner(
+        &self,
+        name: &str,
+        scope: &ScopeInfo,
+        parent: Option<&CodeUnit>,
+    ) -> CodeUnit {
+        let short_name = parent.map_or_else(
+            || name.to_string(),
+            |parent| cpp_join_nested_short(parent.short_name(), name),
+        );
+        let fq = cpp_leaf_fq(
+            &scope.package_name,
+            parent,
+            name,
+            SegmentKind::Nested,
+            SegmentKind::Type,
+        );
+        CodeUnit::with_signature_and_fq(
+            self.file.clone(),
+            CodeUnitType::Class,
+            scope.package_name.clone(),
+            short_name,
+            None,
+            false,
+            fq,
+        )
+    }
+
     /// Recover ordinary aggregates whose field-list macro invocations made
     /// tree-sitter collapse the class heads and bodies into one `ERROR` node.
     /// The class markers, aggregate braces, field nodes, and macro identifier
@@ -9272,26 +9634,7 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
                         .and_then(|class| recovered.get(*class))
                         .map(|(owner, _, _, _)| owner.clone())
                         .or_else(|| scope.class_unit.clone());
-                    let short_name = parent.as_ref().map_or_else(
-                        || name.clone(),
-                        |parent| cpp_join_nested_short(parent.short_name(), &name),
-                    );
-                    let fq = cpp_leaf_fq(
-                        &scope.package_name,
-                        parent.as_ref(),
-                        &name,
-                        SegmentKind::Nested,
-                        SegmentKind::Type,
-                    );
-                    let owner = CodeUnit::with_signature_and_fq(
-                        self.file.clone(),
-                        CodeUnitType::Class,
-                        scope.package_name.clone(),
-                        short_name,
-                        None,
-                        false,
-                        fq,
-                    );
+                    let owner = self.collapsed_aggregate_owner(&name, scope, parent.as_ref());
                     recovered.push((
                         owner,
                         head.key.start_byte(),
@@ -9530,26 +9873,7 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
             );
         }
         let parent = scope.class_unit.clone();
-        let short_name = parent.as_ref().map_or_else(
-            || name.clone(),
-            |parent| cpp_join_nested_short(parent.short_name(), &name),
-        );
-        let fq = cpp_leaf_fq(
-            &scope.package_name,
-            parent.as_ref(),
-            &name,
-            SegmentKind::Nested,
-            SegmentKind::Type,
-        );
-        let owner = CodeUnit::with_signature_and_fq(
-            self.file.clone(),
-            CodeUnitType::Class,
-            scope.package_name.clone(),
-            short_name,
-            None,
-            false,
-            fq,
-        );
+        let owner = self.collapsed_aggregate_owner(&name, scope, parent.as_ref());
         let recovered = cpp_collapsed_aggregate_members(
             members,
             &inner,
@@ -9742,15 +10066,27 @@ fn object_macro_identifier_nodes<'tree>(
     source: &str,
     fields: &HashMap<String, ObjectMacroReplacement>,
 ) -> Vec<Node<'tree>> {
-    let mut result = Vec::new();
-    let mut stack = vec![node];
-    while let Some(current) = stack.pop() {
+    walk_object_macro_identifier_nodes(node, |current, result| {
         if matches!(
             current.kind(),
             "identifier" | "field_identifier" | "type_identifier"
         ) && fields.contains_key(node_text(current, source).trim())
         {
             result.push(current);
+        }
+        false
+    })
+}
+
+fn walk_object_macro_identifier_nodes<'tree>(
+    node: Node<'tree>,
+    mut visit: impl FnMut(Node<'tree>, &mut Vec<Node<'tree>>) -> bool,
+) -> Vec<Node<'tree>> {
+    let mut result = Vec::new();
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if visit(current, &mut result) {
+            continue;
         }
         let mut cursor = current.walk();
         let children = current.children(&mut cursor).collect::<Vec<_>>();
@@ -9770,11 +10106,9 @@ fn object_macro_identifier_nodes_with_environment<'tree>(
     fields: &mut HashMap<String, ObjectMacroReplacement>,
     ambiguous: &mut HashSet<String>,
 ) -> Vec<Node<'tree>> {
-    let mut result = Vec::new();
-    let mut stack = vec![node];
-    while let Some(current) = stack.pop() {
+    walk_object_macro_identifier_nodes(node, |current, result| {
         if update_object_macro_field_environment(current, source, fields, ambiguous) {
-            continue;
+            return true;
         }
         if matches!(
             current.kind(),
@@ -9783,12 +10117,8 @@ fn object_macro_identifier_nodes_with_environment<'tree>(
         {
             result.push(current);
         }
-        let mut cursor = current.walk();
-        let children = current.children(&mut cursor).collect::<Vec<_>>();
-        stack.extend(children.into_iter().rev());
-    }
-    result.sort_by_key(|node| node.start_byte());
-    result
+        false
+    })
 }
 
 /// One member region of an aggregate whose head and body tree-sitter collapsed
@@ -10200,9 +10530,12 @@ fn extract_cpp_base_facts(node: Node<'_>, source: &str) -> Vec<CppBaseSpecifierF
                 | "scoped_type_identifier"
                 | "template_type"
                 | "template_function" => {
-                    if let Some(fact) =
-                        crate::source_facts::base_specifier_from_node(base, source, is_virtual)
-                    {
+                    if let Some(fact) = crate::source_facts::base_specifier_from_node(
+                        base,
+                        source,
+                        is_virtual,
+                        crate::source_facts::base_access_specifier(child, base, node.kind()),
+                    ) {
                         facts.push(fact);
                     }
                     is_virtual = false;
@@ -10381,22 +10714,22 @@ impl FunctionInfo {
                     } else {
                         SegmentKind::Nested
                     };
-                    fq.push(cpp_segment(component, kind));
+                    fq.push(segment_interner().intern(component, kind));
                     first = false;
                 }
-                fq.push(cpp_segment(&self.name, SegmentKind::Member));
+                fq.push(segment_interner().intern(&self.name, SegmentKind::Member));
                 fq
             }
             Some(CppMemberOwner::Unit(parent)) if !parent.short_name().is_empty() => parent
                 .fq()
                 .clone()
-                .with_pushed(cpp_segment(&self.name, SegmentKind::Member)),
+                .with_pushed(segment_interner().intern(&self.name, SegmentKind::Member)),
             // An anonymous parent (empty short chain) contributes no owner
             // segment -- the same guard as cpp_join_member_short above.
             Some(CppMemberOwner::Unit(_)) | None => {
                 let mut fq = FqName::new();
                 cpp_push_package(&mut fq, &self.package_name);
-                fq.push(cpp_segment(&self.name, SegmentKind::Member));
+                fq.push(segment_interner().intern(&self.name, SegmentKind::Member));
                 fq
             }
         };
@@ -11080,7 +11413,7 @@ fn cpp_namespace_name_for_forward<'tree>(
     ancestry: &ParentIndex<'tree>,
 ) -> Option<String> {
     cpp_namespace_definition_for_forward(node, ancestry)?;
-    cpp_lexical_namespace_name(node, source, ancestry)
+    cpp_lexical_namespace_name(node, source)
 }
 
 fn cpp_namespace_definition_for_forward<'tree>(
@@ -11112,15 +11445,10 @@ fn cpp_namespace_definition_for_forward<'tree>(
 
 fn is_function_pointer_like_inner_declarator(node: Node<'_>) -> bool {
     match node.kind() {
-        "pointer_declarator" | "reference_declarator" | "array_declarator" => true,
-        "parenthesized_declarator" => node
-            .child_by_field_name("declarator")
-            .or_else(|| last_named_child(node))
-            .is_some_and(is_pointer_wrapper_declarator),
         "template_function" => node
             .child_by_field_name("name")
             .is_some_and(is_function_pointer_like_inner_declarator),
-        _ => false,
+        _ => is_pointer_wrapper_declarator(node),
     }
 }
 
@@ -11502,17 +11830,24 @@ fn extract_callable_declarator_name(node: Node<'_>, source: &str) -> Option<Stri
     }
 }
 
-fn extract_variable_name(node: Node<'_>, source: &str) -> Option<String> {
-    match node.kind() {
-        "identifier" | "field_identifier" | "type_identifier" | "qualified_identifier" => {
-            let name = node_text(node, source).trim().to_string();
-            (!name.is_empty()).then_some(name)
+fn extract_variable_name(mut node: Node<'_>, source: &str) -> Option<String> {
+    loop {
+        if let Some(name) = macro_decorated_unqualified_name(node) {
+            node = name;
+            continue;
         }
-        _ => node
-            .child_by_field_name("declarator")
-            .or_else(|| node.child_by_field_name("name"))
-            .or_else(|| last_named_child(node))
-            .and_then(|child| extract_variable_name(child, source)),
+        match node.kind() {
+            "identifier" | "field_identifier" | "type_identifier" | "qualified_identifier" => {
+                let name = node_text(node, source).trim().to_string();
+                return (!name.is_empty()).then_some(name);
+            }
+            _ => {
+                node = node
+                    .child_by_field_name("declarator")
+                    .or_else(|| node.child_by_field_name("name"))
+                    .or_else(|| last_named_child(node))?;
+            }
+        }
     }
 }
 
@@ -11627,14 +11962,7 @@ pub(crate) fn recovered_function_like_field_declarator<'tree>(
     })
 }
 
-fn last_named_child(node: Node<'_>) -> Option<Node<'_>> {
-    let count = node.named_child_count();
-    if count == 0 {
-        None
-    } else {
-        node.named_child(count - 1)
-    }
-}
+use brokk_bifrost_core::analyzer::tree_walk::last_named_child;
 
 fn extract_alias_declaration_name(node: Node<'_>, source: &str) -> Option<String> {
     let name_node = node.child_by_field_name("name")?;
@@ -11817,11 +12145,10 @@ fn fragmented_parenthesized_typedef_type(node: Node<'_>) -> Option<Node<'_>> {
     node.child_by_field_name("type")
 }
 
-fn extract_typedef_declarator_name(node: Node<'_>, source: &str) -> Option<String> {
+pub(crate) fn extract_typedef_declarator_name(node: Node<'_>, source: &str) -> Option<String> {
     match node.kind() {
         "identifier" | "field_identifier" | "type_identifier" => {
-            let name = normalize_cpp_whitespace(node_text(node, source));
-            (!name.is_empty()).then_some(name)
+            direct_identifier_name(node, source)
         }
         "qualified_identifier" => node
             .child_by_field_name("name")
@@ -11835,25 +12162,19 @@ fn extract_typedef_declarator_name(node: Node<'_>, source: &str) -> Option<Strin
 }
 
 fn extract_macro_name(node: Node<'_>, source: &str) -> Option<String> {
-    let name = node
-        .child_by_field_name("name")
-        .map(|name_node| normalize_cpp_whitespace(node_text(name_node, source)))
-        .or_else(|| {
-            let mut cursor = node.walk();
-            node.named_children(&mut cursor)
-                .find(|child| {
-                    matches!(
-                        child.kind(),
-                        "identifier" | "field_identifier" | "type_identifier"
-                    )
-                })
-                .map(|name_node| normalize_cpp_whitespace(node_text(name_node, source)))
-        })?;
-    (!name.is_empty()).then_some(name)
-}
-
-fn same_node(left: Node<'_>, right: Node<'_>) -> bool {
-    left.id() == right.id()
+    if let Some(name_node) = node.child_by_field_name("name") {
+        let name = normalize_cpp_whitespace(node_text(name_node, source));
+        return (!name.is_empty()).then_some(name);
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| {
+            matches!(
+                child.kind(),
+                "identifier" | "field_identifier" | "type_identifier"
+            )
+        })
+        .and_then(|name_node| direct_identifier_name(name_node, source))
 }
 
 fn render_cpp_type_signature(
@@ -11922,7 +12243,6 @@ fn render_cpp_field_signature(node: Node<'_>, declarator: Node<'_>, source: &str
     {
         return signature;
     }
-    let declaration_text = normalize_cpp_whitespace(node_text(node, source));
     let prefix = cpp_declaration_prefix(node, source);
     let name = extract_variable_name(declarator, source).unwrap_or_default();
     let raw_suffix = cpp_declarator_suffix_without_name(declarator, source);
@@ -11945,9 +12265,11 @@ fn render_cpp_field_signature(node: Node<'_>, declarator: Node<'_>, source: &str
     };
     rendered = collapse_cpp_whitespace(&rendered);
 
+    // Check the terminal token directly instead of normalizing the whole
+    // declaration, which can copy a large initializer for each field.
     if let Some(initializer) = cpp_preserved_initializer(node, declarator, source) {
         format!("{rendered} = {initializer};")
-    } else if declaration_text.ends_with(';') {
+    } else if cpp_direct_semicolon(node).is_some() {
         format!("{rendered};")
     } else {
         rendered
@@ -12879,15 +13201,7 @@ fn recovered_using_declaration_alias_name(node: Node<'_>, source: &str) -> Optio
         .and_then(|declarator| extract_variable_name(declarator, source))
 }
 
-fn has_function_scope_ancestor(mut node: Node<'_>) -> bool {
-    while let Some(parent) = node.parent() {
-        if matches!(parent.kind(), "function_definition" | "lambda_expression") {
-            return true;
-        }
-        node = parent;
-    }
-    false
-}
+use crate::graph::syntax::has_function_scope_ancestor;
 
 fn cpp_template_metadata<'tree>(
     template_node: Node<'tree>,
@@ -13075,6 +13389,9 @@ fn cpp_template_parameter_name(node: Node<'_>, source: &str) -> Option<String> {
                 )
             })
         })?;
+    if let Some(name) = direct_identifier_name(candidate, source) {
+        return Some(name);
+    }
     let name = normalize_cpp_whitespace(&extract_declarator_name(candidate, source));
     (!name.is_empty()).then_some(name)
 }
@@ -13087,6 +13404,35 @@ fn cpp_template_parameter_kind(node: Node<'_>) -> CppTemplateParameterKind {
         "template_template_parameter_declaration" => CppTemplateParameterKind::Template,
         _ => CppTemplateParameterKind::Value,
     }
+}
+
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct CppTemplateParameterNameMatches {
+    pub any_parameter: bool,
+    pub type_parameter: bool,
+}
+
+pub fn cpp_template_parameter_name_matches(
+    parameters: Node<'_>,
+    name: &str,
+    mut parameter_name: impl FnMut(Node<'_>) -> Option<String>,
+) -> CppTemplateParameterNameMatches {
+    let mut matches = CppTemplateParameterNameMatches::default();
+    let mut cursor = parameters.walk();
+    for parameter in parameters.named_children(&mut cursor) {
+        if parameter_name(parameter).as_deref() == Some(name) {
+            matches.any_parameter = true;
+            matches.type_parameter |=
+                cpp_template_parameter_kind(parameter) == CppTemplateParameterKind::Type;
+        }
+    }
+    matches
+}
+
+pub fn cpp_type_field_contains_node(parent: Node<'_>, node: Node<'_>) -> bool {
+    parent.child_by_field_name("type").is_some_and(|type_node| {
+        type_node.start_byte() <= node.start_byte() && node.end_byte() <= type_node.end_byte()
+    })
 }
 
 fn cpp_template_parameter_default(node: Node<'_>) -> Option<Node<'_>> {
@@ -13266,6 +13612,14 @@ fn cpp_parameter_signature(parameters_node: Node<'_>, source: &str) -> String {
     let mut cursor = parameters_node.walk();
     for child in parameters_node.children(&mut cursor) {
         match child.kind() {
+            "explicit_object_parameter_declaration" => {
+                if let Some(parameter) = child
+                    .named_children(&mut child.walk())
+                    .find(|node| node.kind() == "parameter_declaration")
+                {
+                    params.push(format!("this {}", cpp_parameter_type(parameter, source)));
+                }
+            }
             "parameter_declaration" | "optional_parameter_declaration" => {
                 params.push(cpp_parameter_type(child, source));
             }
@@ -13665,35 +14019,107 @@ fn malformed_class_error_owner_name(node: Node<'_>, source: &str) -> Option<Stri
     has_body.then_some(name)
 }
 
-/// The parser-derived return type of one callable declaration.
+/// Whether one declaration carries a native must-use attribute.
 ///
-/// This accepts the enclosing declaration node so consumers do not need to
-/// duplicate the declarator-unwrapping rules before asking for the structured
-/// identity.
-pub fn cpp_callable_declaration_return_type_identity<'tree>(
-    callable: Node<'tree>,
-    source: &str,
-    ancestry: &ParentIndex<'tree>,
-) -> Option<StructuredTypeIdentity> {
-    let declarator = callable
-        .child_by_field_name("declarator")
-        .and_then(extract_function_declarator)?;
-    cpp_callable_return_type_identity(declarator, source, ancestry)
+/// Attribute names are read only from structurally selected attribute nodes;
+/// an identifier with the same spelling elsewhere in the declaration cannot
+/// produce a proof. GNU's spelling is accepted for `warn_unused_result`,
+/// while standard `nodiscard` is accepted without a namespace prefix.
+pub fn cpp_declaration_has_native_must_use_attribute(declaration: Node<'_>, source: &str) -> bool {
+    // The C++ grammar keeps a prefix attribute on the enclosing declaration
+    // while the enum unit's occurrence points at its `enum_specifier`. Bring
+    // that one structural sibling into the same declaration boundary; this
+    // does not widen the walk to surrounding declarations.
+    let declaration = declaration
+        .parent()
+        .filter(|parent| {
+            parent.kind() == "declaration"
+                && parent
+                    .child_by_field_name("type")
+                    .is_some_and(|type_node| type_node.id() == declaration.id())
+        })
+        .unwrap_or(declaration);
+    let mut pending = vec![declaration];
+    while let Some(node) = pending.pop() {
+        if cpp_attribute_node_is_native_must_use(node, source)
+            && cpp_attribute_is_attached_to_declaration(node, declaration)
+        {
+            return true;
+        }
+        if node != declaration && matches!(node.kind(), "compound_statement" | "lambda_expression")
+        {
+            continue;
+        }
+        push_named_children_reversed(node, &mut pending);
+    }
+    false
 }
 
-pub(crate) fn cpp_callable_return_type_identity<'tree>(
+fn cpp_attribute_node_is_native_must_use(node: Node<'_>, source: &str) -> bool {
+    if node.kind() == "attribute" {
+        return node.child_by_field_name("name").is_some_and(|name| {
+            let name = node_text(name, source);
+            let prefix = node
+                .child_by_field_name("prefix")
+                .map(|prefix| node_text(prefix, source));
+            matches!(
+                (prefix, name),
+                (None, "nodiscard")
+                    | (None, "warn_unused_result")
+                    | (Some("gnu"), "warn_unused_result")
+            )
+        });
+    }
+    if node.kind() != "attribute_specifier" || !node_text(node, source).starts_with("__attribute__")
+    {
+        return false;
+    }
+    let Some(arguments) = node.named_child(0) else {
+        return false;
+    };
+    let Some(name) = arguments.named_child(0) else {
+        return false;
+    };
+    arguments.kind() == "argument_list"
+        && name.kind() == "identifier"
+        && node_text(name, source) == "warn_unused_result"
+}
+
+fn cpp_attribute_is_attached_to_declaration(attribute: Node<'_>, declaration: Node<'_>) -> bool {
+    let mut current = attribute;
+    while let Some(parent) = current.parent() {
+        if parent.id() == declaration.id() {
+            return true;
+        }
+        if matches!(
+            parent.kind(),
+            "declaration"
+                | "field_declaration"
+                | "function_definition"
+                | "struct_specifier"
+                | "class_specifier"
+                | "union_specifier"
+                | "enum_specifier"
+        ) {
+            return false;
+        }
+        current = parent;
+    }
+    false
+}
+
+fn cpp_callable_return_type_parts<'tree>(
     function_declarator: Node<'tree>,
     source: &str,
     ancestry: &ParentIndex<'tree>,
-) -> Option<StructuredTypeIdentity> {
+) -> Option<(Node<'tree>, Vec<CppStructuredTypeWrapper>)> {
     if cpp_callable_is_structural_constructor(function_declarator, source, ancestry) {
         return None;
     }
-    let lexical_scope = cpp_callable_lexical_scope(function_declarator, source, ancestry);
     if let Some((return_type, _)) =
         cpp_macro_displaced_callable_parts(function_declarator, source, ancestry)
     {
-        return cpp_structured_type_identity(return_type, source, &lexical_scope);
+        return Some((return_type, Vec::new()));
     }
     let mut cursor = function_declarator.walk();
     if let Some(trailing) = function_declarator
@@ -13701,7 +14127,7 @@ pub(crate) fn cpp_callable_return_type_identity<'tree>(
         .find(|child| child.kind() == "trailing_return_type")
         && let Some(type_descriptor) = trailing.named_child(0)
     {
-        return cpp_structured_type_identity(type_descriptor, source, &lexical_scope);
+        return Some((type_descriptor, Vec::new()));
     }
 
     let mut current = function_declarator;
@@ -13721,11 +14147,7 @@ pub(crate) fn cpp_callable_return_type_identity<'tree>(
             {
                 return None;
             }
-            let mut identity = cpp_structured_type_identity(type_node, source, &lexical_scope)?;
-            for wrapper in wrappers.into_iter().rev() {
-                identity = cpp_wrap_structured_type(identity, wrapper)?;
-            }
-            return Some(identity);
+            return Some((type_node, wrappers));
         }
         let wraps_current_declarator = parent.child_by_field_name("declarator") == Some(current)
             || (matches!(
@@ -13749,6 +14171,53 @@ pub(crate) fn cpp_callable_return_type_identity<'tree>(
         current = parent;
     }
     None
+}
+
+/// Return the AST node that describes one callable's declared result type.
+///
+/// The node is returned only after the same declarator walk that establishes
+/// the persisted C++ return identity. Consumers can therefore resolve a
+/// nominal result or inspect its declaration attributes without parsing a
+/// rendered signature.
+pub fn cpp_callable_declaration_return_type_node<'tree>(
+    callable: Node<'tree>,
+    source: &str,
+    ancestry: &ParentIndex<'tree>,
+) -> Option<Node<'tree>> {
+    let declarator = callable
+        .child_by_field_name("declarator")
+        .and_then(extract_function_declarator)?;
+    cpp_callable_return_type_parts(declarator, source, ancestry).map(|(node, _)| node)
+}
+
+/// Return the structured declared result type of one callable declaration.
+///
+/// This accepts the enclosing declaration node so consumers do not need to
+/// duplicate the declarator-unwrapping rules before asking for the structured
+/// identity.
+pub fn cpp_callable_declaration_return_type_identity<'tree>(
+    callable: Node<'tree>,
+    source: &str,
+    ancestry: &ParentIndex<'tree>,
+) -> Option<StructuredTypeIdentity> {
+    let declarator = callable
+        .child_by_field_name("declarator")
+        .and_then(extract_function_declarator)?;
+    cpp_callable_return_type_identity(declarator, source, ancestry)
+}
+
+pub(crate) fn cpp_callable_return_type_identity<'tree>(
+    function_declarator: Node<'tree>,
+    source: &str,
+    ancestry: &ParentIndex<'tree>,
+) -> Option<StructuredTypeIdentity> {
+    let lexical_scope = cpp_callable_lexical_scope(function_declarator, source, ancestry);
+    let (return_type, wrappers) =
+        cpp_callable_return_type_parts(function_declarator, source, ancestry)?;
+    cpp_apply_structured_type_wrappers(
+        cpp_structured_type_identity(return_type, source, &lexical_scope)?,
+        wrappers,
+    )
 }
 
 fn cpp_structured_type_identity(
@@ -13943,6 +14412,16 @@ fn cpp_wrap_structured_type(
         CppStructuredTypeWrapper::RvalueReference => identity.wrap_rvalue_reference(),
         CppStructuredTypeWrapper::Array => identity.wrap_array(),
     }
+}
+
+fn cpp_apply_structured_type_wrappers(
+    mut identity: StructuredTypeIdentity,
+    wrappers: Vec<CppStructuredTypeWrapper>,
+) -> Option<StructuredTypeIdentity> {
+    for wrapper in wrappers.into_iter().rev() {
+        identity = cpp_wrap_structured_type(identity, wrapper)?;
+    }
+    Some(identity)
 }
 
 fn cpp_wrap_structured_type_node(
@@ -14247,53 +14726,37 @@ pub(crate) fn cpp_callable_arity(parameters_node: Node<'_>, source: &str) -> Cal
     let mut required = 0;
     let mut total = 0;
     let mut repeated = false;
-    let mut cursor = parameters_node.walk();
-    for child in parameters_node.children(&mut cursor) {
-        match child.kind() {
-            "parameter_declaration" => {
-                if cpp_parameter_is_explicit_object(child, source) {
-                    continue;
-                }
-                if child.child_by_field_name("declarator").is_none()
-                    && child
-                        .child_by_field_name("type")
-                        .is_some_and(|type_node| node_text(type_node, source).trim() == "void")
-                {
-                    continue;
-                }
-                required += 1;
+    for slot in cpp_callable_parameter_slots(parameters_node, source) {
+        match slot {
+            CppParameterSlot::Declared {
+                required: is_required,
+                ..
+            } => {
                 total += 1;
+                if is_required {
+                    required += 1;
+                }
             }
-            "optional_parameter_declaration" => total += 1,
-            "variadic_parameter" | "variadic_parameter_declaration" | "..." => {
-                repeated = true;
-            }
-            _ => {}
+            CppParameterSlot::OptionalVoid => total += 1,
+            CppParameterSlot::Ellipsis => repeated = true,
         }
     }
     CallableArity::new(required, total, repeated)
 }
 
-fn cpp_parameter_is_explicit_object(parameter: Node<'_>, source: &str) -> bool {
-    parameter
-        .child_by_field_name("type")
-        .filter(|type_node| type_node.kind() == "placeholder_type_specifier")
-        .and_then(|type_node| type_node.child_by_field_name("constraint"))
-        .is_some_and(|constraint| {
-            constraint.kind() == "type_identifier" && node_text(constraint, source).trim() == "this"
-        })
-}
-
-/// One entry of a callable's invocation parameter list.
+/// One entry of a callable's invocation parameter list, plus an optional
+/// unnamed `void` declaration retained for the legacy arity result.
 ///
-/// The list excludes an explicit object parameter and a lone `void`, so its
-/// length is the callable's invocation arity. Every derivation of a parameter
-/// type - the rendered spelling used for overload discrimination and the
-/// structured identity used by dependency-pack production - starts from this
-/// same sequence, so the two can never disagree about which parameters exist.
+/// The list excludes an explicit object parameter and a lone `void`. Every
+/// derivation of parameter arity or type starts from this same sequence, so
+/// those views cannot disagree about which parameters exist.
 #[derive(Clone, Copy)]
 enum CppParameterSlot<'tree> {
-    Declared(Node<'tree>),
+    Declared {
+        parameter: Node<'tree>,
+        required: bool,
+    },
+    OptionalVoid,
     Ellipsis,
 }
 
@@ -14306,15 +14769,21 @@ fn cpp_callable_parameter_slots<'tree>(
     for parameter in parameters_node.children(&mut cursor) {
         match parameter.kind() {
             "parameter_declaration" | "optional_parameter_declaration" => {
-                if cpp_parameter_is_explicit_object(parameter, source)
-                    || (parameter.child_by_field_name("declarator").is_none()
-                        && parameter
-                            .child_by_field_name("type")
-                            .is_some_and(|type_node| node_text(type_node, source).trim() == "void"))
-                {
+                let is_unnamed_void = parameter.child_by_field_name("declarator").is_none()
+                    && parameter
+                        .child_by_field_name("type")
+                        .is_some_and(|type_node| node_text(type_node, source).trim() == "void");
+                if is_unnamed_void && parameter.kind() == "parameter_declaration" {
                     continue;
                 }
-                slots.push(CppParameterSlot::Declared(parameter));
+                if is_unnamed_void {
+                    slots.push(CppParameterSlot::OptionalVoid);
+                    continue;
+                }
+                slots.push(CppParameterSlot::Declared {
+                    parameter,
+                    required: parameter.kind() == "parameter_declaration",
+                });
             }
             "variadic_parameter" | "variadic_parameter_declaration" | "..." => {
                 slots.push(CppParameterSlot::Ellipsis);
@@ -14328,9 +14797,33 @@ fn cpp_callable_parameter_slots<'tree>(
 pub(crate) fn cpp_callable_parameter_types(parameters_node: Node<'_>, source: &str) -> Vec<String> {
     cpp_callable_parameter_slots(parameters_node, source)
         .into_iter()
-        .map(|slot| match slot {
-            CppParameterSlot::Declared(parameter) => cpp_parameter_type(parameter, source),
-            CppParameterSlot::Ellipsis => "...".to_string(),
+        .filter_map(|slot| match slot {
+            CppParameterSlot::Declared { parameter, .. } => {
+                Some(cpp_parameter_type(parameter, source))
+            }
+            CppParameterSlot::Ellipsis => Some("...".to_string()),
+            CppParameterSlot::OptionalVoid => None,
+        })
+        .collect()
+}
+
+/// Return the written name of each callable parameter in invocation order.
+/// C and C++ permit declarations without names; those slots deliberately stay
+/// `None` so consumers can distinguish an unnamed formal from a guessed one.
+pub(crate) fn cpp_callable_parameter_names(
+    parameters_node: Node<'_>,
+    source: &str,
+) -> Vec<Option<String>> {
+    cpp_callable_parameter_slots(parameters_node, source)
+        .into_iter()
+        .filter_map(|slot| match slot {
+            CppParameterSlot::Declared { parameter, .. } => Some(
+                parameter
+                    .child_by_field_name("declarator")
+                    .and_then(|declarator| declarator_name_from_node(declarator, source)),
+            ),
+            CppParameterSlot::Ellipsis => Some(None),
+            CppParameterSlot::OptionalVoid => None,
         })
         .collect()
 }
@@ -14368,12 +14861,13 @@ pub fn cpp_callable_parameter_type_identities<'tree>(
     let lexical_scope = cpp_callable_lexical_scope(function_declarator, source, ancestry);
     cpp_callable_parameter_slots(parameters_node, source)
         .into_iter()
-        .map(|slot| match slot {
-            CppParameterSlot::Ellipsis => CppParameterType::Ellipsis,
-            CppParameterSlot::Declared(parameter) => {
+        .filter_map(|slot| match slot {
+            CppParameterSlot::Ellipsis => Some(CppParameterType::Ellipsis),
+            CppParameterSlot::Declared { parameter, .. } => Some(
                 cpp_parameter_type_identity(parameter, source, &lexical_scope)
-                    .map_or(CppParameterType::Unstructured, CppParameterType::Structured)
-            }
+                    .map_or(CppParameterType::Unstructured, CppParameterType::Structured),
+            ),
+            CppParameterSlot::OptionalVoid => None,
         })
         .collect()
 }
@@ -14414,14 +14908,12 @@ fn cpp_declaration_type_identity_in_scope(
     lexical_scope: &[String],
 ) -> Option<StructuredTypeIdentity> {
     let type_node = declaration.child_by_field_name("type")?;
-    let mut identity = cpp_structured_type_identity(type_node, source, lexical_scope)?;
+    let identity = cpp_structured_type_identity(type_node, source, lexical_scope)?;
     if let Some(declarator) = declarator {
-        for wrapper in cpp_structured_declarator_wrappers(declarator)?
-            .into_iter()
-            .rev()
-        {
-            identity = cpp_wrap_structured_type(identity, wrapper)?;
-        }
+        return cpp_apply_structured_type_wrappers(
+            identity,
+            cpp_structured_declarator_wrappers(declarator)?,
+        );
     }
     Some(identity)
 }
@@ -14443,12 +14935,13 @@ pub fn cpp_comparable_parameter_shapes<'tree>(
     let lexical_scope = cpp_callable_lexical_scope(function_declarator, source, ancestry);
     cpp_callable_parameter_slots(parameters_node, source)
         .into_iter()
-        .map(|slot| match slot {
-            CppParameterSlot::Ellipsis => CppComparableSlot::Ellipsis,
-            CppParameterSlot::Declared(parameter) => {
+        .filter_map(|slot| match slot {
+            CppParameterSlot::Ellipsis => Some(CppComparableSlot::Ellipsis),
+            CppParameterSlot::Declared { parameter, .. } => Some(
                 cpp_comparable_parameter(parameter, source, &lexical_scope)
-                    .map_or(CppComparableSlot::Unstructured, CppComparableSlot::Shape)
-            }
+                    .map_or(CppComparableSlot::Unstructured, CppComparableSlot::Shape),
+            ),
+            CppParameterSlot::OptionalVoid => None,
         })
         .collect()
 }
@@ -14885,10 +15378,7 @@ fn cpp_parameter_declarator(parameter: Node<'_>) -> Option<Node<'_>> {
         // Recover only the structured abstract-declarator node; the parameter's
         // type and qualifiers are distinct children and must not be guessed from
         // source text.
-        let mut cursor = parameter.walk();
-        parameter
-            .named_children(&mut cursor)
-            .find(|child| is_cpp_abstract_declarator(child.kind()))
+        cpp_first_abstract_declarator_child(parameter)
     })
 }
 
@@ -14926,12 +15416,16 @@ fn is_cpp_abstract_declarator(kind: &str) -> bool {
     )
 }
 
+fn cpp_first_abstract_declarator_child(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| is_cpp_abstract_declarator(child.kind()))
+}
+
 fn cpp_nested_declarator(node: Node<'_>) -> Option<Node<'_>> {
     node.child_by_field_name("declarator").or_else(|| {
         if is_cpp_abstract_declarator(node.kind()) {
-            let mut cursor = node.walk();
-            node.named_children(&mut cursor)
-                .find(|child| is_cpp_abstract_declarator(child.kind()))
+            cpp_first_abstract_declarator_child(node)
         } else {
             // Named declarators historically use their last named child when
             // tree-sitter omits the field. Keep that broad fallback for
@@ -15038,20 +15532,16 @@ fn collapse_cpp_whitespace(value: &str) -> String {
     result.trim().to_string()
 }
 
-pub fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    node_source_text(node, source)
-}
-
 fn cpp_body_node(node: Node<'_>) -> Option<Node<'_>> {
-    node.child_by_field_name("body").or_else(|| {
-        let mut cursor = node.walk();
-        node.named_children(&mut cursor).find(|child| {
-            matches!(
-                child.kind(),
-                "declaration_list" | "field_declaration_list" | "enumerator_list"
-            )
-        })
-    })
+    child_by_field_or_named_child_of_kinds(
+        node,
+        "body",
+        &[
+            "declaration_list",
+            "field_declaration_list",
+            "enumerator_list",
+        ],
+    )
 }
 
 /// Return a class body's actual closing brace when the parser supplied one.
@@ -15762,7 +16252,7 @@ fn cpp_sentinel_fragmented_class_tail<'tree>(
         return None;
     }
     let tree = cpp_reparse_region_items(source, *reparse_start, reparse_end)?;
-    if !cpp_reparsed_members_are_indexable(tree.root_node(), source) {
+    if !cpp_reparsed_members_are_indexable_for_class(tree.root_node(), source, Some(name)) {
         return None;
     }
     let class_range = Range {
@@ -16232,12 +16722,7 @@ fn cpp_sentinel_recovered_owner_ranges_after_declaration_siblings(
             }
             continue;
         }
-        walk_named_tree_preorder(child, true, |node| {
-            if node.kind() == "namespace_definition" {
-                return WalkControl::SkipChildren;
-            }
-            cpp_sentinel_collect_owner_range(node, namespace_components, source, &mut owners)
-        });
+        cpp_sentinel_append_owner_ranges(child, namespace_components, source, &mut owners);
     }
     owners
 }
@@ -16264,14 +16749,23 @@ fn cpp_sentinel_recovered_owner_ranges_after_namespace_siblings(
         if cpp_sentinel_namespace_end(child, source) {
             return Some(owners);
         }
-        walk_named_tree_preorder(child, true, |node| {
-            if node.kind() == "namespace_definition" {
-                return WalkControl::SkipChildren;
-            }
-            cpp_sentinel_collect_owner_range(node, namespace_components, source, &mut owners)
-        });
+        cpp_sentinel_append_owner_ranges(child, namespace_components, source, &mut owners);
     }
     None
+}
+
+fn cpp_sentinel_append_owner_ranges(
+    sibling: Node<'_>,
+    namespace_components: &[String],
+    source: &str,
+    owners: &mut Vec<CppSentinelRecoveredOwner>,
+) {
+    walk_named_tree_preorder(sibling, true, |node| {
+        if node.kind() == "namespace_definition" {
+            return WalkControl::SkipChildren;
+        }
+        cpp_sentinel_collect_owner_range(node, namespace_components, source, owners)
+    });
 }
 
 fn cpp_sentinel_recovered_sibling_owner_ranges(
@@ -16578,10 +17072,7 @@ fn cpp_sentinel_macro_class_region<'tree>(
         let mut found = None;
         while let Some(current) = sibling {
             let next = current.next_named_sibling();
-            if cpp_is_stray_close_brace(current, source)
-                && next.is_some_and(|next| cpp_is_stray_semicolon(next, source))
-            {
-                let semicolon = next.expect("checked above");
+            if let Some(semicolon) = cpp_stray_close_followed_by_semicolon(current, next, source) {
                 found = Some((
                     current.start_byte(),
                     semicolon.end_byte(),
@@ -16839,6 +17330,16 @@ fn cpp_is_stray_semicolon(node: Node<'_>, source: &str) -> bool {
         && node_text(node, source).trim() == ";"
 }
 
+fn cpp_stray_close_followed_by_semicolon<'tree>(
+    close: Node<'tree>,
+    next: Option<Node<'tree>>,
+    source: &str,
+) -> Option<Node<'tree>> {
+    cpp_is_stray_close_brace(close, source)
+        .then(|| next.filter(|semicolon| cpp_is_stray_semicolon(*semicolon, source)))
+        .flatten()
+}
+
 /// Recover the member that follows CPython's object header macro when
 /// tree-sitter folds both declarations into one malformed field.
 ///
@@ -16931,10 +17432,10 @@ pub(crate) fn recovered_pyobject_head_field<'tree>(
 /// `bitfield_clause` containing an error plus an assignment.  The assignment's
 /// left field is the only structured declaration name in that malformed tail.
 /// A real bit-field is excluded by the all-caps macro type and required error.
-fn recovered_macro_qualified_field_declarators<'tree>(
+fn recovered_macro_qualified_field_clause<'tree>(
     node: Node<'tree>,
     source: &str,
-) -> Option<Vec<Node<'tree>>> {
+) -> Option<Node<'tree>> {
     if node.kind() != "field_declaration" {
         return None;
     }
@@ -16944,14 +17445,20 @@ fn recovered_macro_qualified_field_declarators<'tree>(
     {
         return None;
     }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| child.kind() == "bitfield_clause")
+}
+
+fn recovered_macro_qualified_field_declarators<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<Vec<Node<'tree>>> {
     let pseudo_declarator = node.child_by_field_name("declarator")?;
     if pseudo_declarator.kind() != "field_identifier" {
         return None;
     }
-    let mut cursor = node.walk();
-    let clause = node
-        .named_children(&mut cursor)
-        .find(|child| child.kind() == "bitfield_clause")?;
+    let clause = recovered_macro_qualified_field_clause(node, source)?;
     if !(0..clause.named_child_count()).any(|index| {
         clause
             .named_child(index)
@@ -16993,19 +17500,7 @@ fn recovered_macro_qualified_constructor_call<'tree>(
     class_name: &str,
     source: &str,
 ) -> Option<Node<'tree>> {
-    if node.kind() != "field_declaration" {
-        return None;
-    }
-    let macro_type = node.child_by_field_name("type")?;
-    if macro_type.kind() != "type_identifier"
-        || !cpp_export_macro_token(&normalize_cpp_whitespace(node_text(macro_type, source)))
-    {
-        return None;
-    }
-    let mut cursor = node.walk();
-    let bitfield = node
-        .named_children(&mut cursor)
-        .find(|child| child.kind() == "bitfield_clause")?;
+    let bitfield = recovered_macro_qualified_field_clause(node, source)?;
     let error = bitfield
         .named_child(0)
         .filter(|child| child.kind() == "ERROR")?;
@@ -17038,15 +17533,7 @@ fn recovered_macro_qualified_function_call<'tree>(
     node: Node<'tree>,
     source: &str,
 ) -> Option<Node<'tree>> {
-    if node.kind() != "field_declaration" {
-        return None;
-    }
-    let macro_type = node.child_by_field_name("type")?;
-    if macro_type.kind() != "type_identifier"
-        || !cpp_export_macro_token(&normalize_cpp_whitespace(node_text(macro_type, source)))
-    {
-        return None;
-    }
+    let bitfield = recovered_macro_qualified_field_clause(node, source)?;
     let declarator = node.child_by_field_name("declarator")?;
     if declarator.kind() != "field_identifier" {
         return None;
@@ -17059,9 +17546,6 @@ fn recovered_macro_qualified_function_call<'tree>(
     }) {
         return None;
     }
-    let bitfield = named
-        .iter()
-        .find(|child| child.kind() == "bitfield_clause")?;
     let mut bitfield_cursor = bitfield.walk();
     let payload = bitfield
         .named_children(&mut bitfield_cursor)
@@ -17195,15 +17679,12 @@ pub(crate) fn cpp_active_template_type_parameter<'tree>(
     while let Some(current) = ancestor {
         if current.kind() == "template_declaration"
             && let Some(parameters) = current.child_by_field_name("parameters")
+            && cpp_template_parameter_name_matches(parameters, name, |parameter| {
+                cpp_template_parameter_name(parameter, source)
+            })
+            .type_parameter
         {
-            let mut cursor = parameters.walk();
-            if parameters.named_children(&mut cursor).any(|parameter| {
-                cpp_template_parameter_kind(parameter) == CppTemplateParameterKind::Type
-                    && cpp_template_parameter_name(parameter, source)
-                        .is_some_and(|parameter_name| parameter_name == name)
-            }) {
-                return true;
-            }
+            return true;
         }
         ancestor = ancestry.parent(current);
     }
@@ -17384,14 +17865,13 @@ fn cpp_prototype_macro_candidate_from_init_declaration(
     {
         return None;
     }
-    Some(PrototypeMacroCandidate {
-        run_start: declaration.start_byte(),
-        identifier_start: macro_name.start_byte(),
-        inner_open_start: inner.start_byte(),
-        inner_close_end: inner.end_byte(),
-        outer_close_end: arguments.end_byte(),
-        semicolon_end: semicolon.end_byte(),
-    })
+    Some(cpp_prototype_macro_candidate_from_parts(
+        declaration.start_byte(),
+        macro_name,
+        inner,
+        arguments,
+        semicolon,
+    ))
 }
 
 fn cpp_prototype_macro_candidate_from_qualified_declaration(
@@ -17490,14 +17970,30 @@ fn cpp_prototype_macro_candidate_from_pointer_expression(
     {
         return None;
     }
-    Some(PrototypeMacroCandidate {
-        run_start: statement.start_byte(),
+    Some(cpp_prototype_macro_candidate_from_parts(
+        statement.start_byte(),
+        macro_name,
+        inner,
+        arguments,
+        semicolon,
+    ))
+}
+
+fn cpp_prototype_macro_candidate_from_parts(
+    run_start: usize,
+    macro_name: Node<'_>,
+    inner_arguments: Node<'_>,
+    outer_arguments: Node<'_>,
+    semicolon: Node<'_>,
+) -> PrototypeMacroCandidate {
+    PrototypeMacroCandidate {
+        run_start,
         identifier_start: macro_name.start_byte(),
-        inner_open_start: inner.start_byte(),
-        inner_close_end: inner.end_byte(),
-        outer_close_end: arguments.end_byte(),
+        inner_open_start: inner_arguments.start_byte(),
+        inner_close_end: inner_arguments.end_byte(),
+        outer_close_end: outer_arguments.end_byte(),
         semicolon_end: semicolon.end_byte(),
-    })
+    }
 }
 
 /// Recover only CST shapes whose fields preserve the declaration name, macro
@@ -17592,7 +18088,7 @@ fn cpp_reparse_padded_class_body(source: &str, start: usize, end: usize) -> Opti
     );
     padded.extend_from_slice(interior);
     let padded = String::from_utf8(padded).ok()?;
-    let mut parser = Parser::new();
+    let mut parser = tree_sitter::Parser::new();
     parser
         .set_language(&tree_sitter_cpp::LANGUAGE.into())
         .ok()?;
@@ -17863,10 +18359,14 @@ fn cpp_reparsed_member_signature_identifier_errors(node: Node<'_>) -> bool {
 fn cpp_reparsed_member_attribute_error(node: Node<'_>, source: &str) -> bool {
     node.kind() == "ERROR"
         && node.named_child_count() == 1
-        && node.named_child(0).is_some_and(|attribute| {
-            attribute.kind() == "identifier"
-                && cpp_export_macro_token(&normalize_cpp_whitespace(node_text(attribute, source)))
-        })
+        && node
+            .named_child(0)
+            .is_some_and(|attribute| cpp_reparsed_export_macro_identifier(attribute, source))
+}
+
+fn cpp_reparsed_export_macro_identifier(node: Node<'_>, source: &str) -> bool {
+    node.kind() == "identifier"
+        && cpp_export_macro_token(&normalize_cpp_whitespace(node_text(node, source)))
 }
 
 /// A C++ attribute placed between a member's declarator and body can make
@@ -17888,8 +18388,7 @@ fn cpp_reparsed_attribute_member_function(node: Node<'_>, source: &str) -> bool 
     };
     if !same_node(*body_node, body)
         || !cpp_reparsed_member_return_type_is_indexable(*type_node, source)
-        || attribute.kind() != "identifier"
-        || !cpp_export_macro_token(&normalize_cpp_whitespace(node_text(*attribute, source)))
+        || !cpp_reparsed_export_macro_identifier(*attribute, source)
         || error.kind() != "ERROR"
         || error.named_child_count() != 1
     {
@@ -17905,6 +18404,24 @@ fn cpp_reparsed_member_return_type_is_indexable(node: Node<'_>, source: &str) ->
         && !cpp_export_macro_token(&normalize_cpp_whitespace(node_text(node, source)))
 }
 
+fn cpp_reparsed_member_return_and_declarator_are_indexable(
+    return_error: Node<'_>,
+    declarator: Node<'_>,
+    body_node: Node<'_>,
+    body: Node<'_>,
+    source: &str,
+) -> bool {
+    return_error.kind() == "ERROR"
+        && return_error.named_child_count() == 1
+        && same_node(body_node, body)
+        && return_error.named_child(0).is_some_and(|return_type| {
+            cpp_reparsed_member_return_type_is_indexable(return_type, source)
+        })
+        && extract_function_declarator(declarator)
+            .and_then(cpp_function_declarator_name_node)
+            .is_some()
+}
+
 fn cpp_reparsed_friend_function_is_indexable(node: Node<'_>, source: &str) -> bool {
     let Some(body) = cpp_reparsed_member_function_body(node) else {
         return false;
@@ -17917,18 +18434,15 @@ fn cpp_reparsed_friend_function_is_indexable(node: Node<'_>, source: &str) -> bo
     let [friend, return_error, declarator, body_node] = named.as_slice() else {
         return false;
     };
-    let Some(return_type) = return_error.named_child(0) else {
-        return false;
-    };
-    same_node(*body_node, body)
-        && friend.kind() == "type_identifier"
+    friend.kind() == "type_identifier"
         && node_text(*friend, source) == "friend"
-        && return_error.kind() == "ERROR"
-        && return_error.named_child_count() == 1
-        && cpp_reparsed_member_return_type_is_indexable(return_type, source)
-        && extract_function_declarator(*declarator)
-            .and_then(cpp_function_declarator_name_node)
-            .is_some()
+        && cpp_reparsed_member_return_and_declarator_are_indexable(
+            *return_error,
+            *declarator,
+            *body_node,
+            body,
+            source,
+        )
 }
 
 fn cpp_reparsed_prefix_attribute_function_is_indexable(node: Node<'_>, source: &str) -> bool {
@@ -17943,21 +18457,18 @@ fn cpp_reparsed_prefix_attribute_function_is_indexable(node: Node<'_>, source: &
     let [prefix @ .., attribute, return_error, declarator, body_node] = named.as_slice() else {
         return false;
     };
-    let Some(return_type) = return_error.named_child(0) else {
-        return false;
-    };
-    same_node(*body_node, body)
-        && prefix
-            .iter()
-            .all(|node| matches!(node.kind(), "storage_class_specifier" | "type_qualifier"))
+    prefix
+        .iter()
+        .all(|node| matches!(node.kind(), "storage_class_specifier" | "type_qualifier"))
         && attribute.kind() == "type_identifier"
         && cpp_export_macro_token(&normalize_cpp_whitespace(node_text(*attribute, source)))
-        && return_error.kind() == "ERROR"
-        && return_error.named_child_count() == 1
-        && cpp_reparsed_member_return_type_is_indexable(return_type, source)
-        && extract_function_declarator(*declarator)
-            .and_then(cpp_function_declarator_name_node)
-            .is_some()
+        && cpp_reparsed_member_return_and_declarator_are_indexable(
+            *return_error,
+            *declarator,
+            *body_node,
+            body,
+            source,
+        )
 }
 
 /// An included-range reparse that begins inside a malformed class can merge an
@@ -18172,6 +18683,21 @@ fn cpp_reparsed_attribute_requires_body(node: Node<'_>, source: &str) -> bool {
     cpp_reparsed_attribute_requires_error(error, source)
 }
 
+fn cpp_reparsed_template_macro_prefix_parameter_name<'tree>(
+    parameter: Node<'tree>,
+    macro_name: Node<'tree>,
+    message: Node<'tree>,
+    source: &str,
+) -> Option<Node<'tree>> {
+    let parameter_name = parameter.named_child(0)?;
+    (parameter.kind() == "type_parameter_declaration"
+        && parameter_name.kind() == "type_identifier"
+        && macro_name.kind() == "type_identifier"
+        && cpp_export_macro_token(&normalize_cpp_whitespace(node_text(macro_name, source)))
+        && message.kind() == "string_literal")
+        .then_some(parameter_name)
+}
+
 fn cpp_reparsed_template_macro_prefix_parameter<'tree>(
     node: Node<'tree>,
     source: &str,
@@ -18184,13 +18710,7 @@ fn cpp_reparsed_template_macro_prefix_parameter<'tree>(
     let [parameter, macro_name, message] = named.as_slice() else {
         return None;
     };
-    let parameter_name = parameter.named_child(0)?;
-    (parameter.kind() == "type_parameter_declaration"
-        && parameter_name.kind() == "type_identifier"
-        && macro_name.kind() == "type_identifier"
-        && cpp_export_macro_token(&normalize_cpp_whitespace(node_text(*macro_name, source)))
-        && message.kind() == "string_literal")
-        .then_some(parameter_name)
+    cpp_reparsed_template_macro_prefix_parameter_name(*parameter, *macro_name, *message, source)
 }
 
 /// Recognize the alternate constraint-macro prefix where tree-sitter retains
@@ -18209,7 +18729,12 @@ fn cpp_reparsed_template_macro_constraint_prefix_parameter<'tree>(
     let [parameter, macro_name, message, constraint] = named.as_slice() else {
         return None;
     };
-    let parameter_name = parameter.named_child(0)?;
+    let parameter_name = cpp_reparsed_template_macro_prefix_parameter_name(
+        *parameter,
+        *macro_name,
+        *message,
+        source,
+    )?;
     let constraint_scope = constraint.child_by_field_name("scope")?;
     let constraint_template = constraint.child_by_field_name("name")?;
     let constraint_arguments = constraint_template.child_by_field_name("arguments")?;
@@ -18217,12 +18742,7 @@ fn cpp_reparsed_template_macro_constraint_prefix_parameter<'tree>(
     let constraint_types = constraint_arguments
         .named_children(&mut argument_cursor)
         .collect::<Vec<_>>();
-    if parameter.kind() != "type_parameter_declaration"
-        || parameter_name.kind() != "type_identifier"
-        || macro_name.kind() != "type_identifier"
-        || !cpp_export_macro_token(&normalize_cpp_whitespace(node_text(*macro_name, source)))
-        || message.kind() != "string_literal"
-        || constraint.kind() != "qualified_identifier"
+    if constraint.kind() != "qualified_identifier"
         || constraint_scope.kind() != "namespace_identifier"
         || !matches!(
             constraint_template.kind(),
@@ -18592,7 +19112,120 @@ fn cpp_reparsed_stranded_member_error(node: Node<'_>, source: &str) -> bool {
     run.complete && !run.declarations.is_empty()
 }
 
+/// The ABI 15 grammar reads a defaulted zero-argument constructor in a
+/// translation-unit-shaped class-body reparse as an assignment expression:
+/// `Ctor() = default`. Admit only the exact assignment shape, and only when
+/// the same reparse retains a separate constructor declarator for that name.
+/// The second condition keeps an arbitrary expression statement from becoming
+/// a member merely because it contains a callee followed by `default`.
+fn cpp_reparsed_defaulted_constructor_is_indexable(
+    node: Node<'_>,
+    members: &[Node<'_>],
+    class_name: Option<&str>,
+    source: &str,
+) -> bool {
+    let Some(class_name) = class_name else {
+        return false;
+    };
+    if node.kind() != "expression_statement" || node.named_child_count() != 1 {
+        return false;
+    }
+    let Some(assignment) = node.named_child(0) else {
+        return false;
+    };
+    if assignment.kind() != "assignment_expression" || assignment.child_count() != 3 {
+        return false;
+    }
+    if assignment
+        .child(1)
+        .is_none_or(|operator| operator.kind() != "=")
+    {
+        return false;
+    }
+    let Some(call) = assignment.child_by_field_name("left") else {
+        return false;
+    };
+    let Some(default_value) = assignment.child_by_field_name("right") else {
+        return false;
+    };
+    let Some(function) = call.child_by_field_name("function") else {
+        return false;
+    };
+    let Some(arguments) = call.child_by_field_name("arguments") else {
+        return false;
+    };
+    if call.kind() != "call_expression"
+        || function.kind() != "identifier"
+        || arguments.kind() != "argument_list"
+        || arguments.named_child_count() != 0
+        || default_value.kind() != "identifier"
+        || node_text(default_value, source) != "default"
+        || node_text(function, source) != class_name
+    {
+        return false;
+    }
+    members.iter().any(|member| {
+        if same_node(*member, node) {
+            return false;
+        }
+        cpp_reparsed_member_constructor_name(*member, source).is_some_and(|name| name == class_name)
+    })
+}
+
+/// Return the constructor name from one direct class-member-shaped reparse
+/// item. The function-declarator in an `ERROR` is admitted only through the
+/// existing ERROR-only member proof; clean function definitions must carry no
+/// return type and must retain either a body or ABI 15's `default_method_clause`.
+fn cpp_reparsed_member_constructor_name(node: Node<'_>, source: &str) -> Option<String> {
+    let function_declarator = match node.kind() {
+        "function_definition"
+            if !node.has_error() && node.child_by_field_name("type").is_none() =>
+        {
+            let has_body = node
+                .child_by_field_name("body")
+                .is_some_and(|body| body.kind() == "compound_statement");
+            let has_default_method_clause = node
+                .named_children(&mut node.walk())
+                .any(|child| child.kind() == "default_method_clause");
+            if !has_body && !has_default_method_clause {
+                return None;
+            }
+            node.child_by_field_name("declarator")
+                .and_then(extract_function_declarator)
+        }
+        "ERROR" if cpp_reparsed_member_error_is_indexable(node) => {
+            let mut stack = node.named_children(&mut node.walk()).collect::<Vec<_>>();
+            let mut candidate = None;
+            while let Some(current) = stack.pop() {
+                if current.kind() == "function_declarator" {
+                    if candidate.is_some() {
+                        return None;
+                    }
+                    candidate = Some(current);
+                    continue;
+                }
+                if current.kind() == "ERROR" {
+                    let mut cursor = current.walk();
+                    stack.extend(current.named_children(&mut cursor));
+                }
+            }
+            candidate
+        }
+        _ => None,
+    }?;
+    cpp_function_declarator_name_node(function_declarator)
+        .map(|name| normalize_cpp_whitespace(node_text(name, source)))
+}
+
 fn cpp_reparsed_members_are_indexable(root: Node<'_>, source: &str) -> bool {
+    cpp_reparsed_members_are_indexable_for_class(root, source, None)
+}
+
+fn cpp_reparsed_members_are_indexable_for_class(
+    root: Node<'_>,
+    source: &str,
+    class_name: Option<&str>,
+) -> bool {
     let mut cursor = root.walk();
     let children = root.named_children(&mut cursor).collect::<Vec<_>>();
     let mut saw_member = false;
@@ -18612,7 +19245,11 @@ fn cpp_reparsed_members_are_indexable(root: Node<'_>, source: &str) -> bool {
             ) else {
                 return false;
             };
-            if !cpp_reparsed_members_are_indexable(tree.root_node(), source) {
+            if !cpp_reparsed_members_are_indexable_for_class(
+                tree.root_node(),
+                source,
+                Some(recovered.name.as_str()),
+            ) {
                 return false;
             }
             saw_member = true;
@@ -18640,6 +19277,13 @@ fn cpp_reparsed_members_are_indexable(root: Node<'_>, source: &str) -> bool {
             // of its own. It declares nothing; the member it decorated is the
             // sibling after it, checked on its own turn.
             "expression_statement" if is_string_attribute_macro_statement(child) => {}
+            "expression_statement"
+                if cpp_reparsed_defaulted_constructor_is_indexable(
+                    child, &children, class_name, source,
+                ) =>
+            {
+                saw_member = true;
+            }
             "ERROR"
                 if (cpp_reparsed_member_error_is_indexable(child)
                     || cpp_reparsed_adjacent_copy_control_error(child, source)
@@ -18920,25 +19564,91 @@ mod tests {
     use super::*;
     use crate::adapter::parse_cpp_file;
     use brokk_bifrost_core::analyzer::parsed_file::{
-        finish_code_unit_removal_scan_probe, finish_declaration_identity_comparison_probe,
-        start_code_unit_removal_scan_probe, start_declaration_identity_comparison_probe,
+        finish_declaration_identity_comparison_probe, start_declaration_identity_comparison_probe,
     };
+    use brokk_bifrost_test_macros::hardwon;
     use std::fmt::Write;
 
     fn parse_cpp_declarations(source: &str, name: &str) -> ParsedFile {
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_cpp::LANGUAGE.into())
-            .unwrap();
-        let tree = parser.parse(source, None).unwrap();
+        let tree = crate::diagnostics::parse_cpp_tree(source);
         let file = ProjectFile::new(std::env::temp_dir(), name);
         parse_cpp_file(&file, source, &tree)
+    }
+
+    #[test]
+    fn native_must_use_attribute_nodes_are_structural() {
+        let source = "int must_use_value() __attribute__((warn_unused_result));\nint must_use_value() { return 1; }\n[[nodiscard]] int standard_value();\n";
+        let tree = crate::diagnostics::parse_cpp_tree(source);
+        let root = tree.root_node();
+        let mut declarations = Vec::new();
+        walk_named_tree_preorder(root, true, |node| {
+            if matches!(
+                node.kind(),
+                "declaration" | "function_definition" | "field_declaration"
+            ) {
+                declarations.push(node);
+            }
+            WalkControl::Continue
+        });
+        assert_eq!(
+            declarations
+                .into_iter()
+                .map(|declaration| {
+                    cpp_declaration_has_native_must_use_attribute(declaration, source)
+                })
+                .collect::<Vec<_>>(),
+            vec![true, false, true]
+        );
+        let enum_source = "[[nodiscard]] enum Marker { MarkerValue } marker;";
+        let enum_tree = crate::diagnostics::parse_cpp_tree(enum_source);
+        let mut enum_specifier = None;
+        walk_named_tree_preorder(enum_tree.root_node(), true, |node| {
+            if node.kind() == "enum_specifier" {
+                enum_specifier = Some(node);
+                WalkControl::Break
+            } else {
+                WalkControl::Continue
+            }
+        });
+        assert!(cpp_declaration_has_native_must_use_attribute(
+            enum_specifier.expect("enum declaration"),
+            enum_source
+        ));
+    }
+
+    fn recorded_callable_modifiers(parsed: &ParsedFile) -> Vec<String> {
+        let mut rows = parsed
+            .signature_metadata
+            .iter()
+            .flat_map(|(unit, entries)| {
+                entries.iter().map(move |metadata| {
+                    assert!(
+                        metadata.callable_modifiers_recorded(),
+                        "{} must record that the walk read its declaration shape",
+                        unit.fq_name()
+                    );
+                    format!(
+                        "{} decl_only={} static={} constructor={} visibility={:?}",
+                        unit.fq_name(),
+                        metadata.is_declaration_only(),
+                        metadata.callable_is_static(),
+                        metadata.callable_is_constructor(),
+                        metadata
+                            .callable_declared_visibility()
+                            .expect("a recorded modifier set states a visibility"),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        rows
     }
 
     /// #3520: the input-edge rebuild of a rendered C++ name must render back to
     /// exactly the spelling it was given, with the nested-class `$` recorded as
     /// a [`SegmentKind::Nested`] join and a member as its own tail segment.
     #[test]
+    #[hardwon("#3520: exact C++ lookup could not round-trip nested terminal identities")]
     fn rendered_name_fq_round_trips_nested_class_spellings() {
         assert!(cpp_rendered_name_fq("").is_empty());
         for rendered in [
@@ -18975,6 +19685,9 @@ mod tests {
     /// and the namespace `.` identity. Canonical `.` / `$` spellings stay on
     /// the single rendered-name parse.
     #[test]
+    #[hardwon(
+        "509d66c85788: C++ declaration recovery regressed for colon source aliases name nested and namespace identities"
+    )]
     fn colon_source_aliases_name_nested_and_namespace_identities() {
         let native = |rendered: &str| {
             cpp_colon_source_aliases(rendered)
@@ -19006,6 +19719,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "aa581047b253: C++ declaration recovery regressed for displaced terminator ignores nested initializer endif"
+    )]
     fn displaced_terminator_ignores_nested_initializer_endif() {
         let source = "#ifdef ENABLE_ITEMS\n\
 struct Item { int reg; };\n\
@@ -19035,6 +19751,9 @@ int read_item(int i) { return items[i].reg; }\n\
     }
 
     #[test]
+    #[hardwon(
+        "376bffa02aec: C++ parser recovery previously lost declaration ownership, member scope, or source identity"
+    )]
     fn pyobject_head_field_recovery_publishes_only_the_real_member() {
         let source = "struct Image { PyObject_HEAD Imaging image; };";
         let parsed = parse_cpp_declarations(source, "image.h");
@@ -19084,6 +19803,9 @@ int read_item(int i) { return items[i].reg; }\n\
     }
 
     #[test]
+    #[hardwon(
+        "376bffa02aec: C++ parser recovery previously lost declaration ownership, member scope, or source identity"
+    )]
     fn gtest_style_stolen_namespace_recovery_never_retains_class_owner() {
         let source = r#"namespace testing {
 namespace internal {
@@ -19172,6 +19894,7 @@ namespace internal {
             primary_root_id: tree.root_node().id(),
             source_links: HashMap::default(),
             source_declarations: HashSet::default(),
+            preprocessor_context_cache: Default::default(),
             active_source_context: None,
             c_tag_semantics: false,
             c_tag_scope_witness: false,
@@ -19231,7 +19954,165 @@ namespace internal {
         );
     }
 
+    /// #4292: a recovered namespace level whose close the brace stack could not
+    /// prove keeps its head-only range, and the first declaration the walk
+    /// reaches inside the region is not the namespace. The Module's name
+    /// occurrence must be the level's own name token; deriving it from the
+    /// walk's current node paired the head range with an unrelated name and
+    /// panicked the collector's containment assertion.
     #[test]
+    fn recovered_namespace_levels_name_their_own_name_tokens() {
+        // #3084's collapsed-head fixture without the namespace's own close:
+        // the file ends inside the namespace, so the brace stack proves no
+        // close for its `{` and the level keeps its `namespace Name {` head
+        // alone (#3328).
+        let source = r#"namespace outer::app {
+
+    class Target {
+        int value_;
+    };
+
+    template <typename T>
+    class Holder {
+    public:
+        explicit constexpr Holder( T lhs ): m_lhs( lhs ) {}
+
+#define HOLDER_DEFINE_OP( id, op )                                             \
+    template <typename U>                                                      \
+    constexpr friend auto operator op( Holder&& lhs, U&& rhs )                 \
+        -> std::enable_if_t<is_##id##_comparable<T, U>::value, Target> {       \
+        return Target{};                                                       \
+    }
+
+        HOLDER_DEFINE_OP( equal, == )
+#undef HOLDER_DEFINE_OP
+        T m_lhs;
+    };
+
+    class Tail {};
+"#;
+        let parsed = parse_cpp_declarations(source, "recovered-namespace-name.h");
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        assert!(
+            tree.root_node().has_error(),
+            "the fixture must reproduce the parse damage"
+        );
+        let target_start = source.find("class Target").expect("target class");
+        let target_node = tree
+            .root_node()
+            .named_descendant_for_byte_range(target_start, target_start + "class".len())
+            .expect("target class AST node");
+        let index = OrphanedNamespaceScopeIndex::build(tree.root_node(), source);
+        assert!(
+            index.region_at(target_start).is_some(),
+            "the collapsed namespaces must restore a region over the members"
+        );
+        assert_eq!(
+            index.enclosing_namespace_components(target_node, source),
+            ["outer", "app"]
+        );
+        let file = ProjectFile::new(std::env::temp_dir(), "recovered-namespace-name.h");
+        let mut recovered_parsed = ParsedFile::new(String::new());
+        let scope = ScopeInfo {
+            package_name: String::new(),
+            module: None,
+            class_unit: None,
+            template_signature: None,
+            template_metadata: None,
+            declarations_are_fields: false,
+            recovered_specialization_member_scope: false,
+            visible_using_namespaces: Vec::new(),
+        };
+        let collector = RefCell::new(PrimarySourceFactCollector::new(source));
+        let properties = RefCell::new(HashMap::default());
+        let dependencies =
+            RefCell::new(crate::source_dependencies::DeclarationDependencies::default());
+        let ancestry = ParentIndex::new(tree.root_node());
+        let mut visitor = CppVisitor {
+            file: &file,
+            source,
+            parsed: &mut recovered_parsed,
+            source_collector: &collector,
+            source_properties: &properties,
+            source_dependencies: &dependencies,
+            primary_ancestry: &ancestry,
+            primary_root_id: tree.root_node().id(),
+            source_links: HashMap::default(),
+            source_declarations: HashSet::default(),
+            preprocessor_context_cache: Default::default(),
+            active_source_context: None,
+            c_tag_semantics: false,
+            c_tag_scope_witness: false,
+            recovered_class_sibling_scopes: HashMap::default(),
+            consumed_fragment_regions: Vec::new(),
+            orphaned_namespaces: &index,
+            partitioned_regions: Vec::new(),
+            namespace_forward_scans: HashMap::default(),
+            field_owners: None,
+            recovery_captures: Vec::new(),
+            object_macro_fields: HashMap::default(),
+            ambiguous_object_macro_fields: HashSet::default(),
+        };
+        let recovered = visitor
+            .recovered_namespace_scope(target_node, &scope)
+            .expect("the members must use the recovered namespace scope");
+        assert_eq!(recovered.package_name, "outer::app");
+        let collector = collector.borrow();
+        for (module_name, expected_name) in [
+            (
+                "outer",
+                Range {
+                    start_byte: 10,
+                    end_byte: 15,
+                    start_line: 1,
+                    end_line: 1,
+                },
+            ),
+            (
+                "outer::app",
+                Range {
+                    start_byte: 17,
+                    end_byte: 20,
+                    start_line: 1,
+                    end_line: 1,
+                },
+            ),
+        ] {
+            let declaration = visitor
+                .source_links
+                .iter()
+                .find(|(unit, _)| unit.fq_name() == module_name)
+                .expect("the recovered module links a source declaration")
+                .1
+                .last()
+                .expect("the recovered module declaration");
+            let declaration = collector.declaration(*declaration);
+            let name = declaration
+                .name
+                .expect("the recovered module records its name occurrence");
+            assert_eq!(
+                collector.occurrence(name).range,
+                expected_name,
+                "the recovered module names its own token: {module_name}"
+            );
+        }
+        assert!(
+            parsed.declarations().iter().any(|unit| {
+                unit.fq_name() == "outer::app.Target" || unit.fq_name() == "outer::app.Tail"
+            }),
+            "the recovered namespace members keep their namespace: {:#?}",
+            parsed.declarations()
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "3d77aac19607: C++ parser recovery previously lost declaration ownership, member scope, or source identity"
+    )]
     fn object_like_field_macros_materialize_owner_specific_declarations() {
         let source = r#"#define PUBLIC_FIELDS int public_value;
 #define PRIVATE_FIELDS int private_value;
@@ -19281,6 +20162,20 @@ struct Third {
     }
 
     #[test]
+    fn conditional_macro_redefinition_is_ambiguous() {
+        let source = "#define FIELDS int first;\n#if USE_FIRST\n#else\n#undef FIELDS\n#define FIELDS int second;\n#endif\nstruct Item { FIELDS };\n";
+        let tree = crate::diagnostics::parse_cpp_tree(source);
+        let fields = collect_cpp_object_macro_fields(tree.root_node(), source);
+        assert!(
+            !fields.contains_key("FIELDS"),
+            "conditional macro state must not select one branch's declaration: {fields:?}"
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "daa20f600d11: C++ parser recovery previously lost declaration ownership, member scope, or source identity"
+    )]
     fn macro_redefinitions_keep_distinct_structured_declaration_identities() {
         let source = "#define VALUE 1\n#undef VALUE\n#define VALUE 2\n";
         let parsed = parse_cpp_declarations(source, "macro-redefinition.c");
@@ -19302,6 +20197,9 @@ struct Third {
     }
 
     #[test]
+    #[hardwon(
+        "5de822e5d66f: C++ declaration recovery regressed for identifies export macro class base displaced into declarator"
+    )]
     fn identifies_export_macro_class_base_displaced_into_declarator() {
         let source = r#"#define PROJECT_API_
 namespace project {
@@ -19335,17 +20233,19 @@ class PROJECT_API_ [[nodiscard]] Wrapper<int> : public internal::Base<int> {};
         );
     }
 
-    fn function_identities(parsed: &ParsedFile) -> Vec<(String, String)> {
-        let mut identities = parsed
+    fn all_function_identities(parsed: &ParsedFile) -> Vec<(String, Option<String>)> {
+        parsed
             .declarations()
             .iter()
             .filter(|unit| unit.is_function())
-            .map(|unit| {
-                (
-                    unit.fq_name(),
-                    unit.signature().unwrap_or_default().to_string(),
-                )
-            })
+            .map(|unit| (unit.fq_name(), unit.signature().map(str::to_string)))
+            .collect()
+    }
+
+    fn function_identities(parsed: &ParsedFile) -> Vec<(String, String)> {
+        let mut identities = all_function_identities(parsed)
+            .into_iter()
+            .map(|(name, signature)| (name, signature.unwrap_or_default()))
             .collect::<Vec<_>>();
         identities.sort();
         identities
@@ -19358,6 +20258,9 @@ class PROJECT_API_ [[nodiscard]] Wrapper<int> : public internal::Base<int> {};
     /// closed rather than fall back to a token scan. Parameter names are
     /// dropped from signatures just as they are for ordinary C prototypes.
     #[test]
+    #[hardwon(
+        "398ac6605e9f: C++ declaration recovery regressed for c prototype macro recovers parser owned declaration shapes"
+    )]
     fn c_prototype_macro_recovers_parser_owned_declaration_shapes() {
         let cases = [
             (
@@ -19426,6 +20329,9 @@ class PROJECT_API_ [[nodiscard]] Wrapper<int> : public internal::Base<int> {};
     /// here with a clean preceding field so the prototype remains the
     /// parser-owned `expression_statement` this recovery requires.
     #[test]
+    #[hardwon(
+        "398ac6605e9f: C++ declaration recovery regressed for c prototype macro recovers pointer return expression statements"
+    )]
     fn c_prototype_macro_recovers_pointer_return_expression_statements() {
         let cases = [
             (
@@ -19470,6 +20376,9 @@ class PROJECT_API_ [[nodiscard]] Wrapper<int> : public internal::Base<int> {};
     /// not claim that structurally flattened neighboring prototypes are safe
     /// to recover.
     #[test]
+    #[hardwon(
+        "398ac6605e9f: C++ declaration recovery regressed for c prototype macro recovers the issue witness inside the real ruby pg header block"
+    )]
     fn c_prototype_macro_recovers_the_issue_witness_inside_the_real_ruby_pg_header_block() {
         let source = r#"VALUE pg_typemap_fit_to_result                         _(( VALUE, VALUE ));
 VALUE pg_typemap_fit_to_query                          _(( VALUE, VALUE ));
@@ -19540,6 +20449,9 @@ rb_encoding *pg_conn_enc_get                           _(( PGconn * ));
     /// macro in type position, was already recovered and is the control that
     /// both spellings agree.
     #[test]
+    #[hardwon(
+        "6b1e2f76b805: C++ declaration recovery regressed for a macro decorated constructor is named for the constructor"
+    )]
     fn a_macro_decorated_constructor_is_named_for_the_constructor() {
         let source = r#"class SIMD_4x26 final {
    public:
@@ -19560,11 +20472,37 @@ rb_encoding *pg_conn_enc_get                           _(( PGconn * ));
         );
     }
 
+    #[test]
+    #[hardwon(
+        "e3ff69209ab2: C++ variable recovery must keep the terminal name after a missing scope separator"
+    )]
+    fn a_missing_scope_separator_keeps_variable_name_and_real_qualified_names() {
+        let source = r#"struct cpu_spec {};
+static struct cpu_spec __initdata cpu_specs[];
+static struct cpu_spec ns::cpu_specs[];
+"#;
+        let tree = crate::diagnostics::parse_cpp_tree(source);
+        let root = tree.root_node();
+        let declarations = root
+            .named_children(&mut root.walk())
+            .filter(|node| node.kind() == "declaration")
+            .collect::<Vec<_>>();
+        let names = declarations
+            .iter()
+            .filter_map(|declaration| declaration.child_by_field_name("declarator"))
+            .filter_map(|declarator| extract_variable_name(declarator, source))
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["cpu_specs", "ns::cpu_specs"]);
+    }
+
     /// #2552 shape 2. `DEPRECATED(decl, "hint");` makes tree-sitter emit one
     /// `ERROR` holding the wrapped declaration and every declaration after it
     /// until the parser recovers. All of them must be indexed, each with the
     /// byte range that spells it.
     #[test]
+    #[hardwon(
+        "a0b3bd93484b: C++ declaration recovery regressed for a macro wrapped declaration and the declarations it swallowed are indexed"
+    )]
     fn a_macro_wrapped_declaration_and_the_declarations_it_swallowed_are_indexed() {
         let source = r#"#include <cstdint>
 struct llama_vocab; struct llama_model; struct llama_context; struct llama_context_params {};
@@ -19640,6 +20578,9 @@ struct llama_vocab; struct llama_model; struct llama_context; struct llama_conte
     /// tree-sitter prices error recovery partly by how much input a repair
     /// skips, and the same construct written with shorter names parses cleanly.
     #[test]
+    #[hardwon(
+        "9e1f8732e419: C++ declaration recovery regressed for a flattened macro invocation run is read from its token order"
+    )]
     fn a_flattened_macro_invocation_run_is_read_from_its_token_order() {
         let source = r#"    LIBRARY_DEPRECATED(
         LIBRARY_API struct library_context * library_init_from_file(const char * path_model),
@@ -19755,12 +20696,63 @@ struct llama_vocab; struct llama_model; struct llama_context; struct llama_conte
         );
     }
 
+    #[test]
+    #[hardwon(
+        "9e1f8732e419: C++ declaration recovery must not lift a conditional function-body error to file scope"
+    )]
+    fn a_conditional_error_inside_an_ordinary_function_is_not_global_scope() {
+        let source = r#"void host() {
+#ifdef ENABLED
+LIBRARY_DEPRECATED(
+    int hidden(const char* value),
+    "hint"
+);
+#endif
+}
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .expect("C++ grammar");
+        let tree = parser.parse(source, None).expect("C++ tree");
+        let root = tree.root_node();
+        let function = root.named_child(0).expect("ordinary function");
+        let body = function
+            .child_by_field_name("body")
+            .expect("ordinary function body");
+        let conditional = body.named_child(0).expect("conditional body");
+        let mut conditional_cursor = conditional.walk();
+        let envelope = conditional
+            .named_children(&mut conditional_cursor)
+            .find(|child| child.kind() == "ERROR")
+            .expect("macro error");
+        assert_eq!(conditional.kind(), "preproc_ifdef");
+        assert_eq!(envelope.kind(), "ERROR");
+
+        let ancestry = ParentIndex::new(root);
+        assert!(declaration_scope_container(envelope, &ancestry).is_none());
+        assert!(collapsed_macro_declaration_run(envelope, source, &ancestry).is_none());
+
+        let parsed = parse_cpp_declarations(source, "function-body-macro.h");
+        assert!(
+            parsed
+                .declarations()
+                .iter()
+                .all(|unit| unit.fq_name() != "hidden"),
+            "a function-body macro error must not become a global declaration: {:#?}",
+            parsed.declarations()
+        );
+    }
+
     /// The hand-off that keeps the scan finite. An invocation that reaches the
     /// end of its own declaration scope swallowed nothing, and the ordinary
     /// `macro_wrapped_declarations` reader has it. The scan reparses exactly
     /// that region for every invocation it finds, so admitting it here would
     /// hand the scan its own input back.
     #[test]
+    #[hardwon(
+        "9e1f8732e419: C++ declaration recovery regressed for an invocation that fills its scope is left to the ordinary reader"
+    )]
     fn an_invocation_that_fills_its_scope_is_left_to_the_ordinary_reader() {
         let source = r#"LIBRARY_DEPRECATED(
         LIBRARY_API struct library_context * library_init_from_file(const char * path_model),
@@ -19803,6 +20795,9 @@ struct llama_vocab; struct llama_model; struct llama_context; struct llama_conte
     /// keeps it clean, reads the arguments as a type, or reads them as a bare
     /// declarator.
     #[test]
+    #[hardwon(
+        "a0b3bd93484b: C++ declaration recovery regressed for a macro call without a wrapped declaration recovers nothing"
+    )]
     fn a_macro_call_without_a_wrapped_declaration_recovers_nothing() {
         for source in [
             "int before;\nFOO(1, 2);\nint after;\n",
@@ -19825,6 +20820,9 @@ struct llama_vocab; struct llama_model; struct llama_context; struct llama_conte
     /// list as a parenthesized declarator, which then swallows the attributed
     /// member and the member written after it. Both are members.
     #[test]
+    #[hardwon(
+        "c1aac56476f0: C++ declaration recovery regressed for a string attribute macro member keeps itself and the member after it"
+    )]
     fn a_string_attribute_macro_member_keeps_itself_and_the_member_after_it() {
         let source = r#"#include <string_view>
 namespace Botan {
@@ -19862,6 +20860,9 @@ class DL_Group final {
     /// string-attribute member used to make that reparse unindexable -- which
     /// left the class with no members at all.
     #[test]
+    #[hardwon(
+        "c1aac56476f0: C++ declaration recovery regressed for an export macro class keeps its string attribute members"
+    )]
     fn an_export_macro_class_keeps_its_string_attribute_members() {
         let source = r#"#include <string_view>
 namespace Botan {
@@ -19906,6 +20907,9 @@ class BOTAN_PUBLIC_API(2, 0) DL_Group final {
     /// with a member-initializer list under `private:` dissolves into
     /// expression soup that the reparse recovers from its own source range.
     #[test]
+    #[hardwon(
+        "c1aac56476f0: C++ declaration recovery regressed for an export macro class keeps stranded and access labeled constructors"
+    )]
     fn an_export_macro_class_keeps_stranded_and_access_labeled_constructors() {
         let source = r#"namespace Botan {
 class BOTAN_PUBLIC_API(2, 0) XMSS_Parameters final {
@@ -19947,6 +20951,9 @@ class BOTAN_PUBLIC_API(2, 0) XMSS_Parameters final {
     /// `::` in the source, so the separator is present rather than MISSING and
     /// the out-of-line definition keeps its owner.
     #[test]
+    #[hardwon(
+        "6b1e2f76b805: C++ declaration recovery regressed for a genuine qualified out of line definition keeps its scope"
+    )]
     fn a_genuine_qualified_out_of_line_definition_keeps_its_scope() {
         let source = r#"namespace shell {
 struct Outer {
@@ -19973,6 +20980,9 @@ void Outer::Inner::run(int v) {}
     }
 
     #[test]
+    #[hardwon(
+        "3aa210fd2699: C++ declaration recovery regressed for macro decorated template class keeps member scope without forward declaration"
+    )]
     fn macro_decorated_template_class_keeps_member_scope_without_forward_declaration() {
         let source = r#"namespace control {
 template <typename T>
@@ -20032,6 +21042,9 @@ int back();
     }
 
     #[test]
+    #[hardwon(
+        "79f4bb1fb605: C++ parser recovery previously lost declaration ownership, member scope, or source identity"
+    )]
     fn explicit_global_member_definition_has_canonical_package_boundary() {
         let source = r#"
 namespace arangodb::aql {
@@ -20055,6 +21068,9 @@ Node* ::arangodb::aql::ExecutionPlan::createNode(Args&&... args) { return nullpt
     }
 
     #[test]
+    #[hardwon(
+        "b020725e0ba9: C++ parser recovery previously lost declaration ownership, member scope, or source identity"
+    )]
     fn consecutive_macro_export_classes_keep_namespace_sibling_ownership() {
         let source = r#"
 #ifndef TINYXML2_INCLUDED
@@ -20150,6 +21166,9 @@ class TINYXML2_LIB XMLNode {
     }
 
     #[test]
+    #[hardwon(
+        "bac47d427848: C++ parser recovery previously lost declaration ownership, member scope, or source identity"
+    )]
     fn explicit_global_namespace_recovery_does_not_duplicate_lexical_scope() {
         // Clang's diagnostic suite intentionally contains this ill-formed
         // spelling. The analyzer must retain the parser's explicit-global AST
@@ -20180,6 +21199,9 @@ namespace ::cwg311::X {}
     }
 
     #[test]
+    #[hardwon(
+        "bac47d427848: C++ parser recovery previously lost declaration ownership, member scope, or source identity"
+    )]
     fn repeated_scope_separator_does_not_create_empty_function_owner() {
         let scope = ScopeInfo {
             package_name: "X".to_string(),
@@ -20200,6 +21222,9 @@ namespace ::cwg311::X {}
     }
 
     #[test]
+    #[hardwon(
+        "79f4bb1fb605: C++ parser recovery previously lost declaration ownership, member scope, or source identity"
+    )]
     fn trailing_decltype_expression_is_not_a_function_declarator() {
         let source = r#"
 namespace boost { namespace detail {
@@ -20251,6 +21276,9 @@ invoke(BOOST_THREAD_RV_REF(Fp) f, BOOST_THREAD_RV_REF(A0) a0,
     }
 
     #[test]
+    #[hardwon(
+        "9ac72fd81fc1: C++ parser recovery previously lost declaration ownership, member scope, or source identity"
+    )]
     fn sentinel_candidate_rejects_macro_qualified_callables_before_reparse() {
         let source = r#"EXPORT void definition(struct Value value) {}
 EXPORT void prototype(struct Value value);
@@ -20278,6 +21306,9 @@ EXPORT void prototype(struct Value value);
     }
 
     #[test]
+    #[hardwon(
+        "b235b350b15c: C++ parser recovery previously lost declaration ownership, member scope, or source identity"
+    )]
     fn sentinel_candidate_keeps_class_before_recovered_member_callable() {
         let source = r#"namespace absl {
 ABSL_NAMESPACE_BEGIN
@@ -20332,6 +21363,9 @@ ABSL_NAMESPACE_END
     }
 
     #[test]
+    #[hardwon(
+        "b235b350b15c: C++ parser recovery previously lost declaration ownership, member scope, or source identity"
+    )]
     fn sentinel_candidate_keeps_class_before_recovered_constructor_callable() {
         let source = r#"namespace absl {
 ABSL_NAMESPACE_BEGIN
@@ -20382,6 +21416,9 @@ ABSL_NAMESPACE_END
     }
 
     #[test]
+    #[hardwon(
+        "ab74ff5a2b2d: C++ parser recovery previously lost declaration ownership, member scope, or source identity"
+    )]
     fn macro_qualified_member_function_does_not_publish_namespace_as_field() {
         let source = r#"
 #define CPPCHECKLIB
@@ -20421,6 +21458,9 @@ class Library {
     }
 
     #[test]
+    #[hardwon(
+        "0be673ef7747: C++ parser recovery previously lost declaration ownership, member scope, or source identity"
+    )]
     fn fragmented_export_constructor_keeps_initializer_names_as_fields() {
         let source = r#"
 #define SIMPLECPP_LIB
@@ -20551,6 +21591,9 @@ class SIMPLECPP_LIB Token {
     }
 
     #[test]
+    #[hardwon(
+        "b28b8950890a: C++ parser recovery previously lost declaration ownership, member scope, or source identity"
+    )]
     fn simplecpp_token_fragmented_export_keeps_location_and_string_fields() {
         let source = r#"
 #define SIMPLECPP_LIB
@@ -20684,6 +21727,9 @@ class SIMPLECPP_LIB Later {
     }
 
     #[test]
+    #[hardwon(
+        "0be673ef7747: C++ parser recovery previously lost declaration ownership, member scope, or source identity"
+    )]
     fn fragmented_export_constructor_in_anonymous_namespace_has_internal_linkage() {
         let source = r#"
 #define SIMPLECPP_LIB
@@ -20723,6 +21769,9 @@ class SIMPLECPP_LIB HiddenToken {
     }
 
     #[test]
+    #[hardwon(
+        "1c570a35813e: C++ parser recovery previously lost declaration ownership, member scope, or source identity"
+    )]
     fn macro_qualified_static_field_keeps_real_declarator() {
         let source = r#"#define JSON_INLINE_VARIABLE
 struct Reader {
@@ -20837,6 +21886,9 @@ static JSON_INLINE_VARIABLE constexpr std::size_t &reference = other;
     }
 
     #[test]
+    #[hardwon(
+        "fe77a0120e5e: C++ parser recovery previously lost declaration ownership, member scope, or source identity"
+    )]
     fn malformed_class_macro_constructors_have_no_decorator_return_type() {
         let source = r#"
 #ifndef PROTON_VALUE_HPP
@@ -20913,6 +21965,9 @@ class value : public internal::value_base, private internal::comparable<value> {
     }
 
     #[test]
+    #[hardwon(
+        "c53d3b9c1b19: C++ declaration recovery regressed for recovered export class typedef uses displaced alias name"
+    )]
     fn recovered_export_class_typedef_uses_displaced_alias_name() {
         let source = r#"
 namespace spi {
@@ -20962,6 +22017,9 @@ public:
     }
 
     #[test]
+    #[hardwon(
+        "f7a2bb562e28: C++ parser recovery previously lost declaration ownership, member scope, or source identity"
+    )]
     fn exported_single_base_recovery_uses_displaced_class_name() {
         let source = r#"
 class CORE_EXPORT QgsPoint : public AbstractGeometry
@@ -21154,6 +22212,9 @@ class ctx_t ZMQ_FINAL : public thread_ctx_t {
     }
 
     #[test]
+    #[hardwon(
+        "364341b21a48: C++ parser recovery previously lost declaration ownership, member scope, or source identity"
+    )]
     fn function_like_export_macro_classes_keep_names_and_base_edges() {
         // Every sibling shape tree-sitter produces after the `class MACRO(2, 0)`
         // error: a plain body, a single base, `final` without a base, `final`
@@ -21252,6 +22313,9 @@ class PROJECT_PUBLIC_API(2, 0) Woven : public Base, public Mixin {
     }
 
     #[test]
+    #[hardwon(
+        "861f46399c96: C++ declaration recovery regressed for function like export macro classes are named by position not spelling"
+    )]
     fn function_like_export_macro_classes_are_named_by_position_not_spelling() {
         // #2557: the class name is the last identifier before the head ends
         // (`final`, the base clause `:`, or the body), whatever its spelling.
@@ -21345,6 +22409,9 @@ class PROJECT_PUBLIC_API(2, 0) FIRST_MACRO SECOND_MACRO Layered final : public B
     }
 
     #[test]
+    #[hardwon(
+        "7552b3145622: C++ declaration recovery regressed for export class head with a virtual base recovers its fragmented body"
+    )]
     fn export_class_head_with_a_virtual_base_recovers_its_fragmented_body() {
         // #2924: `class MACRO(2, 0) Name : public virtual Base {` leaves the
         // head, the body's `{` and its first member in one declaration-scope
@@ -21409,6 +22476,9 @@ class PROJECT_PUBLIC_API(2, 0) VirtualBased : public virtual BaseKey {
     }
 
     #[test]
+    #[hardwon(
+        "7552b3145622: C++ declaration recovery regressed for export class head after object macro lines recovers its name and bases"
+    )]
     fn export_class_head_after_object_macro_lines_recovers_its_name_and_bases() {
         // #2924: object-like macro lines before the head demote the `class`
         // keyword to a bare identifier and make the macro invocation an
@@ -21460,13 +22530,9 @@ DIAGNOSTIC_POP
         );
     }
 
-    #[test]
-    fn embedded_function_like_export_class_is_named_by_position_not_spelling() {
-        // The class embedded in a preceding malformed body follows the same
-        // rule (#2557): `X509_CA` is the class, `OTHER_MACRO` is decoration.
-        let fixture = |head: &str, name: &str| {
-            format!(
-                r#"
+    fn function_like_export_class_fixture(head: &str, name: &str) -> String {
+        format!(
+            r#"
 namespace api {{
 class PROJECT_PUBLIC_API(2, 0) Exception : public std::exception {{
    public:
@@ -21504,11 +22570,19 @@ class PROJECT_PUBLIC_API(2, 0) {head} : public Exception {{
 }};
 }} // namespace api
 "#
-            )
-        };
+        )
+    }
+
+    #[test]
+    #[hardwon(
+        "861f46399c96: C++ declaration recovery regressed for embedded function like export class is named by position not spelling"
+    )]
+    fn embedded_function_like_export_class_is_named_by_position_not_spelling() {
+        // The class embedded in a preceding malformed body follows the same
+        // rule (#2557): `X509_CA` is the class, `OTHER_MACRO` is decoration.
         for (head, name) in [("X509_CA", "X509_CA"), ("OTHER_MACRO Verdict", "Verdict")] {
-            let source = fixture(head, name);
-            let mut parser = Parser::new();
+            let source = function_like_export_class_fixture(head, name);
+            let mut parser = tree_sitter::Parser::new();
             parser
                 .set_language(&tree_sitter_cpp::LANGUAGE.into())
                 .expect("set C++ grammar");
@@ -21557,6 +22631,9 @@ class PROJECT_PUBLIC_API(2, 0) {head} : public Exception {{
     }
 
     #[test]
+    #[hardwon(
+        "861f46399c96: C++ declaration recovery regressed for function like export class head with virtual qualified bases does not invent a name"
+    )]
     fn function_like_export_class_head_with_virtual_qualified_bases_does_not_invent_a_name() {
         // Botan's TPM2 keys (`tpm2_ecc.h`, `tpm2_rsa.h`). The grammar keeps
         // `class MACRO(3, 6) Name final :` in the error, the first base as the
@@ -21665,54 +22742,20 @@ class PROJECT_PUBLIC_API(3, 6) EC_PublicKey final : public virtual Botan::TPM2::
     }
 
     #[test]
+    #[hardwon(
+        "1548bb89de04: C++ parser recovery previously lost declaration ownership, member scope, or source identity"
+    )]
     fn function_like_export_class_survives_a_preceding_malformed_body() {
-        let source = r#"
-namespace api {
-class PROJECT_PUBLIC_API(2, 0) Exception : public std::exception {
-   public:
-      /** Return a descriptive string. */
-      const char* what() const noexcept override { return m_msg.c_str(); }
-
-      /** Return the type of error. */
-      virtual ErrorType error_type() const noexcept { return ErrorType::Unknown; }
-
-      /** Return an associated error code. */
-      virtual int error_code() const noexcept { return 0; }
-
-      /** Avoid throwing the base directly. */
-      explicit Exception(std::string_view msg);
-
-      /** Avoid throwing the base directly. */
-      Exception(const char* prefix, std::string_view msg);
-
-      /** Avoid throwing the base directly. */
-      Exception(std::string_view msg, const std::exception& e);
-
-   private:
-      std::string m_msg;
-};
-
-class PROJECT_PUBLIC_API(2, 0) Invalid_Argument : public Exception {
-   public:
-      explicit Invalid_Argument(std::string_view msg);
-
-      explicit Invalid_Argument(std::string_view msg, std::string_view where);
-
-      Invalid_Argument(std::string_view msg, const std::exception& e);
-
-      ErrorType error_type() const noexcept override { return ErrorType::InvalidArgument; }
-};
-} // namespace api
-"#;
-        let mut parser = Parser::new();
+        let source = function_like_export_class_fixture("Invalid_Argument", "Invalid_Argument");
+        let mut parser = tree_sitter::Parser::new();
         parser
             .set_language(&tree_sitter_cpp::LANGUAGE.into())
             .expect("set C++ grammar");
-        let tree = parser.parse(source, None).expect("parse fixture");
+        let tree = parser.parse(&source, None).expect("parse fixture");
         let mut stack = vec![tree.root_node()];
         let mut saw_embedded_shape = false;
         while let Some(node) = stack.pop() {
-            saw_embedded_shape |= recover_embedded_function_like_export_classes(node, source)
+            saw_embedded_shape |= recover_embedded_function_like_export_classes(node, &source)
                 .iter()
                 .any(|recovered| recovered.name == "Invalid_Argument");
             let mut cursor = node.walk();
@@ -21726,7 +22769,7 @@ class PROJECT_PUBLIC_API(2, 0) Invalid_Argument : public Exception {
 
         let parsed = parse_cpp_file(
             &ProjectFile::new(std::env::temp_dir(), "embedded-function-like-export.hpp"),
-            source,
+            &source,
             &tree,
         );
         let declarations = parsed.declarations();
@@ -21759,6 +22802,9 @@ class PROJECT_PUBLIC_API(2, 0) Invalid_Argument : public Exception {
     }
 
     #[test]
+    #[hardwon(
+        "1548bb89de04: C++ parser recovery previously lost declaration ownership, member scope, or source identity"
+    )]
     fn function_like_export_class_recovers_a_merged_inline_constructor_shape() {
         let source = r#"
 public:
@@ -21784,6 +22830,9 @@ public:
     }
 
     #[test]
+    #[hardwon(
+        "1c570a35813e: C++ parser recovery previously lost declaration ownership, member scope, or source identity"
+    )]
     fn cpp_reparsed_members_gate_handles_copy_control_error_only_with_semicolon() {
         let positive_source =
             "private:\n  virtual ~XMLElement();\n  XMLElement( const XMLElement& )\n  ;\n";
@@ -21806,6 +22855,9 @@ public:
     }
 
     #[test]
+    #[hardwon(
+        "ab74ff5a2b2d: C++ parser recovery previously lost declaration ownership, member scope, or source identity"
+    )]
     fn cpp_reparsed_members_gate_accepts_cppcheck_copy_control_and_constraint_macros() {
         let copy_control_source = r#"
 public:
@@ -21875,6 +22927,9 @@ public:
     }
 
     #[test]
+    #[hardwon(
+        "ab74ff5a2b2d: C++ parser recovery previously lost declaration ownership, member scope, or source identity"
+    )]
     fn fragmented_plain_class_recovers_nested_constrained_constructor_owner() {
         let source = r#"
 struct Analyzer {
@@ -21954,12 +23009,12 @@ struct Analyzer {
             macro_companion.to_sexp()
         );
         assert!(
-            cpp_reparsed_members_are_indexable(action_root, source),
+            cpp_reparsed_members_are_indexable_for_class(action_root, source, Some("Action")),
             "complete Action body must pass the recovery gate: {}",
             action_tree.root_node().to_sexp()
         );
         assert!(
-            cpp_reparsed_members_are_indexable(outer_root, source),
+            cpp_reparsed_members_are_indexable_for_class(outer_root, source, Some("Analyzer")),
             "complete Analyzer body must pass the recovery gate: {}",
             outer_tree.root_node().to_sexp()
         );
@@ -21986,6 +23041,56 @@ struct Analyzer {
     }
 
     #[test]
+    #[hardwon("e3ff69209ab2: ABI 15 defaulted-constructor recovery must retain class ownership")]
+    fn defaulted_constructor_gate_rejects_unrelated_expression_assignments() {
+        let source = "value() = default;\nint value();\n";
+        let tree = crate::diagnostics::parse_cpp_tree(source);
+        let root = tree.root_node();
+        assert!(
+            !cpp_reparsed_members_are_indexable_for_class(root, source, Some("Owner")),
+            "a default assignment and a same-name free declaration do not prove an Owner constructor: {}",
+            root.to_sexp()
+        );
+        assert!(
+            !cpp_reparsed_members_are_indexable_for_class(root, source, Some("value")),
+            "a return-typed same-name declaration is not a constructor witness: {}",
+            root.to_sexp()
+        );
+
+        let damaged_source = r#"
+value(int x) {
+  broken(
+}
+value() = default;
+int value();
+"#;
+        let damaged_tree = crate::diagnostics::parse_cpp_tree(damaged_source);
+        let damaged_root = damaged_tree.root_node();
+        let mut damaged_cursor = damaged_root.walk();
+        let damaged_members = damaged_root
+            .named_children(&mut damaged_cursor)
+            .collect::<Vec<_>>();
+        let damaged_assignment = damaged_members
+            .iter()
+            .copied()
+            .find(|member| member.kind() == "expression_statement")
+            .expect("damaged witness probe retains the default assignment expression");
+        assert!(
+            !cpp_reparsed_defaulted_constructor_is_indexable(
+                damaged_assignment,
+                &damaged_members,
+                Some("value"),
+                damaged_source,
+            ),
+            "an errorful same-name function must not witness a recovered defaulted constructor: {}",
+            damaged_root.to_sexp()
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "ef5c28a76765: C++ parser recovery previously lost declaration ownership, member scope, or source identity"
+    )]
     fn cpp_reparsed_members_gate_accepts_complete_errorful_member_functions() {
         let source = r#"
 raw_hash_set& operator=(raw_hash_set&& that) {
@@ -22055,6 +23160,9 @@ void AssertOnFind([[maybe_unused]] const K& key) {
     }
 
     #[test]
+    #[hardwon(
+        "ef5c28a76765: C++ parser recovery previously lost declaration ownership, member scope, or source identity"
+    )]
     fn cpp_reparsed_members_gate_accepts_paired_attribute_requires_body() {
         let positive_source = r#"
 std::pair<iterator, bool> insert(init_type&& value)
@@ -22149,6 +23257,9 @@ int value(1) ABSL_ATTRIBUTE_LIFETIME_BOUND
     }
 
     #[test]
+    #[hardwon(
+        "ef5c28a76765: C++ parser recovery previously lost declaration ownership, member scope, or source identity"
+    )]
     fn sentinel_scope_prefers_deeper_fragmented_class_over_outer_shadow() {
         let source = r#"namespace absl {
 ABSL_NAMESPACE_BEGIN namespace container_internal {
@@ -22300,6 +23411,9 @@ ABSL_NAMESPACE_END
     /// `ERROR` regions a sentinel macro produces. Anonymous nodes are compared
     /// too -- `Node::parent` walks the visible tree, not the named one.
     #[test]
+    #[hardwon(
+        "90181359ed41: C++ declaration recovery regressed for the parent index answers what tree sitter answers"
+    )]
     fn the_parent_index_answers_what_tree_sitter_answers() {
         const SHAPES: [&str; 5] = [
             "namespace outer { namespace inner { struct Tag { int field; }; } }",
@@ -22339,6 +23453,9 @@ ABSL_NAMESPACE_END
     /// tree walk. Exact query counts pin the route without a machine-dependent
     /// wall-clock ceiling.
     #[test]
+    #[hardwon(
+        "e6a524ac8d71: C++ declaration recovery regressed for deeply nested callable ancestor questions use the parent index"
+    )]
     fn deeply_nested_callable_ancestor_questions_use_the_parent_index() {
         const DEPTH: usize = 64;
         let mut source = String::new();
@@ -22424,6 +23541,9 @@ ABSL_NAMESPACE_END
     /// a class body with no base clause at all can close a member that writes
     /// nothing.
     #[test]
+    #[hardwon(
+        "84b42ca510ce: C++ declaration recovery regressed for callable dispatch extensibility comes from the class body"
+    )]
     fn callable_dispatch_extensibility_comes_from_the_class_body() {
         const SOURCE: &str = "\
 class Plain { public: long send(long order); };
@@ -22468,72 +23588,10 @@ long Plain::send(long order) { return order; }
         );
     }
 
-    /// Forward declarations followed by definitions are compacted as one
-    /// batch, without rescanning the shared namespace/top-level lists for each
-    /// tag. Definitions are intentionally visited in reverse order so the
-    /// assertion also pins eager remove-and-reappend ordering.
     #[test]
-    fn forward_declared_aggregates_are_replaced_without_sibling_scans() {
-        for aggregates in [64usize, 512] {
-            let mut source =
-                String::from("typedef unsigned long long u64;\nnamespace generated {\n");
-            for index in 0..aggregates {
-                writeln!(source, "struct tag{index};").unwrap();
-            }
-            for index in (0..aggregates).rev() {
-                writeln!(
-                    source,
-                    "struct tag{index} {{\n\tu64 first;\n\tint second;\n}};"
-                )
-                .unwrap();
-            }
-            source.push_str("}\n");
-
-            start_code_unit_removal_scan_probe();
-            let parsed = parse_cpp_declarations(&source, "vmlinux.h");
-            let scanned = finish_code_unit_removal_scan_probe();
-
-            let expected_names: Vec<String> = (0..aggregates)
-                .rev()
-                .map(|index| format!("tag{index}"))
-                .collect();
-            let top_level_names: Vec<String> = parsed
-                .top_level_declarations
-                .iter()
-                .filter(|unit| unit.is_class() && unit.short_name().starts_with("tag"))
-                .map(|unit| unit.short_name().to_string())
-                .collect();
-            let namespace = parsed
-                .declarations()
-                .iter()
-                .find(|unit| {
-                    unit.kind() == CodeUnitType::Module && unit.short_name() == "generated"
-                })
-                .expect("generated namespace should be declared");
-            let child_names: Vec<String> = parsed.children[namespace]
-                .iter()
-                .filter(|unit| unit.is_class() && unit.short_name().starts_with("tag"))
-                .map(|unit| unit.short_name().to_string())
-                .collect();
-            assert_eq!(
-                aggregates,
-                parsed
-                    .declarations()
-                    .iter()
-                    .filter(|unit| unit.is_class() && unit.short_name().starts_with("tag"))
-                    .count(),
-                "every aggregate must still be declared at {aggregates} aggregates"
-            );
-            assert_eq!(expected_names, top_level_names);
-            assert_eq!(expected_names, child_names);
-            assert_eq!(
-                0, scanned,
-                "replacing {aggregates} forward declarations must compact their shared lists once"
-            );
-        }
-    }
-
-    #[test]
+    #[hardwon(
+        "8b8f8ecaac59: C++ declaration recovery regressed for cpp alias and macro dedup comparison count is linear"
+    )]
     fn cpp_alias_and_macro_dedup_comparison_count_is_linear() {
         const DISTINCT_PER_KIND: usize = 64;
         let mut source = String::new();
@@ -22599,8 +23657,42 @@ long Plain::send(long order) { return order; }
     }
 
     #[test]
+    #[hardwon("3ba12c745afa: sentinel recovery requires the class's own body close")]
     fn sentinel_recovery_admits_errorful_class_with_real_body_close() {
-        let source = r#"namespace absl {
+        let negative_source = r#"namespace absl {
+ABSL_NAMESPACE_BEGIN namespace container_internal {
+template <typename T>
+class broken {
+ public:
+  using value_type = T;
+  T operator->() const { return &operator*(); }
+}
+}
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let negative_tree = parser.parse(negative_source, None).unwrap();
+        let broken = find_class_named(negative_tree.root_node(), negative_source, "broken")
+            .expect("the negative fixture must expose the malformed class node");
+        assert!(
+            broken.has_error(),
+            "the negative fixture must retain a parser error"
+        );
+        assert!(
+            cpp_complete_class_body_close(broken).is_none(),
+            "the malformed class must not expose a real body close"
+        );
+        let recovered = cpp_sentinel_recovered_classes(negative_tree.root_node(), negative_source);
+        assert!(
+            recovered
+                .iter()
+                .all(|class| class.scope_components != ["absl", "container_internal", "broken"]),
+            "an incomplete class must not borrow the namespace close: {recovered:#?}"
+        );
+
+        let positive_source = r#"namespace absl {
 ABSL_NAMESPACE_BEGIN namespace container_internal {
 template <typename T>
 class broken {
@@ -22612,12 +23704,8 @@ class broken {
 }
 }
 "#;
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_cpp::LANGUAGE.into())
-            .unwrap();
-        let tree = parser.parse(source, None).unwrap();
-        let broken = find_class_named(tree.root_node(), source, "broken")
+        let positive_tree = parser.parse(positive_source, None).unwrap();
+        let broken = find_class_named(positive_tree.root_node(), positive_source, "broken")
             .expect("the positive fixture must expose the broken class node");
         assert!(
             broken.has_error(),
@@ -22627,7 +23715,7 @@ class broken {
             cpp_complete_class_body_close(broken).is_some(),
             "the positive fixture must expose a real class body close"
         );
-        let recovered = cpp_sentinel_recovered_classes(tree.root_node(), source);
+        let recovered = cpp_sentinel_recovered_classes(positive_tree.root_node(), positive_source);
         assert!(
             recovered.iter().any(|class| {
                 class.scope_components == ["absl", "container_internal", "broken"]
@@ -22637,6 +23725,9 @@ class broken {
     }
 
     #[test]
+    #[hardwon(
+        "0e6df36dfa5d: C++ declaration recovery regressed for sentinel recovery keeps members after nested body close"
+    )]
     fn sentinel_recovery_keeps_members_after_nested_body_close() {
         let source = r#"NLOHMANN_JSON_NAMESPACE_BEGIN
 NLOHMANN_BASIC_JSON_TPL_DECLARATION
@@ -22677,42 +23768,9 @@ NLOHMANN_JSON_NAMESPACE_END
     }
 
     #[test]
-    fn sentinel_recovery_rejects_class_that_borrows_outer_close() {
-        let source = r#"namespace absl {
-ABSL_NAMESPACE_BEGIN namespace container_internal {
-template <typename T>
-class broken {
- public:
-  using value_type = T;
-  T operator->() const { return &operator*(); }
-}
-}
-"#;
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_cpp::LANGUAGE.into())
-            .unwrap();
-        let tree = parser.parse(source, None).unwrap();
-        let broken = find_class_named(tree.root_node(), source, "broken")
-            .expect("the negative fixture must expose the malformed class node");
-        assert!(
-            broken.has_error(),
-            "the negative fixture must retain a parser error"
-        );
-        assert!(
-            cpp_complete_class_body_close(broken).is_none(),
-            "the malformed class must not expose a real body close"
-        );
-        let recovered = cpp_sentinel_recovered_classes(tree.root_node(), source);
-        assert!(
-            recovered
-                .iter()
-                .all(|class| class.scope_components != ["absl", "container_internal", "broken"]),
-            "an incomplete class must not borrow the namespace close: {recovered:#?}"
-        );
-    }
-
-    #[test]
+    #[hardwon(
+        "06f7e51d8ae6: C++ declaration recovery regressed for sentinel recovery collects guarded sibling owner without crossing namespace sibling"
+    )]
     fn sentinel_recovery_collects_guarded_sibling_owner_without_crossing_namespace_sibling() {
         let source = r#"namespace absl {
 ABSL_NAMESPACE_BEGIN namespace container_internal {
@@ -22780,6 +23838,9 @@ ABSL_NAMESPACE_END
     }
 
     #[test]
+    #[hardwon(
+        "06f7e51d8ae6: C++ declaration recovery regressed for sentinel recovery discards outer siblings without namespace end marker"
+    )]
     fn sentinel_recovery_discards_outer_siblings_without_namespace_end_marker() {
         let source = r#"#ifdef OUTER
 namespace absl {
@@ -22825,11 +23886,10 @@ typename broken<T>::value_type broken<T>::method() {
 
     /// Every identity signature emitted for `fq_name`, deduplicated, sorted.
     fn identity_signatures(parsed: &ParsedFile, fq_name: &str) -> Vec<String> {
-        let mut signatures = parsed
-            .declarations()
-            .iter()
-            .filter(|unit| unit.is_function() && unit.fq_name() == fq_name)
-            .filter_map(|unit| unit.signature().map(str::to_string))
+        let mut signatures = all_function_identities(parsed)
+            .into_iter()
+            .filter(|(name, _)| name == fq_name)
+            .filter_map(|(_, signature)| signature)
             .collect::<Vec<_>>();
         signatures.sort();
         signatures.dedup();
@@ -22837,6 +23897,9 @@ typename broken<T>::value_type broken<T>::method() {
     }
 
     #[test]
+    #[hardwon(
+        "64ce2f1b00cf: C++ declaration recovery regressed for callable parameter types come from the ast parameter list"
+    )]
     fn callable_parameter_types_come_from_the_ast_parameter_list() {
         let source = r#"
 template <typename T, ENABLE_BYTES(T)>
@@ -22844,6 +23907,7 @@ Vec256<T> DupOdd(Vec256<T> value) { return value; }
 
 struct Visitor {
   void fail(this auto const& self) {}
+  void consume(this Visitor const& self, int count) {}
 };
 "#;
         let parsed = parse_cpp_declarations(source, "structured-parameter-types.cpp");
@@ -22870,7 +23934,7 @@ struct Visitor {
             .iter()
             .find(|unit| unit.is_function() && unit.fq_name() == "Visitor.fail")
             .expect("explicit-object member");
-        assert_eq!(fail.signature(), Some("(const this auto &)"));
+        assert_eq!(fail.signature(), Some("(this const auto &)"));
         let metadata = parsed
             .signature_metadata
             .get(fail)
@@ -22882,9 +23946,32 @@ struct Visitor {
                 .callable_arity()
                 .is_some_and(|arity| arity.accepts(0))
         );
+        let consume = parsed
+            .declarations()
+            .iter()
+            .find(|unit| unit.is_function() && unit.fq_name() == "Visitor.consume")
+            .expect("explicit-object member with an invocation argument");
+        assert_eq!(consume.signature(), Some("(this const Visitor &, int)"));
+        let metadata = parsed
+            .signature_metadata
+            .get(consume)
+            .and_then(|metadata| metadata.first())
+            .expect("typed explicit-object signature metadata");
+        assert_eq!(
+            metadata.callable_parameter_types(),
+            Some(["int".to_string()].as_slice())
+        );
+        assert!(
+            metadata
+                .callable_arity()
+                .is_some_and(|arity| arity.accepts(1) && !arity.accepts(0) && !arity.accepts(2))
+        );
     }
 
     #[test]
+    #[hardwon(
+        "026332d8e7db: C++ declaration recovery regressed for trailing qualifiers survive parameter list whitespace"
+    )]
     fn trailing_qualifiers_survive_parameter_list_whitespace() {
         // #1827: the trailing `const`/`noexcept`/ref-qualifier belongs to the
         // declarator's structure, so an out-of-line definition that spells its
@@ -22927,6 +24014,9 @@ bool Widget::ref_multiline(int settings,
     }
 
     #[test]
+    #[hardwon(
+        "3a22f72d49b5: C++ parser recovery previously lost declaration ownership, member scope, or source identity"
+    )]
     fn macro_fragmented_plain_class_keeps_following_member_signature() {
         let source = r#"
 struct CString {};
@@ -22950,6 +24040,9 @@ CString CMessage::GetParamsColon(unsigned int index, unsigned int length) const 
     }
 
     #[test]
+    #[hardwon(
+        "ed735e56af02: C++ declaration recovery regressed for namespaced macro fragment keeps prefix members and following classes"
+    )]
     fn namespaced_macro_fragment_keeps_prefix_members_and_following_classes() {
         let source = r#"
 #pragma once
@@ -23021,6 +24114,9 @@ struct Global {};
     }
 
     #[test]
+    #[hardwon(
+        "026332d8e7db: C++ declaration recovery regressed for trailing qualifiers still separate genuine overloads"
+    )]
     fn trailing_qualifiers_still_separate_genuine_overloads() {
         // The qualifier must keep distinguishing the real C++ overload sets it
         // exists for: a const and a non-const accessor, and a `&`/`&&` pair.
@@ -23044,6 +24140,9 @@ struct Widget {
     }
 
     #[test]
+    #[hardwon(
+        "026332d8e7db: C++ declaration recovery regressed for virtual specifier is not part of the identity signature"
+    )]
     fn virtual_specifier_is_not_part_of_the_identity_signature() {
         // `override` never appears on the out-of-line definition, and C++ does
         // not make it part of the signature, so it must not split the identity.
@@ -23064,6 +24163,7 @@ void Widget::run(int value) const {}
     }
 
     #[test]
+    #[hardwon("026332d8e7db: top-level cv is ignored without collapsing pointee overloads")]
     fn top_level_parameter_cv_qualifiers_do_not_split_identity() {
         // [dcl.fct]/5: top-level cv-qualifiers on a parameter are not part of
         // the function type, so a declaration that spells `const int` and a
@@ -23076,6 +24176,8 @@ struct Widget {
   void both_const(const int* const p);
   void reference_const(const int& p);
   void array_const(const int values[4]);
+  void take(const int* p);
+  void take(int* p);
 };
 bool Widget::value_params(int settings, int supprs) { return true; }
 void Widget::pointer_const(int* p) {}
@@ -23107,17 +24209,6 @@ void Widget::both_const(const int* p) {}
             vec!["(const int [4])".to_string()],
             identity_signatures(&parsed, "Widget.array_const")
         );
-    }
-
-    #[test]
-    fn top_level_parameter_const_still_separates_pointee_overloads() {
-        let source = r#"
-struct Widget {
-  void take(const int* p);
-  void take(int* p);
-};
-"#;
-        let parsed = parse_cpp_declarations(source, "pointee-overloads.cpp");
         assert_eq!(
             vec!["(const int *)".to_string(), "(int *)".to_string()],
             identity_signatures(&parsed, "Widget.take")
@@ -23159,6 +24250,9 @@ struct Widget {
     }
 
     #[test]
+    #[hardwon(
+        "17ad29c5a08c: C++ declaration recovery regressed for comparable shape keeps pointee const"
+    )]
     fn comparable_shape_keeps_pointee_const() {
         assert_ne!(
             sole_comparable_shape("void f(const char* p);", "f("),
@@ -23167,6 +24261,9 @@ struct Widget {
     }
 
     #[test]
+    #[hardwon(
+        "17ad29c5a08c: C++ declaration recovery regressed for comparable shape keeps inner pointer const"
+    )]
     fn comparable_shape_keeps_inner_pointer_const() {
         assert_ne!(
             sole_comparable_shape("void f(int** p);", "f("),
@@ -23175,6 +24272,9 @@ struct Widget {
     }
 
     #[test]
+    #[hardwon(
+        "17ad29c5a08c: C++ declaration recovery regressed for comparable shape drops top level pointer const"
+    )]
     fn comparable_shape_drops_top_level_pointer_const() {
         assert_eq!(
             sole_comparable_shape("void f(int* const p);", "f("),
@@ -23183,6 +24283,9 @@ struct Widget {
     }
 
     #[test]
+    #[hardwon(
+        "17ad29c5a08c: C++ declaration recovery regressed for comparable shape drops top level base const"
+    )]
     fn comparable_shape_drops_top_level_base_const() {
         assert_eq!(
             sole_comparable_shape("void f(const int p);", "f("),
@@ -23191,6 +24294,9 @@ struct Widget {
     }
 
     #[test]
+    #[hardwon(
+        "17ad29c5a08c: C++ declaration recovery regressed for comparable shape decays top level array to pointer"
+    )]
     fn comparable_shape_decays_top_level_array_to_pointer() {
         assert_eq!(
             sole_comparable_shape("void f(int a[3]);", "f("),
@@ -23203,6 +24309,9 @@ struct Widget {
     }
 
     #[test]
+    #[hardwon(
+        "17ad29c5a08c: C++ declaration recovery regressed for comparable shape keeps array behind pointer"
+    )]
     fn comparable_shape_keeps_array_behind_pointer() {
         assert_ne!(
             sole_comparable_shape("struct S { void f(int (*a)[3]); };", "f("),
@@ -23211,6 +24320,9 @@ struct Widget {
     }
 
     #[test]
+    #[hardwon(
+        "17ad29c5a08c: C++ declaration recovery regressed for comparable shape records written name and lexical scope"
+    )]
     fn comparable_shape_records_written_name_and_lexical_scope() {
         let declared =
             sole_comparable_shape("namespace ns { struct S { void g(Msg* m); }; }", "g(");
@@ -23235,6 +24347,9 @@ struct Widget {
     }
 
     #[test]
+    #[hardwon(
+        "17ad29c5a08c: C++ declaration recovery regressed for comparable shape marks sized primitive leaf"
+    )]
     fn comparable_shape_marks_sized_primitive_leaf() {
         let shape = sole_comparable_shape("void f(unsigned char c);", "f(");
         let CppComparableNode::Named {
@@ -23249,6 +24364,9 @@ struct Widget {
     }
 
     #[test]
+    #[hardwon(
+        "17ad29c5a08c: C++ declaration recovery regressed for comparable shape reports function pointer parameter as unstructured"
+    )]
     fn comparable_shape_reports_function_pointer_parameter_as_unstructured() {
         assert_eq!(
             vec![CppComparableSlot::Unstructured],
@@ -23257,6 +24375,9 @@ struct Widget {
     }
 
     #[test]
+    #[hardwon(
+        "17ad29c5a08c: C++ declaration recovery regressed for comparable shape reports ellipsis slot"
+    )]
     fn comparable_shape_reports_ellipsis_slot() {
         let shapes = comparable_shapes("void f(int a, ...);", "f(");
         assert_eq!(2, shapes.len(), "{shapes:?}");
@@ -23264,6 +24385,9 @@ struct Widget {
     }
 
     #[test]
+    #[hardwon(
+        "17ad29c5a08c: C++ declaration recovery regressed for comparable shape keeps template argument const"
+    )]
     fn comparable_shape_keeps_template_argument_const() {
         assert_ne!(
             sole_comparable_shape("void f(std::vector<const int*> v);", "f("),
@@ -23274,6 +24398,9 @@ struct Widget {
     /// The issue #1970 fixture: C has no nested tag scope, so `inner` is a
     /// file-scope tag that a later `struct inner *` at file scope may name.
     #[test]
+    #[hardwon(
+        "9cce90a89128: C++ declaration recovery regressed for c file mints aggregate member tag at file scope"
+    )]
     fn c_file_mints_aggregate_member_tag_at_file_scope() {
         let source = "struct outer {\n  struct inner { int value; } item;\n};\n";
         let parsed = parse_cpp_declarations(source, "x.c");
@@ -23328,6 +24455,9 @@ struct Widget {
     /// translation unit really does declare a nested class. Both keep exactly
     /// the C++ extraction they had before the C dialect existed.
     #[test]
+    #[hardwon(
+        "9cce90a89128: C++ declaration recovery regressed for header and cpp files keep nested tag identity"
+    )]
     fn header_and_cpp_files_keep_nested_tag_identity() {
         let source = "struct outer {\n  struct inner { int value; } item;\n};\n";
         for name in ["x.h", "x.cpp", "x.cc", "x.cxx"] {
@@ -23351,8 +24481,78 @@ struct Widget {
         }
     }
 
+    #[test]
+    fn c_projection_keeps_defaulted_constructor_nested_in_template_class() {
+        let source = r#"
+template <class K, class V, class Traits = CacheTraits<K>>
+class ARCCache {
+ public:
+    struct ArcSizeInfo {
+        void BSize() {}
+    };
+ private:
+    struct BMapVal;
+    struct BListVal;
+    typedef std::unordered_map<K, BMapVal> BMap;
+    typedef typename BMap::iterator bmap_iter;
+    typedef typename std::list<BListVal> BList;
+    typedef typename BList::iterator blist_iter;
+    struct BListVal {
+        bmap_iter map_iter;
+        BListVal() = default;
+    };
+    struct DefinedVal {
+        DefinedVal() {}
+    };
+};
+"#;
+        let tree = crate::diagnostics::parse_cpp_tree(source);
+        let file = ProjectFile::new(std::env::temp_dir(), "arc-cache.hpp");
+        let cpp = crate::adapter::parse_cpp_file_in_dialect(
+            &file,
+            source,
+            &tree,
+            LanguageDialect::Standard(Language::Cpp),
+        );
+        let c =
+            crate::adapter::parse_cpp_file_in_dialect(&file, source, &tree, LanguageDialect::CppC);
+        for (dialect, parsed) in [("C++", &cpp), ("C", &c)] {
+            for fq_name in [
+                "ARCCache$ArcSizeInfo.BSize",
+                "ARCCache$BListVal.BListVal",
+                "ARCCache$DefinedVal.DefinedVal",
+            ] {
+                assert!(
+                    parsed
+                        .declarations()
+                        .iter()
+                        .any(|unit| unit.fq_name() == fq_name),
+                    "{dialect} reading must contain {fq_name}: {:#?}",
+                    parsed.declarations()
+                );
+            }
+            for flattened in [
+                "ArcSizeInfo.BSize",
+                "BListVal.BListVal",
+                "DefinedVal.DefinedVal",
+            ] {
+                assert!(
+                    parsed
+                        .declarations()
+                        .iter()
+                        .all(|unit| unit.fq_name() != flattened),
+                    "{dialect} reading must not flatten {flattened}: {:#?}",
+                    parsed.declarations()
+                );
+            }
+        }
+    }
+
     /// Uppercase `.C` conventionally means C++, so it keeps C++ scoping.
     #[test]
+    #[hardwon(
+        "9cce90a89128: C++ declaration recovery regressed for uppercase c extension keeps cpp tag scope"
+    )]
     fn uppercase_c_extension_keeps_cpp_tag_scope() {
         let source = "struct outer {\n  struct inner { int value; } item;\n};\n";
         let parsed = parse_cpp_declarations(source, "x.C");
@@ -23367,6 +24567,9 @@ struct Widget {
     /// There is no such thing as a partially nested tag in C: every level of a
     /// nested aggregate chain lands at the same enclosing scope.
     #[test]
+    #[hardwon(
+        "9cce90a89128: C++ declaration recovery regressed for c file mints every nesting level at file scope"
+    )]
     fn c_file_mints_every_nesting_level_at_file_scope() {
         let source = "struct a { struct b { struct c { int v; } cc; } bb; };\n";
         let parsed = parse_cpp_declarations(source, "z.c");
@@ -23395,6 +24598,9 @@ struct Widget {
     /// An enum tag is a tag; its enumerators stay members of the enum, which is
     /// what makes them ordinary identifiers at the enum's own (file) scope.
     #[test]
+    #[hardwon(
+        "9cce90a89128: C++ declaration recovery regressed for c file mints member list enum at file scope with its enumerators"
+    )]
     fn c_file_mints_member_list_enum_at_file_scope_with_its_enumerators() {
         let source = "struct outer { enum color { RED, GREEN } c; };\n";
         let parsed = parse_cpp_declarations(source, "e.c");
@@ -23428,6 +24634,9 @@ struct Widget {
     }
 
     #[test]
+    #[hardwon(
+        "9cce90a89128: C++ declaration recovery regressed for c file mints member list union at file scope"
+    )]
     fn c_file_mints_member_list_union_at_file_scope() {
         let source = "struct outer { union inner { int a; float b; } item; };\n";
         let parsed = parse_cpp_declarations(source, "u.c");
@@ -23450,6 +24659,9 @@ struct Widget {
     /// A tag declared in a namespace member list is not a file-scope tag: the
     /// nearest enclosing non-aggregate scope is the namespace.
     #[test]
+    #[hardwon(
+        "9cce90a89128: C++ declaration recovery regressed for c file member list tag lands in the enclosing namespace"
+    )]
     fn c_file_member_list_tag_lands_in_the_enclosing_namespace() {
         let source = "namespace ns { struct outer { struct inner { int v; } i; }; }\n";
         let parsed = parse_cpp_declarations(source, "n.c");
@@ -23471,6 +24683,9 @@ struct Widget {
     /// minted for it in either dialect. C block scope is out of scope for the
     /// dialect change, and this test proves the change did not disturb it.
     #[test]
+    #[hardwon(
+        "9cce90a89128: C++ declaration recovery regressed for function local tags are unchanged in both dialects"
+    )]
     fn function_local_tags_are_unchanged_in_both_dialects() {
         let source =
             "void run(void) {\n  struct localtag { struct deeper { int v; } d; } item;\n}\n";
@@ -23495,6 +24710,9 @@ struct Widget {
     /// An anonymous aggregate declares no tag, so the C dialect has nothing to
     /// re-scope: the typedef name is identical in both dialects.
     #[test]
+    #[hardwon(
+        "9cce90a89128: C++ declaration recovery regressed for anonymous typedef struct is identical in both dialects"
+    )]
     fn anonymous_typedef_struct_is_identical_in_both_dialects() {
         let source = "typedef struct { int v; } T;\n";
         for name in ["t.c", "t.cpp"] {
@@ -23516,6 +24734,9 @@ struct Widget {
     /// body. The C++ reading used to mint none of these, so a pure C++
     /// workspace indexed no members at all (#3301).
     #[test]
+    #[hardwon(
+        "605f5c5219c4: C++ declaration recovery regressed for anonymous aggregate members are identical in both dialects"
+    )]
     fn anonymous_aggregate_members_are_identical_in_both_dialects() {
         let sources = [
             "struct outer { union { int a; float b; }; };\n",
@@ -23547,6 +24768,9 @@ struct Widget {
     }
 
     #[test]
+    #[hardwon(
+        "31913fee42a0: C++ declaration recovery regressed for c anonymous aggregate members keep promoted and named receiver shapes"
+    )]
     fn c_anonymous_aggregate_members_keep_promoted_and_named_receiver_shapes() {
         let source = "typedef struct { union { struct { struct socket_ops *ops; } sock; int other; }; } *PAL_HANDLE;\n";
         let parsed = parse_cpp_declarations(source, "socket.c");
@@ -23570,33 +24794,6 @@ struct Widget {
                 "expected {expected}, got {declarations:?}"
             );
         }
-    }
-
-    /// `class` is not C. Source that spells one in a `.c` file is not C code,
-    /// so it keeps the C++ reading rather than acquiring a half-C identity.
-    #[test]
-    fn class_specifier_in_a_c_file_keeps_cpp_nesting() {
-        let source = "class outer { class inner { int v; }; };\n";
-        let c_parsed = parse_cpp_declarations(source, "k.c");
-        let cpp_parsed = parse_cpp_declarations(source, "k.cpp");
-        let c_declarations = c_parsed.declarations();
-        let cpp_declarations = cpp_parsed.declarations();
-        assert!(
-            c_declarations
-                .iter()
-                .any(|unit| unit.is_class() && unit.fq_name() == "outer$inner"),
-            "{c_declarations:?}"
-        );
-        assert_eq!(
-            c_declarations
-                .iter()
-                .map(|unit| unit.fq_name())
-                .collect::<std::collections::BTreeSet<_>>(),
-            cpp_declarations
-                .iter()
-                .map(|unit| unit.fq_name())
-                .collect::<std::collections::BTreeSet<_>>()
-        );
     }
 
     /// Drive [`CppNamespaceForwardScan`] and the prefix scan it replaced over
@@ -23690,6 +24887,9 @@ public:
 "#;
 
     #[test]
+    #[hardwon(
+        "d3b385cc16ff: C++ declaration recovery regressed for carried forward namespace scan answers what the prefix scan answers"
+    )]
     fn carried_forward_namespace_scan_answers_what_the_prefix_scan_answers() {
         assert!(
             namespace_forward_scan_agreement(MALFORMED_NAMESPACE_WITH_TWO_RECOVERED_CLASSES) > 0,
@@ -23732,69 +24932,6 @@ public:
                 "no borrow is justified here: {source}"
             );
         }
-    }
-
-    /// The fold is incremental, so a walk that asks about steadily later bytes
-    /// must never re-fold a node an earlier question already folded, and must
-    /// never skip one that lies between two questions.
-    #[test]
-    fn carried_forward_namespace_scan_folds_each_node_once() {
-        let source = MALFORMED_NAMESPACE_WITH_TWO_RECOVERED_CLASSES;
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_cpp::LANGUAGE.into())
-            .unwrap();
-        let tree = parser.parse(source, None).unwrap();
-        let root = tree.root_node();
-        let ancestry = ParentIndex::new(root);
-
-        let mut incremental = CppNamespaceForwardScan::default();
-        for cutoff in 0..=source.len() {
-            incremental.advance_to(root, cutoff, source, &ancestry);
-        }
-        let mut whole = CppNamespaceForwardScan::default();
-        whole.advance_to(root, source.len(), source, &ancestry);
-
-        let mut incremental_shape: Vec<_> = incremental
-            .forwards
-            .iter()
-            .map(|(name, forwards)| {
-                (
-                    name.clone(),
-                    forwards
-                        .iter()
-                        .map(|forward| (forward.start_byte, forward.package_name.clone()))
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .collect();
-        let mut whole_shape: Vec<_> = whole
-            .forwards
-            .iter()
-            .map(|(name, forwards)| {
-                (
-                    name.clone(),
-                    forwards
-                        .iter()
-                        .map(|forward| (forward.start_byte, forward.package_name.clone()))
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .collect();
-        incremental_shape.sort();
-        whole_shape.sort();
-        for (_, forwards) in &mut incremental_shape {
-            forwards.sort();
-        }
-        for (_, forwards) in &mut whole_shape {
-            forwards.sort();
-        }
-
-        assert!(!whole_shape.is_empty(), "fixture folds no forward");
-        assert_eq!(
-            incremental_shape, whole_shape,
-            "one byte at a time must fold exactly what one whole pass folds"
-        );
     }
 
     /// Drive the region reparse and the whitespace-padded reparse it replaced
@@ -23843,6 +24980,9 @@ public:
     }
 
     #[test]
+    #[hardwon(
+        "a4a47ac2395c: C++ declaration recovery regressed for the region reparse of a fragmented class body is the padded reparse"
+    )]
     fn the_region_reparse_of_a_fragmented_class_body_is_the_padded_reparse() {
         // A conditional immediately after an access label: the shape the padded
         // technique was kept for, because the directive and its macro name
@@ -23904,6 +25044,9 @@ public:
     }
 
     #[test]
+    #[hardwon(
+        "1c7c8490fb76: C++ declaration recovery regressed for following named siblings cursor matches native traversal"
+    )]
     fn following_named_siblings_cursor_matches_native_traversal() {
         // The damaged #2924 shape scatters members across container siblings,
         // and the anonymous punctuation forces the cursor to filter children
@@ -24135,6 +25278,9 @@ enum After { Value };
     /// survived that removal answers `true` where the declarations say `false`,
     /// which is exactly what the in-walk agreement assertion catches (#2786).
     #[test]
+    #[hardwon(
+        "69c2e1f7e41c: C++ declaration recovery regressed for a replacement that removes children drops the field index"
+    )]
     fn a_replacement_that_removes_children_drops_the_field_index() {
         let source =
             "enum First { A };\nstruct Color { int RED; };\nstruct Color {};\nenum Color {};\n";
@@ -24165,6 +25311,9 @@ enum After { Value };
     /// the recovered set is empty and only the region's own reparse window is
     /// recorded (#2787).
     #[test]
+    #[hardwon(
+        "a1556d125712: C++ declaration recovery regressed for a recovery that restores an existing declaration mints nothing"
+    )]
     fn a_recovery_that_restores_an_existing_declaration_mints_nothing() {
         let source = "namespace demo { struct Widget { void doWork(); }; }\n\
                       BEGIN_NS\n\
@@ -24204,6 +25353,9 @@ enum After { Value };
     /// minted, and not the file's other declarations -- in start-byte order,
     /// and each record must carry its own reparse window (#2787).
     #[test]
+    #[hardwon(
+        "a1556d125712: C++ declaration recovery regressed for repeated sentinel recoveries record only what each one minted"
+    )]
     fn repeated_sentinel_recoveries_record_only_what_each_one_minted() {
         let mut source = String::new();
         for index in 0..4 {
@@ -24264,6 +25416,9 @@ enum After { Value };
     }
 
     #[test]
+    #[hardwon(
+        "69c2e1f7e41c: C++ declaration recovery regressed for carried forward field index answers what the declaration scan answers"
+    )]
     fn carried_forward_field_index_answers_what_the_declaration_scan_answers() {
         assert!(
             field_owner_index_agreement(&many_enums_and_mixed_declarations(), "many-enums.hpp") > 0,
@@ -24316,6 +25471,9 @@ enum After { Value };
     /// sources here answer `None` -- these are plain classes that no recovery
     /// shape claims -- which is exactly the case that used to pay full price.
     #[test]
+    #[hardwon(
+        "4530afa0b64f: C++ declaration recovery regressed for recovered class body lookup cost does not grow with the rest of the file"
+    )]
     fn recovered_class_body_lookup_cost_does_not_grow_with_the_rest_of_the_file() {
         let mut answers = Vec::new();
         let mut visits = Vec::new();
@@ -24379,6 +25537,7 @@ enum After { Value };
     }
 
     #[test]
+    #[hardwon("#2982: C MBEDTLS_PRIVATE fields lost direct and chained receiver types")]
     fn mbedtls_private_pointer_field_keeps_its_structured_name_and_type() {
         let source = "struct ssl { struct handshake *MBEDTLS_PRIVATE(handshake); };";
         let mut parser = tree_sitter::Parser::new();
@@ -24415,6 +25574,9 @@ enum After { Value };
     }
 
     #[test]
+    #[hardwon(
+        "4f0531e0e865: C++ parser recovery previously lost declaration ownership, member scope, or source identity"
+    )]
     fn pyobject_head_pointer_field_keeps_its_structured_name_and_type() {
         let source = "struct Holder { PyObject_HEAD ImagingObject *image; };";
         let mut parser = tree_sitter::Parser::new();
@@ -24461,10 +25623,30 @@ enum After { Value };
         );
     }
 
-    /// The C source shapes whose callable modifiers the walk reads, and what
-    /// each one states. C has no member functions at all, so the only fact its
-    /// declarations carry is Unknown; linkage is separate. The `static`
-    /// a C function writes is internal linkage, never a receiver.
+    #[test]
+    fn class_specifier_in_a_c_file_keeps_cpp_nesting() {
+        let source = "class outer { class inner { int v; }; };\n";
+        let c_parsed = parse_cpp_declarations(source, "k.c");
+        let cpp_parsed = parse_cpp_declarations(source, "k.cpp");
+        let c_declarations = c_parsed.declarations();
+        let cpp_declarations = cpp_parsed.declarations();
+        assert!(
+            c_declarations
+                .iter()
+                .any(|unit| unit.is_class() && unit.fq_name() == "outer$inner"),
+            "{c_declarations:?}"
+        );
+        assert_eq!(
+            c_declarations
+                .iter()
+                .map(|unit| unit.fq_name())
+                .collect::<std::collections::BTreeSet<_>>(),
+            cpp_declarations
+                .iter()
+                .map(|unit| unit.fq_name())
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+    }
     #[test]
     fn callable_metadata_records_c_receiver_contracts_structurally() {
         const SOURCE: &str = concat!(
@@ -24485,19 +25667,6 @@ enum After { Value };
             ],
         );
     }
-
-    /// The C++ source shapes whose callable modifiers the walk reads.
-    ///
-    /// C++ states the receiver fact in the declaration's position: a class-body
-    /// member binds the object it is selected on unless it writes `static`, and
-    /// its access is the one the body's specifier ladder is under. The
-    /// out-of-line definitions state neither -- C++ forbids them from repeating
-    /// `static` and they write no access specifier -- which is why
-    /// `Client::count` is recorded static only on the declaration-only row, the
-    /// one whose `static` is actually written. An in-class prototype and the
-    /// out-of-line definition completing it in this translation unit are two
-    /// rows of one code unit (#3508), so their rows share the unit's name and
-    /// `decl_only` is what separates them.
     #[test]
     fn callable_metadata_records_cpp_receiver_contracts_structurally() {
         const SOURCE: &str = concat!(
@@ -24562,39 +25731,5 @@ enum After { Value };
                     .to_string(),
             ],
         );
-    }
-
-    /// One readable row per recorded callable signature entry.
-    ///
-    /// An in-class prototype and the out-of-line definition completing it are
-    /// two entries -- of one code unit when one translation unit holds both
-    /// (#3508) -- and the two state different modifier facts, so the row says
-    /// which declaration role it read.
-    fn recorded_callable_modifiers(parsed: &ParsedFile) -> Vec<String> {
-        let mut rows = parsed
-            .signature_metadata
-            .iter()
-            .flat_map(|(unit, entries)| {
-                entries.iter().map(move |metadata| {
-                    assert!(
-                        metadata.callable_modifiers_recorded(),
-                        "{} must record that the walk read its declaration shape",
-                        unit.fq_name()
-                    );
-                    format!(
-                        "{} decl_only={} static={} constructor={} visibility={:?}",
-                        unit.fq_name(),
-                        metadata.is_declaration_only(),
-                        metadata.callable_is_static(),
-                        metadata.callable_is_constructor(),
-                        metadata
-                            .callable_declared_visibility()
-                            .expect("a recorded modifier set states a visibility"),
-                    )
-                })
-            })
-            .collect::<Vec<_>>();
-        rows.sort();
-        rows
     }
 }

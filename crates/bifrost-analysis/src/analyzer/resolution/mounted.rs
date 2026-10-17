@@ -10,7 +10,7 @@
 //!
 //! [`Mounted`] is where that difference is applied. It is a forwarding
 //! decorator over an unmounted source, implementing both reader traits, and
-//! every one of its sixty methods splices the identities that cross it:
+//! each of its ninety-one reader methods splices the identities that cross it:
 //! arguments from the mount's ordinal to the unmounted one, results from the
 //! unmounted one back to the mount's. The count of identities one seam call
 //! carries is bounded by the call, where the count in a page is not, which is
@@ -34,13 +34,15 @@ use crate::hash::HashSet;
 use super::batch::{
     BatchCandidateCompletionOutcome, BatchCandidateMatch, BatchCandidateOutcome,
     BatchCandidateRequest, BatchDefinitionNode, BatchEndpointClassification, BatchReferenceSeed,
-    BatchResolutionFragmentSource, CandidatePathIdentity, ReferenceSeed, ReferenceSeedBatch,
-    ReferenceSeedReadOutcome, ReverseCandidateGapExclusionPlan, ReverseReferenceSeedRequest,
+    BatchResolutionFragmentSource, CandidatePathIdentity, ReferenceLocalPathEvidence,
+    ReferenceSeed, ReferenceSeedBatch, ReferenceSeedReadOutcome, ReverseCandidateGapExclusionPlan,
+    ReverseReferenceSeedRequest,
 };
 use super::common_fact_lowering::LoweredDeferredMemberOwner;
 use super::engine::ResolutionQuery;
 use super::fact_source::{
-    DeclarationAccessDecision, DeferredMemberOwnerLookupName, FactPageVisitor, FactReadOutcome,
+    CompanionTypeRelation, DeclarationAccessDecision, DeferredMemberOwnerLookupName,
+    FactPageVisitor, FactReadOutcome, LoweredIntrinsicTypeDescriptor,
     LoweredRustDeclarationAuthority, LoweredRustReferenceContext, QualifiedRouteSlotLookup,
     RustImplementedTraits, SelectedGapReasonProvenance, SelectedQualifiedRoute,
     SelectedTypeFrontierCompletion, SelectedTypedFactSource, SelectedTypedRow,
@@ -63,10 +65,12 @@ use super::remount::{
 use super::typed_fact_lowering::{
     LoweredBindingProjection, LoweredCallApplicabilityObligation, LoweredCallableSignatureProperty,
     LoweredConstructionRequirementProperty, LoweredDeclarationTypeProperty,
-    LoweredDeclarationVisibilityProperty, LoweredDefinitionPropertyGap, LoweredIntrinsicSeed,
-    LoweredMemberOwnerProperty, LoweredMemberScopeProperty, LoweredQualifiedSeededRoute,
-    LoweredSupertypeProperty, LoweredTypeComponent, LoweredTypeTransfer, LoweredTypedFrontier,
-    LoweredUnderlyingType,
+    LoweredDeclarationVisibilityProperty, LoweredDeclaredTypeArgument,
+    LoweredDefinitionPropertyGap, LoweredGenericFormal, LoweredGenericFormalDefault,
+    LoweredGenericTypeAliasParameter, LoweredIntrinsicSeed, LoweredMemberOwnerProperty,
+    LoweredMemberScopeProperty, LoweredQualifiedSeededRoute, LoweredSupertypeProperty,
+    LoweredTypeArgument, LoweredTypeComponent, LoweredTypeProduction, LoweredTypeTransfer,
+    LoweredTypedFrontier, LoweredUnderlyingType,
 };
 
 /// The token every splice walk runs under.
@@ -424,6 +428,25 @@ impl<V: SpliceMount> SpliceMount for Vec<V> {
     }
 }
 
+impl<V: SpliceMount> SpliceMount for Box<[V]> {
+    fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
+        self.iter().map(|value| value.splice(translation)).collect()
+    }
+}
+
+impl SpliceMount for super::FactReferenceSiteMetadata {
+    fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
+        remount_site_metadata(*self, translation)
+    }
+}
+
+impl SpliceMount for super::TypedFrontierState {
+    fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
+        super::remount::remount_frontier_state(self, translation, uncancelled())
+            .expect("a mount splice runs under an uncancelled token")
+    }
+}
+
 impl<A: SpliceMount, B: SpliceMount> SpliceMount for (A, B) {
     fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
         (self.0.splice(translation), self.1.splice(translation))
@@ -434,6 +457,90 @@ impl SpliceMount for ResolutionCompletion {
     fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
         remount_completion(self, translation, uncancelled())
             .expect("a mount splice runs under an uncancelled token")
+    }
+}
+
+impl SpliceMount for super::model::WitnessStep {
+    fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
+        match self {
+            Self::Node(node) => Self::Node(translation.node(*node)),
+            Self::Candidate { semantic, outcome } => Self::Candidate {
+                semantic: translation.semantic(*semantic),
+                outcome: *outcome,
+            },
+            Self::Boundary { semantic, status } => Self::Boundary {
+                semantic: translation.semantic(*semantic),
+                status: *status,
+            },
+        }
+    }
+}
+
+fn remount_native_defeated_imports<T: ResolutionIdentityTranslation>(
+    routes: &super::model::NativeDefeatedImports,
+    translation: &T,
+) -> super::model::NativeDefeatedImports {
+    // Operation-arena splices leave selected source tokens and lookup names
+    // unchanged. Keep the common payload shared in that usual case.
+    if routes.iter().all(|(token, _, path)| {
+        translation.semantic(*token) == *token
+            && path
+                .iter()
+                .all(|semantic| translation.semantic(*semantic) == *semantic)
+    }) {
+        return routes.clone();
+    }
+    routes
+        .iter()
+        .map(|(token, tier, path)| {
+            (
+                translation.semantic(*token),
+                *tier,
+                path.iter()
+                    .map(|semantic| translation.semantic(*semantic))
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .into()
+}
+
+impl SpliceMount for super::model::NativeSelectionProvenance {
+    fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
+        Self {
+            tier: self.tier,
+            import_route: self.import_route.as_deref().map(|(token, route)| {
+                Box::new((
+                    translation.semantic(*token),
+                    route
+                        .iter()
+                        .map(|semantic| translation.semantic(*semantic))
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                ))
+            }),
+            defeated_imports: remount_native_defeated_imports(&self.defeated_imports, translation),
+            rejection_coverage: self.rejection_coverage,
+        }
+    }
+}
+
+impl SpliceMount for super::model::ResolutionWitness {
+    fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
+        Self::new(
+            translation.semantic(self.reference()),
+            translation.semantic(self.target()),
+            self.steps()
+                .iter()
+                .map(|step| step.splice(translation))
+                .collect::<Vec<_>>(),
+            self.completion().splice(translation),
+        )
+        .with_native_provenance(
+            self.native_provenance()
+                .map(|value| Box::new(value.splice(translation))),
+        )
     }
 }
 
@@ -659,6 +766,36 @@ impl SpliceMount for SelectedTypeFrontierCompletion {
     }
 }
 
+impl SpliceMount for CompanionTypeRelation {
+    fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
+        CompanionTypeRelation::new(
+            translation.semantic(self.enclosing_type()),
+            translation.semantic(self.companion_type()),
+        )
+    }
+}
+
+impl SpliceMount for ReferenceLocalPathEvidence {
+    fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
+        ReferenceLocalPathEvidence::new(
+            remount_site_metadata(self.metadata(), translation),
+            self.local_definitions()
+                .iter()
+                .map(|definition| translation.semantic(*definition))
+                .collect(),
+            self.prefix_local_definitions()
+                .iter()
+                .map(|definition| translation.semantic(*definition))
+                .collect(),
+            self.prefix_scope_spellings().to_vec(),
+            self.scope_endpoints().to_vec(),
+            self.reaches_root(),
+            self.reaches_package_root_scope(),
+        )
+        .with_local_bindings_certified(self.local_bindings_certified())
+    }
+}
+
 impl SpliceMount for LoweredRustReferenceContext {
     fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
         LoweredRustReferenceContext::new(
@@ -727,7 +864,28 @@ splice_lowered_row!(
     remount_definition_property_gap
 );
 splice_lowered_row!(LoweredIntrinsicSeed, remount_intrinsic_seed, cancellable);
+
+impl SpliceMount for LoweredIntrinsicTypeDescriptor {
+    fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
+        LoweredIntrinsicTypeDescriptor::new(
+            translation.semantic(self.identity()),
+            self.kind(),
+            self.spelling(),
+        )
+    }
+}
 splice_lowered_row!(LoweredTypeTransfer, remount_transfer, cancellable);
+impl SpliceMount for LoweredTypeProduction {
+    fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
+        Self {
+            output: translation.semantic(self.output),
+            element: translation.semantic(self.element),
+            constructor: self.constructor,
+            length: self.length.clone(),
+        }
+    }
+}
+
 impl SpliceMount for LoweredTypeComponent {
     fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
         LoweredTypeComponent::new(
@@ -739,11 +897,66 @@ impl SpliceMount for LoweredTypeComponent {
     }
 }
 
+impl SpliceMount for LoweredDeclaredTypeArgument {
+    fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
+        LoweredDeclaredTypeArgument::new(
+            translation.semantic(self.owner()),
+            self.position(),
+            translation.semantic(self.argument()),
+        )
+    }
+}
+
 impl SpliceMount for LoweredUnderlyingType {
     fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
         LoweredUnderlyingType::new(
             translation.semantic(self.definition()),
             translation.semantic(self.slot()),
+        )
+    }
+}
+
+impl SpliceMount for LoweredTypeArgument {
+    fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
+        LoweredTypeArgument::new(
+            translation.semantic(self.application()),
+            self.ordinal(),
+            translation.semantic(self.argument()),
+            self.indirection_delta(),
+            self.reference_indirection_delta(),
+        )
+    }
+}
+
+impl SpliceMount for LoweredGenericFormal {
+    fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
+        LoweredGenericFormal::new(
+            translation.semantic(self.owner()),
+            self.ordinal(),
+            translation.semantic(self.parameter()),
+        )
+    }
+}
+
+impl SpliceMount for LoweredGenericFormalDefault {
+    fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
+        LoweredGenericFormalDefault::new(
+            translation.semantic(self.owner()),
+            self.ordinal(),
+            translation.semantic(self.default()),
+        )
+    }
+}
+
+impl SpliceMount for LoweredGenericTypeAliasParameter {
+    fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
+        LoweredGenericTypeAliasParameter::new(
+            translation.semantic(self.alias()),
+            self.ordinal(),
+            translation.semantic(self.parameter()),
+            translation.semantic(self.target()),
+            self.indirection_delta(),
+            self.reference_indirection_delta(),
         )
     }
 }
@@ -779,6 +992,12 @@ impl<R: SpliceMount> SpliceMount for SelectedTypedRow<R> {
 /// pointer to the source rather than the source itself, because what a mount
 /// has in hand is the `Arc` the interior cache's page holds: wrapping one
 /// costs the ordinal beside the pointer and nothing else.
+struct RustCrateAccessArguments {
+    base_blobs: Vec<(BindingFragmentId, i64)>,
+    reference: Option<SelectedTypedRow<LoweredRustReferenceContext>>,
+    definition: Option<SelectedTypedRow<LoweredRustDeclarationAuthority>>,
+}
+
 pub(crate) struct Mounted<S> {
     inner: S,
     ordinal: u32,
@@ -837,6 +1056,34 @@ impl<S> Mounted<S> {
     fn argument<V: SpliceMount>(&self, value: &V) -> V {
         value.splice(&self.interior_translation())
     }
+
+    fn rust_crate_access_arguments(
+        &self,
+        base_blobs: &[(BindingFragmentId, i64)],
+        reference: Option<&SelectedTypedRow<LoweredRustReferenceContext>>,
+        definition: Option<&SelectedTypedRow<LoweredRustDeclarationAuthority>>,
+    ) -> RustCrateAccessArguments {
+        RustCrateAccessArguments {
+            base_blobs: base_blobs
+                .iter()
+                .map(|&(fragment, blob)| (self.argument(&fragment), blob))
+                .collect(),
+            reference: reference.map(|row| self.argument(row)),
+            definition: definition.map(|row| self.argument(row)),
+        }
+    }
+
+    fn splice_rust_implemented_traits(
+        &self,
+        result: RustImplementedTraits,
+    ) -> RustImplementedTraits {
+        match result {
+            RustImplementedTraits::Traits(traits) => {
+                RustImplementedTraits::Traits(self.results(&traits))
+            }
+            other => other,
+        }
+    }
 }
 
 /// A batch method whose arguments and results are both slices of spliceable
@@ -880,6 +1127,21 @@ where
     S: std::ops::Deref,
     S::Target: BatchResolutionFragmentSource,
 {
+    fn identity_content_digest(
+        &self,
+        key: super::ResolutionIdentityDigestKey,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<[u8; 32]>> {
+        use super::ResolutionIdentityDigestKey as Key;
+        let key = match key {
+            Key::Semantic(value) => Key::Semantic(self.argument(&value)),
+            Key::Node(value) => Key::Node(self.argument(&value)),
+            Key::Path(value) => Key::Path(self.argument(&value)),
+            Key::Fragment(value) => Key::Fragment(self.argument(&value)),
+        };
+        self.inner.identity_content_digest(key, cancellation)
+    }
+
     /// The authority names a selection, not an identity, so there is nothing
     /// for this decorator to rebase: the inner source's answer is this one.
     fn selection_authority(&self) -> Option<super::batch::SeedReadAuthority> {
@@ -899,14 +1161,14 @@ where
         self.result(&self.inner.scope_reverse_inventory_completion(&completion))
     }
 
-    fn go_lookup_spelling(
+    fn universe_entry(
         &self,
         reference: SemanticId,
         namespace: brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace,
         cancellation: &CancellationToken,
-    ) -> StoreResult<Option<String>> {
+    ) -> StoreResult<Option<super::universe::UniverseEntry>> {
         self.inner
-            .go_lookup_spelling(self.argument(&reference), namespace, cancellation)
+            .universe_entry(self.argument(&reference), namespace, cancellation)
     }
 
     fn intern_shared_name_digest(
@@ -920,8 +1182,26 @@ where
             .map(|name| self.result(&name)))
     }
 
+    fn shared_name_digest_for_identity(
+        &self,
+        identity: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<[u8; 32]>> {
+        self.inner
+            .shared_name_digest_for_identity(self.argument(&identity), cancellation)
+    }
+
     fn supports_go_universe(&self) -> bool {
         self.inner.supports_go_universe()
+    }
+
+    fn go_package_inventory_complete(&self) -> Option<bool> {
+        self.inner.go_package_inventory_complete()
+    }
+
+    fn go_package_inventory_complete_for_fragment(&self, fragment: BindingFragmentId) -> bool {
+        self.inner
+            .go_package_inventory_complete_for_fragment(self.argument(&fragment))
     }
 
     fn reference_seed(
@@ -946,6 +1226,18 @@ where
         Ok(self.result(&outcome))
     }
 
+    fn reference_local_path_evidence(
+        &self,
+        reference: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<ReferenceLocalPathEvidence>> {
+        let reference = self.argument(&reference);
+        let evidence = self
+            .inner
+            .reference_local_path_evidence(reference, cancellation)?;
+        Ok(evidence.map(|evidence| self.result(&evidence)))
+    }
+
     fn lookup_definition_node(
         &self,
         definition: SemanticId,
@@ -964,6 +1256,8 @@ where
         issue_reverse_reference_seeds(requests: &[ReverseReferenceSeedRequest])
             -> Vec<ReferenceSeed>
     );
+
+    spliced_batch!(scope_owners_for_heads(heads: &[BindingNodeId]) -> Vec<LoweredMemberScopeProperty>);
 
     spliced_batch!(
         classify_endpoint_nodes(nodes: &[BindingNodeId]) -> Vec<BatchEndpointClassification>
@@ -1033,6 +1327,21 @@ where
 
     spliced_candidate_pages!(visit_reverse_candidate_match_pages);
 
+    fn visit_reverse_candidate_match_pages_with_gap_exclusions(
+        &mut self,
+        requests: &[BatchCandidateRequest],
+        exclusions: &mut ReverseCandidateGapExclusionPlan,
+        cancellation: &CancellationToken,
+        visitor: &mut dyn FnMut(&[BatchCandidateMatch]) -> StoreResult<bool>,
+    ) -> StoreResult<BatchCandidateCompletionOutcome> {
+        self.visit_reverse_candidate_match_pages_with_gap_exclusions_shared(
+            requests,
+            exclusions,
+            cancellation,
+            visitor,
+        )
+    }
+
     spliced_candidate_pages!(
         visit_reverse_root_candidate_match_pages,
         mounts: Option<&[SelectedResolutionMountOrdinal]>
@@ -1049,21 +1358,6 @@ where
             return Err(gap_exclusions_do_not_cross_a_mount());
         }
         self.visit_reverse_candidate_match_pages(requests, cancellation, visitor)
-    }
-
-    fn visit_reverse_candidate_match_pages_with_gap_exclusions(
-        &mut self,
-        requests: &[BatchCandidateRequest],
-        exclusions: &mut ReverseCandidateGapExclusionPlan,
-        cancellation: &CancellationToken,
-        visitor: &mut dyn FnMut(&[BatchCandidateMatch]) -> StoreResult<bool>,
-    ) -> StoreResult<BatchCandidateCompletionOutcome> {
-        self.visit_reverse_candidate_match_pages_with_gap_exclusions_shared(
-            requests,
-            exclusions,
-            cancellation,
-            visitor,
-        )
     }
 
     fn visit_type_transfer_rules(
@@ -1139,6 +1433,67 @@ where
     S: std::ops::Deref,
     S::Target: SelectedTypedFactSource,
 {
+    fn generated_items_cannot_shadow_bindings(
+        &self,
+        reference: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<bool> {
+        self.inner
+            .generated_items_cannot_shadow_bindings(self.argument(&reference), cancellation)
+    }
+
+    fn named_argument_label_for_reference(
+        &self,
+        reference: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<super::fact_source::NamedArgumentLabelRead> {
+        Ok(
+            match self
+                .inner
+                .named_argument_label_for_reference(self.argument(&reference), cancellation)?
+            {
+                super::fact_source::NamedArgumentLabelRead::Found(mut label) => {
+                    label.call = self.result(&label.call);
+                    label.callee_reference = label
+                        .callee_reference
+                        .map(|reference| self.result(&reference));
+                    super::fact_source::NamedArgumentLabelRead::Found(label)
+                }
+                other => other,
+            },
+        )
+    }
+
+    fn callable_parameter_for_label(
+        &self,
+        callable: SemanticId,
+        label: &str,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<SemanticId>> {
+        Ok(self
+            .inner
+            .callable_parameter_for_label(self.argument(&callable), label, cancellation)?
+            .map(|parameter| self.result(&parameter)))
+    }
+
+    fn external_callable_result_type_identities(
+        &self,
+        definitions: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<(SemanticId, SemanticId)>>> {
+        let arguments = self.arguments(definitions);
+        Ok(self
+            .inner
+            .external_callable_result_type_identities(&arguments, cancellation)?
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|(definition, identity)| {
+                        (self.result(&definition), self.result(&identity))
+                    })
+                    .collect()
+            }))
+    }
+
     fn rust_crate_access(
         &self,
         crate_key: [u8; 32],
@@ -1146,17 +1501,12 @@ where
         reference: Option<&SelectedTypedRow<LoweredRustReferenceContext>>,
         definition: Option<&SelectedTypedRow<LoweredRustDeclarationAuthority>>,
     ) -> StoreResult<Option<DeclarationAccessDecision>> {
-        let base_blobs = base_blobs
-            .iter()
-            .map(|&(fragment, blob)| (self.argument(&fragment), blob))
-            .collect::<Vec<_>>();
-        let reference = reference.map(|row| self.argument(row));
-        let definition = definition.map(|row| self.argument(row));
+        let arguments = self.rust_crate_access_arguments(base_blobs, reference, definition);
         self.inner.rust_crate_access(
             crate_key,
-            &base_blobs,
-            reference.as_ref(),
-            definition.as_ref(),
+            &arguments.base_blobs,
+            arguments.reference.as_ref(),
+            arguments.definition.as_ref(),
         )
     }
 
@@ -1167,17 +1517,12 @@ where
         reference: Option<&SelectedTypedRow<LoweredRustReferenceContext>>,
         definition: Option<&SelectedTypedRow<LoweredRustDeclarationAuthority>>,
     ) -> StoreResult<Option<DeclarationAccessDecision>> {
-        let base_blobs = base_blobs
-            .iter()
-            .map(|&(fragment, blob)| (self.argument(&fragment), blob))
-            .collect::<Vec<_>>();
-        let reference = reference.map(|row| self.argument(row));
-        let definition = definition.map(|row| self.argument(row));
+        let arguments = self.rust_crate_access_arguments(base_blobs, reference, definition);
         self.inner.rust_crate_set_access(
             crate_key,
-            &base_blobs,
-            reference.as_ref(),
-            definition.as_ref(),
+            &arguments.base_blobs,
+            arguments.reference.as_ref(),
+            arguments.definition.as_ref(),
         )
     }
 
@@ -1190,16 +1535,11 @@ where
         cancellation: &CancellationToken,
     ) -> StoreResult<RustImplementedTraits> {
         Ok(
-            match self.inner.rust_implemented_traits_nameable_at(
+            self.splice_rust_implemented_traits(self.inner.rust_implemented_traits_nameable_at(
                 self.argument(&owner),
                 self.argument(&reference),
                 cancellation,
-            )? {
-                RustImplementedTraits::Traits(traits) => {
-                    RustImplementedTraits::Traits(self.results(&traits))
-                }
-                other => other,
-            },
+            )?),
         )
     }
 
@@ -1211,16 +1551,11 @@ where
         cancellation: &CancellationToken,
     ) -> StoreResult<RustImplementedTraits> {
         Ok(
-            match self.inner.rust_trait_nameable_at(
+            self.splice_rust_implemented_traits(self.inner.rust_trait_nameable_at(
                 self.argument(&owner),
                 self.argument(&reference),
                 cancellation,
-            )? {
-                RustImplementedTraits::Traits(traits) => {
-                    RustImplementedTraits::Traits(self.results(&traits))
-                }
-                other => other,
-            },
+            )?),
         )
     }
 
@@ -1229,21 +1564,57 @@ where
         member: SemanticId,
         cancellation: &CancellationToken,
     ) -> StoreResult<RustImplementedTraits> {
-        Ok(
-            match self
-                .inner
-                .rust_impl_item_traits(self.argument(&member), cancellation)?
-            {
-                RustImplementedTraits::Traits(traits) => {
-                    RustImplementedTraits::Traits(self.results(&traits))
-                }
-                other => other,
-            },
-        )
+        Ok(self.splice_rust_implemented_traits(
+            self.inner
+                .rust_impl_item_traits(self.argument(&member), cancellation)?,
+        ))
+    }
+
+    fn lookup_namespace(
+        &self,
+        lookup: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace>>
+    {
+        self.inner
+            .lookup_namespace(self.argument(&lookup), cancellation)
     }
 
     fn selection_has_java_semantics(&self) -> bool {
         self.inner.selection_has_java_semantics()
+    }
+
+    fn selection_has_jvm_semantics(&self) -> bool {
+        self.inner.selection_has_jvm_semantics()
+    }
+
+    fn fragment_call_target_precedence(
+        &self,
+        fragment: BindingFragmentId,
+        namespace: brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace,
+        ordinal: u32,
+    ) -> StoreResult<u32> {
+        self.inner
+            .fragment_call_target_precedence(fragment, namespace, ordinal)
+    }
+
+    fn fragment_language(
+        &self,
+        fragment: BindingFragmentId,
+    ) -> StoreResult<brokk_bifrost_core::analyzer::Language> {
+        self.inner.fragment_language(fragment)
+    }
+
+    fn fragment_type_qualifiers_search_companion_members(
+        &self,
+        fragment: BindingFragmentId,
+    ) -> StoreResult<bool> {
+        self.inner
+            .fragment_type_qualifiers_search_companion_members(fragment)
+    }
+
+    fn intrinsic_reverse_index_uses_shared_type_names(&self) -> bool {
+        self.inner.intrinsic_reverse_index_uses_shared_type_names()
     }
 
     fn java_access_endpoints(
@@ -1258,6 +1629,29 @@ where
             .map(|mut rows| {
                 for row in &mut rows {
                     row.semantic = self.result(&row.semantic);
+                    row.outermost_type = row.outermost_type.map(|owner| self.result(&owner));
+                }
+                rows
+            }))
+    }
+
+    fn jvm_access_endpoints(
+        &self,
+        semantics: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<super::fact_source::JvmAccessEndpoint>>> {
+        let semantics = self.arguments(semantics);
+        Ok(self
+            .inner
+            .jvm_access_endpoints(&semantics, cancellation)?
+            .map(|mut rows| {
+                for row in &mut rows {
+                    row.semantic = self.result(&row.semantic);
+                    row.enclosing_templates = row
+                        .enclosing_templates
+                        .iter()
+                        .map(|owner| self.result(owner))
+                        .collect();
                     row.outermost_type = row.outermost_type.map(|owner| self.result(&owner));
                 }
                 rows
@@ -1281,6 +1675,73 @@ where
                     .map(|(lookup, callable)| (self.result(&lookup), self.result(&callable)))
                     .collect()
             }))
+    }
+
+    fn invocation_roles_for_references(
+        &self,
+        references: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<super::fact_source::SelectedInvocationRole>>> {
+        let references = self.arguments(references);
+        Ok(self
+            .inner
+            .invocation_roles_for_references(&references, cancellation)?
+            .map(|mut rows| {
+                for row in &mut rows {
+                    row.reference = self.result(&row.reference);
+                }
+                rows
+            }))
+    }
+
+    fn lookups_outside_implicit_root(
+        &self,
+        lookups: &[(BindingFragmentId, SemanticId)],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<SemanticId>>> {
+        let lookups = lookups
+            .iter()
+            .map(|(fragment, lookup)| (self.argument(fragment), self.argument(lookup)))
+            .collect::<Vec<_>>();
+        Ok(self
+            .inner
+            .lookups_outside_implicit_root(&lookups, cancellation)?
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|lookup| self.result(&lookup))
+                    .collect()
+            }))
+    }
+
+    fn generic_parameter_declarations(
+        &self,
+        definitions: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<SemanticId>>> {
+        let definitions = self.arguments(definitions);
+        Ok(self
+            .inner
+            .generic_parameter_declarations(&definitions, cancellation)?
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|identity| self.result(&identity))
+                    .collect()
+            }))
+    }
+
+    fn deferred_member_owner_proofs(
+        &self,
+        owners: &[SemanticId],
+        candidates: &[(SemanticId, SemanticId)],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<super::fact_source::DeferredMemberOwnerProof>>> {
+        let owners = self.arguments(owners);
+        let candidates = candidates
+            .iter()
+            .map(|(definition, frontier)| (self.argument(definition), self.argument(frontier)))
+            .collect::<Vec<_>>();
+        self.inner
+            .deferred_member_owner_proofs(&owners, &candidates, cancellation)
     }
 
     fn go_member_declarations(
@@ -1415,6 +1876,11 @@ where
         SelectedTypedRow<LoweredRustDeclarationAuthority>
     );
     spliced_typed_pages!(
+        visit_rust_reason_owners,
+        SemanticId,
+        (SemanticId, SemanticId)
+    );
+    spliced_typed_pages!(
         visit_typed_frontier_pages,
         SemanticId,
         SelectedTypedRow<LoweredTypedFrontier>
@@ -1440,9 +1906,40 @@ where
         SelectedTypedRow<LoweredTypeTransfer>
     );
     spliced_typed_pages!(
+        visit_type_production_pages_for_outputs,
+        SemanticId,
+        SelectedTypedRow<LoweredTypeProduction>
+    );
+    spliced_typed_pages!(
         visit_type_component_pages_for_containers,
         SemanticId,
         SelectedTypedRow<LoweredTypeComponent>
+    );
+    spliced_typed_pages!(
+        visit_declared_type_argument_pages_for_owners,
+        SemanticId,
+        SelectedTypedRow<LoweredDeclaredTypeArgument>
+    );
+    spliced_typed_pages!(
+        visit_type_argument_pages_for_applications,
+        SemanticId,
+        SelectedTypedRow<LoweredTypeArgument>
+    );
+    spliced_typed_pages!(
+        visit_generic_type_alias_parameter_pages_for_definitions,
+        SemanticId,
+        SelectedTypedRow<LoweredGenericTypeAliasParameter>
+    );
+    spliced_typed_pages!(
+        visit_generic_formal_pages_for_owners,
+        SemanticId,
+        SelectedTypedRow<LoweredGenericFormal>
+    );
+
+    spliced_typed_pages!(
+        visit_generic_formal_default_pages_for_owners,
+        SemanticId,
+        SelectedTypedRow<LoweredGenericFormalDefault>
     );
     spliced_typed_pages!(
         visit_underlying_type_pages_for_definitions,
@@ -1458,6 +1955,11 @@ where
         visit_intrinsic_seed_pages_for_type_identities,
         SemanticId,
         SelectedTypedRow<LoweredIntrinsicSeed>
+    );
+    spliced_typed_pages!(
+        visit_intrinsic_type_descriptor_pages_for_type_identities,
+        SemanticId,
+        SelectedTypedRow<LoweredIntrinsicTypeDescriptor>
     );
     spliced_typed_pages!(
         visit_binding_projection_pages_for_references,
@@ -1519,6 +2021,11 @@ where
         visit_member_scope_pages_for_definitions,
         SemanticId,
         SelectedTypedRow<LoweredMemberScopeProperty>
+    );
+    spliced_typed_pages!(
+        visit_companion_relation_pages_for_enclosing_types,
+        SemanticId,
+        SelectedTypedRow<CompanionTypeRelation>
     );
     spliced_typed_pages!(
         visit_member_scope_pages_for_heads,
@@ -1603,7 +2110,7 @@ mod tests {
 
     /// Method names declared at the top level of one trait body.
     ///
-    /// The decorator must forward all sixty. A required method that is not
+    /// The decorator must forward all sixty-four. A required method that is not
     /// forwarded fails to compile; a *defaulted* one does not, and its default
     /// body would then run on the decorator, read the inner source through the
     /// decorator's own spliced methods and splice one value twice. This reads
@@ -1696,8 +2203,10 @@ mod tests {
             declared_methods(&typed_crlf, "SelectedTypedFactSource"),
             typed
         );
-        assert_eq!(batch.len(), 25, "BatchResolutionFragmentSource: {batch:?}");
-        assert_eq!(typed.len(), 55, "SelectedTypedFactSource: {typed:?}");
+        assert_eq!(batch.len(), 31, "BatchResolutionFragmentSource: {batch:?}");
+        // The descriptor-only projection is forwarded independently of the
+        // seed reader; the source-derived membership check below proves both.
+        assert_eq!(typed.len(), 79, "SelectedTypedFactSource: {typed:?}");
 
         let forwarded = forwarded_methods(include_str!("mounted.rs"))
             .into_iter()

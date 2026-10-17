@@ -8,6 +8,9 @@
 //! contributes a typed incomplete diagnostic and never presents its surviving
 //! rows as the whole answer.
 
+use super::xml_relations::{
+    has_xml_relation_filter, matches_xml_relations, xml_reference_coverage,
+};
 use super::*;
 use crate::analyzer::semantic::LengthDelimitedDigest;
 use crate::query::{
@@ -15,7 +18,9 @@ use crate::query::{
     ConfigurationNodeKindFilter, ConfigurationRouteFilter, ConfigurationRouteSegmentFilter,
 };
 use brokk_bifrost_analysis::analyzer::configuration::{
-    ConfigurationIngestionError, ConfigurationIngestionOutcome, ingest_configuration_document,
+    ConfigurationIngestionError, ConfigurationIngestionOutcome, decoded_json_scalar_value,
+    decoded_properties_scalar_value, decoded_xml_scalar_value, decoded_yaml_scalar_value,
+    ingest_configuration_document,
 };
 use brokk_bifrost_core::analyzer::configuration::{
     ConfigurationCompleteness, ConfigurationDocumentFacts, ConfigurationFact, ConfigurationFactId,
@@ -77,6 +82,31 @@ impl ConfigurationFactValue {
                 .stable_id(self.document.format())
                 .to_string(),
         )
+    }
+
+    /// Decode the authored scalar represented by this row. Member rows expose
+    /// the value of their scalar child; scalar rows expose themselves. Each
+    /// format-specific decoder runs only after the configuration grammar has
+    /// selected the scalar fact and its exact evidence range.
+    pub(super) fn scalar_value(&self) -> Option<String> {
+        let scalar_id = match self.fact().kind() {
+            ConfigurationNodeKind::Scalar { .. } => ConfigurationFactId::new(self.index),
+            ConfigurationNodeKind::Member {
+                value: Some(value), ..
+            } => match self.document.fact(*value)?.kind() {
+                ConfigurationNodeKind::Scalar { .. } => Some(*value),
+                ConfigurationNodeKind::Section {
+                    header: Some(header),
+                    ..
+                } => Some(*header),
+                _ => None,
+            },
+            _ => None,
+        }?;
+        decoded_json_scalar_value(&self.document, &self.source, scalar_id)
+            .or_else(|| decoded_yaml_scalar_value(&self.document, &self.source, scalar_id))
+            .or_else(|| decoded_xml_scalar_value(&self.document, &self.source, scalar_id))
+            .or_else(|| decoded_properties_scalar_value(&self.document, &self.source, scalar_id))
     }
 
     /// The workspace-scoped row id: one file spelling plus the document-scoped
@@ -163,6 +193,19 @@ pub(super) struct ConfigurationDocumentSnapshot {
     document: Option<(Arc<ConfigurationDocumentFacts>, Arc<str>)>,
 }
 
+/// The ingestion state of one document in the current request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ConfigurationDocumentIngestion {
+    /// No configuration input of this request read the document: it is not in
+    /// the workspace listing, or the input stopped before reaching it.
+    NotIngested,
+    /// The document was read but produced no fact arena.
+    NoFacts,
+    /// The document's facts come from a partly recovered parse.
+    Recovered,
+    Complete,
+}
+
 /// Per-request memo of ingested configuration documents plus the incomplete
 /// diagnostics already reported, so one file ingests once per execution and
 /// one gap reports once.
@@ -173,6 +216,22 @@ pub(super) struct ConfigurationFactsTraversalCache {
 }
 
 impl ConfigurationFactsTraversalCache {
+    /// Full immutable facts already ingested by this request, before any row
+    /// predicate. Effective resolution must not lose shadowing declarations.
+    pub(super) fn ingested_document(&self, path: &str) -> Option<ConfigurationFactValue> {
+        self.documents.iter().find_map(|(file, snapshot)| {
+            if rel_path_string(file) != path {
+                return None;
+            }
+            let (document, source) = snapshot.document.as_ref()?;
+            Some(ConfigurationFactValue {
+                file: file.clone(),
+                document: Arc::clone(document),
+                source: Arc::clone(source),
+                index: 0,
+            })
+        })
+    }
     /// Ingest (or replay) one workspace configuration document. `None` only on
     /// cancellation; a supported-but-failed document yields `Some` with no
     /// arena plus its diagnostic.
@@ -280,6 +339,25 @@ impl ConfigurationFactsTraversalCache {
         Some(snapshot)
     }
 
+    /// How the document at one workspace-relative path fared in this request.
+    /// A cross-domain relation reads this to tell a declared document whose
+    /// keys are all known from one whose absence would only look clean.
+    pub(super) fn ingestion_of(&self, rel_path: &str) -> ConfigurationDocumentIngestion {
+        let snapshot = self
+            .documents
+            .iter()
+            .find(|(file, _)| rel_path_string(file) == rel_path)
+            .map(|(_, snapshot)| snapshot);
+        match snapshot.map(|snapshot| &snapshot.document) {
+            None => ConfigurationDocumentIngestion::NotIngested,
+            Some(None) => ConfigurationDocumentIngestion::NoFacts,
+            Some(Some((facts, _))) if facts.completeness().is_complete() => {
+                ConfigurationDocumentIngestion::Complete
+            }
+            Some(Some(_)) => ConfigurationDocumentIngestion::Recovered,
+        }
+    }
+
     fn report_file_incomplete(
         &mut self,
         file: &ProjectFile,
@@ -291,12 +369,14 @@ impl ConfigurationFactsTraversalCache {
             return;
         }
         diagnostics.push(CodeQueryDiagnostic {
+            source: None,
             code,
             impact: CodeQueryDiagnosticImpact::Incomplete,
             branch: Vec::new(),
             language: "workspace",
             message,
             exhausted_roots: Vec::new(),
+            withheld_rows_path: None,
         });
     }
 }
@@ -389,6 +469,44 @@ pub(super) fn fact_matches_filter(
             return false;
         }
     }
+    let scalar_value = value.scalar_value();
+    if !filter.values.is_empty()
+        && !scalar_value
+            .as_deref()
+            .is_some_and(|actual| filter.values.iter().any(|expected| expected == actual))
+    {
+        return false;
+    }
+    if !filter.values_ignore_case.is_empty()
+        && !scalar_value.as_deref().is_some_and(|actual| {
+            filter
+                .values_ignore_case
+                .iter()
+                .any(|expected| expected.eq_ignore_ascii_case(actual))
+        })
+    {
+        return false;
+    }
+    let numeric_value = scalar_value.as_deref().and_then(parse_configuration_number);
+    if !matches_numeric_bound(
+        numeric_value,
+        filter.value_lt.as_deref(),
+        |actual, bound| actual < bound,
+    ) || !matches_numeric_bound(
+        numeric_value,
+        filter.value_le.as_deref(),
+        |actual, bound| actual <= bound,
+    ) || !matches_numeric_bound(
+        numeric_value,
+        filter.value_gt.as_deref(),
+        |actual, bound| actual > bound,
+    ) || !matches_numeric_bound(
+        numeric_value,
+        filter.value_ge.as_deref(),
+        |actual, bound| actual >= bound,
+    ) {
+        return false;
+    }
     if !filter.routes.is_empty()
         && !filter
             .routes
@@ -416,7 +534,31 @@ pub(super) fn fact_matches_filter(
     if !filter.completenesses.is_empty() && !filter.completenesses.contains(&value.completeness()) {
         return false;
     }
-    true
+    matches_xml_relations(value, filter)
+}
+
+fn parse_configuration_number(value: &str) -> Option<f64> {
+    value
+        .parse::<f64>()
+        .ok()
+        .filter(|number| number.is_finite())
+}
+
+fn matches_numeric_bound(
+    actual: Option<f64>,
+    bound: Option<&str>,
+    predicate: impl FnOnce(f64, f64) -> bool,
+) -> bool {
+    let Some(bound) = bound else {
+        return true;
+    };
+    let Some(actual) = actual else {
+        return false;
+    };
+    let Some(bound) = parse_configuration_number(bound) else {
+        return false;
+    };
+    predicate(actual, bound)
 }
 
 fn kind_matches(kind: &ConfigurationNodeKind, filter: ConfigurationNodeKindFilter) -> bool {
@@ -485,7 +627,7 @@ pub(super) fn configuration_seed_files(
         if !where_globs.matches(&rel) {
             continue;
         }
-        let Some(format) = format_for_path(&file) else {
+        let Some(format) = format_for_path(file.rel_path()) else {
             continue;
         };
         if !formats.is_empty() && !formats.contains(&format) {
@@ -497,13 +639,15 @@ pub(super) fn configuration_seed_files(
     Ok(files)
 }
 
+/// The configuration format the canonical registry assigns to one
+/// workspace-relative path, if any.
 pub(super) fn format_for_path(
-    file: &ProjectFile,
+    rel_path: &std::path::Path,
 ) -> Option<crate::query::domain::ConfigurationFormat> {
     use brokk_bifrost_core::analyzer::configuration::{
         ConfigurationPathClassification, classify_configuration_path,
     };
-    match classify_configuration_path(file.rel_path()) {
+    match classify_configuration_path(rel_path) {
         ConfigurationPathClassification::Supported(format) => Some(format.into()),
         ConfigurationPathClassification::Unsupported => None,
     }
@@ -517,30 +661,24 @@ pub(super) fn execute_configuration_facts_seed(
     limits: CodeQueryExecutionLimits,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> PlanExecution {
-    let budget_cap = limits
-        .max_pipeline_rows
-        .saturating_sub(state.budget.pipeline_rows);
-    let desired_rows = terminal_cap.unwrap_or(budget_cap).min(budget_cap);
-    if desired_rows == 0 {
-        push_pipeline_budget_diagnostic(diagnostics, &state.budget);
-        return PlanExecution {
-            rows: Vec::new(),
-            truncated: true,
-            cancelled: false,
-            pipeline_halted: false,
-        };
-    }
+    let Some(desired_rows) =
+        super::seeds::desired_seed_rows(terminal_cap, state, limits, diagnostics)
+    else {
+        return super::seeds::empty_truncated_seed_execution();
+    };
 
     let files = match configuration_seed_files(state, &seed.filter.formats, &seed.where_globs) {
         Ok(files) => files,
         Err(error) => {
             diagnostics.push(CodeQueryDiagnostic {
+                source: None,
                 code: CodeQueryDiagnosticCode::PathDerivationIncomplete,
                 impact: CodeQueryDiagnosticImpact::Incomplete,
                 branch: Vec::new(),
                 language: "workspace",
                 message: format!("configuration seed could not list workspace files: {error}"),
                 exhausted_roots: Vec::new(),
+                withheld_rows_path: None,
             });
             return PlanExecution {
                 rows: Vec::new(),
@@ -550,25 +688,32 @@ pub(super) fn execute_configuration_facts_seed(
             };
         }
     };
+    if files.is_empty() && !seed.where_globs.is_empty() {
+        diagnostics.push(CodeQueryDiagnostic {
+            source: None,
+            code: CodeQueryDiagnosticCode::PathDerivationIncomplete,
+            impact: CodeQueryDiagnosticImpact::Incomplete,
+            branch: Vec::new(),
+            language: "workspace",
+            message: "configuration seed did not route to any workspace document for the requested path scope; absence is not provable".to_owned(),
+            exhausted_roots: Vec::new(),
+            withheld_rows_path: None,
+        });
+    }
 
     let mut rows: Vec<PipelineRow> = Vec::new();
     let mut indexes: HashMap<PipelineKey, usize> = HashMap::default();
     let mut truncated = false;
+    let mut visited_rows = 0;
     for file in files {
-        if state
-            .cancellation
-            .is_some_and(CancellationToken::is_cancelled)
-        {
-            return cancelled_plan_execution();
+        match super::seeds::scan_seed_file(state, limits, diagnostics) {
+            super::seeds::SeedFileScanStatus::Scanned => {}
+            super::seeds::SeedFileScanStatus::BudgetExhausted => {
+                truncated = true;
+                break;
+            }
+            super::seeds::SeedFileScanStatus::Cancelled => return cancelled_plan_execution(),
         }
-        let mut projected = state.budget;
-        projected.scanned_files = projected.scanned_files.saturating_add(1);
-        if projected.scanned_files > limits.max_scanned_files {
-            push_budget_diagnostic(diagnostics, &projected);
-            truncated = true;
-            break;
-        }
-        state.budget.scanned_files = projected.scanned_files;
 
         let Some(snapshot) = state.configuration_cache.document_for(
             state.analyzer,
@@ -598,6 +743,26 @@ pub(super) fn execute_configuration_facts_seed(
         }
         state.budget.fact_nodes = projected.fact_nodes;
 
+        if has_xml_relation_filter(&seed.filter) {
+            let document_value = ConfigurationFactValue {
+                file: file.clone(),
+                document: Arc::clone(&document),
+                source: Arc::clone(&source),
+                index: 0,
+            };
+            if let Some(reason) = xml_reference_coverage(&document_value, &seed.filter) {
+                state.configuration_cache.report_file_incomplete(
+                    &file,
+                    CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                    format!(
+                        "XML configuration relation for {} is incomplete: {reason}",
+                        rel_path_string(&file)
+                    ),
+                    diagnostics,
+                );
+            }
+        }
+
         for (index, _) in document.facts().iter().enumerate() {
             let value = ConfigurationFactValue {
                 file: file.clone(),
@@ -608,9 +773,17 @@ pub(super) fn execute_configuration_facts_seed(
             if !fact_matches_filter(&value, &seed.filter) {
                 continue;
             }
-            if rows.len() >= desired_rows {
+            if !super::seeds::record_seed_row(
+                &mut rows,
+                &mut indexes,
+                &mut visited_rows,
+                state,
+                desired_rows,
+                || Some(PipelineValue::ConfigurationFact(value)),
+            ) {
                 truncated = true;
                 diagnostics.push(CodeQueryDiagnostic {
+                    source: None,
                     code: CodeQueryDiagnosticCode::EnvironmentRowBudgetExhausted,
                     impact: CodeQueryDiagnosticImpact::Incomplete,
                     branch: Vec::new(),
@@ -619,17 +792,10 @@ pub(super) fn execute_configuration_facts_seed(
                         "configuration fact seed reached its {desired_rows}-row cap; narrow the filter, formats, or where globs"
                     ),
                     exhausted_roots: Vec::new(),
+                    withheld_rows_path: None,
                 });
                 break;
             }
-            state.budget.pipeline_rows = state.budget.pipeline_rows.saturating_add(1);
-            insert_pipeline_row(
-                &mut rows,
-                &mut indexes,
-                PipelineValue::ConfigurationFact(value),
-                Vec::new(),
-                false,
-            );
         }
         if truncated {
             break;

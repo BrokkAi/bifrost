@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 
-import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { required, toCamelCase } from "./cli-argument-helpers.mjs";
+import { parseCamelCaseArgs, required } from "./cli-argument-helpers.mjs";
+import { sha256Hex } from "../lib/sha256.mjs";
 
 const EXPORTED_FILES = [
   "plugins/bifrost-agent/bifrost-release.json",
@@ -60,20 +60,12 @@ fs.writeFileSync(
 );
 
 function sha256(contents) {
-  return createHash("sha256").update(contents).digest("hex");
+  return sha256Hex(contents);
 }
 
 function parseArgs(args) {
-  const parsed = {};
-  for (let index = 0; index < args.length; index += 2) {
-    const key = args[index];
-    const value = args[index + 1];
-    if (!key?.startsWith("--") || value === undefined) {
-      throw new Error(
-        "Usage: export-release-metadata.mjs --tag <vX.Y.Z> --version <X.Y.Z> --public-commit <sha> --output-dir <dir> [--source-root <dir>]",
-      );
-    }
-    parsed[toCamelCase(key.slice(2))] = value;
-  }
-  return parsed;
+  return parseCamelCaseArgs(
+    args,
+    "Usage: export-release-metadata.mjs --tag <vX.Y.Z> --version <X.Y.Z> --public-commit <sha> --output-dir <dir> [--source-root <dir>]",
+  );
 }

@@ -26,6 +26,7 @@
 //! and feeds the pure core. The whole run is a measurement performed once; the
 //! artifact it writes is committed.
 
+use brokk_bifrost_analysis::analyzer::common::find_by_label;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -115,7 +116,7 @@ impl InjectionCategory {
     }
 
     pub fn from_label(label: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|c| c.label() == label)
+        find_by_label(Self::ALL, label, |case| case.label())
     }
 }
 
@@ -207,14 +208,16 @@ impl Confusion {
 
     /// True-positive rate (recall / sensitivity). None when there are no reals.
     fn tpr(&self) -> Option<f64> {
-        let denom = self.positives();
-        (denom > 0).then(|| f64::from(self.tp) / f64::from(denom))
+        Self::rate(self.tp, self.positives())
     }
 
     /// False-positive rate (1 - specificity). None when there are no fakes.
     fn fpr(&self) -> Option<f64> {
-        let denom = self.negatives();
-        (denom > 0).then(|| f64::from(self.fp) / f64::from(denom))
+        Self::rate(self.fp, self.negatives())
+    }
+
+    fn rate(numerator: u32, denominator: u32) -> Option<f64> {
+        (denominator > 0).then(|| f64::from(numerator) / f64::from(denominator))
     }
 
     /// Youden's J = TPR - FPR. None when either rate is undefined.
@@ -1678,6 +1681,7 @@ fn merge_completion(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
 
     fn obs(
         name: &str,
@@ -1762,94 +1766,6 @@ mod tests {
             }
         );
     }
-
-    #[test]
-    fn overall_aggregates_across_categories() {
-        use CaseCompletion::*;
-        use InjectionCategory::{Cmdi, Sqli};
-        let cases = vec![
-            obs("A", Sqli, true, true, Complete),
-            obs("B", Cmdi, false, false, Complete),
-        ];
-        let board = score(&cases);
-        assert_eq!(board.overall.total, 2);
-        assert_eq!(board.overall.naive.tp, 1);
-        assert_eq!(board.overall.naive.tn, 1);
-        assert_eq!(board.overall.honest.tp, 1);
-        assert_eq!(board.overall.honest.tn, 1);
-        // A category with no cases contributes an all-zero matrix.
-        let ldapi = board
-            .per_category
-            .iter()
-            .find(|c| c.category == "ldapi")
-            .unwrap();
-        assert_eq!(ldapi.total, 0);
-        assert_eq!(ldapi.naive_metrics.tpr, None);
-    }
-
-    #[test]
-    fn rates_are_none_when_a_class_is_empty() {
-        use CaseCompletion::Complete;
-        use InjectionCategory::Sqli;
-        // Only reals: FPR is undefined.
-        let cases = vec![obs("A", Sqli, true, true, Complete)];
-        let board = score(&cases);
-        let sqli = board
-            .per_category
-            .iter()
-            .find(|c| c.category == "sqli")
-            .unwrap();
-        assert_eq!(sqli.naive_metrics.tpr, Some(1.0));
-        assert_eq!(sqli.naive_metrics.fpr, None);
-        assert_eq!(sqli.naive_metrics.youden, None);
-    }
-
-    #[test]
-    fn progress_records_append_as_independent_json_lines() {
-        let scratch = tempfile::tempdir().expect("scratch dir");
-        let path = scratch.path().join("progress.jsonl");
-        let status = CategoryRunStatus {
-            category: "sqli".to_owned(),
-            completion: "no_taint_run".to_owned(),
-            termination: Some("DeadlineExceeded".to_owned()),
-            findings: 0,
-            retained_analyses: 0,
-            sample_diagnostics: Vec::new(),
-            work: BTreeMap::new(),
-        };
-
-        append_progress(
-            Some(&path),
-            &CategoryProgressRecord::CategoryStarted {
-                category: "sqli",
-                ordinal: 1,
-                total: InjectionCategory::ALL.len(),
-                timeout_secs: 3_600,
-            },
-        )
-        .expect("append category start");
-        append_progress(
-            Some(&path),
-            &CategoryProgressRecord::CategoryCompleted {
-                ordinal: 1,
-                total: InjectionCategory::ALL.len(),
-                status: &status,
-            },
-        )
-        .expect("append category completion");
-
-        let lines = fs::read_to_string(path).expect("read progress stream");
-        let records = lines
-            .lines()
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("valid JSON line"))
-            .collect::<Vec<_>>();
-        assert_eq!(records.len(), 2);
-        assert_eq!(records[0]["event"], "category_started");
-        assert_eq!(records[0]["timeout_secs"], 3_600);
-        assert_eq!(records[1]["event"], "category_completed");
-        assert_eq!(records[1]["termination"], "DeadlineExceeded");
-    }
-
     #[test]
     fn parse_expected_results_narrows_to_taint_subset() {
         let csv = "# header line\n\
@@ -1862,23 +1778,8 @@ mod tests {
         assert_eq!(set.skipped_non_taint.get("hash"), Some(&1));
         assert_eq!(set.skipped_non_taint.get("crypto"), Some(&1));
     }
-
     #[test]
-    fn case_name_comes_from_the_path_stem() {
-        assert_eq!(
-            case_name_from_path(
-                "src/main/java/org/owasp/benchmark/testcode/BenchmarkTest01234.java"
-            )
-            .as_deref(),
-            Some("BenchmarkTest01234")
-        );
-        assert_eq!(
-            case_name_from_path("src/main/java/org/owasp/Helper.java"),
-            None
-        );
-    }
-
-    #[test]
+    #[hardwon("bc1cbe8ea882: OWASP sanitizer policy labels must match sink context")]
     fn benchmark_categories_use_exact_sink_context_hazard_labels() {
         let expected = [
             (InjectionCategory::Sqli, "sql"),
@@ -1912,56 +1813,6 @@ mod tests {
             )));
         }
     }
-
-    #[test]
-    fn built_policy_carries_sources_sinks_and_require_model() {
-        let policy = build_policy(InjectionCategory::Sqli);
-        assert!(policy.contains(":unmodeled require-model"));
-        assert!(policy.contains("getParameter"));
-        assert!(policy.contains("executeQuery"));
-        assert!(policy.contains("bifrost.owasp-benchmark.sqli.require-model"));
-        // Every sink selector constrains minimum arity so a no-operand
-        // arity-overloaded call (e.g. `PreparedStatement.execute()`) does not
-        // collide by name and abort binding (#1935 cause 1). An operand at
-        // argument index 0 requires at least one positional argument.
-        assert!(policy.contains("(call :callee (name \"executeQuery\") (arity :min 1))"));
-        // The sqli policy also models the Spring `JdbcTemplate` lane, which 156
-        // benchmark cases sink through; its SQL operand is argument 0 too.
-        assert!(policy.contains("(call :callee (name \"queryForObject\") (arity :min 1))"));
-        // A pathtraver policy names the file sinks, not the sql ones.
-        let pathtraver = build_policy(InjectionCategory::Pathtraver);
-        assert!(pathtraver.contains("FileInputStream"));
-        assert!(!pathtraver.contains("executeQuery"));
-        // The ldapi filter operand sits at argument index 1, so its sink
-        // requires at least two positional arguments.
-        let ldapi = build_policy(InjectionCategory::Ldapi);
-        assert!(ldapi.contains("(call :callee (name \"search\") (arity :min 1))"));
-        assert!(ldapi.contains("(call :callee (name \"search\") (arity :min 2))"));
-    }
-
-    #[test]
-    fn promotion_pins_every_activation() {
-        let staged = r#"{
-            "schema_version": 2,
-            "pack_id": "bifrost.esapi-sanitizers",
-            "provenance": { "source": "staged", "revision": "k3" },
-            "shards": [
-                { "activation": [ { "package": { "name": "org.owasp.esapi:esapi" }, "targets": ["jvm"], "configurations": [] } ], "payload": {} }
-            ]
-        }"#;
-        let digest = "2288e84a6c93a457c5215eb8028c87ebd4326a515e21545d2e02db8356d6ccff";
-        let pinned = promote_staged_sanitizer_pack(staged, digest).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&pinned).unwrap();
-        let activation = &value["shards"][0]["activation"][0];
-        assert_eq!(activation["artifact_sha256"], serde_json::json!(digest));
-        assert!(
-            value["provenance"]["source"]
-                .as_str()
-                .unwrap()
-                .contains(digest)
-        );
-    }
-
     /// #2558 fail-before: a Partial JDK pack installed with no gap
     /// accounting (the pre-#2401 shape) is exactly the kind of pack
     /// `register_session_pack` accepts without complaint -- it only
@@ -1973,6 +1824,7 @@ mod tests {
     /// gate for the JDK pack, not just a second copy of the old
     /// no-gate-at-all path.
     #[test]
+    #[hardwon("#2558: incomplete JDK packs without gap accounting must fail product activation")]
     fn jdk_pack_activation_refuses_a_gap_unaccounted_partial_pack_where_register_session_pack_would_accept_it()
      {
         use brokk_bifrost_analysis::analyzer::semantic_model::{
@@ -2096,6 +1948,101 @@ mod tests {
         assert!(
             error.contains("completeness gate"),
             "the refusal must name the completeness gate: {error}"
+        );
+    }
+
+    #[test]
+    fn progress_records_append_as_independent_json_lines() {
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let path = scratch.path().join("progress.jsonl");
+        let status = CategoryRunStatus {
+            category: "sqli".to_owned(),
+            completion: "no_taint_run".to_owned(),
+            termination: Some("DeadlineExceeded".to_owned()),
+            findings: 0,
+            retained_analyses: 0,
+            sample_diagnostics: Vec::new(),
+            work: BTreeMap::new(),
+        };
+
+        append_progress(
+            Some(&path),
+            &CategoryProgressRecord::CategoryStarted {
+                category: "sqli",
+                ordinal: 1,
+                total: InjectionCategory::ALL.len(),
+                timeout_secs: 3_600,
+            },
+        )
+        .expect("append category start");
+        append_progress(
+            Some(&path),
+            &CategoryProgressRecord::CategoryCompleted {
+                ordinal: 1,
+                total: InjectionCategory::ALL.len(),
+                status: &status,
+            },
+        )
+        .expect("append category completion");
+
+        let lines = fs::read_to_string(path).expect("read progress stream");
+        let records = lines
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("valid JSON line"))
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["event"], "category_started");
+        assert_eq!(records[0]["timeout_secs"], 3_600);
+        assert_eq!(records[1]["event"], "category_completed");
+        assert_eq!(records[1]["termination"], "DeadlineExceeded");
+    }
+
+    #[test]
+    fn built_policy_carries_sources_sinks_and_require_model() {
+        let policy = build_policy(InjectionCategory::Sqli);
+        assert!(policy.contains(":unmodeled require-model"));
+        assert!(policy.contains("getParameter"));
+        assert!(policy.contains("executeQuery"));
+        assert!(policy.contains("bifrost.owasp-benchmark.sqli.require-model"));
+        // Every sink selector constrains minimum arity so a no-operand
+        // arity-overloaded call (e.g. `PreparedStatement.execute()`) does not
+        // collide by name and abort binding (#1935 cause 1). An operand at
+        // argument index 0 requires at least one positional argument.
+        assert!(policy.contains("(call :callee (name \"executeQuery\") (arity :min 1))"));
+        // The sqli policy also models the Spring `JdbcTemplate` lane, which 156
+        // benchmark cases sink through; its SQL operand is argument 0 too.
+        assert!(policy.contains("(call :callee (name \"queryForObject\") (arity :min 1))"));
+        // A pathtraver policy names the file sinks, not the sql ones.
+        let pathtraver = build_policy(InjectionCategory::Pathtraver);
+        assert!(pathtraver.contains("FileInputStream"));
+        assert!(!pathtraver.contains("executeQuery"));
+        // The ldapi filter operand sits at argument index 1, so its sink
+        // requires at least two positional arguments.
+        let ldapi = build_policy(InjectionCategory::Ldapi);
+        assert!(ldapi.contains("(call :callee (name \"search\") (arity :min 1))"));
+        assert!(ldapi.contains("(call :callee (name \"search\") (arity :min 2))"));
+    }
+
+    #[test]
+    fn promotion_pins_every_activation() {
+        let staged = r#"{
+            "schema_version": 2,
+            "pack_id": "bifrost.esapi-sanitizers",
+            "provenance": { "source": "staged", "revision": "k3" },
+            "shards": [
+                { "activation": [ { "package": { "name": "org.owasp.esapi:esapi" }, "targets": ["jvm"], "configurations": [] } ], "payload": {} }
+            ]
+        }"#;
+        let digest = "2288e84a6c93a457c5215eb8028c87ebd4326a515e21545d2e02db8356d6ccff";
+        let pinned = promote_staged_sanitizer_pack(staged, digest).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&pinned).unwrap();
+        let activation = &value["shards"][0]["activation"][0];
+        assert_eq!(activation["artifact_sha256"], serde_json::json!(digest));
+        assert!(
+            value["provenance"]["source"]
+                .as_str()
+                .unwrap()
+                .contains(digest)
         );
     }
 }

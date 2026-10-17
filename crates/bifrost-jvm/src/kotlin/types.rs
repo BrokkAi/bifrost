@@ -191,11 +191,7 @@ fn resolve_kotlin_head_segment(
 }
 
 fn qualify(package_name: &str, name: &str) -> String {
-    if package_name.is_empty() {
-        name.to_string()
-    } else {
-        format!("{package_name}.{name}")
-    }
+    brokk_bifrost_core::analyzer::common::qualify_dotted_name(package_name, name)
 }
 
 /// A resolved Kotlin type: either a declaration in the workspace or a type
@@ -464,12 +460,12 @@ pub(crate) fn kotlin_scope_owners_for_with<S: KotlinSource + ?Sized>(
     realm: Option<&JvmSourceRealm<'_>>,
     type_by_fqn: &mut dyn FnMut(&str) -> Option<CodeUnit>,
 ) -> Vec<String> {
-    let mut owners = Vec::new();
-    let mut current = Some(owner.clone());
-    while let Some(unit) = current {
-        owners.push(unit.fq_name());
-        current = CodeUnitIndex::parent_of(source, &unit);
-    }
+    let mut owners = kotlin_lexical_owner_chain(Some(owner.clone()), |unit| {
+        CodeUnitIndex::parent_of(source, unit)
+    })
+    .into_iter()
+    .map(|unit| unit.fq_name())
+    .collect::<Vec<_>>();
 
     // Inherited nested types: a class can name a type its superclass declares.
     // Resolving a Kotlin supertype here uses the lexical scope only, and a
@@ -494,6 +490,19 @@ pub(crate) fn kotlin_scope_owners_for_with<S: KotlinSource + ?Sized>(
             break;
         }
         frontier = next;
+    }
+    owners
+}
+
+/// Collect a Kotlin declaration's lexical owner chain, innermost first.
+pub fn kotlin_lexical_owner_chain(
+    mut current: Option<CodeUnit>,
+    mut parent_of: impl FnMut(&CodeUnit) -> Option<CodeUnit>,
+) -> Vec<CodeUnit> {
+    let mut owners = Vec::new();
+    while let Some(unit) = current {
+        current = parent_of(&unit);
+        owners.push(unit);
     }
     owners
 }
@@ -526,12 +535,12 @@ pub fn kotlin_lexical_direct_ancestor_fqns<S: KotlinSource + ?Sized>(
             .peer_direct_ancestor_fqns(&owner, Language::Kotlin)
             .expect("a type the JVM realm returned is owned by one of its members");
     }
-    let mut lexical_owners = Vec::new();
-    let mut current = Some(owner.clone());
-    while let Some(unit) = current {
-        lexical_owners.push(unit.fq_name());
-        current = CodeUnitIndex::parent_of(source, &unit);
-    }
+    let lexical_owners = kotlin_lexical_owner_chain(Some(owner.clone()), |unit| {
+        CodeUnitIndex::parent_of(source, unit)
+    })
+    .into_iter()
+    .map(|unit| unit.fq_name())
+    .collect::<Vec<_>>();
     let imports = source.import_info_of(token, owner.source());
     let scope = KotlinNameScope {
         package_name: owner.package_name(),

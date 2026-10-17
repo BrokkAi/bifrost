@@ -197,6 +197,7 @@ mod tests {
     use crate::analyzer::ProjectFile;
     use crate::analyzer::model::CodeUnitType;
     use crate::analyzer::usages::model::UsageHit;
+    use brokk_bifrost_test_macros::hardwon;
 
     fn unit(name: &str) -> CodeUnit {
         CodeUnit::new(
@@ -220,6 +221,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2087: eager Rust usage scans exceeded the requested callsite budget")]
     fn candidate_union_stops_at_deduplicated_external_cap() {
         let candidates = [unit("a"), unit("b"), unit("must_not_scan")];
         let enclosing = unit("caller");
@@ -248,6 +250,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2087: duplicate Rust usage hits incorrectly consumed the distinct-callsite budget")]
     fn duplicate_candidate_hits_do_not_trip_the_cap() {
         let candidates = [unit("a"), unit("b")];
         let enclosing = unit("caller");

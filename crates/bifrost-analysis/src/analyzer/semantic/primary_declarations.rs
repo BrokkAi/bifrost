@@ -135,32 +135,6 @@ mod tests {
     }
 
     #[test]
-    fn insufficient_primary_budget_never_invokes_the_producer() {
-        let (file, prepared, budget) = prepared();
-        let mut limits = budget.limits();
-        limits.nested_entries = 1;
-        let mut budget = SemanticBudget::new(limits).expect("limits");
-        budget
-            .charge(SemanticWork {
-                source_bytes: prepared.source().len(),
-                ..SemanticWork::default()
-            })
-            .unwrap();
-        let lowerer = CountingLowerer(AtomicUsize::new(0));
-        let result = lower_with_primary_declarations(
-            &lowerer,
-            &file,
-            &prepared,
-            &budget,
-            &CancellationToken::new(),
-            || panic!("producer must not run before admission"),
-        )
-        .unwrap();
-        assert!(matches!(result, SemanticOutcome::ExceededBudget { .. }));
-        assert_eq!(lowerer.0.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
     fn cancellation_after_synchronous_primary_construction_prevents_lowering() {
         let (file, prepared, budget) = prepared();
         let cancellation = CancellationToken::new();
@@ -183,6 +157,32 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(result, SemanticOutcome::Cancelled { .. }));
+        assert_eq!(lowerer.0.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn insufficient_primary_budget_never_invokes_the_producer() {
+        let (file, prepared, budget) = prepared();
+        let mut limits = budget.limits();
+        limits.nested_entries = 1;
+        let mut budget = SemanticBudget::new(limits).expect("limits");
+        budget
+            .charge(SemanticWork {
+                source_bytes: prepared.source().len(),
+                ..SemanticWork::default()
+            })
+            .unwrap();
+        let lowerer = CountingLowerer(AtomicUsize::new(0));
+        let result = lower_with_primary_declarations(
+            &lowerer,
+            &file,
+            &prepared,
+            &budget,
+            &CancellationToken::new(),
+            || panic!("producer must not run before admission"),
+        )
+        .unwrap();
+        assert!(matches!(result, SemanticOutcome::ExceededBudget { .. }));
         assert_eq!(lowerer.0.load(Ordering::Relaxed), 0);
     }
 

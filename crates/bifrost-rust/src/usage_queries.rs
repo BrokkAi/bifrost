@@ -1,14 +1,11 @@
 //! Query-time composition over the persisted per-file Rust usage facts.
 //!
-//! This is the read side of the tables Milestone 1 of
-//! `.agents/plans/rust-usage-index-v2.md` added. Where Rust usage analysis
-//! used to answer a question from seventeen workspace-wide maps built
-//! wholesale into heap, `RustUsageQueries` answers it from rows: the file's own
+//! This is the read side of the persisted Rust usage tables. `RustUsageQueries`
+//! answers from rows: the file's own
 //! facts for a per-file question, and one indexed lookup plus per-candidate
 //! verification for a name question.
 //!
-//! Two contracts govern everything here, both taken from IntelliJ (see
-//! `.agents/docs/intellij-indexing-research-2026-08.md`):
+//! Two contracts govern everything here:
 //!
 //! An inverted lookup returns CANDIDATES, never answers. "This file mentions
 //! the name `foo`" is all `rust_identifier_occurrences` claims; deciding

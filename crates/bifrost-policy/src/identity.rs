@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use super::canonical_loaded;
 use super::definition::{
     CategoryPredicate, DirectoryScope, EndpointRole, MatchSetManifestHash, PolicyDefinition,
-    Sha256ValueError, TaintCatalogHash,
+    Sha256ValueError, TaintCatalogHash, parse_lower_sha256,
 };
 use super::resolved::{
     EndpointDefinitionSchemaResolution, LoadedModelError, PolicyPrecedenceManifest,
@@ -17,6 +17,7 @@ use super::resolved::{
     ResolvedEndpointManifestEntry, ResolvedEndpointModel, ResolvedMatchDirectoryManifest,
     ResolvedPolicySelector, ResolvedTaintPolicySpec, ResolvedTypestatePolicySpec,
 };
+pub(crate) use brokk_bifrost_analysis::analyzer::canonical_hash::write_lower_hex;
 
 const POLICY_SOURCE_DOMAIN: &[u8] = b"bifrost-policy-source/v1";
 const SELECTOR_SEMANTIC_DOMAIN: &[u8] = b"bifrost-policy-selector/v1";
@@ -110,10 +111,7 @@ impl PolicySemanticHash {
 
 impl fmt::Display for PolicySemanticHash {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for byte in self.0 {
-            write!(formatter, "{byte:02x}")?;
-        }
-        Ok(())
+        brokk_bifrost_analysis::analyzer::canonical_hash::write_lower_hex(&self.0, formatter)
     }
 }
 
@@ -282,47 +280,19 @@ fn hash_canonical_value(domain: &[u8], value: &Value) -> [u8; 32] {
     hash_fields(domain, [bytes.as_slice()])
 }
 
-fn update_length_prefixed(hasher: &mut Sha256, value: &[u8]) {
-    let length = u64::try_from(value.len()).expect("usize fits in u64 on supported targets");
-    hasher.update(length.to_be_bytes());
-    hasher.update(value);
-}
-
-fn parse_lower_sha256(value: &str) -> Result<[u8; 32], Sha256ValueError> {
-    if value.len() != 64 {
-        return Err(Sha256ValueError::InvalidLength);
-    }
-    let bytes = value.as_bytes();
-    let mut digest = [0_u8; 32];
-    let mut index = 0;
-    while index < bytes.len() {
-        digest[index / 2] = (lower_hex_nibble(bytes[index], index)? << 4)
-            | lower_hex_nibble(bytes[index + 1], index + 1)?;
-        index += 2;
-    }
-    Ok(digest)
-}
-
-fn lower_hex_nibble(byte: u8, index: usize) -> Result<u8, Sha256ValueError> {
-    match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        b'A'..=b'F' => Err(Sha256ValueError::Uppercase),
-        _ => Err(Sha256ValueError::InvalidCharacter { index }),
-    }
-}
+pub(crate) use brokk_bifrost_analysis::analyzer::canonical_hash::write_length_prefixed as update_length_prefixed;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::load_match_policy;
     use crate::{
         CategoryPredicate, EndpointDefinitionSchemaResolution, EndpointOrigin, EndpointRole,
-        LoadedEndpoint, LoadedPolicy, MatchEndpointDefinition, PolicyDependencyPath,
-        PolicyEndpointBinding, PolicyPrecedenceManifest, PolicySelector, PolicySelectorPath,
-        PolicySourceIdentity, ResolvedEndpointDependency, ResolvedEndpointIdentity,
-        ResolvedEndpointManifestEntry, ResolvedEndpointModel, ResolvedEndpointSelectorSchemas,
-        ResolvedMatchDirectoryManifest, ResolvedPolicySelector, RqlpDocument, SelectorOrigin,
-        parse_rqlp_source,
+        LoadedEndpoint, MatchEndpointDefinition, PolicyDependencyPath, PolicyEndpointBinding,
+        PolicyPrecedenceManifest, PolicySelector, PolicySelectorPath, PolicySourceIdentity,
+        ResolvedEndpointDependency, ResolvedEndpointIdentity, ResolvedEndpointManifestEntry,
+        ResolvedEndpointModel, ResolvedEndpointSelectorSchemas, ResolvedMatchDirectoryManifest,
+        ResolvedPolicySelector, RqlpDocument, SelectorOrigin, parse_rqlp_source,
     };
     use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
 
@@ -362,13 +332,6 @@ mod tests {
         let endpoint_set = EndpointSetSemanticHash::from_canonical_value(&value);
         let policy = hash_canonical_value(POLICY_SEMANTIC_DOMAIN, &value);
         assert_ne!(endpoint_set.as_bytes(), &policy);
-    }
-
-    #[test]
-    fn source_hash_covers_comments_and_layout() {
-        let compact = PolicySourceHash::from_source_bytes(b"(policy :id \"x\")");
-        let commented = PolicySourceHash::from_source_bytes(b"(policy\n  ; note\n  :id \"x\")");
-        assert_ne!(compact, commented);
     }
 
     #[test]
@@ -560,46 +523,6 @@ mod tests {
         );
     }
 
-    fn load_match_policy(source: &str) -> LoadedPolicy {
-        let identity = PolicySourceIdentity::new("policy.rqlp");
-        let parsed = parse_rqlp_source(source, identity.clone()).unwrap();
-        let schema_resolution = parsed.schema_resolution();
-        let RqlpDocument::Policy { definition } = parsed.into_document() else {
-            panic!("fixture must be a policy");
-        };
-        let definition = *definition;
-        let crate::PolicyAnalysis::Match { spec } = &definition.analysis else {
-            panic!("fixture must be a match policy");
-        };
-        let PolicySelector::Inline { schema, query, .. } = &spec.selector else {
-            panic!("fixture selector must be inline");
-        };
-        let selector = ResolvedPolicySelector::try_new(
-            PolicySelectorPath::new("/analysis/selector").unwrap(),
-            *schema,
-            query.clone(),
-            SelectorOrigin::Document {
-                source: identity.clone(),
-            },
-        )
-        .unwrap();
-        LoadedPolicy::try_new(
-            definition,
-            identity,
-            source.as_bytes(),
-            schema_resolution,
-            vec![selector],
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            PolicyPrecedenceManifest::default(),
-            None,
-            None,
-        )
-        .unwrap()
-    }
-
     fn load_endpoint(source: &str) -> LoadedEndpoint {
         let identity = PolicySourceIdentity::new("endpoint.rqlp");
         let parsed = parse_rqlp_source(source, identity.clone()).unwrap();
@@ -661,5 +584,12 @@ mod tests {
             }],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn source_hash_covers_comments_and_layout() {
+        let compact = PolicySourceHash::from_source_bytes(b"(policy :id \"x\")");
+        let commented = PolicySourceHash::from_source_bytes(b"(policy\n  ; note\n  :id \"x\")");
+        assert_ne!(compact, commented);
     }
 }

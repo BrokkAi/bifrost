@@ -2,7 +2,7 @@ use crate::imports::parse_ruby_load_syntax;
 use crate::local_bindings::PrimaryLocalBindings;
 use crate::mixins::{encode_mixin_relation, encode_superclass_relation, mixin_specs_for_call};
 use crate::structural::{RUBY_STRUCTURAL_SPEC, is_nested_scope_root, is_value_read_position};
-use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
+use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::model::{
     CodeUnitType, DispatchExtensibility, RubyMethodDispatchMode, SignatureMetadata,
 };
@@ -23,16 +23,12 @@ use brokk_bifrost_core::analyzer::structural::materialization::{
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 use brokk_bifrost_core::analyzer::structural::spec::{CompiledKinds, StructuralSpec};
 use brokk_bifrost_core::analyzer::tree_walk::{
-    ParentIndex, WalkControl, node_range, walk_named_tree_preorder,
+    ParentIndex, first_named_descendant_of_kind_inclusive, node_range,
 };
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
+use std::borrow::Cow;
 use tree_sitter::{Node, Parser, Tree};
-
-/// Intern one qualified-name segment in the process-global interner.
-fn ruby_segment(text: &str, kind: SegmentKind) -> SegmentId {
-    segment_interner().intern(text, kind)
-}
 
 /// Build the structured type/namespace chain for a sequence of Ruby class/
 /// module name segments (already atomic AST-derived strings — see
@@ -48,7 +44,7 @@ fn ruby_segment(text: &str, kind: SegmentKind) -> SegmentId {
 fn ruby_type_chain_fq(segments: &[String]) -> FqName {
     let mut fq = FqName::new();
     for segment in segments {
-        fq.push(ruby_segment(segment, SegmentKind::Nested));
+        fq.push(segment_interner().intern(segment, SegmentKind::Nested));
     }
     fq
 }
@@ -57,7 +53,8 @@ fn ruby_type_chain_fq(segments: &[String]) -> FqName {
 /// structured counterpart of [`member_short_name`], which appends `.name`
 /// after the `$`-joined chain.
 fn ruby_member_fq(type_segments: &[String], name: &str) -> FqName {
-    ruby_type_chain_fq(type_segments).with_pushed(ruby_segment(name, SegmentKind::Member))
+    ruby_type_chain_fq(type_segments)
+        .with_pushed(segment_interner().intern(name, SegmentKind::Member))
 }
 
 /// Parses Ruby source into a tree-sitter tree, or `None` if parsing fails.
@@ -70,9 +67,7 @@ pub fn parse_ruby_tree(source: &str) -> Option<Tree> {
 }
 
 /// Reads the source text backing a tree-sitter node.
-pub fn ruby_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    brokk_bifrost_core::analyzer::common::node_source_text(node, source)
-}
+pub use brokk_bifrost_core::analyzer::common::node_source_text as ruby_node_text;
 
 /// Walks a Ruby file and emits its declarations into `parsed`.
 ///
@@ -152,15 +147,13 @@ fn push_named_children<'tree>(
     parent: Option<&CodeUnit>,
     stack: &mut Vec<RubyWork<'tree>>,
 ) {
-    let mut cursor = node.walk();
-    let children: Vec<_> = node.named_children(&mut cursor).collect();
-    for child in children.into_iter().rev() {
-        stack.push(RubyWork {
-            node: child,
+    brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed_as(node, stack, |node| {
+        RubyWork {
+            node,
             segments: segments.to_vec(),
             parent: parent.cloned(),
-        });
-    }
+        }
+    });
 }
 
 impl RubyVisitor<'_> {
@@ -469,7 +462,7 @@ impl RubyVisitor<'_> {
             source_bytes: self.source.len(),
             occurrences,
             structural: structural
-                .finish()
+                .finish(root)
                 .expect("Ruby structural collection must finish"),
             native_site_occurrences: Vec::new(),
             native_declaration_sources: Vec::new(),
@@ -490,9 +483,7 @@ impl RubyVisitor<'_> {
         name: Option<Node<'_>>,
         unit: CodeUnit,
     ) -> SourceDeclarationId {
-        let occurrence = self.source_facts.intern_node(node);
-        let name = name.map(|name| self.source_facts.intern_node(name));
-        let declaration = self.source_facts.declare(occurrence, name);
+        let declaration = self.source_facts.declare_node(node, name);
         self.parsed
             .source_declaration_units
             .push((declaration, unit));
@@ -680,13 +671,7 @@ impl RubyVisitor<'_> {
             short_name,
             assignment_constant_fq(segments, &name_path),
         );
-        self.parsed
-            .replace_code_unit(code_unit.clone(), node, self.source, parent.cloned(), None);
-        self.record_declaration(node, Some(left), code_unit.clone());
-        self.parsed.add_signature(
-            code_unit,
-            ruby_node_text(node, self.source).trim().to_string(),
-        );
+        self.record_assignment_declaration(node, left, code_unit, parent);
     }
 
     fn visit_variable_field_assignment(
@@ -716,6 +701,16 @@ impl RubyVisitor<'_> {
         {
             return;
         }
+        self.record_assignment_declaration(node, left, code_unit, parent);
+    }
+
+    fn record_assignment_declaration(
+        &mut self,
+        node: Node<'_>,
+        left: Node<'_>,
+        code_unit: CodeUnit,
+        parent: Option<&CodeUnit>,
+    ) {
         self.parsed
             .replace_code_unit(code_unit.clone(), node, self.source, parent.cloned(), None);
         self.record_declaration(node, Some(left), code_unit.clone());
@@ -985,9 +980,9 @@ fn ruby_field_fq(
 fn ruby_scoped_field_fq(segments: &[String], name: &str, singleton: bool) -> FqName {
     let mut fq = ruby_type_chain_fq(segments);
     if singleton {
-        fq.push(ruby_segment("$singleton", SegmentKind::Package));
+        fq.push(segment_interner().intern("$singleton", SegmentKind::Package));
     }
-    fq.push(ruby_segment(name, SegmentKind::Member));
+    fq.push(segment_interner().intern(name, SegmentKind::Member));
     fq
 }
 
@@ -1053,43 +1048,40 @@ fn module_function_names<'a>(node: Node<'_>, source: &'a str) -> impl Iterator<I
 }
 
 fn assignment_constant_short_name(lexical_segments: &[String], name_path: &RubyNamePath) -> String {
-    let Some((name, owner_segments)) = name_path.segments.split_last() else {
+    let Some((name, owner_segments)) = assignment_constant_owner(lexical_segments, name_path)
+    else {
         return String::new();
     };
-    if owner_segments.is_empty() {
-        return member_short_name(lexical_segments, name);
-    }
-    if name_path.absolute || owner_segments.len() > 1 || lexical_segments.is_empty() {
-        return member_short_name(owner_segments, name);
-    }
-
-    let mut resolved_owner = Vec::new();
-    resolved_owner.extend_from_slice(lexical_segments);
-    resolved_owner.extend_from_slice(owner_segments);
-    member_short_name(&resolved_owner, name)
+    member_short_name(owner_segments.as_ref(), name)
 }
 
-/// The structured counterpart of [`assignment_constant_short_name`] — mirrors
-/// its branches exactly, building an [`FqName`] from the same owner segments
-/// instead of a `$`-joined string. The owner segments come from the constant
-/// reference's own AST-derived name path (`extract_name_path`), which may name
-/// a different (re-opened) namespace than the lexically enclosing one, so this
-/// builds a fresh chain rather than extending a `parent` `CodeUnit`'s `fq`.
+/// The structured counterpart of [`assignment_constant_short_name`]. The owner
+/// comes from the constant reference's own AST-derived name path, which may
+/// name a different (re-opened) namespace than the lexical parent.
 fn assignment_constant_fq(lexical_segments: &[String], name_path: &RubyNamePath) -> FqName {
-    let Some((name, owner_segments)) = name_path.segments.split_last() else {
+    let Some((name, owner_segments)) = assignment_constant_owner(lexical_segments, name_path)
+    else {
         return FqName::new();
     };
-    if owner_segments.is_empty() {
-        return ruby_member_fq(lexical_segments, name);
-    }
-    if name_path.absolute || owner_segments.len() > 1 || lexical_segments.is_empty() {
-        return ruby_member_fq(owner_segments, name);
-    }
+    ruby_member_fq(owner_segments.as_ref(), name)
+}
 
-    let mut resolved_owner = Vec::new();
-    resolved_owner.extend_from_slice(lexical_segments);
-    resolved_owner.extend_from_slice(owner_segments);
-    ruby_member_fq(&resolved_owner, name)
+fn assignment_constant_owner<'a>(
+    lexical_segments: &'a [String],
+    name_path: &'a RubyNamePath,
+) -> Option<(&'a str, Cow<'a, [String]>)> {
+    let (name, owner_segments) = name_path.segments.split_last()?;
+    let resolved_owner = if owner_segments.is_empty() {
+        Cow::Borrowed(lexical_segments)
+    } else if name_path.absolute || owner_segments.len() > 1 || lexical_segments.is_empty() {
+        Cow::Borrowed(owner_segments)
+    } else {
+        let mut resolved = Vec::with_capacity(lexical_segments.len() + owner_segments.len());
+        resolved.extend_from_slice(lexical_segments);
+        resolved.extend_from_slice(owner_segments);
+        Cow::Owned(resolved)
+    };
+    Some((name, resolved_owner))
 }
 
 pub struct RubyNamePath {
@@ -1225,24 +1217,9 @@ fn ruby_parameter_label_node(node: Node<'_>) -> Option<Node<'_>> {
         | "hash_splat_parameter"
         | "block_parameter" => node
             .child_by_field_name("name")
-            .or_else(|| first_identifier_descendant(node)),
+            .or_else(|| first_named_descendant_of_kind_inclusive(node, "identifier")),
         _ => None,
     }
-}
-
-fn first_identifier_descendant(node: Node<'_>) -> Option<Node<'_>> {
-    let mut stack = vec![node];
-    while let Some(current) = stack.pop() {
-        if current.kind() == "identifier" {
-            return Some(current);
-        }
-        for index in (0..current.named_child_count()).rev() {
-            if let Some(child) = current.named_child(index) {
-                stack.push(child);
-            }
-        }
-    }
-    None
 }
 
 /// Container node kinds the visitor recurses through to find conditionally
@@ -1275,21 +1252,19 @@ pub fn is_descendable_container(kind: &str) -> bool {
     )
 }
 pub fn collect_ruby_identifiers(node: Node<'_>, source: &str, identifiers: &mut HashSet<String>) {
-    walk_named_tree_preorder(node, true, |node| {
-        if matches!(node.kind(), "identifier" | "constant") {
-            let text = ruby_node_text(node, source).trim();
-            if !text.is_empty() {
-                identifiers.insert(text.to_string());
-            }
-        }
-        WalkControl::Continue
-    });
+    brokk_bifrost_core::analyzer::tree_walk::collect_trimmed_node_texts(
+        node,
+        source,
+        identifiers,
+        |node| matches!(node.kind(), "identifier" | "constant"),
+    );
 }
 
 #[cfg(test)]
 mod callable_modifier_tests {
     use super::*;
     use crate::adapter::parse_ruby_file;
+    use brokk_bifrost_test_macros::hardwon;
 
     /// The Ruby half of #2912. `def self.name` and a `def` inside
     /// `class << self` bind no instance receiver; an ordinary `def` in a class
@@ -1297,6 +1272,7 @@ mod callable_modifier_tests {
     /// is an instance method of `Object` and is not static either. Every `def`
     /// states that the walk read its declaration shape.
     #[test]
+    #[hardwon("#2912: Ruby callable receiver metadata was missing, preventing procedure keys")]
     fn callable_metadata_records_ruby_singleton_structurally() {
         let source = "def top_level(value)\n  value\nend\n\nclass Widget\n  def initialize(spec)\n    @spec = spec\n  end\n\n  def self.build(spec)\n    new(spec)\n  end\n\n  def render(target)\n    target\n  end\n\n  class << self\n    def measure(target)\n      target\n    end\n  end\nend\n\nmodule Helpers\n  def helper\n  end\nend\n";
         let file = ProjectFile::new(std::env::temp_dir(), "widget.rb");

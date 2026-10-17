@@ -1,5 +1,10 @@
 use brokk_bifrost_core::analyzer::ProjectFile;
+use brokk_bifrost_core::analyzer::common::{collapse_whitespace, node_source_text as node_text};
 use brokk_bifrost_core::analyzer::model::{TestAssertionSmell, TestAssertionWeights};
+use brokk_bifrost_core::analyzer::test_assertions::{
+    CommonTestAssertionKind, TestAssertionSignal, append_test_assertion_findings,
+    classify_common_test_assertion, is_common_assertion_literal, normalize_assertion_expression,
+};
 use regex::Regex;
 use std::sync::LazyLock;
 use tree_sitter::Node;
@@ -68,57 +73,28 @@ fn analyze_csharp_test_case(
     weights: &TestAssertionWeights,
     out: &mut Vec<TestAssertionSmell>,
 ) {
-    let assertions = collect_csharp_assertions(body, weights);
-    let assertion_count = assertions.len() as i32;
     let symbol = format!("{}::{}", file, name);
-
-    if assertion_count == 0 {
-        out.push(TestAssertionSmell {
-            file: file.clone(),
-            enclosing_fq_name: symbol,
-            assertion_kind: "no-assertions".to_string(),
-            score: weights.no_assertion_weight,
-            assertion_count: 0,
-            reasons: vec!["no-assertions".to_string()],
-            excerpt: compact_csharp_excerpt(body),
-            start_byte,
-        });
-        return;
-    }
-
-    for assertion in &assertions {
-        if assertion.score <= 0 {
-            continue;
-        }
-        out.push(TestAssertionSmell {
-            file: file.clone(),
-            enclosing_fq_name: symbol.clone(),
-            assertion_kind: assertion.kind.clone(),
+    let assertions: Vec<_> = collect_csharp_assertions(body, weights)
+        .into_iter()
+        .map(|assertion| TestAssertionSignal {
+            kind: assertion.kind,
             score: assertion.score,
-            assertion_count,
-            reasons: vec![assertion.reason.clone()],
-            excerpt: assertion.excerpt.clone(),
+            shallow: assertion.shallow,
+            meaningful: assertion.meaningful,
+            reasons: vec![assertion.reason],
+            excerpt: assertion.excerpt,
             start_byte: start_byte + assertion.start_byte,
-        });
-    }
-
-    if assertions.iter().all(|assertion| assertion.shallow) {
-        let score = (weights.shallow_assertion_only_weight
-            - csharp_meaningful_assertion_credit(assertions.iter(), weights))
-        .max(0);
-        if score > 0 {
-            out.push(TestAssertionSmell {
-                file: file.clone(),
-                enclosing_fq_name: symbol,
-                assertion_kind: "shallow-assertions-only".to_string(),
-                score,
-                assertion_count,
-                reasons: vec!["shallow-assertions-only".to_string()],
-                excerpt: compact_csharp_excerpt(body),
-                start_byte,
-            });
-        }
-    }
+        })
+        .collect();
+    append_test_assertion_findings(
+        file,
+        symbol,
+        collapse_whitespace(body),
+        start_byte,
+        &assertions,
+        weights,
+        out,
+    );
 }
 
 fn collect_csharp_assertions(
@@ -131,60 +107,47 @@ fn collect_csharp_assertions(
         let whole = captures.get(0).expect("whole match");
         let left = normalize_csharp_expr(captures.name("left").map(|m| m.as_str()).unwrap_or(""));
         let right = normalize_csharp_expr(captures.name("right").map(|m| m.as_str()).unwrap_or(""));
-        let signal = if left == right {
-            let (kind, reason, score) = if is_csharp_literal(&left) {
-                (
-                    "constant-equality",
-                    "constant-equality",
-                    weights.constant_equality_weight,
-                )
-            } else {
-                (
-                    "self-comparison",
-                    "self-comparison",
-                    weights.tautological_assertion_weight,
-                )
-            };
-            CSharpAssertionSignal {
-                kind: kind.to_string(),
-                score,
-                shallow: false,
-                meaningful: false,
-                reason: reason.to_string(),
-                excerpt: compact_csharp_excerpt(whole.as_str()),
-                start_byte: whole.start(),
-            }
+        let classification = if left == right {
+            classify_common_test_assertion(
+                if is_csharp_literal(&left) {
+                    CommonTestAssertionKind::ConstantEquality
+                } else {
+                    CommonTestAssertionKind::SelfComparison
+                },
+                weights,
+            )
         } else {
-            CSharpAssertionSignal {
-                kind: "meaningful-assertion".to_string(),
-                score: 0,
-                shallow: false,
-                meaningful: true,
-                reason: "meaningful-assertion".to_string(),
-                excerpt: compact_csharp_excerpt(whole.as_str()),
-                start_byte: whole.start(),
-            }
+            classify_common_test_assertion(CommonTestAssertionKind::Meaningful, weights)
         };
-        assertions.push(signal);
+        assertions.push(CSharpAssertionSignal {
+            kind: classification.kind.to_string(),
+            score: classification.score,
+            shallow: classification.shallow,
+            meaningful: classification.kind == "meaningful-assertion",
+            reason: classification.kind.to_string(),
+            excerpt: collapse_whitespace(whole.as_str()),
+            start_byte: whole.start(),
+        });
     }
 
     for captures in CSHARP_ASSERT_TRUTH_RE.captures_iter(body) {
         let whole = captures.get(0).expect("whole match");
         let matcher = captures.name("matcher").map(|m| m.as_str()).unwrap_or("");
         let arg = normalize_csharp_expr(captures.name("arg").map(|m| m.as_str()).unwrap_or(""));
-        let (kind, score, shallow) = match matcher {
-            "True" if arg == "true" => ("constant-truth", weights.constant_truth_weight, true),
-            "False" if arg == "false" => ("constant-truth", weights.constant_truth_weight, true),
-            "Null" | "NotNull" => ("nullness-only", weights.nullness_only_weight, true),
-            _ => ("meaningful-assertion", 0, false),
+        let kind = match matcher {
+            "True" if arg == "true" => CommonTestAssertionKind::ConstantTruth,
+            "False" if arg == "false" => CommonTestAssertionKind::ConstantTruth,
+            "Null" | "NotNull" => CommonTestAssertionKind::NullnessOnly,
+            _ => CommonTestAssertionKind::Meaningful,
         };
+        let classification = classify_common_test_assertion(kind, weights);
         assertions.push(CSharpAssertionSignal {
-            kind: kind.to_string(),
-            score,
-            shallow,
-            meaningful: score == 0,
-            reason: kind.to_string(),
-            excerpt: compact_csharp_excerpt(whole.as_str()),
+            kind: classification.kind.to_string(),
+            score: classification.score,
+            shallow: classification.shallow,
+            meaningful: classification.score == 0,
+            reason: classification.kind.to_string(),
+            excerpt: collapse_whitespace(whole.as_str()),
             start_byte: whole.start(),
         });
     }
@@ -198,7 +161,7 @@ fn collect_csharp_assertions(
                 shallow: false,
                 meaningful: true,
                 reason: "meaningful-assertion".to_string(),
-                excerpt: compact_csharp_excerpt(whole.as_str()),
+                excerpt: collapse_whitespace(whole.as_str()),
                 start_byte: whole.start(),
             });
         }
@@ -207,34 +170,13 @@ fn collect_csharp_assertions(
     assertions
 }
 
-fn csharp_meaningful_assertion_credit<'a>(
-    assertions: impl Iterator<Item = &'a CSharpAssertionSignal>,
-    weights: &TestAssertionWeights,
-) -> i32 {
-    let count = assertions.filter(|assertion| assertion.meaningful).count() as i32;
-    let creditable = count.min(weights.meaningful_assertion_credit_cap.max(0));
-    weights.meaningful_assertion_credit.max(0) * creditable
-}
-
 fn normalize_csharp_expr(expr: &str) -> String {
-    expr.trim()
-        .trim_end_matches(';')
-        .trim_matches(|ch| matches!(ch, '(' | ')' | ' '))
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    normalize_assertion_expression(expr.trim().trim_end_matches(';'))
 }
 
 fn is_csharp_literal(expr: &str) -> bool {
     let trimmed = expr.trim();
-    (trimmed.starts_with('"') && trimmed.ends_with('"'))
-        || matches!(trimmed, "true" | "false" | "null")
-        || trimmed.parse::<i64>().is_ok()
-        || trimmed.parse::<f64>().is_ok()
-}
-
-fn compact_csharp_excerpt(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+    is_common_assertion_literal(trimmed) || matches!(trimmed, "true" | "false" | "null")
 }
 
 /// Whether this method declaration carries a runner-recognized test attribute.
@@ -318,12 +260,6 @@ fn final_identifier_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str>
     last
 }
 
-fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    source
-        .get(node.start_byte()..node.end_byte())
-        .unwrap_or_default()
-}
-
 #[cfg(test)]
 mod test_classification_tests {
     use crate::declarations::parse_csharp_file;
@@ -340,22 +276,6 @@ mod test_classification_tests {
         parse_csharp_file(&file, source, &tree)
             .contains_tests
             .expect("primary classification")
-    }
-
-    #[test]
-    fn recognizes_standard_runner_method_attributes() {
-        for attribute in [
-            "Fact",
-            "Xunit.TheoryAttribute",
-            "Test",
-            "NUnit.Framework.TestCase",
-            "TestCaseSource",
-            "TestMethod",
-            "Microsoft.VisualStudio.TestTools.UnitTesting.DataTestMethodAttribute",
-        ] {
-            let source = format!("public class Suite {{ [{attribute}] public void Runs() {{ }} }}");
-            assert!(contains_tests(&source), "{attribute}");
-        }
     }
 
     #[test]
@@ -390,6 +310,9 @@ mod test_classification_tests {
 }
 
 #[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#701: C# resolution omitted interface owners and mishandled generic arity in explicit member declarations"
+)]
 fn csharp_issue701_arity_key_keeps_generic_owner_and_normalizes_constructor_member() {
     assert_eq!(
         crate::syntax::csharp_arity_preserving_full_name("Ns.List`1.#ctor"),

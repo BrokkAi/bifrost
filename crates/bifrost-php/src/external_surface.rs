@@ -113,10 +113,9 @@ impl PhpExternalSurface for UnindexedPhpExternalSurface {
 
     fn discovery_incomplete_reasons(&self) -> Vec<SemanticDiagnosticIncompleteReason> {
         vec![
-            SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery {
-                boundary:
-                    brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus::ExternalUnknown,
-            },
+            SemanticDiagnosticIncompleteReason::missing_dependency_discovery(
+                brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus::ExternalUnknown,
+            ),
         ]
     }
 }

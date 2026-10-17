@@ -1,25 +1,73 @@
 use crate::scala::supertypes::scala_type_lookup_segments;
 use crate::scala::wildcard_imports::scala_package_prefixes_at;
 use brokk_bifrost_core::analyzer::CodeUnit;
+#[cfg(test)]
+use brokk_bifrost_core::analyzer::ProjectFile;
+pub use brokk_bifrost_core::analyzer::common::node_source_text as node_text;
 use brokk_bifrost_core::analyzer::model::{CallableArity, ImportInfo};
-use brokk_bifrost_core::analyzer::tree_walk::{ParentIndex, subtree_contains};
+use brokk_bifrost_core::analyzer::tree_walk::{
+    ParentIndex, first_named_child_matching, has_child_of_kind as has_direct_token,
+    subtree_contains,
+};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use tree_sitter::Node;
 #[cfg(test)]
 use tree_sitter::Parser;
 
-/// The builtin type a Scala literal node denotes.
-///
-/// Moved here from `scala_graph/resolver.rs` ahead of the rest of that file:
-/// it is a pure node-kind mapping and this module's `types.push(...)` walk is
-/// its only caller on this side of the seam.
-pub fn scala_literal_type_name(kind: &str) -> Option<&'static str> {
-    match kind {
-        "string" | "string_literal" | "interpolated_string_expression" => Some("String"),
-        "integer_literal" => Some("Int"),
-        "floating_point_literal" => Some("Double"),
+/// The builtin type a Scala literal node denotes, using its selected value
+/// where the spelling affects the type.
+pub fn scala_literal_type_name(source: &str, mut node: Node<'_>) -> Option<&'static str> {
+    loop {
+        match node.kind() {
+            "parenthesized_expression" => {
+                node = first_named_child_matching(node, |_| true)?;
+            }
+            "prefix_expression"
+                if node
+                    .child_by_field_name("operator")
+                    .and_then(|operator| source.get(operator.byte_range()))
+                    == Some("-")
+                    || has_direct_token(node, "-") =>
+            {
+                node = first_named_child_matching(node, |_| true)?;
+            }
+            _ => break,
+        }
+    }
+
+    match node.kind() {
+        "integer_literal" => {
+            let text = source.get(node.byte_range())?;
+            Some(
+                if text
+                    .as_bytes()
+                    .last()
+                    .is_some_and(|suffix| matches!(suffix, b'l' | b'L'))
+                {
+                    "Long"
+                } else {
+                    "Int"
+                },
+            )
+        }
+        "floating_point_literal" => {
+            let text = source.get(node.byte_range())?;
+            Some(
+                if text
+                    .as_bytes()
+                    .last()
+                    .is_some_and(|suffix| matches!(suffix, b'f' | b'F'))
+                {
+                    "Float"
+                } else {
+                    "Double"
+                },
+            )
+        }
         "boolean_literal" | "true" | "false" => Some("Boolean"),
         "character_literal" => Some("Char"),
+        "string" | "string_literal" | "interpolated_string_expression" => Some("String"),
+        "unit" => Some("Unit"),
         _ => None,
     }
 }
@@ -92,6 +140,69 @@ impl ScalaSourceFacts {
             }
         }
         projection
+    }
+
+    /// Estimate the heap retained by this projection for the owning byte-bounded
+    /// memo. The estimate includes container capacities and nested strings and
+    /// paths that are not covered by `size_of::<Self>()`.
+    pub fn estimated_retained_bytes(&self) -> usize {
+        let mut bytes = std::mem::size_of::<Self>();
+        bytes = bytes.saturating_add(
+            self.callable_alternatives_by_range
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(
+                    (usize, usize),
+                    ScalaCallableSourceAlternative,
+                )>()),
+        );
+        bytes = bytes.saturating_add(
+            self.callable_alternatives_by_range
+                .values()
+                .map(ScalaCallableSourceAlternative::estimated_retained_bytes)
+                .sum::<usize>(),
+        );
+        for (map, value_size) in [
+            (
+                &self.field_type_paths_by_range,
+                std::mem::size_of::<((usize, usize), Vec<String>)>(),
+            ),
+            (
+                &self.type_alias_paths_by_range,
+                std::mem::size_of::<((usize, usize), Vec<String>)>(),
+            ),
+        ] {
+            bytes = bytes.saturating_add(map.capacity().saturating_mul(value_size));
+            bytes = bytes.saturating_add(
+                map.values()
+                    .map(|path| {
+                        path.capacity()
+                            .saturating_mul(std::mem::size_of::<String>())
+                            .saturating_add(path.iter().map(String::capacity).sum::<usize>())
+                    })
+                    .sum::<usize>(),
+            );
+        }
+        for ranges in [
+            &self.stable_owner_ranges,
+            &self.enum_ranges,
+            &self.case_class_ranges,
+            &self.abstract_callable_ranges,
+        ] {
+            bytes = bytes.saturating_add(
+                ranges
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(usize, usize)>()),
+            );
+        }
+        bytes = bytes.saturating_add(self.generic_owner_facts_by_range.capacity().saturating_mul(
+            std::mem::size_of::<((usize, usize), ScalaGenericOwnerSourceFacts)>(),
+        ));
+        bytes.saturating_add(
+            self.generic_owner_facts_by_range
+                .values()
+                .map(ScalaGenericOwnerSourceFacts::estimated_retained_bytes)
+                .sum::<usize>(),
+        )
     }
 }
 
@@ -740,14 +851,14 @@ fn scala_type_expression_path(node: Node<'_>, source: &str) -> Option<ScalaTypeE
 /// -- and follows the pattern rule below.
 pub fn scala_definition_binder_names<'a>(node: Node<'_>, source: &'a str) -> Vec<&'a str> {
     if matches!(node.kind(), "identifier" | "operator_identifier") {
-        let name = node_text(node, source).trim();
-        return if name.is_empty() {
-            Vec::new()
-        } else {
-            vec![name]
-        };
+        return nonempty_node_text(node, source).into_iter().collect();
     }
     scala_pattern_binder_names(node, source)
+}
+
+fn nonempty_node_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
+    let text = node_text(node, source).trim();
+    (!text.is_empty()).then_some(text)
 }
 
 /// Return only the value binders introduced by a Scala pattern.
@@ -760,10 +871,7 @@ pub fn scala_definition_binder_names<'a>(node: Node<'_>, source: &'a str) -> Vec
 pub fn scala_pattern_binder_names<'a>(node: Node<'_>, source: &'a str) -> Vec<&'a str> {
     scala_pattern_binder_nodes(node, source)
         .into_iter()
-        .filter_map(|node| {
-            let name = node_text(node, source).trim();
-            (!name.is_empty()).then_some(name)
-        })
+        .filter_map(|node| nonempty_node_text(node, source))
         .collect()
 }
 
@@ -944,7 +1052,7 @@ fn enclosing_extension_receiver_type_path(node: Node<'_>, source: &str) -> Optio
     None
 }
 
-fn callable_arity_for_parameters(parameters: Node<'_>) -> CallableArity {
+pub(crate) fn callable_arity_for_parameters(parameters: Node<'_>) -> CallableArity {
     let mut total = 0usize;
     let mut required = 0usize;
     let mut repeated = false;
@@ -991,28 +1099,16 @@ fn callable_parameter_defaults(parameters: Node<'_>) -> Vec<bool> {
 }
 
 fn parameter_function_arities(parameters: Node<'_>) -> Vec<Option<usize>> {
-    let mut cursor = parameters.walk();
-    parameters
-        .named_children(&mut cursor)
-        .filter(|parameter| matches!(parameter.kind(), "parameter" | "class_parameter"))
-        .map(|parameter| {
-            parameter
-                .child_by_field_name("type")
-                .and_then(function_type_arity)
-        })
+    parameter_type_nodes(parameters)
+        .into_iter()
+        .map(|type_node| type_node.and_then(function_type_arity))
         .collect()
 }
 
 fn parameter_type_paths(parameters: Node<'_>, source: &str) -> Vec<Option<Vec<String>>> {
-    let mut cursor = parameters.walk();
-    parameters
-        .named_children(&mut cursor)
-        .filter(|parameter| matches!(parameter.kind(), "parameter" | "class_parameter"))
-        .map(|parameter| {
-            parameter
-                .child_by_field_name("type")
-                .and_then(|type_node| named_type_path(type_node, source))
-        })
+    parameter_type_nodes(parameters)
+        .into_iter()
+        .map(|type_node| type_node.and_then(|type_node| named_type_path(type_node, source)))
         .collect()
 }
 
@@ -1020,14 +1116,10 @@ fn parameter_type_expressions(
     parameters: Node<'_>,
     source: &str,
 ) -> Vec<Option<ScalaTypeExpressionPath>> {
-    let mut cursor = parameters.walk();
-    parameters
-        .named_children(&mut cursor)
-        .filter(|parameter| matches!(parameter.kind(), "parameter" | "class_parameter"))
-        .map(|parameter| {
-            parameter
-                .child_by_field_name("type")
-                .and_then(|type_node| scala_type_expression_path(type_node, source))
+    parameter_type_nodes(parameters)
+        .into_iter()
+        .map(|type_node| {
+            type_node.and_then(|type_node| scala_type_expression_path(type_node, source))
         })
         .collect()
 }
@@ -1036,15 +1128,20 @@ fn parameter_function_type_paths(
     parameters: Node<'_>,
     source: &str,
 ) -> Vec<Option<Vec<Option<Vec<String>>>>> {
+    parameter_type_nodes(parameters)
+        .into_iter()
+        .map(|type_node| {
+            type_node.and_then(|type_node| function_parameter_type_paths(type_node, source))
+        })
+        .collect()
+}
+
+fn parameter_type_nodes<'tree>(parameters: Node<'tree>) -> Vec<Option<Node<'tree>>> {
     let mut cursor = parameters.walk();
     parameters
         .named_children(&mut cursor)
         .filter(|parameter| matches!(parameter.kind(), "parameter" | "class_parameter"))
-        .map(|parameter| {
-            parameter
-                .child_by_field_name("type")
-                .and_then(|type_node| function_parameter_type_paths(type_node, source))
-        })
+        .map(|parameter| parameter.child_by_field_name("type"))
         .collect()
 }
 
@@ -1088,7 +1185,7 @@ fn function_type_arity(type_node: Node<'_>) -> Option<usize> {
     Some(parameter_types.named_children(&mut cursor).count())
 }
 
-fn contains_repeated_parameter_type(node: Node<'_>) -> bool {
+pub(crate) fn contains_repeated_parameter_type(node: Node<'_>) -> bool {
     subtree_contains(node, |current| current.kind() == "repeated_parameter_type")
 }
 
@@ -1128,6 +1225,17 @@ pub fn scala_import_path(info: &ImportInfo) -> Option<String> {
 
 pub struct ScalaImportContextIndex {
     segments: Vec<ScalaImportContextSegment>,
+}
+
+fn advance_context_cursor<T>(
+    segments: &[T],
+    byte: usize,
+    cursor: &mut usize,
+    start_byte: impl Fn(&T) -> usize,
+) {
+    while *cursor + 1 < segments.len() && start_byte(&segments[*cursor + 1]) <= byte {
+        *cursor += 1;
+    }
 }
 
 pub struct ScalaPackageContextIndex {
@@ -1184,9 +1292,7 @@ impl ScalaPackageContextIndex {
     }
 
     pub fn advance_to(&self, byte: usize, cursor: &mut usize) -> &[String] {
-        while *cursor + 1 < self.segments.len() && self.segments[*cursor + 1].start_byte <= byte {
-            *cursor += 1;
-        }
+        advance_context_cursor(&self.segments, byte, cursor, |segment| segment.start_byte);
         &self.segments[*cursor].prefixes
     }
 
@@ -1268,9 +1374,7 @@ impl ScalaImportContextIndex {
     }
 
     pub fn advance_to(&self, byte: usize, cursor: &mut usize) -> &[usize] {
-        while *cursor + 1 < self.segments.len() && self.segments[*cursor + 1].start_byte <= byte {
-            *cursor += 1;
-        }
+        advance_context_cursor(&self.segments, byte, cursor, |segment| segment.start_byte);
         &self.segments[*cursor].import_indices
     }
 }
@@ -1400,16 +1504,24 @@ pub fn is_scala_object_reference(node: Node<'_>) -> bool {
 fn qualified_stable_type_expression_shape_role(
     node: Node<'_>,
 ) -> Option<ScalaQualifiedStableTypeRole> {
-    let mut stable = node.parent()?;
-    if stable.kind() != "stable_type_identifier" {
-        return None;
-    }
+    let parents = ParentIndex::unindexed();
+    let (_, expression) = stable_type_expression_with_parents(node, &parents)?;
+    Some(qualified_stable_type_role(expression, &parents))
+}
+
+fn stable_type_expression_with_parents<'tree>(
+    node: Node<'tree>,
+    parents: &ParentIndex<'tree>,
+) -> Option<(Node<'tree>, Node<'tree>)> {
+    let mut stable = parents
+        .parent(node)
+        .filter(|parent| parent.kind() == "stable_type_identifier")?;
     let mut cursor = stable.walk();
     if stable.named_children(&mut cursor).last() != Some(node) {
         return None;
     }
-    while let Some(parent) = stable
-        .parent()
+    while let Some(parent) = parents
+        .parent(stable)
         .filter(|parent| parent.kind() == "stable_type_identifier")
     {
         let mut cursor = parent.walk();
@@ -1418,8 +1530,14 @@ fn qualified_stable_type_expression_shape_role(
         }
         stable = parent;
     }
-    let mut expression = stable;
-    while let Some(parent) = expression.parent().filter(|parent| {
+    Some((stable, widen_type_expression(stable, parents)))
+}
+
+fn widen_type_expression<'tree>(
+    mut expression: Node<'tree>,
+    parents: &ParentIndex<'tree>,
+) -> Node<'tree> {
+    while let Some(parent) = parents.parent(expression).filter(|parent| {
         matches!(
             parent.kind(),
             "generic_type" | "applied_constructor_type" | "annotated_type" | "type"
@@ -1427,26 +1545,31 @@ fn qualified_stable_type_expression_shape_role(
     }) {
         expression = parent;
     }
-    Some(
-        expression
-            .parent()
-            .map(|parent| {
-                if parent.kind() == "call_expression"
-                    && parent.child_by_field_name("function") == Some(expression)
-                {
-                    ScalaQualifiedStableTypeRole::Apply
-                } else if parent.kind() == "case_class_pattern"
-                    && parent.child_by_field_name("type") == Some(expression)
-                {
-                    ScalaQualifiedStableTypeRole::Extractor
-                } else if parent.kind() == "instance_expression" {
-                    ScalaQualifiedStableTypeRole::Constructor
-                } else {
-                    ScalaQualifiedStableTypeRole::Type
-                }
-            })
-            .unwrap_or(ScalaQualifiedStableTypeRole::Type),
-    )
+    expression
+}
+
+fn qualified_stable_type_role(
+    expression: Node<'_>,
+    parents: &ParentIndex<'_>,
+) -> ScalaQualifiedStableTypeRole {
+    parents
+        .parent(expression)
+        .map(|parent| {
+            if parent.kind() == "call_expression"
+                && parent.child_by_field_name("function") == Some(expression)
+            {
+                ScalaQualifiedStableTypeRole::Apply
+            } else if parent.kind() == "case_class_pattern"
+                && parent.child_by_field_name("type") == Some(expression)
+            {
+                ScalaQualifiedStableTypeRole::Extractor
+            } else if parent.kind() == "instance_expression" {
+                ScalaQualifiedStableTypeRole::Constructor
+            } else {
+                ScalaQualifiedStableTypeRole::Type
+            }
+        })
+        .unwrap_or(ScalaQualifiedStableTypeRole::Type)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1543,62 +1666,21 @@ fn qualified_stable_type_expression_role<'tree>(
     source: &str,
     parents: &ParentIndex<'tree>,
 ) -> Option<(Node<'tree>, ScalaQualifiedStableTypeRole, Vec<String>)> {
-    let mut expression;
-    let segments = if let Some(mut stable) = parents
-        .parent(node)
-        .filter(|parent| parent.kind() == "stable_type_identifier")
-    {
-        let mut cursor = stable.walk();
-        if stable.named_children(&mut cursor).last() != Some(node) {
-            return None;
-        }
-        while let Some(parent) = parents
-            .parent(stable)
-            .filter(|parent| parent.kind() == "stable_type_identifier")
-        {
-            let mut cursor = parent.walk();
-            if parent.named_children(&mut cursor).last() != Some(stable) {
-                break;
-            }
-            stable = parent;
-        }
-        expression = stable;
-        scala_type_lookup_segments(stable, source)
-    } else {
-        let stable = parents
-            .parent(node)
-            .filter(|parent| parent.kind() == "stable_identifier")?;
-        let reference = stable_identifier_reference_with_parents(node, source, parents)?;
-        expression = stable;
-        reference.segments
-    };
-    while let Some(parent) = parents.parent(expression).filter(|parent| {
-        matches!(
-            parent.kind(),
-            "generic_type" | "applied_constructor_type" | "annotated_type" | "type"
-        )
-    }) {
-        expression = parent;
-    }
-    let role = parents
-        .parent(expression)
-        .map(|parent| {
-            if parent.kind() == "call_expression"
-                && parent.child_by_field_name("function") == Some(expression)
-            {
-                ScalaQualifiedStableTypeRole::Apply
-            } else if parent.kind() == "case_class_pattern"
-                && parent.child_by_field_name("type") == Some(expression)
-            {
-                ScalaQualifiedStableTypeRole::Extractor
-            } else if parent.kind() == "instance_expression" {
-                ScalaQualifiedStableTypeRole::Constructor
-            } else {
-                ScalaQualifiedStableTypeRole::Type
-            }
-        })
-        .unwrap_or(ScalaQualifiedStableTypeRole::Type);
-    Some((expression, role, segments))
+    let (expression, segments) =
+        if let Some((stable, expression)) = stable_type_expression_with_parents(node, parents) {
+            (expression, scala_type_lookup_segments(stable, source))
+        } else {
+            let stable = parents
+                .parent(node)
+                .filter(|parent| parent.kind() == "stable_identifier")?;
+            let reference = stable_identifier_reference_with_parents(node, source, parents)?;
+            (widen_type_expression(stable, parents), reference.segments)
+        };
+    Some((
+        expression,
+        qualified_stable_type_role(expression, parents),
+        segments,
+    ))
 }
 
 pub fn is_scala_class_reference(node: Node<'_>, source: &str) -> bool {
@@ -1925,6 +2007,14 @@ pub fn stable_identifier_reference_with_parents<'tree>(
         expression = parent;
     }
 
+    let leaves = stable_identifier_leaf_nodes(expression)?;
+    if leaves.last().copied() != Some(node) {
+        return None;
+    }
+    stable_identifier_reference_from_leaves(leaves, source)
+}
+
+fn stable_identifier_leaf_nodes<'tree>(expression: Node<'tree>) -> Option<Vec<Node<'tree>>> {
     let mut leaves = Vec::new();
     let mut stack = vec![expression];
     while let Some(current) = stack.pop() {
@@ -1939,9 +2029,13 @@ pub fn stable_identifier_reference_with_parents<'tree>(
             stack.push(current.named_child(index)?);
         }
     }
-    if leaves.last().copied() != Some(node) {
-        return None;
-    }
+    Some(leaves)
+}
+
+fn stable_identifier_reference_from_leaves<'tree>(
+    leaves: Vec<Node<'tree>>,
+    source: &str,
+) -> Option<ScalaStableIdentifierReference> {
     let segments = leaves
         .into_iter()
         .map(|leaf| node_text(leaf, source).trim().to_string())
@@ -1963,28 +2057,11 @@ pub fn stable_identifier_prefix_reference<'tree>(
         .parent()
         .filter(|parent| parent.kind() == "stable_identifier")?;
     loop {
-        let mut leaves = Vec::new();
-        let mut stack = vec![expression];
-        while let Some(current) = stack.pop() {
-            if matches!(current.kind(), "identifier" | "operator_identifier") {
-                leaves.push(current);
-                continue;
-            }
-            if current.kind() != "stable_identifier" {
-                return None;
-            }
-            for index in (0..current.named_child_count()).rev() {
-                stack.push(current.named_child(index)?);
-            }
-        }
-        if leaves.last().copied() == Some(node) {
-            let segments = leaves
-                .into_iter()
-                .map(|leaf| node_text(leaf, source).trim().to_string())
-                .collect::<Vec<_>>();
-            if segments.len() >= 2 && segments.iter().all(|segment| !segment.is_empty()) {
-                return Some(ScalaStableIdentifierReference { segments });
-            }
+        let leaves = stable_identifier_leaf_nodes(expression)?;
+        if leaves.last().copied() == Some(node)
+            && let Some(reference) = stable_identifier_reference_from_leaves(leaves, source)
+        {
+            return Some(reference);
         }
         expression = expression
             .parent()
@@ -2166,16 +2243,7 @@ pub fn parent_kind(node: Node<'_>) -> Option<&str> {
     parent_kind_with_parents(node, &ParentIndex::unindexed())
 }
 
-pub fn has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {
-    let mut current = node.parent();
-    while let Some(parent) = current {
-        if parent.kind() == kind {
-            return true;
-        }
-        current = parent.parent();
-    }
-    false
-}
+pub use brokk_bifrost_core::analyzer::tree_walk::has_ancestor_kind;
 
 pub fn field_expression_for_member(node: Node<'_>) -> Option<Node<'_>> {
     field_expression_for_member_with_parents(node, &ParentIndex::unindexed())
@@ -2236,25 +2304,27 @@ pub fn stable_type_qualifier_with_parents<'tree>(
     (!prefix.is_empty()).then_some(prefix)
 }
 
-pub fn call_arities_for_reference(node: Node<'_>) -> Option<Vec<usize>> {
-    call_arities_for_reference_with_parents(node, &ParentIndex::unindexed())
+pub fn call_arities_for_reference(node: Node<'_>, source: &str) -> Option<Vec<usize>> {
+    call_arities_for_reference_with_parents(node, &ParentIndex::unindexed(), source)
 }
 
 pub fn call_arities_for_reference_with_parents<'tree>(
     node: Node<'tree>,
     parents: &ParentIndex<'tree>,
+    source: &str,
 ) -> Option<Vec<usize>> {
-    call_site_shape_for_reference_with_parents(node, parents)
+    call_site_shape_for_reference_with_parents(node, parents, source)
         .map(|shape| shape.lists.into_iter().map(|list| list.arity).collect())
 }
 
-pub fn call_site_shape_for_reference(node: Node<'_>) -> Option<ScalaCallSiteShape> {
-    call_site_shape_for_reference_with_parents(node, &ParentIndex::unindexed())
+pub fn call_site_shape_for_reference(node: Node<'_>, source: &str) -> Option<ScalaCallSiteShape> {
+    call_site_shape_for_reference_with_parents(node, &ParentIndex::unindexed(), source)
 }
 
 pub fn call_site_shape_for_reference_with_parents<'tree>(
     node: Node<'tree>,
     parents: &ParentIndex<'tree>,
+    source: &str,
 ) -> Option<ScalaCallSiteShape> {
     // Qualified extractor types may wrap the focused terminal in stable and
     // applied type nodes before reaching the case-class pattern.
@@ -2331,7 +2401,7 @@ pub fn call_site_shape_for_reference_with_parents<'tree>(
         {
             let list = call_argument_list(arguments);
             if list.kind == ScalaCallArgumentListKind::Ordinary {
-                leading_literal_argument_types = literal_argument_types(arguments);
+                leading_literal_argument_types = literal_argument_types(arguments, source);
             }
             lists.push(list);
         }
@@ -2350,7 +2420,7 @@ pub fn call_site_shape_for_reference_with_parents<'tree>(
         if let Some(arguments) = arguments {
             let list = call_argument_list(arguments);
             if lists.is_empty() && list.kind == ScalaCallArgumentListKind::Ordinary {
-                leading_literal_argument_types = literal_argument_types(arguments);
+                leading_literal_argument_types = literal_argument_types(arguments, source);
             }
             lists.push(list);
         } else {
@@ -2372,7 +2442,7 @@ pub fn call_site_shape_for_reference_with_parents<'tree>(
         let arguments = call.child_by_field_name("arguments")?;
         let list = call_argument_list(arguments);
         if lists.is_empty() && list.kind == ScalaCallArgumentListKind::Ordinary {
-            leading_literal_argument_types = literal_argument_types(arguments);
+            leading_literal_argument_types = literal_argument_types(arguments, source);
         }
         lists.push(list);
         type_arguments_only = false;
@@ -2394,11 +2464,11 @@ pub fn call_site_shape_for_reference_with_parents<'tree>(
     })
 }
 
-/// Kind-derived builtin types of a plain `arguments` list's literal arguments.
+/// Builtin types of a plain `arguments` list's literal arguments.
 /// `None` when the node is not a plain argument list or any argument is named:
 /// named arguments may reorder positions, and a wrong positional mapping would
 /// turn the conservative literal filter into false absences.
-fn literal_argument_types(arguments: Node<'_>) -> Option<Vec<Option<&'static str>>> {
+fn literal_argument_types(arguments: Node<'_>, source: &str) -> Option<Vec<Option<&'static str>>> {
     if arguments.kind() != "arguments" {
         return None;
     }
@@ -2411,7 +2481,7 @@ fn literal_argument_types(arguments: Node<'_>) -> Option<Vec<Option<&'static str
         if argument.kind() == "assignment_expression" {
             return None;
         }
-        types.push(scala_literal_type_name(argument.kind()));
+        types.push(scala_literal_type_name(source, argument));
     }
     Some(types)
 }
@@ -2621,6 +2691,17 @@ pub enum ScalaCallableMismatch {
     NoCallShape,
 }
 
+fn partial_callable_shape_is_candidate(
+    next_explicit_arity: CallableArity,
+    actual: &ScalaCallSiteShape,
+    policy: ScalaCallableUsePolicy,
+) -> bool {
+    policy == ScalaCallableUsePolicy::OrdinaryMethod
+        && actual
+            .method_value_arity
+            .is_none_or(|arity| next_explicit_arity.accepts(arity))
+}
+
 /// The single admission decision for one declared shape against one call site.
 ///
 /// [`scala_callable_shape_matches`] is exactly this answer read as a boolean,
@@ -2651,10 +2732,8 @@ pub fn scala_callable_shape_mismatch(
             // arity is known (#1853): `xs.map(render("p"))` on an unresolved
             // receiver proves nothing about the function `map` wants, and an
             // unproven arity is not a mismatch.
-            let candidate = policy == ScalaCallableUsePolicy::OrdinaryMethod
-                && actual
-                    .method_value_arity
-                    .is_none_or(|arity| next_explicit_arity.accepts(arity));
+            let candidate =
+                partial_callable_shape_is_candidate(next_explicit_arity, actual, policy);
             if !candidate {
                 Some(ScalaCallableMismatch::MethodValueArity)
             } else if unique_callable {
@@ -2774,10 +2853,7 @@ pub fn scala_callable_shape_is_candidate(
             // receiver proves nothing about the function `map` wants, and an
             // unproven arity is not a mismatch. `scala_callable_shape_matches`
             // still requires the partially applied callable to be the only one.
-            policy == ScalaCallableUsePolicy::OrdinaryMethod
-                && actual
-                    .method_value_arity
-                    .is_none_or(|arity| next_explicit_arity.accepts(arity))
+            partial_callable_shape_is_candidate(next_explicit_arity, actual, policy)
         }
     }
 }
@@ -2832,6 +2908,12 @@ pub fn named_argument_invocation_owner(node: Node<'_>) -> Option<Node<'_>> {
     named_argument_invocation_owner_with_parents(node, &ParentIndex::unindexed())
 }
 
+pub fn named_argument_label_owner(node: Node<'_>) -> Option<Node<'_>> {
+    (node.kind() == "identifier")
+        .then(|| named_argument_invocation_owner(node))
+        .flatten()
+}
+
 pub fn named_argument_invocation_owner_with_parents<'tree>(
     node: Node<'tree>,
     parents: &ParentIndex<'tree>,
@@ -2871,15 +2953,13 @@ pub fn named_argument_invocation_owner_with_parents<'tree>(
 /// after visiting that node: the left side names a parameter/member of the
 /// callee, not a value being reassigned in the current lexical scope.
 pub fn is_scala_named_argument_assignment(node: Node<'_>) -> bool {
-    if node.kind() != "assignment_expression" {
-        return false;
-    }
-    let Some(arguments) = node.parent().filter(|parent| parent.kind() == "arguments") else {
-        return false;
-    };
-    arguments.parent().is_some_and(|invocation| {
-        matches!(invocation.kind(), "call_expression" | "instance_expression")
-    })
+    crate::scala::structural::is_named_argument_assignment(node)
+        && node
+            .parent()
+            .and_then(|arguments| arguments.parent())
+            .is_some_and(|invocation| {
+                matches!(invocation.kind(), "call_expression" | "instance_expression")
+            })
 }
 
 pub fn terminal_invocation_owner_name(node: Node<'_>) -> Option<Node<'_>> {
@@ -3051,10 +3131,6 @@ fn pattern_contains_identifier(node: Node<'_>, name: &str, source: &str) -> bool
     false
 }
 
-pub fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    brokk_bifrost_core::analyzer::common::node_source_text(node, source)
-}
-
 pub fn is_declaration_name(node: Node<'_>) -> bool {
     node.parent().is_some_and(|parent| {
         if parent.kind() == "type_definition" {
@@ -3078,11 +3154,134 @@ pub fn is_declaration_name(node: Node<'_>) -> bool {
     })
 }
 
+/// The written terminal type name of a non-anonymous explicit construction.
+/// Type arguments and qualifier prefixes remain ordinary type references.
+pub fn explicit_constructor_reference(mut node: Node<'_>) -> bool {
+    loop {
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        match parent.kind() {
+            "stable_type_identifier" | "scoped_type_identifier"
+                if parent.named_child(parent.named_child_count().saturating_sub(1))
+                    == Some(node) => {}
+            "generic_type" if parent.child_by_field_name("type") == Some(node) => {}
+            "annotated_type" if parent.named_child(0) == Some(node) => {}
+            "instance_expression" if parent.named_child(0) == Some(node) => {
+                let mut cursor = parent.walk();
+                return !parent
+                    .named_children(&mut cursor)
+                    .any(|child| matches!(child.kind(), "template_body" | "early_defs"));
+            }
+            _ => return false,
+        }
+        node = parent;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     #[test]
+    #[hardwon("#3393: bounded Scala source-facts cache evicted and recomputed resident facts")]
+    fn scala_source_facts_cache_evicts_and_recomputes_under_pressure() {
+        let source = r#"class Roleful(value: Int) {
+  def this() = this(0)
+  def this(text: String, flag: Boolean) = this(text.length)
+}
+object Roleful { def apply(using String): Roleful = new Roleful(0) }
+"#;
+        let prototype = Arc::new(scala_source_facts(source).expect("Scala source facts"));
+        assert!(!prototype.callable_alternatives_by_range.is_empty());
+
+        let root = std::env::temp_dir().join("bifrost-3393-scala-facts-cache");
+        let files = (0..8)
+            .map(|index| ProjectFile::new(root.clone(), format!("src/cache/file-{index:02}.scala")))
+            .collect::<Vec<_>>();
+        let budget =
+            crate::scala::graph::inverted::weight_scala_source_facts(&files[0], &prototype) as u64;
+        let cache = crate::scala::graph::inverted::new_scala_source_facts_cache(budget);
+        let constructions = AtomicUsize::new(0);
+        let load = |file: ProjectFile| {
+            cache.get_with(file, || {
+                let facts = scala_source_facts(source).expect("Scala source facts");
+                constructions.fetch_add(1, Ordering::Relaxed);
+                Arc::new(facts)
+            })
+        };
+
+        let first_facts = load(files[0].clone());
+        assert_eq!(constructions.load(Ordering::Relaxed), 1);
+        let first_hit = load(files[0].clone());
+        assert_eq!(constructions.load(Ordering::Relaxed), 1);
+        assert!(Arc::ptr_eq(&first_facts, &first_hit));
+        for file in &files[1..] {
+            load(file.clone());
+        }
+        cache.run_pending_tasks();
+
+        assert!(cache.weighted_size() <= budget);
+        assert_eq!(cache.entry_count(), 1, "one entry fits in the test budget");
+        let evicted_file = files
+            .iter()
+            .find(|file| cache.get(*file).is_none())
+            .expect("cache pressure evicted a resident Scala facts entry")
+            .clone();
+        let constructions_before_reload = constructions.load(Ordering::Relaxed);
+
+        let restored_facts = load(evicted_file);
+        cache.run_pending_tasks();
+        let independently_parsed =
+            Arc::new(scala_source_facts(source).expect("Scala source facts"));
+
+        assert_eq!(
+            constructions.load(Ordering::Relaxed),
+            constructions_before_reload + 1,
+            "an evicted miss invokes the real Scala facts producer"
+        );
+        assert!(!Arc::ptr_eq(&restored_facts, &independently_parsed));
+        assert_eq!(
+            restored_facts.callable_alternatives_by_range,
+            independently_parsed.callable_alternatives_by_range
+        );
+        assert_eq!(
+            restored_facts.field_type_paths_by_range,
+            independently_parsed.field_type_paths_by_range
+        );
+        assert_eq!(
+            restored_facts.type_alias_paths_by_range,
+            independently_parsed.type_alias_paths_by_range
+        );
+        assert_eq!(
+            restored_facts.stable_owner_ranges,
+            independently_parsed.stable_owner_ranges
+        );
+        assert_eq!(restored_facts.enum_ranges, independently_parsed.enum_ranges);
+        assert_eq!(
+            restored_facts.case_class_ranges,
+            independently_parsed.case_class_ranges
+        );
+        assert_eq!(
+            restored_facts.abstract_callable_ranges,
+            independently_parsed.abstract_callable_ranges
+        );
+        assert_eq!(
+            restored_facts.generic_owner_facts_by_range,
+            independently_parsed.generic_owner_facts_by_range
+        );
+        assert!(cache.weighted_size() <= budget);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3357: indexed Scala syntax diverged from native parent lookups after the startup/scan optimization"
+    )]
     fn indexed_syntax_matches_native_parent_lookups() {
         let source = r#"package sample
 object Outer {
@@ -3174,13 +3373,13 @@ object Outer {
                 "field expression at {node:?}"
             );
             assert_eq!(
-                call_site_shape_for_reference_with_parents(node, &parents),
-                call_site_shape_for_reference(node),
+                call_site_shape_for_reference_with_parents(node, &parents, source),
+                call_site_shape_for_reference(node, source),
                 "call shape at {node:?}"
             );
             assert_eq!(
-                call_arities_for_reference_with_parents(node, &parents),
-                call_arities_for_reference(node),
+                call_arities_for_reference_with_parents(node, &parents, source),
+                call_arities_for_reference(node, source),
                 "call arities at {node:?}"
             );
             assert_eq!(
@@ -3199,10 +3398,7 @@ object Outer {
     }
 
     fn explicit(arity: usize) -> ScalaCallableParameterList {
-        ScalaCallableParameterList {
-            arity: CallableArity::exact(arity),
-            kind: ScalaParameterListKind::Explicit,
-        }
+        ScalaCallableParameterList::explicit(CallableArity::exact(arity))
     }
 
     fn contextual(arity: usize) -> ScalaCallableParameterList {
@@ -3241,6 +3437,7 @@ object Outer {
     }
 
     #[test]
+    #[hardwon("#663: Scala inverse usage missed inherited calls with contextual argument lists")]
     fn call_site_shape_treats_blocks_as_one_argument_and_records_using_lists() {
         let source = r#"object Use:
   val block = run {
@@ -3268,7 +3465,7 @@ object Outer {
             }
         }
         assert_eq!(calls.len(), 2);
-        let block = call_site_shape_for_reference(calls[0]).expect("block call shape");
+        let block = call_site_shape_for_reference(calls[0], source).expect("block call shape");
         assert_eq!(
             block.lists,
             [ScalaCallArgumentList {
@@ -3276,7 +3473,8 @@ object Outer {
                 kind: ScalaCallArgumentListKind::Block,
             }]
         );
-        let contextual = call_site_shape_for_reference(calls[1]).expect("contextual call shape");
+        let contextual =
+            call_site_shape_for_reference(calls[1], source).expect("contextual call shape");
         assert_eq!(
             contextual.lists,
             [
@@ -3293,6 +3491,7 @@ object Outer {
     }
 
     #[test]
+    #[hardwon("#663: Scala inverse usage missed inherited calls with contextual argument lists")]
     fn call_shape_aligns_contextual_lists_and_requires_proven_partial_use() {
         let ordinary = ScalaCallArgumentList {
             arity: 1,
@@ -3429,6 +3628,9 @@ object Outer {
     }
 
     #[test]
+    #[hardwon(
+        "#661: Scala inverse usage confused pattern binders with type, extractor, operator, and label references"
+    )]
     fn pattern_binders_exclude_types_extractors_operators_and_named_labels() {
         let source = r#"object Patterns {
   def read(value: Any): Any = value match {
@@ -3471,6 +3673,9 @@ object Outer {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "c8261aa3985f: Scala parameterized enum cases lost their primary-constructor source facts"
+    )]
     fn parameterized_enum_case_records_primary_constructor_source_facts() {
         let source = r#"trait Tagged
 enum Event:
@@ -3526,6 +3731,7 @@ enum Event:
     }
 
     #[test]
+    #[hardwon("#662: Scala inverse usage missed companion apply and infix-lowered calls")]
     fn callable_roles_precede_shape_matching_for_primary_and_secondary_construction() {
         let source = r#"class Roleful(value: Int) {
   def this() = this(0)
@@ -3617,6 +3823,9 @@ object Use { val value = new ArrayOps(1) }
     }
 
     #[test]
+    #[hardwon(
+        "#661: Scala inverse usage missed selections, stable terms, and qualified type references"
+    )]
     fn qualified_stable_type_roles_follow_parser_structure() {
         let source = r#"object Use {
   val applied = Structure.Value(1)
@@ -3658,14 +3867,14 @@ object EnumUse:
                         }
                         if reference.role == ScalaQualifiedStableTypeRole::Extractor {
                             extractor_shapes
-                                .push(call_site_shape_for_reference(reference.expression));
+                                .push(call_site_shape_for_reference(reference.expression, source));
                         }
                         value_roles.push(reference.role);
                     }
                     "Box" => box_roles.push(reference.role),
                     "Number" if reference.role == ScalaQualifiedStableTypeRole::Extractor => {
                         enum_extractor_shapes
-                            .push(call_site_shape_for_reference(reference.expression));
+                            .push(call_site_shape_for_reference(reference.expression, source));
                     }
                     _ => {}
                 }

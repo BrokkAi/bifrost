@@ -1,11 +1,11 @@
-//! Test-support route for native Go forward usage over selected reverse rows.
+//! Native Go usage queries over selected inverse rows.
 
 use super::GoAnalyzer;
-use super::selected_reverse::{GoSelectedReverseOutcome, go_selected_inverse_for};
+use super::selected_reverse::{GoSelectedReverseOutcome, go_selected_inverse_for_usage_scope};
 use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::structural::reference_edges::EdgeCompleteness;
 use crate::analyzer::usages::UsageProof;
-use crate::analyzer::usages::outcome::GraphUsageOutcome;
+use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::{
     FuzzyResult, GraphUsageAnalyzer, UsageAnalysisDiagnostic, UsageHit, UsageHitSurface,
 };
@@ -16,7 +16,6 @@ use brokk_bifrost_core::analyzer::usages::scan_scope::UsageScanScope;
 use std::collections::BTreeSet;
 
 /// Native Go forward-usage discovery through the selected reference index.
-/// The type is test-support only until the Go consumer cutover is approved.
 #[derive(Default)]
 pub struct GoNativeUsageStrategy;
 
@@ -67,37 +66,39 @@ impl GraphUsageAnalyzer for GoNativeUsageStrategy {
                     "native Go usage query was cancelled".into(),
                 ));
             }
-            let answer = match go_selected_inverse_for(go, target, &cancellation) {
-                GoSelectedReverseOutcome::Ready(answer) => answer,
-                GoSelectedReverseOutcome::Unavailable(reason) => {
-                    return GraphUsageOutcome::TerminalFailure(diagnostic(
-                        primary,
-                        "native_resolution_unavailable",
-                        reason,
-                    ));
-                }
-                GoSelectedReverseOutcome::Stale(reason) => {
-                    return GraphUsageOutcome::TerminalFailure(diagnostic(
-                        primary,
-                        "stale_selected_source",
-                        reason,
-                    ));
-                }
-                GoSelectedReverseOutcome::Cancelled => {
-                    return GraphUsageOutcome::TerminalFailure(diagnostic(
-                        primary,
-                        "cancelled",
-                        "native Go usage query was cancelled".into(),
-                    ));
-                }
-                GoSelectedReverseOutcome::StoreError(reason) => {
-                    return GraphUsageOutcome::TerminalFailure(diagnostic(
-                        primary,
-                        "native_store_error",
-                        reason,
-                    ));
-                }
-            };
+            let answer =
+                match go_selected_inverse_for_usage_scope(go, target, scan_scope, &cancellation) {
+                    GoSelectedReverseOutcome::Ready(answer) => answer,
+                    GoSelectedReverseOutcome::Unavailable(reason) => {
+                        let mut unavailable = GraphFailureReason::UnavailableCanonicalFacts(
+                            "Go graph indexed source was unavailable",
+                        )
+                        .diagnostic(primary.fq_name(), "go_native");
+                        unavailable.reason = format!("{}; {reason}", unavailable.reason);
+                        return GraphUsageOutcome::TerminalFailure(unavailable);
+                    }
+                    GoSelectedReverseOutcome::Stale(reason) => {
+                        return GraphUsageOutcome::TerminalFailure(diagnostic(
+                            primary,
+                            "stale_selected_source",
+                            reason,
+                        ));
+                    }
+                    GoSelectedReverseOutcome::Cancelled => {
+                        return GraphUsageOutcome::TerminalFailure(diagnostic(
+                            primary,
+                            "cancelled",
+                            "native Go usage query was cancelled".into(),
+                        ));
+                    }
+                    GoSelectedReverseOutcome::StoreError(reason) => {
+                        return GraphUsageOutcome::TerminalFailure(diagnostic(
+                            primary,
+                            "native_store_error",
+                            reason,
+                        ));
+                    }
+                };
             if let EdgeCompleteness::Incomplete { reasons } = &answer.completeness {
                 diagnostics.push(diagnostic(
                     target,

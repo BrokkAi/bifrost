@@ -48,6 +48,14 @@ pub const MAX_RETAINED_TAINT_PLAN_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_RETAINED_TAINT_REPORT_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_RETAINED_TAINT_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 
+const fn capped_limit(requested: usize, maximum: usize) -> usize {
+    if requested < maximum {
+        requested
+    } else {
+        maximum
+    }
+}
+
 /// One immutable host registration. Semantic handles never cross the wire.
 #[derive(Debug)]
 pub struct ProtocolRegistration {
@@ -208,31 +216,11 @@ impl ProtocolRegistrationLimits {
         artifact_bytes: usize,
     ) -> Self {
         Self {
-            references: if references < MAX_PROTOCOL_REFS {
-                references
-            } else {
-                MAX_PROTOCOL_REFS
-            },
-            registrations: if registrations < MAX_PROTOCOL_REGISTRATIONS {
-                registrations
-            } else {
-                MAX_PROTOCOL_REGISTRATIONS
-            },
-            protocol_bytes: if protocol_bytes < MAX_RETAINED_PROTOCOL_BYTES {
-                protocol_bytes
-            } else {
-                MAX_RETAINED_PROTOCOL_BYTES
-            },
-            binding_plan_bytes: if binding_plan_bytes < MAX_RETAINED_BINDING_PLAN_BYTES {
-                binding_plan_bytes
-            } else {
-                MAX_RETAINED_BINDING_PLAN_BYTES
-            },
-            artifact_bytes: if artifact_bytes < MAX_RETAINED_REGISTRATION_ARTIFACT_BYTES {
-                artifact_bytes
-            } else {
-                MAX_RETAINED_REGISTRATION_ARTIFACT_BYTES
-            },
+            references: capped_limit(references, MAX_PROTOCOL_REFS),
+            registrations: capped_limit(registrations, MAX_PROTOCOL_REGISTRATIONS),
+            protocol_bytes: capped_limit(protocol_bytes, MAX_RETAINED_PROTOCOL_BYTES),
+            binding_plan_bytes: capped_limit(binding_plan_bytes, MAX_RETAINED_BINDING_PLAN_BYTES),
+            artifact_bytes: capped_limit(artifact_bytes, MAX_RETAINED_REGISTRATION_ARTIFACT_BYTES),
         }
     }
 }
@@ -426,36 +414,55 @@ pub enum ProtocolRegistrationSetError {
     RetainedArtifactBytes { maximum: usize },
 }
 
+fn fmt_registration_conflict<T: fmt::Display>(
+    formatter: &mut fmt::Formatter<'_>,
+    registration_kind: &str,
+    reference: &T,
+) -> fmt::Result {
+    write!(
+        formatter,
+        "{registration_kind} reference `{reference}` is already registered"
+    )
+}
+
+fn fmt_registration_limit(
+    formatter: &mut fmt::Formatter<'_>,
+    registration_kind: &str,
+    maximum: usize,
+    resource: &str,
+) -> fmt::Result {
+    write!(
+        formatter,
+        "{registration_kind} registration set exceeds {maximum} {resource}"
+    )
+}
+
 impl fmt::Display for ProtocolRegistrationSetError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ReferenceConflict { protocol_ref } => {
-                write!(
-                    formatter,
-                    "protocol reference `{protocol_ref}` is already registered"
-                )
+                fmt_registration_conflict(formatter, "protocol", protocol_ref)
             }
             Self::TooManyReferences { maximum } => {
-                write!(
-                    formatter,
-                    "protocol registration set exceeds {maximum} references"
-                )
+                fmt_registration_limit(formatter, "protocol", *maximum, "references")
             }
-            Self::TooManyRegistrations { maximum } => write!(
+            Self::TooManyRegistrations { maximum } => {
+                fmt_registration_limit(formatter, "protocol", *maximum, "unique registrations")
+            }
+            Self::RetainedProtocolBytes { maximum } => {
+                fmt_registration_limit(formatter, "protocol", *maximum, "retained protocol bytes")
+            }
+            Self::RetainedBindingPlanBytes { maximum } => fmt_registration_limit(
                 formatter,
-                "protocol registration set exceeds {maximum} unique registrations"
+                "protocol",
+                *maximum,
+                "retained binding-plan bytes",
             ),
-            Self::RetainedProtocolBytes { maximum } => write!(
+            Self::RetainedArtifactBytes { maximum } => fmt_registration_limit(
                 formatter,
-                "protocol registration set exceeds {maximum} retained protocol bytes"
-            ),
-            Self::RetainedBindingPlanBytes { maximum } => write!(
-                formatter,
-                "protocol registration set exceeds {maximum} retained binding-plan bytes"
-            ),
-            Self::RetainedArtifactBytes { maximum } => write!(
-                formatter,
-                "protocol registration set exceeds {maximum} retained semantic-artifact bytes"
+                "protocol",
+                *maximum,
+                "retained semantic-artifact bytes",
             ),
         }
     }
@@ -590,26 +597,10 @@ impl ValueFlowPlanRegistrationLimits {
         artifact_bytes: usize,
     ) -> Self {
         Self {
-            references: if references < MAX_VALUE_FLOW_PLAN_REFS {
-                references
-            } else {
-                MAX_VALUE_FLOW_PLAN_REFS
-            },
-            registrations: if registrations < MAX_VALUE_FLOW_PLAN_REGISTRATIONS {
-                registrations
-            } else {
-                MAX_VALUE_FLOW_PLAN_REGISTRATIONS
-            },
-            plan_bytes: if plan_bytes < MAX_RETAINED_VALUE_FLOW_PLAN_BYTES {
-                plan_bytes
-            } else {
-                MAX_RETAINED_VALUE_FLOW_PLAN_BYTES
-            },
-            artifact_bytes: if artifact_bytes < MAX_RETAINED_VALUE_FLOW_ARTIFACT_BYTES {
-                artifact_bytes
-            } else {
-                MAX_RETAINED_VALUE_FLOW_ARTIFACT_BYTES
-            },
+            references: capped_limit(references, MAX_VALUE_FLOW_PLAN_REFS),
+            registrations: capped_limit(registrations, MAX_VALUE_FLOW_PLAN_REGISTRATIONS),
+            plan_bytes: capped_limit(plan_bytes, MAX_RETAINED_VALUE_FLOW_PLAN_BYTES),
+            artifact_bytes: capped_limit(artifact_bytes, MAX_RETAINED_VALUE_FLOW_ARTIFACT_BYTES),
         }
     }
 }
@@ -775,26 +766,28 @@ impl fmt::Display for ValueFlowPlanRegistrationSetError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ReferenceConflict { plan_ref } => {
-                write!(
-                    formatter,
-                    "value-flow plan reference `{plan_ref}` is already registered"
-                )
+                fmt_registration_conflict(formatter, "value-flow plan", plan_ref)
             }
-            Self::TooManyReferences { maximum } => write!(
+            Self::TooManyReferences { maximum } => {
+                fmt_registration_limit(formatter, "value-flow plan", *maximum, "references")
+            }
+            Self::TooManyRegistrations { maximum } => fmt_registration_limit(
                 formatter,
-                "value-flow plan registration set exceeds {maximum} references"
+                "value-flow plan",
+                *maximum,
+                "unique registrations",
             ),
-            Self::TooManyRegistrations { maximum } => write!(
+            Self::RetainedPlanBytes { maximum } => fmt_registration_limit(
                 formatter,
-                "value-flow plan registration set exceeds {maximum} unique registrations"
+                "value-flow plan",
+                *maximum,
+                "retained plan bytes",
             ),
-            Self::RetainedPlanBytes { maximum } => write!(
+            Self::RetainedArtifactBytes { maximum } => fmt_registration_limit(
                 formatter,
-                "value-flow plan registration set exceeds {maximum} retained plan bytes"
-            ),
-            Self::RetainedArtifactBytes { maximum } => write!(
-                formatter,
-                "value-flow plan registration set exceeds {maximum} retained semantic-artifact bytes"
+                "value-flow plan",
+                *maximum,
+                "retained semantic-artifact bytes",
             ),
         }
     }
@@ -993,31 +986,11 @@ impl TaintResultRegistrationLimits {
         artifact_bytes: usize,
     ) -> Self {
         Self {
-            references: if references < MAX_TAINT_RESULT_REFS {
-                references
-            } else {
-                MAX_TAINT_RESULT_REFS
-            },
-            registrations: if registrations < MAX_TAINT_RESULT_REGISTRATIONS {
-                registrations
-            } else {
-                MAX_TAINT_RESULT_REGISTRATIONS
-            },
-            plan_bytes: if plan_bytes < MAX_RETAINED_TAINT_PLAN_BYTES {
-                plan_bytes
-            } else {
-                MAX_RETAINED_TAINT_PLAN_BYTES
-            },
-            report_bytes: if report_bytes < MAX_RETAINED_TAINT_REPORT_BYTES {
-                report_bytes
-            } else {
-                MAX_RETAINED_TAINT_REPORT_BYTES
-            },
-            artifact_bytes: if artifact_bytes < MAX_RETAINED_TAINT_ARTIFACT_BYTES {
-                artifact_bytes
-            } else {
-                MAX_RETAINED_TAINT_ARTIFACT_BYTES
-            },
+            references: capped_limit(references, MAX_TAINT_RESULT_REFS),
+            registrations: capped_limit(registrations, MAX_TAINT_RESULT_REGISTRATIONS),
+            plan_bytes: capped_limit(plan_bytes, MAX_RETAINED_TAINT_PLAN_BYTES),
+            report_bytes: capped_limit(report_bytes, MAX_RETAINED_TAINT_REPORT_BYTES),
+            artifact_bytes: capped_limit(artifact_bytes, MAX_RETAINED_TAINT_ARTIFACT_BYTES),
         }
     }
 }
@@ -1208,30 +1181,25 @@ impl fmt::Display for TaintResultRegistrationSetError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ReferenceConflict { taint_ref } => {
-                write!(
-                    formatter,
-                    "taint result reference `{taint_ref}` is already registered"
-                )
+                fmt_registration_conflict(formatter, "taint result", taint_ref)
             }
-            Self::TooManyReferences { maximum } => write!(
+            Self::TooManyReferences { maximum } => {
+                fmt_registration_limit(formatter, "taint result", *maximum, "references")
+            }
+            Self::TooManyRegistrations { maximum } => {
+                fmt_registration_limit(formatter, "taint result", *maximum, "unique registrations")
+            }
+            Self::RetainedPlanBytes(maximum) => {
+                fmt_registration_limit(formatter, "taint result", *maximum, "retained plan bytes")
+            }
+            Self::RetainedReportBytes(maximum) => {
+                fmt_registration_limit(formatter, "taint result", *maximum, "retained report bytes")
+            }
+            Self::RetainedArtifactBytes(maximum) => fmt_registration_limit(
                 formatter,
-                "taint result registration set exceeds {maximum} references"
-            ),
-            Self::TooManyRegistrations { maximum } => write!(
-                formatter,
-                "taint result registration set exceeds {maximum} unique registrations"
-            ),
-            Self::RetainedPlanBytes(maximum) => write!(
-                formatter,
-                "taint result registration set exceeds {maximum} retained plan bytes"
-            ),
-            Self::RetainedReportBytes(maximum) => write!(
-                formatter,
-                "taint result registration set exceeds {maximum} retained report bytes"
-            ),
-            Self::RetainedArtifactBytes(maximum) => write!(
-                formatter,
-                "taint result registration set exceeds {maximum} retained semantic-artifact bytes"
+                "taint result",
+                *maximum,
+                "retained semantic-artifact bytes",
             ),
         }
     }
@@ -1692,8 +1660,7 @@ impl QueryAnalysisContext {
 }
 
 fn same_procedure_identity(left: &ProcedureHandle, right: &ProcedureHandle) -> bool {
-    left.artifact().key() == right.artifact().key()
-        && left.semantics().locator() == right.semantics().locator()
+    procedure_identity_cmp(left, right) == std::cmp::Ordering::Equal
 }
 
 fn validate_registration(
@@ -1783,13 +1750,9 @@ fn validate_value_flow_registration(
 }
 
 fn value_flow_registration_error(error: QueryAnalysisContextError) -> QueryAnalysisContextError {
-    match error {
-        QueryAnalysisContextError::Cancelled
-        | QueryAnalysisContextError::ValidationBudgetExceeded { .. } => error,
-        _ => QueryAnalysisContextError::ValueFlowRegistrationInvalid {
-            detail: Box::new(error),
-        },
-    }
+    registration_error(error, |detail| {
+        QueryAnalysisContextError::ValueFlowRegistrationInvalid { detail }
+    })
 }
 
 fn validate_taint_registration(
@@ -1821,12 +1784,19 @@ fn validate_taint_registration(
 }
 
 fn taint_registration_error(error: QueryAnalysisContextError) -> QueryAnalysisContextError {
+    registration_error(error, |detail| {
+        QueryAnalysisContextError::TaintRegistrationInvalid { detail }
+    })
+}
+
+fn registration_error(
+    error: QueryAnalysisContextError,
+    wrap: impl FnOnce(Box<QueryAnalysisContextError>) -> QueryAnalysisContextError,
+) -> QueryAnalysisContextError {
     match error {
         QueryAnalysisContextError::Cancelled
         | QueryAnalysisContextError::ValidationBudgetExceeded { .. } => error,
-        _ => QueryAnalysisContextError::TaintRegistrationInvalid {
-            detail: Box::new(error),
-        },
+        error => wrap(Box::new(error)),
     }
 }
 

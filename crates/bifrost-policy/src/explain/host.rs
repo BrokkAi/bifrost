@@ -23,20 +23,17 @@
 use std::path::Path;
 use std::sync::Arc;
 
-#[cfg(test)]
-use std::cell::Cell;
-
 use brokk_bifrost_analysis::CancellationToken;
 use brokk_bifrost_analysis::analyzer::packs_document::load_workspace_packs_config_at;
 use brokk_bifrost_analysis::analyzer::{
-    AnalyzerQueryScope, FilesystemProject, Project, WorkspaceAnalyzer,
+    AnalyzerConfig, AnalyzerQueryScope, FilesystemProject, Project, WorkspaceAnalyzer,
 };
 
 use crate::budget::{PolicyBatchBudget, PolicyBudget};
 use crate::catalog::{CatalogRegistryLimits, TaintCatalogRegistry};
 use crate::coordinator::{
-    PolicyEvaluationInput, activate_owned_policy_workspace, owned_policy_analyzer_config,
-    policy_budget_for_workspace, ready_policy_semantic_model_snapshot,
+    PolicyEvaluationInput, activate_owned_policy_workspace, policy_budget_for_workspace,
+    ready_policy_semantic_model_snapshot,
 };
 use crate::evaluator::{DefaultPolicyEvaluator, PolicyEvaluationContext, PolicyEvaluator};
 use crate::finding_identity::PolicyFindingId;
@@ -49,16 +46,7 @@ use super::model::{ExplainError, ExplanationGeneration, ExplanationLimits, Polic
 use super::near_miss::{NearMissCandidates, PolicyNearMissRanking, rank_near_misses};
 use super::why::explain_finding;
 use super::why_not::{ExplanationCandidate, explain_candidate};
-
-#[cfg(test)]
-thread_local! {
-    static OWNED_WORKSPACE_BUILD_COUNT: Cell<u64> = const { Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(super) fn owned_workspace_build_count_for_test() -> u64 {
-    OWNED_WORKSPACE_BUILD_COUNT.with(Cell::get)
-}
+use super::why_not_flow::{FlowExplanationCandidate, explain_flow_candidate};
 
 /// Which question a host is asking about one policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +57,10 @@ pub enum ExplanationTarget {
     /// Why is this candidate not reported? The policy is loaded but not
     /// evaluated; only the bounded candidate-specific plan runs.
     Candidate(ExplanationCandidate),
+    /// Why is this flow or taint candidate -- a source position and an
+    /// observation position -- not reported? Only the analysis regions that
+    /// bind both sites are compiled into a solve (issue 3686).
+    FlowCandidate(FlowExplanationCandidate),
 }
 
 /// Explain one policy against one workspace.
@@ -195,8 +187,6 @@ fn with_one_policy<T>(
     let owned = match workspace {
         Some(_) => None,
         None => {
-            #[cfg(test)]
-            OWNED_WORKSPACE_BUILD_COUNT.with(|count| count.set(count.get() + 1));
             let project = FilesystemProject::new(&root).map_err(|error| {
                 unavailable(format!(
                     "failed to construct the analyzer project {}: {error}",
@@ -208,13 +198,14 @@ fn with_one_policy<T>(
             // explanation over a live root should read the cache the ordinary
             // run already warmed rather than re-parse the workspace.
             Some(
-                WorkspaceAnalyzer::build_persisted(project, owned_policy_analyzer_config())
-                    .map_err(|error| {
+                WorkspaceAnalyzer::build_persisted(project, AnalyzerConfig::default()).map_err(
+                    |error| {
                         unavailable(format!(
                             "failed to build the analyzer workspace at {}: {error}",
                             root.display()
                         ))
-                    })?,
+                    },
+                )?,
             )
         }
     };
@@ -390,6 +381,9 @@ pub fn explain_loaded_policy(
         ExplanationTarget::Candidate(candidate) => {
             explain_candidate(policy, context, candidate, budget, limits)
         }
+        ExplanationTarget::FlowCandidate(candidate) => {
+            explain_flow_candidate(policy, context, candidate, budget, limits)
+        }
     }
     .map(|explanation| explanation.answered_under(answered_under))
 }
@@ -433,7 +427,9 @@ fn register_inputs(
                         ))
                     })?;
             }
-            PolicyEvaluationInput::Embedded { identity, source } => {
+            PolicyEvaluationInput::Embedded {
+                identity, source, ..
+            } => {
                 registry
                     .register_policy_bytes_with_analyzer(
                         identity.clone(),

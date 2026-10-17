@@ -1,8 +1,8 @@
 use crate::graph_support::{
     RustCargoRouteError, RustFactSource, RustItemMacroDecided, RustPlacedDeclaration,
     is_rust_enum_declaration, is_rust_struct_declaration, is_rust_trait_declaration,
-    is_rust_type_alias_declaration, live_file_at, resolve_imported_export_from_binder,
-    resolve_module_files,
+    is_rust_type_alias_declaration, join_rust_fqn, live_file_at,
+    resolve_imported_export_from_binder, resolve_module_files,
 };
 use crate::hierarchy_source_context::RustSourceContextIndex;
 use crate::imports::{
@@ -577,12 +577,15 @@ fn member_is_declared_in_an_impl(
     member: &CodeUnit,
 ) -> Result<bool, RustCargoRouteError> {
     let facts = rust.canonical_rust_hierarchy_source_facts(member.source(), &|| true)?;
-    let declarations = member_declarations(&facts, member);
-    Ok(facts
-        .items
-        .impls
-        .iter()
-        .any(|impl_fact| declares_any(&impl_fact.body_children, &declarations)))
+    Ok(member_is_direct_child_of(
+        &facts,
+        member,
+        facts
+            .items
+            .impls
+            .iter()
+            .map(|impl_fact| impl_fact.body_children.as_slice()),
+    ))
 }
 
 /// Whether a declaration is a direct member of some `trait` body in its own
@@ -593,12 +596,24 @@ fn member_is_declared_in_a_trait(
     member: &CodeUnit,
 ) -> Result<bool, RustCargoRouteError> {
     let facts = rust.canonical_rust_hierarchy_source_facts(member.source(), &|| true)?;
-    let declarations = member_declarations(&facts, member);
-    Ok(facts
-        .items
-        .traits
-        .iter()
-        .any(|trait_fact| declares_any(&trait_fact.body_children, &declarations)))
+    Ok(member_is_direct_child_of(
+        &facts,
+        member,
+        facts
+            .items
+            .traits
+            .iter()
+            .map(|trait_fact| trait_fact.body_children.as_slice()),
+    ))
+}
+
+fn member_is_direct_child_of<'facts>(
+    facts: &'facts RustHierarchySourceFacts,
+    member: &CodeUnit,
+    mut owner_children: impl Iterator<Item = &'facts [RustItemBodyChildSourceFact]>,
+) -> bool {
+    let declarations = member_declarations(facts, member);
+    owner_children.any(|children| declares_any(children, &declarations))
 }
 
 /// The source declarations in its own file that link to one unit.
@@ -1250,10 +1265,7 @@ impl RustHierarchyIndex {
         for file in files {
             let source_facts = rust.canonical_rust_hierarchy_source_facts(file, &|| true)?;
             let source_index = RustHierarchyFileIndex::new(source_facts.as_ref(), &|| true)?;
-            builder.record_trait_methods(&source_index)?;
-            for macro_fact in &source_index.facts.items.macros {
-                builder.record_macro_expansion(rust, token, file, &source_index, macro_fact)?;
-            }
+            builder.record_common_file_facts(rust, token, file, &source_index)?;
             for impl_fact in &source_index.facts.items.impls {
                 if !source_index
                     .contexts
@@ -1308,10 +1320,7 @@ impl RustHierarchyIndex {
         for (position, file) in files.iter().enumerate() {
             let source_facts = rust.canonical_rust_hierarchy_source_facts(file, &|| true)?;
             let source_index = RustHierarchyFileIndex::new(source_facts.as_ref(), &|| true)?;
-            builder.record_trait_methods(&source_index)?;
-            for macro_fact in &source_index.facts.items.macros {
-                builder.record_macro_expansion(rust, token, file, &source_index, macro_fact)?;
-            }
+            builder.record_common_file_facts(rust, token, file, &source_index)?;
             if let Some(namings) = namings.get(file) {
                 builder.account_item_macros(
                     rust,
@@ -1396,6 +1405,20 @@ impl RustHierarchyIndex {
 }
 
 impl RustHierarchyBuilder {
+    fn record_common_file_facts(
+        &mut self,
+        rust: &dyn RustFactSource,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+        source_index: &RustHierarchyFileIndex<'_>,
+    ) -> Result<(), RustCargoRouteError> {
+        self.record_trait_methods(source_index)?;
+        for macro_fact in &source_index.facts.items.macros {
+            self.record_macro_expansion(rust, token, file, source_index, macro_fact)?;
+        }
+        Ok(())
+    }
+
     /// The traits whose enumerability `member`'s answer follows, once the
     /// member's own file has been read: the trait whose method table lists it,
     /// or the traits its impls were recorded against. No other file declares
@@ -2392,12 +2415,4 @@ where
         }
     }
     Ok(resolved)
-}
-
-fn join_rust_fqn(package: &str, name: &str) -> String {
-    if package.is_empty() {
-        name.to_string()
-    } else {
-        format!("{package}.{name}")
-    }
 }

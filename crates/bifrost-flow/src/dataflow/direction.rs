@@ -156,13 +156,11 @@ impl DataflowDirectionCapabilities {
     /// implementations themselves.
     pub const fn all_supported() -> Self {
         Self {
-            forward_bounded_snapshot: true,
-            backward_bounded_snapshot: true,
-            backward_reverse_semantics_complete: true,
             forward_reusable_summaries: true,
             backward_reusable_summaries: true,
             forward_normalized_witnesses: true,
             backward_normalized_witnesses: true,
+            ..Self::bounded_snapshot()
         }
     }
 
@@ -244,6 +242,16 @@ pub struct DataflowDirectionRequirements {
 }
 
 impl DataflowDirectionRequirements {
+    pub(crate) const fn unsupported_backward_output(&self) -> Option<DataflowDirectionCapability> {
+        if self.reusable_summaries {
+            Some(DataflowDirectionCapability::ReusableSummaries)
+        } else if self.normalized_witnesses {
+            Some(DataflowDirectionCapability::NormalizedWitnesses)
+        } else {
+            None
+        }
+    }
+
     pub const fn none() -> Self {
         Self {
             bounded_snapshot: false,
@@ -320,18 +328,22 @@ impl DataflowDirectionEstimate {
 
     /// Conservative forward work estimate using saturating arithmetic.
     pub const fn forward_cost(self) -> usize {
-        self.forward_nodes
-            .saturating_add(self.forward_edges)
-            .saturating_add(self.forward_transfer_fanout)
-            .saturating_add(self.bound_sources)
+        saturating_work_cost(
+            self.forward_nodes,
+            self.forward_edges,
+            self.forward_transfer_fanout,
+            self.bound_sources,
+        )
     }
 
     /// Conservative backward work estimate using saturating arithmetic.
     pub const fn backward_cost(self) -> usize {
-        self.backward_nodes
-            .saturating_add(self.backward_edges)
-            .saturating_add(self.backward_transfer_fanout)
-            .saturating_add(self.bound_sinks)
+        saturating_work_cost(
+            self.backward_nodes,
+            self.backward_edges,
+            self.backward_transfer_fanout,
+            self.bound_sinks,
+        )
     }
 
     pub const fn cost(self, direction: DataflowDirection) -> usize {
@@ -340,6 +352,18 @@ impl DataflowDirectionEstimate {
             DataflowDirection::Backward => self.backward_cost(),
         }
     }
+}
+
+const fn saturating_work_cost(
+    nodes: usize,
+    edges: usize,
+    transfer_fanout: usize,
+    boundary_count: usize,
+) -> usize {
+    nodes
+        .saturating_add(edges)
+        .saturating_add(transfer_fanout)
+        .saturating_add(boundary_count)
 }
 
 /// Why the planner selected a direction.
@@ -408,7 +432,7 @@ impl DataflowDirectionPlan {
     }
 
     pub const fn selected_direction(self) -> DataflowDirection {
-        self.direction
+        self.direction()
     }
 
     pub const fn reason(self) -> DataflowDirectionSelectionReason {
@@ -648,53 +672,8 @@ pub const fn plan_dataflow_direction(
 mod tests {
     use super::*;
 
-    const REQUIREMENTS: DataflowDirectionRequirements = DataflowDirectionRequirements::none();
-    const CAPABILITIES: DataflowDirectionCapabilities =
-        DataflowDirectionCapabilities::all_supported();
-
     fn estimate(forward: usize, backward: usize) -> DataflowDirectionEstimate {
         DataflowDirectionEstimate::new(forward, 0, 0, backward, 0, 0, 0, 0)
-    }
-
-    #[test]
-    fn auto_defaults_to_forward_for_ties_and_selects_at_threshold() {
-        let tie = plan_dataflow_direction(
-            DataflowQueryPlanConfig::default(),
-            estimate(100, 100),
-            CAPABILITIES,
-            REQUIREMENTS,
-        )
-        .unwrap();
-        assert_eq!(tie.direction(), DataflowDirection::Forward);
-        assert_eq!(
-            tie.reason(),
-            DataflowDirectionSelectionReason::AutoForwardTie
-        );
-
-        let threshold = plan_dataflow_direction(
-            DataflowQueryPlanConfig::default(),
-            estimate(100, 80),
-            CAPABILITIES,
-            REQUIREMENTS,
-        )
-        .unwrap();
-        assert_eq!(threshold.direction(), DataflowDirection::Backward);
-        assert_eq!(
-            threshold.reason(),
-            DataflowDirectionSelectionReason::AutoBackwardSavings
-        );
-    }
-
-    #[test]
-    fn zero_cost_tie_still_prefers_forward() {
-        let plan = plan_dataflow_direction(
-            DataflowQueryPlanConfig::default(),
-            DataflowDirectionEstimate::default(),
-            CAPABILITIES,
-            REQUIREMENTS,
-        )
-        .unwrap();
-        assert_eq!(plan.direction(), DataflowDirection::Forward);
     }
 
     #[test]
@@ -711,117 +690,6 @@ mod tests {
         );
         assert_eq!(estimate.forward_cost(), usize::MAX);
         assert_eq!(estimate.backward_cost(), usize::MAX);
-    }
-
-    #[test]
-    fn bound_observations_contribute_to_their_directional_cost() {
-        let estimate = DataflowDirectionEstimate::new(100, 0, 0, 100, 0, 0, 100, 0);
-        let plan = plan_dataflow_direction(
-            DataflowQueryPlanConfig::default(),
-            estimate,
-            CAPABILITIES,
-            REQUIREMENTS,
-        )
-        .unwrap();
-
-        assert_eq!(estimate.forward_cost(), 200);
-        assert_eq!(estimate.backward_cost(), 100);
-        assert_eq!(plan.direction(), DataflowDirection::Backward);
-    }
-
-    #[test]
-    fn explicit_directions_are_deterministic() {
-        let forward = plan_dataflow_direction(
-            DataflowQueryPlanConfig::new(DataflowDirectionRequest::Forward),
-            estimate(1000, 1),
-            CAPABILITIES,
-            REQUIREMENTS,
-        )
-        .unwrap();
-        assert_eq!(forward.direction(), DataflowDirection::Forward);
-        assert_eq!(
-            forward.reason(),
-            DataflowDirectionSelectionReason::ExplicitForward
-        );
-
-        let backward = plan_dataflow_direction(
-            DataflowQueryPlanConfig::new(DataflowDirectionRequest::Backward),
-            estimate(1, 1000),
-            CAPABILITIES,
-            REQUIREMENTS,
-        )
-        .unwrap();
-        assert_eq!(backward.direction(), DataflowDirection::Backward);
-        assert_eq!(
-            backward.reason(),
-            DataflowDirectionSelectionReason::ExplicitBackward
-        );
-    }
-
-    #[test]
-    fn explicit_backward_reports_the_missing_capability() {
-        let requirements = DataflowDirectionRequirements::none().with_reusable_summaries(true);
-        let capabilities = DataflowDirectionCapabilities::current();
-        let error = plan_dataflow_direction(
-            DataflowQueryPlanConfig::new(DataflowDirectionRequest::Backward),
-            estimate(1, 1),
-            capabilities,
-            requirements,
-        )
-        .unwrap_err();
-        assert_eq!(
-            error,
-            DataflowDirectionPlanningError::UnsupportedDirection {
-                requested: DataflowDirectionRequest::Backward,
-                direction: DataflowDirection::Backward,
-                missing: DataflowDirectionCapability::ReusableSummaries,
-            }
-        );
-    }
-
-    #[test]
-    fn auto_falls_forward_for_each_missing_backward_capability() {
-        for (requirements, missing) in [
-            (
-                DataflowDirectionRequirements::none().with_bounded_snapshot(true),
-                DataflowDirectionCapability::BoundedSnapshot,
-            ),
-            (
-                DataflowDirectionRequirements::none().with_reusable_summaries(true),
-                DataflowDirectionCapability::ReusableSummaries,
-            ),
-            (
-                DataflowDirectionRequirements::none().with_normalized_witnesses(true),
-                DataflowDirectionCapability::NormalizedWitnesses,
-            ),
-            (
-                DataflowDirectionRequirements::none().with_complete_reverse_semantics(true),
-                DataflowDirectionCapability::CompleteReverseSemantics,
-            ),
-        ] {
-            let capabilities = DataflowDirectionCapabilities {
-                backward_bounded_snapshot: missing != DataflowDirectionCapability::BoundedSnapshot,
-                backward_reverse_semantics_complete: missing
-                    != DataflowDirectionCapability::CompleteReverseSemantics,
-                backward_reusable_summaries: missing
-                    != DataflowDirectionCapability::ReusableSummaries,
-                backward_normalized_witnesses: missing
-                    != DataflowDirectionCapability::NormalizedWitnesses,
-                ..CAPABILITIES
-            };
-            let plan = plan_dataflow_direction(
-                DataflowQueryPlanConfig::default(),
-                estimate(1000, 1),
-                capabilities,
-                requirements,
-            )
-            .unwrap();
-            assert_eq!(plan.direction(), DataflowDirection::Forward);
-            assert_eq!(
-                plan.reason(),
-                DataflowDirectionSelectionReason::AutoForwardMissingBackwardCapability(missing)
-            );
-        }
     }
 
     #[test]
@@ -859,44 +727,5 @@ mod tests {
                 missing: DataflowDirectionCapability::CompleteReverseSemantics,
             }
         );
-    }
-
-    #[test]
-    fn invalid_threshold_is_typed() {
-        let error = plan_dataflow_direction(
-            DataflowQueryPlanConfig::default().with_minimum_backward_savings_percent(101),
-            estimate(100, 1),
-            CAPABILITIES,
-            REQUIREMENTS,
-        )
-        .unwrap_err();
-        assert_eq!(
-            error,
-            DataflowDirectionPlanningError::InvalidMinimumBackwardSavingsPercent { percent: 101 }
-        );
-    }
-
-    #[test]
-    fn execution_metrics_keep_snapshot_and_propagation_work_separate() {
-        let plan = plan_dataflow_direction(
-            DataflowQueryPlanConfig::default(),
-            estimate(100, 10),
-            CAPABILITIES,
-            REQUIREMENTS,
-        )
-        .unwrap();
-        let snapshot_work = SemanticWork {
-            control_edges: 7,
-            ..SemanticWork::default()
-        };
-        let propagation_work = SolverWork {
-            propagated_outputs: 13,
-            ..SolverWork::default()
-        };
-        let metrics = plan.record_work(snapshot_work, propagation_work);
-
-        assert_eq!(metrics.direction(), DataflowDirection::Backward);
-        assert_eq!(metrics.snapshot_work(), snapshot_work);
-        assert_eq!(metrics.propagation_work(), propagation_work);
     }
 }

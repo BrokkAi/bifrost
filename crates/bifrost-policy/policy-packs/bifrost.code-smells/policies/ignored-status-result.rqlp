@@ -1,27 +1,47 @@
 ; Files.deleteIfExists(Path) returns false when the file did not exist. The
 ; false status is not an I/O exception; I/O failures are thrown separately.
-; This policy asks only whether the reviewed status value was discarded.
+; Go's native error result and Rust's core/std Result are the native arms:
+; only exact declaration signatures prove them, and explicit blank
+; assignments remain intentional discards.
 (policy
   :schema-version 1
   :id "bifrost.correctness.ignored-status-result"
-  :name "Ignored file-deletion status"
-  :message "the reviewed deletion status is discarded"
+  :name "Ignored fallible result"
+  :message "a fallible result is discarded"
   :severity note
-  :description "The exact JDK 21 Files.deleteIfExists(Path) call returns a Boolean status: false means no file was deleted because it did not exist. An expression statement or for-loop initializer/update discards that status. An expression lambda discards the status only when its resolved functional method returns void; a value-returning target retains it. Missing or conflicting contracts remain incomplete, and a diagnostic does not prove the deferred body executes. I/O exceptions remain separate. This diagnostic requires exact selected-artifact and dispatch evidence; it does not claim that discarding the status is always a bug."
+  :description "The exact JDK 21 Files.deleteIfExists(Path) call returns a Boolean status: false means no file was deleted because it did not exist. Go calls whose resolved declaration has a native predeclared error result and Rust calls whose resolved declaration returns core/std Result are covered by the same result-use relation. An expression statement or for-loop initializer/update discards a result; an explicit blank assignment is intentional. Missing or conflicting contracts, shadowed Go error names, unproved Rust aliases, and unresolved dispatch remain incomplete. I/O exceptions and standard-library Write methods documented to never return an error remain separate. This diagnostic does not claim that every discarded fallible result is always a bug."
   :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
-  :tags ["correctness" "java" "result-use" "status"]
+  :tags ["correctness" "java" "go" "rust" "result-use" "status"]
   :analysis (analysis
     :type assertion
     (bind :name discarded
       :query (rql :schema-version 1
-        (filter :where ((obligation_kind eq fallible_status)
-                        (failure_predicate eq (enum false))
-                        (result_use eq discarded)
-                        (coverage eq exhaustive)
-                        (terminal eq false))
-          (language java
-            (call-result-obligations
-              (call-shape (call :callee "deleteIfExists")))))))
+        (union
+          (filter :where ((obligation_kind eq fallible_status)
+                          (failure_predicate eq (enum false))
+                          (provenance eq reviewed)
+                          (result_use eq discarded)
+                          (coverage eq exhaustive)
+                          (terminal eq false))
+            (language java
+              (call-result-obligations
+                (call-shape (call :callee "deleteIfExists")))))
+          (filter :where ((obligation_kind eq fallible_status)
+                          (provenance eq native)
+                          (result_use eq discarded)
+                          (coverage eq exhaustive)
+                          (terminal eq false))
+            (language go
+              (call-result-obligations
+                (call-shape (call)))))
+          (filter :where ((obligation_kind eq fallible_status)
+                          (provenance eq native)
+                          (result_use eq discarded)
+                          (coverage eq exhaustive)
+                          (terminal eq false))
+            (language rust
+              (call-result-obligations
+                (call-shape (call))))))))
     (group :name by-call :by (discarded.id)
       (aggregate :name ignored-statuses :op count))
     (assert :group by-call :value ignored-statuses :cardinality (exactly 0))))

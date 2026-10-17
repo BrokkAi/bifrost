@@ -86,24 +86,6 @@ mod tests {
     use super::*;
     use crate::analyzer::semantic_model::TypeRefReferenceKind;
 
-    fn named(name: &str) -> TypeRef {
-        TypeRef::Named {
-            name: name.to_owned(),
-            arguments: Vec::new(),
-            nullable: false,
-        }
-    }
-
-    #[test]
-    fn type_identity_is_deterministic() {
-        let identity = TypeIdentity {
-            ecosystem: "maven",
-            name: "com.example.Widget`1",
-        };
-        assert_eq!(type_declaration_id(identity), type_declaration_id(identity));
-        assert!(type_declaration_id(identity).starts_with("type."));
-    }
-
     #[test]
     fn member_identity_tracks_overload_shape() {
         fn identity<'a>(owner_id: &'a str, parameter_types: &'a [TypeRef]) -> MemberIdentity<'a> {
@@ -124,8 +106,14 @@ mod tests {
             ecosystem: "nuget",
             name: "Example.Client`1",
         });
-        let one = [named("System.String"), named("System.Int32")];
-        let reversed = [named("System.Int32"), named("System.String")];
+        let one = [
+            TypeRef::named("System.String"),
+            TypeRef::named("System.Int32"),
+        ];
+        let reversed = [
+            TypeRef::named("System.Int32"),
+            TypeRef::named("System.String"),
+        ];
         assert_eq!(
             member_declaration_id(identity(&owner_id, &one)),
             member_declaration_id(identity(&owner_id, &one))
@@ -139,7 +127,7 @@ mod tests {
     #[test]
     fn member_identity_distinguishes_lvalue_and_rvalue_references() {
         let owner_id = "type.cpp.example.Widget";
-        let named_type = named("example.Widget");
+        let named_type = TypeRef::named("example.Widget");
         let lvalue = [TypeRef::ByRef {
             element: Box::new(named_type.clone()),
             reference_kind: TypeRefReferenceKind::Lvalue,

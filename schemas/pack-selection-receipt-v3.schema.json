@@ -1,0 +1,634 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bifrost.dev/schemas/pack-selection-receipt-v3.schema.json",
+  "title": "Open Pack Selection Receipt",
+  "description": "The immutable record of the verified releases and content selected for an open-pack acquisition.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "receipt_schema_version": {
+      "type": "integer",
+      "const": 3
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "qualified",
+        "compatible"
+      ]
+    },
+    "selection_id": {
+      "$ref": "#/$defs/Sha256"
+    },
+    "selection_reason": {
+      "type": "string",
+      "enum": [
+        "strict-lock",
+        "preferred-version",
+        "highest-eligible"
+      ]
+    },
+    "request": {
+      "$ref": "pack-request-v1.schema.json"
+    },
+    "engine": {
+      "$ref": "#/$defs/ReceiptEngine"
+    },
+    "source": {
+      "$ref": "#/$defs/SourceInventory"
+    },
+    "releases": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/SelectedRelease"
+      }
+    },
+    "rejections": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {
+        "$ref": "#/$defs/Rejection"
+      }
+    },
+    "extracted_files": {
+      "$ref": "#/$defs/ExtractedFiles"
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/CachedArtifact"
+      }
+    },
+    "replay": {
+      "$ref": "pack-request-v1.schema.json"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "required": [
+    "receipt_schema_version",
+    "status",
+    "selection_id",
+    "selection_reason",
+    "request",
+    "engine",
+    "source",
+    "releases",
+    "rejections",
+    "extracted_files",
+    "artifacts",
+    "replay",
+    "created_at"
+  ],
+  "$defs": {
+    "Sha256": {
+      "type": "string",
+      "pattern": "^[A-Fa-f0-9]{64}$"
+    },
+    "ReceiptEngine": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "build_identity": {
+          "type": "string",
+          "minLength": 1
+        },
+        "profile": {
+          "$ref": "#/$defs/EngineProfile"
+        }
+      },
+      "required": [
+        "version",
+        "build_identity",
+        "profile"
+      ]
+    },
+    "EngineProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "engine_version": {
+          "type": "string"
+        },
+        "build_identity": {
+          "type": "string"
+        },
+        "model_set_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "capability_contract_version": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "capabilities": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "schemas": {
+          "$ref": "#/$defs/EngineSchemas"
+        }
+      },
+      "required": [
+        "engine_version",
+        "build_identity",
+        "model_set_sha256",
+        "capability_contract_version",
+        "capabilities",
+        "schemas"
+      ]
+    },
+    "EngineSchemas": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "policy_document": {
+          "$ref": "#/$defs/SchemaVersions"
+        },
+        "rql": {
+          "$ref": "#/$defs/SchemaVersions"
+        },
+        "builtin_catalog": {
+          "$ref": "#/$defs/SchemaVersions"
+        },
+        "policy_bundle": {
+          "$ref": "#/$defs/SchemaVersions"
+        },
+        "semantic_model_read": {
+          "$ref": "#/$defs/SchemaVersions"
+        },
+        "semantic_model_write": {
+          "$ref": "#/$defs/SchemaVersions"
+        },
+        "semantic_spec": {
+          "$ref": "#/$defs/SchemaVersions"
+        },
+        "release_index": {
+          "$ref": "#/$defs/SchemaVersions"
+        },
+        "runtime": {
+          "$ref": "#/$defs/SchemaVersions"
+        }
+      },
+      "required": [
+        "policy_document",
+        "rql",
+        "builtin_catalog",
+        "policy_bundle",
+        "semantic_model_read",
+        "semantic_model_write",
+        "semantic_spec",
+        "release_index",
+        "runtime"
+      ]
+    },
+    "SchemaVersions": {
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "SourceInventory": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "repository": {
+          "$ref": "pack-request-v1.schema.json#/$defs/RepositoryUrl"
+        },
+        "inventory_url": {
+          "anyOf": [
+            {
+              "$ref": "pack-request-v1.schema.json#/$defs/InventoryUrl"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "inventory_sha256_pin": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "index_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "fetched_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "fetched_online": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "repository",
+        "inventory_url",
+        "inventory_sha256_pin",
+        "index_sha256",
+        "fetched_at",
+        "fetched_online"
+      ]
+    },
+    "SelectedRelease": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "role": {
+          "type": "string",
+          "enum": [
+            "root",
+            "dependency"
+          ]
+        },
+        "pack_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "release_version": {
+          "$ref": "pack-request-v1.schema.json#/$defs/SemVer"
+        },
+        "visibility": {
+          "type": "string",
+          "enum": [
+            "public",
+            "private"
+          ]
+        },
+        "tag": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tag_commit": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_commit": {
+          "type": "string",
+          "minLength": 1
+        },
+        "manifest_schema_version": {
+          "type": "integer",
+          "enum": [
+            1,
+            2
+          ]
+        },
+        "manifest_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "qualification": {
+          "$ref": "#/$defs/Qualification"
+        },
+        "provenance": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Provenance"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "artifacts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ReleaseArtifact"
+          }
+        },
+        "contents": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ContentRecord"
+          }
+        }
+      },
+      "required": [
+        "role",
+        "pack_id",
+        "release_version",
+        "visibility",
+        "tag",
+        "tag_commit",
+        "source_commit",
+        "manifest_schema_version",
+        "manifest_sha256",
+        "qualification",
+        "provenance",
+        "artifacts",
+        "contents"
+      ]
+    },
+    "Qualification": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/QualificationV1"
+        },
+        {
+          "$ref": "#/$defs/QualificationV2"
+        }
+      ]
+    },
+    "QualificationV1": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "status",
+        "evidence"
+      ]
+    },
+    "QualificationV2": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "integrity": {
+          "$ref": "#/$defs/QualificationState"
+        },
+        "behavior": {
+          "$ref": "#/$defs/QualificationState"
+        }
+      },
+      "required": [
+        "integrity",
+        "behavior"
+      ]
+    },
+    "QualificationState": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "status",
+        "evidence"
+      ]
+    },
+    "Provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "engine_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "build_identity": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_commit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "testing": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/EngineProvenance"
+          }
+        }
+      }
+    },
+    "EngineProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "engine_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "build_identity": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_commit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "ReleaseArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "role": {
+          "type": "string",
+          "minLength": 1
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "sha256": {
+          "$ref": "#/$defs/Sha256"
+        }
+      },
+      "required": [
+        "name",
+        "role",
+        "size_bytes",
+        "sha256"
+      ]
+    },
+    "ContentRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "$ref": "#/$defs/Sha256"
+        }
+      },
+      "required": [
+        "path",
+        "sha256"
+      ]
+    },
+    "ExtractedFiles": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "root": {
+          "$ref": "#/$defs/ExtractedFileList"
+        }
+      },
+      "patternProperties": {
+        "^dependency-[A-Za-z0-9._-]+$": {
+          "$ref": "#/$defs/ExtractedFileList"
+        }
+      },
+      "required": [
+        "root"
+      ]
+    },
+    "ExtractedFileList": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ExtractedFile"
+      }
+    },
+    "ExtractedFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "sha256": {
+          "$ref": "#/$defs/Sha256"
+        }
+      },
+      "required": [
+        "path",
+        "size_bytes",
+        "sha256"
+      ]
+    },
+    "CachedArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "pack_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "release_version": {
+          "$ref": "pack-request-v1.schema.json#/$defs/SemVer"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "role": {
+          "type": "string",
+          "minLength": 1
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "cache_path": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "pack_id",
+        "release_version",
+        "name",
+        "role",
+        "size_bytes",
+        "sha256",
+        "cache_path"
+      ]
+    },
+    "Rejection": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "pack_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "release_version": {
+          "$ref": "pack-request-v1.schema.json#/$defs/SemVer"
+        },
+        "tag": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reason": {
+          "type": "string",
+          "enum": [
+            "channel",
+            "version-range",
+            "engine-contract",
+            "dependency-missing",
+            "dependency-repository",
+            "dependency-transitive",
+            "dependency-engine-contract",
+            "dependency-pin-mismatch",
+            "qualification-integrity-failed",
+            "qualification-behavior-failed",
+            "qualification-pending"
+          ]
+        },
+        "detail": {
+          "type": "string",
+          "maxLength": 1024
+        }
+      },
+      "required": [
+        "pack_id",
+        "release_version",
+        "tag",
+        "reason",
+        "detail"
+      ]
+    }
+  }
+}

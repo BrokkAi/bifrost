@@ -27,6 +27,8 @@ pub struct CodeQueryConfigurationFact {
     pub role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scalar_kind: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
     /// Authorship provenance for this configuration fact. The wire name is
     /// distinct from `CodeQueryResultItem::provenance`, which is flattened
     /// into the same object as query-derivation provenance.

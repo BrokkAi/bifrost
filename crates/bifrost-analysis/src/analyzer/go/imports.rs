@@ -321,6 +321,7 @@ mod tests {
         Language, ProjectFile, QueryScope,
     };
     use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_test_macros::hardwon;
 
     fn test_analyzer(
         files: &[(&str, &str)],
@@ -377,6 +378,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#1748: reachability regressed when it scanned declarations instead of package file facts"
+    )]
     fn reachability_is_decided_from_package_facts() {
         let (_project, analyzer) = workspace();
         let store = file(&analyzer, "store/store.go");
@@ -413,6 +417,7 @@ mod tests {
     /// Before this change every undecided pair materialized the declarations
     /// of every file the candidate's imports brought in.
     #[test]
+    #[hardwon("#1748: warm reachability queries repeatedly hydrated workspace files")]
     fn reachability_hydrates_no_file_state_once_warm() {
         let (_project, analyzer) = workspace();
         let files: Vec<ProjectFile> = [

@@ -5,7 +5,9 @@
 //! normalization that knows Python moved to [`brokk_bifrost_python::clones`].
 
 use super::PythonAnalyzer;
-use crate::analyzer::clone_detection::{CloneCandidateData, compact_clone_excerpt};
+use crate::analyzer::clone_detection::{
+    CloneCandidateData, build_clone_candidate_data as build_shared_clone_candidate_data,
+};
 use crate::analyzer::{CloneSmellWeights, CodeUnit, CodeUnitIndex};
 use brokk_bifrost_python::clones::prepare_python_clone;
 
@@ -14,18 +16,13 @@ pub(super) fn build_clone_candidate_data(
     code_unit: &CodeUnit,
     weights: CloneSmellWeights,
 ) -> Option<CloneCandidateData> {
-    let source = analyzer
-        .get_source(code_unit, false)
-        .map(|source| source.trim().to_string())
-        .filter(|source| !source.is_empty());
-    let source = source?;
-
-    let preparation = prepare_python_clone(&source, weights.min_normalized_tokens.max(0) as usize);
-    let preparation = preparation?;
-    Some(CloneCandidateData {
-        unit: code_unit.clone(),
-        normalized_tokens: preparation.normalized_tokens,
-        ast_signature: preparation.ast_signature,
-        excerpt: compact_clone_excerpt(&source),
-    })
+    build_shared_clone_candidate_data(
+        analyzer.get_source(code_unit, false),
+        code_unit,
+        weights,
+        |source, minimum| {
+            let preparation = prepare_python_clone(source, minimum)?;
+            Some((preparation.normalized_tokens, preparation.ast_signature))
+        },
+    )
 }

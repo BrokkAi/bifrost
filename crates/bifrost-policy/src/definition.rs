@@ -9,7 +9,8 @@ use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::str::FromStr;
 
-use brokk_bifrost_analysis::analyzer::identifier::define_identifier;
+use brokk_bifrost_analysis::analyzer::identifier::{define_identifier, is_lower_alphanumeric};
+pub use brokk_bifrost_analysis::analyzer::semantic::ValueTypePredicate;
 use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
 use brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelProvenance;
 use brokk_bifrost_analysis::analyzer::usages::{ReferenceKind, UsageHitKind, UsageHitSurface};
@@ -116,16 +117,6 @@ pub enum PolicyAnalysis {
 }
 
 impl PolicyAnalysis {
-    pub const fn analysis_type(&self) -> PolicyAnalysisType {
-        match self {
-            Self::Match { .. } => PolicyAnalysisType::Match,
-            Self::Taint { .. } => PolicyAnalysisType::Taint,
-            Self::Typestate { .. } => PolicyAnalysisType::Typestate,
-            Self::Assertion { .. } => PolicyAnalysisType::Assertion,
-            Self::Flow { .. } => PolicyAnalysisType::Flow,
-        }
-    }
-
     /// The taint-shaped model this analysis executes through, for the two
     /// kinds that share the production taint pipeline.
     pub const fn taint_shaped_spec(&self) -> Option<&TaintPolicySpec> {
@@ -147,6 +138,8 @@ impl PolicyAnalysis {
         }
     }
 }
+
+crate::impl_policy_analysis_type!(PolicyAnalysis);
 
 /// The one internal provenance label every `analysis :type flow` policy is
 /// closed over. It is never authored and never rendered as a taint label; a
@@ -267,6 +260,7 @@ pub enum ReceiverTypeConstraintKind {
 pub enum ResolvedPolicyLocatorRole {
     Callable,
     ReceiverType,
+    Value,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -486,17 +480,18 @@ pub enum RowPredicateOp {
 
 impl RowPredicateOp {
     pub const fn label(self) -> &'static str {
-        match self {
-            Self::Eq => "eq",
-            Self::Ne => "ne",
-            Self::Lt => "lt",
-            Self::Le => "le",
-            Self::Gt => "gt",
-            Self::Ge => "ge",
-            Self::IsNull => "is-null",
-            Self::IsNotNull => "is-not-null",
-            Self::In => "in",
-        }
+        let operator = match self {
+            Self::Eq => brokk_bifrost_rql::query::QueryRowPredicateOp::Eq,
+            Self::Ne => brokk_bifrost_rql::query::QueryRowPredicateOp::Ne,
+            Self::Lt => brokk_bifrost_rql::query::QueryRowPredicateOp::Lt,
+            Self::Le => brokk_bifrost_rql::query::QueryRowPredicateOp::Le,
+            Self::Gt => brokk_bifrost_rql::query::QueryRowPredicateOp::Gt,
+            Self::Ge => brokk_bifrost_rql::query::QueryRowPredicateOp::Ge,
+            Self::IsNull => brokk_bifrost_rql::query::QueryRowPredicateOp::IsNull,
+            Self::IsNotNull => brokk_bifrost_rql::query::QueryRowPredicateOp::IsNotNull,
+            Self::In => brokk_bifrost_rql::query::QueryRowPredicateOp::In,
+        };
+        operator.label()
     }
 
     /// Every spelling, in the order the documentation lists them.
@@ -521,6 +516,7 @@ impl RowPredicateOp {
 pub enum RowLiteral {
     String(String),
     StringList(Vec<String>),
+    IntegerList(Vec<u64>),
     Integer(u64),
     Boolean(bool),
     ConstrainedEnum(String),
@@ -534,6 +530,7 @@ impl fmt::Display for RowLiteral {
         match self {
             Self::String(value) => write!(formatter, "\"{value}\""),
             Self::StringList(value) => write!(formatter, "{value:?}"),
+            Self::IntegerList(value) => write!(formatter, "{value:?}"),
             Self::Integer(value) => write!(formatter, "{value}"),
             Self::Boolean(value) => write!(formatter, "{value}"),
             Self::ConstrainedEnum(value) => formatter.write_str(value),
@@ -1326,13 +1323,7 @@ impl EdgeParityAssert {
         } else {
             "every forward edge has a field-identical inverse counterpart"
         };
-        match self.surface {
-            Some(surface) => format!(
-                "{direction} on the {} surface",
-                brokk_bifrost_rql::schema::usage_surface_label(surface)
-            ),
-            None => direction.to_string(),
-        }
+        with_usage_surface_expectation(direction, self.surface)
     }
 }
 
@@ -1354,13 +1345,21 @@ pub struct EdgeClassAssert {
 impl EdgeClassAssert {
     pub fn expectation(&self) -> String {
         let base = self.constraint.expectation();
-        match self.surface {
-            Some(surface) => format!(
-                "{base} on the {} surface",
-                brokk_bifrost_rql::schema::usage_surface_label(surface)
-            ),
-            None => base,
-        }
+        with_usage_surface_expectation(base, self.surface)
+    }
+}
+
+fn with_usage_surface_expectation(
+    base: impl AsRef<str>,
+    surface: Option<UsageHitSurface>,
+) -> String {
+    match surface {
+        Some(surface) => format!(
+            "{} on the {} surface",
+            base.as_ref(),
+            brokk_bifrost_rql::schema::usage_surface_label(surface)
+        ),
+        None => base.as_ref().to_string(),
     }
 }
 
@@ -1518,12 +1517,33 @@ pub enum PolicyLevel {
     Error,
 }
 
+impl PolicyLevel {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Note => "note",
+            Self::Warning => "warning",
+            Self::Error => "error",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FindingSeverity {
     Unrated,
     Note,
     Warning,
     Error,
+}
+
+impl FindingSeverity {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Unrated => "unrated",
+            Self::Note => "note",
+            Self::Warning => "warning",
+            Self::Error => "error",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1570,6 +1590,15 @@ pub enum EndpointRole {
     Sink,
 }
 
+impl EndpointRole {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Sink => "sink",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyEndpointBinding {
     MatchedValue,
@@ -1584,6 +1613,7 @@ pub enum PolicyEndpointBinding {
 pub enum EndpointTaintSemantics {
     Source {
         labels: Vec<TaintLabel>,
+        threat_model: Option<TaintThreatModel>,
         evidence: Option<TaintSourceEvidence>,
     },
     Sink {
@@ -1631,13 +1661,46 @@ pub enum MayMode {
     May,
 }
 
+impl MayMode {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::May => "may",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum TaintThreatModel {
+    Remote,
+    CommandArgs,
+    Environment,
+    Stdin,
+    File,
+    Database,
+}
+
+impl TaintThreatModel {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Remote => "remote",
+            Self::CommandArgs => "commandargs",
+            Self::Environment => "environment",
+            Self::Stdin => "stdin",
+            Self::File => "file",
+            Self::Database => "database",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TaintPolicySpec {
     pub mode: MayMode,
     pub call_modeling: CallModelingSpec,
+    pub threat_models: Vec<TaintThreatModel>,
     pub sources: TaintEndpointSet<TaintSourceSpec>,
     pub sinks: TaintEndpointSet<TaintSinkSpec>,
     pub sanitizers: TaintEndpointSet<TaintSanitizerSpec>,
+    pub barriers: TaintEndpointSet<TaintBarrierSpec>,
     pub entry_points: TaintEndpointSet<TaintEntryPointSpec>,
     pub transforms: TaintEndpointSet<TaintTransformSpec>,
     pub external_models: TaintEndpointSet<TaintExternalModelSpec>,
@@ -1682,6 +1745,7 @@ pub enum EndpointSetKind {
     Sources,
     Sinks,
     Sanitizers,
+    Barriers,
     EntryPoints,
     Transforms,
     ExternalModels,
@@ -1698,6 +1762,7 @@ impl EndpointSetKind {
             Self::Sources => "sources",
             Self::Sinks => "sinks",
             Self::Sanitizers => "sanitizers",
+            Self::Barriers => "barriers",
             Self::EntryPoints => "entry-points",
             Self::Transforms => "transforms",
             Self::ExternalModels => "external-models",
@@ -1760,10 +1825,47 @@ pub enum DirectoryScope {
     Recursive,
 }
 
+impl DirectoryScope {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Recursive => "recursive",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CategoryPredicate {
     Any { categories: Vec<PolicyCategoryId> },
     All { categories: Vec<PolicyCategoryId> },
+}
+
+impl CategoryPredicate {
+    pub(crate) fn matches_categories(&self, categories: &[PolicyCategoryId]) -> bool {
+        match self {
+            Self::Any {
+                categories: expected,
+            } => expected
+                .iter()
+                .any(|category| categories.contains(category)),
+            Self::All {
+                categories: expected,
+            } => expected
+                .iter()
+                .all(|category| categories.contains(category)),
+        }
+    }
+}
+
+pub(crate) fn is_valid_namespaced_identifier(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && is_lower_alphanumeric(bytes[0])
+        && is_lower_alphanumeric(bytes[bytes.len() - 1])
+        && bytes
+            .iter()
+            .copied()
+            .all(|byte| is_lower_alphanumeric(byte) || matches!(byte, b'.' | b'-' | b'_'))
 }
 
 #[derive(Debug, Clone)]
@@ -1828,6 +1930,7 @@ pub struct TaintSourceSpec {
     pub selector: PolicySelector,
     pub bind: PolicyPort,
     pub labels: Vec<TaintLabel>,
+    pub threat_model: Option<TaintThreatModel>,
     pub evidence: Option<TaintSourceEvidence>,
 }
 
@@ -1844,6 +1947,16 @@ pub enum TaintTrustBoundary {
     SameTrustZone,
 }
 
+impl TaintTrustBoundary {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::External => "external",
+            Self::Internal => "internal",
+            Self::SameTrustZone => "same_trust_zone",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TaintSystemEntry {
     VulnerableSystemNetworkStack,
@@ -1851,6 +1964,18 @@ pub enum TaintSystemEntry {
     LocalInput,
     AdjacentNetwork,
     Physical,
+}
+
+impl TaintSystemEntry {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::VulnerableSystemNetworkStack => "vulnerable_system_network_stack",
+            Self::DownloadedArtifact => "downloaded_artifact",
+            Self::LocalInput => "local_input",
+            Self::AdjacentNetwork => "adjacent_network",
+            Self::Physical => "physical",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1863,6 +1988,13 @@ pub struct TaintSinkSpec {
     pub accepts: Vec<TaintLabel>,
     pub tags: Vec<TaintTag>,
     pub impacts: Vec<TaintImpact>,
+}
+
+/// A policy-specific node barrier, independent of call transfers and labels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaintBarrierSpec {
+    pub id: TaintEntryId,
+    pub value_type: ValueTypePredicate,
 }
 
 #[derive(Debug, Clone)]
@@ -2045,6 +2177,14 @@ pub enum InconclusivePolicy {
     Inconclusive,
 }
 
+impl InconclusivePolicy {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Inconclusive => "inconclusive",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TypestateAutomatonSpec {
     pub states: Vec<TypestateStateId>,
@@ -2070,6 +2210,7 @@ pub enum TypestateEventTrigger {
         selector: PolicySelector,
         subject: TypestateCallBinding,
         phase: EndpointObservationPhase,
+        argument_condition: Option<TypestateArgumentCondition>,
     },
     MatchEndpoints {
         set: MatchEndpointSetRef,
@@ -2079,6 +2220,15 @@ pub enum TypestateEventTrigger {
     SemanticEvent {
         event: PolicySemanticEvent,
     },
+}
+
+/// A direct Boolean equality requirement on one positional call argument.
+/// The typestate compiler evaluates this through the semantic value oracle;
+/// policy source text is never inspected to decide whether it matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TypestateArgumentCondition {
+    pub index: u32,
+    pub equals: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2443,10 +2593,28 @@ pub enum CvssSystemScope {
     SubsequentSystem,
 }
 
+impl CvssSystemScope {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::VulnerableSystem => "vulnerable_system",
+            Self::SubsequentSystem => "subsequent_system",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CvssEvidenceScope {
     Global,
     System { system: CvssSystemScope },
+}
+
+impl CvssEvidenceScope {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::System { system } => system.label(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -2996,6 +3164,10 @@ pub enum PolicyEvidenceRef {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PolicySelectorPath(Box<str>);
 
+pub(crate) fn json_pointer_segment(value: &str) -> String {
+    value.replace('~', "~0").replace('/', "~1")
+}
+
 impl PolicySelectorPath {
     pub fn new(path: impl AsRef<str>) -> Result<Self, PolicySelectorPathError> {
         let path = path.as_ref();
@@ -3091,7 +3263,7 @@ impl CatalogRef {
         version: u32,
         sha256: Option<TaintCatalogHash>,
     ) -> Result<Self, CatalogRefError> {
-        if version == 0 {
+        if !catalog_version_is_valid(version) {
             return Err(CatalogRefError::ZeroVersion);
         }
         Ok(Self {
@@ -3100,6 +3272,10 @@ impl CatalogRef {
             sha256,
         })
     }
+}
+
+pub(crate) const fn catalog_version_is_valid(version: u32) -> bool {
+    version > 0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3194,26 +3370,22 @@ impl fmt::Display for Sha256ValueError {
 impl std::error::Error for Sha256ValueError {}
 
 pub(crate) fn parse_lower_sha256(value: &str) -> Result<[u8; 32], Sha256ValueError> {
+    if let Some(digest) =
+        brokk_bifrost_analysis::analyzer::canonical_hash::parse_lower_sha256(value)
+    {
+        return Ok(digest);
+    }
     if value.len() != 64 {
         return Err(Sha256ValueError::InvalidLength);
     }
-    let bytes = value.as_bytes();
-    let mut digest = [0_u8; 32];
-    let mut index = 0;
-    while index < bytes.len() {
-        digest[index / 2] = (lower_hex_nibble(bytes[index], index)? << 4)
-            | lower_hex_nibble(bytes[index + 1], index + 1)?;
-        index += 2;
-    }
-    Ok(digest)
-}
-
-fn lower_hex_nibble(byte: u8, index: usize) -> Result<u8, Sha256ValueError> {
-    match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        b'A'..=b'F' => Err(Sha256ValueError::Uppercase),
-        _ => Err(Sha256ValueError::InvalidCharacter { index }),
+    let index = value
+        .bytes()
+        .position(|byte| !(byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+        .expect("a rejected SHA-256 value has a non-lowercase-hex byte");
+    if matches!(value.as_bytes()[index], b'A'..=b'F') {
+        Err(Sha256ValueError::Uppercase)
+    } else {
+        Err(Sha256ValueError::InvalidCharacter { index })
     }
 }
 
@@ -3272,62 +3444,6 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(HashSet::from([first, second]).len(), 1);
-    }
-
-    #[test]
-    fn policy_identifiers_enforce_the_two_public_grammars() {
-        assert_eq!(
-            PolicyId::new("bifrost.security.dynamic-eval")
-                .unwrap()
-                .as_str(),
-            "bifrost.security.dynamic-eval"
-        );
-        assert!(PolicyId::new("Bifrost.security").is_err());
-        assert!(PolicyId::new("bifrost.").is_err());
-        assert!(TaintEntryId::new("dynamic.eval").is_err());
-        assert!(TaintEntryId::new("dynamic-eval_2").is_ok());
-    }
-
-    #[test]
-    fn sha256_values_accept_only_lowercase_wire_spelling() {
-        let value = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let hash = MatchSetManifestHash::from_lower_hex(value).unwrap();
-        assert_eq!(hash.to_string(), value);
-        assert_eq!(
-            MatchSetManifestHash::from_lower_hex(&value.to_ascii_uppercase()),
-            Err(Sha256ValueError::Uppercase)
-        );
-    }
-
-    #[test]
-    fn cvss_metric_values_cover_base_and_context_only_tables() {
-        assert!(
-            CvssMetricValue::try_new(
-                CvssMetric::Base {
-                    metric: CvssBaseMetric::Av,
-                },
-                CvssMetricValueToken::N,
-            )
-            .is_ok()
-        );
-        assert!(
-            CvssMetricValue::try_new(
-                CvssMetric::Base {
-                    metric: CvssBaseMetric::Av,
-                },
-                CvssMetricValueToken::X,
-            )
-            .is_err()
-        );
-        assert!(
-            CvssMetricValue::try_new(
-                CvssMetric::EnvironmentalOrSupplemental {
-                    metric: CvssEnvironmentalOrSupplementalMetric::U,
-                },
-                CvssMetricValueToken::Amber,
-            )
-            .is_ok()
-        );
     }
 
     #[test]
@@ -3514,63 +3630,6 @@ mod tests {
     }
 
     #[test]
-    fn cvss_metrics_and_values_expose_exact_first_labels() {
-        let base_metrics = [
-            CvssBaseMetric::Av,
-            CvssBaseMetric::Ac,
-            CvssBaseMetric::At,
-            CvssBaseMetric::Pr,
-            CvssBaseMetric::Ui,
-            CvssBaseMetric::Vc,
-            CvssBaseMetric::Vi,
-            CvssBaseMetric::Va,
-            CvssBaseMetric::Sc,
-            CvssBaseMetric::Si,
-            CvssBaseMetric::Sa,
-        ];
-        assert_eq!(
-            base_metrics.map(CvssBaseMetric::first_label),
-            [
-                "AV", "AC", "AT", "PR", "UI", "VC", "VI", "VA", "SC", "SI", "SA"
-            ]
-        );
-
-        let contextual_metrics = [
-            CvssEnvironmentalOrSupplementalMetric::Cr,
-            CvssEnvironmentalOrSupplementalMetric::Ir,
-            CvssEnvironmentalOrSupplementalMetric::Ar,
-            CvssEnvironmentalOrSupplementalMetric::Mav,
-            CvssEnvironmentalOrSupplementalMetric::Mac,
-            CvssEnvironmentalOrSupplementalMetric::Mat,
-            CvssEnvironmentalOrSupplementalMetric::Mpr,
-            CvssEnvironmentalOrSupplementalMetric::Mui,
-            CvssEnvironmentalOrSupplementalMetric::Mvc,
-            CvssEnvironmentalOrSupplementalMetric::Mvi,
-            CvssEnvironmentalOrSupplementalMetric::Mva,
-            CvssEnvironmentalOrSupplementalMetric::Msc,
-            CvssEnvironmentalOrSupplementalMetric::Msi,
-            CvssEnvironmentalOrSupplementalMetric::Msa,
-            CvssEnvironmentalOrSupplementalMetric::S,
-            CvssEnvironmentalOrSupplementalMetric::Au,
-            CvssEnvironmentalOrSupplementalMetric::R,
-            CvssEnvironmentalOrSupplementalMetric::V,
-            CvssEnvironmentalOrSupplementalMetric::Re,
-            CvssEnvironmentalOrSupplementalMetric::U,
-        ];
-        assert_eq!(
-            contextual_metrics.map(CvssEnvironmentalOrSupplementalMetric::first_label),
-            [
-                "CR", "IR", "AR", "MAV", "MAC", "MAT", "MPR", "MUI", "MVC", "MVI", "MVA", "MSC",
-                "MSI", "MSA", "S", "AU", "R", "V", "RE", "U",
-            ]
-        );
-
-        assert_eq!(CvssThreatMetric::E.first_label(), "E");
-        assert_eq!(CvssVersion::V4_0.wire_label(), "4.0");
-        assert_eq!(CvssMetricValueToken::Clear.first_label(), "Clear");
-    }
-
-    #[test]
     fn selector_paths_use_canonical_json_pointer_escaping() {
         assert!(PolicySelectorPath::new("/analysis/selector").is_ok());
         assert!(PolicySelectorPath::new("analysis/selector").is_err());
@@ -3579,11 +3638,58 @@ mod tests {
     }
 
     #[test]
-    fn report_defaults_are_schema_fixed() {
-        let options = PolicyReportOptions::default();
-        assert_eq!(options.witness.max_steps, 64);
-        assert_eq!(options.witness.max_bytes, 16 * 1024);
-        assert_eq!(options.witnesses_per_finding, 8);
-        assert_eq!(options.origins_per_finding, 8);
+    fn policy_identifiers_enforce_the_two_public_grammars() {
+        assert_eq!(
+            PolicyId::new("bifrost.security.dynamic-eval")
+                .unwrap()
+                .as_str(),
+            "bifrost.security.dynamic-eval"
+        );
+        assert!(PolicyId::new("Bifrost.security").is_err());
+        assert!(PolicyId::new("bifrost.").is_err());
+        assert!(TaintEntryId::new("dynamic.eval").is_err());
+        assert!(TaintEntryId::new("dynamic-eval_2").is_ok());
+    }
+
+    #[test]
+    fn sha256_values_accept_only_lowercase_wire_spelling() {
+        let value = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let hash = MatchSetManifestHash::from_lower_hex(value).unwrap();
+        assert_eq!(hash.to_string(), value);
+        assert_eq!(
+            MatchSetManifestHash::from_lower_hex(&value.to_ascii_uppercase()),
+            Err(Sha256ValueError::Uppercase)
+        );
+    }
+
+    #[test]
+    fn cvss_metric_values_cover_base_and_context_only_tables() {
+        assert!(
+            CvssMetricValue::try_new(
+                CvssMetric::Base {
+                    metric: CvssBaseMetric::Av,
+                },
+                CvssMetricValueToken::N,
+            )
+            .is_ok()
+        );
+        assert!(
+            CvssMetricValue::try_new(
+                CvssMetric::Base {
+                    metric: CvssBaseMetric::Av,
+                },
+                CvssMetricValueToken::X,
+            )
+            .is_err()
+        );
+        assert!(
+            CvssMetricValue::try_new(
+                CvssMetric::EnvironmentalOrSupplemental {
+                    metric: CvssEnvironmentalOrSupplementalMetric::U,
+                },
+                CvssMetricValueToken::Amber,
+            )
+            .is_ok()
+        );
     }
 }

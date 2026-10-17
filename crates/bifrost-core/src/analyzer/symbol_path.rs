@@ -303,7 +303,6 @@ pub fn normalized_go_client_symbol_segment(segment: &str) -> String {
 /// returned `FqName` renders (via `display`/`display_native`) to exactly the
 /// canonical `.`-joined spelling that [`parse_symbol_path`]`.join(".")`
 /// produces, which is what the string-keyed `definitions` index is keyed by.
-/// See the M2 Decision Log in `.agents/plans/fqname-interned-segments.md`.
 pub fn parse_symbol_path_fq(language: Language, value: &str, interner: &SegmentInterner) -> FqName {
     let mut fq = FqName::new();
     for segment in parse_symbol_path(language, value) {
@@ -334,6 +333,7 @@ fn go_receiver_type_segment(segment: &str) -> Option<&str> {
 mod tests {
     use super::*;
     use crate::analyzer::fq_name::segment_interner;
+    use brokk_bifrost_test_macros::hardwon;
 
     /// A segment that is nothing but the Rust raw-identifier escape normalizes
     /// away, and a segment is a non-empty run by definition. Both spellings of
@@ -343,6 +343,7 @@ mod tests {
     /// reachable from the MCP input edge, where the selector is whatever a
     /// client typed.
     #[test]
+    #[hardwon("#1189: a Rust raw-identifier escape could produce an empty interned segment")]
     fn a_segment_that_normalizes_away_is_dropped_by_both_spellings() {
         assert_eq!(
             parse_symbol_path(Language::Rust, "r#"),
@@ -363,6 +364,7 @@ mod tests {
     /// spelling verbatim, so the selector must produce that one segment and not
     /// the two nonexistent segments `zio` and `ZIO`.
     #[test]
+    #[hardwon("#2219: dots inside Scala quoted names split one symbol into multiple selectors")]
     fn a_scala_backtick_quoted_name_containing_a_dot_is_one_segment() {
         assert_eq!(
             parse_symbol_path(Language::Scala, "scalaz.`zio.ZIO`"),
@@ -395,6 +397,7 @@ mod tests {
     /// treats `::`, `/` and `+` as delimiters and so would eat a symbolic
     /// Scala member's own name.
     #[test]
+    #[hardwon("#3033: terminal extraction split a quoted Scala identifier at its literal dot")]
     fn a_rendered_terminal_is_the_last_dot_joined_segment() {
         assert_eq!(
             rendered_terminal_segment(Language::Scala, "scalaz.`zio.ZIO`"),
@@ -440,6 +443,9 @@ mod tests {
     /// selector renders back to the byte-identical selector, which is the
     /// #1189 round trip for a segment that carries a delimiter inside it.
     #[test]
+    #[hardwon(
+        "#2219: Scala dotted backtick names lost their segment boundary in qualified-name round trips"
+    )]
     fn a_scala_backtick_quoted_name_round_trips_through_fq_name() {
         let selector = "scalaz.`zio.ZIO`";
         let fq = parse_symbol_path_fq(Language::Scala, selector, segment_interner());
@@ -464,6 +470,9 @@ mod tests {
     /// and, because Kotlin's declaration walk indexes the bare name, the
     /// segment normalizes to that bare name.
     #[test]
+    #[hardwon(
+        "#2219: Kotlin quoted names with spaces were split or retained with delimiter quotes"
+    )]
     fn a_kotlin_backtick_quoted_name_is_one_segment_without_its_quotes() {
         assert_eq!(
             parse_symbol_path(Language::Kotlin, "pkg.`my test`"),
@@ -489,6 +498,7 @@ mod tests {
     /// back to plain splitting would instead re-shred exactly the name the
     /// quotes were protecting.
     #[test]
+    #[hardwon("#2219: unmatched language backticks were segmented inconsistently at end of input")]
     fn an_unterminated_backtick_run_reaches_the_end_of_the_input() {
         assert_eq!(
             parse_symbol_path(Language::Scala, "scalaz.`zio.ZIO"),
@@ -516,6 +526,9 @@ mod tests {
     /// language splits a stray backtick exactly the way it did before #2219 --
     /// it is an ordinary character carried inside whatever segment it lands in.
     #[test]
+    #[hardwon(
+        "#2219: non-Scala and non-Kotlin selectors treated ordinary backticks as quoting delimiters"
+    )]
     fn other_languages_split_a_stray_backtick_as_an_ordinary_character() {
         assert_eq!(
             parse_symbol_path(Language::Cpp, "ns::`zio.ZIO`::run"),

@@ -19,9 +19,13 @@ use crate::model::*;
 use crate::parse::flow_dialect_blocks_extraction;
 use crate::primary::JsTsParsedFile;
 use crate::providers::JsTsSource;
-use crate::syntax::{inline_object_type, js_program_is_external_module, ts_type_wrapper_operand};
+use crate::syntax::{
+    expression_preserves_parameter_shape, function_returns_parameter_shape, inline_object_type,
+    js_program_is_external_module, parameter_name_at_index,
+};
+use crate::ts_owners::{node_text_matches, ts_parameter_name_node, ts_unwrap_expression};
 use brokk_bifrost_core::analyzer::ProjectFile;
-use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind};
+use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::model::{CodeUnit, SignatureMetadata};
 use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
@@ -41,7 +45,7 @@ pub fn parse_typescript_file(file: &ProjectFile, source: &str, tree: &Tree) -> P
         program_scoped_field_identity
     };
     let mut module_has_imports = false;
-    let exported_roots = ts_es_named_exported_roots(root, source);
+    let exported_roots = crate::identifiers::es_named_exported_roots(root, source);
     crate::primary::parse_primary(
         source,
         tree,
@@ -294,7 +298,7 @@ fn visit_ts_export(
                     declaration.kind(),
                     "class_declaration" | "abstract_class_declaration"
                 ) && declaration.child_by_field_name("name").is_none()
-                    && ts_export_is_default(node, source)
+                    && export_is_default(node, source)
                     && parent.is_none()
                 {
                     visit_ts_default_export_class(file, source, node, declaration, parsed);
@@ -304,7 +308,7 @@ fn visit_ts_export(
                             source,
                             node,
                             declaration,
-                            ts_export_is_default(node, source),
+                            export_is_default(node, source),
                             parsed,
                         );
                     }
@@ -314,7 +318,7 @@ fn visit_ts_export(
             "function_declaration" | "function_signature" => {
                 if declaration.kind() == "function_declaration"
                     && declaration.child_by_field_name("name").is_none()
-                    && ts_export_is_default(node, source)
+                    && export_is_default(node, source)
                     && parent.is_none()
                 {
                     visit_ts_default_export_function(file, source, node, declaration, parsed);
@@ -324,7 +328,7 @@ fn visit_ts_export(
                             source,
                             node,
                             declaration,
-                            ts_export_is_default(node, source),
+                            export_is_default(node, source),
                             parsed,
                         );
                     }
@@ -361,13 +365,6 @@ fn visit_ts_export(
     }
 }
 
-fn ts_export_is_default(node: Node<'_>, source: &str) -> bool {
-    (0..node.child_count()).any(|index| {
-        node.child(index)
-            .is_some_and(|child| child.kind() == "default" || node_text(child, source) == "default")
-    })
-}
-
 fn visit_ts_default_export_value(
     file: &ProjectFile,
     source: &str,
@@ -375,39 +372,20 @@ fn visit_ts_default_export_value(
     value: Node<'_>,
     parsed: &mut JsTsParsedFile<'_>,
 ) {
-    match value.kind() {
-        "arrow_function" | "function_expression" | "generator_function" => {
-            visit_ts_default_export_function(file, source, export, value, parsed);
-        }
-        "class" => {
-            visit_ts_default_export_class(file, source, export, value, parsed);
-        }
-        "object" => {
-            let code_unit = add_default_export_unit(
-                file,
-                source,
-                export,
-                brokk_bifrost_core::analyzer::model::CodeUnitType::Field,
-                parsed,
-            );
-            parsed.add_signature(code_unit.clone(), trim_statement(node_text(export, source)));
-            visit_ts_object_literal_properties(file, source, value, &code_unit, &code_unit, parsed);
-        }
-        // `export default name` and `export default object.member` point at an
-        // existing binding. Every other expression creates an anonymous default
-        // value that needs its own source-backed declaration (#2301).
-        "identifier" | "member_expression" => record_default_reexport(export, parsed),
-        _ => {
-            let code_unit = add_default_export_unit(
-                file,
-                source,
-                export,
-                brokk_bifrost_core::analyzer::model::CodeUnitType::Field,
-                parsed,
-            );
-            parsed.add_signature(code_unit, trim_statement(node_text(export, source)));
-        }
-    }
+    visit_default_export_value(
+        file,
+        source,
+        export,
+        value,
+        parsed,
+        |file, source, export, function, parsed| {
+            visit_ts_default_export_function(file, source, export, function, parsed);
+        },
+        |file, source, export, class, parsed| {
+            visit_ts_default_export_class(file, source, export, class, parsed);
+        },
+        visit_ts_object_literal_properties,
+    );
 }
 
 fn visit_ts_default_export_function(
@@ -493,8 +471,8 @@ fn visit_ts_class_like(
             Some(parent) => parent
                 .fq()
                 .clone()
-                .with_pushed(js_ts_segment(&name, SegmentKind::Type)),
-            None => FqName::new().with_pushed(js_ts_segment(&name, SegmentKind::Type)),
+                .with_pushed(segment_interner().intern(&name, SegmentKind::Type)),
+            None => FqName::new().with_pushed(segment_interner().intern(&name, SegmentKind::Type)),
         };
         let code_unit = CodeUnit::new_fq(
             file.clone(),
@@ -630,8 +608,8 @@ fn visit_ts_function(
         Some(parent) => parent
             .fq()
             .clone()
-            .with_pushed(js_ts_segment(&name, SegmentKind::Member)),
-        None => FqName::new().with_pushed(js_ts_segment(&name, SegmentKind::Member)),
+            .with_pushed(segment_interner().intern(&name, SegmentKind::Member)),
+        None => FqName::new().with_pushed(segment_interner().intern(&name, SegmentKind::Member)),
     };
     let code_unit = CodeUnit::new_fq(
         file.clone(),
@@ -701,7 +679,7 @@ fn visit_ts_type_alias(
         Some(parent) => parent
             .fq()
             .clone()
-            .with_pushed(js_ts_segment(&name, SegmentKind::Type)),
+            .with_pushed(segment_interner().intern(&name, SegmentKind::Type)),
         None => file_scoped_type_fq(file, &name),
     };
     let code_unit = CodeUnit::new_fq(
@@ -803,7 +781,7 @@ fn visit_ts_value(
                 Some(parent) => parent
                     .fq()
                     .clone()
-                    .with_pushed(js_ts_segment(&name, SegmentKind::Member)),
+                    .with_pushed(segment_interner().intern(&name, SegmentKind::Member)),
                 None => top_level_field_identity(file, &name).1,
             }
         } else {
@@ -811,8 +789,10 @@ fn visit_ts_value(
                 Some(parent) => parent
                     .fq()
                     .clone()
-                    .with_pushed(js_ts_segment(&name, SegmentKind::Member)),
-                None => FqName::new().with_pushed(js_ts_segment(&name, SegmentKind::Member)),
+                    .with_pushed(segment_interner().intern(&name, SegmentKind::Member)),
+                None => {
+                    FqName::new().with_pushed(segment_interner().intern(&name, SegmentKind::Member))
+                }
             }
         };
         let code_unit = CodeUnit::new_fq(file.clone(), kind, "", short_name, fq);
@@ -865,7 +845,8 @@ fn visit_ts_value(
             && kind == brokk_bifrost_core::analyzer::model::CodeUnitType::Field
             && parent.is_none()
         {
-            let surface_fq = FqName::new().with_pushed(js_ts_segment(&name, SegmentKind::Member));
+            let surface_fq =
+                FqName::new().with_pushed(segment_interner().intern(&name, SegmentKind::Member));
             let surface_code_unit = CodeUnit::new_fq(
                 file.clone(),
                 brokk_bifrost_core::analyzer::model::CodeUnitType::Field,
@@ -928,7 +909,7 @@ fn ts_indexable_object_literal_value<'tree>(
     value: Node<'tree>,
     source: &str,
 ) -> Option<Node<'tree>> {
-    ts_object_literal_value(value).or_else(|| {
+    crate::syntax::js_ts_object_literal_value(value).or_else(|| {
         (value.kind() == "call_expression")
             .then(|| ts_shape_preserving_call_object_argument(declarator, value, source))
             .flatten()
@@ -940,32 +921,11 @@ fn ts_exported_surface_object_literal_value<'tree>(
     value: Node<'tree>,
     source: &str,
 ) -> Option<Node<'tree>> {
-    ts_object_literal_value(value).or_else(|| {
+    crate::syntax::js_ts_object_literal_value(value).or_else(|| {
         (value.kind() == "call_expression")
             .then(|| ts_surface_call_object_argument(declarator, value, source))
             .flatten()
     })
-}
-
-fn ts_object_literal_value(node: Node<'_>) -> Option<Node<'_>> {
-    let mut stack = vec![node];
-    while let Some(node) = stack.pop() {
-        match node.kind() {
-            "object" => return Some(node),
-            "parenthesized_expression"
-            | "as_expression"
-            | "satisfies_expression"
-            | "type_assertion" => {
-                for index in (0..node.named_child_count()).rev() {
-                    if let Some(child) = node.named_child(index) {
-                        stack.push(child);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    None
 }
 
 fn ts_shape_preserving_call_object_argument<'tree>(
@@ -973,15 +933,9 @@ fn ts_shape_preserving_call_object_argument<'tree>(
     call: Node<'tree>,
     source: &str,
 ) -> Option<Node<'tree>> {
-    let arguments = call.child_by_field_name("arguments")?;
-    let mut cursor = arguments.walk();
-    arguments
-        .named_children(&mut cursor)
-        .enumerate()
-        .find_map(|(index, argument)| {
-            let object = ts_object_literal_value(argument)?;
-            ts_call_preserves_object_argument_shape(anchor, call, source, index).then_some(object)
-        })
+    crate::syntax::first_preserved_object_literal_call_argument(call, |index| {
+        ts_call_preserves_object_argument_shape(anchor, call, source, index)
+    })
 }
 
 fn ts_call_preserves_object_argument_shape(
@@ -990,11 +944,12 @@ fn ts_call_preserves_object_argument_shape(
     source: &str,
     argument_index: usize,
 ) -> bool {
-    if argument_index == 0 && call_is_schema_object_builder(call, source) {
-        return true;
-    }
-    ts_call_object_argument_shape_preservation(anchor, call, source, argument_index)
-        == TsShapePreservation::Preserves
+    call_preserves_object_argument_shape(
+        call,
+        source,
+        argument_index,
+        ts_call_object_argument_shape_preservation(anchor, call, source, argument_index),
+    )
 }
 
 fn ts_source_function_preserves_parameter_shape(
@@ -1002,19 +957,19 @@ fn ts_source_function_preserves_parameter_shape(
     source: &str,
     function_name: &str,
     parameter_index: usize,
-) -> TsShapePreservation {
+) -> ShapePreservation {
     let root = root_node(anchor);
     let mut functions = Vec::new();
     collect_function_nodes(root, source, function_name, &mut functions);
     if functions.is_empty() {
-        return TsShapePreservation::Unknown;
+        return ShapePreservation::Unknown;
     }
     if functions.into_iter().any(|function| {
         ts_function_node_preserves_parameter_shape(function, source, parameter_index)
     }) {
-        TsShapePreservation::Preserves
+        ShapePreservation::Preserves
     } else {
-        TsShapePreservation::DoesNotPreserve
+        ShapePreservation::DoesNotPreserve
     }
 }
 
@@ -1023,16 +978,9 @@ fn ts_surface_call_object_argument<'tree>(
     call: Node<'tree>,
     source: &str,
 ) -> Option<Node<'tree>> {
-    let arguments = call.child_by_field_name("arguments")?;
-    let mut cursor = arguments.walk();
-    arguments
-        .named_children(&mut cursor)
-        .enumerate()
-        .find_map(|(index, argument)| {
-            let object = ts_object_literal_value(argument)?;
-            ts_surface_call_preserves_object_argument_shape(anchor, call, source, index)
-                .then_some(object)
-        })
+    crate::syntax::first_preserved_object_literal_call_argument(call, |index| {
+        ts_surface_call_preserves_object_argument_shape(anchor, call, source, index)
+    })
 }
 
 fn ts_surface_call_preserves_object_argument_shape(
@@ -1041,21 +989,12 @@ fn ts_surface_call_preserves_object_argument_shape(
     source: &str,
     argument_index: usize,
 ) -> bool {
-    if argument_index == 0 && call_is_schema_object_builder(call, source) {
-        return true;
-    }
-    match ts_call_object_argument_shape_preservation(anchor, call, source, argument_index) {
-        TsShapePreservation::Preserves => true,
-        TsShapePreservation::DoesNotPreserve => false,
-        TsShapePreservation::Unknown => call_has_likely_surface_factory_name(call, source),
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TsShapePreservation {
-    Preserves,
-    DoesNotPreserve,
-    Unknown,
+    surface_call_preserves_object_argument_shape(
+        call,
+        source,
+        argument_index,
+        ts_call_object_argument_shape_preservation(anchor, call, source, argument_index),
+    )
 }
 
 fn ts_call_object_argument_shape_preservation(
@@ -1063,14 +1002,14 @@ fn ts_call_object_argument_shape_preservation(
     call: Node<'_>,
     source: &str,
     argument_index: usize,
-) -> TsShapePreservation {
+) -> ShapePreservation {
     let Some(callee_name) = call_identifier_name(call, source) else {
-        return TsShapePreservation::Unknown;
+        return ShapePreservation::Unknown;
     };
     ts_source_function_preserves_parameter_shape(anchor, source, &callee_name, argument_index)
 }
 
-fn ts_function_node_preserves_parameter_shape(
+pub fn ts_function_node_preserves_parameter_shape(
     function: Node<'_>,
     source: &str,
     parameter_index: usize,
@@ -1092,24 +1031,7 @@ fn ts_function_parameter_name(
     source: &str,
     parameter_index: usize,
 ) -> Option<String> {
-    let parameters = function.child_by_field_name("parameters")?;
-    let mut cursor = parameters.walk();
-    parameters
-        .named_children(&mut cursor)
-        .filter_map(ts_parameter_name_node)
-        .nth(parameter_index)
-        .map(|name| node_text(name, source).trim().to_string())
-        .filter(|name| !name.is_empty())
-}
-
-fn ts_parameter_name_node(parameter: Node<'_>) -> Option<Node<'_>> {
-    match parameter.kind() {
-        "identifier" | "shorthand_property_identifier_pattern" => Some(parameter),
-        "required_parameter" | "optional_parameter" => parameter
-            .child_by_field_name("pattern")
-            .or_else(|| parameter.child_by_field_name("name")),
-        _ => None,
-    }
+    parameter_name_at_index(function, source, parameter_index, ts_parameter_name_node)
 }
 
 fn ts_parameter_labels(function: Node<'_>, source: &str) -> Vec<String> {
@@ -1133,11 +1055,12 @@ fn ts_function_returns_parameter_shape(
     source: &str,
     parameter_name: &str,
 ) -> bool {
-    let mut stack = vec![node];
-    while let Some(node) = stack.pop() {
-        if node.id() != root_id
-            && matches!(
-                node.kind(),
+    function_returns_parameter_shape(
+        node,
+        root_id,
+        |kind| {
+            matches!(
+                kind,
                 "function_declaration"
                     | "function_expression"
                     | "arrow_function"
@@ -1146,29 +1069,9 @@ fn ts_function_returns_parameter_shape(
                     | "abstract_class_declaration"
                     | "interface_declaration"
             )
-        {
-            continue;
-        }
-        if node.kind() == "return_statement" {
-            let mut cursor = node.walk();
-            if node
-                .named_children(&mut cursor)
-                .next()
-                .is_some_and(|expression| {
-                    ts_expression_preserves_parameter_shape(expression, source, parameter_name)
-                })
-            {
-                return true;
-            }
-            continue;
-        }
-        for index in (0..node.named_child_count()).rev() {
-            if let Some(child) = node.named_child(index) {
-                stack.push(child);
-            }
-        }
-    }
-    false
+        },
+        |expression| ts_expression_preserves_parameter_shape(expression, source, parameter_name),
+    )
 }
 
 fn ts_expression_preserves_parameter_shape(
@@ -1176,35 +1079,43 @@ fn ts_expression_preserves_parameter_shape(
     source: &str,
     parameter_name: &str,
 ) -> bool {
-    let Some(expression) = ts_object_shape_expression(expression) else {
-        return false;
-    };
-    if matches!(expression.kind(), "identifier" | "property_identifier")
-        && node_text(expression, source).trim() == parameter_name
-    {
-        return true;
-    }
-    if expression.kind() != "object" {
-        return false;
-    }
-    let mut cursor = expression.walk();
-    expression.named_children(&mut cursor).any(|child| {
-        child.kind() == "spread_element"
-            && child
-                .named_child(0)
-                .and_then(ts_object_shape_expression)
-                .is_some_and(|spread| node_text(spread, source).trim() == parameter_name)
-    })
+    expression_preserves_parameter_shape(
+        expression,
+        parameter_name,
+        ts_unwrap_expression,
+        |node, name| node_text_matches(node, source, name),
+    )
 }
 
-fn ts_object_shape_expression(mut node: Node<'_>) -> Option<Node<'_>> {
-    while matches!(
-        node.kind(),
-        "as_expression" | "satisfies_expression" | "type_assertion"
-    ) {
-        node = ts_type_wrapper_operand(node)?;
+#[cfg(test)]
+mod parameter_shape_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    #[test]
+    fn parenthesized_parameter_with_type_assertion_preserves_shape() {
+        let source = "const copy = (param: Shape) => (param) as Shape;";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .expect("TypeScript parser language");
+        let tree = parser
+            .parse(source, None)
+            .expect("parse TypeScript fixture");
+        let declaration = tree
+            .root_node()
+            .named_child(0)
+            .expect("variable declaration");
+        let declarator = declaration.named_child(0).expect("variable declarator");
+        let function = declarator
+            .child_by_field_name("value")
+            .expect("arrow function value");
+
+        assert_eq!(function.kind(), "arrow_function");
+        assert!(ts_function_node_preserves_parameter_shape(
+            function, source, 0
+        ));
     }
-    Some(node)
 }
 
 /// The members of a function's result surface, from both places TypeScript
@@ -1278,28 +1189,42 @@ fn visit_ts_object_type_members(
         if name.is_empty() {
             continue;
         }
-        let fq = parent
-            .fq()
-            .clone()
-            .with_pushed(js_ts_segment(&name, SegmentKind::Member));
-        let code_unit = CodeUnit::with_signature_and_fq(
-            file.clone(),
-            kind,
-            "",
-            format!("{}.{}", parent.short_name(), name),
-            None,
-            true,
-            fq,
-        );
-        parsed.add_code_unit(
-            code_unit.clone(),
-            child,
-            source,
-            Some(parent.clone()),
-            Some(top_level.clone()),
-        );
-        parsed.add_signature(code_unit, trim_statement(node_text(child, source)));
+        add_ts_object_member(file, source, child, &name, kind, parent, top_level, parsed);
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_ts_object_member(
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    name: &str,
+    kind: brokk_bifrost_core::analyzer::model::CodeUnitType,
+    parent: &CodeUnit,
+    top_level: &CodeUnit,
+    parsed: &mut JsTsParsedFile<'_>,
+) {
+    let fq = parent
+        .fq()
+        .clone()
+        .with_pushed(segment_interner().intern(name, SegmentKind::Member));
+    let code_unit = CodeUnit::with_signature_and_fq(
+        file.clone(),
+        kind,
+        "",
+        format!("{}.{}", parent.short_name(), name),
+        None,
+        true,
+        fq,
+    );
+    parsed.add_code_unit(
+        code_unit.clone(),
+        node,
+        source,
+        Some(parent.clone()),
+        Some(top_level.clone()),
+    );
+    parsed.add_signature(code_unit, trim_statement(node_text(node, source)));
 }
 
 fn collect_ts_return_object_literals<'tree>(
@@ -1307,10 +1232,12 @@ fn collect_ts_return_object_literals<'tree>(
     root_id: usize,
     out: &mut Vec<Node<'tree>>,
 ) {
-    let mut stack = vec![node];
-    while let Some(node) = stack.pop() {
-        if node.id() != root_id
-            && matches!(
+    collect_return_object_literals(
+        node,
+        root_id,
+        out,
+        |node| {
+            matches!(
                 node.kind(),
                 "function_declaration"
                     | "function_expression"
@@ -1320,34 +1247,9 @@ fn collect_ts_return_object_literals<'tree>(
                     | "abstract_class_declaration"
                     | "interface_declaration"
             )
-        {
-            continue;
-        }
-
-        if node.kind() == "return_statement" {
-            let mut cursor = node.walk();
-            if let Some(object) = node
-                .named_children(&mut cursor)
-                .find_map(ts_object_literal_value)
-            {
-                out.push(object);
-            }
-            continue;
-        }
-
-        if node.kind() == "arrow_function"
-            && let Some(body) = node.child_by_field_name("body")
-            && let Some(object) = ts_object_literal_value(body)
-        {
-            out.push(object);
-        }
-
-        for index in (0..node.named_child_count()).rev() {
-            if let Some(child) = node.named_child(index) {
-                stack.push(child);
-            }
-        }
-    }
+        },
+        crate::syntax::js_ts_object_literal_value,
+    );
 }
 
 fn visit_ts_object_literal_properties(
@@ -1365,108 +1267,36 @@ fn visit_ts_object_literal_properties(
         let Some(name) = ts_object_literal_property_name(child, source) else {
             continue;
         };
-        let kind = if ts_object_literal_property_is_function(child) {
-            brokk_bifrost_core::analyzer::model::CodeUnitType::Function
-        } else {
-            brokk_bifrost_core::analyzer::model::CodeUnitType::Field
-        };
-        let fq = parent
-            .fq()
-            .clone()
-            .with_pushed(js_ts_segment(&name, SegmentKind::Member));
-        let code_unit = CodeUnit::with_signature_and_fq(
-            file.clone(),
-            kind,
-            "",
-            format!("{}.{}", parent.short_name(), name),
-            None,
-            true,
-            fq,
-        );
-        parsed.add_code_unit(
-            code_unit.clone(),
-            child,
-            source,
-            Some(parent.clone()),
-            Some(top_level.clone()),
-        );
-        parsed.add_signature(code_unit, trim_statement(node_text(child, source)));
+        let kind = object_literal_property_kind(child);
+        add_ts_object_member(file, source, child, &name, kind, parent, top_level, parsed);
     }
 }
 
+/// A static object key that can be represented as a nonempty CodeUnit name.
+/// Empty and lone-surrogate keys still have exact property identity, but must
+/// not be interned as declaration names or replaced with raw escape spellings.
 pub fn ts_object_literal_property_name(node: Node<'_>, source: &str) -> Option<String> {
-    let key = match node.kind() {
-        "pair" => node
-            .child_by_field_name("key")
-            .or_else(|| node.named_child(0))?,
-        "shorthand_property_identifier" => node,
-        "method_definition" => node.child_by_field_name("name")?,
-        _ => return None,
-    };
-    if key.kind() == "computed_property_name" {
-        return None;
-    }
-    let name = trim_statement(node_text(key, source))
-        .trim_matches('"')
-        .trim_matches('\'')
-        .to_string();
+    let value = crate::syntax::object_literal_property_key_value(node, source)?;
+    let name = String::from_utf16(&value).ok()?;
     (!name.is_empty()).then_some(name)
 }
 
-fn ts_object_literal_property_is_function(node: Node<'_>) -> bool {
-    node.kind() == "method_definition"
-        || node
-            .child_by_field_name("value")
-            .is_some_and(|value| matches!(value.kind(), "arrow_function" | "function_expression"))
-}
-
-fn ts_es_named_exported_roots(root: Node<'_>, source: &str) -> HashSet<String> {
-    let mut roots = HashSet::default();
-    for index in 0..root.named_child_count() {
-        let Some(child) = root.named_child(index) else {
-            continue;
-        };
-        if child.kind() != "export_statement" || child.child_by_field_name("source").is_some() {
-            continue;
-        }
-        let mut cursor = child.walk();
-        for export_child in child.named_children(&mut cursor) {
-            collect_ts_export_clause_roots(export_child, source, &mut roots);
-        }
-    }
-    roots
-}
-
-fn collect_ts_export_clause_roots(node: Node<'_>, source: &str, roots: &mut HashSet<String>) {
-    match node.kind() {
-        "export_clause" => {
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                collect_ts_export_clause_roots(child, source, roots);
-            }
-        }
-        "export_specifier" => {
-            let name = node
-                .child_by_field_name("name")
-                .or_else(|| node.named_child(0));
-            if let Some(name) = name {
-                collect_ts_export_identifier(name, source, roots);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn collect_ts_export_identifier(node: Node<'_>, source: &str, roots: &mut HashSet<String>) {
-    if matches!(
-        node.kind(),
-        "identifier" | "property_identifier" | "shorthand_property_identifier" | "type_identifier"
-    ) {
-        let name = node_text(node, source).trim();
-        if !name.is_empty() {
-            roots.insert(name.to_string());
-        }
-    }
+pub fn ts_object_literal_property_at_key<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<(Node<'tree>, Node<'tree>, String)> {
+    let property = match node.kind() {
+        "pair" | "shorthand_property_identifier" | "method_definition" => node,
+        _ => node.parent().filter(|parent| {
+            crate::syntax::object_literal_property_key_node(*parent)
+                .is_some_and(|key| key.id() == node.id())
+        })?,
+    };
+    let object = property
+        .parent()
+        .filter(|parent| parent.kind() == "object")?;
+    let member = ts_object_literal_property_name(property, source)?;
+    Some((property, object, member))
 }
 
 /// The declared name of a class-body or interface member: its `name` child,
@@ -1509,7 +1339,7 @@ fn visit_ts_method(
     let fq = parent
         .fq()
         .clone()
-        .with_pushed(js_ts_segment(&member_name, SegmentKind::Member));
+        .with_pushed(segment_interner().intern(&member_name, SegmentKind::Member));
     let code_unit = CodeUnit::new_fq(
         file.clone(),
         brokk_bifrost_core::analyzer::model::CodeUnitType::Function,
@@ -1563,11 +1393,16 @@ fn visit_ts_constructor_assigned_fields(
     top_level: &CodeUnit,
     parsed: &mut JsTsParsedFile<'_>,
 ) {
-    let mut stack = vec![constructor];
-    while let Some(node) = stack.pop() {
-        if node.id() != constructor.id()
-            && matches!(
-                node.kind(),
+    crate::primary::visit_constructor_assigned_fields(
+        file,
+        source,
+        constructor,
+        parent,
+        top_level,
+        parsed,
+        |kind| {
+            matches!(
+                kind,
                 "function_declaration"
                     | "function_expression"
                     | "function"
@@ -1576,43 +1411,8 @@ fn visit_ts_constructor_assigned_fields(
                     | "class_declaration"
                     | "class"
             )
-        {
-            continue;
-        }
-        if node.kind() == "assignment_expression"
-            && let Some(left) = node.child_by_field_name("left")
-            && let Some(property) = this_member_property(left, source)
-        {
-            let Some(name) = property_name_text(property, source) else {
-                continue;
-            };
-            let fq = parent
-                .fq()
-                .clone()
-                .with_pushed(js_ts_segment(&name, SegmentKind::Member));
-            let code_unit = CodeUnit::new_fq(
-                file.clone(),
-                brokk_bifrost_core::analyzer::model::CodeUnitType::Field,
-                "",
-                format!("{}.{}", parent.short_name(), name),
-                fq,
-            );
-            parsed.add_code_unit(
-                code_unit.clone(),
-                property,
-                source,
-                Some(parent.clone()),
-                Some(top_level.clone()),
-            );
-            parsed.add_signature(code_unit, trim_statement(node_text(node, source)));
-            continue;
-        }
-        for index in (0..node.named_child_count()).rev() {
-            if let Some(child) = node.named_child(index) {
-                stack.push(child);
-            }
-        }
-    }
+        },
+    );
 }
 
 fn visit_ts_field(
@@ -1631,23 +1431,14 @@ fn visit_ts_field(
     } else {
         name
     };
-    let fq = parent
-        .fq()
-        .clone()
-        .with_pushed(js_ts_segment(&member_name, SegmentKind::Member));
-    let code_unit = CodeUnit::new_fq(
-        file.clone(),
-        brokk_bifrost_core::analyzer::model::CodeUnitType::Field,
-        "",
-        format!("{}.{}", parent.short_name(), member_name),
-        fq,
-    );
-    parsed.add_code_unit(
-        code_unit.clone(),
-        node,
+    let code_unit = crate::primary::add_field_member_unit(
+        file,
         source,
-        Some(parent.clone()),
-        Some(top_level.clone()),
+        node,
+        &member_name,
+        parent,
+        top_level,
+        parsed,
     );
     parsed.add_signature(code_unit, ts_field_signature(node, source));
 }
@@ -1673,7 +1464,7 @@ fn visit_ts_enum_member(
     let fq = parent
         .fq()
         .clone()
-        .with_pushed(js_ts_segment(&name, SegmentKind::Member));
+        .with_pushed(segment_interner().intern(&name, SegmentKind::Member));
     let code_unit = CodeUnit::new_fq(
         file.clone(),
         brokk_bifrost_core::analyzer::model::CodeUnitType::Field,
@@ -1838,7 +1629,7 @@ fn ts_variable_signature(
 ) -> String {
     let header = variable_header(statement, declarator, source, exported);
     match declarator.child_by_field_name("value") {
-        Some(value) if is_simple_ts_initializer(value) => {
+        Some(value) if is_simple_js_ts_initializer(value) => {
             let value_text = trim_statement(node_text(value, source));
             format!("{header} = {value_text}")
         }
@@ -1853,7 +1644,7 @@ fn ts_field_signature(node: Node<'_>, source: &str) -> String {
 
     let raw = trim_statement(node_text(node, source));
     if let Some(value) = node.child_by_field_name("value")
-        && !is_simple_ts_initializer(value)
+        && !is_simple_js_ts_initializer(value)
     {
         return raw
             .split('=')
@@ -1863,24 +1654,6 @@ fn ts_field_signature(node: Node<'_>, source: &str) -> String {
             .unwrap_or(raw);
     }
     raw
-}
-
-fn is_simple_ts_initializer(node: Node<'_>) -> bool {
-    matches!(
-        node.kind(),
-        "string"
-            | "number"
-            | "true"
-            | "false"
-            | "null"
-            | "undefined"
-            | "regex"
-            | "template_string"
-            | "unary_expression"
-            | "binary_expression"
-            | "identifier"
-            | "member_expression"
-    )
 }
 
 /// Whether this class member declares `static`, read from the member's own
@@ -1950,6 +1723,8 @@ fn ts_callable_modifiers(node: Node<'_>, source: &str) -> (bool, bool) {
 #[cfg(test)]
 mod callable_modifier_tests {
     use super::*;
+    use crate::test_support::assert_callable_metadata_flags;
+    use brokk_bifrost_test_macros::hardwon;
     use tree_sitter::Parser;
 
     /// The TypeScript half of #2597. `abstract` members and bodiless overload
@@ -1957,6 +1732,9 @@ mod callable_modifier_tests {
     /// kinds, and a walk that only handled `method_definition` would leave them
     /// unkeyable.
     #[test]
+    #[hardwon(
+        "#2597: TypeScript callable modifier metadata was absent, preventing summary binding"
+    )]
     fn callable_metadata_records_typescript_static_and_constructor_structurally() {
         let source = "export function free(value: string): string { return value; }\n\nexport abstract class Widget {\n    constructor(spec: string) { this.spec = spec; }\n    static build(spec: string): Widget { return null!; }\n    render(target: string): string { return target; }\n    abstract measure(target: string): number;\n}\n\nexport const arrow = (value: string): string => value;\n";
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1973,41 +1751,18 @@ mod callable_modifier_tests {
             .expect("parse TypeScript fixture");
         let parsed = parse_typescript_file(&file, source, &tree);
 
-        let modifiers = |name: &str| {
-            let metadata = parsed
-                .signature_metadata
-                .iter()
-                .find(|(unit, _)| unit.identifier() == name)
-                .and_then(|(_, metadata)| metadata.first())
-                .unwrap_or_else(|| {
-                    panic!(
-                        "missing TypeScript callable {name}; recorded {:?}",
-                        parsed
-                            .signature_metadata
-                            .keys()
-                            .map(|unit| unit.identifier().to_owned())
-                            .collect::<Vec<_>>()
-                    )
-                });
-            assert!(
-                metadata.callable_modifiers_recorded(),
-                "{name} must record that the walk read its modifiers"
-            );
-            (
-                metadata.callable_is_static(),
-                metadata.callable_is_constructor(),
-            )
-        };
-
-        assert_eq!(modifiers("free"), (true, false));
-        assert_eq!(modifiers("arrow"), (true, false));
+        assert_callable_metadata_flags(&parsed, "free", true, false);
+        assert_callable_metadata_flags(&parsed, "arrow", true, false);
         // A static member's identity already carries the `$static` suffix.
-        assert_eq!(modifiers("build$static"), (true, false));
-        assert_eq!(modifiers("render"), (false, false));
-        assert_eq!(modifiers("measure"), (false, false));
-        assert_eq!(modifiers("constructor"), (false, true));
+        assert_callable_metadata_flags(&parsed, "build$static", true, false);
+        assert_callable_metadata_flags(&parsed, "render", false, false);
+        assert_callable_metadata_flags(&parsed, "measure", false, false);
+        assert_callable_metadata_flags(&parsed, "constructor", false, true);
     }
 
+    #[hardwon(
+        "26cea49c2589: TypeScript namespace classes lost qualified identity in retained type-flow origins"
+    )]
     #[test]
     fn namespace_exported_class_is_indexed_with_qualified_identity() {
         let source = "namespace Domain { export class Declared {} }";
@@ -2039,6 +1794,7 @@ mod callable_modifier_tests {
 #[cfg(test)]
 mod recovered_member_name_tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
     use tree_sitter::Parser;
 
     /// Issue #3020: tree-sitter error recovery gives a member whose modifier
@@ -2077,16 +1833,7 @@ mod recovered_member_name_tests {
     }
 
     #[test]
-    fn abstract_definite_assignment_without_a_name_mints_only_the_class() {
-        let parsed = parse("class C {\n    abstract!: void;\n}\n");
-        assert_eq!(
-            minted(&parsed),
-            vec![("C".to_string(), false)],
-            "a nameless recovered field is unaddressable and is skipped: {parsed:?}"
-        );
-    }
-
-    #[test]
+    #[hardwon("#3020: a recovered abstract field with a missing name panicked indexing")]
     fn accessor_definite_assignment_without_a_name_mints_only_the_class() {
         let parsed = parse("class C {\n    accessor!: void;\n}\n");
         assert_eq!(
@@ -2097,6 +1844,7 @@ mod recovered_member_name_tests {
     }
 
     #[test]
+    #[hardwon("#3020: recovered nameless interface and method members panicked indexing")]
     fn nameless_recovered_members_in_interfaces_and_method_shapes_are_skipped() {
         let parsed = parse("interface I {\n    : void;\n}\nclass C {\n    (): void;\n}\n");
         assert_eq!(
@@ -2107,6 +1855,7 @@ mod recovered_member_name_tests {
     }
 
     #[test]
+    #[hardwon("#3020: modifier words were mistaken for recovered member names")]
     fn modifier_named_members_keep_their_names() {
         let parsed = parse(
             "class C {\n    readonly!: void;\n    abstract foo!: void;\n    public(): void;\n}\n",
@@ -2128,6 +1877,7 @@ mod recovered_member_name_tests {
     /// field. The whole class must index, and the nameless member must leave
     /// no empty segment behind.
     #[test]
+    #[hardwon("#3020: a recovered nameless modifier field panicked indexing the class")]
     fn members_with_modifier_names_fixture_indexes_without_a_nameless_member() {
         let parsed = parse(
             "class C {\n    public(): void;\n    public static(): void;\n    readonly = 0;\n    async<T>(): void;\n    abstract!:void;\n}\n",
@@ -2142,6 +1892,17 @@ mod recovered_member_name_tests {
                 ("static".to_string(), false),
             ],
             "`abstract!:void` recovers without a name and is skipped: {parsed:?}"
+        );
+    }
+
+    #[hardwon("#3020: zero-width recovered TypeScript field names panicked workspace indexing")]
+    #[test]
+    fn abstract_definite_assignment_without_a_name_mints_only_the_class() {
+        let parsed = parse("class C {\n    abstract!: void;\n}\n");
+        assert_eq!(
+            minted(&parsed),
+            vec![("C".to_string(), false)],
+            "a nameless recovered field is unaddressable and is skipped: {parsed:?}"
         );
     }
 }

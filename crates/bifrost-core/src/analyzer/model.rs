@@ -192,6 +192,14 @@ impl Language {
         Language::None
     }
 
+    /// Resolve an analyzable language from a path's extension.
+    pub fn from_path(path: &Path) -> Self {
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(Self::from_extension)
+            .unwrap_or(Self::None)
+    }
+
     pub fn from_config_label(input: &str) -> Option<Self> {
         let normalized = input
             .trim()
@@ -452,18 +460,10 @@ impl fmt::Display for LanguageDialect {
 #[cfg(test)]
 mod language_dialect_tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
-    fn stable_labels_cover_every_artifact_dialect() {
-        assert_eq!(
-            LanguageDialect::ALL
-                .map(LanguageDialect::stable_label)
-                .as_slice(),
-            LanguageDialect::STABLE_LABELS
-        );
-    }
-
-    #[test]
+    #[hardwon("#3322: .jsx files selected ordinary JavaScript and failed on JSX attributes")]
     fn semantic_pack_identity_folds_the_grammar_only_dialects() {
         assert_eq!(
             LanguageDialect::TypeScriptTsx.stable_label(),
@@ -488,9 +488,33 @@ mod language_dialect_tests {
         assert_eq!(LanguageDialect::CppC.semantic_pack_label(), "cpp-c");
     }
 
-    /// The JVM realm shares one external declaration surface, and only that
-    /// realm widens: a pack labelled for one JVM language answers the other
-    /// two, while every other label stays exact.
+    /// `.jsx` selects the TSX grammar, and it does so from the path alone:
+    /// the dialect is the analyzer store's language key, which is asked for
+    /// before any source is read (#3322).
+    #[test]
+    #[hardwon("#3322: .jsx files selected ordinary JavaScript and failed on JSX attributes")]
+    fn jsx_extension_selects_the_javascript_jsx_dialect() {
+        for path in ["Playground.jsx", "deep/nested/Playground.JSX"] {
+            assert_eq!(
+                LanguageDialect::for_path(Language::JavaScript, Path::new(path)),
+                LanguageDialect::JavaScriptJsx,
+                "{path}"
+            );
+        }
+        for path in ["index.js", "index.mjs", "index.cjs"] {
+            assert_eq!(
+                LanguageDialect::for_path(Language::JavaScript, Path::new(path)),
+                LanguageDialect::Standard(Language::JavaScript),
+                "{path}"
+            );
+        }
+        assert_eq!(
+            LanguageDialect::from_config_label("jsx"),
+            Some(LanguageDialect::JavaScriptJsx)
+        );
+        assert!(LanguageDialect::config_labels().any(|label| label == "jsx"));
+    }
+
     #[test]
     fn a_jvm_pack_language_applies_to_the_whole_jvm_realm() {
         for dialect in [
@@ -517,32 +541,6 @@ mod language_dialect_tests {
         assert!(
             !LanguageDialect::Standard(Language::Python).accepts_semantic_pack_language("kotlin")
         );
-    }
-
-    /// `.jsx` selects the TSX grammar, and it does so from the path alone:
-    /// the dialect is the analyzer store's language key, which is asked for
-    /// before any source is read (#3322).
-    #[test]
-    fn jsx_extension_selects_the_javascript_jsx_dialect() {
-        for path in ["Playground.jsx", "deep/nested/Playground.JSX"] {
-            assert_eq!(
-                LanguageDialect::for_path(Language::JavaScript, Path::new(path)),
-                LanguageDialect::JavaScriptJsx,
-                "{path}"
-            );
-        }
-        for path in ["index.js", "index.mjs", "index.cjs"] {
-            assert_eq!(
-                LanguageDialect::for_path(Language::JavaScript, Path::new(path)),
-                LanguageDialect::Standard(Language::JavaScript),
-                "{path}"
-            );
-        }
-        assert_eq!(
-            LanguageDialect::from_config_label("jsx"),
-            Some(LanguageDialect::JavaScriptJsx)
-        );
-        assert!(LanguageDialect::config_labels().any(|label| label == "jsx"));
     }
 }
 
@@ -617,6 +615,19 @@ impl CodeUnitType {
             CodeUnitType::Module => "module",
             CodeUnitType::Macro => "macro",
             CodeUnitType::FileScope => "file scope",
+        }
+    }
+
+    /// Canonical kind bytes used by declaration identities and machine evidence.
+    /// These are distinct from human-facing labels such as `file scope`.
+    pub fn identity_label(self) -> &'static str {
+        match self {
+            Self::Class => "class",
+            Self::Function => "function",
+            Self::Field => "field",
+            Self::Module => "module",
+            Self::Macro => "macro",
+            Self::FileScope => "file_scope",
         }
     }
 
@@ -755,6 +766,33 @@ impl ClassLikeKind {
 }
 
 impl ParameterMetadata {
+    /// Locate ordered parameter labels inside their rendered parameter text.
+    pub fn from_signature_labels<'a>(
+        signature: &str,
+        parameter_text: &str,
+        labels: impl IntoIterator<Item = &'a str>,
+    ) -> Vec<Self> {
+        let Some(parameters_start) = signature.find(parameter_text) else {
+            return Vec::new();
+        };
+        let parameters_end = parameters_start + parameter_text.len();
+        let mut search_start = parameters_start;
+        labels
+            .into_iter()
+            .filter_map(|label| {
+                if label.is_empty() || search_start > parameters_end {
+                    return None;
+                }
+                let haystack = signature.get(search_start..parameters_end)?;
+                let relative_start = haystack.find(label)?;
+                let start_byte = search_start + relative_start;
+                let end_byte = start_byte + label.len();
+                search_start = end_byte;
+                Some(Self::new(label, start_byte, end_byte))
+            })
+            .collect()
+    }
+
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
@@ -1474,21 +1512,11 @@ impl StructuredTypeName {
     }
 
     pub fn estimated_retained_bytes(&self) -> usize {
-        self.path
-            .capacity()
-            .saturating_mul(std::mem::size_of::<String>())
-            .saturating_add(
-                self.lexical_scope
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<String>()),
-            )
-            .saturating_add(
-                self.path
-                    .iter()
-                    .chain(&self.lexical_scope)
-                    .map(String::capacity)
-                    .sum(),
-            )
+        crate::analyzer::common::estimated_string_vec_bytes(&self.path, self.path.capacity())
+            .saturating_add(crate::analyzer::common::estimated_string_vec_bytes(
+                &self.lexical_scope,
+                self.lexical_scope.capacity(),
+            ))
     }
 
     fn is_valid(&self) -> bool {
@@ -2217,20 +2245,12 @@ impl StructuredTypeIdentity {
     }
 
     fn push_node(&mut self, node: StructuredTypeNode) -> Option<StructuredTypeNodeId> {
-        let (node_edges, node_string_bytes) = structured_type_node_resource_cost(&node)?;
-        let edge_count = self.edge_count.checked_add(node_edges)?;
-        let string_bytes = self.string_bytes.checked_add(node_string_bytes)?;
-        if self.nodes.len() >= MAX_STRUCTURED_TYPE_IDENTITY_NODES
-            || edge_count > MAX_STRUCTURED_TYPE_IDENTITY_EDGES
-            || string_bytes > MAX_STRUCTURED_TYPE_IDENTITY_STRING_BYTES
-        {
-            return None;
-        }
-        let id = StructuredTypeNodeId(u32::try_from(self.nodes.len()).ok()?);
-        self.nodes.push(node);
-        self.edge_count = edge_count;
-        self.string_bytes = string_bytes;
-        Some(id)
+        push_structured_type_node(
+            &mut self.nodes,
+            &mut self.edge_count,
+            &mut self.string_bytes,
+            node,
+        )
     }
 
     fn validated_resource_counts(&self) -> Option<(usize, usize)> {
@@ -2337,25 +2357,39 @@ impl StructuredTypeIdentityBuilder {
     }
 
     fn push(&mut self, node: StructuredTypeNode) -> Option<StructuredTypeNodeId> {
-        let (node_edges, node_string_bytes) = structured_type_node_resource_cost(&node)?;
-        let edge_count = self.edge_count.checked_add(node_edges)?;
-        let string_bytes = self.string_bytes.checked_add(node_string_bytes)?;
-        if self.nodes.len() >= MAX_STRUCTURED_TYPE_IDENTITY_NODES
-            || edge_count > MAX_STRUCTURED_TYPE_IDENTITY_EDGES
-            || string_bytes > MAX_STRUCTURED_TYPE_IDENTITY_STRING_BYTES
-        {
-            return None;
-        }
-        let id = StructuredTypeNodeId(u32::try_from(self.nodes.len()).ok()?);
-        self.nodes.push(node);
-        self.edge_count = edge_count;
-        self.string_bytes = string_bytes;
-        Some(id)
+        push_structured_type_node(
+            &mut self.nodes,
+            &mut self.edge_count,
+            &mut self.string_bytes,
+            node,
+        )
     }
 
     fn contains(&self, id: StructuredTypeNodeId) -> bool {
         (id.0 as usize) < self.nodes.len()
     }
+}
+
+fn push_structured_type_node(
+    nodes: &mut Vec<StructuredTypeNode>,
+    current_edges: &mut usize,
+    current_string_bytes: &mut usize,
+    node: StructuredTypeNode,
+) -> Option<StructuredTypeNodeId> {
+    let (node_edges, node_string_bytes) = structured_type_node_resource_cost(&node)?;
+    let edge_count = current_edges.checked_add(node_edges)?;
+    let string_bytes = current_string_bytes.checked_add(node_string_bytes)?;
+    if nodes.len() >= MAX_STRUCTURED_TYPE_IDENTITY_NODES
+        || edge_count > MAX_STRUCTURED_TYPE_IDENTITY_EDGES
+        || string_bytes > MAX_STRUCTURED_TYPE_IDENTITY_STRING_BYTES
+    {
+        return None;
+    }
+    let id = StructuredTypeNodeId(u32::try_from(nodes.len()).ok()?);
+    nodes.push(node);
+    *current_edges = edge_count;
+    *current_string_bytes = string_bytes;
+    Some(id)
 }
 
 fn structured_type_node_resource_cost(node: &StructuredTypeNode) -> Option<(usize, usize)> {
@@ -2455,6 +2489,22 @@ impl CppTemplateMetadata {
     }
 }
 
+pub fn first_callable_arity(
+    metadata: impl IntoIterator<Item = SignatureMetadata>,
+) -> Option<CallableArity> {
+    metadata
+        .into_iter()
+        .find_map(|metadata| metadata.callable_arity())
+}
+
+pub fn first_callable_parameter_types(
+    metadata: impl IntoIterator<Item = SignatureMetadata>,
+) -> Option<Vec<String>> {
+    metadata
+        .into_iter()
+        .find_map(|metadata| metadata.callable_parameter_types().map(<[String]>::to_vec))
+}
+
 impl SignatureMetadata {
     pub fn new(label: impl Into<String>, parameters: Vec<ParameterMetadata>) -> Self {
         Self {
@@ -2530,16 +2580,12 @@ impl SignatureMetadata {
     /// [`Self::callable_modifiers_recorded`] true, so a consumer can tell a
     /// declared-absent modifier from an unread one.
     pub fn with_callable_modifiers(
-        mut self,
+        self,
         is_static: bool,
         is_constructor: bool,
         visibility: DeclaredVisibility,
     ) -> Self {
-        self.callable_is_static = is_static;
-        self.callable_is_constructor = is_constructor;
-        self.callable_declared_visibility = Some(visibility);
-        self.callable_modifiers_recorded = true;
-        self
+        self.with_persisted_callable_modifiers(is_static, is_constructor, Some(visibility), true)
     }
 
     /// Override only the source-owned visibility cell for a declaration.
@@ -3149,7 +3195,7 @@ impl ProjectFile {
 
     /// Whether no analyzable language claims this path's extension -- the
     /// eligibility rule for include-driven language inference (#1837). See
-    /// `analyzer::common::has_unclaimed_extension` for what rests on it.
+    /// include-driven language inference for what rests on it.
     pub fn has_unclaimed_extension(&self) -> bool {
         self.0.unclaimed_extension
     }
@@ -3378,6 +3424,12 @@ impl RenderedCodeUnitName {
 #[derive(Clone)]
 pub struct CodeUnit(Arc<CodeUnitInner>);
 
+/// The fully qualified name a child declaration extends: its lexical parent's
+/// structured name when nested, otherwise the language-computed package name.
+pub fn child_fq_base(parent: Option<&CodeUnit>, fallback: impl FnOnce() -> FqName) -> FqName {
+    parent.map_or_else(fallback, |unit| unit.fq().clone())
+}
+
 /// Stable, exact identity of one declaration in a workspace.
 ///
 /// The digest contains only structured analyzer identity: language, normalized
@@ -3439,15 +3491,7 @@ impl CodeUnit {
             .to_string_lossy()
             .replace('\\', "/");
         hasher.field("path", relative_path.as_bytes());
-        let kind = match self.kind() {
-            CodeUnitType::Class => "class",
-            CodeUnitType::Function => "function",
-            CodeUnitType::Field => "field",
-            CodeUnitType::Module => "module",
-            CodeUnitType::Macro => "macro",
-            CodeUnitType::FileScope => "file_scope",
-        };
-        hasher.field("kind", kind.as_bytes());
+        hasher.field("kind", self.kind().identity_label().as_bytes());
         let interner = segment_interner();
         hasher.sequence("fq_segments", self.fq().segments(), |digest, segment| {
             let (text, kind) = interner.resolve(*segment);
@@ -3613,6 +3657,26 @@ impl CodeUnit {
         Self::with_signature_and_fq(source, kind, package_name, short_name, None, false, fq)
     }
 
+    /// Construct a field whose structured member name extends its parent's FQ name.
+    pub fn new_member_field(
+        source: ProjectFile,
+        package_name: impl Into<String>,
+        parent: &CodeUnit,
+        member_name: impl AsRef<str>,
+    ) -> Self {
+        let member_name = member_name.as_ref();
+        Self::new_fq(
+            source,
+            CodeUnitType::Field,
+            package_name,
+            format!("{}.{}", parent.short_name(), member_name),
+            parent
+                .fq()
+                .clone()
+                .with_pushed(segment_interner().intern(member_name, SegmentKind::Member)),
+        )
+    }
+
     pub fn file_scope(source: ProjectFile) -> Self {
         let short_name = source.rel_path().to_string_lossy().replace('\\', "/");
         Self::with_signature(
@@ -3743,7 +3807,7 @@ impl CodeUnit {
     }
 
     pub fn fq_name(&self) -> String {
-        self.0.rendered_name.display.clone()
+        self.fq_name_str().to_owned()
     }
 
     /// The borrowed form of [`Self::fq_name`], for consumers that render the
@@ -3980,6 +4044,44 @@ pub enum ParseErrorKind {
     /// grammar required. The wrapped string is the node kind that was
     /// expected (e.g. `"}"`, `";"`).
     Missing(String),
+    /// A construct the parse opened and never closed before the end of the
+    /// file, so the tree's root is the ERROR node tree-sitter wraps around
+    /// whatever was still open (#3501). The wrapped string is the opening
+    /// token (e.g. `"#ifndef"`, `"{"`), and the range is that token's.
+    Unclosed(String),
+}
+
+/// Whether every declaration a file publishes is a reading of a completed
+/// parse, persisted with the file's other analysis facts (#3501).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum ParseCompleteness {
+    /// No published declaration depends on a construct the parse left open.
+    #[default]
+    Complete,
+    /// The parse ended inside a construct it never closed, and at least one
+    /// published declaration lies inside that construct, so its scope and
+    /// nesting are a recovery claim. The file is never reported complete.
+    Partial,
+}
+
+impl ParseCompleteness {
+    /// The value the analyzer store persists.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Partial => "partial",
+        }
+    }
+
+    /// The value for a persisted label. The store's CHECK constraint admits
+    /// only these two labels, so any other value is a corrupt row.
+    pub fn from_label(label: &str) -> Self {
+        match label {
+            "complete" => Self::Complete,
+            "partial" => Self::Partial,
+            other => panic!("unknown persisted parse completeness {other:?}"),
+        }
+    }
 }
 
 /// Comment line counts and span lines for a [`CodeUnit`], with optional roll-up
@@ -4165,6 +4267,11 @@ pub enum ExceptionHandlingAnalysis {
     Failed { message: String },
 }
 
+/// Whether `byte` lies in the half-open byte range `[start_byte, end_byte)`.
+pub const fn byte_range_contains(start_byte: usize, end_byte: usize, byte: usize) -> bool {
+    start_byte <= byte && byte < end_byte
+}
+
 impl Range {
     pub fn contains(&self, other: &Range) -> bool {
         self.start_byte <= other.start_byte && self.end_byte >= other.end_byte
@@ -4277,6 +4384,10 @@ impl StructuredImportPath {
     pub fn render_segments(&self, separator: &str) -> String {
         self.segments.join(separator)
     }
+
+    pub const fn is_static_member_import(&self) -> bool {
+        matches!(self.kind, Some(StructuredImportPathKind::StaticMember))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -4291,12 +4402,17 @@ pub enum StructuredImportPathKind {
     /// binding form because it introduces the crate itself rather than the
     /// names exported by a `use` path.
     ExternCrate,
+    /// A PHP include/require whose path was folded to a workspace-relative
+    /// file path.
+    FileInclude,
+    /// A PHP include/require whose target depends on runtime state.
+    DynamicInclude,
 }
 
 impl StructuredImportPathKind {
     /// The spelling this variant is stored under in
-    /// `import_statements.path_kind`. That column's `CHECK` lists exactly these
-    /// four strings, so the enum and the schema's closed vocabulary stay one
+    /// `source_imports.path_kind`. That column's `CHECK` lists exactly these
+    /// strings, so the enum and the schema's closed vocabulary stay one
     /// declaration apart instead of drifting.
     pub const fn persist_tag(self) -> &'static str {
         match self {
@@ -4304,6 +4420,8 @@ impl StructuredImportPathKind {
             Self::ImportFrom => "import_from",
             Self::StaticMember => "static_member",
             Self::ExternCrate => "extern_crate",
+            Self::FileInclude => "file_include",
+            Self::DynamicInclude => "dynamic_include",
         }
     }
 
@@ -4313,30 +4431,10 @@ impl StructuredImportPathKind {
             "import_from" => Some(Self::ImportFrom),
             "static_member" => Some(Self::StaticMember),
             "extern_crate" => Some(Self::ExternCrate),
+            "file_include" => Some(Self::FileInclude),
+            "dynamic_include" => Some(Self::DynamicInclude),
             _ => None,
         }
-    }
-}
-
-#[cfg(test)]
-mod structured_import_path_kind_tests {
-    use super::StructuredImportPathKind;
-
-    #[test]
-    fn persisted_tags_round_trip_and_preserve_existing_spellings() {
-        for (kind, tag) in [
-            (StructuredImportPathKind::Namespace, "namespace"),
-            (StructuredImportPathKind::ImportFrom, "import_from"),
-            (StructuredImportPathKind::StaticMember, "static_member"),
-            (StructuredImportPathKind::ExternCrate, "extern_crate"),
-        ] {
-            assert_eq!(kind.persist_tag(), tag);
-            assert_eq!(StructuredImportPathKind::from_persist_tag(tag), Some(kind));
-        }
-        assert_eq!(
-            StructuredImportPathKind::from_persist_tag("not-a-path-kind"),
-            None
-        );
     }
 }
 
@@ -4462,6 +4560,12 @@ pub enum SemanticDiagnosticIncompleteReason {
         pack_id: String,
         declaration: String,
     },
+}
+
+impl SemanticDiagnosticIncompleteReason {
+    pub fn missing_dependency_discovery(boundary: BoundaryStatus) -> Self {
+        Self::MissingDependencyDiscovery { boundary }
+    }
 }
 
 /// The result of one structured lookup made while collecting diagnostics.
@@ -4625,6 +4729,17 @@ impl SemanticDiagnosticReport {
         &self.outcomes
     }
 
+    /// Iterate over every reason that made one of this report's outcomes incomplete.
+    pub fn incomplete_reasons(&self) -> impl Iterator<Item = &SemanticDiagnosticIncompleteReason> {
+        self.outcomes
+            .iter()
+            .filter_map(|outcome| match outcome {
+                SemanticDiagnosticOutcome::Incomplete { reasons, .. } => Some(reasons),
+                _ => None,
+            })
+            .flatten()
+    }
+
     pub fn status(&self) -> SemanticDiagnosticReportStatus {
         self.status
     }
@@ -4632,6 +4747,27 @@ impl SemanticDiagnosticReport {
     pub fn into_diagnostics(self) -> Vec<SemanticDiagnostic> {
         self.diagnostics
     }
+}
+
+pub fn push_absent_diagnostic(
+    report: &mut SemanticDiagnosticReport,
+    diagnostic_count: &mut usize,
+    absence: SemanticAbsenceProof,
+    source: &'static str,
+    kind: &'static str,
+    message: String,
+) {
+    let range = absence.range;
+    report.push_absent(
+        absence,
+        SemanticDiagnostic {
+            range,
+            source,
+            kind,
+            message,
+        },
+    );
+    *diagnostic_count += 1;
 }
 
 impl std::ops::Deref for SemanticDiagnosticReport {
@@ -4658,8 +4794,10 @@ impl IntoIterator for SemanticDiagnosticReport {
 #[cfg(test)]
 mod value_domain_tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
+    #[hardwon("#2515: valid language labels could drift outside the relational predicate domain")]
     fn every_language_config_label_is_published_in_variant_order() {
         let mapped = Language::ALL
             .iter()
@@ -4680,171 +4818,13 @@ mod value_domain_tests {
     }
 
     #[test]
+    #[hardwon("#2515: valid unit-kind labels could drift outside the relational predicate domain")]
     fn every_code_unit_kind_label_is_published_in_variant_order() {
         let mapped = CodeUnitType::ALL
             .iter()
             .map(CodeUnitType::display_lowercase)
             .collect::<Vec<_>>();
         assert_eq!(mapped, CodeUnitType::DISPLAY_LOWERCASE_LABELS);
-    }
-}
-
-#[cfg(test)]
-mod semantic_diagnostic_report_tests {
-    use super::*;
-
-    fn range(start_byte: usize) -> Range {
-        Range {
-            start_byte,
-            end_byte: start_byte + 1,
-            start_line: 1,
-            end_line: 1,
-        }
-    }
-
-    fn diagnostic(range: Range) -> SemanticDiagnostic {
-        SemanticDiagnostic {
-            range,
-            source: "test",
-            kind: "unrecognized_symbol",
-            message: "Unrecognized symbol `Missing`".to_string(),
-        }
-    }
-
-    #[test]
-    fn report_emits_only_a_diagnostic_with_complete_absence_proof() {
-        let location = range(2);
-        let mut report = SemanticDiagnosticReport::new();
-        report.push_resolved(location, BoundaryStatus::ExternalIndexed);
-        report.push_ambiguous(
-            location,
-            vec![
-                BoundaryStatus::WorkspaceLocal,
-                BoundaryStatus::ExternalIndexed,
-            ],
-        );
-        report.push_incomplete(
-            Some(location),
-            vec![SemanticDiagnosticIncompleteReason::Cancelled],
-        );
-
-        assert!(report.diagnostics().is_empty());
-        assert_eq!(report.status(), SemanticDiagnosticReportStatus::Incomplete);
-
-        report.push_absent(
-            SemanticAbsenceProof {
-                range: location,
-                domain: SemanticDiagnosticDomain::Type {
-                    name: "example.Owner".to_string(),
-                },
-                boundary: BoundaryStatus::ExternalIndexed,
-            },
-            diagnostic(location),
-        );
-
-        assert_eq!(report.diagnostics(), &[diagnostic(location)]);
-        assert_eq!(report.status(), SemanticDiagnosticReportStatus::Incomplete);
-        assert_eq!(report.outcomes().len(), 4);
-        assert!(matches!(
-            report.outcomes().last(),
-            Some(SemanticDiagnosticOutcome::Absent(proof))
-                if proof.boundary == BoundaryStatus::ExternalIndexed
-        ));
-    }
-
-    #[test]
-    fn report_retains_each_typed_incomplete_reason_without_an_error() {
-        let reasons = vec![
-            SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery {
-                boundary: BoundaryStatus::ExternalDeclaredUnindexed,
-            },
-            SemanticDiagnosticIncompleteReason::StaleGeneration {
-                expected: 4,
-                actual: 3,
-            },
-            SemanticDiagnosticIncompleteReason::Cancelled,
-            SemanticDiagnosticIncompleteReason::Truncated,
-            SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
-                detail: "macro expansion".to_string(),
-            },
-            SemanticDiagnosticIncompleteReason::DynamicBehavior {
-                detail: "runtime member".to_string(),
-            },
-            SemanticDiagnosticIncompleteReason::RuntimeUnavailable {
-                detail: "pack activation unavailable".to_string(),
-            },
-            SemanticDiagnosticIncompleteReason::CorruptSemanticPack {
-                detail: "invalid manifest".to_string(),
-            },
-            SemanticDiagnosticIncompleteReason::UnsupportedGeneratedSurface {
-                detail: "generated sources are not indexed".to_string(),
-            },
-        ];
-        let mut report = SemanticDiagnosticReport::new();
-        report.push_incomplete(Some(range(7)), reasons.clone());
-
-        assert!(report.diagnostics().is_empty());
-        assert_eq!(
-            report.outcomes(),
-            &[SemanticDiagnosticOutcome::Incomplete {
-                range: Some(range(7)),
-                reasons,
-            }]
-        );
-    }
-
-    #[test]
-    fn workspace_conversion_records_the_checked_lexical_domain() {
-        let file = ProjectFile::new(std::env::current_dir().unwrap(), "src/Main.java");
-        let location = range(11);
-        let report =
-            SemanticDiagnosticReport::from_workspace_absences(&file, vec![diagnostic(location)]);
-
-        assert_eq!(report.diagnostics(), &[diagnostic(location)]);
-        assert_eq!(report.status(), SemanticDiagnosticReportStatus::Complete);
-        assert!(matches!(
-            report.outcomes(),
-            [SemanticDiagnosticOutcome::Absent(SemanticAbsenceProof {
-                range,
-                domain: SemanticDiagnosticDomain::LexicalScope { file, range: domain_range },
-                boundary: BoundaryStatus::WorkspaceLocal,
-            })] if *range == location
-                && file == &PathBuf::from("src/Main.java")
-                && *domain_range == location
-        ));
-    }
-
-    #[test]
-    #[should_panic(expected = "absence proof and diagnostic must identify the same source range")]
-    fn report_rejects_an_error_without_matching_absence_evidence() {
-        let mut report = SemanticDiagnosticReport::new();
-        report.push_absent(
-            SemanticAbsenceProof {
-                range: range(1),
-                domain: SemanticDiagnosticDomain::Module {
-                    name: "example".to_string(),
-                },
-                boundary: BoundaryStatus::WorkspaceLocal,
-            },
-            diagnostic(range(2)),
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "absence proof requires a complete boundary")]
-    fn report_rejects_absence_at_an_unknown_boundary() {
-        let location = range(3);
-        let mut report = SemanticDiagnosticReport::new();
-        report.push_absent(
-            SemanticAbsenceProof {
-                range: location,
-                domain: SemanticDiagnosticDomain::Package {
-                    name: "unknown.external".to_string(),
-                },
-                boundary: BoundaryStatus::ExternalUnknown,
-            },
-            diagnostic(location),
-        );
     }
 }
 
@@ -4942,65 +4922,6 @@ pub fn metrics_from_declarations(
         .collect::<BTreeSet<_>>()
         .len();
     CodeBaseMetrics::new(file_count, declarations.len())
-}
-
-#[cfg(test)]
-mod package_anchor_tests {
-    use super::*;
-
-    fn anchored_unit() -> CodeUnit {
-        let source = ProjectFile::new(
-            std::env::current_dir().expect("test working directory should be available"),
-            PathBuf::from("src/describe.rs"),
-        );
-        CodeUnit::with_signature(
-            source,
-            CodeUnitType::Function,
-            "demo",
-            "JsError.describe",
-            Some("fn describe()".to_string()),
-            false,
-        )
-        .with_package_anchor(PackageAnchor::CrateRoot)
-    }
-
-    #[test]
-    fn rebuilders_preserve_the_package_anchor() {
-        let unit = anchored_unit();
-        assert_eq!(unit.package_anchor(), Some(PackageAnchor::CrateRoot));
-
-        let stripped = unit.without_signature();
-        assert_eq!(stripped.signature(), None);
-        assert_eq!(stripped.package_anchor(), Some(PackageAnchor::CrateRoot));
-
-        let synthetic = unit.with_synthetic(true);
-        assert!(synthetic.is_synthetic());
-        assert_eq!(synthetic.package_anchor(), Some(PackageAnchor::CrateRoot));
-
-        // Chained rebuilds keep it too, including a non-unit-variant anchor.
-        let popped = unit
-            .clone()
-            .with_package_anchor(PackageAnchor::OwnModule { pop: 2 })
-            .with_synthetic(true)
-            .without_signature();
-        assert_eq!(
-            popped.package_anchor(),
-            Some(PackageAnchor::OwnModule { pop: 2 })
-        );
-        assert_eq!(popped.fq(), unit.fq());
-        assert_eq!(popped.package_name(), unit.package_name());
-    }
-
-    #[test]
-    fn units_default_to_the_adapter_anchor() {
-        let source = ProjectFile::new(
-            std::env::current_dir().expect("test working directory should be available"),
-            PathBuf::from("src/lib.rs"),
-        );
-        let unit = CodeUnit::new(source, CodeUnitType::Class, "demo", "JsError");
-        assert_eq!(unit.package_anchor(), None);
-        assert_eq!(unit.without_signature().package_anchor(), None);
-    }
 }
 
 #[cfg(test)]
@@ -5258,34 +5179,6 @@ mod structured_type_identity_tests {
     }
 
     #[test]
-    fn resource_bound_preserves_existing_generic_bincode_wire_roundtrip() {
-        let mut builder = StructuredTypeIdentityBuilder::default();
-        let base = builder
-            .named(
-                StructuredTypeName::new(vec!["Result".to_string()], Vec::new(), false)
-                    .expect("base name"),
-            )
-            .expect("base node");
-        let argument = builder
-            .named(
-                StructuredTypeName::new(
-                    vec!["example".to_string(), "Service".to_string()],
-                    vec!["scope".to_string()],
-                    false,
-                )
-                .expect("argument name"),
-            )
-            .expect("argument node");
-        let generic = builder.generic(base, vec![argument]).expect("generic node");
-        let identity = builder.finish(generic).expect("structured identity");
-
-        let bytes = bincode::serialize(&identity).expect("serialize identity");
-        let decoded: StructuredTypeIdentity =
-            bincode::deserialize(&bytes).expect("deserialize identity");
-        assert_eq!(decoded, identity);
-    }
-
-    #[test]
     fn rerooted_map_identities_compare_by_reachable_shape() {
         let service =
             StructuredTypeName::new(vec!["Service".to_string()], Vec::new(), false).unwrap();
@@ -5356,71 +5249,76 @@ mod structured_type_identity_tests {
 }
 
 #[cfg(test)]
-mod claude_plugin_lsp_manifest_tests {
-    use super::Language;
-    use std::collections::BTreeMap;
-    use std::fs;
+mod language_extension_contract_tests {
+    use super::{Language, LanguageDialect};
+    use brokk_bifrost_test_macros::hardwon;
+    use std::collections::BTreeSet;
     use std::path::Path;
 
     #[test]
-    fn claude_plugin_maps_every_analyzable_extension_to_bifrost_lsp() {
-        let manifest_path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/bifrost-agent/.lsp.json");
-        let manifest: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(&manifest_path).expect("read Claude LSP manifest"),
-        )
-        .expect("parse Claude LSP manifest");
-        let actual: BTreeMap<String, String> =
-            serde_json::from_value(manifest["bifrost"]["extensionToLanguage"].clone())
-                .expect("Claude LSP manifest extensionToLanguage object");
-
-        let expected = Language::ANALYZABLE
+    #[hardwon("#3836: retired plugin registration cannot be the engine extension-coverage oracle")]
+    fn every_declared_source_extension_has_its_expected_engine_dialect() {
+        // Preserve the complete 25-extension coverage formerly pinned by the
+        // Claude registration, while exercising the current engine interface.
+        // Headers use the engine's conservative C++ dialect; only .c selects C.
+        let expected = [
+            ("java", LanguageDialect::Standard(Language::Java)),
+            ("go", LanguageDialect::Standard(Language::Go)),
+            ("c", LanguageDialect::CppC),
+            ("cc", LanguageDialect::Standard(Language::Cpp)),
+            ("cpp", LanguageDialect::Standard(Language::Cpp)),
+            ("cxx", LanguageDialect::Standard(Language::Cpp)),
+            ("h", LanguageDialect::Standard(Language::Cpp)),
+            ("hin", LanguageDialect::Standard(Language::Cpp)),
+            ("hpp", LanguageDialect::Standard(Language::Cpp)),
+            ("hh", LanguageDialect::Standard(Language::Cpp)),
+            ("hxx", LanguageDialect::Standard(Language::Cpp)),
+            ("js", LanguageDialect::Standard(Language::JavaScript)),
+            ("mjs", LanguageDialect::Standard(Language::JavaScript)),
+            ("cjs", LanguageDialect::Standard(Language::JavaScript)),
+            ("jsx", LanguageDialect::JavaScriptJsx),
+            ("ts", LanguageDialect::Standard(Language::TypeScript)),
+            ("tsx", LanguageDialect::TypeScriptTsx),
+            ("py", LanguageDialect::Standard(Language::Python)),
+            ("rs", LanguageDialect::Standard(Language::Rust)),
+            ("php", LanguageDialect::Standard(Language::Php)),
+            ("scala", LanguageDialect::Standard(Language::Scala)),
+            ("cs", LanguageDialect::Standard(Language::CSharp)),
+            ("rb", LanguageDialect::Standard(Language::Ruby)),
+            ("kt", LanguageDialect::Standard(Language::Kotlin)),
+            ("kts", LanguageDialect::Standard(Language::Kotlin)),
+        ];
+        let declared: BTreeSet<_> = Language::ANALYZABLE
             .into_iter()
-            .flat_map(|language| {
-                language.extensions().iter().map(move |extension| {
-                    let language_id = match *extension {
-                        "c" | "h" => "c",
-                        "jsx" => "javascriptreact",
-                        "tsx" => "typescriptreact",
-                        _ => language.config_label(),
-                    };
-                    (format!(".{extension}"), language_id.to_string())
-                })
-            })
+            .flat_map(|language| language.extensions().iter().copied())
             .collect();
-
-        assert_eq!(actual, expected);
+        assert_eq!(
+            declared,
+            expected
+                .iter()
+                .map(|(extension, _)| *extension)
+                .collect::<BTreeSet<_>>()
+        );
+        for (extension, dialect) in expected {
+            let filename = format!("Probe.{extension}");
+            let path = Path::new(&filename);
+            let language = Language::from_path(path);
+            assert_eq!(language, dialect.language(), "{filename}");
+            assert_eq!(
+                LanguageDialect::for_path(language, path),
+                dialect,
+                "{filename}"
+            );
+        }
     }
 }
 
-#[cfg(all(test, windows))]
-mod path_tests {
-    use super::*;
-
-    #[test]
-    fn project_file_normalizes_ordinary_and_verbatim_roots_equally() {
-        let ordinary = ProjectFile::new(
-            PathBuf::from(r"C:\Users\runner\repo"),
-            PathBuf::from(r"src\..\A.java"),
-        );
-        let verbatim = ProjectFile::new(
-            PathBuf::from(r"\\?\C:\Users\runner\repo"),
-            PathBuf::from("A.java"),
-        );
-        assert_eq!(ordinary, verbatim);
-    }
-
-    #[test]
-    fn project_file_normalizes_ordinary_and_verbatim_unc_roots_equally() {
-        let ordinary = ProjectFile::new(
-            PathBuf::from(r"\\server\share\repo"),
-            PathBuf::from("A.java"),
-        );
-        let verbatim = ProjectFile::new(
-            PathBuf::from(r"\\?\UNC\server\share\repo"),
-            PathBuf::from("A.java"),
-        );
-        assert_eq!(ordinary, verbatim);
+#[cfg(test)]
+fn absolute_test_root(name: &str) -> PathBuf {
+    if cfg!(windows) {
+        PathBuf::from(format!(r"C:\{name}"))
+    } else {
+        PathBuf::from(format!("/{name}"))
     }
 }
 
@@ -5452,14 +5350,6 @@ mod project_file_identity_tests {
         left.root() == right.root() && left.rel_path() == right.rel_path()
     }
 
-    fn absolute_root(name: &str) -> PathBuf {
-        if cfg!(windows) {
-            PathBuf::from(format!(r"C:\{name}"))
-        } else {
-            PathBuf::from(format!("/{name}"))
-        }
-    }
-
     /// Paths chosen to exercise the orderings that a naive fast path breaks:
     /// prefixes of one another, differing only in depth, differing only in
     /// case, and sorting differently as strings than as component sequences.
@@ -5481,9 +5371,9 @@ mod project_file_identity_tests {
     fn corpus() -> Vec<ProjectFile> {
         let mut files = Vec::new();
         for root in [
-            absolute_root("identity-corpus-one"),
-            absolute_root("identity-corpus-two"),
-            absolute_root("identity-corpus-one-longer"),
+            absolute_test_root("identity-corpus-one"),
+            absolute_test_root("identity-corpus-two"),
+            absolute_test_root("identity-corpus-one-longer"),
         ] {
             for rel in REL_PATHS {
                 files.push(ProjectFile::new(root.clone(), rel));
@@ -5502,15 +5392,6 @@ mod project_file_identity_tests {
                     reference_cmp(left, right),
                     "order drifted for {left:?} vs {right:?}"
                 );
-            }
-        }
-    }
-
-    #[test]
-    fn eq_matches_the_pre_change_definition_over_every_pair() {
-        let files = corpus();
-        for left in &files {
-            for right in &files {
                 assert_eq!(
                     left == right,
                     reference_eq(left, right),
@@ -5521,35 +5402,11 @@ mod project_file_identity_tests {
     }
 
     #[test]
-    fn sorting_the_corpus_agrees_with_the_pre_change_total_order() {
-        let mut sorted = corpus();
-        sorted.sort();
-        let mut reference = corpus();
-        reference.sort_by(reference_cmp);
-        assert_eq!(sorted, reference);
-        // `sort` is stable, so agreeing element-wise is only half the claim;
-        // the rendered order is what ordered containers hand to callers.
-        let rendered: Vec<String> = sorted.iter().map(|file| format!("{file:?}")).collect();
-        let reference_rendered: Vec<String> =
-            reference.iter().map(|file| format!("{file:?}")).collect();
-        assert_eq!(rendered, reference_rendered);
-    }
-
-    #[test]
-    fn equal_files_hash_equally_and_distinct_files_do_not_collide() {
+    fn equal_files_have_equal_hashes() {
         let files = corpus();
         for file in &files {
             let clone = ProjectFile::new(file.root().to_path_buf(), file.rel_path());
             assert_eq!(hash_of(file), hash_of(&clone));
-        }
-        // Same-process consistency plus a collision check over the corpus: the
-        // precomputed hash is a pure function of the two paths, so two files
-        // that differ must not be forced to share a bucket by construction.
-        let mut seen: HashMap<u64, ProjectFile> = HashMap::default();
-        for file in files {
-            if let Some(previous) = seen.insert(hash_of(&file), file.clone()) {
-                assert_eq!(previous, file, "distinct files collided in the corpus");
-            }
         }
     }
 
@@ -5557,104 +5414,6 @@ mod project_file_identity_tests {
         let mut hasher = DefaultHasher::new();
         file.hash(&mut hasher);
         hasher.finish()
-    }
-
-    /// Mechanism pin for the precomputed hash: hashing writes one `u64` and
-    /// touches neither path. Reverting `Hash` to `root.hash(); rel_path.hash()`
-    /// makes this record the path bytes instead.
-    #[test]
-    fn hashing_writes_the_precomputed_value_and_never_walks_the_paths() {
-        #[derive(Default)]
-        struct RecordingHasher {
-            writes: Vec<&'static str>,
-            bytes: usize,
-        }
-
-        impl Hasher for RecordingHasher {
-            fn finish(&self) -> u64 {
-                0
-            }
-
-            fn write(&mut self, bytes: &[u8]) {
-                self.writes.push("write");
-                self.bytes += bytes.len();
-            }
-
-            fn write_u64(&mut self, _: u64) {
-                self.writes.push("write_u64");
-                self.bytes += 8;
-            }
-        }
-
-        let file = ProjectFile::new(
-            absolute_root("identity-hash-pin"),
-            "a/deeply/nested/module/path/that/would/be/walked.rs",
-        );
-        let mut hasher = RecordingHasher::default();
-        file.hash(&mut hasher);
-        assert_eq!(hasher.writes, vec!["write_u64"]);
-        assert_eq!(hasher.bytes, 8);
-    }
-
-    /// Mechanism pin for root interning: files built independently under one
-    /// workspace share a single root allocation, which is what lets `eq` and
-    /// `cmp` settle the root half with a pointer test. Reverting to a per-inner
-    /// `PathBuf` root makes the addresses differ.
-    #[test]
-    fn roots_are_interned_so_one_workspace_has_one_root_allocation() {
-        let root = absolute_root("identity-intern-pin");
-        let first = ProjectFile::new(root.clone(), "a.rs");
-        let second = ProjectFile::new(root.clone(), "b/c.rs");
-        // Reached by a different spelling that normalizes to the same root.
-        let third = ProjectFile::new(root.join("nested").join(".."), "d.rs");
-        assert!(std::ptr::eq(first.root(), second.root()));
-        assert!(std::ptr::eq(first.root(), third.root()));
-
-        let other = ProjectFile::new(absolute_root("identity-intern-pin-other"), "a.rs");
-        assert!(!std::ptr::eq(first.root(), other.root()));
-        assert_ne!(first, other);
-        assert_eq!(first.cmp(&other), reference_cmp(&first, &other));
-    }
-
-    #[test]
-    fn with_rel_path_reuses_the_root_and_agrees_with_new() {
-        let root = absolute_root("identity-sibling-pin");
-        let file = ProjectFile::new(root.clone(), "src/lib.rs");
-        let sibling = file.with_rel_path("src/a/mod.rs");
-        assert!(std::ptr::eq(file.root(), sibling.root()));
-        assert_eq!(sibling, ProjectFile::new(root, "src/a/mod.rs"));
-        assert_eq!(sibling.rel_path(), Path::new("src/a/mod.rs"));
-    }
-
-    #[test]
-    fn retained_bytes_accounts_for_owned_path_storage() {
-        let root = absolute_root("identity-retained-bytes");
-        let short = ProjectFile::new(root.clone(), "a.go");
-        let long_rel = format!("src/{}/subject.go", "nested".repeat(128));
-        let long = ProjectFile::new(root, &long_rel);
-
-        assert!(
-            short.retained_bytes()
-                >= std::mem::size_of::<ProjectFile>()
-                    .saturating_add(short.root().as_os_str().len())
-                    .saturating_add(short.rel_path().as_os_str().len())
-        );
-        assert!(
-            long.retained_bytes() >= short.retained_bytes().saturating_add(long_rel.len() / 2),
-            "long owned paths must materially increase retained accounting"
-        );
-    }
-
-    /// Files from two workspaces meet in one process -- a multi-root MCP
-    /// session, a cross-workspace comparison -- and must still order by path.
-    #[test]
-    fn cross_workspace_pairs_order_and_compare_by_path() {
-        let left = ProjectFile::new(absolute_root("workspace-a"), "same/rel.rs");
-        let right = ProjectFile::new(absolute_root("workspace-b"), "same/rel.rs");
-        assert_ne!(left, right);
-        assert_eq!(left.cmp(&right), reference_cmp(&left, &right));
-        assert_eq!(right.cmp(&left), reference_cmp(&right, &left));
-        assert_ne!(hash_of(&left), hash_of(&right));
     }
 }
 
@@ -5713,18 +5472,10 @@ mod owner_scope_tests {
 mod declaration_id_tests {
     use super::*;
 
-    fn root(name: &str) -> PathBuf {
-        if cfg!(windows) {
-            PathBuf::from(format!(r"C:\{name}"))
-        } else {
-            PathBuf::from(format!("/{name}"))
-        }
-    }
-
     #[test]
     fn declaration_id_excludes_the_absolute_workspace_root() {
         let left = CodeUnit::with_signature(
-            ProjectFile::new(root("workspace-a"), "src/Widget.java"),
+            ProjectFile::new(absolute_test_root("workspace-a"), "src/Widget.java"),
             CodeUnitType::Function,
             "example.Widget",
             "run",
@@ -5732,7 +5483,7 @@ mod declaration_id_tests {
             false,
         );
         let right = CodeUnit::with_signature(
-            ProjectFile::new(root("workspace-b"), "src/Widget.java"),
+            ProjectFile::new(absolute_test_root("workspace-b"), "src/Widget.java"),
             CodeUnitType::Function,
             "example.Widget",
             "run",
@@ -5745,7 +5496,7 @@ mod declaration_id_tests {
 
     #[test]
     fn declaration_id_distinguishes_overloads_and_structured_segment_kinds() {
-        let file = ProjectFile::new(root("workspace"), "src/Widget.java");
+        let file = ProjectFile::new(absolute_test_root("workspace"), "src/Widget.java");
         let integer = CodeUnit::with_signature(
             file.clone(),
             CodeUnitType::Function,
@@ -5787,7 +5538,7 @@ mod declaration_id_tests {
     #[test]
     fn declaration_site_id_is_the_declaration_id_plus_exact_byte_span() {
         let unit = CodeUnit::with_signature(
-            ProjectFile::new(root("workspace"), "src/Widget.java"),
+            ProjectFile::new(absolute_test_root("workspace"), "src/Widget.java"),
             CodeUnitType::Function,
             "example.Widget",
             "run",
@@ -5819,13 +5570,10 @@ mod declaration_id_tests {
 mod identity_cost_tests {
     use super::*;
     use crate::analyzer::fq_name::{SegmentInterner, SegmentKind, counters};
+    use brokk_bifrost_test_macros::hardwon;
 
     fn absolute_root() -> PathBuf {
-        if cfg!(windows) {
-            PathBuf::from(r"C:\identity-cost")
-        } else {
-            PathBuf::from("/identity-cost")
-        }
+        absolute_test_root("identity-cost")
     }
 
     /// A C++-shaped name with a `::`-joined namespace head, a type, and a
@@ -5849,6 +5597,7 @@ mod identity_cost_tests {
     /// segment `SmallVec` per rendering. For this four-segment name that was
     /// 4+2+2+1+3+1 = 13 resolves and six strings; it is now 4 and one.
     #[test]
+    #[hardwon("#1928: each CodeUnit projection re-rendered its qualified name per candidate")]
     fn building_a_code_unit_resolves_each_segment_once() {
         let interner = segment_interner();
         let file = ProjectFile::new(absolute_root(), "third_party/blink/task_queue.cc");
@@ -5886,6 +5635,7 @@ mod identity_cost_tests {
     /// the per-segment interner cost once per declaration, with no per-row
     /// multiplier from the projections each `CodeUnit` exposes.
     #[test]
+    #[hardwon("#1928: hydrating each file row repeated qualified-name work per projection")]
     fn hydrating_rows_of_one_file_scales_by_segment_not_by_projection() {
         const ROWS: usize = 64;
         let interner = segment_interner();
@@ -5919,6 +5669,7 @@ mod identity_cost_tests {
     /// A file answers its language from the value it computed at construction,
     /// so a declaration never re-derives it from the path.
     #[test]
+    #[hardwon("#1878: extensionless included headers used neutral declaration spelling")]
     fn project_file_answers_language_questions_without_reparsing_the_path() {
         let cpp = ProjectFile::new(absolute_root(), "src/renderer.cc");
         assert_eq!(cpp.language(), Language::Cpp);
@@ -5941,6 +5692,7 @@ mod identity_cost_tests {
     /// reference-only sibling extension no analyzer parses, and an extension
     /// no list claims at all, which include inference adopts (#1837, #3391).
     #[test]
+    #[hardwon("#3391: extension claims must not give semantic results to the wrong language")]
     fn declaration_language_for_rel_path_agrees_with_the_file() {
         for path in [
             "src/renderer.cc",
@@ -5995,5 +5747,180 @@ mod source_declared_visibility_tests {
         assert!(recorded.callable_is_constructor());
         assert!(recorded.callable_modifiers_recorded());
         assert!(recorded.callable_is_native());
+    }
+}
+
+#[cfg(test)]
+mod structured_import_path_kind_tests {
+    use super::StructuredImportPathKind;
+
+    #[test]
+    fn persisted_tags_round_trip_and_preserve_existing_spellings() {
+        for (kind, tag) in [
+            (StructuredImportPathKind::Namespace, "namespace"),
+            (StructuredImportPathKind::ImportFrom, "import_from"),
+            (StructuredImportPathKind::StaticMember, "static_member"),
+            (StructuredImportPathKind::ExternCrate, "extern_crate"),
+            (StructuredImportPathKind::FileInclude, "file_include"),
+            (StructuredImportPathKind::DynamicInclude, "dynamic_include"),
+        ] {
+            assert_eq!(kind.persist_tag(), tag);
+            assert_eq!(StructuredImportPathKind::from_persist_tag(tag), Some(kind));
+        }
+        assert_eq!(
+            StructuredImportPathKind::from_persist_tag("not-a-path-kind"),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod semantic_diagnostic_report_tests {
+    use super::*;
+    use crate::analyzer::common::test_range as range;
+
+    fn diagnostic(range: Range) -> SemanticDiagnostic {
+        SemanticDiagnostic {
+            range,
+            source: "test",
+            kind: "unrecognized_symbol",
+            message: "Unrecognized symbol `Missing`".to_string(),
+        }
+    }
+
+    #[test]
+    fn report_emits_only_a_diagnostic_with_complete_absence_proof() {
+        let location = range(2);
+        let mut report = SemanticDiagnosticReport::new();
+        report.push_resolved(location, BoundaryStatus::ExternalIndexed);
+        report.push_ambiguous(
+            location,
+            vec![
+                BoundaryStatus::WorkspaceLocal,
+                BoundaryStatus::ExternalIndexed,
+            ],
+        );
+        report.push_incomplete(
+            Some(location),
+            vec![SemanticDiagnosticIncompleteReason::Cancelled],
+        );
+
+        assert!(report.diagnostics().is_empty());
+        assert_eq!(report.status(), SemanticDiagnosticReportStatus::Incomplete);
+
+        report.push_absent(
+            SemanticAbsenceProof {
+                range: location,
+                domain: SemanticDiagnosticDomain::Type {
+                    name: "example.Owner".to_string(),
+                },
+                boundary: BoundaryStatus::ExternalIndexed,
+            },
+            diagnostic(location),
+        );
+
+        assert_eq!(report.diagnostics(), &[diagnostic(location)]);
+        assert_eq!(report.status(), SemanticDiagnosticReportStatus::Incomplete);
+        assert_eq!(report.outcomes().len(), 4);
+        assert!(matches!(
+            report.outcomes().last(),
+            Some(SemanticDiagnosticOutcome::Absent(proof))
+                if proof.boundary == BoundaryStatus::ExternalIndexed
+        ));
+    }
+
+    #[test]
+    fn report_retains_each_typed_incomplete_reason_without_an_error() {
+        let reasons = vec![
+            SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery {
+                boundary: BoundaryStatus::ExternalDeclaredUnindexed,
+            },
+            SemanticDiagnosticIncompleteReason::StaleGeneration {
+                expected: 4,
+                actual: 3,
+            },
+            SemanticDiagnosticIncompleteReason::Cancelled,
+            SemanticDiagnosticIncompleteReason::Truncated,
+            SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                detail: "macro expansion".to_string(),
+            },
+            SemanticDiagnosticIncompleteReason::DynamicBehavior {
+                detail: "runtime member".to_string(),
+            },
+            SemanticDiagnosticIncompleteReason::RuntimeUnavailable {
+                detail: "pack activation unavailable".to_string(),
+            },
+            SemanticDiagnosticIncompleteReason::CorruptSemanticPack {
+                detail: "invalid manifest".to_string(),
+            },
+            SemanticDiagnosticIncompleteReason::UnsupportedGeneratedSurface {
+                detail: "generated sources are not indexed".to_string(),
+            },
+        ];
+        let mut report = SemanticDiagnosticReport::new();
+        report.push_incomplete(Some(range(7)), reasons.clone());
+
+        assert!(report.diagnostics().is_empty());
+        assert_eq!(
+            report.outcomes(),
+            &[SemanticDiagnosticOutcome::Incomplete {
+                range: Some(range(7)),
+                reasons,
+            }]
+        );
+    }
+
+    #[test]
+    fn workspace_conversion_records_the_checked_lexical_domain() {
+        let file = ProjectFile::new(std::env::current_dir().unwrap(), "src/Main.java");
+        let location = range(11);
+        let report =
+            SemanticDiagnosticReport::from_workspace_absences(&file, vec![diagnostic(location)]);
+
+        assert_eq!(report.diagnostics(), &[diagnostic(location)]);
+        assert_eq!(report.status(), SemanticDiagnosticReportStatus::Complete);
+        assert!(matches!(
+            report.outcomes(),
+            [SemanticDiagnosticOutcome::Absent(SemanticAbsenceProof {
+                range,
+                domain: SemanticDiagnosticDomain::LexicalScope { file, range: domain_range },
+                boundary: BoundaryStatus::WorkspaceLocal,
+            })] if *range == location
+                && file == &PathBuf::from("src/Main.java")
+                && *domain_range == location
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "absence proof and diagnostic must identify the same source range")]
+    fn report_rejects_an_error_without_matching_absence_evidence() {
+        let mut report = SemanticDiagnosticReport::new();
+        report.push_absent(
+            SemanticAbsenceProof {
+                range: range(1),
+                domain: SemanticDiagnosticDomain::Module {
+                    name: "example".to_string(),
+                },
+                boundary: BoundaryStatus::WorkspaceLocal,
+            },
+            diagnostic(range(2)),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "absence proof requires a complete boundary")]
+    fn report_rejects_absence_at_an_unknown_boundary() {
+        let location = range(3);
+        let mut report = SemanticDiagnosticReport::new();
+        report.push_absent(
+            SemanticAbsenceProof {
+                range: location,
+                domain: SemanticDiagnosticDomain::Package {
+                    name: "unknown.external".to_string(),
+                },
+                boundary: BoundaryStatus::ExternalUnknown,
+            },
+            diagnostic(location),
+        );
     }
 }

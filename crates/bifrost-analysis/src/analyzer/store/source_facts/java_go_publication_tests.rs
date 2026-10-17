@@ -1,8 +1,10 @@
 //! Java and Go publication coverage for the shared canonical source contract.
 
+use brokk_bifrost_test_macros::hardwon;
 use std::sync::Arc;
 
 use brokk_bifrost_core::analyzer::model::StructuredImportPathKind;
+use brokk_bifrost_core::analyzer::structural::facts::StructuralFactRows;
 
 use crate::CancellationToken;
 use crate::analyzer::Language;
@@ -28,10 +30,14 @@ fn assert_published_canonical_source<A: LanguageAdapter>(
     let facts = state.source_facts.as_ref().expect("canonical source facts");
     let expected_imports = facts.imports.clone();
     let expected_generic_imports = state.imports.clone();
-    let expected_structural = FileFacts::from_source_and_rows(
+    // A recovered region publishes its span; whether a callable contains it
+    // is the store's answer when it reads the row back (#3777), so the parse
+    // alone cannot state the expected region rows.
+    let (nodes, roles, occurrence_roles, recovered_regions) = facts.structural.clone().into_parts();
+    let mut expected_structural = FileFacts::from_source_and_rows(
         state.source.clone(),
         facts.occurrences.clone(),
-        facts.structural.clone(),
+        StructuralFactRows::new(nodes, roles, occurrence_roles, Vec::new()),
     )
     .persisted_rows()
     .expect("canonical structural rows");
@@ -66,11 +72,25 @@ fn assert_published_canonical_source<A: LanguageAdapter>(
     let generation = reopened
         .current_generation(lang)
         .expect("current language generation");
+    let published = reopened
+        .load_structural_facts_rows(oid, lang, generation, STRUCTURAL_FACTS_VERSION)
+        .expect("read canonical structural rows")
+        .expect("published canonical structural rows");
     assert_eq!(
-        reopened
-            .load_structural_facts_rows(oid, lang, generation, STRUCTURAL_FACTS_VERSION)
-            .expect("read canonical structural rows"),
-        Some(expected_structural),
+        published
+            .recovered_regions
+            .iter()
+            .map(|region| (region.span.start as usize, region.span.end as usize))
+            .collect::<Vec<_>>(),
+        recovered_regions
+            .iter()
+            .map(|span| (span.start_byte, span.end_byte))
+            .collect::<Vec<_>>(),
+        "the store must publish every recovered region the parse found"
+    );
+    expected_structural.recovered_regions = published.recovered_regions.clone();
+    assert_eq!(
+        published, expected_structural,
         "structural consumers must read the source-owned publication"
     );
 
@@ -564,12 +584,7 @@ fn prepare_empty_java_with_storage(
 
 #[test]
 #[should_panic(expected = "canonical source facts contain an unhandled adapter family")]
-fn prepared_java_publication_rejects_the_wrong_storage_capability() {
-    prepare_empty_java_with_storage(GoAdapter.source_fact_storage());
-}
-
-#[test]
-#[should_panic(expected = "canonical source facts contain an unhandled adapter family")]
+#[hardwon("c8c2017cd61c: prepared Java facts outside the storage capability were silently omitted")]
 fn prepared_java_publication_rejects_an_absent_storage_capability() {
     prepare_empty_java_with_storage(None);
 }

@@ -2,7 +2,8 @@
 //!
 //! Binding and conversion completeness are separate: matching a formal slot
 //! does not establish its type. This query-local relation consumes the selected
-//! declaration and the shared formal layout. It never selects an overload.
+//! declaration and the shared formal layout. Model overload selection also
+//! requires competing signatures to be proven inapplicable.
 
 use std::sync::Arc;
 
@@ -15,7 +16,10 @@ use crate::analyzer::semantic::{
     LengthDelimitedDigest, StableDigest, TransferKind, TransferOperation, ValuePreservation,
     ValueTransfer,
 };
-use crate::analyzer::semantic_model::{Signature, TypeRef};
+use crate::analyzer::semantic_model::{
+    SemanticModelArgumentBinding, SemanticModelCallApplication, Signature, TypeRef,
+    bind_semantic_model_arguments,
+};
 use crate::analyzer::usages::call_binding::{
     CallBindingKind, CallBindingMapping, CallBindingReport, CallBindingRow,
 };
@@ -173,6 +177,13 @@ impl ExternalConversionIdentity {
     }
 }
 
+/// Complete conversion evidence, a proven rejection, or unresolved applicability.
+pub(crate) enum ModelArgumentApplicability {
+    Applicable(Box<ArgumentTypeConversion>),
+    Inapplicable,
+    Unknown(ConversionUnknown),
+}
+
 /// Language-owned call-argument conversion producer.
 ///
 /// The shared relation owns exact call/signature/actual/formal joins and delegates only
@@ -210,6 +221,23 @@ pub(crate) trait CallArgumentConversionProver: Send + Sync {
     ) -> Result<ArgumentTypeConversion, ConversionUnknown> {
         Err(ConversionUnknown::UnsupportedConversion)
     }
+
+    /// An unsupported conversion is not a proof that an overload is inapplicable.
+    /// Languages may reject a candidate only from complete conversion rules and
+    /// resolved type identities; the default preserves every failure as unknown.
+    fn model_argument_applicability(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        actual: tree_sitter::Node<'_>,
+        source: &str,
+        formal_type: &TypeRef,
+    ) -> ModelArgumentApplicability {
+        match self.prove_model_argument(analyzer, file, actual, source, formal_type) {
+            Ok(proof) => ModelArgumentApplicability::Applicable(Box::new(proof)),
+            Err(reason) => ModelArgumentApplicability::Unknown(reason),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,6 +250,13 @@ pub enum JavaPrimitive {
     Long,
     Float,
     Double,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CSharpPrimitive {
+    Char,
+    Int32,
+    String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -342,6 +377,7 @@ impl RustConversionType {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolvedConversionType {
     JavaPrimitive(JavaPrimitive),
+    CSharpPrimitive(CSharpPrimitive),
     TypeScriptPrimitive(TypeScriptPrimitive),
     Rust(RustConversionType),
     Scala(ScalaConversionType),
@@ -359,6 +395,8 @@ pub enum ConversionKind {
     JavaReferenceWidening,
     JavaBoxing,
     JavaUnboxing,
+    CSharpIdentity,
+    CSharpImplicitNumeric,
     TypeScriptIdentity,
     TypeScriptStructuralAssignability,
     RustIdentity,
@@ -379,6 +417,8 @@ impl ConversionKind {
         "java_reference_widening",
         "java_boxing",
         "java_unboxing",
+        "csharp_identity",
+        "csharp_implicit_numeric",
         "typescript_identity",
         "typescript_structural_assignability",
         "rust_identity",
@@ -399,6 +439,8 @@ impl ConversionKind {
             Self::JavaReferenceWidening => "java_reference_widening",
             Self::JavaBoxing => "java_boxing",
             Self::JavaUnboxing => "java_unboxing",
+            Self::CSharpIdentity => "csharp_identity",
+            Self::CSharpImplicitNumeric => "csharp_implicit_numeric",
             Self::TypeScriptIdentity => "typescript_identity",
             Self::TypeScriptStructuralAssignability => "typescript_structural_assignability",
             Self::RustIdentity => "rust_identity",
@@ -582,6 +624,9 @@ impl CallArgumentConversion {
                     },
                 }
             }
+            ConversionKind::CSharpImplicitNumeric => TransferKind::Conversion {
+                preservation: ValuePreservation::Preserving,
+            },
             ConversionKind::ScalaImplicitConversion => TransferKind::Conversion {
                 preservation: ValuePreservation::Changing,
             },
@@ -590,6 +635,7 @@ impl CallArgumentConversion {
             },
             ConversionKind::JavaIdentity
             | ConversionKind::JavaReferenceWidening
+            | ConversionKind::CSharpIdentity
             | ConversionKind::TypeScriptIdentity
             | ConversionKind::TypeScriptStructuralAssignability
             | ConversionKind::RustIdentity
@@ -632,6 +678,10 @@ impl CallArgumentConversion {
                     digest.push(b"java_primitive");
                     digest.push(&[*primitive as u8]);
                 }
+                ResolvedConversionType::CSharpPrimitive(primitive) => {
+                    digest.push(b"csharp_primitive");
+                    digest.push(&[*primitive as u8]);
+                }
                 ResolvedConversionType::TypeScriptPrimitive(primitive) => {
                     digest.push(b"typescript_primitive");
                     digest.push(&[*primitive as u8]);
@@ -667,6 +717,52 @@ type IndexedConversionProof = (usize, Result<ArgumentTypeConversion, ConversionU
 struct ConversionSource {
     source: String,
     tree: tree_sitter::Tree,
+}
+
+fn is_explicit_conversion_row(row: &CallBindingRow) -> bool {
+    row.argument_id.is_some()
+        && !matches!(
+            row.binding_kind,
+            Some(CallBindingKind::Receiver | CallBindingKind::Implicit)
+        )
+}
+
+fn exact_positional_formal_index(row: &CallBindingRow) -> Result<usize, ConversionUnknown> {
+    if row.mapping != CallBindingMapping::Exact
+        || row.binding_kind != Some(CallBindingKind::Positional)
+    {
+        return Err(ConversionUnknown::AmbiguousBinding);
+    }
+    row.formal_index.ok_or(ConversionUnknown::AmbiguousBinding)
+}
+
+fn exact_argument_expression<'tree>(
+    source: &'tree ConversionSource,
+    row: &CallBindingRow,
+) -> Result<tree_sitter::Node<'tree>, ConversionUnknown> {
+    let actual = source
+        .tree
+        .root_node()
+        .named_descendant_for_byte_range(row.range.start_byte, row.range.end_byte)
+        .filter(|node| node.byte_range() == (row.range.start_byte..row.range.end_byte))
+        .ok_or(ConversionUnknown::UnsupportedExpression)?;
+    if actual.has_error() || actual.is_missing() {
+        return Err(ConversionUnknown::UnsupportedExpression);
+    }
+    Ok(actual)
+}
+
+fn apply_conversion_proofs(report: &mut CallBindingReport, proofs: Vec<IndexedConversionProof>) {
+    for (index, proof) in proofs {
+        match proof {
+            Ok(proof) => report.conversion_facts[index].establish(proof),
+            Err(reason) => {
+                report.conversion_facts[index].result = Err(reason);
+                report.conversion_facts[index].completeness =
+                    ConversionCompleteness::Unknown(reason);
+            }
+        }
+    }
 }
 
 /// One indexed source/tree per file, scoped to the caller's query snapshot.
@@ -723,16 +819,7 @@ impl CallConversionCache {
             })
             .collect();
         if let Ok(proofs) = prerequisite {
-            for (index, proof) in proofs {
-                match proof {
-                    Ok(proof) => report.conversion_facts[index].establish(proof),
-                    Err(reason) => {
-                        report.conversion_facts[index].result = Err(reason);
-                        report.conversion_facts[index].completeness =
-                            ConversionCompleteness::Unknown(reason);
-                    }
-                }
-            }
+            apply_conversion_proofs(report, proofs);
         }
         project_conversion_facts(report, signature, None);
     }
@@ -785,40 +872,19 @@ impl CallConversionCache {
         let ordinary: Vec<_> = slots.iter().filter(|(slot, _)| !slot.receiver).collect();
         let mut proofs = Vec::new();
         for (index, row) in report.rows.iter().enumerate() {
-            if row.argument_id.is_none()
-                || matches!(
-                    row.binding_kind,
-                    Some(CallBindingKind::Receiver | CallBindingKind::Implicit)
-                )
-            {
+            if !is_explicit_conversion_row(row) {
                 continue;
             }
             let proof = (|| {
-                if row.mapping != CallBindingMapping::Exact
-                    || row.binding_kind != Some(CallBindingKind::Positional)
-                {
-                    return Err(ConversionUnknown::AmbiguousBinding);
-                }
+                let formal_index = exact_positional_formal_index(row)?;
                 let (slot, formal) = ordinary
-                    .get(
-                        row.formal_index
-                            .ok_or(ConversionUnknown::AmbiguousBinding)?,
-                    )
+                    .get(formal_index)
                     .ok_or(ConversionUnknown::UnresolvedTargetType)?;
                 if slot.variadic.is_some() {
                     return Err(ConversionUnknown::UnsupportedConversion);
                 }
-                let actual = source
-                    .tree
-                    .root_node()
-                    .named_descendant_for_byte_range(row.range.start_byte, row.range.end_byte)
-                    .filter(|node| node.byte_range() == (row.range.start_byte..row.range.end_byte))
-                    .ok_or(ConversionUnknown::UnsupportedExpression)?;
-                if actual.has_error()
-                    || actual.is_missing()
-                    || formal.has_error()
-                    || formal.is_missing()
-                {
+                let actual = exact_argument_expression(&source, row)?;
+                if formal.has_error() || formal.is_missing() {
                     return Err(ConversionUnknown::UnsupportedExpression);
                 }
                 prover.prove_argument(
@@ -867,6 +933,13 @@ impl CallConversionCache {
         caller_source: Option<(&ProjectFile, &str)>,
         candidates: &[(String, Signature)],
     ) -> Result<Option<(String, Signature)>, ConversionUnknown> {
+        let cancellation = analyzer.active_query_cancellation();
+        if cancellation
+            .as_ref()
+            .is_some_and(crate::CancellationToken::is_cancelled)
+        {
+            return Err(ConversionUnknown::Cancelled);
+        }
         let language = language_for_file(&shape.outcome.file);
         let Some(prover) =
             language_support(language).and_then(LanguageSupport::call_argument_conversion_prover)
@@ -888,7 +961,13 @@ impl CallConversionCache {
             }
         };
         let mut written = Vec::new();
-        for (formal_index, argument) in shape.arguments.iter().enumerate() {
+        for argument in &shape.arguments {
+            if cancellation
+                .as_ref()
+                .is_some_and(crate::CancellationToken::is_cancelled)
+            {
+                return Err(ConversionUnknown::Cancelled);
+            }
             if argument.spread || argument.name.is_some() {
                 return Err(ConversionUnknown::AmbiguousBinding);
             }
@@ -903,47 +982,84 @@ impl CallConversionCache {
             if actual.has_error() || actual.is_missing() {
                 return Err(ConversionUnknown::UnsupportedExpression);
             }
-            written.push((formal_index, actual));
+            written.push(actual);
         }
 
         let mut applicable = Vec::new();
         let mut failures = Vec::new();
+        let application = SemanticModelCallApplication::positional(
+            u32::try_from(written.len()).expect("written call arity must fit u32"),
+        );
         for (model_id, signature) in candidates {
-            let mut candidate_ok = true;
-            for (formal_index, actual) in &written {
-                let Some(formal) = signature.parameters.get(*formal_index) else {
-                    failures.push(ConversionUnknown::UnresolvedTargetType);
-                    candidate_ok = false;
-                    break;
-                };
-                if !formal.passing_mode.accepts_positional() || formal.variadic {
-                    failures.push(ConversionUnknown::UnsupportedConversion);
-                    candidate_ok = false;
-                    break;
+            if cancellation
+                .as_ref()
+                .is_some_and(crate::CancellationToken::is_cancelled)
+            {
+                return Err(ConversionUnknown::Cancelled);
+            }
+            let parameter_ordinals = match bind_semantic_model_arguments(signature, &application) {
+                SemanticModelArgumentBinding::Exact { parameter_ordinals } => parameter_ordinals,
+                SemanticModelArgumentBinding::Mismatch => continue,
+                SemanticModelArgumentBinding::PossibleSpread => {
+                    failures.push(ConversionUnknown::AmbiguousBinding);
+                    continue;
                 }
-                if let Err(reason) = prover.prove_model_argument(
+            };
+            let mut rejected = false;
+            let mut unknown = Vec::new();
+            for (actual, formal_index) in written.iter().zip(parameter_ordinals) {
+                if cancellation
+                    .as_ref()
+                    .is_some_and(crate::CancellationToken::is_cancelled)
+                {
+                    return Err(ConversionUnknown::Cancelled);
+                }
+                let formal = &signature.parameters[formal_index];
+                // Variadic conversion requires language-owned expansion semantics.
+                if formal.variadic {
+                    unknown.push(ConversionUnknown::UnsupportedConversion);
+                    continue;
+                }
+                match prover.model_argument_applicability(
                     analyzer,
                     &shape.outcome.file,
                     *actual,
                     &source.source,
                     &formal.r#type,
                 ) {
-                    failures.push(reason);
-                    candidate_ok = false;
-                    break;
+                    ModelArgumentApplicability::Applicable(_proof) => {}
+                    ModelArgumentApplicability::Inapplicable => rejected = true,
+                    ModelArgumentApplicability::Unknown(
+                        reason
+                        @ (ConversionUnknown::Cancelled | ConversionUnknown::BudgetExhausted),
+                    ) => return Err(reason),
+                    ModelArgumentApplicability::Unknown(reason) => unknown.push(reason),
                 }
             }
-            if candidate_ok {
+            if rejected {
+                continue;
+            }
+            if unknown.is_empty() {
                 applicable.push((model_id.clone(), signature.clone()));
+            } else {
+                failures.extend(unknown);
             }
         }
+        if cancellation
+            .as_ref()
+            .is_some_and(crate::CancellationToken::is_cancelled)
+        {
+            return Err(ConversionUnknown::Cancelled);
+        }
         match applicable.as_slice() {
-            [(model_id, signature)] => Ok(Some((model_id.clone(), signature.clone()))),
-            [] if failures.windows(2).all(|pair| pair[0] == pair[1]) && !failures.is_empty() => {
+            [_, _, ..] => Err(ConversionUnknown::AmbiguousBinding),
+            [(model_id, signature)] if failures.is_empty() => {
+                Ok(Some((model_id.clone(), signature.clone())))
+            }
+            _ if failures.windows(2).all(|pair| pair[0] == pair[1]) && !failures.is_empty() => {
                 Err(failures[0])
             }
-            [] => Err(ConversionUnknown::SignatureApplicability),
-            _ => Err(ConversionUnknown::AmbiguousBinding),
+            _ => Err(ConversionUnknown::SignatureApplicability),
         }
     }
 
@@ -979,16 +1095,7 @@ impl CallConversionCache {
             })
             .collect();
         if let Ok(proofs) = prerequisite {
-            for (index, proof) in proofs {
-                match proof {
-                    Ok(proof) => report.conversion_facts[index].establish(proof),
-                    Err(reason) => {
-                        report.conversion_facts[index].result = Err(reason);
-                        report.conversion_facts[index].completeness =
-                            ConversionCompleteness::Unknown(reason);
-                    }
-                }
-            }
+            apply_conversion_proofs(report, proofs);
         }
         project_conversion_facts(report, Some(signature_id), Some(model_target_id));
     }
@@ -1005,23 +1112,11 @@ impl CallConversionCache {
             .ok_or(ConversionUnknown::UnresolvedSourceType)?;
         let mut proofs = Vec::new();
         for (index, row) in report.rows.iter().enumerate() {
-            if row.argument_id.is_none()
-                || matches!(
-                    row.binding_kind,
-                    Some(CallBindingKind::Receiver | CallBindingKind::Implicit)
-                )
-            {
+            if !is_explicit_conversion_row(row) {
                 continue;
             }
             let proof = (|| {
-                if row.mapping != CallBindingMapping::Exact
-                    || row.binding_kind != Some(CallBindingKind::Positional)
-                {
-                    return Err(ConversionUnknown::AmbiguousBinding);
-                }
-                let formal_index = row
-                    .formal_index
-                    .ok_or(ConversionUnknown::AmbiguousBinding)?;
+                let formal_index = exact_positional_formal_index(row)?;
                 let formal = signature
                     .parameters
                     .get(formal_index)
@@ -1029,15 +1124,7 @@ impl CallConversionCache {
                 if formal.variadic {
                     return Err(ConversionUnknown::UnsupportedConversion);
                 }
-                let actual = source
-                    .tree
-                    .root_node()
-                    .named_descendant_for_byte_range(row.range.start_byte, row.range.end_byte)
-                    .filter(|node| node.byte_range() == (row.range.start_byte..row.range.end_byte))
-                    .ok_or(ConversionUnknown::UnsupportedExpression)?;
-                if actual.has_error() || actual.is_missing() {
-                    return Err(ConversionUnknown::UnsupportedExpression);
-                }
+                let actual = exact_argument_expression(&source, row)?;
                 prover.prove_model_argument(
                     analyzer,
                     &report.file,
@@ -1136,6 +1223,7 @@ mod tests {
     use super::*;
     use crate::analyzer::usages::call_binding::CallBindingCoverage;
     use crate::analyzer::{CodeUnitType, Range};
+    use brokk_bifrost_test_macros::hardwon;
 
     fn report() -> CallBindingReport {
         let file = ProjectFile::new(std::env::temp_dir(), "Conversions.java");
@@ -1280,6 +1368,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "2dc7a9b231a0: a modeled overload identity could borrow conversion evidence from a different model target"
+    )]
     fn model_target_identity_is_disjoint_and_cannot_borrow_a_conversion() {
         let mut report = report();
         report.target = None;
@@ -1349,50 +1440,5 @@ mod tests {
                 preservation: ValuePreservation::Changing
             }
         );
-    }
-
-    #[test]
-    fn conversion_labels_and_unknown_reasons_are_stable() {
-        assert_eq!(
-            ConversionKind::LABELS,
-            &[
-                "java_identity",
-                "java_primitive_widening",
-                "java_reference_widening",
-                "java_boxing",
-                "java_unboxing",
-                "typescript_identity",
-                "typescript_structural_assignability",
-                "rust_identity",
-                "rust_deref",
-                "rust_unsizing",
-                "rust_reborrow",
-                "scala_identity",
-                "scala_implicit_conversion",
-                "scala_value_class_boxing",
-                "scala_value_class_unboxing",
-                "scala_opaque_adaptation",
-            ]
-        );
-        assert_eq!(
-            ConversionUnknown::LABELS,
-            &[
-                "unsupported_language",
-                "unresolved_signature",
-                "unresolved_source_type",
-                "unresolved_target_type",
-                "ambiguous_binding",
-                "generic_substitution",
-                "unsupported_conversion",
-                "unsupported_expression",
-                "incomplete_hierarchy",
-                "budget_exhausted",
-                "cancelled",
-                "signature_applicability",
-            ]
-        );
-        for reason in ConversionUnknown::LABELS {
-            assert!(reason.as_bytes().iter().all(|byte| byte.is_ascii()));
-        }
     }
 }

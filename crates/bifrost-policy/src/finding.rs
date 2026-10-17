@@ -1,4 +1,4 @@
-//! Stable policy evaluation and schema-version-5 match-evidence report types.
+//! Stable policy evaluation and schema-version-6 match-evidence report types.
 //!
 //! This module deliberately contains no query-to-finding conversion.  The
 //! evaluator must combine a loaded policy, detailed analyzer evidence, and a
@@ -20,7 +20,9 @@ use super::classification::{
     ClassificationProvenance, FindingClassification, OrganizationalRiskAssessment,
 };
 use super::cvss::{CvssAssessmentSet, VulnerabilityIdentity};
-use super::definition::{FindingSeverity, PolicyAnalysisType, PolicyId, UnknownVerdict};
+use super::definition::{
+    FindingSeverity, PolicyAnalysisType, PolicyId, UnknownVerdict, is_valid_namespaced_identifier,
+};
 use super::finding_identity::{
     EvidenceRef, FindingIdentityStability, MatchFindingAnchor, MatchResultDomain, PolicyFindingId,
     StableSemanticIdentity, WitnessId,
@@ -28,7 +30,10 @@ use super::finding_identity::{
 use super::future_evidence::{FlowFindingEvidence, TaintFindingEvidence, TypestateFindingEvidence};
 use super::identity::PolicySemanticHash;
 use super::resolved::ResolvedEndpointIdentity;
-use super::retained::{RetainedSize, retained_extra};
+use super::retained::{
+    RetainedSize, ensure_truncation_consistency, retained_extra, retained_size_with_extra,
+    retained_size_with_extras,
+};
 use super::scope::PolicyFindingScope;
 use super::suppression::PolicyFindingSuppression;
 use crate::is_false;
@@ -36,6 +41,19 @@ use crate::is_false;
 pub(crate) const MAX_REPORT_PROSE_BYTES: usize = 4_096;
 const MAX_REPORT_IDENTIFIER_BYTES: usize = 128;
 const MAX_TYPED_REASONS: usize = 256;
+
+fn normalized_report_identifier(value: impl Into<String>) -> Result<String, ReportValueError> {
+    let mut value = value.into();
+    validate_report_identifier(&value)?;
+    tighten_string(&mut value);
+    Ok(value)
+}
+
+fn has_canonical_typed_reasons<T: Ord>(reasons: &[T]) -> bool {
+    !reasons.is_empty()
+        && reasons.len() <= MAX_TYPED_REASONS
+        && reasons.windows(2).all(|pair| pair[0] < pair[1])
+}
 const MAX_QUERY_PROVENANCE: usize = 16;
 const MAX_QUERY_BRANCH_DEPTH: usize = 128;
 const MAX_QUERY_PROVENANCE_STEPS: usize = 1_024;
@@ -46,6 +64,10 @@ const MAX_WITNESS_STEPS: usize = 1_024;
 const MAX_WITNESS_BYTES: u64 = 1024 * 1024;
 const MAX_WORK_METRICS: usize = 256;
 const MAX_CAPABILITIES: usize = 64;
+/// The most files an inconclusive verdict names. A run that could not
+/// conclude more files than this still says so through `truncated`, and a
+/// reader then treats the verdict as concerning the whole run.
+const MAX_INCONCLUSIVE_FILES: usize = 256;
 /// The byte cap on one obligation's rendered group key. Group keys are row
 /// scalars an author chose, so their combined text is unbounded in principle
 /// while every other obligation field is a validated identifier.
@@ -67,6 +89,15 @@ pub enum PolicyRunCompletion {
     ProvenBySummary,
     Inconclusive {
         reasons: Vec<PolicyIncompleteReason>,
+        /// Which files the blocked verdict concerns (#5433).
+        scope: InconclusiveScope,
+    },
+    /// The selected policy could not run because its required workspace
+    /// capability was unavailable. An implicit catalog selection does not
+    /// affect the batch exit status; an explicit policy ID request does.
+    NotRun {
+        unavailable_capabilities: Vec<UnavailablePolicyCapability>,
+        selected_by: PolicySelectionProvenance,
     },
     Unsupported {
         capability: PolicyCapability,
@@ -77,6 +108,18 @@ pub enum PolicyRunCompletion {
 }
 
 impl PolicyRunCompletion {
+    pub(crate) const fn label(&self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::ProvenSubset { .. } => "proven_subset",
+            Self::ProvenBySummary => "proven_by_summary",
+            Self::Inconclusive { .. } => "inconclusive",
+            Self::NotRun { .. } => "not_run",
+            Self::Unsupported { .. } => "unsupported",
+            Self::Failed { .. } => "failed",
+        }
+    }
+
     /// Map the canonical query-domain support decision without re-evaluating
     /// it or laundering unavailable coverage into a clean policy run.
     pub fn from_query_capability_evaluation(evaluation: &CapabilityEvaluation) -> Self {
@@ -111,11 +154,54 @@ impl PolicyRunCompletion {
         }
     }
 
+    /// An inconclusive completion whose causes are not tied to files, so its
+    /// verdict concerns the whole run.
     pub fn inconclusive(
+        reasons: Vec<PolicyIncompleteReason>,
+    ) -> Result<Self, CompletionReasonError> {
+        Self::inconclusive_in(reasons, InconclusiveScope::Run)
+    }
+
+    /// An inconclusive completion whose every cause lies in `scope`.
+    pub(crate) fn inconclusive_in(
         mut reasons: Vec<PolicyIncompleteReason>,
+        scope: InconclusiveScope,
     ) -> Result<Self, CompletionReasonError> {
         normalize_nonempty(&mut reasons)?;
-        Ok(Self::Inconclusive { reasons })
+        Ok(Self::Inconclusive { reasons, scope })
+    }
+
+    /// Which files an inconclusive verdict concerns. `None` for every other
+    /// completion.
+    pub const fn inconclusive_scope(&self) -> Option<&InconclusiveScope> {
+        match self {
+            Self::Inconclusive { scope, .. } => Some(scope),
+            _ => None,
+        }
+    }
+
+    /// Add one incomplete reason that is not tied to files.
+    ///
+    /// A reliable completion becomes inconclusive for the whole run, and an
+    /// inconclusive one keeps its reasons and widens its scope to the whole
+    /// run. A run that failed, was unsupported or did not run published no
+    /// verdict to block and is left as it is; the return value says whether
+    /// the reason was recorded.
+    pub(crate) fn mark_inconclusive(&mut self, reason: PolicyIncompleteReason) -> bool {
+        match self {
+            Self::Complete | Self::ProvenSubset { .. } | Self::ProvenBySummary => {
+                *self = Self::inconclusive(vec![reason])
+                    .expect("one typed incomplete reason is canonical");
+                true
+            }
+            Self::Inconclusive { reasons, scope } => {
+                reasons.push(reason);
+                normalize_nonempty(reasons).expect("one more typed reason stays canonical");
+                *scope = InconclusiveScope::Run;
+                true
+            }
+            Self::NotRun { .. } | Self::Unsupported { .. } | Self::Failed { .. } => false,
+        }
     }
 
     pub fn failed(mut reasons: Vec<PolicyFailureReason>) -> Result<Self, CompletionReasonError> {
@@ -139,6 +225,12 @@ impl PolicyRunCompletion {
         matches!(
             self,
             Self::Complete | Self::ProvenSubset { .. } | Self::ProvenBySummary
+        ) || matches!(
+            self,
+            Self::NotRun {
+                selected_by: PolicySelectionProvenance::PackCategoryOrDefault,
+                ..
+            }
         )
     }
 
@@ -157,6 +249,13 @@ impl PolicyRunCompletion {
     /// the whole program.
     pub const fn permits_clean_negative(&self) -> bool {
         matches!(self, Self::Complete | Self::ProvenBySummary)
+            || matches!(
+                self,
+                Self::NotRun {
+                    selected_by: PolicySelectionProvenance::PackCategoryOrDefault,
+                    ..
+                }
+            )
     }
 
     fn validate(&self) -> Result<(), CompletionReasonError> {
@@ -170,10 +269,30 @@ impl PolicyRunCompletion {
                 }
                 Ok(())
             }
-            Self::Inconclusive { reasons } => {
+            Self::Inconclusive { reasons, scope } => {
                 let mut normalized = reasons.clone();
                 normalize_nonempty(&mut normalized)?;
                 if &normalized != reasons {
+                    return Err(CompletionReasonError::NonCanonical);
+                }
+                scope.validate()
+            }
+            Self::NotRun {
+                unavailable_capabilities,
+                ..
+            } => {
+                if unavailable_capabilities.is_empty() {
+                    return Err(CompletionReasonError::Empty);
+                }
+                if unavailable_capabilities.len() > MAX_CAPABILITIES {
+                    return Err(CompletionReasonError::TooMany {
+                        max_items: MAX_CAPABILITIES,
+                    });
+                }
+                let mut normalized = unavailable_capabilities.clone();
+                normalized.sort();
+                normalized.dedup();
+                if &normalized != unavailable_capabilities {
                     return Err(CompletionReasonError::NonCanonical);
                 }
                 Ok(())
@@ -189,6 +308,117 @@ impl PolicyRunCompletion {
             }
         }
     }
+}
+
+/// Which files an inconclusive verdict concerns (#5433).
+///
+/// `Files` is a promise: every finding the run could have missed lies in one
+/// of the listed files, so its verdict on any other file is as reliable as a
+/// complete run's. A cause that cannot keep that promise makes the scope
+/// `Run`. So does every constructor that is not told otherwise, which keeps a
+/// new inconclusive cause fail-closed until someone attributes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum InconclusiveScope {
+    /// The verdict concerns the run as a whole and names no file.
+    Run,
+    /// The verdict concerns only these files.
+    Files {
+        /// Workspace-relative paths, sorted and distinct, as a finding's
+        /// `primary.path` spells them.
+        files: Vec<String>,
+        /// Whether the bound left files out. A truncated list does not keep
+        /// the promise, so a reader treats it as `Run`.
+        truncated: bool,
+    },
+}
+
+impl InconclusiveScope {
+    /// The scope of causes that lie in `files`. No file at all is not a
+    /// promise about any file, so it is the whole run.
+    pub(crate) fn of_files<'a>(files: impl IntoIterator<Item = &'a WorkspaceRelativePath>) -> Self {
+        let mut files = files
+            .into_iter()
+            .map(|path| path.as_str().to_owned())
+            .collect::<Vec<_>>();
+        if files.is_empty() {
+            return Self::Run;
+        }
+        files.sort();
+        files.dedup();
+        let truncated = files.len() > MAX_INCONCLUSIVE_FILES;
+        files.truncate(MAX_INCONCLUSIVE_FILES);
+        tighten_vec(&mut files);
+        Self::Files { files, truncated }
+    }
+
+    /// The scope of a verdict blocked by the causes of both scopes.
+    pub(crate) fn union(self, other: Self) -> Self {
+        match (self, other) {
+            (
+                Self::Files {
+                    mut files,
+                    truncated,
+                },
+                Self::Files {
+                    files: other_files,
+                    truncated: other_truncated,
+                },
+            ) => {
+                files.extend(other_files);
+                files.sort();
+                files.dedup();
+                let truncated =
+                    truncated || other_truncated || files.len() > MAX_INCONCLUSIVE_FILES;
+                files.truncate(MAX_INCONCLUSIVE_FILES);
+                tighten_vec(&mut files);
+                Self::Files { files, truncated }
+            }
+            _ => Self::Run,
+        }
+    }
+
+    fn validate(&self) -> Result<(), CompletionReasonError> {
+        let Self::Files { files, .. } = self else {
+            return Ok(());
+        };
+        if files.is_empty() {
+            return Err(CompletionReasonError::Empty);
+        }
+        if files.len() > MAX_INCONCLUSIVE_FILES {
+            return Err(CompletionReasonError::TooMany {
+                max_items: MAX_INCONCLUSIVE_FILES,
+            });
+        }
+        if files.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(CompletionReasonError::NonCanonical);
+        }
+        Ok(())
+    }
+}
+
+impl RetainedSize for InconclusiveScope {
+    fn retained_size(&self) -> usize {
+        size_of::<Self>().saturating_add(match self {
+            Self::Run => 0,
+            Self::Files { files, .. } => retained_extra(files),
+        })
+    }
+}
+
+/// How one selected policy entered the batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicySelectionProvenance {
+    ExplicitPolicyId,
+    PackCategoryOrDefault,
+}
+
+/// A required capability that prevented a policy from running.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct UnavailablePolicyCapability {
+    pub label: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -287,9 +517,8 @@ mod query_domain_completion_tests {
             CapabilityEvaluation::incomplete(evidence(), IncompleteReason::DiscoveryIncomplete);
         assert_eq!(
             PolicyRunCompletion::from_query_capability_evaluation(&incomplete),
-            PolicyRunCompletion::Inconclusive {
-                reasons: vec![PolicyIncompleteReason::CapabilityIncomplete]
-            }
+            PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::CapabilityIncomplete])
+                .expect("canonical reasons")
         );
 
         let invalid = CapabilityEvaluation::invalid(
@@ -338,12 +567,7 @@ impl FindingCertainty {
 
     fn validate(&self) -> Result<(), ReportValueError> {
         if let Self::Possible { reasons } = self {
-            if reasons.is_empty() || reasons.len() > MAX_TYPED_REASONS {
-                return Err(ReportValueError::NonCanonicalSet {
-                    field: "certainty_reasons",
-                });
-            }
-            if reasons.windows(2).any(|pair| pair[0] >= pair[1]) {
+            if !has_canonical_typed_reasons(reasons) {
                 return Err(ReportValueError::NonCanonicalSet {
                     field: "certainty_reasons",
                 });
@@ -394,9 +618,7 @@ impl FindingCompleteness {
 
     fn validate(&self) -> Result<(), ReportValueError> {
         if let Self::Partial { reasons } = self
-            && (reasons.is_empty()
-                || reasons.len() > MAX_TYPED_REASONS
-                || reasons.windows(2).any(|pair| pair[0] >= pair[1]))
+            && !has_canonical_typed_reasons(reasons)
         {
             return Err(ReportValueError::NonCanonicalSet {
                 field: "finding_incomplete_reasons",
@@ -488,9 +710,7 @@ impl CertaintyReason {
     }
 
     pub fn analyzer_ambiguity(code: impl Into<String>) -> Result<Self, ReportValueError> {
-        let mut code = code.into();
-        validate_report_identifier(&code)?;
-        tighten_string(&mut code);
+        let code = normalized_report_identifier(code)?;
         Ok(Self::AnalyzerAmbiguity { code })
     }
 
@@ -701,6 +921,22 @@ impl PolicySourceLocation {
         }
     }
 
+    pub(crate) fn span_from_coordinates(
+        path: WorkspaceRelativePath,
+        start_byte: u64,
+        end_byte: u64,
+        start_line: u64,
+        start_column: u64,
+        end_line: u64,
+        end_column: u64,
+    ) -> Result<Self, String> {
+        let byte_span =
+            PolicyByteSpan::new(start_byte, end_byte).map_err(|error| error.to_string())?;
+        let region = PolicyDisplayRegion::new(start_line, start_column, end_line, end_column)
+            .map_err(|error| error.to_string())?;
+        Ok(Self::span(path, byte_span, region))
+    }
+
     pub fn try_new(
         path: WorkspaceRelativePath,
         byte_span: Option<PolicyByteSpan>,
@@ -733,21 +969,9 @@ impl PolicySourceLocation {
     }
 }
 
-impl RetainedSize for PolicyByteSpan {
-    fn retained_size(&self) -> usize {
-        size_of::<Self>()
-    }
-}
-
-impl RetainedSize for PolicyDisplayRegion {
-    fn retained_size(&self) -> usize {
-        size_of::<Self>()
-    }
-}
-
 impl RetainedSize for PolicySourceLocation {
     fn retained_size(&self) -> usize {
-        size_of::<Self>().saturating_add(self.path.capacity())
+        retained_size_with_extras(self, [self.path.capacity()])
     }
 }
 
@@ -857,10 +1081,14 @@ impl MatchFindingEvidence {
 
 impl RetainedSize for MatchFindingEvidence {
     fn retained_size(&self) -> usize {
-        size_of::<Self>()
-            .saturating_add(retained_extra(&self.anchor))
-            .saturating_add(retained_extra(&self.terminal))
-            .saturating_add(retained_extra(&self.provenance))
+        retained_size_with_extras(
+            self,
+            [
+                retained_extra(&self.anchor),
+                retained_extra(&self.terminal),
+                retained_extra(&self.provenance),
+            ],
+        )
     }
 }
 
@@ -875,16 +1103,6 @@ pub enum PolicyFindingEvidence {
 }
 
 impl PolicyFindingEvidence {
-    pub const fn analysis_type(&self) -> PolicyAnalysisType {
-        match self {
-            Self::Match { .. } => PolicyAnalysisType::Match,
-            Self::Taint { .. } => PolicyAnalysisType::Taint,
-            Self::Typestate { .. } => PolicyAnalysisType::Typestate,
-            Self::Assertion { .. } => PolicyAnalysisType::Assertion,
-            Self::Flow { .. } => PolicyAnalysisType::Flow,
-        }
-    }
-
     pub const fn identity_stability(&self) -> super::finding_identity::FindingIdentityStability {
         match self {
             Self::Match { evidence } => evidence.anchor().stability(),
@@ -895,6 +1113,8 @@ impl PolicyFindingEvidence {
         }
     }
 }
+
+crate::impl_policy_analysis_type!(PolicyFindingEvidence);
 
 impl RetainedSize for PolicyFindingEvidence {
     fn retained_size(&self) -> usize {
@@ -1305,10 +1525,14 @@ impl PolicyQueryProvenance {
 
 impl RetainedSize for PolicyQueryProvenance {
     fn retained_size(&self) -> usize {
-        size_of::<Self>()
-            .saturating_add(retained_extra(&self.branch))
-            .saturating_add(retained_extra(&self.seed))
-            .saturating_add(retained_extra(&self.steps))
+        retained_size_with_extras(
+            self,
+            [
+                retained_extra(&self.branch),
+                retained_extra(&self.seed),
+                retained_extra(&self.steps),
+            ],
+        )
     }
 }
 
@@ -1376,18 +1600,128 @@ impl RetainedSize for PolicyQueryProvenanceStep {
     }
 }
 
+/// Bounded reviewed dependency/configuration evidence carried by a policy witness.
+/// The flag describes supplied static evidence, never runtime safety.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyDependencyMitigation {
+    pub dependency_id: String,
+    pub owner: String,
+    pub mapping_id: String,
+    pub mitigated: bool,
+    pub effective_configuration: Option<serde_json::Value>,
+    pub configuration_contributors: Vec<PolicySourceLocation>,
+}
+
+impl PolicyDependencyMitigation {
+    fn validate(&self) -> Result<(), ReportValueError> {
+        validate_report_identifier(&self.dependency_id)?;
+        validate_report_identifier(&self.mapping_id)?;
+        validate_report_prose(&self.owner)?;
+        if self.configuration_contributors.len() > 4096 {
+            return Err(ReportValueError::TooManyItems {
+                field: "configuration_contributors",
+                max_items: 4096,
+            });
+        }
+        for location in &self.configuration_contributors {
+            require_span_bearing(location)?;
+        }
+        Ok(())
+    }
+
+    fn tighten_storage(&mut self) {
+        tighten_string(&mut self.dependency_id);
+        tighten_string(&mut self.owner);
+        tighten_string(&mut self.mapping_id);
+        tighten_vec(&mut self.configuration_contributors);
+    }
+}
+
+impl RetainedSize for PolicyDependencyMitigation {
+    fn retained_size(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(self.dependency_id.capacity())
+            .saturating_add(self.owner.capacity())
+            .saturating_add(self.mapping_id.capacity())
+            .saturating_add(retained_extra(&self.effective_configuration))
+            .saturating_add(retained_extra(&self.configuration_contributors))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PolicyQueryResultRef {
+    DependencyEvidence {
+        location: PolicySourceLocation,
+        id: String,
+        ecosystem: String,
+        package: String,
+        evidence_kind: String,
+        scope: String,
+        source_digest: String,
+        version_requirement: Option<String>,
+        exact_version: Option<String>,
+        source: Option<String>,
+        declared_by: Option<String>,
+    },
     ConfigurationFact {
         location: PolicySourceLocation,
         id: String,
         fact_id: String,
     },
+    GenerationSite {
+        location: PolicySourceLocation,
+        id: String,
+        ast_id: Option<String>,
+        kind: String,
+    },
+    Export {
+        location: PolicySourceLocation,
+        id: String,
+        form: String,
+        exported_name: String,
+        target_fq_name: Option<String>,
+        local_definition: Option<PolicyExportLocalDefinition>,
+    },
+    /// A cross-domain row (#3284). `location` anchors the row: the code row
+    /// when one is carried, otherwise the configuration fact. A correlated
+    /// row also carries the configuration fact's own exact
+    /// `configuration_location`, so the finding keeps both sides' evidence.
+    CrossDomain {
+        location: PolicySourceLocation,
+        id: String,
+        operator: String,
+        domain: String,
+        code_id: Option<String>,
+        configuration_id: Option<String>,
+        configuration_location: Option<PolicySourceLocation>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dependency_mitigation: Option<PolicyDependencyMitigation>,
+    },
     StructuralMatch {
         kind: String,
         location: PolicySourceLocation,
         identity: Option<StableSemanticIdentity>,
+    },
+    Binding {
+        id: String,
+        ast_id: Option<String>,
+        name: String,
+        location: PolicySourceLocation,
+    },
+    LexicalScope {
+        id: String,
+        ast_id: Option<String>,
+        index: u32,
+        location: PolicySourceLocation,
+    },
+    Occurrence {
+        id: String,
+        ast_id: String,
+        class: String,
+        role: String,
+        namespace: String,
+        location: PolicySourceLocation,
     },
     Declaration {
         kind: String,
@@ -1397,7 +1731,7 @@ pub enum PolicyQueryResultRef {
     },
     File {
         #[serde(
-            serialize_with = "serialize_workspace_path",
+            serialize_with = "crate::display_path::serialize_workspace_relative_path",
             deserialize_with = "deserialize_workspace_path"
         )]
         path: WorkspaceRelativePath,
@@ -1457,6 +1791,61 @@ pub enum PolicyQueryResultRef {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum PolicyExportLocalDefinition {
+    Defined {
+        binding_name: String,
+        binding_kind: String,
+        binding_location: PolicySourceLocation,
+    },
+    Undefined,
+    Unknown,
+}
+
+impl PolicyExportLocalDefinition {
+    fn validate(&self) -> Result<(), ReportValueError> {
+        match self {
+            Self::Defined {
+                binding_name,
+                binding_kind,
+                binding_location,
+            } => {
+                validate_report_prose(binding_name)?;
+                validate_report_identifier(binding_kind)?;
+                require_span_bearing(binding_location)?;
+            }
+            Self::Undefined | Self::Unknown => {}
+        }
+        Ok(())
+    }
+
+    fn tighten(&mut self) {
+        if let Self::Defined {
+            binding_name,
+            binding_kind,
+            ..
+        } = self
+        {
+            tighten_string(binding_name);
+            tighten_string(binding_kind);
+        }
+    }
+
+    fn retained_extra(&self) -> usize {
+        match self {
+            Self::Defined {
+                binding_name,
+                binding_kind,
+                binding_location,
+            } => retained_extra(binding_name)
+                .saturating_add(retained_extra(binding_kind))
+                .saturating_add(retained_extra(binding_location)),
+            Self::Undefined | Self::Unknown => 0,
+        }
+    }
+}
+
 impl PolicyQueryResultRef {
     pub fn file(path: WorkspaceRelativePath) -> Self {
         Self::File { path }
@@ -1464,8 +1853,15 @@ impl PolicyQueryResultRef {
 
     pub const fn result_domain(&self) -> Option<MatchResultDomain> {
         match self {
+            Self::DependencyEvidence { .. } => Some(MatchResultDomain::DependencyEvidence),
             Self::ConfigurationFact { .. } => Some(MatchResultDomain::ConfigurationFact),
+            Self::GenerationSite { .. } => Some(MatchResultDomain::GenerationSite),
+            Self::Export { .. } => Some(MatchResultDomain::Export),
+            Self::CrossDomain { .. } => Some(MatchResultDomain::CrossDomain),
             Self::StructuralMatch { .. } => Some(MatchResultDomain::StructuralMatch),
+            Self::Binding { .. } => Some(MatchResultDomain::Binding),
+            Self::LexicalScope { .. } => Some(MatchResultDomain::LexicalScope),
+            Self::Occurrence { .. } => Some(MatchResultDomain::Occurrence),
             Self::Declaration { .. } => Some(MatchResultDomain::Declaration),
             Self::File { .. } => Some(MatchResultDomain::File),
             Self::ReferenceSite { .. } => Some(MatchResultDomain::ReferenceSite),
@@ -1481,8 +1877,15 @@ impl PolicyQueryResultRef {
 
     pub const fn location(&self) -> Option<&PolicySourceLocation> {
         match self {
-            Self::ConfigurationFact { location, .. }
+            Self::DependencyEvidence { location, .. }
+            | Self::ConfigurationFact { location, .. }
+            | Self::GenerationSite { location, .. }
+            | Self::Export { location, .. }
+            | Self::CrossDomain { location, .. }
             | Self::StructuralMatch { location, .. }
+            | Self::Binding { location, .. }
+            | Self::LexicalScope { location, .. }
+            | Self::Occurrence { location, .. }
             | Self::Declaration { location, .. }
             | Self::ReferenceSite { location, .. }
             | Self::CallSite { location, .. }
@@ -1505,6 +1908,31 @@ impl PolicyQueryResultRef {
 
     pub fn validate(&self) -> Result<(), ReportValueError> {
         match self {
+            Self::DependencyEvidence {
+                location,
+                id,
+                ecosystem,
+                package,
+                evidence_kind,
+                scope,
+                source_digest,
+                version_requirement,
+                exact_version,
+                source,
+                declared_by,
+            } => {
+                require_span_bearing(location)?;
+                validate_report_identifier(id)?;
+                for text in [ecosystem, package, evidence_kind, scope, source_digest] {
+                    validate_report_prose(text)?;
+                }
+                for text in [version_requirement, exact_version, source, declared_by]
+                    .into_iter()
+                    .flatten()
+                {
+                    validate_report_prose(text)?;
+                }
+            }
             Self::ConfigurationFact {
                 location,
                 id,
@@ -1513,6 +1941,61 @@ impl PolicyQueryResultRef {
                 require_span_bearing(location)?;
                 validate_report_identifier(id)?;
                 validate_report_identifier(fact_id)?;
+            }
+            Self::GenerationSite {
+                location,
+                id,
+                ast_id,
+                kind,
+            } => {
+                require_span_bearing(location)?;
+                validate_report_identifier(id)?;
+                if let Some(ast_id) = ast_id {
+                    validate_report_identifier(ast_id)?;
+                }
+                validate_report_identifier(kind)?;
+            }
+            Self::Export {
+                location,
+                id,
+                form,
+                exported_name,
+                target_fq_name,
+                local_definition,
+            } => {
+                require_span_bearing(location)?;
+                validate_report_identifier(id)?;
+                validate_report_identifier(form)?;
+                validate_report_prose(exported_name)?;
+                if let Some(target_fq_name) = target_fq_name {
+                    validate_report_prose(target_fq_name)?;
+                }
+                if let Some(local_definition) = local_definition {
+                    local_definition.validate()?;
+                }
+            }
+            Self::CrossDomain {
+                location: _,
+                id,
+                operator,
+                domain,
+                code_id,
+                configuration_id,
+                configuration_location,
+                dependency_mitigation,
+            } => {
+                if let Some(mitigation) = dependency_mitigation {
+                    mitigation.validate()?;
+                }
+                validate_report_identifier(id)?;
+                validate_report_identifier(operator)?;
+                validate_report_identifier(domain)?;
+                for identifier in [code_id, configuration_id].into_iter().flatten() {
+                    validate_report_identifier(identifier)?;
+                }
+                if let Some(location) = configuration_location {
+                    require_span_bearing(location)?;
+                }
             }
             Self::StructuralMatch {
                 kind,
@@ -1528,6 +2011,44 @@ impl PolicyQueryResultRef {
                 validate_report_identifier(kind)?;
                 require_span_bearing(location)?;
                 validate_identity_path(identity.as_ref(), location)?;
+            }
+            Self::Binding {
+                id,
+                ast_id,
+                name,
+                location,
+            } => {
+                require_span_bearing(location)?;
+                validate_report_identifier(id)?;
+                if let Some(ast_id) = ast_id {
+                    validate_report_identifier(ast_id)?;
+                }
+                validate_report_prose(name)?;
+            }
+            Self::LexicalScope {
+                id,
+                ast_id,
+                location,
+                ..
+            } => {
+                require_span_bearing(location)?;
+                validate_report_identifier(id)?;
+                if let Some(ast_id) = ast_id {
+                    validate_report_identifier(ast_id)?;
+                }
+            }
+            Self::Occurrence {
+                id,
+                ast_id,
+                class,
+                role,
+                namespace,
+                location,
+            } => {
+                require_span_bearing(location)?;
+                for identifier in [id, ast_id, class, role, namespace] {
+                    validate_report_identifier(identifier)?;
+                }
             }
             Self::File { .. } => {}
             Self::ReferenceSite {
@@ -1643,11 +2164,107 @@ impl PolicyQueryResultRef {
 
     fn tighten_owned_storage(&mut self) {
         match self {
+            Self::DependencyEvidence {
+                id,
+                ecosystem,
+                package,
+                evidence_kind,
+                scope,
+                source_digest,
+                version_requirement,
+                exact_version,
+                source,
+                declared_by,
+                ..
+            } => {
+                for text in [id, ecosystem, package, evidence_kind, scope, source_digest] {
+                    tighten_string(text);
+                }
+                for text in [version_requirement, exact_version, source, declared_by]
+                    .into_iter()
+                    .flatten()
+                {
+                    tighten_string(text);
+                }
+            }
             Self::ConfigurationFact { id, fact_id, .. } => {
                 tighten_string(id);
                 tighten_string(fact_id);
             }
+            Self::GenerationSite {
+                id, ast_id, kind, ..
+            } => {
+                tighten_string(id);
+                if let Some(ast_id) = ast_id {
+                    tighten_string(ast_id);
+                }
+                tighten_string(kind);
+            }
+            Self::Export {
+                id,
+                form,
+                exported_name,
+                target_fq_name,
+                local_definition,
+                ..
+            } => {
+                tighten_string(id);
+                tighten_string(form);
+                tighten_string(exported_name);
+                if let Some(target_fq_name) = target_fq_name {
+                    tighten_string(target_fq_name);
+                }
+                if let Some(local_definition) = local_definition {
+                    local_definition.tighten();
+                }
+            }
+            Self::CrossDomain {
+                id,
+                operator,
+                domain,
+                code_id,
+                configuration_id,
+                dependency_mitigation,
+                ..
+            } => {
+                if let Some(mitigation) = dependency_mitigation {
+                    mitigation.tighten_storage();
+                }
+                tighten_string(id);
+                tighten_string(operator);
+                tighten_string(domain);
+                for identifier in [code_id, configuration_id].into_iter().flatten() {
+                    tighten_string(identifier);
+                }
+            }
             Self::StructuralMatch { kind, .. } => tighten_string(kind),
+            Self::Binding {
+                id, ast_id, name, ..
+            } => {
+                tighten_string(id);
+                if let Some(ast_id) = ast_id {
+                    tighten_string(ast_id);
+                }
+                tighten_string(name);
+            }
+            Self::LexicalScope { id, ast_id, .. } => {
+                tighten_string(id);
+                if let Some(ast_id) = ast_id {
+                    tighten_string(ast_id);
+                }
+            }
+            Self::Occurrence {
+                id,
+                ast_id,
+                class,
+                role,
+                namespace,
+                ..
+            } => {
+                for identifier in [id, ast_id, class, role, namespace] {
+                    tighten_string(identifier);
+                }
+            }
             Self::Declaration { kind, fq_name, .. } => {
                 tighten_string(kind);
                 tighten_string(fq_name);
@@ -1743,6 +2360,32 @@ impl PolicyQueryResultRef {
 impl RetainedSize for PolicyQueryResultRef {
     fn retained_size(&self) -> usize {
         size_of::<Self>().saturating_add(match self {
+            Self::DependencyEvidence {
+                location,
+                id,
+                ecosystem,
+                package,
+                evidence_kind,
+                scope,
+                source_digest,
+                version_requirement,
+                exact_version,
+                source,
+                declared_by,
+            } => retained_extra(location)
+                .saturating_add(
+                    [id, ecosystem, package, evidence_kind, scope, source_digest]
+                        .iter()
+                        .map(|s| s.capacity())
+                        .sum::<usize>(),
+                )
+                .saturating_add(
+                    [version_requirement, exact_version, source, declared_by]
+                        .iter()
+                        .filter_map(|s| s.as_ref())
+                        .map(|s| s.capacity())
+                        .sum::<usize>(),
+                ),
             Self::ConfigurationFact {
                 location,
                 id,
@@ -1750,6 +2393,49 @@ impl RetainedSize for PolicyQueryResultRef {
             } => retained_extra(location)
                 .saturating_add(id.capacity())
                 .saturating_add(fact_id.capacity()),
+            Self::GenerationSite {
+                location,
+                id,
+                ast_id,
+                kind,
+            } => retained_extra(location)
+                .saturating_add(id.capacity())
+                .saturating_add(retained_extra(ast_id))
+                .saturating_add(kind.capacity()),
+            Self::Export {
+                location,
+                id,
+                form,
+                exported_name,
+                target_fq_name,
+                local_definition,
+            } => retained_extra(location)
+                .saturating_add(id.capacity())
+                .saturating_add(form.capacity())
+                .saturating_add(exported_name.capacity())
+                .saturating_add(retained_extra(target_fq_name))
+                .saturating_add(
+                    local_definition
+                        .as_ref()
+                        .map_or(0, PolicyExportLocalDefinition::retained_extra),
+                ),
+            Self::CrossDomain {
+                location,
+                id,
+                operator,
+                domain,
+                code_id,
+                configuration_id,
+                configuration_location,
+                dependency_mitigation,
+            } => retained_extra(location)
+                .saturating_add(id.capacity())
+                .saturating_add(operator.capacity())
+                .saturating_add(domain.capacity())
+                .saturating_add(retained_extra(code_id))
+                .saturating_add(retained_extra(configuration_id))
+                .saturating_add(retained_extra(configuration_location))
+                .saturating_add(retained_extra(dependency_mitigation)),
             Self::StructuralMatch {
                 kind,
                 location,
@@ -1758,6 +2444,37 @@ impl RetainedSize for PolicyQueryResultRef {
                 .capacity()
                 .saturating_add(retained_extra(location))
                 .saturating_add(retained_extra(identity)),
+            Self::Binding {
+                id,
+                ast_id,
+                name,
+                location,
+            } => id
+                .capacity()
+                .saturating_add(retained_extra(ast_id))
+                .saturating_add(name.capacity())
+                .saturating_add(retained_extra(location)),
+            Self::LexicalScope {
+                id,
+                ast_id,
+                location,
+                ..
+            } => id
+                .capacity()
+                .saturating_add(retained_extra(ast_id))
+                .saturating_add(retained_extra(location)),
+            Self::Occurrence {
+                id,
+                ast_id,
+                class,
+                role,
+                namespace,
+                location,
+            } => [id, ast_id, class, role, namespace]
+                .iter()
+                .map(|value| value.capacity())
+                .sum::<usize>()
+                .saturating_add(retained_extra(location)),
             Self::Declaration {
                 kind,
                 fq_name,
@@ -1851,16 +2568,6 @@ impl RetainedSize for PolicyQueryResultRef {
                 .saturating_add(retained_extra(location)),
         })
     }
-}
-
-fn serialize_workspace_path<S>(
-    path: &WorkspaceRelativePath,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    serializer.serialize_str(path.as_str())
 }
 
 /// Read one workspace-relative path back through its own validating parser.
@@ -1964,9 +2671,7 @@ impl AuthoredArmClosureEvidence {
 
 impl RetainedSize for AuthoredArmClosureEvidence {
     fn retained_size(&self) -> usize {
-        size_of::<Self>()
-            .saturating_add(self.model.capacity())
-            .saturating_add(self.content.capacity())
+        retained_size_with_extras(self, [self.model.capacity(), self.content.capacity()])
     }
 }
 
@@ -2033,9 +2738,13 @@ impl ProofMetadata {
 
 impl RetainedSize for ProofMetadata {
     fn retained_size(&self) -> usize {
-        size_of::<Self>()
-            .saturating_add(retained_extra(&self.reasons))
-            .saturating_add(retained_extra(&self.evidence_refs))
+        retained_size_with_extras(
+            self,
+            [
+                retained_extra(&self.reasons),
+                retained_extra(&self.evidence_refs),
+            ],
+        )
     }
 }
 
@@ -2100,9 +2809,7 @@ impl ProofReason {
     }
 
     pub fn analyzer_evidence(code: impl Into<String>) -> Result<Self, ReportValueError> {
-        let mut code = code.into();
-        validate_report_identifier(&code)?;
-        tighten_string(&mut code);
+        let code = normalized_report_identifier(code)?;
         Ok(Self::AnalyzerEvidence { code })
     }
 
@@ -2298,9 +3005,10 @@ impl BoundedWitness {
 
 impl RetainedSize for BoundedWitness {
     fn retained_size(&self) -> usize {
-        size_of::<Self>()
-            .saturating_add(retained_extra(&self.id))
-            .saturating_add(retained_extra(&self.steps))
+        retained_size_with_extras(
+            self,
+            [retained_extra(&self.id), retained_extra(&self.steps)],
+        )
     }
 }
 
@@ -2477,10 +3185,13 @@ impl RetainedSize for WitnessStepProvenance {
 
 impl RetainedSize for StoreDimensionEvidence {
     fn retained_size(&self) -> usize {
-        size_of::<Self>().saturating_add(match self {
-            Self::Proven { identities } => retained_extra(identities),
-            Self::Undeclared | Self::Unproven => 0,
-        })
+        retained_size_with_extra(
+            self,
+            match self {
+                Self::Proven { identities } => retained_extra(identities),
+                Self::Undeclared | Self::Unproven => 0,
+            },
+        )
     }
 }
 
@@ -2958,15 +3669,13 @@ impl PolicyFindingDiff {
     }
 }
 
-impl RetainedSize for PolicyFindingDiff {
-    fn retained_size(&self) -> usize {
-        size_of::<Self>()
-    }
-}
+impl RetainedSize for PolicyFindingDiff {}
 
-/// One normalized finding in the canonical schema-version-5 report model.
+/// One normalized finding in the canonical schema-version-6 report model.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PolicyFinding {
+    #[serde(skip_serializing_if = "crate::ValueTypeBarrierNotes::is_empty")]
+    value_type_barrier_notes: crate::ValueTypeBarrierNotes,
     id: PolicyFindingId,
     identity_stability: FindingIdentityStability,
     policy_id: PolicyId,
@@ -3130,6 +3839,7 @@ impl PolicyFinding {
             }
         };
         let finding = Self {
+            value_type_barrier_notes: Default::default(),
             id,
             identity_stability,
             policy_id,
@@ -3161,6 +3871,21 @@ impl PolicyFinding {
         };
         finding.validate_against_budget(budget)?;
         Ok(finding)
+    }
+
+    pub fn value_type_barrier_notes(&self) -> &crate::ValueTypeBarrierNotes {
+        &self.value_type_barrier_notes
+    }
+
+    pub(crate) fn with_value_type_barrier_notes(
+        mut self,
+        notes: crate::ValueTypeBarrierNotes,
+        budget: &PolicyBudget,
+    ) -> Result<Self, PolicyFindingError> {
+        notes.validate()?;
+        self.value_type_barrier_notes = notes;
+        self.validate_against_budget(budget)?;
+        Ok(self)
     }
 
     pub const fn id(&self) -> PolicyFindingId {
@@ -3329,6 +4054,7 @@ impl PolicyFinding {
         &self,
         budget: &PolicyBudget,
     ) -> Result<(), PolicyFindingError> {
+        self.value_type_barrier_notes.validate()?;
         if self.suppression.is_some() && self.identity_stability != FindingIdentityStability::Strong
         {
             return Err(PolicyFindingError::SuppressionRequiresStrongIdentity);
@@ -3452,6 +4178,7 @@ impl RetainedSize for PolicyFinding {
         // not let it change canonical report-retention decisions.
         size_of::<Self>()
             .saturating_sub(size_of::<super::display_path::TaintDisplayPathCache>())
+            .saturating_add(retained_extra(&self.value_type_barrier_notes))
             .saturating_add(retained_extra(&self.policy_id))
             .saturating_add(self.message.capacity())
             .saturating_add(retained_extra(&self.classification))
@@ -3656,9 +4383,7 @@ impl PolicyCoveragePartition {
 
 impl RetainedSize for PolicyCoveragePartition {
     fn retained_size(&self) -> usize {
-        size_of::<Self>()
-            .saturating_add(self.family.capacity())
-            .saturating_add(self.root.capacity())
+        retained_size_with_extras(self, [self.family.capacity(), self.root.capacity()])
     }
 }
 
@@ -3755,6 +4480,75 @@ fn bound_obligation_group_key(value: &str) -> String {
     value[..end].to_owned()
 }
 
+/// How a run's endpoints were scoped against a requested changed range.
+///
+/// A `changed-range` run bound sinks only in the procedures it examined, so an empty
+/// result says nothing about sinks outside them. A `workspace` run considered
+/// every endpoint; `widened` then names why the request did not narrow it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PolicyRunScope {
+    kind: PolicyRunScopeKind,
+    /// Procedure source ranges overlapping a changed hunk, in path/range order.
+    /// An empty array explicitly states that no procedure was in scope.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    examined_procedures: Option<Vec<PolicySourceLocation>>,
+    /// Each selector or engine that kept this run from the requested range,
+    /// with the reason.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    widened: Vec<String>,
+}
+
+/// The kinds of [`PolicyRunScope`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PolicyRunScopeKind {
+    Workspace,
+    ChangedRange,
+}
+
+impl PolicyRunScope {
+    /// A run that considered every endpoint of the workspace.
+    pub(crate) const fn workspace(widened: Vec<String>) -> Self {
+        Self {
+            kind: PolicyRunScopeKind::Workspace,
+            examined_procedures: None,
+            widened,
+        }
+    }
+
+    /// A run that bound sinks only in `examined_procedures`.
+    pub(crate) const fn changed_range(
+        examined_procedures: Vec<PolicySourceLocation>,
+        widened: Vec<String>,
+    ) -> Self {
+        Self {
+            kind: PolicyRunScopeKind::ChangedRange,
+            examined_procedures: Some(examined_procedures),
+            widened,
+        }
+    }
+
+    pub const fn kind(&self) -> PolicyRunScopeKind {
+        self.kind
+    }
+
+    pub fn examined_procedures(&self) -> &[PolicySourceLocation] {
+        self.examined_procedures.as_deref().unwrap_or_default()
+    }
+
+    pub fn widened(&self) -> &[String] {
+        &self.widened
+    }
+}
+
+impl RetainedSize for PolicyRunScope {
+    fn retained_size(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(retained_extra(&self.examined_procedures))
+            .saturating_add(retained_extra(&self.widened))
+    }
+}
+
 /// One policy's complete, incomplete, unsupported, or failed evaluation run.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PolicyRun {
@@ -3777,6 +4571,14 @@ pub struct PolicyRun {
     /// is `ProvenBySummary`. Empty for every other tier.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     authored_arm_closures: Vec<AuthoredArmClosureEvidence>,
+    /// The engine that answered a taint run. `None` for every
+    /// other analysis, and for a taint run that failed before choosing one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    engine: Option<crate::taint_policy::TaintEngine>,
+    /// How this run's endpoints were scoped against a requested changed range
+    /// `None` when the request named no range.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<PolicyRunScope>,
     /// The policy's declared non-default handling of a blocked verdict, set
     /// only once it actually applied: the run is `Inconclusive` and the policy
     /// authored something other than the default `abstain` (#2506). `None`
@@ -3803,7 +4605,48 @@ where
     }
 }
 
+fn validate_finding_for_run(
+    finding: &PolicyFinding,
+    policy_id: &PolicyId,
+    policy_hash: PolicySemanticHash,
+    analysis_type: PolicyAnalysisType,
+    budget: &PolicyBudget,
+) -> Result<(), PolicyRunError> {
+    if &finding.policy_id != policy_id
+        || finding.policy_hash != policy_hash
+        || finding.analysis_type != analysis_type
+    {
+        return Err(PolicyRunError::FindingJoinMismatch);
+    }
+    finding
+        .validate_against_budget(budget)
+        .map_err(|_| PolicyRunError::FindingBudgetViolation)
+}
+
 impl PolicyRun {
+    /// Record the engine that answered this taint run.
+    pub(crate) fn with_engine(mut self, engine: Option<crate::taint_policy::TaintEngine>) -> Self {
+        self.engine = engine;
+        self
+    }
+
+    /// The engine that answered this taint run, when a taint engine ran.
+    pub(crate) fn engine(&self) -> Option<&crate::taint_policy::TaintEngine> {
+        self.engine.as_ref()
+    }
+
+    /// Record how this run's endpoints were scoped.
+    pub(crate) fn with_scope(mut self, scope: Option<PolicyRunScope>) -> Self {
+        self.scope = scope;
+        self
+    }
+
+    /// How this run's endpoints were scoped, when the request named a changed
+    /// range.
+    pub fn scope(&self) -> Option<&PolicyRunScope> {
+        self.scope.as_ref()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_new(
         policy_id: PolicyId,
@@ -3823,15 +4666,7 @@ impl PolicyRun {
             });
         }
         for finding in &findings {
-            if finding.policy_id != policy_id
-                || finding.policy_hash != policy_hash
-                || finding.analysis_type != analysis_type
-            {
-                return Err(PolicyRunError::FindingJoinMismatch);
-            }
-            finding
-                .validate_against_budget(budget)
-                .map_err(|_| PolicyRunError::FindingBudgetViolation)?;
+            validate_finding_for_run(finding, &policy_id, policy_hash, analysis_type, budget)?;
         }
         findings.sort_by_key(PolicyFinding::id);
         if findings.windows(2).any(|pair| pair[0].id == pair[1].id) {
@@ -3892,6 +4727,8 @@ impl PolicyRun {
             omitted_obligations_lower_bound: 0,
             work,
             authored_arm_closures: Vec::new(),
+            engine: None,
+            scope: None,
             unknown_verdict: None,
         };
         run.refresh_retained_bytes();
@@ -4037,7 +4874,7 @@ impl PolicyRun {
         verdict: UnknownVerdict,
         budget: &PolicyBudget,
     ) -> Result<(), PolicyRunError> {
-        let PolicyRunCompletion::Inconclusive { reasons } = &self.completion else {
+        let PolicyRunCompletion::Inconclusive { reasons, .. } = &self.completion else {
             return Ok(());
         };
         match verdict {
@@ -4082,7 +4919,7 @@ impl PolicyRun {
         from: PolicyIncompleteReason,
         to: PolicyIncompleteReason,
     ) -> Result<(), CompletionReasonError> {
-        let PolicyRunCompletion::Inconclusive { reasons } = &mut self.completion else {
+        let PolicyRunCompletion::Inconclusive { reasons, .. } = &mut self.completion else {
             return Ok(());
         };
         for reason in reasons.iter_mut().filter(|reason| **reason == from) {
@@ -4118,15 +4955,13 @@ impl PolicyRun {
             budget,
         )?;
         for finding in &self.findings {
-            if finding.policy_id != self.policy_id
-                || finding.policy_hash != self.policy_hash
-                || finding.analysis_type != self.analysis_type
-            {
-                return Err(PolicyRunError::FindingJoinMismatch);
-            }
-            finding
-                .validate_against_budget(budget)
-                .map_err(|_| PolicyRunError::FindingBudgetViolation)?;
+            validate_finding_for_run(
+                finding,
+                &self.policy_id,
+                self.policy_hash,
+                self.analysis_type,
+                budget,
+            )?;
         }
         if self.retained_size() > budget.max_retained_report_bytes() {
             return Err(PolicyRunError::RetainedReportBytesExceeded {
@@ -4136,24 +4971,9 @@ impl PolicyRun {
         Ok(())
     }
 
-    pub(crate) fn mark_inconclusive(
-        &mut self,
-        reason: PolicyIncompleteReason,
-    ) -> Result<(), CompletionReasonError> {
-        match &mut self.completion {
-            PolicyRunCompletion::Complete
-            | PolicyRunCompletion::ProvenSubset { .. }
-            | PolicyRunCompletion::ProvenBySummary => {
-                self.completion = PolicyRunCompletion::inconclusive(vec![reason])?;
-            }
-            PolicyRunCompletion::Inconclusive { reasons } => {
-                reasons.push(reason);
-                normalize_nonempty(reasons)?;
-            }
-            PolicyRunCompletion::Unsupported { .. } | PolicyRunCompletion::Failed { .. } => {}
-        }
+    pub(crate) fn mark_inconclusive(&mut self, reason: PolicyIncompleteReason) {
+        self.completion.mark_inconclusive(reason);
         self.refresh_retained_bytes();
-        Ok(())
     }
 
     pub(crate) fn replace_findings(&mut self, mut findings: Vec<PolicyFinding>) {
@@ -4189,8 +5009,7 @@ impl PolicyRun {
     }
 
     fn refresh_retained_bytes(&mut self) {
-        self.work.retained_report_bytes = 0;
-        self.work.retained_report_bytes = u64::try_from(self.retained_size()).unwrap_or(u64::MAX);
+        self.set_retained_report_bytes(self.retained_size());
     }
 }
 
@@ -4204,6 +5023,7 @@ impl RetainedSize for PolicyRun {
             .saturating_add(retained_extra(&self.obligations))
             .saturating_add(retained_extra(&self.work))
             .saturating_add(retained_extra(&self.authored_arm_closures))
+            .saturating_add(self.scope.as_ref().map_or(0, retained_extra))
     }
 }
 
@@ -4314,10 +5134,11 @@ fn validate_truncation_pair(
     truncated: bool,
     omitted_lower_bound: u64,
 ) -> Result<(), ReportValueError> {
-    if truncated != (omitted_lower_bound > 0) {
-        return Err(ReportValueError::InconsistentTruncation { field });
-    }
-    Ok(())
+    ensure_truncation_consistency(
+        truncated,
+        omitted_lower_bound,
+        ReportValueError::InconsistentTruncation { field },
+    )
 }
 
 fn validate_primary_evidence_shape(
@@ -4720,7 +5541,7 @@ fn completion_has_incomplete_reason(
     completion: &PolicyRunCompletion,
     reason: PolicyIncompleteReason,
 ) -> bool {
-    matches!(completion, PolicyRunCompletion::Inconclusive { reasons } if reasons.contains(&reason))
+    matches!(completion, PolicyRunCompletion::Inconclusive { reasons, .. } if reasons.contains(&reason))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4822,7 +5643,7 @@ impl fmt::Display for ReportValueError {
 
 impl std::error::Error for ReportValueError {}
 
-fn validate_report_identifier(value: &str) -> Result<(), ReportValueError> {
+pub(crate) fn validate_report_identifier(value: &str) -> Result<(), ReportValueError> {
     if value.is_empty() {
         return Err(ReportValueError::EmptyIdentifier);
     }
@@ -4831,20 +5652,10 @@ fn validate_report_identifier(value: &str) -> Result<(), ReportValueError> {
             max_bytes: MAX_REPORT_IDENTIFIER_BYTES,
         });
     }
-    let bytes = value.as_bytes();
-    if !is_identifier_endpoint(bytes[0]) || !is_identifier_endpoint(bytes[bytes.len() - 1]) {
-        return Err(ReportValueError::InvalidIdentifier);
-    }
-    if !value.bytes().all(|byte| {
-        byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-' | b'_')
-    }) {
+    if !is_valid_namespaced_identifier(value) {
         return Err(ReportValueError::InvalidIdentifier);
     }
     Ok(())
-}
-
-const fn is_identifier_endpoint(byte: u8) -> bool {
-    byte.is_ascii_lowercase() || byte.is_ascii_digit()
 }
 
 pub(crate) fn validate_report_prose(value: &str) -> Result<(), ReportValueError> {
@@ -4879,10 +5690,24 @@ impl RetainedSize for PolicyRunCompletion {
             Self::ProvenSubset { codes } => codes
                 .capacity()
                 .saturating_mul(size_of::<CodeQueryDiagnosticCode>()),
-            Self::Inconclusive { reasons } => retained_extra(reasons),
+            Self::Inconclusive { reasons, scope } => {
+                retained_extra(reasons).saturating_add(retained_extra(scope))
+            }
+            Self::NotRun {
+                unavailable_capabilities,
+                ..
+            } => retained_extra(unavailable_capabilities),
             Self::Unsupported { capability } => retained_extra(capability),
             Self::Failed { reasons } => retained_extra(reasons),
         })
+    }
+}
+
+impl RetainedSize for UnavailablePolicyCapability {
+    fn retained_size(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(self.label.capacity())
+            .saturating_add(self.reason.capacity())
     }
 }
 
@@ -4907,19 +5732,25 @@ impl RetainedSize for PolicyCapability {
 
 impl RetainedSize for FindingCertainty {
     fn retained_size(&self) -> usize {
-        size_of::<Self>().saturating_add(match self {
-            Self::Definite => 0,
-            Self::Possible { reasons } => retained_extra(reasons),
-        })
+        retained_size_with_extra(
+            self,
+            match self {
+                Self::Definite => 0,
+                Self::Possible { reasons } => retained_extra(reasons),
+            },
+        )
     }
 }
 
 impl RetainedSize for FindingCompleteness {
     fn retained_size(&self) -> usize {
-        size_of::<Self>().saturating_add(match self {
-            Self::Complete => 0,
-            Self::Partial { reasons } => retained_extra(reasons),
-        })
+        retained_size_with_extra(
+            self,
+            match self {
+                Self::Complete => 0,
+                Self::Partial { reasons } => retained_extra(reasons),
+            },
+        )
     }
 }
 
@@ -4951,7 +5782,7 @@ impl RetainedSize for PolicyWorkReport {
 
 impl RetainedSize for PolicyWorkMetric {
     fn retained_size(&self) -> usize {
-        size_of::<Self>().saturating_add(self.name.capacity())
+        retained_size_with_extras(self, [self.name.capacity()])
     }
 }
 
@@ -4989,13 +5820,7 @@ impl Serialize for PolicyAnalysisType {
     where
         S: Serializer,
     {
-        serializer.serialize_str(match self {
-            Self::Match => "match",
-            Self::Taint => "taint",
-            Self::Typestate => "typestate",
-            Self::Assertion => "assertion",
-            Self::Flow => "flow",
-        })
+        serializer.serialize_str(self.label())
     }
 }
 
@@ -5004,12 +5829,7 @@ impl Serialize for FindingSeverity {
     where
         S: Serializer,
     {
-        serializer.serialize_str(match self {
-            Self::Unrated => "unrated",
-            Self::Note => "note",
-            Self::Warning => "warning",
-            Self::Error => "error",
-        })
+        serializer.serialize_str(self.label())
     }
 }
 
@@ -5036,7 +5856,7 @@ impl Serialize for PolicySemanticHash {
 // ---------------------------------------------------------------------------
 //
 // A persisted policy evaluation unit carries the findings one file's asserts
-// produced (`.agents/plans/impact-sliced-diff-base.md`, Milestone 4), so a
+// produced, so a
 // later run has to read a finding back out of the analyzer cache. Every value
 // below goes back through the constructor that minted it: a stored value that
 // no longer validates is a deserialization error and the caller widens, never a
@@ -5108,6 +5928,10 @@ impl<'de> Deserialize<'de> for PolicySemanticHash {
     }
 }
 
+const fn whole_run_scope() -> InconclusiveScope {
+    InconclusiveScope::Run
+}
+
 impl<'de> Deserialize<'de> for PolicyRunCompletion {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -5123,6 +5947,14 @@ impl<'de> Deserialize<'de> for PolicyRunCompletion {
             ProvenBySummary,
             Inconclusive {
                 reasons: Vec<PolicyIncompleteReason>,
+                /// A report written before #5433 names no scope, which is the
+                /// whole run.
+                #[serde(default = "whole_run_scope")]
+                scope: InconclusiveScope,
+            },
+            NotRun {
+                unavailable_capabilities: Vec<UnavailablePolicyCapability>,
+                selected_by: PolicySelectionProvenance,
             },
             Unsupported {
                 capability: PolicyCapability,
@@ -5136,7 +5968,14 @@ impl<'de> Deserialize<'de> for PolicyRunCompletion {
             Wire::Complete => Self::Complete,
             Wire::ProvenSubset { codes } => Self::ProvenSubset { codes },
             Wire::ProvenBySummary => Self::ProvenBySummary,
-            Wire::Inconclusive { reasons } => Self::Inconclusive { reasons },
+            Wire::Inconclusive { reasons, scope } => Self::Inconclusive { reasons, scope },
+            Wire::NotRun {
+                unavailable_capabilities,
+                selected_by,
+            } => Self::NotRun {
+                unavailable_capabilities,
+                selected_by,
+            },
             Wire::Unsupported { capability } => Self::Unsupported { capability },
             Wire::Failed { reasons } => Self::Failed { reasons },
         };
@@ -5518,6 +6357,8 @@ impl<'de> de::DeserializeSeed<'de> for PolicyFindingSeed<'_> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Wire {
+            #[serde(default)]
+            value_type_barrier_notes: crate::ValueTypeBarrierNotes,
             id: PolicyFindingId,
             identity_stability: FindingIdentityStability,
             policy_id: PolicyId,
@@ -5593,6 +6434,8 @@ impl<'de> de::DeserializeSeed<'de> for PolicyFindingSeed<'_> {
             wire.omitted_witnesses_lower_bound,
             self.budget,
         )
+        .map_err(de::Error::custom)?
+        .with_value_type_barrier_notes(wire.value_type_barrier_notes, self.budget)
         .map_err(de::Error::custom)?;
 
         // The identity, the analysis type and the identity stability are
@@ -5627,19 +6470,18 @@ mod tests {
         CvssAssessment, CvssAssessmentProvenance, CvssAssessmentSet, CvssAssessmentVariant,
         CvssEvidenceSetHash, CvssUnscoredReason, SourceScenarioSetHash, VulnerabilityIdentity,
     };
-    use crate::definition::{
-        CvssBaseMetric, CvssVersion, PolicyAnalysis, PolicySelector, RqlpDocument,
-    };
+    use crate::definition::{CvssBaseMetric, CvssVersion};
     use crate::finding_identity::{OpaqueFindingKey, SourceSliceHash};
-    use crate::resolved::{
-        LoadedPolicy, PolicyPrecedenceManifest, ResolvedPolicySelector, SelectorOrigin,
-    };
-    use crate::source::{PolicySourceIdentity, parse_rqlp_source};
+    use crate::resolved::LoadedPolicy;
+    use brokk_bifrost_test_macros::hardwon;
     use serde_json::json;
 
     /// #2779: an oversized message must be truncated, never rejected, so a
     /// run-level failure explanation cannot vanish for being too complete.
     #[test]
+    #[hardwon(
+        "#2779: oversized diagnostic prose must be bounded instead of dropping the run explanation"
+    )]
     fn a_bounded_diagnostic_truncates_oversized_prose_instead_of_failing() {
         let oversized = PolicyDiagnostic::new_bounded(
             PolicyDiagnosticCode::EvaluationFailure,
@@ -5667,6 +6509,7 @@ mod tests {
     /// the other two. Folding by declared family keeps every family with the
     /// number of sites it covers.
     #[test]
+    #[hardwon("#2356: a diagnostic cap must retain each incomplete reason family and its count")]
     fn a_capped_diagnostic_list_keeps_every_reason_family_with_its_count() {
         let families = ["alpha cause", "beta cause", "gamma cause"];
         let per_family = 200_u64;
@@ -5721,6 +6564,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#1916: authored-complete summary evidence is reliable but not exhaustive")]
     fn issue_1916_proven_by_summary_ranks_between_complete_and_inconclusive() {
         let tier = PolicyRunCompletion::ProvenBySummary;
         // Reliable enough for the batch exit status, like Complete and ProvenSubset.
@@ -5781,43 +6625,7 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/testdata/policies/dynamic-eval.rqlp"
         ));
-        let identity = PolicySourceIdentity::new("policy.rqlp");
-        let parsed = parse_rqlp_source(source, identity.clone()).unwrap();
-        let schema_resolution = parsed.schema_resolution();
-        let RqlpDocument::Policy { definition } = parsed.into_document() else {
-            panic!("fixture must be a policy");
-        };
-        let definition = *definition;
-        let PolicyAnalysis::Match { spec } = &definition.analysis else {
-            panic!("fixture must be a match policy");
-        };
-        let PolicySelector::Inline { schema, query, .. } = &spec.selector else {
-            panic!("fixture selector must be inline");
-        };
-        let selector = ResolvedPolicySelector::try_new(
-            super::super::definition::PolicySelectorPath::new("/analysis/selector").unwrap(),
-            *schema,
-            query.clone(),
-            SelectorOrigin::Document {
-                source: identity.clone(),
-            },
-        )
-        .unwrap();
-        LoadedPolicy::try_new(
-            definition,
-            identity,
-            source.as_bytes(),
-            schema_resolution,
-            vec![selector],
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            PolicyPrecedenceManifest::default(),
-            None,
-            None,
-        )
-        .unwrap()
+        crate::test_support::load_match_policy(source)
     }
 
     fn match_evidence() -> PolicyFindingEvidence {
@@ -5963,25 +6771,6 @@ mod tests {
             )
             .unwrap(),
         }
-    }
-
-    #[test]
-    fn an_assertion_finding_reads_back_as_the_finding_that_was_written() {
-        let budget = PolicyBudget::default();
-        let loaded = loaded_match_policy();
-        let finding =
-            finding_with(&loaded, assertion_evidence(), Vec::new(), None, &budget).unwrap();
-
-        assert_eq!(round_trip(&finding, &budget), finding);
-    }
-
-    #[test]
-    fn a_match_finding_reads_back_as_the_finding_that_was_written() {
-        let budget = PolicyBudget::default();
-        let loaded = loaded_match_policy();
-        let finding = finding_with(&loaded, match_evidence(), Vec::new(), None, &budget).unwrap();
-
-        assert_eq!(round_trip(&finding, &budget), finding);
     }
 
     /// A finding whose related locations, witnesses, classification and
@@ -6171,89 +6960,6 @@ mod tests {
         assert!(error.to_string().contains("`diff`"), "{error}");
     }
 
-    /// The budget the reader holds is what the caps are checked against, not
-    /// whatever budget the writer had.
-    #[test]
-    fn a_finding_that_exceeds_the_readers_budget_is_a_load_error() {
-        let writer = PolicyBudget::default();
-        let loaded = loaded_match_policy();
-        let finding = PolicyFinding::try_new(
-            loaded.definition().metadata.id.clone(),
-            loaded.semantic_hash(),
-            FindingSeverity::Warning,
-            "finding".to_string(),
-            FindingClassification::Unclassified,
-            FindingCertainty::Definite,
-            FindingCompleteness::Complete,
-            location(),
-            vec![
-                RelatedPolicyLocation::try_new(
-                    PolicyLocationRelationship::Subject,
-                    location(),
-                    Vec::new(),
-                )
-                .unwrap(),
-            ],
-            false,
-            0,
-            assertion_evidence(),
-            false,
-            0,
-            None,
-            None,
-            ProofMetadata::try_new(
-                ProofState::Proven,
-                vec![ProofReason::DirectStructuralMatch],
-                Vec::new(),
-            )
-            .unwrap(),
-            Vec::new(),
-            false,
-            0,
-            &writer,
-        )
-        .unwrap();
-
-        let reader = PolicyBudget::builder()
-            .with_max_related_locations_per_finding(0)
-            .expect("zero related locations is a valid budget")
-            .build()
-            .expect("a lowered per-finding cap is a valid budget");
-        let json = serde_json::to_string(&finding).unwrap();
-        let mut deserializer = serde_json::Deserializer::from_str(&json);
-        serde::de::DeserializeSeed::deserialize(PolicyFindingSeed::new(&reader), &mut deserializer)
-            .expect_err("a finding wider than the reader's budget must not load");
-    }
-
-    #[test]
-    fn completion_is_typed_sorted_and_never_empty_when_non_complete() {
-        assert_eq!(
-            PolicyRunCompletion::inconclusive(vec![
-                PolicyIncompleteReason::PipelineRowBudget,
-                PolicyIncompleteReason::Cancelled,
-                PolicyIncompleteReason::PipelineRowBudget,
-            ])
-            .unwrap(),
-            PolicyRunCompletion::Inconclusive {
-                reasons: vec![
-                    PolicyIncompleteReason::Cancelled,
-                    PolicyIncompleteReason::PipelineRowBudget,
-                ]
-            }
-        );
-        assert!(PolicyRunCompletion::inconclusive(Vec::new()).is_err());
-        assert!(FindingCompleteness::partial(Vec::new()).is_err());
-        assert_eq!(
-            serde_json::to_value(PolicyRunCompletion::Complete).unwrap(),
-            json!({ "type": "complete" })
-        );
-        assert!(completion_allows_diagnostic_impact(
-            &PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::PipelineRowBudget])
-                .unwrap(),
-            PolicyDiagnosticImpact::DeclaredNonExhaustive,
-        ));
-    }
-
     #[test]
     fn locations_require_paired_byte_and_display_ranges() {
         let artifact = PolicySourceLocation::artifact(path());
@@ -6407,6 +7113,479 @@ mod tests {
     }
 
     #[test]
+    fn weak_match_anchor_remains_partial_evidence_not_a_stable_fingerprint() {
+        let anchor = MatchFindingAnchor::weak(
+            MatchResultDomain::CallSite,
+            path(),
+            OpaqueFindingKey::try_new("query", "run-key").unwrap(),
+        );
+        let evidence = MatchFindingEvidence::try_new(
+            MatchResultDomain::CallSite,
+            anchor,
+            call_terminal(),
+            Vec::new(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            evidence.anchor().stability(),
+            super::super::finding_identity::FindingIdentityStability::Weak
+        );
+        let completeness =
+            FindingCompleteness::partial(vec![FindingIncompleteReason::StableAnchorWeak]).unwrap();
+        assert!(!completeness.is_complete());
+    }
+
+    #[test]
+    fn query_result_refs_enforce_domain_locations_and_identity_paths() {
+        let artifact = PolicySourceLocation::artifact(path());
+        let artifact_structural = PolicyQueryResultRef::StructuralMatch {
+            kind: "call".to_string(),
+            location: artifact,
+            identity: None,
+        };
+        assert_eq!(
+            artifact_structural.validate().unwrap_err(),
+            ReportValueError::ResultLocationMustHaveSpan
+        );
+
+        let cross_file_identity = StableSemanticIdentity::analyzer_declaration_id(
+            "rust",
+            WorkspaceRelativePath::new("src/target.rs").unwrap(),
+            format!("decl:v1:{}", "1".repeat(64)),
+        )
+        .unwrap();
+        let structural = PolicyQueryResultRef::StructuralMatch {
+            kind: "call".to_string(),
+            location: location(),
+            identity: Some(cross_file_identity.clone()),
+        };
+        assert_eq!(
+            structural.validate().unwrap_err(),
+            ReportValueError::StableIdentityPathMismatch
+        );
+
+        // A reference target may legitimately live in another file; it is not
+        // the identity of the span-bearing reference site itself.
+        let reference = PolicyQueryResultRef::ReferenceSite {
+            location: location(),
+            target_fq_name: "crate::Target::run".to_string(),
+            target_identity: Some(cross_file_identity),
+            usage_kind: Some("call".to_string()),
+            proof: PolicyQueryProof::Resolved,
+        };
+        assert!(reference.validate().is_ok());
+    }
+
+    /// Build one run at the given completion with no findings.
+    fn run_at(completion: PolicyRunCompletion) -> PolicyRun {
+        let loaded = loaded_match_policy();
+        PolicyRun::try_new(
+            loaded.definition().metadata.id.clone(),
+            loaded.semantic_hash(),
+            PolicyAnalysisType::Match,
+            completion,
+            Vec::new(),
+            Vec::new(),
+            false,
+            PolicyWorkReport::default(),
+            &PolicyBudget::default(),
+        )
+        .unwrap()
+    }
+
+    fn obligation() -> PolicyObligation {
+        PolicyObligation::try_new(
+            "by-site-winners",
+            PolicyObligationKind::AbsenceRequiresExhaustiveCoverage,
+            "by-site",
+            None,
+            Vec::new(),
+            false,
+            vec![PolicyIncompleteReason::PipelineRowBudget],
+        )
+        .unwrap()
+    }
+
+    /// Issue #2435: a run that lists a blocked verdict cannot also claim a
+    /// reliable one. This is what keeps a false green unrepresentable in the
+    /// report model rather than only in the evaluator that fills it.
+    #[test]
+    fn obligations_require_an_inconclusive_run() {
+        let budget = PolicyBudget::default();
+        for completion in [
+            PolicyRunCompletion::Complete,
+            PolicyRunCompletion::ProvenBySummary,
+            PolicyRunCompletion::proven_subset(vec![
+                CodeQueryDiagnosticCode::SemanticBudgetExhausted,
+            ])
+            .unwrap(),
+            PolicyRunCompletion::failed(vec![PolicyFailureReason::InternalInvariant]).unwrap(),
+            PolicyRunCompletion::Unsupported {
+                capability: PolicyCapability::TaintEvaluation,
+            },
+        ] {
+            let mut run = run_at(completion.clone());
+            assert_eq!(
+                run.set_obligations(&[obligation()], false, 0, &budget)
+                    .unwrap_err(),
+                PolicyRunError::ObligationsRequireInconclusiveRun,
+                "completion {completion:?} must refuse an unmet obligation"
+            );
+            // Truncation alone is the same claim with the list elided.
+            assert_eq!(
+                run.set_obligations(&[], true, 1, &budget).unwrap_err(),
+                PolicyRunError::ObligationsRequireInconclusiveRun,
+            );
+            assert!(
+                run.obligations().is_empty(),
+                "a refused set changes nothing"
+            );
+            assert!(!run.obligations_truncated());
+        }
+
+        let mut run = run_at(
+            PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::PipelineRowBudget])
+                .unwrap(),
+        );
+        run.set_obligations(&[obligation()], false, 0, &budget)
+            .unwrap();
+        assert_eq!(run.obligations().len(), 1);
+        assert_eq!(
+            run.validate_against_budget(&budget),
+            Ok(()),
+            "a validated run re-validates"
+        );
+    }
+
+    /// The schema-5 run shape: the three obligation fields are always present,
+    /// so a reader distinguishes "nothing was blocked" from "this producer
+    /// does not report obligations".
+    #[test]
+    fn every_run_publishes_the_obligation_fields() {
+        let clean = serde_json::to_value(run_at(PolicyRunCompletion::Complete)).unwrap();
+        assert_eq!(clean["obligations"], json!([]));
+        assert_eq!(clean["obligations_truncated"], json!(false));
+        assert_eq!(clean["omitted_obligations_lower_bound"], json!(0));
+
+        let mut run = run_at(
+            PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::PipelineRowBudget])
+                .unwrap(),
+        );
+        run.set_obligations(&[obligation()], false, 0, &PolicyBudget::default())
+            .unwrap();
+        let blocked = serde_json::to_value(&run).unwrap();
+        assert_eq!(
+            blocked["obligations"],
+            json!([{
+                "assertion": "by-site-winners",
+                "kind": "absence_requires_exhaustive_coverage",
+                "group": "by-site",
+                "group_key": null,
+                "reasons": ["pipeline_row_budget"],
+            }])
+        );
+    }
+
+    /// The partition an analysis-backed obligation is about is report data, not
+    /// prose: a reader joins the blocked verdict to the solve that left it open
+    /// without parsing a diagnostic message. A query-scope obligation publishes
+    /// no partition at all, so an absent list reads as "the row set was short",
+    /// not as "this producer does not report partitions".
+    #[test]
+    fn an_obligation_publishes_the_analysis_partitions_that_blocked_it() {
+        let mut run = run_at(
+            PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::PartialDiscovery])
+                .unwrap(),
+        );
+        let blocked = PolicyObligation::try_new(
+            "no-tainted-sink",
+            PolicyObligationKind::AbsenceRequiresExhaustiveCoverage,
+            "by-sink",
+            None,
+            vec![
+                PolicyCoveragePartition::new("taint_finding", "sink-b"),
+                PolicyCoveragePartition::new("flow_endpoint", "plan-a"),
+            ],
+            true,
+            vec![PolicyIncompleteReason::PartialDiscovery],
+        )
+        .unwrap();
+        run.set_obligations(&[blocked], false, 0, &PolicyBudget::default())
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&run).unwrap()["obligations"],
+            json!([{
+                "assertion": "no-tainted-sink",
+                "kind": "absence_requires_exhaustive_coverage",
+                "group": "by-sink",
+                "group_key": null,
+                "partitions": [
+                    { "family": "flow_endpoint", "root": "plan-a" },
+                    { "family": "taint_finding", "root": "sink-b" },
+                ],
+                "partitions_truncated": true,
+                "reasons": ["partial_discovery"],
+            }]),
+            "partitions are canonical and the truncation flag travels with them"
+        );
+
+        let mut unpartitioned = run_at(
+            PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::PipelineRowBudget])
+                .unwrap(),
+        );
+        unpartitioned
+            .set_obligations(&[obligation()], false, 0, &PolicyBudget::default())
+            .unwrap();
+        let value = serde_json::to_value(&unpartitioned).unwrap();
+        assert!(value["obligations"][0].get("partitions").is_none());
+        assert!(
+            value["obligations"][0]
+                .get("partitions_truncated")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cvss_variants_must_join_the_finding_anchor_and_scenario_domain() {
+        let loaded = loaded_match_policy();
+        let evidence = match_evidence();
+        let empty_hash = super::super::future_evidence::empty_source_scenario_set_hash();
+        let wrong_identity = unscored_cvss(
+            VulnerabilityIdentity::from_bytes([9; 32]),
+            Vec::new(),
+            empty_hash,
+            false,
+        );
+        assert!(matches!(
+            finding_with(
+                &loaded,
+                evidence.clone(),
+                Vec::new(),
+                Some(wrong_identity),
+                &PolicyBudget::default(),
+            ),
+            Err(PolicyFindingError::CvssVulnerabilityIdentityMismatch)
+        ));
+
+        let PolicyFindingEvidence::Match {
+            evidence: match_evidence,
+        } = &evidence
+        else {
+            unreachable!()
+        };
+        let vulnerability = VulnerabilityIdentity::from_bytes(
+            super::super::finding_identity::match_vulnerability_digest(match_evidence.anchor()),
+        );
+        let scenario =
+            super::super::finding_identity::SourceScenarioId::try_new("taint", "s1").unwrap();
+        let nonempty_hash =
+            SourceScenarioSetHash::try_from_scenarios(vec![scenario.clone()]).unwrap();
+        let wrong_scenario = unscored_cvss(vulnerability, vec![scenario], nonempty_hash, false);
+        assert!(matches!(
+            finding_with(
+                &loaded,
+                evidence,
+                Vec::new(),
+                Some(wrong_scenario),
+                &PolicyBudget::default(),
+            ),
+            Err(PolicyFindingError::CvssSourceScenarioJoinMismatch)
+        ));
+    }
+
+    #[test]
+    fn complete_run_cannot_claim_truncated_diagnostics() {
+        let loaded = loaded_match_policy();
+        assert_eq!(
+            PolicyRun::try_new(
+                loaded.definition().metadata.id.clone(),
+                loaded.semantic_hash(),
+                PolicyAnalysisType::Match,
+                PolicyRunCompletion::Complete,
+                Vec::new(),
+                Vec::new(),
+                true,
+                PolicyWorkReport::default(),
+                &PolicyBudget::default(),
+            )
+            .unwrap_err(),
+            PolicyRunError::CompletionDoesNotReflectDiagnostics
+        );
+    }
+
+    #[test]
+    #[hardwon("#2356: duplicate diagnostics must be folded before the representative-family cap")]
+    fn bounded_diagnostic_insertion_deduplicates_before_applying_the_cap() {
+        let diagnostic = |message: &str| {
+            PolicyDiagnostic::try_new(
+                PolicyDiagnosticCode::EvaluationFailure,
+                PolicyDiagnosticSeverity::Warning,
+                PolicyDiagnosticImpact::RunIncomplete,
+                message,
+                None,
+                Vec::new(),
+            )
+            .unwrap()
+        };
+        let mut retained = Vec::new();
+        assert!(!insert_policy_diagnostic_bounded(
+            &mut retained,
+            diagnostic("same cause"),
+            1,
+        ));
+        assert!(!insert_policy_diagnostic_bounded(
+            &mut retained,
+            diagnostic("same cause"),
+            1,
+        ));
+        assert_eq!(retained.len(), 1);
+
+        // Past the cap the list is no longer verbatim. It used to keep
+        // whichever message sorted first and drop the rest without trace; it
+        // now folds to one entry per reason family carrying the count of the
+        // diagnostics that family covers (#2356). Neither cause is lost.
+        retained.clear();
+        assert!(!insert_policy_diagnostic_bounded(
+            &mut retained,
+            diagnostic("z cause"),
+            1,
+        ));
+        assert!(insert_policy_diagnostic_bounded(
+            &mut retained,
+            diagnostic("a cause"),
+            1,
+        ));
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].family(), "evaluation_failure");
+        assert_eq!(retained[0].message(), "evaluation_failure");
+        assert_eq!(retained[0].family_count(), 2);
+    }
+
+    #[test]
+    fn an_assertion_finding_reads_back_as_the_finding_that_was_written() {
+        let budget = PolicyBudget::default();
+        let loaded = loaded_match_policy();
+        let finding =
+            finding_with(&loaded, assertion_evidence(), Vec::new(), None, &budget).unwrap();
+
+        assert_eq!(round_trip(&finding, &budget), finding);
+    }
+
+    #[test]
+    fn a_match_finding_reads_back_as_the_finding_that_was_written() {
+        let budget = PolicyBudget::default();
+        let loaded = loaded_match_policy();
+        let finding = finding_with(&loaded, match_evidence(), Vec::new(), None, &budget).unwrap();
+
+        assert_eq!(round_trip(&finding, &budget), finding);
+    }
+
+    #[test]
+    fn a_finding_that_exceeds_the_readers_budget_is_a_load_error() {
+        let writer = PolicyBudget::default();
+        let loaded = loaded_match_policy();
+        let finding = PolicyFinding::try_new(
+            loaded.definition().metadata.id.clone(),
+            loaded.semantic_hash(),
+            FindingSeverity::Warning,
+            "finding".to_string(),
+            FindingClassification::Unclassified,
+            FindingCertainty::Definite,
+            FindingCompleteness::Complete,
+            location(),
+            vec![
+                RelatedPolicyLocation::try_new(
+                    PolicyLocationRelationship::Subject,
+                    location(),
+                    Vec::new(),
+                )
+                .unwrap(),
+            ],
+            false,
+            0,
+            assertion_evidence(),
+            false,
+            0,
+            None,
+            None,
+            ProofMetadata::try_new(
+                ProofState::Proven,
+                vec![ProofReason::DirectStructuralMatch],
+                Vec::new(),
+            )
+            .unwrap(),
+            Vec::new(),
+            false,
+            0,
+            &writer,
+        )
+        .unwrap();
+
+        let reader = PolicyBudget::builder()
+            .with_max_related_locations_per_finding(0)
+            .expect("zero related locations is a valid budget")
+            .build()
+            .expect("a lowered per-finding cap is a valid budget");
+        let json = serde_json::to_string(&finding).unwrap();
+        let mut deserializer = serde_json::Deserializer::from_str(&json);
+        serde::de::DeserializeSeed::deserialize(PolicyFindingSeed::new(&reader), &mut deserializer)
+            .expect_err("a finding wider than the reader's budget must not load");
+    }
+
+    #[test]
+    fn completion_is_typed_sorted_and_never_empty_when_non_complete() {
+        assert_eq!(
+            PolicyRunCompletion::inconclusive(vec![
+                PolicyIncompleteReason::PipelineRowBudget,
+                PolicyIncompleteReason::Cancelled,
+                PolicyIncompleteReason::PipelineRowBudget,
+            ])
+            .unwrap(),
+            PolicyRunCompletion::inconclusive(vec![
+                PolicyIncompleteReason::Cancelled,
+                PolicyIncompleteReason::PipelineRowBudget
+            ])
+            .expect("canonical reasons")
+        );
+        assert!(PolicyRunCompletion::inconclusive(Vec::new()).is_err());
+        assert!(FindingCompleteness::partial(Vec::new()).is_err());
+        assert_eq!(
+            serde_json::to_value(PolicyRunCompletion::Complete).unwrap(),
+            json!({ "type": "complete" })
+        );
+        let unavailable = UnavailablePolicyCapability {
+            label: "python-declaration-models".to_owned(),
+            reason: "the active semantic snapshot has no complete Python declaration surface"
+                .to_owned(),
+        };
+        let implicit = PolicyRunCompletion::NotRun {
+            unavailable_capabilities: vec![unavailable.clone()],
+            selected_by: PolicySelectionProvenance::PackCategoryOrDefault,
+        };
+        assert!(implicit.is_reliable());
+        assert!(!implicit.is_exhaustive());
+        assert!(implicit.permits_clean_negative());
+        let implicit_json = serde_json::to_value(&implicit).unwrap();
+        assert_eq!(implicit_json["selected_by"], "pack_category_or_default");
+        assert_eq!(
+            serde_json::from_value::<PolicyRunCompletion>(implicit_json).unwrap(),
+            implicit
+        );
+        let explicit = PolicyRunCompletion::NotRun {
+            unavailable_capabilities: vec![unavailable],
+            selected_by: PolicySelectionProvenance::ExplicitPolicyId,
+        };
+        assert!(!explicit.is_reliable());
+        assert!(!explicit.permits_clean_negative());
+        assert!(completion_allows_diagnostic_impact(
+            &PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::PipelineRowBudget])
+                .unwrap(),
+            PolicyDiagnosticImpact::DeclaredNonExhaustive,
+        ));
+    }
+
+    #[test]
     fn witness_truncation_is_explicit_and_bounded() {
         let witness_id = WitnessId::try_new("query", "path-1").unwrap();
         let step = WitnessStep::try_new(
@@ -6454,82 +7633,6 @@ mod tests {
             )
             .is_err()
         );
-    }
-
-    #[test]
-    fn weak_match_anchor_remains_partial_evidence_not_a_stable_fingerprint() {
-        let anchor = MatchFindingAnchor::weak(
-            MatchResultDomain::CallSite,
-            path(),
-            OpaqueFindingKey::try_new("query", "run-key").unwrap(),
-        );
-        let evidence = MatchFindingEvidence::try_new(
-            MatchResultDomain::CallSite,
-            anchor,
-            call_terminal(),
-            Vec::new(),
-            false,
-        )
-        .unwrap();
-        assert_eq!(
-            evidence.anchor().stability(),
-            super::super::finding_identity::FindingIdentityStability::Weak
-        );
-        let completeness =
-            FindingCompleteness::partial(vec![FindingIncompleteReason::StableAnchorWeak]).unwrap();
-        assert!(!completeness.is_complete());
-    }
-
-    #[test]
-    fn report_identifiers_require_ascii_alphanumeric_ends() {
-        for value in [".rust", "rust.", "-rust", "rust-", "_rust", "rust_"] {
-            assert!(
-                PolicyCapability::query_feature(value, "query.feature").is_err(),
-                "identifier {value}"
-            );
-        }
-        assert!(PolicyCapability::query_feature("rust", "query.feature").is_ok());
-    }
-
-    #[test]
-    fn query_result_refs_enforce_domain_locations_and_identity_paths() {
-        let artifact = PolicySourceLocation::artifact(path());
-        let artifact_structural = PolicyQueryResultRef::StructuralMatch {
-            kind: "call".to_string(),
-            location: artifact,
-            identity: None,
-        };
-        assert_eq!(
-            artifact_structural.validate().unwrap_err(),
-            ReportValueError::ResultLocationMustHaveSpan
-        );
-
-        let cross_file_identity = StableSemanticIdentity::analyzer_declaration_id(
-            "rust",
-            WorkspaceRelativePath::new("src/target.rs").unwrap(),
-            format!("decl:v1:{}", "1".repeat(64)),
-        )
-        .unwrap();
-        let structural = PolicyQueryResultRef::StructuralMatch {
-            kind: "call".to_string(),
-            location: location(),
-            identity: Some(cross_file_identity.clone()),
-        };
-        assert_eq!(
-            structural.validate().unwrap_err(),
-            ReportValueError::StableIdentityPathMismatch
-        );
-
-        // A reference target may legitimately live in another file; it is not
-        // the identity of the span-bearing reference site itself.
-        let reference = PolicyQueryResultRef::ReferenceSite {
-            location: location(),
-            target_fq_name: "crate::Target::run".to_string(),
-            target_identity: Some(cross_file_identity),
-            usage_kind: Some("call".to_string()),
-            proof: PolicyQueryProof::Resolved,
-        };
-        assert!(reference.validate().is_ok());
     }
 
     #[test]
@@ -6689,89 +7792,6 @@ mod tests {
         );
     }
 
-    /// Build one run at the given completion with no findings.
-    fn run_at(completion: PolicyRunCompletion) -> PolicyRun {
-        let loaded = loaded_match_policy();
-        PolicyRun::try_new(
-            loaded.definition().metadata.id.clone(),
-            loaded.semantic_hash(),
-            PolicyAnalysisType::Match,
-            completion,
-            Vec::new(),
-            Vec::new(),
-            false,
-            PolicyWorkReport::default(),
-            &PolicyBudget::default(),
-        )
-        .unwrap()
-    }
-
-    fn obligation() -> PolicyObligation {
-        PolicyObligation::try_new(
-            "by-site-winners",
-            PolicyObligationKind::AbsenceRequiresExhaustiveCoverage,
-            "by-site",
-            None,
-            Vec::new(),
-            false,
-            vec![PolicyIncompleteReason::PipelineRowBudget],
-        )
-        .unwrap()
-    }
-
-    /// Issue #2435: a run that lists a blocked verdict cannot also claim a
-    /// reliable one. This is what keeps a false green unrepresentable in the
-    /// report model rather than only in the evaluator that fills it.
-    #[test]
-    fn obligations_require_an_inconclusive_run() {
-        let budget = PolicyBudget::default();
-        for completion in [
-            PolicyRunCompletion::Complete,
-            PolicyRunCompletion::ProvenBySummary,
-            PolicyRunCompletion::proven_subset(vec![
-                CodeQueryDiagnosticCode::SemanticBudgetExhausted,
-            ])
-            .unwrap(),
-            PolicyRunCompletion::failed(vec![PolicyFailureReason::InternalInvariant]).unwrap(),
-            PolicyRunCompletion::Unsupported {
-                capability: PolicyCapability::TaintEvaluation,
-            },
-        ] {
-            let mut run = run_at(completion.clone());
-            assert_eq!(
-                run.set_obligations(&[obligation()], false, 0, &budget)
-                    .unwrap_err(),
-                PolicyRunError::ObligationsRequireInconclusiveRun,
-                "completion {completion:?} must refuse an unmet obligation"
-            );
-            // Truncation alone is the same claim with the list elided.
-            assert_eq!(
-                run.set_obligations(&[], true, 1, &budget).unwrap_err(),
-                PolicyRunError::ObligationsRequireInconclusiveRun,
-            );
-            assert!(
-                run.obligations().is_empty(),
-                "a refused set changes nothing"
-            );
-            assert!(!run.obligations_truncated());
-        }
-
-        let mut run = run_at(
-            PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::PipelineRowBudget])
-                .unwrap(),
-        );
-        run.set_obligations(&[obligation()], false, 0, &budget)
-            .unwrap();
-        assert_eq!(run.obligations().len(), 1);
-        assert_eq!(
-            run.validate_against_budget(&budget),
-            Ok(()),
-            "a validated run re-validates"
-        );
-    }
-
-    /// The crate's truncation-pair convention: a flag and an omitted count
-    /// that disagree describe a report nobody can read honestly.
     #[test]
     fn obligation_truncation_flag_and_omitted_count_must_agree() {
         let budget = PolicyBudget::default();
@@ -6816,8 +7836,6 @@ mod tests {
         assert_eq!(run.obligations().len(), 1);
     }
 
-    /// The obligation's own value rules: identifiers, a stated reason, and a
-    /// group key bounded on a character boundary rather than a byte.
     #[test]
     fn obligation_values_are_validated_and_the_group_key_is_bounded() {
         assert_eq!(
@@ -6875,8 +7893,6 @@ mod tests {
         );
     }
 
-    /// The wire vocabulary is a published contract, so it is pinned here
-    /// rather than derived from the enum's Rust spelling at review time.
     #[test]
     fn obligation_kinds_serialize_as_stable_snake_case() {
         for (kind, expected) in [
@@ -6892,142 +7908,6 @@ mod tests {
             assert_eq!(serde_json::to_value(kind).unwrap(), json!(expected));
             assert_eq!(kind.as_str(), expected);
         }
-    }
-
-    /// The schema-5 run shape: the three obligation fields are always present,
-    /// so a reader distinguishes "nothing was blocked" from "this producer
-    /// does not report obligations".
-    #[test]
-    fn every_run_publishes_the_obligation_fields() {
-        let clean = serde_json::to_value(run_at(PolicyRunCompletion::Complete)).unwrap();
-        assert_eq!(clean["obligations"], json!([]));
-        assert_eq!(clean["obligations_truncated"], json!(false));
-        assert_eq!(clean["omitted_obligations_lower_bound"], json!(0));
-
-        let mut run = run_at(
-            PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::PipelineRowBudget])
-                .unwrap(),
-        );
-        run.set_obligations(&[obligation()], false, 0, &PolicyBudget::default())
-            .unwrap();
-        let blocked = serde_json::to_value(&run).unwrap();
-        assert_eq!(
-            blocked["obligations"],
-            json!([{
-                "assertion": "by-site-winners",
-                "kind": "absence_requires_exhaustive_coverage",
-                "group": "by-site",
-                "group_key": null,
-                "reasons": ["pipeline_row_budget"],
-            }])
-        );
-    }
-
-    /// The partition an analysis-backed obligation is about is report data, not
-    /// prose: a reader joins the blocked verdict to the solve that left it open
-    /// without parsing a diagnostic message. A query-scope obligation publishes
-    /// no partition at all, so an absent list reads as "the row set was short",
-    /// not as "this producer does not report partitions".
-    #[test]
-    fn an_obligation_publishes_the_analysis_partitions_that_blocked_it() {
-        let mut run = run_at(
-            PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::PartialDiscovery])
-                .unwrap(),
-        );
-        let blocked = PolicyObligation::try_new(
-            "no-tainted-sink",
-            PolicyObligationKind::AbsenceRequiresExhaustiveCoverage,
-            "by-sink",
-            None,
-            vec![
-                PolicyCoveragePartition::new("taint_finding", "sink-b"),
-                PolicyCoveragePartition::new("flow_endpoint", "plan-a"),
-            ],
-            true,
-            vec![PolicyIncompleteReason::PartialDiscovery],
-        )
-        .unwrap();
-        run.set_obligations(&[blocked], false, 0, &PolicyBudget::default())
-            .unwrap();
-        assert_eq!(
-            serde_json::to_value(&run).unwrap()["obligations"],
-            json!([{
-                "assertion": "no-tainted-sink",
-                "kind": "absence_requires_exhaustive_coverage",
-                "group": "by-sink",
-                "group_key": null,
-                "partitions": [
-                    { "family": "flow_endpoint", "root": "plan-a" },
-                    { "family": "taint_finding", "root": "sink-b" },
-                ],
-                "partitions_truncated": true,
-                "reasons": ["partial_discovery"],
-            }]),
-            "partitions are canonical and the truncation flag travels with them"
-        );
-
-        let mut unpartitioned = run_at(
-            PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::PipelineRowBudget])
-                .unwrap(),
-        );
-        unpartitioned
-            .set_obligations(&[obligation()], false, 0, &PolicyBudget::default())
-            .unwrap();
-        let value = serde_json::to_value(&unpartitioned).unwrap();
-        assert!(value["obligations"][0].get("partitions").is_none());
-        assert!(
-            value["obligations"][0]
-                .get("partitions_truncated")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn cvss_variants_must_join_the_finding_anchor_and_scenario_domain() {
-        let loaded = loaded_match_policy();
-        let evidence = match_evidence();
-        let empty_hash = super::super::future_evidence::empty_source_scenario_set_hash();
-        let wrong_identity = unscored_cvss(
-            VulnerabilityIdentity::from_bytes([9; 32]),
-            Vec::new(),
-            empty_hash,
-            false,
-        );
-        assert!(matches!(
-            finding_with(
-                &loaded,
-                evidence.clone(),
-                Vec::new(),
-                Some(wrong_identity),
-                &PolicyBudget::default(),
-            ),
-            Err(PolicyFindingError::CvssVulnerabilityIdentityMismatch)
-        ));
-
-        let PolicyFindingEvidence::Match {
-            evidence: match_evidence,
-        } = &evidence
-        else {
-            unreachable!()
-        };
-        let vulnerability = VulnerabilityIdentity::from_bytes(
-            super::super::finding_identity::match_vulnerability_digest(match_evidence.anchor()),
-        );
-        let scenario =
-            super::super::finding_identity::SourceScenarioId::try_new("taint", "s1").unwrap();
-        let nonempty_hash =
-            SourceScenarioSetHash::try_from_scenarios(vec![scenario.clone()]).unwrap();
-        let wrong_scenario = unscored_cvss(vulnerability, vec![scenario], nonempty_hash, false);
-        assert!(matches!(
-            finding_with(
-                &loaded,
-                evidence,
-                Vec::new(),
-                Some(wrong_scenario),
-                &PolicyBudget::default(),
-            ),
-            Err(PolicyFindingError::CvssSourceScenarioJoinMismatch)
-        ));
     }
 
     #[test]
@@ -7123,75 +8003,9 @@ mod tests {
     }
 
     #[test]
-    fn complete_run_cannot_claim_truncated_diagnostics() {
-        let loaded = loaded_match_policy();
-        assert_eq!(
-            PolicyRun::try_new(
-                loaded.definition().metadata.id.clone(),
-                loaded.semantic_hash(),
-                PolicyAnalysisType::Match,
-                PolicyRunCompletion::Complete,
-                Vec::new(),
-                Vec::new(),
-                true,
-                PolicyWorkReport::default(),
-                &PolicyBudget::default(),
-            )
-            .unwrap_err(),
-            PolicyRunError::CompletionDoesNotReflectDiagnostics
-        );
-    }
-
-    #[test]
-    fn bounded_diagnostic_insertion_deduplicates_before_applying_the_cap() {
-        let diagnostic = |message: &str| {
-            PolicyDiagnostic::try_new(
-                PolicyDiagnosticCode::EvaluationFailure,
-                PolicyDiagnosticSeverity::Warning,
-                PolicyDiagnosticImpact::RunIncomplete,
-                message,
-                None,
-                Vec::new(),
-            )
-            .unwrap()
-        };
-        let mut retained = Vec::new();
-        assert!(!insert_policy_diagnostic_bounded(
-            &mut retained,
-            diagnostic("same cause"),
-            1,
-        ));
-        assert!(!insert_policy_diagnostic_bounded(
-            &mut retained,
-            diagnostic("same cause"),
-            1,
-        ));
-        assert_eq!(retained.len(), 1);
-
-        // Past the cap the list is no longer verbatim. It used to keep
-        // whichever message sorted first and drop the rest without trace; it
-        // now folds to one entry per reason family carrying the count of the
-        // diagnostics that family covers (#2356). Neither cause is lost.
-        retained.clear();
-        assert!(!insert_policy_diagnostic_bounded(
-            &mut retained,
-            diagnostic("z cause"),
-            1,
-        ));
-        assert!(insert_policy_diagnostic_bounded(
-            &mut retained,
-            diagnostic("a cause"),
-            1,
-        ));
-        assert_eq!(retained.len(), 1);
-        assert_eq!(retained[0].family(), "evaluation_failure");
-        assert_eq!(retained[0].message(), "evaluation_failure");
-        assert_eq!(retained[0].family_count(), 2);
-    }
-
-    /// `label()` documents itself as byte-identical to the serde tag, and the
-    /// explanation node identity hashes it under that claim.
-    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "db13bb5ed3ae: incomplete-reason labels must match serialized tags for stable explanation identities"
+    )]
     fn incomplete_reason_labels_agree_with_their_serde_tags() {
         use PolicyIncompleteReason as R;
         let reasons = [

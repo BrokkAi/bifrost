@@ -23,10 +23,14 @@ use brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix;
 use brokk_bifrost_core::hash::HashMap as CargoHashMap;
 use git2::{ObjectType, Oid};
 
+use crate::cargo_config::RustCargoConfiguration;
 use crate::cargo_manifest::RustCargoManifestDocument;
 use crate::cargo_routes::{
-    AUTO_TARGET_MAX_DEPTH, RustCargoTargetKind, auto_cargo_target_kind,
-    cargo_dependency_directory_with, normalize_crate_name,
+    AUTO_TARGET_MAX_DEPTH, CargoBuildScriptPathState, RustCargoTargetKind, auto_cargo_target_kind,
+    cargo_auto_target_enabled, cargo_build_script_path_state, cargo_dependency_directory_with,
+    cargo_dependency_table_kinds, cargo_dependency_value, cargo_library_autodiscovery_enabled,
+    cargo_manifest_has_explicit_target, cargo_workspace_manifest_directory,
+    inferred_cargo_target_paths, normalize_crate_name,
 };
 
 mod crate_inventory;
@@ -268,11 +272,11 @@ impl RustCargoManifestFacts {
             None
         };
         let mut dependencies = Vec::new();
-        for (table_name, kind) in [
-            ("dependencies", RustCargoDependencyKind::Normal),
-            ("dev-dependencies", RustCargoDependencyKind::Development),
-            ("build-dependencies", RustCargoDependencyKind::Build),
-        ] {
+        for (table_name, kind) in cargo_dependency_table_kinds(
+            RustCargoDependencyKind::Normal,
+            RustCargoDependencyKind::Development,
+            RustCargoDependencyKind::Build,
+        ) {
             let Some(table) = manifest.get(table_name).and_then(toml::Value::as_table) else {
                 continue;
             };
@@ -328,27 +332,33 @@ fn cargo_package_boolean(
     }
 }
 
-fn cargo_manifest_has_explicit_target(manifest: &RustCargoManifestDocument) -> bool {
-    manifest.get("lib").is_some()
-        || ["bin", "example", "test", "bench"].into_iter().any(|name| {
-            manifest
-                .get(name)
-                .and_then(toml::Value::as_array)
-                .is_some_and(|targets| !targets.is_empty())
-        })
-}
-
 fn cargo_explicit_target_facts(
     manifest: &RustCargoManifestDocument,
     package_name: &str,
     target_configuration_complete: &mut bool,
 ) -> Vec<RustCargoTargetFact> {
     let mut facts = Vec::new();
-    for (table_name, kind) in [
-        ("bin", RustCallerTargetKind::Binary),
-        ("example", RustCallerTargetKind::Example),
-        ("test", RustCallerTargetKind::Test),
-        ("bench", RustCallerTargetKind::Bench),
+    for (table_name, kind, cargo_kind) in [
+        (
+            "bin",
+            RustCallerTargetKind::Binary,
+            RustCargoTargetKind::Binary,
+        ),
+        (
+            "example",
+            RustCallerTargetKind::Example,
+            RustCargoTargetKind::Example,
+        ),
+        (
+            "test",
+            RustCallerTargetKind::Test,
+            RustCargoTargetKind::Test,
+        ),
+        (
+            "bench",
+            RustCallerTargetKind::Bench,
+            RustCargoTargetKind::Bench,
+        ),
     ] {
         let Some(value) = manifest.get(table_name) else {
             continue;
@@ -370,7 +380,7 @@ fn cargo_explicit_target_facts(
                 }
                 None => match target.get("name") {
                     Some(toml::Value::String(name)) => {
-                        inferred_cargo_target_paths(table_name, name, package_name)
+                        inferred_cargo_target_paths(cargo_kind, name, package_name)
                     }
                     Some(_) | None => {
                         *target_configuration_complete = false;
@@ -404,48 +414,14 @@ fn cargo_explicit_target_facts(
     facts
 }
 
-fn inferred_cargo_target_paths(table_name: &str, name: &str, package_name: &str) -> Vec<PathBuf> {
-    if !matches!(
-        Path::new(name).components().collect::<Vec<_>>().as_slice(),
-        [Component::Normal(_)]
-    ) {
-        return Vec::new();
-    }
-    match table_name {
-        "bin" => {
-            let mut paths = Vec::new();
-            if normalize_crate_name(name) == normalize_crate_name(package_name) {
-                paths.push(PathBuf::from("src/main.rs"));
-            }
-            paths.push(Path::new("src/bin").join(name).with_extension("rs"));
-            paths.push(Path::new("src/bin").join(name).join("main.rs"));
-            paths
-        }
-        "example" => vec![
-            Path::new("examples").join(name).with_extension("rs"),
-            Path::new("examples").join(name).join("main.rs"),
-        ],
-        "test" => vec![
-            Path::new("tests").join(name).with_extension("rs"),
-            Path::new("tests").join(name).join("main.rs"),
-        ],
-        "bench" => vec![
-            Path::new("benches").join(name).with_extension("rs"),
-            Path::new("benches").join(name).join("main.rs"),
-        ],
-        _ => unreachable!("explicit Cargo target tables are enumerated above"),
-    }
-}
-
 fn cargo_build_script_fact(
     package: &toml::Value,
     target_configuration_complete: &mut bool,
 ) -> Option<PathBuf> {
-    match package.get("build") {
-        Some(toml::Value::String(path)) => Some(PathBuf::from(path)),
-        Some(toml::Value::Boolean(false)) => None,
-        Some(toml::Value::Boolean(true)) | None => Some(PathBuf::from("build.rs")),
-        Some(_) => {
+    match cargo_build_script_path_state(package.get("build")) {
+        CargoBuildScriptPathState::Path(path) => Some(path),
+        CargoBuildScriptPathState::Disabled => None,
+        CargoBuildScriptPathState::Invalid => {
             *target_configuration_complete = false;
             None
         }
@@ -630,21 +606,32 @@ impl RustSelectedTopologyInput {
     }
 }
 
+fn always_continue_selected_context(_: RustSelectedContextWork) -> bool {
+    true
+}
+
+fn with_always_live_progress<T>(
+    build: impl FnOnce(
+        &mut fn(RustSelectedContextWork) -> bool,
+    ) -> Result<RustSelectedBuildOutcome<T>, String>,
+) -> Result<T, String> {
+    let mut progress: fn(RustSelectedContextWork) -> bool = always_continue_selected_context;
+    match build(&mut progress)? {
+        RustSelectedBuildOutcome::Ready(value) => Ok(value),
+        RustSelectedBuildOutcome::Stopped => {
+            unreachable!("an always-live selected Rust build cannot stop")
+        }
+    }
+}
+
 /// Prepare canonical Rust topology inputs for one or more profiles.
 pub fn prepare_rust_selected_topology_input(
     source_mounts: impl IntoIterator<Item = RustSelectedTopologySourceMount>,
     manifest_mounts: impl IntoIterator<Item = RustSelectedManifestMount>,
 ) -> Result<RustSelectedTopologyInput, String> {
-    let RustSelectedBuildOutcome::Ready(input) =
-        prepare_rust_selected_topology_input_with_progress(
-            source_mounts,
-            manifest_mounts,
-            &mut |_| true,
-        )?
-    else {
-        unreachable!("an always-live selected Rust topology input cannot stop")
-    };
-    Ok(input)
+    with_always_live_progress(|progress| {
+        prepare_rust_selected_topology_input_with_progress(source_mounts, manifest_mounts, progress)
+    })
 }
 
 pub fn prepare_rust_selected_topology_input_with_progress(
@@ -677,27 +664,16 @@ pub fn prepare_rust_selected_topology_input_with_progress(
     else {
         return Ok(RustSelectedBuildOutcome::Stopped);
     };
-    for manifest in manifests.values() {
-        if !progress(RustSelectedContextWork::ScopeNode) {
-            return Ok(RustSelectedBuildOutcome::Stopped);
-        }
-        if manifest.facts.version != RUST_CARGO_MANIFEST_FACT_VERSION {
-            return Err(format!(
-                "unsupported Rust Cargo manifest fact version at {:?}: {}",
-                manifest.relative_path, manifest.facts.version
-            ));
-        }
-    }
-    let mut manifests_by_directory = BTreeMap::new();
-    for path in manifests.keys() {
-        if !progress(RustSelectedContextWork::ScopeNode) {
-            return Ok(RustSelectedBuildOutcome::Stopped);
-        }
-        manifests_by_directory.insert(
-            path.parent().unwrap_or(Path::new("")).to_path_buf(),
-            path.clone(),
-        );
-    }
+    let RustSelectedBuildOutcome::Ready(()) =
+        validate_selected_manifest_facts(&manifests, progress)?
+    else {
+        return Ok(RustSelectedBuildOutcome::Stopped);
+    };
+    let RustSelectedBuildOutcome::Ready(manifests_by_directory) =
+        selected_manifest_directories(&manifests, progress)
+    else {
+        return Ok(RustSelectedBuildOutcome::Stopped);
+    };
     let RustSelectedBuildOutcome::Ready(content_identity) =
         selected_content_identity_bytes(&sources, &manifests, progress)?
     else {
@@ -738,6 +714,41 @@ fn selected_content_identity_bytes(
         bytes.extend_from_slice(mount.content_oid.as_bytes());
     }
     Ok(RustSelectedBuildOutcome::Ready(bytes.into_boxed_slice()))
+}
+
+fn validate_selected_manifest_facts(
+    manifests: &BTreeMap<PathBuf, RustSelectedManifestMount>,
+    progress: &mut impl FnMut(RustSelectedContextWork) -> bool,
+) -> Result<RustSelectedBuildOutcome<()>, String> {
+    for manifest in manifests.values() {
+        if !progress(RustSelectedContextWork::ScopeNode) {
+            return Ok(RustSelectedBuildOutcome::Stopped);
+        }
+        if manifest.facts.version != RUST_CARGO_MANIFEST_FACT_VERSION {
+            return Err(format!(
+                "unsupported Rust Cargo manifest fact version at {:?}: {}",
+                manifest.relative_path, manifest.facts.version
+            ));
+        }
+    }
+    Ok(RustSelectedBuildOutcome::Ready(()))
+}
+
+fn selected_manifest_directories(
+    manifests: &BTreeMap<PathBuf, RustSelectedManifestMount>,
+    progress: &mut impl FnMut(RustSelectedContextWork) -> bool,
+) -> RustSelectedBuildOutcome<BTreeMap<PathBuf, PathBuf>> {
+    let mut manifests_by_directory = BTreeMap::new();
+    for path in manifests.keys() {
+        if !progress(RustSelectedContextWork::ScopeNode) {
+            return RustSelectedBuildOutcome::Stopped;
+        }
+        manifests_by_directory.insert(
+            path.parent().unwrap_or(Path::new("")).to_path_buf(),
+            path.clone(),
+        );
+    }
+    RustSelectedBuildOutcome::Ready(manifests_by_directory)
 }
 
 fn prepare_rust_selected_source_topologies(
@@ -1183,15 +1194,9 @@ pub fn rust_selected_workspace_profiles(
     source_mounts: &[RustSelectedTopologySourceMount],
     manifest_mounts: &[RustSelectedManifestMount],
 ) -> Result<RustSelectedWorkspaceProfiles, String> {
-    let RustSelectedBuildOutcome::Ready(profiles) = rust_selected_workspace_profiles_with_progress(
-        source_mounts,
-        manifest_mounts,
-        &mut |_| true,
-    )?
-    else {
-        unreachable!("an always-live selected workspace profile build cannot stop")
-    };
-    Ok(profiles)
+    with_always_live_progress(|progress| {
+        rust_selected_workspace_profiles_with_progress(source_mounts, manifest_mounts, progress)
+    })
 }
 
 pub fn rust_selected_workspace_profiles_with_progress(
@@ -1214,12 +1219,9 @@ pub fn rust_selected_workspace_profiles_with_progress(
 pub fn rust_selected_workspace_profiles_from_prepared(
     input: &RustSelectedTopologyInput,
 ) -> Result<RustSelectedWorkspaceProfiles, String> {
-    let RustSelectedBuildOutcome::Ready(profiles) =
-        rust_selected_workspace_profiles_from_prepared_with_progress(input, &mut |_| true)?
-    else {
-        unreachable!("an always-live selected Rust workspace profile build cannot stop")
-    };
-    Ok(profiles)
+    with_always_live_progress(|progress| {
+        rust_selected_workspace_profiles_from_prepared_with_progress(input, progress)
+    })
 }
 
 pub fn rust_selected_workspace_profiles_from_prepared_with_progress(
@@ -1259,6 +1261,18 @@ pub fn rust_selected_workspace_profiles_from_prepared_with_progress(
             continue;
         };
         let directory = manifest.relative_path.parent().unwrap_or(Path::new(""));
+        let RustSelectedBuildOutcome::Ready(excluded) =
+            cargo_package_is_excluded_from_selected_workspace(
+                manifest,
+                &input.manifests,
+                progress,
+            )?
+        else {
+            return Ok(RustSelectedBuildOutcome::Stopped);
+        };
+        if excluded && package.edition == RustCargoPackageEdition::Workspace {
+            continue;
+        }
         let RustSelectedBuildOutcome::Ready(edition) =
             effective_cargo_edition(&manifest.relative_path, &input.manifests, progress)?
         else {
@@ -1391,7 +1405,11 @@ fn cargo_automatic_target_enabled(
     edition: RustCargoEdition,
     has_explicit_target: bool,
 ) -> bool {
-    configured.unwrap_or(edition != RustCargoEdition::Rust2015 || !has_explicit_target)
+    cargo_auto_target_enabled(
+        configured,
+        edition == RustCargoEdition::Rust2015,
+        has_explicit_target,
+    )
 }
 
 /// A package's library is `src/lib.rs` in every edition, whatever else the
@@ -1410,7 +1428,8 @@ fn cargo_automatic_target_enabled(
 /// is one `narrow_forward_scope_to_crates` declines to narrow, so those
 /// requests resolved against the whole selection.
 fn cargo_library_target_enabled(package: &RustCargoPackageFact) -> bool {
-    package.automatic_targets.library_explicit || package.automatic_targets.library.unwrap_or(true)
+    package.automatic_targets.library_explicit
+        || cargo_library_autodiscovery_enabled(package.automatic_targets.library)
 }
 
 fn add_selected_target_profiles(
@@ -1493,17 +1512,14 @@ pub fn build_rust_selected_library_context_for_caller(
     manifest_mounts: &[RustSelectedManifestMount],
     caller: &Path,
 ) -> Result<RustSelectedLibraryContextOutcome, String> {
-    let RustSelectedBuildOutcome::Ready(outcome) =
+    with_always_live_progress(|progress| {
         build_rust_selected_library_context_for_caller_with_progress(
             source_mounts,
             manifest_mounts,
             caller,
-            |_| true,
-        )?
-    else {
-        unreachable!("an always-live selected Rust caller build cannot stop")
-    };
-    Ok(outcome)
+            progress,
+        )
+    })
 }
 
 pub fn build_rust_selected_library_context_for_caller_with_progress(
@@ -2216,15 +2232,9 @@ pub fn build_rust_selected_context(
     manifest_mounts: impl IntoIterator<Item = RustSelectedManifestMount>,
     profile: RustCallerTargetProfile,
 ) -> Result<RustSelectedContext, String> {
-    let RustSelectedBuildOutcome::Ready(mut build) = build_rust_selected_context_with_progress(
-        source_mounts,
-        manifest_mounts,
-        profile,
-        &mut |_| true,
-    )?
-    else {
-        unreachable!("an always-live selected Rust context build cannot stop")
-    };
+    let mut build = with_always_live_progress(|progress| {
+        build_rust_selected_context_with_progress(source_mounts, manifest_mounts, profile, progress)
+    })?;
     let dependency_edges = build
         .context
         .dependency_edges
@@ -2271,17 +2281,11 @@ fn build_rust_selected_context_with_progress(
     else {
         return Ok(RustSelectedBuildOutcome::Stopped);
     };
-    for manifest in manifests.values() {
-        if !progress(RustSelectedContextWork::ScopeNode) {
-            return Ok(RustSelectedBuildOutcome::Stopped);
-        }
-        if manifest.facts.version != RUST_CARGO_MANIFEST_FACT_VERSION {
-            return Err(format!(
-                "unsupported Rust Cargo manifest fact version at {:?}: {}",
-                manifest.relative_path, manifest.facts.version
-            ));
-        }
-    }
+    let RustSelectedBuildOutcome::Ready(()) =
+        validate_selected_manifest_facts(&manifests, progress)?
+    else {
+        return Ok(RustSelectedBuildOutcome::Stopped);
+    };
     if !manifests.contains_key(&profile.manifest_path) {
         return Err(format!(
             "caller manifest is absent from selected inventory: {:?}",
@@ -2293,16 +2297,11 @@ fn build_rust_selected_context_with_progress(
     else {
         return Ok(RustSelectedBuildOutcome::Stopped);
     };
-    let mut manifests_by_directory = BTreeMap::new();
-    for path in manifests.keys() {
-        if !progress(RustSelectedContextWork::ScopeNode) {
-            return Ok(RustSelectedBuildOutcome::Stopped);
-        }
-        manifests_by_directory.insert(
-            path.parent().unwrap_or(Path::new("")).to_path_buf(),
-            path.clone(),
-        );
-    }
+    let RustSelectedBuildOutcome::Ready(manifests_by_directory) =
+        selected_manifest_directories(&manifests, progress)
+    else {
+        return Ok(RustSelectedBuildOutcome::Stopped);
+    };
     let RustSelectedBuildOutcome::Ready(source_topologies) =
         prepare_rust_selected_source_topologies(&sources, progress)?
     else {
@@ -2433,6 +2432,9 @@ fn build_rust_selected_context_from_maps_with_progress(
                 .and_then(toml::Value::as_table)
                 .and_then(|dependencies| dependencies.get(&dependency.manifest_name))
                 .expect("every selected Cargo dependency fact retains its source value");
+            // A selected profile is a host profile with no Cargo
+            // configuration input; configured patches reach the persisted
+            // crate rows through `rust_crate_targets`.
             let Some(dependency_directory) = cargo_dependency_directory_with(
                 Path::new(""),
                 directory,
@@ -2440,6 +2442,7 @@ fn build_rust_selected_context_from_maps_with_progress(
                 &dependency.manifest_name,
                 raw_dependency,
                 &cargo_manifests,
+                &RustCargoConfiguration::default(),
                 &mut normalize_selected_path,
             ) else {
                 if let Some(relative_path) = dependency.relative_path.as_deref()
@@ -2484,7 +2487,17 @@ fn build_rust_selected_context_from_maps_with_progress(
                     .insert(dependency.exposed_name.clone());
                 continue;
             }
-            if package.package_name != dependency.package_name {
+            let effective_package_name = cargo_dependency_value(
+                Path::new(""),
+                directory,
+                &manifest.document,
+                &dependency.manifest_name,
+                raw_dependency,
+                &cargo_manifests,
+            )
+            .and_then(|(value, _)| value.get("package").and_then(toml::Value::as_str))
+            .unwrap_or(&dependency.package_name);
+            if package.package_name != effective_package_name {
                 external_dependencies
                     .entry(source_crate_root.clone())
                     .or_default()
@@ -3210,17 +3223,14 @@ pub fn build_rust_selected_topology_context(
     manifest_mounts: impl IntoIterator<Item = RustSelectedManifestMount>,
     profile: RustCallerTargetProfile,
 ) -> Result<RustSelectedContext, String> {
-    let RustSelectedBuildOutcome::Ready(context) =
+    with_always_live_progress(|progress| {
         build_rust_selected_topology_context_with_progress(
             source_mounts,
             manifest_mounts,
             profile,
-            &mut |_| true,
-        )?
-    else {
-        unreachable!("an always-live selected Rust topology build cannot stop")
-    };
-    Ok(context)
+            progress,
+        )
+    })
 }
 
 pub fn build_rust_selected_topology_context_with_progress(
@@ -3245,16 +3255,9 @@ pub fn build_rust_selected_topology_context_from_prepared(
     input: &RustSelectedTopologyInput,
     profile: RustCallerTargetProfile,
 ) -> Result<RustSelectedContext, String> {
-    let RustSelectedBuildOutcome::Ready(context) =
-        build_rust_selected_topology_context_from_prepared_with_progress(
-            input,
-            profile,
-            &mut |_| true,
-        )?
-    else {
-        unreachable!("an always-live selected Rust topology build cannot stop")
-    };
-    Ok(context)
+    with_always_live_progress(|progress| {
+        build_rust_selected_topology_context_from_prepared_with_progress(input, profile, progress)
+    })
 }
 
 pub fn build_rust_selected_topology_context_from_prepared_with_progress(
@@ -4001,6 +4004,57 @@ fn cargo_workspace_claims_package(
         .any(|pattern| cargo_path_pattern_covers(pattern, relative))
 }
 
+/// An excluded package is outside the enclosing workspace, even when its
+/// invalid manifest tries to inherit fields from that workspace. Keep it out
+/// of this workspace's target inventory so one excluded manifest cannot
+/// suppress the valid member topologies.
+fn cargo_package_is_excluded_from_selected_workspace(
+    manifest: &RustSelectedManifestMount,
+    manifests: &BTreeMap<PathBuf, RustSelectedManifestMount>,
+    progress: &mut impl FnMut(RustSelectedContextWork) -> bool,
+) -> Result<RustSelectedBuildOutcome<bool>, String> {
+    let directory = manifest.relative_path.parent().unwrap_or(Path::new(""));
+    let workspace = if let Some(workspace_path) = manifest
+        .facts
+        .package
+        .as_ref()
+        .and_then(|package| package.workspace_path.as_deref())
+    {
+        let directory = normalize_selected_path(directory, workspace_path)
+            .ok_or_else(|| "Cargo package workspace path escapes selected inventory".to_string())?;
+        manifests.get(&directory.join("Cargo.toml"))
+    } else {
+        let mut nearest = None;
+        for (path, candidate) in manifests {
+            if !progress(RustSelectedContextWork::ScopeNode) {
+                return Ok(RustSelectedBuildOutcome::Stopped);
+            }
+            if !candidate.facts.is_workspace {
+                continue;
+            }
+            let workspace_directory = path.parent().unwrap_or(Path::new(""));
+            if directory.starts_with(workspace_directory)
+                && nearest.is_none_or(|(depth, _): (usize, &RustSelectedManifestMount)| {
+                    path.components().count() > depth
+                })
+            {
+                nearest = Some((path.components().count(), candidate));
+            }
+        }
+        nearest.map(|(_, candidate)| candidate)
+    };
+    let Some(workspace) = workspace else {
+        return Ok(RustSelectedBuildOutcome::Ready(false));
+    };
+    Ok(RustSelectedBuildOutcome::Ready(
+        !cargo_workspace_claims_package(
+            workspace.relative_path.parent().unwrap_or(Path::new("")),
+            &workspace.facts,
+            directory,
+        ),
+    ))
+}
+
 /// Whether one Cargo path pattern names `path` or one of its ancestors.
 ///
 /// Cargo matches these entries as globs against workspace-relative directory
@@ -4634,26 +4688,7 @@ fn rust_module_visibility_reaches(
     source_module: &[String],
     declaring_module: &[String],
 ) -> bool {
-    if *visibility == RustVisibility::Public {
-        return true;
-    }
-    if !same_crate {
-        return false;
-    }
-    let scope = match visibility {
-        RustVisibility::Public | RustVisibility::Crate => return true,
-        RustVisibility::Private | RustVisibility::SelfModule => declaring_module,
-        RustVisibility::SuperModule => declaring_module
-            .split_last()
-            .map_or(declaring_module, |(_, parent)| parent),
-        RustVisibility::InPath(path) => {
-            let Some(scope) = resolve_visibility_scope(declaring_module, path) else {
-                return false;
-            };
-            return source_module.starts_with(&scope);
-        }
-    };
-    source_module.starts_with(scope)
+    rust_declaration_visibility_reaches(visibility, same_crate, source_module, declaring_module)
 }
 
 /// Apply terminal Rust item visibility after module-route visibility has been
@@ -4712,12 +4747,7 @@ fn resolve_visibility_scope(declaring_module: &[String], path: &[String]) -> Opt
 }
 
 fn resolution_name(facts: &FileResolutionFacts, name: ResolutionNameId) -> &str {
-    facts
-        .names
-        .get(name.index())
-        .filter(|fact| fact.id == name)
-        .map(|fact| fact.spelling.as_str())
-        .expect("Rust selected root route names an unknown resolution spelling")
+    facts.name(name)
 }
 
 fn selected_resolution_scope_segments(
@@ -5054,42 +5084,108 @@ fn module_candidates(
 }
 
 fn normalize_selected_path(base: &Path, path: &Path) -> Option<PathBuf> {
-    if path.is_absolute() {
-        return None;
-    }
-    let mut normalized = base.to_path_buf();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop().then_some(())?;
-            }
-            Component::Normal(component) => normalized.push(component),
-            Component::RootDir | Component::Prefix(_) => return None,
-        }
-    }
-    Some(normalized)
+    brokk_bifrost_core::path_utils::normalize_relative_path_from(base, path)
 }
 
 #[cfg(test)]
 mod tests {
     use std::fmt::Write as _;
 
+    use brokk_bifrost_test_macros::hardwon;
+
     use super::*;
     use crate::declarations::parse_rust_file;
     use crate::resolution_spike_fixture::M6A_RUST_WORKSPACE_FILES;
 
-    fn test_public_declaration_authority() -> RustSelectedDeclarationAuthority {
-        RustSelectedDeclarationAuthority {
-            source_site: ResolutionSiteId::new(0),
-            declaration: SourceDeclarationId::new(0),
-            crate_root: PathBuf::new(),
-            declaring_module_segments: Box::new([]),
-            visibility: RustVisibility::Public,
+    fn rust_files_below(root: &Path, relative: &Path, files: &mut Vec<PathBuf>) {
+        let mut pending = vec![root.join(relative)];
+        while let Some(path) = pending.pop() {
+            let Ok(metadata) = path.symlink_metadata() else {
+                continue;
+            };
+            if metadata.is_file() {
+                if path.extension().is_some_and(|extension| extension == "rs") {
+                    files.push(
+                        path.strip_prefix(root)
+                            .expect("operator corpus stays below the workspace root")
+                            .to_path_buf(),
+                    );
+                }
+                continue;
+            }
+            if !metadata.is_dir() {
+                continue;
+            }
+            let mut children = std::fs::read_dir(&path)
+                .expect("read operator corpus directory")
+                .map(|entry| entry.expect("read operator corpus entry").path())
+                .collect::<Vec<_>>();
+            children.sort();
+            pending.extend(children.into_iter().rev());
         }
     }
 
+    fn source_mount_from_tree(
+        root: &Path,
+        relative_path: PathBuf,
+        source: &str,
+        tree: &tree_sitter::Tree,
+    ) -> RustSelectedSourceMount {
+        let file = brokk_bifrost_core::analyzer::ProjectFile::new(
+            root.to_path_buf(),
+            relative_path.clone(),
+        );
+        let parsed = parse_rust_file(&file, source, tree);
+        RustSelectedSourceMount {
+            relative_path,
+            content_oid: Oid::hash_object(ObjectType::Blob, source.as_bytes())
+                .expect("hash selected source"),
+            facts: parsed.rust_usage_facts,
+            resolution_facts: parsed.resolution_facts,
+        }
+    }
+
+    fn current_bifrost_package_inputs()
+    -> (Vec<RustSelectedSourceMount>, Vec<RustSelectedManifestMount>) {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("canonical Bifrost workspace root");
+        let manifest_source =
+            std::fs::read_to_string(root.join("Cargo.toml")).expect("read Bifrost root manifest");
+        let manifest = RustSelectedManifestMount::from_source("Cargo.toml", &manifest_source)
+            .expect("parse Bifrost root manifest");
+        let mut paths = Vec::new();
+        for directory in ["src", "tests", "test-support", "examples", "benches"] {
+            rust_files_below(&root, Path::new(directory), &mut paths);
+        }
+        if root.join("build.rs").is_file() {
+            paths.push(PathBuf::from("build.rs"));
+        }
+        paths.retain(|path| !path.starts_with(Path::new("tests/fixtures")));
+        paths.sort();
+        paths.dedup();
+
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("configure Rust parser");
+        let sources = paths
+            .into_iter()
+            .map(|relative_path| {
+                let source = std::fs::read_to_string(root.join(&relative_path))
+                    .unwrap_or_else(|error| panic!("read {relative_path:?}: {error}"));
+                let tree = parser
+                    .parse(&source, None)
+                    .unwrap_or_else(|| panic!("parse {relative_path:?}"));
+                source_mount_from_tree(&root, relative_path, &source, &tree)
+            })
+            .collect();
+        (sources, vec![manifest])
+    }
+
     #[test]
+    #[hardwon("#2767: declaration visibility must use the exact declaring module and crate")]
     fn declaration_visibility_uses_exact_declaring_module_and_crate() {
         let declaring = ["outer".to_string(), "inner".to_string()];
         let descendant = ["outer".to_string(), "inner".to_string(), "leaf".to_string()];
@@ -5146,6 +5242,36 @@ mod tests {
             &foreign,
             &declaring,
         ));
+        assert!(rust_module_visibility_reaches(
+            &RustVisibility::SelfModule,
+            true,
+            &descendant,
+            &declaring,
+        ));
+        assert!(!rust_module_visibility_reaches(
+            &RustVisibility::Private,
+            true,
+            &sibling,
+            &declaring,
+        ));
+        assert!(rust_module_visibility_reaches(
+            &RustVisibility::SuperModule,
+            true,
+            &sibling,
+            &declaring,
+        ));
+        assert!(rust_module_visibility_reaches(
+            &RustVisibility::InPath(vec!["crate".into(), "outer".into()]),
+            true,
+            &descendant,
+            &declaring,
+        ));
+        assert!(!rust_module_visibility_reaches(
+            &RustVisibility::Crate,
+            false,
+            &foreign,
+            &declaring,
+        ));
     }
 
     fn fixture_inputs() -> (Vec<RustSelectedSourceMount>, Vec<RustSelectedManifestMount>) {
@@ -5174,98 +5300,14 @@ mod tests {
             let tree = parser
                 .parse(source, None)
                 .expect("parse selected Rust source");
-            let file =
-                brokk_bifrost_core::analyzer::ProjectFile::new(root.clone(), PathBuf::from(path));
-            let parsed = parse_rust_file(&file, source, &tree);
-            sources.push(RustSelectedSourceMount {
-                relative_path: PathBuf::from(path),
-                content_oid: Oid::hash_object(ObjectType::Blob, source.as_bytes())
-                    .expect("hash selected source"),
-                facts: parsed.rust_usage_facts,
-                resolution_facts: parsed.resolution_facts,
-            });
+            sources.push(source_mount_from_tree(
+                &root,
+                PathBuf::from(path),
+                source,
+                &tree,
+            ));
         }
         (sources, manifests)
-    }
-
-    fn rust_files_below(root: &Path, relative: &Path, files: &mut Vec<PathBuf>) {
-        let mut pending = vec![root.join(relative)];
-        while let Some(path) = pending.pop() {
-            let Ok(metadata) = path.symlink_metadata() else {
-                continue;
-            };
-            if metadata.is_file() {
-                if path.extension().is_some_and(|extension| extension == "rs") {
-                    files.push(
-                        path.strip_prefix(root)
-                            .expect("operator corpus stays below the workspace root")
-                            .to_path_buf(),
-                    );
-                }
-                continue;
-            }
-            if !metadata.is_dir() {
-                continue;
-            }
-            let mut children = std::fs::read_dir(&path)
-                .expect("read operator corpus directory")
-                .map(|entry| entry.expect("read operator corpus entry").path())
-                .collect::<Vec<_>>();
-            children.sort();
-            pending.extend(children.into_iter().rev());
-        }
-    }
-
-    fn current_bifrost_package_inputs()
-    -> (Vec<RustSelectedSourceMount>, Vec<RustSelectedManifestMount>) {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .canonicalize()
-            .expect("canonical Bifrost workspace root");
-        let manifest_source =
-            std::fs::read_to_string(root.join("Cargo.toml")).expect("read Bifrost root manifest");
-        let manifest = RustSelectedManifestMount::from_source("Cargo.toml", &manifest_source)
-            .expect("parse Bifrost root manifest");
-        let mut paths = Vec::new();
-        for directory in ["src", "tests", "test-support", "examples", "benches"] {
-            rust_files_below(&root, Path::new(directory), &mut paths);
-        }
-        if root.join("build.rs").is_file() {
-            paths.push(PathBuf::from("build.rs"));
-        }
-        // These are analyzer input samples read as data by tests, not sources
-        // compiled into one of the package's Cargo targets.
-        paths.retain(|path| !path.starts_with(Path::new("tests/fixtures")));
-        paths.sort();
-        paths.dedup();
-
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .expect("configure Rust parser");
-        let sources = paths
-            .into_iter()
-            .map(|relative_path| {
-                let source = std::fs::read_to_string(root.join(&relative_path))
-                    .unwrap_or_else(|error| panic!("read {relative_path:?}: {error}"));
-                let tree = parser
-                    .parse(&source, None)
-                    .unwrap_or_else(|| panic!("parse {relative_path:?}"));
-                let file = brokk_bifrost_core::analyzer::ProjectFile::new(
-                    root.clone(),
-                    relative_path.clone(),
-                );
-                let parsed = parse_rust_file(&file, &source, &tree);
-                RustSelectedSourceMount {
-                    relative_path,
-                    content_oid: Oid::hash_object(ObjectType::Blob, source.as_bytes())
-                        .expect("hash Bifrost source"),
-                    facts: parsed.rust_usage_facts,
-                    resolution_facts: parsed.resolution_facts,
-                }
-            })
-            .collect();
-        (sources, vec![manifest])
     }
 
     fn profile(left: bool, test: bool) -> RustCallerTargetProfile {
@@ -5326,6 +5368,800 @@ mod tests {
                 facts: source.facts,
             })
             .collect()
+    }
+
+    fn same_crate_profile() -> RustCallerTargetProfile {
+        RustCallerTargetProfile {
+            manifest_path: PathBuf::from("app/Cargo.toml"),
+            target_kind: RustCallerTargetKind::Library,
+            target_root: PathBuf::from("src/lib.rs"),
+            target_triple: "x86_64-unknown-linux-gnu".to_string(),
+            cfg_atoms: BTreeSet::new(),
+            features: BTreeSet::new(),
+            test: false,
+        }
+    }
+
+    #[test]
+    #[hardwon("754457cd8054: detached cfg predicates must match compiled host values")]
+    fn detached_cfg_target_values_follow_the_compiled_host() {
+        use brokk_bifrost_core::analyzer::rust_facts::RustCfgInstruction;
+        let profile = detached_profile_for_source(None, Path::new("scratch.rs")).unwrap();
+        for (key, value) in [
+            ("target_os", std::env::consts::OS),
+            ("target_arch", std::env::consts::ARCH),
+            ("target_family", std::env::consts::FAMILY),
+        ] {
+            let condition = RustCfgCondition::Expression(
+                vec![RustCfgInstruction::KeyValue {
+                    key: key.to_string(),
+                    value: value.to_string(),
+                }]
+                .into_boxed_slice(),
+            );
+            assert_eq!(
+                profile.activation(&condition),
+                RustSelectedActivation::Active
+            );
+            let condition = RustCfgCondition::Expression(
+                vec![RustCfgInstruction::KeyValue {
+                    key: key.to_string(),
+                    value: "nonexistent-target-value".to_string(),
+                }]
+                .into_boxed_slice(),
+            );
+            assert_eq!(
+                profile.activation(&condition),
+                RustSelectedActivation::Inactive
+            );
+        }
+        assert_eq!(
+            profile.activation(&RustCfgCondition::Atom("unix".into())),
+            if cfg!(unix) {
+                RustSelectedActivation::Active
+            } else {
+                RustSelectedActivation::Inactive
+            }
+        );
+        assert_eq!(
+            profile.activation(&RustCfgCondition::Atom("windows".into())),
+            if cfg!(windows) {
+                RustSelectedActivation::Active
+            } else {
+                RustSelectedActivation::Inactive
+            }
+        );
+    }
+
+    #[test]
+    fn selected_workspace_profiles_normalize_library_paths_and_retain_escape_gaps() {
+        let (sources, manifests) = inputs_from_files(&[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[lib]\npath = \"./src/../src/lib.rs\"\n",
+            ),
+            ("src/lib.rs", "pub fn library() {}\n"),
+        ]);
+        let inventory = rust_selected_workspace_profiles(&topology_sources(sources), &manifests)
+            .expect("normalize a contained library target path");
+        assert!(inventory.target_inventory_complete);
+        assert_eq!(inventory.profiles.len(), 2);
+        assert!(
+            inventory
+                .profiles
+                .iter()
+                .all(|profile| profile.target_root == Path::new("src/lib.rs"))
+        );
+
+        let (sources, manifests) = inputs_from_files(&[
+            (
+                "app/Cargo.toml",
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[lib]\npath = \"../shared/src/lib.rs\"\n",
+            ),
+            ("shared/src/lib.rs", "pub fn shared() {}\n"),
+        ]);
+        let inventory = rust_selected_workspace_profiles(&topology_sources(sources), &manifests)
+            .expect("retain an escaping library target boundary");
+        assert!(!inventory.target_inventory_complete);
+        assert!(inventory.profiles.is_empty());
+    }
+
+    #[test]
+    fn module_route_cycles_close_with_a_structured_gap() {
+        const FILES: &[(&str, &str)] = &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"cycle\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            ),
+            ("src/lib.rs", "#[path = \"a.rs\"] pub mod a;\n"),
+            ("src/a.rs", "#[path = \"b.rs\"] pub mod b;\n"),
+            ("src/b.rs", "#[path = \"a.rs\"] pub mod a_again;\n"),
+        ];
+        let (sources, manifests) = inputs_from_files(FILES);
+        let mut profile = same_crate_profile();
+        profile.manifest_path = PathBuf::from("Cargo.toml");
+        let context = build_rust_selected_context(sources, manifests, profile)
+            .expect("close a cyclic path-routed module graph");
+
+        assert_eq!(
+            context.reachable_files,
+            BTreeSet::from([
+                PathBuf::from("src/a.rs"),
+                PathBuf::from("src/b.rs"),
+                PathBuf::from("src/lib.rs"),
+            ])
+        );
+        assert!(context.gaps.iter().any(|gap| {
+            matches!(
+                gap,
+                RustSelectedContextGap::CyclicModuleRoute {
+                    file,
+                    start_byte: _
+                } if file == Path::new("src/b.rs")
+            )
+        }));
+        assert_eq!(context.target_memberships.len(), 3);
+    }
+
+    #[test]
+    fn include_cycles_close_with_a_structured_gap() {
+        const FILES: &[(&str, &str)] = &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"include-cycle\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            ),
+            ("src/lib.rs", "include!(\"shared.rs\");\n"),
+            ("src/shared.rs", "include!(\"lib.rs\");\n"),
+        ];
+        let (sources, manifests) = inputs_from_files(FILES);
+        let mut profile = same_crate_profile();
+        profile.manifest_path = PathBuf::from("Cargo.toml");
+        let context = build_rust_selected_context(sources, manifests, profile)
+            .expect("close a cyclic include graph");
+
+        assert_eq!(
+            context.reachable_files,
+            BTreeSet::from([PathBuf::from("src/lib.rs"), PathBuf::from("src/shared.rs")])
+        );
+        assert_eq!(context.include_splices.len(), 1);
+        assert!(context.gaps.iter().any(|gap| {
+            matches!(
+                gap,
+                RustSelectedContextGap::CyclicInclude {
+                    file,
+                    include_start: _
+                } if file == Path::new("src/shared.rs")
+            )
+        }));
+    }
+
+    #[test]
+    fn shared_include_fan_in_replays_nested_includes_per_host_module() {
+        const FILES: &[(&str, &str)] = &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"include-fan-in\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            ),
+            ("src/lib.rs", "pub mod a;\npub mod b;\n"),
+            ("src/a.rs", "include!(\"shared.rs\");\n"),
+            ("src/b.rs", "include!(\"shared.rs\");\n"),
+            ("src/shared.rs", "include!(\"leaf.rs\");\n"),
+            ("src/leaf.rs", "pub fn leaf() {}\n"),
+        ];
+        let (sources, manifests) = inputs_from_files(FILES);
+        let mut profile = same_crate_profile();
+        profile.manifest_path = PathBuf::from("Cargo.toml");
+        let context = build_rust_selected_context(sources, manifests, profile)
+            .expect("replay a shared nested include for each host module");
+
+        assert!(
+            context.gaps.is_empty(),
+            "unexpected gaps: {:?}",
+            context.gaps
+        );
+        assert_eq!(context.reachable_files.len(), 5);
+        assert_eq!(context.target_memberships.len(), 7);
+        assert_eq!(context.include_splices.len(), 4);
+        assert_eq!(
+            context
+                .include_splices
+                .iter()
+                .map(|splice| (splice.host_file.as_path(), splice.included_file.as_path()))
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                (Path::new("src/a.rs"), Path::new("src/shared.rs")),
+                (Path::new("src/b.rs"), Path::new("src/shared.rs")),
+                (Path::new("src/shared.rs"), Path::new("src/leaf.rs")),
+            ])
+        );
+        assert_eq!(
+            context
+                .include_splices
+                .iter()
+                .filter(|splice| splice.included_file == Path::new("src/leaf.rs"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "bcc6609e373a: An include nested in an inline module inherits that module's selected membership and scope."
+    )]
+    fn include_inside_inline_module_inherits_the_inline_membership() {
+        const FILES: &[(&str, &str)] = &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"inline-include\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub mod outer { include!(\"shared.rs\"); }\n#[cfg(not(test))] mod inactive { include!(\"disabled.rs\"); }\n",
+            ),
+            ("src/shared.rs", "include!(\"leaf.rs\");\n"),
+            ("src/leaf.rs", "pub fn included_target() {}\n"),
+            ("src/disabled.rs", "pub fn disabled_target() {}\n"),
+        ];
+        let (sources, manifests) = inputs_from_files(FILES);
+        let mut profile = same_crate_profile();
+        profile.manifest_path = PathBuf::from("Cargo.toml");
+        let context = build_rust_selected_context(sources, manifests, profile)
+            .expect("build an inline include route");
+
+        assert!(context.reachable_files.contains(Path::new("src/shared.rs")));
+        assert!(
+            !context
+                .reachable_files
+                .contains(Path::new("src/disabled.rs"))
+        );
+        assert!(context.target_memberships.iter().any(|membership| {
+            membership.file == Path::new("src/shared.rs")
+                && membership.module_segments.as_ref() == ["outer"]
+        }));
+        assert!(context.target_memberships.iter().any(|membership| {
+            membership.file == Path::new("src/leaf.rs")
+                && membership.module_segments.as_ref() == ["outer"]
+        }));
+        assert!(context.include_splices.iter().any(|splice| {
+            splice.host_file == Path::new("src/lib.rs")
+                && splice.included_file == Path::new("src/shared.rs")
+                && splice.host_module == "outer"
+        }));
+        assert!(context.include_splices.iter().any(|splice| {
+            splice.host_file == Path::new("src/shared.rs")
+                && splice.included_file == Path::new("src/leaf.rs")
+                && splice.host_module == "outer"
+        }));
+    }
+
+    #[test]
+    fn selected_workspace_profile_progress_stops_atomically_and_retries_exactly() {
+        const FILES: &[(&str, &str)] = &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            ),
+            ("src/lib.rs", "pub fn library() {}\n"),
+            ("src/main.rs", "fn main() {}\n"),
+            ("tests/service.rs", "#[test]\nfn service() {}\n"),
+        ];
+        let (sources, manifests) = inputs_from_files(FILES);
+        let topology_sources = topology_sources(sources);
+        let mut work = 0_usize;
+        let RustSelectedBuildOutcome::Ready(expected) =
+            rust_selected_workspace_profiles_with_progress(
+                &topology_sources,
+                &manifests,
+                &mut |_| {
+                    work += 1;
+                    true
+                },
+            )
+            .expect("measure selected workspace profile enumeration")
+        else {
+            panic!("an always-live measured profile enumeration must complete")
+        };
+        assert!(work > 1);
+
+        let mut remaining = work - 1;
+        let stopped = rust_selected_workspace_profiles_with_progress(
+            &topology_sources,
+            &manifests,
+            &mut |_| {
+                if remaining == 0 {
+                    false
+                } else {
+                    remaining -= 1;
+                    true
+                }
+            },
+        )
+        .expect("stop one unit before workspace profile completion");
+        assert_eq!(stopped, RustSelectedBuildOutcome::Stopped);
+
+        assert_eq!(
+            rust_selected_workspace_profiles(&topology_sources, &manifests)
+                .expect("retry selected workspace profile enumeration"),
+            expected,
+        );
+    }
+
+    #[test]
+    fn topology_build_progress_stops_atomically_and_retries_exactly() {
+        let (sources, manifests) = same_crate_inputs();
+        let topology_sources = topology_sources(sources);
+        let mut work = 0_usize;
+        let RustSelectedBuildOutcome::Ready(expected) =
+            build_rust_selected_topology_context_with_progress(
+                topology_sources.clone(),
+                manifests.clone(),
+                same_crate_profile(),
+                &mut |_| {
+                    work += 1;
+                    true
+                },
+            )
+            .expect("build a measured selected Rust topology")
+        else {
+            panic!("an always-live measured topology build must complete")
+        };
+        assert!(work > 1);
+
+        let mut remaining = work - 1;
+        let stopped = build_rust_selected_topology_context_with_progress(
+            topology_sources.clone(),
+            manifests.clone(),
+            same_crate_profile(),
+            &mut |_| {
+                if remaining == 0 {
+                    false
+                } else {
+                    remaining -= 1;
+                    true
+                }
+            },
+        )
+        .expect("stop one unit before selected Rust topology completion");
+        assert_eq!(stopped, RustSelectedBuildOutcome::Stopped);
+
+        let retried =
+            build_rust_selected_topology_context(topology_sources, manifests, same_crate_profile())
+                .expect("retry the selected Rust topology from fresh inputs");
+        assert_eq!(retried, expected);
+    }
+
+    #[test]
+    fn caller_profile_identity_is_stable_across_a_b_a_and_gates_tests() {
+        let (sources, manifests) = fixture_inputs();
+        let left =
+            build_rust_selected_context(sources.clone(), manifests.clone(), profile(true, false))
+                .expect("build left profile");
+        let right_test =
+            build_rust_selected_context(sources.clone(), manifests.clone(), profile(false, true))
+                .expect("build right test profile");
+        let left_again = build_rust_selected_context(sources, manifests, profile(true, false))
+            .expect("rebuild left profile");
+
+        assert_eq!(left.identity, left_again.identity);
+        assert_eq!(left, left_again);
+        assert_ne!(left.identity, right_test.identity);
+        assert!(
+            right_test
+                .reachable_files
+                .contains(Path::new("app/src/tests.rs"))
+        );
+        let unknown_right = right_test
+            .module_activations
+            .iter()
+            .filter(|module| {
+                module.file == Path::new("app/src/main.rs")
+                    && module.module_name == "selected"
+                    && module.activation == RustSelectedActivation::Unknown
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(unknown_right.len(), 2);
+        for module in unknown_right {
+            assert!(
+                right_test
+                    .gaps
+                    .contains(&RustSelectedContextGap::UnknownActivation {
+                        file: module.file.clone(),
+                        start_byte: module.start_byte,
+                    },)
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_topology_matches_owning_profiles_and_input_permutations() {
+        let (sources, manifests) = fixture_inputs();
+        let topology_sources = topology_sources(sources);
+        let prepared =
+            prepare_rust_selected_topology_input(topology_sources.clone(), manifests.clone())
+                .expect("prepare selected Rust topology input");
+        let permuted = prepare_rust_selected_topology_input(
+            topology_sources.iter().cloned().rev(),
+            manifests.iter().cloned().rev(),
+        )
+        .expect("prepare permuted selected Rust topology input");
+
+        for profile in [profile(true, false), profile(false, true)] {
+            let owning = build_rust_selected_topology_context(
+                topology_sources.clone(),
+                manifests.clone(),
+                profile.clone(),
+            )
+            .expect("build owning selected Rust topology");
+            let expected =
+                build_rust_selected_topology_context_from_prepared(&prepared, profile.clone())
+                    .expect("build prepared selected Rust topology");
+            let permuted_context =
+                build_rust_selected_topology_context_from_prepared(&permuted, profile)
+                    .expect("build permuted prepared selected Rust topology");
+            assert_eq!(owning, expected);
+            assert_eq!(expected, permuted_context);
+        }
+    }
+
+    #[test]
+    fn unknown_cfg_is_incomplete_instead_of_inactive() {
+        let (mut sources, manifests) = fixture_inputs();
+        let main = sources
+            .iter_mut()
+            .find(|mount| mount.relative_path == Path::new("app/src/main.rs"))
+            .expect("app main mount");
+        let selected = main
+            .facts
+            .modules
+            .iter_mut()
+            .find(|module| module.module_name == "selected")
+            .expect("selected module");
+        selected.cfg_condition = RustCfgCondition::Unknown;
+        let selected_start = selected.start_byte;
+
+        let context = build_rust_selected_context(sources, manifests, profile(true, false))
+            .expect("build incomplete selected context");
+        assert!(
+            context
+                .gaps
+                .contains(&RustSelectedContextGap::UnknownActivation {
+                    file: PathBuf::from("app/src/main.rs"),
+                    start_byte: selected_start,
+                })
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "7bef2103a255: Parsed feature-gated source remains possible membership while only its uncertain module route is marked incomplete."
+    )]
+    fn feature_gated_module_is_owned_with_a_route_local_activation_gap() {
+        let (sources, manifests) = inputs_from_files(&[
+            (
+                "Cargo.toml",
+                concat!(
+                    "[package]\n",
+                    "name = \"app\"\n",
+                    "version = \"0.1.0\"\n",
+                    "edition = \"2024\"\n",
+                    "\n",
+                    "[features]\n",
+                    "gated = []\n",
+                ),
+            ),
+            (
+                "src/lib.rs",
+                "#[cfg(feature = \"gated\")]\nmod gated;\nmod always;\n",
+            ),
+            ("src/gated.rs", "pub fn gated() {}\n"),
+            ("src/always.rs", "pub fn always() {}\n"),
+        ]);
+        let gated_start = sources
+            .iter()
+            .find(|source| source.relative_path == Path::new("src/lib.rs"))
+            .expect("library source facts")
+            .facts
+            .module_routes
+            .routes
+            .iter()
+            .find(|route| route.module_name == "gated")
+            .expect("feature-gated module route")
+            .declaration_start;
+        let inventory =
+            rust_selected_workspace_profiles(&topology_sources(sources.clone()), &manifests)
+                .expect("feature declarations do not make target enumeration incomplete");
+        assert!(inventory.target_inventory_complete);
+        let profile = inventory
+            .profiles
+            .iter()
+            .find(|profile| profile.target_kind == RustCallerTargetKind::Library && !profile.test)
+            .expect("normal library profile");
+        let context = build_rust_selected_context(sources, manifests, profile.clone())
+            .expect("build a feature-uncertain target context");
+
+        assert_eq!(
+            context.gaps,
+            BTreeSet::from([RustSelectedContextGap::UnknownActivation {
+                file: PathBuf::from("src/lib.rs"),
+                start_byte: gated_start,
+            }]),
+        );
+        for target in [Path::new("src/gated.rs"), Path::new("src/always.rs")] {
+            assert!(
+                context
+                    .target_memberships
+                    .iter()
+                    .any(|membership| membership.file == target),
+                "possible module route must retain ownership for {target:?}",
+            );
+            assert!(
+                context
+                    .module_edges
+                    .iter()
+                    .any(|edge| edge.target_file == target),
+                "possible module route must retain its structured edge for {target:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn selected_inventory_not_live_existence_decides_module_and_include_reachability() {
+        let (mut sources, manifests) = fixture_inputs();
+        sources.retain(|mount| {
+            mount.relative_path != Path::new("engine/src/model.rs")
+                && mount.relative_path != Path::new("app/src/included.rs")
+        });
+
+        let context = build_rust_selected_context(sources, manifests, profile(true, false))
+            .expect("build inventory-limited context");
+        assert!(
+            !context
+                .reachable_files
+                .contains(Path::new("engine/src/model.rs"))
+        );
+        assert!(
+            !context
+                .reachable_files
+                .contains(Path::new("app/src/included.rs"))
+        );
+        assert!(
+            context
+                .module_edges
+                .iter()
+                .all(|edge| { edge.target_file != Path::new("engine/src/model.rs") })
+        );
+        assert!(context.include_splices.is_empty());
+        assert!(context.gaps.iter().any(|gap| matches!(
+            gap,
+            RustSelectedContextGap::UnsupportedMacroGeneratedModule { file, .. }
+                if file == Path::new("app/src/main.rs")
+        )));
+    }
+
+    #[test]
+    fn dependency_module_bridge_requires_every_crossed_module_to_be_public() {
+        let (mut sources, manifests) = fixture_inputs();
+        let engine = sources
+            .iter_mut()
+            .find(|mount| mount.relative_path == Path::new("engine/src/lib.rs"))
+            .expect("engine root mount");
+        let model = engine
+            .facts
+            .module_routes
+            .routes
+            .iter_mut()
+            .find(|route| route.module_name == "model")
+            .expect("engine model route");
+        model.visibility = RustVisibility::Private;
+
+        let context = build_rust_selected_context(sources, manifests, profile(true, false))
+            .expect("build selected context with private dependency module");
+        assert!(
+            context
+                .root_bridges
+                .iter()
+                .all(|bridge| bridge.source_name != "DirectWidget")
+        );
+        assert!(context.root_bridges.iter().any(|bridge| {
+            bridge.source_name == "direct_value"
+                && bridge.target_file == Path::new("engine/src/lib.rs")
+        }));
+        assert!(context.root_bridges.iter().any(|bridge| {
+            bridge.source_name == "WidgetAlias"
+                && bridge.target_file == Path::new("engine/src/model.rs")
+                && bridge.namespace == ResolutionNamespace::Type
+        }));
+    }
+
+    #[test]
+    fn named_reexport_cycles_fail_closed() {
+        const FILES: &[(&str, &str)] = &[
+            (
+                "app/Cargo.toml",
+                concat!(
+                    "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+                    "[dependencies]\nengine = { path = \"../engine\" }\n",
+                ),
+            ),
+            (
+                "engine/Cargo.toml",
+                "[package]\nname = \"engine\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            ),
+            ("app/src/main.rs", "use engine::PublicItem as Item;\n"),
+            (
+                "engine/src/lib.rs",
+                "mod left;\nmod right;\npub use left::Item as PublicItem;\n",
+            ),
+            ("engine/src/left.rs", "pub use crate::right::Item;\n"),
+            ("engine/src/right.rs", "pub use crate::left::Item;\n"),
+        ];
+        let (sources, manifests) = inputs_from_files(FILES);
+        let context = build_rust_selected_context(sources, manifests, profile(false, false))
+            .expect("build cyclic named-reexport context");
+        assert!(context.root_bridges.is_empty());
+    }
+
+    #[test]
+    fn rust_2015_dependency_needs_an_explicit_extern_crate_route() {
+        let (sources, mut manifests) = fixture_inputs();
+        manifests
+            .iter_mut()
+            .find(|mount| mount.relative_path == Path::new("app/Cargo.toml"))
+            .and_then(|mount| mount.facts.package.as_mut())
+            .expect("app package facts")
+            .edition = RustCargoPackageEdition::Explicit(RustCargoEdition::Rust2015);
+
+        let context = build_rust_selected_context(sources, manifests, profile(true, false))
+            .expect("build Rust 2015 dependency context");
+        assert!(context.root_bridges.is_empty());
+    }
+
+    #[test]
+    fn rust_2015_unprefixed_use_starts_at_the_selected_crate_root() {
+        const FILES: &[(&str, &str)] = &[
+            (
+                "app/Cargo.toml",
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+            ),
+            ("app/src/lib.rs", "mod root_item;\nmod consumer;\n"),
+            (
+                "app/src/root_item.rs",
+                "pub struct Item { pub value: () }\n",
+            ),
+            ("app/src/consumer.rs", "use root_item::Item as RootItem;\n"),
+        ];
+        let (sources, manifests) = inputs_from_files(FILES);
+        let context = build_rust_selected_context(sources, manifests, same_crate_profile())
+            .expect("build Rust 2015 selected context");
+        let bridges = context
+            .root_bridges
+            .iter()
+            .filter(|bridge| bridge.source_name == "RootItem")
+            .collect::<Vec<_>>();
+        assert_eq!(bridges.len(), 1);
+        assert!(bridges.iter().all(|bridge| {
+            bridge.source_file == Path::new("app/src/consumer.rs")
+                && bridge.target_file == Path::new("app/src/root_item.rs")
+                && bridge.route.as_ref() == ["root_item"]
+                && bridge.namespace == ResolutionNamespace::Type
+        }));
+    }
+
+    #[test]
+    fn modern_local_module_shadows_a_same_named_dependency() {
+        const FILES: &[(&str, &str)] = &[
+            (
+                "app/Cargo.toml",
+                concat!(
+                    "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+                    "edition = \"2024\"\n",
+                    "[dependencies]\nengine = { path = \"../engine\" }\n",
+                ),
+            ),
+            (
+                "engine/Cargo.toml",
+                "[package]\nname = \"engine\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            ),
+            (
+                "app/src/lib.rs",
+                "mod engine;\nuse engine::Item as SelectedItem;\n",
+            ),
+            ("app/src/engine.rs", "pub struct Item { pub value: () }\n"),
+            ("engine/src/lib.rs", "pub struct Item { pub value: () }\n"),
+        ];
+        let (sources, manifests) = inputs_from_files(FILES);
+        let context = build_rust_selected_context(sources, manifests, same_crate_profile())
+            .expect("build local-shadow selected context");
+        let bridges = context
+            .root_bridges
+            .iter()
+            .filter(|bridge| bridge.source_name == "SelectedItem")
+            .collect::<Vec<_>>();
+        assert_eq!(bridges.len(), 1);
+        assert!(bridges.iter().all(|bridge| {
+            bridge.target_file == Path::new("app/src/engine.rs")
+                && bridge.namespace == ResolutionNamespace::Type
+        }));
+    }
+
+    #[test]
+    fn modern_absolute_route_bypasses_a_same_named_local_module() {
+        const FILES: &[(&str, &str)] = &[
+            (
+                "app/Cargo.toml",
+                concat!(
+                    "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+                    "edition = \"2024\"\n",
+                    "[dependencies]\nengine = { path = \"../engine\" }\n",
+                ),
+            ),
+            (
+                "engine/Cargo.toml",
+                "[package]\nname = \"engine\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            ),
+            (
+                "app/src/lib.rs",
+                "mod engine;\nuse ::engine::Item as ExternalItem;\n",
+            ),
+            ("app/src/engine.rs", "pub struct Item;\n"),
+            ("engine/src/lib.rs", "pub struct Item;\n"),
+        ];
+        let (sources, manifests) = inputs_from_files(FILES);
+        let context = build_rust_selected_topology_context(
+            topology_sources(sources),
+            manifests,
+            same_crate_profile(),
+        )
+        .expect("build modern absolute selected context");
+        assert!(context.root_routes.iter().any(|route| {
+            route.route == "engine"
+                && route.anchor == ResolutionRootImportAnchor::Absolute
+                && route.local_name.as_deref() == Some("ExternalItem")
+        }));
+        let source = context
+            .target_memberships
+            .iter()
+            .find(|membership| {
+                membership.crate_root == Path::new("app/src/lib.rs")
+                    && membership.file == Path::new("app/src/lib.rs")
+                    && membership.module_segments.is_empty()
+            })
+            .expect("app crate root membership");
+        let imports = BTreeSet::new();
+        let exports = BTreeSet::new();
+        let mut progress = |_| true;
+        let absolute = selected_topology_import_targets(
+            &context,
+            source,
+            &imports,
+            &exports,
+            &["engine"],
+            ResolutionRootImportAnchor::Absolute,
+            &mut progress,
+        );
+        assert_eq!(
+            absolute,
+            RustSelectedBuildOutcome::Ready(vec![RustSelectedImportTarget {
+                crate_root: PathBuf::from("engine/src/lib.rs"),
+                module_segments: Box::new([]),
+            }])
+        );
+        let bare = selected_topology_import_targets(
+            &context,
+            source,
+            &imports,
+            &exports,
+            &["engine"],
+            ResolutionRootImportAnchor::Lexical,
+            &mut progress,
+        );
+        assert_eq!(
+            bare,
+            RustSelectedBuildOutcome::Ready(vec![RustSelectedImportTarget {
+                crate_root: PathBuf::from("app/src/lib.rs"),
+                module_segments: vec!["engine".to_string()].into_boxed_slice(),
+            }])
+        );
     }
 
     #[test]
@@ -5443,18 +6279,6 @@ mod tests {
         }
     }
 
-    fn same_crate_profile() -> RustCallerTargetProfile {
-        RustCallerTargetProfile {
-            manifest_path: PathBuf::from("app/Cargo.toml"),
-            target_kind: RustCallerTargetKind::Library,
-            target_root: PathBuf::from("src/lib.rs"),
-            target_triple: "x86_64-unknown-linux-gnu".to_string(),
-            cfg_atoms: BTreeSet::new(),
-            features: BTreeSet::new(),
-            test: false,
-        }
-    }
-
     #[test]
     fn workspace_inherited_edition_accepts_nonvirtual_workspace_root() {
         const FILES: &[(&str, &str)] = &[
@@ -5513,56 +6337,6 @@ mod tests {
                 "{predicate}: {condition:?}"
             );
         }
-    }
-
-    #[test]
-    fn detached_cfg_target_values_follow_the_compiled_host() {
-        use brokk_bifrost_core::analyzer::rust_facts::RustCfgInstruction;
-        let profile = detached_profile_for_source(None, Path::new("scratch.rs")).unwrap();
-        for (key, value) in [
-            ("target_os", std::env::consts::OS),
-            ("target_arch", std::env::consts::ARCH),
-            ("target_family", std::env::consts::FAMILY),
-        ] {
-            let condition = RustCfgCondition::Expression(
-                vec![RustCfgInstruction::KeyValue {
-                    key: key.to_string(),
-                    value: value.to_string(),
-                }]
-                .into_boxed_slice(),
-            );
-            assert_eq!(
-                profile.activation(&condition),
-                RustSelectedActivation::Active
-            );
-            let condition = RustCfgCondition::Expression(
-                vec![RustCfgInstruction::KeyValue {
-                    key: key.to_string(),
-                    value: "nonexistent-target-value".to_string(),
-                }]
-                .into_boxed_slice(),
-            );
-            assert_eq!(
-                profile.activation(&condition),
-                RustSelectedActivation::Inactive
-            );
-        }
-        assert_eq!(
-            profile.activation(&RustCfgCondition::Atom("unix".into())),
-            if cfg!(unix) {
-                RustSelectedActivation::Active
-            } else {
-                RustSelectedActivation::Inactive
-            }
-        );
-        assert_eq!(
-            profile.activation(&RustCfgCondition::Atom("windows".into())),
-            if cfg!(windows) {
-                RustSelectedActivation::Active
-            } else {
-                RustSelectedActivation::Inactive
-            }
-        );
     }
 
     #[test]
@@ -5634,49 +6408,6 @@ mod tests {
             .expect("reject a non-library caller"),
             RustSelectedLibraryContextOutcome::Unavailable
         ));
-    }
-
-    #[test]
-    fn a_manifest_less_rust_file_resolves_as_a_detached_crate_root() {
-        const FILES: &[(&str, &str)] = &[
-            ("loose/app.rs", "mod helper;\npub struct Item;\n"),
-            ("loose/helper.rs", "pub struct Helper;\n"),
-        ];
-        let (sources, manifests) = inputs_from_files(FILES);
-        let topology = topology_sources(sources);
-        let outcome = build_rust_selected_library_context_for_caller(
-            &topology,
-            &manifests,
-            Path::new("loose/app.rs"),
-        )
-        .expect("derive a detached selected caller context");
-        let RustSelectedLibraryContextOutcome::Ready(context) = outcome else {
-            panic!("a Rust file no manifest encloses is its own detached crate root")
-        };
-        assert_eq!(
-            context.target_roots,
-            BTreeSet::from([PathBuf::from("loose/app.rs")])
-        );
-        assert_eq!(
-            context.reachable_files,
-            BTreeSet::from([
-                PathBuf::from("loose/app.rs"),
-                PathBuf::from("loose/helper.rs")
-            ])
-        );
-        assert!(context.dependency_edges.is_empty());
-        for file in ["loose/app.rs", "loose/helper.rs"] {
-            assert!(
-                context.target_memberships.iter().any(|membership| {
-                    membership.crate_root == Path::new("loose/app.rs")
-                        && membership.file == Path::new(file)
-                        && membership.edition == DETACHED_DEFAULT_EDITION
-                }),
-                "{file} is a module of the detached root: {:?}",
-                context.target_memberships
-            );
-        }
-        assert!(context.gaps.is_empty(), "{:?}", context.gaps);
     }
 
     #[test]
@@ -5755,7 +6486,8 @@ mod tests {
     }
 
     #[test]
-    fn an_excluded_package_cannot_inherit_the_enclosing_workspace_edition() {
+    #[hardwon("#4460: an excluded manifest disabled valid workspace Cargo topology")]
+    fn an_excluded_package_manifest_does_not_poison_workspace_profiles() {
         const FILES: &[(&str, &str)] = &[
             (
                 "Cargo.toml",
@@ -5768,17 +6500,43 @@ mod tests {
                 ),
             ),
             (
+                "crates/app/Cargo.toml",
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition.workspace = true\n",
+            ),
+            ("crates/app/src/lib.rs", "pub fn member() {}\n"),
+            (
                 "vendor/app/Cargo.toml",
                 "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition.workspace = true\n",
             ),
             ("vendor/app/src/lib.rs", "pub fn vendored() {}\n"),
         ];
         let (sources, manifests) = inputs_from_files(FILES);
-        let error = rust_selected_workspace_profiles(&topology_sources(sources), &manifests)
-            .expect_err("an excluded package has no workspace to inherit from");
+        let inventory = rust_selected_workspace_profiles(&topology_sources(sources), &manifests)
+            .expect("an excluded package is outside this workspace's target inventory");
         assert!(
-            error.contains("has no selected workspace") && error.contains("vendor/app/Cargo.toml"),
-            "{error}"
+            inventory.target_inventory_complete,
+            "the excluded package cannot make valid workspace targets incomplete: {inventory:#?}"
+        );
+        assert!(
+            inventory.profiles.iter().all(|profile| {
+                profile.manifest_path == Path::new("crates/app/Cargo.toml")
+                    && profile.target_root == Path::new("src/lib.rs")
+            }),
+            "{inventory:#?}"
+        );
+        assert!(
+            inventory.profiles.iter().any(|profile| {
+                profile.manifest_path == Path::new("crates/app/Cargo.toml")
+                    && profile.target_kind == RustCallerTargetKind::Library
+            }),
+            "the selected workspace member retains its Cargo profile: {inventory:#?}"
+        );
+        assert!(
+            inventory
+                .profiles
+                .iter()
+                .all(|profile| { profile.manifest_path != Path::new("vendor/app/Cargo.toml") }),
+            "excluded package must not inherit the workspace's edition: {inventory:#?}"
         );
     }
 
@@ -6266,15 +7024,8 @@ mod tests {
         assert!(unowned_sources.is_empty());
     }
 
-    /// Corrected 2026-09-22 (measured against Cargo 1.96, not read from the
-    /// documentation): a package with `edition = "2015"`, an explicit
-    /// `[[bin]] path = "src/cli.rs"` and both `src/lib.rs` and `src/main.rs`
-    /// present reports `[legacy: lib (lib.rs), legacy-cli: bin (cli.rs)]` under
-    /// `cargo metadata --no-deps`. The legacy 2015 rule drops the implicit
-    /// binary and leaves the library, so an inherited 2015 edition with a
-    /// manual target keeps the implicit library everywhere, and this test now
-    /// pins that. It previously pinned the opposite.
     #[test]
+    #[hardwon("792ad0e50bce: an explicit Rust 2015 binary suppressed the implicit library target")]
     fn inherited_rust_2015_explicit_target_keeps_implicit_library_everywhere() {
         let (sources, manifests) = inputs_from_files(&[
             (
@@ -6443,76 +7194,6 @@ mod tests {
     }
 
     #[test]
-    fn selected_workspace_profiles_normalize_library_paths_and_retain_escape_gaps() {
-        let (sources, manifests) = inputs_from_files(&[
-            (
-                "Cargo.toml",
-                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[lib]\npath = \"./src/../src/lib.rs\"\n",
-            ),
-            ("src/lib.rs", "pub fn library() {}\n"),
-        ]);
-        let inventory = rust_selected_workspace_profiles(&topology_sources(sources), &manifests)
-            .expect("normalize a contained library target path");
-        assert!(inventory.target_inventory_complete);
-        assert_eq!(inventory.profiles.len(), 2);
-        assert!(
-            inventory
-                .profiles
-                .iter()
-                .all(|profile| profile.target_root == Path::new("src/lib.rs"))
-        );
-
-        let (sources, manifests) = inputs_from_files(&[
-            (
-                "app/Cargo.toml",
-                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[lib]\npath = \"../shared/src/lib.rs\"\n",
-            ),
-            ("shared/src/lib.rs", "pub fn shared() {}\n"),
-        ]);
-        let inventory = rust_selected_workspace_profiles(&topology_sources(sources), &manifests)
-            .expect("retain an escaping library target boundary");
-        assert!(!inventory.target_inventory_complete);
-        assert!(inventory.profiles.is_empty());
-    }
-
-    #[test]
-    fn module_route_cycles_close_with_a_structured_gap() {
-        const FILES: &[(&str, &str)] = &[
-            (
-                "Cargo.toml",
-                "[package]\nname = \"cycle\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-            ),
-            ("src/lib.rs", "#[path = \"a.rs\"] pub mod a;\n"),
-            ("src/a.rs", "#[path = \"b.rs\"] pub mod b;\n"),
-            ("src/b.rs", "#[path = \"a.rs\"] pub mod a_again;\n"),
-        ];
-        let (sources, manifests) = inputs_from_files(FILES);
-        let mut profile = same_crate_profile();
-        profile.manifest_path = PathBuf::from("Cargo.toml");
-        let context = build_rust_selected_context(sources, manifests, profile)
-            .expect("close a cyclic path-routed module graph");
-
-        assert_eq!(
-            context.reachable_files,
-            BTreeSet::from([
-                PathBuf::from("src/a.rs"),
-                PathBuf::from("src/b.rs"),
-                PathBuf::from("src/lib.rs"),
-            ])
-        );
-        assert!(context.gaps.iter().any(|gap| {
-            matches!(
-                gap,
-                RustSelectedContextGap::CyclicModuleRoute {
-                    file,
-                    start_byte: _
-                } if file == Path::new("src/b.rs")
-            )
-        }));
-        assert_eq!(context.target_memberships.len(), 3);
-    }
-
-    #[test]
     fn external_module_nested_in_inline_scope_preserves_qualified_route() {
         const FILES: &[(&str, &str)] = &[
             (
@@ -6659,216 +7340,6 @@ mod tests {
     }
 
     #[test]
-    fn present_include_preserves_the_host_module_route() {
-        let (sources, manifests) = inputs_from_files(&[
-            (
-                "Cargo.toml",
-                "[package]\nname = \"include-present\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-            ),
-            (
-                "src/lib.rs",
-                "pub mod api { include!(\"generated.rs\"); }\n",
-            ),
-            ("src/generated.rs", "pub fn generated() {}\n"),
-        ]);
-        let mut profile = same_crate_profile();
-        profile.manifest_path = PathBuf::from("Cargo.toml");
-        let context = build_rust_selected_context(sources, manifests, profile)
-            .expect("build context with a present expansion");
-
-        assert!(context.gaps.is_empty(), "{:?}", context.gaps);
-        assert_eq!(context.include_splices.len(), 1);
-        let splice = &context.include_splices[0];
-        assert_eq!(splice.host_file, Path::new("src/lib.rs"));
-        assert_eq!(splice.included_file, Path::new("src/generated.rs"));
-        assert_eq!(splice.host_module, "api");
-        assert!(context.target_memberships.iter().any(|membership| {
-            membership.file == Path::new("src/generated.rs")
-                && membership.module_segments.as_ref() == ["api"]
-        }));
-    }
-
-    #[test]
-    fn include_cycles_close_with_a_structured_gap() {
-        const FILES: &[(&str, &str)] = &[
-            (
-                "Cargo.toml",
-                "[package]\nname = \"include-cycle\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-            ),
-            ("src/lib.rs", "include!(\"shared.rs\");\n"),
-            ("src/shared.rs", "include!(\"lib.rs\");\n"),
-        ];
-        let (sources, manifests) = inputs_from_files(FILES);
-        let mut profile = same_crate_profile();
-        profile.manifest_path = PathBuf::from("Cargo.toml");
-        let context = build_rust_selected_context(sources, manifests, profile)
-            .expect("close a cyclic include graph");
-
-        assert_eq!(
-            context.reachable_files,
-            BTreeSet::from([PathBuf::from("src/lib.rs"), PathBuf::from("src/shared.rs")])
-        );
-        assert_eq!(context.include_splices.len(), 1);
-        assert!(context.gaps.iter().any(|gap| {
-            matches!(
-                gap,
-                RustSelectedContextGap::CyclicInclude {
-                    file,
-                    include_start: _
-                } if file == Path::new("src/shared.rs")
-            )
-        }));
-    }
-
-    #[test]
-    fn shared_include_fan_in_replays_nested_includes_per_host_module() {
-        const FILES: &[(&str, &str)] = &[
-            (
-                "Cargo.toml",
-                "[package]\nname = \"include-fan-in\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-            ),
-            ("src/lib.rs", "pub mod a;\npub mod b;\n"),
-            ("src/a.rs", "include!(\"shared.rs\");\n"),
-            ("src/b.rs", "include!(\"shared.rs\");\n"),
-            ("src/shared.rs", "include!(\"leaf.rs\");\n"),
-            ("src/leaf.rs", "pub fn leaf() {}\n"),
-        ];
-        let (sources, manifests) = inputs_from_files(FILES);
-        let mut profile = same_crate_profile();
-        profile.manifest_path = PathBuf::from("Cargo.toml");
-        let context = build_rust_selected_context(sources, manifests, profile)
-            .expect("replay a shared nested include for each host module");
-
-        assert!(
-            context.gaps.is_empty(),
-            "unexpected gaps: {:?}",
-            context.gaps
-        );
-        assert_eq!(context.reachable_files.len(), 5);
-        assert_eq!(context.target_memberships.len(), 7);
-        assert_eq!(context.include_splices.len(), 4);
-        assert_eq!(
-            context
-                .include_splices
-                .iter()
-                .map(|splice| (splice.host_file.as_path(), splice.included_file.as_path()))
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from([
-                (Path::new("src/a.rs"), Path::new("src/shared.rs")),
-                (Path::new("src/b.rs"), Path::new("src/shared.rs")),
-                (Path::new("src/shared.rs"), Path::new("src/leaf.rs")),
-            ])
-        );
-        assert_eq!(
-            context
-                .include_splices
-                .iter()
-                .filter(|splice| splice.included_file == Path::new("src/leaf.rs"))
-                .count(),
-            2
-        );
-    }
-
-    #[test]
-    fn include_inside_inline_module_inherits_the_inline_membership() {
-        const FILES: &[(&str, &str)] = &[
-            (
-                "Cargo.toml",
-                "[package]\nname = \"inline-include\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-            ),
-            (
-                "src/lib.rs",
-                "pub mod outer { include!(\"shared.rs\"); }\n#[cfg(not(test))] mod inactive { include!(\"disabled.rs\"); }\n",
-            ),
-            ("src/shared.rs", "include!(\"leaf.rs\");\n"),
-            ("src/leaf.rs", "pub fn included_target() {}\n"),
-            ("src/disabled.rs", "pub fn disabled_target() {}\n"),
-        ];
-        let (sources, manifests) = inputs_from_files(FILES);
-        let mut profile = same_crate_profile();
-        profile.manifest_path = PathBuf::from("Cargo.toml");
-        let context = build_rust_selected_context(sources, manifests, profile)
-            .expect("build an inline include route");
-
-        assert!(context.reachable_files.contains(Path::new("src/shared.rs")));
-        assert!(
-            !context
-                .reachable_files
-                .contains(Path::new("src/disabled.rs"))
-        );
-        assert!(context.target_memberships.iter().any(|membership| {
-            membership.file == Path::new("src/shared.rs")
-                && membership.module_segments.as_ref() == ["outer"]
-        }));
-        assert!(context.target_memberships.iter().any(|membership| {
-            membership.file == Path::new("src/leaf.rs")
-                && membership.module_segments.as_ref() == ["outer"]
-        }));
-        assert!(context.include_splices.iter().any(|splice| {
-            splice.host_file == Path::new("src/lib.rs")
-                && splice.included_file == Path::new("src/shared.rs")
-                && splice.host_module == "outer"
-        }));
-        assert!(context.include_splices.iter().any(|splice| {
-            splice.host_file == Path::new("src/shared.rs")
-                && splice.included_file == Path::new("src/leaf.rs")
-                && splice.host_module == "outer"
-        }));
-    }
-
-    #[test]
-    fn selected_workspace_profile_progress_stops_atomically_and_retries_exactly() {
-        const FILES: &[(&str, &str)] = &[
-            (
-                "Cargo.toml",
-                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-            ),
-            ("src/lib.rs", "pub fn library() {}\n"),
-            ("src/main.rs", "fn main() {}\n"),
-            ("tests/service.rs", "#[test]\nfn service() {}\n"),
-        ];
-        let (sources, manifests) = inputs_from_files(FILES);
-        let topology_sources = topology_sources(sources);
-        let mut work = 0_usize;
-        let RustSelectedBuildOutcome::Ready(expected) =
-            rust_selected_workspace_profiles_with_progress(
-                &topology_sources,
-                &manifests,
-                &mut |_| {
-                    work += 1;
-                    true
-                },
-            )
-            .expect("measure selected workspace profile enumeration")
-        else {
-            panic!("an always-live measured profile enumeration must complete")
-        };
-        assert!(work > 1);
-
-        let mut remaining = work - 1;
-        let stopped = rust_selected_workspace_profiles_with_progress(
-            &topology_sources,
-            &manifests,
-            &mut |_| {
-                if remaining == 0 {
-                    false
-                } else {
-                    remaining -= 1;
-                    true
-                }
-            },
-        )
-        .expect("stop one unit before workspace profile completion");
-        assert_eq!(stopped, RustSelectedBuildOutcome::Stopped);
-
-        assert_eq!(
-            rust_selected_workspace_profiles(&topology_sources, &manifests)
-                .expect("retry selected workspace profile enumeration"),
-            expected,
-        );
-    }
-
-    #[test]
     fn integration_target_imports_its_same_package_library() {
         const FILES: &[(&str, &str)] = &[
             (
@@ -6915,6 +7386,79 @@ mod tests {
             context.gaps.is_empty(),
             "unexpected gaps: {:?}",
             context.gaps
+        );
+    }
+
+    #[test]
+    #[hardwon("#4460: an inherited renamed workspace dependency lost its backend crate route")]
+    fn inherited_renamed_workspace_dependency_routes_nested_backend_types() {
+        const FILES: &[(&str, &str)] = &[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"app\", \"candle-core\"]\nresolver = \"2\"\n[workspace.dependencies]\ncandle = { package = \"candle-core\", path = \"candle-core\" }\n",
+            ),
+            (
+                "app/Cargo.toml",
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\ncandle = { workspace = true }\n",
+            ),
+            (
+                "candle-core/Cargo.toml",
+                "[package]\nname = \"candle-core\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            (
+                "app/src/lib.rs",
+                "use candle::npy::NpzTensors;\npub fn caller(_: NpzTensors) {}\n",
+            ),
+            ("candle-core/src/lib.rs", "pub mod npy;\n"),
+            ("candle-core/src/npy.rs", "pub struct NpzTensors;\n"),
+        ];
+        let (sources, manifests) = inputs_from_files(FILES);
+        let topology_sources = topology_sources(sources.clone());
+        let inventory = rust_selected_workspace_profiles(&topology_sources, &manifests)
+            .expect("enumerate inherited dependency targets");
+        let profile = inventory
+            .profiles
+            .iter()
+            .find(|profile| {
+                profile.manifest_path == Path::new("app/Cargo.toml")
+                    && profile.target_kind == RustCallerTargetKind::Library
+                    && !profile.test
+            })
+            .expect("app library profile");
+        let context = build_rust_selected_context(sources, manifests, profile.clone())
+            .expect("build inherited alias context");
+
+        assert!(
+            context
+                .dependency_edges
+                .contains(&RustSelectedDependencyEdge {
+                    source_crate_root: PathBuf::from("app/src/lib.rs"),
+                    exposed_name: "candle".to_string(),
+                    target_crate_root: PathBuf::from("candle-core/src/lib.rs"),
+                }),
+            "dependency_edges={:?}, gaps={:?}",
+            context.dependency_edges,
+            context.gaps,
+        );
+        assert!(
+            !context.gaps.iter().any(|gap| matches!(
+                gap,
+                RustSelectedContextGap::ExternalDependency { exposed_name, .. }
+                    if exposed_name == "candle"
+            )),
+            "the inherited workspace alias is indexed: {:?}",
+            context.gaps,
+        );
+        assert!(
+            context.root_bridges.iter().any(|bridge| {
+                bridge.source_file == Path::new("app/src/lib.rs")
+                    && bridge.target_file == Path::new("candle-core/src/npy.rs")
+                    && bridge.route.as_ref() == ["candle", "npy"]
+                    && bridge.source_name == "NpzTensors"
+                    && bridge.target_name == "NpzTensors"
+            }),
+            "root_bridges={:?}",
+            context.root_bridges,
         );
     }
 
@@ -7047,50 +7591,6 @@ mod tests {
     }
 
     #[test]
-    fn topology_build_progress_stops_atomically_and_retries_exactly() {
-        let (sources, manifests) = same_crate_inputs();
-        let topology_sources = topology_sources(sources);
-        let mut work = 0_usize;
-        let RustSelectedBuildOutcome::Ready(expected) =
-            build_rust_selected_topology_context_with_progress(
-                topology_sources.clone(),
-                manifests.clone(),
-                same_crate_profile(),
-                &mut |_| {
-                    work += 1;
-                    true
-                },
-            )
-            .expect("build a measured selected Rust topology")
-        else {
-            panic!("an always-live measured topology build must complete")
-        };
-        assert!(work > 1);
-
-        let mut remaining = work - 1;
-        let stopped = build_rust_selected_topology_context_with_progress(
-            topology_sources.clone(),
-            manifests.clone(),
-            same_crate_profile(),
-            &mut |_| {
-                if remaining == 0 {
-                    false
-                } else {
-                    remaining -= 1;
-                    true
-                }
-            },
-        )
-        .expect("stop one unit before selected Rust topology completion");
-        assert_eq!(stopped, RustSelectedBuildOutcome::Stopped);
-
-        let retried =
-            build_rust_selected_topology_context(topology_sources, manifests, same_crate_profile())
-                .expect("retry the selected Rust topology from fresh inputs");
-        assert_eq!(retried, expected);
-    }
-
-    #[test]
     fn prepared_topology_input_and_profile_build_stop_atomically() {
         let (sources, manifests) = same_crate_inputs();
         let topology_sources = topology_sources(sources);
@@ -7146,72 +7646,6 @@ mod tests {
             build_rust_selected_topology_context_from_prepared(&prepared, same_crate_profile())
                 .expect("retry the prepared selected Rust topology");
         assert_eq!(retried, expected);
-    }
-
-    #[test]
-    fn prepared_topology_reuses_source_work_across_profile_scale() {
-        let (sources, manifests) = same_crate_inputs();
-        let topology_sources = topology_sources(sources);
-        let prepared = prepare_rust_selected_topology_input(topology_sources, manifests)
-            .expect("prepare one immutable selected Rust topology");
-        let source_topologies = prepared
-            .source_topologies
-            .values()
-            .next()
-            .map(|source| source as *const RustSelectedPreparedSource);
-        let source_paths = prepared.source_paths().collect::<Vec<_>>();
-        let mut base = same_crate_profile();
-        base.target_kind = RustCallerTargetKind::Library;
-        base.target_root = PathBuf::from("src/lib.rs");
-        let mut total_profile_work = 0_usize;
-        for profile in [
-            base.clone(),
-            RustCallerTargetProfile {
-                features: BTreeSet::new(),
-                ..base.clone()
-            },
-            RustCallerTargetProfile {
-                test: true,
-                ..base.clone()
-            },
-            RustCallerTargetProfile {
-                target_triple: "aarch64-unknown-linux-gnu".to_string(),
-                ..base.clone()
-            },
-        ] {
-            let mut profile_work = 0_usize;
-            let RustSelectedBuildOutcome::Ready(context) =
-                build_rust_selected_topology_context_from_prepared_with_progress(
-                    &prepared,
-                    profile,
-                    &mut |work| {
-                        match work {
-                            RustSelectedContextWork::PreparationNode => {
-                                panic!("a prepared profile must not rebuild source topology")
-                            }
-                            RustSelectedContextWork::ScopeNode => profile_work += 1,
-                        }
-                        true
-                    },
-                )
-                .expect("build profile overlay from prepared topology")
-            else {
-                panic!("an always-live profile overlay must complete")
-            };
-            assert!(profile_work > 0);
-            total_profile_work += profile_work;
-            assert_eq!(
-                prepared
-                    .source_topologies
-                    .values()
-                    .next()
-                    .map(|source| source as *const RustSelectedPreparedSource),
-                source_topologies
-            );
-            assert_eq!(prepared.source_paths().collect::<Vec<_>>(), source_paths);
-            assert_eq!(context.root_bridges.as_ref(), &[]);
-        }
-        assert!(total_profile_work > 1);
     }
 
     #[test]
@@ -7352,563 +7786,6 @@ mod tests {
     }
 
     #[test]
-    fn fixture_builds_exact_context_from_content_facts_and_selected_inventory() {
-        let (sources, manifests) = fixture_inputs();
-        let context = build_rust_selected_context(sources, manifests, profile(true, false))
-            .expect("build selected Rust context");
-
-        assert_eq!(
-            context.target_roots,
-            BTreeSet::from([
-                PathBuf::from("app/src/main.rs"),
-                PathBuf::from("engine/src/lib.rs"),
-            ])
-        );
-        assert!(
-            context
-                .reachable_files
-                .contains(Path::new("engine/src/model.rs"))
-        );
-        assert!(
-            context
-                .reachable_files
-                .contains(Path::new("app/src/included.rs"))
-        );
-        assert!(
-            context
-                .reachable_files
-                .contains(Path::new("app/src/tests.rs"))
-        );
-        let selected = context
-            .module_activations
-            .iter()
-            .filter(|module| {
-                module.file == Path::new("app/src/main.rs") && module.module_name == "selected"
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(selected.len(), 2);
-        assert_eq!(
-            selected
-                .iter()
-                .filter(|module| module.activation == RustSelectedActivation::Active)
-                .count(),
-            1
-        );
-        assert_eq!(context.include_splices.len(), 1);
-        assert_eq!(
-            context.include_splices[0].included_file,
-            Path::new("app/src/included.rs")
-        );
-        assert!(
-            context.include_splices[0]
-                .host_bindings
-                .iter()
-                .any(|binding| binding.local_name == "WidgetAlias")
-        );
-        assert!(context.root_routes.iter().any(|route| {
-            route.kind == RustSelectedRootRouteKind::GlobReexport && route.route == "model"
-        }));
-        assert!(context.root_routes.iter().any(|route| {
-            route.kind == RustSelectedRootRouteKind::NamedUse
-                && route.local_name.as_deref() == Some("WidgetAlias")
-        }));
-        assert!(
-            context
-                .root_routes
-                .iter()
-                .filter(|route| {
-                    matches!(
-                        route.kind,
-                        RustSelectedRootRouteKind::ExternCrate
-                            | RustSelectedRootRouteKind::NamedUse
-                            | RustSelectedRootRouteKind::GlobUse
-                            | RustSelectedRootRouteKind::NamedReexport
-                            | RustSelectedRootRouteKind::GlobReexport
-                    )
-                })
-                .all(|route| route.source_import_ordinal.is_some())
-        );
-        assert!(
-            context
-                .root_routes
-                .iter()
-                .filter(|route| {
-                    matches!(
-                        route.kind,
-                        RustSelectedRootRouteKind::Module
-                            | RustSelectedRootRouteKind::ExportedMacro
-                    )
-                })
-                .all(|route| route.source_import_ordinal.is_none())
-        );
-        assert_eq!(
-            context.dependency_edges.as_ref(),
-            [RustSelectedDependencyEdge {
-                source_crate_root: PathBuf::from("app/src/main.rs"),
-                exposed_name: "engine".to_string(),
-                target_crate_root: PathBuf::from("engine/src/lib.rs"),
-            }]
-        );
-        let direct_bridges = context
-            .root_bridges
-            .iter()
-            .filter(|bridge| bridge.source_name == "direct_value")
-            .collect::<Vec<_>>();
-        assert_eq!(direct_bridges.len(), 1);
-        assert!(direct_bridges.iter().all(|bridge| {
-            bridge.source_file == Path::new("app/src/main.rs")
-                && bridge.target_file == Path::new("engine/src/lib.rs")
-                && bridge.route.as_ref() == ["engine"]
-                && bridge.target_name == "local_macro_value"
-                && bridge.namespace == ResolutionNamespace::Value
-        }));
-        let module_bridges = context
-            .root_bridges
-            .iter()
-            .filter(|bridge| bridge.source_name == "DirectWidget")
-            .collect::<Vec<_>>();
-        assert_eq!(module_bridges.len(), 1);
-        assert!(module_bridges.iter().all(|bridge| {
-            bridge.target_file == Path::new("engine/src/model.rs")
-                && bridge.route.as_ref() == ["engine", "model"]
-                && bridge.target_name == "Widget"
-                && bridge.namespace == ResolutionNamespace::Type
-        }));
-        let reexport_bridges = context
-            .root_bridges
-            .iter()
-            .filter(|bridge| bridge.source_name == "WidgetAlias")
-            .collect::<Vec<_>>();
-        assert_eq!(reexport_bridges.len(), 1);
-        assert!(reexport_bridges.iter().all(|bridge| {
-            bridge.target_file == Path::new("engine/src/model.rs")
-                && bridge.route.as_ref() == ["engine"]
-                && bridge.target_name == "Widget"
-                && bridge.namespace == ResolutionNamespace::Type
-        }));
-        let import_authorities = context
-            .root_bridges
-            .iter()
-            .map(|bridge| RustSelectedRootImportAuthority {
-                source_file: bridge.source_file.clone(),
-                source_module_segments: context
-                    .target_memberships
-                    .iter()
-                    .find(|membership| membership.file == bridge.source_file)
-                    .expect("fixture bridge source has one target membership")
-                    .module_segments
-                    .clone(),
-                source_root_scope: ResolutionScopeId::new(0),
-                route: bridge.route.clone(),
-                source_import_ordinal: None,
-                anchor: ResolutionRootImportAnchor::Lexical,
-                source_name: bridge.source_name.clone(),
-                target_name: bridge.target_name.clone(),
-                namespace: bridge.namespace,
-            })
-            .collect::<Vec<_>>();
-        let export_authorities = context
-            .root_bridges
-            .iter()
-            .map(|bridge| RustSelectedRootExportAuthority {
-                target_file: bridge.target_file.clone(),
-                target_module_segments: context
-                    .file_root_memberships
-                    .iter()
-                    .find(|membership| membership.file == bridge.target_file)
-                    .expect("fixture bridge target has one file-root membership")
-                    .module_segments
-                    .clone(),
-                target_root_scope: bridge.target_root_scope,
-                name: bridge.target_name.clone(),
-                namespace: bridge.namespace,
-                declaration_authority: Some(test_public_declaration_authority()),
-            })
-            .collect::<Vec<_>>();
-        let topology = compile_rust_selected_root_bridge_topology(
-            &context,
-            import_authorities.clone(),
-            export_authorities.clone(),
-        );
-        let expected_topology = context
-            .root_bridges
-            .iter()
-            .map(|bridge| RustSelectedRootBridgeTopology {
-                source_file: bridge.source_file.clone(),
-                source_root_scope: ResolutionScopeId::new(0),
-                target_file: bridge.target_file.clone(),
-                target_root_scope: bridge.target_root_scope,
-                route: bridge.route.clone(),
-                source_import_ordinal: None,
-                anchor: ResolutionRootImportAnchor::Lexical,
-                source_name: bridge.source_name.clone(),
-                target_name: bridge.target_name.clone(),
-                namespace: bridge.namespace,
-                declaration_authority: Some(test_public_declaration_authority()),
-            })
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            topology.into_iter().collect::<BTreeSet<_>>(),
-            expected_topology
-        );
-        let mut bridge_work = 0_usize;
-        let measured = compile_rust_selected_root_bridge_topology_with_progress(
-            &context,
-            import_authorities.clone(),
-            export_authorities.clone(),
-            &mut |_| {
-                bridge_work += 1;
-                true
-            },
-        );
-        assert!(matches!(measured, RustSelectedBuildOutcome::Ready(_)));
-        assert!(bridge_work > 1);
-        let mut remaining = bridge_work - 1;
-        let stopped = compile_rust_selected_root_bridge_topology_with_progress(
-            &context,
-            import_authorities,
-            export_authorities,
-            &mut |_| {
-                if remaining == 0 {
-                    false
-                } else {
-                    remaining -= 1;
-                    true
-                }
-            },
-        );
-        assert_eq!(stopped, RustSelectedBuildOutcome::Stopped);
-        assert!(context.root_routes.iter().any(|route| {
-            route.kind == RustSelectedRootRouteKind::ExportedMacro
-                && route.route == "exported_value"
-        }));
-        let engine_macros = context
-            .macro_visibility
-            .iter()
-            .filter(|definition| definition.file == Path::new("engine/src/lib.rs"))
-            .collect::<Vec<_>>();
-        assert_eq!(engine_macros.len(), 2);
-        assert!(engine_macros[0].visible_after < engine_macros[1].visible_after);
-        assert!(
-            context.gaps.is_empty(),
-            "unexpected gaps: {:?}",
-            context.gaps
-        );
-    }
-
-    #[test]
-    fn caller_profile_identity_is_stable_across_a_b_a_and_gates_tests() {
-        let (sources, manifests) = fixture_inputs();
-        let left =
-            build_rust_selected_context(sources.clone(), manifests.clone(), profile(true, false))
-                .expect("build left profile");
-        let right_test =
-            build_rust_selected_context(sources.clone(), manifests.clone(), profile(false, true))
-                .expect("build right test profile");
-        let left_again = build_rust_selected_context(sources, manifests, profile(true, false))
-            .expect("rebuild left profile");
-
-        assert_eq!(left.identity, left_again.identity);
-        assert_eq!(left, left_again);
-        assert_ne!(left.identity, right_test.identity);
-        assert!(
-            right_test
-                .reachable_files
-                .contains(Path::new("app/src/tests.rs"))
-        );
-        let unknown_right = right_test
-            .module_activations
-            .iter()
-            .filter(|module| {
-                module.file == Path::new("app/src/main.rs")
-                    && module.module_name == "selected"
-                    && module.activation == RustSelectedActivation::Unknown
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(unknown_right.len(), 2);
-        for module in unknown_right {
-            assert!(
-                right_test
-                    .gaps
-                    .contains(&RustSelectedContextGap::UnknownActivation {
-                        file: module.file.clone(),
-                        start_byte: module.start_byte,
-                    },)
-            );
-        }
-    }
-
-    #[test]
-    fn prepared_topology_matches_owning_profiles_and_input_permutations() {
-        let (sources, manifests) = fixture_inputs();
-        let topology_sources = topology_sources(sources);
-        let prepared =
-            prepare_rust_selected_topology_input(topology_sources.clone(), manifests.clone())
-                .expect("prepare selected Rust topology input");
-        let permuted = prepare_rust_selected_topology_input(
-            topology_sources.iter().cloned().rev(),
-            manifests.iter().cloned().rev(),
-        )
-        .expect("prepare permuted selected Rust topology input");
-
-        for profile in [profile(true, false), profile(false, true)] {
-            let owning = build_rust_selected_topology_context(
-                topology_sources.clone(),
-                manifests.clone(),
-                profile.clone(),
-            )
-            .expect("build owning selected Rust topology");
-            let expected =
-                build_rust_selected_topology_context_from_prepared(&prepared, profile.clone())
-                    .expect("build prepared selected Rust topology");
-            let permuted_context =
-                build_rust_selected_topology_context_from_prepared(&permuted, profile)
-                    .expect("build permuted prepared selected Rust topology");
-            assert_eq!(owning, expected);
-            assert_eq!(expected, permuted_context);
-        }
-    }
-
-    #[test]
-    fn unknown_cfg_is_incomplete_instead_of_inactive() {
-        let (mut sources, manifests) = fixture_inputs();
-        let main = sources
-            .iter_mut()
-            .find(|mount| mount.relative_path == Path::new("app/src/main.rs"))
-            .expect("app main mount");
-        let selected = main
-            .facts
-            .modules
-            .iter_mut()
-            .find(|module| module.module_name == "selected")
-            .expect("selected module");
-        selected.cfg_condition = RustCfgCondition::Unknown;
-        let selected_start = selected.start_byte;
-
-        let context = build_rust_selected_context(sources, manifests, profile(true, false))
-            .expect("build incomplete selected context");
-        assert!(
-            context
-                .gaps
-                .contains(&RustSelectedContextGap::UnknownActivation {
-                    file: PathBuf::from("app/src/main.rs"),
-                    start_byte: selected_start,
-                })
-        );
-    }
-
-    #[test]
-    fn feature_gated_module_is_owned_with_a_route_local_activation_gap() {
-        let (sources, manifests) = inputs_from_files(&[
-            (
-                "Cargo.toml",
-                concat!(
-                    "[package]\n",
-                    "name = \"app\"\n",
-                    "version = \"0.1.0\"\n",
-                    "edition = \"2024\"\n",
-                    "\n",
-                    "[features]\n",
-                    "gated = []\n",
-                ),
-            ),
-            (
-                "src/lib.rs",
-                "#[cfg(feature = \"gated\")]\nmod gated;\nmod always;\n",
-            ),
-            ("src/gated.rs", "pub fn gated() {}\n"),
-            ("src/always.rs", "pub fn always() {}\n"),
-        ]);
-        let gated_start = sources
-            .iter()
-            .find(|source| source.relative_path == Path::new("src/lib.rs"))
-            .expect("library source facts")
-            .facts
-            .module_routes
-            .routes
-            .iter()
-            .find(|route| route.module_name == "gated")
-            .expect("feature-gated module route")
-            .declaration_start;
-        let inventory =
-            rust_selected_workspace_profiles(&topology_sources(sources.clone()), &manifests)
-                .expect("feature declarations do not make target enumeration incomplete");
-        assert!(inventory.target_inventory_complete);
-        let profile = inventory
-            .profiles
-            .iter()
-            .find(|profile| profile.target_kind == RustCallerTargetKind::Library && !profile.test)
-            .expect("normal library profile");
-        let context = build_rust_selected_context(sources, manifests, profile.clone())
-            .expect("build a feature-uncertain target context");
-
-        assert_eq!(
-            context.gaps,
-            BTreeSet::from([RustSelectedContextGap::UnknownActivation {
-                file: PathBuf::from("src/lib.rs"),
-                start_byte: gated_start,
-            }]),
-        );
-        for target in [Path::new("src/gated.rs"), Path::new("src/always.rs")] {
-            assert!(
-                context
-                    .target_memberships
-                    .iter()
-                    .any(|membership| membership.file == target),
-                "possible module route must retain ownership for {target:?}",
-            );
-            assert!(
-                context
-                    .module_edges
-                    .iter()
-                    .any(|edge| edge.target_file == target),
-                "possible module route must retain its structured edge for {target:?}",
-            );
-        }
-    }
-
-    #[test]
-    fn selected_inventory_not_live_existence_decides_module_and_include_reachability() {
-        let (mut sources, manifests) = fixture_inputs();
-        sources.retain(|mount| {
-            mount.relative_path != Path::new("engine/src/model.rs")
-                && mount.relative_path != Path::new("app/src/included.rs")
-        });
-
-        let context = build_rust_selected_context(sources, manifests, profile(true, false))
-            .expect("build inventory-limited context");
-        assert!(
-            !context
-                .reachable_files
-                .contains(Path::new("engine/src/model.rs"))
-        );
-        assert!(
-            !context
-                .reachable_files
-                .contains(Path::new("app/src/included.rs"))
-        );
-        assert!(
-            context
-                .module_edges
-                .iter()
-                .all(|edge| { edge.target_file != Path::new("engine/src/model.rs") })
-        );
-        assert!(context.include_splices.is_empty());
-        assert!(context.gaps.iter().any(|gap| matches!(
-            gap,
-            RustSelectedContextGap::UnsupportedMacroGeneratedModule { file, .. }
-                if file == Path::new("app/src/main.rs")
-        )));
-    }
-
-    #[test]
-    fn dependency_module_bridge_requires_every_crossed_module_to_be_public() {
-        let (mut sources, manifests) = fixture_inputs();
-        let engine = sources
-            .iter_mut()
-            .find(|mount| mount.relative_path == Path::new("engine/src/lib.rs"))
-            .expect("engine root mount");
-        let model = engine
-            .facts
-            .module_routes
-            .routes
-            .iter_mut()
-            .find(|route| route.module_name == "model")
-            .expect("engine model route");
-        model.visibility = RustVisibility::Private;
-
-        let context = build_rust_selected_context(sources, manifests, profile(true, false))
-            .expect("build selected context with private dependency module");
-        assert!(
-            context
-                .root_bridges
-                .iter()
-                .all(|bridge| bridge.source_name != "DirectWidget")
-        );
-        assert!(context.root_bridges.iter().any(|bridge| {
-            bridge.source_name == "direct_value"
-                && bridge.target_file == Path::new("engine/src/lib.rs")
-        }));
-        assert!(context.root_bridges.iter().any(|bridge| {
-            bridge.source_name == "WidgetAlias"
-                && bridge.target_file == Path::new("engine/src/model.rs")
-                && bridge.namespace == ResolutionNamespace::Type
-        }));
-    }
-
-    #[test]
-    fn named_reexport_chains_forward_to_the_exported_declaration() {
-        const FILES: &[(&str, &str)] = &[
-            (
-                "app/Cargo.toml",
-                concat!(
-                    "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-                    "[dependencies]\nengine = { path = \"../engine\" }\n",
-                ),
-            ),
-            (
-                "engine/Cargo.toml",
-                "[package]\nname = \"engine\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-            ),
-            ("app/src/main.rs", "use engine::PublicItem as Item;\n"),
-            (
-                "engine/src/lib.rs",
-                "mod first;\nmod second;\npub use first::FirstItem as PublicItem;\n",
-            ),
-            (
-                "engine/src/first.rs",
-                "pub use crate::second::Item as FirstItem;\n",
-            ),
-            (
-                "engine/src/second.rs",
-                "pub struct Item { pub value: () }\n",
-            ),
-        ];
-        let (sources, manifests) = inputs_from_files(FILES);
-        let context = build_rust_selected_context(sources, manifests, profile(false, false))
-            .expect("build chained named-reexport context");
-        let bridges = context
-            .root_bridges
-            .iter()
-            .filter(|bridge| bridge.source_name == "Item")
-            .collect::<Vec<_>>();
-        assert_eq!(bridges.len(), 1);
-        assert!(bridges.iter().all(|bridge| {
-            bridge.target_file == Path::new("engine/src/second.rs")
-                && bridge.target_name == "Item"
-                && bridge.namespace == ResolutionNamespace::Type
-        }));
-    }
-
-    #[test]
-    fn named_reexport_cycles_fail_closed() {
-        const FILES: &[(&str, &str)] = &[
-            (
-                "app/Cargo.toml",
-                concat!(
-                    "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-                    "[dependencies]\nengine = { path = \"../engine\" }\n",
-                ),
-            ),
-            (
-                "engine/Cargo.toml",
-                "[package]\nname = \"engine\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-            ),
-            ("app/src/main.rs", "use engine::PublicItem as Item;\n"),
-            (
-                "engine/src/lib.rs",
-                "mod left;\nmod right;\npub use left::Item as PublicItem;\n",
-            ),
-            ("engine/src/left.rs", "pub use crate::right::Item;\n"),
-            ("engine/src/right.rs", "pub use crate::left::Item;\n"),
-        ];
-        let (sources, manifests) = inputs_from_files(FILES);
-        let context = build_rust_selected_context(sources, manifests, profile(false, false))
-            .expect("build cyclic named-reexport context");
-        assert!(context.root_bridges.is_empty());
-    }
-
-    #[test]
     fn consumer_and_reexport_globs_forward_a_demand_through_a_private_module() {
         const FILES: &[(&str, &str)] = &[
             (
@@ -7954,21 +7831,6 @@ mod tests {
         assert!(bridges.iter().any(|bridge| {
             bridge.target_name == "imported_macro" && bridge.namespace == ResolutionNamespace::Macro
         }));
-    }
-
-    #[test]
-    fn rust_2015_dependency_needs_an_explicit_extern_crate_route() {
-        let (sources, mut manifests) = fixture_inputs();
-        manifests
-            .iter_mut()
-            .find(|mount| mount.relative_path == Path::new("app/Cargo.toml"))
-            .and_then(|mount| mount.facts.package.as_mut())
-            .expect("app package facts")
-            .edition = RustCargoPackageEdition::Explicit(RustCargoEdition::Rust2015);
-
-        let context = build_rust_selected_context(sources, manifests, profile(true, false))
-            .expect("build Rust 2015 dependency context");
-        assert!(context.root_bridges.is_empty());
     }
 
     #[test]
@@ -8098,195 +7960,6 @@ mod tests {
                 .root_bridges
                 .iter()
                 .any(|bridge| bridge.source_name == "RelativeItem")
-        );
-    }
-
-    #[test]
-    fn restricted_visibility_scopes_are_resolved_from_structured_segments() {
-        let declaring = ["parent".to_string(), "nested".to_string()];
-        let descendant = [
-            "parent".to_string(),
-            "nested".to_string(),
-            "consumer".to_string(),
-        ];
-        let sibling = ["parent".to_string(), "sibling".to_string()];
-        assert!(rust_module_visibility_reaches(
-            &RustVisibility::SelfModule,
-            true,
-            &descendant,
-            &declaring,
-        ));
-        assert!(!rust_module_visibility_reaches(
-            &RustVisibility::Private,
-            true,
-            &sibling,
-            &declaring,
-        ));
-        assert!(rust_module_visibility_reaches(
-            &RustVisibility::SuperModule,
-            true,
-            &sibling,
-            &declaring,
-        ));
-        assert!(rust_module_visibility_reaches(
-            &RustVisibility::InPath(vec!["crate".to_string(), "parent".to_string()]),
-            true,
-            &sibling,
-            &declaring,
-        ));
-        assert!(!rust_module_visibility_reaches(
-            &RustVisibility::Crate,
-            false,
-            &sibling,
-            &declaring,
-        ));
-    }
-
-    #[test]
-    fn rust_2015_unprefixed_use_starts_at_the_selected_crate_root() {
-        const FILES: &[(&str, &str)] = &[
-            (
-                "app/Cargo.toml",
-                "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
-            ),
-            ("app/src/lib.rs", "mod root_item;\nmod consumer;\n"),
-            (
-                "app/src/root_item.rs",
-                "pub struct Item { pub value: () }\n",
-            ),
-            ("app/src/consumer.rs", "use root_item::Item as RootItem;\n"),
-        ];
-        let (sources, manifests) = inputs_from_files(FILES);
-        let context = build_rust_selected_context(sources, manifests, same_crate_profile())
-            .expect("build Rust 2015 selected context");
-        let bridges = context
-            .root_bridges
-            .iter()
-            .filter(|bridge| bridge.source_name == "RootItem")
-            .collect::<Vec<_>>();
-        assert_eq!(bridges.len(), 1);
-        assert!(bridges.iter().all(|bridge| {
-            bridge.source_file == Path::new("app/src/consumer.rs")
-                && bridge.target_file == Path::new("app/src/root_item.rs")
-                && bridge.route.as_ref() == ["root_item"]
-                && bridge.namespace == ResolutionNamespace::Type
-        }));
-    }
-
-    #[test]
-    fn modern_local_module_shadows_a_same_named_dependency() {
-        const FILES: &[(&str, &str)] = &[
-            (
-                "app/Cargo.toml",
-                concat!(
-                    "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
-                    "edition = \"2024\"\n",
-                    "[dependencies]\nengine = { path = \"../engine\" }\n",
-                ),
-            ),
-            (
-                "engine/Cargo.toml",
-                "[package]\nname = \"engine\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-            ),
-            (
-                "app/src/lib.rs",
-                "mod engine;\nuse engine::Item as SelectedItem;\n",
-            ),
-            ("app/src/engine.rs", "pub struct Item { pub value: () }\n"),
-            ("engine/src/lib.rs", "pub struct Item { pub value: () }\n"),
-        ];
-        let (sources, manifests) = inputs_from_files(FILES);
-        let context = build_rust_selected_context(sources, manifests, same_crate_profile())
-            .expect("build local-shadow selected context");
-        let bridges = context
-            .root_bridges
-            .iter()
-            .filter(|bridge| bridge.source_name == "SelectedItem")
-            .collect::<Vec<_>>();
-        assert_eq!(bridges.len(), 1);
-        assert!(bridges.iter().all(|bridge| {
-            bridge.target_file == Path::new("app/src/engine.rs")
-                && bridge.namespace == ResolutionNamespace::Type
-        }));
-    }
-
-    #[test]
-    fn modern_absolute_route_bypasses_a_same_named_local_module() {
-        const FILES: &[(&str, &str)] = &[
-            (
-                "app/Cargo.toml",
-                concat!(
-                    "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
-                    "edition = \"2024\"\n",
-                    "[dependencies]\nengine = { path = \"../engine\" }\n",
-                ),
-            ),
-            (
-                "engine/Cargo.toml",
-                "[package]\nname = \"engine\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-            ),
-            (
-                "app/src/lib.rs",
-                "mod engine;\nuse ::engine::Item as ExternalItem;\n",
-            ),
-            ("app/src/engine.rs", "pub struct Item;\n"),
-            ("engine/src/lib.rs", "pub struct Item;\n"),
-        ];
-        let (sources, manifests) = inputs_from_files(FILES);
-        let context = build_rust_selected_topology_context(
-            topology_sources(sources),
-            manifests,
-            same_crate_profile(),
-        )
-        .expect("build modern absolute selected context");
-        assert!(context.root_routes.iter().any(|route| {
-            route.route == "engine"
-                && route.anchor == ResolutionRootImportAnchor::Absolute
-                && route.local_name.as_deref() == Some("ExternalItem")
-        }));
-        let source = context
-            .target_memberships
-            .iter()
-            .find(|membership| {
-                membership.crate_root == Path::new("app/src/lib.rs")
-                    && membership.file == Path::new("app/src/lib.rs")
-                    && membership.module_segments.is_empty()
-            })
-            .expect("app crate root membership");
-        let imports = BTreeSet::new();
-        let exports = BTreeSet::new();
-        let mut progress = |_| true;
-        let absolute = selected_topology_import_targets(
-            &context,
-            source,
-            &imports,
-            &exports,
-            &["engine"],
-            ResolutionRootImportAnchor::Absolute,
-            &mut progress,
-        );
-        assert_eq!(
-            absolute,
-            RustSelectedBuildOutcome::Ready(vec![RustSelectedImportTarget {
-                crate_root: PathBuf::from("engine/src/lib.rs"),
-                module_segments: Box::new([]),
-            }])
-        );
-        let bare = selected_topology_import_targets(
-            &context,
-            source,
-            &imports,
-            &exports,
-            &["engine"],
-            ResolutionRootImportAnchor::Lexical,
-            &mut progress,
-        );
-        assert_eq!(
-            bare,
-            RustSelectedBuildOutcome::Ready(vec![RustSelectedImportTarget {
-                crate_root: PathBuf::from("app/src/lib.rs"),
-                module_segments: vec!["engine".to_string()].into_boxed_slice(),
-            }])
         );
     }
 

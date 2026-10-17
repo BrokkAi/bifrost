@@ -30,13 +30,7 @@ pub const GO_FILE_EXTENSION: &str = "go";
 /// The receiver of a Go call reference, i.e. everything before the final `.` of
 /// the callee path, with any argument list dropped.
 pub fn go_extract_call_receiver(reference: &str) -> Option<String> {
-    let trimmed = reference.trim();
-    let before_args = trimmed
-        .split_once('(')
-        .map(|(head, _)| head)
-        .unwrap_or(trimmed);
-    before_args
-        .rsplit_once('.')
+    brokk_bifrost_core::analyzer::common::extract_call_reference_parts(reference, &["."])
         .map(|(receiver, _)| receiver.to_string())
 }
 

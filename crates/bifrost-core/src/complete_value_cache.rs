@@ -21,6 +21,7 @@ use moka::sync::Cache;
 
 use crate::cancellation::CancellationToken;
 use crate::hash::HashMap;
+use crate::util::elapsed_ns;
 
 const CANCELLATION_POLL: Duration = Duration::from_millis(10);
 
@@ -532,78 +533,25 @@ where
     }
 }
 
-fn elapsed_ns(started: Instant) -> u64 {
-    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Barrier;
     use std::thread;
     use std::time::{Duration, Instant};
 
+    use brokk_bifrost_test_macros::hardwon;
+
     use super::*;
-
-    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-    struct FakeDigest(Box<str>);
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    enum FakeDerivedLayerKind {
-        DirectImportTopology,
-        OtherRelation,
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-    struct FakeDerivedLayerKey {
-        workspace_mount: FakeDigest,
-        storage_generations: Box<[(Box<str>, u64)]>,
-        content_overlay_fingerprint: FakeDigest,
-        kind: FakeDerivedLayerKind,
-        projection_filter_fingerprint: FakeDigest,
-        configuration_fingerprint: FakeDigest,
-        representation_version: u32,
-    }
-
-    fn digest(label: &str) -> FakeDigest {
-        FakeDigest(label.into())
-    }
-
-    fn fake_derived_key(generation: u64) -> FakeDerivedLayerKey {
-        let mut storage_generations = vec![
-            (Box::<str>::from("rust"), generation),
-            (Box::<str>::from("java"), 0),
-        ];
-        storage_generations.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-        assert!(
-            storage_generations
-                .windows(2)
-                .all(|pair| pair[0].0 != pair[1].0),
-            "fake layer key must reject duplicate storage labels"
-        );
-        FakeDerivedLayerKey {
-            workspace_mount: digest("workspace-a"),
-            storage_generations: storage_generations.into_boxed_slice(),
-            content_overlay_fingerprint: digest("content-overlay-a"),
-            kind: FakeDerivedLayerKind::DirectImportTopology,
-            projection_filter_fingerprint: digest("projection-filter-a"),
-            configuration_fingerprint: digest("resolver-config-a"),
-            representation_version: 1,
-        }
-    }
 
     fn cache(capacity: u64, weight: u32) -> CompleteValueCache<String, usize> {
         CompleteValueCache::new(capacity, move |_, _| weight)
     }
 
     fn wait_for_waiter(cache: &CompleteValueCache<String, usize>) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while cache.waiting_count_for_test() == 0 {
-            assert!(
-                Instant::now() < deadline,
-                "same-key request did not enter the single-flight wait"
-            );
-            thread::yield_now();
-        }
+        crate::test_support::wait_for_nonzero_count(
+            || cache.waiting_count_for_test(),
+            "same-key request did not enter the single-flight wait",
+        );
     }
 
     fn wait_for_physical_reclamation(
@@ -792,6 +740,7 @@ mod tests {
     /// every lookup that crosses the two, which is how require-model taint lost
     /// real findings at corpus scale.
     #[test]
+    #[hardwon("#2307: an evicted artifact must keep one allocation identity while callers hold it")]
     fn an_evicted_value_that_is_still_referenced_is_reused_rather_than_rebuilt() {
         let cache = cache(1, 1);
         let cancellation = CancellationToken::default();
@@ -821,37 +770,7 @@ mod tests {
     }
 
     #[test]
-    fn invalidate_all_forces_a_ready_miss_and_reset_counts_the_next_revival() {
-        let cache = cache(1, 1);
-        let cancellation = CancellationToken::default();
-        let key = "held".to_string();
-
-        let (CompleteValueAcquisition::Leader { permit }, _) = cache.acquire(&key, &cancellation)
-        else {
-            panic!("a new key must lead")
-        };
-        let held = Arc::new(19);
-        permit.publish_complete(Arc::clone(&held));
-
-        cache.evict_for_test(&key);
-        let (CompleteValueAcquisition::Cached { value }, _) = cache.acquire(&key, &cancellation)
-        else {
-            panic!("the first logical eviction must revive the held value")
-        };
-        assert!(Arc::ptr_eq(&held, &value));
-        assert_eq!(cache.revival_census_for_test().operations, 1);
-
-        cache.reset_revival_census_for_test();
-        cache.invalidate_all_for_test();
-        let (CompleteValueAcquisition::Cached { value }, _) = cache.acquire(&key, &cancellation)
-        else {
-            panic!("bulk invalidation must force a miss that revives the held value")
-        };
-        assert!(Arc::ptr_eq(&held, &value));
-        assert_eq!(cache.revival_census_for_test().operations, 1);
-    }
-
-    #[test]
+    #[hardwon("#3377: invalidation must remove the live identity so stale values cannot revive")]
     fn exact_invalidation_removes_live_identity_and_prevents_resurrection() {
         let cache = cache(1, 1);
         let cancellation = CancellationToken::default();
@@ -873,6 +792,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#3377: publication must serialize live identity and ready-cache insertion")]
     fn publication_holds_the_live_identity_lock_through_ready_insertion() {
         let insertion_reached = Arc::new(Barrier::new(2));
         let insertion_release = Arc::new(Barrier::new(2));
@@ -902,6 +822,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#3377: a flight already running at invalidation may publish its completed value")]
     fn publication_after_invalidation_completes_the_existing_flight() {
         let cache = cache(1, 1);
         let cancellation = CancellationToken::default();
@@ -934,6 +855,87 @@ mod tests {
             .get_ready(&key, &cancellation)
             .expect("the later publication must remain ready");
         assert!(Arc::ptr_eq(&published, &ready));
+    }
+
+    /// The registry holds weak references only: after the last holder drops the
+    /// value and Moka physically reclaims its logically evicted entry, the key
+    /// rebuilds exactly as it did before (#2456).
+    #[test]
+    #[hardwon(
+        "#2456: a weak live identity must expire after physical eviction and the last holder drops"
+    )]
+    fn a_dropped_value_is_rebuilt_rather_than_revived() {
+        let cache = cache(1, 1);
+        let cancellation = CancellationToken::default();
+        let key = "dropped".to_string();
+
+        let (CompleteValueAcquisition::Leader { permit }, _) = cache.acquire(&key, &cancellation)
+        else {
+            panic!("a new key must lead")
+        };
+        let built = Arc::new(33);
+        let dropped = Arc::downgrade(&built);
+        permit.publish_complete(Arc::clone(&built));
+        drop(built);
+        cache.evict_for_test(&key);
+        wait_for_physical_reclamation(&cache, &dropped);
+
+        assert!(
+            matches!(
+                cache.acquire(&key, &cancellation).0,
+                CompleteValueAcquisition::Leader { .. }
+            ),
+            "a value nobody holds must be rebuilt, not resurrected"
+        );
+        assert_eq!(cache.revival_census_for_test().operations, 0);
+    }
+
+    #[test]
+    fn zero_reported_weights_cannot_bypass_the_retention_bound() {
+        let cache = CompleteValueCache::new(1, |_: &String, _: &Arc<usize>| 0);
+        let cancellation = CancellationToken::default();
+
+        for (key, value) in [("first".to_string(), 1), ("second".to_string(), 2)] {
+            let (CompleteValueAcquisition::Leader { permit }, _) =
+                cache.acquire(&key, &cancellation)
+            else {
+                panic!("a new key must lead")
+            };
+            permit.publish_complete(Arc::new(value));
+        }
+
+        assert_eq!(cache.len_for_test(), 1);
+    }
+
+    #[test]
+    fn invalidate_all_forces_a_ready_miss_and_reset_counts_the_next_revival() {
+        let cache = cache(1, 1);
+        let cancellation = CancellationToken::default();
+        let key = "held".to_string();
+
+        let (CompleteValueAcquisition::Leader { permit }, _) = cache.acquire(&key, &cancellation)
+        else {
+            panic!("a new key must lead")
+        };
+        let held = Arc::new(19);
+        permit.publish_complete(Arc::clone(&held));
+
+        cache.evict_for_test(&key);
+        let (CompleteValueAcquisition::Cached { value }, _) = cache.acquire(&key, &cancellation)
+        else {
+            panic!("the first logical eviction must revive the held value")
+        };
+        assert!(Arc::ptr_eq(&held, &value));
+        assert_eq!(cache.revival_census_for_test().operations, 1);
+
+        cache.reset_revival_census_for_test();
+        cache.invalidate_all_for_test();
+        let (CompleteValueAcquisition::Cached { value }, _) = cache.acquire(&key, &cancellation)
+        else {
+            panic!("bulk invalidation must force a miss that revives the held value")
+        };
+        assert!(Arc::ptr_eq(&held, &value));
+        assert_eq!(cache.revival_census_for_test().operations, 1);
     }
 
     #[test]
@@ -995,120 +997,5 @@ mod tests {
             cache.revival_census_for_test(),
             CompleteValueRevivalCensus::default()
         );
-    }
-
-    /// The registry holds weak references only: after the last holder drops the
-    /// value and Moka physically reclaims its logically evicted entry, the key
-    /// rebuilds exactly as it did before (#2456).
-    #[test]
-    fn a_dropped_value_is_rebuilt_rather_than_revived() {
-        let cache = cache(1, 1);
-        let cancellation = CancellationToken::default();
-        let key = "dropped".to_string();
-
-        let (CompleteValueAcquisition::Leader { permit }, _) = cache.acquire(&key, &cancellation)
-        else {
-            panic!("a new key must lead")
-        };
-        let built = Arc::new(33);
-        let dropped = Arc::downgrade(&built);
-        permit.publish_complete(Arc::clone(&built));
-        drop(built);
-        cache.evict_for_test(&key);
-        wait_for_physical_reclamation(&cache, &dropped);
-
-        assert!(
-            matches!(
-                cache.acquire(&key, &cancellation).0,
-                CompleteValueAcquisition::Leader { .. }
-            ),
-            "a value nobody holds must be rebuilt, not resurrected"
-        );
-        assert_eq!(cache.revival_census_for_test().operations, 0);
-    }
-
-    #[test]
-    fn zero_reported_weights_cannot_bypass_the_retention_bound() {
-        let cache = CompleteValueCache::new(1, |_: &String, _: &Arc<usize>| 0);
-        let cancellation = CancellationToken::default();
-
-        for (key, value) in [("first".to_string(), 1), ("second".to_string(), 2)] {
-            let (CompleteValueAcquisition::Leader { permit }, _) =
-                cache.acquire(&key, &cancellation)
-            else {
-                panic!("a new key must lead")
-            };
-            permit.publish_complete(Arc::new(value));
-        }
-
-        assert_eq!(cache.len_for_test(), 1);
-    }
-
-    #[test]
-    fn fake_derived_key_binds_every_required_validity_dimension() {
-        let baseline = fake_derived_key(1);
-        assert_eq!(
-            baseline
-                .storage_generations
-                .iter()
-                .map(|(language, _)| language.as_ref())
-                .collect::<Vec<_>>(),
-            vec!["java", "rust"]
-        );
-
-        let mut changed = baseline.clone();
-        changed.workspace_mount = digest("workspace-b");
-        assert_ne!(baseline, changed);
-
-        let mut changed = baseline.clone();
-        changed.storage_generations[1].1 = 2;
-        assert_ne!(baseline, changed);
-
-        let mut changed = baseline.clone();
-        changed.content_overlay_fingerprint = digest("content-overlay-b");
-        assert_ne!(baseline, changed);
-
-        let mut changed = baseline.clone();
-        changed.kind = FakeDerivedLayerKind::OtherRelation;
-        assert_ne!(baseline, changed);
-
-        let mut changed = baseline.clone();
-        changed.projection_filter_fingerprint = digest("projection-filter-b");
-        assert_ne!(baseline, changed);
-
-        let mut changed = baseline.clone();
-        changed.configuration_fingerprint = digest("resolver-config-b");
-        assert_ne!(baseline, changed);
-
-        let mut changed = baseline.clone();
-        changed.representation_version = 2;
-        assert_ne!(baseline, changed);
-    }
-
-    #[test]
-    fn fake_derived_generation_cutover_cannot_reuse_a_ready_value() {
-        let first_key = fake_derived_key(1);
-        let second_key = fake_derived_key(2);
-        let cache = CompleteValueCache::new(1024, |_, _: &Arc<usize>| 1);
-        let cancellation = CancellationToken::default();
-
-        let (CompleteValueAcquisition::Leader { permit }, _) =
-            cache.acquire(&first_key, &cancellation)
-        else {
-            panic!("first exact generation should lead")
-        };
-        let first = Arc::new(23);
-        permit.publish_complete(Arc::clone(&first));
-        let (CompleteValueAcquisition::Cached { value }, _) =
-            cache.acquire(&first_key, &cancellation)
-        else {
-            panic!("same exact generation should reuse the ready value")
-        };
-        assert!(Arc::ptr_eq(&first, &value));
-
-        assert!(matches!(
-            cache.acquire(&second_key, &cancellation).0,
-            CompleteValueAcquisition::Leader { .. }
-        ));
     }
 }

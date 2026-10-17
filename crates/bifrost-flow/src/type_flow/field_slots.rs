@@ -3,17 +3,19 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use super::{class_seed_has_open_bound, mapping_span};
 use brokk_bifrost_core::complete_value_cache::{CompleteValueAcquisition, CompleteValueCache};
 
-#[cfg(test)]
-use crate::analyzer::semantic::MemberAccessKind;
 use crate::analyzer::semantic::{
-    ClassAtom, ClassBodyMemberBinding, ClassIdentity, ClassSeed, DynamicFieldWrite,
-    IcfgProviderBehaviorIdentity, LengthDelimitedDigest, MemberAccessQuery, MemoryLocationKind,
-    ProcedureHandle, SemanticBudget, SemanticBudgetExceeded, SemanticEffect, SemanticIrVersion,
-    SemanticRequest, SemanticValueKind, SourcePosition, SourceSpan, StableDigest, TypeFlowAdapter,
-    UnknownReason, ValueFlowKind, WorkspaceMountId, WorkspaceRelativePath,
+    ClassAtom, ClassBodyMemberBinding, ClassIdentity, ClassSeed, DynamicFieldNameSet,
+    DynamicFieldWrite, IcfgProviderBehaviorIdentity, LengthDelimitedDigest, MemberAccessQuery,
+    MemoryLocationKind, ProcedureHandle, SemanticBudget, SemanticBudgetExceeded, SemanticEffect,
+    SemanticIrVersion, SemanticRequest, SemanticValueKind, SourcePosition, SourceSpan,
+    StableDigest, TypeFlowAdapter, UnknownReason, ValueFlowKind, WorkspaceMountId,
+    WorkspaceRelativePath,
 };
+#[cfg(test)]
+use crate::analyzer::semantic::{MemberAccessKind, MemberReceiverQuery};
 use crate::analyzer::semantic_model::ActiveSemanticModelSnapshot;
 use crate::analyzer::store::StoreError;
 use crate::analyzer::store::class_set_field_slots::{
@@ -25,13 +27,14 @@ use crate::analyzer::store::class_set_field_slots::{
 use crate::analyzer::{AnalyzerQueryScope, IAnalyzer, ProjectFile, WorkspaceAnalyzer};
 use crate::hash::{HashMap, HashSet};
 use crate::value_flow::ValueFlowCache;
+use brokk_bifrost_analysis::analyzer::semantic::type_flow::file_for_locator;
 
 use super::dynamic_stores::{DynamicWriteEvidence, PendingDynamicWrite, ScopedDynamicWrite};
 use super::plan::TypeFlowPlanError;
 use crate::analyzer::semantic::{SourceSite, SourceSiteKind};
 
 type FieldSlotKey = (ClassIdentity, Box<str>);
-type FieldSlotAtom = (ClassAtom, SourceSite);
+type FieldSlotAtom = (ClassAtom, SourceSite, bool);
 const FIELD_SLOT_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -82,6 +85,7 @@ pub struct FieldSlot {
 pub struct FieldSlotIndex {
     slots: Vec<FieldSlot>,
     lookup: HashMap<ClassIdentity, HashMap<Box<str>, usize>>,
+    open_bound_class_sources: HashSet<(usize, usize)>,
     digest: StableDigest,
     store_survey: FieldStoreSurvey,
     semantic_budget_exhaustion: Option<SemanticBudgetExceeded>,
@@ -145,6 +149,7 @@ struct CollectedSlots {
     dynamic_effects: Vec<ScopedDynamicWrite>,
     globally_incomplete: bool,
     transient_resolver_budget: bool,
+    has_open_bound: bool,
     semantic_budget_exhaustion: Option<SemanticBudgetExceeded>,
     persistent_artifacts: HashSet<(
         String,
@@ -261,6 +266,7 @@ impl FieldStoreSurvey {
                     |bytes, effect| {
                         bytes
                             .saturating_add(project_file_path_bytes(&effect.evidence.site.file))
+                            .saturating_add(dynamic_field_names_heap_bytes(&effect.names))
                             .saturating_add(
                                 effect
                                     .classes
@@ -295,7 +301,7 @@ impl FieldStoreSurvey {
 
 impl FieldSlotIndex {
     // Bump when the language-neutral field-slot algorithm changes.
-    const ALGORITHM_VERSION: u32 = 22;
+    const ALGORITHM_VERSION: u32 = 29;
     // Bump only when the persisted row encoding changes.
     const REPRESENTATION_VERSION: u32 = 2;
 
@@ -664,7 +670,11 @@ impl FieldSlotIndex {
                     .dynamic_writes
                     .iter()
                     .map(|write| {
-                        ScopedDynamicWrite::open(write.site.clone(), UnknownReason::UnmodeledLoad)
+                        ScopedDynamicWrite::open(
+                            write.site.clone(),
+                            write.names.clone(),
+                            UnknownReason::UnmodeledLoad,
+                        )
                     })
                     .collect();
                 let mut effects = super::dynamic_stores::survey(
@@ -747,13 +757,30 @@ impl FieldSlotIndex {
     fn finish(
         workspace: &WorkspaceAnalyzer,
         adapter: &dyn TypeFlowAdapter,
-        collected: CollectedSlots,
+        mut collected: CollectedSlots,
         cancellation: &crate::analyzer::semantic::CancellationToken,
     ) -> Result<Self, TypeFlowPlanError> {
+        let mut descriptor_cache: HashMap<FieldSlotKey, bool> = HashMap::default();
+        let descriptor_stores = collected
+            .stores
+            .keys()
+            .filter_map(|(class, member)| {
+                let descriptor = *descriptor_cache
+                    .entry((class.clone(), member.clone()))
+                    .or_insert_with(|| {
+                        adapter.field_access_may_use_descriptor(workspace, class, member)
+                    });
+                descriptor.then(|| (class.clone(), member.clone()))
+            })
+            .collect::<Vec<_>>();
+        for key in descriptor_stores {
+            collected.stores.remove(&key);
+        }
         let store_survey = FieldStoreSurvey::from_collected(&collected);
         let persistable = collected.dynamic_writes.is_empty()
             && !collected.globally_incomplete
             && !collected.transient_resolver_budget
+            && !collected.has_open_bound
             && collected.semantic_budget_exhaustion.is_none();
         let mut artifacts = collected
             .persistent_artifacts
@@ -777,9 +804,34 @@ impl FieldSlotIndex {
         });
         let mut hierarchy_cache = HashMap::default();
         let mut slots = Vec::new();
+        let mut open_bound_class_sources = HashSet::default();
         for (class, member) in requested {
             if cancellation.is_cancelled() {
                 return Err(TypeFlowPlanError::Cancelled);
+            }
+            let descriptor = *descriptor_cache
+                .entry((class.clone(), member.clone()))
+                .or_insert_with(|| {
+                    adapter.field_access_may_use_descriptor(workspace, &class, &member)
+                });
+            if descriptor {
+                let site = collected
+                    .loads
+                    .get(&(class.clone(), member.clone()))
+                    .expect("a requested slot retains a load site")
+                    .clone();
+                slots.push(FieldSlot {
+                    class,
+                    member,
+                    atoms: vec![(
+                        ClassAtom::Unknown(UnknownReason::UnmodeledLoad),
+                        SourceSite {
+                            kind: SourceSiteKind::Unknown,
+                            ..site
+                        },
+                    )],
+                });
+                continue;
             }
             let hierarchy = hierarchy_cache
                 .entry(class.clone())
@@ -792,15 +844,18 @@ impl FieldSlotIndex {
             }
             related.sort_by(class_order);
             related.dedup();
+            let has_related_store = collected.stores.keys().any(|(owner, stored_member)| {
+                related.contains(owner) && stored_member.as_ref() == member.as_ref()
+            });
 
             let has_related_dynamic_effect = related.iter().any(|related_class| {
                 let related_hierarchy = hierarchy_cache
                     .entry(related_class.clone())
                     .or_insert_with(|| adapter.class_hierarchy(workspace, related_class));
-                collected
-                    .dynamic_effects
-                    .iter()
-                    .any(|write| write.affects(related_class, related_hierarchy))
+                collected.dynamic_effects.iter().any(|write| {
+                    (has_related_store || !matches!(&write.names, DynamicFieldNameSet::None))
+                        && write.may_change_slot_contents(related_class, related_hierarchy, &member)
+                })
             });
 
             let mut atoms = Vec::new();
@@ -858,19 +913,37 @@ impl FieldSlotIndex {
                         kind: SourceSiteKind::Unknown,
                         ..site
                     },
+                    false,
                 ));
                 dedup_atoms(&mut atoms);
             }
             if atoms.is_empty() {
                 continue;
             }
+            let slot_index = slots.len();
+            let mut field_atoms = Vec::with_capacity(atoms.len());
+            for (atom_index, (atom, site, open_bound)) in atoms.into_iter().enumerate() {
+                assert!(
+                    !open_bound || matches!(atom, ClassAtom::Class(_)),
+                    "only class atoms carry open class bounds"
+                );
+                if open_bound {
+                    open_bound_class_sources.insert((slot_index, atom_index));
+                }
+                field_atoms.push((atom, site));
+            }
             slots.push(FieldSlot {
                 class,
                 member,
-                atoms,
+                atoms: field_atoms,
             });
         }
-        let digest = digest_index(&slots, &store_survey, field_slot_semantics_digest(adapter));
+        let digest = digest_index(
+            &slots,
+            &open_bound_class_sources,
+            &store_survey,
+            field_slot_semantics_digest(adapter),
+        );
         let mut lookup: HashMap<ClassIdentity, HashMap<Box<str>, usize>> = HashMap::default();
         for (index, slot) in slots.iter().enumerate() {
             lookup
@@ -881,6 +954,7 @@ impl FieldSlotIndex {
         let mut index = Self {
             slots,
             lookup,
+            open_bound_class_sources,
             digest,
             store_survey,
             semantic_budget_exhaustion: collected.semantic_budget_exhaustion,
@@ -897,6 +971,10 @@ impl FieldSlotIndex {
         &self,
         key: ClassSetFieldSlotIndexKey,
     ) -> Result<Option<ClassSetFieldSlotIndexRow>, StoreError> {
+        assert!(
+            self.open_bound_class_sources.is_empty(),
+            "open-bound field slots are not persisted"
+        );
         let Some(slots) = self
             .slots
             .iter()
@@ -1071,7 +1149,13 @@ impl FieldSlotIndex {
         }) {
             return Err(PersistedHydrationRejection::Hydration);
         }
-        let digest = digest_index(&slots, &store_survey, semantics_digest);
+        let open_bound_class_sources = HashSet::default();
+        let digest = digest_index(
+            &slots,
+            &open_bound_class_sources,
+            &store_survey,
+            semantics_digest,
+        );
         let mut lookup: HashMap<ClassIdentity, HashMap<Box<str>, usize>> = HashMap::default();
         for (index, slot) in slots.iter().enumerate() {
             if lookup
@@ -1086,6 +1170,7 @@ impl FieldSlotIndex {
         let index = Self {
             slots,
             lookup,
+            open_bound_class_sources,
             digest,
             store_survey,
             semantic_budget_exhaustion: None,
@@ -1128,7 +1213,7 @@ impl FieldSlotIndex {
             .store_survey
             .dynamic_effects
             .iter()
-            .any(|write| write.affects(class, &hierarchy))
+            .any(|write| write.affects(class, &hierarchy, member))
             || self.store_survey.unknown_members
             || self.store_survey.unowned_members.contains(member)
             || hierarchy.unresolved_base
@@ -1140,18 +1225,74 @@ impl FieldSlotIndex {
         }
     }
 
+    /// Dynamic effects are a safe conditional remainder only when every
+    /// effect against this member has both an unbounded receiver and an Any
+    /// name set.
+    pub(super) fn unbounded_any_dynamic_write_evidence(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        adapter: &dyn TypeFlowAdapter,
+        class: &ClassIdentity,
+        member: &str,
+    ) -> Option<Vec<DynamicWriteEvidence>> {
+        let closed = adapter.member_surface_is_closed(workspace, class);
+        let hierarchy = adapter.class_hierarchy(workspace, class);
+        let mut evidence = Vec::new();
+        for write in self
+            .store_survey
+            .dynamic_effects
+            .iter()
+            .filter(|write| !closed && write.affects(class, &hierarchy, member))
+        {
+            if !write.global || !matches!(&write.names, DynamicFieldNameSet::Any) {
+                return None;
+            }
+            evidence.push(write.evidence.clone());
+        }
+        if evidence.is_empty() {
+            return None;
+        }
+        evidence.sort_unstable_by_key(DynamicWriteEvidence::origin);
+        evidence.dedup();
+        Some(evidence)
+    }
+
+    /// `Unknown` member-store evidence can be attributed to global dynamic
+    /// writes only when no separate survey or hierarchy gap also keeps the
+    /// slot open.
+    pub(super) fn member_store_unknown_only_from_unbounded_any_writes(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        adapter: &dyn TypeFlowAdapter,
+        class: &ClassIdentity,
+        member: &str,
+    ) -> Option<Vec<DynamicWriteEvidence>> {
+        let evidence =
+            self.unbounded_any_dynamic_write_evidence(workspace, adapter, class, member)?;
+        let hierarchy = adapter.class_hierarchy(workspace, class);
+        if self.store_survey.unknown_members
+            || self.store_survey.unowned_members.contains(member)
+            || hierarchy.unresolved_base
+            || hierarchy.dynamic_attributes
+        {
+            return None;
+        }
+        Some(evidence)
+    }
+
     pub(super) fn dynamic_write_evidence(
         &self,
         workspace: &WorkspaceAnalyzer,
         adapter: &dyn TypeFlowAdapter,
         class: &ClassIdentity,
+        member: &str,
     ) -> impl Iterator<Item = &DynamicWriteEvidence> {
         let closed = adapter.member_surface_is_closed(workspace, class);
         let hierarchy = adapter.class_hierarchy(workspace, class);
         self.store_survey
             .dynamic_effects
             .iter()
-            .filter(move |write| !closed && write.affects(class, &hierarchy))
+            .filter(move |write| !closed && write.affects(class, &hierarchy, member))
             .map(|write| &write.evidence)
     }
 
@@ -1160,6 +1301,20 @@ impl FieldSlotIndex {
             .get(class)?
             .get(member)
             .map(|index| &self.slots[*index])
+    }
+
+    pub(super) fn atom_is_open_bound(&self, slot: &FieldSlot, atom_index: usize) -> bool {
+        let slot_index = *self
+            .lookup
+            .get(&slot.class)
+            .and_then(|members| members.get(&slot.member))
+            .expect("a field-slot reference belongs to this index");
+        assert!(
+            std::ptr::eq(&self.slots[slot_index], slot),
+            "a field-slot reference belongs to this index"
+        );
+        self.open_bound_class_sources
+            .contains(&(slot_index, atom_index))
     }
 
     pub const fn digest(&self) -> StableDigest {
@@ -1201,29 +1356,37 @@ impl FieldSlotIndex {
     }
 
     fn retained_bytes(&self) -> usize {
-        let slot_bytes = self.slots.iter().fold(
-            self.slots
-                .capacity()
-                .saturating_mul(std::mem::size_of::<FieldSlot>()),
-            |total, slot| {
-                total
-                    .saturating_add(slot.member.len())
-                    .saturating_add(
-                        slot.atoms
-                            .capacity()
-                            .saturating_mul(std::mem::size_of::<FieldSlotAtom>()),
-                    )
-                    .saturating_add(class_identity_heap_bytes(&slot.class))
-                    .saturating_add(slot.atoms.iter().fold(0usize, |total, (atom, source)| {
-                        total
-                            .saturating_add(match atom {
-                                ClassAtom::Class(class) => class_identity_heap_bytes(class),
-                                ClassAtom::Unknown(reason) => unknown_reason_heap_bytes(reason),
-                            })
-                            .saturating_add(project_file_path_bytes(&source.file))
-                    }))
-            },
-        );
+        let slot_bytes = self
+            .slots
+            .iter()
+            .fold(
+                self.slots
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<FieldSlot>()),
+                |total, slot| {
+                    total
+                        .saturating_add(slot.member.len())
+                        .saturating_add(slot.atoms.capacity().saturating_mul(std::mem::size_of::<(
+                            ClassAtom,
+                            SourceSite,
+                        )>(
+                        )))
+                        .saturating_add(class_identity_heap_bytes(&slot.class))
+                        .saturating_add(slot.atoms.iter().fold(0usize, |total, (atom, source)| {
+                            total
+                                .saturating_add(match atom {
+                                    ClassAtom::Class(class) => class_identity_heap_bytes(class),
+                                    ClassAtom::Unknown(reason) => unknown_reason_heap_bytes(reason),
+                                })
+                                .saturating_add(project_file_path_bytes(&source.file))
+                        }))
+                },
+            )
+            .saturating_add(
+                self.open_bound_class_sources
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(usize, usize)>()),
+            );
         let lookup_bytes = self.lookup.iter().fold(
             self.lookup
                 .capacity()
@@ -1542,6 +1705,8 @@ fn portable_path(file: &ProjectFile) -> Option<String> {
 fn source_kind(label: &str) -> Option<SourceSiteKind> {
     Some(match label {
         "constructor_call" => SourceSiteKind::ConstructorCall,
+        "exact_access_result" => SourceSiteKind::ExactAccessResult,
+        "exact_call_result" => SourceSiteKind::ExactCallResult,
         "literal" => SourceSiteKind::Literal,
         "container_literal" => SourceSiteKind::ContainerLiteral,
         "declared_parameter" => SourceSiteKind::DeclaredParameter,
@@ -1566,18 +1731,27 @@ fn collect_procedure(
             DynamicFieldWrite::Member(member) => {
                 collected.dynamic_members.insert(member);
             }
-            DynamicFieldWrite::Any { receiver, span } => {
+            DynamicFieldWrite::Scoped {
+                names,
+                receiver,
+                span,
+            } => {
                 if let Some(file) = file_for_procedure(workspace, procedure) {
                     collected.dynamic_writes.push(PendingDynamicWrite {
                         procedure: procedure.clone(),
                         receiver,
+                        names,
                         site: SourceSite {
                             file,
                             span,
                             kind: SourceSiteKind::Unknown,
                         },
                     });
-                } else {
+                } else if match &names {
+                    DynamicFieldNameSet::Exact(names) => !names.is_empty(),
+                    DynamicFieldNameSet::Prefix(_) | DynamicFieldNameSet::Any => true,
+                    DynamicFieldNameSet::None => false,
+                } {
                     collected.globally_incomplete = true;
                 }
             }
@@ -1617,6 +1791,7 @@ fn collect_procedure(
                             collected.dynamic_writes.push(PendingDynamicWrite {
                                 procedure: procedure.clone(),
                                 receiver: Some(base),
+                                names: DynamicFieldNameSet::Any,
                                 site: SourceSite {
                                     file,
                                     span: mapping_span(procedure, event.source),
@@ -1657,6 +1832,7 @@ fn collect_procedure(
                         span,
                     );
                     collected.transient_resolver_budget |= classified.transient_resolver_budget;
+                    collected.has_open_bound |= classified.has_open_bound;
                     collected
                         .stores
                         .entry((class, member))
@@ -1805,6 +1981,7 @@ struct StoredValueClassification {
     atoms: Vec<FieldSlotAtom>,
     incomplete: bool,
     transient_resolver_budget: bool,
+    has_open_bound: bool,
 }
 
 impl StoredValueClassification {
@@ -1819,6 +1996,8 @@ impl StoredValueClassification {
             self.incomplete = true;
             return;
         }
+        let has_open_bound = class_seed_has_open_bound(&seed);
+        self.has_open_bound |= has_open_bound;
         for atom in seed.into_atoms() {
             match atom {
                 ClassAtom::Class(_) => self.atoms.push((
@@ -1828,6 +2007,7 @@ impl StoredValueClassification {
                         span,
                         kind,
                     },
+                    has_open_bound,
                 )),
                 ClassAtom::Unknown(UnknownReason::OpenTypeBound) => self.atoms.push((
                     atom,
@@ -1836,6 +2016,7 @@ impl StoredValueClassification {
                         span,
                         kind: SourceSiteKind::Unknown,
                     },
+                    false,
                 )),
                 ClassAtom::Unknown(reason) => {
                     self.incomplete = true;
@@ -1855,6 +2036,7 @@ impl StoredValueClassification {
                     span,
                     kind: SourceSiteKind::Unknown,
                 },
+                false,
             ));
         }
         dedup_atoms(&mut self.atoms);
@@ -1907,12 +2089,18 @@ fn classify_stored_value(
             .iter()
             .find(|call| call.result == Some(value) || call.normal_results.contains(&value))
         {
-            classified.observe_seed(
-                adapter.constructed_class(workspace, procedure, call),
-                &file,
-                span,
-                SourceSiteKind::ConstructorCall,
-            );
+            let (seed, kind) = adapter
+                .exact_call_result_class(workspace, procedure, call)
+                .map_or_else(
+                    || {
+                        (
+                            adapter.constructed_class(workspace, procedure, call),
+                            SourceSiteKind::ConstructorCall,
+                        )
+                    },
+                    |classes| (ClassSeed::Classes(classes), SourceSiteKind::ExactCallResult),
+                );
+            classified.observe_seed(seed, &file, span, kind);
             continue;
         }
         if let Some(allocation) = semantics
@@ -1986,27 +2174,11 @@ fn classify_stored_value(
     classified.finish(file, span)
 }
 
-fn mapping_span(
-    procedure: &ProcedureHandle,
-    source: crate::analyzer::semantic::SourceMappingId,
-) -> SourceSpan {
-    procedure
-        .semantics()
-        .source_mapping(source)
-        .expect("a retained IR row's source mapping is live")
-        .locator
-        .anchor()
-        .span()
-}
-
 fn file_for_procedure(
     workspace: &WorkspaceAnalyzer,
     procedure: &ProcedureHandle,
 ) -> Option<ProjectFile> {
-    workspace
-        .analyzer()
-        .project()
-        .file_by_rel_path(Path::new(procedure.semantics().locator().path().as_str()))
+    file_for_locator(workspace, procedure.semantics().locator())
 }
 
 pub(super) fn class_order(left: &ClassIdentity, right: &ClassIdentity) -> std::cmp::Ordering {
@@ -2035,9 +2207,9 @@ pub(super) fn class_order(left: &ClassIdentity, right: &ClassIdentity) -> std::c
     }
 }
 
-fn atom_order(
-    (left, left_site): &(ClassAtom, SourceSite),
-    (right, right_site): &(ClassAtom, SourceSite),
+fn classified_atom_order(
+    (left, left_site, left_open_bound): &FieldSlotAtom,
+    (right, right_site, right_open_bound): &FieldSlotAtom,
 ) -> std::cmp::Ordering {
     let atom_order = match (left, right) {
         (ClassAtom::Class(left), ClassAtom::Class(right)) => class_order(left, right),
@@ -2048,7 +2220,25 @@ fn atom_order(
             .cmp(right.label())
             .then_with(|| left.cmp(right)),
     };
-    atom_order.then_with(|| source_site_order(left_site, right_site))
+    atom_order
+        .then_with(|| source_site_order(left_site, right_site))
+        .then_with(|| left_open_bound.cmp(right_open_bound))
+}
+
+fn atom_order(
+    (left, left_site): &(ClassAtom, SourceSite),
+    (right, right_site): &(ClassAtom, SourceSite),
+) -> std::cmp::Ordering {
+    let class_order = match (left, right) {
+        (ClassAtom::Class(left), ClassAtom::Class(right)) => class_order(left, right),
+        (ClassAtom::Class(_), ClassAtom::Unknown(_)) => std::cmp::Ordering::Less,
+        (ClassAtom::Unknown(_), ClassAtom::Class(_)) => std::cmp::Ordering::Greater,
+        (ClassAtom::Unknown(left), ClassAtom::Unknown(right)) => left
+            .label()
+            .cmp(right.label())
+            .then_with(|| left.cmp(right)),
+    };
+    class_order.then_with(|| source_site_order(left_site, right_site))
 }
 
 fn source_site_order(left: &SourceSite, right: &SourceSite) -> std::cmp::Ordering {
@@ -2059,22 +2249,52 @@ fn source_site_order(left: &SourceSite, right: &SourceSite) -> std::cmp::Orderin
         .then_with(|| source_kind_label(left.kind).cmp(source_kind_label(right.kind)))
 }
 
-fn dedup_atoms(atoms: &mut Vec<(ClassAtom, SourceSite)>) {
-    atoms.sort_by(atom_order);
+fn dedup_atoms(atoms: &mut Vec<FieldSlotAtom>) {
+    atoms.sort_by(classified_atom_order);
     atoms.dedup();
+}
+
+fn dynamic_field_names_heap_bytes(names: &DynamicFieldNameSet) -> usize {
+    match names {
+        DynamicFieldNameSet::Exact(names) => names
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Box<str>>())
+            .saturating_add(names.iter().map(|name| name.len()).sum::<usize>()),
+        DynamicFieldNameSet::Prefix(prefix) => prefix.len(),
+        DynamicFieldNameSet::Any | DynamicFieldNameSet::None => 0,
+    }
+}
+
+fn digest_dynamic_field_names(digest: &mut LengthDelimitedDigest, names: &DynamicFieldNameSet) {
+    match names {
+        DynamicFieldNameSet::Exact(names) => {
+            digest.push(b"exact");
+            for name in names {
+                digest.push(name.as_bytes());
+            }
+        }
+        DynamicFieldNameSet::Prefix(prefix) => {
+            digest.push(b"prefix");
+            digest.push(prefix.as_bytes());
+        }
+        DynamicFieldNameSet::Any => digest.push(b"any"),
+        DynamicFieldNameSet::None => digest.push(b"none"),
+    }
 }
 
 fn digest_index(
     slots: &[FieldSlot],
+    open_bound_class_sources: &HashSet<(usize, usize)>,
     survey: &FieldStoreSurvey,
     semantics: StableDigest,
 ) -> StableDigest {
     let mut digest = LengthDelimitedDigest::new(b"bifrost-type-flow-field-index-v2");
-    digest.push(digest_slots(slots, semantics).as_bytes());
+    digest.push(digest_slots(slots, open_bound_class_sources, semantics).as_bytes());
     digest.push(&[u8::from(survey.unknown_members)]);
     for write in &survey.dynamic_effects {
         digest.push(write.evidence.origin().as_bytes());
         digest.push(&[u8::from(write.global)]);
+        digest_dynamic_field_names(&mut digest, &write.names);
         for class in &write.classes {
             digest.push(b"exact");
             push_class(&mut digest, class);
@@ -2097,13 +2317,17 @@ fn digest_index(
     digest.finish()
 }
 
-fn digest_slots(slots: &[FieldSlot], semantics: StableDigest) -> StableDigest {
+fn digest_slots(
+    slots: &[FieldSlot],
+    open_bound_class_sources: &HashSet<(usize, usize)>,
+    semantics: StableDigest,
+) -> StableDigest {
     let mut digest = LengthDelimitedDigest::new(b"bifrost-type-flow-field-slots-v1");
     digest.push(semantics.as_bytes());
-    for slot in slots {
+    for (slot_index, slot) in slots.iter().enumerate() {
         push_class(&mut digest, &slot.class);
         digest.push(slot.member.as_bytes());
-        for (atom, site) in &slot.atoms {
+        for (atom_index, (atom, site)) in slot.atoms.iter().enumerate() {
             match atom {
                 ClassAtom::Class(class) => {
                     digest.push(b"class");
@@ -2118,6 +2342,9 @@ fn digest_slots(slots: &[FieldSlot], semantics: StableDigest) -> StableDigest {
             digest.push(&site.span.start_byte().to_le_bytes());
             digest.push(&site.span.end_byte().to_le_bytes());
             digest.push(source_kind_label(site.kind).as_bytes());
+            digest.push(&[u8::from(
+                open_bound_class_sources.contains(&(slot_index, atom_index)),
+            )]);
         }
     }
     digest.finish()
@@ -2149,6 +2376,8 @@ fn push_class(digest: &mut LengthDelimitedDigest, class: &ClassIdentity) {
 const fn source_kind_label(kind: SourceSiteKind) -> &'static str {
     match kind {
         SourceSiteKind::ConstructorCall => "constructor_call",
+        SourceSiteKind::ExactAccessResult => "exact_access_result",
+        SourceSiteKind::ExactCallResult => "exact_call_result",
         SourceSiteKind::Literal => "literal",
         SourceSiteKind::ContainerLiteral => "container_literal",
         SourceSiteKind::DeclaredParameter => "declared_parameter",
@@ -2162,11 +2391,6 @@ const fn source_kind_label(kind: SourceSiteKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, Barrier};
-    use std::thread;
-    use std::time::{Duration, Instant};
-
     use super::*;
     use crate::analyzer::semantic::{
         AllocationSite, ClassHierarchy, ClassSeed, DynamicFieldWrite, IcfgProvider,
@@ -2178,8 +2402,15 @@ mod tests {
     use crate::inline_project::{BuiltInlineTestProject, InlineTestProject};
     use crate::type_flow::solve_type_flow_workspace;
     use crate::value_flow::ClosureLimits;
+    use brokk_bifrost_test_macros::hardwon;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     #[test]
+    #[hardwon(
+        "5cbb54cd15c9: computed writes must retain independent identity predecessors without inheriting operand definitions"
+    )]
     fn computed_definition_keeps_only_its_independent_identity_predecessors() {
         use crate::analyzer::semantic::{
             ProgramPoint, SemanticEvent, TransferKind, TransferOperation, ValueId,
@@ -2284,17 +2515,15 @@ mod tests {
             classification
                 .atoms
                 .iter()
-                .any(|(atom, _)| { atom == &ClassAtom::Class(class.clone()) })
+                .any(|(atom, _, _)| { atom == &ClassAtom::Class(class.clone()) })
         );
-        assert!(classification.atoms.iter().any(|(atom, site)| {
+        assert!(classification.atoms.iter().any(|(atom, site, _)| {
             atom == &ClassAtom::Unknown(UnknownReason::OpenTypeBound)
                 && site.kind == SourceSiteKind::Unknown
         }));
-        assert!(
-            !classification.atoms.iter().any(|(atom, _)| {
-                atom == &ClassAtom::Unknown(UnknownReason::FieldSlotIncomplete)
-            })
-        );
+        assert!(!classification.atoms.iter().any(|(atom, _, _)| {
+            atom == &ClassAtom::Unknown(UnknownReason::FieldSlotIncomplete)
+        }));
     }
 
     fn field_slot_project() -> BuiltInlineTestProject {
@@ -2367,14 +2596,10 @@ mod tests {
     }
 
     fn wait_for_field_slot_follower(cache: &FieldSlotIndexCache) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while cache.complete.waiting_count_for_test() == 0 {
-            assert!(
-                Instant::now() < deadline,
-                "same-key field-slot follower never entered the flight"
-            );
-            thread::yield_now();
-        }
+        brokk_bifrost_core::test_support::wait_for_nonzero_count(
+            || cache.complete.waiting_count_for_test(),
+            "same-key field-slot follower never entered the flight",
+        );
     }
 
     struct BlockingTypeFlowAdapter {
@@ -2500,6 +2725,14 @@ mod tests {
             self.inner.member_lookup(workspace, kind, class, member)
         }
 
+        fn member_lookup_for_receiver(
+            &self,
+            workspace: &WorkspaceAnalyzer,
+            query: MemberReceiverQuery<'_>,
+        ) -> MemberLookup {
+            self.inner.member_lookup_for_receiver(workspace, query)
+        }
+
         fn enclosing_class(
             &self,
             workspace: &WorkspaceAnalyzer,
@@ -2590,7 +2823,13 @@ mod tests {
         slots.store_survey.dynamic_effects = collected
             .dynamic_writes
             .iter()
-            .map(|write| ScopedDynamicWrite::open(write.site.clone(), UnknownReason::UnmodeledLoad))
+            .map(|write| {
+                ScopedDynamicWrite::open(
+                    write.site.clone(),
+                    write.names.clone(),
+                    UnknownReason::UnmodeledLoad,
+                )
+            })
             .collect();
         let caller = procedures
             .iter()
@@ -2631,243 +2870,6 @@ mod tests {
             adapter.constructed_queries.load(Ordering::Relaxed),
             0,
             "class seeding cannot repair a discovery the survey already rejects"
-        );
-    }
-
-    #[test]
-    fn dynamic_write_survey_does_not_seed_disjoint_roots() {
-        let project = InlineTestProject::with_language(Language::Python)
-            .file(
-                "app.py",
-                concat!(
-                    "class Value:\n    pass\n",
-                    "def unrelated():\n    return Value()\n",
-                    "def unrelated_indexed():\n    return [Value()][0]\n",
-                    "def unrelated_opaque():\n    class Hidden:\n        pass\n    return Value()\n",
-                    "def write(target, name):\n    setattr(target, name, 1)\n",
-                    "def caller():\n    write(Value(), 'extra')\n",
-                ),
-            )
-            .build();
-        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
-        let adapter = BlockingTypeFlowAdapter::python().without_hierarchy_block();
-        let cancellation = crate::analyzer::semantic::CancellationToken::default();
-        let mut budget = SemanticBudget::default();
-        let artifact = workspace
-            .materialize_program_semantics(
-                &project.file("app.py"),
-                &mut SemanticRequest::new(&mut budget, &cancellation),
-            )
-            .unwrap()
-            .available_value()
-            .cloned()
-            .unwrap();
-        let procedures = artifact
-            .procedures()
-            .iter()
-            .map(|procedure| artifact.procedure_handle(procedure.id()).unwrap())
-            .collect::<Vec<_>>();
-        let mut collected = CollectedSlots::default();
-        for procedure in &procedures {
-            collect_procedure(
-                &workspace,
-                &adapter,
-                procedure,
-                &mut collected,
-                &cancellation,
-            )
-            .unwrap();
-        }
-        assert_eq!(collected.dynamic_writes.len(), 1);
-        let mut slots =
-            FieldSlotIndex::finish(&workspace, &adapter, collected.clone(), &cancellation).unwrap();
-        slots.store_survey.dynamic_effects = collected
-            .dynamic_writes
-            .iter()
-            .map(|write| ScopedDynamicWrite::open(write.site.clone(), UnknownReason::UnmodeledLoad))
-            .collect();
-        for name in [
-            "unrelated",
-            "unrelated_indexed",
-            "unrelated_opaque",
-            "caller",
-        ] {
-            let root = procedures
-                .iter()
-                .find(|procedure| {
-                    procedure
-                        .semantics()
-                        .locator()
-                        .declaration()
-                        .segments()
-                        .last()
-                        .and_then(|segment| segment.name())
-                        == Some(name)
-                })
-                .unwrap();
-            adapter.constructed_queries.store(0, Ordering::Relaxed);
-            let effects = super::super::dynamic_stores::survey(
-                &workspace,
-                &adapter,
-                &slots,
-                std::slice::from_ref(root),
-                &collected.dynamic_writes,
-                ValueFlowCache::default(),
-                &mut budget,
-                &mut SolverBudget::default(),
-                &cancellation,
-            )
-            .unwrap();
-            if name == "unrelated_opaque" {
-                assert!(
-                    adapter.constructed_queries.load(Ordering::Relaxed) > 0,
-                    "missing control topology must retain the original plan boundary path"
-                );
-            } else if name != "caller" {
-                assert_eq!(
-                    adapter.constructed_queries.load(Ordering::Relaxed),
-                    0,
-                    "discovery proves this root cannot reach the surveyed write"
-                );
-                assert!(effects[0].classes.is_empty());
-            } else {
-                assert!(
-                    effects[0]
-                        .classes
-                        .iter()
-                        .any(|class| class.qualified_name() == "app.Value"),
-                    "the connected caller must contribute its actual receiver: {effects:?}"
-                );
-                assert!(adapter.constructed_queries.load(Ordering::Relaxed) > 0);
-                let provider = crate::value_flow::WorkspaceValueFlowProvider::new(
-                    &workspace,
-                    crate::value_flow::ValueFlowCache::default(),
-                );
-                let stopped = super::super::plan::TypeFlowDiscovery::new(
-                    root,
-                    &provider,
-                    ClosureLimits { max_procedures: 1 },
-                    &mut budget,
-                    &cancellation,
-                )
-                .unwrap();
-                assert!(
-                    !stopped.excludes_procedures(
-                        collected
-                            .dynamic_writes
-                            .iter()
-                            .map(|write| &write.procedure)
-                    ),
-                    "a procedure cap must not hide the connected write"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn dynamic_write_survey_skips_roots_that_only_reach_open_writes() {
-        let project = InlineTestProject::with_language(Language::Python)
-            .file(
-                "app.py",
-                concat!(
-                    "class Value:\n    pass\n",
-                    "def open_write(name):\n    setattr([Value()][0], name, 1)\n",
-                    "def redundant(name):\n    value = Value()\n    open_write(name)\n",
-                    "def pending_write(name):\n    setattr(Value(), name, 1)\n",
-                ),
-            )
-            .build();
-        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
-        let adapter = BlockingTypeFlowAdapter::python().without_hierarchy_block();
-        let cancellation = crate::analyzer::semantic::CancellationToken::default();
-        let mut budget = SemanticBudget::default();
-        let artifact = workspace
-            .materialize_program_semantics(
-                &project.file("app.py"),
-                &mut SemanticRequest::new(&mut budget, &cancellation),
-            )
-            .unwrap()
-            .available_value()
-            .cloned()
-            .unwrap();
-        let procedures = artifact
-            .procedures()
-            .iter()
-            .map(|procedure| artifact.procedure_handle(procedure.id()).unwrap())
-            .collect::<Vec<_>>();
-        let mut collected = CollectedSlots::default();
-        for procedure in &procedures {
-            collect_procedure(
-                &workspace,
-                &adapter,
-                procedure,
-                &mut collected,
-                &cancellation,
-            )
-            .unwrap();
-        }
-        assert_eq!(collected.dynamic_writes.len(), 2);
-        let slots =
-            FieldSlotIndex::finish(&workspace, &adapter, collected.clone(), &cancellation).unwrap();
-        let root = |name| {
-            procedures
-                .iter()
-                .find(|procedure| {
-                    procedure
-                        .semantics()
-                        .locator()
-                        .declaration()
-                        .segments()
-                        .last()
-                        .and_then(|segment| segment.name())
-                        == Some(name)
-                })
-                .unwrap()
-                .clone()
-        };
-        let mut outcomes = Vec::new();
-        for roots in [
-            vec![root("open_write"), root("pending_write")],
-            vec![root("open_write"), root("redundant"), root("pending_write")],
-        ] {
-            adapter.constructed_queries.store(0, Ordering::Relaxed);
-            let effects = super::super::dynamic_stores::survey(
-                &workspace,
-                &adapter,
-                &slots,
-                &roots,
-                &collected.dynamic_writes,
-                ValueFlowCache::default(),
-                &mut SemanticBudget::default(),
-                &mut SolverBudget::default(),
-                &cancellation,
-            )
-            .unwrap();
-            let open = effects
-                .iter()
-                .find(|effect| effect.evidence.reason.is_some())
-                .unwrap();
-            assert_eq!(open.evidence.reason, Some(UnknownReason::UnmodeledLoad));
-            let pending = effects
-                .iter()
-                .find(|effect| effect.evidence.reason.is_none())
-                .unwrap();
-            assert!(
-                pending
-                    .classes
-                    .iter()
-                    .any(|class| class.qualified_name() == "app.Value"),
-                "the pending write must still receive its actual class: {effects:?}"
-            );
-            outcomes.push((effects, adapter.constructed_queries.load(Ordering::Relaxed)));
-        }
-        assert_eq!(
-            outcomes[0].0, outcomes[1].0,
-            "adding the redundant root cannot change effects"
-        );
-        assert_eq!(
-            outcomes[0].1, outcomes[1].1,
-            "a root that reaches only an already-open write must not seed another plan"
         );
     }
 
@@ -3238,58 +3240,6 @@ mod tests {
     }
 
     #[test]
-    fn resolver_budget_incomplete_field_slots_are_never_cached_or_persisted() {
-        let project = field_slot_project();
-        let workspace =
-            WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
-                .expect("persisted workspace builds");
-        let adapter = BlockingTypeFlowAdapter::python()
-            .with_constructed_seed(ClassSeed::Unknown(UnknownReason::SemanticBudget))
-            .without_hierarchy_block()
-            .with_semantics(
-                crate::analyzer::semantic::AdapterSemanticsVersion::hash_bytes(
-                    "python-semantic-budget-seed-test",
-                    b"v1",
-                )
-                .expect("test adapter identity is named"),
-            );
-        let cache = FieldSlotIndexCache::default();
-        let cancellation = crate::analyzer::semantic::CancellationToken::new();
-
-        for _ in 0..2 {
-            let mut budget = SemanticBudget::default();
-            let acquired = acquire(&workspace, &adapter, &cache, &mut budget, &cancellation)
-                .expect("resolver-budget classification returns an honest incomplete index");
-            assert_eq!(acquired.kind, FieldSlotIndexAcquisitionKind::Built);
-            assert!(!acquired.published);
-            assert!(!acquired.index.persistable);
-            assert!(acquired.index.semantic_budget_exhausted());
-            assert_eq!(acquired.index.semantic_budget_exhaustion(), None);
-            assert!(acquired.index.slots().iter().any(|slot| {
-                slot.atoms.iter().any(|(atom, _)| {
-                    matches!(atom, ClassAtom::Unknown(UnknownReason::FieldSlotIncomplete))
-                })
-            }));
-        }
-
-        let key = field_slot_persistence_key(
-            &workspace,
-            &adapter,
-            WorkspaceIcfgProvider::new(&workspace).behavior_identity(),
-            None,
-        )
-        .expect("persisted workspace has a field-slot key");
-        assert!(
-            workspace
-                .store()
-                .expect("persisted workspace has a store")
-                .class_set_field_slot_index(&key, &cancellation)
-                .expect("field-slot lookup succeeds")
-                .is_none()
-        );
-    }
-
-    #[test]
     fn field_slot_winner_published_during_incomplete_acquisition_is_recovered() {
         let project = field_slot_project();
         let workspace =
@@ -3400,39 +3350,6 @@ mod tests {
             assert_eq!(replayed.kind, FieldSlotIndexAcquisitionKind::MemoryHit);
             assert!(Arc::ptr_eq(&recovered.index, &replayed.index));
         });
-    }
-
-    #[test]
-    fn ephemeral_field_slots_reuse_memory_without_durable_store() {
-        let project = field_slot_project();
-        let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
-            project.project_dyn(),
-            AnalyzerConfig::default(),
-        )
-        .expect("ephemeral workspace builds");
-        let adapter = type_flow_adapter(Language::Python).expect("Python type-flow adapter");
-        let cache = FieldSlotIndexCache::default();
-        let cancellation = crate::analyzer::semantic::CancellationToken::new();
-
-        let mut cold_budget = SemanticBudget::default();
-        let cold = acquire(&workspace, adapter, &cache, &mut cold_budget, &cancellation)
-            .expect("ephemeral index builds");
-        assert_eq!(cold.kind, FieldSlotIndexAcquisitionKind::Built);
-        assert_eq!(
-            cold.miss_reason,
-            Some(FieldSlotIndexMissReason::NoPersistentStore)
-        );
-        assert!(!cold.published);
-
-        let mut warm_budget = SemanticBudget::default();
-        let warm = acquire(&workspace, adapter, &cache, &mut warm_budget, &cancellation)
-            .expect("ephemeral index reuses memory");
-        assert_eq!(warm.kind, FieldSlotIndexAcquisitionKind::MemoryHit);
-        assert_eq!(warm.miss_reason, None);
-        assert!(!warm.published);
-        assert!(Arc::ptr_eq(&cold.index, &warm.index));
-        assert_eq!(cold.index.digest(), warm.index.digest());
-        assert_eq!(warm_budget.used(), artifact_census(&warm.index));
     }
 
     #[test]
@@ -3796,6 +3713,339 @@ mod tests {
         assert_eq!(recovered.kind, FieldSlotIndexAcquisitionKind::PersistentHit);
         assert_eq!(recovered.miss_reason, None);
         assert_eq!(recovered.index.digest(), failed.index.digest());
+    }
+
+    #[hardwon(
+        "5b11f64c8ae7: dynamic-write survey seeded field-slot roots outside its reachable closure"
+    )]
+    #[test]
+    fn dynamic_write_survey_does_not_seed_disjoint_roots() {
+        let project = InlineTestProject::with_language(Language::Python)
+            .file(
+                "app.py",
+                concat!(
+                    "class Value:\n    pass\n",
+                    "def unrelated():\n    return Value()\n",
+                    "def unrelated_indexed():\n    return [Value()][0]\n",
+                    "def unrelated_opaque():\n    class Hidden:\n        pass\n    return Value()\n",
+                    "def write(target, name):\n    setattr(target, name, 1)\n",
+                    "def caller():\n    write(Value(), 'extra')\n",
+                ),
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let adapter = BlockingTypeFlowAdapter::python().without_hierarchy_block();
+        let cancellation = crate::analyzer::semantic::CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &project.file("app.py"),
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .unwrap()
+            .available_value()
+            .cloned()
+            .unwrap();
+        let procedures = artifact
+            .procedures()
+            .iter()
+            .map(|procedure| artifact.procedure_handle(procedure.id()).unwrap())
+            .collect::<Vec<_>>();
+        let mut collected = CollectedSlots::default();
+        for procedure in &procedures {
+            collect_procedure(
+                &workspace,
+                &adapter,
+                procedure,
+                &mut collected,
+                &cancellation,
+            )
+            .unwrap();
+        }
+        assert_eq!(collected.dynamic_writes.len(), 1);
+        let mut slots =
+            FieldSlotIndex::finish(&workspace, &adapter, collected.clone(), &cancellation).unwrap();
+        slots.store_survey.dynamic_effects = collected
+            .dynamic_writes
+            .iter()
+            .map(|write| {
+                ScopedDynamicWrite::open(
+                    write.site.clone(),
+                    write.names.clone(),
+                    UnknownReason::UnmodeledLoad,
+                )
+            })
+            .collect();
+        for name in [
+            "unrelated",
+            "unrelated_indexed",
+            "unrelated_opaque",
+            "caller",
+        ] {
+            let root = procedures
+                .iter()
+                .find(|procedure| {
+                    procedure
+                        .semantics()
+                        .locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some(name)
+                })
+                .unwrap();
+            adapter.constructed_queries.store(0, Ordering::Relaxed);
+            let effects = super::super::dynamic_stores::survey(
+                &workspace,
+                &adapter,
+                &slots,
+                std::slice::from_ref(root),
+                &collected.dynamic_writes,
+                ValueFlowCache::default(),
+                &mut budget,
+                &mut SolverBudget::default(),
+                &cancellation,
+            )
+            .unwrap();
+            if name == "unrelated_opaque" {
+                assert!(
+                    adapter.constructed_queries.load(Ordering::Relaxed) > 0,
+                    "missing control topology must retain the original plan boundary path"
+                );
+            } else if name != "caller" {
+                assert_eq!(
+                    adapter.constructed_queries.load(Ordering::Relaxed),
+                    0,
+                    "discovery proves this root cannot reach the surveyed write"
+                );
+                assert!(effects[0].classes.is_empty());
+            } else {
+                assert!(
+                    effects[0]
+                        .classes
+                        .iter()
+                        .any(|class| class.qualified_name() == "app.Value"),
+                    "the connected caller must contribute its actual receiver: {effects:?}"
+                );
+                assert!(adapter.constructed_queries.load(Ordering::Relaxed) > 0);
+                let provider = crate::value_flow::WorkspaceValueFlowProvider::new(
+                    &workspace,
+                    crate::value_flow::ValueFlowCache::default(),
+                );
+                let stopped = super::super::plan::TypeFlowDiscovery::new(
+                    root,
+                    &provider,
+                    ClosureLimits { max_procedures: 1 },
+                    &mut budget,
+                    &cancellation,
+                )
+                .unwrap();
+                assert!(
+                    !stopped.excludes_procedures(
+                        collected
+                            .dynamic_writes
+                            .iter()
+                            .map(|write| &write.procedure)
+                    ),
+                    "a procedure cap must not hide the connected write"
+                );
+            }
+        }
+    }
+
+    #[hardwon("94038d26179f: an already-open dynamic write still scheduled field-slot survey work")]
+    #[test]
+    fn dynamic_write_survey_skips_roots_that_only_reach_open_writes() {
+        let project = InlineTestProject::with_language(Language::Python)
+            .file(
+                "app.py",
+                concat!(
+                    "class Value:\n    pass\n",
+                    "def open_write(name):\n    setattr([Value()][0], name, 1)\n",
+                    "def redundant(name):\n    value = Value()\n    open_write(name)\n",
+                    "def pending_write(name):\n    setattr(Value(), name, 1)\n",
+                ),
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let adapter = BlockingTypeFlowAdapter::python().without_hierarchy_block();
+        let cancellation = crate::analyzer::semantic::CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &project.file("app.py"),
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .unwrap()
+            .available_value()
+            .cloned()
+            .unwrap();
+        let procedures = artifact
+            .procedures()
+            .iter()
+            .map(|procedure| artifact.procedure_handle(procedure.id()).unwrap())
+            .collect::<Vec<_>>();
+        let mut collected = CollectedSlots::default();
+        for procedure in &procedures {
+            collect_procedure(
+                &workspace,
+                &adapter,
+                procedure,
+                &mut collected,
+                &cancellation,
+            )
+            .unwrap();
+        }
+        assert_eq!(collected.dynamic_writes.len(), 2);
+        let slots =
+            FieldSlotIndex::finish(&workspace, &adapter, collected.clone(), &cancellation).unwrap();
+        let root = |name| {
+            procedures
+                .iter()
+                .find(|procedure| {
+                    procedure
+                        .semantics()
+                        .locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some(name)
+                })
+                .unwrap()
+                .clone()
+        };
+        let mut outcomes = Vec::new();
+        for roots in [
+            vec![root("open_write"), root("pending_write")],
+            vec![root("open_write"), root("redundant"), root("pending_write")],
+        ] {
+            adapter.constructed_queries.store(0, Ordering::Relaxed);
+            let effects = super::super::dynamic_stores::survey(
+                &workspace,
+                &adapter,
+                &slots,
+                &roots,
+                &collected.dynamic_writes,
+                ValueFlowCache::default(),
+                &mut SemanticBudget::default(),
+                &mut SolverBudget::default(),
+                &cancellation,
+            )
+            .unwrap();
+            let open = effects
+                .iter()
+                .find(|effect| effect.evidence.reason.is_some())
+                .unwrap();
+            assert_eq!(open.evidence.reason, Some(UnknownReason::UnmodeledLoad));
+            let pending = effects
+                .iter()
+                .find(|effect| effect.evidence.reason.is_none())
+                .unwrap();
+            assert!(
+                pending
+                    .classes
+                    .iter()
+                    .any(|class| class.qualified_name() == "app.Value"),
+                "the pending write must still receive its actual class: {effects:?}"
+            );
+            outcomes.push((effects, adapter.constructed_queries.load(Ordering::Relaxed)));
+        }
+        assert_eq!(
+            outcomes[0].0, outcomes[1].0,
+            "adding the redundant root cannot change effects"
+        );
+        assert_eq!(
+            outcomes[0].1, outcomes[1].1,
+            "a root that reaches only an already-open write must not seed another plan"
+        );
+    }
+
+    #[hardwon("5b1cf9d35082: resolver-budget incomplete field slots were reused or persisted")]
+    #[test]
+    fn resolver_budget_incomplete_field_slots_are_never_cached_or_persisted() {
+        let project = field_slot_project();
+        let workspace =
+            WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+                .expect("persisted workspace builds");
+        let adapter = BlockingTypeFlowAdapter::python()
+            .with_constructed_seed(ClassSeed::Unknown(UnknownReason::SemanticBudget))
+            .without_hierarchy_block()
+            .with_semantics(
+                crate::analyzer::semantic::AdapterSemanticsVersion::hash_bytes(
+                    "python-semantic-budget-seed-test",
+                    b"v1",
+                )
+                .expect("test adapter identity is named"),
+            );
+        let cache = FieldSlotIndexCache::default();
+        let cancellation = crate::analyzer::semantic::CancellationToken::new();
+
+        for _ in 0..2 {
+            let mut budget = SemanticBudget::default();
+            let acquired = acquire(&workspace, &adapter, &cache, &mut budget, &cancellation)
+                .expect("resolver-budget classification returns an honest incomplete index");
+            assert_eq!(acquired.kind, FieldSlotIndexAcquisitionKind::Built);
+            assert!(!acquired.published);
+            assert!(!acquired.index.persistable);
+            assert!(acquired.index.semantic_budget_exhausted());
+            assert_eq!(acquired.index.semantic_budget_exhaustion(), None);
+            assert!(acquired.index.slots().iter().any(|slot| {
+                slot.atoms.iter().any(|(atom, _)| {
+                    matches!(atom, ClassAtom::Unknown(UnknownReason::FieldSlotIncomplete))
+                })
+            }));
+        }
+
+        let key = field_slot_persistence_key(
+            &workspace,
+            &adapter,
+            WorkspaceIcfgProvider::new(&workspace).behavior_identity(),
+            None,
+        )
+        .expect("persisted workspace has a field-slot key");
+        assert!(
+            workspace
+                .store()
+                .expect("persisted workspace has a store")
+                .class_set_field_slot_index(&key, &cancellation)
+                .expect("field-slot lookup succeeds")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn ephemeral_field_slots_reuse_memory_without_durable_store() {
+        let project = field_slot_project();
+        let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
+            project.project_dyn(),
+            AnalyzerConfig::default(),
+        )
+        .expect("ephemeral workspace builds");
+        let adapter = type_flow_adapter(Language::Python).expect("Python type-flow adapter");
+        let cache = FieldSlotIndexCache::default();
+        let cancellation = crate::analyzer::semantic::CancellationToken::new();
+
+        let mut cold_budget = SemanticBudget::default();
+        let cold = acquire(&workspace, adapter, &cache, &mut cold_budget, &cancellation)
+            .expect("ephemeral index builds");
+        assert_eq!(cold.kind, FieldSlotIndexAcquisitionKind::Built);
+        assert_eq!(
+            cold.miss_reason,
+            Some(FieldSlotIndexMissReason::NoPersistentStore)
+        );
+        assert!(!cold.published);
+
+        let mut warm_budget = SemanticBudget::default();
+        let warm = acquire(&workspace, adapter, &cache, &mut warm_budget, &cancellation)
+            .expect("ephemeral index reuses memory");
+        assert_eq!(warm.kind, FieldSlotIndexAcquisitionKind::MemoryHit);
+        assert_eq!(warm.miss_reason, None);
+        assert!(!warm.published);
+        assert!(Arc::ptr_eq(&cold.index, &warm.index));
+        assert_eq!(cold.index.digest(), warm.index.digest());
+        assert_eq!(warm_budget.used(), artifact_census(&warm.index));
     }
 
     #[test]

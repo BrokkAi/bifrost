@@ -6,16 +6,17 @@ use std::mem::{size_of, size_of_val};
 use std::sync::Arc;
 
 use crate::analyzer::semantic::{
-    DeclarationLocator, IcfgProvider, ProcedureHandle, ProgramPointId, ReturnTransferKind,
-    SemanticArtifactKey, SemanticBudget,
+    IcfgProvider, ProcedureHandle, ProgramPointId, ReturnTransferKind, SemanticBudget,
 };
 use crate::dataflow::{
     DataflowRequest, PathQuality, PathQualityFrontier, ProcedureSummaryIdentity,
     ProcedureSummaryKey, ReusableIdeEndSummary, ReusableIdeProcedureSummary,
     ReusableIdeReachedFact, ReusableIdeSummaryProvider, SemanticProcedureSummary,
-    SemanticSummarySetValidationError, SolverTermination, SolverWork, SummaryCallCycle,
-    SummaryCalledProcedures, SummaryDependencyKey, SummaryEntry, SummaryExitKind,
-    SummaryRecursiveGroupKey, canonicalize_semantic_summary_items,
+    SemanticSummaryArtifactIndex, SemanticSummarySetValidationError, SolverTermination, SolverWork,
+    SummaryCallCycle, SummaryCalledProcedures, SummaryDependencyKey, SummaryEntry, SummaryExitKind,
+    SummaryRecursiveGroupKey, canonical_semantic_summaries_by_artifact,
+    path_evidence_from_frontier, path_evidence_frontier, path_evidence_has_complete_path,
+    path_evidence_has_proven_complete_path, path_evidence_has_proven_path, path_evidence_qualities,
     validate_recursive_summary_batch,
 };
 use crate::value_flow::{ValueFlowCarrierKey, ValueFlowEventKey, ValueFlowObservationPhase};
@@ -62,7 +63,7 @@ impl CarrierSummaryKey {
         if !semantic.completeness().is_complete() {
             return Err(TaintTransferSummaryError::IncompleteSemanticSummary);
         }
-        if !procedure_matches(procedure, semantic.key()) {
+        if !semantic.key().matches_procedure(procedure) {
             return Err(TaintTransferSummaryError::ProcedureMismatch);
         }
         Ok(Self {
@@ -538,49 +539,27 @@ pub struct TaintPathEvidence(u8);
 
 impl TaintPathEvidence {
     pub const fn has_proven_path(self) -> bool {
-        self.0 & 0b1100 != 0
+        path_evidence_has_proven_path(self.0)
     }
 
     pub const fn has_complete_path(self) -> bool {
-        self.0 & 0b1010 != 0
+        path_evidence_has_complete_path(self.0)
     }
 
     pub const fn has_proven_complete_path(self) -> bool {
-        self.0 & 0b1000 != 0
+        path_evidence_has_proven_complete_path(self.0)
     }
 
     fn from_frontier(frontier: PathQualityFrontier) -> Self {
-        let mut bits = 0;
-        for quality in frontier.iter() {
-            bits |= match (quality.is_proven(), quality.is_complete()) {
-                (false, false) => 0b0001,
-                (false, true) => 0b0010,
-                (true, false) => 0b0100,
-                (true, true) => 0b1000,
-            };
-        }
-        Self(bits)
+        Self(path_evidence_from_frontier(frontier))
     }
 
     fn qualities(self) -> Box<[PathQuality]> {
-        [
-            (0b0001, PathQuality::UNPROVEN_PARTIAL),
-            (0b0010, PathQuality::UNPROVEN_COMPLETE),
-            (0b0100, PathQuality::PROVEN_PARTIAL),
-            (0b1000, PathQuality::PROVEN_COMPLETE),
-        ]
-        .into_iter()
-        .filter_map(|(bit, quality)| (self.0 & bit != 0).then_some(quality))
-        .collect::<Vec<_>>()
-        .into_boxed_slice()
+        path_evidence_qualities(self.0)
     }
 
     fn frontier(self) -> PathQualityFrontier {
-        let mut frontier = PathQualityFrontier::default();
-        for quality in self.qualities() {
-            frontier.insert(quality);
-        }
-        frontier
+        path_evidence_frontier(self.0)
     }
 }
 
@@ -678,18 +657,13 @@ impl TaintTransferSummary {
     }
 
     fn row_range(&self, input: &StableTaintFact) -> std::ops::Range<usize> {
-        let start = self.rows.partition_point(|row| row.input < *input);
-        let end = start + self.rows[start..].partition_point(|row| row.input == *input);
-        start..end
+        crate::dataflow::sorted_equal_range_by(&self.rows, input, |row, input| row.input.cmp(input))
     }
 
     fn observation_range(&self, input: &StableTaintFact) -> std::ops::Range<usize> {
-        let start = self
-            .observations
-            .partition_point(|observation| observation.input < *input);
-        let end = start
-            + self.observations[start..].partition_point(|observation| observation.input == *input);
-        start..end
+        crate::dataflow::sorted_equal_range_by(&self.observations, input, |observation, input| {
+            observation.input.cmp(input)
+        })
     }
 
     pub fn retained_bytes(&self) -> usize {
@@ -718,7 +692,7 @@ impl TaintTransferSummary {
 #[derive(Debug)]
 pub struct TaintSemanticSummarySet<'summary> {
     summaries: Box<[&'summary SemanticProcedureSummary]>,
-    by_artifact: HashMap<SemanticArtifactKey, HashMap<DeclarationLocator, usize>>,
+    by_artifact: SemanticSummaryArtifactIndex,
     by_identity: HashMap<ProcedureSummaryIdentity, usize>,
     eligible: HashSet<ProcedureSummaryKey>,
 }
@@ -727,7 +701,7 @@ impl<'summary> TaintSemanticSummarySet<'summary> {
     pub fn try_new(
         summaries: Vec<&'summary SemanticProcedureSummary>,
     ) -> Result<Self, TaintTransferSummaryError> {
-        let summaries = canonicalize_semantic_summary_items(summaries, |summary| *summary, true)
+        let (summaries, by_artifact) = canonical_semantic_summaries_by_artifact(summaries)
             .map_err(|error| match error {
                 SemanticSummarySetValidationError::Incomplete => {
                     TaintTransferSummaryError::IncompleteSemanticSummary
@@ -736,18 +710,8 @@ impl<'summary> TaintSemanticSummarySet<'summary> {
                     TaintTransferSummaryError::AmbiguousSemanticSummary
                 }
             })?;
-        let mut by_artifact =
-            HashMap::<SemanticArtifactKey, HashMap<DeclarationLocator, usize>>::new();
         let mut by_identity = HashMap::new();
         for (index, summary) in summaries.iter().enumerate() {
-            if by_artifact
-                .entry(summary.key().artifact().clone())
-                .or_default()
-                .insert(summary.key().declaration().clone(), index)
-                .is_some()
-            {
-                return Err(TaintTransferSummaryError::AmbiguousSemanticSummary);
-            }
             if by_identity
                 .insert(summary.key().identity().clone(), index)
                 .is_some()
@@ -779,11 +743,11 @@ impl<'summary> TaintSemanticSummarySet<'summary> {
     }
 
     fn unique_summary_for(&self, procedure: &ProcedureHandle) -> Option<&SemanticProcedureSummary> {
-        let index = self
-            .by_artifact
-            .get(procedure.artifact().key())?
-            .get(procedure.semantics().locator().declaration())?;
-        self.summaries.get(*index).copied()
+        crate::semantic_summary::unique_semantic_summary(
+            &self.by_artifact,
+            &self.summaries,
+            procedure,
+        )
     }
 
     fn eligible(&self, summary: &SemanticProcedureSummary) -> bool {
@@ -1357,7 +1321,7 @@ impl CompleteTaintTransferSummaryRepository {
         &mut self,
         summary: TaintTransferSummary,
     ) -> Result<TaintSummaryPublicationOutcome, TaintSummaryPublicationError> {
-        if summary.key.carrier.procedure.recursive_group().is_some() {
+        if summary.key.carrier.procedure.is_recursive() {
             return Err(TaintSummaryPublicationError::RecursiveSummaryRequiresBatch);
         }
         self.publish_batch(vec![summary])
@@ -1816,10 +1780,16 @@ pub fn solve_taint_with_reusable_summaries<Provider>(
 where
     Provider: IcfgProvider + ?Sized,
 {
+    if !plan.value_type_barriers().is_empty() {
+        return Err(TaintSolveError::UnsupportedValueTypeBarriers {
+            operation: "reusable taint summaries",
+        }
+        .into());
+    }
     let root_semantic = semantic_summaries
         .unique_summary_for(root)
         .ok_or(TaintTransferSummaryError::ProcedureMismatch)?;
-    if !procedure_matches(root, root_semantic.key()) {
+    if !root_semantic.key().matches_procedure(root) {
         return Err(TaintTransferSummaryError::ProcedureMismatch.into());
     }
     let contracts = if request.cancellation.is_cancelled()
@@ -2367,11 +2337,6 @@ fn publish_projected_summaries(
         TaintTransferSummaryCacheStatus::AlreadyPresent
     };
     (status, published)
-}
-
-fn procedure_matches(procedure: &ProcedureHandle, key: &ProcedureSummaryKey) -> bool {
-    procedure.artifact().key() == key.artifact()
-        && procedure.semantics().locator().declaration() == key.declaration()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

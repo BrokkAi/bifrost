@@ -17,13 +17,14 @@
 //! either resolves to the target or does not, with no receiver to be unsure
 //! about. The other two exist for the callable and property arms.
 
+use crate::graph_hits::{HitRecorder, refresh_usage_limit};
 use crate::kotlin::graph::extractor::ScanCtx;
 use brokk_bifrost_core::analyzer::usages::common::{
-    SNIPPET_CONTEXT_LINES, external_usage_hit_count, reclassify_import_hit_at,
-    reclassify_override_declaration_hit_at, reclassify_self_receiver_hit_at, usage_hit,
+    reclassify_import_hit_at, reclassify_override_declaration_hit_at,
+    reclassify_self_receiver_hit_at,
 };
 use brokk_bifrost_core::analyzer::{CodeUnit, Range};
-use brokk_bifrost_core::text_utils::{find_line_index_for_offset, snippet_around_line};
+use brokk_bifrost_core::text_utils::find_line_index_for_offset;
 use tree_sitter::Node;
 
 /// The declaration a reference sits inside.
@@ -38,40 +39,24 @@ pub fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     let start = node.start_byte();
-    let line_idx = find_line_index_for_offset(ctx.line_starts, start);
-    let Some(enclosing) = enclosing_context(node, ctx).enclosing.clone() else {
+    let Some(enclosing) = enclosing_context(node, ctx).enclosing else {
         return;
     };
-    // A reference inside a *callable* target's own body is a recursive call
-    // (#1638): recorded, then classified `SelfReceiver`, so editor
-    // find-references lists it while the external usage surface omits it.
-    // Types are exempt: a class naming itself (a factory returning its own
-    // type, a self-referential parameter) is an ordinary reference. Every
-    // other enclosing-equals-target reference stays dropped.
-    if enclosing == ctx.spec.target && !ctx.spec.target.is_function() && !ctx.spec.target.is_class()
-    {
-        return;
-    }
-    let recursive = enclosing == ctx.spec.target && ctx.spec.target.is_function();
     let end = node.end_byte();
-    ctx.hits.insert(usage_hit(
-        ctx.file,
-        line_idx,
+    HitRecorder::new(ctx.file, ctx.source, ctx.line_starts, &ctx.spec.target).record_proven(
+        ctx.hits,
+        ctx.max_usages,
+        ctx.limit_exceeded,
         start,
         end,
         enclosing,
-        snippet_around_line(ctx.source, ctx.line_starts, line_idx, SNIPPET_CONTEXT_LINES),
-    ));
-    if recursive {
-        reclassify_self_receiver_hit_at(ctx.hits, ctx.file, start, end);
-    }
-    refresh_usage_limit(ctx);
+    );
 }
 
 pub fn push_import_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     push_hit(node, ctx);
     reclassify_import_hit_at(ctx.hits, ctx.file, node.start_byte(), node.end_byte());
-    refresh_usage_limit(ctx);
+    refresh_usage_limit(ctx.hits, ctx.max_usages, ctx.limit_exceeded);
 }
 
 /// Record a declaration that overrides the target as a reference to it.
@@ -92,11 +77,7 @@ pub fn push_override_declaration_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 pub fn push_self_receiver_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     push_hit(node, ctx);
     reclassify_self_receiver_hit_at(ctx.hits, ctx.file, node.start_byte(), node.end_byte());
-    refresh_usage_limit(ctx);
-}
-
-fn refresh_usage_limit(ctx: &mut ScanCtx<'_>) {
-    *ctx.limit_exceeded = external_usage_hit_count(ctx.hits) > ctx.max_usages;
+    refresh_usage_limit(ctx.hits, ctx.max_usages, ctx.limit_exceeded);
 }
 
 /// Record a reference that *might* name the target but could not be proven —
@@ -108,23 +89,13 @@ fn refresh_usage_limit(ctx: &mut ScanCtx<'_>) {
 /// references reads as inconclusive rather than as confidently dead.
 pub fn push_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let start = node.start_byte();
-    let line_idx = find_line_index_for_offset(ctx.line_starts, start);
-    let Some(enclosing) = enclosing_context(node, ctx).enclosing.clone() else {
-        return;
-    };
-    if enclosing == ctx.spec.target {
-        return;
-    }
-    ctx.unproven_hits.insert(
-        usage_hit(
-            ctx.file,
-            line_idx,
-            start,
-            node.end_byte(),
-            enclosing,
-            snippet_around_line(ctx.source, ctx.line_starts, line_idx, SNIPPET_CONTEXT_LINES),
-        )
-        .into_unproven(),
+    let end = node.end_byte();
+    let enclosing = enclosing_context(node, ctx).enclosing;
+    HitRecorder::new(ctx.file, ctx.source, ctx.line_starts, &ctx.spec.target).record_unproven(
+        ctx.unproven_hits,
+        start,
+        end,
+        enclosing,
     );
 }
 

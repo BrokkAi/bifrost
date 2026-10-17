@@ -1,13 +1,13 @@
 {
-  "schema_version": 7,
+  "schema_version": 12,
   "pack_id": "bifrost.go.concurrency",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "producer": { "name": "bifrost", "version": "0.11.3" },
   "language": "go",
   "ecosystem": "go",
-  "compatibility": { "bifrost": ">=0.11.3, <1.0.0", "toolchains": [] },
+  "compatibility": { "toolchains": [] },
   "provenance": {
-    "source": "https://go.dev/src/context/, https://go.dev/src/sync/, https://go.dev/src/time/, https://go.dev/src/testing/, and https://pkg.go.dev/golang.org/x/sync/errgroup",
+    "source": "https://pkg.go.dev/context, https://go.dev/ref/mem, https://go.dev/src/context/, https://go.dev/src/sync/, https://go.dev/src/time/, https://go.dev/src/testing/, and https://pkg.go.dev/golang.org/x/sync/errgroup",
     "revision": "go1.26.0;x-sync-v0.15.0"
   },
   "license": "BSD-3-Clause",
@@ -25,7 +25,109 @@
             "target": { "path": "src/context/context.go", "symbol": "context.Context.Done()", "has_receiver": true, "parameter_count": 0 },
             "completeness": "complete",
             "normal_result_count": 1,
-            "transfers": [{ "input": { "kind": "receiver" }, "exit_kind": "normal", "output": { "kind": "normal_return" } }]
+            "transfers": [{ "input": { "kind": "receiver" }, "exit_kind": "normal", "output": { "kind": "normal_return" } }],
+            "concurrency_effects": [{
+              "kind": "channel_close_propagate",
+              "source": { "kind": "input", "input": { "kind": "receiver" } },
+              "target": { "kind": "output", "output": { "kind": "normal_return" } },
+              "target_fresh": true
+            }]
+          },
+          {
+            "id": "context.background",
+            "target": { "path": "src/context/context.go", "symbol": "context.Background()", "has_receiver": false, "parameter_count": 0 },
+            "completeness": "complete",
+            "normal_result_count": 1,
+            "no_concurrency_effects": true,
+            "transfers": []
+          },
+          {
+            "id": "context.todo",
+            "target": { "path": "src/context/context.go", "symbol": "context.TODO()", "has_receiver": false, "parameter_count": 0 },
+            "completeness": "complete",
+            "normal_result_count": 1,
+            "no_concurrency_effects": true,
+            "transfers": []
+          },
+          {
+            "id": "context.with-cancel",
+            "target": { "path": "src/context/context.go", "symbol": "context.WithCancel(parent Context)", "has_receiver": false, "parameter_count": 1 },
+            "completeness": "complete",
+            "normal_result_count": 2,
+            "transfers": [],
+            "concurrency_effects": [{
+              "kind": "channel_close_propagate",
+              "source": { "kind": "input", "input": { "kind": "parameter", "ordinal": 0 } },
+              "target": { "kind": "output", "output": { "kind": "indexed_normal_return", "ordinal": 0 } },
+              "target_fresh": true
+            }],
+            "returned_callables": [{
+              "result_ordinal": 1,
+              "at_most_once": true,
+              "concurrency_effects": [{
+                "kind": "channel_close",
+                "channel": { "kind": "output", "output": { "kind": "indexed_normal_return", "ordinal": 0 } },
+                "fresh": true
+              }]
+            }]
+          },
+          {
+            "id": "context.with-deadline",
+            "target": { "path": "src/context/context.go", "symbol": "context.WithDeadline(parent Context, deadline time.Time)", "has_receiver": false, "parameter_count": 2 },
+            "completeness": "complete",
+            "normal_result_count": 2,
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "channel_close_propagate",
+                "source": { "kind": "input", "input": { "kind": "parameter", "ordinal": 0 } },
+                "target": { "kind": "output", "output": { "kind": "indexed_normal_return", "ordinal": 0 } },
+                "target_fresh": true
+              },
+              {
+                "kind": "channel_close_async",
+                "channel": { "kind": "output", "output": { "kind": "indexed_normal_return", "ordinal": 0 } },
+                "fresh": true
+              }
+            ],
+            "returned_callables": [{
+              "result_ordinal": 1,
+              "at_most_once": true,
+              "concurrency_effects": [{
+                "kind": "channel_close",
+                "channel": { "kind": "output", "output": { "kind": "indexed_normal_return", "ordinal": 0 } },
+                "fresh": true
+              }]
+            }]
+          },
+          {
+            "id": "context.with-timeout",
+            "target": { "path": "src/context/context.go", "symbol": "context.WithTimeout(parent Context, timeout time.Duration)", "has_receiver": false, "parameter_count": 2 },
+            "completeness": "complete",
+            "normal_result_count": 2,
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "channel_close_propagate",
+                "source": { "kind": "input", "input": { "kind": "parameter", "ordinal": 0 } },
+                "target": { "kind": "output", "output": { "kind": "indexed_normal_return", "ordinal": 0 } },
+                "target_fresh": true
+              },
+              {
+                "kind": "channel_close_async",
+                "channel": { "kind": "output", "output": { "kind": "indexed_normal_return", "ordinal": 0 } },
+                "fresh": true
+              }
+            ],
+            "returned_callables": [{
+              "result_ordinal": 1,
+              "at_most_once": true,
+              "concurrency_effects": [{
+                "kind": "channel_close",
+                "channel": { "kind": "output", "output": { "kind": "indexed_normal_return", "ordinal": 0 } },
+                "fresh": true
+              }]
+            }]
           },
           {
             "id": "sync.mutex.lock",

@@ -1682,6 +1682,10 @@ fn direct_array_element_member_use(subscript: Node<'_>) -> bool {
 }
 
 fn array_alias_use(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
+    variable_declaration_alias_use(node)
+}
+
+fn variable_declaration_alias_use(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
     let parent = node.parent()?;
     if parent.kind() != "variable_declarator"
         || parent
@@ -1756,15 +1760,11 @@ fn is_object_entries_argument(
 }
 
 pub(super) fn allocation_alias_use(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
+    if let Some(alias) = variable_declaration_alias_use(node) {
+        return Some(alias);
+    }
     let parent = node.parent()?;
     let (target, value) = match parent.kind() {
-        "variable_declarator"
-            if parent
-                .child_by_field_name("value")
-                .is_some_and(|value| value.id() == node.id()) =>
-        {
-            (parent.child_by_field_name("name"), Some(node))
-        }
         "assignment_expression"
             if parent
                 .child_by_field_name("right")

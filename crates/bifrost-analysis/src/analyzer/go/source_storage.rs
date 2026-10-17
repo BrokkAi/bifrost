@@ -31,7 +31,7 @@ pub(in crate::analyzer) const GO_SOURCE_HEADER_SQL: &str =
        AND source.publication_state = 'complete' AND meta.is_complete = 1 AND ready.available = 1";
 
 fn required<T>(value: Option<T>, label: &str) -> Result<T> {
-    value.ok_or_else(|| StoreError::new(format!("Go source syntax is missing {label}")))
+    crate::analyzer::store::required_source_value(value, "Go source syntax", label)
 }
 
 impl AnalyzerStore {

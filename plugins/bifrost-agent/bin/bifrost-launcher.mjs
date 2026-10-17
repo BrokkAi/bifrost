@@ -8,13 +8,6 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import {
-  OpenPackError,
-  openPackCacheRootFor,
-  prepareOpenPacks,
-  readEnginePackProfile
-} from "./open-packs.mjs";
-
 const execFileAsync = promisify(execFile);
 const OWNER = "BrokkAi";
 const REPO = "bifrost";
@@ -75,15 +68,7 @@ export function parseLauncherArgs(args) {
     toolset: DEFAULT_TOOLSET,
     passThrough: []
   };
-  let explicitMcpMode = false;
   const selectMcpToolset = (toolset) => {
-    if (parsed.command === "lsp") {
-      throw new LauncherError(
-        "invalid_arguments",
-        "--lsp cannot be combined with --mcp or --toolset."
-      );
-    }
-    explicitMcpMode = true;
     parsed.toolset = toolset;
   };
 
@@ -100,16 +85,6 @@ export function parseLauncherArgs(args) {
     }
     if (arg.startsWith("--workspace-root=")) {
       parsed.root = arg.slice("--workspace-root=".length);
-      continue;
-    }
-    if (arg === "--lsp") {
-      if (explicitMcpMode) {
-        throw new LauncherError(
-          "invalid_arguments",
-          "--lsp cannot be combined with --mcp or --toolset."
-        );
-      }
-      parsed.command = "lsp";
       continue;
     }
     if ((arg === "--mcp" || arg === "--toolset") && index + 1 < args.length) {
@@ -436,7 +411,7 @@ export async function prepareBifrostInstallation(options = {}) {
   }
 }
 
-export async function preparePreferredBifrostInstallation(options = {}) {
+async function resolveBifrostInstallationContext(options = {}) {
   const env = options.env ?? process.env;
   const platform = options.platform ?? process.platform;
   const arch = options.arch ?? process.arch;
@@ -447,33 +422,42 @@ export async function preparePreferredBifrostInstallation(options = {}) {
   const cacheRoot = options.cacheRoot ?? cacheRootFor(env, platform);
   const cachePath = managedBinaryPath(cacheRoot, metadata.binaryVersion, platform, arch);
 
-  if (env.BIFROST_LAUNCHER_AUTO_INSTALL === "0") {
-    return launcherStatus({
-      status: "missing",
-      preferredVersion: metadata.binaryVersion,
-      selectedVersion: null,
-      source: null,
-      compatibilityMode: null,
-      binaryPath: null,
-      cachePath,
-      autoInstall: false,
-      message: `Preferred Bifrost ${metadata.binaryVersion} preparation is disabled.`
-    });
-  }
-
-  if (await pathExists(cachePath, fsImpl)) {
-    const exact = await inspectCandidate("managed", cachePath, {
+  return {
+    env,
+    context: {
       preferredVersion: metadata.binaryVersion,
       selectedVersion: null,
       compatibilityMode: null,
       cachePath,
-      autoInstall: true,
+      autoInstall: env.BIFROST_LAUNCHER_AUTO_INSTALL !== "0",
       metadata,
       cacheRoot,
       platform,
       arch,
       fsImpl
-    }, options);
+    }
+  };
+}
+
+export async function preparePreferredBifrostInstallation(options = {}) {
+  const { context } = await resolveBifrostInstallationContext(options);
+
+  if (!context.autoInstall) {
+    return launcherStatus({
+      status: "missing",
+      preferredVersion: context.preferredVersion,
+      selectedVersion: null,
+      source: null,
+      compatibilityMode: null,
+      binaryPath: null,
+      cachePath: context.cachePath,
+      autoInstall: false,
+      message: `Preferred Bifrost ${context.preferredVersion} preparation is disabled.`
+    });
+  }
+
+  if (await pathExists(context.cachePath, context.fsImpl)) {
+    const exact = await inspectCandidate("managed", context.cachePath, context, options);
     if (exact.status === "ready" && exact.compatibilityMode === "exact") {
       return launcherStatus(exact);
     }
@@ -481,48 +465,28 @@ export async function preparePreferredBifrostInstallation(options = {}) {
 
   const installed = await installManagedBinary({
     ...options,
-    metadata,
-    cacheRoot,
-    platform,
-    arch,
-    fsImpl
+    metadata: context.metadata,
+    cacheRoot: context.cacheRoot,
+    platform: context.platform,
+    arch: context.arch,
+    fsImpl: context.fsImpl
   });
   return launcherStatus({
     status: "ready",
-    preferredVersion: metadata.binaryVersion,
-    selectedVersion: metadata.binaryVersion,
+    preferredVersion: context.preferredVersion,
+    selectedVersion: context.preferredVersion,
     source: "installed",
     compatibilityMode: "exact",
     binaryPath: installed,
-    cachePath,
+    cachePath: context.cachePath,
     autoInstall: true,
-    message: readyMessage(metadata.binaryVersion, metadata.binaryVersion, "installed")
+    message: readyMessage(context.preferredVersion, context.preferredVersion, "installed")
   });
 }
 
 async function assessBifrostCandidates(options = {}) {
-  const env = options.env ?? process.env;
-  const platform = options.platform ?? process.platform;
-  const arch = options.arch ?? process.arch;
-  const fsImpl = options.fsImpl ?? fs;
-  const metadata = options.metadata
-    ? normalizeReleaseMetadata(options.metadata)
-    : await readReleaseMetadata(options.metadataPath ?? metadataPath, fsImpl);
-  releaseTargetFor(platform, arch);
-  const cacheRoot = options.cacheRoot ?? cacheRootFor(env, platform);
-  const cachePath = managedBinaryPath(cacheRoot, metadata.binaryVersion, platform, arch);
-  const context = {
-    preferredVersion: metadata.binaryVersion,
-    selectedVersion: null,
-    compatibilityMode: null,
-    cachePath,
-    autoInstall: env.BIFROST_LAUNCHER_AUTO_INSTALL !== "0",
-    metadata,
-    cacheRoot,
-    platform,
-    arch,
-    fsImpl
-  };
+  const { env, context } = await resolveBifrostInstallationContext(options);
+  releaseTargetFor(context.platform, context.arch);
 
   try {
     if (env.BIFROST_BINARY_PATH?.trim()) {
@@ -531,8 +495,8 @@ async function assessBifrostCandidates(options = {}) {
     }
 
     let fallback = null;
-    if (await pathExists(cachePath, fsImpl)) {
-      const managed = await inspectCandidate("managed", cachePath, context, options);
+    if (await pathExists(context.cachePath, context.fsImpl)) {
+      const managed = await inspectCandidate("managed", context.cachePath, context, options);
       if (managed.status === "ready") {
         return managed;
       }
@@ -553,8 +517,8 @@ async function assessBifrostCandidates(options = {}) {
         env.PATH ?? "",
         env.PATHEXT,
         options.cwd ?? process.cwd(),
-        fsImpl,
-        platform
+        context.fsImpl,
+        context.platform
       );
       if (pathBinary) {
         const pathResult = await inspectCandidate("path", pathBinary, context, options);
@@ -1039,11 +1003,6 @@ export function buildBifrostArgs(root, toolset, passThrough = []) {
   return [...rootArgs, "--mcp", toolset || DEFAULT_TOOLSET, ...passThrough];
 }
 
-export function buildBifrostLspArgs(root, passThrough = []) {
-  const rootArgs = root ? ["--root", root] : [];
-  return [...rootArgs, "--lsp", ...passThrough];
-}
-
 export async function resolveBifrostLaunch(options = {}) {
   const env = options.env ?? process.env;
   const root = await resolveWorkspaceRoot({
@@ -1053,69 +1012,18 @@ export async function resolveBifrostLaunch(options = {}) {
     allowCwdFallback: false
   });
   const binary = await resolveBifrostBinary({ ...options, env });
-  const openPacks = await prepareLaunchOpenPacks(binary.path, env, options);
   const launch = {
     command: binary.path,
     args: buildBifrostArgs(root, options.toolset, options.passThrough),
     cwd: root,
-    env: openPacks ? { ...env, ...openPacks.env } : env,
+    env,
     source: binary.source,
     preferredVersion: binary.preferredVersion,
     selectedVersion: binary.selectedVersion,
     compatibilityMode: binary.compatibilityMode
   };
-  if (openPacks) launch.openPackReceipt = openPacks.receipt;
   schedulePreferredBifrostPreparation(launch, options);
   return launch;
-}
-
-export async function resolveBifrostLspLaunch(options = {}) {
-  const env = options.env ?? process.env;
-  const root = await resolveWorkspaceRoot({
-    env: {},
-    argvRoot: options.root,
-    cwd: options.root,
-    allowCwdFallback: false
-  });
-  const binary = await resolveBifrostBinary({ ...options, env });
-  const openPacks = await prepareLaunchOpenPacks(binary.path, env, options);
-  const launch = {
-    command: binary.path,
-    args: buildBifrostLspArgs(root, options.passThrough),
-    cwd: root,
-    env: openPacks ? { ...env, ...openPacks.env } : env,
-    source: binary.source,
-    preferredVersion: binary.preferredVersion,
-    selectedVersion: binary.selectedVersion,
-    compatibilityMode: binary.compatibilityMode
-  };
-  if (openPacks) launch.openPackReceipt = openPacks.receipt;
-  schedulePreferredBifrostPreparation(launch, options);
-  return launch;
-}
-
-async function prepareLaunchOpenPacks(binaryPath, env, options) {
-  try {
-    const profile = await (options.openPackProfileImpl ?? readEnginePackProfile)(binaryPath, {
-      execFileImpl: options.execFileImpl ?? execFileAsync,
-      env
-    });
-    return await (options.prepareOpenPacksImpl ?? prepareOpenPacks)( {
-      cacheDir: options.openPackCacheDir ?? openPackCacheRootFor(env),
-      engineProfile: profile,
-      fetchImpl: options.openPackFetchImpl ?? globalThis.fetch,
-      offline: env.BIFROST_LAUNCHER_AUTO_INSTALL === "0" ||
-        env.BIFROST_OPEN_PACKS_OFFLINE === "1" || env.BIFROST_OPEN_PACKS_OFFLINE === "true",
-      refresh: env.BIFROST_OPEN_PACKS_REFRESH === "1" || env.BIFROST_OPEN_PACKS_REFRESH === "true"
-    });
-  } catch (error) {
-    const code = error instanceof OpenPackError ? error.code : error?.code;
-    if (!["unsupported", "pending", "no-compatible-release", "unavailable"].includes(code)) throw error;
-    const diagnostic = `[bifrost] Open pack selection ${code}: ${error.message} Continuing without externally acquired rules; core analysis remains available.\n`;
-    if (options.onOpenPackDiagnostic) options.onOpenPackDiagnostic(diagnostic, error);
-    else process.stderr.write(diagnostic);
-    return null;
-  }
 }
 
 export function spawnBifrost(binaryPath, args, options = {}) {
@@ -1251,29 +1159,19 @@ async function main() {
       process.exitCode = status.status === "ready" ? 0 : 1;
       return;
     }
-    let launch;
-    if (parsed.command === "lsp") {
-      launch = await resolveBifrostLspLaunch({
-        ...installProgressHandlers(),
-        root: parsed.root,
-        env: process.env,
-        passThrough: parsed.passThrough
-      });
-    } else {
-      const root = await resolveWorkspaceRoot({
-        env: process.env,
-        argvRoot: parsed.root,
-        cwd: process.cwd(),
-        allowCwdFallback: false
-      });
-      launch = await resolveBifrostLaunch({
-        ...installProgressHandlers(),
-        root,
-        env: process.env,
-        toolset: parsed.toolset,
-        passThrough: parsed.passThrough
-      });
-    }
+    const root = await resolveWorkspaceRoot({
+      env: process.env,
+      argvRoot: parsed.root,
+      cwd: process.cwd(),
+      allowCwdFallback: false
+    });
+    const launch = await resolveBifrostLaunch({
+      ...installProgressHandlers(),
+      root,
+      env: process.env,
+      toolset: parsed.toolset,
+      passThrough: parsed.passThrough
+    });
     if (launch.compatibilityMode === "compatible") {
       console.error(
         `Bifrost launcher: preferred ${launch.preferredVersion}, selected compatible ${launch.selectedVersion} from ${launch.source}.`

@@ -91,6 +91,7 @@ impl PhpBareNameFunctionScopes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
     use tree_sitter::Parser;
 
     fn build(source: &str) -> PhpBareNameFunctionScopes {
@@ -110,6 +111,7 @@ mod tests {
     /// really is reachable from a bare call, so the grading fix must keep
     /// answering `true` here.
     #[test]
+    #[hardwon("#1867: same-file free functions must remain valid bare-call evidence")]
     fn a_same_file_free_function_binds_a_bare_call() {
         let source = concat!(
             "<?php\n",
@@ -129,6 +131,7 @@ mod tests {
     /// method of the enclosing class shadows nothing, because PHP has no
     /// implicit-receiver call.
     #[test]
+    #[hardwon("#1867: class methods were falsely treated as bare-call targets")]
     fn a_method_never_binds_a_bare_call() {
         let source = concat!(
             "<?php\n",
@@ -148,6 +151,7 @@ mod tests {
     /// The tenancy `protected Tenancy $tenancy` shape: the census credited a
     /// PROPERTY, which is not even callable.
     #[test]
+    #[hardwon("#1867: properties and promoted parameters were falsely treated as callable")]
     fn a_property_or_promoted_parameter_never_binds_a_bare_call() {
         let source = concat!(
             "<?php\n",
@@ -172,6 +176,7 @@ mod tests {
     /// A trait member is a member: `use Roundable` does not put `floor` in the
     /// term scope a bare call binds in.
     #[test]
+    #[hardwon("#1867: trait methods were falsely treated as bare-call targets")]
     fn a_trait_method_never_binds_a_bare_call() {
         let source = concat!(
             "<?php\n",
@@ -199,6 +204,7 @@ mod tests {
     /// ordinary published free function, and a call written above it still
     /// binds.
     #[test]
+    #[hardwon("#1867: guarded and later free functions were missed by file-wide binding")]
     fn a_guarded_or_later_free_function_still_binds() {
         let source = concat!(
             "<?php\n",
@@ -218,6 +224,7 @@ mod tests {
     /// walk does not descend into a class -- so it is not the same-file
     /// declaration the census matched.
     #[test]
+    #[hardwon("#1867: a nested function was incorrectly published as a file-level target")]
     fn a_function_nested_in_a_class_body_is_not_published() {
         let source = concat!(
             "<?php\n",

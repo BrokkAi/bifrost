@@ -1,14 +1,17 @@
-; An ordinary Java, JavaScript, TypeScript, Python, Go, C# or Kotlin local value
+; An ordinary Java, JavaScript, TypeScript, Python, Go, C#, Kotlin, Rust,
+; Scala, PHP, Ruby, C or C++ local value
 ; replaced before
 ; any read. The RHS has already run at the selected establishment; no fix is
-; offered because removing it could remove side effects.
+; offered because removing it could remove side effects. Kotlin's plain local
+; `=` writes are exact; compound reads, member/index writes, delegated locals,
+; and captured mutable locals stay open.
 (policy
   :schema-version 1
   :id "bifrost.correctness.overwritten-unread-value"
   :name "Overwritten unread local value"
   :message "the local value is overwritten before it is read"
   :severity warning
-  :description "An exact ordinary local establishment is replaced on every modeled continuation before any read of that value. The row retains every first replacement event as evidence. Review the original assignment and its right-hand-side effects; no automatic removal is offered."
+  :description "An exact ordinary local establishment is replaced on every modeled continuation before any read of that value. For Kotlin, only a plain local `=` write is exact; compound reads, member/index writes, delegated locals, and captured mutable locals stay open. The row retains every first replacement event as evidence. Review the original assignment and its right-hand-side effects; no automatic removal is offered."
   :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
   :tags ["correctness" "assignment"]
   :analysis (analysis
@@ -20,7 +23,7 @@
                         (verdict eq overwritten_unread)
                         (proof eq exact)
                         (coverage eq exhaustive))
-          (language java javascript typescript python go csharp kotlin rust
+          (language java javascript typescript python go csharp kotlin rust scala php ruby c cpp
             (assignment-relations :relation [overwritten-unread]
               (procedure-of
                 (callable)))))))

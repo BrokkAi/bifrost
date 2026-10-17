@@ -1,12 +1,12 @@
 use std::path::PathBuf;
 
 use crate::CancellationToken;
+use crate::analyzer::dependency_support::failed_dependency_pack_production as failed_production;
 use crate::analyzer::semantic_model::{
-    ActivationSelector, ArtifactProducerLimits, ArtifactProductionRequest, AuthoredPayload,
-    AuthoredSemanticModelPack, CatalogCoordinate, Compatibility, Completeness,
-    DependencyArtifactRole, DependencyPackAdapter, DependencyPackProduction,
-    ExactDependencyArtifact, ExternalArtifactKind, NameSelector, Producer, ProducerDiagnostic,
-    ProducerDiagnosticSeverity, Provenance, ResolvedDependency, Safety, SuppressedDiagnostics,
+    ArtifactProducerLimits, ArtifactProductionRequest, AuthoredPayload, AuthoredSemanticModelPack,
+    Compatibility, Completeness, DependencyArtifactRole, DependencyPackAdapter,
+    DependencyPackProduction, ExactDependencyArtifact, ExternalArtifactKind, Producer,
+    ProducerDiagnostic, ProducerDiagnosticSeverity, Provenance, ResolvedDependency, Safety,
     VersionConstraint, normalize_artifact_locator_paths,
 };
 
@@ -20,15 +20,8 @@ impl DependencyPackAdapter for RustDependencyPackAdapter {
         "bifrost-rust-dependency"
     }
 
-    fn adapter_version(&self) -> &str {
-        env!("CARGO_PKG_VERSION")
-    }
-
     fn producer(&self) -> Producer {
-        Producer {
-            name: "bifrost-rustdoc-json".to_owned(),
-            version: env!("CARGO_PKG_VERSION").to_owned(),
-        }
+        Producer::for_name("bifrost-rustdoc-json")
     }
 
     fn can_produce(&self, dependency: &ResolvedDependency) -> bool {
@@ -278,27 +271,9 @@ fn rust_dependency_production_request(
                 .into_iter()
                 .collect(),
         },
-        activation: vec![ActivationSelector {
-            package: dependency
-                .evidence
-                .package
-                .as_ref()
-                .map(exact_name_selector),
-            module: dependency.evidence.module.as_ref().map(exact_name_selector),
-            toolchain: dependency
-                .evidence
-                .toolchain
-                .as_ref()
-                .map(exact_name_selector),
-            targets: dependency.evidence.target.clone().into_iter().collect(),
-            configurations: dependency
-                .evidence
-                .configuration
-                .clone()
-                .into_iter()
-                .collect(),
-            artifact_sha256: None,
-        }],
+        activation: vec![
+            crate::analyzer::semantic_model::activation_selector_for_evidence(&dependency.evidence),
+        ],
         provenance: Provenance {
             source: dependency
                 .provenance
@@ -320,37 +295,13 @@ fn rust_dependency_production_request(
     }
 }
 
-fn exact_name_selector(coordinate: &CatalogCoordinate) -> NameSelector {
-    NameSelector {
-        name: coordinate.name.clone(),
-        version: coordinate
-            .version
-            .as_ref()
-            .map(|version| format!("={version}")),
-    }
-}
-
-fn failed_production(code: &str, message: &str) -> DependencyPackProduction {
-    DependencyPackProduction {
-        pack: None,
-        diagnostics: vec![ProducerDiagnostic {
-            severity: ProducerDiagnosticSeverity::Error,
-            source_entry: None,
-            code: code.to_owned(),
-            location: None,
-            declaration: None,
-            message: message.to_owned(),
-        }],
-        suppressed_diagnostics: SuppressedDiagnostics::default(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::rustdoc_item as item;
     use super::*;
     use rustdoc_types::{
-        Crate as RustdocCrate, Id, Item, ItemEnum, ItemKind, ItemSummary, Module, Struct,
-        StructKind, Target, Visibility as RustVisibility,
+        Crate as RustdocCrate, Id, ItemEnum, ItemKind, ItemSummary, Module, Struct, StructKind,
+        Target, Visibility as RustVisibility,
     };
     use semver::Version;
     use std::collections::HashMap as StdHashMap;
@@ -364,23 +315,6 @@ mod tests {
     };
     use crate::analyzer::{Language, Project, ProjectFile, RustAnalyzer, TestProject};
 
-    fn item(id: u32, name: &str, visibility: RustVisibility, inner: ItemEnum) -> Item {
-        Item {
-            id: Id(id),
-            crate_id: 0,
-            name: Some(name.to_owned()),
-            span: None,
-            visibility,
-            docs: None,
-            links: StdHashMap::new(),
-            attrs: Vec::new(),
-            deprecation: None,
-            stability: None,
-            const_stability: None,
-            inner,
-        }
-    }
-
     fn rustdoc_document(extra_type: bool) -> RustdocCrate {
         let mut root_items = vec![Id(1)];
         if extra_type {
@@ -391,7 +325,7 @@ mod tests {
                 Id(0),
                 item(
                     0,
-                    "widget",
+                    Some("widget"),
                     RustVisibility::Default,
                     ItemEnum::Module(Module {
                         is_crate: true,
@@ -404,7 +338,7 @@ mod tests {
                 Id(1),
                 item(
                     1,
-                    "Widget",
+                    Some("Widget"),
                     RustVisibility::Public,
                     ItemEnum::Struct(Struct {
                         kind: StructKind::Unit,
@@ -422,7 +356,7 @@ mod tests {
                 Id(2),
                 item(
                     2,
-                    "Added",
+                    Some("Added"),
                     RustVisibility::Public,
                     ItemEnum::Struct(Struct {
                         kind: StructKind::Unit,

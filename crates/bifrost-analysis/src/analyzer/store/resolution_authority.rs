@@ -1,7 +1,9 @@
 //! Ordinary resolution authority read by requested keys from persisted rows.
 
 use super::resolution_prepare::authority_rows;
-use super::resolution_selection::SelectedResolutionMountRecord;
+use super::resolution_selection::{
+    SelectedResolutionMountInventory, SelectedResolutionMountRecord,
+};
 use super::{Result as StoreResult, StoreError};
 use crate::CancellationToken;
 use crate::analyzer::resolution::{
@@ -43,16 +45,36 @@ pub(crate) struct RootExportHalf {
 /// the same answer. Outside a crate stage the set is `None` and every read
 /// checks, as before.
 ///
-/// The stage also keeps each semantic catalog provenance answer
-/// (SEMANTIC_PROVENANCE) by blob and local key. On the whole tract graph the
-/// statement ran 5.10 M times, and 78% of them repeated a key the same stage
-/// had already asked (tract_core: 881,634 for 193,074 keys). A catalog row
-/// is persisted content of the blob and does not change while the stage's
-/// checked publication stands.
+/// The selected inventory also owns an operation memo for checked publications
+/// and node/semantic identity rows. `finish_native` revalidates the full
+/// selection before a result is returned, so these immutable answers can be
+/// reused across the operation's per-file and engine-step reads.
 #[derive(Default)]
 pub(crate) struct AuthorityValidations {
     mounts: HashSet<(SelectedResolutionMountOrdinal, i64)>,
+    queried_mounts: HashSet<(SelectedResolutionMountOrdinal, i64)>,
+    memo_hits: u64,
+}
+
+impl AuthorityValidations {
+    pub(super) fn memo_stats(&self) -> (u64, usize) {
+        (self.memo_hits, self.queried_mounts.len())
+    }
+}
+
+/// Published answers read by one selected operation, bounded by its touched keys.
+#[derive(Default)]
+pub(super) struct AuthorityRequestMemo {
+    /// Canonical content reached by this query. Supplemental aliases are never
+    /// reused inside the query; cleanup leaves their high-water counters intact.
+    pub(super) canonical_digests:
+        HashMap<crate::analyzer::resolution::ResolutionIdentityDigestKey, [u8; 32]>,
+    mounts: HashSet<(SelectedResolutionMountOrdinal, i64)>,
     semantic_identities: HashMap<(i64, u32), Option<[u8; 32]>>,
+    node_identities: HashMap<(i64, u32), Option<[u8; 32]>>,
+    /// Raw declaration keys, including absence, from immutable blob publications.
+    /// Decode with the current mount ordinal at use; never retain mounted IDs.
+    pub(super) rust_reason_owners: HashMap<(i64, i64), Option<i64>>,
 }
 
 pub(crate) struct SelectedResolutionAuthority<'project> {
@@ -61,15 +83,30 @@ pub(crate) struct SelectedResolutionAuthority<'project> {
     requested_mounts: &'project super::resolution_selection::RequestedResolutionMountRows,
     persisted_mount_count: usize,
     validated: &'project std::cell::RefCell<Option<AuthorityValidations>>,
+    request_memo: &'project std::cell::RefCell<AuthorityRequestMemo>,
 }
 
 impl<'project> SelectedResolutionAuthority<'project> {
-    pub(crate) fn new(
+    pub(crate) fn from_selection(
+        selection: &'project SelectedResolutionMountInventory<'_>,
+    ) -> Self {
+        Self::new(
+            selection.connection(),
+            selection.shared_name_table(),
+            selection.requested_mount_rows(),
+            selection.persisted_mount_count(),
+            selection.authority_validations(),
+            selection.authority_request_memo(),
+        )
+    }
+
+    pub(super) fn new(
         connection: &'project Connection,
         names: &'project super::resolution::SharedNameTable,
         requested_mounts: &'project super::resolution_selection::RequestedResolutionMountRows,
         persisted_mount_count: usize,
         validated: &'project std::cell::RefCell<Option<AuthorityValidations>>,
+        request_memo: &'project std::cell::RefCell<AuthorityRequestMemo>,
     ) -> Self {
         Self {
             connection,
@@ -77,6 +114,7 @@ impl<'project> SelectedResolutionAuthority<'project> {
             requested_mounts,
             persisted_mount_count,
             validated,
+            request_memo,
         }
     }
 
@@ -99,6 +137,53 @@ impl<'project> SelectedResolutionAuthority<'project> {
                 Ok(Some(SemanticId::shared_name(identity)))
             },
         )
+    }
+
+    pub(crate) fn shared_name_digest_for_identity(
+        &self,
+        identity: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<[u8; 32]>> {
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let Some(shared_id) = identity.shared_name_id() else {
+            return Ok(None);
+        };
+        let names = self.names.interner(self.connection);
+        if let Some(digest) = names.digest_for_id(shared_id) {
+            return Ok(Some(digest));
+        }
+        assert!(
+            shared_id.is_interned(),
+            "a per-request shared identity retains its digest"
+        );
+        let digest = super::resolution::with_resolution_read_progress_handler(
+            self.connection,
+            cancellation,
+            |connection| {
+                if cancellation.is_cancelled() {
+                    return Ok(None);
+                }
+                Ok(connection
+                    .prepare_cached(
+                        "SELECT identity_digest FROM resolution_identities WHERE id = ?1",
+                    )?
+                    .query_row([i64::from(shared_id.get())], |row| {
+                        row.get::<_, [u8; 32]>(0)
+                    })
+                    .optional()?)
+            },
+        )?;
+        let Some(digest) = digest else {
+            assert!(
+                cancellation.is_cancelled(),
+                "an interned shared identity has a row"
+            );
+            return Ok(None);
+        };
+        self.names.remember_identity(digest, shared_id);
+        Ok(Some(digest))
     }
 
     fn mount_record(
@@ -167,27 +252,29 @@ impl<'project> SelectedResolutionAuthority<'project> {
                 )
             })
         };
-        let remembered = self.validated.borrow().as_ref().and_then(|validated| {
-            validated
-                .semantic_identities
-                .get(&(record.blob_id(), key))
-                .copied()
-        });
-        if let Some(digest) = remembered {
-            return Ok(Some(provenance(digest)));
-        }
         self.read_authority(&record, cancellation, |conn| {
-            let digest = conn
-                .prepare_cached(authority_rows::SEMANTIC_PROVENANCE_SQL)?
-                .query_row(rusqlite::params![record.blob_id(), key], |row| {
-                    row.get::<_, [u8; 32]>(0)
-                })
-                .optional()?;
-            if let Some(validated) = self.validated.borrow_mut().as_mut() {
-                validated
+            let memo_key = (record.blob_id(), key);
+            let remembered = self
+                .request_memo
+                .borrow()
+                .semantic_identities
+                .get(&memo_key)
+                .copied();
+            let digest = if let Some(digest) = remembered {
+                digest
+            } else {
+                let digest = conn
+                    .prepare_cached(authority_rows::SEMANTIC_PROVENANCE_SQL)?
+                    .query_row(rusqlite::params![record.blob_id(), key], |row| {
+                        row.get::<_, [u8; 32]>(0)
+                    })
+                    .optional()?;
+                self.request_memo
+                    .borrow_mut()
                     .semantic_identities
-                    .insert((record.blob_id(), key), digest);
-            }
+                    .insert(memo_key, digest);
+                digest
+            };
             Ok(provenance(digest))
         })
     }
@@ -212,12 +299,28 @@ impl<'project> SelectedResolutionAuthority<'project> {
         };
         let mount = SelectedResolutionMount::from_ordinal(record.ordinal());
         self.read_authority(&record, cancellation, |conn| {
-            let identity = conn
-                .prepare_cached(authority_rows::NODE_PROVENANCE_SQL)?
-                .query_row(rusqlite::params![record.blob_id(), key], |row| {
-                    row.get::<_, [u8; 32]>(0)
-                })
-                .optional()?;
+            let memo_key = (record.blob_id(), key);
+            let remembered = self
+                .request_memo
+                .borrow()
+                .node_identities
+                .get(&memo_key)
+                .copied();
+            let identity = if let Some(identity) = remembered {
+                identity
+            } else {
+                let identity = conn
+                    .prepare_cached(authority_rows::NODE_PROVENANCE_SQL)?
+                    .query_row(rusqlite::params![record.blob_id(), key], |row| {
+                        row.get::<_, [u8; 32]>(0)
+                    })
+                    .optional()?;
+                self.request_memo
+                    .borrow_mut()
+                    .node_identities
+                    .insert(memo_key, identity);
+                identity
+            };
             Ok(identity.map(|digest| {
                 SelectedNodeProvenance::fragment_local(
                     mount,
@@ -428,9 +531,11 @@ impl<'project> SelectedResolutionAuthority<'project> {
         &self,
         mount: &SelectedResolutionMountRecord,
         keys: &[u32],
-        namespace: ResolutionNamespace,
+        namespaces: &[i64],
         cancellation: &CancellationToken,
     ) -> StoreResult<Option<HashMap<SemanticId, String>>> {
+        let namespaces =
+            serde_json::to_string(namespaces).expect("reference lookup namespaces serialize");
         self.read_authority(mount, cancellation, |conn| {
             let mut statement =
                 conn.prepare_cached(authority_rows::REFERENCE_LOOKUP_SPELLING_SQL)?;
@@ -438,7 +543,7 @@ impl<'project> SelectedResolutionAuthority<'project> {
                 rusqlite::params![
                     mount.blob_id(),
                     serde_json::to_string(keys).expect("scalar local key array"),
-                    super::resolution_prepare::resolution_rows::namespace_code(namespace)
+                    namespaces
                 ],
                 |row| Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?)),
             )?;
@@ -828,12 +933,19 @@ impl<'project> SelectedResolutionAuthority<'project> {
             cancellation,
             |conn| {
                 let key = (mount.ordinal(), mount.blob_id());
-                if self
-                    .validated
-                    .borrow()
+                let request_validated = self.request_memo.borrow().mounts.contains(&key);
+                let mut stage = self.validated.borrow_mut();
+                let stage_validated = stage
                     .as_ref()
-                    .is_some_and(|validated| validated.mounts.contains(&key))
-                {
+                    .is_some_and(|validated| validated.mounts.contains(&key));
+                if let Some(validated) = stage.as_mut() {
+                    let first_query = validated.queried_mounts.insert(key);
+                    if !first_query || request_validated || stage_validated {
+                        validated.memo_hits += 1;
+                    }
+                }
+                if request_validated || stage_validated {
+                    self.request_memo.borrow_mut().mounts.insert(key);
                     return read(conn);
                 }
                 let ready = conn
@@ -854,7 +966,8 @@ impl<'project> SelectedResolutionAuthority<'project> {
                         "selected catalog authority changed",
                     ));
                 }
-                if let Some(validated) = self.validated.borrow_mut().as_mut() {
+                self.request_memo.borrow_mut().mounts.insert(key);
+                if let Some(validated) = stage.as_mut() {
                     validated.mounts.insert(key);
                 }
                 read(conn)

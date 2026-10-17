@@ -5,6 +5,17 @@ use std::fmt;
 
 pub struct CanonicalHasher(Sha256);
 
+pub fn finish_sha256(hasher: Sha256) -> [u8; 32] {
+    hasher.finalize().into()
+}
+
+/// Append a byte slice as a big-endian `u64` length followed by its bytes.
+pub fn write_length_prefixed(hasher: &mut Sha256, value: &[u8]) {
+    let length = u64::try_from(value.len()).expect("usize fits u64 on supported targets");
+    hasher.update(length.to_be_bytes());
+    hasher.update(value);
+}
+
 impl CanonicalHasher {
     pub fn new(domain: &[u8]) -> Self {
         let mut hasher = Self(Sha256::new());
@@ -18,9 +29,7 @@ impl CanonicalHasher {
     }
 
     pub fn value(&mut self, value: &[u8]) {
-        let length = u64::try_from(value.len()).expect("usize fits u64 on supported targets");
-        self.0.update(length.to_be_bytes());
-        self.0.update(value);
+        write_length_prefixed(&mut self.0, value);
     }
 
     pub fn sequence<T>(&mut self, name: &str, values: &[T], mut update: impl FnMut(&mut Self, &T)) {
@@ -36,7 +45,7 @@ impl CanonicalHasher {
     }
 
     pub fn finish(self) -> [u8; 32] {
-        self.0.finalize().into()
+        finish_sha256(self.0)
     }
 }
 
@@ -77,15 +86,15 @@ pub fn parse_lower_sha256(value: &str) -> Option<[u8; 32]> {
     Some(digest)
 }
 
-fn lower_hex_nibble(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        _ => None,
+pub fn lower_hex_nibble(byte: u8) -> Option<u8> {
+    if byte.is_ascii_uppercase() {
+        None
+    } else {
+        crate::path_utils::hex_value(byte)
     }
 }
 
-pub fn write_lower_hex(bytes: &[u8; 32], formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+pub fn write_lower_hex(bytes: &[u8], formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     for byte in bytes {
         write!(formatter, "{byte:02x}")?;
     }

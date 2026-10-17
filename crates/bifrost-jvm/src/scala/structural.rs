@@ -12,7 +12,6 @@ use brokk_bifrost_core::analyzer::structural::callable::{
 use brokk_bifrost_core::analyzer::structural::edges::{
     INVERSE_REFERENCE_EDGE_SUPPORT, ReferenceEdgeSupport,
 };
-use brokk_bifrost_core::analyzer::structural::facts::Span;
 use brokk_bifrost_core::analyzer::structural::kinds::{NormalizedKind, Role};
 use brokk_bifrost_core::analyzer::structural::materialization::{
     DeclarationMaterializationSupport, NO_MATERIALIZATION_SUPPORT,
@@ -78,6 +77,8 @@ pub struct ScalaStructuralSpec;
 pub static SCALA_STRUCTURAL_SPEC: ScalaStructuralSpec = ScalaStructuralSpec;
 
 pub const SCALA_KIND_TABLE: &[(&str, NormalizedKind)] = &[
+    ("comment", NormalizedKind::Comment),
+    ("block_comment", NormalizedKind::Comment),
     ("call_expression", NormalizedKind::Call),
     ("infix_expression", NormalizedKind::Call),
     ("postfix_expression", NormalizedKind::Call),
@@ -150,29 +151,9 @@ pub const SCALA_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("do_while_expression", NormalizedKind::WhileLoop),
 ];
 
-fn last_named_child<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
-    (0..node.named_child_count())
-        .rev()
-        .find_map(|index| node.named_child(index))
-}
-
-fn single_named_child(node: Node<'_>) -> Option<Node<'_>> {
-    if node.named_child_count() == 1 {
-        node.named_child(0)
-    } else {
-        None
-    }
-}
-
-fn expression_target_node(mut node: Node<'_>) -> Node<'_> {
-    while matches!(node.kind(), "expression" | "parenthesized_expression") {
-        let Some(child) = first_named_child(node) else {
-            break;
-        };
-        node = child;
-    }
-    node
-}
+use brokk_bifrost_core::analyzer::tree_walk::{
+    expression_target_node, last_named_child, single_named_child_matching,
+};
 
 fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Node<'tree>> {
     let mut current = expression_target_node(expression);
@@ -201,7 +182,8 @@ fn postfix_operator_node(node: Node<'_>) -> Option<Node<'_>> {
         .rfind(|child| matches!(child.kind(), "identifier" | "operator_identifier"))
 }
 
-fn call_function_node(node: Node<'_>) -> Option<Node<'_>> {
+/// The method named by a Scala call, including infix and postfix syntax.
+pub fn scala_call_function_node(node: Node<'_>) -> Option<Node<'_>> {
     match node.kind() {
         "infix_expression" => node.child_by_field_name("operator"),
         "postfix_expression" => postfix_operator_node(node),
@@ -230,11 +212,18 @@ fn prefix_argument(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn is_signed_numeric_prefix(node: Node<'_>) -> bool {
-    node.kind() == "prefix_expression"
-        && prefix_argument(node).is_some_and(is_numeric_literal_node)
-        && (0..node.child_count())
-            .filter_map(|index| node.child(index))
-            .any(|child| !child.is_named() && matches!(child.kind(), "+" | "-"))
+    if node.kind() != "prefix_expression" {
+        return false;
+    }
+    let operator = (0..node.child_count())
+        .filter_map(|index| node.child(index))
+        .find(|child| !child.is_named() && matches!(child.kind(), "+" | "-"))
+        .map(|child| child.kind());
+    brokk_bifrost_core::analyzer::tree_walk::is_signed_numeric_operand(
+        prefix_argument(node),
+        operator,
+        is_numeric_literal_node,
+    )
 }
 
 fn is_inside_signed_numeric_wrapper(node: Node<'_>) -> bool {
@@ -244,7 +233,7 @@ fn is_inside_signed_numeric_wrapper(node: Node<'_>) -> bool {
     is_signed_numeric_prefix(parent)
 }
 
-fn is_named_argument_assignment(node: Node<'_>) -> bool {
+pub(super) fn is_named_argument_assignment(node: Node<'_>) -> bool {
     node.kind() == "assignment_expression"
         && node
             .parent()
@@ -254,30 +243,35 @@ fn is_named_argument_assignment(node: Node<'_>) -> bool {
 fn attach_argument_roles(sink: &mut RoleSink<'_>, arguments: Node<'_>) {
     match arguments.kind() {
         "arguments" => {
-            for index in 0..arguments.named_child_count() {
-                if !sink.should_continue() {
-                    break;
-                }
-                let Some(argument) = arguments.named_child(index) else {
-                    continue;
-                };
-                let argument = expression_target_node(argument);
-                if let Some((keyword, value)) = named_argument_parts(argument) {
-                    sink.kwarg(keyword, value);
-                } else {
-                    attach_argument_role_with_derived_name(sink, argument, expression_name_node);
-                }
-            }
+            brokk_bifrost_core::analyzer::structural::adapter_helpers::for_each_argument(
+                arguments,
+                |argument| {
+                    if !sink.should_continue() {
+                        return false;
+                    }
+                    let argument = expression_target_node(argument);
+                    if let Some((keyword, value)) = named_argument_parts(argument) {
+                        sink.kwarg(keyword, value);
+                    } else {
+                        attach_argument_role_with_derived_name(
+                            sink,
+                            argument,
+                            expression_name_node,
+                        );
+                    }
+                    true
+                },
+            );
         }
         "block" | "case_block" => {
-            let argument = single_named_child(arguments)
+            let argument = single_named_child_matching(arguments, |_| true)
                 .map(expression_target_node)
                 .unwrap_or(arguments);
             attach_role_with_derived_name(sink, Role::Arg, argument, expression_name_node);
         }
         "colon_argument" => {
             if let Some(argument) = last_named_child(arguments).map(expression_target_node) {
-                let argument = single_named_child(argument)
+                let argument = single_named_child_matching(argument, |_| true)
                     .map(expression_target_node)
                     .unwrap_or(argument);
                 attach_role_with_derived_name(sink, Role::Arg, argument, expression_name_node);
@@ -331,7 +325,7 @@ fn attach_decorators(sink: &mut RoleSink<'_>, declaration: Node<'_>) {
     }
 }
 
-fn is_case_class(node: Node<'_>) -> bool {
+pub(super) fn is_case_class(node: Node<'_>) -> bool {
     node.kind() == "class_definition"
         && (0..node.child_count())
             .filter_map(|index| node.child(index))
@@ -373,20 +367,14 @@ fn path_field_nodes(node: Node<'_>) -> Vec<Node<'_>> {
         .collect()
 }
 
-fn span_from(first: Node<'_>, last: Node<'_>) -> Span {
-    Span {
-        start_byte: first.start_byte(),
-        end_byte: last.end_byte(),
-    }
-}
-
 fn attach_path_module(sink: &mut RoleSink<'_>, target: Node<'_>, path: &[Node<'_>]) {
     let Some(last) = path.last().copied() else {
         return;
     };
-    sink.role_named(Role::Module, target, last);
     if path.len() > 1 {
-        sink.role_named_span(Role::Module, target, span_from(path[0], last));
+        sink.role_named_between_nodes(Role::Module, target, path[0], last);
+    } else {
+        sink.role_named(Role::Module, target, last);
     }
 }
 
@@ -835,7 +823,12 @@ impl StructuralSpec for ScalaStructuralSpec {
         SCALA_KIND_TABLE
     }
 
-    fn generator_construct(&self, node: Node<'_>, _kind: NormalizedKind) -> Option<&'static str> {
+    fn generator_construct(
+        &self,
+        node: Node<'_>,
+        _kind: NormalizedKind,
+        _source: &str,
+    ) -> Option<&'static str> {
         is_case_class(node).then_some("scala_case_class")
     }
 
@@ -908,16 +901,18 @@ impl StructuralSpec for ScalaStructuralSpec {
     }
 
     fn supports_kind(&self, kind: NormalizedKind) -> bool {
-        kind == NormalizedKind::Method
-            || self
-                .kind_table()
-                .iter()
-                .any(|(_, fact_kind)| fact_kind.satisfies(kind))
+        brokk_bifrost_core::analyzer::structural::spec::supports_kind_from_table(
+            kind,
+            &[NormalizedKind::Method, NormalizedKind::SyntaxError],
+            self.kind_table(),
+        )
     }
 
     fn supports_role(&self, role: Role) -> bool {
         // #2647: not yet extracted by this adapter.
-        !matches!(role, Role::Iterable | Role::Element)
+        brokk_bifrost_core::analyzer::structural::spec::supports_role_without_iterable_or_element(
+            role,
+        )
     }
 
     fn occurrence_role_support(&self) -> &OccurrenceRoleSupport {
@@ -985,7 +980,7 @@ impl StructuralSpec for ScalaStructuralSpec {
         }
         match kind {
             NormalizedKind::Call => {
-                if let Some(function) = call_function_node(node) {
+                if let Some(function) = scala_call_function_node(node) {
                     attach_terminal_callee(sink, function, expression_name_node(function));
                     if node.kind() == "infix_expression"
                         && let Some(receiver) = node.child_by_field_name("left")
@@ -1111,8 +1106,7 @@ mod tests {
     use brokk_bifrost_core::analyzer::structural::occurrences::OccurrenceRole;
     use brokk_bifrost_core::analyzer::structural::resolution::{BindingKind, HoistingClass};
     use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
-    use tree_sitter::Node;
-
+    use brokk_bifrost_test_macros::hardwon;
     /// Every binder token of `source` with the binding the spec states for it,
     /// as `(token, kind, hoisting class, activation text)` in source order.
     ///
@@ -1163,7 +1157,8 @@ mod tests {
                 .binding_activation(node, node_range(scope))
                 .expect("every classified binder states an interval");
             found.push((
-                text_of(node, source),
+                brokk_bifrost_core::analyzer::common::try_node_source_text(node, source)
+                    .expect("Scala syntax test node ranges must be valid UTF-8"),
                 binding.kind,
                 binding.hoisting,
                 &source[binding.activation.start_byte..binding.activation.end_byte],
@@ -1172,14 +1167,11 @@ mod tests {
         found
     }
 
-    fn text_of<'source>(node: Node<'_>, source: &'source str) -> &'source str {
-        &source[node.start_byte()..node.end_byte()]
-    }
-
     /// The four binder shapes Scala has, and the interval each is in effect
     /// over. The shapes differ only in that interval, so the interval is what
     /// the assertions are about.
     #[test]
+    #[hardwon("#1644: This fix preserves an activation interval for every Scala binder shape.")]
     fn scala_states_a_binding_interval_for_every_binder_shape() {
         let source = concat!(
             "object Host {\n",
@@ -1250,9 +1242,32 @@ mod tests {
         assert_eq!(activation("item"), "item => item.length");
     }
 
-    /// A `given` and an `extension` scope the parameters written in them, so
-    /// each parameter is in effect over the definition that declares it and
-    /// not over the template the definition is written in (#2925).
+    /// Scala 3's braceless `catch` inlines its case pattern into the
+    /// `catch_clause` itself, where the braced form nests a `case_clause` in a
+    /// `case_block`. Both spellings are the same construct, so both must state
+    /// the same interval rather than let the binder climb to an outer form.
+    #[test]
+    #[hardwon(
+        "#1644: It prevents a catch binder in a braceless Scala clause from leaking beyond that clause."
+    )]
+    fn a_braceless_catch_binder_is_scoped_to_its_own_clause() {
+        let source = concat!(
+            "object Host {\n",
+            "  val outcome = try compute() catch case failure: RuntimeException => failure\n",
+            "}\n",
+        );
+        let found = binding_activations(source);
+        let failure = found
+            .iter()
+            .find(|(token, _, _, _)| *token == "failure")
+            .unwrap_or_else(|| panic!("the catch pattern binds: {found:#?}"));
+        assert_eq!(
+            (failure.1, failure.2),
+            (BindingKind::PatternBinder, HoistingClass::DeclaredHead)
+        );
+        assert_eq!(failure.3, " => failure");
+    }
+
     #[test]
     fn given_and_extension_parameters_are_scope_wide_over_their_own_definition() {
         let source = concat!(
@@ -1300,9 +1315,6 @@ mod tests {
         );
     }
 
-    /// A Scala `import` inside a statement list is in effect from the import
-    /// clause onward; an import written anywhere else -- the file, a package
-    /// clause, a template body -- is in effect over its whole scope (#2925).
     #[test]
     fn a_block_scoped_import_activates_at_its_own_declaration() {
         let declaration = Range {
@@ -1337,28 +1349,5 @@ mod tests {
             );
             assert_eq!(elsewhere.activation, scope);
         }
-    }
-
-    /// Scala 3's braceless `catch` inlines its case pattern into the
-    /// `catch_clause` itself, where the braced form nests a `case_clause` in a
-    /// `case_block`. Both spellings are the same construct, so both must state
-    /// the same interval rather than let the binder climb to an outer form.
-    #[test]
-    fn a_braceless_catch_binder_is_scoped_to_its_own_clause() {
-        let source = concat!(
-            "object Host {\n",
-            "  val outcome = try compute() catch case failure: RuntimeException => failure\n",
-            "}\n",
-        );
-        let found = binding_activations(source);
-        let failure = found
-            .iter()
-            .find(|(token, _, _, _)| *token == "failure")
-            .unwrap_or_else(|| panic!("the catch pattern binds: {found:#?}"));
-        assert_eq!(
-            (failure.1, failure.2),
-            (BindingKind::PatternBinder, HoistingClass::DeclaredHead)
-        );
-        assert_eq!(failure.3, " => failure");
     }
 }

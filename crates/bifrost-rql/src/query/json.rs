@@ -3,12 +3,12 @@ use super::ir::{
     BranchRelationFilter, CallArgumentSelector, CallIdentity, CallInputSelector, CandidateFilter,
     CodeQuery, CodeQueryPlan, CodeQueryPlanSource, CodeQuerySeed, ConfigurationCompletenessFilter,
     ConfigurationFactsFilter, ConfigurationFactsSeed, ConfigurationNodeKindFilter,
-    ConfigurationRouteSegmentFilter, ControlRelationFilter, DeclarationStateFilter,
-    DecoratorBindingFilter, EdgeFilter, ExportFilter, ExportSeed, FlowRelationFilter,
-    GenerationSiteFilter, GenerationSiteSeed, HierarchyTraversal, KeyedReadKeySelector,
-    OccurrenceFilter, OccurrenceSeed, PathSeed, Pattern, QueryPathScope, QueryStep,
-    ResultContractFailureUseFilter, RewritePathFilter, ScopeFilter, ScopeSeed, StateEventFilter,
-    StringPredicate, UNATTRIBUTED_TIER_LABEL,
+    ConfigurationRouteSegmentFilter, ControlRelationFilter, CppProvenanceFilter,
+    CrossDomainRelation, DeclarationStateFilter, DecoratorBindingFilter, EdgeFilter, ExportFilter,
+    ExportSeed, FlowRelationFilter, GenerationSiteFilter, GenerationSiteSeed, HierarchyTraversal,
+    KeyedReadKeySelector, OccurrenceFilter, OccurrenceSeed, PathSeed, Pattern, QueryPathScope,
+    QueryStep, ResultContractFailureUseFilter, RewritePathFilter, ScopeFilter, ScopeSeed,
+    StateEventFilter, StringPredicate, UNATTRIBUTED_TIER_LABEL,
 };
 use super::schema::{
     CallTraversalCompleteness, QueryStepField, configuration_member_role_label,
@@ -64,6 +64,7 @@ fn plan_to_json(plan: &CodeQueryPlan) -> Map<String, Value> {
         CodeQueryPlanSource::Bindings(seed) => binding_seed_to_json(seed),
         CodeQueryPlanSource::GenerationSites(seed) => generation_site_seed_to_json(seed),
         CodeQueryPlanSource::Exports(seed) => export_seed_to_json(seed),
+        CodeQueryPlanSource::DependencyEvidence(seed) => dependency_evidence_seed_to_json(seed),
         CodeQueryPlanSource::ConfigurationFacts(seed) => configuration_facts_seed_to_json(seed),
         CodeQueryPlanSource::Paths(seed) => path_seed_to_json(seed),
         CodeQueryPlanSource::Set { op, branches } => {
@@ -79,6 +80,45 @@ fn plan_to_json(plan: &CodeQueryPlan) -> Map<String, Value> {
             );
             object
         }
+        CodeQueryPlanSource::Correlate(correlation) => {
+            let body = match &correlation.relation {
+                CrossDomainRelation::ConfigurationKey(relation) => {
+                    json!({ "documents": relation.documents })
+                }
+                CrossDomainRelation::ConfigurationCode(relation) => json!({
+                    "match": relation.match_kind.label(),
+                    "absence": relation.absence,
+                }),
+                CrossDomainRelation::DependencyConfiguration(relation) => json!({
+                    "owner": relation.owner, "ecosystem": relation.ecosystem,
+                    "version_ranges": relation.version_ranges, "documents": relation.documents,
+                    "overrides": relation.overrides, "values": relation.values,
+                }),
+            };
+            let mut relation = Map::new();
+            relation.insert(correlation.relation.label().to_string(), body);
+            let mut object = Map::new();
+            object.insert(
+                "correlate".to_string(),
+                json!({
+                    "relation": relation,
+                    "code": Value::Object(plan_to_json(&correlation.code)),
+                    "configuration": Value::Object(plan_to_json(&correlation.configuration)),
+                }),
+            );
+            object
+        }
+        CodeQueryPlanSource::RequireBoth(requirement) => {
+            let mut object = Map::new();
+            object.insert(
+                "require_both".to_string(),
+                json!({
+                    "code": Value::Object(plan_to_json(&requirement.code)),
+                    "configuration": Value::Object(plan_to_json(&requirement.configuration)),
+                }),
+            );
+            object
+        }
     };
     if !plan.steps.is_empty() {
         object.insert(
@@ -90,21 +130,7 @@ fn plan_to_json(plan: &CodeQueryPlan) -> Map<String, Value> {
 }
 
 pub(super) fn seed_to_json(seed: &CodeQuerySeed) -> Map<String, Value> {
-    let mut object = Map::new();
-    if !seed.where_globs.is_empty() {
-        object.insert("where".to_string(), path_scope_to_json(&seed.where_globs));
-    }
-    if !seed.languages.is_empty() {
-        object.insert(
-            "languages".to_string(),
-            Value::Array(
-                seed.languages
-                    .iter()
-                    .map(|language| Value::String(language.config_label().to_string()))
-                    .collect(),
-            ),
-        );
-    }
+    let mut object = environment_seed_scope_json(&seed.where_globs, &seed.languages);
     object.insert("match".to_string(), pattern_to_json(&seed.root));
     if let Some(pattern) = &seed.inside {
         object.insert("inside".to_string(), pattern_to_json(pattern));
@@ -160,21 +186,7 @@ pub(super) fn occurrence_filter_to_json(filter: &OccurrenceFilter) -> Map<String
 }
 
 fn occurrence_seed_to_json(seed: &OccurrenceSeed) -> Map<String, Value> {
-    let mut object = Map::new();
-    if !seed.where_globs.is_empty() {
-        object.insert("where".to_string(), path_scope_to_json(&seed.where_globs));
-    }
-    if !seed.languages.is_empty() {
-        object.insert(
-            "languages".to_string(),
-            Value::Array(
-                seed.languages
-                    .iter()
-                    .map(|language| Value::String(language.config_label().to_string()))
-                    .collect(),
-            ),
-        );
-    }
+    let mut object = environment_seed_scope_json(&seed.where_globs, &seed.languages);
     object.insert(
         "occurrences".to_string(),
         Value::Object(occurrence_filter_to_json(&seed.filter)),
@@ -206,6 +218,25 @@ pub(super) fn path_scope_to_json(scope: &QueryPathScope) -> Value {
     )
 }
 
+fn insert_labeled_array<T>(
+    object: &mut Map<String, Value>,
+    field: &str,
+    values: &[T],
+    label_for: impl Fn(&T) -> &'static str,
+) {
+    if !values.is_empty() {
+        object.insert(
+            field.to_string(),
+            Value::Array(
+                values
+                    .iter()
+                    .map(|value| Value::String(label_for(value).to_string()))
+                    .collect(),
+            ),
+        );
+    }
+}
+
 fn glob_group_to_json(group: &[glob::Pattern]) -> Value {
     Value::Array(
         group
@@ -217,35 +248,13 @@ fn glob_group_to_json(group: &[glob::Pattern]) -> Value {
 
 pub(super) fn scope_filter_to_json(filter: &ScopeFilter) -> Map<String, Value> {
     let mut object = Map::new();
-    if !filter.kinds.is_empty() {
-        object.insert(
-            "kind".to_string(),
-            Value::Array(
-                filter
-                    .kinds
-                    .iter()
-                    .map(|kind| json!(kind.label()))
-                    .collect(),
-            ),
-        );
-    }
+    insert_labeled_array(&mut object, "kind", &filter.kinds, |kind| kind.label());
     object
 }
 
 pub(super) fn binding_filter_to_json(filter: &BindingFilter) -> Map<String, Value> {
     let mut object = Map::new();
-    if !filter.kinds.is_empty() {
-        object.insert(
-            "kind".to_string(),
-            Value::Array(
-                filter
-                    .kinds
-                    .iter()
-                    .map(|kind| json!(kind.label()))
-                    .collect(),
-            ),
-        );
-    }
+    insert_labeled_array(&mut object, "kind", &filter.kinds, |kind| kind.label());
     if !filter.names.is_empty() {
         object.insert(
             "name".to_string(),
@@ -309,35 +318,35 @@ pub(super) fn state_event_filter_to_json(filter: &StateEventFilter) -> Map<Strin
             ),
         );
     }
+    if !filter.read_causes.is_empty() {
+        object.insert(
+            QueryStepField::StateEventReadCauses.label().to_string(),
+            Value::Array(
+                filter
+                    .read_causes
+                    .iter()
+                    .map(|cause| json!(cause.label()))
+                    .collect(),
+            ),
+        );
+    }
     object
 }
 
 pub(super) fn flow_relation_filter_to_json(filter: &FlowRelationFilter) -> Map<String, Value> {
     let mut object = Map::new();
-    if !filter.relations.is_empty() {
-        object.insert(
-            QueryStepField::FlowRelations.label().to_string(),
-            Value::Array(
-                filter
-                    .relations
-                    .iter()
-                    .map(|relation| json!(relation.label()))
-                    .collect(),
-            ),
-        );
-    }
-    if !filter.certainties.is_empty() {
-        object.insert(
-            QueryStepField::FlowCertainties.label().to_string(),
-            Value::Array(
-                filter
-                    .certainties
-                    .iter()
-                    .map(|certainty| json!(certainty.label()))
-                    .collect(),
-            ),
-        );
-    }
+    insert_labeled_array(
+        &mut object,
+        QueryStepField::FlowRelations.label(),
+        &filter.relations,
+        |relation| relation.label(),
+    );
+    insert_labeled_array(
+        &mut object,
+        QueryStepField::FlowCertainties.label(),
+        &filter.certainties,
+        |certainty| certainty.label(),
+    );
     object
 }
 
@@ -374,14 +383,25 @@ pub(super) fn result_contract_failure_use_filter_to_json(
 
 pub(super) fn branch_relation_filter_to_json(filter: &BranchRelationFilter) -> Map<String, Value> {
     let mut object = Map::new();
-    if !filter.relations.is_empty() {
+    insert_labeled_array(
+        &mut object,
+        QueryStepField::BranchRelations.label(),
+        &filter.relations,
+        |relation| relation.label(),
+    );
+    object
+}
+
+pub(super) fn cpp_provenance_filter_to_json(filter: &CppProvenanceFilter) -> Map<String, Value> {
+    let mut object = Map::new();
+    if !filter.rules.is_empty() {
         object.insert(
-            QueryStepField::BranchRelations.label().to_string(),
+            QueryStepField::CppProvenance.label().to_string(),
             Value::Array(
                 filter
-                    .relations
+                    .rules
                     .iter()
-                    .map(|relation| json!(relation.label()))
+                    .map(|rule| json!(rule.label()))
                     .collect(),
             ),
         );
@@ -393,47 +413,29 @@ pub(super) fn control_relation_filter_to_json(
     filter: &ControlRelationFilter,
 ) -> Map<String, Value> {
     let mut object = Map::new();
-    if !filter.relations.is_empty() {
-        object.insert(
-            QueryStepField::ControlRelations.label().to_string(),
-            Value::Array(
-                filter
-                    .relations
-                    .iter()
-                    .map(|relation| json!(relation.label()))
-                    .collect(),
-            ),
-        );
-    }
-    if !filter.exit_partitions.is_empty() {
-        object.insert(
-            QueryStepField::ControlExitPartitions.label().to_string(),
-            Value::Array(
-                filter
-                    .exit_partitions
-                    .iter()
-                    .map(|partition| json!(partition.label()))
-                    .collect(),
-            ),
-        );
-    }
+    insert_labeled_array(
+        &mut object,
+        QueryStepField::ControlRelations.label(),
+        &filter.relations,
+        |relation| relation.label(),
+    );
+    insert_labeled_array(
+        &mut object,
+        QueryStepField::ControlExitPartitions.label(),
+        &filter.exit_partitions,
+        |partition| partition.label(),
+    );
     object
 }
 
 fn assignment_relation_filter_to_json(filter: &AssignmentRelationFilter) -> Map<String, Value> {
     let mut object = Map::new();
-    if !filter.relations.is_empty() {
-        object.insert(
-            QueryStepField::AssignmentRelations.label().to_string(),
-            Value::Array(
-                filter
-                    .relations
-                    .iter()
-                    .map(|relation| json!(relation.label()))
-                    .collect(),
-            ),
-        );
-    }
+    insert_labeled_array(
+        &mut object,
+        QueryStepField::AssignmentRelations.label(),
+        &filter.relations,
+        |relation| relation.label(),
+    );
     object
 }
 
@@ -605,30 +607,8 @@ fn export_seed_to_json(seed: &ExportSeed) -> Map<String, Value> {
 
 pub(super) fn generation_site_filter_to_json(filter: &GenerationSiteFilter) -> Map<String, Value> {
     let mut object = Map::new();
-    if !filter.kinds.is_empty() {
-        object.insert(
-            "kind".to_string(),
-            Value::Array(
-                filter
-                    .kinds
-                    .iter()
-                    .map(|kind| json!(kind.label()))
-                    .collect(),
-            ),
-        );
-    }
-    if !filter.inputs.is_empty() {
-        object.insert(
-            "input".to_string(),
-            Value::Array(
-                filter
-                    .inputs
-                    .iter()
-                    .map(|input| json!(input.label()))
-                    .collect(),
-            ),
-        );
-    }
+    insert_labeled_array(&mut object, "kind", &filter.kinds, |kind| kind.label());
+    insert_labeled_array(&mut object, "input", &filter.inputs, |input| input.label());
     object
 }
 
@@ -655,7 +635,9 @@ pub(super) fn export_filter_to_json(filter: &ExportFilter) -> Map<String, Value>
     object
 }
 
-fn configuration_facts_seed_to_json(seed: &ConfigurationFactsSeed) -> Map<String, Value> {
+pub(crate) fn configuration_facts_seed_to_json(
+    seed: &ConfigurationFactsSeed,
+) -> Map<String, Value> {
     let mut object = Map::new();
     if !seed.where_globs.is_empty() {
         object.insert("where".to_string(), path_scope_to_json(&seed.where_globs));
@@ -700,6 +682,82 @@ pub(super) fn configuration_facts_filter_to_json(
             "keys".to_string(),
             Value::Array(filter.keys.iter().map(|key| json!(key)).collect()),
         );
+    }
+    if !filter.values.is_empty() {
+        object.insert(
+            "values".to_string(),
+            Value::Array(filter.values.iter().map(|value| json!(value)).collect()),
+        );
+    }
+    if !filter.values_ignore_case.is_empty() {
+        object.insert(
+            "values_ignore_case".to_string(),
+            Value::Array(
+                filter
+                    .values_ignore_case
+                    .iter()
+                    .map(|value| json!(value))
+                    .collect(),
+            ),
+        );
+    }
+    for (field, value) in [
+        ("value_lt", filter.value_lt.as_ref()),
+        ("value_le", filter.value_le.as_ref()),
+        ("value_gt", filter.value_gt.as_ref()),
+        ("value_ge", filter.value_ge.as_ref()),
+    ] {
+        if let Some(value) = value {
+            object.insert(field.to_string(), json!(value));
+        }
+    }
+    for (field, values) in [
+        ("xml_parent_keys", &filter.xml_parent_keys),
+        (
+            "xml_preceding_sibling_keys",
+            &filter.xml_preceding_sibling_keys,
+        ),
+        (
+            "xml_sibling_attribute_keys",
+            &filter.xml_sibling_attribute_keys,
+        ),
+        (
+            "xml_sibling_attribute_values",
+            &filter.xml_sibling_attribute_values,
+        ),
+        (
+            "xml_sibling_attribute_values_ignore_case",
+            &filter.xml_sibling_attribute_values_ignore_case,
+        ),
+        (
+            "xml_reference_source_keys",
+            &filter.xml_reference_source_keys,
+        ),
+        (
+            "xml_reference_target_keys",
+            &filter.xml_reference_target_keys,
+        ),
+        (
+            "xml_reference_target_element_keys",
+            &filter.xml_reference_target_element_keys,
+        ),
+        (
+            "xml_reference_target_child_keys",
+            &filter.xml_reference_target_child_keys,
+        ),
+        ("xml_peer_element_keys", &filter.xml_peer_element_keys),
+        ("xml_peer_attribute_keys", &filter.xml_peer_attribute_keys),
+        ("xml_peer_child_keys", &filter.xml_peer_child_keys),
+    ] {
+        if !values.is_empty() {
+            object.insert(
+                field.to_string(),
+                Value::Array(values.iter().map(|value| json!(value)).collect()),
+            );
+        }
+    }
+    if let Some(value) = filter.xml_peer_min_shared_children {
+        object.insert("xml_peer_min_shared_children".to_string(), json!(value));
     }
     if !filter.routes.is_empty() {
         object.insert(
@@ -920,6 +978,27 @@ fn query_step_to_json(step: &QueryStep) -> Value {
                 ),
             );
         }
+        QueryStep::CaptureAnchor(capture) => {
+            object.insert("capture".to_string(), json!(capture));
+        }
+        QueryStep::ProgramPointById { id } => {
+            object.insert(
+                QueryStepField::ProgramPointId.label().to_string(),
+                json!(id),
+            );
+        }
+        QueryStep::ConfigurationAbsence(filter) => {
+            object.extend(configuration_facts_filter_to_json(filter));
+        }
+        QueryStep::StatementFacts(kind) => {
+            object.insert(
+                QueryStepField::StatementFactKind.label().to_string(),
+                json!(kind.label()),
+            );
+        }
+        QueryStep::CppFacts(kind) => {
+            object.insert("kind".to_string(), json!(kind.label()));
+        }
         QueryStep::Supertypes(HierarchyTraversal::Depth(depth))
         | QueryStep::Subtypes(HierarchyTraversal::Depth(depth)) => {
             object.insert("depth".to_string(), json!(depth.get()));
@@ -932,6 +1011,7 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         | QueryStep::Subtypes(HierarchyTraversal::Direct)
         | QueryStep::EnclosingDecl
         | QueryStep::ProcedureOf
+        | QueryStep::ProgramPointOf
         | QueryStep::CfgEntry
         | QueryStep::CfgExits
         | QueryStep::CfgSuccessorEdges
@@ -941,6 +1021,8 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         | QueryStep::FileOf
         | QueryStep::ImportsOf
         | QueryStep::ImportersOf
+        | QueryStep::PythonImportSite
+        | QueryStep::PythonImportCycles
         | QueryStep::Members
         | QueryStep::Owner
         | QueryStep::OccurrenceTarget
@@ -964,28 +1046,69 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         | QueryStep::SegmentTarget
         | QueryStep::ReceiverOutcome
         | QueryStep::ReceiverEvidence
+        | QueryStep::PointsToCandidates
         | QueryStep::CallShape
+        | QueryStep::ExactExternalCallee
         | QueryStep::CallResults
         | QueryStep::ResultSubjectUses
         | QueryStep::CallArgumentGroups
         | QueryStep::CallArguments
         | QueryStep::CallBindings
+        | QueryStep::CppBadStrncpySize
+        | QueryStep::CppNetworkToHostFunctionAsArrayBound
+        | QueryStep::CppNonConstantFormat
+        | QueryStep::CppWrongNumberFormatArguments
+        | QueryStep::CppTooManyFormatArguments
+        | QueryStep::CppWrongTypeFormatArgument
+        | QueryStep::CppNonPortablePrintf
+        | QueryStep::CppOverflowingSnprintf
         | QueryStep::CallEffects
         | QueryStep::ResultContractCalls
         | QueryStep::CallResultContracts
         | QueryStep::CallResultObligations
+        | QueryStep::ProcedureReturnProfile
+        | QueryStep::RustPointerFindings
+        | QueryStep::PythonIteratorReturnProtocol
+        | QueryStep::PythonBuiltinIdentity
+        | QueryStep::PythonUninitializedVariable
+        | QueryStep::PythonVariableOf
+        | QueryStep::PythonVariableDefinitions
+        | QueryStep::PythonVariableUses
+        | QueryStep::PythonVariablePeers
+        | QueryStep::PythonVariableNestedLoops
+        | QueryStep::PythonRaiseNotImplemented
+        | QueryStep::PythonUnsafeCyclicImport
+        | QueryStep::PythonCommentedOutCode
+        | QueryStep::PythonDocumentation
+        | QueryStep::PythonUselessClass
+        | QueryStep::PythonAttributeShadowsMethod
+        | QueryStep::PythonModificationOfDefaultValue
+        | QueryStep::PythonOverlyComplexDelete
+        | QueryStep::CallResultUse
+        | QueryStep::PythonAssertionContext
+        | QueryStep::TupleReturnAssignment
+        | QueryStep::PythonImplicitStringConcatenation
+        | QueryStep::TupleReturnGroups
+        | QueryStep::LambdaForwarding
+        | QueryStep::PythonFormatIssues
+        | QueryStep::PythonUrlConstruction
+        | QueryStep::PythonRaiseLegality
+        | QueryStep::PythonSpecialMethodRaise
         | QueryStep::ResultContractUses
         | QueryStep::ResultContractOperationUses
         | QueryStep::NilnessOperations
         | QueryStep::SwitchCoverage
-        | QueryStep::ConcurrentAccessConflicts
         | QueryStep::ClassSet
         | QueryStep::DetachedTaskTransfers
         | QueryStep::ProcedureEffects
         | QueryStep::CallableSignature
+        | QueryStep::LiteralOccurrences
+        | QueryStep::CallableMetrics
         | QueryStep::SignatureParameters
         | QueryStep::CallableApplicability
-        | QueryStep::OverloadSelection => {}
+        | QueryStep::OverloadSelection
+        | QueryStep::CppExpressions => {}
+        QueryStep::BindingInitializerCallsOf | QueryStep::SelectedPropertyRelationsOf => {}
         // The default tier is omitted so a query written before the filter
         // existed keeps its canonical form and semantic hash.
         QueryStep::AbsentMember(proof) => {
@@ -1004,7 +1127,20 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         | QueryStep::DispatchOutcome
         | QueryStep::DispatchTargets
         | QueryStep::MemberFamily
-        | QueryStep::FamilyEdges => {}
+        | QueryStep::FamilyEdges
+        | QueryStep::ClassHierarchy
+        | QueryStep::ClassBases
+        | QueryStep::ClassMro
+        | QueryStep::MroMembers
+        | QueryStep::PythonOverrides
+        | QueryStep::PythonCallRelations
+        | QueryStep::PythonOverrideSignatures
+        | QueryStep::BindingUses
+        | QueryStep::PythonComparisonConstants
+        | QueryStep::PythonComparisonUsingIs
+        | QueryStep::PythonComparisonUsingIsNonPortable
+        | QueryStep::IdenticalOperands
+        | QueryStep::PythonMissingSelf => {}
         QueryStep::DeclarationStateOf(filter) => {
             object.extend(declaration_state_filter_to_json(filter));
         }
@@ -1023,8 +1159,13 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         QueryStep::BranchRelations(filter) => {
             object.extend(branch_relation_filter_to_json(filter));
         }
+        QueryStep::CppInconsistentLoopDirection | QueryStep::CppUnsafeArrayForDaysOfTheYear => {}
+        QueryStep::CppProvenance(filter) => {
+            object.extend(cpp_provenance_filter_to_json(filter));
+        }
         QueryStep::LoopRelations => {}
         QueryStep::StatementReachability => {}
+        QueryStep::PendingCleanupFlows => {}
         QueryStep::ControlRelations(filter) => {
             object.extend(control_relation_filter_to_json(filter));
         }
@@ -1160,6 +1301,13 @@ fn query_step_to_json(step: &QueryStep) -> Value {
                 object.insert("receiver_type".to_string(), receiver_type);
             }
         }
+        QueryStep::ResolvedValue(filter) => {
+            object.insert(
+                "resolves_to".to_string(),
+                call_identity_to_json(&filter.resolves_to),
+            );
+            object.insert("call_proof".to_string(), json!("exact"));
+        }
         QueryStep::CallArgument(selector) => match selector {
             CallArgumentSelector::FormalName(name) => {
                 object.insert("formal_name".to_string(), json!(name));
@@ -1234,6 +1382,7 @@ fn row_literal_to_json(literal: &super::ir::QueryRowLiteral) -> Value {
     match literal {
         super::ir::QueryRowLiteral::String(value) => json!({ "string": value }),
         super::ir::QueryRowLiteral::StringList(values) => json!({ "string_list": values }),
+        super::ir::QueryRowLiteral::IntegerList(values) => json!({ "integer_list": values }),
         super::ir::QueryRowLiteral::Integer(value) => json!({ "integer": value }),
         super::ir::QueryRowLiteral::Boolean(value) => json!({ "boolean": value }),
         super::ir::QueryRowLiteral::ConstrainedEnum(value) => json!({ "enum": value }),
@@ -1328,11 +1477,86 @@ fn pattern_to_json(pattern: &Pattern) -> Value {
     if let Some(predicate) = &pattern.name {
         object.insert("name".to_string(), string_predicate_to_json(predicate));
     }
+    if let Some(predicate) = &pattern.string_value {
+        object.insert(
+            "string_value".to_string(),
+            string_predicate_to_json(predicate),
+        );
+    }
     if let Some(predicate) = &pattern.text {
         object.insert("text".to_string(), string_predicate_to_json(predicate));
     }
     if let Some(value) = pattern.boolean_value {
         object.insert("boolean_value".to_string(), Value::Bool(value));
+    }
+    if let Some(value) = pattern.parenthesized {
+        object.insert("parenthesized".to_string(), Value::Bool(value));
+    }
+    if let Some(value) = &pattern.integer_value {
+        object.insert("integer_value".to_string(), Value::String(value.clone()));
+    }
+    if let Some(value) = pattern.duplicate_key {
+        object.insert("duplicate_key".to_string(), Value::Bool(value));
+    }
+    if let Some(value) = pattern.integer_has_any_bits {
+        object.insert("integer_has_any_bits".to_string(), json!(value));
+    }
+    if let Some(value) = pattern.integer_has_all_bits {
+        object.insert("integer_has_all_bits".to_string(), json!(value));
+    }
+    if let Some(value) = pattern.integer_has_no_bits {
+        object.insert("integer_has_no_bits".to_string(), json!(value));
+    }
+    if let Some(value) = pattern.index {
+        object.insert("index".to_string(), json!(value));
+    }
+    if let Some(value) = pattern.is_async {
+        object.insert("async".to_string(), Value::Bool(value));
+    }
+    if let Some(value) = pattern.modifier {
+        object.insert("modifier".to_string(), json!(value.label()));
+    }
+    if let Some(value) = pattern.assignment_target_kind {
+        object.insert(
+            "assignment_target_kind".to_string(),
+            Value::String(value.label().to_string()),
+        );
+    }
+    if let Some(value) = pattern.assignment_value_kind {
+        object.insert(
+            "assignment_value_kind".to_string(),
+            Value::String(value.label().to_string()),
+        );
+    }
+    if let Some(value) = pattern.assignment_target_unstarred_count {
+        object.insert(
+            "assignment_target_unstarred_count".to_string(),
+            json!(value),
+        );
+    }
+    if let Some(value) = pattern.assignment_value_unstarred_count {
+        object.insert("assignment_value_unstarred_count".to_string(), json!(value));
+    }
+    if let Some(value) = pattern.assignment_target_starred {
+        object.insert("assignment_target_starred".to_string(), Value::Bool(value));
+    }
+    if let Some(value) = pattern.assignment_value_starred {
+        object.insert("assignment_value_starred".to_string(), Value::Bool(value));
+    }
+    if let Some(value) = pattern.assignment_unstarred_count_mismatch {
+        object.insert(
+            "assignment_unstarred_count_mismatch".to_string(),
+            Value::Bool(value),
+        );
+    }
+    if let Some(rule) = pattern.language_rule {
+        object.insert("language_rule".to_string(), json!(rule.label()));
+    }
+    if let Some(state) = pattern.body_state {
+        object.insert("body_state".to_string(), json!(state.label()));
+    }
+    if let Some(owner) = pattern.body_owner {
+        object.insert("body_owner".to_string(), json!(owner.label()));
     }
     if let Some(arity) = &pattern.arity {
         object.insert("arity".to_string(), arity_to_json(arity));
@@ -1355,8 +1579,26 @@ fn pattern_to_json(pattern: &Pattern) -> Value {
     if let Some(sub) = &pattern.has {
         object.insert("has".to_string(), pattern_to_json(sub));
     }
+    if let Some(sub) = &pattern.local_value {
+        object.insert("local_value".to_string(), pattern_to_json(sub));
+    }
     if let Some(sub) = &pattern.not_has {
         object.insert("not_has".to_string(), pattern_to_json(sub));
+    }
+    if let Some(sub) = &pattern.not {
+        object.insert("not".to_string(), pattern_to_json(sub));
+    }
+    if !pattern.all.is_empty() {
+        object.insert(
+            "all".to_string(),
+            Value::Array(pattern.all.iter().map(pattern_to_json).collect()),
+        );
+    }
+    if !pattern.any.is_empty() {
+        object.insert(
+            "any".to_string(),
+            Value::Array(pattern.any.iter().map(pattern_to_json).collect()),
+        );
     }
     for &role in Role::single_target_roles() {
         if let Some(sub) = pattern.single_role_pattern(role) {
@@ -1405,4 +1647,18 @@ fn arity_to_json(arity: &ArityConstraint) -> Value {
         object.insert("max".to_string(), json!(max));
     }
     Value::Object(object)
+}
+
+pub(crate) fn dependency_evidence_seed_to_json(
+    seed: &super::DependencyEvidenceSeed,
+) -> Map<String, Value> {
+    let mut object = Map::new();
+    if !seed.where_globs.is_empty() {
+        object.insert("where".into(), path_scope_to_json(&seed.where_globs));
+    }
+    object.insert(
+        "dependency_evidence".into(),
+        serde_json::to_value(&seed.filter).expect("dependency filters serialize"),
+    );
+    object
 }

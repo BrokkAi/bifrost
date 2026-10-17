@@ -88,6 +88,9 @@ pub struct SymbolSourcesResult {
 #[serde(rename_all = "snake_case")]
 pub enum SymbolSourcesIncompleteReason {
     Cancelled,
+    /// The declaration lies inside a construct its file's parse never closed,
+    /// so its scope and nesting are a recovery claim (#3501).
+    InsideUnclosedConstruct,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -113,6 +116,10 @@ pub struct SourceBlock {
     pub note: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub semantic_model: Option<crate::analyzer::semantic_model::SemanticModelProvenance>,
+    /// Set when the declaration lies inside a construct the parse of its file
+    /// never closed (#3501).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inside_unclosed_construct: Option<UnclosedConstruct>,
 }
 
 pub(super) enum SourceLookupOutcome {
@@ -191,7 +198,8 @@ fn source_blocks_for_resolved_units_with_budget(
             &mut render_cache,
             source_budget,
         )?;
-        if source_blocks.is_empty() && is_scala_object_like(code_unit) {
+        if source_blocks.is_empty() && is_scala_object_like(code_unit) && !code_unit.is_synthetic()
+        {
             module_units.push(code_unit.clone());
         } else {
             blocks.extend(source_blocks);
@@ -335,40 +343,43 @@ fn resolve_file_anchored_symbol_sources(
     lookup: &str,
     source_budget: &SourceByteBudget,
 ) -> SourceLookupOutcome {
-    let code_units = match anchor_scoped_codeunit_resolution(analyzer, &anchor, lookup) {
-        CodeUnitResolution::Resolved(code_units) | CodeUnitResolution::Ambiguous(code_units) => {
-            code_units
-        }
-        CodeUnitResolution::NotFound => {
-            // Nothing resolved in the anchor file. Check globally once for
-            // diagnostics: candidates elsewhere mean the symbol exists but
-            // not here (the anchor recovery note's case); nothing anywhere
-            // falls through to the generated/unsupported/generic not-found
-            // handling, as before.
-            let global_candidates = match exact_then_fuzzy_codeunit_resolution(analyzer, lookup) {
-                CodeUnitResolution::Resolved(units) | CodeUnitResolution::Ambiguous(units) => units,
-                CodeUnitResolution::NotFound => Vec::new(),
-            };
-            if !global_candidates.is_empty() {
-                return SourceLookupOutcome::NotFound(anchor_not_found_input(
-                    input, &anchor, lookup,
-                ));
+    let code_units =
+        match anchor_scoped_codeunit_resolution(analyzer, &anchor, lookup) {
+            CodeUnitResolution::Resolved(code_units)
+            | CodeUnitResolution::Ambiguous(code_units) => code_units,
+            CodeUnitResolution::NotFound => {
+                // Nothing resolved in the anchor file. Check globally once for
+                // diagnostics: candidates elsewhere mean the symbol exists but
+                // not here (the anchor recovery note's case); nothing anywhere
+                // falls through to the generated/unsupported/generic not-found
+                // handling, as before.
+                let (_, bare_lookup) = split_kind_qualified_lookup(lookup);
+                let global_candidates =
+                    match exact_then_fuzzy_codeunit_resolution(analyzer, bare_lookup) {
+                        CodeUnitResolution::Resolved(units)
+                        | CodeUnitResolution::Ambiguous(units) => units,
+                        CodeUnitResolution::NotFound => Vec::new(),
+                    };
+                if !global_candidates.is_empty() {
+                    return SourceLookupOutcome::NotFound(anchor_not_found_input(
+                        input, &anchor, lookup,
+                    ));
+                }
+                if let Some(outcome) = semantic_model_source_outcome_with_anchor(
+                    analyzer,
+                    token,
+                    lookup,
+                    Some(&anchor),
+                    source_budget,
+                ) {
+                    return outcome;
+                }
+                if let Some(item) = unsupported_selector_shape_not_found_input(analyzer, input) {
+                    return SourceLookupOutcome::NotFound(item);
+                }
+                return SourceLookupOutcome::NotFound(symbol_not_found_input(input));
             }
-            if let Some(outcome) = semantic_model_source_outcome_with_anchor(
-                analyzer,
-                token,
-                lookup,
-                Some(&anchor),
-                source_budget,
-            ) {
-                return outcome;
-            }
-            if let Some(item) = unsupported_selector_shape_not_found_input(analyzer, input) {
-                return SourceLookupOutcome::NotFound(item);
-            }
-            return SourceLookupOutcome::NotFound(symbol_not_found_input(input));
-        }
-    };
+        };
     let narrowed: Vec<_> = code_units
         .into_iter()
         .filter(|unit| rel_path_string(unit.source()) == anchor)
@@ -814,7 +825,23 @@ fn get_symbol_sources_with_budget(
     let mut incomplete = Vec::new();
     for outcome in outcomes {
         match outcome {
-            SourceLookupOutcome::Found(blocks) => sources.extend(dedup_source_blocks(blocks)),
+            SourceLookupOutcome::Found(blocks) => {
+                for block in &blocks {
+                    if block.inside_unclosed_construct.is_some()
+                        && !incomplete.iter().any(|item: &SymbolSourcesIncomplete| {
+                            item.target == block.label
+                                && item.reason
+                                    == SymbolSourcesIncompleteReason::InsideUnclosedConstruct
+                        })
+                    {
+                        incomplete.push(SymbolSourcesIncomplete {
+                            target: block.label.clone(),
+                            reason: SymbolSourcesIncompleteReason::InsideUnclosedConstruct,
+                        });
+                    }
+                }
+                sources.extend(dedup_source_blocks(blocks));
+            }
             SourceLookupOutcome::NotFound(symbol) => not_found.push(symbol),
             SourceLookupOutcome::Ambiguous(item) => ambiguous.push(item),
             SourceLookupOutcome::AmbiguousPath(item) => ambiguous_paths.push(item),
@@ -957,6 +984,7 @@ fn semantic_model_source_outcome_with_anchor(
 #[derive(Default)]
 struct SourceRenderCache {
     cpp_identity: CppIdentityRenderCache,
+    unclosed_constructs: UnclosedConstructCache,
     line_starts: HashMap<ProjectFile, std::rc::Rc<Vec<usize>>>,
     function_ranges_by_name: HashMap<String, HashMap<ProjectFile, Vec<SourceOccurrence>>>,
 }
@@ -1060,6 +1088,16 @@ fn source_blocks_for_code_unit_with_cache(
     let canonical_selector = render_cache
         .cpp_identity
         .canonical_selector(analyzer, token, code_unit);
+    let inside_unclosed_construct =
+        render_cache
+            .unclosed_constructs
+            .around(analyzer, code_unit, content.len());
+    let note = inside_unclosed_construct.as_ref().map(|construct| {
+        format!(
+            "Placed by parser recovery: the parse of this file ended inside a construct it never closed, opened at byte {} (line {}), so this declaration's scope and nesting may be wrong.",
+            construct.start_byte, construct.line
+        )
+    });
 
     let mut ranges = source_ranges_for_code_unit(analyzer, code_unit, render_cache);
     ranges.sort_by_key(|occurrence| (occurrence.range.start_byte, occurrence.range.end_byte));
@@ -1132,8 +1170,9 @@ fn source_blocks_for_code_unit_with_cache(
             canonical_selector: canonical_selector.clone(),
             occurrence_role,
             presentation: None,
-            note: None,
+            note: note.clone(),
             semantic_model: None,
+            inside_unclosed_construct: inside_unclosed_construct.clone(),
         });
     }
     Ok(blocks)
@@ -1207,6 +1246,7 @@ pub(super) fn file_outline_source_block(
         presentation,
         note: Some(note),
         semantic_model: None,
+        inside_unclosed_construct: None,
     })
 }
 
@@ -1258,6 +1298,7 @@ pub(super) fn include_fallback_source_block(
                 .to_string(),
         ),
         semantic_model: None,
+        inside_unclosed_construct: None,
     })
 }
 
@@ -1278,6 +1319,7 @@ pub(super) fn excerpt_fallback_source_block(
         presentation: sampled.presentation,
         note: Some(note),
         semantic_model: None,
+        inside_unclosed_construct: None,
     })
 }
 
@@ -1337,6 +1379,7 @@ pub(super) fn module_file_listing_blocks(
                     presentation: Some("file_listing".to_string()),
                     note: Some(note),
                     semantic_model: None,
+                    inside_unclosed_construct: None,
                 }
             })
         })
@@ -1393,6 +1436,7 @@ fn semantic_model_source_block(
         presentation: Some("semantic_model".to_string()),
         note: Some(note.to_string()),
         semantic_model: Some(symbol.provenance.clone()),
+        inside_unclosed_construct: None,
     }
 }
 
@@ -1446,43 +1490,12 @@ pub(super) fn is_ancestor_target(code_unit: &CodeUnit) -> bool {
 
 pub(super) fn expanded_comment_start(language: Language, source: &str, start_byte: usize) -> usize {
     if language == Language::Python {
-        return python_expanded_comment_start(source, start_byte);
+        return brokk_bifrost_python::declarations::python_expanded_comment_start(
+            source, start_byte,
+        );
     }
     // Share the analyzer's comment-walk so both source-rendering paths agree on
     // what counts as a declaration's attached comment block (and inherit fixes
     // like the blank-line terminator that excludes file-level license headers).
     crate::analyzer::tree_sitter_analyzer::expanded_comment_start(language, source, start_byte)
-}
-
-pub(super) fn python_expanded_comment_start(source: &str, start_byte: usize) -> usize {
-    let line_starts = line_starts(source);
-    let line_index = find_line_index_for_offset(&line_starts, start_byte);
-
-    let mut comment_start = start_byte;
-    for line_idx in (0..line_index).rev() {
-        let line_start = line_starts[line_idx];
-        let line_end = line_starts
-            .get(line_idx + 1)
-            .copied()
-            .unwrap_or(source.len());
-        let line = &source[line_start..line_end];
-        let trimmed = line.trim_start();
-
-        if trimmed.trim().is_empty() {
-            continue;
-        }
-
-        if trimmed.starts_with('#') {
-            comment_start = line_start;
-            continue;
-        }
-
-        break;
-    }
-
-    comment_start
-}
-
-pub(super) fn line_starts(source: &str) -> Vec<usize> {
-    compute_line_starts(source)
 }

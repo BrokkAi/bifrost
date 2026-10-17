@@ -1,7 +1,7 @@
 -- The workspace projections, as TEMP views over the content-addressed tables.
 --
 -- Fact rows are keyed by an interned integer `blob_id` that only `blobs` can
--- mint (`.agents/plans/store-blob-id-interning.md`). `workspace_file_versions`
+-- mint. `workspace_file_versions`
 -- still stores the forty-character blob OID, because its rows outlive any one
 -- publication and a republished blob gets a new id. `live_workspace_files`
 -- therefore carries BOTH: the hex it read from the projection and the id its
@@ -764,6 +764,59 @@ JOIN selected_workspace_file_versions AS files
 JOIN main.blobs AS blobs ON blobs.id = sources.blob_id
  AND blobs.blob_oid = files.blob_oid AND blobs.lang = files.lang
  AND blobs.generation = files.generation;
+
+-- Selection-owned rows shared by ordinary and resolution readers. Fill after
+-- installing selected_workspace_revisions; clear with those selection inputs.
+CREATE TEMP TABLE IF NOT EXISTS selected_rust_unit_summaries(
+ workspace_id TEXT NOT NULL, lang TEXT NOT NULL, generation INTEGER NOT NULL,
+ revision INTEGER NOT NULL, unit_key BLOB NOT NULL, valid_from INTEGER NOT NULL,
+ summary_id INTEGER NOT NULL, manifest_file_version_id INTEGER,
+ topology_id INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS temp.selected_rust_unit_summaries_key
+ ON selected_rust_unit_summaries(unit_key);
+CREATE INDEX IF NOT EXISTS temp.selected_rust_unit_summaries_summary
+ ON selected_rust_unit_summaries(summary_id);
+CREATE INDEX IF NOT EXISTS temp.selected_rust_unit_summaries_topology
+ ON selected_rust_unit_summaries(topology_id);
+-- MODULES' detached check seeks the selected workspace before its contexts.
+CREATE INDEX IF NOT EXISTS temp.selected_rust_unit_summaries_workspace
+ ON selected_rust_unit_summaries(workspace_id, generation, unit_key);
+
+-- Workspace dependency reachability, including each root itself. UNION in
+-- the fill makes cyclic and diamond graphs produce one row per root and unit.
+CREATE TEMP TABLE IF NOT EXISTS selected_rust_unit_closure(
+ root_unit_key BLOB NOT NULL, unit_key BLOB NOT NULL, summary_id INTEGER NOT NULL,
+ topology_id INTEGER NOT NULL, workspace_id TEXT NOT NULL, generation INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS temp.selected_rust_unit_closure_topology
+ ON selected_rust_unit_closure(root_unit_key, topology_id);
+CREATE INDEX IF NOT EXISTS temp.selected_rust_unit_closure_summary
+ ON selected_rust_unit_closure(root_unit_key, summary_id);
+
+
+-- Every complete Rust summary publishes its context before its version.
+-- Route owners therefore share the selected unit membership relation.
+CREATE TEMP VIEW IF NOT EXISTS selected_rust_unit_summary_route_owners AS
+SELECT workspace_id, lang, generation, revision, unit_key, valid_from, summary_id
+FROM selected_rust_unit_summaries;
+
+-- Summary members are selected through the same revision-valid summary and
+-- must still be the selected source blob at the member's workspace path.
+CREATE TEMP VIEW IF NOT EXISTS selected_rust_unit_members AS
+SELECT units.workspace_id, units.lang, units.generation, units.revision,
+       units.unit_key, units.summary_id, members.member_ordinal,
+       members.blob_id, members.rel_path, members.source_role,
+       files.file_version_id, files.blob_oid
+FROM selected_rust_unit_summaries AS units
+CROSS JOIN main.resolution_unit_summary_members AS members
+  ON members.summary_id = units.summary_id
+CROSS JOIN selected_workspace_file_versions AS files
+  ON files.workspace_id = units.workspace_id AND files.lang = units.lang
+ AND files.generation = units.generation AND files.rel_path = members.rel_path
+CROSS JOIN main.blobs AS blobs
+  ON blobs.id = members.blob_id AND blobs.blob_oid = files.blob_oid
+ AND blobs.lang = files.lang AND blobs.generation = files.generation;
 
 -- Re-export traversal stays bounded even for an invalid cyclic route graph.
 CREATE TEMP VIEW IF NOT EXISTS rust_crate_exports_reachable AS

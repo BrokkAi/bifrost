@@ -1,0 +1,69 @@
+{
+  "schema_version": 2,
+  "pack_id": "bifrost.rust-cookie",
+  "version": "0.1.0",
+  "producer": {
+    "name": "bifrost-codeql-rust-parity-cq09",
+    "version": "0.1.0"
+  },
+  "language": "rust",
+  "ecosystem": "cargo",
+  "compatibility": {
+    "bifrost": ">=0.12.0, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "CodeQL Rust parity fixture API shape for cookie configuration state.",
+    "revision": "api-shape"
+  },
+  "license": "Apache-2.0",
+  "completeness": "complete",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "declarations.rust-cookie",
+      "activation": [{"targets": [], "configurations": []}],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {"id": "type.rust-cookie.module", "name": "cookie", "type_kind": "module", "visibility": "public", "locator": {"kind": "artifact", "path": "src/lib.rs", "symbol": "cookie"}},
+          {"id": "type.rust-cookie.cookie", "name": "cookie.Cookie", "type_kind": "struct", "visibility": "public", "locator": {"kind": "artifact", "path": "src/api.rs", "symbol": "cookie.Cookie"}},
+          {"id": "type.rust-cookie.builder", "name": "cookie.CookieBuilder", "type_kind": "struct", "visibility": "public", "locator": {"kind": "artifact", "path": "src/api.rs", "symbol": "cookie.CookieBuilder"}},
+          {"id": "type.rust-cookie.jar", "name": "cookie.CookieJar", "type_kind": "struct", "visibility": "public", "locator": {"kind": "artifact", "path": "src/api.rs", "symbol": "cookie.CookieJar"}}
+        ],
+        "members": [
+          {"id": "member.rust-cookie.cookie.build", "owner": "type.rust-cookie.cookie", "name": "build", "member_kind": "method", "visibility": "public", "is_static": true, "callable_family_complete": true, "signature": {"parameters": [{"name": "value", "type": {"kind": "named", "name": "untyped"}}], "returns": {"kind": "named", "name": "cookie.CookieBuilder"}}, "locator": {"kind": "artifact", "path": "src/api.rs", "symbol": "cookie.Cookie.build"}},
+          {"id": "member.rust-cookie.builder.new", "owner": "type.rust-cookie.builder", "name": "new", "member_kind": "method", "visibility": "public", "is_static": true, "callable_family_complete": true, "signature": {"parameters": [{"name": "value", "type": {"kind": "named", "name": "untyped"}}], "returns": {"kind": "named", "name": "cookie.CookieBuilder"}}, "locator": {"kind": "artifact", "path": "src/api.rs", "symbol": "cookie.CookieBuilder.new"}},
+          {"id": "member.rust-cookie.cookie.new", "owner": "type.rust-cookie.cookie", "name": "new", "member_kind": "method", "visibility": "public", "is_static": true, "callable_family_complete": true, "signature": {"parameters": [{"name": "name", "type": {"kind": "named", "name": "untyped"}}, {"name": "value", "type": {"kind": "named", "name": "untyped"}}], "returns": {"kind": "named", "name": "cookie.Cookie"}}, "locator": {"kind": "artifact", "path": "src/api.rs", "symbol": "cookie.Cookie.new"}},
+          {"id": "member.rust-cookie.builder.secure", "owner": "type.rust-cookie.builder", "name": "secure", "member_kind": "method", "visibility": "public", "is_static": false, "callable_family_complete": true, "signature": {"parameters": [{"name": "value", "type": {"kind": "named", "name": "untyped"}}], "returns": {"kind": "named", "name": "cookie.CookieBuilder"}}, "locator": {"kind": "artifact", "path": "src/api.rs", "symbol": "cookie.CookieBuilder.secure"}},
+          {"id": "member.rust-cookie.builder.partitioned", "owner": "type.rust-cookie.builder", "name": "partitioned", "member_kind": "method", "visibility": "public", "is_static": false, "callable_family_complete": true, "signature": {"parameters": [{"name": "value", "type": {"kind": "named", "name": "untyped"}}], "returns": {"kind": "named", "name": "cookie.CookieBuilder"}}, "locator": {"kind": "artifact", "path": "src/api.rs", "symbol": "cookie.CookieBuilder.partitioned"}},
+          {"id": "member.rust-cookie.builder.build", "owner": "type.rust-cookie.builder", "name": "build", "member_kind": "method", "visibility": "public", "is_static": false, "callable_family_complete": true, "signature": {"parameters": [], "returns": {"kind": "named", "name": "cookie.Cookie"}}, "locator": {"kind": "artifact", "path": "src/api.rs", "symbol": "cookie.CookieBuilder.build"}},
+          {"id": "member.rust-cookie.builder.finish", "owner": "type.rust-cookie.builder", "name": "finish", "member_kind": "method", "visibility": "public", "is_static": false, "callable_family_complete": true, "signature": {"parameters": [], "returns": {"kind": "named", "name": "cookie.Cookie"}}, "locator": {"kind": "artifact", "path": "src/api.rs", "symbol": "cookie.CookieBuilder.finish"}},
+          {"id": "member.rust-cookie.cookie.set-secure", "owner": "type.rust-cookie.cookie", "name": "set_secure", "member_kind": "method", "visibility": "public", "is_static": false, "callable_family_complete": true, "signature": {"parameters": [{"name": "value", "type": {"kind": "named", "name": "untyped"}}], "returns": {"kind": "named", "name": "std.unit"}}, "locator": {"kind": "artifact", "path": "src/api.rs", "symbol": "cookie.Cookie.set_secure"}},
+          {"id": "member.rust-cookie.jar.add", "owner": "type.rust-cookie.jar", "name": "add", "member_kind": "method", "visibility": "public", "is_static": false, "callable_family_complete": true, "signature": {"parameters": [{"name": "cookie", "type": {"kind": "named", "name": "cookie.Cookie"}}], "returns": {"kind": "named", "name": "std.unit"}}, "locator": {"kind": "artifact", "path": "src/api.rs", "symbol": "cookie.CookieJar.add"}}
+        ]
+      }
+    },
+    {
+      "id": "summaries.rust-cookie",
+      "activation": [{"targets": [], "configurations": []}],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {"id": "summary.rust-cookie.cookie.build", "target": {"path": "src/api.rs", "symbol": "cookie.Cookie.build", "has_receiver": false, "parameter_count": 1}, "completeness": "complete", "locations": [], "transfers": [], "effects": [{"kind": "allocation", "event": "event.rust-cookie.cookie.build.result", "output": {"kind": "normal_return"}}]},
+          {"id": "summary.rust-cookie.builder.new", "target": {"path": "src/api.rs", "symbol": "cookie.CookieBuilder.new", "has_receiver": false, "parameter_count": 1}, "completeness": "complete", "locations": [], "transfers": [], "effects": [{"kind": "allocation", "event": "event.rust-cookie.builder.new.result", "output": {"kind": "normal_return"}}]},
+          {"id": "summary.rust-cookie.cookie.new", "target": {"path": "src/api.rs", "symbol": "cookie.Cookie.new", "has_receiver": false, "parameter_count": 2}, "completeness": "complete", "locations": [], "transfers": [], "effects": [{"kind": "allocation", "event": "event.rust-cookie.cookie.new.result", "output": {"kind": "normal_return"}}]},
+          {"id": "summary.rust-cookie.builder.secure", "target": {"path": "src/api.rs", "symbol": "cookie.CookieBuilder.secure", "has_receiver": true, "parameter_count": 1}, "completeness": "complete", "covers_overrides": true, "locations": [], "transfers": [{"input": {"kind": "receiver"}, "exit_kind": "normal", "output": {"kind": "normal_return"}}], "effects": []},
+          {"id": "summary.rust-cookie.builder.partitioned", "target": {"path": "src/api.rs", "symbol": "cookie.CookieBuilder.partitioned", "has_receiver": true, "parameter_count": 1}, "completeness": "complete", "covers_overrides": true, "locations": [], "transfers": [{"input": {"kind": "receiver"}, "exit_kind": "normal", "output": {"kind": "normal_return"}}], "effects": []},
+          {"id": "summary.rust-cookie.builder.build", "target": {"path": "src/api.rs", "symbol": "cookie.CookieBuilder.build", "has_receiver": true, "parameter_count": 0}, "completeness": "complete", "covers_overrides": true, "locations": [], "transfers": [{"input": {"kind": "receiver"}, "exit_kind": "normal", "output": {"kind": "normal_return"}}], "effects": []},
+          {"id": "summary.rust-cookie.builder.finish", "target": {"path": "src/api.rs", "symbol": "cookie.CookieBuilder.finish", "has_receiver": true, "parameter_count": 0}, "completeness": "complete", "covers_overrides": true, "locations": [], "transfers": [{"input": {"kind": "receiver"}, "exit_kind": "normal", "output": {"kind": "normal_return"}}], "effects": []},
+          {"id": "summary.rust-cookie.cookie.set-secure", "target": {"path": "src/api.rs", "symbol": "cookie.Cookie.set_secure", "has_receiver": true, "parameter_count": 1}, "completeness": "complete", "covers_overrides": true, "locations": [], "transfers": [{"input": {"kind": "receiver"}, "exit_kind": "normal", "output": {"kind": "receiver"}}], "effects": []},
+          {"id": "summary.rust-cookie.jar.add", "target": {"path": "src/api.rs", "symbol": "cookie.CookieJar.add", "has_receiver": true, "parameter_count": 1}, "completeness": "complete", "covers_overrides": true, "locations": [], "transfers": [], "effects": [{"kind": "escape", "event": "event.rust-cookie.jar.add.cookie", "input": {"kind": "parameter", "ordinal": 0}}]}
+        ]
+      }
+    }
+  ]
+}

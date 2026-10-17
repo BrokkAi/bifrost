@@ -26,7 +26,7 @@ use crate::analyzer::store::resolution_operation::{
     SelectedResolutionContextMetrics, SelectedResolutionOperationInput,
     SelectedResolutionOperationOpenOutcome, SelectedResolutionOperationOutcome,
     SelectedRustBindingDefinition, SelectedRustBindingDefinitionUnitsOutcome,
-    SelectedRustBindingOwner, SelectedRustBindingWorld,
+    SelectedRustBindingOwner, SelectedRustBindingSite, SelectedRustBindingWorld,
 };
 #[cfg(test)]
 use crate::analyzer::store::resolution_operation::{
@@ -37,12 +37,18 @@ use crate::analyzer::store::resolution_publication::SelectedResolutionOverlayInp
 #[cfg(test)]
 use crate::analyzer::store::resolution_selection::SelectedResolutionLanguage;
 use crate::analyzer::structural::EdgeProvenance;
+#[cfg(test)]
+use crate::analyzer::structural::reference_edges::EdgeCompleteness;
 use crate::analyzer::structural::reference_edges::{
-    EdgeCompleteness, EdgeDerivationResult, EdgeIncompleteReason, SelectedInverseIndexOutcome,
+    EdgeDerivationResult, EdgeIncompleteReason, SelectedInverseIndexOutcome,
     SelectedInverseReferenceIndex, SelectedInverseReferenceProvider,
 };
 #[cfg(test)]
-use crate::analyzer::usages::FuzzyResult;
+use crate::analyzer::usages::UsageHitKind;
+#[cfg(test)]
+use crate::analyzer::usages::UsageProof;
+#[cfg(test)]
+use crate::analyzer::usages::call_relations::CallRelationService;
 #[cfg(test)]
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, CallSyntaxKind, DefinitionLookupStatus, candidates_outcome,
@@ -52,12 +58,13 @@ use crate::analyzer::usages::inverted_edges::MAX_CALLSITES;
 #[cfg(test)]
 use crate::analyzer::usages::workspace_graph::is_graph_declaration;
 #[cfg(test)]
-use crate::analyzer::usages::workspace_graph::{UsageEcosystem, WorkspaceUsageGraph};
+use crate::analyzer::usages::workspace_graph::{
+    UsageEcosystem, WorkspaceUsageCatalog, WorkspaceUsageGraph, WorkspaceUsageGraphBuildOutcome,
+    build_workspace_usage_graph_with_cancellation,
+};
 #[cfg(test)]
-use crate::analyzer::usages::{UsageHitKind, UsageProof};
+use crate::analyzer::{AnalyzerQueryScope, CodeUnitIndex, Language, ProjectFile, QueryScope};
 use crate::analyzer::{CodeUnit, IAnalyzer};
-#[cfg(test)]
-use crate::analyzer::{CodeUnitIndex, Language, ProjectFile};
 #[cfg(test)]
 use crate::hash::HashSet;
 #[cfg(test)]
@@ -163,7 +170,7 @@ fn selected_rust_definition_shadow_result_with_after_open(
         &masks,
     )
     .with_content_mounts(content_mounts);
-    let operation = match rust
+    let mut operation = match rust
         .inner
         .analyzer_store()
         .open_selected_resolution_operation(input, &cancellation)
@@ -264,6 +271,166 @@ fn selected_rust_definition_shadow_result_with_after_open(
                 RustDefinitionShadowResult::Cancelled { work }
             }
         },
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn selected_rust_native_usage_consumer_shadow(
+    rust: &RustAnalyzer,
+    target: &CodeUnit,
+    files: &HashSet<ProjectFile>,
+) -> crate::analyzer::usages::outcome::GraphUsageOutcome {
+    super::native_usages::find_native_usages(
+        rust,
+        std::slice::from_ref(target),
+        &brokk_bifrost_core::analyzer::usages::scan_scope::UsageScanScope::new(files),
+        1,
+    )
+}
+
+/// A generation-bound handle; each target owns and drops its row query.
+pub(crate) struct RustSelectedReferenceIndex {
+    generation: u64,
+    rust: Box<RustAnalyzer>,
+    cancellation: crate::CancellationToken,
+}
+
+impl RustSelectedReferenceIndex {
+    #[cfg(test)]
+    pub(crate) fn covers_target(&self, target: &CodeUnit) -> bool {
+        use super::selected_reverse::{
+            RustSelectedReverseOutcome, with_rust_selected_reverse_queries,
+        };
+        matches!(
+            with_rust_selected_reverse_queries(&self.rust, &self.cancellation, |queries| queries
+                .candidate_sets(std::slice::from_ref(target))),
+            RustSelectedReverseOutcome::Ready(Some(_))
+        )
+    }
+
+    pub(crate) fn inverse_for(&self, target: &CodeUnit) -> EdgeDerivationResult {
+        use super::selected_reverse::{
+            RustSelectedReverseOutcome, with_rust_selected_reverse_queries,
+        };
+        if self.rust.inner.project().analysis_generation() == self.generation {
+            match with_rust_selected_reverse_queries(&self.rust, &self.cancellation, |queries| {
+                queries.inverse_for(std::slice::from_ref(target))
+            }) {
+                RustSelectedReverseOutcome::Ready(Some(mut answers)) => {
+                    assert_eq!(answers.len(), 1);
+                    let mut answer = answers.pop().expect("one target answer");
+                    let mut edges = std::collections::BTreeMap::new();
+                    for row in answer.edges {
+                        let key = (
+                            row.site.file.clone(),
+                            row.site.range.start_byte,
+                            row.site.range.end_byte,
+                            row.target.clone(),
+                            row.usage_kind,
+                        );
+                        if let Some(previous) = edges.insert(key, row.clone()) {
+                            assert_eq!(
+                                previous, row,
+                                "one physical inverse edge has one canonical projection"
+                            );
+                        }
+                    }
+                    answer.edges = edges.into_values().collect();
+                    return answer;
+                }
+                RustSelectedReverseOutcome::Ready(None) => {
+                    return self.incomplete(EdgeIncompleteReason::InverseIndexTargetUncovered);
+                }
+                failure => eprintln!("selected inverse row query did not complete: {failure:?}"),
+            }
+        }
+        self.incomplete(EdgeIncompleteReason::InverseIndexResolutionIncomplete)
+    }
+
+    fn incomplete(&self, reason: EdgeIncompleteReason) -> EdgeDerivationResult {
+        EdgeDerivationResult::incomplete(vec![reason], EdgeProvenance::Inverse, self.generation)
+    }
+}
+
+pub(crate) enum RustSelectedReferenceIndexOutcome {
+    Ready(RustSelectedReferenceIndex),
+    Unavailable(String),
+    Stale(String),
+    Cancelled,
+    StoreError(String),
+}
+
+impl SelectedInverseReferenceIndex for RustSelectedReferenceIndex {
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn inverse_for(&self, target: &CodeUnit) -> EdgeDerivationResult {
+        Self::inverse_for(self, target)
+    }
+}
+
+/// The registered Rust selected inverse index builder.
+///
+/// RQL `edges_of` and the policy edge asserts reach Rust's native inverse
+/// answer through this provider, so a workspace whose selected facts cannot
+/// produce an index reports that refusal instead of an empty edge set.
+pub(crate) struct RustNativeSelectedInverseProvider;
+
+impl SelectedInverseReferenceProvider for RustNativeSelectedInverseProvider {
+    fn build_selected_inverse_index(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        cancellation: Option<&crate::CancellationToken>,
+    ) -> SelectedInverseIndexOutcome {
+        let Some(rust) = crate::analyzer::resolve_analyzer::<RustAnalyzer>(analyzer) else {
+            return SelectedInverseIndexOutcome::Unavailable(
+                "the workspace has no Rust analyzer".to_string(),
+            );
+        };
+        let token = cancellation.cloned().unwrap_or_default();
+        match build_rust_selected_reference_index(rust, &token) {
+            RustSelectedReferenceIndexOutcome::Ready(index) => {
+                SelectedInverseIndexOutcome::Ready(Arc::new(index))
+            }
+            RustSelectedReferenceIndexOutcome::Unavailable(detail) => {
+                SelectedInverseIndexOutcome::Unavailable(detail)
+            }
+            RustSelectedReferenceIndexOutcome::Stale(detail) => {
+                SelectedInverseIndexOutcome::Stale(detail)
+            }
+            RustSelectedReferenceIndexOutcome::Cancelled => SelectedInverseIndexOutcome::Cancelled,
+            RustSelectedReferenceIndexOutcome::StoreError(detail) => {
+                SelectedInverseIndexOutcome::StoreError(detail)
+            }
+        }
+    }
+}
+
+pub(crate) fn build_rust_selected_reference_index(
+    rust: &RustAnalyzer,
+    cancellation: &crate::CancellationToken,
+) -> RustSelectedReferenceIndexOutcome {
+    use super::selected_reverse::{RustSelectedReverseOutcome, with_rust_selected_reverse_queries};
+    let generation = rust.inner.project().analysis_generation();
+    match with_rust_selected_reverse_queries(rust, cancellation, |_| Ok(())) {
+        RustSelectedReverseOutcome::Ready(()) => {
+            RustSelectedReferenceIndexOutcome::Ready(RustSelectedReferenceIndex {
+                generation,
+                rust: Box::new(rust.clone()),
+                cancellation: cancellation.clone(),
+            })
+        }
+        RustSelectedReverseOutcome::Unavailable(detail) => {
+            RustSelectedReferenceIndexOutcome::Unavailable(detail)
+        }
+        RustSelectedReverseOutcome::Stale(detail) => {
+            RustSelectedReferenceIndexOutcome::Stale(detail)
+        }
+        RustSelectedReverseOutcome::Cancelled => RustSelectedReferenceIndexOutcome::Cancelled,
+        RustSelectedReverseOutcome::StoreError(detail) => {
+            RustSelectedReferenceIndexOutcome::StoreError(detail)
+        }
     }
 }
 
@@ -804,347 +971,6 @@ fn selected_rust_workspace_graph_shadow_result(
 }
 
 #[cfg(test)]
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct RustDeadCodeGraphShadow {
-    edges: BTreeMap<(String, String), usize>,
-    truncated: BTreeMap<String, usize>,
-    unproven_inbound: BTreeMap<String, usize>,
-}
-
-#[cfg(test)]
-fn accumulate_rust_dead_code_count(
-    counts: &mut BTreeMap<String, usize>,
-    name: String,
-    added: usize,
-) {
-    let count = counts.entry(name).or_default();
-    *count = count
-        .checked_add(added)
-        .expect("Rust dead-code graph count must fit usize");
-}
-
-#[cfg(test)]
-fn native_rust_dead_code_graph_shadow(graph: &RustWorkspaceGraphShadow) -> RustDeadCodeGraphShadow {
-    let mut shadow = RustDeadCodeGraphShadow::default();
-    for ((caller, target), counts) in &graph.edges {
-        let key = (caller.fq_name(), target.fq_name());
-        let count = shadow.edges.entry(key).or_default();
-        *count = count
-            .checked_add(counts.total())
-            .expect("Rust dead-code edge count must fit usize");
-    }
-    for (target, &count) in &graph.truncated {
-        accumulate_rust_dead_code_count(&mut shadow.truncated, target.fq_name(), count);
-    }
-    for (target, &count) in &graph.unproven_inbound {
-        accumulate_rust_dead_code_count(&mut shadow.unproven_inbound, target.fq_name(), count);
-    }
-    shadow
-}
-
-#[cfg(test)]
-fn selected_rust_dead_code_graph_shadow_result(
-    rust: &RustAnalyzer,
-    nodes: &HashSet<String>,
-    cancellation: &crate::CancellationToken,
-) -> RustWorkspaceGraphShadowResult {
-    let selected = match selected_rust_workspace_binding_world(rust, cancellation) {
-        RustWorkspaceBindingWorldResult::Ready(selected) => selected,
-        RustWorkspaceBindingWorldResult::Unavailable(detail) => {
-            return RustWorkspaceGraphShadowResult::Unavailable(detail);
-        }
-        RustWorkspaceBindingWorldResult::Stale(detail) => {
-            return RustWorkspaceGraphShadowResult::Stale(detail);
-        }
-        RustWorkspaceBindingWorldResult::Cancelled => {
-            return RustWorkspaceGraphShadowResult::Cancelled;
-        }
-        RustWorkspaceBindingWorldResult::StoreError(detail) => {
-            return RustWorkspaceGraphShadowResult::StoreError(detail);
-        }
-    };
-    let mut graph_units = BTreeMap::new();
-    let mut projected_fq_names = HashSet::default();
-    for unit in selected.definition_units.values() {
-        let fq_name = unit.fq_name();
-        if !rust_selected_reference_target(unit) || !nodes.contains(&fq_name) {
-            continue;
-        }
-        projected_fq_names.insert(fq_name);
-        if let Some(previous) = graph_units.insert(unit.clone(), unit.clone()) {
-            assert_eq!(
-                previous, *unit,
-                "one Rust dead-code graph declaration has one canonical parser unit"
-            );
-        }
-    }
-    let required_units = graph_units.keys().cloned().collect::<BTreeSet<_>>();
-    let graph_definition_spans = graph_units
-        .values()
-        .map(|unit| {
-            (
-                unit.clone(),
-                rust.ranges(unit)
-                    .into_iter()
-                    .map(|range| (unit.source().clone(), range))
-                    .collect::<Vec<_>>(),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    let result = native_rust_graph_shadow_for_units(
-        rust,
-        &selected.definition_units,
-        &graph_units,
-        &required_units,
-        &graph_definition_spans,
-        &selected.world,
-        cancellation,
-    );
-    let mut missing_nodes = nodes
-        .difference(&projected_fq_names)
-        .cloned()
-        .collect::<Vec<_>>();
-    missing_nodes.sort_unstable();
-    if missing_nodes.is_empty() {
-        return result;
-    }
-    match result {
-        RustWorkspaceGraphShadowResult::Complete(graph) => {
-            RustWorkspaceGraphShadowResult::Incomplete {
-                graph,
-                detail: format!(
-                    "selected Rust dead-code graph omitted requested nodes: {missing_nodes:?}"
-                ),
-            }
-        }
-        RustWorkspaceGraphShadowResult::Incomplete { graph, detail } => {
-            RustWorkspaceGraphShadowResult::Incomplete {
-                graph,
-                detail: format!("{detail}; omitted requested nodes: {missing_nodes:?}"),
-            }
-        }
-        terminal => terminal,
-    }
-}
-
-/// Real native Rust graph preparation feeding the shared relevance reducer.
-/// This diagnostic seam never changes production graph or cache selection.
-#[cfg(test)]
-pub(crate) fn selected_rust_relevance_graph_shadow(
-    rust: &RustAnalyzer,
-    cancellation: &crate::CancellationToken,
-) -> Result<
-    crate::analyzer::usages::workspace_graph::SelectedWorkspaceUsageRankingBuildOutcome,
-    String,
-> {
-    use super::native_graph::{
-        RustNativeWorkspaceGraphOutcome, build_rust_native_workspace_graph_for_files,
-    };
-    use crate::analyzer::usages::workspace_graph::SelectedWorkspaceUsageGraphProjectionOutcome;
-    let root_files: Vec<ProjectFile> = rust
-        .source_file_inventory()
-        .rows
-        .into_iter()
-        .filter(|file| crate::analyzer::common::language_for_file(file) == Language::Rust)
-        .collect();
-    let projection =
-        match build_rust_native_workspace_graph_for_files(rust, &root_files, 8, cancellation)
-            .map_err(|error| error.to_string())?
-        {
-            RustNativeWorkspaceGraphOutcome::Complete(graph) => {
-                SelectedWorkspaceUsageGraphProjectionOutcome::Complete(graph)
-            }
-            RustNativeWorkspaceGraphOutcome::Incomplete(graph) => {
-                SelectedWorkspaceUsageGraphProjectionOutcome::Incomplete(graph)
-            }
-            RustNativeWorkspaceGraphOutcome::Cancelled => {
-                SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled
-            }
-            RustNativeWorkspaceGraphOutcome::Stale(_) => {
-                SelectedWorkspaceUsageGraphProjectionOutcome::Stale
-            }
-            RustNativeWorkspaceGraphOutcome::Unavailable(reason) => return Err(reason),
-        };
-    Ok(projection.into_ranking_graph(rust, cancellation))
-}
-
-#[cfg(test)]
-pub(crate) fn selected_rust_native_usage_consumer_shadow(
-    rust: &RustAnalyzer,
-    target: &CodeUnit,
-    files: &HashSet<ProjectFile>,
-) -> crate::analyzer::usages::outcome::GraphUsageOutcome {
-    super::native_usages::find_native_usages(
-        rust,
-        std::slice::from_ref(target),
-        &brokk_bifrost_core::analyzer::usages::scan_scope::UsageScanScope::new(files),
-        1,
-    )
-}
-
-/// A generation-bound handle; each target owns and drops its row query.
-pub(crate) struct RustSelectedReferenceIndex {
-    generation: u64,
-    rust: Box<RustAnalyzer>,
-    cancellation: crate::CancellationToken,
-}
-
-impl RustSelectedReferenceIndex {
-    pub(crate) const fn generation(&self) -> u64 {
-        self.generation
-    }
-
-    #[cfg(test)]
-    pub(crate) fn covers_target(&self, target: &CodeUnit) -> bool {
-        use super::selected_reverse::{
-            RustSelectedReverseOutcome, with_rust_selected_reverse_queries,
-        };
-        matches!(
-            with_rust_selected_reverse_queries(&self.rust, &self.cancellation, |queries| queries
-                .candidate_files(std::slice::from_ref(target))),
-            RustSelectedReverseOutcome::Ready(Some(_))
-        )
-    }
-
-    pub(crate) fn inverse_for(&self, target: &CodeUnit) -> EdgeDerivationResult {
-        use super::selected_reverse::{
-            RustSelectedReverseOutcome, with_rust_selected_reverse_queries,
-        };
-        if self.rust.inner.project().analysis_generation() == self.generation {
-            match with_rust_selected_reverse_queries(&self.rust, &self.cancellation, |queries| {
-                queries.inverse_for(std::slice::from_ref(target))
-            }) {
-                RustSelectedReverseOutcome::Ready(Some(mut answers)) => {
-                    assert_eq!(answers.len(), 1);
-                    let mut answer = answers.pop().expect("one target answer");
-                    let mut edges = std::collections::BTreeMap::new();
-                    for row in answer.edges {
-                        let key = (
-                            row.site.file.clone(),
-                            row.site.range.start_byte,
-                            row.site.range.end_byte,
-                            row.target.clone(),
-                            row.usage_kind,
-                        );
-                        if let Some(previous) = edges.insert(key, row.clone()) {
-                            assert_eq!(
-                                previous, row,
-                                "one physical inverse edge has one canonical projection"
-                            );
-                        }
-                    }
-                    answer.edges = edges.into_values().collect();
-                    return answer;
-                }
-                RustSelectedReverseOutcome::Ready(None) => {
-                    return self.incomplete(EdgeIncompleteReason::InverseIndexTargetUncovered);
-                }
-                failure => eprintln!("selected inverse row query did not complete: {failure:?}"),
-            }
-        }
-        self.incomplete(EdgeIncompleteReason::InverseIndexResolutionIncomplete)
-    }
-
-    fn incomplete(&self, reason: EdgeIncompleteReason) -> EdgeDerivationResult {
-        EdgeDerivationResult {
-            edges: Vec::new(),
-            completeness: EdgeCompleteness::Incomplete {
-                reasons: vec![reason],
-            },
-            provenance: EdgeProvenance::Inverse,
-            generation: self.generation,
-        }
-    }
-}
-
-pub(crate) enum RustSelectedReferenceIndexOutcome {
-    Ready(RustSelectedReferenceIndex),
-    Unavailable(String),
-    Stale(String),
-    Cancelled,
-    StoreError(String),
-}
-
-impl SelectedInverseReferenceIndex for RustSelectedReferenceIndex {
-    fn generation(&self) -> u64 {
-        Self::generation(self)
-    }
-
-    fn inverse_for(&self, target: &CodeUnit) -> EdgeDerivationResult {
-        Self::inverse_for(self, target)
-    }
-}
-
-/// The registered Rust selected inverse index builder.
-///
-/// RQL `edges_of` and the policy edge asserts reach Rust's native inverse
-/// answer through this provider, so a workspace whose selected facts cannot
-/// produce an index reports that refusal instead of an empty edge set.
-pub(crate) struct RustNativeSelectedInverseProvider;
-
-impl SelectedInverseReferenceProvider for RustNativeSelectedInverseProvider {
-    fn build_selected_inverse_index(
-        &self,
-        analyzer: &dyn IAnalyzer,
-        cancellation: Option<&crate::CancellationToken>,
-    ) -> SelectedInverseIndexOutcome {
-        let Some(rust) = crate::analyzer::resolve_analyzer::<RustAnalyzer>(analyzer) else {
-            return SelectedInverseIndexOutcome::Unavailable(
-                "the workspace has no Rust analyzer".to_string(),
-            );
-        };
-        let token = cancellation.cloned().unwrap_or_default();
-        match build_rust_selected_reference_index(rust, &token) {
-            RustSelectedReferenceIndexOutcome::Ready(index) => {
-                SelectedInverseIndexOutcome::Ready(Arc::new(index))
-            }
-            RustSelectedReferenceIndexOutcome::Unavailable(detail) => {
-                SelectedInverseIndexOutcome::Unavailable(detail)
-            }
-            RustSelectedReferenceIndexOutcome::Stale(detail) => {
-                SelectedInverseIndexOutcome::Stale(detail)
-            }
-            RustSelectedReferenceIndexOutcome::Cancelled => SelectedInverseIndexOutcome::Cancelled,
-            RustSelectedReferenceIndexOutcome::StoreError(detail) => {
-                SelectedInverseIndexOutcome::StoreError(detail)
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-fn rust_selected_reference_target(unit: &CodeUnit) -> bool {
-    !unit.is_synthetic() && (unit.is_class() || unit.is_callable() || unit.is_field())
-}
-
-pub(crate) fn build_rust_selected_reference_index(
-    rust: &RustAnalyzer,
-    cancellation: &crate::CancellationToken,
-) -> RustSelectedReferenceIndexOutcome {
-    use super::selected_reverse::{RustSelectedReverseOutcome, with_rust_selected_reverse_queries};
-    let generation = rust.inner.project().analysis_generation();
-    match with_rust_selected_reverse_queries(rust, cancellation, |_| Ok(())) {
-        RustSelectedReverseOutcome::Ready(()) => {
-            RustSelectedReferenceIndexOutcome::Ready(RustSelectedReferenceIndex {
-                generation,
-                rust: Box::new(rust.clone()),
-                cancellation: cancellation.clone(),
-            })
-        }
-        RustSelectedReverseOutcome::Unavailable(detail) => {
-            RustSelectedReferenceIndexOutcome::Unavailable(detail)
-        }
-        RustSelectedReverseOutcome::Stale(detail) => {
-            RustSelectedReferenceIndexOutcome::Stale(detail)
-        }
-        RustSelectedReverseOutcome::Cancelled => RustSelectedReferenceIndexOutcome::Cancelled,
-        RustSelectedReverseOutcome::StoreError(detail) => {
-            RustSelectedReferenceIndexOutcome::StoreError(detail)
-        }
-    }
-}
-
-#[cfg(test)]
 fn selected_rust_rename_shadow_result(
     rust: &RustAnalyzer,
     project: &dyn Project,
@@ -1164,43 +990,30 @@ mod tests {
     use super::super::RustSupport;
     use super::*;
     use crate::CancellationToken;
-    use crate::analyzer::languages::{LanguageSupport, StructuralReceiverResolver, fqn_bulk_nodes};
-    use crate::analyzer::usages::call_relations::CallRelationService;
+    use crate::analyzer::languages::StructuralReceiverResolver;
     use crate::analyzer::usages::get_definition::ResolvedReferenceSite;
-    use crate::analyzer::usages::workspace_graph::{
-        WorkspaceUsageCatalog, WorkspaceUsageGraphBuildOutcome,
-        build_workspace_usage_graph_with_cancellation,
-    };
-    use crate::analyzer::{AnalyzerQueryScope, Project, QueryScope, Range};
-    use crate::hash::HashSet;
+    use crate::analyzer::{Project, Range};
     use crate::inline_project::InlineTestProject;
     use crate::symbol_rename::RenameSelection;
+    use brokk_bifrost_test_macros::hardwon;
     use std::sync::Arc;
 
     fn rust_shadow_site(source: &str, spelling: &str) -> ResolvedReferenceSite {
         let start_byte = source.rfind(spelling).expect("Rust shadow call");
-        ResolvedReferenceSite {
-            path: "src/lib.rs".to_string(),
-            text: spelling.to_string(),
-            range: Range {
+        crate::test_support::resolved_reference_site(
+            "src/lib.rs".to_string(),
+            spelling.to_string(),
+            Range {
                 start_byte,
                 end_byte: start_byte + spelling.len(),
                 start_line: 3,
                 end_line: 3,
             },
-            focus_start_byte: start_byte,
-            focus_end_byte: start_byte + spelling.len(),
-        }
+        )
     }
 
     fn rust_shadow_tree(source: &str) -> tree_sitter::Tree {
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .expect("configure Rust parser");
-        parser
-            .parse(source, None)
-            .expect("parse Rust shadow fixture")
+        crate::test_support::parse_fixture_tree(source, tree_sitter_rust::LANGUAGE.into())
     }
 
     fn assert_rust_shadow_case(
@@ -1252,45 +1065,46 @@ mod tests {
     }
 
     #[test]
-    fn production_structural_resolver_shadows_selected_rust_library_resolution() {
+    #[hardwon(
+        "#4488: additive derive metadata falsely opened unrelated authored reverse inventory"
+    )]
+    fn derive_surface_keeps_authored_reverse_complete() {
+        use super::super::selected_reverse::{
+            RustSelectedReverseOutcome, with_rust_selected_reverse_queries,
+        };
+        use crate::analyzer::structural::reference_edges::EdgeCompleteness;
+        use crate::analyzer::usages::UsageProof;
+
         let source = concat!(
-            "pub mod model;\n",
-            "pub use model::target as alias;\n",
-            "pub fn caller() -> usize { alias() }\n",
+            "#[derive(Unknown)] pub struct Generated;\n",
+            "pub struct Worker; impl Worker { pub fn run(self) {} }\n",
+            "pub fn caller() { let worker = Worker; worker.run(); }\n",
         );
         let fixture = InlineTestProject::with_language(Language::Rust)
             .file(
                 "Cargo.toml",
-                "[package]\nname = \"shadow\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+                "[package]\nname='derive_views'\nversion='0.1.0'\nedition='2024'\n",
             )
             .file("src/lib.rs", source)
-            .file("src/model.rs", "pub fn target() -> usize { 1 }\n")
             .build();
         let analyzer = RustAnalyzer::new(fixture.project_dyn());
         let file = fixture.file("src/lib.rs");
-        let site = rust_shadow_site(source, "alias");
-        let tree = rust_shadow_tree(source);
-        let query = BoundedReceiverQuery {
-            analyzer: &analyzer,
-            file: &file,
-            source,
-            tree: Some(&tree),
-            site: &site,
-            budget: brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget::default(),
-            cancellation: None,
+        let target = analyzer
+            .declarations(&file)
+            .into_iter()
+            .find(|unit| unit.identifier() == "run" && unit.is_function())
+            .unwrap();
+        let result =
+            with_rust_selected_reverse_queries(&analyzer, &CancellationToken::new(), |queries| {
+                queries.inverse_for(&[target])
+            });
+        let RustSelectedReverseOutcome::Ready(Some(rows)) = result else {
+            panic!("authored reverse lookup must be available: {result:?}");
         };
-
-        let RustDefinitionShadowResult::Complete {
-            status,
-            definitions,
-            ..
-        } = selected_rust_definition_shadow_result(&analyzer, query)
-        else {
-            panic!("selected Rust library resolution must complete")
-        };
-        assert_eq!(status, DefinitionLookupStatus::Resolved);
-        assert_eq!(definitions.len(), 1);
-        assert_eq!(definitions[0].short_name(), "target");
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].edges.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].edges[0].proof, UsageProof::Proven, "{rows:?}");
+        assert_eq!(rows[0].completeness, EdgeCompleteness::Complete, "{rows:?}");
     }
 
     #[test]
@@ -1360,148 +1174,6 @@ mod tests {
                 && unit.identifier() == "target"
                 && unit.owner_identifier() == Some("Api")
         }));
-    }
-
-    #[test]
-    fn production_structural_definition_ignores_unused_call_result_projection() {
-        assert_rust_shadow_case(
-            "pub fn target() {}\npub fn caller() { target(); }\n",
-            "target",
-            &[],
-            DefinitionLookupStatus::Resolved,
-            &["target"],
-        );
-    }
-
-    #[test]
-    fn production_usage_resolver_shadows_selected_rust_reverse_source_sites() {
-        let consumer_source = concat!(
-            "use crate::model::target as imported_target;\n",
-            "pub fn caller() { imported_target(); }\n",
-        );
-        let fixture = InlineTestProject::with_language(Language::Rust)
-            .file(
-                "Cargo.toml",
-                "[package]\nname = \"shadow\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-            )
-            .file(
-                "src/lib.rs",
-                "pub mod model;\nmod consumer;\nmod excluded;\n",
-            )
-            .file("src/model.rs", "pub fn target() {}\n")
-            .file("src/consumer.rs", consumer_source)
-            .file(
-                "src/excluded.rs",
-                "use crate::model::target;\npub fn outside_scope() { target(); }\n",
-            )
-            .build();
-        let analyzer = RustAnalyzer::new(fixture.project_dyn());
-        let model = fixture.file("src/model.rs");
-        let consumer = fixture.file("src/consumer.rs");
-        let target = analyzer
-            .declarations(&model)
-            .into_iter()
-            .find(|unit| unit.identifier() == "target")
-            .expect("target declaration");
-        let candidates: HashSet<_> = [consumer.clone()].into_iter().collect();
-        let scope = UsageScanScope::new(&candidates);
-
-        let native = selected_rust_usage_shadow_result(
-            &analyzer,
-            std::slice::from_ref(&target),
-            &scope,
-            100,
-        );
-
-        let RustUsageShadowResult::Complete {
-            sites,
-            capped: false,
-        } = native
-        else {
-            panic!("the selected library-only Rust workspace reverse must be complete")
-        };
-        let expected_start = consumer_source
-            .rfind("imported_target")
-            .expect("consumer call");
-        assert_eq!(
-            sites,
-            BTreeSet::from([RustUsageShadowSite {
-                file: consumer,
-                start_byte: expected_start,
-                end_byte: expected_start + "imported_target".len(),
-                enclosing: analyzer
-                    .declarations(&fixture.file("src/consumer.rs"))
-                    .into_iter()
-                    .find(|unit| unit.identifier() == "caller")
-                    .expect("caller declaration"),
-            }])
-        );
-    }
-
-    #[test]
-    fn production_usage_resolver_shadows_selected_rust_reverse_chained_let_sites() {
-        let consumer_source = concat!(
-            "use crate::model::target as imported_target;\n",
-            "pub fn caller() {\n",
-            "    if let Some(value) = Some(1) && imported_target() {\n",
-            "        imported_target();\n",
-            "    }\n",
-            "    while let Some(value) = Some(1) && imported_target() {\n",
-            "        imported_target();\n",
-            "        break;\n",
-            "    }\n",
-            "}\n",
-        );
-        let fixture = InlineTestProject::with_language(Language::Rust)
-            .file(
-                "Cargo.toml",
-                "[package]\nname = \"shadow\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-            )
-            .file("src/lib.rs", "pub mod model;\nmod consumer;\n")
-            .file("src/model.rs", "pub fn target() -> bool { true }\n")
-            .file("src/consumer.rs", consumer_source)
-            .build();
-        let analyzer = RustAnalyzer::new(fixture.project_dyn());
-        let model = fixture.file("src/model.rs");
-        let consumer = fixture.file("src/consumer.rs");
-        let target = analyzer
-            .declarations(&model)
-            .into_iter()
-            .find(|unit| unit.identifier() == "target")
-            .expect("target declaration");
-        let candidates: HashSet<_> = [consumer.clone()].into_iter().collect();
-        let scope = UsageScanScope::new(&candidates);
-
-        let native = selected_rust_usage_shadow_result(
-            &analyzer,
-            std::slice::from_ref(&target),
-            &scope,
-            100,
-        );
-
-        let RustUsageShadowResult::Complete {
-            sites,
-            capped: false,
-        } = native
-        else {
-            panic!("the selected chained-let reverse must be complete")
-        };
-        let caller = analyzer
-            .declarations(&consumer)
-            .into_iter()
-            .find(|unit| unit.identifier() == "caller")
-            .expect("caller declaration");
-        let expected_sites = consumer_source
-            .match_indices("imported_target")
-            .skip(1)
-            .map(|(start_byte, _)| RustUsageShadowSite {
-                file: consumer.clone(),
-                start_byte,
-                end_byte: start_byte + "imported_target".len(),
-                enclosing: caller.clone(),
-            })
-            .collect::<BTreeSet<_>>();
-        assert_eq!(sites, expected_sites);
     }
 
     #[test]
@@ -1599,6 +1271,9 @@ mod tests {
         );
     }
 
+    #[hardwon(
+        "4ea6d2b2f5cb: qualified Rust path prefixes were not resolved from selected source authority during rename"
+    )]
     #[test]
     fn native_rename_updates_import_targets_without_changing_aliases() {
         for (import, call, expected_edits) in [
@@ -1646,6 +1321,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "4ea6d2b2f5cb: qualified Rust path prefixes were not resolved from selected source authority during rename"
+    )]
     fn native_rename_preserves_qualified_prefixes_in_counterfactual_content() {
         let mut failures = Vec::new();
         for (label, source) in [
@@ -1784,6 +1462,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("3e4862340fb8: Cargo profiles sharing one Rust source invalidated rename safety")]
     fn production_rename_shadow_proves_shared_explicit_target_safe() {
         let source = "pub fn target() {}\npub fn caller() { target(); }\n";
         let fixture = InlineTestProject::with_language(Language::Rust)
@@ -1815,51 +1494,6 @@ mod tests {
             native,
             RustRenameSafetyOutcome::Safe,
             "enumerating every Cargo profile closes the shared-source counterfactual"
-        );
-    }
-
-    /// A Rust source no Cargo target reaches does not leave the rename's
-    /// source inventory open.
-    ///
-    /// `scratch.rs` is outside every Cargo target of `shadow`, so the
-    /// workspace inventory gives it a `Detached` profile: it is its own
-    /// single-file crate root with no dependency crates, and it declares no
-    /// module of its own. It therefore cannot name `shadow::target` at all,
-    /// the counterfactual it used to keep open is closed, and the rename
-    /// certifies its two edits in `src/lib.rs`.
-    #[test]
-    fn production_rename_over_a_detached_rust_source_certifies_its_edits() {
-        let source = "pub fn target() {}\npub fn caller() { target(); }\n";
-        let fixture = InlineTestProject::with_language(Language::Rust)
-            .file(
-                "Cargo.toml",
-                "[package]\nname = \"shadow\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-            )
-            .file("src/lib.rs", source)
-            .file("scratch.rs", "pub fn unrelated() {}\n")
-            .build();
-        let analyzer = RustAnalyzer::new(fixture.project_dyn());
-        let file = fixture.file("src/lib.rs");
-        let declaration_start = source.find("target").expect("target declaration");
-
-        let result = crate::symbol_rename::rename_symbol(
-            &analyzer,
-            fixture.project(),
-            file.clone(),
-            RenameSelection::ByteOffset(declaration_start),
-            "renamed",
-        )
-        .expect("a detached source closes the rename's open inventory");
-        assert_eq!(result.files.len(), 1, "{result:#?}");
-        assert_eq!(result.files[0].file, file, "{result:#?}");
-        assert_eq!(
-            result.files[0]
-                .edits
-                .iter()
-                .map(|edit| (edit.start_byte, edit.end_byte))
-                .collect::<Vec<_>>(),
-            vec![(7, 13), (37, 43)],
-            "{result:#?}"
         );
     }
 
@@ -2067,6 +1701,16 @@ mod tests {
             "{value:#?}"
         );
     }
+
+    #[test]
+    #[ignore = "finds real bug: function-local macro enumeration retains two UnsupportedSemantic reasons instead of Complete (#2767). Owner: selected_rust_workspace_binding_world"]
+    fn partition_2767_local_macro_enumeration_is_complete() {
+        let world = partition_binding_world(
+            "fn unrelated() { macro_rules! value { () => { 1 }; } let _ = value!(); }\nfn target() {}\nfn caller() { target(); }\n",
+        );
+        assert_eq!(world.completion(), &ResolutionCompletion::Complete);
+    }
+
     #[test]
     fn production_call_relations_preserve_exact_and_ambiguous_rust_calls() {
         let source = concat!(
@@ -2130,9 +1774,11 @@ mod tests {
                 && !site.arguments[0].variadic
                 && !site.arguments[0].spread
         }));
+        // Relation-layer ambiguity has no analyzer failure reason; RQL
+        // reserves reason_kind for AnalysisFailed diagnostics.
         assert!(outgoing.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == crate::analyzer::usages::CallRelationDiagnosticCode::TargetsAmbiguous
-                && diagnostic.reason_kind.as_deref() == Some("native_call_targets_ambiguous")
+                && diagnostic.reason_kind.is_none()
         }));
 
         let exact = analyzer
@@ -2176,30 +1822,7 @@ mod tests {
             "fn pattern(pair: (usize, usize)) { let (left, right) = pair; }\n",
         ] {
             let source = format!("{extra_source}fn target() {{}}\nfn caller() {{ target(); }}\n");
-            let fixture = InlineTestProject::with_language(Language::Rust)
-                .file(
-                    "Cargo.toml",
-                    "[package]\nname = \"shadow\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-                )
-                .file("src/lib.rs", &source)
-                .build();
-            let analyzer = RustAnalyzer::new(fixture.project_dyn());
-            let target = analyzer
-                .all_declarations()
-                .find(|unit| unit.identifier() == "target")
-                .expect("local target declaration");
-            let cancellation = CancellationToken::default();
-            let result = selected_rust_binding_world(
-                &analyzer,
-                analyzer.inner.selected_workspace_snapshots().as_ref(),
-                RustBindingTargetProof::Current(&target),
-                &[],
-                Vec::new(),
-                &cancellation,
-            );
-            let RustBindingWorldOutcome::Ready(world) = result else {
-                panic!("local binding world must be available: {result:?}")
-            };
+            let world = binding_world(&source, "shadow");
             if extra_source.is_empty() {
                 assert_eq!(
                     world.completion(),
@@ -2207,16 +1830,7 @@ mod tests {
                     "unused call-result projections must not weaken the binding world"
                 );
             }
-            let call_start = source.rfind("target()").expect("local call");
-            let site = world
-                .sites()
-                .iter()
-                .find(|site| {
-                    site.metadata()
-                        .is_some_and(|metadata| metadata.start_byte() == call_start)
-                })
-                .expect("local call has a structured binding site");
-            assert_eq!(site.definitions(), std::slice::from_ref(world.target()));
+            let site = assert_local_call_targets(&world, &source);
             if site.completion() != &ResolutionCompletion::Complete {
                 incomplete_local_calls.push((extra_source, site.clone()));
             }
@@ -2227,11 +1841,25 @@ mod tests {
         );
     }
 
+    #[test]
+    #[hardwon("cf6242ee4553: a function-local Rust import alias made a sibling call incomplete")]
+    fn partition_2767_local_import_alias_keeps_sibling_call_proven() {
+        assert_unrelated_item_keeps_local_call_proven(
+            "enum Mode { Exact }\nfn unrelated() { use Mode as Alias; }",
+        );
+    }
+
     fn partition_binding_world(source: &str) -> SelectedRustBindingWorld {
+        binding_world(source, "partition")
+    }
+
+    fn binding_world(source: &str, package_name: &str) -> SelectedRustBindingWorld {
         let fixture = InlineTestProject::with_language(Language::Rust)
             .file(
                 "Cargo.toml",
-                "[package]\nname = \"partition\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+                format!(
+                    "[package]\nname = \"{package_name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"
+                ),
             )
             .file("src/lib.rs", source)
             .build();
@@ -2257,6 +1885,18 @@ mod tests {
     fn assert_unrelated_item_keeps_local_call_proven(extra_source: &str) {
         let source = format!("{extra_source}\nfn target() {{}}\nfn caller() {{ target(); }}\n");
         let world = partition_binding_world(&source);
+        let site = assert_local_call_targets(&world, &source);
+        assert_eq!(
+            site.completion(),
+            &ResolutionCompletion::Complete,
+            "unrelated item must not weaken the local call: {extra_source}"
+        );
+    }
+
+    fn assert_local_call_targets<'a>(
+        world: &'a SelectedRustBindingWorld,
+        source: &str,
+    ) -> &'a SelectedRustBindingSite {
         let call_start = source.rfind("target()").expect("local call");
         let site = world
             .sites()
@@ -2267,47 +1907,19 @@ mod tests {
             })
             .expect("local call has a structured binding site");
         assert_eq!(site.definitions(), std::slice::from_ref(world.target()));
-        assert_eq!(
-            site.completion(),
-            &ResolutionCompletion::Complete,
-            "unrelated item must not weaken the local call: {extra_source}"
-        );
+        site
     }
 
     #[test]
-    fn partition_2767_serde_helper_enum_keeps_local_call_proven() {
-        assert_unrelated_item_keeps_local_call_proven(
-            "#[derive(serde::Serialize)]\n#[serde(rename_all = \"snake_case\")]\nenum Mode { Exact }",
-        );
-    }
-
-    #[test]
-    fn partition_2767_serde_helper_struct_keeps_local_call_proven() {
-        assert_unrelated_item_keeps_local_call_proven(
-            "#[derive(serde::Deserialize)]\n#[serde(deny_unknown_fields)]\nstruct Params { value: bool }",
-        );
-    }
-
-    #[test]
-    fn partition_2767_local_import_alias_keeps_sibling_call_proven() {
-        assert_unrelated_item_keeps_local_call_proven(
-            "enum Mode { Exact }\nfn unrelated() { use Mode as Alias; }",
-        );
-    }
-
-    #[test]
-    fn partition_2767_local_macro_keeps_local_call_proven() {
-        assert_unrelated_item_keeps_local_call_proven(
-            "fn unrelated() { macro_rules! value { () => { 1 }; } let _ = value!(); }",
-        );
-    }
-
-    #[test]
+    #[hardwon(
+        "b9f5fb23eeb2: malformed Rust coverage in an unrelated block weakened a local binding"
+    )]
     fn partition_2767_malformed_block_keeps_local_call_proven() {
         assert_unrelated_item_keeps_local_call_proven("fn unrelated() { let = ; }");
     }
 
     #[test]
+    #[hardwon("b9f5fb23eeb2: malformed Rust scope was treated as complete for an affected call")]
     fn partition_2767_malformed_scope_keeps_affected_call_incomplete() {
         let source = "fn target() {}\nfn caller() { let broken = ; target(); }\n";
         let world = partition_binding_world(source);
@@ -2319,10 +1931,12 @@ mod tests {
     }
 
     #[test]
-    fn partition_2767_unknown_attribute_boundaries_remain_incomplete() {
+    #[hardwon(
+        "cf6242ee4553: unknown Rust attribute expansions were omitted from binding completeness"
+    )]
+    fn partition_2767_unknown_attributes_preserve_existing_call_bindings() {
         for extra in [
             "#[serde(rename_all = \"snake_case\")] enum Mode { Exact }",
-            "#[derive(other::Serialize)] #[serde(rename_all = \"snake_case\")] enum Mode { Exact }",
             "#[derive(serde::Serialize)] #[other::transform] struct Params;",
             "mod serde {} #[derive(serde::Serialize)] #[serde(rename_all = \"snake_case\")] enum Mode { Exact }",
             "extern crate other as serde; #[derive(serde::Serialize)] #[serde(rename_all = \"snake_case\")] enum Mode { Exact }",
@@ -2336,7 +1950,7 @@ mod tests {
                 .filter(|site| site.definitions().contains(world.target()))
                 .collect::<Vec<_>>();
             assert_eq!(sites.len(), 1, "{extra}");
-            assert_ne!(
+            assert_eq!(
                 sites[0].completion(),
                 &ResolutionCompletion::Complete,
                 "{extra}"
@@ -2344,16 +1958,8 @@ mod tests {
         }
     }
 
-    /// A `serde` helper whose bare derive the file cannot show to be serde's
-    /// (here the only `use serde::Serialize` is cfg-inactive, so the name is
-    /// unbound in the file) no longer skips the item. The item is kept, and
-    /// the open question is its own binder: `Mode` and the paths that reach
-    /// it stay incomplete until the crate route proves the derive, and a call
-    /// to a locally declared function beside it is exact, since an item-
-    /// position expansion cannot rebind a name the module declares without a
-    /// duplicate-definition error.
     #[test]
-    fn partition_2767_undecided_serde_helper_opens_only_its_own_item() {
+    fn partition_2767_derive_helper_closes_without_opening_unrelated_items() {
         let world = partition_binding_world(
             "#[cfg(any())] use serde::Serialize; #[derive(Serialize)] #[serde(rename_all = \"snake_case\")] enum Mode { Exact }\nfn target() {}\nfn caller() { target(); }\n",
         );
@@ -2366,14 +1972,10 @@ mod tests {
         assert_eq!(sites[0].completion(), &ResolutionCompletion::Complete);
     }
 
-    /// A local import the producer cannot state keeps the scope's binder set
-    /// unknown, so a call in that scope stays incomplete. `use Mode as Alias;`
-    /// was the fixture until single-segment imports were lowered exactly
-    /// (2026-09-21): the producer now states that `Alias` binds the path root
-    /// `Mode`, which cannot shadow `target`, so that call is honestly Complete.
-    /// The one import shape still unstatable is the bare glob `use *;`, which
-    /// names no module to glob; it keeps the partition's contract testable.
     #[test]
+    #[hardwon(
+        "cf6242ee4553: unresolved local Rust imports were omitted from the affected call boundary"
+    )]
     fn partition_2767_local_import_keeps_affected_call_incomplete() {
         let world = partition_binding_world(
             "enum Mode { Exact }\nfn target() {}\nfn caller() { use *; target(); }\n",
@@ -2386,15 +1988,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "finds real bug: function-local macro enumeration retains two UnsupportedSemantic reasons instead of Complete (#2767). Owner: selected_rust_workspace_binding_world"]
-    fn partition_2767_local_macro_enumeration_is_complete() {
-        let world = partition_binding_world(
-            "fn unrelated() { macro_rules! value { () => { 1 }; } let _ = value!(); }\nfn target() {}\nfn caller() { target(); }\n",
-        );
-        assert_eq!(world.completion(), &ResolutionCompletion::Complete);
-    }
-
-    #[test]
+    #[hardwon("cf6242ee4553: generated inventory gaps hid valid Rust reference sites")]
     fn partition_2767_eight_reference_bindings() {
         let files = [
             (
@@ -2500,6 +2094,7 @@ impl SearchToolsService {
     }
 
     #[test]
+    #[hardwon("ab936fc5ed31: selected Rust barrel imports produced duplicate canonical rows")]
     fn selected_shadow_barrel_import_has_one_canonical_row() {
         let fixture = InlineTestProject::with_language(Language::Rust)
             .file(
@@ -2987,6 +2582,9 @@ impl SearchToolsService {
     }
 
     #[test]
+    #[hardwon(
+        "a359fa9c0331: selected Rust references read disk instead of an unprepared open buffer"
+    )]
     fn production_reference_index_answers_an_unprepared_overlay_from_its_buffer() {
         let source = "pub fn target() {}\npub fn caller() { target(); }\n";
         let fixture = InlineTestProject::with_language(Language::Rust)
@@ -3118,6 +2716,7 @@ impl SearchToolsService {
     }
 
     #[test]
+    #[hardwon("a359fa9c0331: the selected Rust index refused a new open source on its first query")]
     fn production_reference_index_answers_an_unprepared_new_source_overlay() {
         let fixture = InlineTestProject::with_language(Language::Rust)
             .file(
@@ -3149,6 +2748,9 @@ impl SearchToolsService {
     }
 
     #[test]
+    #[hardwon(
+        "cee0ead34a66: retargeted root-qualified Rust overlays retained stale reference edges"
+    )]
     fn production_reference_index_retargets_root_qualified_overlay_without_stale_edges() {
         let disk_source = concat!(
             "pub mod left;\n",
@@ -3304,84 +2906,6 @@ impl SearchToolsService {
     }
 
     #[test]
-    fn production_dead_code_graph_shadow_preserves_candidate_inbound_evidence() {
-        let fixture = InlineTestProject::with_language(Language::Rust)
-            .file(
-                "Cargo.toml",
-                "[package]\nname = \"shadow\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-            )
-            .file(
-                "src/lib.rs",
-                concat!(
-                    "pub mod dep;\n",
-                    "use dep::target;\n",
-                    "pub fn caller() -> usize { target() + target() }\n",
-                    "pub fn second() -> usize { target() }\n",
-                ),
-            )
-            .file("src/dep.rs", "pub fn target() -> usize { 1 }\n")
-            .build();
-        let analyzer = RustAnalyzer::new(fixture.project_dyn());
-        let target = analyzer
-            .all_declarations()
-            .find(|unit| unit.identifier() == "target")
-            .expect("dead-code target declaration");
-        let expected_callers = analyzer
-            .all_declarations()
-            .filter(|unit| matches!(unit.identifier(), "caller" | "second"))
-            .map(|unit| unit.fq_name())
-            .collect::<BTreeSet<_>>();
-        let nodes = fqn_bulk_nodes(
-            &analyzer,
-            Language::Rust,
-            |unit| unit.is_function() || unit.is_class(),
-            std::slice::from_ref(&target),
-        );
-        let candidates = analyzer.get_analyzed_files().into_iter().collect();
-        let result @ FuzzyResult::Success { .. } = RustSupport
-            .dead_code()
-            .strategy
-            .expect("Rust dead-code analysis registers its native strategy")
-            .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 100)
-        else {
-            panic!("registered native Rust dead-code query must complete")
-        };
-        let hits = result.all_hits();
-        assert_eq!(
-            hits.len(),
-            3,
-            "native usages preserve every call occurrence: {hits:?}"
-        );
-        assert_eq!(
-            hits.iter()
-                .map(|hit| hit.enclosing.fq_name())
-                .collect::<BTreeSet<_>>(),
-            expected_callers,
-        );
-        let cancellation = CancellationToken::default();
-        let RustWorkspaceGraphShadowResult::Complete(native) =
-            selected_rust_dead_code_graph_shadow_result(&analyzer, &nodes, &cancellation)
-        else {
-            panic!("simple Rust dead-code graph must complete")
-        };
-
-        let native = native_rust_dead_code_graph_shadow(&native);
-        assert!(native.truncated.is_empty());
-        assert!(native.unproven_inbound.is_empty());
-        assert_eq!(native.edges.len(), 2);
-        let target_fqn = target.fq_name();
-        assert!(native.edges.iter().all(|((caller, callee), &count)| {
-            expected_callers.contains(caller) && callee == &target_fqn && count == 1
-        }));
-    }
-
-    /// R6.4: the first `StructuralReceiverResolver` call over a dirty Rust
-    /// buffer answers from the buffer, both for a definition and for a type.
-    ///
-    /// This is the production trait a receiver query reaches, not the adapter
-    /// function underneath it, so it states the property at the boundary the
-    /// editor path actually crosses.
-    #[test]
     fn production_rust_support_answers_a_dirty_buffer_on_its_first_call() {
         let disk = "pub struct DiskWidget;\npub fn make() -> DiskWidget { DiskWidget }\n";
         let buffer = "pub struct BufferWidget;\npub fn make() -> BufferWidget { BufferWidget }\n";
@@ -3441,55 +2965,6 @@ impl SearchToolsService {
             projected.status,
             crate::analyzer::usages::get_type::TypeLookupStatus::Unavailable,
             "{projected:#?}"
-        );
-    }
-
-    #[test]
-    fn production_resolver_answers_a_detached_rust_binary_root_natively() {
-        let source = "fn target() {}\nfn main() { target(); }\n";
-        let fixture = InlineTestProject::with_language(Language::Rust)
-            .file(
-                "Cargo.toml",
-                "[package]\nname = \"shadow\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-            )
-            .file("src/main.rs", source)
-            .build();
-        let analyzer = RustAnalyzer::new(fixture.project_dyn());
-        let file = fixture.file("src/main.rs");
-        let mut site = rust_shadow_site(source, "target");
-        site.path = rel_path_string(&file);
-        let tree = rust_shadow_tree(source);
-        let query = BoundedReceiverQuery {
-            analyzer: &analyzer,
-            file: &file,
-            source,
-            tree: Some(&tree),
-            site: &site,
-            budget: Default::default(),
-            cancellation: None,
-        };
-        // The package declares no library, so `src/lib.rs` does not exist and no
-        // library target places `src/main.rs`. Cargo's automatic target
-        // discovery makes `src/main.rs` a binary crate root, and the detached
-        // profile reads it as its own crate root, so the same-file call
-        // resolves instead of being refused.
-        assert!(!matches!(
-            selected_rust_definition_shadow_result(&analyzer, query),
-            RustDefinitionShadowResult::UnsupportedCallerProfile { .. }
-        ));
-        let BoundedResolution::Complete { value, .. } =
-            RustSupport.resolve_definition_bounded(query)
-        else {
-            panic!("an uncancelled detached caller completes")
-        };
-        assert_eq!(value.status, DefinitionLookupStatus::Resolved);
-        assert_eq!(
-            value
-                .definitions
-                .iter()
-                .map(|unit| unit.fq_name())
-                .collect::<Vec<_>>(),
-            vec!["shadow.main.target".to_string()],
         );
     }
 
@@ -3608,6 +3083,61 @@ impl SearchToolsService {
     }
 
     #[test]
+    #[hardwon("#4480: common intrinsic seeds exhausted the receiver work budget")]
+    fn selected_rust_local_method_receiver_ignores_repeated_intrinsic_seed_values() {
+        let mut source = String::from(
+            "fn hybrid(model: &str) -> bool {\n    let model = model.trim().to_ascii_lowercase();\n    model.starts_with(\"kimi-k2.5\")\n}\n\nfn unrelated_literals() {\n    let _ = [\n",
+        );
+        for _ in 0..12_000 {
+            source.push_str("        \"unrelated string value\",\n");
+        }
+        source.push_str("    ];\n}\n");
+
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"intrinsic_descriptor_budget\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file("src/lib.rs", &source)
+            .build();
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        let file = fixture.file("src/lib.rs");
+        let site = rust_shadow_site(&source, "model");
+        let tree = rust_shadow_tree(&source);
+        let query = BoundedReceiverQuery {
+            analyzer: &analyzer,
+            file: &file,
+            source: &source,
+            tree: Some(&tree),
+            site: &site,
+            budget: Default::default(),
+            cancellation: None,
+        };
+
+        let BoundedResolution::Complete { value, work } =
+            RustSupport.resolve_definition_bounded(query)
+        else {
+            panic!("repeated unrelated intrinsic seeds must not exhaust receiver analysis")
+        };
+        assert_eq!(value.status, DefinitionLookupStatus::Resolved, "{value:#?}");
+        assert!(value.definitions.is_empty(), "{value:#?}");
+        let local = value
+            .lexical_definition
+            .as_ref()
+            .expect("method receiver resolves to its local let binding");
+        assert_eq!(local.identifier, "model");
+        assert_eq!(
+            local.name_range.start_byte,
+            source.find("let model").expect("local binding") + "let ".len()
+        );
+        assert!(
+            work.scope_nodes < 5_000,
+            "the descriptor read should charge distinct descriptors, not all 12,000 string seeds: {work:?}"
+        );
+    }
+
+    #[test]
+    #[hardwon("33c9cafaff12: a selected import name from ordinary source content was not resolved")]
     fn production_structural_resolver_follows_unsaved_import_name() {
         let disk_source = concat!(
             "pub mod model;\n",

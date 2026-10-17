@@ -264,11 +264,14 @@ fn typed_descriptor_digest_tracks_nested_identity_and_cancelled_work() {
     let second = seed_fragment(SemanticId::operation_local(1), SemanticId::context_local(3));
     let cancellation = CancellationToken::new();
     assert_ne!(
-        typed_fragment_digest(&first, &cancellation).unwrap(),
-        typed_fragment_digest(&second, &cancellation).unwrap()
+        typed_fragment_digest(&first, [7; 32], &cancellation).unwrap(),
+        typed_fragment_digest(&second, [7; 32], &cancellation).unwrap()
     );
     cancellation.cancel();
-    assert_eq!(typed_fragment_digest(&first, &cancellation).unwrap(), None);
+    assert_eq!(
+        typed_fragment_digest(&first, [7; 32], &cancellation).unwrap(),
+        None
+    );
 }
 
 #[test]
@@ -674,12 +677,22 @@ fn nonempty_stage_body_families_round_trip_through_indexed_rows() {
     let owner_type_argument = SemanticId::context_local(111);
     let expected = SemanticId::context_local(112);
     let owner_segment = SemanticId::context_local(113);
+    let member_reference = SemanticId::context_local(114);
+    let member_binding = SemanticId::context_local(115);
+    let non_invoking = LoweredBindingProjection::new(
+        member_reference,
+        member_binding,
+        BindingProjectionKind::NonInvokingMemberReference,
+    );
+    // Appended codec value: existing persisted projection codes stay unchanged.
+    assert_eq!(code(ALL_BINDING_PROJECTION_KINDS, non_invoking.kind()), 8);
     let frontiers = [
         (parameter_slot, ResolutionTypeSlotRole::DeclaredValue),
         (type_argument, ResolutionTypeSlotRole::DeclaredValue),
         (owner_type_argument, ResolutionTypeSlotRole::DeclaredValue),
         (expected, ResolutionTypeSlotRole::DeclaredValue),
         (owner_segment, ResolutionTypeSlotRole::TargetTypeIdentity),
+        (member_binding, ResolutionTypeSlotRole::ExpressionValue),
         (receiver, ResolutionTypeSlotRole::Receiver),
         (argument, ResolutionTypeSlotRole::Argument),
         (result, ResolutionTypeSlotRole::CallResult),
@@ -717,7 +730,8 @@ fn nonempty_stage_body_families_round_trip_through_indexed_rows() {
     )
     .with_type_argument_slots(vec![type_argument])
     .with_owner_type_arguments(Some(owner_segment), vec![owner_type_argument])
-    .with_expected_result_slot(Some(expected));
+    .with_expected_result_slot(Some(expected))
+    .with_language(Language::Java);
     let deferred = LoweredDeferredMemberOwner::new(
         definition,
         parameter_slot,
@@ -733,11 +747,14 @@ fn nonempty_stage_body_families_round_trip_through_indexed_rows() {
         frontiers,
         vec![],
         vec![],
-        vec![LoweredBindingProjection::new(
-            callee,
-            result,
-            BindingProjectionKind::TargetCallableResultType,
-        )],
+        vec![
+            LoweredBindingProjection::new(
+                callee,
+                result,
+                BindingProjectionKind::TargetCallableResultType,
+            ),
+            non_invoking,
+        ],
         vec![],
         vec![LoweredDeclarationTypeProperty::new(
             parameter_definition,
@@ -768,8 +785,16 @@ fn nonempty_stage_body_families_round_trip_through_indexed_rows() {
     assert_eq!(actual, signature);
     let actual=connection.query_row("SELECT *,json(body) AS body_json FROM temp.selected_resolution_stage_deferred_member_owners WHERE producer_id=1",[],|row|Ok(decode_deferred_owner(row).unwrap())).unwrap();
     assert_eq!(actual, deferred);
-    let actual=connection.query_row("SELECT *,json(argument_slots) AS argument_slots_json,json(type_argument_slots) AS type_argument_slots_json,json(eligible_rules) AS eligible_rules_json,json(completion) AS completion_json FROM temp.selected_resolution_stage_call_obligations WHERE producer_id=1",[],|row|Ok(decode_call_obligation(row).unwrap())).unwrap();
+    let actual=connection.query_row("SELECT call.*,mount.semantic_language,json(call.argument_slots) AS argument_slots_json,json(call.type_argument_slots) AS type_argument_slots_json,json(call.eligible_rules) AS eligible_rules_json,json(call.completion) AS completion_json FROM temp.selected_resolution_stage_call_obligations call JOIN temp.selected_resolution_mounts mount ON mount.mount_ordinal=call.host_ordinal WHERE call.producer_id=1",[],|row|Ok(decode_call_obligation(row).unwrap())).unwrap();
     assert_eq!(actual, call);
+    let decoded = connection
+        .query_row(
+            "SELECT * FROM temp.selected_resolution_stage_binding_projections WHERE kind=?1",
+            [code(ALL_BINDING_PROJECTION_KINDS, non_invoking.kind())],
+            |row| Ok(decode_projection(row).unwrap()),
+        )
+        .unwrap();
+    assert_eq!(decoded, non_invoking);
     connection.execute_batch("ROLLBACK").unwrap();
 }
 
@@ -1292,15 +1317,14 @@ fn ordinary_call_identity_conflicts_even_with_new_callee_reference() {
 #[test]
 fn ordinary_property_provenance_requires_same_owner_without_rejecting_new_frontier() {
     use crate::analyzer::store::resolution_selection::SelectedResolutionTempTransaction;
-    // Java's direct default-construction proof emits an implicit-constructor
-    // property gap for this class through the actual producer.
-    let fixture = SelectionFixture::custom_source(1, "package demo; public class Model {}\n");
+    // The actual Java producer emits a hierarchy property gap for an interface.
+    let fixture = SelectionFixture::custom_source(1, "package demo; public interface Model {}\n");
     let selection = fixture.open_ready(&[]);
     let (definition,reason,site):(u32,u32,u32)=selection.connection().query_row(
         "SELECT old.definition,old.reason,old.site FROM temp.selected_resolution_mounts mount JOIN main.resolution_definition_property_gaps old ON old.blob_id=mount.blob_id WHERE mount.mount_ordinal=0 AND old.kind=?1 LIMIT 1",
-        [code(ALL_RESOLUTION_GAP_KINDS,ResolutionGapKind::ImplicitConstructor)],
+        [code(ALL_RESOLUTION_GAP_KINDS,ResolutionGapKind::UnsupportedHierarchyTraversal)],
         |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
-    ).expect("parsed default-constructible class publishes property provenance");
+    ).expect("parsed interface publishes property provenance");
     for owner in [
         SemanticId::local(0, definition),
         SemanticId::context_local(990),
@@ -1327,7 +1351,7 @@ fn ordinary_property_provenance_requires_same_owner_without_rejecting_new_fronti
             vec![LoweredDefinitionPropertyGap::new(
                 owner,
                 ResolutionSiteId::new(site),
-                ResolutionGapKind::ImplicitConstructor,
+                ResolutionGapKind::UnsupportedHierarchyTraversal,
                 frontier,
                 SemanticId::local(0, reason),
             )],
@@ -1559,4 +1583,71 @@ fn staged_property_gap_reason_seek_preserves_frontiers_and_host_scope() {
             }
         }
     }
+}
+
+#[test]
+fn constructor_production_stage_rows_round_trip_without_components() {
+    let output = SemanticId::local(9, 21);
+    let element = SemanticId::context_local(27);
+    let expected = LoweredTypeProduction {
+        output,
+        element,
+        constructor: ResolutionTypeConstructorKind::Array,
+        length: Some("0x04".to_owned()),
+    };
+    let fragment = LoweredTypedFragment::new(
+        BindingFragmentId::at_ordinal(7),
+        Language::Rust,
+        vec![
+            LoweredTypedFrontier::new(output, ResolutionTypeSlotRole::TargetTypeIdentity),
+            LoweredTypedFrontier::new(element, ResolutionTypeSlotRole::TargetTypeIdentity),
+        ],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+    )
+    .with_type_productions(vec![expected.clone()]);
+    let fixture = SelectionFixture::shared_blob(16);
+    let selection = fixture.open_ready(&[]);
+    let connection = begin_projection(&selection);
+    assert!(
+        insert_typed_fragment(
+            connection,
+            1,
+            SelectedResolutionMountOrdinal::new(7),
+            &fragment,
+            &CancellationToken::new()
+        )
+        .unwrap()
+    );
+    let actual = connection
+        .query_row(
+            "SELECT * FROM temp.selected_resolution_stage_type_productions",
+            [],
+            |row| Ok(decode_type_production(row).unwrap()),
+        )
+        .unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM temp.selected_resolution_stage_type_components",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    connection.execute_batch("ROLLBACK").unwrap();
 }

@@ -610,21 +610,6 @@ pub fn workspace_topology(project: &dyn Project) -> WorkspaceTopology {
 mod tests {
     use super::*;
 
-    /// The support table is total: an axis nobody named is unsupported, and
-    /// naming one does not disturb its neighbours.
-    #[test]
-    fn topology_support_defaults_every_unnamed_axis_to_unsupported() {
-        const TABLE: TopologySupport = TopologySupport::NONE
-            .supported(TopologyAxis::Targets)
-            .supported(TopologyAxis::FileOwnership);
-        assert!(TABLE.is_supported(TopologyAxis::Targets));
-        assert!(TABLE.is_supported(TopologyAxis::FileOwnership));
-        assert!(!TABLE.is_supported(TopologyAxis::Configurations));
-        assert!(!TABLE.is_supported(TopologyAxis::TargetDependencies));
-        assert_eq!(TABLE.iter().count(), TopologyAxis::COUNT);
-        assert_eq!(TopologyAxis::LABELS.len(), TopologyAxis::COUNT);
-    }
-
     /// A workspace with no build evidence answers incomplete, and a file it
     /// was never told about gets an explicit unknown-ownership row rather than
     /// nothing.

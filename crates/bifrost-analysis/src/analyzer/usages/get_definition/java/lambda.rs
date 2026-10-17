@@ -173,6 +173,9 @@ pub fn java_expression_lambda_result_use(
                 if formal.variadic {
                     return None;
                 }
+                if formal.r#type.contains_unknown() {
+                    return None;
+                }
                 let candidates = match &formal.r#type {
                     TypeRef::Named { name, .. } => models.symbols_named(name),
                     TypeRef::Declared { id, .. } => models.symbols_with_id(id),

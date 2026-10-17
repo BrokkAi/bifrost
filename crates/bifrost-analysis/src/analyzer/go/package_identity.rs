@@ -13,11 +13,14 @@
 //! discovery, runs the Go toolchain, or touches a module cache.
 
 use crate::analyzer::GO_MODULE_SCOPE_SEGMENT;
+use crate::analyzer::semantic::{IndexedLocationIdentity, MemoryValueCopy};
 use crate::analyzer::semantic_model::{
     SemanticModelCompleteness, SemanticModelOverlay, SemanticModelOverlayDisposition,
     SemanticModelSymbol, SemanticModelSymbolKind, Signature, TypeRef, Visibility,
 };
 use brokk_bifrost_go::diagnostics::GoPackageSurface;
+
+use super::{GoOuterTypeShape, GoStructFieldIdentity};
 
 /// One exact nominal Go result type published by declaration facts.
 ///
@@ -30,6 +33,28 @@ pub(crate) struct GoModeledNominalType {
     pub(crate) declaration_id: String,
     pub(crate) qualified_name: String,
     pub(crate) pointer: bool,
+}
+
+/// Resolve the one exact nominal return type of an authored Go declaration.
+/// This is shared with semantic consumers that follow a modeled result across
+/// an open interface call; it never infers a type from source spelling.
+pub fn modeled_go_callable_result_nominal_type(
+    overlay: &SemanticModelOverlay,
+    owner_fqn: &str,
+    member: &str,
+    has_receiver: bool,
+    parameter_count: usize,
+    result_ordinal: usize,
+) -> Option<String> {
+    GoOverlayPackages::new(Some(overlay))
+        .callable_result_nominal_type(
+            owner_fqn,
+            member,
+            has_receiver,
+            parameter_count,
+            result_ordinal,
+        )
+        .map(|nominal| nominal.qualified_name)
 }
 
 /// What one activated declaration fact proves about a package-qualified Go
@@ -98,6 +123,41 @@ fn go_signature_applicability(
     }
 }
 
+/// Resolve one structurally selected member path with provider-supplied
+/// postings. Native and incumbent navigation share the walk, including the
+/// rule that an absent segment cannot be bypassed by a later matching name.
+pub(crate) struct GoVisibleMemberPath {
+    pub(crate) symbol_name: String,
+    pub(crate) reference_name: String,
+}
+
+pub(crate) fn go_visible_member_path<'a>(
+    package: &str,
+    mut members: impl Iterator<Item = &'a str>,
+    package_member: impl Fn(&str, &str) -> Option<String>,
+    symbol: impl Fn(&str) -> Option<String>,
+    mut step: impl FnMut() -> bool,
+) -> Option<GoVisibleMemberPath> {
+    if !step() {
+        return None;
+    }
+    let first = members.next()?;
+    let mut target = package_member(package, first)?;
+    let mut reference = format!("{package}.{first}");
+    for member in members {
+        if !step() {
+            return None;
+        }
+        target = symbol(&format!("{target}.{member}"))?;
+        reference.push('.');
+        reference.push_str(member);
+    }
+    Some(GoVisibleMemberPath {
+        symbol_name: target,
+        reference_name: reference,
+    })
+}
+
 /// The activated overlay, read as a Go package index.
 #[derive(Clone, Copy)]
 pub(crate) struct GoOverlayPackages<'a> {
@@ -145,9 +205,7 @@ impl<'a> GoOverlayPackages<'a> {
                 SemanticModelOverlayDisposition::Conflict => return None,
                 SemanticModelOverlayDisposition::Unique => {
                     let candidate = matched
-                        .records
-                        .first()
-                        .copied()
+                        .unique()
                         .expect("a unique overlay match contains one record");
                     match selected {
                         None => selected = Some(candidate),
@@ -166,7 +224,33 @@ impl<'a> GoOverlayPackages<'a> {
     /// unique: the overlay marks it `Conflict` and this returns `None`, so
     /// neither navigation nor a diagnostic picks an arbitrary winner.
     pub(crate) fn unique_symbol(&self, qualified_name: &str) -> Option<&'a SemanticModelSymbol> {
-        self.unique_symbol_across_names(std::iter::once(qualified_name))
+        self.overlay?.symbols_named(qualified_name).unique()
+    }
+
+    /// The declaration-fact kind of one public, top-level Go receiver type.
+    /// Unknown or ambiguous symbols do not become either concrete or
+    /// interface evidence.
+    pub(crate) fn receiver_type_kind(&self, owner_fqn: &str) -> Option<SemanticModelSymbolKind> {
+        let owner = self.unique_symbol(owner_fqn)?;
+        (owner.language == "go"
+            && owner.owner_id.is_none()
+            && owner.visibility == Visibility::Public
+            && !owner.provenance.ambiguous
+            && matches!(
+                owner.kind,
+                SemanticModelSymbolKind::Struct | SemanticModelSymbolKind::Interface
+            ))
+        .then_some(owner.kind)
+    }
+
+    pub(crate) fn receiver_is_interface(&self, owner_fqn: &str) -> Option<bool> {
+        self.receiver_type_kind(owner_fqn)
+            .map(|kind| kind == SemanticModelSymbolKind::Interface)
+    }
+
+    pub(crate) fn receiver_is_struct(&self, owner_fqn: &str) -> Option<bool> {
+        self.receiver_type_kind(owner_fqn)
+            .map(|kind| kind == SemanticModelSymbolKind::Struct)
     }
 
     /// The sole active Go member with this exact direct owner and name.
@@ -197,8 +281,7 @@ impl<'a> GoOverlayPackages<'a> {
     /// declaration. A name several packs publish, or one whose only records
     /// are unexported, resolves to nothing.
     pub(crate) fn visible_symbol(&self, qualified_name: &str) -> Option<&'a SemanticModelSymbol> {
-        let symbol = self.unique_symbol(qualified_name)?;
-        (symbol.language == "go" && symbol.visibility == Visibility::Public).then_some(symbol)
+        self.overlay?.visible_public_symbol(qualified_name, "go")
     }
 
     /// The exact public Go type published under one declaration id.
@@ -453,6 +536,35 @@ impl<'a> GoOverlayPackages<'a> {
             .then_some(method)
     }
 
+    /// The unique public method contract on one modeled external Go
+    /// interface. The selected declaration names the interface member only;
+    /// callers still need receiver provenance before applying its effects.
+    pub(crate) fn interface_receiver_method(
+        &self,
+        owner_fqn: &str,
+        member: &str,
+        parameter_count: usize,
+    ) -> Option<&'a SemanticModelSymbol> {
+        let owner = self.unique_symbol(owner_fqn)?;
+        if owner.language != "go"
+            || owner.owner_id.is_some()
+            || owner.kind != SemanticModelSymbolKind::Interface
+            || owner.visibility != Visibility::Public
+        {
+            return None;
+        }
+        let method = self.unique_go_owner_member(owner, member)?;
+        (method.kind == SemanticModelSymbolKind::Method
+            && method.visibility == Visibility::Public
+            && method.owner_id.as_deref() == Some(owner.id.as_str())
+            && !method.is_static()
+            && method.structured_signature().is_some_and(|signature| {
+                go_signature_applicability(signature, parameter_count)
+                    == GoSignatureApplicability::Applicable
+            }))
+        .then_some(method)
+    }
+
     /// The unique public field published directly on one concrete Go struct.
     ///
     /// This is a positive-only lookup. A partial pack may prove a field it
@@ -480,6 +592,33 @@ impl<'a> GoOverlayPackages<'a> {
             && !field.is_static()
             && !field.has_receiver())
         .then_some(field)
+    }
+
+    /// The value-copy behavior represented by one exact public field's
+    /// structured Go type, or `Unknown` when the declaration does not carry a
+    /// supported type shape. The field symbol itself remains the identity
+    /// carrier for its model location and activation provenance.
+    pub(crate) fn concrete_receiver_field_value_copy(
+        &self,
+        owner_fqn: &str,
+        member: &str,
+    ) -> MemoryValueCopy {
+        let Some(field) = self.concrete_receiver_field(owner_fqn, member) else {
+            return MemoryValueCopy::Unknown;
+        };
+        let Some(signature) = field.structured_signature() else {
+            return MemoryValueCopy::Unknown;
+        };
+        if !signature.parameters.is_empty() {
+            return MemoryValueCopy::Unknown;
+        }
+        let Some(field_type) = signature.returns.as_ref() else {
+            return MemoryValueCopy::Unknown;
+        };
+        go_field_value_copy(
+            field_type,
+            self.overlay.expect("resolved field has an overlay"),
+        )
     }
 
     /// The exact nominal result selected from one exact modeled Go callable.
@@ -590,6 +729,56 @@ impl<'a> GoOverlayPackages<'a> {
             result if result_ordinal == 0 => result,
             _ => return None,
         })
+    }
+}
+
+fn go_field_value_copy(field_type: &TypeRef, overlay: &SemanticModelOverlay) -> MemoryValueCopy {
+    match field_type {
+        TypeRef::Function { .. } | TypeRef::Pointer { .. } | TypeRef::Channel { .. } => {
+            MemoryValueCopy::Reference
+        }
+        TypeRef::Slice { .. } => MemoryValueCopy::BackingStore {
+            identity: IndexedLocationIdentity::Element,
+        },
+        TypeRef::Map { .. } => MemoryValueCopy::BackingStore {
+            identity: IndexedLocationIdentity::Aggregate,
+        },
+        TypeRef::FixedArray { .. } => MemoryValueCopy::Value,
+        TypeRef::Declared { id, .. } => {
+            let matched = overlay.symbols_with_id(id);
+            if matched.disposition != SemanticModelOverlayDisposition::Unique {
+                return MemoryValueCopy::Unknown;
+            }
+            let Some(symbol) = matched.records.first().copied() else {
+                return MemoryValueCopy::Unknown;
+            };
+            if symbol.language == "go"
+                && symbol.owner_id.is_none()
+                && symbol.kind == SemanticModelSymbolKind::Struct
+                && !symbol.provenance.ambiguous
+            {
+                MemoryValueCopy::Value
+            } else {
+                MemoryValueCopy::Unknown
+            }
+        }
+        // A `Named` spelling can denote a package-local alias, a predeclared
+        // scalar, or an unresolved imported type. Do not infer storage from
+        // that display name; the producer must supply a structured identity.
+        _ => MemoryValueCopy::Unknown,
+    }
+}
+
+/// Classify a field after its selected source artifact has resolved the outer
+/// named type. The declaration model's `TypeRef` intentionally does not retain
+/// the alias chain's outer shape, so a declared Go function type can only be
+/// admitted from the exact AST-backed `GoOuterTypeShape`.
+pub(crate) fn go_field_value_copy_from_source(field: &GoStructFieldIdentity) -> MemoryValueCopy {
+    match &field.outer_type_shape {
+        GoOuterTypeShape::Function(_) => MemoryValueCopy::Reference,
+        GoOuterTypeShape::Other { .. } | GoOuterTypeShape::Unknown { .. } => {
+            MemoryValueCopy::Unknown
+        }
     }
 }
 

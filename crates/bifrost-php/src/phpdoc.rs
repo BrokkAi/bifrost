@@ -10,66 +10,64 @@ use mago_phpdoc_syntax::PHPDocParser;
 use mago_phpdoc_syntax::cst::r#type::{GenericParameters, ReferenceKind, Type};
 use mago_phpdoc_syntax::cst::{Document, TagValue};
 
+fn unique_phpdoc_type(types: impl Iterator<Item = Option<String>>) -> Option<String> {
+    let mut types = types.flatten();
+    let value = types.next()?;
+    types.next().is_none().then_some(value)
+}
+
 pub fn return_nominal_type(comment: &str) -> Option<String> {
     with_document(comment, |document| {
-        let mut types = document.tags().filter_map(|tag| match &tag.value {
-            TagValue::Return(value) | TagValue::RealReturn(value) => nominal_type(value.r#type),
+        unique_phpdoc_type(document.tags().filter_map(|tag| match &tag.value {
+            TagValue::Return(value) | TagValue::RealReturn(value) => {
+                Some(nominal_type(value.r#type))
+            }
             _ => None,
-        });
-        let nominal = types.next()?;
-        types.next().is_none().then_some(nominal)
+        }))
     })
 }
 
 pub fn return_element_type(comment: &str) -> Option<String> {
     with_document(comment, |document| {
-        let mut types = document.tags().filter_map(|tag| match &tag.value {
+        unique_phpdoc_type(document.tags().filter_map(|tag| match &tag.value {
             TagValue::Return(value) | TagValue::RealReturn(value) => {
-                collection_element_type(value.r#type)
+                Some(collection_element_type(value.r#type))
             }
             _ => None,
-        });
-        let nominal = types.next()?;
-        types.next().is_none().then_some(nominal)
+        }))
     })
 }
 
 pub fn parameter_element_type(comment: &str, parameter: &str) -> Option<String> {
     with_document(comment, |document| {
-        let mut types = document.tags().filter_map(|tag| match &tag.value {
+        unique_phpdoc_type(document.tags().filter_map(|tag| match &tag.value {
             TagValue::Param(value)
                 if value.parameter.as_ref().is_some_and(|variable| {
                     variable.value.strip_prefix(b"$") == Some(parameter.as_bytes())
                 }) =>
             {
-                collection_element_type(value.r#type)
+                Some(collection_element_type(value.r#type))
             }
             _ => None,
-        });
-        let nominal = types.next()?;
-        types.next().is_none().then_some(nominal)
+        }))
     })
 }
 
 pub fn var_element_type(comment: &str) -> Option<String> {
     with_document(comment, |document| {
-        let mut types = document.tags().filter_map(|tag| match &tag.value {
-            TagValue::Var(value) => collection_element_type(value.r#type),
+        unique_phpdoc_type(document.tags().filter_map(|tag| match &tag.value {
+            TagValue::Var(value) => Some(collection_element_type(value.r#type)),
             _ => None,
-        });
-        let nominal = types.next()?;
-        types.next().is_none().then_some(nominal)
+        }))
     })
 }
 
 pub fn var_nominal_type(comment: &str) -> Option<String> {
     with_document(comment, |document| {
-        let mut types = document.tags().filter_map(|tag| match &tag.value {
-            TagValue::Var(value) => nominal_type(value.r#type),
+        unique_phpdoc_type(document.tags().filter_map(|tag| match &tag.value {
+            TagValue::Var(value) => Some(nominal_type(value.r#type)),
             _ => None,
-        });
-        let nominal = types.next()?;
-        types.next().is_none().then_some(nominal)
+        }))
     })
 }
 

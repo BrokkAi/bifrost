@@ -1,8 +1,8 @@
 //! Shared identity and work-accounting mechanics for procedure inventories.
 //!
-//! Language adapters still own tree traversal and callable recognition. This
-//! module owns the syntax-free state that must remain identical across those
-//! traversals: declaration paths, sibling ordinals, dense procedure IDs,
+//! Language adapters own syntax and callable recognition. This module owns
+//! the iterative scope walk and syntax-free identity state shared by those
+//! adapters: declaration paths, sibling ordinals, dense procedure IDs,
 //! stable locators, and the distinction between observed enumeration work and
 //! the traversal-only work passed into procedure lowering.
 
@@ -12,11 +12,12 @@ use crate::analyzer::ProjectFile;
 use crate::hash::HashMap;
 
 use super::cfg::initial_procedure_cfg_work;
-use super::lowering::{source_anchor, sum_lowering_work};
+use super::lowering::source_anchor;
 use super::{
-    DeclarationLocator, DeclarationSegment, DeclarationSegmentKind, ProcedureId, SemanticBudget,
-    SemanticBudgetExceeded, SemanticLanguage, SemanticLocator, SemanticProviderError, SemanticRole,
-    SemanticWork, SourceAnchor, WorkspaceMountId, WorkspaceRelativePath,
+    DeclarationLocator, DeclarationSegment, DeclarationSegmentKind, ProcedureId,
+    ProcedureSemanticsParts, SemanticBudget, SemanticBudgetExceeded, SemanticLanguage,
+    SemanticLocator, SemanticOutcome, SemanticProviderError, SemanticRole, SemanticWork,
+    SourceAnchor, WorkspaceMountId, WorkspaceRelativePath,
 };
 
 /// Result of a language-owned procedure inventory walk.
@@ -39,6 +40,42 @@ pub(crate) enum ProcedureInventoryOutcome<T> {
     },
 }
 
+pub(crate) enum ProcedureLoweringInput<T> {
+    Complete {
+        value: T,
+        initial_work: SemanticWork,
+    },
+    Stopped(SemanticOutcome<Vec<ProcedureSemanticsParts>>),
+}
+
+impl<T> ProcedureInventoryOutcome<T> {
+    pub(crate) fn into_lowering_input(self) -> ProcedureLoweringInput<T> {
+        match self {
+            Self::Complete {
+                value,
+                initial_work,
+                ..
+            } => ProcedureLoweringInput::Complete {
+                value,
+                initial_work,
+            },
+            Self::ExceededBudget { exceeded, work } => {
+                ProcedureLoweringInput::Stopped(SemanticOutcome::ExceededBudget {
+                    partial: None,
+                    exceeded,
+                    work,
+                })
+            }
+            Self::Cancelled { work } => {
+                ProcedureLoweringInput::Stopped(SemanticOutcome::Cancelled {
+                    partial: None,
+                    work,
+                })
+            }
+        }
+    }
+}
+
 /// A successfully allocated procedure identity.
 pub(crate) struct ProcedureIdentity {
     pub(crate) id: ProcedureId,
@@ -51,6 +88,38 @@ pub(crate) struct ProcedureIdentity {
 pub(crate) struct ProcedureInventoryStop {
     pub(crate) exceeded: SemanticBudgetExceeded,
     work: Box<SemanticWork>,
+}
+
+/// A prepass stopped either because the budget ended or cancellation arrived.
+pub(crate) enum ProcedureInventoryPrepassStop {
+    Budget(ProcedureInventoryStop),
+    Cancelled,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ProcedureEnumerationFrame<'tree> {
+    pub(crate) node: Node<'tree>,
+    pub(crate) lexical_parent: Option<ProcedureId>,
+    pub(crate) declaration_path: usize,
+}
+
+pub(crate) struct ProcedureWalkScopes {
+    pub(crate) container_body: Option<(usize, usize)>,
+    pub(crate) callable_body: Option<(usize, ProcedureId, usize)>,
+}
+
+pub(crate) enum ProcedureWalkStep<T> {
+    Continue {
+        value: Option<T>,
+        scopes: ProcedureWalkScopes,
+    },
+    ExceededBudget(ProcedureInventoryStop),
+}
+
+pub(crate) enum ProcedureTreeWalkOutcome<T> {
+    Complete(Vec<T>),
+    ExceededBudget(ProcedureInventoryStop),
+    Cancelled,
 }
 
 impl ProcedureInventoryStop {
@@ -179,9 +248,10 @@ impl<'budget> ProcedureInventoryBuilder<'budget> {
             SemanticRole::Procedure,
             anchor,
         );
-        let identity_candidate =
-            sum_lowering_work(self.identity_work, procedure_identity_preflight(&locator));
-        let observed_candidate = sum_lowering_work(identity_candidate, self.traversal_work);
+        let identity_candidate = self
+            .identity_work
+            .conservative_add(procedure_identity_preflight(&locator));
+        let observed_candidate = identity_candidate.conservative_add(self.traversal_work);
         if let Err(exceeded) = self.budget.check(observed_candidate) {
             return Ok(Err(ProcedureInventoryStop {
                 exceeded,
@@ -203,8 +273,8 @@ impl<'budget> ProcedureInventoryBuilder<'budget> {
         &mut self,
         work: SemanticWork,
     ) -> Result<(), ProcedureInventoryStop> {
-        let traversal_candidate = sum_lowering_work(self.traversal_work, work);
-        let observed_candidate = sum_lowering_work(self.identity_work, traversal_candidate);
+        let traversal_candidate = self.traversal_work.conservative_add(work);
+        let observed_candidate = self.identity_work.conservative_add(traversal_candidate);
         if let Err(exceeded) = self.budget.check(observed_candidate) {
             return Err(ProcedureInventoryStop {
                 exceeded,
@@ -230,7 +300,7 @@ impl<'budget> ProcedureInventoryBuilder<'budget> {
     }
 
     pub(crate) fn observed_work(&self) -> SemanticWork {
-        sum_lowering_work(self.identity_work, self.traversal_work)
+        self.identity_work.conservative_add(self.traversal_work)
     }
 
     pub(crate) fn complete<T>(self, value: T) -> ProcedureInventoryOutcome<T> {
@@ -246,6 +316,79 @@ impl<'budget> ProcedureInventoryBuilder<'budget> {
             work: self.observed_work(),
         }
     }
+}
+
+/// Check cancellation before charging one shared inventory traversal entry.
+pub(crate) fn charge_prepass(
+    inventory: &mut ProcedureInventoryBuilder<'_>,
+    cancellation: &crate::CancellationToken,
+) -> Result<(), ProcedureInventoryPrepassStop> {
+    if cancellation.is_cancelled() {
+        return Err(ProcedureInventoryPrepassStop::Cancelled);
+    }
+    inventory
+        .charge_traversal_entry()
+        .map_err(ProcedureInventoryPrepassStop::Budget)
+}
+
+pub(crate) fn walk_procedure_tree<'tree, T>(
+    root: Node<'tree>,
+    root_path: usize,
+    inventory: &mut ProcedureInventoryBuilder<'_>,
+    cancellation: &crate::cancellation::CancellationToken,
+    mut children_of: impl FnMut(Node<'tree>) -> Vec<Node<'tree>>,
+    mut visit: impl FnMut(
+        ProcedureEnumerationFrame<'tree>,
+        &mut ProcedureInventoryBuilder<'_>,
+    ) -> Result<ProcedureWalkStep<T>, SemanticProviderError>,
+) -> Result<ProcedureTreeWalkOutcome<T>, SemanticProviderError> {
+    let mut values = Vec::new();
+    let mut stack = vec![ProcedureEnumerationFrame {
+        node: root,
+        lexical_parent: None,
+        declaration_path: root_path,
+    }];
+
+    while let Some(frame) = stack.pop() {
+        if cancellation.is_cancelled() {
+            return Ok(ProcedureTreeWalkOutcome::Cancelled);
+        }
+        if let Err(stop) = inventory.charge_traversal_entry() {
+            return Ok(ProcedureTreeWalkOutcome::ExceededBudget(stop));
+        }
+        let scopes = match visit(frame, inventory)? {
+            ProcedureWalkStep::Continue { value, scopes } => {
+                if let Some(value) = value {
+                    values.push(value);
+                }
+                scopes
+            }
+            ProcedureWalkStep::ExceededBudget(stop) => {
+                return Ok(ProcedureTreeWalkOutcome::ExceededBudget(stop));
+            }
+        };
+
+        let child_path = frame.declaration_path;
+        for child in children_of(frame.node).into_iter().rev() {
+            let child_path = scopes
+                .container_body
+                .filter(|(body_id, _)| *body_id == child.id())
+                .map(|(_, path)| path)
+                .unwrap_or(child_path);
+            let (lexical_parent, declaration_path) = scopes
+                .callable_body
+                .filter(|(body_id, _, _)| *body_id == child.id())
+                .map(|(_, procedure, path)| (Some(procedure), path))
+                .unwrap_or((frame.lexical_parent, child_path));
+            stack.push(ProcedureEnumerationFrame {
+                node: child,
+                lexical_parent,
+                declaration_path,
+            });
+        }
+    }
+
+    Ok(ProcedureTreeWalkOutcome::Complete(values))
 }
 
 /// One node in the persistent declaration path assembled while adapters walk

@@ -24,7 +24,11 @@ use crate::analyzer::{JavaAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_jvm::java::structural::JAVA_STRUCTURAL_SPEC;
 
-const ADAPTER_VERSION: &[u8] = b"java-value-semantics-v27";
+// Bumping this rotates every public wire id hashed from the adapter
+// fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
+// golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
+// change; the code-query tutorial pages elide such ids (#5016).
+const ADAPTER_VERSION: &[u8] = b"java-value-semantics-v28";
 
 impl_program_semantics_provider!(JavaAnalyzer, JavaSemanticLowerer);
 
@@ -32,16 +36,16 @@ struct JavaSemanticLowerer;
 
 impl ProgramSemanticsLowerer for JavaSemanticLowerer {
     fn identity(&self) -> SemanticAdapterIdentity {
-        let mut digest =
-            LengthDelimitedDigest::new(b"bifrost.java-semantic.structural-facts-dependency.v1");
-        digest.push(&STRUCTURAL_FACTS_VERSION.to_le_bytes());
         SemanticAdapterIdentity {
             adapter: AdapterSemanticsVersion::hash_bytes("java", ADAPTER_VERSION)
                 .expect("adapter name is non-empty"),
             configuration: ConfigurationFingerprint::hash_bytes(
                 b"java-intrafile-execution-defaults-v1",
             ),
-            dependencies: DependencyFingerprint::from_digest(digest.finish()),
+            dependencies: crate::analyzer::semantic::versioned_dependency_fingerprint(
+                b"bifrost.java-semantic.structural-facts-dependency.v1",
+                STRUCTURAL_FACTS_VERSION,
+            ),
         }
     }
 
@@ -137,17 +141,14 @@ impl ProgramSemanticsLowerer for JavaSemanticLowerer {
                     nested_entries: work_items,
                     ..SemanticWork::default()
                 };
-                initial_work = sum_lowering_work(initial_work, work);
+                initial_work = initial_work.conservative_add(work);
                 index
             }
             StructuralNodeIndexOutcome::Exceeded { minimum_work_items } => {
-                let work = sum_lowering_work(
-                    inventory_work,
-                    SemanticWork {
-                        nested_entries: minimum_work_items,
-                        ..SemanticWork::default()
-                    },
-                );
+                let work = inventory_work.conservative_add(SemanticWork {
+                    nested_entries: minimum_work_items,
+                    ..SemanticWork::default()
+                });
                 let exceeded = budget
                     .check(work)
                     .expect_err("structural minimum exceeds its remaining semantic budget");
@@ -184,50 +185,9 @@ impl ProgramSemanticsLowerer for JavaSemanticLowerer {
 }
 
 fn java_capabilities() -> SemanticCapabilities {
-    let mut builder = SemanticCapabilities::builder();
-    for capability in [
-        SemanticCapability::Procedures,
-        SemanticCapability::EntryBoundary,
-        SemanticCapability::NormalExitBoundary,
-        SemanticCapability::ExceptionalExitBoundary,
-        SemanticCapability::BasicBlocks,
-        SemanticCapability::ProgramPoints,
-        SemanticCapability::ReturnFlow,
-        SemanticCapability::NormalCallContinuation,
-        SemanticCapability::ExceptionalCallContinuation,
-    ] {
-        builder = builder.complete(capability);
-    }
-    for capability in [
-        SemanticCapability::NormalControlFlow,
-        SemanticCapability::ExceptionalControlFlow,
-        SemanticCapability::CleanupControlFlow,
-        SemanticCapability::Calls,
-        SemanticCapability::DynamicDispatch,
-        SemanticCapability::CallableReferences,
-        SemanticCapability::Values,
-        SemanticCapability::Assignments,
-        SemanticCapability::Allocations,
-        SemanticCapability::FieldMemory,
-        SemanticCapability::IndexMemory,
-        SemanticCapability::LocalFlow,
-        SemanticCapability::ParameterFlow,
-        SemanticCapability::ReceiverFlow,
-        SemanticCapability::Captures,
-        SemanticCapability::NonLocalControl,
-        SemanticCapability::ResourceManagement,
-        SemanticCapability::DeferredExecution,
-        // Java is the only adapter that publishes guard facts today (#2443).
-        // `Partial` rather than `Complete` states the exact limit: every
-        // decision the lowerer reaches gets a row, but only constant, null,
-        // constant-equality, primitive ordered-literal and primitive
-        // self-comparison conditions are normalized and everything else is
-        // recorded `Opaque`.
-        SemanticCapability::GuardFacts,
-    ] {
-        builder = builder.partial(capability);
-    }
-    builder.build()
+    crate::analyzer::semantic::capabilities::tree_sitter_adapter_capabilities()
+        .complete(SemanticCapability::SwitchFacts)
+        .build()
 }
 
 mod control;
@@ -394,9 +354,9 @@ fn java_capture_destination(
     captures_receiver: bool,
     index: usize,
 ) -> Result<MemoryLocationId, JavaLoweringError> {
-    let index = index
-        .checked_add(usize::from(captures_receiver))
-        .and_then(|index| u32::try_from(index).ok())
-        .ok_or_else(|| JavaLoweringError::Invalid("too many Java captures".into()))?;
-    Ok(MemoryLocationId::new(index))
+    crate::analyzer::semantic::lowering::lexical_capture_destination(
+        captures_receiver,
+        index,
+        "Java",
+    )
 }

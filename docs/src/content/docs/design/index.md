@@ -21,6 +21,7 @@ work. The linked product docs cover API details.
 | [System Architecture](./system-architecture/) | How do clients, runtimes, analyzers, and stores fit together? |
 | [Identity and Language Front Ends](./identity-and-language-frontends/) | How does Bifrost turn incomplete multi-language source into resolvable identities? |
 | [Storage and Cache Strategy](./storage-and-cache/) | What is persisted, reused, invalidated, and recomputed? |
+| [Name Resolution Engine](./name-resolution/) | How does a reference bind to its declaration across files, revisions, and build configurations? |
 | [Usage Analysis Engine](./usage-analysis/) | How are definitions, references, calls, and receiver-sensitive candidates connected? |
 | [Dataflow Engine](./dataflow-engine/) | How do the bounded IFDS-family and IDE-style kernels power value flow, taint, and typestate? |
 | [Semantic Models and Summaries](./semantic-models/) | How does external behavior participate while retaining its own provenance? |

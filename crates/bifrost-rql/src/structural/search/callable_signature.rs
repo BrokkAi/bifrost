@@ -1,11 +1,12 @@
 //! Pipeline execution for the `callable_signature` and `signature_parameters`
 //! steps (issue #1478, Milestone 2).
 //!
-//! Both steps project
-//! [`crate::analyzer::usages::callable_signature::callable_signature_reports`],
-//! which is a pure function of the analyzer's persisted `SignatureMetadata`.
-//! Nothing is re-parsed here and no declaration is re-read from source, so the
-//! rows a warm cache produces are the rows a cold run produces.
+//! Signature and parameter rows project
+//! [`crate::analyzer::usages::callable_signature::callable_signature_reports`]
+//! from persisted `SignatureMetadata`. For Python special methods, the
+//! signature row is enriched at query time from prepared syntax with the
+//! protocol arity verdict and placeholder status; no special-method facts are
+//! persisted.
 //!
 //! `callable_signature` is mandatory per input declaration: a declaration
 //! whose language publishes no signature metadata still emits exactly one row,
@@ -16,6 +17,9 @@
 
 use super::*;
 
+use super::python_special_method_signature::{
+    PythonSpecialMethodContract, python_special_method_context,
+};
 use crate::analyzer::usages::callable_signature::{
     CallableSignatureReport, callable_signature_reports,
 };
@@ -26,6 +30,8 @@ use crate::analyzer::usages::callable_signature::{
 pub(super) struct CallableSignatureValue {
     pub(super) declaration: DeclarationValue,
     pub(super) report: Arc<CallableSignatureReport>,
+    pub(super) python_special_method: Option<PythonSpecialMethodContract>,
+    pub(super) python_receiver: super::python_method_receiver::PythonMethodReceiverEvidence,
 }
 
 impl CallableSignatureValue {
@@ -59,20 +65,35 @@ impl SignatureParameterValue {
 /// signature metadata still gets the mandatory `unrecorded` row.
 pub(super) fn callable_signature_expansions_for_declaration(
     analyzer: &dyn IAnalyzer,
+    environment_cache: &mut EnvironmentTraversalCache,
     declaration: &DeclarationValue,
+    cancellation: Option<&CancellationToken>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> Vec<PipelineExpansion> {
     // Overloads with the same displayed name remain distinct because the
     // analyzer declaration identity includes their structured signature. The
     // source span then distinguishes multiple indexed sites of that identity.
     let declaration_site_id = declaration.site_id();
+    let special_method_context = python_special_method_context(analyzer, declaration);
+    let python_receiver = super::python_method_receiver::receiver_evidence(
+        analyzer,
+        environment_cache,
+        declaration,
+        cancellation,
+        diagnostics,
+    );
     let entries = analyzer.signature_metadata(&declaration.unit);
     callable_signature_reports(&declaration_site_id, &declaration.unit, &entries)
         .into_iter()
         .map(|report| {
+            let python_special_method =
+                special_method_context.map(|context| context.contract(report.signature.arity));
             pipeline_expansion(PipelineValue::CallableSignature(Box::new(
                 CallableSignatureValue {
                     declaration: declaration.clone(),
                     report: Arc::new(report),
+                    python_special_method,
+                    python_receiver,
                 },
             )))
         })

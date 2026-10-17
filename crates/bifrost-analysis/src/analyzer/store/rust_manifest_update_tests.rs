@@ -1,16 +1,17 @@
 //! An incremental `WorkspaceAnalyzer::update` that reports only `Cargo.toml`
-//! edits must publish what a fresh build of the edited tree publishes
-//! (#3749, plan step 1).
+//! or `.cargo/config.toml` edits must publish what a fresh build of the edited
+//! tree publishes (#3749, plan step 1; #3768).
 //!
-//! `Cargo.toml` has no language of its own, so the workspace analyzer decides
-//! per delegate whether a changed manifest reaches it. These tests compare,
+//! Neither file has a language of its own, so the workspace analyzer decides
+//! per delegate whether a changed input reaches it. These tests compare,
 //! after each edit, the incrementally updated analyzer with a fresh ephemeral
 //! build of the same tree on the observable results: the current crate rows
-//! (membership, dependencies, imports, gaps), the declaration names, and the
-//! cross-crate edges of the usage graph.
+//! (cfg set, modules, dependencies, imports, gaps), the declaration names, and
+//! the cross-crate edges of the usage graph.
 
 use std::collections::BTreeSet;
 
+use brokk_bifrost_test_macros::hardwon;
 use rusqlite::Connection;
 
 use crate::AnalyzerConfig;
@@ -30,6 +31,8 @@ const APP_LIB: &str = "use dep::target;\npub fn caller() { target(); }\n";
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Observed {
     crates: Vec<String>,
+    /// The modules each crate places: which `mod` declarations are active.
+    modules: Vec<String>,
     dependencies: Vec<String>,
     imports: Vec<String>,
     gaps: Vec<String>,
@@ -60,8 +63,17 @@ fn observe(workspace: &WorkspaceAnalyzer) -> Observed {
     let crates = rows(
         &conn,
         "SELECT t.crate_name || ' ' || t.target_kind || ' ' || t.edition \
-         || ' complete=' || t.inventory_complete \
+         || ' complete=' || t.inventory_complete || ' cfg=' || json(t.cfg_atoms) \
          FROM rust_crate_versions v JOIN rust_crate_topologies t USING(topology_id) \
+         WHERE v.valid_until IS NULL ORDER BY 1",
+    );
+    let modules = rows(
+        &conn,
+        "SELECT t.crate_name || ' ' || t.target_kind || ' ' || m.container_path || ' ' \
+         || s.rel_path || ' ' || m.placement \
+         FROM rust_crate_versions v JOIN rust_crate_topologies t USING(topology_id) \
+         JOIN rust_crate_containers m USING(topology_id) \
+         JOIN rust_crate_container_sources s USING(topology_id, container_path) \
          WHERE v.valid_until IS NULL ORDER BY 1",
     );
     let dependencies = rows(
@@ -132,6 +144,7 @@ fn observe(workspace: &WorkspaceAnalyzer) -> Observed {
         .collect();
     Observed {
         crates,
+        modules,
         dependencies,
         imports,
         gaps,
@@ -162,7 +175,7 @@ struct Edited {
     full_updates: usize,
 }
 
-/// Apply `edits` (manifests only) to the built tree and feed exactly those
+/// Apply `edits` (Cargo inputs only) to the built tree and feed exactly those
 /// paths to `update`.
 fn edit_and_rebuild(project: &BuiltInlineTestProject, edits: &[(&str, &str)]) -> Edited {
     let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
@@ -197,6 +210,7 @@ fn has_edge(observed: &Observed, from_suffix: &str, to_suffix: &str) -> bool {
 /// (a) A crate is renamed through its manifest, and its dependent follows with
 /// Cargo's `package =` key, so no Rust source changes.
 #[test]
+#[hardwon("#3749: a manifest crate rename left incremental crate rows and graph edges stale")]
 fn renaming_a_crate_in_its_manifest_matches_a_fresh_build() {
     let project = fixture(&[
         ("Cargo.toml", WORKSPACE),
@@ -246,6 +260,7 @@ fn renaming_a_crate_in_its_manifest_matches_a_fresh_build() {
 /// (b) A path dependency is added, so a reference that used to resolve to
 /// nothing now resolves across crates.
 #[test]
+#[hardwon("#3749: a new path dependency stayed unresolved after incremental update")]
 fn adding_a_path_dependency_matches_a_fresh_build() {
     let project = fixture(&[
         ("Cargo.toml", WORKSPACE),
@@ -283,19 +298,31 @@ fn adding_a_path_dependency_matches_a_fresh_build() {
 /// is incremental and still publishes what a fresh build does, including the
 /// exact new manifest bytes and current crate rows.
 fn assert_manifest_edit_is_incremental(edited_app_manifest: &str) {
-    let project = fixture(&[
-        ("Cargo.toml", WORKSPACE),
-        ("app/Cargo.toml", APP_MANIFEST_WITH_DEP),
-        ("dep/Cargo.toml", DEP_MANIFEST),
-        ("app/src/lib.rs", APP_LIB),
-        ("dep/src/lib.rs", DEP_LIB),
-    ]);
+    assert_edit_is_incremental(
+        &[
+            ("Cargo.toml", WORKSPACE),
+            ("app/Cargo.toml", APP_MANIFEST_WITH_DEP),
+            ("dep/Cargo.toml", DEP_MANIFEST),
+            ("app/src/lib.rs", APP_LIB),
+            ("dep/src/lib.rs", DEP_LIB),
+        ],
+        "app/Cargo.toml",
+        edited_app_manifest,
+    );
+}
+
+/// Edit the Cargo input `path` of the tree `files` in a way no crate row
+/// reads, and check that the update is incremental and still publishes what a
+/// fresh build does, including the input's exact new bytes and current crate
+/// rows.
+fn assert_edit_is_incremental(files: &[(&str, &str)], path: &str, edited: &str) {
+    let project = fixture(files);
     let Edited {
         before,
         updated,
         fresh,
         full_updates,
-    } = edit_and_rebuild(&project, &[("app/Cargo.toml", edited_app_manifest)]);
+    } = edit_and_rebuild(&project, &[(path, edited)]);
     assert_eq!(full_updates, 0, "the edit must not rebuild the workspace");
     let expected = observe(&fresh);
     assert!(
@@ -322,10 +349,187 @@ fn assert_manifest_edit_is_incremental(edited_app_manifest: &str) {
 
 /// (c) A comment-only manifest edit changes nothing observable.
 #[test]
+#[hardwon("#3749: comment-only edits exposed overbroad Cargo identity invalidation")]
 fn a_comment_only_manifest_edit_changes_nothing() {
     assert_manifest_edit_is_incremental(&format!(
         "# a comment that means nothing\n{APP_MANIFEST_WITH_DEP}"
     ));
+}
+
+/// `.cargo/config.toml` before each edit: only keys analysis does not read.
+const CONFIG_WITHOUT_SETTINGS: &str = "[alias]\nb = \"build\"\n";
+const APP_MANIFEST_WITH_REGISTRY_DEP: &str = "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\ndep = \"0.1\"\n";
+/// One module per cfg the configuration can settle.
+const CFG_GATED_APP_LIB: &str = "#[cfg(fast_path)]\npub mod fast;\n\
+     #[cfg(not(fast_path))]\npub mod slow;\n\
+     #[cfg(unix)]\npub mod nix;\n\
+     #[cfg(windows)]\npub mod win;\n\
+     #[cfg(target_arch = \"wasm32\")]\npub mod wasm;\n";
+
+fn configured_fixture(config_path: &str, app_manifest: &str) -> BuiltInlineTestProject {
+    fixture(&[
+        ("Cargo.toml", WORKSPACE),
+        (config_path, CONFIG_WITHOUT_SETTINGS),
+        ("app/Cargo.toml", app_manifest),
+        ("dep/Cargo.toml", DEP_MANIFEST),
+        ("app/src/lib.rs", CFG_GATED_APP_LIB),
+        ("app/src/fast.rs", "pub fn fast() {}\n"),
+        ("app/src/slow.rs", "pub fn slow() {}\n"),
+        ("app/src/nix.rs", "pub fn nix() {}\n"),
+        ("app/src/win.rs", "pub fn win() {}\n"),
+        ("app/src/wasm.rs", "pub fn wasm() {}\n"),
+        ("dep/src/lib.rs", DEP_LIB),
+    ])
+}
+
+fn has_module(observed: &Observed, module: &str) -> bool {
+    observed
+        .modules
+        .iter()
+        .any(|row| row.starts_with(&format!("app lib {module} ")))
+}
+
+fn has_gap(observed: &Observed, kind: &str, module: &str) -> bool {
+    observed.gaps.contains(&format!("app {kind} {module}"))
+}
+
+/// Edit `config_path` from keys no reader consumes to `edited`, and check that
+/// the update rebuilds once and publishes what a fresh build of the edited
+/// tree does. Returns the analyzer before the edit and the fresh build.
+fn assert_configuration_edit_matches_a_fresh_build(
+    project: &BuiltInlineTestProject,
+    config_path: &str,
+    edited: &str,
+) -> (Observed, Observed) {
+    let Edited {
+        before,
+        updated,
+        fresh,
+        full_updates,
+    } = edit_and_rebuild(project, &[(config_path, edited)]);
+    assert_eq!(
+        full_updates, 1,
+        "a configuration that changes crate rows rebuilds"
+    );
+    let expected = observe(&fresh);
+    let derived = |observed: &Observed| Observed {
+        manifests: Vec::new(),
+        ..observed.clone()
+    };
+    assert_ne!(
+        derived(&before),
+        derived(&expected),
+        "the edit must change what a fresh build derives"
+    );
+    assert_eq!(
+        observe(&updated),
+        expected,
+        "the updated analyzer must publish what a fresh build of the edited tree publishes"
+    );
+    (before, expected)
+}
+
+/// `--cfg` rustflags activate `#[cfg(name)]` modules and deactivate
+/// `#[cfg(not(name))]` ones. Without them both stay undecided, because a
+/// build script could set the cfg.
+#[test]
+#[hardwon("#3768: Cargo rustflags cfg values were absent from incremental module selection")]
+fn cfg_rustflags_in_cargo_configuration_activate_modules_like_a_fresh_build() {
+    let project = configured_fixture(".cargo/config.toml", APP_MANIFEST_WITHOUT_DEP);
+    let (before, expected) = assert_configuration_edit_matches_a_fresh_build(
+        &project,
+        ".cargo/config.toml",
+        &format!("{CONFIG_WITHOUT_SETTINGS}[build]\nrustflags = [\"--cfg\", \"fast_path\"]\n"),
+    );
+    assert!(
+        has_gap(&before, "unknown_activation", "crate::fast")
+            && has_gap(&before, "unknown_activation", "crate::slow"),
+        "without the flag both modules are undecided: {:?}",
+        before.gaps
+    );
+    assert!(
+        has_module(&expected, "crate::fast"),
+        "the flag places the cfg(fast_path) module: {:?}",
+        expected.modules
+    );
+    assert!(
+        has_gap(&expected, "inactive_placement", "crate::slow")
+            && !has_module(&expected, "crate::slow"),
+        "the flag deactivates the cfg(not(fast_path)) module: {:?}",
+        expected.gaps
+    );
+}
+
+/// `build.target` selects that target's cfg set instead of the host's, here
+/// through the legacy `.cargo/config`. The target is no CI host, so `unix`
+/// and `windows` are both false and `target_arch = "wasm32"` is true.
+#[test]
+#[hardwon("#3768: Cargo build.target did not select its target cfg set")]
+fn build_target_in_cargo_configuration_selects_its_cfg_set_like_a_fresh_build() {
+    let project = configured_fixture(".cargo/config", APP_MANIFEST_WITHOUT_DEP);
+    let (before, expected) = assert_configuration_edit_matches_a_fresh_build(
+        &project,
+        ".cargo/config",
+        &format!("{CONFIG_WITHOUT_SETTINGS}[build]\ntarget = \"wasm32-unknown-unknown\"\n"),
+    );
+    assert!(
+        has_gap(&before, "inactive_placement", "crate::wasm"),
+        "the host is not wasm32: {:?}",
+        before.gaps
+    );
+    assert!(
+        has_module(&expected, "crate::wasm"),
+        "the wasm32 target places the cfg(target_arch) module: {:?}",
+        expected.modules
+    );
+    for module in ["crate::nix", "crate::win"] {
+        assert!(
+            has_gap(&expected, "inactive_placement", module) && !has_module(&expected, module),
+            "{module} is inactive on wasm32: {:?}",
+            expected.gaps
+        );
+    }
+}
+
+/// A `[patch]` in the configuration routes a registry dependency to the
+/// workspace member it names, so the cross-crate reference resolves.
+#[test]
+#[hardwon("#3768: Cargo config patch routes were ignored during incremental analysis")]
+fn a_patch_in_cargo_configuration_routes_the_dependency_like_a_fresh_build() {
+    let project = fixture(&[
+        ("Cargo.toml", WORKSPACE),
+        (".cargo/config.toml", CONFIG_WITHOUT_SETTINGS),
+        ("app/Cargo.toml", APP_MANIFEST_WITH_REGISTRY_DEP),
+        ("dep/Cargo.toml", DEP_MANIFEST),
+        ("app/src/lib.rs", APP_LIB),
+        ("dep/src/lib.rs", DEP_LIB),
+    ]);
+    let (before, expected) = assert_configuration_edit_matches_a_fresh_build(
+        &project,
+        ".cargo/config.toml",
+        &format!("{CONFIG_WITHOUT_SETTINGS}[patch.crates-io]\ndep = {{ path = \"dep\" }}\n"),
+    );
+    let routed = |observed: &Observed| {
+        observed
+            .dependencies
+            .iter()
+            .any(|row| row.starts_with("app lib -> dep ") && row.ends_with(" dep"))
+    };
+    assert!(
+        !routed(&before),
+        "without the patch dep is a registry crate: {:?}",
+        before.dependencies
+    );
+    assert!(
+        routed(&expected),
+        "the patch routes dep to the member: {:?}",
+        expected.dependencies
+    );
+    assert!(
+        has_edge(&expected, "caller", "target"),
+        "the patched route resolves the cross-crate reference: {:?}",
+        expected.edges
+    );
 }
 
 /// (d) Package metadata, a profile and reformatting reach no crate row.
@@ -335,5 +539,29 @@ fn a_metadata_and_profile_manifest_edit_changes_nothing() {
         "[package]\nedition = \"2021\"\nversion = \"0.2.0\"\nname = \"app\"\n\
          description = \"now described\"\n\n[dependencies]\ndep = { path = \"../dep\" }\n\n\
          [profile.release]\nopt-level = 3\n",
+    );
+}
+
+/// Comments and keys analysis does not read reach no crate row, so editing
+/// them stays incremental, and the store still retains the new bytes.
+#[test]
+fn an_unread_cargo_configuration_edit_changes_nothing() {
+    assert_edit_is_incremental(
+        &[
+            ("Cargo.toml", WORKSPACE),
+            (
+                ".cargo/config.toml",
+                "[build]\nrustflags = [\"--cfg\", \"fast_path\"]\n",
+            ),
+            ("app/Cargo.toml", APP_MANIFEST_WITH_DEP),
+            ("dep/Cargo.toml", DEP_MANIFEST),
+            ("app/src/lib.rs", APP_LIB),
+            ("dep/src/lib.rs", DEP_LIB),
+        ],
+        ".cargo/config.toml",
+        "# a comment\n[alias]\nb = \"build\"\n\
+         [build]\njobs = 4\nrustflags   =   [ \"--cfg\", \"fast_path\" ]\n\
+         [env]\nRUST_LOG = \"debug\"\n\
+         [target.x86_64-unknown-linux-gnu]\nlinker = \"clang\"\n",
     );
 }

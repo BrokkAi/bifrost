@@ -287,6 +287,70 @@ mod tests {
         CvssMetric::EnvironmentalOrSupplemental { metric }
     }
 
+    fn pinned_token(value: &str) -> CvssMetricValueToken {
+        match value {
+            "N" => CvssMetricValueToken::N,
+            "L" => CvssMetricValueToken::L,
+            "P" => CvssMetricValueToken::P,
+            "H" => CvssMetricValueToken::H,
+            "U" => CvssMetricValueToken::U,
+            _ => panic!("unknown pinned CVSS token {value}"),
+        }
+    }
+
+    fn pinned_base_metric(label: &str) -> B {
+        match label {
+            "AV" => B::Av,
+            "AC" => B::Ac,
+            "AT" => B::At,
+            "PR" => B::Pr,
+            "UI" => B::Ui,
+            "VC" => B::Vc,
+            "VI" => B::Vi,
+            "VA" => B::Va,
+            "SC" => B::Sc,
+            "SI" => B::Si,
+            "SA" => B::Sa,
+            _ => panic!("unknown pinned CVSS base metric {label}"),
+        }
+    }
+
+    fn pinned_environmental_metric(label: &str) -> ES {
+        match label {
+            "CR" => ES::Cr,
+            "IR" => ES::Ir,
+            "AR" => ES::Ar,
+            "MAV" => ES::Mav,
+            "MAC" => ES::Mac,
+            "MAT" => ES::Mat,
+            "MVC" => ES::Mvc,
+            "MVI" => ES::Mvi,
+            "MVA" => ES::Mva,
+            _ => panic!("unknown pinned CVSS environmental metric {label}"),
+        }
+    }
+
+    fn pinned_values(
+        case: &crate::test_support::cvss_vectors::PinnedCvssVector,
+    ) -> Vec<(CvssMetric, CvssMetricValueToken)> {
+        let mut values = case
+            .base
+            .iter()
+            .map(|(metric, value)| (base(pinned_base_metric(metric)), pinned_token(value)))
+            .collect::<Vec<_>>();
+        values.extend(case.threat.iter().map(|(metric, value)| {
+            assert_eq!(*metric, "E");
+            (threat(), pinned_token(value))
+        }));
+        values.extend(case.environment.iter().map(|(metric, value)| {
+            (
+                environmental(pinned_environmental_metric(metric)),
+                pinned_token(value),
+            )
+        }));
+        values
+    }
+
     fn evidence(values: &[(CvssMetric, CvssMetricValueToken)]) -> Vec<CvssMetricEvidence> {
         values
             .iter()
@@ -343,118 +407,43 @@ mod tests {
 
     #[test]
     fn scores_pinned_first_vectors_through_typed_evidence() {
-        assert_projection(
-            &[
-                (base(B::Av), CvssMetricValueToken::L),
-                (base(B::Ac), CvssMetricValueToken::L),
-                (base(B::At), CvssMetricValueToken::P),
-                (base(B::Pr), CvssMetricValueToken::L),
-                (base(B::Ui), CvssMetricValueToken::N),
-                (base(B::Vc), CvssMetricValueToken::H),
-                (base(B::Vi), CvssMetricValueToken::H),
-                (base(B::Va), CvssMetricValueToken::H),
-                (base(B::Sc), CvssMetricValueToken::N),
-                (base(B::Si), CvssMetricValueToken::N),
-                (base(B::Sa), CvssMetricValueToken::N),
-            ],
-            "CVSS:4.0/AV:L/AC:L/AT:P/PR:L/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N",
-            CvssNomenclature::B,
-            7.3,
-            CvssSeverity::High,
-        );
-        assert_projection(
-            &[
-                (base(B::Av), CvssMetricValueToken::N),
-                (base(B::Ac), CvssMetricValueToken::L),
-                (base(B::At), CvssMetricValueToken::P),
-                (base(B::Pr), CvssMetricValueToken::N),
-                (base(B::Ui), CvssMetricValueToken::P),
-                (base(B::Vc), CvssMetricValueToken::H),
-                (base(B::Vi), CvssMetricValueToken::H),
-                (base(B::Va), CvssMetricValueToken::H),
-                (base(B::Sc), CvssMetricValueToken::N),
-                (base(B::Si), CvssMetricValueToken::N),
-                (base(B::Sa), CvssMetricValueToken::N),
-                (threat(), CvssMetricValueToken::U),
-            ],
-            "CVSS:4.0/AV:N/AC:L/AT:P/PR:N/UI:P/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N/E:U",
-            CvssNomenclature::BT,
-            5.2,
-            CvssSeverity::Medium,
-        );
-        assert_projection(
-            &[
-                (base(B::Av), CvssMetricValueToken::N),
-                (base(B::Ac), CvssMetricValueToken::L),
-                (base(B::At), CvssMetricValueToken::P),
-                (base(B::Pr), CvssMetricValueToken::N),
-                (base(B::Ui), CvssMetricValueToken::N),
-                (base(B::Vc), CvssMetricValueToken::H),
-                (base(B::Vi), CvssMetricValueToken::L),
-                (base(B::Va), CvssMetricValueToken::L),
-                (base(B::Sc), CvssMetricValueToken::N),
-                (base(B::Si), CvssMetricValueToken::N),
-                (base(B::Sa), CvssMetricValueToken::N),
-                (environmental(ES::Cr), CvssMetricValueToken::H),
-                (environmental(ES::Ir), CvssMetricValueToken::L),
-                (environmental(ES::Ar), CvssMetricValueToken::L),
-                (environmental(ES::Mav), CvssMetricValueToken::N),
-                (environmental(ES::Mac), CvssMetricValueToken::H),
-                (environmental(ES::Mvc), CvssMetricValueToken::H),
-                (environmental(ES::Mvi), CvssMetricValueToken::L),
-                (environmental(ES::Mva), CvssMetricValueToken::L),
-            ],
-            "CVSS:4.0/AV:N/AC:L/AT:P/PR:N/UI:N/VC:H/VI:L/VA:L/SC:N/SI:N/SA:N/CR:H/IR:L/AR:L/MAV:N/MAC:H/MVC:H/MVI:L/MVA:L",
-            CvssNomenclature::BE,
-            8.1,
-            CvssSeverity::High,
-        );
-        assert_projection(
-            &[
-                (base(B::Av), CvssMetricValueToken::N),
-                (base(B::Ac), CvssMetricValueToken::H),
-                (base(B::At), CvssMetricValueToken::P),
-                (base(B::Pr), CvssMetricValueToken::N),
-                (base(B::Ui), CvssMetricValueToken::N),
-                (base(B::Vc), CvssMetricValueToken::H),
-                (base(B::Vi), CvssMetricValueToken::H),
-                (base(B::Va), CvssMetricValueToken::H),
-                (base(B::Sc), CvssMetricValueToken::N),
-                (base(B::Si), CvssMetricValueToken::N),
-                (base(B::Sa), CvssMetricValueToken::N),
-                (threat(), CvssMetricValueToken::P),
-                (environmental(ES::Mac), CvssMetricValueToken::L),
-                (environmental(ES::Mat), CvssMetricValueToken::N),
-                (environmental(ES::Mvc), CvssMetricValueToken::N),
-                (environmental(ES::Mvi), CvssMetricValueToken::N),
-                (environmental(ES::Mva), CvssMetricValueToken::L),
-            ],
-            "CVSS:4.0/AV:N/AC:H/AT:P/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N/E:P/MAC:L/MAT:N/MVC:N/MVI:N/MVA:L",
-            CvssNomenclature::BTE,
-            5.5,
-            CvssSeverity::Medium,
-        );
+        for case in crate::test_support::cvss_vectors::PINNED_FIRST_CVSS_VECTORS
+            .iter()
+            .filter(|case| case.id != "test.cvss-zero")
+        {
+            let nomenclature = match case.nomenclature {
+                "B" => CvssNomenclature::B,
+                "BT" => CvssNomenclature::BT,
+                "BE" => CvssNomenclature::BE,
+                "BTE" => CvssNomenclature::BTE,
+                other => panic!("unknown pinned CVSS nomenclature {other}"),
+            };
+            let severity = match case.severity {
+                "Medium" => CvssSeverity::Medium,
+                "High" => CvssSeverity::High,
+                other => panic!("unknown pinned CVSS severity {other}"),
+            };
+            assert_projection(
+                &pinned_values(case),
+                case.vector,
+                nomenclature,
+                case.score,
+                severity,
+            );
+        }
     }
 
     #[test]
     fn scores_complete_all_none_impacts_as_zero() {
+        let case = crate::test_support::cvss_vectors::PINNED_FIRST_CVSS_VECTORS
+            .iter()
+            .find(|case| case.id == "test.cvss-zero")
+            .expect("pinned zero-score vector");
         assert_projection(
-            &[
-                (base(B::Av), CvssMetricValueToken::N),
-                (base(B::Ac), CvssMetricValueToken::L),
-                (base(B::At), CvssMetricValueToken::N),
-                (base(B::Pr), CvssMetricValueToken::N),
-                (base(B::Ui), CvssMetricValueToken::N),
-                (base(B::Vc), CvssMetricValueToken::N),
-                (base(B::Vi), CvssMetricValueToken::N),
-                (base(B::Va), CvssMetricValueToken::N),
-                (base(B::Sc), CvssMetricValueToken::N),
-                (base(B::Si), CvssMetricValueToken::N),
-                (base(B::Sa), CvssMetricValueToken::N),
-            ],
-            "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:N/VI:N/VA:N/SC:N/SI:N/SA:N",
+            &pinned_values(case),
+            case.vector,
             CvssNomenclature::B,
-            0.0,
+            case.score,
             CvssSeverity::None,
         );
     }

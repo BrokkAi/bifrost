@@ -140,6 +140,7 @@ impl TierDemand {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
     use std::path::PathBuf;
 
     fn file(rel_path: &str) -> ProjectFile {
@@ -154,6 +155,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#1865: unrelated files triggered whole-workspace C++ include re-derivation")]
     fn a_recorded_key_matches_every_path_suffix_that_spells_it() {
         let mut demand = TierDemand::default();
         demand.set_source(
@@ -171,6 +173,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#1865: shared unresolved include demand retired before its last source")]
     fn a_key_retires_only_when_its_last_demanding_source_drops_it() {
         let mut demand = TierDemand::default();
         demand.set_source(

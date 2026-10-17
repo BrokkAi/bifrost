@@ -1,7 +1,7 @@
 use crate::syntax::ruby_semantic_identifier_range;
 use brokk_bifrost_core::analyzer::model::Range;
 use brokk_bifrost_core::analyzer::usages::common::{
-    SNIPPET_CONTEXT_LINES, reclassify_self_receiver_hit_at, usage_hit,
+    SNIPPET_CONTEXT_LINES, insert_unproven_hit, reclassify_self_receiver_hit_at, usage_hit,
 };
 use brokk_bifrost_core::analyzer::usages::model::UsageHit;
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, ProjectFile};
@@ -17,26 +17,9 @@ pub fn record_usage_hit(
     hits: &mut BTreeSet<UsageHit>,
     node: Node<'_>,
 ) {
-    let range = ruby_semantic_identifier_range(node, source);
-    let start_byte = range.start_byte;
-    let end_byte = range.end_byte;
-    if start_byte >= end_byte {
-        return;
+    if let Some(hit) = semantic_usage_hit(index, file, source, line_starts, node) {
+        hits.insert(hit);
     }
-    let line_idx = find_line_index_for_offset(line_starts, start_byte);
-    let snippet = trimmed_snippet_around_line(source, line_starts, line_idx, SNIPPET_CONTEXT_LINES);
-    let enclosing_range = Range {
-        start_byte,
-        end_byte,
-        start_line: line_idx,
-        end_line: line_idx,
-    };
-    let enclosing = index
-        .enclosing_code_unit(file, &enclosing_range)
-        .unwrap_or_else(|| CodeUnit::file_scope(file.clone()));
-    hits.insert(usage_hit(
-        file, line_idx, start_byte, end_byte, enclosing, snippet,
-    ));
 }
 
 /// Record `node` as a same-owner self receiver hit (#1014 facet B): a `self.`
@@ -66,11 +49,24 @@ pub fn record_unproven_usage_hit(
     hits: &mut BTreeSet<UsageHit>,
     node: Node<'_>,
 ) {
+    insert_unproven_hit(
+        hits,
+        semantic_usage_hit(index, file, source, line_starts, node),
+    );
+}
+
+fn semantic_usage_hit(
+    index: &dyn CodeUnitIndex,
+    file: &ProjectFile,
+    source: &str,
+    line_starts: &[usize],
+    node: Node<'_>,
+) -> Option<UsageHit> {
     let range = ruby_semantic_identifier_range(node, source);
     let start_byte = range.start_byte;
     let end_byte = range.end_byte;
     if start_byte >= end_byte {
-        return;
+        return None;
     }
     let line_idx = find_line_index_for_offset(line_starts, start_byte);
     let snippet = trimmed_snippet_around_line(source, line_starts, line_idx, SNIPPET_CONTEXT_LINES);
@@ -83,7 +79,7 @@ pub fn record_unproven_usage_hit(
     let enclosing = index
         .enclosing_code_unit(file, &enclosing_range)
         .unwrap_or_else(|| CodeUnit::file_scope(file.clone()));
-    hits.insert(
-        usage_hit(file, line_idx, start_byte, end_byte, enclosing, snippet).into_unproven(),
-    );
+    Some(usage_hit(
+        file, line_idx, start_byte, end_byte, enclosing, snippet,
+    ))
 }

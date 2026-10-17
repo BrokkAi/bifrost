@@ -1,10 +1,11 @@
 //! AST-owned context captured alongside canonical C++ declaration facts.
 
 use crate::graph::resolver::{
-    BooleanGuardExpression, PreprocessorGuard, callable_preprocessor_guard_requirements,
-    direct_unmatched_closing_brace, flattened_macro_namespace_components,
-    is_recovered_declaration_scope_container, preprocessor_conditional_family_for_declaration,
-    preprocessor_guard_environment,
+    BooleanGuardExpression, PreprocessorContextCache, PreprocessorGuard,
+    callable_preprocessor_guard_requirements_with_cache, direct_unmatched_closing_brace,
+    flattened_macro_namespace_components, is_recovered_declaration_scope_container,
+    preprocessor_conditional_family_for_declaration_with_cache,
+    preprocessor_guard_environment_with_cache,
 };
 use brokk_bifrost_core::analyzer::CodeUnit;
 use brokk_bifrost_core::analyzer::cpp_facts::{CppGuardNode, CppGuardSet};
@@ -25,6 +26,7 @@ pub(crate) fn capture_declaration_context<'tree>(
     node: Node<'tree>,
     unit: &CodeUnit,
     source: &str,
+    cache: &mut PreprocessorContextCache,
 ) -> CppSourceContext<'tree> {
     let declaration = callable_declaration_node(node);
     // The visibility resolver also uses declaration activation for fields.
@@ -36,7 +38,9 @@ pub(crate) fn capture_declaration_context<'tree>(
     let callable_declarator = declaration.and_then(function_declarator);
     let callable_guards = callable_nameable
         .then(|| declaration.expect("callable declaration"))
-        .and_then(|declaration| callable_preprocessor_guard_requirements(declaration, source))
+        .and_then(|declaration| {
+            callable_preprocessor_guard_requirements_with_cache(declaration, source, cache)
+        })
         .map(|guards| cpp_guard_set_from_runtime(&guards));
     let callable_activation = callable_nameable.then(|| {
         let declaration = declaration.expect("callable declaration");
@@ -57,15 +61,16 @@ pub(crate) fn capture_declaration_context<'tree>(
         .and_then(namespace_closing_brace);
 
     CppSourceContext {
-        guard_requirements: preprocessor_guard_environment(node, source)
+        guard_requirements: preprocessor_guard_environment_with_cache(node, source, cache)
             .as_ref()
             .map(cpp_guard_set_from_runtime),
         callable_guards,
         callable_activation,
-        callable_guard_completion_byte: crate::graph::resolver::callable_guard_completion_byte(
-            node, source,
+        callable_guard_completion_byte:
+            crate::graph::resolver::callable_guard_completion_byte_with_cache(node, source, cache),
+        exhaustive_conditional_family: preprocessor_conditional_family_for_declaration_with_cache(
+            node, cache,
         ),
-        exhaustive_conditional_family: preprocessor_conditional_family_for_declaration(node),
         flattened_macro_namespace,
         displaced_namespace_closing_brace,
     }

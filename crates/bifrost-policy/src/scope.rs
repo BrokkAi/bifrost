@@ -18,12 +18,15 @@ use brokk_bifrost_analysis::analyzer::semantic::{
     WorkspaceRelativePath, WorkspaceRelativePathError,
 };
 use brokk_bifrost_analysis::workspace_document::{
-    WorkspaceDocumentError, WorkspaceRoot, read_workspace_document,
+    WorkspaceDocumentError, WorkspaceRoot, fmt_json_decode_error, read_optional_workspace_document,
 };
 
 use super::classification::{TextValidationError, validate_required_text};
 use super::definition::{PolicyCategoryId, PolicyId, PolicyIdentifierError};
-use super::retained::{RetainedSize, retained_extra};
+use super::retained::{
+    RetainedSize, retained_extra, retained_size_with_extra, retained_size_with_extras,
+    retained_size_with_field_extra,
+};
 
 pub const DEFAULT_POLICY_SCOPE_PATH: &str = ".bifrost/policy-scope.json";
 pub const MAX_POLICY_SCOPE_DOCUMENT_BYTES: u64 = 256 * 1024;
@@ -42,7 +45,7 @@ const MAX_JSON_ERROR_BYTES: usize = 512;
 /// listed (union semantics).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PolicyScopeEntry {
-    #[serde(serialize_with = "serialize_workspace_relative_path")]
+    #[serde(serialize_with = "crate::display_path::serialize_workspace_relative_path")]
     path: WorkspaceRelativePath,
     reason: Box<str>,
     exclude_roots: bool,
@@ -133,10 +136,6 @@ pub struct PolicyScopeDocument {
     scopes: Box<[PolicyScopeEntry]>,
 }
 
-const fn is_zero(value: &u64) -> bool {
-    *value == 0
-}
-
 impl PolicyScopeDocument {
     pub const fn schema_version(&self) -> u32 {
         self.schema_version
@@ -185,7 +184,7 @@ impl PolicyScopeSource {
     }
 
     fn from_workspace_path(path: WorkspaceRelativePath) -> Result<Self, PolicyScopeSourceError> {
-        if path.as_str().len() > MAX_POLICY_SCOPE_PATH_BYTES {
+        if crate::is_over_byte_limit(path.as_str(), MAX_POLICY_SCOPE_PATH_BYTES) {
             return Err(PolicyScopeSourceError::TooLong {
                 max_bytes: MAX_POLICY_SCOPE_PATH_BYTES,
             });
@@ -232,14 +231,7 @@ impl fmt::Display for PolicyScopeSourceError {
     }
 }
 
-impl std::error::Error for PolicyScopeSourceError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Path(error) => Some(error),
-            Self::TooLong { .. } => None,
-        }
-    }
-}
+crate::impl_policy_source_error!(PolicyScopeSourceError);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -273,7 +265,7 @@ pub struct PolicyScopeReview {
     #[serde(flatten)]
     entry: PolicyScopeEntry,
     matched_findings: u64,
-    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(skip_serializing_if = "crate::is_zero")]
     excluded_root_files: u64,
     applied: bool,
     result_omitted: bool,
@@ -350,15 +342,16 @@ pub(crate) fn load_policy_scope_from_root(
     options: &PolicyScopeOptions,
 ) -> Result<Option<PolicyScopeDocument>, PolicyScopeLoadError> {
     let relative_path = Path::new(options.source.relative_path());
-    let document = match read_workspace_document(
+    let document = match read_optional_workspace_document(
         root,
         relative_path,
         &["json"],
         MAX_POLICY_SCOPE_DOCUMENT_BYTES,
-    ) {
-        Ok(document) => document,
-        Err(error) if workspace_error_is_not_found(&error) => return Ok(None),
-        Err(error) => return Err(PolicyScopeLoadError::Workspace(error)),
+    )
+    .map_err(PolicyScopeLoadError::Workspace)?
+    {
+        Some(document) => document,
+        None => return Ok(None),
     };
     parse_policy_scope_document(document.source())
         .map(Some)
@@ -368,7 +361,7 @@ pub(crate) fn load_policy_scope_from_root(
 pub fn parse_policy_scope_document(
     source: &str,
 ) -> Result<PolicyScopeDocument, PolicyScopeDocumentError> {
-    if u64::try_from(source.len()).unwrap_or(u64::MAX) > MAX_POLICY_SCOPE_DOCUMENT_BYTES {
+    if crate::is_over_u64_byte_limit(source, MAX_POLICY_SCOPE_DOCUMENT_BYTES) {
         return Err(PolicyScopeDocumentError::Validation(
             PolicyScopeValidationError::DocumentTooLarge {
                 max_bytes: MAX_POLICY_SCOPE_DOCUMENT_BYTES,
@@ -487,30 +480,12 @@ fn normalize_selector<T: Ord>(
     Ok(parsed.into_boxed_slice())
 }
 
-fn serialize_workspace_relative_path<S>(
-    path: &WorkspaceRelativePath,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    serializer.serialize_str(path.as_str())
-}
-
 fn compare_scope_key(left: &PolicyScopeEntry, right: &PolicyScopeEntry) -> Ordering {
     left.path
         .cmp(&right.path)
         .then_with(|| left.exclude_roots.cmp(&right.exclude_roots))
         .then_with(|| left.policy_ids.cmp(&right.policy_ids))
         .then_with(|| left.policy_categories.cmp(&right.policy_categories))
-}
-
-fn workspace_error_is_not_found(error: &WorkspaceDocumentError) -> bool {
-    matches!(
-        error,
-        WorkspaceDocumentError::OpenFile { source, .. }
-            if source.kind() == std::io::ErrorKind::NotFound
-    )
 }
 
 fn bounded_error_message(message: &str) -> Box<str> {
@@ -561,10 +536,7 @@ impl fmt::Display for PolicyScopeDocumentError {
                 message,
                 line,
                 column,
-            } => write!(
-                formatter,
-                "scope document is not valid JSON at line {line} column {column}: {message}"
-            ),
+            } => fmt_json_decode_error(formatter, "scope", message, *line, *column),
             Self::Validation(error) => error.fmt(formatter),
         }
     }
@@ -750,26 +722,25 @@ impl RetainedSize for PolicyScopeEntry {
 
 impl RetainedSize for PolicyScopeDocument {
     fn retained_size(&self) -> usize {
-        self.scopes
-            .iter()
-            .fold(std::mem::size_of::<Self>(), |bytes, scope| {
-                bytes.saturating_add(scope.retained_size())
-            })
+        retained_size_with_extras(self, self.scopes.iter().map(RetainedSize::retained_size))
     }
 }
 
 impl RetainedSize for PolicyScopeSource {
     fn retained_size(&self) -> usize {
-        std::mem::size_of::<Self>().saturating_add(match self {
-            Self::Conventional => 0,
-            Self::Explicit(path) => path.as_str().len(),
-        })
+        retained_size_with_extra(
+            self,
+            match self {
+                Self::Conventional => 0,
+                Self::Explicit(path) => retained_extra(path),
+            },
+        )
     }
 }
 
 impl RetainedSize for PolicyScopeOptions {
     fn retained_size(&self) -> usize {
-        std::mem::size_of::<Self>().saturating_add(self.source.retained_size())
+        retained_size_with_field_extra(self, &self.source)
     }
 }
 
@@ -783,19 +754,23 @@ impl RetainedSize for PolicyFindingScope {
 
 impl RetainedSize for PolicyScopeReview {
     fn retained_size(&self) -> usize {
-        std::mem::size_of::<Self>().saturating_add(self.entry.retained_size())
+        retained_size_with_field_extra(self, &self.entry)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
 
     fn parse(source: &str) -> Result<PolicyScopeDocument, PolicyScopeDocumentError> {
         parse_policy_scope_document(source)
     }
 
     #[test]
+    #[hardwon(
+        "9e032012f530: the root-scope fix applies exclusions before solving while retaining the excluded-file count in the review."
+    )]
     fn document_excludes_roots_and_review_counts_excluded_files() {
         let document = parse(
             r#"{
@@ -829,6 +804,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "9e032012f530: the scope fix keeps old documents inclusive unless they explicitly opt into root exclusion."
+    )]
     fn root_exclusion_defaults_off_for_existing_acceptance_scopes() {
         let document = parse(
             r#"{
@@ -903,37 +881,6 @@ mod tests {
     }
 
     #[test]
-    fn selector_union_semantics() {
-        let document = parse(
-            r#"{
-                "schema_version": 1,
-                "scopes": [
-                    {
-                        "path": "tests",
-                        "reason": "Performance prompts and one exact rule.",
-                        "policy_ids": ["bifrost.correctness.dynamic-evaluation"],
-                        "policy_categories": ["performance"]
-                    }
-                ]
-            }"#,
-        )
-        .unwrap();
-        let scope = entry(&document, 0);
-        let performance = PolicyCategoryId::new("performance").unwrap();
-        let correctness = PolicyCategoryId::new("correctness").unwrap();
-        let sleep = PolicyId::new("bifrost.performance.sleep-in-loop").unwrap();
-        let dynamic = PolicyId::new("bifrost.correctness.dynamic-evaluation").unwrap();
-        let unsafe_deser = PolicyId::new("bifrost.correctness.unsafe-deserialization").unwrap();
-        assert!(scope.matches("tests/a.py", &sleep, std::slice::from_ref(&performance)));
-        assert!(scope.matches("tests/a.py", &dynamic, std::slice::from_ref(&correctness)));
-        assert!(!scope.matches(
-            "tests/a.py",
-            &unsafe_deser,
-            std::slice::from_ref(&correctness)
-        ));
-    }
-
-    #[test]
     fn rejects_invalid_documents() {
         let cases = [
             (r#"{"schema_version": 2, "scopes": []}"#, "schema_version"),
@@ -989,5 +936,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(document.scopes().len(), 2);
+    }
+
+    #[test]
+    fn selector_union_semantics() {
+        let document = parse(
+            r#"{
+                "schema_version": 1,
+                "scopes": [
+                    {
+                        "path": "tests",
+                        "reason": "Performance prompts and one exact rule.",
+                        "policy_ids": ["bifrost.correctness.dynamic-evaluation"],
+                        "policy_categories": ["performance"]
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+        let scope = entry(&document, 0);
+        let performance = PolicyCategoryId::new("performance").unwrap();
+        let correctness = PolicyCategoryId::new("correctness").unwrap();
+        let sleep = PolicyId::new("bifrost.performance.sleep-in-loop").unwrap();
+        let dynamic = PolicyId::new("bifrost.correctness.dynamic-evaluation").unwrap();
+        let unsafe_deser = PolicyId::new("bifrost.correctness.unsafe-deserialization").unwrap();
+        assert!(scope.matches("tests/a.py", &sleep, std::slice::from_ref(&performance)));
+        assert!(scope.matches("tests/a.py", &dynamic, std::slice::from_ref(&correctness)));
+        assert!(!scope.matches(
+            "tests/a.py",
+            &unsafe_deser,
+            std::slice::from_ref(&correctness)
+        ));
     }
 }

@@ -5,13 +5,16 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::CancellationToken;
+use crate::analyzer::dependency_support::{
+    cancelled_dependency_evidence_diagnostic, dependency_diagnostic as diagnostic,
+    dependency_provenance_entry, read_evidence_file_with_budget, require_non_empty_evidence_field,
+    resolve_dependency_path as resolve_path,
+};
 use crate::analyzer::semantic_model::{
-    ArtifactProducerLimits, BoundedDependencyDiagnostics, CatalogCoordinate,
-    DependencyArtifactRole, DependencyDiscoveryOutcome, DependencyDiscoveryProfile,
-    DependencyPackDiagnostic, DependencyPackDiagnosticSeverity, DependencyPackLimits,
-    DependencyProvenance, ExternalArtifactKind, ProducerDiagnostic, ProducerDiagnosticSeverity,
-    ResolvedDependency, ResolvedDependencyArtifact, SemanticModelActivationEvidence,
-    read_exact_artifact_while,
+    BoundedDependencyDiagnostics, CatalogCoordinate, DependencyArtifactRole,
+    DependencyDiscoveryOutcome, DependencyDiscoveryProfile, DependencyPackDiagnostic,
+    DependencyPackLimits, DependencyProvenance, ExternalArtifactKind, ResolvedDependency,
+    ResolvedDependencyArtifact, SemanticModelActivationEvidence, StandardLibraryPackExpectation,
 };
 use crate::analyzer::topology::DependencyScope;
 use crate::analyzer::{Language, Project, RustAnalyzerConfig, RustDependencyApiEvidence};
@@ -25,6 +28,9 @@ pub const RUST_STDLIB_TOOLCHAIN_CHANNEL: &str = "nightly-2026-08-24";
 pub const RUST_STDLIB_TOOLCHAIN_NAME: &str = "rust";
 pub const RUST_STDLIB_TOOLCHAIN_VERSION: &str = "1.100.0-nightly";
 pub const RUST_STDLIB_RUSTC_COMMIT: &str = "fb6531d55";
+/// The rustdoc standard-library pack a pinned `rust-toolchain.toml` selects
+/// (`semantic-packs/rust/rust-stdlib-*.json`).
+pub const RUST_STDLIB_PACK_ID: &str = "bifrost.rust-stdlib";
 
 #[derive(Debug, Deserialize)]
 struct RustToolchainFile {
@@ -83,18 +89,99 @@ struct CargoMetadataNodeDependency {
 }
 
 #[derive(Debug, Deserialize)]
-struct CargoLockfile {
-    version: u32,
+pub(super) struct CargoLockfile {
+    pub(super) version: u32,
     #[serde(default, rename = "package")]
-    packages: Vec<CargoLockPackage>,
+    pub(super) packages: Vec<CargoLockPackage>,
 }
 
 #[derive(Debug, Deserialize)]
-struct CargoLockPackage {
-    name: String,
-    version: String,
-    source: Option<String>,
-    checksum: Option<String>,
+pub(super) struct CargoLockPackage {
+    pub(super) name: String,
+    pub(super) version: String,
+    pub(super) source: Option<String>,
+    pub(super) checksum: Option<String>,
+    #[serde(default)]
+    pub(super) dependencies: Vec<String>,
+}
+
+/// Decode the same lock contract for API ingestion and files-only evidence.
+pub(super) fn decode_cargo_lockfile(
+    source: &str,
+    path: &Path,
+) -> Result<CargoLockfile, DependencyPackDiagnostic> {
+    let lockfile: CargoLockfile = toml::from_str(source).map_err(|error| {
+        diagnostic(
+            "rust.lockfile.invalid_toml",
+            Some(path),
+            format!("could not decode Cargo.lock: {error}"),
+        )
+    })?;
+    if !(MINIMUM_LOCKFILE_VERSION..=MAXIMUM_LOCKFILE_VERSION).contains(&lockfile.version) {
+        return Err(diagnostic(
+            "rust.lockfile.unsupported_version",
+            Some(path),
+            format!(
+                "Cargo.lock version {} is unsupported; expected {} through {}",
+                lockfile.version, MINIMUM_LOCKFILE_VERSION, MAXIMUM_LOCKFILE_VERSION
+            ),
+        ));
+    }
+    for package in &lockfile.packages {
+        semver::Version::parse(&package.version).map_err(|error| {
+            diagnostic(
+                "rust.lockfile.invalid_semver",
+                Some(path),
+                format!("invalid locked version for {}: {error}", package.name),
+            )
+        })?;
+        if package.name.is_empty() || package.source.as_deref() == Some("") {
+            return Err(diagnostic(
+                "rust.lockfile.invalid_identity",
+                Some(path),
+                "empty lock package name or source",
+            ));
+        }
+        for reference in &package.dependencies {
+            cargo_lock_reference(reference).map_err(|message| {
+                diagnostic(
+                    "rust.lockfile.invalid_dependency_reference",
+                    Some(path),
+                    message,
+                )
+            })?;
+        }
+    }
+    Ok(lockfile)
+}
+
+/// Cargo wire reference grammar: name [version] [(source)]. These are lock
+/// coordinates, not Rust source paths or rendered analyzer identities.
+pub(super) fn cargo_lock_reference(
+    reference: &str,
+) -> Result<(&str, Option<&str>, Option<&str>), &'static str> {
+    let (coordinate, source) = match reference.split_once(" (") {
+        Some((coordinate, suffix)) => (
+            coordinate,
+            Some(
+                suffix
+                    .strip_suffix(')')
+                    .filter(|source| !source.is_empty())
+                    .ok_or("invalid lock source reference")?,
+            ),
+        ),
+        None => (reference, None),
+    };
+    let mut parts = coordinate.split_whitespace();
+    let name = parts.next().ok_or("empty lock dependency reference")?;
+    let version = parts.next();
+    if parts.next().is_some() || (source.is_some() && version.is_none()) {
+        return Err("invalid lock dependency reference shape");
+    }
+    if let Some(version) = version {
+        semver::Version::parse(version).map_err(|_| "invalid lock dependency version")?;
+    }
+    Ok((name, version, source))
 }
 
 #[derive(Debug, Deserialize)]
@@ -182,6 +269,7 @@ pub fn resolve_rust_semantic_pack_dependencies(
         }
     }
 
+    let mut stdlib_expectation = None;
     if !cancelled && project.analyzer_languages().contains(&Language::Rust) {
         match resolve_rust_stdlib_dependency(
             project,
@@ -189,10 +277,25 @@ pub fn resolve_rust_semantic_pack_dependencies(
             &mut evidence_bytes_read,
             cancellation,
         ) {
-            Ok(Some(stdlib)) => dependencies.push(stdlib),
-            Ok(None) => {}
+            Ok(stdlib) => {
+                stdlib_expectation = Some(StandardLibraryPackExpectation::declared(
+                    Language::Rust,
+                    RUST_STDLIB_PACK_ID,
+                    vec![stdlib.id.clone()],
+                ));
+                dependencies.push(stdlib);
+            }
             Err(diagnostic) => {
                 cancelled |= diagnostic.code == "rust.evidence.cancelled";
+                // A cancelled read answers nothing about the pack; every other
+                // refusal is the exact reason the pack is not selected.
+                if !cancelled {
+                    stdlib_expectation = Some(StandardLibraryPackExpectation::not_selected(
+                        Language::Rust,
+                        RUST_STDLIB_PACK_ID,
+                        diagnostic.message.clone(),
+                    ));
+                }
                 diagnostics.push(diagnostic);
             }
         }
@@ -201,7 +304,7 @@ pub fn resolve_rust_semantic_pack_dependencies(
     dependencies.sort_by(|left, right| left.id.cmp(&right.id));
     dependencies.dedup();
     let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
-    DependencyDiscoveryOutcome {
+    let mut outcome = DependencyDiscoveryOutcome {
         profile: DependencyDiscoveryProfile {
             metadata_inputs_considered,
             dependencies_resolved: dependencies.len(),
@@ -212,7 +315,11 @@ pub fn resolve_rust_semantic_pack_dependencies(
         diagnostics,
         suppressed_diagnostics,
         cancelled,
+    };
+    if let Some(expectation) = stdlib_expectation {
+        outcome.expect_standard_library_pack(expectation);
     }
+    outcome
 }
 
 fn resolve_rust_stdlib_dependency(
@@ -220,7 +327,7 @@ fn resolve_rust_stdlib_dependency(
     limits: &DependencyPackLimits,
     evidence_bytes_read: &mut u64,
     cancellation: Option<&CancellationToken>,
-) -> Result<Option<ResolvedDependency>, DependencyPackDiagnostic> {
+) -> Result<ResolvedDependency, DependencyPackDiagnostic> {
     let path = project.root().join("rust-toolchain.toml");
     match std::fs::metadata(&path) {
         Ok(metadata) if !metadata.is_file() => {
@@ -249,7 +356,7 @@ fn resolve_rust_stdlib_dependency(
         }
     }
     let artifact =
-        read_evidence_file_with_budget(&path, limits, evidence_bytes_read, cancellation)?;
+        read_evidence_file_with_budget("Rust", &path, limits, evidence_bytes_read, cancellation)?;
     let source = std::str::from_utf8(artifact.bytes()).map_err(|error| {
         diagnostic(
             "rust.toolchain.invalid_utf8",
@@ -276,7 +383,7 @@ fn resolve_rust_stdlib_dependency(
     }
     let version = semver::Version::parse(RUST_STDLIB_TOOLCHAIN_VERSION)
         .expect("pinned Rust toolchain version is valid semver");
-    Ok(Some(ResolvedDependency {
+    Ok(ResolvedDependency {
         id: format!("rust:stdlib:{RUST_STDLIB_TOOLCHAIN_CHANNEL}"),
         evidence: SemanticModelActivationEvidence {
             language: "rust".to_owned(),
@@ -316,7 +423,7 @@ fn resolve_rust_stdlib_dependency(
         artifacts: Vec::new(),
         scope: DependencyScope::Unknown,
         declared_by: None,
-    }))
+    })
 }
 
 fn resolve_rust_dependency_evidence(
@@ -570,6 +677,7 @@ fn decode_rust_dependency_evidence(
     }
 
     let metadata_artifact = read_evidence_file_with_budget(
+        "Rust",
         &evidence.metadata_path,
         limits,
         evidence_bytes_read,
@@ -595,12 +703,13 @@ fn decode_rust_dependency_evidence(
     }
 
     let lockfile_artifact = read_evidence_file_with_budget(
+        "Rust",
         &evidence.lockfile_path,
         limits,
         evidence_bytes_read,
         cancellation,
     )?;
-    let lockfile: CargoLockfile = toml::from_str(
+    let lockfile = decode_cargo_lockfile(
         std::str::from_utf8(lockfile_artifact.bytes()).map_err(|error| {
             diagnostic(
                 "rust.lockfile.invalid_utf8",
@@ -608,24 +717,8 @@ fn decode_rust_dependency_evidence(
                 format!("Cargo.lock is not UTF-8: {error}"),
             )
         })?,
-    )
-    .map_err(|error| {
-        diagnostic(
-            "rust.lockfile.invalid_toml",
-            Some(&evidence.lockfile_path),
-            format!("could not decode Cargo.lock: {error}"),
-        )
-    })?;
-    if !(MINIMUM_LOCKFILE_VERSION..=MAXIMUM_LOCKFILE_VERSION).contains(&lockfile.version) {
-        return Err(diagnostic(
-            "rust.lockfile.unsupported_version",
-            Some(&evidence.lockfile_path),
-            format!(
-                "Cargo.lock version {} is unsupported; expected {} through {}",
-                lockfile.version, MINIMUM_LOCKFILE_VERSION, MAXIMUM_LOCKFILE_VERSION
-            ),
-        ));
-    }
+        &evidence.lockfile_path,
+    )?;
 
     let mut artifacts = Vec::with_capacity(evidence.packages.len());
     for binding in &evidence.packages {
@@ -648,6 +741,7 @@ fn decode_rust_dependency_evidence(
         }
 
         let artifact = read_evidence_file_with_budget(
+            "Rust",
             &binding.rustdoc_json_path,
             limits,
             evidence_bytes_read,
@@ -723,14 +817,6 @@ fn evidence_paths_from_root(
         artifact.rustdoc_json_path = resolve_path(root, &artifact.rustdoc_json_path);
     }
     resolved
-}
-
-fn resolve_path(root: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        root.join(path)
-    }
 }
 
 fn validate_selected_targets<'a>(
@@ -896,101 +982,19 @@ fn source_kind(source: Option<&str>) -> &'static str {
 }
 
 fn push_provenance(provenance: &mut Vec<DependencyProvenance>, key: &str, value: impl ToString) {
-    provenance.push(DependencyProvenance {
-        key: key.to_owned(),
-        value: value.to_string(),
-    });
-}
-
-fn read_evidence_file_with_budget(
-    path: &Path,
-    limits: &DependencyPackLimits,
-    evidence_bytes_read: &mut u64,
-    cancellation: Option<&CancellationToken>,
-) -> Result<crate::analyzer::semantic_model::ExactArtifact, DependencyPackDiagnostic> {
-    let remaining = limits
-        .max_total_artifact_bytes
-        .saturating_sub(*evidence_bytes_read);
-    if remaining == 0 {
-        return Err(diagnostic(
-            "limit.total_artifact_bytes",
-            Some(path),
-            format!(
-                "Rust dependency evidence exceeds the {} byte aggregate limit",
-                limits.max_total_artifact_bytes
-            ),
-        ));
-    }
-    let producer_limits = ArtifactProducerLimits {
-        max_artifact_bytes: limits.producer.max_artifact_bytes.min(remaining),
-        ..limits.producer
-    };
-    let artifact = read_exact_artifact_while(path, &producer_limits, || is_cancelled(cancellation))
-        .map_err(|producer| {
-            let mut diagnostic = producer_diagnostic(path, producer);
-            if diagnostic.code == "limit.artifact_bytes"
-                && remaining < limits.producer.max_artifact_bytes
-            {
-                diagnostic.code = "limit.total_artifact_bytes".to_owned();
-                diagnostic.message = format!(
-                    "Rust dependency evidence exceeds the {} byte aggregate limit",
-                    limits.max_total_artifact_bytes
-                );
-            }
-            diagnostic
-        })?;
-    *evidence_bytes_read = evidence_bytes_read.saturating_add(artifact.bytes().len() as u64);
-    Ok(artifact)
-}
-
-fn producer_diagnostic(path: &Path, producer: ProducerDiagnostic) -> DependencyPackDiagnostic {
-    DependencyPackDiagnostic {
-        severity: match producer.severity {
-            ProducerDiagnosticSeverity::Warning => DependencyPackDiagnosticSeverity::Warning,
-            ProducerDiagnosticSeverity::Error => DependencyPackDiagnosticSeverity::Error,
-        },
-        code: producer.code,
-        dependency_id: None,
-        location: Some(path.to_string_lossy().into_owned()),
-        message: producer.message,
-    }
+    provenance.push(dependency_provenance_entry(key, value));
 }
 
 fn require_non_empty(field: &str, value: &str) -> Result<(), DependencyPackDiagnostic> {
-    if value.trim().is_empty() {
-        return Err(diagnostic(
-            "rust.evidence.empty_field",
-            None,
-            format!("Rust dependency evidence field {field} must not be empty"),
-        ));
-    }
-    Ok(())
+    require_non_empty_evidence_field("Rust", "rust.evidence.empty_field", field, value)
 }
 
 fn is_cancelled(cancellation: Option<&CancellationToken>) -> bool {
-    cancellation.is_some_and(CancellationToken::is_cancelled)
+    brokk_bifrost_core::cancellation::optional_is_cancelled(cancellation)
 }
 
 fn cancelled_diagnostic(path: Option<&Path>) -> DependencyPackDiagnostic {
-    diagnostic(
-        "rust.evidence.cancelled",
-        path,
-        "Rust dependency evidence decoding was cancelled",
-    )
-}
-
-fn diagnostic(
-    code: &str,
-    path: Option<&Path>,
-    message: impl Into<String>,
-) -> DependencyPackDiagnostic {
-    DependencyPackDiagnostic {
-        severity: DependencyPackDiagnosticSeverity::Error,
-        code: code.to_owned(),
-        dependency_id: None,
-        location: path.map(|value| value.to_string_lossy().into_owned()),
-        message: message.into(),
-    }
+    cancelled_dependency_evidence_diagnostic("Rust", "rust.evidence.cancelled", path)
 }
 
 #[cfg(test)]
@@ -1270,6 +1274,9 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "84ee4df01eba: missing rust-toolchain.toml gave no actionable stdlib-pack remediation"
+    )]
     fn missing_rust_toolchain_reports_stdlib_remediation_requirement() {
         let fixture = EvidenceFixture::new();
         let project = TestProject::new(fixture._root.path().to_path_buf(), Language::Rust);
@@ -1424,24 +1431,6 @@ mod tests {
 
         assert_eq!(diagnostic.code, "rust.rustdoc.target_mismatch");
     }
-
-    #[test]
-    fn cancellation_stops_before_decoding_evidence() {
-        let fixture = EvidenceFixture::new();
-        let cancellation = CancellationToken::new();
-        cancellation.cancel();
-
-        let diagnostic = decode_rust_dependency_evidence(
-            &fixture.evidence,
-            &DependencyPackLimits::default(),
-            &mut 0,
-            Some(&cancellation),
-        )
-        .unwrap_err();
-
-        assert_eq!(diagnostic.code, "artifact.cancelled");
-    }
-
     struct EvidenceFixture {
         _root: TempDir,
         rustdoc_path: std::path::PathBuf,

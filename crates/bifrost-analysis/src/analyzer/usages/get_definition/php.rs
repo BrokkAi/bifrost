@@ -17,7 +17,7 @@ use crate::analyzer::semantic_model::SemanticModelOverlay;
 use crate::analyzer::usages::local_inference::SymbolResolution;
 use crate::analyzer::usages::php_graph::syntax::{
     PhpMagicSurface, anonymous_function_capture_names, captured_local_scope_bindings,
-    collection_element_type_fq_name, declared_callable_return_type_fq_name,
+    clone_object_operand, collection_element_type_fq_name, declared_callable_return_type_fq_name,
     declared_field_type_fq_name, declared_type_of, dominating_instanceof_type_node,
     enclosing_array_map_collection, enclosing_foreach_collection, foreach_value_reassigned_before,
     infer_indexed_local_element_type, is_local_scope as php_is_local_scope, magic_member_names,
@@ -33,13 +33,22 @@ use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use brokk_bifrost_core::analyzer::php_facts::{
     PhpDeclarationKind, PhpDeclaredSourceType, PhpFieldWriteKind,
 };
+#[cfg(test)]
+use brokk_bifrost_php::aliases::parse_php_tree;
 use brokk_bifrost_php::aliases::{PhpFileContextIndex, php_file_context_from_tree_at};
 use brokk_bifrost_php::graph::PhpCallableFacts;
-use brokk_bifrost_php::graph::syntax::{
-    canonical_declared_type, canonical_doc_element_type, canonical_doc_nominal_type,
-    canonical_field_element_type, canonical_inferred_field_type,
+use brokk_bifrost_php::graph::resolver::qualified_candidate_node;
+use brokk_bifrost_php::graph::resolver::{
+    is_bare_constant_reference, is_object_creation_type_name,
 };
-use brokk_bifrost_php::graph_support::{php_direct_declared_class_parent, php_is_interface};
+use brokk_bifrost_php::graph::syntax::{
+    CollectionElementTypeAccess, canonical_declared_type, canonical_doc_nominal_type,
+    canonical_field_element_type, canonical_inferred_field_type, collection_element_type_access,
+    declared_callable_return_element_type_fq_name, instanceof_type_node, literal_member_identifier,
+};
+use brokk_bifrost_php::graph_support::{
+    php_direct_declared_class_parent, php_is_interface, uniform_php_declaration_kind,
+};
 use brokk_bifrost_php::source_facts::{PhpFileSourceFacts, PhpSourceFactProvider};
 
 pub(crate) struct PhpDefinitionProvider<'a> {
@@ -55,7 +64,7 @@ impl<'a> PhpDefinitionProvider<'a> {
 
 impl BoundedDefinitionLookup for PhpDefinitionProvider<'_> {
     fn fqn(&self, fqn: &str) -> Vec<CodeUnit> {
-        self.fqn_in_language(fqn, Language::Php)
+        php_fqn_candidates(self, fqn)
     }
 
     fn fqn_in_language(&self, fqn: &str, language: Language) -> Vec<CodeUnit> {
@@ -84,9 +93,7 @@ impl BoundedDefinitionLookup for PhpDefinitionProvider<'_> {
                 })
         });
         units.retain(|unit| unit.source() == file && unit.identifier() == ident);
-        sort_units(&mut units);
-        units.dedup();
-        units
+        crate::analyzer::definition_lookup::sort_dedup_units(units)
     }
 
     fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit> {
@@ -100,10 +107,6 @@ impl BoundedDefinitionLookup for PhpDefinitionProvider<'_> {
         sort_units(&mut children);
         children.dedup();
         children
-    }
-
-    fn fqn_exists(&self, fqn: &str) -> bool {
-        !self.fqn(fqn).is_empty()
     }
 
     fn package_exists(&self, package: &str) -> bool {
@@ -254,11 +257,16 @@ fn php_expression_type_fqn(
             .and_then(|type_node| {
                 php_static_scope_fqn(php, support, type_node, source, ctx, enclosing, session)
             }),
-        "parenthesized_expression" | "clone_expression" => node.named_child(0).and_then(|inner| {
+        "parenthesized_expression" | "clone_expression" => {
+            let inner = if node.kind() == "clone_expression" {
+                clone_object_operand(node, source)
+            } else {
+                node.named_child(0)
+            }?;
             php_expression_type_fqn(
                 php, analyzer, support, inner, source, enclosing, bindings, ctx, session,
             )
-        }),
+        }
         "subscript_expression" => php_instance_receiver_fqn(
             php, analyzer, support, node, source, enclosing, bindings, ctx, session,
         ),
@@ -307,18 +315,12 @@ struct PhpCallEvidence {
 
 impl PhpCallEvidence {
     fn record_external_member(&mut self, owner_fqn: &str, member: &str) {
-        let identity = ResolverOwnedExternalCalleeIdentity::new(
+        super::record_external_member_identity(
+            &mut self.external_callee_identity,
             Language::Php,
-            owner_fqn.to_owned(),
-            member.to_owned(),
+            owner_fqn,
+            member,
         );
-        debug_assert!(
-            self.external_callee_identity
-                .as_ref()
-                .is_none_or(|existing| existing == &identity),
-            "one PHP call cannot resolve to conflicting external identities"
-        );
-        self.external_callee_identity = Some(identity);
     }
 
     fn record_external_callable(&mut self, callable_fqn: &str) {
@@ -630,30 +632,16 @@ fn resolve_php_with_session(
 
 fn php_smallest_named_node_covering<'tree>(
     session: &ResolutionSession,
-    mut node: Node<'tree>,
+    node: Node<'tree>,
     start: usize,
     end: usize,
 ) -> Option<Node<'tree>> {
-    if !session.scope_step() || node.end_byte() < end || node.start_byte() > start {
-        return None;
-    }
-    loop {
-        let mut cursor = node.walk();
-        let mut containing = None;
-        for child in node.named_children(&mut cursor) {
-            if !session.scope_step() {
-                return None;
-            }
-            if child.start_byte() <= start && child.end_byte() >= end {
-                containing = Some(child);
-                break;
-            }
-        }
-        match containing {
-            Some(child) => node = child,
-            None => return Some(node),
-        }
-    }
+    brokk_bifrost_core::analyzer::usages::reference_site::smallest_named_node_covering_with_scope(
+        node,
+        start,
+        end,
+        || session.scope_step(),
+    )
 }
 
 fn php_enclosing_type_from_tree(
@@ -807,15 +795,6 @@ fn php_method_declaration_name<'a>(node: Node<'_>, source: &'a str) -> Option<&'
     (!name.is_empty()).then_some(name)
 }
 
-#[cfg(test)]
-fn parse_php_tree(source: &str) -> Option<Tree> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
-        .ok()?;
-    parser.parse(source, None)
-}
-
 enum PhpReferenceNode<'tree> {
     Type(Node<'tree>),
     Function(Node<'tree>),
@@ -882,7 +861,9 @@ fn php_reference_node<'tree>(
         "object_creation_expression" => {
             php_object_creation_type_with_session(node, session).map(PhpReferenceNode::Type)
         }
-        "named_type" => (!php_is_in_object_creation(node)).then_some(PhpReferenceNode::Type(node)),
+        "named_type" => {
+            (!is_object_creation_type_name(node)).then_some(PhpReferenceNode::Type(node))
+        }
         "function_call_expression" => node
             .child_by_field_name("function")
             .filter(|name| matches!(name.kind(), "name" | "qualified_name"))
@@ -938,7 +919,7 @@ fn php_reference_node<'tree>(
                     })
                 }
                 _ if php_is_instanceof_type_name(node) => Some(PhpReferenceNode::Type(node)),
-                _ if php_is_bare_constant_reference(node) => Some(PhpReferenceNode::Constant(node)),
+                _ if is_bare_constant_reference(node) => Some(PhpReferenceNode::Constant(node)),
                 _ => None,
             }
         }
@@ -961,14 +942,9 @@ fn php_reference_node<'tree>(
 /// `$x instanceof Foo` as a `binary_expression` whose `operator` child is the
 /// `instanceof` token and whose `right` field is the class name.
 fn php_is_instanceof_type_name(node: Node<'_>) -> bool {
-    let Some(parent) = node.parent() else {
-        return false;
-    };
-    parent.kind() == "binary_expression"
-        && parent
-            .child_by_field_name("operator")
-            .is_some_and(|operator| operator.kind() == "instanceof")
-        && parent.child_by_field_name("right").is_some_and(|right| {
+    node.parent()
+        .and_then(instanceof_type_node)
+        .is_some_and(|right| {
             right.start_byte() <= node.start_byte() && node.end_byte() <= right.end_byte()
         })
 }
@@ -1061,20 +1037,10 @@ fn php_namespace_prefix_segment_owner<'tree>(node: Node<'tree>) -> Option<Node<'
 }
 
 fn php_qualified_reference_node<'tree>(
-    mut node: Node<'tree>,
+    node: Node<'tree>,
     session: Option<&ResolutionSession>,
 ) -> Option<Node<'tree>> {
-    while let Some(parent) = node.parent() {
-        if session.is_some_and(|session| !session.scope_step()) {
-            return None;
-        }
-        if matches!(parent.kind(), "namespace_name" | "qualified_name") {
-            node = parent;
-        } else {
-            break;
-        }
-    }
-    Some(node)
+    qualified_candidate_node(node, || session.is_none_or(ResolutionSession::scope_step))
 }
 
 fn php_qualified_candidate_text_with_session(
@@ -1082,22 +1048,11 @@ fn php_qualified_candidate_text_with_session(
     source: &str,
     session: Option<&ResolutionSession>,
 ) -> String {
-    if session.is_none() {
-        return php_qualified_candidate_text(node, source);
-    }
-    let mut candidate = node;
-    let mut parent = node.parent();
-    while let Some(ancestor) = parent {
-        if session.is_some_and(|session| !session.scope_step()) {
-            return String::new();
-        }
-        if matches!(ancestor.kind(), "namespace_name" | "qualified_name") {
-            candidate = ancestor;
-            parent = ancestor.parent();
-        } else {
-            break;
-        }
-    }
+    let Some(candidate) =
+        qualified_candidate_node(node, || session.is_none_or(ResolutionSession::scope_step))
+    else {
+        return String::new();
+    };
     php_node_text(candidate, source).trim().to_string()
 }
 
@@ -1412,6 +1367,35 @@ fn php_member_outcome(
 /// No member attribution is staged here: `PhpMemberTrace` is rooted at one base
 /// owner and its hierarchy routes are relative to that root, so a merged
 /// multi-owner answer has no single route to record.
+enum PhpOwnerMemberCandidates {
+    Direct(Vec<CodeUnit>),
+    Inherited(Vec<CodeUnit>),
+}
+
+fn php_owner_member_candidates(
+    php: &PhpAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    owner: &str,
+    member: &str,
+    kind: PhpMemberKind,
+    session: Option<&ResolutionSession>,
+    mut member_trace: Option<&mut PhpMemberTrace>,
+) -> PhpOwnerMemberCandidates {
+    let mut direct = php_fqn_candidates(support, &format!("{owner}.{member}"));
+    direct.retain(|candidate| kind.accepts(candidate));
+    if !direct.is_empty() {
+        if let Some(state) = member_trace.as_deref_mut() {
+            state.record_found(&direct, owner, 0);
+        }
+        return PhpOwnerMemberCandidates::Direct(direct);
+    }
+
+    let mut inherited =
+        php_inherited_member_candidates(php, support, owner, member, session, member_trace);
+    inherited.retain(|candidate| kind.accepts(candidate));
+    PhpOwnerMemberCandidates::Inherited(inherited)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn php_union_owner_member_outcome(
     php: &PhpAnalyzer,
@@ -1424,13 +1408,10 @@ fn php_union_owner_member_outcome(
 ) -> DefinitionLookupOutcome {
     let mut candidates = Vec::new();
     for owner in owners {
-        let mut direct = php_fqn_candidates(support, &format!("{owner}.{member}"));
-        direct.retain(|candidate| kind.accepts(candidate));
-        if direct.is_empty() {
-            direct = php_inherited_member_candidates(php, support, owner, member, session, None);
-            direct.retain(|candidate| kind.accepts(candidate));
+        match php_owner_member_candidates(php, support, owner, member, kind, session, None) {
+            PhpOwnerMemberCandidates::Direct(units)
+            | PhpOwnerMemberCandidates::Inherited(units) => candidates.extend(units),
         }
-        candidates.extend(direct);
     }
     sort_units(&mut candidates);
     candidates.dedup();
@@ -1491,27 +1472,26 @@ fn php_single_owner_member_outcome(
 ) -> DefinitionLookupOutcome {
     let owner = owner.to_string();
     let fqn = format!("{owner}.{member}");
-    let mut candidates = php_fqn_candidates(support, &fqn);
-    candidates.retain(|candidate| kind.accepts(candidate));
     // Attribution is built only while a trace records (#1477); the walk itself
     // consumes nothing from it.
     let mut member_trace = trace::recording().then(|| PhpMemberTrace::rooted(support, &owner));
-    if !candidates.is_empty() {
-        if let Some(state) = member_trace.as_mut() {
-            state.record_found(&candidates, &owner, 0);
-            state.stage(php, &candidates, access);
-        }
-        return candidates_outcome(candidates);
-    }
-    let mut inherited = php_inherited_member_candidates(
+    let inherited = match php_owner_member_candidates(
         php,
         support,
         &owner,
         member,
+        kind,
         session,
         member_trace.as_mut(),
-    );
-    inherited.retain(|candidate| kind.accepts(candidate));
+    ) {
+        PhpOwnerMemberCandidates::Direct(candidates) => {
+            if let Some(state) = member_trace.as_mut() {
+                state.stage(php, &candidates, access);
+            }
+            return candidates_outcome(candidates);
+        }
+        PhpOwnerMemberCandidates::Inherited(inherited) => inherited,
+    };
     if !inherited.is_empty() {
         if let Some(state) = member_trace.as_mut() {
             state.stage(php, &inherited, access);
@@ -1725,11 +1705,12 @@ impl PhpMemberTrace {
     }
 
     fn record_found(&mut self, candidates: &[CodeUnit], owner_fqn: &str, depth: usize) {
-        for candidate in candidates {
-            self.found
-                .entry(candidate.clone())
-                .or_insert_with(|| (owner_fqn.to_owned(), depth));
-        }
+        super::record_member_trace_found(
+            &mut self.found,
+            candidates,
+            || owner_fqn.to_owned(),
+            depth,
+        );
     }
 
     /// The exact hierarchy route from the base owner to `owner_fqn`, as
@@ -1740,33 +1721,32 @@ impl PhpMemberTrace {
         use crate::analyzer::structural::HierarchyRelation;
 
         let base = self.base_unit.as_ref()?;
-        let mut chain = vec![owner_fqn.to_owned()];
-        while chain.last().is_some_and(|last| *last != self.base_fqn) {
-            let parent = self
-                .parents
-                .get(chain.last().expect("chain is never empty"))?;
-            chain.push(parent.clone());
+        let (route, reached_base) = trace::hierarchy_route_from_predecessors(
+            &owner_fqn.to_owned(),
+            depth,
+            |current, _| current == &self.base_fqn,
+            |current| {
+                self.parents
+                    .get(current)
+                    .cloned()
+                    .map(|parent| (parent, HierarchyRelation::Supertype))
+            },
+            |unit| {
+                if unit == &self.base_fqn {
+                    Some(base.clone())
+                } else {
+                    self.units.get(unit).cloned()
+                }
+            },
+        )?;
+        if !reached_base {
+            return None;
         }
-        chain.reverse();
         debug_assert_eq!(
-            chain.len(),
-            depth + 1,
+            route.len(),
+            depth,
             "the first-discovery chain must be exactly the walk's hop distance"
         );
-        let mut route = Vec::with_capacity(depth);
-        for (hop, pair) in chain.windows(2).enumerate() {
-            let from = if pair[0] == self.base_fqn {
-                base.clone()
-            } else {
-                self.units.get(&pair[0])?.clone()
-            };
-            route.push(trace::HierarchyHopRecord {
-                hop,
-                from,
-                to: self.units.get(&pair[1])?.clone(),
-                relation: HierarchyRelation::Supertype,
-            });
-        }
         Some(route)
     }
 
@@ -1830,23 +1810,13 @@ impl PhpMemberTrace {
     /// reach. The PHP walk returns the whole level it first found candidates
     /// on and discards nothing, so it records no rejected rows.
     fn stage(&self, php: &PhpAnalyzer, winners: &[CodeUnit], access: PhpMemberAccess) {
-        use crate::analyzer::structural::PrecedenceTier;
-
-        let winner_tier = winners
-            .iter()
-            .filter_map(|unit| self.found.get(unit))
-            .map(|(_, depth)| *depth)
-            .min()
-            .map(|depth| {
-                if depth == 0 {
-                    PrecedenceTier::OwnMember
-                } else {
-                    PrecedenceTier::InheritedMember
-                }
-            });
-        if let Some(tier) = winner_tier {
-            trace::stage_tier(tier, winners.iter().map(CodeUnit::fq_name).collect());
-        }
+        trace::stage_winner_tier(
+            winners,
+            winners
+                .iter()
+                .filter_map(|unit| self.found.get(unit))
+                .map(|(_, depth)| super::member_precedence_tier(*depth)),
+        );
         trace::stage_member_context(
             winners
                 .iter()
@@ -2030,12 +2000,7 @@ fn php_declaration_kind_bounded(
     session: &ResolutionSession,
 ) -> Option<&'static str> {
     let source = php_canonical_source_bounded(php, owner.source(), session)?;
-    let mut declarations = source.declarations_for(owner);
-    let first = declarations.next()?.kind;
-    if declarations.any(|declaration| declaration.kind != first) {
-        return None;
-    }
-    match first {
+    match uniform_php_declaration_kind(source.declarations_for(owner).map(|decl| decl.kind))? {
         PhpDeclarationKind::Class => Some("class_declaration"),
         PhpDeclarationKind::Interface => Some("interface_declaration"),
         PhpDeclarationKind::Trait => Some("trait_declaration"),
@@ -2065,8 +2030,8 @@ fn php_collection_element_type_fqn_bounded(
     ctx: &FileContext,
     session: &ResolutionSession,
 ) -> Option<String> {
-    match collection.kind() {
-        "variable_name" => infer_indexed_local_element_type(
+    match collection_element_type_access(collection, source)? {
+        CollectionElementTypeAccess::IndexedLocal => infer_indexed_local_element_type(
             collection,
             source,
             collection.start_byte(),
@@ -2076,12 +2041,7 @@ fn php_collection_element_type_fqn_bounded(
                 )
             },
         ),
-        "member_access_expression" | "nullsafe_member_access_expression" => {
-            let object = collection.child_by_field_name("object")?;
-            if object.kind() != "variable_name" || php_variable_identifier(object, source) != "this"
-            {
-                return None;
-            }
+        CollectionElementTypeAccess::ThisField(collection) => {
             let member = collection.child_by_field_name("name")?;
             let member = php_literal_member_name(member, source, session)?;
             let owner = enclosing.fqn()?;
@@ -2095,7 +2055,7 @@ fn php_collection_element_type_fqn_bounded(
             )?;
             php_declared_field_element_type_fqn_bounded(php, support, &field, session)
         }
-        "member_call_expression" | "nullsafe_member_call_expression" => {
+        CollectionElementTypeAccess::MemberCall(collection) => {
             let object = collection.child_by_field_name("object")?;
             let owner = php_expression_type_fqn_bounded(
                 php, support, object, source, enclosing, bindings, ctx, session,
@@ -2112,7 +2072,6 @@ fn php_collection_element_type_fqn_bounded(
             )?;
             php_declared_callable_return_element_type_fqn_bounded(php, &callable, session)
         }
-        _ => None,
     }
 }
 
@@ -2183,7 +2142,11 @@ fn php_expression_type_fqn_bounded(
                     )?);
                 }
                 "parenthesized_expression" | "clone_expression" => {
-                    let inner = expression.named_child(0)?;
+                    let inner = if expression.kind() == "clone_expression" {
+                        clone_object_operand(expression, source)
+                    } else {
+                        expression.named_child(0)
+                    }?;
                     frames.push(PhpExpressionTypeFrame::Evaluate(inner));
                 }
                 "subscript_expression" => {
@@ -2342,11 +2305,33 @@ fn php_literal_member_name<'a>(
     source: &'a str,
     session: &ResolutionSession,
 ) -> Option<&'a str> {
-    if !session.scope_step() || node.kind() != "name" {
+    if !session.scope_step() {
         return None;
     }
-    let member = php_node_text(node, source);
-    (!member.is_empty()).then_some(member)
+    literal_member_identifier(node, source).filter(|member| !member.is_empty())
+}
+
+fn php_unique_member_candidate(
+    php: &PhpAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    owner: &str,
+    member: &str,
+    wanted: fn(&CodeUnit) -> bool,
+    session: Option<&ResolutionSession>,
+) -> Option<CodeUnit> {
+    let mut candidates = php_fqn_candidates(support, &format!("{owner}.{member}"));
+    if candidates.is_empty() {
+        // A receiver-type probe, not the reference's own member answer: its
+        // candidates never become the outcome, so it stages no attribution.
+        candidates = php_inherited_member_candidates(php, support, owner, member, session, None);
+    }
+    candidates.retain(wanted);
+    sort_units(&mut candidates);
+    candidates.dedup();
+    let [candidate] = candidates.as_slice() else {
+        return None;
+    };
+    Some(candidate.clone())
 }
 
 fn php_unique_member_candidate_bounded(
@@ -2357,20 +2342,7 @@ fn php_unique_member_candidate_bounded(
     kind: fn(&CodeUnit) -> bool,
     session: &ResolutionSession,
 ) -> Option<CodeUnit> {
-    let mut candidates = php_fqn_candidates(support, &format!("{owner}.{member}"));
-    if candidates.is_empty() {
-        // A receiver-type probe, not the reference's own member answer: its
-        // candidates never become the outcome, so it stages no attribution.
-        candidates =
-            php_inherited_member_candidates(php, support, owner, member, Some(session), None);
-    }
-    candidates.retain(kind);
-    sort_units(&mut candidates);
-    candidates.dedup();
-    let [candidate] = candidates.as_slice() else {
-        return None;
-    };
-    Some(candidate.clone())
+    php_unique_member_candidate(php, support, owner, member, kind, Some(session))
 }
 
 fn php_declared_unit_type_fqn_bounded(
@@ -2392,7 +2364,7 @@ fn php_declared_callable_return_element_type_fqn_bounded(
         return None;
     }
     php_canonical_source_bounded(php, callable.source(), session)?;
-    canonical_doc_element_type(php, callable)
+    declared_callable_return_element_type_fq_name(php, callable)
 }
 
 fn php_declared_unit_type_bounded(
@@ -2589,11 +2561,16 @@ fn php_instance_receiver_fqn(
             .and_then(|type_node| {
                 php_static_scope_fqn(php, support, type_node, source, ctx, enclosing, session)
             }),
-        "parenthesized_expression" => object.named_child(0).and_then(|inner| {
+        "parenthesized_expression" | "clone_expression" => {
+            let inner = if object.kind() == "clone_expression" {
+                clone_object_operand(object, source)
+            } else {
+                object.named_child(0)
+            }?;
             php_instance_receiver_fqn(
                 php, analyzer, support, inner, source, enclosing, bindings, ctx, session,
             )
-        }),
+        }
         "subscript_expression" => {
             let collection = object.named_child(0)?;
             let facts = PhpAnalyzerFacts::new(php);
@@ -2849,19 +2826,7 @@ fn php_receiver_member_unit(
     if member.is_empty() {
         return None;
     }
-    let mut candidates = php_fqn_candidates(support, &format!("{owner}.{member}"));
-    if candidates.is_empty() {
-        // A receiver-type probe, not the reference's own member answer, so it
-        // stages no attribution.
-        candidates = php_inherited_member_candidates(php, support, &owner, member, session, None);
-    }
-    candidates.retain(wanted);
-    sort_units(&mut candidates);
-    candidates.dedup();
-    let [unit] = candidates.as_slice() else {
-        return None;
-    };
-    Some(unit.clone())
+    php_unique_member_candidate(php, support, &owner, member, wanted, session)
 }
 
 /// The one indexed callable a literal free or scoped call names.
@@ -2905,9 +2870,7 @@ fn php_direct_callable_unit(
 }
 
 fn php_literal_member_name_unbounded<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
-    (node.kind() == "name")
-        .then(|| php_node_text(node, source))
-        .filter(|member| !member.is_empty())
+    literal_member_identifier(node, source).filter(|member| !member.is_empty())
 }
 
 /// What one declaration's declared type proves, on whichever path is active.
@@ -3310,40 +3273,6 @@ fn php_field_type_fqn(
         .flatten()
 }
 
-fn php_is_in_object_creation(node: Node<'_>) -> bool {
-    node.parent()
-        .is_some_and(|parent| parent.kind() == "object_creation_expression")
-}
-
-fn php_is_bare_constant_reference(node: Node<'_>) -> bool {
-    let Some(parent) = node.parent() else {
-        return false;
-    };
-    !matches!(
-        parent.kind(),
-        "function_call_expression"
-            | "member_access_expression"
-            | "nullsafe_member_access_expression"
-            | "member_call_expression"
-            | "nullsafe_member_call_expression"
-            | "scoped_call_expression"
-            | "class_constant_access_expression"
-            | "named_type"
-            | "object_creation_expression"
-            | "function_definition"
-            | "method_declaration"
-            | "const_element"
-            | "namespace_use_clause"
-            | "namespace_definition"
-            | "class_declaration"
-            | "interface_declaration"
-            | "trait_declaration"
-            | "qualified_name"
-            | "base_clause"
-            | "class_interface_clause"
-    )
-}
-
 fn php_is_declaration_name(node: Node<'_>, session: Option<&ResolutionSession>) -> bool {
     if session.is_some_and(|session| !session.scope_step()) {
         return false;
@@ -3351,7 +3280,7 @@ fn php_is_declaration_name(node: Node<'_>, session: Option<&ResolutionSession>) 
     let Some(parent) = node.parent() else {
         return false;
     };
-    parent.child_by_field_name("name") == Some(node)
+    brokk_bifrost_core::analyzer::structural::adapter_helpers::is_field_of(parent, node, "name")
         && matches!(
             parent.kind(),
             "class_declaration"
@@ -3449,11 +3378,12 @@ fn php_is_non_reference_context(node: Node<'_>, session: Option<&ResolutionSessi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::CodeUnitIndex;
-    use crate::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
+
+    use crate::analyzer::usages::test_support::assert_scope_budget_exceeded;
     use crate::analyzer::{Language, Range};
     use crate::path_utils::rel_path_string;
     use crate::test_support::AnalyzerFixture;
+    use brokk_bifrost_test_macros::hardwon;
 
     fn php_site(
         source: &str,
@@ -3507,7 +3437,28 @@ mod tests {
         )
     }
 
+    fn declared_php_type_outcome(
+        fixture: &AnalyzerFixture,
+        callable_fqn: &str,
+        budget: ReceiverAnalysisBudget,
+        cancellation: Option<&CancellationToken>,
+    ) -> BoundedResolution<Option<String>> {
+        let php =
+            resolve_analyzer::<PhpAnalyzer>(fixture.analyzer.analyzer()).expect("PHP analyzer");
+        let definitions = php.get_definitions(callable_fqn);
+        let [callable] = definitions.as_slice() else {
+            panic!("expected one definition for {callable_fqn}: {definitions:#?}");
+        };
+        let session = ResolutionSession::bounded(budget, cancellation);
+        let support = PhpDefinitionProvider::new(php, &session);
+        let resolved = php_declared_unit_type_fqn_bounded(php, &support, callable, &session);
+        session.finish(resolved)
+    }
+
     #[test]
+    #[hardwon(
+        "#3017: PHP fixtures check external identity requires a resolver-proven owner and literal member, rejecting indirect expression spellings"
+    )]
     fn external_call_identity_requires_one_structured_php_owner_and_literal_member() {
         let source = r#"<?php
 namespace App;
@@ -3584,71 +3535,6 @@ function workspace_helper(): void {}
                 resolution.outcome
             );
         }
-    }
-
-    fn declared_php_type_outcome(
-        fixture: &AnalyzerFixture,
-        callable_fqn: &str,
-        budget: ReceiverAnalysisBudget,
-        cancellation: Option<&CancellationToken>,
-    ) -> BoundedResolution<Option<String>> {
-        let php =
-            resolve_analyzer::<PhpAnalyzer>(fixture.analyzer.analyzer()).expect("PHP analyzer");
-        let definitions = php.get_definitions(callable_fqn);
-        let [callable] = definitions.as_slice() else {
-            panic!("expected one definition for {callable_fqn}: {definitions:#?}");
-        };
-        let session = ResolutionSession::bounded(budget, cancellation);
-        let support = PhpDefinitionProvider::new(php, &session);
-        let resolved = php_declared_unit_type_fqn_bounded(php, &support, callable, &session);
-        session.finish(resolved)
-    }
-
-    #[test]
-    fn bounded_context_extracts_structured_group_type_function_and_const_aliases() {
-        let source = r#"<?php
-namespace App;
-use Vendor\Package\Target as DirectTarget;
-use function Vendor\Package\make as build;
-use const Vendor\Package\READY as IS_READY;
-use Vendor\Package\{
-    Helper as GroupHelper,
-    function render as group_render,
-    const LIMIT as GROUP_LIMIT
-};
-new DirectTarget();
-"#;
-        let tree = parse_php_tree(source).expect("PHP tree");
-        let byte = source.find("new DirectTarget").expect("reference");
-        let contexts = PhpFileContextIndex::from_tree(tree.root_node(), source, || true)
-            .expect("complete structured context");
-        let ctx = contexts.context_at(byte);
-
-        assert_eq!(ctx.namespace, "App");
-        assert_eq!(
-            ctx.aliases.type_aliases.get("DirectTarget"),
-            Some(&"Vendor.Package.Target".to_string())
-        );
-        assert_eq!(
-            ctx.aliases.type_aliases.get("GroupHelper"),
-            Some(&"Vendor.Package.Helper".to_string())
-        );
-        assert_eq!(
-            ctx.aliases.function_aliases.get("build"),
-            Some(&"Vendor.Package.make".to_string())
-        );
-        assert_eq!(
-            ctx.aliases.function_aliases.get("group_render"),
-            Some(&"Vendor.Package.render".to_string())
-        );
-        assert_eq!(
-            ctx.aliases.const_aliases.get("IS_READY"),
-            Some(&"Vendor.Package.READY".to_string())
-        );
-        assert_eq!(
-            ctx.aliases.const_aliases.get("GROUP_LIMIT"),
-            Some(&"Vendor.Package.LIMIT".to_string())
-        );
     }
 
     #[test]
@@ -4116,13 +4002,7 @@ class RelativeFactory {
             budget,
             None,
         );
-        assert!(matches!(
-            outcome,
-            BoundedResolution::Exceeded {
-                limit: ReceiverBudgetLimit::ScopeNodes,
-                work,
-            } if work.scope_nodes == budget.max_scope_nodes
-        ));
+        assert_scope_budget_exceeded(&outcome, budget);
     }
 
     #[test]

@@ -25,8 +25,8 @@ use crate::graph::extractor::{
 use crate::graph::resolver::{
     CSharpBuiltinValueArguments, UnqualifiedMethodGroupResolution, argument_count,
     class_unit_for_fq_name, collection_target_element_type_node, extension_visibility_site_key,
-    first_type_child, invocation_member_candidates_for_owner, is_member_variable_declaration,
-    is_type_reference_node, nearest_member_candidates_for_owner, node_text,
+    for_local_variable_declarators, invocation_member_candidates_for_owner, is_type_reference_node,
+    nearest_member_candidates_for_owner, node_text, object_created_type,
     object_creation_collection_target, object_initializer_for_label,
     object_initializer_owner_type_node, reference_type_text, resolve_arity_free_type_fq_name_at,
     resolve_type_fq_name_at, resolve_unqualified_method_group_for_owner, same_node,
@@ -44,11 +44,12 @@ use crate::syntax::{
     csharp_nameof_type_candidates, csharp_relational_generic_call,
     csharp_relational_generic_call_for_argument, csharp_type_leftmost_identifier,
     csharp_type_reference_root, csharp_type_terminal_identifier,
-    csharp_unqualified_invocation_for_name,
+    csharp_unqualified_invocation_for_name, map_csharp_type_arguments,
 };
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
+use brokk_bifrost_core::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use brokk_bifrost_core::analyzer::usages::inverted_edges::{
-    ClassRangeIndex, FileEdgeScanInput, PerFileEdges, classify_reference_node, first_precise,
+    ClassRangeIndex, FileEdgeScanInput, PerFileEdges, first_precise,
 };
 use brokk_bifrost_core::analyzer::usages::local_inference::{
     LocalInferenceConfig, LocalInferenceEngine, SymbolResolution,
@@ -197,18 +198,12 @@ impl CsScan<'_> {
     }
 
     fn record(&mut self, callee: String, node: Node<'_>) {
-        self.edges.record_kind(
-            self.input,
-            callee,
-            classify_reference_node(node),
-            node.start_byte(),
-            node.end_byte(),
-        );
+        self.edges.record_reference(self.input, callee, node);
     }
 
     fn record_unproven(&mut self, name: &str, node: Node<'_>) {
         self.edges
-            .record_unproven_name(self.input, name, node.start_byte(), node.end_byte());
+            .record_unproven_name_at_node(self.input, name, node);
     }
 
     fn record_unproven_callee(&mut self, callee: String, node: Node<'_>) {
@@ -374,21 +369,25 @@ fn walk(
     ctx: &mut CsScan<'_>,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
-    let enters_scope = SCOPE_NODES.contains(&node.kind());
-    if enters_scope {
-        bindings.enter_scope();
-    }
-    seed_declaration(node, token, ctx, bindings);
-    record_reference(node, token, ctx, bindings);
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        walk(child, token, ctx, bindings);
-    }
-
-    if enters_scope {
-        bindings.exit_scope();
-    }
+    let mut state = (ctx, bindings);
+    walk_tree_iterative(
+        node,
+        &mut state,
+        |node, (ctx, bindings)| {
+            let enters_scope = SCOPE_NODES.contains(&node.kind());
+            if enters_scope {
+                bindings.enter_scope();
+            }
+            seed_declaration(node, token, ctx, bindings);
+            record_reference(node, token, ctx, bindings);
+            if enters_scope {
+                TreeWalkAction::DescendWithExit
+            } else {
+                TreeWalkAction::Descend
+            }
+        },
+        |(_, bindings)| bindings.exit_scope(),
+    );
 }
 
 fn record_reference(
@@ -872,20 +871,9 @@ fn seed_variable_declaration(
     ctx: &CsScan<'_>,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
-    if is_member_variable_declaration(node) {
-        return;
-    }
-    let Some(type_node) = node.child_by_field_name("type") else {
-        return;
-    };
-    let type_text = reference_type_text(type_node, ctx.source);
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.kind() != "variable_declarator" {
-            continue;
-        }
+    for_local_variable_declarators(node, ctx.source, |type_node, type_text, child| {
         let Some(name) = child.child_by_field_name("name") else {
-            continue;
+            return;
         };
         // `var x = new Foo()` infers from the initializer; other `var` is unknown.
         let resolved = if type_text == "var" {
@@ -899,10 +887,10 @@ fn seed_variable_declaration(
                 })
                 .or_else(|| var_initializer_type(child, token, ctx, bindings))
         } else {
-            ctx.resolve_type_fqn_at(token, &type_text, type_node)
+            ctx.resolve_type_fqn_at(token, type_text, type_node)
         };
         seed_typed(name, resolved, ctx, bindings);
-    }
+    });
 }
 
 fn seed_typed(
@@ -915,24 +903,10 @@ fn seed_typed(
     if binding_name.is_empty() {
         return;
     }
-    match resolved {
-        Some(fqn) => bindings.seed_symbol(binding_name.to_string(), fqn),
-        None => bindings.declare_shadow(binding_name.to_string()),
-    }
+    bindings.seed_or_shadow(binding_name.to_string(), resolved);
 }
 
 /// The type node of a `new Foo()` initializer reachable from a declarator.
-fn object_created_type(node: Node<'_>) -> Option<Node<'_>> {
-    if node.kind() == "object_creation_expression" {
-        return node
-            .child_by_field_name("type")
-            .or_else(|| first_type_child(node));
-    }
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .find_map(object_created_type)
-}
-
 fn var_initializer_type(
     declarator: Node<'_>,
     token: QueryToken<'_>,
@@ -943,29 +917,7 @@ fn var_initializer_type(
     expression_type_fqn(initializer, token, ctx, bindings)
 }
 
-fn variable_declarator_initializer(declarator: Node<'_>) -> Option<Node<'_>> {
-    declarator
-        .child_by_field_name("value")
-        .or_else(|| declarator.child_by_field_name("initializer"))
-        .or_else(|| {
-            let mut cursor = declarator.walk();
-            declarator
-                .named_children(&mut cursor)
-                .find(|child| child.kind() == "equals_value_clause")
-                .and_then(|clause| {
-                    clause
-                        .child_by_field_name("value")
-                        .or_else(|| clause.named_child(0))
-                })
-        })
-        .or_else(|| {
-            let name = declarator.child_by_field_name("name")?;
-            let mut cursor = declarator.walk();
-            declarator
-                .named_children(&mut cursor)
-                .find(|child| child.start_byte() > name.end_byte())
-        })
-}
+use crate::syntax::variable_declarator_initializer;
 
 fn expression_type_fqn(
     expression: Node<'_>,
@@ -1142,12 +1094,7 @@ fn resolved_type_arguments(
     token: QueryToken<'_>,
     ctx: &CsScan<'_>,
 ) -> Option<Vec<String>> {
-    let arguments = name.type_arguments?;
-    let mut cursor = arguments.walk();
-    arguments
-        .named_children(&mut cursor)
-        .map(|argument| {
-            ctx.resolve_type_fqn_at(token, &reference_type_text(argument, ctx.source), argument)
-        })
-        .collect()
+    map_csharp_type_arguments(name.type_arguments, |argument| {
+        ctx.resolve_type_fqn_at(token, &reference_type_text(argument, ctx.source), argument)
+    })
 }

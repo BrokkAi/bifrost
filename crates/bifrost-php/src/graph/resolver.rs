@@ -3,6 +3,7 @@ use crate::graph::PhpGraphSource;
 use crate::graph::syntax::static_member_parts;
 use crate::graph_support::PhpSource;
 use crate::graph_support::php_is_interface;
+use crate::structural::php_namespace_name_declares;
 use brokk_bifrost_core::analyzer::model::Range;
 pub use brokk_bifrost_core::analyzer::usages::common::node_text;
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
@@ -238,21 +239,62 @@ pub fn enclosing_owner_fq_name_at(
 }
 
 pub fn qualified_candidate_text(node: Node<'_>, source: &str) -> String {
-    let mut candidate = node;
-    let mut parent = node.parent();
-    while let Some(ancestor) = parent {
-        if matches!(ancestor.kind(), "namespace_name" | "qualified_name") {
-            candidate = ancestor;
-            parent = ancestor.parent();
+    let candidate =
+        qualified_candidate_node(node, || true).expect("unbounded PHP qualified-name traversal");
+    node_text(candidate, source).trim().to_string()
+}
+
+/// Select the outermost qualified PHP name while honoring the caller's work budget.
+pub fn qualified_candidate_node<'tree>(
+    mut node: Node<'tree>,
+    mut step: impl FnMut() -> bool,
+) -> Option<Node<'tree>> {
+    while let Some(parent) = node.parent() {
+        if !step() {
+            return None;
+        }
+        if matches!(parent.kind(), "namespace_name" | "qualified_name") {
+            node = parent;
         } else {
             break;
         }
     }
-    node_text(candidate, source).trim().to_string()
+    Some(node)
 }
 
 pub fn is_object_creation_type_name(node: Node<'_>) -> bool {
     semantic_parent(node).is_some_and(|parent| parent.kind() == "object_creation_expression")
+}
+
+/// Whether a PHP name is a bare constant reference rather than a name in
+/// another syntactic role.
+pub fn is_bare_constant_reference(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    !matches!(
+        parent.kind(),
+        "function_call_expression"
+            | "member_access_expression"
+            | "nullsafe_member_access_expression"
+            | "member_call_expression"
+            | "nullsafe_member_call_expression"
+            | "scoped_call_expression"
+            | "class_constant_access_expression"
+            | "named_type"
+            | "object_creation_expression"
+            | "function_definition"
+            | "method_declaration"
+            | "const_element"
+            | "namespace_use_clause"
+            | "namespace_definition"
+            | "class_declaration"
+            | "interface_declaration"
+            | "trait_declaration"
+            | "qualified_name"
+            | "base_clause"
+            | "class_interface_clause"
+    )
 }
 
 pub fn is_function_call_name(node: Node<'_>) -> bool {
@@ -296,9 +338,7 @@ pub fn is_declaration_name(node: Node<'_>) -> bool {
     {
         path = path.parent().expect("checked PHP name parent");
     }
-    path.parent().is_some_and(|parent| {
-        parent.kind() == "namespace_definition" && parent.child_by_field_name("name") == Some(path)
-    })
+    php_namespace_name_declares(path)
 }
 
 /// Whether a PHP identifier recovered below an ERROR node still has a precise

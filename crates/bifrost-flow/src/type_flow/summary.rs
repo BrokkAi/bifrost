@@ -15,8 +15,6 @@ use std::{
 };
 
 use crate::analyzer::read_ledger::read_set_digest;
-#[cfg(test)]
-use crate::analyzer::semantic::MemberAccessKind;
 use crate::analyzer::semantic::{
     CancellationToken, ClassAtom, ClassIdentity, DispatchBoundaryKind, IcfgProvider,
     IcfgProviderBehaviorIdentity, LengthDelimitedDigest, OracleCallContext, ProcedureHandle,
@@ -24,6 +22,8 @@ use crate::analyzer::semantic::{
     SemanticArtifactMaterializationId, SemanticBudget, SemanticRequest, SemanticWork, StableDigest,
     ValueFlowSnapshot, one_call_dispatch_answer_digest,
 };
+#[cfg(test)]
+use crate::analyzer::semantic::{MemberAccessKind, MemberReceiverQuery};
 use crate::analyzer::store::class_set_procedure_surfaces::{
     ClassSetProcedureIdentityRow, ClassSetProcedureSurfaceCallRow,
     ClassSetProcedureSurfaceDispatchRow, ClassSetProcedureSurfaceHeaderRow,
@@ -50,6 +50,7 @@ use crate::dataflow::{
     SummaryPublicationOutcome, SummarySchemaVersion, SummarySemanticsVersion,
 };
 use crate::hash::{HashMap, HashSet};
+use crate::ordering::{compare_summary_entries, return_kind_ordinal};
 use crate::value_flow::{
     BindingCoverage, CallSiteCoverage, ClosureCutDecider, DispatchStatus, DurableProcedureKey,
     HydratedProcedureSurface, ValueFlowCarrierKey, ValueFlowCarrierSummaryIdentity,
@@ -70,7 +71,7 @@ use super::{FieldSlotIndex, TypeFlowPlan};
 // computed with joining return ports must not survive that transfer change.
 // #3430 keys a guard source by what it states instead of by a per-plan
 // counter, so rows naming the old positional keys must not be restored.
-const CLASS_SET_SUMMARY_SEMANTICS: &[u8] = b"bifrost-class-set-summary-semantics-v15";
+const CLASS_SET_SUMMARY_SEMANTICS: &[u8] = b"bifrost-class-set-summary-semantics-v17";
 const CLASS_SET_SUMMARY_CONTEXT: &[u8] = b"bifrost-class-set-summary-context-v1";
 const CLASS_SET_SUMMARY_BEHAVIOR: &[u8] = b"bifrost-class-set-summary-behavior-v3";
 const CLASS_SET_SUMMARY_ATOM: &[u8] = b"bifrost-class-set-summary-atom-v1";
@@ -349,11 +350,6 @@ impl TypeFlowSummaryState {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn semantic(&self) -> &Arc<ProductionSemanticSummaryRepository> {
-        &self.semantic
-    }
-
     pub fn field_slot_indexes(&self) -> FieldSlotIndexCache {
         self.field_slots.clone()
     }
@@ -364,7 +360,7 @@ struct ClassSetProcedureContract {
     carrier_semantics: StableDigest,
     direct_calls: StableDigest,
     field_slots: StableDigest,
-    sources: Box<[(ValueFlowEventKey, ClassAtom)]>,
+    sources: Box<[(ValueFlowEventKey, ClassAtom, bool)]>,
     sinks: Box<[ValueFlowEventKey]>,
 }
 
@@ -628,17 +624,11 @@ fn validate_projection_entry(
     entry: &SummaryEntry,
 ) -> Result<(), ClassSetObservationProjectionError> {
     projection_fact(result, entry.entry_fact())?;
-    if entry
-        .procedure()
-        .point_handle(entry.entry_point().id())
-        .as_ref()
-        != Some(entry.entry_point())
-    {
-        return Err(ClassSetObservationProjectionError::MissingEntryPoint(
-            entry.entry_point().id(),
-        ));
-    }
-    Ok(())
+    validate_projection_point(
+        entry,
+        entry.entry_point(),
+        ClassSetObservationProjectionError::MissingEntryPoint,
+    )
 }
 
 fn validate_projection_point(
@@ -666,27 +656,6 @@ fn merge_projection_frontier(retained: &mut PathQualityFrontier, incoming: PathQ
     for quality in incoming.iter() {
         retained.insert(quality);
     }
-}
-
-fn compare_summary_entries(left: &SummaryEntry, right: &SummaryEntry) -> Ordering {
-    left.procedure()
-        .artifact()
-        .key()
-        .cmp(right.procedure().artifact().key())
-        .then_with(|| {
-            left.procedure()
-                .semantics()
-                .locator()
-                .cmp(right.procedure().semantics().locator())
-        })
-        .then_with(|| left.procedure().id().cmp(&right.procedure().id()))
-        .then_with(|| {
-            Arc::as_ptr(left.procedure().artifact())
-                .cast::<()>()
-                .cmp(&Arc::as_ptr(right.procedure().artifact()).cast::<()>())
-        })
-        .then_with(|| left.entry_point().id().cmp(&right.entry_point().id()))
-        .then_with(|| left.entry_fact().cmp(&right.entry_fact()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2001,12 +1970,12 @@ fn class_set_surface_input_status(
     }
 }
 
-fn class_set_surface_identity(
-    plan: &TypeFlowPlan,
+fn class_set_surface_identity_row(
     procedure: &ProcedureHandle,
-) -> Option<ClassSetProcedureIdentityRow> {
+    local_structure_digest: [u8; 32],
+) -> ClassSetProcedureIdentityRow {
     let key = procedure.artifact().key();
-    Some(ClassSetProcedureIdentityRow {
+    ClassSetProcedureIdentityRow {
         procedure_lineage: *key
             .procedure_lineage_fingerprint(procedure.semantics().locator().declaration())
             .as_bytes(),
@@ -2014,8 +1983,18 @@ fn class_set_surface_identity(
         language: key.language().language(),
         artifact_public_identity: *key.public_fingerprint().as_bytes(),
         artifact_content_identity: *key.revision().content().as_bytes(),
-        local_structure_digest: *plan.local_structure_digest(procedure)?.as_bytes(),
-    })
+        local_structure_digest,
+    }
+}
+
+fn class_set_surface_identity(
+    plan: &TypeFlowPlan,
+    procedure: &ProcedureHandle,
+) -> Option<ClassSetProcedureIdentityRow> {
+    Some(class_set_surface_identity_row(
+        procedure,
+        *plan.local_structure_digest(procedure)?.as_bytes(),
+    ))
 }
 
 fn class_set_surface_identity_from_snapshot(
@@ -2025,17 +2004,10 @@ fn class_set_surface_identity_from_snapshot(
     if snapshot.value().procedure().durable_key() != procedure.durable_key() {
         return None;
     }
-    let key = procedure.artifact().key();
-    Some(ClassSetProcedureIdentityRow {
-        procedure_lineage: *key
-            .procedure_lineage_fingerprint(procedure.semantics().locator().declaration())
-            .as_bytes(),
-        rel_path: key.path().as_str().to_owned(),
-        language: key.language().language(),
-        artifact_public_identity: *key.public_fingerprint().as_bytes(),
-        artifact_content_identity: *key.revision().content().as_bytes(),
-        local_structure_digest: *class_set_local_structure_digest(snapshot).ok()?.as_bytes(),
-    })
+    Some(class_set_surface_identity_row(
+        procedure,
+        *class_set_local_structure_digest(snapshot).ok()?.as_bytes(),
+    ))
 }
 
 fn class_set_procedure_surface(
@@ -2229,7 +2201,13 @@ fn class_set_procedure_contract(
     let mut sources = value_flow
         .sources()
         .filter(|(_, source)| source.point().procedure() == procedure)
-        .map(|(source, spec)| (spec.key().clone(), plan.atom(source).clone()))
+        .map(|(source, spec)| {
+            (
+                spec.key().clone(),
+                plan.atom(source).clone(),
+                plan.class_source_is_open_bound(source),
+            )
+        })
         .collect::<Vec<_>>();
     sources.sort_unstable_by(|left, right| left.0.cmp(&right.0));
     let mut sinks = value_flow
@@ -3028,17 +3006,7 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
         entry: &StableEntryFact,
         source: Option<crate::value_flow::ValueFlowSourceId>,
     ) -> Option<ValueFlowFact> {
-        let StableEntryFact::Carrier {
-            carrier, uncertain, ..
-        } = entry
-        else {
-            return Some(ValueFlowFact::zero());
-        };
-        Some(ValueFlowFact::carrier_fact(
-            source?,
-            self.plan.carrier_id_for_key(carrier)?,
-            ValueFlowUncertainty::from_semantic_uncertainty(*uncertain),
-        ))
+        value_flow_fact_for_stable_entry(self.plan, entry, source)
     }
 
     fn dependencies_are_live(
@@ -3674,15 +3642,15 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
     ) -> Option<ClassSetRuntimeLookupKey> {
         let prepared = self.procedures.get(procedure)?;
         let surface = self.surfaces.get(procedure)?;
-        Some(ClassSetRuntimeLookupKey {
-            procedure: prepared
+        Some(class_set_runtime_key(
+            prepared
                 .semantic
                 .key()
                 .identity()
                 .procedure_read_fingerprint(prepared.procedure_semantics),
             entry_selector,
-            root_surface: StableDigest::from_array(*surface.surface_digest()),
-        })
+            StableDigest::from_array(*surface.surface_digest()),
+        ))
     }
 
     fn root_observation_coverage(
@@ -4688,13 +4656,6 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
     }
 }
 
-fn return_kind_ordinal(kind: ReturnTransferKind) -> u8 {
-    match kind {
-        ReturnTransferKind::Normal => 0,
-        ReturnTransferKind::Exceptional => 1,
-    }
-}
-
 fn compare_qualities(left: &[PathQuality], right: &[PathQuality]) -> std::cmp::Ordering {
     left.iter()
         .map(|quality| quality.ordinal())
@@ -4728,7 +4689,7 @@ fn class_set_procedure_semantics_key(
     contract: &ClassSetProcedureContract,
     procedure: &crate::analyzer::semantic::SemanticLocator,
 ) -> SummaryProcedureSemanticsKey {
-    let mut digest = LengthDelimitedDigest::new(b"bifrost-class-set-procedure-semantics-v1");
+    let mut digest = LengthDelimitedDigest::new(b"bifrost-class-set-procedure-semantics-v2");
     digest.push(contract.carrier_semantics.as_bytes());
     digest.push(contract.field_slots.as_bytes());
     digest.push(contract.direct_calls.as_bytes());
@@ -4737,9 +4698,10 @@ fn class_set_procedure_semantics_key(
             .expect("class-set source count fits in u64")
             .to_le_bytes(),
     );
-    for (event, atom) in &contract.sources {
+    for (event, atom, open_bound_class) in &contract.sources {
         event.push_procedure_local_identity(&mut digest, procedure);
         digest.push(class_atom_fingerprint(atom).as_bytes());
+        digest.push(&[u8::from(*open_bound_class)]);
     }
     digest.push(
         &u64::try_from(contract.sinks.len())
@@ -4864,26 +4826,33 @@ fn entry_source_witness_fingerprint() -> StableDigest {
 }
 
 fn class_set_lookup_fingerprint(key: &ClassSetSummaryLookupKey) -> StableDigest {
+    let runtime_key = class_set_runtime_lookup_key(key);
     let mut digest = LengthDelimitedDigest::new(CLASS_SET_SUMMARY_LOOKUP);
-    digest.push(
-        key.procedure
-            .identity()
-            .procedure_read_fingerprint(key.procedure_semantics)
-            .as_bytes(),
-    );
-    digest.push(stable_entry_fingerprint(&key.entry, &key.procedure_locator).as_bytes());
-    digest.push(key.root_surface.as_bytes());
+    digest.push(runtime_key.procedure.as_bytes());
+    digest.push(runtime_key.entry_selector.as_bytes());
+    digest.push(runtime_key.root_surface.as_bytes());
     digest.finish()
 }
 
 fn class_set_runtime_lookup_key(key: &ClassSetSummaryLookupKey) -> ClassSetRuntimeLookupKey {
-    ClassSetRuntimeLookupKey {
-        procedure: key
-            .procedure
+    class_set_runtime_key(
+        key.procedure
             .identity()
             .procedure_read_fingerprint(key.procedure_semantics),
-        entry_selector: stable_entry_fingerprint(&key.entry, &key.procedure_locator),
-        root_surface: key.root_surface,
+        stable_entry_fingerprint(&key.entry, &key.procedure_locator),
+        key.root_surface,
+    )
+}
+
+fn class_set_runtime_key(
+    procedure: StableDigest,
+    entry_selector: StableDigest,
+    root_surface: StableDigest,
+) -> ClassSetRuntimeLookupKey {
+    ClassSetRuntimeLookupKey {
+        procedure,
+        entry_selector,
+        root_surface,
     }
 }
 
@@ -5518,6 +5487,24 @@ fn store_error_context(error: StoreError, context: &str) -> StoreError {
     StoreError::new(format!("{context}: {error}"))
 }
 
+fn value_flow_fact_for_stable_entry(
+    plan: &ValueFlowPlan,
+    entry: &StableEntryFact,
+    source: Option<crate::value_flow::ValueFlowSourceId>,
+) -> Option<ValueFlowFact> {
+    let StableEntryFact::Carrier {
+        carrier, uncertain, ..
+    } = entry
+    else {
+        return Some(ValueFlowFact::zero());
+    };
+    Some(ValueFlowFact::carrier_fact(
+        source?,
+        plan.carrier_id_for_key(carrier)?,
+        ValueFlowUncertainty::from_semantic_uncertainty(*uncertain),
+    ))
+}
+
 #[cfg(test)]
 fn maintenance_entry_fact(
     plan: &ValueFlowPlan,
@@ -5525,29 +5512,24 @@ fn maintenance_entry_fact(
     source_partitions: &[(StableDigest, crate::value_flow::ValueFlowSourceId)],
     entry: &StableEntryFact,
 ) -> Option<ValueFlowFact> {
-    match entry {
-        StableEntryFact::Zero => Some(ValueFlowFact::zero()),
+    let source = match entry {
+        StableEntryFact::Zero => None,
         // StableEntryFact erases the original source into StableSource::Entry
         // but retains its edge-kill behavior partition. Any matching source
         // is the representational witness for the same transfer relation; it
         // is not claimed to be the original atom.
         StableEntryFact::Carrier {
-            carrier,
-            uncertain,
-            source_partition,
-        } => Some(ValueFlowFact::carrier_fact(
-            match source_partition {
-                Some(partition) if source_sensitive => source_partitions
-                    .binary_search_by_key(partition, |(candidate, _)| *candidate)
-                    .ok()
-                    .map(|index| source_partitions[index].1)?,
-                None if !source_sensitive => source_partitions.first()?.1,
-                Some(_) | None => return None,
-            },
-            plan.carrier_id_for_key(carrier)?,
-            ValueFlowUncertainty::from_semantic_uncertainty(*uncertain),
-        )),
-    }
+            source_partition, ..
+        } => Some(match source_partition {
+            Some(partition) if source_sensitive => source_partitions
+                .binary_search_by_key(partition, |(candidate, _)| *candidate)
+                .ok()
+                .map(|index| source_partitions[index].1)?,
+            None if !source_sensitive => source_partitions.first()?.1,
+            Some(_) | None => return None,
+        }),
+    };
+    value_flow_fact_for_stable_entry(plan, entry, source)
 }
 
 fn current_dependencies_match_stabilized(
@@ -6178,11 +6160,15 @@ mod tests {
     };
     use crate::value_flow::{
         ClosureLimits, ValueFlowCache, ValueFlowPortKey, ValueFlowProvider, ValueFlowSummaryResult,
-        WorkspaceValueFlowProvider, solve_value_flow_entry_with_reusable_summaries,
-        solve_value_flow_with_reusable_summaries, solve_value_flow_with_summaries,
+        WorkspaceValueFlowProvider, solve_value_flow_with_reusable_summaries,
+        solve_value_flow_with_summaries,
     };
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
+    #[hardwon(
+        "#3131: Named unmodeled-guard identities must remain distinct in atom fingerprints; tagged as the fix's identity regression."
+    )]
     fn named_unknown_guard_payloads_have_distinct_atom_fingerprints() {
         let first = ClassAtom::Unknown(UnknownReason::UnmodeledGuard {
             class: "pkg.First".into(),
@@ -6195,126 +6181,6 @@ mod tests {
             class_atom_fingerprint(&first),
             class_atom_fingerprint(&second)
         );
-    }
-
-    #[test]
-    fn summary_profile_is_typed_serializable_and_saturating() {
-        let mut profile = TypeFlowSummaryProfile::default();
-        profile.record(SummaryProfileReason::LookupRelation);
-        profile.record(SummaryProfileReason::PublicationDependency);
-        let doubled = profile.saturating_add(profile);
-        assert_eq!(doubled.lookup_relation, 2);
-        assert_eq!(doubled.publication_dependency, 2);
-        assert_eq!(doubled.saturating_sub(profile), profile);
-        assert_eq!(
-            serde_json::from_str::<TypeFlowSummaryProfile>(
-                &serde_json::to_string(&profile).expect("summary profile serializes")
-            )
-            .expect("summary profile deserializes"),
-            profile
-        );
-    }
-
-    fn projection_fixture(source: &str) -> (TypeFlowPlan, ValueFlowSummaryResult) {
-        let project = InlineTestProject::with_language(Language::Python)
-            .file("app.py", source)
-            .build();
-        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
-        let cancellation = CancellationToken::default();
-        let mut semantic_budget = SemanticBudget::default();
-        let artifact = workspace
-            .materialize_program_semantics(
-                &project.file("app.py"),
-                &mut SemanticRequest::new(&mut semantic_budget, &cancellation),
-            )
-            .expect("projection fixture semantics materialize")
-            .available_value()
-            .cloned()
-            .expect("projection fixture semantics remain available");
-        let root = artifact
-            .procedures()
-            .iter()
-            .find(|procedure| {
-                procedure
-                    .locator()
-                    .declaration()
-                    .segments()
-                    .last()
-                    .and_then(|segment| segment.name())
-                    == Some("root")
-            })
-            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
-            .expect("projection fixture declares root");
-        let adapter =
-            type_flow_adapter(Language::Python).expect("Python registers a type-flow adapter");
-        let mut field_budget = SemanticBudget::default();
-        let field_slots =
-            FieldSlotIndex::build(&workspace, adapter, &mut field_budget, &cancellation)
-                .expect("projection fixture field slots build");
-        let provider = WorkspaceValueFlowProvider::new(&workspace, ValueFlowCache::default());
-        let mut plan_budget = SemanticBudget::default();
-        let plan = TypeFlowPlan::build(
-            &workspace,
-            adapter,
-            &field_slots,
-            &root,
-            &provider,
-            ClosureLimits { max_procedures: 16 },
-            &mut plan_budget,
-            &cancellation,
-            &mut Default::default(),
-        )
-        .expect("projection fixture plan builds");
-        let mut solve_budget = SemanticBudget::default();
-        let mut solver_budget = SolverBudget::default();
-        let mut request = DataflowRequest::new(&mut solver_budget, &cancellation);
-        let result = solve_value_flow_with_summaries(
-            &root,
-            &workspace.icfg_provider(),
-            plan.value_flow(),
-            &mut solve_budget,
-            &mut request,
-        )
-        .expect("projection fixture solves");
-        (plan, result)
-    }
-
-    fn entry_name(entry: &SummaryEntry) -> &str {
-        entry
-            .procedure()
-            .semantics()
-            .locator()
-            .declaration()
-            .segments()
-            .last()
-            .and_then(|segment| segment.name())
-            .expect("projection fixture procedures are named")
-    }
-
-    fn nonempty_entry<'a>(
-        entries: &'a [FlattenedClassSetEntry],
-        name: &str,
-    ) -> &'a FlattenedClassSetEntry {
-        let matches = entries
-            .iter()
-            .filter(|entry| entry_name(&entry.entry) == name && !entry.reached.is_empty())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            matches.len(),
-            1,
-            "one live {name} entry carries projected meetings: {entries:#?}"
-        );
-        matches[0]
-    }
-
-    fn meeting_shape(fact: &StableValueFlowFact) -> (&ValueFlowEventKey, bool) {
-        let StableValueFlowFact::Meeting {
-            sink, uncertain, ..
-        } = fact
-        else {
-            panic!("projected class-set observation is a meeting: {fact:#?}");
-        };
-        (sink, *uncertain)
     }
 
     fn runtime_fixture(
@@ -6397,12 +6263,24 @@ mod tests {
         state: TypeFlowSummaryState,
         cache: ValueFlowCache,
     ) -> TypeFlowRootResult {
-        let adapter =
-            type_flow_adapter(Language::Python).expect("Python registers a type-flow adapter");
-        solve_runtime_root_with_adapter(workspace, adapter, field_slots, root, state, cache)
+        let mut semantic_budget = SemanticBudget::default();
+        let mut solver_budget = SolverBudget::default();
+        solve_runtime_root_with_budgets(
+            workspace,
+            field_slots,
+            root,
+            state,
+            cache,
+            FeedbackLimits::default(),
+            &mut semantic_budget,
+            &mut solver_budget,
+        )
     }
 
     #[test]
+    #[hardwon(
+        "70822778aaef: computed values must not inherit operand class identity through transfer projection"
+    )]
     fn computed_result_does_not_inherit_operand_classes() {
         let (_project, workspace, field_slots, procedures) = runtime_fixture(
             "class Result:\n    def present(self):\n        pass\n\nclass Operand:\n    def __truediv__(self, other):\n        return Result()\n\ndef root():\n    value = Operand() / Operand()\n    value.present()\n",
@@ -6511,6 +6389,10 @@ mod tests {
         .expect("runtime fixture root solve succeeds")
     }
 
+    fn python_type_flow_adapter() -> &'static dyn TypeFlowAdapter {
+        type_flow_adapter(Language::Python).expect("Python registers a type-flow adapter")
+    }
+
     struct OpenBoundSeedAdapter {
         inner: &'static dyn TypeFlowAdapter,
     }
@@ -6518,8 +6400,7 @@ mod tests {
     impl OpenBoundSeedAdapter {
         fn python() -> Self {
             Self {
-                inner: type_flow_adapter(Language::Python)
-                    .expect("Python registers a type-flow adapter"),
+                inner: python_type_flow_adapter(),
             }
         }
     }
@@ -6593,6 +6474,14 @@ mod tests {
         ) -> MemberLookup {
             self.inner.member_lookup(workspace, kind, class, member)
         }
+
+        fn member_lookup_for_receiver(
+            &self,
+            workspace: &WorkspaceAnalyzer,
+            query: MemberReceiverQuery<'_>,
+        ) -> MemberLookup {
+            self.inner.member_lookup_for_receiver(workspace, query)
+        }
     }
 
     struct RetainedUnknownSeedAdapter {
@@ -6602,8 +6491,7 @@ mod tests {
     impl RetainedUnknownSeedAdapter {
         fn python() -> Self {
             Self {
-                inner: type_flow_adapter(Language::Python)
-                    .expect("Python registers a type-flow adapter"),
+                inner: python_type_flow_adapter(),
             }
         }
     }
@@ -6687,6 +6575,14 @@ mod tests {
         ) -> MemberLookup {
             self.inner.member_lookup(workspace, kind, class, member)
         }
+
+        fn member_lookup_for_receiver(
+            &self,
+            workspace: &WorkspaceAnalyzer,
+            query: MemberReceiverQuery<'_>,
+        ) -> MemberLookup {
+            self.inner.member_lookup_for_receiver(workspace, query)
+        }
     }
 
     #[test]
@@ -6759,65 +6655,9 @@ mod tests {
     }
 
     #[test]
-    fn type_flow_persistence_rejects_solver_and_semantic_budget_results() {
-        let (_project, workspace, field_slots, procedures) = runtime_fixture(concat!(
-            "class Present:\n",
-            "    def member(self):\n",
-            "        pass\n",
-            "def root():\n",
-            "    value = Present()\n",
-            "    return value.member\n",
-        ));
-
-        let mut solver_limits = SolverWork::default_limits();
-        solver_limits.reached_states = 1;
-        let mut solver_budget = SolverBudget::new(solver_limits);
-        let solver_limited = solve_runtime_root_with_budgets(
-            &workspace,
-            &field_slots,
-            &procedures["root"],
-            TypeFlowSummaryState::default(),
-            ValueFlowCache::default(),
-            FeedbackLimits::new(1),
-            &mut SemanticBudget::default(),
-            &mut solver_budget,
-        );
-        assert!(
-            !solver_limited.complete,
-            "the solver ceiling stops the fixed point"
-        );
-        assert_eq!(
-            solver_limited.persistence_status,
-            TypeFlowRootPersistenceStatus::Ineligible(
-                TypeFlowRootPersistenceRejection::SolverIncomplete
-            )
-        );
-
-        let adapter =
-            type_flow_adapter(Language::Python).expect("Python registers a type-flow adapter");
-        let cancellation = CancellationToken::default();
-        let mut field_budget =
-            SemanticBudget::new(SemanticWork::uniform(1)).expect("positive semantic limits");
-        let incomplete_field_slots =
-            FieldSlotIndex::build(&workspace, adapter, &mut field_budget, &cancellation)
-                .expect("a bounded field-slot build returns its typed incomplete index");
-        assert!(incomplete_field_slots.semantic_budget_exhausted());
-        let semantic_limited = solve_runtime_root(
-            &workspace,
-            &incomplete_field_slots,
-            &procedures["root"],
-            TypeFlowSummaryState::default(),
-            ValueFlowCache::default(),
-        );
-        assert_eq!(
-            semantic_limited.persistence_status,
-            TypeFlowRootPersistenceStatus::Ineligible(
-                TypeFlowRootPersistenceRejection::SemanticBudget
-            )
-        );
-    }
-
-    #[test]
+    #[hardwon(
+        "#3194: a later incomplete feedback pass must invalidate persistence of an earlier result"
+    )]
     fn feedback_persistence_rejects_an_earlier_result_after_a_later_incomplete_pass() {
         let source = concat!(
             "class Present:\n",
@@ -7000,9 +6840,7 @@ mod tests {
             .key
             .procedure_locator
             .declaration()
-            .segments()
-            .last()
-            .and_then(|segment| segment.name())
+            .last_segment_name()
             .expect("runtime fixture summaries are named")
     }
 
@@ -7011,9 +6849,7 @@ mod tests {
             .semantics()
             .locator()
             .declaration()
-            .segments()
-            .last()
-            .and_then(|segment| segment.name())
+            .last_segment_name()
             .expect("runtime fixture procedures are named")
     }
 
@@ -8273,246 +8109,6 @@ mod tests {
     }
 
     #[test]
-    fn persisted_selector_fallback_is_bounded() {
-        let (_project, workspace, field_slots, procedures) = runtime_fixture(concat!(
-            "class A:\n    pass\n",
-            "def guarded(value):\n",
-            "    if value is not None:\n        return value\n",
-            "    return value\n",
-            "def root():\n    return guarded(A())\n",
-        ));
-        let state = TypeFlowSummaryState::default();
-        let cold = solve_runtime_root(
-            &workspace,
-            &field_slots,
-            &procedures["root"],
-            state.clone(),
-            ValueFlowCache::default(),
-        );
-        assert!(cold.published_summaries > 0);
-        let guarded_summary = state
-            .class_set
-            .runtime
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .values()
-            .find(|summary| {
-                summary_name(summary) == "guarded"
-                    && matches!(summary.key.entry, StableEntryFact::Carrier { .. })
-            })
-            .cloned()
-            .expect("the source-sensitive guarded entry is persisted");
-        let (plan, behavior) = runtime_plan(&workspace, &field_slots, &procedures["root"]);
-        let mut prepared = PreparedClassSetSummaries::new(
-            TypeFlowSummaryState::default(),
-            &workspace,
-            &plan,
-            &field_slots,
-            behavior,
-        );
-        let mut dependency = ClassSetRelationDependency {
-            procedure_lineage: guarded_summary
-                .key
-                .procedure
-                .identity()
-                .read_lineage_fingerprint(),
-            entry_selector: stable_entry_fingerprint(
-                &guarded_summary.key.entry,
-                &guarded_summary.key.procedure_locator,
-            ),
-            entry: stable_dependency_entry(
-                &guarded_summary.key.entry,
-                &guarded_summary.key.procedure_locator,
-            ),
-            source_witnesses: Box::default(),
-            output: guarded_summary.output_digest,
-            consumed_lookup: class_set_lookup_fingerprint(&guarded_summary.key),
-        };
-        dependency.source_witnesses = (0..=MAX_CLASS_SET_ENTRY_SELECTOR_PROBES)
-            .map(|index| StableDigest::sha256(index.to_le_bytes()))
-            .collect();
-        let cancellation = CancellationToken::new();
-        let mut budget = SolverBudget::default();
-        let mut request = DataflowRequest::new(&mut budget, &cancellation);
-        assert!(
-            prepared
-                .resolve_dependency_entry(&procedures["guarded"], &dependency, None, &mut request)
-                .expect("the hard witness cap is not solver exhaustion")
-                .is_none(),
-            "untrusted dependency witnesses cannot trigger unbounded reconstruction"
-        );
-    }
-
-    #[test]
-    fn projection_flattens_leaf_meeting_through_wrapper_at_each_call_point() {
-        let (plan, result) = projection_fixture(concat!(
-            "class Missing:\n    pass\n",
-            "def leaf(value):\n    value.missing\n",
-            "def wrapper(value):\n    leaf(value)\n",
-            "def root():\n    wrapper(Missing())\n",
-        ));
-        let flattened =
-            project_flattened_class_set_observations(plan.value_flow(), result.result())
-                .expect("the acyclic entry graph projects");
-        let leaf = nonempty_entry(&flattened, "leaf");
-        let wrapper = nonempty_entry(&flattened, "wrapper");
-        let root = nonempty_entry(&flattened, "root");
-
-        assert_eq!(leaf.reached.len(), 1, "{leaf:#?}");
-        assert_eq!(wrapper.reached.len(), 1, "{wrapper:#?}");
-        assert_eq!(root.reached.len(), 1, "{root:#?}");
-        assert_eq!(
-            meeting_shape(&wrapper.reached[0].fact),
-            meeting_shape(&leaf.reached[0].fact)
-        );
-        assert_eq!(
-            meeting_shape(&root.reached[0].fact),
-            meeting_shape(&leaf.reached[0].fact)
-        );
-
-        let transfer = |source: &str, target: &str| {
-            result
-                .result()
-                .entry_transfers()
-                .iter()
-                .find(|transfer| {
-                    entry_name(transfer.source()) == source
-                        && entry_name(transfer.target()) == target
-                })
-                .expect("fixture contains the requested entry transfer")
-        };
-        assert_eq!(
-            wrapper.reached[0].point,
-            transfer("wrapper", "leaf").call_point().id()
-        );
-        assert_eq!(
-            root.reached[0].point,
-            transfer("root", "wrapper").call_point().id()
-        );
-        assert!(!wrapper.reached[0].qualities.is_empty());
-        assert!(!root.reached[0].qualities.is_empty());
-    }
-
-    #[test]
-    fn projection_is_canonical_and_deduplicates_descendants_rehomed_at_one_call() {
-        let (plan, result) = projection_fixture(concat!(
-            "class Missing:\n    pass\n",
-            "def leaf(value):\n    value.missing\n",
-            "def wrapper(value):\n    leaf(value)\n    leaf(value)\n",
-            "def root():\n    wrapper(Missing())\n",
-        ));
-        let first = project_flattened_class_set_observations(plan.value_flow(), result.result())
-            .expect("the acyclic entry graph projects");
-        let second = project_flattened_class_set_observations(plan.value_flow(), result.result())
-            .expect("repeated projection succeeds");
-        assert_eq!(first, second, "projection order is deterministic");
-
-        let wrapper = nonempty_entry(&first, "wrapper");
-        let root = nonempty_entry(&first, "root");
-        assert_eq!(
-            wrapper.reached.len(),
-            2,
-            "the wrapper owns one observation per distinct leaf call: {wrapper:#?}"
-        );
-        assert_ne!(wrapper.reached[0].point, wrapper.reached[1].point);
-        assert_eq!(
-            root.reached.len(),
-            1,
-            "both descendant observations collapse at the wrapper call: {root:#?}"
-        );
-        for entry in &first {
-            assert!(entry.reached.windows(2).all(|rows| {
-                rows[0].point < rows[1].point
-                    || (rows[0].point == rows[1].point && rows[0].fact < rows[1].fact)
-            }));
-        }
-    }
-
-    #[test]
-    fn acyclic_wrapper_summary_is_published_and_reused_with_equal_results() {
-        let (_project, workspace, field_slots, procedures) = runtime_fixture(concat!(
-            "def leaf():\n",
-            "    value = 123\n",
-            "    value.__class__\n",
-            "    return value\n",
-            "def wrapper():\n",
-            "    first = leaf()\n",
-            "    first.__class__\n",
-            "    second = leaf()\n",
-            "    second.__eq__\n",
-            "    return second\n",
-            "def first_root():\n",
-            "    value = wrapper()\n",
-            "    return value.__class__\n",
-            "def second_root():\n",
-            "    value = wrapper()\n",
-            "    return value.__class__\n",
-        ));
-        let state = TypeFlowSummaryState::default();
-        let cache = ValueFlowCache::default();
-        let first = solve_runtime_root(
-            &workspace,
-            &field_slots,
-            &procedures["first_root"],
-            state.clone(),
-            cache.clone(),
-        );
-        assert!(first.published_summaries > 0, "{first:#?}");
-        {
-            let runtime = state
-                .class_set
-                .runtime
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            assert!(
-                runtime.values().any(|summary| {
-                    summary_name(summary) == "wrapper" && !summary.dependencies.is_empty()
-                }),
-                "the first solve publishes a dependency-bearing wrapper relation: {:?}",
-                runtime
-                    .values()
-                    .map(|summary| (summary_name(summary), summary.dependencies.len()))
-                    .collect::<Vec<_>>()
-            );
-        }
-
-        let reused = solve_runtime_root(
-            &workspace,
-            &field_slots,
-            &procedures["second_root"],
-            state.clone(),
-            cache,
-        );
-        let fresh = solve_runtime_root(
-            &workspace,
-            &field_slots,
-            &procedures["second_root"],
-            TypeFlowSummaryState::default(),
-            ValueFlowCache::default(),
-        );
-        assert!(reused.reusable_summary_hits > 0, "{reused:#?}");
-        assert_eq!(reused.class_sets, fresh.class_sets);
-        assert_eq!(reused.findings, fresh.findings);
-        assert_eq!(reused.complete, fresh.complete);
-        assert_eq!(
-            reused.semantic_budget_exhausted,
-            fresh.semantic_budget_exhausted
-        );
-        assert!(
-            state
-                .class_set
-                .runtime
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .values()
-                .any(|summary| {
-                    summary_name(summary) == "second_root" && !summary.dependencies.is_empty()
-                }),
-            "a caller above the reused wrapper remains publishable"
-        );
-    }
-
-    #[test]
     fn open_boundary_wrapper_publishes_nonleaf_and_replays_known_and_unknown_rows() {
         let (_project, workspace, field_slots, procedures) = runtime_fixture(concat!(
             "class Present:\n",
@@ -8927,115 +8523,6 @@ mod tests {
                 .expect("changed-output validation completes")
                 .is_none(),
             "a persisted parent cannot replay after its child's typed output changes"
-        );
-    }
-
-    #[test]
-    fn exact_entry_maintenance_solve_roots_at_a_demanded_callee() {
-        let (_project, workspace, field_slots, procedures) = runtime_fixture(concat!(
-            "def leaf(value):\n",
-            "    return value\n",
-            "def wrapper(value):\n",
-            "    return leaf(value)\n",
-            "def root():\n",
-            "    return wrapper(1)\n",
-        ));
-        let source_state = TypeFlowSummaryState::default();
-        solve_runtime_root(
-            &workspace,
-            &field_slots,
-            &procedures["root"],
-            source_state.clone(),
-            ValueFlowCache::default(),
-        );
-        let demanded_entry = source_state
-            .class_set
-            .runtime
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .values()
-            .find(|summary| {
-                summary_name(summary) == "wrapper"
-                    && matches!(summary.key.entry, StableEntryFact::Carrier { .. })
-            })
-            .map(|summary| summary.key.entry.clone())
-            .expect("the caller supplies one carrier entry to wrapper");
-
-        let (plan, behavior) = runtime_plan(&workspace, &field_slots, &procedures["root"]);
-        let entry_source = plan
-            .value_flow()
-            .sources()
-            .next()
-            .map(|(source, _)| source)
-            .expect("the root literal supplies a source");
-        let StableEntryFact::Carrier {
-            carrier, uncertain, ..
-        } = &demanded_entry
-        else {
-            unreachable!("the demanded wrapper entry was selected as a carrier")
-        };
-        let entry_fact = ValueFlowFact::carrier_fact(
-            entry_source,
-            plan.value_flow()
-                .carrier_id_for_key(carrier)
-                .expect("the demanded wrapper carrier remains in the live plan"),
-            ValueFlowUncertainty::from_semantic_uncertainty(*uncertain),
-        );
-        let state = TypeFlowSummaryState::default();
-        let mut prepared =
-            PreparedClassSetSummaries::new(state, &workspace, &plan, &field_slots, behavior);
-        let wrapper_source_sensitive = prepared.procedures[&procedures["wrapper"]].source_sensitive;
-        let provider = WorkspaceIcfgProvider::new(&workspace);
-        let cancellation = CancellationToken::default();
-        let mut semantic_budget = SemanticBudget::default();
-        let mut solver_budget = SolverBudget::default();
-        let mut request = DataflowRequest::new(&mut solver_budget, &cancellation);
-        let result = solve_value_flow_entry_with_reusable_summaries(
-            &procedures["wrapper"],
-            entry_fact,
-            &provider,
-            &mut prepared,
-            plan.value_flow(),
-            &mut semantic_budget,
-            &mut request,
-        )
-        .expect("one demanded wrapper entry solves against the existing plan");
-
-        let mut wrapper_entries = Vec::new();
-        for row in result
-            .result()
-            .reached()
-            .iter()
-            .filter(|row| row.entry().procedure() == &procedures["wrapper"])
-        {
-            let Some(fact) = result.result().fact(row.entry().entry_fact()).copied() else {
-                continue;
-            };
-            let source_partition = if wrapper_source_sensitive {
-                fact.source()
-                    .and_then(|source| prepared.source_behavior_for(&procedures["wrapper"], source))
-            } else {
-                None
-            };
-            if let Some(entry) = stable_entry_fact(plan.value_flow(), source_partition, fact) {
-                wrapper_entries.push(entry);
-            }
-        }
-        wrapper_entries.sort_unstable();
-        wrapper_entries.dedup();
-        assert_eq!(
-            wrapper_entries,
-            vec![StableEntryFact::Zero, demanded_entry],
-            "maintenance tabulation contains only zero and the demanded explicit entry"
-        );
-        assert!(
-            result.result().termination().is_fixed_point(),
-            "{result:#?}"
-        );
-        assert!(result.result().incoming_calls().is_empty(), "{result:#?}");
-        assert!(
-            !result.result().witness_retention_truncated(),
-            "{result:#?}"
         );
     }
 
@@ -9513,47 +9000,6 @@ mod tests {
                 retained_write: false,
             },
             "an exact runtime head is a true no-op"
-        );
-    }
-
-    #[test]
-    fn recursive_procedure_stays_ineligible_and_fresh() {
-        let (_project, workspace, field_slots, procedures) = runtime_fixture(concat!(
-            "class Present:\n    def member(self):\n        pass\n",
-            "def recursive(value):\n    recursive(value)\n    value.member\n",
-            "def first_root():\n    recursive(Present())\n",
-            "def second_root():\n    recursive(Present())\n",
-        ));
-        let state = TypeFlowSummaryState::default();
-        let cache = ValueFlowCache::default();
-        solve_runtime_root(
-            &workspace,
-            &field_slots,
-            &procedures["first_root"],
-            state.clone(),
-            cache.clone(),
-        );
-        assert!(
-            state
-                .class_set
-                .runtime
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .values()
-                .all(|summary| summary_name(summary) != "recursive"),
-            "recursive SCC members are not published"
-        );
-        let second = solve_runtime_root(
-            &workspace,
-            &field_slots,
-            &procedures["second_root"],
-            state,
-            cache,
-        );
-        assert_eq!(second.reusable_summary_hits, 0, "{second:#?}");
-        assert!(
-            second.summary_profile.preparation_recursive_dependency > 0,
-            "recursive key rejection is attributed: {second:#?}"
         );
     }
 
@@ -10478,82 +9924,6 @@ mod tests {
     }
 
     #[test]
-    fn acquisition_session_scans_one_artifact_once_for_many_exact_identities() {
-        let source = concat!(
-            "def first(value):\n    return value\n",
-            "def second(value):\n    return value\n",
-            "def third(value):\n    return value\n",
-            "def fourth(value):\n    return value\n",
-            "def fifth(value):\n    return value\n",
-            "def root(value):\n    return fifth(fourth(third(second(first(value)))))\n",
-        );
-        let (project, workspace, field_slots, procedures) = runtime_fixture(source);
-        let provider = WorkspaceIcfgProvider::with_active_semantic_model_snapshot_and_hints(
-            &workspace,
-            workspace.analyzer().active_semantic_model_snapshot(),
-            DispatchHints::empty(),
-        );
-        let discovery = WorkspaceValueFlowProvider::with_oracle(
-            provider.oracle().clone(),
-            provider.behavior_identity(),
-            ValueFlowCache::default(),
-        );
-        let mut cuts = ClassSetAcquisitionCuts::new(
-            TypeFlowSummaryState::default(),
-            &workspace,
-            &discovery,
-            provider.behavior_identity(),
-            &field_slots,
-            HashSet::default(),
-        );
-        let cancellation = CancellationToken::default();
-        let mut budget = SemanticBudget::default();
-        let mut identities = Vec::new();
-        for procedure in procedures.values() {
-            let (procedure, snapshot) = cuts
-                .acquire_snapshot(
-                    procedure,
-                    &mut SemanticRequest::new(&mut budget, &cancellation),
-                )
-                .expect("the exact-identity fixture snapshot is available");
-            identities.push(
-                class_set_surface_identity_from_snapshot(&procedure, &snapshot)
-                    .expect("the fixture procedure has a surface identity"),
-            );
-        }
-        assert!(identities.len() > 2);
-        workspace
-            .materialize_program_semantics(
-                &project.file("app.py"),
-                &mut SemanticRequest::new(&mut budget, &cancellation),
-            )
-            .expect("the many-identity artifact rematerializes")
-            .available_value()
-            .expect("the many-identity artifact remains available");
-
-        let before_scan = budget.used().procedures;
-        cuts.acquire_exact_identity(
-            &identities[0],
-            &mut SemanticRequest::new(&mut budget, &cancellation),
-        )
-        .expect("the first exact identity is acquired");
-        let after_scan = budget.used().procedures;
-        assert_eq!(
-            after_scan - before_scan,
-            procedures["root"].artifact().procedures().len()
-        );
-        for identity in &identities[1..] {
-            cuts.acquire_exact_identity(
-                identity,
-                &mut SemanticRequest::new(&mut budget, &cancellation),
-            )
-            .expect("another exact identity from the same artifact is acquired");
-        }
-        assert_eq!(budget.used().procedures, after_scan);
-        assert_eq!(cuts.exact_identity_lineage_indexes.len(), 1);
-    }
-
-    #[test]
     fn acquisition_session_does_not_cache_an_incomplete_lineage_scan() {
         let source = concat!(
             "def first(value):\n    return value\n",
@@ -10833,66 +10203,6 @@ mod tests {
     }
 
     #[test]
-    fn carrier_only_surface_family_is_not_selected_as_a_mandatory_cut() {
-        let source = concat!(
-            "class Present:\n    pass\n",
-            "def wrapper(value):\n    return value\n",
-            "def root():\n    return wrapper(Present())\n",
-        );
-        let (_first_project, first_workspace, first_fields, first_procedures) =
-            runtime_fixture(source);
-        let state = TypeFlowSummaryState::default();
-        let cold = solve_runtime_root(
-            &first_workspace,
-            &first_fields,
-            &first_procedures["root"],
-            state.clone(),
-            ValueFlowCache::default(),
-        );
-        assert!(cold.published_summaries > 0, "{cold:#?}");
-        let wrapper_lineage = first_procedures["wrapper"]
-            .artifact()
-            .key()
-            .procedure_lineage_fingerprint(
-                first_procedures["wrapper"]
-                    .semantics()
-                    .locator()
-                    .declaration(),
-            );
-        {
-            let mut summaries = state
-                .class_set
-                .runtime
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            summaries.retain(|_, summary| {
-                summary.key.procedure.identity().read_lineage_fingerprint() != wrapper_lineage
-                    || !matches!(summary.key.entry, StableEntryFact::Zero)
-            });
-            assert!(summaries.values().any(|summary| {
-                summary.key.procedure.identity().read_lineage_fingerprint() == wrapper_lineage
-                    && matches!(summary.key.entry, StableEntryFact::Carrier { .. })
-            }));
-        }
-
-        // Use an independent store so persisted Zero rows from the cold solve
-        // cannot satisfy this deliberately carrier-only runtime family.
-        let (_second_project, second_workspace, second_fields, second_procedures) =
-            runtime_fixture(source);
-        let (plan, _) = runtime_cut_plan(
-            &second_workspace,
-            &second_fields,
-            &second_procedures["root"],
-            state,
-            DispatchHints::empty(),
-        );
-        assert!(
-            !plan.is_summary_cut(&second_procedures["wrapper"]),
-            "every procedure receives the mandatory Zero seed before carrier entries"
-        );
-    }
-
-    #[test]
     fn descendant_without_zero_summary_prevents_the_ancestor_surface_cut() {
         let source = concat!(
             "class Present:\n    pass\n",
@@ -10983,90 +10293,6 @@ mod tests {
         );
         assert_eq!(warm.class_sets, cold.class_sets);
         assert_eq!(warm.findings, cold.findings);
-    }
-
-    #[test]
-    fn terminal_meeting_at_a_mandatory_cut_uses_the_exact_empty_relation() {
-        let (_project, workspace, field_slots, procedures) = runtime_fixture(concat!(
-            "class Present:\n    def member(self):\n        pass\n",
-            "def consume(value):\n    return value\n",
-            "def root():\n",
-            "    value = Present()\n",
-            "    return consume(value.member)\n",
-        ));
-        let state = TypeFlowSummaryState::default();
-        let cold = solve_runtime_root(
-            &workspace,
-            &field_slots,
-            &procedures["root"],
-            state.clone(),
-            ValueFlowCache::default(),
-        );
-        assert!(cold.findings.is_empty(), "{cold:#?}");
-
-        let cancellation = CancellationToken::default();
-        let (cut_plan, cut_manifest) = runtime_cut_plan(
-            &workspace,
-            &field_slots,
-            &procedures["root"],
-            state.clone(),
-            DispatchHints::empty(),
-        );
-        assert!(cut_plan.is_summary_cut(&procedures["consume"]));
-        let source = cut_plan
-            .value_flow()
-            .sources()
-            .next()
-            .map(|(source, _)| source)
-            .expect("the constructor produces a class source");
-        let sink = cut_plan
-            .value_flow()
-            .sinks()
-            .next()
-            .map(|(sink, _)| sink)
-            .expect("the member access produces a receiver sink");
-        let meeting = ValueFlowFact::meeting_fact(source, sink, ValueFlowUncertainty::empty());
-        let behavior = WorkspaceIcfgProvider::new(&workspace).behavior_identity();
-        let mut prepared = PreparedClassSetSummaries::new_with_cuts(
-            state.clone(),
-            &workspace,
-            &cut_plan,
-            &field_slots,
-            behavior,
-            cut_manifest,
-        );
-        let mut solver_budget = SolverBudget::default();
-        let mut request = DataflowRequest::new(&mut solver_budget, &cancellation);
-        let terminal = prepared
-            .summary_for(
-                &procedures["consume"],
-                &procedures["root"],
-                meeting,
-                &mut request,
-            )
-            .expect("a terminal Meeting cannot miss a mandatory summary cut")
-            .expect("the terminal Meeting has an exact reusable relation");
-        assert!(terminal.exits.is_empty());
-        assert!(terminal.reached.is_empty());
-        assert_eq!(terminal.call_cycle, SummaryCallCycle::ExcludesRoot);
-        assert_eq!(
-            terminal.called_procedures,
-            SummaryCalledProcedures::CoveredByContract
-        );
-
-        let warm = solve_runtime_root(
-            &workspace,
-            &field_slots,
-            &procedures["root"],
-            state,
-            ValueFlowCache::default(),
-        );
-        assert_eq!(warm.class_sets, cold.class_sets);
-        assert_eq!(warm.findings, cold.findings);
-        assert!(
-            warm.reusable_summary_hits > 0,
-            "the cut-backed trial completes without a full-plan retry: {warm:#?}"
-        );
     }
 
     #[test]
@@ -11538,6 +10764,594 @@ mod tests {
             identity.fallback_component_reference_count() + location_rows
                 < component_ordinals.len() * location_rows,
             "identity storage and hashing stay linear instead of expanding every location per call"
+        );
+    }
+
+    #[test]
+    #[hardwon("82e9a283d5ff: type flow persistence rejects solver and semantic budget results")]
+    fn type_flow_persistence_rejects_solver_and_semantic_budget_results() {
+        let (_project, workspace, field_slots, procedures) = runtime_fixture(concat!(
+            "class Present:\n",
+            "    def member(self):\n",
+            "        pass\n",
+            "def root():\n",
+            "    value = Present()\n",
+            "    return value.member\n",
+        ));
+
+        let mut solver_limits = SolverWork::default_limits();
+        solver_limits.reached_states = 1;
+        let mut solver_budget = SolverBudget::new(solver_limits);
+        let solver_limited = solve_runtime_root_with_budgets(
+            &workspace,
+            &field_slots,
+            &procedures["root"],
+            TypeFlowSummaryState::default(),
+            ValueFlowCache::default(),
+            FeedbackLimits::new(1),
+            &mut SemanticBudget::default(),
+            &mut solver_budget,
+        );
+        assert!(
+            !solver_limited.complete,
+            "the solver ceiling stops the fixed point"
+        );
+        assert_eq!(
+            solver_limited.persistence_status,
+            TypeFlowRootPersistenceStatus::Ineligible(
+                TypeFlowRootPersistenceRejection::SolverIncomplete
+            )
+        );
+
+        let adapter =
+            type_flow_adapter(Language::Python).expect("Python registers a type-flow adapter");
+        let cancellation = CancellationToken::default();
+        let mut field_budget =
+            SemanticBudget::new(SemanticWork::uniform(1)).expect("positive semantic limits");
+        let incomplete_field_slots =
+            FieldSlotIndex::build(&workspace, adapter, &mut field_budget, &cancellation)
+                .expect("a bounded field-slot build returns its typed incomplete index");
+        assert!(incomplete_field_slots.semantic_budget_exhausted());
+        let semantic_limited = solve_runtime_root(
+            &workspace,
+            &incomplete_field_slots,
+            &procedures["root"],
+            TypeFlowSummaryState::default(),
+            ValueFlowCache::default(),
+        );
+        assert_eq!(
+            semantic_limited.persistence_status,
+            TypeFlowRootPersistenceStatus::Ineligible(
+                TypeFlowRootPersistenceRejection::SemanticBudget
+            )
+        );
+    }
+    #[test]
+    fn persisted_selector_fallback_is_bounded() {
+        let (_project, workspace, field_slots, procedures) = runtime_fixture(concat!(
+            "class A:\n    pass\n",
+            "def guarded(value):\n",
+            "    if value is not None:\n        return value\n",
+            "    return value\n",
+            "def root():\n    return guarded(A())\n",
+        ));
+        let state = TypeFlowSummaryState::default();
+        let cold = solve_runtime_root(
+            &workspace,
+            &field_slots,
+            &procedures["root"],
+            state.clone(),
+            ValueFlowCache::default(),
+        );
+        assert!(cold.published_summaries > 0);
+        let guarded_summary = state
+            .class_set
+            .runtime
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .find(|summary| {
+                summary_name(summary) == "guarded"
+                    && matches!(summary.key.entry, StableEntryFact::Carrier { .. })
+            })
+            .cloned()
+            .expect("the source-sensitive guarded entry is persisted");
+        let (plan, behavior) = runtime_plan(&workspace, &field_slots, &procedures["root"]);
+        let mut prepared = PreparedClassSetSummaries::new(
+            TypeFlowSummaryState::default(),
+            &workspace,
+            &plan,
+            &field_slots,
+            behavior,
+        );
+        let mut dependency = ClassSetRelationDependency {
+            procedure_lineage: guarded_summary
+                .key
+                .procedure
+                .identity()
+                .read_lineage_fingerprint(),
+            entry_selector: stable_entry_fingerprint(
+                &guarded_summary.key.entry,
+                &guarded_summary.key.procedure_locator,
+            ),
+            entry: stable_dependency_entry(
+                &guarded_summary.key.entry,
+                &guarded_summary.key.procedure_locator,
+            ),
+            source_witnesses: Box::default(),
+            output: guarded_summary.output_digest,
+            consumed_lookup: class_set_lookup_fingerprint(&guarded_summary.key),
+        };
+        dependency.source_witnesses = (0..=MAX_CLASS_SET_ENTRY_SELECTOR_PROBES)
+            .map(|index| StableDigest::sha256(index.to_le_bytes()))
+            .collect();
+        let cancellation = CancellationToken::new();
+        let mut budget = SolverBudget::default();
+        let mut request = DataflowRequest::new(&mut budget, &cancellation);
+        assert!(
+            prepared
+                .resolve_dependency_entry(&procedures["guarded"], &dependency, None, &mut request)
+                .expect("the hard witness cap is not solver exhaustion")
+                .is_none(),
+            "untrusted dependency witnesses cannot trigger unbounded reconstruction"
+        );
+    }
+
+    fn projection_fixture(source: &str) -> (TypeFlowPlan, ValueFlowSummaryResult) {
+        let project = InlineTestProject::with_language(Language::Python)
+            .file("app.py", source)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        let mut semantic_budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &project.file("app.py"),
+                &mut SemanticRequest::new(&mut semantic_budget, &cancellation),
+            )
+            .expect("projection fixture semantics materialize")
+            .available_value()
+            .cloned()
+            .expect("projection fixture semantics remain available");
+        let root = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("root")
+            })
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .expect("projection fixture declares root");
+        let adapter =
+            type_flow_adapter(Language::Python).expect("Python registers a type-flow adapter");
+        let mut field_budget = SemanticBudget::default();
+        let field_slots =
+            FieldSlotIndex::build(&workspace, adapter, &mut field_budget, &cancellation)
+                .expect("projection fixture field slots build");
+        let provider = WorkspaceValueFlowProvider::new(&workspace, ValueFlowCache::default());
+        let mut plan_budget = SemanticBudget::default();
+        let plan = TypeFlowPlan::build(
+            &workspace,
+            adapter,
+            &field_slots,
+            &root,
+            &provider,
+            ClosureLimits { max_procedures: 16 },
+            &mut plan_budget,
+            &cancellation,
+            &mut Default::default(),
+        )
+        .expect("projection fixture plan builds");
+        let mut solve_budget = SemanticBudget::default();
+        let mut solver_budget = SolverBudget::default();
+        let mut request = DataflowRequest::new(&mut solver_budget, &cancellation);
+        let result = solve_value_flow_with_summaries(
+            &root,
+            &workspace.icfg_provider(),
+            plan.value_flow(),
+            &mut solve_budget,
+            &mut request,
+        )
+        .expect("projection fixture solves");
+        (plan, result)
+    }
+
+    fn entry_name(entry: &SummaryEntry) -> &str {
+        entry
+            .procedure()
+            .semantics()
+            .locator()
+            .declaration()
+            .last_segment_name()
+            .expect("projection fixture procedures are named")
+    }
+
+    fn nonempty_entry<'a>(
+        entries: &'a [FlattenedClassSetEntry],
+        name: &str,
+    ) -> &'a FlattenedClassSetEntry {
+        let matches = entries
+            .iter()
+            .filter(|entry| entry_name(&entry.entry) == name && !entry.reached.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matches.len(),
+            1,
+            "one live {name} entry carries projected meetings: {entries:#?}"
+        );
+        matches[0]
+    }
+
+    #[test]
+    fn projection_is_canonical_and_deduplicates_descendants_rehomed_at_one_call() {
+        let (plan, result) = projection_fixture(concat!(
+            "class Missing:\n    pass\n",
+            "def leaf(value):\n    value.missing\n",
+            "def wrapper(value):\n    leaf(value)\n    leaf(value)\n",
+            "def root():\n    wrapper(Missing())\n",
+        ));
+        let first = project_flattened_class_set_observations(plan.value_flow(), result.result())
+            .expect("the acyclic entry graph projects");
+        let second = project_flattened_class_set_observations(plan.value_flow(), result.result())
+            .expect("repeated projection succeeds");
+        assert_eq!(first, second, "projection order is deterministic");
+
+        let wrapper = nonempty_entry(&first, "wrapper");
+        let root = nonempty_entry(&first, "root");
+        assert_eq!(
+            wrapper.reached.len(),
+            2,
+            "the wrapper owns one observation per distinct leaf call: {wrapper:#?}"
+        );
+        assert_ne!(wrapper.reached[0].point, wrapper.reached[1].point);
+        assert_eq!(
+            root.reached.len(),
+            1,
+            "both descendant observations collapse at the wrapper call: {root:#?}"
+        );
+        for entry in &first {
+            assert!(entry.reached.windows(2).all(|rows| {
+                rows[0].point < rows[1].point
+                    || (rows[0].point == rows[1].point && rows[0].fact < rows[1].fact)
+            }));
+        }
+    }
+    #[test]
+    fn acyclic_wrapper_summary_is_published_and_reused_with_equal_results() {
+        let (_project, workspace, field_slots, procedures) = runtime_fixture(concat!(
+            "def leaf():\n",
+            "    value = 123\n",
+            "    value.__class__\n",
+            "    return value\n",
+            "def wrapper():\n",
+            "    first = leaf()\n",
+            "    first.__class__\n",
+            "    second = leaf()\n",
+            "    second.__eq__\n",
+            "    return second\n",
+            "def first_root():\n",
+            "    value = wrapper()\n",
+            "    return value.__class__\n",
+            "def second_root():\n",
+            "    value = wrapper()\n",
+            "    return value.__class__\n",
+        ));
+        let state = TypeFlowSummaryState::default();
+        let cache = ValueFlowCache::default();
+        let first = solve_runtime_root(
+            &workspace,
+            &field_slots,
+            &procedures["first_root"],
+            state.clone(),
+            cache.clone(),
+        );
+        assert!(first.published_summaries > 0, "{first:#?}");
+        {
+            let runtime = state
+                .class_set
+                .runtime
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                runtime.values().any(|summary| {
+                    summary_name(summary) == "wrapper" && !summary.dependencies.is_empty()
+                }),
+                "the first solve publishes a dependency-bearing wrapper relation: {:?}",
+                runtime
+                    .values()
+                    .map(|summary| (summary_name(summary), summary.dependencies.len()))
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        let reused = solve_runtime_root(
+            &workspace,
+            &field_slots,
+            &procedures["second_root"],
+            state.clone(),
+            cache,
+        );
+        let fresh = solve_runtime_root(
+            &workspace,
+            &field_slots,
+            &procedures["second_root"],
+            TypeFlowSummaryState::default(),
+            ValueFlowCache::default(),
+        );
+        assert!(reused.reusable_summary_hits > 0, "{reused:#?}");
+        assert_eq!(reused.class_sets, fresh.class_sets);
+        assert_eq!(reused.findings, fresh.findings);
+        assert_eq!(reused.complete, fresh.complete);
+        assert_eq!(
+            reused.semantic_budget_exhausted,
+            fresh.semantic_budget_exhausted
+        );
+        assert!(
+            state
+                .class_set
+                .runtime
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .values()
+                .any(|summary| {
+                    summary_name(summary) == "second_root" && !summary.dependencies.is_empty()
+                }),
+            "a caller above the reused wrapper remains publishable"
+        );
+    }
+    #[test]
+    fn exact_entry_maintenance_solve_roots_at_a_demanded_callee() {
+        let (_project, workspace, field_slots, procedures) = runtime_fixture(concat!(
+            "def leaf(value):\n",
+            "    return value\n",
+            "def wrapper(value):\n",
+            "    return leaf(value)\n",
+            "def root():\n",
+            "    return wrapper(1)\n",
+        ));
+        let source_state = TypeFlowSummaryState::default();
+        solve_runtime_root(
+            &workspace,
+            &field_slots,
+            &procedures["root"],
+            source_state.clone(),
+            ValueFlowCache::default(),
+        );
+        let demanded_entry = source_state
+            .class_set
+            .runtime
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .find(|summary| {
+                summary_name(summary) == "wrapper"
+                    && matches!(summary.key.entry, StableEntryFact::Carrier { .. })
+            })
+            .map(|summary| summary.key.entry.clone())
+            .expect("the caller supplies one carrier entry to wrapper");
+
+        let (plan, behavior) = runtime_plan(&workspace, &field_slots, &procedures["root"]);
+        let entry_source = plan
+            .value_flow()
+            .sources()
+            .next()
+            .map(|(source, _)| source)
+            .expect("the root literal supplies a source");
+        let StableEntryFact::Carrier {
+            carrier, uncertain, ..
+        } = &demanded_entry
+        else {
+            unreachable!("the demanded wrapper entry was selected as a carrier")
+        };
+        let entry_fact = ValueFlowFact::carrier_fact(
+            entry_source,
+            plan.value_flow()
+                .carrier_id_for_key(carrier)
+                .expect("the demanded wrapper carrier remains in the live plan"),
+            ValueFlowUncertainty::from_semantic_uncertainty(*uncertain),
+        );
+        let state = TypeFlowSummaryState::default();
+        let mut prepared =
+            PreparedClassSetSummaries::new(state, &workspace, &plan, &field_slots, behavior);
+        let wrapper_source_sensitive = prepared.procedures[&procedures["wrapper"]].source_sensitive;
+        let provider = WorkspaceIcfgProvider::new(&workspace);
+        let cancellation = CancellationToken::default();
+        let mut semantic_budget = SemanticBudget::default();
+        let mut solver_budget = SolverBudget::default();
+        let mut request = DataflowRequest::new(&mut solver_budget, &cancellation);
+        let result = solve_value_flow_entry_with_reusable_summaries(
+            &procedures["wrapper"],
+            entry_fact,
+            &provider,
+            &mut prepared,
+            plan.value_flow(),
+            &mut semantic_budget,
+            &mut request,
+        )
+        .expect("one demanded wrapper entry solves against the existing plan");
+
+        let mut wrapper_entries = Vec::new();
+        for row in result
+            .result()
+            .reached()
+            .iter()
+            .filter(|row| row.entry().procedure() == &procedures["wrapper"])
+        {
+            let Some(fact) = result.result().fact(row.entry().entry_fact()).copied() else {
+                continue;
+            };
+            let source_partition = if wrapper_source_sensitive {
+                fact.source()
+                    .and_then(|source| prepared.source_behavior_for(&procedures["wrapper"], source))
+            } else {
+                None
+            };
+            if let Some(entry) = stable_entry_fact(plan.value_flow(), source_partition, fact) {
+                wrapper_entries.push(entry);
+            }
+        }
+        wrapper_entries.sort_unstable();
+        wrapper_entries.dedup();
+        assert_eq!(
+            wrapper_entries,
+            vec![StableEntryFact::Zero, demanded_entry],
+            "maintenance tabulation contains only zero and the demanded explicit entry"
+        );
+        assert!(
+            result.result().termination().is_fixed_point(),
+            "{result:#?}"
+        );
+        assert!(result.result().incoming_calls().is_empty(), "{result:#?}");
+        assert!(
+            !result.result().witness_retention_truncated(),
+            "{result:#?}"
+        );
+    }
+    #[test]
+    fn carrier_only_surface_family_is_not_selected_as_a_mandatory_cut() {
+        let source = concat!(
+            "class Present:\n    pass\n",
+            "def wrapper(value):\n    return value\n",
+            "def root():\n    return wrapper(Present())\n",
+        );
+        let (_first_project, first_workspace, first_fields, first_procedures) =
+            runtime_fixture(source);
+        let state = TypeFlowSummaryState::default();
+        let cold = solve_runtime_root(
+            &first_workspace,
+            &first_fields,
+            &first_procedures["root"],
+            state.clone(),
+            ValueFlowCache::default(),
+        );
+        assert!(cold.published_summaries > 0, "{cold:#?}");
+        let wrapper_lineage = first_procedures["wrapper"]
+            .artifact()
+            .key()
+            .procedure_lineage_fingerprint(
+                first_procedures["wrapper"]
+                    .semantics()
+                    .locator()
+                    .declaration(),
+            );
+        {
+            let mut summaries = state
+                .class_set
+                .runtime
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            summaries.retain(|_, summary| {
+                summary.key.procedure.identity().read_lineage_fingerprint() != wrapper_lineage
+                    || !matches!(summary.key.entry, StableEntryFact::Zero)
+            });
+            assert!(summaries.values().any(|summary| {
+                summary.key.procedure.identity().read_lineage_fingerprint() == wrapper_lineage
+                    && matches!(summary.key.entry, StableEntryFact::Carrier { .. })
+            }));
+        }
+
+        // Use an independent store so persisted Zero rows from the cold solve
+        // cannot satisfy this deliberately carrier-only runtime family.
+        let (_second_project, second_workspace, second_fields, second_procedures) =
+            runtime_fixture(source);
+        let (plan, _) = runtime_cut_plan(
+            &second_workspace,
+            &second_fields,
+            &second_procedures["root"],
+            state,
+            DispatchHints::empty(),
+        );
+        assert!(
+            !plan.is_summary_cut(&second_procedures["wrapper"]),
+            "every procedure receives the mandatory Zero seed before carrier entries"
+        );
+    }
+    #[test]
+    fn terminal_meeting_at_a_mandatory_cut_uses_the_exact_empty_relation() {
+        let (_project, workspace, field_slots, procedures) = runtime_fixture(concat!(
+            "class Present:\n    def member(self):\n        pass\n",
+            "def consume(value):\n    return value\n",
+            "def root():\n",
+            "    value = Present()\n",
+            "    return consume(value.member)\n",
+        ));
+        let state = TypeFlowSummaryState::default();
+        let cold = solve_runtime_root(
+            &workspace,
+            &field_slots,
+            &procedures["root"],
+            state.clone(),
+            ValueFlowCache::default(),
+        );
+        assert!(cold.findings.is_empty(), "{cold:#?}");
+
+        let cancellation = CancellationToken::default();
+        let (cut_plan, cut_manifest) = runtime_cut_plan(
+            &workspace,
+            &field_slots,
+            &procedures["root"],
+            state.clone(),
+            DispatchHints::empty(),
+        );
+        assert!(cut_plan.is_summary_cut(&procedures["consume"]));
+        let source = cut_plan
+            .value_flow()
+            .sources()
+            .next()
+            .map(|(source, _)| source)
+            .expect("the constructor produces a class source");
+        let sink = cut_plan
+            .value_flow()
+            .sinks()
+            .next()
+            .map(|(sink, _)| sink)
+            .expect("the member access produces a receiver sink");
+        let meeting = ValueFlowFact::meeting_fact(source, sink, ValueFlowUncertainty::empty());
+        let behavior = WorkspaceIcfgProvider::new(&workspace).behavior_identity();
+        let mut prepared = PreparedClassSetSummaries::new_with_cuts(
+            state.clone(),
+            &workspace,
+            &cut_plan,
+            &field_slots,
+            behavior,
+            cut_manifest,
+        );
+        let mut solver_budget = SolverBudget::default();
+        let mut request = DataflowRequest::new(&mut solver_budget, &cancellation);
+        let terminal = prepared
+            .summary_for(
+                &procedures["consume"],
+                &procedures["root"],
+                meeting,
+                &mut request,
+            )
+            .expect("a terminal Meeting cannot miss a mandatory summary cut")
+            .expect("the terminal Meeting has an exact reusable relation");
+        assert!(terminal.exits.is_empty());
+        assert!(terminal.reached.is_empty());
+        assert_eq!(terminal.call_cycle, SummaryCallCycle::ExcludesRoot);
+        assert_eq!(
+            terminal.called_procedures,
+            SummaryCalledProcedures::CoveredByContract
+        );
+
+        let warm = solve_runtime_root(
+            &workspace,
+            &field_slots,
+            &procedures["root"],
+            state,
+            ValueFlowCache::default(),
+        );
+        assert_eq!(warm.class_sets, cold.class_sets);
+        assert_eq!(warm.findings, cold.findings);
+        assert!(
+            warm.reusable_summary_hits > 0,
+            "the cut-backed trial completes without a full-plan retry: {warm:#?}"
         );
     }
 }

@@ -36,3 +36,6 @@ pub mod queries;
 pub mod structural;
 pub mod syntax;
 pub mod test_detection;
+
+#[cfg(test)]
+mod test_support;

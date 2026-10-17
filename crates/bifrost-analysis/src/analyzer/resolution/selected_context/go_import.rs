@@ -1,8 +1,8 @@
 //! Selected Go import bindings use the source file's lexical choice and actual
-//! import definition. Package names come from selected context, never paths.
+//! import definition. An absent package clause admits only an explicitly presumed name.
 
 use super::*;
-use crate::analyzer::resolution::LoweredGoPackageImport;
+use crate::analyzer::resolution::{LoweredGoPackageImport, UnindexedExternalFrontier};
 use brokk_bifrost_core::analyzer::resolution_facts::ResolutionGoPackageImportKind;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -12,6 +12,9 @@ pub(crate) struct SelectedGoImportBindingDescriptor {
     definition_node: BindingNodeId,
     lookup: SemanticId,
     completion: ResolutionCompletion,
+    /// Present only for an unresolved provider's conventional default binder.
+    /// This does not verify the provider's package clause.
+    presumed_provider: Option<UnindexedExternalFrontier>,
 }
 
 impl SelectedGoImportBindingDescriptor {
@@ -35,18 +38,80 @@ impl SelectedGoImportBindingDescriptor {
             definition_node,
             lookup,
             completion,
+            presumed_provider: None,
         }
     }
 
-    fn digest(&self) -> [u8; 32] {
-        let mut hash = CanonicalHasher::new(b"bifrost-selected-go-import-binding:v1");
-        hash.field("source", &self.source_fragment.as_bytes());
-        hash.field("definition", &self.import.definition.as_bytes());
-        hash.field("definition_node", &self.definition_node.as_bytes());
-        hash.field("file_scope", &self.import.file_scope.as_bytes());
-        hash.field("spelling_choice", &self.import.spelling_choice.as_bytes());
-        hash.field("lookup", &self.lookup.as_bytes());
-        hash.finish()
+    pub(crate) fn with_presumed_provider(
+        mut self,
+        path: Arc<str>,
+        provider_package_id: Option<i64>,
+    ) -> Self {
+        self.presumed_provider = Some(UnindexedExternalFrontier {
+            provider_path: path,
+            provider_package_id,
+            member: None,
+        });
+        self
+    }
+
+    fn digest(
+        &self,
+        identities: &SelectedContextIdentities,
+        source: &dyn BatchResolutionFragmentSource,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<[u8; 32]> {
+        let mut hash =
+            CanonicalIdentityDescriptor::new(b"bifrost-selected-go-import-binding:v1", |key| {
+                super::super::canonical_identity::selected_identity_content_digest(
+                    identities,
+                    source,
+                    key,
+                    cancellation,
+                )
+            });
+        hash.field(
+            "source",
+            CanonicalIdentityPart::identity(self.source_fragment),
+        )?;
+        hash.field(
+            "definition",
+            CanonicalIdentityPart::identity(self.import.definition),
+        )?;
+        hash.field(
+            "definition_node",
+            CanonicalIdentityPart::identity(self.definition_node),
+        )?;
+        hash.field(
+            "file_scope",
+            CanonicalIdentityPart::identity(self.import.file_scope),
+        )?;
+        hash.field(
+            "spelling_choice",
+            CanonicalIdentityPart::identity(self.import.spelling_choice),
+        )?;
+        hash.field("lookup", CanonicalIdentityPart::identity(self.lookup))?;
+        if let Some(provider) = &self.presumed_provider {
+            hash.field(
+                "presumed_provider",
+                CanonicalIdentityPart::Label(&provider.provider_path),
+            )?;
+            if let Some(package) = provider.provider_package_id {
+                hash.field(
+                    "presumed_provider_package",
+                    CanonicalIdentityPart::Content(&package.to_le_bytes()),
+                )?;
+            }
+        }
+        Ok(hash.finish())
+    }
+
+    pub(super) fn remap_shared_names(
+        &mut self,
+        remap: &mut impl FnMut(SemanticId) -> StoreResult<SemanticId>,
+    ) -> StoreResult<()> {
+        self.lookup = remap(self.lookup)?;
+        Ok(())
     }
 
     pub(crate) fn shared_identities(&self) -> [ResolutionSemanticIdentity; 1] {
@@ -58,14 +123,21 @@ impl SelectedGoImportBindingDescriptor {
     pub(crate) fn compile(
         &self,
         identities: &SelectedContextIdentities,
+        source: &dyn BatchResolutionFragmentSource,
         cancellation: &CancellationToken,
         session: &ResolutionSession,
-    ) -> Option<(CandidatePathIdentity, PartialPath)> {
+    ) -> StoreResult<Option<(CandidatePathIdentity, PartialPath)>> {
         if cancellation.is_cancelled() || !session.scope_step() {
-            return None;
+            return Ok(None);
         }
-        Some((
-            CandidatePathIdentity::new(self.source_fragment, identities.path(self.digest())),
+        if let Some(provider) = &self.presumed_provider {
+            identities.record_presumed_go_import(self.import.definition, provider.clone());
+        }
+        Ok(Some((
+            CandidatePathIdentity::new(
+                self.source_fragment,
+                identities.path(self.digest(identities, source, cancellation)?),
+            ),
             PartialPath::new(
                 EndpointSignature::new(
                     self.import.file_scope,
@@ -85,37 +157,54 @@ impl SelectedGoImportBindingDescriptor {
                 [WitnessStep::Node(self.definition_node)],
                 self.completion.clone(),
             ),
-        ))
+        )))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::engine::PreloadedFragmentSource;
+    use crate::analyzer::resolution::test_support::{fragment as fixture_fragment, node, semantic};
+
     use super::*;
 
     #[test]
     fn selected_import_authority_survives_context_extensions_and_cancels_atomically() {
-        let fragment = BindingFragmentId::at_ordinal(1);
-        let ordinal = SelectedResolutionMountOrdinal::new(1);
+        let fragment = fixture_fragment("selected-go-import-source");
+        let ordinal = SelectedResolutionMountOrdinal::new(fragment.ordinal());
         let lookup = |candidate| Ok((candidate == fragment).then_some((ordinal, Language::Go)));
         let identities = SelectedContextIdentities::new();
         let cancellation = CancellationToken::new();
         let binding = SelectedGoImportBindingDescriptor::new(
             fragment,
             &LoweredGoPackageImport {
-                definition: SemanticId::local(1, 3),
+                definition: semantic("selected-go-import-definition"),
                 source_site: ResolutionSiteId::new(7),
-                file_scope: BindingNodeId::local(1, 2),
-                spelling_choice: SemanticId::local(1, 4),
+                file_scope: node("selected-go-import-file-scope"),
+                spelling_choice: semantic("selected-go-import-choice"),
                 start_byte: 10,
                 end_byte: 20,
                 kind: ResolutionGoPackageImportKind::Named,
             },
-            BindingNodeId::local(1, 3),
-            SemanticId::shared_name(super::super::super::SharedNameId::interned(17)),
+            node("selected-go-import-definition-node"),
+            SemanticId::shared_name(
+                super::super::super::local_identity::test_shared_names().intern(
+                    brokk_bifrost_core::analyzer::canonical_hash::hash_domain_bytes(
+                        b"bifrost-fixture-go-package-lookup:v1",
+                        b"Package",
+                    ),
+                ),
+            ),
             ResolutionCompletion::Complete,
         );
-        let expected = binding.compile(&identities, &cancellation, &ResolutionSession::unbounded());
+        let expected = binding
+            .compile(
+                &identities,
+                &PreloadedFragmentSource::new([], []),
+                &cancellation,
+                &ResolutionSession::unbounded(),
+            )
+            .unwrap();
         let context = SelectedResolutionContextSet::new(identities.clone(), Vec::new(), 1, &lookup)
             .unwrap()
             .extend_go_import_bindings(vec![binding.clone()], &cancellation, &lookup)
@@ -151,7 +240,14 @@ mod tests {
         let (_, _, _, _, assigned, _, imports) = input.into_parts();
         assert_eq!(imports.as_ref(), std::slice::from_ref(&binding));
         assert_eq!(
-            imports[0].compile(&assigned, &cancellation, &ResolutionSession::unbounded()),
+            imports[0]
+                .compile(
+                    &assigned,
+                    &PreloadedFragmentSource::new([], []),
+                    &cancellation,
+                    &ResolutionSession::unbounded()
+                )
+                .unwrap(),
             expected
         );
         cancellation.cancel();

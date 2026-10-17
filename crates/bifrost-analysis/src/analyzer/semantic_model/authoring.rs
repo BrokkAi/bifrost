@@ -4,7 +4,6 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
 use super::{
@@ -185,7 +184,7 @@ fn source_report(
         .any(|diagnostic| diagnostic.severity == AuthoringDiagnosticSeverity::Error);
     SemanticModelSourceReport {
         format,
-        source_sha256: sha256(bytes),
+        source_sha256: crate::analyzer::semantic_model::csmi::sha256_hex(bytes),
         valid,
         pack_id: compiled.map(|compiled| compiled.manifest.pack_id.clone()),
         pack_version: compiled.map(|compiled| compiled.manifest.version.clone()),
@@ -453,7 +452,7 @@ fn error(
     path: impl Into<String>,
     message: impl Into<String>,
 ) -> AuthoringDiagnostic {
-    diagnostic(AuthoringDiagnosticSeverity::Error, code, path, message)
+    Diagnostic::error(code, path, message).into()
 }
 
 fn warning(
@@ -994,7 +993,8 @@ pub fn workspace_semantic_models_not_active<'a>(
     inactive
 }
 
-fn source_format_for_path(path: &Path) -> Option<SourceFormat> {
+/// Infer the source format from a JSON, YAML, or YML file extension.
+pub fn source_format_for_path(path: &Path) -> Option<SourceFormat> {
     match path.extension().and_then(|extension| extension.to_str()) {
         Some("json") => Some(SourceFormat::Json),
         Some("yaml" | "yml") => Some(SourceFormat::Yaml),
@@ -1070,10 +1070,6 @@ fn write_exact_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .persist_noclobber(path)
         .map_err(|error| error.error)?;
     Ok(())
-}
-
-fn sha256(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

@@ -615,9 +615,9 @@ impl CallBindings {
                         (Some(_), Some(CallerReceiverBinding::ModuleQualified(_))) => false,
                         (Some(receiver), _) => receiver == actual.id(),
                         (None, _)
-                            if caller_receiver_binding.is_some_and(|binding| {
-                                binding.passes_receiver_as_argument(callee.semantics())
-                            }) =>
+                            if call
+                                .source_receiver_argument_index(callee.semantics())
+                                .is_some() =>
                         {
                             false
                         }
@@ -727,9 +727,9 @@ impl CallBindings {
                         }
                         if mapping.formal.kind() == ProcedurePortKind::Receiver {
                             if has_receiver
-                                || !caller_receiver_binding.is_some_and(|binding| {
-                                    binding.passes_receiver_as_argument(callee.semantics())
-                                })
+                                || call
+                                    .source_receiver_argument_index(callee.semantics())
+                                    .is_none()
                                 || !matches!(
                                     argument.expansion,
                                     CallArgumentExpansion::Direct(

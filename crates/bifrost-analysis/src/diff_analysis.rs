@@ -1,15 +1,17 @@
 use crate::analyzer::test_paths;
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::{
-    AnalyzerConfig, CodeUnit, CodeUnitType, DependencyPackEcosystem, IAnalyzer, Language,
-    ProjectFile,
+    AnalyzerConfig, CodeUnitType, DeclarationId, DependencyPackEcosystem, IAnalyzer,
+    ImportAnalysisProvider, Language, ProjectFile, QueryToken,
 };
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::analyzer::{RevisionBlobIdentities, SharedAnalyzerCache, WorkspaceProjectionLease};
 use crate::gitblob::resolve_default_branch_ref;
 use crate::profiling;
 use crate::searchtools::{
-    UsageGraphCallSite, UsageGraphEdge, UsageGraphParams, UsageGraphTruncatedSymbol, usage_graph,
+    UsageGraphCallSite, UsageGraphEdge, UsageGraphIncompleteReason, UsageGraphParams,
+    UsageGraphResult, UsageGraphTruncatedSymbol, usage_graph_at_lines,
+    usage_graph_with_cancellation,
 };
 use crate::{
     CancellationToken, FileSetProject, FilesystemProject, ImportInfo, Project, WorkspaceAnalyzer,
@@ -50,6 +52,76 @@ pub struct AnalyzeDiffParams {
     pub target: Option<String>,
     #[serde(default = "default_include_tests")]
     pub include_tests: bool,
+    /// Reference-site scope. Selected lines do not prove whole-caller deltas.
+    #[serde(default)]
+    pub call_edges: DiffCallEdges,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffCallEdges {
+    #[default]
+    ChangedLines,
+    ChangedFiles,
+    Omit,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffCallStatus {
+    Complete,
+    Incomplete,
+    Omitted,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DiffCallEndpoint {
+    pub complete: bool,
+    pub incomplete_reasons: Vec<UsageGraphIncompleteReason>,
+}
+
+/// Completion refers only to the named site scope; omitted facts are not empty
+/// complete call relations. `score_diff` always requests changed-file facts.
+#[derive(Debug, Clone, Serialize)]
+pub struct DiffCallAnalysis {
+    pub scope: DiffCallEdges,
+    pub status: DiffCallStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base: Option<DiffCallEndpoint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<DiffCallEndpoint>,
+}
+
+impl DiffCallAnalysis {
+    fn omitted() -> Self {
+        Self {
+            scope: DiffCallEdges::Omit,
+            status: DiffCallStatus::Omitted,
+            base: None,
+            target: None,
+        }
+    }
+
+    fn from_graphs(
+        scope: DiffCallEdges,
+        before: &UsageGraphResult,
+        after: &UsageGraphResult,
+    ) -> Self {
+        let endpoint = |graph: &UsageGraphResult| DiffCallEndpoint {
+            complete: graph.complete,
+            incomplete_reasons: graph.incomplete_reasons.clone(),
+        };
+        Self {
+            scope,
+            status: if before.complete && after.complete {
+                DiffCallStatus::Complete
+            } else {
+                DiffCallStatus::Incomplete
+            },
+            base: Some(endpoint(before)),
+            target: Some(endpoint(after)),
+        }
+    }
 }
 
 /// Endpoint selectors shared by diff-derived tools.
@@ -83,6 +155,7 @@ fn default_include_tests() -> bool {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DiffAnalysisResult {
+    pub call_analysis: DiffCallAnalysis,
     pub endpoints: DiffEndpoints,
     pub file_changes: Vec<FileChange>,
     pub patch_symbols: PatchSymbols,
@@ -392,6 +465,12 @@ struct EdgeKey {
     language: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum DiffEdgeKey {
+    Declaration(DeclarationId, DeclarationId),
+    LegacyName(EdgeKey),
+}
+
 /// One end of a diff: a commit, a bare tree, or the live working tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Snapshot {
@@ -554,7 +633,29 @@ pub fn analyze_diff_at_root(
         options,
         cancellation,
     )?;
-    analyze_prepared_diff(&prepared, params.include_tests)
+    if params.call_edges == DiffCallEdges::Omit {
+        let paired = analyze_prepared_symbol_changes(&prepared, params.include_tests)?;
+        let (before, after) = paired.endpoint_analyzers();
+        let imports = import_changes(before, after, &paired.context.changed_paths);
+        return Ok(DiffAnalysisResult {
+            call_analysis: DiffCallAnalysis::omitted(),
+            endpoints: DiffEndpoints {
+                base: prepared.base.label(),
+                target: prepared.target.label(),
+            },
+            file_changes: prepared.file_changes.clone(),
+            patch_symbols: paired.into_symbol_changes().into_patch_symbols(),
+            dependency_symbols: Vec::new(),
+            import_changes: imports,
+            unattributed_call_edge_changes: Vec::new(),
+            large_callsite_symbols: Vec::new(),
+        });
+    }
+    if params.call_edges == DiffCallEdges::ChangedFiles {
+        return analyze_prepared_diff(&prepared, params.include_tests);
+    }
+    analyze_prepared_diff_scoped(&prepared, params.include_tests, params.call_edges)
+        .map(|analyzed| analyzed.result)
 }
 
 /// A resolved diff and its Git metadata, shared by tools derived from a diff.
@@ -562,6 +663,7 @@ pub fn analyze_diff_at_root(
 /// The repository owner remains attached because immutable comparisons may use
 /// a private bare repository whose lifetime must cover subsequent exports.
 pub(crate) struct PreparedDiff {
+    cancellation: CancellationToken,
     repository: DiffRepository,
     /// Mixed immutable/worktree comparisons need the live repository for
     /// worktree metadata, but immutable endpoint materialization must use the
@@ -632,6 +734,7 @@ impl PreparedDiff {
             None
         };
         Ok(Self {
+            cancellation: cancellation.clone(),
             repository,
             immutable_repository,
             shared_cache,
@@ -863,18 +966,21 @@ fn analyze_prepared_symbol_changes_from_images(
         pair_endpoints(&before, &after, file_changes)
     };
     for (pre, post) in &endpoint_pairing.pairs {
-        // A paired symbol is only *moved* when it genuinely relocated -- its
-        // name changed (body-identity pairing matched it under a new fqn), its
-        // file changed, or its position changed by more than the patch's own
-        // line offset accounts for. A symbol whose start line merely shifted
-        // because lines were inserted/deleted ELSEWHERE in the file has not
-        // moved; reporting it as such floods the result with one entry per
-        // symbol below any early edit (a single insert near the top of a large
-        // file otherwise yields hundreds of spurious "moved" rows).
-        let relocated = pre.symbol.fqn != post.symbol.fqn
-            || pre.symbol.path != post.symbol.path
-            || (pre.symbol.start_line != post.symbol.start_line
-                && !is_pure_line_shift(&pre.symbol, &post.symbol, changed_lines));
+        // A paired symbol is *moved* only when it changed file. Within one file
+        // the only pairing rule is identity, so the symbol keeps its fqn and
+        // name, and a start line that moved is a shift caused by edits elsewhere
+        // in the file: it is reported as an edit below when its own lines were
+        // touched, and not at all otherwise. Reporting a shift as a move floods
+        // the result with one entry per symbol below any early edit (#1897, and
+        // #4423 for generated files). Body-similarity pairs are cross-file only
+        // (see `pair_endpoints`).
+        debug_assert!(
+            pre.symbol.path != post.symbol.path || pre.symbol.fqn == post.symbol.fqn,
+            "a same-file pair must share its fqn: {} -> {}",
+            pre.symbol.fqn,
+            post.symbol.fqn
+        );
+        let relocated = pre.symbol.path != post.symbol.path;
         let fallback_score = endpoint_pairing.fallback_paired.get(&pre.key).copied();
         if relocated {
             moved.push(PairedMovedSymbol {
@@ -1001,19 +1107,20 @@ pub(crate) fn analyze_prepared_diff_with_endpoints(
     prepared: &PreparedDiff,
     include_tests: bool,
 ) -> Result<AnalyzedDiff, String> {
-    let (changed_paths, base_paths, target_paths) = symbol_change_paths(prepared);
-    let base_repository = prepared.repository_for(prepared.base);
+    analyze_prepared_diff_scoped(prepared, include_tests, DiffCallEdges::ChangedFiles)
+}
+
+fn analyze_prepared_diff_scoped(
+    prepared: &PreparedDiff,
+    include_tests: bool,
+    call_edges: DiffCallEdges,
+) -> Result<AnalyzedDiff, String> {
+    let PreparedDiffBase {
+        changed_paths,
+        target_paths,
+        image: base_image,
+    } = materialize_prepared_diff_base(prepared)?;
     let target_repository = prepared.repository_for(prepared.target);
-    let base_image = {
-        let _scope = profiling::scope("diff_exact.materialize_base");
-        RevisionImage::materialize(
-            &base_repository.repo,
-            prepared.base,
-            Some(&base_paths),
-            &base_repository.alternate_object_dirs,
-            prepared.shared_cache(),
-        )?
-    };
     let target_image = {
         let _scope = profiling::scope("diff_exact.materialize_target");
         RevisionImage::materialize(
@@ -1030,6 +1137,7 @@ pub(crate) fn analyze_prepared_diff_with_endpoints(
         base_image,
         target_image,
         changed_paths,
+        call_edges,
     )
 }
 
@@ -1038,18 +1146,11 @@ pub(crate) fn analyze_prepared_diff_with_target_image(
     include_tests: bool,
     whole_target: &EndpointAnalysis,
 ) -> Result<AnalyzedDiff, String> {
-    let (changed_paths, base_paths, target_paths) = symbol_change_paths(prepared);
-    let base_repository = prepared.repository_for(prepared.base);
-    let base_image = {
-        let _scope = profiling::scope("diff_exact.materialize_base");
-        RevisionImage::materialize(
-            &base_repository.repo,
-            prepared.base,
-            Some(&base_paths),
-            &base_repository.alternate_object_dirs,
-            prepared.shared_cache(),
-        )?
-    };
+    let PreparedDiffBase {
+        changed_paths,
+        target_paths,
+        image: base_image,
+    } = materialize_prepared_diff_base(prepared)?;
     let target_image = {
         let _scope = profiling::scope("diff_exact.materialize_target_scope");
         materialize_target_scope_from_whole_image(prepared, whole_target, &target_paths)?
@@ -1060,7 +1161,34 @@ pub(crate) fn analyze_prepared_diff_with_target_image(
         base_image,
         target_image,
         changed_paths,
+        DiffCallEdges::ChangedFiles,
     )
+}
+
+struct PreparedDiffBase {
+    changed_paths: Vec<String>,
+    target_paths: Vec<String>,
+    image: RevisionImage,
+}
+
+fn materialize_prepared_diff_base(prepared: &PreparedDiff) -> Result<PreparedDiffBase, String> {
+    let (changed_paths, base_paths, target_paths) = symbol_change_paths(prepared);
+    let base_repository = prepared.repository_for(prepared.base);
+    let image = {
+        let _scope = profiling::scope("diff_exact.materialize_base");
+        RevisionImage::materialize(
+            &base_repository.repo,
+            prepared.base,
+            Some(&base_paths),
+            &base_repository.alternate_object_dirs,
+            prepared.shared_cache(),
+        )?
+    };
+    Ok(PreparedDiffBase {
+        changed_paths,
+        target_paths,
+        image,
+    })
 }
 
 fn analyze_prepared_diff_from_images(
@@ -1069,6 +1197,7 @@ fn analyze_prepared_diff_from_images(
     base_image: RevisionImage,
     target_image: RevisionImage,
     changed_paths: Vec<String>,
+    call_edges: DiffCallEdges,
 ) -> Result<AnalyzedDiff, String> {
     let PreparedSymbolChanges {
         symbol_changes,
@@ -1109,36 +1238,76 @@ fn analyze_prepared_diff_from_images(
     );
     // Parsing is serialized by the shared-store build lock. Once both
     // analyzers exist, their independent query work can share the query pool.
-    let (graph_before, graph_after) = rayon::join(
+    let selected_before = prepared
+        .changed_lines
+        .iter()
+        .filter(|(path, _)| is_parseable_path(path))
+        .map(|(path, lines)| (path.clone(), lines.old.clone()))
+        .collect();
+    let selected_after = prepared
+        .changed_lines
+        .iter()
+        .filter(|(path, _)| is_parseable_path(path))
+        .map(|(path, lines)| (path.clone(), lines.new.clone()))
+        .collect();
+    let cancellation = &prepared.cancellation;
+    let (mut graph_before, mut graph_after) = rayon::join(
         || {
-            usage_graph(
+            if call_edges == DiffCallEdges::ChangedLines {
+                return usage_graph_at_lines(
+                    base_analyzer.analyzer(),
+                    &selected_before,
+                    include_tests,
+                    cancellation,
+                );
+            }
+            usage_graph_with_cancellation(
                 base_analyzer.analyzer(),
                 UsageGraphParams {
                     include_tests,
                     paths: Some(changed_paths.clone()),
                     depth: 1,
                 },
+                cancellation.clone(),
             )
         },
         || {
-            usage_graph(
+            if call_edges == DiffCallEdges::ChangedLines {
+                return usage_graph_at_lines(
+                    target_analyzer.analyzer(),
+                    &selected_after,
+                    include_tests,
+                    cancellation,
+                );
+            }
+            usage_graph_with_cancellation(
                 target_analyzer.analyzer(),
                 UsageGraphParams {
                     include_tests,
                     paths: Some(changed_paths.clone()),
                     depth: 1,
                 },
+                cancellation.clone(),
             )
         },
     );
+    if call_edges == DiffCallEdges::ChangedLines {
+        ensure_unambiguous_diff_attribution(base_analyzer.analyzer(), &mut graph_before);
+        ensure_unambiguous_diff_attribution(target_analyzer.analyzer(), &mut graph_after);
+    }
+    if call_edges == DiffCallEdges::ChangedLines {
+        refuse_uncertain_moved_correspondence(&mut graph_before, &mut graph_after, &moved);
+    }
+    let call_analysis = DiffCallAnalysis::from_graphs(call_edges, &graph_before, &graph_after);
     let CallEdgeDiff {
         deltas,
         dependency_symbols,
     } = diff_call_edges(
-        &graph_before.edges,
-        &graph_after.edges,
+        &graph_before,
+        &graph_after,
         &fqn_renames(&moved),
         &after,
+        call_edges,
     );
 
     // Hand each patch symbol the callee delta recorded under its name, so the
@@ -1201,6 +1370,7 @@ fn analyze_prepared_diff_from_images(
 
     Ok(AnalyzedDiff {
         result: DiffAnalysisResult {
+            call_analysis,
             endpoints: DiffEndpoints {
                 base: base.label(),
                 target: target.label(),
@@ -1299,6 +1469,50 @@ fn add_odb_alternate(repo: &Repository, path: &Path, description: &str) -> Resul
     repo.odb()
         .and_then(|odb| odb.add_disk_alternate(path_str))
         .map_err(|err| format!("unable to attach {description} {}: {err}", path.display()))
+}
+
+/// Changed hunks in the head buffer, as half-open byte ranges. Context lines
+/// are excluded; a deletion is a zero-width position in the head. This uses
+/// the same libgit2 diff machinery as repository diff analysis, without
+/// interpreting rendered patches or reading the live working tree.
+pub fn changed_buffer_ranges(
+    base: &str,
+    head: &str,
+) -> Result<Vec<std::ops::Range<usize>>, String> {
+    let mut options = DiffOptions::new();
+    options.context_lines(0).interhunk_lines(0);
+    let patch = git2::Patch::from_buffers(
+        base.as_bytes(),
+        None,
+        head.as_bytes(),
+        None,
+        Some(&mut options),
+    )
+    .map_err(|error| format!("unable to compare source buffers: {error}"))?;
+    // libgit2 counts LF-delimited lines. A lone CR is content, whereas the
+    // display-coordinate helper also treats it as a line break.
+    let starts = std::iter::once(0)
+        .chain(
+            head.bytes()
+                .enumerate()
+                .filter_map(|(offset, byte)| (byte == b'\n').then_some(offset + 1)),
+        )
+        .collect::<Vec<_>>();
+    let offset = |line: usize| starts.get(line).copied().unwrap_or(head.len());
+    (0..patch.num_hunks())
+        .map(|index| {
+            let (hunk, _) = patch
+                .hunk(index)
+                .map_err(|error| format!("unable to read source hunk: {error}"))?;
+            let count = hunk.new_lines() as usize;
+            let start = if count == 0 {
+                hunk.new_start() as usize
+            } else {
+                hunk.new_start() as usize - 1
+            };
+            Ok(offset(start)..offset(start + count))
+        })
+        .collect()
 }
 
 fn diff_metadata(
@@ -1482,6 +1696,12 @@ pub(crate) enum RevisionImage {
     },
 }
 
+fn worktree_root(repo: &Repository) -> Result<PathBuf, String> {
+    repo.workdir().map(Path::to_path_buf).ok_or_else(|| {
+        "repository has no working tree; pass an explicit `target` commit".to_string()
+    })
+}
+
 impl RevisionImage {
     /// Assemble a snapshot image from one materialization's `(path, blob id)`
     /// inventory.
@@ -1544,13 +1764,7 @@ impl RevisionImage {
                 Self::snapshot(temp, exported, Vec::new(), repo, alternate_object_dirs)
             }
             Snapshot::Worktree => {
-                let root = repo
-                    .workdir()
-                    .ok_or_else(|| {
-                        "repository has no working tree; pass an explicit `target` commit"
-                            .to_string()
-                    })?
-                    .to_path_buf();
+                let root = worktree_root(repo)?;
                 let files = match paths {
                     Some(paths) => worktree_files(&root, paths)?,
                     None => {
@@ -1592,13 +1806,7 @@ impl RevisionImage {
                 Self::snapshot(temp, exported, Vec::new(), repo, alternate_object_dirs)
             }
             Snapshot::Worktree => {
-                let root = repo
-                    .workdir()
-                    .ok_or_else(|| {
-                        "repository has no working tree; pass an explicit `target` commit"
-                            .to_string()
-                    })?
-                    .to_path_buf();
+                let root = worktree_root(repo)?;
                 let files = worktree_symbol_files(&root, paths)?;
                 Ok(Self::Worktree { root, files })
             }
@@ -1639,13 +1847,7 @@ impl RevisionImage {
                 )
             }
             Snapshot::Worktree => {
-                let root = repo
-                    .workdir()
-                    .ok_or_else(|| {
-                        "repository has no working tree; pass an explicit `target` commit"
-                            .to_string()
-                    })?
-                    .to_path_buf();
+                let root = worktree_root(repo)?;
                 let project = FilesystemProject::new(&root).map_err(|err| {
                     format!("unable to list working tree {}: {err}", root.display())
                 })?;
@@ -1853,18 +2055,16 @@ impl RevisionExport {
     ) -> Result<RevisionWorkspace, String> {
         let cache = SharedAnalyzerCache::open(repository_root, cancellation)
             .map_err(|error| error.to_string())?;
-        // Claimed before the build, so a build that fails partway still leaves
-        // no rows naming this export's directory behind.
-        let projection = cache.claim_revision_workspace(self.image.root());
         let (project, blobs) = self.image.project();
         let blobs = blobs.expect(
             "an export always materializes a snapshot image, which carries the revision's blob ids",
         );
-        let workspace =
-            WorkspaceAnalyzer::build_revision_image(project, config, None, Some(&cache), blobs)
-                .map_err(|error| {
-                    format!("Failed to build the revision export analyzer: {error}")
-                })?;
+        let (workspace, projection) =
+            build_with_revision_projection(self.image.root(), Some(&cache), || {
+                WorkspaceAnalyzer::build_revision_image(project, config, None, Some(&cache), blobs)
+            })
+            .map_err(|error| format!("Failed to build the revision export analyzer: {error}"))?;
+        let projection = projection.expect("a revision export always has a shared cache");
         Ok(RevisionWorkspace {
             workspace,
             _projection: projection,
@@ -1900,19 +2100,7 @@ impl RevisionWorkspace {
 /// finding identity computed over the export joins with one computed over the
 /// live workspace.
 pub fn export_revision(workspace_root: &Path, revision: &str) -> Result<RevisionExport, String> {
-    let repo = Repository::discover(workspace_root).map_err(|err| {
-        format!(
-            "workspace root {} is not inside a git repository: {err}",
-            workspace_root.display()
-        )
-    })?;
-    let commit_id = match resolve_snapshot(&repo, revision)? {
-        Snapshot::Commit(oid) => oid,
-        Snapshot::Tree(_) => {
-            return Err(format!("revision `{revision}` is a tree, not a commit"));
-        }
-        Snapshot::Worktree => unreachable!("explicit revisions never resolve to worktree"),
-    };
+    let (repo, commit_id) = resolve_revision_commit(workspace_root, revision)?;
     let tree = workspace_subtree(&repo, workspace_root, commit_id, revision)?;
     let tree_id = tree.id();
     let subtree = Snapshot::Tree(tree_id);
@@ -1975,19 +2163,7 @@ pub fn resolve_revision_subtree(
     workspace_root: &Path,
     revision: &str,
 ) -> Result<RevisionSubtree, String> {
-    let repository = Repository::discover(workspace_root).map_err(|err| {
-        format!(
-            "workspace root {} is not inside a git repository: {err}",
-            workspace_root.display()
-        )
-    })?;
-    let commit_id = match resolve_snapshot(&repository, revision)? {
-        Snapshot::Commit(oid) => oid,
-        Snapshot::Tree(_) => {
-            return Err(format!("revision `{revision}` is a tree, not a commit"));
-        }
-        Snapshot::Worktree => unreachable!("explicit revisions never resolve to worktree"),
-    };
+    let (repository, commit_id) = resolve_revision_commit(workspace_root, revision)?;
     let tree = workspace_subtree(&repository, workspace_root, commit_id, revision)?;
     let tree_id = tree.id();
     let mut blobs = Vec::new();
@@ -2024,6 +2200,26 @@ pub fn resolve_revision_subtree(
         tree_id,
         blobs,
     })
+}
+
+fn resolve_revision_commit(
+    workspace_root: &Path,
+    revision: &str,
+) -> Result<(Repository, Oid), String> {
+    let repository = Repository::discover(workspace_root).map_err(|err| {
+        format!(
+            "workspace root {} is not inside a git repository: {err}",
+            workspace_root.display()
+        )
+    })?;
+    let commit_id = match resolve_snapshot(&repository, revision)? {
+        Snapshot::Commit(oid) => oid,
+        Snapshot::Tree(_) => {
+            return Err(format!("revision `{revision}` is a tree, not a commit"));
+        }
+        Snapshot::Worktree => unreachable!("explicit revisions never resolve to worktree"),
+    };
+    Ok((repository, commit_id))
 }
 
 /// The tree holding `commit_id`'s content at `workspace_root`.
@@ -2118,17 +2314,7 @@ fn worktree_files(root: &Path, paths: &[String]) -> Result<Vec<PathBuf>, String>
     let mut present = worktree_symbol_files(root, paths)?
         .into_iter()
         .collect::<BTreeSet<_>>();
-    let mut changed = Vec::with_capacity(paths.len());
-    for raw_path in paths {
-        let rel = safe_tree_entry_path(raw_path)?;
-        let absolute = root.join(&rel);
-        let is_regular_file = fs::symlink_metadata(&absolute)
-            .map(|metadata| metadata.is_file())
-            .unwrap_or(false);
-        if is_regular_file {
-            changed.push(rel);
-        }
-    }
+    let changed = worktree_regular_file_paths(root, paths)?;
     for target in worktree_import_expansion_targets(root, &changed)? {
         match target {
             ImportExpansionTarget::Directory(dir) => {
@@ -2148,56 +2334,71 @@ fn worktree_files(root: &Path, paths: &[String]) -> Result<Vec<PathBuf>, String>
 }
 
 fn worktree_symbol_files(root: &Path, paths: &[String]) -> Result<Vec<PathBuf>, String> {
-    let mut present = BTreeSet::new();
+    let mut present = worktree_regular_file_paths(root, paths)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    present.extend(symbol_identity_ancestor_paths_fs(root, paths));
+    Ok(present.into_iter().collect())
+}
+
+fn worktree_regular_file_paths(root: &Path, paths: &[String]) -> Result<Vec<PathBuf>, String> {
+    let mut present = Vec::with_capacity(paths.len());
     for raw_path in paths {
         let rel = safe_tree_entry_path(raw_path)?;
         let is_regular_file = fs::symlink_metadata(root.join(&rel))
             .map(|metadata| metadata.is_file())
             .unwrap_or(false);
         if is_regular_file {
-            present.insert(rel);
+            present.push(rel);
         }
     }
-    present.extend(symbol_identity_ancestor_paths_fs(root, paths));
-    Ok(present.into_iter().collect())
+    Ok(present)
 }
 
 /// Analyzer configuration and package-identity files sitting directly inside
 /// an ancestor directory of a changed path, up to `root`, deduplicated across
 /// `paths`. Filesystem analog of [`symbol_identity_ancestor_paths`].
 fn symbol_identity_ancestor_paths_fs(root: &Path, paths: &[String]) -> Vec<PathBuf> {
-    let mut visited_dirs = BTreeSet::new();
     let mut ambient = Vec::new();
+    for current in symbol_identity_ancestor_directories(paths) {
+        for entry in fs::read_dir(root.join(&current))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let path = entry.path();
+            if symbol_identity_file(&path)
+                && fs::symlink_metadata(&path)
+                    .map(|metadata| metadata.file_type().is_file())
+                    .unwrap_or(false)
+                && let Ok(rel_file) = path.strip_prefix(root)
+            {
+                ambient.push(rel_file.to_path_buf());
+            }
+        }
+    }
+    ambient
+}
+
+fn symbol_identity_ancestor_directories(paths: &[String]) -> Vec<PathBuf> {
+    let mut visited_dirs = BTreeSet::new();
+    let mut directories = Vec::new();
     for raw_path in paths {
         let Ok(rel) = safe_tree_entry_path(raw_path) else {
             continue;
         };
         let mut dir = rel.parent();
         while let Some(current) = dir {
-            // See `symbol_identity_ancestor_paths`: once a directory is
-            // revisited, the rest of this path's ancestors were already swept.
+            // Every ancestor of a visited directory was visited in the same
+            // pass, so once a directory repeats the remaining parents did too.
             if !visited_dirs.insert(current.to_path_buf()) {
                 break;
             }
-            for entry in fs::read_dir(root.join(current))
-                .into_iter()
-                .flatten()
-                .flatten()
-            {
-                let path = entry.path();
-                if symbol_identity_file(&path)
-                    && fs::symlink_metadata(&path)
-                        .map(|metadata| metadata.file_type().is_file())
-                        .unwrap_or(false)
-                    && let Ok(rel_file) = path.strip_prefix(root)
-                {
-                    ambient.push(rel_file.to_path_buf());
-                }
-            }
+            directories.push(current.to_path_buf());
             dir = current.parent();
         }
     }
-    ambient
+    directories
 }
 
 /// Something an import's own repo-relative directory/file might resolve to,
@@ -2242,23 +2443,9 @@ pub(crate) fn resolved_imports_of(
     let scope = AnalyzerQueryScope::new(analyzer);
     let token = scope.token();
     let importing_dir = rel.parent().unwrap_or_else(|| Path::new(""));
-    let mut targets = Vec::new();
-    for info in provider.import_info_of(token, &file) {
-        for import_target in import_targets(&info) {
-            if let Some((path, is_directory)) =
-                resolve_import_target(importing_dir, &import_target, |candidate| {
-                    worktree_entry_kind(root, candidate)
-                })
-            {
-                targets.push(if is_directory {
-                    ImportExpansionTarget::Directory(path)
-                } else {
-                    ImportExpansionTarget::File(path)
-                });
-            }
-        }
-    }
-    targets
+    import_expansion_targets_for_file(provider, token, &file, importing_dir, &|candidate| {
+        worktree_entry_kind(root, candidate)
+    })
 }
 
 /// Import expansion for a committed endpoint, whose `root` is the private
@@ -2353,17 +2540,35 @@ fn collect_import_expansion_targets(
             continue;
         };
         let importing_dir = rel.parent().unwrap_or_else(|| Path::new(""));
-        for info in provider.import_info_of(token, &file) {
-            for import_target in import_targets(&info) {
-                if let Some((path, is_directory)) =
-                    resolve_import_target(importing_dir, &import_target, &entry_kind)
-                {
-                    targets.push(if is_directory {
-                        ImportExpansionTarget::Directory(path)
-                    } else {
-                        ImportExpansionTarget::File(path)
-                    });
-                }
+        targets.extend(import_expansion_targets_for_file(
+            provider,
+            token,
+            &file,
+            importing_dir,
+            &entry_kind,
+        ));
+    }
+    targets
+}
+
+fn import_expansion_targets_for_file(
+    provider: &dyn ImportAnalysisProvider,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+    importing_dir: &Path,
+    entry_kind: &impl Fn(&Path) -> Option<bool>,
+) -> Vec<ImportExpansionTarget> {
+    let mut targets = Vec::new();
+    for info in provider.import_info_of(token, file) {
+        for import_target in import_targets(&info) {
+            if let Some((path, is_directory)) =
+                resolve_import_target(importing_dir, &import_target, entry_kind)
+            {
+                targets.push(if is_directory {
+                    ImportExpansionTarget::Directory(path)
+                } else {
+                    ImportExpansionTarget::File(path)
+                });
             }
         }
     }
@@ -2717,9 +2922,8 @@ impl Project for RevisionImageProject {
     }
 
     fn is_bifrostignored(&self, rel_path: &Path) -> bool {
-        let file = ProjectFile::new(self.root().to_path_buf(), rel_path.to_path_buf());
         self.bifrost_ignore()
-            .is_ok_and(|ignore| ignore.is_ignored(&file))
+            .is_ok_and(|ignore| ignore.is_ignored_path(rel_path))
     }
 
     fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile> {
@@ -2793,11 +2997,7 @@ impl Project for RevisionImageProject {
     ) -> std::io::Result<Option<crate::analyzer::ProjectSourceSnapshot>> {
         match self.revision_bytes(file) {
             Some(bytes) => {
-                let bytes = bytes?;
-                if bytes.len() > max_bytes {
-                    return Ok(None);
-                }
-                crate::analyzer::ProjectSourceSnapshot::disk_bytes(bytes).map(Some)
+                crate::analyzer::ProjectSourceSnapshot::disk_bytes_limited(bytes?, max_bytes)
             }
             None => self.files.read_source_snapshot_limited(file, max_bytes),
         }
@@ -2842,12 +3042,19 @@ impl RevisionImageProject {
     /// resolution can see the path (see `create_empty_source_files`), so
     /// reading disk first would hand every caller an empty file.
     fn revision_bytes(&self, file: &ProjectFile) -> Option<std::io::Result<Vec<u8>>> {
-        let oid = self.object_blobs.oid_for(file)?;
-        Some(self.read_object_blob(file, oid))
+        self.revision_bytes_from(file, &self.object_blobs)
     }
 
     fn fallback_revision_bytes(&self, file: &ProjectFile) -> Option<std::io::Result<Vec<u8>>> {
-        let oid = self.blobs.oid_for(file)?;
+        self.revision_bytes_from(file, &self.blobs)
+    }
+
+    fn revision_bytes_from(
+        &self,
+        file: &ProjectFile,
+        identities: &RevisionBlobIdentities,
+    ) -> Option<std::io::Result<Vec<u8>>> {
+        let oid = identities.oid_for(file)?;
         Some(self.read_object_blob(file, oid))
     }
 
@@ -2926,13 +3133,21 @@ fn export_snapshot_symbol_files_from_tree(
 ) -> Result<Vec<(PathBuf, Oid)>, String> {
     let exported =
         export_snapshot_symbol_files_from_tree_with(repo, tree, root, paths, |rel, oid| {
-            let blob = repo
-                .find_blob(oid)
-                .map_err(|err| format!("unable to read blob `{}`: {err}", rel.display()))?;
-            write_private_file(&root.join(rel), blob.content())?;
-            set_private_file_permissions(&root.join(rel))
+            export_snapshot_blob(repo, root, rel, oid)
         })?;
     Ok(exported)
+}
+
+fn export_snapshot_blob(
+    repo: &Repository,
+    root: &Path,
+    rel: &Path,
+    oid: Oid,
+) -> Result<(), String> {
+    let blob = repo
+        .find_blob(oid)
+        .map_err(|err| format!("unable to read blob `{}`: {err}", rel.display()))?;
+    write_private_file(&root.join(rel), blob.content())
 }
 
 fn export_snapshot_symbol_files_from_tree_with<F>(
@@ -2976,11 +3191,7 @@ fn export_snapshot_files(
 ) -> Result<Vec<(PathBuf, Oid)>, String> {
     let tree = snapshot_tree(repo, snapshot)?;
     export_snapshot_files_from_tree(repo, &tree, root, paths, cache, |rel, oid| {
-        let blob = repo
-            .find_blob(oid)
-            .map_err(|err| format!("unable to read blob `{}`: {err}", rel.display()))?;
-        write_private_file(&root.join(rel), blob.content())?;
-        set_private_file_permissions(&root.join(rel))
+        export_snapshot_blob(repo, root, rel, oid)
     })
 }
 
@@ -3540,30 +3751,16 @@ fn symbol_identity_ancestor_paths(
         }
     }
 
-    let mut visited_dirs = BTreeSet::new();
     let mut ambient = Vec::new();
-    for raw_path in paths {
-        let Ok(rel) = safe_tree_entry_path(raw_path) else {
-            continue;
-        };
-        let mut dir = rel.parent();
-        while let Some(current) = dir {
-            // Every ancestor of an already-visited directory was visited
-            // in the same pass that visited it, so once we hit one, the
-            // rest of this path's ancestors were already swept too.
-            if !visited_dirs.insert(current.to_path_buf()) {
-                break;
-            }
-            if current.as_os_str().is_empty() {
-                push_blobs(tree, "", &mut ambient);
-            } else if let Ok(dir_tree) = tree
-                .get_path(current)
-                .and_then(|entry| entry.to_object(repo))
-                .and_then(|object| object.peel_to_tree())
-            {
-                push_blobs(&dir_tree, &format!("{}/", current.display()), &mut ambient);
-            }
-            dir = current.parent();
+    for current in symbol_identity_ancestor_directories(paths) {
+        if current.as_os_str().is_empty() {
+            push_blobs(tree, "", &mut ambient);
+        } else if let Ok(dir_tree) = tree
+            .get_path(&current)
+            .and_then(|entry| entry.to_object(repo))
+            .and_then(|object| object.peel_to_tree())
+        {
+            push_blobs(&dir_tree, &format!("{}/", current.display()), &mut ambient);
         }
     }
     ambient
@@ -3664,12 +3861,16 @@ fn write_private_file(path: &Path, contents: &[u8]) -> Result<(), String> {
         .open(path)
         .map_err(|err| format!("unable to write {}: {err}", path.display()))?;
     file.write_all(contents)
-        .map_err(|err| format!("unable to write {}: {err}", path.display()))
+        .map_err(|err| format!("unable to write {}: {err}", path.display()))?;
+    drop(file);
+    set_private_file_permissions(path)
 }
 
 #[cfg(not(unix))]
 fn write_private_file(path: &Path, contents: &[u8]) -> Result<(), String> {
-    fs::write(path, contents).map_err(|err| format!("unable to write {}: {err}", path.display()))
+    fs::write(path, contents)
+        .map_err(|err| format!("unable to write {}: {err}", path.display()))?;
+    set_private_file_permissions(path)
 }
 
 #[cfg(unix)]
@@ -3719,7 +3920,7 @@ fn safe_tree_entry_path(name: &str) -> Result<PathBuf, String> {
     }
 }
 
-fn is_regular_file_mode(mode: i32) -> bool {
+pub(crate) fn is_regular_file_mode(mode: i32) -> bool {
     mode == i32::from(FileMode::Blob)
         || mode == i32::from(FileMode::BlobGroupWritable)
         || mode == i32::from(FileMode::BlobExecutable)
@@ -3763,6 +3964,19 @@ pub(crate) struct RevisionAnalyzer {
     _projection: Option<WorkspaceProjectionLease>,
 }
 
+fn build_with_revision_projection(
+    root: &Path,
+    cache: Option<&SharedAnalyzerCache>,
+    build: impl FnOnce() -> Result<WorkspaceAnalyzer, crate::analyzer::store::StoreError>,
+) -> Result<(WorkspaceAnalyzer, Option<WorkspaceProjectionLease>), crate::analyzer::store::StoreError>
+{
+    // Claimed before the build, so a build that fails partway still leaves no
+    // workspace rows naming this image's root behind.
+    let projection = cache.map(|cache| cache.claim_revision_workspace(root));
+    let workspace = build()?;
+    Ok((workspace, projection))
+}
+
 impl RevisionAnalyzer {
     fn build(
         image: &RevisionImage,
@@ -3778,28 +3992,27 @@ impl RevisionAnalyzer {
             RevisionImage::Snapshot { .. } => cache,
             RevisionImage::Worktree { .. } => None,
         };
-        // Claimed before the build, so a build that fails partway still leaves
-        // no workspace rows behind.
-        let projection = cache.map(|cache| cache.claim_revision_workspace(image.root()));
-        let workspace = match blobs {
-            Some(blobs) => WorkspaceAnalyzer::build_revision_image(
-                project,
-                AnalyzerConfig::default(),
-                languages,
-                cache,
-                blobs,
-            ),
-            None => match languages {
-                Some(languages) => WorkspaceAnalyzer::build_ephemeral_for_languages_footgun(
+        let (workspace, projection) =
+            build_with_revision_projection(image.root(), cache, || match blobs {
+                Some(blobs) => WorkspaceAnalyzer::build_revision_image(
                     project,
                     AnalyzerConfig::default(),
                     languages,
+                    cache,
+                    blobs,
                 ),
-                None => {
-                    WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default())
-                }
-            },
-        }?;
+                None => match languages {
+                    Some(languages) => WorkspaceAnalyzer::build_ephemeral_for_languages_footgun(
+                        project,
+                        AnalyzerConfig::default(),
+                        languages,
+                    ),
+                    None => WorkspaceAnalyzer::build_ephemeral_footgun(
+                        project,
+                        AnalyzerConfig::default(),
+                    ),
+                },
+            })?;
         Ok(Self {
             workspace,
             _projection: projection,
@@ -3824,15 +4037,15 @@ impl RevisionAnalyzer {
             root.to_path_buf(),
             files.iter().cloned(),
         ));
-        // Claimed before the build, as in `build` above.
-        let projection = cache.map(|cache| cache.claim_revision_workspace(root));
-        let workspace = WorkspaceAnalyzer::build_revision_image(
-            project,
-            AnalyzerConfig::default(),
-            None,
-            cache,
-            blobs,
-        )?;
+        let (workspace, projection) = build_with_revision_projection(root, cache, || {
+            WorkspaceAnalyzer::build_revision_image(
+                project,
+                AnalyzerConfig::default(),
+                None,
+                cache,
+                blobs,
+            )
+        })?;
         Ok(Self {
             workspace,
             _projection: projection,
@@ -3890,7 +4103,7 @@ fn symbol_snapshot_map(
         if unit.is_synthetic() {
             continue;
         }
-        let path = rel_path(unit.source());
+        let path = brokk_bifrost_core::path_utils::rel_path_string(unit.source());
         // Symbol-level test filtering (#1102): filter a declaration only when it
         // is itself in a structurally-evidenced test region or under a test-tree
         // path, so production symbols in a file with inline tests still surface.
@@ -3899,7 +4112,7 @@ fn symbol_snapshot_map(
         if is_test && !include_tests {
             continue;
         }
-        let Some(range) = primary_range(analyzer, &unit) else {
+        let Some(range) = crate::analyzer::primary_range(&analyzer.ranges(&unit)) else {
             continue;
         };
         let language = language_for_path(unit.source().rel_path());
@@ -3983,7 +4196,9 @@ struct EndpointPairing<'a> {
 /// internal edits -- keeps neither its key nor a rename bucket. Leftovers are
 /// paired by token-similarity of their bodies, greedily and one-to-one above a
 /// threshold, so a relocated-and-renamed symbol still lines up. Trivial bodies
-/// never participate.
+/// never participate. Only cross-file candidates pair this way: a same-file
+/// symbol whose name and body both changed is a rewrite of one declaration, so
+/// it stays a deletion plus an introduction (#4423).
 fn pair_endpoints<'a>(
     before: &'a BTreeMap<SymbolKey, SymbolSnapshot>,
     after: &'a BTreeMap<SymbolKey, SymbolSnapshot>,
@@ -4132,6 +4347,9 @@ fn pair_endpoints<'a>(
         let mut scored: Vec<(f64, &'a SymbolSnapshot, &'a SymbolSnapshot)> = Vec::new();
         for (pre_idx, (pre, pre_sig)) in pre_candidates.iter().enumerate() {
             for (post_idx, (post, post_sig)) in post_candidates.iter().enumerate() {
+                if pre.symbol.path == post.symbol.path {
+                    continue;
+                }
                 // Size-ratio prefilter -- a pure fast-path, not a behavior
                 // change: see `within_fuzzy_weight_ratio`.
                 if !within_fuzzy_weight_ratio(pre_weights[pre_idx], post_weights[post_idx]) {
@@ -4383,32 +4601,6 @@ fn body_similarity(a: &[String], b: &[String], idf: &HashMap<&str, f64>) -> f64 
     }
 }
 
-/// Whether a paired symbol's line change is fully explained by edits ELSEWHERE
-/// in the same file (a pure shift), as opposed to a genuine relocation.
-///
-/// An unchanged symbol occupies the same position *among unchanged lines* on
-/// both endpoints. Subtracting the deletions before its old start and the
-/// insertions before its new start collapses both sides to that shared
-/// unchanged-line index; equal indices mean the symbol only slid, it did not
-/// move. Same-file only -- a path change is always a relocation.
-fn is_pure_line_shift(
-    pre: &CommitSymbol,
-    post: &CommitSymbol,
-    changed_lines: &BTreeMap<String, ChangedLines>,
-) -> bool {
-    if pre.path != post.path {
-        return false;
-    }
-    let deletions_before = changed_lines
-        .get(&pre.path)
-        .map_or(0, |cl| cl.old.range(..pre.start_line).count());
-    let insertions_before = changed_lines
-        .get(&post.path)
-        .map_or(0, |cl| cl.new.range(..post.start_line).count());
-    pre.start_line.saturating_sub(deletions_before)
-        == post.start_line.saturating_sub(insertions_before)
-}
-
 /// Deleted lines of the patch that fall inside a preimage symbol's range.
 ///
 /// `symbol.path` is the preimage path, which is also how `-` lines are keyed,
@@ -4591,24 +4783,132 @@ fn rename_edges<'e>(
     )
 }
 
+/// The legacy patch-symbol surface groups records by name, kind and language.
+/// Do not attach exact selected-site deltas to such a group when it contains
+/// distinct declarations, even when only one overload was selected.
+fn ensure_unambiguous_diff_attribution(analyzer: &dyn IAnalyzer, graph: &mut UsageGraphResult) {
+    let query = AnalyzerQueryScope::new(analyzer);
+    let mut identities = graph
+        .nodes
+        .iter()
+        .map(|node| ((node.fqn.clone(), node.language.clone()), BTreeSet::new()))
+        .collect::<HashMap<_, BTreeSet<DeclarationId>>>();
+    for unit in analyzer.all_declarations() {
+        let language = UsageEcosystem::of(path_language(unit.source().rel_path()))
+            .as_str()
+            .to_string();
+        if let Some(ids) = identities.get_mut(&(unit.fq_name(), language)) {
+            ids.insert(unit.declaration_id());
+        }
+    }
+    if let Some(error) = query.store_error() {
+        graph.complete = false;
+        graph.incomplete_reasons.push(UsageGraphIncompleteReason {
+            code: "query_failed".into(),
+            message: error.to_string(),
+        });
+    }
+    let ambiguous = identities
+        .into_iter()
+        .filter(|(_, ids)| ids.len() > 1)
+        .collect::<BTreeMap<_, _>>();
+    if ambiguous.is_empty() {
+        return;
+    }
+    graph.complete = false;
+    graph.incomplete_reasons.push(UsageGraphIncompleteReason {
+        code: "ambiguous_diff_attribution".into(),
+        message: format!("patch-symbol groups contain distinct declarations: {ambiguous:?}"),
+    });
+    graph.edges.retain(|edge| {
+        !ambiguous.contains_key(&(edge.from.clone(), edge.language.clone()))
+            && !ambiguous.contains_key(&(edge.to.clone(), edge.language.clone()))
+    });
+}
+
+/// Similarity and Git rename buckets establish candidate correspondence, not
+/// exact declaration identity. Refuse attribution through those candidates in
+/// the exact selected scope; independently proven graph edges remain positive.
+fn refuse_uncertain_moved_correspondence(
+    before: &mut UsageGraphResult,
+    after: &mut UsageGraphResult,
+    moved: &[MovedSymbol],
+) {
+    for pair in moved {
+        if pair.before.fqn == pair.after.fqn
+            && pair.before.path == pair.after.path
+            && pair.before.kind == pair.after.kind
+            && pair.before.signature == pair.after.signature
+            && pair.before.language == pair.after.language
+        {
+            continue;
+        }
+        for (graph, symbol) in [(&mut *before, &pair.before), (&mut *after, &pair.after)] {
+            let ids = graph
+                .nodes
+                .iter()
+                .filter(|node| node.fqn == symbol.fqn && node.path == symbol.path)
+                .map(|node| node.id.clone())
+                .collect::<BTreeSet<_>>();
+            if ids.is_empty() {
+                continue;
+            }
+            graph.complete = false;
+            graph.incomplete_reasons.push(UsageGraphIncompleteReason {
+                code: "unknown_declaration_correspondence".into(),
+                message: format!("relocation does not prove correspondence between {:?} and {:?}; similarity={:?}; endpoint declarations={ids:?}", pair.before, pair.after, pair.similarity),
+            });
+            graph
+                .edges
+                .retain(|edge| !ids.contains(&edge.from_id) && !ids.contains(&edge.to_id));
+        }
+    }
+}
+
 /// Compare the two scoped usage graphs and group the differences by caller.
 ///
-/// Edge identity is `(from, to, language)`, so a weight-only change is not a
-/// difference: the same call written twice instead of once keeps one edge.
+/// Selected-line edges compare exact declaration IDs; the explicit full-file
+/// scope retains its incumbent named-relation comparison for scoring. A
+/// weight-only change is not a difference within either scope.
 fn diff_call_edges(
-    before: &[UsageGraphEdge],
-    after: &[UsageGraphEdge],
+    before: &UsageGraphResult,
+    after: &UsageGraphResult,
     renames: &HashMap<CallerKey, String>,
     postimage: &BTreeMap<SymbolKey, SymbolSnapshot>,
+    scope: DiffCallEdges,
 ) -> CallEdgeDiff {
-    let before = rename_edges(before, renames);
-    let old = edge_map(&before);
-    let new = edge_map(after);
+    let renamed_before = match scope {
+        DiffCallEdges::ChangedLines => Cow::Borrowed(before.edges.as_slice()),
+        DiffCallEdges::ChangedFiles => rename_edges(&before.edges, renames),
+        DiffCallEdges::Omit => unreachable!("omitted call facts do not enter edge diffing"),
+    };
+    let edge_key = |edge: &UsageGraphEdge| match scope {
+        DiffCallEdges::ChangedLines => {
+            DiffEdgeKey::Declaration(edge.from_id.clone(), edge.to_id.clone())
+        }
+        DiffCallEdges::ChangedFiles => DiffEdgeKey::LegacyName(EdgeKey {
+            from: edge.from.clone(),
+            to: edge.to.clone(),
+            language: edge.language.clone(),
+        }),
+        DiffCallEdges::Omit => unreachable!("omitted call facts do not enter edge diffing"),
+    };
+    let old = renamed_before
+        .iter()
+        .map(|edge| (edge_key(edge), edge))
+        .collect::<BTreeMap<_, _>>();
+    let new = after
+        .edges
+        .iter()
+        .map(|edge| (edge_key(edge), edge))
+        .collect::<BTreeMap<_, _>>();
     let definitions = symbols_by_edge_key(postimage);
     let mut deltas: HashMap<CallerKey, CalleeDelta> = HashMap::new();
     let mut deps: BTreeMap<String, CommitSymbol> = BTreeMap::new();
     for (key, edge) in &new {
-        if old.contains_key(key) {
+        // An added relation requires an absence proof on the before side;
+        // a proven positive after edge alone cannot establish that delta.
+        if old.contains_key(key) || (scope == DiffCallEdges::ChangedLines && !before.complete) {
             continue;
         }
         deltas
@@ -4621,7 +4921,7 @@ fn diff_call_edges(
         }
     }
     for (key, edge) in &old {
-        if new.contains_key(key) {
+        if new.contains_key(key) || (scope == DiffCallEdges::ChangedLines && !after.complete) {
             continue;
         }
         deltas
@@ -4691,22 +4991,6 @@ fn sort_callee_changes(changes: &mut [CalleeChange]) {
     changes.sort_by(|a, b| a.language.cmp(&b.language).then_with(|| a.to.cmp(&b.to)));
 }
 
-fn edge_map(edges: &[UsageGraphEdge]) -> BTreeMap<EdgeKey, &UsageGraphEdge> {
-    edges
-        .iter()
-        .map(|edge| {
-            (
-                EdgeKey {
-                    from: edge.from.clone(),
-                    to: edge.to.clone(),
-                    language: edge.language.clone(),
-                },
-                edge,
-            )
-        })
-        .collect()
-}
-
 fn callee_change(edge: &UsageGraphEdge) -> CalleeChange {
     CalleeChange {
         to: edge.to.clone(),
@@ -4752,27 +5036,12 @@ fn large_callsite_symbols(
     out.into_values().collect()
 }
 
-pub(crate) fn primary_range(
-    analyzer: &dyn IAnalyzer,
-    unit: &CodeUnit,
-) -> Option<crate::analyzer::Range> {
-    analyzer
-        .ranges(unit)
-        .iter()
-        .copied()
-        .min_by_key(|range| (range.start_line, range.start_byte))
-}
-
 fn sort_symbols(symbols: &mut [CommitSymbol]) {
     symbols.sort();
 }
 
 pub(crate) fn path_string(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
-}
-
-fn rel_path(file: &ProjectFile) -> String {
-    path_string(file.rel_path())
+    brokk_bifrost_core::path_utils::normalize_pattern(&path.to_string_lossy())
 }
 
 fn delta_status(status: Delta) -> &'static str {
@@ -4791,11 +5060,7 @@ fn delta_status(status: Delta) -> &'static str {
 }
 
 fn is_parseable_path(path: &str) -> bool {
-    Path::new(path)
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| Language::from_extension(ext) != Language::None)
-        .unwrap_or(false)
+    Language::from_path(Path::new(path)) != Language::None
 }
 
 fn language_for_path(path: &Path) -> String {
@@ -4808,39 +5073,69 @@ fn language_for_path(path: &Path) -> String {
 }
 
 pub(crate) fn path_language(path: &Path) -> Language {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .map(Language::from_extension)
-        .unwrap_or(Language::None)
+    Language::from_path(path)
 }
 
 fn kind_name(kind: CodeUnitType) -> &'static str {
     kind.display_lowercase()
 }
 
-#[cfg(test)]
-#[path = "diff_analysis/native_rust_tests.rs"]
-mod native_rust_tests;
-
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        AnalyzeDiffParams, BODY_MOVE_SIMILARITY_THRESHOLD, CancellationToken, ChangedLines,
-        CommitSymbol, DiffAnalysisOptions, DiffEndpointParams, FileChange, ImportTarget, Language,
-        PreparedDiff, RevisionImage, RevisionTempDir, SharedAnalyzerCache, Snapshot, SymbolKey,
-        SymbolSnapshot, WORKTREE_ENDPOINT, analyze_diff_at_root, analyze_prepared_diff,
-        analyze_prepared_symbol_changes, body_similarity, body_token_signature_for_bytes,
-        create_private_dirs, diff_local_idf, is_pure_line_shift, pair_endpoints,
-        resolve_import_target, within_fuzzy_weight_ratio, worktree_files, write_private_file,
+        AnalyzeDiffParams, BODY_MOVE_SIMILARITY_THRESHOLD, CancellationToken, CommitSymbol,
+        DiffAnalysisOptions, DiffAnalysisResult, DiffEndpointParams, FileChange, ImportTarget,
+        Language, PreparedDiff, RevisionImage, RevisionTempDir, SharedAnalyzerCache, Snapshot,
+        SymbolKey, SymbolSnapshot, WORKTREE_ENDPOINT, analyze_diff, analyze_diff_at_root,
+        analyze_prepared_diff, analyze_prepared_diff_with_endpoints,
+        analyze_prepared_diff_with_target_image, analyze_prepared_symbol_changes, body_similarity,
+        body_token_signature_for_bytes, build_analyzer, create_private_dirs, diff_local_idf,
+        pair_endpoints, resolve_import_target, within_fuzzy_weight_ratio, worktree_files,
+        write_private_file,
     };
     use crate::gitblob::test_repo;
+    use crate::test_support::cache_row_count;
+    use brokk_bifrost_test_macros::hardwon;
     use git2::{Oid, Repository};
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
 
+    fn analyze_sentinel_and_explicit_target(
+        root: &Path,
+    ) -> (DiffAnalysisResult, DiffAnalysisResult) {
+        let sentinel = analyze_diff_at_root(
+            root,
+            AnalyzeDiffParams {
+                call_edges: super::DiffCallEdges::ChangedFiles,
+                base: Some("HEAD~1".to_string()),
+                target: None,
+                include_tests: true,
+            },
+            &DiffAnalysisOptions::default(),
+            &CancellationToken::default(),
+        )
+        .expect("sentinel analyze_diff failed");
+        let explicit = analyze_diff_at_root(
+            root,
+            AnalyzeDiffParams {
+                call_edges: super::DiffCallEdges::ChangedFiles,
+                base: Some("HEAD~1".to_string()),
+                target: Some("HEAD".to_string()),
+                include_tests: true,
+            },
+            &DiffAnalysisOptions::default(),
+            &CancellationToken::default(),
+        )
+        .expect("explicit-target analyze_diff failed");
+        (sentinel, explicit)
+    }
+
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "d8b89d842cf3: Builds a real Git tree with nested regular files and verifies the immutable revision image preserves the complete file set and bytes"
+    )]
     fn complete_revision_export_preserves_every_regular_tree_file() {
         let dir = tempfile::tempdir().unwrap();
         let repo = test_repo::init_repo(dir.path());
@@ -4902,91 +5197,6 @@ mod tests {
     }
 
     #[test]
-    fn file_dependency_export_keeps_selected_sources_and_identity_inputs_only() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = test_repo::init_repo(dir.path());
-        fs::create_dir_all(dir.path().join("src")).unwrap();
-        fs::write(dir.path().join("src/main.ts"), "export const main = 1;\n").unwrap();
-        fs::write(
-            dir.path().join("src/shared.js"),
-            "export const shared = 1;\n",
-        )
-        .unwrap();
-        fs::write(
-            dir.path().join("src/unrelated.java"),
-            "class Unrelated {}\n",
-        )
-        .unwrap();
-        fs::write(
-            dir.path().join("src/app.cs"),
-            "namespace Fixture; class App {}\n",
-        )
-        .unwrap();
-        fs::write(dir.path().join("package.json"), "{\"name\":\"fixture\"}\n").unwrap();
-        fs::write(dir.path().join("package-lock.json"), "{}\n").unwrap();
-        fs::write(dir.path().join("tsconfig.json"), "{}\n").unwrap();
-        fs::write(dir.path().join("pom.xml"), "<project/>\n").unwrap();
-        fs::write(
-            dir.path().join("Cargo.toml"),
-            "[package]\nname = \"fixture\"\n",
-        )
-        .unwrap();
-        fs::write(dir.path().join("Directory.Build.props"), "<Project/>\n").unwrap();
-        fs::write(dir.path().join("generated.targets"), "<Project/>\n").unwrap();
-        fs::write(dir.path().join("fixture.dll"), b"managed fixture").unwrap();
-        let commit = test_repo::commit_all(&repo, "scoped graph image");
-
-        let selected = BTreeSet::from([Language::JavaScript, Language::TypeScript]);
-        let image = RevisionImage::materialize_file_dependencies(
-            &repo,
-            Snapshot::Commit(commit),
-            &selected,
-            &[],
-        )
-        .unwrap();
-        let files = image.files().iter().cloned().collect::<BTreeSet<_>>();
-
-        assert!(files.contains(Path::new("src/main.ts")));
-        assert!(files.contains(Path::new("src/shared.js")));
-        assert!(files.contains(Path::new("package.json")));
-        assert!(files.contains(Path::new("package-lock.json")));
-        assert!(files.contains(Path::new("tsconfig.json")));
-        assert!(!files.contains(Path::new("src/unrelated.java")));
-        assert!(!files.contains(Path::new("pom.xml")));
-        assert!(!files.contains(Path::new("Cargo.toml")));
-        assert!(!files.contains(Path::new("Directory.Build.props")));
-        assert!(!files.contains(Path::new("generated.targets")));
-        assert!(!files.contains(Path::new("fixture.dll")));
-
-        let csharp_image = RevisionImage::materialize_file_dependencies(
-            &repo,
-            Snapshot::Commit(commit),
-            &BTreeSet::from([Language::CSharp]),
-            &[],
-        )
-        .unwrap();
-        let csharp_files = csharp_image
-            .files()
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        assert!(csharp_files.contains(Path::new("src/app.cs")));
-        assert!(csharp_files.contains(Path::new("Directory.Build.props")));
-        assert!(csharp_files.contains(Path::new("generated.targets")));
-        assert!(csharp_files.contains(Path::new("fixture.dll")));
-        assert!(!csharp_files.contains(Path::new("src/main.ts")));
-
-        // The complete exporter remains an independent contract for callers
-        // that need every regular tree file.
-        let complete =
-            RevisionImage::materialize(&repo, Snapshot::Commit(commit), None, &[], None).unwrap();
-        let complete_files = complete.files().iter().cloned().collect::<BTreeSet<_>>();
-        assert!(complete_files.contains(Path::new("src/unrelated.java")));
-        assert!(complete_files.contains(Path::new("pom.xml")));
-        assert!(complete_files.contains(Path::new("Cargo.toml")));
-    }
-
-    #[test]
     fn file_dependency_export_writes_only_configuration_inputs() {
         let dir = tempfile::tempdir().unwrap();
         let repo = test_repo::init_repo(dir.path());
@@ -5041,67 +5251,10 @@ mod tests {
         );
     }
 
-    /// A revision image applies the revision's own `.bifrostignore` to its
-    /// analyzable file set, exactly as the working tree's project does, and
-    /// keeps ignored paths in the file view, exactly as the working tree's
-    /// project does. Without this, a `--diff-base` run analyzes files at the
-    /// base that the head never analyzes, and reports their findings as fixed.
     #[test]
-    fn a_revision_image_applies_the_revisions_own_bifrostignore() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = test_repo::init_repo(dir.path());
-        fs::create_dir_all(dir.path().join("generated")).unwrap();
-        fs::create_dir_all(dir.path().join("src")).unwrap();
-        fs::write(dir.path().join(".bifrostignore"), "generated/\n").unwrap();
-        fs::write(
-            dir.path().join("generated/x.ts"),
-            "export const generated = 1;\n",
-        )
-        .unwrap();
-        fs::write(dir.path().join("src/y.ts"), "export const source = 2;\n").unwrap();
-        let commit = test_repo::commit_all(&repo, "ignored generated tree");
-
-        let image =
-            RevisionImage::materialize(&repo, Snapshot::Commit(commit), None, &[], None).unwrap();
-        // The rules must come from the revision's blobs, not from the export
-        // directory: the file-dependency image writes its sources as empty
-        // placeholders, so a filesystem read would find no rules there.
-        // Removing the exported copy leaves the object database as the only
-        // source that can still answer.
-        fs::remove_file(image.root().join(".bifrostignore")).unwrap();
-        let (project, _) = image.project();
-
-        let generated = PathBuf::from("generated/x.ts");
-        let source = PathBuf::from("src/y.ts");
-        let rel_paths = |files: BTreeSet<crate::analyzer::ProjectFile>| {
-            files
-                .into_iter()
-                .map(|file| file.rel_path().to_path_buf())
-                .collect::<BTreeSet<_>>()
-        };
-
-        assert_eq!(
-            rel_paths(project.analyzable_files(Language::TypeScript).unwrap()),
-            BTreeSet::from([source.clone()]),
-        );
-        let all_files = project.all_files().unwrap();
-        assert!(
-            rel_paths(all_files.clone()).contains(&generated),
-            "an ignored path stays in the file view"
-        );
-        assert_eq!(
-            rel_paths(
-                project
-                    .analyzable_files_from(&all_files, Language::TypeScript)
-                    .unwrap()
-            ),
-            BTreeSet::from([source.clone()]),
-        );
-        assert!(project.is_bifrostignored(&generated));
-        assert!(!project.is_bifrostignored(&source));
-    }
-
-    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "897138510c6a: Contrasts symbol-scoped export identity files with full import expansion across a real Go module"
+    )]
     fn symbol_materialization_keeps_ambient_identity_without_import_expansion() {
         let dir = tempfile::tempdir().unwrap();
         let repo = test_repo::init_repo(dir.path());
@@ -5139,63 +5292,6 @@ mod tests {
             RevisionImage::materialize(&repo, Snapshot::Commit(commit), Some(&paths), &[], None)
                 .unwrap();
         assert!(exact.files().contains(&PathBuf::from("pkgb/b.go")));
-    }
-
-    #[test]
-    fn full_diff_composes_exact_calls_after_standalone_symbol_pairing() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = test_repo::init_repo(dir.path());
-        fs::write(dir.path().join("go.mod"), "module repro\n\ngo 1.21\n").unwrap();
-        fs::create_dir_all(dir.path().join("sample")).unwrap();
-        fs::write(
-            dir.path().join("sample/calls.go"),
-            "package sample\n\nfunc Left() int { return 1 }\nfunc Right() int { return 2 }\nfunc Caller() int { return Left() }\n",
-        )
-        .unwrap();
-        test_repo::commit_all(&repo, "base");
-        fs::write(
-            dir.path().join("sample/calls.go"),
-            "package sample\n\nfunc Left() int { return 1 }\nfunc Right() int { return 2 }\nfunc Caller() int { return Right() }\n",
-        )
-        .unwrap();
-
-        let prepared = PreparedDiff::at_root(
-            dir.path(),
-            DiffEndpointParams {
-                base: Some("HEAD".to_string()),
-                target: None,
-            },
-            &DiffAnalysisOptions::default(),
-            &CancellationToken::default(),
-        )
-        .unwrap();
-        let paired_only = analyze_prepared_symbol_changes(&prepared, true).unwrap();
-        let full = analyze_prepared_diff(&prepared, true).unwrap();
-
-        assert_eq!(1, paired_only.symbol_changes.edited.len());
-        assert_eq!("Caller", paired_only.symbol_changes.edited[0].after.name);
-        let caller = full
-            .patch_symbols
-            .edited
-            .iter()
-            .find(|pair| pair.after.name == "Caller")
-            .expect("full diff must retain the paired callable");
-        assert_eq!(
-            vec!["repro/sample.Right"],
-            caller
-                .added_calls
-                .iter()
-                .map(|call| call.to.as_str())
-                .collect::<Vec<_>>()
-        );
-        assert_eq!(
-            vec!["repro/sample.Left"],
-            caller
-                .removed_calls
-                .iter()
-                .map(|call| call.to.as_str())
-                .collect::<Vec<_>>()
-        );
     }
 
     #[test]
@@ -5284,6 +5380,9 @@ mod tests {
     /// and looks like one symbol deleted and an unrelated one introduced.
     #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2587: Compares equivalent explicit and worktree endpoints and checks Go module identity remains stable"
+    )]
     fn working_tree_sentinel_matches_explicit_target_for_a_go_module() {
         let dir = tempfile::tempdir().unwrap();
         let repo = test_repo::init_repo(dir.path());
@@ -5304,28 +5403,7 @@ mod tests {
         test_repo::commit_all(&repo, "commit 2");
         drop(repo);
 
-        let sentinel = analyze_diff_at_root(
-            dir.path(),
-            AnalyzeDiffParams {
-                base: Some("HEAD~1".to_string()),
-                target: None,
-                include_tests: true,
-            },
-            &DiffAnalysisOptions::default(),
-            &CancellationToken::default(),
-        )
-        .expect("sentinel analyze_diff failed");
-        let explicit = analyze_diff_at_root(
-            dir.path(),
-            AnalyzeDiffParams {
-                base: Some("HEAD~1".to_string()),
-                target: Some("HEAD".to_string()),
-                include_tests: true,
-            },
-            &DiffAnalysisOptions::default(),
-            &CancellationToken::default(),
-        )
-        .expect("explicit-target analyze_diff failed");
+        let (sentinel, explicit) = analyze_sentinel_and_explicit_target(dir.path());
 
         assert_eq!(
             explicit.patch_symbols.edited.len(),
@@ -5353,6 +5431,9 @@ mod tests {
     /// crate-qualified rather than falling back to an unqualified name.
     #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2587: Compares equivalent explicit and worktree endpoints and checks Rust crate identity remains stable"
+    )]
     fn working_tree_sentinel_matches_explicit_target_for_a_rust_crate() {
         let dir = tempfile::tempdir().unwrap();
         let repo = test_repo::init_repo(dir.path());
@@ -5377,28 +5458,7 @@ mod tests {
         test_repo::commit_all(&repo, "commit 2");
         drop(repo);
 
-        let sentinel = analyze_diff_at_root(
-            dir.path(),
-            AnalyzeDiffParams {
-                base: Some("HEAD~1".to_string()),
-                target: None,
-                include_tests: true,
-            },
-            &DiffAnalysisOptions::default(),
-            &CancellationToken::default(),
-        )
-        .expect("sentinel analyze_diff failed");
-        let explicit = analyze_diff_at_root(
-            dir.path(),
-            AnalyzeDiffParams {
-                base: Some("HEAD~1".to_string()),
-                target: Some("HEAD".to_string()),
-                include_tests: true,
-            },
-            &DiffAnalysisOptions::default(),
-            &CancellationToken::default(),
-        )
-        .expect("explicit-target analyze_diff failed");
+        let (sentinel, explicit) = analyze_sentinel_and_explicit_target(dir.path());
 
         assert_eq!(
             explicit.patch_symbols.edited.len(),
@@ -5463,15 +5523,6 @@ mod tests {
         image.files().iter().cloned().collect()
     }
 
-    fn cache_row_count(root: &Path, table: &str) -> i64 {
-        rusqlite::Connection::open(crate::analyzer::store::analyzer_db_path(root))
-            .expect("open the shared analyzer cache")
-            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-                row.get(0)
-            })
-            .expect("count cache rows")
-    }
-
     /// A committed endpoint's import expansion parses the diff's own changed
     /// files, and those parses describe blobs of the revision, so they belong in
     /// the repository's shared cache: a second identical materialization must
@@ -5511,29 +5562,6 @@ mod tests {
         assert_eq!(0, cache_row_count(root, "workspace_file_versions"));
     }
 
-    /// The fallback a host without a usable persisted cache takes: the same
-    /// expansion runs against an ephemeral store and must select the same image.
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[test]
-    fn snapshot_import_expansion_without_a_cache_selects_the_same_image() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let head = go_import_expansion_repo(root);
-        let repo = Repository::open(root).unwrap();
-
-        let fallback = expanded_image_files(&repo, head, None);
-        let cache = SharedAnalyzerCache::open(root, &CancellationToken::default())
-            .expect("the fixture is a git repository");
-        let shared = expanded_image_files(&repo, head, Some(&cache));
-        drop(cache);
-
-        assert_eq!(fallback, shared);
-        assert!(
-            cache_row_count(root, "blobs") > 0,
-            "the shared run must have used the cache"
-        );
-    }
-
     /// A changed file that starts calling a function in an untouched sibling
     /// package: `MakeThing`'s own file was never part of the diff, so
     /// resolving the call and attaching its full definition both depend on
@@ -5541,35 +5569,17 @@ mod tests {
     /// "repro/pkgb"` to `pkgb`'s directory and exporting it alongside the
     /// diff's own files.
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2587: Changes a Go caller and verifies the new dependency is resolved from an untouched imported package"
+    )]
     fn dependency_symbols_includes_a_newly_called_function_in_an_untouched_package() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = test_repo::init_repo(dir.path());
-        fs::write(dir.path().join("go.mod"), "module repro\n\ngo 1.21\n").unwrap();
-        fs::create_dir_all(dir.path().join("pkga")).unwrap();
-        fs::create_dir_all(dir.path().join("pkgb")).unwrap();
-        fs::write(
-            dir.path().join("pkga/a.go"),
-            "package pkga\n\nfunc helper() int { return 1 }\nfunc Caller() int { return helper() }\n",
-        )
-        .unwrap();
-        fs::write(
-            dir.path().join("pkgb/b.go"),
-            "package pkgb\n\nfunc MakeThing(x int) int { return x }\n",
-        )
-        .unwrap();
-        test_repo::commit_all(&repo, "commit 1");
-
-        fs::write(
-            dir.path().join("pkga/a.go"),
-            "package pkga\n\nimport \"repro/pkgb\"\n\nfunc helper() int { return 1 }\nfunc Caller() int { return helper() + pkgb.MakeThing(2) }\n",
-        )
-        .unwrap();
-        test_repo::commit_all(&repo, "commit 2");
-        drop(repo);
+        go_import_expansion_repo(dir.path());
 
         let result = analyze_diff_at_root(
             dir.path(),
             AnalyzeDiffParams {
+                call_edges: super::DiffCallEdges::ChangedFiles,
                 base: Some("HEAD~1".to_string()),
                 target: Some("HEAD".to_string()),
                 include_tests: true,
@@ -5607,35 +5617,17 @@ mod tests {
     /// expansion must resolve identically on both endpoint kinds, not just
     /// the explicit-target/explicit-target case above.
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2587: Exercises the Go import-closure dependency through the worktree endpoint in addition to the committed endpoint"
+    )]
     fn working_tree_sentinel_also_sees_a_newly_called_function_in_an_untouched_package() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = test_repo::init_repo(dir.path());
-        fs::write(dir.path().join("go.mod"), "module repro\n\ngo 1.21\n").unwrap();
-        fs::create_dir_all(dir.path().join("pkga")).unwrap();
-        fs::create_dir_all(dir.path().join("pkgb")).unwrap();
-        fs::write(
-            dir.path().join("pkga/a.go"),
-            "package pkga\n\nfunc helper() int { return 1 }\nfunc Caller() int { return helper() }\n",
-        )
-        .unwrap();
-        fs::write(
-            dir.path().join("pkgb/b.go"),
-            "package pkgb\n\nfunc MakeThing(x int) int { return x }\n",
-        )
-        .unwrap();
-        test_repo::commit_all(&repo, "commit 1");
-
-        fs::write(
-            dir.path().join("pkga/a.go"),
-            "package pkga\n\nimport \"repro/pkgb\"\n\nfunc helper() int { return 1 }\nfunc Caller() int { return helper() + pkgb.MakeThing(2) }\n",
-        )
-        .unwrap();
-        test_repo::commit_all(&repo, "commit 2");
-        drop(repo);
+        go_import_expansion_repo(dir.path());
 
         let sentinel = analyze_diff_at_root(
             dir.path(),
             AnalyzeDiffParams {
+                call_edges: super::DiffCallEdges::ChangedFiles,
                 base: Some("HEAD~1".to_string()),
                 target: None,
                 include_tests: true,
@@ -5666,6 +5658,9 @@ mod tests {
     /// `assert!(!rel_path.is_absolute())` once fed to the analyzer.
     #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2587: Treats a diff-controlled absolute import as untrusted and proves expansion never emits a path outside the project"
+    )]
     fn worktree_import_expansion_rejects_an_absolute_import_target() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("package.json"), "{\"name\": \"repro\"}\n").unwrap();
@@ -5686,6 +5681,9 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2587: Checks filesystem import expansion cannot follow a symlinked directory into an outside project"
+    )]
     fn worktree_import_expansion_does_not_follow_a_symlinked_directory() {
         use std::os::unix::fs::symlink;
 
@@ -5725,6 +5723,9 @@ mod tests {
     /// incidental `strip_prefix(root)` check further downstream, regardless
     /// of whether this containment check exists at all.
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2587: Uses a permissive existence spy to prove parent-segment candidates are rejected before filesystem lookup"
+    )]
     fn resolve_import_target_rejects_a_candidate_with_an_embedded_parent_dir_segment() {
         // A permissive spy: everything "exists", so the only reason a
         // `..`-carrying candidate would ever be absent from `calls` is
@@ -5760,6 +5761,9 @@ mod tests {
     /// specifically exercises `resolve_import_target`'s prefix search, not
     /// just its suffix search.
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2587: Checks Rust import expansion resolves a newly called function from a separate untouched workspace crate"
+    )]
     fn dependency_symbols_includes_a_newly_called_function_in_an_untouched_crate() {
         let dir = tempfile::tempdir().unwrap();
         let repo = test_repo::init_repo(dir.path());
@@ -5805,6 +5809,7 @@ mod tests {
         let result = analyze_diff_at_root(
             dir.path(),
             AnalyzeDiffParams {
+                call_edges: super::DiffCallEdges::ChangedFiles,
                 base: Some("HEAD~1".to_string()),
                 target: Some("HEAD".to_string()),
                 include_tests: true,
@@ -5825,63 +5830,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rust_diff_analysis_uses_complete_selected_rooted_edge_evidence() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = test_repo::init_repo(dir.path());
-        fs::write(
-            dir.path().join("Cargo.toml"),
-            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-        )
-        .unwrap();
-        fs::create_dir_all(dir.path().join("src")).unwrap();
-        fs::write(
-            dir.path().join("src/lib.rs"),
-            "pub fn left() -> usize { 1 }\npub fn right() -> usize { 2 }\npub fn caller() -> usize { left() }\n",
-        )
-        .unwrap();
-        test_repo::commit_all(&repo, "commit 1");
-
-        fs::write(
-            dir.path().join("src/lib.rs"),
-            "pub fn left() -> usize { 1 }\npub fn right() -> usize { 2 }\npub fn caller() -> usize { right() }\n",
-        )
-        .unwrap();
-        test_repo::commit_all(&repo, "commit 2");
-        drop(repo);
-
-        // Direct Rust shadow tests cover the selected comparison paths; this
-        // concurrent diff test covers the public rooted edge result.
-        let result = analyze_diff_at_root(
-            dir.path(),
-            AnalyzeDiffParams {
-                base: Some("HEAD~1".to_string()),
-                target: Some("HEAD".to_string()),
-                include_tests: true,
-            },
-            &DiffAnalysisOptions::default(),
-            &CancellationToken::new(),
-        )
-        .expect("Rust analyze_diff");
-
-        let caller = result
-            .patch_symbols
-            .edited
-            .iter()
-            .find(|pair| pair.after.name == "caller")
-            .expect("edited Rust caller");
-        assert_eq!(caller.added_calls.len(), 1, "edited caller: {caller:#?}");
-        assert_eq!(caller.removed_calls.len(), 1, "edited caller: {caller:#?}");
-        assert_eq!(caller.added_calls[0].weight, 1);
-        assert_eq!(caller.removed_calls[0].weight, 1);
-        assert!(caller.added_calls[0].to.ends_with(".right"));
-        assert!(caller.removed_calls[0].to.ends_with(".left"));
-    }
-
     /// Same shape again, for Python: `from pkgb.b import make_thing` has no
     /// leading dots (an absolute import), so this exercises the plain
     /// structured-segments path rather than the relative-import handling.
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2587: Checks a Python absolute import expands to an untouched package and returns its newly called definition"
+    )]
     fn dependency_symbols_includes_a_newly_called_function_in_an_untouched_python_package() {
         let dir = tempfile::tempdir().unwrap();
         let repo = test_repo::init_repo(dir.path());
@@ -5918,6 +5873,7 @@ mod tests {
         let result = analyze_diff_at_root(
             dir.path(),
             AnalyzeDiffParams {
+                call_edges: super::DiffCallEdges::ChangedFiles,
                 base: Some("HEAD~1".to_string()),
                 target: Some("HEAD".to_string()),
                 include_tests: true,
@@ -5942,6 +5898,9 @@ mod tests {
     /// module specifier as a structured import path, which expansion resolves
     /// without reparsing the raw import declaration.
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2587: Checks a TypeScript import specifier expands to an untouched module and returns its newly called definition"
+    )]
     fn dependency_symbols_includes_a_newly_called_function_in_an_untouched_ts_module() {
         let dir = tempfile::tempdir().unwrap();
         let repo = test_repo::init_repo(dir.path());
@@ -5973,6 +5932,7 @@ mod tests {
         let result = analyze_diff_at_root(
             dir.path(),
             AnalyzeDiffParams {
+                call_edges: super::DiffCallEdges::ChangedFiles,
                 base: Some("HEAD~1".to_string()),
                 target: Some("HEAD".to_string()),
                 include_tests: true,
@@ -6038,20 +5998,6 @@ mod tests {
         );
     }
 
-    fn symbol_at(path: &str, start_line: usize) -> CommitSymbol {
-        CommitSymbol {
-            fqn: format!("{path}::sym"),
-            name: "sym".to_string(),
-            kind: "function".to_string(),
-            signature: "fn sym()".to_string(),
-            path: path.to_string(),
-            start_line,
-            end_line: start_line + 3,
-            language: "rust".to_string(),
-            is_test: false,
-        }
-    }
-
     fn snapshot(
         fqn: &str,
         name: &str,
@@ -6077,36 +6023,6 @@ mod tests {
                 is_test: false,
             },
         }
-    }
-
-    /// Guards the regression behind #1897: a symbol whose start line only slid
-    /// because lines were inserted/deleted *before* it must not be reported as
-    /// moved. A single early insert once produced hundreds of spurious "moved"
-    /// rows -- one per symbol below it -- because any `start_line` delta was
-    /// treated as a relocation.
-    #[test]
-    fn pure_line_shift_is_not_a_move() {
-        // Three lines inserted before the symbol: it slid 10 -> 13 with no
-        // deletions on the old side. Same position among unchanged lines.
-        let mut changed = BTreeMap::new();
-        changed.insert(
-            "src/a.rs".to_string(),
-            ChangedLines {
-                old: Default::default(),
-                new: [1usize, 2, 3].into_iter().collect(),
-            },
-        );
-        let pre = symbol_at("src/a.rs", 10);
-        let post = symbol_at("src/a.rs", 13);
-        assert!(is_pure_line_shift(&pre, &post, &changed));
-
-        // A larger jump than the 3 insertions explain is a genuine relocation.
-        let moved_post = symbol_at("src/a.rs", 20);
-        assert!(!is_pure_line_shift(&pre, &moved_post, &changed));
-
-        // A path change is always a relocation, regardless of line arithmetic.
-        let renamed_post = symbol_at("src/b.rs", 13);
-        assert!(!is_pure_line_shift(&pre, &renamed_post, &changed));
     }
 
     // A realistic reduce-over-a-slice body, parameterized by function and
@@ -6160,28 +6076,6 @@ mod tests {
         assert!(
             score < BODY_MOVE_SIMILARITY_THRESHOLD,
             "unrelated bodies scored {score}, at/above threshold"
-        );
-    }
-
-    #[test]
-    fn body_token_signature_rejects_trivial_and_degenerate_byte_ranges() {
-        let src = accumulate_body("f", "sum");
-        assert!(body_token_signature_for_bytes(&src, "f", 0, src.len()).is_some());
-        // One non-blank line is too weak a fingerprint.
-        assert_eq!(
-            body_token_signature_for_bytes(
-                "pub fn f() { done() }\n",
-                "f",
-                0,
-                "pub fn f() { done() }\n".len(),
-            ),
-            None
-        );
-        // Degenerate ranges are rejected, not panicked on.
-        assert_eq!(body_token_signature_for_bytes(&src, "f", 5, 1), None);
-        assert_eq!(
-            body_token_signature_for_bytes(&src, "f", src.len(), src.len() + 1),
-            None
         );
     }
 
@@ -6307,6 +6201,9 @@ mod tests {
     /// path. Unrelated same-name functions in different files must not pair;
     /// a genuine cross-file move is recovered by the body-similarity rule.
     #[test]
+    #[hardwon(
+        "e683f5db2080: same-named unqualified symbols in different files must not identity-pair"
+    )]
     fn unqualified_identity_requires_a_matching_path() {
         // Two unrelated same-name `updateConfig` functions, a.js deleted,
         // b.js added, dissimilar bodies: refuse the identity pair AND the
@@ -6413,34 +6310,10 @@ mod tests {
         assert_eq!(pairing.postimage_only.len(), 1);
     }
 
-    /// The hard candidate cap: past `FUZZY_PAIRING_CANDIDATE_CAP` leftover
-    /// pre x post combinations, the fuzzy rule is skipped wholesale and every
-    /// leftover reports as plain delete+introduce -- even identical bodies
-    /// that would otherwise pair at score 1.0.
     #[test]
-    fn fuzzy_pairing_is_skipped_past_the_candidate_cap() {
-        // 501 x 500 = 250_500 > 250_000. All bodies identical and substantial;
-        // the symbol names do not occur in the body, so every token signature
-        // is identical and every pair would score 1.0 if scored.
-        let body = accumulate_body("worker", "sum");
-        let mut before = BTreeMap::new();
-        for i in 0..501 {
-            let s = snap_src(&format!("a::sym{i}"), &format!("sym{i}"), "src/a.rs", &body);
-            before.insert(s.key.clone(), s);
-        }
-        let mut after = BTreeMap::new();
-        for i in 0..500 {
-            let s = snap_src(&format!("b::sym{i}"), &format!("sym{i}"), "src/b.rs", &body);
-            after.insert(s.key.clone(), s);
-        }
-        let pairing = pair_endpoints(&before, &after, &[] as &[FileChange]);
-        assert!(pairing.pairs.is_empty(), "past the cap nothing may pair");
-        assert!(pairing.fallback_paired.is_empty());
-        assert_eq!(pairing.preimage_only.len(), 501);
-        assert_eq!(pairing.postimage_only.len(), 500);
-    }
-
-    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2584: Runs two TypeScript revisions and checks the edited caller reports both the new call edge and its dependency symbol"
+    )]
     fn dependency_symbols_and_added_calls_include_a_newly_called_ts_function() {
         let dir = tempfile::tempdir().unwrap();
         let repo = test_repo::init_repo(dir.path());
@@ -6467,6 +6340,7 @@ mod tests {
         let result = super::analyze_diff_at_root(
             dir.path(),
             super::AnalyzeDiffParams {
+                call_edges: super::DiffCallEdges::ChangedFiles,
                 base: Some("HEAD~1".to_string()),
                 target: Some("HEAD".to_string()),
                 include_tests: true,
@@ -6521,152 +6395,305 @@ mod tests {
             0o600
         );
     }
-}
 
-#[cfg(test)]
-mod entry_point_tests {
-    use super::*;
-    use crate::gitblob::test_repo;
+    #[test]
+    fn file_dependency_export_keeps_selected_sources_and_identity_inputs_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo::init_repo(dir.path());
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/main.ts"), "export const main = 1;\n").unwrap();
+        fs::write(
+            dir.path().join("src/shared.js"),
+            "export const shared = 1;\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("src/unrelated.java"),
+            "class Unrelated {}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("src/app.cs"),
+            "namespace Fixture; class App {}\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("package.json"), "{\"name\":\"fixture\"}\n").unwrap();
+        fs::write(dir.path().join("package-lock.json"), "{}\n").unwrap();
+        fs::write(dir.path().join("tsconfig.json"), "{}\n").unwrap();
+        fs::write(dir.path().join("pom.xml"), "<project/>\n").unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("Directory.Build.props"), "<Project/>\n").unwrap();
+        fs::write(dir.path().join("generated.targets"), "<Project/>\n").unwrap();
+        fs::write(dir.path().join("fixture.dll"), b"managed fixture").unwrap();
+        let commit = test_repo::commit_all(&repo, "scoped graph image");
 
-    /// A two-commit repository whose second commit edits `lib.go`, built with
-    /// `git2` so the lib tests do not need a `git` binary on PATH.
-    fn two_commit_repo(root: &Path) -> Oid {
-        let repo = Repository::init(root).unwrap();
-        let signature = git2::Signature::now("Tester", "tester@example.com").unwrap();
-        let mut head: Option<Oid> = None;
-        for body in ["\treturn 1\n", "\treturn 2\n"] {
-            fs::write(
-                root.join("lib.go"),
-                format!("package sample\n\nfunc Existing() int {{\n{body}}}\n"),
-            )
-            .unwrap();
-            let mut index = repo.index().unwrap();
-            index.add_path(Path::new("lib.go")).unwrap();
-            index.write().unwrap();
-            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
-            let parents: Vec<git2::Commit> = head
-                .into_iter()
-                .map(|oid| repo.find_commit(oid).unwrap())
-                .collect();
-            head = Some(
-                repo.commit(
-                    Some("HEAD"),
-                    &signature,
-                    &signature,
-                    "commit",
-                    &tree,
-                    &parents.iter().collect::<Vec<_>>(),
-                )
-                .unwrap(),
-            );
-        }
-        head.unwrap()
+        let selected = BTreeSet::from([Language::JavaScript, Language::TypeScript]);
+        let image = RevisionImage::materialize_file_dependencies(
+            &repo,
+            Snapshot::Commit(commit),
+            &selected,
+            &[],
+        )
+        .unwrap();
+        let files = image.files().iter().cloned().collect::<BTreeSet<_>>();
+
+        assert!(files.contains(Path::new("src/main.ts")));
+        assert!(files.contains(Path::new("src/shared.js")));
+        assert!(files.contains(Path::new("package.json")));
+        assert!(files.contains(Path::new("package-lock.json")));
+        assert!(files.contains(Path::new("tsconfig.json")));
+        assert!(!files.contains(Path::new("src/unrelated.java")));
+        assert!(!files.contains(Path::new("pom.xml")));
+        assert!(!files.contains(Path::new("Cargo.toml")));
+        assert!(!files.contains(Path::new("Directory.Build.props")));
+        assert!(!files.contains(Path::new("generated.targets")));
+        assert!(!files.contains(Path::new("fixture.dll")));
+
+        let csharp_image = RevisionImage::materialize_file_dependencies(
+            &repo,
+            Snapshot::Commit(commit),
+            &BTreeSet::from([Language::CSharp]),
+            &[],
+        )
+        .unwrap();
+        let csharp_files = csharp_image
+            .files()
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert!(csharp_files.contains(Path::new("src/app.cs")));
+        assert!(csharp_files.contains(Path::new("Directory.Build.props")));
+        assert!(csharp_files.contains(Path::new("generated.targets")));
+        assert!(csharp_files.contains(Path::new("fixture.dll")));
+        assert!(!csharp_files.contains(Path::new("src/main.ts")));
+
+        // The complete exporter remains an independent contract for callers
+        // that need every regular tree file.
+        let complete =
+            RevisionImage::materialize(&repo, Snapshot::Commit(commit), None, &[], None).unwrap();
+        let complete_files = complete.files().iter().cloned().collect::<BTreeSet<_>>();
+        assert!(complete_files.contains(Path::new("src/unrelated.java")));
+        assert!(complete_files.contains(Path::new("pom.xml")));
+        assert!(complete_files.contains(Path::new("Cargo.toml")));
     }
 
-    /// Keep the tree-base/worktree path observable through source loading,
-    /// retained-revision GC, and deleted-line attribution. Forced collection
-    /// makes the former Windows scheduling race deterministic on every host.
     #[test]
-    fn tree_base_worktree_keeps_base_bytes_lines_and_deleted_symbol() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("repo");
-        fs::create_dir(&root).unwrap();
-        two_commit_repo(&root);
-        fs::write(root.join("lib.go"), "package sample\nfunc LiveNow() {}\n").unwrap();
+    fn a_revision_image_applies_the_revisions_own_bifrostignore() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo::init_repo(dir.path());
+        fs::create_dir_all(dir.path().join("generated")).unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join(".bifrostignore"), "generated/\n").unwrap();
+        fs::write(
+            dir.path().join("generated/x.ts"),
+            "export const generated = 1;\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("src/y.ts"), "export const source = 2;\n").unwrap();
+        let commit = test_repo::commit_all(&repo, "ignored generated tree");
 
-        // Build the tree and blob in a sibling bare repository so this is the
-        // same host-trusted alternate shape as the integration regression.
-        let snapshot_root = temp.path().join("snapshot.git");
-        let snapshot = Repository::init_bare(&snapshot_root).unwrap();
-        let blob = snapshot
-            .blob(b"package sample\nfunc SnapshotBase() {}\n")
-            .unwrap();
-        let mut tree_builder = snapshot.treebuilder(None).unwrap();
-        tree_builder.insert("lib.go", blob, 0o100644).unwrap();
-        let base_tree = tree_builder.write().unwrap();
-        let options = DiffAnalysisOptions {
-            snapshot_object_dir: Some(snapshot_root.join("objects")),
+        let image =
+            RevisionImage::materialize(&repo, Snapshot::Commit(commit), None, &[], None).unwrap();
+        // The rules must come from the revision's blobs, not from the export
+        // directory: the file-dependency image writes its sources as empty
+        // placeholders, so a filesystem read would find no rules there.
+        // Removing the exported copy leaves the object database as the only
+        // source that can still answer.
+        fs::remove_file(image.root().join(".bifrostignore")).unwrap();
+        let (project, _) = image.project();
+
+        let generated = PathBuf::from("generated/x.ts");
+        let source = PathBuf::from("src/y.ts");
+        let rel_paths = |files: BTreeSet<crate::analyzer::ProjectFile>| {
+            files
+                .into_iter()
+                .map(|file| file.rel_path().to_path_buf())
+                .collect::<BTreeSet<_>>()
         };
+
+        assert_eq!(
+            rel_paths(project.analyzable_files(Language::TypeScript).unwrap()),
+            BTreeSet::from([source.clone()]),
+        );
+        let all_files = project.all_files().unwrap();
+        assert!(
+            rel_paths(all_files.clone()).contains(&generated),
+            "an ignored path stays in the file view"
+        );
+        assert_eq!(
+            rel_paths(
+                project
+                    .analyzable_files_from(&all_files, Language::TypeScript)
+                    .unwrap()
+            ),
+            BTreeSet::from([source.clone()]),
+        );
+        assert!(project.is_bifrostignored(&generated));
+        assert!(!project.is_bifrostignored(&source));
+    }
+
+    #[test]
+    fn full_diff_composes_exact_calls_after_standalone_symbol_pairing() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo::init_repo(dir.path());
+        fs::write(dir.path().join("go.mod"), "module repro\n\ngo 1.21\n").unwrap();
+        fs::create_dir_all(dir.path().join("sample")).unwrap();
+        fs::write(
+            dir.path().join("sample/calls.go"),
+            "package sample\n\nfunc Left() int { return 1 }\nfunc Right() int { return 2 }\nfunc Caller() int { return Left() }\n",
+        )
+        .unwrap();
+        test_repo::commit_all(&repo, "base");
+        fs::write(
+            dir.path().join("sample/calls.go"),
+            "package sample\n\nfunc Left() int { return 1 }\nfunc Right() int { return 2 }\nfunc Caller() int { return Right() }\n",
+        )
+        .unwrap();
+
         let prepared = PreparedDiff::at_root(
-            &root,
+            dir.path(),
             DiffEndpointParams {
-                base: Some(base_tree.to_string()),
+                base: Some("HEAD".to_string()),
                 target: None,
             },
-            &options,
+            &DiffAnalysisOptions::default(),
             &CancellationToken::default(),
         )
         .unwrap();
-        assert_eq!(prepared.base, Snapshot::Tree(base_tree));
-        assert_eq!(prepared.target, Snapshot::Worktree);
+        let paired_only = analyze_prepared_symbol_changes(&prepared, true).unwrap();
+        let full = analyze_prepared_diff(&prepared, true).unwrap();
 
-        let base_paths = vec!["lib.go".to_string()];
-        let base_repository = prepared.repository_for(prepared.base);
-        let base_image = RevisionImage::materialize(
-            &base_repository.repo,
-            prepared.base,
-            Some(&base_paths),
-            &base_repository.alternate_object_dirs,
-            prepared.shared_cache(),
-        )
-        .unwrap();
-        let (base_project, _) = base_image.project();
-        let base_file = base_project
-            .file_by_rel_path(Path::new("lib.go"))
-            .expect("base image must contain the changed path");
-        assert_eq!(
-            base_project.read_source(&base_file).unwrap(),
-            "package sample\nfunc SnapshotBase() {}\n"
-        );
-
-        // The service opens this shared cache for every immutable endpoint;
-        // keep the diagnostic on that exact path rather than validating only
-        // the ephemeral-store variant.
-        let base_analyzer = build_revision_analyzer(&base_image, prepared.shared_cache()).unwrap();
-        // Startup GC can overlap a diff request. The sibling snapshot blob is
-        // unreachable from Git refs, but this retained revision still owns its
-        // facts. Force that ordering so the regression does not depend on how
-        // quickly the host schedules the background collector.
-        let db_path = crate::analyzer::store::analyzer_db_path(&root);
-        let repo = Repository::open(&root).unwrap();
-        let retained_gc = crate::cache_gc::force_gc_for_path(&db_path, &repo, &root).unwrap();
-        assert!(retained_gc.ran);
-        assert_eq!(retained_gc.analyzer_dropped, 0);
-        let base_symbols = symbol_snapshot_map(base_analyzer.analyzer(), true);
-        let base_symbol = base_symbols
-            .values()
-            .find(|snapshot| snapshot.symbol.name == "SnapshotBase")
-            .expect("base analyzer must contain SnapshotBase");
-        assert!(
-            symbol_snapshot_map(base_analyzer.analyzer(), false)
-                .values()
-                .any(|snapshot| snapshot.symbol.name == "SnapshotBase"),
-            "production-symbol filtering must retain SnapshotBase"
-        );
-        assert_eq!(
-            old_overlap(&base_symbol.symbol, &prepared.changed_lines),
-            vec![2],
-            "the base symbol must overlap the deleted old line: {:?}",
-            prepared.changed_lines
-        );
-
-        drop(base_analyzer);
-        let released_gc = crate::cache_gc::force_gc_for_path(&db_path, &repo, &root).unwrap();
-        assert!(released_gc.ran);
-        assert_eq!(released_gc.analyzer_dropped, 1);
-
-        let analyzed = analyze_prepared_diff_with_endpoints(&prepared, false).unwrap();
-        let deleted = analyzed
-            .result
+        assert_eq!(1, paired_only.symbol_changes.edited.len());
+        assert_eq!("Caller", paired_only.symbol_changes.edited[0].after.name);
+        let caller = full
             .patch_symbols
-            .deleted
+            .edited
             .iter()
-            .find(|symbol| symbol.before.name == "SnapshotBase")
-            .expect("full symbol classification must retain SnapshotBase deletion");
-        assert_eq!(deleted.touched_old_lines, vec![2]);
+            .find(|pair| pair.after.name == "Caller")
+            .expect("full diff must retain the paired callable");
+        assert_eq!(
+            vec!["repro/sample.Right"],
+            caller
+                .added_calls
+                .iter()
+                .map(|call| call.to.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            vec!["repro/sample.Left"],
+            caller
+                .removed_calls
+                .iter()
+                .map(|call| call.to.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
+    #[test]
+    fn snapshot_import_expansion_without_a_cache_selects_the_same_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let head = go_import_expansion_repo(root);
+        let repo = Repository::open(root).unwrap();
+
+        let fallback = expanded_image_files(&repo, head, None);
+        let cache = SharedAnalyzerCache::open(root, &CancellationToken::default())
+            .expect("the fixture is a git repository");
+        let shared = expanded_image_files(&repo, head, Some(&cache));
+        drop(cache);
+
+        assert_eq!(fallback, shared);
+        assert!(
+            cache_row_count(root, "blobs") > 0,
+            "the shared run must have used the cache"
+        );
     }
 
     #[test]
+    fn rust_diff_analysis_uses_complete_selected_rooted_edge_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo::init_repo(dir.path());
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join("src/lib.rs"),
+            "pub fn left() -> usize { 1 }\npub fn right() -> usize { 2 }\npub fn caller() -> usize { left() }\n",
+        )
+        .unwrap();
+        test_repo::commit_all(&repo, "commit 1");
+
+        fs::write(
+            dir.path().join("src/lib.rs"),
+            "pub fn left() -> usize { 1 }\npub fn right() -> usize { 2 }\npub fn caller() -> usize { right() }\n",
+        )
+        .unwrap();
+        test_repo::commit_all(&repo, "commit 2");
+        drop(repo);
+
+        // Direct Rust shadow tests cover the selected comparison paths; this
+        // concurrent diff test covers the public rooted edge result.
+        let result = analyze_diff_at_root(
+            dir.path(),
+            AnalyzeDiffParams {
+                call_edges: super::DiffCallEdges::ChangedFiles,
+                base: Some("HEAD~1".to_string()),
+                target: Some("HEAD".to_string()),
+                include_tests: true,
+            },
+            &DiffAnalysisOptions::default(),
+            &CancellationToken::new(),
+        )
+        .expect("Rust analyze_diff");
+
+        let caller = result
+            .patch_symbols
+            .edited
+            .iter()
+            .find(|pair| pair.after.name == "caller")
+            .expect("edited Rust caller");
+        assert_eq!(caller.added_calls.len(), 1, "edited caller: {caller:#?}");
+        assert_eq!(caller.removed_calls.len(), 1, "edited caller: {caller:#?}");
+        assert_eq!(caller.added_calls[0].weight, 1);
+        assert_eq!(caller.removed_calls[0].weight, 1);
+        assert!(caller.added_calls[0].to.ends_with(".right"));
+        assert!(caller.removed_calls[0].to.ends_with(".left"));
+    }
+
+    #[test]
+    #[hardwon("b99dda4ed257: fuzzy pairing scored beyond its quadratic candidate cap")]
+    fn fuzzy_pairing_is_skipped_past_the_candidate_cap() {
+        // 501 x 500 = 250_500 > 250_000. All bodies identical and substantial;
+        // the symbol names do not occur in the body, so every token signature
+        // is identical and every pair would score 1.0 if scored.
+        let body = accumulate_body("worker", "sum");
+        let mut before = BTreeMap::new();
+        for i in 0..501 {
+            let s = snap_src(&format!("a::sym{i}"), &format!("sym{i}"), "src/a.rs", &body);
+            before.insert(s.key.clone(), s);
+        }
+        let mut after = BTreeMap::new();
+        for i in 0..500 {
+            let s = snap_src(&format!("b::sym{i}"), &format!("sym{i}"), "src/b.rs", &body);
+            after.insert(s.key.clone(), s);
+        }
+        let pairing = pair_endpoints(&before, &after, &[] as &[FileChange]);
+        assert!(pairing.pairs.is_empty(), "past the cap nothing may pair");
+        assert!(pairing.fallback_paired.is_empty());
+        assert_eq!(pairing.preimage_only.len(), 501);
+        assert_eq!(pairing.postimage_only.len(), 500);
+    }
+
+    #[test]
+    #[hardwon("#2766: scoped diff scoring lost the target dependency closure")]
     fn scoped_target_image_matches_closure_and_keeps_whole_target_alive() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("repo");
@@ -6772,43 +6799,6 @@ mod entry_point_tests {
         );
     }
 
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[test]
-    fn analyze_diff_diffs_the_analyzers_own_project_root() {
-        let temp = RevisionTempDir::new("analyzer-entry").unwrap();
-        let root = temp.path();
-        let head = two_commit_repo(root);
-        let analyzer = build_analyzer(root, &[PathBuf::from("lib.go")]).unwrap();
-
-        let result = analyze_diff(
-            analyzer.analyzer(),
-            AnalyzeDiffParams {
-                base: None,
-                target: Some(head.to_string()),
-                include_tests: true,
-            },
-            &DiffAnalysisOptions::default(),
-            &CancellationToken::default(),
-        )
-        .unwrap();
-
-        assert_eq!(result.endpoints.target, head.to_string());
-        assert_eq!(
-            result
-                .patch_symbols
-                .edited
-                .iter()
-                .map(|pair| pair.after.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["Existing"],
-            "the analyzer's project root is the repository that gets diffed"
-        );
-    }
-
-    /// End-to-end over a real repository: a fuzzy-paired move (relocated AND
-    /// renamed, so only body similarity lines it up) carries `similarity:
-    /// Some(score >= threshold)`, while a move paired by identity or a Git
-    /// rename reports `similarity: None`.
     #[test]
     fn analyze_diff_reports_similarity_only_for_fuzzy_moved_pairs() {
         let temp = RevisionTempDir::new("fuzzy-move-entry").unwrap();
@@ -6879,6 +6869,7 @@ mod entry_point_tests {
         let result = analyze_diff(
             analyzer.analyzer(),
             AnalyzeDiffParams {
+                call_edges: super::DiffCallEdges::ChangedFiles,
                 base: Some(base.to_string()),
                 target: Some(head.to_string()),
                 include_tests: true,
@@ -6910,10 +6901,196 @@ mod entry_point_tests {
             "a move paired by identity or Git rename must not report a score"
         );
     }
+}
+
+#[cfg(test)]
+mod entry_point_tests {
+    use super::*;
+
+    /// A two-commit repository whose second commit edits `lib.go`, built with
+    /// `git2` so the lib tests do not need a `git` binary on PATH.
+    fn two_commit_repo(root: &Path) -> Oid {
+        let repo = Repository::init(root).unwrap();
+        let signature = git2::Signature::now("Tester", "tester@example.com").unwrap();
+        let mut head: Option<Oid> = None;
+        for body in ["\treturn 1\n", "\treturn 2\n"] {
+            fs::write(
+                root.join("lib.go"),
+                format!("package sample\n\nfunc Existing() int {{\n{body}}}\n"),
+            )
+            .unwrap();
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new("lib.go")).unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let parents: Vec<git2::Commit> = head
+                .into_iter()
+                .map(|oid| repo.find_commit(oid).unwrap())
+                .collect();
+            head = Some(
+                repo.commit(
+                    Some("HEAD"),
+                    &signature,
+                    &signature,
+                    "commit",
+                    &tree,
+                    &parents.iter().collect::<Vec<_>>(),
+                )
+                .unwrap(),
+            );
+        }
+        head.unwrap()
+    }
+
+    /// Keep the tree-base/worktree path observable through source loading,
+    /// retained-revision GC, and deleted-line attribution. Forced collection
+    /// makes the former Windows scheduling race deterministic on every host.
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "a4a6495a44d7: Crosses alternate Git trees, shared-cache retention/GC, base source loading, and deleted-line attribution"
+    )]
+    fn tree_base_worktree_keeps_base_bytes_lines_and_deleted_symbol() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        fs::create_dir(&root).unwrap();
+        two_commit_repo(&root);
+        fs::write(root.join("lib.go"), "package sample\nfunc LiveNow() {}\n").unwrap();
+
+        // Build the tree and blob in a sibling bare repository so this is the
+        // same host-trusted alternate shape as the integration regression.
+        let snapshot_root = temp.path().join("snapshot.git");
+        let snapshot = Repository::init_bare(&snapshot_root).unwrap();
+        let blob = snapshot
+            .blob(b"package sample\nfunc SnapshotBase() {}\n")
+            .unwrap();
+        let mut tree_builder = snapshot.treebuilder(None).unwrap();
+        tree_builder.insert("lib.go", blob, 0o100644).unwrap();
+        let base_tree = tree_builder.write().unwrap();
+        let options = DiffAnalysisOptions {
+            snapshot_object_dir: Some(snapshot_root.join("objects")),
+        };
+        let prepared = PreparedDiff::at_root(
+            &root,
+            DiffEndpointParams {
+                base: Some(base_tree.to_string()),
+                target: None,
+            },
+            &options,
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert_eq!(prepared.base, Snapshot::Tree(base_tree));
+        assert_eq!(prepared.target, Snapshot::Worktree);
+
+        let base_paths = vec!["lib.go".to_string()];
+        let base_repository = prepared.repository_for(prepared.base);
+        let base_image = RevisionImage::materialize(
+            &base_repository.repo,
+            prepared.base,
+            Some(&base_paths),
+            &base_repository.alternate_object_dirs,
+            prepared.shared_cache(),
+        )
+        .unwrap();
+        let (base_project, _) = base_image.project();
+        let base_file = base_project
+            .file_by_rel_path(Path::new("lib.go"))
+            .expect("base image must contain the changed path");
+        assert_eq!(
+            base_project.read_source(&base_file).unwrap(),
+            "package sample\nfunc SnapshotBase() {}\n"
+        );
+
+        // The service opens this shared cache for every immutable endpoint;
+        // keep the diagnostic on that exact path rather than validating only
+        // the ephemeral-store variant.
+        let base_analyzer = build_revision_analyzer(&base_image, prepared.shared_cache()).unwrap();
+        // Startup GC can overlap a diff request. The sibling snapshot blob is
+        // unreachable from Git refs, but this retained revision still owns its
+        // facts. Force that ordering so the regression does not depend on how
+        // quickly the host schedules the background collector.
+        let db_path = crate::analyzer::store::analyzer_db_path(&root);
+        let repo = Repository::open(&root).unwrap();
+        let retained_gc = crate::cache_gc::force_gc_for_path(&db_path, &repo, &root).unwrap();
+        assert!(retained_gc.ran);
+        assert_eq!(retained_gc.analyzer_dropped, 0);
+        let base_symbols = symbol_snapshot_map(base_analyzer.analyzer(), true);
+        let base_symbol = base_symbols
+            .values()
+            .find(|snapshot| snapshot.symbol.name == "SnapshotBase")
+            .expect("base analyzer must contain SnapshotBase");
+        assert!(
+            symbol_snapshot_map(base_analyzer.analyzer(), false)
+                .values()
+                .any(|snapshot| snapshot.symbol.name == "SnapshotBase"),
+            "production-symbol filtering must retain SnapshotBase"
+        );
+        assert_eq!(
+            old_overlap(&base_symbol.symbol, &prepared.changed_lines),
+            vec![2],
+            "the base symbol must overlap the deleted old line: {:?}",
+            prepared.changed_lines
+        );
+
+        drop(base_analyzer);
+        let released_gc = crate::cache_gc::force_gc_for_path(&db_path, &repo, &root).unwrap();
+        assert!(released_gc.ran);
+        assert_eq!(released_gc.analyzer_dropped, 1);
+
+        let analyzed = analyze_prepared_diff_with_endpoints(&prepared, false).unwrap();
+        let deleted = analyzed
+            .result
+            .patch_symbols
+            .deleted
+            .iter()
+            .find(|symbol| symbol.before.name == "SnapshotBase")
+            .expect("full symbol classification must retain SnapshotBase deletion");
+        assert_eq!(deleted.touched_old_lines, vec![2]);
+    }
+
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1518: Runs the public analyzer entry point against its own Git repository and checks the edited symbol from two commits"
+    )]
+    fn analyze_diff_diffs_the_analyzers_own_project_root() {
+        let temp = RevisionTempDir::new("analyzer-entry").unwrap();
+        let root = temp.path();
+        let head = two_commit_repo(root);
+        let analyzer = build_analyzer(root, &[PathBuf::from("lib.go")]).unwrap();
+
+        let result = analyze_diff(
+            analyzer.analyzer(),
+            AnalyzeDiffParams {
+                call_edges: super::DiffCallEdges::ChangedFiles,
+                base: None,
+                target: Some(head.to_string()),
+                include_tests: true,
+            },
+            &DiffAnalysisOptions::default(),
+            &CancellationToken::default(),
+        )
+        .unwrap();
+
+        assert_eq!(result.endpoints.target, head.to_string());
+        assert_eq!(
+            result
+                .patch_symbols
+                .edited
+                .iter()
+                .map(|pair| pair.after.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Existing"],
+            "the analyzer's project root is the repository that gets diffed"
+        );
+    }
 
     /// Snapshot trees can come from a host-supplied object directory, so the
     /// export refuses any entry name that would escape the revision root.
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1518: Pins rejection of empty, absolute, and parent-escaping names from a host-supplied Git tree"
+    )]
     fn safe_tree_entry_path_rejects_names_that_escape_the_root() {
         assert_eq!(
             safe_tree_entry_path("pkg/inner/lib.go").unwrap(),
@@ -6933,6 +7110,9 @@ mod entry_point_tests {
     /// same build published are keyed by content and stay: those are the asset
     /// the next request reuses.
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2769: Builds a revision workspace through the shared cache, answers from it, and verifies ephemeral projection rows are released"
+    )]
     fn a_revision_export_workspace_answers_and_then_drops_its_projection() {
         let temp = tempfile::tempdir().expect("temporary repository");
         let root = temp.path();

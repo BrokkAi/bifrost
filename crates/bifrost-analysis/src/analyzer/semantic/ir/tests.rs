@@ -1,34 +1,34 @@
 use super::*;
+use crate::test_support::source_anchor;
+use brokk_bifrost_test_macros::hardwon;
 use std::sync::Arc;
 
 use crate::analyzer::Language;
-use crate::hash::HashSet;
 
 use super::super::capabilities::{SemanticCapabilities, SemanticCapability};
 
 use super::super::ids::{
-    AdapterSemanticsVersion, AllocationId, BlockId, CallSiteId, CaptureId,
-    ConfigurationFingerprint, ContentIdentity, ControlEdgeId, DeclarationLocator,
-    DeclarationSegment, DeclarationSegmentKind, DependencyFingerprint, EvidenceId, GuardId,
-    MemoryLocationId, ProcedureId, ProgramPointId, SemanticArtifactKey, SemanticGapId,
-    SemanticIrVersion, SemanticLanguage, SemanticLocator, SemanticRole, SourceAnchor,
-    SourceMappingId, SourcePosition, SourceRevision, SourceSpan, StructuralNodeIdentity, ValueId,
-    WorkspaceMountId, WorkspaceRelativePath,
+    AllocationId, CallSiteId, CaptureId, ContentIdentity, ControlEdgeId, DeclarationLocator,
+    DeclarationSegment, DeclarationSegmentKind, EvidenceId, MemoryLocationId, ProcedureId,
+    ProgramPointId, SemanticArtifactKey, SemanticGapId, SemanticLanguage, SemanticLocator,
+    SemanticRole, SourceMappingId, SourceRevision, StructuralNodeIdentity, ValueId,
+    WorkspaceRelativePath,
 };
 use super::super::provider::{SemanticBudget, SemanticWork};
 
 fn key_with_language(language: SemanticLanguage) -> SemanticArtifactKey {
-    SemanticArtifactKey::new(
-        WorkspaceMountId::hash_bytes(b"test mount"),
-        WorkspaceRelativePath::new("src/Test.java").expect("valid fixture path"),
+    crate::test_support::semantic_artifact_key_fixture(
+        "test mount",
+        "src/Test.java",
         language,
         SourceRevision::Disk {
             content: ContentIdentity::hash_bytes(b"class Test {}"),
         },
-        AdapterSemanticsVersion::hash_bytes("test-java", b"adapter").expect("non-empty adapter"),
-        SemanticIrVersion::hash_bytes(b"semantic-ir-test"),
-        ConfigurationFingerprint::hash_bytes(b"configuration"),
-        DependencyFingerprint::hash_bytes(b"dependencies"),
+        "test-java",
+        "adapter",
+        "semantic-ir-test",
+        "configuration",
+        "dependencies",
     )
 }
 
@@ -36,120 +36,8 @@ pub(crate) fn key() -> SemanticArtifactKey {
     key_with_language(SemanticLanguage::Standard(Language::Java))
 }
 
-#[test]
-fn semantic_gap_impacts_are_compact_total_and_deterministic() {
-    let impacts = SemanticGapImpacts::NONE
-        .with(SemanticGapImpact::Aliasing)
-        .with(SemanticGapImpact::DispatchCoverage)
-        .with(SemanticGapImpact::HeapRead)
-        .with(SemanticGapImpact::HeapRead);
-
-    assert_eq!(
-        impacts.iter().collect::<Vec<_>>(),
-        vec![
-            SemanticGapImpact::DispatchCoverage,
-            SemanticGapImpact::HeapRead,
-            SemanticGapImpact::Aliasing,
-        ]
-    );
-    assert!(impacts.contains(SemanticGapImpact::HeapRead));
-    assert!(!impacts.contains(SemanticGapImpact::ValueFlow));
-    assert_eq!(SemanticGapImpacts::default(), SemanticGapImpacts::NONE);
-
-    assert_eq!(
-        SemanticGapImpacts::for_gap(
-            SemanticCapability::DynamicDispatch,
-            SemanticGapSubject::Point,
-        ),
-        SemanticGapImpacts::single(SemanticGapImpact::DispatchCoverage),
-    );
-    assert_eq!(
-        SemanticGapImpacts::for_gap(
-            SemanticCapability::ExceptionalControlFlow,
-            SemanticGapSubject::Point,
-        ),
-        SemanticGapImpacts::CONTROL_FLOW,
-    );
-    let call_impacts = SemanticGapImpacts::for_gap(
-        SemanticCapability::Calls,
-        SemanticGapSubject::CallSite(CallSiteId::new(0)),
-    );
-    assert_eq!(call_impacts, SemanticGapImpacts::VALUE);
-    assert!(!call_impacts.contains(SemanticGapImpact::DispatchCoverage));
-    assert!(!call_impacts.contains(SemanticGapImpact::CallEvaluation));
-    assert_eq!(
-        SemanticGapImpacts::for_gap(SemanticCapability::Calls, SemanticGapSubject::Procedure,),
-        SemanticGapImpacts::NONE,
-    );
-    let callable_impacts = SemanticGapImpacts::for_gap(
-        SemanticCapability::CallableReferences,
-        SemanticGapSubject::CallSite(CallSiteId::new(0)),
-    );
-    assert_eq!(callable_impacts, SemanticGapImpacts::NONE);
-    let deferred_impacts = SemanticGapImpacts::for_gap(
-        SemanticCapability::DeferredExecution,
-        SemanticGapSubject::CallSite(CallSiteId::new(0)),
-    );
-    assert_eq!(deferred_impacts, SemanticGapImpacts::DEFERRED_EFFECTS);
-    assert!(!deferred_impacts.contains(SemanticGapImpact::DispatchCoverage));
-    assert!(!deferred_impacts.contains(SemanticGapImpact::CallEvaluation));
-    for impact in [
-        SemanticGapImpact::ReturnTransfer,
-        SemanticGapImpact::ValueFlow,
-        SemanticGapImpact::HeapRead,
-        SemanticGapImpact::HeapWrite,
-        SemanticGapImpact::Aliasing,
-    ] {
-        assert!(SemanticGapImpacts::DEFERRED_EFFECTS.contains(impact));
-        assert!(SemanticGapImpacts::CALL_EVALUATION.contains(impact));
-    }
-    assert!(!SemanticGapImpacts::DEFERRED_EFFECTS.contains(SemanticGapImpact::CallEvaluation));
-    assert!(SemanticGapImpacts::CALL_EVALUATION.contains(SemanticGapImpact::CallEvaluation));
-    assert!(!SemanticGapImpacts::CALL_EVALUATION.contains(SemanticGapImpact::DispatchCoverage));
-    assert_eq!(
-        SemanticGapImpacts::for_gap(
-            SemanticCapability::ConcurrentSpawn,
-            SemanticGapSubject::CallSite(CallSiteId::new(0)),
-        ),
-        SemanticGapImpacts::CALL_EVALUATION,
-    );
-    let assignment =
-        SemanticGapImpacts::for_gap(SemanticCapability::Assignments, SemanticGapSubject::Point);
-    assert!(assignment.contains(SemanticGapImpact::ValueFlow));
-    assert!(assignment.contains(SemanticGapImpact::Aliasing));
-
-    let capture = SemanticGapImpacts::for_gap(
-        SemanticCapability::Captures,
-        SemanticGapSubject::MemoryLocation(MemoryLocationId::new(0)),
-    );
-    for impact in [
-        SemanticGapImpact::ValueFlow,
-        SemanticGapImpact::HeapRead,
-        SemanticGapImpact::HeapWrite,
-        SemanticGapImpact::Aliasing,
-    ] {
-        assert!(capture.contains(impact), "missing {impact:?}");
-    }
-}
-
 pub(crate) fn capabilities(features: &[SemanticCapability]) -> SemanticCapabilities {
-    let mut builder = SemanticCapabilities::builder();
-    for capability in [
-        SemanticCapability::Procedures,
-        SemanticCapability::EntryBoundary,
-        SemanticCapability::NormalExitBoundary,
-        SemanticCapability::ExceptionalExitBoundary,
-        SemanticCapability::BasicBlocks,
-        SemanticCapability::ProgramPoints,
-        SemanticCapability::NormalControlFlow,
-        SemanticCapability::ExceptionalControlFlow,
-    ]
-    .into_iter()
-    .chain(features.iter().copied())
-    {
-        builder = builder.complete(capability);
-    }
-    builder.build()
+    crate::test_support::complete_semantic_capabilities(features)
 }
 
 fn partial_index_capabilities() -> SemanticCapabilities {
@@ -170,32 +58,13 @@ fn partial_index_capabilities() -> SemanticCapabilities {
     builder.partial(SemanticCapability::IndexMemory).build()
 }
 
-fn anchor(offset: u32, occurrence: u32) -> SourceAnchor {
-    let start = SourcePosition::new(offset, 0, offset);
-    let end = SourcePosition::new(offset + 1, 0, offset + 1);
-    SourceAnchor::new(
-        SourceSpan::new(start, end).expect("ordered fixture span"),
-        occurrence,
-    )
-}
-
 fn procedure_locator(key: &SemanticArtifactKey, name: &str, offset: u32) -> SemanticLocator {
-    let file_anchor = anchor(0, 0);
-    let procedure_anchor = anchor(offset, 0);
-    let declaration = DeclarationLocator::new(vec![
-        DeclarationSegment::named(DeclarationSegmentKind::File, "Test.java", file_anchor, 0)
-            .expect("named file segment"),
-        DeclarationSegment::named(DeclarationSegmentKind::Function, name, procedure_anchor, 0)
-            .expect("named procedure segment"),
-    ])
-    .expect("non-empty declaration path");
-    SemanticLocator::new(
-        key.mount(),
-        key.path().clone(),
-        key.language(),
-        declaration,
+    crate::test_support::named_file_function_locator(
+        key,
+        "Test.java",
+        name,
+        source_anchor(offset, offset + 1, 0),
         SemanticRole::Procedure,
-        procedure_anchor,
     )
 }
 
@@ -206,7 +75,7 @@ fn direct_child_locator(
     name: &str,
     offset: u32,
 ) -> SemanticLocator {
-    let child_anchor = anchor(offset, 0);
+    let child_anchor = source_anchor(offset, offset + 1, 0);
     let mut segments = parent.declaration().segments().to_vec();
     segments.push(
         DeclarationSegment::named(kind, name, child_anchor, 0)
@@ -229,263 +98,7 @@ pub(crate) fn minimal_procedure(
     offset: u32,
 ) -> ProcedureSemanticsParts {
     let locator = procedure_locator(key, name, offset);
-    let source = SourceMappingId::new(0);
-    let evidence = EvidenceId::new(0);
-    let mut parts = ProcedureSemanticsParts::new(
-        id,
-        locator.clone(),
-        ProcedureKind::Function,
-        source,
-        evidence,
-    );
-    parts.source_mappings.push(SourceMapping {
-        id: source,
-        locator,
-        kind: SourceMappingKind::Exact,
-        ast_identity: None,
-    });
-    parts.evidence_rows.push(Evidence {
-        id: evidence,
-        proof: ProofStatus::Proven,
-        completeness: EvidenceCompleteness::Complete,
-        sources: vec![source].into_boxed_slice(),
-    });
-
-    let entry = ProgramPointId::new(0);
-    let normal_exit = ProgramPointId::new(1);
-    let exceptional_exit = ProgramPointId::new(2);
-    parts.blocks.push(BasicBlock {
-        id: BlockId::new(0),
-        points: vec![entry, normal_exit, exceptional_exit].into_boxed_slice(),
-        source,
-        evidence,
-    });
-    parts.points.extend([
-        ProgramPoint {
-            id: entry,
-            block: BlockId::new(0),
-            events: vec![SemanticEvent::new(SemanticEffect::Entry, source, evidence)]
-                .into_boxed_slice(),
-            source,
-            evidence,
-        },
-        ProgramPoint {
-            id: normal_exit,
-            block: BlockId::new(0),
-            events: vec![SemanticEvent::new(
-                SemanticEffect::NormalExit,
-                source,
-                evidence,
-            )]
-            .into_boxed_slice(),
-            source,
-            evidence,
-        },
-        ProgramPoint {
-            id: exceptional_exit,
-            block: BlockId::new(0),
-            events: vec![SemanticEvent::new(
-                SemanticEffect::ExceptionalExit,
-                source,
-                evidence,
-            )]
-            .into_boxed_slice(),
-            source,
-            evidence,
-        },
-    ]);
-    parts.control_edges.extend([
-        ControlEdge {
-            source_point: entry,
-            target_point: normal_exit,
-            kind: ControlEdgeKind::Normal,
-            source,
-            evidence,
-        },
-        ControlEdge {
-            source_point: entry,
-            target_point: exceptional_exit,
-            kind: ControlEdgeKind::Exceptional,
-            source,
-            evidence,
-        },
-    ]);
-    parts
-}
-
-#[test]
-fn minimal_valid_artifact_exposes_scoped_handles() {
-    let key = key();
-    let artifact = SemanticArtifact::try_new(
-        key.clone(),
-        capabilities(&[]),
-        vec![minimal_procedure(&key, ProcedureId::new(0), "main", 1)],
-    )
-    .expect("minimal procedure is valid");
-    assert_eq!(artifact.key(), &key);
-    assert_eq!(artifact.procedures().len(), 1);
-    let procedure = &artifact.procedures()[0];
-    assert_eq!(procedure.entry_point(), ProgramPointId::new(0));
-    assert_eq!(procedure.normal_exit_point(), ProgramPointId::new(1));
-    assert_eq!(procedure.exceptional_exit_point(), ProgramPointId::new(2));
-
-    let artifact = Arc::new(artifact);
-    let handle = artifact
-        .procedure_handle(ProcedureId::new(0))
-        .expect("in-bounds procedure handle");
-    assert!(handle.point_handle(ProgramPointId::new(2)).is_some());
-    assert!(handle.point_handle(ProgramPointId::new(3)).is_none());
-    assert!(handle.control_edge_handle(ControlEdgeId::new(1)).is_some());
-    assert!(handle.control_edge_handle(ControlEdgeId::new(2)).is_none());
-    assert!(handle.value_handle(ValueId::new(0)).is_none());
-}
-
-#[test]
-fn ordered_integer_guards_require_a_subject_and_represented_integer_constant() {
-    let artifact = |subject, constant, constant_kind| {
-        let key = key();
-        let mut procedure = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
-        procedure.values = vec![
-            parameter_value(0, 0, FormalMultiplicity::One),
-            SemanticValue {
-                id: ValueId::new(1),
-                kind: constant_kind,
-                source: SourceMappingId::new(0),
-                evidence: EvidenceId::new(0),
-            },
-        ];
-        procedure.guard_facts.push(GuardFactParts {
-            id: GuardId::new(0),
-            point: ProgramPointId::new(0),
-            subject,
-            predicate: GuardPredicate::OrderedIntegerComparison {
-                relation: IntegerComparison::GreaterThan,
-                constant,
-            },
-            true_arm: None,
-            false_arm: None,
-            source: SourceMappingId::new(0),
-            evidence: EvidenceId::new(0),
-        });
-        SemanticArtifact::try_new(
-            key,
-            capabilities(&[SemanticCapability::Values, SemanticCapability::GuardFacts]),
-            vec![procedure],
-        )
-    };
-
-    let valid = artifact(
-        Some(ValueId::new(0)),
-        ValueId::new(1),
-        SemanticValueKind::UnsignedInteger(0),
-    )
-    .expect("a subject and represented integer form a valid ordered guard");
-    assert!(matches!(
-        valid.procedures()[0].guard_facts(),
-        [GuardFact {
-            subject: Some(subject),
-            predicate: GuardPredicate::OrderedIntegerComparison {
-                relation: IntegerComparison::GreaterThan,
-                constant,
-            },
-            ..
-        }] if *subject == ValueId::new(0) && *constant == ValueId::new(1)
-    ));
-
-    for (invalid, expected) in [
-        (
-            artifact(None, ValueId::new(1), SemanticValueKind::UnsignedInteger(0)),
-            SemanticIrErrorKind::GuardContract,
-        ),
-        (
-            artifact(
-                Some(ValueId::new(0)),
-                ValueId::new(2),
-                SemanticValueKind::UnsignedInteger(0),
-            ),
-            SemanticIrErrorKind::OutOfBounds,
-        ),
-        (
-            artifact(
-                Some(ValueId::new(0)),
-                ValueId::new(1),
-                SemanticValueKind::Boolean(false),
-            ),
-            SemanticIrErrorKind::GuardContract,
-        ),
-    ] {
-        assert_eq!(
-            invalid
-                .expect_err("the malformed ordered guard is rejected")
-                .kind(),
-            expected
-        );
-    }
-}
-
-fn artifact_with_values(values: Vec<SemanticValue>) -> Result<SemanticArtifact, SemanticIrError> {
-    let key = key();
-    let mut procedure = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
-    procedure.values = values;
-    SemanticArtifact::try_new(
-        key,
-        capabilities(&[SemanticCapability::Values]),
-        vec![procedure],
-    )
-}
-
-fn parameter_value(id: u32, ordinal: u32, multiplicity: FormalMultiplicity) -> SemanticValue {
-    SemanticValue {
-        id: ValueId::new(id),
-        kind: SemanticValueKind::Parameter {
-            ordinal,
-            multiplicity,
-            name: None,
-            passing_mode: FormalParameterPassingMode::PositionalOrNamed,
-        },
-        source: SourceMappingId::new(0),
-        evidence: EvidenceId::new(0),
-    }
-}
-
-fn default_argument_value(id: u32, ordinal: u32) -> SemanticValue {
-    SemanticValue {
-        id: ValueId::new(id),
-        kind: SemanticValueKind::DefaultArgument { ordinal },
-        source: SourceMappingId::new(0),
-        evidence: EvidenceId::new(0),
-    }
-}
-
-#[test]
-fn default_argument_values_require_one_existing_nonrest_formal() {
-    let duplicate = artifact_with_values(vec![
-        parameter_value(0, 0, FormalMultiplicity::One),
-        default_argument_value(1, 0),
-        default_argument_value(2, 0),
-    ])
-    .expect_err("one formal cannot publish duplicate saved defaults");
-    assert_eq!(duplicate.kind(), SemanticIrErrorKind::CallContract);
-    assert!(duplicate.detail().contains("published more than once"));
-
-    let absent = artifact_with_values(vec![default_argument_value(0, 4)])
-        .expect_err("a saved default must name an existing formal");
-    assert_eq!(absent.kind(), SemanticIrErrorKind::CallContract);
-    assert!(absent.detail().contains("has no parameter formal"));
-
-    let rest = artifact_with_values(vec![
-        parameter_value(0, 0, FormalMultiplicity::Rest(ArgumentDomain::Positional)),
-        default_argument_value(1, 0),
-    ])
-    .expect_err("a rest formal cannot own a saved default");
-    assert_eq!(rest.kind(), SemanticIrErrorKind::CallContract);
-    assert!(rest.detail().contains("names a rest formal"));
-
-    artifact_with_values(vec![
-        parameter_value(0, 0, FormalMultiplicity::One),
-        default_argument_value(1, 0),
-    ])
-    .expect("one saved default for an existing nonrest formal is valid");
+    crate::test_support::minimal_semantic_procedure(id, locator, ProcedureKind::Function)
 }
 
 #[test]
@@ -778,145 +391,6 @@ fn exact_rich_edges_are_rejected_but_distinct_provenance_is_preserved() {
     );
 }
 
-fn raw_cfg_parts() -> (Vec<ControlEdge>, Vec<u32>, Vec<u32>, Vec<ControlEdgeId>) {
-    let source = SourceMappingId::new(0);
-    let evidence = EvidenceId::new(0);
-    (
-        vec![
-            ControlEdge {
-                source_point: ProgramPointId::new(0),
-                target_point: ProgramPointId::new(2),
-                kind: ControlEdgeKind::Exceptional,
-                source,
-                evidence,
-            },
-            ControlEdge {
-                source_point: ProgramPointId::new(0),
-                target_point: ProgramPointId::new(1),
-                kind: ControlEdgeKind::Normal,
-                source,
-                evidence,
-            },
-        ],
-        vec![0, 2, 2, 2],
-        vec![0, 0, 1, 2],
-        vec![ControlEdgeId::new(1), ControlEdgeId::new(0)],
-    )
-}
-
-#[test]
-fn checked_cfg_parts_reject_corrupt_adjacency() {
-    let procedure = ProcedureId::new(0);
-    let (edges, outgoing, incoming_offsets, incoming_ids) = raw_cfg_parts();
-    ControlFlowGraph::try_from_parts(
-        procedure,
-        3,
-        edges,
-        outgoing,
-        incoming_offsets,
-        incoming_ids,
-    )
-    .expect("valid raw adjacency should pass defensive validation");
-
-    let (edges, _, incoming_offsets, incoming_ids) = raw_cfg_parts();
-    let error = ControlFlowGraph::try_from_parts(
-        procedure,
-        3,
-        edges,
-        vec![0, 1, 2, 2],
-        incoming_offsets,
-        incoming_ids,
-    )
-    .expect_err("an edge in the wrong outgoing row must fail");
-    assert_eq!(error.kind(), SemanticIrErrorKind::ControlFlowContract);
-
-    let (edges, outgoing, incoming_offsets, _) = raw_cfg_parts();
-    let error = ControlFlowGraph::try_from_parts(
-        procedure,
-        3,
-        edges,
-        outgoing,
-        incoming_offsets,
-        vec![ControlEdgeId::new(1), ControlEdgeId::new(9)],
-    )
-    .expect_err("an out-of-range incoming edge id must fail");
-    assert_eq!(error.kind(), SemanticIrErrorKind::ControlFlowContract);
-
-    let (edges, outgoing, incoming_offsets, _) = raw_cfg_parts();
-    let error = ControlFlowGraph::try_from_parts(
-        procedure,
-        3,
-        edges,
-        outgoing,
-        incoming_offsets,
-        vec![ControlEdgeId::new(0), ControlEdgeId::new(1)],
-    )
-    .expect_err("an edge in the wrong incoming row must fail");
-    assert_eq!(error.kind(), SemanticIrErrorKind::ControlFlowContract);
-
-    let (edges, outgoing, incoming_offsets, _) = raw_cfg_parts();
-    let error = ControlFlowGraph::try_from_parts(
-        procedure,
-        3,
-        edges,
-        outgoing,
-        incoming_offsets,
-        vec![ControlEdgeId::new(1), ControlEdgeId::new(1)],
-    )
-    .expect_err("duplicate and missing incoming membership must fail");
-    assert_eq!(error.kind(), SemanticIrErrorKind::ControlFlowContract);
-
-    let source = SourceMappingId::new(0);
-    let evidence = EvidenceId::new(0);
-    let (mut edges, _, _, _) = raw_cfg_parts();
-    edges.push(ControlEdge {
-        source_point: ProgramPointId::new(1),
-        target_point: ProgramPointId::new(2),
-        kind: ControlEdgeKind::Normal,
-        source,
-        evidence,
-    });
-    let error = ControlFlowGraph::try_from_parts(
-        procedure,
-        3,
-        edges,
-        vec![0, 2, 3, 3],
-        vec![0, 0, 1, 3],
-        vec![
-            ControlEdgeId::new(1),
-            ControlEdgeId::new(2),
-            ControlEdgeId::new(0),
-        ],
-    )
-    .expect_err("incoming rows must retain canonical control-edge order");
-    assert_eq!(error.kind(), SemanticIrErrorKind::ControlFlowContract);
-}
-
-#[test]
-fn rejects_non_dense_and_out_of_bounds_local_ids() {
-    let key = key();
-    let mut non_dense = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
-    non_dense.points[1].id = ProgramPointId::new(99);
-    let error = SemanticArtifact::try_new(key.clone(), capabilities(&[]), vec![non_dense])
-        .expect_err("non-dense point id must fail");
-    assert_eq!(error.kind(), SemanticIrErrorKind::DenseId);
-
-    let mut out_of_bounds = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
-    let mut entry_events = out_of_bounds.points[0].events.to_vec();
-    entry_events.push(SemanticEvent::new(
-        SemanticEffect::Assignment {
-            target: ValueId::new(0),
-            value: ValueId::new(0),
-        },
-        SourceMappingId::new(0),
-        EvidenceId::new(0),
-    ));
-    out_of_bounds.points[0].events = entry_events.into_boxed_slice();
-    let error = SemanticArtifact::try_new(key, capabilities(&[]), vec![out_of_bounds])
-        .expect_err("bare value id outside this procedure must fail");
-    assert_eq!(error.kind(), SemanticIrErrorKind::OutOfBounds);
-}
-
 #[test]
 fn aggregate_initializer_validates_values_selector_scope_and_event_evidence() {
     let key = key();
@@ -928,7 +402,7 @@ fn aggregate_initializer_validates_values_selector_scope_and_event_evidence() {
         key.language(),
         procedure_locator(&key, "main", 1).declaration().clone(),
         SemanticRole::MemoryLocation,
-        anchor(3, 0),
+        source_anchor(3, 4, 0),
     );
     let procedure_with = |aggregate: ValueId,
                           value: ValueId,
@@ -995,7 +469,7 @@ fn aggregate_initializer_validates_values_selector_scope_and_event_evidence() {
         key.language(),
         procedure_locator(&key, "main", 1).declaration().clone(),
         SemanticRole::MemoryLocation,
-        anchor(3, 0),
+        source_anchor(3, 4, 0),
     );
     let error = SemanticArtifact::try_new(
         key.clone(),
@@ -1025,6 +499,7 @@ fn aggregate_initializer_validates_values_selector_scope_and_event_evidence() {
 }
 
 #[test]
+#[hardwon("#2662: Go aggregate copies lost identity with the matching assignment")]
 fn aggregate_copy_requires_one_adjacent_matching_assignment() {
     let key = key();
     let source = SourceMappingId::new(0);
@@ -1158,41 +633,6 @@ fn transfer_capabilities() -> SemanticCapabilities {
 }
 
 #[test]
-fn every_transfer_kind_accepts_an_adjacent_matching_assignment() {
-    let key = key();
-    for kind in [
-        TransferKind::Copy,
-        TransferKind::AggregateCopy,
-        TransferKind::Move {
-            invalidation: MoveInvalidation::Invalidated,
-        },
-        TransferKind::Conversion {
-            preservation: ValuePreservation::Identity,
-        },
-        TransferKind::Conversion {
-            preservation: ValuePreservation::Preserving,
-        },
-        TransferKind::Conversion {
-            preservation: ValuePreservation::Changing,
-        },
-        TransferKind::Boxing,
-        TransferKind::Unboxing,
-    ] {
-        let parts = transfer_pair_procedure(
-            &key,
-            ValueTransfer {
-                kind,
-                operation: TransferOperation::None,
-            },
-            ProofStatus::Proven,
-            EvidenceCompleteness::Complete,
-        );
-        SemanticArtifact::try_new(key.clone(), transfer_capabilities(), vec![parts])
-            .unwrap_or_else(|error| panic!("{} transfer must validate: {error}", kind.label()));
-    }
-}
-
-#[test]
 fn uncertain_transfer_facts_reject_proven_complete_evidence() {
     let key = key();
     for transfer in [
@@ -1230,96 +670,9 @@ fn uncertain_transfer_facts_reject_proven_complete_evidence() {
 }
 
 #[test]
-fn transfer_operation_call_site_must_be_in_bounds() {
-    let key = key();
-    let parts = transfer_pair_procedure(
-        &key,
-        ValueTransfer {
-            kind: TransferKind::Copy,
-            operation: TransferOperation::CallSite(CallSiteId::new(0)),
-        },
-        ProofStatus::Proven,
-        EvidenceCompleteness::Complete,
-    );
-    let error = SemanticArtifact::try_new(key, transfer_capabilities(), vec![parts])
-        .expect_err("transfer operation naming a missing call site must fail");
-    assert_eq!(error.kind(), SemanticIrErrorKind::OutOfBounds);
-}
-
-#[test]
-fn value_use_requires_a_procedure_local_value() {
-    let key = key();
-    let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
-    let mut entry_events = parts.points[0].events.to_vec();
-    entry_events.push(SemanticEvent::new(
-        SemanticEffect::ValueUse {
-            kind: ValueUseKind::Dereference,
-            value: ValueId::new(0),
-        },
-        SourceMappingId::new(0),
-        EvidenceId::new(0),
-    ));
-    parts.points[0].events = entry_events.into_boxed_slice();
-
-    let error = SemanticArtifact::try_new(
-        key,
-        capabilities(&[SemanticCapability::Values]),
-        vec![parts],
-    )
-    .expect_err("value-use events cannot name a value outside their procedure");
-    assert_eq!(error.kind(), SemanticIrErrorKind::OutOfBounds);
-}
-
-#[test]
-fn rejects_lexical_parent_cycle_iteratively() {
-    let key = key();
-    let mut outer = minimal_procedure(&key, ProcedureId::new(0), "outer", 1);
-    let mut inner = minimal_procedure(&key, ProcedureId::new(1), "inner", 3);
-    outer.lexical_parent = Some(ProcedureId::new(1));
-    inner.lexical_parent = Some(ProcedureId::new(0));
-
-    let error = SemanticArtifact::try_new(key, capabilities(&[]), vec![outer, inner])
-        .expect_err("lexical cycle must fail");
-    assert_eq!(error.kind(), SemanticIrErrorKind::ParentCycle);
-}
-
-#[test]
-fn rejects_non_analyzable_artifact_language() {
-    let key = key_with_language(SemanticLanguage::Standard(Language::None));
-    let error = SemanticArtifact::try_new(key, SemanticCapabilities::default(), Vec::new())
-        .expect_err("Language::None is not a semantic adapter language");
-    assert_eq!(error.kind(), SemanticIrErrorKind::ArtifactIdentity);
-}
-
-#[test]
-fn rejects_exact_ir_for_unsupported_capabilities() {
-    let key = key();
-    let parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
-    let error = SemanticArtifact::try_new(key, SemanticCapabilities::default(), vec![parts])
-        .expect_err("exact procedure rows contradict unsupported capabilities");
-    assert_eq!(error.kind(), SemanticIrErrorKind::CapabilityContract);
-}
-
-#[test]
-fn rejects_source_mapping_outside_artifact_scope() {
-    let key = key();
-    let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
-    let local = &parts.source_mappings[0].locator;
-    parts.source_mappings[0].locator = SemanticLocator::new(
-        WorkspaceMountId::hash_bytes(b"different mount"),
-        local.path().clone(),
-        local.language(),
-        local.declaration().clone(),
-        local.role(),
-        local.anchor(),
-    );
-
-    let error = SemanticArtifact::try_new(key, capabilities(&[]), vec![parts])
-        .expect_err("source mappings cannot cross mounted artifact scope");
-    assert_eq!(error.kind(), SemanticIrErrorKind::SourceScope);
-}
-
-#[test]
+#[hardwon(
+    "#2816: semantic source mappings accepted structural identities from a different source revision"
+)]
 fn rejects_structural_identity_from_another_source_revision() {
     let key = key();
     let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
@@ -1331,73 +684,6 @@ fn rejects_structural_identity_from_another_source_revision() {
     let error = SemanticArtifact::try_new(key, capabilities(&[]), vec![parts])
         .expect_err("source mappings cannot carry another revision's structural identity");
     assert_eq!(error.kind(), SemanticIrErrorKind::SourceScope);
-}
-
-#[test]
-fn rejects_creator_local_capture_destination() {
-    let key = key();
-    let mut outer = minimal_procedure(&key, ProcedureId::new(0), "outer", 1);
-    let mut child = minimal_procedure(&key, ProcedureId::new(1), "child", 3);
-    child.lexical_parent = Some(ProcedureId::new(0));
-    outer.values.extend([
-        SemanticValue {
-            id: ValueId::new(0),
-            kind: SemanticValueKind::Callable,
-            source: SourceMappingId::new(0),
-            evidence: EvidenceId::new(0),
-        },
-        SemanticValue {
-            id: ValueId::new(1),
-            kind: SemanticValueKind::Local,
-            source: SourceMappingId::new(0),
-            evidence: EvidenceId::new(0),
-        },
-    ]);
-    outer.allocations.push(AllocationSite {
-        id: AllocationId::new(0),
-        point: ProgramPointId::new(0),
-        result: ValueId::new(0),
-        kind: AllocationKind::ClosureEnvironment,
-        source: SourceMappingId::new(0),
-        evidence: EvidenceId::new(0),
-    });
-    // This location exists only in the creator.  Destination IDs are
-    // scoped by `target`, so using raw id 0 cannot make it a child slot.
-    outer.memory_locations.push(MemoryLocation {
-        id: MemoryLocationId::new(0),
-        kind: MemoryLocationKind::LexicalCell {
-            binding: ValueId::new(1),
-        },
-        value_copy: MemoryValueCopy::Unknown,
-        source: SourceMappingId::new(0),
-        evidence: EvidenceId::new(0),
-    });
-    outer.captures.push(CaptureBinding {
-        id: CaptureId::new(0),
-        point: ProgramPointId::new(0),
-        callable: ValueId::new(0),
-        target: ProcedureId::new(1),
-        environment: AllocationId::new(0),
-        captured: CaptureSource::Value(ValueId::new(1)),
-        destination: MemoryLocationId::new(0),
-        mode: CaptureMode::Value,
-        source: SourceMappingId::new(0),
-        evidence: EvidenceId::new(0),
-    });
-
-    let error = SemanticArtifact::try_new(
-        key,
-        capabilities(&[
-            SemanticCapability::Values,
-            SemanticCapability::Allocations,
-            SemanticCapability::LocalFlow,
-            SemanticCapability::Captures,
-        ]),
-        vec![outer, child],
-    )
-    .expect_err("capture destination must exist in the target child");
-    assert_eq!(error.kind(), SemanticIrErrorKind::CaptureContract);
-    assert!(error.detail().contains("target procedure"));
 }
 
 #[test]
@@ -1460,6 +746,7 @@ fn capture_slot_requires_a_subject_specific_binding_gap() {
 }
 
 #[test]
+#[hardwon("#2638: duplicate gaps for one scoped fact were rejected as a semantic failure")]
 fn one_point_publishes_one_gap_per_scoped_fact() {
     let key = key();
     let mut procedure = minimal_procedure(&key, ProcedureId::new(0), "one_fact", 1);
@@ -1533,83 +820,6 @@ fn one_point_publishes_one_gap_per_scoped_fact() {
         vec![procedure],
     )
     .expect("distinct capabilities at one point remain distinct scoped facts");
-}
-
-#[test]
-fn receiver_capture_requires_a_receiver_value() {
-    let key = key();
-    let mut outer = minimal_procedure(&key, ProcedureId::new(0), "outer", 1);
-    let mut child = minimal_procedure(&key, ProcedureId::new(1), "child", 3);
-    child.lexical_parent = Some(ProcedureId::new(0));
-    child.memory_locations.push(MemoryLocation {
-        id: MemoryLocationId::new(0),
-        kind: MemoryLocationKind::Capture {
-            lexical_parent: ProcedureId::new(0),
-            binding: None,
-        },
-        value_copy: MemoryValueCopy::Unknown,
-        source: SourceMappingId::new(0),
-        evidence: EvidenceId::new(0),
-    });
-    outer.values.extend([
-        SemanticValue {
-            id: ValueId::new(0),
-            kind: SemanticValueKind::Callable,
-            source: SourceMappingId::new(0),
-            evidence: EvidenceId::new(0),
-        },
-        SemanticValue {
-            id: ValueId::new(1),
-            kind: SemanticValueKind::Local,
-            source: SourceMappingId::new(0),
-            evidence: EvidenceId::new(0),
-        },
-    ]);
-    outer.allocations.push(AllocationSite {
-        id: AllocationId::new(0),
-        point: ProgramPointId::new(0),
-        result: ValueId::new(0),
-        kind: AllocationKind::ClosureEnvironment,
-        source: SourceMappingId::new(0),
-        evidence: EvidenceId::new(0),
-    });
-    outer.captures.push(CaptureBinding {
-        id: CaptureId::new(0),
-        point: ProgramPointId::new(0),
-        callable: ValueId::new(0),
-        target: ProcedureId::new(1),
-        environment: AllocationId::new(0),
-        captured: CaptureSource::Value(ValueId::new(1)),
-        destination: MemoryLocationId::new(0),
-        mode: CaptureMode::Receiver,
-        source: SourceMappingId::new(0),
-        evidence: EvidenceId::new(0),
-    });
-
-    let error = SemanticArtifact::try_new(
-        key.clone(),
-        capabilities(&[
-            SemanticCapability::Values,
-            SemanticCapability::Allocations,
-            SemanticCapability::Captures,
-        ]),
-        vec![outer.clone(), child.clone()],
-    )
-    .expect_err("receiver capture cannot relabel a local value");
-    assert_eq!(error.kind(), SemanticIrErrorKind::CaptureContract);
-
-    outer.captures[0].mode = CaptureMode::Unknown;
-    let error = SemanticArtifact::try_new(
-        key,
-        capabilities(&[
-            SemanticCapability::Values,
-            SemanticCapability::Allocations,
-            SemanticCapability::Captures,
-        ]),
-        vec![outer, child],
-    )
-    .expect_err("unknown capture mode requires a subject-specific gap");
-    assert_eq!(error.kind(), SemanticIrErrorKind::GapContract);
 }
 
 #[test]
@@ -1744,81 +954,6 @@ fn known_capture_mode_rejects_a_contradictory_unknown_gap() {
 }
 
 #[test]
-fn rejects_same_artifact_external_callable_target() {
-    let key = key();
-    let external_in_name_only = procedure_locator(&key, "other", 3);
-    let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
-    parts.values.push(SemanticValue {
-        id: ValueId::new(0),
-        kind: SemanticValueKind::Callable,
-        source: SourceMappingId::new(0),
-        evidence: EvidenceId::new(0),
-    });
-    let mut events = parts.points[0].events.to_vec();
-    events.push(SemanticEvent::new(
-        SemanticEffect::CallableReference {
-            result: ValueId::new(0),
-            callable: CallableValue {
-                kind: CallableReferenceKind::Function,
-                targets: CallableTargetResolution::Proven(CallableTarget::External(
-                    external_in_name_only,
-                )),
-                target_evidence: EvidenceId::new(0),
-                bound_receiver: None,
-                environment: None,
-            },
-        },
-        SourceMappingId::new(0),
-        EvidenceId::new(0),
-    ));
-    parts.points[0].events = events.into_boxed_slice();
-
-    let error = SemanticArtifact::try_new(
-        key,
-        capabilities(&[
-            SemanticCapability::Values,
-            SemanticCapability::CallableReferences,
-        ]),
-        vec![parts],
-    )
-    .expect_err("same-artifact targets must use artifact-local ProcedureId");
-    assert_eq!(error.kind(), SemanticIrErrorKind::CallableContract);
-}
-
-#[test]
-fn rejects_unsupported_gap_for_complete_capability() {
-    let key = key();
-    let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
-    parts.gaps.push(SemanticGap {
-        id: SemanticGapId::new(0),
-        point: ProgramPointId::new(0),
-        subject: SemanticGapSubject::Point,
-        capability: SemanticCapability::Calls,
-        impacts: SemanticGapImpacts::for_gap(SemanticCapability::Calls, SemanticGapSubject::Point),
-        kind: SemanticGapKind::Unsupported,
-        budget: None,
-        discharge: SemanticGapDischarge::None,
-        detail: "calls are unsupported here".into(),
-        source: SourceMappingId::new(0),
-        evidence: EvidenceId::new(0),
-    });
-    let mut events = parts.points[0].events.to_vec();
-    events.push(SemanticEvent::new(
-        SemanticEffect::Gap {
-            gap: SemanticGapId::new(0),
-        },
-        SourceMappingId::new(0),
-        EvidenceId::new(0),
-    ));
-    parts.points[0].events = events.into_boxed_slice();
-
-    let error =
-        SemanticArtifact::try_new(key, capabilities(&[SemanticCapability::Calls]), vec![parts])
-            .expect_err("unsupported gap contradicts complete support");
-    assert_eq!(error.kind(), SemanticIrErrorKind::CapabilityContract);
-}
-
-#[test]
 fn retained_control_topology_requires_unknown_point_scoped_normal_control() {
     let key = key();
     for kind in [
@@ -1908,85 +1043,6 @@ fn retained_control_topology_accepts_a_point_scoped_concurrent_spawn() {
 
     SemanticArtifact::try_new(key, semantic_capabilities, vec![parts])
         .expect("the adapter may retain parent topology while spawned execution stays open");
-}
-
-#[test]
-fn canonical_index_identity_requires_a_constant_indexed_location() {
-    let key = key();
-    let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
-    let source = SourceMappingId::new(0);
-    let evidence = EvidenceId::new(0);
-    parts.values.extend([
-        SemanticValue {
-            id: ValueId::new(0),
-            kind: SemanticValueKind::Local,
-            source,
-            evidence,
-        },
-        SemanticValue {
-            id: ValueId::new(1),
-            kind: SemanticValueKind::Local,
-            source,
-            evidence,
-        },
-        SemanticValue {
-            id: ValueId::new(2),
-            kind: SemanticValueKind::Temporary,
-            source,
-            evidence,
-        },
-    ]);
-    parts.memory_locations.push(MemoryLocation {
-        id: MemoryLocationId::new(0),
-        kind: MemoryLocationKind::Index {
-            base: ValueId::new(0),
-            index: Some(ValueId::new(1)),
-            constant_index: None,
-            identity: IndexedLocationIdentity::Element,
-        },
-        value_copy: MemoryValueCopy::Unknown,
-        source,
-        evidence,
-    });
-    parts.gaps.push(SemanticGap {
-        id: SemanticGapId::new(0),
-        point: ProgramPointId::new(0),
-        subject: SemanticGapSubject::MemoryLocation(MemoryLocationId::new(0)),
-        capability: SemanticCapability::IndexMemory,
-        impacts: SemanticGapImpacts::for_gap(
-            SemanticCapability::IndexMemory,
-            SemanticGapSubject::MemoryLocation(MemoryLocationId::new(0)),
-        ),
-        kind: SemanticGapKind::Unsupported,
-        budget: None,
-        discharge: SemanticGapDischarge::CanonicalIndexIdentity,
-        detail: "fixture dynamic index identity".into(),
-        source,
-        evidence,
-    });
-    let mut events = parts.points[0].events.to_vec();
-    events.push(SemanticEvent::new(
-        SemanticEffect::MemoryLoad {
-            kind: MemoryAccessKind::Index,
-            location: MemoryLocationId::new(0),
-            result: ValueId::new(2),
-        },
-        source,
-        evidence,
-    ));
-    events.push(SemanticEvent::new(
-        SemanticEffect::Gap {
-            gap: SemanticGapId::new(0),
-        },
-        source,
-        evidence,
-    ));
-    parts.points[0].events = events.into_boxed_slice();
-
-    let error = SemanticArtifact::try_new(key, partial_index_capabilities(), vec![parts])
-        .expect_err("dynamic index values cannot certify canonical literal identity");
-    assert_eq!(error.kind(), SemanticIrErrorKind::GapContract);
-    assert!(error.detail().contains("canonical index identity"));
 }
 
 #[test]
@@ -2085,493 +1141,6 @@ fn canonical_index_identity_requires_its_exact_access_at_the_gap_point() {
         assert_eq!(error.kind(), SemanticIrErrorKind::GapContract);
         assert!(error.detail().contains("canonical index identity"));
     }
-}
-
-#[test]
-fn non_rejoining_exceptional_exit_requires_a_local_exceptional_gap() {
-    let key = key();
-    for (capability, subject, kind) in [
-        (
-            SemanticCapability::NormalControlFlow,
-            SemanticGapSubject::Point,
-            SemanticGapKind::Unsupported,
-        ),
-        (
-            SemanticCapability::ExceptionalControlFlow,
-            SemanticGapSubject::Procedure,
-            SemanticGapKind::Unsupported,
-        ),
-        (
-            SemanticCapability::ExceptionalControlFlow,
-            SemanticGapSubject::Point,
-            SemanticGapKind::Ambiguous,
-        ),
-    ] {
-        let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
-        parts.gaps.push(SemanticGap {
-            id: SemanticGapId::new(0),
-            point: ProgramPointId::new(0),
-            subject,
-            capability,
-            impacts: SemanticGapImpacts::for_gap(capability, subject),
-            kind,
-            budget: None,
-            discharge: SemanticGapDischarge::NonRejoiningExceptionalExit,
-            detail: "fixture non-rejoining exceptional exit".into(),
-            source: SourceMappingId::new(0),
-            evidence: EvidenceId::new(0),
-        });
-        let mut events = parts.points[0].events.to_vec();
-        events.push(SemanticEvent::new(
-            SemanticEffect::Gap {
-                gap: SemanticGapId::new(0),
-            },
-            SourceMappingId::new(0),
-            EvidenceId::new(0),
-        ));
-        parts.points[0].events = events.into_boxed_slice();
-
-        let error = SemanticArtifact::try_new(key.clone(), capabilities(&[]), vec![parts])
-            .expect_err("invalid non-rejoining exit markers must be rejected");
-        assert_eq!(error.kind(), SemanticIrErrorKind::GapContract);
-        assert!(error.detail().contains("non-rejoining exceptional exit"));
-    }
-}
-
-#[test]
-fn modeled_heap_partitions_reject_unpartitioned_effects() {
-    for (impacts, valid) in [
-        (
-            SemanticGapImpacts::single(SemanticGapImpact::HeapRead),
-            true,
-        ),
-        (
-            SemanticGapImpacts::single(SemanticGapImpact::HeapWrite),
-            true,
-        ),
-        (
-            SemanticGapImpacts::single(SemanticGapImpact::HeapWrite)
-                .with(SemanticGapImpact::ValueFlow),
-            false,
-        ),
-        (SemanticGapImpacts::NONE, false),
-    ] {
-        let key = key();
-        let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
-        parts.values.push(SemanticValue {
-            id: ValueId::new(0),
-            kind: SemanticValueKind::Temporary,
-            source: SourceMappingId::new(0),
-            evidence: EvidenceId::new(0),
-        });
-        parts.gaps.push(SemanticGap {
-            id: SemanticGapId::new(0),
-            point: ProgramPointId::new(0),
-            subject: SemanticGapSubject::Value(ValueId::new(0)),
-            capability: SemanticCapability::IndexMemory,
-            impacts,
-            kind: SemanticGapKind::Unsupported,
-            budget: None,
-            discharge: SemanticGapDischarge::ModeledEffectPartition,
-            detail: "isolated heap effect".into(),
-            source: SourceMappingId::new(0),
-            evidence: EvidenceId::new(0),
-        });
-        let mut events = parts.points[0].events.to_vec();
-        events.push(SemanticEvent::new(
-            SemanticEffect::Gap {
-                gap: SemanticGapId::new(0),
-            },
-            SourceMappingId::new(0),
-            EvidenceId::new(0),
-        ));
-        parts.points[0].events = events.into_boxed_slice();
-        let mut caps = SemanticCapabilities::builder();
-        for capability in [
-            SemanticCapability::Procedures,
-            SemanticCapability::EntryBoundary,
-            SemanticCapability::NormalExitBoundary,
-            SemanticCapability::ExceptionalExitBoundary,
-            SemanticCapability::BasicBlocks,
-            SemanticCapability::ProgramPoints,
-            SemanticCapability::Values,
-            SemanticCapability::NormalControlFlow,
-            SemanticCapability::ExceptionalControlFlow,
-        ] {
-            caps = caps.complete(capability);
-        }
-        let result = SemanticArtifact::try_new(
-            key,
-            caps.partial(SemanticCapability::IndexMemory).build(),
-            vec![parts],
-        );
-        if valid {
-            result.expect("one isolated heap partition is valid");
-        } else {
-            assert_eq!(result.unwrap_err().kind(), SemanticIrErrorKind::GapContract);
-        }
-    }
-}
-
-#[test]
-fn exit_only_procedure_completion_requires_a_local_completion_gap() {
-    let key = key();
-    let procedure_with_gap = |capability, subject, kind| {
-        let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
-        if matches!(subject, SemanticGapSubject::Value(_)) {
-            parts.values.push(SemanticValue {
-                id: ValueId::new(0),
-                kind: SemanticValueKind::Temporary,
-                source: SourceMappingId::new(0),
-                evidence: EvidenceId::new(0),
-            });
-        }
-        parts.gaps.push(SemanticGap {
-            id: SemanticGapId::new(0),
-            point: ProgramPointId::new(0),
-            subject,
-            capability,
-            impacts: SemanticGapImpacts::for_gap(capability, subject),
-            kind,
-            budget: None,
-            discharge: SemanticGapDischarge::ExitOnlyProcedureCompletion,
-            detail: "fixture exit-only procedure completion".into(),
-            source: SourceMappingId::new(0),
-            evidence: EvidenceId::new(0),
-        });
-        let mut events = parts.points[0].events.to_vec();
-        events.push(SemanticEvent::new(
-            SemanticEffect::Gap {
-                gap: SemanticGapId::new(0),
-            },
-            SourceMappingId::new(0),
-            EvidenceId::new(0),
-        ));
-        parts.points[0].events = events.into_boxed_slice();
-        parts
-    };
-    let partial_capabilities = |capability| {
-        let mut builder = SemanticCapabilities::builder();
-        for capability in [
-            SemanticCapability::Procedures,
-            SemanticCapability::EntryBoundary,
-            SemanticCapability::NormalExitBoundary,
-            SemanticCapability::ExceptionalExitBoundary,
-            SemanticCapability::BasicBlocks,
-            SemanticCapability::ProgramPoints,
-            SemanticCapability::Values,
-            SemanticCapability::NormalControlFlow,
-            SemanticCapability::ExceptionalControlFlow,
-        ] {
-            builder = builder.complete(capability);
-        }
-        builder.partial(capability).build()
-    };
-
-    for (capability, subject, kind) in [
-        (
-            SemanticCapability::DeferredExecution,
-            SemanticGapSubject::Procedure,
-            SemanticGapKind::Unsupported,
-        ),
-        (
-            SemanticCapability::Calls,
-            SemanticGapSubject::Point,
-            SemanticGapKind::Unsupported,
-        ),
-        (
-            SemanticCapability::CleanupControlFlow,
-            SemanticGapSubject::Point,
-            SemanticGapKind::Ambiguous,
-        ),
-        (
-            SemanticCapability::ExceptionalControlFlow,
-            SemanticGapSubject::Procedure,
-            SemanticGapKind::Unknown,
-        ),
-    ] {
-        let parts = procedure_with_gap(capability, subject, kind);
-        let error =
-            SemanticArtifact::try_new(key.clone(), partial_capabilities(capability), vec![parts])
-                .expect_err("invalid exit-only completion markers must be rejected");
-        assert_eq!(error.kind(), SemanticIrErrorKind::GapContract);
-        assert!(error.detail().contains("exit-only procedure completion"));
-    }
-
-    for (capability, subject, kind) in [
-        (
-            SemanticCapability::DeferredExecution,
-            SemanticGapSubject::Point,
-            SemanticGapKind::Unsupported,
-        ),
-        (
-            SemanticCapability::CleanupControlFlow,
-            SemanticGapSubject::Point,
-            SemanticGapKind::Unknown,
-        ),
-        (
-            SemanticCapability::ExceptionalControlFlow,
-            SemanticGapSubject::Point,
-            SemanticGapKind::Unknown,
-        ),
-        (
-            SemanticCapability::ExceptionalControlFlow,
-            SemanticGapSubject::Value(ValueId::new(0)),
-            SemanticGapKind::Unsupported,
-        ),
-    ] {
-        let parts = procedure_with_gap(capability, subject, kind);
-        SemanticArtifact::try_new(key.clone(), partial_capabilities(capability), vec![parts])
-            .expect("a local exit-only completion gap is valid");
-    }
-}
-
-#[test]
-fn mandatory_gap_impacts_are_enforced_while_specific_extras_are_allowed() {
-    let key = key();
-    let procedure_with_gap = |capability, subject, impacts| {
-        let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
-        parts.gaps.push(SemanticGap {
-            id: SemanticGapId::new(0),
-            point: ProgramPointId::new(0),
-            subject,
-            capability,
-            impacts,
-            kind: SemanticGapKind::Unknown,
-            budget: None,
-            discharge: SemanticGapDischarge::None,
-            detail: "fixture semantic gap".into(),
-            source: SourceMappingId::new(0),
-            evidence: EvidenceId::new(0),
-        });
-        let mut events = parts.points[0].events.to_vec();
-        events.push(SemanticEvent::new(
-            SemanticEffect::Gap {
-                gap: SemanticGapId::new(0),
-            },
-            SourceMappingId::new(0),
-            EvidenceId::new(0),
-        ));
-        parts.points[0].events = events.into_boxed_slice();
-        parts
-    };
-
-    for (capability, missing) in [
-        (
-            SemanticCapability::DynamicDispatch,
-            SemanticGapImpact::DispatchCoverage,
-        ),
-        (
-            SemanticCapability::CleanupControlFlow,
-            SemanticGapImpact::ReturnTransfer,
-        ),
-        (
-            SemanticCapability::ExceptionalControlFlow,
-            SemanticGapImpact::ReturnTransfer,
-        ),
-        (
-            SemanticCapability::NonLocalControl,
-            SemanticGapImpact::ReturnTransfer,
-        ),
-        (
-            SemanticCapability::Assignments,
-            SemanticGapImpact::ValueFlow,
-        ),
-        (SemanticCapability::Captures, SemanticGapImpact::ValueFlow),
-        (
-            SemanticCapability::NormalCallContinuation,
-            SemanticGapImpact::CallEvaluation,
-        ),
-    ] {
-        let error = SemanticArtifact::try_new(
-            key.clone(),
-            capabilities(&[capability]),
-            vec![procedure_with_gap(
-                capability,
-                SemanticGapSubject::Point,
-                SemanticGapImpacts::NONE,
-            )],
-        )
-        .expect_err("a consumer-affecting gap cannot omit its mandatory impact");
-        assert_eq!(error.kind(), SemanticIrErrorKind::GapContract);
-        assert!(error.detail().contains(missing.label()));
-    }
-
-    let incomplete_capture = SemanticGapImpacts::single(SemanticGapImpact::ValueFlow);
-    let error = SemanticArtifact::try_new(
-        key.clone(),
-        capabilities(&[SemanticCapability::Captures]),
-        vec![procedure_with_gap(
-            SemanticCapability::Captures,
-            SemanticGapSubject::Point,
-            incomplete_capture,
-        )],
-    )
-    .expect_err("a capture gap cannot hide missing heap and alias impacts");
-    assert_eq!(error.kind(), SemanticIrErrorKind::GapContract);
-    assert!(error.detail().contains(SemanticGapImpact::HeapRead.label()));
-
-    let impacts = SemanticGapImpacts::single(SemanticGapImpact::DispatchCoverage)
-        .with(SemanticGapImpact::CallEvaluation);
-    let procedure = procedure_with_gap(
-        SemanticCapability::DynamicDispatch,
-        SemanticGapSubject::Point,
-        impacts,
-    );
-    SemanticArtifact::try_new(
-        key,
-        capabilities(&[SemanticCapability::DynamicDispatch]),
-        vec![procedure],
-    )
-    .expect("adapter-specific impacts may extend the mandatory baseline");
-}
-
-#[test]
-fn duplicate_gap_diagnostic_names_both_facts_and_the_procedure() {
-    let key = key();
-    let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
-    let source = SourceMappingId::new(0);
-    let evidence = EvidenceId::new(0);
-    for (id, detail) in [(0, "first assignment gap"), (1, "second assignment gap")] {
-        parts.gaps.push(SemanticGap {
-            id: SemanticGapId::new(id),
-            point: ProgramPointId::new(0),
-            subject: SemanticGapSubject::Point,
-            capability: SemanticCapability::Assignments,
-            impacts: SemanticGapImpacts::for_gap(
-                SemanticCapability::Assignments,
-                SemanticGapSubject::Point,
-            ),
-            kind: SemanticGapKind::Unsupported,
-            budget: None,
-            discharge: SemanticGapDischarge::None,
-            detail: detail.into(),
-            source,
-            evidence,
-        });
-    }
-    let mut events = parts.points[0].events.to_vec();
-    events.extend([0, 1].map(|id| {
-        SemanticEvent::new(
-            SemanticEffect::Gap {
-                gap: SemanticGapId::new(id),
-            },
-            source,
-            evidence,
-        )
-    }));
-    parts.points[0].events = events.into_boxed_slice();
-
-    let mut capability_builder = SemanticCapabilities::builder();
-    for capability in [
-        SemanticCapability::Procedures,
-        SemanticCapability::EntryBoundary,
-        SemanticCapability::NormalExitBoundary,
-        SemanticCapability::ExceptionalExitBoundary,
-        SemanticCapability::BasicBlocks,
-        SemanticCapability::ProgramPoints,
-        SemanticCapability::NormalControlFlow,
-        SemanticCapability::ExceptionalControlFlow,
-    ] {
-        capability_builder = capability_builder.complete(capability);
-    }
-    let semantic_capabilities = capability_builder
-        .partial(SemanticCapability::Assignments)
-        .build();
-    let error = SemanticArtifact::try_new(key, semantic_capabilities, vec![parts])
-        .expect_err("one scoped fact cannot have two gap rows");
-    assert_eq!(error.kind(), SemanticIrErrorKind::GapContract);
-    assert!(error.detail().contains("src/Test.java"), "{error}");
-    assert!(
-        error.detail().contains("gap 1 (second assignment gap)"),
-        "{error}"
-    );
-    assert!(
-        error.detail().contains("gap 0 (first assignment gap)"),
-        "{error}"
-    );
-}
-
-#[test]
-fn method_references_cannot_be_callable_creation_events() {
-    let key = key();
-    let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
-    parts.values.push(SemanticValue {
-        id: ValueId::new(0),
-        kind: SemanticValueKind::Callable,
-        source: SourceMappingId::new(0),
-        evidence: EvidenceId::new(0),
-    });
-    let mut events = parts.points[0].events.to_vec();
-    events.push(SemanticEvent::new(
-        SemanticEffect::CallableCreation {
-            result: ValueId::new(0),
-            callable: CallableValue {
-                kind: CallableReferenceKind::StaticMethod,
-                targets: CallableTargetResolution::Proven(CallableTarget::Local(ProcedureId::new(
-                    0,
-                ))),
-                target_evidence: EvidenceId::new(0),
-                bound_receiver: None,
-                environment: None,
-            },
-        },
-        SourceMappingId::new(0),
-        EvidenceId::new(0),
-    ));
-    parts.points[0].events = events.into_boxed_slice();
-
-    let error = SemanticArtifact::try_new(
-        key,
-        capabilities(&[
-            SemanticCapability::Values,
-            SemanticCapability::CallableReferences,
-        ]),
-        vec![parts],
-    )
-    .expect_err("method references are values, not body creation");
-    assert_eq!(error.kind(), SemanticIrErrorKind::CallableContract);
-}
-
-#[test]
-fn out_of_bounds_callable_creation_target_returns_an_error() {
-    let key = key();
-    let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
-    parts.values.push(SemanticValue {
-        id: ValueId::new(0),
-        kind: SemanticValueKind::Callable,
-        source: SourceMappingId::new(0),
-        evidence: EvidenceId::new(0),
-    });
-    let mut events = parts.points[0].events.to_vec();
-    events.push(SemanticEvent::new(
-        SemanticEffect::CallableCreation {
-            result: ValueId::new(0),
-            callable: CallableValue {
-                kind: CallableReferenceKind::Lambda,
-                targets: CallableTargetResolution::Proven(CallableTarget::Local(ProcedureId::new(
-                    u32::MAX,
-                ))),
-                target_evidence: EvidenceId::new(0),
-                bound_receiver: None,
-                environment: None,
-            },
-        },
-        SourceMappingId::new(0),
-        EvidenceId::new(0),
-    ));
-    parts.points[0].events = events.into_boxed_slice();
-
-    let error = SemanticArtifact::try_new(
-        key,
-        capabilities(&[
-            SemanticCapability::Values,
-            SemanticCapability::CallableReferences,
-        ]),
-        vec![parts],
-    )
-    .expect_err("invalid local target must be rejected without indexing it");
-    assert_eq!(error.kind(), SemanticIrErrorKind::OutOfBounds);
 }
 
 #[test]
@@ -2681,87 +1250,6 @@ fn callable_creation_preserves_target_uncertainty_without_a_locator() {
         SemanticArtifact::try_new(key.clone(), semantic_capabilities.clone(), vec![parts])
             .expect("a known creation event may retain typed target uncertainty");
     }
-}
-
-#[test]
-fn budget_limited_same_artifact_target_remains_explicitly_unmaterialized() {
-    let key = key();
-    let omitted = procedure_locator(&key, "omitted", 7);
-    let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
-    parts.values.push(SemanticValue {
-        id: ValueId::new(0),
-        kind: SemanticValueKind::Callable,
-        source: SourceMappingId::new(0),
-        evidence: EvidenceId::new(0),
-    });
-    let mut budget = SemanticBudget::uniform(1).unwrap();
-    budget
-        .charge(SemanticWork {
-            procedures: 1,
-            ..SemanticWork::default()
-        })
-        .unwrap();
-    let exceeded = budget
-        .charge(SemanticWork {
-            procedures: 1,
-            ..SemanticWork::default()
-        })
-        .unwrap_err();
-    parts.gaps.push(SemanticGap {
-        id: SemanticGapId::new(0),
-        point: ProgramPointId::new(0),
-        subject: SemanticGapSubject::Value(ValueId::new(0)),
-        capability: SemanticCapability::CallableReferences,
-        impacts: SemanticGapImpacts::for_gap(
-            SemanticCapability::CallableReferences,
-            SemanticGapSubject::Value(ValueId::new(0)),
-        ),
-        kind: SemanticGapKind::ExceededBudget,
-        budget: Some(exceeded),
-        discharge: SemanticGapDischarge::None,
-        detail: "nested body was recognized but not materialized".into(),
-        source: SourceMappingId::new(0),
-        evidence: EvidenceId::new(0),
-    });
-    let targets =
-        CallableTargetResolution::ExceededBudget(Box::new([CallableTarget::Unmaterialized(
-            omitted,
-        )]));
-    let mut events = parts.points[0].events.to_vec();
-    events.extend([
-        SemanticEvent::new(
-            SemanticEffect::CallableReference {
-                result: ValueId::new(0),
-                callable: CallableValue {
-                    kind: CallableReferenceKind::Function,
-                    targets,
-                    target_evidence: EvidenceId::new(0),
-                    bound_receiver: None,
-                    environment: None,
-                },
-            },
-            SourceMappingId::new(0),
-            EvidenceId::new(0),
-        ),
-        SemanticEvent::new(
-            SemanticEffect::Gap {
-                gap: SemanticGapId::new(0),
-            },
-            SourceMappingId::new(0),
-            EvidenceId::new(0),
-        ),
-    ]);
-    parts.points[0].events = events.into_boxed_slice();
-
-    SemanticArtifact::try_new(
-        key,
-        capabilities(&[
-            SemanticCapability::Values,
-            SemanticCapability::CallableReferences,
-        ]),
-        vec![parts],
-    )
-    .expect("same-artifact locator is legal only as an incomplete target");
 }
 
 #[test]
@@ -2896,35 +1384,6 @@ fn artifact_construction_charges_retained_work_atomically() {
 }
 
 #[test]
-fn handles_from_different_materializations_do_not_compare_equal() {
-    let key = key();
-    let first = Arc::new(
-        SemanticArtifact::try_new(
-            key.clone(),
-            capabilities(&[]),
-            vec![minimal_procedure(&key, ProcedureId::new(0), "main", 1)],
-        )
-        .unwrap(),
-    );
-    let second = Arc::new(
-        SemanticArtifact::try_new(
-            key.clone(),
-            capabilities(&[]),
-            vec![minimal_procedure(&key, ProcedureId::new(0), "main", 1)],
-        )
-        .unwrap(),
-    );
-    let first = first.procedure_handle(ProcedureId::new(0)).unwrap();
-    let second = second.procedure_handle(ProcedureId::new(0)).unwrap();
-
-    assert_ne!(first, second);
-    let mut handles = HashSet::default();
-    handles.insert(first);
-    handles.insert(second);
-    assert_eq!(handles.len(), 2);
-}
-
-#[test]
 fn callable_environment_allocation_is_at_creation_point() {
     let key = key();
     let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
@@ -2986,20 +1445,146 @@ fn callable_environment_allocation_is_at_creation_point() {
 }
 
 #[test]
-fn call_site_callee_must_be_a_callable_value() {
+fn exit_only_procedure_completion_requires_a_local_completion_gap() {
+    let key = key();
+    let procedure_with_gap = |capability, subject, kind| {
+        let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
+        if matches!(subject, SemanticGapSubject::Value(_)) {
+            parts.values.push(SemanticValue {
+                id: ValueId::new(0),
+                kind: SemanticValueKind::Temporary,
+                source: SourceMappingId::new(0),
+                evidence: EvidenceId::new(0),
+            });
+        }
+        parts.gaps.push(SemanticGap {
+            id: SemanticGapId::new(0),
+            point: ProgramPointId::new(0),
+            subject,
+            capability,
+            impacts: SemanticGapImpacts::for_gap(capability, subject),
+            kind,
+            budget: None,
+            discharge: SemanticGapDischarge::ExitOnlyProcedureCompletion,
+            detail: "fixture exit-only procedure completion".into(),
+            source: SourceMappingId::new(0),
+            evidence: EvidenceId::new(0),
+        });
+        let mut events = parts.points[0].events.to_vec();
+        events.push(SemanticEvent::new(
+            SemanticEffect::Gap {
+                gap: SemanticGapId::new(0),
+            },
+            SourceMappingId::new(0),
+            EvidenceId::new(0),
+        ));
+        parts.points[0].events = events.into_boxed_slice();
+        parts
+    };
+    let partial_capabilities = |capability| {
+        let mut builder = SemanticCapabilities::builder();
+        for capability in [
+            SemanticCapability::Procedures,
+            SemanticCapability::EntryBoundary,
+            SemanticCapability::NormalExitBoundary,
+            SemanticCapability::ExceptionalExitBoundary,
+            SemanticCapability::BasicBlocks,
+            SemanticCapability::ProgramPoints,
+            SemanticCapability::Values,
+            SemanticCapability::NormalControlFlow,
+            SemanticCapability::ExceptionalControlFlow,
+        ] {
+            builder = builder.complete(capability);
+        }
+        builder.partial(capability).build()
+    };
+
+    for (capability, subject, kind) in [
+        (
+            SemanticCapability::DeferredExecution,
+            SemanticGapSubject::Procedure,
+            SemanticGapKind::Unsupported,
+        ),
+        (
+            SemanticCapability::Calls,
+            SemanticGapSubject::Point,
+            SemanticGapKind::Unsupported,
+        ),
+        (
+            SemanticCapability::CleanupControlFlow,
+            SemanticGapSubject::Point,
+            SemanticGapKind::Ambiguous,
+        ),
+        (
+            SemanticCapability::ExceptionalControlFlow,
+            SemanticGapSubject::Procedure,
+            SemanticGapKind::Unknown,
+        ),
+    ] {
+        let parts = procedure_with_gap(capability, subject, kind);
+        let error =
+            SemanticArtifact::try_new(key.clone(), partial_capabilities(capability), vec![parts])
+                .expect_err("invalid exit-only completion markers must be rejected");
+        assert_eq!(error.kind(), SemanticIrErrorKind::GapContract);
+        assert!(error.detail().contains("exit-only procedure completion"));
+    }
+
+    for (capability, subject, kind) in [
+        (
+            SemanticCapability::DeferredExecution,
+            SemanticGapSubject::Point,
+            SemanticGapKind::Unsupported,
+        ),
+        (
+            SemanticCapability::CleanupControlFlow,
+            SemanticGapSubject::Point,
+            SemanticGapKind::Unknown,
+        ),
+        (
+            SemanticCapability::ExceptionalControlFlow,
+            SemanticGapSubject::Point,
+            SemanticGapKind::Unknown,
+        ),
+        (
+            SemanticCapability::ExceptionalControlFlow,
+            SemanticGapSubject::Value(ValueId::new(0)),
+            SemanticGapKind::Unsupported,
+        ),
+    ] {
+        let parts = procedure_with_gap(capability, subject, kind);
+        SemanticArtifact::try_new(key.clone(), partial_capabilities(capability), vec![parts])
+            .expect("a local exit-only completion gap is valid");
+    }
+}
+
+#[test]
+#[hardwon("#5522: invalid callee diagnostics omitted artifact and source context")]
+fn non_callable_callee_error_includes_available_source_context() {
     let key = key();
     let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
+    let source = SourceMappingId::new(0);
+    let evidence = EvidenceId::new(0);
+    let procedure_anchor = format!("procedure_anchor={:?}", parts.locator.anchor());
+    let source_locator = &parts.source_mappings[source.index()].locator;
+    let call_site_mapping = format!(
+        "call_site_mapping={:?}",
+        Some((source_locator.path(), source_locator.anchor()))
+    );
+    let callee_mapping = format!(
+        "callee_mapping={:?}",
+        Some((source_locator.path(), source_locator.anchor()))
+    );
     parts.values.push(SemanticValue {
         id: ValueId::new(0),
         kind: SemanticValueKind::Temporary,
-        source: SourceMappingId::new(0),
-        evidence: EvidenceId::new(0),
+        source,
+        evidence,
     });
     parts.call_sites.push(SemanticCallSite {
         id: CallSiteId::new(0),
         point: ProgramPointId::new(0),
         invocation_mode: CallInvocationMode::Ordinary,
-        execution_timing: ExecutionTiming::SameEvaluation,
+        execution_timing: ExecutionTiming::SameInvocation,
         callee: ValueId::new(0),
         receiver: None,
         arguments: Box::new([]),
@@ -3009,25 +1594,38 @@ fn call_site_callee_must_be_a_callable_value() {
         declared_targets: CallableTargetResolution::Proven(CallableTarget::Local(
             ProcedureId::new(0),
         )),
-        target_evidence: EvidenceId::new(0),
+        target_evidence: evidence,
         normal_continuation: ControlContinuation::Target(ProgramPointId::new(1)),
         exceptional_continuation: ControlContinuation::Target(ProgramPointId::new(2)),
-        source: SourceMappingId::new(0),
-        evidence: EvidenceId::new(0),
+        source,
+        evidence,
     });
 
     let error = SemanticArtifact::try_new(
         key,
-        capabilities(&[
-            SemanticCapability::Values,
-            SemanticCapability::Calls,
-            SemanticCapability::NormalCallContinuation,
-            SemanticCapability::ExceptionalCallContinuation,
-        ]),
+        capabilities(&[SemanticCapability::Values, SemanticCapability::Calls]),
         vec![parts],
     )
-    .expect_err("call site must classify its callee as callable");
+    .expect_err("the non-callable callee kind remains a strict contract error");
+
     assert_eq!(error.kind(), SemanticIrErrorKind::CallableContract);
+    let diagnostic = error.to_string();
+    assert!(diagnostic.contains("procedure 0"));
+    let detail = error.detail();
+    assert!(detail.contains("call site 0 callee 0 is not a callable value row"));
+    assert!(detail.contains("artifact_path=src/Test.java"));
+    assert!(detail.contains(&procedure_anchor));
+    assert!(detail.contains(&call_site_mapping));
+    assert!(detail.contains("callee_kind=temporary"));
+    assert!(detail.contains(&callee_mapping));
+    // PolicyDiagnostic rejects report prose above its 4096-byte validation boundary.
+    assert!(
+        diagnostic.len() <= 4096,
+        "diagnostic is {} bytes",
+        diagnostic.len()
+    );
+    assert!(!detail.contains("SemanticLocator"));
+    assert!(!detail.contains("StructuralNodeIdentity"));
 }
 
 #[test]
@@ -3574,61 +2172,7 @@ fn valid_async_suspend_has_matched_resume_arms() {
     let key = key();
     let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
     parts.properties.is_async = true;
-    let source = SourceMappingId::new(0);
-    let evidence = EvidenceId::new(0);
-
-    let mut entry_events = parts.points[0].events.to_vec();
-    entry_events.push(SemanticEvent::new(
-        SemanticEffect::AsyncSuspend {
-            awaited: None,
-            normal_resume: ControlContinuation::Target(ProgramPointId::new(1)),
-            exceptional_resume: ControlContinuation::Target(ProgramPointId::new(2)),
-        },
-        source,
-        evidence,
-    ));
-    parts.points[0].events = entry_events.into_boxed_slice();
-    let mut normal_events = parts.points[1].events.to_vec();
-    normal_events.push(SemanticEvent::new(
-        SemanticEffect::AsyncResume {
-            suspend: ProgramPointId::new(0),
-            kind: AsyncResumeKind::Normal,
-            result: None,
-        },
-        source,
-        evidence,
-    ));
-    parts.points[1].events = normal_events.into_boxed_slice();
-    let mut exceptional_events = parts.points[2].events.to_vec();
-    exceptional_events.push(SemanticEvent::new(
-        SemanticEffect::AsyncResume {
-            suspend: ProgramPointId::new(0),
-            kind: AsyncResumeKind::Exceptional,
-            result: None,
-        },
-        source,
-        evidence,
-    ));
-    parts.points[2].events = exceptional_events.into_boxed_slice();
-    parts
-        .control_edges
-        .retain(|edge| edge.source_point != ProgramPointId::new(0));
-    parts.control_edges.extend([
-        ControlEdge {
-            source_point: ProgramPointId::new(0),
-            target_point: ProgramPointId::new(1),
-            kind: ControlEdgeKind::AsyncNormal,
-            source,
-            evidence,
-        },
-        ControlEdge {
-            source_point: ProgramPointId::new(0),
-            target_point: ProgramPointId::new(2),
-            kind: ControlEdgeKind::AsyncExceptional,
-            source,
-            evidence,
-        },
-    ]);
+    let (source, evidence) = add_matched_async_suspend(&mut parts);
 
     let mut extra_edge = parts.clone();
     extra_edge.control_edges.push(ControlEdge {
@@ -3725,6 +2269,794 @@ fn valid_async_suspend_has_matched_resume_arms() {
     .expect("matched async resume arms are valid");
 }
 
+fn artifact_with_values(values: Vec<SemanticValue>) -> Result<SemanticArtifact, SemanticIrError> {
+    let key = key();
+    let mut procedure = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
+    procedure.values = values;
+    SemanticArtifact::try_new(
+        key,
+        capabilities(&[SemanticCapability::Values]),
+        vec![procedure],
+    )
+}
+
+fn parameter_value(id: u32, ordinal: u32, multiplicity: FormalMultiplicity) -> SemanticValue {
+    SemanticValue {
+        id: ValueId::new(id),
+        kind: SemanticValueKind::Parameter {
+            ordinal,
+            multiplicity,
+            name: None,
+            passing_mode: FormalParameterPassingMode::PositionalOrNamed,
+        },
+        source: SourceMappingId::new(0),
+        evidence: EvidenceId::new(0),
+    }
+}
+
+fn default_argument_value(id: u32, ordinal: u32) -> SemanticValue {
+    SemanticValue {
+        id: ValueId::new(id),
+        kind: SemanticValueKind::DefaultArgument { ordinal },
+        source: SourceMappingId::new(0),
+        evidence: EvidenceId::new(0),
+    }
+}
+
+#[test]
+fn default_argument_values_require_one_existing_nonrest_formal() {
+    let duplicate = artifact_with_values(vec![
+        parameter_value(0, 0, FormalMultiplicity::One),
+        default_argument_value(1, 0),
+        default_argument_value(2, 0),
+    ])
+    .expect_err("one formal cannot publish duplicate saved defaults");
+    assert_eq!(duplicate.kind(), SemanticIrErrorKind::CallContract);
+    assert!(duplicate.detail().contains("published more than once"));
+
+    let absent = artifact_with_values(vec![default_argument_value(0, 4)])
+        .expect_err("a saved default must name an existing formal");
+    assert_eq!(absent.kind(), SemanticIrErrorKind::CallContract);
+    assert!(absent.detail().contains("has no parameter formal"));
+
+    let rest = artifact_with_values(vec![
+        parameter_value(0, 0, FormalMultiplicity::Rest(ArgumentDomain::Positional)),
+        default_argument_value(1, 0),
+    ])
+    .expect_err("a rest formal cannot own a saved default");
+    assert_eq!(rest.kind(), SemanticIrErrorKind::CallContract);
+    assert!(rest.detail().contains("names a rest formal"));
+
+    artifact_with_values(vec![
+        parameter_value(0, 0, FormalMultiplicity::One),
+        default_argument_value(1, 0),
+    ])
+    .expect("one saved default for an existing nonrest formal is valid");
+}
+
+fn raw_cfg_parts() -> (Vec<ControlEdge>, Vec<u32>, Vec<u32>, Vec<ControlEdgeId>) {
+    let source = SourceMappingId::new(0);
+    let evidence = EvidenceId::new(0);
+    (
+        vec![
+            ControlEdge {
+                source_point: ProgramPointId::new(0),
+                target_point: ProgramPointId::new(2),
+                kind: ControlEdgeKind::Exceptional,
+                source,
+                evidence,
+            },
+            ControlEdge {
+                source_point: ProgramPointId::new(0),
+                target_point: ProgramPointId::new(1),
+                kind: ControlEdgeKind::Normal,
+                source,
+                evidence,
+            },
+        ],
+        vec![0, 2, 2, 2],
+        vec![0, 0, 1, 2],
+        vec![ControlEdgeId::new(1), ControlEdgeId::new(0)],
+    )
+}
+
+#[test]
+fn checked_cfg_parts_reject_corrupt_adjacency() {
+    let procedure = ProcedureId::new(0);
+    let (edges, outgoing, incoming_offsets, incoming_ids) = raw_cfg_parts();
+    ControlFlowGraph::try_from_parts(
+        procedure,
+        3,
+        edges,
+        outgoing,
+        incoming_offsets,
+        incoming_ids,
+    )
+    .expect("valid raw adjacency should pass defensive validation");
+
+    let (edges, _, incoming_offsets, incoming_ids) = raw_cfg_parts();
+    let error = ControlFlowGraph::try_from_parts(
+        procedure,
+        3,
+        edges,
+        vec![0, 1, 2, 2],
+        incoming_offsets,
+        incoming_ids,
+    )
+    .expect_err("an edge in the wrong outgoing row must fail");
+    assert_eq!(error.kind(), SemanticIrErrorKind::ControlFlowContract);
+
+    let (edges, outgoing, incoming_offsets, _) = raw_cfg_parts();
+    let error = ControlFlowGraph::try_from_parts(
+        procedure,
+        3,
+        edges,
+        outgoing,
+        incoming_offsets,
+        vec![ControlEdgeId::new(1), ControlEdgeId::new(9)],
+    )
+    .expect_err("an out-of-range incoming edge id must fail");
+    assert_eq!(error.kind(), SemanticIrErrorKind::ControlFlowContract);
+
+    let (edges, outgoing, incoming_offsets, _) = raw_cfg_parts();
+    let error = ControlFlowGraph::try_from_parts(
+        procedure,
+        3,
+        edges,
+        outgoing,
+        incoming_offsets,
+        vec![ControlEdgeId::new(0), ControlEdgeId::new(1)],
+    )
+    .expect_err("an edge in the wrong incoming row must fail");
+    assert_eq!(error.kind(), SemanticIrErrorKind::ControlFlowContract);
+
+    let (edges, outgoing, incoming_offsets, _) = raw_cfg_parts();
+    let error = ControlFlowGraph::try_from_parts(
+        procedure,
+        3,
+        edges,
+        outgoing,
+        incoming_offsets,
+        vec![ControlEdgeId::new(1), ControlEdgeId::new(1)],
+    )
+    .expect_err("duplicate and missing incoming membership must fail");
+    assert_eq!(error.kind(), SemanticIrErrorKind::ControlFlowContract);
+
+    let source = SourceMappingId::new(0);
+    let evidence = EvidenceId::new(0);
+    let (mut edges, _, _, _) = raw_cfg_parts();
+    edges.push(ControlEdge {
+        source_point: ProgramPointId::new(1),
+        target_point: ProgramPointId::new(2),
+        kind: ControlEdgeKind::Normal,
+        source,
+        evidence,
+    });
+    let error = ControlFlowGraph::try_from_parts(
+        procedure,
+        3,
+        edges,
+        vec![0, 2, 3, 3],
+        vec![0, 0, 1, 3],
+        vec![
+            ControlEdgeId::new(1),
+            ControlEdgeId::new(2),
+            ControlEdgeId::new(0),
+        ],
+    )
+    .expect_err("incoming rows must retain canonical control-edge order");
+    assert_eq!(error.kind(), SemanticIrErrorKind::ControlFlowContract);
+}
+
+#[test]
+fn rejects_lexical_parent_cycle_iteratively() {
+    let key = key();
+    let mut outer = minimal_procedure(&key, ProcedureId::new(0), "outer", 1);
+    let mut inner = minimal_procedure(&key, ProcedureId::new(1), "inner", 3);
+    outer.lexical_parent = Some(ProcedureId::new(1));
+    inner.lexical_parent = Some(ProcedureId::new(0));
+
+    let error = SemanticArtifact::try_new(key, capabilities(&[]), vec![outer, inner])
+        .expect_err("lexical cycle must fail");
+    assert_eq!(error.kind(), SemanticIrErrorKind::ParentCycle);
+}
+
+#[test]
+fn rejects_unsupported_gap_for_complete_capability() {
+    let key = key();
+    let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
+    parts.gaps.push(SemanticGap {
+        id: SemanticGapId::new(0),
+        point: ProgramPointId::new(0),
+        subject: SemanticGapSubject::Point,
+        capability: SemanticCapability::Calls,
+        impacts: SemanticGapImpacts::for_gap(SemanticCapability::Calls, SemanticGapSubject::Point),
+        kind: SemanticGapKind::Unsupported,
+        budget: None,
+        discharge: SemanticGapDischarge::None,
+        detail: "calls are unsupported here".into(),
+        source: SourceMappingId::new(0),
+        evidence: EvidenceId::new(0),
+    });
+    let mut events = parts.points[0].events.to_vec();
+    events.push(SemanticEvent::new(
+        SemanticEffect::Gap {
+            gap: SemanticGapId::new(0),
+        },
+        SourceMappingId::new(0),
+        EvidenceId::new(0),
+    ));
+    parts.points[0].events = events.into_boxed_slice();
+
+    let error =
+        SemanticArtifact::try_new(key, capabilities(&[SemanticCapability::Calls]), vec![parts])
+            .expect_err("unsupported gap contradicts complete support");
+    assert_eq!(error.kind(), SemanticIrErrorKind::CapabilityContract);
+}
+
+#[test]
+fn canonical_index_identity_requires_a_constant_indexed_location() {
+    let key = key();
+    let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
+    let source = SourceMappingId::new(0);
+    let evidence = EvidenceId::new(0);
+    parts.values.extend([
+        SemanticValue {
+            id: ValueId::new(0),
+            kind: SemanticValueKind::Local,
+            source,
+            evidence,
+        },
+        SemanticValue {
+            id: ValueId::new(1),
+            kind: SemanticValueKind::Local,
+            source,
+            evidence,
+        },
+        SemanticValue {
+            id: ValueId::new(2),
+            kind: SemanticValueKind::Temporary,
+            source,
+            evidence,
+        },
+    ]);
+    parts.memory_locations.push(MemoryLocation {
+        id: MemoryLocationId::new(0),
+        kind: MemoryLocationKind::Index {
+            base: ValueId::new(0),
+            index: Some(ValueId::new(1)),
+            constant_index: None,
+            identity: IndexedLocationIdentity::Element,
+        },
+        value_copy: MemoryValueCopy::Unknown,
+        source,
+        evidence,
+    });
+    parts.gaps.push(SemanticGap {
+        id: SemanticGapId::new(0),
+        point: ProgramPointId::new(0),
+        subject: SemanticGapSubject::MemoryLocation(MemoryLocationId::new(0)),
+        capability: SemanticCapability::IndexMemory,
+        impacts: SemanticGapImpacts::for_gap(
+            SemanticCapability::IndexMemory,
+            SemanticGapSubject::MemoryLocation(MemoryLocationId::new(0)),
+        ),
+        kind: SemanticGapKind::Unsupported,
+        budget: None,
+        discharge: SemanticGapDischarge::CanonicalIndexIdentity,
+        detail: "fixture dynamic index identity".into(),
+        source,
+        evidence,
+    });
+    let mut events = parts.points[0].events.to_vec();
+    events.push(SemanticEvent::new(
+        SemanticEffect::MemoryLoad {
+            kind: MemoryAccessKind::Index,
+            location: MemoryLocationId::new(0),
+            result: ValueId::new(2),
+        },
+        source,
+        evidence,
+    ));
+    events.push(SemanticEvent::new(
+        SemanticEffect::Gap {
+            gap: SemanticGapId::new(0),
+        },
+        source,
+        evidence,
+    ));
+    parts.points[0].events = events.into_boxed_slice();
+
+    let error = SemanticArtifact::try_new(key, partial_index_capabilities(), vec![parts])
+        .expect_err("dynamic index values cannot certify canonical literal identity");
+    assert_eq!(error.kind(), SemanticIrErrorKind::GapContract);
+    assert!(error.detail().contains("canonical index identity"));
+}
+
+#[test]
+#[hardwon(
+    "6e0319679345: non-rejoining exceptional-exit discharge must require a local exceptional gap"
+)]
+fn non_rejoining_exceptional_exit_requires_a_local_exceptional_gap() {
+    let key = key();
+    for (capability, subject, kind) in [
+        (
+            SemanticCapability::NormalControlFlow,
+            SemanticGapSubject::Point,
+            SemanticGapKind::Unsupported,
+        ),
+        (
+            SemanticCapability::ExceptionalControlFlow,
+            SemanticGapSubject::Procedure,
+            SemanticGapKind::Unsupported,
+        ),
+        (
+            SemanticCapability::ExceptionalControlFlow,
+            SemanticGapSubject::Point,
+            SemanticGapKind::Ambiguous,
+        ),
+    ] {
+        let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
+        parts.gaps.push(SemanticGap {
+            id: SemanticGapId::new(0),
+            point: ProgramPointId::new(0),
+            subject,
+            capability,
+            impacts: SemanticGapImpacts::for_gap(capability, subject),
+            kind,
+            budget: None,
+            discharge: SemanticGapDischarge::NonRejoiningExceptionalExit,
+            detail: "fixture non-rejoining exceptional exit".into(),
+            source: SourceMappingId::new(0),
+            evidence: EvidenceId::new(0),
+        });
+        let mut events = parts.points[0].events.to_vec();
+        events.push(SemanticEvent::new(
+            SemanticEffect::Gap {
+                gap: SemanticGapId::new(0),
+            },
+            SourceMappingId::new(0),
+            EvidenceId::new(0),
+        ));
+        parts.points[0].events = events.into_boxed_slice();
+
+        let error = SemanticArtifact::try_new(key.clone(), capabilities(&[]), vec![parts])
+            .expect_err("invalid non-rejoining exit markers must be rejected");
+        assert_eq!(error.kind(), SemanticIrErrorKind::GapContract);
+        assert!(error.detail().contains("non-rejoining exceptional exit"));
+    }
+}
+
+#[test]
+fn modeled_heap_partitions_reject_unpartitioned_effects() {
+    for (impacts, valid) in [
+        (
+            SemanticGapImpacts::single(SemanticGapImpact::HeapRead),
+            true,
+        ),
+        (
+            SemanticGapImpacts::single(SemanticGapImpact::HeapWrite),
+            true,
+        ),
+        (
+            SemanticGapImpacts::single(SemanticGapImpact::HeapWrite)
+                .with(SemanticGapImpact::ValueFlow),
+            false,
+        ),
+        (SemanticGapImpacts::NONE, false),
+    ] {
+        let key = key();
+        let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
+        parts.values.push(SemanticValue {
+            id: ValueId::new(0),
+            kind: SemanticValueKind::Temporary,
+            source: SourceMappingId::new(0),
+            evidence: EvidenceId::new(0),
+        });
+        parts.gaps.push(SemanticGap {
+            id: SemanticGapId::new(0),
+            point: ProgramPointId::new(0),
+            subject: SemanticGapSubject::Value(ValueId::new(0)),
+            capability: SemanticCapability::IndexMemory,
+            impacts,
+            kind: SemanticGapKind::Unsupported,
+            budget: None,
+            discharge: SemanticGapDischarge::ModeledEffectPartition,
+            detail: "isolated heap effect".into(),
+            source: SourceMappingId::new(0),
+            evidence: EvidenceId::new(0),
+        });
+        let mut events = parts.points[0].events.to_vec();
+        events.push(SemanticEvent::new(
+            SemanticEffect::Gap {
+                gap: SemanticGapId::new(0),
+            },
+            SourceMappingId::new(0),
+            EvidenceId::new(0),
+        ));
+        parts.points[0].events = events.into_boxed_slice();
+        let mut caps = SemanticCapabilities::builder();
+        for capability in [
+            SemanticCapability::Procedures,
+            SemanticCapability::EntryBoundary,
+            SemanticCapability::NormalExitBoundary,
+            SemanticCapability::ExceptionalExitBoundary,
+            SemanticCapability::BasicBlocks,
+            SemanticCapability::ProgramPoints,
+            SemanticCapability::Values,
+            SemanticCapability::NormalControlFlow,
+            SemanticCapability::ExceptionalControlFlow,
+        ] {
+            caps = caps.complete(capability);
+        }
+        let result = SemanticArtifact::try_new(
+            key,
+            caps.partial(SemanticCapability::IndexMemory).build(),
+            vec![parts],
+        );
+        if valid {
+            result.expect("one isolated heap partition is valid");
+        } else {
+            assert_eq!(result.unwrap_err().kind(), SemanticIrErrorKind::GapContract);
+        }
+    }
+}
+
+#[test]
+#[hardwon(
+    "#5237: exact field partitions require zero impacts and a retained concrete field access"
+)]
+fn exact_field_partition_preserves_the_mandatory_impact_boundary() {
+    let key = key();
+    let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
+    let source = SourceMappingId::new(0);
+    let evidence = EvidenceId::new(0);
+    for id in [ValueId::new(0), ValueId::new(1)] {
+        parts.values.push(SemanticValue {
+            id,
+            kind: SemanticValueKind::Temporary,
+            source,
+            evidence,
+        });
+    }
+    parts.memory_locations.push(MemoryLocation {
+        id: MemoryLocationId::new(0),
+        kind: MemoryLocationKind::Field {
+            base: ValueId::new(0),
+            member: parts.locator.memory_location_at(source_anchor(1, 2, 0)),
+        },
+        value_copy: MemoryValueCopy::Unknown,
+        source,
+        evidence,
+    });
+    parts.gaps.push(SemanticGap {
+        id: SemanticGapId::new(0),
+        point: ProgramPointId::new(0),
+        subject: SemanticGapSubject::MemoryLocation(MemoryLocationId::new(0)),
+        capability: SemanticCapability::FieldMemory,
+        impacts: SemanticGapImpacts::NONE,
+        kind: SemanticGapKind::Unknown,
+        budget: None,
+        discharge: SemanticGapDischarge::ModeledEffectPartition,
+        detail: "exact member; declaration/type unresolved".into(),
+        source,
+        evidence,
+    });
+    let mut events = parts.points[0].events.to_vec();
+    events.extend([
+        SemanticEvent::new(
+            SemanticEffect::Gap {
+                gap: SemanticGapId::new(0),
+            },
+            source,
+            evidence,
+        ),
+        SemanticEvent::new(
+            SemanticEffect::MemoryLoad {
+                kind: MemoryAccessKind::Field,
+                location: MemoryLocationId::new(0),
+                result: ValueId::new(1),
+            },
+            source,
+            evidence,
+        ),
+    ]);
+    parts.points[0].events = events.into_boxed_slice();
+    let capabilities = capabilities(&[SemanticCapability::Values, SemanticCapability::FieldMemory]);
+    SemanticArtifact::try_new(key.clone(), capabilities.clone(), vec![parts.clone()])
+        .expect("an explicitly exact concrete field has no missing memory effects");
+
+    for case in [
+        "default contract",
+        "partial impacts",
+        "missing access",
+        "property",
+    ] {
+        let mut invalid = parts.clone();
+        match case {
+            "default contract" => invalid.gaps[0].discharge = SemanticGapDischarge::None,
+            "partial impacts" => {
+                invalid.gaps[0].impacts = SemanticGapImpacts::single(SemanticGapImpact::HeapRead)
+            }
+            "missing access" => {
+                invalid.points[0].events = invalid.points[0]
+                    .events
+                    .iter()
+                    .filter(|event| !matches!(event.effect, SemanticEffect::MemoryLoad { .. }))
+                    .cloned()
+                    .collect()
+            }
+            "property" => {
+                invalid.memory_locations[0].kind = MemoryLocationKind::Property {
+                    base: ValueId::new(0),
+                    key: "dynamic".into(),
+                };
+                for event in &mut invalid.points[0].events {
+                    if let SemanticEffect::MemoryLoad { kind, .. } = &mut event.effect {
+                        *kind = MemoryAccessKind::Property;
+                    }
+                }
+            }
+            _ => unreachable!(),
+        }
+        let error = SemanticArtifact::try_new(key.clone(), capabilities.clone(), vec![invalid])
+            .expect_err(case);
+        assert_eq!(
+            error.kind(),
+            SemanticIrErrorKind::GapContract,
+            "{case}: {error}"
+        );
+    }
+}
+
+#[test]
+fn mandatory_gap_impacts_are_enforced_while_specific_extras_are_allowed() {
+    let key = key();
+    let procedure_with_gap = |capability, subject, impacts| {
+        let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
+        parts.gaps.push(SemanticGap {
+            id: SemanticGapId::new(0),
+            point: ProgramPointId::new(0),
+            subject,
+            capability,
+            impacts,
+            kind: SemanticGapKind::Unknown,
+            budget: None,
+            discharge: SemanticGapDischarge::None,
+            detail: "fixture semantic gap".into(),
+            source: SourceMappingId::new(0),
+            evidence: EvidenceId::new(0),
+        });
+        let mut events = parts.points[0].events.to_vec();
+        events.push(SemanticEvent::new(
+            SemanticEffect::Gap {
+                gap: SemanticGapId::new(0),
+            },
+            SourceMappingId::new(0),
+            EvidenceId::new(0),
+        ));
+        parts.points[0].events = events.into_boxed_slice();
+        parts
+    };
+
+    for (capability, missing) in [
+        (
+            SemanticCapability::DynamicDispatch,
+            SemanticGapImpact::DispatchCoverage,
+        ),
+        (
+            SemanticCapability::CleanupControlFlow,
+            SemanticGapImpact::ReturnTransfer,
+        ),
+        (
+            SemanticCapability::ExceptionalControlFlow,
+            SemanticGapImpact::ReturnTransfer,
+        ),
+        (
+            SemanticCapability::NonLocalControl,
+            SemanticGapImpact::ReturnTransfer,
+        ),
+        (
+            SemanticCapability::Assignments,
+            SemanticGapImpact::ValueFlow,
+        ),
+        (SemanticCapability::Captures, SemanticGapImpact::ValueFlow),
+        (
+            SemanticCapability::NormalCallContinuation,
+            SemanticGapImpact::CallEvaluation,
+        ),
+    ] {
+        let error = SemanticArtifact::try_new(
+            key.clone(),
+            capabilities(&[capability]),
+            vec![procedure_with_gap(
+                capability,
+                SemanticGapSubject::Point,
+                SemanticGapImpacts::NONE,
+            )],
+        )
+        .expect_err("a consumer-affecting gap cannot omit its mandatory impact");
+        assert_eq!(error.kind(), SemanticIrErrorKind::GapContract);
+        assert!(error.detail().contains(missing.label()));
+    }
+
+    let incomplete_capture = SemanticGapImpacts::single(SemanticGapImpact::ValueFlow);
+    let error = SemanticArtifact::try_new(
+        key.clone(),
+        capabilities(&[SemanticCapability::Captures]),
+        vec![procedure_with_gap(
+            SemanticCapability::Captures,
+            SemanticGapSubject::Point,
+            incomplete_capture,
+        )],
+    )
+    .expect_err("a capture gap cannot hide missing heap and alias impacts");
+    assert_eq!(error.kind(), SemanticIrErrorKind::GapContract);
+    assert!(error.detail().contains(SemanticGapImpact::HeapRead.label()));
+
+    let impacts = SemanticGapImpacts::single(SemanticGapImpact::DispatchCoverage)
+        .with(SemanticGapImpact::CallEvaluation);
+    let procedure = procedure_with_gap(
+        SemanticCapability::DynamicDispatch,
+        SemanticGapSubject::Point,
+        impacts,
+    );
+    SemanticArtifact::try_new(
+        key,
+        capabilities(&[SemanticCapability::DynamicDispatch]),
+        vec![procedure],
+    )
+    .expect("adapter-specific impacts may extend the mandatory baseline");
+}
+
+#[test]
+#[hardwon("5aba1d8d47f4: duplicate gap diagnostics must name both facts and the procedure")]
+fn duplicate_gap_diagnostic_names_both_facts_and_the_procedure() {
+    let key = key();
+    let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
+    let source = SourceMappingId::new(0);
+    let evidence = EvidenceId::new(0);
+    for (id, detail) in [(0, "first assignment gap"), (1, "second assignment gap")] {
+        parts.gaps.push(SemanticGap {
+            id: SemanticGapId::new(id),
+            point: ProgramPointId::new(0),
+            subject: SemanticGapSubject::Point,
+            capability: SemanticCapability::Assignments,
+            impacts: SemanticGapImpacts::for_gap(
+                SemanticCapability::Assignments,
+                SemanticGapSubject::Point,
+            ),
+            kind: SemanticGapKind::Unsupported,
+            budget: None,
+            discharge: SemanticGapDischarge::None,
+            detail: detail.into(),
+            source,
+            evidence,
+        });
+    }
+    let mut events = parts.points[0].events.to_vec();
+    events.extend([0, 1].map(|id| {
+        SemanticEvent::new(
+            SemanticEffect::Gap {
+                gap: SemanticGapId::new(id),
+            },
+            source,
+            evidence,
+        )
+    }));
+    parts.points[0].events = events.into_boxed_slice();
+
+    let mut capability_builder = SemanticCapabilities::builder();
+    for capability in [
+        SemanticCapability::Procedures,
+        SemanticCapability::EntryBoundary,
+        SemanticCapability::NormalExitBoundary,
+        SemanticCapability::ExceptionalExitBoundary,
+        SemanticCapability::BasicBlocks,
+        SemanticCapability::ProgramPoints,
+        SemanticCapability::NormalControlFlow,
+        SemanticCapability::ExceptionalControlFlow,
+    ] {
+        capability_builder = capability_builder.complete(capability);
+    }
+    let semantic_capabilities = capability_builder
+        .partial(SemanticCapability::Assignments)
+        .build();
+    let error = SemanticArtifact::try_new(key, semantic_capabilities, vec![parts])
+        .expect_err("one scoped fact cannot have two gap rows");
+    assert_eq!(error.kind(), SemanticIrErrorKind::GapContract);
+    assert!(error.detail().contains("src/Test.java"), "{error}");
+    assert!(
+        error.detail().contains("gap 1 (second assignment gap)"),
+        "{error}"
+    );
+    assert!(
+        error.detail().contains("gap 0 (first assignment gap)"),
+        "{error}"
+    );
+}
+
+#[test]
+fn budget_limited_same_artifact_target_remains_explicitly_unmaterialized() {
+    let key = key();
+    let omitted = procedure_locator(&key, "omitted", 7);
+    let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
+    parts.values.push(SemanticValue {
+        id: ValueId::new(0),
+        kind: SemanticValueKind::Callable,
+        source: SourceMappingId::new(0),
+        evidence: EvidenceId::new(0),
+    });
+    let mut budget = SemanticBudget::uniform(1).unwrap();
+    budget
+        .charge(SemanticWork {
+            procedures: 1,
+            ..SemanticWork::default()
+        })
+        .unwrap();
+    let exceeded = budget
+        .charge(SemanticWork {
+            procedures: 1,
+            ..SemanticWork::default()
+        })
+        .unwrap_err();
+    parts.gaps.push(SemanticGap {
+        id: SemanticGapId::new(0),
+        point: ProgramPointId::new(0),
+        subject: SemanticGapSubject::Value(ValueId::new(0)),
+        capability: SemanticCapability::CallableReferences,
+        impacts: SemanticGapImpacts::for_gap(
+            SemanticCapability::CallableReferences,
+            SemanticGapSubject::Value(ValueId::new(0)),
+        ),
+        kind: SemanticGapKind::ExceededBudget,
+        budget: Some(exceeded),
+        discharge: SemanticGapDischarge::None,
+        detail: "nested body was recognized but not materialized".into(),
+        source: SourceMappingId::new(0),
+        evidence: EvidenceId::new(0),
+    });
+    let targets =
+        CallableTargetResolution::ExceededBudget(Box::new([CallableTarget::Unmaterialized(
+            omitted,
+        )]));
+    let mut events = parts.points[0].events.to_vec();
+    events.extend([
+        SemanticEvent::new(
+            SemanticEffect::CallableReference {
+                result: ValueId::new(0),
+                callable: CallableValue {
+                    kind: CallableReferenceKind::Function,
+                    targets,
+                    target_evidence: EvidenceId::new(0),
+                    bound_receiver: None,
+                    environment: None,
+                },
+            },
+            SourceMappingId::new(0),
+            EvidenceId::new(0),
+        ),
+        SemanticEvent::new(
+            SemanticEffect::Gap {
+                gap: SemanticGapId::new(0),
+            },
+            SourceMappingId::new(0),
+            EvidenceId::new(0),
+        ),
+    ]);
+    parts.points[0].events = events.into_boxed_slice();
+
+    SemanticArtifact::try_new(
+        key,
+        capabilities(&[
+            SemanticCapability::Values,
+            SemanticCapability::CallableReferences,
+        ]),
+        vec![parts],
+    )
+    .expect("same-artifact locator is legal only as an incomplete target");
+}
+
 #[test]
 fn async_continuation_gap_requires_a_real_matching_suspend_arm() {
     let key = key();
@@ -3772,41 +3104,9 @@ fn async_continuation_gap_requires_a_real_matching_suspend_arm() {
     assert_eq!(error.kind(), SemanticIrErrorKind::GapContract);
 }
 
-#[test]
-fn multiple_control_splits_at_one_point_are_rejected() {
-    let key = key();
-    let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
-    let mut events = parts.points[0].events.to_vec();
-    events.extend([
-        SemanticEvent::new(
-            SemanticEffect::ProcedureReturn { value: None },
-            SourceMappingId::new(0),
-            EvidenceId::new(0),
-        ),
-        SemanticEvent::new(
-            SemanticEffect::Throw { value: None },
-            SourceMappingId::new(0),
-            EvidenceId::new(0),
-        ),
-    ]);
-    parts.points[0].events = events.into_boxed_slice();
-
-    let error = SemanticArtifact::try_new(
-        key,
-        capabilities(&[SemanticCapability::ReturnFlow]),
-        vec![parts],
-    )
-    .expect_err("one point cannot contain two control splits");
-    assert_eq!(error.kind(), SemanticIrErrorKind::ControlFlowContract);
-}
-
-#[test]
-fn async_events_require_async_procedure_property() {
-    let key = key();
-    let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
+fn add_matched_async_suspend(parts: &mut ProcedureSemanticsParts) -> (SourceMappingId, EvidenceId) {
     let source = SourceMappingId::new(0);
     let evidence = EvidenceId::new(0);
-
     let mut entry_events = parts.points[0].events.to_vec();
     entry_events.push(SemanticEvent::new(
         SemanticEffect::AsyncSuspend {
@@ -3818,7 +3118,6 @@ fn async_events_require_async_procedure_property() {
         evidence,
     ));
     parts.points[0].events = entry_events.into_boxed_slice();
-
     let mut normal_events = parts.points[1].events.to_vec();
     normal_events.push(SemanticEvent::new(
         SemanticEffect::AsyncResume {
@@ -3830,7 +3129,6 @@ fn async_events_require_async_procedure_property() {
         evidence,
     ));
     parts.points[1].events = normal_events.into_boxed_slice();
-
     let mut exceptional_events = parts.points[2].events.to_vec();
     exceptional_events.push(SemanticEvent::new(
         SemanticEffect::AsyncResume {
@@ -3861,6 +3159,14 @@ fn async_events_require_async_procedure_property() {
             evidence,
         },
     ]);
+    (source, evidence)
+}
+
+#[test]
+fn async_events_require_async_procedure_property() {
+    let key = key();
+    let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
+    add_matched_async_suspend(&mut parts);
 
     let error = SemanticArtifact::try_new(
         key,
@@ -3869,4 +3175,93 @@ fn async_events_require_async_procedure_property() {
     )
     .expect_err("async events in a non-async procedure must fail");
     assert_eq!(error.kind(), SemanticIrErrorKind::AsyncContract);
+}
+
+#[test]
+fn artifact_callable_identity_is_bound_source_evidence_and_not_lexical_creation() {
+    use crate::analyzer::go::{
+        GoPinnedPackage, GoSourceDeclarationKind, analyze_go_package_source_identities,
+        bind_go_anonymous_callable_identity,
+    };
+    use crate::analyzer::semantic_model::{ArtifactProducerLimits, read_exact_source_set};
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("factory.go"),
+        "package external\nfunc Factory() func() int { return func() int { return 1 } }\n",
+    )
+    .unwrap();
+    let source = read_exact_source_set(
+        root.path(),
+        &["factory.go".into()],
+        1,
+        1,
+        &ArtifactProducerLimits::default(),
+    )
+    .unwrap();
+    let package = GoPinnedPackage {
+        import_path: "example.test/external".into(),
+        name: "external".into(),
+        files: vec!["factory.go".into()],
+    };
+    let analysis = analyze_go_package_source_identities(&source, &package, 10_000, None);
+    assert!(analysis.gaps.is_empty(), "{:?}", analysis.gaps);
+    let literal = analysis
+        .identities
+        .iter()
+        .find(|declaration| declaration.anchor.kind == GoSourceDeclarationKind::FunctionLiteral)
+        .unwrap();
+    let identity = literal.anonymous_callable_identity("literal").unwrap();
+    let bound =
+        bind_go_anonymous_callable_identity(&source, &package, &identity, 10_000, None).unwrap();
+    let target = ArtifactCallableTarget::from_bound_go_identity(&bound);
+    assert_eq!(target.identity(), &identity);
+
+    let key = key();
+    let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
+    parts.values.push(SemanticValue {
+        id: ValueId::new(0),
+        kind: SemanticValueKind::Callable,
+        source: SourceMappingId::new(0),
+        evidence: EvidenceId::new(0),
+    });
+    let callable = CallableValue {
+        kind: CallableReferenceKind::Function,
+        targets: CallableTargetResolution::Proven(CallableTarget::Artifact(target)),
+        target_evidence: EvidenceId::new(0),
+        bound_receiver: None,
+        environment: None,
+    };
+    let mut events = parts.points[0].events.to_vec();
+    events.push(SemanticEvent::new(
+        SemanticEffect::CallableReference {
+            result: ValueId::new(0),
+            callable: callable.clone(),
+        },
+        SourceMappingId::new(0),
+        EvidenceId::new(0),
+    ));
+    parts.points[0].events = events.into_boxed_slice();
+    let capabilities = capabilities(&[
+        SemanticCapability::Values,
+        SemanticCapability::CallableReferences,
+    ]);
+    let artifact =
+        SemanticArtifact::try_new(key.clone(), capabilities.clone(), vec![parts.clone()]).unwrap();
+    assert!(
+        artifact.work().owned_text_bytes
+            >= identity.artifact_sha256.len() + identity.package_identity.len()
+    );
+
+    let mut creation = callable;
+    creation.kind = CallableReferenceKind::Lambda;
+    parts.points[0].events.last_mut().unwrap().effect = SemanticEffect::CallableCreation {
+        result: ValueId::new(0),
+        callable: creation,
+    };
+    assert_eq!(
+        SemanticArtifact::try_new(key, capabilities, vec![parts])
+            .unwrap_err()
+            .kind(),
+        SemanticIrErrorKind::CallableContract,
+    );
 }

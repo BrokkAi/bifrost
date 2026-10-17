@@ -3,26 +3,36 @@
 //!
 //! Both entry points share the same bridge: materialize the file's semantic
 //! artifact, select the narrowest retained source mapping that contains the
-//! requested range, and delegate to the handle-keyed oracle. Neither entry
-//! point re-implements the answer it projects.
+//! requested range, and delegate to the handle-keyed oracle. The value path
+//! tries a wider mapping when the narrowest one has no executable observation,
+//! so a selected member name can reach its enclosing field load.
 
 use std::sync::Arc;
 
-use crate::analyzer::{ProjectFile, Range};
+use crate::analyzer::usages::get_definition::{
+    DefinitionLookupRequest, DefinitionLookupStatus, parse_tree_for_language,
+    resolve_definition_batch_with_source,
+};
+use crate::analyzer::usages::reference_site::{node_range, smallest_named_node_covering};
+use crate::analyzer::{CodeUnitType, Language, ProjectFile, Range};
 use crate::hash::HashMap;
 
 use super::{
     WorkspaceSemanticOracle, common::Interruption, common::WorkStager,
     dispatch::PreparedWorkspaceDispatchSession, heap::points_to_capability_surface_is_incomplete,
 };
+use crate::analyzer::semantic::ids::{
+    push_evidence_completeness, push_optional_bytes, push_proof_status,
+};
 use crate::analyzer::semantic::{
     AbstractObject, CallSiteHandle, CandidateCoverage, DispatchBoundary, DispatchBoundaryKind,
-    DispatchCandidate, DispatchResult, EvidenceCompleteness, HeapOracle, LengthDelimitedDigest,
-    ObservationPhase, OracleCallContext, OracleCandidate, PointsToResult, ProofStatus,
-    SemanticArtifact, SemanticBudgetExceeded, SemanticBudgetScopeIdentity, SemanticCapability,
-    SemanticLocator, SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticWork,
-    SourceSpan, StableDigest, ValueAtPoint, ValueHandle,
+    DispatchCandidate, DispatchResult, HeapOracle, LengthDelimitedDigest, ObservationPhase,
+    OracleCallContext, OracleCandidate, PointsToResult, SemanticArtifact, SemanticBudgetExceeded,
+    SemanticBudgetScopeIdentity, SemanticCapability, SemanticLocator, SemanticOutcome,
+    SemanticProviderError, SemanticRequest, SemanticValueKind, SemanticWork, SourceSpan,
+    StableDigest, ValueAtPoint, ValueHandle,
 };
+use tree_sitter::Node;
 
 /// A lazy file-window dispatch session over one immutable semantic artifact.
 ///
@@ -51,6 +61,44 @@ impl PreparedSourceDispatchSession<'_> {
         self.calls
             .as_ref()
             .map_or(0, PreparedWorkspaceDispatchSession::retained_bytes)
+    }
+
+    /// Resolve one range, then record its answer in the read ledger when one
+    /// is attached. Dispatch is the channel a result contract or a task slice
+    /// composes callee bodies through, so the answer, including which targets
+    /// it named and whether the set was exhaustive, is an input the reader
+    /// depended on.
+    #[doc(hidden)]
+    pub fn resolve_at_source_recorded(
+        &mut self,
+        range: Range,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<SourceDispatchResult>, SemanticProviderError> {
+        // Only computed when a ledger will read it: the question names the
+        // artifact, and an Arc bump on every dispatch is a cost runs that
+        // record nothing should not pay.
+        let question = self
+            .oracle
+            .workspace
+            .analyzer()
+            .read_ledger_attached()
+            .then(|| {
+                self.materialized
+                    .available_value()
+                    .map(|artifact| dispatch_question(artifact, range))
+            })
+            .flatten();
+        let outcome = self.resolve_at_source(range, request)?;
+        if let Some(question) = question {
+            self.oracle.workspace.analyzer().record_read(
+                crate::analyzer::read_ledger::ReadKey::lookup(
+                    crate::analyzer::read_ledger::LookupKind::Dispatch,
+                    question,
+                    dispatch_answer_digest(outcome.available_value()),
+                ),
+            );
+        }
+        Ok(outcome)
     }
 
     #[doc(hidden)]
@@ -203,59 +251,30 @@ impl<'a> WorkspaceSemanticOracle<'a> {
         range: Range,
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<SourcePointsToResult>, SemanticProviderError> {
-        if request.cancellation.is_cancelled() {
-            return Ok(SemanticOutcome::Cancelled {
-                partial: None,
-                work: SemanticWork::default(),
-            });
-        }
-        let materialized = self
-            .workspace
-            .materialize_program_semantics(file, request)?;
-        let mut quality = SourceOutcomeQuality::from_outcome(&materialized);
-        let mut work = materialized.work();
-        let Some(artifact) = materialized.available_value().cloned() else {
-            return Ok(source_outcome_without_value(materialized));
-        };
-
-        let mut staged = WorkStager::new(request);
-        let projection = source_value_observations(
-            &artifact,
-            range,
-            self.limits.source_observations(),
-            &mut staged,
-            request.cancellation,
-        );
-        work = work.conservative_add(staged.work);
-        let (observations, observations_truncated) = match projection {
-            Ok(_) if request.cancellation.is_cancelled() => {
-                return Ok(SemanticOutcome::Cancelled {
-                    partial: None,
+        let ObservedSource {
+            observations,
+            truncated: observations_truncated,
+            materialization_complete,
+            mut quality,
+            mut work,
+        } = match self.observe_source(file, range, request)? {
+            SourceObservation::Observed(observed) => observed,
+            SourceObservation::BodylessParameter { work } => {
+                return Ok(SemanticOutcome::Complete {
+                    value: SourcePointsToResult {
+                        observations: Vec::new().into_boxed_slice(),
+                        coverage: CandidateCoverage::Exhaustive,
+                        source_observations_complete: true,
+                    },
                     work,
                 });
             }
-            Ok(projection) => projection,
-            Err(Interruption::Budget(exceeded)) => {
-                return Ok(SemanticOutcome::ExceededBudget {
-                    partial: None,
-                    exceeded,
-                    work,
-                });
-            }
-            Err(Interruption::Cancelled) => {
-                return Ok(SemanticOutcome::Cancelled {
-                    partial: None,
-                    work,
-                });
+            SourceObservation::Settled(outcome) => {
+                return Ok(outcome.map(|()| unreachable!("a settled source holds no value")));
             }
         };
-        *request.budget = staged.budget;
-        if observations.is_empty() {
-            return Ok(SemanticOutcome::Unknown {
-                partial: None,
-                work,
-            });
-        }
+        let source_observations_materialization_complete =
+            materialization_complete && !observations_truncated;
         if observations_truncated {
             quality.absorb(SourceOutcomeQuality::Unproven);
         }
@@ -264,8 +283,8 @@ impl<'a> WorkspaceSemanticOracle<'a> {
         let mut all_results_exhaustive = true;
         let mut any_result_truncated = false;
         let observation_count = observations.len();
-        for (index, observation) in observations.into_iter().enumerate() {
-            let outcome = self.pointees(&observation, request)?;
+        for (index, observation) in observations.iter().enumerate() {
+            let outcome = self.pointees(observation, request)?;
             work = work.conservative_add(outcome.work());
             quality.absorb(SourceOutcomeQuality::from_outcome(&outcome));
             if let Some(result) = outcome.available_value() {
@@ -284,6 +303,8 @@ impl<'a> WorkspaceSemanticOracle<'a> {
             }
         }
 
+        let source_observations_complete =
+            source_observations_materialization_complete && points_to.len() == observation_count;
         let coverage = if observations_truncated || any_result_truncated {
             CandidateCoverage::Truncated
         } else if all_results_exhaustive
@@ -307,8 +328,264 @@ impl<'a> WorkspaceSemanticOracle<'a> {
         let result = (!points_to.is_empty()).then(|| SourcePointsToResult {
             observations: points_to.into_boxed_slice(),
             coverage,
+            source_observations_complete,
         });
         Ok(quality.publish(result, work))
+    }
+
+    /// The point-sensitive value observations for the narrowest semantic
+    /// source mapping that contains `range`, without their points-to sets.
+    ///
+    /// This is the file-local half of [`Self::pointees_at_source`]: it
+    /// materializes the file, applies the bodyless-parameter rule and the
+    /// literal const/static read narrowing, and projects the observations,
+    /// but asks no heap question. A consumer that needs only the value and
+    /// its point (the taint composition's frontier) uses it, because points-to
+    /// of a formal asks for every caller of its procedure. The quality is the
+    /// projection's own: a truncated set is unproven, an incomplete
+    /// materialization keeps its outcome, and no observation is `Unknown`.
+    pub fn value_observations_at_source(
+        &self,
+        file: &ProjectFile,
+        range: Range,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<Box<[ValueAtPoint]>>, SemanticProviderError> {
+        Ok(match self.observe_source(file, range, request)? {
+            SourceObservation::Observed(ObservedSource {
+                observations,
+                truncated,
+                materialization_complete: _,
+                mut quality,
+                work,
+            }) => {
+                if truncated {
+                    quality.absorb(SourceOutcomeQuality::Unproven);
+                }
+                quality.publish(Some(observations.into_boxed_slice()), work)
+            }
+            SourceObservation::BodylessParameter { work } => SemanticOutcome::Complete {
+                value: Box::default(),
+                work,
+            },
+            SourceObservation::Settled(outcome) => {
+                outcome.map(|()| unreachable!("a settled source holds no value"))
+            }
+        })
+    }
+
+    /// Materialize `file` and project the value observations at `range`,
+    /// the step [`Self::pointees_at_source`] and
+    /// [`Self::value_observations_at_source`] share.
+    fn observe_source(
+        &self,
+        file: &ProjectFile,
+        range: Range,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SourceObservation, SemanticProviderError> {
+        if request.cancellation.is_cancelled() {
+            return Ok(SourceObservation::Settled(SemanticOutcome::Cancelled {
+                partial: None,
+                work: SemanticWork::default(),
+            }));
+        }
+        let materialized = self
+            .workspace
+            .materialize_program_semantics(file, request)?;
+        let work = materialized.work();
+
+        // A declaration-only Rust signature cannot have a runtime value at
+        // its parameter site. This is a structural fact independent of
+        // whether the file has an executable semantic artifact.
+        if self.rust_bodyless_parameter_source(file, range) {
+            return Ok(SourceObservation::BodylessParameter { work });
+        }
+
+        let quality = SourceOutcomeQuality::from_outcome(&materialized);
+        let Some(artifact) = materialized.available_value().cloned() else {
+            return Ok(SourceObservation::Settled(source_outcome_without_value(
+                materialized,
+            )));
+        };
+
+        // A Rust const/static read is represented by the executable procedure
+        // at the read site, while its initializer belongs to a declaration
+        // outside that procedure. Resolve that origin once and narrow the
+        // projection to the terminal name only after the definition proves a
+        // literal initializer. All other matched-value users retain the
+        // existing source-range behavior.
+        let projection_range = self
+            .rust_literal_const_read_range(file, range)
+            .unwrap_or(range);
+        let mut staged = WorkStager::new(request);
+        let projection = source_value_observations(
+            &artifact,
+            projection_range,
+            self.limits.source_observations(),
+            &mut staged,
+            request.cancellation,
+        );
+        let work = work.conservative_add(staged.work);
+        let (observations, truncated) = match projection {
+            Ok(_) if request.cancellation.is_cancelled() => {
+                return Ok(SourceObservation::Settled(SemanticOutcome::Cancelled {
+                    partial: None,
+                    work,
+                }));
+            }
+            Ok(projection) => projection,
+            Err(Interruption::Budget(exceeded)) => {
+                return Ok(SourceObservation::Settled(
+                    SemanticOutcome::ExceededBudget {
+                        partial: None,
+                        exceeded,
+                        work,
+                    },
+                ));
+            }
+            Err(Interruption::Cancelled) => {
+                return Ok(SourceObservation::Settled(SemanticOutcome::Cancelled {
+                    partial: None,
+                    work,
+                }));
+            }
+        };
+        *request.budget = staged.budget;
+        if observations.is_empty() {
+            return Ok(SourceObservation::Settled(SemanticOutcome::Unknown {
+                partial: None,
+                work,
+            }));
+        }
+        Ok(SourceObservation::Observed(ObservedSource {
+            observations,
+            truncated,
+            materialization_complete: materialized.is_complete(),
+            quality,
+            work,
+        }))
+    }
+
+    /// Whether `range` selects a Rust parameter on a signature without an
+    /// executable body. A range in the parameter's type is not a parameter
+    /// value site, even when the type is nested under the declaration.
+    fn rust_bodyless_parameter_source(&self, file: &ProjectFile, range: Range) -> bool {
+        if crate::analyzer::common::language_for_file(file) != Language::Rust {
+            return false;
+        }
+        let analyzer = self.workspace.analyzer();
+        let Some(source) = analyzer.indexed_source(file) else {
+            return false;
+        };
+        let Some(tree) = parse_tree_for_language(file, Language::Rust, &source) else {
+            return false;
+        };
+        let Some(mut node) =
+            smallest_named_node_covering(tree.root_node(), range.start_byte, range.end_byte)
+        else {
+            return false;
+        };
+        let parameter = loop {
+            if matches!(node.kind(), "parameter" | "self_parameter") {
+                break node;
+            }
+            let Some(parent) = node.parent() else {
+                return false;
+            };
+            node = parent;
+        };
+        let selected_parameter =
+            range.start_byte == parameter.start_byte() && range.end_byte == parameter.end_byte();
+        let selected_pattern = parameter
+            .child_by_field_name("pattern")
+            .is_some_and(|pattern| {
+                range.start_byte >= pattern.start_byte() && range.end_byte <= pattern.end_byte()
+            });
+        if !selected_parameter && !selected_pattern {
+            return false;
+        }
+
+        let mut owner = parameter.parent();
+        while let Some(node) = owner {
+            match node.kind() {
+                "function_item" => return false,
+                "function_signature_item" => {
+                    return node.child_by_field_name("body").is_none();
+                }
+                _ => owner = node.parent(),
+            }
+        }
+        false
+    }
+
+    /// Return the terminal name range for a Rust const/static read whose
+    /// resolved declaration has a directly literal initializer.
+    ///
+    /// This deliberately resolves one selected reference at a time. The
+    /// result is query-scoped and is used only to improve source projection;
+    /// ordinary matched-value source ranges keep their established behavior.
+    fn rust_literal_const_read_range(&self, file: &ProjectFile, range: Range) -> Option<Range> {
+        if crate::analyzer::common::language_for_file(file) != Language::Rust {
+            return None;
+        }
+        let analyzer = self.workspace.analyzer();
+        let source = analyzer.indexed_source(file)?;
+        let tree = parse_tree_for_language(file, Language::Rust, &source)?;
+        let focus =
+            smallest_named_node_covering(tree.root_node(), range.start_byte, range.end_byte)?;
+        if !matches!(
+            focus.kind(),
+            "identifier" | "scoped_identifier" | "field_identifier"
+        ) {
+            return None;
+        }
+
+        let request = DefinitionLookupRequest {
+            file: file.clone(),
+            line: None,
+            column: None,
+            start_byte: Some(focus.start_byte()),
+            end_byte: Some(focus.end_byte()),
+        };
+        let outcomes = resolve_definition_batch_with_source(
+            analyzer,
+            vec![request],
+            file.clone(),
+            Arc::from(source.as_str()),
+        );
+        let [outcome] = outcomes.as_slice() else {
+            return None;
+        };
+        if !matches!(outcome.status, DefinitionLookupStatus::Resolved) {
+            return None;
+        }
+        let [definition] = outcome.definitions.as_slice() else {
+            return None;
+        };
+        if definition.kind() != CodeUnitType::Field {
+            return None;
+        }
+        let definition_source = analyzer.indexed_source(definition.source())?;
+        let definition_tree =
+            parse_tree_for_language(definition.source(), Language::Rust, &definition_source)?;
+        let literal_initializer = analyzer
+            .location_ranges(definition)
+            .into_iter()
+            .any(|range| {
+                let Some(node) = smallest_named_node_covering(
+                    definition_tree.root_node(),
+                    range.start_byte,
+                    range.end_byte,
+                ) else {
+                    return false;
+                };
+                let Some(declaration) = enclosing_rust_const_static(node, range) else {
+                    return false;
+                };
+                declaration
+                    .child_by_field_name("value")
+                    .is_some_and(rust_literal_initializer)
+            });
+        literal_initializer.then(|| terminal_rust_name_range(focus))
     }
 
     /// Resolve dispatch for every semantic call site whose narrowest source
@@ -364,34 +641,8 @@ impl<'a> WorkspaceSemanticOracle<'a> {
         range: Range,
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<SourceDispatchResult>, SemanticProviderError> {
-        // Only retained when a ledger will read it: the artifact is needed to
-        // name the question, and an Arc bump on every dispatch is a cost this
-        // milestone must not add to runs that record nothing.
-        let artifact = self
-            .workspace
-            .analyzer()
-            .read_ledger_attached()
-            .then(|| materialized.available_value().map(Arc::clone))
-            .flatten();
-        let question = artifact
-            .as_ref()
-            .map(|artifact| dispatch_question(artifact, range));
-        let outcome = self
-            .prepare_source_dispatch_session_in_artifact(materialized)
-            .resolve_at_source(range, request)?;
-        // Dispatch is the channel a result contract or a task slice composes
-        // callee bodies through, so the answer -- which targets, and whether
-        // the set was exhaustive -- is itself an input the reader depended on.
-        if let Some(question) = question {
-            self.workspace
-                .analyzer()
-                .record_read(crate::analyzer::read_ledger::ReadKey::lookup(
-                    crate::analyzer::read_ledger::LookupKind::Dispatch,
-                    question,
-                    dispatch_answer_digest(outcome.available_value()),
-                ));
-        }
-        Ok(outcome)
+        self.prepare_source_dispatch_session_in_artifact(materialized)
+            .resolve_at_source_recorded(range, request)
     }
 }
 
@@ -646,8 +897,8 @@ fn procedure_dispatch_candidate_digest(candidate: &DispatchCandidate) -> StableD
             .procedure_lineage_fingerprint(target.semantics().locator().declaration())
             .as_bytes(),
     );
-    push_proof(&mut digest, candidate.proof());
-    push_completeness(&mut digest, candidate.completeness());
+    push_proof_status(&mut digest, candidate.proof());
+    push_evidence_completeness(&mut digest, candidate.completeness());
     let mut excluded = candidate
         .excluded_targets()
         .iter()
@@ -755,8 +1006,8 @@ fn procedure_dispatch_boundary_digest(boundary: &DispatchBoundary) -> StableDige
         }
         None => digest.push(b"no-unmaterialized-external-target"),
     }
-    push_proof(&mut digest, &boundary.proof);
-    push_completeness(&mut digest, &boundary.completeness);
+    push_proof_status(&mut digest, &boundary.proof);
+    push_evidence_completeness(&mut digest, &boundary.completeness);
     digest.finish()
 }
 
@@ -788,20 +1039,6 @@ fn push_source_outcome_quality(digest: &mut LengthDelimitedDigest, quality: Sour
     }
 }
 
-fn push_proof(digest: &mut LengthDelimitedDigest, proof: &ProofStatus) {
-    digest.push(proof.label().as_bytes());
-    if let ProofStatus::Unproven(reason) = proof {
-        digest.push(reason.as_bytes());
-    }
-}
-
-fn push_completeness(digest: &mut LengthDelimitedDigest, completeness: &EvidenceCompleteness) {
-    digest.push(completeness.label().as_bytes());
-    if let EvidenceCompleteness::Partial(reason) = completeness {
-        digest.push(reason.as_bytes());
-    }
-}
-
 fn push_optional_locator(digest: &mut LengthDelimitedDigest, locator: Option<&SemanticLocator>) {
     match locator {
         Some(locator) => {
@@ -814,16 +1051,6 @@ fn push_optional_locator(digest: &mut LengthDelimitedDigest, locator: Option<&Se
 
 fn push_locator(digest: &mut LengthDelimitedDigest, locator: &SemanticLocator) {
     locator.push_anchor_free_procedure_declaration_identity(digest);
-}
-
-fn push_optional_bytes(digest: &mut LengthDelimitedDigest, value: Option<&[u8]>) {
-    match value {
-        Some(value) => {
-            digest.push(b"some");
-            digest.push(value);
-        }
-        None => digest.push(b"none"),
-    }
 }
 
 /// One call site addressed by a source range together with its exact dispatch
@@ -886,6 +1113,7 @@ impl SourceDispatchResult {
 pub struct SourcePointsToResult {
     observations: Box<[PointsToResult]>,
     coverage: CandidateCoverage,
+    source_observations_complete: bool,
 }
 
 impl SourcePointsToResult {
@@ -911,23 +1139,31 @@ impl SourcePointsToResult {
             .all(|result| result.objects().candidates().is_empty())
     }
 
-    /// Whether every retained observation is locally proven even though the
-    /// adapter's whole-language points-to capability surface keeps coverage
-    /// open. Consumers with an independent, syntax-scoped closure proof can
-    /// use this distinction without treating arbitrary open evidence as exact.
+    /// Whether this exact source range produced a complete observation set
+    /// whose point-to candidates are locally proven even though the adapter's
+    /// whole-language capability surface keeps coverage open. Consumers still
+    /// need independent, syntax-scoped proof that the selected range is the
+    /// value they intend to reason about.
     pub(crate) fn globally_incomplete_with_proven_candidates(&self) -> bool {
         self.coverage == CandidateCoverage::Open
-            && !self.observations.is_empty()
-            && self.observations.iter().all(|result| {
-                let query = result.query();
-                let candidates = result.objects().candidates();
-                result.objects().coverage() == CandidateCoverage::Open
-                    && points_to_capability_surface_is_incomplete(query.point().procedure())
-                    && !query.context().was_truncated()
-                    && !candidates.is_empty()
-                    && candidates.iter().all(OracleCandidate::is_proven_complete)
-            })
+            && self.source_observations_complete
+            && source_points_have_globally_incomplete_proven_candidates(&self.observations)
     }
+}
+
+fn source_points_have_globally_incomplete_proven_candidates(
+    observations: &[PointsToResult],
+) -> bool {
+    !observations.is_empty()
+        && observations.iter().all(|result| {
+            let query = result.query();
+            let candidates = result.objects().candidates();
+            result.objects().coverage() == CandidateCoverage::Open
+                && points_to_capability_surface_is_incomplete(query.point().procedure())
+                && !query.context().was_truncated()
+                && !candidates.is_empty()
+                && candidates.iter().all(OracleCandidate::is_proven_complete)
+        })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1020,6 +1256,31 @@ impl SourceOutcomeQuality {
     }
 }
 
+/// The value observations at one source range, or why there are none.
+enum SourceObservation {
+    Observed(ObservedSource),
+    /// The range selects a parameter of a Rust signature without a body,
+    /// which has no runtime value.
+    BodylessParameter {
+        work: SemanticWork,
+    },
+    /// No observation: cancelled, over budget, no artifact, or nothing at the
+    /// range. The outcome holds no value.
+    Settled(SemanticOutcome<()>),
+}
+
+/// The observations projected at one source range.
+struct ObservedSource {
+    observations: Vec<ValueAtPoint>,
+    /// The projection stopped at the source-observation limit.
+    truncated: bool,
+    /// The file's materialization was complete.
+    materialization_complete: bool,
+    /// The materialization's quality.
+    quality: SourceOutcomeQuality,
+    work: SemanticWork,
+}
+
 /// Re-type an unavailable materialization outcome for the projected answer.
 /// Only the artifact's own honest failure state survives; no projection is
 /// invented for a file whose semantics never materialized.
@@ -1056,11 +1317,13 @@ fn source_outcome_without_value<T>(
 }
 
 /// Locate the call sites whose source mapping is the narrowest one containing
-/// `range`, across every procedure in the artifact.
+/// `range`, across the procedures whose call-site mappings can contain it.
+/// Only those procedures are examined and charged, so one range does not cost
+/// a walk of the whole procedure table.
 ///
-/// Narrowest-span selection matches [`source_value_candidates`]: a nested call
-/// such as `outer(inner())` must address `inner` when the range is inside it,
-/// never the enclosing call. Returns the retained handles and whether the
+/// Narrowest-span selection keeps nested calls precise: a nested call such as
+/// `outer(inner())` must address `inner` when the range is inside it, never the
+/// enclosing call. Returns the retained handles and whether the
 /// oracle's source-observation limit omitted an equally narrow call site.
 fn source_call_sites(
     artifact: &Arc<SemanticArtifact>,
@@ -1071,7 +1334,7 @@ fn source_call_sites(
 ) -> Result<(Vec<CallSiteHandle>, bool), Interruption> {
     let mut best_width = None;
     let mut calls = Vec::new();
-    for procedure in artifact.procedures() {
+    for procedure_id in artifact.procedures_with_call_source_containing(range) {
         if cancellation.is_cancelled() {
             return Err(Interruption::Cancelled);
         }
@@ -1079,7 +1342,10 @@ fn source_call_sites(
             procedures: 1,
             ..SemanticWork::default()
         })?;
-        let Some(procedure_handle) = artifact.procedure_handle(procedure.id()) else {
+        let procedure = artifact
+            .procedure(procedure_id)
+            .expect("an indexed procedure belongs to its artifact");
+        let Some(procedure_handle) = artifact.procedure_handle(procedure_id) else {
             continue;
         };
         for call in procedure.call_sites() {
@@ -1121,6 +1387,45 @@ fn source_call_sites(
     Ok((calls, truncated))
 }
 
+fn enclosing_rust_const_static<'tree>(mut node: Node<'tree>, range: Range) -> Option<Node<'tree>> {
+    loop {
+        if matches!(node.kind(), "const_item" | "static_item")
+            && node.start_byte() <= range.start_byte
+            && node.end_byte() >= range.end_byte
+        {
+            return Some(node);
+        }
+        node = node.parent()?;
+    }
+}
+
+fn rust_literal_initializer(node: Node<'_>) -> bool {
+    match node.kind() {
+        "string_literal"
+        | "raw_string_literal"
+        | "byte_string_literal"
+        | "char_literal"
+        | "integer_literal"
+        | "float_literal"
+        | "negative_literal"
+        | "array_expression"
+        | "tuple_expression" => true,
+        "unary_expression" => node
+            .named_child(0)
+            .is_some_and(|child| matches!(child.kind(), "integer_literal" | "float_literal")),
+        _ => false,
+    }
+}
+
+fn terminal_rust_name_range(node: Node<'_>) -> Range {
+    let terminal = if node.kind() == "scoped_identifier" {
+        node.child_by_field_name("name").unwrap_or(node)
+    } else {
+        node
+    };
+    node_range(terminal)
+}
+
 fn source_value_observations(
     artifact: &Arc<SemanticArtifact>,
     range: Range,
@@ -1130,9 +1435,16 @@ fn source_value_observations(
 ) -> Result<(Vec<ValueAtPoint>, bool), Interruption> {
     let candidate_groups = source_value_candidates(artifact, range, staged, cancellation)?;
     let mut observations = Vec::new();
+    let mut selected_width = None;
     for group in candidate_groups {
         if cancellation.is_cancelled() {
             return Err(Interruption::Cancelled);
+        }
+        if selected_width.is_some_and(|width| group.width > width && !observations.is_empty()) {
+            break;
+        }
+        if selected_width.is_none_or(|width| group.width > width) {
+            selected_width = Some(group.width);
         }
         if project_procedure_observations(
             &group.procedure,
@@ -1158,6 +1470,7 @@ struct SourceValueCandidate {
 #[derive(Debug)]
 struct ProcedureSourceCandidates {
     procedure: crate::analyzer::semantic::ProcedureHandle,
+    width: usize,
     candidates: Vec<SourceValueCandidate>,
 }
 
@@ -1167,8 +1480,8 @@ fn source_value_candidates(
     staged: &mut WorkStager,
     cancellation: &crate::cancellation::CancellationToken,
 ) -> Result<Vec<ProcedureSourceCandidates>, Interruption> {
-    let mut best_value_width = None;
     let mut groups = Vec::new();
+    let range_width = range.end_byte - range.start_byte;
     for procedure in artifact.procedures() {
         if cancellation.is_cancelled() {
             return Err(Interruption::Cancelled);
@@ -1180,7 +1493,7 @@ fn source_value_candidates(
         let Some(procedure_handle) = artifact.procedure_handle(procedure.id()) else {
             continue;
         };
-        let mut candidates = Vec::new();
+        let mut candidates_by_width = HashMap::<usize, Vec<SourceValueCandidate>>::default();
         for value in procedure.values() {
             if cancellation.is_cancelled() {
                 return Err(Interruption::Cancelled);
@@ -1198,14 +1511,6 @@ fn source_value_candidates(
                 continue;
             }
             let width = (span.end_byte() - span.start_byte()) as usize;
-            if best_value_width.is_some_and(|best| width > best) {
-                continue;
-            }
-            if best_value_width.is_none_or(|best| width < best) {
-                best_value_width = Some(width);
-                groups.clear();
-                candidates.clear();
-            }
             let Some(value_handle) = procedure_handle.value_handle(value.id) else {
                 continue;
             };
@@ -1213,18 +1518,66 @@ fn source_value_candidates(
                 nested_entries: 1,
                 ..SemanticWork::default()
             })?;
-            candidates.push(SourceValueCandidate {
-                value: value_handle,
-                span,
-            });
+            candidates_by_width
+                .entry(width)
+                .or_default()
+                .push(SourceValueCandidate {
+                    value: value_handle,
+                    span,
+                });
         }
-        if !candidates.is_empty() {
+        let Some(min_width) = candidates_by_width.keys().copied().min() else {
+            continue;
+        };
+        debug_assert!(min_width >= range_width);
+        // An exact hit cannot have a strictly narrower boundary containing the range.
+        if min_width > range_width {
+            // An empty source region is still a boundary.
+            // Widening past its narrowest program point can turn an identifier
+            // in unevaluated syntax into the value of an enclosing call (#5267).
+            let mut point_width = None;
+            let mut boundary_is_empty = true;
+            for point in procedure.points() {
+                if cancellation.is_cancelled() {
+                    return Err(Interruption::Cancelled);
+                }
+                staged.charge(SemanticWork {
+                    program_points: 1,
+                    source_mappings: 1,
+                    ..SemanticWork::default()
+                })?;
+                if let Some(mapping) = procedure.source_mapping(point.source) {
+                    let span = mapping.locator.anchor().span();
+                    if span_contains_range(span, range) {
+                        let width = (span.end_byte() - span.start_byte()) as usize;
+                        if width >= min_width {
+                            continue;
+                        }
+                        if point_width.is_none_or(|best| width < best) {
+                            point_width = Some(width);
+                            boundary_is_empty = point.events.is_empty();
+                        } else if point_width == Some(width) {
+                            boundary_is_empty &= point.events.is_empty();
+                        }
+                    }
+                }
+            }
+            // An event-free callable point can still own a value. Preserve its
+            // normal projection to the call result; only a region with neither
+            // events nor mapped values is an unevaluated boundary (#5267).
+            if boundary_is_empty && point_width.is_some() {
+                continue;
+            }
+        }
+        for (width, candidates) in candidates_by_width {
             groups.push(ProcedureSourceCandidates {
-                procedure: procedure_handle,
+                procedure: procedure_handle.clone(),
+                width,
                 candidates,
             });
         }
     }
+    groups.sort_unstable_by_key(|group| group.width);
     Ok(groups)
 }
 
@@ -1324,6 +1677,36 @@ fn project_procedure_observations(
             .is_some_and(|span| span.has_exact_point)
         {
             fallback_candidates.push(index);
+        }
+    }
+
+    let parameter_candidates = candidates
+        .iter()
+        .enumerate()
+        .filter_map(|(index, candidate)| {
+            procedure
+                .semantics()
+                .value(candidate.value.id())
+                .is_some_and(|value| matches!(value.kind, SemanticValueKind::Parameter { .. }))
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    if !parameter_candidates.is_empty() {
+        let entry = procedure
+            .point_handle(procedure.semantics().entry_point())
+            .expect("semantic procedure entry has a point handle");
+        if append_observations(
+            &parameter_candidates,
+            candidates,
+            &load_points,
+            procedure,
+            &entry,
+            limit,
+            observations,
+            staged,
+            cancellation,
+        )? {
+            return Ok(true);
         }
     }
 
@@ -1440,20 +1823,34 @@ fn append_observations(
 }
 
 fn span_contains_range(span: SourceSpan, range: Range) -> bool {
-    (span.start_byte() as usize) <= range.start_byte && (span.end_byte() as usize) >= range.end_byte
+    Range {
+        start_byte: span.start_byte() as usize,
+        end_byte: span.end_byte() as usize,
+        start_line: span.start().line() as usize,
+        end_line: span.end().line() as usize,
+    }
+    .contains(&range)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::dispatch::exact_call_range;
     use super::*;
-    use crate::analyzer::semantic::{DispatchOracle, SemanticBudget, SemanticBudgetDimension};
+    use crate::analyzer::semantic::{
+        DispatchOracle, EvidenceCompleteness, ProofStatus, SemanticBudget, SemanticBudgetDimension,
+    };
     use crate::analyzer::{Language, ProjectFile};
     use crate::cancellation::CancellationToken;
     use crate::test_support::AnalyzerFixture;
+    use brokk_bifrost_test_macros::hardwon;
 
     const CALL_SOURCE: &str = "function target() {}\nexport function caller() { target(); }\n";
     const BATCH_CALL_SOURCE: &str = "import { open } from \"third-party\";\nexport function caller() { open(\"a\"); open(\"b\"); }\n";
     const DISTINCT_CALL_SOURCE: &str = "function first() {}\nfunction second() {}\nexport function caller() { first(); second(); }\n";
+    const RUST_FIELD_SOURCE: &str = "struct Config { password: &'static str }\nfn log_sink(_: &str) {}\nfn caller(config: &Config) { log_sink(config.password); }\nfn main() {}\n";
+    const RUST_PARAMETER_SOURCE: &str = "fn caller(password: &str) {}\n";
+    const RUST_CONST_SOURCE: &str =
+        "const KEY: [u8; 4] = [0u8; 4];\nfn use_key(_: &[u8]) {}\nfn caller() { use_key(&KEY); }\n";
 
     /// The durable, arena-independent shape of one dispatch answer. Relation
     /// provenance handles are query-local (they compare by arena identity), so
@@ -1489,19 +1886,15 @@ mod tests {
     }
 
     fn outcome_label<T>(outcome: &SemanticOutcome<T>) -> &'static str {
-        match outcome {
-            SemanticOutcome::Complete { .. } => "complete",
-            SemanticOutcome::Ambiguous { .. } => "ambiguous",
-            SemanticOutcome::Unproven { .. } => "unproven",
-            SemanticOutcome::Unknown { .. } => "unknown",
-            SemanticOutcome::Unsupported { .. } => "unsupported",
-            SemanticOutcome::ExceededBudget { .. } => "exceeded_budget",
-            SemanticOutcome::Cancelled { .. } => "cancelled",
-        }
+        outcome.label()
     }
 
     fn typescript_fixture(files: &[(&str, &str)]) -> AnalyzerFixture {
         AnalyzerFixture::new_for_language(Language::TypeScript, files)
+    }
+
+    fn rust_fixture(files: &[(&str, &str)]) -> AnalyzerFixture {
+        AnalyzerFixture::new_for_language(Language::Rust, files)
     }
 
     fn artifact_for(
@@ -1522,6 +1915,121 @@ mod tests {
             .expect("TypeScript semantic artifact")
     }
 
+    #[test]
+    fn field_member_source_falls_back_to_observable_field_load() {
+        let fixture = rust_fixture(&[("main.rs", RUST_FIELD_SOURCE)]);
+        let file = ProjectFile::new(fixture.project_root(), "main.rs");
+        let start_byte = RUST_FIELD_SOURCE
+            .find("config.password")
+            .expect("field access")
+            + "config.".len();
+        let end_byte = start_byte + "password".len();
+        let range = Range {
+            start_byte,
+            end_byte,
+            start_line: RUST_FIELD_SOURCE[..start_byte]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count(),
+            end_line: RUST_FIELD_SOURCE[..end_byte]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count(),
+        };
+        let oracle = fixture.analyzer.semantic_oracle_provider();
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let outcome = oracle
+            .pointees_at_source(
+                &file,
+                range,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("field member source points-to query");
+        let points_to = outcome
+            .available_value()
+            .expect("field member source retains points-to evidence");
+        assert!(
+            !points_to.observations().is_empty(),
+            "field member must address an observable field load: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn parameter_source_observes_the_procedure_input_at_entry() {
+        let fixture = rust_fixture(&[("main.rs", RUST_PARAMETER_SOURCE)]);
+        let file = ProjectFile::new(fixture.project_root(), "main.rs");
+        let start_byte = RUST_PARAMETER_SOURCE
+            .find("password: &str")
+            .expect("parameter binder");
+        let end_byte = start_byte + "password: &str".len();
+        let range = Range {
+            start_byte,
+            end_byte,
+            start_line: 0,
+            end_line: 0,
+        };
+        let oracle = fixture.analyzer.semantic_oracle_provider();
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let outcome = oracle
+            .pointees_at_source(
+                &file,
+                range,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("parameter source points-to query");
+        let points_to = outcome
+            .available_value()
+            .expect("parameter source retains points-to evidence");
+        assert!(
+            !points_to.observations().is_empty(),
+            "parameter binder must observe the input at procedure entry: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn const_read_source_projects_the_literal_definition_to_the_read() {
+        let fixture = rust_fixture(&[("main.rs", RUST_CONST_SOURCE)]);
+        let file = ProjectFile::new(fixture.project_root(), "main.rs");
+        let start_byte = RUST_CONST_SOURCE.find("&KEY").expect("const read") + "&".len();
+        let end_byte = start_byte + "KEY".len();
+        let range = Range {
+            start_byte,
+            end_byte,
+            start_line: RUST_CONST_SOURCE[..start_byte]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count(),
+            end_line: RUST_CONST_SOURCE[..end_byte]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count(),
+        };
+        let oracle = fixture.analyzer.semantic_oracle_provider();
+        assert_eq!(
+            oracle.rust_literal_const_read_range(&file, range),
+            Some(range),
+            "the const read must resolve to its literal initializer"
+        );
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let outcome = oracle
+            .pointees_at_source(
+                &file,
+                range,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("const source points-to query");
+        let points_to = outcome
+            .available_value()
+            .expect("const read retains point-sensitive evidence");
+        assert!(
+            !points_to.observations().is_empty(),
+            "const read must observe the value at its executable read: {outcome:?}"
+        );
+    }
+
     /// The only call site in `CALL_SOURCE`, with the exact source range its
     /// semantic mapping anchors.
     fn only_call_site(
@@ -1533,25 +2041,12 @@ mod tests {
             .find(|procedure| !procedure.call_sites().is_empty())
             .expect("caller procedure");
         let call = &procedure.call_sites()[0];
-        let span = procedure
-            .source_mapping(call.source)
-            .expect("call source mapping")
-            .locator
-            .anchor()
-            .span();
         let handle = artifact
             .procedure_handle(procedure.id())
             .and_then(|procedure| procedure.call_site_handle(call.id))
             .expect("scoped call handle");
-        (
-            handle,
-            Range {
-                start_byte: span.start_byte() as usize,
-                end_byte: span.end_byte() as usize,
-                start_line: span.start().line() as usize,
-                end_line: span.end().line() as usize,
-            },
-        )
+        let range = exact_call_range(&handle).expect("call source mapping");
+        (handle, range)
     }
 
     fn all_call_sites(
@@ -1562,25 +2057,12 @@ mod tests {
             .iter()
             .flat_map(|procedure| {
                 procedure.call_sites().iter().map(|call| {
-                    let span = procedure
-                        .source_mapping(call.source)
-                        .expect("call source mapping")
-                        .locator
-                        .anchor()
-                        .span();
                     let handle = artifact
                         .procedure_handle(procedure.id())
                         .and_then(|procedure| procedure.call_site_handle(call.id))
                         .expect("scoped call handle");
-                    (
-                        handle,
-                        Range {
-                            start_byte: span.start_byte() as usize,
-                            end_byte: span.end_byte() as usize,
-                            start_line: span.start().line() as usize,
-                            end_line: span.end().line() as usize,
-                        },
-                    )
+                    let range = exact_call_range(&handle).expect("call source mapping");
+                    (handle, range)
                 })
             })
             .collect()
@@ -1660,27 +2142,18 @@ mod tests {
                 dispatch_shape(serial_result.observations()[0].dispatch())
             );
         }
-    }
 
-    #[test]
-    fn prepared_source_dispatch_session_uses_one_source_budget_for_two_calls() {
-        let fixture = typescript_fixture(&[("batch.ts", BATCH_CALL_SOURCE)]);
-        let file = ProjectFile::new(fixture.project_root(), "batch.ts");
-        let artifact = artifact_for(&fixture, &file);
-        let calls = all_call_sites(&artifact);
-        assert_eq!(calls.len(), 2, "the fixture has two external calls");
-        let oracle = fixture.analyzer.semantic_oracle_provider();
-        let cancellation = CancellationToken::default();
         let mut limits = SemanticBudget::default().limits();
         limits.source_bytes = BATCH_CALL_SOURCE.len();
-
-        let mut session_budget = SemanticBudget::new(limits).expect("positive source budget");
-        let mut session_request = SemanticRequest::new(&mut session_budget, &cancellation);
-        let mut session =
+        let mut capped_session_budget =
+            SemanticBudget::new(limits).expect("positive source budget");
+        let mut capped_session_request =
+            SemanticRequest::new(&mut capped_session_budget, &cancellation);
+        let mut capped_session =
             oracle.prepare_source_dispatch_session_in_artifact(complete_materialization(&artifact));
         for (_, range) in &calls {
-            let outcome = session
-                .resolve_at_source(*range, &mut session_request)
+            let outcome = capped_session
+                .resolve_at_source(*range, &mut capped_session_request)
                 .expect("prepared source dispatch");
             assert!(
                 outcome.available_value().is_some(),
@@ -1688,7 +2161,7 @@ mod tests {
             );
         }
         assert_eq!(
-            session_request.budget.used().source_bytes,
+            capped_session_request.budget.used().source_bytes,
             BATCH_CALL_SOURCE.len()
         );
 
@@ -1725,9 +2198,20 @@ mod tests {
         let cancellation = CancellationToken::default();
         let mut first_budget = SemanticBudget::default();
         let nested_limit = first_budget.limits().nested_entries;
+        // Leave the paid callable-producer IR sweep plus one entry of headroom
+        // so this regression still exercises exhaustion after source parsing.
+        let producer_entries: usize = calls[0]
+            .0
+            .procedure()
+            .semantics()
+            .points()
+            .iter()
+            .map(|point| point.events.len())
+            .sum();
+        assert!(producer_entries < nested_limit);
         first_budget
             .charge(SemanticWork {
-                nested_entries: nested_limit - 1,
+                nested_entries: nested_limit - producer_entries - 1,
                 ..SemanticWork::default()
             })
             .expect("the first source projection retains one nested entry of headroom");
@@ -1768,6 +2252,85 @@ mod tests {
     }
 
     #[test]
+    fn source_dispatch_session_cancellation_does_not_reclassify_prior_calls() {
+        let fixture = typescript_fixture(&[("batch.ts", BATCH_CALL_SOURCE)]);
+        let file = ProjectFile::new(fixture.project_root(), "batch.ts");
+        let artifact = artifact_for(&fixture, &file);
+        let calls = all_call_sites(&artifact);
+        assert_eq!(calls.len(), 2, "the fixture has two external calls");
+        let oracle = fixture.analyzer.semantic_oracle_provider();
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let mut request = SemanticRequest::new(&mut budget, &cancellation);
+        let mut session =
+            oracle.prepare_source_dispatch_session_in_artifact(complete_materialization(&artifact));
+
+        let first = session
+            .resolve_at_source(calls[0].1, &mut request)
+            .expect("first requested dispatch");
+        assert!(!matches!(first, SemanticOutcome::Cancelled { .. }));
+        assert_eq!(first.work().source_bytes, BATCH_CALL_SOURCE.len());
+
+        cancellation.cancel();
+        let second = session
+            .resolve_at_source(calls[1].1, &mut request)
+            .expect("second requested dispatch");
+        let SemanticOutcome::Cancelled { work, .. } = second else {
+            panic!("only the call requested after cancellation is cancelled: {second:?}");
+        };
+        assert_eq!(work.source_bytes, 0);
+        assert_eq!(work.call_sites, 0);
+        assert_eq!(work.nested_entries, 0);
+    }
+
+    #[test]
+    fn procedure_dispatch_v2_is_order_independent_and_rotates_coverage_and_refinement() {
+        let candidate_a = StableDigest::sha256(b"candidate-a");
+        let candidate_b = StableDigest::sha256(b"candidate-b");
+        let boundary_a = StableDigest::sha256(b"boundary-a");
+        let boundary_b = StableDigest::sha256(b"boundary-b");
+        let baseline = procedure_dispatch_components_digest(
+            CandidateCoverage::Open,
+            false,
+            &mut [candidate_a, candidate_b],
+            &mut [boundary_a, boundary_b],
+        );
+        assert_eq!(
+            baseline,
+            procedure_dispatch_components_digest(
+                CandidateCoverage::Open,
+                false,
+                &mut [candidate_b, candidate_a],
+                &mut [boundary_b, boundary_a],
+            ),
+            "candidate and boundary iteration order is not answer semantics"
+        );
+        assert_ne!(
+            baseline,
+            procedure_dispatch_components_digest(
+                CandidateCoverage::Truncated,
+                false,
+                &mut [candidate_a, candidate_b],
+                &mut [boundary_a, boundary_b],
+            ),
+            "coverage is a binding-relevant axis"
+        );
+        assert_ne!(
+            baseline,
+            procedure_dispatch_components_digest(
+                CandidateCoverage::Open,
+                true,
+                &mut [candidate_a, candidate_b],
+                &mut [boundary_a, boundary_b],
+            ),
+            "the typed feedback-refinement exception is a planning-relevant axis"
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "bc14f106eeaa: repeated source dispatch reparsed the same caller and duplicated materialization work"
+    )]
     fn prepared_source_dispatch_session_reports_materialization_work_once() {
         let fixture = typescript_fixture(&[("batch.ts", BATCH_CALL_SOURCE)]);
         let file = ProjectFile::new(fixture.project_root(), "batch.ts");
@@ -1811,7 +2374,56 @@ mod tests {
         assert_eq!(second.work(), baseline_second.work());
     }
 
+    /// Every call-site projection walked and charged every procedure of its
+    /// file, so a file of N functions cost N procedures per range. A range now
+    /// charges only the procedures whose call-site mappings can contain it.
     #[test]
+    #[hardwon("6287e19f0597: a source range charged every procedure of its file")]
+    fn source_projection_charges_only_the_procedures_that_contain_the_range() {
+        let mut source = String::from("import { open } from \"third-party\";\n");
+        for index in 0..32 {
+            source.push_str(&format!(
+                "export function f{index}() {{ open(\"{index}\"); }}\n"
+            ));
+        }
+        let fixture = typescript_fixture(&[("many.ts", &source)]);
+        let file = ProjectFile::new(fixture.project_root(), "many.ts");
+        let artifact = artifact_for(&fixture, &file);
+        assert!(
+            artifact.procedures().len() >= 32,
+            "the fixture must have one procedure per function"
+        );
+        let calls = all_call_sites(&artifact);
+        assert_eq!(
+            calls.len(),
+            32,
+            "the fixture has one external call per function"
+        );
+        let oracle = fixture.analyzer.semantic_oracle_provider();
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let mut request = SemanticRequest::new(&mut budget, &cancellation);
+        let mut session =
+            oracle.prepare_source_dispatch_session_in_artifact(complete_materialization(&artifact));
+        for (call, range) in &calls {
+            let outcome = session
+                .resolve_at_source(*range, &mut request)
+                .expect("prepared source dispatch");
+            assert_eq!(
+                outcome.work().procedures,
+                1,
+                "a range inside one function examines only that function, not the {} procedures of the file",
+                artifact.procedures().len()
+            );
+            let result = outcome
+                .available_value()
+                .expect("external call retains a dispatch result");
+            assert_eq!(result.observations()[0].call(), call);
+        }
+    }
+
+    #[test]
+    #[hardwon("bc14f106eeaa: prepared syntax reuse must stay bound to its logical budget scope")]
     fn prepared_source_dispatch_session_rejects_an_unrelated_budget_scope() {
         let fixture = typescript_fixture(&[("batch.ts", BATCH_CALL_SOURCE)]);
         let file = ProjectFile::new(fixture.project_root(), "batch.ts");
@@ -1858,6 +2470,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "bc14f106eeaa: prepared dispatch must preserve requested result order for distinct callees"
+    )]
     fn source_dispatch_session_preserves_reverse_order_for_distinct_targets() {
         let fixture = typescript_fixture(&[("ordered.ts", DISTINCT_CALL_SOURCE)]);
         let file = ProjectFile::new(fixture.project_root(), "ordered.ts");
@@ -1920,6 +2535,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "bc14f106eeaa: non-call ranges must not eagerly parse or charge source before dispatch is requested"
+    )]
     fn source_dispatch_session_defers_parse_until_a_range_contains_a_call() {
         let fixture = typescript_fixture(&[("batch.ts", BATCH_CALL_SOURCE)]);
         let file = ProjectFile::new(fixture.project_root(), "batch.ts");
@@ -1961,40 +2579,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn source_dispatch_session_cancellation_does_not_reclassify_prior_calls() {
-        let fixture = typescript_fixture(&[("batch.ts", BATCH_CALL_SOURCE)]);
-        let file = ProjectFile::new(fixture.project_root(), "batch.ts");
-        let artifact = artifact_for(&fixture, &file);
-        let calls = all_call_sites(&artifact);
-        assert_eq!(calls.len(), 2, "the fixture has two external calls");
-        let oracle = fixture.analyzer.semantic_oracle_provider();
-        let cancellation = CancellationToken::default();
-        let mut budget = SemanticBudget::default();
-        let mut request = SemanticRequest::new(&mut budget, &cancellation);
-        let mut session =
-            oracle.prepare_source_dispatch_session_in_artifact(complete_materialization(&artifact));
-
-        let first = session
-            .resolve_at_source(calls[0].1, &mut request)
-            .expect("first requested dispatch");
-        assert!(!matches!(first, SemanticOutcome::Cancelled { .. }));
-        assert_eq!(first.work().source_bytes, BATCH_CALL_SOURCE.len());
-
-        cancellation.cancel();
-        let second = session
-            .resolve_at_source(calls[1].1, &mut request)
-            .expect("second requested dispatch");
-        let SemanticOutcome::Cancelled { work, .. } = second else {
-            panic!("only the call requested after cancellation is cancelled: {second:?}");
-        };
-        assert_eq!(work.source_bytes, 0);
-        assert_eq!(work.call_sites, 0);
-        assert_eq!(work.nested_entries, 0);
-    }
-
-    /// #1477 Milestone 4: the source-position seam must publish exactly the
-    /// answer the `CallSiteHandle` path publishes, not an approximation of it.
     #[test]
     fn dispatch_at_source_agrees_with_the_call_site_handle_path() {
         let fixture = typescript_fixture(&[("call.ts", CALL_SOURCE)]);
@@ -2056,50 +2640,9 @@ mod tests {
     }
 
     #[test]
-    fn procedure_dispatch_v2_is_order_independent_and_rotates_coverage_and_refinement() {
-        let candidate_a = StableDigest::sha256(b"candidate-a");
-        let candidate_b = StableDigest::sha256(b"candidate-b");
-        let boundary_a = StableDigest::sha256(b"boundary-a");
-        let boundary_b = StableDigest::sha256(b"boundary-b");
-        let baseline = procedure_dispatch_components_digest(
-            CandidateCoverage::Open,
-            false,
-            &mut [candidate_a, candidate_b],
-            &mut [boundary_a, boundary_b],
-        );
-        assert_eq!(
-            baseline,
-            procedure_dispatch_components_digest(
-                CandidateCoverage::Open,
-                false,
-                &mut [candidate_b, candidate_a],
-                &mut [boundary_b, boundary_a],
-            ),
-            "candidate and boundary iteration order is not answer semantics"
-        );
-        assert_ne!(
-            baseline,
-            procedure_dispatch_components_digest(
-                CandidateCoverage::Truncated,
-                false,
-                &mut [candidate_a, candidate_b],
-                &mut [boundary_a, boundary_b],
-            ),
-            "coverage is a binding-relevant axis"
-        );
-        assert_ne!(
-            baseline,
-            procedure_dispatch_components_digest(
-                CandidateCoverage::Open,
-                true,
-                &mut [candidate_a, candidate_b],
-                &mut [boundary_a, boundary_b],
-            ),
-            "the typed feedback-refinement exception is a planning-relevant axis"
-        );
-    }
-
-    #[test]
+    #[hardwon(
+        "840fffe45997: dispatch certificates omitted candidate and boundary evidence axes, allowing stale reuse"
+    )]
     fn procedure_dispatch_v2_rotates_candidate_and_boundary_evidence_axes() {
         let fixture =
             typescript_fixture(&[("call.ts", CALL_SOURCE), ("external.ts", BATCH_CALL_SOURCE)]);
@@ -2188,6 +2731,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "840fffe45997: dispatch certificates omitted answer quality and v1 identity, allowing stale reuse"
+    )]
     fn procedure_dispatch_v2_rotates_quality_and_cannot_equal_a_v1_answer() {
         let fixture = typescript_fixture(&[("call.ts", CALL_SOURCE)]);
         let file = ProjectFile::new(fixture.project_root(), "call.ts");
@@ -2244,8 +2790,6 @@ mod tests {
         );
     }
 
-    /// A position that no call site covers is unknown. It must never publish
-    /// an empty target set that a policy could read as a proven zero.
     #[test]
     fn dispatch_at_source_without_a_call_site_is_unknown() {
         let fixture = typescript_fixture(&[("call.ts", CALL_SOURCE)]);
@@ -2277,8 +2821,6 @@ mod tests {
         );
     }
 
-    /// A file the workspace cannot materialize keeps the materialization's own
-    /// unsupported capability rather than reporting an empty dispatch set.
     #[test]
     fn dispatch_at_source_in_an_unsupported_file_is_unsupported() {
         let fixture =
@@ -2312,7 +2854,6 @@ mod tests {
         assert!(partial.is_none(), "{partial:?}");
     }
 
-    /// Cancellation before any work is a cancelled outcome, not an empty one.
     #[test]
     fn dispatch_at_source_reports_cancellation() {
         let fixture = typescript_fixture(&[("call.ts", CALL_SOURCE)]);

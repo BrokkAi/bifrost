@@ -1,0 +1,632 @@
+{
+  "schema_version": 2,
+  "pack_id": "bifrost.rust-reqwest",
+  "version": "0.1.0",
+  "producer": {
+    "name": "bifrost-reviewed-codeql-rust-parity",
+    "version": "0.1.0"
+  },
+  "language": "rust",
+  "ecosystem": "cargo",
+  "compatibility": {
+    "bifrost": ">=0.12.0, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "reqwest request construction and send APIs used by the CodeQL Rust RequestForgery parity rule",
+    "revision": "reqwest-api-shape"
+  },
+  "license": "Apache-2.0",
+  "completeness": "complete",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "declarations.rust-reqwest",
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {
+            "id": "type.rust-reqwest",
+            "name": "reqwest",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/lib.rs",
+              "symbol": "reqwest"
+            }
+          },
+          {
+            "id": "type.rust-reqwest-blocking",
+            "name": "reqwest.blocking",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/blocking/mod.rs",
+              "symbol": "reqwest.blocking"
+            }
+          },
+          {
+            "id": "type.rust-reqwest-client",
+            "name": "reqwest.Client",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/async_impl/client.rs",
+              "symbol": "reqwest.Client"
+            }
+          },
+          {
+            "id": "type.rust-reqwest-request-builder",
+            "name": "reqwest.RequestBuilder",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/async_impl/request.rs",
+              "symbol": "reqwest.RequestBuilder"
+            }
+          },
+          {
+            "id": "type.rust-reqwest-response",
+            "name": "reqwest.Response",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/async_impl/response.rs",
+              "symbol": "reqwest.Response"
+            }
+          }
+        ],
+        "members": [
+          {
+            "id": "member.rust-reqwest.get",
+            "owner": "type.rust-reqwest",
+            "name": "get",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "url",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "reqwest.RequestBuilder"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/async_impl/request.rs",
+              "symbol": "reqwest.get"
+            }
+          },
+          {
+            "id": "member.rust-reqwest.blocking-get",
+            "owner": "type.rust-reqwest-blocking",
+            "name": "get",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "url",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "reqwest.RequestBuilder"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/blocking/client.rs",
+              "symbol": "reqwest.blocking.get"
+            }
+          },
+          {
+            "id": "member.rust-reqwest-client-new",
+            "owner": "type.rust-reqwest-client",
+            "name": "new",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "reqwest.Client"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/async_impl/client.rs",
+              "symbol": "reqwest.Client.new"
+            }
+          },
+          {
+            "id": "member.rust-reqwest-client-get",
+            "owner": "type.rust-reqwest-client",
+            "name": "get",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "url",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "reqwest.RequestBuilder"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/async_impl/client.rs",
+              "symbol": "reqwest.Client.get"
+            }
+          },
+          {
+            "id": "member.rust-reqwest-client-post",
+            "owner": "type.rust-reqwest-client",
+            "name": "post",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "url",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "reqwest.RequestBuilder"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/async_impl/client.rs",
+              "symbol": "reqwest.Client.post"
+            }
+          },
+          {
+            "id": "member.rust-reqwest-client-put",
+            "owner": "type.rust-reqwest-client",
+            "name": "put",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "url",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "reqwest.RequestBuilder"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/async_impl/client.rs",
+              "symbol": "reqwest.Client.put"
+            }
+          },
+          {
+            "id": "member.rust-reqwest-client-patch",
+            "owner": "type.rust-reqwest-client",
+            "name": "patch",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "url",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "reqwest.RequestBuilder"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/async_impl/client.rs",
+              "symbol": "reqwest.Client.patch"
+            }
+          },
+          {
+            "id": "member.rust-reqwest-client-delete",
+            "owner": "type.rust-reqwest-client",
+            "name": "delete",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "url",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "reqwest.RequestBuilder"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/async_impl/client.rs",
+              "symbol": "reqwest.Client.delete"
+            }
+          },
+          {
+            "id": "member.rust-reqwest-client-head",
+            "owner": "type.rust-reqwest-client",
+            "name": "head",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "url",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "reqwest.RequestBuilder"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/async_impl/client.rs",
+              "symbol": "reqwest.Client.head"
+            }
+          },
+          {
+            "id": "member.rust-reqwest-client-request",
+            "owner": "type.rust-reqwest-client",
+            "name": "request",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "method",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                },
+                {
+                  "name": "url",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "reqwest.RequestBuilder"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/async_impl/client.rs",
+              "symbol": "reqwest.Client.request"
+            }
+          },
+          {
+            "id": "member.rust-reqwest-request-builder-send",
+            "owner": "type.rust-reqwest-request-builder",
+            "name": "send",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "reqwest.Response"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/async_impl/request.rs",
+              "symbol": "reqwest.RequestBuilder.send"
+            }
+          }
+        ],
+        "relations": []
+      }
+    },
+    {
+      "id": "summaries.rust-reqwest",
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "summary.rust-reqwest.get",
+            "target": {
+              "path": "src/async_impl/request.rs",
+              "symbol": "reqwest.get",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": { "kind": "parameter", "ordinal": 0 },
+                "exit_kind": "normal",
+                "output": { "kind": "normal_return" }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-reqwest.blocking-get",
+            "target": {
+              "path": "src/blocking/client.rs",
+              "symbol": "reqwest.blocking.get",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": { "kind": "parameter", "ordinal": 0 },
+                "exit_kind": "normal",
+                "output": { "kind": "normal_return" }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-reqwest.client-new",
+            "target": {
+              "path": "src/async_impl/client.rs",
+              "symbol": "reqwest.Client.new",
+              "has_receiver": false,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.rust-reqwest.client.new.result",
+                "output": { "kind": "normal_return" }
+              }
+            ]
+          },
+          {
+            "id": "summary.rust-reqwest.client-get",
+            "target": {
+              "path": "src/async_impl/client.rs",
+              "symbol": "reqwest.Client.get",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": { "kind": "parameter", "ordinal": 0 },
+                "exit_kind": "normal",
+                "output": { "kind": "normal_return" }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-reqwest.client-post",
+            "target": {
+              "path": "src/async_impl/client.rs",
+              "symbol": "reqwest.Client.post",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": { "kind": "parameter", "ordinal": 0 },
+                "exit_kind": "normal",
+                "output": { "kind": "normal_return" }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-reqwest.client-put",
+            "target": {
+              "path": "src/async_impl/client.rs",
+              "symbol": "reqwest.Client.put",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": { "kind": "parameter", "ordinal": 0 },
+                "exit_kind": "normal",
+                "output": { "kind": "normal_return" }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-reqwest.client-patch",
+            "target": {
+              "path": "src/async_impl/client.rs",
+              "symbol": "reqwest.Client.patch",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": { "kind": "parameter", "ordinal": 0 },
+                "exit_kind": "normal",
+                "output": { "kind": "normal_return" }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-reqwest.client-delete",
+            "target": {
+              "path": "src/async_impl/client.rs",
+              "symbol": "reqwest.Client.delete",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": { "kind": "parameter", "ordinal": 0 },
+                "exit_kind": "normal",
+                "output": { "kind": "normal_return" }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-reqwest.client-head",
+            "target": {
+              "path": "src/async_impl/client.rs",
+              "symbol": "reqwest.Client.head",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": { "kind": "parameter", "ordinal": 0 },
+                "exit_kind": "normal",
+                "output": { "kind": "normal_return" }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-reqwest.client-request",
+            "target": {
+              "path": "src/async_impl/client.rs",
+              "symbol": "reqwest.Client.request",
+              "has_receiver": true,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": { "kind": "parameter", "ordinal": 1 },
+                "exit_kind": "normal",
+                "output": { "kind": "normal_return" }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-reqwest.request-builder-send",
+            "target": {
+              "path": "src/async_impl/request.rs",
+              "symbol": "reqwest.RequestBuilder.send",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": { "kind": "receiver" },
+                "exit_kind": "normal",
+                "output": { "kind": "normal_return" }
+              }
+            ],
+            "effects": []
+          }
+        ]
+      }
+    }
+  ]
+}

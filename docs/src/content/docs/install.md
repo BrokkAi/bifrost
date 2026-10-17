@@ -52,8 +52,17 @@ npx -y @brokkai/bifrost --version
 ```
 
 The root package installs one checksum-verified native package for the current
-supported operating system and CPU. On Linux it requires glibc; musl platforms
-are rejected. It does not download or build Bifrost during installation.
+operating system and CPU. It does not download or build Bifrost during
+installation. Native packages exist for these platforms:
+
+| Operating system | CPU |
+| --- | --- |
+| macOS (one universal package) | Apple Silicon and Intel |
+| Linux with glibc | x64 and ARM64 |
+| Android | ARM64 |
+| Windows | x64 and ARM64 |
+
+Linux with musl, such as Alpine, is not supported.
 Upgrade it with `npm update -g @brokkai/bifrost`. Remove it with
 `npm uninstall -g @brokkai/bifrost`.
 
@@ -74,9 +83,23 @@ Claude Code, OpenCode, Kimi Code, Hermes, and Oh My Pi clients. It starts
 Bifrost with the `core` toolset. The server starts without a fixed
 project and uses the workspace root that the client supplies for each session.
 
-The command skips clients that are not installed. It does not install client
-applications, skills, instruction files, or extensions. Run it again after the
-Bifrost executable moves to a different path.
+The command finds clients by these command names on `PATH`:
+
+| Client | Command | How Bifrost registers the server |
+| --- | --- | --- |
+| Codex | `codex` | Runs `codex mcp add`. |
+| Claude Code | `claude` | Runs `claude mcp add` with user scope. If a user-level `brokk` entry already exists, Bifrost removes it and adds it again. |
+| OpenCode | `opencode2`, or else `opencode` | Runs `opencode2 mcp add`. For `opencode`, writes the `brokk` entry into `opencode/opencode.json` in the user configuration directory. |
+| Kimi Code | `kimi` | Runs `kimi mcp add`. |
+| Hermes | `hermes` | Runs `hermes mcp add` and checks the result. |
+| Oh My Pi | `omp` | Writes the `brokk` entry into `mcp.json` in the directory that `omp config path` prints. |
+
+The command skips clients that are not installed. If it finds no client, it
+prints `No supported coding host was found` and exits 1. If registration fails
+for a client, the command still tries the others, then reports every failure
+and exits 1. It does not install client applications, skills, instruction
+files, or extensions. Run it again after the Bifrost executable moves to a
+different path. `--install` cannot be combined with any other flag.
 
 Oh My Pi receives a native user MCP entry. It reads Bifrost's standard MCP instructions and adds them to its model prompt.
 
@@ -159,16 +182,11 @@ less install.sh
 bash install.sh
 ```
 
-The script accepts these environment variables:
-
-| Variable | Purpose |
-| --- | --- |
-| `INSTALL_DIR` | Install directory. Defaults to `~/.local/bin`. |
-| `BIFROST_INSTALL_DIR` | Same as `INSTALL_DIR`, with higher precedence. |
-| `BIFROST_VERSION` | Release tag to install, for example `v0.8.17`. Defaults to the latest release. |
-| `BIFROST_GITHUB_OWNER` | GitHub owner to download from. Defaults to `BrokkAi`. |
-| `GITHUB_TOKEN` | Token used for GitHub API rate limits. |
-| `PROFILE` | Shell profile to update when the install directory is not on `PATH`. |
+The script reads `BIFROST_VERSION` to choose a release and `INSTALL_DIR` or
+`BIFROST_INSTALL_DIR` to choose the directory. It also reads
+`BIFROST_GITHUB_OWNER`, `GITHUB_TOKEN`, and `PROFILE`. See
+[Environment Variables](/reference/environment/#install-script) for each
+variable's values and default.
 
 Pin a version and choose the directory like this:
 
@@ -223,4 +241,4 @@ Or install it with pip:
 pip install brokk-bifrost-searchtools
 ```
 
-Import it as `bifrost_searchtools`. See [Python Client](../python-client/) for the API surface and local development workflow.
+Import it as `bifrost_searchtools`. See [Python Client](/python-client/) for the API surface and local development workflow.

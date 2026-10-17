@@ -20,6 +20,13 @@ use std::sync::{Arc, Mutex, OnceLock};
 type MemberLookupKey = (Language, String, String, String);
 type StructuredMemberLookupKey = (Language, FqName, String);
 
+// Bounded C++ receiver resolution may ask the same indexed name from many
+// call sites in one request. Keep only small, complete answers: the cache is
+// request-scoped and its entry/row caps keep a repeated-name workload from
+// retaining a workspace-sized result set.
+const LIMITED_LOOKUP_CACHE_MAX_ENTRIES: usize = 512;
+const LIMITED_LOOKUP_CACHE_MAX_ROWS: usize = 32;
+
 pub(crate) trait ForwardQueryProvider {
     fn normalize_rendered_name(&self, fqn: &str) -> String;
     /// The structured name a rendered spelling addresses, when the language's
@@ -134,12 +141,80 @@ pub struct DefinitionLookupMemo {
     fqn_cache: Mutex<HashMap<(Language, String), Vec<CodeUnit>>>,
     normalized_fqn_cache: Mutex<HashMap<(Language, String), Vec<CodeUnit>>>,
     identifier_cache: Mutex<HashMap<(Language, String), Vec<CodeUnit>>>,
+    limited_fqn_cache: Mutex<HashMap<(Language, bool, String), Vec<CodeUnit>>>,
+    limited_identifier_cache: Mutex<HashMap<(Language, String), Vec<CodeUnit>>>,
     file_identifier_cache: Mutex<HashMap<(ProjectFile, String), Vec<CodeUnit>>>,
     children_cache: Mutex<HashMap<(Language, String), Vec<CodeUnit>>>,
     members_cache: Mutex<HashMap<MemberLookupKey, Vec<CodeUnit>>>,
     structured_members_cache: Mutex<HashMap<StructuredMemberLookupKey, Vec<CodeUnit>>>,
     package_cache: Mutex<HashMap<(Language, String), bool>>,
     prefix_cache: Mutex<HashMap<(Language, String), bool>>,
+}
+
+impl DefinitionLookupMemo {
+    pub(crate) fn limited_fqn(
+        &self,
+        language: Language,
+        normalized: bool,
+        fqn: &str,
+    ) -> Option<Vec<CodeUnit>> {
+        self.limited_fqn_cache
+            .lock()
+            .expect("limited definition fqn cache poisoned")
+            .get(&(language, normalized, fqn.to_owned()))
+            .cloned()
+    }
+
+    pub(crate) fn remember_limited_fqn(
+        &self,
+        language: Language,
+        normalized: bool,
+        fqn: &str,
+        units: Vec<CodeUnit>,
+    ) {
+        if units.len() > LIMITED_LOOKUP_CACHE_MAX_ROWS {
+            return;
+        }
+        let mut cache = self
+            .limited_fqn_cache
+            .lock()
+            .expect("limited definition fqn cache poisoned");
+        let key = (language, normalized, fqn.to_owned());
+        if cache.len() < LIMITED_LOOKUP_CACHE_MAX_ENTRIES || cache.contains_key(&key) {
+            cache.insert(key, units);
+        }
+    }
+
+    pub(crate) fn limited_identifier(
+        &self,
+        language: Language,
+        identifier: &str,
+    ) -> Option<Vec<CodeUnit>> {
+        self.limited_identifier_cache
+            .lock()
+            .expect("limited definition identifier cache poisoned")
+            .get(&(language, identifier.to_owned()))
+            .cloned()
+    }
+
+    pub(crate) fn remember_limited_identifier(
+        &self,
+        language: Language,
+        identifier: &str,
+        units: Vec<CodeUnit>,
+    ) {
+        if units.len() > LIMITED_LOOKUP_CACHE_MAX_ROWS {
+            return;
+        }
+        let mut cache = self
+            .limited_identifier_cache
+            .lock()
+            .expect("limited definition identifier cache poisoned");
+        let key = (language, identifier.to_owned());
+        if cache.len() < LIMITED_LOOKUP_CACHE_MAX_ENTRIES || cache.contains_key(&key) {
+            cache.insert(key, units);
+        }
+    }
 }
 
 /// A forward-query view over an analyzer.  Keeping this separate from the
@@ -621,26 +696,94 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
             ));
     }
 
-    fn fqn_for_language_unrecorded(&self, fqn: &str, language: Language) -> Vec<CodeUnit> {
-        let key = (language, fqn.to_string());
-        if let Some(cached) = self
-            .memo
-            .fqn_cache
-            .lock()
-            .expect("definition fqn cache poisoned")
-            .get(&key)
-        {
+    fn memoized_units<K: Eq + std::hash::Hash>(
+        &self,
+        cache: &Mutex<HashMap<K, Vec<CodeUnit>>>,
+        key: K,
+        poison_message: &'static str,
+        compute: impl FnOnce() -> Vec<CodeUnit>,
+    ) -> Vec<CodeUnit> {
+        if let Some(cached) = cache.lock().expect(poison_message).get(&key) {
             return cached.clone();
         }
-        let matches = self.exact_for_language(fqn, language);
+        let units = compute();
         if self.can_publish() {
-            self.memo
-                .fqn_cache
+            cache
                 .lock()
-                .expect("definition fqn cache poisoned")
-                .insert(key, matches.clone());
+                .expect(poison_message)
+                .insert(key, units.clone());
         }
-        matches
+        units
+    }
+
+    fn fqn_for_language_unrecorded(&self, fqn: &str, language: Language) -> Vec<CodeUnit> {
+        let key = (language, fqn.to_string());
+        self.memoized_units(
+            &self.memo.fqn_cache,
+            key,
+            "definition fqn cache poisoned",
+            || self.exact_for_language(fqn, language),
+        )
+    }
+
+    fn fqn_for_languages(
+        &self,
+        fqn: &str,
+        languages: impl IntoIterator<Item = Language>,
+    ) -> Vec<CodeUnit> {
+        let mut units = languages
+            .into_iter()
+            .flat_map(|language| self.fqn_for_language(fqn, language))
+            .collect::<Vec<_>>();
+        sort_units(&mut units);
+        units.dedup();
+        units
+    }
+
+    fn sorted_definition_units(
+        values: Vec<RelationalDefinitionValue>,
+        shape_error: &'static str,
+    ) -> Vec<CodeUnit> {
+        let mut units = values
+            .into_iter()
+            .flat_map(|value| match value {
+                RelationalDefinitionValue::Definitions(units) => units,
+                _ => panic!("{shape_error}"),
+            })
+            .collect::<Vec<_>>();
+        sort_units(&mut units);
+        units.dedup();
+        units
+    }
+
+    fn structural_members(
+        &self,
+        language: Language,
+        owners: impl IntoIterator<Item = RelationalName>,
+        name: &str,
+        shape_error: &'static str,
+    ) -> Vec<CodeUnit> {
+        let query = RelationalDefinitionQuery::StructuralMembers {
+            identifier: name.to_string(),
+        };
+        let values = self.query_values(
+            language,
+            owners
+                .into_iter()
+                .map(|owner| (owner, query.clone()))
+                .collect(),
+        );
+        Self::sorted_definition_units(values, shape_error)
+    }
+
+    fn package_exists_in_languages(
+        &self,
+        package: &str,
+        languages: impl IntoIterator<Item = Language>,
+    ) -> bool {
+        languages
+            .into_iter()
+            .any(|language| self.package_exists_in_language(package, language))
     }
 
     /// Resolve many rendered names into the shared fqn memo with two batched
@@ -846,35 +989,10 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
         let mut identifiers_by_fqn = Vec::with_capacity(misses.len());
         for (fqn, _) in &misses {
             let identifiers = self.rendered_identifier_candidates(language, fqn);
-            for identifier in &identifiers {
-                if let Some(name) = Self::identifier_name(identifier) {
-                    fallback_queries
-                        .push((name, RelationalDefinitionQuery::Identifier { file: None }));
-                    fallback_owner.push(identifiers_by_fqn.len());
-                }
-                for seek in decorated_identifier_seeks(language, identifier) {
-                    match seek {
-                        IdentifierSeek::Exact(spelling) => {
-                            if let Some(name) = Self::identifier_name(&spelling) {
-                                fallback_queries.push((
-                                    name,
-                                    RelationalDefinitionQuery::Identifier { file: None },
-                                ));
-                                fallback_owner.push(identifiers_by_fqn.len());
-                            }
-                        }
-                        IdentifierSeek::Prefix(prefix) => {
-                            if let Some(name) = Self::identifier_name(&prefix) {
-                                fallback_queries.push((
-                                    name,
-                                    RelationalDefinitionQuery::IdentifierPrefix { file: None },
-                                ));
-                                fallback_owner.push(identifiers_by_fqn.len());
-                            }
-                        }
-                    }
-                }
-            }
+            let owner = identifiers_by_fqn.len();
+            let queries = Self::identifier_queries(language, &identifiers, None);
+            fallback_owner.extend(std::iter::repeat_n(owner, queries.len()));
+            fallback_queries.extend(queries);
             identifiers_by_fqn.push(identifiers);
         }
         let mut units_by_fqn: Vec<Vec<CodeUnit>> = vec![Vec::new(); misses.len()];
@@ -911,6 +1029,13 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
     }
 }
 
+pub(super) fn package_exists_value(value: &RelationalDefinitionValue) -> bool {
+    matches!(
+        value,
+        RelationalDefinitionValue::PackageRelation(PackageRelationValue::Exists(true))
+    )
+}
+
 fn analyzer_for_language(
     analyzer: &dyn IAnalyzer,
     language: Language,
@@ -920,13 +1045,7 @@ fn analyzer_for_language(
 
 impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
     fn fqn(&self, fqn: &str) -> Vec<CodeUnit> {
-        let mut units = self
-            .query_languages()
-            .into_iter()
-            .flat_map(|language| self.fqn_for_language(fqn, language))
-            .collect::<Vec<_>>();
-        sort_units(&mut units);
-        units.dedup();
+        let units = self.fqn_for_languages(fqn, self.query_languages());
         if self.analyzer.read_ledger_attached()
             && *self
                 .language
@@ -944,12 +1063,7 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
     }
 
     fn fqn_in_any_language(&self, fqn: &str) -> Vec<CodeUnit> {
-        let mut units = Vec::new();
-        for language in self.workspace_languages() {
-            units.extend(self.fqn_for_language(fqn, *language));
-        }
-        sort_units(&mut units);
-        units.dedup();
+        let units = self.fqn_for_languages(fqn, self.workspace_languages().iter().copied());
         self.record_resolved_name(fqn, None, &units);
         units
     }
@@ -958,27 +1072,17 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
         let mut units = Vec::new();
         for language in self.query_languages() {
             let key = (language, normalized.to_string());
-            if let Some(cached) = self
-                .memo
-                .normalized_fqn_cache
-                .lock()
-                .expect("normalized definition cache poisoned")
-                .get(&key)
-            {
-                units.extend(cached.clone());
-                continue;
-            }
-            let mut matches = self.normalized_for_language(normalized, language);
-            sort_units(&mut matches);
-            matches.dedup();
-            if self.can_publish() {
-                self.memo
-                    .normalized_fqn_cache
-                    .lock()
-                    .expect("normalized definition cache poisoned")
-                    .insert(key, matches.clone());
-            }
-            units.extend(matches);
+            units.extend(self.memoized_units(
+                &self.memo.normalized_fqn_cache,
+                key,
+                "normalized definition cache poisoned",
+                || {
+                    let mut matches = self.normalized_for_language(normalized, language);
+                    sort_units(&mut matches);
+                    matches.dedup();
+                    matches
+                },
+            ));
         }
         sort_units(&mut units);
         units.dedup();
@@ -1018,9 +1122,7 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
     }
 
     fn package_exists_in_any_language(&self, package: &str) -> bool {
-        self.workspace_languages()
-            .iter()
-            .any(|language| self.package_exists_in_language(package, *language))
+        self.package_exists_in_languages(package, self.workspace_languages().iter().copied())
     }
 
     fn file_identifier(&self, file: &ProjectFile, ident: &str) -> Vec<CodeUnit> {
@@ -1107,22 +1209,16 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
             }
             owner_names.sort_by_cached_key(|name| name.full_name().display(segment_interner()));
             owner_names.dedup();
-            let mut children = self
-                .query_values(
+            let children = Self::sorted_definition_units(
+                self.query_values(
                     language,
                     owner_names
                         .into_iter()
                         .map(|owner| (owner, RelationalDefinitionQuery::StructuralChildren))
                         .collect(),
-                )
-                .into_iter()
-                .flat_map(|value| match value {
-                    RelationalDefinitionValue::Definitions(units) => units,
-                    _ => panic!("a structural-children query returned the wrong result shape"),
-                })
-                .collect::<Vec<_>>();
-            sort_units(&mut children);
-            children.dedup();
+                ),
+                "a structural-children query returned the wrong result shape",
+            );
             if self.can_publish() {
                 self.memo
                     .children_cache
@@ -1178,25 +1274,12 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
             }
             owner_names.sort_by_cached_key(|name| name.full_name().display(segment_interner()));
             owner_names.dedup();
-            let query = RelationalDefinitionQuery::StructuralMembers {
-                identifier: name.to_string(),
-            };
-            let mut members = self
-                .query_values(
-                    language,
-                    owner_names
-                        .into_iter()
-                        .map(|owner| (owner, query.clone()))
-                        .collect(),
-                )
-                .into_iter()
-                .flat_map(|value| match value {
-                    RelationalDefinitionValue::Definitions(units) => units,
-                    _ => panic!("a structural-member query returned the wrong result shape"),
-                })
-                .collect::<Vec<_>>();
-            sort_units(&mut members);
-            members.dedup();
+            let members = self.structural_members(
+                language,
+                owner_names,
+                name,
+                "a structural-member query returned the wrong result shape",
+            );
             if self.can_publish() {
                 self.memo
                     .members_cache
@@ -1224,24 +1307,12 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
             return cached.clone();
         }
         let relational_owner = self.relational_name_for_unit(language, owner);
-        let values = self.query_values(
+        let members = self.structural_members(
             language,
-            vec![(
-                relational_owner,
-                RelationalDefinitionQuery::StructuralMembers {
-                    identifier: name.to_string(),
-                },
-            )],
+            std::iter::once(relational_owner),
+            name,
+            "a structured-member query returned the wrong result shape",
         );
-        let mut members = values
-            .into_iter()
-            .flat_map(|value| match value {
-                RelationalDefinitionValue::Definitions(units) => units,
-                _ => panic!("a structured-member query returned the wrong result shape"),
-            })
-            .collect::<Vec<_>>();
-        sort_units(&mut members);
-        members.dedup();
         if self.can_publish() {
             self.memo
                 .structured_members_cache
@@ -1253,9 +1324,7 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
     }
 
     fn package_exists(&self, package: &str) -> bool {
-        self.query_languages()
-            .into_iter()
-            .any(|language| self.package_exists_in_language(package, language))
+        self.package_exists_in_languages(package, self.query_languages())
     }
 
     fn package_exists_in_language(&self, package: &str, language: Language) -> bool {
@@ -1276,12 +1345,7 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
                 RelationalDefinitionQuery::PackageRelation(PackageRelationKind::Exists),
             )],
         );
-        let exists = matches!(
-            values.pop(),
-            Some(RelationalDefinitionValue::PackageRelation(
-                PackageRelationValue::Exists(true)
-            ))
-        );
+        let exists = values.pop().as_ref().is_some_and(package_exists_value);
         if self.can_publish() {
             self.memo
                 .package_cache
@@ -1349,6 +1413,7 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
 mod definition_lookup_tests {
     use super::*;
     use crate::analyzer::{RubyAnalyzer, TestProject};
+    use brokk_bifrost_test_macros::hardwon;
     use std::path::PathBuf;
 
     /// One lookup's interner calls on this thread, with the answer it produced.
@@ -1373,6 +1438,9 @@ mod definition_lookup_tests {
     /// interner one spelling per separator suffix plus the query's own
     /// identity work, not the suffix x encoding product.
     #[test]
+    #[hardwon(
+        "#3299: a missed Scala name expanded the process-global identifier interner combinatorially"
+    )]
     fn missed_scala_lookup_mints_only_terminal_spellings() {
         use crate::analyzer::ScalaAnalyzer;
         let fixture = crate::inline_project::InlineTestProject::with_language(Language::Scala)
@@ -1398,6 +1466,7 @@ mod definition_lookup_tests {
     /// identifier view at all: that view is the compatibility net for the rows
     /// the structural seek cannot reach, not a second round for every answer.
     #[test]
+    #[hardwon("#3299: a successful Scala lookup still generated the expensive fallback vocabulary")]
     fn resolved_scala_lookup_does_not_expand_identifier_candidates() {
         use crate::analyzer::ScalaAnalyzer;
         let fixture = crate::inline_project::InlineTestProject::with_language(Language::Scala)
@@ -1429,6 +1498,9 @@ mod definition_lookup_tests {
     /// chain that is stored with `$` markers, and the object terminal is
     /// reached through its own `$` decoration.
     #[test]
+    #[hardwon(
+        "#3299: a bounded fallback must keep resolving Scala names stored with object markers"
+    )]
     fn terminal_spelling_vocabulary_still_resolves_encoded_scala_names() {
         use crate::analyzer::ScalaAnalyzer;
         let fixture = crate::inline_project::InlineTestProject::with_language(Language::Scala)
@@ -1461,6 +1533,9 @@ mod definition_lookup_tests {
     }
 
     #[test]
+    #[hardwon(
+        "#3140: empty language delegates multiplied definition lookups and masked later source updates"
+    )]
     fn workspace_lookup_skips_empty_delegates_and_observes_their_first_source() {
         use crate::analyzer::{AnalyzerDelegate, CppAnalyzer, MultiAnalyzer, ScalaAnalyzer};
         use std::collections::{BTreeMap, BTreeSet};
@@ -1532,6 +1607,7 @@ mod definition_lookup_tests {
     }
 
     #[test]
+    #[hardwon("#3078: an incomplete C++ lookup was cached as an authoritative empty result")]
     fn cancelled_relational_lookup_does_not_memoize_an_empty_answer() {
         let fixture = crate::inline_project::InlineTestProject::with_language(Language::Ruby)
             .file("widget.rb", "class Widget\nend\n")
@@ -1565,6 +1641,7 @@ mod definition_lookup_tests {
     }
 
     #[test]
+    #[hardwon("#3078: a failed C++ definition batch could poison later lookup answers")]
     fn failed_relational_lookup_does_not_publish_later_memo_entries() {
         let fixture = crate::inline_project::InlineTestProject::with_language(Language::Ruby)
             .file("widget.rb", "class Widget\nend\n")
@@ -1658,6 +1735,7 @@ mod definition_lookup_tests {
     }
 
     #[test]
+    #[hardwon("#2883: optimized bare-name lookup must preserve file-set membership and ordering")]
     fn file_set_identifier_lookup_matches_the_per_file_union() {
         let project = BareIdentifierProject::new();
         let all_three = [
@@ -1701,6 +1779,9 @@ mod definition_lookup_tests {
     /// costs no store read. Candidate discovery builds one lookup per candidate
     /// file, which is why this is what the scan actually pays.
     #[test]
+    #[hardwon(
+        "#2883: each candidate lookup repeated the same relational answer within one request"
+    )]
     fn lookups_under_one_query_scope_share_one_definition_memo() {
         let project = BareIdentifierProject::new();
         let checkouts = || {
@@ -1734,6 +1815,7 @@ mod definition_lookup_tests {
     /// each lookup owns its own and pays its own store read. Ownership of the
     /// memo is what changes, not what a lookup answers.
     #[test]
+    #[hardwon("#2883: shared request memoization must not outlive the request scope")]
     fn lookups_outside_a_query_scope_keep_their_own_definition_memo() {
         let project = BareIdentifierProject::new();
         let checkouts = || {
@@ -1761,6 +1843,7 @@ mod definition_lookup_tests {
     /// exactly what the unprefetched point path computed -- including the
     /// name that resolves to nothing.
     #[test]
+    #[hardwon("#2743: prefetched Ruby name answers still incurred one store read per visible file")]
     fn prefetched_fqns_answer_from_the_shared_memo_without_store_reads() {
         let project = BareIdentifierProject::new();
         let names = vec!["shared_helper".to_string(), "no_such_name".to_string()];
@@ -1803,6 +1886,7 @@ mod definition_lookup_tests {
     /// the shape of one query; it cannot express how many queries a caller
     /// issues, which is the whole defect here.
     #[test]
+    #[hardwon("#2743: a bare Ruby method lookup paid one relational read for every visible file")]
     fn file_set_identifier_lookup_cost_is_independent_of_the_file_count() {
         let project = BareIdentifierProject::new();
         let all_four = [

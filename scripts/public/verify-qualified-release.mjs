@@ -4,6 +4,8 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { requireNonEmptyString } from "../lib/value-validation.mjs";
+import { parseLongOptionArgs } from "./cli-argument-helpers.mjs";
 
 import { verifyManifest } from "./release-qualification.mjs";
 
@@ -70,37 +72,25 @@ export function qualifiedFile(verified, relativePath) {
 }
 
 export function qualifiedFiles(verified, predicate) {
-  if (typeof predicate !== "function") throw new TypeError("Qualified file predicate must be a function.");
-  return verified.files.filter(predicate).map((entry) => entry.absolutePath);
+  return filteredQualifiedFiles(verified, predicate).map((entry) => entry.absolutePath);
 }
 
 export function qualifiedManifestFiles(verified, predicate) {
+  return filteredQualifiedFiles(verified, predicate).map((entry) => entry.path);
+}
+
+function filteredQualifiedFiles(verified, predicate) {
   if (typeof predicate !== "function") throw new TypeError("Qualified file predicate must be a function.");
-  return verified.files.filter(predicate).map((entry) => entry.path);
+  return verified.files.filter(predicate);
 }
 
 function requiredString(value, label) {
-  if (typeof value !== "string" || value.length === 0) throw new Error(`${label} is required.`);
-  return value;
+  return requireNonEmptyString(value, `${label} is required.`);
 }
 
 function parsePositiveInteger(value, label) {
   if (!/^[1-9][0-9]*$/u.test(value)) throw new Error(`${label} must be a positive integer.`);
   return Number(value);
-}
-
-function parseArgs(args) {
-  const options = {};
-  for (let index = 0; index < args.length; index += 2) {
-    const option = args[index];
-    const value = args[index + 1];
-    if (!option?.startsWith("--") || value === undefined || value.startsWith("--")) {
-      throw new Error("Usage: node scripts/public/verify-qualified-release.mjs verify --bundle DIR --manifest FILE --repository OWNER/REPO --commit SHA --version VERSION [options]");
-    }
-    if (options[option] !== undefined) throw new Error(`${option} may only be provided once.`);
-    options[option] = value;
-  }
-  return options;
 }
 
 function requiredOption(options, name) {
@@ -110,7 +100,10 @@ function requiredOption(options, name) {
 export function main(args = process.argv.slice(2)) {
   const command = args.shift();
   if (command !== "verify") throw new Error("Usage: node scripts/public/verify-qualified-release.mjs verify ...");
-  const options = parseArgs(args);
+  const options = parseLongOptionArgs(
+    args,
+    "Usage: node scripts/public/verify-qualified-release.mjs verify --bundle DIR --manifest FILE --repository OWNER/REPO --commit SHA --version VERSION [options]",
+  );
   const expectedManifestSha256 = options["--manifest-sha256"];
   if (expectedManifestSha256 !== undefined && !/^[0-9a-f]{64}$/u.test(expectedManifestSha256)) {
     throw new Error("--manifest-sha256 must be 64 lowercase hexadecimal characters.");

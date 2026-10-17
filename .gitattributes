@@ -1,5 +1,16 @@
+# SQL resources are included as source text; planner-statistics needles split on LF.
+*.sql text eol=lf
+
 # Policy sources and formatter golds are compared with exact byte ranges.
 *.rqlp text eol=lf
+
+# The py16 comment policy test compares exact comment byte spans; the Python
+# grammar's comment token would include a CRLF checkout's carriage return.
+tests/fixtures/py16-commented-out-code/*.py text eol=lf
+
+# The #5044 escape-boundary census loads fixtures with include_str! and compares
+# them with LF-joined output, so a CRLF checkout must not rewrite these bytes.
+tests/fixtures/issue-5044-escape-boundaries/** text eol=lf
 
 # Typestate canonical contracts are compared byte for byte.
 tests/fixtures/typestate/*.canonical*.json text eol=lf
@@ -16,6 +27,12 @@ docs/src/content/docs/semantic-model-packs.md text eol=lf
 
 # This reviewed upstream artifact is verified by its exact SHA-256 digest.
 tests/fixtures/sarif/sarif-schema-2.1.0.json text eol=lf
+
+# This pinned Go source set is verified by its exact SHA-256 digest.
+tests/fixtures/go_ssh_callbacks/xcrypto/**/*.go text eol=lf
+
+# File-search goldens include exact source lines from this Markdown fixture.
+tests/fixtures/golden/file-search/simple/README.md text eol=lf
 
 # Authored semantic packs are pinned by their exact SHA-256 digests.
 semantic-packs/**/*.json text eol=lf
@@ -37,3 +54,49 @@ tests/suite_issues/issue_3087_namespace_overrun.cc text eol=lf whitespace=-trail
 
 # The #3633 test finds the namespace close by an LF-joined needle and pins line numbers.
 tests/suite_issues/issue_3633_basictests_reduced.cpp text eol=lf
+
+# The PHP foreach definition test finds its call site by an LF-joined needle.
+tests/fixtures/php/foreach_consistent_typed_property_writes.php text eol=lf
+
+# Golden fixture source bytes feed parser ranges, snippets, and content-derived
+# identities. Keep the committed LF contract on Windows; expected.txt is
+# normalized by the golden runner and binary fixture types remain unlisted.
+tests/fixtures/golden/**/*.c text eol=lf
+tests/fixtures/golden/**/*.cc text eol=lf
+tests/fixtures/golden/**/*.config text eol=lf
+tests/fixtures/golden/**/*.cpp text eol=lf
+tests/fixtures/golden/**/*.cs text eol=lf
+tests/fixtures/golden/**/*.go text eol=lf
+tests/fixtures/golden/**/*.h text eol=lf
+tests/fixtures/golden/**/*.hpp text eol=lf
+tests/fixtures/golden/**/*.java text eol=lf
+tests/fixtures/golden/**/*.js text eol=lf
+tests/fixtures/golden/**/*.jsx text eol=lf
+tests/fixtures/golden/**/*.json text eol=lf
+tests/fixtures/golden/**/*.kt text eol=lf
+tests/fixtures/golden/**/*.kts text eol=lf
+tests/fixtures/golden/**/*.lock text eol=lf
+tests/fixtures/golden/**/*.mod text eol=lf
+tests/fixtures/golden/**/*.php text eol=lf
+tests/fixtures/golden/**/*.properties text eol=lf
+tests/fixtures/golden/**/*.py text eol=lf
+tests/fixtures/golden/**/*.rb text eol=lf
+tests/fixtures/golden/**/*.rql text eol=lf
+tests/fixtures/golden/**/*.rs text eol=lf
+tests/fixtures/golden/**/*.scala text eol=lf
+tests/fixtures/golden/**/*.semantics text eol=lf
+tests/fixtures/golden/**/*.toml text eol=lf
+tests/fixtures/golden/**/*.ts text eol=lf
+tests/fixtures/golden/**/*.tsx text eol=lf
+tests/fixtures/golden/**/*.xml text eol=lf
+tests/fixtures/golden/**/*.yaml text eol=lf
+tests/fixtures/golden/**/*.yml text eol=lf
+
+# The rust-codeql-parity corpus asserts exact byte spans and call-site offsets
+# over its Rust fixtures, so a CRLF checkout shifts every span after the first
+# line. Keep the committed LF contract on Windows.
+tests/fixtures/rust-codeql-parity/**/*.rs text eol=lf
+
+# Tutorial Markdown contains executable source snippets whose bytes appear in
+# documented analyzer ranges and output identities.
+docs/src/content/docs/code-query-tutorials/*.md text eol=lf

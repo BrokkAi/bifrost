@@ -401,27 +401,19 @@ pub(super) fn assign_node(
     identity: crate::analyzer::resolution::ResolutionNodeIdentity,
     cancellation: &CancellationToken,
 ) -> Result<Option<BindingNodeId>> {
-    require_transaction(connection);
-    if cancellation.is_cancelled() {
-        return Ok(None);
-    }
-    require_host(connection, host)?;
-    let names = selection.shared_name_table().interner(connection);
-    let Some(reuse) = lookup(
+    let Some(key) = assign_identity_key(
+        selection,
         connection,
-        &names,
         host,
-        &[identity.digest().into()],
+        identity.digest(),
         NODES_SQL,
+        1,
         cancellation,
     )?
     else {
         return Ok(None);
     };
-    let Some(keys) = assign_keys(connection, host, 1, &reuse, cancellation)? else {
-        return Ok(None);
-    };
-    Ok(Some(BindingNodeId::local(host.get(), keys[0])))
+    Ok(Some(BindingNodeId::local(host.get(), key)))
 }
 
 /// Internal generated-bridge path assignment; never commits a reservation.
@@ -432,6 +424,30 @@ pub(super) fn assign_path(
     identity: crate::analyzer::resolution::ResolutionPathIdentity,
     cancellation: &CancellationToken,
 ) -> Result<Option<PartialPathId>> {
+    let Some(key) = assign_identity_key(
+        selection,
+        connection,
+        host,
+        identity.digest(),
+        PATHS_SQL,
+        2,
+        cancellation,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(PartialPathId::local(host.get(), key)))
+}
+
+fn assign_identity_key(
+    selection: &SelectedResolutionMountInventory<'_>,
+    connection: &Connection,
+    host: SelectedResolutionMountOrdinal,
+    digest: [u8; 32],
+    sql: &str,
+    key_count: i64,
+    cancellation: &CancellationToken,
+) -> Result<Option<u32>> {
     require_transaction(connection);
     if cancellation.is_cancelled() {
         return Ok(None);
@@ -442,17 +458,17 @@ pub(super) fn assign_path(
         connection,
         &names,
         host,
-        &[identity.digest().into()],
-        PATHS_SQL,
+        &[digest.into()],
+        sql,
         cancellation,
     )?
     else {
         return Ok(None);
     };
-    let Some(keys) = assign_keys(connection, host, 2, &reuse, cancellation)? else {
+    let Some(keys) = assign_keys(connection, host, key_count, &reuse, cancellation)? else {
         return Ok(None);
     };
-    Ok(Some(PartialPathId::local(host.get(), keys[0])))
+    Ok(Some(keys[0]))
 }
 
 /// Replay only the exact saved producer, including variables. Missing or changed

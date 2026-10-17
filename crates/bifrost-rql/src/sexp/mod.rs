@@ -7,9 +7,10 @@
 mod format;
 mod syntax;
 
-pub use format::{DEFAULT_SEXP_LINE_WIDTH, SexpFormatOptions, format_sexp_document};
-#[cfg(test)]
-pub(crate) use syntax::MAX_SEXP_DEPTH;
+pub use format::{
+    DEFAULT_SEXP_LINE_WIDTH, SexpFormatOptions, comments_in, flat_expr, format_sexp_document,
+    indent_width,
+};
 // RQLP parsing and formatting live in brokk-bifrost-policy, so the parser's
 // syntax surface is public rather than crate-internal.
 pub use syntax::{

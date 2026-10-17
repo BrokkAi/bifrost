@@ -10,8 +10,8 @@
 //! ladder through `super::resolver::KotlinResolutionCtx`.
 
 use super::{
-    KotlinGraphSource, kotlin_target_spec_replayable, prepare_kotlin_scan_files,
-    scan_kotlin_files_replayable, with_kotlin_graph_source,
+    KotlinFileScanOutput, KotlinGraphSource, PreparedKotlinScanFile, kotlin_target_spec_replayable,
+    prepare_kotlin_scan_files, scan_kotlin_files_replayable, with_kotlin_graph_source,
 };
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::common::language_for_file;
@@ -33,6 +33,7 @@ use crate::analyzer::{
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_jvm::kotlin::graph::inverted::scan_file as scan_inverted_file;
+use brokk_bifrost_jvm::kotlin::graph::resolver::TargetSpec;
 use std::collections::BTreeSet;
 
 /// Resolves usages of one Kotlin target within a candidate file set.
@@ -121,21 +122,24 @@ impl<'a> UsageQueryResolver<'a> for KotlinQueryResolver {
         let prepared_files = prepare_kotlin_scan_files(analyzer, &ordered);
         drop(_prepare_scope);
 
-        let file_results: Vec<Option<_>> = match scan_kotlin_files_replayable(
+        let mut hits: BTreeSet<UsageHit> = BTreeSet::new();
+        let mut unproven_hits: BTreeSet<UsageHit> = BTreeSet::new();
+        let mut raw_match_count = 0usize;
+        let mut limit_exceeded = false;
+        match scan_and_merge_kotlin_files(
             &relational_session,
             analyzer,
             token,
             &prepared_files,
             &spec,
             max_usages,
+            &mut hits,
+            &mut unproven_hits,
+            &mut raw_match_count,
+            &mut limit_exceeded,
         ) {
-            crate::analyzer::relational_frontier::RelationalItemFrontierOutcome::Complete(
-                results,
-            ) => results.into_iter().map(Some).collect(),
-            crate::analyzer::relational_frontier::RelationalItemFrontierOutcome::Cancelled(
-                results,
-            ) => results,
-            crate::analyzer::relational_frontier::RelationalItemFrontierOutcome::Failed(_) => {
+            KotlinPreparedScanStatus::Complete | KotlinPreparedScanStatus::Cancelled => {}
+            KotlinPreparedScanStatus::Failed => {
                 return GraphUsageOutcome::fallback_safe(
                     target.fq_name(),
                     GraphFailureReason::UnsupportedTargetShape(
@@ -145,23 +149,6 @@ impl<'a> UsageQueryResolver<'a> for KotlinQueryResolver {
                 );
             }
         };
-        let mut hits: BTreeSet<UsageHit> = BTreeSet::new();
-        let mut unproven_hits: BTreeSet<UsageHit> = BTreeSet::new();
-        let mut raw_match_count = 0usize;
-        let mut limit_exceeded = false;
-        // Prepared order is the sorted file order, so this merge truncates the
-        // same way on every run.
-        for (file_hits, file_unproven_hits, file_raw_match_count, file_limit_exceeded) in
-            file_results.into_iter().flatten()
-        {
-            hits.extend(file_hits);
-            unproven_hits.extend(file_unproven_hits);
-            raw_match_count += file_raw_match_count;
-            limit_exceeded |= file_limit_exceeded;
-        }
-        limit_exceeded |=
-            crate::analyzer::usages::common::external_usage_hit_count(&hits) > max_usages;
-
         // A Kotlin class is equally nameable from Java and Scala source, and the
         // three languages share one candidate space, so find-references on a
         // Kotlin type must see those call sites too (#1239 milestone 4).
@@ -256,33 +243,91 @@ pub(crate) fn scan_kotlin_files_for_jvm_type(
         .collect();
     ordered.sort();
     let prepared_files = prepare_kotlin_scan_files(analyzer, &ordered);
-    let file_results: Vec<Option<_>> = match scan_kotlin_files_replayable(
+    scan_and_merge_kotlin_files(
         &relational_session,
         analyzer,
         token,
         &prepared_files,
         &spec,
         max_usages,
+        hits,
+        unproven_hits,
+        raw_match_count,
+        limit_exceeded,
+    );
+}
+
+enum KotlinPreparedScanStatus {
+    Complete,
+    Cancelled,
+    Failed,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_and_merge_kotlin_files(
+    relational_session: &crate::analyzer::relational_frontier::RelationalFrontierSession<'_>,
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    prepared_files: &[PreparedKotlinScanFile],
+    spec: &TargetSpec,
+    max_usages: usize,
+    hits: &mut BTreeSet<UsageHit>,
+    unproven_hits: &mut BTreeSet<UsageHit>,
+    raw_match_count: &mut usize,
+    limit_exceeded: &mut bool,
+) -> KotlinPreparedScanStatus {
+    match scan_kotlin_files_replayable(
+        relational_session,
+        analyzer,
+        token,
+        prepared_files,
+        spec,
+        max_usages,
     ) {
         crate::analyzer::relational_frontier::RelationalItemFrontierOutcome::Complete(results) => {
-            results.into_iter().map(Some).collect()
+            merge_kotlin_scan_results(
+                results.into_iter().map(Some),
+                hits,
+                unproven_hits,
+                raw_match_count,
+                limit_exceeded,
+                max_usages,
+            );
+            KotlinPreparedScanStatus::Complete
         }
         crate::analyzer::relational_frontier::RelationalItemFrontierOutcome::Cancelled(results) => {
-            results
+            merge_kotlin_scan_results(
+                results,
+                hits,
+                unproven_hits,
+                raw_match_count,
+                limit_exceeded,
+                max_usages,
+            );
+            KotlinPreparedScanStatus::Cancelled
         }
-        crate::analyzer::relational_frontier::RelationalItemFrontierOutcome::Failed(_) => return,
-    };
+        crate::analyzer::relational_frontier::RelationalItemFrontierOutcome::Failed(_) => {
+            KotlinPreparedScanStatus::Failed
+        }
+    }
+}
+
+fn merge_kotlin_scan_results(
+    results: impl IntoIterator<Item = Option<KotlinFileScanOutput>>,
+    hits: &mut BTreeSet<UsageHit>,
+    unproven_hits: &mut BTreeSet<UsageHit>,
+    raw_match_count: &mut usize,
+    limit_exceeded: &mut bool,
+    max_usages: usize,
+) {
     for (file_hits, file_unproven_hits, file_raw_match_count, file_limit_exceeded) in
-        file_results.into_iter().flatten()
+        results.into_iter().flatten()
     {
         hits.extend(file_hits);
         unproven_hits.extend(file_unproven_hits);
         *raw_match_count += file_raw_match_count;
         *limit_exceeded |= file_limit_exceeded;
     }
-    // The caller's hit set spans every JVM language scanned so far, so the
-    // cumulative limit is refreshed over it, exactly as the sequential scan's
-    // per-hit refresh did.
     *limit_exceeded |= crate::analyzer::usages::common::external_usage_hit_count(hits) > max_usages;
 }
 
@@ -319,12 +364,10 @@ fn clone_file_declarations(declarations: &FileDeclarations) -> FileDeclarations 
 impl<'a> KotlinEdgeResolver<'a> {
     pub(crate) fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
         let kotlin = resolve_analyzer::<KotlinAnalyzer>(analyzer)?;
-        let files: Vec<ProjectFile> = analyzer
-            .project()
-            .analyzable_files(Language::Kotlin)
-            .ok()?
-            .into_iter()
-            .collect();
+        let files = crate::analyzer::usages::common::analyzable_usage_graph_files(
+            analyzer,
+            Language::Kotlin,
+        )?;
         Some(Self { files, kotlin })
     }
 
@@ -339,12 +382,8 @@ impl<'a> KotlinEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        let selected_files: Vec<_> = self
-            .files
-            .iter()
-            .filter(|file| keep_file(file))
-            .cloned()
-            .collect();
+        let selected_files =
+            crate::analyzer::usages::common::select_usage_graph_files(&self.files, &keep_file);
         let file_states = self
             .kotlin
             .bulk_file_states(selected_files, BulkFileStateSource::Omit);
@@ -368,12 +407,8 @@ impl<'a> KotlinEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        let selected_files: Vec<_> = self
-            .files
-            .iter()
-            .filter(|file| keep_file(file))
-            .cloned()
-            .collect();
+        let selected_files =
+            crate::analyzer::usages::common::select_usage_graph_files(&self.files, &keep_file);
         let file_states = self
             .kotlin
             .bulk_file_states(selected_files, BulkFileStateSource::Omit);
@@ -397,12 +432,8 @@ impl<'a> KotlinEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        let mut selected_files: Vec<_> = self
-            .files
-            .iter()
-            .filter(|file| keep_file(file))
-            .cloned()
-            .collect();
+        let mut selected_files =
+            crate::analyzer::usages::common::select_usage_graph_files(&self.files, &keep_file);
         selected_files.sort_unstable();
         let file_states = self
             .kotlin
@@ -426,12 +457,8 @@ impl<'a> KotlinEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        let selected_files: Vec<_> = self
-            .files
-            .iter()
-            .filter(|file| keep_file(file))
-            .cloned()
-            .collect();
+        let selected_files =
+            crate::analyzer::usages::common::select_usage_graph_files(&self.files, &keep_file);
         let file_states = self
             .kotlin
             .bulk_file_states(selected_files, BulkFileStateSource::Omit);

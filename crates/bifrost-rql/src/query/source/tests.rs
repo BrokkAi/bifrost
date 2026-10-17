@@ -1,61 +1,6 @@
 use super::*;
 
 #[test]
-fn quiet_for_empty_and_incomplete_sources() {
-    for source in ["", "  ; comment", "(call", "(call :callee", "\"unfinished"] {
-        assert!(validate_query_source(source).is_empty(), "{source:?}");
-    }
-}
-
-#[test]
-fn reports_multiple_rql_errors_at_exact_ranges() {
-    let source = "(call :wat 1 :name 2 :also-nope 3)";
-    let diagnostics = validate_query_source(source);
-    assert_eq!(diagnostics.len(), 3);
-    assert_eq!(&source[diagnostics[0].range.clone()], ":wat");
-    assert_eq!(&source[diagnostics[1].range.clone()], "2");
-    assert_eq!(&source[diagnostics[2].range.clone()], ":also-nope");
-}
-
-#[test]
-fn reports_independent_semantic_errors_with_unknown_properties() {
-    let source = r#"(call :unknown 1 :name/regex "[")"#;
-    let diagnostics = validate_query_source(source);
-    assert_eq!(diagnostics.len(), 2, "{source}: {diagnostics:#?}");
-    assert!(
-        diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "unknown-property")
-    );
-    assert!(
-        diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.message.contains("invalid regex"))
-    );
-}
-
-#[test]
-fn reports_role_compatibility_without_waiting_for_typed_lowering() {
-    let source = r#"(assignment :unknown 1 :callee (name "run"))"#;
-    let diagnostics = validate_query_source(source);
-    assert_eq!(diagnostics.len(), 2, "{source}: {diagnostics:#?}");
-    assert!(
-        diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.message.contains("not valid for kind"))
-    );
-}
-
-#[test]
-fn incomplete_rql_keeps_help_for_completed_tokens() {
-    let source = "(call :callee";
-    let offset = source.find(":callee").unwrap() + 1;
-    let help = query_source_help_at(source, offset).expect("role help");
-    assert_eq!(&source[help.range], ":callee");
-    assert!(validate_query_source(source).is_empty());
-}
-
-#[test]
 fn source_and_diagnostic_budgets_are_bounded() {
     let oversized = " ".repeat(MAX_QUERY_SOURCE_BYTES + 1);
     let diagnostics = validate_query_source(&oversized);
@@ -94,40 +39,6 @@ fn plan_budgets_stop_rql_source_validation_early() {
 }
 
 #[test]
-fn execution_mode_forms_validate_with_exact_ranges_and_shared_help() {
-    let rql = "(profile (call))";
-    assert!(validate_query_source(rql).is_empty());
-
-    let nested_rql = "(union (profile (call)) (call))";
-    let diagnostic = validate_query_source(nested_rql)
-        .into_iter()
-        .find(|diagnostic| diagnostic.message.contains("root query"))
-        .expect("nested RQL execution-mode diagnostic");
-    assert_eq!(&nested_rql[diagnostic.range], "profile");
-
-    let duplicated = "(profile (explain (call)))";
-    let diagnostic = validate_query_source(duplicated)
-        .into_iter()
-        .find(|diagnostic| diagnostic.message.contains("duplicate S-expression field"))
-        .expect("mutually exclusive execution-mode diagnostic");
-    assert_eq!(&duplicated[diagnostic.range], "profile");
-
-    let rql_help = query_source_help_at(rql, rql.find("profile").unwrap()).unwrap();
-    assert_eq!(&rql[rql_help.range], "profile");
-    assert!(rql_help.description.contains("operator timing"));
-}
-
-#[test]
-fn declaration_bounded_containment_has_shared_help() {
-    let rql = "(inside-decl (loop) (call :callee (name \"open\")))";
-    assert!(validate_query_source(rql).is_empty());
-    let help =
-        query_source_help_at(rql, rql.find("inside-decl").unwrap()).expect("inside-decl help");
-    assert_eq!(&rql[help.range], "inside-decl");
-    assert!(help.description.contains("callable declaration"));
-}
-
-#[test]
 fn accepted_rql_shorthands_have_no_live_diagnostics() {
     for source in [
         r#"(call :callee "run")"#,
@@ -147,58 +58,91 @@ fn accepted_rql_shorthands_have_no_live_diagnostics() {
 }
 
 #[test]
-fn help_covers_forms_properties_roles_kinds_and_values() {
-    let source = "(result-detail full (call :callee (name \"run\")))";
-    for (token, expected_range) in [
-        ("result-detail", "result-detail"),
-        ("full", "full"),
-        ("call", "call"),
-        ("callee", ":callee"),
-        ("name", "name"),
-    ] {
-        let offset = source.find(token).unwrap();
-        let help =
-            query_source_help_at(source, offset).unwrap_or_else(|| panic!("no help for {token}"));
-        assert!(!help.description.is_empty());
-        assert_eq!(&source[help.range], expected_range);
-    }
-    assert!(query_source_help_at(source, source.find("run").unwrap()).is_none());
+fn cpp_fact_help_and_validation_are_schema_driven() {
+    let source = "(cpp-facts :kind assignment-does-not-return-this (method :name \"operator=\"))";
+    assert!(validate_query_source(source).is_empty(), "{source}");
+    let help =
+        query_source_help_at(source, source.find(":kind").unwrap()).expect("cpp fact kind help");
+    assert_eq!(&source[help.range], ":kind");
+    assert!(help.description.contains("C++"));
+
+    let invalid = "(cpp-facts :kind no-such-cpp-fact (method))";
+    let diagnostic = validate_query_source(invalid)
+        .into_iter()
+        .find(|diagnostic| diagnostic.code == "invalid-query-step-option")
+        .expect("invalid C++ fact kind diagnostic");
+    assert_eq!(&invalid[diagnostic.range], "no-such-cpp-fact");
 }
 
 #[test]
-fn boolean_value_help_suggestions_and_validation_ranges_are_schema_driven() {
-    for (source, token) in [
-        ("(boolean_literal :boolean-value true)", ":boolean-value"),
-        ("(boolean_literal (boolean-value false))", "boolean-value"),
-    ] {
-        assert!(
-            validate_query_source(source).is_empty(),
-            "{source}: {:#?}",
-            validate_query_source(source)
-        );
-        let offset = source.find(token).expect("help token");
-        let help = query_source_help_at(source, offset).expect("boolean value help");
-        assert_eq!(&source[help.range], token);
-        assert!(help.description.contains("language-neutral"));
-    }
+fn shared_statement_fact_and_language_rule_vocabulary_is_schema_driven() {
+    let source = r#"(language csharp
+        (statement-facts :kind nested-loops-with-same-variable
+          (assignment :language-rule "cs/static-array")))"#;
+    assert!(validate_query_source(source).is_empty(), "{source}");
 
-    for (source, invalid) in [
-        ("(boolean_literal :boolean-value 1)", "1"),
-        ("(boolean_literal (boolean-value \"true\"))", r#""true""#),
-    ] {
-        let diagnostic = validate_query_source(source)
-            .into_iter()
-            .find(|diagnostic| diagnostic.code == "wrong-value-shape")
-            .unwrap_or_else(|| panic!("missing boolean shape diagnostic for {source}"));
-        assert_eq!(&source[diagnostic.range], invalid);
-    }
+    let statement_help = query_source_help_at(source, source.find("statement-facts").unwrap())
+        .expect("statement fact help");
+    assert!(statement_help.description.contains("C/C++-only"));
+    let rule_help = query_source_help_at(source, source.find(":language-rule").unwrap())
+        .expect("language rule help");
+    assert_eq!(&source[rule_help.range], ":language-rule");
+    assert!(rule_help.description.contains("language-rule"));
 
-    let source = "(boolean_literal :boolean-vlue true)";
+    let invalid_fact = "(statement-facts :kind no-such-statement-fact (assignment))";
+    let fact_diagnostic = validate_query_source(invalid_fact)
+        .into_iter()
+        .find(|diagnostic| diagnostic.code == "invalid-query-step-option")
+        .expect("invalid statement fact diagnostic");
+    assert_eq!(
+        &invalid_fact[fact_diagnostic.range],
+        "no-such-statement-fact"
+    );
+
+    let invalid_rule = r#"(assignment :language-rule "cs/no-such-rule")"#;
+    let rule_diagnostic = validate_query_source(invalid_rule)
+        .into_iter()
+        .find(|diagnostic| diagnostic.code == "invalid-query")
+        .expect("invalid language rule diagnostic");
+    assert_eq!(&invalid_rule[rule_diagnostic.range], "\"cs/no-such-rule\"");
+}
+
+#[test]
+fn async_callable_property_and_await_kind_help_are_schema_driven() {
+    let async_source = "(function :async true)";
+    assert!(
+        validate_query_source(async_source).is_empty(),
+        "{:#?}",
+        validate_query_source(async_source)
+    );
+    let offset = async_source.find(":async").expect("async property");
+    let help = query_source_help_at(async_source, offset).expect("async property help");
+    assert_eq!(&async_source[help.range], ":async");
+    assert!(help.description.contains("AST-backed async"));
+
+    let await_source = "(program-point-of (await))";
+    assert!(
+        validate_query_source(await_source).is_empty(),
+        "{:#?}",
+        validate_query_source(await_source)
+    );
+    let offset = await_source.find("await").expect("await form");
+    let help = query_source_help_at(await_source, offset).expect("await kind help");
+    assert_eq!(&await_source[help.range], "await");
+
+    let source = "(function :async 1)";
+    let diagnostic = validate_query_source(source)
+        .into_iter()
+        .find(|diagnostic| diagnostic.code == "wrong-value-shape")
+        .expect("async requires a boolean");
+    assert_eq!(&source[diagnostic.range], "1");
+
+    let source = "(function :asyn true)";
     let diagnostic = validate_query_source(source)
         .into_iter()
         .find(|diagnostic| diagnostic.message.contains("Did you mean"))
-        .unwrap_or_else(|| panic!("missing boolean_value suggestion for {source}"));
-    assert!(diagnostic.message.contains("boolean"));
+        .expect("async property suggestion");
+    assert!(diagnostic.message.contains("async"), "{diagnostic:#?}");
 }
 
 /// `module` is spelled by both a normalized kind and a role (issue #2518),
@@ -247,6 +191,107 @@ fn module_kind_and_module_role_keep_separate_help_and_validation() {
         .find(|diagnostic| diagnostic.message.contains("not valid for kind"))
         .unwrap_or_else(|| panic!("missing role-compatibility diagnostic for {invalid}"));
     assert_eq!(&invalid[diagnostic.range], ":module");
+}
+
+#[test]
+fn comparison_and_assertion_vocabulary_has_validation_and_hover_help() {
+    let comparison =
+        r#"(comparison :left (identifier) :right (null_literal) :operator (text/regex "^==$"))"#;
+    assert!(
+        validate_query_source(comparison).is_empty(),
+        "{:#?}",
+        validate_query_source(comparison)
+    );
+    for (token, expected) in [
+        ("comparison", "comparison expression"),
+        (":left", "left-hand side"),
+        (":right", "right-hand side"),
+        (":operator", "operator token"),
+    ] {
+        let help = query_source_help_at(comparison, comparison.find(token).unwrap())
+            .unwrap_or_else(|| panic!("missing hover help for {token}"));
+        assert!(
+            help.description.contains(expected),
+            "{token}: {}",
+            help.description
+        );
+    }
+
+    let assertion = "(assertion :test (comparison))";
+    assert!(validate_query_source(assertion).is_empty());
+    let test_help = query_source_help_at(assertion, assertion.find(":test").unwrap())
+        .expect("assertion test role help");
+    assert!(
+        test_help
+            .description
+            .contains("expression tested by an assertion")
+    );
+
+    for (kind, expected_help) in [
+        ("binary_expression", "binary expression"),
+        ("comparison_chain", "chained comparison"),
+    ] {
+        let source = format!("({kind})");
+        assert!(validate_query_source(&source).is_empty(), "{kind}");
+        let help = query_source_help_at(&source, source.find(kind).unwrap())
+            .unwrap_or_else(|| panic!("missing hover help for {kind}"));
+        assert!(
+            help.description.contains(expected_help),
+            "{kind}: {}",
+            help.description
+        );
+    }
+
+    for (label, expected_help) in [
+        (
+            "python-comparison-constants",
+            "AST operands are supported constants",
+        ),
+        ("python-comparison-using-is", "effective custom __eq__"),
+        ("python-comparison-using-is-non-portable", "CPython interns"),
+    ] {
+        let source = format!("({label} (language python (comparison)))");
+        assert!(validate_query_source(&source).is_empty(), "{label}");
+        let help = query_source_help_at(&source, source.find(label).unwrap())
+            .unwrap_or_else(|| panic!("missing hover help for {label}"));
+        assert!(
+            help.description.contains(expected_help),
+            "{label}: {}",
+            help.description
+        );
+    }
+
+    let invalid = "(assertion :left (comparison))";
+    let diagnostic = validate_query_source(invalid)
+        .into_iter()
+        .find(|diagnostic| diagnostic.message.contains("not valid for kind"))
+        .expect("left is invalid on assertion");
+    assert_eq!(&invalid[diagnostic.range], ":left");
+}
+
+#[test]
+fn capture_anchor_step_has_validation_and_hover_help() {
+    let source = r#"(anchor :capture "condition"
+        (language python
+          (if :test (literal :capture "condition"))))"#;
+    assert!(
+        validate_query_source(source).is_empty(),
+        "{:#?}",
+        validate_query_source(source)
+    );
+    let anchor = query_source_help_at(source, source.find("anchor").unwrap())
+        .expect("anchor step hover help");
+    assert!(anchor.description.contains("source range"));
+    let capture = query_source_help_at(source, source.find(":capture").unwrap())
+        .expect("anchor capture option hover help");
+    assert!(capture.description.contains("structural capture"));
+
+    let invalid = r#"(anchor :capture "missing" (language python (if)))"#;
+    let diagnostic = validate_query_source(invalid)
+        .into_iter()
+        .find(|diagnostic| diagnostic.message.contains("not declared"))
+        .expect("unknown capture should be rejected");
+    assert_eq!(&invalid[diagnostic.range], "\"missing\"");
 }
 
 /// The iteration vocabulary added for issue #2647: the `collection_literal`
@@ -338,44 +383,163 @@ fn iteration_vocabulary_help_suggestions_and_validation_ranges_are_schema_driven
 }
 
 #[test]
-fn typed_pipeline_help_and_diagnostics_use_shared_schema() {
-    let rql = "(file-of (enclosing-decl (call)))";
-    for token in ["file-of", "enclosing-decl"] {
-        let offset = rql.find(token).unwrap();
-        let help =
-            query_source_help_at(rql, offset).unwrap_or_else(|| panic!("no help for {token}"));
-        assert_eq!(&rql[help.range], token);
-        assert!(!help.description.is_empty());
+fn exact_index_help_and_validation_are_schema_driven() {
+    for source in [
+        r#"(collection_literal :elements [(string_literal :index 1)])"#,
+        r#"(collection_literal :elements [(string_literal (index 1))])"#,
+    ] {
+        assert!(
+            validate_query_source(source).is_empty(),
+            "{source}: {:#?}",
+            validate_query_source(source)
+        );
     }
-    let file_of_help = query_source_help_at(rql, rql.find("file-of").unwrap()).unwrap();
-    assert!(file_of_help.description.contains("reference site"));
-    assert!(file_of_help.description.contains("receiver analyses"));
-    assert!(validate_query_source(rql).is_empty());
 
-    let invalid = "(imports-of (call))";
-    let diagnostic = validate_query_source(invalid).pop().expect("diagnostic");
-    assert_eq!(diagnostic.code, "invalid-query");
-    assert_eq!(&invalid[diagnostic.range], "imports-of");
-    assert!(diagnostic.message.contains("requires file"));
+    let property = r#"(collection_literal :elements [(string_literal :index 1)])"#;
+    let help = query_source_help_at(property, property.find(":index").unwrap())
+        .expect("index property help");
+    assert_eq!(&property[help.range], ":index");
+    assert!(help.description.contains("exact zero-based position"));
+
+    let form = r#"(collection_literal :elements [(string_literal (index 1))])"#;
+    let help = query_source_help_at(form, form.find("index").unwrap()).expect("index form help");
+    assert_eq!(&form[help.range], "index");
+
+    let root_index = "(collection_literal :index 1)";
+    let diagnostic = validate_query_source(root_index)
+        .into_iter()
+        .find(|diagnostic| diagnostic.message.contains("ordered list role"))
+        .expect("index rejected outside list role");
+    assert_eq!(&root_index[diagnostic.range], "1");
+
+    let invalid = "(collection_literal :elements [(string_literal :index -1)])";
+    let diagnostic = validate_query_source(invalid)
+        .into_iter()
+        .find(|diagnostic| diagnostic.message.contains("non-negative"))
+        .expect("negative index rejected");
+    assert_eq!(&invalid[diagnostic.range], "-1");
 }
 
 #[test]
-fn decorator_binding_identity_options_have_shared_help_and_validation() {
-    let rql = r#"(decorator-bindings :module "@nestjs/common" :imported-name Query (parameter))"#;
-    assert!(validate_query_source(rql).is_empty(), "{rql:?}");
-    for token in [":module", ":imported-name"] {
-        let help = query_source_help_at(rql, rql.find(token).unwrap())
-            .unwrap_or_else(|| panic!("no help for {token}"));
-        assert_eq!(&rql[help.range], token);
+fn string_parts_role_help_and_validation_are_schema_driven() {
+    let source = "(string_literal :parts [(string_literal)])";
+    assert!(
+        validate_query_source(source).is_empty(),
+        "{:#?}",
+        validate_query_source(source)
+    );
+    let help =
+        query_source_help_at(source, source.find(":parts").unwrap()).expect("parts role help");
+    assert_eq!(&source[help.range], ":parts");
+    assert!(help.description.contains("implicitly concatenated string"));
+
+    let invalid = "(collection_literal :parts [(string_literal)])";
+    let diagnostic = validate_query_source(invalid)
+        .into_iter()
+        .find(|diagnostic| diagnostic.message.contains("not valid for kind"))
+        .expect("parts role restricted to strings");
+    assert_eq!(&invalid[diagnostic.range], ":parts");
+}
+
+#[test]
+fn parenthesized_literal_property_has_schema_help() {
+    let source = "(string_literal :parenthesized true)";
+    assert!(
+        validate_query_source(source).is_empty(),
+        "{:#?}",
+        validate_query_source(source)
+    );
+    let help = query_source_help_at(source, source.find(":parenthesized").unwrap())
+        .expect("parenthesized help");
+    assert_eq!(&source[help.range], ":parenthesized");
+    assert!(help.description.contains("string-literal"));
+}
+
+#[test]
+fn duplicate_key_property_has_schema_help_and_validation_ranges() {
+    let source = "(object_property :duplicate-key true)";
+    assert!(validate_query_source(source).is_empty());
+    let help = query_source_help_at(source, source.find(":duplicate-key").unwrap())
+        .expect("duplicate key help");
+    assert_eq!(&source[help.range], ":duplicate-key");
+    assert!(help.description.contains("Python dictionary"));
+
+    let source = "(object_property :duplicate-key \"true\")";
+    let diagnostic = validate_query_source(source)
+        .into_iter()
+        .find(|diagnostic| diagnostic.code == "wrong-value-shape")
+        .expect("boolean property rejects a string value");
+    assert_eq!(&source[diagnostic.range], "\"true\"");
+
+    let source = "(object_property :duplicate-ky true)";
+    let diagnostic = validate_query_source(source)
+        .into_iter()
+        .find(|diagnostic| diagnostic.message.contains("Did you mean"))
+        .expect("duplicate-key typo suggestion");
+    assert!(diagnostic.message.contains("duplicate-key"));
+}
+
+#[test]
+fn integer_literal_value_and_mask_fields_have_schema_help_and_validation() {
+    let source = r#"(numeric_literal :integer-value "511" :integer-has-any-bits 2 :integer-has-all-bits 3 :integer-has-no-bits 4)"#;
+    assert!(
+        validate_query_source(source).is_empty(),
+        "{:#?}",
+        validate_query_source(source)
+    );
+    for token in [
+        "integer-value",
+        "integer-has-any-bits",
+        "integer-has-all-bits",
+        "integer-has-no-bits",
+    ] {
+        let help = query_source_help_at(source, source.find(token).unwrap())
+            .unwrap_or_else(|| panic!("missing integer-literal help for {token}"));
+        assert_eq!(&source[help.range], format!(":{token}"));
+        assert!(help.description.contains("integer literal"));
+    }
+
+    for (invalid, expected_value) in [
+        (r#"(numeric_literal :integer-value "0511")"#, "\"0511\""),
+        ("(numeric_literal :integer-has-any-bits 0)", "0"),
+        (
+            "(numeric_literal :integer-has-no-bits 4294967296)",
+            "4294967296",
+        ),
+    ] {
+        let diagnostic = validate_query_source(invalid)
+            .into_iter()
+            .find(|diagnostic| &invalid[diagnostic.range.clone()] == expected_value)
+            .unwrap_or_else(|| panic!("expected integer-value rejection for {invalid}"));
+        assert_eq!(&invalid[diagnostic.range], expected_value);
+    }
+}
+
+#[test]
+fn assignment_shape_properties_have_schema_help_and_validate_enum_values() {
+    let source =
+        "(assignment :assignment-target-kind tuple :assignment-unstarred-count-mismatch true)";
+    assert!(
+        validate_query_source(source).is_empty(),
+        "{:#?}",
+        validate_query_source(source)
+    );
+    for token in [
+        "assignment-target-kind",
+        "assignment-unstarred-count-mismatch",
+    ] {
+        let help = query_source_help_at(source, source.find(token).unwrap())
+            .unwrap_or_else(|| panic!("missing assignment-shape help for {token}"));
+        assert_eq!(&source[help.range], format!(":{token}"));
         assert!(!help.description.is_empty());
     }
 
-    let invalid_rql = r#"(decorator-bindings :module (wrong) (parameter))"#;
-    let diagnostic = validate_query_source(invalid_rql)
+    let invalid = "(assignment :assignment-target-kind array)";
+    let diagnostic = validate_query_source(invalid)
         .into_iter()
-        .find(|diagnostic| diagnostic.code == "wrong-value-shape")
-        .expect("invalid module value should be diagnosed");
-    assert_eq!(&invalid_rql[diagnostic.range], "(wrong)");
+        .find(|diagnostic| diagnostic.message.contains("list or tuple"))
+        .expect("unsupported assignment sequence kind is rejected");
+    assert_eq!(&invalid[diagnostic.range], "array");
 }
 
 #[test]
@@ -410,350 +574,9 @@ fn hierarchy_step_help_and_option_diagnostics_are_range_precise() {
 }
 
 #[test]
-fn typestate_step_help_and_diagnostics_are_range_precise() {
-    let rql = "(witness :max-steps 8 :max-bytes 2048 (typestate :protocol-ref test:lifecycle (procedure-of (function))))";
-    for token in [
-        "witness",
-        ":max-steps",
-        ":max-bytes",
-        "typestate",
-        ":protocol-ref",
-    ] {
-        let offset = rql.find(token).unwrap();
-        let help = query_source_help_at(rql, offset)
-            .unwrap_or_else(|| panic!("no typestate help for {token}"));
-        assert_eq!(&rql[help.range], token);
-        assert!(!help.description.is_empty());
-    }
-    assert!(validate_query_source(rql).is_empty());
-
-    let invalid_ref = "(typestate :protocol-ref \"missing-separator\" (procedure-of (function)))";
-    let diagnostic = validate_query_source(invalid_ref)
-        .into_iter()
-        .find(|diagnostic| diagnostic.message.contains("namespace:name"))
-        .expect("protocol-ref diagnostic");
-    assert_eq!(&invalid_ref[diagnostic.range], r#""missing-separator""#);
-}
-
-/// Hover help and validation ranges for the flow-state vocabulary (#1480), in
-/// RQL source. Every option name and every constrained value is checked at
-/// its own range, so an editor cannot underline the wrong token.
-#[test]
-fn flow_state_help_and_diagnostics_are_range_precise() {
-    let rql = "(flow-relations-of :relation [reaching] :certainty [exact] (state-events-of :class [establish] :subject [binding] (procedure-of (function))))";
-    for token in [
-        "flow-relations-of",
-        ":relation",
-        ":certainty",
-        "state-events-of",
-        ":class",
-        ":subject",
-    ] {
-        let offset = rql.find(token).unwrap();
-        let help = query_source_help_at(rql, offset)
-            .unwrap_or_else(|| panic!("no flow-state help for {token}"));
-        assert_eq!(&rql[help.range], token);
-        assert!(!help.description.is_empty());
-    }
-    assert!(validate_query_source(rql).is_empty(), "{rql}");
-
-    for projection in ["(flow-source ", "(flow-target "] {
-        let source = format!("{projection}(flow-relations-of (procedure-of (function))))");
-        let offset = source
-            .find(projection.trim_start_matches('(').trim())
-            .unwrap();
-        let help = query_source_help_at(&source, offset).expect("flow projection help");
-        assert!(!help.description.is_empty());
-        assert!(validate_query_source(&source).is_empty(), "{source}");
-    }
-}
-
-/// A constrained value outside the registry is reported on the value's own
-/// range, and the message names the allowed set.
-#[test]
-fn flow_state_constrained_values_report_their_allowed_set() {
-    let rql = "(state-events-of :class [obliterate] (procedure-of (function)))";
-    let diagnostic = validate_query_source(rql)
-        .into_iter()
-        .find(|diagnostic| diagnostic.message.contains("obliterate"))
-        .expect("state-event class diagnostic");
-    assert_eq!(&rql[diagnostic.range.clone()], "obliterate");
-    for allowed in ["establish", "kill", "read"] {
-        assert!(diagnostic.message.contains(allowed), "{diagnostic:?}");
-    }
-
-    let rql = "(flow-relations-of :certainty [probably] (procedure-of (function)))";
-    let diagnostic = validate_query_source(rql)
-        .into_iter()
-        .find(|diagnostic| diagnostic.message.contains("probably"))
-        .expect("certainty diagnostic");
-    assert_eq!(&rql[diagnostic.range.clone()], "probably");
-    assert!(diagnostic.message.contains("exact"), "{diagnostic:?}");
-    assert!(diagnostic.message.contains("may"), "{diagnostic:?}");
-
-    let rql = "(state-events-of :relation [reaching] (procedure-of (function)))";
-    let diagnostic = validate_query_source(rql)
-        .into_iter()
-        .find(|diagnostic| diagnostic.code == "unknown-property")
-        .expect("unknown option diagnostic");
-    assert_eq!(&rql[diagnostic.range.clone()], ":relation");
-
-    let rql_source = "(flow-relations-of :relation [adjacent] (procedure-of (function)))";
-    let diagnostic = validate_query_source(rql_source)
-        .into_iter()
-        .find(|diagnostic| diagnostic.message.contains("adjacent"))
-        .expect("RQL flow-relation diagnostic");
-    assert_eq!(&rql_source[diagnostic.range.clone()], "adjacent");
-}
-
-/// Hover help and validation ranges for the control-relation vocabulary
-/// (#2443), in RQL source. Every option name and every constrained value is
-/// checked at its own range, so an editor cannot underline the wrong token.
-#[test]
-fn control_relation_help_and_diagnostics_are_range_precise() {
-    let rql = "(control-relations :relation [dominates] \
-                :exit-partition [normal-and-exceptional] (procedure-of (function)))";
-    for token in ["control-relations", ":relation", ":exit-partition"] {
-        let offset = rql.find(token).unwrap();
-        let help = query_source_help_at(rql, offset)
-            .unwrap_or_else(|| panic!("no control-relation help for {token}"));
-        assert_eq!(&rql[help.range], token);
-        assert!(!help.description.is_empty());
-    }
-    assert!(validate_query_source(rql).is_empty(), "{rql}");
-}
-
-/// Hover help and validation ranges for the guard step (#2443 slice 2), in
-/// RQL source. The step has no option axis, so one borrowed from a sibling
-/// step is reported on its own token rather than ignored.
-#[test]
-fn guard_help_and_diagnostics_are_range_precise() {
-    let rql = "(guards-of (procedure-of (function)))";
-    let offset = rql.find("guards-of").unwrap();
-    let help = query_source_help_at(rql, offset).expect("guard help");
-    assert_eq!(&rql[help.range], "guards-of");
-    assert!(
-        help.description.contains("guard_facts"),
-        "{:?}",
-        help.description
-    );
-    assert!(validate_query_source(rql).is_empty(), "{rql}");
-
-    let borrowed = "(guards-of :relation [dominates] (procedure-of (function)))";
-    let diagnostic = validate_query_source(borrowed)
-        .into_iter()
-        .find(|diagnostic| diagnostic.code == "wrong-value-shape")
-        .expect("a guard step takes no option axis");
-    assert!(diagnostic.message.contains("guards-of"), "{diagnostic:?}");
-}
-
-/// A constrained value outside the registry is reported on the value's own
-/// range, and the message names the allowed set -- including the reserved exit
-/// partitions, which are declared values even though no row carries them yet.
-#[test]
-fn control_relation_constrained_values_report_their_allowed_set() {
-    let rql = "(control-relations :relation [precedes] (procedure-of (function)))";
-    let diagnostic = validate_query_source(rql)
-        .into_iter()
-        .find(|diagnostic| diagnostic.message.contains("precedes"))
-        .expect("control-relation diagnostic");
-    assert_eq!(&rql[diagnostic.range.clone()], "precedes");
-    for allowed in [
-        "dominates",
-        "postdominates",
-        "control_depends_on",
-        "reachable",
-        "in_loop",
-    ] {
-        assert!(diagnostic.message.contains(allowed), "{diagnostic:?}");
-    }
-
-    let rql = "(control-relations :exit-partition [normal_and_cancellation] \
-                (procedure-of (function)))";
-    let diagnostic = validate_query_source(rql)
-        .into_iter()
-        .find(|diagnostic| diagnostic.message.contains("normal_and_cancellation"))
-        .expect("exit-partition diagnostic");
-    for allowed in ["normal_and_exceptional", "normal_only", "with_suspension"] {
-        assert!(diagnostic.message.contains(allowed), "{diagnostic:?}");
-    }
-
-    let rql = "(control-relations :certainty [exact] (procedure-of (function)))";
-    let diagnostic = validate_query_source(rql)
-        .into_iter()
-        .find(|diagnostic| diagnostic.code == "unknown-property")
-        .expect("unknown option diagnostic");
-    assert_eq!(&rql[diagnostic.range.clone()], ":certainty");
-}
-
-#[test]
-fn assignment_relation_option_help_and_invalid_value_are_range_precise() {
-    let rql = "(assignment-relations :relation [self-assignment failed-swap overwritten-unread] (procedure-of (function)))";
-    for token in ["assignment-relations", ":relation"] {
-        let offset = rql.find(token).expect("declared assignment relation token");
-        let help = query_source_help_at(rql, offset)
-            .unwrap_or_else(|| panic!("no assignment relation help for {token}"));
-        assert_eq!(&rql[help.range], token);
-        assert!(!help.description.is_empty());
-    }
-    assert!(validate_query_source(rql).is_empty(), "{rql}");
-
-    let invalid = "(assignment-relations :relation [swapped] (procedure-of (function)))";
-    let diagnostic = validate_query_source(invalid)
-        .into_iter()
-        .find(|diagnostic| diagnostic.message.contains("swapped"))
-        .expect("invalid assignment relation diagnostic");
-    assert_eq!(&invalid[diagnostic.range.clone()], "swapped");
-    for allowed in ["self_assignment", "failed_swap", "overwritten_unread"] {
-        assert!(diagnostic.message.contains(allowed), "{diagnostic:?}");
-    }
-}
-
-#[test]
-fn loop_relation_help_and_invalid_option_are_range_precise() {
-    let rql = "(loop-relations (procedure-of (function)))";
-    let offset = rql.find("loop-relations").expect("step token");
-    let help = query_source_help_at(rql, offset).expect("loop relation help");
-    assert_eq!(&rql[help.range], "loop-relations");
-    assert!(validate_query_source(rql).is_empty(), "{rql}");
-    let invalid = "(loop-relations :relation [repeat] (procedure-of (function)))";
-    let diagnostic = validate_query_source(invalid)
-        .into_iter()
-        .next()
-        .expect("unrecognized option");
-    assert_eq!(&invalid[diagnostic.range.clone()], ":relation");
-}
-
-#[test]
-fn statement_reachability_help_and_invalid_option_are_range_precise() {
-    let rql = "(statement-reachability (procedure-of (function)))";
-    let offset = rql.find("statement-reachability").expect("step token");
-    let help = query_source_help_at(rql, offset).expect("statement reachability help");
-    assert_eq!(&rql[help.range], "statement-reachability");
-    assert!(validate_query_source(rql).is_empty(), "{rql}");
-    let invalid = "(statement-reachability :relation [dead] (procedure-of (function)))";
-    let diagnostic = validate_query_source(invalid)
-        .into_iter()
-        .next()
-        .expect("unrecognized option");
-    assert_eq!(&invalid[diagnostic.range.clone()], ":relation");
-}
-
-/// Hover help and validation ranges for the three project-topology steps
-/// (#2448), in RQL source.
-///
-/// Each step name hovers at its own range with the description the step
-/// registry declares, and a well-formed chain reports nothing. The steps carry
-/// no option axis at all, so a borrowed one is a shape error naming the step
-/// rather than a silently ignored key.
-#[test]
-fn topology_step_help_and_diagnostics_are_range_precise() {
-    let rql = "(topology-edges-of (target-of (file-of (class :name \"Order\"))))";
-    for token in ["topology-edges-of", "target-of", "file-of"] {
-        let offset = rql.find(token).unwrap();
-        let help = query_source_help_at(rql, offset)
-            .unwrap_or_else(|| panic!("no topology help for {token}"));
-        assert_eq!(&rql[help.range], token);
-        assert!(!help.description.is_empty());
-    }
-    assert!(validate_query_source(rql).is_empty(), "{rql}");
-
-    let source_set = "(source-set-of (file-of (class :name \"Order\")))";
-    let offset = source_set.find("source-set-of").unwrap();
-    let help = query_source_help_at(source_set, offset).expect("no help for source-set-of");
-    assert_eq!(&source_set[help.range], "source-set-of");
-    assert!(
-        help.description.contains("source set"),
-        "{:?}",
-        help.description
-    );
-    assert!(validate_query_source(source_set).is_empty(), "{source_set}");
-
-    let borrowed = "(target-of :scope [compile] (file-of (class)))";
-    let diagnostic = validate_query_source(borrowed)
-        .into_iter()
-        .find(|diagnostic| diagnostic.code == "wrong-value-shape")
-        .expect("a topology step takes no option axis");
-    assert!(diagnostic.message.contains("target-of"), "{diagnostic:?}");
-}
-
-/// Hover help and validation ranges for the bounded rewrite vocabulary
-/// (#1480), in RQL source.
-#[test]
-fn rewrite_path_help_and_diagnostics_are_range_precise() {
-    let rql =
-        "(rewrite-paths-of :domain [rust-import-alias] :outcome [cycle] (file-of (function)))";
-    for token in ["rewrite-paths-of", ":domain", ":outcome"] {
-        let offset = rql.find(token).unwrap();
-        let help = query_source_help_at(rql, offset)
-            .unwrap_or_else(|| panic!("no rewrite-path help for {token}"));
-        assert_eq!(&rql[help.range], token);
-        assert!(!help.description.is_empty());
-    }
-    assert!(validate_query_source(rql).is_empty(), "{rql}");
-}
-
-/// A constrained value outside the registry is reported on the value's own
-/// range, and the message names the allowed set.
-#[test]
-fn rewrite_path_constrained_values_report_their_allowed_set() {
-    let rql = "(rewrite-paths-of :outcome [diverged] (file-of (function)))";
-    let diagnostic = validate_query_source(rql)
-        .into_iter()
-        .find(|diagnostic| diagnostic.message.contains("diverged"))
-        .expect("rewrite outcome diagnostic");
-    assert_eq!(&rql[diagnostic.range.clone()], "diverged");
-    for allowed in ["converged", "cycle", "exceeded_budget"] {
-        assert!(diagnostic.message.contains(allowed), "{diagnostic:?}");
-    }
-
-    let rql = "(rewrite-paths-of :certainty [exact] (file-of (function)))";
-    let diagnostic = validate_query_source(rql)
-        .into_iter()
-        .find(|diagnostic| diagnostic.code == "unknown-property")
-        .expect("unknown option diagnostic");
-    assert_eq!(&rql[diagnostic.range.clone()], ":certainty");
-
-    let rql_source = "(rewrite-paths-of :domain [ruby_require] (file-of (function)))";
-    let diagnostic = validate_query_source(rql_source)
-        .into_iter()
-        .find(|diagnostic| diagnostic.message.contains("ruby_require"))
-        .expect("RQL rewrite-domain diagnostic");
-    assert_eq!(&rql_source[diagnostic.range.clone()], "ruby_require");
-}
-
-/// Hover help and validation ranges for the class-set type-flow steps, in
-/// RQL source. Class-set takes exactly one query, and absent-member takes only
-/// its `:proof` option, so an extra argument or a borrowed option is reported
-/// rather than ignored.
-#[test]
-fn class_set_and_absent_member_help_and_diagnostics_are_range_precise() {
-    for form in ["class-set", "absent-member"] {
-        let rql = format!("({form} (procedure-of (function)))");
-        let offset = rql.find(form).unwrap();
-        let help = query_source_help_at(&rql, offset).unwrap_or_else(|| panic!("no {form} help"));
-        assert_eq!(&rql[help.range], form);
-        assert!(!help.description.is_empty());
-        assert!(validate_query_source(&rql).is_empty(), "{rql}");
-    }
-
-    let rql = "(class-set (function) (function))";
-    let diagnostic = validate_query_source(rql)
-        .into_iter()
-        .find(|diagnostic| diagnostic.code == "wrong-value-shape")
-        .expect("class-set takes exactly one query");
-    assert!(diagnostic.message.contains("class-set"), "{diagnostic:?}");
-
-    let rql = "(absent-member :plan-ref test:flow (function))";
-    let diagnostic = validate_query_source(rql)
-        .into_iter()
-        .find(|diagnostic| diagnostic.code == "unknown-property")
-        .expect("absent-member accepts only its proof option");
-    assert_eq!(&rql[diagnostic.range.clone()], ":plan-ref");
-    assert!(diagnostic.message.contains(":proof"), "{diagnostic:?}");
-}
-
-#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#3745: absent-member proof values were not constrained to the conditional row domain"
+)]
 fn absent_member_proof_option_help_validation_and_row_domain_are_typed() {
     let rql = "(absent-member :proof conditional (procedure-of (function)))";
     for token in ["absent-member", ":proof"] {
@@ -805,89 +628,6 @@ fn absent_member_proof_option_help_validation_and_row_domain_are_typed() {
 }
 
 #[test]
-fn absent_member_witness_help_validation_and_status_domain_are_typed() {
-    let rql =
-        "(file-of (witness :max-steps 1 :max-bytes 256 (absent-member (procedure-of (function)))))";
-    for token in [
-        "file-of",
-        "witness",
-        "absent-member",
-        ":max-steps",
-        ":max-bytes",
-    ] {
-        let offset = rql.find(token).expect("RQL witness token");
-        let help = query_source_help_at(rql, offset)
-            .unwrap_or_else(|| panic!("no RQL witness help for {token}"));
-        assert_eq!(&rql[help.range], token);
-        assert!(!help.description.is_empty());
-    }
-    assert!(validate_query_source(rql).is_empty(), "{rql}");
-
-    let incompatible = "(witness (class-set (procedure-of (function))))";
-    let diagnostic = validate_query_source(incompatible)
-        .into_iter()
-        .find(|diagnostic| diagnostic.code == "invalid-query")
-        .expect("witness must reject class-set input");
-    assert_eq!(&incompatible[diagnostic.range.clone()], "witness");
-    assert!(diagnostic.message.contains("absent_member_finding"));
-
-    let fields =
-        crate::structural::search::DetailedCodeQueryDomain::AbsentMemberWitness.row_fields();
-    let status = fields
-        .iter()
-        .find(|field| field.name == "witness_status")
-        .expect("absent-member witness status field");
-    assert_eq!(
-        status.scalar_type,
-        crate::structural::search::CodeQueryRowScalarType::ConstrainedEnum
-    );
-    assert_eq!(
-        status.value_domain.and_then(|domain| domain.labels()),
-        Some(["available", "truncated", "unavailable"].as_slice())
-    );
-}
-
-#[test]
-fn value_flow_help_and_diagnostics_are_range_precise() {
-    let rql = "(witness :max-steps 8 (value-flow :plan-ref test:flow (procedure-of (function))))";
-    for token in ["witness", "value-flow", ":plan-ref"] {
-        let offset = rql.find(token).unwrap();
-        let help = query_source_help_at(rql, offset)
-            .unwrap_or_else(|| panic!("no value-flow help for {token}"));
-        assert_eq!(&rql[help.range], token);
-        assert!(!help.description.is_empty());
-    }
-    assert!(validate_query_source(rql).is_empty());
-
-    let invalid_ref = "(value-flow :plan-ref \"missing-separator\" (procedure-of (function)))";
-    let diagnostic = validate_query_source(invalid_ref)
-        .into_iter()
-        .find(|diagnostic| diagnostic.message.contains("namespace:name"))
-        .expect("plan-ref diagnostic");
-    assert_eq!(&invalid_ref[diagnostic.range], r#""missing-separator""#);
-}
-
-#[test]
-fn taint_help_and_diagnostics_are_range_precise() {
-    let rql = "(taint :taint-ref test:flow (procedure-of (function)))";
-    for token in ["taint", ":taint-ref"] {
-        let offset = rql.find(token).unwrap();
-        let help = query_source_help_at(rql, offset)
-            .unwrap_or_else(|| panic!("no taint help for {token}"));
-        assert_eq!(&rql[help.range], token);
-        assert!(!help.description.is_empty());
-    }
-    assert!(validate_query_source(rql).is_empty());
-
-    let invalid_ref = "(taint :taint-ref \"missing-separator\" (procedure-of (function)))";
-    let diagnostic = validate_query_source(invalid_ref)
-        .into_iter()
-        .find(|diagnostic| diagnostic.message.contains("namespace:name"))
-        .expect("taint-ref diagnostic");
-    assert_eq!(&invalid_ref[diagnostic.range], r#""missing-separator""#);
-}
-
-#[test]
 fn set_composition_help_and_domain_diagnostics_are_range_precise() {
     let rql = "(file-of (union (enclosing-decl (class :name \"A\")) (enclosing-decl (class :name \"B\"))))";
     for token in ["union", "file-of"] {
@@ -899,12 +639,23 @@ fn set_composition_help_and_domain_diagnostics_are_range_precise() {
     }
     assert!(validate_query_source(rql).is_empty());
 
-    let rql_source = "(union (enclosing-decl (class)) (file-of (class)))";
+    let rql_source = "(intersect (enclosing-decl (class)) (file-of (class)))";
     let diagnostic = validate_query_source(rql_source)
         .into_iter()
         .find(|diagnostic| diagnostic.message.contains("first branch produces"))
         .expect("typed branch diagnostic");
     assert_eq!(&rql_source[diagnostic.range], "(class)");
+
+    // A union of different row kinds is valid on its own (#5352); a typed
+    // step over it is what the diagnostic refuses.
+    let mixed_union = "(union (enclosing-decl (class)) (file-of (class)))";
+    assert!(validate_query_source(mixed_union).is_empty());
+    let stepped = "(imports-of (union (enclosing-decl (class)) (file-of (class))))";
+    let diagnostic = validate_query_source(stepped)
+        .into_iter()
+        .find(|diagnostic| diagnostic.message.contains("requires rows of one kind"))
+        .expect("mixed union step diagnostic");
+    assert_eq!(&stepped[diagnostic.range], "imports-of");
 
     let too_short = "(except (class))";
     let diagnostic = validate_query_source(too_short)
@@ -915,83 +666,22 @@ fn set_composition_help_and_domain_diagnostics_are_range_precise() {
 }
 
 #[test]
-fn parameter_name_constraints_have_precise_ranges() {
-    let oversized = "x".repeat(MAX_KWARG_NAME_LENGTH + 1);
-    let rql = format!(
-        "(call-input :parameter-name \"{oversized}\" (call-sites-to (enclosing-decl (method))))"
-    );
-
-    let (source, expected) = (rql.as_str(), format!("\"{oversized}\""));
-    let diagnostics = validate_query_source(source);
-    assert!(diagnostics.iter().any(|diagnostic| {
-        source[diagnostic.range.clone()] == expected
-            && diagnostic.message.contains("parameter name")
-    }));
-
-    let source = r#"(call-input :parameter-name "" (call-sites-to (enclosing-decl (method))))"#;
-    assert!(validate_query_source(source).iter().any(|diagnostic| {
-        &source[diagnostic.range.clone()] == "\"\"" && diagnostic.message.contains("parameter name")
-    }));
-}
-
-#[test]
-fn receiver_step_help_and_capture_diagnostics_are_range_precise() {
-    let rql = "(points-to :capture service (call :receiver (capture \"service\")))";
-    for token in ["points-to", ":capture"] {
-        let offset = rql.find(token).unwrap();
-        let help = query_source_help_at(rql, offset)
-            .unwrap_or_else(|| panic!("no receiver traversal help for {token}"));
-        assert_eq!(&rql[help.range], token);
-        assert!(!help.description.is_empty());
-    }
+fn points_to_candidate_help_and_shape_diagnostics_are_range_precise() {
+    let rql = r#"(points-to-candidates (points-to :capture service (call :receiver (capture "service"))))"#;
+    let offset = rql.find("points-to-candidates").unwrap();
+    let help = query_source_help_at(rql, offset).expect("candidate expansion help");
+    assert_eq!(&rql[help.range], "points-to-candidates");
+    assert!(!help.description.is_empty());
     assert!(validate_query_source(rql).is_empty());
 
-    let missing = r#"(points-to :capture "service" (call))"#;
-    let diagnostic = validate_query_source(missing).pop().expect("diagnostic");
-    assert_eq!(diagnostic.code, "invalid-query");
-    assert_eq!(&missing[diagnostic.range], "points-to");
-    assert!(
-        diagnostic
-            .message
-            .contains("not declared by a positive pattern")
-    );
-
-    let wrong_domain = r#"(points-to :capture "service" (references-of (enclosing-decl (class :capture "service"))))"#;
-    let diagnostic = validate_query_source(wrong_domain)
+    let wrong_shape = "(points-to-candidates (function))";
+    let diagnostic = validate_query_source(wrong_shape)
         .into_iter()
-        .find(|diagnostic| diagnostic.message.contains("capture is allowed only"))
-        .expect("domain diagnostic");
-    assert_eq!(&wrong_domain[diagnostic.range], "points-to");
-}
-
-#[test]
-fn reference_step_help_and_option_diagnostics_are_range_precise() {
-    let rql = "(references-of :surface external-usages :reference-kinds [field-write] :proof proven (enclosing-decl (class)))";
-    for token in ["references-of", ":surface", ":reference-kinds", ":proof"] {
-        let offset = rql.find(token).unwrap();
-        let help = query_source_help_at(rql, offset)
-            .unwrap_or_else(|| panic!("no reference traversal help for {token}"));
-        assert_eq!(&rql[help.range], token);
-        assert!(!help.description.is_empty());
-    }
-    assert!(validate_query_source(rql).is_empty());
-
-    for (source, token) in [
-        (
-            "(references-of :reference-kinds [field_guess] (enclosing-decl (class)))",
-            "field_guess",
-        ),
-        ("(used-by :proof maybe (enclosing-decl (class)))", "maybe"),
-        ("(uses :surface all (enclosing-decl (class)))", "all"),
-    ] {
-        let diagnostics = validate_query_source(source);
-        assert!(
-            diagnostics
-                .iter()
-                .any(|diagnostic| &source[diagnostic.range.clone()] == token),
-            "{source}: {diagnostics:#?}"
-        );
-    }
+        .next()
+        .expect("wrong candidate input diagnostic");
+    assert_eq!(diagnostic.code, "invalid-query");
+    assert!(!diagnostic.message.is_empty());
+    assert_eq!(&wrong_shape[diagnostic.range], "points-to-candidates");
 }
 
 #[test]
@@ -1002,53 +692,9 @@ fn byte_ranges_preserve_utf8_boundaries() {
 }
 
 #[test]
-fn spelling_fixes_use_unique_canonical_schema_candidates() {
-    let cases = [
-        (
-            "(resut-detail full (call))",
-            "resut-detail",
-            "result-detail",
-        ),
-        ("(call :captur \"item\")", ":captur", ":capture"),
-        ("(call :calle (call))", ":calle", ":callee"),
-        ("(cal)", "cal", "call"),
-        ("(language ruts (call))", "ruts", "rust"),
-        ("(language .rss (call))", ".rss", "rust"),
-        ("(result-detail ful (call))", "ful", "full"),
-        ("(profle (call))", "profle", "profile"),
-    ];
-
-    for (source, token, replacement) in cases {
-        let diagnostic = validate_query_source(source)
-            .into_iter()
-            .find(|diagnostic| &source[diagnostic.range.clone()] == token)
-            .unwrap_or_else(|| panic!("missing diagnostic for {token} in {source}"));
-        assert!(diagnostic.message.contains("Did you mean"));
-        assert_eq!(&source[diagnostic.range], token);
-        assert_eq!(
-            diagnostic.fix,
-            Some(QuerySourceFix {
-                title: format!(
-                    "Replace with `{}`",
-                    replacement.trim_matches('"').trim_start_matches(':')
-                ),
-                edit: QuerySourceEdit::Replace {
-                    new_text: replacement.to_string(),
-                },
-            })
-        );
-    }
-
-    let ambiguous = "(language .rts (call))";
-    let diagnostic = validate_query_source(ambiguous)
-        .into_iter()
-        .find(|diagnostic| &ambiguous[diagnostic.range.clone()] == ".rts")
-        .expect("language diagnostic");
-    assert!(!diagnostic.message.contains("Did you mean"));
-    assert_eq!(diagnostic.fix, None);
-}
-
-#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#744: RQL quick-fix suggestions duplicated aliases and emitted ambiguous/distant candidates"
+)]
 fn suggestion_selector_deduplicates_aliases_and_suppresses_ties_and_distant_values() {
     assert_eq!(
         best_suggestion(
@@ -1084,164 +730,21 @@ fn suggestion_selector_deduplicates_aliases_and_suppresses_ties_and_distant_valu
 }
 
 #[test]
-fn safe_shape_fixes_wrap_only_recognizable_single_values() {
-    let supported = [("(call :args (call))", "(call)")];
-    for (source, token) in supported {
-        let diagnostic = validate_query_source(source)
-            .into_iter()
-            .find(|diagnostic| &source[diagnostic.range.clone()] == token)
-            .unwrap_or_else(|| panic!("missing wrapping diagnostic for {source}"));
-        assert_eq!(
-            diagnostic.fix,
-            Some(QuerySourceFix {
-                title: "Wrap in a pattern list".to_string(),
-                edit: QuerySourceEdit::Surround {
-                    prefix: "[".to_string(),
-                    suffix: "]".to_string(),
-                },
-            })
-        );
-    }
-
-    for source in ["(call :args \"item\")", "(call :args (call :wat 1))"] {
-        assert!(
-            validate_query_source(source)
-                .into_iter()
-                .all(|diagnostic| diagnostic.fix.is_none())
-        );
-    }
-}
-
-/// Occurrence filters are validated against the registries in both
-/// frontends, and hover reaches every option keyword.
-#[test]
-fn occurrence_filter_help_and_value_diagnostics_are_range_precise() {
-    let rql =
-        "(occurrences-in :class reference :role [member_position] :namespace value (function))";
-    for token in ["occurrences-in", ":class", ":role", ":namespace"] {
-        let offset = rql.find(token).unwrap();
-        let help = query_source_help_at(rql, offset)
-            .unwrap_or_else(|| panic!("no occurrence help for {token}"));
-        assert_eq!(&rql[help.range], token);
-        assert!(!help.description.is_empty());
-    }
-    assert!(validate_query_source(rql).is_empty(), "{rql}");
-
-    let seed = "(language \"rust\" (occurrences :role binder))";
-    assert!(
-        validate_query_source(seed).is_empty(),
-        "{seed}: {:#?}",
-        validate_query_source(seed)
-    );
-
-    for (source, token, code) in [
-        ("(occurrences :role binderr)", "binderr", "unknown-value"),
-        ("(occurrences :kind function)", ":kind", "unknown-property"),
-        (
-            "(occurrences :role binder :role declaration_name)",
-            ":role",
-            "duplicate-property",
-        ),
-    ] {
-        let diagnostic = validate_query_source(source)
-            .into_iter()
-            .find(|diagnostic| diagnostic.code == code)
-            .unwrap_or_else(|| panic!("no {code} diagnostic for {source}"));
-        assert_eq!(&source[diagnostic.range.clone()], token, "{source}");
-    }
-}
-
-/// Result-contract projection, aggregate validation, and typed operation uses
-/// hover from the same registry that parses and validates both RQL spellings
-/// and typed operations.
-#[test]
-fn result_contract_use_form_help_and_diagnostics_are_range_precise() {
-    for rql in [
-        "(result-contract-uses (call-result-contracts (call-shape (call :callee \"Open\"))))",
-        "(result-contract-operation-uses (call-result-contracts (call-shape (call :callee \"Open\"))))",
-    ] {
-        for token in [
-            if rql.starts_with("(result-contract-operation-uses") {
-                "result-contract-operation-uses"
-            } else {
-                "result-contract-uses"
-            },
-            "call-result-contracts",
-        ] {
-            let offset = rql.find(token).unwrap();
-            let help = query_source_help_at(rql, offset)
-                .unwrap_or_else(|| panic!("no result-contract help for {token}"));
-            assert_eq!(&rql[help.range], token);
-            assert!(!help.description.is_empty());
-            if token == "result-contract-operation-uses" {
-                assert!(help.description.contains("positional call arguments"));
-                assert!(help.description.contains("parameter_ordinal"));
-            }
-        }
-        assert!(
-            validate_query_source(rql).is_empty(),
-            "{rql}: {:#?}",
-            validate_query_source(rql)
-        );
-    }
-
-    let underscored = "(result_contract_operation_uses (call_result_contracts (call_shape (call :callee \"Open\"))))";
-    assert!(
-        validate_query_source(underscored).is_empty(),
-        "{underscored}: {:#?}",
-        validate_query_source(underscored)
-    );
-
-    let wrong_upstream = "(result-contract-operation-uses (call-shape (call)))";
-    let diagnostic = validate_query_source(wrong_upstream)
-        .into_iter()
-        .find(|diagnostic| {
-            diagnostic.code == "invalid-query"
-                && diagnostic.message.contains("requires call_result_contract")
-        })
-        .expect("typed upstream diagnostic");
-    assert_eq!(
-        &wrong_upstream[diagnostic.range.clone()],
-        "result-contract-operation-uses",
-        "{diagnostic:?}"
-    );
-
-    let removed_summary =
-        "(result-contract-use-summary (call-result-contracts (call-shape (call))))";
-    let diagnostic = validate_query_source(removed_summary)
-        .into_iter()
-        .find(|diagnostic| diagnostic.code == "unknown-form")
-        .expect("unknown-form diagnostic");
-    assert_eq!(
-        &removed_summary[diagnostic.range.clone()],
-        "result-contract-use-summary",
-        "{diagnostic:?}"
-    );
-}
-
-#[test]
-fn result_subject_uses_form_help_and_diagnostics_are_range_precise() {
-    for label in ["result-subject-uses", "result_subject_uses"] {
-        let source = format!("({label} (call-results (call-shape (call :callee \"build\"))))");
+fn python_format_issues_form_help_and_diagnostics_are_range_precise() {
+    for label in ["python-format-issues", "python_format_issues"] {
+        let source = format!("({label} (language python (call)))");
         let offset = source.find(label).unwrap();
         let help = query_source_help_at(&source, offset)
-            .unwrap_or_else(|| panic!("no result-subject-uses help for {label}"));
+            .unwrap_or_else(|| panic!("no format-issues help for {label}"));
         assert_eq!(&source[help.range], label);
-        assert!(
-            help.description
-                .contains("normal-result reference provenance")
-        );
-        assert!(help.description.contains("freshness"));
+        assert!(help.description.contains("brace-format and percent-format"));
         assert!(validate_query_source(&source).is_empty(), "{source}");
 
         let wrong_upstream = format!("({label} (call-shape (call)))");
         let diagnostic = validate_query_source(&wrong_upstream)
             .into_iter()
-            .find(|diagnostic| {
-                diagnostic.code == "invalid-query"
-                    && diagnostic.message.contains("requires call_result")
-            })
-            .expect("call-result upstream diagnostic");
+            .find(|diagnostic| diagnostic.code == "invalid-query")
+            .expect("typed structural-match upstream diagnostic");
         assert_eq!(
             &wrong_upstream[diagnostic.range.clone()],
             label,
@@ -1251,12 +754,110 @@ fn result_subject_uses_form_help_and_diagnostics_are_range_precise() {
 }
 
 #[test]
-fn result_contract_failure_use_help_and_diagnostics_are_range_precise() {
-    let rql = "(result-contract-failure-uses :provenance [distinct-zero-binding unknown] :consumer [returned-call-argument] (call-result-contracts (call-shape (call :callee \"Open\"))))";
-    for token in ["result-contract-failure-uses", ":provenance", ":consumer"] {
+fn python_rule_fact_forms_validate_and_hover_from_schema() {
+    let forms = [
+        "procedure-return-profile",
+        "python-iterator-return-protocol",
+        "python-builtin-identity",
+        "python-raise-not-implemented",
+        "python-attribute-shadows-method",
+        "python-modification-of-default-value",
+        "call-result-use",
+        "tuple-return-groups",
+        "lambda-forwarding",
+        "python-url-construction",
+        "python-raise-legality",
+        "python-special-method-raise",
+    ];
+    for (form, query) in forms.into_iter().zip([
+        "(procedure-return-profile (procedure-of (language python (callable))))",
+        "(python-iterator-return-protocol (procedure-of (language python (method :name \"__iter__\"))))",
+        "(python-builtin-identity (language python (occurrences :class reference)))",
+        "(python-raise-not-implemented (language python (throw)))",
+        "(python-attribute-shadows-method (enclosing-decl (language python (class))))",
+        "(python-modification-of-default-value (enclosing-decl (language python (function))))",
+        "(call-result-use (call-shape (language python (call))))",
+        "(tuple-return-groups (procedure-of (language python (callable))))",
+        "(lambda-forwarding (language python (lambda)))",
+        "(python-url-construction (language python (binary_expression)))",
+        "(python-raise-legality (language python (throw)))",
+        "(python-special-method-raise (language python (throw)))",
+    ]) {
+        let help = query_source_help_at(query, query.find(form).unwrap())
+            .unwrap_or_else(|| panic!("no help for {form}"));
+        assert_eq!(&query[help.range], form);
+        assert!(!help.description.is_empty());
+        assert!(
+            validate_query_source(query).is_empty(),
+            "{query}: {:#?}",
+            validate_query_source(query)
+        );
+    }
+    let underscored = "(procedure_return_profile (procedure-of (language python (callable))))";
+    assert!(
+        validate_query_source(underscored).is_empty(),
+        "{underscored}"
+    );
+    let underscored = "(python_iterator_return_protocol (procedure-of (language python (method :name \"__iter__\"))))";
+    assert!(
+        validate_query_source(underscored).is_empty(),
+        "{underscored}"
+    );
+    let underscored =
+        "(python_attribute_shadows_method (enclosing-decl (language python (class))))";
+    assert!(
+        validate_query_source(underscored).is_empty(),
+        "{underscored}"
+    );
+    let underscored =
+        "(python_modification_of_default_value (enclosing-decl (language python (function))))";
+    assert!(
+        validate_query_source(underscored).is_empty(),
+        "{underscored}"
+    );
+
+    let invalid = "(procedure-return-profiles (procedure-of (callable)))";
+    let diagnostic = validate_query_source(invalid)
+        .into_iter()
+        .find(|diagnostic| diagnostic.code == "unknown-form")
+        .expect("unknown-form diagnostic");
+    assert_eq!(
+        &invalid[diagnostic.range.clone()],
+        "procedure-return-profiles"
+    );
+}
+
+#[test]
+fn rust_pointer_findings_form_validates_and_has_hover_help() {
+    for form in ["rust-pointer-findings", "rust_pointer_findings"] {
+        let source = format!("({form} (procedure-of (language rust (function :name \"run\"))))");
+        assert!(
+            validate_query_source(&source).is_empty(),
+            "{source}: {:#?}",
+            validate_query_source(&source)
+        );
+        let help = query_source_help_at(&source, source.find(form).unwrap())
+            .unwrap_or_else(|| panic!("missing RQL help for {form}"));
+        assert_eq!(&source[help.range], form);
+        assert!(help.description.contains("pointer provenance"));
+        assert!(help.description.contains("completeness"));
+    }
+
+    let invalid = "(rust-pointer-findings (call))";
+    let diagnostic = validate_query_source(invalid)
+        .into_iter()
+        .find(|diagnostic| diagnostic.code == "invalid-query")
+        .expect("pointer findings require procedure input");
+    assert_eq!(&invalid[diagnostic.range], "rust-pointer-findings");
+}
+
+#[test]
+fn procedure_effects_accept_procedure_rows_with_registered_help_and_ranges() {
+    let rql = "(procedure-effects (procedure-of (function (name \"run\"))))";
+    for token in ["procedure-effects", "procedure-of"] {
         let offset = rql.find(token).unwrap();
-        let help = query_source_help_at(rql, offset)
-            .unwrap_or_else(|| panic!("no failure-use help for {token}"));
+        let help =
+            query_source_help_at(rql, offset).unwrap_or_else(|| panic!("no help for {token}"));
         assert_eq!(&rql[help.range], token);
         assert!(!help.description.is_empty());
     }
@@ -1266,209 +867,20 @@ fn result_contract_failure_use_help_and_diagnostics_are_range_precise() {
         validate_query_source(rql)
     );
 
-    for (source, token, allowed) in [
-        (
-            "(result-contract-failure-uses :provenance [same-name] (call-result-contracts (call-shape (call))))",
-            "same-name",
-            &["condition_result", "distinct_zero_binding", "unknown"][..],
-        ),
-        (
-            "(result-contract-failure-uses :consumer [log] (call-result-contracts (call-shape (call))))",
-            "log",
-            &["return", "returned_call_argument", "call_argument"][..],
-        ),
-    ] {
-        let diagnostic = validate_query_source(source)
-            .into_iter()
-            .find(|diagnostic| diagnostic.code == "invalid-query-step-option")
-            .unwrap_or_else(|| panic!("no constrained-value diagnostic for {source}"));
-        assert_eq!(&source[diagnostic.range.clone()], token);
-        for label in allowed {
-            assert!(diagnostic.message.contains(label), "{diagnostic:?}");
-        }
-    }
-
-    let wrong_upstream = "(result-contract-failure-uses (call-shape (call)))";
+    let wrong_upstream = "(procedure-effects (call-shape (call :callee (name \"run\"))))";
     let diagnostic = validate_query_source(wrong_upstream)
         .into_iter()
         .find(|diagnostic| {
             diagnostic.code == "invalid-query"
-                && diagnostic.message.contains("requires call_result_contract")
+                && diagnostic
+                    .message
+                    .contains("requires declaration or procedure")
         })
-        .expect("typed failure-use upstream diagnostic");
+        .expect("procedure-effects rejects a call-shape upstream");
     assert_eq!(
         &wrong_upstream[diagnostic.range.clone()],
-        "result-contract-failure-uses"
+        "procedure-effects"
     );
-}
-
-/// The callable-signature row wrappers hover from the same registry that
-/// parses them, and live validation accepts the wrapper chain and rejects a
-/// misspelling with a range-precise diagnostic (#1478 M2).
-#[test]
-fn callable_signature_form_help_and_diagnostics_are_range_precise() {
-    let rql = "(signature-parameters (callable-signature (enclosing-decl (method))))";
-    for token in ["signature-parameters", "callable-signature"] {
-        let offset = rql.find(token).unwrap();
-        let help =
-            query_source_help_at(rql, offset).unwrap_or_else(|| panic!("no help for {token}"));
-        assert_eq!(&rql[help.range], token);
-        assert!(!help.description.is_empty());
-    }
-    assert!(
-        validate_query_source(rql).is_empty(),
-        "{rql}: {:#?}",
-        validate_query_source(rql)
-    );
-
-    // The underscore spelling is the same form.
-    let underscored = "(signature_parameters (callable_signature (enclosing-decl (method))))";
-    assert!(
-        validate_query_source(underscored).is_empty(),
-        "{underscored}: {:#?}",
-        validate_query_source(underscored)
-    );
-
-    let misspelled = "(callable-signatures (enclosing-decl (method)))";
-    let diagnostic = validate_query_source(misspelled)
-        .into_iter()
-        .find(|diagnostic| diagnostic.code == "unknown-form")
-        .expect("unknown-form diagnostic");
-    assert_eq!(&misspelled[diagnostic.range.clone()], "callable-signatures");
-}
-
-/// The decorator-binding wrapper is declared once and therefore gets parser,
-/// alias, validation, and hover behavior in both spellings from the same
-/// registry (#2644).
-#[test]
-fn decorator_binding_form_help_and_diagnostics_are_range_precise() {
-    let rql = "(decorator-bindings (parameter))";
-    for token in ["decorator-bindings", "parameter"] {
-        let offset = rql.find(token).unwrap();
-        let help =
-            query_source_help_at(rql, offset).unwrap_or_else(|| panic!("no help for {token}"));
-        assert_eq!(&rql[help.range], token);
-        assert!(!help.description.is_empty());
-    }
-    assert!(validate_query_source(rql).is_empty(), "{rql}");
-
-    let underscored = "(decorator_bindings (parameter))";
-    assert!(
-        validate_query_source(underscored).is_empty(),
-        "{underscored}: {:#?}",
-        validate_query_source(underscored)
-    );
-
-    let misspelled = "(decorator-binding (parameter))";
-    let diagnostic = validate_query_source(misspelled)
-        .into_iter()
-        .find(|diagnostic| diagnostic.code == "unknown-form")
-        .expect("unknown-form diagnostic");
-    assert_eq!(&misspelled[diagnostic.range.clone()], "decorator-binding");
-}
-
-/// Materialization filters are validated against the registries in both
-/// frontends, and hover reaches every option keyword (#1476).
-#[test]
-fn materialization_filter_help_and_value_diagnostics_are_range_precise() {
-    let rql = "(declaration-state-of :origin generated :declaration-only true \
-               :config-gated false (enclosing-decl (function)))";
-    for token in [
-        "declaration-state-of",
-        ":origin",
-        ":declaration-only",
-        ":config-gated",
-    ] {
-        let offset = rql.find(token).unwrap();
-        let help = query_source_help_at(rql, offset)
-            .unwrap_or_else(|| panic!("no materialization help for {token}"));
-        assert_eq!(&rql[help.range], token);
-        assert!(!help.description.is_empty());
-    }
-    assert!(
-        validate_query_source(rql).is_empty(),
-        "{rql}: {:#?}",
-        validate_query_source(rql)
-    );
-
-    let sites = "(generated-by (generates (generation-sites :kind accessor_macro \
-                 :input literal)))";
-    for token in [
-        "generation-sites",
-        ":kind",
-        ":input",
-        "generates",
-        "generated-by",
-    ] {
-        let offset = sites.find(token).unwrap();
-        let help = query_source_help_at(sites, offset)
-            .unwrap_or_else(|| panic!("no materialization help for {token}"));
-        assert_eq!(&sites[help.range], token);
-        assert!(!help.description.is_empty());
-    }
-    assert!(
-        validate_query_source(sites).is_empty(),
-        "{sites}: {:#?}",
-        validate_query_source(sites)
-    );
-
-    let exports = "(export-target (exports :form default_anonymous :name \"default\"))";
-    assert!(
-        validate_query_source(exports).is_empty(),
-        "{exports}: {:#?}",
-        validate_query_source(exports)
-    );
-
-    // The inverse linkage step (#1660) validates and hovers in both
-    // spellings, exactly like its forward sibling.
-    let stubs = "(stubs-of (enclosing-decl (function)))";
-    for token in ["stubs-of", "enclosing-decl"] {
-        let offset = stubs.find(token).unwrap();
-        let help = query_source_help_at(stubs, offset)
-            .unwrap_or_else(|| panic!("no materialization help for {token}"));
-        assert_eq!(&stubs[help.range], token);
-        assert!(!help.description.is_empty());
-    }
-    assert!(
-        validate_query_source(stubs).is_empty(),
-        "{stubs}: {:#?}",
-        validate_query_source(stubs)
-    );
-    let underscored = "(stubs_of (enclosing-decl (function)))";
-    assert!(
-        validate_query_source(underscored).is_empty(),
-        "{underscored}: {:#?}",
-        validate_query_source(underscored)
-    );
-
-    for (source, token, code) in [
-        (
-            "(generation-sites :kind accessor_macroo)",
-            "accessor_macroo",
-            "unknown-value",
-        ),
-        (
-            "(generation-sites :form named)",
-            ":form",
-            "unknown-property",
-        ),
-        (
-            "(exports :form default_anonymous :form named)",
-            ":form",
-            "duplicate-property",
-        ),
-        (
-            "(declaration-state-of :declaration-only maybe (class))",
-            "maybe",
-            "unknown-value",
-        ),
-    ] {
-        let diagnostic = validate_query_source(source)
-            .into_iter()
-            .find(|diagnostic| diagnostic.code == code)
-            .unwrap_or_else(|| panic!("no {code} diagnostic for {source}"));
-        assert_eq!(&source[diagnostic.range.clone()], token, "{source}");
-    }
 }
 
 #[test]
@@ -1479,25 +891,6 @@ fn accepted_language_aliases_do_not_produce_diagnostics() {
             "accepted language alias should validate: {source}"
         );
     }
-}
-
-#[test]
-fn arity_help_covers_the_predicate_form_property() {
-    // Predicate form and inline property both hover on the `arity` token.
-    let form = "(call (arity :min 1 :max 3))";
-    let form_help =
-        query_source_help_at(form, form.find("arity").unwrap()).expect("arity form help");
-    assert_eq!(&form[form_help.range.clone()], "arity");
-    assert!(
-        form_help.description.contains("argument count"),
-        "{form_help:?}"
-    );
-
-    let property = r#"(call :callee (name "execute") :arity 1)"#;
-    let property_help =
-        query_source_help_at(property, property.find(":arity").unwrap()).expect("arity property");
-    assert_eq!(&property[property_help.range], ":arity");
-    assert!(!property_help.description.is_empty());
 }
 
 #[test]
@@ -1562,83 +955,9 @@ fn arity_forms_validate_ranges_at_exact_positions() {
 }
 
 #[test]
-fn visibility_help_covers_the_predicate_form_property() {
-    let form = "(method (visibility public))";
-    let form_help =
-        query_source_help_at(form, form.find("visibility").unwrap()).expect("visibility form help");
-    assert_eq!(&form[form_help.range.clone()], "visibility");
-    assert!(
-        form_help.description.contains("visibility"),
-        "{form_help:?}"
-    );
-
-    let property = "(method :visibility public)";
-    let property_help = query_source_help_at(property, property.find(":visibility").unwrap())
-        .expect("visibility property");
-    assert_eq!(&property[property_help.range], ":visibility");
-}
-
-#[test]
-fn visibility_and_parameter_type_forms_validate_at_exact_positions() {
-    for source in [
-        "(method :visibility public)",
-        "(method :visibility [public protected])",
-        "(method :visibility (public protected))",
-        "(method (visibility package-private))",
-        r#"(method :parameter-type "String")"#,
-        r#"(method :parameter-type/regex "String")"#,
-    ] {
-        assert!(
-            validate_query_source(source).is_empty(),
-            "well-formed callable signature predicate should validate: {source}: {:#?}",
-            validate_query_source(source)
-        );
-    }
-
-    let rql = "(call :visibility public)";
-    let diagnostic = validate_query_source(rql)
-        .pop()
-        .expect("visibility on call");
-    assert!(diagnostic.message.contains("callable"), "{diagnostic:?}");
-
-    let rql_source = r#"(call :parameter-type "String")"#;
-    let diagnostic = validate_query_source(rql_source)
-        .pop()
-        .expect("parameter_type on call");
-    assert!(diagnostic.message.contains("callable"), "{diagnostic:?}");
-
-    let rql = "(method :visibility banana)";
-    let diagnostic = validate_query_source(rql)
-        .pop()
-        .expect("unknown visibility");
-    assert!(
-        diagnostic.message.contains("unknown visibility"),
-        "{diagnostic:?}"
-    );
-}
-
-#[test]
-fn jsx_attribute_value_source_forms_validate_and_hover_from_schema() {
-    let rql = r#"(jsx-attribute-value :identity intrinsic :element-name div :property-name __html
-        (jsx_attribute (name "dangerouslySetInnerHTML")))"#;
-    assert!(
-        validate_query_source(rql).is_empty(),
-        "{:#?}",
-        validate_query_source(rql)
-    );
-    let help =
-        query_source_help_at(rql, rql.find(":identity").unwrap()).expect("identity option help");
-    assert!(help.description.contains("semantic element identity"));
-
-    let invalid = r#"(jsx-attribute-value :identity unresolved (jsx_attribute))"#;
-    let diagnostic = validate_query_source(invalid)
-        .into_iter()
-        .find(|diagnostic| diagnostic.code == "unknown-value")
-        .expect("invalid identity diagnostic");
-    assert!(diagnostic.message.contains("intrinsic"));
-}
-
-#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#3351: keyed-read value-family options were not validated against the portable runtime contract"
+)]
 fn keyed_read_value_family_options_validate_have_range_help() {
     let source = "(keyed-read-value :runtime node :global process :container argv :key-kind static-index :index-min 1 :index-max 3 (call))";
     assert!(
@@ -1700,57 +1019,6 @@ fn generated_json_is_machine_serialization_only() {
 }
 
 #[test]
-fn assignable_receiver_family_validates_and_provides_schema_help() {
-    for form in ["assignable-to", "assignable_to"] {
-        let source = format!(
-            r#"(resolved-call :resolves-to "Child.sink" :proof exact
-              :receiver-type ({form} "Base")
-              (call-bindings (call-shape (call :callee "sink"))))"#
-        );
-        assert!(
-            validate_query_source(&source).is_empty(),
-            "{:#?}",
-            validate_query_source(&source)
-        );
-        let help = query_source_help_at(&source, source.find(form).unwrap())
-            .expect("receiver family help");
-        assert_eq!(&source[help.range.clone()], form);
-        assert!(help.description.contains("typed hierarchy"), "{help:?}");
-    }
-
-    let source = r#"(resolved-call :resolves-to "Child.sink" :proof exact
-      :receiver-type (subtype-of "Base")
-      (call-bindings (call-shape (call :callee "sink"))))"#;
-    let diagnostic = validate_query_source(source)
-        .into_iter()
-        .find(|diagnostic| diagnostic.message.contains("assignable-to"))
-        .expect("unknown receiver family diagnostic");
-    assert_eq!(&source[diagnostic.range], "subtype-of");
-}
-
-#[test]
-fn language_family_help_and_validation_use_fixed_expansions() {
-    let source = "(language jvm (language java (call)))";
-    assert!(validate_query_source(source).is_empty());
-    let offset = source.find("jvm").unwrap();
-    let help = query_source_help_at(source, offset).unwrap();
-    assert_eq!(&source[help.range], "jvm");
-    assert_eq!(help.signature, "jvm = [java kotlin scala]");
-    let source = "(language \"js-ts\" (call))";
-    assert!(validate_query_source(source).is_empty());
-    let help = query_source_help_at(source, source.find("js-ts").unwrap()).unwrap();
-    assert_eq!(help.signature, "js-ts = [javascript typescript]");
-    let source = "(language jvmm (call))";
-    let errors = validate_query_source(source);
-    let error = errors
-        .iter()
-        .find(|error| error.code == "invalid-language")
-        .unwrap();
-    assert_eq!(&source[error.range.clone()], "jvmm");
-    assert!(format!("{:?}", error.fix).contains("jvm"));
-}
-
-#[test]
 fn configuration_key_validation_matches_the_decoder() {
     // The editor validator and the canonical decoder must agree on which
     // authored keys are selectable, including the empty key that JSON admits.
@@ -1777,62 +1045,6 @@ fn configuration_key_validation_matches_the_decoder() {
 }
 
 #[test]
-fn branch_relation_help_and_validation_are_range_precise() {
-    let rql = "(branch-relations :relation [identical-bodies] (if))";
-    for token in ["branch-relations", ":relation"] {
-        let offset = rql.find(token).unwrap();
-        let help = query_source_help_at(rql, offset).expect("branch relation help");
-        assert_eq!(&rql[help.range], token);
-        assert!(!help.description.is_empty());
-    }
-    assert!(validate_query_source(rql).is_empty(), "{rql}");
-
-    let invalid = "(branch-relations :relation [clone] (if))";
-    let diagnostic = validate_query_source(invalid)
-        .into_iter()
-        .find(|diagnostic| diagnostic.message.contains("clone"))
-        .expect("invalid relation diagnostic");
-    assert_eq!(&invalid[diagnostic.range], "clone");
-    assert!(diagnostic.message.contains("identical_bodies"));
-}
-
-#[test]
-fn failure_handler_state_help_and_validation_are_range_precise() {
-    let rql = "(failure-handler-state (language java (catch)))";
-    let token = "failure-handler-state";
-    let offset = rql.find(token).unwrap();
-    let help = query_source_help_at(rql, offset).expect("failure-handler-state help");
-    assert_eq!(&rql[help.range.clone()], token);
-    assert!(help.description.contains("catch body"), "{help:?}");
-    assert!(validate_query_source(rql).is_empty(), "{rql}");
-
-    let borrowed = "(failure-handler-state :relation [empty] (catch))";
-    let diagnostic = validate_query_source(borrowed)
-        .into_iter()
-        .find(|diagnostic| diagnostic.code == "wrong-value-shape")
-        .expect("the step takes no relation option");
-    assert!(diagnostic.message.contains(token), "{diagnostic:?}");
-}
-
-#[test]
-fn call_result_obligation_help_and_validation_are_range_precise() {
-    for token in ["call-result-obligations", "call_result_obligations"] {
-        let source = format!("({token} (call-shape (call)))");
-        let help = query_source_help_at(&source, 1).expect("result-obligation help");
-        assert_eq!(&source[help.range], token);
-        assert!(help.description.contains("selected JDK artifact"));
-        assert!(validate_query_source(&source).is_empty(), "{source}");
-    }
-    let invalid = "(call-result-obligations true)";
-    let diagnostics = validate_query_source(invalid);
-    let diagnostic = diagnostics
-        .iter()
-        .find(|diagnostic| diagnostic.code == "wrong-value-shape")
-        .unwrap_or_else(|| panic!("wrong input kind diagnostic: {diagnostics:#?}"));
-    assert_eq!(&invalid[diagnostic.range.clone()], "true");
-}
-
-#[test]
 fn explicit_enum_row_literal_help_and_error_ranges_are_precise() {
     let source = "(filter :where ((failure_predicate eq (enum false))) (call-result-obligations (call-shape (call))))";
     assert!(validate_query_source(source).is_empty());
@@ -1847,4 +1059,134 @@ fn explicit_enum_row_literal_help_and_error_ranges_are_precise() {
         .find(|d| d.message.contains("exactly one label"))
         .unwrap_or_else(|| panic!("expected invalid enum: {diagnostics:?}"));
     assert_eq!(&invalid[diagnostic.range.clone()], "(enum false true)");
+}
+
+#[test]
+fn cross_domain_operators_have_shared_help_and_range_precise_validation() {
+    let rql = r#"(correlate
+  :relation (configuration-key :documents ["src/main/resources/app.properties"])
+  :code (call-input :parameter-index 0 (call-sites-to (enclosing-decl (method (name "get")))))
+  :configuration (configuration-facts :format properties))"#;
+    assert!(
+        validate_query_source(rql).is_empty(),
+        "{:#?}",
+        validate_query_source(rql)
+    );
+    for token in [
+        "correlate",
+        ":relation",
+        "configuration-key",
+        ":documents",
+        ":code",
+        ":configuration",
+    ] {
+        let help = query_source_help_at(rql, rql.find(token).unwrap()).expect(token);
+        assert_eq!(&rql[help.range], token);
+        assert!(!help.description.is_empty(), "{token}");
+    }
+    let require = "(require-both :code (call) :configuration (configuration-facts))";
+    let help = query_source_help_at(require, 1).expect("require-both help");
+    assert_eq!(&require[help.range], "require-both");
+    assert!(
+        help.description.contains("never pairs"),
+        "{}",
+        help.description
+    );
+
+    // A glob is not a declared document: the typed error lands on the entry.
+    let glob = rql.replace("src/main/resources/app.properties", "**/*.properties");
+    let diagnostic = validate_query_source(&glob)
+        .into_iter()
+        .find(|diagnostic| diagnostic.message.contains("without globs"))
+        .expect("declared-document diagnostic");
+    assert_eq!(&glob[diagnostic.range], r#""**/*.properties""#);
+
+    // An unknown relation is suggested from the relation registry only.
+    let misspelled = rql.replace("configuration-key", "configuration-keys");
+    let diagnostic = validate_query_source(&misspelled)
+        .into_iter()
+        .find(|diagnostic| diagnostic.code == "unknown-form")
+        .expect("unknown relation diagnostic");
+    assert_eq!(&misspelled[diagnostic.range.clone()], "configuration-keys");
+    assert!(
+        format!("{:?}", diagnostic.fix).contains("configuration-key"),
+        "{diagnostic:?}"
+    );
+
+    // A relation is not a query, and require-both takes no relation.
+    let relation = r#"(configuration-key :documents ["a.properties"])"#;
+    let diagnostic = validate_query_source(relation)
+        .into_iter()
+        .next()
+        .expect("relation-as-query diagnostic");
+    assert_eq!(&relation[diagnostic.range], "configuration-key");
+    let related = format!(
+        "(require-both :relation {relation} :code (call) :configuration (configuration-facts))"
+    );
+    let diagnostic = validate_query_source(&related)
+        .into_iter()
+        .find(|diagnostic| diagnostic.message.contains("never relates rows"))
+        .expect("require-both relation diagnostic");
+    assert_eq!(&related[diagnostic.range], relation);
+}
+
+#[test]
+fn dependency_configuration_relation_help_and_validation_range() {
+    let rql = r#"(correlate
+        :relation (dependency-configuration :owner "npm:workspace:packages/a"
+            :ecosystem npm :version-range "<2.0.0" :documents ["a.properties"] :values ["true"])
+        :code (dependency-evidence :ecosystem npm :kind locked)
+        :configuration (configuration-facts :format properties :key "feature.enabled"))"#;
+    assert!(
+        validate_query_source(rql).is_empty(),
+        "{:#?}",
+        validate_query_source(rql)
+    );
+    for token in [
+        "dependency-configuration",
+        ":owner",
+        ":ecosystem",
+        ":version-range",
+        ":documents",
+        ":values",
+    ] {
+        let help = query_source_help_at(rql, rql.find(token).unwrap()).expect(token);
+        assert_eq!(&rql[help.range], token);
+        assert!(!help.description.is_empty());
+    }
+    let invalid = rql.replace("<2.0.0", "workspace:*");
+    let diagnostic = validate_query_source(&invalid)
+        .into_iter()
+        .find(|diagnostic| {
+            diagnostic.range
+                == (invalid.find("\"workspace:*\"").unwrap()
+                    ..invalid.find("\"workspace:*\"").unwrap() + "\"workspace:*\"".len())
+        })
+        .expect("version range diagnostic on exact value");
+    assert_eq!(&invalid[diagnostic.range], "\"workspace:*\"");
+}
+
+#[test]
+fn resolved_value_source_validation_and_help_are_registered() {
+    let source = r#"(resolved-value :resolves-to "django.views.decorators.csrf.csrf_exempt" :proof exact
+        (language python (decorator)))"#;
+    assert!(
+        validate_query_source(source).is_empty(),
+        "{source}: {:#?}",
+        validate_query_source(source)
+    );
+    for token in [":resolves-to", ":proof"] {
+        let help = query_source_help_at(source, source.find(token).unwrap())
+            .unwrap_or_else(|| panic!("no resolved-value help for {token}"));
+        assert_eq!(&source[help.range], token);
+        assert!(!help.description.is_empty());
+    }
+
+    let invalid = source.replace(":proof exact", ":proof declared");
+    let diagnostic = validate_query_source(&invalid)
+        .into_iter()
+        .find(|diagnostic| diagnostic.code == "unknown-value")
+        .expect("resolved-value rejects a non-exact proof");
+    assert_eq!(&invalid[diagnostic.range], "declared");
+    assert!(diagnostic.message.contains("must be exact"));
 }

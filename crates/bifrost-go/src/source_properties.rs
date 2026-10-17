@@ -20,7 +20,25 @@ use brokk_bifrost_core::analyzer::source_facts::{
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use tree_sitter::Node;
 
-use crate::declarations::{children_by_field, go_node_text, named_children};
+use crate::declarations::{
+    GoCallableResultSyntax, go_callable_result_syntax, go_node_text, go_parameter_syntax,
+    named_children,
+};
+
+fn parameter_type_nodes<'tree>(list: Node<'tree>) -> impl Iterator<Item = Node<'tree>> {
+    named_children(list).into_iter().filter_map(|parameter| {
+        if matches!(
+            parameter.kind(),
+            "parameter_declaration" | "variadic_parameter_declaration"
+        ) {
+            parameter
+                .child_by_field_name("type")
+                .or_else(|| parameter.named_child(parameter.named_child_count().saturating_sub(1)))
+        } else {
+            None
+        }
+    })
+}
 
 pub(crate) struct GoSourcePropertyCollector<'source> {
     source: &'source str,
@@ -302,19 +320,8 @@ impl<'source> GoSourcePropertyCollector<'source> {
         list: Node<'_>,
         source_collector: &mut PrimarySourceFactCollector<'source>,
     ) {
-        for parameter in named_children(list) {
-            if matches!(
-                parameter.kind(),
-                "parameter_declaration" | "variadic_parameter_declaration"
-            ) {
-                if let Some(ty) = parameter.child_by_field_name("type") {
-                    self.capture_type(ty, source_collector);
-                } else if let Some(ty) =
-                    parameter.named_child(parameter.named_child_count().saturating_sub(1))
-                {
-                    self.capture_type(ty, source_collector);
-                }
-            }
+        for ty in parameter_type_nodes(list) {
+            self.capture_type(ty, source_collector);
         }
     }
 
@@ -323,19 +330,8 @@ impl<'source> GoSourcePropertyCollector<'source> {
         list: Node<'_>,
         source_collector: &mut PrimarySourceFactCollector<'source>,
     ) {
-        for parameter in named_children(list) {
-            if !matches!(
-                parameter.kind(),
-                "parameter_declaration" | "variadic_parameter_declaration"
-            ) {
-                continue;
-            }
-            let ty = parameter
-                .child_by_field_name("type")
-                .or_else(|| parameter.named_child(parameter.named_child_count().saturating_sub(1)));
-            if let Some(ty) = ty {
-                self.capture_method_key_type(ty, source_collector);
-            }
+        for ty in parameter_type_nodes(list) {
+            self.capture_method_key_type(ty, source_collector);
         }
     }
 
@@ -716,26 +712,28 @@ pub(crate) fn result_parameters(
     source_collector: &mut PrimarySourceFactCollector<'_>,
     types: &GoSourcePropertyCollector<'_>,
 ) -> (Vec<GoCallableParameterFact>, Option<SourceOccurrenceId>) {
-    let Some(result) = node.child_by_field_name("result") else {
-        return (Vec::new(), None);
-    };
-    let occurrence = source_collector.intern_node(result);
-    if result.kind() == "parameter_list" {
-        (
-            parameter_facts(result, source, source_collector, types),
-            Some(occurrence),
-        )
-    } else {
-        let ty = types.type_id_for_node(result);
-        (
-            vec![GoCallableParameterFact {
-                group: occurrence,
-                name: None,
-                ty,
-                variadic: false,
-            }],
-            Some(occurrence),
-        )
+    match go_callable_result_syntax(node) {
+        GoCallableResultSyntax::None => (Vec::new(), None),
+        GoCallableResultSyntax::Parameters(result) => {
+            let occurrence = source_collector.intern_node(result);
+            (
+                parameter_facts(result, source, source_collector, types),
+                Some(occurrence),
+            )
+        }
+        GoCallableResultSyntax::Type(result) => {
+            let occurrence = source_collector.intern_node(result);
+            let ty = types.type_id_for_node(result);
+            (
+                vec![GoCallableParameterFact {
+                    group: occurrence,
+                    name: None,
+                    ty,
+                    variadic: false,
+                }],
+                Some(occurrence),
+            )
+        }
     }
 }
 
@@ -747,33 +745,24 @@ fn parameter_facts(
 ) -> Vec<GoCallableParameterFact> {
     let group = source_collector.intern_node(list);
     let mut facts = Vec::new();
-    for parameter in named_children(list) {
-        if !matches!(
-            parameter.kind(),
-            "parameter_declaration" | "variadic_parameter_declaration"
-        ) {
-            continue;
-        }
+    for parameter in go_parameter_syntax(list) {
         let ty = parameter
-            .child_by_field_name("type")
-            .or_else(|| parameter.named_child(parameter.named_child_count().saturating_sub(1)))
+            .type_node
             .and_then(|node| types.type_id_for_node(node));
-        let names = children_by_field(parameter, "name");
-        let variadic = parameter.kind() == "variadic_parameter_declaration";
-        if names.is_empty() {
+        if parameter.name_nodes.is_empty() {
             facts.push(GoCallableParameterFact {
                 group,
                 name: None,
                 ty,
-                variadic,
+                variadic: parameter.variadic,
             });
         } else {
-            for name in names {
+            for name in parameter.name_nodes {
                 facts.push(GoCallableParameterFact {
                     group,
                     name: Some(source_collector.intern_node(name)),
                     ty,
-                    variadic,
+                    variadic: parameter.variadic,
                 });
             }
         }

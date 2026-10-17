@@ -3,13 +3,6 @@
 use super::*;
 use rusqlite::params;
 
-fn current_connection() -> Connection {
-    let mut conn = Connection::open_in_memory().unwrap();
-    configure_connection(&mut conn).unwrap();
-    migrate(&mut conn).unwrap();
-    conn
-}
-
 fn seed_macro_route(conn: &Connection, seed: &str, context_occurrence_id: Option<i64>) -> i64 {
     conn.execute(
         "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'rust', 0)",
@@ -132,21 +125,11 @@ fn seed_macro_route(conn: &Connection, seed: &str, context_occurrence_id: Option
     blob_id
 }
 
-fn seal(conn: &Connection, blob_id: i64) -> rusqlite::Result<()> {
-    conn.execute(
-        "UPDATE source_fact_manifests
-            SET publication_state = 'complete'
-          WHERE blob_id = ?1",
-        [blob_id],
-    )?;
-    Ok(())
-}
-
 #[test]
 fn fresh_macro_routes_require_definition_and_context_links_before_seal() {
-    let conn = current_connection();
+    let conn = current_rust_connection();
     let valid = seed_macro_route(&conn, "macro-route-valid", Some(0));
-    seal(&conn, valid).unwrap();
+    seal_rust_source_manifest(&conn, valid).unwrap();
     assert_eq!(
         conn.query_row(
             "SELECT visible_after, scope_start, scope_end
@@ -177,7 +160,7 @@ fn fresh_macro_routes_require_definition_and_context_links_before_seal() {
     ] {
         conn.execute(sql, [missing_definition]).unwrap();
     }
-    let error = seal(&conn, missing_definition).unwrap_err();
+    let error = seal_rust_source_manifest(&conn, missing_definition).unwrap_err();
     assert!(
         error
             .to_string()
@@ -188,7 +171,7 @@ fn fresh_macro_routes_require_definition_and_context_links_before_seal() {
         .unwrap();
 
     let missing_context = seed_macro_route(&conn, "macro-route-no-context", None);
-    let error = seal(&conn, missing_context).unwrap_err();
+    let error = seal_rust_source_manifest(&conn, missing_context).unwrap_err();
     assert!(
         error.to_string().contains("canonical Rust macro"),
         "missing definition context must remain rejected by a macro link law: {error}"
@@ -197,9 +180,9 @@ fn fresh_macro_routes_require_definition_and_context_links_before_seal() {
 
 #[test]
 fn sealed_macro_route_source_rows_remain_immutable_after_rebuild() {
-    let conn = current_connection();
+    let conn = current_rust_connection();
     let blob_id = seed_macro_route(&conn, "macro-route-immutable", Some(0));
-    seal(&conn, blob_id).unwrap();
+    seal_rust_source_manifest(&conn, blob_id).unwrap();
     for sql in [
         "UPDATE source_rust_item_macros SET passthrough = 1 WHERE blob_id = ?1",
         "DELETE FROM source_rust_item_macros WHERE blob_id = ?1",

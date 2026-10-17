@@ -21,7 +21,7 @@
 /// resolution/receiver indices, re-exported at the paths their framework callers
 /// already use.
 pub(crate) use crate::analyzer::js_ts::receiver_facts::JsTsReceiverFacts;
-use crate::analyzer::usages::parsed_tree::ParseSpec;
+use crate::analyzer::usages::parsed_tree::{ParseSpec, ParsedTreeFile};
 use brokk_bifrost_js_ts::graph::js_ts_target_candidate_files;
 pub(in crate::analyzer::usages) use brokk_bifrost_js_ts::graph::receiver_analysis::{
     JsTsReceiverFactProvider, JsTsReceiverSyntaxIndex, build_js_ts_receiver_syntax_index,
@@ -79,6 +79,25 @@ fn js_ts_hosts(analyzer: &dyn IAnalyzer) -> JsTsHosts<'_> {
     )
 }
 
+fn combined_jsts_usage_index(
+    analyzer: &dyn IAnalyzer,
+    hosts: &JsTsHosts<'_>,
+) -> Option<JsTsUsageIndex> {
+    let mut cached_indices = Vec::new();
+    for language in JS_TS_LANGUAGES {
+        if let Some(index) =
+            resolve_js_ts_source(analyzer, language).and_then(jsts_usage_index_for_parallel_scan)
+        {
+            cached_indices.push(index);
+        }
+    }
+    let aliases = hosts.alias_resolver()?;
+    Some(combine_jsts_usage_indices(
+        aliases,
+        cached_indices.iter().map(std::convert::AsRef::as_ref),
+    ))
+}
+
 /// Build rooted JS/TS usage sites without discarding module identity. The
 /// cross-dialect declaration/import preparation is shared with the ranking
 /// pass; only the common finalizer differs (locations here, kind counts there).
@@ -92,19 +111,7 @@ where
     F: Fn(&ProjectFile) -> bool + Sync + Copy,
 {
     let hosts = js_ts_hosts(analyzer);
-    let mut cached_indices = Vec::new();
-    for language in JS_TS_LANGUAGES {
-        if let Some(index) =
-            resolve_js_ts_source(analyzer, language).and_then(jsts_usage_index_for_parallel_scan)
-        {
-            cached_indices.push(index);
-        }
-    }
-    let aliases = hosts.alias_resolver()?;
-    let combined_index = combine_jsts_usage_indices(
-        aliases,
-        cached_indices.iter().map(std::convert::AsRef::as_ref),
-    );
+    let combined_index = combined_jsts_usage_index(analyzer, &hosts)?;
     let prep = inverted::prepare_scoped_scan(analyzer, &combined_index, callers);
     let mut edges: BTreeMap<(UsageNodeKey, UsageNodeKey), Vec<CallSite>> = BTreeMap::new();
     let mut truncated: BTreeMap<UsageNodeKey, usize> = BTreeMap::new();
@@ -121,35 +128,33 @@ where
             continue;
         };
         let result: UsageEdges<UsageNodeKey> = build_edge_output(&files, keep_file, |file| {
-            let parser_language = js_ts_tree_sitter_language_for_file(file, language)?;
-            let parsed = parse_tree_sitter_file(file, ParseSpec::whole(&parser_language))?;
-            let file_prep = inverted::prepare_scoped_file(
-                &prep,
+            prepare_and_scan_jsts_scoped_file(
                 analyzer,
                 file,
                 language,
-                parsed.tree.root_node(),
-                parsed.source.as_str(),
-            );
-            let declarations = build_file_declarations(analyzer, file);
-            Some(collect_file_edges_with_domain(
-                file,
-                EdgeNodeDomain::Rooted(callers),
-                &parsed,
-                declarations,
-                |input| {
-                    inverted::scan_scoped_file(
-                        host,
-                        token,
-                        &combined_index,
-                        &prep,
-                        file_prep,
-                        language,
+                &prep,
+                |parsed, file_prep| {
+                    let declarations = build_file_declarations(analyzer, file);
+                    collect_file_edges_with_domain(
                         file,
-                        input,
+                        EdgeNodeDomain::Rooted(callers),
+                        parsed,
+                        declarations,
+                        |input| {
+                            inverted::scan_scoped_file(
+                                host,
+                                token,
+                                &combined_index,
+                                &prep,
+                                file_prep,
+                                language,
+                                file,
+                                input,
+                            )
+                        },
                     )
                 },
-            ))
+            )
         });
         for (key, sites) in result.edges {
             edges.entry(key).or_default().extend(sites);
@@ -170,6 +175,26 @@ where
         truncated,
         unproven_inbound,
     })
+}
+
+fn prepare_and_scan_jsts_scoped_file<T>(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    language: Language,
+    prep: &inverted::ScopedScanPrep,
+    scan: impl FnOnce(&ParsedTreeFile, brokk_bifrost_js_ts::graph::inverted::ScopedFilePrep) -> T,
+) -> Option<T> {
+    let parser_language = js_ts_tree_sitter_language_for_file(file, language)?;
+    let parsed = parse_tree_sitter_file(file, ParseSpec::whole(&parser_language))?;
+    let file_prep = inverted::prepare_scoped_file(
+        prep,
+        analyzer,
+        file,
+        language,
+        parsed.tree.root_node(),
+        parsed.source.as_str(),
+    );
+    Some(scan(&parsed, file_prep))
 }
 
 /// Borrow the analyzer-cached [`JsTsUsageIndex`] for `language` off the concrete TS/JS
@@ -319,21 +344,9 @@ where
     let mut node_status: BTreeMap<UsageNodeKey, JsTsScopedNodeStatus> = BTreeMap::new();
     let mut any = false;
 
-    let mut cached_indices = Vec::new();
-    for language in JS_TS_LANGUAGES {
-        if let Some(index) =
-            resolve_js_ts_source(analyzer, language).and_then(jsts_usage_index_for_parallel_scan)
-        {
-            cached_indices.push(index);
-        }
-    }
     // No JS/TS analyzer means no analyzed files for either dialect either, so
     // `any` would stay false and this would return `None` regardless.
-    let aliases = hosts.alias_resolver()?;
-    let combined_index = combine_jsts_usage_indices(
-        aliases,
-        cached_indices.iter().map(std::convert::AsRef::as_ref),
-    );
+    let combined_index = combined_jsts_usage_index(analyzer, &hosts)?;
 
     for language in JS_TS_LANGUAGES {
         if analyzed_files_for_language(analyzer, language).is_empty() {
@@ -403,29 +416,13 @@ where
     // and JavaScript, and a JS file can import a name a TS file declares.
     let prep = inverted::prepare_scoped_scan(analyzer, index, nodes);
     let edges = build_edge_weights(&files, keep_file, |file| {
-        // Parse on demand and drop the tree when this closure returns; cross-file
-        // resolution comes from the analyzer-cached `index`, not retained trees.
-        let parser_language = js_ts_tree_sitter_language_for_file(file, language)?;
-        let parsed = parse_tree_sitter_file(file, ParseSpec::whole(&parser_language))?;
-        let file_prep = inverted::prepare_scoped_file(
-            &prep,
-            analyzer,
-            file,
-            language,
-            parsed.tree.root_node(),
-            parsed.source.as_str(),
-        );
-        Some(collect_file_edges(
-            analyzer,
-            file,
-            nodes,
-            &parsed,
-            |input| {
+        prepare_and_scan_jsts_scoped_file(analyzer, file, language, &prep, |parsed, file_prep| {
+            collect_file_edges(analyzer, file, nodes, parsed, |input| {
                 inverted::scan_scoped_file(
                     host, token, index, &prep, file_prep, language, file, input,
                 )
-            },
-        ))
+            })
+        })
     });
     JsTsScopedUsageEdges {
         edges,
@@ -471,16 +468,6 @@ impl GraphUsageAnalyzer for JsTsExportUsageGraphStrategy {
         scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
-        let Some(resolver) = JsTsQueryResolver::try_new(analyzer) else {
-            let fq_name = overloads.first().map(CodeUnit::fq_name).unwrap_or_default();
-            return GraphUsageOutcome::fallback_safe(
-                fq_name,
-                GraphFailureReason::MissingAnalyzerCapability(
-                    "analyzer does not expose a JS/TS analyzer",
-                ),
-                JS_TS_STRATEGY,
-            );
-        };
-        resolver.find_usages(analyzer, overloads, scan_scope, max_usages)
+        JsTsQueryResolver.find_usages(analyzer, overloads, scan_scope, max_usages)
     }
 }

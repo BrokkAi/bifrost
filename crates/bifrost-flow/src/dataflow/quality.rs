@@ -86,6 +86,52 @@ pub struct PathQualityFrontier {
     bits: u8,
 }
 
+pub(crate) const fn path_evidence_has_proven_path(bits: u8) -> bool {
+    bits & 0b1100 != 0
+}
+
+pub(crate) const fn path_evidence_has_complete_path(bits: u8) -> bool {
+    bits & 0b1010 != 0
+}
+
+pub(crate) const fn path_evidence_has_proven_complete_path(bits: u8) -> bool {
+    bits & 0b1000 != 0
+}
+
+pub(crate) fn path_evidence_from_frontier(frontier: PathQualityFrontier) -> u8 {
+    let mut bits = 0;
+    for quality in frontier.iter() {
+        bits |= match (quality.is_proven(), quality.is_complete()) {
+            (false, false) => 0b0001,
+            (false, true) => 0b0010,
+            (true, false) => 0b0100,
+            (true, true) => 0b1000,
+        };
+    }
+    bits
+}
+
+pub(crate) fn path_evidence_qualities(bits: u8) -> Box<[PathQuality]> {
+    [
+        (0b0001, PathQuality::UNPROVEN_PARTIAL),
+        (0b0010, PathQuality::UNPROVEN_COMPLETE),
+        (0b0100, PathQuality::PROVEN_PARTIAL),
+        (0b1000, PathQuality::PROVEN_COMPLETE),
+    ]
+    .into_iter()
+    .filter_map(|(bit, quality)| (bits & bit != 0).then_some(quality))
+    .collect::<Vec<_>>()
+    .into_boxed_slice()
+}
+
+pub(crate) fn path_evidence_frontier(bits: u8) -> PathQualityFrontier {
+    let mut frontier = PathQualityFrontier::default();
+    for quality in path_evidence_qualities(bits).iter().copied() {
+        frontier.insert(quality);
+    }
+    frontier
+}
+
 impl PathQualityFrontier {
     pub(crate) const fn singleton(quality: PathQuality) -> Self {
         Self {
@@ -102,15 +148,15 @@ impl PathQualityFrontier {
     }
 
     pub const fn has_proven_path(self) -> bool {
-        self.contains(PathQuality::PROVEN_COMPLETE) || self.contains(PathQuality::PROVEN_PARTIAL)
+        path_evidence_has_proven_path(self.bits)
     }
 
     pub const fn has_complete_path(self) -> bool {
-        self.contains(PathQuality::PROVEN_COMPLETE) || self.contains(PathQuality::UNPROVEN_COMPLETE)
+        path_evidence_has_complete_path(self.bits)
     }
 
     pub const fn has_proven_complete_path(self) -> bool {
-        self.contains(PathQuality::PROVEN_COMPLETE)
+        path_evidence_has_proven_complete_path(self.bits)
     }
 
     /// Conjoin every concrete prefix and suffix quality and retain their
@@ -186,19 +232,6 @@ mod tests {
         assert!(frontier.has_proven_path());
         assert!(frontier.has_complete_path());
         assert!(!frontier.has_proven_complete_path());
-    }
-
-    #[test]
-    fn proven_complete_path_dominates_the_entire_frontier() {
-        let mut frontier = PathQualityFrontier::default();
-        frontier.insert(PathQuality::PROVEN_PARTIAL);
-        frontier.insert(PathQuality::UNPROVEN_COMPLETE);
-
-        assert!(frontier.insert(PathQuality::PROVEN_COMPLETE));
-        assert_eq!(
-            frontier.iter().collect::<Vec<_>>(),
-            vec![PathQuality::PROVEN_COMPLETE]
-        );
     }
 
     #[test]

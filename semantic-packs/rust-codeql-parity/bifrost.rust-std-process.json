@@ -1,0 +1,438 @@
+{
+  "schema_version": 2,
+  "pack_id": "bifrost.rust-std-process",
+  "version": "0.1.0",
+  "producer": {
+    "name": "bifrost-reviewed-rust-codeql-parity-models",
+    "version": "0.1.0"
+  },
+  "language": "rust",
+  "ecosystem": "cargo",
+  "compatibility": {
+    "bifrost": ">=0.12.0, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "Rust standard library process command builder APIs reviewed for command-injection taint: Command::new, arg, args, env, current_dir, spawn, output, and status. Builder setters retain receiver identity through normal return.",
+    "revision": "rust-std-1.100"
+  },
+  "license": "Apache-2.0",
+  "completeness": "complete",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "declarations.rust-process.std",
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {
+            "id": "type.rust-process.std-process",
+            "name": "std.process",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/process.rs",
+              "symbol": "std.process"
+            }
+          },
+          {
+            "id": "type.rust-process.std-process-command",
+            "name": "std.process.Command",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/process.rs",
+              "symbol": "std.process.Command"
+            }
+          }
+        ],
+        "members": [
+          {
+            "id": "member.rust-process.std-process-command.new",
+            "owner": "type.rust-process.std-process-command",
+            "name": "new",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "program",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.process.Command"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/process.rs",
+              "symbol": "std.process.Command.new"
+            }
+          },
+          {
+            "id": "member.rust-process.std-process-command.arg",
+            "owner": "type.rust-process.std-process-command",
+            "name": "arg",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "arg",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.process.Command"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/process.rs",
+              "symbol": "std.process.Command.arg"
+            }
+          },
+          {
+            "id": "member.rust-process.std-process-command.args",
+            "owner": "type.rust-process.std-process-command",
+            "name": "args",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "args",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.process.Command"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/process.rs",
+              "symbol": "std.process.Command.args"
+            }
+          },
+          {
+            "id": "member.rust-process.std-process-command.env",
+            "owner": "type.rust-process.std-process-command",
+            "name": "env",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "key",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                },
+                {
+                  "name": "value",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.process.Command"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/process.rs",
+              "symbol": "std.process.Command.env"
+            }
+          },
+          {
+            "id": "member.rust-process.std-process-command.current-dir",
+            "owner": "type.rust-process.std-process-command",
+            "name": "current_dir",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "dir",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.process.Command"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/process.rs",
+              "symbol": "std.process.Command.current_dir"
+            }
+          },
+          {
+            "id": "member.rust-process.std-process-command.spawn",
+            "owner": "type.rust-process.std-process-command",
+            "name": "spawn",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/process.rs",
+              "symbol": "std.process.Command.spawn"
+            }
+          },
+          {
+            "id": "member.rust-process.std-process-command.output",
+            "owner": "type.rust-process.std-process-command",
+            "name": "output",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/process.rs",
+              "symbol": "std.process.Command.output"
+            }
+          },
+          {
+            "id": "member.rust-process.std-process-command.status",
+            "owner": "type.rust-process.std-process-command",
+            "name": "status",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/process.rs",
+              "symbol": "std.process.Command.status"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "summaries.rust-process.std",
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "summary.rust-process.std-process-command.new",
+            "target": {
+              "path": "library/std/src/process.rs",
+              "symbol": "std.process.Command.new",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-process.std-process-command.arg",
+            "target": {
+              "path": "library/std/src/process.rs",
+              "symbol": "std.process.Command.arg",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-process.std-process-command.args",
+            "target": {
+              "path": "library/std/src/process.rs",
+              "symbol": "std.process.Command.args",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-process.std-process-command.env",
+            "target": {
+              "path": "library/std/src/process.rs",
+              "symbol": "std.process.Command.env",
+              "has_receiver": true,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-process.std-process-command.current-dir",
+            "target": {
+              "path": "library/std/src/process.rs",
+              "symbol": "std.process.Command.current_dir",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-process.std-process-command.spawn",
+            "target": {
+              "path": "library/std/src/process.rs",
+              "symbol": "std.process.Command.spawn",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-process.std-process-command.output",
+            "target": {
+              "path": "library/std/src/process.rs",
+              "symbol": "std.process.Command.output",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-process.std-process-command.status",
+            "target": {
+              "path": "library/std/src/process.rs",
+              "symbol": "std.process.Command.status",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          }
+        ]
+      }
+    }
+  ]
+}

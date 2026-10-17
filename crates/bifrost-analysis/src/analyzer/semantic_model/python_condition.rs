@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 use serde_json::{Map, Value};
 
 use super::csmi::{CsmiArtifactDigest, CsmiJson};
+use super::runtime_contract_activation::stable_release as canonical_stable_version;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PythonConditionSnapshot {
@@ -303,12 +304,6 @@ fn validate_field(name: &str, value: Value) -> Vec<String> {
     super::csmi::validate_python_profile_condition(&Value::Object(condition))
 }
 
-fn canonical_stable_version(value: &str) -> Option<semver::Version> {
-    let parsed = semver::Version::parse(value).ok()?;
-    (parsed.pre.is_empty() && parsed.build.is_empty() && parsed.to_string() == value)
-        .then_some(parsed)
-}
-
 fn push_missing(findings: &mut Vec<PythonConditionFinding>, field: PythonConditionField) {
     findings.push(PythonConditionFinding {
         field,
@@ -379,31 +374,6 @@ mod tests {
         assert_eq!(
             evaluate_python_condition(Some(&json!({"python":"3.13"})), &snapshot).status,
             PythonConditionStatus::Indeterminate
-        );
-    }
-
-    #[test]
-    fn python_condition_generic_range_and_unknown_field_are_unsupported() {
-        let snapshot = PythonConditionSnapshot {
-            python_version_raw: Some("3.13.0".to_owned()),
-            ..Default::default()
-        };
-        let range = evaluate_python_condition(
-            Some(&json!({"python":"vers:generic/>=3.12.0|<4.0.0"})),
-            &snapshot,
-        );
-        assert_eq!(range.status, PythonConditionStatus::Unsupported);
-        assert!(range.findings.iter().any(|finding| {
-            finding.field == PythonConditionField::Python
-                && finding.kind == PythonConditionFindingKind::Unsupported
-        }));
-        let unknown = evaluate_python_condition(Some(&json!({"futureField":true})), &snapshot);
-        assert_eq!(unknown.status, PythonConditionStatus::Unsupported);
-        assert!(
-            unknown
-                .findings
-                .iter()
-                .any(|finding| finding.field == PythonConditionField::Condition)
         );
     }
 
@@ -511,6 +481,31 @@ mod tests {
         assert_eq!(
             evaluate_python_condition(Some(&condition), &snapshot).status,
             PythonConditionStatus::Compatible
+        );
+    }
+
+    #[test]
+    fn python_condition_generic_range_and_unknown_field_are_unsupported() {
+        let snapshot = PythonConditionSnapshot {
+            python_version_raw: Some("3.13.0".to_owned()),
+            ..Default::default()
+        };
+        let range = evaluate_python_condition(
+            Some(&json!({"python":"vers:generic/>=3.12.0|<4.0.0"})),
+            &snapshot,
+        );
+        assert_eq!(range.status, PythonConditionStatus::Unsupported);
+        assert!(range.findings.iter().any(|finding| {
+            finding.field == PythonConditionField::Python
+                && finding.kind == PythonConditionFindingKind::Unsupported
+        }));
+        let unknown = evaluate_python_condition(Some(&json!({"futureField":true})), &snapshot);
+        assert_eq!(unknown.status, PythonConditionStatus::Unsupported);
+        assert!(
+            unknown
+                .findings
+                .iter()
+                .any(|finding| finding.field == PythonConditionField::Condition)
         );
     }
 

@@ -1,6 +1,6 @@
 use crate::analyzer::{
     CodeUnit, DescendantIndexVariant, DirectDescendantIndex, KeyedPoolSafeMemo, PoolSafeMemo,
-    ProjectFile,
+    ProjectFile, estimate_collection_bytes,
 };
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
@@ -12,8 +12,9 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, OnceLock};
 
 use super::compilation::CSharpCompilationIndex;
+use crate::analyzer::cache_weight::{estimate_code_unit, estimate_project_file};
 use crate::analyzer::usages::inverted_edges::{UsageEdgesCache, weight_usage_edges};
-use crate::analyzer::weighted_cache::build_weighted_cache;
+use crate::analyzer::weighted_cache::{build_weighted_cache, weight_bytes};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) struct PersistedFqnLookup {
@@ -258,23 +259,28 @@ fn weight_persisted_fqn_candidates(
 }
 
 fn weight_string(_key: &ProjectFile, value: &Arc<String>) -> u32 {
-    weight_bytes(size_of::<String>() as u64 + value.len() as u64)
+    weight_string_payload(size_of::<String>(), value.len() as u64)
 }
 
 fn weight_string_vec(_key: &ProjectFile, value: &Arc<Vec<String>>) -> u32 {
-    weight_bytes(
-        size_of::<Vec<String>>() as u64 + value.iter().map(|item| item.len() as u64).sum::<u64>(),
+    weight_string_payload(
+        size_of::<Vec<String>>(),
+        value.iter().map(|item| item.len() as u64).sum(),
     )
 }
 
 fn weight_string_map(_key: &ProjectFile, value: &Arc<HashMap<String, String>>) -> u32 {
-    weight_bytes(
-        size_of::<HashMap<String, String>>() as u64
-            + value
-                .iter()
-                .map(|(key, value)| key.len() as u64 + value.len() as u64)
-                .sum::<u64>(),
+    weight_string_payload(
+        size_of::<HashMap<String, String>>(),
+        value
+            .iter()
+            .map(|(key, value)| key.len() as u64 + value.len() as u64)
+            .sum(),
     )
+}
+
+fn weight_string_payload(container_size: usize, payload_bytes: u64) -> u32 {
+    weight_bytes(container_size as u64 + payload_bytes)
 }
 
 fn weight_project_code_unit_set(_key: &ProjectFile, value: &Arc<HashSet<CodeUnit>>) -> u32 {
@@ -289,32 +295,20 @@ fn weight_project_file_set(_key: &ProjectFile, value: &Arc<HashSet<ProjectFile>>
     weight_bytes(estimate_project_file_set(value.as_ref()))
 }
 
-fn weight_bytes(bytes: u64) -> u32 {
-    bytes.clamp(1, u32::MAX as u64) as u32
-}
-
-fn estimate_project_file(file: &ProjectFile) -> u64 {
-    size_of::<ProjectFile>() as u64
-        + file.root().as_os_str().to_string_lossy().len() as u64
-        + file.rel_path().as_os_str().to_string_lossy().len() as u64
-}
-
-fn estimate_code_unit(code_unit: &CodeUnit) -> u64 {
-    size_of::<CodeUnit>() as u64
-        + estimate_project_file(code_unit.source())
-        + code_unit.package_name().len() as u64
-        + code_unit.short_name().len() as u64
-        + code_unit
-            .signature()
-            .map_or(0, |signature| signature.len() as u64)
-}
-
 fn estimate_code_unit_set(values: &HashSet<CodeUnit>) -> u64 {
-    size_of::<HashSet<CodeUnit>>() as u64 + values.iter().map(estimate_code_unit).sum::<u64>()
+    estimate_collection_bytes(
+        size_of::<HashSet<CodeUnit>>() as u64,
+        values,
+        estimate_code_unit,
+    )
 }
 
 fn estimate_code_unit_vec(values: &[CodeUnit]) -> u64 {
-    size_of::<Vec<CodeUnit>>() as u64 + values.iter().map(estimate_code_unit).sum::<u64>()
+    estimate_collection_bytes(
+        size_of::<Vec<CodeUnit>>() as u64,
+        values,
+        estimate_code_unit,
+    )
 }
 
 fn estimate_project_file_set(files: &HashSet<ProjectFile>) -> u64 {
@@ -324,6 +318,7 @@ fn estimate_project_file_set(files: &HashSet<ProjectFile>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::BoundedSingleFlightCache;
+    use brokk_bifrost_test_macros::hardwon;
     use moka::sync::Cache;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
@@ -335,6 +330,7 @@ mod tests {
     /// value with a zero-capacity cache, install C2, then let the delayed C1
     /// holder run cleanup. Its identity-conditional removal must preserve C2.
     #[test]
+    #[hardwon("#2795: a late single-flight holder could remove a replacement cache cell")]
     fn rejected_value_does_not_let_a_stale_holder_remove_the_replacement_cell() {
         let cache = Arc::new(BoundedSingleFlightCache::new(Cache::new(0)));
         let after_cell = Arc::new(Barrier::new(2));
@@ -409,6 +405,7 @@ mod tests {
     /// eight callers return that one failure, then C1 is retired and the next
     /// forced miss wave retries once through C2 and publishes the value.
     #[test]
+    #[hardwon("#2795: concurrent failed builds were not shared or retried exactly once")]
     fn failed_wave_is_shared_and_the_next_wave_retries_once() {
         const WORKERS: usize = 8;
 

@@ -18,6 +18,17 @@ mod rows;
 pub(super) mod rust_context;
 pub(super) mod typed;
 
+pub(super) fn completion_from_reasons(
+    reasons: impl IntoIterator<Item = crate::analyzer::resolution::ResolutionIncompleteReason>,
+) -> crate::analyzer::resolution::ResolutionCompletion {
+    let reasons = reasons.into_iter().collect::<Vec<_>>();
+    if reasons.is_empty() {
+        crate::analyzer::resolution::ResolutionCompletion::Complete
+    } else {
+        crate::analyzer::resolution::ResolutionCompletion::incomplete(reasons)
+    }
+}
+
 use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use std::sync::OnceLock;
@@ -44,6 +55,24 @@ use super::resolution_selection::{
     SelectedResolutionTempTransaction, SelectedResolutionUnavailable,
 };
 use crate::CancellationToken;
+
+#[cfg(test)]
+pub(crate) fn assert_partial_path_bodies_equal(
+    actual: &crate::analyzer::resolution::PartialPath,
+    expected: &crate::analyzer::resolution::PartialPath,
+) {
+    assert_eq!(
+        actual
+            .stack_effect_alpha_key_with_poll(&mut || false)
+            .expect("uncancelled actual alpha key"),
+        expected
+            .stack_effect_alpha_key_with_poll(&mut || false)
+            .expect("uncancelled expected alpha key"),
+    );
+    assert_eq!(actual.precedence(), expected.precedence());
+    assert_eq!(actual.witness(), expected.witness());
+    assert_eq!(actual.completion(), expected.completion());
+}
 
 pub(super) const STAGE_SCHEMA_SQL: &str = r#"
 CREATE TEMP TABLE IF NOT EXISTS selected_resolution_admissions(
@@ -125,6 +154,14 @@ pub(super) fn schema_sql() -> &'static str {
     })
 }
 
+pub(super) fn generic_formals_schema_sql() -> &'static str {
+    rows::generic_formals_schema_sql()
+}
+
+pub(super) fn generic_formal_defaults_schema_sql() -> &'static str {
+    rows::generic_formal_defaults_schema_sql()
+}
+
 pub(super) const CLEAR_REQUEST_SQL: &str = "DELETE FROM temp.selected_resolution_stage_producers; DELETE FROM temp.selected_resolution_stage_nodes; DELETE FROM temp.selected_resolution_admissions; DELETE FROM temp.selected_resolution_contexts; DELETE FROM temp.selected_resolution_stage_allocation_counters;";
 
 pub(crate) enum SelectedResolutionStageOutcome {
@@ -133,6 +170,8 @@ pub(crate) enum SelectedResolutionStageOutcome {
     Unavailable(SelectedResolutionUnavailable),
     Stale(SelectedResolutionStale),
 }
+
+pub(crate) use generated::SelectedIncludeBindingPair;
 
 /// A view, never an owner of a lexical or typed fact collection.
 pub(crate) struct SelectedResolutionStage<'selection, 'store> {
@@ -163,6 +202,10 @@ impl<'selection, 'store> SelectedResolutionStage<'selection, 'store> {
         if changed {
             self.selection.note_stage_content_commit();
         }
+        self.selection
+            .derive_helper_decisions()
+            .borrow_mut()
+            .clear();
         Ok(())
     }
 
@@ -418,25 +461,7 @@ pub(super) fn validate_admissions(
     connection: &Connection,
     cancellation: &CancellationToken,
 ) -> Result<SelectedResolutionRevalidationOutcome> {
-    if cancellation.is_cancelled() {
-        return Ok(SelectedResolutionRevalidationOutcome::Cancelled);
-    }
-    super::resolution::with_resolution_read_progress_handler(
-        connection,
-        cancellation,
-        |connection| {
-            let mut statement = connection.prepare_cached(admission_validation_sql())?;
-            let mut rows = statement.query([])?;
-            validation_outcome(&mut rows, cancellation)
-        },
-    )
-    .or_else(|error| {
-        if error.is_sqlite_interrupted() && cancellation.is_cancelled() {
-            Ok(SelectedResolutionRevalidationOutcome::Cancelled)
-        } else {
-            Err(error)
-        }
-    })
+    validate_admission_rows(connection, admission_validation_sql(), &[], cancellation)
 }
 
 fn validate_admission(
@@ -451,6 +476,16 @@ fn validate_admission(
         crate::analyzer::store::resolution_selection::note_selected_static_sql_capacity(6, sql.capacity());
         sql
     });
+    let parameters: [&dyn rusqlite::ToSql; 1] = [&admission];
+    validate_admission_rows(connection, sql, &parameters, cancellation)
+}
+
+fn validate_admission_rows(
+    connection: &Connection,
+    sql: &str,
+    parameters: &[&dyn rusqlite::ToSql],
+    cancellation: &CancellationToken,
+) -> Result<SelectedResolutionRevalidationOutcome> {
     if cancellation.is_cancelled() {
         return Ok(SelectedResolutionRevalidationOutcome::Cancelled);
     }
@@ -459,7 +494,7 @@ fn validate_admission(
         cancellation,
         |connection| {
             let mut statement = connection.prepare_cached(sql)?;
-            let mut rows = statement.query([admission])?;
+            let mut rows = statement.query(parameters)?;
             validation_outcome(&mut rows, cancellation)
         },
     )

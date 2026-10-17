@@ -1,5 +1,5 @@
 use super::*;
-use crate::analyzer::usages::{ExportEntry, ImportBinder, ImportBinding, ReexportStar};
+use crate::analyzer::usages::{ImportBinder, ImportBinding};
 use std::mem::size_of;
 use std::sync::Arc;
 
@@ -7,6 +7,18 @@ use std::sync::Arc;
 pub(super) struct PythonUsageEdgesKey {
     caller_nodes: Arc<[String]>,
     callee_targets: Arc<[String]>,
+}
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+pub(super) struct PythonClassMutationKey {
+    identity_groups: Arc<[Arc<[String]>]>,
+    member: String,
+}
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+pub(super) struct PythonModuleMemberMutationKey {
+    module: String,
+    member: String,
 }
 
 impl PythonUsageEdgesKey {
@@ -18,41 +30,52 @@ impl PythonUsageEdgesKey {
     }
 }
 
-pub(super) fn weight_code_unit_vec(_key: &CodeUnit, value: &Arc<Vec<CodeUnit>>) -> u32 {
-    let size = value
-        .iter()
-        .map(|item| item.fq_name().len() + size_of::<CodeUnit>())
-        .sum::<usize>()
-        + size_of::<Vec<CodeUnit>>();
-    size.min(u32::MAX as usize) as u32
+impl PythonClassMutationKey {
+    pub(super) fn new(identity_groups: &[Vec<&str>], member: &str) -> Self {
+        let mut identity_groups = identity_groups
+            .iter()
+            .map(|group| {
+                let mut identities = group
+                    .iter()
+                    .map(|identity| (*identity).to_owned())
+                    .collect::<Vec<_>>();
+                identities.sort_unstable();
+                identities.dedup();
+                Arc::<[String]>::from(identities)
+            })
+            .collect::<Vec<_>>();
+        identity_groups.sort_unstable_by(|left, right| left.as_ref().cmp(right.as_ref()));
+        identity_groups.dedup_by(|left, right| left.as_ref() == right.as_ref());
+        Self {
+            identity_groups: identity_groups.into(),
+            member: member.to_owned(),
+        }
+    }
 }
 
-pub(super) fn weight_export_index(_key: &ProjectFile, value: &Arc<ExportIndex>) -> u32 {
-    let exports_size = value
-        .exports_by_name
-        .iter()
-        .map(|(name, entry)| {
-            name.len()
-                + match entry {
-                    ExportEntry::Local { local_name } => local_name.len(),
-                    ExportEntry::ReexportedNamed {
-                        module_specifier,
-                        imported_name,
-                    } => module_specifier.len() + imported_name.len(),
-                    ExportEntry::ReexportedModule { module_specifier } => module_specifier.len(),
-                    ExportEntry::Default { local_name } => {
-                        local_name.as_deref().map_or(0, str::len)
-                    }
-                }
-                + size_of::<ExportEntry>()
-        })
-        .sum::<usize>();
-    let reexport_stars_size = value
-        .reexport_stars
-        .iter()
-        .map(|star| star.module_specifier.len() + size_of::<ReexportStar>())
-        .sum::<usize>();
-    (exports_size + reexport_stars_size + size_of::<ExportIndex>()).min(u32::MAX as usize) as u32
+pub(super) fn build_python_class_mutation_cache() -> Cache<PythonClassMutationKey, bool> {
+    Cache::builder().max_capacity(4_096).build()
+}
+
+pub(super) fn build_python_module_member_mutation_cache()
+-> Cache<PythonModuleMemberMutationKey, bool> {
+    Cache::builder().max_capacity(4_096).build()
+}
+
+impl PythonModuleMemberMutationKey {
+    pub(super) fn new(module: &str, member: &str) -> Self {
+        Self {
+            module: module.to_owned(),
+            member: member.to_owned(),
+        }
+    }
+}
+
+pub(super) fn weight_module_global_source_facts(
+    _key: &(crate::analyzer::store::GenerationId, git2::Oid, ProjectFile),
+    value: &Arc<brokk_bifrost_python::source_facts::PythonModuleGlobalSourceFacts>,
+) -> u32 {
+    u32::try_from(value.estimated_retained_bytes()).unwrap_or(u32::MAX)
 }
 
 pub(super) fn weight_import_binder(_key: &ProjectFile, value: &Arc<ImportBinder>) -> u32 {
@@ -78,28 +101,7 @@ pub(super) fn weight_python_usage_edges(
     edges: &Arc<crate::analyzer::usages::inverted_edges::UsageEdges>,
 ) -> u32 {
     let key_bytes = names_weight(&key.caller_nodes) + names_weight(&key.callee_targets);
-    let edge_bytes = edges
-        .edges
-        .iter()
-        .map(|((caller, callee), sites)| {
-            caller.len()
-                + callee.len()
-                + sites
-                    .iter()
-                    .map(|site| {
-                        size_of::<crate::analyzer::usages::inverted_edges::CallSite>()
-                            + site.path.len()
-                    })
-                    .sum::<usize>()
-        })
-        .sum::<usize>();
-    let summary_bytes = edges
-        .truncated
-        .keys()
-        .chain(edges.unproven_inbound.keys())
-        .map(|name| size_of::<String>() + name.len() + size_of::<usize>())
-        .sum::<usize>();
-    (key_bytes + edge_bytes + summary_bytes).clamp(1, u32::MAX as usize) as u32
+    crate::analyzer::usages::inverted_edges::weight_usage_edge_contents(key_bytes, edges)
 }
 
 fn sorted_names(names: &HashSet<String>) -> Arc<[String]> {
@@ -123,7 +125,11 @@ mod tests {
     use crate::analyzer::{IAnalyzer, Language, ProjectFile, TestProject};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use brokk_bifrost_test_macros::hardwon;
     #[test]
+    #[hardwon(
+        "#1320: Regression from sustained warm Python benchmark latency: cached exact-target edges must be reused and invalidated with analyzer generation"
+    )]
     fn usage_edges_are_reused_per_target_set_and_reset_on_update() {
         let root = tempfile::tempdir().expect("temporary project root");
         let file = ProjectFile::new(root.path(), "module.py");
@@ -200,5 +206,138 @@ mod tests {
             panic!("available Python usage graph must be cached")
         });
         assert_eq!(2, builds.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    #[hardwon("#4598: constructor member lookups repeated the same full-workspace mutation scan")]
+    fn class_mutation_scan_cache_keys_sorted_inputs_and_resets_on_update() {
+        let root = tempfile::tempdir().expect("temporary project root");
+        let file = ProjectFile::new(root.path(), "module.py");
+        file.write("class Widget: pass\n")
+            .expect("write Python fixture");
+        let analyzer = PythonAnalyzer::new(Arc::new(TestProject::new(
+            root.path().to_path_buf(),
+            Language::Python,
+        )));
+        let identity_groups = vec![
+            vec!["pkg.Widget", "alias.Widget"],
+            vec!["pkg.Other", "other"],
+        ];
+        let reordered_groups = vec![
+            vec!["other", "pkg.Other"],
+            vec!["alias.Widget", "pkg.Widget"],
+        ];
+        let changed_groups = vec![
+            vec!["pkg.Widget", "alias.Widget"],
+            vec!["pkg.Renamed", "other"],
+        ];
+        let scans = AtomicUsize::new(0);
+
+        assert!(
+            analyzer.cached_class_member_mutation_free(&identity_groups, "run", || {
+                scans.fetch_add(1, Ordering::Relaxed);
+                true
+            },)
+        );
+        assert!(
+            analyzer.cached_class_member_mutation_free(&reordered_groups, "run", || panic!(
+                "permuted identity groups must reuse the full-workspace scan"
+            ),)
+        );
+        assert_eq!(1, scans.load(Ordering::Relaxed));
+
+        assert!(
+            !analyzer.cached_class_member_mutation_free(&changed_groups, "run", || {
+                scans.fetch_add(1, Ordering::Relaxed);
+                false
+            },)
+        );
+        assert!(
+            !analyzer.cached_class_member_mutation_free(&changed_groups, "run", || panic!(
+                "the cached negative proof must be reused"
+            ),)
+        );
+        assert_eq!(2, scans.load(Ordering::Relaxed));
+
+        assert!(
+            !analyzer.cached_class_member_mutation_free(&identity_groups, "close", || {
+                scans.fetch_add(1, Ordering::Relaxed);
+                false
+            },)
+        );
+        assert_eq!(3, scans.load(Ordering::Relaxed));
+
+        file.write("class Widget:\n    pass\n")
+            .expect("update Python fixture");
+        let updated = analyzer.update(&std::collections::BTreeSet::from([file]));
+        assert!(
+            updated.cached_class_member_mutation_free(&identity_groups, "run", || {
+                scans.fetch_add(1, Ordering::Relaxed);
+                true
+            },)
+        );
+        assert_eq!(4, scans.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    #[hardwon(
+        "#4622: repeated module-global class reads must reuse the bounded cross-file write scan"
+    )]
+    fn module_member_mutation_scan_cache_is_bounded_by_generation_and_name() {
+        let root = tempfile::tempdir().expect("temporary project root");
+        let file = ProjectFile::new(root.path(), "module.py");
+        file.write("value = object()\n")
+            .expect("write Python fixture");
+        let analyzer = PythonAnalyzer::new(Arc::new(TestProject::new(
+            root.path().to_path_buf(),
+            Language::Python,
+        )));
+        let scans = AtomicUsize::new(0);
+
+        assert!(
+            analyzer.cached_module_member_mutation_free("module", "value", || {
+                scans.fetch_add(1, Ordering::Relaxed);
+                Some(true)
+            })
+        );
+        assert!(
+            analyzer.cached_module_member_mutation_free("module", "value", || panic!(
+                "the same module and name must reuse its completed scan"
+            ))
+        );
+        assert_eq!(1, scans.load(Ordering::Relaxed));
+
+        assert!(
+            !analyzer.cached_module_member_mutation_free("module", "other", || {
+                scans.fetch_add(1, Ordering::Relaxed);
+                Some(false)
+            })
+        );
+        assert!(
+            !analyzer.cached_module_member_mutation_free("module", "other", || panic!(
+                "a completed open result must be memoized"
+            ))
+        );
+        assert_eq!(2, scans.load(Ordering::Relaxed));
+
+        assert!(!analyzer.cached_module_member_mutation_free("module", "retry", || None));
+        assert!(
+            analyzer.cached_module_member_mutation_free("module", "retry", || {
+                scans.fetch_add(1, Ordering::Relaxed);
+                Some(true)
+            })
+        );
+        assert_eq!(3, scans.load(Ordering::Relaxed));
+
+        file.write("value = object()\n# updated\n")
+            .expect("update Python fixture");
+        let updated = analyzer.update(&std::collections::BTreeSet::from([file]));
+        assert!(
+            updated.cached_module_member_mutation_free("module", "value", || {
+                scans.fetch_add(1, Ordering::Relaxed);
+                Some(true)
+            })
+        );
+        assert_eq!(4, scans.load(Ordering::Relaxed));
     }
 }

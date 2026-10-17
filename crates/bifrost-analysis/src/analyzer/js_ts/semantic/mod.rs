@@ -25,8 +25,16 @@ use brokk_bifrost_js_ts::syntax::{
 };
 use brokk_bifrost_js_ts::ts_owners::ts_unwrap_expression;
 
-const JAVASCRIPT_ADAPTER_VERSION: &[u8] = b"javascript-value-semantics-v30";
-const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v35";
+// Bumping this rotates every public wire id hashed from the adapter
+// fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
+// golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
+// change; the code-query tutorial pages elide such ids (#5016).
+const JAVASCRIPT_ADAPTER_VERSION: &[u8] = b"javascript-value-semantics-v32";
+// Bumping this rotates every public wire id hashed from the adapter
+// fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
+// golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
+// change; the code-query tutorial pages elide such ids (#5016).
+const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v37";
 
 #[derive(Debug, Clone, Copy)]
 enum JsTsSemanticFlavor {
@@ -89,11 +97,10 @@ impl ProgramSemanticsLowerer for JsTsSemanticLowerer {
                 DependencyFingerprint::hash_bytes(b"no-intrafile-dependencies")
             }
             JsTsSemanticFlavor::TypeScript => {
-                let mut digest = LengthDelimitedDigest::new(
+                crate::analyzer::semantic::versioned_dependency_fingerprint(
                     b"bifrost.typescript-semantic.structural-facts-dependency.v1",
-                );
-                digest.push(&STRUCTURAL_FACTS_VERSION.to_le_bytes());
-                DependencyFingerprint::from_digest(digest.finish())
+                    STRUCTURAL_FACTS_VERSION,
+                )
             }
         };
         SemanticAdapterIdentity {
@@ -234,18 +241,15 @@ impl ProgramSemanticsLowerer for JsTsSemanticLowerer {
                         nested_entries: work_items,
                         ..SemanticWork::default()
                     };
-                    initial_work = sum_lowering_work(initial_work, work);
-                    inventory_work = sum_lowering_work(inventory_work, work);
+                    initial_work = initial_work.conservative_add(work);
+                    inventory_work = inventory_work.conservative_add(work);
                     Some(index)
                 }
                 StructuralNodeIndexOutcome::Exceeded { minimum_work_items } => {
-                    let work = sum_lowering_work(
-                        inventory_work,
-                        SemanticWork {
-                            nested_entries: minimum_work_items,
-                            ..SemanticWork::default()
-                        },
-                    );
+                    let work = inventory_work.conservative_add(SemanticWork {
+                        nested_entries: minimum_work_items,
+                        ..SemanticWork::default()
+                    });
                     let exceeded = budget
                         .check(work)
                         .expect_err("structural minimum exceeds its remaining semantic budget");
@@ -310,45 +314,13 @@ const fn procedure_owns_receiver(kind: ProcedureKind, properties: ProcedurePrope
 }
 
 fn js_ts_capabilities() -> SemanticCapabilities {
-    let mut builder = SemanticCapabilities::builder();
+    let mut builder = crate::analyzer::semantic::capabilities::tree_sitter_adapter_capabilities();
     for capability in [
-        SemanticCapability::Procedures,
-        SemanticCapability::EntryBoundary,
-        SemanticCapability::NormalExitBoundary,
-        SemanticCapability::ExceptionalExitBoundary,
-        SemanticCapability::BasicBlocks,
-        SemanticCapability::ProgramPoints,
-        SemanticCapability::ReturnFlow,
-        SemanticCapability::NormalCallContinuation,
-        SemanticCapability::ExceptionalCallContinuation,
-    ] {
-        builder = builder.complete(capability);
-    }
-    for capability in [
-        SemanticCapability::ExceptionalControlFlow,
-        SemanticCapability::CleanupControlFlow,
-        SemanticCapability::Calls,
-        SemanticCapability::DynamicDispatch,
-        SemanticCapability::CallableReferences,
-        SemanticCapability::Values,
-        SemanticCapability::Assignments,
-        SemanticCapability::Allocations,
-        SemanticCapability::FieldMemory,
-        SemanticCapability::IndexMemory,
-        SemanticCapability::LocalFlow,
-        SemanticCapability::ParameterFlow,
-        SemanticCapability::ReceiverFlow,
-        SemanticCapability::Captures,
-        SemanticCapability::NormalControlFlow,
         SemanticCapability::GeneratorSuspension,
-        SemanticCapability::NonLocalControl,
-        SemanticCapability::ResourceManagement,
         SemanticCapability::AsyncSuspendResume,
-        SemanticCapability::DeferredExecution,
     ] {
         builder = builder.partial(capability);
     }
-    builder = builder.partial(SemanticCapability::GuardFacts);
     builder.build()
 }
 
@@ -480,12 +452,11 @@ fn lexical_capture_destination(
     captures_receiver: bool,
     capture_index: usize,
 ) -> Result<MemoryLocationId, TsLoweringError> {
-    let index = capture_index
-        .checked_add(usize::from(captures_receiver))
-        .ok_or_else(|| TsLoweringError::Invalid("too many JS/TS captures".into()))?;
-    let index = u32::try_from(index)
-        .map_err(|_| TsLoweringError::Invalid("too many JS/TS captures".into()))?;
-    Ok(MemoryLocationId::new(index))
+    crate::analyzer::semantic::lowering::lexical_capture_destination(
+        captures_receiver,
+        capture_index,
+        "JS/TS",
+    )
 }
 
 /// A local whose value is a proven allocation for the binding's whole extent:

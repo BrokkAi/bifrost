@@ -6,6 +6,7 @@ import {
   ROOT_PACKAGE,
   platformManifest,
   rootManifest,
+  selectPlatforms,
   tarballBasename,
   versionFromTag,
 } from "../scripts/package-release.mjs";
@@ -53,4 +54,14 @@ test("sets npm platform constraints", () => {
 
 test("uses npm tarball names for scoped packages", () => {
   assert.equal(tarballBasename(ROOT_PACKAGE, "0.8.22"), "brokkai-bifrost-0.8.22.tgz");
+});
+
+test("narrows the packaged platforms to named targets and refuses unknown ones", () => {
+  assert.equal(selectPlatforms(undefined), PLATFORMS);
+  assert.deepEqual(
+    selectPlatforms(["x86_64-unknown-linux-gnu"]).map((platform) => platform.packageName),
+    ["@brokkai/bifrost-linux-x64-gnu"],
+  );
+  assert.throws(() => selectPlatforms(["x86_64-unknown-linux-musl"]), /unknown release targets/);
+  assert.throws(() => selectPlatforms([]), /unknown release targets/);
 });

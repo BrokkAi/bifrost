@@ -2,11 +2,11 @@ use crate::bindings::python_direct_scope_bindings_bounded;
 use crate::imports::{python_import_infos_from_node, python_import_syntaxes_from_node};
 use crate::syntax::{
     PythonOverloadDecoratorBindings, PythonOverloadDecoratorName, expression_name_node,
-    python_plain_string_literal,
+    python_parameter_name, python_plain_string_literal,
 };
-use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
+use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::model::{
-    CodeUnitType, DispatchExtensibility, ParameterMetadata, SignatureMetadata,
+    CallableArity, CodeUnitType, DispatchExtensibility, ParameterMetadata, SignatureMetadata,
     StructuredImportPathKind, StructuredTypeIdentity,
 };
 use brokk_bifrost_core::analyzer::parsed_file::{
@@ -30,12 +30,7 @@ use std::path::{Path, PathBuf};
 use tree_sitter::{Node, Parser, Tree};
 
 use crate::source_properties::{python_annotation_references, python_return_type_identity};
-use crate::structural::PYTHON_STRUCTURAL_SPEC;
-
-/// Intern one qualified-name segment in the process-global interner.
-fn py_segment(text: &str, kind: SegmentKind) -> SegmentId {
-    segment_interner().intern(text, kind)
-}
+use crate::structural::{PYTHON_STRUCTURAL_SPEC, python_parenthesized_expression_child};
 
 /// Build the structured module-path prefix for a Python declaration.
 ///
@@ -50,15 +45,7 @@ fn py_segment(text: &str, kind: SegmentKind) -> SegmentId {
 /// hidden-directory segments stay intact in cold extraction, synthesized module
 /// units, and persisted reconstruction.
 pub fn python_module_fq(file: &ProjectFile) -> FqName {
-    python_module_fq_from_components(&python_module_components(file))
-}
-
-fn python_module_fq_from_components(components: &[String]) -> FqName {
-    let mut fq = FqName::new();
-    for component in components {
-        fq.push(py_segment(component, SegmentKind::Package));
-    }
-    fq
+    FqName::from_package_components(&python_module_components(file))
 }
 
 fn python_module_components(file: &ProjectFile) -> Vec<String> {
@@ -364,13 +351,18 @@ fn parse_setuptools_setup_py_import_root(setup_py: &Path) -> Option<PathBuf> {
 /// calls that disagree declare nothing.
 pub fn setuptools_setup_py_python_requires(setup_py: &Path) -> Option<String> {
     let source = std::fs::read_to_string(setup_py).ok()?;
-    let tree = parse_python_tree(&source)?;
+    setuptools_setup_py_python_requires_from_source(&source)
+}
+
+/// Snapshot-fed counterpart of the legacy declaration reader.
+pub fn setuptools_setup_py_python_requires_from_source(source: &str) -> Option<String> {
+    let tree = parse_python_tree(source)?;
     let root = tree.root_node();
     if root.has_error() {
         return None;
     }
     let mut requirement: Option<String> = None;
-    for (call, _) in setup_py_setup_calls(&source, root) {
+    for (call, _) in setup_py_setup_calls(source, root) {
         let Some(arguments) = call.child_by_field_name("arguments") else {
             continue;
         };
@@ -385,11 +377,11 @@ pub fn setuptools_setup_py_python_requires(setup_py: &Path) -> Option<String> {
             let Some(name) = argument.child_by_field_name("name") else {
                 continue;
             };
-            if py_node_text(name, &source).trim() != "python_requires" {
+            if py_node_text(name, source).trim() != "python_requires" {
                 continue;
             }
             let value = argument.child_by_field_name("value")?;
-            let declared = python_plain_string_literal(value, &source)?.to_owned();
+            let declared = python_plain_string_literal(value, source)?.to_owned();
             if requirement
                 .replace(declared.clone())
                 .is_some_and(|previous| previous != declared)
@@ -399,6 +391,100 @@ pub fn setuptools_setup_py_python_requires(setup_py: &Path) -> Option<String> {
         }
     }
     requirement
+}
+
+/// One supported setuptools keyword, with its original AST range. Unknown
+/// expressions remain `None`; this function never executes the script.
+#[derive(Debug, Clone)]
+pub struct SetuptoolsLiteralArgument {
+    pub name: String,
+    pub value: Option<SetuptoolsLiteralValue>,
+    pub byte_range: std::ops::Range<usize>,
+    pub call_index: usize,
+}
+
+#[derive(Debug, Clone)]
+pub enum SetuptoolsLiteralValue {
+    String(String),
+    Strings(Vec<String>),
+    Extras(Vec<(String, Vec<String>)>),
+}
+
+pub fn setuptools_setup_py_literal_arguments(
+    source: &str,
+) -> Option<Vec<SetuptoolsLiteralArgument>> {
+    let tree = parse_python_tree(source)?;
+    let root = tree.root_node();
+    if root.has_error() {
+        return None;
+    }
+    let mut output = Vec::new();
+    for (call_index, (call, _)) in setup_py_setup_calls(source, root).into_iter().enumerate() {
+        let arguments = call.child_by_field_name("arguments")?;
+        let mut cursor = arguments.walk();
+        for argument in arguments.named_children(&mut cursor) {
+            if argument.kind() == "dictionary_splat" {
+                output.push(SetuptoolsLiteralArgument {
+                    name: "**kwargs".to_owned(),
+                    value: None,
+                    byte_range: argument.byte_range(),
+                    call_index,
+                });
+                continue;
+            }
+            if argument.kind() != "keyword_argument" {
+                continue;
+            }
+            let name = py_node_text(argument.child_by_field_name("name")?, source).to_owned();
+            let node = argument.child_by_field_name("value")?;
+            let value = match name.as_str() {
+                "name" | "version" | "python_requires" => python_plain_string_literal(node, source)
+                    .map(|value| SetuptoolsLiteralValue::String(value.to_owned())),
+                "install_requires" | "setup_requires" | "tests_require" => {
+                    setuptools_literal_strings(node, source).map(SetuptoolsLiteralValue::Strings)
+                }
+                "extras_require" => {
+                    let mut entries = Vec::new();
+                    let mut cursor = node.walk();
+                    let mut complete = node.kind() == "dictionary";
+                    for pair in node.named_children(&mut cursor) {
+                        let entry = pair
+                            .child_by_field_name("key")
+                            .and_then(|key| python_plain_string_literal(key, source))
+                            .zip(
+                                pair.child_by_field_name("value")
+                                    .and_then(|value| setuptools_literal_strings(value, source)),
+                            );
+                        if let Some((key, values)) = entry {
+                            entries.push((key.to_owned(), values));
+                        } else {
+                            complete = false;
+                        }
+                    }
+                    complete.then_some(SetuptoolsLiteralValue::Extras(entries))
+                }
+                _ => continue,
+            };
+            output.push(SetuptoolsLiteralArgument {
+                name,
+                value,
+                byte_range: node.byte_range(),
+                call_index,
+            });
+        }
+    }
+    Some(output)
+}
+
+fn setuptools_literal_strings(node: Node<'_>, source: &str) -> Option<Vec<String>> {
+    if !matches!(node.kind(), "list" | "tuple") {
+        return None;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .filter(|child| child.kind() != "comment")
+        .map(|child| python_plain_string_literal(child, source).map(str::to_owned))
+        .collect()
 }
 
 /// Every top-level call to an imported setuptools `setup` binding, paired with
@@ -687,11 +773,11 @@ fn setup_py_static_package_dir(value: Node<'_>, source: &str) -> Option<PathBuf>
     (!root.is_absolute()).then_some(root)
 }
 
-fn setup_py_unwrap_parenthesized(mut node: Node<'_>) -> Node<'_> {
-    while node.kind() == "parenthesized_expression" && node.named_child_count() == 1 {
-        node = node.named_child(0).expect("parenthesized expression child");
-    }
-    node
+fn setup_py_unwrap_parenthesized(node: Node<'_>) -> Node<'_> {
+    brokk_bifrost_core::analyzer::tree_walk::unwrap_parenthesized_expression_with(
+        node,
+        python_parenthesized_expression_child,
+    )
 }
 
 fn parse_setuptools_where_entries(manifest: &Path) -> Vec<String> {
@@ -738,8 +824,7 @@ pub fn python_is_decorated_function_boundary(node: Node<'_>) -> bool {
 pub struct Scope {
     kind: ScopeKind,
     path: String,
-    /// The structured qualified name matching `path` (M1 dual representation;
-    /// see `.agents/plans/fqname-interned-segments.md`). Tracked independent of
+    /// The structured qualified name matching `path`. Tracked independently of
     /// whether this scope level was actually `capture`d as a `CodeUnit`, so a
     /// nested class/function that IS captured can always extend an ancestor's
     /// `fq` even when an intermediate scope level (e.g. a non-captured nested
@@ -962,9 +1047,7 @@ where
         unit: CodeUnit,
         metadata_ordinal: Option<usize>,
     ) -> SourceDeclarationId {
-        let occurrence = self.source_facts.intern_node(declaration_node);
-        let name = name_node.map(|node| self.source_facts.intern_node(node));
-        let declaration = self.source_facts.declare(occurrence, name);
+        let declaration = self.source_facts.declare_node(declaration_node, name_node);
         self.source_declaration_units
             .push((declaration, unit.clone()));
         if let Some(metadata_ordinal) = metadata_ordinal {
@@ -990,11 +1073,9 @@ where
                     .filter(|parent| parent.kind() == "decorated_definition")
             })
             .unwrap_or(node);
-        let occurrence = self.source_facts.intern_node(declaration_node);
-        let name = node
-            .child_by_field_name("name")
-            .map(|name| self.source_facts.intern_node(name));
-        let declaration = self.source_facts.declare(occurrence, name);
+        let declaration = self
+            .source_facts
+            .declare_node(declaration_node, node.child_by_field_name("name"));
         let return_annotation = node
             .child_by_field_name("return_type")
             .map(|annotation| self.source_facts.intern_node(annotation));
@@ -1171,11 +1252,11 @@ where
             Some(parent) => parent
                 .fq
                 .clone()
-                .with_pushed(py_segment(name, SegmentKind::Nested)),
+                .with_pushed(segment_interner().intern(name, SegmentKind::Nested)),
             None => self
                 .module_fq
                 .clone()
-                .with_pushed(py_segment(name, SegmentKind::Type)),
+                .with_pushed(segment_interner().intern(name, SegmentKind::Type)),
         };
         let code_unit = CodeUnit::new_fq(
             self.file.clone(),
@@ -1279,20 +1360,20 @@ where
                 ScopeKind::Class => parent
                     .fq
                     .clone()
-                    .with_pushed(py_segment(name, SegmentKind::Member)),
+                    .with_pushed(segment_interner().intern(name, SegmentKind::Member)),
                 ScopeKind::Function => parent
                     .fq
                     .clone()
-                    .with_pushed(py_segment(name, SegmentKind::Nested)),
+                    .with_pushed(segment_interner().intern(name, SegmentKind::Nested)),
             }
         } else {
             self.module_fq
                 .clone()
-                .with_pushed(py_segment(name, SegmentKind::Member))
+                .with_pushed(segment_interner().intern(name, SegmentKind::Member))
         };
 
         if capture {
-            let code_unit_type = if python_function_has_decorator(node, self.source, "property") {
+            let code_unit_type = if python_function_has_property_decorator(node, self.source) {
                 CodeUnitType::Field
             } else {
                 CodeUnitType::Function
@@ -1311,7 +1392,7 @@ where
             );
             self.parsed
                 .replace_code_unit(code_unit.clone(), range_node, self.source, None, None);
-            let signature = python_function_signature(range_node, self.source);
+            let signature = python_function_signature(node, self.source);
             let fact_index = *self
                 .python_callable_return_by_node
                 .get(&node.id())
@@ -1436,14 +1517,14 @@ where
                     parent
                         .fq
                         .clone()
-                        .with_pushed(py_segment(&name, SegmentKind::Member)),
+                        .with_pushed(segment_interner().intern(&name, SegmentKind::Member)),
                 )
             } else if module_control_depth <= 1 {
                 (
                     name.clone(),
                     self.module_fq
                         .clone()
-                        .with_pushed(py_segment(&name, SegmentKind::Member)),
+                        .with_pushed(segment_interner().intern(&name, SegmentKind::Member)),
                 )
             } else {
                 continue;
@@ -1522,7 +1603,7 @@ where
                 parent
                     .fq
                     .clone()
-                    .with_pushed(py_segment(&name, SegmentKind::Member)),
+                    .with_pushed(segment_interner().intern(&name, SegmentKind::Member)),
             );
             if !self.parsed.contains_declaration(&code_unit) {
                 self.parsed.replace_code_unit(
@@ -1569,7 +1650,7 @@ where
         }
     }
 
-    fn finish(self) {
+    fn finish(self, root: Node<'_>) {
         let PythonVisitor {
             parsed,
             source,
@@ -1587,7 +1668,7 @@ where
         } = self;
         assert_eq!(structural_parents, vec![None]);
         let structural = structural
-            .finish()
+            .finish(root)
             .expect("Python structural fact collection must finish");
         let occurrences = source_facts.finish();
         assert!(
@@ -1644,7 +1725,7 @@ where
 pub fn parse_python_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFile {
     let module_components = python_module_components(file);
     let module_name = module_components.join(".");
-    let module_fq = python_module_fq_from_components(&module_components);
+    let module_fq = FqName::from_package_components(&module_components);
     let mut parsed = ParsedFile::new(module_name.clone());
     let root = tree.root_node();
 
@@ -1687,14 +1768,12 @@ pub fn parse_python_file(file: &ProjectFile, source: &str, tree: &Tree) -> Parse
         overload_metadata: Vec::new(),
     };
     visitor.visit_container(root, &[], 0);
-    visitor.finish();
+    visitor.finish(root);
 
     parsed
 }
 
-pub fn py_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    brokk_bifrost_core::analyzer::common::node_source_text(node, source)
-}
+pub use brokk_bifrost_core::analyzer::common::node_source_text as py_node_text;
 
 pub fn python_module_name(file: &ProjectFile) -> String {
     python_module_components(file).join(".")
@@ -1710,7 +1789,7 @@ pub fn module_code_unit(file: &ProjectFile, module_fq: &str) -> Option<CodeUnit>
         components.join("."),
         "module_code_unit must be built from the file's path-derived Python module name"
     );
-    let structured_fq = python_module_fq_from_components(&components);
+    let structured_fq = FqName::from_package_components(&components);
     module_code_unit_from_fq(file, &components, structured_fq)
 }
 
@@ -1734,13 +1813,80 @@ fn python_class_signature(node: Node<'_>, source: &str) -> String {
     python_header_with_decorators(node, source)
 }
 
-fn python_function_signature(node: Node<'_>, source: &str) -> String {
-    let header = python_header_with_decorators(node, source);
-    if let Some((head, tail)) = header.rsplit_once('\n') {
-        format!("{head}\n{tail} ...")
-    } else {
-        format!("{header} ...")
+fn python_function_signature(function: Node<'_>, source: &str) -> String {
+    let header_end = (0..function.child_count())
+        .rev()
+        .filter_map(|index| function.child(index))
+        .find(|child| child.kind() == ":")
+        .map_or_else(
+            || {
+                function
+                    .child_by_field_name("body")
+                    .map_or(function.end_byte(), |body| body.start_byte())
+            },
+            |colon| colon.end_byte(),
+        );
+    let header_node = python_function_header_node(function);
+    let header_start = header_node.start_byte();
+    let header = source
+        .get(header_start..header_end)
+        .expect("Python function header must be a source range")
+        .trim_end();
+    format!(
+        "{} ...",
+        python_dedent_function_header(header, header_node.start_position().column)
+    )
+}
+
+fn python_dedent_function_header(header: &str, base_indent: usize) -> String {
+    let mut lines = header.lines();
+    let Some(first) = lines.next() else {
+        return String::new();
+    };
+    let mut dedented = String::with_capacity(header.len());
+    dedented.push_str(first);
+    for line in lines {
+        dedented.push('\n');
+        dedented.push_str(&line[python_header_indent_bytes(line, base_indent)..]);
     }
+    dedented
+}
+
+/// Map an AST byte position in a source prefix to the matching offset after
+/// function-header dedenting and CRLF normalization.
+fn python_dedented_header_offset(source_prefix: &str, base_indent: usize) -> usize {
+    let mut removed_bytes = 0;
+    let mut line_start = 0;
+    let mut continuation_line = false;
+
+    while line_start < source_prefix.len() {
+        let newline = source_prefix.as_bytes()[line_start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|offset| line_start + offset);
+        let line_end = newline.unwrap_or(source_prefix.len());
+        let line = &source_prefix[line_start..line_end];
+        if continuation_line {
+            removed_bytes += python_header_indent_bytes(line, base_indent);
+        }
+        let Some(newline) = newline else {
+            break;
+        };
+        if newline > 0 && source_prefix.as_bytes()[newline - 1] == b'\r' {
+            removed_bytes += 1;
+        }
+        line_start = newline + 1;
+        continuation_line = true;
+    }
+
+    source_prefix.len() - removed_bytes
+}
+
+fn python_header_indent_bytes(line: &str, base_indent: usize) -> usize {
+    line.bytes()
+        .take_while(|byte| matches!(*byte, b' ' | b'\t'))
+        .count()
+        .min(base_indent)
 }
 
 fn python_signature_metadata(
@@ -1750,10 +1896,7 @@ fn python_signature_metadata(
     return_type_text: Option<&str>,
     return_type_identity: Option<StructuredTypeIdentity>,
 ) -> SignatureMetadata {
-    let Some(parameters_node) = node
-        .child_by_field_name("parameters")
-        .filter(|parameters| parameters.start_position().row == parameters.end_position().row)
-    else {
+    let Some(parameters_node) = node.child_by_field_name("parameters") else {
         return SignatureMetadata::new(signature, Vec::new())
             .with_return_type_text(return_type_text)
             .with_return_type_identity(return_type_identity)
@@ -1764,23 +1907,33 @@ fn python_signature_metadata(
                 DeclaredVisibility::Unknown,
             );
     };
-    // The display header is the last line after any decorators. Parameter
-    // labels use offsets from their exact AST nodes, so repeated spellings in
-    // annotations/defaults cannot masquerade as another parameter's identity.
-    // The existing one-line display omits multiline continuations; omitted
-    // labels remain unavailable rather than pointing into unrelated text.
-    let header_start = signature.rfind('\n').map_or(0, |offset| offset + 1);
+    let arity = python_callable_arity(parameters_node, source);
+    // Parameter labels use offsets from their exact AST nodes, so repeated
+    // spellings in annotations/defaults cannot masquerade as another
+    // parameter's identity. The full source header, including multiline
+    // continuations and decorators, is retained in the signature label.
+    let header_node = python_function_header_node(node);
+    let header_start = header_node.start_byte();
+    let base_indent = header_node.start_position().column;
     let parameters = python_parameter_label_nodes(parameters_node)
         .into_iter()
-        .filter_map(|label_node| {
+        .map(|label_node| {
             let label = py_node_text(label_node, source);
-            let start_byte = header_start + label_node.start_byte() - node.start_byte();
+            let label_range = label_node.byte_range();
+            let source_prefix = source
+                .get(header_start..label_range.start)
+                .expect("Python parameter must follow its function header");
+            let start_byte = python_dedented_header_offset(source_prefix, base_indent);
             let end_byte = start_byte + label.len();
-            (signature.get(start_byte..end_byte) == Some(label))
-                .then(|| ParameterMetadata::new(label, start_byte, end_byte))
+            assert_eq!(
+                signature.get(start_byte..end_byte),
+                Some(label),
+                "Python parameter metadata must point at its exact signature label"
+            );
+            ParameterMetadata::new(label, start_byte, end_byte)
         })
         .collect();
-    SignatureMetadata::new(signature, parameters)
+    let metadata = SignatureMetadata::new(signature, parameters)
         .with_return_type_text(return_type_text)
         .with_return_type_identity(return_type_identity)
         .with_dispatch_extensibility(DispatchExtensibility::Open)
@@ -1788,7 +1941,72 @@ fn python_signature_metadata(
             python_callable_is_static(node, source),
             false,
             DeclaredVisibility::Unknown,
-        )
+        );
+    if let Some(arity) = arity {
+        metadata.with_callable_arity(arity)
+    } else {
+        metadata
+    }
+}
+
+/// Positional arity of one Python parameter list, derived from its structured
+/// parameter nodes. Keyword-only parameters are intentionally excluded from
+/// positional counts; `*args` makes the upper bound open, while `**kwargs`
+/// does not accept extra positional values.
+fn python_callable_arity(parameters: Node<'_>, source: &str) -> Option<CallableArity> {
+    let mut required = 0;
+    let mut total = 0;
+    let mut repeated = false;
+    let mut keyword_only = false;
+    let mut cursor = parameters.walk();
+    for parameter in parameters.named_children(&mut cursor) {
+        match parameter.kind() {
+            "positional_separator" => continue,
+            "keyword_separator" => {
+                keyword_only = true;
+                continue;
+            }
+            "ERROR" => return None,
+            _ => {}
+        }
+        if !matches!(
+            parameter.kind(),
+            "identifier"
+                | "typed_parameter"
+                | "default_parameter"
+                | "typed_default_parameter"
+                | "list_splat_pattern"
+                | "dictionary_splat_pattern"
+        ) {
+            continue;
+        }
+        let label = python_parameter_label_node(parameter)?;
+        source.get(label.byte_range())?;
+        match python_parameter_splat(parameter) {
+            Some(PythonParameterSplat::Positional) => {
+                repeated = true;
+                keyword_only = true;
+            }
+            Some(PythonParameterSplat::Keyword) => {}
+            None if !keyword_only => {
+                total += 1;
+                if !matches!(
+                    parameter.kind(),
+                    "default_parameter" | "typed_default_parameter"
+                ) {
+                    required += 1;
+                }
+            }
+            None => {}
+        }
+    }
+    Some(CallableArity::new(required, total, repeated))
+}
+
+fn python_function_header_node(node: Node<'_>) -> Node<'_> {
+    node.parent()
+        .filter(|parent| parent.kind() == "decorated_definition")
+        .unwrap_or(node)
 }
 
 /// Whether this Python callable binds no instance receiver, read from its own
@@ -1826,14 +2044,9 @@ fn python_callable_is_static(node: Node<'_>, source: &str) -> bool {
 }
 
 fn python_parameter_label_nodes(parameters_node: Node<'_>) -> Vec<Node<'_>> {
-    let mut labels = Vec::new();
-    let mut cursor = parameters_node.walk();
-    for child in parameters_node.named_children(&mut cursor) {
-        if let Some(label_node) = python_parameter_label_node(child) {
-            labels.push(label_node);
-        }
-    }
-    labels
+    brokk_bifrost_core::analyzer::tree_walk::named_children_iter(parameters_node)
+        .filter_map(python_parameter_label_node)
+        .collect()
 }
 
 /// The identifier node that names one parameter's binding.
@@ -2091,7 +2304,7 @@ fn python_instance_method_receiver_name(node: Node<'_>, source: &str) -> Option<
     python_first_parameter_name(node, source)
 }
 
-fn python_function_has_decorator(node: Node<'_>, source: &str, decorator_name: &str) -> bool {
+pub fn python_function_has_decorator(node: Node<'_>, source: &str, decorator_name: &str) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
@@ -2107,6 +2320,18 @@ fn python_function_has_decorator(node: Node<'_>, source: &str, decorator_name: &
         .any(|name| py_node_text(name, source).trim() == decorator_name)
 }
 
+/// Whether a function's decorator syntax makes it a Python property descriptor.
+///
+/// The terminal decorator name is selected from the decorator AST, so both
+/// `@cached_property` and `@functools.cached_property` are recognized without
+/// searching source text. Declaration indexing and type-flow use this shared
+/// predicate so a cached property is both a present attribute and an unmodeled
+/// descriptor read.
+pub fn python_function_has_property_decorator(node: Node<'_>, source: &str) -> bool {
+    python_function_has_decorator(node, source, "property")
+        || python_function_has_decorator(node, source, "cached_property")
+}
+
 /// The name a callable binds its first parameter to, which for a method is
 /// the receiver every `self.x` and `setattr(self, ...)` in its body names.
 pub fn python_first_parameter_name(node: Node<'_>, source: &str) -> Option<String> {
@@ -2117,35 +2342,13 @@ pub fn python_first_parameter_name(node: Node<'_>, source: &str) -> Option<Strin
         .find_map(|child| python_parameter_name(child, source))
 }
 
-fn python_parameter_name(node: Node<'_>, source: &str) -> Option<String> {
-    match node.kind() {
-        "identifier" => Some(py_node_text(node, source).trim().to_string()),
-        "typed_parameter"
-        | "default_parameter"
-        | "list_splat_pattern"
-        | "dictionary_splat_pattern" => node
-            .child_by_field_name("name")
-            .or_else(|| {
-                let mut cursor = node.walk();
-                node.named_children(&mut cursor)
-                    .find(|child| child.kind() == "identifier")
-            })
-            .and_then(|name| python_parameter_name(name, source)),
-        _ => None,
-    }
-    .filter(|name| !name.is_empty())
-}
-
 pub fn collect_python_identifiers(node: Node<'_>, source: &str, identifiers: &mut HashSet<String>) {
-    walk_named_tree_preorder(node, true, |node| {
-        if node.kind() == "identifier" {
-            let text = py_node_text(node, source).trim();
-            if !text.is_empty() {
-                identifiers.insert(text.to_string());
-            }
-        }
-        WalkControl::Continue
-    });
+    brokk_bifrost_core::analyzer::tree_walk::collect_trimmed_node_texts(
+        node,
+        source,
+        identifiers,
+        |node| node.kind() == "identifier",
+    );
 }
 
 pub fn parse_python_tree(source: &str) -> Option<Tree> {
@@ -2168,6 +2371,29 @@ mod primary_tests {
     }
 
     #[test]
+    fn setup_py_unwrap_parenthesized_skips_comments() {
+        let source = "VALUE = (\n    # before\n    \"value\"  # after\n)\n";
+        let tree = parse_python_tree(source).expect("Python fixture tree");
+        let mut pending = vec![tree.root_node()];
+        let parenthesized = loop {
+            let node = pending.pop().expect("parenthesized expression exists");
+            if node.kind() == "parenthesized_expression" {
+                break node;
+            }
+            let mut cursor = node.walk();
+            pending.extend(node.named_children(&mut cursor));
+        };
+
+        assert_eq!(
+            setup_py_unwrap_parenthesized(parenthesized).kind(),
+            "string"
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "f4495e5c7c62: replacing a duplicate Python class left stale descendant callable metadata links"
+    )]
     fn replacing_a_class_withdraws_descendant_metadata_links() {
         let parsed = parse(
             "class Replaced:\n    def obsolete(self): pass\n    class Nested:\n        def stale(self): pass\n\nclass Kept:\n    def stable(self): pass\n\nclass Replaced:\n    def current(self): pass\n",
@@ -2284,6 +2510,9 @@ mod primary_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "1fa35d421feb: aliased import leaves pointed at imported-name ranges instead of the whole import statement"
+    )]
     fn aliased_import_leaves_keep_the_statement_and_exact_binder_tokens() {
         let source = "from pkg import alpha as beta, beta as alpha\n";
         let parsed = parse(source);
@@ -2314,6 +2543,185 @@ mod primary_tests {
             second.start_byte(),
             metadata.label().rfind("second:").unwrap()
         );
+    }
+
+    #[test]
+    fn multiline_parameter_metadata_keeps_each_formal_name_at_its_ast_offset() {
+        let source = concat!(
+            "@decorate\n",
+            "def call(\n",
+            "    bare,\n",
+            "    typed: T,\n",
+            "    default=1,\n",
+            "    typed_default: U = 2,\n",
+            "    *args: V,\n",
+            "    required_kw,\n",
+            "    **kwargs: W,\n",
+            "):\n",
+            "    pass\n",
+        );
+        let parsed = parse(source);
+        let metadata = parsed
+            .signature_metadata
+            .values()
+            .flatten()
+            .find(|metadata| metadata.parameters().len() == 7)
+            .expect("multiline callable parameter metadata");
+        let names = metadata
+            .parameters()
+            .iter()
+            .map(|parameter| &metadata.label()[parameter.start_byte()..parameter.end_byte()])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "bare",
+                "typed",
+                "default",
+                "typed_default",
+                "args",
+                "required_kw",
+                "kwargs"
+            ]
+        );
+        assert!(metadata.label().contains("    typed_default: U = 2,"));
+        assert!(metadata.label().ends_with(" ..."));
+    }
+
+    #[test]
+    fn crlf_multiline_parameter_metadata_keeps_each_formal_name_at_its_ast_offset() {
+        let source = concat!(
+            "@decorate\r\n",
+            "def call(\r\n",
+            "    bare,\r\n",
+            "    typed: T,\r\n",
+            "    default=1,\r\n",
+            "):\r\n",
+            "    pass\r\n",
+        );
+        let parsed = parse(source);
+        let metadata = parsed
+            .signature_metadata
+            .values()
+            .flatten()
+            .find(|metadata| metadata.parameters().len() == 3)
+            .expect("multiline callable parameter metadata");
+        let names = metadata
+            .parameters()
+            .iter()
+            .map(|parameter| &metadata.label()[parameter.start_byte()..parameter.end_byte()])
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["bare", "typed", "default"]);
+    }
+
+    #[test]
+    fn crlf_parameter_metadata_preserves_normalized_signature_offsets() {
+        for indentation in ["", "    "] {
+            let header = concat!(
+                "@decorate\r\n",
+                "def call(\r\n",
+                "    first: T,\r\n",
+                "    second: U = 2,\r\n",
+                "):\r\n",
+                "    pass\r\n",
+            );
+            let source = if indentation.is_empty() {
+                header.to_owned()
+            } else {
+                format!(
+                    "class Service:\r\n{}",
+                    header
+                        .split_inclusive('\n')
+                        .map(|line| format!("{indentation}{line}"))
+                        .collect::<String>()
+                )
+            };
+            let parsed = parse(&source);
+            let metadata = parsed
+                .signature_metadata
+                .values()
+                .flatten()
+                .find(|metadata| metadata.parameters().len() == 2)
+                .expect("CRLF callable metadata");
+            assert!(!metadata.label().contains('\r'));
+            let labels = metadata
+                .parameters()
+                .iter()
+                .map(|parameter| &metadata.label()[parameter.start_byte()..parameter.end_byte()])
+                .collect::<Vec<_>>();
+            assert_eq!(labels, ["first", "second"]);
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#4455: multiline Python parameter offsets dropped a newline before an unindented label"
+    )]
+    fn multiline_parameter_offsets_follow_ast_ranges_through_header_normalization() {
+        let source = concat!(
+            "def manyargs(first: Annotated[int, 'second'] = second, second: int = 1,\r\n",
+            "# comment between parameters\r\n",
+            "third: int = second,\r\n",
+            "/,\r\n",
+            "*args: object,\r\n",
+            "keyword: int = 2,\r\n",
+            "**kwargs: object,\r\n",
+            "):\r\n",
+            "    pass\r\n",
+            "def keyword_only(\r\n",
+            "positional,\r\n",
+            "*,\r\n",
+            "required,\r\n",
+            "):\r\n",
+            "    pass\r\n",
+            "class Service:\n",
+            "\tdef tabbed(\n",
+            "\t\tfirst,\n",
+            "\t\tsecond,\n",
+            "\t):\n",
+            "\t\tpass\n",
+        );
+        let parsed = parse(source);
+        let metadata = |name: &str| {
+            parsed
+                .signature_metadata
+                .iter()
+                .find(|(unit, _)| unit.short_name() == name)
+                .unwrap_or_else(|| {
+                    let available = parsed
+                        .signature_metadata
+                        .keys()
+                        .map(|unit| unit.short_name())
+                        .collect::<Vec<_>>();
+                    panic!("callable metadata for {name}; available names: {available:?}");
+                })
+                .1
+                .first()
+                .expect("one signature")
+        };
+        let parameter_names = |name: &str| {
+            let metadata = metadata(name);
+            metadata
+                .parameters()
+                .iter()
+                .map(|parameter| &metadata.label()[parameter.start_byte()..parameter.end_byte()])
+                .collect::<Vec<_>>()
+        };
+
+        let manyargs = metadata("manyargs");
+        assert_eq!(
+            parameter_names("manyargs"),
+            ["first", "second", "third", "args", "keyword", "kwargs"]
+        );
+        assert!(
+            manyargs
+                .label()
+                .contains("# comment between parameters\nthird: int")
+        );
+        assert!(manyargs.label().contains("\n/,\n*args: object"));
+        assert!(!manyargs.label().contains('\r'));
+        assert_eq!(parameter_names("keyword_only"), ["positional", "required"]);
+        assert_eq!(parameter_names("Service.tabbed"), ["first", "second"]);
     }
 
     #[test]
@@ -2439,6 +2847,9 @@ mod primary_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "45e71db39f13: generic Python annotations mistook a list element for the returned class owner"
+    )]
     fn return_annotation_references_preserve_runtime_owners() {
         let source = "def generic() -> list[User]:\n    pass\n\ndef nested() -> list[pkg.User]:\n    pass\n\ndef direct() -> pkg.User:\n    pass\n\ndef quoted() -> \"pkg.User\":\n    pass\n\ndef unsupported() -> Left | Right:\n    pass\n";
         let parsed = parse(source);
@@ -2517,22 +2928,13 @@ mod primary_tests {
 /// only the outermost `left` declares `encrypt` and silently drops `decrypt`,
 /// so the alias reads as an absent member on the class that defines it.
 fn python_chained_assignment_targets<'tree>(assignment: Node<'tree>) -> Vec<Node<'tree>> {
-    let mut targets = Vec::new();
-    let mut node = assignment;
-    while let Some(left) = node.child_by_field_name("left") {
-        targets.push(left);
-        match node.child_by_field_name("right") {
-            Some(right) if right.kind() == "assignment" => node = right,
-            _ => break,
-        }
-    }
-    targets
+    super::imports::python_assignment_chain(assignment).0
 }
 
 #[cfg(test)]
 mod supertype_tests {
     use super::extract_python_supertypes;
-    use tree_sitter::{Node, Parser};
+    use tree_sitter::Node;
 
     fn class_node<'tree>(tree: &'tree tree_sitter::Tree, source: &str) -> Node<'tree> {
         let mut cursor = tree.root_node().walk();
@@ -2543,14 +2945,13 @@ mod supertype_tests {
     }
 
     fn parse(source: &str) -> tree_sitter::Tree {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_python::LANGUAGE.into())
-            .expect("the Python grammar loads");
-        parser.parse(source, None).expect("the source parses")
+        super::parse_python_tree(source).expect("the source parses")
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "50c1574b2070: unsupported Python positional bases were dropped and created false complete absence"
+    )]
     fn every_positional_base_contributes_a_spelling() {
         for (source, expected) in [
             ("class A(Base): pass\n", vec!["Base"]),
@@ -2613,6 +3014,9 @@ mod callable_modifier_tests {
     ///   this walk mints no declaration, no `SignatureMetadata`, and no
     ///   procedure key for it.
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3451: Python callable receiver modifiers were missing, leaving workspace procedures unkeyable"
+    )]
     fn callable_metadata_records_python_receiver_contracts_structurally() {
         let source = "def free(value):\n    return value\n\nclass Widget:\n    def __init__(self, spec):\n        self.spec = spec\n\n    def render(self, target):\n        return target\n\n    @staticmethod\n    def build(spec):\n        return spec\n\n    @classmethod\n    def measure(cls, target):\n        return target\n\n    @property\n    def label(self):\n        return \"widget\"\n\nasync def fetch_all(url):\n    return url\n\ndef outer(seed):\n    def inner(value):\n        return value\n    return inner(seed)\n\nassigned = lambda value: value\n";
         let file = ProjectFile::new(std::env::temp_dir(), "widget.py");

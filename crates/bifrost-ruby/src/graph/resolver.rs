@@ -1,6 +1,8 @@
 use crate::declarations::{RubyFieldScope, extract_name_path};
 use crate::graph::RubyGraphSource;
+use crate::graph::syntax::is_declaration_constant;
 use crate::graph_support::RubySource;
+use crate::imports::{is_ruby_autoload_symbol_argument, ruby_symbol_name};
 use crate::mixins::{ruby_forward_mixin_specs, ruby_forward_superclass_targets};
 use brokk_bifrost_core::analyzer::model::RubyMethodDispatchMode;
 use brokk_bifrost_core::analyzer::type_relations::TypeRelationKind;
@@ -27,6 +29,11 @@ pub struct RubyFieldTarget {
     pub owner: String,
     pub scope: RubyFieldScope,
     pub member: String,
+}
+
+pub struct RubyConstantReference {
+    pub unit: CodeUnit,
+    pub is_autoload_symbol: bool,
 }
 
 impl RubyTargetSpec {
@@ -812,6 +819,22 @@ pub enum RubyMethodLookupMode {
     SingletonMethod,
 }
 
+pub fn ruby_dispatch_matches_lookup_mode(
+    declaration: RubyMethodDispatchMode,
+    mode: RubyMethodLookupMode,
+) -> bool {
+    matches!(
+        (declaration, mode),
+        (
+            RubyMethodDispatchMode::Instance,
+            RubyMethodLookupMode::InstanceMethod
+        ) | (
+            RubyMethodDispatchMode::Singleton,
+            RubyMethodLookupMode::SingletonMethod
+        ) | (RubyMethodDispatchMode::ModuleFunction, _)
+    )
+}
+
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub struct FactoryInferenceKey {
     pub method: CodeUnit,
@@ -834,16 +857,7 @@ pub fn ruby_method_lookup_mode_matches(
     unit: &CodeUnit,
     mode: RubyMethodLookupMode,
 ) -> bool {
-    matches!(
-        (ruby.method_dispatch_mode(unit), mode),
-        (
-            RubyMethodDispatchMode::Instance,
-            RubyMethodLookupMode::InstanceMethod
-        ) | (
-            RubyMethodDispatchMode::Singleton,
-            RubyMethodLookupMode::SingletonMethod
-        ) | (RubyMethodDispatchMode::ModuleFunction, _)
-    )
+    ruby_dispatch_matches_lookup_mode(ruby.method_dispatch_mode(unit), mode)
 }
 
 fn constant_lookup_candidates(
@@ -885,4 +899,28 @@ fn constant_lookup_candidates(
     candidates.push(format!("{owner_name}.{constant_name}"));
 
     Some(candidates)
+}
+
+pub fn resolve_constant_reference(
+    semantic: &RubySemanticIndex<'_>,
+    file: &ProjectFile,
+    visible_files: &HashSet<ProjectFile>,
+    lexical_stack: &[String],
+    node: Node<'_>,
+    source: &str,
+) -> Option<RubyConstantReference> {
+    if is_ruby_autoload_symbol_argument(node, source) {
+        let name = ruby_symbol_name(node, source)?;
+        return Some(RubyConstantReference {
+            unit: semantic.resolve_constant_name(file, visible_files, lexical_stack, &name)?,
+            is_autoload_symbol: true,
+        });
+    }
+    if !matches!(node.kind(), "constant" | "scope_resolution") || is_declaration_constant(node) {
+        return None;
+    }
+    Some(RubyConstantReference {
+        unit: semantic.resolve_constant(file, visible_files, lexical_stack, node, source)?,
+        is_autoload_symbol: false,
+    })
 }

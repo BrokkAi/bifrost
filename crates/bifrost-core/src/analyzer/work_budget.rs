@@ -10,6 +10,11 @@ pub trait BudgetWork: Copy {
     fn checked_add(self, other: Self) -> Option<Self>;
 }
 
+/// A budget work shape with a constant all-zero value.
+pub trait ZeroBudgetWork: BudgetWork {
+    const ZERO: Self;
+}
+
 /// Exact failed charge reported by the shared ledger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WorkBudgetExceeded<Dimension> {
@@ -42,6 +47,16 @@ pub struct BudgetLedger<Work> {
 impl<Work> BudgetLedger<Work> {
     pub const fn new(limits: Work, used: Work) -> Self {
         Self { limits, used }
+    }
+}
+
+impl<Work> BudgetLedger<Work>
+where
+    Work: ZeroBudgetWork,
+{
+    /// Create a ledger with the work shape's all-zero usage value.
+    pub const fn with_zero_usage(limits: Work) -> Self {
+        Self::new(limits, Work::ZERO)
     }
 }
 
@@ -176,6 +191,10 @@ macro_rules! define_work_dimensions {
             fn checked_add(self, other: Self) -> Option<Self> {
                 self.checked_add(other)
             }
+        }
+
+        impl $crate::analyzer::work_budget::ZeroBudgetWork for $work {
+            const ZERO: Self = Self::uniform(0);
         }
     };
 }

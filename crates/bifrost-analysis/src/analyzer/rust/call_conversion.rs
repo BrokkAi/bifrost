@@ -19,6 +19,7 @@ use crate::analyzer::usages::get_definition::{
 use crate::analyzer::{
     AnalyzerQueryScope, IAnalyzer, Language, ProjectFile, RustAnalyzer, resolve_analyzer,
 };
+use brokk_bifrost_core::analyzer::tree_walk::root_node;
 use brokk_bifrost_rust::declarations::rust_node_text;
 use brokk_bifrost_rust::lexical_scope::{rust_lexical_scope_index, visible_import_binder_in_tree};
 use brokk_bifrost_rust::ownership::{
@@ -69,13 +70,13 @@ impl CallArgumentConversionProver for RustCallArgumentConversionProver {
             analyzer,
             file,
             source,
-            root: node_root(actual),
+            root: root_node(actual),
         };
         let formal_context = RustTypeContext {
             analyzer,
             file: formal_file,
             source: formal_source,
-            root: node_root(formal),
+            root: root_node(formal),
         };
 
         let source_type = actual_context.expression_type(actual, 0)?;
@@ -93,6 +94,89 @@ impl CallArgumentConversionProver for RustCallArgumentConversionProver {
             kind,
         })
     }
+}
+
+/// Share structured actual-type evidence with modeled generic impl selection.
+pub(super) fn expression_conversion_type(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+) -> Result<RustConversionType, ConversionUnknown> {
+    if matches!(node.kind(), "string_literal" | "raw_string_literal") {
+        return Ok(RustConversionType::Reference {
+            mutable: false,
+            referent: Box::new(RustConversionType::Primitive(RustPrimitive::Str)),
+        });
+    }
+    RustTypeContext {
+        analyzer,
+        file,
+        source,
+        root: root_node(node),
+    }
+    .expression_type(node, 0)
+}
+
+/// Interpret one structurally selected explicit trait argument.
+pub(super) fn type_conversion_type(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+) -> Result<RustConversionType, ConversionUnknown> {
+    RustTypeContext {
+        analyzer,
+        file,
+        source,
+        root: root_node(node),
+    }
+    .type_from_node(node, 0)
+}
+
+/// Compare a concrete model argument with parser/resolver type evidence.
+/// Only concrete contradictions return Some(false). Unsupported nominal or
+/// generic substitutions return None and keep the entire selection open.
+pub(super) fn matches_model_type(
+    actual: &RustConversionType,
+    model: &crate::analyzer::semantic_model::TypeRef,
+) -> Option<bool> {
+    use crate::analyzer::semantic_model::{TypeRef, TypeRefReferenceKind};
+    let mut pending = vec![(actual, model)];
+    while let Some((actual, model)) = pending.pop() {
+        match model {
+            TypeRef::ByRef {
+                element,
+                reference_kind: TypeRefReferenceKind::Lvalue,
+            } => match actual {
+                RustConversionType::Reference {
+                    mutable: false,
+                    referent,
+                } => pending.push((referent, element)),
+                RustConversionType::Primitive(_) => return Some(false),
+                _ => return None,
+            },
+            TypeRef::Named {
+                name, arguments, ..
+            } if arguments.is_empty() => {
+                let expected = name
+                    .strip_prefix("std.primitive.")
+                    .or_else(|| name.strip_prefix("core.primitive."))
+                    .and_then(primitive_for_spelling)?;
+                match actual {
+                    RustConversionType::Primitive(actual) => {
+                        if *actual != expected {
+                            return Some(false);
+                        }
+                    }
+                    RustConversionType::Reference { .. } => return Some(false),
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(true)
 }
 
 struct RustTypeContext<'a, 'tree> {
@@ -459,9 +543,7 @@ fn primitive_for_spelling(spelling: &str) -> Option<RustPrimitive> {
 }
 
 fn has_named_child_kind(node: Node<'_>, kind: &str) -> bool {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .any(|child| child.kind() == kind)
+    brokk_bifrost_core::analyzer::tree_walk::first_named_child_of_kind(node, kind).is_some()
 }
 
 fn supported_type_context(node: Node<'_>) -> Result<(), ConversionUnknown> {
@@ -494,13 +576,6 @@ fn supported_type_context(node: Node<'_>) -> Result<(), ConversionUnknown> {
         current = scope.parent();
     }
     Ok(())
-}
-
-fn node_root<'tree>(mut node: Node<'tree>) -> Node<'tree> {
-    while let Some(parent) = node.parent() {
-        node = parent;
-    }
-    node
 }
 
 #[cfg(test)]

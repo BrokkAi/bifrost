@@ -34,16 +34,18 @@ use super::resolution::EnvironmentAxis;
 use crate::analyzer::canonical_hash::CanonicalHasher;
 use crate::analyzer::semantic::ContentIdentity;
 use crate::analyzer::semantic::ids::StableDigest;
+use crate::analyzer::usages::get_definition::DefinitionLookupStatus;
 use crate::analyzer::usages::{
     FuzzyResult, ReferenceEngine, ReferenceHit, ReferenceKind, UsageHit, UsageHitKind,
     UsageHitSurface, UsageProof, UsageQueryCompletion,
 };
 use crate::analyzer::{
-    CodeUnit, DeclarationId, FqName, IAnalyzer, ProjectFile, Range, TypeHierarchyProvider,
+    CodeUnit, DeclarationId, FqName, IAnalyzer, Language, ProjectFile, Range, TypeHierarchyProvider,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
+use crate::text_utils::compute_line_starts;
 use rayon::prelude::*;
 use std::sync::Arc;
 
@@ -363,6 +365,27 @@ pub(crate) struct ReferenceSiteClassifier<'analyzer> {
     site_identities: SiteIdentityIndex,
 }
 
+/// Source-derived state shared by selected reference file wrappers.
+pub(crate) struct SelectedReferenceFileState<'analyzer> {
+    pub(crate) source_len: usize,
+    pub(crate) line_starts: Box<[usize]>,
+    pub(crate) classifier: Option<ReferenceSiteClassifier<'analyzer>>,
+}
+
+impl<'analyzer> SelectedReferenceFileState<'analyzer> {
+    pub(crate) fn new(
+        analyzer: &'analyzer dyn IAnalyzer,
+        file: &ProjectFile,
+        source: &str,
+    ) -> Self {
+        Self {
+            source_len: source.len(),
+            line_starts: compute_line_starts(source).into_boxed_slice(),
+            classifier: ReferenceSiteClassifier::new(analyzer, file),
+        }
+    }
+}
+
 impl<'analyzer> ReferenceSiteClassifier<'analyzer> {
     /// Build the classifier from the analyzer's one facts snapshot for `file`.
     /// Returns `None` when the file has no structural adapter or facts.
@@ -388,10 +411,9 @@ impl<'analyzer> ReferenceSiteClassifier<'analyzer> {
                     .entry((node.range.start_byte, node.range.end_byte))
                     .or_insert(id);
             }
-            if matches!(
-                node.kind,
-                NormalizedKind::Call | NormalizedKind::FieldAccess
-            ) && let Some(name) = node.name
+            if (node.kind.satisfies(NormalizedKind::Call)
+                || node.kind == NormalizedKind::FieldAccess)
+                && let Some(name) = node.name
             {
                 named_accesses.push((name, id));
             }
@@ -454,7 +476,7 @@ impl<'analyzer> ReferenceSiteClassifier<'analyzer> {
             .best_containing_by_key(start_byte, end_byte, |id| {
                 let node = self.facts.node(id);
                 (
-                    usize::from(node.kind != NormalizedKind::Call),
+                    usize::from(!node.kind.satisfies(NormalizedKind::Call)),
                     node.range.end_byte - node.range.start_byte,
                     id,
                 )
@@ -482,7 +504,7 @@ impl<'analyzer> ReferenceSiteClassifier<'analyzer> {
             if static_receiver {
                 return Some(ReferenceKind::StaticReference);
             }
-            if node.kind == NormalizedKind::Call {
+            if node.kind.satisfies(NormalizedKind::Call) {
                 return Some(
                     if target.is_class() || target.kind().display_lowercase() == "constructor" {
                         ReferenceKind::ConstructorCall
@@ -538,13 +560,15 @@ impl<'analyzer> ReferenceSiteClassifier<'analyzer> {
             .best_containing_by_key(start_byte, end_byte, |id| {
                 let node = self.facts.node(id);
                 (
-                    usize::from(node.kind != NormalizedKind::Call),
+                    usize::from(!node.kind.satisfies(NormalizedKind::Call)),
                     node.range.end_byte - node.range.start_byte,
                     id,
                 )
             })?;
         let node = self.facts.node(id);
-        (node.kind == NormalizedKind::Call).then_some(node.range)
+        node.kind
+            .satisfies(NormalizedKind::Call)
+            .then_some(node.range)
     }
 
     /// Exact content-scoped AST identity for an identifier at this byte range.
@@ -594,15 +618,13 @@ fn classify_reference_kind_scan_oracle(
         .enumerate()
         .filter(|(_, node)| {
             node.name.is_some_and(covers)
-                && matches!(
-                    node.kind,
-                    NormalizedKind::Call | NormalizedKind::FieldAccess
-                )
+                && (node.kind.satisfies(NormalizedKind::Call)
+                    || node.kind == NormalizedKind::FieldAccess)
         })
         .collect::<Vec<_>>();
     candidates.sort_by_key(|(_, node)| {
         (
-            usize::from(node.kind != NormalizedKind::Call),
+            usize::from(!node.kind.satisfies(NormalizedKind::Call)),
             node.range.end_byte - node.range.start_byte,
         )
     });
@@ -626,7 +648,7 @@ fn classify_reference_kind_scan_oracle(
         if static_receiver {
             return Some(ReferenceKind::StaticReference);
         }
-        if node.kind == NormalizedKind::Call {
+        if node.kind.satisfies(NormalizedKind::Call) {
             return Some(
                 if target.is_class() || target.kind().display_lowercase() == "constructor" {
                     ReferenceKind::ConstructorCall
@@ -706,6 +728,10 @@ pub struct ReferenceEdgeRow {
     /// one. Absence is "unclassified", never a kind.
     pub reference_kind: Option<ReferenceKind>,
     pub proof: UsageProof,
+    /// This exact target is one member of a closed ambiguous binding.
+    /// Ranking graphs may retain it as a candidate edge while preserving the
+    /// row's `Unproven` proof and the graph's incomplete inbound evidence.
+    pub ambiguous_candidate: bool,
     pub usage_kind: UsageHitKind,
     pub site_class: SiteClass,
     /// How the site's enclosing declaration relates to the target, computed
@@ -721,6 +747,13 @@ pub struct ReferenceEdgeRow {
 impl ReferenceEdgeRow {
     pub fn target_id(&self) -> DeclarationId {
         self.target.declaration_id()
+    }
+
+    /// The exact target declaration carries its source language in the
+    /// declaration identity and source path. JVM edges may cross Java, Kotlin
+    /// and Scala while retaining that target language.
+    pub fn target_language(&self) -> Language {
+        self.target.source().declaration_language()
     }
 
     pub fn source_id(&self) -> Option<DeclarationId> {
@@ -1173,7 +1206,7 @@ impl<'a> ReferenceEngine<'a> {
 }
 
 impl EdgeDerivationResult {
-    fn incomplete(
+    pub(crate) fn incomplete(
         reasons: Vec<EdgeIncompleteReason>,
         provenance: EdgeProvenance,
         generation: u64,
@@ -1618,6 +1651,7 @@ pub(crate) fn edge_rows_from_reference_hits(
                 target: hit.resolved,
                 reference_kind: hit.kind,
                 proof: hit.proof,
+                ambiguous_candidate: false,
                 usage_kind: hit.usage_kind,
                 site_class,
                 owner_relation,
@@ -1966,7 +2000,7 @@ pub fn forward_edges_for_file_at_lines(
     forward_edges_from_occurrences(analyzer, file, occurrences, generation)
 }
 
-fn forward_axis_gate(
+pub(crate) fn forward_axis_gate(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     generation: u64,
@@ -1988,7 +2022,7 @@ fn forward_axis_gate(
     }
 }
 
-fn forward_edges_from_occurrences(
+pub(crate) fn forward_edges_from_occurrences(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     occurrences: OccurrenceFileResult,
@@ -1997,11 +2031,19 @@ fn forward_edges_from_occurrences(
     let import_target_nodes = import_target_nodes_for_file(analyzer, file).unwrap_or_default();
     let reference_sites = ReferenceSiteClassifier::new(analyzer, file);
     let mut edges = Vec::new();
+    let mut reasons = Vec::new();
     for row in &occurrences.rows {
+        if let Some(reason) = forward_resolution_incomplete_reason(row)
+            && !reasons.contains(&reason)
+        {
+            reasons.push(reason);
+        }
         let OccurrenceTarget::Resolved(units) = &row.target else {
             continue;
         };
-        let proof = if units.len() == 1 {
+        let proof = if row.resolution_status == Some(DefinitionLookupStatus::Resolved)
+            && units.len() == 1
+        {
             UsageProof::Proven
         } else {
             UsageProof::Unproven
@@ -2021,6 +2063,7 @@ fn forward_edges_from_occurrences(
                 target: unit.clone(),
                 reference_kind: kind,
                 proof,
+                ambiguous_candidate: false,
                 usage_kind: classify_forward_usage_kind(row, &import_target_nodes, owner_relation),
                 site_class: SiteClass::UseSite,
                 owner_relation,
@@ -2030,7 +2073,6 @@ fn forward_edges_from_occurrences(
         }
     }
 
-    let mut reasons = Vec::new();
     if let OccurrenceCompleteness::Incomplete { .. } = &occurrences.completeness {
         // Name the exact reference-producing roles the file does not cover,
         // so a consumer narrowed to one role can tell whether the gap is its
@@ -2067,43 +2109,46 @@ fn forward_edges_from_occurrences(
     })
 }
 
+fn forward_resolution_incomplete_reason(row: &OccurrenceRow) -> Option<EdgeIncompleteReason> {
+    if row.class != OccurrenceClass::Reference {
+        return None;
+    }
+    match row.resolution_status? {
+        DefinitionLookupStatus::Resolved | DefinitionLookupStatus::NoDefinition => None,
+        DefinitionLookupStatus::Cancelled => Some(EdgeIncompleteReason::Cancelled),
+        DefinitionLookupStatus::Unavailable
+        | DefinitionLookupStatus::Incomplete
+        | DefinitionLookupStatus::UnresolvableImportBoundary
+        | DefinitionLookupStatus::Ambiguous
+        | DefinitionLookupStatus::UnsupportedLanguage
+        | DefinitionLookupStatus::InvalidLocation
+        | DefinitionLookupStatus::NotFound
+        | DefinitionLookupStatus::ExceededBudget(_) => {
+            Some(EdgeIncompleteReason::ForwardResolutionIncomplete)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::analyzer::java::JavaAnalyzer;
-    use crate::analyzer::{
-        AnalyzerConfig, CodeUnitIndex, Language, Project, TestProject, WorkspaceAnalyzer,
-    };
+    use crate::analyzer::structural::test_support::workspace_fixture;
+    use crate::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
+    use crate::analyzer::{CodeUnitIndex, Language, WorkspaceAnalyzer};
     use crate::inline_project::InlineTestProject;
+    use crate::test_support::token_range;
+    use brokk_bifrost_test_macros::hardwon;
     use std::collections::BTreeSet;
-    use std::path::PathBuf;
-    use std::sync::Arc;
-    use tempfile::TempDir;
-
     struct Fixture {
-        _temp: TempDir,
+        _temp: tempfile::TempDir,
         workspace: WorkspaceAnalyzer,
         files: Vec<ProjectFile>,
     }
 
     impl Fixture {
         fn new(language: Language, sources: &[(&str, &str)]) -> Self {
-            let temp = tempfile::tempdir().expect("temp dir");
-            let root: PathBuf = temp.path().canonicalize().expect("canonical root");
-            let files = sources
-                .iter()
-                .map(|(relative_path, source)| {
-                    let file = ProjectFile::new(root.clone(), *relative_path);
-                    file.write(source).expect("write fixture source");
-                    file
-                })
-                .collect::<Vec<_>>();
-            let project = TestProject::new(root, language);
-            let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
-                Arc::new(project) as Arc<dyn Project>,
-                AnalyzerConfig::default(),
-            )
-            .expect("ephemeral workspace should build");
+            let (temp, workspace, files, _) = workspace_fixture(language, sources);
             Self {
                 _temp: temp,
                 workspace,
@@ -2116,22 +2161,13 @@ mod tests {
         }
 
         fn declaration(&self, fq_suffix: &str) -> CodeUnit {
-            self.analyzer()
-                .all_declarations()
-                .find(|unit| unit.fq_name().ends_with(fq_suffix))
-                .unwrap_or_else(|| panic!("fixture must declare {fq_suffix}"))
+            crate::analyzer::structural::test_support::declarations_ending_with(
+                self.analyzer(),
+                fq_suffix,
+            )
+            .next()
+            .unwrap_or_else(|| panic!("fixture must declare {fq_suffix}"))
         }
-    }
-
-    fn token_range(source: &str, marker: &str, token: &str) -> (usize, usize) {
-        let marker_start = source
-            .find(marker)
-            .unwrap_or_else(|| panic!("fixture must contain marker {marker:?}"));
-        let token_offset = marker
-            .find(token)
-            .unwrap_or_else(|| panic!("marker {marker:?} must contain token {token:?}"));
-        let start = marker_start + token_offset;
-        (start, start + token.len())
     }
 
     const JAVA_REFERENCE_KIND_SITES: &str = r#"package fixture;
@@ -2263,6 +2299,182 @@ class Child extends Base {
         }
     }
 
+    const JAVA_TARGET: &str =
+        "package fixture;\n\npublic class Registry {\n    public void register() {\n    }\n}\n";
+    const JAVA_CALLER: &str = "package fixture;\n\npublic class Startup {\n    void boot(Registry registry) {\n        registry.register();\n    }\n}\n";
+
+    #[test]
+    #[hardwon(
+        "#4428: retained incomplete and ambiguous resolution candidates must not become proven forward edges"
+    )]
+    fn forward_resolution_status_preserves_proof_and_run_completeness() {
+        let fixture = Fixture::new(
+            Language::Java,
+            &[
+                ("src/fixture/Registry.java", JAVA_TARGET),
+                ("src/fixture/Startup.java", JAVA_CALLER),
+            ],
+        );
+        let analyzer = fixture.analyzer();
+        let caller = &fixture.files[1];
+        let target = fixture.declaration("Registry.register");
+        let occurrences = occurrences_for_file(analyzer, caller, &CancellationToken::new())
+            .expect("uncancelled occurrence derivation");
+        let template = occurrences
+            .rows
+            .iter()
+            .find(|row| {
+                matches!(
+                    &row.target,
+                    OccurrenceTarget::Resolved(units)
+                        if units.len() == 1 && units[0] == target
+                )
+            })
+            .cloned()
+            .expect("fixture must contain a resolved singleton reference");
+        assert_eq!(
+            template.resolution_status,
+            Some(DefinitionLookupStatus::Resolved)
+        );
+
+        let derive_rows = |rows: Vec<OccurrenceRow>| {
+            forward_edges_from_occurrences(
+                analyzer,
+                caller,
+                OccurrenceFileResult {
+                    rows,
+                    completeness: OccurrenceCompleteness::Complete,
+                },
+                analyzer.project().analysis_generation(),
+            )
+            .expect("forward edge conversion does not perform cancellable work")
+        };
+        let derive = |target: OccurrenceTarget, status: DefinitionLookupStatus| {
+            let mut row = template.clone();
+            row.target = target;
+            row.resolution_status = Some(status);
+            derive_rows(vec![row])
+        };
+
+        let alternatives = fixture.declaration("Startup.boot");
+        let cases = [
+            (
+                DefinitionLookupStatus::Resolved,
+                1,
+                Some(UsageProof::Proven),
+                None,
+            ),
+            (DefinitionLookupStatus::NoDefinition, 0, None, None),
+            (
+                DefinitionLookupStatus::Incomplete,
+                1,
+                Some(UsageProof::Unproven),
+                Some(EdgeIncompleteReason::ForwardResolutionIncomplete),
+            ),
+            (
+                DefinitionLookupStatus::Ambiguous,
+                2,
+                Some(UsageProof::Unproven),
+                Some(EdgeIncompleteReason::ForwardResolutionIncomplete),
+            ),
+            (
+                DefinitionLookupStatus::ExceededBudget(ReceiverBudgetLimit::ScopeNodes),
+                0,
+                None,
+                Some(EdgeIncompleteReason::ForwardResolutionIncomplete),
+            ),
+            (
+                DefinitionLookupStatus::Cancelled,
+                0,
+                None,
+                Some(EdgeIncompleteReason::Cancelled),
+            ),
+        ];
+        for (status, edge_count, proof, reason) in cases {
+            let target = match status {
+                DefinitionLookupStatus::Resolved | DefinitionLookupStatus::Incomplete => {
+                    OccurrenceTarget::Resolved(vec![target.clone()])
+                }
+                DefinitionLookupStatus::Ambiguous => {
+                    OccurrenceTarget::Resolved(vec![target.clone(), alternatives.clone()])
+                }
+                _ => OccurrenceTarget::Unresolved(status),
+            };
+            let result = derive(target, status);
+            assert_eq!(result.edges.len(), edge_count, "status {status:?}");
+            if let Some(proof) = proof {
+                assert!(
+                    result.edges.iter().all(|edge| edge.proof == proof),
+                    "status {status:?} produced the wrong proof: {:?}",
+                    result.edges
+                );
+            }
+            match (reason, result.completeness) {
+                (None, EdgeCompleteness::Complete) => {}
+                (Some(reason), EdgeCompleteness::Incomplete { reasons }) => {
+                    assert!(reasons.contains(&reason), "status {status:?}: {reasons:?}");
+                    if status == DefinitionLookupStatus::Cancelled {
+                        assert!(
+                            !reasons.contains(&EdgeIncompleteReason::ForwardResolutionIncomplete)
+                        );
+                    }
+                }
+                (reason, completeness) => {
+                    panic!("status {status:?} expected reason {reason:?}, got {completeness:?}")
+                }
+            }
+        }
+
+        let mut incomplete = template.clone();
+        incomplete.resolution_status = Some(DefinitionLookupStatus::Incomplete);
+        let mixed = derive_rows(vec![template.clone(), incomplete]);
+        assert_eq!(mixed.edges.len(), 2);
+        assert_eq!(
+            mixed
+                .edges
+                .iter()
+                .filter(|edge| edge.proof == UsageProof::Proven)
+                .count(),
+            1
+        );
+        assert_eq!(
+            mixed
+                .edges
+                .iter()
+                .filter(|edge| edge.proof == UsageProof::Unproven)
+                .count(),
+            1
+        );
+        assert!(matches!(
+            mixed.completeness,
+            EdgeCompleteness::Incomplete { ref reasons }
+                if reasons.contains(&EdgeIncompleteReason::ForwardResolutionIncomplete)
+        ));
+    }
+
+    #[test]
+    fn reference_engine_file_scan_never_expands_its_hard_scope() {
+        let fixture = Fixture::new(
+            Language::Java,
+            &[
+                ("src/Registry.java", JAVA_TARGET),
+                ("src/Startup.java", JAVA_CALLER),
+                (
+                    "src/Other.java",
+                    "package fixture; class Other { void unrelated() {} }",
+                ),
+            ],
+        );
+        let run = ReferenceEngine::new().scan_file_edges(fixture.analyzer(), &fixture.files[1..2]);
+        assert_eq!(run.work.candidate_files, 1);
+        assert_eq!(run.work.scanned_files, 1);
+        assert!(
+            run.edges
+                .iter()
+                .all(|edge| edge.site.file == fixture.files[1])
+        );
+    }
+
     #[test]
     fn external_usage_graph_excludes_only_target_definition_overlap() {
         const SOURCE: &str = r#"package fixture;
@@ -2307,6 +2519,7 @@ class Target {
             target,
             reference_kind: Some(ReferenceKind::TypeReference),
             proof: UsageProof::Proven,
+            ambiguous_candidate: false,
             usage_kind: UsageHitKind::Reference,
             site_class: SiteClass::UseSite,
             owner_relation: OwnerRelation::SameOwner,
@@ -2346,72 +2559,6 @@ class Target {
             self_receiver.overlaps_target_definition_spans(&target_spans),
             "definition overlap remains available independently of usage surface"
         );
-    }
-
-    const JAVA_TARGET: &str =
-        "package fixture;\n\npublic class Registry {\n    public void register() {\n    }\n}\n";
-    const JAVA_CALLER: &str = "package fixture;\n\npublic class Startup {\n    void boot(Registry registry) {\n        registry.register();\n    }\n}\n";
-
-    /// The acceptance shape for this milestone: one plain proven cross-file
-    /// call yields a forward row and an inverse row that agree field for field
-    /// on everything except the fields that legitimately differ between the
-    /// producers (`provenance`, and the forward-only `ast_id`).
-    #[test]
-    fn forward_and_inverse_producers_agree_on_a_plain_proven_call() {
-        let fixture = Fixture::new(
-            Language::Java,
-            &[
-                ("src/Registry.java", JAVA_TARGET),
-                ("src/Startup.java", JAVA_CALLER),
-            ],
-        );
-        let analyzer = fixture.analyzer();
-        let target = fixture.declaration("Registry.register");
-
-        let inverse = inverse_edges_for_declaration(analyzer, &target, None);
-        assert!(
-            inverse.completeness.is_complete(),
-            "inverse derivation must be complete: {:?}",
-            inverse.completeness
-        );
-        let inverse_call = inverse
-            .edges
-            .iter()
-            .find(|edge| edge.usage_kind == UsageHitKind::Reference)
-            .expect("the call site must appear as an inverse edge");
-
-        let caller_file = &fixture.files[1];
-        let forward = forward_edges_for_file(analyzer, caller_file, &CancellationToken::new())
-            .expect("not cancelled");
-        let forward_call = forward
-            .edges
-            .iter()
-            .find(|edge| edge.target.fq_name() == target.fq_name())
-            .expect("the call site must appear as a forward edge");
-
-        assert_eq!(forward_call.site.file, inverse_call.site.file);
-        assert_eq!(
-            forward_call.site.range.start_byte,
-            inverse_call.site.range.start_byte
-        );
-        assert_eq!(
-            forward_call.site.range.end_byte,
-            inverse_call.site.range.end_byte
-        );
-        assert_eq!(forward_call.target.fq_name(), inverse_call.target.fq_name());
-        assert_eq!(forward_call.reference_kind, inverse_call.reference_kind);
-        assert_eq!(forward_call.reference_kind, Some(ReferenceKind::MethodCall));
-        assert_eq!(forward_call.proof, UsageProof::Proven);
-        assert_eq!(inverse_call.proof, UsageProof::Proven);
-        assert_eq!(forward_call.usage_kind, inverse_call.usage_kind);
-        assert_eq!(forward_call.site_class, SiteClass::UseSite);
-        assert_eq!(forward_call.generation, inverse_call.generation);
-        assert_eq!(forward_call.provenance, EdgeProvenance::Forward);
-        assert_eq!(inverse_call.provenance, EdgeProvenance::Inverse);
-        assert!(forward_call.site.ast_id.is_some());
-        assert_eq!(forward_call.site.ast_id, inverse_call.site.ast_id);
-        assert_eq!(forward_call.owner_relation, inverse_call.owner_relation);
-        assert_ne!(forward_call.owner_relation, OwnerRelation::Unknown);
     }
 
     #[test]
@@ -2468,36 +2615,10 @@ class Target {
         );
     }
 
-    #[test]
-    fn reference_engine_file_scan_never_expands_its_hard_scope() {
-        let fixture = Fixture::new(
-            Language::Java,
-            &[
-                ("src/Registry.java", JAVA_TARGET),
-                ("src/Startup.java", JAVA_CALLER),
-                (
-                    "src/Other.java",
-                    "package fixture; class Other { void unrelated() {} }",
-                ),
-            ],
-        );
-        let run = ReferenceEngine::new().scan_file_edges(fixture.analyzer(), &fixture.files[1..2]);
-        assert_eq!(run.work.candidate_files, 1);
-        assert_eq!(run.work.scanned_files, 1);
-        assert!(
-            run.edges
-                .iter()
-                .all(|edge| edge.site.file == fixture.files[1])
-        );
-    }
-
     const JAVA_BASE: &str =
         "package fixture;\n\npublic class Base {\n    public void ping() {\n    }\n}\n";
     const JAVA_DERIVED: &str = "package fixture;\n\npublic class Derived extends Base {\n    void run() {\n        helper();\n        run();\n    }\n\n    void helper() {\n    }\n}\n";
 
-    /// The one shared classifier answers every relation the issue names, from
-    /// the units alone, so both producers inherit identical classifications by
-    /// construction.
     #[test]
     fn the_owner_classifier_states_each_relation() {
         let fixture = Fixture::new(
@@ -2530,50 +2651,8 @@ class Target {
         );
     }
 
-    /// The memo states the relation the plain classifier states, on the first
-    /// ask of a site type and on every later one.
     #[test]
-    fn the_owner_relation_memo_answers_the_classifier() {
-        let fixture = Fixture::new(
-            Language::Java,
-            &[
-                ("src/Base.java", JAVA_BASE),
-                ("src/Derived.java", JAVA_DERIVED),
-            ],
-        );
-        let analyzer = fixture.analyzer();
-        let units = [
-            fixture.declaration("Base.ping"),
-            fixture.declaration("Derived.run"),
-            fixture.declaration("Derived.helper"),
-        ];
-        let mut memo = OwnerRelationMemo::default();
-        for _ in 0..2 {
-            for site in units.iter().map(Some).chain([None]) {
-                for target in &units {
-                    assert_eq!(
-                        memo.classify(analyzer, site, target),
-                        classify_owner_relation(analyzer, site, target),
-                        "{site:?} -> {target:?}"
-                    );
-                }
-            }
-        }
-        assert_eq!(
-            memo.classify(analyzer, Some(&units[1]), &units[0]),
-            OwnerRelation::InheritedOwner
-        );
-    }
-
-    /// A declaration whose qualified name places it in a namespace and in no
-    /// type has that namespace as its owner, so a free function calling a
-    /// method states `External` instead of declining to answer (#1645).
-    ///
-    /// The rule reads only the recorded segment kinds, so every language whose
-    /// free functions carry a module, package, or namespace prefix -- or carry
-    /// no type prefix at all -- answers the same way without a per-language
-    /// branch. Each language is listed with the shape it contributes.
-    #[test]
+    #[hardwon("#1645: free-function namespaces and type owners were misclassified as unknown")]
     fn a_namespace_owner_and_a_type_owner_are_external() {
         /// One language's contribution: the sources, the free callable, and
         /// the type-owned target it calls.
@@ -2702,10 +2781,8 @@ class Target {
         }
     }
 
-    /// Two declarations directly in one named namespace share that owner, and
-    /// two in different named namespaces are external -- the namespace half of
-    /// the same rule.
     #[test]
+    #[hardwon("#1645: named namespace owners were not compared by identity")]
     fn namespace_owners_are_compared_by_name() {
         let fixture = Fixture::new(
             Language::Go,
@@ -2736,11 +2813,8 @@ class Target {
         );
     }
 
-    /// A root scope carries no name, so two declarations in one are not
-    /// claimed to share an owner. `Unknown` here is the honesty rule, not a
-    /// missing case: the qualified names cannot tell one root scope from
-    /// another.
     #[test]
+    #[hardwon("#1645: unrelated root-scope functions must remain unknown owners")]
     fn two_root_scope_owners_stay_unknown() {
         let fixture = Fixture::new(
             Language::Rust,
@@ -2755,72 +2829,6 @@ class Target {
         assert_eq!(
             classify_owner_relation(analyzer, Some(&drive), &helper),
             OwnerRelation::Unknown
-        );
-    }
-
-    #[test]
-    fn forward_usage_kind_uses_only_role_and_owner_evidence() {
-        assert_eq!(
-            classify_forward_usage_kind_from_evidence(
-                OccurrenceRole::ImportTarget,
-                true,
-                OwnerRelation::External,
-            ),
-            UsageHitKind::Import
-        );
-        assert_eq!(
-            classify_forward_usage_kind_from_evidence(
-                OccurrenceRole::MemberPosition,
-                false,
-                OwnerRelation::SameOwner,
-            ),
-            UsageHitKind::Reference
-        );
-        assert_eq!(
-            classify_forward_usage_kind_from_evidence(
-                OccurrenceRole::ValueReference,
-                false,
-                OwnerRelation::SelfReference
-            ),
-            UsageHitKind::SelfReceiver
-        );
-        assert_eq!(
-            classify_forward_usage_kind_from_evidence(
-                OccurrenceRole::ImportTarget,
-                false,
-                OwnerRelation::External,
-            ),
-            UsageHitKind::Reference
-        );
-
-        // A type/path reference can share an owner without being a
-        // self/this receiver, and an inherited or unknown owner does not prove
-        // recursion. Those cases retain the public fallback.
-        for role in [
-            OccurrenceRole::TypeOperand,
-            OccurrenceRole::PathSegment,
-            OccurrenceRole::PatternPosition,
-        ] {
-            assert_eq!(
-                classify_forward_usage_kind_from_evidence(role, false, OwnerRelation::SameOwner),
-                UsageHitKind::Reference
-            );
-        }
-        assert_eq!(
-            classify_forward_usage_kind_from_evidence(
-                OccurrenceRole::MemberPosition,
-                false,
-                OwnerRelation::InheritedOwner
-            ),
-            UsageHitKind::Reference
-        );
-        assert_eq!(
-            classify_forward_usage_kind_from_evidence(
-                OccurrenceRole::MemberPosition,
-                false,
-                OwnerRelation::Unknown,
-            ),
-            UsageHitKind::Reference
         );
     }
 
@@ -2942,10 +2950,6 @@ class Target {
         assert_eq!(inverse_call.usage_kind, UsageHitKind::Reference);
     }
 
-    /// Kotlin's forward surface is supported, while its one uncovered
-    /// occurrence role remains an explicit completeness gap. Supported roles
-    /// retain their role-scoped completeness even when this fixture has no
-    /// reference sites.
     #[test]
     fn kotlin_forward_support_reports_only_its_uncovered_occurrence_role() {
         let fixture = Fixture::new(
@@ -2976,50 +2980,6 @@ class Target {
         assert!(!result.covers_forward_role(OccurrenceRole::PatternPosition));
     }
 
-    /// Two hits that disagree only on proof are two canonical rows. The
-    /// usage-hit identity excludes proof, so upstream sets collapse exactly
-    /// this disagreement; the canonical layer must not.
-    #[test]
-    fn rows_that_disagree_only_on_proof_stay_distinct() {
-        let fixture = Fixture::new(
-            Language::Java,
-            &[
-                ("src/Registry.java", JAVA_TARGET),
-                ("src/Startup.java", JAVA_CALLER),
-            ],
-        );
-        let target = fixture.declaration("Registry.register");
-        let caller = fixture.declaration("Startup.boot");
-        let range = Range {
-            start_byte: 10,
-            end_byte: 18,
-            start_line: 4,
-            end_line: 4,
-        };
-        let hit = |proof| ReferenceHit {
-            file: fixture.files[1].clone(),
-            range,
-            enclosing_unit: caller.clone(),
-            kind: Some(ReferenceKind::MethodCall),
-            resolved: target.clone(),
-            confidence: 1_000_000,
-            usage_kind: UsageHitKind::Reference,
-            proof,
-        };
-        let rows = edge_rows_from_reference_hits(
-            fixture.analyzer(),
-            [hit(UsageProof::Proven), hit(UsageProof::Unproven)],
-            7,
-            None,
-        );
-        assert_eq!(rows.len(), 2);
-        assert_ne!(rows[0], rows[1]);
-        assert_eq!(rows[0].proof, UsageProof::Proven);
-        assert_eq!(rows[1].proof, UsageProof::Unproven);
-    }
-
-    /// The covers table: axes this producer does not answer are never covered,
-    /// and each incomplete reason blocks exactly its own projection.
     #[test]
     fn completeness_covers_the_declared_axes_only() {
         let complete = EdgeCompleteness::Complete;

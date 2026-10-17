@@ -14,8 +14,6 @@
 
 #[cfg(test)]
 mod extractor_tests;
-#[cfg(test)]
-mod inverted_tests;
 pub mod macro_lexical;
 #[cfg(test)]
 mod resolver_tests;
@@ -27,9 +25,8 @@ use crate::analyzer::{AnalyzerQueryScope, QueryScope, QueryToken};
 use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::cpp_graph::shared::{CppEdgeResolver, CppQueryResolver};
 use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
-use crate::analyzer::usages::model::FuzzyResult;
-use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::traits::{UsageQueryResolver, UsageScanScope};
+use crate::analyzer::usages::outcome::GraphUsageOutcome;
+use crate::analyzer::usages::traits::{GraphUsageDispatchSpec, UsageScanScope};
 use crate::analyzer::{CodeUnit, CppAnalyzer, IAnalyzer, Language, ProjectFile, resolve_analyzer};
 use crate::hash::HashSet;
 pub(in crate::analyzer::usages) use brokk_bifrost_cpp::call_match::cpp_split_top_level_commas;
@@ -144,10 +141,7 @@ impl CppWorkspaceSource for CppDispatch<'_> {
         _token: QueryToken<'_>,
         name: &brokk_bifrost_core::analyzer::fq_name::FqName,
     ) -> Vec<CodeUnit> {
-        self.definitions(
-            name,
-            brokk_bifrost_core::analyzer::RelationalDefinitionQuery::Identifier { file: None },
-        )
+        self.definitions(name, workspace_identifier_query())
     }
 }
 
@@ -179,11 +173,11 @@ pub(crate) fn relational_identifier_definitions(
     analyzer: &dyn IAnalyzer,
     name: &brokk_bifrost_core::analyzer::fq_name::FqName,
 ) -> Vec<CodeUnit> {
-    relational_definitions(
-        analyzer,
-        name,
-        brokk_bifrost_core::analyzer::RelationalDefinitionQuery::Identifier { file: None },
-    )
+    relational_definitions(analyzer, name, workspace_identifier_query())
+}
+
+fn workspace_identifier_query() -> brokk_bifrost_core::analyzer::RelationalDefinitionQuery {
+    brokk_bifrost_core::analyzer::RelationalDefinitionQuery::Identifier { file: None }
 }
 
 pub(crate) fn relational_structural_members(
@@ -371,57 +365,33 @@ impl GraphUsageAnalyzer for CppUsageGraphStrategy {
         scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
-        if overloads.is_empty() {
-            return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
-        }
-
-        let target = &overloads[0];
-        if language_for_target(target) != Language::Cpp {
-            return GraphUsageOutcome::fallback_safe(
-                target.fq_name(),
-                GraphFailureReason::UnsupportedTargetLanguage("target is not C/C++"),
-                "CppUsageGraphStrategy",
-            );
-        }
-
-        let Some(resolver) = CppQueryResolver::try_new(analyzer) else {
-            return GraphUsageOutcome::fallback_safe(
-                target.fq_name(),
-                GraphFailureReason::MissingAnalyzerCapability(
-                    "analyzer does not expose CppAnalyzer",
-                ),
-                "CppUsageGraphStrategy",
-            );
-        };
-
-        resolver.find_usages(analyzer, overloads, scan_scope, max_usages)
+        crate::analyzer::usages::traits::dispatch_graph_usage_query::<CppQueryResolver<'_>>(
+            analyzer,
+            overloads,
+            scan_scope,
+            max_usages,
+            GraphUsageDispatchSpec {
+                target_language: Language::Cpp,
+                unsupported_target: "target is not C/C++",
+                missing_analyzer: "analyzer does not expose CppAnalyzer",
+                strategy: "CppUsageGraphStrategy",
+            },
+        )
     }
 }
 
 #[cfg(test)]
 mod bare_implicit_this_inverted_edge_tests {
     use super::*;
-    use crate::analyzer::{AnalyzerConfig, AnalyzerQueryScope, TestProject, WorkspaceAnalyzer};
+    use crate::analyzer::usages::cpp_graph::build_cpp_usage_edges;
+    use crate::analyzer::{AnalyzerConfig, TestProject, WorkspaceAnalyzer};
+    use crate::hash::HashSet;
     use std::sync::Arc;
 
-    /// #1161: a bare `m()` call resolving to a method on the enclosing class
-    /// (implicit-this, no receiver token at all) must be recorded as
-    /// *unproven* inbound by the whole-workspace inverted builder, never
-    /// silently dropped — the second same-owner drop site, alongside the
-    /// explicit `this->m()` fix at #1138.
-    ///
-    /// This can't be asserted at the dead-code smell verdict: a genuine C++
-    /// method is unconditionally `NeedsPrecise`
-    /// (`dead_code_bulk_eligibility`'s catch-all arm), so the smell path
-    /// never reaches the bulk inverted graph for a method target and the
-    /// verdict is inconclusive-by-skip regardless of this bug. Asserting
-    /// directly on `build_cpp_usage_edges`'s `unproven_inbound` map is the
-    /// level that actually discriminates: before the fix the same-owner call
-    /// site vanishes entirely (`unproven_inbound` has no entry for the
-    /// callee); after the fix it is counted, while `edges` (the proven-edge
-    /// set) stays empty for it either way, matching the sibling
-    /// `this->m()` behavior.
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1161: bare C++ implicit-this calls were dropped instead of retained as unproven inbound edges"
+    )]
     fn bare_implicit_this_call_is_recorded_as_unproven_inbound_not_dropped() {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical temp dir");

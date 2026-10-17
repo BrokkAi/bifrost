@@ -1,4 +1,4 @@
-const SERVER_TOOLSET_ORDER = ["symbol", "extended", "slopcop", "text"] as const;
+const SERVER_TOOLSET_ORDER = ["symbol", "extended", "diff", "slopcop", "text"] as const;
 type ServerToolset = (typeof SERVER_TOOLSET_ORDER)[number];
 
 interface CapabilityShape {
@@ -15,7 +15,7 @@ export const BIFROST_CAPABILITIES = [
     id: "symbols",
     label: "Symbols",
     description: "Navigation, definitions, usages, graphs, and diff analysis",
-    serverToolsets: ["symbol", "slopcop"],
+    serverToolsets: ["symbol", "diff", "slopcop"],
     toolRequirements: [
       ["search_symbols"],
       ["get_symbol_sources"],

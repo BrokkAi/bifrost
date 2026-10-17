@@ -47,6 +47,29 @@ pub(crate) struct ValidationLimits {
     pub max_depth: usize,
 }
 
+fn valid_go_import_path(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('/')
+        && !value.contains('\\')
+        && !value.chars().any(char::is_whitespace)
+        && !value.chars().any(char::is_control)
+        && value
+            .split('/')
+            .all(|component| !component.is_empty() && component != "." && component != "..")
+}
+
+fn valid_go_source_range(range: SourceByteRange) -> bool {
+    range.start < range.end
+}
+
+fn contains_source_range(outer: SourceByteRange, inner: SourceByteRange) -> bool {
+    outer.start <= inner.start && inner.end <= outer.end
+}
+
+fn contains_strict_source_range(outer: SourceByteRange, inner: SourceByteRange) -> bool {
+    outer.start < inner.start && inner.end < outer.end
+}
+
 pub(crate) fn validate_pack(
     pack: &AuthoredSemanticModelPack,
     limits: ValidationLimits,
@@ -78,7 +101,10 @@ fn validate_pack_internal(
         limits,
         stable_ids: HashMap::new(),
         declaration_ids: HashSet::new(),
+        anonymous_callable_ids: HashSet::new(),
         type_ids: HashSet::new(),
+        type_kinds_by_id: HashMap::new(),
+        type_kinds_by_name: HashMap::new(),
         member_ids: HashSet::new(),
         member_owners: HashMap::new(),
         member_family_complete: HashMap::new(),
@@ -112,7 +138,10 @@ struct Validator {
     limits: ValidationLimits,
     stable_ids: HashMap<String, String>,
     declaration_ids: HashSet<String>,
+    anonymous_callable_ids: HashSet<String>,
     type_ids: HashSet<String>,
+    type_kinds_by_id: HashMap<String, TypeKind>,
+    type_kinds_by_name: HashMap<String, Option<TypeKind>>,
     member_ids: HashSet<String>,
     member_owners: HashMap<String, String>,
     member_family_complete: HashMap<String, bool>,
@@ -220,6 +249,14 @@ impl Validator {
                     .extend(types.iter().map(|fact| fact.id.clone()));
                 self.type_ids
                     .extend(types.iter().map(|fact| fact.id.clone()));
+                for fact in types {
+                    self.type_kinds_by_id
+                        .insert(fact.id.clone(), fact.type_kind);
+                    self.type_kinds_by_name
+                        .entry(fact.name.clone())
+                        .and_modify(|kind| *kind = None)
+                        .or_insert(Some(fact.type_kind));
+                }
                 self.declaration_ids
                     .extend(members.iter().map(|fact| fact.id.clone()));
                 self.member_ids
@@ -276,10 +313,91 @@ impl Validator {
                 );
             }
         }
+        let mut anonymous_id_counts = HashMap::<&str, usize>::new();
+        for identity in pack
+            .shards
+            .iter()
+            .filter_map(|shard| shard.callable_values.as_ref())
+            .flat_map(|payload| payload.anonymous_callables.iter())
+        {
+            *anonymous_id_counts.entry(&identity.id).or_default() += 1;
+        }
+        for shard in &pack.shards {
+            let Some(payload) = &shard.callable_values else {
+                continue;
+            };
+            for (index, identity) in payload.anonymous_callables.iter().enumerate() {
+                let identity_path = format!(
+                    "$.shards[{}/callable_values].anonymous_callables[{index}]",
+                    shard.id
+                );
+                let id_path = format!("{identity_path}.id");
+                self.stable_id(&id_path, &identity.id);
+                let structurally_valid =
+                    self.anonymous_callable_identity(&identity_path, identity, &shard.activation);
+                if anonymous_id_counts.get(identity.id.as_str()).copied() != Some(1) {
+                    self.error(
+                        "callable_values.anonymous_duplicate_id",
+                        id_path,
+                        format!(
+                            "anonymous callable ID `{}` must identify exactly one source identity in the pack",
+                            identity.id
+                        ),
+                    );
+                    continue;
+                }
+                let collides = self.declaration_ids.contains(&identity.id)
+                    || self.procedure_ids.contains(&identity.id)
+                    || self
+                        .stable_ids
+                        .get(&identity.id)
+                        .is_some_and(|first_path| first_path != &id_path);
+                if collides {
+                    self.error(
+                        "callable_values.anonymous_id_collision",
+                        id_path,
+                        "anonymous callable ID collides with another pack identity",
+                    );
+                    continue;
+                }
+                if structurally_valid {
+                    self.anonymous_callable_ids.insert(identity.id.clone());
+                    self.declaration_ids.insert(identity.id.clone());
+                }
+            }
+        }
+        let callable_members = pack
+            .shards
+            .iter()
+            .filter_map(|shard| match &shard.payload {
+                AuthoredPayload::DeclarationFacts { members, .. } => Some(members),
+                _ => None,
+            })
+            .flatten()
+            .filter(|member| {
+                matches!(
+                    member.member_kind,
+                    MemberKind::Constructor | MemberKind::Method | MemberKind::Function
+                )
+            })
+            .map(|member| (member.id.as_str(), member))
+            .collect::<HashMap<_, _>>();
+        let anonymous_callable_ids = self.anonymous_callable_ids.clone();
+        for shard in &pack.shards {
+            if let Some(callable_values) = &shard.callable_values {
+                self.callable_values(
+                    &format!("$.shards[{}/callable_values]", shard.id),
+                    callable_values,
+                    &callable_members,
+                    &anonymous_callable_ids,
+                );
+            }
+        }
         if pack.shards.iter().any(|shard| {
             shard.deferred_yields.is_some()
                 || shard.conditional_type_refinements.is_some()
                 || shard.runtime_contracts.is_some()
+                || shard.callable_values.is_some()
         }) {
             if native_profile_depth_within(pack, self.limits.max_depth) {
                 if self.validate_references {
@@ -365,7 +483,24 @@ impl Validator {
                         .conditional_type_refinements
                         .as_ref()
                         .map_or(0, ConditionalTypeRefinementsPayload::record_count),
+                )
+                .saturating_add(
+                    shard
+                        .callable_values
+                        .as_ref()
+                        .map_or(0, CallableValuesPayload::record_count),
                 );
+            if shard.callable_values.is_some()
+                && self.schema_version < CALLABLE_VALUES_MIN_SCHEMA_VERSION
+            {
+                self.error(
+                    "schema.callable_values_version",
+                    format!("{path}.callable_values"),
+                    format!(
+                        "callable-values transport requires schema version {CALLABLE_VALUES_MIN_SCHEMA_VERSION}"
+                    ),
+                );
+            }
             if records == 0 {
                 self.error(
                     "shard.empty_payload",
@@ -395,6 +530,441 @@ impl Validator {
                     self.limits.max_records_per_pack
                 ),
             );
+        }
+    }
+
+    fn anonymous_callable_identity(
+        &mut self,
+        path: &str,
+        identity: &AnonymousCallableIdentity,
+        activation: &[ActivationSelector],
+    ) -> bool {
+        let mut valid = true;
+        if self.language != "go" {
+            self.error(
+                "callable_values.anonymous_language",
+                path,
+                "anonymous callable source identities are supported only for Go packs",
+            );
+            valid = false;
+        }
+        self.text(
+            &format!("{path}.artifact_sha256"),
+            &identity.artifact_sha256,
+        );
+        if !is_lower_sha256(&identity.artifact_sha256) {
+            self.error(
+                "callable_values.anonymous_artifact",
+                format!("{path}.artifact_sha256"),
+                "anonymous callable artifact identity must be a lowercase SHA-256 digest",
+            );
+            valid = false;
+        }
+        if !activation.iter().any(|selector| {
+            selector.artifact_sha256.as_deref() == Some(identity.artifact_sha256.as_str())
+        }) {
+            self.error(
+                "callable_values.anonymous_artifact",
+                format!("{path}.artifact_sha256"),
+                "anonymous callable digest must match an artifact-pinned shard activation selector",
+            );
+            valid = false;
+        }
+
+        self.text(
+            &format!("{path}.package_import_path"),
+            &identity.package_identity,
+        );
+        if !valid_go_import_path(&identity.package_identity) {
+            self.error(
+                "callable_values.anonymous_package",
+                format!("{path}.package_import_path"),
+                "Go package import path must be relative, canonical, and contain no empty, dot, or parent components",
+            );
+            valid = false;
+        }
+
+        self.locator_path(&format!("{path}.anchor.file"), &identity.anchor.file);
+        if identity.anchor.kind != SourceDeclarationKind::FunctionLiteral {
+            self.error(
+                "callable_values.anonymous_anchor_kind",
+                format!("{path}.anchor.kind"),
+                "anonymous callable anchor must identify a Go function literal",
+            );
+            valid = false;
+        }
+        if !valid_go_source_range(identity.anchor.byte_range) {
+            self.error(
+                "callable_values.anonymous_range",
+                format!("{path}.anchor.byte_range"),
+                "source ranges must be non-empty half-open byte ranges",
+            );
+            valid = false;
+        }
+
+        if identity.lexical_owner_chain.len() > self.limits.max_depth {
+            self.error(
+                "limit.callable_values_anonymous_owners",
+                format!("{path}.lexical_owner_chain"),
+                format!("lexical owner depth exceeds {}", self.limits.max_depth),
+            );
+            valid = false;
+        } else {
+            let mut parent = None;
+            for (index, owner) in identity.lexical_owner_chain.iter().enumerate() {
+                let owner_path = format!("{path}.lexical_owner_chain[{index}]");
+                self.locator_path(&format!("{owner_path}.file"), &owner.file);
+                if owner.file != identity.anchor.file
+                    || !matches!(
+                        owner.kind,
+                        SourceDeclarationKind::Function
+                            | SourceDeclarationKind::Method
+                            | SourceDeclarationKind::FunctionLiteral
+                    )
+                {
+                    self.error(
+                        "callable_values.anonymous_owner",
+                        owner_path.clone(),
+                        "lexical owners must be enclosing Go functions, methods, or function literals in the same file",
+                    );
+                    valid = false;
+                }
+                if !valid_go_source_range(owner.byte_range) {
+                    self.error(
+                        "callable_values.anonymous_range",
+                        format!("{owner_path}.byte_range"),
+                        "source ranges must be non-empty half-open byte ranges",
+                    );
+                    valid = false;
+                }
+                if let Some(parent_range) = parent
+                    && !contains_strict_source_range(parent_range, owner.byte_range)
+                {
+                    self.error(
+                        "callable_values.anonymous_owner",
+                        format!("{owner_path}.byte_range"),
+                        "lexical owner ranges must be strictly nested from outermost to innermost",
+                    );
+                    valid = false;
+                }
+                parent = Some(owner.byte_range);
+            }
+            if let Some(parent_range) = parent
+                && !contains_strict_source_range(parent_range, identity.anchor.byte_range)
+            {
+                self.error(
+                    "callable_values.anonymous_owner",
+                    format!("{path}.anchor.byte_range"),
+                    "the function literal must be strictly contained by its innermost lexical owner",
+                );
+                valid = false;
+            }
+        }
+
+        let signature = &identity.signature;
+        self.text(
+            &format!("{path}.signature.function_type.file"),
+            &signature.function_type.file,
+        );
+        let signature_range = signature.function_type.byte_range;
+        if signature.function_type.file != identity.anchor.file
+            || !valid_go_source_range(signature_range)
+            || signature_range.start != identity.anchor.byte_range.start
+            || signature_range.end > identity.anchor.byte_range.end
+        {
+            self.error(
+                "callable_values.anonymous_signature",
+                format!("{path}.signature.function_type"),
+                "literal signature range must start at the function literal and remain inside its exact source anchor",
+            );
+            valid = false;
+        }
+        if !signature.declaration_chain.is_empty() {
+            self.error(
+                "callable_values.anonymous_signature",
+                format!("{path}.signature.declaration_chain"),
+                "function literal signature provenance cannot claim package-scope type declaration bindings",
+            );
+            valid = false;
+        }
+
+        let shape_record_count = signature
+            .parameters
+            .len()
+            .saturating_add(signature.results.len());
+        if shape_record_count > self.limits.max_records_per_shard {
+            self.error(
+                "limit.callable_values_anonymous_shape",
+                format!("{path}.signature"),
+                format!(
+                    "signature shape has more than {} parameter and result groups",
+                    self.limits.max_records_per_shard
+                ),
+            );
+            valid = false;
+            return valid;
+        }
+        for (kind, items) in [
+            ("parameters", signature.parameters.as_slice()),
+            ("results", signature.results.as_slice()),
+        ] {
+            for (index, item) in items.iter().enumerate() {
+                let item_path = format!("{path}.signature.{kind}[{index}]");
+                self.text(&format!("{item_path}.type_node.file"), &item.type_node.file);
+                if item.arity == 0 {
+                    self.error(
+                        "callable_values.anonymous_signature",
+                        format!("{item_path}.arity"),
+                        "AST parameter and result groups must have positive arity",
+                    );
+                    valid = false;
+                }
+                if item.type_node.file != identity.anchor.file
+                    || !valid_go_source_range(item.type_node.byte_range)
+                    || !contains_source_range(signature_range, item.type_node.byte_range)
+                {
+                    self.error(
+                        "callable_values.anonymous_signature",
+                        format!("{item_path}.type_node"),
+                        "parameter and result type nodes must be anchored inside the literal signature in the same file",
+                    );
+                    valid = false;
+                }
+                if item.variadic && (kind == "results" || index + 1 != items.len()) {
+                    self.error(
+                        "callable_values.anonymous_signature",
+                        format!("{item_path}.variadic"),
+                        "only the final parameter group may be variadic",
+                    );
+                    valid = false;
+                }
+            }
+        }
+        valid
+    }
+
+    fn callable_values(
+        &mut self,
+        path: &str,
+        payload: &CallableValuesPayload,
+        callable_members: &HashMap<&str, &MemberFact>,
+        anonymous_callable_ids: &HashSet<String>,
+    ) {
+        use super::csmi::{CsmiCallableValuesArgument, CsmiCallableValuesPayload};
+
+        if payload.facts.is_empty()
+            && payload.coverage.is_empty()
+            && payload.anonymous_callables.is_empty()
+        {
+            self.error(
+                "callable_values.empty",
+                path,
+                "callable-values carrier must contain a fact or coverage row",
+            );
+        }
+
+        for (index, fact) in payload.facts.iter().enumerate() {
+            let fact_path = format!("{path}.facts[{index}]");
+            let permitted_anonymous_target = match &fact.payload {
+                CsmiCallableValuesPayload::ReturnedCallable { target, .. }
+                    if anonymous_callable_ids.contains(target)
+                        && payload
+                            .anonymous_callables
+                            .iter()
+                            .any(|identity| identity.id.as_str() == target.as_str()) =>
+                {
+                    Some(target.as_str())
+                }
+                _ => None,
+            };
+            let mut remapped = fact.payload.clone();
+            if let Err(error) = remapped.remap_symbols(|symbol| {
+                (self.declaration_ids.contains(symbol)
+                    && (!anonymous_callable_ids.contains(symbol)
+                        || permitted_anonymous_target == Some(symbol)))
+                .then(|| symbol.to_owned())
+                .ok_or_else(|| symbol.to_owned())
+            }) {
+                self.error(
+                    "callable_values.symbol_reference",
+                    format!("{fact_path}.payload"),
+                    format!("callable-values payload has an unknown symbol or unsupported projection: {error:?}"),
+                );
+            }
+
+            match &fact.payload {
+                CsmiCallableValuesPayload::ReturnedCallable {
+                    callable,
+                    result,
+                    target,
+                } => {
+                    let Some(factory) = callable_members.get(callable.as_str()).copied() else {
+                        self.error(
+                            "callable_values.factory",
+                            format!("{fact_path}.payload.callable"),
+                            format!("returned-callable factory `{callable}` is not an indexed callable member"),
+                        );
+                        continue;
+                    };
+                    let Some(signature) = factory.signature.as_ref() else {
+                        self.error(
+                            "callable_values.factory",
+                            format!("{fact_path}.payload.callable"),
+                            format!(
+                                "returned-callable factory `{callable}` has no callable signature"
+                            ),
+                        );
+                        continue;
+                    };
+                    let normal_results = match &signature.returns {
+                        None => 0,
+                        Some(TypeRef::Tuple { elements }) => {
+                            u32::try_from(elements.len()).expect("model result count fits a u32")
+                        }
+                        Some(_) => 1,
+                    };
+                    if *result >= normal_results {
+                        self.error(
+                            "callable_values.result",
+                            format!("{fact_path}.payload.result"),
+                            format!("returned-callable result {result} is outside the factory's {normal_results} normal result ports"),
+                        );
+                    }
+                    let Some(target_member) = callable_members.get(target.as_str()).copied() else {
+                        if anonymous_callable_ids.contains(target)
+                            && payload
+                                .anonymous_callables
+                                .iter()
+                                .any(|identity| identity.id.as_str() == target.as_str())
+                        {
+                            continue;
+                        }
+                        self.error(
+                            "callable_values.target",
+                            format!("{fact_path}.payload.target"),
+                            format!("returned-callable target `{target}` is not an indexed callable member or unique validated Go function literal"),
+                        );
+                        continue;
+                    };
+                    if target_member.signature.is_none() {
+                        self.error(
+                            "callable_values.target",
+                            format!("{fact_path}.payload.target"),
+                            format!(
+                                "returned-callable target `{target}` has no callable signature"
+                            ),
+                        );
+                    }
+                }
+                CsmiCallableValuesPayload::CallbackInvocation {
+                    callable,
+                    callback,
+                    shape,
+                    arguments,
+                    ..
+                } => {
+                    let Some(factory) = callable_members.get(callable.as_str()).copied() else {
+                        self.error(
+                            "callable_values.factory",
+                            format!("{fact_path}.payload.callable"),
+                            format!(
+                                "callback factory `{callable}` is not an indexed callable member"
+                            ),
+                        );
+                        continue;
+                    };
+                    let Some(signature) = factory.signature.as_ref() else {
+                        self.error(
+                            "callable_values.factory",
+                            format!("{fact_path}.payload.callable"),
+                            format!("callback factory `{callable}` has no callable signature"),
+                        );
+                        continue;
+                    };
+                    if arguments.len() != usize::from(shape.parameters) {
+                        self.error(
+                            "callable_values.argument_arity",
+                            format!("{fact_path}.payload.arguments"),
+                            format!("known callback arguments count {} does not equal shape.parameters {}", arguments.len(), shape.parameters),
+                        );
+                    }
+                    self.callable_values_location_root(
+                        &format!("{fact_path}.payload.callback"),
+                        callback,
+                        factory,
+                        signature,
+                    );
+                    for (argument_index, argument) in arguments.iter().enumerate() {
+                        if let CsmiCallableValuesArgument::Input { source } = argument {
+                            self.callable_values_location_root(
+                                &format!("{fact_path}.payload.arguments[{argument_index}].source"),
+                                source,
+                                factory,
+                                signature,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        for (index, coverage) in payload.coverage.iter().enumerate() {
+            let path = format!("{path}.coverage[{index}].callable");
+            let Some(member) = callable_members.get(coverage.callable.as_str()).copied() else {
+                self.error(
+                    "callable_values.coverage_callable",
+                    path,
+                    format!(
+                        "coverage callable `{}` is not an indexed callable member",
+                        coverage.callable
+                    ),
+                );
+                continue;
+            };
+            if member.signature.is_none() {
+                self.error(
+                    "callable_values.coverage_callable",
+                    path,
+                    format!(
+                        "coverage callable `{}` has no callable signature",
+                        coverage.callable
+                    ),
+                );
+            }
+        }
+    }
+
+    fn callable_values_location_root(
+        &mut self,
+        path: &str,
+        location: &super::csmi::CsmiInputLocation,
+        factory: &MemberFact,
+        signature: &Signature,
+    ) {
+        use super::csmi::CsmiInputBoundaryRoot;
+
+        match &location.root {
+            CsmiInputBoundaryRoot::Receiver(_) if factory.receiver.is_none() => self.error(
+                "callable_values.receiver_root",
+                format!("{path}.root"),
+                "callable-values location uses a receiver root but the factory has no receiver",
+            ),
+            CsmiInputBoundaryRoot::Parameter(parameter)
+                if parameter.position as usize >= signature.parameters.len() => self.error(
+                    "callable_values.parameter_root",
+                    format!("{path}.root.position"),
+                    format!(
+                        "parameter root {} is outside the factory arity {}",
+                        parameter.position,
+                        signature.parameters.len()
+                    ),
+                ),
+            CsmiInputBoundaryRoot::Capture(_) => self.error(
+                "callable_values.capture_root",
+                format!("{path}.root"),
+                "callable-values callback locations require a factory receiver or formal parameter root",
+            ),
+            _ => {}
         }
     }
 
@@ -910,11 +1480,74 @@ impl Validator {
                         );
                     }
                     for (type_index, hierarchy) in fact.hierarchy.iter().enumerate() {
+                        let hierarchy_target_path =
+                            format!("{fact_path}.hierarchy[{type_index}].target");
+                        if hierarchy.target.contains_unknown() {
+                            self.error(
+                                "hierarchy.unknown_target",
+                                &hierarchy_target_path,
+                                "hierarchy relations require a concrete target type",
+                            );
+                        }
                         self.type_ref(
-                            &format!("{fact_path}.hierarchy[{type_index}].target"),
+                            &hierarchy_target_path,
                             &hierarchy.target,
                             &fact.type_parameters,
                         );
+                    }
+                    if let Some(bases) = &fact.runtime_bases {
+                        let bases_path = format!("{fact_path}.runtime_bases");
+                        if self.schema_version < RUNTIME_BASES_MIN_SCHEMA_VERSION {
+                            self.error("declaration.runtime_bases_schema_version", &bases_path,
+                                format!("runtime_bases requires schema version {RUNTIME_BASES_MIN_SCHEMA_VERSION}"));
+                        }
+                        if self.language != "python" || fact.type_kind != TypeKind::Class {
+                            self.error(
+                                "declaration.runtime_bases_owner",
+                                &bases_path,
+                                "runtime_bases is only valid on Python class facts",
+                            );
+                        }
+                        for (base_index, base) in bases.iter().enumerate() {
+                            let base_path = format!("{bases_path}[{base_index}]");
+                            self.type_ref(&base_path, base, &[]);
+                            let known_non_class = match base {
+                                TypeRef::Named {
+                                    name,
+                                    arguments,
+                                    nullable: false,
+                                } if arguments.is_empty() => self
+                                    .type_kinds_by_name
+                                    .get(name)
+                                    .copied()
+                                    .flatten()
+                                    .is_some_and(|kind| kind != TypeKind::Class),
+                                TypeRef::Declared {
+                                    id,
+                                    arguments,
+                                    nullable: false,
+                                } if arguments.is_empty() => {
+                                    self.type_kinds_by_id.get(id).map_or_else(
+                                        || self.declaration_ids.contains(id),
+                                        |kind| *kind != TypeKind::Class,
+                                    )
+                                }
+                                _ => {
+                                    self.error("declaration.runtime_base_shape", &base_path,
+                                        "runtime bases require non-nullable, non-parameterized named or declared class references");
+                                    continue;
+                                }
+                            };
+                            // Only a unique local declaration is known here. Missing or
+                            // ambiguous active named targets remain a query-time boundary.
+                            if known_non_class {
+                                self.error(
+                                    "declaration.runtime_base_non_class",
+                                    base_path,
+                                    "runtime base refers to a non-class declaration",
+                                );
+                            }
+                        }
                     }
                     for (alias_index, alias) in fact.aliases.iter().enumerate() {
                         self.qualified_name(&format!("{fact_path}.aliases[{alias_index}]"), alias);
@@ -942,6 +1575,65 @@ impl Validator {
                     self.stable_id(&format!("{fact_path}.id"), &fact.id);
                     self.language_identifier(&format!("{fact_path}.name"), &fact.name);
                     self.locator(&format!("{fact_path}.locator"), &fact.locator);
+                    if fact.proxied_type.is_some() && fact.value_type.is_none() {
+                        self.error(
+                            "declaration.proxied_type_without_value_type",
+                            format!("{fact_path}.proxied_type"),
+                            "a proxied module value type requires its declared value type",
+                        );
+                    }
+                    for (field_name, declared_type) in [
+                        ("value_type", fact.value_type.as_ref()),
+                        ("proxied_type", fact.proxied_type.as_ref()),
+                    ] {
+                        let Some(declared_type) = declared_type else {
+                            continue;
+                        };
+                        let type_path = format!("{fact_path}.{field_name}");
+                        if self.schema_version < TYPED_VALUES_AND_PARAMETER_ROLES_MIN_SCHEMA_VERSION
+                        {
+                            self.error(
+                                "declaration.module_value_type_schema_version",
+                                &type_path,
+                                format!(
+                                    "declared module value types require schema version {TYPED_VALUES_AND_PARAMETER_ROLES_MIN_SCHEMA_VERSION}"
+                                ),
+                            );
+                        }
+                        if fact.member_kind != MemberKind::Field {
+                            self.error(
+                                "declaration.module_value_type_requires_field",
+                                &type_path,
+                                "declared module value types are valid only on field facts",
+                            );
+                        }
+                        let is_class_type = match declared_type {
+                            TypeRef::Named {
+                                arguments,
+                                nullable,
+                                ..
+                            }
+                            | TypeRef::Declared {
+                                arguments,
+                                nullable,
+                                ..
+                            } => arguments.is_empty() && !nullable,
+                            _ => false,
+                        };
+                        if !is_class_type {
+                            self.error(
+                                "declaration.module_value_type_shape",
+                                &type_path,
+                                "declared module value types must name one non-null class without type arguments",
+                            );
+                        }
+                        let owner_parameters = self
+                            .type_parameters_by_id
+                            .get(&fact.owner)
+                            .cloned()
+                            .unwrap_or_default();
+                        self.type_ref(&type_path, declared_type, &owner_parameters);
+                    }
                     if fact.ambient_use.is_some() {
                         self.ambient_use_version(&fact_path);
                     }
@@ -1038,25 +1730,72 @@ impl Validator {
                                 "callable_family_complete requires a constructor, method, or function",
                             );
                         }
-                        match &fact.signature {
-                            None => self.error(
+                        if fact.signature.is_none() {
+                            self.error(
                                 "declaration.callable_family_complete_without_signature",
                                 format!("{fact_path}.callable_family_complete"),
                                 "callable_family_complete requires a structured signature",
-                            ),
-                            Some(signature)
-                                if signature
-                                    .parameters
-                                    .last()
-                                    .is_some_and(|parameter| parameter.variadic) =>
-                            {
+                            );
+                        }
+                    }
+                    if !fact.exact_return_classes.is_empty() {
+                        if self.schema_version < EXACT_RETURN_CLASSES_MIN_SCHEMA_VERSION {
+                            self.error(
+                                "declaration.exact_return_classes_schema_version",
+                                format!("{fact_path}.exact_return_classes"),
+                                format!(
+                                    "exact runtime return-class sets require schema version {EXACT_RETURN_CLASSES_MIN_SCHEMA_VERSION}"
+                                ),
+                            );
+                        }
+                        let mut class_identities = HashSet::new();
+                        let mut valid_classes = true;
+                        for (class_index, class) in fact.exact_return_classes.iter().enumerate() {
+                            self.type_ref(
+                                &format!("{fact_path}.exact_return_classes[{class_index}]"),
+                                class,
+                                &[],
+                            );
+                            let identity = match class {
+                                TypeRef::Named {
+                                    name,
+                                    nullable: false,
+                                    ..
+                                } if !name.is_empty() => format!("named:{name}"),
+                                TypeRef::Declared {
+                                    id,
+                                    nullable: false,
+                                    ..
+                                } if self.type_ids.contains(id) => format!("declared:{id}"),
+                                _ => {
+                                    valid_classes = false;
+                                    continue;
+                                }
+                            };
+                            if !class_identities.insert(identity) {
                                 self.error(
-                                    "declaration.callable_family_complete_on_variadic",
-                                    format!("{fact_path}.callable_family_complete"),
-                                    "callable_family_complete does not yet support variadic declarations",
+                                    "declaration.exact_return_classes_duplicate",
+                                    format!("{fact_path}.exact_return_classes[{class_index}]"),
+                                    "exact_return_classes cannot repeat a runtime class",
                                 );
+                                valid_classes = false;
                             }
-                            Some(_) => {}
+                        }
+                        if !matches!(
+                            fact.member_kind,
+                            MemberKind::Constructor
+                                | MemberKind::Method
+                                | MemberKind::Function
+                                | MemberKind::Static
+                                | MemberKind::Property
+                        ) || fact.signature.is_none()
+                            || !valid_classes
+                        {
+                            self.error(
+                                "declaration.exact_return_classes",
+                                format!("{fact_path}.exact_return_classes"),
+                                "exact_return_classes requires a callable signature and a non-empty set of unique, non-null nominal classes",
+                            );
                         }
                     }
                     if let Some(signature) = &fact.signature {
@@ -1879,6 +2618,136 @@ impl Validator {
                 "a variadic target must declare its variadic final formal parameter",
             );
         }
+        if !summary.target.formals.is_empty() {
+            if self.schema_version < PROCEDURE_FORMALS_MIN_SCHEMA_VERSION {
+                self.error(
+                    "summary.formals_schema_version",
+                    format!("{path}.target.formals"),
+                    format!(
+                        "structured procedure formals require schema version {PROCEDURE_FORMALS_MIN_SCHEMA_VERSION}"
+                    ),
+                );
+            }
+            if summary.target.variadic
+                && self.schema_version < PROCEDURE_VARIADIC_FORMALS_MIN_SCHEMA_VERSION
+            {
+                self.error(
+                    "summary.formals_variadic_target",
+                    format!("{path}.target.formals"),
+                    format!(
+                        "structured variadic procedure formals require schema version {PROCEDURE_VARIADIC_FORMALS_MIN_SCHEMA_VERSION}"
+                    ),
+                );
+            }
+            if summary.target.formals.len() != summary.target.parameter_count as usize {
+                self.error(
+                    "summary.formals_count_mismatch",
+                    format!("{path}.target.formals"),
+                    format!(
+                        "expected {} structured formals, found {}",
+                        summary.target.parameter_count,
+                        summary.target.formals.len()
+                    ),
+                );
+            }
+            let mut names = HashSet::new();
+            let variadic_formals = summary
+                .target
+                .formals
+                .iter()
+                .enumerate()
+                .filter_map(|(index, formal)| formal.variadic_kind.map(|kind| (index, kind)))
+                .collect::<Vec<_>>();
+            if !variadic_formals.is_empty()
+                && self.schema_version < PROCEDURE_VARIADIC_FORMALS_MIN_SCHEMA_VERSION
+            {
+                self.error(
+                    "summary.variadic_formals_schema_version",
+                    format!("{path}.target.formals"),
+                    format!(
+                        "variadic formal kinds require schema version {PROCEDURE_VARIADIC_FORMALS_MIN_SCHEMA_VERSION}"
+                    ),
+                );
+            }
+            if self.schema_version >= PROCEDURE_VARIADIC_FORMALS_MIN_SCHEMA_VERSION {
+                let target_variadic_formal_is_exact =
+                    summary.target.variadic == !variadic_formals.is_empty();
+                if !target_variadic_formal_is_exact {
+                    self.error(
+                        "summary.formals_variadic_target_mismatch",
+                        format!("{path}.target.formals"),
+                        "a structured variadic target must declare at least one variadic formal, and a fixed target must declare none",
+                    );
+                }
+                let positional_variadics = variadic_formals
+                    .iter()
+                    .filter_map(|(index, kind)| kind.accepts_positional().then_some(*index))
+                    .collect::<Vec<_>>();
+                let keyword_variadics = variadic_formals
+                    .iter()
+                    .filter_map(|(index, kind)| kind.accepts_named().then_some(*index))
+                    .collect::<Vec<_>>();
+                if positional_variadics.len() > 1 || keyword_variadics.len() > 1 {
+                    self.error(
+                        "summary.variadic_formal_domain_conflict",
+                        format!("{path}.target.formals"),
+                        "a structured signature may declare at most one rest formal per argument domain",
+                    );
+                }
+                if let Some(index) = keyword_variadics.first()
+                    && *index + 1 != summary.target.formals.len()
+                {
+                    self.error(
+                        "summary.variadic_formal_not_final",
+                        format!("{path}.target.formals[{index}]"),
+                        "the keyword-rest formal must be final",
+                    );
+                }
+                if let Some(index) = positional_variadics.first()
+                    && summary.target.formals[*index + 1..]
+                        .iter()
+                        .any(|formal| formal.passing_mode.accepts_positional())
+                {
+                    self.error(
+                        "summary.variadic_formal_order",
+                        format!("{path}.target.formals[{index}]"),
+                        "a positional-rest formal may be followed only by named-only fixed formals or keyword-rest",
+                    );
+                }
+                for (index, kind) in &variadic_formals {
+                    let formal = &summary.target.formals[*index];
+                    let expected_mode = match kind {
+                        AuthoredProcedureFormalVariadicKind::Positional => {
+                            AuthoredProcedureFormalPassingMode::PositionalOnly
+                        }
+                        AuthoredProcedureFormalVariadicKind::Keyword => {
+                            AuthoredProcedureFormalPassingMode::NamedOnly
+                        }
+                        AuthoredProcedureFormalVariadicKind::Both => {
+                            AuthoredProcedureFormalPassingMode::PositionalOrNamed
+                        }
+                    };
+                    if formal.passing_mode != expected_mode {
+                        self.error(
+                            "summary.variadic_formal_passing_mode",
+                            format!("{path}.target.formals[{index}].passing_mode"),
+                            "the formal passing mode must match its positional, keyword, or both-domain variadic kind",
+                        );
+                    }
+                }
+            }
+            for (index, formal) in summary.target.formals.iter().enumerate() {
+                let formal_path = format!("{path}.target.formals[{index}]");
+                self.text(&format!("{formal_path}.name"), &formal.name);
+                if !names.insert(formal.name.as_str()) {
+                    self.error(
+                        "summary.duplicate_formal_name",
+                        format!("{formal_path}.name"),
+                        format!("formal name {:?} is already declared", formal.name),
+                    );
+                }
+            }
+        }
         let target = (summary.target.path.clone(), summary.target.symbol.clone());
         if let Some(first_path) = self.procedure_targets.insert(target, path.to_owned()) {
             self.error(
@@ -1935,6 +2804,35 @@ impl Validator {
         self.ordinary_heap_unchanged(path, summary);
         self.no_concurrency_effects(path, summary);
 
+        let has_channel_close_effect = summary
+            .concurrency_effects
+            .iter()
+            .chain(
+                summary
+                    .returned_callables
+                    .iter()
+                    .flat_map(|callable| callable.concurrency_effects.iter()),
+            )
+            .any(|effect| {
+                matches!(
+                    effect,
+                    AuthoredConcurrencyEffect::ChannelClose { .. }
+                        | AuthoredConcurrencyEffect::ChannelCloseAsync { .. }
+                        | AuthoredConcurrencyEffect::ChannelClosePropagate { .. }
+                )
+            });
+        if (has_channel_close_effect || !summary.returned_callables.is_empty())
+            && self.schema_version < CHANNEL_CLOSE_EFFECTS_MIN_SCHEMA_VERSION
+        {
+            self.error(
+                "summary.channel_close_schema_version",
+                format!("{path}.concurrency_effects"),
+                format!(
+                    "channel-close effects and returned-callable models require schema version {CHANNEL_CLOSE_EFFECTS_MIN_SCHEMA_VERSION}"
+                ),
+            );
+        }
+
         if let Some(normal_result_count) = summary.normal_result_count
             && normal_result_count > MAX_PROCEDURE_SUMMARY_ORDINAL.saturating_add(1)
         {
@@ -1976,6 +2874,13 @@ impl Validator {
                 format!(
                     "summary has more than {MAX_PROCEDURE_SUMMARY_EFFECTS} concurrency effects"
                 ),
+            );
+        }
+        if summary.returned_callables.len() > MAX_PROCEDURE_SUMMARY_EFFECTS {
+            self.error(
+                "limit.summary_returned_callables",
+                format!("{path}.returned_callables"),
+                format!("summary has more than {MAX_PROCEDURE_SUMMARY_EFFECTS} returned callables"),
             );
         }
         let effect_references = summary.effects.iter().fold(0usize, |count, effect| {
@@ -2120,12 +3025,13 @@ impl Validator {
             && (!summary.result_contracts.is_empty()
                 || !summary.result_use_obligations.is_empty()
                 || !summary.conditional_result_refinements.is_empty()
-                || !summary.conditional_indirect_writes.is_empty())
+                || !summary.conditional_indirect_writes.is_empty()
+                || !summary.returned_callables.is_empty())
         {
             self.error(
                 "summary.result_count_required",
                 format!("{path}.normal_result_count"),
-                "normal_result_count is required when result contracts, result-use obligations, conditional-result refinements, or conditional indirect writes are non-empty",
+                "normal_result_count is required when result contracts, result-use obligations, conditional-result refinements, conditional indirect writes, or returned-callable models are non-empty",
             );
         }
         self.result_contracts(path, summary.normal_result_count, &summary.result_contracts);
@@ -2265,6 +3171,7 @@ impl Validator {
             &locations,
             summary.normal_result_count,
         );
+        self.returned_callables(path, summary, &locations);
 
         for (index, transfer) in summary.transfers.iter().enumerate() {
             let transfer_path = format!("{path}.transfers[{index}]");
@@ -2452,7 +3359,7 @@ impl Validator {
                     if once == callable {
                         self.error(
                             "summary.conflicting_concurrency_effect",
-                            effect_path,
+                            &effect_path,
                             "Once object and Once callable must be distinct ports",
                         );
                     }
@@ -2524,6 +3431,57 @@ impl Validator {
                 AuthoredConcurrencyEffect::TimerReset { timer } => {
                     self.summary_input(&format!("{effect_path}.timer"), timer, target);
                 }
+                AuthoredConcurrencyEffect::ChannelClose { channel, fresh }
+                | AuthoredConcurrencyEffect::ChannelCloseAsync { channel, fresh } => {
+                    self.summary_port(
+                        &format!("{effect_path}.channel"),
+                        channel,
+                        locations,
+                        target,
+                        normal_result_count,
+                    );
+                    if *fresh && !matches!(channel, AuthoredSummaryPort::Output { .. }) {
+                        self.error(
+                            "summary.fresh_channel_requires_output",
+                            format!("{effect_path}.channel"),
+                            "a fresh channel identity must name a normal result port",
+                        );
+                    }
+                }
+                AuthoredConcurrencyEffect::ChannelClosePropagate {
+                    source,
+                    target: output,
+                    target_fresh,
+                } => {
+                    self.summary_port(
+                        &format!("{effect_path}.source"),
+                        source,
+                        locations,
+                        target,
+                        normal_result_count,
+                    );
+                    self.summary_port(
+                        &format!("{effect_path}.target"),
+                        output,
+                        locations,
+                        target,
+                        normal_result_count,
+                    );
+                    if source == output {
+                        self.error(
+                            "summary.conflicting_concurrency_effect",
+                            &effect_path,
+                            "channel-close propagation source and target must be distinct ports",
+                        );
+                    }
+                    if *target_fresh && !matches!(output, AuthoredSummaryPort::Output { .. }) {
+                        self.error(
+                            "summary.fresh_channel_requires_output",
+                            format!("{effect_path}.target"),
+                            "a fresh propagated channel identity must name a normal result port",
+                        );
+                    }
+                }
                 AuthoredConcurrencyEffect::SubtestRun { callable, group } => {
                     self.summary_input(&format!("{effect_path}.callable"), callable, target);
                     self.summary_input(&format!("{effect_path}.group"), group, target);
@@ -2570,6 +3528,146 @@ impl Validator {
                 "summary.conflicting_concurrency_effect",
                 format!("{path}.concurrency_effects"),
                 format!("task_join and wait_group_wait make duplicate join claims for {group:?}"),
+            );
+        }
+    }
+
+    fn summary_port(
+        &mut self,
+        path: &str,
+        port: &AuthoredSummaryPort,
+        locations: &HashMap<&str, (AuthoredSummaryLocationKind, String)>,
+        target: &AuthoredProcedureTarget,
+        normal_result_count: Option<u32>,
+    ) {
+        match port {
+            AuthoredSummaryPort::Input { input } => {
+                self.summary_input(&format!("{path}.input"), input, target)
+            }
+            AuthoredSummaryPort::Output { output } => {
+                self.summary_output(
+                    &format!("{path}.output"),
+                    output,
+                    locations,
+                    target,
+                    normal_result_count,
+                );
+                if !matches!(
+                    output,
+                    AuthoredSummaryOutput::NormalReturn {}
+                        | AuthoredSummaryOutput::IndexedNormalReturn { .. }
+                ) {
+                    self.error(
+                        "summary.invalid_channel_port",
+                        path,
+                        "a channel identity output must name a normal result port",
+                    );
+                }
+            }
+        }
+    }
+
+    fn returned_callables(
+        &mut self,
+        path: &str,
+        summary: &AuthoredProcedureSummary,
+        locations: &HashMap<&str, (AuthoredSummaryLocationKind, String)>,
+    ) {
+        let mut seen = HashSet::new();
+        for (index, callable) in summary.returned_callables.iter().enumerate() {
+            let callable_path = format!("{path}.returned_callables[{index}]");
+            if !seen.insert(callable.result_ordinal) {
+                self.error(
+                    "summary.duplicate_returned_callable",
+                    format!("{callable_path}.result_ordinal"),
+                    format!(
+                        "result ordinal {} is declared callable more than once",
+                        callable.result_ordinal
+                    ),
+                );
+            }
+            match summary.normal_result_count {
+                Some(count) if callable.result_ordinal < count => {}
+                Some(count) => self.error(
+                    "summary.invalid_returned_callable_ordinal",
+                    format!("{callable_path}.result_ordinal"),
+                    format!(
+                        "result ordinal {} is outside normal_result_count {count}",
+                        callable.result_ordinal
+                    ),
+                ),
+                None => self.error(
+                    "summary.returned_callable_result_count_required",
+                    format!("{path}.normal_result_count"),
+                    "normal_result_count is required for a returned-callable model",
+                ),
+            }
+            if summary.completeness != Completeness::Complete {
+                self.error(
+                    "summary.returned_callable_on_partial_summary",
+                    callable_path.clone(),
+                    "a returned-callable model requires completeness: complete",
+                );
+            }
+            if callable.concurrency_effects.is_empty() {
+                self.error(
+                    "summary.returned_callable_without_effect",
+                    format!("{callable_path}.concurrency_effects"),
+                    "a returned-callable model must declare at least one concurrency effect",
+                );
+            }
+            if callable.at_most_once
+                && callable
+                    .concurrency_effects
+                    .iter()
+                    .any(|effect| !matches!(effect, AuthoredConcurrencyEffect::ChannelClose { .. }))
+            {
+                self.error(
+                    "summary.unsupported_once_returned_callable_effect",
+                    format!("{callable_path}.concurrency_effects"),
+                    "at-most-once returned-callable effects currently support synchronous channel close",
+                );
+            }
+            for (effect_index, effect) in callable.concurrency_effects.iter().enumerate() {
+                if !matches!(
+                    effect,
+                    AuthoredConcurrencyEffect::ChannelClose { .. }
+                        | AuthoredConcurrencyEffect::ChannelCloseAsync { .. }
+                ) {
+                    self.error(
+                        "summary.unsupported_returned_callable_effect",
+                        format!("{callable_path}.concurrency_effects[{effect_index}]"),
+                        "returned-callable models currently support channel-close effects",
+                    );
+                }
+                let channel = match effect {
+                    AuthoredConcurrencyEffect::ChannelClose { channel, .. }
+                    | AuthoredConcurrencyEffect::ChannelCloseAsync { channel, .. } => channel,
+                    _ => continue,
+                };
+                let target_ordinal = match channel {
+                    AuthoredSummaryPort::Output {
+                        output: AuthoredSummaryOutput::NormalReturn {},
+                    } => Some(0),
+                    AuthoredSummaryPort::Output {
+                        output: AuthoredSummaryOutput::IndexedNormalReturn { ordinal },
+                    } => Some(*ordinal),
+                    _ => None,
+                };
+                if target_ordinal.is_none_or(|ordinal| ordinal == callable.result_ordinal) {
+                    self.error(
+                        "summary.invalid_returned_callable_effect_target",
+                        format!("{callable_path}.concurrency_effects[{effect_index}].channel"),
+                        "a returned callable must affect another normal result identity",
+                    );
+                }
+            }
+            self.concurrency_effects(
+                &callable_path,
+                &callable.concurrency_effects,
+                &summary.target,
+                locations,
+                summary.normal_result_count,
             );
         }
     }
@@ -2682,11 +3780,11 @@ impl Validator {
                 "no_concurrency_effects requires completeness: complete",
             );
         }
-        if !summary.concurrency_effects.is_empty() {
+        if !summary.concurrency_effects.is_empty() || !summary.returned_callables.is_empty() {
             self.error(
                 "summary.no_concurrency_effects_conflict",
                 format!("{path}.concurrency_effects"),
-                "no_concurrency_effects conflicts with declared concurrency effects",
+                "no_concurrency_effects conflicts with declared concurrency effects or returned callables",
             );
         }
     }
@@ -3225,6 +4323,57 @@ impl Validator {
         }
     }
 
+    fn parameter_ordinal(
+        &mut self,
+        ordinal: u32,
+        target: &AuthoredProcedureTarget,
+        path: &str,
+        subject: &str,
+    ) {
+        if ordinal > MAX_PROCEDURE_SUMMARY_ORDINAL {
+            self.error(
+                "summary.invalid_parameter_ordinal",
+                path,
+                format!("parameter ordinal exceeds {MAX_PROCEDURE_SUMMARY_ORDINAL}"),
+            );
+        }
+        if ordinal >= target.parameter_count {
+            self.error(
+                "summary.parameter_ordinal_out_of_range",
+                path,
+                format!(
+                    "parameter ordinal {ordinal} is outside parameter_count {}",
+                    target.parameter_count
+                ),
+            );
+        } else if target.variadic && target.parameter_count.checked_sub(1) == Some(ordinal) {
+            self.error(
+                "summary.unsupported_variadic_tail_reference",
+                path,
+                format!("{subject} cannot reference variadic tail ordinal {ordinal}"),
+            );
+        }
+    }
+
+    fn result_ordinal(&mut self, ordinal: u32, normal_result_count: Option<u32>, path: &str) {
+        if ordinal > MAX_PROCEDURE_SUMMARY_ORDINAL {
+            self.error(
+                "summary.invalid_result_ordinal",
+                format!("{path}.result_ordinal"),
+                format!("result ordinal exceeds {MAX_PROCEDURE_SUMMARY_ORDINAL}"),
+            );
+        }
+        if let Some(count) = normal_result_count
+            && ordinal >= count
+        {
+            self.error(
+                "summary.result_ordinal_out_of_range",
+                format!("{path}.result_ordinal"),
+                format!("result ordinal {ordinal} is outside normal_result_count {count}"),
+            );
+        }
+    }
+
     fn conditional_result_refinements(
         &mut self,
         path: &str,
@@ -3246,52 +4395,17 @@ impl Validator {
         let mut established = HashMap::new();
         for (index, refinement) in refinements.iter().enumerate() {
             let refinement_path = format!("{path}.conditional_result_refinements[{index}]");
-            if refinement.result_ordinal > MAX_PROCEDURE_SUMMARY_ORDINAL {
-                self.error(
-                    "summary.invalid_result_ordinal",
-                    format!("{refinement_path}.result_ordinal"),
-                    format!("result ordinal exceeds {MAX_PROCEDURE_SUMMARY_ORDINAL}"),
-                );
-            }
-            if normal_result_count.is_some_and(|count| refinement.result_ordinal >= count) {
-                self.error(
-                    "summary.result_ordinal_out_of_range",
-                    format!("{refinement_path}.result_ordinal"),
-                    format!(
-                        "result ordinal {} is outside normal_result_count {}",
-                        refinement.result_ordinal,
-                        normal_result_count.expect("checked as some")
-                    ),
-                );
-            }
-            if refinement.parameter_ordinal > MAX_PROCEDURE_SUMMARY_ORDINAL {
-                self.error(
-                    "summary.invalid_parameter_ordinal",
-                    format!("{refinement_path}.parameter_ordinal"),
-                    format!("parameter ordinal exceeds {MAX_PROCEDURE_SUMMARY_ORDINAL}"),
-                );
-            }
-            if refinement.parameter_ordinal >= target.parameter_count {
-                self.error(
-                    "summary.parameter_ordinal_out_of_range",
-                    format!("{refinement_path}.parameter_ordinal"),
-                    format!(
-                        "parameter ordinal {} is outside parameter_count {}",
-                        refinement.parameter_ordinal, target.parameter_count
-                    ),
-                );
-            } else if target.variadic
-                && target.parameter_count.checked_sub(1) == Some(refinement.parameter_ordinal)
-            {
-                self.error(
-                    "summary.unsupported_variadic_tail_reference",
-                    format!("{refinement_path}.parameter_ordinal"),
-                    format!(
-                        "conditional-result refinement cannot reference variadic tail ordinal {}",
-                        refinement.parameter_ordinal
-                    ),
-                );
-            }
+            self.result_ordinal(
+                refinement.result_ordinal,
+                normal_result_count,
+                &refinement_path,
+            );
+            self.parameter_ordinal(
+                refinement.parameter_ordinal,
+                target,
+                &format!("{refinement_path}.parameter_ordinal"),
+                "conditional-result refinement",
+            );
 
             let claim_key = (
                 refinement.result_ordinal,
@@ -3365,52 +4479,13 @@ impl Validator {
         let mut seen = HashMap::new();
         for (index, write) in writes.iter().enumerate() {
             let write_path = format!("{path}.conditional_indirect_writes[{index}]");
-            if write.result_ordinal > MAX_PROCEDURE_SUMMARY_ORDINAL {
-                self.error(
-                    "summary.invalid_result_ordinal",
-                    format!("{write_path}.result_ordinal"),
-                    format!("result ordinal exceeds {MAX_PROCEDURE_SUMMARY_ORDINAL}"),
-                );
-            }
-            if normal_result_count.is_some_and(|count| write.result_ordinal >= count) {
-                self.error(
-                    "summary.result_ordinal_out_of_range",
-                    format!("{write_path}.result_ordinal"),
-                    format!(
-                        "result ordinal {} is outside normal_result_count {}",
-                        write.result_ordinal,
-                        normal_result_count.expect("checked as some")
-                    ),
-                );
-            }
-            if write.parameter_ordinal > MAX_PROCEDURE_SUMMARY_ORDINAL {
-                self.error(
-                    "summary.invalid_parameter_ordinal",
-                    format!("{write_path}.parameter_ordinal"),
-                    format!("parameter ordinal exceeds {MAX_PROCEDURE_SUMMARY_ORDINAL}"),
-                );
-            }
-            if write.parameter_ordinal >= target.parameter_count {
-                self.error(
-                    "summary.parameter_ordinal_out_of_range",
-                    format!("{write_path}.parameter_ordinal"),
-                    format!(
-                        "parameter ordinal {} is outside parameter_count {}",
-                        write.parameter_ordinal, target.parameter_count
-                    ),
-                );
-            } else if target.variadic
-                && target.parameter_count.checked_sub(1) == Some(write.parameter_ordinal)
-            {
-                self.error(
-                    "summary.unsupported_variadic_tail_reference",
-                    format!("{write_path}.parameter_ordinal"),
-                    format!(
-                        "conditional indirect write cannot reference variadic tail ordinal {}",
-                        write.parameter_ordinal
-                    ),
-                );
-            }
+            self.result_ordinal(write.result_ordinal, normal_result_count, &write_path);
+            self.parameter_ordinal(
+                write.parameter_ordinal,
+                target,
+                &format!("{write_path}.parameter_ordinal"),
+                "conditional indirect write",
+            );
 
             let key = (
                 write.result_ordinal,
@@ -3446,34 +4521,12 @@ impl Validator {
         let mut seen = HashSet::new();
         for (index, refinement) in refinements.iter().enumerate() {
             let refinement_path = format!("{path}.normal_return_refinements[{index}]");
-            if refinement.parameter_ordinal > MAX_PROCEDURE_SUMMARY_ORDINAL {
-                self.error(
-                    "summary.invalid_parameter_ordinal",
-                    format!("{refinement_path}.parameter_ordinal"),
-                    format!("parameter ordinal exceeds {MAX_PROCEDURE_SUMMARY_ORDINAL}"),
-                );
-            }
-            if refinement.parameter_ordinal >= target.parameter_count {
-                self.error(
-                    "summary.parameter_ordinal_out_of_range",
-                    format!("{refinement_path}.parameter_ordinal"),
-                    format!(
-                        "parameter ordinal {} is outside parameter_count {}",
-                        refinement.parameter_ordinal, target.parameter_count
-                    ),
-                );
-            } else if target.variadic
-                && target.parameter_count.checked_sub(1) == Some(refinement.parameter_ordinal)
-            {
-                self.error(
-                    "summary.unsupported_variadic_tail_reference",
-                    format!("{refinement_path}.parameter_ordinal"),
-                    format!(
-                        "normal-return refinement cannot reference variadic tail ordinal {}",
-                        refinement.parameter_ordinal
-                    ),
-                );
-            }
+            self.parameter_ordinal(
+                refinement.parameter_ordinal,
+                target,
+                &format!("{refinement_path}.parameter_ordinal"),
+                "normal-return refinement",
+            );
             if !seen.insert(refinement.parameter_ordinal) {
                 self.error(
                     "summary.duplicate_normal_return_refinement",
@@ -3719,8 +4772,62 @@ impl Validator {
         let mut available_type_parameters = owner_type_parameters.to_vec();
         available_type_parameters.extend(signature.type_parameters.iter().cloned());
         let mut parameter_names = HashSet::new();
+        let mut positional_variadic = false;
+        let mut named_variadic = false;
+        let mut positional_variadic_index = None;
         for (index, parameter) in signature.parameters.iter().enumerate() {
             let parameter_path = format!("{path}.parameters[{index}]");
+            if parameter.role.is_some()
+                && self.schema_version < TYPED_VALUES_AND_PARAMETER_ROLES_MIN_SCHEMA_VERSION
+            {
+                self.error(
+                    "parameter.role_schema_version",
+                    format!("{parameter_path}.role"),
+                    format!(
+                        "callable parameter roles require schema version {TYPED_VALUES_AND_PARAMETER_ROLES_MIN_SCHEMA_VERSION}"
+                    ),
+                );
+            }
+            if positional_variadic_index.is_some()
+                && !parameter.variadic
+                && parameter.passing_mode.accepts_positional()
+            {
+                self.error(
+                    "parameter.positional_after_variadic",
+                    format!("{parameter_path}.passing_mode"),
+                    "only named-only parameters may follow a positional variadic parameter",
+                );
+            }
+            if parameter.variadic {
+                if parameter.passing_mode.accepts_positional() {
+                    if positional_variadic {
+                        self.error(
+                            "parameter.duplicate_positional_variadic",
+                            format!("{parameter_path}.variadic"),
+                            "a signature may declare at most one positional variadic parameter",
+                        );
+                    }
+                    positional_variadic = true;
+                    positional_variadic_index = Some(index);
+                }
+                if parameter.passing_mode.accepts_named() {
+                    if named_variadic {
+                        self.error(
+                            "parameter.duplicate_named_variadic",
+                            format!("{parameter_path}.variadic"),
+                            "a signature may declare at most one named variadic parameter",
+                        );
+                    }
+                    named_variadic = true;
+                    if index + 1 != signature.parameters.len() {
+                        self.error(
+                            "parameter.named_variadic_not_final",
+                            format!("{parameter_path}.variadic"),
+                            "a named variadic parameter must be final",
+                        );
+                    }
+                }
+            }
             if let Some(name) = &parameter.name {
                 self.language_identifier(&format!("{parameter_path}.name"), name);
                 if !parameter_names.insert(name) {
@@ -3891,6 +4998,17 @@ impl Validator {
                             depth + 1,
                             format!("{parameter_path}.type"),
                         ));
+                    }
+                }
+                TypeRef::Unknown => {
+                    if self.schema_version < UNKNOWN_TYPE_MIN_SCHEMA_VERSION {
+                        self.error(
+                            "schema.unknown_type_version",
+                            &current_path,
+                            format!(
+                                "unknown type references require schema version {UNKNOWN_TYPE_MIN_SCHEMA_VERSION}"
+                            ),
+                        );
                     }
                 }
             }

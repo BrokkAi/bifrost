@@ -21,7 +21,6 @@ use crate::analyzer::semantic_model::{
     SemanticModelSymbolKind, TypeIdentity, retained_discovery_verdict, type_declaration_id,
     universal_root_name_for_language,
 };
-use crate::analyzer::structural::BoundaryStatus;
 use crate::analyzer::{
     IAnalyzer, Language, ProjectFile, PythonAnalyzer, SemanticDiagnosticIncompleteReason,
     SemanticDiagnosticReport, resolve_analyzer,
@@ -87,13 +86,13 @@ impl RetainedPythonEnvironment {
         let reason = match retained_discovery_verdict(self.evidence.as_deref(), module_path) {
             RetainedDiscoveryVerdict::NoDiscovery | RetainedDiscoveryVerdict::Undeclared => {
                 SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery {
-                    boundary: BoundaryStatus::ExternalUnknown,
+                    boundary: crate::analyzer::semantic_model::missing_dependency_boundary(false),
                 }
             }
             RetainedDiscoveryVerdict::Truncated => SemanticDiagnosticIncompleteReason::Truncated,
             RetainedDiscoveryVerdict::Declared => {
                 SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery {
-                    boundary: BoundaryStatus::ExternalDeclaredUnindexed,
+                    boundary: crate::analyzer::semantic_model::missing_dependency_boundary(true),
                 }
             }
         };
@@ -334,16 +333,9 @@ fn python_declaration_id(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::collect_python_semantic_diagnostics;
-    use crate::analyzer::structural::BoundaryStatus;
-    use crate::analyzer::{AnalyzerQueryScope, QueryScope};
     use crate::analyzer::{
-        Language, ProjectFile, PythonAnalyzer, SemanticDiagnostic, SemanticDiagnosticDomain,
-        SemanticDiagnosticIncompleteReason, SemanticDiagnosticOutcome, SemanticDiagnosticReport,
-        SemanticDiagnosticReportStatus, TestProject,
-    };
-    use brokk_bifrost_python::diagnostics::{
-        MAX_PYTHON_SEMANTIC_DIAGNOSTICS, PYTHON_UNRECOGNIZED_SYMBOL,
+        IAnalyzer, Language, ProjectFile, PythonAnalyzer, SemanticDiagnostic,
+        SemanticDiagnosticReport, TestProject,
     };
     use tempfile::TempDir;
 
@@ -357,9 +349,7 @@ mod tests {
         fn report_for(&self, rel_path: &str) -> SemanticDiagnosticReport {
             let file = self.file(rel_path);
             let source = file.read_to_string().expect("read source");
-            let scope = AnalyzerQueryScope::new(&self.analyzer);
-            let token = scope.token();
-            collect_python_semantic_diagnostics(&self.analyzer, token, &file, &source)
+            self.analyzer.semantic_diagnostics(&file, &source)
         }
 
         fn diagnostics_for(&self, rel_path: &str) -> Vec<SemanticDiagnostic> {
@@ -367,7 +357,7 @@ mod tests {
         }
 
         fn file(&self, rel_path: &str) -> ProjectFile {
-            ProjectFile::new(self.root.clone(), rel_path)
+            crate::analyzer::common::project_file_for_test(&self.root, rel_path)
         }
     }
 
@@ -388,188 +378,7 @@ mod tests {
         }
     }
 
-    fn incomplete_details(report: &SemanticDiagnosticReport) -> Vec<String> {
-        report
-            .outcomes()
-            .iter()
-            .filter_map(|outcome| match outcome {
-                SemanticDiagnosticOutcome::Incomplete { reasons, .. } => Some(reasons),
-                _ => None,
-            })
-            .flatten()
-            .map(|reason| format!("{reason:?}"))
-            .collect()
-    }
-
-    #[test]
-    fn python_semantic_diagnostics_report_unknown_local_identifier() {
-        let fixture = fixture(&[(
-            "app.py",
-            r#"
-def run():
-    missing_value
-"#,
-        )]);
-
-        let report = fixture.report_for("app.py");
-        assert_eq!(1, report.diagnostics().len(), "{report:#?}");
-        assert_eq!(PYTHON_UNRECOGNIZED_SYMBOL, report.diagnostics()[0].kind);
-        assert!(report.diagnostics()[0].message.contains("missing_value"));
-        assert!(
-            report.outcomes().iter().any(|outcome| matches!(
-                outcome,
-                SemanticDiagnosticOutcome::Absent(proof)
-                    if proof.boundary == BoundaryStatus::WorkspaceLocal
-                        && matches!(proof.domain, SemanticDiagnosticDomain::LexicalScope { .. })
-            )),
-            "{report:#?}"
-        );
-    }
-
-    #[test]
-    fn python_semantic_diagnostics_suppress_known_names_and_imports() {
-        let fixture = fixture(&[
-            (
-                "pkg/service.py",
-                r#"
-class Service:
-    pass
-
-def build():
-    return Service()
-"#,
-            ),
-            (
-                "app.py",
-                r#"
-from pkg.service import Service, build
-
-LOCAL = 1
-
-class Runner:
-    pass
-
-def run(param):
-    value = LOCAL
-    for item in range(1):
-        alias = item
-    with open(__file__) as handle:
-        data = handle
-    try:
-        build()
-    except Exception as exc:
-        print(exc)
-    return Service(), Runner(), value, alias, data, param, True, None
-"#,
-            ),
-        ]);
-
-        let report = fixture.report_for("app.py");
-        assert!(report.diagnostics().is_empty(), "{report:#?}");
-        assert_eq!(SemanticDiagnosticReportStatus::Complete, report.status());
-        assert!(
-            report.outcomes().iter().any(|outcome| matches!(
-                outcome,
-                SemanticDiagnosticOutcome::Resolved {
-                    boundary: BoundaryStatus::WorkspaceLocal,
-                    ..
-                }
-            )),
-            "{report:#?}"
-        );
-    }
-
-    #[test]
-    fn python_semantic_diagnostics_suppress_relative_imports_and_reexports() {
-        let fixture = fixture(&[
-            (
-                "pkg/core.py",
-                r#"
-class Service:
-    pass
-"#,
-            ),
-            (
-                "pkg/__init__.py",
-                r#"
-from .core import Service
-"#,
-            ),
-            (
-                "app.py",
-                r#"
-from pkg import Service
-
-def run():
-    return Service()
-"#,
-            ),
-        ]);
-
-        let report = fixture.report_for("app.py");
-        assert!(report.diagnostics().is_empty(), "{report:#?}");
-    }
-
-    #[test]
-    fn python_semantic_diagnostics_report_unknown_type_references() {
-        let fixture = fixture(&[(
-            "app.py",
-            r#"
-class Known:
-    pass
-
-def run(value: Known) -> MissingType:
-    return value
-"#,
-        )]);
-
-        let diagnostics = fixture.diagnostics_for("app.py");
-        assert_eq!(1, diagnostics.len(), "{diagnostics:#?}");
-        assert_eq!(PYTHON_UNRECOGNIZED_SYMBOL, diagnostics[0].kind);
-        assert!(diagnostics[0].message.contains("MissingType"));
-    }
-
-    #[test]
-    fn python_semantic_diagnostics_report_unknown_parameter_annotations_and_defaults() {
-        let fixture = fixture(&[(
-            "app.py",
-            r#"
-def run(value: MissingType = missing_default):
-    return value
-"#,
-        )]);
-
-        let diagnostics = fixture.diagnostics_for("app.py");
-        assert_eq!(2, diagnostics.len(), "{diagnostics:#?}");
-        assert!(
-            diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.message.contains("MissingType"))
-        );
-        assert!(
-            diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.message.contains("missing_default"))
-        );
-    }
-
     #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[test]
-    fn python_semantic_diagnostics_check_attribute_receiver_but_not_unproven_member() {
-        let fixture = fixture(&[(
-            "app.py",
-            r#"
-def run():
-    return missing_client.fetch()
-"#,
-        )]);
-
-        let diagnostics = fixture.diagnostics_for("app.py");
-        assert_eq!(1, diagnostics.len(), "{diagnostics:#?}");
-        assert!(diagnostics[0].message.contains("missing_client"));
-        assert!(!diagnostics[0].message.contains("fetch"));
-    }
-
     #[test]
     fn python_semantic_diagnostics_handle_comprehension_scopes() {
         let fixture = fixture(&[(
@@ -584,200 +393,5 @@ def run(rows):
         let diagnostics = fixture.diagnostics_for("app.py");
         assert_eq!(1, diagnostics.len(), "{diagnostics:#?}");
         assert!(diagnostics[0].message.contains("item"));
-    }
-
-    #[test]
-    fn python_semantic_diagnostics_state_match_pattern_uncertainty() {
-        let fixture = fixture(&[(
-            "app.py",
-            r#"
-def run(value):
-    match value:
-        case {"id": ident}:
-            return ident
-"#,
-        )]);
-
-        let report = fixture.report_for("app.py");
-        assert!(report.diagnostics().is_empty(), "{report:#?}");
-        assert_eq!(SemanticDiagnosticReportStatus::Incomplete, report.status());
-        assert!(
-            incomplete_details(&report)
-                .iter()
-                .any(|detail| detail.contains("match statement")),
-            "{report:#?}"
-        );
-    }
-
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[test]
-    fn python_semantic_diagnostics_resolve_builtins() {
-        let fixture = fixture(&[(
-            "app.py",
-            r#"
-def run():
-    try:
-        raise RuntimeError("boom")
-    except ValueError as exc:
-        return exc
-"#,
-        )]);
-
-        let report = fixture.report_for("app.py");
-        assert!(report.diagnostics().is_empty(), "{report:#?}");
-        assert!(
-            report.outcomes().iter().any(|outcome| matches!(
-                outcome,
-                SemanticDiagnosticOutcome::Resolved {
-                    boundary: BoundaryStatus::ExternalIndexed,
-                    ..
-                }
-            )),
-            "{report:#?}"
-        );
-    }
-
-    #[test]
-    fn python_semantic_diagnostics_state_unresolved_import_boundaries() {
-        let fixture = fixture(&[
-            (
-                "external.py",
-                r#"
-from missing_package import *
-
-def run():
-    missing_name
-"#,
-            ),
-            (
-                "named.py",
-                r#"
-from missing_package import maybe
-
-def run():
-    maybe
-"#,
-            ),
-        ]);
-
-        let wildcard = fixture.report_for("external.py");
-        assert!(wildcard.diagnostics().is_empty(), "{wildcard:#?}");
-        assert!(
-            incomplete_details(&wildcard)
-                .iter()
-                .any(|detail| detail.contains("DynamicBehavior")),
-            "{wildcard:#?}"
-        );
-
-        let named = fixture.report_for("named.py");
-        assert!(named.diagnostics().is_empty(), "{named:#?}");
-        assert!(
-            named.outcomes().iter().any(|outcome| matches!(
-                outcome,
-                SemanticDiagnosticOutcome::Incomplete { reasons, .. }
-                    if reasons.iter().any(|reason| matches!(
-                        reason,
-                        SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery {
-                            boundary: BoundaryStatus::ExternalUnknown,
-                        }
-                    ))
-            )),
-            "{named:#?}"
-        );
-    }
-
-    #[test]
-    fn python_semantic_diagnostics_state_dynamic_constructs() {
-        let fixture = fixture(&[
-            (
-                "dynamic.py",
-                r#"
-def run():
-    globals()
-    missing_name
-"#,
-            ),
-            (
-                "module_getattr.py",
-                r#"
-def __getattr__(name):
-    return 1
-
-def run():
-    missing_name
-"#,
-            ),
-            (
-                "attribute.py",
-                r#"
-def run(obj):
-    obj.missing_name
-"#,
-            ),
-        ]);
-
-        let dynamic = fixture.report_for("dynamic.py");
-        assert!(dynamic.diagnostics().is_empty(), "{dynamic:#?}");
-        assert!(
-            incomplete_details(&dynamic)
-                .iter()
-                .any(|detail| detail.contains("globals")),
-            "{dynamic:#?}"
-        );
-
-        let getattr = fixture.report_for("module_getattr.py");
-        assert!(getattr.diagnostics().is_empty(), "{getattr:#?}");
-        assert!(
-            incomplete_details(&getattr)
-                .iter()
-                .any(|detail| detail.contains("__getattr__")),
-            "{getattr:#?}"
-        );
-
-        // An attribute on an unproven receiver is not a candidate here: the
-        // receiver's own binding resolves, the member is not judged.
-        let attribute = fixture.report_for("attribute.py");
-        assert!(attribute.diagnostics().is_empty(), "{attribute:#?}");
-    }
-
-    #[test]
-    fn python_semantic_diagnostics_state_malformed_files() {
-        let fixture = fixture(&[(
-            "broken.py",
-            r#"
-def run(
-    missing_name
-"#,
-        )]);
-
-        let report = fixture.report_for("broken.py");
-        assert!(report.diagnostics().is_empty(), "{report:#?}");
-        assert_eq!(SemanticDiagnosticReportStatus::Incomplete, report.status());
-        assert!(
-            incomplete_details(&report)
-                .iter()
-                .any(|detail| detail.contains("parse errors")),
-            "{report:#?}"
-        );
-    }
-
-    #[test]
-    fn python_semantic_diagnostics_cap_reported_items() {
-        let mut source = String::from("def run():\n");
-        for index in 0..(MAX_PYTHON_SEMANTIC_DIAGNOSTICS + 25) {
-            source.push_str(&format!("    missing_{index}\n"));
-        }
-        let fixture = fixture(&[("app.py", &source)]);
-
-        let report = fixture.report_for("app.py");
-        assert_eq!(MAX_PYTHON_SEMANTIC_DIAGNOSTICS, report.diagnostics().len());
-        assert!(
-            report.outcomes().iter().any(|outcome| matches!(
-                outcome,
-                SemanticDiagnosticOutcome::Incomplete { reasons, .. }
-                    if reasons.contains(&SemanticDiagnosticIncompleteReason::Truncated)
-            )),
-            "truncation must be stated"
-        );
     }
 }

@@ -1,16 +1,21 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 
 use semver::Version;
 
 use crate::CancellationToken;
 use crate::analyzer::canonical_hash::is_lower_sha256;
+use crate::analyzer::dependency_support::{
+    cancelled_dependency_evidence_diagnostic, dependency_diagnostic as diagnostic,
+    dependency_provenance_entry as provenance_entry, read_evidence_file_with_budget,
+    require_non_empty_evidence_field, resolve_dependency_path as resolve_path,
+};
 use crate::analyzer::semantic_model::{
-    ArtifactProducerLimits, BoundedDependencyDiagnostics, CatalogCoordinate,
-    DependencyArtifactRole, DependencyDiscoveryOutcome, DependencyDiscoveryProfile,
-    DependencyPackDiagnostic, DependencyPackDiagnosticSeverity, DependencyPackLimits,
-    DependencyProvenance, ExternalArtifactKind, ProducerDiagnostic, ProducerDiagnosticSeverity,
-    ResolvedDependency, ResolvedDependencyArtifact, SemanticModelActivationEvidence,
-    read_exact_artifact_while,
+    BoundedDependencyDiagnostics, CatalogCoordinate, DependencyArtifactRole,
+    DependencyDiscoveryOutcome, DependencyDiscoveryProfile, DependencyPackDiagnostic,
+    DependencyPackLimits, ExternalArtifactKind, ResolvedDependency, ResolvedDependencyArtifact,
+    SemanticModelActivationEvidence,
 };
 use crate::analyzer::topology::DependencyScope;
 use crate::analyzer::{Project, RubyAnalyzerConfig, RubyDependencyApiEvidence, RubyGemApiArtifact};
@@ -110,6 +115,7 @@ fn resolve_evidence(
     }
 
     let lockfile = read_evidence_file_with_budget(
+        "Ruby",
         &evidence.lockfile_path,
         limits,
         evidence_bytes_read,
@@ -237,6 +243,7 @@ fn resolve_evidence(
         }
 
         let archive = read_evidence_file_with_budget(
+            "Ruby",
             &canonical_archive,
             limits,
             evidence_bytes_read,
@@ -387,14 +394,6 @@ fn evidence_paths_from_root(
     resolved
 }
 
-fn resolve_path(root: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        root.join(path)
-    }
-}
-
 fn validate_gem_fields(gem: &RubyGemApiArtifact) -> Result<(), DependencyPackDiagnostic> {
     require_non_empty("gem.name", &gem.name)?;
     require_non_empty("gem.version", &gem.version)?;
@@ -411,90 +410,16 @@ fn validate_gem_fields(gem: &RubyGemApiArtifact) -> Result<(), DependencyPackDia
     Ok(())
 }
 
-fn read_evidence_file_with_budget(
-    path: &Path,
-    limits: &DependencyPackLimits,
-    evidence_bytes_read: &mut u64,
-    cancellation: Option<&CancellationToken>,
-) -> Result<crate::analyzer::semantic_model::ExactArtifact, DependencyPackDiagnostic> {
-    let remaining = limits
-        .max_total_artifact_bytes
-        .saturating_sub(*evidence_bytes_read);
-    if remaining == 0 {
-        return Err(diagnostic(
-            "limit.total_artifact_bytes",
-            Some(path),
-            format!(
-                "Ruby dependency evidence exceeds the {} byte aggregate limit",
-                limits.max_total_artifact_bytes
-            ),
-        ));
-    }
-    let producer_limits = ArtifactProducerLimits {
-        max_artifact_bytes: limits.producer.max_artifact_bytes.min(remaining),
-        ..limits.producer
-    };
-    let artifact = read_exact_artifact_while(path, &producer_limits, || is_cancelled(cancellation))
-        .map_err(|producer| producer_diagnostic(path, producer))?;
-    *evidence_bytes_read = evidence_bytes_read.saturating_add(artifact.bytes().len() as u64);
-    Ok(artifact)
-}
-
-fn provenance_entry(key: &str, value: impl ToString) -> DependencyProvenance {
-    DependencyProvenance {
-        key: key.to_owned(),
-        value: value.to_string(),
-    }
-}
-
-fn producer_diagnostic(path: &Path, producer: ProducerDiagnostic) -> DependencyPackDiagnostic {
-    DependencyPackDiagnostic {
-        severity: match producer.severity {
-            ProducerDiagnosticSeverity::Warning => DependencyPackDiagnosticSeverity::Warning,
-            ProducerDiagnosticSeverity::Error => DependencyPackDiagnosticSeverity::Error,
-        },
-        code: producer.code,
-        dependency_id: None,
-        location: Some(path.to_string_lossy().into_owned()),
-        message: producer.message,
-    }
-}
-
 fn require_non_empty(field: &str, value: &str) -> Result<(), DependencyPackDiagnostic> {
-    if value.trim().is_empty() {
-        return Err(diagnostic(
-            "ruby.evidence.empty_field",
-            None,
-            format!("Ruby dependency evidence field {field} must not be empty"),
-        ));
-    }
-    Ok(())
+    require_non_empty_evidence_field("Ruby", "ruby.evidence.empty_field", field, value)
 }
 
 fn is_cancelled(cancellation: Option<&CancellationToken>) -> bool {
-    cancellation.is_some_and(CancellationToken::is_cancelled)
+    brokk_bifrost_core::cancellation::optional_is_cancelled(cancellation)
 }
 
 fn cancelled_diagnostic(path: Option<&Path>) -> DependencyPackDiagnostic {
-    diagnostic(
-        "ruby.evidence.cancelled",
-        path,
-        "Ruby dependency evidence decoding was cancelled",
-    )
-}
-
-fn diagnostic(
-    code: &str,
-    path: Option<&Path>,
-    message: impl Into<String>,
-) -> DependencyPackDiagnostic {
-    DependencyPackDiagnostic {
-        severity: DependencyPackDiagnosticSeverity::Error,
-        code: code.to_owned(),
-        dependency_id: None,
-        location: path.map(|value| value.to_string_lossy().into_owned()),
-        message: message.into(),
-    }
+    cancelled_dependency_evidence_diagnostic("Ruby", "ruby.evidence.cancelled", path)
 }
 
 #[cfg(test)]
@@ -504,7 +429,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::analyzer::canonical_hash::{lower_hex_string, sha256_bytes};
+    use crate::analyzer::semantic_model::csmi::sha256_hex;
     use crate::analyzer::{Language, TestProject};
 
     const LOCKFILE: &[u8] = b"GEM\n  remote: https://rubygems.org/\n  specs:\n    widget (1.2.3.pre)\n\nPLATFORMS\n  arm64-darwin\n\nDEPENDENCIES\n  widget\n\nRUBY VERSION\n   ruby 3.4.1p0\n";
@@ -534,7 +459,7 @@ mod tests {
             dependency.artifacts[0].path(),
             fixture.archive.canonicalize().unwrap()
         );
-        let archive_digest = digest(b"exact gem bytes");
+        let archive_digest = sha256_hex(b"exact gem bytes");
         assert_eq!(
             dependency.artifacts[0].expected_sha256.as_deref(),
             Some(archive_digest.as_str())
@@ -566,9 +491,9 @@ mod tests {
         let outside = fixture.temp.path().join("outside.gem");
         fs::write(&outside, b"outside").unwrap();
         let evidence = &mut fixture.config.dependency_api_evidence[0];
-        evidence.lockfile_sha256 = digest(LOCKFILE);
+        evidence.lockfile_sha256 = sha256_hex(LOCKFILE);
         evidence.gems[0].gem_archive_path = outside;
-        evidence.gems[0].checksum = Some(digest(b"outside"));
+        evidence.gems[0].checksum = Some(sha256_hex(b"outside"));
         let outside = resolve_ruby_semantic_pack_dependencies(
             &fixture.config,
             &fixture.project,
@@ -631,7 +556,7 @@ mod tests {
             let config = RubyAnalyzerConfig {
                 dependency_api_evidence: vec![RubyDependencyApiEvidence {
                     lockfile_path: PathBuf::from("Gemfile.lock"),
-                    lockfile_sha256: digest(LOCKFILE),
+                    lockfile_sha256: sha256_hex(LOCKFILE),
                     ruby_version: "3.4.1".to_owned(),
                     platform: "arm64-darwin".to_owned(),
                     approved_archive_roots: vec![PathBuf::from("vendor/cache")],
@@ -639,7 +564,7 @@ mod tests {
                         name: "widget".to_owned(),
                         version: "1.2.3.pre".to_owned(),
                         source: "https://rubygems.org/".to_owned(),
-                        checksum: Some(digest(b"exact gem bytes")),
+                        checksum: Some(sha256_hex(b"exact gem bytes")),
                         gem_archive_path: PathBuf::from("vendor/cache/widget-1.2.3.pre.gem"),
                     }],
                 }],
@@ -651,9 +576,5 @@ mod tests {
                 archive,
             }
         }
-    }
-
-    fn digest(bytes: &[u8]) -> String {
-        lower_hex_string(&sha256_bytes(bytes))
     }
 }

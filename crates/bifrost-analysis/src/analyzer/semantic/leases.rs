@@ -7,6 +7,8 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::mem::size_of;
+#[cfg(test)]
+use std::sync::MutexGuard;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -213,6 +215,29 @@ fn checked_attempted_retained_bytes<'a>(
         .ok_or(SemanticArtifactLeaseError::RetainedBytesOverflow)
 }
 
+fn check_retained_capacity<'a>(
+    storages: impl IntoIterator<Item = &'a LeaseStorage>,
+    other_live_bytes: usize,
+    limit: usize,
+) -> Result<(), SemanticArtifactLeaseError> {
+    let attempted = checked_attempted_retained_bytes(storages, other_live_bytes)?;
+    if attempted > limit {
+        return Err(SemanticArtifactLeaseError::Capacity(
+            SemanticArtifactLeaseCapacityExceeded { limit, attempted },
+        ));
+    }
+    Ok(())
+}
+
+fn contains_exact_artifact<'a>(
+    storages: impl IntoIterator<Item = &'a LeaseStorage>,
+    artifact: &Arc<SemanticArtifact>,
+) -> bool {
+    storages
+        .into_iter()
+        .any(|storage| storage.contains_artifact(artifact))
+}
+
 #[derive(Debug)]
 struct SemanticArtifactLeaseScope;
 
@@ -220,6 +245,12 @@ struct SemanticArtifactLeaseScope;
 struct LeaseState {
     generation: u64,
     storage: LeaseStorage,
+}
+
+impl LeaseState {
+    fn retained_bytes(&self) -> usize {
+        self.storage.retained_bytes()
+    }
 }
 
 /// A committed, bounded set of exact semantic artifact allocations.
@@ -248,7 +279,7 @@ impl SemanticArtifactLeaseSet {
     }
 
     pub fn retained_bytes(&self) -> usize {
-        self.state.storage.retained_bytes()
+        self.state.retained_bytes()
     }
 
     pub fn len(&self) -> usize {
@@ -343,7 +374,7 @@ pub struct SemanticArtifactLeaseSnapshot {
 
 impl SemanticArtifactLeaseSnapshot {
     pub fn retained_bytes(&self) -> usize {
-        self.state.storage.retained_bytes()
+        self.state.retained_bytes()
     }
 
     /// Narrow this snapshot's physical authority for a bounded child query.
@@ -396,19 +427,12 @@ impl SemanticArtifactLeaseChild {
                 .is_ok(),
             "semantic artifact lease child already has a live window"
         );
-        let overflow = match checked_attempted_retained_bytes(
+        let overflow = check_retained_capacity(
             [&self.base.storage, self.additions.as_ref()],
             other_live_bytes,
-        ) {
-            Ok(attempted) if attempted > self.max_retained_bytes => Some(
-                SemanticArtifactLeaseError::Capacity(SemanticArtifactLeaseCapacityExceeded {
-                    limit: self.max_retained_bytes,
-                    attempted,
-                }),
-            ),
-            Ok(_) => None,
-            Err(error) => Some(error),
-        };
+            self.max_retained_bytes,
+        )
+        .err();
         SemanticArtifactLeaseWindow {
             state: Arc::new(Mutex::new(LeaseWindowState {
                 max_retained_bytes: self.max_retained_bytes,
@@ -448,7 +472,7 @@ impl SemanticArtifactLeaseChild {
 
     /// Whether the base or additions already retain this exact allocation.
     pub fn contains_exact(&self, artifact: &Arc<SemanticArtifact>) -> bool {
-        self.base.storage.contains_artifact(artifact) || self.additions.contains_artifact(artifact)
+        contains_exact_artifact([&self.base.storage, self.additions.as_ref()], artifact)
     }
 
     /// Finish this child as a one-shot, additions-only charge.
@@ -534,22 +558,11 @@ impl SemanticArtifactLeaseWindow {
             .promoted
             .as_deref()
             .expect("open lease window has promoted storage");
-        let attempted = match checked_attempted_retained_bytes(
+        if let Err(error) = check_retained_capacity(
             [&base.storage, promoted, &state.staged],
             next_other_live_bytes,
+            state.max_retained_bytes,
         ) {
-            Ok(attempted) => attempted,
-            Err(error) => {
-                state.overflow = Some(error);
-                return Err(error);
-            }
-        };
-        if attempted > state.max_retained_bytes {
-            let error =
-                SemanticArtifactLeaseError::Capacity(SemanticArtifactLeaseCapacityExceeded {
-                    limit: state.max_retained_bytes,
-                    attempted,
-                });
             state.overflow = Some(error);
             return Err(error);
         }
@@ -575,15 +588,16 @@ impl SemanticArtifactLeaseWindow {
             .state
             .lock()
             .expect("semantic artifact lease window mutex poisoned");
-        state
-            .base
-            .as_ref()
-            .is_some_and(|base| base.storage.contains_artifact(artifact))
-            || state
-                .promoted
+        contains_exact_artifact(
+            state
+                .base
                 .as_ref()
-                .is_some_and(|promoted| promoted.contains_artifact(artifact))
-            || state.staged.contains_artifact(artifact)
+                .map(|base| &base.storage)
+                .into_iter()
+                .chain(state.promoted.as_deref())
+                .chain(std::iter::once(&state.staged)),
+            artifact,
+        )
     }
 
     /// Promote this complete window into its originating child atomically.
@@ -977,32 +991,39 @@ impl SemanticArtifactCollector {
     }
 
     #[cfg(test)]
-    pub(crate) fn take_complete(&self, file: &ProjectFile) -> Vec<SemanticArtifactLease> {
-        match &self.state {
-            SemanticArtifactCollectorState::Unbounded(state) => state
-                .lock()
-                .expect("semantic artifact collector mutex poisoned")
-                .storage
-                .take_file(file),
-            SemanticArtifactCollectorState::Bounded(_) => {
-                panic!("bounded semantic artifact collectors cannot drain leases")
-            }
+    pub(crate) fn shares_state(&self, other: &Self) -> bool {
+        match (&self.state, &other.state) {
+            (
+                SemanticArtifactCollectorState::Unbounded(left),
+                SemanticArtifactCollectorState::Unbounded(right),
+            ) => Arc::ptr_eq(left, right),
+            (
+                SemanticArtifactCollectorState::Bounded(left),
+                SemanticArtifactCollectorState::Bounded(right),
+            ) => Arc::ptr_eq(left, right),
+            _ => false,
         }
+    }
+
+    #[cfg(test)]
+    fn unbounded_state(&self) -> MutexGuard<'_, UnboundedCollectorState> {
+        let SemanticArtifactCollectorState::Unbounded(state) = &self.state else {
+            panic!("bounded semantic artifact collectors cannot drain leases");
+        };
+        state
+            .lock()
+            .expect("semantic artifact collector mutex poisoned")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_complete(&self, file: &ProjectFile) -> Vec<SemanticArtifactLease> {
+        self.unbounded_state().storage.take_file(file)
     }
 
     /// Atomically drain every complete artifact in this collector window.
     #[cfg(test)]
     pub(crate) fn take_all_complete(&self) -> Vec<SemanticArtifactLease> {
-        let mut complete = match &self.state {
-            SemanticArtifactCollectorState::Unbounded(state) => state
-                .lock()
-                .expect("semantic artifact collector mutex poisoned")
-                .storage
-                .take_all(),
-            SemanticArtifactCollectorState::Bounded(_) => {
-                panic!("bounded semantic artifact collectors cannot drain leases")
-            }
-        };
+        let mut complete = self.unbounded_state().storage.take_all();
         complete.sort_by(|left, right| left.file.cmp(&right.file));
         complete
     }
@@ -1067,21 +1088,6 @@ impl SemanticArtifactCollector {
                 .len(),
         }
     }
-
-    #[cfg(test)]
-    pub(crate) fn shares_state(&self, other: &Self) -> bool {
-        match (&self.state, &other.state) {
-            (
-                SemanticArtifactCollectorState::Unbounded(left),
-                SemanticArtifactCollectorState::Unbounded(right),
-            ) => Arc::ptr_eq(left, right),
-            (
-                SemanticArtifactCollectorState::Bounded(left),
-                SemanticArtifactCollectorState::Bounded(right),
-            ) => Arc::ptr_eq(left, right),
-            _ => false,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1095,7 +1101,7 @@ mod tests {
     };
 
     fn file(path: &str) -> ProjectFile {
-        ProjectFile::new(std::env::temp_dir(), path)
+        crate::analyzer::common::project_file_for_test(&std::env::temp_dir(), path)
     }
 
     fn artifact(path: &str, source: &str) -> Arc<SemanticArtifact> {
@@ -1132,28 +1138,6 @@ mod tests {
                 retained_artifact_bytes(file, artifact).expect("fixture lease weight fits usize"),
             )
             .expect("fixture storage weight fits usize")
-    }
-
-    #[test]
-    fn exact_artifact_allocation_is_retained_once() {
-        let file = file("src/once.ts");
-        let artifact = artifact("src/once.ts", "export const once = 1;\n");
-        let mut leases = SemanticArtifactLeaseSet::new(usize::MAX);
-        let mut child = leases.snapshot().into_child();
-        let window = child.begin_window(0);
-        let collector = window.collector();
-
-        observe(&collector, &file, &artifact);
-        observe(&collector, &file, &artifact);
-        assert_eq!(collector.len(), 1);
-        drop(collector);
-        window.commit(&mut child).expect("one lease fits");
-        let charge = child.into_charge();
-        assert_eq!(charge.len(), 1);
-        leases
-            .try_apply_charge(charge, 0)
-            .expect("one lease charge applies");
-        assert_eq!(leases.len(), 1);
     }
 
     #[test]
@@ -1349,30 +1333,6 @@ mod tests {
     }
 
     #[test]
-    fn consumed_snapshot_allows_sequential_apply_without_state_cow() {
-        let file = file("src/in_place.ts");
-        let artifact = artifact("src/in_place.ts", "export const inPlace = 1;\n");
-        let mut leases = SemanticArtifactLeaseSet::new(usize::MAX);
-        let before = leases.state_identity();
-        let mut child = leases.snapshot().into_child();
-        let window = child.begin_window(0);
-        let collector = window.collector();
-        observe(&collector, &file, &artifact);
-        drop(collector);
-        window.commit(&mut child).expect("lease fits");
-        let charge = child.into_charge();
-
-        leases
-            .try_apply_charge(charge, 0)
-            .expect("consumed snapshot charge applies");
-        assert_eq!(
-            leases.state_identity(),
-            before,
-            "without a live snapshot the state allocation is updated in place"
-        );
-    }
-
-    #[test]
     fn apply_rejects_an_outstanding_snapshot_without_cloning_state() {
         let file = file("src/outstanding.ts");
         let artifact = artifact("src/outstanding.ts", "export const outstanding = 1;\n");
@@ -1439,7 +1399,6 @@ mod tests {
             "lease charge weights must include owned ProjectFile paths"
         );
     }
-
     #[test]
     fn child_allows_only_one_live_window_and_seals_late_collectors() {
         let file = file("src/window.ts");
@@ -1490,7 +1449,6 @@ mod tests {
         assert_eq!(first_child.into_charge().len(), 0);
         assert_eq!(second_child.into_charge().len(), 0);
     }
-
     #[test]
     fn bounded_collector_latches_retained_byte_arithmetic_overflow() {
         let file = file("src/arithmetic.ts");

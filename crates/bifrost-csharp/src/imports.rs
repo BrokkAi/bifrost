@@ -12,7 +12,7 @@
 //! `StructuredImportPathKind` and its own `is_global` flag, and consumers read
 //! those instead of re-deriving them from text.
 
-use brokk_bifrost_core::analyzer::common::node_span;
+use brokk_bifrost_core::analyzer::common::{node_source_text as node_text, node_span};
 use brokk_bifrost_core::analyzer::model::{
     ImportInfo, StructuredImportPath, StructuredImportPathKind,
 };
@@ -126,7 +126,7 @@ pub fn csharp_import_info_from_using_directive(
 /// The type a `using static` directive imports, from its structured path.
 pub fn csharp_static_using_from_import(import: &ImportInfo) -> Option<&str> {
     let path = import.path.as_ref()?;
-    (path.kind == Some(StructuredImportPathKind::StaticMember))
+    path.is_static_member_import()
         .then_some(import.identifier.as_deref())
         .flatten()
 }
@@ -144,8 +144,4 @@ pub fn csharp_using_alias_from_node(node: Node<'_>, source: &str) -> Option<(Str
     let target_node = csharp_using_directive_target_node(node)?;
     let target = csharp_type_node_segments(target_node, source).join(".");
     (!target.is_empty()).then_some((alias, target))
-}
-
-fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    node.utf8_text(source.as_bytes()).unwrap_or("")
 }

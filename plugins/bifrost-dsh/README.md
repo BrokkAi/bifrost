@@ -4,6 +4,8 @@
 bundle that gives dsh sessions Bifrost code intelligence over MCP. It ships the
 shared Bifrost launcher, which downloads and checksum-verifies the pinned
 native `bifrost` binary on first use; no manual binary installation is needed.
+The binary selects and verifies public policy and semantic packs during MCP
+startup, so DSH and direct binary launches use the same pack acquisition path.
 
 Bifrost tools appear to the model as `mcp__bifrost__<tool>` (for example
 `mcp__bifrost__search_symbols`), serving the `symbol|extended` toolsets by

@@ -9,16 +9,18 @@ and completeness semantics around native [Rune Query Language
 (RQL)](/rune-query-language/) selectors. JSON is available as a normalized or
 reporting form, but it is not an alternate RQLP authoring syntax.
 
-Open policy rules and semantic models are maintained in
+Standard-library-style policy rules and semantic models are maintained in
 [Bifrost-packs](https://github.com/BrokkAi/bifrost-packs). Submit shared open
-content there; parser, evaluation, catalog, and reporting changes belong in
+content there; third-party library content normally has a separate private
+authoring home. A public benchmark exception needs a maintainer classification
+decision. Parser, evaluation, catalog, and reporting changes belong in
 the engine repository. Pack releases have independent versions and compatibility
 metadata.
 
 > **Current execution boundary:** Bifrost executes match-, taint-, typestate-,
 > assertion-, and flow-analysis policies. Taint and flow resolve typed endpoint
-> bindings, compiles compatible demand, runs bounded set-oriented propagation,
-> and renders retained findings. Unsupported or incomplete semantic boundaries
+> bindings, compile compatible demand, run bounded set-oriented propagation,
+> and render retained findings. Unsupported or incomplete semantic boundaries
 > remain non-clean completion states rather than empty successful results.
 
 > **Important:** An RQL selector returns analysis candidates. An endpoint
@@ -34,490 +36,23 @@ rows while enforcing callable identity and exact actual-to-formal evidence.
 Relational `bind`, `filter`, `project`, `join`, `group`, and `aggregate`
 records belong to assertion plans; they are not endpoint selector forms.
 
+The [policy reference](/reference/policies/) lists every RQLP record, field,
+and atom value, the policy catalog, the report formats, the
+diagnostic codes, and the review file formats. This page explains how to use
+them.
+
 ## One Document Per File
 
 Every `.rqlp` file contains exactly one top-level document:
 
 | Document | Purpose | Executable root? |
 | --- | --- | --- |
-| `(policy ...)` | Defines one rule, its report metadata, and exactly one `match`, `taint`, `typestate`, or `assertion` analysis. | Yes. |
+| `(policy ...)` | Defines one rule, its report metadata, and exactly one `match`, `taint`, `typestate`, `assertion`, or `flow` analysis. | Yes. |
 | `(endpoint ...)` | Names one reusable, diagnostic-neutral source or sink selector with categories and a typed value/API binding. | No. It is loaded only as a dependency. |
 | `(endpoint-set-document ...)` | Groups reusable entries of one declared taint or flow endpoint-set kind. | No. Import it through `endpoint-set-file`. |
 
 Passing an endpoint to `--policy-file` is an error; Bifrost does not turn it
 into a match policy behind the author's back.
-
-### Built-in code-smell pack
-
-The installed binary embeds `bifrost.code-smells`, which contains seventeen
-structured policies. It covers
-dynamic evaluation, unsafe Python object deserialization, success-gated Go API
-results, wrong zero-valued errors returned from exact Go API failure paths,
-Go data races and Proven Python absent-member accesses,
-rayon parallelism inside blocking Rust lazy initializers,
-loop-invariant sorting, and review prompts for regular-expression compilation,
-file reads, serialization, parsing, database calls, network calls,
-subprocesses, sleep, and expensive operations beneath nested loops. Every rule
-is an ordinary checked-in `.rqlp` source with a stable ID and semantic hash;
-its pack manifest also records the category, claimed languages, required
-capabilities, severity rationale, and remediation.
-
-Version 2.11 adds `bifrost.correctness.python-absent-member`. It follows caller
-values to a member access and reports only a fully classified receiver whose
-complete class surface proves the member absent. Unknown receivers, unresolved
-bases, dynamic attributes, and incomplete member models suppress a finding.
-Missing Python declaration-model coverage makes the run inconclusive. A clean
-run means no Proven absence was found, not that every runtime receiver was
-classified. Inspect `(witness (absent-member ...))` for the retained origin-to-
-access evidence; missing or truncated evidence is explicitly labeled.
-
-### Built-in correctness pack
-
-The installed binary also embeds `bifrost.correctness`. Version 0.1 contains
-`bifrost.correctness.resource-lifecycle`, a typestate rule that reports a
-resource reaching a normal or exceptional exit of the procedure that acquired
-it while it is still open. Analysis roots are acquiring procedures, so a
-helper's return is never treated as a terminal exit. The rule observes the
-close operation at both its normal and its exceptional continuation: a
-`try/finally` close discharges both obligations, while a bare trailing close
-leaves the exceptional obligation because the close operation's own failure
-contract is not a release proof. Every event is bound to the tracked subject
-identity, so a close written on an unrelated object cannot discharge an
-obligation.
-
-The shipped release claims Java, Go, JavaScript, TypeScript, Python, Rust,
-Kotlin, Scala, and PHP. Each language row carries one reviewed acquisition
-family (a concrete factory, its close operations, and its use operations) plus
-a multi-file positive, a corrected close, and an unrelated same-named close in
-`tests/suite_bench_policy/resource_lifecycle_pack.rs`. The pack manifest
-records the claimed languages, so a language cannot be claimed without a
-fixture and a fixture cannot exist without a claim. C, C++, C#, and Ruby rows
-stay open until their adapters bind the reviewed close; the exact gap and the
-interface-typed resource gap are recorded in
-`.agents/docs/resource-lifecycle-language-status.md`.
-
-Activate the rule with `--policy-id bifrost.correctness.resource-lifecycle` or
-`--policy-pack bifrost.correctness`. A project with a custom `Handle` API
-follows the reviewed configuration path: copy the rule and replace the
-policy-local acquisition family selectors with the project's exact factory and
-close identities, as the Java landing fixture under
-`tests/fixtures/resource-lifecycle/` does. A call that merely spells `open` or
-`close` creates no subject.
-
-### Built-in security pack
-
-The installed binary also embeds `bifrost.security`. Its Servlet parameter rule
-reports a request parameter reaching the exact `sql` operand of
-`Statement.execute(String)` or `Statement.executeQuery(String)`.
-The rule uses semantic declaration and actual-to-formal identity plus value-flow
-reachability. It does not treat PreparedStatement value binding or unrelated
-same-named methods as SQL-text sinks. A witnessed flow through an open dispatch
-retains possible, unproven, partial evidence; unresolved binding remains
-inconclusive instead of clean. The built-in catalog groups the code-smell and
-security manifests in stable pack order and permits selection by pack, category,
-or policy ID.
-
-Pack version 1.2 adds the **declared-storage family**: two independently
-selectable obligations per supported source language, each an opt-in policy
-that runs only when a policy-ID selector names it. The taint obligation
-(`bifrost.security.<lang>.stored-request-to-sql`) reports a request value that
-crosses the workspace's declared persistence boundary -- written to the
-application's own store in one file, read back in another -- and reaches the
-driver's SQL-text operand, with the write-to-read edge exposed in the finding
-as a declared model assumption rather than an observed database connection.
-The required-validation obligation
-(`bifrost.security.<lang>.store-requires-validation`) is a separate flow
-policy that diagnoses a request value reaching the declared store write
-without passing through the validator the workspace configured; it never
-claims that every application requires validation before storage, and a
-function merely named `validate` never satisfies it. The two are independent
-by construction: a parameterized query removes only the SQL-structure flow,
-and passing a domain validator never sanitizes SQL.
-
-Every rule binds exact proven calls of the declared request, store, validator,
-and SQL APIs -- never same-named members of unrelated classes -- and the
-store, key, and instance contracts come from the workspace's reviewed
-endpoint-set documents under `.bifrost/endpoint-sets/`: a `stores` document
-naming the write/read pair and its store, key, and instance contracts for the
-taint rule, and `observations` and `kills` documents naming the observed store
-write and the required validator for the flow rule. The checked-in fixture for
-each language carries a worked copy of all three documents; copy it, rename
-the application classes and the channel keys, and keep the file paths the
-policies import. Selecting a rule without its documents fails activation with
-a typed error naming the missing file -- a missing required model never counts
-as a passed check. The family ships rows for JavaScript, TypeScript, Python,
-Java, Rust, Go, Ruby, C, C++, PHP, Scala, C#, and Kotlin, each with an
-idiomatic multi-file fixture, the four validator-present/absent crossed with
-concatenated/parameterized combinations, and near-miss controls. The C# row
-stays open: two matched endpoints currently fail C# taint discovery closed,
-which reports an inconclusive run rather than the flow.
-
-Pack version 1.1 adds Rust coverage to eight performance policies. The Rust
-selectors recognize the standard slice `sort*` family, `Regex::new`,
-`fs::read` / `fs::read_to_string`, `serde_json::{to_string, to_vec, from_str,
-from_slice}`, `bincode::{serialize, deserialize}`, `toml::from_str`, direct
-`reqwest::get` and `ureq::{get, post}` requests, and `thread::sleep`. These are
-language- and API-specific normalized call shapes, not source-text matches. The
-pack does not claim Rust database or
-subprocess coverage yet: common APIs expose generic instance methods whose
-resolved receiver type is not available to structural match policies, so a
-name-only rule would be too broad. Dynamic evaluation and unsafe object
-deserialization also remain scoped to languages with a defensible equivalent.
-
-Pack version 1.3 narrows `bifrost.performance.sleep-in-loop` to the `for_loop`
-kind: a sleep that throttles every iterated item is worth review, while a
-sleep inside a condition-controlled `while` loop is usually the deliberate
-mechanism of a poll or bounded-backoff loop and no longer matches. Counting
-loops that a language cannot lexically distinguish from iteration (Go's single
-`for`, C-style `for`) stay outside the rule.
-
-Pack version 1.5 adds `bifrost.correctness.rayon-in-blocking-lazy-init`, a
-Rust-only review prompt for a blocking lazy-init call (`OnceLock::get_or_init`,
-`OnceLock::get_or_try_init`, `Once::call_once`, `LazyLock::new`) whose
-initializer closure lexically contains rayon parallelism (`par_iter`,
-`into_par_iter`, `par_bridge`, `par_chunks`). When the first initialization
-runs on a rayon worker, the initializer's parallel join steals sibling jobs; a
-stolen job that re-enters the same cell parks on it forever and can wedge the
-whole pool. The match is lexical containment, not proof of a deadlock: a rayon
-call inside a nested closure defined within the initializer also matches even
-when that closure only runs later, and bare `rayon::join`, `rayon::scope`, and
-`ThreadPool::install` are excluded because their unqualified names are too
-generic for a name-based rule.
-
-Pack version 2.0 replaces the review prompt `bifrost.performance.sort-in-loop`
-with `bifrost.performance.loop-invariant-sort`, and the removed ID is why the
-major version moves. The old rule asked only "is a sort call written inside a
-loop?", which on Bifrost's own repository produced 284 findings that triage
-found to be false positives almost without exception: the sorted value was
-built inside the loop, so the work was inherent to the iteration. The new rule
-is an assertion policy over the question those prompts meant to ask -- whether
-the sorted receiver's value is *established* inside the loop, by its binder or
-by an assignment there. It claims Rust, Python, Java, TypeScript, and
-JavaScript, each with positive and near-miss fixtures. The worked rule below is
-its shipped source. The other in-loop prompts stay deliberately naive pending
-the same treatment for their argument forms.
-
-Pack version 2.1 moves the eight remaining in-loop review prompts -- regular
-expression compilation, file reads, serialization, parsing, database calls,
-network calls, subprocess launches, and expensive operations beneath nested
-loops -- from `warning` to `note`. Their messages begin "Review whether ..."
-because lexical containment cannot prove that the operation repeats per
-iteration or that the loop is hot, and a prompt that declines to claim
-run-time cost should not fail a build as though it had proved one. With the
-default `--fail-on warning` threshold these prompts now surface without
-gating; pass `--fail-on note` to restore the stricter gate. Policies that
-substantiate their claim keep `warning`: `loop-invariant-sort` proves value
-origin, and the correctness rules are not review prompts.
-
-Pack version 2.2 gives `file-read-in-loop` and `parsing-in-loop` the
-"same treatment" the 2.0 note promised: both become assertion policies whose
-`assert-origin-shape` withdraws the prompt when the enclosing for-each loop's
-iterated expression provably resolves to a collection literal with at most
-eight elements. The bound came from triaging this repository's own accepted
-suppressions, where release scripts loop over module-level lists of two to
-seven known file names. The proof is deliberately narrow: it covers
-declarator-established bindings -- JS/TS `const`/`let`/`var`, Rust `let`,
-Java local declarators -- and every establishing initializer must qualify, so
-a literal later reassigned from a call still reports. Loops whose iterated
-value is out of evidence keep reporting: while and counting loops, call
-results, parameters, Java fields, and Python names bound only by assignment,
-which carry no lexical-binding rows in Python's scope-categorical model. A
-Rust `[value; length]` repeat array never qualifies because its run-time size
-is not its spelled element count.
-
-Pack version 2.3 adds
-`bifrost.correctness.go-result-used-before-success-check`. It starts from an
-exact activated result contract, follows the acquisition's indexed result and
-modeled success condition through procedure-local flow, and evaluates each
-structured use against the reviewed operation preconditions. A use becomes a
-finding only when its operation requires a valid result and that result's
-success condition has not been proved at the operation. The initial `os` scope
-models the usual paired-result shape, where the protected result is valid when
-its paired error is nil. An ignored error is therefore not automatically safe:
-it reports when a later success-gated operation uses the result. Reviewed
-nil-tolerant operations such as `(*os.File).Close`, `Read`, `Seek`, and `Stat`
-need no guard and do not report; `File.Name` and operations on a possibly nil
-`FileInfo` do. Missing or ambiguous operation knowledge stays incomplete rather
-than becoming a finding or a clean negative.
-
-Pack version 2.4 extends that exact result-contract rule to `net.Dial` and
-`net.DialTimeout`. A required operation on the returned connection reports
-when the paired error has not been proved nil; guarded operations stay clean,
-and canonical dispatch identity prevents unrelated local `Dial` methods from
-entering the rule.
-
-Pack version 2.5 adds exact `net.Listen` acquisitions. The reviewed
-`net.Listener` operations `Accept`, `Close`, and `Addr` require a valid
-listener, so using them before the paired error is proved nil reports while
-guarded listeners and unrelated functions or methods named `Listen` stay out
-of the rule.
-
-Pack version 2.6 adds the direct-result form through exact
-`encoding/pem.Decode` acquisitions. `Decode` returns a nullable `*pem.Block`
-as result zero and unconsumed input as result one; the block is valid when the
-block itself is non-nil, not when the remainder has some value. Dereferencing
-the block, including accessing fields such as `Block.Bytes`, reports unless a
-non-nil guard has been proved. Unrelated functions or methods named `Decode`
-remain outside the rule through canonical dispatch identity.
-
-The same rule also recognizes exact call arguments when an activated procedure
-summary publishes a reviewed entry precondition. The built-in Go 1.26
-`crypto/x509` pack models `IsEncryptedPEMBlock` parameter zero as requiring a
-non-null block. Passing an unchecked `pem.Decode` result therefore reports at
-the argument itself; a dominating block nil check is clean. Local or
-other-package functions with the same name, incomplete target resolution, and
-unreviewed parameter requirements remain inconclusive rather than inheriting
-the standard-library claim. A declarations-only `bytes` pack records the exact
-`TrimSpace([]byte) []byte` signature so Go's possible multi-result forwarding
-rule can prove that `pem.Decode(bytes.TrimSpace(data))` still receives exactly
-one argument; the pack makes no broader behavioral claim about `bytes`.
-
-Pack version 2.7 adds
-`bifrost.correctness.go-wrong-error-on-failure-path`. It starts from the same
-canonical reviewed Go result contracts, identifies the exact edge where a
-condition result establishes failure, and reports when a call returned from
-that edge consumes a different error binding whose exact reaching value is
-Go's zero value. A correct condition result, an independently established
-sentinel, a direct return, a statement-only call, a success-arm use, or an
-incomplete origin does not match. The initial returned-call-argument scope is
-deliberately narrower than every syntactically possible wrong-error pattern;
-broader consumer kinds require independent live precision evidence before they
-join the built-in policy.
-
-Pack version 2.8 replaces the specialized
-`bifrost.correctness.go-result-used-before-success-check` finding with
-`bifrost.correctness.go-nil-dereference`. The new policy reports only exact
-`Nil` or `MaybeNil` facts at structured Go dereferences, field accesses, and
-reviewed receiver operations. Exact unguarded result/error contracts remain
-available as a second origin in that same nilness relation, preserving the
-reviewed standard-library cases under one finding identity. Unknown scalar
-facts, nil-tolerant methods, and arbitrary pointer receiver calls do not
-report.
-
-Pack version 2.10 finishes what 2.2 started: the seven remaining in-loop
-review prompts -- serialization, regular-expression compilation, sleeps,
-network calls, database calls, subprocess launches, and expensive operations
-beneath nested loops -- become assertion policies carrying the same
-`assert-origin-shape` exclusion at eight elements. Every policy ID, message,
-severity, and claimed language is unchanged; only the analysis type and the
-withdrawal are new. The proof coverage is the one 2.2 documented: JS/TS
-`const`/`let`/`var`, Rust `let`, and Java local declarators establish a
-binding a proof can read, and every establishing initializer must qualify, so
-a literal later reassigned from a call still reports. Loops whose iterated
-value is out of evidence keep reporting: while and counting loops, call
-results, parameters, Java fields, Java `new String[] {...}` array-creation
-iterables (the iterated node is the creation expression, not the initializer
-literal inside it), and Python names bound only by assignment. `sleep-in-loop`
-keeps its 1.3 narrowing to `for_loop`, so a sleep in a poll or backoff `while`
-is still outside the rule rather than merely unproven.
-
-`expensive-operation-in-nested-loop` resolves the inner loop -- the one whose
-iteration the operation is written under. A proven small inner literal makes
-the nest's work linear in the outer loop rather than multiplicative, which is
-exactly the claim that policy makes, and the outer loop remains the reported
-location. The mirror case, a small outer loop over an unbounded inner one,
-stays reported: the exclusion withdraws a prompt only on proof, never on
-plausibility.
-
-Use `bifrost --list-policies` or MCP `list_policies` to inspect the exact catalog
-in the running build. A CLI policy invocation with no `--policy-file` and no
-built-in selector -- `bifrost --root . --policy` is the plain form -- evaluates
-every built-in pack; any explicit selection replaces that default, and
-`--no-builtin-policies` refuses it for controlled runs that must evaluate only
-their own `--policy-file` inputs. Select a subset with
-`--policy-pack bifrost.code-smells`, a `--policy-category`, or a stable
-`--policy-id`; MCP `run_policy` exposes the same pack/category/ID selectors.
-`bifrost --version` prints each shipped pack's id, version, and policy count
-plus a catalog SHA-256, so a shipped-catalog change is a visible version event. The match policies are deliberately
-review-oriented: a call name or lexical location is evidence of the parsed
-shape, not proof of runtime dispatch, loop invariance, or measured cost.
-`bifrost.performance.loop-invariant-sort` is the exception that proves the rule
--- it reports only what its assert established -- and it states its own two
-limits in its message and description.
-
-### Built-in network-effect boundary pack
-
-Pack version 1.4.0 contains ten policies. The C# specialization uses the reviewed
-`System.Net.Http.HttpClient.SendAsync` model at written arity one. Awaited calls
-propagate the declared network effect; unexpanded deferred callbacks and other
-arities keep the absence claim open. Parameter and explicitly typed local
-receivers bind today. Field and property receivers need further C# receiver
-typing support.
-
-The installed binary also embeds `bifrost.effects`, which is opt-in: a run that
-names no selector evaluates no built-in pack, and this pack is the one that
-carries a configured obligation rather than a repository-independent prompt.
-Each policy in it asserts that **one explicitly selected declaration** reaches
-no declared network effect, directly or through workspace helpers.
-
-The obligation never comes from a name, a file name, a comment, or an
-unqualified annotation. It comes from two reviewed artifacts:
-
-- a semantic model that declares the effect `bifrost.network_io` on the exact
-  API identity, checked in under `.bifrost/semantic-models/` or installed in
-  the catalog; and
-- the repository's declaration-selection block inside the policy, which names
-  the exact declaration(s) the repository reviewed.
-
-The ship-time selection is the empty set, so a repository that enables the pack
-without configuring a selection carries no purity obligation at all and gets a
-clean, complete run. Configure the block, then select the policy:
-
-```sh
-bifrost --root . \
-  --policy-id bifrost.effects.javascript.selected-boundary-no-network-io \
-  --fail-on error
-```
-
-The JavaScript and TypeScript specializations are separate policies with
-separate stable IDs and separate model packs, so a shared rule body never hides
-a missing language. The reviewed models
-(`semantic-packs/web-network/javascript/bifrost.web-network-javascript.json`
-and its TypeScript sibling) declare the WHATWG `fetch` operation at the global
-object identity `globalThis.fetch`. A bare `fetch(...)` binds that identity
-only when the identifier carries no lexical binding at the call site: a
-module-local `fetch`, an imported `fetch`, a parameter, or a reassignment mints
-no identity and therefore no effect. Nothing about the call's spelling is
-trusted, and a call the analyzer cannot expand leaves the absence claim unmet
-rather than clean.
-
-Findings retain the selected root, the helper chain, the exact API, and the
-declared effect's pack/model/summary provenance; the relational row publishes
-`depth`, `classification` (direct or transitive), `certainty`, `timing`,
-`coverage`, and a bounded witness chain.
-
-The Java specialization
-(`bifrost.effects.java.selected-boundary-no-network-io`) is a separate policy
-with its own stable ID. It consumes one reviewed JDK model,
-`semantic-packs/web-network/jvm/bifrost.web-network-jvm.json`, which declares
-`java.net.URL.openConnection()` at its written arity zero. That model is
-declared once for the whole JVM realm: Java, Kotlin and Scala compile to one
-classpath, so a Kotlin or Scala call site binds the same reviewed declaration
-through the JVM external identity route, and none of the three rows ships a
-second JDK model.
-
-The Kotlin specialization
-(`bifrost.effects.kotlin.selected-boundary-no-network-io`) is again a separate
-policy with its own stable ID, and it reads that same shared JVM model one-way.
-Nothing Kotlin-specific is added to the model or to the rule body: the
-specialization differs in its declaration-selection block and in the call shape
-its resolver must bind. Kotlin writes a receiver as a *value* -- `val url =
-URL(address)` and then `url.openConnection()` -- so the resolver proves the
-owner type from the receiver's value expression, a local whose initializer
-constructs the imported JDK type, and asks the same external declaration
-surface for the member. A receiver the workspace declares itself stays a
-workspace call: a class with a method named `openConnection` is not the JDK
-method, and a helper the analyzer cannot expand leaves the absence claim unmet
-rather than clean.
-The Scala specialization
-(`bifrost.effects.scala.selected-boundary-no-network-io`) is again its own
-policy with its own stable ID, and its declaration-selection block is written
-in `(language scala ...)`. It activates the same JVM model rather than a Scala
-JDK model of its own: when the analyzer types a Scala receiver as
-`java.net.URL`, the member access publishes the canonical identity the
-activated declaration surface answers, so `auditUrl.openConnection()` binds
-`java.net.URL.openConnection()` at its written arity zero exactly as the Java
-and Kotlin call sites do. A Scala method that merely shares the JDK method's
-name binds its own workspace declaration instead, and an unresolved Scala
-helper keeps the absence claim open.
-The Rust specialization
-(`bifrost.effects.rust.selected-boundary-no-network-io`) consumes
-`semantic-packs/web-network/rust/bifrost.web-network-rust.json`, which declares
-`std::net::TcpStream::connect` at its written arity one. Rust binds that
-identity through its own path resolver, from either spelling the language
-offers: the verbatim `std::net::TcpStream::connect(addr)`, or the one written
-segment `TcpStream::connect(addr)` that a `use std::net::TcpStream;`
-declaration expands. The owner path is the identity, so a workspace type also
-spelled `TcpStream` with an associated function also spelled `connect`, called
-at the same arity, binds the workspace declaration and carries no effect.
-Neither spelling is proof by itself: the resolver publishes that identity only
-when the activated declaration surface publishes one applicable receiverless
-callable for the written member at the written arity, a workspace root of the
-same name wins over the pack, and a member nothing declares leaves the absence
-claim open rather than borrowing a same-spelled summary.
-The Ruby specialization
-(`bifrost.effects.ruby.selected-boundary-no-network-io`) consumes
-`semantic-packs/web-network/ruby/bifrost.web-network-ruby.json`, which
-publishes the `Net::HTTP` class and declares `bifrost.network_io` on its `get`
-singleton method at written arity one. Ruby writes the receiver as a constant
-path, so the resolver turns `Net::HTTP` into the declaration identity the
-activated model publishes and `Net::HTTP.get(address)` binds the reviewed API
-at its written arity instead of the member spelling. A workspace class also
-spelled `Net::HTTP` with its own `get` resolves inside the workspace and
-carries no effect, and an unresolved Ruby helper keeps the absence claim open.
-
-The same model declares the result of `Net::HTTP.new`, so a local such as
-`http = Net::HTTP.new(host, port)` or a chained constructor expression can
-bind `http.request(req)` to the reviewed instance member. One- and two-argument
-requests carry the network effect. Ordinary construction at one or two arguments
-has a reviewed complete effect-free summary; it creates the client without
-opening a connection. Other constructor call shapes retain their unmodeled
-behavior obligations. This return typing also applies to separately named
-factories when an activated declaration supplies a unique applicable return
-type. Reassigning the local to an unknown value keeps a later request unresolved;
-factory-to-caller, parameter, conditional-join and instance-field propagation
-remain separate capabilities.
-
-<!-- policy-doc-test:rqlp:tests/fixtures/network-effect-boundary/policies/javascript.rqlp -->
-```lisp
-; Network-effect boundary for one explicitly selected JavaScript declaration.
-;
-; The rule family is shared; only the declaration-selection block below and the
-; activated language model differ per language. `total` is not pure because it
-; is named `total`: the reviewed configuration on this repository selects that
-; exact declaration, and a repository that configures nothing carries no
-; obligation at all.
-;
-; The join
-; --------
-; `procedure-effects` projects one row per (procedure, effect id) with the
-; classification (direct or transitive), certainty, timing, coverage and a
-; bounded witness chain. Rows are keyed on the declaration domain's own
-; `procedure_id`, so the join to the selected relation is declaration-identity
-; equality.
-;
-; The absence claim
-; -----------------
-; `(exactly 0)` is an absence claim, so it is conclusive only when the effect
-; relation's coverage is exhaustive. A selected declaration that reaches an
-; unresolved helper leaves the effect set open; the run then publishes an unmet
-; obligation and exits 2 rather than reporting a clean verdict.
-(policy
-  :schema-version 1
-  :id "bifrost.effects.javascript.selected-boundary-no-network-io"
-  :name "Selected JavaScript boundary reaches no network effect"
-  :message "the selected JavaScript boundary reaches the declared network effect"
-  :severity error
-  :description "One explicitly selected JavaScript declaration must not reach a declared network effect, directly or through workspace helpers. The effect is declared by a reviewed semantic model on the exact external API identity, never inferred from a function name, a file name, a comment, or an unqualified annotation."
-  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#network-effect-boundary"
-  :tags ["effects" "network" "boundary" "javascript"]
-  :analysis
-    (analysis
-      :type assertion
-      ; ---------------------------------------------------------------------
-      ; Declaration-selection block (the repository's reviewed configuration).
-      ; Replace the pattern below with the exact declaration this repository
-      ; protects, for example:
-      ;   (language javascript
-      ;     (inside-decl (class :name "PriceCalculator")
-      ;       (method :name "total")))
-      ; ---------------------------------------------------------------------
-      (bind :name selected
-        :query (rql :schema-version 1
-          (language javascript
-            (enclosing-decl (function :name "total")))))
-      (bind :name effect
-        :query (rql :schema-version 1
-          (language javascript
-            (procedure-effects
-              (enclosing-decl (function :name "total"))))))
-      (join :left selected :right effect :on ((id procedure_id)))
-      (group :name selected-boundary :by (selected.id)
-        (aggregate :name network-effects :op count
-          :where ((effect.effect_id eq "bifrost.network_io")
-                  (effect.derivation eq declared))))
-      (assert :group selected-boundary :value network-effects :cardinality (exactly 0))))
-```
 
 ### A runnable match policy
 
@@ -592,9 +127,621 @@ text and exits 1. Add `--verbose` to include the complete finding identity,
 evidence, provenance, proof, classification, rule schema, and manifest record.
 
 Policy evaluation units preserve the same row-level `{proof, completeness,
-reason}` evidence object emitted by direct CodeQuery, CLI, MCP, and LSP results.
+reason}` evidence object that direct CodeQuery results carry.
 This object survives unit serialization and reuse without recreating a composite
 quality label or dropping a typed limitation reason.
+
+## Built-in Policy Packs
+
+The v0.13 production core has an empty product-rule catalog. Hosts acquire
+compatible, verified content separately and supply its installed root to the
+engine. The following four pack identities describe the external baseline;
+their presence in this documentation does not mean they are installed or
+enabled.
+
+| Pack | What it checks |
+| --- | --- |
+| `bifrost.code-smells` | Bug-prone patterns, proven correctness defects, and performance review prompts. |
+| `bifrost.correctness` | Resource lifecycle: a resource left open at the exit of the procedure that acquired it. |
+| `bifrost.security` | Taint rules from untrusted input to SQL text or a shell command, and the opt-in declared-storage family. |
+| `bifrost.effects` | Network-effect boundaries: a declaration you select must not reach a declared network call. |
+
+The [policy reference](/reference/policies/) lists baseline policies with
+its ID, category, severity, analysis type, languages, and activation. Every
+rule is an ordinary `.rqlp` source with a stable ID and a semantic hash. Its
+pack manifest also records the category, claimed languages, required
+capabilities, severity rationale, remediation, and activation.
+
+After a host supplies a verified catalog, run its default policies:
+
+```sh
+bifrost --root . --policy
+```
+
+With no supplied rules, a scan is explicitly not evaluated; an empty catalog
+does not establish that the project is clean. `bifrost scan .` uses the same
+selected catalog and prints the activated pack versions and the
+catalog hash on stderr. To run a subset, name it with `--policy-pack`,
+`--policy-category`, or `--policy-id`. MCP `run_policy` accepts the same
+selectors as `policy_packs`, `policy_categories`, and `policy_ids`, but has no
+default selection. The selection rules are:
+
+- Repeating one selector widens the selection. `--policy-pack
+  bifrost.code-smells --policy-pack bifrost.security` runs both packs.
+- Combining different selectors narrows it. `--policy-pack bifrost.code-smells
+  --policy-category performance` runs only the performance policies of the
+  code-smell pack.
+- A selection that matches no policy exits with status 2.
+- A policy whose catalog `activation` is `opt-in` runs only when
+  `--policy-id` or `policy_ids` names it. Pack, category, and default runs
+  never include it. Today the opt-in policies are the 26 declared-storage
+  policies of `bifrost.security`.
+- `--policy-file` alone runs only the named files. Add
+  `--no-builtin-policies` to make a run fail if it would otherwise include a
+  catalog policy.
+
+`bifrost --list-policies` and MCP `list_policies` print the catalog of the
+running host. `bifrost --version` prints each selected pack's ID, version, and
+policy count and the catalog SHA-256. Pack release versions are independent
+of the engine version.
+
+Setting `BIFROST_OPEN_POLICY_PACK_ROOT` to a directory of extracted packs
+supplies the catalog for every policy surface: `--list-policies`,
+`--version`, `bifrost scan`, default runs, built-in selectors, and MCP. Each
+subdirectory is one pack with a `manifest.json` and its `policies/*.rqlp`
+files. Bifrost verifies each manifest and each policy's authored hash. An
+empty value, an empty directory, or an invalid pack is an error; Bifrost does
+not fall back to legacy regression sources. Acquisition, compatibility
+admission, and verified offline-cache reuse belong to the host; the engine
+does not fetch a live authoring repository.
+
+The match policies are review-oriented: a call name or lexical location is
+evidence of the parsed shape, not proof of runtime dispatch, loop invariance,
+or measured cost. Assertion, taint, flow, and typestate policies report only
+what their analysis establishes, and state their limits in their own
+descriptions.
+
+### Built-in code-smell pack
+
+`bifrost.code-smells` contains 31 policies in two categories, `correctness`
+and `performance`. All of them have activation `default`.
+
+**Structural correctness checks.** These assertion policies report a defect
+only from exact structural or semantic evidence:
+
+- `contradictory-condition`: a condition whose outcome is fixed by proven
+  scalar facts, so one arm cannot run.
+- `identical-conditional-branches`, `repeated-branch-condition`, and
+  `redundant-boolean-branches`: conditionals whose arms are equivalent, whose
+  later condition repeats an earlier one, or whose two paths return opposite
+  Boolean literals.
+- `empty-failure-handler`: a `catch`, `except`, or `rescue` clause with no
+  statements other than comments, empty statements, `pass`, or `...`. A C#
+  exception filter selects an exception but does not handle it.
+- `local-self-assignment`, `c-self-assignment`, `failed-swap`, and
+  `overwritten-unread-value`: local assignments that copy a value back to
+  itself, swap incorrectly, or write a value that is replaced before any read.
+- `loop-body-never-repeats`: a `while`, `for`, or `do` loop whose body always
+  leaves before the next iteration. Iteration loops such as Java enhanced
+  `for`, Python `for`, and Go `for range` are not assessed, because one pass
+  over the first element is a common deliberate idiom.
+- `unreachable-statement`: a statement inside a callable that no path from the
+  callable's entry reaches. Statements outside callables, such as
+  JavaScript module-level code, are not assessed.
+- `discarded-pure-result` and `ignored-status-result` (Java): the result of
+  the exact JDK 21 `String.trim()` call, or the Boolean status of the exact
+  `Files.deleteIfExists(Path)` call, is discarded.
+
+When the evidence for one of these checks is partial, for example an
+unsupported predicate or an inexact source mapping, the run is inconclusive
+rather than clean. `contradictory-condition` reports a complete result for a
+function only when the analysis of that function has no gaps and decides every
+condition in it. A condition on a value that the analysis cannot decide, such
+as a test of a function parameter, leaves the run inconclusive. [Scan a
+Codebase](/scan-a-codebase/) shows both cases in a real run. Each policy's description names the shapes it does not
+decide. The description is in the report's `rules[].description`, in the
+SARIF rule's `fullDescription`, and in `--verbose` human output.
+
+**Dynamic evaluation and unsafe deserialization.** These two match policies
+report calls named `eval` or `exec` in Python, calls named `eval` or
+`Function` in JavaScript and TypeScript, and calls to `pickle.loads` or
+`pickle.load` in Python.
+
+**Python absent members.** `bifrost.correctness.python-absent-member` follows
+caller values to a member access. It reports only a fully classified receiver
+whose complete class surface proves the member absent. Unknown receivers,
+unresolved bases, dynamic attributes, and incomplete member models do not
+produce a finding. Missing Python declaration-model coverage makes the run
+inconclusive. That coverage needs the released Python standard-library pack,
+`bifrost.python-stdlib`. It activates only when it is installed and the project
+declares a CPython version in `.python-version`, `pyproject.toml`
+`requires-python`, `setup.cfg`, or `setup.py`. A clean run means that no proven absence was found, not that
+every runtime receiver was classified. Inspect `(witness (absent-member ...))`
+for the retained origin-to-access evidence; missing or truncated evidence is
+labeled. `python-absent-member-conditional` keeps the class absence conditional
+when other receiver values may also reach the access. It may also retain a
+possible installation by a listed global dynamic write only when every matching
+write has no receiver bound and an Any member-name set; the condition names the
+write sites. A `DeclaredParameter` origin qualifies only when its annotation
+resolves to one workspace class with no workspace subclass, unresolved or
+unmodeled external base, or attribute hook such as `__getattr__`,
+`__getattribute__`, or `__setattr__`. Its condition states the annotated type
+and that no workspace subclass exists. Bounded or member-attributed writes,
+and incomplete member models, still suppress the finding.
+
+**Go.** Two Go policies use canonical API identity, so unrelated functions
+or methods with the same name never enter them:
+
+- `go-nil-dereference` reports a dereference, field access, or reviewed
+  receiver operation reached with an exact `Nil` or `MaybeNil` fact. It also
+  reports an operation that requires a valid result of a reviewed API before
+  the result's success condition is proved. The reviewed APIs are the `os`
+  paired-result functions (`(*os.File).Close`, `Read`, `Seek`, and `Stat`
+  tolerate a nil receiver and do not report; `File.Name` does),
+  `net.Dial`, `net.DialTimeout`, `net.Listen` (the `Accept`, `Close`, and
+  `Addr` operations), and `encoding/pem.Decode`, whose nullable block is valid
+  only when it is non-nil. Passing an unchecked `pem.Decode` block to
+  `crypto/x509.IsEncryptedPEMBlock` reports at the argument. Unknown scalar
+  facts, nil-tolerant methods, and arbitrary pointer receiver calls do not
+  report. Missing or ambiguous operation knowledge stays incomplete.
+- `go-wrong-error-on-failure-path` reports a call returned from the exact
+  failure edge of a reviewed Go API when that call consumes a different error
+  binding whose reaching value is Go's zero value. A correct condition result,
+  an independent sentinel, a direct return, a statement-only call, a
+  success-arm use, or an incomplete origin does not match. The rule covers
+  returned call arguments only.
+
+**Performance.** `bifrost.performance.loop-invariant-sort` is an assertion
+policy. It reports a sort call inside a loop only when the sorted receiver's
+value is established outside the loop: its binding is declared outside and no
+assignment inside the loop reaches it. It claims Rust, Python, Java,
+TypeScript, and JavaScript.
+
+The other nine performance policies are review prompts with severity `note`:
+regular-expression compilation, file reads, serialization, parsing, database
+calls, network calls, subprocess launches, and sleeps written inside a loop,
+and expensive operations written inside two nested loops. Their messages begin
+"Review whether ..." because lexical containment cannot prove that the
+operation repeats per iteration or that the loop is hot. With the default
+`--fail-on warning` they appear in the report without failing the run. Pass
+`--fail-on note` to make them gate.
+
+Each prompt withdraws itself when the enclosing for-each loop's iterated
+expression provably resolves to a collection literal with at most eight
+elements. The proof reads declarator-established bindings: JavaScript and
+TypeScript `const`, `let`, and `var`, Rust `let`, and Java local declarators.
+Every establishing initializer must qualify, so a literal later reassigned
+from a call still reports. These iterated values are out of evidence and keep
+reporting: while and counting loops, call results, parameters, Java fields,
+Java `new String[] {...}` array-creation expressions, Python names bound only
+by assignment, and Rust `[value; length]` repeat arrays. For
+`expensive-operation-in-nested-loop`, the withdrawal looks at the inner loop.
+A small outer loop over an unbounded inner loop still reports.
+
+`sleep-in-loop` matches only for-each loops (`for_loop`). A sleep inside a
+condition-controlled `while` loop is usually the mechanism of a poll or
+bounded backoff and does not match. Counting loops that a language cannot
+distinguish from iteration, such as Go's single `for` and C-style `for`, are
+outside the rule.
+
+The Rust selectors of the performance prompts recognize the standard slice
+`sort*` family, `Regex::new`, `fs::read` and `fs::read_to_string`,
+`serde_json::{to_string, to_vec, from_str, from_slice}`,
+`bincode::{serialize, deserialize}`, `toml::from_str`, direct `reqwest::get`
+and `ureq::{get, post}` requests, and `thread::sleep`. The pack does not claim
+Rust database or subprocess coverage.
+
+**Rayon in blocking lazy initializers.**
+`bifrost.correctness.rayon-in-blocking-lazy-init` is a Rust review prompt for
+a blocking lazy-init call (`OnceLock::get_or_init`,
+`OnceLock::get_or_try_init`, `Once::call_once`, `LazyLock::new`) whose
+initializer closure lexically contains rayon parallelism (`par_iter`,
+`into_par_iter`, `par_bridge`, `par_chunks`). When the first initialization
+runs on a rayon worker, the initializer's parallel join can steal a sibling
+job that re-enters the same cell and waits on it forever. The match is lexical
+containment, not proof of a deadlock. Bare `rayon::join`, `rayon::scope`, and
+`ThreadPool::install` are excluded because their unqualified names are too
+generic.
+
+### Built-in correctness pack
+
+`bifrost.correctness` contains one typestate policy,
+`bifrost.correctness.resource-lifecycle`. It reports a resource that reaches a
+normal or exceptional exit of the procedure that acquired it while it is still
+open. Only the acquiring procedure is an analysis root, so a helper's return
+is never treated as an exit.
+
+The shipped rule tracks one reviewed acquisition family per language:
+
+| Languages | Acquire | Close |
+| --- | --- | --- |
+| Java, JavaScript, TypeScript, Kotlin, Scala | `openResource(...)` | `closeResource(resource)` or `resource.close()` |
+| Python, Rust, PHP | `open_resource(...)` | `close_resource(resource)` or `resource.close()` |
+| Go | `open_resource(...)` | `close_resource(resource)` |
+
+Java `try (...)`, Python `with`, and Go `defer` close the resource they name.
+A close inside a workspace helper discharges the caller's obligation when the
+helper closes the parameter it received on every supported exit path. Every
+event is bound to the tracked resource, so a close on an
+unrelated object, or a call that only spells `open` or `close`, does not count.
+
+The rule observes the close at both its normal and its exceptional
+continuation. A close in a `try`/`finally` block discharges both obligations.
+A bare close at the end of the procedure leaves the exceptional obligation,
+because the close operation's own failure is not proof of release. Escape,
+ownership-transfer, and alias shapes that the analysis does not support make
+the run inconclusive rather than clean.
+
+The pack claims Go, Java, JavaScript, Kotlin, PHP, Python, Rust, Scala, and
+TypeScript. C, C++, C#, and Ruby are not claimed: the reviewed close does not
+yet bind in those languages, so a corrected close would still report.
+
+Typestate call events may also require a direct Boolean argument value. Add
+`:condition (argument-condition :argument (argument :index 0) :equals true)`
+inside a `:calls` record to match only a call whose selected argument is the
+semantic Boolean constant `true`. The condition is evaluated from semantic
+value facts, so a parameter or computed value does not match it and keeps the
+run incomplete. Argument conditions currently accept positional indexes and
+Boolean equality only.
+
+To check your own API, copy the rule and replace its acquisition and close
+selectors with your project's exact factory and close identities. Give the
+copy its own policy ID and run it with `--policy-file`.
+
+### Built-in security pack
+
+`bifrost.security` has three taint policies with activation `default`:
+
+| Policy ID | Source | Sink |
+| --- | --- | --- |
+| `bifrost.security.java.servlet-parameter-to-jdbc` | `ServletRequest.getParameter(String)` | The `sql` operand of `Statement.execute(String)` or `Statement.executeQuery(String)` |
+| `bifrost.security.java.system-getenv-to-runtime-exec` | `System.getenv(String)` | The command operand of `Runtime.exec(String)` |
+| `bifrost.security.python.process-input-to-os-system` | `os.environ` and `sys.argv` | The command operand of `os.system` |
+
+Each rule binds exact declarations through semantic identity and
+actual-to-formal evidence, then follows value flow. The JDBC rule does not
+treat `PreparedStatement` value binding as a SQL-text sink. The `Runtime.exec`
+rule excludes `Runtime.exec(String[])`. `os.system` runs its command in a
+subshell, so text from the environment or the argument vector changes the
+command that runs. Same-named methods of unrelated classes never match. A
+witnessed flow through an open dispatch is retained as possible, unproven,
+partial evidence. An unresolved binding makes the run inconclusive instead of
+clean.
+
+#### Declared storage
+
+The declared-storage family has two policies for each of 13 languages:
+JavaScript, TypeScript, Python, Java, Rust, Go, Ruby, C, C++, PHP, Scala, C#,
+and Kotlin. Both are opt-in: they run only when `--policy-id` or `policy_ids`
+names them.
+
+- `bifrost.security.<language>.stored-request-to-sql` (taint, `error`)
+  reports a request value that the application writes to its own declared
+  store in one place, reads back in another, and passes to the SQL-text
+  operand of a database driver. The write-to-read edge appears in the finding
+  as a declared model assumption, not as an observed database connection.
+- `bifrost.security.<language>.store-requires-validation` (flow, `warning`)
+  reports a request value that reaches the declared store write without
+  passing through the validator the workspace configured. It never claims
+  that every application must validate before storage, and a function merely
+  named `validate` never satisfies it.
+
+The two obligations are independent. A parameterized query removes only the
+SQL flow, and passing the validator never sanitizes SQL.
+
+Each policy imports reviewed endpoint-set documents from fixed paths in the
+workspace. Create them before you select the policy:
+
+| File | `:kind` | Used by | Declares |
+| --- | --- | --- | --- |
+| `.bifrost/endpoint-sets/stores/<language>-declared-store.rqlp` | `stores` | `stored-request-to-sql` | The `store-write` and `store-read` calls, the store name, and the key and instance ports. |
+| `.bifrost/endpoint-sets/observations/<language>-declared-store-write.rqlp` | `observations` | `store-requires-validation` | The store write and the operand that must carry a validated value. |
+| `.bifrost/endpoint-sets/kills/<language>-required-validator.rqlp` | `kills` | `store-requires-validation` | The validator call, its input, and its output. |
+
+`<language>` is the policy's language label: `javascript`, `typescript`,
+`python`, `java`, `rust`, `go`, `ruby`, `c`, `cpp`, `php`, `scala`, `csharp`,
+or `kotlin`. Selecting a policy without its documents fails activation with a
+`policy-validation-failed` diagnostic that names the missing file, and the run
+exits 2. A missing model never counts as a passed check.
+
+The policies select the request source and the SQL sink themselves; the
+[policy reference](/reference/policies/) lists them per language. For
+example, the Python policies read Flask `request.args.get` through a class
+named `RequestValues` and write SQL through `Cursor.execute`. These three
+Python documents declare a `JobStore` class whose `put(key, value)` writes the
+store and whose `get(key)` reads it, and a `SearchTermValidator.validate`
+method:
+
+```lisp
+; .bifrost/endpoint-sets/stores/python-declared-store.rqlp
+(endpoint-set-document
+  :schema-version 1
+  :kind stores
+  :language python
+  :rql-schema-version 1
+  :set (endpoint-set :entries [
+      (store-write :id job-store-put
+        :selector (rql :schema-version 1
+          (language python
+            (call-sites-to :proof proven
+              (enclosing-decl
+                (inside-decl (class :name "JobStore") (method :name "put"))))))
+        :store job-store
+        :key (argument :index 0)
+        :instance receiver
+        :input (argument :index 1))
+      (store-read :id job-store-get
+        :selector (rql :schema-version 1
+          (language python
+            (call-sites-to :proof proven
+              (enclosing-decl
+                (inside-decl (class :name "JobStore") (method :name "get"))))))
+        :store job-store
+        :key (argument :index 0)
+        :instance receiver
+        :output return-value)]))
+```
+
+```lisp
+; .bifrost/endpoint-sets/observations/python-declared-store-write.rqlp
+(endpoint-set-document
+  :schema-version 1
+  :kind observations
+  :language python
+  :rql-schema-version 1
+  :set (endpoint-set :entries [
+      (observation :id job-store-put-value
+        :display-name "JobStore.put stored value"
+        :selector (rql :schema-version 1
+          (language python
+            (call-sites-to :proof proven
+              (enclosing-decl
+                (inside-decl (class :name "JobStore") (method :name "put"))))))
+        :observed-operand (argument :index 1))]))
+```
+
+```lisp
+; .bifrost/endpoint-sets/kills/python-required-validator.rqlp
+(endpoint-set-document
+  :schema-version 1
+  :kind kills
+  :language python
+  :rql-schema-version 1
+  :set (endpoint-set :entries [
+      (kill :id search-term-validator-validate
+        :selector (rql :schema-version 1
+          (language python
+            (call-sites-to :proof proven
+              (enclosing-decl
+                (inside-decl (class :name "SearchTermValidator") (method :name "validate"))))))
+        :input (argument :index 0)
+        :output return-value)]))
+```
+
+Replace the class and method names with your application's store and
+validator. The key contract separates channels by their proven key constants,
+and the instance contract separates store objects that are proven distinct.
+Then run both obligations:
+
+```sh
+bifrost --root . \
+  --policy-id bifrost.security.python.stored-request-to-sql \
+  --policy-id bifrost.security.python.store-requires-validation
+```
+
+The C# taint row does not conclude today: C# taint discovery over the two
+matched endpoints is incomplete, so `bifrost.security.csharp.stored-request-to-sql`
+reports an inconclusive run (`partial_discovery`) and exits 2 rather than
+reporting the flow.
+
+### Rust SQL-injection taint support
+
+A Rust taint run with `:unmodeled require-model` concludes only when every
+call it crosses is analyzed source, a reviewed model, or one of the Rust
+standard-library facts the engine carries. Anything else keeps the run
+`inconclusive` and names the unmodeled call or the unresolved identity; an
+empty result from incomplete discovery is never reported as clean. The
+reviewed Rust models below describe transitional engine regression coverage,
+not a released pack to copy from the engine. For production use, obtain
+separately delivered, reviewed content or author a workspace model under
+`.bifrost/semantic-models/`. The retained regression stubs mimic each crate's
+API shape; they do not claim compatibility with a specific crate release.
+
+The engine's Rust standard-library facts are Bifrost-authored and apply only
+where the resolver proves the standard identity: a string literal or `&str`
+binding for the `str` methods, and the `std`/`core` prelude for the other
+names, with no shadowing item, `use`, or glob import. They model their calls at
+the same tier as analyzed code, so a run that needs nothing else concludes
+`complete`. Reviewed model summaries are authored claims about code Bifrost did
+not analyze, so a run that needs one concludes `proven_by_summary` instead,
+unless the summary states no transfer at all.
+
+| Area | Supported | Status |
+| --- | --- | --- |
+| Std facts (engine) | `str::to_owned`, `str::len`, `Ok`, `Err`, `Some`, `String::new`; `String + &str`; drops of `String`, and of `Option`, `Result`, `Vec`, `Box` whose type arguments are themselves covered; references (a borrowed temporary, which a `let` keeps alive to the end of its block, must itself be covered), primitives, tuples, arrays, and workspace structs and enums without type parameters, attributes, or a `drop` member | Complete |
+| Std sources (model) | `std::env::var` and `std::env::args()` return values, `std::env::args().nth(i)` return value, `std::io::Stdin::read_line` buffer argument (`std::io::stdin().read_line(&mut buffer)`), with `Result::unwrap`, `Option::unwrap`, and `Args::nth` as transfers | Proven by summary |
+| Std sources | A zero-argument `std::env::args()` selected directly | Complete: an exact empty call-binding partition is a usable call site for a return-value source |
+| SQL sinks (model) | `postgres::Client::{execute, query, query_one, query_opt}` (SQL text is argument 0, bound values argument 1), `batch_execute`, `prepare`; `rusqlite::Connection::{execute, execute_batch, prepare}`, `rusqlite::Statement::execute` | Complete: the summaries carry no transfer, so bound values reach neither the result nor the receiver, and the SQL text is observed at the call |
+| SQL sinks | `rusqlite::Connection::query_row` and other callback forms; `sqlx::query`, `sqlx::query_as`, `sqlx::Executor::execute`; `diesel::sql_query`; `tokio_postgres` and other `async fn` calls | Incomplete: no reviewed model; callbacks need a callable-argument contract, crate-root functions such as `sqlx::query` need a single-segment owner identity, and `async fn` bodies are deferred execution the adapter does not lower |
+| Receivers | A method on a string literal, a `&str`, a reviewed std prelude type, a `use`-imported external type behind built-in references, or the result of a modeled call whose model declares its return type | Complete |
+| Receivers | Trait objects, generic receivers, user `Deref` wrappers, unannotated bindings of an external call's result | Incomplete: no exact receiver type |
+| Value construction | `+` on `String` and `&str`; a source bound to a `&mut local` argument reaches the local; `let` bindings and wildcard `let` temporaries | Complete |
+| Value construction | `format!` and other macros, `String::push_str` and builders, closures, `async` blocks, `?`, `match`/`if let` destructuring that may drop owned values | Incomplete: macros and closures are not lowered, and these drops are outside the inert-drop proof |
+| Drops of external values | `let _ = client.execute(..)` where the result's type comes from an external crate | Incomplete: needs a drop-glue fact in the declaration schema (follow-up to the in-code std table) |
+| Framework sources | Axum and Actix extractors (`Query<T>`, `Path<T>`, `Json<T>`), handler parameters as entry points, `http::HeaderMap::get` | Incomplete: no reviewed model |
+| Shipped policy | A general Rust request-to-SQL policy | Not shipped: author sources and sinks with `resolved-call` selectors that name the reviewed identity, such as `(call-argument :formal-index 0 (resolved-call :resolves-to "postgres.Client.execute" :proof declared ...))` |
+
+### Built-in network-effect boundary pack
+
+`bifrost.effects` contains ten assertion policies, one per language: C#, Go,
+Java, JavaScript, Kotlin, Python, Ruby, Rust, Scala, and TypeScript. Each has
+the ID `bifrost.effects.<language>.selected-boundary-no-network-io`, category
+`effects`, and severity `error`.
+
+#### Network-effect boundary
+
+Each policy asserts that **explicitly selected declarations** reach no
+declared network effect, directly or through workspace helpers. The
+obligation never comes from a name, a file name, a comment, or an unqualified
+annotation. It comes from two reviewed artifacts:
+
+- a semantic model that declares the effect `bifrost.network_io` on the exact
+  API identity; and
+- a declaration-selection block inside the policy that names the exact
+  declarations the repository reviewed.
+
+When this external pack is selected, its policies have activation `default`,
+so `bifrost --root . --policy` and `bifrost scan` run them. Their template
+selection block is empty: it selects
+`(except (enclosing-decl (function)) (enclosing-decl (function)))`. Each
+policy checks no protected declaration until you configure a copy. That empty
+selection does not certify a network boundary in your application.
+`--policy-id bifrost.effects.<language>.selected-boundary-no-network-io` also
+runs the selected template, with its empty selection.
+
+To configure the obligation:
+
+1. Copy the policy source from the exact selected external release. Its
+   authoring path in Bifrost-packs is
+   `rules/bifrost.effects/policies/<language>/selected-boundary-no-network-io.rqlp`;
+   the `path` field of `bifrost --list-policies` gives the path inside the
+   installed pack. Retain its license, notices, and source/release identity.
+2. Replace both `(except ...)` expressions with the exact declaration you
+   protect, for example
+   `(enclosing-decl (inside-decl (class :name "PriceCalculator") (method :name "total")))`.
+3. Give the copy its own `:id`. If the copy keeps the shipped ID and runs
+   beside the selected external pack, both definitions are excluded with
+   `duplicate-policy-id`.
+4. Put the language's reviewed model under `.bifrost/semantic-models/`. Go
+   needs no file.
+5. Run the copy: `bifrost --root . --policy-file policies/my-boundary.rqlp
+   --fail-on error`.
+
+| Language | Modeled API and written arity | Model to install |
+| --- | --- | --- |
+| C# | `System.Net.Http.HttpClient.SendAsync`, arity 1 | `semantic-packs/web-network/csharp/bifrost.web-network-csharp.json` |
+| Go | `net/http.Get`, arity 1 | None. The embedded `bifrost.go.stdlib.net-http` pack declares it. |
+| Java, Kotlin, Scala | `java.net.URL.openConnection()`, arity 0 | `semantic-packs/web-network/jvm/bifrost.web-network-jvm.json`, one model for all three |
+| JavaScript | `globalThis.fetch` | `semantic-packs/web-network/javascript/bifrost.web-network-javascript.json` |
+| TypeScript | `globalThis.fetch` | `semantic-packs/web-network/typescript/bifrost.web-network-typescript.json` |
+| Python | `urllib.request.urlopen` | `semantic-packs/web-network/python/bifrost.web-network-python.json` |
+| Ruby | `Net::HTTP.get`, arity 1, and `request` on a `Net::HTTP.new` result | `semantic-packs/web-network/ruby/bifrost.web-network-ruby.json` |
+| Rust | `std::net::TcpStream::connect`, arity 1 | `semantic-packs/web-network/rust/bifrost.web-network-rust.json` |
+
+The model paths in this table are relative to
+[Bifrost-packs](https://github.com/BrokkAi/bifrost-packs/tree/main/semantic-packs/web-network),
+which owns their authoring and delivery. The engine's retained copies are
+transitional test inputs; do not use the engine tree as an authoring source.
+
+`(exactly 0)` is an absence claim, so it is conclusive only when the effect
+relation's coverage is exhaustive. A selected declaration that reaches a
+helper the analyzer cannot expand leaves the effect set open. The run then
+publishes an unmet obligation and exits 2 rather than reporting a clean
+result. Findings retain the selected root, the helper chain, the exact API,
+and the declared effect's pack, model, and summary provenance. The relational
+row publishes `depth`, `classification` (direct or transitive), `certainty`,
+`timing`, `coverage`, and a bounded witness chain.
+
+How each language binds its modeled API:
+
+- **JavaScript and TypeScript.** A bare `fetch(...)` binds
+  `globalThis.fetch` only when the identifier has no lexical binding at the
+  call site. A module-local `fetch`, an imported `fetch`, a parameter, or a
+  reassignment creates no identity and therefore no effect.
+- **Java, Kotlin, and Scala.** The JVM model is declared once for the whole
+  JVM realm, because the three languages compile to one classpath. A Kotlin
+  receiver written as a value, `val url = URL(address)` and then
+  `url.openConnection()`, binds through the value's constructor. A Scala
+  receiver typed as `java.net.URL` binds the same identity. A workspace class
+  with its own `openConnection` method stays a workspace call.
+- **Rust.** `std::net::TcpStream::connect(addr)` and
+  `TcpStream::connect(addr)` after `use std::net::TcpStream;` both bind the
+  identity. A workspace type also named `TcpStream` with its own `connect`
+  binds the workspace declaration and carries no effect.
+- **Ruby.** `Net::HTTP.get(address)` binds through the constant path. The same
+  model types the result of `Net::HTTP.new`, so `http.request(req)` on a local
+  or chained constructor binds the reviewed instance member. One- and
+  two-argument requests carry the effect. Construction with one or two
+  arguments has a reviewed effect-free summary. Reassigning the local to an
+  unknown value keeps a later request unresolved. A workspace class also
+  spelled `Net::HTTP` resolves inside the workspace.
+- **C#.** Awaited calls of `SendAsync` propagate the effect. Unexpanded
+  deferred callbacks and other arities keep the absence claim open. Parameter
+  and explicitly typed local receivers bind; field and property receivers do
+  not yet.
+- **Go.** The Go import binder expands the call's `http` qualifier to the
+  `net/http` import path, so the identity never rests on the spelling `Get`.
+
+In every language, a helper the analyzer cannot expand leaves the absence claim
+open rather than clean.
+
+This is an example configured copy of the JavaScript policy. It selects a
+module-level function named `total`:
+
+<!-- policy-doc-test:rqlp:tests/fixtures/network-effect-boundary/policies/javascript.rqlp -->
+```lisp
+; Network-effect boundary for one explicitly selected JavaScript declaration.
+;
+; The rule family is shared; only the declaration-selection block below and the
+; activated language model differ per language. `total` is not pure because it
+; is named `total`: the reviewed configuration on this repository selects that
+; exact declaration, and a repository that configures nothing carries no
+; obligation at all.
+;
+; The join
+; --------
+; `procedure-effects` projects one row per (procedure, effect id) with the
+; classification (direct or transitive), certainty, timing, coverage and a
+; bounded witness chain. Rows are keyed on the declaration domain's own
+; `procedure_id`, so the join to the selected relation is declaration-identity
+; equality.
+;
+; The absence claim
+; -----------------
+; `(exactly 0)` is an absence claim, so it is conclusive only when the effect
+; relation's coverage is exhaustive. A selected declaration that reaches an
+; unresolved helper leaves the effect set open; the run then publishes an unmet
+; obligation and exits 2 rather than reporting a clean verdict.
+(policy
+  :schema-version 1
+  :id "bifrost.effects.javascript.selected-boundary-no-network-io"
+  :name "Selected JavaScript boundary reaches no network effect"
+  :message "the selected JavaScript boundary reaches the declared network effect"
+  :severity error
+  :description "One explicitly selected JavaScript declaration must not reach a declared network effect, directly or through workspace helpers. The effect is declared by a reviewed semantic model on the exact external API identity, never inferred from a function name, a file name, a comment, or an unqualified annotation."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#network-effect-boundary"
+  :tags ["effects" "network" "boundary" "javascript"]
+  :analysis
+    (analysis
+      :type assertion
+      ; ---------------------------------------------------------------------
+      ; Declaration-selection block (the repository's reviewed configuration).
+      ; Replace the pattern below with the exact declaration this repository
+      ; protects, for example:
+      ;   (language javascript
+      ;     (inside-decl (class :name "PriceCalculator")
+      ;       (method :name "total")))
+      ; ---------------------------------------------------------------------
+      (bind :name selected
+        :query (rql :schema-version 1
+          (language javascript
+            (enclosing-decl (function :name "total")))))
+      (bind :name effect
+        :query (rql :schema-version 1
+          (language javascript
+            (procedure-effects
+              (enclosing-decl (function :name "total"))))))
+      (join :left selected :right effect :on ((id procedure_id)))
+      (group :name selected-boundary :by (selected.id)
+        (aggregate :name network-effects :op count
+          :where ((effect.effect_id eq "bifrost.network_io")
+                  (effect.derivation eq declared))))
+      (assert :group selected-boundary :value network-effects :cardinality (exactly 0))))
+```
+
+This example keeps the shipped `:id`. Run it with `--policy-file` only, or give
+your copy its own ID before you run it together with the selected external
+`bifrost.effects` pack.
 
 ## Schema Versions And Selectors
 
@@ -611,7 +758,7 @@ File-backed selectors have four version-resolution cases:
 
 | `rql-file` wrapper | Referenced `.rql` document | Result |
 | --- | --- | --- |
-| Omitted | Native query with no version envelope | Resolve the latest compatible RQL version (currently 3); the version is inferred. |
+| Omitted | Native query with no version envelope | Resolve the latest compatible RQL version (currently 1); the version is inferred. |
 | Exact pin `N` | Native query with no version envelope | Use exact `N`; the wrapper supplies the explicit pin. |
 | Omitted | `(rql :schema-version N QUERY)` | Use exact `N`; the referenced document supplies the explicit pin. |
 | Exact pin `N` | `(rql :schema-version N QUERY)` | Use exact `N`; the agreeing referenced-document pin is retained as the resolution origin. |
@@ -647,8 +794,14 @@ An analysis may declare selector context once:
   :selector (rql (call :callee (name "eval"))))
 ```
 
-`:languages` is a list of public analyzer labels or first-class family aliases,
-not file extensions, tags, display names, or inferred identities. Shared RQL
+`:languages` is a list of language labels or family aliases. An entry can be a
+language label such as `java` or `cpp`, the alias `c++` or `c#`, or a file
+extension that one language owns, such as `py` or `tsx`. A label or extension
+ignores case, a leading dot, `-`, and `_`. The family aliases `jvm` and `js-ts`
+must be written exactly. An unknown entry fails to load with
+`invalid-language-label`. Tags, display names, and inferred identities are not
+accepted. The [languages reference](/reference/languages/) lists every label
+and extension. Shared RQL
 defines `jvm` as exactly `[java kotlin scala]` and `js-ts` as exactly
 `[javascript typescript]`. Alias expansion is concrete before composition:
 `[jvm java]` and `[js-ts typescript]` deduplicate their members instead of
@@ -658,9 +811,9 @@ silent addition.
 
 There is no separate `tsx` analyzer language. The `typescript` label covers both
 `.ts` and TSX-bearing `.tsx` source, while `javascript` covers `.js`, `.mjs`,
-`.cjs`, and JSX-bearing `.jsx` source. Those ownership boundaries do not turn a
-filename, policy tag, workspace listing, or qualified name into language
-inference.
+`.cjs`, and JSX-bearing `.jsx` source, so `tsx` names `typescript`. The label
+selects files by the language that owns their extension. Bifrost does not infer
+a language from a policy tag, a workspace listing, or a qualified name.
 
 The shared language and path constraints are conjoined outer constraints. A
 selector with no local language or path scope inherits the analysis scope. A
@@ -773,6 +926,17 @@ role, exact opaque categories, one selector, and one binding. Bindings can name
 the matched value, receiver, return value, or an argument by zero-based index or
 formal name. Optional taint semantics declare source labels/evidence or sink
 accepted labels; they still do not make the endpoint a diagnostic.
+
+Taint source entries may also carry `:threat-model` with one of `remote`,
+`commandargs`, `environment`, `stdin`, `file`, or `database`. A taint analysis
+may select its active kinds with `:threat-models [KIND ...]`; when the field is
+omitted, the analysis selects `[remote]`. A source without `:threat-model` is
+active for every selection, which keeps policy-local sources compatible with
+older policies. A classified source whose kind is outside the active set is
+excluded before plan compilation. If that filtering removes every source, the
+run is incomplete and includes a typed run-incomplete diagnostic rather than
+reporting a clean empty result. The selected kind is retained beside the source
+identity and display name in taint finding evidence.
 
 <!-- policy-doc-test:rqlp:tests/fixtures/policies/endpoints/http-request-parameter.rqlp -->
 ```lisp
@@ -925,9 +1089,10 @@ bifrost --root . \
   --fail-on warning
 ```
 
-The same policy file is accepted by MCP `run_policy` in `policy_files` and by
-the LSP `bifrost/runPolicy` request. Both routes resolve the imported path
-relative to the workspace root. A second policy can import the same document;
+MCP `run_policy` accepts the same policy file in `policy_files` and resolves
+the imported path relative to the workspace root. Editors run policies through
+the separate `bifrost-lsp` program, which sends a `bifrost/runPolicy` request;
+see [LSP Server](/lsp/). A second policy can import the same document;
 each policy retains its own finding identity while the report records the
 shared document's source, entry identities, and semantic hash; the resolved
 entries retain their analysis projection hashes and endpoint-set provenance.
@@ -949,8 +1114,12 @@ dependency.
 | `match` | One inline or file-backed RQL selector returning supported, location-bearing terminal results. | Executable. |
 | `taint` | Set-oriented sources, sinks, sanitizers, transforms, external models, and optional finding combinations. | Executes the production compiler, compatible batch planner, solver, retained report, and human/JSON/SARIF projection. |
 | `typestate` | Tracked subjects, typed events, deterministic transitions, uncertainty rules, and terminal expectations. | Executes query-local semantic bindings and emits production findings with stable identity, primary/related locations, bounded witnesses, and completeness metadata. |
-| `assertion` | Either a subject selector that captures identifier tokens plus one or more `assert`, `assert-resolution`, `assert-binding-scope`, `assert-value-origin`, `assert-boundary`, `assert-canonical`, `assert-route`, or `assert-round-trip` invariants about the [occurrence](/rune-query-language/) each captured token carries and about how it resolved; or a relational plan of `bind`, `join`, `group`, and `assert` records over typed rows. | Executes. Correlates captures to occurrence, candidate, and binding rows by AST identity and emits one multi-location finding per violated invariant or violated row group. |
+| `assertion` | Either a subject selector that captures identifier tokens plus one or more specialized invariants about the [occurrence](/rune-query-language/) each captured token carries and about how it resolved (`assert`, `assert-resolution`, `assert-binding-scope`, `assert-value-origin`, `assert-origin-shape`, `assert-boundary`, `assert-generation`, `assert-declaration-state`, `assert-edge-parity`, `assert-edge-class`, `assert-canonical`, `assert-route`, `assert-round-trip`, `assert-flow-establishment`, or `assert-rewrite-termination`); or a relational plan of `bind`, `join`, `group`, `aggregate`, `assert`, and `assert-selected-in-winning-tier` records over typed rows. | Executes. Correlates captures to occurrence, candidate, and binding rows by AST identity and emits one multi-location finding per violated invariant or violated row group. |
 | `flow` | Neutral origins, observations, kills, and policy-local transforms over typed value-flow ports. | Executes bounded value-flow propagation. Uncertain or unbindable typed ports remain incomplete rather than producing a clean verdict. |
+
+The [policy reference](/reference/policies/#rqlp-vocabulary) lists every
+record and field of each analysis type, with its signature, whether it is
+required, and its legal values.
 
 ### Taint: broad libraries, specific findings
 
@@ -1504,6 +1673,17 @@ the right relation was truncated or partly unreadable, its output rows exist
 only because nothing was found to remove them, so they support no verdict and
 the run reports an unmet obligation instead of a clean pass.
 
+A join never pairs programming-code rows with configuration rows. Equal
+spellings, equal paths, or two rows in one repository prove no relation, so a
+plan that joins a code binding to a `configuration-facts` binding fails at load
+time. Correlate them inside one selector with the registered `correlate`
+operator, which pairs a code row with a configuration fact only through a
+structural relation, or require both with `require-both`, which pairs nothing.
+A `cross_domain` binding produced by either operator may join a
+`configuration-facts` binding on `configuration_id`, which is that fact's own
+stable `id`. See [Code And Configuration
+Correlation](/code-query-json/#code-and-configuration-correlation).
+
 ##### Aggregates
 
 The aggregate operations are `count`, `count-distinct`, `min`, `max`, `any`,
@@ -1667,7 +1847,7 @@ excluded.
 #### A worked loop-invariance rule
 
 The rule below is the reason `assert-value-origin` exists, and it is the one the
-built-in `bifrost.code-smells` pack ships. A structural rule that only asks "is
+external `bifrost.code-smells` pack contains. A structural rule that only asks "is
 this call written inside a loop" cannot tell a collection built inside the loop
 and canonicalized once from a collection built before the loop and re-sorted on
 every pass; the second is the waste worth reporting and the first is not. The
@@ -1953,50 +2133,144 @@ Typestate terminal obligations:
 
 ## An Executable P0 Walkthrough
 
-Everything below runs from a checked-in fixture directory,
-`tests/fixtures/policy-substrate-p0/`. Two reference policies exercise the
-whole substrate: exact semantic selection, policy-authored value flow,
-declarative effects, bounded relational assertions, explicit behaviour when
-analysis is incomplete, and one canonical report behind the human, JSON, SARIF,
-CLI, and MCP surfaces.
+This walkthrough uses two reference policies to show the whole policy
+substrate: exact semantic selection, policy-authored value flow, declarative
+effects, bounded relational assertions, explicit behavior when analysis is
+incomplete, and one canonical report behind the human, JSON, SARIF, CLI, and
+MCP surfaces.
 
-Neither policy needs new analyzer code. Each is a `.rqlp` document; the second
+Neither policy needs new analyzer code. Each is a `.rqlp` document. The second
 also needs one reviewed semantic model, which is data as well.
 
-### The fixture directory
+### The example workspaces
+
+Every example below is a small workspace that you can create from the sources
+on this page. Reference policy A uses this layout:
 
 ```text
-tests/fixtures/policy-substrate-p0/
-  policies/
-    acme-validated-value-reaches-store.rqlp         reference policy A (Java)
-    acme-validated-value-reaches-store-python.rqlp  reference policy A (Python)
-    acme-validated-value-reaches-store-typescript.rqlp  reference policy A (TypeScript)
-    acme-pure-has-no-network-io.rqlp                reference policy B
-  semantic-models/
-    acme-http-client.json                           the reviewed effect model
-  flow/java/api/AcmeApi.java                        the exact APIs and the near miss
-  flow/java/finding/App.java                        one proven violating path
-  flow/java/clean/App.java                          validated directly and through a helper
-  flow/java/unreliable/App.java                     an unresolvable wrapper
-  flow/python/api.py                                the same APIs and near miss, `@final`
-  flow/python/finding_app.py                        one proven violating path
-  flow/python/clean_app.py                          validated directly, plus the near miss
-  flow/python/inconclusive_app.py                   the two shapes Python cannot conclude
-  flow/typescript/api.ts                            the same APIs and near miss, private constructors
-  flow/typescript/finding_app.ts                    one proven violating path
-  flow/typescript/clean_app.ts                      validated directly, plus the near miss
-  flow/typescript/inconclusive_app.ts               the two shapes TypeScript cannot conclude
-  effects/java/api/                                 the @Pure marker and the modeled API
-  effects/java/finding/App.java                     a direct and a transitive effect
-  effects/java/clean/App.java                       a proven-clean call graph
-  effects/java/unreliable/App.java                  an unresolvable callee
-  effects/java/deferred/App.java                    a declared deferred effect
+acme-flow/
+  policies/acme-validated-value-reaches-store.rqlp   reference policy A, shown below
+  src/AcmeApi.java                                   the exact APIs and the near miss
+  src/App.java                                       one of the three App.java variants
 ```
 
-The acceptance tests are `tests/suite_bench_policy/policy_substrate_p0.rs`
-(library surfaces), `tests/suite_bench_policy/policy_substrate_p0_cli.rs`
-(CLI), and `crates/bifrost-mcp/tests/bifrost_mcp_policy_substrate_p0.rs`
-(MCP `run_policy`).
+Create one workspace for each `App.java` variant, because the three variants
+declare the same class. Run the policy from any directory:
+
+```sh
+bifrost --root acme-flow --policy-file policies/acme-validated-value-reaches-store.rqlp
+```
+
+`src/AcmeApi.java` declares the source, the validator, the exact API, and a
+near-miss class with a method of the same name:
+
+```java
+package com.acme;
+
+/** The value origin reference policy A tracks. */
+public final class AcmeSource {
+    public static String read() {
+        return "raw";
+    }
+}
+
+/** The only procedure that may establish a value for AcmeStore.put. */
+public final class AcmeValidator {
+    public static String validate(String value) {
+        return value;
+    }
+}
+
+/** The exact API reference policy A observes. */
+public final class AcmeStore {
+    public void put(String value) {
+    }
+}
+
+/**
+ * The near miss. `AcmeCache.put(String)` shares the member name `put` with
+ * `AcmeStore.put(String)` and is otherwise unrelated. Exact selection means
+ * no finding ever attaches to a call of this method.
+ */
+public final class AcmeCache {
+    public void put(String value) {
+    }
+}
+```
+
+<details>
+<summary>The three <code>src/App.java</code> variants</summary>
+
+The violating variant stores an unvalidated value:
+
+```java
+package com.acme;
+
+public final class App {
+    void storesAnUnvalidatedValue(AcmeStore store, AcmeCache cache) {
+        String value = AcmeSource.read();
+        // The near miss: the same member name on an unrelated class. Reference
+        // policy A must not report this line.
+        cache.put(value);
+        // The violation: an unvalidated value reaches the exact API.
+        store.put(value);
+    }
+}
+```
+
+The clean variant validates directly and through a helper, and stores an
+unvalidated value only in the near-miss class:
+
+```java
+package com.acme;
+
+public final class App {
+    /** Directly validated: the kill runs on the value's own path. */
+    void storesADirectlyValidatedValue(AcmeStore store) {
+        String value = AcmeValidator.validate(AcmeSource.read());
+        store.put(value);
+    }
+
+    /** Validated through a workspace helper: the kill runs interprocedurally. */
+    void storesAHelperValidatedValue(AcmeStore store) {
+        String value = AcmeSource.read();
+        store.put(validated(value));
+    }
+
+    static String validated(String value) {
+        return AcmeValidator.validate(value);
+    }
+
+    /**
+     * An unvalidated value reaching the near-miss class. The tree stays clean,
+     * which is the second half of the exact-selection proof.
+     */
+    void fillsAnUnrelatedCache(AcmeCache cache) {
+        cache.put(AcmeSource.read());
+    }
+}
+```
+
+The unreliable variant passes the value through a wrapper that the workspace
+does not declare:
+
+```java
+package com.acme;
+
+public final class App {
+    /**
+     * The wrapper is not resolvable in this workspace, so the value's path
+     * through it is unknown. No spelling of reference policy A may report this
+     * tree as clean.
+     */
+    void storesThroughAnUnresolvedWrapper(AcmeStore store) {
+        String value = AcmeSource.read();
+        store.put(AcmeUnknownWrapper.wrap(value));
+    }
+}
+```
+
+</details>
 
 ### Reference policy A: a validated value reaches an exact API
 
@@ -2099,35 +2373,169 @@ Three things make this exact rather than name-shaped:
 3. `(call-sites-to :proof proven ...)` returns only call sites the definition
    resolver bound to that declaration.
 
-The fixture tree contains `AcmeCache.put(String)`, a same-named member of an
-unrelated class. Run the policy over `flow/java/finding/App.java`, which calls
-both:
+`src/AcmeApi.java` also declares `AcmeCache.put(String)`, a same-named member
+of an unrelated class. The violating `App.java` calls both. Run:
 
 ```sh
-bifrost --policy-file policies/acme-validated-value-reaches-store.rqlp
+bifrost --root acme-flow --policy-file policies/acme-validated-value-reaches-store.rqlp
 ```
 
-One finding, on `store.put(value)`, exit status 1, completion `complete`. No
-finding attaches to `cache.put(value)`.
+The report has one finding, on `store.put(value)`. The exit status is 1 and the
+completion is `complete`. No finding attaches to `cache.put(value)`.
 
-Over `flow/java/clean/App.java` — one value validated directly, one validated
-through a workspace helper, and an unvalidated value stored in the near-miss
-class — the same command exits 0 with completion `complete`. That clean verdict
-is the kill's doing: delete the `:kills` block and both validated flows are
-reported.
+With the clean `App.java`, which validates one value directly and one through a
+workspace helper and stores an unvalidated value only in the near-miss class,
+the same command exits 0 with completion `complete`. The kill makes that
+result clean: delete the `:kills` block and both validated flows are reported.
 
-Over `flow/java/unreliable/App.java`, where an unresolvable wrapper sits between
-the origin and the observation, the run exits 2 under both
+With the unreliable `App.java`, an unresolvable wrapper sits between the origin
+and the observation. The run exits 2 with completion `inconclusive` under both
 `:unmodeled paranoid` and `:unmodeled require-model`. An unresolved call is
-never a clean verdict.
+never a clean result.
 
 #### The same policy on Python
 
-`acme-validated-value-reaches-store-python.rqlp` is the same document with
-`(language python)` and the same `:proof proven` on every endpoint. It reaches
-the same verdicts over `flow/python/`: exit 1 with one finding on
-`store.put(value)` and none on the near-miss `cache.put(value)`, and exit 0 on
-the validated tree.
+The Python edition is the same document with its own `:id`
+(`bifrost.p0.acme-validated-value-reaches-store-python`) and
+`(language python)` in each of the three selectors. Save it as
+`policies/acme-validated-value-reaches-store-python.rqlp` in a workspace that
+holds `api.py` and one of the app files below. It reaches the same results:
+exit 1 with one finding on `store.put(value)` and none on the near-miss
+`cache.put(value)`, and exit 0 on the validated tree.
+
+<details>
+<summary>The Python sources</summary>
+
+`api.py`:
+
+```python
+"""The Python edition of reference policy A's API tree.
+
+Every class is `@final`. That is not decoration: PEP 591 is Python's own
+closed-dispatch declaration, and it is what lets `store.put(value)` name one
+exact target instead of "this member or any override a subclass may add". The
+Java edition spells the same claim `public final class`. Drop the decorator and
+the tree stays correct, but every run over it becomes inconclusive.
+"""
+
+from typing import final
+
+
+@final
+class AcmeSource:
+    """The value origin reference policy A tracks."""
+
+    @staticmethod
+    def read():
+        return "raw"
+
+
+@final
+class AcmeValidator:
+    """The only procedure that may establish a value for AcmeStore.put."""
+
+    @staticmethod
+    def validate(value):
+        return value
+
+
+@final
+class AcmeStore:
+    """The exact API reference policy A observes."""
+
+    def put(self, value):
+        pass
+
+
+@final
+class AcmeCache:
+    """The near miss.
+
+    `AcmeCache.put` shares the member name `put` with `AcmeStore.put` and is
+    otherwise unrelated. Exact selection means no finding ever attaches to a
+    call of this method.
+    """
+
+    def put(self, value):
+        pass
+```
+
+`finding_app.py`:
+
+```python
+from api import AcmeCache, AcmeSource, AcmeStore
+
+
+def stores_an_unvalidated_value(store: AcmeStore, cache: AcmeCache):
+    value = AcmeSource.read()
+    # The near miss: the same member name on an unrelated class. Reference
+    # policy A must not report this line.
+    cache.put(value)
+    # The violation: an unvalidated value reaches the exact API.
+    store.put(value)
+```
+
+`clean_app.py`:
+
+```python
+from api import AcmeCache, AcmeSource, AcmeStore, AcmeValidator
+
+
+def stores_a_directly_validated_value(store: AcmeStore):
+    """Directly validated: the kill runs on the value's own path."""
+    value = AcmeValidator.validate(AcmeSource.read())
+    store.put(value)
+
+
+def fills_an_unrelated_cache(cache: AcmeCache):
+    """An unvalidated value reaching the near-miss class.
+
+    The tree stays clean, which is the second half of the exact-selection
+    proof.
+    """
+    cache.put(AcmeSource.read())
+```
+
+`inconclusive_app.py`:
+
+```python
+"""Two Python shapes that keep the combined run open while it still decides.
+
+The keyword call is an exact finding through semantic call bindings. The
+helper-validated call is not a finding, and cannot be one: its origin read
+reaches a static method through an instance, which the adapter's attribute
+resolution does not prove, so the value is never tracked from the origin. The
+run reports the keyword violation and stays open rather than reading as clean.
+"""
+
+from api import AcmeSource, AcmeStore, AcmeValidator
+
+
+def stores_an_unvalidated_value_by_name(store: AcmeStore):
+    """A keyword actual binds directly to the semantic formal named `value`."""
+    value = AcmeSource.read()
+    store.put(value=value)
+
+
+def stores_a_helper_validated_value(store: AcmeStore):
+    """A helper-carried kill whose origin read the adapter cannot prove.
+
+    `read` is declared `@staticmethod`, so `source.read()` is an instance
+    attribute read whose resolution is not proven and whose value therefore
+    never enters the tracked flow. The run stays incomplete with a
+    `partial_discovery` reason instead of reporting the value as established.
+    The same helper shape over the proven `AcmeSource.read()` origin concludes.
+    """
+    source = AcmeSource()
+    value = validated(source.read())
+    store.put(value)
+
+
+def validated(value):
+    return AcmeValidator.validate(value)
+```
+
+</details>
 
 Two facts have to hold for that, and both are visible in the source:
 
@@ -2143,17 +2551,187 @@ Two facts have to hold for that, and both are visible in the source:
    subclass could override `put`, so the resolved member is not proven to be
    the complete target set.
 
-Two Python shapes still exit 2, and `flow/python/inconclusive_app.py` carries
-both: a keyword actual (`store.put(value=value)`), which has no formal to map
-onto as a value-flow input, and a kill that runs inside a workspace helper
-rather than on the observed value's own path.
+`inconclusive_app.py` exits 2. Its keyword call `store.put(value=value)`
+binds the formal named `value` exactly and is reported as a definite finding.
+Its second function reads the origin as `source.read()` on an instance of
+`AcmeSource`. That read reaches a static method through an instance, which the
+Python adapter does not prove, so the value is never tracked from the origin.
+The run reports the keyword finding and stays `inconclusive` with reason
+`partial_discovery` rather than reading as clean.
 
 #### The same policy on TypeScript
 
-`acme-validated-value-reaches-store-typescript.rqlp` is again the same document
-with `(language typescript)`, and it reaches the same verdicts over
-`flow/typescript/`: exit 1 with one finding on `store.put(value)` and none on
-the near-miss `cache.put(value)`, and exit 0 on the validated tree.
+The TypeScript edition is again the same document, with the `:id`
+`bifrost.p0.acme-validated-value-reaches-store-typescript` and
+`(language typescript)` in each selector. Over a workspace with `api.ts` and
+one app file it reaches the same results: exit 1 with one finding on
+`store.put(value)` and none on the near-miss `cache.put(value)`, and exit 0 on
+the validated tree.
+
+<details>
+<summary>The TypeScript sources</summary>
+
+`api.ts`:
+
+```ts
+// The TypeScript edition of reference policy A's API tree.
+//
+// Every class declares a `private constructor`. That is not decoration: a
+// private constructor is TypeScript's own statement that the class cannot be
+// extended (`class D extends AcmeStore` refuses to compile), so no subclass,
+// and therefore no override, exists. It is what lets `store.put(value)` name
+// one exact target instead of "this member or any override a subclass may
+// add". The Java edition spells the same claim `public final class`; the
+// Python edition spells it `@final`. Make the constructors public and the
+// tree stays correct, but every run over it becomes inconclusive.
+
+export class AcmeSource {
+  private constructor() {}
+
+  /** The value origin reference policy A tracks. */
+  static read(): string {
+    return "raw";
+  }
+}
+
+export class AcmeValidator {
+  private constructor() {}
+
+  /** The only procedure that may establish a value for AcmeStore.put. */
+  static validate(value: string): string {
+    return value;
+  }
+}
+
+export class AcmeStore {
+  private constructor() {}
+
+  /** The exact API reference policy A observes. */
+  put(value: string): void {}
+}
+
+/**
+ * The near miss.
+ *
+ * `AcmeCache.put` shares the member name `put` with `AcmeStore.put` and is
+ * otherwise unrelated. Exact selection means no finding ever attaches to a
+ * call of this method.
+ */
+export class AcmeCache {
+  private constructor() {}
+
+  put(value: string): void {}
+}
+```
+
+`finding_app.ts`:
+
+```ts
+import { AcmeCache, AcmeSource, AcmeStore } from "./api";
+
+export function storesAnUnvalidatedValue(store: AcmeStore, cache: AcmeCache): void {
+  const value = AcmeSource.read();
+  // The near miss: the same member name on an unrelated class. Reference
+  // policy A must not report this line.
+  cache.put(value);
+  // The violation: an unvalidated value reaches the exact API.
+  store.put(value);
+}
+```
+
+`clean_app.ts`:
+
+```ts
+import { AcmeCache, AcmeSource, AcmeStore, AcmeValidator } from "./api";
+
+/** Directly validated: the kill runs on the value's own path. */
+export function storesADirectlyValidatedValue(store: AcmeStore): void {
+  const value = AcmeValidator.validate(AcmeSource.read());
+  store.put(value);
+}
+
+/**
+ * An unvalidated value reaching the near-miss class.
+ *
+ * The tree stays clean, which is the second half of the exact-selection
+ * proof.
+ */
+export function fillsAnUnrelatedCache(cache: AcmeCache): void {
+  cache.put(AcmeSource.read());
+}
+
+/**
+ * A TypeScript annotation states a structural contract, not the nominal owner
+ * of the initializer. The exact AcmeCache value must keep its own `put` target
+ * rather than borrowing AcmeStore.put from the compatible annotation.
+ */
+export function fillsAnUnrelatedCacheThroughStoreShapedBinding(cache: AcmeCache): void {
+  const store: AcmeStore = cache;
+  store.put(AcmeSource.read());
+}
+```
+
+`structural_receiver_app.ts`:
+
+```ts
+// The structural-receiver shape reference policy A cannot prove, by itself.
+//
+// This file is the only region in its fixture: there is no workspace helper
+// and no kill on any path. `policy_substrate_p0.rs` pins what the run reports
+// for it, so a change to the helper region's handling cannot change this
+// result.
+
+import { AcmeSource } from "./api";
+
+/**
+ * A structurally-typed receiver keeps the target set open.
+ *
+ * `StoreLike` is satisfied by any object with a matching `put`, so the call
+ * has no exact target: no proven row exists for `AcmeStore.put`.
+ */
+interface StoreLike {
+  put(value: string): void;
+}
+
+export function storesThroughAStructuralType(store: StoreLike): void {
+  store.put(AcmeSource.read());
+}
+```
+
+`helper_kill_app.ts`:
+
+```ts
+// The helper-kill shape reference policy A still cannot conclude about.
+//
+// The kill that validates the value runs inside a workspace helper rather than
+// on the observed path. The run stays inconclusive rather than clean, and the
+// finding does not attach to the near-miss class. This file is its own
+// fixture, so a change that carries the helper's return across the call
+// changes only this shape's result.
+//
+// `policy_substrate_p0.rs` pins this shape. The structural-receiver shape is
+// pinned separately in `structural_receiver_app.ts`.
+
+import { AcmeSource, AcmeStore, AcmeValidator } from "./api";
+
+/**
+ * A kill that runs inside a workspace helper rather than on this path.
+ *
+ * The Java edition concludes on the same shape. The TypeScript edition does
+ * not yet, so the run stays inconclusive instead of reporting the value as
+ * established.
+ */
+export function storesAHelperValidatedValue(store: AcmeStore): void {
+  const value = validated(AcmeSource.read());
+  store.put(value);
+}
+
+function validated(value: string): string {
+  return AcmeValidator.validate(value);
+}
+```
+
+</details>
 
 The same two facts carry it. The receiver's type is evident at the call — an
 annotated parameter (`store: AcmeStore`), a `const` assigned exactly one
@@ -2166,9 +2744,13 @@ which is what the fixture classes declare. Make the constructors public and
 the same tree reports the same finding but refuses the clean verdict, exactly
 as Java without `final` and Python without `@final` would.
 
-Two TypeScript shapes still exit 2, and `flow/typescript/inconclusive_app.ts`
-carries both: a receiver typed by a structural interface, whose implementation
-set no declaration closes, and the same helper-run kill as Python.
+The two shapes still left open are split into one fixture each.
+`structural_receiver_app.ts` holds a receiver typed by a structural interface,
+whose implementation set no declaration closes. Its run completes with no
+finding and one advisory `empty_selection` diagnostic, because the receiver
+binds no proven `AcmeStore.put` call. `helper_kill_app.ts` holds a kill that
+runs inside a workspace helper rather than on the stored value's own path. Its
+run stays `inconclusive` with reason `partial_discovery`.
 
 ### Binding the actual passed to a named formal
 
@@ -2203,10 +2785,10 @@ actual coverage. Those guarantees are why `call-input :parameter-name` is not
 an equivalent endpoint selector: `call-input` projects the expression site and
 does not retain the call-binding proof row.
 
-Over the Java tree it returns one row, the operand of `store.put(value)`. Over
-the Python tree it returns the operand of both `store.put(value)` and
-`store.put(value=value)`, so a named call binds formal `value` the same way a
-positional one does.
+Over the violating Java workspace it returns one row, the operand of
+`store.put(value)`. Over a Python workspace that contains both
+`store.put(value)` and `store.put(value=value)`, it returns both operands, so a
+named call binds formal `value` the same way a positional one does.
 
 Reference policy A binds the same formal directly, as a value-flow port:
 
@@ -2215,20 +2797,12 @@ Reference policy A binds the same formal directly, as a value-flow port:
 ```
 
 The port resolves the name against the selected call's own caller/callee
-binding, so it names the operand of formal `value` in either syntax. It reads
-two sources. The dispatch-aware binding relation is the authoritative one: it
-maps a positional actual to the formal ordinal the resolved target declares.
-That relation records only that an actual is a keyword argument, not which
-keyword, so a keyword call falls back to the structural actual-to-formal
-relation above, which reads the label from the call's own syntax; a binding
-taken from it is complete only up to that relation. Both editions of reference
-policy A use the port, and `issue_2496_named_flow_port.rs` pins that
-`(argument :name "value")` and `(argument :index 0)` report the same sites, and
-reach the same verdict, on every fixture tree. Every call in the Python
-verdict trees is positional, so the named spelling takes the authoritative
-route and keeps the complete clean verdict those trees earn; the keyword actual
-in `flow/python/inconclusive_app.py` takes the structural one, and the run
-reports that rather than concluding.
+binding, so it names the operand of formal `value` whether the call passes it
+by position or by keyword. Both editions of reference policy A use the port.
+`(argument :name "value")` and `(argument :index 0)` report the same sites and
+reach the same result on every example workspace above. The keyword call in
+`inconclusive_app.py` is reported as a definite finding through the same
+binding.
 
 The ordinal a name resolves to is the callee's, not the call's. Python declares
 its receiver, `self`, in the parameter list, and the lowering that mints formal
@@ -2287,7 +2861,7 @@ API identity:
     "toolchains": []
   },
   "provenance": {
-    "source": "tests/fixtures/policy-substrate-p0",
+    "source": "acme-platform",
     "revision": "reviewed"
   },
   "license": "Apache-2.0",
@@ -2349,7 +2923,7 @@ API identity:
 }
 ```
 
-Then the policy:
+Save it as `.bifrost/semantic-models/acme-http-client.json`. Then the policy:
 
 <!-- policy-doc-test:rqlp:tests/fixtures/policy-substrate-p0/policies/acme-pure-has-no-network-io.rqlp -->
 ```lisp
@@ -2441,17 +3015,150 @@ with the exact source call and every transitive call edge before it publishes
 returns," so it composes as `same_invocation`, not the stronger
 `same_evaluation` claim.
 
-Over `effects/java/finding/App.java` the policy reports two findings — the
-direct call at depth 1 and the helper call at depth 2 — and exits 1. The same
-helper without the marker is not reported, and neither is a marked procedure
-whose whole reachable call graph is analyzed and clean.
+Reference policy B uses this workspace layout:
 
-Over `effects/java/clean/App.java` the run exits 0 with completion `complete`,
-because the effect relation's coverage is `exhaustive` and the absence claim is
+```text
+acme-effects/
+  .bifrost/semantic-models/acme-http-client.json   the reviewed model above
+  policies/acme-pure-has-no-network-io.rqlp        reference policy B
+  src/com/acme/Pure.java                           the @Pure marker
+  src/com/acme/AcmeHttpClient.java                 the modeled API
+  src/com/acme/App.java                            one of the App.java variants
+```
+
+```sh
+bifrost --root acme-effects --policy-file policies/acme-pure-has-no-network-io.rqlp
+```
+
+<details>
+<summary>The Java sources for reference policy B</summary>
+
+`src/com/acme/Pure.java`:
+
+```java
+package com.acme;
+
+/**
+ * The purity marker reference policy B joins on. The policy matches the
+ * annotation's written name through the shared `decorators` role, so nothing
+ * about this declaration is load-bearing beyond its name.
+ */
+public @interface Pure {
+}
+```
+
+`src/com/acme/AcmeHttpClient.java`:
+
+```java
+package com.acme;
+
+/**
+ * The exact API the workspace semantic model annotates with the namespaced
+ * effect `acme.network_io`.
+ */
+public final class AcmeHttpClient {
+    /** Declared with timing `immediate`. */
+    public String send(String url) {
+        return url;
+    }
+
+    /** Declared with timing `deferred`. */
+    public String sendLater(String url) {
+        return url;
+    }
+}
+```
+
+The violating `src/com/acme/App.java`:
+
+```java
+package com.acme;
+
+public final class App {
+    /** Direct: depth 1, classification `direct`. A finding. */
+    @Pure
+    void pureCallsTheApiDirectly(AcmeHttpClient client) {
+        client.send("https://example.test");
+    }
+
+    /** Transitive: depth 2, classification `transitive`. A finding. */
+    @Pure
+    void pureCallsTheApiThroughAHelper(AcmeHttpClient client) {
+        relay(client);
+    }
+
+    static void relay(AcmeHttpClient client) {
+        client.send("https://example.test");
+    }
+
+    /** The same helper, no marker. The policy joins on the marker, so no finding. */
+    void unannotatedCallsTheHelper(AcmeHttpClient client) {
+        relay(client);
+    }
+
+    /** A marked procedure whose whole reachable call graph is analyzed and clean. */
+    @Pure
+    void pureCallsAProvenCleanHelper() {
+        leaf();
+    }
+
+    static void leaf() {
+    }
+}
+```
+
+The clean `src/com/acme/App.java`:
+
+```java
+package com.acme;
+
+public final class App {
+    /**
+     * Every callee below this marked procedure is a workspace procedure with a
+     * readable body and no declared effect, so the effect relation's coverage
+     * is exhaustive and the absence claim is provable.
+     */
+    @Pure
+    void pureCallsAProvenCleanHelper() {
+        leaf();
+    }
+
+    static void leaf() {
+    }
+}
+```
+
+The unreliable `src/com/acme/App.java`:
+
+```java
+package com.acme;
+
+public final class App {
+    /**
+     * The gateway is not resolvable in this workspace, so the effect set below
+     * this marked procedure is open. The zero-cardinality claim becomes an
+     * unmet obligation rather than a clean verdict.
+     */
+    @Pure
+    void pureCallsAnUnresolvedTarget(Object gateway) {
+        AcmeUnknownGateway.dispatch(gateway);
+    }
+}
+```
+
+</details>
+
+With the violating `App.java`, the policy reports two findings, the direct
+call at depth 1 and the helper call at depth 2, and exits 1. The same helper
+without the marker is not reported, and neither is a marked procedure whose
+whole reachable call graph is analyzed and clean.
+
+With the clean `App.java`, the run exits 0 with completion `complete`, because
+the effect relation's coverage is `exhaustive` and the absence claim is
 therefore provable.
 
-Over `effects/java/unreliable/App.java` the run exits 2 and publishes the
-blocked claim as data:
+With the unreliable `App.java`, the run exits 2 and publishes the blocked
+claim as data:
 
 ```json
 {
@@ -2500,19 +3207,20 @@ feed one activation, so a workspace can use either or both:
 
 | Route | Location | Opt-in | Activated by |
 | --- | --- | --- | --- |
-| Reviewed workspace models | `.bifrost/semantic-models/*.json` and `*.yaml` | the directory exists | `bifrost --policy-file`, and the MCP host with `BIFROST_WORKSPACE_SEMANTIC_MODELS=on` |
-| Installed catalog | the catalog `.bifrost/packs.json` names | the document configures ecosystems; an absent document uses the ambient default | `bifrost --policy-file`, the LSP host, and the MCP host |
+| Reviewed workspace models | `.bifrost/semantic-models/*.json`, `*.yaml`, and `*.yml` | the directory exists | CLI policy runs without `--sources` (`--policy`, `--policy-file`, and `bifrost scan`); `SearchToolsService` sessions only with `BIFROST_WORKSPACE_SEMANTIC_MODELS=on` |
+| Installed catalog | the catalog `.bifrost/packs.json` names | the document configures ecosystems; an absent document uses the ambient default | CLI policy runs and every `SearchToolsService` session: the MCP server, one-shot `--tool` and `--query-file` runs, a policy run with `--sources`, and the Rust and Python libraries |
 
 Use the reviewed workspace route for a model you write and check in beside your
-policies. Put the file in `.bifrost/semantic-models/`, commit it, and
-`bifrost --policy-file` activates it. You need no packs document and no catalog
-install. Reference policy B runs this way, and
-`policy_substrate_p0_cli.rs` pins the outcome.
+policies. Put the file in `.bifrost/semantic-models/`, commit it, and a CLI
+policy run activates it. You need no packs document and no catalog
+install. Reference policy B runs this way.
 
 Use the installed catalog for a pack that ships with a dependency. The shared
-packs document names the catalog and dependency ecosystems, while an absent
-document uses an ephemeral catalog and the ecosystems serving languages in the
-workspace. An empty `ecosystems` array explicitly disables that route.
+packs document names the catalog and dependency ecosystems. An absent
+document uses the default catalog and the ecosystems that serve the languages
+in the workspace. The default catalog is in the Bifrost cache directory, or in
+memory when the analyzer keeps no persisted cache. The
+[semantic pack reference](/reference/semantic-packs/) gives the exact rule. An empty `ecosystems` array explicitly disables that route.
 Activation evidence comes from dependency discovery and remains subject to
 compatibility and review gates.
 
@@ -2579,12 +3287,63 @@ bounded witness paths a flow finding publishes. `explain_candidate` serves
 complete binding query it is absent from. Row-local RQL filters and projections
 execute as part of that binding query and are not a second policy-level replay
 stage. Joins, group keys, and aggregates are still not replayed, so a candidate
-that survives every binding is `unknown`, never `satisfied`. The families
-`why-not` does not serve — `flow`, `taint`, and `typestate` — are refused with
-an explicit adapter-unavailable answer that names the supported analysis types.
-`why-not` over a flow or taint policy is not a projection of anything the run
-retained: it needs candidate-specific solver queries, and it is designed
-separately.
+that survives every binding is `unknown`, never `satisfied`. `typestate`
+`why-not` is refused with an explicit adapter-unavailable answer that names the
+supported analysis types.
+
+### Explaining a flow or taint candidate
+
+A flow or taint finding is a value that enters at one site and is observed at
+another, so its `why-not` candidate is a pair: the **source** position (a flow
+origin or a taint source) and the **observation** position (a flow observation
+or a taint sink). `explain_flow_candidate` takes the pair, and each position
+resolves, under the same containment rule a `match` candidate uses, to the
+innermost site that a compiled endpoint of that role binds. A single position
+is refused for these families, and a source position is refused for `match`
+and `assertion`, so a question is never silently answered about a different
+value.
+
+Nothing the run retained answers this question, so the explanation runs the
+production pipeline itself: the ordinary taint compiler, then the ordinary
+solver over only the analysis regions that bind both sites, under the one
+workspace generation and semantic-model snapshot pinned for the question. The
+tree has one stage per step, in order:
+
+| Stage | `satisfied` | `failed` |
+| --- | --- | --- |
+| `origin_endpoint` / `source_endpoint` | an endpoint binds the source position | no endpoint binds it, and every endpoint selector finished |
+| `observation_endpoint` / `sink_endpoint` | an endpoint binds the observation position | no endpoint binds it, and every endpoint selector finished |
+| `analysis_region` | a compiled region binds both sites | no region binds both, and no region was skipped or refused |
+| `propagation` | the solver reaches the observation, and the policy reports the finding | the candidate regions solved to a fixed point with complete coverage, and no path reaches the observation |
+| `kill_attribution` / `sanitizer_attribution` | with the policy's kills removed, the same route reaches the observation, and every retained path passes a declared kill | with the kills removed, the observation is still unreached |
+
+A reached candidate names the finding an ordinary run reports, with the same
+identity, retained witnesses, certainty, proof, and completeness. Over
+reference policy A's clean tree, the helper-validated value explains as
+`failed` at `propagation`, and `kill_attribution` names `acme-validate` at the
+exact `AcmeValidator.validate(value)` call inside the helper, with the
+counterfactual path that passes it. The kill is matched to that path by
+program-point identity, not by location text. The near-miss `cache.put` call
+fails at `observation_endpoint`.
+
+Every analysis limit is `unknown`, never `failed`, and is published as a
+`boundary:<kind>` child that carries the run's own incomplete reasons:
+
+| Boundary | Meaning |
+| --- | --- |
+| `unresolved_call` | a call has neither a completely resolved target nor an applicable complete model: unknown dispatch, or a missing model |
+| `model_unavailable` | an activated model could not be compiled for the policy, for example two packs that summarize one procedure differently |
+| `unsupported_flow` | the policy declares semantics this route does not replay; persistence-store crossings are seeded across every region, so a store-declaring policy is answered this way |
+| `cancelled` | the question was cancelled |
+| `analysis_budget`, `output_budget`, `region_budget` | a solver, retention, or region-discovery budget ran out |
+| `discovery_incomplete`, `refused_site` | an endpoint selector did not finish, or a selector row bound no single site |
+| `call_binding`, `semantic_gap`, `endpoint_evidence`, `open_coverage`, `semantic_unavailable`, `invalid_plan` | the remaining typed causes the solver and compiler already report |
+
+Each answer is bounded. At most two production passes run, each under the
+policy's own budget: the authored policy, and, for a negative whose regions
+bind kills, the policy with its kills removed. `max_prefix_executions` caps the
+passes; a limit of one leaves the attribution `unknown`. Ordinary evaluation
+never runs either pass and retains nothing for them.
 
 ### Pinning the workspace an answer is about
 
@@ -2656,9 +3415,9 @@ Undecided subjects report the conjunct count they were observed to reach, the
 same as decided ones, and the ranking breaks ties by decidedness, so
 incompleteness never moves a subject further away than the evidence puts it.
 
-A ranking serves `match` and `assertion` policies, the same two families
-`why-not` serves and for the same reason: it relaxes a selector plan, and a
-flow, taint, or typestate policy has none. Reference policy A is itself a flow
+A ranking serves `match` and `assertion` policies, because it relaxes a
+selector plan and a flow, taint, or typestate policy has none. `why-not` over a
+flow or taint policy runs the solver instead, as described above. Reference policy A is itself a flow
 policy, which is why the ranking above is asked about its equivalent `match`
 view. For a relational policy the candidates come from the first row binding's
 source query and each further binding is one membership conjunct; a subject
@@ -2672,16 +3431,26 @@ The MCP tool `explain_policy` takes one policy selection plus exactly one of
 `finding_id`, `candidate`, or `near_misses`, and returns the structured
 document. The CLI accepts `--explain-finding <ID>`, `--explain-candidate
 <PATH:BYTE_START[-BYTE_END]>`, or `--explain-near-misses <N>` beside
-`--policy-file` and prints the same JSON. All three exit 0 whenever an answer
+`--policy-file` or a built-in selector that names one policy, and prints the
+same JSON. For a flow or taint policy the candidate is the observation
+position, and the source position is `candidate_source` on MCP and
+`--explain-candidate-source <PATH:BYTE_START[-BYTE_END]>` on the CLI. The
+library, the CLI, and MCP return the same outcome, subject, and node tree, node
+identifiers included, for the same question. All three exit 0 whenever an answer
 was produced, whatever its outcome and even when a ranking is empty, and 2 only
 when none could be. Both surfaces also accept the optional workspace-generation
 pin described above, on any of the three questions.
 
-Both surfaces bound the ranking explicitly: how many subjects to retain, and
-how many queries the ladder may run. What a bound removed is reported in the
-document's truncation record in the same `*_truncated` plus
-`omitted_*_lower_bound` form the explanation schema uses, so a caller can raise
-the right one.
+The CLI always searches the policy's own seed scope. `--explain-near-misses N`
+retains N subjects, from 1 to 64, and uses the default execution budget for the
+ladder. MCP `explain_policy` `near_misses` takes exactly one of `candidates`,
+an explicit list of positions, or `enumerate_from_policy_seed`, the same seed
+search the CLI uses. It also accepts `max_candidates`, the number of subjects
+to retain, and `max_executions`, the number of bounded queries the ranking may
+run.
+What a bound removed is reported in the document's truncation record in the
+same `*_truncated` plus `omitted_*_lower_bound` form the explanation schema
+uses, so a caller can raise the right one.
 
 A `why` question through either surface evaluates the policy once to obtain the
 run its finding came from. That evaluation does not activate semantic-model
@@ -2695,11 +3464,11 @@ than explained from a differently-modeled run.
 | Capability | Today | Boundary |
 | --- | --- | --- |
 | Exact call selection | `call-sites-to :proof proven` over an `inside-decl` seed | Java, Python, and TypeScript all answer. Python and TypeScript prove the row whenever the receiver's type is evident at the call — annotated, constructed in the same procedure, or `self`/`this` — and return nothing rather than a guess when it is not. A clean *flow* verdict additionally needs the target's dispatch closed: `final` on Java, `@final` on Python, and a `private constructor` on TypeScript, the language's own statement that the class cannot be extended |
-| Actual-to-formal binding | `call-input :parameter-name` binds positional and named syntax exactly, and `(argument :name "...")` is a value-flow port for flow and taint endpoints, which both editions of reference policy A bind through | The port needs the callee's parameter list, so an unresolved callee degrades the endpoint rather than binding; a formal the resolved target does not declare is a diagnostic, and a declared receiver such as Python's `self` is not a formal; a keyword actual reaches the port only through the unproven structural relation, so a tree that writes one cannot be clean; and every resolved dispatch candidate must agree that the name reaches this operand, so a call through an interface whose implementations name the formal differently is refused |
+| Actual-to-formal binding | `call-input :parameter-name` binds positional and named syntax exactly, and `(argument :name "...")` is a value-flow port for flow and taint endpoints, which both editions of reference policy A bind through | The port needs the callee's parameter list, so an unresolved callee degrades the endpoint rather than binding; a formal the resolved target does not declare is a diagnostic, and a declared receiver such as Python's `self` is not a formal; and every resolved dispatch candidate must agree that the name reaches this operand, so a call through an interface whose implementations name the formal differently is refused |
 | Declared effects | `declared_effects` on a procedure summary, propagated with depth, certainty, timing, and coverage | Path-conditional effects are a P0 non-goal; effect timing is the pack's declaration, not an inference about scheduling syntax |
 | Annotation markers | The normalized `decorators` role | Matches the written annotation name, not a resolved annotation type |
 | Negative claims | Absence requires exhaustive coverage; an unmet obligation is structured data on the run | An open effect set or an unresolved callee is exit 2, never exit 0 |
-| Explanations | `explain_finding` over `match`, `assertion`, `flow`, `taint`, and `typestate` findings and `explain_candidate` over `match` and `assertion` policies, plus the MCP `explain_policy` tool and the CLI `--explain-finding`/`--explain-candidate` flags, each accepting an optional workspace-generation pin | A `why` answer projects retained evidence only, so it is exactly as complete as the report; an effect chain names the reviewed declaration, the retained call chain, and the timing, and publishes no hop the effect relation did not retain; every `why-not` over a flow, taint, or typestate policy is refused rather than answered; a relational `why-not` replays each complete RQL binding query as one membership decision and reports the plan's joins, group keys, and aggregates as unreplayed |
+| Explanations | `explain_finding` over `match`, `assertion`, `flow`, `taint`, and `typestate` findings, `explain_candidate` over `match` and `assertion` policies, and `explain_flow_candidate` over `flow` and `taint` source and observation pairs, plus the MCP `explain_policy` tool and the CLI `--explain-finding`/`--explain-candidate`/`--explain-candidate-source` flags, each accepting an optional workspace-generation pin | A `why` answer projects retained evidence only, so it is exactly as complete as the report; an effect chain names the reviewed declaration, the retained call chain, and the timing, and publishes no hop the effect relation did not retain; a flow or taint `why-not` solves only the regions that bind both sites, is `failed` only over complete coverage, and refuses store-declaring policies with a typed `unsupported_flow` boundary; `typestate` `why-not` is refused rather than answered; a relational `why-not` replays each complete RQL binding query as one membership decision and reports the plan's joins, group keys, and aggregates as unreplayed |
 | Near-miss ranking | `rank_near_misses` over `match` and `assertion` policies, published as `bifrost_policy_near_miss/v1`, plus the MCP `explain_policy` `near_misses` form and the CLI `--explain-near-misses N` flag | Distance is the count of unsatisfied declared predicates and nothing else; candidates are the caller's list or the policy's own seed scope, never a repository scan, and a seed with no kind union is refused; a relational subject that clears every row binding is `unknown`, because the joins, group keys, and aggregates are not replayed |
 | Model activation | Two routes, above; the CLI policy runner activates both | A `review_required` workspace model stays inert without an `enable` entry, reported as a warning |
 
@@ -2712,12 +3481,26 @@ A policy run is not just a list of findings:
   does not currently record the analyzer version, workspace root/revision, or
   configured budget maxima; preserve those separately as described in
   [Reproduce an Analysis](/reproduce-analysis/).
+- `proven_subset` means every retained finding is proven, but the run
+  searched only part of the program. Its findings gate normally. With zero
+  gated findings the run exits 2, because a subset cannot prove absence. The
+  completion carries the `codes` that limited the search.
+- `proven_by_summary` means the result is precise, but it rests on authored
+  external procedure summaries rather than on analyzed code. It can exit 0 or
+  1. A clean result holds only as far as those summaries are correct.
 - `inconclusive` (including cancellation or budget reasons), `unsupported`, or
   `failed` is non-clean even when zero findings were retained. Existing positive
   findings remain useful bounded evidence, but the run cannot support a complete
   negative claim.
+- `not_run` means a selected policy lacked a required capability and made no
+  absence claim. Pack, category, and default selections do not affect the exit
+  status; an explicitly named policy ID exits 2.
 - Query diagnostics carry typed impact. Capability or work omissions propagate
   into policy completion instead of being flattened into an empty match set.
+
+Only `complete` is exhaustive. The [policy reference](/reference/policies/)
+lists every completion state with its reasons, its exit effect, and its SARIF
+notification ID.
 
 ### Declare What An Unknown Result Does
 
@@ -2778,6 +3561,7 @@ separate:
 ├── suppressions.private.json   # decisions on files this repository does not publish
 ├── suppressions.local.json     # one developer's decisions; not committed
 ├── policy-scope.json           # directory-level review decisions
+├── baseline.json               # bulk-accepted findings from --accept-current
 └── cache/                      # generated; safe to ignore
 ```
 
@@ -2890,7 +3674,8 @@ gate needs:
 - `orphaned`: the run analyzed the record's file and no finding carries its
   identity. The accepted decision no longer resolves to anything, either
   because an edit changed the identity or because the finding is genuinely
-  gone. **This fails the run.** A finding that was reviewed and accepted must
+  gone. **This makes the run exit 1, even with `--fail-on never`.** A finding
+  that was reviewed and accepted must
   not quietly return to the gate as new code, and a decision that covers
   nothing must not sit in the document unnoticed. Repair it by re-keying the
   record to the current identity or by deleting it; the review lists the
@@ -2905,10 +3690,14 @@ gate needs:
 
 A missing conventional or explicit suppression file means no suppressions.
 Malformed, unsafe, oversized, escaping, duplicate, or conflicting input
-produces a report diagnostic, applies none of that document, and exits with
-status 2. Use `--suppressions-file PATH` for one workspace-relative override.
-The CLI uses today's UTC date if `--evaluation-date` is omitted; library, LSP,
-and MCP callers supply the date explicitly to the deterministic coordinator.
+produces a `suppression-load-failed` report diagnostic, applies none of that
+document, and exits with status 2. Each file holds at most 512 records and
+256 KiB; the [policy reference](/reference/policies/) lists every field, limit,
+and review state. Use `--suppressions-file PATH` for one workspace-relative
+override.
+The CLI uses today's UTC date if `--evaluation-date` is omitted. MCP
+`run_policy` requires `evaluation_date`, and library callers pass the date
+explicitly.
 
 ## Scope Directories Out Of The Gate
 
@@ -2953,8 +3742,8 @@ under the entry are accepted.
 
 An entry without selectors applies to every policy. `policy_ids` and
 `policy_categories` restrict it, as a union: the entry applies to a policy
-whose stable id is listed or whose built-in category is listed. Categories
-exist only for built-in pack policies, so an entry that should also cover a
+whose stable id is listed or whose catalog category is listed. Categories
+come from catalog pack policies, so an entry that should also cover a
 repository `.rqlp` policy must list its id or omit selectors entirely. Two
 entries may share a path when their selectors differ.
 
@@ -3001,7 +3790,8 @@ root.
 A missing scope file means no scoping. A malformed one produces a
 `scope-load-failed` report diagnostic, applies none of that document, and
 exits with status 2, so a broken scope file can never silently accept
-findings. Use `--scope-file PATH` on the CLI or `scope_file` on the MCP
+findings. A scope file holds at most 256 entries and 256 KiB, and each entry
+lists at most 64 policy IDs and 64 categories. Use `--scope-file PATH` on the CLI or `scope_file` on the MCP
 `run_policy` tool for one workspace-relative override; both default to
 `.bifrost/policy-scope.json`.
 
@@ -3051,7 +3841,9 @@ evaluation cannot prove its own completeness instead degrades to full gating:
 every head finding gates as if `--diff-base` had not been given, the review
 records `degraded: true`, and a `diff-base-unreliable` report diagnostic
 states why, so a broken base can never hide new findings and can never be
-mistaken for a clean diff run.
+mistaken for a clean diff run. That diagnostic, and the per-policy
+`diff-base-policy-unqualified` diagnostic, have severity `error`, so such a run
+exits 2 even though it still reports every head finding.
 
 Two identity limitations are accepted rather than solved. A pure file rename
 re-keys every finding in the file (the path is part of the identity), so a
@@ -3111,12 +3903,47 @@ full evaluation except for the run's own measurements: the `work` counters and
 the `incremental` section. Pass `--no-incremental` to force the full dual
 evaluation, which is how to compare the two when you diagnose a difference.
 
+A changed line is an input to this analysis, never a filter on where a finding
+may appear. A unit is recomputed because something it read moved: a caller, an
+import, a declaration a name resolves to, a semantic model, the policy text, or
+the analyzer configuration. Its finding can therefore appear in a file the pull
+request did not touch, and the gate counts it like any other new finding.
+
+Every entry point evaluates policies the same way and shares one store. The
+CLI, the GitHub action, an MCP session's `run_policy`, and an ordinary scan
+without `--diff-base` all analyze the workspace under the same policy analyzer
+configuration and activate the same semantic models: the shipped models, the
+repository's reviewed models under `.bifrost/semantic-models/`, and the packs
+its `.bifrost/packs.json` names. An MCP session builds this policy workspace
+over its own files for each `run_policy` call instead of evaluating on the
+analyzer that serves its other tools, so its policy findings match the CLI's.
+Units are published to the repository's analyzer cache under keys that every
+entry point computes identically, so a unit one entry point publishes is a unit
+another can reuse. An ordinary scan computes every unit afresh and publishes
+what completes; a later `--diff-base` run whose base is that same revision
+reuses those units for its base evaluation, and its head reuses the ones whose
+inputs it verifies. Reuse is on by default everywhere; the full-evaluation
+override is `--no-incremental` on the CLI, `incremental: false` for MCP
+`run_policy`, and `full-evaluation: true` for the GitHub action.
+
+A unit records the content identity of the workspace snapshot whose name
+lookups it read. A recorded name lookup is verified by the set of names that
+changed since that snapshot, so a run reuses a unit with such lookups only when
+the unit's snapshot is the run's base or its head. A unit computed on any other
+revision, such as an earlier push to the same pull request or a scan of a
+different commit, is recomputed. A unit that read no name lookup is verified
+against the working tree directly, wherever it was computed.
+
 The `incremental` section reports what the run reused. `base` is `reused` when
 the run served the base findings from a stored base evaluation, and `evaluated`
 when the run evaluated the base itself. `policies` holds one entry per policy
 that ran, with the policy's `mode` (`sliced` when it ran unit by unit, `full`
-when it was evaluated whole) and four counts: `units_total`, `units_reused`,
-`units_recomputed`, and `units_unbounded`.
+when it was evaluated whole) and four counts for the working tree:
+`units_total`, `units_reused`, `units_recomputed`, and `units_unbounded`. Two
+more counts, `base_units_reused` and `base_units_recomputed`, describe the base
+evaluation of the same policy in the same run, and `base_widen_reason` says why
+that evaluation ran in full when it did. They are zero when the run evaluated no
+base.
 
 A policy evaluated in full also carries `widen_reason`, one of these typed
 reasons:
@@ -3170,7 +3997,12 @@ Entries are identity-only — no per-record prose — so the document holds up t
 100,000 entries in at most 16 MiB, two decimal orders beyond the suppression
 cap. Acceptance is written only by a clean run: an unreliable run refuses to
 define a baseline and exits 2 without writing, because an identity the run
-could not prove cannot be accepted. Weak-identity findings are never written
+could not prove cannot be accepted. A successful acceptance run exits 0. Its
+`reason` is always `Bulk baseline acceptance of existing findings via
+--accept-current`, and its `accepted_at` is the evaluation date
+(`--evaluation-date`, or today's UTC date). `--accept-current` cannot be
+combined with `--fail-on` or `--diff-base`, and it replaces any existing
+document at the target path. Weak-identity findings are never written
 (their identities are snapshot-local), and their excluded count is reported.
 Regeneration is always an explicit re-run; the baseline never refreshes
 itself.
@@ -3199,8 +4031,9 @@ absent; an incomplete run reports `policy_incomplete` instead of guessing. The
 source slice re-keys the finding, so the old entry goes stale and the re-keyed
 finding gates until it is re-accepted or fixed.
 
-For the onboarding recipe that commits the baseline once and keeps
-pull-request gates on `--diff-base`, see
+The [policy reference](/reference/policies/) shows the document's fields and
+the review's count fields. For the onboarding recipe that commits the baseline
+once and keeps pull-request gates on `--diff-base`, see
 [CI Gating with GitHub Actions](/ci-github-actions/).
 
 ## Classification And CVSS v4.0
@@ -3231,12 +4064,26 @@ bifrost --root docs/fixtures/ten-minute-evaluation \
 ```
 
 This is the published, executable [ten-minute policy
-example](/evaluate-bifrost/#journey-2-run-a-match-policy). Replace the root and
+example](/evaluate-bifrost/). Replace the root and
 policy path with your project when authoring a rule of your own.
 
 Repeat `--policy-file` to produce one deterministic combined report. Choose
 `human`, `json`, or `sarif`; use `--output report.sarif` for synchronized,
 same-directory atomic replacement instead of stdout.
+
+`--sources PATH` restricts policy evaluation to the named files, directories,
+or globs. It is repeatable and helps when you iterate on one rule against a
+small part of a repository:
+
+```bash
+bifrost --root . --policy-file policies/security.rqlp --sources src/auth
+```
+
+`--policy-timings` adds each policy's elapsed evaluation time to its report
+work metrics. `bifrost scan [PATH]` runs the selected external catalog's default
+policies and prints the activated pack versions and catalog hash on
+stderr before the report. [Scan a Codebase](/scan-a-codebase/) walks through a
+first scan and explains why it can exit 2.
 
 The one-shot CLI starts with empty catalog and endpoint registries. A workspace
 semantic-pack policy uses the shared `.bifrost/packs.json` contract: an absent
@@ -3258,9 +4105,9 @@ incomplete activation.
 
 | Status | Meaning |
 | --- | --- |
-| `0` | Every requested policy completed and no active unsuppressed finding met `--fail-on`, or the threshold was `never`. |
-| `1` | Every requested policy completed and at least one active unsuppressed finding met the threshold. |
-| `2` | Policy, suppression, or scope loading, schema validation, composition, evaluation, completeness, serialization, or output was unreliable. This takes precedence over status 1. |
+| `0` | The run is reliable, no active finding met `--fail-on`, and no suppression record is orphaned. |
+| `1` | The run is reliable, and at least one active finding met the threshold or at least one suppression record is orphaned. An orphaned record gives status 1 even with `--fail-on never`. |
+| `2` | Policy, suppression, scope, or baseline loading, schema validation, composition, evaluation, completeness, serialization, or output was unreliable, or a `proven_subset` run had no gated finding. This takes precedence over status 1. |
 
 `--fail-on` accepts `never`, `finding`, `note`, `warning` (the default), or
 `error`; `finding` includes unrated findings. It changes only the complete-run
@@ -3274,22 +4121,22 @@ must explicitly supply and activate a semantic-model catalog when external
 procedure summaries are required outside the shared workspace activation
 contract.
 
-See [CLI](/cli/#static-analysis-policies) for option interactions and
-[Reproduce an Analysis](/reproduce-analysis/) for the artifacts to preserve.
+See the [policy reference](/reference/policies/) for the exact exit-status
+rules, the [CLI reference](/reference/cli/) for option syntax and
+interactions, and [Reproduce an Analysis](/reproduce-analysis/) for the
+artifacts to preserve.
 
 ## Author In VS Code
 
-The Bifrost extension registers `.rqlp` as the distinct **Bifrost RQL Policy**
-language. It provides source-only validation, schema-resolution hover,
-optional-version completion, 100-column formatting, and a distinct **Run RQL
-Policy** action while preserving comments and omitted version fields. Nested
-RQL receives RQL highlighting only inside `(rql ...)`.
+The Bifrost VS Code extension associates `.rqlp` files with the **Bifrost RQL
+Policy** language. Diagnostics, hover, and the **Run RQL Policy** action need a
+running language server. The language server is the separate `bifrost-lsp`
+program, not the `bifrost` binary. See [LSP Server](/lsp/) for the versions
+that serve it.
 
-The policy action sends the current unsaved root to the workspace-backed
-loader, which resolves saved query and endpoint dependencies and reads the
-conventional suppression file. Active findings appear under **Bifrost Policy
-Results**; applied findings move into its suppression audit with stale,
-expired, drifted, and unproven review states. `.rqlp` remains separate from
-the ordinary RQL query action and never publishes policy findings into
-**Bifrost Query Results**. See [RQL in VS
-Code](/rql-vscode/#rql-policy-documents).
+**Run RQL Policy** sends the current text, including unsaved edits, and
+today's UTC date as the evaluation date. It does not name a suppression file.
+Active findings appear under **Bifrost Policy Results**. Suppressed findings
+move to its suppression audit. Policy findings never appear in **Bifrost Query
+Results**. When the date or the suppression file must be fixed, run the policy
+from the CLI. See [RQL in VS Code](/rql-vscode/).

@@ -31,12 +31,33 @@ pub static PYTHON_COGNITIVE_CONFIG: LazyLock<cognitive_complexity::Config> =
     });
 
 pub fn python_extract_call_receiver(reference: &str) -> Option<String> {
-    let trimmed = reference.trim();
-    let before_args = trimmed
-        .split_once('(')
-        .map(|(head, _)| head)
-        .unwrap_or(trimmed);
-    before_args
-        .rsplit_once('.')
+    brokk_bifrost_core::analyzer::common::extract_call_reference_parts(reference, &["."])
         .map(|(receiver, _)| receiver.to_string())
+}
+
+/// Literal string data may occupy a long physical line, but replacement fields
+/// remain executable structure. Bytes and implicit concatenation use the same
+/// grammar nodes. The caller validates the finite source/tree envelope first.
+pub fn is_string_line_data(
+    node: tree_sitter::Node<'_>,
+    should_stop: &mut dyn FnMut() -> bool,
+) -> std::ops::ControlFlow<(), bool> {
+    use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_tree_preorder};
+    use std::ops::ControlFlow;
+    if !matches!(node.kind(), "string" | "concatenated_string") {
+        return ControlFlow::Continue(false);
+    }
+    let mut result = ControlFlow::Continue(true);
+    walk_tree_preorder(node, true, |current| {
+        if should_stop() {
+            result = ControlFlow::Break(());
+            WalkControl::Break
+        } else if current.is_error() || current.is_missing() || current.kind() == "interpolation" {
+            result = ControlFlow::Continue(false);
+            WalkControl::Break
+        } else {
+            WalkControl::Continue
+        }
+    });
+    result
 }

@@ -11,8 +11,9 @@ use brokk_bifrost_core::analyzer::{
 use super::{
     AnalyzerStore, CandidateRow, CandidateRowContainer, FqIdentityHeader, GenerationId,
     HydratedCandidateRow, RelationalUnitFq, Result, StoreError, WorkspaceSnapshots,
-    candidate_row_from_row, candidate_row_from_row_at, hydrate_candidate_rows, hydrate_unit_fq,
-    require_generation_map, signature_metadata_projection_from_row,
+    candidate_row_from_row, candidate_row_from_row_at, candidate_rows_for_languages_with,
+    hydrate_candidate_rows, hydrate_mounted_candidate, require_generation_map,
+    signature_metadata_projection_from_row,
 };
 use crate::analyzer::tree_sitter_analyzer::LanguageAdapter;
 use crate::analyzer::{CodeUnit, ProjectFile, sort_units};
@@ -131,13 +132,9 @@ fn query_content_candidates(
     lang: &str,
     values: &[&dyn rusqlite::ToSql],
 ) -> Result<Vec<(HydratedCandidateRow, String)>> {
-    let mut statement = tx.prepare_cached(sql)?;
-    let parameters = std::iter::once(&lang as &dyn rusqlite::ToSql).chain(values.iter().copied());
-    let rows = statement.query_map(rusqlite::params_from_iter(parameters), |row| {
+    let rows = candidate_rows_for_languages_with(tx, std::iter::once(lang), sql, values, |row| {
         Ok((candidate_row_from_row(row)?, row.get::<_, String>(19)?))
     })?;
-    let rows = rows.collect::<std::result::Result<Vec<_>, _>>()?;
-    drop(statement);
     Ok(hydrate_candidate_rows(tx, rows, None)?
         .expect("uncancelled relational candidate hydration completes"))
 }
@@ -149,21 +146,20 @@ fn hydrate_candidates<A: LanguageAdapter>(
 ) -> Result<Vec<CodeUnit>> {
     let mut units = Vec::with_capacity(rows.len());
     for (row, rel_path) in rows {
-        let file = ProjectFile::new(project_root.to_path_buf(), rel_path);
-        let (fq, package_segment_count) =
-            hydrate_unit_fq(adapter, row.fq.as_ref(), &row.content_qualifier, &file)?;
-        units.push(CodeUnit::from_fq(
-            file,
-            row.kind,
-            fq,
-            package_segment_count,
-            row.signature,
-            row.flags.synthetic,
-        ));
+        units.push(hydrate_mounted_candidate(
+            adapter,
+            project_root,
+            row,
+            rel_path,
+        )?);
     }
     sort_units(&mut units);
     units.dedup();
     Ok(units)
+}
+
+fn batched_request_rows_sql(request_values: &str) -> String {
+    format!("SELECT CAST(key AS INTEGER), {request_values}\n             FROM json_each(?1)")
 }
 
 fn batched_content_sql(
@@ -173,10 +169,7 @@ fn batched_content_sql(
     join_predicate: &str,
 ) -> String {
     format!(
-        "WITH requests(request_index, {request_columns}) AS MATERIALIZED (
-             SELECT CAST(key AS INTEGER), {request_values}
-             FROM json_each(?1)
-         )
+        "WITH requests(request_index, {request_columns}) AS MATERIALIZED ({})
          SELECT requests.request_index, {CANDIDATE_COLUMNS}, names.rel_path
          FROM requests
          CROSS JOIN {view} AS names ON names.lang = ?2
@@ -184,7 +177,8 @@ fn batched_content_sql(
           AND {join_predicate}
          JOIN code_units AS units
            ON units.blob_id = names.blob_id
-          AND units.unit_key = names.unit_key"
+          AND units.unit_key = names.unit_key",
+        batched_request_rows_sql(request_values)
     )
 }
 
@@ -371,14 +365,12 @@ fn query_batched_definition_order_candidates(
 /// `adapter.path_synthetic_module_unit` on the file, not from `code_units`.
 fn batched_path_sql(request_columns: &str, request_values: &str, predicate: &str) -> String {
     format!(
-        "WITH requests(request_index, {request_columns}) AS (
-             SELECT CAST(key AS INTEGER), {request_values}
-             FROM json_each(?1)
-         )
+        "WITH requests(request_index, {request_columns}) AS ({})
          SELECT requests.request_index, names.rel_path
          FROM requests
          CROSS JOIN live_path_symbol_names AS names ON names.lang = ?2
-          AND {predicate}"
+          AND {predicate}",
+        batched_request_rows_sql(request_values)
     )
 }
 
@@ -491,6 +483,17 @@ fn serialize_set_requests<T: serde::Serialize>(requests: &[T]) -> Result<String>
         .map_err(|error| StoreError::new(format!("serializing relational set requests: {error}")))
 }
 
+fn hydrate_batched_definition_units<A: LanguageAdapter>(
+    adapter: &A,
+    project_root: &Path,
+    rows: Vec<(HydratedCandidateRow, String)>,
+    path_units: Vec<CodeUnit>,
+) -> Result<Vec<CodeUnit>> {
+    let mut units = hydrate_candidates(adapter, project_root, rows)?;
+    units.extend(path_units);
+    Ok(units)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn set_exact_definition_values<A: LanguageAdapter>(
     tx: &Transaction<'_>,
@@ -566,8 +569,7 @@ fn set_exact_definition_values<A: LanguageAdapter>(
         .zip(path_candidates)
     {
         let full_name = request.name.full_name();
-        let mut units = hydrate_candidates(adapter, project_root, rows)?;
-        units.extend(path_units);
+        let mut units = hydrate_batched_definition_units(adapter, project_root, rows, path_units)?;
         units.retain(|unit| unit_matches_requested_name(adapter, unit, &full_name, false));
         sort_units(&mut units);
         units.dedup();
@@ -763,8 +765,7 @@ fn set_structural_member_values<A: LanguageAdapter>(
     for ((request_index, rows), path_units) in
         indices.into_iter().zip(candidates).zip(path_candidates)
     {
-        let mut units = hydrate_candidates(adapter, project_root, rows)?;
-        units.extend(path_units);
+        let mut units = hydrate_batched_definition_units(adapter, project_root, rows, path_units)?;
         sort_units(&mut units);
         units.dedup();
         values[request_index] = RelationalDefinitionValue::Definitions(units);
@@ -1791,9 +1792,9 @@ impl AnalyzerStore {
 
 #[cfg(test)]
 mod tests {
+    use brokk_bifrost_test_macros::hardwon;
     use rusqlite::params;
 
-    use super::super::REVISIONED_WORKSPACE_VIEWS_SQL;
     use super::{
         AnalyzerStore, CALLABLE_CANDIDATE_AVAILABILITY_SQL, EXACT_PATH_REQUEST,
         NORMALIZED_PATH_REQUEST, PACKAGE_EXISTS_SQL, STRUCTURAL_MEMBER_PATH_REQUEST,
@@ -1805,6 +1806,7 @@ mod tests {
     use crate::analyzer::fq_name::segment_interner;
     use crate::analyzer::java::JavaAdapter;
     use crate::analyzer::python::PythonAdapter;
+    use crate::analyzer::store::REVISIONED_WORKSPACE_VIEWS_SQL;
     use brokk_bifrost_core::analyzer::{
         DefinitionLanguageScope, RelationalDefinitionQuery, RelationalDefinitionRequest,
         RelationalName, symbol_path::parse_symbol_path_fq,
@@ -1814,49 +1816,28 @@ mod tests {
     // from real corpus stores, because production carries the latter (#3016).
     use brokk_bifrost_core::cache_gc::PlannerStatisticsState;
 
-    #[test]
-    fn callable_candidate_preflight_seeks_stable_and_anchored_name_indexes() {
-        let store = AnalyzerStore::open_ephemeral().expect("ephemeral store");
-        let connection = store.conn.lock().expect("store mutex");
-        connection
-            .execute_batch(REVISIONED_WORKSPACE_VIEWS_SQL)
-            .expect("install revisioned candidate views");
+    fn explain_query_plan(
+        connection: &rusqlite::Connection,
+        label: &str,
+        sql: &str,
+        bindings: &[&str],
+    ) -> Vec<String> {
         let mut statement = connection
-            .prepare(&format!(
-                "EXPLAIN QUERY PLAN {CALLABLE_CANDIDATE_AVAILABILITY_SQL}"
-            ))
-            .expect("prepare callable candidate availability plan");
-        let plan = statement
-            .query_map(params!["java", "demo", "Widget", "demo", "Widget"], |row| {
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap_or_else(|error| panic!("prepare {label} query plan: {error}"));
+        statement
+            .query_map(rusqlite::params_from_iter(bindings), |row| {
                 row.get::<_, String>(3)
             })
-            .expect("read callable candidate availability plan")
+            .unwrap_or_else(|error| panic!("read {label} query plan: {error}"))
             .collect::<std::result::Result<Vec<_>, _>>()
-            .expect("collect callable candidate availability plan");
-
-        assert!(
-            plan.iter()
-                .any(|detail| detail.contains("idx_code_units_stable_parent_identifier")),
-            "stable callable candidates must seek the stable name index: {plan:#?}"
-        );
-        assert!(
-            plan.iter()
-                .any(|detail| detail.contains("idx_code_units_anchored_parent_identifier")),
-            "anchored callable candidates must seek the anchored name index: {plan:#?}"
-        );
-        assert!(
-            plan.iter()
-                .any(|detail| detail.contains("idx_workspace_file_anchor_rows_package")),
-            "anchored callable candidates must seek the package anchor index: {plan:#?}"
-        );
-        assert!(
-            plan.iter()
-                .all(|detail| !detail.contains("SCAN units") && !detail.contains("SCAN anchors")),
-            "callable candidate preflight must not scan name or anchor rows: {plan:#?}"
-        );
+            .unwrap_or_else(|error| panic!("collect {label} query plan: {error}"))
     }
 
     #[test]
+    #[hardwon(
+        "ff7bbbb91467: package existence walked live membership instead of seeking the exact name"
+    )]
     fn package_exists_query_seeks_exact_live_membership() {
         for state in PlannerStatisticsState::BOTH {
             package_exists_query_seeks_exact_live_membership_in(state);
@@ -1983,6 +1964,7 @@ mod tests {
     /// behavior of falling back to the wide compound views -- the
     /// `.unwrap_or_else` below panics and this test fails.
     #[test]
+    #[hardwon("#2588: hot definition point queries regressed from indexed views to broad scans")]
     fn definition_point_queries_seek_split_view_indexes() {
         for state in PlannerStatisticsState::BOTH {
             definition_point_queries_seek_split_view_indexes_in(state);
@@ -1994,16 +1976,7 @@ mod tests {
         let connection = store.conn.lock().expect("store mutex");
         state.install(&connection);
         let explain = |sql: String, bindings: &[&str]| {
-            let mut statement = connection
-                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
-                .expect("prepare query plan");
-            statement
-                .query_map(rusqlite::params_from_iter(bindings), |row| {
-                    row.get::<_, String>(3)
-                })
-                .expect("read query plan")
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .expect("collect query plan")
+            explain_query_plan(&connection, "definition", &sql, bindings)
         };
         let assert_seeks_units_index = |case_name: &str,
                                         view: &str,
@@ -2354,6 +2327,7 @@ mod tests {
     /// `short_name` term from the identifier shape, for example, leaves the
     /// query with nothing but `lang`, and the index assertion fails.
     #[test]
+    #[hardwon("3932076e7002: path-derived policy queries scanned every live file per request")]
     fn path_unit_queries_seek_path_symbol_indexes() {
         let store = AnalyzerStore::open_ephemeral().expect("ephemeral store");
         let connection = store.conn.lock().expect("store mutex");
@@ -2548,6 +2522,9 @@ mod tests {
     /// `live_stable_definition_identifiers` / `live_anchored_definition_identifiers`
     /// route that shape uses instead).
     #[test]
+    #[hardwon(
+        "9527ec801458: identifier lookups walked revision membership before narrowing by name"
+    )]
     fn identifier_definition_queries_narrow_before_revision_membership() {
         for state in PlannerStatisticsState::BOTH {
             identifier_definition_queries_narrow_before_revision_membership_in(state);
@@ -2585,16 +2562,8 @@ mod tests {
                 let bindings = std::iter::once("java")
                     .chain(values.iter().map(String::as_str))
                     .collect::<Vec<_>>();
-                let mut statement = connection
-                    .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
-                    .expect("prepare identifier query plan");
-                let plan = statement
-                    .query_map(rusqlite::params_from_iter(bindings), |row| {
-                        row.get::<_, String>(3)
-                    })
-                    .expect("read identifier query plan")
-                    .collect::<std::result::Result<Vec<_>, _>>()
-                    .expect("collect identifier query plan");
+                let plan =
+                    explain_query_plan(&connection, "identifier definition", &sql, &bindings);
                 let identifier_step = plan
                     .iter()
                     .position(|detail| detail.contains("idx_code_units_lang_identifier_lookup"))
@@ -2620,6 +2589,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "4871e560ddbe: set-oriented definition queries materialized broad views instead of seeking names"
+    )]
     fn set_definition_queries_seek_name_indexes() {
         for state in PlannerStatisticsState::BOTH {
             set_definition_queries_seek_name_indexes_in(state);
@@ -2775,6 +2747,48 @@ mod tests {
                 |detail| !detail.contains("SCAN code_units") && !detail.contains("SCAN ranges")
             ),
             "definition ordering must scan neither code units nor ranges {state}: {order_plan:#?}"
+        );
+    }
+
+    #[test]
+    fn callable_candidate_preflight_seeks_stable_and_anchored_name_indexes() {
+        let store = AnalyzerStore::open_ephemeral().expect("ephemeral store");
+        let connection = store.conn.lock().expect("store mutex");
+        connection
+            .execute_batch(REVISIONED_WORKSPACE_VIEWS_SQL)
+            .expect("install revisioned candidate views");
+        let mut statement = connection
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {CALLABLE_CANDIDATE_AVAILABILITY_SQL}"
+            ))
+            .expect("prepare callable candidate availability plan");
+        let plan = statement
+            .query_map(params!["java", "demo", "Widget", "demo", "Widget"], |row| {
+                row.get::<_, String>(3)
+            })
+            .expect("read callable candidate availability plan")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("collect callable candidate availability plan");
+
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("idx_code_units_stable_parent_identifier")),
+            "stable callable candidates must seek the stable name index: {plan:#?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("idx_code_units_anchored_parent_identifier")),
+            "anchored callable candidates must seek the anchored name index: {plan:#?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("idx_workspace_file_anchor_rows_package")),
+            "anchored callable candidates must seek the package anchor index: {plan:#?}"
+        );
+        assert!(
+            plan.iter()
+                .all(|detail| !detail.contains("SCAN units") && !detail.contains("SCAN anchors")),
+            "callable candidate preflight must not scan name or anchor rows: {plan:#?}"
         );
     }
 }

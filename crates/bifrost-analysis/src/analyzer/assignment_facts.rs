@@ -1,13 +1,14 @@
 //! Prepared-syntax qualification for ordinary local assignments.
 
 use crate::CancellationToken;
+use crate::analyzer::common::{CandidateState, exact_span};
 use crate::analyzer::semantic::statement_entries::ProcedureSyntax;
-use crate::analyzer::semantic::type_flow::validate_prepared_syntax_source_for_procedure;
 use crate::analyzer::semantic::{
-    ProcedureHandle, ProgramPointId, SemanticEffect, SemanticValueKind, SourceMappingKind, ValueId,
+    ProcedureHandle, ProcedureSemantics, ProgramPoint, ProgramPointId, SemanticEffect,
+    SemanticValueKind, SourceMappingKind, ValueId,
 };
-use crate::analyzer::structural::provider::StructuralSyntaxLimitedOutcome;
-use crate::analyzer::{Language, ProjectFile, Range, WorkspaceAnalyzer};
+use crate::analyzer::{Language, Range, WorkspaceAnalyzer};
+use brokk_bifrost_core::analyzer::tree_walk::node_range;
 use brokk_bifrost_js_ts::syntax::ts_type_wrapper_operand;
 use std::collections::{HashMap, HashSet};
 use tree_sitter::Node;
@@ -75,8 +76,6 @@ pub struct OverwrittenLocalCandidates {
     pub reason: Option<&'static str>,
 }
 
-const MAX_SOURCE_BYTES: usize = 1_048_576;
-
 pub fn plain_assignment_candidates(
     workspace: &WorkspaceAnalyzer,
     procedure: &ProcedureHandle,
@@ -90,7 +89,10 @@ pub fn plain_assignment_candidates(
         Language::CSharp => csharp_plain_write,
         Language::Kotlin => kotlin_plain_write,
         Language::Go => go_plain_write,
+        Language::Scala => scala_plain_write,
         Language::Rust => rust_plain_write,
+        Language::Php => php_plain_write,
+        Language::Ruby => ruby_plain_write,
         _ => {
             return PlainAssignmentCandidates {
                 rows: Vec::new(),
@@ -111,52 +113,16 @@ fn pilot_plain_assignment_candidates(
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
         return unavailable("cancelled");
     }
-    let file = ProjectFile::new(
-        workspace.analyzer().project().root().to_path_buf(),
-        procedure.artifact().key().path().as_path(),
-    );
-    let syntax = workspace
-        .analyzer()
-        .structural_fact_providers()
-        .into_iter()
-        .find(|provider| provider.structural_language() == language)
-        .map(|provider| provider.structural_syntax_limited(&file, MAX_SOURCE_BYTES, cancellation));
-    let syntax = match syntax {
-        Some(StructuralSyntaxLimitedOutcome::Available(syntax)) => syntax,
-        Some(StructuralSyntaxLimitedOutcome::Exceeded { .. }) => {
-            return unavailable("source_budget_exhausted");
-        }
-        Some(StructuralSyntaxLimitedOutcome::Cancelled) => return unavailable("cancelled"),
-        Some(StructuralSyntaxLimitedOutcome::Unavailable) | None => {
-            return unavailable("prepared_syntax_unavailable");
-        }
-    };
-    let Ok(syntax) = validate_prepared_syntax_source_for_procedure(
-        workspace,
-        procedure,
-        &file,
-        syntax.into_inner(),
-    ) else {
-        return unavailable("source_identity_mismatch");
+    let prepared = match ProcedureSyntax::prepare(workspace, procedure, cancellation) {
+        Ok(prepared) => prepared,
+        Err(reason) => return unavailable(reason),
     };
     let semantics = procedure.semantics();
-    let Some(mapping) = semantics.source_mapping(semantics.source()) else {
-        return unavailable("procedure_mapping_missing");
+    let syntax = &prepared.syntax;
+    let procedure_node = match exact_assignment_procedure_node(&prepared, procedure) {
+        Ok(node) => node,
+        Err(reason) => return unavailable(reason),
     };
-    if mapping.kind != SourceMappingKind::Exact {
-        return unavailable("procedure_mapping_inexact");
-    }
-    let span = mapping.locator.anchor().span();
-    let Some(procedure_node) = syntax
-        .tree()
-        .root_node()
-        .named_descendant_for_byte_range(span.start_byte() as usize, span.end_byte() as usize)
-    else {
-        return unavailable("procedure_syntax_missing");
-    };
-    if !exact_span(span, procedure_node) || procedure_node.has_error() {
-        return unavailable("procedure_syntax_inexact");
-    }
     if matches!(language, Language::JavaScript | Language::TypeScript)
         && !is_js_function(procedure_node.kind())
     {
@@ -169,48 +135,33 @@ fn pilot_plain_assignment_candidates(
 
     let mut assignments = Vec::new();
     let mut python_directives = HashSet::new();
-    let mut stack = vec![procedure_node];
-    while let Some(node) = stack.pop() {
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return unavailable("cancelled");
-        }
-        if node.id() != procedure_node.id() && is_nested_body(node, language) {
-            continue;
-        }
-        if is_assignment(node, language) {
-            assignments.push(node);
-        }
-        if language == Language::Python
-            && matches!(node.kind(), "global_statement" | "nonlocal_statement")
-        {
-            let mut cursor = node.walk();
-            for name in node
-                .named_children(&mut cursor)
-                .filter(|child| child.kind() == "identifier")
+    if !for_each_procedure_node(
+        procedure_node,
+        cancellation,
+        |node| is_nested_body(node, language),
+        |node| {
+            if is_assignment(node, language) {
+                assignments.push(node);
+            }
+            if language == Language::Python
+                && matches!(node.kind(), "global_statement" | "nonlocal_statement")
             {
-                if let Some(text) = syntax.source().get(name.byte_range()) {
-                    python_directives.insert(text);
+                let mut cursor = node.walk();
+                for name in node
+                    .named_children(&mut cursor)
+                    .filter(|child| child.kind() == "identifier")
+                {
+                    if let Some(text) = syntax.source().get(name.byte_range()) {
+                        python_directives.insert(text);
+                    }
                 }
             }
-        }
-        let mut cursor = node.walk();
-        stack.extend(node.named_children(&mut cursor));
+        },
+    ) {
+        return unavailable("cancelled");
     }
     assignments.sort_unstable_by_key(Node::start_byte);
-    let mut points_by_span: HashMap<(usize, usize), Vec<&crate::analyzer::semantic::ProgramPoint>> =
-        HashMap::new();
-    for point in semantics.points() {
-        if let Some(mapping) = semantics
-            .source_mapping(point.source)
-            .filter(|mapping| mapping.kind == SourceMappingKind::Exact)
-        {
-            let span = mapping.locator.anchor().span();
-            points_by_span
-                .entry((span.start_byte() as usize, span.end_byte() as usize))
-                .or_default()
-                .push(point);
-        }
-    }
+    let points_by_span = exact_program_points_by_span(semantics);
     let rows = assignments
         .into_iter()
         .map(|node| {
@@ -234,11 +185,80 @@ fn pilot_plain_assignment_candidates(
 }
 
 fn unavailable(reason: &'static str) -> PlainAssignmentCandidates {
+    let CandidateState {
+        rows,
+        complete,
+        reason,
+    } = CandidateState::unavailable(reason);
     PlainAssignmentCandidates {
-        rows: Vec::new(),
-        complete: false,
-        reason: Some(reason),
+        rows,
+        complete,
+        reason,
     }
+}
+
+fn exact_assignment_procedure_node<'syntax>(
+    prepared: &'syntax ProcedureSyntax,
+    procedure: &ProcedureHandle,
+) -> Result<Node<'syntax>, &'static str> {
+    let semantics = procedure.semantics();
+    let mapping = semantics
+        .source_mapping(semantics.source())
+        .ok_or("procedure_mapping_missing")?;
+    if mapping.kind != SourceMappingKind::Exact {
+        return Err("procedure_mapping_inexact");
+    }
+    let span = mapping.locator.anchor().span();
+    let node = prepared
+        .syntax
+        .tree()
+        .root_node()
+        .named_descendant_for_byte_range(span.start_byte() as usize, span.end_byte() as usize)
+        .ok_or("procedure_syntax_missing")?;
+    if !exact_span(span, node) || node.has_error() {
+        return Err("procedure_syntax_inexact");
+    }
+    Ok(node)
+}
+
+fn for_each_procedure_node<'tree>(
+    procedure_node: Node<'tree>,
+    cancellation: Option<&CancellationToken>,
+    mut is_nested_body: impl FnMut(Node<'tree>) -> bool,
+    mut visit: impl FnMut(Node<'tree>),
+) -> bool {
+    let mut stack = vec![procedure_node];
+    while let Some(node) = stack.pop() {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return false;
+        }
+        if node.id() != procedure_node.id() && is_nested_body(node) {
+            continue;
+        }
+        visit(node);
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    true
+}
+
+fn exact_program_points_by_span(
+    semantics: &ProcedureSemantics,
+) -> HashMap<(usize, usize), Vec<&ProgramPoint>> {
+    let mut points_by_span = HashMap::new();
+    for point in semantics.points() {
+        if let Some(mapping) = semantics
+            .source_mapping(point.source)
+            .filter(|mapping| mapping.kind == SourceMappingKind::Exact)
+        {
+            let span = mapping.locator.anchor().span();
+            points_by_span
+                .entry((span.start_byte() as usize, span.end_byte() as usize))
+                .or_insert_with(Vec::new)
+                .push(point);
+        }
+    }
+    points_by_span
 }
 
 /// Enumerate only Java source writes which could establish an ordinary local
@@ -260,89 +280,38 @@ pub fn java_overwritten_local_candidates(
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
         return unavailable("cancelled");
     }
-    let file = ProjectFile::new(
-        workspace.analyzer().project().root().to_path_buf(),
-        procedure.artifact().key().path().as_path(),
-    );
-    let syntax = workspace
-        .analyzer()
-        .structural_fact_providers()
-        .into_iter()
-        .find(|provider| provider.structural_language() == Language::Java)
-        .map(|provider| provider.structural_syntax_limited(&file, MAX_SOURCE_BYTES, cancellation));
-    let syntax = match syntax {
-        Some(StructuralSyntaxLimitedOutcome::Available(syntax)) => syntax,
-        Some(StructuralSyntaxLimitedOutcome::Exceeded { .. }) => {
-            return unavailable("source_budget_exhausted");
-        }
-        Some(StructuralSyntaxLimitedOutcome::Cancelled) => return unavailable("cancelled"),
-        Some(StructuralSyntaxLimitedOutcome::Unavailable) | None => {
-            return unavailable("prepared_syntax_unavailable");
-        }
-    };
-    let Ok(syntax) = validate_prepared_syntax_source_for_procedure(
-        workspace,
-        procedure,
-        &file,
-        syntax.into_inner(),
-    ) else {
-        return unavailable("source_identity_mismatch");
+    let prepared = match ProcedureSyntax::prepare(workspace, procedure, cancellation) {
+        Ok(prepared) => prepared,
+        Err(reason) => return unavailable(reason),
     };
     let semantics = procedure.semantics();
-    let Some(mapping) = semantics.source_mapping(semantics.source()) else {
-        return unavailable("procedure_mapping_missing");
+    let syntax = &prepared.syntax;
+    let procedure_node = match exact_assignment_procedure_node(&prepared, procedure) {
+        Ok(node) => node,
+        Err(reason) => return unavailable(reason),
     };
-    if mapping.kind != SourceMappingKind::Exact {
-        return unavailable("procedure_mapping_inexact");
-    }
-    let span = mapping.locator.anchor().span();
-    let Some(procedure_node) = syntax
-        .tree()
-        .root_node()
-        .named_descendant_for_byte_range(span.start_byte() as usize, span.end_byte() as usize)
-    else {
-        return unavailable("procedure_syntax_missing");
-    };
-    if !exact_span(span, procedure_node) || procedure_node.has_error() {
-        return unavailable("procedure_syntax_inexact");
-    }
 
     let mut nodes = Vec::new();
-    let mut stack = vec![procedure_node];
-    while let Some(node) = stack.pop() {
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return unavailable("cancelled");
-        }
-        if node.id() != procedure_node.id() && is_nested_body(node, Language::Java) {
-            continue;
-        }
-        if node.kind() == "assignment_expression"
-            || (node.kind() == "variable_declarator"
-                && node
-                    .parent()
-                    .is_some_and(|parent| parent.kind() == "local_variable_declaration")
-                && node.child_by_field_name("value").is_some())
-        {
-            nodes.push(node);
-        }
-        let mut cursor = node.walk();
-        stack.extend(node.named_children(&mut cursor));
+    if !for_each_procedure_node(
+        procedure_node,
+        cancellation,
+        |node| is_nested_body(node, Language::Java),
+        |node| {
+            if node.kind() == "assignment_expression"
+                || (node.kind() == "variable_declarator"
+                    && node
+                        .parent()
+                        .is_some_and(|parent| parent.kind() == "local_variable_declaration")
+                    && node.child_by_field_name("value").is_some())
+            {
+                nodes.push(node);
+            }
+        },
+    ) {
+        return unavailable("cancelled");
     }
     nodes.sort_unstable_by_key(Node::start_byte);
-    let mut points_by_span: HashMap<(usize, usize), Vec<&crate::analyzer::semantic::ProgramPoint>> =
-        HashMap::new();
-    for point in semantics.points() {
-        if let Some(mapping) = semantics
-            .source_mapping(point.source)
-            .filter(|mapping| mapping.kind == SourceMappingKind::Exact)
-        {
-            let span = mapping.locator.anchor().span();
-            points_by_span
-                .entry((span.start_byte() as usize, span.end_byte() as usize))
-                .or_default()
-                .push(point);
-        }
-    }
+    let points_by_span = exact_program_points_by_span(semantics);
     let mut rows = Vec::with_capacity(nodes.len());
     for node in nodes {
         let mut row = OverwrittenLocalCandidate {
@@ -533,52 +502,16 @@ pub fn js_ts_overwritten_local_candidates(
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
         return unavailable("cancelled");
     }
-    let file = ProjectFile::new(
-        workspace.analyzer().project().root().to_path_buf(),
-        procedure.artifact().key().path().as_path(),
-    );
-    let syntax = workspace
-        .analyzer()
-        .structural_fact_providers()
-        .into_iter()
-        .find(|provider| provider.structural_language() == language)
-        .map(|provider| provider.structural_syntax_limited(&file, MAX_SOURCE_BYTES, cancellation));
-    let syntax = match syntax {
-        Some(StructuralSyntaxLimitedOutcome::Available(syntax)) => syntax,
-        Some(StructuralSyntaxLimitedOutcome::Exceeded { .. }) => {
-            return unavailable("source_budget_exhausted");
-        }
-        Some(StructuralSyntaxLimitedOutcome::Cancelled) => return unavailable("cancelled"),
-        Some(StructuralSyntaxLimitedOutcome::Unavailable) | None => {
-            return unavailable("prepared_syntax_unavailable");
-        }
-    };
-    let Ok(syntax) = validate_prepared_syntax_source_for_procedure(
-        workspace,
-        procedure,
-        &file,
-        syntax.into_inner(),
-    ) else {
-        return unavailable("source_identity_mismatch");
+    let prepared = match ProcedureSyntax::prepare(workspace, procedure, cancellation) {
+        Ok(prepared) => prepared,
+        Err(reason) => return unavailable(reason),
     };
     let semantics = procedure.semantics();
-    let Some(mapping) = semantics.source_mapping(semantics.source()) else {
-        return unavailable("procedure_mapping_missing");
+    let syntax = &prepared.syntax;
+    let procedure_node = match exact_assignment_procedure_node(&prepared, procedure) {
+        Ok(node) => node,
+        Err(reason) => return unavailable(reason),
     };
-    if mapping.kind != SourceMappingKind::Exact {
-        return unavailable("procedure_mapping_inexact");
-    }
-    let span = mapping.locator.anchor().span();
-    let Some(procedure_node) = syntax
-        .tree()
-        .root_node()
-        .named_descendant_for_byte_range(span.start_byte() as usize, span.end_byte() as usize)
-    else {
-        return unavailable("procedure_syntax_missing");
-    };
-    if !exact_span(span, procedure_node) || procedure_node.has_error() {
-        return unavailable("procedure_syntax_inexact");
-    }
     if !is_js_function(procedure_node.kind()) {
         return if procedure_node.kind() == "program" {
             OverwrittenLocalCandidates {
@@ -592,42 +525,27 @@ pub fn js_ts_overwritten_local_candidates(
     }
 
     let mut nodes = Vec::new();
-    let mut stack = vec![procedure_node];
-    while let Some(node) = stack.pop() {
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return unavailable("cancelled");
-        }
-        if node.id() != procedure_node.id() && is_nested_body(node, language) {
-            continue;
-        }
-        if matches!(node.kind(), "for_in_statement" | "using_declaration")
-            || node.kind() == "assignment_expression"
-            || (node.kind() == "variable_declarator"
-                && (node.child_by_field_name("value").is_some()
-                    || node.parent().is_some_and(|parent| {
-                        matches!(parent.kind(), "for_in_statement" | "for_of_statement")
-                    })))
-        {
-            nodes.push(node);
-        }
-        let mut cursor = node.walk();
-        stack.extend(node.named_children(&mut cursor));
+    if !for_each_procedure_node(
+        procedure_node,
+        cancellation,
+        |node| is_nested_body(node, language),
+        |node| {
+            if matches!(node.kind(), "for_in_statement" | "using_declaration")
+                || node.kind() == "assignment_expression"
+                || (node.kind() == "variable_declarator"
+                    && (node.child_by_field_name("value").is_some()
+                        || node.parent().is_some_and(|parent| {
+                            matches!(parent.kind(), "for_in_statement" | "for_of_statement")
+                        })))
+            {
+                nodes.push(node);
+            }
+        },
+    ) {
+        return unavailable("cancelled");
     }
     nodes.sort_unstable_by_key(Node::start_byte);
-    let mut points_by_span: HashMap<(usize, usize), Vec<&crate::analyzer::semantic::ProgramPoint>> =
-        HashMap::new();
-    for point in semantics.points() {
-        if let Some(mapping) = semantics
-            .source_mapping(point.source)
-            .filter(|mapping| mapping.kind == SourceMappingKind::Exact)
-        {
-            let span = mapping.locator.anchor().span();
-            points_by_span
-                .entry((span.start_byte() as usize, span.end_byte() as usize))
-                .or_default()
-                .push(point);
-        }
-    }
+    let points_by_span = exact_program_points_by_span(semantics);
 
     let mut rows = Vec::with_capacity(nodes.len());
     for node in nodes {
@@ -851,15 +769,11 @@ pub fn python_overwritten_local_candidates(
 
     let mut nodes = Vec::new();
     let mut python_directives = HashSet::new();
-    let mut stack = vec![procedure_node];
-    while let Some(node) = stack.pop() {
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return unavailable("cancelled");
-        }
-        if node.id() != procedure_node.id() && is_nested_body(node, Language::Python) {
-            continue;
-        }
-        match node.kind() {
+    if !for_each_procedure_node(
+        procedure_node,
+        cancellation,
+        |node| is_nested_body(node, Language::Python),
+        |node| match node.kind() {
             "assignment" | "augmented_assignment" => nodes.push(node),
             "global_statement" | "nonlocal_statement" => {
                 let mut cursor = node.walk();
@@ -873,25 +787,12 @@ pub fn python_overwritten_local_candidates(
                 }
             }
             _ => {}
-        }
-        let mut cursor = node.walk();
-        stack.extend(node.named_children(&mut cursor));
+        },
+    ) {
+        return unavailable("cancelled");
     }
     nodes.sort_unstable_by_key(Node::start_byte);
-    let mut points_by_span: HashMap<(usize, usize), Vec<&crate::analyzer::semantic::ProgramPoint>> =
-        HashMap::new();
-    for point in semantics.points() {
-        if let Some(mapping) = semantics
-            .source_mapping(point.source)
-            .filter(|mapping| mapping.kind == SourceMappingKind::Exact)
-        {
-            let span = mapping.locator.anchor().span();
-            points_by_span
-                .entry((span.start_byte() as usize, span.end_byte() as usize))
-                .or_default()
-                .push(point);
-        }
-    }
+    let points_by_span = exact_program_points_by_span(semantics);
 
     let rows = nodes
         .into_iter()
@@ -1008,37 +909,20 @@ pub fn go_overwritten_local_candidates(
     let semantics = procedure.semantics();
 
     let mut statements = Vec::new();
-    let mut stack = vec![procedure_node];
-    while let Some(node) = stack.pop() {
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return unavailable("cancelled");
-        }
-        if node.id() != procedure_node.id() && is_nested_body(node, Language::Go) {
-            continue;
-        }
-        match node.kind() {
+    if !for_each_procedure_node(
+        procedure_node,
+        cancellation,
+        |node| is_nested_body(node, Language::Go),
+        |node| match node.kind() {
             "assignment_statement" | "short_var_declaration" => statements.push(node),
             "var_spec" if node.child_by_field_name("value").is_some() => statements.push(node),
             _ => {}
-        }
-        let mut cursor = node.walk();
-        stack.extend(node.named_children(&mut cursor));
+        },
+    ) {
+        return unavailable("cancelled");
     }
     statements.sort_unstable_by_key(Node::start_byte);
-    let mut points_by_span: HashMap<(usize, usize), Vec<&crate::analyzer::semantic::ProgramPoint>> =
-        HashMap::new();
-    for point in semantics.points() {
-        if let Some(mapping) = semantics
-            .source_mapping(point.source)
-            .filter(|mapping| mapping.kind == SourceMappingKind::Exact)
-        {
-            let span = mapping.locator.anchor().span();
-            points_by_span
-                .entry((span.start_byte() as usize, span.end_byte() as usize))
-                .or_default()
-                .push(point);
-        }
-    }
+    let points_by_span = exact_program_points_by_span(semantics);
 
     let mut rows = Vec::new();
     for statement in statements {
@@ -1233,7 +1117,7 @@ enum SingleTargetWrite<'tree> {
     Open(Node<'tree>, &'static str),
 }
 
-/// C# and Kotlin local establishments. Each lowered write point holds
+/// C#, Kotlin, Rust, Scala, PHP, and Ruby local establishments. Each lowered write point holds
 /// exactly one binding (Local or Parameter) assignment; a C# point also
 /// assigns the expression's own Temporary, which is not a binding. The
 /// language supplies candidates from syntax; the join, the parameter
@@ -1254,6 +1138,9 @@ pub fn single_target_overwritten_local_candidates(
             Language::CSharp => csharp_single_target_write,
             Language::Kotlin => kotlin_single_target_write,
             Language::Rust => rust_single_target_write,
+            Language::Scala => scala_single_target_write,
+            Language::Php => php_single_target_write,
+            Language::Ruby => ruby_single_target_write,
             _ => return unavailable("unsupported_language"),
         };
     let prepared = match ProcedureSyntax::prepare(workspace, procedure, cancellation) {
@@ -1283,20 +1170,7 @@ pub fn single_target_overwritten_local_candidates(
         let mut cursor = node.walk();
         stack.extend(node.named_children(&mut cursor));
     }
-    let mut points_by_span: HashMap<(usize, usize), Vec<&crate::analyzer::semantic::ProgramPoint>> =
-        HashMap::new();
-    for point in semantics.points() {
-        if let Some(mapping) = semantics
-            .source_mapping(point.source)
-            .filter(|mapping| mapping.kind == SourceMappingKind::Exact)
-        {
-            let span = mapping.locator.anchor().span();
-            points_by_span
-                .entry((span.start_byte() as usize, span.end_byte() as usize))
-                .or_default()
-                .push(point);
-        }
-    }
+    let points_by_span = exact_program_points_by_span(semantics);
 
     let mut rows = writes
         .into_iter()
@@ -1342,8 +1216,26 @@ pub fn single_target_overwritten_local_candidates(
                 target,
             ) {
                 Ok(write) => write,
-                Err((verdict, reason)) => return row(target, source_kind, verdict, reason),
+                Err((verdict, reason)) => {
+                    if language == Language::Scala
+                        && verdict == PlainAssignmentVerdict::Excluded
+                        && reason == "nonlocal_target"
+                    {
+                        return row(target, source_kind, PlainAssignmentVerdict::Unknown, reason);
+                    }
+                    return row(target, source_kind, verdict, reason);
+                }
             };
+            if language == Language::Scala
+                && !scala_var_declaration(write.declaration, procedure_node)
+            {
+                return row(
+                    target,
+                    source_kind,
+                    PlainAssignmentVerdict::Unknown,
+                    "immutable_or_nonlocal_target",
+                );
+            }
             if write.parameter {
                 return row(
                     target,
@@ -1373,21 +1265,21 @@ pub fn single_target_overwritten_local_candidates(
 
 /// A simple-name write joined to the one binding the lowering assigns at the
 /// write's point.
-struct BindingWrite<'tree> {
-    point: ProgramPointId,
-    binding: ValueId,
-    value: ValueId,
-    parameter: bool,
+pub(crate) struct BindingWrite<'tree> {
+    pub(crate) point: ProgramPointId,
+    pub(crate) binding: ValueId,
+    pub(crate) value: ValueId,
+    pub(crate) parameter: bool,
     /// The binding's declared name.
-    declaration: Node<'tree>,
+    pub(crate) declaration: Node<'tree>,
 }
 
 /// Join the simple name `target` to the one binding (Local or Parameter)
 /// that the lowering assigns at `point_node`, declared inside this procedure
-/// and spelled like `target`. C#, Kotlin and Go lower a simple-name write to
-/// exactly one binding assignment; a C# point also assigns the expression's
-/// own Temporary, which is not a binding.
-fn join_binding_write<'tree>(
+/// and spelled like `target`. C#, Kotlin, Go, Rust, Scala, PHP, and Ruby lower a
+/// simple-name write to exactly one binding assignment; a C# point also
+/// assigns the expression's own Temporary, which is not a binding.
+pub(crate) fn join_binding_write<'tree>(
     semantics: &crate::analyzer::semantic::ProcedureSemantics,
     points_by_span: &HashMap<(usize, usize), Vec<&crate::analyzer::semantic::ProgramPoint>>,
     source: &str,
@@ -1503,11 +1395,12 @@ enum PlainWrite<'tree> {
     },
     Excluded(Node<'tree>, &'static str, &'static str),
     Open(Node<'tree>, &'static str),
+    OpenWithNext(Node<'tree>, &'static str, Option<usize>),
 }
 
-/// C#, Kotlin and Go assignments to a simple name. Each lowering maps the
-/// write to the assignment node and assigns exactly one binding there, so
-/// the B1 binding join also serves these relations.
+/// C#, Kotlin, Go, Rust, Scala, PHP, and Ruby assignments to a simple name. Each
+/// lowering maps the write to the assignment node and assigns exactly one
+/// binding there, so the B1 binding join also serves these relations.
 fn single_target_plain_assignment_candidates(
     workspace: &WorkspaceAnalyzer,
     procedure: &ProcedureHandle,
@@ -1527,34 +1420,19 @@ fn single_target_plain_assignment_candidates(
     let semantics = procedure.semantics();
 
     let mut writes = Vec::new();
-    let mut stack = vec![procedure_node];
-    while let Some(node) = stack.pop() {
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return unavailable("cancelled");
-        }
-        if node.id() != procedure_node.id() && (prepared.roles.nested_procedure)(node) {
-            continue;
-        }
-        if let Some(write) = classify(node, source) {
-            writes.push(write);
-        }
-        let mut cursor = node.walk();
-        stack.extend(node.named_children(&mut cursor));
+    if !for_each_procedure_node(
+        procedure_node,
+        cancellation,
+        |node| (prepared.roles.nested_procedure)(node),
+        |node| {
+            if let Some(write) = classify(node, source) {
+                writes.push(write);
+            }
+        },
+    ) {
+        return unavailable("cancelled");
     }
-    let mut points_by_span: HashMap<(usize, usize), Vec<&crate::analyzer::semantic::ProgramPoint>> =
-        HashMap::new();
-    for point in semantics.points() {
-        if let Some(mapping) = semantics
-            .source_mapping(point.source)
-            .filter(|mapping| mapping.kind == SourceMappingKind::Exact)
-        {
-            let span = mapping.locator.anchor().span();
-            points_by_span
-                .entry((span.start_byte() as usize, span.end_byte() as usize))
-                .or_default()
-                .push(point);
-        }
-    }
+    let points_by_span = exact_program_points_by_span(semantics);
 
     let mut rows = writes
         .into_iter()
@@ -1598,6 +1476,15 @@ fn single_target_plain_assignment_candidates(
                         reason,
                     );
                 }
+                PlainWrite::OpenWithNext(node, reason, next) => {
+                    return row(
+                        node,
+                        next,
+                        PlainAssignmentVerdict::Unknown,
+                        "unknown",
+                        reason,
+                    );
+                }
             };
             let mut row = row(
                 assignment,
@@ -1623,6 +1510,18 @@ fn single_target_plain_assignment_candidates(
                 left,
             ) {
                 Ok(write) => {
+                    if language == Language::Scala
+                        && !scala_var_declaration(write.declaration, procedure_node)
+                    {
+                        row.verdict = PlainAssignmentVerdict::Unknown;
+                        row.storage_kind = "unknown";
+                        row.reason = if write.parameter {
+                            "parameter_target"
+                        } else {
+                            "immutable_target"
+                        };
+                        return row;
+                    }
                     // C# conversions between distinct types can run
                     // user-defined code, so a swap needs equal declared types.
                     // Kotlin and Go assignments never convert a value.
@@ -1637,6 +1536,33 @@ fn single_target_plain_assignment_candidates(
                     row.reason = "qualified";
                 }
                 Err((verdict, reason)) => {
+                    // Scala's simple-name field and captured-local assignments
+                    // can reach this join without a local binding. Their
+                    // setter/capture behavior is effectful or deferred, so
+                    // preserve an open row instead of certifying an absence.
+                    if language == Language::Scala
+                        && verdict == PlainAssignmentVerdict::Excluded
+                        && reason == "nonlocal_target"
+                    {
+                        row.verdict = PlainAssignmentVerdict::Unknown;
+                        row.storage_kind = "unknown";
+                        row.reason = reason;
+                        return row;
+                    }
+                    // A Ruby block may write a captured binding declared by
+                    // its enclosing method. The exact binding join can see
+                    // that target but correctly places its declaration
+                    // outside the block procedure; preserve that as an open
+                    // Ruby closure boundary instead of a clean exclusion.
+                    if language == Language::Ruby
+                        && verdict == PlainAssignmentVerdict::Excluded
+                        && reason == "declaration_outside_procedure"
+                    {
+                        row.verdict = PlainAssignmentVerdict::Unknown;
+                        row.storage_kind = "unknown";
+                        row.reason = reason;
+                        return row;
+                    }
                     if verdict == PlainAssignmentVerdict::Excluded {
                         row.storage_kind = "nonlocal";
                     }
@@ -1655,8 +1581,44 @@ fn single_target_plain_assignment_candidates(
     }
 }
 
+/// A Scala assignment is a local candidate only when its exact binding was
+/// declared by a local `var`. `val`, `lazy val`, parameters, and `var`
+/// members in a template body are effectful or immutable from this relation's
+/// point of view; retaining those rows as unknown keeps them from becoming a
+/// clean assignment proof.
+fn scala_var_declaration(declaration: Node<'_>, procedure_node: Node<'_>) -> bool {
+    let Some(var_definition) = declaration
+        .parent()
+        .filter(|parent| parent.kind() == "var_definition")
+    else {
+        return false;
+    };
+    let Some(container) = var_definition.parent() else {
+        return false;
+    };
+    let is_template_member = matches!(container.kind(), "template_body" | "with_template_body")
+        || matches!(container.kind(), "block" | "indented_block")
+            && container.parent().is_some_and(|parent| {
+                matches!(parent.kind(), "template_body" | "with_template_body")
+            });
+    if is_template_member {
+        return false;
+    }
+    let mut current = Some(var_definition);
+    while let Some(node) = current {
+        if node.id() == procedure_node.id() {
+            return true;
+        }
+        current = node.parent();
+    }
+    false
+}
+
 /// The name `node` spells inside transparent parentheses, when it is a
-/// simple name of `name_kind`.
+/// simple name of `name_kind`. Ruby represents these parentheses as a
+/// `parenthesized_statements` node rather than the `parenthesized_expression`
+/// kind used by several other grammars; one named child is still a
+/// transparent expression for this join.
 fn parenthesized_name<'tree>(mut node: Node<'tree>, name_kind: &str) -> Option<Node<'tree>> {
     loop {
         if node.has_error() {
@@ -1665,7 +1627,11 @@ fn parenthesized_name<'tree>(mut node: Node<'tree>, name_kind: &str) -> Option<N
         if node.kind() == name_kind {
             return Some(node);
         }
-        if node.kind() != "parenthesized_expression" || node.named_child_count() != 1 {
+        if !matches!(
+            node.kind(),
+            "parenthesized_expression" | "parenthesized_statements"
+        ) || node.named_child_count() != 1
+        {
             return None;
         }
         node = node.named_child(0)?;
@@ -1969,8 +1935,811 @@ fn go_plain_write<'tree>(node: Node<'tree>, source: &str) -> Option<PlainWrite<'
     })
 }
 
-/// C#: an initialized local declarator or an `=` assignment to a simple
-/// name. Field initializers belong to other procedures.
+/// Scala: a direct `=` assignment whose target is a plain identifier. Scala
+/// compound updates are `infix_expression` nodes and named call arguments
+/// also use `assignment_expression`; neither is a local write candidate.
+/// Non-identifier targets stay open because they can dispatch through a
+/// setter, field, update method, or another effectful assignment protocol.
+fn scala_plain_write<'tree>(node: Node<'tree>, _source: &str) -> Option<PlainWrite<'tree>> {
+    if node.kind() != "assignment_expression" || is_named_argument_assignment(node) {
+        return None;
+    }
+    if node.has_error() {
+        return Some(PlainWrite::Open(node, "syntax_unresolved"));
+    }
+    let (Some(left), Some(right)) = (
+        node.child_by_field_name("left"),
+        node.child_by_field_name("right"),
+    ) else {
+        return Some(PlainWrite::Open(node, "syntax_unresolved"));
+    };
+    let next = node
+        .parent()
+        .filter(|parent| {
+            matches!(
+                parent.kind(),
+                "block" | "indented_block" | "case_clause" | "template_body"
+            )
+        })
+        .and_then(|_| next_statement(node))
+        .filter(|next| {
+            next.kind() == "assignment_expression" && !is_named_argument_assignment(*next)
+        })
+        .map(|next| next.start_byte());
+    if left.kind() != "identifier" {
+        return Some(PlainWrite::OpenWithNext(node, "nonlocal_target", next));
+    }
+    Some(PlainWrite::Candidate {
+        assignment: node,
+        left,
+        right,
+        next,
+    })
+}
+
+/// Scala: an initialized local `var` or a direct `=` assignment to a simple
+/// name. `val` declarations do not establish a mutable value for B1. Member,
+/// setter, tuple and other non-simple targets stay open because assignment
+/// syntax can execute user code or establish more than one binding.
+fn scala_single_target_write<'tree>(
+    node: Node<'tree>,
+    _source: &str,
+) -> Option<SingleTargetWrite<'tree>> {
+    match node.kind() {
+        "var_definition" => {
+            if node.has_error() {
+                return Some(SingleTargetWrite::Open(node, "syntax_unresolved"));
+            }
+            let pattern = node.child_by_field_name("pattern")?;
+            node.child_by_field_name("value")?;
+            Some(if pattern.kind() == "identifier" {
+                SingleTargetWrite::Candidate {
+                    point_node: node,
+                    target: pattern,
+                    source_kind: OverwrittenLocalSourceKind::DeclarationInitializer,
+                }
+            } else {
+                SingleTargetWrite::Open(node, "destructuring_target_unmodeled")
+            })
+        }
+        "assignment_expression" => {
+            if is_named_argument_assignment(node) {
+                return None;
+            }
+            if node.has_error() {
+                return Some(SingleTargetWrite::Open(node, "syntax_unresolved"));
+            }
+            if !assignment_has_plain_operator(node) {
+                return Some(SingleTargetWrite::Excluded(node, "compound_assignment"));
+            }
+            let left = node.child_by_field_name("left")?;
+            Some(if left.kind() == "identifier" {
+                SingleTargetWrite::Candidate {
+                    point_node: node,
+                    target: left,
+                    source_kind: OverwrittenLocalSourceKind::PlainAssignment,
+                }
+            } else {
+                SingleTargetWrite::Open(node, "nonlocal_target")
+            })
+        }
+        _ => None,
+    }
+}
+
+/// PHP's direct local assignment shape. PHP variables are bindings only for a
+/// plain `variable_name` target; properties, elements, references,
+/// destructuring and variable variables can invoke runtime protocols or alias
+/// storage, so they remain open for review. The enclosing procedure is also
+/// checked for PHP's dynamic local-scope constructs because the lowering does
+/// not bind those constructs to the ordinary local value it creates for a
+/// same-spelled assignment.
+fn php_plain_write<'tree>(node: Node<'tree>, source: &str) -> Option<PlainWrite<'tree>> {
+    if node.kind() == "reference_assignment_expression" {
+        return Some(PlainWrite::OpenWithNext(
+            node,
+            "reference_assignment",
+            php_next_assignment_start(node),
+        ));
+    }
+    if node.kind() == "augmented_assignment_expression" {
+        return Some(PlainWrite::Excluded(
+            node,
+            "compound",
+            "compound_assignment",
+        ));
+    }
+    if node.kind() != "assignment_expression" {
+        return None;
+    }
+    let next = php_next_assignment_start(node);
+    if node.has_error() {
+        return Some(PlainWrite::OpenWithNext(node, "syntax_unresolved", next));
+    }
+    let (Some(left), Some(right)) = (
+        node.child_by_field_name("left"),
+        node.child_by_field_name("right"),
+    ) else {
+        return Some(PlainWrite::OpenWithNext(node, "syntax_unresolved", next));
+    };
+    match left.kind() {
+        "variable_name" => {
+            if let Some(reason) = php_dynamic_scope_reason(node, source) {
+                return Some(PlainWrite::OpenWithNext(node, reason, next));
+            }
+            Some(PlainWrite::Candidate {
+                assignment: node,
+                left,
+                right,
+                next,
+            })
+        }
+        "member_access_expression"
+        | "nullsafe_member_access_expression"
+        | "scoped_property_access_expression"
+        | "subscript_expression" => Some(PlainWrite::OpenWithNext(node, "effectful_target", next)),
+        "dynamic_variable_name" => Some(PlainWrite::OpenWithNext(node, "variable_variable", next)),
+        "list_literal" => Some(PlainWrite::OpenWithNext(node, "destructuring_target", next)),
+        _ => Some(PlainWrite::OpenWithNext(
+            node,
+            "assignment_target_unresolved",
+            next,
+        )),
+    }
+}
+
+/// PHP's single-target B1 shape. A plain variable assignment can be joined to
+/// one local binding; every other write that reads, aliases, dispatches, or
+/// spreads storage remains open until a more precise lowering exists.
+fn php_single_target_write<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<SingleTargetWrite<'tree>> {
+    if matches!(
+        node.kind(),
+        "reference_assignment_expression" | "augmented_assignment_expression" | "update_expression"
+    ) {
+        return Some(SingleTargetWrite::Open(node, "effectful_or_reading_write"));
+    }
+    if node.kind() != "assignment_expression" {
+        return None;
+    }
+    if node.has_error() {
+        return Some(SingleTargetWrite::Open(node, "syntax_unresolved"));
+    }
+    let (Some(left), Some(_right)) = (
+        node.child_by_field_name("left"),
+        node.child_by_field_name("right"),
+    ) else {
+        return Some(SingleTargetWrite::Open(node, "syntax_unresolved"));
+    };
+    if left.kind() != "variable_name" {
+        return Some(SingleTargetWrite::Open(
+            node,
+            "nonlocal_or_destructuring_target",
+        ));
+    }
+    if let Some(reason) = php_dynamic_scope_reason(node, source) {
+        return Some(SingleTargetWrite::Open(node, reason));
+    }
+    Some(SingleTargetWrite::Candidate {
+        point_node: node,
+        target: left,
+        source_kind: OverwrittenLocalSourceKind::PlainAssignment,
+    })
+}
+
+fn php_next_assignment_start(node: Node<'_>) -> Option<usize> {
+    let statement = node
+        .parent()
+        .filter(|parent| parent.kind() == "expression_statement")?;
+    let next = next_statement(statement)?;
+    if next.kind() != "expression_statement" || next.named_child_count() != 1 {
+        return None;
+    }
+    let expression = next.named_child(0)?;
+    matches!(
+        expression.kind(),
+        "assignment_expression" | "reference_assignment_expression"
+    )
+    .then_some(expression.start_byte())
+}
+
+fn php_dynamic_scope_reason(node: Node<'_>, source: &str) -> Option<&'static str> {
+    let procedure = nearest_php_procedure(node)?;
+    if php_procedure_has_reference_parameter(procedure) {
+        return Some("reference_parameter");
+    }
+    let body = procedure.child_by_field_name("body")?;
+    let mut stack = vec![body];
+    while let Some(current) = stack.pop() {
+        if current.id() != body.id() && is_php_assignment_procedure(current) {
+            if php_closure_captures_by_reference(current) {
+                return Some("closure_reference_capture");
+            }
+            continue;
+        }
+        match current.kind() {
+            "global_declaration"
+            | "static_variable_declaration"
+            | "function_static_declaration" => {
+                return Some("dynamic_local_scope");
+            }
+            "dynamic_variable_name" => return Some("variable_variable"),
+            "reference_modifier" => return Some("reference_alias"),
+            "variable_name"
+                if source
+                    .get(current.byte_range())
+                    .is_some_and(|text| text.trim_start_matches('$') == "GLOBALS") =>
+            {
+                return Some("dynamic_local_scope");
+            }
+            "function_call_expression"
+                if php_dynamic_function_call(current, source, "extract")
+                    || php_dynamic_function_call(current, source, "compact")
+                    || php_dynamic_function_call(current, source, "get_defined_vars") =>
+            {
+                return Some("dynamic_local_scope");
+            }
+            _ => {}
+        }
+        let mut cursor = current.walk();
+        stack.extend(current.named_children(&mut cursor));
+    }
+    None
+}
+
+fn php_procedure_has_reference_parameter(procedure: Node<'_>) -> bool {
+    let Some(parameters) = procedure.child_by_field_name("parameters") else {
+        return false;
+    };
+    let mut stack = vec![parameters];
+    while let Some(current) = stack.pop() {
+        if matches!(current.kind(), "reference_modifier" | "by_ref") {
+            return true;
+        }
+        let mut cursor = current.walk();
+        stack.extend(current.named_children(&mut cursor));
+    }
+    false
+}
+
+fn nearest_php_procedure(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        if is_php_assignment_procedure(node) {
+            return Some(node);
+        }
+        node = node.parent()?;
+    }
+}
+
+fn is_php_assignment_procedure(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "function_definition"
+            | "method_declaration"
+            | "anonymous_function"
+            | "arrow_function"
+            | "property_hook"
+    )
+}
+
+fn php_closure_captures_by_reference(node: Node<'_>) -> bool {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).any(|child| {
+        child.kind() == "anonymous_function_use_clause" && {
+            let mut cursor = child.walk();
+            child
+                .named_children(&mut cursor)
+                .any(|capture| capture.kind() == "by_ref")
+        }
+    })
+}
+
+fn php_dynamic_function_call(node: Node<'_>, source: &str, expected: &str) -> bool {
+    let Some(function) = node.child_by_field_name("function") else {
+        return false;
+    };
+    if !matches!(
+        function.kind(),
+        "name" | "qualified_name" | "fully_qualified_name" | "relative_name"
+    ) {
+        return false;
+    }
+    source
+        .get(function.byte_range())
+        .and_then(|name| name.rsplit('\\').next())
+        .is_some_and(|name| name.eq_ignore_ascii_case(expected))
+}
+
+/// Ruby's direct local assignment shape. Ruby's parser distinguishes a plain
+/// local `assignment` from an `operator_assignment`; only the former can be
+/// joined to one lexical binding. Parallel assignment is an intentional
+/// corrected form when every position crosses distinct names, while a
+/// same-name position remains open because the lowering does not expose one
+/// scalar write for that element.
+fn ruby_plain_write<'tree>(node: Node<'tree>, source: &str) -> Option<PlainWrite<'tree>> {
+    let next = ruby_next_assignment_start(node);
+    match node.kind() {
+        "operator_assignment" => {
+            return Some(PlainWrite::OpenWithNext(node, "compound_assignment", next));
+        }
+        "assignment" => {}
+        _ => return None,
+    }
+    if node.has_error() {
+        return Some(PlainWrite::OpenWithNext(node, "syntax_unresolved", next));
+    }
+    let (Some(left), Some(right)) = (
+        node.child_by_field_name("left"),
+        node.child_by_field_name("right"),
+    ) else {
+        return Some(PlainWrite::OpenWithNext(node, "syntax_unresolved", next));
+    };
+    if let Some(reason) = ruby_dynamic_scope_reason(node, source) {
+        return Some(PlainWrite::OpenWithNext(node, reason, next));
+    }
+    match left.kind() {
+        "identifier" => Some(PlainWrite::Candidate {
+            assignment: node,
+            left,
+            right,
+            next,
+        }),
+        "left_assignment_list" => Some(ruby_parallel_plain_write(node, left, right, source, next)),
+        "instance_variable" | "class_variable" | "global_variable" => {
+            Some(PlainWrite::OpenWithNext(node, "nonlocal_target", next))
+        }
+        "call" => Some(PlainWrite::OpenWithNext(node, "writer_target", next)),
+        "element_reference" => Some(PlainWrite::OpenWithNext(node, "element_target", next)),
+        "destructured_left_assignment" | "rest_assignment" => {
+            Some(PlainWrite::OpenWithNext(node, "destructuring_target", next))
+        }
+        _ => Some(PlainWrite::OpenWithNext(
+            node,
+            "assignment_target_unresolved",
+            next,
+        )),
+    }
+}
+
+fn ruby_parallel_plain_write<'tree>(
+    assignment: Node<'tree>,
+    left: Node<'tree>,
+    right: Node<'tree>,
+    source: &str,
+    next: Option<usize>,
+) -> PlainWrite<'tree> {
+    if !matches!(right.kind(), "right_assignment_list" | "array") {
+        return PlainWrite::OpenWithNext(assignment, "parallel_assignment_unmodeled", next);
+    }
+    let mut left_cursor = left.walk();
+    let lefts = left.named_children(&mut left_cursor).collect::<Vec<_>>();
+    let mut right_cursor = right.walk();
+    let rights = right.named_children(&mut right_cursor).collect::<Vec<_>>();
+    if lefts.is_empty()
+        || lefts.len() != rights.len()
+        || lefts.iter().any(|node| node.kind() != "identifier")
+        || rights
+            .iter()
+            .any(|node| node.kind() == "splat_argument" || node.has_error())
+    {
+        return PlainWrite::OpenWithNext(assignment, "parallel_assignment_unmodeled", next);
+    }
+    let same_name = lefts.iter().zip(&rights).any(|(left, right)| {
+        parenthesized_name(*right, "identifier")
+            .is_some_and(|right| source.get(left.byte_range()) == source.get(right.byte_range()))
+    });
+    if same_name {
+        PlainWrite::OpenWithNext(assignment, "parallel_self_assignment_unmodeled", next)
+    } else {
+        PlainWrite::Excluded(assignment, "indirect", "parallel_assignment")
+    }
+}
+
+fn ruby_next_assignment_start(node: Node<'_>) -> Option<usize> {
+    let parent = node.parent()?;
+    let (statement, list) = if is_ruby_statement_modifier(parent.kind()) {
+        (parent, parent.parent()?)
+    } else if is_ruby_statement_list(parent.kind()) {
+        (node, parent)
+    } else {
+        return None;
+    };
+    debug_assert_eq!(
+        statement.parent().map(|parent| parent.id()),
+        Some(list.id())
+    );
+    let next = next_statement(statement)?;
+    ruby_statement_assignment(next).map(|assignment| assignment.start_byte())
+}
+
+fn ruby_statement_assignment(node: Node<'_>) -> Option<Node<'_>> {
+    if matches!(node.kind(), "assignment" | "operator_assignment") {
+        return Some(node);
+    }
+    if is_ruby_statement_modifier(node.kind()) {
+        return node
+            .child_by_field_name("body")
+            .filter(|child| matches!(child.kind(), "assignment" | "operator_assignment"));
+    }
+    if node.kind() == "expression_statement" && node.named_child_count() == 1 {
+        return node
+            .named_child(0)
+            .filter(|child| matches!(child.kind(), "assignment" | "operator_assignment"));
+    }
+    None
+}
+
+fn is_ruby_statement_modifier(kind: &str) -> bool {
+    matches!(
+        kind,
+        "if_modifier" | "unless_modifier" | "while_modifier" | "until_modifier"
+    )
+}
+
+fn is_ruby_statement_list(kind: &str) -> bool {
+    matches!(
+        kind,
+        "program"
+            | "body_statement"
+            | "block_body"
+            | "then"
+            | "else"
+            | "do"
+            | "begin"
+            | "rescue"
+            | "ensure"
+            | "parenthesized_statements"
+    )
+}
+
+fn ruby_dynamic_scope_reason(node: Node<'_>, source: &str) -> Option<&'static str> {
+    let procedure = nearest_ruby_assignment_procedure(node)?;
+    if matches!(procedure.kind(), "block" | "do_block") {
+        return Some("block_local_or_captured_write");
+    }
+    let mut stack = vec![procedure];
+    while let Some(current) = stack.pop() {
+        if current.id() != procedure.id() && ruby_assignment_nested_procedure(current) {
+            if matches!(current.kind(), "block" | "do_block") && ruby_block_writes_local(current) {
+                return Some("block_local_or_captured_write");
+            }
+            continue;
+        }
+        if current.kind() == "call"
+            && current
+                .child_by_field_name("method")
+                .and_then(|method| source.get(method.byte_range()))
+                .is_some_and(|name| {
+                    matches!(
+                        name,
+                        "binding" | "eval" | "local_variable_get" | "local_variable_set"
+                    )
+                })
+        {
+            return Some("dynamic_local_scope");
+        }
+        if current.kind() == "identifier"
+            && ruby_identifier_value_position(current)
+            && source.get(current.byte_range()).is_some_and(|name| {
+                matches!(
+                    name,
+                    "binding" | "eval" | "local_variable_get" | "local_variable_set"
+                )
+            })
+            && !ruby_procedure_declares_name(procedure, source, current)
+        {
+            return Some("dynamic_local_scope");
+        }
+        let mut cursor = current.walk();
+        stack.extend(current.named_children(&mut cursor));
+    }
+    None
+}
+
+fn nearest_ruby_assignment_procedure(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        if ruby_assignment_procedure(node) {
+            return Some(node);
+        }
+        node = node.parent()?;
+    }
+}
+
+fn ruby_assignment_procedure(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "program"
+            | "method"
+            | "singleton_method"
+            | "lambda"
+            | "block"
+            | "do_block"
+            | "class"
+            | "module"
+            | "singleton_class"
+    )
+}
+
+fn ruby_assignment_nested_procedure(node: Node<'_>) -> bool {
+    ruby_assignment_procedure(node) && node.kind() != "program"
+}
+
+fn ruby_block_writes_local(block: Node<'_>) -> bool {
+    let mut stack = vec![block];
+    while let Some(current) = stack.pop() {
+        if current.id() != block.id() && ruby_assignment_nested_procedure(current) {
+            continue;
+        }
+        if matches!(current.kind(), "assignment" | "operator_assignment")
+            && current
+                .child_by_field_name("left")
+                .is_some_and(ruby_target_contains_identifier)
+        {
+            return true;
+        }
+        let mut cursor = current.walk();
+        stack.extend(current.named_children(&mut cursor));
+    }
+    false
+}
+
+fn ruby_target_contains_identifier(node: Node<'_>) -> bool {
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "identifier" {
+            return true;
+        }
+        let mut cursor = current.walk();
+        stack.extend(current.named_children(&mut cursor));
+    }
+    false
+}
+
+fn ruby_procedure_declares_name(procedure: Node<'_>, source: &str, name: Node<'_>) -> bool {
+    let Some(name) = source.get(name.byte_range()) else {
+        return false;
+    };
+    let mut stack = vec![procedure];
+    while let Some(current) = stack.pop() {
+        if current.id() != procedure.id() && ruby_assignment_nested_procedure(current) {
+            continue;
+        }
+        let declaration = match current.kind() {
+            "assignment" | "operator_assignment" => current.child_by_field_name("left"),
+            "for" | "rescue" | "match_pattern" | "test_pattern" | "in_clause" => current
+                .child_by_field_name("pattern")
+                .or_else(|| current.child_by_field_name("variable")),
+            "method_parameters" | "lambda_parameters" | "block_parameters" => Some(current),
+            _ => None,
+        };
+        if declaration
+            .is_some_and(|declaration| ruby_target_contains_name(declaration, source, name))
+        {
+            return true;
+        }
+        let mut cursor = current.walk();
+        stack.extend(current.named_children(&mut cursor));
+    }
+    false
+}
+
+fn ruby_target_contains_name(node: Node<'_>, source: &str, name: &str) -> bool {
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "identifier" && source.get(current.byte_range()) == Some(name) {
+            return true;
+        }
+        let mut cursor = current.walk();
+        stack.extend(current.named_children(&mut cursor));
+    }
+    false
+}
+
+fn ruby_identifier_value_position(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    let field_is = |field: &str| {
+        parent
+            .child_by_field_name(field)
+            .is_some_and(|child| child.id() == node.id())
+    };
+    match parent.kind() {
+        "program"
+        | "body_statement"
+        | "then"
+        | "else"
+        | "do"
+        | "block_body"
+        | "begin"
+        | "interpolation"
+        | "argument_list"
+        | "splat_argument"
+        | "hash_splat_argument"
+        | "block_argument"
+        | "binary"
+        | "range"
+        | "array"
+        | "element_reference"
+        | "if"
+        | "unless"
+        | "elsif"
+        | "while"
+        | "until"
+        | "conditional"
+        | "case"
+        | "case_match"
+        | "when"
+        | "rescue_modifier" => true,
+        "parenthesized_statements" => true,
+        "assignment" | "operator_assignment" => field_is("right"),
+        "call" => field_is("receiver"),
+        "pair" => field_is("value"),
+        "unary" => field_is("operand"),
+        _ => false,
+    }
+}
+
+/// Ruby's exact B1 write shape. A plain identifier assignment is the only
+/// scalar write that can be joined to one lexical binding. Ruby's dynamic
+/// scope, closure, method-call ambiguity, and re-execution constructs keep the
+/// corresponding procedure open until the lowering models those boundaries.
+fn ruby_single_target_write<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<SingleTargetWrite<'tree>> {
+    match node.kind() {
+        "operator_assignment" => {
+            return Some(SingleTargetWrite::Open(node, "compound_assignment"));
+        }
+        "assignment" => {}
+        _ => return None,
+    }
+    if node.has_error() {
+        return Some(SingleTargetWrite::Open(node, "syntax_unresolved"));
+    }
+    let (Some(left), Some(right)) = (
+        node.child_by_field_name("left"),
+        node.child_by_field_name("right"),
+    ) else {
+        return Some(SingleTargetWrite::Open(node, "syntax_unresolved"));
+    };
+    if let Some(reason) = ruby_dynamic_scope_reason(node, source) {
+        return Some(SingleTargetWrite::Open(node, reason));
+    }
+    if ruby_procedure_reexecutes(node) {
+        return Some(SingleTargetWrite::Open(node, "redo_or_retry"));
+    }
+    match left.kind() {
+        "identifier" => {
+            let Some(procedure) = nearest_ruby_assignment_procedure(node) else {
+                return Some(SingleTargetWrite::Open(
+                    node,
+                    "assignment_procedure_unresolved",
+                ));
+            };
+            if ruby_nested_callable_observes_name(procedure, left, source) {
+                return Some(SingleTargetWrite::Open(node, "captured_local_observation"));
+            }
+            if ruby_rhs_has_method_or_unresolved_name(right, procedure, source) {
+                return Some(SingleTargetWrite::Open(node, "method_local_ambiguity"));
+            }
+            Some(SingleTargetWrite::Candidate {
+                point_node: node,
+                target: left,
+                source_kind: OverwrittenLocalSourceKind::PlainAssignment,
+            })
+        }
+        "left_assignment_list" | "destructured_left_assignment" | "rest_assignment" => Some(
+            SingleTargetWrite::Open(node, "parallel_or_destructuring_assignment"),
+        ),
+        "instance_variable" | "class_variable" | "global_variable" => {
+            Some(SingleTargetWrite::Open(node, "nonlocal_target"))
+        }
+        "call" => Some(SingleTargetWrite::Open(node, "writer_target")),
+        "element_reference" => Some(SingleTargetWrite::Open(node, "element_target")),
+        _ => Some(SingleTargetWrite::Open(
+            node,
+            "assignment_target_unresolved",
+        )),
+    }
+}
+
+fn ruby_procedure_reexecutes(node: Node<'_>) -> bool {
+    let Some(procedure) = nearest_ruby_assignment_procedure(node) else {
+        return false;
+    };
+    let mut stack = vec![procedure];
+    while let Some(current) = stack.pop() {
+        if current.id() != procedure.id() && ruby_assignment_nested_procedure(current) {
+            continue;
+        }
+        if matches!(current.kind(), "redo" | "retry") {
+            return true;
+        }
+        let mut cursor = current.walk();
+        stack.extend(current.named_children(&mut cursor));
+    }
+    false
+}
+
+fn ruby_nested_callable_observes_name(procedure: Node<'_>, target: Node<'_>, source: &str) -> bool {
+    let Some(name) = source.get(target.byte_range()) else {
+        return true;
+    };
+    let mut stack = vec![procedure];
+    while let Some(current) = stack.pop() {
+        if current.id() != procedure.id() && ruby_assignment_nested_procedure(current) {
+            if ruby_closure_procedure(current) && ruby_callable_observes_name(current, name, source)
+            {
+                return true;
+            }
+            continue;
+        }
+        let mut cursor = current.walk();
+        stack.extend(current.named_children(&mut cursor));
+    }
+    false
+}
+
+fn ruby_closure_procedure(node: Node<'_>) -> bool {
+    matches!(node.kind(), "lambda" | "block" | "do_block")
+}
+
+fn ruby_callable_observes_name(callable: Node<'_>, name: &str, source: &str) -> bool {
+    let mut stack = vec![callable];
+    while let Some(current) = stack.pop() {
+        if current.id() != callable.id() && ruby_assignment_nested_procedure(current) {
+            continue;
+        }
+        let target_write = matches!(current.kind(), "assignment" | "operator_assignment")
+            && current
+                .child_by_field_name("left")
+                .is_some_and(|left| ruby_target_contains_name(left, source, name));
+        if target_write
+            || (current.kind() == "identifier"
+                && source.get(current.byte_range()) == Some(name)
+                && ruby_identifier_value_position(current))
+        {
+            return true;
+        }
+        let mut cursor = current.walk();
+        stack.extend(current.named_children(&mut cursor));
+    }
+    false
+}
+
+fn ruby_rhs_has_method_or_unresolved_name(
+    rhs: Node<'_>,
+    procedure: Node<'_>,
+    source: &str,
+) -> bool {
+    let mut stack = vec![rhs];
+    while let Some(current) = stack.pop() {
+        if current.id() != rhs.id() && ruby_assignment_nested_procedure(current) {
+            continue;
+        }
+        if current.kind() == "call" && current.child_by_field_name("receiver").is_none() {
+            return true;
+        }
+        if current.kind() == "identifier"
+            && ruby_identifier_value_position(current)
+            && !ruby_procedure_declares_name(procedure, source, current)
+        {
+            return true;
+        }
+        let mut cursor = current.walk();
+        stack.extend(current.named_children(&mut cursor));
+    }
+    false
+}
+
+/// C#: an initialized local declarator, an `=` assignment, or an integral
+/// update expression on a simple name. Field initializers belong to other
+/// procedures. Update candidates join only when the lowering publishes the
+/// exact binding write; a user-defined or non-integral update stays open.
 fn csharp_single_target_write<'tree>(
     node: Node<'tree>,
     _source: &str,
@@ -2002,7 +2771,7 @@ fn csharp_single_target_write<'tree>(
                 .child_by_field_name("operator")
                 .is_none_or(|operator| operator.kind() != "=")
             {
-                return Some(SingleTargetWrite::Excluded(node, "compound_assignment"));
+                return Some(SingleTargetWrite::Open(node, "compound_assignment"));
             }
             Some(match left.kind() {
                 "identifier" => SingleTargetWrite::Candidate {
@@ -2016,8 +2785,36 @@ fn csharp_single_target_write<'tree>(
                 _ => SingleTargetWrite::Open(node, "destructuring_target_unmodeled"),
             })
         }
+        "prefix_unary_expression" | "postfix_unary_expression"
+            if csharp_is_update_expression(node) =>
+        {
+            let target = node.named_child(0)?;
+            Some(match target.kind() {
+                "identifier" => SingleTargetWrite::Candidate {
+                    point_node: node,
+                    target,
+                    source_kind: OverwrittenLocalSourceKind::PlainAssignment,
+                },
+                "member_access_expression" | "element_access_expression" => {
+                    SingleTargetWrite::Excluded(node, "nonlocal_target")
+                }
+                _ => SingleTargetWrite::Open(node, "update_target_unmodeled"),
+            })
+        }
         _ => None,
     }
+}
+
+fn csharp_is_update_expression(node: Node<'_>) -> bool {
+    if !matches!(
+        node.kind(),
+        "prefix_unary_expression" | "postfix_unary_expression"
+    ) {
+        return false;
+    }
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .any(|child| !child.is_named() && matches!(child.kind(), "++" | "--"))
 }
 
 /// Rust: an initialized `let` of one name (`let x` or `let mut x`) or an `=`
@@ -2064,7 +2861,7 @@ fn rust_single_target_write<'tree>(
 /// name. A compound operator is an anonymous `+=`-style token.
 fn kotlin_single_target_write<'tree>(
     node: Node<'tree>,
-    _source: &str,
+    source: &str,
 ) -> Option<SingleTargetWrite<'tree>> {
     match node.kind() {
         "property_declaration" => {
@@ -2083,6 +2880,12 @@ fn kotlin_single_target_write<'tree>(
             let name = variable
                 .named_children(&mut cursor)
                 .find(|child| child.kind() == "simple_identifier")?;
+            if children
+                .iter()
+                .any(|child| child.kind() == "property_delegate")
+            {
+                return Some(SingleTargetWrite::Open(node, "delegated_local"));
+            }
             let initialized = children.iter().any(|child| {
                 !matches!(
                     child.kind(),
@@ -2108,7 +2911,11 @@ fn kotlin_single_target_write<'tree>(
                 !child.is_named() && matches!(child.kind(), "+=" | "-=" | "*=" | "/=" | "%=")
             });
             if compound {
-                return Some(SingleTargetWrite::Excluded(node, "compound_assignment"));
+                // A compound assignment reads the old value before it writes
+                // the replacement. Its operator convention is deliberately
+                // opaque to B1, even when the semantic lowering can model a
+                // primitive offset for other policies.
+                return Some(SingleTargetWrite::Open(node, "compound_assignment"));
             }
             let target = node.named_child(0)?;
             let name = if target.kind() == "directly_assignable_expression"
@@ -2118,18 +2925,145 @@ fn kotlin_single_target_write<'tree>(
             } else {
                 target
             };
-            Some(if name.kind() == "simple_identifier" {
+            Some(if name.kind() != "simple_identifier" {
+                SingleTargetWrite::Open(node, "nonlocal_target")
+            } else if let Some(reason) = kotlin_unmodeled_target_reason(node, name, source) {
+                SingleTargetWrite::Open(node, reason)
+            } else {
                 SingleTargetWrite::Candidate {
                     point_node: node,
                     target: name,
                     source_kind: OverwrittenLocalSourceKind::PlainAssignment,
                 }
-            } else {
-                SingleTargetWrite::Excluded(node, "nonlocal_target")
             })
         }
         _ => None,
     }
+}
+
+/// Return the Kotlin-specific reason a simple spelling is not a stable local
+/// binding for B1. The assignment relation deliberately stays conservative at
+/// this syntax boundary: delegated properties dispatch through `setValue`, and
+/// a lambda or nested function can write an outer mutable binding through a
+/// capture slot whose call-time value is not a plain local establishment.
+fn kotlin_unmodeled_target_reason(
+    assignment: Node<'_>,
+    target: Node<'_>,
+    source: &str,
+) -> Option<&'static str> {
+    let name = target.utf8_text(source.as_bytes()).ok()?;
+    if kotlin_target_is_delegated(assignment, name, source) {
+        return Some("delegated_local");
+    }
+    kotlin_target_is_captured(assignment, name, source).then_some("captured_local")
+}
+
+fn kotlin_target_is_delegated(assignment: Node<'_>, name: &str, source: &str) -> bool {
+    let mut current = assignment.parent();
+    while let Some(node) = current {
+        if node.kind() == "statements"
+            && let Some(property) = kotlin_visible_property(node, name, assignment, source)
+        {
+            return property;
+        }
+        current = node.parent();
+    }
+    false
+}
+
+/// Find the nearest declaration with `name` in an enclosing Kotlin statement
+/// scope. `Some(true)` means that declaration is delegated and `Some(false)`
+/// means it shadows any outer declaration for this assignment.
+fn kotlin_visible_property(
+    statements: Node<'_>,
+    name: &str,
+    assignment: Node<'_>,
+    source: &str,
+) -> Option<bool> {
+    let mut cursor = statements.walk();
+    statements
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "property_declaration")
+        .filter(|child| child.start_byte() < assignment.start_byte())
+        .filter_map(|property| {
+            let mut property_cursor = property.walk();
+            let variable = property
+                .named_children(&mut property_cursor)
+                .find(|child| child.kind() == "variable_declaration")?;
+            let mut variable_cursor = variable.walk();
+            let binding = variable
+                .named_children(&mut variable_cursor)
+                .find(|child| child.kind() == "simple_identifier")?;
+            let mut property_cursor = property.walk();
+            let delegated = property
+                .named_children(&mut property_cursor)
+                .any(|child| child.kind() == "property_delegate");
+            (binding.utf8_text(source.as_bytes()).ok()? == name).then_some(delegated)
+        })
+        .next()
+}
+
+fn kotlin_target_is_captured(assignment: Node<'_>, name: &str, source: &str) -> bool {
+    let mut current = assignment.parent();
+    let mut boundary = None;
+    while let Some(node) = current {
+        if matches!(
+            node.kind(),
+            "lambda_literal" | "anonymous_function" | "function_declaration"
+        ) {
+            boundary = Some(node);
+            break;
+        }
+        current = node.parent();
+    }
+    let Some(boundary) = boundary else {
+        return false;
+    };
+
+    let mut scope = assignment.parent();
+    while let Some(node) = scope {
+        if node.kind() == "statements"
+            && kotlin_visible_property(node, name, assignment, source).is_some()
+        {
+            return false;
+        }
+        if node.id() == boundary.id() {
+            break;
+        }
+        scope = node.parent();
+    }
+
+    if boundary.kind() == "function_declaration" {
+        let mut stack = vec![boundary];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "function_value_parameters" {
+                let mut cursor = node.walk();
+                if node.named_children(&mut cursor).any(|parameter| {
+                    let mut parameter_cursor = parameter.walk();
+                    parameter
+                        .named_children(&mut parameter_cursor)
+                        .find(|child| child.kind() == "simple_identifier")
+                        .and_then(|child| child.utf8_text(source.as_bytes()).ok())
+                        == Some(name)
+                }) {
+                    return false;
+                }
+            }
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if child.id() != boundary.id()
+                    && matches!(
+                        child.kind(),
+                        "lambda_literal" | "anonymous_function" | "function_declaration"
+                    )
+                {
+                    continue;
+                }
+                stack.push(child);
+            }
+        }
+    }
+    true
 }
 
 fn is_nested_body(node: Node<'_>, language: Language) -> bool {
@@ -2155,16 +3089,7 @@ fn is_nested_body(node: Node<'_>, language: Language) -> bool {
 }
 
 fn is_js_function(kind: &str) -> bool {
-    matches!(
-        kind,
-        "function"
-            | "function_declaration"
-            | "function_expression"
-            | "generator_function"
-            | "generator_function_declaration"
-            | "arrow_function"
-            | "method_definition"
-    )
+    kind == "function" || brokk_bifrost_js_ts::syntax::is_function_like(kind)
 }
 
 fn is_assignment(node: Node<'_>, language: Language) -> bool {
@@ -2546,6 +3471,7 @@ fn ordinary_local_declaration(
             debug_assert!(!python_directives.contains(name_text));
             Some(None)
         }
+        Language::Ruby => Some(None),
         _ => None,
     }
 }
@@ -2669,10 +3595,27 @@ fn next_assignment_start(assignment: Node<'_>, language: Language) -> Option<usi
     is_assignment(next_assignment, language).then_some(next_assignment.start_byte())
 }
 
+pub(super) fn is_plain_assignment_operator_kind(kind: &str) -> bool {
+    kind == "="
+}
+
 fn assignment_has_plain_operator(node: Node<'_>) -> bool {
     (0..node.child_count())
         .filter_map(|index| node.child(index))
-        .any(|child| child.kind() == "=")
+        .any(|child| is_plain_assignment_operator_kind(child.kind()))
+}
+
+fn is_named_argument_assignment(node: Node<'_>) -> bool {
+    node.kind() == "assignment_expression"
+        && node
+            .parent()
+            .is_some_and(|parent| parent.kind() == "arguments")
+        && node
+            .parent()
+            .and_then(|arguments| arguments.parent())
+            .is_some_and(|invocation| {
+                matches!(invocation.kind(), "call_expression" | "instance_expression")
+            })
 }
 
 /// The identifier inside wrappers that have no run-time effect: parentheses
@@ -2699,18 +3642,5 @@ fn bare_identifier_rhs(mut node: Node<'_>) -> Option<Node<'_>> {
             }
             _ => return None,
         };
-    }
-}
-
-fn exact_span(span: crate::analyzer::semantic::SourceSpan, node: Node<'_>) -> bool {
-    node.start_byte() == span.start_byte() as usize && node.end_byte() == span.end_byte() as usize
-}
-
-fn node_range(node: Node<'_>) -> Range {
-    Range {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_line: node.start_position().row + 1,
-        end_line: node.end_position().row + 1,
     }
 }

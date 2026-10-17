@@ -1,25 +1,29 @@
 use super::*;
 use crate::analyzer::CodeUnitIndex;
-#[cfg(any(test, feature = "test-support"))]
-use crate::analyzer::go::package_identity::GoOverlayPackages;
-use crate::analyzer::go::package_identity::{GoModeledNominalType, GoModeledPackageCallResolution};
+use crate::analyzer::go::package_identity::{
+    GoModeledNominalType, GoModeledPackageCallResolution, GoOverlayPackages,
+};
 use crate::analyzer::languages::package_fq_name;
 use crate::analyzer::semantic::{PropertyReachingLimits, SourceSpan, ValueFlowRelationKind};
 use crate::analyzer::store::StoreError;
-#[cfg(any(test, feature = "test-support"))]
-use crate::analyzer::store::resolution_operation::GoSelectedExternalImport;
-use crate::analyzer::{
-    DefinitionLanguageScope, DispatchExtensibility, QueryReadIncomplete, RelationalBatchOutcome,
-    RelationalDefinitionQuery, RelationalDefinitionRequest, RelationalDefinitionValue,
-    SignatureMetadata, StructuredTypeIdentity, go_internal_import_allowed,
+use crate::analyzer::store::resolution_operation::{
+    GoExternalPackageProvenance, GoSelectedExternalImport,
 };
+use crate::analyzer::{
+    DefinitionLanguageScope, DispatchExtensibility, QueryReadIncomplete, Range,
+    RelationalBatchOutcome, RelationalDefinitionQuery, RelationalDefinitionRequest,
+    RelationalDefinitionValue, SignatureMetadata, StructuredTypeIdentity,
+    go_internal_import_allowed,
+};
+use brokk_bifrost_core::analyzer::common::node_source_text_trimmed as go_node_text;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
+use brokk_bifrost_core::analyzer::tree_walk::{parent_if_field, root_node};
 use brokk_bifrost_core::analyzer::usages::common::same_node;
 use brokk_bifrost_core::analyzer::{
     PackageRelationKind, PackageRelationValue, RelationalName, model::StructuredTypeNodeView,
 };
 use brokk_bifrost_go::declarations::is_predeclared_go_type;
-use brokk_bifrost_go::graph::reference::go_name_shadowed_at_with_scope;
+use brokk_bifrost_go::graph::reference::{GoReferenceResolution, go_name_shadowed_at_with_scope};
 use tree_sitter::Tree;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,8 +36,14 @@ pub(crate) enum GoWorkspacePackageStatus {
 
 pub(crate) trait GoDefinitionProvider {
     fn fqn(&self, fqn: &str) -> Vec<CodeUnit>;
+    fn fqn_exists(&self, fqn: &str) -> bool {
+        !self.fqn(fqn).is_empty()
+    }
     fn workspace_package_status(&self, import_path: &str) -> GoWorkspacePackageStatus;
     fn workspace_declaration_identities_authoritative(&self) -> bool;
+    fn workspace_package_inventory_complete(&self) -> bool {
+        false
+    }
     fn members_for_owner_name(&self, owner_fqn: &str, name: &str) -> Vec<CodeUnit> {
         self.fqn(&format!("{owner_fqn}.{name}"))
     }
@@ -43,7 +53,11 @@ pub(crate) trait GoDefinitionProvider {
         go: &GoAnalyzer,
         file: &ProjectFile,
     ) -> Vec<ImportInfo> {
-        go.import_info_of(token, file)
+        ResolutionSession::query_limited_rows_with_optional_session(
+            self.session(),
+            |limit| go.import_info_limited(token, file, limit),
+            || go.import_info_of(token, file),
+        )
     }
     fn signature_metadata(
         &self,
@@ -120,6 +134,18 @@ pub(crate) trait GoDefinitionProvider {
         None
     }
 
+    /// The exact declaration of one method published by a modeled external
+    /// interface. This identifies the interface contract; callers must still
+    /// prove the receiver's origin before applying concurrency effects.
+    fn external_interface_receiver_member(
+        &self,
+        _owner_fqn: &str,
+        _member: &str,
+        _parameter_count: usize,
+    ) -> Option<String> {
+        None
+    }
+
     /// One exact nominal result from one exact external declaration-fact
     /// callable. Providers without an activated declaration overlay abstain.
     fn external_callable_result_nominal_type(
@@ -131,10 +157,6 @@ pub(crate) trait GoDefinitionProvider {
         _result_ordinal: usize,
     ) -> Option<GoModeledNominalType> {
         None
-    }
-
-    fn fqn_exists(&self, fqn: &str) -> bool {
-        !self.fqn(fqn).is_empty()
     }
 }
 
@@ -176,7 +198,7 @@ impl<'a> AnalyzerGoDefinitionProvider<'a> {
 
 impl GoDefinitionProvider for AnalyzerGoDefinitionProvider<'_> {
     fn fqn(&self, fqn: &str) -> Vec<CodeUnit> {
-        let mut units: Vec<_> = match self.session {
+        let units: Vec<_> = match self.session {
             Some(session) => session.query_limited_rows(|limit| {
                 self.analyzer
                     .declaration_candidates_by_fqn_limited(fqn, limit, || {
@@ -185,9 +207,7 @@ impl GoDefinitionProvider for AnalyzerGoDefinitionProvider<'_> {
             }),
             None => self.analyzer.definitions(fqn).collect(),
         };
-        sort_units(&mut units);
-        units.dedup();
-        units
+        crate::analyzer::definition_lookup::sort_dedup_units(units)
     }
 
     fn workspace_package_status(&self, import_path: &str) -> GoWorkspacePackageStatus {
@@ -256,32 +276,21 @@ impl GoDefinitionProvider for AnalyzerGoDefinitionProvider<'_> {
             .workspace_declaration_identities_authoritative()
     }
 
+    fn workspace_package_inventory_complete(&self) -> bool {
+        self.analyzer.workspace_package_inventory_complete()
+    }
+
     fn members_for_owner_name(&self, owner_fqn: &str, name: &str) -> Vec<CodeUnit> {
-        let mut units = match self.session {
-            Some(session) => session.query_limited_rows(|limit| {
+        match self.session {
+            Some(session) => super::query_limited_definition_units(session, |limit| {
                 self.analyzer
                     .member_candidates_for_owner_limited(owner_fqn, name, limit, || {
                         session.observe_cancellation()
                     })
             }),
-            None => self.fqn(&format!("{owner_fqn}.{name}")),
-        };
-        sort_units(&mut units);
-        units.dedup();
-        units
-    }
-
-    fn import_infos(
-        &self,
-        token: QueryToken<'_>,
-        go: &GoAnalyzer,
-        file: &ProjectFile,
-    ) -> Vec<ImportInfo> {
-        match self.session {
-            Some(session) => {
-                session.query_limited_rows(|limit| go.import_info_limited(token, file, limit))
-            }
-            None => go.import_info_of(token, file),
+            None => crate::analyzer::definition_lookup::sort_dedup_units(
+                self.fqn(&format!("{owner_fqn}.{name}")),
+            ),
         }
     }
 
@@ -290,19 +299,19 @@ impl GoDefinitionProvider for AnalyzerGoDefinitionProvider<'_> {
         analyzer: &dyn IAnalyzer,
         unit: &CodeUnit,
     ) -> Vec<SignatureMetadata> {
-        match self.session {
-            Some(session) => session
-                .query_limited_rows(|limit| self.analyzer.signature_metadata_limited(unit, limit)),
-            None => analyzer.signature_metadata(unit),
-        }
+        ResolutionSession::query_limited_rows_with_optional_session(
+            self.session,
+            |limit| self.analyzer.signature_metadata_limited(unit, limit),
+            || analyzer.signature_metadata(unit),
+        )
     }
 
     fn scope_step(&self) -> bool {
-        self.session.is_none_or(ResolutionSession::scope_step)
+        super::session_scope_step(self.session())
     }
 
     fn summary_step(&self) -> bool {
-        self.session.is_none_or(ResolutionSession::summary_step)
+        super::summary_step(self.session)
     }
 
     fn session(&self) -> Option<&ResolutionSession> {
@@ -382,6 +391,19 @@ impl GoDefinitionProvider for AnalyzerGoDefinitionProvider<'_> {
         .map(|method| method.qualified_name.clone())
     }
 
+    fn external_interface_receiver_member(
+        &self,
+        owner_fqn: &str,
+        member: &str,
+        parameter_count: usize,
+    ) -> Option<String> {
+        crate::analyzer::go::package_identity::GoOverlayPackages::new(
+            self.semantic_model_overlay.as_deref(),
+        )
+        .interface_receiver_method(owner_fqn, member, parameter_count)
+        .map(|method| method.qualified_name.clone())
+    }
+
     fn external_callable_result_nominal_type(
         &self,
         owner_fqn: &str,
@@ -405,43 +427,23 @@ impl GoDefinitionProvider for AnalyzerGoDefinitionProvider<'_> {
 
 fn go_smallest_named_node_covering<'tree>(
     support: &dyn GoDefinitionProvider,
-    mut node: Node<'tree>,
+    node: Node<'tree>,
     start: usize,
     end: usize,
 ) -> Option<Node<'tree>> {
-    if !support.scope_step() || node.end_byte() < end || node.start_byte() > start {
-        return None;
-    }
-    loop {
-        let mut cursor = node.walk();
-        let mut containing_child = None;
-        for child in node.named_children(&mut cursor) {
-            if !support.scope_step() {
-                return None;
-            }
-            if child.start_byte() <= start && child.end_byte() >= end {
-                containing_child = Some(child);
-                break;
-            }
-        }
-        match containing_child {
-            Some(child) => node = child,
-            None => return Some(node),
-        }
-    }
+    brokk_bifrost_core::analyzer::usages::reference_site::smallest_named_node_covering_with_scope(
+        node,
+        start,
+        end,
+        || support.scope_step(),
+    )
 }
 
 fn go_fqn_candidates(
     support: &dyn GoDefinitionProvider,
     fqns: impl IntoIterator<Item = String>,
 ) -> Vec<CodeUnit> {
-    let mut candidates = Vec::new();
-    for fqn in fqns {
-        candidates.extend(support.fqn(&fqn));
-    }
-    sort_units(&mut candidates);
-    candidates.dedup();
-    candidates
+    crate::analyzer::definition_lookup::collect_fqn_candidates(fqns, |fqn| support.fqn(fqn))
 }
 
 /// Memoized on exact source bytes (#2679): the package-selector chain probe
@@ -453,6 +455,167 @@ pub(crate) fn parse_go_tree(source: &str) -> Option<Tree> {
     GO_TREES.parse(source, brokk_bifrost_go::parse::parse_go)
 }
 
+/// Recover the result type of a known function-valued call expression from
+/// the same structured local-value inference used by Go navigation.
+///
+/// The call resolver may leave a function-valued binding without dispatch
+/// arms because its value flow is local rather than declaration-target based.
+/// This narrow adapter still has a positive proof when the callee's selected
+/// expression has one indexed result type. Unknown bindings and modeled-only
+/// values deliberately abstain.
+pub(crate) fn go_function_value_result_type_identity(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    range: Range,
+    result_ordinal: usize,
+) -> Option<StructuredTypeIdentity> {
+    if file.declaration_language() != Language::Go || range.start_byte >= range.end_byte {
+        return None;
+    }
+    let source = analyzer.indexed_source(file)?;
+    let tree = parse_go_tree(&source)?;
+    let root = tree.root_node();
+    let mut node = smallest_named_node_covering(root, range.start_byte, range.end_byte)?;
+    while node.kind() != "call_expression" {
+        node = node.parent()?;
+    }
+    if node.has_error() {
+        return None;
+    }
+    let function = node.child_by_field_name("function")?;
+    let go = resolve_analyzer::<GoAnalyzer>(analyzer)?;
+    let support = AnalyzerGoDefinitionProvider::new(go, analyzer.semantic_model_overlay());
+    let scope = AnalyzerQueryScope::new(analyzer);
+    if function.kind() == "identifier"
+        && let Some(GoLocalBinding::Type(type_node)) = go_nearest_visible_binding_with_evaluation(
+            &support,
+            root,
+            &source,
+            go_node_text(function, &source),
+            function.start_byte(),
+            GoLexicalEvaluation::ordinary(),
+        )
+    {
+        if type_node.kind() != "function_type" {
+            let token = scope.token();
+            let type_fqn =
+                go_resolve_type_fqn(analyzer, token, &support, file, &source, type_node)?;
+            let units = support.fqn(&type_fqn);
+            let [unit] = units.as_slice() else {
+                return None;
+            };
+            let type_source = analyzer.indexed_source(unit.source())?;
+            let type_tree = parse_go_tree(&type_source)?;
+            let type_root = type_tree.root_node();
+            let function_type = go_named_function_type_node(
+                type_root,
+                &type_source,
+                go_node_text(type_node, &source).trim(),
+            )?;
+            if function_type.has_error() {
+                return None;
+            }
+            let result_type = go_function_type_result_type_node(function_type, result_ordinal)?;
+            if go_node_text(result_type, &type_source).trim() != "error"
+                || go_name_shadowed_at_with_scope(
+                    type_root,
+                    &type_source,
+                    result_type.start_byte(),
+                    "error",
+                    || support.scope_step(),
+                ) != Some(false)
+            {
+                return None;
+            }
+            return crate::analyzer::go::go_structured_type_identity_bounded(
+                result_type,
+                &type_source,
+                || support.scope_step(),
+            );
+        }
+        let result_type = go_function_type_result_type_node(type_node, result_ordinal)?;
+        if go_node_text(result_type, &source).trim() == "error"
+            && go_name_shadowed_at_with_scope(
+                root,
+                &source,
+                result_type.start_byte(),
+                "error",
+                || support.scope_step(),
+            ) == Some(false)
+        {
+            return crate::analyzer::go::go_structured_type_identity_bounded(
+                result_type,
+                &source,
+                || support.scope_step(),
+            );
+        }
+        return None;
+    }
+    let inferred = go_expression_inferred_type(
+        analyzer,
+        scope.token(),
+        &support,
+        file,
+        &source,
+        root,
+        function,
+        function.start_byte(),
+        0,
+    )?;
+    inferred.indexed_identity().cloned()
+}
+
+fn go_named_function_type_node<'tree>(
+    root: Node<'tree>,
+    source: &str,
+    name: &str,
+) -> Option<Node<'tree>> {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "type_spec"
+            && node
+                .child_by_field_name("name")
+                .is_some_and(|candidate| go_node_text(candidate, source).trim() == name)
+        {
+            let type_node = node.child_by_field_name("type")?;
+            if type_node.kind() == "function_type" {
+                return Some(type_node);
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    None
+}
+
+fn go_function_type_result_type_node(type_node: Node<'_>, ordinal: usize) -> Option<Node<'_>> {
+    let result = type_node.child_by_field_name("result")?;
+    if result.kind() != "parameter_list" {
+        return (ordinal == 0).then_some(result);
+    }
+    let mut current_ordinal = 0usize;
+    let mut cursor = result.walk();
+    for parameter in result.named_children(&mut cursor) {
+        if !matches!(
+            parameter.kind(),
+            "parameter_declaration" | "variadic_parameter_declaration"
+        ) {
+            continue;
+        }
+        let mut names = parameter.walk();
+        let named_count = parameter
+            .named_children(&mut names)
+            .filter(|child| child.kind() == "identifier")
+            .count()
+            .max(1);
+        if ordinal < current_ordinal.saturating_add(named_count) {
+            return parameter.child_by_field_name("type");
+        }
+        current_ordinal = current_ordinal.saturating_add(named_count);
+    }
+    None
+}
+
 pub(crate) fn resolve_go_bounded(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
@@ -462,29 +625,30 @@ pub(crate) fn resolve_go_bounded(
     budget: ReceiverAnalysisBudget,
     cancellation: Option<&CancellationToken>,
 ) -> BoundedResolution<DefinitionLookupOutcome> {
-    let session = ResolutionSession::bounded(budget, cancellation);
-    let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer) else {
-        return session.finish(no_definition(
-            "go_analyzer_unavailable",
-            "Go analyzer is unavailable",
-        ));
-    };
-    let definitions =
-        AnalyzerGoDefinitionProvider::bounded(go, &session, analyzer.semantic_model_overlay());
-    let selector = tree.and_then(|tree| {
-        go_selector_descriptor_with_scope(tree.root_node(), site, || definitions.scope_step())
-    });
-    let outcome = resolve_go(
+    super::with_bounded_go_definition_provider(
         analyzer,
-        &definitions,
-        file,
-        source,
-        tree,
-        site,
-        selector.as_ref(),
-        None,
-    );
-    session.finish(outcome.outcome)
+        budget,
+        cancellation,
+        || no_definition("go_analyzer_unavailable", "Go analyzer is unavailable"),
+        |definitions| {
+            let selector = tree.and_then(|tree| {
+                go_selector_descriptor_with_scope(tree.root_node(), site, || {
+                    definitions.scope_step()
+                })
+            });
+            resolve_go(
+                analyzer,
+                definitions,
+                file,
+                source,
+                tree,
+                site,
+                selector.as_ref(),
+                None,
+            )
+            .outcome
+        },
+    )
 }
 
 pub(super) struct GoDefinitionResolution {
@@ -510,18 +674,12 @@ impl GoCallEvidence {
     }
 
     fn record_external_identity(&mut self, owner_fqn: &str, member: &str) {
-        let identity = ResolverOwnedExternalCalleeIdentity::new(
+        super::record_external_member_identity(
+            &mut self.external_callee_identity,
             Language::Go,
-            owner_fqn.to_owned(),
-            member.to_owned(),
+            owner_fqn,
+            member,
         );
-        debug_assert!(
-            self.external_callee_identity
-                .as_ref()
-                .is_none_or(|existing| existing == &identity),
-            "one Go call cannot resolve to conflicting external identities"
-        );
-        self.external_callee_identity = Some(identity);
     }
 }
 
@@ -815,6 +973,18 @@ fn resolve_go_outcome(
                     ClaimSubjectRole::Module,
                 ),
             );
+        }
+        if resolution.resolved_import_packages.len() == 1
+            && tree
+                .is_some_and(|tree| go_identifier_is_call_target(support, tree.root_node(), site))
+            && let Some(outcome) = go_dot_import_package_scope_conflict_outcome(
+                support,
+                &importer_package,
+                reference,
+                &external_packages,
+            )
+        {
+            return outcome;
         }
         if let [package] = external_packages.as_slice() {
             if go_internal_import_allowed(&importer_package, package)
@@ -1288,11 +1458,22 @@ fn go_composite_key_identifier_name(
     key: Node<'_>,
     source: &str,
 ) -> Option<String> {
+    let (identifier, has_extra_child) = go_composite_key_identifier(support, key)?;
+    if has_extra_child || !matches!(identifier.kind(), "identifier" | "field_identifier") {
+        return None;
+    }
+    Some(go_node_text(identifier, source).to_string())
+}
+
+fn go_composite_key_identifier<'tree>(
+    support: &dyn GoDefinitionProvider,
+    key: Node<'tree>,
+) -> Option<(Node<'tree>, bool)> {
     if !support.scope_step() {
         return None;
     }
     if matches!(key.kind(), "identifier" | "field_identifier") {
-        return Some(go_node_text(key, source).to_string());
+        return Some((key, false));
     }
     if key.kind() != "literal_element" {
         return None;
@@ -1300,11 +1481,10 @@ fn go_composite_key_identifier_name(
     let mut cursor = key.walk();
     let mut children = key.named_children(&mut cursor);
     let child = children.next()?;
-    if !support.scope_step() || children.next().is_some() {
+    if !support.scope_step() {
         return None;
     }
-    matches!(child.kind(), "identifier" | "field_identifier")
-        .then(|| go_node_text(child, source).to_string())
+    Some((child, children.next().is_some()))
 }
 
 fn go_keyed_element_containing_key<'tree>(
@@ -1331,29 +1511,14 @@ fn go_simple_composite_key_identifier<'tree>(
     key: Node<'tree>,
     selected: Node<'tree>,
 ) -> Option<Node<'tree>> {
-    if !support.scope_step() {
+    let (identifier, has_extra_child) = go_composite_key_identifier(support, key)?;
+    if has_extra_child {
+        let _ = support.scope_step();
         return None;
     }
-    let identifier = if matches!(key.kind(), "identifier" | "field_identifier") {
-        key
-    } else if key.kind() == "literal_element" {
-        let mut cursor = key.walk();
-        let mut children = key.named_children(&mut cursor);
-        let child = children.next()?;
-        if !support.scope_step() {
-            return None;
-        }
-        if let Some(_extra) = children.next() {
-            let _ = support.scope_step();
-            return None;
-        }
-        if !matches!(child.kind(), "identifier" | "field_identifier") {
-            return None;
-        }
-        child
-    } else {
+    if !matches!(identifier.kind(), "identifier" | "field_identifier") {
         return None;
-    };
+    }
     (identifier.start_byte() <= selected.start_byte()
         && selected.end_byte() <= identifier.end_byte())
     .then_some(identifier)
@@ -1505,7 +1670,11 @@ fn go_composite_owner_map_key_step<'tree>(
 ) -> Option<GoCompositeOwnerRef<'tree>> {
     match owner {
         GoCompositeOwnerRef::Syntax(owner_type) => {
-            if let Some(key) = go_composite_map_key_type(support, owner_type) {
+            if let Some(key) =
+                brokk_bifrost_go::graph::ast::go_map_key_type_with_scope(owner_type, || {
+                    support.scope_step()
+                })
+            {
                 return Some(GoCompositeOwnerRef::Syntax(key));
             }
             go_named_underlying_composite_owner(analyzer, token, support, file, source, owner_type)?
@@ -1515,13 +1684,12 @@ fn go_composite_owner_map_key_step<'tree>(
             file,
             package,
             identity,
-        } => identity
-            .into_map_key_with(|| support.scope_step())
-            .map(|identity| GoCompositeOwnerRef::IndexedType {
-                file,
-                package,
-                identity,
-            }),
+        } => GoCompositeOwnerRef::IndexedType {
+            file,
+            package,
+            identity,
+        }
+        .and_then_map_key(support),
     }
 }
 
@@ -1535,7 +1703,11 @@ fn go_composite_owner_container_step<'tree>(
 ) -> Option<GoCompositeOwnerRef<'tree>> {
     match owner {
         GoCompositeOwnerRef::Syntax(owner_type) => {
-            if let Some(element) = go_composite_container_element_or_value_type(support, owner_type)
+            if let Some(element) =
+                brokk_bifrost_go::graph::ast::go_container_element_or_value_type_with_scope(
+                    owner_type,
+                    || support.scope_step(),
+                )
             {
                 return Some(GoCompositeOwnerRef::Syntax(element));
             }
@@ -1546,49 +1718,42 @@ fn go_composite_owner_container_step<'tree>(
             file,
             package,
             identity,
-        } => identity
-            .into_container_element_with(|| support.scope_step())
-            .map(|identity| GoCompositeOwnerRef::IndexedType {
-                file,
-                package,
-                identity,
-            }),
+        } => GoCompositeOwnerRef::IndexedType {
+            file,
+            package,
+            identity,
+        }
+        .and_then_container_element(support),
     }
 }
 
 impl<'tree> GoCompositeOwnerRef<'tree> {
-    fn and_then_container_element(self, support: &dyn GoDefinitionProvider) -> Option<Self> {
+    fn and_then_indexed_type(
+        self,
+        transform: impl FnOnce(StructuredTypeIdentity) -> Option<StructuredTypeIdentity>,
+    ) -> Option<Self> {
         match self {
             Self::IndexedType {
                 file,
                 package,
                 identity,
-            } => identity
-                .into_container_element_with(|| support.scope_step())
-                .map(|identity| Self::IndexedType {
-                    file,
-                    package,
-                    identity,
-                }),
+            } => transform(identity).map(|identity| Self::IndexedType {
+                file,
+                package,
+                identity,
+            }),
             Self::Syntax(_) => None,
         }
     }
 
+    fn and_then_container_element(self, support: &dyn GoDefinitionProvider) -> Option<Self> {
+        self.and_then_indexed_type(|identity| {
+            identity.into_container_element_with(|| support.scope_step())
+        })
+    }
+
     fn and_then_map_key(self, support: &dyn GoDefinitionProvider) -> Option<Self> {
-        match self {
-            Self::IndexedType {
-                file,
-                package,
-                identity,
-            } => identity
-                .into_map_key_with(|| support.scope_step())
-                .map(|identity| Self::IndexedType {
-                    file,
-                    package,
-                    identity,
-                }),
-            Self::Syntax(_) => None,
-        }
+        self.and_then_indexed_type(|identity| identity.into_map_key_with(|| support.scope_step()))
     }
 }
 
@@ -1647,7 +1812,10 @@ fn go_composite_owner_keyed_value_step<'tree>(
         GoCompositeOwnerRef::Syntax(owner_type) => {
             if matches!(owner_type.kind(), "map_type" | "array_type" | "slice_type") {
                 return Some(GoCompositeOwnerRef::Syntax(
-                    go_composite_container_element_or_value_type(support, owner_type)?,
+                    brokk_bifrost_go::graph::ast::go_container_element_or_value_type_with_scope(
+                        owner_type,
+                        || support.scope_step(),
+                    )?,
                 ));
             }
             if let Some(owner) = go_named_underlying_composite_owner(
@@ -1711,54 +1879,7 @@ fn go_composite_owner_keyed_value_step<'tree>(
         });
     }
 
-    match owner {
-        GoCompositeOwnerRef::IndexedType {
-            file,
-            package,
-            identity,
-        } => identity
-            .into_container_element_with(|| support.scope_step())
-            .map(|identity| GoCompositeOwnerRef::IndexedType {
-                file,
-                package,
-                identity,
-            }),
-        GoCompositeOwnerRef::Syntax(_) => None,
-    }
-}
-
-fn go_composite_container_element_or_value_type<'tree>(
-    support: &dyn GoDefinitionProvider,
-    mut node: Node<'tree>,
-) -> Option<Node<'tree>> {
-    loop {
-        if !support.scope_step() {
-            return None;
-        }
-        match node.kind() {
-            "array_type" => return node.child_by_field_name("element"),
-            "slice_type" => return node.named_child(0),
-            "map_type" => return node.child_by_field_name("value"),
-            "pointer_type" | "parenthesized_type" => node = node.named_child(0)?,
-            _ => return None,
-        }
-    }
-}
-
-fn go_composite_map_key_type<'tree>(
-    support: &dyn GoDefinitionProvider,
-    mut node: Node<'tree>,
-) -> Option<Node<'tree>> {
-    loop {
-        if !support.scope_step() {
-            return None;
-        }
-        match node.kind() {
-            "map_type" => return node.child_by_field_name("key"),
-            "pointer_type" | "parenthesized_type" => node = node.named_child(0)?,
-            _ => return None,
-        }
-    }
+    owner.and_then_container_element(support)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1769,9 +1890,269 @@ pub(crate) enum GoTypeLookupResolutionKind {
 
 #[derive(Debug, Clone)]
 pub(crate) struct GoTypeLookupResolution {
+    /// Nominal lookup key used to find the source declaration.
     pub(crate) fqn: String,
+    /// Go pointer layers belong in the reported type spelling, while the
+    /// declaration lookup remains keyed by the nominal type.
+    pub(crate) pointer_depth: usize,
     pub(crate) kind: GoTypeLookupResolutionKind,
     pub(crate) member_name: Option<String>,
+}
+
+impl GoTypeLookupResolution {
+    pub(crate) fn result_fqn(&self) -> String {
+        format!("{}{}", "*".repeat(self.pointer_depth), self.fqn)
+    }
+}
+
+/// A selector target recovered from the receiver's structured Go type fact.
+/// Workspace methods retain the declaration selected by Go's method set;
+/// external methods retain only their canonical model key and call-shape
+/// proof, never an invented body.
+#[derive(Debug, Clone)]
+pub(crate) struct GoTypedSelectorTarget {
+    pub(crate) member: String,
+    pub(crate) receiver_is_interface: bool,
+    pub(crate) external_concrete_owner_fqn: Option<String>,
+    pub(crate) workspace_methods: Vec<CodeUnit>,
+    pub(crate) external_callee: Option<String>,
+    pub(crate) external_call: Option<ExactExternalCallProof>,
+}
+
+/// Resolve one exact Go selector call using the same structured expression
+/// inference and method-set rules as ordinary Go definition lookup. The
+/// caller supplies nodes from the call site's already-paid parse tree.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn go_typed_selector_target(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    receiver: Node<'_>,
+    callable: Node<'_>,
+    member: &str,
+    byte: usize,
+    budget: ReceiverAnalysisBudget,
+    cancellation: Option<&CancellationToken>,
+) -> BoundedResolution<Option<GoTypedSelectorTarget>> {
+    let session = ResolutionSession::bounded(budget, cancellation);
+    let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer) else {
+        return session.finish(None);
+    };
+    let support =
+        AnalyzerGoDefinitionProvider::bounded(go, &session, analyzer.semantic_model_overlay());
+    // A package-qualified function such as `time.NewTicker` is also a Go
+    // selector expression, but its left identifier names an import namespace
+    // rather than a receiver value. Keep it on the package-function resolver
+    // path so its reviewed call proof is not replaced with a receiver proof.
+    if matches!(receiver.kind(), "identifier" | "package_identifier")
+        && go_nearest_visible_binding(
+            &support,
+            root,
+            source,
+            go_node_text(receiver, source),
+            receiver.start_byte(),
+        )
+        .is_none()
+        && go_import_paths(&support, token, go, file).contains_key(go_node_text(receiver, source))
+    {
+        return session.finish(None);
+    }
+    let Some(inferred) = go_expression_inferred_type(
+        analyzer, token, &support, file, source, root, receiver, byte, 0,
+    ) else {
+        return session.finish(None);
+    };
+    let Some((owner_fqn, owner_is_external)) =
+        go_selector_owner_fqn(&support, token, go, &inferred)
+    else {
+        return session.finish(None);
+    };
+    let Some(parameter_count) =
+        go_callable_modeled_argument_count(&support, token, go, file, source, callable)
+    else {
+        return session.finish(None);
+    };
+
+    if owner_is_external {
+        let model_overlay = analyzer.semantic_model_overlay();
+        let overlay = GoOverlayPackages::new(model_overlay.as_deref());
+        let receiver_is_interface = overlay.receiver_is_interface(&owner_fqn).unwrap_or(false);
+        let receiver_is_struct = overlay.receiver_is_struct(&owner_fqn).unwrap_or(false);
+        let modeled = go_modeled_receiver_lookup_with_promotion(
+            analyzer,
+            token,
+            &support,
+            &owner_fqn,
+            member,
+            inferred.admits_pointer_receivers(),
+            parameter_count,
+        );
+        let callee = match &modeled {
+            GoModeledReceiverLookup::Unique(candidate) => candidate.target.clone(),
+            GoModeledReceiverLookup::Missing | GoModeledReceiverLookup::Ambiguous => {
+                format!("{owner_fqn}.{member}")
+            }
+        };
+        let external_concrete_owner_fqn = if receiver_is_interface || !receiver_is_struct {
+            None
+        } else {
+            match &modeled {
+                GoModeledReceiverLookup::Unique(candidate) => Some(candidate.owner_fqn.clone()),
+                GoModeledReceiverLookup::Missing => Some(owner_fqn.clone()),
+                GoModeledReceiverLookup::Ambiguous => None,
+            }
+        };
+        let parameter_count = u32::try_from(parameter_count)
+            .expect("validated Go call argument count fits the semantic model schema");
+        let external_call = match (
+            receiver_is_interface,
+            overlay.receiver_is_struct(&owner_fqn),
+            &modeled,
+        ) {
+            (true, _, _) => {
+                ExactExternalCallProof::go_interface_receiver(callee.clone(), parameter_count)
+            }
+            (false, Some(true), GoModeledReceiverLookup::Unique(_)) => {
+                ExactExternalCallProof::go_concrete_receiver(callee.clone(), parameter_count)
+            }
+            (false, _, _) => {
+                ExactExternalCallProof::go_receiver_candidate(callee.clone(), parameter_count)
+            }
+        };
+        return session.finish(Some(GoTypedSelectorTarget {
+            member: member.to_owned(),
+            receiver_is_interface,
+            external_concrete_owner_fqn,
+            workspace_methods: Vec::new(),
+            external_callee: Some(callee),
+            external_call: Some(external_call),
+        }));
+    }
+
+    let Some(owner_fqn) = go_resolve_selector_alias_owner(go, &owner_fqn) else {
+        return session.finish(None);
+    };
+    let methods = match go_indexed_field_lookup_with_method_set(
+        analyzer,
+        token,
+        &support,
+        &owner_fqn,
+        member,
+        Some(&inferred),
+    ) {
+        GoDefinitionMemberLookup::Missing => return session.finish(None),
+        GoDefinitionMemberLookup::Unique(method) => vec![method],
+        GoDefinitionMemberLookup::Ambiguous(methods) => methods,
+    };
+    let Some(receiver_is_interface) = methods.iter().try_fold(false, |is_interface, method| {
+        go_method_is_interface_method(analyzer, &support, method)
+            .map(|candidate_is_interface| is_interface || candidate_is_interface)
+    }) else {
+        return session.finish(None);
+    };
+    session.finish(Some(GoTypedSelectorTarget {
+        member: member.to_owned(),
+        receiver_is_interface,
+        external_concrete_owner_fqn: None,
+        workspace_methods: methods,
+        external_callee: None,
+        external_call: None,
+    }))
+}
+
+/// Resolve the concrete method represented by one exhaustive heap allocation.
+/// A value allocated as `T` has T's value method set even when the allocation
+/// expression itself is addressable; only a pointer allocation admits pointer
+/// receiver methods here.
+#[allow(clippy::too_many_arguments)]
+pub fn go_allocation_selector_method(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    allocation: Node<'_>,
+    member: &str,
+    byte: usize,
+    budget: ReceiverAnalysisBudget,
+    cancellation: Option<&CancellationToken>,
+) -> BoundedResolution<Option<CodeUnit>> {
+    let session = ResolutionSession::bounded(budget, cancellation);
+    let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer) else {
+        return session.finish(None);
+    };
+    let support =
+        AnalyzerGoDefinitionProvider::bounded(go, &session, analyzer.semantic_model_overlay());
+    let Some(mut inferred) = go_expression_inferred_type(
+        analyzer, token, &support, file, source, root, allocation, byte, 0,
+    ) else {
+        return session.finish(None);
+    };
+    inferred.addressable = false;
+    let Some((owner_fqn, owner_is_external)) =
+        go_selector_owner_fqn(&support, token, go, &inferred)
+    else {
+        return session.finish(None);
+    };
+    if owner_is_external {
+        return session.finish(None);
+    }
+    let Some(owner_fqn) = go_resolve_selector_alias_owner(go, &owner_fqn) else {
+        return session.finish(None);
+    };
+    let method = match go_indexed_field_lookup_with_method_set(
+        analyzer,
+        token,
+        &support,
+        &owner_fqn,
+        member,
+        Some(&inferred),
+    ) {
+        GoDefinitionMemberLookup::Unique(method) => Some(method),
+        GoDefinitionMemberLookup::Missing | GoDefinitionMemberLookup::Ambiguous(_) => None,
+    };
+    if method.as_ref().is_some_and(|method| {
+        go_method_is_interface_method(analyzer, &support, method) != Some(false)
+    }) {
+        return session.finish(None);
+    }
+    session.finish(method)
+}
+
+fn go_resolve_selector_alias_owner(go: &GoAnalyzer, owner_fqn: &str) -> Option<String> {
+    let edge_index = go.usage_edge_index().ok()?;
+    let resolved = edge_index.resolve_type_alias(owner_fqn);
+    if resolved != owner_fqn {
+        Some(resolved)
+    } else {
+        edge_index
+            .is_known_non_alias_type(owner_fqn)
+            .then(|| owner_fqn.to_owned())
+    }
+}
+
+fn go_method_is_interface_method(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn GoDefinitionProvider,
+    method: &CodeUnit,
+) -> Option<bool> {
+    if !method.is_function() || !method.owner_is_type_scope() {
+        return None;
+    }
+    let mut has_receiver = None;
+    for metadata in support.signature_metadata(analyzer, method) {
+        if !support.scope_step() {
+            return None;
+        }
+        let current = metadata.extension_receiver_type_identity().is_some();
+        if has_receiver.is_some_and(|previous| previous != current) {
+            return None;
+        }
+        has_receiver = Some(current);
+    }
+    has_receiver.map(|has_receiver| !has_receiver)
 }
 
 pub(crate) fn go_type_lookup_resolution(
@@ -1785,18 +2166,20 @@ pub(crate) fn go_type_lookup_resolution(
 ) -> Option<GoTypeLookupResolution> {
     let node =
         go_smallest_named_node_covering(support, root, site.focus_start_byte, site.focus_end_byte)?;
-    if let Some((fqn, member_name)) =
-        go_interface_method_owner_type_fqn(support, file, source, root, node)
+    if let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer)
+        && let Some((fqn, member_name)) =
+            go_interface_method_owner_type_fqn(go, support, file, source, root, node)
     {
         return Some(GoTypeLookupResolution {
             fqn,
+            pointer_depth: 0,
             kind: GoTypeLookupResolutionKind::InterfaceMethodOwner,
             member_name: Some(member_name),
         });
     }
 
     let expression = go_type_lookup_expression(support, node)?;
-    let fqn = go_expression_type_fqn(
+    let (fqn, pointer_depth) = go_expression_type_fqn_and_pointer_depth(
         analyzer,
         token,
         support,
@@ -1809,6 +2192,7 @@ pub(crate) fn go_type_lookup_resolution(
     )?;
     Some(GoTypeLookupResolution {
         fqn,
+        pointer_depth,
         kind: GoTypeLookupResolutionKind::Expression,
         member_name: None,
     })
@@ -1824,7 +2208,14 @@ fn go_package_name(
         return None;
     }
     let declared = match root {
-        Some(root) => go_declared_package_name(support, root, source)?,
+        Some(root) => {
+            if !support.scope_step() {
+                return None;
+            }
+            crate::analyzer::go::try_determine_go_package_name(root, source, || {
+                support.scope_step()
+            })?
+        }
         None if support.session().is_none() => parse_go_tree(source)
             .map(|tree| crate::analyzer::go::determine_go_package_name(tree.root_node(), source))
             .unwrap_or_default(),
@@ -1833,35 +2224,6 @@ fn go_package_name(
     Some(crate::analyzer::go::packages::canonical_go_package_name(
         file, &declared,
     ))
-}
-
-fn go_declared_package_name(
-    support: &dyn GoDefinitionProvider,
-    root: Node<'_>,
-    source: &str,
-) -> Option<String> {
-    if !support.scope_step() {
-        return None;
-    }
-    let mut cursor = root.walk();
-    for child in root.named_children(&mut cursor) {
-        if !support.scope_step() {
-            return None;
-        }
-        if child.kind() != "package_clause" {
-            continue;
-        }
-        let mut package_cursor = child.walk();
-        for package_child in child.named_children(&mut package_cursor) {
-            if !support.scope_step() {
-                return None;
-            }
-            if matches!(package_child.kind(), "package_identifier" | "identifier") {
-                return Some(go_node_text(package_child, source).to_string());
-            }
-        }
-    }
-    Some(String::new())
 }
 
 /// The file import names whose structured namespace has exactly one distinct
@@ -1914,7 +2276,6 @@ pub(crate) fn go_imported_package_at_range(
     go_import_paths(&support, scope.token(), go, file).remove(name)
 }
 
-#[cfg(any(test, feature = "test-support"))]
 pub(super) fn go_native_external_import_binding_resolution(
     query: crate::analyzer::languages::BoundedReceiverQuery<'_>,
     go: &GoAnalyzer,
@@ -1960,6 +2321,209 @@ pub(super) fn go_native_external_import_binding_resolution(
     Some(outcome)
 }
 
+pub(super) fn go_native_import_namespace_resolution(
+    query: crate::analyzer::languages::BoundedReceiverQuery<'_>,
+    go: &GoAnalyzer,
+    session: &ResolutionSession,
+) -> Option<DefinitionLookupOutcome> {
+    let tree = query.tree?;
+    let selector =
+        brokk_bifrost_go::graph::reference::go_selector_descriptor(tree.root_node(), query.site)?;
+    if selector.focus_segment != 0
+        || !matches!(selector.base.kind(), "identifier" | "package_identifier")
+    {
+        return None;
+    }
+    let support =
+        AnalyzerGoDefinitionProvider::bounded(go, session, query.analyzer.semantic_model_overlay());
+    let query_scope = AnalyzerQueryScope::new(query.analyzer);
+    let token = query_scope.token();
+    let alias = go_node_text(selector.base, query.source);
+    if go_nearest_visible_binding(
+        &support,
+        tree.root_node(),
+        query.source,
+        alias,
+        query.site.focus_start_byte,
+    )
+    .is_some()
+    {
+        return None;
+    }
+    let package = go_import_paths(&support, token, go, query.file).remove(alias)?;
+    let workspace_status = go_workspace_package_status(&support, &package);
+    let mut outcome = match workspace_status {
+        GoWorkspacePackageStatus::Present => no_definition(
+            "workspace_package_namespace",
+            format!(
+                "`{alias}` names a Go package in this workspace, not a single indexed declaration"
+            ),
+        ),
+        GoWorkspacePackageStatus::Absent => go_workspace_package_boundary(
+            &package,
+            workspace_status,
+            format!("`{package}` is outside this partial Go workspace analysis"),
+            "no_indexed_definition",
+            format!("`{alias}` is not indexed in Go package `{package}`"),
+        ),
+        GoWorkspacePackageStatus::Unknown => go_workspace_package_status_unknown(&package),
+    };
+    outcome.reference = Some(query.site.clone());
+    Some(outcome)
+}
+
+pub(super) fn go_native_external_dot_import_call_resolution(
+    query: crate::analyzer::languages::BoundedReceiverQuery<'_>,
+    go: &GoAnalyzer,
+    session: &ResolutionSession,
+) -> Option<(
+    DefinitionLookupOutcome,
+    Option<ExactExternalCallProof>,
+    CallApplicationKind,
+    Option<ResolverOwnedExternalCalleeIdentity>,
+)> {
+    let tree = query.tree?;
+    let root = tree.root_node();
+    let support =
+        AnalyzerGoDefinitionProvider::bounded(go, session, query.analyzer.semantic_model_overlay());
+    let callable = go_smallest_named_node_covering(
+        &support,
+        root,
+        query.site.focus_start_byte,
+        query.site.focus_end_byte,
+    )?;
+    if !matches!(callable.kind(), "identifier" | "package_identifier")
+        || go_call_for_callable(&support, callable).is_none()
+    {
+        return None;
+    }
+    let name = go_node_text(callable, query.source);
+    if go_nearest_visible_binding(
+        &support,
+        root,
+        query.source,
+        name,
+        query.site.focus_start_byte,
+    )
+    .is_some()
+    {
+        return None;
+    }
+    // Go universe identifiers take precedence over dot-imported package
+    // members. Local bindings were checked above because they can shadow the
+    // universe; a published model member cannot.
+    if brokk_bifrost_go::diagnostics::is_predeclared_go_name(name) {
+        return None;
+    }
+    let query_scope = AnalyzerQueryScope::new(query.analyzer);
+    let token = query_scope.token();
+    let dot_imports = go_dot_import_paths(go, &support, token, query.file);
+    if dot_imports.is_empty() {
+        return None;
+    }
+    let mut external_imports = Vec::new();
+    for package in &dot_imports {
+        match go_workspace_package_status(&support, package) {
+            GoWorkspacePackageStatus::Present => {}
+            GoWorkspacePackageStatus::Absent => external_imports.push(package.as_str()),
+            GoWorkspacePackageStatus::Unknown => return None,
+        }
+    }
+    if external_imports.is_empty() {
+        return None;
+    }
+    if dot_imports.len() != 1 {
+        return Some((
+            boundary_unchecked(
+                format!(
+                    "dot-imported `{name}` is ambiguous across external packages {external_imports:?}"
+                ),
+                UnindexedClaim::external_boundary_many(external_imports, ClaimSubjectRole::Module),
+            ),
+            None,
+            CallApplicationKind::PackageFunction,
+            None,
+        ));
+    }
+
+    let package = &dot_imports[0];
+    let importer_package = go_package_name(&support, query.file, query.source, Some(root))?;
+    let package_scope_candidates = go_package_member_candidates(&support, &importer_package, name);
+    let model_publishes_member = support
+        .external_visible_package_member(package, name)
+        .is_some();
+    if !package_scope_candidates.is_empty() {
+        if model_publishes_member {
+            if let Some(outcome) = go_dot_import_package_scope_conflict_outcome(
+                &support,
+                &importer_package,
+                name,
+                &external_imports,
+            ) {
+                return Some((outcome, None, CallApplicationKind::PackageFunction, None));
+            }
+        } else {
+            return None;
+        }
+    }
+    let mut evidence = GoCallEvidence {
+        application: CallApplicationKind::PackageFunction,
+        dispatch_extensibility: None,
+        exact_external_call: None,
+        external_callee_identity: None,
+    };
+    if let Some(parameter_count) = go_identifier_modeled_call_argument_count(
+        &support,
+        token,
+        go,
+        query.file,
+        query.source,
+        root,
+        query.site,
+    ) && let Some(outcome) = go_model_package_call_outcome(
+        &support,
+        query.site,
+        package,
+        name,
+        parameter_count,
+        &mut evidence,
+    ) {
+        return Some((
+            outcome,
+            evidence.exact_external_call,
+            evidence.application,
+            evidence.external_callee_identity,
+        ));
+    }
+
+    if let Some(outcome) =
+        go_model_published_member_call_shape_outcome(&support, query.site, package, name)
+    {
+        evidence.record_external_identity(package, name);
+        return Some((
+            outcome,
+            None,
+            evidence.application,
+            evidence.external_callee_identity,
+        ));
+    }
+    let outcome = go_imported_member_boundary(
+        query.site,
+        package,
+        name,
+        GoWorkspacePackageStatus::Absent,
+        format!("`{package}` is outside this partial Go workspace analysis"),
+        format!("`{package}.{name}` has no activated exact Go call model"),
+        &mut evidence,
+    );
+    Some((
+        outcome,
+        None,
+        evidence.application,
+        evidence.external_callee_identity,
+    ))
+}
+
 pub(super) fn go_definition_import_namespaces(
     support: &dyn GoDefinitionProvider,
     token: QueryToken<'_>,
@@ -1968,9 +2532,15 @@ pub(super) fn go_definition_import_namespaces(
 ) -> (HashMap<String, Vec<String>>, Vec<String>) {
     if support.session().is_some() {
         let mut aliases: HashMap<String, Vec<String>> = HashMap::default();
+        let imports = support.import_infos(token, go, file);
         let mut dot_imports = Vec::new();
-        for import in support.import_infos(token, go, file) {
-            let Some(import_path) = go_structured_import_path(support, &import) else {
+        for import in imports {
+            let dot_import = import.alias.as_deref() == Some(".");
+            let Some(import_path) = (if dot_import {
+                go_dot_import_path(support, &import)
+            } else {
+                go_structured_import_path(support, &import)
+            }) else {
                 continue;
             };
             match import.alias.as_deref() {
@@ -2061,14 +2631,16 @@ fn go_package_member_candidates(
     package: &str,
     name: &str,
 ) -> Vec<CodeUnit> {
-    let mut candidates = support.fqn(&format!("{package}.{name}"));
-    candidates.extend(support.fqn(&format!(
-        "{package}.{}.{name}",
-        crate::analyzer::GO_MODULE_SCOPE_SEGMENT
-    )));
-    sort_units(&mut candidates);
-    candidates.dedup();
-    candidates
+    go_fqn_candidates(
+        support,
+        [
+            format!("{package}.{name}"),
+            format!(
+                "{package}.{}.{name}",
+                crate::analyzer::GO_MODULE_SCOPE_SEGMENT
+            ),
+        ],
+    )
 }
 
 fn go_unqualified_package_member_candidates(
@@ -2266,14 +2838,93 @@ fn go_external_import_in_expression(
     None
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn go_native_call_application(
+    query: crate::analyzer::languages::BoundedReceiverQuery<'_>,
+    go: &GoAnalyzer,
+    session: &ResolutionSession,
+    overlay: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+    selected_imports: &[GoSelectedExternalImport],
+) -> CallApplicationKind {
+    let Some(tree) = query.tree else {
+        return CallApplicationKind::Unknown;
+    };
+    let support = AnalyzerGoDefinitionProvider::bounded(go, session, overlay);
+    let scope = AnalyzerQueryScope::new(query.analyzer);
+    let token = scope.token();
+    let root = tree.root_node();
+    if let Some(selector) =
+        brokk_bifrost_go::graph::reference::go_selector_descriptor(root, query.site)
+        && go_selector_is_call_target(&support, &selector)
+    {
+        if selector.focus_segment > 1 {
+            return CallApplicationKind::ReceiverBindingUnknown;
+        }
+        let base = selector.base;
+        if matches!(base.kind(), "identifier" | "package_identifier") {
+            let name = go_node_text(base, query.source);
+            if let Some(binding) = go_nearest_visible_binding(
+                &support,
+                root,
+                query.source,
+                name,
+                query.site.focus_start_byte,
+            ) {
+                return match binding {
+                    GoLocalBinding::Value { .. } => CallApplicationKind::BoundReceiver,
+                    GoLocalBinding::Type(_) => CallApplicationKind::ReceiverBindingUnknown,
+                    GoLocalBinding::RangeElement(_) | GoLocalBinding::Opaque => {
+                        CallApplicationKind::BoundReceiver
+                    }
+                };
+            }
+            // The value-binding lookup does not own local type declarations
+            // or generic parameters. Use the shared lexical scope walk before
+            // treating the selector base as an imported package.
+            match go_name_shadowed_at_with_scope(
+                root,
+                query.source,
+                query.site.focus_start_byte,
+                name,
+                || support.scope_step(),
+            ) {
+                Some(true) => return CallApplicationKind::ReceiverBindingUnknown,
+                Some(false) => {}
+                None => return CallApplicationKind::Unknown,
+            }
+            let imports = go_import_paths(&support, token, go, query.file);
+            if imports.contains_key(name)
+                || selected_imports.iter().any(|selected| {
+                    go_selected_external_import_spec(query, &support, token, selected, root, base)
+                        .is_some()
+                })
+            {
+                return CallApplicationKind::PackageFunction;
+            }
+            return CallApplicationKind::Unknown;
+        }
+        return CallApplicationKind::BoundReceiver;
+    }
+    if go_identifier_is_call_target(&support, root, query.site) {
+        CallApplicationKind::PackageFunction
+    } else {
+        CallApplicationKind::Unknown
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn go_native_external_package_member_resolution(
     query: crate::analyzer::languages::BoundedReceiverQuery<'_>,
     go: &GoAnalyzer,
     session: &ResolutionSession,
+    overlay: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
     selected_import: &GoSelectedExternalImport,
-) -> Option<(DefinitionLookupOutcome, Option<ExactExternalCallProof>)> {
+) -> Option<(
+    DefinitionLookupOutcome,
+    Option<ExactExternalCallProof>,
+    CallApplicationKind,
+    Option<ResolverOwnedExternalCalleeIdentity>,
+)> {
     let tree = query.tree?;
     let selector =
         brokk_bifrost_go::graph::reference::go_selector_descriptor(tree.root_node(), query.site)?;
@@ -2283,7 +2934,6 @@ pub(super) fn go_native_external_package_member_resolution(
     {
         return None;
     }
-    let overlay = query.analyzer.semantic_model_overlay();
     let support = AnalyzerGoDefinitionProvider::bounded(go, session, overlay.clone());
     let scope = AnalyzerQueryScope::new(query.analyzer);
     go_selected_external_import_spec(
@@ -2298,7 +2948,7 @@ pub(super) fn go_native_external_package_member_resolution(
     let is_call_target = go_selector_is_call_target(&support, &selector);
     if is_call_target {
         let mut evidence = GoCallEvidence {
-            application: CallApplicationKind::Unknown,
+            application: CallApplicationKind::PackageFunction,
             dispatch_extensibility: None,
             exact_external_call: None,
             external_callee_identity: None,
@@ -2316,15 +2966,39 @@ pub(super) fn go_native_external_package_member_resolution(
         );
         if let Some(outcome) = outcome {
             if outcome.status == DefinitionLookupStatus::UnresolvableImportBoundary {
-                return Some((outcome, evidence.exact_external_call));
+                return Some((
+                    outcome,
+                    evidence.exact_external_call,
+                    evidence.application,
+                    evidence.external_callee_identity,
+                ));
             }
             let proven_non_callable = outcome.status == DefinitionLookupStatus::NoDefinition
                 && outcome.diagnostics.iter().any(|diagnostic| {
                     diagnostic.kind == GO_MODELED_PACKAGE_CALL_NOT_APPLICABLE_DIAGNOSTIC_KIND
                 });
             if proven_non_callable {
-                return Some((outcome, None));
+                return Some((
+                    outcome,
+                    None,
+                    evidence.application,
+                    evidence.external_callee_identity,
+                ));
             }
+        }
+        if let Some(outcome) = go_model_published_member_call_shape_outcome(
+            &support,
+            query.site,
+            &selected_import.import_path,
+            member,
+        ) {
+            evidence.record_external_identity(&selected_import.import_path, member);
+            return Some((
+                outcome,
+                None,
+                evidence.application,
+                evidence.external_callee_identity,
+            ));
         }
         // gated upstream: Go package discovery selected this source-less
         // import instance, so the package boundary is known even when its
@@ -2344,7 +3018,12 @@ pub(super) fn go_native_external_package_member_resolution(
             ),
             &mut evidence,
         );
-        return Some((outcome, None));
+        return Some((
+            outcome,
+            None,
+            evidence.application,
+            evidence.external_callee_identity,
+        ));
     }
 
     let visible_member =
@@ -2359,10 +3038,166 @@ pub(super) fn go_native_external_package_member_resolution(
     );
     let mut outcome = outcome;
     outcome.reference = Some(reference);
-    Some((outcome, None))
+    Some((outcome, None, CallApplicationKind::Unknown, None))
 }
 
-#[cfg(any(test, feature = "test-support"))]
+pub(super) fn go_native_source_imported_member_resolution(
+    query: crate::analyzer::languages::BoundedReceiverQuery<'_>,
+    go: &GoAnalyzer,
+    session: &ResolutionSession,
+) -> Option<(
+    DefinitionLookupOutcome,
+    Option<ExactExternalCallProof>,
+    CallApplicationKind,
+    Option<ResolverOwnedExternalCalleeIdentity>,
+)> {
+    let tree = query.tree?;
+    let selector =
+        brokk_bifrost_go::graph::reference::go_selector_descriptor(tree.root_node(), query.site)?;
+    if selector.focus_segment != 1
+        || selector.members.len() != 1
+        || !matches!(selector.base.kind(), "identifier" | "package_identifier")
+    {
+        return None;
+    }
+    let overlay = query.analyzer.semantic_model_overlay();
+    let support = AnalyzerGoDefinitionProvider::bounded(go, session, overlay.clone());
+    let alias = go_node_text(selector.base, query.source);
+    if go_name_shadowed_at_with_scope(
+        tree.root_node(),
+        query.source,
+        selector.base.start_byte(),
+        alias,
+        || support.scope_step(),
+    ) != Some(false)
+    {
+        return None;
+    }
+    let scope = AnalyzerQueryScope::new(query.analyzer);
+    let import_path = go_import_paths(&support, scope.token(), go, query.file).remove(alias)?;
+    if go_workspace_package_status(&support, &import_path) != GoWorkspacePackageStatus::Absent {
+        return None;
+    }
+    if let Some(identity) =
+        GoOverlayPackages::new(overlay.as_deref()).modeled_package_identity(&import_path)
+    {
+        let selected_import = GoSelectedExternalImport {
+            source_spelling: import_path.clone(),
+            import_path: import_path.clone(),
+            package_name: identity.package_name,
+            provenance: GoExternalPackageProvenance::SemanticModel {
+                symbol_id: identity.symbol_id,
+                pack_id: identity.pack_id,
+                pack_digest: identity.pack_digest,
+                record_id: identity.record_id,
+            },
+        };
+        if let Some(resolution) = go_native_external_package_member_resolution(
+            query,
+            go,
+            session,
+            overlay.clone(),
+            &selected_import,
+        ) {
+            return Some(resolution);
+        }
+    }
+    let member = go_node_text(selector.focused_node(), query.source);
+    let application = if go_selector_is_call_target(&support, &selector) {
+        CallApplicationKind::PackageFunction
+    } else {
+        CallApplicationKind::Unknown
+    };
+    let mut evidence = GoCallEvidence {
+        application,
+        dispatch_extensibility: None,
+        exact_external_call: None,
+        external_callee_identity: None,
+    };
+    let outcome = go_imported_member_boundary(
+        query.site,
+        &import_path,
+        member,
+        GoWorkspacePackageStatus::Absent,
+        format!("`{import_path}` is outside this partial Go workspace analysis"),
+        format!("`{import_path}.{member}` has no activated exact Go call model"),
+        &mut evidence,
+    );
+    Some((
+        outcome,
+        evidence.exact_external_call,
+        evidence.application,
+        evidence.external_callee_identity,
+    ))
+}
+
+pub(super) fn go_native_unmodeled_external_package_member_resolution(
+    query: crate::analyzer::languages::BoundedReceiverQuery<'_>,
+    go: &GoAnalyzer,
+    session: &ResolutionSession,
+    overlay: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+    selected_imports: &[GoSelectedExternalImport],
+) -> Option<(
+    DefinitionLookupOutcome,
+    Option<ExactExternalCallProof>,
+    Option<ResolverOwnedExternalCalleeIdentity>,
+)> {
+    let tree = query.tree?;
+    let selector =
+        brokk_bifrost_go::graph::reference::go_selector_descriptor(tree.root_node(), query.site)?;
+    if selector.focus_segment != 1
+        || selector.members.len() != 1
+        || !matches!(selector.base.kind(), "identifier" | "package_identifier")
+    {
+        return None;
+    }
+    let support = AnalyzerGoDefinitionProvider::bounded(go, session, overlay);
+    let scope = AnalyzerQueryScope::new(query.analyzer);
+    let identifier = go_node_text(selector.base, query.source);
+    if go_name_shadowed_at_with_scope(
+        tree.root_node(),
+        query.source,
+        selector.base.start_byte(),
+        identifier,
+        || support.scope_step(),
+    ) != Some(false)
+    {
+        return None;
+    }
+    let import_path =
+        go_import_paths(&support, scope.token(), go, query.file).remove(identifier)?;
+    if selected_imports.iter().any(|selected| {
+        selected.source_spelling == import_path || selected.import_path == import_path
+    }) {
+        return None;
+    }
+    if go_workspace_package_status(&support, &import_path) != GoWorkspacePackageStatus::Absent {
+        return None;
+    }
+
+    let member = go_node_text(selector.focused_node(), query.source);
+    let mut evidence = GoCallEvidence {
+        application: CallApplicationKind::Unknown,
+        dispatch_extensibility: None,
+        exact_external_call: None,
+        external_callee_identity: None,
+    };
+    let outcome = go_imported_member_boundary(
+        query.site,
+        &import_path,
+        member,
+        GoWorkspacePackageStatus::Absent,
+        format!("`{import_path}` is outside this partial Go workspace analysis"),
+        format!("`{import_path}.{member}` has no selected external package model"),
+        &mut evidence,
+    );
+    Some((
+        outcome,
+        evidence.exact_external_call,
+        evidence.external_callee_identity,
+    ))
+}
+
 pub(super) fn go_native_external_receiver_call_resolution(
     query: crate::analyzer::languages::BoundedReceiverQuery<'_>,
     session: &ResolutionSession,
@@ -2412,31 +3247,27 @@ pub(super) fn go_native_external_receiver_call_resolution(
         query.site.focus_start_byte,
         0,
     )?;
-    let identity = inferred.indexed_identity()?;
-    let (qualifier, receiver_type_name) = go_native_external_receiver_type_name(identity)?;
-    let receiver_type_node =
-        go_native_receiver_type_node(&support, query, root, receiver_expression)?;
-    let qualified_type = go_native_qualified_type_node(&support, receiver_type_node)?;
-    let package_node = qualified_type.child_by_field_name("package")?;
-    let type_name_node = qualified_type.child_by_field_name("name")?;
-    if go_node_text(package_node, query.source) != qualifier
-        || go_node_text(type_name_node, query.source) != receiver_type_name
-    {
-        return None;
-    }
-
-    let mut selected_import = None;
-    for candidate in selected_imports {
-        if go_selected_external_import_spec(query, &support, token, candidate, root, package_node)
-            .is_some()
-            && selected_import.replace(candidate).is_some()
-        {
+    let packages = GoOverlayPackages::new(overlay.as_deref());
+    let owner_fqn = if let Some(nominal) = inferred.modeled_nominal() {
+        let owner = packages.unique_symbol(&nominal.qualified_name)?;
+        if owner.id != nominal.declaration_id {
             return None;
         }
-    }
-    let selected_import = selected_import?;
-    let owner_fqn = format!("{}.{}", selected_import.import_path, receiver_type_name);
-    let packages = GoOverlayPackages::new(overlay.as_deref());
+        nominal.qualified_name.clone()
+    } else {
+        let identity = inferred.indexed_identity()?;
+        let (owner_fqn, import_path) = go_imported_nominal_receiver_candidate_fqn(
+            &support,
+            token,
+            go,
+            &inferred.file,
+            identity,
+        )?;
+        selected_imports
+            .iter()
+            .any(|selected| selected.import_path == import_path)
+            .then_some(owner_fqn)?
+    };
     let owner = packages.unique_symbol(&owner_fqn)?;
     let method = packages.concrete_receiver_method(
         &owner_fqn,
@@ -2448,122 +3279,178 @@ pub(super) fn go_native_external_receiver_call_resolution(
         return None;
     }
 
-    let target = format!(
-        "{}.{}.{}",
-        selected_import.import_path, owner.name, method.name
-    );
+    let target = format!("{owner_fqn}.{}", method.name);
     let mut call_evidence = GoCallEvidence {
         application: CallApplicationKind::Unknown,
         dispatch_extensibility: None,
         exact_external_call: None,
         external_callee_identity: None,
     };
-    let outcome =
-        go_model_receiver_target_outcome(query.site, target, parameter_count, &mut call_evidence);
+    let outcome = go_model_receiver_target_outcome(
+        query.site,
+        target,
+        parameter_count,
+        &mut call_evidence,
+        false,
+    );
     Some((outcome, call_evidence.exact_external_call?))
 }
 
-#[cfg(any(test, feature = "test-support"))]
-fn go_native_external_receiver_type_name(
-    identity: &StructuredTypeIdentity,
-) -> Option<(&str, &str)> {
-    let name = match identity.view(identity.root_id())? {
-        StructuredTypeNodeView::Named(name) => name,
-        StructuredTypeNodeView::Pointer(inner) => match identity.view(inner)? {
-            StructuredTypeNodeView::Named(name) => name,
-            _ => return None,
-        },
-        _ => return None,
-    };
-    let [qualifier, name] = name.path() else {
-        return None;
-    };
-    Some((qualifier, name))
-}
-
-#[cfg(any(test, feature = "test-support"))]
-fn go_native_receiver_type_node<'tree>(
-    support: &dyn GoDefinitionProvider,
+pub(super) fn go_native_local_receiver_call_application(
     query: crate::analyzer::languages::BoundedReceiverQuery<'_>,
-    root: Node<'tree>,
-    receiver: Node<'tree>,
-) -> Option<Node<'tree>> {
-    if matches!(receiver.kind(), "identifier" | "package_identifier") {
-        let name = go_node_text(receiver, query.source);
-        if let Some(type_node) = go_receiver_binding_type_node(
-            support,
-            root,
-            query.source,
-            name,
-            query.site.focus_start_byte,
-        ) {
-            return Some(type_node);
-        }
-        return match go_nearest_visible_binding(
-            support,
-            root,
-            query.source,
-            name,
-            query.site.focus_start_byte,
-        )? {
-            GoLocalBinding::Type(type_node) => Some(type_node),
-            GoLocalBinding::Value { expression, .. } => {
-                go_native_receiver_initializer_type_node(support, expression)
-            }
-            GoLocalBinding::RangeElement(_) | GoLocalBinding::Opaque => None,
+    session: &ResolutionSession,
+) -> Option<CallApplicationKind> {
+    let tree = query.tree?;
+    let go = resolve_analyzer::<GoAnalyzer>(query.analyzer)?;
+    let support =
+        AnalyzerGoDefinitionProvider::bounded(go, session, query.analyzer.semantic_model_overlay());
+    let selector =
+        go_selector_descriptor_with_scope(tree.root_node(), query.site, || support.scope_step())?;
+    if selector.focus_segment == 0 {
+        return None;
+    }
+    let mut receiver_name = selector.base;
+    loop {
+        receiver_name = match receiver_name.kind() {
+            "parenthesized_expression" => go_first_named_child(&support, receiver_name)?,
+            "unary_expression" => receiver_name.child_by_field_name("operand")?,
+            "selector_expression" => receiver_name.child_by_field_name("field")?,
+            "identifier" | "package_identifier" => break,
+            _ => return None,
         };
     }
-    go_native_receiver_initializer_type_node(support, receiver)
+    let base_is_value = if go_nearest_visible_binding(
+        &support,
+        tree.root_node(),
+        query.source,
+        go_node_text(receiver_name, query.source),
+        receiver_name.start_byte(),
+    )
+    .is_some()
+    {
+        true
+    } else {
+        let start_byte = receiver_name.start_byte();
+        let end_byte = receiver_name.end_byte();
+        let line = receiver_name.start_position().row + 1;
+        let base_site = ResolvedReferenceSite {
+            path: query.site.path.clone(),
+            text: go_node_text(receiver_name, query.source).to_owned(),
+            range: Range {
+                start_byte,
+                end_byte,
+                start_line: line,
+                end_line: line,
+            },
+            focus_start_byte: start_byte,
+            focus_end_byte: end_byte,
+        };
+        let base_selector = go_selector_descriptor_with_scope(tree.root_node(), &base_site, || {
+            support.scope_step()
+        });
+        let resolution = resolve_go(
+            query.analyzer,
+            &support,
+            query.file,
+            query.source,
+            Some(tree),
+            &base_site,
+            base_selector.as_ref(),
+            None,
+        );
+        let [definition] = resolution.outcome.definitions.as_slice() else {
+            return None;
+        };
+        !definition.is_class()
+    };
+    if !base_is_value {
+        return None;
+    }
+    let scope = AnalyzerQueryScope::new(query.analyzer);
+    go_expression_inferred_type(
+        query.analyzer,
+        scope.token(),
+        &support,
+        query.file,
+        query.source,
+        tree.root_node(),
+        selector.base,
+        query.site.focus_start_byte,
+        0,
+    )
+    .map(|_| CallApplicationKind::BoundReceiver)
 }
 
-#[cfg(any(test, feature = "test-support"))]
-fn go_native_receiver_initializer_type_node<'tree>(
-    support: &dyn GoDefinitionProvider,
-    mut expression: Node<'tree>,
-) -> Option<Node<'tree>> {
-    loop {
-        if !support.scope_step() {
+pub(super) fn go_native_workspace_unqualified_call_resolution(
+    query: crate::analyzer::languages::BoundedReceiverQuery<'_>,
+    session: &ResolutionSession,
+) -> Option<DefinitionLookupOutcome> {
+    let tree = query.tree?;
+    let go = resolve_analyzer::<GoAnalyzer>(query.analyzer)?;
+    let support =
+        AnalyzerGoDefinitionProvider::bounded(go, session, query.analyzer.semantic_model_overlay());
+    if !support.workspace_declaration_identities_authoritative()
+        || !support.workspace_package_inventory_complete()
+        || !go_identifier_is_call_target(&support, tree.root_node(), query.site)
+        || go_nearest_visible_binding(
+            &support,
+            tree.root_node(),
+            query.source,
+            query.site.text.as_str(),
+            query.site.focus_start_byte,
+        )
+        .is_some()
+    {
+        return None;
+    }
+    let package = go_package_name(&support, query.file, query.source, Some(tree.root_node()))?;
+    let scope = AnalyzerQueryScope::new(query.analyzer);
+    let dot_imports = go_dot_import_paths(go, &support, scope.token(), query.file);
+    let mut dot_candidates = Vec::new();
+    for import_path in &dot_imports {
+        if go_workspace_package_status(&support, import_path) != GoWorkspacePackageStatus::Present {
             return None;
         }
-        match expression.kind() {
-            "composite_literal" => return expression.child_by_field_name("type"),
-            "parenthesized_expression" => {
-                expression = go_first_named_child(support, expression)?;
-            }
-            "unary_expression" => {
-                let operator = expression.child_by_field_name("operator")?.kind();
-                if !matches!(operator, "&" | "*") {
-                    return None;
-                }
-                expression = expression
-                    .child_by_field_name("operand")
-                    .or_else(|| go_first_named_child(support, expression))?;
-            }
-            _ => return None,
-        }
+        dot_candidates.extend(go_package_member_candidates(
+            &support,
+            import_path,
+            &query.site.text,
+        ));
     }
-}
-
-#[cfg(any(test, feature = "test-support"))]
-fn go_native_qualified_type_node<'tree>(
-    support: &dyn GoDefinitionProvider,
-    mut type_node: Node<'tree>,
-) -> Option<Node<'tree>> {
-    loop {
-        if !support.scope_step() {
+    dot_candidates.retain(|candidate| {
+        brokk_bifrost_go::declarations::go_identifier_is_exported(candidate.identifier())
+    });
+    sort_units(&mut dot_candidates);
+    dot_candidates.dedup();
+    if !dot_candidates.is_empty() {
+        let [target] = dot_candidates.as_slice() else {
             return None;
-        }
-        match type_node.kind() {
-            "qualified_type" => return Some(type_node),
-            "pointer_type" | "parenthesized_type" => {
-                type_node = brokk_bifrost_go::declarations::go_type_wrapper_child(type_node)?;
-            }
-            _ => return None,
-        }
+        };
+        return target
+            .is_function()
+            .then(|| candidates_outcome(dot_candidates));
     }
-}
 
-#[cfg(any(test, feature = "test-support"))]
+    let candidates = go_package_member_candidates(&support, &package, &query.site.text);
+    if !candidates.is_empty() {
+        let [target] = candidates.as_slice() else {
+            return None;
+        };
+        return target.is_function().then(|| candidates_outcome(candidates));
+    }
+    if brokk_bifrost_go::diagnostics::is_predeclared_go_name(&query.site.text) {
+        return None;
+    }
+    let mut outcome = no_definition(
+        GO_UNQUALIFIED_CALL_NO_TARGET_DIAGNOSTIC_KIND,
+        format!(
+            "`{}` has no declaration in the complete Go package or dot-import scope",
+            query.site.text
+        ),
+    );
+    outcome.reference = Some(query.site.clone());
+    Some(outcome)
+}
 fn go_selected_external_import_spec<'tree>(
     query: crate::analyzer::languages::BoundedReceiverQuery<'_>,
     support: &dyn GoDefinitionProvider,
@@ -2576,13 +3463,14 @@ fn go_selected_external_import_spec<'tree>(
         return None;
     }
     let identifier = go_node_text(base, query.source);
-    let visible_binding =
-        go_nearest_visible_binding(support, root, query.source, identifier, base.start_byte());
-    let go = resolve_analyzer::<GoAnalyzer>(query.analyzer)?;
-    let imports = support.import_infos(token, go, query.file);
-    if visible_binding.is_some() {
+    if go_name_shadowed_at_with_scope(root, query.source, base.start_byte(), identifier, || {
+        support.scope_step()
+    }) != Some(false)
+    {
         return None;
     }
+    let go = resolve_analyzer::<GoAnalyzer>(query.analyzer)?;
+    let imports = support.import_infos(token, go, query.file);
     let mut import_start = None;
     for import in imports {
         let import_path = go_structured_import_path(support, &import);
@@ -2668,22 +3556,22 @@ fn go_model_package_selector_navigation_outcome(
     if selector.focus_segment == 0 || go_selector_is_call_target(support, selector) {
         return None;
     }
-    let mut members = selector.members.iter().take(selector.focus_segment);
-    let first_member = go_node_text(*members.next()?, source);
-    let mut target = support.external_visible_package_member(package, first_member)?;
-    let mut canonical_reference = format!("{package}.{first_member}");
-    for member in members {
-        let member = go_node_text(*member, source);
-        target.push('.');
-        target.push_str(member);
-        target = support.external_visible_symbol(&target)?;
-        canonical_reference.push('.');
-        canonical_reference.push_str(member);
-    }
+    let members = selector
+        .members
+        .iter()
+        .take(selector.focus_segment)
+        .map(|member| go_node_text(*member, source));
+    let canonical_reference = crate::analyzer::go::package_identity::go_visible_member_path(
+        package,
+        members,
+        |package, member| support.external_visible_package_member(package, member),
+        |target| support.external_visible_symbol(target),
+        || support.scope_step(),
+    )?;
     let mut reference = site.clone();
     // The overlay storage owner is an implementation detail. Keep the exact
     // import-path spelling supplied by the structured import binder.
-    reference.text = canonical_reference;
+    reference.text = canonical_reference.reference_name;
     Some(DefinitionLookupOutcome {
         modeled_definitions: Vec::new(),
         status: DefinitionLookupStatus::NoDefinition,
@@ -2717,6 +3605,28 @@ fn go_model_published_member_call_shape_outcome(
         })
 }
 
+fn go_dot_import_package_scope_conflict_outcome(
+    support: &dyn GoDefinitionProvider,
+    importer_package: &str,
+    member: &str,
+    external_packages: &[&str],
+) -> Option<DefinitionLookupOutcome> {
+    if external_packages.len() != 1
+        || go_package_member_candidates(support, importer_package, member).is_empty()
+    {
+        return None;
+    }
+    Some(boundary_unchecked(
+        format!(
+            "dot-imported `{member}` conflicts with a declaration in package `{importer_package}`"
+        ),
+        UnindexedClaim::external_boundary_many(
+            external_packages.iter().copied(),
+            ClaimSubjectRole::Module,
+        ),
+    ))
+}
+
 fn go_model_package_call_outcome(
     support: &dyn GoDefinitionProvider,
     site: &ResolvedReferenceSite,
@@ -2734,13 +3644,8 @@ fn go_model_package_call_outcome(
                 canonical_reference.clone(),
                 parameter_count,
             ));
-            boundary_unchecked(
-                format!("`{canonical_reference}` is declared by an activated external Go model"),
-                UnindexedClaim::resolved_external(
-                    canonical_reference.clone(),
-                    ClaimSubjectRole::Member,
-                ),
-            )
+            call_evidence.record_external_identity(package, member);
+            go_external_model_member_outcome(&canonical_reference)
         }
         GoModeledPackageCallResolution::DefinitelyNotApplicable => no_definition(
             GO_MODELED_PACKAGE_CALL_NOT_APPLICABLE_DIAGNOSTIC_KIND,
@@ -2771,23 +3676,29 @@ fn go_model_receiver_target_outcome(
     target: String,
     parameter_count: usize,
     call_evidence: &mut GoCallEvidence,
+    receiver_is_interface: bool,
 ) -> DefinitionLookupOutcome {
     let parameter_count = u32::try_from(parameter_count)
         .expect("validated Go call argument count fits the semantic model schema");
-    call_evidence.record_exact_external_call(ExactExternalCallProof::go_concrete_receiver(
-        target.clone(),
-        parameter_count,
-    ));
+    call_evidence.record_exact_external_call(if receiver_is_interface {
+        ExactExternalCallProof::go_interface_receiver(target.clone(), parameter_count)
+    } else {
+        ExactExternalCallProof::go_concrete_receiver(target.clone(), parameter_count)
+    });
     // gated upstream: structured workspace type resolution failed before the
     // import-binder identity was offered to the reviewed declaration overlay.
-    let mut outcome = boundary_unchecked(
-        format!("`{target}` is declared by an activated external Go model"),
-        UnindexedClaim::resolved_external(target.clone(), ClaimSubjectRole::Member),
-    );
+    let mut outcome = go_external_model_member_outcome(&target);
     let mut reference = site.clone();
     reference.text = target;
     outcome.reference = Some(reference);
     outcome
+}
+
+fn go_external_model_member_outcome(target: &str) -> DefinitionLookupOutcome {
+    boundary_unchecked(
+        format!("`{target}` is declared by an activated external Go model"),
+        UnindexedClaim::resolved_external(target.to_string(), ClaimSubjectRole::Member),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2838,6 +3749,14 @@ fn go_modeled_receiver_lookup_with_promotion(
                 path.pointer_receivers,
                 parameter_count,
             ) {
+                candidates.push(GoModeledReceiverMember {
+                    owner_fqn: path.owner.clone(),
+                    target,
+                });
+            }
+            if let Some(target) =
+                support.external_interface_receiver_member(&path.owner, member, parameter_count)
+            {
                 candidates.push(GoModeledReceiverMember {
                     owner_fqn: path.owner.clone(),
                     target,
@@ -2909,15 +3828,24 @@ fn go_dot_import_paths(
     if support.session().is_none() {
         return go.definition_import_namespaces(token, file).1;
     }
-    support
-        .import_infos(token, go, file)
-        .into_iter()
-        .filter_map(|import| {
-            (import.alias.as_deref() == Some("."))
-                .then(|| go_structured_import_path(support, &import))
-                .flatten()
-        })
+    let imports = support.import_infos(token, go, file);
+    go_dot_import_paths_from_imports(support, &imports)
+}
+
+fn go_dot_import_paths_from_imports(
+    support: &dyn GoDefinitionProvider,
+    imports: &[ImportInfo],
+) -> Vec<String> {
+    imports
+        .iter()
+        .filter_map(|import| go_dot_import_path(support, import))
         .collect()
+}
+
+fn go_dot_import_path(support: &dyn GoDefinitionProvider, import: &ImportInfo) -> Option<String> {
+    (import.alias.as_deref() == Some("."))
+        .then(|| go_structured_import_path(support, import))
+        .flatten()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3028,11 +3956,17 @@ fn resolve_go_local_selector_chain(
                             parameter_count,
                         ) {
                             GoModeledReceiverLookup::Unique(candidate) => {
+                                let receiver_is_interface = GoOverlayPackages::new(
+                                    analyzer.semantic_model_overlay().as_deref(),
+                                )
+                                .receiver_is_interface(&owner_fqn)
+                                .unwrap_or(false);
                                 return Some(go_model_receiver_target_outcome(
                                     site,
                                     candidate.target,
                                     parameter_count,
                                     call_evidence,
+                                    receiver_is_interface,
                                 ));
                             }
                             GoModeledReceiverLookup::Ambiguous => {
@@ -3175,7 +4109,7 @@ fn go_local_binding_type_fqn(
                 GoLocalBinding::Value {
                     expression,
                     result_ordinal,
-                } => go_value_type_fqn(
+                } => go_expression_type_fqn_and_pointer_depth(
                     analyzer,
                     token,
                     support,
@@ -3185,7 +4119,8 @@ fn go_local_binding_type_fqn(
                     expression,
                     byte,
                     result_ordinal,
-                ),
+                )
+                .map(|(fqn, _pointer_depth)| fqn),
                 GoLocalBinding::RangeElement(range_node) => go_range_binding_type_fqn(
                     analyzer, token, support, file, source, root, range_node, name, byte,
                 ),
@@ -3255,7 +4190,18 @@ impl GoSourceNodeIdentity {
     }
 
     fn is_contained_by(self, span: SourceSpan) -> bool {
-        span.start_byte() as usize <= self.start_byte && span.end_byte() as usize >= self.end_byte
+        Range {
+            start_byte: span.start_byte() as usize,
+            end_byte: span.end_byte() as usize,
+            start_line: 0,
+            end_line: 0,
+        }
+        .contains(&Range {
+            start_byte: self.start_byte,
+            end_byte: self.end_byte,
+            start_line: 0,
+            end_line: 0,
+        })
     }
 }
 
@@ -4138,18 +5084,10 @@ fn go_allocation_call_binding_mode(node: Node<'_>, source: &str) -> Option<bool>
         "make" => {
             let arguments = node.child_by_field_name("arguments")?;
             let type_node = arguments.named_child(0)?;
-            go_type_binding_mode(find_go_root(type_node), type_node, source, node)
+            go_type_binding_mode(root_node(type_node), type_node, source, node)
         }
         _ => None,
     }
-}
-
-fn find_go_root<'tree>(node: Node<'tree>) -> Node<'tree> {
-    let mut root = node;
-    while let Some(parent) = root.parent() {
-        root = parent;
-    }
-    root
 }
 
 fn go_type_binding_mode(
@@ -4158,21 +5096,24 @@ fn go_type_binding_mode(
     source: &str,
     expression: Node<'_>,
 ) -> Option<bool> {
+    if let Some(mode) = go_direct_type_binding_mode(type_node.kind()) {
+        return Some(mode);
+    }
     match type_node.kind() {
-        // Direct aggregate literals own their element storage. A slice/map
-        // literal owns fresh backing storage whose descriptor is copied by
-        // reference, as does a channel value.
-        "struct_type" | "array_type" | "implicit_length_array_type" => Some(false),
-        "slice_type" | "map_type" | "channel_type" => Some(true),
-        // A pointer type is a reference-shaped result, although a direct
-        // pointer composite literal is uncommon; retaining this fact is safe.
-        "pointer_type" => Some(true),
         "type_identifier" | "identifier" => {
             let name = go_node_text(type_node, source);
             go_named_type_binding_mode(root, name, source, expression)
         }
         // Qualified and generic names need package/type-argument resolution;
         // the local AST alone cannot prove their storage mode.
+        _ => None,
+    }
+}
+
+fn go_direct_type_binding_mode(kind: &str) -> Option<bool> {
+    match kind {
+        "struct_type" | "array_type" | "implicit_length_array_type" => Some(false),
+        "slice_type" | "map_type" | "channel_type" | "pointer_type" => Some(true),
         _ => None,
     }
 }
@@ -4195,11 +5136,7 @@ fn go_named_type_binding_mode(
     if type_node.has_error() || type_node.is_missing() {
         return None;
     }
-    match type_node.kind() {
-        "struct_type" | "array_type" | "implicit_length_array_type" => Some(false),
-        "slice_type" | "map_type" | "channel_type" | "pointer_type" => Some(true),
-        _ => None,
-    }
+    go_direct_type_binding_mode(type_node.kind())
 }
 
 /// Return whether `name` is supplied by a generic context enclosing the
@@ -4649,8 +5586,7 @@ fn go_first_named_child<'tree>(
     if !support.scope_step() {
         return None;
     }
-    let mut cursor = node.walk();
-    let child = node.named_children(&mut cursor).next()?;
+    let child = brokk_bifrost_core::analyzer::structural::adapter_helpers::first_named_child(node)?;
     support.scope_step().then_some(child)
 }
 
@@ -4725,8 +5661,12 @@ fn go_callable_modeled_argument_count(
     }
     match arguments.possible_multi_result_call {
         Some(inner_call) => {
-            go_exact_modeled_package_call_result_count(support, token, go, file, source, inner_call)
-                .filter(|result_count| *result_count > 0)
+            match go_exact_modeled_package_call_result_count(
+                support, token, go, file, source, inner_call,
+            ) {
+                Some(0) => None,
+                result_count => result_count,
+            }
         }
         None => Some(arguments.count),
     }
@@ -4791,12 +5731,7 @@ fn go_call_for_callable<'tree>(
     if !support.scope_step() {
         return None;
     }
-    let call = callable.parent()?;
-    (call.kind() == "call_expression"
-        && call
-            .child_by_field_name("function")
-            .is_some_and(|function| function.id() == callable.id()))
-    .then_some(call)
+    parent_if_field(callable, "call_expression", "function")
 }
 
 fn go_selector_is_call_target(
@@ -5534,7 +6469,7 @@ fn go_selector_owner_fqn(
         return Some((owner_fqn, false));
     }
     let identity = owner.indexed_identity()?;
-    let owner_fqn =
+    let (owner_fqn, _) =
         go_imported_nominal_receiver_candidate_fqn(support, token, go, &owner.file, identity)?;
     Some((owner_fqn, true))
 }
@@ -5572,7 +6507,7 @@ fn go_imported_nominal_receiver_candidate_fqn(
     go: &GoAnalyzer,
     file: &ProjectFile,
     identity: &StructuredTypeIdentity,
-) -> Option<String> {
+) -> Option<(String, String)> {
     let name = match identity.view(identity.root_id())? {
         StructuredTypeNodeView::Named(name) => name,
         StructuredTypeNodeView::Pointer(inner) => match identity.view(inner)? {
@@ -5586,36 +6521,11 @@ fn go_imported_nominal_receiver_candidate_fqn(
     };
     let import_path = go_import_paths(support, token, go, file).remove(qualifier)?;
     (go_workspace_package_status(support, &import_path) == GoWorkspacePackageStatus::Absent)
-        .then(|| format!("{import_path}.{name}"))
+        .then(|| (format!("{import_path}.{name}"), import_path))
 }
 
 #[allow(clippy::too_many_arguments)]
-fn go_value_type_fqn(
-    analyzer: &dyn IAnalyzer,
-    token: QueryToken<'_>,
-    support: &dyn GoDefinitionProvider,
-    file: &ProjectFile,
-    source: &str,
-    root: Node<'_>,
-    value_node: Node<'_>,
-    byte: usize,
-    result_ordinal: usize,
-) -> Option<String> {
-    go_expression_type_fqn(
-        analyzer,
-        token,
-        support,
-        file,
-        source,
-        root,
-        value_node,
-        byte,
-        result_ordinal,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn go_expression_type_fqn(
+fn go_expression_type_fqn_and_pointer_depth(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
     support: &dyn GoDefinitionProvider,
@@ -5625,7 +6535,7 @@ fn go_expression_type_fqn(
     expression: Node<'_>,
     byte: usize,
     result_ordinal: usize,
-) -> Option<String> {
+) -> Option<(String, usize)> {
     let go = resolve_analyzer::<GoAnalyzer>(analyzer)?;
     let inferred = go_expression_inferred_type(
         analyzer,
@@ -5638,7 +6548,34 @@ fn go_expression_type_fqn(
         byte,
         result_ordinal,
     )?;
-    go_resolve_inferred_type_fqn(support, token, go, &inferred)
+    let fqn = go_resolve_inferred_type_fqn(support, token, go, &inferred)?;
+    let pointer_depth = match &inferred.identity {
+        GoInferredTypeIdentity::Indexed(identity) => {
+            let mut depth = 0usize;
+            let mut current = identity.root_id();
+            loop {
+                if !support.scope_step() {
+                    return None;
+                }
+                match identity.view(current)? {
+                    StructuredTypeNodeView::Pointer(inner) => {
+                        depth = depth.checked_add(1)?;
+                        current = inner;
+                    }
+                    _ => break,
+                }
+            }
+            depth
+        }
+        GoInferredTypeIdentity::Modeled(nominal) => {
+            if nominal.pointer {
+                1
+            } else {
+                0
+            }
+        }
+    };
+    Some((fqn, pointer_depth))
 }
 
 fn go_type_lookup_expression<'tree>(
@@ -5675,6 +6612,7 @@ fn go_type_lookup_expression<'tree>(
 }
 
 fn go_interface_method_owner_type_fqn(
+    go: &GoAnalyzer,
     support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
     source: &str,
@@ -5707,6 +6645,7 @@ fn go_interface_method_owner_type_fqn(
             let package = go_package_name(support, file, source, Some(root))?;
             let owner_fqn = go_resolve_exact_type_name_in_package(
                 support,
+                go,
                 &package,
                 go_node_text(name, source),
             )?;
@@ -6261,8 +7200,6 @@ impl GoPromotionTrace {
     /// Stage attribution for the candidates the walk is about to return, for
     /// the outcome constructor the caller reaches next.
     fn stage_selection(&self, analyzer: &dyn IAnalyzer, winners: &[CodeUnit]) {
-        use crate::analyzer::structural::PrecedenceTier;
-
         let by_fq_name: Vec<(String, trace::MemberEnrichment)> = winners
             .iter()
             .filter_map(|unit| {
@@ -6270,20 +7207,12 @@ impl GoPromotionTrace {
                     .map(|enrichment| (unit.fq_name(), enrichment))
             })
             .collect();
-        let winner_tier = by_fq_name
-            .iter()
-            .map(|(_, enrichment)| enrichment.hierarchy_depth)
-            .min()
-            .map(|depth| {
-                if depth == 0 {
-                    PrecedenceTier::OwnMember
-                } else {
-                    PrecedenceTier::InheritedMember
-                }
-            });
-        if let Some(tier) = winner_tier {
-            trace::stage_tier(tier, winners.iter().map(|unit| unit.fq_name()).collect());
-        }
+        trace::stage_winner_tier(
+            winners,
+            by_fq_name
+                .iter()
+                .map(|(_, enrichment)| super::member_precedence_tier(enrichment.hierarchy_depth)),
+        );
         trace::stage_member_context(by_fq_name);
     }
 
@@ -6294,25 +7223,19 @@ impl GoPromotionTrace {
     /// [`RejectionReason::WrongDeclarationSpace`] names. It is not a visibility
     /// rule and not a call-shape rule, so neither of those reasons applies.
     fn record_rejection(&self, analyzer: &dyn IAnalyzer, candidate: &CodeUnit) {
-        use crate::analyzer::structural::{PrecedenceTier, RejectionReason};
+        use crate::analyzer::structural::RejectionReason;
 
         let enrichment = self.enrichment(analyzer, candidate);
-        let tier = enrichment.as_ref().map(|enrichment| {
-            if enrichment.hierarchy_depth == 0 {
-                PrecedenceTier::OwnMember
-            } else {
-                PrecedenceTier::InheritedMember
-            }
-        });
-        let mut row = trace::TraceCandidate::rejected(
-            trace::TraceCandidateRef::Unit(candidate.clone()),
+        let tier = enrichment
+            .as_ref()
+            .map(|enrichment| super::member_precedence_tier(enrichment.hierarchy_depth));
+        trace::record_rejected_unit(
+            candidate,
             tier,
             RejectionReason::WrongDeclarationSpace,
+            None,
+            enrichment,
         );
-        if let Some(enrichment) = enrichment {
-            row = row.with_member(enrichment);
-        }
-        trace::record(row);
     }
 }
 
@@ -6355,6 +7278,7 @@ fn go_embedded_method_set_types(
                     owner.source(),
                     &identity,
                 )
+                .map(|(fqn, _)| fqn)
             }) {
                 embedded.push((fqn, pointer_receivers));
             }
@@ -6438,7 +7362,8 @@ fn go_resolve_structured_type_fqn(
     match name.path() {
         [name] => {
             let mut candidates = Vec::new();
-            if let Some(fqn) = go_resolve_exact_type_name_in_package(support, default_package, name)
+            if let Some(fqn) =
+                go_resolve_exact_type_name_in_package(support, go, default_package, name)
             {
                 candidates.push(fqn);
             }
@@ -6447,7 +7372,7 @@ fn go_resolve_structured_type_fqn(
                     return None;
                 }
                 if let Some(fqn) =
-                    go_resolve_exact_type_name_in_package(support, &import_path, name)
+                    go_resolve_exact_type_name_in_package(support, go, &import_path, name)
                 {
                     candidates.push(fqn);
                 }
@@ -6458,11 +7383,51 @@ fn go_resolve_structured_type_fqn(
         }
         [qualifier, name] => {
             let import_path = go_import_paths(support, token, go, file).remove(qualifier)?;
-            let fqn = format!("{import_path}.{name}");
-            support.fqn_exists(&fqn).then_some(fqn)
+            go_resolve_exact_type_name_in_package(support, go, &import_path, name)
         }
         _ => None,
     }
+}
+
+/// Resolve one exact AST type through the same bounded import and nominal
+/// binder used by ordinary definition queries. Imported names remain candidates
+/// until the caller joins their exact activated declaration and artifact.
+pub(crate) fn go_type_owner_at_node_bounded(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    type_node: Node<'_>,
+    budget: ReceiverAnalysisBudget,
+    cancellation: &CancellationToken,
+) -> BoundedResolution<Option<String>> {
+    let session = ResolutionSession::bounded(budget, Some(cancellation));
+    let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer) else {
+        return session.finish(None);
+    };
+    let support =
+        AnalyzerGoDefinitionProvider::bounded(go, &session, analyzer.semantic_model_overlay());
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let owner = (|| {
+        let root = go_syntax_root(&support, type_node)?;
+        let identity =
+            crate::analyzer::go::go_structured_type_identity_bounded(type_node, source, || {
+                support.scope_step()
+            })?;
+        let name = identity.nominal_name_with(|| support.scope_step())?;
+        let [qualifier, _] = name.path() else {
+            // Local aliases require their own declaration-to-artifact proof.
+            return go_resolve_type_fqn(analyzer, scope.token(), &support, file, source, type_node);
+        };
+        if go_name_shadowed_at_with_scope(root, source, type_node.start_byte(), qualifier, || {
+            support.scope_step()
+        }) != Some(false)
+        {
+            return None;
+        }
+        go_imported_nominal_receiver_candidate_fqn(&support, scope.token(), go, file, &identity)
+            .map(|(fqn, _)| fqn)
+    })();
+    session.finish(owner)
 }
 
 fn go_resolve_type_fqn(
@@ -6500,6 +7465,7 @@ fn go_syntax_root<'tree>(
 
 fn go_resolve_exact_type_name_in_package(
     support: &dyn GoDefinitionProvider,
+    go: &GoAnalyzer,
     package: &str,
     name: &str,
 ) -> Option<String> {
@@ -6507,25 +7473,58 @@ fn go_resolve_exact_type_name_in_package(
         return None;
     }
     let fqn = format!("{package}.{name}");
+    if let Ok(edge_index) = go.usage_edge_index() {
+        let resolved = edge_index.resolve_type_alias(&fqn);
+        if resolved != fqn {
+            return Some(resolved);
+        }
+    }
     support.fqn_exists(&fqn).then_some(fqn)
-}
-
-fn go_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    source
-        .get(node.start_byte()..node.end_byte())
-        .unwrap_or_default()
-        .trim()
 }
 
 #[cfg(test)]
 mod bounded_tests {
     use super::*;
-    use crate::analyzer::model::StructuredTypeIdentityBuilder;
-    use crate::analyzer::usages::receiver_analysis::{ReceiverAnalysisWork, ReceiverBudgetLimit};
-    use crate::analyzer::{Language, Range, StructuredTypeName};
-    use crate::inline_project::InlineTestProject;
+
+    use crate::analyzer::{Language, Range};
+
     use crate::path_utils::rel_path_string;
     use crate::test_support::AnalyzerFixture;
+    use brokk_bifrost_test_macros::hardwon;
+
+    fn site_for(
+        file: &ProjectFile,
+        source: &str,
+        expression: &str,
+        focus: &str,
+    ) -> ResolvedReferenceSite {
+        let expression_start = source.rfind(expression).expect("Go expression");
+        let relative_focus = expression.find(focus).expect("Go focus");
+        let start_byte = expression_start + relative_focus;
+        let end_byte = start_byte + focus.len();
+        let start_line = source[..start_byte]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
+        ResolvedReferenceSite {
+            path: rel_path_string(file),
+            text: focus.to_string(),
+            range: Range {
+                start_byte,
+                end_byte,
+                start_line,
+                end_line: start_line,
+            },
+            focus_start_byte: start_byte,
+            focus_end_byte: end_byte,
+        }
+    }
+
+    use crate::analyzer::StructuredTypeName;
+    use crate::analyzer::model::StructuredTypeIdentityBuilder;
+    use crate::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
+    use crate::inline_project::InlineTestProject;
 
     struct ConcreteTestingReceiverProvider<'a> {
         inner: AnalyzerGoDefinitionProvider<'a>,
@@ -6700,35 +7699,6 @@ mod bounded_tests {
         }
     }
 
-    fn site_for(
-        file: &ProjectFile,
-        source: &str,
-        expression: &str,
-        focus: &str,
-    ) -> ResolvedReferenceSite {
-        let expression_start = source.rfind(expression).expect("Go expression");
-        let relative_focus = expression.find(focus).expect("Go focus");
-        let start_byte = expression_start + relative_focus;
-        let end_byte = start_byte + focus.len();
-        let start_line = source[..start_byte]
-            .bytes()
-            .filter(|byte| *byte == b'\n')
-            .count()
-            + 1;
-        ResolvedReferenceSite {
-            path: rel_path_string(file),
-            text: focus.to_string(),
-            range: Range {
-                start_byte,
-                end_byte,
-                start_line,
-                end_line: start_line,
-            },
-            focus_start_byte: start_byte,
-            focus_end_byte: end_byte,
-        }
-    }
-
     fn imported_type_fixture(
         import: &str,
         expression: &str,
@@ -6780,12 +7750,9 @@ mod bounded_tests {
 
     fn activate_selector_navigation_overlay(fixture: &AnalyzerFixture) {
         use crate::analyzer::semantic_model::{
-            CatalogCoordinate, CatalogOptions, CompilerOptions, SemanticModelActivationControl,
-            SemanticModelActivationEvidence, SemanticModelActivationRequest,
-            SemanticModelControlAction, SemanticModelControlScope, SemanticModelPackSelector,
-            SemanticModelRuntimeLimits, SemanticModelRuntimeOutcome, SemanticPackCatalog,
-            SessionPackSource, SessionPackSourceKind, SourceFormat, acquire_active_semantic_models,
-            compile_source,
+            CatalogCoordinate, SemanticModelActivationControl, SemanticModelActivationEvidence,
+            SemanticModelActivationRequest, SemanticModelControlAction, SemanticModelControlScope,
+            SemanticModelPackSelector, SemanticModelRuntimeLimits,
         };
 
         let source = serde_json::to_vec(&serde_json::json!({
@@ -6939,21 +7906,6 @@ mod bounded_tests {
             }]
         }))
         .expect("serialize Go selector fixture");
-        let pack = compile_source(SourceFormat::Json, &source, &CompilerOptions::default())
-            .unwrap_or_else(|diagnostics| {
-                panic!("Go selector fixture must compile: {diagnostics:#?}")
-            });
-        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
-            .expect("ephemeral catalog");
-        catalog
-            .register_session_pack(
-                &pack,
-                &SessionPackSource {
-                    kind: SessionPackSourceKind::Embedded,
-                    source_id: "fixture.go.selector-navigation".to_owned(),
-                },
-            )
-            .expect("register Go selector fixture");
         let request = SemanticModelActivationRequest {
             bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
                 .expect("crate version"),
@@ -6981,173 +7933,129 @@ mod bounded_tests {
             }],
             limits: SemanticModelRuntimeLimits::default(),
         };
-        let SemanticModelRuntimeOutcome::Ready { .. } = acquire_active_semantic_models(
+        crate::analyzer::usages::test_support::activate_semantic_pack(
             fixture.analyzer.analyzer(),
-            &catalog,
-            None,
+            "fixture.go.selector-navigation",
+            &source,
             &request,
-            &CancellationToken::new(),
-        ) else {
-            panic!("Go selector fixture must activate");
-        };
-    }
-
-    #[test]
-    fn exact_go_overlay_canonicalizes_only_the_published_non_call_selector_chain() {
-        let source = r#"package main
-
-import api "example.com/mod"
-
-var (
-    _ = api.Concrete.Read
-    _ = api.hidden.Read
-    _ = api.Lookalike.Read
-)
-"#;
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Go,
-            &[("go.mod", "module example.com/app\n"), ("main.go", source)],
-        );
-        activate_selector_navigation_overlay(&fixture);
-        let file = ProjectFile::new(fixture.project_root(), "main.go");
-        let tree = parse_go_tree(source).expect("Go tree");
-
-        let resolve = |expression: &str| {
-            let site = site_for(&file, source, expression, "Read");
-            let selector = go_selector_descriptor_with_scope(tree.root_node(), &site, || true)
-                .expect("Go selector");
-            let go = resolve_analyzer::<GoAnalyzer>(fixture.analyzer.analyzer())
-                .expect("fixture Go analyzer");
-            let provider = AnalyzerGoDefinitionProvider::new(
-                go,
-                fixture.analyzer.analyzer().semantic_model_overlay(),
-            );
-            resolve_go(
-                go,
-                &provider,
-                &file,
-                source,
-                Some(&tree),
-                &site,
-                Some(&selector),
-                None,
-            )
-            .outcome
-        };
-
-        let published = resolve("api.Concrete.Read");
-        assert_eq!(
-            published.status,
-            DefinitionLookupStatus::NoDefinition,
-            "navigation carries the overlay identity without inventing a source definition: {published:#?}"
-        );
-        assert_eq!(
-            published
-                .reference
-                .as_ref()
-                .map(|reference| reference.text.as_str()),
-            Some("example.com/mod.Concrete.Read"),
-            "the exact overlay declaration canonicalizes the whole selector chain: {published:#?}"
-        );
-
-        let hidden_owner = resolve("api.hidden.Read");
-        assert_eq!(
-            hidden_owner.status,
-            DefinitionLookupStatus::UnresolvableImportBoundary,
-            "a public method cannot make its unexported owner navigable: {hidden_owner:#?}"
-        );
-
-        let lookalike = resolve("api.Lookalike.Read");
-        assert_eq!(
-            lookalike.status,
-            DefinitionLookupStatus::UnresolvableImportBoundary,
-            "an unsupported same-named selector remains an external boundary: {lookalike:#?}"
-        );
-        assert_eq!(
-            lookalike
-                .reference
-                .as_ref()
-                .map(|reference| reference.text.as_str()),
-            Some("example.com/mod.Read"),
-            "an unsupported same-named chain retains only the import binder's boundary identity: {lookalike:#?}"
         );
     }
 
-    #[test]
-    fn external_go_module_scope_values_keep_canonical_navigation_identity() {
-        let source = r#"package main
+    fn resolve_with_concrete_testing_receiver(
+        fixture: &AnalyzerFixture,
+        file: &ProjectFile,
+        source: &str,
+        tree: &Tree,
+        site: &ResolvedReferenceSite,
+    ) -> GoDefinitionResolution {
+        let analyzer = fixture.analyzer.analyzer();
+        let go = resolve_analyzer::<GoAnalyzer>(analyzer).expect("Go analyzer");
+        let provider = ConcreteTestingReceiverProvider {
+            inner: AnalyzerGoDefinitionProvider::new(go, None),
+        };
+        let selector = go_selector_descriptor_with_scope(tree.root_node(), site, || true)
+            .expect("Go selector");
+        resolve_go(
+            analyzer,
+            &provider,
+            file,
+            source,
+            Some(tree),
+            site,
+            Some(&selector),
+            None,
+        )
+    }
 
-import api "example.com/mod"
-
-var (
-    _ = api.ExportedVar
-    _ = api.ExportedConst
-    _ = api.Ambiguous
-)
-"#;
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Go,
-            &[("go.mod", "module example.com/app\n"), ("main.go", source)],
-        );
-        activate_selector_navigation_overlay(&fixture);
-        let file = ProjectFile::new(fixture.project_root(), "main.go");
-        let tree = parse_go_tree(source).expect("Go tree");
+    fn assert_exact_import_namespace_authority(
+        fixture: &AnalyzerFixture,
+        provider: &dyn GoDefinitionProvider,
+        file: &ProjectFile,
+        source: &str,
+        tree: &Tree,
+    ) {
         let go = resolve_analyzer::<GoAnalyzer>(fixture.analyzer.analyzer())
             .expect("fixture Go analyzer");
-        let provider = AnalyzerGoDefinitionProvider::new(
-            go,
-            fixture.analyzer.analyzer().semantic_model_overlay(),
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let token = scope.token();
+        let (aliases, _) = go_definition_import_namespaces(provider, token, go, file);
+        assert_eq!(
+            aliases.get("duplicate"),
+            Some(&vec![
+                "example.com/custom".to_owned(),
+                "example.com/external".to_owned(),
+            ]),
+            "the import namespace must retain every distinct path"
         );
-        let resolve = |member: &str| {
-            let expression = format!("api.{member}");
-            let site = site_for(&file, source, &expression, member);
+        assert!(
+            !go_import_paths(provider, token, go, file).contains_key("duplicate"),
+            "an ambiguous local import name must not select an arbitrary path"
+        );
+
+        let resolve = |expression: &str, focus: &str| {
+            let site = site_for(file, source, expression, focus);
             let selector = go_selector_descriptor_with_scope(tree.root_node(), &site, || true)
                 .expect("Go selector");
             resolve_go(
-                go,
-                &provider,
-                &file,
+                fixture.analyzer.analyzer(),
+                provider,
+                file,
                 source,
-                Some(&tree),
+                Some(tree),
                 &site,
                 Some(&selector),
                 None,
             )
-            .outcome
         };
 
-        for member in ["ExportedVar", "ExportedConst"] {
-            let outcome = resolve(member);
-            let expected = format!("example.com/mod.{member}");
-            assert_eq!(
-                outcome.status,
-                DefinitionLookupStatus::NoDefinition,
-                "the modeled package value is navigable without inventing a source definition: {outcome:#?}"
-            );
-            assert_eq!(
-                outcome
-                    .reference
-                    .as_ref()
-                    .map(|reference| reference.text.as_str()),
-                Some(expected.as_str()),
-                "the synthetic module-scope storage owner must not leak into reference identity: {outcome:#?}"
+        let positive = resolve("external.MakeVariadic(external.MakePair())", "MakeVariadic");
+        let positive_proof = positive.exact_external_call.as_ref().unwrap_or_else(|| {
+            panic!(
+                "unique tuple import should bind exactly: {:#?}",
+                positive.outcome
+            )
+        });
+        assert_eq!(
+            positive_proof.canonical_callee(),
+            "example.com/external.MakeVariadic"
+        );
+        assert_eq!(positive_proof.parameter_count(), 2);
+
+        for (expression, focus) in [
+            ("duplicate.MakePair()", "MakePair"),
+            (
+                "external.MakeVariadic(duplicate.MakePair())",
+                "MakeVariadic",
+            ),
+        ] {
+            let resolution = resolve(expression, focus);
+            assert!(
+                resolution.exact_external_call.is_none(),
+                "an ambiguous import must not prove a callee or tuple arity: {expression}: {:#?}",
+                resolution.outcome
             );
         }
+    }
 
-        let ambiguous = resolve("Ambiguous");
-        assert_eq!(
-            ambiguous.status,
-            DefinitionLookupStatus::UnresolvableImportBoundary,
-            "distinct declarations under both accepted storage names remain ambiguous: {ambiguous:#?}"
+    fn wide_deep_fixture() -> (
+        AnalyzerFixture,
+        ProjectFile,
+        String,
+        Tree,
+        ResolvedReferenceSite,
+    ) {
+        let statements = (0..96)
+            .map(|index| format!("    value{index} := {index}\n    _ = value{index}\n"))
+            .collect::<String>();
+        let expression = format!("{}service{}.Run()", "(".repeat(24), ")".repeat(24));
+        let source = format!(
+            "package main\n\ntype Service struct{{}}\nfunc (Service) Run() {{}}\n\nfunc use(service Service) {{\n{statements}    {expression}\n}}\n"
         );
-        assert_eq!(
-            ambiguous
-                .reference
-                .as_ref()
-                .map(|reference| reference.text.as_str()),
-            Some("example.com/mod.Ambiguous"),
-            "the import binder still carries the canonical unresolved boundary identity: {ambiguous:#?}"
-        );
+        let fixture = AnalyzerFixture::new_for_language(Language::Go, &[("main.go", &source)]);
+        let file = ProjectFile::new(fixture.project_root(), "main.go");
+        let tree = parse_go_tree(&source).expect("Go tree");
+        let site = site_for(&file, &source, &expression, "Run");
+        (fixture, file, source, tree, site)
     }
 
     #[test]
@@ -7299,6 +8207,925 @@ var (
         );
     }
 
+    #[test]
+    #[hardwon(
+        "cd472d9c1eff: Ensures an unresolved final selector does not fall back to the resolved receiver field as the answer"
+    )]
+    fn unresolved_terminal_selector_does_not_return_its_receiver_field() {
+        let source = "package repro\n\nimport \"sync\"\n\ntype anonymizer struct { lock sync.Mutex }\nfunc (a *anonymizer) SaveMapping() { a.lock.Lock() }\n";
+        let fixture = AnalyzerFixture::new_for_language(Language::Go, &[("main.go", source)]);
+        let file = ProjectFile::new(fixture.project_root(), "main.go");
+        let tree = parse_go_tree(source).expect("Go tree");
+        let site = site_for(&file, source, "a.lock.Lock()", "Lock");
+
+        let outcome = resolve_go_bounded(
+            fixture.analyzer.analyzer(),
+            &file,
+            source,
+            Some(&tree),
+            &site,
+            ReceiverAnalysisBudget::default(),
+            None,
+        );
+        let BoundedResolution::Complete { value, .. } = outcome else {
+            panic!("Go selector lookup should complete: {outcome:#?}");
+        };
+        assert_eq!(
+            DefinitionLookupStatus::NoDefinition,
+            value.status,
+            "{value:#?}"
+        );
+        assert!(value.definitions.is_empty(), "{value:#?}");
+    }
+
+    #[test]
+    #[hardwon(
+        "bb38340252e1: Checks dot-import names remain external while local receiver types are inferred from both calls and annotations"
+    )]
+    fn bounded_go_dot_import_types_local_receivers_from_calls_and_annotations() {
+        let source = r#"package main
+
+import . "example.com/app/worker"
+
+func use() {
+    worker := NewWorker()
+    worker.Record()
+    _, paired := 0, NewWorker()
+    paired.Record()
+    var recorder Recorder = worker
+    recorder.Record()
+}
+"#;
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Go,
+            &[
+                ("go.mod", "module example.com/app\n"),
+                (
+                    "worker/worker.go",
+                    r#"package worker
+
+type Worker struct{}
+func (Worker) Record() {}
+
+type Recorder interface {
+    Record()
+}
+
+func NewWorker() Worker { return Worker{} }
+"#,
+                ),
+                ("main.go", source),
+            ],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "main.go");
+        let tree = parse_go_tree(source).expect("Go tree");
+
+        for (expression, target) in [
+            ("worker.Record()", "example.com/app/worker.Worker.Record"),
+            ("paired.Record()", "example.com/app/worker.Worker.Record"),
+            (
+                "recorder.Record()",
+                "example.com/app/worker.Recorder.Record",
+            ),
+        ] {
+            let site = site_for(&file, source, expression, "Record");
+            let outcome = resolve_go_bounded(
+                fixture.analyzer.analyzer(),
+                &file,
+                source,
+                Some(&tree),
+                &site,
+                ReceiverAnalysisBudget::default(),
+                None,
+            );
+            let BoundedResolution::Complete { value, .. } = outcome else {
+                panic!("{expression} should complete: {outcome:#?}");
+            };
+            assert_eq!(value.status, DefinitionLookupStatus::Resolved, "{value:#?}");
+            assert!(
+                matches!(value.definitions.as_slice(), [definition] if definition.fq_name() == target),
+                "{expression}: {value:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn internal_import_access_uses_the_canonical_import_path_prefix() {
+        assert!(go_internal_import_allowed(
+            "example.com/owner/consumer",
+            "example.com/owner/internal/api"
+        ));
+        assert!(go_internal_import_allowed(
+            "example.com/owner",
+            "example.com/owner/internal/api"
+        ));
+        assert!(!go_internal_import_allowed(
+            "example.com/other/consumer",
+            "example.com/owner/internal/api"
+        ));
+        assert!(!go_internal_import_allowed(
+            "example.com/ownerish/consumer",
+            "example.com/owner/internal/api"
+        ));
+        assert!(!go_internal_import_allowed(
+            "example.com/owner",
+            "internal/api"
+        ));
+        assert!(!go_internal_import_allowed(
+            "example.com/owner/consumer",
+            "example.com/owner/internal/nested/internal/api"
+        ));
+        assert!(go_internal_import_allowed(
+            "example.com/owner/internal/nested/consumer",
+            "example.com/owner/internal/nested/internal/api"
+        ));
+    }
+
+    #[test]
+    fn bounded_go_builtin_new_and_method_sets_respect_addressability() {
+        let source = r#"package main
+
+type Service struct{}
+func (Service) ValueOnly() {}
+func (*Service) PointerOnly() {}
+
+type Embedded struct{}
+func (*Embedded) Promoted() {}
+type Outer struct{ Embedded }
+type OuterPointer struct{ *Embedded }
+
+func MakeValue() Service { return Service{} }
+func MakePointer() *Service { return nil }
+func MakeOuter() Outer { return Outer{} }
+func MakeOuterPointer() OuterPointer { return OuterPointer{} }
+
+func use() {
+    var addressable Service
+    addressable.PointerOnly()
+    new(Service).PointerOnly()
+    new(Service).ValueOnly()
+    MakePointer().PointerOnly()
+    MakeValue().ValueOnly()
+    MakeValue().PointerOnly()
+
+    var outer Outer
+    outer.Promoted()
+    MakeOuter().Promoted()
+    MakeOuterPointer().Promoted()
+}
+"#;
+        let fixture = AnalyzerFixture::new_for_language(Language::Go, &[("main.go", source)]);
+        let file = ProjectFile::new(fixture.project_root(), "main.go");
+        let tree = parse_go_tree(source).expect("Go tree");
+
+        for (expression, member, target) in [
+            (
+                "addressable.PointerOnly()",
+                "PointerOnly",
+                "main.Service.PointerOnly",
+            ),
+            (
+                "new(Service).PointerOnly()",
+                "PointerOnly",
+                "main.Service.PointerOnly",
+            ),
+            (
+                "new(Service).ValueOnly()",
+                "ValueOnly",
+                "main.Service.ValueOnly",
+            ),
+            (
+                "MakePointer().PointerOnly()",
+                "PointerOnly",
+                "main.Service.PointerOnly",
+            ),
+            (
+                "MakeValue().ValueOnly()",
+                "ValueOnly",
+                "main.Service.ValueOnly",
+            ),
+            ("outer.Promoted()", "Promoted", "main.Embedded.Promoted"),
+            (
+                "MakeOuterPointer().Promoted()",
+                "Promoted",
+                "main.Embedded.Promoted",
+            ),
+        ] {
+            let site = site_for(&file, source, expression, member);
+            let outcome = resolve_go_bounded(
+                fixture.analyzer.analyzer(),
+                &file,
+                source,
+                Some(&tree),
+                &site,
+                ReceiverAnalysisBudget::default(),
+                None,
+            );
+            let BoundedResolution::Complete { value, .. } = outcome else {
+                panic!("{expression} should complete: {outcome:#?}");
+            };
+            assert_eq!(
+                value.status,
+                DefinitionLookupStatus::Resolved,
+                "{expression}: {value:#?}"
+            );
+            assert!(
+                matches!(value.definitions.as_slice(), [definition] if definition.fq_name() == target),
+                "{expression}: {value:#?}"
+            );
+        }
+
+        for (expression, member) in [
+            ("MakeValue().PointerOnly()", "PointerOnly"),
+            ("MakeOuter().Promoted()", "Promoted"),
+        ] {
+            let site = site_for(&file, source, expression, member);
+            let outcome = resolve_go_bounded(
+                fixture.analyzer.analyzer(),
+                &file,
+                source,
+                Some(&tree),
+                &site,
+                ReceiverAnalysisBudget::default(),
+                None,
+            );
+            assert!(
+                !matches!(
+                    outcome,
+                    BoundedResolution::Complete {
+                        value: DefinitionLookupOutcome {
+                            status: DefinitionLookupStatus::Resolved,
+                            ..
+                        },
+                        ..
+                    }
+                ),
+                "non-addressable value receiver must not claim a pointer-only method: {expression}: {outcome:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_go_deep_receiver_wrappers_use_an_explicit_work_stack() {
+        let expression = format!("{}service{}.Run()", "(".repeat(512), ")".repeat(512));
+        let source = format!(
+            "package main\n\ntype Service struct{{}}\nfunc (Service) Run() {{}}\nfunc use(service Service) {{\n    {expression}\n}}\n"
+        );
+        let fixture = AnalyzerFixture::new_for_language(Language::Go, &[("main.go", &source)]);
+        let file = ProjectFile::new(fixture.project_root(), "main.go");
+        let tree = parse_go_tree(&source).expect("Go tree");
+        let site = site_for(&file, &source, &expression, "Run");
+        let outcome = resolve_go_bounded(
+            fixture.analyzer.analyzer(),
+            &file,
+            &source,
+            Some(&tree),
+            &site,
+            ReceiverAnalysisBudget {
+                context_depth: 8,
+                max_targets: 16,
+                max_summary_expansions: 4_096,
+                max_scope_nodes: 100_000,
+                max_resolution_rounds: ReceiverAnalysisBudget::default().max_resolution_rounds,
+            },
+            None,
+        );
+
+        let BoundedResolution::Complete { value, .. } = outcome else {
+            panic!("deep Go receiver lookup should complete: {outcome:#?}");
+        };
+        assert_eq!(value.status, DefinitionLookupStatus::Resolved, "{value:#?}");
+        assert!(
+            value
+                .definitions
+                .iter()
+                .any(|definition| definition.fq_name() == "main.Service.Run"),
+            "{value:#?}"
+        );
+    }
+
+    #[test]
+    fn bounded_go_import_alias_and_dot_import_use_structured_paths() {
+        for (import, expression) in [
+            ("svc \"example.com/app/service\"", "svc.Service{}"),
+            (". \"example.com/app/service\"", "Service{}"),
+        ] {
+            let (fixture, file, source, tree, site) = imported_type_fixture(import, expression);
+            let outcome = resolve_go_bounded(
+                fixture.analyzer.analyzer(),
+                &file,
+                &source,
+                Some(&tree),
+                &site,
+                ReceiverAnalysisBudget::default(),
+                None,
+            );
+            let BoundedResolution::Complete { value, .. } = outcome else {
+                panic!("bounded Go import lookup should complete: {outcome:#?}");
+            };
+            assert_eq!(value.status, DefinitionLookupStatus::Resolved, "{value:#?}");
+            assert!(
+                value
+                    .definitions
+                    .iter()
+                    .any(|definition| definition.fq_name() == "example.com/app/service.Service"),
+                "{value:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_go_shadowed_new_is_not_treated_as_builtin_allocation() {
+        let source = r#"package main
+
+type Service struct{}
+func (*Service) PointerOnly() {}
+func new(value Service) Service { return value }
+
+func use() {
+    new(Service{}).PointerOnly()
+}
+"#;
+        let fixture = AnalyzerFixture::new_for_language(Language::Go, &[("main.go", source)]);
+        let file = ProjectFile::new(fixture.project_root(), "main.go");
+        let tree = parse_go_tree(source).expect("Go tree");
+        let site = site_for(&file, source, "new(Service{}).PointerOnly()", "PointerOnly");
+        let outcome = resolve_go_bounded(
+            fixture.analyzer.analyzer(),
+            &file,
+            source,
+            Some(&tree),
+            &site,
+            ReceiverAnalysisBudget::default(),
+            None,
+        );
+
+        assert!(
+            !matches!(
+                outcome,
+                BoundedResolution::Complete {
+                    value: DefinitionLookupOutcome {
+                        status: DefinitionLookupStatus::Resolved,
+                        ..
+                    },
+                    ..
+                }
+            ),
+            "a package binding named new must shadow the builtin: {outcome:#?}"
+        );
+    }
+
+    #[test]
+    fn bounded_go_uses_structured_return_field_and_container_shapes() {
+        let source = r#"package main
+
+import svc "example.com/app/service"
+
+type Holder struct {
+    Next *svc.Service
+    Items []svc.Service
+    ByName map[string]svc.Service
+}
+
+func Make() *svc.Service { return nil }
+func Similar() string { return "svc.Service" }
+
+func use(holder Holder) {
+    holder.Next.Run()
+    Make().Run()
+    svc.Make().Run()
+    holder.Items[0].Run()
+    holder.ByName["chosen"].Run()
+    for _, service := range holder.Items {
+        service.Run()
+    }
+    Similar().Run()
+}
+"#;
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Go,
+            &[
+                ("go.mod", "module example.com/app\n"),
+                (
+                    "service/service.go",
+                    "package service\n\ntype Service struct{}\nfunc (*Service) Run() {}\nfunc Make() *Service { return nil }\n",
+                ),
+                ("main.go", source),
+            ],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "main.go");
+        let tree = parse_go_tree(source).expect("Go tree");
+
+        for expression in [
+            "holder.Next.Run()",
+            "Make().Run()",
+            "svc.Make().Run()",
+            "holder.Items[0].Run()",
+            "service.Run()",
+        ] {
+            let site = site_for(&file, source, expression, "Run");
+            let outcome = resolve_go_bounded(
+                fixture.analyzer.analyzer(),
+                &file,
+                source,
+                Some(&tree),
+                &site,
+                ReceiverAnalysisBudget::default(),
+                None,
+            );
+            let BoundedResolution::Complete { value, .. } = outcome else {
+                panic!("{expression} should complete: {outcome:#?}");
+            };
+            assert_eq!(
+                value.status,
+                DefinitionLookupStatus::Resolved,
+                "{expression}: {value:#?}"
+            );
+            assert!(
+                value.definitions.iter().any(|definition| {
+                    definition.fq_name() == "example.com/app/service.Service.Run"
+                }),
+                "{expression}: {value:#?}"
+            );
+        }
+
+        let non_addressable_map_element =
+            site_for(&file, source, "holder.ByName[\"chosen\"].Run()", "Run");
+        let outcome = resolve_go_bounded(
+            fixture.analyzer.analyzer(),
+            &file,
+            source,
+            Some(&tree),
+            &non_addressable_map_element,
+            ReceiverAnalysisBudget::default(),
+            None,
+        );
+        assert!(
+            !matches!(
+                outcome,
+                BoundedResolution::Complete {
+                    value: DefinitionLookupOutcome {
+                        status: DefinitionLookupStatus::Resolved,
+                        ..
+                    },
+                    ..
+                }
+            ),
+            "a map element is not addressable and must not claim a pointer-only method: {outcome:#?}"
+        );
+
+        let negative = site_for(&file, source, "Similar().Run()", "Run");
+        let outcome = resolve_go_bounded(
+            fixture.analyzer.analyzer(),
+            &file,
+            source,
+            Some(&tree),
+            &negative,
+            ReceiverAnalysisBudget::default(),
+            None,
+        );
+        assert!(
+            !matches!(
+                outcome,
+                BoundedResolution::Complete {
+                    value: DefinitionLookupOutcome {
+                        status: DefinitionLookupStatus::Resolved,
+                        ..
+                    },
+                    ..
+                }
+            ),
+            "textually similar string return must not become a receiver type: {outcome:#?}"
+        );
+    }
+
+    #[test]
+    fn bounded_go_wide_deep_walk_honors_mid_walk_cancellation() {
+        let (fixture, file, source, tree, site) = wide_deep_fixture();
+        let cancellation = CancellationToken::cancel_after_checks_for_test(12);
+        let outcome = resolve_go_bounded(
+            fixture.analyzer.analyzer(),
+            &file,
+            &source,
+            Some(&tree),
+            &site,
+            ReceiverAnalysisBudget::default(),
+            Some(&cancellation),
+        );
+
+        assert!(matches!(outcome, BoundedResolution::Cancelled { .. }));
+    }
+
+    #[test]
+    fn bounded_go_wide_deep_walk_stops_without_partial_result() {
+        let (fixture, file, source, tree, site) = wide_deep_fixture();
+        let outcome = resolve_go_bounded(
+            fixture.analyzer.analyzer(),
+            &file,
+            &source,
+            Some(&tree),
+            &site,
+            ReceiverAnalysisBudget::tiny(),
+            None,
+        );
+
+        assert!(matches!(
+            outcome,
+            BoundedResolution::Exceeded {
+                limit: ReceiverBudgetLimit::ScopeNodes,
+                ..
+            }
+        ));
+    }
+
+    #[hardwon("5c5d4e214494: changed go.mod cannot reuse stale internal-package authorization")]
+    #[test]
+    fn changed_go_mod_cannot_authorize_stale_internal_model_call() {
+        let source = "package main\n\nimport pkg \"old.example/app/internal/pkg\"\n\nfunc use() { pkg.MakePair() }\n";
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Go,
+            &[("go.mod", "module old.example/app\n"), ("main.go", source)],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "main.go");
+        let tree = parse_go_tree(source).expect("Go tree");
+        let site = site_for(&file, source, "pkg.MakePair()", "MakePair");
+        let selector = go_selector_descriptor_with_scope(tree.root_node(), &site, || true)
+            .expect("Go selector");
+        let go = resolve_analyzer::<GoAnalyzer>(fixture.analyzer.analyzer())
+            .expect("fixture Go analyzer");
+
+        let disk_provider = ExactPackageCallProvider {
+            inner: AnalyzerGoDefinitionProvider::new(go, None),
+        };
+        let disk_resolution = resolve_go(
+            go,
+            &disk_provider,
+            &file,
+            source,
+            Some(&tree),
+            &site,
+            Some(&selector),
+            None,
+        );
+        assert_eq!(
+            disk_resolution
+                .exact_external_call
+                .as_ref()
+                .map(ExactExternalCallProof::canonical_callee),
+            Some("old.example/app/internal/pkg.MakePair"),
+            "the disk module identity permits its own internal modeled package"
+        );
+
+        let overlay = Arc::new(crate::analyzer::OverlayProject::new(Arc::new(
+            fixture.test_project().clone(),
+        )));
+        let go_mod = ProjectFile::new(fixture.project_root(), "go.mod");
+        assert!(overlay.set(
+            go_mod.abs_path().to_path_buf(),
+            "module new.example/app\n".to_owned(),
+        ));
+        let request = go.clone_with_project(overlay as Arc<dyn crate::analyzer::Project>);
+        assert!(!request.workspace_declaration_identities_authoritative());
+        let request_provider = ExactPackageCallProvider {
+            inner: AnalyzerGoDefinitionProvider::new(&request, None),
+        };
+        let request_resolution = resolve_go(
+            &request,
+            &request_provider,
+            &file,
+            source,
+            Some(&tree),
+            &site,
+            Some(&selector),
+            None,
+        );
+        assert!(
+            request_resolution.exact_external_call.is_none(),
+            "the disk importer identity must not authorize an internal model in the overlaid module namespace: {:#?}",
+            request_resolution.outcome
+        );
+    }
+
+    #[hardwon(
+        "5c5d4e214494: duplicate import aliases cannot authorize an arbitrary callee or result arity"
+    )]
+    #[test]
+    fn duplicate_import_alias_never_proves_a_callee_or_tuple_arity() {
+        let source = r#"package main
+
+import (
+    external "example.com/external"
+    duplicate "example.com/external"
+    duplicate "example.com/custom"
+)
+
+const external = 1
+
+func use() {
+    external.MakeVariadic(external.MakePair())
+    external.MakeVariadic(duplicate.MakePair())
+    duplicate.MakePair()
+}
+"#;
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Go,
+            &[("go.mod", "module example.com/app\n"), ("main.go", source)],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "main.go");
+        let tree = parse_go_tree(source).expect("Go tree");
+        let go = resolve_analyzer::<GoAnalyzer>(fixture.analyzer.analyzer())
+            .expect("fixture Go analyzer");
+
+        let unbounded = ExactPackageCallProvider {
+            inner: AnalyzerGoDefinitionProvider::new(go, None),
+        };
+        assert_exact_import_namespace_authority(&fixture, &unbounded, &file, source, &tree);
+
+        let session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
+        let bounded = ExactPackageCallProvider {
+            inner: AnalyzerGoDefinitionProvider::bounded(go, &session, None),
+        };
+        assert_exact_import_namespace_authority(&fixture, &bounded, &file, source, &tree);
+        assert!(matches!(
+            session.finish(()),
+            BoundedResolution::Complete { .. }
+        ));
+    }
+
+    #[hardwon(
+        "43a2c41d9d02: exact overlay identity canonicalizes supported Go selectors without inventing source definitions"
+    )]
+    #[test]
+    fn exact_go_overlay_canonicalizes_only_the_published_non_call_selector_chain() {
+        let source = r#"package main
+
+import api "example.com/mod"
+
+var (
+    _ = api.Concrete.Read
+    _ = api.hidden.Read
+    _ = api.Lookalike.Read
+)
+"#;
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Go,
+            &[("go.mod", "module example.com/app\n"), ("main.go", source)],
+        );
+        activate_selector_navigation_overlay(&fixture);
+        let file = ProjectFile::new(fixture.project_root(), "main.go");
+        let tree = parse_go_tree(source).expect("Go tree");
+
+        let resolve = |expression: &str| {
+            let site = site_for(&file, source, expression, "Read");
+            let selector = go_selector_descriptor_with_scope(tree.root_node(), &site, || true)
+                .expect("Go selector");
+            let go = resolve_analyzer::<GoAnalyzer>(fixture.analyzer.analyzer())
+                .expect("fixture Go analyzer");
+            let provider = AnalyzerGoDefinitionProvider::new(
+                go,
+                fixture.analyzer.analyzer().semantic_model_overlay(),
+            );
+            resolve_go(
+                go,
+                &provider,
+                &file,
+                source,
+                Some(&tree),
+                &site,
+                Some(&selector),
+                None,
+            )
+            .outcome
+        };
+
+        let published = resolve("api.Concrete.Read");
+        assert_eq!(
+            published.status,
+            DefinitionLookupStatus::NoDefinition,
+            "navigation carries the overlay identity without inventing a source definition: {published:#?}"
+        );
+        assert_eq!(
+            published
+                .reference
+                .as_ref()
+                .map(|reference| reference.text.as_str()),
+            Some("example.com/mod.Concrete.Read"),
+            "the exact overlay declaration canonicalizes the whole selector chain: {published:#?}"
+        );
+
+        let hidden_owner = resolve("api.hidden.Read");
+        assert_eq!(
+            hidden_owner.status,
+            DefinitionLookupStatus::UnresolvableImportBoundary,
+            "a public method cannot make its unexported owner navigable: {hidden_owner:#?}"
+        );
+
+        let lookalike = resolve("api.Lookalike.Read");
+        assert_eq!(
+            lookalike.status,
+            DefinitionLookupStatus::UnresolvableImportBoundary,
+            "an unsupported same-named selector remains an external boundary: {lookalike:#?}"
+        );
+        assert_eq!(
+            lookalike
+                .reference
+                .as_ref()
+                .map(|reference| reference.text.as_str()),
+            Some("example.com/mod.Read"),
+            "an unsupported same-named chain retains only the import binder's boundary identity: {lookalike:#?}"
+        );
+    }
+
+    #[hardwon(
+        "43a2c41d9d02: module-scope values keep canonical navigation identity and reject unsupported selectors"
+    )]
+    #[test]
+    fn external_go_module_scope_values_keep_canonical_navigation_identity() {
+        let source = r#"package main
+
+import api "example.com/mod"
+
+var (
+    _ = api.ExportedVar
+    _ = api.ExportedConst
+    _ = api.Ambiguous
+)
+"#;
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Go,
+            &[("go.mod", "module example.com/app\n"), ("main.go", source)],
+        );
+        activate_selector_navigation_overlay(&fixture);
+        let file = ProjectFile::new(fixture.project_root(), "main.go");
+        let tree = parse_go_tree(source).expect("Go tree");
+        let go = resolve_analyzer::<GoAnalyzer>(fixture.analyzer.analyzer())
+            .expect("fixture Go analyzer");
+        let provider = AnalyzerGoDefinitionProvider::new(
+            go,
+            fixture.analyzer.analyzer().semantic_model_overlay(),
+        );
+        let resolve = |member: &str| {
+            let expression = format!("api.{member}");
+            let site = site_for(&file, source, &expression, member);
+            let selector = go_selector_descriptor_with_scope(tree.root_node(), &site, || true)
+                .expect("Go selector");
+            resolve_go(
+                go,
+                &provider,
+                &file,
+                source,
+                Some(&tree),
+                &site,
+                Some(&selector),
+                None,
+            )
+            .outcome
+        };
+
+        for member in ["ExportedVar", "ExportedConst"] {
+            let outcome = resolve(member);
+            let expected = format!("example.com/mod.{member}");
+            assert_eq!(
+                outcome.status,
+                DefinitionLookupStatus::NoDefinition,
+                "the modeled package value is navigable without inventing a source definition: {outcome:#?}"
+            );
+            assert_eq!(
+                outcome
+                    .reference
+                    .as_ref()
+                    .map(|reference| reference.text.as_str()),
+                Some(expected.as_str()),
+                "the synthetic module-scope storage owner must not leak into reference identity: {outcome:#?}"
+            );
+        }
+
+        let ambiguous = resolve("Ambiguous");
+        assert_eq!(
+            ambiguous.status,
+            DefinitionLookupStatus::UnresolvableImportBoundary,
+            "distinct declarations under both accepted storage names remain ambiguous: {ambiguous:#?}"
+        );
+        assert_eq!(
+            ambiguous
+                .reference
+                .as_ref()
+                .map(|reference| reference.text.as_str()),
+            Some("example.com/mod.Ambiguous"),
+            "the import binder still carries the canonical unresolved boundary identity: {ambiguous:#?}"
+        );
+    }
+
+    #[hardwon(
+        "5c5d4e214494: const and grouped-var bindings follow Go scope when shadowing imports"
+    )]
+    #[test]
+    fn go_const_and_grouped_var_bindings_obey_spec_scope_for_import_shadowing() {
+        for (label, source, marker, expected_shadow) in [
+            (
+                "const own initializer",
+                "package main\n\nimport os \"example.com/external\"\n\nfunc use() {\n    const os = os.O_RDONLY\n    _ = os\n}\n",
+                "os.O_RDONLY",
+                false,
+            ),
+            (
+                "const after spec",
+                "package main\n\nimport os \"example.com/external\"\n\nfunc use() {\n    const os = 1\n    _ = os.Open\n}\n",
+                "os.Open",
+                true,
+            ),
+            (
+                "earlier grouped const spec",
+                "package main\n\nimport os \"example.com/external\"\n\nfunc use() {\n    const (\n        os = 1\n        later = os.Open\n    )\n    _ = later\n}\n",
+                "os.Open",
+                true,
+            ),
+            (
+                "grouped local const after declaration",
+                "package main\n\nimport os \"example.com/external\"\n\nfunc use() {\n    const (\n        os = 1\n        later = 2\n    )\n    _ = os.Open\n}\n",
+                "os.Open",
+                true,
+            ),
+            (
+                "earlier grouped var spec",
+                "package main\n\nimport os \"example.com/external\"\n\nfunc use() {\n    var (\n        os = 1\n        later = os.Open\n    )\n    _, _ = os, later\n}\n",
+                "os.Open",
+                true,
+            ),
+            (
+                "package const beneath file import",
+                "package main\n\nimport os \"example.com/external\"\n\nconst os = 1\n\nfunc use() {\n    _ = os.Open\n}\n",
+                "os.Open",
+                false,
+            ),
+            (
+                "package grouped const later initializer",
+                "package main\n\nimport os \"example.com/external\"\n\nconst (\n    os = 1\n    later = os.Open\n)\n",
+                "os.Open",
+                false,
+            ),
+            (
+                "package grouped var later initializer",
+                "package main\n\nimport os \"example.com/external\"\n\nvar (\n    os = 1\n    later = os.Open\n)\n",
+                "os.Open",
+                false,
+            ),
+        ] {
+            let fixture = AnalyzerFixture::new_for_language(Language::Go, &[("main.go", source)]);
+            let go = resolve_analyzer::<GoAnalyzer>(fixture.analyzer.analyzer())
+                .expect("fixture Go analyzer");
+            let provider = AnalyzerGoDefinitionProvider::new(go, None);
+            let tree = parse_go_tree(source).expect("Go tree");
+            let byte = source.find(marker).expect("shadowing marker");
+            let binding =
+                go_nearest_visible_binding(&provider, tree.root_node(), source, "os", byte);
+            assert_eq!(binding.is_some(), expected_shadow, "{label}");
+        }
+    }
+
+    #[test]
+    fn go_import_declarations_persist_structured_paths() {
+        let source = r#"
+package main
+import (
+    svc "example.com/app/service"
+    . `example.com/app/model`
+)
+"#;
+        let tree = parse_go_tree(source).expect("Go tree");
+        let imports =
+            brokk_bifrost_go::declarations::collect_go_import_infos(tree.root_node(), source);
+
+        assert_eq!(imports.len(), 2);
+        // A Go import path is stored one '/'-separated component per segment,
+        // so consumers rejoin it with `render_segments("/")` instead of taking
+        // segment zero as the whole path.
+        assert_eq!(
+            imports[0]
+                .path
+                .as_ref()
+                .map(|path| path.segments.as_slice()),
+            Some(
+                [
+                    "example.com".to_string(),
+                    "app".to_string(),
+                    "service".to_string()
+                ]
+                .as_slice()
+            )
+        );
+        assert_eq!(
+            imports[1]
+                .path
+                .as_ref()
+                .map(|path| path.render_segments("/")),
+            Some("example.com/app/model".to_string())
+        );
+    }
+
+    #[hardwon(
+        "5c5d4e214494: a changed go.mod overlay invalidates stale workspace package declarations"
+    )]
     #[test]
     fn go_mod_overlay_suppresses_stale_workspace_declarations() {
         let source = "package main\n\nimport pkg \"old.example/app/pkg\"\n\nfunc use() string { return pkg.Run(\"value\") }\n";
@@ -7561,134 +9388,9 @@ var (
         );
     }
 
-    #[test]
-    fn changed_go_mod_cannot_authorize_stale_internal_model_call() {
-        let source = "package main\n\nimport pkg \"old.example/app/internal/pkg\"\n\nfunc use() { pkg.MakePair() }\n";
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Go,
-            &[("go.mod", "module old.example/app\n"), ("main.go", source)],
-        );
-        let file = ProjectFile::new(fixture.project_root(), "main.go");
-        let tree = parse_go_tree(source).expect("Go tree");
-        let site = site_for(&file, source, "pkg.MakePair()", "MakePair");
-        let selector = go_selector_descriptor_with_scope(tree.root_node(), &site, || true)
-            .expect("Go selector");
-        let go = resolve_analyzer::<GoAnalyzer>(fixture.analyzer.analyzer())
-            .expect("fixture Go analyzer");
-
-        let disk_provider = ExactPackageCallProvider {
-            inner: AnalyzerGoDefinitionProvider::new(go, None),
-        };
-        let disk_resolution = resolve_go(
-            go,
-            &disk_provider,
-            &file,
-            source,
-            Some(&tree),
-            &site,
-            Some(&selector),
-            None,
-        );
-        assert_eq!(
-            disk_resolution
-                .exact_external_call
-                .as_ref()
-                .map(ExactExternalCallProof::canonical_callee),
-            Some("old.example/app/internal/pkg.MakePair"),
-            "the disk module identity permits its own internal modeled package"
-        );
-
-        let overlay = Arc::new(crate::analyzer::OverlayProject::new(Arc::new(
-            fixture.test_project().clone(),
-        )));
-        let go_mod = ProjectFile::new(fixture.project_root(), "go.mod");
-        assert!(overlay.set(
-            go_mod.abs_path().to_path_buf(),
-            "module new.example/app\n".to_owned(),
-        ));
-        let request = go.clone_with_project(overlay as Arc<dyn crate::analyzer::Project>);
-        assert!(!request.workspace_declaration_identities_authoritative());
-        let request_provider = ExactPackageCallProvider {
-            inner: AnalyzerGoDefinitionProvider::new(&request, None),
-        };
-        let request_resolution = resolve_go(
-            &request,
-            &request_provider,
-            &file,
-            source,
-            Some(&tree),
-            &site,
-            Some(&selector),
-            None,
-        );
-        assert!(
-            request_resolution.exact_external_call.is_none(),
-            "the disk importer identity must not authorize an internal model in the overlaid module namespace: {:#?}",
-            request_resolution.outcome
-        );
-    }
-
-    #[test]
-    fn workspace_package_inventory_is_incomplete_for_invalid_go_mod() {
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Go,
-            &[("go.mod", "go 1.26\n"), ("pkg/pkg.go", "package pkg\n")],
-        );
-        let go = resolve_analyzer::<GoAnalyzer>(fixture.analyzer.analyzer())
-            .expect("fixture Go analyzer");
-        let session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
-        let status = AnalyzerGoDefinitionProvider::bounded(go, &session, None)
-            .workspace_package_status("example.com/app/pkg");
-        assert!(matches!(
-            session.finish(status),
-            BoundedResolution::Complete {
-                value: GoWorkspacePackageStatus::Unknown,
-                ..
-            }
-        ));
-        assert_eq!(go.workspace_path_index_build_count_for_test(), 0);
-    }
-
-    #[test]
-    fn partial_go_workspace_snapshot_keeps_valid_declarations_and_unknown_absence() {
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Go,
-            &[
-                ("go.mod", "module example.com/app\n"),
-                ("valid/valid.go", "package valid\n\nfunc Kept() {}\n"),
-                ("broken/broken.go", "\0not parseable source"),
-            ],
-        );
-        let go = resolve_analyzer::<GoAnalyzer>(fixture.analyzer.analyzer())
-            .expect("fixture Go analyzer");
-        let valid_file = ProjectFile::new(fixture.project_root(), "valid/valid.go");
-        let definitions = go.get_definitions("example.com/app/valid.Kept");
-        let [definition] = definitions.as_slice() else {
-            panic!(
-                "the valid blob must remain published in the partial snapshot: {definitions:#?}"
-            );
-        };
-        assert_eq!(definition.source(), &valid_file);
-
-        for (import_path, expected) in [
-            ("example.com/app/valid", GoWorkspacePackageStatus::Present),
-            ("example.com/app/broken", GoWorkspacePackageStatus::Unknown),
-        ] {
-            let session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
-            let status = AnalyzerGoDefinitionProvider::bounded(go, &session, None)
-                .workspace_package_status(import_path);
-            assert!(matches!(
-                session.finish(status),
-                BoundedResolution::Complete { value, .. } if value == expected
-            ));
-        }
-        assert_eq!(
-            go.workspace_path_index_build_count_for_test(),
-            0,
-            "partial package authority must remain a relational snapshot answer"
-        );
-    }
-
+    #[hardwon(
+        "5c5d4e214494: go.mod edits reproject package identity and invalidate cached resolution state"
+    )]
     #[test]
     fn go_mod_update_reprojects_workspace_package_identity() {
         let fixture = AnalyzerFixture::new_for_language(
@@ -7800,250 +9502,424 @@ var (
         }
     }
 
-    fn resolve_with_concrete_testing_receiver(
-        fixture: &AnalyzerFixture,
-        file: &ProjectFile,
-        source: &str,
-        tree: &Tree,
-        site: &ResolvedReferenceSite,
-    ) -> GoDefinitionResolution {
-        let analyzer = fixture.analyzer.analyzer();
-        let go = resolve_analyzer::<GoAnalyzer>(analyzer).expect("Go analyzer");
-        let provider = ConcreteTestingReceiverProvider {
-            inner: AnalyzerGoDefinitionProvider::new(go, None),
-        };
-        let selector = go_selector_descriptor_with_scope(tree.root_node(), site, || true)
-            .expect("Go selector");
-        resolve_go(
-            analyzer,
-            &provider,
-            file,
-            source,
-            Some(tree),
-            site,
-            Some(&selector),
-            None,
-        )
-    }
-
-    fn assert_exact_import_namespace_authority(
-        fixture: &AnalyzerFixture,
-        provider: &dyn GoDefinitionProvider,
-        file: &ProjectFile,
-        source: &str,
-        tree: &Tree,
-    ) {
-        let go = resolve_analyzer::<GoAnalyzer>(fixture.analyzer.analyzer())
-            .expect("fixture Go analyzer");
-        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
-        let token = scope.token();
-        let (aliases, _) = go_definition_import_namespaces(provider, token, go, file);
-        assert_eq!(
-            aliases.get("duplicate"),
-            Some(&vec![
-                "example.com/custom".to_owned(),
-                "example.com/external".to_owned(),
-            ]),
-            "the import namespace must retain every distinct path"
-        );
-        assert!(
-            !go_import_paths(provider, token, go, file).contains_key("duplicate"),
-            "an ambiguous local import name must not select an arbitrary path"
-        );
-
-        let resolve = |expression: &str, focus: &str| {
-            let site = site_for(file, source, expression, focus);
-            let selector = go_selector_descriptor_with_scope(tree.root_node(), &site, || true)
-                .expect("Go selector");
-            resolve_go(
-                fixture.analyzer.analyzer(),
-                provider,
-                file,
-                source,
-                Some(tree),
-                &site,
-                Some(&selector),
-                None,
-            )
-        };
-
-        let positive = resolve("external.MakeVariadic(external.MakePair())", "MakeVariadic");
-        let positive_proof = positive.exact_external_call.as_ref().unwrap_or_else(|| {
-            panic!(
-                "unique tuple import should bind exactly: {:#?}",
-                positive.outcome
-            )
-        });
-        assert_eq!(
-            positive_proof.canonical_callee(),
-            "example.com/external.MakeVariadic"
-        );
-        assert_eq!(positive_proof.parameter_count(), 2);
-
-        for (expression, focus) in [
-            ("duplicate.MakePair()", "MakePair"),
-            (
-                "external.MakeVariadic(duplicate.MakePair())",
-                "MakeVariadic",
-            ),
-        ] {
-            let resolution = resolve(expression, focus);
-            assert!(
-                resolution.exact_external_call.is_none(),
-                "an ambiguous import must not prove a callee or tuple arity: {expression}: {:#?}",
-                resolution.outcome
-            );
-        }
-    }
-
+    #[hardwon(
+        "c51b249c4f34: parameter binding uses exact callable spans and preserves descriptor copies"
+    )]
     #[test]
-    fn structured_concrete_external_receiver_carries_only_the_reviewed_method_identity() {
-        for (
-            receiver,
-            expression,
-            focus,
-            expected_status,
-            expected_target,
-            expected_extensibility,
-        ) in [
-            (
-                "*testing.T",
-                "t.Fatal(\"stop\")",
-                "Fatal",
-                DefinitionLookupStatus::UnresolvableImportBoundary,
-                Some("testing.T.Fatal"),
-                Some(DispatchExtensibility::Closed),
-            ),
-            (
-                "testing.TB",
-                "t.Fatal(\"stop\")",
-                "Fatal",
-                DefinitionLookupStatus::NoDefinition,
-                None,
-                None,
-            ),
-            (
-                "*testing.T",
-                "t.Stat(1)",
-                "Stat",
-                DefinitionLookupStatus::NoDefinition,
-                None,
-                None,
-            ),
-        ] {
-            let source = format!(
-                "package main\n\nimport \"testing\"\n\nfunc use(t {receiver}) {{\n    {expression}\n}}\n"
-            );
-            let fixture = AnalyzerFixture::new_for_language(
-                Language::Go,
-                &[("go.mod", "module example.com/app\n"), ("main.go", &source)],
-            );
-            let file = ProjectFile::new(fixture.project_root(), "main.go");
-            let tree = parse_go_tree(&source).expect("Go tree");
-            let site = site_for(&file, &source, expression, focus);
-
-            let resolution =
-                resolve_with_concrete_testing_receiver(&fixture, &file, &source, &tree, &site);
-
-            assert_eq!(
-                resolution.outcome.status, expected_status,
-                "{:#?}",
-                resolution.outcome
-            );
-            assert_eq!(
-                resolution
-                    .outcome
-                    .reference
-                    .as_ref()
-                    .map(|reference| reference.text.as_str()),
-                expected_target,
-                "{:#?}",
-                resolution.outcome
-            );
-            assert_eq!(
-                resolution.call_application,
-                CallApplicationKind::BoundReceiver,
-                "{:#?}",
-                resolution.outcome
-            );
-            assert_eq!(
-                resolution.dispatch_extensibility, expected_extensibility,
-                "{:#?}",
-                resolution.outcome
-            );
-            match expected_target {
-                Some(expected_target) => {
-                    let proof = resolution.exact_external_call.as_ref().unwrap_or_else(|| {
-                        panic!(
-                            "exact receiver target must retain one proof: {:#?}",
-                            resolution.outcome
-                        )
-                    });
-                    assert_eq!(proof.canonical_callee(), expected_target);
-                    assert_eq!(proof.call_application(), CallApplicationKind::BoundReceiver);
-                    assert_eq!(proof.parameter_count(), 1);
-                }
-                None => assert!(
-                    resolution.exact_external_call.is_none(),
-                    "a rejected receiver must not retain a partial proof: {:#?}",
-                    resolution.outcome
-                ),
+    fn go_parameter_binding_uses_exact_callable_spans_and_preserves_descriptor_copies() {
+        let source = r#"package main
+type Cell struct{}
+type Other struct{}
+func Values(first, second *Cell, value Cell, slice []int, mapping map[int]int, channel chan int, callback func(), boxed interface{}, array [1]int, unknown Missing) {}
+func (Cell) Same(value *Cell) {}
+func (Other) Same(value Cell) {}
+func init() {
+    _ = func(value *Cell) {}
+    _ = func(value Cell) {}
+}
+"#;
+        let file = ProjectFile::new(std::env::temp_dir(), "parameter-binding.go");
+        let tree = parse_tree_for_language(&file, Language::Go, source).expect("Go fixture parses");
+        let mut pending = vec![tree.root_node()];
+        let mut callables = Vec::new();
+        while let Some(node) = pending.pop() {
+            if matches!(
+                node.kind(),
+                "function_declaration" | "method_declaration" | "func_literal"
+            ) {
+                callables.push(node);
             }
+            let mut cursor = node.walk();
+            pending.extend(node.named_children(&mut cursor));
         }
+        callables.sort_by_key(Node::start_byte);
+        let expected = [
+            vec![
+                Some(true),
+                Some(true),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false),
+                None,
+            ],
+            vec![Some(true)],
+            vec![Some(false)],
+            vec![],
+            vec![Some(true)],
+            vec![Some(false)],
+        ];
+        let backing_expected = [
+            vec![
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(true),
+                Some(true),
+                Some(true),
+                Some(false),
+                Some(false),
+                Some(false),
+                None,
+            ],
+            vec![Some(false)],
+            vec![Some(false)],
+            vec![],
+            vec![Some(false)],
+            vec![Some(false)],
+        ];
+        assert_eq!(callables.len(), expected.len());
+        assert_eq!(callables.len(), backing_expected.len());
+        for ((callable, expected), backing_expected) in
+            callables.into_iter().zip(expected).zip(backing_expected)
+        {
+            for (ordinal, (expected, backing_expected)) in expected
+                .into_iter()
+                .chain([None])
+                .zip(backing_expected.into_iter().chain([None]))
+                .enumerate()
+            {
+                assert_eq!(
+                    parameter_binds_by_reference_at_span(
+                        &file,
+                        source,
+                        callable.start_byte(),
+                        callable.end_byte(),
+                        ordinal
+                    ),
+                    expected,
+                    "exact callable {:?}, ordinal {ordinal}",
+                    callable.range()
+                );
+                assert_eq!(
+                    parameter_preserves_backing_at_span(
+                        &file,
+                        source,
+                        callable.start_byte(),
+                        callable.end_byte(),
+                        ordinal
+                    ),
+                    backing_expected,
+                    "exact callable {:?}, backing ordinal {ordinal}",
+                    callable.range()
+                );
+            }
+            assert_eq!(
+                parameter_binds_by_reference_at_span(
+                    &file,
+                    source,
+                    callable.start_byte(),
+                    callable.end_byte() - 1,
+                    0
+                ),
+                None
+            );
+            assert_eq!(
+                parameter_preserves_backing_at_span(
+                    &file,
+                    source,
+                    callable.start_byte(),
+                    callable.end_byte() - 1,
+                    0
+                ),
+                None
+            );
+        }
+        let recovery = "package main\nfunc broken(value *Cell) { @ }";
+        assert_eq!(
+            parameter_binds_by_reference_at_span(&file, recovery, 13, recovery.len(), 0),
+            None
+        );
+        assert_eq!(
+            parameter_preserves_backing_at_span(&file, recovery, 13, recovery.len(), 0),
+            None
+        );
     }
 
+    #[hardwon(
+        "18b213945166: parameter references use exact result ordinals and do not treat shadowed primitives as builtins"
+    )]
     #[test]
-    fn structured_local_embedding_resolves_one_promoted_external_receiver_method() {
+    fn go_parameter_reference_free_uses_exact_ordinals_and_unshadowed_primitives() {
         let source = r#"package main
 
-import "sync"
+type Cell struct{}
+type Alias = int
+type Box[T any] struct{}
+type Left struct{}
+type Right struct{}
 
-type CacheTable struct {
-    sync.RWMutex
-}
-
-func use(table *CacheTable) {
-    table.Lock()
-}
+func Values(first, second int, flag bool, text string, pointer *Cell, slice []int, values map[int]int, channel chan int, callback func(), boxed interface{}, aggregate struct{}, array [1]int) {}
+func AliasParameter(value Alias) {}
+func Variadic(values ...int) {}
+func Generic[T any](value T) {}
+func (box Box[T]) GenericReceiver(value int) {}
+func (Left) Build(value int) {}
+func (Right) Build(value *Cell) {}
 "#;
         let fixture = AnalyzerFixture::new_for_language(
             Language::Go,
             &[("go.mod", "module example.com/app\n"), ("main.go", source)],
         );
+        let analyzer = fixture.analyzer.analyzer();
         let file = ProjectFile::new(fixture.project_root(), "main.go");
-        let tree = parse_go_tree(source).expect("Go tree");
-        let site = site_for(&file, source, "table.Lock()", "Lock");
 
-        let resolution =
-            resolve_with_concrete_testing_receiver(&fixture, &file, source, &tree, &site);
+        let values = indexed_go_function_at_start(analyzer, &file, source, "func Values(");
+        for (ordinal, expected) in [
+            (0, Some(true)), // first
+            (1, Some(true)), // second, grouped with first
+            (2, Some(true)), // bool
+            (3, None),       // string
+            (4, None),       // pointer
+            (5, None),       // slice
+            (6, None),       // map
+            (7, None),       // channel
+            (8, None),       // function
+            (9, None),       // interface
+            (10, None),      // struct
+            (11, None),      // array
+            (12, None),      // out of range
+        ] {
+            assert_eq!(
+                parameter_is_reference_free_at_ordinal(analyzer, &file, source, &values, ordinal,),
+                expected,
+                "Values parameter ordinal {ordinal}",
+            );
+        }
 
+        for (marker, expected, reason) in [
+            ("func AliasParameter(", None, "named alias"),
+            ("func Variadic(", None, "variadic parameter"),
+            ("func Generic[", None, "type parameter"),
+            (
+                "func (box Box[T]) GenericReceiver(",
+                None,
+                "generic receiver",
+            ),
+        ] {
+            let function = indexed_go_function_at_start(analyzer, &file, source, marker);
+            assert_eq!(
+                parameter_is_reference_free_at_ordinal(analyzer, &file, source, &function, 0),
+                expected,
+                "{reason}",
+            );
+        }
+
+        let left = indexed_go_function_at_start(analyzer, &file, source, "func (Left) Build(");
+        let right = indexed_go_function_at_start(analyzer, &file, source, "func (Right) Build(");
         assert_eq!(
-            resolution.outcome.status,
-            DefinitionLookupStatus::UnresolvableImportBoundary,
-            "{:#?}",
-            resolution.outcome
+            parameter_is_reference_free_at_ordinal(analyzer, &file, source, &left, 0),
+            Some(true),
+            "the exact Left.Build declaration has a primitive parameter",
         );
         assert_eq!(
-            resolution
-                .outcome
-                .reference
-                .as_ref()
-                .map(|reference| reference.text.as_str()),
-            Some("sync.RWMutex.Lock"),
-            "{:#?}",
-            resolution.outcome
+            parameter_is_reference_free_at_ordinal(analyzer, &file, source, &right, 0),
+            None,
+            "the exact Right.Build declaration has a pointer parameter",
         );
-        let proof = resolution.exact_external_call.as_ref().unwrap_or_else(|| {
-            panic!(
-                "the promoted receiver target must retain one exact proof: {:#?}",
-                resolution.outcome
-            )
-        });
-        assert_eq!(proof.canonical_callee(), "sync.RWMutex.Lock");
-        assert_eq!(proof.call_application(), CallApplicationKind::BoundReceiver);
-        assert_eq!(proof.parameter_count(), 0);
+
+        let shadowed_source = r#"package main
+
+type Cell struct{}
+type int *Cell
+
+func Shadowed(value int) {}
+"#;
+        let shadowed_fixture = AnalyzerFixture::new_for_language(
+            Language::Go,
+            &[
+                ("go.mod", "module example.com/app\n"),
+                ("main.go", shadowed_source),
+            ],
+        );
+        let shadowed_analyzer = shadowed_fixture.analyzer.analyzer();
+        let shadowed_file = ProjectFile::new(shadowed_fixture.project_root(), "main.go");
+        let shadowed = indexed_go_function_at_start(
+            shadowed_analyzer,
+            &shadowed_file,
+            shadowed_source,
+            "func Shadowed(",
+        );
+        assert_eq!(
+            parameter_is_reference_free_at_ordinal(
+                shadowed_analyzer,
+                &shadowed_file,
+                shadowed_source,
+                &shadowed,
+                0,
+            ),
+            None,
+            "a package declaration shadowing int must stay unknown",
+        );
     }
 
+    #[hardwon(
+        "78664013705a: unsupported and recovered result types abstain without guessed receiver identity"
+    )]
+    #[test]
+    fn go_result_binding_abstains_on_aliases_generics_type_parameters_and_recovery() {
+        let source = r#"package main
+
+type NamedSlice []byte
+type Alias = []byte
+type GenericBox[T any] struct{}
+
+func AliasResult() Alias { return nil }
+func NamedSliceResult() NamedSlice { return nil }
+func GenericResult() GenericBox[int] { return GenericBox[int]{} }
+func GenericPointer() *GenericBox[int] { return nil }
+func GenericSlice() []GenericBox[int] { return nil }
+func TypeParameterShadow[Shadow any]() Shadow {
+    var zero Shadow
+    return zero
+}
+func (box GenericBox[T]) GenericReceiver() NamedSlice { return nil }
+func Recovery() *NamedSlice {
+    @@@
+    return nil
+}
+"#;
+        let fixture = AnalyzerFixture::new_for_language(Language::Go, &[("main.go", source)]);
+        let analyzer = fixture.analyzer.analyzer();
+        let file = ProjectFile::new(fixture.project_root(), "main.go");
+
+        for (marker, expected, reason) in [
+            ("func AliasResult()", None, "type alias"),
+            ("func NamedSliceResult()", Some(true), "direct named slice"),
+            ("func GenericResult()", None, "instantiated generic nominal"),
+            (
+                "func GenericPointer()",
+                Some(true),
+                "pointer outer shape remains known with a generic element",
+            ),
+            (
+                "func GenericSlice()",
+                Some(true),
+                "slice outer shape remains known with a generic element",
+            ),
+            ("func TypeParameterShadow", None, "type parameter shadowing"),
+            (
+                "func (box GenericBox[T]) GenericReceiver()",
+                None,
+                "generic receiver",
+            ),
+            ("func Recovery()", None, "parser recovery"),
+        ] {
+            let function = indexed_go_function_at_start(analyzer, &file, source, marker);
+            assert_eq!(
+                result_binds_by_reference_at_ordinal(analyzer, &file, source, &function, 0),
+                expected,
+                "{reason}",
+            );
+        }
+    }
+
+    #[hardwon("78664013705a: result binding follows the selected Go return ordinal")]
+    #[test]
+    fn go_result_binding_modes_follow_exact_result_ordinals() {
+        let source = r#"package main
+
+type NamedStruct struct{}
+
+func Shapes() (*NamedStruct, struct{}, [2]byte, []byte, map[string]int, chan int) {
+    return nil, struct{}{}, [2]byte{}, nil, nil, nil
+}
+func NamedValue() NamedStruct { return NamedStruct{} }
+func Scalar() int { return 0 }
+func Grouped() (first, second []byte, third [2]byte, fourth, fifth struct{}) {
+    return nil, nil, [2]byte{}, struct{}{}, struct{}{}
+}
+"#;
+        let fixture = AnalyzerFixture::new_for_language(Language::Go, &[("main.go", source)]);
+        let analyzer = fixture.analyzer.analyzer();
+        let file = ProjectFile::new(fixture.project_root(), "main.go");
+
+        let shapes = indexed_go_function_at_start(analyzer, &file, source, "func Shapes()");
+        for (ordinal, expected) in [
+            (0, Some(true)),  // pointer
+            (1, Some(false)), // struct
+            (2, Some(false)), // array
+            (3, Some(true)),  // slice
+            (4, Some(true)),  // map
+            (5, Some(true)),  // channel
+            (6, None),        // out of range
+        ] {
+            assert_eq!(
+                result_binds_by_reference_at_ordinal(analyzer, &file, source, &shapes, ordinal,),
+                expected,
+                "Shapes result ordinal {ordinal}",
+            );
+        }
+
+        let named = indexed_go_function_at_start(analyzer, &file, source, "func NamedValue()");
+        assert_eq!(
+            result_binds_by_reference_at_ordinal(analyzer, &file, source, &named, 0),
+            Some(false),
+            "a direct same-file named struct is inline",
+        );
+
+        let scalar = indexed_go_function_at_start(analyzer, &file, source, "func Scalar()");
+        assert_eq!(
+            result_binds_by_reference_at_ordinal(analyzer, &file, source, &scalar, 0),
+            None,
+            "a scalar result has no proven reference or inline aggregate shape",
+        );
+        assert_eq!(
+            result_binds_by_reference_at_ordinal(analyzer, &file, source, &scalar, 1),
+            None,
+            "a scalar result has no ordinal one",
+        );
+
+        let grouped = indexed_go_function_at_start(analyzer, &file, source, "func Grouped()");
+        for (ordinal, expected) in [
+            (0, Some(true)),  // first
+            (1, Some(true)),  // second, grouped with first
+            (2, Some(false)), // third
+            (3, Some(false)), // fourth
+            (4, Some(false)), // fifth, grouped with fourth
+            (5, None),        // out of range
+        ] {
+            assert_eq!(
+                result_binds_by_reference_at_ordinal(analyzer, &file, source, &grouped, ordinal,),
+                expected,
+                "Grouped result ordinal {ordinal}",
+            );
+        }
+    }
+
+    #[hardwon("78664013705a: same-named methods use the exact declaration identity")]
+    #[test]
+    fn go_result_binding_uses_exact_same_named_method_declaration() {
+        let source = r#"package main
+
+type Left struct{}
+type Right struct{}
+
+func (Left) Build() []byte { return nil }
+func (Right) Build() struct{} { return struct{}{} }
+"#;
+        let fixture = AnalyzerFixture::new_for_language(Language::Go, &[("main.go", source)]);
+        let analyzer = fixture.analyzer.analyzer();
+        let file = ProjectFile::new(fixture.project_root(), "main.go");
+        let left = indexed_go_function_at_start(analyzer, &file, source, "func (Left) Build()");
+        let right = indexed_go_function_at_start(analyzer, &file, source, "func (Right) Build()");
+
+        assert_eq!(
+            result_binds_by_reference_at_ordinal(analyzer, &file, source, &left, 0),
+            Some(true),
+            "the Left.Build declaration returns a slice",
+        );
+        assert_eq!(
+            result_binds_by_reference_at_ordinal(analyzer, &file, source, &right, 0),
+            Some(false),
+            "the Right.Build declaration returns a struct",
+        );
+    }
+
+    #[hardwon("ea2822a0199a: Go interface-key map ranges preserve pointer and value element types")]
     #[test]
     fn interface_key_map_ranges_preserve_pointer_and_value_elements() {
         let source = r#"package main
@@ -8201,47 +10077,6 @@ func runUnknown(t *unknownTable) {
     }
 
     #[test]
-    fn equally_near_modeled_promotions_remain_ambiguous() {
-        let source = r#"package main
-
-import "sync"
-
-type left struct { sync.RWMutex }
-type right struct { sync.RWMutex }
-type both struct {
-    left
-    right
-}
-
-func use(value *both) {
-    value.Lock()
-}
-"#;
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Go,
-            &[("go.mod", "module example.com/app\n"), ("main.go", source)],
-        );
-        let file = ProjectFile::new(fixture.project_root(), "main.go");
-        let tree = parse_go_tree(source).expect("Go tree");
-        let site = site_for(&file, source, "value.Lock()", "Lock");
-
-        let resolution =
-            resolve_with_concrete_testing_receiver(&fixture, &file, source, &tree, &site);
-
-        assert_eq!(
-            resolution.outcome.status,
-            DefinitionLookupStatus::Ambiguous,
-            "{:#?}",
-            resolution.outcome
-        );
-        assert!(
-            resolution.exact_external_call.is_none(),
-            "ambiguous promotions must not retain an exact call proof: {:#?}",
-            resolution.outcome
-        );
-    }
-
-    #[test]
     fn modeled_external_results_preserve_go_assignment_ordinals_and_call_identity() {
         let source = r#"package main
 
@@ -8367,86 +10202,158 @@ func use() {
         }
     }
 
+    #[hardwon(
+        "43a2c41d9d02: partial Go snapshots preserve valid declarations and keep missing packages unknown"
+    )]
     #[test]
-    fn go_const_and_grouped_var_bindings_obey_spec_scope_for_import_shadowing() {
-        for (label, source, marker, expected_shadow) in [
-            (
-                "const own initializer",
-                "package main\n\nimport os \"example.com/external\"\n\nfunc use() {\n    const os = os.O_RDONLY\n    _ = os\n}\n",
-                "os.O_RDONLY",
-                false,
-            ),
-            (
-                "const after spec",
-                "package main\n\nimport os \"example.com/external\"\n\nfunc use() {\n    const os = 1\n    _ = os.Open\n}\n",
-                "os.Open",
-                true,
-            ),
-            (
-                "earlier grouped const spec",
-                "package main\n\nimport os \"example.com/external\"\n\nfunc use() {\n    const (\n        os = 1\n        later = os.Open\n    )\n    _ = later\n}\n",
-                "os.Open",
-                true,
-            ),
-            (
-                "grouped local const after declaration",
-                "package main\n\nimport os \"example.com/external\"\n\nfunc use() {\n    const (\n        os = 1\n        later = 2\n    )\n    _ = os.Open\n}\n",
-                "os.Open",
-                true,
-            ),
-            (
-                "earlier grouped var spec",
-                "package main\n\nimport os \"example.com/external\"\n\nfunc use() {\n    var (\n        os = 1\n        later = os.Open\n    )\n    _, _ = os, later\n}\n",
-                "os.Open",
-                true,
-            ),
-            (
-                "package const beneath file import",
-                "package main\n\nimport os \"example.com/external\"\n\nconst os = 1\n\nfunc use() {\n    _ = os.Open\n}\n",
-                "os.Open",
-                false,
-            ),
-            (
-                "package grouped const later initializer",
-                "package main\n\nimport os \"example.com/external\"\n\nconst (\n    os = 1\n    later = os.Open\n)\n",
-                "os.Open",
-                false,
-            ),
-            (
-                "package grouped var later initializer",
-                "package main\n\nimport os \"example.com/external\"\n\nvar (\n    os = 1\n    later = os.Open\n)\n",
-                "os.Open",
-                false,
-            ),
+    fn partial_go_workspace_snapshot_keeps_valid_declarations_and_unknown_absence() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Go,
+            &[
+                ("go.mod", "module example.com/app\n"),
+                ("valid/valid.go", "package valid\n\nfunc Kept() {}\n"),
+                ("broken/broken.go", "\0not parseable source"),
+            ],
+        );
+        let go = resolve_analyzer::<GoAnalyzer>(fixture.analyzer.analyzer())
+            .expect("fixture Go analyzer");
+        let valid_file = ProjectFile::new(fixture.project_root(), "valid/valid.go");
+        let definitions = go.get_definitions("example.com/app/valid.Kept");
+        let [definition] = definitions.as_slice() else {
+            panic!(
+                "the valid blob must remain published in the partial snapshot: {definitions:#?}"
+            );
+        };
+        assert_eq!(definition.source(), &valid_file);
+
+        for (import_path, expected) in [
+            ("example.com/app/valid", GoWorkspacePackageStatus::Present),
+            ("example.com/app/broken", GoWorkspacePackageStatus::Unknown),
         ] {
-            let fixture = AnalyzerFixture::new_for_language(Language::Go, &[("main.go", source)]);
-            let go = resolve_analyzer::<GoAnalyzer>(fixture.analyzer.analyzer())
-                .expect("fixture Go analyzer");
-            let provider = AnalyzerGoDefinitionProvider::new(go, None);
-            let tree = parse_go_tree(source).expect("Go tree");
-            let byte = source.find(marker).expect("shadowing marker");
-            let binding =
-                go_nearest_visible_binding(&provider, tree.root_node(), source, "os", byte);
-            assert_eq!(binding.is_some(), expected_shadow, "{label}");
+            let session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
+            let status = AnalyzerGoDefinitionProvider::bounded(go, &session, None)
+                .workspace_package_status(import_path);
+            assert!(matches!(
+                session.finish(status),
+                BoundedResolution::Complete { value, .. } if value == expected
+            ));
         }
+        assert_eq!(
+            go.workspace_path_index_build_count_for_test(),
+            0,
+            "partial package authority must remain a relational snapshot answer"
+        );
     }
 
     #[test]
-    fn duplicate_import_alias_never_proves_a_callee_or_tuple_arity() {
+    fn structured_concrete_external_receiver_carries_only_the_reviewed_method_identity() {
+        for (
+            receiver,
+            expression,
+            focus,
+            expected_status,
+            expected_target,
+            expected_extensibility,
+        ) in [
+            (
+                "*testing.T",
+                "t.Fatal(\"stop\")",
+                "Fatal",
+                DefinitionLookupStatus::UnresolvableImportBoundary,
+                Some("testing.T.Fatal"),
+                Some(DispatchExtensibility::Closed),
+            ),
+            (
+                "testing.TB",
+                "t.Fatal(\"stop\")",
+                "Fatal",
+                DefinitionLookupStatus::NoDefinition,
+                None,
+                None,
+            ),
+            (
+                "*testing.T",
+                "t.Stat(1)",
+                "Stat",
+                DefinitionLookupStatus::NoDefinition,
+                None,
+                None,
+            ),
+        ] {
+            let source = format!(
+                "package main\n\nimport \"testing\"\n\nfunc use(t {receiver}) {{\n    {expression}\n}}\n"
+            );
+            let fixture = AnalyzerFixture::new_for_language(
+                Language::Go,
+                &[("go.mod", "module example.com/app\n"), ("main.go", &source)],
+            );
+            let file = ProjectFile::new(fixture.project_root(), "main.go");
+            let tree = parse_go_tree(&source).expect("Go tree");
+            let site = site_for(&file, &source, expression, focus);
+
+            let resolution =
+                resolve_with_concrete_testing_receiver(&fixture, &file, &source, &tree, &site);
+
+            assert_eq!(
+                resolution.outcome.status, expected_status,
+                "{:#?}",
+                resolution.outcome
+            );
+            assert_eq!(
+                resolution
+                    .outcome
+                    .reference
+                    .as_ref()
+                    .map(|reference| reference.text.as_str()),
+                expected_target,
+                "{:#?}",
+                resolution.outcome
+            );
+            assert_eq!(
+                resolution.call_application,
+                CallApplicationKind::BoundReceiver,
+                "{:#?}",
+                resolution.outcome
+            );
+            assert_eq!(
+                resolution.dispatch_extensibility, expected_extensibility,
+                "{:#?}",
+                resolution.outcome
+            );
+            match expected_target {
+                Some(expected_target) => {
+                    let proof = resolution.exact_external_call.as_ref().unwrap_or_else(|| {
+                        panic!(
+                            "exact receiver target must retain one proof: {:#?}",
+                            resolution.outcome
+                        )
+                    });
+                    assert_eq!(proof.canonical_callee(), expected_target);
+                    assert_eq!(proof.call_application(), CallApplicationKind::BoundReceiver);
+                    assert_eq!(proof.parameter_count(), 1);
+                }
+                None => assert!(
+                    resolution.exact_external_call.is_none(),
+                    "a rejected receiver must not retain a partial proof: {:#?}",
+                    resolution.outcome
+                ),
+            }
+        }
+    }
+
+    #[hardwon("db3b2335e6d7: promoted external receiver resolution retains one exact method proof")]
+    #[test]
+    fn structured_local_embedding_resolves_one_promoted_external_receiver_method() {
         let source = r#"package main
 
-import (
-    external "example.com/external"
-    duplicate "example.com/external"
-    duplicate "example.com/custom"
-)
+import "sync"
 
-const external = 1
+type CacheTable struct {
+    sync.RWMutex
+}
 
-func use() {
-    external.MakeVariadic(external.MakePair())
-    external.MakeVariadic(duplicate.MakePair())
-    duplicate.MakePair()
+func use(table *CacheTable) {
+    table.Lock()
 }
 "#;
         let fixture = AnalyzerFixture::new_for_language(
@@ -8455,968 +10362,41 @@ func use() {
         );
         let file = ProjectFile::new(fixture.project_root(), "main.go");
         let tree = parse_go_tree(source).expect("Go tree");
-        let go = resolve_analyzer::<GoAnalyzer>(fixture.analyzer.analyzer())
-            .expect("fixture Go analyzer");
+        let site = site_for(&file, source, "table.Lock()", "Lock");
 
-        let unbounded = ExactPackageCallProvider {
-            inner: AnalyzerGoDefinitionProvider::new(go, None),
-        };
-        assert_exact_import_namespace_authority(&fixture, &unbounded, &file, source, &tree);
+        let resolution =
+            resolve_with_concrete_testing_receiver(&fixture, &file, source, &tree, &site);
 
-        let session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
-        let bounded = ExactPackageCallProvider {
-            inner: AnalyzerGoDefinitionProvider::bounded(go, &session, None),
-        };
-        assert_exact_import_namespace_authority(&fixture, &bounded, &file, source, &tree);
-        assert!(matches!(
-            session.finish(()),
-            BoundedResolution::Complete { .. }
-        ));
-    }
-
-    #[test]
-    fn unresolved_terminal_selector_does_not_return_its_receiver_field() {
-        let source = "package repro\n\nimport \"sync\"\n\ntype anonymizer struct { lock sync.Mutex }\nfunc (a *anonymizer) SaveMapping() { a.lock.Lock() }\n";
-        let fixture = AnalyzerFixture::new_for_language(Language::Go, &[("main.go", source)]);
-        let file = ProjectFile::new(fixture.project_root(), "main.go");
-        let tree = parse_go_tree(source).expect("Go tree");
-        let site = site_for(&file, source, "a.lock.Lock()", "Lock");
-
-        let outcome = resolve_go_bounded(
-            fixture.analyzer.analyzer(),
-            &file,
-            source,
-            Some(&tree),
-            &site,
-            ReceiverAnalysisBudget::default(),
-            None,
-        );
-        let BoundedResolution::Complete { value, .. } = outcome else {
-            panic!("Go selector lookup should complete: {outcome:#?}");
-        };
         assert_eq!(
-            DefinitionLookupStatus::NoDefinition,
-            value.status,
-            "{value:#?}"
+            resolution.outcome.status,
+            DefinitionLookupStatus::UnresolvableImportBoundary,
+            "{:#?}",
+            resolution.outcome
         );
-        assert!(value.definitions.is_empty(), "{value:#?}");
-    }
-
-    #[test]
-    fn go_import_declarations_persist_structured_paths() {
-        let source = r#"
-package main
-import (
-    svc "example.com/app/service"
-    . `example.com/app/model`
-)
-"#;
-        let tree = parse_go_tree(source).expect("Go tree");
-        let imports =
-            brokk_bifrost_go::declarations::collect_go_import_infos(tree.root_node(), source);
-
-        assert_eq!(imports.len(), 2);
-        // A Go import path is stored one '/'-separated component per segment,
-        // so consumers rejoin it with `render_segments("/")` instead of taking
-        // segment zero as the whole path.
         assert_eq!(
-            imports[0]
-                .path
+            resolution
+                .outcome
+                .reference
                 .as_ref()
-                .map(|path| path.segments.as_slice()),
-            Some(
-                [
-                    "example.com".to_string(),
-                    "app".to_string(),
-                    "service".to_string()
-                ]
-                .as_slice()
+                .map(|reference| reference.text.as_str()),
+            Some("sync.RWMutex.Lock"),
+            "{:#?}",
+            resolution.outcome
+        );
+        let proof = resolution.exact_external_call.as_ref().unwrap_or_else(|| {
+            panic!(
+                "the promoted receiver target must retain one exact proof: {:#?}",
+                resolution.outcome
             )
-        );
-        assert_eq!(
-            imports[1]
-                .path
-                .as_ref()
-                .map(|path| path.render_segments("/")),
-            Some("example.com/app/model".to_string())
-        );
+        });
+        assert_eq!(proof.canonical_callee(), "sync.RWMutex.Lock");
+        assert_eq!(proof.call_application(), CallApplicationKind::BoundReceiver);
+        assert_eq!(proof.parameter_count(), 0);
     }
 
-    #[test]
-    fn bounded_go_import_alias_and_dot_import_use_structured_paths() {
-        for (import, expression) in [
-            ("svc \"example.com/app/service\"", "svc.Service{}"),
-            (". \"example.com/app/service\"", "Service{}"),
-        ] {
-            let (fixture, file, source, tree, site) = imported_type_fixture(import, expression);
-            let outcome = resolve_go_bounded(
-                fixture.analyzer.analyzer(),
-                &file,
-                &source,
-                Some(&tree),
-                &site,
-                ReceiverAnalysisBudget::default(),
-                None,
-            );
-            let BoundedResolution::Complete { value, .. } = outcome else {
-                panic!("bounded Go import lookup should complete: {outcome:#?}");
-            };
-            assert_eq!(value.status, DefinitionLookupStatus::Resolved, "{value:#?}");
-            assert!(
-                value
-                    .definitions
-                    .iter()
-                    .any(|definition| definition.fq_name() == "example.com/app/service.Service"),
-                "{value:#?}"
-            );
-        }
-    }
-
-    #[test]
-    fn bounded_go_dot_import_types_local_receivers_from_calls_and_annotations() {
-        let source = r#"package main
-
-import . "example.com/app/worker"
-
-func use() {
-    worker := NewWorker()
-    worker.Record()
-    _, paired := 0, NewWorker()
-    paired.Record()
-    var recorder Recorder = worker
-    recorder.Record()
-}
-"#;
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Go,
-            &[
-                ("go.mod", "module example.com/app\n"),
-                (
-                    "worker/worker.go",
-                    r#"package worker
-
-type Worker struct{}
-func (Worker) Record() {}
-
-type Recorder interface {
-    Record()
-}
-
-func NewWorker() Worker { return Worker{} }
-"#,
-                ),
-                ("main.go", source),
-            ],
-        );
-        let file = ProjectFile::new(fixture.project_root(), "main.go");
-        let tree = parse_go_tree(source).expect("Go tree");
-
-        for (expression, target) in [
-            ("worker.Record()", "example.com/app/worker.Worker.Record"),
-            ("paired.Record()", "example.com/app/worker.Worker.Record"),
-            (
-                "recorder.Record()",
-                "example.com/app/worker.Recorder.Record",
-            ),
-        ] {
-            let site = site_for(&file, source, expression, "Record");
-            let outcome = resolve_go_bounded(
-                fixture.analyzer.analyzer(),
-                &file,
-                source,
-                Some(&tree),
-                &site,
-                ReceiverAnalysisBudget::default(),
-                None,
-            );
-            let BoundedResolution::Complete { value, .. } = outcome else {
-                panic!("{expression} should complete: {outcome:#?}");
-            };
-            assert_eq!(value.status, DefinitionLookupStatus::Resolved, "{value:#?}");
-            assert!(
-                matches!(value.definitions.as_slice(), [definition] if definition.fq_name() == target),
-                "{expression}: {value:#?}"
-            );
-        }
-    }
-
-    fn wide_deep_fixture() -> (
-        AnalyzerFixture,
-        ProjectFile,
-        String,
-        Tree,
-        ResolvedReferenceSite,
-    ) {
-        let statements = (0..96)
-            .map(|index| format!("    value{index} := {index}\n    _ = value{index}\n"))
-            .collect::<String>();
-        let expression = format!("{}service{}.Run()", "(".repeat(24), ")".repeat(24));
-        let source = format!(
-            "package main\n\ntype Service struct{{}}\nfunc (Service) Run() {{}}\n\nfunc use(service Service) {{\n{statements}    {expression}\n}}\n"
-        );
-        let fixture = AnalyzerFixture::new_for_language(Language::Go, &[("main.go", &source)]);
-        let file = ProjectFile::new(fixture.project_root(), "main.go");
-        let tree = parse_go_tree(&source).expect("Go tree");
-        let site = site_for(&file, &source, &expression, "Run");
-        (fixture, file, source, tree, site)
-    }
-
-    #[test]
-    fn bounded_go_wide_deep_walk_stops_without_partial_result() {
-        let (fixture, file, source, tree, site) = wide_deep_fixture();
-        let outcome = resolve_go_bounded(
-            fixture.analyzer.analyzer(),
-            &file,
-            &source,
-            Some(&tree),
-            &site,
-            ReceiverAnalysisBudget::tiny(),
-            None,
-        );
-
-        assert!(matches!(
-            outcome,
-            BoundedResolution::Exceeded {
-                limit: ReceiverBudgetLimit::ScopeNodes,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn bounded_go_wide_deep_walk_honors_mid_walk_cancellation() {
-        let (fixture, file, source, tree, site) = wide_deep_fixture();
-        let cancellation = CancellationToken::cancel_after_checks_for_test(12);
-        let outcome = resolve_go_bounded(
-            fixture.analyzer.analyzer(),
-            &file,
-            &source,
-            Some(&tree),
-            &site,
-            ReceiverAnalysisBudget::default(),
-            Some(&cancellation),
-        );
-
-        assert!(matches!(outcome, BoundedResolution::Cancelled { .. }));
-    }
-
-    #[test]
-    fn bounded_go_deep_receiver_wrappers_use_an_explicit_work_stack() {
-        let expression = format!("{}service{}.Run()", "(".repeat(512), ")".repeat(512));
-        let source = format!(
-            "package main\n\ntype Service struct{{}}\nfunc (Service) Run() {{}}\nfunc use(service Service) {{\n    {expression}\n}}\n"
-        );
-        let fixture = AnalyzerFixture::new_for_language(Language::Go, &[("main.go", &source)]);
-        let file = ProjectFile::new(fixture.project_root(), "main.go");
-        let tree = parse_go_tree(&source).expect("Go tree");
-        let site = site_for(&file, &source, &expression, "Run");
-        let outcome = resolve_go_bounded(
-            fixture.analyzer.analyzer(),
-            &file,
-            &source,
-            Some(&tree),
-            &site,
-            ReceiverAnalysisBudget {
-                context_depth: 8,
-                max_targets: 16,
-                max_summary_expansions: 4_096,
-                max_scope_nodes: 100_000,
-            },
-            None,
-        );
-
-        let BoundedResolution::Complete { value, .. } = outcome else {
-            panic!("deep Go receiver lookup should complete: {outcome:#?}");
-        };
-        assert_eq!(value.status, DefinitionLookupStatus::Resolved, "{value:#?}");
-        assert!(
-            value
-                .definitions
-                .iter()
-                .any(|definition| definition.fq_name() == "main.Service.Run"),
-            "{value:#?}"
-        );
-    }
-
-    #[test]
-    fn bounded_go_structured_type_walk_charges_each_flat_wrapper() {
-        let source = "package main\n\ntype Service struct{}\n";
-        let fixture = AnalyzerFixture::new_for_language(Language::Go, &[("main.go", source)]);
-        let go = resolve_analyzer::<GoAnalyzer>(fixture.analyzer.analyzer())
-            .expect("fixture Go analyzer");
-        let file = ProjectFile::new(fixture.project_root(), "main.go");
-
-        let mut builder = StructuredTypeIdentityBuilder::default();
-        let name = StructuredTypeName::new(vec!["Service".to_string()], Vec::new(), false).unwrap();
-        let mut root = builder.named(name).unwrap();
-        for _ in 0..8 {
-            root = builder.pointer(root).unwrap();
-        }
-        let identity = builder.finish(root).unwrap();
-
-        let complete_session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
-        let complete_provider = AnalyzerGoDefinitionProvider::bounded(go, &complete_session, None);
-        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
-        let token = scope.token();
-        let resolved =
-            go_resolve_structured_type_fqn(&complete_provider, token, go, &file, "main", &identity);
-        assert!(matches!(
-            complete_session.finish(resolved),
-            BoundedResolution::Complete {
-                value: Some(ref fqn),
-                ..
-            } if fqn == "main.Service"
-        ));
-
-        let tiny_session = ResolutionSession::bounded(ReceiverAnalysisBudget::tiny(), None);
-        let tiny_provider = AnalyzerGoDefinitionProvider::bounded(go, &tiny_session, None);
-        let unresolved =
-            go_resolve_structured_type_fqn(&tiny_provider, token, go, &file, "main", &identity);
-        assert!(matches!(
-            tiny_session.finish(unresolved),
-            BoundedResolution::Exceeded {
-                limit: ReceiverBudgetLimit::ScopeNodes,
-                work: ReceiverAnalysisWork { scope_nodes: 1, .. },
-            }
-        ));
-    }
-
-    #[test]
-    fn go_result_binding_modes_follow_exact_result_ordinals() {
-        let source = r#"package main
-
-type NamedStruct struct{}
-
-func Shapes() (*NamedStruct, struct{}, [2]byte, []byte, map[string]int, chan int) {
-    return nil, struct{}{}, [2]byte{}, nil, nil, nil
-}
-func NamedValue() NamedStruct { return NamedStruct{} }
-func Scalar() int { return 0 }
-func Grouped() (first, second []byte, third [2]byte, fourth, fifth struct{}) {
-    return nil, nil, [2]byte{}, struct{}{}, struct{}{}
-}
-"#;
-        let fixture = AnalyzerFixture::new_for_language(Language::Go, &[("main.go", source)]);
-        let analyzer = fixture.analyzer.analyzer();
-        let file = ProjectFile::new(fixture.project_root(), "main.go");
-
-        let shapes = indexed_go_function_at_start(analyzer, &file, source, "func Shapes()");
-        for (ordinal, expected) in [
-            (0, Some(true)),  // pointer
-            (1, Some(false)), // struct
-            (2, Some(false)), // array
-            (3, Some(true)),  // slice
-            (4, Some(true)),  // map
-            (5, Some(true)),  // channel
-            (6, None),        // out of range
-        ] {
-            assert_eq!(
-                result_binds_by_reference_at_ordinal(analyzer, &file, source, &shapes, ordinal,),
-                expected,
-                "Shapes result ordinal {ordinal}",
-            );
-        }
-
-        let named = indexed_go_function_at_start(analyzer, &file, source, "func NamedValue()");
-        assert_eq!(
-            result_binds_by_reference_at_ordinal(analyzer, &file, source, &named, 0),
-            Some(false),
-            "a direct same-file named struct is inline",
-        );
-
-        let scalar = indexed_go_function_at_start(analyzer, &file, source, "func Scalar()");
-        assert_eq!(
-            result_binds_by_reference_at_ordinal(analyzer, &file, source, &scalar, 0),
-            None,
-            "a scalar result has no proven reference or inline aggregate shape",
-        );
-        assert_eq!(
-            result_binds_by_reference_at_ordinal(analyzer, &file, source, &scalar, 1),
-            None,
-            "a scalar result has no ordinal one",
-        );
-
-        let grouped = indexed_go_function_at_start(analyzer, &file, source, "func Grouped()");
-        for (ordinal, expected) in [
-            (0, Some(true)),  // first
-            (1, Some(true)),  // second, grouped with first
-            (2, Some(false)), // third
-            (3, Some(false)), // fourth
-            (4, Some(false)), // fifth, grouped with fourth
-            (5, None),        // out of range
-        ] {
-            assert_eq!(
-                result_binds_by_reference_at_ordinal(analyzer, &file, source, &grouped, ordinal,),
-                expected,
-                "Grouped result ordinal {ordinal}",
-            );
-        }
-    }
-
-    #[test]
-    fn go_result_binding_uses_exact_same_named_method_declaration() {
-        let source = r#"package main
-
-type Left struct{}
-type Right struct{}
-
-func (Left) Build() []byte { return nil }
-func (Right) Build() struct{} { return struct{}{} }
-"#;
-        let fixture = AnalyzerFixture::new_for_language(Language::Go, &[("main.go", source)]);
-        let analyzer = fixture.analyzer.analyzer();
-        let file = ProjectFile::new(fixture.project_root(), "main.go");
-        let left = indexed_go_function_at_start(analyzer, &file, source, "func (Left) Build()");
-        let right = indexed_go_function_at_start(analyzer, &file, source, "func (Right) Build()");
-
-        assert_eq!(
-            result_binds_by_reference_at_ordinal(analyzer, &file, source, &left, 0),
-            Some(true),
-            "the Left.Build declaration returns a slice",
-        );
-        assert_eq!(
-            result_binds_by_reference_at_ordinal(analyzer, &file, source, &right, 0),
-            Some(false),
-            "the Right.Build declaration returns a struct",
-        );
-    }
-
-    #[test]
-    fn go_result_binding_abstains_on_aliases_generics_type_parameters_and_recovery() {
-        let source = r#"package main
-
-type NamedSlice []byte
-type Alias = []byte
-type GenericBox[T any] struct{}
-
-func AliasResult() Alias { return nil }
-func NamedSliceResult() NamedSlice { return nil }
-func GenericResult() GenericBox[int] { return GenericBox[int]{} }
-func GenericPointer() *GenericBox[int] { return nil }
-func GenericSlice() []GenericBox[int] { return nil }
-func TypeParameterShadow[Shadow any]() Shadow {
-    var zero Shadow
-    return zero
-}
-func (box GenericBox[T]) GenericReceiver() NamedSlice { return nil }
-func Recovery() *NamedSlice {
-    @@@
-    return nil
-}
-"#;
-        let fixture = AnalyzerFixture::new_for_language(Language::Go, &[("main.go", source)]);
-        let analyzer = fixture.analyzer.analyzer();
-        let file = ProjectFile::new(fixture.project_root(), "main.go");
-
-        for (marker, expected, reason) in [
-            ("func AliasResult()", None, "type alias"),
-            ("func NamedSliceResult()", Some(true), "direct named slice"),
-            ("func GenericResult()", None, "instantiated generic nominal"),
-            (
-                "func GenericPointer()",
-                Some(true),
-                "pointer outer shape remains known with a generic element",
-            ),
-            (
-                "func GenericSlice()",
-                Some(true),
-                "slice outer shape remains known with a generic element",
-            ),
-            ("func TypeParameterShadow", None, "type parameter shadowing"),
-            (
-                "func (box GenericBox[T]) GenericReceiver()",
-                None,
-                "generic receiver",
-            ),
-            ("func Recovery()", None, "parser recovery"),
-        ] {
-            let function = indexed_go_function_at_start(analyzer, &file, source, marker);
-            assert_eq!(
-                result_binds_by_reference_at_ordinal(analyzer, &file, source, &function, 0),
-                expected,
-                "{reason}",
-            );
-        }
-    }
-
-    #[test]
-    fn go_parameter_binding_uses_exact_callable_spans_and_preserves_descriptor_copies() {
-        let source = r#"package main
-type Cell struct{}
-type Other struct{}
-func Values(first, second *Cell, value Cell, slice []int, mapping map[int]int, channel chan int, callback func(), boxed interface{}, array [1]int, unknown Missing) {}
-func (Cell) Same(value *Cell) {}
-func (Other) Same(value Cell) {}
-func init() {
-    _ = func(value *Cell) {}
-    _ = func(value Cell) {}
-}
-"#;
-        let file = ProjectFile::new(std::env::temp_dir(), "parameter-binding.go");
-        let tree = parse_tree_for_language(&file, Language::Go, source).expect("Go fixture parses");
-        let mut pending = vec![tree.root_node()];
-        let mut callables = Vec::new();
-        while let Some(node) = pending.pop() {
-            if matches!(
-                node.kind(),
-                "function_declaration" | "method_declaration" | "func_literal"
-            ) {
-                callables.push(node);
-            }
-            let mut cursor = node.walk();
-            pending.extend(node.named_children(&mut cursor));
-        }
-        callables.sort_by_key(Node::start_byte);
-        let expected = [
-            vec![
-                Some(true),
-                Some(true),
-                Some(false),
-                Some(false),
-                Some(false),
-                Some(false),
-                Some(false),
-                Some(false),
-                Some(false),
-                None,
-            ],
-            vec![Some(true)],
-            vec![Some(false)],
-            vec![],
-            vec![Some(true)],
-            vec![Some(false)],
-        ];
-        let backing_expected = [
-            vec![
-                Some(false),
-                Some(false),
-                Some(false),
-                Some(true),
-                Some(true),
-                Some(true),
-                Some(false),
-                Some(false),
-                Some(false),
-                None,
-            ],
-            vec![Some(false)],
-            vec![Some(false)],
-            vec![],
-            vec![Some(false)],
-            vec![Some(false)],
-        ];
-        assert_eq!(callables.len(), expected.len());
-        assert_eq!(callables.len(), backing_expected.len());
-        for ((callable, expected), backing_expected) in
-            callables.into_iter().zip(expected).zip(backing_expected)
-        {
-            for (ordinal, (expected, backing_expected)) in expected
-                .into_iter()
-                .chain([None])
-                .zip(backing_expected.into_iter().chain([None]))
-                .enumerate()
-            {
-                assert_eq!(
-                    parameter_binds_by_reference_at_span(
-                        &file,
-                        source,
-                        callable.start_byte(),
-                        callable.end_byte(),
-                        ordinal
-                    ),
-                    expected,
-                    "exact callable {:?}, ordinal {ordinal}",
-                    callable.range()
-                );
-                assert_eq!(
-                    parameter_preserves_backing_at_span(
-                        &file,
-                        source,
-                        callable.start_byte(),
-                        callable.end_byte(),
-                        ordinal
-                    ),
-                    backing_expected,
-                    "exact callable {:?}, backing ordinal {ordinal}",
-                    callable.range()
-                );
-            }
-            assert_eq!(
-                parameter_binds_by_reference_at_span(
-                    &file,
-                    source,
-                    callable.start_byte(),
-                    callable.end_byte() - 1,
-                    0
-                ),
-                None
-            );
-            assert_eq!(
-                parameter_preserves_backing_at_span(
-                    &file,
-                    source,
-                    callable.start_byte(),
-                    callable.end_byte() - 1,
-                    0
-                ),
-                None
-            );
-        }
-        let recovery = "package main\nfunc broken(value *Cell) { @ }";
-        assert_eq!(
-            parameter_binds_by_reference_at_span(&file, recovery, 13, recovery.len(), 0),
-            None
-        );
-        assert_eq!(
-            parameter_preserves_backing_at_span(&file, recovery, 13, recovery.len(), 0),
-            None
-        );
-    }
-
-    #[test]
-    fn go_parameter_reference_free_uses_exact_ordinals_and_unshadowed_primitives() {
-        let source = r#"package main
-
-type Cell struct{}
-type Alias = int
-type Box[T any] struct{}
-type Left struct{}
-type Right struct{}
-
-func Values(first, second int, flag bool, text string, pointer *Cell, slice []int, values map[int]int, channel chan int, callback func(), boxed interface{}, aggregate struct{}, array [1]int) {}
-func AliasParameter(value Alias) {}
-func Variadic(values ...int) {}
-func Generic[T any](value T) {}
-func (box Box[T]) GenericReceiver(value int) {}
-func (Left) Build(value int) {}
-func (Right) Build(value *Cell) {}
-"#;
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Go,
-            &[("go.mod", "module example.com/app\n"), ("main.go", source)],
-        );
-        let analyzer = fixture.analyzer.analyzer();
-        let file = ProjectFile::new(fixture.project_root(), "main.go");
-
-        let values = indexed_go_function_at_start(analyzer, &file, source, "func Values(");
-        for (ordinal, expected) in [
-            (0, Some(true)), // first
-            (1, Some(true)), // second, grouped with first
-            (2, Some(true)), // bool
-            (3, None),       // string
-            (4, None),       // pointer
-            (5, None),       // slice
-            (6, None),       // map
-            (7, None),       // channel
-            (8, None),       // function
-            (9, None),       // interface
-            (10, None),      // struct
-            (11, None),      // array
-            (12, None),      // out of range
-        ] {
-            assert_eq!(
-                parameter_is_reference_free_at_ordinal(analyzer, &file, source, &values, ordinal,),
-                expected,
-                "Values parameter ordinal {ordinal}",
-            );
-        }
-
-        for (marker, expected, reason) in [
-            ("func AliasParameter(", None, "named alias"),
-            ("func Variadic(", None, "variadic parameter"),
-            ("func Generic[", None, "type parameter"),
-            (
-                "func (box Box[T]) GenericReceiver(",
-                None,
-                "generic receiver",
-            ),
-        ] {
-            let function = indexed_go_function_at_start(analyzer, &file, source, marker);
-            assert_eq!(
-                parameter_is_reference_free_at_ordinal(analyzer, &file, source, &function, 0),
-                expected,
-                "{reason}",
-            );
-        }
-
-        let left = indexed_go_function_at_start(analyzer, &file, source, "func (Left) Build(");
-        let right = indexed_go_function_at_start(analyzer, &file, source, "func (Right) Build(");
-        assert_eq!(
-            parameter_is_reference_free_at_ordinal(analyzer, &file, source, &left, 0),
-            Some(true),
-            "the exact Left.Build declaration has a primitive parameter",
-        );
-        assert_eq!(
-            parameter_is_reference_free_at_ordinal(analyzer, &file, source, &right, 0),
-            None,
-            "the exact Right.Build declaration has a pointer parameter",
-        );
-
-        let shadowed_source = r#"package main
-
-type Cell struct{}
-type int *Cell
-
-func Shadowed(value int) {}
-"#;
-        let shadowed_fixture = AnalyzerFixture::new_for_language(
-            Language::Go,
-            &[
-                ("go.mod", "module example.com/app\n"),
-                ("main.go", shadowed_source),
-            ],
-        );
-        let shadowed_analyzer = shadowed_fixture.analyzer.analyzer();
-        let shadowed_file = ProjectFile::new(shadowed_fixture.project_root(), "main.go");
-        let shadowed = indexed_go_function_at_start(
-            shadowed_analyzer,
-            &shadowed_file,
-            shadowed_source,
-            "func Shadowed(",
-        );
-        assert_eq!(
-            parameter_is_reference_free_at_ordinal(
-                shadowed_analyzer,
-                &shadowed_file,
-                shadowed_source,
-                &shadowed,
-                0,
-            ),
-            None,
-            "a package declaration shadowing int must stay unknown",
-        );
-    }
-
-    #[test]
-    fn bounded_go_uses_structured_return_field_and_container_shapes() {
-        let source = r#"package main
-
-import svc "example.com/app/service"
-
-type Holder struct {
-    Next *svc.Service
-    Items []svc.Service
-    ByName map[string]svc.Service
-}
-
-func Make() *svc.Service { return nil }
-func Similar() string { return "svc.Service" }
-
-func use(holder Holder) {
-    holder.Next.Run()
-    Make().Run()
-    svc.Make().Run()
-    holder.Items[0].Run()
-    holder.ByName["chosen"].Run()
-    for _, service := range holder.Items {
-        service.Run()
-    }
-    Similar().Run()
-}
-"#;
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Go,
-            &[
-                ("go.mod", "module example.com/app\n"),
-                (
-                    "service/service.go",
-                    "package service\n\ntype Service struct{}\nfunc (*Service) Run() {}\nfunc Make() *Service { return nil }\n",
-                ),
-                ("main.go", source),
-            ],
-        );
-        let file = ProjectFile::new(fixture.project_root(), "main.go");
-        let tree = parse_go_tree(source).expect("Go tree");
-
-        for expression in [
-            "holder.Next.Run()",
-            "Make().Run()",
-            "svc.Make().Run()",
-            "holder.Items[0].Run()",
-            "service.Run()",
-        ] {
-            let site = site_for(&file, source, expression, "Run");
-            let outcome = resolve_go_bounded(
-                fixture.analyzer.analyzer(),
-                &file,
-                source,
-                Some(&tree),
-                &site,
-                ReceiverAnalysisBudget::default(),
-                None,
-            );
-            let BoundedResolution::Complete { value, .. } = outcome else {
-                panic!("{expression} should complete: {outcome:#?}");
-            };
-            assert_eq!(
-                value.status,
-                DefinitionLookupStatus::Resolved,
-                "{expression}: {value:#?}"
-            );
-            assert!(
-                value.definitions.iter().any(|definition| {
-                    definition.fq_name() == "example.com/app/service.Service.Run"
-                }),
-                "{expression}: {value:#?}"
-            );
-        }
-
-        let non_addressable_map_element =
-            site_for(&file, source, "holder.ByName[\"chosen\"].Run()", "Run");
-        let outcome = resolve_go_bounded(
-            fixture.analyzer.analyzer(),
-            &file,
-            source,
-            Some(&tree),
-            &non_addressable_map_element,
-            ReceiverAnalysisBudget::default(),
-            None,
-        );
-        assert!(
-            !matches!(
-                outcome,
-                BoundedResolution::Complete {
-                    value: DefinitionLookupOutcome {
-                        status: DefinitionLookupStatus::Resolved,
-                        ..
-                    },
-                    ..
-                }
-            ),
-            "a map element is not addressable and must not claim a pointer-only method: {outcome:#?}"
-        );
-
-        let negative = site_for(&file, source, "Similar().Run()", "Run");
-        let outcome = resolve_go_bounded(
-            fixture.analyzer.analyzer(),
-            &file,
-            source,
-            Some(&tree),
-            &negative,
-            ReceiverAnalysisBudget::default(),
-            None,
-        );
-        assert!(
-            !matches!(
-                outcome,
-                BoundedResolution::Complete {
-                    value: DefinitionLookupOutcome {
-                        status: DefinitionLookupStatus::Resolved,
-                        ..
-                    },
-                    ..
-                }
-            ),
-            "textually similar string return must not become a receiver type: {outcome:#?}"
-        );
-    }
-
-    #[test]
-    fn unbounded_go_field_type_requires_identity_for_every_metadata_alternative() {
-        let project = InlineTestProject::with_language(Language::Go)
-            .file(
-                "main.go",
-                "package main\n\ntype Service struct{}\ntype Holder struct { Next *Service }\n",
-            )
-            .build();
-        let analyzer = GoAnalyzer::new(project.project_dyn());
-        let owner = analyzer
-            .get_all_declarations()
-            .into_iter()
-            .find(|unit| unit.is_class() && unit.identifier() == "Holder")
-            .expect("Holder declaration");
-        let field = analyzer
-            .get_definitions(&format!("{}.Next", owner.fq_name()))
-            .into_iter()
-            .next()
-            .expect("Holder.Next declaration");
-        let service = analyzer
-            .get_all_declarations()
-            .into_iter()
-            .find(|unit| unit.is_class() && unit.identifier() == "Service")
-            .expect("Service declaration");
-        let real_provider = AnalyzerGoDefinitionProvider::new(&analyzer, None);
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        assert_eq!(
-            go_indexed_field_type_fqn(
-                &analyzer,
-                scope.token(),
-                &real_provider,
-                &owner.fq_name(),
-                "Next",
-            ),
-            Some(service.fq_name().to_owned()),
-        );
-        let provider = MetadataOverrideProvider {
-            inner: AnalyzerGoDefinitionProvider::new(&analyzer, None),
-            unit: field,
-            metadata: vec![
-                SignatureMetadata::new("*Service", Vec::new())
-                    .with_return_type_text(Some("*Service"))
-                    .with_return_type_identity(Some(named_type_identity("Service"))),
-                SignatureMetadata::new("*Service", Vec::new())
-                    .with_return_type_text(Some("*Service")),
-            ],
-        };
-
-        assert!(
-            go_indexed_field_type_fqn(
-                &analyzer,
-                scope.token(),
-                &provider,
-                &owner.fq_name(),
-                "Next",
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn unbounded_go_field_type_rejects_conflicting_identity_alternatives() {
-        let project = InlineTestProject::with_language(Language::Go)
-            .file(
-                "main.go",
-                "package main\n\ntype Service struct{}\ntype Other struct{}\ntype Holder struct { Next *Service }\n",
-            )
-            .build();
-        let analyzer = GoAnalyzer::new(project.project_dyn());
-        let owner = analyzer
-            .get_all_declarations()
-            .into_iter()
-            .find(|unit| unit.is_class() && unit.identifier() == "Holder")
-            .expect("Holder declaration");
-        let field = analyzer
-            .get_definitions(&format!("{}.Next", owner.fq_name()))
-            .into_iter()
-            .next()
-            .expect("Holder.Next declaration");
-        let metadata = |identity| {
-            SignatureMetadata::new("*Service", Vec::new())
-                .with_return_type_text(Some("*Service"))
-                .with_return_type_identity(Some(identity))
-        };
-        let provider = MetadataOverrideProvider {
-            inner: AnalyzerGoDefinitionProvider::new(&analyzer, None),
-            unit: field,
-            metadata: vec![
-                metadata(named_type_identity("Service")),
-                metadata(named_type_identity("Other")),
-            ],
-        };
-        let scope = AnalyzerQueryScope::new(&analyzer);
-
-        assert!(
-            go_indexed_field_type_fqn(
-                &analyzer,
-                scope.token(),
-                &provider,
-                &owner.fq_name(),
-                "Next",
-            )
-            .is_none()
-        );
-    }
-
+    #[hardwon(
+        "ec40fea7cc91: incomplete embedding metadata preserves known components without reparsing source headers"
+    )]
     #[test]
     fn unbounded_go_embedding_keeps_components_but_does_not_reparse_header() {
         let project = InlineTestProject::with_language(Language::Go)
@@ -9469,200 +10449,100 @@ func use(holder Holder) {
         assert!(components.contains(&other_fqn));
     }
 
+    #[hardwon(
+        "ec40fea7cc91: field type identity requires agreement from every metadata alternative"
+    )]
     #[test]
-    fn bounded_go_builtin_new_and_method_sets_respect_addressability() {
-        let source = r#"package main
-
-type Service struct{}
-func (Service) ValueOnly() {}
-func (*Service) PointerOnly() {}
-
-type Embedded struct{}
-func (*Embedded) Promoted() {}
-type Outer struct{ Embedded }
-type OuterPointer struct{ *Embedded }
-
-func MakeValue() Service { return Service{} }
-func MakePointer() *Service { return nil }
-func MakeOuter() Outer { return Outer{} }
-func MakeOuterPointer() OuterPointer { return OuterPointer{} }
-
-func use() {
-    var addressable Service
-    addressable.PointerOnly()
-    new(Service).PointerOnly()
-    new(Service).ValueOnly()
-    MakePointer().PointerOnly()
-    MakeValue().ValueOnly()
-    MakeValue().PointerOnly()
-
-    var outer Outer
-    outer.Promoted()
-    MakeOuter().Promoted()
-    MakeOuterPointer().Promoted()
-}
-"#;
-        let fixture = AnalyzerFixture::new_for_language(Language::Go, &[("main.go", source)]);
-        let file = ProjectFile::new(fixture.project_root(), "main.go");
-        let tree = parse_go_tree(source).expect("Go tree");
-
-        for (expression, member, target) in [
-            (
-                "addressable.PointerOnly()",
-                "PointerOnly",
-                "main.Service.PointerOnly",
+    fn unbounded_go_field_type_requires_consistent_identity_across_metadata_alternatives() {
+        let project = InlineTestProject::with_language(Language::Go)
+            .file(
+                "main.go",
+                "package main\n\ntype Service struct{}\ntype Other struct{}\ntype Holder struct { Next *Service }\n",
+            )
+            .build();
+        let analyzer = GoAnalyzer::new(project.project_dyn());
+        let owner = analyzer
+            .get_all_declarations()
+            .into_iter()
+            .find(|unit| unit.is_class() && unit.identifier() == "Holder")
+            .expect("Holder declaration");
+        let field = analyzer
+            .get_definitions(&format!("{}.Next", owner.fq_name()))
+            .into_iter()
+            .next()
+            .expect("Holder.Next declaration");
+        let service = analyzer
+            .get_all_declarations()
+            .into_iter()
+            .find(|unit| unit.is_class() && unit.identifier() == "Service")
+            .expect("Service declaration");
+        let real_provider = AnalyzerGoDefinitionProvider::new(&analyzer, None);
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        assert_eq!(
+            go_indexed_field_type_fqn(
+                &analyzer,
+                scope.token(),
+                &real_provider,
+                &owner.fq_name(),
+                "Next",
             ),
-            (
-                "new(Service).PointerOnly()",
-                "PointerOnly",
-                "main.Service.PointerOnly",
-            ),
-            (
-                "new(Service).ValueOnly()",
-                "ValueOnly",
-                "main.Service.ValueOnly",
-            ),
-            (
-                "MakePointer().PointerOnly()",
-                "PointerOnly",
-                "main.Service.PointerOnly",
-            ),
-            (
-                "MakeValue().ValueOnly()",
-                "ValueOnly",
-                "main.Service.ValueOnly",
-            ),
-            ("outer.Promoted()", "Promoted", "main.Embedded.Promoted"),
-            (
-                "MakeOuterPointer().Promoted()",
-                "Promoted",
-                "main.Embedded.Promoted",
-            ),
-        ] {
-            let site = site_for(&file, source, expression, member);
-            let outcome = resolve_go_bounded(
-                fixture.analyzer.analyzer(),
-                &file,
-                source,
-                Some(&tree),
-                &site,
-                ReceiverAnalysisBudget::default(),
-                None,
-            );
-            let BoundedResolution::Complete { value, .. } = outcome else {
-                panic!("{expression} should complete: {outcome:#?}");
+            Some(service.fq_name().to_owned()),
+        );
+        let assert_unresolved = |metadata| {
+            let provider = MetadataOverrideProvider {
+                inner: AnalyzerGoDefinitionProvider::new(&analyzer, None),
+                unit: field.clone(),
+                metadata,
             };
-            assert_eq!(
-                value.status,
-                DefinitionLookupStatus::Resolved,
-                "{expression}: {value:#?}"
-            );
             assert!(
-                matches!(value.definitions.as_slice(), [definition] if definition.fq_name() == target),
-                "{expression}: {value:#?}"
+                go_indexed_field_type_fqn(
+                    &analyzer,
+                    scope.token(),
+                    &provider,
+                    &owner.fq_name(),
+                    "Next",
+                )
+                .is_none()
             );
-        }
+        };
 
-        for (expression, member) in [
-            ("MakeValue().PointerOnly()", "PointerOnly"),
-            ("MakeOuter().Promoted()", "Promoted"),
-        ] {
-            let site = site_for(&file, source, expression, member);
-            let outcome = resolve_go_bounded(
-                fixture.analyzer.analyzer(),
-                &file,
-                source,
-                Some(&tree),
-                &site,
-                ReceiverAnalysisBudget::default(),
-                None,
-            );
-            assert!(
-                !matches!(
-                    outcome,
-                    BoundedResolution::Complete {
-                        value: DefinitionLookupOutcome {
-                            status: DefinitionLookupStatus::Resolved,
-                            ..
-                        },
-                        ..
-                    }
-                ),
-                "non-addressable value receiver must not claim a pointer-only method: {expression}: {outcome:#?}"
-            );
-        }
+        assert_unresolved(vec![
+            SignatureMetadata::new("*Service", Vec::new())
+                .with_return_type_text(Some("*Service"))
+                .with_return_type_identity(Some(named_type_identity("Service"))),
+            SignatureMetadata::new("*Service", Vec::new()).with_return_type_text(Some("*Service")),
+        ]);
+        assert_unresolved(vec![
+            SignatureMetadata::new("*Service", Vec::new())
+                .with_return_type_text(Some("*Service"))
+                .with_return_type_identity(Some(named_type_identity("Service"))),
+            SignatureMetadata::new("*Service", Vec::new())
+                .with_return_type_text(Some("*Service"))
+                .with_return_type_identity(Some(named_type_identity("Other"))),
+        ]);
     }
 
+    #[hardwon(
+        "5c5d4e214494: invalid go.mod makes package absence unknown instead of authoritative"
+    )]
     #[test]
-    fn bounded_go_shadowed_new_is_not_treated_as_builtin_allocation() {
-        let source = r#"package main
-
-type Service struct{}
-func (*Service) PointerOnly() {}
-func new(value Service) Service { return value }
-
-func use() {
-    new(Service{}).PointerOnly()
-}
-"#;
-        let fixture = AnalyzerFixture::new_for_language(Language::Go, &[("main.go", source)]);
-        let file = ProjectFile::new(fixture.project_root(), "main.go");
-        let tree = parse_go_tree(source).expect("Go tree");
-        let site = site_for(&file, source, "new(Service{}).PointerOnly()", "PointerOnly");
-        let outcome = resolve_go_bounded(
-            fixture.analyzer.analyzer(),
-            &file,
-            source,
-            Some(&tree),
-            &site,
-            ReceiverAnalysisBudget::default(),
-            None,
+    fn workspace_package_inventory_is_incomplete_for_invalid_go_mod() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Go,
+            &[("go.mod", "go 1.26\n"), ("pkg/pkg.go", "package pkg\n")],
         );
-
-        assert!(
-            !matches!(
-                outcome,
-                BoundedResolution::Complete {
-                    value: DefinitionLookupOutcome {
-                        status: DefinitionLookupStatus::Resolved,
-                        ..
-                    },
-                    ..
-                }
-            ),
-            "a package binding named new must shadow the builtin: {outcome:#?}"
-        );
-    }
-
-    #[test]
-    fn internal_import_access_uses_the_canonical_import_path_prefix() {
-        assert!(go_internal_import_allowed(
-            "example.com/owner/consumer",
-            "example.com/owner/internal/api"
+        let go = resolve_analyzer::<GoAnalyzer>(fixture.analyzer.analyzer())
+            .expect("fixture Go analyzer");
+        let session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
+        let status = AnalyzerGoDefinitionProvider::bounded(go, &session, None)
+            .workspace_package_status("example.com/app/pkg");
+        assert!(matches!(
+            session.finish(status),
+            BoundedResolution::Complete {
+                value: GoWorkspacePackageStatus::Unknown,
+                ..
+            }
         ));
-        assert!(go_internal_import_allowed(
-            "example.com/owner",
-            "example.com/owner/internal/api"
-        ));
-        assert!(!go_internal_import_allowed(
-            "example.com/other/consumer",
-            "example.com/owner/internal/api"
-        ));
-        assert!(!go_internal_import_allowed(
-            "example.com/ownerish/consumer",
-            "example.com/owner/internal/api"
-        ));
-        assert!(!go_internal_import_allowed(
-            "example.com/owner",
-            "internal/api"
-        ));
-        assert!(!go_internal_import_allowed(
-            "example.com/owner/consumer",
-            "example.com/owner/internal/nested/internal/api"
-        ));
-        assert!(go_internal_import_allowed(
-            "example.com/owner/internal/nested/consumer",
-            "example.com/owner/internal/nested/internal/api"
-        ));
+        assert_eq!(go.workspace_path_index_build_count_for_test(), 0);
     }
 }

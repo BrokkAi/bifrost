@@ -1,7 +1,7 @@
 use super::{PhpAnalyzerFacts, php_graph_source};
 use crate::analyzer::usages::common::{analyzed_files_for_language, language_for_file};
 use crate::analyzer::usages::inverted_edges::{
-    EdgeNodeDomain, UsageEdgeBuildOutput, UsageEdgeWeights, UsageEdges, build_edge_output,
+    EdgeNodeDomain, UsageEdgeBuildOutput, UsageEdges, build_edge_output,
     parse_and_collect_with_domain,
 };
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
@@ -110,13 +110,14 @@ impl<'a> PhpEdgeResolver<'a> {
         Some(Self { php, files })
     }
 
-    pub(crate) fn build_edges<F>(
+    pub(crate) fn build_edges<Output, F>(
         &self,
         analyzer: &dyn IAnalyzer,
         nodes: &HashSet<String>,
         keep_file: F,
-    ) -> UsageEdges
+    ) -> Output
     where
+        Output: UsageEdgeBuildOutput<String>,
         F: Fn(&ProjectFile) -> bool + Sync,
     {
         self.build_php_edges(analyzer, EdgeNodeDomain::Closed(nodes), keep_file)
@@ -132,18 +133,6 @@ impl<'a> PhpEdgeResolver<'a> {
         F: Fn(&ProjectFile) -> bool + Sync,
     {
         self.build_php_edges(analyzer, EdgeNodeDomain::Rooted(callers), keep_file)
-    }
-
-    pub(crate) fn build_edge_weights<F>(
-        &self,
-        analyzer: &dyn IAnalyzer,
-        nodes: &HashSet<String>,
-        keep_file: F,
-    ) -> UsageEdgeWeights
-    where
-        F: Fn(&ProjectFile) -> bool + Sync,
-    {
-        self.build_php_edges(analyzer, EdgeNodeDomain::Closed(nodes), keep_file)
     }
 
     /// The inverted pass's fan-out: the shared driver's parallel walk plus

@@ -21,6 +21,8 @@ use chrono::{DateTime, SecondsFormat};
 use serde::{Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
+use brokk_bifrost_analysis::analyzer::canonical_hash::write_length_prefixed as update_hash;
+
 use brokk_bifrost_analysis::CancellationToken;
 use brokk_bifrost_analysis::analyzer::Range as AnalyzerRange;
 use brokk_bifrost_analysis::analyzer::common::language_for_file;
@@ -29,10 +31,9 @@ use brokk_bifrost_analysis::analyzer::semantic_model::ActiveSemanticModelSnapsho
 use brokk_bifrost_analysis::analyzer::usages::{UsageHitSurface, UsageProof};
 use brokk_bifrost_analysis::analyzer::{CodeUnit, IAnalyzer, ProjectFile, WorkspaceAnalyzer};
 use brokk_bifrost_flow::flow_state::{
-    FileFlowState, FlowRelation, FlowStateAxis, FlowStateDerivation, FlowStateRequest, FlowSubject,
-    StateEventClass, StateEventRow, flow_state_for_file,
+    FileFlowState, FlowRelation, FlowStateAxis, FlowStateDerivation, FlowSubject, StateEventClass,
+    StateEventRow, flow_state_for_file_with_snapshot,
 };
-use brokk_bifrost_rql::structural::OwnerRelation;
 use brokk_bifrost_rql::structural::edges::EdgeAxis;
 use brokk_bifrost_rql::structural::materialization::MaterializationAxis;
 use brokk_bifrost_rql::structural::materialization_rows::{
@@ -45,22 +46,21 @@ use brokk_bifrost_rql::structural::reference_edges::{
     inverse_edges_for_declaration,
 };
 use brokk_bifrost_rql::structural::rewrite_path::RewriteOutcome;
-use brokk_bifrost_rql::structural::rewrite_paths::{
-    FileRewritePaths, RewritePathIncompleteReason, RewritePathRequest, rewrite_paths_for_file,
-};
+use brokk_bifrost_rql::structural::rewrite_paths::{FileRewritePaths, RewritePathIncompleteReason};
 use brokk_bifrost_rql::structural::search::{
     CodeQueryBinding, CodeQueryCandidateRef, CodeQueryGenerationSite, CodeQueryLexicalScope,
     CodeQueryOccurrence, CodeQueryResolutionCandidate,
 };
 use brokk_bifrost_rql::structural::search::{
     CodeQueryExecutionScope, CodeQueryRowFamilySession, CodeQueryStableOwnerCandidate,
-    CodeQueryStableOwnerDerivation, DetailedCodeQueryDomain, DetailedCodeQueryKey, UnitRowEvidence,
+    CodeQueryStableOwnerDerivation, DetailedCodeQueryDomain,
+    DetailedCodeQueryExportLocalDefinition, DetailedCodeQueryKey, UnitRowEvidence,
     UnitRowIdentities, UnitRowIdentityCandidate, UnitRowItem, UnitRowItemProvenance,
     UnitRowItemRef, UnitRowItemRefValue, UnitRowItemTerminal, UnitRowProvenance,
     UnitRowProvenanceRef, execute_code_query_detailed_eager_index,
     execute_code_query_detailed_eager_index_in_scope,
     execute_code_query_detailed_eager_index_with_row_family_session_in_scope,
-    execute_code_query_detailed_eager_index_without_targets_with_row_family_session_in_scope,
+    execute_code_query_detailed_eager_index_workspace,
     execute_code_query_detailed_eager_index_workspace_in_scope, execute_code_query_unit,
 };
 use brokk_bifrost_rql::structural::{BoundaryStatus, PrecedenceTier};
@@ -72,7 +72,8 @@ use brokk_bifrost_rql::structural::{
 use brokk_bifrost_rql::structural::{
     CodeQuery, CodeQueryCompletion, CodeQueryDiagnostic, CodeQueryDiagnosticCode,
     CodeQueryDiagnosticImpact, CodeQueryExecutionWork, CodeQueryRange, CodeQueryResultDetail,
-    CodeQueryResultItem, CodeQueryResultValue, QueryValueKind,
+    CodeQueryResultItem, CodeQueryResultValue, CodeQueryRowScalarRef, OwnerRelation,
+    QueryValueKind,
 };
 use brokk_bifrost_rql::structural::{
     NormalizedKind, OccurrenceRow as InternalOccurrenceRow,
@@ -98,7 +99,7 @@ use super::cvss::{
 use super::definition::{
     ASSERTION_SUBJECT_SELECTOR_PATH, AssertionPolicySpec, BindingScopeAssert, BoundaryAssert,
     CanonicalAssert, CvssEnvironmentalOrSupplementalMetric, CvssEvidenceScope, CvssMetric,
-    CvssMetricValue, CvssSystemScope, CvssThreatMetric, DeclarationStateAssert, EdgeClassAssert,
+    CvssMetricValue, CvssThreatMetric, DeclarationStateAssert, EdgeClassAssert,
     EdgeClassConstraint, EdgeParityAssert, EstablishmentRequirement, FindingSeverity,
     FlowEstablishmentAssert, GenerationAssert, OccurrenceAssert, OriginShapeAssert, PolicyAnalysis,
     PolicyAnalysisType, PolicyAssert, PolicyId, PolicyLevel, PolicyMessageSpec, PolicySeveritySpec,
@@ -106,12 +107,12 @@ use super::definition::{
 };
 use super::finding::{
     CertaintyReason, FindingCertainty, FindingCompleteness, FindingIncompleteReason,
-    MatchFindingEvidence, PolicyByteSpan, PolicyCapability, PolicyDiagnostic, PolicyDiagnosticCode,
-    PolicyDiagnosticImpact, PolicyDiagnosticSeverity, PolicyDisplayRegion, PolicyFailureReason,
-    PolicyFinding, PolicyFindingEvidence, PolicyIncompleteReason, PolicyLocationRelationship,
-    PolicyQueryProof, PolicyQueryProvenance, PolicyQueryProvenanceStep, PolicyQueryResultRef,
-    PolicyRun, PolicyRunCompletion, PolicyRunError, PolicySourceLocation, PolicyWorkMetric,
-    PolicyWorkReport, PolicyWorkUnit, ProofMetadata, ProofReason, ProofState,
+    MatchFindingEvidence, PolicyCapability, PolicyDiagnostic, PolicyDiagnosticCode,
+    PolicyDiagnosticImpact, PolicyDiagnosticSeverity, PolicyExportLocalDefinition,
+    PolicyFailureReason, PolicyFinding, PolicyFindingEvidence, PolicyIncompleteReason,
+    PolicyLocationRelationship, PolicyQueryProof, PolicyQueryProvenance, PolicyQueryProvenanceStep,
+    PolicyQueryResultRef, PolicyRun, PolicyRunCompletion, PolicyRunError, PolicySourceLocation,
+    PolicyWorkMetric, PolicyWorkReport, PolicyWorkUnit, ProofMetadata, ProofReason, ProofState,
     RelatedPolicyLocation, ReportValueError, insert_policy_diagnostic_bounded,
     normalize_policy_diagnostics_bounded,
 };
@@ -199,10 +200,7 @@ impl CvssExternalArtifactHash {
 
 impl fmt::Display for CvssExternalArtifactHash {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for byte in self.0 {
-            write!(formatter, "{byte:02x}")?;
-        }
-        Ok(())
+        brokk_bifrost_analysis::analyzer::canonical_hash::write_lower_hex(&self.0, formatter)
     }
 }
 
@@ -211,7 +209,7 @@ impl Serialize for CvssExternalArtifactHash {
     where
         S: Serializer,
     {
-        serializer.collect_str(self)
+        crate::serialize_display_value(self, serializer)
     }
 }
 
@@ -265,6 +263,27 @@ impl CvssOverlayEvidenceMetadata {
             system_scope,
             external_artifact_hash,
         })
+    }
+
+    pub(crate) fn try_new_metric_evidence(
+        &self,
+        metric: CvssMetric,
+        value: CvssMetricValue,
+        basis: CvssEvidenceBasis,
+        content_hash: CvssEvidenceContentHash,
+    ) -> Result<CvssMetricEvidence, CvssValidationError> {
+        CvssMetricEvidence::try_new(
+            metric,
+            value,
+            basis,
+            self.evidence_refs.clone(),
+            self.rationale.clone(),
+            self.assumptions.clone(),
+            self.assessor_or_tool.clone(),
+            Some(self.assessed_at.clone()),
+            self.system_scope,
+            content_hash,
+        )
     }
 
     pub fn evidence_refs(&self) -> &[super::finding_identity::EvidenceRef] {
@@ -401,7 +420,9 @@ pub trait PolicyEvaluator {
 }
 
 /// Adapter boundary for the future taint compiler and solver integration.
-pub(crate) trait TaintPolicyEvaluator: super::projection::sealed::TaintAdapter {
+pub(crate) trait TaintPolicyEvaluator:
+    super::projection::sealed::TaintAdapter + Send + Sync
+{
     fn evaluate_taint(
         &self,
         authority: &TaintProjectionAuthority,
@@ -414,7 +435,7 @@ pub(crate) trait TaintPolicyEvaluator: super::projection::sealed::TaintAdapter {
 
 /// Adapter boundary for the future typestate compiler and solver integration.
 pub(crate) trait TypestatePolicyEvaluator:
-    super::projection::sealed::TypestateAdapter
+    super::projection::sealed::TypestateAdapter + Send + Sync
 {
     /// Return the exact hashes produced by the in-crate protocol and binding
     /// compilers. This is a trusted compiler claim, not an exhaustion proof.
@@ -442,7 +463,10 @@ pub(crate) trait TypestatePolicyEvaluator:
     /// all, which the caller records as a whole-family run. The default is
     /// `None` because a test fake solves whatever it is asked to and reuses
     /// nothing.
-    fn take_unit_attempt(&self) -> Option<(UnitAttempt, Option<WidenReason>)> {
+    fn take_unit_attempt(
+        &self,
+        _policy_id: &PolicyId,
+    ) -> Option<(UnitAttempt, Option<WidenReason>)> {
         None
     }
 }
@@ -644,7 +668,7 @@ impl DefaultPolicyEvaluator<'_> {
                     let policy_id = policy.definition().metadata.id.clone();
                     let review = match self
                         .typestate
-                        .and_then(TypestatePolicyEvaluator::take_unit_attempt)
+                        .and_then(|adapter| adapter.take_unit_attempt(&policy_id))
                     {
                         Some((attempt, reason)) => attempt.into_run(policy_id, reason),
                         None => PolicyIncrementalRun::whole_family(policy_id),
@@ -661,6 +685,10 @@ impl DefaultPolicyEvaluator<'_> {
 /// Whether the policy's authored seed queries can honor an explicit execution
 /// scope. This is intentionally narrower than whole-query support: only the
 /// Match selector and Assertion subject or binding queries are narrowed.
+pub(crate) fn policy_uses_only_file_facts(policy: &LoadedPolicy) -> bool {
+    match_policy_query(policy).is_ok_and(|query| query.plan.source.uses_only_file_facts())
+}
+
 pub(crate) fn policy_supports_execution_scope(policy: &LoadedPolicy) -> bool {
     match &policy.definition().analysis {
         PolicyAnalysis::Match { .. } => policy
@@ -701,7 +729,13 @@ fn query_plan_source_supports_execution_scope(source: &CodeQueryPlanSource) -> b
     let mut pending = vec![source];
     while let Some(source) = pending.pop() {
         match source {
-            CodeQueryPlanSource::ConfigurationFacts(_) => return false,
+            // Configuration seeds and dependency evidence ignore a narrowed
+            // unit scope, and a cross-domain operator reads both of its inputs
+            // whole (#3284).
+            CodeQueryPlanSource::DependencyEvidence(_)
+            | CodeQueryPlanSource::ConfigurationFacts(_)
+            | CodeQueryPlanSource::Correlate(_)
+            | CodeQueryPlanSource::RequireBoth(_) => return false,
             CodeQueryPlanSource::Set { branches, .. } => {
                 pending.extend(branches.iter().map(|branch| &branch.source));
             }
@@ -851,6 +885,7 @@ fn evaluate_match_policy(
             Ok(query) => evaluate_match_query_candidates_in_scope(
                 &policy.definition().metadata.id,
                 context.analyzer,
+                context.workspace,
                 query,
                 budget,
                 context.cancellation,
@@ -865,6 +900,7 @@ fn evaluate_match_policy(
             None => evaluate_match_policy_candidates(
                 policy,
                 context.analyzer,
+                context.workspace,
                 budget,
                 context.cancellation,
             ),
@@ -1037,9 +1073,10 @@ fn assemble_match_run(
             message.clone(),
             classification.clone(),
             candidate.certainty,
-            finding_completeness_with_evidence_omission(
+            finding_completeness_with_omission(
                 candidate.completeness,
                 omitted_evidence_refs_lower_bound,
+                FindingIncompleteReason::EvidenceTruncated,
             ),
             candidate.location,
             Vec::new(),
@@ -1121,15 +1158,16 @@ pub(crate) fn finding_severity(
     }
 }
 
-fn finding_completeness_with_evidence_omission(
+fn finding_completeness_with_omission(
     completeness: FindingCompleteness,
-    omitted_evidence_refs_lower_bound: u64,
+    omitted_lower_bound: u64,
+    reason: FindingIncompleteReason,
 ) -> FindingCompleteness {
-    if omitted_evidence_refs_lower_bound == 0 {
+    if omitted_lower_bound == 0 {
         return completeness;
     }
     let mut reasons = completeness.reasons().to_vec();
-    reasons.push(FindingIncompleteReason::EvidenceTruncated);
+    reasons.push(reason);
     FindingCompleteness::partial(reasons).expect("one typed finding-incomplete reason is canonical")
 }
 
@@ -1140,30 +1178,6 @@ fn finding_completeness_with_declared_non_exhaustiveness(
     reasons.push(FindingIncompleteReason::DeclaredNonExhaustive);
     FindingCompleteness::partial(reasons)
         .expect("declared non-exhaustiveness is a bounded typed finding reason")
-}
-
-fn finding_completeness_with_source_scenario_omission(
-    completeness: FindingCompleteness,
-    omitted_source_scenarios_lower_bound: u64,
-) -> FindingCompleteness {
-    if omitted_source_scenarios_lower_bound == 0 {
-        return completeness;
-    }
-    let mut reasons = completeness.reasons().to_vec();
-    reasons.push(FindingIncompleteReason::SourceScenariosTruncated);
-    FindingCompleteness::partial(reasons).expect("one typed finding-incomplete reason is canonical")
-}
-
-fn finding_completeness_with_typestate_scenario_omission(
-    completeness: FindingCompleteness,
-    omitted_scenarios_lower_bound: u64,
-) -> FindingCompleteness {
-    if omitted_scenarios_lower_bound == 0 {
-        return completeness;
-    }
-    let mut reasons = completeness.reasons().to_vec();
-    reasons.push(FindingIncompleteReason::TypestateScenariosTruncated);
-    FindingCompleteness::partial(reasons).expect("one typed finding-incomplete reason is canonical")
 }
 
 fn combined_evidence_omission_lower_bound(
@@ -1242,21 +1256,18 @@ fn reduce_organizational_risk(
     let applicable = overlays
         .iter()
         .filter(|overlay| {
-            organizational_risk_scope_applies(
-                &overlay.scope,
-                policy_id,
-                finding_id,
-                source_scenarios,
-            )
+            overlay
+                .scope
+                .applies_to(policy_id, finding_id, source_scenarios)
         })
         .collect::<Vec<_>>();
     let maximal = applicable
         .iter()
         .copied()
         .filter(|candidate| {
-            !applicable.iter().any(|other| {
-                organizational_risk_scope_strictly_refines(&other.scope, &candidate.scope)
-            })
+            !applicable
+                .iter()
+                .any(|other| other.scope.strictly_refines(&candidate.scope))
         })
         .collect::<Vec<_>>();
     let Some(first) = maximal.first() else {
@@ -1322,63 +1333,6 @@ fn projected_core_evidence_refs(
     refs
 }
 
-fn organizational_risk_scope_applies(
-    scope: &PolicyOverlayScope,
-    policy_id: &PolicyId,
-    finding_id: &PolicyFindingId,
-    source_scenarios: &[SourceScenarioId],
-) -> bool {
-    match scope {
-        PolicyOverlayScope::AllFindings => true,
-        PolicyOverlayScope::Policy {
-            policy_id: expected,
-        } => expected == policy_id,
-        PolicyOverlayScope::Finding {
-            finding_id: expected,
-        } => expected == finding_id,
-        PolicyOverlayScope::SourceScenario { scenario_id } => {
-            source_scenarios.contains(scenario_id)
-        }
-        PolicyOverlayScope::FindingScenario { finding, scenario } => {
-            finding == finding_id && source_scenarios.contains(scenario)
-        }
-    }
-}
-
-fn organizational_risk_scope_strictly_refines(
-    left: &PolicyOverlayScope,
-    right: &PolicyOverlayScope,
-) -> bool {
-    use PolicyOverlayScope as Scope;
-    match (left, right) {
-        (Scope::Policy { .. }, Scope::AllFindings) => true,
-        (
-            Scope::Finding { .. } | Scope::SourceScenario { .. },
-            Scope::AllFindings | Scope::Policy { .. },
-        ) => true,
-        (
-            Scope::FindingScenario {
-                finding: left_finding,
-                ..
-            },
-            Scope::Finding {
-                finding_id: right_finding,
-            },
-        ) => left_finding == right_finding,
-        (
-            Scope::FindingScenario {
-                scenario: left_scenario,
-                ..
-            },
-            Scope::SourceScenario {
-                scenario_id: right_scenario,
-            },
-        ) => left_scenario == right_scenario,
-        (Scope::FindingScenario { .. }, Scope::AllFindings | Scope::Policy { .. }) => true,
-        _ => false,
-    }
-}
-
 fn record_run_incomplete(
     completion: &mut PolicyRunCompletion,
     diagnostics: &mut Vec<PolicyDiagnostic>,
@@ -1387,19 +1341,8 @@ fn record_run_incomplete(
     message: &str,
     budget: &PolicyBudget,
 ) {
-    match completion {
-        PolicyRunCompletion::Complete
-        | PolicyRunCompletion::ProvenSubset { .. }
-        | PolicyRunCompletion::ProvenBySummary => {
-            *completion = PolicyRunCompletion::inconclusive(vec![reason])
-                .expect("one typed incomplete reason is canonical");
-        }
-        PolicyRunCompletion::Inconclusive { reasons } => {
-            reasons.push(reason);
-            reasons.sort();
-            reasons.dedup();
-        }
-        PolicyRunCompletion::Unsupported { .. } | PolicyRunCompletion::Failed { .. } => return,
+    if !completion.mark_inconclusive(reason) {
+        return;
     }
     let code = match reason {
         PolicyIncompleteReason::ReportRetentionBudget => {
@@ -1411,20 +1354,27 @@ fn record_run_incomplete(
         }
         _ => PolicyDiagnosticCode::EvaluationFailure,
     };
-    let diagnostic = PolicyDiagnostic::try_new(
+    if let Some(diagnostic) = incomplete_run_diagnostic(code, message) {
+        *diagnostics_truncated |=
+            insert_policy_diagnostic_bounded(diagnostics, diagnostic, budget.max_diagnostics());
+    } else {
+        *diagnostics_truncated = true;
+    }
+}
+
+pub(super) fn incomplete_run_diagnostic(
+    code: PolicyDiagnosticCode,
+    message: &str,
+) -> Option<PolicyDiagnostic> {
+    PolicyDiagnostic::try_new(
         code,
         PolicyDiagnosticSeverity::Warning,
         PolicyDiagnosticImpact::RunIncomplete,
         message,
         None,
         Vec::new(),
-    );
-    if let Ok(diagnostic) = diagnostic {
-        *diagnostics_truncated |=
-            insert_policy_diagnostic_bounded(diagnostics, diagnostic, budget.max_diagnostics());
-    } else {
-        *diagnostics_truncated = true;
-    }
+    )
+    .ok()
 }
 
 fn omit_finding_for_report_budget(
@@ -1812,6 +1762,19 @@ fn assemble_taint_projection_batch(
     context: &PolicyEvaluationContext<'_>,
     budget: &PolicyBudget,
 ) -> Result<PolicyRun, PolicyRunError> {
+    let engine = batch.engine.clone();
+    let scope = batch.scope.clone();
+    assemble_taint_run(policy, authority, batch, context, budget)
+        .map(|run| run.with_engine(engine).with_scope(scope))
+}
+
+fn assemble_taint_run(
+    policy: &LoadedPolicy,
+    authority: &TaintProjectionAuthority,
+    batch: TaintProjectionBatch,
+    context: &PolicyEvaluationContext<'_>,
+    budget: &PolicyBudget,
+) -> Result<PolicyRun, PolicyRunError> {
     // Taint and flow share this assembly: one resolved model, one adapter,
     // one projection authority. The sealed analysis type is what decides the
     // run's kind and which evidence variant every finding carries (#2436).
@@ -1976,13 +1939,14 @@ fn assemble_taint_projection_batch(
             budget.max_projection_scenario_memberships(),
             available_for_evidence,
             |retained, scenarios_truncated, omitted_scenarios_lower_bound| {
-                TaintFindingEvidence::try_new(
+                TaintFindingEvidence::try_new_with_threat_model(
                     projection.analysis_finding_id.clone(),
                     projection.anchor.clone(),
                     projection.sink.clone(),
                     source_fact.source_endpoint.clone(),
                     projection.facts.sink_endpoint.clone(),
                     source_fact.source_display_name.clone(),
+                    source_fact.source_threat_model,
                     projection.facts.sink_display_name.clone(),
                     source_fact.source_categories.clone(),
                     projection.facts.sink_categories.clone(),
@@ -2091,12 +2055,13 @@ fn assemble_taint_projection_batch(
             &organizational_risk_omitted_evidence_refs,
             &cvss_omitted_evidence_refs,
         );
-        let completeness = finding_completeness_with_source_scenario_omission(
+        let completeness = finding_completeness_with_omission(
             report.completeness,
             omitted_source_scenarios_lower_bound
                 .max(u64::from(cvss.as_ref().is_some_and(
                     super::cvss::CvssAssessmentSet::has_truncated_source_scenarios,
                 ))),
+            FindingIncompleteReason::SourceScenariosTruncated,
         );
         let display_path = report.display_path;
         debug_assert!(display_path.as_ref().is_none_or(|path| {
@@ -2114,9 +2079,10 @@ fn assemble_taint_projection_batch(
             message,
             classification,
             report.certainty,
-            finding_completeness_with_evidence_omission(
+            finding_completeness_with_omission(
                 completeness,
                 omitted_evidence_refs_lower_bound,
+                FindingIncompleteReason::EvidenceTruncated,
             ),
             report.primary,
             report.related,
@@ -2137,7 +2103,10 @@ fn assemble_taint_projection_batch(
             report.witnesses_truncated,
             report.omitted_witnesses_lower_bound,
             budget,
-        );
+        )
+        .and_then(|finding| {
+            finding.with_value_type_barrier_notes(report.value_type_barrier_notes, budget)
+        });
         match finding {
             Ok(mut finding) if finding.id() == expected_id => {
                 finding.attach_display_path(display_path);
@@ -2391,9 +2360,10 @@ fn assemble_typestate_projection_batch(
             &organizational_risk_omitted_evidence_refs,
             &cvss_omitted_evidence_refs,
         );
-        let completeness = finding_completeness_with_typestate_scenario_omission(
+        let completeness = finding_completeness_with_omission(
             report.completeness,
             omitted_typestate_scenarios_lower_bound,
+            FindingIncompleteReason::TypestateScenariosTruncated,
         );
         let finding = PolicyFinding::try_new(
             metadata.id.clone(),
@@ -2402,9 +2372,10 @@ fn assemble_typestate_projection_batch(
             message.clone(),
             classification,
             report.certainty,
-            finding_completeness_with_evidence_omission(
+            finding_completeness_with_omission(
                 completeness,
                 omitted_evidence_refs_lower_bound,
+                FindingIncompleteReason::EvidenceTruncated,
             ),
             report.primary,
             report.related,
@@ -2560,8 +2531,7 @@ fn sliced_match_candidates(
     let workspace_files = context.analyzer.analyzed_files();
     let execution = UnitQueryExecution {
         analyzer: context.analyzer,
-        // The whole match execution is analyzer-only, so its units are too.
-        workspace: None,
+        workspace: context.workspace,
         cancellation: context.cancellation,
         limits,
         workspace_files: &workspace_files,
@@ -2615,9 +2585,7 @@ fn widened_match_candidates(
     };
     let product = execute_code_query_unit(
         context.analyzer,
-        // The whole match execution is analyzer-only, as in the historical
-        // non-incremental path.
-        None,
+        context.workspace,
         &executable,
         budget.query_limits(),
         context.cancellation,
@@ -2674,6 +2642,7 @@ fn match_policy_query(
 pub(crate) fn evaluate_match_policy_candidates(
     policy: &LoadedPolicy,
     analyzer: &dyn IAnalyzer,
+    workspace: Option<&WorkspaceAnalyzer>,
     budget: &PolicyBudget,
     cancellation: Option<&CancellationToken>,
 ) -> EvaluatedMatchPolicy {
@@ -2684,6 +2653,7 @@ pub(crate) fn evaluate_match_policy_candidates(
     evaluate_match_query_candidates(
         &policy.definition().metadata.id,
         analyzer,
+        workspace,
         query,
         budget,
         cancellation,
@@ -2718,13 +2688,20 @@ fn executable_match_query(
     query: &brokk_bifrost_rql::structural::CodeQuery,
     budget: &PolicyBudget,
 ) -> Result<brokk_bifrost_rql::structural::CodeQuery, MatchPolicyRefusal> {
-    match query.validate_steps() {
-        Ok(
+    // A union of different row kinds yields rows of every branch's kind, so
+    // every kind must be a positive terminal domain on its own (#5352).
+    let Ok(row_kinds) = query.validate_row_kinds() else {
+        return Err(MatchPolicyRefusal {
+            reason: PolicyFailureReason::InvalidExecutionPlan,
+            message: "match policy contains an invalid query plan",
+        });
+    };
+    for kind in row_kinds {
+        match kind {
             QueryValueKind::ReceiverAnalysis
             | QueryValueKind::MemberTargetAnalysis
             | QueryValueKind::ReceiverOutcome
             | QueryValueKind::ReceiverEvidence
-            | QueryValueKind::CallShape
             | QueryValueKind::CallResult
             | QueryValueKind::ResultSubjectUse
             | QueryValueKind::CallArgumentGroup
@@ -2740,14 +2717,13 @@ fn executable_match_query(
             | QueryValueKind::AssignmentRelation
             | QueryValueKind::LoopRelation
             | QueryValueKind::StatementReachability
-            | QueryValueKind::ConcurrentAccessConflict
+            | QueryValueKind::PendingCleanupFlow
             | QueryValueKind::ClassSetRow
             | QueryValueKind::AbsentMemberFinding
             | QueryValueKind::AbsentMemberWitness
             | QueryValueKind::DetachedTaskTransfer
             | QueryValueKind::ProcedureEffect
-            | QueryValueKind::CallableSignature
-            | QueryValueKind::SignatureParameter
+            | QueryValueKind::LiteralOccurrence
             | QueryValueKind::DecoratedParameter
             | QueryValueKind::CallableApplicability
             | QueryValueKind::OverloadSelection
@@ -2758,6 +2734,7 @@ fn executable_match_query(
             | QueryValueKind::MemberFamily
             | QueryValueKind::MemberFamilyEdge
             | QueryValueKind::StateEvent
+            | QueryValueKind::BindingInitializerCall
             | QueryValueKind::FlowRelation
             | QueryValueKind::ControlRelation
             | QueryValueKind::BranchRelation
@@ -2774,14 +2751,13 @@ fn executable_match_query(
             | QueryValueKind::TypestateWitness
             | QueryValueKind::FlowEndpoint
             | QueryValueKind::FlowWitness
-            | QueryValueKind::TaintFinding,
-        ) => {
+            | QueryValueKind::PointsToCandidate
+            | QueryValueKind::TaintFinding => {
             return Err(MatchPolicyRefusal {
                 reason: PolicyFailureReason::InvalidExecutionPlan,
                 message: "analysis-only query values are not positive match-policy terminal domains",
             });
         }
-        Ok(
             QueryValueKind::StructuralMatch
             | QueryValueKind::Declaration
             | QueryValueKind::ReferenceSite
@@ -2791,6 +2767,9 @@ fn executable_match_query(
             | QueryValueKind::FieldWriteValue
             | QueryValueKind::KeyedReadValue
             | QueryValueKind::Occurrence
+            | QueryValueKind::PythonRuleFact
+            | QueryValueKind::PythonHierarchyFact
+            | QueryValueKind::RustPointerFinding
             // A binding and a resolution candidate are both exact facts about
             // one source position, so a match policy listing suspicious
             // bindings or candidate selections is a legitimate thing to
@@ -2806,10 +2785,26 @@ fn executable_match_query(
             | QueryValueKind::GenerationSite
             | QueryValueKind::Export
             | QueryValueKind::DeclarationState
-            // An authored configuration fact is an exact parser record at one
-            // document position (#3277); whether the ingested documents are
-            // whole is the query's diagnostics' business, the #1476 argument.
+            | QueryValueKind::CallShape
+            | QueryValueKind::CallableMetrics
+            | QueryValueKind::CallableSignature
+            | QueryValueKind::SignatureParameter
+            // These result domains become findings only for rows carrying an
+            // exact source range and matching detailed source evidence.
+            // An unanchored row leaves the run incomplete in candidate
+            // adaptation.
+            // An authored configuration fact is an exact parser record at
+            // one document position (#3277); whether the ingested documents
+            // are whole is the query's diagnostics' business, the #1476
+            // argument.
+            | QueryValueKind::DependencyEvidence
             | QueryValueKind::ConfigurationFact
+            // A cross-domain row is an exact record of one structurally
+            // proven pair, or of one contributing row of a satisfied
+            // requirement (#3284). Its anchors are exact positions, and
+            // whether either input was whole is the query's diagnostics'
+            // business, the same #1476 argument.
+            | QueryValueKind::CrossDomain
             // A reference edge is likewise an exact record of what one
             // producer derived at one site; set-level completeness is the
             // query's diagnostics' business (#1479).
@@ -2818,13 +2813,8 @@ fn executable_match_query(
             // token chains, the same argument again (#1475).
             | QueryValueKind::QualifiedPath
             | QueryValueKind::PathSegment
-            | QueryValueKind::File,
-        ) => {}
-        Err(_) => {
-            return Err(MatchPolicyRefusal {
-                reason: PolicyFailureReason::InvalidExecutionPlan,
-                message: "match policy contains an invalid query plan",
-            });
+            | QueryValueKind::CppExpression
+            | QueryValueKind::File => {}
         }
     }
 
@@ -2841,6 +2831,7 @@ fn executable_match_query(
 fn evaluate_match_query_candidates(
     policy_id: &PolicyId,
     analyzer: &dyn IAnalyzer,
+    workspace: Option<&WorkspaceAnalyzer>,
     query: &CodeQuery,
     budget: &PolicyBudget,
     cancellation: Option<&CancellationToken>,
@@ -2848,6 +2839,7 @@ fn evaluate_match_query_candidates(
     evaluate_match_query_candidates_in_scope(
         policy_id,
         analyzer,
+        workspace,
         query,
         budget,
         cancellation,
@@ -2858,6 +2850,7 @@ fn evaluate_match_query_candidates(
 fn evaluate_match_query_candidates_in_scope(
     policy_id: &PolicyId,
     analyzer: &dyn IAnalyzer,
+    workspace: Option<&WorkspaceAnalyzer>,
     query: &brokk_bifrost_rql::structural::CodeQuery,
     budget: &PolicyBudget,
     cancellation: Option<&CancellationToken>,
@@ -2871,13 +2864,22 @@ fn evaluate_match_query_candidates_in_scope(
     // index reuse is guaranteed: build the snapshot index on first use
     // instead of letting Auto's first-request deferral scan the workspace
     // once per policy.
-    let detailed = execute_code_query_detailed_eager_index_in_scope(
-        analyzer,
-        &executable,
-        budget.query_limits(),
-        cancellation,
-        execution_scope,
-    );
+    let detailed = match workspace {
+        Some(workspace) => execute_code_query_detailed_eager_index_workspace_in_scope(
+            workspace,
+            &executable,
+            budget.query_limits(),
+            cancellation,
+            execution_scope,
+        ),
+        None => execute_code_query_detailed_eager_index_in_scope(
+            analyzer,
+            &executable,
+            budget.query_limits(),
+            cancellation,
+            execution_scope,
+        ),
+    };
     adapt_match_execution(
         policy_id,
         // One adapter serves the whole run and the unit path: the whole run's
@@ -2942,6 +2944,7 @@ fn adapt_match_execution(
     }
 
     let adapted_candidates = adapt_match_candidates(policy_id, rows, evidence, query_diagnostics);
+    incomplete_reasons.extend(adapted_candidates.incomplete_reasons.iter().copied());
     let mut candidates = adapted_candidates.candidates;
     if matches!(query_completion, CodeQueryCompletion::ProvenSubset { .. }) {
         for candidate in &mut candidates {
@@ -3075,16 +3078,9 @@ fn retain_incomplete_diagnostic(
         *diagnostics_truncated = true;
         return;
     }
-    match PolicyDiagnostic::try_new(
-        PolicyDiagnosticCode::ReportRetentionBudget,
-        PolicyDiagnosticSeverity::Warning,
-        PolicyDiagnosticImpact::RunIncomplete,
-        message,
-        None,
-        Vec::new(),
-    ) {
-        Ok(diagnostic) => diagnostics.push(diagnostic),
-        Err(_) => *diagnostics_truncated = true,
+    match incomplete_run_diagnostic(PolicyDiagnosticCode::ReportRetentionBudget, message) {
+        Some(diagnostic) => diagnostics.push(diagnostic),
+        None => *diagnostics_truncated = true,
     }
 }
 
@@ -3093,6 +3089,7 @@ struct AdaptedMatchCandidates {
     candidates: Vec<EvaluatedMatchCandidate>,
     conversion_failed: bool,
     omitted_findings_lower_bound: u64,
+    incomplete_reasons: Vec<PolicyIncompleteReason>,
 }
 
 fn adapt_match_candidates(
@@ -3107,9 +3104,27 @@ fn adapt_match_candidates(
     let mut conversion_failed = result_count != evidence_count;
     let mut omitted_findings_lower_bound =
         u64::try_from(result_count.saturating_sub(paired_count)).unwrap_or(u64::MAX);
+    let mut incomplete_reasons = Vec::new();
     let mut ordinals: HashMap<StrongOrdinalKey, u32> = HashMap::new();
     let mut candidates = Vec::with_capacity(paired_count);
     for (item, evidence) in rows.into_iter().zip(evidence) {
+        if match_domain(evidence.domain).is_none()
+            && !source_backed_analysis_terminal(&item, &evidence)
+        {
+            omitted_findings_lower_bound = omitted_findings_lower_bound.saturating_add(1);
+            if analysis_terminal_pair_is_consistent(&item, &evidence) {
+                incomplete_reasons.push(PolicyIncompleteReason::CapabilityIncomplete);
+            } else {
+                conversion_failed = true;
+            }
+            continue;
+        }
+        if evidence.domain == DetailedCodeQueryDomain::PythonHierarchyFact
+            && !matches!(unit_row_label(&item, "coverage"), Ok("complete"))
+        {
+            incomplete_reasons.push(PolicyIncompleteReason::CapabilityIncomplete);
+            continue;
+        }
         match adapt_match_candidate(policy_id, item, evidence, query_diagnostics, &mut ordinals) {
             Ok(candidate) => candidates.push(candidate),
             Err(()) => {
@@ -3122,6 +3137,7 @@ fn adapt_match_candidates(
         candidates,
         conversion_failed,
         omitted_findings_lower_bound,
+        incomplete_reasons,
     }
 }
 
@@ -3132,13 +3148,27 @@ fn adapt_match_candidate(
     query_diagnostics: &[CodeQueryDiagnostic],
     ordinals: &mut HashMap<StrongOrdinalKey, u32>,
 ) -> Result<EvaluatedMatchCandidate, ()> {
-    let result_domain = match_domain(evidence.domain).ok_or(())?;
+    let result_domain = match_domain(evidence.domain)
+        .or_else(|| {
+            source_backed_analysis_terminal(&item, &evidence)
+                .then_some(MatchResultDomain::StructuralMatch)
+        })
+        .ok_or(())?;
     let path = workspace_relative_path(&evidence.rel_path)?;
     let (location, mut candidate_reasons, proof) =
         terminal_presentation(&item, evidence.domain, &path, evidence.byte_span.as_ref())?;
     candidate_reasons.extend(certainty_reasons(query_diagnostics, &evidence.provenance));
 
     let owner = match evidence.stable_owner_candidate.as_ref() {
+        Some(CodeQueryStableOwnerCandidate::Derived {
+            derivation: CodeQueryStableOwnerDerivation::SemanticWireId,
+            ..
+        }) if evidence.domain == DetailedCodeQueryDomain::RustPointerFinding => {
+            // A pointer finding is anchored at its exact source row. Its
+            // semantic wire id is not a declaration owner; the source slice
+            // hash and row ordinal provide the stable finding key.
+            OwnerCandidate::Absent
+        }
         Some(candidate) => {
             let identity = match candidate {
                 CodeQueryStableOwnerCandidate::Declaration { namespace, id } => {
@@ -3307,15 +3337,70 @@ struct StrongOrdinalKey {
     source_hash: SourceSliceHash,
 }
 
+fn unit_row_label<'a>(item: &'a UnitRowItem, name: &str) -> Result<&'a str, ()> {
+    match item.field(name).map_err(|_| ())? {
+        Some(
+            CodeQueryRowScalarRef::StableId(value)
+            | CodeQueryRowScalarRef::ConstrainedEnum(value)
+            | CodeQueryRowScalarRef::String(value),
+        ) => Ok(value),
+        _ => Err(()),
+    }
+}
+
+fn unit_row_optional_label<'a>(item: &'a UnitRowItem, name: &str) -> Result<Option<&'a str>, ()> {
+    match item.field(name).map_err(|_| ())? {
+        None => Ok(None),
+        Some(
+            CodeQueryRowScalarRef::StableId(value)
+            | CodeQueryRowScalarRef::ConstrainedEnum(value)
+            | CodeQueryRowScalarRef::String(value),
+        ) => Ok(Some(value)),
+        _ => Err(()),
+    }
+}
+
+fn unit_row_optional_usize(item: &UnitRowItem, name: &str) -> Result<Option<usize>, ()> {
+    match item.field(name).map_err(|_| ())? {
+        None => Ok(None),
+        Some(CodeQueryRowScalarRef::Integer(value)) => {
+            Ok(Some(usize::try_from(value).map_err(|_| ())?))
+        }
+        _ => Err(()),
+    }
+}
+
+/// Whether an analysis-only result can stand as a policy finding on its own.
+/// The row must have its own source range and paired detailed key, path, byte
+/// span, and source-slice digest. Derived rows without a concrete stable source
+/// position remain analysis-only and cannot create a positive match finding.
+fn source_backed_analysis_terminal(item: &UnitRowItem, evidence: &UnitRowEvidence) -> bool {
+    source_backed_analysis_terminal_domain(evidence.domain)
+        && analysis_terminal_pair_is_consistent(item, evidence)
+        && item.range.is_some()
+        && evidence.byte_span.is_some()
+        && evidence.source_slice_sha256.is_some()
+        && matches!(
+            item.terminal.as_ref(),
+            Some(UnitRowItemTerminal::SourcePosition)
+        )
+}
+
+fn analysis_terminal_pair_is_consistent(item: &UnitRowItem, evidence: &UnitRowEvidence) -> bool {
+    item.domain == evidence.domain
+        && item.path.as_ref() == evidence.rel_path.as_ref()
+        && evidence.key.domain() == evidence.domain
+}
+
 fn terminal_presentation(
     item: &UnitRowItem,
     expected_domain: DetailedCodeQueryDomain,
     expected_path: &WorkspaceRelativePath,
     byte_span: Option<&std::ops::Range<usize>>,
 ) -> Result<(PolicySourceLocation, Vec<CertaintyReason>, ProofMetadata), ()> {
-    // An analysis-only row is refused before any field of it is read: it is a
-    // projection over a call site or a declaration, and the finding anchors at
-    // the row it names rather than at the projection.
+    // Source-backed analysis rows may use their own exact range as the
+    // finding anchor. Rows without a concrete range are rejected by the
+    // candidate adapter before their fields are read.
     let UnitRowItem {
         domain: actual_domain,
         path,
@@ -3336,6 +3421,11 @@ fn terminal_presentation(
             Vec::new(),
             ProofState::Proven,
             ProofReason::ResolvedDeclaration,
+        ),
+        UnitRowItemTerminal::Binding { .. } | UnitRowItemTerminal::Occurrence { .. } => (
+            Vec::new(),
+            ProofState::Proven,
+            ProofReason::DirectStructuralMatch,
         ),
         UnitRowItemTerminal::File => (
             Vec::new(),
@@ -3425,6 +3515,9 @@ fn terminal_presentation(
             },
             ProofReason::DirectStructuralMatch,
         ),
+        UnitRowItemTerminal::CallEffect { .. } => {
+            (Vec::new(), ProofState::Proven, ProofReason::ExactCallTarget)
+        }
         UnitRowItemTerminal::ResultSubjectUse {
             proof,
             completeness,
@@ -3453,11 +3546,115 @@ fn terminal_presentation(
                 },
             )
         }
+        UnitRowItemTerminal::GenerationSite { .. } => (
+            Vec::new(),
+            ProofState::Proven,
+            ProofReason::DirectStructuralMatch,
+        ),
+        UnitRowItemTerminal::SourcePosition
+            if *actual_domain == DetailedCodeQueryDomain::PythonRuleFact =>
+        {
+            let fact_label = |name| match item.field(name) {
+                Ok(Some(
+                    CodeQueryRowScalarRef::ConstrainedEnum(value)
+                    | CodeQueryRowScalarRef::String(value),
+                )) => Some(value),
+                _ => None,
+            };
+            let proven = fact_label("proof") == Some("proven");
+            let complete = fact_label("completeness") == Some("complete");
+            let certainty = if proven && complete {
+                Vec::new()
+            } else {
+                vec![
+                    CertaintyReason::analyzer_ambiguity(
+                        fact_label("reason")
+                            .unwrap_or("Python rule fact proof or completeness is unavailable"),
+                    )
+                    .map_err(|_| ())?,
+                ]
+            };
+            (
+                certainty,
+                if proven && complete {
+                    ProofState::Proven
+                } else {
+                    ProofState::Unproven
+                },
+                if proven && complete {
+                    ProofReason::DirectStructuralMatch
+                } else {
+                    ProofReason::PartialWitness
+                },
+            )
+        }
+        UnitRowItemTerminal::SourcePosition
+            if *actual_domain == DetailedCodeQueryDomain::PythonHierarchyFact =>
+        {
+            let complete = unit_row_label(item, "coverage")? == "complete";
+            let certainty = if complete {
+                Vec::new()
+            } else {
+                vec![
+                    CertaintyReason::analyzer_ambiguity("Python hierarchy outcome is incomplete")
+                        .map_err(|_| ())?,
+                ]
+            };
+            (
+                certainty,
+                if complete {
+                    ProofState::Proven
+                } else {
+                    ProofState::Unproven
+                },
+                if complete {
+                    ProofReason::DirectStructuralMatch
+                } else {
+                    ProofReason::PartialWitness
+                },
+            )
+        }
+        UnitRowItemTerminal::SourcePosition
+            if *actual_domain == DetailedCodeQueryDomain::RustPointerFinding =>
+        {
+            let fact_label = |name| match item.field(name) {
+                Ok(Some(
+                    CodeQueryRowScalarRef::ConstrainedEnum(value)
+                    | CodeQueryRowScalarRef::String(value),
+                )) => Some(value),
+                _ => None,
+            };
+            let proven = fact_label("proof") == Some("proven");
+            let complete = fact_label("completeness") == Some("complete");
+            let certainty = if proven && complete {
+                Vec::new()
+            } else {
+                vec![
+                    CertaintyReason::analyzer_ambiguity("rust_pointer_finding_incomplete")
+                        .map_err(|_| ())?,
+                ]
+            };
+            (
+                certainty,
+                if proven && complete {
+                    ProofState::Proven
+                } else {
+                    ProofState::Unproven
+                },
+                if proven && complete {
+                    ProofReason::DirectStructuralMatch
+                } else {
+                    ProofReason::PartialWitness
+                },
+            )
+        }
         // Every remaining presented family is an exact record of what one
         // producer derived at one position: its own presence is proven, and
         // whatever completeness the row states is the row's own column, not a
         // proof tier of the position.
-        UnitRowItemTerminal::SourcePosition | UnitRowItemTerminal::AbsentMemberFinding { .. } => (
+        UnitRowItemTerminal::SourcePosition
+        | UnitRowItemTerminal::CrossDomain { .. }
+        | UnitRowItemTerminal::AbsentMemberFinding { .. } => (
             Vec::new(),
             ProofState::Proven,
             ProofReason::DirectStructuralMatch,
@@ -3467,8 +3664,10 @@ fn terminal_presentation(
         return Err(());
     }
     let location = if *actual_domain == DetailedCodeQueryDomain::File
-        || (*actual_domain == DetailedCodeQueryDomain::DeclarationState
-            && byte_span.is_none()
+        || (matches!(
+            *actual_domain,
+            DetailedCodeQueryDomain::DeclarationState | DetailedCodeQueryDomain::CrossDomain
+        ) && byte_span.is_none()
             && range.is_none())
     {
         if byte_span.is_some() || range.is_some() {
@@ -3545,11 +3744,195 @@ fn adapt_terminal_result(
             ))
         }
         (
+            UnitRowItemTerminal::Binding {
+                id, ast_id, name, ..
+            },
+            DetailedCodeQueryDomain::Binding,
+            DetailedCodeQueryKey::Binding {
+                id: detailed_id,
+                ast_id: detailed_ast_id,
+                name: detailed_name,
+            },
+            UnitRowIdentities::None,
+        ) if id.as_ref() == detailed_id
+            && ast_id.as_deref() == detailed_ast_id.as_deref()
+            && name.as_ref() == detailed_name.as_str()
+            && range_matches_location(*range, location) =>
+        {
+            Ok((
+                PolicyQueryResultRef::Binding {
+                    id: detailed_id.clone(),
+                    ast_id: detailed_ast_id.clone(),
+                    name: detailed_name.clone(),
+                    location: location.clone(),
+                },
+                false,
+            ))
+        }
+        (
+            UnitRowItemTerminal::Occurrence {
+                id,
+                ast_id,
+                class,
+                role,
+                namespace,
+            },
+            DetailedCodeQueryDomain::Occurrence,
+            DetailedCodeQueryKey::Occurrence {
+                id: detailed_id,
+                ast_id: detailed_ast_id,
+                role: detailed_role,
+            },
+            UnitRowIdentities::None,
+        ) if id.as_ref() == detailed_id
+            && ast_id.as_ref() == detailed_ast_id
+            && role.as_ref() == detailed_role
+            && range_matches_location(*range, location) =>
+        {
+            Ok((
+                PolicyQueryResultRef::Occurrence {
+                    id: detailed_id.clone(),
+                    ast_id: detailed_ast_id.clone(),
+                    class: class.to_string(),
+                    role: detailed_role.clone(),
+                    namespace: namespace.to_string(),
+                    location: location.clone(),
+                },
+                false,
+            ))
+        }
+        (
             UnitRowItemTerminal::File,
             DetailedCodeQueryDomain::File,
             DetailedCodeQueryKey::File,
             UnitRowIdentities::None,
         ) => Ok((PolicyQueryResultRef::file(expected_path.clone()), false)),
+        (
+            UnitRowItemTerminal::SourcePosition,
+            DetailedCodeQueryDomain::Export,
+            DetailedCodeQueryKey::Export {
+                id,
+                form,
+                exported_name,
+                local_definition: detailed_definition,
+            },
+            UnitRowIdentities::None,
+        ) if unit_row_label(item, "id")? == id
+            && unit_row_label(item, "form")? == form
+            && unit_row_label(item, "exported_name")? == exported_name
+            && range_matches_location(*range, location) =>
+        {
+            let target_fq_name = match item.field("target_fq_name").map_err(|_| ())? {
+                None => None,
+                Some(CodeQueryRowScalarRef::String(value)) => Some(value.to_owned()),
+                _ => return Err(()),
+            };
+            let definition_status = unit_row_optional_label(item, "definition_status")?;
+            let binding_name = unit_row_optional_label(item, "definition_binding_name")?;
+            let binding_kind = unit_row_optional_label(item, "definition_binding_kind")?;
+            let binding_start_byte =
+                unit_row_optional_usize(item, "definition_binding_start_byte")?;
+            let binding_end_byte = unit_row_optional_usize(item, "definition_binding_end_byte")?;
+            let binding_start_line =
+                unit_row_optional_usize(item, "definition_binding_start_line")?;
+            let binding_start_column =
+                unit_row_optional_usize(item, "definition_binding_start_column")?;
+            let binding_end_line = unit_row_optional_usize(item, "definition_binding_end_line")?;
+            let binding_end_column =
+                unit_row_optional_usize(item, "definition_binding_end_column")?;
+            let no_binding_fields = binding_name.is_none()
+                && binding_kind.is_none()
+                && binding_start_byte.is_none()
+                && binding_end_byte.is_none()
+                && binding_start_line.is_none()
+                && binding_start_column.is_none()
+                && binding_end_line.is_none()
+                && binding_end_column.is_none();
+            let local_definition = match detailed_definition {
+                None if definition_status.is_none() && no_binding_fields => None,
+                Some(DetailedCodeQueryExportLocalDefinition::Undefined)
+                    if definition_status == Some("undefined") && no_binding_fields =>
+                {
+                    Some(PolicyExportLocalDefinition::Undefined)
+                }
+                Some(DetailedCodeQueryExportLocalDefinition::Unknown)
+                    if definition_status == Some("unknown") && no_binding_fields =>
+                {
+                    Some(PolicyExportLocalDefinition::Unknown)
+                }
+                Some(DetailedCodeQueryExportLocalDefinition::Defined {
+                    binding_name: detailed_name,
+                    binding_kind: detailed_kind,
+                    start_byte: detailed_start_byte,
+                    end_byte: detailed_end_byte,
+                    range: detailed_range,
+                }) if definition_status == Some("defined")
+                    && binding_name == Some(detailed_name.as_str())
+                    && binding_kind == Some(detailed_kind.as_str())
+                    && binding_start_byte == Some(*detailed_start_byte)
+                    && binding_end_byte == Some(*detailed_end_byte)
+                    && binding_start_line == Some(detailed_range.start_line)
+                    && binding_start_column == Some(detailed_range.start_column)
+                    && binding_end_line == Some(detailed_range.end_line)
+                    && binding_end_column == Some(detailed_range.end_column) =>
+                {
+                    let binding_location = policy_span_location(
+                        expected_path.clone(),
+                        &(*detailed_start_byte..*detailed_end_byte),
+                        *detailed_range,
+                    )?;
+                    Some(PolicyExportLocalDefinition::Defined {
+                        binding_name: detailed_name.clone(),
+                        binding_kind: detailed_kind.clone(),
+                        binding_location,
+                    })
+                }
+                _ => return Err(()),
+            };
+            Ok((
+                PolicyQueryResultRef::Export {
+                    location: location.clone(),
+                    id: id.clone(),
+                    form: form.clone(),
+                    exported_name: exported_name.clone(),
+                    target_fq_name,
+                    local_definition,
+                },
+                false,
+            ))
+        }
+        (
+            UnitRowItemTerminal::SourcePosition,
+            DetailedCodeQueryDomain::DependencyEvidence,
+            DetailedCodeQueryKey::DependencyEvidence {
+                id,
+                ecosystem,
+                package,
+                evidence_kind,
+                scope,
+                source_digest,
+                version_requirement,
+                exact_version,
+                source,
+                declared_by,
+            },
+            UnitRowIdentities::None,
+        ) => Ok((
+            PolicyQueryResultRef::DependencyEvidence {
+                location: location.clone(),
+                id: id.clone(),
+                ecosystem: ecosystem.clone(),
+                package: package.clone(),
+                evidence_kind: evidence_kind.clone(),
+                scope: scope.clone(),
+                source_digest: source_digest.clone(),
+                version_requirement: version_requirement.clone(),
+                exact_version: exact_version.clone(),
+                source: source.clone(),
+                declared_by: declared_by.clone(),
+            },
+            false,
+        )),
         // Authored configuration facts are exact parser rows. The policy
         // terminal keeps the fact's workspace path and byte span through the
         // structural envelope while carrying no semantic identity: a
@@ -3569,6 +3952,133 @@ fn adapt_terminal_result(
                     location: location.clone(),
                     id: id.clone(),
                     fact_id: fact_id.clone(),
+                },
+                false,
+            ))
+        }
+        (
+            UnitRowItemTerminal::SourcePosition,
+            DetailedCodeQueryDomain::CppExpression,
+            DetailedCodeQueryKey::CppExpression { .. },
+            UnitRowIdentities::None,
+        ) => Ok((
+            PolicyQueryResultRef::StructuralMatch {
+                kind: "cpp_expression".to_owned(),
+                location: location.clone(),
+                identity: None,
+            },
+            false,
+        )),
+        (
+            UnitRowItemTerminal::SourcePosition,
+            DetailedCodeQueryDomain::PythonRuleFact,
+            DetailedCodeQueryKey::PythonRuleFact { relation, .. },
+            UnitRowIdentities::None,
+        ) => Ok((
+            PolicyQueryResultRef::StructuralMatch {
+                kind: relation.clone(),
+                location: location.clone(),
+                identity: None,
+            },
+            false,
+        )),
+        (
+            UnitRowItemTerminal::SourcePosition,
+            DetailedCodeQueryDomain::RustPointerFinding,
+            DetailedCodeQueryKey::RustPointerFinding { .. },
+            UnitRowIdentities::Primary(identity),
+        ) => Ok((
+            PolicyQueryResultRef::StructuralMatch {
+                kind: unit_row_label(item, "relation")?.to_owned(),
+                location: location.clone(),
+                identity: validated_provenance_identity(identity.as_ref()),
+            },
+            false,
+        )),
+        (
+            UnitRowItemTerminal::SourcePosition,
+            DetailedCodeQueryDomain::PythonHierarchyFact,
+            DetailedCodeQueryKey::PythonHierarchyFact { .. },
+            UnitRowIdentities::None,
+        ) => {
+            let fact_kind = unit_row_label(item, "fact_kind")?;
+            Ok((
+                PolicyQueryResultRef::StructuralMatch {
+                    kind: fact_kind.to_owned(),
+                    location: location.clone(),
+                    identity: None,
+                },
+                false,
+            ))
+        }
+        // A cross-domain row keeps both identities and both anchors: the row
+        // location is the code row (or a configuration witness's fact), and a
+        // carried configuration fact keeps its own exact span (#3284).
+        (
+            UnitRowItemTerminal::CrossDomain {
+                operator,
+                domain,
+                configuration,
+                dependency_mitigation,
+            },
+            DetailedCodeQueryDomain::CrossDomain,
+            DetailedCodeQueryKey::CrossDomain {
+                id,
+                code_id,
+                configuration_id,
+            },
+            UnitRowIdentities::None,
+        ) => {
+            let configuration_location = configuration
+                .as_ref()
+                .map(|anchor| {
+                    policy_span_location(
+                        WorkspaceRelativePath::try_from_path(std::path::Path::new(
+                            anchor.path.as_ref(),
+                        ))
+                        .map_err(|_| ())?,
+                        &(anchor.start_byte..anchor.end_byte),
+                        anchor.range,
+                    )
+                })
+                .transpose()?;
+            let dependency_mitigation = dependency_mitigation
+                .as_ref()
+                .map(|evidence| {
+                    let configuration_contributors = evidence
+                        .contributors
+                        .iter()
+                        .map(|anchor| {
+                            policy_span_location(
+                                WorkspaceRelativePath::try_from_path(std::path::Path::new(
+                                    anchor.path.as_ref(),
+                                ))
+                                .map_err(|_| ())?,
+                                &(anchor.start_byte..anchor.end_byte),
+                                anchor.range,
+                            )
+                        })
+                        .collect::<Result<Vec<_>, ()>>()?;
+                    Ok::<_, ()>(super::finding::PolicyDependencyMitigation {
+                        dependency_id: evidence.dependency_id.clone(),
+                        owner: evidence.owner.clone(),
+                        mapping_id: evidence.mapping_id.clone(),
+                        mitigated: evidence.mitigated,
+                        effective_configuration: evidence.effective.clone(),
+                        configuration_contributors,
+                    })
+                })
+                .transpose()?;
+            Ok((
+                PolicyQueryResultRef::CrossDomain {
+                    location: location.clone(),
+                    id: id.clone(),
+                    operator: operator.to_string(),
+                    domain: domain.to_string(),
+                    code_id: code_id.clone(),
+                    configuration_id: configuration_id.clone(),
+                    configuration_location,
+                    dependency_mitigation,
                 },
                 false,
             ))
@@ -3613,6 +4123,7 @@ fn adapt_terminal_result(
             DetailedCodeQueryKey::CallSite {
                 caller_fq_name: detailed_caller,
                 callee_fq_name: detailed_callee,
+                ..
             },
             UnitRowIdentities::Call { caller, callee },
         ) if caller_fq_name.as_ref() == detailed_caller.as_str()
@@ -3661,6 +4172,29 @@ fn adapt_terminal_result(
                     input_kind: detailed_input.clone(),
                     parameter_index: *detailed_index,
                     parameter_name: detailed_name.clone(),
+                },
+                false,
+            ))
+        }
+        (
+            UnitRowItemTerminal::GenerationSite { id, ast_id, kind },
+            DetailedCodeQueryDomain::GenerationSite,
+            DetailedCodeQueryKey::GenerationSite {
+                id: detailed_id,
+                ast_id: detailed_ast_id,
+                kind: detailed_kind,
+            },
+            UnitRowIdentities::None,
+        ) if id.as_ref() == detailed_id.as_str()
+            && ast_id.as_deref() == detailed_ast_id.as_deref()
+            && kind.as_ref() == detailed_kind.as_str() =>
+        {
+            Ok((
+                PolicyQueryResultRef::GenerationSite {
+                    location: location.clone(),
+                    id: detailed_id.clone(),
+                    ast_id: detailed_ast_id.clone(),
+                    kind: detailed_kind.clone(),
                 },
                 false,
             ))
@@ -3766,8 +4300,45 @@ fn adapt_terminal_result(
                 false,
             ))
         }
+        (UnitRowItemTerminal::SourcePosition, domain, key, UnitRowIdentities::None)
+            if match_domain(domain).is_none()
+                && item.range.is_some()
+                && key.domain() == domain
+                && range_matches_location(*range, location) =>
+        {
+            Ok((
+                PolicyQueryResultRef::StructuralMatch {
+                    kind: domain.label().to_owned(),
+                    location: location.clone(),
+                    identity: None,
+                },
+                false,
+            ))
+        }
+        (
+            UnitRowItemTerminal::SourcePosition,
+            DetailedCodeQueryDomain::CallableMetrics,
+            DetailedCodeQueryKey::CallableMetrics { .. },
+            UnitRowIdentities::None,
+        ) if item.range.is_some() && range_matches_location(*range, location) => Ok((
+            PolicyQueryResultRef::StructuralMatch {
+                kind: "callable_metrics".to_owned(),
+                location: location.clone(),
+                identity: None,
+            },
+            false,
+        )),
         _ => Err(()),
     }
+}
+
+fn source_backed_analysis_terminal_domain(domain: DetailedCodeQueryDomain) -> bool {
+    matches!(
+        domain,
+        DetailedCodeQueryDomain::CallShape
+            | DetailedCodeQueryDomain::CallableSignature
+            | DetailedCodeQueryDomain::SignatureParameter
+    )
 }
 
 fn proof_certainty(proof: &str) -> (Vec<CertaintyReason>, ProofState) {
@@ -3786,19 +4357,31 @@ fn policy_span_location(
     byte_span: &std::ops::Range<usize>,
     range: CodeQueryRange,
 ) -> Result<PolicySourceLocation, ()> {
-    let bytes = PolicyByteSpan::new(
+    PolicySourceLocation::span_from_coordinates(
+        path,
         u64::try_from(byte_span.start).map_err(|_| ())?,
         u64::try_from(byte_span.end).map_err(|_| ())?,
-    )
-    .map_err(|_| ())?;
-    let region = PolicyDisplayRegion::new(
         u64::try_from(range.start_line).map_err(|_| ())?,
         u64::try_from(range.start_column).map_err(|_| ())?,
         u64::try_from(range.end_line).map_err(|_| ())?,
         u64::try_from(range.end_column).map_err(|_| ())?,
     )
-    .map_err(|_| ())?;
-    Ok(PolicySourceLocation::span(path, bytes, region))
+    .map_err(|_| ())
+}
+
+fn range_matches_location(range: Option<CodeQueryRange>, location: &PolicySourceLocation) -> bool {
+    let Some(range) = range else {
+        return false;
+    };
+    location.region().is_some_and(|region| {
+        range
+            == CodeQueryRange {
+                start_line: region.start_line() as usize,
+                start_column: region.start_column() as usize,
+                end_line: region.end_line() as usize,
+                end_column: region.end_column() as usize,
+            }
+    })
 }
 
 fn adapt_provenance(
@@ -3852,6 +4435,13 @@ fn adapt_provenance_ref(
     value: UnitRowItemRef,
     detailed: UnitRowProvenanceRef,
 ) -> Result<(PolicyQueryResultRef, bool, bool), ()> {
+    let value_kind = value.kind.clone();
+    let kind = value.kind.clone();
+    let item_path = value.path.clone();
+    let python_hierarchy_fact_ref = value.kind.as_ref() == "python_hierarchy_fact";
+    let binding_ref = value.kind.as_ref() == "binding";
+    let lexical_scope_ref = value.kind.as_ref() == "lexical_scope";
+    let occurrence_ref = value.kind.as_ref() == "occurrence";
     let UnitRowProvenanceRef {
         domain,
         key,
@@ -3862,17 +4452,63 @@ fn adapt_provenance_ref(
         source_slice_sha256,
     } = detailed;
     let path = workspace_relative_path(&rel_path)?;
-    if value.path.as_ref() != path.as_str() {
+    if item_path.as_ref() != path.as_str() {
         return Err(());
     }
     let source_exact = domain == DetailedCodeQueryDomain::File
         || (source_slice_sha256.is_some() && byte_span.is_some() && display_range.is_some());
+    if matches!(&value.value, UnitRowItemRefValue::Unsupported)
+        && domain != DetailedCodeQueryDomain::DispatchTarget
+    {
+        let reference = if source_exact {
+            match (byte_span.as_ref(), display_range) {
+                (Some(byte_span), Some(range)) => PolicyQueryResultRef::Unsupported {
+                    query_result_kind: value.kind.to_string(),
+                    location: Some(policy_span_location(path.clone(), byte_span, range)?),
+                },
+                _ => unsupported_provenance_ref(&value.kind, path),
+            }
+        } else {
+            unsupported_provenance_ref(&value.kind, path)
+        };
+        return Ok((reference, true, false));
+    }
     if !source_exact {
-        return Ok((unsupported_provenance_ref(&value.kind, path), true, false));
+        return Ok((unsupported_provenance_ref(&kind, path), true, false));
     }
 
     let mut identity_uncertain = false;
+    let unsupported = matches!(&value.value, UnitRowItemRefValue::Unsupported);
+    let provenance_partial = unsupported
+        && matches!(
+            domain,
+            DetailedCodeQueryDomain::CallShape
+                | DetailedCodeQueryDomain::CallArgumentGroup
+                | DetailedCodeQueryDomain::CallArgument
+                | DetailedCodeQueryDomain::CallBinding
+        );
     let adapted = match (value.value, domain, key, identities) {
+        // Analysis-only rows such as call shapes and call bindings are not
+        // terminal policy result families, but they can still occur in the
+        // provenance of a source-backed structural finding. Preserve their
+        // exact anchor without pretending the policy adapter has a typed
+        // payload for them.
+        (
+            UnitRowItemRefValue::Unsupported,
+            DetailedCodeQueryDomain::CallShape
+            | DetailedCodeQueryDomain::CallArgumentGroup
+            | DetailedCodeQueryDomain::CallArgument
+            | DetailedCodeQueryDomain::CallBinding,
+            _,
+            _,
+        ) => PolicyQueryResultRef::Unsupported {
+            query_result_kind: kind.to_string(),
+            location: Some(policy_span_location(
+                path,
+                byte_span.as_ref().ok_or(())?,
+                display_range.ok_or(())?,
+            )?),
+        },
         (
             UnitRowItemRefValue::StructuralMatch {
                 kind,
@@ -3893,6 +4529,164 @@ fn adapt_provenance_ref(
                     display_range.ok_or(())?,
                 )?,
                 identity: validated_provenance_identity(identity.as_ref()),
+            }
+        }
+        (
+            UnitRowItemRefValue::StructuralMatch {
+                kind,
+                node_range: Some(range),
+            },
+            DetailedCodeQueryDomain::PythonRuleFact,
+            DetailedCodeQueryKey::PythonRuleFact { relation, .. },
+            UnitRowIdentities::None,
+        ) if value_kind.as_ref() == "python_rule_fact"
+            && kind.as_ref() == relation
+            && Some(range) == display_range =>
+        {
+            PolicyQueryResultRef::StructuralMatch {
+                kind: relation,
+                location: policy_span_location(
+                    path,
+                    byte_span.as_ref().ok_or(())?,
+                    display_range.ok_or(())?,
+                )?,
+                identity: None,
+            }
+        }
+        (
+            UnitRowItemRefValue::StructuralMatch {
+                kind,
+                node_range: Some(range),
+            },
+            DetailedCodeQueryDomain::RustPointerFinding,
+            DetailedCodeQueryKey::RustPointerFinding { .. },
+            UnitRowIdentities::Primary(identity),
+        ) if value_kind.as_ref() == "rust_pointer_finding" && Some(range) == display_range => {
+            PolicyQueryResultRef::StructuralMatch {
+                kind: kind.to_string(),
+                location: policy_span_location(
+                    path,
+                    byte_span.as_ref().ok_or(())?,
+                    display_range.ok_or(())?,
+                )?,
+                identity: validated_provenance_identity(identity.as_ref()),
+            }
+        }
+        (
+            UnitRowItemRefValue::Binding {
+                id,
+                ast_id,
+                name,
+                range,
+                ..
+            },
+            DetailedCodeQueryDomain::Binding,
+            DetailedCodeQueryKey::Binding {
+                id: detailed_id,
+                ast_id: detailed_ast_id,
+                name: detailed_name,
+            },
+            UnitRowIdentities::None,
+        ) if binding_ref
+            && id.as_ref() == detailed_id
+            && ast_id.as_deref() == detailed_ast_id.as_deref()
+            && name.as_ref() == detailed_name.as_str()
+            && Some(range) == display_range =>
+        {
+            PolicyQueryResultRef::Binding {
+                id: detailed_id,
+                ast_id: detailed_ast_id,
+                name: detailed_name,
+                location: policy_span_location(
+                    path,
+                    byte_span.as_ref().ok_or(())?,
+                    display_range.ok_or(())?,
+                )?,
+            }
+        }
+        (
+            UnitRowItemRefValue::LexicalScope {
+                id,
+                ast_id,
+                index,
+                range,
+            },
+            DetailedCodeQueryDomain::LexicalScope,
+            DetailedCodeQueryKey::LexicalScope {
+                id: detailed_id,
+                ast_id: detailed_ast_id,
+                index: detailed_index,
+            },
+            UnitRowIdentities::None,
+        ) if lexical_scope_ref
+            && id.as_ref() == detailed_id
+            && ast_id.as_deref() == detailed_ast_id.as_deref()
+            && index == detailed_index
+            && Some(range) == display_range =>
+        {
+            PolicyQueryResultRef::LexicalScope {
+                id: detailed_id,
+                ast_id: detailed_ast_id,
+                index: detailed_index,
+                location: policy_span_location(
+                    path,
+                    byte_span.as_ref().ok_or(())?,
+                    display_range.ok_or(())?,
+                )?,
+            }
+        }
+        (
+            UnitRowItemRefValue::Occurrence {
+                id,
+                ast_id,
+                role,
+                class,
+                namespace,
+                range,
+            },
+            DetailedCodeQueryDomain::Occurrence,
+            DetailedCodeQueryKey::Occurrence {
+                id: detailed_id,
+                ast_id: detailed_ast_id,
+                role: detailed_role,
+            },
+            UnitRowIdentities::None,
+        ) if occurrence_ref
+            && id.as_ref() == detailed_id
+            && ast_id.as_ref() == detailed_ast_id
+            && role.as_ref() == detailed_role
+            && Some(range) == display_range =>
+        {
+            PolicyQueryResultRef::Occurrence {
+                id: detailed_id,
+                ast_id: detailed_ast_id,
+                class: class.to_string(),
+                role: detailed_role,
+                namespace: namespace.to_string(),
+                location: policy_span_location(
+                    path,
+                    byte_span.as_ref().ok_or(())?,
+                    display_range.ok_or(())?,
+                )?,
+            }
+        }
+        (
+            UnitRowItemRefValue::StructuralMatch {
+                kind,
+                node_range: Some(range),
+            },
+            DetailedCodeQueryDomain::PythonHierarchyFact,
+            DetailedCodeQueryKey::PythonHierarchyFact { .. },
+            UnitRowIdentities::None,
+        ) if python_hierarchy_fact_ref && Some(range) == display_range => {
+            PolicyQueryResultRef::StructuralMatch {
+                kind: kind.to_string(),
+                location: policy_span_location(
+                    path,
+                    byte_span.as_ref().ok_or(())?,
+                    display_range.ok_or(())?,
+                )?,
+                identity: None,
             }
         }
         (
@@ -3921,6 +4715,23 @@ fn adapt_provenance_ref(
                 identity: None,
             }
         }
+        (
+            UnitRowItemRefValue::StructuralMatch {
+                kind,
+                node_range: Some(range),
+            },
+            DetailedCodeQueryDomain::CppExpression,
+            DetailedCodeQueryKey::CppExpression { .. },
+            UnitRowIdentities::None,
+        ) if Some(range) == display_range => PolicyQueryResultRef::StructuralMatch {
+            kind: kind.to_string(),
+            location: policy_span_location(
+                path,
+                byte_span.as_ref().ok_or(())?,
+                display_range.ok_or(())?,
+            )?,
+            identity: None,
+        },
         (
             UnitRowItemRefValue::Declaration {
                 kind,
@@ -3955,6 +4766,36 @@ fn adapt_provenance_ref(
             DetailedCodeQueryKey::File,
             UnitRowIdentities::None,
         ) if byte_span.is_none() && display_range.is_none() => PolicyQueryResultRef::file(path),
+        (
+            UnitRowItemRefValue::GenerationSite {
+                id,
+                ast_id,
+                kind,
+                range,
+            },
+            DetailedCodeQueryDomain::GenerationSite,
+            DetailedCodeQueryKey::GenerationSite {
+                id: detailed_id,
+                ast_id: detailed_ast_id,
+                kind: detailed_kind,
+            },
+            UnitRowIdentities::None,
+        ) if id.as_ref() == detailed_id.as_str()
+            && ast_id.as_deref() == detailed_ast_id.as_deref()
+            && kind.as_ref() == detailed_kind.as_str()
+            && Some(range) == display_range =>
+        {
+            PolicyQueryResultRef::GenerationSite {
+                location: policy_span_location(
+                    path,
+                    byte_span.as_ref().ok_or(())?,
+                    display_range.ok_or(())?,
+                )?,
+                id: detailed_id,
+                ast_id: detailed_ast_id,
+                kind: detailed_kind,
+            }
+        }
         (
             UnitRowItemRefValue::ReferenceSite {
                 range,
@@ -4000,6 +4841,7 @@ fn adapt_provenance_ref(
             DetailedCodeQueryKey::CallSite {
                 caller_fq_name: detailed_caller,
                 callee_fq_name: detailed_callee,
+                ..
             },
             UnitRowIdentities::Call { caller, callee },
         ) if caller_fq_name.as_ref() == detailed_caller.as_str()
@@ -4190,9 +5032,27 @@ fn adapt_provenance_ref(
                 capture: detailed_capture,
             }
         }
+        // Dispatch targets are exact semantic rows used to select a call,
+        // but the policy finding envelope has no target-row variant. Keep
+        // the exact source position in provenance without downgrading the
+        // enclosing declaration finding: the target identity was already
+        // validated by the structural filter that produced this row.
+        (
+            UnitRowItemRefValue::Unsupported,
+            DetailedCodeQueryDomain::DispatchTarget,
+            DetailedCodeQueryKey::DispatchTarget { .. },
+            UnitRowIdentities::None,
+        ) => PolicyQueryResultRef::Unsupported {
+            query_result_kind: "dispatch_target".to_owned(),
+            location: Some(policy_span_location(
+                path,
+                byte_span.as_ref().ok_or(())?,
+                display_range.ok_or(())?,
+            )?),
+        },
         _ => return Err(()),
     };
-    Ok((adapted, false, identity_uncertain))
+    Ok((adapted, provenance_partial, identity_uncertain))
 }
 
 fn lower_proof_for_missing_identity(proof: ProofMetadata) -> Result<ProofMetadata, ()> {
@@ -4260,6 +5120,11 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         // use the existing structural finding envelope while selector policies
         // retain the typed endpoint evidence for taint binding.
         DetailedCodeQueryDomain::RuntimeKeyedReadValue => Some(MatchResultDomain::StructuralMatch),
+        // Python rule facts are exact source rows. Their policy finding uses
+        // the structural source envelope; selector adaptation retains the
+        // typed proof and completeness columns.
+        DetailedCodeQueryDomain::PythonRuleFact => Some(MatchResultDomain::StructuralMatch),
+        DetailedCodeQueryDomain::RustPointerFinding => Some(MatchResultDomain::StructuralMatch),
         DetailedCodeQueryDomain::File => Some(MatchResultDomain::File),
         DetailedCodeQueryDomain::Occurrence => Some(MatchResultDomain::Occurrence),
         DetailedCodeQueryDomain::LexicalScope => Some(MatchResultDomain::LexicalScope),
@@ -4274,7 +5139,11 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         // own workspace path and byte span. They are parser evidence, not
         // semantic resolution, so they keep a dedicated result domain instead
         // of borrowing a structural one.
+        DetailedCodeQueryDomain::DependencyEvidence => Some(MatchResultDomain::DependencyEvidence),
         DetailedCodeQueryDomain::ConfigurationFact => Some(MatchResultDomain::ConfigurationFact),
+        // A cross-domain row is anchored at an exact position and carries
+        // both input identities, so it keeps its own result domain (#3284).
+        DetailedCodeQueryDomain::CrossDomain => Some(MatchResultDomain::CrossDomain),
         DetailedCodeQueryDomain::ReferenceEdge => Some(MatchResultDomain::ReferenceEdge),
         DetailedCodeQueryDomain::QualifiedPath => Some(MatchResultDomain::QualifiedPath),
         DetailedCodeQueryDomain::PathSegment => Some(MatchResultDomain::PathSegment),
@@ -4282,6 +5151,14 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         // parameter node. Policy findings retain the existing structural
         // terminal shape so matched-value can bind the exact source span.
         DetailedCodeQueryDomain::DecoratedParameter => Some(MatchResultDomain::StructuralMatch),
+        // Callable metrics are exact source-position rows when coverage is
+        // exact; incomplete and unrecorded rows remain visible to the
+        // selector-quality and query-completion paths.
+        DetailedCodeQueryDomain::CallableMetrics => Some(MatchResultDomain::StructuralMatch),
+        DetailedCodeQueryDomain::CppExpression => Some(MatchResultDomain::StructuralMatch),
+        // This query-local source row is an exact anchor, but the policy
+        // finding envelope remains the existing structural source shape.
+        DetailedCodeQueryDomain::LiteralOccurrence => Some(MatchResultDomain::StructuralMatch),
         DetailedCodeQueryDomain::StateEvent
         | DetailedCodeQueryDomain::FlowRelation
         | DetailedCodeQueryDomain::ControlRelation
@@ -4289,6 +5166,7 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         | DetailedCodeQueryDomain::LoopRelation
         | DetailedCodeQueryDomain::FailureHandlerState
         | DetailedCodeQueryDomain::StatementReachability
+        | DetailedCodeQueryDomain::PendingCleanupFlow
         | DetailedCodeQueryDomain::Guard
         | DetailedCodeQueryDomain::SourceSet
         | DetailedCodeQueryDomain::BuildTarget
@@ -4306,6 +5184,7 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         | DetailedCodeQueryDomain::MemberTargetAnalysis
         | DetailedCodeQueryDomain::ReceiverOutcome
         | DetailedCodeQueryDomain::ReceiverEvidence
+        | DetailedCodeQueryDomain::PointsToCandidate
         | DetailedCodeQueryDomain::CallShape
         | DetailedCodeQueryDomain::CallResult
         | DetailedCodeQueryDomain::CallArgumentGroup
@@ -4320,7 +5199,6 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         | DetailedCodeQueryDomain::NilnessOperation
         | DetailedCodeQueryDomain::SwitchCoverage
         | DetailedCodeQueryDomain::AssignmentRelation
-        | DetailedCodeQueryDomain::ConcurrentAccessConflict
         | DetailedCodeQueryDomain::ClassSetRow
         | DetailedCodeQueryDomain::AbsentMemberFinding
         | DetailedCodeQueryDomain::AbsentMemberWitness
@@ -4335,7 +5213,9 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         | DetailedCodeQueryDomain::DispatchOutcome
         | DetailedCodeQueryDomain::DispatchTarget
         | DetailedCodeQueryDomain::MemberFamily
-        | DetailedCodeQueryDomain::MemberFamilyEdge => None,
+        | DetailedCodeQueryDomain::MemberFamilyEdge
+        | DetailedCodeQueryDomain::BindingInitializerCall => None,
+        DetailedCodeQueryDomain::PythonHierarchyFact => Some(MatchResultDomain::StructuralMatch),
     }
 }
 
@@ -4397,9 +5277,28 @@ fn weak_finding_key(evidence: &UnitRowEvidence, path: &WorkspaceRelativePath) ->
         DetailedCodeQueryKey::RuntimeKeyedReadValue { id } => {
             update_hash(&mut hasher, id.as_bytes());
         }
+        DetailedCodeQueryKey::PythonRuleFact { id, relation } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, relation.as_bytes());
+        }
+        DetailedCodeQueryKey::RustPointerFinding { id } => {
+            update_hash(&mut hasher, id.as_bytes());
+        }
+        DetailedCodeQueryKey::DependencyEvidence { id, .. } => {
+            update_hash(&mut hasher, id.as_bytes())
+        }
         DetailedCodeQueryKey::ConfigurationFact { id, fact_id } => {
             update_hash(&mut hasher, id.as_bytes());
             update_hash(&mut hasher, fact_id.as_bytes());
+        }
+        DetailedCodeQueryKey::CrossDomain {
+            id,
+            code_id,
+            configuration_id,
+        } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_optional_hash(&mut hasher, code_id.as_deref());
+            update_optional_hash(&mut hasher, configuration_id.as_deref());
         }
         DetailedCodeQueryKey::ProgramPoint { id, procedure_id }
         | DetailedCodeQueryKey::ControlEdge { id, procedure_id } => {
@@ -4419,6 +5318,10 @@ fn weak_finding_key(evidence: &UnitRowEvidence, path: &WorkspaceRelativePath) ->
         DetailedCodeQueryKey::FlowWitness { id, endpoint_id } => {
             update_hash(&mut hasher, id.as_bytes());
             update_hash(&mut hasher, endpoint_id.as_bytes());
+        }
+        DetailedCodeQueryKey::PointsToCandidate { id, site_id } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, site_id.as_bytes());
         }
         DetailedCodeQueryKey::File => {}
         DetailedCodeQueryKey::Occurrence { id, ast_id, role } => {
@@ -4454,10 +5357,37 @@ fn weak_finding_key(evidence: &UnitRowEvidence, path: &WorkspaceRelativePath) ->
             id,
             form,
             exported_name,
+            local_definition,
         } => {
             update_hash(&mut hasher, id.as_bytes());
             update_hash(&mut hasher, form.as_bytes());
             update_hash(&mut hasher, exported_name.as_bytes());
+            match local_definition {
+                None => update_hash(&mut hasher, b"no_local_definition"),
+                Some(DetailedCodeQueryExportLocalDefinition::Undefined) => {
+                    update_hash(&mut hasher, b"undefined")
+                }
+                Some(DetailedCodeQueryExportLocalDefinition::Unknown) => {
+                    update_hash(&mut hasher, b"unknown")
+                }
+                Some(DetailedCodeQueryExportLocalDefinition::Defined {
+                    binding_name,
+                    binding_kind,
+                    start_byte,
+                    end_byte,
+                    range,
+                }) => {
+                    update_hash(&mut hasher, b"defined");
+                    update_hash(&mut hasher, binding_name.as_bytes());
+                    update_hash(&mut hasher, binding_kind.as_bytes());
+                    update_hash(&mut hasher, &start_byte.to_be_bytes());
+                    update_hash(&mut hasher, &end_byte.to_be_bytes());
+                    update_hash(&mut hasher, &range.start_line.to_be_bytes());
+                    update_hash(&mut hasher, &range.start_column.to_be_bytes());
+                    update_hash(&mut hasher, &range.end_line.to_be_bytes());
+                    update_hash(&mut hasher, &range.end_column.to_be_bytes());
+                }
+            }
         }
         DetailedCodeQueryKey::DeclarationState {
             id,
@@ -4591,9 +5521,11 @@ fn weak_finding_key(evidence: &UnitRowEvidence, path: &WorkspaceRelativePath) ->
             update_hash(&mut hasher, target_fq_name.as_bytes());
         }
         DetailedCodeQueryKey::CallSite {
+            site_id,
             caller_fq_name,
             callee_fq_name,
         } => {
+            update_optional_hash(&mut hasher, site_id.as_deref());
             update_hash(&mut hasher, caller_fq_name.as_bytes());
             update_hash(&mut hasher, callee_fq_name.as_bytes());
         }
@@ -4646,25 +5578,29 @@ fn weak_finding_key(evidence: &UnitRowEvidence, path: &WorkspaceRelativePath) ->
         | DetailedCodeQueryKey::AssignmentRelation { id, procedure_id }
         | DetailedCodeQueryKey::LoopRelation { id, procedure_id }
         | DetailedCodeQueryKey::StatementReachability { id, procedure_id }
+        | DetailedCodeQueryKey::PendingCleanupFlow { id, procedure_id }
         | DetailedCodeQueryKey::DetachedTaskTransfer { id, procedure_id } => {
             update_hash(&mut hasher, id.as_bytes());
             update_hash(&mut hasher, procedure_id.as_bytes());
         }
-        DetailedCodeQueryKey::ConcurrentAccessConflict {
-            id,
-            root_procedure_id,
-        } => {
-            update_hash(&mut hasher, id.as_bytes());
-            update_hash(&mut hasher, root_procedure_id.as_bytes());
-        }
         DetailedCodeQueryKey::ClassSetRow { id }
         | DetailedCodeQueryKey::ResultSubjectUse { id }
-        | DetailedCodeQueryKey::AbsentMemberFinding { id } => {
+        | DetailedCodeQueryKey::AbsentMemberFinding { id }
+        | DetailedCodeQueryKey::CppExpression { id } => {
             update_hash(&mut hasher, id.as_bytes());
         }
         DetailedCodeQueryKey::AbsentMemberWitness { id, finding_id } => {
             update_hash(&mut hasher, id.as_bytes());
             update_hash(&mut hasher, finding_id.as_bytes());
+        }
+        DetailedCodeQueryKey::BindingInitializerCall {
+            id,
+            establishment_event_id,
+            site_ast_id,
+        } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, establishment_event_id.as_bytes());
+            update_hash(&mut hasher, site_ast_id.as_bytes());
         }
         DetailedCodeQueryKey::ProcedureEffect {
             id,
@@ -4687,6 +5623,18 @@ fn weak_finding_key(evidence: &UnitRowEvidence, path: &WorkspaceRelativePath) ->
         } => {
             update_hash(&mut hasher, id.as_bytes());
             update_hash(&mut hasher, declaration_id.as_bytes());
+            update_hash(&mut hasher, site_id.as_bytes());
+        }
+        DetailedCodeQueryKey::LiteralOccurrence { id } => {
+            update_hash(&mut hasher, id.as_bytes());
+        }
+        DetailedCodeQueryKey::CallableMetrics {
+            id,
+            callable_id,
+            site_id,
+        } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_optional_hash(&mut hasher, callable_id.as_deref());
             update_hash(&mut hasher, site_id.as_bytes());
         }
         DetailedCodeQueryKey::SignatureParameter { id, signature_id } => {
@@ -4740,6 +5688,10 @@ fn weak_finding_key(evidence: &UnitRowEvidence, path: &WorkspaceRelativePath) ->
             update_hash(&mut hasher, member_id.as_bytes());
             update_hash(&mut hasher, &ordinal.to_le_bytes());
         }
+        DetailedCodeQueryKey::PythonHierarchyFact { id, root_id } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, root_id.as_bytes());
+        }
     }
     let digest: [u8; 32] = hasher.finalize().into();
     let mut encoded = String::with_capacity(64);
@@ -4749,15 +5701,6 @@ fn weak_finding_key(evidence: &UnitRowEvidence, path: &WorkspaceRelativePath) ->
     }
     OpaqueFindingKey::try_new("code-query", encoded)
         .expect("a SHA-256 key and static namespace satisfy opaque-key bounds")
-}
-
-fn update_hash(hasher: &mut Sha256, value: &[u8]) {
-    hasher.update(
-        u64::try_from(value.len())
-            .expect("usize fits in u64 on supported targets")
-            .to_be_bytes(),
-    );
-    hasher.update(value);
 }
 
 fn update_optional_hash(hasher: &mut Sha256, value: Option<&str>) {
@@ -4837,6 +5780,7 @@ pub(super) fn incomplete_reason_for_code(code: &CodeQueryDiagnosticCode) -> Poli
         CodeQueryDiagnosticCode::UnsupportedStructuralFeature
         | CodeQueryDiagnosticCode::MissingStructuralAdapter
         | CodeQueryDiagnosticCode::UnsupportedImportAnalysis
+        | CodeQueryDiagnosticCode::DynamicImportTarget
         | CodeQueryDiagnosticCode::SemanticWorkspaceRequired
         | CodeQueryDiagnosticCode::SemanticCapabilityUnsupported
         | CodeQueryDiagnosticCode::TypestateCapabilityUnsupported
@@ -4850,6 +5794,7 @@ pub(super) fn incomplete_reason_for_code(code: &CodeQueryDiagnosticCode) -> Poli
         | CodeQueryDiagnosticCode::MaterializationAxisUnsupported
         | CodeQueryDiagnosticCode::MaterializationDerivationIncomplete
         | CodeQueryDiagnosticCode::ResolutionTraceIncomplete
+        | CodeQueryDiagnosticCode::PythonHierarchyDerivationIncomplete
         | CodeQueryDiagnosticCode::EdgeAxisUnsupported
         | CodeQueryDiagnosticCode::EdgeDerivationIncomplete
         | CodeQueryDiagnosticCode::FlowStateAxisUnsupported
@@ -4858,15 +5803,24 @@ pub(super) fn incomplete_reason_for_code(code: &CodeQueryDiagnosticCode) -> Poli
         | CodeQueryDiagnosticCode::RewritePathDerivationIncomplete
         | CodeQueryDiagnosticCode::ControlRelationDerivationIncomplete
         | CodeQueryDiagnosticCode::BranchRelationDerivationIncomplete
+        // Syntax recovery may have removed a selected node, and no budget
+        // recovers a node the parse never produced (#3777).
+        | CodeQueryDiagnosticCode::RecoveredSyntaxIncomplete
         | CodeQueryDiagnosticCode::LoopRelationDerivationIncomplete
         | CodeQueryDiagnosticCode::FailureHandlerDerivationIncomplete
         | CodeQueryDiagnosticCode::StatementReachabilityDerivationIncomplete
+        | CodeQueryDiagnosticCode::PendingCleanupFlowDerivationIncomplete
         | CodeQueryDiagnosticCode::ControlRelationExitPartitionPartial
         // The build model behind a topology row could not be read in full, or
         // no provider answers the axis at all. Either way the absence of a row
         // is not evidence of an absent declaration (#2448).
         | CodeQueryDiagnosticCode::TopologyDerivationIncomplete
         | CodeQueryDiagnosticCode::TopologyOwnershipAmbiguous
+        // A cross-domain binding the resolver did not prove, or a key
+        // expression with no structured decoder, hides a correlation that no
+        // larger budget would recover (#3284).
+        | CodeQueryDiagnosticCode::CrossDomainBindingUnproven
+        | CodeQueryDiagnosticCode::CrossDomainKeyUnsupported
         | CodeQueryDiagnosticCode::IdentityAxisUnsupported
         | CodeQueryDiagnosticCode::PathDerivationIncomplete
         // An effect derivation that could not establish every callee is a
@@ -4960,6 +5914,14 @@ pub(super) fn incomplete_reason_for_code(code: &CodeQueryDiagnosticCode) -> Poli
         CodeQueryDiagnosticCode::JsxProjectionIncomplete => {
             PolicyIncompleteReason::PartialDiscovery
         }
+        // A declared document that was not searched, produced no facts, or
+        // only partly recovered leaves the correlation's configuration side
+        // undiscovered (#3284). Ambiguity is advisory and never blocks a
+        // verdict, but every code needs a reason.
+        CodeQueryDiagnosticCode::CrossDomainDocumentIncomplete
+        | CodeQueryDiagnosticCode::CrossDomainCorrelationAmbiguous => {
+            PolicyIncompleteReason::PartialDiscovery
+        }
     }
 }
 
@@ -4984,6 +5946,16 @@ fn adapt_query_diagnostic(
             PolicyDiagnosticImpact::RunFailed,
         ),
     };
+    let primary = diagnostic
+        .source
+        .as_ref()
+        .map(|source| {
+            let path = WorkspaceRelativePath::new(&source.path)
+                .map_err(|_| ReportValueError::InvalidWorkspacePath)?;
+            policy_span_location(path, &(source.start_byte..source.end_byte), source.range)
+                .map_err(|_| ReportValueError::ResultLocationMustHaveSpan)
+        })
+        .transpose()?;
     PolicyDiagnostic::try_new(
         PolicyDiagnosticCode::CodeQuery {
             code: diagnostic.code,
@@ -4991,7 +5963,7 @@ fn adapt_query_diagnostic(
         severity,
         impact,
         diagnostic.message.clone(),
-        None,
+        primary,
         Vec::new(),
     )
 }
@@ -5034,6 +6006,20 @@ fn work_report(
     retained_findings: usize,
     omitted_findings_lower_bound: u64,
 ) -> PolicyWorkReport {
+    work_report_with_metrics(
+        work,
+        retained_findings,
+        omitted_findings_lower_bound,
+        Vec::new(),
+    )
+}
+
+fn work_report_with_metrics(
+    work: CodeQueryExecutionWork,
+    retained_findings: usize,
+    omitted_findings_lower_bound: u64,
+    metrics: Vec<PolicyWorkMetric>,
+) -> PolicyWorkReport {
     PolicyWorkReport::try_new(
         work.scanned_files,
         work.scanned_source_bytes,
@@ -5043,9 +6029,9 @@ fn work_report(
         u64::try_from(retained_findings).expect("usize fits in u64 on supported targets"),
         omitted_findings_lower_bound,
         0,
-        Vec::new(),
+        metrics,
     )
-    .expect("an empty metric set always satisfies the work-report schema")
+    .expect("the work metrics satisfy the work-report schema")
 }
 
 fn relational_work_report(
@@ -5087,18 +6073,12 @@ fn relational_work_report(
             .expect("static relational work metric names are canonical")
     })
     .collect();
-    PolicyWorkReport::try_new(
-        work.scanned_files,
-        work.scanned_source_bytes,
-        work.fact_nodes,
-        work.pipeline_rows,
-        work.examined_references,
-        u64::try_from(retained_findings).expect("usize fits in u64 on supported targets"),
+    work_report_with_metrics(
+        work,
+        retained_findings,
         omitted_findings_lower_bound,
-        0,
         metrics,
     )
-    .expect("the fixed relational metric set satisfies the work-report schema")
 }
 
 #[cfg(test)]

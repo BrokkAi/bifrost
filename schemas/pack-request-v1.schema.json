@@ -1,0 +1,163 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bifrost.dev/schemas/pack-request-v1.schema.json",
+  "title": "Open Pack Acquisition Request",
+  "description": "A caller-supplied request to select one policy pack release and its exact dependencies.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "request_schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "pack_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "repository": {
+      "$ref": "#/$defs/RepositoryUrl"
+    },
+    "inventory": {
+      "$ref": "#/$defs/InventoryPin"
+    },
+    "selection": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/StrictSelection"
+        },
+        {
+          "$ref": "#/$defs/PreferredSelection"
+        }
+      ]
+    },
+    "dependencies": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/DependencyPin"
+      }
+    }
+  },
+  "required": [
+    "request_schema_version",
+    "pack_id",
+    "repository",
+    "selection"
+  ],
+  "$defs": {
+    "RepositoryUrl": {
+      "type": "string",
+      "format": "uri",
+      "pattern": "^https://github\\.com/[^/?#]+/[^/?#]+$",
+      "description": "An HTTPS URL for one GitHub owner and repository, with no credentials, port, query, or fragment."
+    },
+    "InventoryUrl": {
+      "type": "string",
+      "format": "uri",
+      "pattern": "^https://[^/@?#]+(/[^?#]*)?$",
+      "description": "An HTTPS URL for a trusted inventory mirror, with no credentials, query, or fragment."
+    },
+    "Sha256": {
+      "type": "string",
+      "pattern": "^[A-Fa-f0-9]{64}$"
+    },
+    "SemVer": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?(\\+[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$",
+      "description": "A semantic version in major.minor.patch form, with optional prerelease and build metadata. The request parser applies the full SemVer rules."
+    },
+    "InventoryPin": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "url": {
+          "$ref": "#/$defs/InventoryUrl"
+        },
+        "sha256": {
+          "$ref": "#/$defs/Sha256"
+        }
+      },
+      "required": [
+        "url",
+        "sha256"
+      ]
+    },
+    "StrictSelection": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "strict"
+          ]
+        },
+        "release_version": {
+          "$ref": "#/$defs/SemVer"
+        },
+        "manifest_sha256": {
+          "$ref": "#/$defs/Sha256"
+        }
+      },
+      "required": [
+        "mode",
+        "release_version",
+        "manifest_sha256"
+      ]
+    },
+    "PreferredSelection": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "preferred"
+          ]
+        },
+        "preferred_version": {
+          "$ref": "#/$defs/SemVer"
+        },
+        "allowed_versions": {
+          "type": "string",
+          "minLength": 1,
+          "description": "A SemVer version requirement. When omitted, every version is allowed."
+        },
+        "channel": {
+          "type": "string",
+          "enum": [
+            "stable",
+            "prerelease"
+          ],
+          "description": "Stable excludes GitHub prereleases and SemVer prerelease versions. Prerelease admits both."
+        }
+      },
+      "required": [
+        "mode"
+      ]
+    },
+    "DependencyPin": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "pack_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "repository": {
+          "$ref": "#/$defs/RepositoryUrl"
+        },
+        "release_version": {
+          "$ref": "#/$defs/SemVer"
+        },
+        "manifest_sha256": {
+          "$ref": "#/$defs/Sha256"
+        }
+      },
+      "required": [
+        "pack_id",
+        "repository",
+        "manifest_sha256"
+      ]
+    }
+  }
+}

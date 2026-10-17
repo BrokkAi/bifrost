@@ -108,11 +108,11 @@ clippy_pid=$!
 # under nextest, which only strengthens their isolation assumptions).
 step "cargo nextest run --workspace --max-fail 100"
 nextest_status=0
-cargo nextest run --workspace --max-fail 100 || nextest_status=$?
+BIFROST_OPEN_PACKS_DISABLE="${BIFROST_OPEN_PACKS_DISABLE-1}" cargo nextest run --workspace --max-fail 100 || nextest_status=$?
 
 step "cargo test --workspace --doc"
 doc_status=0
-cargo test --workspace --doc || doc_status=$?
+BIFROST_OPEN_PACKS_DISABLE="${BIFROST_OPEN_PACKS_DISABLE-1}" cargo test --workspace --doc || doc_status=$?
 
 step "waiting for all-features clippy"
 clippy_status=0

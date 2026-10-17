@@ -14,6 +14,7 @@ use brokk_bifrost_analysis::schema_version::SchemaVersionResolution;
 use brokk_bifrost_rql::structural::CodeQuery;
 
 use super::canonical_loaded;
+use super::catalog::{RegisteredTaintCatalog, endpoint_binding_to_port};
 use super::definition::*;
 use super::identity::*;
 use super::source::PolicySourceIdentity;
@@ -175,12 +176,20 @@ pub struct ResolvedCatalogIdentity {
 }
 
 impl ResolvedCatalogIdentity {
+    pub(crate) fn from_catalog(catalog: &RegisteredTaintCatalog) -> Result<Self, LoadedModelError> {
+        Self::try_new(
+            catalog.identity().name.clone(),
+            catalog.identity().version,
+            catalog.semantic_hash(),
+        )
+    }
+
     pub fn try_new(
         name: PolicyId,
         version: u32,
         semantic_hash: TaintCatalogHash,
     ) -> Result<Self, LoadedModelError> {
-        if version == 0 {
+        if !catalog_version_is_valid(version) {
             return Err(LoadedModelError::ZeroCatalogVersion);
         }
         Ok(Self {
@@ -284,6 +293,11 @@ pub enum EndpointOrigin {
     },
 }
 
+fn sort_dedup<T: Ord>(values: &mut Vec<T>) {
+    values.sort();
+    values.dedup();
+}
+
 /// One endpoint leaf after all authoring-source forms have been normalized.
 #[derive(Debug, Clone)]
 pub struct ResolvedEndpointDependency {
@@ -309,8 +323,7 @@ impl ResolvedEndpointDependency {
         analysis_projection_hash: EndpointAnalysisProjectionHash,
         mut origins: Vec<EndpointOrigin>,
     ) -> Self {
-        origins.sort();
-        origins.dedup();
+        sort_dedup(&mut origins);
         Self {
             identity,
             definition_schema,
@@ -576,8 +589,7 @@ impl ResolvedEndpointSetDependency {
         semantic_hash: EndpointSetSemanticHash,
         mut entries: Vec<PolicyDependencyPath>,
     ) -> Self {
-        entries.sort();
-        entries.dedup();
+        sort_dedup(&mut entries);
         Self {
             source,
             semantic_hash,
@@ -652,8 +664,7 @@ impl<T> ResolvedTaintEndpoint<T> {
         definition: T,
         mut origins: Vec<EndpointOrigin>,
     ) -> Self {
-        origins.sort();
-        origins.dedup();
+        sort_dedup(&mut origins);
         Self {
             identity,
             semantic_hash,
@@ -671,6 +682,7 @@ pub struct ResolvedTaintSourceDefinition {
     pub selector_path: PolicySelectorPath,
     pub bind: PolicyPort,
     pub labels: Vec<TaintLabel>,
+    pub threat_model: Option<TaintThreatModel>,
     pub evidence: Option<TaintSourceEvidence>,
 }
 
@@ -683,6 +695,49 @@ pub struct ResolvedTaintSinkDefinition {
     pub accepts: Vec<TaintLabel>,
     pub tags: Vec<TaintTag>,
     pub impacts: Vec<TaintImpact>,
+}
+
+trait ResolvedTaintEndpointDefinition {
+    fn display_name(&self) -> &str;
+    fn categories(&self) -> &[PolicyCategoryId];
+    fn selector_path(&self) -> &PolicySelectorPath;
+    fn binding(&self) -> &PolicyPort;
+}
+
+impl ResolvedTaintEndpointDefinition for ResolvedTaintSourceDefinition {
+    fn display_name(&self) -> &str {
+        &self.display_name
+    }
+
+    fn categories(&self) -> &[PolicyCategoryId] {
+        &self.categories
+    }
+
+    fn selector_path(&self) -> &PolicySelectorPath {
+        &self.selector_path
+    }
+
+    fn binding(&self) -> &PolicyPort {
+        &self.bind
+    }
+}
+
+impl ResolvedTaintEndpointDefinition for ResolvedTaintSinkDefinition {
+    fn display_name(&self) -> &str {
+        &self.display_name
+    }
+
+    fn categories(&self) -> &[PolicyCategoryId] {
+        &self.categories
+    }
+
+    fn selector_path(&self) -> &PolicySelectorPath {
+        &self.selector_path
+    }
+
+    fn binding(&self) -> &PolicyPort {
+        &self.dangerous_operand
+    }
 }
 
 /// One policy-local or catalog auxiliary taint entry after composition.
@@ -705,8 +760,7 @@ impl<T> ResolvedTaintAuxiliary<T> {
         definition: T,
         mut origins: Vec<EndpointOrigin>,
     ) -> Self {
-        origins.sort();
-        origins.dedup();
+        sort_dedup(&mut origins);
         Self {
             identity,
             selector_path,
@@ -800,14 +854,24 @@ impl ResolvedFindingCombination {
     }
 }
 
+/// A resolved policy-specific value-type barrier. It has no selector or ports.
+#[derive(Debug, Clone)]
+pub struct ResolvedTaintBarrier {
+    pub id: TaintEntryId,
+    pub value_type: ValueTypePredicate,
+    pub origins: Vec<EndpointOrigin>,
+}
+
 /// Finite, set-oriented taint input. It never contains a source/sink pair product.
 #[derive(Debug, Clone)]
 pub struct ResolvedTaintPolicySpec {
     pub mode: MayMode,
     pub call_modeling: CallModelingSpec,
+    pub threat_models: Vec<TaintThreatModel>,
     pub sources: Vec<ResolvedTaintEndpoint<ResolvedTaintSourceDefinition>>,
     pub sinks: Vec<ResolvedTaintEndpoint<ResolvedTaintSinkDefinition>>,
     pub sanitizers: Vec<ResolvedTaintAuxiliary<ResolvedTaintSanitizerDefinition>>,
+    pub barriers: Vec<ResolvedTaintBarrier>,
     /// Framework entry points (#2692). Each is a full source-shaped endpoint
     /// whose `bind` names the tainted formal parameter of the *selected
     /// declaration* rather than a port of a selected call.
@@ -844,6 +908,7 @@ impl ResolvedTaintPolicySpec {
     pub fn new(
         mode: MayMode,
         call_modeling: CallModelingSpec,
+        mut threat_models: Vec<TaintThreatModel>,
         mut sources: Vec<ResolvedTaintEndpoint<ResolvedTaintSourceDefinition>>,
         mut sinks: Vec<ResolvedTaintEndpoint<ResolvedTaintSinkDefinition>>,
         mut sanitizers: Vec<ResolvedTaintAuxiliary<ResolvedTaintSanitizerDefinition>>,
@@ -855,10 +920,12 @@ impl ResolvedTaintPolicySpec {
         mut catalogs: Vec<ResolvedCatalogIdentity>,
         mut match_manifests: Vec<ResolvedMatchDirectoryManifest>,
         mut finding_combinations: Vec<ResolvedFindingCombination>,
+        mut barriers: Vec<ResolvedTaintBarrier>,
     ) -> Self {
         sources.sort_by(|left, right| left.identity.cmp(&right.identity));
         sinks.sort_by(|left, right| left.identity.cmp(&right.identity));
         sanitizers.sort_by(|left, right| left.identity.cmp(&right.identity));
+        barriers.sort_by(|left, right| left.id.cmp(&right.id));
         entry_points.sort_by(|left, right| left.identity.cmp(&right.identity));
         transforms.sort_by(|left, right| left.identity.cmp(&right.identity));
         external_models.sort_by(|left, right| left.identity.cmp(&right.identity));
@@ -866,14 +933,18 @@ impl ResolvedTaintPolicySpec {
         store_reads.sort_by(|left, right| left.identity.cmp(&right.identity));
         catalogs.sort();
         catalogs.dedup();
+        threat_models.sort();
+        threat_models.dedup();
         match_manifests.sort_by(|left, right| left.path.cmp(&right.path));
         finding_combinations.sort_by(|left, right| left.id.cmp(&right.id));
         Self {
             mode,
             call_modeling,
+            threat_models,
             sources,
             sinks,
             sanitizers,
+            barriers,
             entry_points,
             transforms,
             external_models,
@@ -946,8 +1017,7 @@ impl ResolvedTypestateSubject {
         analysis_projection_hash: EndpointAnalysisProjectionHash,
         mut origins: Vec<EndpointOrigin>,
     ) -> Self {
-        origins.sort();
-        origins.dedup();
+        sort_dedup(&mut origins);
         Self {
             identity,
             selector_path,
@@ -1012,10 +1082,8 @@ impl ResolvedTypestateEventSpec {
         mut applies_to_subjects: Vec<ResolvedEndpointIdentity>,
         mut supersedes: Vec<TypestateEventId>,
     ) -> Self {
-        applies_to_subjects.sort();
-        applies_to_subjects.dedup();
-        supersedes.sort();
-        supersedes.dedup();
+        sort_dedup(&mut applies_to_subjects);
+        sort_dedup(&mut supersedes);
         Self {
             id,
             trigger,
@@ -1031,6 +1099,7 @@ pub enum ResolvedTypestateEventTrigger {
         selector_path: PolicySelectorPath,
         subject: TypestateCallBinding,
         phase: EndpointObservationPhase,
+        argument_condition: Option<TypestateArgumentCondition>,
     },
     MatchEndpoints {
         endpoints: Vec<ResolvedEndpointIdentity>,
@@ -1058,12 +1127,9 @@ impl ResolvedTypestateTerminalExpectationSpec {
         mut expected_states: Vec<TypestateStateId>,
         mut supersedes: Vec<TypestateExpectationId>,
     ) -> Self {
-        applies_to_subjects.sort();
-        applies_to_subjects.dedup();
-        expected_states.sort();
-        expected_states.dedup();
-        supersedes.sort();
-        supersedes.dedup();
+        sort_dedup(&mut applies_to_subjects);
+        sort_dedup(&mut expected_states);
+        sort_dedup(&mut supersedes);
         Self {
             id,
             trigger,
@@ -1687,8 +1753,16 @@ fn validate_resolved_taint(
 ) -> Result<(), LoadedModelError> {
     let policy_id = &definition.metadata.id;
     let segments = definition.analysis.set_segments();
-    if authored.mode != resolved.mode || authored.call_modeling != resolved.call_modeling {
-        return invalid("resolved taint mode/call modeling differs from the authored policy");
+    let mut authored_threat_models = authored.threat_models.clone();
+    authored_threat_models.sort();
+    authored_threat_models.dedup();
+    if authored.mode != resolved.mode
+        || authored.call_modeling != resolved.call_modeling
+        || authored_threat_models != resolved.threat_models
+    {
+        return invalid(
+            "resolved taint mode/call modeling/threat-model selection differs from the authored policy",
+        );
     }
     if resolved.sources.is_empty() && authored.sources.include_files.is_empty()
         || resolved.sinks.is_empty() && authored.sinks.include_files.is_empty()
@@ -1868,6 +1942,7 @@ fn validate_resolved_taint(
             || endpoint.definition.selector_path != expected_path
             || endpoint.definition.bind != source.bind
             || !same_set(&endpoint.definition.labels, &source.labels)
+            || endpoint.definition.threat_model != source.threat_model
             || endpoint.definition.evidence != source.evidence
         {
             return invalid("resolved local taint source differs from its authored definition");
@@ -1900,6 +1975,18 @@ fn validate_resolved_taint(
         }
     }
 
+    for authored_entry in &authored.barriers.entries {
+        let entry = resolved
+            .barriers
+            .iter()
+            .find(|entry| entry.id == authored_entry.id)
+            .ok_or(LoadedModelError::InvalidResolvedModel {
+                reason: "authored value-type barrier is absent from the resolved set",
+            })?;
+        if entry.value_type != authored_entry.value_type {
+            return invalid("resolved value-type barrier differs from its authored definition");
+        }
+    }
     for authored_entry in &authored.sanitizers.entries {
         let identity = ResolvedEndpointIdentity::Local {
             policy_id: policy_id.clone(),
@@ -2103,7 +2190,7 @@ fn validate_resolved_taint_source(
     endpoint: &ResolvedTaintEndpoint<ResolvedTaintSourceDefinition>,
     dependencies: &HashMap<&ResolvedEndpointIdentity, &ResolvedEndpointDependency>,
 ) -> Result<(), LoadedModelError> {
-    if endpoint.origins.is_empty() || contains_duplicates(endpoint.origins.iter().cloned()) {
+    if !taint_endpoint_origins_are_valid(&endpoint.origins) {
         return invalid("resolved taint source requires duplicate-free provenance");
     }
     if endpoint.definition.labels.is_empty()
@@ -2118,7 +2205,11 @@ fn validate_resolved_taint_source(
             .ok_or(LoadedModelError::InvalidResolvedModel {
                 reason: "resolved taint source has no endpoint dependency",
             })?;
-    let EndpointTaintSemantics::Source { labels, evidence } = dependency
+    let EndpointTaintSemantics::Source {
+        labels,
+        threat_model,
+        evidence,
+    } = dependency
         .model
         .taint
         .as_ref()
@@ -2128,19 +2219,10 @@ fn validate_resolved_taint_source(
     else {
         return invalid("resolved taint source dependency has sink semantics");
     };
-    if dependency.model.role != EndpointRole::Source
-        || endpoint.semantic_hash != dependency.semantic_hash
-        || endpoint.analysis_projection_hash != dependency.analysis_projection_hash
-        || endpoint.definition.selector_path != dependency.selector_path
-        || endpoint.definition.display_name != dependency.model.display_name
-        || !same_set(
-            &endpoint.definition.categories,
-            &dependency.model.categories,
-        )
-        || endpoint.definition.bind != endpoint_binding_to_port(&dependency.model.binding)
+    if !taint_endpoint_matches_dependency(endpoint, dependency, EndpointRole::Source)
         || !same_set(&endpoint.definition.labels, labels)
+        || endpoint.definition.threat_model != *threat_model
         || endpoint.definition.evidence != *evidence
-        || !same_set(&endpoint.origins, &dependency.origins)
     {
         return invalid("resolved taint source differs from its endpoint dependency");
     }
@@ -2151,7 +2233,7 @@ fn validate_resolved_taint_sink(
     endpoint: &ResolvedTaintEndpoint<ResolvedTaintSinkDefinition>,
     dependencies: &HashMap<&ResolvedEndpointIdentity, &ResolvedEndpointDependency>,
 ) -> Result<(), LoadedModelError> {
-    if endpoint.origins.is_empty() || contains_duplicates(endpoint.origins.iter().cloned()) {
+    if !taint_endpoint_origins_are_valid(&endpoint.origins) {
         return invalid("resolved taint sink requires duplicate-free provenance");
     }
     if endpoint.definition.accepts.is_empty()
@@ -2182,25 +2264,36 @@ fn validate_resolved_taint_sink(
     else {
         return invalid("resolved taint sink dependency has source semantics");
     };
-    if dependency.model.role != EndpointRole::Sink
-        || endpoint.semantic_hash != dependency.semantic_hash
-        || endpoint.analysis_projection_hash != dependency.analysis_projection_hash
-        || endpoint.definition.selector_path != dependency.selector_path
-        || endpoint.definition.display_name != dependency.model.display_name
-        || !same_set(
-            &endpoint.definition.categories,
-            &dependency.model.categories,
-        )
-        || endpoint.definition.dangerous_operand
-            != endpoint_binding_to_port(&dependency.model.binding)
+    if !taint_endpoint_matches_dependency(endpoint, dependency, EndpointRole::Sink)
         || !same_set(&endpoint.definition.accepts, accepts)
         || !same_set(&endpoint.definition.tags, tags)
         || !same_set(&endpoint.definition.impacts, impacts)
-        || !same_set(&endpoint.origins, &dependency.origins)
     {
         return invalid("resolved taint sink differs from its endpoint dependency");
     }
     Ok(())
+}
+
+fn taint_endpoint_origins_are_valid(origins: &[EndpointOrigin]) -> bool {
+    !origins.is_empty() && !contains_duplicates(origins.iter().cloned())
+}
+
+fn taint_endpoint_matches_dependency<T: ResolvedTaintEndpointDefinition>(
+    endpoint: &ResolvedTaintEndpoint<T>,
+    dependency: &ResolvedEndpointDependency,
+    role: EndpointRole,
+) -> bool {
+    dependency.model.role == role
+        && endpoint.semantic_hash == dependency.semantic_hash
+        && endpoint.analysis_projection_hash == dependency.analysis_projection_hash
+        && endpoint.definition.selector_path() == &dependency.selector_path
+        && endpoint.definition.display_name() == dependency.model.display_name
+        && same_set(
+            endpoint.definition.categories(),
+            &dependency.model.categories,
+        )
+        && endpoint.definition.binding() == &endpoint_binding_to_port(&dependency.model.binding)
+        && same_set(&endpoint.origins, &dependency.origins)
 }
 
 fn validate_resolved_typestate(
@@ -2470,12 +2563,7 @@ fn validate_event_trigger(
             }
         }
         ResolvedTypestateEventTrigger::MatchEndpoints { endpoints, .. } => {
-            if endpoints.is_empty()
-                || contains_duplicates(endpoints.iter().cloned())
-                || !endpoints
-                    .iter()
-                    .all(|identity| dependencies.contains_key(identity))
-            {
+            if !resolved_endpoints_are_valid(endpoints, dependencies) {
                 return invalid("resolved typestate endpoint event is empty or unresolved");
             }
         }
@@ -2489,15 +2577,22 @@ fn validate_terminal_trigger(
     dependencies: &HashMap<&ResolvedEndpointIdentity, &ResolvedEndpointDependency>,
 ) -> Result<(), LoadedModelError> {
     if let ResolvedTypestateTerminalTrigger::MatchEndpoints { endpoints, .. } = trigger
-        && (endpoints.is_empty()
-            || contains_duplicates(endpoints.iter().cloned())
-            || !endpoints
-                .iter()
-                .all(|identity| dependencies.contains_key(identity)))
+        && !resolved_endpoints_are_valid(endpoints, dependencies)
     {
         return invalid("resolved typestate endpoint terminal is empty or unresolved");
     }
     Ok(())
+}
+
+fn resolved_endpoints_are_valid(
+    endpoints: &[ResolvedEndpointIdentity],
+    dependencies: &HashMap<&ResolvedEndpointIdentity, &ResolvedEndpointDependency>,
+) -> bool {
+    !endpoints.is_empty()
+        && !contains_duplicates(endpoints.iter().cloned())
+        && endpoints
+            .iter()
+            .all(|identity| dependencies.contains_key(identity))
 }
 
 fn event_trigger_matches_authored(
@@ -2510,10 +2605,20 @@ fn event_trigger_matches_authored(
             ResolvedTypestateEventTrigger::Calls {
                 subject: resolved_subject,
                 phase: resolved_phase,
+                argument_condition: resolved_condition,
                 ..
             },
-            TypestateEventTrigger::Calls { subject, phase, .. },
-        ) => resolved_subject == subject && resolved_phase == phase,
+            TypestateEventTrigger::Calls {
+                subject,
+                phase,
+                argument_condition: authored_condition,
+                ..
+            },
+        ) => {
+            resolved_subject == subject
+                && resolved_phase == phase
+                && resolved_condition == authored_condition
+        }
         (
             ResolvedTypestateEventTrigger::MatchEndpoints { endpoints, phase },
             TypestateEventTrigger::MatchEndpoints {
@@ -2522,12 +2627,7 @@ fn event_trigger_matches_authored(
                 ..
             },
         ) => {
-            phase == authored_phase
-                && endpoints.iter().all(|identity| {
-                    dependencies
-                        .get(identity)
-                        .is_some_and(|dependency| dependency.model.role == *role)
-                })
+            endpoint_trigger_matches_authored(endpoints, phase, role, authored_phase, dependencies)
         }
         (
             ResolvedTypestateEventTrigger::SemanticEvent { event: resolved },
@@ -2551,12 +2651,7 @@ fn terminal_trigger_matches_authored(
                 ..
             },
         ) => {
-            phase == authored_phase
-                && endpoints.iter().all(|identity| {
-                    dependencies
-                        .get(identity)
-                        .is_some_and(|dependency| dependency.model.role == *role)
-                })
+            endpoint_trigger_matches_authored(endpoints, phase, role, authored_phase, dependencies)
         }
         (
             ResolvedTypestateTerminalTrigger::SemanticEvent { event: resolved },
@@ -2564,6 +2659,21 @@ fn terminal_trigger_matches_authored(
         ) => resolved == authored,
         _ => false,
     }
+}
+
+fn endpoint_trigger_matches_authored(
+    endpoints: &[ResolvedEndpointIdentity],
+    phase: &EndpointObservationPhase,
+    role: &EndpointRole,
+    authored_phase: &EndpointObservationPhase,
+    dependencies: &HashMap<&ResolvedEndpointIdentity, &ResolvedEndpointDependency>,
+) -> bool {
+    phase == authored_phase
+        && endpoints.iter().all(|identity| {
+            dependencies
+                .get(identity)
+                .is_some_and(|dependency| dependency.model.role == *role)
+        })
 }
 
 fn validate_precedence(
@@ -2731,7 +2841,12 @@ fn validate_role_taint(
     taint: Option<&EndpointTaintSemantics>,
 ) -> Result<(), LoadedModelError> {
     match (role, taint) {
-        (EndpointRole::Source, Some(EndpointTaintSemantics::Source { labels, evidence })) => {
+        (
+            EndpointRole::Source,
+            Some(EndpointTaintSemantics::Source {
+                labels, evidence, ..
+            }),
+        ) => {
             if labels.is_empty() || contains_duplicates(labels.iter().cloned()) {
                 return invalid("source endpoint taint labels must be non-empty and unique");
             }
@@ -2963,21 +3078,6 @@ fn validate_authored_selector_resolution(
         }
     }
     Ok(())
-}
-
-fn endpoint_binding_to_port(binding: &PolicyEndpointBinding) -> PolicyPort {
-    match binding {
-        PolicyEndpointBinding::MatchedValue => PolicyPort::MatchedValue,
-        PolicyEndpointBinding::Receiver => PolicyPort::Receiver,
-        PolicyEndpointBinding::ReturnValue => PolicyPort::ReturnValue,
-        PolicyEndpointBinding::ResultIndex { index } => PolicyPort::ResultIndex { index: *index },
-        PolicyEndpointBinding::ArgumentIndex { index } => {
-            PolicyPort::ArgumentIndex { index: *index }
-        }
-        PolicyEndpointBinding::ArgumentName { name } => {
-            PolicyPort::ArgumentName { name: name.clone() }
-        }
-    }
 }
 
 fn resolved_binding_to_endpoint(binding: &ResolvedTypestateBinding) -> PolicyEndpointBinding {
@@ -3347,9 +3447,9 @@ fn extend_taint_paths<T: SelectorEntry>(
     entries: &[T],
 ) -> Result<(), LoadedModelError> {
     for entry in entries {
-        paths.push(selector_path(&format!(
-            "/analysis/{set}/entries/{}/selector",
-            json_pointer_segment(entry.selector_entry_id().as_str())
+        paths.push(selector_path(&taint_entry_selector_path(
+            set,
+            entry.selector_entry_id().as_str(),
         ))?);
     }
     Ok(())
@@ -3358,10 +3458,6 @@ fn extend_taint_paths<T: SelectorEntry>(
 fn selector_path(path: &str) -> Result<PolicySelectorPath, LoadedModelError> {
     PolicySelectorPath::new(path)
         .map_err(|error| LoadedModelError::CanonicalProjection(error.to_string()))
-}
-
-fn json_pointer_segment(value: &str) -> String {
-    value.replace('~', "~0").replace('/', "~1")
 }
 
 #[cfg(test)]
@@ -3488,6 +3584,36 @@ mod tests {
         assert_eq!(error, LoadedModelError::DuplicateManifestPath);
     }
 
+    fn match_policy_parts(
+        source: &str,
+    ) -> (
+        PolicyDefinition,
+        SchemaVersionResolution,
+        ResolvedPolicySelector,
+    ) {
+        let identity = PolicySourceIdentity::new("policy.rqlp");
+        let parsed = parse_rqlp_source(source, identity.clone()).unwrap();
+        let resolution = parsed.schema_resolution();
+        let RqlpDocument::Policy { definition } = parsed.into_document() else {
+            panic!("fixture must be a policy");
+        };
+        let definition = *definition;
+        let PolicyAnalysis::Match { spec } = &definition.analysis else {
+            panic!("fixture must be a match policy");
+        };
+        let PolicySelector::Inline { schema, query, .. } = &spec.selector else {
+            panic!("fixture selector must be inline");
+        };
+        let selector = ResolvedPolicySelector::try_new(
+            PolicySelectorPath::new("/analysis/selector").unwrap(),
+            *schema,
+            query.clone(),
+            SelectorOrigin::Document { source: identity },
+        )
+        .unwrap();
+        (definition, resolution, selector)
+    }
+
     #[test]
     fn precedence_cycle_detection_is_domain_typed() {
         let first = EndpointId::new("bifrost.sources.first").unwrap();
@@ -3575,10 +3701,12 @@ mod tests {
             CallModelingSpec::default(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
             vec![sanitizer],
             Vec::new(),
             vec![transform],
             vec![model],
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -3596,35 +3724,5 @@ mod tests {
         assert!(paths.contains("/dependencies/catalogs/test.catalog@1/catalog-sanitizer/selector"));
         assert!(paths.contains("/dependencies/catalogs/test.catalog@1/catalog-transform/selector"));
         assert!(paths.contains("/dependencies/catalogs/test.catalog@1/catalog-model/selector"));
-    }
-
-    fn match_policy_parts(
-        source: &str,
-    ) -> (
-        PolicyDefinition,
-        SchemaVersionResolution,
-        ResolvedPolicySelector,
-    ) {
-        let identity = PolicySourceIdentity::new("policy.rqlp");
-        let parsed = parse_rqlp_source(source, identity.clone()).unwrap();
-        let resolution = parsed.schema_resolution();
-        let RqlpDocument::Policy { definition } = parsed.into_document() else {
-            panic!("fixture must be a policy");
-        };
-        let definition = *definition;
-        let PolicyAnalysis::Match { spec } = &definition.analysis else {
-            panic!("fixture must be a match policy");
-        };
-        let PolicySelector::Inline { schema, query, .. } = &spec.selector else {
-            panic!("fixture selector must be inline");
-        };
-        let selector = ResolvedPolicySelector::try_new(
-            PolicySelectorPath::new("/analysis/selector").unwrap(),
-            *schema,
-            query.clone(),
-            SelectorOrigin::Document { source: identity },
-        )
-        .unwrap();
-        (definition, resolution, selector)
     }
 }

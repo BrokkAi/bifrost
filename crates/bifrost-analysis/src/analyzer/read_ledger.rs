@@ -69,9 +69,8 @@ const READ_SET_DOMAIN: &[u8] = b"bifrost-read-ledger:set:v1";
 /// The per-file fact index families a name-keyed store lookup can consult.
 ///
 /// Closed on purpose: a new family is a new funnel, and a funnel nobody named
-/// is a funnel nobody verifies. The variants are exactly the analyzer-side
-/// store funnels of the funnel map
-/// (`.agents/docs/read-ledger-funnel-map-2026-09.md`, section 2).
+/// is a funnel nobody verifies. The variants enumerate the analyzer-side
+/// store lookup families whose reads the ledger verifies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum IndexFamily {
     /// A definition looked up by its exact qualified name.
@@ -319,6 +318,16 @@ impl ReadKey {
             id,
             rel_path: rel_path.map(Box::from),
         }
+    }
+
+    /// One semantic artifact and its workspace-relative source path.
+    pub fn semantic_artifact(key: &crate::analyzer::semantic::ids::SemanticArtifactKey) -> Self {
+        Self::artifact(
+            crate::analyzer::invalidation::DerivedArtifactId::semantic_artifact(
+                key.public_fingerprint(),
+            ),
+            Some(key.path().as_str()),
+        )
     }
 
     /// One whole-scope dependency over exactly `languages`.
@@ -665,6 +674,22 @@ pub fn declaration_set_digest<'a>(units: impl IntoIterator<Item = &'a CodeUnit>)
     StableDigest::from_array(hasher.finish())
 }
 
+pub(crate) fn declaration_candidates_lookup_key<'a>(
+    kind: LookupKind,
+    language: Option<Language>,
+    name: impl Into<String>,
+    declarations: impl IntoIterator<Item = &'a CodeUnit>,
+) -> ReadKey {
+    ReadKey::lookup(
+        kind,
+        LookupQuestion::Name {
+            language,
+            name: name.into().into(),
+        },
+        declaration_set_digest(declarations),
+    )
+}
+
 /// The canonical digest of the exact declaration facts a resolver consumed.
 ///
 /// A declaration identity includes the normalized source path, structured
@@ -686,7 +711,11 @@ pub fn declaration_facts_digest(declaration: &CodeUnit, parent: Option<&CodeUnit
 
 /// The answer digest of a declaration-facts lookup whose declaration is absent.
 pub fn absent_declaration_facts_digest() -> StableDigest {
-    StableDigest::from_array(CanonicalHasher::new(ABSENT_DECLARATION_FACTS_DOMAIN).finish())
+    absent_answer_digest(ABSENT_DECLARATION_FACTS_DOMAIN)
+}
+
+fn absent_answer_digest(domain: &[u8]) -> StableDigest {
+    StableDigest::from_array(CanonicalHasher::new(domain).finish())
 }
 
 /// The canonical digest of one declaration's structured signature metadata.
@@ -710,7 +739,7 @@ pub fn signature_metadata_digest(
 
 /// The answer digest of a signature-metadata lookup whose declaration is absent.
 pub fn absent_signature_metadata_digest() -> StableDigest {
-    StableDigest::from_array(CanonicalHasher::new(ABSENT_SIGNATURE_METADATA_DOMAIN).finish())
+    absent_answer_digest(ABSENT_SIGNATURE_METADATA_DOMAIN)
 }
 
 /// The answer digest of a procedure-summary lookup that found nothing.
@@ -721,7 +750,7 @@ pub fn absent_signature_metadata_digest() -> StableDigest {
 /// holding the same one. One fixed digest is enough because the identity that
 /// was asked about is already in the question.
 pub fn absent_summary_digest() -> StableDigest {
-    StableDigest::from_array(CanonicalHasher::new(ABSENT_SUMMARY_DOMAIN).finish())
+    absent_answer_digest(ABSENT_SUMMARY_DOMAIN)
 }
 
 /// The canonical digest of an answer that is a set of files.
@@ -867,10 +896,7 @@ pub fn read_set_digest(keys: &[ReadKey]) -> ReadSetDigest {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn oid(byte: u8) -> Oid {
-        Oid::from_bytes(&[byte; 20]).expect("twenty bytes is a valid object id")
-    }
+    use crate::test_support::synthetic_oid as oid;
 
     fn file_key(path: &str, byte: u8) -> ReadKey {
         ReadKey::file(Language::Rust, path, oid(byte))
@@ -889,24 +915,12 @@ mod tests {
         backward.record(file_key("src/a.rs", 1));
 
         assert_eq!(forward.digest(), backward.digest());
-        assert_eq!(forward.keys(), backward.keys());
-    }
-
-    #[test]
-    fn recording_one_key_twice_records_one_input() {
-        let ledger = ReadLedger::new();
-        ledger.record(file_key("src/a.rs", 1));
-        ledger.record(file_key("src/a.rs", 1));
-        assert_eq!(ledger.len(), 1);
-    }
-
-    #[test]
-    fn a_changed_blob_changes_the_digest() {
-        let before = ReadLedger::new();
-        before.record(file_key("src/a.rs", 1));
-        let after = ReadLedger::new();
-        after.record(file_key("src/a.rs", 2));
-        assert_ne!(before.digest(), after.digest());
+        let keys = forward.keys();
+        assert_eq!(keys, backward.keys());
+        assert_eq!(read_set_digest(&keys), forward.digest());
+        let mut reversed = keys.clone();
+        reversed.reverse();
+        assert_eq!(read_set_digest(&reversed), forward.digest());
     }
 
     #[test]
@@ -965,69 +979,6 @@ mod tests {
             ReadKey::path_absent(Language::Rust, rel_path_string(&base).as_str()),
             ReadKey::path_absent(Language::Rust, rel_path_string(&head).as_str()),
         );
-    }
-
-    #[test]
-    fn an_unattributed_read_makes_the_ledger_unbounded() {
-        let ledger = ReadLedger::new();
-        assert!(ledger.is_bounded());
-        ledger.record_unattributed();
-        assert!(!ledger.is_bounded());
-        assert_eq!(ledger.unattributed_reads(), 1);
-    }
-
-    #[test]
-    fn a_lookup_question_round_trips_through_serde() {
-        let questions = [
-            LookupQuestion::Name {
-                language: Some(Language::Rust),
-                name: Box::from("crate::a::f"),
-            },
-            LookupQuestion::Name {
-                language: None,
-                name: Box::from("crate::a::f"),
-            },
-            LookupQuestion::Declaration {
-                rel_path: Box::from("src/a.rs"),
-                fq_name: Box::from("crate::a::f"),
-            },
-            LookupQuestion::File {
-                rel_path: Box::from("src/a.rs"),
-            },
-            LookupQuestion::CallSite {
-                rel_path: Box::from("src/a.rs"),
-                artifact: StableDigest::sha256("artifact"),
-                site: CallSiteLocator {
-                    start_byte: 10,
-                    end_byte: 20,
-                },
-            },
-            LookupQuestion::ProcedureCallSite {
-                rel_path: Box::from("src/a.rs"),
-                procedure: StableDigest::sha256("procedure"),
-                site: ProcedureCallSiteLocator {
-                    start_byte: 3,
-                    end_byte: 13,
-                },
-            },
-            LookupQuestion::ProcedureCallSite {
-                rel_path: Box::from("src/a.rs"),
-                procedure: StableDigest::sha256("artifact"),
-                site: ProcedureCallSiteLocator {
-                    start_byte: 0,
-                    end_byte: 0,
-                },
-            },
-            LookupQuestion::Summary {
-                identity: StableDigest::sha256("summary"),
-            },
-        ];
-        for question in questions {
-            let encoded = serde_json::to_string(&question).expect("question serializes");
-            let decoded: LookupQuestion =
-                serde_json::from_str(&encoded).expect("question deserializes");
-            assert_eq!(decoded, question, "{encoded}");
-        }
     }
 
     #[test]
@@ -1164,17 +1115,6 @@ mod tests {
     }
 
     #[test]
-    fn a_read_set_digest_over_keys_equals_the_ledger_that_recorded_them() {
-        let ledger = ReadLedger::new();
-        ledger.record(file_key("src/b.rs", 2));
-        ledger.record(file_key("src/a.rs", 1));
-        assert_eq!(read_set_digest(&ledger.keys()), ledger.digest());
-        let mut reversed = ledger.keys();
-        reversed.reverse();
-        assert_eq!(read_set_digest(&reversed), ledger.digest());
-    }
-
-    #[test]
     fn an_unattributed_read_does_not_enter_the_digest() {
         let bounded = ReadLedger::new();
         bounded.record(file_key("src/a.rs", 1));
@@ -1183,5 +1123,76 @@ mod tests {
         unbounded.record_unattributed();
         assert_eq!(bounded.digest(), unbounded.digest());
         assert!(!unbounded.is_bounded());
+    }
+
+    #[test]
+    fn recording_one_key_twice_records_one_input() {
+        let ledger = ReadLedger::new();
+        ledger.record(file_key("src/a.rs", 1));
+        ledger.record(file_key("src/a.rs", 1));
+        assert_eq!(ledger.len(), 1);
+    }
+
+    #[test]
+    fn an_unattributed_read_makes_the_ledger_unbounded() {
+        let ledger = ReadLedger::new();
+        assert!(ledger.is_bounded());
+        ledger.record_unattributed();
+        assert!(!ledger.is_bounded());
+        assert_eq!(ledger.unattributed_reads(), 1);
+    }
+
+    #[test]
+    fn a_lookup_question_round_trips_through_serde() {
+        let questions = [
+            LookupQuestion::Name {
+                language: Some(Language::Rust),
+                name: Box::from("crate::a::f"),
+            },
+            LookupQuestion::Name {
+                language: None,
+                name: Box::from("crate::a::f"),
+            },
+            LookupQuestion::Declaration {
+                rel_path: Box::from("src/a.rs"),
+                fq_name: Box::from("crate::a::f"),
+            },
+            LookupQuestion::File {
+                rel_path: Box::from("src/a.rs"),
+            },
+            LookupQuestion::CallSite {
+                rel_path: Box::from("src/a.rs"),
+                artifact: StableDigest::sha256("artifact"),
+                site: CallSiteLocator {
+                    start_byte: 10,
+                    end_byte: 20,
+                },
+            },
+            LookupQuestion::ProcedureCallSite {
+                rel_path: Box::from("src/a.rs"),
+                procedure: StableDigest::sha256("procedure"),
+                site: ProcedureCallSiteLocator {
+                    start_byte: 3,
+                    end_byte: 13,
+                },
+            },
+            LookupQuestion::ProcedureCallSite {
+                rel_path: Box::from("src/a.rs"),
+                procedure: StableDigest::sha256("artifact"),
+                site: ProcedureCallSiteLocator {
+                    start_byte: 0,
+                    end_byte: 0,
+                },
+            },
+            LookupQuestion::Summary {
+                identity: StableDigest::sha256("summary"),
+            },
+        ];
+        for question in questions {
+            let encoded = serde_json::to_string(&question).expect("question serializes");
+            let decoded: LookupQuestion =
+                serde_json::from_str(&encoded).expect("question deserializes");
+            assert_eq!(decoded, question, "{encoded}");
+        }
     }
 }

@@ -41,6 +41,7 @@ pub(crate) fn finalize_dialect(
     for include in &cpp.includes {
         needed.extend([include.declaration, include.target]);
     }
+    needed.extend(cpp.expressions.iter().map(|fact| fact.occurrence));
     needed.extend(cpp.using_namespaces.iter().map(|(id, _)| *id));
     for import in &shared.imports {
         needed.insert(import.declaration);
@@ -138,7 +139,12 @@ pub(crate) fn finalize_dialect(
                 .copied(),
         );
     }
-    facts.structural = StructuralFactRows::new(nodes, roles.finish(), occurrence_roles.finish());
+    facts.structural = StructuralFactRows::new(
+        nodes,
+        roles.finish(),
+        occurrence_roles.finish(),
+        shared.structural.recovered_regions().to_vec(),
+    );
     for import in &mut facts.imports {
         import.declaration = occurrence(import.declaration);
         import.target = import.target.map(occurrence);
@@ -165,6 +171,11 @@ pub(crate) fn finalize_dialect(
     for (id, _) in &mut cpp.using_namespaces {
         *id = occurrence(*id);
     }
+    for fact in &mut cpp.expressions {
+        fact.occurrence = occurrence(fact.occurrence);
+    }
+    cpp.expressions
+        .sort_unstable_by_key(|fact| fact.occurrence.get());
     let mounted: HashSet<_> = units.iter().cloned().collect();
     metadata.retain(|link| mounted.contains(&(link.declaration, link.unit.clone())));
     for (id, _) in units {

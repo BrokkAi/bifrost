@@ -39,8 +39,7 @@ use brokk_bifrost_cpp::declarations::{CppComparableNode, CppComparableSlot, CppP
 use brokk_bifrost_cpp::external_declarations::{
     CppCallableExplicitness, CppExternalDeclarationCompleteness, CppExternalDeclarationLimits,
     CppExternalMemberKind, CppExternalOwner, CppExternalTypeKind, CppExternalVisibility,
-    external_angle_include_paths, external_angle_include_paths_from_root,
-    extract_external_declarations,
+    external_include_paths, external_include_paths_from_root, extract_external_declarations,
 };
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -57,6 +56,12 @@ enum BasicStringConstructorRole {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum BasicStringAssignmentRole {
+    Copy,
+    Move,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BasicStringSelfReferenceRole {
     Copy,
     Move,
 }
@@ -187,17 +192,10 @@ fn basic_string_constructor_role(
     }
     match member.parameter_types.as_deref()? {
         [CppParameterType::Structured(identity)] => {
-            let root = identity.root_id();
-            let (role, inner) = match identity.view(root)? {
-                StructuredTypeNodeView::Reference(inner) => {
-                    (BasicStringConstructorRole::Copy, inner)
-                }
-                StructuredTypeNodeView::RvalueReference(inner) => {
-                    (BasicStringConstructorRole::Move, inner)
-                }
-                _ => return None,
-            };
-            is_basic_string_self_type(identity, inner).then_some(role)
+            basic_string_self_reference_role(identity).map(|role| match role {
+                BasicStringSelfReferenceRole::Copy => BasicStringConstructorRole::Copy,
+                BasicStringSelfReferenceRole::Move => BasicStringConstructorRole::Move,
+            })
         }
         [
             CppParameterType::Structured(character_data),
@@ -422,10 +420,20 @@ fn basic_string_assignment_role(
     let [CppParameterType::Structured(identity)] = member.parameter_types.as_deref()? else {
         return None;
     };
-    let root = identity.root_id();
-    let (role, inner) = match identity.view(root)? {
-        StructuredTypeNodeView::Reference(inner) => (BasicStringAssignmentRole::Copy, inner),
-        StructuredTypeNodeView::RvalueReference(inner) => (BasicStringAssignmentRole::Move, inner),
+    basic_string_self_reference_role(identity).map(|role| match role {
+        BasicStringSelfReferenceRole::Copy => BasicStringAssignmentRole::Copy,
+        BasicStringSelfReferenceRole::Move => BasicStringAssignmentRole::Move,
+    })
+}
+
+fn basic_string_self_reference_role(
+    identity: &StructuredTypeIdentity,
+) -> Option<BasicStringSelfReferenceRole> {
+    let (role, inner) = match identity.view(identity.root_id())? {
+        StructuredTypeNodeView::Reference(inner) => (BasicStringSelfReferenceRole::Copy, inner),
+        StructuredTypeNodeView::RvalueReference(inner) => {
+            (BasicStringSelfReferenceRole::Move, inner)
+        }
         _ => return None,
     };
     is_basic_string_self_type(identity, inner).then_some(role)
@@ -508,6 +516,27 @@ pub(crate) enum CppExternalTypeModelResolution {
     Conflict,
 }
 
+fn exact_generated_cpp_symbols_in_headers<'overlay>(
+    overlay: &'overlay SemanticModelOverlay,
+    headers: &[ReachedExternalHeader],
+    qualified_name: &str,
+) -> Vec<&'overlay SemanticModelSymbol> {
+    let mut records = overlay
+        .symbols_named(qualified_name)
+        .records
+        .into_iter()
+        .filter(|symbol| {
+            symbol.language == "cpp"
+                && symbol.owner_id.is_none()
+                && symbol.qualified_name == qualified_name
+                && symbol_is_in_headers(symbol, headers)
+                && symbol.provenance.origin == SemanticModelOriginKind::ExactGeneratedOutput
+        })
+        .collect::<Vec<_>>();
+    records.sort_by(|left, right| left.id.cmp(&right.id));
+    records
+}
+
 /// Resolve one parser-derived C++ type occurrence through a directly reached
 /// generated header model.
 ///
@@ -537,19 +566,7 @@ pub(crate) fn external_structured_type_model_resolution(
         return CppExternalTypeModelResolution::Incomplete;
     }
     let qualified_name = name.path().join(".");
-    let mut records = overlay
-        .symbols_named(&qualified_name)
-        .records
-        .into_iter()
-        .filter(|symbol| {
-            symbol.language == "cpp"
-                && symbol.owner_id.is_none()
-                && symbol.qualified_name == qualified_name
-                && symbol_is_in_headers(symbol, headers)
-                && symbol.provenance.origin == SemanticModelOriginKind::ExactGeneratedOutput
-        })
-        .collect::<Vec<_>>();
-    records.sort_by(|left, right| left.id.cmp(&right.id));
+    let records = exact_generated_cpp_symbols_in_headers(overlay, headers, &qualified_name);
     if records.len() > 1 || records.iter().any(|record| record.provenance.ambiguous) {
         return CppExternalTypeModelResolution::Conflict;
     }
@@ -607,23 +624,13 @@ pub(crate) fn external_namespace_model_resolution(
     let headers = headers.headers()?;
     let overlay = overlay?;
     let qualified_name = namespace_path.join(".");
-    let matched = overlay.symbols_named(&qualified_name);
-    let mut records = matched
-        .records
-        .into_iter()
-        .filter(|symbol| {
-            symbol.language == "cpp"
-                && symbol.owner_id.is_none()
-                && symbol.kind == SemanticModelSymbolKind::Module
-                && !is_header_module(symbol)
-                && symbol.qualified_name == qualified_name
-                && symbol_is_in_headers(symbol, headers)
-                && symbol.provenance.origin == SemanticModelOriginKind::ExactGeneratedOutput
-                && !symbol.provenance.ambiguous
-                && symbol.provenance.completeness == SemanticModelCompleteness::Complete
-        })
-        .collect::<Vec<_>>();
-    records.sort_by(|left, right| left.id.cmp(&right.id));
+    let mut records = exact_generated_cpp_symbols_in_headers(overlay, headers, &qualified_name);
+    records.retain(|symbol| {
+        symbol.kind == SemanticModelSymbolKind::Module
+            && !is_header_module(symbol)
+            && !symbol.provenance.ambiguous
+            && symbol.provenance.completeness == SemanticModelCompleteness::Complete
+    });
     let [record] = records.as_slice() else {
         return None;
     };
@@ -729,15 +736,17 @@ fn build_directly_reached_external_headers(
     const MAX_CLOSURE_HEADERS: usize = 10_000;
     const MAX_CLOSURE_BYTES: usize = 32 * 1024 * 1024;
     let mut resolved_headers = Vec::new();
-    let mut pending =
-        external_angle_include_paths_from_root(syntax.source(), syntax.tree().root_node());
+    let mut pending = external_include_paths_from_root(syntax.source(), syntax.tree().root_node())
+        .into_iter()
+        .map(|(include, quoted)| (file.abs_path(), include, quoted))
+        .collect::<Vec<_>>();
     let mut visited = crate::hash::HashSet::default();
     let mut bytes_read = 0usize;
-    while let Some(include) = pending.pop() {
+    while let Some((including_file, include, quoted)) = pending.pop() {
         if !keep_going() {
             return None;
         }
-        match analyzer.resolve_external_angle_include(file, &include) {
+        match analyzer.resolve_external_include(file, &including_file, &include, quoted) {
             CppExternalIncludeResolution::Declared { root, header } => {
                 if !visited.insert(header.clone()) {
                     continue;
@@ -760,7 +769,11 @@ fn build_directly_reached_external_headers(
                     return Some(ReachedExternalHeaders::Unavailable);
                 }
                 analyzer.record_external_header_parse();
-                pending.extend(external_angle_include_paths(&header_source));
+                pending.extend(
+                    external_include_paths(&header_source)
+                        .into_iter()
+                        .map(|(include, quoted)| (header.clone(), include, quoted)),
+                );
             }
             CppExternalIncludeResolution::MissingCompileContext
             | CppExternalIncludeResolution::Conflicting => {
@@ -839,6 +852,8 @@ fn header_module_id(dependency_name: &str, header: &str) -> String {
 fn header_module_fact(dependency_name: &str, header: &str) -> Option<TypeFact> {
     let name = crate::analyzer::semantic::module_identity_owner(Path::new(header))?;
     Some(TypeFact {
+        jvm_inventory: None,
+        runtime_bases: None,
         ambient_use: None,
         id: header_module_id(dependency_name, header),
         name: name.clone(),
@@ -908,6 +923,20 @@ pub(crate) struct CHeaderFunction {
     pub(crate) header_module: String,
 }
 
+/// The one namespace-qualified function a C++ call's reached headers declare.
+///
+/// Unlike a file-scope C declaration, a C++ standard-library function carries
+/// its namespace as part of the declaration identity. Keep the generated
+/// declaration id with that owner so the resolver can publish one exact
+/// external-call proof instead of recovering the owner from rendered text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CppHeaderNamespaceFunction {
+    /// The activated declaration record the call binds.
+    pub(crate) symbol_id: String,
+    /// The namespace that owns the function (`std` for `<cstdio>`).
+    pub(crate) namespace: String,
+}
+
 /// Resolve a bare C call that no workspace declaration answers to the one
 /// file-scope function its compile-database-scoped header closure declares.
 ///
@@ -973,13 +1002,91 @@ pub(crate) fn reached_header_file_scope_function(
     }
 }
 
+/// Resolve a qualified C++ call that no workspace declaration answers to the
+/// one namespace function its compile-database-scoped header closure declares.
+///
+/// The namespace and member are supplied by the tree-sitter qualified-name
+/// structure. The generated header overlay must publish exactly one complete,
+/// unambiguous function declaration for that owner and arity in a directly
+/// reached header. A same-named workspace function is filtered by the caller
+/// before this proof is requested.
+pub(crate) fn reached_header_namespace_function(
+    analyzer: &CppAnalyzer,
+    overlay: Option<&SemanticModelOverlay>,
+    file: &ProjectFile,
+    namespace_path: &[String],
+    name: &str,
+    written_arity: u32,
+) -> Option<CppHeaderNamespaceFunction> {
+    if namespace_path.is_empty() || name.is_empty() {
+        return None;
+    }
+    let closure = directly_reached_external_headers(analyzer, file)?;
+    let headers = closure.headers()?;
+    let overlay = overlay?;
+    let namespace = namespace_path.join(".");
+    let owners = overlay
+        .symbols_named(&namespace)
+        .records
+        .into_iter()
+        .filter(|symbol| {
+            symbol.language == "cpp"
+                && symbol.owner_id.is_none()
+                && symbol.kind == SemanticModelSymbolKind::Module
+                && !is_header_module(symbol)
+                && symbol.qualified_name == namespace
+                && symbol.provenance.origin == SemanticModelOriginKind::ExactGeneratedOutput
+                && !symbol.provenance.ambiguous
+                && symbol.provenance.completeness == SemanticModelCompleteness::Complete
+                && symbol_is_in_headers(symbol, headers)
+        })
+        .collect::<Vec<_>>();
+    let [owner] = owners.as_slice() else {
+        return None;
+    };
+    let declarations = overlay
+        .members_of(&owner.id)
+        .records
+        .into_iter()
+        .filter(|symbol| {
+            symbol.language == "cpp"
+                && symbol.name == name
+                && matches!(
+                    symbol.kind,
+                    SemanticModelSymbolKind::Function | SemanticModelSymbolKind::Method
+                )
+                && symbol.visibility == Visibility::Public
+                && symbol.provenance.origin == SemanticModelOriginKind::ExactGeneratedOutput
+                && !symbol.provenance.ambiguous
+                && symbol.provenance.completeness == SemanticModelCompleteness::Complete
+                && symbol_is_in_headers(symbol, headers)
+        })
+        .collect::<Vec<_>>();
+    let [declaration] = declarations.as_slice() else {
+        return None;
+    };
+    let callable = overlay.callable_for_application(
+        // The C++ header producer represents namespace members as methods in
+        // the declaration overlay. The call itself is still receiverless;
+        // this key only selects the generated declaration family whose
+        // structured owner is the namespace.
+        SemanticModelCallableKey::new("cpp", &namespace, name, true, written_arity),
+        &SemanticModelCallApplication::positional(written_arity),
+    );
+    match (callable.disposition, callable.records.as_slice()) {
+        (SemanticModelCallableDisposition::Unique, [selected]) if selected.id == declaration.id => {
+            Some(CppHeaderNamespaceFunction {
+                symbol_id: declaration.id.clone(),
+                namespace,
+            })
+        }
+        _ => None,
+    }
+}
+
 impl DependencyPackAdapter for CppDependencyPackAdapter {
     fn adapter_name(&self) -> &str {
         "bifrost-cpp-headers"
-    }
-
-    fn adapter_version(&self) -> &str {
-        env!("CARGO_PKG_VERSION")
     }
 
     fn producer(&self) -> Producer {
@@ -990,11 +1097,7 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
     }
 
     fn can_produce(&self, dependency: &ResolvedDependency) -> bool {
-        dependency.evidence.language == "cpp"
-            && dependency
-                .artifacts
-                .iter()
-                .any(|artifact| artifact.kind == ExternalArtifactKind::CppHeaderSourceSet)
+        dependency.has_language_artifact("cpp", ExternalArtifactKind::CppHeaderSourceSet)
     }
 
     fn produce(
@@ -1199,6 +1302,8 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
         let mut types = extracted_types
             .into_iter()
             .map(|record| TypeFact {
+                jvm_inventory: None,
+                runtime_bases: None,
                 ambient_use: None,
                 id: type_ids[&record.name].clone(),
                 name: record.name.clone(),
@@ -1236,7 +1341,7 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                     .into_iter()
                     .map(|name| HierarchyFact {
                         hierarchy_kind: HierarchyKind::Extends,
-                        target: named_type(name),
+                        target: TypeRef::named(name),
                         declaration_ordinal: None,
                     })
                     .collect(),
@@ -1314,6 +1419,14 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                     CppParameterType::Unstructured => (unknown_type(), false),
                 })
                 .collect::<Vec<_>>();
+            let parameter_names = record
+                .parameter_names
+                .unwrap_or_else(|| vec![None; parameters.len()]);
+            debug_assert_eq!(
+                parameter_names.len(),
+                parameters.len(),
+                "external declaration parameter names and types must stay positional"
+            );
             let callable_arity = record.callable_arity;
             let parameter_types = parameters
                 .iter()
@@ -1360,7 +1473,7 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                     .into_iter()
                     .enumerate()
                     .map(|(index, (r#type, variadic))| Parameter {
-                        name: None,
+                        name: parameter_names.get(index).cloned().flatten(),
                         r#type,
                         optional: !variadic
                             && callable_arity.is_some_and(|arity| {
@@ -1368,6 +1481,7 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                             }),
                         variadic,
                         // C and C++ bind every argument by position.
+                        role: None,
                         passing_mode: ParameterPassingMode::PositionalOnly,
                     })
                     .collect(),
@@ -1380,10 +1494,13 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
             // beside the function, where it competes for the call.
             let callable_family_complete = file_scope
                 && record.kind == CppExternalMemberKind::Function
+                && !parameter_variadics.iter().any(|variadic| *variadic)
                 && syntax_complete_headers.contains(&record.source_path);
             members.push(MemberFact {
                 non_overridable: None,
                 ambient_use: None,
+                value_type: None,
+                proxied_type: None,
                 id: id.clone(),
                 owner: owner_id,
                 name: record.name,
@@ -1401,6 +1518,7 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                     .or_else(|| assignment_role.map(BasicStringAssignmentRole::operation)),
                 explicit_operation: explicit_roles_by_index.get(&record_index).copied(),
                 callable_family_complete,
+                exact_return_classes: Vec::new(),
                 signature,
                 receiver: (!file_scope).then_some(ReceiverFact { pointer: false }),
                 extension_receiver: None,
@@ -1505,6 +1623,7 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                     collection_flows: None,
                     deferred_yields: None,
                     conditional_type_refinements: None,
+                    callable_values: None,
                 }],
             }),
             diagnostics,
@@ -1658,14 +1777,14 @@ fn discover_reachable_header_sets(
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut BoundedDependencyDiagnostics,
 ) -> Result<Vec<(PathBuf, Vec<PathBuf>)>, HeaderDiscoveryError> {
-    // An angle include reaches an external root only through the compile
-    // contexts of the file that spells it: with no entry naming that file,
-    // `resolve_external_angle_include` answers `MissingCompileContext` and the
-    // traversal below drops the pair. That is the resolution rule, not a
-    // shortcut around one, and it holds at every depth because a header
-    // reached from a workspace source keeps that source's identity through the
-    // whole closure. So the only sources worth reading are the ones the
-    // database names.
+    // A literal include reaches an external root only through the compile
+    // contexts of the translation unit that spells it: with no entry naming
+    // that source, `resolve_external_include` answers `MissingCompileContext`
+    // and the traversal below drops the pair. That is the resolution rule, not
+    // a shortcut around one. Quoted includes additionally carry the absolute
+    // path of the file that spells them so the including-file directory is
+    // checked before compiler search roots at every depth. So the only sources
+    // worth reading are the ones the database names.
     //
     // Reading and parsing all of them instead was serial startup latency
     // scaling with the workspace rather than with the header sets found: on
@@ -1697,21 +1816,21 @@ fn discover_reachable_header_sets(
                 }
             };
             pending.extend(
-                external_angle_include_paths(&source)
+                external_include_paths(&source)
                     .into_iter()
-                    .map(|include| (file.clone(), include)),
+                    .map(|(include, quoted)| (file.clone(), file.abs_path(), include, quoted)),
             );
         }
     }
     let mut paths_by_root: HashMap<PathBuf, crate::hash::HashSet<PathBuf>> = HashMap::default();
     let mut visited = crate::hash::HashSet::default();
     let mut bytes_read = 0u64;
-    while let Some((source_file, include)) = pending.pop() {
+    while let Some((source_file, including_file, include, quoted)) = pending.pop() {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return Err(HeaderDiscoveryError::Cancelled);
         }
         let CppExternalIncludeResolution::Declared { root, header } =
-            contexts.resolve_external_angle_include(&source_file, &include)
+            contexts.resolve_external_include(&source_file, &including_file, &include, quoted)
         else {
             continue;
         };
@@ -1757,9 +1876,9 @@ fn discover_reachable_header_sets(
             )));
         }
         pending.extend(
-            external_angle_include_paths(&source)
+            external_include_paths(&source)
                 .into_iter()
-                .map(|include| (source_file.clone(), include)),
+                .map(|(include, quoted)| (source_file.clone(), header.clone(), include, quoted)),
         );
     }
     let mut sets = paths_by_root
@@ -1796,14 +1915,6 @@ fn header_discovery_failed(
 enum HeaderDiscoveryError {
     Cancelled,
     Failed(String),
-}
-
-fn named_type(name: String) -> TypeRef {
-    TypeRef::Named {
-        name,
-        arguments: Vec::new(),
-        nullable: false,
-    }
 }
 
 /// The pack type reference for a type the header extractor could not reduce to
@@ -1863,7 +1974,7 @@ fn pack_type_ref(identity: &StructuredTypeIdentity) -> Option<TypeRef> {
                         !name.is_empty() && !name.chars().any(char::is_whitespace),
                         "structured type name components are parser identifiers: {name:?}"
                     );
-                    values.push(named_type(name));
+                    values.push(TypeRef::named(name));
                 }
                 StructuredTypeNodeView::Pointer(inner) => {
                     work.push(Work::Pointer);
@@ -2034,8 +2145,9 @@ mod tests {
     use super::*;
     use crate::analyzer::semantic::{
         CallableTarget, CallableTargetResolution, DeclarationSegmentKind, ProcedureSemantics,
-        SemanticArtifact, SemanticBudget, SemanticCapability, SemanticEffect, SemanticGapImpact,
-        SemanticOutcome, SemanticRequest, TransferKind, TransferOperation, ValueFlowKind, ValueId,
+        SemanticArtifact, SemanticBudget, SemanticCapability, SemanticEffect, SemanticGap,
+        SemanticGapImpact, SemanticOutcome, SemanticRequest, TransferKind, TransferOperation,
+        ValueFlowKind, ValueId,
     };
     use crate::analyzer::semantic_model::CompilerOptions;
     use crate::analyzer::semantic_model::DependencyDiscoveryEvidence;
@@ -2053,10 +2165,13 @@ mod tests {
         AnalyzerConfig, DependencyPackEcosystem, DependencyPackWorkspaceContext, Language,
         OverlayProject, Project, TestProject, WorkspaceAnalyzer,
     };
+    use crate::test_support::call_backed_transfer_sites;
+    use crate::test_support::procedure_named as named_procedure;
     use brokk_bifrost_core::analyzer::ProjectFile;
     use brokk_bifrost_core::analyzer::model::CallableArity;
     use brokk_bifrost_core::analyzer::model::CppTemplateParameterMetadata;
     use brokk_bifrost_cpp::external_declarations::CppExternalDeclarationSet;
+    use brokk_bifrost_test_macros::hardwon;
     use std::sync::Arc;
 
     fn extract_test_declarations(source: &str) -> CppExternalDeclarationSet {
@@ -2067,6 +2182,47 @@ mod tests {
             source,
             CppExternalDeclarationLimits::default(),
         )
+    }
+
+    fn missing_generated_source_project(header: &str) -> (tempfile::TempDir, TestProject) {
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), "src/main.cpp")
+            .write(format!("#include <{header}>\n"))
+            .expect("present source");
+        ProjectFile::new(root.clone(), format!("fake/include/{header}"))
+            .write("class Widget {};\n")
+            .expect("header");
+        ProjectFile::new(root.clone(), "compile_commands.json")
+            .write(
+                serde_json::json!([
+                    {
+                        "directory": ".",
+                        "file": "src/main.cpp",
+                        "arguments": ["clang++", "-isystem", "fake/include", "-c", "src/main.cpp"]
+                    },
+                    {
+                        "directory": ".",
+                        "file": "generated/widget.cpp",
+                        "arguments": ["clang++", "-c", "generated/widget.cpp"]
+                    }
+                ])
+                .to_string(),
+            )
+            .expect("database");
+        (temp, TestProject::new(root, Language::Cpp))
+    }
+
+    fn assert_missing_generated_source_evidence(discovery: &DependencyDiscoveryOutcome) {
+        assert_eq!(
+            &[
+                DependencyDiscoveryInformationalEvidence::CppMissingWorkspaceSources {
+                    count: 1,
+                    sample: vec![PathBuf::from("generated/widget.cpp")],
+                }
+            ],
+            discovery.profile.informational_evidence.as_slice()
+        );
     }
 
     /// How many adjacent `Assignment` then call-backed `Transfer` event pairs
@@ -2131,38 +2287,17 @@ mod tests {
         procedure: &ProcedureSemantics,
         kind: TransferKind,
     ) -> Vec<SpelledTransfer> {
-        procedure
-            .points()
-            .iter()
-            .flat_map(|point| &point.events)
-            .filter_map(|event| {
-                let SemanticEffect::ValueFlow {
-                    kind: ValueFlowKind::Transfer(transfer),
-                    source,
-                    target,
-                } = &event.effect
-                else {
-                    return None;
-                };
-                if transfer.kind != kind {
-                    return None;
-                }
-                let TransferOperation::CallSite(call_site) = transfer.operation else {
-                    return None;
-                };
-                let call_site = procedure
-                    .call_site(call_site)
-                    .expect("a transfer names a call site of its own procedure");
-                Some(SpelledTransfer {
-                    source: *source,
-                    target: *target,
-                    receiver: call_site.receiver,
-                    arguments: call_site
-                        .arguments
-                        .iter()
-                        .map(|argument| argument.value)
-                        .collect(),
-                })
+        call_backed_transfer_sites(procedure, kind)
+            .into_iter()
+            .map(|(source, target, call_site)| SpelledTransfer {
+                source,
+                target,
+                receiver: call_site.receiver,
+                arguments: call_site
+                    .arguments
+                    .iter()
+                    .map(|argument| argument.value)
+                    .collect(),
             })
             .collect()
     }
@@ -2179,40 +2314,21 @@ mod tests {
         procedure: &ProcedureSemantics,
         kind: TransferKind,
     ) -> Vec<TransferWitness> {
-        procedure
-            .points()
-            .iter()
-            .flat_map(|point| &point.events)
-            .filter_map(|event| {
-                let SemanticEffect::ValueFlow {
-                    kind: ValueFlowKind::Transfer(transfer),
-                    source,
-                    target,
-                } = &event.effect
-                else {
-                    return None;
-                };
-                if transfer.kind != kind {
-                    return None;
-                }
-                let TransferOperation::CallSite(call_site) = transfer.operation else {
-                    return None;
-                };
-                let call_site = procedure
-                    .call_site(call_site)
-                    .expect("a transfer names a call site of its own procedure");
+        call_backed_transfer_sites(procedure, kind)
+            .into_iter()
+            .map(|(source, target, call_site)| {
                 assert_eq!(
-                    Some(*target),
+                    Some(target),
                     call_site.result,
                     "the transfer's destination is the call's result object: {call_site:#?}",
                 );
                 assert_eq!(
-                    Some(*target),
+                    Some(target),
                     call_site.receiver,
                     "the transfer's destination is the object the operation runs on: {call_site:#?}",
                 );
                 assert_eq!(
-                    vec![*source],
+                    vec![source],
                     call_site
                         .arguments
                         .iter()
@@ -2229,42 +2345,23 @@ mod tests {
                     panic!("an exact modeled transfer names an owner and a member: {locator:#?}");
                 };
                 assert_eq!(DeclarationSegmentKind::Type, owner.kind());
-                Some(TransferWitness {
+                TransferWitness {
                     owner: owner.name().expect("owner segment is named").to_owned(),
                     member: member.name().expect("member segment is named").to_owned(),
                     member_kind: member.kind(),
-                    source: *source,
-                    target: *target,
-                })
+                    source,
+                    target,
+                }
             })
             .collect()
     }
 
     /// Whether a procedure still declines its by-value return transfer.
     fn retains_return_transfer_gap(procedure: &ProcedureSemantics) -> bool {
-        procedure.gaps().iter().any(|gap| {
-            gap.capability == SemanticCapability::Values
-                && gap.impacts.contains(SemanticGapImpact::ReturnTransfer)
-        })
-    }
-
-    fn named_procedure<'a>(
-        artifact: &'a crate::analyzer::semantic::SemanticArtifact,
-        name: &str,
-    ) -> &'a ProcedureSemantics {
-        artifact
-            .procedures()
+        procedure
+            .gaps()
             .iter()
-            .find(|procedure| {
-                procedure
-                    .locator()
-                    .declaration()
-                    .segments()
-                    .last()
-                    .and_then(|segment| segment.name())
-                    == Some(name)
-            })
-            .unwrap_or_else(|| panic!("procedure `{name}` must be materialized"))
+            .any(SemanticGap::is_return_transfer_gap)
     }
 
     fn template_default(base: &str, parameter: &str) -> CppTemplateExpression {
@@ -2582,73 +2679,6 @@ mod tests {
             "a wrong-return-type overload must not acquire an implicit assignment role"
         );
     }
-
-    #[test]
-    fn discovers_and_produces_vector_type_and_member_facts() {
-        let temp = tempfile::tempdir().expect("temp root");
-        let root = temp.path().canonicalize().expect("canonical root");
-        ProjectFile::new(root.clone(), "src/main.cpp")
-            .write("#include <vector>\n")
-            .expect("source");
-        ProjectFile::new(root.clone(), "fake/include/vector")
-            .write("namespace std { template <typename T> class vector { public: void push_back(const T&); }; }")
-            .expect("header");
-        ProjectFile::new(root.clone(), "compile_commands.json")
-            .write(r#"[{"directory":".","file":"src/main.cpp","arguments":["clang++","-isystem","fake/include","-c","src/main.cpp"]}]"#)
-            .expect("database");
-        let project = TestProject::new(root, Language::Cpp);
-        let discovery = resolve_cpp_semantic_pack_dependencies(
-            &project,
-            &DependencyPackLimits::default(),
-            None,
-        );
-        assert!(discovery.complete, "{discovery:#?}");
-        let [dependency] = discovery.dependencies.as_slice() else {
-            panic!("one C++ include-root dependency: {discovery:#?}");
-        };
-        let ResolvedDependencyArtifactInput::SourceSet {
-            root,
-            relative_paths,
-        } = &dependency.artifacts[0].input
-        else {
-            panic!("C++ dependency uses a source set");
-        };
-        let exact = read_exact_source_set(
-            root,
-            relative_paths,
-            DependencyPackLimits::default().max_source_files_per_artifact,
-            DependencyPackLimits::default().max_source_path_depth,
-            &ArtifactProducerLimits::default(),
-        )
-        .expect("exact source set");
-        let artifact = ExactDependencyArtifact::from_exact(
-            DependencyArtifactRole::Declarations,
-            ExternalArtifactKind::CppHeaderSourceSet,
-            None,
-            exact,
-        );
-        let production = CppDependencyPackAdapter.produce(
-            dependency,
-            &[artifact],
-            &ArtifactProducerLimits::default(),
-            None,
-        );
-        let pack = production.pack.expect("C++ pack");
-        let AuthoredPayload::DeclarationFacts { types, members, .. } = &pack.shards[0].payload
-        else {
-            panic!("declaration facts");
-        };
-        let vector = types
-            .iter()
-            .find(|fact| fact.name == "std.vector")
-            .expect("vector type");
-        assert!(
-            members
-                .iter()
-                .any(|fact| fact.owner == vector.id && fact.name == "push_back")
-        );
-    }
-
     /// The pack type model carries a type's identity and shape, never a source
     /// spelling: a parameter written `const T&` must reach the pack as a
     /// reference to `T`, and the pack must validate.
@@ -2828,32 +2858,34 @@ mod tests {
                 .parameters
                 .clone()
         };
-        let by_reference = |element: TypeRef| Parameter {
-            name: None,
+        let by_reference = |name: &str, element: TypeRef| Parameter {
+            name: Some(name.to_owned()),
             r#type: TypeRef::ByRef {
                 element: Box::new(element),
                 reference_kind: TypeRefReferenceKind::Lvalue,
             },
             optional: false,
             variadic: false,
+            role: None,
             passing_mode: ParameterPassingMode::PositionalOnly,
         };
 
         assert_eq!(
-            vec![by_reference(named_type("T".to_owned()))],
+            vec![by_reference("value", TypeRef::named("T".to_owned()))],
             parameters("push_back", 1),
             "a `const T&` parameter is a reference to `T`, not the text `const T&`"
         );
         assert_eq!(
             vec![
-                by_reference(named_type("std.string".to_owned())),
+                by_reference("name", TypeRef::named("std.string".to_owned())),
                 Parameter {
-                    name: None,
+                    name: Some("widget".to_owned()),
                     r#type: TypeRef::Pointer {
-                        element: Box::new(named_type("ns.Widget".to_owned())),
+                        element: Box::new(TypeRef::named("ns.Widget".to_owned())),
                     },
                     optional: false,
                     variadic: false,
+                    role: None,
                     passing_mode: ParameterPassingMode::PositionalOnly,
                 },
             ],
@@ -2861,23 +2893,27 @@ mod tests {
             "qualification and pointer shape survive"
         );
         assert_eq!(
-            vec![by_reference(TypeRef::Named {
-                name: "vector".to_owned(),
-                arguments: vec![named_type("int".to_owned())],
-                nullable: false,
-            })],
+            vec![by_reference(
+                "other",
+                TypeRef::Named {
+                    name: "vector".to_owned(),
+                    arguments: vec![TypeRef::named("int".to_owned())],
+                    nullable: false,
+                }
+            )],
             parameters("nest", 1),
             "type arguments survive"
         );
         assert_eq!(
             vec![
                 Parameter {
-                    name: None,
+                    name: Some("format".to_owned()),
                     r#type: TypeRef::Pointer {
-                        element: Box::new(named_type("char".to_owned())),
+                        element: Box::new(TypeRef::named("char".to_owned())),
                     },
                     optional: false,
                     variadic: false,
+                    role: None,
                     passing_mode: ParameterPassingMode::PositionalOnly,
                 },
                 Parameter {
@@ -2888,12 +2924,18 @@ mod tests {
                     },
                     optional: false,
                     variadic: true,
+                    role: None,
                     passing_mode: ParameterPassingMode::PositionalOnly,
                 },
             ],
             parameters("log", 2),
             "a `...` pack keeps its position without inventing a type name"
         );
+        let log = members
+            .iter()
+            .find(|member| member.owner == vector.id && member.name == "log")
+            .expect("variadic log member");
+        assert!(!log.callable_family_complete);
 
         let insert_ids = members
             .iter()
@@ -2941,14 +2983,15 @@ mod tests {
             .collect()
     }
 
-    /// An angle include resolves to an external root only through the compile
-    /// contexts of the source file that spells it
-    /// (`CppCompileContexts::resolve_external_angle_include` answers
-    /// `MissingCompileContext` when the database names no entry for that file),
+    /// A literal include resolves to an external root only through the compile
+    /// contexts of the translation unit that spells it
+    /// (`CppCompileContexts::resolve_external_include` answers
+    /// `MissingCompileContext` when the database names no entry for that source),
     /// and discovery keeps only `Declared` results. A workspace source the
     /// database does not name therefore contributes nothing at any depth --
     /// including through a header that does exist under a root some *other*
-    /// source declares.
+    /// source declares. Quoted includes also preserve the including header's
+    /// path so its directory is searched before compiler roots.
     ///
     /// This is the property that lets discovery skip reading and parsing those
     /// sources at all. It is checked here as behavior, on a fixture where the
@@ -3070,88 +3113,6 @@ mod tests {
         assert!(discovery.diagnostics.is_empty(), "{discovery:#?}");
         assert!(discovery.profile.informational_evidence.is_empty());
     }
-
-    #[test]
-    fn cancellation_retains_missing_source_information_without_changing_termination() {
-        let temp = tempfile::tempdir().expect("temp root");
-        let root = temp.path().canonicalize().expect("canonical root");
-        ProjectFile::new(root.clone(), "src/main.cpp")
-            .write("#include <widget.h>\n")
-            .expect("present source");
-        ProjectFile::new(root.clone(), "fake/include/widget.h")
-            .write("class Widget {};\n")
-            .expect("header");
-        ProjectFile::new(root.clone(), "compile_commands.json")
-            .write(
-                r#"[{"directory":".","file":"src/main.cpp","arguments":["clang++","-isystem","fake/include","-c","src/main.cpp"]},{"directory":".","file":"generated/widget.cpp","arguments":["clang++","-c","generated/widget.cpp"]}]"#,
-            )
-            .expect("database");
-        let project = TestProject::new(root, Language::Cpp);
-        let cancellation = CancellationToken::new();
-        cancellation.cancel();
-
-        let discovery = resolve_cpp_semantic_pack_dependencies(
-            &project,
-            &DependencyPackLimits::default(),
-            Some(&cancellation),
-        );
-
-        assert!(discovery.cancelled, "{discovery:#?}");
-        assert!(!discovery.complete, "{discovery:#?}");
-        assert_eq!(
-            &[
-                DependencyDiscoveryInformationalEvidence::CppMissingWorkspaceSources {
-                    count: 1,
-                    sample: vec![PathBuf::from("generated/widget.cpp")],
-                }
-            ],
-            discovery.profile.informational_evidence.as_slice()
-        );
-    }
-
-    #[test]
-    fn discovery_failure_retains_missing_source_information() {
-        let temp = tempfile::tempdir().expect("temp root");
-        let root = temp.path().canonicalize().expect("canonical root");
-        ProjectFile::new(root.clone(), "src/main.cpp")
-            .write("#include <nested/widget.h>\n")
-            .expect("present source");
-        ProjectFile::new(root.clone(), "fake/include/nested/widget.h")
-            .write("class Widget {};\n")
-            .expect("header");
-        ProjectFile::new(root.clone(), "compile_commands.json")
-            .write(
-                r#"[{"directory":".","file":"src/main.cpp","arguments":["clang++","-isystem","fake/include","-c","src/main.cpp"]},{"directory":".","file":"generated/widget.cpp","arguments":["clang++","-c","generated/widget.cpp"]}]"#,
-            )
-            .expect("database");
-        let project = TestProject::new(root, Language::Cpp);
-        let limits = DependencyPackLimits {
-            max_source_path_depth: 1,
-            ..DependencyPackLimits::default()
-        };
-
-        let discovery = resolve_cpp_semantic_pack_dependencies(&project, &limits, None);
-
-        assert!(!discovery.complete, "{discovery:#?}");
-        assert!(!discovery.cancelled, "{discovery:#?}");
-        assert!(
-            discovery
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "cpp.header_discovery_failed"),
-            "{discovery:#?}"
-        );
-        assert_eq!(
-            &[
-                DependencyDiscoveryInformationalEvidence::CppMissingWorkspaceSources {
-                    count: 1,
-                    sample: vec![PathBuf::from("generated/widget.cpp")],
-                }
-            ],
-            discovery.profile.informational_evidence.as_slice()
-        );
-    }
-
     #[test]
     fn discovery_uses_project_decoding_for_named_sources() {
         let temp = tempfile::tempdir().expect("temp root");
@@ -3185,45 +3146,6 @@ mod tests {
             discovered_header_sets(&discovery, &root)
         );
     }
-
-    #[test]
-    fn discovery_uses_unsaved_project_source_overlays() {
-        let temp = tempfile::tempdir().expect("temp root");
-        let root = temp.path().canonicalize().expect("canonical root");
-        let source = ProjectFile::new(root.clone(), "src/main.cpp");
-        source
-            .write("int main() { return 0; }\n")
-            .expect("disk source");
-        ProjectFile::new(root.clone(), "fake/include/widget.h")
-            .write("class Widget {};\n")
-            .expect("header");
-        ProjectFile::new(root.clone(), "compile_commands.json")
-            .write(r#"[{"directory":".","file":"src/main.cpp","arguments":["clang++","-isystem","fake/include","-c","src/main.cpp"]}]"#)
-            .expect("database");
-        let base: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Cpp));
-        let project = OverlayProject::new(base);
-        assert!(project.set(
-            source.abs_path(),
-            "#include <widget.h>\nint main() { return 0; }\n".to_owned(),
-        ));
-
-        let discovery = resolve_cpp_semantic_pack_dependencies(
-            &project,
-            &DependencyPackLimits::default(),
-            None,
-        );
-
-        assert!(discovery.complete, "{discovery:#?}");
-        assert_eq!(
-            vec![(
-                root_dependency_name(&root.join("fake/include")),
-                "fake/include".to_owned(),
-                vec!["widget.h".to_owned()],
-            )],
-            discovered_header_sets(&discovery, &root)
-        );
-    }
-
     #[test]
     fn discovery_decodes_legacy_external_headers_lossily() {
         let temp = tempfile::tempdir().expect("temp root");
@@ -3262,66 +3184,6 @@ mod tests {
             discovered_header_sets(&discovery, &root)
         );
     }
-
-    /// A source the database names but discovery cannot read is a hole in the
-    /// answer, and it says so. Each read failure is charged to that file and
-    /// bounded without discarding roots contributed by readable siblings.
-    #[test]
-    fn unreadable_named_sources_are_bounded_without_losing_readable_siblings() {
-        let temp = tempfile::tempdir().expect("temp root");
-        let root = temp.path().canonicalize().expect("canonical root");
-        std::fs::create_dir_all(root.join("src")).expect("source directory");
-        std::fs::write(root.join("src/bad_one.cpp"), b"int bad_one() {\0}\n")
-            .expect("first NUL-bearing source");
-        std::fs::write(root.join("src/bad_two.cpp"), b"int bad_two() {\0}\n")
-            .expect("second NUL-bearing source");
-        ProjectFile::new(root.clone(), "src/good.cpp")
-            .write("#include <widget.h>\n")
-            .expect("readable source");
-        ProjectFile::new(root.clone(), "fake/include/widget.h")
-            .write("class Widget {};\n")
-            .expect("header");
-        ProjectFile::new(root.clone(), "compile_commands.json")
-            .write(
-                r#"[
-                    {"directory":".","file":"src/bad_one.cpp","arguments":["clang++","-isystem","fake/include","-c","src/bad_one.cpp"]},
-                    {"directory":".","file":"src/bad_two.cpp","arguments":["clang++","-isystem","fake/include","-c","src/bad_two.cpp"]},
-                    {"directory":".","file":"src/good.cpp","arguments":["clang++","-isystem","fake/include","-c","src/good.cpp"]}
-                ]"#,
-            )
-            .expect("database");
-        let project = TestProject::new(root.clone(), Language::Cpp);
-        let limits = DependencyPackLimits {
-            max_diagnostics: 1,
-            ..DependencyPackLimits::default()
-        };
-
-        let discovery = resolve_cpp_semantic_pack_dependencies(&project, &limits, None);
-
-        assert!(!discovery.complete, "{discovery:#?}");
-        assert_eq!(1, discovery.diagnostics.len(), "{discovery:#?}");
-        assert_eq!(
-            1,
-            discovery.suppressed_diagnostics.total(),
-            "{discovery:#?}"
-        );
-        let diagnostic = &discovery.diagnostics[0];
-        assert_eq!("cpp.header_discovery_failed", diagnostic.code);
-        assert_eq!(
-            Some(Path::new("src/bad_one.cpp")),
-            diagnostic.location.as_deref().map(Path::new)
-        );
-        assert_eq!(
-            vec![(
-                root_dependency_name(&root.join("fake/include")),
-                "fake/include".to_owned(),
-                vec!["widget.h".to_owned()],
-            )],
-            discovered_header_sets(&discovery, &root),
-            "the readable source still contributes its include root"
-        );
-    }
-
     /// The same hole with no diagnostic cap in play, which is the shape a real
     /// workspace hits: the readable sibling contributes its whole include
     /// closure, the bad file surfaces exactly one error diagnostic charged to
@@ -3337,6 +3199,7 @@ mod tests {
     /// away by an early return (#2750): after #2887 the resolved sets are what
     /// the workspace actually gets.
     #[test]
+    #[hardwon("#2750: one unreadable compile-database source discarded readable sibling results")]
     fn an_unreadable_named_source_leaves_the_other_sources_discovered() {
         let temp = tempfile::tempdir().expect("temp root");
         let root = temp.path().canonicalize().expect("canonical root");
@@ -3401,6 +3264,7 @@ mod tests {
     /// names a path that already failed to read here. The readable header
     /// beside it stays a member of that set (#2750).
     #[test]
+    #[hardwon("#2750: a failed header read left an unusable path in the published source set")]
     fn an_unreadable_external_header_is_not_recorded_into_its_source_set() {
         let temp = tempfile::tempdir().expect("temp root");
         let root = temp.path().canonicalize().expect("canonical root");
@@ -3448,43 +3312,6 @@ mod tests {
         );
         assert!(!discovery.complete, "{discovery:#?}");
     }
-
-    #[test]
-    fn dependency_limit_makes_discovery_incomplete() {
-        let temp = tempfile::tempdir().expect("temp root");
-        let root = temp.path().canonicalize().expect("canonical root");
-        ProjectFile::new(root.clone(), "src/main.cpp")
-            .write("#include <one.hpp>\n#include <two.hpp>\nint main() {}\n")
-            .expect("source");
-        ProjectFile::new(root.clone(), "first/include/one.hpp")
-            .write("class One {};\n")
-            .expect("first header");
-        ProjectFile::new(root.clone(), "second/include/two.hpp")
-            .write("class Two {};\n")
-            .expect("second header");
-        ProjectFile::new(root.clone(), "compile_commands.json")
-            .write(r#"[{"directory":".","file":"src/main.cpp","arguments":["clang++","-isystem","first/include","-isystem","second/include","-c","src/main.cpp"]}]"#)
-            .expect("database");
-        let project = TestProject::new(root, Language::Cpp);
-        let limits = DependencyPackLimits {
-            max_dependencies: 1,
-            ..DependencyPackLimits::default()
-        };
-
-        let discovery = resolve_cpp_semantic_pack_dependencies(&project, &limits, None);
-
-        assert!(!discovery.complete, "{discovery:#?}");
-        assert_eq!(1, discovery.dependencies.len());
-        assert_eq!(1, discovery.suppressed_diagnostics.total());
-        assert!(
-            discovery
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "limit.dependencies"),
-            "{discovery:#?}"
-        );
-    }
-
     #[test]
     fn activated_header_pack_indexes_a_direct_external_member_route() {
         let temp = tempfile::tempdir().expect("temp root");
@@ -3705,174 +3532,6 @@ mod tests {
     fn materialize_with_basic_string_pack(source: &str) -> Arc<SemanticArtifact> {
         materialize_with_cpp_header_pack(CANONICAL_BASIC_STRING_HEADER, source)
     }
-
-    #[test]
-    fn activated_basic_string_pack_lowers_exact_copy_and_move_operations() {
-        let source = concat!(
-            "#include <string>\n",
-            "std::string copy(std::string source) {\n",
-            "  std::string copied = source;\n",
-            "  std::string assigned;\n",
-            "  assigned = source;\n",
-            "  return copied;\n",
-            "}\n",
-            "std::string relay(std::string source) {\n",
-            "  return source;\n",
-            "}\n",
-            "std::string relay_local(std::string source) {\n",
-            "  std::string local = source;\n",
-            "  return local;\n",
-            "}\n",
-            "std::string relay_const(const std::string source) {\n",
-            "  return source;\n",
-            "}\n",
-            "std::string from_literal() {\n",
-            "  return \"tainted\";\n",
-            "}\n",
-            "std::string from_wide_literal() {\n",
-            "  return L\"tainted\";\n",
-            "}\n",
-        );
-        let artifact = materialize_with_basic_string_pack(source);
-
-        let copy = named_procedure(&artifact, "copy");
-        assert_eq!(
-            2,
-            adjacent_call_backed_transfers(copy, TransferKind::Copy),
-            "exact copy construction and assignment must publish adjacent call-backed transfers: {copy:#?}",
-        );
-
-        let relay = named_procedure(&artifact, "relay");
-        assert_eq!(
-            1,
-            adjacent_call_backed_transfers(
-                relay,
-                TransferKind::Move {
-                    invalidation: crate::analyzer::semantic::MoveInvalidation::Invalidated,
-                },
-            ),
-            "a by-value basic_string parameter return must publish one adjacent call-backed invalidating move: {relay:#?}",
-        );
-        assert_eq!(
-            1,
-            relay
-                .points()
-                .iter()
-                .flat_map(|point| &point.events)
-                .filter(|event| matches!(
-                    event.effect,
-                    SemanticEffect::ValueFlow {
-                        kind: ValueFlowKind::Return,
-                        ..
-                    }
-                ))
-                .count(),
-            "the moved value must feed the procedure's normal return port: {relay:#?}",
-        );
-        assert!(
-            !retains_return_transfer_gap(relay),
-            "an exact parameter move return must not retain a return-transfer gap: {relay:#?}",
-        );
-
-        let relay_local = named_procedure(&artifact, "relay_local");
-        assert_eq!(
-            1,
-            adjacent_call_backed_transfers(relay_local, TransferKind::Copy),
-            "named-local copy initialization remains an exact copy transfer: {relay_local:#?}",
-        );
-        assert!(
-            retains_return_transfer_gap(relay_local),
-            "returning a named local must retain its typed return-transfer gap: {relay_local:#?}",
-        );
-
-        let relay_const = named_procedure(&artifact, "relay_const");
-        assert!(
-            !relay_const
-                .points()
-                .iter()
-                .any(|point| point.events.iter().any(|event| {
-                    matches!(
-                        event.effect,
-                        SemanticEffect::ValueFlow {
-                            kind: ValueFlowKind::Transfer(
-                                crate::analyzer::semantic::ValueTransfer {
-                                    kind: TransferKind::Move { .. },
-                                    ..
-                                }
-                            ),
-                            ..
-                        }
-                    )
-                })),
-            "a const by-value parameter cannot select the move constructor: {relay_const:#?}",
-        );
-        assert_eq!(
-            1,
-            adjacent_call_backed_transfers(relay_const, TransferKind::Copy),
-            "a const by-value parameter return selects the copy constructor: {relay_const:#?}",
-        );
-        assert!(
-            !relay_const.gaps().iter().any(|gap| {
-                gap.capability == SemanticCapability::Values
-                    && gap.impacts.contains(SemanticGapImpact::ReturnTransfer)
-            }),
-            "an exact copy-constructed return must not retain a return-transfer gap: {relay_const:#?}",
-        );
-
-        let from_literal = named_procedure(&artifact, "from_literal");
-        assert_eq!(
-            1,
-            adjacent_call_backed_transfers(
-                from_literal,
-                TransferKind::Conversion {
-                    preservation: crate::analyzer::semantic::ValuePreservation::Preserving,
-                },
-            ),
-            "narrow character data must use the exact value-preserving constructor: {from_literal:#?}",
-        );
-        assert!(
-            !retains_return_transfer_gap(from_literal),
-            "an exact character-data return must not retain a return-transfer gap: {from_literal:#?}",
-        );
-        assert_eq!(
-            1,
-            from_literal
-                .points()
-                .iter()
-                .flat_map(|point| &point.events)
-                .filter(|event| matches!(
-                    event.effect,
-                    SemanticEffect::ValueFlow {
-                        kind: ValueFlowKind::Return,
-                        ..
-                    }
-                ))
-                .count(),
-            "the exact character-data construction must feed the normal return port: {from_literal:#?}",
-        );
-
-        let from_wide_literal = named_procedure(&artifact, "from_wide_literal");
-        assert!(
-            !from_wide_literal
-                .points()
-                .iter()
-                .any(|point| point.events.iter().any(|event| {
-                    matches!(
-                        event.effect,
-                        SemanticEffect::ValueFlow {
-                            kind: ValueFlowKind::Transfer(_),
-                            ..
-                        }
-                    )
-                })),
-            "a wide literal must not acquire the narrow character-data constructor: {from_wide_literal:#?}",
-        );
-        assert!(
-            retains_return_transfer_gap(from_wide_literal),
-            "the rejected wide-literal return must retain typed incompleteness: {from_wide_literal:#?}",
-        );
-    }
-
     /// Replay of the shape that opens every frozen DataFlowBench v0.6.0 C++
     /// case (tag `8b70fd39d4c8777af40adadd70c6d91467a7299e`): a `dfb_source`
     /// returning `std::string` built from narrow character data, followed by
@@ -4068,6 +3727,7 @@ mod tests {
     /// parameter, and declines the reference-bound return that would need the
     /// copy constructor the header never declares.
     #[test]
+    #[hardwon("01094c946373: a move-only basic_string selected an undeclared copy operation")]
     fn basic_string_returns_select_only_the_operations_the_header_declares() {
         let artifact = materialize_with_cpp_header_pack(
             concat!(
@@ -4326,30 +3986,6 @@ mod tests {
             "completed work is published exactly once"
         );
     }
-
-    #[test]
-    fn unavailable_compile_context_is_cached_without_claiming_headers() {
-        let temp = tempfile::tempdir().expect("temp root");
-        let root = temp.path().canonicalize().expect("canonical root");
-        let file = ProjectFile::new(root.clone(), "src/main.cpp");
-        file.write("#include <missing.hpp>\n").expect("source");
-        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Cpp));
-        let analyzer = CppAnalyzer::new(project);
-
-        for _ in 0..2 {
-            let outcome = directly_reached_external_headers_while(&analyzer, &file, &|| true)
-                .expect("stable unavailable outcome");
-            assert!(outcome.headers().is_none());
-        }
-        assert_eq!(
-            crate::analyzer::cpp::ExternalHeaderClosureWorkCounts {
-                builds: 1,
-                external_header_parses: 0,
-            },
-            analyzer.external_header_closure_work_counts_for_test()
-        );
-    }
-
     #[test]
     fn conflicting_compile_context_is_cached_without_claiming_one_header() {
         let temp = tempfile::tempdir().expect("temp root");
@@ -4445,6 +4081,9 @@ mod tests {
     ///    `(cpp, sys/socket, connect)` -- the key a reviewed summary on path
     ///    `sys/socket.h`, symbol `connect` is indexed under.
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3535: C calls lost file-scope declarations from reached external headers"
+    )]
     fn a_c_call_binds_the_file_scope_function_its_reached_header_declares() {
         let project_temp = tempfile::tempdir().expect("project root");
         let root = project_temp.path().canonicalize().expect("canonical root");
@@ -4675,6 +4314,431 @@ mod tests {
                     && candidate.external_target.as_deref() == Some(published.id.as_str())
             }),
             "lookup={lookup:#?}\ntrace={trace:#?}"
+        );
+    }
+
+    #[test]
+    fn discovers_and_produces_vector_type_and_member_facts() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), "src/main.cpp")
+            .write("#include <vector>\n")
+            .expect("source");
+        ProjectFile::new(root.clone(), "fake/include/vector")
+            .write("namespace std { template <typename T> class vector { public: void push_back(const T&); }; }")
+            .expect("header");
+        ProjectFile::new(root.clone(), "compile_commands.json")
+            .write(r#"[{"directory":".","file":"src/main.cpp","arguments":["clang++","-isystem","fake/include","-c","src/main.cpp"]}]"#)
+            .expect("database");
+        let project = TestProject::new(root, Language::Cpp);
+        let discovery = resolve_cpp_semantic_pack_dependencies(
+            &project,
+            &DependencyPackLimits::default(),
+            None,
+        );
+        assert!(discovery.complete, "{discovery:#?}");
+        let [dependency] = discovery.dependencies.as_slice() else {
+            panic!("one C++ include-root dependency: {discovery:#?}");
+        };
+        let ResolvedDependencyArtifactInput::SourceSet {
+            root,
+            relative_paths,
+        } = &dependency.artifacts[0].input
+        else {
+            panic!("C++ dependency uses a source set");
+        };
+        let exact = read_exact_source_set(
+            root,
+            relative_paths,
+            DependencyPackLimits::default().max_source_files_per_artifact,
+            DependencyPackLimits::default().max_source_path_depth,
+            &ArtifactProducerLimits::default(),
+        )
+        .expect("exact source set");
+        let artifact = ExactDependencyArtifact::from_exact(
+            DependencyArtifactRole::Declarations,
+            ExternalArtifactKind::CppHeaderSourceSet,
+            None,
+            exact,
+        );
+        let production = CppDependencyPackAdapter.produce(
+            dependency,
+            &[artifact],
+            &ArtifactProducerLimits::default(),
+            None,
+        );
+        let pack = production.pack.expect("C++ pack");
+        let AuthoredPayload::DeclarationFacts { types, members, .. } = &pack.shards[0].payload
+        else {
+            panic!("declaration facts");
+        };
+        let vector = types
+            .iter()
+            .find(|fact| fact.name == "std.vector")
+            .expect("vector type");
+        assert!(
+            members
+                .iter()
+                .any(|fact| fact.owner == vector.id && fact.name == "push_back")
+        );
+    }
+
+    #[test]
+    fn cancellation_retains_missing_source_information_without_changing_termination() {
+        let (_temp, project) = missing_generated_source_project("widget.h");
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let discovery = resolve_cpp_semantic_pack_dependencies(
+            &project,
+            &DependencyPackLimits::default(),
+            Some(&cancellation),
+        );
+
+        assert!(discovery.cancelled, "{discovery:#?}");
+        assert!(!discovery.complete, "{discovery:#?}");
+        assert_missing_generated_source_evidence(&discovery);
+    }
+
+    #[test]
+    fn discovery_failure_retains_missing_source_information() {
+        let (_temp, project) = missing_generated_source_project("nested/widget.h");
+        let limits = DependencyPackLimits {
+            max_source_path_depth: 1,
+            ..DependencyPackLimits::default()
+        };
+
+        let discovery = resolve_cpp_semantic_pack_dependencies(&project, &limits, None);
+
+        assert!(!discovery.complete, "{discovery:#?}");
+        assert!(!discovery.cancelled, "{discovery:#?}");
+        assert!(
+            discovery
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "cpp.header_discovery_failed"),
+            "{discovery:#?}"
+        );
+        assert_missing_generated_source_evidence(&discovery);
+    }
+
+    #[test]
+    fn discovery_uses_unsaved_project_source_overlays() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let source = ProjectFile::new(root.clone(), "src/main.cpp");
+        source
+            .write("int main() { return 0; }\n")
+            .expect("disk source");
+        ProjectFile::new(root.clone(), "fake/include/widget.h")
+            .write("class Widget {};\n")
+            .expect("header");
+        ProjectFile::new(root.clone(), "compile_commands.json")
+            .write(r#"[{"directory":".","file":"src/main.cpp","arguments":["clang++","-isystem","fake/include","-c","src/main.cpp"]}]"#)
+            .expect("database");
+        let base: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Cpp));
+        let project = OverlayProject::new(base);
+        assert!(project.set(
+            source.abs_path(),
+            "#include <widget.h>\nint main() { return 0; }\n".to_owned(),
+        ));
+
+        let discovery = resolve_cpp_semantic_pack_dependencies(
+            &project,
+            &DependencyPackLimits::default(),
+            None,
+        );
+
+        assert!(discovery.complete, "{discovery:#?}");
+        assert_eq!(
+            vec![(
+                root_dependency_name(&root.join("fake/include")),
+                "fake/include".to_owned(),
+                vec!["widget.h".to_owned()],
+            )],
+            discovered_header_sets(&discovery, &root)
+        );
+    }
+
+    #[test]
+    fn unreadable_named_sources_are_bounded_without_losing_readable_siblings() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().canonicalize().expect("canonical root");
+        std::fs::create_dir_all(root.join("src")).expect("source directory");
+        std::fs::write(root.join("src/bad_one.cpp"), b"int bad_one() {\0}\n")
+            .expect("first NUL-bearing source");
+        std::fs::write(root.join("src/bad_two.cpp"), b"int bad_two() {\0}\n")
+            .expect("second NUL-bearing source");
+        ProjectFile::new(root.clone(), "src/good.cpp")
+            .write("#include <widget.h>\n")
+            .expect("readable source");
+        ProjectFile::new(root.clone(), "fake/include/widget.h")
+            .write("class Widget {};\n")
+            .expect("header");
+        ProjectFile::new(root.clone(), "compile_commands.json")
+            .write(
+                r#"[
+                    {"directory":".","file":"src/bad_one.cpp","arguments":["clang++","-isystem","fake/include","-c","src/bad_one.cpp"]},
+                    {"directory":".","file":"src/bad_two.cpp","arguments":["clang++","-isystem","fake/include","-c","src/bad_two.cpp"]},
+                    {"directory":".","file":"src/good.cpp","arguments":["clang++","-isystem","fake/include","-c","src/good.cpp"]}
+                ]"#,
+            )
+            .expect("database");
+        let project = TestProject::new(root.clone(), Language::Cpp);
+        let limits = DependencyPackLimits {
+            max_diagnostics: 1,
+            ..DependencyPackLimits::default()
+        };
+
+        let discovery = resolve_cpp_semantic_pack_dependencies(&project, &limits, None);
+
+        assert!(!discovery.complete, "{discovery:#?}");
+        assert_eq!(1, discovery.diagnostics.len(), "{discovery:#?}");
+        assert_eq!(
+            1,
+            discovery.suppressed_diagnostics.total(),
+            "{discovery:#?}"
+        );
+        let diagnostic = &discovery.diagnostics[0];
+        assert_eq!("cpp.header_discovery_failed", diagnostic.code);
+        assert_eq!(
+            Some(Path::new("src/bad_one.cpp")),
+            diagnostic.location.as_deref().map(Path::new)
+        );
+        assert_eq!(
+            vec![(
+                root_dependency_name(&root.join("fake/include")),
+                "fake/include".to_owned(),
+                vec!["widget.h".to_owned()],
+            )],
+            discovered_header_sets(&discovery, &root),
+            "the readable source still contributes its include root"
+        );
+    }
+
+    #[test]
+    fn dependency_limit_makes_discovery_incomplete() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), "src/main.cpp")
+            .write("#include <one.hpp>\n#include <two.hpp>\nint main() {}\n")
+            .expect("source");
+        ProjectFile::new(root.clone(), "first/include/one.hpp")
+            .write("class One {};\n")
+            .expect("first header");
+        ProjectFile::new(root.clone(), "second/include/two.hpp")
+            .write("class Two {};\n")
+            .expect("second header");
+        ProjectFile::new(root.clone(), "compile_commands.json")
+            .write(r#"[{"directory":".","file":"src/main.cpp","arguments":["clang++","-isystem","first/include","-isystem","second/include","-c","src/main.cpp"]}]"#)
+            .expect("database");
+        let project = TestProject::new(root, Language::Cpp);
+        let limits = DependencyPackLimits {
+            max_dependencies: 1,
+            ..DependencyPackLimits::default()
+        };
+
+        let discovery = resolve_cpp_semantic_pack_dependencies(&project, &limits, None);
+
+        assert!(!discovery.complete, "{discovery:#?}");
+        assert_eq!(1, discovery.dependencies.len());
+        assert_eq!(1, discovery.suppressed_diagnostics.total());
+        assert!(
+            discovery
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "limit.dependencies"),
+            "{discovery:#?}"
+        );
+    }
+
+    #[test]
+    fn activated_basic_string_pack_lowers_exact_copy_and_move_operations() {
+        let source = concat!(
+            "#include <string>\n",
+            "std::string copy(std::string source) {\n",
+            "  std::string copied = source;\n",
+            "  std::string assigned;\n",
+            "  assigned = source;\n",
+            "  return copied;\n",
+            "}\n",
+            "std::string relay(std::string source) {\n",
+            "  return source;\n",
+            "}\n",
+            "std::string relay_local(std::string source) {\n",
+            "  std::string local = source;\n",
+            "  return local;\n",
+            "}\n",
+            "std::string relay_const(const std::string source) {\n",
+            "  return source;\n",
+            "}\n",
+            "std::string from_literal() {\n",
+            "  return \"tainted\";\n",
+            "}\n",
+            "std::string from_wide_literal() {\n",
+            "  return L\"tainted\";\n",
+            "}\n",
+        );
+        let artifact = materialize_with_basic_string_pack(source);
+
+        let copy = named_procedure(&artifact, "copy");
+        assert_eq!(
+            2,
+            adjacent_call_backed_transfers(copy, TransferKind::Copy),
+            "exact copy construction and assignment must publish adjacent call-backed transfers: {copy:#?}",
+        );
+
+        let relay = named_procedure(&artifact, "relay");
+        assert_eq!(
+            1,
+            adjacent_call_backed_transfers(
+                relay,
+                TransferKind::Move {
+                    invalidation: crate::analyzer::semantic::MoveInvalidation::Invalidated,
+                },
+            ),
+            "a by-value basic_string parameter return must publish one adjacent call-backed invalidating move: {relay:#?}",
+        );
+        assert_eq!(
+            1,
+            relay
+                .points()
+                .iter()
+                .flat_map(|point| &point.events)
+                .filter(|event| matches!(
+                    event.effect,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Return,
+                        ..
+                    }
+                ))
+                .count(),
+            "the moved value must feed the procedure's normal return port: {relay:#?}",
+        );
+        assert!(
+            !retains_return_transfer_gap(relay),
+            "an exact parameter move return must not retain a return-transfer gap: {relay:#?}",
+        );
+
+        let relay_local = named_procedure(&artifact, "relay_local");
+        assert_eq!(
+            1,
+            adjacent_call_backed_transfers(relay_local, TransferKind::Copy),
+            "named-local copy initialization remains an exact copy transfer: {relay_local:#?}",
+        );
+        assert!(
+            retains_return_transfer_gap(relay_local),
+            "returning a named local must retain its typed return-transfer gap: {relay_local:#?}",
+        );
+
+        let relay_const = named_procedure(&artifact, "relay_const");
+        assert!(
+            !relay_const
+                .points()
+                .iter()
+                .any(|point| point.events.iter().any(|event| {
+                    matches!(
+                        event.effect,
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::Transfer(
+                                crate::analyzer::semantic::ValueTransfer {
+                                    kind: TransferKind::Move { .. },
+                                    ..
+                                }
+                            ),
+                            ..
+                        }
+                    )
+                })),
+            "a const by-value parameter cannot select the move constructor: {relay_const:#?}",
+        );
+        assert_eq!(
+            1,
+            adjacent_call_backed_transfers(relay_const, TransferKind::Copy),
+            "a const by-value parameter return selects the copy constructor: {relay_const:#?}",
+        );
+        assert!(
+            !relay_const.gaps().iter().any(|gap| {
+                gap.capability == SemanticCapability::Values
+                    && gap.impacts.contains(SemanticGapImpact::ReturnTransfer)
+            }),
+            "an exact copy-constructed return must not retain a return-transfer gap: {relay_const:#?}",
+        );
+
+        let from_literal = named_procedure(&artifact, "from_literal");
+        assert_eq!(
+            1,
+            adjacent_call_backed_transfers(
+                from_literal,
+                TransferKind::Conversion {
+                    preservation: crate::analyzer::semantic::ValuePreservation::Preserving,
+                },
+            ),
+            "narrow character data must use the exact value-preserving constructor: {from_literal:#?}",
+        );
+        assert!(
+            !retains_return_transfer_gap(from_literal),
+            "an exact character-data return must not retain a return-transfer gap: {from_literal:#?}",
+        );
+        assert_eq!(
+            1,
+            from_literal
+                .points()
+                .iter()
+                .flat_map(|point| &point.events)
+                .filter(|event| matches!(
+                    event.effect,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Return,
+                        ..
+                    }
+                ))
+                .count(),
+            "the exact character-data construction must feed the normal return port: {from_literal:#?}",
+        );
+
+        let from_wide_literal = named_procedure(&artifact, "from_wide_literal");
+        assert!(
+            !from_wide_literal
+                .points()
+                .iter()
+                .any(|point| point.events.iter().any(|event| {
+                    matches!(
+                        event.effect,
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::Transfer(_),
+                            ..
+                        }
+                    )
+                })),
+            "a wide literal must not acquire the narrow character-data constructor: {from_wide_literal:#?}",
+        );
+        assert!(
+            retains_return_transfer_gap(from_wide_literal),
+            "the rejected wide-literal return must retain typed incompleteness: {from_wide_literal:#?}",
+        );
+    }
+
+    #[test]
+    fn unavailable_compile_context_is_cached_without_claiming_headers() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let file = ProjectFile::new(root.clone(), "src/main.cpp");
+        file.write("#include <missing.hpp>\n").expect("source");
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Cpp));
+        let analyzer = CppAnalyzer::new(project);
+
+        for _ in 0..2 {
+            let outcome = directly_reached_external_headers_while(&analyzer, &file, &|| true)
+                .expect("stable unavailable outcome");
+            assert!(outcome.headers().is_none());
+        }
+        assert_eq!(
+            crate::analyzer::cpp::ExternalHeaderClosureWorkCounts {
+                builds: 1,
+                external_header_parses: 0,
+            },
+            analyzer.external_header_closure_work_counts_for_test()
         );
     }
 }

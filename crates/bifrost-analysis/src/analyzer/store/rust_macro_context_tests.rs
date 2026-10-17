@@ -5,9 +5,7 @@ use brokk_bifrost_core::analyzer::rust_facts::{
     RustItemMacroExpansion, RustMacroDefinitionSourceFact, RustSourceContextFact,
     RustSourceContextKind,
 };
-use brokk_bifrost_core::analyzer::source_facts::{
-    SourceDeclarationId, SourceOccurrenceId, SourceOccurrenceProvenance,
-};
+use brokk_bifrost_core::analyzer::source_facts::{SourceOccurrenceId, SourceOccurrenceProvenance};
 
 use crate::analyzer::rust::RustAdapter;
 use crate::inline_project::InlineTestProject;
@@ -43,16 +41,6 @@ passthrough! {
 }
 "#;
 
-fn declaration_name(
-    facts: &ParsedSourceFacts,
-    source: &str,
-    declaration: SourceDeclarationId,
-) -> Option<String> {
-    let name = facts.occurrences.declaration(declaration).name?;
-    let range = facts.occurrences.occurrence(name).range;
-    Some(source[range.start_byte..range.end_byte].to_owned())
-}
-
 fn macro_definition<'a>(
     facts: &'a ParsedSourceFacts,
     source: &str,
@@ -62,9 +50,7 @@ fn macro_definition<'a>(
         .rust_items
         .macro_definitions
         .iter()
-        .find(|definition| {
-            declaration_name(facts, source, definition.declaration).as_deref() == Some(name)
-        })
+        .find(|definition| declaration_name(facts, source, definition.declaration) == name)
         .unwrap_or_else(|| {
             panic!(
                 "missing macro definition {name:?}: {:?}",

@@ -5,6 +5,7 @@
 //! and the eventual SQL source present the same normalized fragment contract.
 
 mod batch;
+mod canonical_identity;
 mod common_fact_lowering;
 mod completion_reasons;
 mod demand_overlay;
@@ -13,8 +14,6 @@ mod fact_lowering;
 mod fact_reference_edges;
 mod fact_resolution;
 mod fact_source;
-#[cfg(test)]
-mod language_spike;
 mod local_identity;
 mod model;
 mod mounted;
@@ -23,13 +22,358 @@ mod saturation;
 pub mod seam_profile;
 pub mod seed_key_profile;
 mod selected_context;
+#[cfg(test)]
+pub(crate) mod test_support;
 mod typed_fact_lowering;
-mod universe;
+pub(crate) mod universe;
+pub(crate) mod worker_transport;
+pub use universe::UniverseEntry;
+pub(crate) use universe::{
+    has_table as universe_has_table, is_entry_digest as universe_is_entry_digest,
+    lookup as universe_lookup, projects_intrinsic_definitions,
+};
 
-use crate::hash::HashSet;
+use crate::hash::{HashMap, HashSet};
+
+fn write_profile_line(
+    output: &std::sync::Mutex<std::fs::File>,
+    line: &str,
+    poison_message: &str,
+    profile_name: &str,
+) {
+    use std::io::Write;
+
+    let mut output = output.lock().expect(poison_message);
+    if let Err(error) = writeln!(output, "{line}").and_then(|()| output.flush()) {
+        eprintln!("Bifrost {profile_name} could not write a line: {error}");
+    }
+}
+
+pub(crate) use engine::cancelled_completion;
+pub(crate) use fact_source::{ResolutionIdentityDomain, language_identity_domain};
+
+pub(crate) fn with_bounded_resolution_session<T>(
+    budget: brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget,
+    cancellation: &crate::CancellationToken,
+    operation: impl FnOnce(
+        &brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession,
+    ) -> crate::analyzer::store::Result<T>,
+) -> crate::analyzer::store::Result<
+    brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution<T>,
+> {
+    use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
+
+    let session = ResolutionSession::bounded(budget, Some(cancellation));
+    let answer = operation(&session)?;
+    Ok(session.finish(answer))
+}
+
+pub(crate) fn callable_receiver_is_incomplete(
+    origin: Option<
+        brokk_bifrost_core::analyzer::resolution_facts::ResolutionCallableReceiverOrigin,
+    >,
+    completion: &ResolutionCompletion,
+) -> bool {
+    origin.is_some() && completion != &ResolutionCompletion::Complete
+}
+
+pub(super) fn assert_fresh_metrics_sink<T>(sink: &T, message: &str)
+where
+    T: std::fmt::Debug + PartialEq + Default,
+{
+    assert_eq!(sink, &T::default(), "{message}");
+}
+
+pub(super) fn add_estimated_map_values(
+    base: usize,
+    values: impl IntoIterator<Item = usize>,
+) -> usize {
+    values.into_iter().fold(base, usize::saturating_add)
+}
+
+pub(super) fn poll_resolution_work(
+    cancellation: &crate::CancellationToken,
+    work: &mut usize,
+) -> bool {
+    *work = work
+        .checked_add(1)
+        .expect("resolution cancellation work must fit usize");
+    work.is_multiple_of(engine::CANCELLATION_QUANTUM) && cancellation.is_cancelled()
+}
+
+pub(super) fn observe_resolution_row(
+    cancellation: &crate::CancellationToken,
+    work: &mut usize,
+) -> bool {
+    poll_resolution_work(cancellation, work) | cancellation.is_cancelled()
+}
+
+pub(crate) fn lookup_definition_node(
+    source: &dyn batch::BatchResolutionFragmentSource,
+    definition: SemanticId,
+    cancellation: &crate::CancellationToken,
+) -> crate::analyzer::store::Result<Option<BindingNodeId>> {
+    source.lookup_definition_node(definition, cancellation)
+}
+
+pub(super) fn closed_endpoint(
+    node: BindingNodeId,
+    symbols: impl Into<Box<[SemanticId]>>,
+) -> EndpointSignature {
+    EndpointSignature::new(
+        node,
+        StackPattern::closed(symbols),
+        StackPattern::closed(Vec::new()),
+    )
+}
+
+fn endpoint_has_empty_scopes(endpoint: &model::EndpointSignature) -> bool {
+    endpoint.scopes().fixed().is_empty() && endpoint.scopes().tail().is_none()
+}
+
+pub(crate) fn reference_inventory_completion_with_session(
+    completion: ResolutionCompletion,
+    cancellation: &crate::CancellationToken,
+    session: &brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession,
+) -> ResolutionCompletion {
+    if let ResolutionCompletion::Incomplete(reasons) = &completion {
+        for _ in reasons.iter() {
+            if !session.scope_step() || cancellation.is_cancelled() {
+                return completion.combine(&cancelled_completion());
+            }
+        }
+    }
+    if cancellation.is_cancelled() || !session.observe_cancellation() {
+        completion.combine(&cancelled_completion())
+    } else {
+        completion
+    }
+}
+
+pub(super) fn open_endpoint(
+    node: BindingNodeId,
+    symbols: impl Into<Box<[SemanticId]>>,
+    variable: StackVariableId,
+) -> EndpointSignature {
+    EndpointSignature::new(
+        node,
+        StackPattern::open(symbols, variable),
+        StackPattern::closed(Vec::new()),
+    )
+}
+
+pub(super) fn required_positioned_identifier(
+    identifier: Option<&brokk_bifrost_core::analyzer::resolution_facts::PositionedIdentifierFact>,
+    site: brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteId,
+) -> &brokk_bifrost_core::analyzer::resolution_facts::PositionedIdentifierFact {
+    identifier.unwrap_or_else(|| panic!("site {site} has no positioned identifier"))
+}
+
+pub(super) const fn qualifier_compatibility_rank(
+    compatibility: brokk_bifrost_core::analyzer::resolution_facts::ResolutionMemberQualifierCompatibility,
+) -> u8 {
+    use brokk_bifrost_core::analyzer::resolution_facts::ResolutionMemberQualifierCompatibility;
+
+    match compatibility {
+        ResolutionMemberQualifierCompatibility::RuntimeOnly => 0,
+        ResolutionMemberQualifierCompatibility::TypeOnly => 1,
+        ResolutionMemberQualifierCompatibility::RuntimeOrType => 2,
+    }
+}
+
+pub(super) fn assert_reference_identifier(
+    identifier: &brokk_bifrost_core::analyzer::resolution_facts::PositionedIdentifierFact,
+) {
+    assert_eq!(
+        identifier.role,
+        brokk_bifrost_core::analyzer::resolution_facts::ResolutionIdentifierRole::Reference
+    );
+}
+
+pub(super) fn charge_summary_step(
+    session: Option<&brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession>,
+) -> bool {
+    session.is_none_or(
+        brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession::summary_step,
+    )
+}
+
+pub(super) fn charge_round_step(
+    session: Option<&brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession>,
+) -> bool {
+    session.is_none_or(
+        brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession::round_step,
+    )
+}
+
+pub(super) fn required_resolution_name<'a>(
+    names: &HashMap<brokk_bifrost_core::analyzer::resolution_facts::ResolutionNameId, &'a str>,
+    id: brokk_bifrost_core::analyzer::resolution_facts::ResolutionNameId,
+) -> &'a str {
+    names
+        .get(&id)
+        .copied()
+        .unwrap_or_else(|| panic!("unknown resolution name {id}"))
+}
+
+pub(super) fn required_resolution_scope(
+    scopes: &HashMap<
+        brokk_bifrost_core::analyzer::resolution_facts::ResolutionScopeId,
+        brokk_bifrost_core::analyzer::resolution_facts::ResolutionScopeFact,
+    >,
+    id: brokk_bifrost_core::analyzer::resolution_facts::ResolutionScopeId,
+) -> brokk_bifrost_core::analyzer::resolution_facts::ResolutionScopeFact {
+    *scopes
+        .get(&id)
+        .unwrap_or_else(|| panic!("unknown resolution scope {id}"))
+}
+
+#[cfg(test)]
+fn runtime_type_for_test(value: &str) -> ResolutionSlotValue {
+    ResolutionSlotValue::runtime(
+        ResolutionTypeRef::new(SemanticId::for_test(value), 0),
+        false,
+    )
+}
+
+#[cfg(test)]
+fn positioned_identifier_for_test(
+    site: u32,
+    name: u32,
+    role: brokk_bifrost_core::analyzer::resolution_facts::ResolutionIdentifierRole,
+    namespace: brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace,
+) -> brokk_bifrost_core::analyzer::resolution_facts::PositionedIdentifierFact {
+    test_support::identifier(site, name, role, namespace, None)
+}
+
+#[cfg(test)]
+fn partial_path_id_for_test(value: &str) -> PartialPathId {
+    PartialPathId::for_test(value)
+}
+pub(crate) use fact_lowering::jvm_type_prefix_gap_origin_is_safe;
+
+static GO_UNIVERSE_IDENTITY_DIGESTS: std::sync::LazyLock<HashSet<[u8; 32]>> =
+    std::sync::LazyLock::new(|| {
+        universe::go_entries()
+            .map(universe::identity_digest)
+            .collect()
+    });
+
+pub(crate) fn go_universe_identity_digest(
+    namespace: brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace,
+    spelling: &str,
+) -> Option<[u8; 32]> {
+    universe::lookup(
+        brokk_bifrost_core::analyzer::Language::Go,
+        namespace,
+        spelling,
+    )
+    .map(universe::identity_digest)
+}
 
 fn never_cancelled() -> bool {
     false
+}
+
+/// Recognize one selected Go universe identity without projecting it as a
+/// source declaration. The Go universe is a fixed language table, and each
+/// entry is compared through the same shared identity used during binding.
+pub(crate) fn is_go_universe_identity(
+    source: &impl BatchResolutionFragmentSource,
+    identity: SemanticId,
+    cancellation: &crate::CancellationToken,
+) -> crate::analyzer::store::Result<Option<bool>> {
+    if cancellation.is_cancelled() {
+        return Ok(None);
+    }
+    if !source.supports_go_universe() {
+        return Ok(Some(false));
+    }
+    let Some(digest) = source.shared_name_digest_for_identity(identity, cancellation)? else {
+        return if cancellation.is_cancelled() {
+            Ok(None)
+        } else {
+            Ok(Some(false))
+        };
+    };
+    if cancellation.is_cancelled() {
+        return Ok(None);
+    }
+    Ok(Some(GO_UNIVERSE_IDENTITY_DIGESTS.contains(&digest)))
+}
+
+/// Identify a fixed language-universe rule from its selected scalar identity.
+/// No source spelling or parser-backed declaration is inferred.
+pub(crate) fn universe_entry_for_identity(
+    source: &impl BatchResolutionFragmentSource,
+    identity: SemanticId,
+    cancellation: &crate::CancellationToken,
+) -> crate::analyzer::store::Result<Option<universe::UniverseEntry>> {
+    let Some(digest) = source.shared_name_digest_for_identity(identity, cancellation)? else {
+        return Ok(None);
+    };
+    Ok(universe::fixed_type_entries()
+        .chain(universe::go_entries())
+        .find(|entry| universe::identity_digest(*entry) == digest))
+}
+
+fn required_resolution_site(
+    sites: &crate::hash::HashMap<
+        brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteId,
+        brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteFact,
+    >,
+    id: brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteId,
+) -> brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteFact {
+    *sites
+        .get(&id)
+        .unwrap_or_else(|| panic!("unknown resolution site {id}"))
+}
+
+pub(super) const fn resolution_member_kind_rank(
+    kind: brokk_bifrost_core::analyzer::resolution_facts::ResolutionMemberKind,
+) -> u8 {
+    use brokk_bifrost_core::analyzer::resolution_facts::ResolutionMemberKind;
+
+    match kind {
+        ResolutionMemberKind::NestedType => 0,
+        ResolutionMemberKind::Method => 1,
+        ResolutionMemberKind::Constructor => 2,
+        ResolutionMemberKind::Field => 3,
+        ResolutionMemberKind::AssociatedType => 4,
+    }
+}
+
+pub(super) const fn binding_projection_kind_rank(
+    kind: brokk_bifrost_core::analyzer::resolution_facts::BindingProjectionKind,
+) -> u8 {
+    use brokk_bifrost_core::analyzer::resolution_facts::BindingProjectionKind;
+
+    match kind {
+        BindingProjectionKind::TargetTypeIdentity => 0,
+        BindingProjectionKind::TargetDeclaredValueType => 1,
+        BindingProjectionKind::TargetCallableResultType => 2,
+        BindingProjectionKind::TargetConstructorOwnerType => 3,
+        BindingProjectionKind::TargetTypeOrDeclaredValueType => 4,
+        BindingProjectionKind::TargetMemberOwnerType => 5,
+        BindingProjectionKind::TargetNominalTypeIdentity => 6,
+        BindingProjectionKind::TargetCallableLaterResultType => 7,
+        BindingProjectionKind::NonInvokingMemberReference => 8,
+    }
+}
+
+pub(super) const fn declaration_type_role_rank(
+    role: brokk_bifrost_core::analyzer::resolution_facts::DeclarationTypeRole,
+) -> u8 {
+    use brokk_bifrost_core::analyzer::resolution_facts::DeclarationTypeRole;
+
+    match role {
+        DeclarationTypeRole::Value => 0,
+        DeclarationTypeRole::Parameter => 1,
+        DeclarationTypeRole::Return => 2,
+        DeclarationTypeRole::Identity => 3,
+        DeclarationTypeRole::NominalIdentity => 4,
+        DeclarationTypeRole::CallableFirstResult => 5,
+    }
 }
 
 pub use batch::{
@@ -37,18 +381,27 @@ pub use batch::{
     BatchCandidateRequest, BatchDefinitionNode, BatchEndpointClassification, BatchReferenceSeed,
     BatchResolutionEngine, BatchResolutionFragmentSource, BatchedReferenceAnswer,
     CandidatePathIdentity, FactReferenceSiteMetadata, MAX_REFERENCE_SEEDS_PER_BATCH,
-    ReferenceBatchAnswer, ReferenceSeed, ReferenceSeedBatch, ReferenceSeedReadOutcome,
-    ReferenceSeedReadTerminal, ResolutionBatchMetrics, ResolutionBatchSummary,
-    ReverseCandidateGapExclusionPlan, ReverseCandidateGapIdentity, ReverseReferenceSeedRequest,
-    SeedReadAuthority, SeededPartialPath, SeededReferenceRequest,
+    ReferenceBatchAnswer, ReferenceLocalPathEvidence, ReferenceSeed, ReferenceSeedBatch,
+    ReferenceSeedReadOutcome, ReferenceSeedReadTerminal, ResolutionBatchMetrics,
+    ResolutionBatchSummary, ReverseCandidateGapExclusionPlan, ReverseCandidateGapIdentity,
+    ReverseReferenceSeedRequest, SeedReadAuthority, SeededPartialPath, SeededPathKey,
+    SeededReferenceRequest,
 };
 pub(crate) use batch::{
-    MAX_REVERSE_TARGETS_PER_BATCH, MAX_SOURCE_ROWS_PER_BATCH, ReverseCandidateGapCoverage,
-    ReverseCandidateGapCoverageBuilder, ReverseCandidateGapCoverageView,
-    ReverseCandidateGapLocation, ReverseCandidateGapRow, SelectedContextPathFragmentSource,
+    ForwardCandidateArtifactCache, MAX_REVERSE_TARGETS_PER_BATCH, MAX_SOURCE_ROWS_PER_BATCH,
+    ReverseCandidateGapCoverage, ReverseCandidateGapCoverageBuilder,
+    ReverseCandidateGapCoverageView, ReverseCandidateGapLocation, ReverseCandidateGapRow,
+    SelectedContextPathFragmentSource,
+};
+pub use canonical_identity::ResolutionIdentityDigestKey;
+pub(crate) use canonical_identity::{
+    CanonicalIdentityDescriptor, CanonicalIdentityHasher, CanonicalIdentityNumbers,
+    CanonicalIdentityPart, mounted_identity_digest, selected_identity_content_digest,
 };
 pub use common_fact_lowering::LoweredDeferredMemberOwner;
-pub(crate) use common_fact_lowering::LoweredRootImportProvenance;
+pub(crate) use common_fact_lowering::{
+    LoweredReferenceLookupIdentity, LoweredRootImportProvenance,
+};
 pub use completion_reasons::CompletionReasons;
 pub(crate) use demand_overlay::DemandSelectedOverlayBlueprint;
 pub use engine::{
@@ -58,9 +411,11 @@ pub use engine::{
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use fact_lowering::fixture_names::{
     FixtureRootImportAnchors, record as record_fixture_identity_catalog,
+    record_selected as record_fixture_selected_identity_catalog,
 };
+pub(crate) use fact_lowering::gap_reason_semantic_identity;
 pub(crate) use fact_lowering::package::{
-    LoweredGoPackageImport, LoweredPackageMember, LoweredPackageReference,
+    LoweredGoPackageImport, LoweredPackageMember, LoweredPackageReference, package_domain_semantic,
 };
 pub use fact_lowering::{
     LoweredCandidateDirection, LoweredCoverageGap, LoweredResolutionFragment, LoweredSemanticRole,
@@ -77,8 +432,10 @@ pub(crate) use fact_lowering::{
     scope_head_node, scope_head_node_identity, structured_import_gap_path_id,
 };
 pub(crate) use fact_lowering::{
-    root_export_token, root_import_anchor_semantic_identity, root_import_token,
+    root_export_token, root_import_anchor_for_identity, root_import_anchor_semantic_identity,
+    root_import_token,
 };
+pub(crate) use fact_reference_edges::NativeReferenceEdgeBatchProjector;
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use fact_reference_edges::validate_selected_reference_edge_coverage;
 pub use fact_reference_edges::{
@@ -98,19 +455,29 @@ pub use fact_reference_edges::{
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use fact_resolution::PreloadedFactResolutionService;
+pub(crate) use fact_resolution::call_applicability::{
+    ArgumentFormalBinding, CallApplicabilityAdapter, CandidateAssessment, ConversionEvidence,
+    ConversionKind, IntrinsicCallType, MappingAssessment, PartialOrder, TypeInCallPosition,
+    map_call_shape, map_scala_call_shape,
+};
 pub(crate) use fact_resolution::{
-    DemandAcyclicOutcome, DemandRootDiscovery, DemandRootPlan, DemandRootProvider,
-    DemandRootUnavailableReason, FactDemandResolution,
+    AnswerMap, CallCandidateApplicability, CallTypeSubstitution, DemandAcyclicOutcome,
+    DemandClosureDischarges, DemandMemberSelection, DemandMemberSelectionRequest,
+    DemandRootDiscovery, DemandRootPlan, DemandRootProvider, DemandRootUnavailableReason,
+    FactDemandResolution, FactEvaluation, InternedFactRow, SelectedDemandState, StateMap,
 };
 pub use fact_resolution::{
-    FactBatchedReferenceAnswer, FactCallableReceiverChannels, FactCallableReceiverDisposition,
-    FactCallableReceiverTargetDisposition, FactReadSession, FactReferenceBatchAnswer,
-    FactReferenceReceiverGap, FactResolutionAnswer, FactResolutionBatchSummary,
-    FactReverseReferenceBinding, FactReverseResolutionMetrics, FactTargetReferenceAnswer,
-    FactTargetReferenceBatchAnswer, SelectedFactResolutionEngine, SelectedFactResolutionSnapshot,
+    FactBatchedReferenceAnswer, FactCallableCandidateApplicability, FactCallableReceiverChannels,
+    FactCallableReceiverDisposition, FactCallableReceiverTargetDisposition, FactReadSession,
+    FactReferenceBatchAnswer, FactReferenceReceiverGap, FactResolutionAnswer,
+    FactResolutionBatchSummary, FactReverseReferenceBinding, FactReverseResolutionMetrics,
+    FactTargetReferenceAnswer, FactTargetReferenceBatchAnswer, SelectedFactResolutionEngine,
+    SelectedFactResolutionSnapshot,
 };
 pub(crate) use fact_resolution::{
-    FactIntrinsicTypeDescriptor, FactResolutionOperation, PolledCompletionAccumulator,
+    FactIntrinsicTypeDescriptor, FactMemberRouteKind, FactProjectedTypeNode,
+    FactProjectedTypeNodeForm, FactProjectedTypeShape, FactResolutionOperation,
+    ForwardOperationArtifactContext, GoReceiverSlotTypeOverlay, PolledCompletionAccumulator,
     SelectedFactOperationBlueprint, SelectedFactOperationBlueprintConstruction,
 };
 #[cfg(any(test, feature = "test-support"))]
@@ -123,21 +490,29 @@ pub(crate) use fact_resolution::{
     selected_fact_operation_construction_count_for_test,
 };
 pub(crate) use fact_source::{
-    DeclarationAccessDecision, DeclarationAccessRequest, DeclarationAccessRow,
+    CompanionTypeRelation, DeclarationAccessDecision, DeclarationAccessRequest,
+    DeclarationAccessRow, JvmDeclarationAccessRules, JvmImplicitRootProvider, ReasonOwnerRow,
     RustDeclarationContextSource, RustReferenceContextSource, SelectedDeclarationAccessSource,
+    SubclassAccessContext, language_callables_occupy_value_namespace, language_has_jvm_semantics,
+    language_implicit_root_member_names, language_implicit_root_providers,
+    language_import_owner_steps_bind_singletons, language_jvm_declaration_access_rules,
+    language_jvm_package_requires_directory_agreement,
+    language_type_qualifiers_search_companion_members, visit_mapped_typed_pages,
 };
 pub use fact_source::{
-    DeferredMemberOwnerLookupName, FactPageVisitor, FactReadOutcome, FactReadTerminal, FactRequest,
-    FactResolutionSource, GoMemberDeclaration, GoMemberDeclarationKind, GoStructField,
-    JavaAccessEndpoint, JavaInheritanceDeclaration, JavaInheritanceDeclarationKind,
-    LoweredRustDeclarationAuthority, LoweredRustReferenceContext, MAX_FACT_REQUESTS_PER_BATCH,
-    MAX_FACT_ROWS_PER_PAGE, MAX_TYPED_FACT_REQUESTS_PER_BATCH, MAX_TYPED_FACT_ROWS_PER_PAGE,
-    QualifiedRouteSlotLookup, RustImplementedTraits, SelectedFactRow, SelectedGapReasonProvenance,
-    SelectedQualifiedRoute, SelectedTypeFrontierCompletion, SelectedTypedFactSource,
-    SelectedTypedRow, TypedFactPageVisitor, TypedFactReadOutcome, TypedFactReadTerminal,
-    TypedFactRequest,
+    DeferredMemberOwnerLookupName, DeferredMemberOwnerProof, ExternalMemberIdentity,
+    ExternalOwnerIdentity, FactPageVisitor, FactReadOutcome, FactReadTerminal, FactRequest,
+    FactResolutionSource, GoInterfaceMethod, GoMemberDeclaration, GoMemberDeclarationKind,
+    GoStructField, JavaAccessEndpoint, JavaInheritanceDeclaration, JavaInheritanceDeclarationKind,
+    JvmAccessEndpoint, LoweredIntrinsicTypeDescriptor, LoweredRustDeclarationAuthority,
+    LoweredRustReferenceContext, MAX_FACT_REQUESTS_PER_BATCH, MAX_FACT_ROWS_PER_PAGE,
+    MAX_TYPED_FACT_REQUESTS_PER_BATCH, MAX_TYPED_FACT_ROWS_PER_PAGE, NamedArgumentLabel,
+    NamedArgumentLabelRead, QualifiedRouteSlotLookup, RustImplementedTraits, SelectedFactRow,
+    SelectedGapReasonProvenance, SelectedInvocationRole, SelectedQualifiedRoute,
+    SelectedTypeFrontierCompletion, SelectedTypedFactSource, SelectedTypedRow,
+    SelectedTypedRowIdentity, SelectedTypedRowKey, TypedFactPageVisitor, TypedFactReadOutcome,
+    TypedFactReadTerminal, TypedFactRequest,
 };
-pub(crate) use local_identity::ResolutionRegisteredIdentities;
 pub(crate) use local_identity::SUPPLEMENTAL_LOCAL_KEY_BASE;
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use local_identity::test_shared_names;
@@ -152,6 +527,7 @@ pub(crate) use local_identity::{
     SelectedStageIdentityProvenance, selected_resolution_fragment_id,
 };
 pub use local_identity::{PerRequestSharedNames, SharedNameInterner};
+pub(crate) use local_identity::{ResolutionIdentityTranslation, ResolutionRegisteredIdentities};
 pub use model::{
     BindingCandidateAdmission, BindingFragmentId, BindingNodeId, BindingNodeKind, CompletionReason,
     DerivationKey, EndpointSignature, GoDefinitionNamespaces, PartialPath, PartialPathId,
@@ -160,6 +536,10 @@ pub use model::{
     ScopeStackPattern, SemanticId, SharedNameId, StackPattern, StackVariable, StackVariableId,
     SymbolStackPattern, TypeTransferRule, TypeTransferValueTransform, TypedFrontierState,
     WitnessStep,
+};
+pub(crate) use model::{
+    BindingOrigin, GoBindingClassification, UnindexedExternalFrontier, binding_origin_rank,
+    classify_go_binding,
 };
 pub(crate) use model::{ResolutionCompletionAccumulator, combine_completion_with_poll};
 #[cfg(any(test, feature = "test-support"))]
@@ -171,25 +551,31 @@ pub(crate) use selected_context::{
     CatalogRootImportAnchors, SelectedContextIdentities, SelectedContextOverlay,
     SelectedContextOverlayCompilation, SelectedContextPathPublication,
     SelectedContextPathPublicationOutcome, SelectedContextPathSource, SelectedContextPathToken,
+    SelectedJvmBridgeEvidence, SelectedJvmBridgeProvenance, SelectedJvmBridgeVisibility,
     SelectedResolutionContextInputs, SelectedResolutionContextSet,
     SelectedResolutionContextValidationOutcome, SelectedResolutionMountContext,
     SelectedRootBridgeDescriptor, SelectedRootBridgeProjection, SelectedRootImportAnchors,
     SelectedRootPathHalf, classify_selected_root_path_half, compile_selected_context_overlay,
     compile_selected_context_overlay_in_session, compile_selected_root_bridge,
     visit_selected_root_export_half_pages, visit_selected_root_import_half_pages,
+    visit_selected_root_import_half_pages_with_targets,
 };
 pub(crate) use selected_context::{
     SelectedGoImportBindingDescriptor, SelectedPackageBridgeDescriptor,
 };
+pub(crate) use typed_fact_lowering::call_semantic_identity;
 pub use typed_fact_lowering::{
-    LoweredBindingProjection, LoweredCallApplicabilityObligation, LoweredCallableParameterProperty,
-    LoweredCallableResultBinding, LoweredCallableResultTypeProperty,
-    LoweredCallableSignatureProperty, LoweredConstructionRequirementProperty,
-    LoweredDeclarationTypeProperty, LoweredDeclarationVisibilityProperty,
-    LoweredDefinitionPropertyGap, LoweredIntrinsicSeed, LoweredMemberOwnerProperty,
+    ExternalMemberCoverage, LoweredBindingProjection, LoweredCallApplicabilityObligation,
+    LoweredCallArgumentProperty, LoweredCallableParameterApplicability,
+    LoweredCallableParameterProperty, LoweredCallableResultBinding,
+    LoweredCallableResultTypeProperty, LoweredCallableSignatureProperty,
+    LoweredConstructionRequirementProperty, LoweredDeclarationTypeProperty,
+    LoweredDeclarationVisibilityProperty, LoweredDeclaredTypeArgument,
+    LoweredDefinitionPropertyGap, LoweredGenericFormal, LoweredGenericFormalDefault,
+    LoweredGenericTypeAliasParameter, LoweredIntrinsicSeed, LoweredMemberOwnerProperty,
     LoweredMemberScopeProperty, LoweredQualifiedSeededRoute, LoweredSupertypeProperty,
-    LoweredTypeComponent, LoweredTypeTransfer, LoweredTypedFragment, LoweredTypedFrontier,
-    LoweredUnderlyingType,
+    LoweredSupertypeTarget, LoweredTypeArgument, LoweredTypeComponent, LoweredTypeProduction,
+    LoweredTypeTransfer, LoweredTypedFragment, LoweredTypedFrontier, LoweredUnderlyingType,
 };
 #[cfg(test)]
 pub(crate) fn rich_java_resolution_facts_for_test()
@@ -559,7 +945,7 @@ fn assert_lookup_recipes_reach_emitted_artifact(
             .lookup_recipe(route.source_lookup())
             .expect("source lookup recipe");
         assert_eq!(member.namespace(), route.namespace());
-        assert_eq!(member.semantic_language(), source.semantic_language());
+        assert_eq!(member.identity_domain(), source.identity_domain());
         assert_eq!(member.spelling(), source.spelling());
         assert!(
             source.namespace() == member.namespace()
@@ -709,16 +1095,7 @@ pub(crate) fn lower_resolution_facts_for_selection(
     );
     let common =
         common_fact_lowering::lower_common_resolution_facts(&mut identities, language, facts);
-    let identities = identities.finish();
-    assert_lookup_recipes_reach_emitted_artifact(&lexical, &typed, &common, &identities);
-    assert_precedence_namespaces_reach_emitted_artifact(&lexical, &identities);
-    LoweredResolutionFactsWithIdentityCatalog {
-        lexical,
-        typed,
-        common,
-        identities: Box::new(identities),
-    }
-    .rekey_dense()
+    finish_lowered_resolution_facts(lexical, typed, common, identities)
 }
 
 #[cfg(test)]
@@ -738,6 +1115,15 @@ pub(crate) fn lower_resolution_paths_with_identity_catalog_for_test(
     );
     let common =
         common_fact_lowering::lower_common_resolution_facts(&mut identities, language, &facts);
+    finish_lowered_resolution_facts(lexical, typed, common, identities)
+}
+
+fn finish_lowered_resolution_facts(
+    lexical: fact_lowering::LoweredResolutionFragment,
+    typed: typed_fact_lowering::LoweredTypedFragment,
+    common: common_fact_lowering::LoweredCommonFacts,
+    identities: local_identity::ResolutionIdentityCatalogBuilder,
+) -> LoweredResolutionFactsWithIdentityCatalog {
     let identities = identities.finish();
     assert_lookup_recipes_reach_emitted_artifact(&lexical, &typed, &common, &identities);
     assert_precedence_namespaces_reach_emitted_artifact(&lexical, &identities);
@@ -763,3 +1149,5 @@ pub fn site_type_frontier_semantic_for_test(
 
 #[cfg(test)]
 pub(crate) use fact_resolution::SelectedContextTestOracle;
+
+pub(crate) use fact_resolution::{GoInterfaceSatisfaction, GoMethodSatisfaction};

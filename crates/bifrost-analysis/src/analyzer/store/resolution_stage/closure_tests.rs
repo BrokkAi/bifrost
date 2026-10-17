@@ -3,7 +3,7 @@ use crate::analyzer::Language;
 use crate::analyzer::resolution::SelectedResolutionMountOrdinal;
 use crate::analyzer::store::WorkspaceSnapshots;
 use crate::analyzer::store::resolution_lexical::SelectedResolutionLexicalSource;
-use crate::analyzer::store::resolution_operation::with_dense_selected_macro_fixture;
+use crate::analyzer::store::resolution_operation::DenseSelectedMacroFixture;
 use crate::analyzer::store::resolution_selection::{
     SelectedResolutionLanguage, SelectedResolutionMountInventoryOutcome, tests::SelectionFixture,
 };
@@ -15,7 +15,9 @@ fn structured_closure_kinds_preserve_exact_authority_repeat_and_atomicity() {
     // This stage law tests descriptor/authority/transaction behavior; it does
     // not claim the matched macro fixture made unmatched/empty/include decisions.
     // Those decisions are exercised by the actual operation matcher tests.
-    with_dense_selected_macro_fixture(|store, owner, fixtures| {
+    // These APIs close argument uncertainty, not an item's separate
+    // generated-name/member surface (#5375).
+    DenseSelectedMacroFixture::with_expression_inputs(|store, owner, fixtures| {
         let live = CancellationToken::new();
         let snapshots = WorkspaceSnapshots::from_iter([(owner.lang.clone(), owner.clone())]);
         let SelectedResolutionMountInventoryOutcome::Ready(selection) = store

@@ -101,6 +101,41 @@ fn find_import_graph_candidates(
     // (2) Defining files + directory siblings.
     let mut source_files: BTreeSet<ProjectFile> =
         all_targets.iter().map(|cu| cu.source().clone()).collect();
+    if language_for_target(target) == Language::Java {
+        let owner = if target.is_class() {
+            Some(target.clone())
+        } else {
+            analyzer.parent_of(target)
+        };
+        if let Some(owner) = owner.filter(CodeUnit::is_class) {
+            let mut ancestor = Some(owner.clone());
+            let mut local_type = false;
+            while let Some(current) = ancestor {
+                if current.is_function() {
+                    local_type = true;
+                    break;
+                }
+                if current.is_module() {
+                    break;
+                }
+                ancestor = analyzer.parent_of(&current);
+            }
+            if local_type {
+                // Local Java classes carry their lexical owner and source
+                // position in the structured identity. Mirrored source sets
+                // can contain the same declaration identity in another file,
+                // outside this file's directory. Admit those exact type peers
+                // so each copy is resolved in its own lexical context.
+                source_files.extend(
+                    analyzer
+                        .declarations_sharing_name(&owner)
+                        .into_iter()
+                        .filter(CodeUnit::is_class)
+                        .map(|unit| unit.source().clone()),
+                );
+            }
+        }
+    }
     source_files.extend(cpp_related_callable_source_files(
         &all_targets,
         analyzer,
@@ -224,10 +259,7 @@ fn find_import_graph_candidates(
 }
 
 fn is_constructor_target(target: &CodeUnit, analyzer: &dyn IAnalyzer) -> bool {
-    analyzer
-        .signature_metadata(target)
-        .iter()
-        .any(|metadata| metadata.callable_is_constructor())
+    crate::analyzer::usages::common::is_constructor_metadata(&analyzer.signature_metadata(target))
 }
 
 /// Files that can name declarations in `target_language` through the usage
@@ -607,6 +639,10 @@ impl ExplicitCandidateProvider {
 }
 
 impl CandidateFileProvider for ExplicitCandidateProvider {
+    fn explicit_candidate_files(&self) -> Option<&HashSet<ProjectFile>> {
+        Some(self.files.as_ref())
+    }
+
     fn find_candidates(
         &self,
         target: &CodeUnit,
@@ -854,7 +890,7 @@ fn cpp_free_function_requires_written_identifier(
 }
 
 fn is_cancelled(cancellation: Option<&CancellationToken>) -> bool {
-    cancellation.is_some_and(CancellationToken::is_cancelled)
+    brokk_bifrost_core::cancellation::optional_is_cancelled(cancellation)
 }
 
 #[cfg(test)]
@@ -865,6 +901,7 @@ mod tests {
     use crate::analyzer::workspace::EmptyAnalyzer;
     use crate::analyzer::{CodeUnitType, ImportInfo, Language};
     use crate::test_support::AnalyzerFixture;
+    use brokk_bifrost_test_macros::hardwon;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// The importer walks take a `QueryToken`, and these tests drive them with
@@ -959,13 +996,12 @@ mod tests {
         fn referencing_files_of(&self, _file: &ProjectFile) -> HashSet<ProjectFile> {
             panic!("cancellable discovery must not build the global reverse index");
         }
-
-        fn import_info_of(&self, _token: QueryToken<'_>, _file: &ProjectFile) -> Vec<ImportInfo> {
-            Vec::new()
-        }
     }
 
     #[test]
+    #[hardwon(
+        "#1748: Scala compiler encodings such as `$plus` must not be confused with source operators; no parser-backed usage test can generate these synthetic names as written callees"
+    )]
     fn scala_symbolic_candidate_names_exclude_synthetic_dollar_identifiers() {
         for identifier in ["-", "<", "::", "++", "unary_-", "unary_!"] {
             assert!(
@@ -994,6 +1030,9 @@ mod tests {
     /// descendant index and resolved every unrelated class hierarchy in the
     /// workspace (#1748).
     #[test]
+    #[hardwon(
+        "#2602: Kotlin constructor candidate lookup avoids scanning workspace descendants when the constructor has a direct type identity"
+    )]
     fn kotlin_constructor_candidates_skip_workspace_descendant_resolution() {
         let unrelated_hierarchy = (0..64)
             .map(|index| format!("open class Base{index}\nclass Child{index} : Base{index}()\n"))
@@ -1030,82 +1069,6 @@ mod tests {
         assert!(
             definition_queries < 8,
             "constructor discovery must not resolve the unrelated workspace hierarchy; got {definition_queries} definition queries"
-        );
-    }
-
-    #[test]
-    fn cancellable_importer_scan_stops_after_current_file_without_recording_partial_work() {
-        let root = std::env::temp_dir();
-        let target_file = ProjectFile::new(root.clone(), "Target.java");
-        let importer = ProjectFile::new(root, "Importer.java");
-        let cancellation = CancellationToken::default();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let provider = CancellingImportProvider {
-            cancellation: cancellation.clone(),
-            calls: Arc::clone(&calls),
-            imported: CodeUnit::new(target_file.clone(), CodeUnitType::Class, "pkg", "Target"),
-        };
-
-        let scope_analyzer = scope_analyzer();
-        let scope = AnalyzerQueryScope::new(&scope_analyzer);
-        let token = scope.token();
-        let importers = find_direct_importers_with_cancellation(
-            [importer],
-            &provider,
-            token,
-            &[target_file].into_iter().collect(),
-            &cancellation,
-        );
-
-        assert_eq!(calls.load(Ordering::Acquire), 1);
-        assert!(importers.is_empty());
-    }
-
-    /// The single-file test above can't exercise real concurrency. This runs enough files through
-    /// the now-parallel `par_iter().try_for_each(..)` that many are genuinely in flight at once, and
-    /// checks the same cancellation invariant still holds when multiple worker threads can observe
-    /// (and race on) the same cancellation flag and the same shared `importers` sink.
-    #[test]
-    fn cancellable_importer_scan_stops_early_without_recording_partial_work_under_concurrency() {
-        let root = std::env::temp_dir();
-        let target_file = ProjectFile::new(root.clone(), "Target.java");
-        let file_count = 200;
-        let importers_input: Vec<ProjectFile> = (0..file_count)
-            .map(|i| ProjectFile::new(root.clone(), format!("Importer{i}.java")))
-            .collect();
-        let cancellation = CancellationToken::default();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let provider = CancellingImportProvider {
-            cancellation: cancellation.clone(),
-            calls: Arc::clone(&calls),
-            imported: CodeUnit::new(target_file.clone(), CodeUnitType::Class, "pkg", "Target"),
-        };
-
-        let scope_analyzer = scope_analyzer();
-        let scope = AnalyzerQueryScope::new(&scope_analyzer);
-        let token = scope.token();
-        let importers = find_direct_importers_with_cancellation(
-            importers_input,
-            &provider,
-            token,
-            &[target_file].into_iter().collect(),
-            &cancellation,
-        );
-
-        assert!(
-            importers.is_empty(),
-            "a cancelled scan must not record partial matches, even with many files racing \
-             concurrently on the same cancellation flag and the same shared sink"
-        );
-        let observed_calls = calls.load(Ordering::Acquire);
-        assert!(
-            observed_calls >= 1,
-            "at least the file that triggered cancellation should have run"
-        );
-        assert!(
-            observed_calls < file_count,
-            "cancellation should stop the scan short of visiting every one of the {file_count} \
-             files, got {observed_calls}"
         );
     }
 
@@ -1150,10 +1113,6 @@ mod tests {
             panic!("cancellable discovery must not build the global reverse index");
         }
 
-        fn import_info_of(&self, _token: QueryToken<'_>, _file: &ProjectFile) -> Vec<ImportInfo> {
-            Vec::new()
-        }
-
         fn could_import_file(
             &self,
             _source_file: &ProjectFile,
@@ -1190,6 +1149,9 @@ mod tests {
     /// get one chance to resolve the whole set first. Fails with zero
     /// prefetches before the hook is called.
     #[test]
+    #[hardwon(
+        "#1748: Operation-count test ensures import targets are prefetched once before candidate-specific resolution"
+    )]
     fn importer_scan_prefetches_import_targets_once_before_asking_per_candidate() {
         let root = std::env::temp_dir();
         let target_file = ProjectFile::new(root.clone(), "Target.java");
@@ -1235,44 +1197,10 @@ mod tests {
         );
     }
 
-    /// A cancelled scan must not spend the batch either.
     #[test]
-    fn cancelled_importer_scan_skips_the_prefetch_and_the_walk() {
-        let root = std::env::temp_dir();
-        let target_file = ProjectFile::new(root.clone(), "Target.java");
-        let candidate = ProjectFile::new(root, "Candidate.java");
-        let cancellation = CancellationToken::default();
-        cancellation.cancel();
-        let provider = PrefetchingImportProvider {
-            prefetched_files: Arc::new(Mutex::new(Vec::new())),
-            per_candidate_calls: Arc::new(AtomicUsize::new(0)),
-            prefetches_before_first_candidate: Arc::new(AtomicUsize::new(0)),
-        };
-
-        let scope_analyzer = scope_analyzer();
-        let scope = AnalyzerQueryScope::new(&scope_analyzer);
-        let token = scope.token();
-        let importers = find_direct_importers_with_cancellation(
-            [candidate],
-            &provider,
-            token,
-            &[target_file].into_iter().collect(),
-            &cancellation,
-        );
-
-        assert!(importers.is_empty());
-        assert_eq!(0, provider.per_candidate_calls.load(Ordering::Acquire));
-        assert!(
-            provider
-                .prefetched_files
-                .lock()
-                .expect("prefetch record poisoned")
-                .is_empty(),
-            "a pre-cancelled scan must not spend the batch either"
-        );
-    }
-
-    #[test]
+    #[hardwon(
+        "#689: Checks transitive importer discovery follows the file graph without revisiting shared edges"
+    )]
     fn transitive_importer_scan_follows_file_edges_once() {
         let root = std::env::temp_dir();
         let target = ProjectFile::new(root.clone(), "target.rb");
@@ -1308,6 +1236,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "6074c794e6bd: Verifies batched importer prefetch respects language ecosystems instead of crossing into unrelated candidate rows"
+    )]
     fn importer_prefetch_scope_follows_language_ecosystems() {
         let root = std::env::temp_dir();
         let files = [
@@ -1340,6 +1271,115 @@ mod tests {
         assert_eq!(
             relative_paths(usage_ecosystem_files(files, Language::TypeScript)),
             BTreeSet::from(["app.js".to_string(), "app.ts".to_string()])
+        );
+    }
+
+    #[test]
+    fn cancellable_importer_scan_stops_after_current_file_without_recording_partial_work() {
+        let root = std::env::temp_dir();
+        let target_file = ProjectFile::new(root.clone(), "Target.java");
+        let importer = ProjectFile::new(root, "Importer.java");
+        let cancellation = CancellationToken::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = CancellingImportProvider {
+            cancellation: cancellation.clone(),
+            calls: Arc::clone(&calls),
+            imported: CodeUnit::new(target_file.clone(), CodeUnitType::Class, "pkg", "Target"),
+        };
+
+        let scope_analyzer = scope_analyzer();
+        let scope = AnalyzerQueryScope::new(&scope_analyzer);
+        let token = scope.token();
+        let importers = find_direct_importers_with_cancellation(
+            [importer],
+            &provider,
+            token,
+            &[target_file].into_iter().collect(),
+            &cancellation,
+        );
+
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert!(importers.is_empty());
+    }
+
+    #[test]
+    fn cancellable_importer_scan_stops_early_without_recording_partial_work_under_concurrency() {
+        let root = std::env::temp_dir();
+        let target_file = ProjectFile::new(root.clone(), "Target.java");
+        let file_count = 200;
+        let importers_input: Vec<ProjectFile> = (0..file_count)
+            .map(|i| ProjectFile::new(root.clone(), format!("Importer{i}.java")))
+            .collect();
+        let cancellation = CancellationToken::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = CancellingImportProvider {
+            cancellation: cancellation.clone(),
+            calls: Arc::clone(&calls),
+            imported: CodeUnit::new(target_file.clone(), CodeUnitType::Class, "pkg", "Target"),
+        };
+
+        let scope_analyzer = scope_analyzer();
+        let scope = AnalyzerQueryScope::new(&scope_analyzer);
+        let token = scope.token();
+        let importers = find_direct_importers_with_cancellation(
+            importers_input,
+            &provider,
+            token,
+            &[target_file].into_iter().collect(),
+            &cancellation,
+        );
+
+        assert!(
+            importers.is_empty(),
+            "a cancelled scan must not record partial matches, even with many files racing \
+             concurrently on the same cancellation flag and the same shared sink"
+        );
+        let observed_calls = calls.load(Ordering::Acquire);
+        assert!(
+            observed_calls >= 1,
+            "at least the file that triggered cancellation should have run"
+        );
+        assert!(
+            observed_calls < file_count,
+            "cancellation should stop the scan short of visiting every one of the {file_count} \
+             files, got {observed_calls}"
+        );
+    }
+
+    #[test]
+    #[hardwon("#1748: cancellation failed to skip importer prefetch and candidate walking")]
+    fn cancelled_importer_scan_skips_the_prefetch_and_the_walk() {
+        let root = std::env::temp_dir();
+        let target_file = ProjectFile::new(root.clone(), "Target.java");
+        let candidate = ProjectFile::new(root, "Candidate.java");
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        let provider = PrefetchingImportProvider {
+            prefetched_files: Arc::new(Mutex::new(Vec::new())),
+            per_candidate_calls: Arc::new(AtomicUsize::new(0)),
+            prefetches_before_first_candidate: Arc::new(AtomicUsize::new(0)),
+        };
+
+        let scope_analyzer = scope_analyzer();
+        let scope = AnalyzerQueryScope::new(&scope_analyzer);
+        let token = scope.token();
+        let importers = find_direct_importers_with_cancellation(
+            [candidate],
+            &provider,
+            token,
+            &[target_file].into_iter().collect(),
+            &cancellation,
+        );
+
+        assert!(importers.is_empty());
+        assert_eq!(0, provider.per_candidate_calls.load(Ordering::Acquire));
+        assert!(
+            provider
+                .prefetched_files
+                .lock()
+                .expect("prefetch record poisoned")
+                .is_empty(),
+            "a pre-cancelled scan must not spend the batch either"
         );
     }
 }

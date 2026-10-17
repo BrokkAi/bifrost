@@ -10,10 +10,10 @@ use crate::analyzer::{AnalyzerQueryScope, QueryScope, QueryToken};
 use crate::analyzer::{CodeUnit, CodeUnitIndex, ProjectFile};
 use crate::hash::HashSet;
 use brokk_bifrost_rust::graph_support::{
-    ReferenceContextResult, RustCargoRouteError, RustPackageFileIndex, RustReferenceContext,
-    exact_member, forward_reference_context_of, forward_reference_context_of_while,
-    is_rust_trait_declaration, reference_context_of, reference_context_of_while,
-    resolve_module_files, rust_trait_member_implementations, rust_usage_candidate_files,
+    ReferenceContextResult, RustCargoRouteError, RustReferenceContext, exact_member,
+    forward_reference_context_of, forward_reference_context_of_while, is_rust_trait_declaration,
+    reference_context_of, reference_context_of_while, resolve_module_files,
+    rust_trait_member_implementations, rust_usage_candidate_files,
 };
 use brokk_bifrost_rust::lexical_scope::insert_rust_import_binding;
 use std::sync::Arc;
@@ -96,17 +96,6 @@ impl RustAnalyzer {
         keep_going: impl Fn() -> bool + 'a,
     ) -> RustReferenceContext<'a> {
         forward_reference_context_of_while(self, token, file, keep_going)
-    }
-
-    /// The analyzed-file listing bucketed by path-derived Rust package name,
-    /// built at most once per analyzer instance. Same lifetime and invalidation
-    /// as `cargo_routes` — both are pure projections of the analyzed-file set,
-    /// so both are rebuilt by `update`/`update_all`/`clone_with_project` and by
-    /// nothing else (#1230 item 3).
-    pub fn package_file_index(&self) -> Arc<RustPackageFileIndex> {
-        self.package_file_index
-            .get_or_init(|| Arc::new(RustPackageFileIndex::build(self.get_analyzed_files())))
-            .clone()
     }
 
     pub fn resolve_module_files(
@@ -407,8 +396,9 @@ mod frozen {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::Language;
+    use crate::analyzer::i_analyzer::IAnalyzer;
     use crate::analyzer::usages::ExportEntry;
-    use crate::analyzer::{IAnalyzer, Language};
     use crate::inline_project::InlineTestProject;
     use crate::test_support::AnalyzerFixture;
     use std::cell::Cell;
@@ -617,133 +607,6 @@ pub fn function() {}
     }
 
     #[test]
-    fn value_constructor_classification_requires_publication_and_recovers_after_repair() {
-        let fixture = InlineTestProject::with_language(Language::Rust)
-            .file("src/lib.rs", "pub struct Tuple(pub usize);\n")
-            .build();
-        let analyzer = RustAnalyzer::new(fixture.project_dyn());
-        let file = fixture.file("src/lib.rs");
-        let declaration = analyzer
-            .declarations(&file)
-            .into_iter()
-            .find(|declaration| declaration.identifier() == "Tuple")
-            .unwrap();
-        analyzer.analyzer_store().delete_rust_facts_for_test("rust");
-        assert_eq!(
-            brokk_bifrost_rust::graph_support::has_rust_value_constructor(&analyzer, &declaration),
-            Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Unavailable)
-        );
-        assert_eq!(
-            brokk_bifrost_rust::graph_support::is_rust_struct_declaration(&analyzer, &declaration),
-            Err(RustCargoRouteError::Unavailable)
-        );
-        analyzer.warm_usage_facts();
-        assert_eq!(
-            brokk_bifrost_rust::graph_support::has_rust_value_constructor(&analyzer, &declaration),
-            Ok(true)
-        );
-        assert_eq!(
-            brokk_bifrost_rust::graph_support::is_rust_struct_declaration(&analyzer, &declaration),
-            Ok(true)
-        );
-    }
-
-    #[test]
-    fn declaration_classifiers_keep_alternatives_and_require_source_identity() {
-        use brokk_bifrost_rust::graph_support as support;
-        type Classifier =
-            fn(&dyn support::RustSource, &CodeUnit) -> Result<bool, RustCargoRouteError>;
-        let fixture = InlineTestProject::with_language(Language::Rust)
-            .file(
-                "src/lib.rs",
-                r#"
-#[cfg(feature = "struct")]
-pub struct Alternative;
-#[cfg(not(feature = "struct"))]
-pub trait Alternative {}
-pub enum Choice { Variant }
-pub const CONSTANT: u8 = 0;
-pub static STATIC: u8 = 0;
-pub type Alias = u8;
-pub fn function() {}
-#[cfg(feature = "private")]
-macro_rules! repeated_macro { () => {}; }
-#[cfg(not(feature = "private"))]
-#[macro_export]
-macro_rules! repeated_macro { () => {}; }
-wrap! { pub trait Embedded {} }
-"#,
-            )
-            .build();
-        let analyzer = RustAnalyzer::new(fixture.project_dyn());
-        let file = fixture.file("src/lib.rs");
-        let declarations = analyzer.declarations(&file);
-        let unit = |name: &str| {
-            declarations
-                .iter()
-                .find(|unit| unit.identifier() == name)
-                .unwrap()
-        };
-        let properties = analyzer
-            .declaration_source_properties(&file, &|| true)
-            .unwrap();
-        assert_eq!(properties[unit("Alternative")].len(), 2);
-        assert_eq!(properties[unit("repeated_macro")].len(), 2);
-        let cases: &[(Classifier, &[&str])] = &[
-            (support::is_rust_struct_declaration, &["Alternative"]),
-            (
-                support::is_rust_trait_declaration,
-                &["Alternative", "Embedded"],
-            ),
-            (support::is_rust_enum_declaration, &["Choice"]),
-            (support::is_rust_enum_variant_declaration, &["Variant"]),
-            (
-                support::is_rust_const_or_static_declaration,
-                &["CONSTANT", "STATIC"],
-            ),
-            (support::is_rust_free_function_declaration, &["function"]),
-            (
-                support::is_rust_module_value_declaration,
-                &["CONSTANT", "STATIC"],
-            ),
-            (support::is_rust_type_alias_declaration, &["Alias"]),
-            (
-                support::is_rust_macro_export_declaration,
-                &["repeated_macro"],
-            ),
-        ];
-        for &(classify, expected_names) in cases {
-            for name in [
-                "Alternative",
-                "Embedded",
-                "Choice",
-                "Variant",
-                "CONSTANT",
-                "STATIC",
-                "Alias",
-                "repeated_macro",
-                "function",
-            ] {
-                assert_eq!(
-                    classify(&analyzer, unit(name)),
-                    Ok(expected_names.contains(&name)),
-                    "expected {expected_names:?}, candidate {name}"
-                );
-            }
-            let missing = CodeUnit::new(
-                file.clone(),
-                crate::analyzer::CodeUnitType::Macro,
-                "crate",
-                "missing",
-            );
-            assert_eq!(
-                classify(&analyzer, &missing),
-                Err(RustCargoRouteError::Unavailable)
-            );
-        }
-    }
-
-    #[test]
     fn module_value_classification_keeps_kind_and_boundary_on_one_source_alternative() {
         use brokk_bifrost_core::analyzer::rust_facts::{
             RustDeclarationBoundary, RustDeclarationKind,
@@ -783,58 +646,6 @@ wrap! { pub trait Embedded {} }
             ),
             Ok(false),
             "the associated const cannot borrow the ordinary field's enclosing boundary"
-        );
-    }
-
-    #[test]
-    fn export_index_rejects_a_declaration_without_canonical_properties() {
-        let fixture = InlineTestProject::with_language(Language::Rust)
-            .file("src/lib.rs", "pub struct Present;\n")
-            .build();
-        let analyzer = RustAnalyzer::new(fixture.project_dyn());
-        let file = fixture.file("src/lib.rs");
-        let mut declarations = analyzer.declarations(&file);
-        let missing = CodeUnit::new(
-            file.clone(),
-            crate::analyzer::CodeUnitType::Function,
-            "crate",
-            "missing_source_identity",
-        );
-        declarations.insert(missing.clone());
-        assert_eq!(
-            brokk_bifrost_rust::graph_support::has_rust_value_constructor(&analyzer, &missing),
-            Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Unavailable)
-        );
-        assert_eq!(
-            brokk_bifrost_rust::graph_support::is_rust_public_like_declaration(&analyzer, &missing),
-            Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Unavailable)
-        );
-        assert_eq!(
-            brokk_bifrost_rust::graph_support::is_rust_export_visible_declaration(
-                &analyzer, &missing
-            ),
-            Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Unavailable)
-        );
-        assert!(matches!(
-            brokk_bifrost_rust::graph_support::export_index_of_declarations_while(
-                &analyzer,
-                &file,
-                &declarations,
-                &|| true
-            ),
-            Err(
-                brokk_bifrost_rust::graph_support::ReferenceContextError::CargoRoutes(
-                    brokk_bifrost_rust::graph_support::RustCargoRouteError::Unavailable
-                )
-            )
-        ));
-        assert!(analyzer.export_indexes.get(&file).is_none());
-        assert!(
-            analyzer
-                .export_index_of(&file)
-                .unwrap()
-                .exports_by_name
-                .contains_key("Present")
         );
     }
 
@@ -939,42 +750,6 @@ pub struct MacroOnly;
                 "non-root import {excluded} must not be an export"
             );
         }
-    }
-
-    #[test]
-    fn missing_root_reexport_facts_are_unavailable_until_repaired() {
-        let fixture = InlineTestProject::with_language(Language::Rust)
-            .file("src/lib.rs", "pub use crate::missing::Alias;\n")
-            .build();
-        let analyzer = RustAnalyzer::new(fixture.project_dyn());
-        let file = fixture.file("src/lib.rs");
-
-        analyzer.analyzer_store().delete_rust_facts_for_test("rust");
-        {
-            let scope = AnalyzerQueryScope::new(&analyzer);
-            assert!(matches!(
-                analyzer.export_index_of(&file),
-                Err(
-                    brokk_bifrost_rust::graph_support::ReferenceContextError::CargoRoutes(
-                        brokk_bifrost_rust::graph_support::RustCargoRouteError::Unavailable
-                    )
-                )
-            ));
-            assert!(scope.store_error().is_some());
-        }
-        assert!(analyzer.export_indexes.get(&file).is_none());
-
-        analyzer.warm_usage_facts();
-        let repaired = analyzer
-            .export_index_of(&file)
-            .expect("root reexport facts are available after repair");
-        assert_eq!(
-            repaired.exports_by_name.get("Alias"),
-            Some(&ExportEntry::ReexportedNamed {
-                module_specifier: "crate::missing".to_string(),
-                imported_name: "Alias".to_string(),
-            })
-        );
     }
 
     const EQUIVALENCE_FIXTURE: &[(&str, &str)] = &[
@@ -1171,56 +946,10 @@ pub struct MacroOnly;
     }
 
     #[test]
-    fn export_index_is_reused_while_reference_contexts_are_query_scoped() {
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Rust,
-            &[
-                ("src/lib.rs", "pub mod exports;\n"),
-                (
-                    "src/exports.rs",
-                    "pub struct Public;\npub(crate) struct CrateVisible;\nstruct Private;\npub use std::collections::HashMap;\n",
-                ),
-            ],
-        );
-        let analyzer = RustAnalyzer::from_project(fixture.test_project().clone());
-        let file = ProjectFile::new(fixture.project_root(), "src/exports.rs");
-
-        let first = analyzer
-            .export_index_of(&file)
-            .expect("published fixture exports");
-        let second = analyzer
-            .export_index_of(&file)
-            .expect("published fixture exports");
-
-        assert!(Arc::ptr_eq(&first, &second));
-        assert!(first.exports_by_name.contains_key("Public"));
-        assert!(first.exports_by_name.contains_key("CrateVisible"));
-        assert!(!first.exports_by_name.contains_key("Private"));
-        assert!(first.exports_by_name.contains_key("HashMap"));
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        assert_eq!(
-            analyzer
-                .forward_reference_context_of(scope.token(), &file)
-                .resolve_bare("HashMap")
-                .unwrap(),
-            Some("std.collections.HashMap".to_string())
-        );
-
-        let unrelated_watcher_noise = ProjectFile::new(
-            fixture.project_root(),
-            format!(".bifrost/cache/{}", crate::cache_db::cache_db_file_name()),
-        );
-        let updated = analyzer.update(&BTreeSet::from([file.clone(), unrelated_watcher_noise]));
-        let after_noop_update = updated
-            .export_index_of(&file)
-            .expect("published fixture exports");
-
-        assert!(Arc::ptr_eq(&first, &after_noop_update));
-        assert!(updated.export_indexes.get(&file).is_some());
-    }
-
-    #[test]
-    fn issue_1228_forward_reference_query_observes_cancellation() {
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1228: forward and inverted reference queries must observe cancellation and remain retryable (#1304)"
+    )]
+    fn issue_1228_and_1304_reference_queries_observe_cancellation() {
         let fixture = AnalyzerFixture::new_for_language(
             Language::Rust,
             &[
@@ -1261,48 +990,25 @@ pub struct MacroOnly;
             complete.resolve_bare("helper").unwrap(),
             Some("exports.helper".to_string())
         );
-    }
-
-    #[test]
-    fn issue_1304_inverted_reference_query_observes_cancellation() {
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Rust,
-            &[
-                (
-                    "src/lib.rs",
-                    "pub mod exports;\nuse exports::{Alias, helper};\npub fn call(value: Alias) { helper(value); }\n",
-                ),
-                (
-                    "src/exports.rs",
-                    "pub struct Alias;\npub fn helper(_: Alias) {}\n",
-                ),
-            ],
-        );
-        let analyzer = RustAnalyzer::from_project(fixture.test_project().clone());
-        let file = ProjectFile::new(fixture.project_root(), "src/lib.rs");
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        let checks = Cell::new(0usize);
-
-        let interrupted = analyzer.reference_context_of_while(scope.token(), &file, || {
-            let next = checks.get() + 1;
-            checks.set(next);
+        let inverse_checks = Cell::new(0usize);
+        let inverse_interrupted = analyzer.reference_context_of_while(scope.token(), &file, || {
+            let next = inverse_checks.get() + 1;
+            inverse_checks.set(next);
             false
         });
-
         assert_eq!(
-            interrupted.resolve_bare("Alias"),
+            inverse_interrupted.resolve_bare("Alias"),
             Err(brokk_bifrost_rust::graph_support::ReferenceContextError::Interrupted)
         );
-        assert_eq!(checks.get(), 1);
+        assert_eq!(inverse_checks.get(), 1);
 
-        let complete = analyzer.reference_context_of(scope.token(), &file);
-
+        let inverse_complete = analyzer.reference_context_of(scope.token(), &file);
         assert_eq!(
-            complete.resolve_bare("Alias").unwrap(),
+            inverse_complete.resolve_bare("Alias").unwrap(),
             Some("exports.Alias".to_string())
         );
         assert_eq!(
-            complete.resolve_bare("helper").unwrap(),
+            inverse_complete.resolve_bare("helper").unwrap(),
             Some("exports.helper".to_string())
         );
     }
@@ -1412,5 +1118,272 @@ pub struct MacroOnly;
                 .unwrap(),
             Some("legacy.root_item.target".to_string())
         );
+    }
+
+    #[test]
+    fn value_constructor_classification_catches_up_missing_publication() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file("src/lib.rs", "pub struct Tuple(pub usize);\n")
+            .build();
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        let file = fixture.file("src/lib.rs");
+        let declaration = analyzer
+            .declarations(&file)
+            .into_iter()
+            .find(|declaration| declaration.identifier() == "Tuple")
+            .unwrap();
+        analyzer.analyzer_store().delete_rust_facts_for_test("rust");
+        assert_eq!(
+            analyzer
+                .rust_files_without_facts_among(std::slice::from_ref(&file))
+                .unwrap(),
+            vec![file.clone()]
+        );
+        assert_eq!(
+            brokk_bifrost_rust::graph_support::has_rust_value_constructor(&analyzer, &declaration),
+            Ok(true)
+        );
+        assert_eq!(
+            brokk_bifrost_rust::graph_support::is_rust_struct_declaration(&analyzer, &declaration),
+            Ok(true)
+        );
+        assert_eq!(
+            analyzer
+                .rust_files_without_facts_among(std::slice::from_ref(&file))
+                .unwrap(),
+            Vec::<ProjectFile>::new()
+        );
+    }
+
+    #[test]
+    fn declaration_classifiers_keep_alternatives_and_require_source_identity() {
+        use brokk_bifrost_rust::graph_support as support;
+        type Classifier =
+            fn(&dyn support::RustSource, &CodeUnit) -> Result<bool, RustCargoRouteError>;
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "src/lib.rs",
+                r#"
+#[cfg(feature = "struct")]
+pub struct Alternative;
+#[cfg(not(feature = "struct"))]
+pub trait Alternative {}
+pub enum Choice { Variant }
+pub const CONSTANT: u8 = 0;
+pub static STATIC: u8 = 0;
+pub type Alias = u8;
+pub fn function() {}
+#[cfg(feature = "private")]
+macro_rules! repeated_macro { () => {}; }
+#[cfg(not(feature = "private"))]
+#[macro_export]
+macro_rules! repeated_macro { () => {}; }
+wrap! { pub trait Embedded {} }
+"#,
+            )
+            .build();
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        let file = fixture.file("src/lib.rs");
+        let declarations = analyzer.declarations(&file);
+        let unit = |name: &str| {
+            declarations
+                .iter()
+                .find(|unit| unit.identifier() == name)
+                .unwrap()
+        };
+        let properties = analyzer
+            .declaration_source_properties(&file, &|| true)
+            .unwrap();
+        assert_eq!(properties[unit("Alternative")].len(), 2);
+        assert_eq!(properties[unit("repeated_macro")].len(), 2);
+        let cases: &[(Classifier, &[&str])] = &[
+            (support::is_rust_struct_declaration, &["Alternative"]),
+            (
+                support::is_rust_trait_declaration,
+                &["Alternative", "Embedded"],
+            ),
+            (support::is_rust_enum_declaration, &["Choice"]),
+            (support::is_rust_enum_variant_declaration, &["Variant"]),
+            (
+                support::is_rust_const_or_static_declaration,
+                &["CONSTANT", "STATIC"],
+            ),
+            (support::is_rust_free_function_declaration, &["function"]),
+            (
+                support::is_rust_module_value_declaration,
+                &["CONSTANT", "STATIC"],
+            ),
+            (support::is_rust_type_alias_declaration, &["Alias"]),
+            (
+                support::is_rust_macro_export_declaration,
+                &["repeated_macro"],
+            ),
+        ];
+        for &(classify, expected_names) in cases {
+            for name in [
+                "Alternative",
+                "Embedded",
+                "Choice",
+                "Variant",
+                "CONSTANT",
+                "STATIC",
+                "Alias",
+                "repeated_macro",
+                "function",
+            ] {
+                assert_eq!(
+                    classify(&analyzer, unit(name)),
+                    Ok(expected_names.contains(&name)),
+                    "expected {expected_names:?}, candidate {name}"
+                );
+            }
+            let missing = CodeUnit::new(
+                file.clone(),
+                crate::analyzer::CodeUnitType::Macro,
+                "crate",
+                "missing",
+            );
+            assert_eq!(
+                classify(&analyzer, &missing),
+                Err(RustCargoRouteError::Unavailable)
+            );
+        }
+    }
+
+    #[test]
+    fn export_index_rejects_a_declaration_without_canonical_properties() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file("src/lib.rs", "pub struct Present;\n")
+            .build();
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        let file = fixture.file("src/lib.rs");
+        let mut declarations = analyzer.declarations(&file);
+        let missing = CodeUnit::new(
+            file.clone(),
+            crate::analyzer::CodeUnitType::Function,
+            "crate",
+            "missing_source_identity",
+        );
+        declarations.insert(missing.clone());
+        assert_eq!(
+            brokk_bifrost_rust::graph_support::has_rust_value_constructor(&analyzer, &missing),
+            Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Unavailable)
+        );
+        assert_eq!(
+            brokk_bifrost_rust::graph_support::is_rust_public_like_declaration(&analyzer, &missing),
+            Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Unavailable)
+        );
+        assert_eq!(
+            brokk_bifrost_rust::graph_support::is_rust_export_visible_declaration(
+                &analyzer, &missing
+            ),
+            Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Unavailable)
+        );
+        assert!(matches!(
+            brokk_bifrost_rust::graph_support::export_index_of_declarations_while(
+                &analyzer,
+                &file,
+                &declarations,
+                &|| true
+            ),
+            Err(
+                brokk_bifrost_rust::graph_support::ReferenceContextError::CargoRoutes(
+                    brokk_bifrost_rust::graph_support::RustCargoRouteError::Unavailable
+                )
+            )
+        ));
+        assert!(analyzer.export_indexes.get(&file).is_none());
+        assert!(
+            analyzer
+                .export_index_of(&file)
+                .unwrap()
+                .exports_by_name
+                .contains_key("Present")
+        );
+    }
+
+    #[test]
+    fn missing_root_reexport_facts_are_unavailable_until_repaired() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file("src/lib.rs", "pub use crate::missing::Alias;\n")
+            .build();
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        let file = fixture.file("src/lib.rs");
+
+        analyzer.analyzer_store().delete_rust_facts_for_test("rust");
+        {
+            let scope = AnalyzerQueryScope::new(&analyzer);
+            assert!(matches!(
+                analyzer.export_index_of(&file),
+                Err(
+                    brokk_bifrost_rust::graph_support::ReferenceContextError::CargoRoutes(
+                        brokk_bifrost_rust::graph_support::RustCargoRouteError::Unavailable
+                    )
+                )
+            ));
+            assert!(scope.store_error().is_some());
+        }
+        assert!(analyzer.export_indexes.get(&file).is_none());
+
+        analyzer.warm_usage_facts();
+        let repaired = analyzer
+            .export_index_of(&file)
+            .expect("root reexport facts are available after repair");
+        assert_eq!(
+            repaired.exports_by_name.get("Alias"),
+            Some(&ExportEntry::ReexportedNamed {
+                module_specifier: "crate::missing".to_string(),
+                imported_name: "Alias".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn export_index_is_reused_while_reference_contexts_are_query_scoped() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Rust,
+            &[
+                ("src/lib.rs", "pub mod exports;\n"),
+                (
+                    "src/exports.rs",
+                    "pub struct Public;\npub(crate) struct CrateVisible;\nstruct Private;\npub use std::collections::HashMap;\n",
+                ),
+            ],
+        );
+        let analyzer = RustAnalyzer::from_project(fixture.test_project().clone());
+        let file = ProjectFile::new(fixture.project_root(), "src/exports.rs");
+
+        let first = analyzer
+            .export_index_of(&file)
+            .expect("published fixture exports");
+        let second = analyzer
+            .export_index_of(&file)
+            .expect("published fixture exports");
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(first.exports_by_name.contains_key("Public"));
+        assert!(first.exports_by_name.contains_key("CrateVisible"));
+        assert!(!first.exports_by_name.contains_key("Private"));
+        assert!(first.exports_by_name.contains_key("HashMap"));
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        assert_eq!(
+            analyzer
+                .forward_reference_context_of(scope.token(), &file)
+                .resolve_bare("HashMap")
+                .unwrap(),
+            Some("std.collections.HashMap".to_string())
+        );
+
+        let unrelated_watcher_noise = ProjectFile::new(
+            fixture.project_root(),
+            format!(".bifrost/cache/{}", crate::cache_db::cache_db_file_name()),
+        );
+        let updated = analyzer.update(&BTreeSet::from([file.clone(), unrelated_watcher_noise]));
+        let after_noop_update = updated
+            .export_index_of(&file)
+            .expect("published fixture exports");
+
+        assert!(Arc::ptr_eq(&first, &after_noop_update));
+        assert!(updated.export_indexes.get(&file).is_some());
     }
 }

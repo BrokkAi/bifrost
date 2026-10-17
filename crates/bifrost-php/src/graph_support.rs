@@ -19,6 +19,16 @@ pub trait PhpSource: CodeUnitIndex + TypeHierarchyProvider + PhpSourceFactProvid
 
 impl<T: CodeUnitIndex + TypeHierarchyProvider + PhpSourceFactProvider + ?Sized> PhpSource for T {}
 
+/// Return the one declaration kind shared by every source row, or `None` on disagreement.
+pub fn uniform_php_declaration_kind(
+    mut declarations: impl Iterator<Item = PhpDeclarationKind>,
+) -> Option<PhpDeclarationKind> {
+    let kind = declarations.next()?;
+    declarations
+        .all(|declaration| declaration == kind)
+        .then_some(kind)
+}
+
 pub fn php_is_constructor(method: &CodeUnit, class_unit: &CodeUnit, _package_name: &str) -> bool {
     method.is_function()
         && class_unit.is_class()
@@ -126,11 +136,11 @@ fn php_declaration_kind(php: &dyn PhpSource, unit: &CodeUnit) -> Option<PhpDecla
         return None;
     }
     let source = php.php_source_facts(unit.source())?;
-    let mut declarations = source.declarations_for(unit);
-    let kind = declarations.next()?.kind;
-    declarations
-        .all(|declaration| declaration.kind == kind)
-        .then_some(kind)
+    uniform_php_declaration_kind(
+        source
+            .declarations_for(unit)
+            .map(|declaration| declaration.kind),
+    )
 }
 
 /// Files declaring the target's owning type or a descendant of it, plus every PHP file

@@ -32,7 +32,7 @@
 //! the repair travels with the grammar rather than with one caller.
 
 use brokk_bifrost_core::analyzer::common::{
-    node_source_text, parse_source_ranges_with_cancellation,
+    node_source_text, parse_source_ranges_with_cancellation, parse_source_with_cancellation,
 };
 use brokk_bifrost_core::analyzer::usages::parsed_tree::ParseSpec;
 use brokk_bifrost_core::cancellation::CancellationToken;
@@ -67,22 +67,8 @@ pub fn parse_go_with_cancellation(
     source: &str,
     cancellation: Option<&CancellationToken>,
 ) -> Option<Tree> {
-    if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return None;
-    }
-    let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&tree_sitter_go::LANGUAGE.into()).ok()?;
-    let tree = if let Some(cancellation) = cancellation {
-        let mut read = |offset: usize, _| &source.as_bytes()[offset..];
-        let mut progress = |_: &tree_sitter::ParseState| cancellation.is_cancelled();
-        parser.parse_with_options(
-            &mut read,
-            None,
-            Some(tree_sitter::ParseOptions::new().progress_callback(&mut progress)),
-        )
-    } else {
-        parser.parse(source, None)
-    }?;
+    let language = tree_sitter_go::LANGUAGE.into();
+    let tree = parse_source_with_cancellation(&language, source, None, cancellation)?;
     Some(go_reparse_grammar_gap(source, &tree, cancellation).unwrap_or(tree))
 }
 
@@ -209,6 +195,7 @@ fn demotion_spans(source: &str, demoted: &[usize]) -> Vec<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
 
     /// The named node that starts exactly at `offset`, innermost first.
     fn node_at<'tree>(tree: &'tree Tree, offset: usize) -> Node<'tree> {
@@ -408,34 +395,6 @@ mod tests {
         }
     }
 
-    /// Near misses the repair must leave alone. Go 1.26 did not extend `make`,
-    /// and no reading completes a truncated call, so both keep the ERROR that
-    /// says so.
-    #[test]
-    fn malformed_builtin_calls_stay_explicit_errors() {
-        for source in [
-            concat!(
-                "package p\n",
-                "\n",
-                "func f(n int) []int { return make(sliceOf(n)) }\n",
-            ),
-            concat!(
-                "package p\n",
-                "\n",
-                "func f() {\n",
-                "\ta := new(Foo(\n",
-                "}\n"
-            ),
-        ] {
-            let tree = parse_go(source).expect("parse");
-            assert!(
-                tree.root_node().has_error(),
-                "malformed source keeps its error: {source:?} -> {}",
-                tree.root_node().to_sexp()
-            );
-        }
-    }
-
     /// An unrelated syntax error puts the whole file past the repair's gate, so
     /// this is where a `new(Type)` call that parsed perfectly well could be
     /// demoted by mistake. It must not be: the demotion is decided per token
@@ -476,6 +435,9 @@ mod tests {
     /// and `, y` its expression tail -- while the numeric form does not and
     /// reaches the repair; both must land in the same shape.
     #[test]
+    #[hardwon(
+        "41489fa54fff: Checks a local function named new remains a call and does not consume the following statement."
+    )]
     fn a_shadowed_new_function_call_keeps_the_following_statement() {
         for (source, call) in [
             (
@@ -524,6 +486,9 @@ mod tests {
     /// of a `new` token moves nothing else. A multi-byte character and a
     /// comment before and after the repaired call keep their exact offsets.
     #[test]
+    #[hardwon(
+        "41489fa54fff: Pins UTF-8 byte offsets around multibyte text, literals, and comments after a narrow syntax repair."
+    )]
     fn the_repair_moves_no_other_offset() {
         const SOURCE: &str = concat!(
             "package p\n",
@@ -575,9 +540,33 @@ mod tests {
         );
     }
 
-    /// A `new` the repair demotes reveals the next one: nesting is what makes a
-    /// second demotion round necessary.
     #[test]
+    #[hardwon("de66cb664d07: malformed builtin calls stay explicit errors")]
+    fn malformed_builtin_calls_stay_explicit_errors() {
+        for source in [
+            concat!(
+                "package p\n",
+                "\n",
+                "func f(n int) []int { return make(sliceOf(n)) }\n",
+            ),
+            concat!(
+                "package p\n",
+                "\n",
+                "func f() {\n",
+                "\ta := new(Foo(\n",
+                "}\n"
+            ),
+        ] {
+            let tree = parse_go(source).expect("parse");
+            assert!(
+                tree.root_node().has_error(),
+                "malformed source keeps its error: {source:?} -> {}",
+                tree.root_node().to_sexp()
+            );
+        }
+    }
+    #[test]
+    #[hardwon("de66cb664d07: nested go 1 26 builtins all parse")]
     fn nested_go_1_26_builtins_all_parse() {
         const SOURCE: &str = concat!(
             "package p\n",

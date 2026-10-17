@@ -1,14 +1,19 @@
 ; Evaluate the complete relation of Conditional absent-member findings. Each
 ; finding names a class that certainly reaches the access and certainly lacks
-; the member, while other unclassified values may also reach it. Proven
-; findings belong to bifrost.correctness.python-absent-member.
+; the member. Other unclassified values may also reach it. A listed global dynamic
+; write is allowed only when every matching write has no receiver bound and an
+; Any member-name set. A DeclaredParameter origin is allowed only for one
+; annotated workspace class with no workspace subclasses, unresolved or
+; unmodeled external bases, or dynamic-attribute hooks; the condition states
+; that it is as annotated and no workspace subclass of that class exists.
+; Proven findings belong to bifrost.correctness.python-absent-member.
 (policy
   :schema-version 1
   :id "bifrost.correctness.python-absent-member-conditional"
   :name "Python absent member (conditional)"
-  :message "this Python receiver may hold a class that does not declare the accessed member when a proven input reaches it"
+  :message "this Python access may lack the member under the receiver and remainder conditions stated in the finding"
   :severity warning
-  :description "Caller-driven class-set propagation proves that a class reaches this access and that its complete modeled surface lacks the accessed member, but other unclassified values may also reach the access. The finding states the condition: if the receiver holds that class, the access fails. A remainder that can mean the class should have been filtered on this path, such as an unmodeled guard or predicate, or an incomplete or budget-limited solve, suppresses the finding. Guard-only class membership, uncertain flow into the class, open member models, and dynamic writes that could install the member also suppress it. Missing Python declaration-model coverage makes the run inconclusive."
+  :description "Caller-driven class-set propagation proves that a class reaches this access and lacks the accessed member, but other unclassified receiver values may also reach the access. A global dynamic write may remain as a conditional remainder only when every matching write has no receiver bound and an Any member-name set; the finding condition names the write sites that could install the member. A DeclaredParameter origin is admitted only when its annotation resolves to exactly one workspace class and the existing surface checks establish no workspace subclasses, unresolved or unmodeled external bases, or dynamic-attribute hooks. Its condition states that the receiver has the annotated type and no workspace subclass of that class exists. A remainder that can mean the class should have been filtered on this path, such as an unmodeled guard or predicate, or an incomplete or budget-limited solve, suppresses the finding. Guard-only class membership, uncertain flow into the class, open member models, and bounded or member-attributed writes that could install the member also suppress it. Missing Python declaration-model coverage makes the run inconclusive."
   :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
   :tags ["correctness" "python" "type-flow"]
   :analysis (analysis

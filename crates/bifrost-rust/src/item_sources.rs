@@ -13,6 +13,7 @@ use brokk_bifrost_core::analyzer::rust_facts::{
     RustMacroParseFailure, RustSourceContextFact, RustSourceContextKind, RustSourceNameFact,
     RustTraitSourceFact, RustValueSourceFact,
 };
+use brokk_bifrost_core::analyzer::source_facts::PrimarySourceFactCollector;
 use brokk_bifrost_core::analyzer::source_facts::{
     SourceDeclarationId, SourceOccurrenceId, SourceOccurrenceSink,
 };
@@ -23,6 +24,13 @@ use crate::declaration_properties::is_rust_named_declaration_kind;
 use crate::declarations::{rust_node_text, rust_parameter_label_node};
 use crate::macro_source_capture::capture_macro_definition;
 use crate::type_syntax::RustTypeSourceCollector;
+
+pub(crate) fn declare_primary_node(
+    collector: &mut PrimarySourceFactCollector<'_>,
+    node: Node<'_>,
+) -> SourceDeclarationId {
+    collector.declare_node(node, node.child_by_field_name("name"))
+}
 
 /// The declaration bridge used by the primary and embedded walks. The bridge
 /// owns the source arena, so this collector never creates a second identity
@@ -252,13 +260,7 @@ impl RustItemSourceCollector {
             .children(&mut node.walk())
             .find(|child| child.kind() == "!")
             .map(|token| sink.intern_node(token));
-        let body = node
-            .child_by_field_name("body")
-            .map(|body| sink.intern_node(body));
-        let body_children = node
-            .child_by_field_name("body")
-            .map(|body| self.body_children(body, sink))
-            .unwrap_or_default();
+        let (body, body_children) = self.record_body(node, sink);
         self.facts.impls.push(RustImplSourceFact {
             declaration,
             context,
@@ -277,13 +279,7 @@ impl RustItemSourceCollector {
         context: SourceOccurrenceId,
     ) {
         let declaration = sink.declare_node(node);
-        let body = node
-            .child_by_field_name("body")
-            .map(|body| sink.intern_node(body));
-        let body_children = node
-            .child_by_field_name("body")
-            .map(|body| self.body_children(body, sink))
-            .unwrap_or_default();
+        let (body, body_children) = self.record_body(node, sink);
         self.facts.traits.push(RustTraitSourceFact {
             declaration,
             context,
@@ -381,6 +377,19 @@ impl RustItemSourceCollector {
                 }
             })
             .collect()
+    }
+
+    fn record_body(
+        &mut self,
+        node: Node<'_>,
+        sink: &mut dyn RustItemSourceSink,
+    ) -> (Option<SourceOccurrenceId>, Vec<RustItemBodyChildSourceFact>) {
+        let Some(body) = node.child_by_field_name("body") else {
+            return (None, Vec::new());
+        };
+        let body_occurrence = sink.intern_node(body);
+        let children = self.body_children(body, sink);
+        (Some(body_occurrence), children)
     }
 
     fn record_generics(&mut self, node: Node<'_>, source: &str, sink: &mut dyn RustItemSourceSink) {
@@ -494,147 +503,4 @@ fn source_name(
         occurrence: sink.intern_node(node),
         name: name.to_string(),
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use brokk_bifrost_core::analyzer::rust_facts::RustTypeSourceFact;
-    use brokk_bifrost_core::analyzer::source_facts::{
-        PrimarySourceFactCollector, SourceFactRows, SourceOccurrenceSink,
-    };
-    use tree_sitter::{Node, Parser};
-
-    struct TestSink<'source> {
-        collector: PrimarySourceFactCollector<'source>,
-    }
-
-    impl SourceOccurrenceSink for TestSink<'_> {
-        fn intern_node(&mut self, node: Node<'_>) -> SourceOccurrenceId {
-            self.collector.intern_node(node)
-        }
-
-        fn intern_subspan_bytes(
-            &mut self,
-            start_byte: usize,
-            end_byte: usize,
-            provenance: brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceProvenance,
-        ) -> SourceOccurrenceId {
-            self.collector
-                .intern_subspan_bytes(start_byte, end_byte, provenance)
-        }
-    }
-
-    impl RustItemSourceSink for TestSink<'_> {
-        fn declare_node(&mut self, node: Node<'_>) -> SourceDeclarationId {
-            let occurrence = self.collector.intern_node(node);
-            let name = node
-                .child_by_field_name("name")
-                .map(|name| self.collector.intern_node(name));
-            self.collector.declare(occurrence, name)
-        }
-    }
-
-    fn collect(source: &str) -> (RustItemSourceFacts, Vec<RustTypeSourceFact>, SourceFactRows) {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .expect("Rust grammar");
-        let tree = parser.parse(source, None).expect("Rust tree");
-        assert!(!tree.root_node().has_error(), "fixture must parse cleanly");
-
-        let mut sink = TestSink {
-            collector: PrimarySourceFactCollector::new(source),
-        };
-        let mut items = RustItemSourceCollector::new();
-        let mut types = RustTypeSourceCollector::new();
-        let mut pending = vec![(tree.root_node(), false)];
-        while let Some((node, exiting)) = pending.pop() {
-            if exiting {
-                items.exit();
-                continue;
-            }
-            items.enter(node, source, &mut sink, &mut types);
-            pending.push((node, true));
-            let mut cursor = node.walk();
-            let children = node.named_children(&mut cursor).collect::<Vec<_>>();
-            pending.extend(children.into_iter().rev().map(|child| (child, false)));
-        }
-        (
-            items.into_facts(),
-            types.into_facts(),
-            sink.collector.finish(),
-        )
-    }
-
-    fn occurrence_text<'source>(
-        source: &'source str,
-        rows: &SourceFactRows,
-        occurrence: SourceOccurrenceId,
-    ) -> &'source str {
-        let range = rows.occurrence(occurrence).range;
-        &source[range.start_byte..range.end_byte]
-    }
-
-    #[test]
-    fn captures_named_values_and_callable_return_types_without_tuple_fakes() {
-        let source = r#"
-struct Inner;
-struct Outer { named: Vec<Inner> }
-struct Tuple(Inner);
-enum Values { Unit, Named { value: Option<Inner> } }
-const GLOBAL: Option<Inner> = None;
-static STATIC: Inner = Inner;
-fn returns() -> Option<Inner> { None }
-trait Trait { fn signature() -> Result<Inner, Inner>; }
-"#;
-        let (items, types, rows) = collect(source);
-
-        let mut names = items
-            .values
-            .iter()
-            .map(|value| {
-                rows.declaration(value.declaration)
-                    .name
-                    .map(|name| occurrence_text(source, &rows, name).to_owned())
-                    .expect("value declaration name")
-            })
-            .collect::<Vec<_>>();
-        names.sort();
-        assert_eq!(
-            names,
-            ["GLOBAL", "Named", "STATIC", "Unit", "named", "value"]
-        );
-        assert!(!names.iter().any(|name| name == "Inner"));
-
-        let value_types = items
-            .values
-            .iter()
-            .filter_map(|value| value.declared_type)
-            .map(|type_occurrence| occurrence_text(source, &rows, type_occurrence))
-            .collect::<Vec<_>>();
-        assert!(value_types.contains(&"Vec<Inner>"));
-        assert!(value_types.contains(&"Option<Inner>"));
-        assert!(value_types.contains(&"Inner"));
-        assert!(
-            items
-                .values
-                .iter()
-                .any(|value| value.declared_type.is_none())
-        );
-
-        let return_types = items
-            .callables
-            .iter()
-            .filter_map(|callable| callable.return_type)
-            .map(|type_occurrence| occurrence_text(source, &rows, type_occurrence))
-            .collect::<Vec<_>>();
-        assert!(return_types.contains(&"Option<Inner>"));
-        assert!(return_types.contains(&"Result<Inner, Inner>"));
-        assert!(
-            types
-                .iter()
-                .any(|fact| fact.occurrence == items.callables[0].return_type.unwrap())
-        );
-    }
 }

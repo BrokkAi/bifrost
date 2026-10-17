@@ -62,7 +62,7 @@
     "schema_version": {
       "type": "integer",
       "format": "uint32",
-      "maximum": 4,
+      "maximum": 7,
       "minimum": 2
     },
     "shards": {

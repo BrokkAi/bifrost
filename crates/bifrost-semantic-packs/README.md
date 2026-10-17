@@ -16,10 +16,11 @@ register their own packs.
 Semantic-model packs describe API facts that are unavailable from workspace
 source, declarative facts produced by frameworks or generators, and reviewed
 external procedure behavior. They are versioned data artifacts: packs do not
-contain executable code, and installing one does not implicitly select the
-newest available content. Generic analysis, explicit catalog activation, and
-direct consumers of this crate remain network-free. Host plugins acquire
-compatible qualified releases into a persistent cache before runtime activation.
+contain executable code. Generic analysis, explicit catalog activation, and
+direct consumers of this crate remain network-free. The `bifrost` executable
+selects compatible Bifrost-packs releases during runtime bootstrap, before it
+activates catalogs; the selected content is verified and stored in a persistent
+cache. Host plugins only acquire and verify the executable itself.
 
 See the
 [semantic-model pack documentation](https://github.com/BrokkAi/bifrost/blob/master/docs/src/content/docs/semantic-model-packs.md)
@@ -33,13 +34,25 @@ streams in Bifrost-packs; its `pack-release.json` records exact source, artifact
 hashes, compatibility, and qualification. A release version alone does not prove
 that a pack applies to this engine or workspace.
 
-The facade imports `BIFROST_OPEN_SEMANTIC_PACK_BUNDLE` into the host's catalog
-through the existing native verifier and installer. Set
-`BIFROST_SEMANTIC_PACK_CACHE_ROOT` to the host's persistent directory. Explicit
-bundle configuration replaces embedded semantic registration, and a malformed
-or incompatible installation fails explicitly. Embedded defaults remain when
-no external bundle is configured. The facade no longer registers the legacy
-engine-release downloader; hosts own public pack acquisition and offline reuse.
+The binary supplies the selected native bundle through
+`BIFROST_OPEN_SEMANTIC_PACK_BUNDLE` and the policy tree through
+`BIFROST_OPEN_POLICY_PACK_ROOT`; the existing native verifier, installer, and
+policy loader validate them during activation. A policy-only selection omits
+`BIFROST_OPEN_SEMANTIC_PACK_BUNDLE`. Explicit host configuration for either
+root suppresses acquisition and takes precedence. The binary honors
+`BIFROST_OPEN_PACKS_OFFLINE` and `BIFROST_OPEN_PACKS_REFRESH`, reuses its
+verified one-hour manifest inventory and hash-addressed artifacts, and falls
+back to embedded packs when no eligible release or unavailable network prevents
+runtime selection. Invalid release metadata and corrupt cached content fail
+explicitly. The analysis facade itself never accesses the network.
+
+The `bifrost prepare-open-packs` command is the strict acquisition interface
+for hosts that need a recorded selection. It accepts an optional versioned
+request file and writes a machine-readable outcome to `--receipt-path` on both
+selection and typed acquisition failure. On success, `--env-path` contains the
+selected policy root, semantic bundle root when present, and semantic cache
+root. See the [open-pack acquisition reference](/reference/pack-acquisition/)
+for request fields, failure classes, replay, and cache handling.
 
 ## Version 0.8.18
 
@@ -115,3 +128,19 @@ corpora are third-party content and are not vendored here. The report records
 each corpus's revision and a digest of the exact bytes read, every row the
 translator could not carry and why, and each target the corpora agree on,
 dispute, or cover alone. Two runs over the same pins produce the same bytes.
+
+## Explicit transition registry selection
+
+For engine repository policy validation, `bifrost-semantic-pack
+export-embedded-registry OUTPUT` writes the entire frozen registered semantic
+set as compiled manifests and shards, plus `embedded-registry.json`. Supply
+that directory as `BIFROST_OPEN_SEMANTIC_PACK_BUNDLE` together with an explicit
+`BIFROST_OPEN_POLICY_PACK_ROOT`. The host verifies the complete source inventory
+and every byte against its own registry before registering the selected disk
+content. Missing, changed, or engine-mismatched content fails without fallback.
+Session provenance and partial completeness are preserved.
+
+This transition snapshot is not a native release bundle and does not qualify
+external content or authorize publication. Native external bundles continue
+through the existing release installer. Content ownership and retirement remain
+with the external pack migration; this command changes no frozen pack bytes.

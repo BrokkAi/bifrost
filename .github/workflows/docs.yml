@@ -26,6 +26,12 @@ concurrency:
 jobs:
   build:
     name: build docs
+    # Public contributors use ordinary PR CI; private sources use merge batches.
+    if: >-
+      github.event_name != 'pull_request' || !github.event.repository.private ||
+      (github.event.pull_request.user.login == 'mergemarshall[bot]' &&
+       startsWith(github.head_ref, 'mergemarshall/batch-') &&
+       github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:

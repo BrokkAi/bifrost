@@ -19,8 +19,8 @@ use super::definition::{
     POLICY_DOCUMENT_SCHEMA_VERSION, PolicyCategoryId, PolicyEndpointBinding, PolicyId, PolicyPort,
     PolicySelector, TaintCatalogHash, TaintEntryId, TaintExternalModelSpec, TaintImpact,
     TaintLabel, TaintSanitizerSpec, TaintSinkSpec, TaintSourceEvidence, TaintSourceSpec,
-    TaintSystemEntry, TaintTag, TaintTransferEffect, TaintTransferSpec, TaintTransformSpec,
-    TaintTrustBoundary, TypestateCallBinding, TypestateSeedBinding,
+    TaintSystemEntry, TaintTag, TaintThreatModel, TaintTransferEffect, TaintTransferSpec,
+    TaintTransformSpec, TaintTrustBoundary, TypestateCallBinding, TypestateSeedBinding,
 };
 use brokk_bifrost_analysis::analyzer::semantic::{
     WorkspaceRelativePath, WorkspaceRelativePathError,
@@ -180,7 +180,7 @@ fn validate_lowered_limit(
     value: usize,
     hard_maximum: usize,
 ) -> Result<(), CatalogRegistryLimitError> {
-    if value == 0 || value > hard_maximum {
+    if !crate::within_policy_limit(value, hard_maximum) {
         return Err(CatalogRegistryLimitError {
             field,
             value,
@@ -199,11 +199,7 @@ pub struct CatalogRegistryLimitError {
 
 impl fmt::Display for CatalogRegistryLimitError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "{} must be from 1 through {}, found {}",
-            self.field, self.hard_maximum, self.value
-        )
+        crate::fmt_limit_error(formatter, &self.field, &self.hard_maximum, &self.value)
     }
 }
 
@@ -516,10 +512,6 @@ impl<'de> Visitor<'de> for StrictJsonVisitor {
     where
         E: de::Error,
     {
-        Ok(())
-    }
-
-    fn visit_string<E>(self, _value: String) -> Result<Self::Value, E> {
         Ok(())
     }
 
@@ -1330,6 +1322,8 @@ struct SourceWire {
     selector: SelectorWire,
     bind: PortWire,
     labels: Vec<String>,
+    #[serde(default)]
+    threat_model: Option<String>,
     evidence: Option<SourceEvidenceWire>,
 }
 
@@ -1618,6 +1612,20 @@ fn invalid_wire_identifier(
     move |error| CatalogRegistryError::InvalidModel(format!("invalid {field}: {error}"))
 }
 
+fn decode_threat_model_label(label: String) -> Result<TaintThreatModel, CatalogRegistryError> {
+    match label.as_str() {
+        "remote" => Ok(TaintThreatModel::Remote),
+        "commandargs" => Ok(TaintThreatModel::CommandArgs),
+        "environment" => Ok(TaintThreatModel::Environment),
+        "stdin" => Ok(TaintThreatModel::Stdin),
+        "file" => Ok(TaintThreatModel::File),
+        "database" => Ok(TaintThreatModel::Database),
+        _ => Err(CatalogRegistryError::InvalidModel(format!(
+            "unknown source threat model `{label}`"
+        ))),
+    }
+}
+
 impl From<&TaintCatalogDefinition> for CatalogWire {
     fn from(definition: &TaintCatalogDefinition) -> Self {
         Self {
@@ -1703,14 +1711,42 @@ fn decode_selector(
 }
 
 fn encode_selector(selector: &PolicySelector) -> SelectorWire {
-    let PolicySelector::Inline { schema, query, .. } = selector else {
-        unreachable!("catalog validation rejects file selectors")
-    };
+    let (schema_version, query) = super::canonical::inline_selector_fields(selector);
     SelectorWire {
         kind: "inline".to_string(),
-        schema_version: schema.version,
-        query: query.to_canonical_query_plan_json(),
+        schema_version,
+        query,
     }
+}
+
+fn catalog_entry_wire_fields(
+    id: &TaintEntryId,
+    display_name: &str,
+    categories: &[PolicyCategoryId],
+    selector: &PolicySelector,
+) -> (String, String, Vec<String>, SelectorWire) {
+    (
+        id.as_str().to_string(),
+        display_name.to_string(),
+        display_ids(categories),
+        encode_selector(selector),
+    )
+}
+
+fn taint_port_transform_wire_fields(
+    id: &TaintEntryId,
+    selector: &PolicySelector,
+    input: &PolicyPort,
+    output: &PolicyPort,
+    removes: &[TaintLabel],
+) -> (String, SelectorWire, PortWire, PortWire, Vec<String>) {
+    (
+        id.as_str().to_string(),
+        encode_selector(selector),
+        PortWire::from(input),
+        PortWire::from(output),
+        display_ids(removes),
+    )
 }
 
 impl TryFrom<SourceWire> for TaintSourceSpec {
@@ -1725,6 +1761,10 @@ impl TryFrom<SourceWire> for TaintSourceSpec {
             categories: parse_ids(wire.categories, PolicyCategoryId::new, "source category")?,
             bind: wire.bind.into(),
             labels: parse_ids(wire.labels, TaintLabel::new, "source label")?,
+            threat_model: wire
+                .threat_model
+                .map(decode_threat_model_label)
+                .transpose()?,
             evidence: wire.evidence.map(Into::into),
         })
     }
@@ -1732,13 +1772,20 @@ impl TryFrom<SourceWire> for TaintSourceSpec {
 
 impl From<&TaintSourceSpec> for SourceWire {
     fn from(spec: &TaintSourceSpec) -> Self {
+        let (id, display_name, categories, selector) = catalog_entry_wire_fields(
+            &spec.id,
+            &spec.display_name,
+            &spec.categories,
+            &spec.selector,
+        );
         Self {
-            id: spec.id.as_str().to_string(),
-            display_name: spec.display_name.clone(),
-            categories: display_ids(&spec.categories),
-            selector: encode_selector(&spec.selector),
+            id,
+            display_name,
+            categories,
+            selector,
             bind: PortWire::from(&spec.bind),
             labels: display_ids(&spec.labels),
+            threat_model: spec.threat_model.map(|model| model.label().to_owned()),
             evidence: spec.evidence.as_ref().map(SourceEvidenceWire::from),
         }
     }
@@ -1764,11 +1811,17 @@ impl TryFrom<SinkWire> for TaintSinkSpec {
 
 impl From<&TaintSinkSpec> for SinkWire {
     fn from(spec: &TaintSinkSpec) -> Self {
+        let (id, display_name, categories, selector) = catalog_entry_wire_fields(
+            &spec.id,
+            &spec.display_name,
+            &spec.categories,
+            &spec.selector,
+        );
         Self {
-            id: spec.id.as_str().to_string(),
-            display_name: spec.display_name.clone(),
-            categories: display_ids(&spec.categories),
-            selector: encode_selector(&spec.selector),
+            id,
+            display_name,
+            categories,
+            selector,
             dangerous_operand: PortWire::from(&spec.dangerous_operand),
             accepts: display_ids(&spec.accepts),
             tags: display_ids(&spec.tags),
@@ -1794,12 +1847,19 @@ impl TryFrom<SanitizerWire> for TaintSanitizerSpec {
 
 impl From<&TaintSanitizerSpec> for SanitizerWire {
     fn from(spec: &TaintSanitizerSpec) -> Self {
+        let (id, selector, input, output, removes) = taint_port_transform_wire_fields(
+            &spec.id,
+            &spec.selector,
+            &spec.input,
+            &spec.output,
+            &spec.removes,
+        );
         Self {
-            id: spec.id.as_str().to_string(),
-            selector: encode_selector(&spec.selector),
-            input: PortWire::from(&spec.input),
-            output: PortWire::from(&spec.output),
-            removes: display_ids(&spec.removes),
+            id,
+            selector,
+            input,
+            output,
+            removes,
         }
     }
 }
@@ -1822,12 +1882,19 @@ impl TryFrom<TransformWire> for TaintTransformSpec {
 
 impl From<&TaintTransformSpec> for TransformWire {
     fn from(spec: &TaintTransformSpec) -> Self {
+        let (id, selector, input, output, removes) = taint_port_transform_wire_fields(
+            &spec.id,
+            &spec.selector,
+            &spec.input,
+            &spec.output,
+            &spec.removes,
+        );
         Self {
-            id: spec.id.as_str().to_string(),
-            selector: encode_selector(&spec.selector),
-            input: PortWire::from(&spec.input),
-            output: PortWire::from(&spec.output),
-            removes: display_ids(&spec.removes),
+            id,
+            selector,
+            input,
+            output,
+            removes,
             adds: display_ids(&spec.adds),
         }
     }
@@ -2108,30 +2175,9 @@ pub(crate) fn phase_accepts_port(phase: EndpointObservationPhase, port: &PolicyP
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brokk_bifrost_analysis::schema_version::{SchemaVersionOrigin, SchemaVersionResolution};
-    use brokk_bifrost_rql::structural::CodeQuery;
-
-    fn selector(name: &str) -> PolicySelector {
-        PolicySelector::Inline {
-            schema: SchemaVersionResolution {
-                version: RQL_SCHEMA_VERSION as u32,
-                origin: SchemaVersionOrigin::Explicit,
-            },
-            query: CodeQuery::from_sexp(&format!(r#"(call :callee (name "{name}"))"#)).unwrap(),
-            resolved_locators: Vec::new(),
-        }
-    }
-
+    use crate::test_support::inline_match_selector as selector;
     fn source(id: &str, name: &str) -> TaintSourceSpec {
-        TaintSourceSpec {
-            id: TaintEntryId::new(id).unwrap(),
-            display_name: name.to_string(),
-            categories: vec![PolicyCategoryId::new("input.user").unwrap()],
-            selector: selector(name),
-            bind: PolicyPort::ReturnValue,
-            labels: vec![TaintLabel::new("attacker-controlled").unwrap()],
-            evidence: None,
-        }
+        crate::test_support::taint_source_spec(id, name, name, "attacker-controlled")
     }
 
     fn catalog(name: &str, source_id: &str, display: &str) -> TaintCatalogDefinition {
@@ -2176,41 +2222,6 @@ mod tests {
         assert!(matches!(
             error,
             CatalogRegistryError::HashPinMismatch { .. }
-        ));
-    }
-
-    #[test]
-    fn typed_and_json_registration_reject_execution_mode_controls() {
-        let mut typed = catalog("bifrost.sources", "request", "request");
-        let PolicySelector::Inline { query, .. } = &mut typed.sources[0].selector else {
-            panic!("catalog test selector is inline");
-        };
-        query.execution_mode = CodeQueryExecutionMode::Profile;
-        let mut registry = TaintCatalogRegistry::new_without_workspace(Default::default());
-        let error = registry.register(typed).unwrap_err();
-        assert!(matches!(
-            error,
-            CatalogRegistryError::InvalidSelector { ref message, .. }
-                if message.contains("output controls")
-        ));
-
-        let definition =
-            normalize_and_validate_catalog(catalog("bifrost.sources", "request", "request"))
-                .unwrap();
-        let mut value = serde_json::to_value(CatalogWire::from(&definition)).unwrap();
-        value["sources"][0]["selector"]["query"]["execution_mode"] =
-            Value::String("profile".to_string());
-        let bytes = serde_json::to_vec(&value).unwrap();
-        let error = registry
-            .register_json_bytes(
-                CatalogSourceIdentity::new("execution-mode").unwrap(),
-                &bytes,
-            )
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            CatalogRegistryError::InvalidSelector { ref message, .. }
-                if message.contains("execution_mode")
         ));
     }
 
@@ -2345,15 +2356,6 @@ mod tests {
     }
 
     #[test]
-    fn workspace_free_registry_refuses_path_loading() {
-        let mut registry = TaintCatalogRegistry::new_without_workspace(Default::default());
-        assert_eq!(
-            registry.register_json_path("catalogs/default.json"),
-            Err(CatalogRegistryError::WorkspaceAccessUnavailable)
-        );
-    }
-
-    #[test]
     fn workspace_registry_reads_only_explicit_json_paths_through_its_capability() {
         let root = tempfile::tempdir().unwrap();
         let definition =
@@ -2432,6 +2434,50 @@ mod tests {
         assert!(
             message.contains("duplicate JSON object key `schema_version`"),
             "{message}"
+        );
+    }
+
+    #[test]
+    fn typed_and_json_registration_reject_execution_mode_controls() {
+        let mut typed = catalog("bifrost.sources", "request", "request");
+        let PolicySelector::Inline { query, .. } = &mut typed.sources[0].selector else {
+            panic!("catalog test selector is inline");
+        };
+        query.execution_mode = CodeQueryExecutionMode::Profile;
+        let mut registry = TaintCatalogRegistry::new_without_workspace(Default::default());
+        let error = registry.register(typed).unwrap_err();
+        assert!(matches!(
+            error,
+            CatalogRegistryError::InvalidSelector { ref message, .. }
+                if message.contains("output controls")
+        ));
+
+        let definition =
+            normalize_and_validate_catalog(catalog("bifrost.sources", "request", "request"))
+                .unwrap();
+        let mut value = serde_json::to_value(CatalogWire::from(&definition)).unwrap();
+        value["sources"][0]["selector"]["query"]["execution_mode"] =
+            Value::String("profile".to_string());
+        let bytes = serde_json::to_vec(&value).unwrap();
+        let error = registry
+            .register_json_bytes(
+                CatalogSourceIdentity::new("execution-mode").unwrap(),
+                &bytes,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CatalogRegistryError::InvalidSelector { ref message, .. }
+                if message.contains("execution_mode")
+        ));
+    }
+
+    #[test]
+    fn workspace_free_registry_refuses_path_loading() {
+        let mut registry = TaintCatalogRegistry::new_without_workspace(Default::default());
+        assert_eq!(
+            registry.register_json_path("catalogs/default.json"),
+            Err(CatalogRegistryError::WorkspaceAccessUnavailable)
         );
     }
 }

@@ -3,10 +3,12 @@
 
 use super::{ReportLines, sanitize_table_cell};
 use crate::analyzer::test_paths;
-use crate::analyzer::{IAnalyzer, Language, parser_language_for_path};
+use crate::analyzer::{IAnalyzer, parser_language_for_path};
+use crate::diff_analysis::is_regular_file_mode;
 use crate::gitblob::resolve_default_branch_ref;
 use crate::path_utils::normalize_pattern;
-use git2::{FileMode, ObjectType, Oid, Repository, Sort, TreeWalkMode, TreeWalkResult};
+use brokk_bifrost_php::graph::syntax::assignment_parts as php_assignment_parts;
+use git2::{ObjectType, Oid, Repository, Sort, TreeWalkMode, TreeWalkResult};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -221,7 +223,14 @@ struct SecretRule {
     pattern: Regex,
     secret_group: usize,
     signal_substrings: &'static [&'static str],
+    classify_in_context: Option<ContextClassifier>,
 }
+
+// Reclassifies a rule's match from the lines around it, for key formats that
+// some platforms publish by design. Receives the scanned lines, the match's
+// line index and its byte offset within that line, and returns the rule name
+// and confidence to report.
+type ContextClassifier = fn(&[&str], usize, usize) -> (&'static str, SecretConfidence);
 
 #[derive(Debug, Clone)]
 struct CredentialKeyword {
@@ -263,6 +272,7 @@ static HIGH_CONFIDENCE_RULES: LazyLock<Vec<SecretRule>> = LazyLock::new(|| {
             pattern: Regex::new(r"\b(A3T[A-Z0-9]|AKIA|ASIA)[A-Z0-9]{16}\b").unwrap(),
             secret_group: 0,
             signal_substrings: &["AKIA", "ASIA", "A3T"],
+            classify_in_context: None,
         },
         SecretRule {
             name: "GitHub token",
@@ -270,6 +280,7 @@ static HIGH_CONFIDENCE_RULES: LazyLock<Vec<SecretRule>> = LazyLock::new(|| {
             pattern: Regex::new(r"\bgh[opurs]_[A-Za-z0-9_]{36,}\b").unwrap(),
             secret_group: 0,
             signal_substrings: &["gho_", "ghp_", "ghu_", "ghr_", "ghs_"],
+            classify_in_context: None,
         },
         SecretRule {
             name: "Slack token",
@@ -277,6 +288,7 @@ static HIGH_CONFIDENCE_RULES: LazyLock<Vec<SecretRule>> = LazyLock::new(|| {
             pattern: Regex::new(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b").unwrap(),
             secret_group: 0,
             signal_substrings: &["xoxb-", "xoxa-", "xoxp-", "xoxr-", "xoxs-"],
+            classify_in_context: None,
         },
         SecretRule {
             name: "Private key block",
@@ -284,6 +296,7 @@ static HIGH_CONFIDENCE_RULES: LazyLock<Vec<SecretRule>> = LazyLock::new(|| {
             pattern: Regex::new(r"-----BEGIN [A-Z ]*PRIVATE KEY-----").unwrap(),
             secret_group: 0,
             signal_substrings: &["-----BEGIN "],
+            classify_in_context: None,
         },
         SecretRule {
             name: "JWT",
@@ -292,6 +305,7 @@ static HIGH_CONFIDENCE_RULES: LazyLock<Vec<SecretRule>> = LazyLock::new(|| {
                 .unwrap(),
             secret_group: 0,
             signal_substrings: &["eyJ"],
+            classify_in_context: None,
         },
         SecretRule {
             name: "Google API key",
@@ -299,6 +313,15 @@ static HIGH_CONFIDENCE_RULES: LazyLock<Vec<SecretRule>> = LazyLock::new(|| {
             pattern: Regex::new(r"\bAIza[0-9A-Za-z_-]{35}\b").unwrap(),
             secret_group: 0,
             signal_substrings: &["AIza"],
+            classify_in_context: Some(classify_google_api_key),
+        },
+        SecretRule {
+            name: "Firebase Cloud Messaging server key",
+            confidence: SecretConfidence::High,
+            pattern: Regex::new(r"\bAAAA[0-9A-Za-z_-]{7}:APA91b[0-9A-Za-z_-]{100,}").unwrap(),
+            secret_group: 0,
+            signal_substrings: &[":APA91b"],
+            classify_in_context: None,
         },
         SecretRule {
             name: "Stripe key",
@@ -306,9 +329,54 @@ static HIGH_CONFIDENCE_RULES: LazyLock<Vec<SecretRule>> = LazyLock::new(|| {
             pattern: Regex::new(r"\b[rs]k_(?:live|test)_[0-9A-Za-z]{16,}\b").unwrap(),
             secret_group: 0,
             signal_substrings: &["sk_live_", "sk_test_", "rk_live_", "rk_test_"],
+            classify_in_context: None,
         },
     ]
 });
+
+// A Firebase web app's config, apiKey included, ships in the browser bundle
+// by design; security rules and App Check protect the project, not the key.
+// These markers are the config's other client fields, in camelCase and in
+// the snake_case of environment variable names.
+static FIREBASE_WEB_CONFIG_MARKERS: &[&str] = &[
+    "authdomain",
+    "auth_domain",
+    "firebaseapp.com",
+    "firebaseio.com",
+    "messagingsenderid",
+    "messaging_sender_id",
+    ":web:",
+];
+const FIREBASE_WEB_CONFIG_CONTEXT_LINES: usize = 8;
+
+// Names that build tools inline into client bundles. Such a key is public,
+// but it may still be unrestricted, so it stays reportable.
+static CLIENT_PUBLIC_ENV_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"\b(?:VITE|NEXT_PUBLIC|REACT_APP|EXPO_PUBLIC)_[A-Z0-9_]*\s*[:=]\s*["'`]?$"#)
+        .unwrap()
+});
+
+fn classify_google_api_key(
+    lines: &[&str],
+    line_index: usize,
+    match_start: usize,
+) -> (&'static str, SecretConfidence) {
+    let window_start = line_index.saturating_sub(FIREBASE_WEB_CONFIG_CONTEXT_LINES);
+    let window_end = (line_index + FIREBASE_WEB_CONFIG_CONTEXT_LINES + 1).min(lines.len());
+    let in_firebase_web_config = lines[window_start..window_end].iter().any(|line| {
+        let lower = line.to_lowercase();
+        FIREBASE_WEB_CONFIG_MARKERS
+            .iter()
+            .any(|marker| lower.contains(marker))
+    });
+    if in_firebase_web_config {
+        ("Firebase web config API key", SecretConfidence::Low)
+    } else if CLIENT_PUBLIC_ENV_ASSIGNMENT.is_match(&lines[line_index][..match_start]) {
+        ("Client-public Google API key", SecretConfidence::Medium)
+    } else {
+        ("Google API key", SecretConfidence::High)
+    }
+}
 
 pub fn report_secret_like_code(
     analyzer: &dyn IAnalyzer,
@@ -456,7 +524,10 @@ fn scan_default_ref(
             format!("{root}{}", entry.name().unwrap_or_default())
         };
         if let Some(project_path) = to_project_relative_path(ctx, &git_path) {
-            if test_paths::is_test_like_path(&project_path, language_for_path(&project_path)) {
+            if test_paths::is_test_like_path(
+                &project_path,
+                crate::diff_analysis::path_language(Path::new(&project_path)),
+            ) {
                 return TreeWalkResult::Ok;
             }
             let result =
@@ -520,7 +591,10 @@ fn scan_history(
             let Some(project_path) = to_project_relative_path(ctx, &git_path) else {
                 return TreeWalkResult::Ok;
             };
-            if test_paths::is_test_like_path(&project_path, language_for_path(&project_path)) {
+            if test_paths::is_test_like_path(
+                &project_path,
+                crate::diff_analysis::path_language(Path::new(&project_path)),
+            ) {
                 return TreeWalkResult::Ok;
             }
             let oid = entry.id();
@@ -636,12 +710,21 @@ fn scan_text(path: &str, text: &str, include_low_confidence: bool) -> HashSet<Se
 
 fn scan_text_detailed(path: &str, text: &str, include_low_confidence: bool) -> TextScanResult {
     let mut result = TextScanResult::default();
-    let mut line_start = 0;
-    for (idx, line_with_ending) in text.split_inclusive('\n').enumerate() {
+    let mut line_starts = Vec::new();
+    let mut lines = Vec::new();
+    let mut next_line_start = 0;
+    for line_with_ending in text.split_inclusive('\n') {
+        line_starts.push(next_line_start);
+        next_line_start += line_with_ending.len();
         let line = line_with_ending
             .strip_suffix('\n')
             .unwrap_or(line_with_ending);
-        let line = line.strip_suffix('\r').unwrap_or(line);
+        lines.push(line.strip_suffix('\r').unwrap_or(line));
+    }
+    // Literals a rule has recognized as public client keys. The structural
+    // pass must not report them again as credential assignments.
+    let mut public_client_key_spans = HashSet::new();
+    for (idx, (&line, &line_start)) in lines.iter().zip(&line_starts).enumerate() {
         let line_number = idx + 1;
         for rule in HIGH_CONFIDENCE_RULES.iter() {
             if !rule
@@ -661,25 +744,41 @@ fn scan_text_detailed(path: &str, text: &str, include_low_confidence: bool) -> T
                 }
                 let start = line_start + matched.start();
                 let end = line_start + matched.end();
+                let (name, confidence) = rule
+                    .classify_in_context
+                    .map_or((rule.name, rule.confidence), |classify| {
+                        classify(&lines, idx, matched.start())
+                    });
+                if confidence != rule.confidence {
+                    public_client_key_spans.insert((start, end));
+                }
+                if confidence == SecretConfidence::Low && !include_low_confidence {
+                    continue;
+                }
                 result.keys.insert(SecretKey {
                     path: path.to_string(),
                     line: line_number,
-                    rule: rule.name.to_string(),
-                    confidence: rule.confidence,
-                    sample: redacted_line(line, value, matched.start(), matched.end()),
+                    rule: name.to_string(),
+                    confidence,
+                    sample: redact_secret(value),
                     redaction_span: redaction_span(text, start, end),
                 });
             }
         }
-        line_start += line_with_ending.len();
     }
-    add_structural_assignment_findings(&mut result, path, text, include_low_confidence);
+    add_structural_assignment_findings(
+        &mut result,
+        path,
+        text,
+        include_low_confidence,
+        &public_client_key_spans,
+    );
     result
 }
 
 fn assignment_grammar(path: &str) -> Option<tree_sitter::Language> {
     let path_obj = Path::new(path);
-    let language = language_for_path(path);
+    let language = crate::diff_analysis::path_language(Path::new(path));
     parser_language_for_path(language, path_obj).or_else(|| {
         match path_obj
             .extension()
@@ -701,6 +800,7 @@ fn add_structural_assignment_findings(
     path: &str,
     text: &str,
     include_low_confidence: bool,
+    public_client_key_spans: &HashSet<(usize, usize)>,
 ) {
     if !has_credential_keyword(&text.to_lowercase()) {
         return;
@@ -759,6 +859,9 @@ fn add_structural_assignment_findings(
         let Some((start, end)) = literal_content_range(literal, text) else {
             continue;
         };
+        if public_client_key_spans.contains(&(start, end)) {
+            continue;
+        }
         let value_text = &text[start..end];
         let confidence = if value_text.chars().count() >= 12 {
             SecretConfidence::Medium
@@ -788,7 +891,8 @@ fn add_structural_assignment_findings(
 
 fn assignment_parts(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
     match node.kind() {
-        "assignment_expression" | "assignment" | "short_var_declaration" => Some((
+        "assignment_expression" => php_assignment_parts(node),
+        "assignment" | "short_var_declaration" => Some((
             node.child_by_field_name("left")?,
             node.child_by_field_name("right")?,
         )),
@@ -920,8 +1024,11 @@ fn redact_assignment_excerpt(text: &str, assignment: Node<'_>, start: usize, end
         relative_start..relative_end,
         &redact_secret(&text[start..end]),
     );
-    if excerpt.len() > MAX_EXCERPT_CHARS {
-        format!("{}...", &excerpt[..MAX_EXCERPT_CHARS - 3])
+    // Repository text is arbitrary UTF-8, so bound the excerpt by characters;
+    // a byte cut can split a multi-byte character and panic.
+    if excerpt.chars().nth(MAX_EXCERPT_CHARS).is_some() {
+        let kept: String = excerpt.chars().take(MAX_EXCERPT_CHARS - 3).collect();
+        format!("{kept}...")
     } else {
         excerpt.trim().to_string()
     }
@@ -970,28 +1077,17 @@ fn approximate_entropy(value: &str) -> f64 {
         .sum()
 }
 
-fn redacted_line(line: &str, secret: &str, start: usize, end: usize) -> String {
-    let redacted = redact_secret(secret);
-    let start = start.min(line.len());
-    let end = end.min(line.len());
-    let excerpt = line[start..end].replace(secret, &redacted);
-    if excerpt.len() > MAX_EXCERPT_CHARS {
-        format!("{}...", &excerpt[..MAX_EXCERPT_CHARS - 3])
-    } else {
-        excerpt.trim().to_string()
-    }
-}
-
 fn redact_secret(secret: &str) -> String {
-    if secret.len() <= 8 {
+    let length = secret.chars().count();
+    if length <= 8 {
         return "[REDACTED]".to_string();
     }
+    // Count characters, not bytes: a credential-named literal can hold any
+    // UTF-8 text, such as a translated string.
     let visible = 4.min(MAX_SECRET_SAMPLE_VALUE_CHARS / 2);
-    format!(
-        "{}...{}",
-        &secret[..visible],
-        &secret[secret.len() - visible..]
-    )
+    let prefix: String = secret.chars().take(visible).collect();
+    let suffix: String = secret.chars().skip(length - visible).collect();
+    format!("{prefix}...{suffix}")
 }
 
 fn to_project_relative_path(ctx: &GitContext, git_path: &str) -> Option<String> {
@@ -1001,9 +1097,10 @@ fn to_project_relative_path(ctx: &GitContext, git_path: &str) -> Option<String> 
         .strip_prefix(&ctx.repo_root)
         .ok()
         .filter(|prefix| !prefix.as_os_str().is_empty())
-        .map(normalize_path)
+        .map(|prefix| crate::path_utils::normalize_relative_components(prefix).unwrap_or_default())
         .unwrap_or_default();
-    let normalized_repo_rel = normalize_path(&repo_rel);
+    let normalized_repo_rel =
+        crate::path_utils::normalize_relative_components(&repo_rel).unwrap_or_default();
     if !project_prefix.as_os_str().is_empty() && !normalized_repo_rel.starts_with(&project_prefix) {
         return None;
     }
@@ -1016,30 +1113,6 @@ fn to_project_relative_path(ctx: &GitContext, git_path: &str) -> Option<String> 
             .to_path_buf()
     };
     Some(project_rel.to_string_lossy().replace('\\', "/"))
-}
-
-fn normalize_path(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::Normal(part) => out.push(part),
-            std::path::Component::CurDir => {}
-            _ => return PathBuf::new(),
-        }
-    }
-    out
-}
-
-fn language_for_path(path: &str) -> Language {
-    Path::new(path)
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(Language::from_extension)
-        .unwrap_or(Language::None)
-}
-
-fn is_regular_file_mode(mode: i32) -> bool {
-    mode == i32::from(FileMode::Blob) || mode == i32::from(FileMode::BlobExecutable)
 }
 
 fn is_binary_text(text: &str) -> bool {
@@ -1295,8 +1368,8 @@ fn format_secret_scan_report(report: &SecretScanReport, max_findings: usize) -> 
 mod tests {
     use super::*;
     use crate::analyzer::{AnalyzerConfig, WorkspaceAnalyzer};
-    use git2::{IndexAddOption, Signature};
-    use std::fs;
+    use brokk_bifrost_core::test_support::write_file;
+    use git2::Signature;
     use tempfile::TempDir;
 
     fn init_repo() -> (TempDir, Repository) {
@@ -1315,33 +1388,9 @@ mod tests {
         .expect("ephemeral workspace should build")
     }
 
-    fn write_file(root: &Path, rel: &str, contents: &str) {
-        let path = root.join(rel);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).unwrap();
-        }
-        fs::write(path, contents).unwrap();
-    }
-
     fn commit_all(repo: &Repository, message: &str) {
-        let mut index = repo.index().unwrap();
-        index
-            .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
-            .unwrap();
-        index.write().unwrap();
-        let tree_id = index.write_tree().unwrap();
-        let tree = repo.find_tree(tree_id).unwrap();
         let sig = Signature::now("Tester", "test@example.com").unwrap();
-        let parents = repo
-            .head()
-            .ok()
-            .and_then(|head| head.target())
-            .and_then(|oid| repo.find_commit(oid).ok())
-            .map(|commit| vec![commit])
-            .unwrap_or_default();
-        let parent_refs = parents.iter().collect::<Vec<_>>();
-        repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &parent_refs)
-            .unwrap();
+        crate::test_support::shared_git::commit_all(repo, message, &sig);
         let origin_head = repo.reference_symbolic(
             "refs/remotes/origin/HEAD",
             "refs/heads/master",
@@ -1371,21 +1420,6 @@ mod tests {
     }
 
     #[test]
-    fn matcher_detects_provider_tokens_and_private_keys() {
-        let text = r#"
-        aws = "AKIAIOSFODNN7EXAMPLE"
-        token = "ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ"
-        key = "-----BEGIN RSA PRIVATE KEY-----"
-        "#;
-
-        let findings = scan_text("Secrets.java", text, false);
-
-        assert!(findings.iter().any(|f| f.rule == "AWS access key id"));
-        assert!(findings.iter().any(|f| f.rule == "GitHub token"));
-        assert!(findings.iter().any(|f| f.rule == "Private key block"));
-    }
-
-    #[test]
     fn matcher_detects_provider_tokens_without_credential_keywords() {
         let text = r#"
         value = "AKIAIOSFODNN7EXAMPLE"
@@ -1404,10 +1438,130 @@ mod tests {
         assert!(findings.iter().any(|f| f.rule == "Stripe key"));
     }
 
+    const SYNTHETIC_GOOGLE_API_KEY: &str = "AIzaSyB7qQ9xV7pL2mN8rT4sZ6wYk3Jd5Fh1Gc0";
+
+    fn rules_and_confidences(findings: &HashSet<SecretKey>) -> Vec<(&str, SecretConfidence)> {
+        let mut found: Vec<_> = findings
+            .iter()
+            .map(|finding| (finding.rule.as_str(), finding.confidence))
+            .collect();
+        found.sort_by_key(|(rule, _)| *rule);
+        found
+    }
+
     #[test]
-    fn matcher_detects_generic_credential_assignment() {
-        let findings = scan_text("config.yml", "client_secret: qQ9xV7pL2mN8rT4sZ6wY", false);
-        assert!(findings.iter().any(|f| f.rule == "Credential assignment"));
+    fn bare_google_api_key_stays_high_confidence() {
+        let text = format!("String mapsKey = lookup(\"{SYNTHETIC_GOOGLE_API_KEY}\");\n");
+
+        let findings = scan_text("Maps.java", &text, true);
+
+        assert_eq!(
+            rules_and_confidences(&findings),
+            vec![("Google API key", SecretConfidence::High)]
+        );
+    }
+
+    #[test]
+    fn firebase_web_config_json_in_env_file_is_low_confidence() {
+        // The shape of excalidraw's .env.production, with a synthetic key.
+        let text = format!(
+            "VITE_APP_WS_SERVER_URL=https://oss-collab.excalidraw.com\n\
+             VITE_APP_FIREBASE_CONFIG='{{\"apiKey\":\"{SYNTHETIC_GOOGLE_API_KEY}\",\
+             \"authDomain\":\"example-room.firebaseapp.com\",\
+             \"databaseURL\":\"https://example-room.firebaseio.com\",\
+             \"projectId\":\"example-room\",\"storageBucket\":\"example-room.appspot.com\",\
+             \"messagingSenderId\":\"123456789012\",\
+             \"appId\":\"1:123456789012:web:0123456789abcdef\"}}'\n"
+        );
+
+        assert!(scan_text(".env.production", &text, false).is_empty());
+        assert_eq!(
+            rules_and_confidences(&scan_text(".env.production", &text, true)),
+            vec![("Firebase web config API key", SecretConfidence::Low)]
+        );
+    }
+
+    #[test]
+    fn firebase_web_config_object_is_not_a_credential_assignment() {
+        let text = format!(
+            "const firebaseConfig = {{\n  \
+               apiKey: \"{SYNTHETIC_GOOGLE_API_KEY}\",\n  \
+               authDomain: \"example-app.firebaseapp.com\",\n  \
+               projectId: \"example-app\",\n  \
+               storageBucket: \"example-app.appspot.com\",\n  \
+               messagingSenderId: \"123456789012\",\n  \
+               appId: \"1:123456789012:web:0123456789abcdef\",\n\
+             }};\n\
+             initializeApp(firebaseConfig);\n"
+        );
+
+        assert!(scan_text("src/firebase.js", &text, false).is_empty());
+        assert_eq!(
+            rules_and_confidences(&scan_text("src/firebase.js", &text, true)),
+            vec![("Firebase web config API key", SecretConfidence::Low)]
+        );
+    }
+
+    #[test]
+    fn google_api_key_in_client_public_env_var_is_medium_confidence() {
+        let text = format!(
+            "NEXT_PUBLIC_MAPS_API_KEY={SYNTHETIC_GOOGLE_API_KEY}\n\
+             export VITE_PLACES_KEY=\"{SYNTHETIC_GOOGLE_API_KEY}\"\n\
+             MAPS_SERVER_API_KEY={SYNTHETIC_GOOGLE_API_KEY}\n"
+        );
+
+        let mut found: Vec<_> = scan_text(".env", &text, false)
+            .into_iter()
+            .map(|finding| (finding.line, finding.rule, finding.confidence))
+            .collect();
+        found.sort_by_key(|(line, _, _)| *line);
+
+        assert_eq!(
+            found,
+            vec![
+                (
+                    1,
+                    "Client-public Google API key".to_string(),
+                    SecretConfidence::Medium
+                ),
+                (
+                    2,
+                    "Client-public Google API key".to_string(),
+                    SecretConfidence::Medium
+                ),
+                (3, "Google API key".to_string(), SecretConfidence::High),
+            ]
+        );
+    }
+
+    #[test]
+    fn firebase_server_credentials_stay_high_confidence() {
+        let service_account = r#"{
+  "type": "service_account",
+  "project_id": "example-app",
+  "private_key_id": "0123456789abcdef0123456789abcdef01234567",
+  "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----\n",
+  "client_email": "firebase-adminsdk@example-app.iam.gserviceaccount.com"
+}
+"#;
+        assert!(
+            rules_and_confidences(&scan_text("serviceAccount.json", service_account, false))
+                .contains(&("Private key block", SecretConfidence::High))
+        );
+
+        // A legacy FCM server key is a secret even beside a web config.
+        let fcm_server_key = format!("AAAAq1w2e3r:APA91b{}", "Xy7_Kp2-Lm9Qr4Zt".repeat(9));
+        let text = format!(
+            "authDomain: \"example-app.firebaseapp.com\",\n\
+             fcmServerKey: \"{fcm_server_key}\",\n"
+        );
+        assert_eq!(
+            rules_and_confidences(&scan_text("config.yml", &text, false)),
+            vec![(
+                "Firebase Cloud Messaging server key",
+                SecretConfidence::High
+            )]
+        );
     }
 
     #[test]
@@ -1463,24 +1617,6 @@ mod tests {
     }
 
     #[test]
-    fn matcher_detects_credential_assignment_keyword_variants() {
-        let text = r#"apiKey: "qQ9xV7pL2mN8rT4sZ6wY"
-api_key: "aB9xV7pL2mN8rT4sZ6wY"
-api-key: "zZ9xV7pL2mN8rT4sZ6wY"
-access_key: "mM9xV7pL2mN8rT4sZ6wY"
-"#;
-
-        let findings = scan_text("config.yml", text, false);
-        assert_eq!(
-            4,
-            findings
-                .iter()
-                .filter(|f| f.rule == "Credential assignment")
-                .count()
-        );
-    }
-
-    #[test]
     fn matcher_ignores_placeholders_and_low_confidence_unless_requested() {
         let text = r#"password: "changeme"
 api_key: "test"
@@ -1501,12 +1637,50 @@ token: "abcd123"
         );
     }
 
+    fn single_sample(path: &str, text: &str) -> String {
+        let findings = scan_text(path, text, false);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        findings.into_iter().next().unwrap().sample
+    }
+
     #[test]
-    fn low_confidence_assignment_is_gated() {
-        let path = "config.yml";
-        let text = "client_secret: shorty";
-        assert!(scan_text(path, text, false).is_empty());
-        assert!(!scan_text(path, text, true).is_empty());
+    fn redaction_keeps_characters_that_span_the_visible_prefix_boundary() {
+        // U+2019 occupies bytes 3..6, so a four-byte prefix would split it.
+        let sample = single_sample("en.json", r#"{"password": "abc’defghijklmnop"}"#);
+
+        assert_eq!(sample, r#""password": "abc’...mnop""#);
+    }
+
+    #[test]
+    fn redaction_keeps_characters_that_span_the_visible_suffix_boundary() {
+        // U+2019 occupies bytes len-6..len-3, so a four-byte suffix would split it.
+        let sample = single_sample("en.json", r#"{"password": "abcdefghijkl’xyz"}"#);
+
+        assert_eq!(sample, r#""password": "abcd...’xyz""#);
+    }
+
+    #[test]
+    fn excerpt_truncation_counts_characters_not_bytes() {
+        // Each "é" is two bytes starting at an even offset, so byte 117 falls
+        // inside one. The first excerpt is longer than 120 bytes but shorter
+        // than 120 characters, so it stays whole.
+        let short_key = format!("passwordX{}", "é".repeat(60));
+        let sample = single_sample(
+            "fr.json",
+            &format!(r#"{{"{short_key}": "qQ9xV7pL2mN8rT4sZ6wY"}}"#),
+        );
+        assert_eq!(sample, format!(r#""{short_key}": "qQ9x...Z6wY""#));
+
+        let long_key = format!("passwordX{}", "é".repeat(150));
+        let sample = single_sample(
+            "fr.json",
+            &format!(r#"{{"{long_key}": "qQ9xV7pL2mN8rT4sZ6wY"}}"#),
+        );
+        let kept: String = format!("\"{long_key}")
+            .chars()
+            .take(MAX_EXCERPT_CHARS - 3)
+            .collect();
+        assert_eq!(sample, format!("{kept}..."));
     }
 
     #[test]
@@ -1545,202 +1719,5 @@ token: "abcd123"
         assert!(!result.findings.is_empty());
         let serialized = serde_json::to_string(&result).unwrap();
         assert!(!serialized.contains("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"));
-    }
-
-    #[test]
-    fn tool_reports_current_and_history_findings_and_excludes_tests() {
-        let (temp, repo) = init_repo();
-        write_file(
-            temp.path(),
-            "src/main/java/App.java",
-            r#"class App { String client_secret = "qQ9xV7pL2mN8rT4sZ6wY"; }"#,
-        );
-        write_file(
-            temp.path(),
-            "src/test/java/AppTest.java",
-            r#"class AppTest { String token = "ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ"; }"#,
-        );
-        commit_all(&repo, "add current secret");
-
-        write_file(
-            temp.path(),
-            "src/main/java/App.java",
-            r#"class App { String value = "clean"; }"#,
-        );
-        commit_all(&repo, "remove current secret");
-
-        write_file(
-            temp.path(),
-            "src/main/java/Live.java",
-            r#"class Live { String token = "ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIK"; }"#,
-        );
-        commit_all(&repo, "add live secret");
-        let analyzer = build_analyzer(temp.path());
-
-        let result = report_secret_like_code(
-            analyzer.analyzer(),
-            ReportSecretLikeCodeParams {
-                max_findings: 20,
-                max_commits: 20,
-                include_history_only: true,
-                include_low_confidence: false,
-            },
-        );
-
-        assert!(result.report.contains("HISTORY"), "{}", result.report);
-        assert!(
-            result.report.contains("CURRENT") || result.report.contains("BOTH"),
-            "{}",
-            result.report
-        );
-        assert!(result.report.contains("src/main/java/App.java"));
-        assert!(result.report.contains("src/main/java/Live.java"));
-        assert!(!result.report.contains("src/test/java/AppTest.java"));
-        assert!(!result.report.contains("qQ9xV7pL2mN8rT4sZ6wY"));
-    }
-
-    #[test]
-    fn blob_cache_preserves_grammar_confidence_and_content_identity() {
-        let (_temp, repo) = init_repo();
-        let text = "client_secret=qQ9xV7pL2mN8rT4sZ6wY";
-        let oid = repo.blob(text.as_bytes()).unwrap();
-        for path in [
-            "first.unknown",
-            "second.properties",
-            "third.unknown",
-            "fourth.properties",
-        ] {
-            let cached = scan_blob_content(&repo, oid, path, false);
-            let reference = scan_text_detailed(path, text, false);
-            assert_eq!(cached.keys, reference.keys, "{path}");
-            assert_eq!(cached.diagnostics, reference.diagnostics, "{path}");
-            if path.ends_with(".properties") {
-                assert_eq!(cached.keys.len(), 1);
-                assert!(cached.diagnostics.is_empty());
-            } else {
-                assert!(cached.keys.is_empty());
-                assert_eq!(
-                    cached.diagnostics[0].kind,
-                    SecretScanDiagnosticKind::UnsupportedAssignmentSyntax
-                );
-            }
-        }
-        let short = "client_secret=qQ9xV7";
-        let short_oid = repo.blob(short.as_bytes()).unwrap();
-        for low in [false, true, false] {
-            let cached = scan_blob_content(&repo, short_oid, "short.properties", low);
-            assert_eq!(cached.keys.len(), usize::from(low));
-        }
-        let changed = repo.blob(b"client_secret=placeholder").unwrap();
-        assert!(
-            scan_blob_content(&repo, changed, "second.properties", false)
-                .keys
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn tool_reports_cached_duplicate_blob_at_each_path() {
-        let (temp, repo) = init_repo();
-        let text = "client_secret: qQ9xV7pL2mN8rT4sZ6wY";
-        write_file(temp.path(), "src/main/resources/first.yml", text);
-        write_file(temp.path(), "src/main/resources/second.yml", text);
-        write_file(temp.path(), "src/main/resources/third.unknown", text);
-        commit_all(&repo, "add duplicate blob secrets");
-        let analyzer = build_analyzer(temp.path());
-
-        let result = report_secret_like_code(
-            analyzer.analyzer(),
-            ReportSecretLikeCodeParams {
-                max_findings: 20,
-                max_commits: 5,
-                include_history_only: true,
-                include_low_confidence: false,
-            },
-        );
-
-        assert!(
-            result
-                .findings
-                .iter()
-                .all(|finding| !finding.path.ends_with("third.unknown"))
-        );
-        assert!(
-            result
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.path.ends_with("third.unknown")
-                    && diagnostic.kind == SecretScanDiagnosticKind::UnsupportedAssignmentSyntax)
-        );
-        assert!(
-            result.report.contains("src/main/resources/first.yml"),
-            "{}",
-            result.report
-        );
-        assert!(
-            result.report.contains("src/main/resources/second.yml"),
-            "{}",
-            result.report
-        );
-    }
-
-    #[test]
-    fn history_scan_keeps_findings_across_commits_with_duplicate_blobs() {
-        let (temp, repo) = init_repo();
-        write_file(
-            temp.path(),
-            "src/main/resources/early.yml",
-            "client_secret: qQ9xV7pL2mN8rT4sZ6wY",
-        );
-        commit_all(&repo, "add early secret");
-
-        write_file(
-            temp.path(),
-            "src/main/resources/duplicate-one.yml",
-            "client_secret: aA9xV7pL2mN8rT4sZ6wY",
-        );
-        write_file(
-            temp.path(),
-            "src/main/resources/duplicate-two.yml",
-            "client_secret: aA9xV7pL2mN8rT4sZ6wY",
-        );
-        write_file(
-            temp.path(),
-            "src/main/resources/middle.yml",
-            "client_secret: bB9xV7pL2mN8rT4sZ6wY",
-        );
-        commit_all(&repo, "add duplicate and middle secrets");
-
-        write_file(
-            temp.path(),
-            "src/main/resources/late.yml",
-            "client_secret: cC9xV7pL2mN8rT4sZ6wY",
-        );
-        commit_all(&repo, "add late secret");
-        let analyzer = build_analyzer(temp.path());
-
-        let result = report_secret_like_code(
-            analyzer.analyzer(),
-            ReportSecretLikeCodeParams {
-                max_findings: 50,
-                max_commits: 20,
-                include_history_only: true,
-                include_low_confidence: false,
-            },
-        );
-
-        for path in [
-            "src/main/resources/early.yml",
-            "src/main/resources/middle.yml",
-            "src/main/resources/late.yml",
-            "src/main/resources/duplicate-one.yml",
-            "src/main/resources/duplicate-two.yml",
-        ] {
-            assert!(
-                result.report.contains(path),
-                "missing {path} in {}",
-                result.report
-            );
-        }
     }
 }

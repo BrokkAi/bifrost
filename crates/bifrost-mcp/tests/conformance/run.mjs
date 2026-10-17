@@ -453,7 +453,14 @@ function runRustGate() {
   const result = spawnSync(
     'cargo',
     ['test', '-p', 'brokk-bifrost-mcp', '--test', 'mcp_wire_schema'],
-    { cwd: REPO_ROOT, stdio: 'inherit' },
+    {
+      cwd: REPO_ROOT,
+      stdio: 'inherit',
+      env: {
+        ...process.env,
+        BIFROST_OPEN_PACKS_DISABLE: process.env.BIFROST_OPEN_PACKS_DISABLE ?? '1',
+      },
+    },
   );
   return result.status === 0;
 }

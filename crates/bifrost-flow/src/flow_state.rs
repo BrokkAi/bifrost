@@ -8,13 +8,13 @@
 //! entry-to-read path passes the write), or `SameEvaluation` (the read feeds
 //! the very value the write assigns, so the write cannot serve it).
 //!
-//! The production semantic IR (`crate::analyzer::semantic`) is the *only*
-//! evidence source. There is no lexical, textual, or source-order fallback
-//! anywhere in this module, by construction: nothing here reads source order,
-//! containment, or spelling to decide a relation. Where the lowering does not
-//! model an axis, this layer reports that axis uncovered rather than
-//! approximating it -- the same per-axis completeness contract the canonical
-//! reference-edge layer ([`super::reference_edges`]) established for #1479.
+//! The production semantic IR (`crate::analyzer::semantic`) owns procedure
+//! topology and ordinary events. Rust's scope-only future-frame reads also use
+//! the existing lexical environment and AST-resolved by-value uses; those
+//! source facts never stand in for CFG reachability. Where a required axis is
+//! incomplete, this layer reports it rather than approximating it -- the same
+//! per-axis completeness contract the canonical reference-edge layer
+//! ([`super::reference_edges`]) established for #1479.
 //!
 //! Deliberately not a stored graph: rows are derived on demand from one
 //! lowered artifact, and every row is stamped with the workspace generation it
@@ -33,18 +33,18 @@ use crate::analyzer::semantic::cfg_algorithms::{
 use crate::analyzer::semantic::derive_property_reaching_over_graph;
 use crate::analyzer::semantic::{
     BindingOriginIndex, CallContinuationKind, CallInvocationMode, CallSiteHandle, CallSiteId,
-    CallToReturnModel, CallTransferSet, CandidateCoverage, CapabilitySupport, ContentIdentity,
-    ControlContinuation, ControlEdgeHandle, ControlEdgeId, ControlEdgeKind, EvidenceCompleteness,
-    IcfgProvider, LengthDelimitedDigest, MemoryAccessKind, MemoryLocationId, MemoryLocationKind,
-    OracleCallContext, ProcedureHandle, ProcedureId, ProcedureSemantics, ProgramPointHandle,
-    ProgramPointId, ProofStatus, PropertyReachCertainty, PropertyReachingIncompleteReason,
-    PropertyReachingLimits, PropertyReachingResult, SemanticArtifact, SemanticArtifactKey,
-    SemanticBudget, SemanticCallSite, SemanticCapabilities, SemanticCapability, SemanticEffect,
-    SemanticGap, SemanticGapDischarge, SemanticGapId, SemanticGapImpact, SemanticGapKind,
-    SemanticGapSubject, SemanticOutcome, SemanticRequest, SemanticValueKind, SemanticWork,
-    SourceMappingId, SourceMappingKind, SourceSpan, StableDigest, SynchronizationOperation,
-    SynchronizationPayload, TransferKind, ValueFlowKind, ValueFlowOracle, ValueId,
-    WorkspaceIcfgProvider,
+    CallToReturnModel, CallTransferSet, CallableTarget, CallableTargetResolution,
+    CandidateCoverage, CapabilitySupport, ContentIdentity, ControlContinuation, ControlEdgeHandle,
+    ControlEdgeId, ControlEdgeKind, EvidenceCompleteness, IcfgProvider, LengthDelimitedDigest,
+    MemoryAccessKind, MemoryLocationId, MemoryLocationKind, OracleCallContext, ProcedureHandle,
+    ProcedureId, ProcedureSemantics, ProgramPointHandle, ProgramPointId, ProofStatus,
+    PropertyReachCertainty, PropertyReachingIncompleteReason, PropertyReachingLimits,
+    PropertyReachingResult, SemanticArtifact, SemanticArtifactKey, SemanticBudget,
+    SemanticCallSite, SemanticCapabilities, SemanticCapability, SemanticEffect, SemanticGap,
+    SemanticGapDischarge, SemanticGapId, SemanticGapImpact, SemanticGapKind, SemanticGapSubject,
+    SemanticOutcome, SemanticRequest, SemanticValueKind, SemanticWork, SourceMappingId,
+    SourceMappingKind, SourceSpan, StableDigest, SynchronizationOperation, SynchronizationPayload,
+    TransferKind, ValueFlowKind, ValueFlowOracle, ValueId, ValueUseKind, WorkspaceIcfgProvider,
 };
 use crate::analyzer::semantic_model::{
     ActiveSemanticModelSnapshot, ProcedureSummaryMemberKey, ResolvedActiveSemanticModels,
@@ -61,9 +61,14 @@ use crate::analyzer::{
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_analysis::analyzer::structural::occurrence_rows::ast_id;
+use brokk_bifrost_analysis::analyzer::structural::{
+    BindingOfOutcome, EnvironmentAxis, Namespace, binding_of, environment_for_file,
+};
+use brokk_bifrost_analysis::analyzer::usages::get_definition::parse_tree_for_language;
 use brokk_bifrost_core::profiling;
 use std::collections::VecDeque;
 use std::sync::{Arc, Weak};
+use tree_sitter::Node;
 
 /// Execute one topology-sensitive operation against the raw graph when no
 /// edge is projected, or against the exact masked view otherwise. Keeping the
@@ -86,7 +91,7 @@ macro_rules! with_control_graph {
 
 pub use brokk_bifrost_core::analyzer::structural::flow_state::{
     ALL_FLOW_STATE_AXES as FLOW_STATE_AXES, FlowCertainty, FlowRelation, FlowStateAxis,
-    FlowSubjectKind, StateEventClass,
+    FlowSubjectKind, StateEventClass, StateEventReadCause,
 };
 
 /// Stable content-scoped identity for one semantic procedure.
@@ -232,6 +237,9 @@ pub struct StateEventRow {
     pub event: usize,
     pub procedure: ProcedureId,
     pub event_class: StateEventClass,
+    /// Present on synthetic reads placed at a suspension point. Ordinary
+    /// semantic events keep `None`.
+    pub read_cause: Option<StateEventReadCause>,
     pub subject: FlowSubject,
     pub point: ProgramPointId,
     /// The wire identity of `point`: the same stable id a `program_point` row
@@ -278,6 +286,9 @@ pub enum FlowStateIncompleteReason {
     /// The analyzed content the artifact was lowered from is no longer the
     /// content the structural facts describe.
     SourceGenerationChanged,
+    /// Rust's lexical environment or AST-to-CFG move-site projection could not
+    /// answer scope-only future-frame liveness for one procedure.
+    BindingScopeLivenessUnavailable { detail: String },
     /// A request-local control projection was minted for another semantic
     /// artifact or named a missing/non-normal edge. No requested edge is
     /// omitted when this reason is present.
@@ -304,6 +315,13 @@ pub enum FlowStateIncompleteReason {
     /// Such an access has no stable property subject, so it contributes no
     /// event rather than an approximated one.
     PropertyBaseNotCanonical { accesses: usize },
+    /// A scoped property proof retained a semantic endpoint that public
+    /// event projection could not present. The exact join identity is kept.
+    SelectedPropertyEndpointUnavailable {
+        point: ProgramPointId,
+        event_index: u32,
+        source: SourceMappingId,
+    },
     /// The lowering declares a local binding it never establishes, so reads of
     /// that binding have no establishment to reach them in this artifact and
     /// their absence is unknown, not proven.
@@ -324,7 +342,7 @@ pub enum FlowStateIncompleteReason {
     /// The structured property provider retained typed evidence, but one or
     /// more proof/completeness conditions remained open.
     PropertyReaching {
-        reason: PropertyReachingIncompleteReason,
+        reason: Box<PropertyReachingIncompleteReason>,
     },
 }
 
@@ -344,7 +362,9 @@ impl FlowStateIncompleteReason {
             AxisUnsupported(blocked) => *blocked == axis,
             BudgetExhausted { axis: blocked, .. } => *blocked == axis,
             LoweringGap { capability, .. } => axes_blocked_by(*capability).contains(&axis),
-            PropertyBaseNotCanonical { .. } => property_axes().contains(&axis),
+            PropertyBaseNotCanonical { .. } | SelectedPropertyEndpointUnavailable { .. } => {
+                property_axes().contains(&axis)
+            }
             BindingWithoutEstablishment { .. } => matches!(
                 axis,
                 FlowStateAxis::BindingEvents
@@ -374,6 +394,7 @@ impl FlowStateIncompleteReason {
             | Cancelled
             | SourceGenerationChanged
             | NoStructuralFacts => true,
+            BindingScopeLivenessUnavailable { .. } => axis == FlowStateAxis::BindingEvents,
         }
     }
 }
@@ -404,7 +425,14 @@ fn property_reason_blocks(reason: &PropertyReachingIncompleteReason, axis: FlowS
                     | FlowStateAxis::SameEvaluationRelation
             )
         }
-        InputRelationBudgetExceeded { .. }
+        SelectedReadMissing { .. }
+        | SelectedReadAmbiguous { .. }
+        | SelectedRelationEndpointUnavailable { .. }
+        | SelectedRuntimeAccess { .. }
+        | SelectedAncestorStore { .. }
+        | SelectedAliasClosureUnavailable { .. }
+        | SelectedSemanticGap { .. }
+        | InputRelationBudgetExceeded { .. }
         | Cancelled
         | UnsupportedLocation { .. }
         | DurableIdentityUnavailable { .. }
@@ -614,6 +642,8 @@ pub struct LoopSourceSite {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoopSourceKind {
     While,
+    /// The condition's false arm enters the body and its true arm exits.
+    Until,
     For,
     Do,
 }
@@ -647,6 +677,7 @@ pub enum LoopRepeatAnswer {
 struct BindingInitializationFacts {
     /// Reachable binding reads and establishments, before their own event.
     uninitialized_before_event: HashMap<usize, bool>,
+    correlated_before_event: HashMap<usize, BindingInitializationAnswer>,
 }
 
 /// The structured, flow-sensitive closure of one value through exact local
@@ -670,6 +701,29 @@ pub struct ExactLocalValueAliasClosure {
 }
 
 impl FlowStateDerivation {
+    fn dominance_context<'a>(
+        &'a self,
+        procedure: &'a ProcedureHandle,
+    ) -> Option<(&'a ProcedureSemantics, &'a Dominators<ProgramPointId>)> {
+        let procedure_artifact = Arc::downgrade(procedure.artifact());
+        // Partial artifacts are not globally cached, so a durable key cannot
+        // substitute for the exact materialization held by this derivation.
+        if self.procedure != procedure.id()
+            || !Weak::ptr_eq(&self.procedure_artifact, &procedure_artifact)
+        {
+            return None;
+        }
+        let semantics = procedure.semantics();
+        let dominance = self.dominance.as_ref()?;
+        if self.completeness.reasons().iter().any(|reason| {
+            reason.blocks(FlowStateAxis::DominanceRelation)
+                && !matches!(reason, FlowStateIncompleteReason::LoweringGap { .. })
+        }) {
+            return None;
+        }
+        Some((semantics, dominance))
+    }
+
     pub fn event(&self, event: usize) -> &StateEventRow {
         &self.events[event]
     }
@@ -686,6 +740,45 @@ impl FlowStateDerivation {
     ) -> BindingInitializationAnswer {
         assert_eq!(self.event(read_event).event_class, StateEventClass::Read);
         self.binding_initialization_before_event(procedure, read_event)
+    }
+
+    /// Whether a modeled exceptional continuation from this local read goes
+    /// directly to an exception handler. The adapter publishes this route
+    /// only when a Python `NameError`/`UnboundLocalError` or catch-all handler
+    /// is proven to match the local-read failure.
+    pub fn binding_read_failure_is_handled(
+        &self,
+        procedure: &ProcedureHandle,
+        read_event: usize,
+    ) -> bool {
+        assert_eq!(self.event(read_event).event_class, StateEventClass::Read);
+        assert!(
+            matches!(self.event(read_event).subject, FlowSubject::Binding { .. }),
+            "handled local-read proof requires a binding event"
+        );
+        assert_eq!(self.procedure, procedure.id());
+        assert!(
+            self.procedure_artifact
+                .upgrade()
+                .is_some_and(|artifact| Arc::ptr_eq(&artifact, procedure.artifact())),
+            "read exception proof requires the derivation's exact artifact"
+        );
+        let semantics = procedure.semantics();
+        let read_point = self.event(read_event).point;
+        semantics
+            .successor_edges(read_point)
+            .filter(|(_, edge)| edge.kind == ControlEdgeKind::Exceptional)
+            .any(|(_, edge)| {
+                // A general exception dispatcher also has switch-case edges,
+                // but retains an exceptional edge for an unmatched exception.
+                // Only the direct, proven local-read handler route is safe.
+                semantics
+                    .successor_edges(edge.target_point)
+                    .any(|(_, handler_edge)| handler_edge.kind == ControlEdgeKind::SwitchCase)
+                    && !semantics
+                        .successor_edges(edge.target_point)
+                        .any(|(_, handler_edge)| handler_edge.kind == ControlEdgeKind::Exceptional)
+            })
     }
 
     /// Prove that an ordinary local was initialized before a projected write.
@@ -780,6 +873,9 @@ impl FlowStateDerivation {
             // completeness and would have returned above.
             unreachable!("covered binding reaching has initialization facts");
         };
+        if let Some(answer) = facts.correlated_before_event.get(&event) {
+            return answer.clone();
+        }
         match facts.uninitialized_before_event.get(&event) {
             Some(false) => BindingInitializationAnswer::Proven,
             Some(true) => BindingInitializationAnswer::MayBeUninitialized,
@@ -813,6 +909,10 @@ impl FlowStateDerivation {
     ///   only a route that leaves the procedure without entering a handler or
     ///   cleanup. No read of this procedure lies on that route, so it cannot
     ///   change any read's initialization.
+    /// - A retained-control-topology exception-selection gap cannot affect
+    ///   initialization when its dispatcher is unreachable from the entry.
+    ///   A proven unbound-local read may route directly to its matching handler,
+    ///   leaving the generic dispatcher available only to other exceptions.
     ///
     /// Every other gap stays open. In particular, any other exceptional-control
     /// gap is not discharged here: some producers publish one for an operation
@@ -827,6 +927,15 @@ impl FlowStateDerivation {
             && gap.discharge == SemanticGapDischarge::NonRejoiningExceptionalExit
         {
             return true;
+        }
+        if gap.capability == SemanticCapability::ExceptionalControlFlow
+            && gap.discharge == SemanticGapDischarge::RetainedControlTopology
+        {
+            return self.dominance.as_ref().is_some_and(|dominance| {
+                with_control_graph!(semantics, &self.control_edge_mask, |graph| {
+                    !dominance.dominates(graph, semantics.entry_point(), gap.point)
+                })
+            });
         }
         match gap.capability {
             SemanticCapability::Captures => match gap.subject {
@@ -883,17 +992,10 @@ impl FlowStateDerivation {
             return false;
         };
         let moved_out = semantics.points().iter().any(|point| {
-            point.events.iter().any(|event| {
-                matches!(
-                    &event.effect,
-                    SemanticEffect::ValueFlow {
-                        kind: ValueFlowKind::Transfer(transfer),
-                        source,
-                        ..
-                    } if *source == binding
-                        && matches!(transfer.kind, TransferKind::Move { .. })
-                )
-            })
+            point
+                .events
+                .iter()
+                .any(|event| binding_is_invalidated_by(&event.effect, binding))
         });
         !moved_out
             && with_control_graph!(semantics, &self.control_edge_mask, |graph| {
@@ -1100,16 +1202,18 @@ impl FlowStateDerivation {
         let establishment = self.event(establishment_event);
         assert_eq!(establishment.event_class, StateEventClass::Establish);
         let FlowSubject::Binding { value: binding } = establishment.subject else {
-            panic!("overwrite proof requires an ordinary local binding");
+            panic!("overwrite proof requires an ordinary local or parameter binding");
         };
         let semantics = procedure.semantics();
-        assert_eq!(
-            semantics
-                .value(binding)
-                .expect("projected binding exists")
-                .kind,
-            SemanticValueKind::Local,
-            "overwrite proof requires an ordinary local binding"
+        assert!(
+            matches!(
+                semantics
+                    .value(binding)
+                    .expect("projected binding exists")
+                    .kind,
+                SemanticValueKind::Local | SemanticValueKind::Parameter { .. }
+            ),
+            "overwrite proof requires an ordinary local or by-value parameter binding"
         );
 
         let reasons = self
@@ -1688,23 +1792,7 @@ impl FlowStateDerivation {
         candidates: &[ProgramPointId],
         targets: &[ProgramPointId],
     ) -> Option<Box<[bool]>> {
-        let procedure_artifact = Arc::downgrade(procedure.artifact());
-        if self.procedure != procedure.id()
-            || !Weak::ptr_eq(&self.procedure_artifact, &procedure_artifact)
-        {
-            // Partial artifacts are not globally cached. A second materialization
-            // can therefore share a durable key while exposing different rows.
-            // It is an honest unavailable proof, not an interchangeable CFG.
-            return None;
-        }
-        let semantics = procedure.semantics();
-        let dominance = self.dominance.as_ref()?;
-        if self.completeness.reasons().iter().any(|reason| {
-            reason.blocks(FlowStateAxis::DominanceRelation)
-                && !matches!(reason, FlowStateIncompleteReason::LoweringGap { .. })
-        }) {
-            return None;
-        }
+        let (semantics, dominance) = self.dominance_context(procedure)?;
         let control_gaps = semantics
             .gaps()
             .iter()
@@ -1736,24 +1824,13 @@ impl FlowStateDerivation {
         candidates: &[ProgramPointId],
         targets: &[ProgramPointId],
     ) -> Option<Box<[bool]>> {
-        let procedure_artifact = Arc::downgrade(procedure.artifact());
-        if self.procedure != procedure.id()
-            || !Weak::ptr_eq(&self.procedure_artifact, &procedure_artifact)
-        {
-            return None;
-        }
-        let semantics = procedure.semantics();
-        let dominance = self.dominance.as_ref()?;
+        let (semantics, dominance) = self.dominance_context(procedure)?;
         if result_establishments.is_empty()
             || result_establishments
                 .iter()
                 .chain(candidates)
                 .chain(targets)
                 .any(|point| semantics.point(*point).is_none())
-            || self.completeness.reasons().iter().any(|reason| {
-                reason.blocks(FlowStateAxis::DominanceRelation)
-                    && !matches!(reason, FlowStateIncompleteReason::LoweringGap { .. })
-            })
         {
             return None;
         }
@@ -1780,20 +1857,7 @@ impl FlowStateDerivation {
         candidates: &[ControlEdgeHandle],
         targets: &[ProgramPointId],
     ) -> Option<Box<[bool]>> {
-        let procedure_artifact = Arc::downgrade(procedure.artifact());
-        if self.procedure != procedure.id()
-            || !Weak::ptr_eq(&self.procedure_artifact, &procedure_artifact)
-        {
-            return None;
-        }
-        let semantics = procedure.semantics();
-        let dominance = self.dominance.as_ref()?;
-        if self.completeness.reasons().iter().any(|reason| {
-            reason.blocks(FlowStateAxis::DominanceRelation)
-                && !matches!(reason, FlowStateIncompleteReason::LoweringGap { .. })
-        }) {
-            return None;
-        }
+        let (semantics, dominance) = self.dominance_context(procedure)?;
 
         let candidate_edges = validated_guard_edges(procedure, candidates)?;
 
@@ -1856,22 +1920,11 @@ impl FlowStateDerivation {
         candidates: &[ControlEdgeHandle],
         targets: &[ProgramPointId],
     ) -> Option<Box<[GuardDominanceAnswer]>> {
-        let procedure_artifact = Arc::downgrade(procedure.artifact());
-        if self.procedure != procedure.id()
-            || !Weak::ptr_eq(&self.procedure_artifact, &procedure_artifact)
-        {
-            return None;
-        }
-        let semantics = procedure.semantics();
-        let dominance = self.dominance.as_ref()?;
+        let (semantics, dominance) = self.dominance_context(procedure)?;
         if result_establishments.is_empty()
             || result_establishments
                 .iter()
                 .any(|point| semantics.point(*point).is_none())
-            || self.completeness.reasons().iter().any(|reason| {
-                reason.blocks(FlowStateAxis::DominanceRelation)
-                    && !matches!(reason, FlowStateIncompleteReason::LoweringGap { .. })
-            })
         {
             return None;
         }
@@ -1928,14 +1981,7 @@ impl FlowStateDerivation {
         candidate_point: ProgramPointId,
         targets: &[ProgramPointId],
     ) -> Option<Box<[bool]>> {
-        let procedure_artifact = Arc::downgrade(procedure.artifact());
-        if self.procedure != procedure.id()
-            || !Weak::ptr_eq(&self.procedure_artifact, &procedure_artifact)
-        {
-            return None;
-        }
-        let semantics = procedure.semantics();
-        let dominance = self.dominance.as_ref()?;
+        let (semantics, dominance) = self.dominance_context(procedure)?;
         if result_establishments.is_empty()
             || result_establishments
                 .iter()
@@ -1945,10 +1991,6 @@ impl FlowStateDerivation {
                 .iter()
                 .any(|point| semantics.point(*point).is_none())
             || self.result_flow_has_hard_hole()
-            || self.completeness.reasons().iter().any(|reason| {
-                reason.blocks(FlowStateAxis::DominanceRelation)
-                    && !matches!(reason, FlowStateIncompleteReason::LoweringGap { .. })
-            })
         {
             return None;
         }
@@ -2003,14 +2045,7 @@ impl FlowStateDerivation {
         candidates: &[ControlEdgeHandle],
         targets: &[ProgramPointId],
     ) -> Option<Box<[bool]>> {
-        let procedure_artifact = Arc::downgrade(procedure.artifact());
-        if self.procedure != procedure.id()
-            || !Weak::ptr_eq(&self.procedure_artifact, &procedure_artifact)
-        {
-            return None;
-        }
-        let semantics = procedure.semantics();
-        let dominance = self.dominance.as_ref()?;
+        let (semantics, dominance) = self.dominance_context(procedure)?;
         if result_establishments.is_empty()
             || result_establishments
                 .iter()
@@ -2018,10 +2053,6 @@ impl FlowStateDerivation {
             || targets
                 .iter()
                 .any(|point| semantics.point(*point).is_none())
-            || self.completeness.reasons().iter().any(|reason| {
-                reason.blocks(FlowStateAxis::DominanceRelation)
-                    && !matches!(reason, FlowStateIncompleteReason::LoweringGap { .. })
-            })
         {
             return None;
         }
@@ -2067,20 +2098,7 @@ impl FlowStateDerivation {
         candidates: &[CallSiteHandle],
         targets: &[ProgramPointId],
     ) -> Option<Box<[bool]>> {
-        let procedure_artifact = Arc::downgrade(procedure.artifact());
-        if self.procedure != procedure.id()
-            || !Weak::ptr_eq(&self.procedure_artifact, &procedure_artifact)
-        {
-            return None;
-        }
-        let semantics = procedure.semantics();
-        let dominance = self.dominance.as_ref()?;
-        if self.completeness.reasons().iter().any(|reason| {
-            reason.blocks(FlowStateAxis::DominanceRelation)
-                && !matches!(reason, FlowStateIncompleteReason::LoweringGap { .. })
-        }) {
-            return None;
-        }
+        let (semantics, dominance) = self.dominance_context(procedure)?;
 
         let mut candidate_points = Vec::with_capacity(candidates.len());
         for candidate in candidates {
@@ -2668,7 +2686,8 @@ impl FlowStateDerivation {
                     // literal occurrences name one index. It does not project
                     // indexed properties into flow state, so the raw gap
                     // remains blocking here.
-                    SemanticGapDischarge::CanonicalIndexIdentity => true,
+                    SemanticGapDischarge::CanonicalIndexIdentity
+                    | SemanticGapDischarge::ExactFieldLayout => true,
                     SemanticGapDischarge::ModeledEffectPartition => true,
                     // Runtime-read discharge belongs to the activation-aware
                     // refinement, not this raw flow-state completeness proof.
@@ -2676,7 +2695,13 @@ impl FlowStateDerivation {
                     // A nested rebinding can change the binding at a call or
                     // suspension; an observation proof enumerates neither.
                     SemanticGapDischarge::RebindAtCallOrSuspension => true,
-                    SemanticGapDischarge::None | SemanticGapDischarge::CallResolution => true,
+                    // The inert-drop proof needs analyzer access, which this
+                    // raw flow-state proof does not have.
+                    SemanticGapDischarge::InertDropGlue
+                    | SemanticGapDischarge::NonRejoiningExceptionalExitAfterInertDrops => true,
+                    SemanticGapDischarge::None
+                    | SemanticGapDischarge::ResidualConversion
+                    | SemanticGapDischarge::CallResolution => true,
                 }
         })
     }
@@ -3257,7 +3282,7 @@ pub(crate) fn address_alias_values(
     // ordinary value propagation before `&` copies a value, not its binding
     // identity. From the exact Address seed, assignments and value-flow events
     // do preserve the escaping reference identity.
-    let mut aliases = semantics
+    let seeds = semantics
         .points()
         .iter()
         .flat_map(|point| &point.events)
@@ -3273,25 +3298,7 @@ pub(crate) fn address_alias_values(
             _ => None,
         })
         .collect::<HashSet<_>>();
-    loop {
-        let mut changed = false;
-        for point in semantics.points() {
-            for event in &point.events {
-                let (source, target) = match event.effect {
-                    SemanticEffect::Assignment { target, value } => (value, target),
-                    SemanticEffect::ValueFlow { source, target, .. } => (source, target),
-                    _ => continue,
-                };
-                if aliases.contains(&source) && aliases.insert(target) {
-                    changed = true;
-                }
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    aliases
+    crate::value_flow::identity_alias_closure(semantics, &seeds)
 }
 
 /// Values that retain `source` identity through plain semantic assignments.
@@ -3753,40 +3760,21 @@ fn guard_edges_confine_targets_for_negative_evidence<G>(
 where
     G: DenseBidirectionalGraph<Node = ProgramPointId, Edge = ControlEdgeId>,
 {
-    let reachable_without_candidate = candidates
-        .iter()
-        .map(|candidate| {
-            reachable_points_without_edge(graph, semantics.entry_point(), candidate.id)
-        })
-        .collect::<Vec<_>>();
-    let non_rejoining_gaps_outside_target_history =
+    let target_local_completions =
         non_rejoining_gaps_that_cannot_reach_targets(graph, targets, control_gaps);
-
-    targets
-        .iter()
-        .map(|target| {
-            candidates.iter().enumerate().any(|(index, candidate)| {
-                if !dominance.dominates(graph, candidate.target, *target)
-                    || reachable_without_candidate[index].contains(target)
-                {
-                    return false;
-                }
-                control_gaps.iter().all(|gap| {
-                    if gap.subject == SemanticGapSubject::Procedure {
-                        return false;
-                    }
-                    let candidate_precedes_gap =
-                        dominance.dominates(graph, candidate.target, gap.point)
-                            && !reachable_without_candidate[index].contains(&gap.point);
-                    let non_rejoining_gap_cannot_reach_target = gap.discharge
-                        == SemanticGapDischarge::NonRejoiningExceptionalExit
-                        && non_rejoining_gaps_outside_target_history.contains(&(*target, gap.id));
-                    candidate_precedes_gap || non_rejoining_gap_cannot_reach_target
-                })
-            })
-        })
-        .collect::<Vec<_>>()
-        .into_boxed_slice()
+    guard_edges_dominate_targets_with_local_completions(
+        semantics,
+        graph,
+        dominance,
+        candidates,
+        targets,
+        control_gaps,
+        &target_local_completions,
+    )
+    .iter()
+    .map(|answer| *answer == GuardDominanceAnswer::Proven)
+    .collect::<Vec<_>>()
+    .into_boxed_slice()
 }
 
 fn strictly_later_non_rejoining_gap_pairs<G>(
@@ -4022,34 +4010,20 @@ fn reachable_points_from<G>(graph: &G, origin: ProgramPointId) -> HashSet<Progra
 where
     G: DenseBidirectionalGraph<Node = ProgramPointId, Edge = ControlEdgeId>,
 {
-    let mut reachable = std::iter::once(origin).collect::<HashSet<_>>();
-    let mut stack = vec![origin];
-    while let Some(point) = stack.pop() {
-        for (_, target) in graph.successors(point) {
-            if reachable.insert(target) {
-                debug_assert!(reachable.len() <= graph.node_count());
-                stack.push(target);
-            }
-        }
-    }
-    reachable
+    reachable_points_by(graph, origin, |point| {
+        graph.successors(point).map(|(_, target)| target)
+    })
 }
 
 fn points_reaching<G>(graph: &G, target: ProgramPointId) -> HashSet<ProgramPointId>
 where
     G: DenseBidirectionalGraph<Node = ProgramPointId, Edge = ControlEdgeId>,
 {
-    let mut reaching = std::iter::once(target).collect::<HashSet<_>>();
-    let mut stack = vec![target];
-    while let Some(point) = stack.pop() {
-        for (_, predecessor) in graph.predecessors(point) {
-            if reaching.insert(predecessor) {
-                debug_assert!(reaching.len() <= graph.node_count());
-                stack.push(predecessor);
-            }
-        }
-    }
-    reaching
+    reachable_points_by(graph, target, |point| {
+        graph
+            .predecessors(point)
+            .map(|(_, predecessor)| predecessor)
+    })
 }
 
 fn reachable_points_without_edge<G>(
@@ -4060,11 +4034,28 @@ fn reachable_points_without_edge<G>(
 where
     G: DenseBidirectionalGraph<Node = ProgramPointId, Edge = ControlEdgeId>,
 {
-    let mut reachable = std::iter::once(entry).collect::<HashSet<_>>();
-    let mut stack = vec![entry];
+    reachable_points_by(graph, entry, |point| {
+        graph
+            .successors(point)
+            .filter_map(|(edge_id, target)| (edge_id != excluded).then_some(target))
+    })
+}
+
+fn reachable_points_by<G, Neighbors, Points>(
+    graph: &G,
+    origin: ProgramPointId,
+    mut neighbors: Neighbors,
+) -> HashSet<ProgramPointId>
+where
+    G: DenseBidirectionalGraph<Node = ProgramPointId, Edge = ControlEdgeId>,
+    Neighbors: FnMut(ProgramPointId) -> Points,
+    Points: IntoIterator<Item = ProgramPointId>,
+{
+    let mut reachable = std::iter::once(origin).collect::<HashSet<_>>();
+    let mut stack = vec![origin];
     while let Some(point) = stack.pop() {
-        for (edge_id, target) in graph.successors(point) {
-            if edge_id != excluded && reachable.insert(target) {
+        for target in neighbors(point) {
+            if reachable.insert(target) {
                 debug_assert!(reachable.len() <= graph.node_count());
                 stack.push(target);
             }
@@ -4395,22 +4386,6 @@ enum WorkspaceNonreturnDiscovery {
     Cancelled,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct WorkspaceNonreturnDiscoveryKey {
-    procedure: ProcedureHandle,
-    root_artifact: bool,
-    provider: crate::analyzer::semantic::IcfgProviderBehaviorIdentity,
-}
-
-/// Complete procedure discoveries retained by one race-query cache. A hit
-/// saves the exact CFG and call-dispatch discovery for this procedure role and
-/// provider snapshot; a fresh fixed-point evaluation still runs per request.
-#[derive(Default)]
-pub(crate) struct WorkspaceNonreturnDiscoveryCache {
-    entries:
-        std::cell::RefCell<HashMap<WorkspaceNonreturnDiscoveryKey, WorkspaceNonreturnProcedure>>,
-}
-
 enum WorkspaceNonreturnInterruption {
     Incomplete(Box<str>),
     Cancelled,
@@ -4481,8 +4456,7 @@ fn incomplete_lookup_may_hide_nonreturn(
             | ModeledCallTargetCoverage::Truncated
             | ModeledCallTargetCoverage::Unsupported
             | ModeledCallTargetCoverage::Cancelled
-    ) || !lookup.adjudicable_workspace_names.is_empty()
-    {
+    ) {
         return false;
     }
     if lookup.arms.is_empty() {
@@ -4527,12 +4501,7 @@ fn modeled_normal_control_edge(
             ));
         }
     };
-    let edges = procedure
-        .successor_edges(call.point)
-        .filter_map(|(edge_id, edge)| {
-            (edge.kind == ControlEdgeKind::Normal && edge.target_point == target).then_some(edge_id)
-        })
-        .collect::<Vec<_>>();
+    let edges = normal_control_edges_to_target(procedure, call.point, target);
     if edges.len() != 1 {
         return Err(format!(
             "call {:?} normal continuation maps to {} exact normal edges: {edges:?}",
@@ -4541,6 +4510,19 @@ fn modeled_normal_control_edge(
         ));
     }
     Ok(Some(edges[0]))
+}
+
+fn normal_control_edges_to_target(
+    procedure: &ProcedureSemantics,
+    point: ProgramPointId,
+    target: ProgramPointId,
+) -> Vec<ControlEdgeId> {
+    procedure
+        .successor_edges(point)
+        .filter_map(|(edge_id, edge)| {
+            (edge.kind == ControlEdgeKind::Normal && edge.target_point == target).then_some(edge_id)
+        })
+        .collect()
 }
 
 fn derive_modeled_control_projection(
@@ -4622,7 +4604,6 @@ fn derive_modeled_control_projection(
             continue;
         }
         if lookup.arms.is_empty()
-            || !lookup.adjudicable_workspace_names.is_empty()
             || !lookup.arms.iter().all(|arm| {
                 arm.origin == ModeledCallTargetOrigin::UnmaterializedExternal
                     && modeled_key_proves_absent(models, &arm.key)
@@ -4904,70 +4885,6 @@ fn discover_workspace_nonreturn_procedure(
     }
 }
 
-fn discover_workspace_nonreturn_procedure_with_cache(
-    provider: &WorkspaceIcfgProvider<'_>,
-    root_artifact: &Arc<SemanticArtifact>,
-    handle: ProcedureHandle,
-    semantic_budget: &mut SemanticBudget,
-    cfg_budget: &mut CfgAlgorithmBudget,
-    cancellation: &CancellationToken,
-    cache: &WorkspaceNonreturnDiscoveryCache,
-) -> WorkspaceNonreturnDiscovery {
-    if cancellation.is_cancelled() {
-        return WorkspaceNonreturnDiscovery::Cancelled;
-    }
-    let key = WorkspaceNonreturnDiscoveryKey {
-        root_artifact: Arc::ptr_eq(handle.artifact(), root_artifact),
-        provider: provider.behavior_identity(),
-        procedure: handle.clone(),
-    };
-    let cached = cache.entries.borrow().get(&key).cloned();
-    if let Some(procedure) = cached {
-        match semantic_budget.charge(SemanticWork {
-            nested_entries: 1,
-            ..SemanticWork::default()
-        }) {
-            Ok(()) if !cancellation.is_cancelled() => {
-                let callees = procedure
-                    .nonreturn_candidates
-                    .iter()
-                    .flat_map(|call| call.transfers.transfers.iter())
-                    .map(|transfer| transfer.callee.clone())
-                    .collect();
-                return WorkspaceNonreturnDiscovery::Complete { procedure, callees };
-            }
-            Ok(()) => return WorkspaceNonreturnDiscovery::Cancelled,
-            Err(exceeded) => {
-                return WorkspaceNonreturnDiscovery::Complete {
-                    procedure: WorkspaceNonreturnProcedure::incomplete(
-                        handle,
-                        format!(
-                            "workspace non-return discovery cache lookup exhausted its semantic budget: {exceeded}"
-                        ),
-                    ),
-                    callees: Vec::new(),
-                };
-            }
-        }
-    }
-
-    let discovery = discover_workspace_nonreturn_procedure(
-        provider,
-        root_artifact,
-        handle,
-        semantic_budget,
-        cfg_budget,
-        cancellation,
-    );
-    if let WorkspaceNonreturnDiscovery::Complete { procedure, .. } = &discovery
-        && procedure.incomplete_detail.is_none()
-        && !cancellation.is_cancelled()
-    {
-        cache.entries.borrow_mut().insert(key, procedure.clone());
-    }
-    discovery
-}
-
 fn normal_return_gap_is_discharged(
     semantics: &ProcedureSemantics,
     gap: &SemanticGap,
@@ -5141,24 +5058,26 @@ fn derive_workspace_nonreturn_projection(
     file: &ProjectFile,
     artifact: &Arc<SemanticArtifact>,
     requested_procedure: Option<ProcedureId>,
-    snapshot: &Arc<ActiveSemanticModelSnapshot>,
+    snapshot: Option<&Arc<ActiveSemanticModelSnapshot>>,
     semantic_budget: &mut SemanticBudget,
     cfg_budget: &mut CfgAlgorithmBudget,
     cancellation: &CancellationToken,
 ) -> ModeledControlProjectionDerivation {
-    if crate::analyzer::common::language_for_file(file) != Language::Go
-        || !snapshot
-            .active_models()
-            .has_normal_continuation_absence_candidates(Language::Go.config_label())
-        || cancellation.is_cancelled()
-    {
+    let language = crate::analyzer::common::language_for_file(file);
+    let go_models_can_diverge = language == Language::Go
+        && snapshot.is_some_and(|snapshot| {
+            snapshot
+                .active_models()
+                .has_normal_continuation_absence_candidates(Language::Go.config_label())
+        });
+    let python_source_can_diverge = language == Language::Python
+        && python_has_local_nonreturn_candidate(artifact, requested_procedure);
+    if !(go_models_can_diverge || python_source_can_diverge) || cancellation.is_cancelled() {
         return ModeledControlProjectionDerivation::default();
     }
 
-    let provider = WorkspaceIcfgProvider::with_active_semantic_model_snapshot(
-        workspace,
-        Some(Arc::clone(snapshot)),
-    );
+    let provider =
+        WorkspaceIcfgProvider::with_active_semantic_model_snapshot(workspace, snapshot.cloned());
     let roots = artifact
         .procedures()
         .iter()
@@ -5176,8 +5095,52 @@ fn derive_workspace_nonreturn_projection(
         semantic_budget,
         cfg_budget,
         cancellation,
-        None,
     )
+}
+
+fn python_has_local_nonreturn_candidate(
+    artifact: &SemanticArtifact,
+    requested_procedure: Option<ProcedureId>,
+) -> bool {
+    let roots = requested_procedure
+        .map(|procedure| vec![procedure])
+        .unwrap_or_else(|| {
+            artifact
+                .procedures()
+                .iter()
+                .map(|procedure| procedure.id())
+                .collect()
+        });
+    let mut scheduled = roots.iter().copied().collect::<HashSet<_>>();
+    let mut pending = VecDeque::from(roots);
+    // This is only a cheap gate for the CFG proof below. A local call graph
+    // candidate avoids constructing an interprocedural provider for every
+    // Python procedure; the provider still proves actual control reachability.
+    while let Some(procedure_id) = pending.pop_front() {
+        let procedure = artifact
+            .procedure(procedure_id)
+            .expect("a local Python call target names a materialized procedure");
+        if procedure.points().iter().any(|point| {
+            point
+                .events
+                .iter()
+                .any(|event| matches!(&event.effect, SemanticEffect::Throw { .. }))
+        }) {
+            return true;
+        }
+        for call in procedure.call_sites() {
+            if call.normal_continuation == ControlContinuation::Absent {
+                return true;
+            }
+            if let CallableTargetResolution::Proven(CallableTarget::Local(callee)) =
+                &call.declared_targets
+                && scheduled.insert(*callee)
+            {
+                pending.push_back(*callee);
+            }
+        }
+    }
+    false
 }
 
 /// Exact, request-local absent normal continuations for one immutable procedure.
@@ -5192,18 +5155,6 @@ pub struct ProcedureContinuationProjection {
 }
 
 impl ProcedureContinuationProjection {
-    /// Test providers that stipulate returning calls still use the production
-    /// graph representation. This is not a source-analysis fallback.
-    #[cfg(test)]
-    pub(crate) fn returning_call_fixture(procedure: &ProcedureHandle) -> Self {
-        Self {
-            procedure: procedure.clone(),
-            mask: ControlEdgeMask::default(),
-            normal_return_absent: false,
-            reasons: Vec::new(),
-        }
-    }
-
     pub fn procedure(&self) -> &ProcedureHandle {
         &self.procedure
     }
@@ -5387,50 +5338,8 @@ pub fn procedure_continuation_projection(
         semantic_budget,
         cfg_budget,
         cancellation,
-        None,
     );
     continuation_projection_from_derivation(procedure, derived, cancellation)
-}
-
-/// Derive or reuse a complete continuation projection in the caller's
-/// one-query cache. The procedure handle names the exact materialization and
-/// the provider identity includes workspace content and the active model set.
-pub fn procedure_continuation_projection_with_cache(
-    provider: &WorkspaceIcfgProvider<'_>,
-    procedure: &ProcedureHandle,
-    semantic_budget: &mut SemanticBudget,
-    cfg_budget: &mut CfgAlgorithmBudget,
-    cancellation: &CancellationToken,
-    cache: &crate::concurrency::ConcurrencyQueryCache,
-) -> ProcedureContinuationProjection {
-    let provider_identity = provider.behavior_identity();
-    if !cancellation.is_cancelled()
-        && let Some(projection) = cache.continuation_projection(procedure, provider_identity)
-        && semantic_budget
-            .charge(SemanticWork {
-                nested_entries: 1,
-                ..SemanticWork::default()
-            })
-            .is_ok()
-        && !cancellation.is_cancelled()
-    {
-        return projection;
-    }
-
-    let derived = derive_nonreturn_projection(
-        provider,
-        procedure.artifact(),
-        vec![procedure.clone()],
-        semantic_budget,
-        cfg_budget,
-        cancellation,
-        Some(cache),
-    );
-    let projection = continuation_projection_from_derivation(procedure, derived, cancellation);
-    if projection.reasons().is_empty() && !cancellation.is_cancelled() {
-        cache.retain_continuation_projection(procedure, provider_identity, projection.clone());
-    }
-    projection
 }
 
 fn continuation_projection_from_derivation(
@@ -5470,7 +5379,6 @@ fn derive_nonreturn_projection(
     semantic_budget: &mut SemanticBudget,
     cfg_budget: &mut CfgAlgorithmBudget,
     cancellation: &CancellationToken,
-    cache: Option<&crate::concurrency::ConcurrencyQueryCache>,
 ) -> ModeledControlProjectionDerivation {
     let mut scheduled = roots.iter().cloned().collect::<HashSet<_>>();
     let mut pending = roots.into_iter().collect::<VecDeque<_>>();
@@ -5479,26 +5387,14 @@ fn derive_nonreturn_projection(
         if cancellation.is_cancelled() {
             return ModeledControlProjectionDerivation::default();
         }
-        let discovery = if let Some(cache) = cache {
-            discover_workspace_nonreturn_procedure_with_cache(
-                provider,
-                artifact,
-                handle,
-                semantic_budget,
-                cfg_budget,
-                cancellation,
-                &cache.nonreturn_discoveries,
-            )
-        } else {
-            discover_workspace_nonreturn_procedure(
-                provider,
-                artifact,
-                handle,
-                semantic_budget,
-                cfg_budget,
-                cancellation,
-            )
-        };
+        let discovery = discover_workspace_nonreturn_procedure(
+            provider,
+            artifact,
+            handle,
+            semantic_budget,
+            cfg_budget,
+            cancellation,
+        );
         let (procedure, callees) = match discovery {
             WorkspaceNonreturnDiscovery::Complete { procedure, callees } => (procedure, callees),
             WorkspaceNonreturnDiscovery::Cancelled => {
@@ -5727,6 +5623,20 @@ pub fn flow_state_for_file(
     )
 }
 
+/// Derive one file's flow state with a captured model snapshot and default
+/// request controls.
+pub fn flow_state_for_file_with_snapshot(
+    workspace: &WorkspaceAnalyzer,
+    file: &ProjectFile,
+    cancellation: Option<&CancellationToken>,
+    active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
+) -> FileFlowState {
+    let token = cancellation.cloned().unwrap_or_default();
+    let mut request = FlowStateRequest::new(&token)
+        .with_active_semantic_model_snapshot(active_semantic_model_snapshot);
+    flow_state_for_file(workspace, file, &mut request)
+}
+
 /// Derive state events and flow relations from one artifact outcome the caller
 /// already materialized.
 ///
@@ -5768,6 +5678,192 @@ pub fn flow_state_for_materialized_procedure(
     }
 
     flow_state_for_materialized_selection(workspace, file, outcome, Some(procedure.id()), request)
+}
+
+/// Prove only the reaching relations of the property read at one exact point.
+/// This is a new scope, not a filter over aggregate completeness. The source
+/// derivation and its diagnostics are never modified. Unknown stored values
+/// remain their original handles; this proves storage, not scalar contents.
+pub fn flow_state_for_selected_property(
+    workspace: &WorkspaceAnalyzer,
+    file: &ProjectFile,
+    state: &FileFlowState,
+    procedure: &ProcedureHandle,
+    point: ProgramPointId,
+    request: &mut FlowStateRequest<'_>,
+) -> FileFlowState {
+    let Some(original) = state
+        .procedures
+        .iter()
+        .find(|row| row.procedure == procedure.id())
+    else {
+        return FileFlowState::incomplete(
+            vec![FlowStateIncompleteReason::PropertyAnalysisPartial {
+                detail: "selected procedure has no flow-state derivation".into(),
+            }],
+            state.generation,
+            state.active_model_set_hash.clone(),
+        );
+    };
+    assert!(
+        Weak::ptr_eq(
+            &original.procedure_artifact,
+            &Arc::downgrade(procedure.artifact())
+        ),
+        "selected property requires the exact materialized artifact"
+    );
+    debug_assert!(original.events.iter().all(|event| &event.site.file == file));
+    let analyzer = workspace.analyzer();
+    let _scope = request
+        .active_semantic_model_snapshot
+        .as_ref()
+        .map(|snapshot| {
+            AnalyzerQueryScope::with_active_semantic_model_snapshot(analyzer, snapshot.clone())
+        });
+    let mut reasons = state.completeness.reasons().to_vec();
+    let selected_model_hash = request
+        .active_semantic_model_snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.as_ref())
+        .map(|snapshot| snapshot.active_models().active_model_set_hash());
+    if state.active_model_set_hash() != selected_model_hash {
+        reasons.push(FlowStateIncompleteReason::PropertyProviderFailed {
+            detail: "selected property activation differs from the event projection".into(),
+        });
+    }
+    if analyzer.project().analysis_generation() != state.generation {
+        reasons.push(FlowStateIncompleteReason::SourceGenerationChanged);
+    }
+    // These are acquisition/control failures, independent of a property
+    // subject. Aggregate memory/lowering reasons are checked by the selected
+    // provider against their original semantic identities below.
+    reasons.extend(
+        original
+            .completeness
+            .reasons()
+            .iter()
+            .filter(|reason| {
+                reason.blocks(FlowStateAxis::PropertyReachingRelation)
+                    && !matches!(
+                        reason,
+                        FlowStateIncompleteReason::LoweringGap { .. }
+                            | FlowStateIncompleteReason::PropertyBaseNotCanonical { .. }
+                            | FlowStateIncompleteReason::PropertyReaching { .. }
+                            | FlowStateIncompleteReason::PropertyProviderUnavailable
+                            | FlowStateIncompleteReason::PropertyProviderFailed { .. }
+                            | FlowStateIncompleteReason::PropertyAnalysisPartial { .. }
+                    )
+            })
+            .cloned(),
+    );
+    let mut derived = original.clone();
+    derived.relations.clear();
+    let outcome = workspace.semantic_oracle_provider().procedure_relations(
+        procedure,
+        &OracleCallContext::empty(),
+        &mut SemanticRequest::new(&mut SemanticBudget::default(), request.cancellation),
+    );
+    match outcome {
+        Err(error) => reasons.push(FlowStateIncompleteReason::PropertyProviderFailed {
+            detail: error.to_string(),
+        }),
+        Ok(outcome) => {
+            if !matches!(outcome, SemanticOutcome::Complete { .. }) {
+                reasons.push(FlowStateIncompleteReason::PropertyAnalysisPartial {
+                    detail: format!(
+                        "selected property acquisition is `{}`",
+                        outcome_label(&outcome)
+                    ),
+                });
+            }
+            if let Some(snapshot) = outcome.available_value() {
+                let graph =
+                    ProjectedProcedureGraph::new(procedure.semantics(), &derived.control_edge_mask);
+                let selected =
+                    crate::analyzer::semantic::derive_selected_property_reaching_over_graph(
+                        snapshot,
+                        &graph,
+                        procedure.semantics().entry_point(),
+                        point,
+                        PropertyReachingLimits {
+                            cfg_work: request.cfg_budget.limits(),
+                            ..PropertyReachingLimits::default()
+                        },
+                        request.cancellation,
+                    );
+                reasons.extend(selected.incomplete_reasons().iter().cloned().map(|reason| {
+                    FlowStateIncompleteReason::PropertyReaching {
+                        reason: Box::new(reason),
+                    }
+                }));
+                // Check every selected modeled endpoint, even a dead store
+                // that contributes no reaching row. Missing joins remain
+                // explicit rather than silently shrinking the proof domain.
+                for (class, point, event_index, source) in selected
+                    .stores()
+                    .iter()
+                    .map(|row| {
+                        (
+                            StateEventClass::Establish,
+                            row.point.id(),
+                            row.event_index,
+                            row.source,
+                        )
+                    })
+                    .chain(selected.reads().iter().map(|row| {
+                        (
+                            StateEventClass::Read,
+                            row.point.id(),
+                            row.event_index,
+                            row.source,
+                        )
+                    }))
+                {
+                    if property_event_id(
+                        &derived.events,
+                        &derived.event_keys,
+                        class,
+                        point,
+                        event_index,
+                        source,
+                    )
+                    .is_none()
+                    {
+                        reasons.push(
+                            FlowStateIncompleteReason::SelectedPropertyEndpointUnavailable {
+                                point,
+                                event_index,
+                                source,
+                            },
+                        );
+                    }
+                }
+                derived.relations = property_reaching_relations(
+                    &derived.events,
+                    &derived.event_keys,
+                    &selected,
+                    state.generation,
+                );
+            } else {
+                reasons.push(FlowStateIncompleteReason::PropertyAnalysisPartial {
+                    detail: format!(
+                        "selected property snapshot outcome is `{}`",
+                        outcome_label(&outcome)
+                    ),
+                });
+            }
+        }
+    }
+    if analyzer.project().analysis_generation() != state.generation {
+        reasons.push(FlowStateIncompleteReason::SourceGenerationChanged);
+    }
+    derived.completeness = FlowStateCompleteness::from_reasons(reasons.clone());
+    FileFlowState {
+        procedures: vec![derived],
+        completeness: FlowStateCompleteness::from_reasons(reasons),
+        generation: state.generation,
+        active_model_set_hash: state.active_model_set_hash.clone(),
+    }
 }
 
 fn flow_state_for_materialized_selection(
@@ -5876,6 +5972,26 @@ fn flow_state_for_materialized_outcome(
         let _scope = profiling::scope("flow.site_index");
         SiteIndex::build(&facts)
     };
+    let selected_procedures_have_suspend = artifact.procedures().iter().any(|procedure| {
+        requested_procedure.is_none_or(|requested| procedure.id() == requested)
+            && procedure.points().iter().any(|point| {
+                point
+                    .events
+                    .iter()
+                    .any(|event| matches!(event.effect, SemanticEffect::AsyncSuspend { .. }))
+            })
+    });
+    let scope_frame_projection = if crate::analyzer::common::language_for_file(file)
+        == Language::Rust
+        && selected_procedures_have_suspend
+    {
+        match rust_scope_frame_facts(analyzer, file, &facts) {
+            Ok(facts) => ScopeFrameProjection::Ready(facts),
+            Err(detail) => ScopeFrameProjection::Unavailable(detail),
+        }
+    } else {
+        ScopeFrameProjection::NotApplicable
+    };
 
     let mut modeled_projection =
         active_models.map_or_else(ModeledControlProjectionDerivation::default, |models| {
@@ -5890,7 +6006,17 @@ fn flow_state_for_materialized_outcome(
                 request.cancellation,
             )
         });
-    if let Some(snapshot) = active_snapshot.as_ref() {
+    let language = crate::analyzer::common::language_for_file(file);
+    let python_has_modeled_or_source_nonreturn = language == Language::Python
+        && python_has_local_nonreturn_candidate(&artifact, requested_procedure);
+    let go_has_nonreturn_models = active_snapshot.as_ref().is_some_and(|snapshot| {
+        snapshot
+            .active_models()
+            .has_normal_continuation_absence_candidates(Language::Go.config_label())
+    });
+    if python_has_modeled_or_source_nonreturn
+        || (language == Language::Go && go_has_nonreturn_models)
+    {
         // The optional control proof obeys the request's CFG limits but owns a
         // separate ledger. Exhausting wrapper discovery must retain raw edges;
         // it must not consume the budget for the ordinary flow relations that
@@ -5902,7 +6028,7 @@ fn flow_state_for_materialized_outcome(
             file,
             &artifact,
             requested_procedure,
-            snapshot,
+            active_snapshot.as_ref(),
             budget,
             &mut nonreturn_cfg_budget,
             request.cancellation,
@@ -5959,6 +6085,7 @@ fn flow_state_for_materialized_outcome(
                 file,
                 &facts,
                 &site_index,
+                &scope_frame_projection,
                 generation,
                 &procedure_reasons,
                 control_edge_masks
@@ -5976,6 +6103,172 @@ fn flow_state_for_materialized_outcome(
         completeness: FlowStateCompleteness::from_reasons(file_reasons),
         generation,
         active_model_set_hash,
+    }
+}
+
+type SourceByteSpan = (usize, usize);
+
+struct ScopeFrameBinding {
+    activation: SourceByteSpan,
+    scope: SourceByteSpan,
+    move_uses: Vec<SourceByteSpan>,
+}
+
+struct RustScopeFrameFacts {
+    bindings: HashMap<SourceByteSpan, ScopeFrameBinding>,
+}
+
+enum ScopeFrameProjection {
+    NotApplicable,
+    Ready(RustScopeFrameFacts),
+    Unavailable(String),
+}
+
+/// Build one request-local Rust liveness projection from the existing lexical
+/// environment plus AST-resolved by-value uses. The move classification is
+/// intentionally syntactic: a `Copy` local may look moved, and consumers of
+/// scope-only reads must also select bindings by initializer identity.
+fn rust_scope_frame_facts(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    facts: &brokk_bifrost_analysis::analyzer::structural::facts::FileFacts,
+) -> Result<RustScopeFrameFacts, String> {
+    let environment = environment_for_file(analyzer, file);
+    for axis in [EnvironmentAxis::Scopes, EnvironmentAxis::BindingIntervals] {
+        if !environment.completeness.covers(axis) {
+            return Err(format!(
+                "Rust lexical environment does not cover {axis:?}: {:?}",
+                environment.completeness
+            ));
+        }
+    }
+    let environment_identity = environment
+        .scopes
+        .first()
+        .map(|scope| scope.content_identity)
+        .or_else(|| {
+            environment
+                .bindings
+                .first()
+                .map(|binding| binding.content_identity)
+        });
+    if environment_identity != Some(facts.source_identity()) {
+        return Err("Rust lexical environment describes different source content".into());
+    }
+    let tree = parse_tree_for_language(file, Language::Rust, facts.source())
+        .ok_or_else(|| "Rust syntax tree is unavailable for move-use projection".to_string())?;
+
+    let mut move_uses = HashMap::<SourceByteSpan, HashSet<SourceByteSpan>>::default();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "identifier" && is_rust_by_value_binding_use(node) {
+            let span = (node.start_byte(), node.end_byte());
+            let name = facts
+                .source()
+                .get(span.0..span.1)
+                .expect("Rust identifier node ranges are within the parsed source");
+            let binding = match binding_of(&environment, name, span.0, Some(Namespace::Value)) {
+                BindingOfOutcome::Reached(binding) => Some(binding),
+                BindingOfOutcome::Shadowed { winner, .. } => Some(winner),
+                BindingOfOutcome::NoBinding => None,
+                BindingOfOutcome::Incomplete(axis) => {
+                    return Err(format!(
+                        "Rust binding-of is incomplete for a by-value use: {axis:?}"
+                    ));
+                }
+            };
+            if let Some(binding) = binding {
+                let declaration = &environment.bindings[binding].range;
+                move_uses
+                    .entry((declaration.start_byte, declaration.end_byte))
+                    .or_default()
+                    .insert(span);
+            }
+        }
+        for child_index in (0..node.child_count()).rev() {
+            if let Some(child) = node.child(child_index) {
+                stack.push(child);
+            }
+        }
+    }
+
+    let bindings = environment
+        .bindings
+        .iter()
+        .map(|binding| {
+            let scope = environment.scope(binding.declaring_scope);
+            let mut binding_moves = move_uses
+                .remove(&(binding.range.start_byte, binding.range.end_byte))
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<Vec<_>>();
+            binding_moves.sort_unstable();
+            (
+                (binding.range.start_byte, binding.range.end_byte),
+                ScopeFrameBinding {
+                    activation: (binding.activation.start_byte, binding.activation.end_byte),
+                    scope: (scope.range.start_byte, scope.range.end_byte),
+                    move_uses: binding_moves,
+                },
+            )
+        })
+        .collect();
+    Ok(RustScopeFrameFacts { bindings })
+}
+
+/// Whether this identifier is the whole value consumed by one of the Rust
+/// constructs whose by-value behavior matters to future-frame liveness.
+/// Parentheses are transparent; references and method receivers remain
+/// distinct AST shapes and therefore do not qualify.
+fn is_rust_by_value_binding_use(identifier: Node<'_>) -> bool {
+    let mut value = identifier;
+    loop {
+        let Some(parent) = value.parent() else {
+            return false;
+        };
+        if parent.kind() == "parenthesized_expression"
+            && parent.named_child_count() == 1
+            && parent
+                .named_child(0)
+                .is_some_and(|child| child.id() == value.id())
+        {
+            value = parent;
+            continue;
+        }
+        return match parent.kind() {
+            "arguments" => parent.parent().is_some_and(|call| {
+                call.kind() == "call_expression"
+                    && call
+                        .child_by_field_name("arguments")
+                        .is_some_and(|arguments| arguments.id() == parent.id())
+            }),
+            "let_declaration" | "assignment_expression" => {
+                let field = if parent.kind() == "let_declaration" {
+                    "value"
+                } else {
+                    "right"
+                };
+                parent
+                    .child_by_field_name(field)
+                    .is_some_and(|right| right.id() == value.id())
+            }
+            "return_expression" | "base_field_initializer" => {
+                parent.named_child_count() == 1
+                    && parent
+                        .named_child(0)
+                        .is_some_and(|child| child.id() == value.id())
+            }
+            "field_initializer" => parent
+                .child_by_field_name("value")
+                .is_some_and(|field_value| field_value.id() == value.id()),
+            "shorthand_field_initializer" => {
+                parent.named_child_count() == 1
+                    && parent
+                        .named_child(0)
+                        .is_some_and(|field_value| field_value.id() == value.id())
+            }
+            _ => false,
+        };
     }
 }
 
@@ -6031,15 +6324,7 @@ fn validated_control_edge_masks(
 }
 
 fn outcome_label<T>(outcome: &SemanticOutcome<T>) -> &'static str {
-    match outcome {
-        SemanticOutcome::Complete { .. } => "complete",
-        SemanticOutcome::Ambiguous { .. } => "ambiguous",
-        SemanticOutcome::Unknown { .. } => "unknown",
-        SemanticOutcome::Unsupported { .. } => "unsupported",
-        SemanticOutcome::Unproven { .. } => "unproven",
-        SemanticOutcome::ExceededBudget { .. } => "exceeded_budget",
-        SemanticOutcome::Cancelled { .. } => "cancelled",
-    }
+    outcome.label()
 }
 
 fn structural_facts(
@@ -6085,17 +6370,6 @@ impl SiteIndex {
     }
 }
 
-/// A binding value is one the language binds by name; a temporary, constant,
-/// return slot, or exception value is not a state subject.
-fn is_binding_kind(kind: &SemanticValueKind) -> bool {
-    matches!(
-        kind,
-        SemanticValueKind::Local
-            | SemanticValueKind::Parameter { .. }
-            | SemanticValueKind::Receiver { .. }
-    )
-}
-
 /// One procedure's derivation.
 #[allow(clippy::too_many_arguments)]
 fn derive_procedure(
@@ -6105,6 +6379,7 @@ fn derive_procedure(
     file: &ProjectFile,
     facts: &brokk_bifrost_analysis::analyzer::structural::facts::FileFacts,
     site_index: &SiteIndex,
+    scope_frame_projection: &ScopeFrameProjection,
     generation: u64,
     file_reasons: &[FlowStateIncompleteReason],
     control_edge_mask: ControlEdgeMask,
@@ -6135,7 +6410,7 @@ fn derive_procedure(
             Ok(result) => {
                 for reason in result.incomplete_reasons() {
                     reasons.push(FlowStateIncompleteReason::PropertyReaching {
-                        reason: reason.clone(),
+                        reason: Box::new(reason.clone()),
                     });
                 }
                 Some(result)
@@ -6150,17 +6425,23 @@ fn derive_procedure(
     };
     let mut builder = EventBuilder {
         procedure: procedure.id(),
-        procedure_handle,
+        procedure_handle: procedure_handle.clone(),
         file,
         facts,
         site_index,
+        scope_frame_projection,
         generation,
         events: Vec::new(),
         event_keys: Vec::new(),
         uncanonical_accesses: 0,
         properties_available,
     };
-    builder.collect(procedure, property_result.as_ref());
+    reasons.extend(
+        builder
+            .collect(procedure, property_result.as_ref())
+            .into_iter()
+            .map(|detail| FlowStateIncompleteReason::BindingScopeLivenessUnavailable { detail }),
+    );
     let uncanonical_accesses = builder.uncanonical_accesses;
     let mut events = builder.events;
     let mut event_keys = builder.event_keys;
@@ -6187,7 +6468,7 @@ fn derive_procedure(
         });
     }
 
-    let (relations, dominance, binding_initialization) = derive_relations(
+    let (relations, dominance, mut binding_initialization) = derive_relations(
         procedure,
         &control_edge_mask,
         &events,
@@ -6197,6 +6478,64 @@ fn derive_procedure(
         request,
         &mut reasons,
     );
+    if crate::analyzer::common::language_for_file(file) == Language::Python
+        && let Some(facts) = binding_initialization.as_mut()
+    {
+        let invalidated_bindings = events
+            .iter()
+            .filter(|event| event.event_class == StateEventClass::Kill)
+            .filter_map(|event| match event.subject {
+                FlowSubject::Binding { value } => Some(value),
+                FlowSubject::Property { .. } => None,
+            })
+            .collect::<HashSet<_>>();
+        let potentially_uninitialized_reads = facts
+            .uninitialized_before_event
+            .iter()
+            .filter_map(|(&event, &uninitialized)| {
+                let row = events.get(event)?;
+                let FlowSubject::Binding { value } = row.subject else {
+                    return None;
+                };
+                (uninitialized
+                    && row.event_class == StateEventClass::Read
+                    && (procedure_handle
+                        .semantics()
+                        .value(value)
+                        .is_some_and(|value| value.kind == SemanticValueKind::Local)
+                        || invalidated_bindings.contains(&value)))
+                .then_some(event)
+            })
+            .collect::<HashSet<_>>();
+        match correlated_initialization_answers(
+            &procedure_handle,
+            &events,
+            &event_keys,
+            &control_edge_mask,
+            &potentially_uninitialized_reads,
+            semantic_budget,
+            request.cancellation,
+        ) {
+            Ok(answers) => {
+                for (event, answer) in answers {
+                    let previous = facts.correlated_before_event.insert(event, answer);
+                    assert!(
+                        previous.is_none(),
+                        "one source-backed read has one correlated initialization answer"
+                    );
+                }
+            }
+            Err(crate::type_flow::CorrelationError::Budget(error)) => {
+                reasons.push(FlowStateIncompleteReason::BudgetExhausted {
+                    axis: FlowStateAxis::ReachingRelation,
+                    detail: format!("path-sensitive binding initialization: {error}"),
+                });
+            }
+            Err(crate::type_flow::CorrelationError::Cancelled { .. }) => {
+                reasons.push(FlowStateIncompleteReason::Cancelled);
+            }
+        }
+    }
 
     FlowStateDerivation {
         procedure: procedure.id(),
@@ -6210,6 +6549,209 @@ fn derive_procedure(
         binding_initialization,
         event_keys,
     }
+}
+
+fn correlated_initialization_answers(
+    procedure: &ProcedureHandle,
+    events: &[StateEventRow],
+    event_keys: &[SemanticEventKey],
+    control_edge_mask: &ControlEdgeMask,
+    potentially_uninitialized_reads: &HashSet<usize>,
+    budget: &mut SemanticBudget,
+    cancellation: &CancellationToken,
+) -> Result<HashMap<usize, BindingInitializationAnswer>, crate::type_flow::CorrelationError> {
+    let semantics = procedure.semantics();
+    if potentially_uninitialized_reads.is_empty() {
+        return Ok(HashMap::default());
+    }
+    let invalidated_bindings = events
+        .iter()
+        .filter(|event| event.event_class == StateEventClass::Kill)
+        .filter_map(|event| match event.subject {
+            FlowSubject::Binding { value } => Some(value),
+            FlowSubject::Property { .. } => None,
+        })
+        .collect::<HashSet<_>>();
+    let candidate_bindings = events
+        .iter()
+        .filter(|event| {
+            potentially_uninitialized_reads.contains(&event.event)
+                && event.event_class == StateEventClass::Read
+        })
+        .filter_map(|event| match event.subject {
+            FlowSubject::Binding { value }
+                if semantics.value(value).is_some_and(|value| {
+                    value.kind == SemanticValueKind::Local
+                        || invalidated_bindings.contains(&value.id)
+                }) =>
+            {
+                Some(value)
+            }
+            FlowSubject::Binding { .. } | FlowSubject::Property { .. } => None,
+        })
+        .collect::<HashSet<_>>();
+    if candidate_bindings.is_empty() {
+        return Ok(HashMap::default());
+    }
+    let uninitialized_entry_bindings = candidate_bindings
+        .iter()
+        .copied()
+        .filter(|&binding| {
+            semantics
+                .value(binding)
+                .is_some_and(|value| value.kind == SemanticValueKind::Local)
+        })
+        .collect::<HashSet<_>>();
+    let mut data_bindings = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.event_class,
+                StateEventClass::Read | StateEventClass::Establish | StateEventClass::Kill
+            )
+        })
+        .filter_map(|event| match event.subject {
+            FlowSubject::Binding { value }
+                if candidate_bindings.contains(&value)
+                    && semantics.value(value).is_some_and(|value| {
+                        value.kind == SemanticValueKind::Local
+                            || invalidated_bindings.contains(&value.id)
+                    }) =>
+            {
+                Some(value)
+            }
+            FlowSubject::Property { .. } => None,
+            FlowSubject::Binding { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    data_bindings.sort_unstable();
+    data_bindings.dedup();
+    if data_bindings.is_empty() {
+        return Ok(HashMap::default());
+    }
+
+    let read_events = events
+        .iter()
+        .zip(event_keys)
+        .filter_map(|(event, key)| {
+            if event.event_class != StateEventClass::Read
+                || !potentially_uninitialized_reads.contains(&event.event)
+            {
+                return None;
+            }
+            let FlowSubject::Binding { value } = event.subject else {
+                return None;
+            };
+            if data_bindings.binary_search(&value).is_err() {
+                return None;
+            }
+            let event_index = key.event_index as usize;
+            semantics
+                .point(key.point)
+                .is_some_and(|point| event_index < point.events.len())
+                .then_some((event.event, key.point, event_index, value))
+        })
+        .collect::<Vec<_>>();
+    if read_events.is_empty() {
+        return Ok(HashMap::default());
+    }
+    let correlation_events = semantics
+        .points()
+        .iter()
+        .map(|point| (0..point.events.len()).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let bool_bindings = crate::type_flow::guard_condition_bindings(procedure);
+    let binding_origins = BindingOriginIndex::new(procedure);
+    let mut open_bindings: crate::hash::HashSet<_> = binding_origins
+        .address_taken_bindings()
+        .into_iter()
+        .collect();
+    for location in semantics.memory_locations() {
+        if let MemoryLocationKind::LexicalCell { binding }
+        | MemoryLocationKind::Capture {
+            binding: Some(binding),
+            ..
+        } = &location.kind
+        {
+            open_bindings.insert(*binding);
+        }
+    }
+    for capture in semantics.captures() {
+        if capture.mode != crate::analyzer::semantic::CaptureMode::Value
+            && let crate::analyzer::semantic::CaptureSource::Value(binding) = &capture.captured
+        {
+            open_bindings.insert(*binding);
+        }
+    }
+    let mut omitted_edges = control_edge_mask
+        .omitted
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    omitted_edges.sort_unstable();
+    let mut uncertain_return_edges = Vec::new();
+    for gap in semantics.gaps() {
+        if gap.capability != SemanticCapability::DynamicDispatch {
+            continue;
+        }
+        let SemanticGapSubject::CallSite(call_id) = gap.subject else {
+            continue;
+        };
+        let Some(call) = semantics.call_site(call_id) else {
+            continue;
+        };
+        if call.invocation_mode != CallInvocationMode::Ordinary {
+            continue;
+        }
+        if gap.kind != SemanticGapKind::Ambiguous
+            && matches!(&call.declared_targets, CallableTargetResolution::Proven(_))
+        {
+            continue;
+        }
+        let Some(target) = call.normal_continuation.target() else {
+            continue;
+        };
+        let edges = normal_control_edges_to_target(semantics, call.point, target);
+        assert_eq!(
+            edges.len(),
+            1,
+            "a represented call continuation maps to one normal CFG edge"
+        );
+        uncertain_return_edges.push(edges[0]);
+    }
+    uncertain_return_edges.sort_unstable();
+    uncertain_return_edges.dedup();
+    let analysis = crate::type_flow::analyze_correlations_with_observations(
+        procedure,
+        &bool_bindings,
+        &data_bindings,
+        &open_bindings,
+        &uninitialized_entry_bindings,
+        &correlation_events,
+        &read_events,
+        &uncertain_return_edges,
+        &omitted_edges,
+        budget,
+        Some(cancellation),
+    )?;
+    let mut answers = HashMap::default();
+    for row in analysis.data_reaching_at_event {
+        let answer = if row.definitions.is_empty() {
+            BindingInitializationAnswer::Unreachable
+        } else if row.unknown {
+            BindingInitializationAnswer::Open {
+                reasons: vec![FlowStateIncompleteReason::BindingStateNotClosed {
+                    binding: row.binding,
+                }],
+            }
+        } else if row.may_be_uninitialized {
+            BindingInitializationAnswer::MayBeUninitialized
+        } else {
+            BindingInitializationAnswer::Proven
+        };
+        assert!(answers.insert(row.event, answer).is_none());
+    }
+    Ok(answers)
 }
 
 fn collect_capability_reasons(
@@ -6333,6 +6875,7 @@ struct EventBuilder<'a> {
     file: &'a ProjectFile,
     facts: &'a brokk_bifrost_analysis::analyzer::structural::facts::FileFacts,
     site_index: &'a SiteIndex,
+    scope_frame_projection: &'a ScopeFrameProjection,
     generation: u64,
     events: Vec<StateEventRow>,
     event_keys: Vec<SemanticEventKey>,
@@ -6348,7 +6891,7 @@ impl EventBuilder<'_> {
         &mut self,
         procedure: &ProcedureSemantics,
         property_result: Option<&PropertyReachingResult>,
-    ) {
+    ) -> Vec<String> {
         let bases = BindingBases::build(procedure);
         let binding_origins = BindingOriginIndex::from_semantics(procedure);
         let property_stores = property_result.map_or_else(HashMap::default, |result| {
@@ -6372,7 +6915,7 @@ impl EventBuilder<'_> {
                         let Some(target_value) = procedure.value(*target) else {
                             continue;
                         };
-                        if !is_binding_kind(&target_value.kind) {
+                        if !target_value.kind.is_binding() {
                             continue;
                         }
                         (
@@ -6385,7 +6928,7 @@ impl EventBuilder<'_> {
                         let Some(source_value) = procedure.value(*source) else {
                             continue;
                         };
-                        if !is_binding_kind(&source_value.kind) {
+                        if !source_value.kind.is_binding() {
                             continue;
                         }
                         (
@@ -6408,7 +6951,7 @@ impl EventBuilder<'_> {
                         };
                         if !procedure
                             .value(value)
-                            .is_some_and(|value| is_binding_kind(&value.kind))
+                            .is_some_and(|value| value.kind.is_binding())
                         {
                             continue;
                         }
@@ -6540,6 +7083,7 @@ impl EventBuilder<'_> {
                     event: self.events.len(),
                     procedure: self.procedure,
                     event_class: class,
+                    read_cause: None,
                     subject,
                     point: point.id,
                     point_id: self.point_id(point.id),
@@ -6554,6 +7098,214 @@ impl EventBuilder<'_> {
                 });
             }
         }
+        self.append_async_suspend_reads(procedure)
+    }
+
+    /// Add request-local future-frame reads for modeled post-resume uses and
+    /// Rust locals whose lexical scope and CFG paths keep them live through a
+    /// later ordinary scope-end drop.
+    fn append_async_suspend_reads(&mut self, procedure: &ProcedureSemantics) -> Vec<String> {
+        let suspensions = procedure
+            .points()
+            .iter()
+            .filter_map(|point| {
+                let (_, event) = point.events.iter().enumerate().find(|(_, event)| {
+                    matches!(event.effect, SemanticEffect::AsyncSuspend { .. })
+                })?;
+                Some((point.id, event.source))
+            })
+            .collect::<Vec<_>>();
+        if suspensions.is_empty() {
+            return Vec::new();
+        }
+        let mut incomplete = match self.scope_frame_projection {
+            ScopeFrameProjection::Unavailable(detail) => vec![detail.clone()],
+            ScopeFrameProjection::NotApplicable | ScopeFrameProjection::Ready(_) => Vec::new(),
+        };
+        let mut read_points = HashMap::<ValueId, HashSet<ProgramPointId>>::default();
+        let mut write_points = HashMap::<ValueId, HashSet<ProgramPointId>>::default();
+        let mut establishment_points = HashMap::<ValueId, HashSet<ProgramPointId>>::default();
+        for event in &self.events {
+            let FlowSubject::Binding { value } = event.subject else {
+                continue;
+            };
+            match event.event_class {
+                StateEventClass::Read => {
+                    read_points.entry(value).or_default().insert(event.point);
+                }
+                StateEventClass::Establish | StateEventClass::Kill => {
+                    write_points.entry(value).or_default().insert(event.point);
+                }
+            }
+            if event.event_class == StateEventClass::Establish {
+                establishment_points
+                    .entry(value)
+                    .or_default()
+                    .insert(event.point);
+            }
+        }
+        let bindings = procedure
+            .values()
+            .iter()
+            .filter(|value| value.kind == SemanticValueKind::Local)
+            .map(|value| value.id)
+            .collect::<Vec<_>>();
+        let mut move_point_cache =
+            HashMap::<SourceByteSpan, Option<HashSet<ProgramPointId>>>::default();
+        for (suspend, source) in suspensions {
+            let await_span = self
+                .site(procedure, source)
+                .map(|site| (site.range.start_byte, site.range.end_byte));
+            let point_event_count = procedure
+                .point(suspend)
+                .expect("suspension point belongs to its procedure")
+                .events
+                .len();
+            let mut synthetic_event_index = u32::try_from(point_event_count)
+                .expect("semantic point event count fits the event-key index");
+            for binding in &bindings {
+                let subject = FlowSubject::Binding { value: *binding };
+                let live_after_resume = binding_read_reachable_without_write(
+                    procedure,
+                    suspend,
+                    read_points.get(binding),
+                    write_points.get(binding),
+                );
+                if !live_after_resume {
+                    let Some((await_start, await_end)) = await_span else {
+                        incomplete.push(format!(
+                            "suspension point {} has no source range for scope liveness",
+                            suspend.index()
+                        ));
+                        continue;
+                    };
+                    let ScopeFrameProjection::Ready(scope_facts) = self.scope_frame_projection
+                    else {
+                        continue;
+                    };
+                    let Some(value) = procedure.value(*binding) else {
+                        continue;
+                    };
+                    let Some(mapping) = procedure.source_mapping(value.source) else {
+                        incomplete.push(format!(
+                            "local value {} has no declaration source mapping",
+                            binding.index()
+                        ));
+                        continue;
+                    };
+                    let declaration = mapping.locator.anchor().span();
+                    let declaration = (
+                        declaration.start_byte() as usize,
+                        declaration.end_byte() as usize,
+                    );
+                    let Some(scope_binding) = scope_facts.bindings.get(&declaration) else {
+                        incomplete.push(format!(
+                            "local value {} does not join a Rust lexical binding row at {:?}",
+                            binding.index(),
+                            declaration
+                        ));
+                        continue;
+                    };
+                    if !(scope_binding.scope.0 <= await_start
+                        && await_end <= scope_binding.scope.1
+                        && scope_binding.activation.0 <= await_start
+                        && await_end <= scope_binding.activation.1)
+                    {
+                        continue;
+                    }
+
+                    let mut moves = HashSet::default();
+                    let mut missing_move_site = None;
+                    for move_use in scope_binding
+                        .move_uses
+                        .iter()
+                        .copied()
+                        .filter(|(start, _)| *start < await_end)
+                    {
+                        let points = move_point_cache
+                            .entry(move_use)
+                            .or_insert_with(|| program_points_for_source_span(procedure, move_use));
+                        if let Some(points) = points {
+                            moves.extend(points.iter().copied());
+                        } else {
+                            missing_move_site = Some(move_use);
+                            break;
+                        }
+                    }
+                    if let Some(move_use) = missing_move_site {
+                        incomplete.push(format!(
+                            "by-value use of local {} at bytes {:?} has no source-mapped CFG point",
+                            binding.index(),
+                            move_use
+                        ));
+                        continue;
+                    }
+                    if !binding_live_on_path_to_suspend(
+                        procedure,
+                        suspend,
+                        establishment_points.get(binding),
+                        write_points.get(binding),
+                        &moves,
+                    ) {
+                        continue;
+                    }
+                    let Some(site) = self.site(procedure, source) else {
+                        incomplete.push(format!(
+                            "suspension point {} has no source mapping for a scope-only read",
+                            suspend.index()
+                        ));
+                        continue;
+                    };
+                    self.events.push(StateEventRow {
+                        event: self.events.len(),
+                        procedure: self.procedure,
+                        event_class: StateEventClass::Read,
+                        read_cause: Some(StateEventReadCause::ScopeEndDrop),
+                        subject,
+                        point: suspend,
+                        point_id: self.point_id(suspend),
+                        value: *binding,
+                        site,
+                        generation: self.generation,
+                    });
+                    self.event_keys.push(SemanticEventKey {
+                        point: suspend,
+                        event_index: synthetic_event_index,
+                        source,
+                    });
+                    synthetic_event_index = synthetic_event_index
+                        .checked_add(1)
+                        .expect("synthetic event-key index fits the event-key index");
+                    continue;
+                }
+                let Some(site) = self.site(procedure, source) else {
+                    continue;
+                };
+                self.events.push(StateEventRow {
+                    event: self.events.len(),
+                    procedure: self.procedure,
+                    event_class: StateEventClass::Read,
+                    read_cause: Some(StateEventReadCause::PostResumeUse),
+                    subject,
+                    point: suspend,
+                    point_id: self.point_id(suspend),
+                    value: *binding,
+                    site,
+                    generation: self.generation,
+                });
+                self.event_keys.push(SemanticEventKey {
+                    point: suspend,
+                    event_index: synthetic_event_index,
+                    source,
+                });
+                synthetic_event_index = synthetic_event_index
+                    .checked_add(1)
+                    .expect("synthetic event-key index fits the event-key index");
+            }
+        }
+        incomplete.sort();
+        incomplete.dedup();
+        incomplete
     }
 
     /// The source-facing property subject of one field access. This is only a
@@ -6624,6 +7376,113 @@ impl EventBuilder<'_> {
     }
 }
 
+fn binding_read_reachable_without_write(
+    procedure: &ProcedureSemantics,
+    origin: ProgramPointId,
+    reads: Option<&HashSet<ProgramPointId>>,
+    writes: Option<&HashSet<ProgramPointId>>,
+) -> bool {
+    let Some(reads) = reads else {
+        return false;
+    };
+    let writes = writes.cloned().unwrap_or_default();
+    let mut visited = HashSet::default();
+    let mut stack = procedure
+        .successors(origin)
+        .map(|(_, target)| target)
+        .collect::<Vec<_>>();
+    while let Some(point) = stack.pop() {
+        if !visited.insert(point) || writes.contains(&point) {
+            continue;
+        }
+        if reads.contains(&point) {
+            return true;
+        }
+        stack.extend(procedure.successors(point).map(|(_, target)| target));
+    }
+    false
+}
+
+/// Find the CFG point(s) that own a structured Rust use site. Exact source
+/// mappings win; if the lowerer maps only an enclosing expression, use the
+/// narrowest source-mapped point that contains the identifier.
+fn program_points_for_source_span(
+    procedure: &ProcedureSemantics,
+    wanted: SourceByteSpan,
+) -> Option<HashSet<ProgramPointId>> {
+    let mut exact = HashSet::default();
+    let mut narrowest_width = usize::MAX;
+    let mut enclosing = HashSet::default();
+    for point in procedure.points() {
+        let source_mappings =
+            std::iter::once(point.source).chain(point.events.iter().map(|event| event.source));
+        for source in source_mappings {
+            let Some(mapping) = procedure.source_mapping(source) else {
+                continue;
+            };
+            let span = mapping.locator.anchor().span();
+            let actual = (span.start_byte() as usize, span.end_byte() as usize);
+            if actual == wanted {
+                exact.insert(point.id);
+            } else if actual.0 <= wanted.0 && wanted.1 <= actual.1 {
+                let width = actual.1 - actual.0;
+                if width < narrowest_width {
+                    narrowest_width = width;
+                    enclosing.clear();
+                    enclosing.insert(point.id);
+                } else if width == narrowest_width {
+                    enclosing.insert(point.id);
+                }
+            }
+        }
+    }
+    if !exact.is_empty() {
+        Some(exact)
+    } else if !enclosing.is_empty() {
+        Some(enclosing)
+    } else {
+        None
+    }
+}
+
+/// Whether any CFG path carries one establishment to `suspend` without an
+/// intervening by-value move or another establishment of the same binding.
+/// Stopping at each write and starting from every establishment handles
+/// reinitialization while preserving the existential path required when only
+/// one branch moves the value.
+fn binding_live_on_path_to_suspend(
+    procedure: &ProcedureSemantics,
+    suspend: ProgramPointId,
+    establishments: Option<&HashSet<ProgramPointId>>,
+    writes: Option<&HashSet<ProgramPointId>>,
+    moves: &HashSet<ProgramPointId>,
+) -> bool {
+    let Some(establishments) = establishments else {
+        return false;
+    };
+    let writes = writes.cloned().unwrap_or_default();
+    let mut stack = establishments
+        .iter()
+        .flat_map(|origin| {
+            procedure
+                .successors(*origin)
+                .map(|(_, target)| target)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut visited = HashSet::default();
+    while let Some(point) = stack.pop() {
+        if point == suspend {
+            return true;
+        }
+        if !visited.insert(point) || writes.contains(&point) || moves.contains(&point) {
+            continue;
+        }
+        stack.extend(procedure.successors(point).map(|(_, target)| target));
+    }
+    false
+}
+
 /// The binding each value is the IR's own copy of.
 ///
 /// Built from `ValueFlow` alone: an effect that says "this binding's value
@@ -6644,7 +7503,7 @@ impl BindingBases {
                 let Some(source_value) = procedure.value(*source) else {
                     continue;
                 };
-                if is_binding_kind(&source_value.kind) {
+                if source_value.kind.is_binding() {
                     canonical.entry(*target).or_insert(*source);
                 }
             }
@@ -7222,14 +8081,7 @@ where
                     StateEventClass::Kill => unreachable!("kills are not projected here"),
                 }
             }
-            if matches!(
-                semantic_event.effect,
-                SemanticEffect::ValueFlow {
-                    source,
-                    kind: ValueFlowKind::Transfer(transfer),
-                    ..
-                } if source == binding && matches!(transfer.kind, TransferKind::Move { .. })
-            ) {
+            if binding_is_invalidated_by(&semantic_event.effect, binding) {
                 return Ok(OverwrittenUnreadAnswer::Open {
                     reasons: vec![FlowStateIncompleteReason::BindingStateNotClosed { binding }],
                 });
@@ -7376,9 +8228,10 @@ where
     };
     let header = loop_site.header;
     let body = loop_site.body;
-    // The adapter's body span and the producer's body entry must name the
-    // same source. A lowering may enter a do body at the loop's own point.
-    let body_mapping = semantics
+    // The producer-authored body entry is the source identity for the body.
+    // Ruby additionally attests a dedicated body source in the loop evidence
+    // because its CFG point deliberately covers only the runtime statements.
+    let point_body_mapping = semantics
         .source_mapping(
             semantics
                 .point(body)
@@ -7386,13 +8239,39 @@ where
                 .source,
         )
         .expect("validated point has a source mapping");
-    let body_span = body_mapping.locator.anchor().span();
-    let body_matches = body_span == site.body_span
-        || (site.kind == LoopSourceKind::Do && body_span == site.loop_span);
-    if body_mapping.kind != SourceMappingKind::Exact || !body_matches {
-        return Ok(join_open("body_entry"));
+    let evidence = semantics
+        .evidence_row(loop_site.evidence)
+        .expect("validated loop site has evidence");
+    let mut body_sources = evidence
+        .sources
+        .iter()
+        .copied()
+        .filter(|source| *source != loop_site.source);
+    let evidence_body_source = body_sources.next();
+    assert!(
+        body_sources.next().is_none(),
+        "a loop site has at most one dedicated body source"
+    );
+    if let Some(source) = evidence_body_source {
+        let mapping = semantics
+            .source_mapping(source)
+            .expect("validated loop evidence body source exists");
+        if mapping.kind != SourceMappingKind::Exact {
+            return Ok(join_open("body_entry"));
+        }
+    } else {
+        // Older producers attest only the loop source and body point. Keep
+        // their conservative source-containment check until they publish a
+        // dedicated body source like Ruby does.
+        let body_span = point_body_mapping.locator.anchor().span();
+        let body_matches = body_span == site.body_span
+            || (site.kind == LoopSourceKind::Do && body_span == site.loop_span);
+        if point_body_mapping.kind != SourceMappingKind::Exact || !body_matches {
+            return Ok(join_open("body_entry"));
+        }
     }
 
+    let entry_reachability = forward_reachability(graph, semantics.entry_point(), request)?;
     let mut exit = None;
     let mut intentional_constant_false_do = false;
     if let Some(condition) = site.condition_span {
@@ -7409,50 +8288,77 @@ where
             let folded_while_at_header = site.kind == LoopSourceKind::While
                 && guard.point == header
                 && guard.predicate.constant_value().is_some();
-            let enters_body = guard.true_edge.is_some_and(|edge| {
-                semantics
-                    .control_edge(edge)
-                    .is_some_and(|edge| edge.target_point == body)
-            });
-            if (within_condition || folded_while_at_header)
-                && (enters_body
-                    || (guard.predicate.constant_value() == Some(false)
-                        && guard.false_edge.is_some()))
-            {
+            let enters_body = match site.kind {
+                LoopSourceKind::Until => guard.false_edge.is_some_and(|edge| {
+                    semantics
+                        .control_edge(edge)
+                        .is_some_and(|edge| edge.target_point == body)
+                }),
+                _ => guard.true_edge.is_some_and(|edge| {
+                    semantics
+                        .control_edge(edge)
+                        .is_some_and(|edge| edge.target_point == body)
+                }),
+            };
+            let constant_exit_arm = match site.kind {
+                LoopSourceKind::Until => {
+                    guard.predicate.constant_value() == Some(true) && guard.true_edge.is_some()
+                }
+                _ => guard.predicate.constant_value() == Some(false) && guard.false_edge.is_some(),
+            };
+            if (within_condition || folded_while_at_header) && (enters_body || constant_exit_arm) {
                 guards.push(guard);
             }
         }
-        let [guard] = guards.as_slice() else {
-            return Ok(join_open("guard"));
-        };
-        let evidence = semantics
-            .evidence_row(guard.evidence)
-            .expect("validated guard has evidence");
-        if !matches!(evidence.proof, ProofStatus::Proven)
-            || !matches!(evidence.completeness, EvidenceCompleteness::Complete)
-        {
-            return Ok(LoopRepeatAnswer::Open {
-                reasons: vec![LoopRepeatIncompleteReason::GuardEvidence],
-            });
-        }
-        intentional_constant_false_do =
-            site.kind == LoopSourceKind::Do && guard.predicate.constant_value() == Some(false);
-        if let Some(false_edge) = guard.false_edge {
-            let edge = semantics
-                .control_edge(false_edge)
-                .expect("validated guard edge exists");
-            if edge.source_point != guard.point || edge.kind != ControlEdgeKind::ConditionalFalse {
-                return Ok(join_open("false_edge"));
+        if guards.len() != 1 {
+            // A post-test body may terminate before its condition. In that
+            // case the retained CFG has no reachable condition guard, and
+            // the graph walk below can prove whether the body has its own
+            // repeat edge without inventing a guard fact.
+            let condition_reachable = entry_reachability.contains(graph, header);
+            if condition_reachable {
+                return Ok(join_open("guard"));
             }
-            exit = Some(edge.target_point);
-        } else if guard.predicate.constant_value() != Some(true) {
-            return Ok(join_open("false_arm"));
+        } else {
+            let guard = guards[0];
+            let evidence = semantics
+                .evidence_row(guard.evidence)
+                .expect("validated guard has evidence");
+            if !matches!(evidence.proof, ProofStatus::Proven)
+                || !matches!(evidence.completeness, EvidenceCompleteness::Complete)
+            {
+                return Ok(LoopRepeatAnswer::Open {
+                    reasons: vec![LoopRepeatIncompleteReason::GuardEvidence],
+                });
+            }
+            intentional_constant_false_do =
+                site.kind == LoopSourceKind::Do && guard.predicate.constant_value() == Some(false);
+            let exit_edge = match site.kind {
+                LoopSourceKind::Until => guard.true_edge,
+                _ => guard.false_edge,
+            };
+            if let Some(exit_edge) = exit_edge {
+                let edge = semantics
+                    .control_edge(exit_edge)
+                    .expect("validated guard edge exists");
+                let expected_kind = match site.kind {
+                    LoopSourceKind::Until => ControlEdgeKind::ConditionalTrue,
+                    _ => ControlEdgeKind::ConditionalFalse,
+                };
+                if edge.source_point != guard.point || edge.kind != expected_kind {
+                    return Ok(join_open("false_edge"));
+                }
+                exit = Some(edge.target_point);
+            } else if guard.predicate.constant_value()
+                != Some(!matches!(site.kind, LoopSourceKind::Until))
+            {
+                return Ok(join_open("false_arm"));
+            }
         }
     } else if site.kind != LoopSourceKind::For {
         return Ok(join_open("condition"));
     }
 
-    let entry_reachability = forward_reachability(graph, semantics.entry_point(), request)?;
     if !entry_reachability.contains(graph, body) {
         return Ok(LoopRepeatAnswer::UnreachableBody);
     }
@@ -7487,7 +8393,17 @@ where
         }
         for (edge_id, target) in graph.successors(point) {
             request.visit_pair()?;
-            if target == header {
+            let body_repeat = target == body
+                && semantics
+                    .control_edge(edge_id)
+                    .is_some_and(|edge| edge.kind == ControlEdgeKind::LoopBack);
+            if target == header
+                // Ruby's `redo` repeats the current body without re-running
+                // its condition. The producer targets the exact body entry,
+                // so retain that explicit body loop-back as repetition while
+                // leaving nested-loop headers distinct.
+                || body_repeat
+            {
                 // A conditional arm can return directly to the proven header;
                 // it retains ConditionalTrue/False rather than LoopBack. Once
                 // bounded to this iteration, either edge proves repetition.
@@ -7506,6 +8422,25 @@ where
 
 /// The dense definition identities the reaching fixed point is solved over:
 /// one per establishment event.
+fn invalidated_binding(effect: &SemanticEffect) -> Option<ValueId> {
+    match effect {
+        SemanticEffect::ValueFlow {
+            kind: ValueFlowKind::Transfer(transfer),
+            source,
+            ..
+        } if matches!(transfer.kind, TransferKind::Move { .. }) => Some(*source),
+        SemanticEffect::ValueUse {
+            kind: ValueUseKind::Unbind,
+            value,
+        } => Some(*value),
+        _ => None,
+    }
+}
+
+fn binding_is_invalidated_by(effect: &SemanticEffect, binding: ValueId) -> bool {
+    invalidated_binding(effect) == Some(binding)
+}
+
 struct Definitions {
     /// Definition id -> event id.
     events: Vec<usize>,
@@ -7561,7 +8496,7 @@ impl Definitions {
             })
             .collect::<HashSet<_>>();
         for value in procedure.values() {
-            if observed_bindings.contains(&value.id) && is_binding_kind(&value.kind) {
+            if observed_bindings.contains(&value.id) && value.kind.is_binding() {
                 let definition =
                     definitions.reachable + 1 + definitions.uninitialized_by_binding.len();
                 definitions
@@ -7593,17 +8528,12 @@ impl Definitions {
                         .last_uninitialized_by_point
                         .insert((point.id.index(), *binding), false);
                 }
-                if let SemanticEffect::ValueFlow {
-                    kind: ValueFlowKind::Transfer(transfer),
-                    source,
-                    ..
-                } = &event.effect
-                    && matches!(transfer.kind, TransferKind::Move { .. })
-                    && definitions.uninitialized_by_binding.contains_key(source)
+                if let Some(binding) = invalidated_binding(&event.effect)
+                    && definitions.uninitialized_by_binding.contains_key(&binding)
                 {
                     definitions
                         .last_uninitialized_by_point
-                        .insert((point.id.index(), *source), true);
+                        .insert((point.id.index(), binding), true);
                 }
             }
         }
@@ -7696,15 +8626,10 @@ impl Definitions {
                         state_at_point.insert(binding, false);
                     }
                 }
-                if let SemanticEffect::ValueFlow {
-                    kind: ValueFlowKind::Transfer(transfer),
-                    source,
-                    ..
-                } = &semantic_event.effect
-                    && matches!(transfer.kind, TransferKind::Move { .. })
-                    && self.uninitialized_by_binding.contains_key(source)
+                if let Some(binding) = invalidated_binding(&semantic_event.effect)
+                    && self.uninitialized_by_binding.contains_key(&binding)
                 {
-                    state_at_point.insert(*source, true);
+                    state_at_point.insert(binding, true);
                 }
             }
         }
@@ -7771,17 +8696,12 @@ where
 /// vocabulary. The relation has already been keyed by the durable receiver,
 /// access path, and structured member in `bifrost-analysis`; the `FlowSubject`
 /// on each event is only a source-facing presentation value.
-fn property_flow_relations<G>(
-    graph: &G,
+fn property_reaching_relations(
     events: &[StateEventRow],
     event_keys: &[SemanticEventKey],
     property_result: &PropertyReachingResult,
-    dominance: &Dominators<ProgramPointId>,
     generation: u64,
-) -> Vec<FlowRelationRow>
-where
-    G: DenseBidirectionalGraph<Node = ProgramPointId, Edge = ControlEdgeId>,
-{
+) -> Vec<FlowRelationRow> {
     let mut rows = Vec::new();
     for relation in property_result.reaching() {
         let Some(source_event) = property_event_id(
@@ -7816,6 +8736,22 @@ where
             generation,
         });
     }
+
+    rows
+}
+
+fn property_flow_relations<G>(
+    graph: &G,
+    events: &[StateEventRow],
+    event_keys: &[SemanticEventKey],
+    property_result: &PropertyReachingResult,
+    dominance: &Dominators<ProgramPointId>,
+    generation: u64,
+) -> Vec<FlowRelationRow>
+where
+    G: DenseBidirectionalGraph<Node = ProgramPointId, Edge = ControlEdgeId>,
+{
+    let mut rows = property_reaching_relations(events, event_keys, property_result, generation);
 
     for store in property_result.stores() {
         let Some(source_event) = property_event_id(
@@ -8007,7 +8943,7 @@ impl EvaluationDependence {
                     SemanticEffect::Assignment { target, value } => {
                         let binding = procedure
                             .value(*target)
-                            .is_some_and(|value| is_binding_kind(&value.kind));
+                            .is_some_and(|value| value.kind.is_binding());
                         if !binding {
                             record(*target, *value);
                         }
@@ -8084,12 +9020,12 @@ mod tests {
     use crate::analyzer::semantic::ExecutionTiming;
     use crate::analyzer::semantic::cfg_algorithms::CfgAlgorithmBudget;
     use crate::analyzer::semantic_model::{
-        CatalogOptions, CompilerOptions, SemanticModelActivationEvidence,
-        SemanticModelActivationRequest, SemanticModelRuntimeLimits, SemanticModelRuntimeOutcome,
-        SemanticPackCatalog, SessionPackSource, SessionPackSourceKind, SourceFormat,
-        acquire_active_semantic_models, compile_source,
+        CatalogOptions, CompilerOptions, SemanticModelRuntimeOutcome, SemanticPackCatalog,
+        SessionPackSource, SessionPackSourceKind, SourceFormat, acquire_active_semantic_models,
+        compile_source,
     };
     use crate::analyzer::{AnalyzerConfig, Language};
+    use brokk_bifrost_test_macros::hardwon;
 
     use crate::inline_project::{BuiltInlineTestProject, InlineTestProject};
 
@@ -8220,27 +9156,13 @@ mod tests {
             &self,
             catalog: &SemanticPackCatalog,
         ) -> Arc<ActiveSemanticModelSnapshot> {
+            let request =
+                brokk_bifrost_analysis::test_support::go_semantic_model_activation_request(None);
             match acquire_active_semantic_models(
                 self.workspace.analyzer(),
                 catalog,
                 None,
-                &SemanticModelActivationRequest {
-                    bifrost_version: env!("CARGO_PKG_VERSION")
-                        .parse()
-                        .expect("crate version is semver"),
-                    evidence: vec![SemanticModelActivationEvidence {
-                        language: "go".to_owned(),
-                        ecosystem: "go".to_owned(),
-                        package: None,
-                        module: None,
-                        toolchain: None,
-                        target: None,
-                        configuration: None,
-                        artifact_sha256: None,
-                    }],
-                    controls: Vec::new(),
-                    limits: SemanticModelRuntimeLimits::default(),
-                },
+                &request,
                 &CancellationToken::default(),
             ) {
                 SemanticModelRuntimeOutcome::Ready { snapshot, .. } => snapshot,
@@ -8303,67 +9225,6 @@ func second(input int) int { return input }
             procedure_public_digest(&changed.procedure(0, ProcedureId::new(0))),
             "artifact content must remain part of the public root identity"
         );
-    }
-
-    #[test]
-    fn materialized_procedure_scope_skips_unrelated_flow_derivations() {
-        let fixture = Fixture::new(
-            Language::Go,
-            &[(
-                "main.go",
-                r#"package sample
-
-func first(input int) int {
-    value := input
-    return value
-}
-
-func second(input int) int {
-    value := input
-    return value
-}
-"#,
-            )],
-        );
-        let outcome = fixture.materialized(0);
-        let artifact = outcome
-            .available_value()
-            .cloned()
-            .expect("Go semantics are available");
-        let cancellation = CancellationToken::default();
-        let full = flow_state_for_materialized_artifact(
-            &fixture.workspace,
-            &fixture.files[0],
-            outcome.clone(),
-            &mut FlowStateRequest::new(&cancellation),
-        );
-        assert!(
-            full.procedures.len() >= 2,
-            "both functions derive: {full:#?}"
-        );
-
-        let selected = &full.procedures[1];
-        let procedure = artifact
-            .procedure_handle(selected.procedure)
-            .expect("the artifact owns the selected procedure");
-        let scoped = flow_state_for_materialized_procedure(
-            &fixture.workspace,
-            &fixture.files[0],
-            outcome,
-            &procedure,
-            &mut FlowStateRequest::new(&cancellation),
-        );
-
-        let [derived] = scoped.procedures.as_slice() else {
-            panic!("only the selected procedure derives: {scoped:#?}");
-        };
-        assert_eq!(derived.procedure, selected.procedure);
-        assert_eq!(derived.events, selected.events);
-        assert_eq!(derived.relations, selected.relations);
-        assert_eq!(derived.completeness, selected.completeness);
-        assert_eq!(scoped.completeness, full.completeness);
-        assert_eq!(scoped.generation, full.generation);
-        assert_eq!(scoped.active_model_set_hash(), full.active_model_set_hash());
     }
 
     #[test]
@@ -8567,13 +9428,7 @@ func choose(flag bool) int {
             .normal_continuation
             .target()
             .expect("the call has a normal continuation");
-        let edges = semantics
-            .successor_edges(call.point)
-            .filter_map(|(edge_id, edge)| {
-                (edge.kind == ControlEdgeKind::Normal && edge.target_point == target)
-                    .then_some(edge_id)
-            })
-            .collect::<Vec<_>>();
+        let edges = normal_control_edges_to_target(semantics, call.point, target);
         assert_eq!(
             edges.len(),
             1,
@@ -8581,6 +9436,136 @@ func choose(flag bool) int {
         );
         edges[0]
     }
+
+    const GO_UNRESOLVED_IMPORTED_FIELD_ACCESS: &str = r#"
+package sample
+
+import (
+    "net/http"
+    "net/url"
+)
+
+func observations(raw string, request *http.Request) string {
+    parsed, _ := url.Parse(raw)
+    request.URL = parsed
+    return parsed.Scheme
+}
+"#;
+
+    const GO_VALIDATOR_RESULT_ARGUMENT_ORDER: &str = r#"
+package sample
+
+func checked(value error) string { return "checked" }
+func use(first string, second string) {}
+func mutate(target *error) string { return "mutated" }
+func publish(target *error) string { return "published" }
+
+func safe(value error) {
+    use(checked(value), "constant")
+}
+
+func invalidated(value error) {
+    use(checked(value), mutate(&value))
+}
+
+func afterReceive(ch chan int, value error) {
+    observed := <-ch
+    _ = observed
+    use(checked(value), "constant")
+}
+
+func escaped(value error) {
+    use(publish(&value), checked(value))
+}
+
+func captured(value error) {
+    mutate := func() string { value = nil; return "mutated" }
+    use(checked(value), mutate())
+}
+"#;
+
+    const JS_PROJECTED_NONRETURN_REACHING: &str = r#"
+function abort() {}
+
+function branch(flag) {
+  const ns = {};
+  ns.value = 1;
+  if (flag) {
+    ns.value = 2;
+    abort();
+  }
+  return ns.value;
+}
+"#;
+
+    const GO_CONTROL_GAP_AT_TARGET: &str = r#"
+package sample
+
+type item struct { value int }
+
+func read(value *item) int {
+    ready := true
+    _ = ready
+    return value.value
+}
+"#;
+
+    const JS_READ_BEFORE_ESTABLISHMENT: &str = r#"
+function beforeEstablishment() {
+  const ns = {};
+  const early = ns.value;
+  ns.value = 1;
+  return early;
+}
+"#;
+
+    const TS_READ_BEFORE_ESTABLISHMENT: &str = r#"
+function beforeEstablishment(): number | undefined {
+  const ns: { value?: number } = {};
+  const early = ns.value;
+  ns.value = 1;
+  return early;
+}
+"#;
+
+    const JS_SHADOW_REBIND: &str = r#"
+function shadowRebind(flag) {
+  let value = 1;
+  if (flag) {
+    let inner = 2;
+    return inner;
+  }
+  value = 3;
+  return value;
+}
+"#;
+
+    const GO_AGGREGATE_COPY_VALUE_ALIAS: &str = r#"package app
+
+type resource struct{}
+
+func copyValue() {
+    original := [1]*resource{}
+    copied := original
+    _ = copied[0]
+}
+"#;
+
+    const GO_MAY_ASSIGNMENT_CONVERSION_ALIAS: &str = r#"package app
+
+type resource struct{}
+
+func acquire() *resource { return nil }
+
+func mayConversionAlias(change bool, acquire func() *resource) any {
+	source := acquire()
+	if change {
+		source = nil
+	}
+	var converted any = source
+	return converted
+}
+"#;
 
     const GO_DETACHED_CONSUMER_PARENT_CONTINUATIONS: &str = r#"
 package sample
@@ -8796,255 +9781,6 @@ func outer(captured int) {
     }()
 }
 "#;
-
-    const GO_UNRESOLVED_IMPORTED_FIELD_ACCESS: &str = r#"
-package sample
-
-import (
-    "net/http"
-    "net/url"
-)
-
-func observations(raw string, request *http.Request) string {
-    parsed, _ := url.Parse(raw)
-    request.URL = parsed
-    return parsed.Scheme
-}
-"#;
-
-    #[test]
-    fn retained_unresolved_property_access_does_not_open_base_observation_enumeration() {
-        let fixture = Fixture::new(
-            Language::Go,
-            &[("main.go", GO_UNRESOLVED_IMPORTED_FIELD_ACCESS)],
-        );
-        let outcome = fixture.materialized(0);
-        let cancellation = CancellationToken::default();
-        let state = flow_state_for_materialized_artifact(
-            &fixture.workspace,
-            &fixture.files[0],
-            outcome.clone(),
-            &mut FlowStateRequest::new(&cancellation),
-        );
-        let artifact = outcome
-            .available_value()
-            .expect("Go semantics are available");
-        let procedure = artifact
-            .procedures()
-            .iter()
-            .find(|procedure| {
-                procedure
-                    .gaps()
-                    .iter()
-                    .filter(|gap| {
-                        gap.capability == SemanticCapability::FieldMemory
-                            && matches!(gap.subject, SemanticGapSubject::MemoryLocation(_))
-                    })
-                    .count()
-                    >= 2
-            })
-            .expect("the imported field accesses belong to one lowered procedure");
-        let load_gap = procedure
-            .gaps()
-            .iter()
-            .find(|gap| {
-                let SemanticGapSubject::MemoryLocation(location) = gap.subject else {
-                    return false;
-                };
-                gap.capability == SemanticCapability::FieldMemory
-                    && procedure.point(gap.point).is_some_and(|point| {
-                        point.events.iter().any(|event| {
-                            matches!(
-                                event.effect,
-                                SemanticEffect::MemoryLoad {
-                                    location: accessed,
-                                    ..
-                                } if accessed == location
-                            )
-                        })
-                    })
-            })
-            .expect("the imported field load has unresolved declaration identity");
-        let SemanticGapSubject::MemoryLocation(load_location) = load_gap.subject else {
-            unreachable!("the selected gap has a memory-location subject");
-        };
-        let base = match procedure
-            .memory_location(load_location)
-            .expect("the gap names a retained memory location")
-            .kind
-        {
-            MemoryLocationKind::Field { base, .. } => base,
-            ref kind => panic!("the imported selector must name a field, got {kind:?}"),
-        };
-        let relevant_values = std::iter::once(base).collect::<HashSet<_>>();
-        let derivation = state
-            .procedures
-            .iter()
-            .find(|derivation| derivation.procedure == procedure.id())
-            .expect("the imported field access has retained flow state");
-        let retained_read_values = derivation
-            .events
-            .iter()
-            .filter(|event| event.event_class == StateEventClass::Read)
-            .map(|event| event.value)
-            .collect::<HashSet<_>>();
-        let origins = [procedure.entry_point()];
-
-        assert!(gap_point_retains_memory_access(
-            procedure,
-            load_gap,
-            load_location
-        ));
-        assert!(
-            retained_read_values.contains(&base),
-            "the imported selector retains a read of its base value"
-        );
-        assert!(
-            !result_observation_gap_is_relevant(
-                procedure,
-                load_gap,
-                &relevant_values,
-                &retained_read_values,
-                &origins,
-            ),
-            "unresolved property identity cannot hide the retained observation of its base"
-        );
-
-        let no_base_read = HashSet::default();
-        assert!(
-            result_observation_gap_is_relevant(
-                procedure,
-                load_gap,
-                &relevant_values,
-                &no_base_read,
-                &origins,
-            ),
-            "a same-point access without a retained base read must keep enumeration open"
-        );
-
-        let mut no_access = load_gap.clone();
-        no_access.point = procedure.entry_point();
-        assert_ne!(no_access.point, load_gap.point);
-        assert!(!gap_point_retains_memory_access(
-            procedure,
-            &no_access,
-            load_location
-        ));
-        assert!(
-            result_observation_gap_is_relevant(
-                procedure,
-                &no_access,
-                &relevant_values,
-                &retained_read_values,
-                &origins,
-            ),
-            "a location gap without its exact retained access must keep enumeration open"
-        );
-
-        let store_gap = procedure
-            .gaps()
-            .iter()
-            .find(|gap| {
-                let SemanticGapSubject::MemoryLocation(location) = gap.subject else {
-                    return false;
-                };
-                gap.capability == SemanticCapability::FieldMemory
-                    && procedure.point(gap.point).is_some_and(|point| {
-                        point.events.iter().any(|event| {
-                            matches!(
-                                event.effect,
-                                SemanticEffect::MemoryStore {
-                                    location: accessed,
-                                    ..
-                                } if accessed == location
-                            )
-                        })
-                    })
-            })
-            .expect("the imported field store has unresolved declaration identity");
-        let SemanticGapSubject::MemoryLocation(store_location) = store_gap.subject else {
-            unreachable!("the selected gap has a memory-location subject");
-        };
-        let stored_value = procedure
-            .point(store_gap.point)
-            .into_iter()
-            .flat_map(|point| &point.events)
-            .find_map(|event| match event.effect {
-                SemanticEffect::MemoryStore {
-                    location, value, ..
-                } if location == store_location => Some(value),
-                _ => None,
-            })
-            .expect("the store gap point retains the exact stored value");
-        let stored_sources = procedure
-            .point(store_gap.point)
-            .into_iter()
-            .flat_map(|point| &point.events)
-            .filter_map(|event| match event.effect {
-                SemanticEffect::ValueFlow {
-                    kind: ValueFlowKind::LanguageDefined,
-                    source,
-                    target,
-                } if target == stored_value
-                    && procedure.value(target).is_some_and(|value| {
-                        matches!(
-                            &value.kind,
-                            SemanticValueKind::LanguageDefined(kind)
-                                if kind.as_ref() == "go.assignment_conversion"
-                        )
-                    }) =>
-                {
-                    Some(source)
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let [stored_source] = stored_sources.as_slice() else {
-            panic!(
-                "the stored value has one exact assignment-conversion source: {stored_sources:?}"
-            )
-        };
-        let root = derivation
-            .events
-            .iter()
-            .find(|event| {
-                event.event_class == StateEventClass::Establish
-                    && spelling(GO_UNRESOLVED_IMPORTED_FIELD_ACCESS, event)
-                        == "parsed, _ := url.Parse(raw)"
-            })
-            .expect("the parsed URL result has one exact establishment");
-        let procedure_handle = artifact
-            .procedure_handle(procedure.id())
-            .expect("the materialized artifact owns the selected procedure");
-        let closure = derivation
-            .exact_local_value_alias_closure(&procedure_handle, std::slice::from_ref(&root.event));
-        let load_base_read = closure
-            .reads
-            .iter()
-            .copied()
-            .find(|event| derivation.event(*event).value == base)
-            .expect("the exact closure reaches the retained selector-base read");
-        let stored_source_read = closure
-            .reads
-            .iter()
-            .copied()
-            .find(|event| derivation.event(*event).value == *stored_source)
-            .expect("the exact closure reaches the retained conversion-source read");
-        assert_ne!(load_base_read, stored_source_read);
-        assert!(
-            !closure.unclosed_transfers.contains(&load_base_read),
-            "a retained field load completely represents its base observation"
-        );
-        assert!(
-            closure.unclosed_transfers.contains(&stored_source_read),
-            "a value stored into unresolved memory remains an unclosed transfer"
-        );
-        assert_eq!(
-            closure.unclosed_transfers,
-            std::iter::once(stored_source_read).collect::<HashSet<_>>(),
-            "only the unresolved store remains open"
-        );
-    }
 
     const GO_UNRESOLVED_IMPORTED_FIELD_STORE_BASE: &str = r#"
 package sample
@@ -9418,6 +10154,19 @@ func first() int {
                 )
             })
             .collect()
+    }
+
+    fn assert_write_consumes_its_read_in_one_evaluation(
+        source: &str,
+        derivation: &FlowStateDerivation,
+        write_spelling: &str,
+        read_spelling: &str,
+    ) {
+        let same = relation_spellings(source, derivation, FlowRelation::SameEvaluation);
+        assert!(
+            same.contains(&(write_spelling, read_spelling, FlowCertainty::Exact)),
+            "the write and the read it consumes must be same-evaluation; got {same:?}"
+        );
     }
 
     const JS_READ_AFTER_ESTABLISHMENT: &str = r#"
@@ -10047,60 +10796,7 @@ class Sample {
     }
 
     #[test]
-    fn overwritten_unread_local_consumes_the_shared_cfg_budget() {
-        let fixture = Fixture::new(
-            Language::Java,
-            &[("src/Sample.java", JAVA_OVERWRITTEN_UNREAD)],
-        );
-        let state = fixture.state(0);
-        let first_write = JAVA_OVERWRITTEN_UNREAD
-            .find("x = 1;")
-            .expect("first write exists");
-        let derivation = state
-            .procedures
-            .iter()
-            .find(|derivation| {
-                derivation.events.iter().any(|event| {
-                    event.event_class == StateEventClass::Establish
-                        && event.site.range.start_byte == first_write
-                })
-            })
-            .expect("clean method has an establishment");
-        let first = derivation
-            .events
-            .iter()
-            .find(|event| event.site.range.start_byte == first_write)
-            .expect("first establishment exists");
-        let procedure = fixture.procedure(0, derivation.procedure);
-        let cancellation = CancellationToken::default();
-        let mut request = FlowStateRequest::new(&cancellation);
-        request.cfg_budget = CfgAlgorithmBudget::uniform(1);
-        assert!(matches!(
-            derivation.overwritten_unread_local(&procedure, first.event, &mut request),
-            OverwrittenUnreadAnswer::Open { reasons }
-                if reasons.iter().any(|reason| matches!(
-                    reason,
-                    FlowStateIncompleteReason::BudgetExhausted {
-                        axis: FlowStateAxis::ReachingRelation,
-                        ..
-                    }
-                ))
-        ));
-        let cancelled = CancellationToken::default();
-        cancelled.cancel();
-        assert!(matches!(
-            derivation.overwritten_unread_local(
-                &procedure,
-                first.event,
-                &mut FlowStateRequest::new(&cancelled)
-            ),
-            OverwrittenUnreadAnswer::Open { reasons }
-                if reasons.contains(&FlowStateIncompleteReason::Cancelled)
-        ));
-    }
-
-    #[test]
-    fn unmodeled_deletion_keeps_overwrite_proof_open() {
+    fn deleting_local_reads_its_value_before_unbinding_it() {
         const SOURCE: &str = r#"
 def deleted():
     x = 1
@@ -10128,21 +10824,15 @@ def deleted():
             .expect("first establishment exists");
         let procedure = fixture.procedure(0, derivation.procedure);
         let cancellation = CancellationToken::default();
-        assert!(matches!(
-            derivation.overwritten_unread_local(
-                &procedure,
-                first.event,
-                &mut FlowStateRequest::new(&cancellation)
-            ),
-            OverwrittenUnreadAnswer::Open { reasons }
-                if reasons.iter().any(|reason| matches!(
-                    reason,
-                    FlowStateIncompleteReason::LoweringGap {
-                        capability: SemanticCapability::ExceptionalControlFlow,
-                        ..
-                    }
-                ))
-        ));
+        let answer = derivation.overwritten_unread_local(
+            &procedure,
+            first.event,
+            &mut FlowStateRequest::new(&cancellation),
+        );
+        assert!(
+            matches!(answer, OverwrittenUnreadAnswer::ReadBeforeOverwrite { .. }),
+            "deleting a local reads its current value: {answer:?}"
+        );
     }
 
     #[test]
@@ -10256,7 +10946,7 @@ function beforeVar() { c = 1; var c; c = 2; }
     }
 
     #[test]
-    fn unmodeled_python_deletion_keeps_binding_initialization_open() {
+    fn python_delete_marks_the_local_uninitialized_until_assignment() {
         const SOURCE: &str = r#"
 def deleted():
     x = 1
@@ -10281,64 +10971,30 @@ def deleted():
         let procedure = fixture.procedure(0, derivation.procedure);
         assert!(matches!(
             derivation.binding_initialization_at_read(&procedure, read),
-            BindingInitializationAnswer::Open { reasons }
-                if reasons.iter().any(|reason| matches!(
-                    reason,
-                    FlowStateIncompleteReason::LoweringGap {
-                        capability: SemanticCapability::ExceptionalControlFlow,
-                        ..
-                    }
-                ))
+            BindingInitializationAnswer::MayBeUninitialized
         ));
     }
 
     #[test]
-    fn mutable_python_capture_does_not_expose_a_provable_binding_read() {
-        const SOURCE: &str = r#"
-def outer():
-    x = 1
-    def inner():
-        nonlocal x
-        x = 2
-    inner()
-    x = x
-    return x
+    #[brokk_bifrost_test_macros::hardwon(
+        "#4720: a local helper with no normal exit left a caller read spuriously uninitialized"
+    )]
+    fn python_workspace_nonreturning_constructor_proves_the_following_local_read() {
+        const SOURCE: &str = r#"class Terminates:
+    def __init__(self):
+        self.ready = True
+        raise
+
+def caller(flag):
+    if flag:
+        value = 1
+    else:
+        Terminates()
+    return value
 "#;
         let fixture = Fixture::new(Language::Python, &[("src/main.py", SOURCE)]);
         let state = fixture.state(0);
-        let read_at = SOURCE.find("x = x").expect("self assignment exists") + 4;
-        assert!(
-            state
-                .procedures
-                .iter()
-                .flat_map(|derivation| &derivation.events)
-                .all(|event| event.event_class != StateEventClass::Read
-                    || event.site.range.start_byte != read_at)
-        );
-        assert!(state.procedures.iter().any(|derivation| {
-            derivation.completeness.reasons().iter().any(|reason| {
-                matches!(
-                    reason,
-                    FlowStateIncompleteReason::LoweringGap {
-                        capability: SemanticCapability::Captures,
-                        ..
-                    }
-                )
-            })
-        }));
-    }
-
-    #[test]
-    fn exhausted_cfg_budget_keeps_binding_initialization_open() {
-        let fixture = Fixture::new(
-            Language::Java,
-            &[("src/Sample.java", JAVA_BINDING_INITIALIZATION)],
-        );
-        let state = fixture.state_with_budget(0, CfgAlgorithmBudget::uniform(1));
-        let read_at = JAVA_BINDING_INITIALIZATION
-            .find("x = x;")
-            .expect("self assignment exists")
-            + 4;
+        let read_at = SOURCE.rfind("value").expect("return read exists");
         let (derivation, read) = state
             .procedures
             .iter()
@@ -10349,16 +11005,20 @@ def outer():
                         .then_some((derivation, event.event))
                 })
             })
-            .expect("the self-assignment RHS is a projected binding read");
+            .expect("return expression projects a local binding read");
         let procedure = fixture.procedure(0, derivation.procedure);
-        assert!(matches!(
+        assert_eq!(
             derivation.binding_initialization_at_read(&procedure, read),
-            BindingInitializationAnswer::Open { reasons }
-                if reasons.iter().any(|reason| matches!(
-                    reason,
-                    FlowStateIncompleteReason::BudgetExhausted { .. }
-                ))
-        ));
+            BindingInitializationAnswer::Proven,
+            "the constructor's exceptional-only body removes the caller's else continuation: {:?}",
+            derivation.completeness
+        );
+        let call = call_handle_spelled(&procedure, SOURCE, "Terminates()");
+        let normal_edge = normal_edge_for_call(&procedure, &call);
+        assert!(
+            derivation.control_edge_mask.omitted.contains(&normal_edge),
+            "the shared workspace effect projection omits the proven non-returning call edge"
+        );
     }
 
     #[test]
@@ -10515,50 +11175,6 @@ class Sample {
         assert_eq!(
             answer,
             OverwrittenUnreadAnswer::ReadBeforeOverwrite { read_event: 2 }
-        );
-    }
-
-    /// The acceptance shape: a read after an establishment on a straight line
-    /// relates to it as `Reaching` with `Exact` certainty, and the write also
-    /// dominates the read. Both rows exist because the two statements are two
-    /// different claims.
-    #[test]
-    fn a_read_after_an_establishment_reaches_exactly_and_is_dominated() {
-        let fixture = Fixture::new(
-            Language::JavaScript,
-            &[("src/main.js", JS_READ_AFTER_ESTABLISHMENT)],
-        );
-        let state = fixture.state(0);
-        let derivation = procedure_containing(
-            &state,
-            |event| matches!(&event.subject, FlowSubject::Property { member, .. } if &**member == "value"),
-        );
-        assert!(
-            derivation.events.iter().all(|event| {
-                event.event_class != StateEventClass::Kill
-                    || !matches!(&event.subject, FlowSubject::Property { .. })
-            }),
-            "a single structured property store must not manufacture a kill"
-        );
-
-        let reaching = relation_spellings(
-            JS_READ_AFTER_ESTABLISHMENT,
-            derivation,
-            FlowRelation::Reaching,
-        );
-        assert!(
-            reaching.contains(&("ns.value = 1", "ns.value", FlowCertainty::Exact)),
-            "expected an exact reaching row for the property; got {reaching:?}"
-        );
-
-        let dominates = relation_spellings(
-            JS_READ_AFTER_ESTABLISHMENT,
-            derivation,
-            FlowRelation::Dominates,
-        );
-        assert!(
-            dominates.contains(&("ns.value = 1", "ns.value", FlowCertainty::Exact)),
-            "expected a dominance row for the property; got {dominates:?}"
         );
     }
 
@@ -10774,6 +11390,9 @@ func read(input *item, value *item) int {
 "#;
 
     #[test]
+    #[hardwon(
+        "6e0319679345: non-rejoining Go panic gaps before a result must not block its exact dominance proof"
+    )]
     fn result_dominance_discharges_only_a_non_rejoining_gap_before_establishment() {
         let fixture = Fixture::new(
             Language::Go,
@@ -11584,6 +12203,9 @@ func read(input *item, value *item) int {
 "#;
 
     #[test]
+    #[hardwon(
+        "cf2e70f23ccf: result-relative ordering must discharge only strict pre-establishment exceptional exits"
+    )]
     fn result_point_dominance_discharges_only_pre_establishment_exceptional_exits() {
         let fixture = Fixture::new(
             Language::Go,
@@ -11653,6 +12275,9 @@ func read(input *item, value *item) int {
 "#;
 
     #[test]
+    #[hardwon(
+        "cf2e70f23ccf: exceptional exits after result creation must still block result-use dominance"
+    )]
     fn result_point_dominance_retains_post_establishment_exceptional_exits() {
         let fixture = Fixture::new(
             Language::Go,
@@ -11712,6 +12337,9 @@ func read(input *item, value *item) int {
 "#;
 
     #[test]
+    #[hardwon(
+        "cf2e70f23ccf: candidate-local proof must retain post-candidate exceptional-gap safety"
+    )]
     fn result_point_dominance_keeps_candidate_local_gap_safety() {
         let fixture = Fixture::new(
             Language::Go,
@@ -11777,6 +12405,9 @@ func read(input *item, value *item) int {
 "#;
 
     #[test]
+    #[hardwon(
+        "cf2e70f23ccf: cyclic gaps before establishment cannot be treated as a one-time pre-origin exit"
+    )]
     fn result_point_dominance_retains_cyclic_pre_establishment_gaps() {
         let fixture = Fixture::new(
             Language::Go,
@@ -11829,145 +12460,6 @@ func read(input *item, value *item) int {
                 .is_none(),
             "a later loop iteration can revisit the omitted exceptional-flow boundary"
         );
-    }
-
-    const GO_VALIDATOR_RESULT_ARGUMENT_ORDER: &str = r#"
-package sample
-
-func checked(value error) string { return "checked" }
-func use(first string, second string) {}
-func mutate(target *error) string { return "mutated" }
-func publish(target *error) string { return "published" }
-
-func safe(value error) {
-    use(checked(value), "constant")
-}
-
-func invalidated(value error) {
-    use(checked(value), mutate(&value))
-}
-
-func afterReceive(ch chan int, value error) {
-    observed := <-ch
-    _ = observed
-    use(checked(value), "constant")
-}
-
-func escaped(value error) {
-    use(publish(&value), checked(value))
-}
-
-func captured(value error) {
-    mutate := func() string { value = nil; return "mutated" }
-    use(checked(value), mutate())
-}
-"#;
-
-    #[test]
-    fn direct_result_argument_requires_a_stable_predicate_binding() {
-        let fixture = Fixture::new(
-            Language::Go,
-            &[("main.go", GO_VALIDATOR_RESULT_ARGUMENT_ORDER)],
-        );
-        let outcome = fixture.materialized(0);
-        let cancellation = CancellationToken::default();
-        let state = flow_state_for_materialized_artifact(
-            &fixture.workspace,
-            &fixture.files[0],
-            outcome.clone(),
-            &mut FlowStateRequest::new(&cancellation),
-        );
-        let artifact = outcome
-            .available_value()
-            .expect("Go semantics are available");
-
-        for (procedure_name, expected) in [
-            ("safe", Some(true)),
-            ("invalidated", None),
-            ("afterReceive", Some(true)),
-            ("escaped", None),
-            ("captured", Some(true)),
-        ] {
-            let semantics = artifact
-                .procedures()
-                .iter()
-                .find(|procedure| {
-                    procedure
-                        .locator()
-                        .declaration()
-                        .segments()
-                        .last()
-                        .and_then(|segment| segment.name())
-                        == Some(procedure_name)
-                })
-                .unwrap_or_else(|| panic!("{procedure_name} procedure"));
-            let procedure = artifact
-                .procedure_handle(semantics.id())
-                .expect("procedure handle");
-            let derivation = state
-                .procedures
-                .iter()
-                .find(|candidate| candidate.procedure == procedure.id())
-                .expect("flow-state derivation");
-            let predicate_binding = semantics
-                .values()
-                .iter()
-                .find(|value| matches!(value.kind, SemanticValueKind::Parameter { ordinal: 0, .. }))
-                .expect("predicate parameter binding")
-                .id;
-            let validator = call_handle_spelled(
-                &procedure,
-                GO_VALIDATOR_RESULT_ARGUMENT_ORDER,
-                "checked(value)",
-            );
-            let target_spelling = match procedure_name {
-                "invalidated" => "use(checked(value), mutate(&value))",
-                "escaped" => "use(publish(&value), checked(value))",
-                "captured" => "use(checked(value), mutate())",
-                "safe" | "afterReceive" => "use(checked(value), \"constant\")",
-                _ => unreachable!("the case table names every target spelling"),
-            };
-            let target = call_handle_spelled(
-                &procedure,
-                GO_VALIDATOR_RESULT_ARGUMENT_ORDER,
-                target_spelling,
-            );
-            let target_call = semantics.call_site(target.id()).expect("target call site");
-            let answer = derivation.any_normal_return_dominates_result_uses(
-                &procedure,
-                &[semantics.entry_point()],
-                &[predicate_binding],
-                std::slice::from_ref(&validator),
-                &[target_call.point],
-                &[Some(target.id())],
-            );
-            if procedure_name == "safe" {
-                assert!(
-                    derivation
-                        .any_normal_return_dominates_result_uses(
-                            &procedure,
-                            &[semantics.entry_point()],
-                            &[predicate_binding],
-                            std::slice::from_ref(&validator),
-                            &[target_call.point],
-                            &[Some(validator.id())],
-                        )
-                        .is_none(),
-                    "a call id from another invocation cannot activate the target-argument shortcut"
-                );
-            }
-            match expected {
-                Some(answer_expected) => assert_eq!(
-                    answer.as_deref(),
-                    Some([answer_expected].as_slice()),
-                    "the exact validator result orders the stable target argument"
-                ),
-                None => assert!(
-                    answer.is_none(),
-                    "a mutation or unresolved escape keeps ordering open in {procedure_name}"
-                ),
-            }
-        }
     }
 
     const SCALA_DEFERRED_TARGET_ARGUMENT_ORDER: &str = r#"
@@ -12237,6 +12729,7 @@ fn receiver_adjustment(mut receiver: Receiver, value: Option<i32>) {
 fn unrelated_adjustment(mut receiver: Receiver, value: Option<i32>) {
     use_values(checked(value), ());
     receiver.consume(false);
+    unknown_macro!();
 }
 "#;
 
@@ -12334,9 +12827,12 @@ fn unrelated_adjustment(mut receiver: Receiver, value: Option<i32>) {
                     "the unknown capture is created in the remaining target operand window"
                 );
             } else {
+                // The receiver adjustment rides on the call-target gap of the
+                // exact call (#3757), which keeps caller-side evaluation open
+                // until the call's resolution answers it.
                 assert!(semantics.gaps().iter().any(|gap| {
                     gap.point == target_call.point
-                        && gap.subject == SemanticGapSubject::Point
+                        && gap.subject == SemanticGapSubject::CallSite(target_call.id)
                         && gap.impacts.contains(SemanticGapImpact::CallEvaluation)
                 }));
             }
@@ -12408,7 +12904,15 @@ fn unrelated_adjustment(mut receiver: Receiver, value: Option<i32>) {
             RUST_OPEN_TARGET_OPERAND_ORDER,
             "use_values(checked(value), ())",
         );
+        let unrelated_macro = call_handle_spelled(
+            &procedure,
+            RUST_OPEN_TARGET_OPERAND_ORDER,
+            "unknown_macro!()",
+        );
         let target_call = semantics.call_site(target.id()).expect("target call site");
+        let unrelated_macro_call = semantics
+            .call_site(unrelated_macro.id())
+            .expect("unknown_macro!() call site");
         assert!(semantics.gaps().iter().any(|gap| {
             gap.point != target_call.point
                 && gap.subject == SemanticGapSubject::Point
@@ -12418,10 +12922,14 @@ fn unrelated_adjustment(mut receiver: Receiver, value: Option<i32>) {
             !target_call_evaluation_is_open(semantics, target_call),
             "a later call's evaluation gap must not contaminate the exact target"
         );
+        // #5267/#5239 lowered non-built-in macros as open calls with an unknown-macro gap.
         assert!(semantics.gaps().iter().any(|gap| {
-            gap.point == semantics.exceptional_exit_point()
-                && gap.subject == SemanticGapSubject::Point
-                && gap.capability == SemanticCapability::CleanupControlFlow
+            gap.point == unrelated_macro_call.point
+                && gap.subject == SemanticGapSubject::CallSite(unrelated_macro.id())
+                && gap.capability == SemanticCapability::Calls
+                && gap.kind == SemanticGapKind::Unknown
+                && gap.detail.as_ref()
+                    == "unknown macro expansion: captured tokens are not evaluated or passed as argument values"
         }));
         assert!(
             derivation
@@ -12434,7 +12942,7 @@ fn unrelated_adjustment(mut receiver: Receiver, value: Option<i32>) {
                     &[Some(target.id())],
                 )
                 .is_none(),
-            "the owned parameters' independent cleanup-control hole keeps generic dominance open"
+            "the unrelated unexpanded macro keeps generic dominance open"
         );
     }
 
@@ -12456,6 +12964,9 @@ func read(check bool, input *item, value *item) int {
 "#;
 
     #[test]
+    #[hardwon(
+        "6614ef58a7c4: optional non-dominating panic gaps before origin must not poison exact result proof"
+    )]
     fn result_guard_dominance_discharges_an_optional_gap_before_establishment() {
         let fixture = Fixture::new(
             Language::Go,
@@ -12697,6 +13208,9 @@ func earlyReturn(result *item, err error) int {
 "#;
 
     #[test]
+    #[hardwon(
+        "f4c4576aa165: a rejoining error arm must remain a bypass when proving conditional guard dominance"
+    )]
     fn rejoining_error_arm_does_not_dominate_result_use() {
         let fixture = Fixture::new(Language::Go, &[("main.go", GO_REJOINING_ERROR_ARM)]);
         let state = fixture.state(0);
@@ -12826,6 +13340,9 @@ func cyclic(result *item, err error) {
 "#;
 
     #[test]
+    #[hardwon(
+        "634e91920ec2: unreachable non-rejoining Go panics must not block a later guard-use proof"
+    )]
     fn result_guard_dominance_ignores_non_rejoining_gaps_that_cannot_reach_the_use() {
         let fixture = Fixture::new(
             Language::Go,
@@ -13254,6 +13771,9 @@ func cyclic(result *item, err error) {
 "#;
 
     #[test]
+    #[hardwon(
+        "fef1c7e37792: result proof must scope exceptional gaps to each exact use without ignoring cycles"
+    )]
     fn candidate_confinement_ignores_only_acyclic_gaps_after_each_result_use() {
         let fixture = Fixture::new(
             Language::Go,
@@ -14166,7 +14686,6 @@ func detached(helper func()) { go helper() }
 
         let empty_lookup = |coverage, call_application| ModeledCallTargetLookup {
             arms: Vec::new(),
-            adjudicable_workspace_names: Vec::new(),
             call_application,
             coverage,
         };
@@ -14213,7 +14732,6 @@ func detached(helper func()) { go helper() }
         };
         let arm_lookup = |origin, key| ModeledCallTargetLookup {
             arms: vec![crate::analyzer::usages::effects::ModeledCallTargetArm { key, origin }],
-            adjudicable_workspace_names: Vec::new(),
             call_application: ModeledCallApplication::PackageFunction,
             coverage: ModeledCallTargetCoverage::Open,
         };
@@ -14295,7 +14813,6 @@ func detached(helper func()) { go helper() }
             .expect("the fixture publishes an os.Exit call shape");
         let interrupted = ModeledCallTargetLookup {
             arms: Vec::new(),
-            adjudicable_workspace_names: Vec::new(),
             call_application: ModeledCallApplication::PackageFunction,
             coverage: ModeledCallTargetCoverage::Cancelled,
         };
@@ -14442,71 +14959,6 @@ func detached(helper func()) { go helper() }
         }
     }
 
-    const JS_PROJECTED_NONRETURN_REACHING: &str = r#"
-function abort() {}
-
-function branch(flag) {
-  const ns = {};
-  ns.value = 1;
-  if (flag) {
-    ns.value = 2;
-    abort();
-  }
-  return ns.value;
-}
-"#;
-
-    #[test]
-    fn projected_nonreturn_drives_reaching_definitions_over_the_same_mask() {
-        let fixture = Fixture::new(
-            Language::JavaScript,
-            &[("src/main.js", JS_PROJECTED_NONRETURN_REACHING)],
-        );
-        let raw = fixture.state(0);
-        let branch = procedure_containing(
-            &raw,
-            |event| matches!(&event.subject, FlowSubject::Property { member, .. } if &**member == "value"),
-        );
-        let procedure = fixture.procedure(0, branch.procedure);
-        let call = call_handle_spelled(&procedure, JS_PROJECTED_NONRETURN_REACHING, "abort()");
-        let omitted = normal_edge_for_call(&procedure, &call);
-        let projection = FlowControlProjection::new(
-            procedure.artifact().key().clone(),
-            [FlowControlEdgeOmission::new(branch.procedure, omitted)],
-        );
-        let projected = fixture.state_with_control_projection(0, &projection);
-        let projected_branch = procedure_containing(
-            &projected,
-            |event| matches!(&event.subject, FlowSubject::Property { member, .. } if &**member == "value"),
-        );
-
-        let raw_reaching = relation_spellings(
-            JS_PROJECTED_NONRETURN_REACHING,
-            branch,
-            FlowRelation::Reaching,
-        );
-        assert!(
-            raw_reaching.contains(&("ns.value = 2", "ns.value", FlowCertainty::May)),
-            "the raw rejoining branch definition reaches the return: {raw_reaching:?}"
-        );
-        let projected_reaching = relation_spellings(
-            JS_PROJECTED_NONRETURN_REACHING,
-            projected_branch,
-            FlowRelation::Reaching,
-        );
-        assert!(
-            projected_reaching.contains(&("ns.value = 1", "ns.value", FlowCertainty::Exact)),
-            "the retained definition becomes exact: {projected_reaching:?}; completeness: {:?}",
-            projected_branch.completeness
-        );
-        assert!(
-            !projected_reaching
-                .iter()
-                .any(|(source, target, _)| *source == "ns.value = 2" && *target == "ns.value"),
-            "a definition on the terminating arm cannot reach the return: {projected_reaching:?}"
-        );
-    }
-
     #[test]
     fn control_projection_validation_is_atomic_and_rejects_stale_artifacts() {
         let fixture = Fixture::new(
@@ -14622,6 +15074,9 @@ func store(target *holder) {
 "#;
 
     #[test]
+    #[hardwon(
+        "885be3d47b72: exact error-result identity must distinguish unrelated gaps from competing writes"
+    )]
     fn guard_identity_ignores_nonrejoining_and_noncompeting_assignment_gaps() {
         let fixture = Fixture::new(
             Language::Go,
@@ -14753,69 +15208,6 @@ func store(target *holder) {
         );
     }
 
-    const GO_CONTROL_GAP_AT_TARGET: &str = r#"
-package sample
-
-type item struct { value int }
-
-func read(value *item) int {
-    ready := true
-    _ = ready
-    return value.value
-}
-"#;
-
-    #[test]
-    fn retained_dominance_allows_a_control_gap_at_the_target() {
-        let fixture = Fixture::new(Language::Go, &[("main.go", GO_CONTROL_GAP_AT_TARGET)]);
-        let state = fixture.state(0);
-        let derivation = procedure_containing(
-            &state,
-            |event| matches!(&event.subject, FlowSubject::Property { member, .. } if &**member == "value"),
-        );
-        let procedure = fixture.procedure(0, derivation.procedure);
-        let candidate = derivation
-            .events
-            .iter()
-            .find(|event| {
-                event.event_class == StateEventClass::Establish
-                    && spelling(GO_CONTROL_GAP_AT_TARGET, event) == "ready := true"
-            })
-            .expect("the pre-read binding is established")
-            .point;
-        let target = derivation
-            .events
-            .iter()
-            .find(|event| {
-                event.event_class == StateEventClass::Read
-                    && matches!(&event.subject, FlowSubject::Property { member, .. } if &**member == "value")
-            })
-            .expect("the returned field is read")
-            .point;
-        let selector_gap = procedure
-            .semantics()
-            .gaps()
-            .iter()
-            .find(|gap| gap.detail.as_ref() == "selection may panic on a nil operand")
-            .expect("the selector records its independent panic gap");
-        assert_eq!(
-            selector_gap.discharge,
-            SemanticGapDischarge::NonRejoiningExceptionalExit,
-            "the Go adapter owns the non-rejoining provenance"
-        );
-        assert_eq!(
-            selector_gap.point, target,
-            "the queried read owns the point-scoped selector gap"
-        );
-        assert_eq!(
-            derivation
-                .any_candidate_dominates_targets(&procedure, &[candidate], &[target])
-                .as_deref(),
-            Some([true].as_slice()),
-            "omitted behavior from the target cannot create an entry-to-target path that bypasses an earlier candidate"
-        );
-    }
-
     const GO_UNSPECIFIED_OPERAND_ORDER: &str = r#"
 package sample
 
@@ -14902,6 +15294,9 @@ func read(value *item, replacement *item) int {
 "#;
 
     #[test]
+    #[hardwon(
+        "237bb2bb831c: operand-order uncertainty must consider only writes inside the mapped call expression"
+    )]
     fn retained_evaluation_order_checks_only_writes_inside_its_source_mapping() {
         let fixture = Fixture::new(
             Language::Go,
@@ -15051,158 +15446,6 @@ func guardedRange(values []int, target *item) int {
         );
     }
 
-    const JS_READ_BEFORE_ESTABLISHMENT: &str = r#"
-function beforeEstablishment() {
-  const ns = {};
-  const early = ns.value;
-  ns.value = 1;
-  return early;
-}
-"#;
-
-    /// The #2015 acceptance shape: a procedure whose only object is a local
-    /// plain literal used purely as a member-access base carries no lowering
-    /// gap, so every axis is covered and the missing reaching row below is a
-    /// conclusion, not an unknown.
-    const TS_READ_BEFORE_ESTABLISHMENT: &str = r#"
-function beforeEstablishment(): number | undefined {
-  const ns: { value?: number } = {};
-  const early = ns.value;
-  ns.value = 1;
-  return early;
-}
-"#;
-
-    #[test]
-    fn a_plain_object_literal_procedure_covers_every_axis() {
-        for (language, path, source) in [
-            (
-                Language::JavaScript,
-                "src/main.js",
-                JS_READ_BEFORE_ESTABLISHMENT,
-            ),
-            (
-                Language::TypeScript,
-                "src/main.ts",
-                TS_READ_BEFORE_ESTABLISHMENT,
-            ),
-        ] {
-            let fixture = Fixture::new(language, &[(path, source)]);
-            let state = fixture.state(0);
-            let derivation = procedure_containing(
-                &state,
-                |event| matches!(&event.subject, FlowSubject::Property { member, .. } if &**member == "value"),
-            );
-            assert!(
-                derivation.completeness.is_complete(),
-                "{language:?} must publish no gap for the plain-literal shape; got {:?}",
-                derivation.completeness
-            );
-            for axis in FLOW_STATE_AXES {
-                assert!(
-                    derivation.completeness.covers(*axis),
-                    "{language:?} must cover {axis:?}"
-                );
-            }
-        }
-    }
-
-    const JS_ESCAPING_OBJECT: &str = r#"
-function escapingObject(sink) {
-  const ns = {};
-  sink(ns);
-  return ns.value;
-}
-"#;
-
-    /// An object literal that escapes into a call can grow accessors behind
-    /// the lowering's back, so its accesses keep the conservative gaps and
-    /// the property and relation axes stay uncovered.
-    #[test]
-    fn an_escaping_object_literal_keeps_the_axes_uncovered() {
-        let fixture = Fixture::new(Language::JavaScript, &[("src/main.js", JS_ESCAPING_OBJECT)]);
-        let state = fixture.state(0);
-        let derivation = procedure_containing(
-            &state,
-            |event| matches!(&event.subject, FlowSubject::Property { member, .. } if &**member == "value"),
-        );
-        assert!(
-            !derivation
-                .completeness
-                .covers(FlowStateAxis::PropertyEvents),
-            "an escaping base must keep the property axis uncovered; got {:?}",
-            derivation.completeness
-        );
-        assert!(
-            !derivation
-                .completeness
-                .covers(FlowStateAxis::PropertyReachingRelation)
-        );
-    }
-
-    /// Source co-presence is not evidence: the only write to the property
-    /// follows the read on every path, so no reaching row exists for it.
-    #[test]
-    fn a_read_before_the_only_establishment_has_no_reaching_row() {
-        let fixture = Fixture::new(
-            Language::JavaScript,
-            &[("src/main.js", JS_READ_BEFORE_ESTABLISHMENT)],
-        );
-        let state = fixture.state(0);
-        let derivation = procedure_containing(
-            &state,
-            |event| matches!(&event.subject, FlowSubject::Property { member, .. } if &**member == "value"),
-        );
-        let reaching = relation_spellings(
-            JS_READ_BEFORE_ESTABLISHMENT,
-            derivation,
-            FlowRelation::Reaching,
-        );
-        assert!(
-            !reaching
-                .iter()
-                .any(|(source, target, _)| *source == "ns.value = 1" && *target == "ns.value"),
-            "the later write must not reach the earlier read; got {reaching:?}"
-        );
-    }
-
-    /// #2014: a read in return position anchors on the identifier occurrence,
-    /// not on the enclosing `return` statement, so an RQLP capture of that
-    /// identifier joins the event by `ast_id` instead of silently joining
-    /// nothing.
-    #[test]
-    fn a_return_position_read_anchors_on_the_identifier_occurrence() {
-        let fixture = Fixture::new(
-            Language::JavaScript,
-            &[("src/main.js", JS_READ_BEFORE_ESTABLISHMENT)],
-        );
-        let state = fixture.state(0);
-        let derivation = procedure_containing(&state, |event| {
-            spelling(JS_READ_BEFORE_ESTABLISHMENT, event) == "early"
-        });
-        let read = derivation
-            .events
-            .iter()
-            .find(|event| {
-                event.event_class == StateEventClass::Read
-                    && matches!(&event.subject, FlowSubject::Binding { .. })
-                    && spelling(JS_READ_BEFORE_ESTABLISHMENT, event) == "early"
-            })
-            .expect("the returned binding is read");
-        let identifier_start = JS_READ_BEFORE_ESTABLISHMENT
-            .rfind("early")
-            .expect("the fixture returns the binding");
-        assert_eq!(
-            (read.site.range.start_byte, read.site.range.end_byte),
-            (identifier_start, identifier_start + "early".len()),
-            "the read must anchor on the returned identifier, not the statement"
-        );
-        assert!(
-            read.site.ast_id.is_some(),
-            "the identifier anchor must land on a facts-arena node so the RQLP join works"
-        );
-    }
-
     const TS_CONDITIONAL_ESTABLISHMENT: &str = r#"
 function conditionalEstablishment(flag: boolean): number {
   const ns: { value?: number } = {};
@@ -15257,267 +15500,6 @@ function conditionalEstablishment(flag: boolean): number {
                 .iter()
                 .any(|(source, _, _)| *source == "ns.value = 1"),
             "a one-armed write dominates no post-join read; got {dominates:?}"
-        );
-    }
-
-    const JS_SHADOW_REBIND: &str = r#"
-function shadowRebind(flag) {
-  let value = 1;
-  if (flag) {
-    let inner = 2;
-    return inner;
-  }
-  value = 3;
-  return value;
-}
-"#;
-
-    /// A rebind emits both a kill and an establishment at its point, and the
-    /// earlier establishment does not survive it to the final read.
-    #[test]
-    fn a_rebind_emits_a_kill_and_kills_the_earlier_establishment() {
-        let fixture = Fixture::new(Language::JavaScript, &[("src/main.js", JS_SHADOW_REBIND)]);
-        let state = fixture.state(0);
-        let derivation = procedure_containing(&state, |event| {
-            spelling(JS_SHADOW_REBIND, event) == "value = 3"
-        });
-
-        let kills = derivation
-            .events
-            .iter()
-            .filter(|event| event.event_class == StateEventClass::Kill)
-            .map(|event| spelling(JS_SHADOW_REBIND, event))
-            .collect::<Vec<_>>();
-        assert!(
-            kills.contains(&"value = 3"),
-            "the rebind must emit a kill; got {kills:?}"
-        );
-        let establishes = derivation
-            .events
-            .iter()
-            .filter(|event| event.event_class == StateEventClass::Establish)
-            .map(|event| spelling(JS_SHADOW_REBIND, event))
-            .collect::<Vec<_>>();
-        assert!(
-            establishes.contains(&"value = 3"),
-            "the rebind must also establish; got {establishes:?}"
-        );
-
-        let reaching = relation_spellings(JS_SHADOW_REBIND, derivation, FlowRelation::Reaching);
-        let serving_the_final_read = reaching
-            .iter()
-            .filter(|(_, target, _)| *target == "value")
-            .collect::<Vec<_>>();
-        assert_eq!(
-            serving_the_final_read,
-            vec![&("value = 3", "value", FlowCertainty::Exact)],
-            "only the rebind may serve the final read; got {reaching:?}"
-        );
-    }
-
-    const GO_CALL_REASSIGNMENT: &str = r#"
-package sample
-
-func first() error { return nil }
-func externalCall() error { return nil }
-
-func overwrite(externalCall func() error) {
-    err := first()
-    err = externalCall()
-    if err != nil { return }
-}
-"#;
-
-    /// A scalar call assignment remains a definite binding write even when
-    /// Go's implicit conversion cannot be proven identity-preserving. The
-    /// opaque post-conversion value establishes and kills the binding, so the
-    /// earlier call result cannot reach the later guard.
-    #[test]
-    fn a_go_scalar_call_reassignment_kills_the_earlier_establishment() {
-        let fixture = Fixture::new(Language::Go, &[("main.go", GO_CALL_REASSIGNMENT)]);
-        let state = fixture.state(0);
-        let derivation = procedure_containing(&state, |event| {
-            event.event_class == StateEventClass::Establish
-                && spelling(GO_CALL_REASSIGNMENT, event) == "err = externalCall()"
-        });
-        let assignment_events = derivation
-            .events
-            .iter()
-            .filter(|event| spelling(GO_CALL_REASSIGNMENT, event) == "err = externalCall()")
-            .collect::<Vec<_>>();
-        assert!(
-            assignment_events
-                .iter()
-                .any(|event| event.event_class == StateEventClass::Establish),
-            "the call assignment must establish the binding: {assignment_events:#?}"
-        );
-        assert!(
-            assignment_events
-                .iter()
-                .any(|event| event.event_class == StateEventClass::Kill),
-            "the call assignment must kill the prior definition: {assignment_events:#?}"
-        );
-
-        let guard_read = derivation
-            .events
-            .iter()
-            .filter(|event| {
-                event.event_class == StateEventClass::Read
-                    && spelling(GO_CALL_REASSIGNMENT, event) == "err"
-            })
-            .max_by_key(|event| event.site.range.start_byte)
-            .expect("the later nil guard reads err");
-        let reaching_guard = derivation
-            .relations_of(FlowRelation::Reaching)
-            .filter(|relation| relation.target_event == guard_read.event)
-            .collect::<Vec<_>>();
-        let [reaching_guard] = reaching_guard.as_slice() else {
-            panic!("one definition must reach the later guard: {reaching_guard:#?}");
-        };
-        let reaching_source = derivation.event(reaching_guard.source_event);
-        assert_eq!(
-            spelling(GO_CALL_REASSIGNMENT, reaching_source),
-            "err = externalCall()",
-            "the earlier establishment must not survive the overwrite"
-        );
-        assert_eq!(reaching_guard.certainty, FlowCertainty::Exact);
-
-        let procedure = fixture.procedure(0, derivation.procedure);
-        let semantics = procedure.semantics();
-        let converted = semantics
-            .value(reaching_source.value)
-            .expect("the establishment carries a published value");
-        assert_eq!(
-            converted.kind,
-            SemanticValueKind::LanguageDefined("go.assignment_conversion".into()),
-            "unproved conversion must not claim raw source identity"
-        );
-        let call = call_handle_spelled(&procedure, GO_CALL_REASSIGNMENT, "externalCall()");
-        let raw_result = semantics
-            .call_site(call.id())
-            .and_then(|call| call.normal_result(0))
-            .expect("the scalar call publishes one raw normal result");
-        let conversion_sources = semantics
-            .points()
-            .iter()
-            .flat_map(|point| &point.events)
-            .filter_map(|event| match event.effect {
-                SemanticEffect::ValueFlow {
-                    kind: ValueFlowKind::LanguageDefined,
-                    source,
-                    target,
-                } if target == reaching_source.value => Some(source),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            conversion_sources,
-            vec![raw_result],
-            "the opaque assignment value must retain exact structured dependence on the raw call result"
-        );
-        assert!(semantics.points().iter().any(|point| {
-            point.events.iter().any(|event| {
-                matches!(
-                    event.effect,
-                    SemanticEffect::ValueFlow {
-                        kind: crate::analyzer::semantic::ValueFlowKind::Local,
-                        source,
-                        target,
-                    } if source == reaching_source.value
-                        && target == reaching_source.subject.value()
-                )
-            })
-        }));
-        assert!(
-            semantics
-                .gaps()
-                .iter()
-                .all(|gap| gap.capability != SemanticCapability::Values),
-            "the structured conversion dependence replaces a broad Values gap: {:#?}",
-            semantics.gaps()
-        );
-    }
-
-    const JS_SAME_ASSIGNMENT: &str = r#"
-function wrap(value) {
-  return value;
-}
-
-function sameAssignment(x) {
-  x = wrap(x);
-  return x;
-}
-"#;
-
-    /// `x = wrap(x)`: the read sits inside the evaluation of the very write
-    /// that rebinds it. The two are related as same-evaluation, and the write
-    /// does not reach its own read.
-    #[test]
-    fn a_same_assignment_write_is_same_evaluation_with_its_own_read() {
-        let fixture = Fixture::new(Language::JavaScript, &[("src/main.js", JS_SAME_ASSIGNMENT)]);
-        let state = fixture.state(0);
-        let derivation = procedure_containing(&state, |event| {
-            spelling(JS_SAME_ASSIGNMENT, event) == "x = wrap(x)"
-        });
-
-        let same = relation_spellings(JS_SAME_ASSIGNMENT, derivation, FlowRelation::SameEvaluation);
-        assert!(
-            same.contains(&("x = wrap(x)", "x", FlowCertainty::Exact)),
-            "the write and the read it consumes must be same-evaluation; got {same:?}"
-        );
-
-        let write = derivation
-            .events
-            .iter()
-            .find(|event| {
-                event.event_class == StateEventClass::Establish
-                    && spelling(JS_SAME_ASSIGNMENT, event) == "x = wrap(x)"
-            })
-            .expect("the assignment establishes the parameter binding");
-        let own_read = derivation
-            .relations_of(FlowRelation::SameEvaluation)
-            .filter(|row| row.source_event == write.event)
-            .map(|row| row.target_event)
-            .collect::<Vec<_>>();
-        assert!(!own_read.is_empty());
-        for read in own_read {
-            assert!(
-                !derivation
-                    .relations_of(FlowRelation::Reaching)
-                    .any(|row| { row.source_event == write.event && row.target_event == read }),
-                "a write must never reach a read inside its own evaluation"
-            );
-        }
-    }
-
-    const JS_NAMESPACE_SELF_ASSIGNMENT: &str = r#"
-function namespaceArtifact() {
-  const ns = {};
-  ns.a = ns;
-  return ns.a.a;
-}
-"#;
-
-    /// The `671e9b23b` shape: the namespace-assignment artifact reads the very
-    /// binding it writes into, so the two are same-evaluation.
-    #[test]
-    fn a_self_namespace_assignment_is_same_evaluation_with_its_own_read() {
-        let fixture = Fixture::new(
-            Language::JavaScript,
-            &[("src/main.js", JS_NAMESPACE_SELF_ASSIGNMENT)],
-        );
-        let state = fixture.state(0);
-        let derivation = procedure_containing(&state, |event| {
-            spelling(JS_NAMESPACE_SELF_ASSIGNMENT, event) == "ns.a = ns"
-        });
-        let same = relation_spellings(
-            JS_NAMESPACE_SELF_ASSIGNMENT,
-            derivation,
-            FlowRelation::SameEvaluation,
-        );
-        assert!(
-            same.contains(&("ns.a = ns", "ns", FlowCertainty::Exact)),
-            "the artifact write consumes its own binding read; got {same:?}"
         );
     }
 
@@ -15646,78 +15628,6 @@ func nonLocal(target *os.File, value holder) {
         );
     }
 
-    const GO_AGGREGATE_COPY_VALUE_ALIAS: &str = r#"package app
-
-type resource struct{}
-
-func copyValue() {
-    original := [1]*resource{}
-    copied := original
-    _ = copied[0]
-}
-"#;
-
-    #[test]
-    fn exact_local_value_alias_closure_keeps_go_aggregate_copy_open() {
-        let fixture = Fixture::new(
-            Language::Go,
-            &[
-                ("go.mod", GO_MOD),
-                ("app.go", GO_AGGREGATE_COPY_VALUE_ALIAS),
-            ],
-        );
-        let state = fixture.state(1);
-        let derivation = procedure_containing(&state, |event| {
-            event.event_class == StateEventClass::Establish
-                && spelling(GO_AGGREGATE_COPY_VALUE_ALIAS, event) == "original := [1]*resource{}"
-        });
-        let procedure = fixture.procedure(1, derivation.procedure);
-        let root = derivation
-            .events
-            .iter()
-            .find(|event| {
-                event.event_class == StateEventClass::Establish
-                    && spelling(GO_AGGREGATE_COPY_VALUE_ALIAS, event)
-                        == "original := [1]*resource{}"
-            })
-            .expect("the fresh array value establishes original");
-        let copied = derivation
-            .events
-            .iter()
-            .find(|event| {
-                event.event_class == StateEventClass::Establish
-                    && spelling(GO_AGGREGATE_COPY_VALUE_ALIAS, event) == "copied := original"
-            })
-            .expect("the array copy establishes its independent local");
-        let source_read = derivation
-            .events
-            .iter()
-            .find(|event| {
-                event.event_class == StateEventClass::Read
-                    && spelling(GO_AGGREGATE_COPY_VALUE_ALIAS, event) == "original"
-            })
-            .expect("the aggregate copy retains its ordinary source read");
-
-        let closure = derivation
-            .exact_local_value_alias_closure(&procedure, std::slice::from_ref(&root.event));
-        assert!(
-            closure.reads.contains(&source_read.event),
-            "AggregateCopy remains ordinary exact data dependence"
-        );
-        assert!(
-            !closure.establishments.contains(&copied.event),
-            "independent array storage is not promoted as exact resource identity"
-        );
-        assert!(
-            closure.unclosed_transfers.contains(&source_read.event),
-            "the copied array remains a candidate-scoped identity frontier"
-        );
-        assert!(
-            !closure.proof_open,
-            "the structured closure itself remains available"
-        );
-    }
-
     const GO_ASSIGNMENT_CONVERSION_ALIAS: &str = r#"package app
 
 type resource struct{}
@@ -15831,185 +15741,6 @@ func conversionAlias(acquire func() *resource) any {
         );
     }
 
-    const GO_MAY_ASSIGNMENT_CONVERSION_ALIAS: &str = r#"package app
-
-type resource struct{}
-
-func acquire() *resource { return nil }
-
-func mayConversionAlias(change bool, acquire func() *resource) any {
-	source := acquire()
-	if change {
-		source = nil
-	}
-	var converted any = source
-	return converted
-}
-"#;
-
-    #[test]
-    fn exact_local_value_alias_closure_keeps_may_go_assignment_conversion_uncertain() {
-        let fixture = Fixture::new(
-            Language::Go,
-            &[
-                ("go.mod", GO_MOD),
-                ("app.go", GO_MAY_ASSIGNMENT_CONVERSION_ALIAS),
-            ],
-        );
-        let state = fixture.state(1);
-        let derivation = procedure_containing(&state, |event| {
-            event.event_class == StateEventClass::Establish
-                && spelling(GO_MAY_ASSIGNMENT_CONVERSION_ALIAS, event) == "source := acquire()"
-        });
-        let procedure = fixture.procedure(1, derivation.procedure);
-        let root = derivation
-            .events
-            .iter()
-            .find(|event| {
-                event.event_class == StateEventClass::Establish
-                    && spelling(GO_MAY_ASSIGNMENT_CONVERSION_ALIAS, event) == "source := acquire()"
-            })
-            .expect("the acquired value establishes source");
-        let conversion = derivation
-            .events
-            .iter()
-            .find(|event| {
-                event.event_class == StateEventClass::Establish
-                    && spelling(GO_MAY_ASSIGNMENT_CONVERSION_ALIAS, event)
-                        == "converted any = source"
-            })
-            .expect("the converted value establishes its typed local");
-        let conversion_source = procedure
-            .semantics()
-            .points()
-            .iter()
-            .flat_map(|point| &point.events)
-            .find_map(|event| match event.effect {
-                SemanticEffect::ValueFlow {
-                    kind: ValueFlowKind::LanguageDefined,
-                    source,
-                    target,
-                } if target == conversion.value => Some(source),
-                _ => None,
-            })
-            .expect("the typed initializer has an explicit assignment conversion");
-        let conversion_source_read = derivation
-            .events
-            .iter()
-            .find(|event| {
-                event.event_class == StateEventClass::Read && event.value == conversion_source
-            })
-            .expect("the typed conversion reads source after the conditional replacement");
-
-        let closure = derivation.exact_local_value_alias_closure(&procedure, &[root.event]);
-        assert!(
-            closure
-                .uncertain_reads
-                .contains(&conversion_source_read.event),
-            "the original establishment may reach the conversion read"
-        );
-        assert!(
-            closure
-                .uncertain_transfers
-                .contains(&conversion_source_read.event),
-            "a May-reaching assignment conversion remains an uncertain identity transfer"
-        );
-    }
-
-    const JS_MAY_LOCAL_VALUE_ALIAS: &str = r#"
-function mayAlias(change, replacement) {
-  let value = 1;
-  if (change) {
-    value = replacement;
-  }
-  const alias = value;
-  return alias;
-}
-"#;
-
-    #[test]
-    fn exact_local_value_alias_closure_does_not_promote_a_may_transfer() {
-        let fixture = Fixture::new(
-            Language::JavaScript,
-            &[("src/main.js", JS_MAY_LOCAL_VALUE_ALIAS)],
-        );
-        let state = fixture.state(0);
-        let derivation = procedure_containing(&state, |event| {
-            spelling(JS_MAY_LOCAL_VALUE_ALIAS, event) == "value = 1"
-        });
-        let procedure = fixture.procedure(0, derivation.procedure);
-        let roots = derivation
-            .events
-            .iter()
-            .filter(|event| {
-                event.event_class == StateEventClass::Establish
-                    && spelling(JS_MAY_LOCAL_VALUE_ALIAS, event) == "value = 1"
-            })
-            .map(|event| event.event)
-            .collect::<Vec<_>>();
-        assert_eq!(roots.len(), 1, "one candidate establishment");
-
-        let closure = derivation.exact_local_value_alias_closure(&procedure, &roots);
-        assert_eq!(
-            closure.establishments.len(),
-            1,
-            "a May-reaching source cannot establish an exact alias"
-        );
-        assert!(
-            !closure.uncertain_transfers.is_empty(),
-            "the candidate transfer remains explicitly open"
-        );
-    }
-
-    const RUST_SCOPED_LOCAL_FLOW_GAP: &str = r#"
-fn scoped_local_flow_gap() -> i32 {
-    let value = 1;
-    let (alias,) = (value,);
-    alias
-}
-"#;
-
-    #[test]
-    fn exact_local_value_alias_closure_keeps_a_scoped_local_flow_gap_open() {
-        let fixture = Fixture::new(
-            Language::Rust,
-            &[("src/lib.rs", RUST_SCOPED_LOCAL_FLOW_GAP)],
-        );
-        let state = fixture.state(0);
-        let derivation = procedure_containing(&state, |event| {
-            event.event_class == StateEventClass::Establish
-        });
-        let procedure = fixture.procedure(0, derivation.procedure);
-        let root = derivation
-            .events
-            .iter()
-            .filter(|event| event.event_class == StateEventClass::Establish)
-            .min_by_key(|event| event.site.range.start_byte)
-            .expect("the plain local is established");
-
-        let closure = derivation.exact_local_value_alias_closure(&procedure, &[root.event]);
-        assert_eq!(
-            closure.establishments.len(),
-            1,
-            "destructuring is not promoted to an exact alias"
-        );
-        assert!(
-            !closure.unclosed_transfers.is_empty(),
-            "the declaratively same-evaluation-blocking LocalFlow gap stays open"
-        );
-    }
-
-    const GO_RANGE_SELF_BINDER: &str = r#"package app
-
-func rangeSelfBinder(x []int) int {
-	total := 0
-	for x := range x {
-		total += x
-	}
-	return total
-}
-"#;
-
     const GO_TYPED_ZERO_BINDINGS: &str = r#"package app
 
 func reported(flag bool) error {
@@ -16108,48 +15839,1422 @@ func reported(flag bool) error {
         );
     }
 
-    /// The `edb00e017` shape, positive since #2013. The Go lowering publishes
-    /// an establishment for the `:=` range binder whose value is derived from
-    /// the iterable, so the outer `x` read of the binder's own right-hand side
-    /// relates to it as same-evaluation, and the compound write consumes its
-    /// operand reads the same way. The binding-events axis is fully
-    /// enumerated; the same-evaluation axis stays uncovered because the range
-    /// mechanics honestly publish a `Calls` gap.
     #[test]
-    fn the_go_range_self_binder_establishes_and_relates_as_same_evaluation() {
+    fn materialized_procedure_scope_skips_unrelated_flow_derivations() {
         let fixture = Fixture::new(
             Language::Go,
-            &[("go.mod", GO_MOD), ("app.go", GO_RANGE_SELF_BINDER)],
+            &[(
+                "main.go",
+                r#"package sample
+
+func first(input int) int {
+    value := input
+    return value
+}
+
+func second(input int) int {
+    value := input
+    return value
+}
+"#,
+            )],
+        );
+        let outcome = fixture.materialized(0);
+        let artifact = outcome
+            .available_value()
+            .cloned()
+            .expect("Go semantics are available");
+        let cancellation = CancellationToken::default();
+        let full = flow_state_for_materialized_artifact(
+            &fixture.workspace,
+            &fixture.files[0],
+            outcome.clone(),
+            &mut FlowStateRequest::new(&cancellation),
+        );
+        assert!(
+            full.procedures.len() >= 2,
+            "both functions derive: {full:#?}"
+        );
+
+        let selected = &full.procedures[1];
+        let procedure = artifact
+            .procedure_handle(selected.procedure)
+            .expect("the artifact owns the selected procedure");
+        let scoped = flow_state_for_materialized_procedure(
+            &fixture.workspace,
+            &fixture.files[0],
+            outcome,
+            &procedure,
+            &mut FlowStateRequest::new(&cancellation),
+        );
+
+        let [derived] = scoped.procedures.as_slice() else {
+            panic!("only the selected procedure derives: {scoped:#?}");
+        };
+        assert_eq!(derived.procedure, selected.procedure);
+        assert_eq!(derived.events, selected.events);
+        assert_eq!(derived.relations, selected.relations);
+        assert_eq!(derived.completeness, selected.completeness);
+        assert_eq!(scoped.completeness, full.completeness);
+        assert_eq!(scoped.generation, full.generation);
+        assert_eq!(scoped.active_model_set_hash(), full.active_model_set_hash());
+    }
+
+    #[test]
+    #[hardwon(
+        "3ac44dca99bb: unresolved property access was treated as a complete Go base observation"
+    )]
+    fn retained_unresolved_property_access_does_not_open_base_observation_enumeration() {
+        let fixture = Fixture::new(
+            Language::Go,
+            &[("main.go", GO_UNRESOLVED_IMPORTED_FIELD_ACCESS)],
+        );
+        let outcome = fixture.materialized(0);
+        let cancellation = CancellationToken::default();
+        let state = flow_state_for_materialized_artifact(
+            &fixture.workspace,
+            &fixture.files[0],
+            outcome.clone(),
+            &mut FlowStateRequest::new(&cancellation),
+        );
+        let artifact = outcome
+            .available_value()
+            .expect("Go semantics are available");
+        let procedure = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .gaps()
+                    .iter()
+                    .filter(|gap| {
+                        gap.capability == SemanticCapability::FieldMemory
+                            && matches!(gap.subject, SemanticGapSubject::MemoryLocation(_))
+                    })
+                    .count()
+                    >= 2
+            })
+            .expect("the imported field accesses belong to one lowered procedure");
+        let load_gap = procedure
+            .gaps()
+            .iter()
+            .find(|gap| {
+                let SemanticGapSubject::MemoryLocation(location) = gap.subject else {
+                    return false;
+                };
+                gap.capability == SemanticCapability::FieldMemory
+                    && procedure.point(gap.point).is_some_and(|point| {
+                        point.events.iter().any(|event| {
+                            matches!(
+                                event.effect,
+                                SemanticEffect::MemoryLoad {
+                                    location: accessed,
+                                    ..
+                                } if accessed == location
+                            )
+                        })
+                    })
+            })
+            .expect("the imported field load has unresolved declaration identity");
+        let SemanticGapSubject::MemoryLocation(load_location) = load_gap.subject else {
+            unreachable!("the selected gap has a memory-location subject");
+        };
+        let base = match procedure
+            .memory_location(load_location)
+            .expect("the gap names a retained memory location")
+            .kind
+        {
+            MemoryLocationKind::Field { base, .. } => base,
+            ref kind => panic!("the imported selector must name a field, got {kind:?}"),
+        };
+        let relevant_values = std::iter::once(base).collect::<HashSet<_>>();
+        let derivation = state
+            .procedures
+            .iter()
+            .find(|derivation| derivation.procedure == procedure.id())
+            .expect("the imported field access has retained flow state");
+        let retained_read_values = derivation
+            .events
+            .iter()
+            .filter(|event| event.event_class == StateEventClass::Read)
+            .map(|event| event.value)
+            .collect::<HashSet<_>>();
+        let origins = [procedure.entry_point()];
+
+        assert!(gap_point_retains_memory_access(
+            procedure,
+            load_gap,
+            load_location
+        ));
+        assert!(
+            retained_read_values.contains(&base),
+            "the imported selector retains a read of its base value"
+        );
+        assert!(
+            !result_observation_gap_is_relevant(
+                procedure,
+                load_gap,
+                &relevant_values,
+                &retained_read_values,
+                &origins,
+            ),
+            "unresolved property identity cannot hide the retained observation of its base"
+        );
+
+        let no_base_read = HashSet::default();
+        assert!(
+            result_observation_gap_is_relevant(
+                procedure,
+                load_gap,
+                &relevant_values,
+                &no_base_read,
+                &origins,
+            ),
+            "a same-point access without a retained base read must keep enumeration open"
+        );
+
+        let mut no_access = load_gap.clone();
+        no_access.point = procedure.entry_point();
+        assert_ne!(no_access.point, load_gap.point);
+        assert!(!gap_point_retains_memory_access(
+            procedure,
+            &no_access,
+            load_location
+        ));
+        assert!(
+            result_observation_gap_is_relevant(
+                procedure,
+                &no_access,
+                &relevant_values,
+                &retained_read_values,
+                &origins,
+            ),
+            "a location gap without its exact retained access must keep enumeration open"
+        );
+
+        let store_gap = procedure
+            .gaps()
+            .iter()
+            .find(|gap| {
+                let SemanticGapSubject::MemoryLocation(location) = gap.subject else {
+                    return false;
+                };
+                gap.capability == SemanticCapability::FieldMemory
+                    && procedure.point(gap.point).is_some_and(|point| {
+                        point.events.iter().any(|event| {
+                            matches!(
+                                event.effect,
+                                SemanticEffect::MemoryStore {
+                                    location: accessed,
+                                    ..
+                                } if accessed == location
+                            )
+                        })
+                    })
+            })
+            .expect("the imported field store has unresolved declaration identity");
+        let SemanticGapSubject::MemoryLocation(store_location) = store_gap.subject else {
+            unreachable!("the selected gap has a memory-location subject");
+        };
+        let stored_value = procedure
+            .point(store_gap.point)
+            .into_iter()
+            .flat_map(|point| &point.events)
+            .find_map(|event| match event.effect {
+                SemanticEffect::MemoryStore {
+                    location, value, ..
+                } if location == store_location => Some(value),
+                _ => None,
+            })
+            .expect("the store gap point retains the exact stored value");
+        let stored_sources = procedure
+            .point(store_gap.point)
+            .into_iter()
+            .flat_map(|point| &point.events)
+            .filter_map(|event| match event.effect {
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::LanguageDefined,
+                    source,
+                    target,
+                } if target == stored_value
+                    && procedure.value(target).is_some_and(|value| {
+                        matches!(
+                            &value.kind,
+                            SemanticValueKind::LanguageDefined(kind)
+                                if kind.as_ref() == "go.assignment_conversion"
+                        )
+                    }) =>
+                {
+                    Some(source)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [stored_source] = stored_sources.as_slice() else {
+            panic!(
+                "the stored value has one exact assignment-conversion source: {stored_sources:?}"
+            )
+        };
+        let root = derivation
+            .events
+            .iter()
+            .find(|event| {
+                event.event_class == StateEventClass::Establish
+                    && spelling(GO_UNRESOLVED_IMPORTED_FIELD_ACCESS, event)
+                        == "parsed, _ := url.Parse(raw)"
+            })
+            .expect("the parsed URL result has one exact establishment");
+        let procedure_handle = artifact
+            .procedure_handle(procedure.id())
+            .expect("the materialized artifact owns the selected procedure");
+        let closure = derivation
+            .exact_local_value_alias_closure(&procedure_handle, std::slice::from_ref(&root.event));
+        let load_base_read = closure
+            .reads
+            .iter()
+            .copied()
+            .find(|event| derivation.event(*event).value == base)
+            .expect("the exact closure reaches the retained selector-base read");
+        let stored_source_read = closure
+            .reads
+            .iter()
+            .copied()
+            .find(|event| derivation.event(*event).value == *stored_source)
+            .expect("the exact closure reaches the retained conversion-source read");
+        assert_ne!(load_base_read, stored_source_read);
+        assert!(
+            !closure.unclosed_transfers.contains(&load_base_read),
+            "a retained field load completely represents its base observation"
+        );
+        assert!(
+            closure.unclosed_transfers.contains(&stored_source_read),
+            "a value stored into unresolved memory remains an unclosed transfer"
+        );
+        assert_eq!(
+            closure.unclosed_transfers,
+            std::iter::once(stored_source_read).collect::<HashSet<_>>(),
+            "only the unresolved store remains open"
+        );
+    }
+
+    #[test]
+    fn overwritten_unread_local_consumes_the_shared_cfg_budget() {
+        let fixture = Fixture::new(
+            Language::Java,
+            &[("src/Sample.java", JAVA_OVERWRITTEN_UNREAD)],
+        );
+        let state = fixture.state(0);
+        let first_write = JAVA_OVERWRITTEN_UNREAD
+            .find("x = 1;")
+            .expect("first write exists");
+        let derivation = state
+            .procedures
+            .iter()
+            .find(|derivation| {
+                derivation.events.iter().any(|event| {
+                    event.event_class == StateEventClass::Establish
+                        && event.site.range.start_byte == first_write
+                })
+            })
+            .expect("clean method has an establishment");
+        let first = derivation
+            .events
+            .iter()
+            .find(|event| event.site.range.start_byte == first_write)
+            .expect("first establishment exists");
+        let procedure = fixture.procedure(0, derivation.procedure);
+        let cancellation = CancellationToken::default();
+        let mut request = FlowStateRequest::new(&cancellation);
+        request.cfg_budget = CfgAlgorithmBudget::uniform(1);
+        assert!(matches!(
+            derivation.overwritten_unread_local(&procedure, first.event, &mut request),
+            OverwrittenUnreadAnswer::Open { reasons }
+                if reasons.iter().any(|reason| matches!(
+                    reason,
+                    FlowStateIncompleteReason::BudgetExhausted {
+                        axis: FlowStateAxis::ReachingRelation,
+                        ..
+                    }
+                ))
+        ));
+        let cancelled = CancellationToken::default();
+        cancelled.cancel();
+        assert!(matches!(
+            derivation.overwritten_unread_local(
+                &procedure,
+                first.event,
+                &mut FlowStateRequest::new(&cancelled)
+            ),
+            OverwrittenUnreadAnswer::Open { reasons }
+                if reasons.contains(&FlowStateIncompleteReason::Cancelled)
+        ));
+    }
+
+    #[test]
+    #[hardwon(
+        "661a63f06f4c: mutable Python capture was misclassified as an established binding read"
+    )]
+    fn mutable_python_capture_does_not_expose_a_provable_binding_read() {
+        const SOURCE: &str = r#"
+def outer():
+    x = 1
+    def inner():
+        nonlocal x
+        x = 2
+    inner()
+    x = x
+    return x
+"#;
+        let fixture = Fixture::new(Language::Python, &[("src/main.py", SOURCE)]);
+        let state = fixture.state(0);
+        let read_at = SOURCE.find("x = x").expect("self assignment exists") + 4;
+        assert!(
+            state
+                .procedures
+                .iter()
+                .flat_map(|derivation| &derivation.events)
+                .all(|event| event.event_class != StateEventClass::Read
+                    || event.site.range.start_byte != read_at)
+        );
+        assert!(state.procedures.iter().any(|derivation| {
+            derivation.completeness.reasons().iter().any(|reason| {
+                matches!(
+                    reason,
+                    FlowStateIncompleteReason::LoweringGap {
+                        capability: SemanticCapability::Captures,
+                        ..
+                    }
+                )
+            })
+        }));
+    }
+
+    #[test]
+    fn exhausted_cfg_budget_keeps_binding_initialization_open() {
+        let fixture = Fixture::new(
+            Language::Java,
+            &[("src/Sample.java", JAVA_BINDING_INITIALIZATION)],
+        );
+        let state = fixture.state_with_budget(0, CfgAlgorithmBudget::uniform(1));
+        let read_at = JAVA_BINDING_INITIALIZATION
+            .find("x = x;")
+            .expect("self assignment exists")
+            + 4;
+        let (derivation, read) = state
+            .procedures
+            .iter()
+            .find_map(|derivation| {
+                derivation.events.iter().find_map(|event| {
+                    (event.event_class == StateEventClass::Read
+                        && event.site.range.start_byte == read_at)
+                        .then_some((derivation, event.event))
+                })
+            })
+            .expect("the self-assignment RHS is a projected binding read");
+        let procedure = fixture.procedure(0, derivation.procedure);
+        assert!(matches!(
+            derivation.binding_initialization_at_read(&procedure, read),
+            BindingInitializationAnswer::Open { reasons }
+                if reasons.iter().any(|reason| matches!(
+                    reason,
+                    FlowStateIncompleteReason::BudgetExhausted { .. }
+                ))
+        ));
+    }
+
+    /// The selected analysis and public event projection evolve separately:
+    /// endpoint loss, cancellation and CFG limits must never turn into a
+    /// complete empty selected answer.
+    #[test]
+    fn selected_property_preserves_endpoint_and_request_failures() {
+        let fixture = Fixture::new(
+            Language::JavaScript,
+            &[("src/main.js", JS_READ_AFTER_ESTABLISHMENT)],
+        );
+        let outcome = fixture.materialized(0);
+        let artifact = outcome.available_value().cloned().expect("JS artifact");
+        let token = CancellationToken::default();
+        let state = flow_state_for_materialized_artifact(
+            &fixture.workspace,
+            &fixture.files[0],
+            outcome,
+            &mut FlowStateRequest::new(&token),
+        );
+        let (index, read) = state.procedures.iter().enumerate().find_map(|(index, row)| {
+            row.events.iter().find(|event| event.event_class == StateEventClass::Read
+                && matches!(&event.subject, FlowSubject::Property { member, .. } if member.as_ref() == "value"))
+                .map(|event| (index, event.event))
+        }).expect("property read");
+        let procedure = artifact
+            .procedure_handle(state.procedures[index].procedure)
+            .expect("procedure");
+        let point = state.procedures[index].events[read].point;
+        let selected = flow_state_for_selected_property(
+            &fixture.workspace,
+            &fixture.files[0],
+            &state,
+            &procedure,
+            point,
+            &mut FlowStateRequest::new(&token),
+        );
+        assert!(
+            selected.procedures[0]
+                .completeness
+                .covers(FlowStateAxis::PropertyReachingRelation),
+            "baseline selected proof: {selected:?}"
+        );
+        assert!(!selected.procedures[0].relations.is_empty());
+        let mut budget = SemanticBudget::default();
+        let outcome = fixture
+            .workspace
+            .semantic_oracle_provider()
+            .procedure_relations(
+                &procedure,
+                &OracleCallContext::empty(),
+                &mut SemanticRequest::new(&mut budget, &token),
+            )
+            .expect("published relation snapshot");
+        let snapshot = outcome.available_value().expect("available snapshot");
+        let store = snapshot
+            .relations()
+            .iter()
+            .find(|relation| {
+                relation.kind == crate::analyzer::semantic::ValueFlowRelationKind::MemoryStore
+            })
+            .expect("fixture store");
+        let omitted_key = (store.point.id(), store.event_index);
+        let retained = snapshot
+            .relations()
+            .iter()
+            .filter(|relation| {
+                relation.kind != crate::analyzer::semantic::ValueFlowRelationKind::MemoryStore
+            })
+            .cloned()
+            .collect();
+        let damaged = crate::analyzer::semantic::ValueFlowSnapshot::with_discharged_gaps(
+            procedure.clone(),
+            OracleCallContext::empty(),
+            retained,
+            CandidateCoverage::Exhaustive,
+            crate::analyzer::semantic::OracleLimits::default(),
+            procedure
+                .semantics()
+                .gaps()
+                .iter()
+                .filter(|gap| snapshot.gap_is_discharged(gap.id))
+                .map(|gap| gap.id)
+                .collect(),
+        )
+        .expect("retained rows still satisfy the oracle relation contract");
+        let selected = crate::analyzer::semantic::derive_selected_property_reaching_over_graph(
+            &damaged,
+            procedure.semantics(),
+            procedure.semantics().entry_point(),
+            point,
+            PropertyReachingLimits::default(),
+            &token,
+        );
+        assert!(!selected.is_complete(), "omitted IR store: {selected:?}");
+        assert!(selected.incomplete_reasons().iter().any(|reason|
+            matches!(reason, PropertyReachingIncompleteReason::SelectedRelationEndpointUnavailable {
+                point, event_index, relation: crate::analyzer::semantic::ValueFlowRelationKind::MemoryStore, ..
+            } if (*point, *event_index) == omitted_key)), "exact omitted key: {selected:?}");
+        let selected = crate::analyzer::semantic::derive_selected_property_reaching_over_graph(
+            snapshot,
+            procedure.semantics(),
+            procedure.semantics().entry_point(),
+            point,
+            PropertyReachingLimits {
+                max_input_relations: 0,
+                ..PropertyReachingLimits::default()
+            },
+            &token,
+        );
+        assert!(!selected.is_complete(), "input frontier: {selected:?}");
+        assert!(selected.incomplete_reasons().iter().any(|reason| matches!(
+            reason,
+            PropertyReachingIncompleteReason::InputRelationBudgetExceeded { limit: 0, .. }
+        )));
+        let mut missing = state.clone();
+        // Keep the parallel join keys intact, but remove the endpoint's
+        // property presentation. This models independently failed projection.
+        missing.procedures[index].events[read].subject = FlowSubject::Binding {
+            value: state.procedures[index].events[read].value,
+        };
+        let selected = flow_state_for_selected_property(
+            &fixture.workspace,
+            &fixture.files[0],
+            &missing,
+            &procedure,
+            point,
+            &mut FlowStateRequest::new(&token),
+        );
+        assert!(selected.completeness.reasons().iter().any(|reason|
+            matches!(reason, FlowStateIncompleteReason::SelectedPropertyEndpointUnavailable { point: missing, .. } if *missing == point)));
+        assert!(
+            !selected
+                .completeness
+                .covers(FlowStateAxis::PropertyReachingRelation)
+        );
+        let mut limited = FlowStateRequest::new(&token);
+        limited.cfg_budget = CfgAlgorithmBudget::uniform(0);
+        let selected = flow_state_for_selected_property(
+            &fixture.workspace,
+            &fixture.files[0],
+            &state,
+            &procedure,
+            point,
+            &mut limited,
+        );
+        assert!(
+            !selected
+                .completeness
+                .covers(FlowStateAxis::PropertyReachingRelation),
+            "budget: {selected:?}"
+        );
+        let cancelled = CancellationToken::default();
+        cancelled.cancel();
+        let selected = flow_state_for_selected_property(
+            &fixture.workspace,
+            &fixture.files[0],
+            &state,
+            &procedure,
+            point,
+            &mut FlowStateRequest::new(&cancelled),
+        );
+        assert!(
+            !selected
+                .completeness
+                .covers(FlowStateAxis::PropertyReachingRelation),
+            "cancelled: {selected:?}"
+        );
+    }
+
+    #[test]
+    fn a_read_after_an_establishment_reaches_exactly_and_is_dominated() {
+        let fixture = Fixture::new(
+            Language::JavaScript,
+            &[("src/main.js", JS_READ_AFTER_ESTABLISHMENT)],
+        );
+        let state = fixture.state(0);
+        let derivation = procedure_containing(
+            &state,
+            |event| matches!(&event.subject, FlowSubject::Property { member, .. } if &**member == "value"),
+        );
+        assert!(
+            derivation.events.iter().all(|event| {
+                event.event_class != StateEventClass::Kill
+                    || !matches!(&event.subject, FlowSubject::Property { .. })
+            }),
+            "a single structured property store must not manufacture a kill"
+        );
+
+        let reaching = relation_spellings(
+            JS_READ_AFTER_ESTABLISHMENT,
+            derivation,
+            FlowRelation::Reaching,
+        );
+        assert!(
+            reaching.contains(&("ns.value = 1", "ns.value", FlowCertainty::Exact)),
+            "expected an exact reaching row for the property; got {reaching:?}"
+        );
+
+        let dominates = relation_spellings(
+            JS_READ_AFTER_ESTABLISHMENT,
+            derivation,
+            FlowRelation::Dominates,
+        );
+        assert!(
+            dominates.contains(&("ns.value = 1", "ns.value", FlowCertainty::Exact)),
+            "expected a dominance row for the property; got {dominates:?}"
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "5c5d4e214494: an operation precondition was inferred without a stable predicate binding"
+    )]
+    fn direct_result_argument_requires_a_stable_predicate_binding() {
+        let fixture = Fixture::new(
+            Language::Go,
+            &[("main.go", GO_VALIDATOR_RESULT_ARGUMENT_ORDER)],
+        );
+        let outcome = fixture.materialized(0);
+        let cancellation = CancellationToken::default();
+        let state = flow_state_for_materialized_artifact(
+            &fixture.workspace,
+            &fixture.files[0],
+            outcome.clone(),
+            &mut FlowStateRequest::new(&cancellation),
+        );
+        let artifact = outcome
+            .available_value()
+            .expect("Go semantics are available");
+
+        for (procedure_name, expected) in [
+            ("safe", Some(true)),
+            ("invalidated", None),
+            ("afterReceive", Some(true)),
+            ("escaped", None),
+            ("captured", Some(true)),
+        ] {
+            let semantics = artifact
+                .procedures()
+                .iter()
+                .find(|procedure| {
+                    procedure
+                        .locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some(procedure_name)
+                })
+                .unwrap_or_else(|| panic!("{procedure_name} procedure"));
+            let procedure = artifact
+                .procedure_handle(semantics.id())
+                .expect("procedure handle");
+            let derivation = state
+                .procedures
+                .iter()
+                .find(|candidate| candidate.procedure == procedure.id())
+                .expect("flow-state derivation");
+            let predicate_binding = semantics
+                .values()
+                .iter()
+                .find(|value| matches!(value.kind, SemanticValueKind::Parameter { ordinal: 0, .. }))
+                .expect("predicate parameter binding")
+                .id;
+            let validator = call_handle_spelled(
+                &procedure,
+                GO_VALIDATOR_RESULT_ARGUMENT_ORDER,
+                "checked(value)",
+            );
+            let target_spelling = match procedure_name {
+                "invalidated" => "use(checked(value), mutate(&value))",
+                "escaped" => "use(publish(&value), checked(value))",
+                "captured" => "use(checked(value), mutate())",
+                "safe" | "afterReceive" => "use(checked(value), \"constant\")",
+                _ => unreachable!("the case table names every target spelling"),
+            };
+            let target = call_handle_spelled(
+                &procedure,
+                GO_VALIDATOR_RESULT_ARGUMENT_ORDER,
+                target_spelling,
+            );
+            let target_call = semantics.call_site(target.id()).expect("target call site");
+            let answer = derivation.any_normal_return_dominates_result_uses(
+                &procedure,
+                &[semantics.entry_point()],
+                &[predicate_binding],
+                std::slice::from_ref(&validator),
+                &[target_call.point],
+                &[Some(target.id())],
+            );
+            if procedure_name == "safe" {
+                assert!(
+                    derivation
+                        .any_normal_return_dominates_result_uses(
+                            &procedure,
+                            &[semantics.entry_point()],
+                            &[predicate_binding],
+                            std::slice::from_ref(&validator),
+                            &[target_call.point],
+                            &[Some(validator.id())],
+                        )
+                        .is_none(),
+                    "a call id from another invocation cannot activate the target-argument shortcut"
+                );
+            }
+            match expected {
+                Some(answer_expected) => assert_eq!(
+                    answer.as_deref(),
+                    Some([answer_expected].as_slice()),
+                    "the exact validator result orders the stable target argument"
+                ),
+                None => assert!(
+                    answer.is_none(),
+                    "a mutation or unresolved escape keeps ordering open in {procedure_name}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn projected_nonreturn_drives_reaching_definitions_over_the_same_mask() {
+        let fixture = Fixture::new(
+            Language::JavaScript,
+            &[("src/main.js", JS_PROJECTED_NONRETURN_REACHING)],
+        );
+        let raw = fixture.state(0);
+        let branch = procedure_containing(
+            &raw,
+            |event| matches!(&event.subject, FlowSubject::Property { member, .. } if &**member == "value"),
+        );
+        let procedure = fixture.procedure(0, branch.procedure);
+        let call = call_handle_spelled(&procedure, JS_PROJECTED_NONRETURN_REACHING, "abort()");
+        let omitted = normal_edge_for_call(&procedure, &call);
+        let projection = FlowControlProjection::new(
+            procedure.artifact().key().clone(),
+            [FlowControlEdgeOmission::new(branch.procedure, omitted)],
+        );
+        let projected = fixture.state_with_control_projection(0, &projection);
+        let projected_branch = procedure_containing(
+            &projected,
+            |event| matches!(&event.subject, FlowSubject::Property { member, .. } if &**member == "value"),
+        );
+
+        let raw_reaching = relation_spellings(
+            JS_PROJECTED_NONRETURN_REACHING,
+            branch,
+            FlowRelation::Reaching,
+        );
+        assert!(
+            raw_reaching.contains(&("ns.value = 2", "ns.value", FlowCertainty::May)),
+            "the raw rejoining branch definition reaches the return: {raw_reaching:?}"
+        );
+        let projected_reaching = relation_spellings(
+            JS_PROJECTED_NONRETURN_REACHING,
+            projected_branch,
+            FlowRelation::Reaching,
+        );
+        assert!(
+            projected_reaching.contains(&("ns.value = 1", "ns.value", FlowCertainty::Exact)),
+            "the retained definition becomes exact: {projected_reaching:?}; completeness: {:?}",
+            projected_branch.completeness
+        );
+        assert!(
+            !projected_reaching
+                .iter()
+                .any(|(source, target, _)| *source == "ns.value = 2" && *target == "ns.value"),
+            "a definition on the terminating arm cannot reach the return: {projected_reaching:?}"
+        );
+    }
+
+    #[test]
+    fn retained_dominance_allows_a_control_gap_at_the_target() {
+        let fixture = Fixture::new(Language::Go, &[("main.go", GO_CONTROL_GAP_AT_TARGET)]);
+        let state = fixture.state(0);
+        let derivation = procedure_containing(
+            &state,
+            |event| matches!(&event.subject, FlowSubject::Property { member, .. } if &**member == "value"),
+        );
+        let procedure = fixture.procedure(0, derivation.procedure);
+        let candidate = derivation
+            .events
+            .iter()
+            .find(|event| {
+                event.event_class == StateEventClass::Establish
+                    && spelling(GO_CONTROL_GAP_AT_TARGET, event) == "ready := true"
+            })
+            .expect("the pre-read binding is established")
+            .point;
+        let target = derivation
+            .events
+            .iter()
+            .find(|event| {
+                event.event_class == StateEventClass::Read
+                    && matches!(&event.subject, FlowSubject::Property { member, .. } if &**member == "value")
+            })
+            .expect("the returned field is read")
+            .point;
+        let selector_gap = procedure
+            .semantics()
+            .gaps()
+            .iter()
+            .find(|gap| gap.detail.as_ref() == "selection may panic on a nil operand")
+            .expect("the selector records its independent panic gap");
+        assert_eq!(
+            selector_gap.discharge,
+            SemanticGapDischarge::NonRejoiningExceptionalExit,
+            "the Go adapter owns the non-rejoining provenance"
+        );
+        assert_eq!(
+            selector_gap.point, target,
+            "the queried read owns the point-scoped selector gap"
+        );
+        assert_eq!(
+            derivation
+                .any_candidate_dominates_targets(&procedure, &[candidate], &[target])
+                .as_deref(),
+            Some([true].as_slice()),
+            "omitted behavior from the target cannot create an entry-to-target path that bypasses an earlier candidate"
+        );
+    }
+
+    #[test]
+    fn a_plain_object_literal_procedure_covers_every_axis() {
+        for (language, path, source) in [
+            (
+                Language::JavaScript,
+                "src/main.js",
+                JS_READ_BEFORE_ESTABLISHMENT,
+            ),
+            (
+                Language::TypeScript,
+                "src/main.ts",
+                TS_READ_BEFORE_ESTABLISHMENT,
+            ),
+        ] {
+            let fixture = Fixture::new(language, &[(path, source)]);
+            let state = fixture.state(0);
+            let derivation = procedure_containing(
+                &state,
+                |event| matches!(&event.subject, FlowSubject::Property { member, .. } if &**member == "value"),
+            );
+            assert!(
+                derivation.completeness.is_complete(),
+                "{language:?} must publish no gap for the plain-literal shape; got {:?}",
+                derivation.completeness
+            );
+            for axis in FLOW_STATE_AXES {
+                assert!(
+                    derivation.completeness.covers(*axis),
+                    "{language:?} must cover {axis:?}"
+                );
+            }
+        }
+    }
+
+    const JS_ESCAPING_OBJECT: &str = r#"
+function escapingObject(sink) {
+  const ns = {};
+  sink(ns);
+  return ns.value;
+}
+"#;
+
+    #[test]
+    fn an_escaping_object_literal_keeps_the_axes_uncovered() {
+        let fixture = Fixture::new(Language::JavaScript, &[("src/main.js", JS_ESCAPING_OBJECT)]);
+        let state = fixture.state(0);
+        let derivation = procedure_containing(
+            &state,
+            |event| matches!(&event.subject, FlowSubject::Property { member, .. } if &**member == "value"),
+        );
+        assert!(
+            !derivation
+                .completeness
+                .covers(FlowStateAxis::PropertyEvents),
+            "an escaping base must keep the property axis uncovered; got {:?}",
+            derivation.completeness
+        );
+        assert!(
+            !derivation
+                .completeness
+                .covers(FlowStateAxis::PropertyReachingRelation)
+        );
+    }
+
+    #[test]
+    fn a_read_before_the_only_establishment_has_no_reaching_row() {
+        let fixture = Fixture::new(
+            Language::JavaScript,
+            &[("src/main.js", JS_READ_BEFORE_ESTABLISHMENT)],
+        );
+        let state = fixture.state(0);
+        let derivation = procedure_containing(
+            &state,
+            |event| matches!(&event.subject, FlowSubject::Property { member, .. } if &**member == "value"),
+        );
+        let reaching = relation_spellings(
+            JS_READ_BEFORE_ESTABLISHMENT,
+            derivation,
+            FlowRelation::Reaching,
+        );
+        assert!(
+            !reaching
+                .iter()
+                .any(|(source, target, _)| *source == "ns.value = 1" && *target == "ns.value"),
+            "the later write must not reach the earlier read; got {reaching:?}"
+        );
+    }
+
+    #[test]
+    #[hardwon("#2014: return-position reads were not anchored on their identifier occurrence")]
+    fn a_return_position_read_anchors_on_the_identifier_occurrence() {
+        let fixture = Fixture::new(
+            Language::JavaScript,
+            &[("src/main.js", JS_READ_BEFORE_ESTABLISHMENT)],
+        );
+        let state = fixture.state(0);
+        let derivation = procedure_containing(&state, |event| {
+            spelling(JS_READ_BEFORE_ESTABLISHMENT, event) == "early"
+        });
+        let read = derivation
+            .events
+            .iter()
+            .find(|event| {
+                event.event_class == StateEventClass::Read
+                    && matches!(&event.subject, FlowSubject::Binding { .. })
+                    && spelling(JS_READ_BEFORE_ESTABLISHMENT, event) == "early"
+            })
+            .expect("the returned binding is read");
+        let identifier_start = JS_READ_BEFORE_ESTABLISHMENT
+            .rfind("early")
+            .expect("the fixture returns the binding");
+        assert_eq!(
+            (read.site.range.start_byte, read.site.range.end_byte),
+            (identifier_start, identifier_start + "early".len()),
+            "the read must anchor on the returned identifier, not the statement"
+        );
+        assert!(
+            read.site.ast_id.is_some(),
+            "the identifier anchor must land on a facts-arena node so the RQLP join works"
+        );
+    }
+
+    #[test]
+    fn a_rebind_emits_a_kill_and_kills_the_earlier_establishment() {
+        let fixture = Fixture::new(Language::JavaScript, &[("src/main.js", JS_SHADOW_REBIND)]);
+        let state = fixture.state(0);
+        let derivation = procedure_containing(&state, |event| {
+            spelling(JS_SHADOW_REBIND, event) == "value = 3"
+        });
+
+        let kills = derivation
+            .events
+            .iter()
+            .filter(|event| event.event_class == StateEventClass::Kill)
+            .map(|event| spelling(JS_SHADOW_REBIND, event))
+            .collect::<Vec<_>>();
+        assert!(
+            kills.contains(&"value = 3"),
+            "the rebind must emit a kill; got {kills:?}"
+        );
+        let establishes = derivation
+            .events
+            .iter()
+            .filter(|event| event.event_class == StateEventClass::Establish)
+            .map(|event| spelling(JS_SHADOW_REBIND, event))
+            .collect::<Vec<_>>();
+        assert!(
+            establishes.contains(&"value = 3"),
+            "the rebind must also establish; got {establishes:?}"
+        );
+
+        let reaching = relation_spellings(JS_SHADOW_REBIND, derivation, FlowRelation::Reaching);
+        let serving_the_final_read = reaching
+            .iter()
+            .filter(|(_, target, _)| *target == "value")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            serving_the_final_read,
+            vec![&("value = 3", "value", FlowCertainty::Exact)],
+            "only the rebind may serve the final read; got {reaching:?}"
+        );
+    }
+
+    const GO_CALL_REASSIGNMENT: &str = r#"
+package sample
+
+func first() error { return nil }
+func externalCall() error { return nil }
+
+func overwrite(externalCall func() error) {
+    err := first()
+    err = externalCall()
+    if err != nil { return }
+}
+"#;
+
+    #[test]
+    #[hardwon("f30141c8e280: opaque Go scalar calls failed to kill an earlier establishment")]
+    fn a_go_scalar_call_reassignment_kills_the_earlier_establishment() {
+        let fixture = Fixture::new(Language::Go, &[("main.go", GO_CALL_REASSIGNMENT)]);
+        let state = fixture.state(0);
+        let derivation = procedure_containing(&state, |event| {
+            event.event_class == StateEventClass::Establish
+                && spelling(GO_CALL_REASSIGNMENT, event) == "err = externalCall()"
+        });
+        let assignment_events = derivation
+            .events
+            .iter()
+            .filter(|event| spelling(GO_CALL_REASSIGNMENT, event) == "err = externalCall()")
+            .collect::<Vec<_>>();
+        assert!(
+            assignment_events
+                .iter()
+                .any(|event| event.event_class == StateEventClass::Establish),
+            "the call assignment must establish the binding: {assignment_events:#?}"
+        );
+        assert!(
+            assignment_events
+                .iter()
+                .any(|event| event.event_class == StateEventClass::Kill),
+            "the call assignment must kill the prior definition: {assignment_events:#?}"
+        );
+
+        let guard_read = derivation
+            .events
+            .iter()
+            .filter(|event| {
+                event.event_class == StateEventClass::Read
+                    && spelling(GO_CALL_REASSIGNMENT, event) == "err"
+            })
+            .max_by_key(|event| event.site.range.start_byte)
+            .expect("the later nil guard reads err");
+        let reaching_guard = derivation
+            .relations_of(FlowRelation::Reaching)
+            .filter(|relation| relation.target_event == guard_read.event)
+            .collect::<Vec<_>>();
+        let [reaching_guard] = reaching_guard.as_slice() else {
+            panic!("one definition must reach the later guard: {reaching_guard:#?}");
+        };
+        let reaching_source = derivation.event(reaching_guard.source_event);
+        assert_eq!(
+            spelling(GO_CALL_REASSIGNMENT, reaching_source),
+            "err = externalCall()",
+            "the earlier establishment must not survive the overwrite"
+        );
+        assert_eq!(reaching_guard.certainty, FlowCertainty::Exact);
+
+        let procedure = fixture.procedure(0, derivation.procedure);
+        let semantics = procedure.semantics();
+        let converted = semantics
+            .value(reaching_source.value)
+            .expect("the establishment carries a published value");
+        assert_eq!(
+            converted.kind,
+            SemanticValueKind::LanguageDefined("go.assignment_conversion".into()),
+            "unproved conversion must not claim raw source identity"
+        );
+        let call = call_handle_spelled(&procedure, GO_CALL_REASSIGNMENT, "externalCall()");
+        let raw_result = semantics
+            .call_site(call.id())
+            .and_then(|call| call.normal_result(0))
+            .expect("the scalar call publishes one raw normal result");
+        let conversion_sources = semantics
+            .points()
+            .iter()
+            .flat_map(|point| &point.events)
+            .filter_map(|event| match event.effect {
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::LanguageDefined,
+                    source,
+                    target,
+                } if target == reaching_source.value => Some(source),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            conversion_sources,
+            vec![raw_result],
+            "the opaque assignment value must retain exact structured dependence on the raw call result"
+        );
+        assert!(semantics.points().iter().any(|point| {
+            point.events.iter().any(|event| {
+                matches!(
+                    event.effect,
+                    SemanticEffect::ValueFlow {
+                        kind: crate::analyzer::semantic::ValueFlowKind::Local,
+                        source,
+                        target,
+                    } if source == reaching_source.value
+                        && target == reaching_source.subject.value()
+                )
+            })
+        }));
+        assert!(
+            semantics
+                .gaps()
+                .iter()
+                .all(|gap| gap.capability != SemanticCapability::Values),
+            "the structured conversion dependence replaces a broad Values gap: {:#?}",
+            semantics.gaps()
+        );
+    }
+
+    const JS_SAME_ASSIGNMENT: &str = r#"
+function wrap(value) {
+  return value;
+}
+
+function sameAssignment(x) {
+  x = wrap(x);
+  return x;
+}
+"#;
+
+    #[test]
+    fn a_same_assignment_write_is_same_evaluation_with_its_own_read() {
+        let fixture = Fixture::new(Language::JavaScript, &[("src/main.js", JS_SAME_ASSIGNMENT)]);
+        let state = fixture.state(0);
+        let derivation = procedure_containing(&state, |event| {
+            spelling(JS_SAME_ASSIGNMENT, event) == "x = wrap(x)"
+        });
+
+        assert_write_consumes_its_read_in_one_evaluation(
+            JS_SAME_ASSIGNMENT,
+            derivation,
+            "x = wrap(x)",
+            "x",
+        );
+
+        let write = derivation
+            .events
+            .iter()
+            .find(|event| {
+                event.event_class == StateEventClass::Establish
+                    && spelling(JS_SAME_ASSIGNMENT, event) == "x = wrap(x)"
+            })
+            .expect("the assignment establishes the parameter binding");
+        let own_read = derivation
+            .relations_of(FlowRelation::SameEvaluation)
+            .filter(|row| row.source_event == write.event)
+            .map(|row| row.target_event)
+            .collect::<Vec<_>>();
+        assert!(!own_read.is_empty());
+        for read in own_read {
+            assert!(
+                !derivation
+                    .relations_of(FlowRelation::Reaching)
+                    .any(|row| { row.source_event == write.event && row.target_event == read }),
+                "a write must never reach a read inside its own evaluation"
+            );
+        }
+    }
+
+    const JS_NAMESPACE_SELF_ASSIGNMENT: &str = r#"
+function namespaceArtifact() {
+  const ns = {};
+  ns.a = ns;
+  return ns.a.a;
+}
+"#;
+
+    #[test]
+    fn a_self_namespace_assignment_is_same_evaluation_with_its_own_read() {
+        let fixture = Fixture::new(
+            Language::JavaScript,
+            &[("src/main.js", JS_NAMESPACE_SELF_ASSIGNMENT)],
+        );
+        let state = fixture.state(0);
+        let derivation = procedure_containing(&state, |event| {
+            spelling(JS_NAMESPACE_SELF_ASSIGNMENT, event) == "ns.a = ns"
+        });
+        assert_write_consumes_its_read_in_one_evaluation(
+            JS_NAMESPACE_SELF_ASSIGNMENT,
+            derivation,
+            "ns.a = ns",
+            "ns",
+        );
+    }
+
+    #[test]
+    #[hardwon("eb52f52ac7d4: a copied Go aggregate alias was incorrectly treated as exact closure")]
+    fn exact_local_value_alias_closure_keeps_go_aggregate_copy_open() {
+        let fixture = Fixture::new(
+            Language::Go,
+            &[
+                ("go.mod", GO_MOD),
+                ("app.go", GO_AGGREGATE_COPY_VALUE_ALIAS),
+            ],
         );
         let state = fixture.state(1);
         let derivation = procedure_containing(&state, |event| {
-            spelling(GO_RANGE_SELF_BINDER, event) == "total := 0"
+            event.event_class == StateEventClass::Establish
+                && spelling(GO_AGGREGATE_COPY_VALUE_ALIAS, event) == "original := [1]*resource{}"
         });
+        let procedure = fixture.procedure(1, derivation.procedure);
+        let root = derivation
+            .events
+            .iter()
+            .find(|event| {
+                event.event_class == StateEventClass::Establish
+                    && spelling(GO_AGGREGATE_COPY_VALUE_ALIAS, event)
+                        == "original := [1]*resource{}"
+            })
+            .expect("the fresh array value establishes original");
+        let copied = derivation
+            .events
+            .iter()
+            .find(|event| {
+                event.event_class == StateEventClass::Establish
+                    && spelling(GO_AGGREGATE_COPY_VALUE_ALIAS, event) == "copied := original"
+            })
+            .expect("the array copy establishes its independent local");
+        let source_read = derivation
+            .events
+            .iter()
+            .find(|event| {
+                event.event_class == StateEventClass::Read
+                    && spelling(GO_AGGREGATE_COPY_VALUE_ALIAS, event) == "original"
+            })
+            .expect("the aggregate copy retains its ordinary source read");
+
+        let closure = derivation
+            .exact_local_value_alias_closure(&procedure, std::slice::from_ref(&root.event));
         assert!(
-            !derivation.completeness.reasons().iter().any(|reason| {
-                matches!(
-                    reason,
-                    FlowStateIncompleteReason::BindingWithoutEstablishment { .. }
-                )
-            }),
-            "the range binder is established; got {:?}",
-            derivation.completeness
-        );
-        assert!(derivation.completeness.covers(FlowStateAxis::BindingEvents));
-        let same = relation_spellings(
-            GO_RANGE_SELF_BINDER,
-            derivation,
-            FlowRelation::SameEvaluation,
+            closure.reads.contains(&source_read.event),
+            "AggregateCopy remains ordinary exact data dependence"
         );
         assert!(
-            same.iter()
-                .any(|(write, _, certainty)| *write == "x" && *certainty == FlowCertainty::Exact),
-            "the binder must relate to the outer `x` read of its own iterable; got {same:?}"
+            !closure.establishments.contains(&copied.event),
+            "independent array storage is not promoted as exact resource identity"
         );
         assert!(
-            same.contains(&("total += x", "total", FlowCertainty::Exact))
-                && same.contains(&("total += x", "x", FlowCertainty::Exact)),
-            "the compound write consumes its own operand reads; got {same:?}"
+            closure.unclosed_transfers.contains(&source_read.event),
+            "the copied array remains a candidate-scoped identity frontier"
+        );
+        assert!(
+            !closure.proof_open,
+            "the structured closure itself remains available"
+        );
+    }
+
+    #[test]
+    #[hardwon("3ac44dca99bb: a may Go assignment conversion was treated as an exact alias")]
+    fn exact_local_value_alias_closure_keeps_may_go_assignment_conversion_uncertain() {
+        let fixture = Fixture::new(
+            Language::Go,
+            &[
+                ("go.mod", GO_MOD),
+                ("app.go", GO_MAY_ASSIGNMENT_CONVERSION_ALIAS),
+            ],
+        );
+        let state = fixture.state(1);
+        let derivation = procedure_containing(&state, |event| {
+            event.event_class == StateEventClass::Establish
+                && spelling(GO_MAY_ASSIGNMENT_CONVERSION_ALIAS, event) == "source := acquire()"
+        });
+        let procedure = fixture.procedure(1, derivation.procedure);
+        let root = derivation
+            .events
+            .iter()
+            .find(|event| {
+                event.event_class == StateEventClass::Establish
+                    && spelling(GO_MAY_ASSIGNMENT_CONVERSION_ALIAS, event) == "source := acquire()"
+            })
+            .expect("the acquired value establishes source");
+        let conversion = derivation
+            .events
+            .iter()
+            .find(|event| {
+                event.event_class == StateEventClass::Establish
+                    && spelling(GO_MAY_ASSIGNMENT_CONVERSION_ALIAS, event)
+                        == "converted any = source"
+            })
+            .expect("the converted value establishes its typed local");
+        let conversion_source = procedure
+            .semantics()
+            .points()
+            .iter()
+            .flat_map(|point| &point.events)
+            .find_map(|event| match event.effect {
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::LanguageDefined,
+                    source,
+                    target,
+                } if target == conversion.value => Some(source),
+                _ => None,
+            })
+            .expect("the typed initializer has an explicit assignment conversion");
+        let conversion_source_read = derivation
+            .events
+            .iter()
+            .find(|event| {
+                event.event_class == StateEventClass::Read && event.value == conversion_source
+            })
+            .expect("the typed conversion reads source after the conditional replacement");
+
+        let closure = derivation.exact_local_value_alias_closure(&procedure, &[root.event]);
+        assert!(
+            closure
+                .uncertain_reads
+                .contains(&conversion_source_read.event),
+            "the original establishment may reach the conversion read"
+        );
+        assert!(
+            closure
+                .uncertain_transfers
+                .contains(&conversion_source_read.event),
+            "a May-reaching assignment conversion remains an uncertain identity transfer"
+        );
+    }
+
+    const JS_MAY_LOCAL_VALUE_ALIAS: &str = r#"
+function mayAlias(change, replacement) {
+  let value = 1;
+  if (change) {
+    value = replacement;
+  }
+  const alias = value;
+  return alias;
+}
+"#;
+
+    #[test]
+    #[hardwon("85e699d19f66: a may alias transfer was promoted to exact local closure")]
+    fn exact_local_value_alias_closure_does_not_promote_a_may_transfer() {
+        let fixture = Fixture::new(
+            Language::JavaScript,
+            &[("src/main.js", JS_MAY_LOCAL_VALUE_ALIAS)],
+        );
+        let state = fixture.state(0);
+        let derivation = procedure_containing(&state, |event| {
+            spelling(JS_MAY_LOCAL_VALUE_ALIAS, event) == "value = 1"
+        });
+        let procedure = fixture.procedure(0, derivation.procedure);
+        let roots = derivation
+            .events
+            .iter()
+            .filter(|event| {
+                event.event_class == StateEventClass::Establish
+                    && spelling(JS_MAY_LOCAL_VALUE_ALIAS, event) == "value = 1"
+            })
+            .map(|event| event.event)
+            .collect::<Vec<_>>();
+        assert_eq!(roots.len(), 1, "one candidate establishment");
+
+        let closure = derivation.exact_local_value_alias_closure(&procedure, &roots);
+        assert_eq!(
+            closure.establishments.len(),
+            1,
+            "a May-reaching source cannot establish an exact alias"
+        );
+        assert!(
+            !closure.uncertain_transfers.is_empty(),
+            "the candidate transfer remains explicitly open"
+        );
+    }
+
+    const RUST_SCOPED_LOCAL_FLOW_GAP: &str = r#"
+fn scoped_local_flow_gap() -> i32 {
+    let value = 1;
+    let (alias,) = (value,);
+    alias
+}
+"#;
+
+    #[test]
+    #[hardwon("2dbc14570554: a scoped local-flow gap was lost during Go alias closure")]
+    fn exact_local_value_alias_closure_keeps_a_scoped_local_flow_gap_open() {
+        let fixture = Fixture::new(
+            Language::Rust,
+            &[("src/lib.rs", RUST_SCOPED_LOCAL_FLOW_GAP)],
+        );
+        let state = fixture.state(0);
+        let derivation = procedure_containing(&state, |event| {
+            event.event_class == StateEventClass::Establish
+        });
+        let procedure = fixture.procedure(0, derivation.procedure);
+        let root = derivation
+            .events
+            .iter()
+            .filter(|event| event.event_class == StateEventClass::Establish)
+            .min_by_key(|event| event.site.range.start_byte)
+            .expect("the plain local is established");
+
+        let closure = derivation.exact_local_value_alias_closure(&procedure, &[root.event]);
+        assert_eq!(
+            closure.establishments.len(),
+            1,
+            "destructuring is not promoted to an exact alias"
+        );
+        assert!(
+            !closure.unclosed_transfers.is_empty(),
+            "the declaratively same-evaluation-blocking LocalFlow gap stays open"
         );
     }
 
@@ -16160,9 +17265,10 @@ def local_binder(x)
 end
 "#;
 
-    /// Ruby's structured field-memory subset makes the property axis available
-    /// without pretending the language's remaining heap shapes are complete.
     #[test]
+    #[hardwon(
+        "#2906: partial Ruby heap assignment flow reported a false unsupported property axis"
+    )]
     fn ruby_partial_field_memory_does_not_report_the_property_axis_unsupported() {
         let fixture = Fixture::new(Language::Ruby, &[("src/main.rb", RUBY_LOCAL_BINDER)]);
         let state = fixture.state(0);
@@ -16198,7 +17304,6 @@ end
         );
     }
 
-    /// Budget exhaustion is a typed incompleteness, never a truncated row set.
     #[test]
     fn an_exhausted_cfg_budget_reports_the_relation_axes_incomplete() {
         let fixture = Fixture::new(
@@ -16241,8 +17346,6 @@ end
         );
     }
 
-    /// A file with no semantic provider yields an explicit uncovered result,
-    /// not an empty complete one.
     #[test]
     fn a_file_that_does_not_lower_reports_an_uncovered_result() {
         let fixture = Fixture::new(
@@ -16273,7 +17376,6 @@ end
         );
     }
 
-    /// Two derivations of one unchanged workspace produce identical rows.
     #[test]
     fn derivation_is_deterministic() {
         let fixture = Fixture::new(
@@ -16293,8 +17395,6 @@ end
         }
     }
 
-    /// Every event carries the arena identity join and the workspace
-    /// generation the artifact was read at.
     #[test]
     fn events_carry_the_arena_identity_and_the_generation() {
         let fixture = Fixture::new(

@@ -120,16 +120,15 @@ impl SelectedEdgesOfTelemetry {
     }
 
     pub(super) fn record_complete_build(&self, index: &SelectedReferenceInverseIndex) {
-        self.inner
-            .complete_index_builds
-            .fetch_add(1, Ordering::Relaxed);
-        self.record_index(index);
+        self.record_index_build(&self.inner.complete_index_builds, index);
     }
 
     pub(super) fn record_incomplete_build(&self, index: &SelectedReferenceInverseIndex) {
-        self.inner
-            .incomplete_index_builds
-            .fetch_add(1, Ordering::Relaxed);
+        self.record_index_build(&self.inner.incomplete_index_builds, index);
+    }
+
+    fn record_index_build(&self, counter: &AtomicUsize, index: &SelectedReferenceInverseIndex) {
+        counter.fetch_add(1, Ordering::Relaxed);
         self.record_index(index);
     }
 
@@ -352,6 +351,7 @@ impl EdgeTraversalCache {
                         continue;
                     }
                     diagnostics.push(CodeQueryDiagnostic {
+                        source: None,
                         code: CodeQueryDiagnosticCode::EdgeAxisUnsupported,
                         impact: CodeQueryDiagnosticImpact::Incomplete,
                         branch: Vec::new(),
@@ -362,6 +362,7 @@ impl EdgeTraversalCache {
                             axis.label()
                         ),
                     exhausted_roots: Vec::new(),
+                        withheld_rows_path: None,
                     });
                 }
                 EdgeIncompleteReason::NoStructuralAdapter
@@ -385,6 +386,7 @@ impl EdgeTraversalCache {
                         continue;
                     }
                     diagnostics.push(CodeQueryDiagnostic {
+                        source: None,
                         code,
                         impact: CodeQueryDiagnosticImpact::Incomplete,
                         branch: Vec::new(),
@@ -394,6 +396,7 @@ impl EdgeTraversalCache {
                             incomplete_reason_label(reason)
                         ),
                     exhausted_roots: Vec::new(),
+                        withheld_rows_path: None,
                     });
                 }
             }
@@ -423,6 +426,7 @@ impl EdgeTraversalCache {
         }
         if !newly_reported_global.is_empty() {
             diagnostics.push(CodeQueryDiagnostic {
+                source: None,
                 exhausted_roots: Vec::new(),
                 code: CodeQueryDiagnosticCode::EdgeDerivationIncomplete,
                 impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -431,6 +435,7 @@ impl EdgeTraversalCache {
                 message: format!(
                     "selected Java inverse index generation {generation} is incomplete ({newly_reported_global:?}); it does not cover every requested reference-edge axis"
                 ),
+                withheld_rows_path: None,
             });
         }
         if !subject_local.is_empty() {
@@ -440,6 +445,7 @@ impl EdgeTraversalCache {
                 .insert((declaration.clone(), code))
             {
                 diagnostics.push(CodeQueryDiagnostic {
+                source: None,
                 exhausted_roots: Vec::new(),
                     code,
                     impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -448,6 +454,7 @@ impl EdgeTraversalCache {
                     message: format!(
                         "{subject} has an incomplete selected Java inverse-index derivation ({subject_local:?}); it does not cover every requested reference-edge axis"
                     ),
+                    withheld_rows_path: None,
                 });
             }
         }

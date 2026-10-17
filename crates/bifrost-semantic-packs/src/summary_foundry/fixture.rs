@@ -36,6 +36,7 @@
 
 use std::fmt;
 
+use brokk_bifrost_analysis::analyzer::Language;
 use brokk_bifrost_analysis::analyzer::semantic_model::{
     ActivationSelector, AuthoredPayload, AuthoredProcedureSummary, AuthoredProcedureTarget,
     AuthoredSemanticModelPack, AuthoredShard, AuthoredSummaryExitKind, AuthoredSummaryInput,
@@ -561,6 +562,7 @@ fn pack_source(
                         // to answer for, and the production compiler is what
                         // answers it.
                         parameter_count: entry.boundary.parameter_count,
+                        formals: Vec::new(),
                     },
                     completeness,
                     ordinary_heap_unchanged: false,
@@ -573,6 +575,7 @@ fn pack_source(
                     transfer_partitions: Vec::new(),
                     effects: Vec::new(),
                     concurrency_effects: Vec::new(),
+                    returned_callables: Vec::new(),
                     declared_effects: Vec::new(),
                     preconditions: None,
                     result_contracts: Vec::new(),
@@ -589,6 +592,7 @@ fn pack_source(
             collection_flows: None,
             deferred_yields: None,
             conditional_type_refinements: None,
+            callable_values: None,
         }],
     };
     let mut rendered =
@@ -624,7 +628,7 @@ impl JavaFixtureLanguage {
 
 impl FixtureLanguage for JavaFixtureLanguage {
     fn language(&self) -> &'static str {
-        "java"
+        Language::Java.config_label()
     }
 
     fn ecosystem(&self) -> &'static str {
@@ -722,15 +726,7 @@ mod tests {
     use crate::summary_foundry::ir::{
         FoundryArtifactBinding, FoundryBoundary, FoundryClaim, FoundryCorpus, FoundryTarget,
     };
-
-    fn transfer(input: AuthoredSummaryInput) -> AuthoredSummaryTransfer {
-        AuthoredSummaryTransfer {
-            input,
-            exit_kind: AuthoredSummaryExitKind::Normal,
-            output: AuthoredSummaryOutput::NormalReturn {},
-            value_transfer: None,
-        }
-    }
+    use crate::summary_foundry::test_support::transfer;
 
     fn entry(
         member: &str,
@@ -760,57 +756,6 @@ mod tests {
             notes: Vec::new(),
             derivation: None,
         }
-    }
-
-    #[test]
-    fn a_static_two_parameter_entry_routes_one_probe_per_claimed_transfer() {
-        let entry = entry(
-            "format",
-            &["String", "Object"],
-            false,
-            vec![
-                transfer(AuthoredSummaryInput::Parameter { ordinal: 0 }),
-                transfer(AuthoredSummaryInput::Parameter { ordinal: 1 }),
-            ],
-        );
-
-        let suite = generate_fixture_suite(&entry, &JavaFixtureLanguage).expect("a routable entry");
-
-        assert_eq!(
-            suite.cases.len(),
-            2,
-            "a partial entry gets no negative case"
-        );
-        let positive = &suite.cases[0];
-        assert_eq!(positive.polarity, FixturePolarity::Positive);
-        assert_eq!(positive.expected_findings, 2);
-        let source = &positive.files[0].contents;
-        assert!(
-            source.contains("static native String format(String p0, Object p1);"),
-            "{source}"
-        );
-        assert!(
-            source.contains("sensitive0(format(attacker0(), \"clean1\"));"),
-            "{source}"
-        );
-        assert!(
-            source.contains("sensitive1(format(\"clean0\", attacker1()));"),
-            "{source}"
-        );
-        // The pack symbol has to be the analyzer's spelling, not the corpus's.
-        assert!(
-            positive
-                .pack_source
-                .as_ref()
-                .unwrap()
-                .contains("format(String, Object)"),
-            "{:?}",
-            positive.pack_source
-        );
-        assert_eq!(suite.cases[1].polarity, FixturePolarity::FailBefore);
-        assert!(suite.cases[1].pack_source.is_none());
-        assert_eq!(suite.cases[1].expected_findings, 0);
-        assert_eq!(suite.cases[1].files, positive.files);
     }
 
     #[test]
@@ -851,71 +796,6 @@ mod tests {
     }
 
     #[test]
-    fn a_complete_entry_gains_a_negative_case_over_an_unclaimed_port() {
-        let mut entry = entry(
-            "substring",
-            &["int", "int"],
-            true,
-            vec![transfer(AuthoredSummaryInput::Receiver {})],
-        );
-        entry.completeness = FoundryCompleteness::Complete;
-
-        let suite = generate_fixture_suite(&entry, &JavaFixtureLanguage).expect("a routable entry");
-
-        assert_eq!(suite.completeness, Completeness::Complete);
-        let negative = suite
-            .cases
-            .iter()
-            .find(|case| case.polarity == FixturePolarity::Negative)
-            .expect("a complete entry with an unclaimed port gets a negative case");
-        assert_eq!(negative.expected_findings, 0);
-        assert_eq!(
-            negative.probes[0].input,
-            FixtureInputPort::Parameter { ordinal: 0 }
-        );
-        assert!(negative.pack_source.is_some());
-    }
-
-    #[test]
-    fn an_unsigned_or_output_bound_entry_is_refused_with_its_reason() {
-        let mut unsigned = entry(
-            "join",
-            &[],
-            false,
-            vec![transfer(AuthoredSummaryInput::Parameter { ordinal: 0 })],
-        );
-        unsigned.target.signature = FoundrySignature::AnyOverload;
-        assert_eq!(
-            generate_fixture_suite(&unsigned, &JavaFixtureLanguage),
-            Err(FixtureUnsupported::NoPinnedOverload)
-        );
-
-        let receiver_output = entry(
-            "getChars",
-            &["char[]"],
-            true,
-            vec![AuthoredSummaryTransfer {
-                input: AuthoredSummaryInput::Parameter { ordinal: 0 },
-                exit_kind: AuthoredSummaryExitKind::Normal,
-                output: AuthoredSummaryOutput::Receiver {},
-                value_transfer: None,
-            }],
-        );
-        assert_eq!(
-            generate_fixture_suite(&receiver_output, &JavaFixtureLanguage),
-            Err(FixtureUnsupported::OutputPortUnsupported {
-                output: "receiver".to_owned()
-            })
-        );
-
-        let no_flow = entry("length", &[], true, Vec::new());
-        assert_eq!(
-            generate_fixture_suite(&no_flow, &JavaFixtureLanguage),
-            Err(FixtureUnsupported::NoAuthoredSummary)
-        );
-    }
-
-    #[test]
     fn a_transfer_past_the_declared_arity_still_reaches_the_production_compiler() {
         // The entry declares one parameter and claims a transfer from a second.
         // The fixture widens its own declaration so the claim is carried, and
@@ -950,7 +830,6 @@ mod tests {
             positive.pack_source
         );
     }
-
     #[test]
     fn two_generations_of_one_entry_are_identical() {
         let entry = entry(

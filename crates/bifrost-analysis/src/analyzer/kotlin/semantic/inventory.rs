@@ -59,15 +59,15 @@ impl ReceiverCaptureSpec for ProcedureSpec<'_> {
     }
 
     fn relays_receiver_capture(&self) -> bool {
-        self.kind == ProcedureKind::Lambda
+        crate::analyzer::semantic::procedure_relays_receiver_capture(self.kind)
     }
 
     fn captures_receiver(&self) -> bool {
         self.captures_receiver
     }
 
-    fn require_receiver_capture(&mut self) {
-        self.captures_receiver = true;
+    fn captures_receiver_mut(&mut self) -> &mut bool {
+        &mut self.captures_receiver
     }
 }
 
@@ -86,21 +86,13 @@ pub(super) struct LexicalCaptureSource {
 
 pub(super) type ProcedureEnumeration<'tree> = ProcedureInventoryOutcome<Vec<ProcedureSpec<'tree>>>;
 
-enum KotlinInventoryPrepassStop {
-    Budget(ProcedureInventoryStop),
-    Cancelled,
-}
+use crate::analyzer::semantic::inventory::ProcedureInventoryPrepassStop as KotlinInventoryPrepassStop;
 
 fn charge_kotlin_inventory_prepass(
     inventory: &mut ProcedureInventoryBuilder<'_>,
     cancellation: &CancellationToken,
 ) -> Result<(), KotlinInventoryPrepassStop> {
-    if cancellation.is_cancelled() {
-        return Err(KotlinInventoryPrepassStop::Cancelled);
-    }
-    inventory
-        .charge_traversal_entry()
-        .map_err(KotlinInventoryPrepassStop::Budget)
+    crate::analyzer::semantic::inventory::charge_prepass(inventory, cancellation)
 }
 
 struct ProcedureEnumerationFrame<'tree> {
@@ -147,7 +139,7 @@ pub(super) fn enumerate_procedures<'tree>(
         }
 
         let mut child_parent = frame.lexical_parent;
-        if let Some(shape) = callable_shape(source, frame.node, frame.lexical_parent.is_some()) {
+        if let Some(shape) = callable_shape(frame.node, frame.lexical_parent.is_some()) {
             let name = callable_name(source, frame.node, shape.kind);
             let anchor =
                 source_anchor(frame.node, 0).map_err(SemanticProviderError::invalid_identity)?;
@@ -387,7 +379,6 @@ struct CallableShape<'tree> {
 /// initializer, getter, or setter from an ordinary local statement that reuses
 /// the same grammar node.
 fn callable_shape<'tree>(
-    source: &str,
     node: Node<'tree>,
     inside_procedure: bool,
 ) -> Option<CallableShape<'tree>> {
@@ -487,7 +478,7 @@ fn callable_shape<'tree>(
             kind,
             ProcedureKind::Function | ProcedureKind::Initializer | ProcedureKind::Accessor
         );
-    let is_suspend = has_modifier(source, node, "suspend");
+    let is_suspend = has_modifier(node, "suspend");
     let delegated =
         node.kind() == "property_declaration" && property_delegate_expression(node).is_some();
     Some(CallableShape {
@@ -504,7 +495,7 @@ fn callable_shape<'tree>(
             is_static,
             is_synthetic: false,
             invocation: ProcedureInvocationKind::Immediate,
-            dispatch_extensibility: dispatch_extensibility(source, node, kind, is_static),
+            dispatch_extensibility: dispatch_extensibility(node, kind, is_static),
             call_boundary: ProcedureCallBoundary::Direct,
             receiver_binding: Default::default(),
             construction_return: Default::default(),
@@ -530,7 +521,6 @@ fn lambda_body(node: Node<'_>) -> ProcedureBody<'_> {
 
 /// Kotlin inverts Java's default: classes and members are final unless opened.
 fn dispatch_extensibility(
-    source: &str,
     node: Node<'_>,
     kind: ProcedureKind,
     is_static: bool,
@@ -546,12 +536,12 @@ fn dispatch_extensibility(
     {
         return DispatchExtensibility::Closed;
     }
-    if has_modifier(source, node, "private") || has_modifier(source, node, "final") {
+    if has_modifier(node, "private") || has_modifier(node, "final") {
         return DispatchExtensibility::Closed;
     }
-    if has_modifier(source, node, "open")
-        || has_modifier(source, node, "abstract")
-        || has_modifier(source, node, "override")
+    if has_modifier(node, "open")
+        || has_modifier(node, "abstract")
+        || has_modifier(node, "override")
     {
         return DispatchExtensibility::Open;
     }
@@ -563,14 +553,14 @@ fn dispatch_extensibility(
         node
     };
     if owner.id() != node.id()
-        && (has_modifier(source, owner, "open")
-            || has_modifier(source, owner, "abstract")
-            || has_modifier(source, owner, "override"))
+        && (has_modifier(owner, "open")
+            || has_modifier(owner, "abstract")
+            || has_modifier(owner, "override"))
     {
         return DispatchExtensibility::Open;
     }
     enclosing_type_declaration(node)
-        .filter(|declaration| type_admits_overrides(source, *declaration))
+        .filter(|declaration| type_admits_overrides(*declaration))
         .map_or(DispatchExtensibility::Closed, |_| {
             DispatchExtensibility::Open
         })

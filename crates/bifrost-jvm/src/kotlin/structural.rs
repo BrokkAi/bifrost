@@ -37,8 +37,10 @@
 //!   `-3` is `(prefix_expression (integer_literal))`. Only the outermost node
 //!   becomes a fact, so `{kind: numeric_literal}` yields one match per literal.
 
+use brokk_bifrost_core::analyzer::semantic_diagnostics::contains_node as contains;
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
-    attach_role_with_derived_name, attach_terminal_callee, first_named_child,
+    attach_argument_role_with_derived_name, attach_decorators_under, attach_role_with_derived_name,
+    attach_terminal_callee, first_named_child,
 };
 use brokk_bifrost_core::analyzer::structural::callable::CallSiteContext;
 use brokk_bifrost_core::analyzer::structural::edges::{
@@ -60,14 +62,17 @@ use brokk_bifrost_core::analyzer::structural::routes::{
 };
 use brokk_bifrost_core::analyzer::structural::spec::{RoleSink, StructuralSpec};
 use brokk_bifrost_core::analyzer::tree_walk::{
-    first_named_child_of_kind, has_token_child, named_children, node_range,
+    first_named_child_of_kind, named_children, node_range,
 };
 use brokk_bifrost_core::analyzer::{Language, Range};
 use tree_sitter::Node;
 
 use crate::kotlin::syntax::{
-    kotlin_callee, kotlin_import_header_segments, kotlin_named_argument_label,
-    kotlin_navigation_receiver, kotlin_user_type_segments, kotlin_value_arguments,
+    kotlin_binding_name_nodes, kotlin_binding_node,
+    kotlin_call_trailing_lambda_body as trailing_lambda, kotlin_callee,
+    kotlin_first_token as jump_keyword, kotlin_import_header_segments, kotlin_named_argument_label,
+    kotlin_navigation_member as navigation_member, kotlin_navigation_receiver,
+    kotlin_property_delegate_expression, kotlin_user_type_segments, kotlin_value_arguments,
 };
 
 #[derive(Debug, Default)]
@@ -88,6 +93,8 @@ static KOTLIN_OCCURRENCE_ROLE_SUPPORT: OccurrenceRoleSupport = OccurrenceRoleSup
     .supported(OccurrenceRole::ValueReference);
 
 pub const KOTLIN_KIND_TABLE: &[(&str, NormalizedKind)] = &[
+    ("line_comment", NormalizedKind::Comment),
+    ("multiline_comment", NormalizedKind::Comment),
     // calls
     ("call_expression", NormalizedKind::Call),
     ("constructor_invocation", NormalizedKind::Call),
@@ -148,19 +155,7 @@ pub const KOTLIN_KIND_TABLE: &[(&str, NormalizedKind)] = &[
 ];
 
 fn span_from(first: Node<'_>, last: Node<'_>) -> Span {
-    Span {
-        start_byte: first.start_byte(),
-        end_byte: last.end_byte(),
-    }
-}
-
-/// The member a `navigation_suffix` selects.
-///
-/// Shared by `navigation_expression` (`a.b`, `a?.b`) and
-/// `directly_assignable_expression` (`this.field = 3`), which spell the suffix
-/// the same way but are otherwise unrelated nodes.
-fn navigation_member<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
-    first_named_child_of_kind(node, "navigation_suffix").and_then(first_named_child)
+    brokk_bifrost_core::analyzer::common::span_from_nodes(first, last)
 }
 
 /// The named node an annotation applies, skipping a `@file:`-style use-site
@@ -203,21 +198,6 @@ fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Node<'tree>> {
     }
 }
 
-/// The name introduced by a `variable_declaration` or the first name of a
-/// destructuring `multi_variable_declaration`.
-fn binding_name_node<'tree>(binding: Node<'tree>) -> Option<Node<'tree>> {
-    match binding.kind() {
-        "multi_variable_declaration" => first_named_child_of_kind(binding, "variable_declaration")
-            .and_then(|declaration| first_named_child_of_kind(declaration, "simple_identifier")),
-        _ => first_named_child_of_kind(binding, "simple_identifier"),
-    }
-}
-
-fn property_binding_node<'tree>(property: Node<'tree>) -> Option<Node<'tree>> {
-    first_named_child_of_kind(property, "variable_declaration")
-        .or_else(|| first_named_child_of_kind(property, "multi_variable_declaration"))
-}
-
 /// The first named child that follows the anonymous `token` child.
 fn named_child_after_token<'tree>(node: Node<'tree>, token: &str) -> Option<Node<'tree>> {
     let mut cursor = node.walk();
@@ -238,8 +218,8 @@ fn named_child_after_token<'tree>(node: Node<'tree>, token: &str) -> Option<Node
 /// in an interface, or one defined solely by a getter) binds nothing and is
 /// not an assignment.
 fn property_value_node<'tree>(property: Node<'tree>) -> Option<Node<'tree>> {
-    if let Some(delegate) = first_named_child_of_kind(property, "property_delegate") {
-        return first_named_child(delegate);
+    if let Some(value) = kotlin_property_delegate_expression(property) {
+        return Some(value);
     }
     named_child_after_token(property, "=")
 }
@@ -261,10 +241,6 @@ fn is_numeric_literal_node(node: Node<'_>) -> bool {
             | "long_literal"
             | "unsigned_literal"
     )
-}
-
-fn contains(outer: Node<'_>, inner: Node<'_>) -> bool {
-    outer.start_byte() <= inner.start_byte() && inner.end_byte() <= outer.end_byte()
 }
 
 /// Classify one Kotlin identifier from its structured AST position.
@@ -347,10 +323,18 @@ fn kotlin_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
 /// Whether a `prefix_expression` is the sign of a numeric literal (`-3`,
 /// `+2.5`) rather than some other unary form (`!flag`, `++index`).
 fn is_signed_numeric_prefix(node: Node<'_>) -> bool {
-    node.kind() == "prefix_expression"
-        && node.named_child_count() == 1
-        && node.named_child(0).is_some_and(is_numeric_literal_node)
-        && (has_token_child(node, "-") || has_token_child(node, "+"))
+    if node.kind() != "prefix_expression" || node.named_child_count() != 1 {
+        return false;
+    }
+    let operator = (0..node.child_count())
+        .filter_map(|index| node.child(index))
+        .find(|child| !child.is_named() && matches!(child.kind(), "+" | "-"))
+        .map(|child| child.kind());
+    brokk_bifrost_core::analyzer::tree_walk::is_signed_numeric_operand(
+        node.named_child(0),
+        operator,
+        is_numeric_literal_node,
+    )
 }
 
 /// Whether a numeric literal is nested inside a wider numeric literal and so
@@ -360,14 +344,6 @@ fn is_signed_numeric_prefix(node: Node<'_>) -> bool {
 fn is_nested_numeric_literal(node: Node<'_>) -> bool {
     node.parent()
         .is_some_and(|parent| is_numeric_literal_node(parent) || is_signed_numeric_prefix(parent))
-}
-
-/// The keyword a `jump_expression` is spelled with (`return`, `return@`,
-/// `throw`, `break`, `break@`, `continue`, `continue@`).
-fn jump_keyword(node: Node<'_>) -> Option<&'static str> {
-    node.child(0)
-        .filter(|child| !child.is_named())
-        .map(|child| child.kind())
 }
 
 fn is_throw_jump(node: Node<'_>) -> bool {
@@ -417,25 +393,17 @@ fn declaration_name_node<'tree>(declaration: Node<'tree>) -> Option<Node<'tree>>
 /// Annotations hang off a declaration's `modifiers` node rather than off the
 /// declaration directly, exactly as they do in Java.
 fn attach_decorators(sink: &mut RoleSink<'_>, declaration: Node<'_>) {
-    for modifiers in named_children(declaration) {
-        if modifiers.kind() != "modifiers" {
-            continue;
-        }
-        for modifier in named_children(modifiers) {
-            if modifier.kind() != "annotation" {
-                continue;
-            }
-            attach_role_with_derived_name(sink, Role::Decorator, modifier, expression_name_node);
-        }
-    }
+    attach_decorators_under(
+        sink,
+        declaration,
+        "modifiers",
+        &["annotation"],
+        expression_name_node,
+    );
 }
 
 fn attach_argument(sink: &mut RoleSink<'_>, argument: Node<'_>) {
-    sink.argument_maybe_named(
-        argument,
-        expression_name_node(argument),
-        argument.kind() == "spread_expression",
-    );
+    attach_argument_role_with_derived_name(sink, argument, expression_name_node);
 }
 
 /// The label/value split of a `value_argument`, routed through the shared
@@ -456,12 +424,6 @@ fn named_argument_parts<'tree>(argument: Node<'tree>) -> Option<(Node<'tree>, No
 /// `lambda_literal` inside it is the node that becomes a `lambda` fact, so
 /// targeting it lets `args: [{kind: lambda, …}]` and `has:` constraints reach
 /// the lambda body.
-fn trailing_lambda<'tree>(call: Node<'tree>) -> Option<Node<'tree>> {
-    first_named_child_of_kind(call, "call_suffix")
-        .and_then(|suffix| first_named_child_of_kind(suffix, "annotated_lambda"))
-        .and_then(|annotated| first_named_child_of_kind(annotated, "lambda_literal"))
-}
-
 fn attach_call_arguments(sink: &mut RoleSink<'_>, call: Node<'_>) {
     if let Some(arguments) = kotlin_value_arguments(call) {
         for argument in named_children(arguments) {
@@ -671,16 +633,22 @@ impl StructuralSpec for KotlinStructuralSpec {
     fn supports_kind(&self, kind: NormalizedKind) -> bool {
         // `method` and `throw` are produced by `refine_kind` rather than by a
         // table entry, so the derived-from-table default would under-report.
-        matches!(kind, NormalizedKind::Method | NormalizedKind::Throw)
-            || self
-                .kind_table()
-                .iter()
-                .any(|(_, fact_kind)| fact_kind.satisfies(kind))
+        brokk_bifrost_core::analyzer::structural::spec::supports_kind_from_table(
+            kind,
+            &[
+                NormalizedKind::Method,
+                NormalizedKind::Throw,
+                NormalizedKind::SyntaxError,
+            ],
+            self.kind_table(),
+        )
     }
 
     fn supports_role(&self, role: Role) -> bool {
         // #2647: not yet extracted by this adapter.
-        !matches!(role, Role::Iterable | Role::Element)
+        brokk_bifrost_core::analyzer::structural::spec::supports_role_without_iterable_or_element(
+            role,
+        )
     }
 
     fn occurrence_role_support(&self) -> &OccurrenceRoleSupport {
@@ -753,9 +721,11 @@ impl StructuralSpec for KotlinStructuralSpec {
             }
             NormalizedKind::Assignment => match node.kind() {
                 "property_declaration" => {
-                    if let Some(binding) = property_binding_node(node) {
-                        attach_role_with_derived_name(sink, Role::Left, binding, binding_name_node);
-                        if let Some(name) = binding_name_node(binding) {
+                    if let Some(binding) = kotlin_binding_node(node) {
+                        attach_role_with_derived_name(sink, Role::Left, binding, |binding| {
+                            kotlin_binding_name_nodes(binding).into_iter().next()
+                        });
+                        if let Some(name) = kotlin_binding_name_nodes(binding).into_iter().next() {
                             sink.set_name(name);
                         }
                     }

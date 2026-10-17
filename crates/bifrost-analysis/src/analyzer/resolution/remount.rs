@@ -14,8 +14,9 @@ use super::batch::FactReferenceSiteMetadata;
 use super::common_fact_lowering::{
     LoweredAdditionalDefinitionNamespace, LoweredCommonFacts, LoweredDeclaredRootRoute,
     LoweredDeclaredTypeRelation, LoweredDeferredMemberOwner, LoweredDefinitionUnitCrosswalk,
-    LoweredImplHeaderPath, LoweredReferenceLookupIdentity, LoweredRelationMember,
-    LoweredRootImportProvenance, LoweredTraitImplementation,
+    LoweredImplHeaderPath, LoweredPackageRoute, LoweredReferenceLookupIdentity,
+    LoweredRelationMember, LoweredRootImportProvenance, LoweredSharedLanguageFacts,
+    LoweredTraitImplementation,
 };
 use super::fact_lowering::{
     LoweredCoverageGap, LoweredResolutionFragment, LoweredSemanticSite, LoweringCoverageFrontier,
@@ -29,13 +30,15 @@ use super::model::{
     TypedFrontierState, WitnessStep,
 };
 use super::typed_fact_lowering::{
-    LoweredBindingProjection, LoweredCallApplicabilityObligation, LoweredCallableParameterProperty,
-    LoweredCallableResultTypeProperty, LoweredCallableSignatureProperty,
-    LoweredConstructionRequirementProperty, LoweredDeclarationTypeProperty,
-    LoweredDeclarationVisibilityProperty, LoweredDefinitionPropertyGap, LoweredIntrinsicSeed,
+    LoweredBindingProjection, LoweredCallApplicabilityObligation, LoweredCallArgumentProperty,
+    LoweredCallableParameterProperty, LoweredCallableResultTypeProperty,
+    LoweredCallableSignatureProperty, LoweredConstructionRequirementProperty,
+    LoweredDeclarationTypeProperty, LoweredDeclarationVisibilityProperty,
+    LoweredDeclaredTypeArgument, LoweredDefinitionPropertyGap, LoweredGenericFormal,
+    LoweredGenericFormalDefault, LoweredGenericTypeAliasParameter, LoweredIntrinsicSeed,
     LoweredMemberOwnerProperty, LoweredMemberScopeProperty, LoweredQualifiedSeededRoute,
-    LoweredSupertypeProperty, LoweredTypeComponent, LoweredTypeTransfer, LoweredTypedFragment,
-    LoweredTypedFrontier, LoweredUnderlyingType,
+    LoweredSupertypeProperty, LoweredTypeArgument, LoweredTypeComponent, LoweredTypeTransfer,
+    LoweredTypedFragment, LoweredTypedFrontier, LoweredUnderlyingType,
 };
 
 /// **Every collection keyed or ordered by a mounted id is rebuilt here, never
@@ -303,14 +306,30 @@ pub(super) fn remount_path(
         });
     }
     let completion = remount_completion(path.completion(), translation, cancellation)?;
-    PartialPath::new_with_poll(
+    let remounted = PartialPath::new_with_poll(
         start,
         end,
         precedence.into_boxed_slice(),
         witness.into_boxed_slice(),
         completion,
         &mut || cancellation.is_cancelled(),
-    )
+    )?
+    .with_root_import_activation(path.root_import_activation())
+    .with_native_import(path.native_import().map(|(token, route)| {
+        Box::new((
+            translation.semantic(*token),
+            route
+                .iter()
+                .map(|semantic| translation.semantic(*semantic))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        ))
+    }));
+    Some(if path.owner_continued() {
+        remounted.with_owner_continued()
+    } else {
+        remounted
+    })
 }
 
 pub(super) fn remount_endpoint(
@@ -330,23 +349,21 @@ fn remount_symbol_stack(
     translation: &impl ResolutionIdentityTranslation,
     cancellation: &CancellationToken,
 ) -> Option<SymbolStackPattern> {
-    let mut fixed = Vec::with_capacity(stack.fixed().len());
-    for symbol in stack.fixed() {
-        if cancellation.is_cancelled() {
-            return None;
-        }
-        fixed.push(match symbol.scopes() {
-            Some(scopes) => PartialScopedSymbol::scoped(
-                translation.semantic(symbol.symbol()),
-                remount_scope_stack(scopes, translation, cancellation)?,
-            ),
-            None => PartialScopedSymbol::unscoped(translation.semantic(symbol.symbol())),
-        });
-    }
-    Some(StackPattern::new(
-        fixed,
-        stack.tail().map(|tail| translation.stack_variable(tail)),
-    ))
+    remount_stack(
+        stack,
+        translation,
+        cancellation,
+        |symbol, translation, cancellation| {
+            let semantic = translation.semantic(symbol.symbol());
+            Some(match symbol.scopes() {
+                Some(scopes) => PartialScopedSymbol::scoped(
+                    semantic,
+                    remount_scope_stack(scopes, translation, cancellation)?,
+                ),
+                None => PartialScopedSymbol::unscoped(semantic),
+            })
+        },
+    )
 }
 
 fn remount_scope_stack(
@@ -354,12 +371,26 @@ fn remount_scope_stack(
     translation: &impl ResolutionIdentityTranslation,
     cancellation: &CancellationToken,
 ) -> Option<ScopeStackPattern> {
+    remount_stack(stack, translation, cancellation, |node, translation, _| {
+        Some(translation.node(*node))
+    })
+}
+
+fn remount_stack<Cell, Mapped, T>(
+    stack: &StackPattern<Cell>,
+    translation: &T,
+    cancellation: &CancellationToken,
+    mut remount_cell: impl FnMut(&Cell, &T, &CancellationToken) -> Option<Mapped>,
+) -> Option<StackPattern<Mapped>>
+where
+    T: ResolutionIdentityTranslation,
+{
     let mut fixed = Vec::with_capacity(stack.fixed().len());
-    for &node in stack.fixed() {
+    for cell in stack.fixed() {
         if cancellation.is_cancelled() {
             return None;
         }
-        fixed.push(translation.node(node));
+        fixed.push(remount_cell(cell, translation, cancellation)?);
     }
     Some(StackPattern::new(
         fixed,
@@ -500,6 +531,30 @@ fn remount_typed(
             )
         })
         .collect();
+    let declared_type_arguments = typed
+        .declared_type_arguments()
+        .iter()
+        .map(|argument| {
+            LoweredDeclaredTypeArgument::new(
+                translation.semantic(argument.owner()),
+                argument.position(),
+                translation.semantic(argument.argument()),
+            )
+        })
+        .collect();
+    let type_arguments = typed
+        .type_arguments()
+        .iter()
+        .map(|argument| {
+            LoweredTypeArgument::new(
+                translation.semantic(argument.application()),
+                argument.ordinal(),
+                translation.semantic(argument.argument()),
+                argument.indirection_delta(),
+                argument.reference_indirection_delta(),
+            )
+        })
+        .collect();
     let underlying_types = typed
         .underlying_types()
         .iter()
@@ -507,6 +562,43 @@ fn remount_typed(
             LoweredUnderlyingType::new(
                 translation.semantic(underlying.definition()),
                 translation.semantic(underlying.slot()),
+            )
+        })
+        .collect();
+    let generic_type_alias_parameters = typed
+        .generic_type_alias_parameters()
+        .iter()
+        .map(|parameter| {
+            LoweredGenericTypeAliasParameter::new(
+                translation.semantic(parameter.alias()),
+                parameter.ordinal(),
+                translation.semantic(parameter.parameter()),
+                translation.semantic(parameter.target()),
+                parameter.indirection_delta(),
+                parameter.reference_indirection_delta(),
+            )
+        })
+        .collect();
+    let generic_formals = typed
+        .generic_formals()
+        .iter()
+        .map(|formal| {
+            LoweredGenericFormal::new(
+                translation.semantic(formal.owner()),
+                formal.ordinal(),
+                translation.semantic(formal.parameter()),
+            )
+        })
+        .collect();
+
+    let generic_formal_defaults = typed
+        .generic_formal_defaults()
+        .iter()
+        .map(|formal| {
+            LoweredGenericFormalDefault::new(
+                translation.semantic(formal.owner()),
+                formal.ordinal(),
+                translation.semantic(formal.default()),
             )
         })
         .collect();
@@ -624,27 +716,46 @@ fn remount_typed(
     if cancellation.is_cancelled() {
         return None;
     }
-    Some(LoweredTypedFragment::new_with_type_relations(
-        fragment,
-        typed.language(),
-        frontiers,
-        transfers,
-        type_components,
-        underlying_types,
-        intrinsic_seeds,
-        projections,
-        qualified_routes,
-        declaration_types,
-        declaration_visibilities,
-        member_scopes,
-        member_owners,
-        deferred_member_owners,
-        construction_requirements,
-        supertypes,
-        property_gaps,
-        call_obligations,
-        callable_signatures,
-    ))
+    Some(
+        LoweredTypedFragment::new_with_type_relations(
+            fragment,
+            typed.language(),
+            frontiers,
+            transfers,
+            type_components,
+            type_arguments,
+            underlying_types,
+            generic_type_alias_parameters,
+            intrinsic_seeds,
+            projections,
+            qualified_routes,
+            declaration_types,
+            declaration_visibilities,
+            member_scopes,
+            member_owners,
+            deferred_member_owners,
+            construction_requirements,
+            supertypes,
+            property_gaps,
+            call_obligations,
+            callable_signatures,
+        )
+        .with_type_productions(
+            typed
+                .type_productions()
+                .iter()
+                .map(|row| super::typed_fact_lowering::LoweredTypeProduction {
+                    output: translation.semantic(row.output),
+                    element: translation.semantic(row.element),
+                    constructor: row.constructor,
+                    length: row.length.clone(),
+                })
+                .collect(),
+        )
+        .with_declared_type_arguments(declared_type_arguments)
+        .with_generic_formal_defaults(generic_formal_defaults)
+        .with_generic_formals(generic_formals),
+    )
 }
 
 pub(super) fn remount_transfer(
@@ -671,11 +782,32 @@ pub(super) fn remount_frontier_state(
         }
         possible_values.push(remount_slot_value(value, translation));
     }
-    Some(TypedFrontierState::new(
-        translation.semantic(frontier.slot()),
-        possible_values,
-        remount_completion(frontier.completion(), translation, cancellation)?,
-    ))
+    let mut unindexed_external = Vec::with_capacity(frontier.unindexed_external().len());
+    for value in frontier.unindexed_external() {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        let super::model::UnindexedExternalFrontier {
+            provider_path,
+            provider_package_id,
+            member,
+        } = value;
+        unindexed_external.push(super::model::UnindexedExternalFrontier {
+            provider_path: provider_path.clone(),
+            provider_package_id: *provider_package_id,
+            member: member.map(|(fragment, lookup)| {
+                (translation.fragment(fragment), translation.semantic(lookup))
+            }),
+        });
+    }
+    Some(
+        TypedFrontierState::new(
+            translation.semantic(frontier.slot()),
+            possible_values,
+            remount_completion(frontier.completion(), translation, cancellation)?,
+        )
+        .with_unindexed_external(unindexed_external),
+    )
 }
 
 fn remount_slot_value(
@@ -745,9 +877,12 @@ fn remount_common(
         root_import_provenance,
         package_references,
         package_members,
+        package_routes,
         go_package_imports,
         reference_lookup_identities,
+        rust_reverse_gap_candidates,
         trait_implementations,
+        shared_language,
     } = common;
 
     let mut remounted_additional = Vec::with_capacity(additional_definition_namespaces.len());
@@ -838,6 +973,7 @@ fn remount_common(
             domain: translation.semantic(row.domain),
             reference: translation.semantic(row.reference),
             root_scope: translation.node(row.root_scope),
+            choice: row.choice.map(|choice| translation.semantic(choice)),
             lookup: translation.semantic(row.lookup),
             ..row
         });
@@ -854,6 +990,18 @@ fn remount_common(
             root_scope: translation.node(row.root_scope),
             lookup: translation.semantic(row.lookup),
             ..row
+        });
+    }
+    let mut remounted_package_routes = Vec::with_capacity(package_routes.len());
+    for route in package_routes {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        remounted_package_routes.push(LoweredPackageRoute {
+            root_scope: translation.node(route.root_scope),
+            declaration: route.declaration,
+            placement_gap_site: route.placement_gap_site,
+            segments: route.segments,
         });
     }
     let mut remounted_go_package_imports = Vec::with_capacity(go_package_imports.len());
@@ -876,6 +1024,7 @@ fn remount_common(
         }
         remounted_reference_lookup_identities.push(LoweredReferenceLookupIdentity {
             reference: translation.semantic(row.reference),
+            prefix_reference: translation.semantic(row.prefix_reference),
             lookup: translation.semantic(row.lookup),
         });
     }
@@ -893,6 +1042,54 @@ fn remount_common(
             impl_end_byte: row.impl_end_byte,
         });
     }
+    let mut remounted_call_arguments = Vec::with_capacity(shared_language.call_arguments.len());
+    for mut row in shared_language.call_arguments {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        row.value = translation.semantic(row.value);
+        remounted_call_arguments.push(row);
+    }
+    let mut remounted_extension_receivers =
+        Vec::with_capacity(shared_language.extension_receivers.len());
+    for mut row in shared_language.extension_receivers {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        row.receiver_type = translation.semantic(row.receiver_type);
+        remounted_extension_receivers.push(row);
+    }
+    let mut remounted_invocation_roles = Vec::with_capacity(shared_language.invocation_roles.len());
+    for mut row in shared_language.invocation_roles {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        row.receiver = row.receiver.map(|semantic| translation.semantic(semantic));
+        row.result = row.result.map(|semantic| translation.semantic(semantic));
+        remounted_invocation_roles.push(row);
+    }
+    let mut remounted_package_object_exports =
+        Vec::with_capacity(shared_language.package_object_exports.len());
+    for mut row in shared_language.package_object_exports {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        row.package_scope = translation.node(row.package_scope);
+        remounted_package_object_exports.push(row);
+    }
+    let shared_language = LoweredSharedLanguageFacts {
+        aliases: shared_language.aliases,
+        call_argument_lists: shared_language.call_argument_lists,
+        call_arguments: remounted_call_arguments,
+        named_argument_labels: shared_language.named_argument_labels,
+        callable_parameter_lists: shared_language.callable_parameter_lists,
+        callable_parameter_semantics: shared_language.callable_parameter_semantics,
+        extension_receivers: remounted_extension_receivers,
+        import_selectors: shared_language.import_selectors,
+        singleton_relations: shared_language.singleton_relations,
+        invocation_roles: remounted_invocation_roles,
+        package_object_exports: remounted_package_object_exports,
+    };
     if cancellation.is_cancelled() {
         return None;
     }
@@ -906,9 +1103,12 @@ fn remount_common(
         remounted_import_provenance,
         remounted_package_references,
         remounted_package_members,
+        remounted_package_routes,
         remounted_go_package_imports,
         remounted_reference_lookup_identities,
+        rust_reverse_gap_candidates,
         remounted_trait_implementations,
+        shared_language,
     ))
 }
 
@@ -973,9 +1173,10 @@ pub(super) fn remount_member_scope(
     property: &LoweredMemberScopeProperty,
     translation: &impl ResolutionIdentityTranslation,
 ) -> LoweredMemberScopeProperty {
-    LoweredMemberScopeProperty::new(
+    LoweredMemberScopeProperty::owned(
         translation.semantic(property.definition()),
         translation.node(property.scope_head()),
+        property.scope_kind(),
     )
 }
 
@@ -987,6 +1188,7 @@ pub(super) fn remount_member_owner(
         translation.semantic(property.definition()),
         translation.semantic(property.owner_definition()),
         translation.node(property.owner_scope_head()),
+        property.member_name(),
         property.kind(),
         property.access(),
         property.qualifier_compatibility(),
@@ -1013,6 +1215,7 @@ pub(super) fn remount_supertype(
         translation.semantic(property.reference()),
         translation.semantic(property.frontier()),
         property.kind(),
+        property.parent_ordinal(),
     )
 }
 
@@ -1040,6 +1243,21 @@ pub(super) fn remount_call_obligation(
             return None;
         }
         argument_slots.push(translation.semantic(slot));
+    }
+    let mut arguments = Vec::with_capacity(obligation.arguments().len());
+    for argument in obligation.arguments() {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        arguments.push(LoweredCallArgumentProperty::new(
+            argument.list_ordinal(),
+            argument.ordinal(),
+            translation.semantic(argument.slot()),
+            argument
+                .label()
+                .map(str::to_owned)
+                .map(String::into_boxed_str),
+        ));
     }
     let mut extra_result_slots = Vec::with_capacity(obligation.extra_result_slots().len());
     for &slot in obligation.extra_result_slots() {
@@ -1084,6 +1302,11 @@ pub(super) fn remount_call_obligation(
             obligation
                 .expected_result_slot()
                 .map(|slot| translation.semantic(slot)),
+        )
+        .with_argument_shape(
+            obligation.language(),
+            arguments,
+            obligation.argument_lists().to_vec(),
         ),
     )
 }
@@ -1126,7 +1349,14 @@ pub(super) fn remount_callable_signature(
         .with_result_bindings(signature.result_bindings())
         .with_receiver(signature.receiver())
         .with_result_type_parameter(signature.result_type_parameter())
-        .with_result_owner_type_parameter(signature.result_owner_type_parameter()),
+        .with_result_owner_type_parameter(signature.result_owner_type_parameter())
+        .with_applicability_shape(
+            signature.parameter_lists().to_vec(),
+            signature.parameter_applicability().to_vec(),
+            signature
+                .extension_receiver()
+                .map(|slot| translation.semantic(slot)),
+        ),
     )
 }
 
@@ -1151,6 +1381,7 @@ pub(super) fn remount_type_transfer_rule(
 mod tests {
     use brokk_bifrost_core::analyzer::Language;
     use brokk_bifrost_core::analyzer::resolution_facts::ResolutionTypeTransferKind;
+    use brokk_bifrost_test_macros::hardwon;
 
     use crate::analyzer::store::resolution_prepare::{
         ResolutionInteriorPreparation, prepare_resolution_bundle_with_unit_keys,
@@ -1207,6 +1438,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("03716676846a: remounting dropped newly merged external frontier evidence")]
     fn remount_preserves_total_and_reference_indirection_provenance() {
         let provisional = BindingFragmentId::for_test(b"fragment-22");
         let final_fragment = BindingFragmentId::for_test(b"fragment-55");
@@ -1239,6 +1471,25 @@ mod tests {
             SemanticId::local(final_fragment.ordinal(), 3)
         );
         assert_eq!(remounted_value.addressable(), Some(true));
+
+        let frontier =
+            TypedFrontierState::new(source_slot, [value], ResolutionCompletion::Complete)
+                .with_unindexed_external([super::super::model::UnindexedExternalFrontier {
+                    provider_path: "unindexed/provider".into(),
+                    provider_package_id: Some(7),
+                    member: Some((provisional, rule_semantic)),
+                }]);
+        let remounted_frontier =
+            remount_frontier_state(&frontier, &translation, &CancellationToken::default())
+                .expect("uncancelled frontier remount must finish");
+        assert_eq!(
+            remounted_frontier.unindexed_external(),
+            &[super::super::model::UnindexedExternalFrontier {
+                provider_path: "unindexed/provider".into(),
+                provider_package_id: Some(7),
+                member: Some((final_fragment, translation.semantic(rule_semantic))),
+            }]
+        );
 
         let transfer = LoweredTypeTransfer::new(
             source_slot,

@@ -4,7 +4,9 @@ use super::{SelectedResolutionStage, codec, lexical};
 use crate::CancellationToken;
 use crate::analyzer::resolution::{CandidatePathIdentity, PartialPath, SelectedContextPathToken};
 use crate::analyzer::store::resolution::with_resolution_read_progress_handler;
-use crate::analyzer::store::resolution_selection::SelectedResolutionTempTransaction;
+use crate::analyzer::store::resolution_selection::{
+    SelectedResolutionMountInventory, SelectedResolutionTempTransaction,
+};
 use crate::analyzer::store::{Result, StoreError};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -44,17 +46,12 @@ fn mint_context_token() -> SelectedContextPathToken {
     SelectedContextPathToken::new(value)
 }
 
-/// Call within the reader's existing progress/read scope before using its token.
+/// Check a token minted by this inventory's committed context publication.
 pub(in crate::analyzer::store) fn require_context(
-    connection: &Connection,
+    selection: &SelectedResolutionMountInventory<'_>,
     context: SelectedContextPathToken,
 ) -> Result<()> {
-    let exists: bool = connection
-        .prepare_cached(
-            "SELECT EXISTS(SELECT 1 FROM temp.selected_resolution_contexts WHERE context_id=?1)",
-        )?
-        .query_row([context.get()], |row| row.get(0))?;
-    if !exists {
+    if !selection.has_published_context(context) {
         return Err(StoreError::new(format!(
             "selected context token has no request-owned rows: {context:?}"
         )));
@@ -147,7 +144,7 @@ impl SelectedResolutionStage<'_, '_> {
         }
         let context = mint_context_token();
         self.selection.mark_stage_used();
-        self.selection.with_owned_temp_transaction(|connection| {
+        let published = self.selection.with_owned_temp_transaction(|connection| {
             let result =
                 with_resolution_read_progress_handler(connection, cancellation, |connection| {
                     connection
@@ -172,7 +169,11 @@ impl SelectedResolutionStage<'_, '_> {
                 }
                 outcome => outcome,
             }
-        })
+        })?;
+        if let Some(context) = published {
+            self.selection.record_published_context(context);
+        }
+        Ok(published)
     }
 }
 

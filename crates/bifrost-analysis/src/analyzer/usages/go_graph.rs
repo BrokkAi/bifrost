@@ -18,19 +18,21 @@ use crate::analyzer::usages::inverted_edges::{
     build_edge_output_with_completeness, build_file_declarations,
     parse_source_and_collect_with_declarations_and_domain,
 };
-use crate::analyzer::usages::model::{FuzzyResult, UsageAnalysisDiagnostic};
+#[cfg(test)]
+use crate::analyzer::usages::model::FuzzyResult;
+use crate::analyzer::usages::model::UsageAnalysisDiagnostic;
 use crate::analyzer::usages::outcome::{
     CandidateUsageHits, GraphFailureReason, GraphUsageOutcome, union_candidate_usages,
 };
-use crate::analyzer::usages::traits::{UsageQueryResolver, UsageScanScope};
+use crate::analyzer::usages::traits::{GraphUsageDispatchSpec, UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::analyzer::{CodeUnit, GoAnalyzer, IAnalyzer, Language, ProjectFile, resolve_analyzer};
 use crate::hash::HashSet;
 use brokk_bifrost_go::graph::extractor::scan_files_for_target;
 use brokk_bifrost_go::graph::inverted::scan_go_file;
 pub(in crate::analyzer::usages) use brokk_bifrost_go::graph::reference::{
-    GoReferenceResolution, GoSelectorDescriptor, go_selector_descriptor,
-    go_selector_descriptor_with_scope, resolve_go_reference_with_namespaces,
+    GoSelectorDescriptor, go_selector_descriptor, go_selector_descriptor_with_scope,
+    resolve_go_reference_with_namespaces,
 };
 use brokk_bifrost_go::graph::resolver::{
     GoEdgeIndex, GoGraphBuildError, GoGraphSource, GoProjectGraph, TargetSpec,
@@ -315,10 +317,9 @@ pub(crate) struct GoEdgeResolver {
     index: Arc<GoEdgeIndex>,
 }
 
-/// The whole-workspace `caller -> callee` scan behind this language's
-/// [`LanguageEdgePass`](crate::analyzer::languages::LanguageEdgePass): borrow the concrete
-/// analyzer once, then walk every file once and finalize into either site-bearing edges or
-/// reference-kind weights.
+/// The indexed Go edge reader used by target-directed references and the retained
+/// dead-code proof. It borrows the concrete analyzer once and walks each selected file on
+/// demand without retaining workspace-sized graph state.
 impl GoEdgeResolver {
     pub(crate) fn try_new(
         analyzer: &dyn IAnalyzer,
@@ -420,30 +421,18 @@ impl GraphUsageAnalyzer for GoUsageGraphStrategy {
         scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
-        if overloads.is_empty() {
-            return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
-        }
-
-        let target = &overloads[0];
-        if language_for_target(target) != Language::Go {
-            return GraphUsageOutcome::fallback_safe(
-                target.fq_name(),
-                GraphFailureReason::UnsupportedTargetLanguage("target is not Go"),
-                GO_STRATEGY,
-            );
-        }
-
-        let Some(resolver) = GoQueryResolver::try_new(analyzer) else {
-            return GraphUsageOutcome::fallback_safe(
-                target.fq_name(),
-                GraphFailureReason::MissingAnalyzerCapability(
-                    "analyzer does not expose GoAnalyzer",
-                ),
-                GO_STRATEGY,
-            );
-        };
-
-        resolver.find_usages(analyzer, overloads, scan_scope, max_usages)
+        crate::analyzer::usages::traits::dispatch_graph_usage_query::<GoQueryResolver<'_>>(
+            analyzer,
+            overloads,
+            scan_scope,
+            max_usages,
+            GraphUsageDispatchSpec {
+                target_language: Language::Go,
+                unsupported_target: "target is not Go",
+                missing_analyzer: "analyzer does not expose GoAnalyzer",
+                strategy: GO_STRATEGY,
+            },
+        )
     }
 }
 
@@ -491,9 +480,86 @@ fn scan_candidate_with_graph(
 #[cfg(test)]
 mod file_scope_tests {
     use super::*;
+    use crate::analyzer::usages::traits::UsageAnalyzer;
     use crate::analyzer::{CodeUnitIndex, EmptyAnalyzer};
     use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_test_macros::hardwon;
     use std::collections::BTreeSet;
+
+    #[test]
+    #[hardwon(
+        "0dec6bce300f: Real Go source with dot imports and aliases must produce identical method-use lines in forward and persisted inverted scans"
+    )]
+    fn typed_dot_imported_and_aliased_var_receivers_match_forward_and_inverted_edges() {
+        let project = InlineTestProject::with_language(Language::Go)
+            .file("go.mod", "module example.com/app\n\ngo 1.24\n")
+            .file(
+                "types/types.go",
+                "package types\ntype T struct{}\ntype A = T\nfunc (T) Method() {}\n",
+            )
+            .file(
+                "main.go",
+                r#"package main
+
+import . "example.com/app/types"
+
+func useDotImportedType() {
+    var x T
+    x.Method()
+}
+
+func useDotImportedAlias() {
+    var x A
+    x.Method()
+}
+"#,
+            )
+            .build();
+        let analyzer = GoAnalyzer::new(project.project_dyn());
+        let declarations = analyzer.get_all_declarations();
+        let target = declarations
+            .iter()
+            .find(|unit| unit.fq_name() == "example.com/app/types.T.Method")
+            .cloned()
+            .expect("method declaration");
+        let nodes = declarations.iter().map(CodeUnit::fq_name).collect();
+
+        let candidates = analyzer.get_analyzed_files().into_iter().collect();
+        let forward = GoUsageGraphStrategy::new().find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &candidates,
+            1000,
+        );
+        let forward_lines: BTreeSet<_> = match forward {
+            FuzzyResult::Success {
+                hits_by_overload, ..
+            } => hits_by_overload
+                .into_values()
+                .flatten()
+                .map(|hit| hit.line)
+                .collect(),
+            result => panic!("forward Go scan should succeed: {result:?}"),
+        };
+
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let inverted = build_go_usage_edges(&analyzer, scope.token(), &nodes, |_| true)
+            .expect("complete inverted Go edge scan")
+            .expect("Go analyzer has files");
+        let target_fqn = target.fq_name();
+        let inverted_lines: BTreeSet<_> = inverted
+            .edges
+            .iter()
+            .filter(|((_, callee), _)| callee == &target_fqn)
+            .flat_map(|(_, sites)| sites.iter().map(|site| site.line))
+            .collect();
+
+        assert_eq!(BTreeSet::from([7, 12]), forward_lines);
+        assert_eq!(
+            forward_lines, inverted_lines,
+            "forward lines: {forward_lines:?}; inverted lines: {inverted_lines:?}"
+        );
+    }
 
     // Canonical graph resolution is separate from enclosing attribution.
     // EmptyAnalyzer supplies only the latter and makes no completeness claim.

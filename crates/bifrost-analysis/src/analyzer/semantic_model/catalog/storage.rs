@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
-use sha2::{Digest, Sha256};
+use brokk_bifrost_core::cache_db::sync_file;
 use tempfile::NamedTempFile;
 
 use super::CatalogError;
@@ -103,7 +103,7 @@ pub(super) fn publish(
     bytes: &[u8],
 ) -> Result<(PathBuf, bool), CatalogError> {
     validate_digest(digest)?;
-    if sha256(bytes) != digest {
+    if crate::analyzer::semantic_model::csmi::sha256_hex(bytes) != digest {
         return Err(CatalogError::Integrity(
             "object bytes do not match their stored digest".to_owned(),
         ));
@@ -124,7 +124,7 @@ pub(super) fn publish(
         .map_err(|error| CatalogError::io("create staged object", error))?;
     temporary
         .write_all(bytes)
-        .and_then(|()| temporary.as_file().sync_all())
+        .and_then(|()| sync_file(temporary.as_file()))
         .map_err(|error| CatalogError::io("write staged object", error))?;
     let published = if destination.exists() {
         match verify(&destination, digest, bytes.len() as u64) {
@@ -143,8 +143,7 @@ pub(super) fn publish(
             Err(error) => return Err(CatalogError::io("publish staged object", error.error)),
         }
     };
-    published
-        .sync_all()
+    sync_file(&published)
         .map_err(|error| CatalogError::io("sync published catalog object", error))?;
     sync_directory(parent)?;
     if !parent_existed {
@@ -344,7 +343,7 @@ fn verify(path: &Path, digest: &str, stored_size: u64) -> Result<(), CatalogErro
         )));
     }
     let bytes = fs::read(path).map_err(|error| CatalogError::io("verify catalog object", error))?;
-    if sha256(&bytes) != digest {
+    if crate::analyzer::semantic_model::csmi::sha256_hex(&bytes) != digest {
         return Err(CatalogError::Integrity(format!(
             "catalog object digest mismatch for {digest}"
         )));
@@ -355,7 +354,7 @@ fn verify(path: &Path, digest: &str, stored_size: u64) -> Result<(), CatalogErro
 #[cfg(unix)]
 fn sync_directory(path: &Path) -> Result<(), CatalogError> {
     File::open(path)
-        .and_then(|directory| directory.sync_all())
+        .and_then(|directory| sync_file(&directory))
         .map_err(|error| CatalogError::io("sync catalog object directory", error))
 }
 
@@ -383,11 +382,6 @@ fn validate_digest(digest: &str) -> Result<(), CatalogError> {
             "catalog digest must be lowercase SHA-256 hex".to_owned(),
         ))
     }
-}
-
-fn sha256(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    format!("{digest:x}")
 }
 
 fn reject_object_tree(root: &Path, prefix: &Path) -> Result<(), CatalogError> {

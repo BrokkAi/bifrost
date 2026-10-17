@@ -33,59 +33,28 @@ See [Rune IR](/rune-ir/) for the representation, `.rune` files and VS Code previ
 
 Semantic declaration steps intentionally stop at the analyzer's indexed declaration boundary. Seeing a reference or usage into a dependency is not evidence that the dependency declaration is indexed. Until Bifrost can target library code for indexing, unindexed library declarations are omitted rather than reconstructed from names, and their absence is not reported as a capability error.
 
-| RQL wrapper | JSON step | Input → output | Use it to |
-| --- | --- | --- | --- |
-| `filter` | `filter` | typed row → same row | Retain rows satisfying a bounded conjunction over the public row schema. |
-| `project` | `project` | typed row → selected row fields | Select and rename the exact fields a relational binding publishes, preserving their public type, nullability, enum domain, source, and evidence anchor. |
-| `enclosing-decl` | `enclosing_decl` | structural match → indexed declaration | Find the smallest real declaration that contains a matching expression. |
-| `procedure-of` | `procedure_of` | structural match or declaration → procedure | Resolve the unique smallest executable procedure enclosing the exact input range. |
-| `cfg-entry` | `cfg_entry` | procedure → program point | Return the validated entry boundary. |
-| `cfg-exits` | `cfg_exits` | procedure → program point | Return normal then exceptional exits. |
-| `cfg-successor-edges` | `cfg_successor_edges` | program point → control edge | Return one-hop outgoing edges. |
-| `cfg-predecessor-edges` | `cfg_predecessor_edges` | program point → control edge | Return one-hop incoming edges. |
-| `cfg-edge-source` | `cfg_edge_source` | control edge → program point | Project an edge to its source. |
-| `cfg-edge-target` | `cfg_edge_target` | control edge → program point | Project an edge to its target. |
-| `typestate` | `typestate` | procedure → typestate finding | Resolve `protocol_ref` against the host snapshot and run the bounded existing typestate client once. |
-| `witness` | `witness` | typestate finding, flow endpoint, or absent-member finding -> matching witness domain | Project retained source-backed steps, optionally reducing them with `max_steps` and `max_bytes`. |
-| `references-of` | `references_of` | declaration → reference site | Return exact structured sites targeting a declaration. |
-| `used-by` | `used_by` | declaration → declaration | Return each smallest exact semantic user, with its proving site under `via`. |
-| `uses` | `uses` | declaration → declaration | Return exact indexed targets used by one semantic declaration, with `via`. |
-| `callers` | `callers` | declaration → declaration | Follow incoming calls, direct by default or through a positive `depth`. |
-| `callees` | `callees` | declaration → declaration | Follow outgoing calls, direct by default or through a positive `depth`. |
-| `call-sites-to` | `call_sites_to` | declaration → call site | Return incoming call sites with caller, callee, proof, receiver, and bound arguments. |
-| `call-sites-from` | `call_sites_from` | declaration → call site | Return call sites lexically owned by the declaration. |
-| `call-input` | `call_input` | call site → expression site | Select `receiver: true`, a zero-based `parameter_index`, or `parameter_name`. |
-| `receiver-targets` | `receiver_targets` | structural match, reference site, call site, or expression site → receiver analysis | Analyze the receiver extracted from a call/member site or an exact receiver expression. |
-| `points-to` | `points_to` | structural match, reference site, or expression site → receiver analysis | Return bounded value/allocation/factory provenance for an expression. |
-| `member-targets` | `member_targets` | structural match or reference site → receiver analysis | Return exact member declarations selected through the receiver candidates. |
-| `receiver-outcome` | `receiver_outcome` | ordinary call/member site or receiver analysis → receiver outcome | Analyze a site directly, or project an existing analysis, into one mandatory terminal outcome row. |
-| `receiver-evidence` | `receiver_evidence` | ordinary call/member site or receiver analysis → receiver evidence | Analyze a site directly, or project an existing analysis, into parent-linked evidence rows. |
-| `receiver-outcome` | `receiver_outcome` | ordinary call/member site or receiver analysis → receiver outcome | Analyze a site directly, or project an existing analysis, into one mandatory terminal outcome row. |
-| `receiver-evidence` | `receiver_evidence` | ordinary call/member site or receiver analysis → receiver evidence | Analyze a site directly, or project an existing analysis, into parent-linked evidence rows. |
-| `occurrences` | `occurrences` | (source) → occurrence | Seed classified identifier occurrences straight from workspace facts, filtered by `class`, `role`, and `namespace`. |
-| `occurrences-in` | `occurrences_in` | structural match or file → occurrence | Return the occurrences lexically inside a matching node or a file. |
-| `occurrences-of` | `occurrences_of` | declaration → occurrence | Return the declaration's own name occurrence plus every reference-class occurrence resolving to it. |
-| `occurrence-target` | `occurrence_target` | occurrence → declaration | Walk a reference-class occurrence back to what it resolved to. |
-| `scopes` | `scopes` | (source) → lexical scope | Seed lexical scope rows straight from workspace facts, filtered by `kind`. |
-| `bindings` | `bindings` | (source) → binding | Seed lexical binding rows straight from workspace facts, filtered by `kind`, `name`, and `hoisting`. |
-| `scope-of` | `scope_of` | binding, occurrence, or structural match → lexical scope | Return the innermost lexical scope that owns the input. |
-| `scope-ancestors` | `scope_ancestors` | lexical scope → lexical scope | Walk outward through the enclosing scopes, excluding the scope itself. |
-| `bindings-in` | `bindings_in` | lexical scope or structural match → binding | Return the bindings declared in the scope, or whose binder token lies inside the match. |
-| `binding-of` | `binding_of` | occurrence → binding | Return the binding of the occurrence's name in effect at its exact position. |
-| `binding-occurrence` | `binding_occurrence` | binding → occurrence | Walk back to the binder-class occurrence of the binding's declaring token. |
-| `candidates-of` | `candidates_of` | occurrence → resolution candidate | Return the candidates the resolver considered, with tier, outcome, and boundary. |
-| `candidate-target` | `candidate_target` | resolution candidate → declaration | Project unit-backed candidates to declarations; partial by construction. |
-| `edges-of` | `edges_of` | declaration → reference edge | Return the canonical inverse edges: every usage site the usage index enumerates for the declaration. |
-| `edges-from` | `edges_from` | occurrence → reference edge | Return the canonical forward edges: the resolver's own resolved targets for that exact token. |
-| `edge-target` | `edge_target` | reference edge → declaration | Move from an edge to its exact indexed target declaration. |
-| `state-events-of` | `state_events_of` | procedure or declaration → state event | Derive the establishment, kill, and read events of bindings and properties from the production CFG. |
-| `flow-relations-of` | `flow_relations_of` | state event or procedure → flow relation | Relate those events: reaching-definition, dominance, and same-evaluation, each with `exact` or `may` certainty. |
-| `flow-source` | `flow_source` | flow relation → state event | Project a relation to its establishment or kill end. |
-| `flow-target` | `flow_target` | flow relation → state event | Project a relation to its read end. |
-| `rewrite-paths-of` | `rewrite_paths_of` | file → rewrite path | Enumerate the bounded rewrite chases the file engages in a declared finite rewrite domain, with their steps, bound, and terminal outcome. |
-| `file-of` | `file_of` | structural match or semantic source value → file | Move from code, a declaration, reference, call, input expression, or receiver analysis to its project file. |
-| `imports-of` | `imports_of` | file → file | Follow one resolved direct project-local import. |
-| `importers-of` | `importers_of` | file → file | Find every project file with a resolved direct import of that file. |
+Steps come in families. Each RQL wrapper has a JSON step whose name uses underscores, such as `enclosing-decl` and `enclosing_decl`. The table names the families and some typical steps; follow a family link for its complete step table.
+
+| Family | Typical steps | Use it to |
+| --- | --- | --- |
+| [Row operations](/reference/code-query/#row-operations) | `filter`, `project` | Keep rows by typed predicates, or publish selected fields to a relational binding. |
+| [Declarations, files, and imports](/reference/code-query/#declarations-files-and-imports) | `enclosing-decl`, `file-of`, `imports-of`, `importers-of`, `python-import-site`, `python-import-cycles` | Move from code to its declaration or file, follow direct imports, and inspect Python import facts or confirmed cycles. |
+| [Type hierarchy and members](/reference/code-query/#type-hierarchy-and-members) | `supertypes`, `subtypes`, `members`, `owner`, `member-family` | Walk indexed type relations and method families. |
+| [References and calls](/reference/code-query/#references-and-calls) | `references-of`, `used-by`, `callers`, `call-sites-to`, `call-input` | Follow exact references and resolved call edges. |
+| [Reference edges](/reference/code-query/#reference-edges) | `edges-of`, `edges-from`, `edge-target` | Compare forward and inverse "X uses Y" edges in one row shape. |
+| [Occurrences, scopes, bindings, and resolution](/reference/code-query/#occurrences-scopes-bindings-and-resolution) | `occurrences-in`, `binding-of`, `scope-of`, `candidates-of`, `overload-selection` | See what each identifier is, which binding is in effect, and why the resolver chose a target. |
+| [Qualified paths](/reference/code-query/#qualified-paths) | `segments-of`, `segment-target` | Resolve each segment of a qualified path. |
+| [Receivers and dispatch](/reference/code-query/#receivers-and-dispatch) | `receiver-targets`, `points-to`, `member-targets`, `receiver-outcome`, `dispatch-targets` | Analyze receiver values, member targets, and dispatch, within bounds. |
+| [Call shape, bindings, and signatures](/reference/code-query/#call-shape-bindings-and-signatures) | `call-shape`, `call-bindings`, `resolved-call`, `call-argument`, `resolved-value`, `callable-signature` | Map written arguments to formal parameters, select calls by resolved identity, and identify exact declarations used as values. |
+| [Effects and result contracts](/reference/code-query/#effects-and-result-contracts) | `call-effects`, `procedure-effects`, `call-result-contracts`, `result-contract-operation-uses` | Read declared effects and check uses of results against reviewed contracts. |
+| [Procedures, control flow, and branch and loop relations](/reference/code-query/#procedures-control-flow-and-branch-and-loop-relations) | `procedure-of`, `cfg-entry`, `cfg-successor-edges`, `control-relations`, `guards-of`, `branch-relations` | Inspect one procedure's control-flow graph and derived relations. |
+| [Flow, state, taint, and typestate](/reference/code-query/#flow-state-taint-and-typestate) | `state-events-of`, `flow-relations-of`, `value-flow`, `taint`, `typestate`, `witness`, `absent-member` | Read flow-sensitive state, and run or project registered analyses. |
+| [Values](/reference/code-query/#values) | `jsx-attribute-value`, `keyed-read-value`, `field-write-value` | Resolve specific value expressions, such as JSX attribute values or runtime environment reads. |
+| [Build topology](/reference/code-query/#build-topology) | `target-of`, `source-set-of`, `topology-edges-of` | Read build targets, source sets, and declared target dependencies. |
+| [Materialization](/reference/code-query/#materialization) | `generated-by`, `declaration-state-of`, `implementation-of`, `export-target` | Explain generated, declaration-only, recovered, and exported declarations. |
+| [Rewrite paths](/reference/code-query/#rewrite-paths) | `rewrite-paths-of` | Show bounded rewrite chases and how they ended. |
+
+Some queries start from a seed source instead of a structural pattern: `occurrences`, `scopes`, `bindings`, `paths`, `generation-sites`, `exports`, `dependency-evidence`, and `configuration-facts`. A seed source is wrapped by steps; it does not wrap a query. The [query plan field table](/reference/code-query/#query-plan-fields) lists each source and its filters.
 
 Row-local steps are schema checked before execution. In RQL, `(filter :where
 ((target_count gt 0)) QUERY)` uses unqualified field names because the pipeline
@@ -97,9 +66,17 @@ JSON references for the full operator, literal, and bound tables.
 
 For example, `(importers-of (file-of (function :name "target")))` answers “which project files directly import the file declaring `target`?” It is deliberately a file relationship: it does not prove that an importer uses that particular declaration, resolve an out-of-scope library's members, or manufacture external declarations. The `references-of`, `used-by`, and `uses` steps provide that exact declaration relationship separately, and `references-of` can compose through `file-of` when both symbol and import-file provenance matter. See [Typed Set Composition](/code-query-tutorials/set-composition/) for executable union, intersection, and subtraction over import traversal, and [Reference Traversal](/code-query-tutorials/reference-traversal/) for exact declaration edges. For bounded receiver values and members, see the executable [Receiver Traversal](/code-query-tutorials/receiver-traversal/) cookbook.
 
+Rust import edges follow `pub use` re-exports. A Rust `use` creates an edge to
+the module file that its path names. It also creates an edge to the file that defines
+the item, when the path reaches the item through re-exports. This covers
+single-name, chained, glob, and module re-exports, also across Cargo crates.
+The edge can point past the file that holds the re-export. Provenance keeps
+every `file-of`, `imports-of`, and `importers-of` step. The edge still does
+not show that the importing file uses a particular declaration.
+
 For CFG inspection, `(cfg-edge-target (cfg-successor-edges (cfg-entry (procedure-of (function :name "run")))))` returns the target point of every edge leaving `run`'s entry. Procedure, point, and edge rows carry checkout-independent content-scoped IDs, exact ranges, proof/completeness, and ordinary CodeQuery provenance. Each edge step is one hop and shares a separate finite semantic file/source/row/retained-byte/traversal budget. Explain mode shows the requested semantic facets without materialization; profile mode attributes actual semantic work to the physical pipeline steps.
 
-For registered typestate, `(witness :max-steps 32 :max-bytes 16384 (typestate :protocol-ref "embedding:resource-lifecycle" (procedure-of (function :name "lifecycle"))))` returns only the bounded witnesses retained by the same solver run. Findings and witnesses carry stable protocol/binding hashes, canonical subjects, certainty, proof/completeness, uncertainty, exact ranges, and omission metadata, but no severity or policy presentation. The host must pre-register the alias against the current workspace generation and exact procedure root; otherwise results/profile mode returns a typed incomplete diagnostic. Explain mode can still plan the query without resolving or running the registration.
+For registered typestate, `(witness :max-steps 32 :max-bytes 16384 (typestate :protocol-ref "embedding:resource-lifecycle" (procedure-of (function :name "lifecycle"))))` returns only the bounded witnesses retained by the same solver run. Findings and witnesses carry stable protocol/binding hashes, canonical subjects, certainty, proof/completeness, uncertainty, exact ranges, and omission metadata, but no severity or policy presentation. Only an in-process Rust host can register the alias, against the current workspace generation and exact procedure root. Otherwise, including in the CLI, REPL, and MCP server, results and profile mode return an `unresolved_protocol_reference` diagnostic with `incomplete` impact. See [Data Flow, Taint, and Typestate](/data-flow-and-typestate/). Explain mode can still plan the query without resolving or running the registration.
 
 For typed occurrences, `(occurrences :role binder (language "rust"))` is not the spelling: `occurrences` is a *source*, so it is wrapped rather than wrapping, as in `(language "rust" (occurrences :role binder))`. Each row says what the parser thinks one identifier token is at one exact position, with the resolved target for reference-class rows. Its `ast_id` is the content-scoped identity of the underlying AST node, equal to the `ast_id` a full-detail structural capture over the same node reports, so captures and occurrences join on one opaque string instead of on coincident ranges or spellings. Occurrence support is declared per language and per role; a query naming a role an adapter does not classify is reported incomplete rather than answered with zero rows.
 
@@ -107,7 +84,7 @@ For the lexical environment, `(scope-of (binding-of (occurrences :role receiver_
 
 For resolution candidates, `(candidates-of :outcome selected (occurrences :class reference))` lists what the resolver considered for each reference, with a precedence tier, an outcome, and a boundary status. Three things are deliberately not inferable from an empty answer: a candidate with no tier is *unattributed* rather than weakest (the `:tier unattributed` filter selects those rows); a trace whose `trace_completeness` is `selection_only` says nothing by omitting a rejection; and `candidate-target` answers only for unit-backed candidates, because a lexical binding and an external route carry no workspace declaration at all. Each of the three reports an `incomplete` diagnostic rather than a clean empty result where it matters.
 
-For canonical reference edges, `(edges-of :usage [reference] (function "register"))` and `(edges-from (occurrences :class reference))` state the same kind of fact from opposite ends, in one row shape, so the two derivations can be compared rather than merely coexisting. Every classification a comparison depends on -- the reference kind, the proof tier, the usage kind, the site class, the owner relation, the derivation direction and the workspace generation -- is an explicit field, never inferred from which step produced the set or from how many rows came back. `:surface` is optional with no default, because the complete edge answer includes editor-only rows. Only Java, Rust, Python, JavaScript and TypeScript answer the forward projection today; `edges-from` in any other language reports `edge_axis_unsupported` rather than an empty answer.
+For canonical reference edges, `(edges-of :usage [reference] (enclosing-decl (function :name "register")))` and `(edges-from (occurrences :class reference))` state the same kind of fact from opposite ends, in one row shape, so the two derivations can be compared rather than merely coexisting. Every classification a comparison depends on -- the reference kind, the proof tier, the usage kind, the site class, the owner relation, the derivation direction and the workspace generation -- is an explicit field, never inferred from which step produced the set or from how many rows came back. `:surface` is optional with no default, because the complete edge answer includes editor-only rows. Only Java, Kotlin, Rust, Python, JavaScript, and TypeScript answer the forward projection; `edges-from` in any other language reports `edge_axis_unsupported` rather than an empty answer.
 
 For flow-sensitive state, `(flow-relations-of :relation [reaching] :certainty [exact] (state-events-of (procedure-of (function :name "handler"))))` answers "has an assignment to this binding actually executed before this read?". The production control-flow graph is the only evidence source: source order, file co-presence and structural containment are never presented as a reaching-definition, a dominance, or a same-evaluation relation. A write that appears one line above a read but that no CFG path carries there produces no reaching row. `exact` means the establishment is the only definition of that subject in the read's IN set *and* dominates the read's program point; anything else is `may`. Where the lowering does not model an axis -- a language without CFG lowering, a field access with no binding-rooted base, a local the adapter declares but never establishes -- the rows say `completeness: partial`, name the uncovered axes, and the response carries `flow_state_axis_unsupported` or `flow_state_derivation_incomplete`. An empty answer is never silently a complete one, and an exhausted control-flow budget emits no rows rather than a shortened relation set.
 
@@ -136,9 +113,8 @@ model directly. `.rql` files and editor buffers accept RQL text only.
 See [JSON CodeQuery](/code-query-json/) for the complete schema, validation
 rules, result model, and machine payload examples. See
 [Rune Query Language](/rune-query-language/) for interactive authoring and
-canonical JSON inspection, and [MCP query and RQL
-availability](/mcp/#query-and-rql-availability) for the exact inline and saved
-file surfaces. Use [Explain and Profile
+canonical JSON inspection, and the Query and RQL Availability section of
+[MCP](/mcp/) for the exact inline and saved file surfaces. Use [Explain and Profile
 CodeQuery](/code-query-explain-profile/) to inspect logical sharing and physical
 selection before execution or collect opt-in operator, cache, budget, wait, and
 concurrency observations from one execution.

@@ -1,5 +1,7 @@
-use crate::analyzer::common::identifier_addresses_target;
-use crate::analyzer::common::language_for_target as code_unit_language;
+use crate::analyzer::common::{
+    display_symbol_for_target, identifier_addresses_target,
+    language_for_target as code_unit_language,
+};
 use crate::analyzer::{CodeUnit, GO_MODULE_SCOPE_SEGMENT, IAnalyzer, Language};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -193,7 +195,132 @@ pub(crate) fn resolve_codeunit_exact(analyzer: &dyn IAnalyzer, input: &str) -> V
         .filter(|unit| unit.fq_name() == trimmed)
         .cloned()
         .collect();
+    // Recorded segment boundaries preserve authored identifier spelling. A
+    // decorated Scala owner alone does not make the terminal selector physical:
+    // nested types, methods and objects can share its normalized selector.
+    let exact_structured = exact.iter().any(|unit| {
+        if code_unit_language(unit) == Language::Scala {
+            display_symbol_for_target(analyzer, unit) == trimmed
+        } else {
+            query_symbol_interpretations(code_unit_language(unit), trimmed)
+                .contains(&unit.fq_segment_texts())
+        }
+    });
+    let explicit_scala_identity = exact.iter().any(|unit| {
+        code_unit_language(unit) == Language::Scala
+            && ((exact.len() == 1
+                && analyzer
+                    .type_alias_provider()
+                    .is_some_and(|provider| provider.is_type_alias(unit)))
+                || unit.fq().segments().last().is_some_and(|&segment| {
+                    crate::analyzer::fq_name::segment_interner()
+                        .resolve(segment)
+                        .1
+                        == crate::analyzer::fq_name::SegmentKind::Companion
+                }))
+    });
+    if exact_structured || explicit_scala_identity {
+        return exact;
+    }
+    let normalized = scala_normalized_exact_matches(analyzer, trimmed);
+    let normalized = if exact.is_empty() {
+        normalized
+    } else {
+        // Keep normalized candidates in an exact result only when they share
+        // the selector group the exact declarations advertise. A nested type,
+        // method, and object may share one source-written selector, while a
+        // class and companion object publish distinct selectors when the
+        // class owns the undecorated fq spelling.
+        let exact_selectors = exact
+            .iter()
+            .map(|unit| display_symbol_for_target(analyzer, unit))
+            .collect::<BTreeSet<_>>();
+        normalized
+            .into_iter()
+            .filter(|unit| exact_selectors.contains(&display_symbol_for_target(analyzer, unit)))
+            .collect()
+    };
+    if !normalized.is_empty() {
+        if exact.is_empty() {
+            return normalized;
+        }
+        let mut exact = exact;
+        exact.extend(normalized);
+        exact.sort();
+        exact.dedup();
+        return exact;
+    }
     if exact.is_empty() { matches } else { exact }
+}
+
+/// Scala's rendered fully-qualified spelling omits the trailing `$` that
+/// distinguishes singleton-object declarations in storage. An exact query
+/// can therefore find some declarations under the normalized name while
+/// omitting object declarations whose stored fq retains `$` (e.g. a type,
+/// method, and same-named nested object). Complete that exact answer from the
+/// identifier index, but keep candidates only when their full structured fq
+/// alias equals one of the query's Scala spellings.
+fn scala_normalized_exact_matches(analyzer: &dyn IAnalyzer, input: &str) -> Vec<CodeUnit> {
+    if !analyzer.languages().contains(&Language::Scala) {
+        return Vec::new();
+    }
+    let query_paths: BTreeSet<_> = query_symbol_interpretations(Language::Scala, input)
+        .into_iter()
+        .filter(|path| path.len() > 1)
+        .collect();
+    let recorded_query_path = symbol_path_variants(Language::Scala, input)
+        .into_iter()
+        .next();
+    if query_paths.is_empty() {
+        return Vec::new();
+    }
+
+    let mut terminals = BTreeSet::new();
+    for path in &query_paths {
+        let Some(terminal) = path.last() else {
+            continue;
+        };
+        let normalized = terminal.trim_end_matches('$');
+        if normalized.is_empty() {
+            continue;
+        }
+        terminals.insert(normalized.to_string());
+        terminals.insert(format!("{normalized}$"));
+    }
+
+    let mut matches = BTreeSet::new();
+    for terminal in terminals {
+        for candidate in analyzer.lookup_candidates_by_identifier(&terminal) {
+            if code_unit_language(&candidate) == Language::Scala
+                && codeunit_lookup_aliases(&candidate)
+                    .iter()
+                    .any(|alias| query_paths.contains(alias))
+            {
+                matches.insert(candidate);
+            }
+        }
+    }
+    // A rendered Scala path can erase the distinction between a source
+    // segment ending in `$` and the `$` added for a companion object. When
+    // one candidate's recorded segment texts are an exact reading of the
+    // query, its display selector is the only valid group for this spelling.
+    // If none is exact, retain the existing companion grouping: that is what
+    // makes `CharsetRange.Atom` address both halves of a nested companion.
+    let exact_selectors: BTreeSet<_> = matches
+        .iter()
+        .filter(|candidate| {
+            recorded_query_path
+                .as_ref()
+                .is_some_and(|path| path == &candidate.fq_segment_texts())
+        })
+        .map(|candidate| display_symbol_for_target(analyzer, candidate))
+        .collect();
+    if !exact_selectors.is_empty() {
+        matches.retain(|candidate| {
+            exact_selectors.contains(&display_symbol_for_target(analyzer, candidate))
+        });
+    }
+    matches.into_iter().collect()
 }
 
 pub(crate) fn resolve_codeunit_fuzzy_with(
@@ -404,15 +531,12 @@ fn bare_name_resolution(
 ) -> Result<Option<CodeUnitResolution>, FuzzyResolveStop> {
     // Neither accumulation loop below polls `keep_going`, and that is the
     // point. Both are cheap in-memory filters over rows two indexed store
-    // reads have already produced (306 ms for 22,177 rows on the rustc tree;
-    // 11.7 ms to filter them), and what they produce is the deduplicated match
+    // reads have already produced, and what they produce is the deduplicated match
     // count -- the input to the fan-out gate at the top of
     // `resolution_from_matches`. Polling here meant a caller whose budget
     // expired during those two reads got a bare `Cancelled` instead of the
     // structured `TooManyCandidates` the count was about to justify, because
-    // `keep_going` is asked before `admits` is ever reached. Measured on the
-    // rustc tree: the `main` cell returned `time_budget` and never evaluated
-    // its own gate (`.agents/docs/gate-cell-overhead-2026-08.md`). The budget
+    // `keep_going` is asked before `admits` is ever reached. The budget
     // still governs everything expensive: the per-match `definitions` reads in
     // `resolution_from_matches` poll it per match, and the caller polls it
     // again on entry to the next resolution stage.
@@ -1067,17 +1191,22 @@ fn symbol_path_variants(language: Language, value: &str) -> Vec<Vec<String>> {
     }
 
     let mut variants = vec![primary.clone()];
-    let scala_normalized: Vec<_> = primary
-        .iter()
-        .map(|segment| segment.trim_end_matches('$').to_string())
-        .collect();
-    if scala_normalized != primary && scala_normalized.iter().all(|segment| !segment.is_empty()) {
-        variants.push(scala_normalized);
+    if language == Language::Scala {
+        let scala_normalized: Vec<_> = primary
+            .iter()
+            .map(|segment| segment.trim_end_matches('$').to_string())
+            .collect();
+        if scala_normalized != primary && scala_normalized.iter().all(|segment| !segment.is_empty())
+        {
+            variants.push(scala_normalized);
+        }
     }
 
-    let dollar_split = split_segments_on_dollar(&primary);
-    if dollar_split != primary {
-        variants.push(dollar_split);
+    if !matches!(language, Language::JavaScript | Language::TypeScript) {
+        let dollar_split = split_segments_on_dollar(&primary);
+        if dollar_split != primary {
+            variants.push(dollar_split);
+        }
     }
 
     // Respell every variant, not just the primary: a nested C# generic member
@@ -1259,27 +1388,16 @@ mod tests {
     use super::*;
     use crate::analyzer::python::PythonAdapter;
     use crate::analyzer::tree_sitter_analyzer::TreeSitterAnalyzer;
-    use crate::analyzer::{Project, TestProject};
     use std::cell::Cell;
-    use std::sync::Arc;
 
     /// A workspace where one identifier names `count` distinct declarations —
     /// the shape #1839 measured at 20,935 on the rustc tree for `main`.
     fn same_named_declarations(
         count: usize,
     ) -> (tempfile::TempDir, TreeSitterAnalyzer<PythonAdapter>) {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        std::fs::create_dir_all(root.join("pkg")).expect("create pkg");
-        std::fs::write(root.join("pkg/__init__.py"), "").expect("write package marker");
-        for index in 0..count {
-            std::fs::write(
-                root.join(format!("pkg/mod_{index}.py")),
-                "class Shared:\n    pass\n",
-            )
-            .expect("write module");
-        }
-        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Python));
+        let (temp, project) = crate::analyzer::test_support::python_package_project(
+            (0..count).map(|_| "class Shared:\n    pass\n".to_string()),
+        );
         let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter);
         (temp, analyzer)
     }
@@ -1408,10 +1526,7 @@ mod tests {
     /// budget expires during those reads used to get a bare `Cancelled` --
     /// `keep_going` was polled per candidate, before `admits` was ever reached
     /// -- so the tool reported the caller's own clock instead of the answer it
-    /// already had. Measured on the rustc tree: the `main` cell reported
-    /// `time_budget` and never evaluated its own gate, in every repetition
-    /// where resolution ran at all
-    /// (`.agents/docs/gate-cell-overhead-2026-08.md`).
+    /// already had.
     ///
     /// `budget_spent_after(1)` leaves exactly the entry poll in
     /// `resolve_codeunit_fuzzy_bounded_with` alive, so the budget is spent by
@@ -1532,28 +1647,47 @@ mod tests {
     }
 
     #[test]
-    fn csharp_generic_member_alias_includes_arity_free_form() {
-        let variants = symbol_path_variants(Language::CSharp, "Ns.Top`1.Go");
-        assert!(
-            variants
-                .iter()
-                .any(|v| v == &vec!["Ns".to_string(), "Top".to_string(), "Go".to_string()]),
-            "arity-free member variant must be offered: {variants:?}"
-        );
+    fn csharp_generic_member_aliases_include_arity_free_forms() {
+        for (input, expected) in [
+            ("Ns.Top`1.Go", &["Ns", "Top", "Go"][..]),
+            (
+                "Ns.Outer$Inner`1.Method",
+                &["Ns", "Outer", "Inner", "Method"][..],
+            ),
+        ] {
+            let variants = symbol_path_variants(Language::CSharp, input);
+            assert!(
+                variants.iter().any(|variant| {
+                    variant
+                        .iter()
+                        .map(String::as_str)
+                        .eq(expected.iter().copied())
+                }),
+                "arity-free member variant must be offered for {input:?}: {variants:?}"
+            );
+        }
     }
 
     #[test]
-    fn csharp_nested_generic_member_alias_includes_dollar_split_arity_free_form() {
-        let variants = symbol_path_variants(Language::CSharp, "Ns.Outer$Inner`1.Method");
+    fn javascript_and_typescript_keep_trailing_dollars_in_identifier_names() {
+        for language in [Language::JavaScript, Language::TypeScript] {
+            let variants = symbol_path_variants(language, "get$$");
+            assert_eq!(
+                variants,
+                vec![vec!["get$$".to_string()]],
+                "a dollar suffix is part of a {language:?} identifier: {variants:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn java_nested_class_names_keep_the_dollar_split_alias() {
+        let variants = symbol_path_variants(Language::Java, "pkg.Outer$Inner");
         assert!(
-            variants.iter().any(|v| v
-                == &vec![
-                    "Ns".to_string(),
-                    "Outer".to_string(),
-                    "Inner".to_string(),
-                    "Method".to_string()
-                ]),
-            "nested arity-free member variant must be offered: {variants:?}"
+            variants.iter().any(|variant| {
+                variant == &["pkg".to_string(), "Outer".to_string(), "Inner".to_string()]
+            }),
+            "nested Java class alias must remain available: {variants:?}"
         );
     }
 }

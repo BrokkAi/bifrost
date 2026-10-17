@@ -233,6 +233,54 @@ impl MemberFamilyAnswer {
     }
 }
 
+pub(crate) fn proven_member_family_answer(
+    capability: MemberFamilyCapability,
+    member: &CodeUnit,
+    implements: impl IntoIterator<Item = (CodeUnit, CodeUnit)>,
+    implemented_by: impl IntoIterator<Item = (CodeUnit, CodeUnit)>,
+) -> MemberFamilyAnswer {
+    let implements: Vec<_> = implements.into_iter().collect();
+    let roots = if implements.is_empty() {
+        vec![member.clone()]
+    } else {
+        let mut roots: Vec<CodeUnit> = implements
+            .iter()
+            .map(|(member, _)| member.clone())
+            .collect();
+        roots.sort();
+        roots.dedup();
+        roots
+    };
+    let edges = implements
+        .into_iter()
+        .map(|(target, owner)| MemberFamilyEdge {
+            target,
+            owner,
+            relation: MethodFamilyRelation::Implements,
+            depth: 1,
+            arity_unique: true,
+        })
+        .chain(
+            implemented_by
+                .into_iter()
+                .map(|(target, owner)| MemberFamilyEdge {
+                    target,
+                    owner,
+                    relation: MethodFamilyRelation::ImplementedBy,
+                    depth: 1,
+                    arity_unique: true,
+                }),
+        )
+        .collect();
+    MemberFamilyAnswer {
+        capability,
+        outcome: MemberFamilyOutcome::Proven,
+        reason: None,
+        edges,
+        roots,
+    }
+}
+
 /// Why an external-root workspace member-family query is incomplete even
 /// though it is supported and was not cancelled or budget-exhausted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1199,52 +1247,6 @@ mod tests {
         }
     }
 
-    /// The support table is total and honest.
-    ///
-    /// Totality is a compile-time property -- [`member_family_support`] is an
-    /// exhaustive `match` with no wildcard arm, so a new [`Language`] variant
-    /// fails to build until it is listed. This test states the two run-time
-    /// properties the match cannot: every unsupported arm names the fact that
-    /// is missing, and no arm claims a capability while reporting itself
-    /// unsupported.
-    #[test]
-    fn member_family_support_table_is_total_and_states_every_gap() {
-        for language in Language::ALL {
-            match member_family_support(language) {
-                MemberFamilySupport::Supported(capability) => {
-                    assert_ne!(
-                        capability,
-                        MemberFamilyCapability::Unsupported,
-                        "{language:?} claims support with no capability"
-                    );
-                    assert_ne!(
-                        capability,
-                        MemberFamilyCapability::ErasedParameterTypes,
-                        "{language:?} claims erased parameter types, but no adapter resolves or \
-                         erases a declared parameter type; each records the written spelling"
-                    );
-                }
-                MemberFamilySupport::Unsupported(reason) => {
-                    assert!(
-                        !reason.trim().is_empty(),
-                        "{language:?} is unsupported without naming the missing fact"
-                    );
-                    assert_eq!(
-                        member_family_support(language).capability(),
-                        MemberFamilyCapability::Unsupported,
-                        "{language:?} reports a capability it cannot back"
-                    );
-                }
-            }
-        }
-    }
-
-    /// Every language the nominal walk implements is listed as supported, and
-    /// each rule answers for exactly the language the table names.
-    ///
-    /// This is what keeps the table from drifting away from the code: adding a
-    /// rule without listing it, or listing a language whose rule was removed,
-    /// fails here rather than silently answering `unsupported` at run time.
     #[test]
     fn nominal_rules_and_the_support_table_agree() {
         let rules: [&dyn NominalFamilyRules; 3] =

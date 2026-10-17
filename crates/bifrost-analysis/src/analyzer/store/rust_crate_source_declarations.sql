@@ -1,4 +1,7 @@
-INSERT INTO cr_source_declarations(
+-- Several physical paths can place the same blob in the same module. Their
+-- declaration facts have this content-level key; source paths remain in the
+-- path-aware member relation.
+INSERT OR IGNORE INTO cr_source_declarations(
   module_path, blob_id, declaration_id, visibility, cfg_condition, activation,
   declaration_kind, macro_exported, nearest_declaration_boundary, identifier
 )

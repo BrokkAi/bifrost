@@ -101,17 +101,7 @@ fn resolve_input(
 }
 
 fn render_file_summary(analyzer: &JavaAnalyzer, file: &ProjectFile) -> Option<String> {
-    let skeletons: BTreeMap<CodeUnit, String> = analyzer
-        .top_level_declarations(file)
-        .into_iter()
-        .filter(|code_unit| !code_unit.is_anonymous())
-        .filter_map(|code_unit| {
-            analyzer
-                .get_skeleton(&code_unit)
-                .filter(|skeleton| !skeleton.trim().is_empty())
-                .map(|skeleton| (code_unit.clone(), skeleton))
-        })
-        .collect();
+    let skeletons = collect_visible_skeletons(analyzer, analyzer.top_level_declarations(file));
     let rendered = format_skeletons_by_package(&skeletons);
     (!rendered.is_empty()).then_some(rendered)
 }
@@ -123,17 +113,7 @@ fn render_code_unit_summary(analyzer: &JavaAnalyzer, fq_name: &str) -> Option<St
     }
 
     let primary_target = (primary_targets.len() == 1).then(|| primary_targets[0].clone());
-    let mut skeletons = BTreeMap::new();
-    for code_unit in &primary_targets {
-        if code_unit.is_anonymous() {
-            continue;
-        }
-        if let Some(skeleton) = analyzer.get_skeleton(code_unit)
-            && !skeleton.trim().is_empty()
-        {
-            skeletons.insert(code_unit.clone(), skeleton);
-        }
-    }
+    let skeletons = collect_visible_skeletons(analyzer, primary_targets.iter().cloned());
 
     if skeletons.is_empty() {
         return None;
@@ -151,6 +131,22 @@ fn render_code_unit_summary(analyzer: &JavaAnalyzer, fq_name: &str) -> Option<St
         &skeletons,
         analyzer,
     ))
+}
+
+fn collect_visible_skeletons(
+    analyzer: &JavaAnalyzer,
+    code_units: impl IntoIterator<Item = CodeUnit>,
+) -> BTreeMap<CodeUnit, String> {
+    code_units
+        .into_iter()
+        .filter(|code_unit| !code_unit.is_anonymous())
+        .filter_map(|code_unit| {
+            analyzer
+                .get_skeleton(&code_unit)
+                .filter(|skeleton| !skeleton.trim().is_empty())
+                .map(|skeleton| (code_unit, skeleton))
+        })
+        .collect()
 }
 
 fn direct_named_ancestors(analyzer: &JavaAnalyzer, code_unit: &CodeUnit) -> Vec<CodeUnit> {

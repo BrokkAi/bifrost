@@ -8,14 +8,12 @@
 #[cfg(test)]
 mod tests {
     use crate::analyzer::rust::RustAnalyzer;
+    use crate::analyzer::rust::test_support::analyzed_file as file;
     use crate::analyzer::{AnalyzerQueryScope, QueryScope};
     use crate::analyzer::{AnalyzerTestHooks, CodeUnitIndex};
-    use crate::analyzer::{IAnalyzer, Language, ProjectFile, TestProject};
+    use crate::analyzer::{IAnalyzer, Language, ProjectFile};
     use crate::inline_project::{BuiltInlineTestProject, InlineTestProject};
-    use brokk_bifrost_rust::graph_support::{
-        RustCargoRouteError, rust_module_files_at, rust_module_files_from_path,
-        rust_relative_module_segments,
-    };
+    use brokk_bifrost_rust::graph_support::RustCargoRouteError;
     use brokk_bifrost_rust::usage::{
         Domain, RustMacroInvocationResolution, RustMacroInvocationRoute, RustSymbolIdentity,
         RustSymbolNamespace,
@@ -23,27 +21,16 @@ mod tests {
     use brokk_bifrost_rust::usage::{usage_binding_seeds, usage_importers};
     use brokk_bifrost_rust::usage_includes::RustIncludeRoutes;
     use brokk_bifrost_rust::usage_walks::RustUsageWalks;
+    use brokk_bifrost_test_macros::hardwon;
     use std::collections::BTreeSet;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     fn project(files: &[(&str, &str)]) -> (tempfile::TempDir, RustAnalyzer) {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().canonicalize().expect("canonical root");
-        for (rel, body) in files {
-            ProjectFile::new(root.clone(), rel)
-                .write(body)
-                .expect("write fixture file");
-        }
-        let analyzer = RustAnalyzer::from_project(TestProject::new(root, Language::Rust));
-        // Force the analysis pass that persists the per-file fact rows.
-        let _ = analyzer.get_analyzed_files();
-        (temp, analyzer)
+        crate::analyzer::rust::test_support::project(files)
     }
 
-    /// `modules` modules in one crate, each re-exporting a name from
-    /// `neighbours` of its successors modulo the count. The import graph is
-    /// therefore one strongly connected component of that size, which is the
-    /// shape issue #1809 measured.
+    /// Build one strongly connected module graph with `modules` nodes and the
+    /// requested number of forward neighbours from each node.
     fn cyclic_project(modules: usize, neighbours: usize) -> (tempfile::TempDir, RustAnalyzer) {
         let mut lib = String::new();
         for index in 0..modules {
@@ -80,14 +67,6 @@ mod tests {
         (project, analyzer)
     }
 
-    fn file(analyzer: &RustAnalyzer, suffix: &str) -> ProjectFile {
-        analyzer
-            .get_analyzed_files()
-            .into_iter()
-            .find(|file| file.rel_path().ends_with(suffix))
-            .unwrap_or_else(|| panic!("{suffix} is analyzed"))
-    }
-
     fn identity_named(
         walks: &RustUsageWalks<'_>,
         file: &ProjectFile,
@@ -103,66 +82,10 @@ mod tests {
             .unwrap_or_else(|| panic!("{name} is declared in {file:?}"))
     }
 
-    /// An inverted hit is a candidate, never an answer, and for an import edge
-    /// the thing that decides is module resolution: two files import a `Widget`
-    /// and a third only mentions the name, but exactly one of those imports
-    /// resolves to the module that declares the target.
-    ///
-    /// Returning the candidate set unverified passes the first assertion and
-    /// fails the second, which is what makes this a regression guard rather
-    /// than a restatement of the implementation.
     #[test]
-    fn a_candidate_importer_whose_import_resolves_elsewhere_is_rejected() {
-        let (_temp, analyzer) = project(&[
-            (
-                "src/lib.rs",
-                "pub mod service;\npub mod decoy;\npub mod consumer;\npub mod bystander;\npub mod impostor;\n",
-            ),
-            ("src/service.rs", "pub struct Widget;\n"),
-            ("src/decoy.rs", "pub struct Widget;\n"),
-            (
-                "src/consumer.rs",
-                "use crate::service::Widget;\npub fn take(_: Widget) {}\n",
-            ),
-            (
-                "src/impostor.rs",
-                "use crate::decoy::Widget;\npub fn take(_: Widget) {}\n",
-            ),
-            (
-                "src/bystander.rs",
-                "pub fn describe() -> &'static str { \"Widget\" }\npub struct Widget;\n",
-            ),
-        ]);
-        let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
-        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token())
-            .expect("Cargo routes available for the fixture");
-        let service = file(&analyzer, "service.rs");
-        let consumer = file(&analyzer, "consumer.rs");
-        let target = identity_named(&walks, &service, "Widget");
-
-        let candidates = walks
-            .importer_candidates_for(&target)
-            .expect("uncancelled fixture importer candidates");
-        assert!(
-            candidates.contains(&file(&analyzer, "impostor.rs"))
-                && candidates.contains(&file(&analyzer, "bystander.rs")),
-            "the offered candidates must include the files this test rejects: {candidates:?}"
-        );
-
-        let importers: BTreeSet<ProjectFile> = walks
-            .edges_binding_identity(&target)
-            .expect("uncancelled fixture binding-edge walk")
-            .into_iter()
-            .map(|edge| edge.importer)
-            .collect();
-        assert_eq!(
-            importers,
-            BTreeSet::from([consumer]),
-            "only the import that resolves to the declaring module binds the target"
-        );
-    }
-
-    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "bd33e1b59a9f: a failed inverse fact read must not cache a complete empty walk"
+    )]
     fn failed_binding_edge_walk_is_retryable_without_empty_cache() {
         let (_temp, analyzer) = binding_edge_project();
         let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
@@ -193,42 +116,6 @@ mod tests {
             retry.iter().any(|edge| edge.importer == consumer),
             "a failed walk must not publish an empty binding-edge cache: {retry:#?}"
         );
-    }
-
-    #[test]
-    fn failed_include_fact_read_does_not_cache_empty_routes() {
-        let fixture = InlineTestProject::with_language(Language::Rust)
-            .file("src/lib.rs", "include!(\"generated.rs\");\n")
-            .file("src/generated.rs", "pub fn generated() {}\n")
-            .build();
-        let analyzer = RustAnalyzer::new(fixture.project_dyn());
-        assert_eq!(analyzer.get_analyzed_files().len(), 2);
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        let includes = RustIncludeRoutes::new(&analyzer, scope.token()).unwrap();
-        let generated = fixture.file("src/generated.rs");
-        analyzer
-            .analyzer_store()
-            .with_unreadable_rust_identifier_occurrences_for_test(|| {
-                // Include verification hydrates the host's complete fact families;
-                // a failed family read must not publish an empty include route.
-                assert_eq!(
-                    includes.include_routes_for(&generated).unwrap_err(),
-                    RustCargoRouteError::Unavailable
-                );
-                assert_eq!(
-                    includes.all_included_files().unwrap_err(),
-                    RustCargoRouteError::Unavailable
-                );
-            });
-        assert!(scope.store_error().is_some());
-        let routes = includes.include_routes_for(&generated).unwrap();
-        assert!(
-            routes
-                .iter()
-                .any(|route| route.root_file == fixture.file("src/lib.rs")),
-            "{routes:?}"
-        );
-        assert_eq!(includes.all_included_files().unwrap(), vec![generated]);
     }
 
     #[test]
@@ -269,6 +156,9 @@ mod tests {
     /// not be offered for expensive forward-edge verification.
     #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
+    #[hardwon(
+        "#2315: It prevents ordinary terminal-name mentions from entering the module-import candidate set."
+    )]
     fn module_import_candidates_exclude_ordinary_terminal_name_mentions() {
         let mut files = vec![
             (
@@ -366,310 +256,15 @@ mod tests {
         );
     }
 
-    /// A walk result is memoized for the analyzer that produced it and for no
-    /// longer. The analyzer instance is the generation: `update_all` builds a
-    /// fresh one with fresh caches, which is the invalidation these
-    /// analyzer-derived values actually have.
-    #[test]
-    fn walk_results_are_memoized_per_generation_and_retire_with_the_analyzer() {
-        let (_temp, analyzer) = project(&[
-            ("src/lib.rs", "pub mod service;\n"),
-            ("src/service.rs", "pub struct Widget;\n"),
-        ]);
-        let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
-        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token())
-            .expect("Cargo routes available for the fixture");
-        let first = walks.files_in_module_package("service");
-        let second = RustUsageWalks::new(&analyzer, analyzer_scope.token())
-            .expect("Cargo routes available for the fixture")
-            .files_in_module_package("service");
-        assert!(
-            Arc::ptr_eq(&first, &second),
-            "a second walker in the same generation must hit the cache"
-        );
-        // Both the file whose package IS the module and the file that
-        // declares `mod service;` back it, which is what `RustModuleFiles`
-        // held in its two maps.
-        assert_eq!(
-            *first,
-            vec![file(&analyzer, "lib.rs"), file(&analyzer, "service.rs")],
-            "files were {first:?}"
-        );
-
-        let updated = analyzer.update_all();
-        let updated_scope = AnalyzerQueryScope::new(&updated);
-        let after = RustUsageWalks::new(&updated, updated_scope.token())
-            .expect("Cargo routes available after update")
-            .files_in_module_package("service");
-        assert!(
-            !Arc::ptr_eq(&first, &after),
-            "a generation bump must not serve the previous generation's entry"
-        );
-        assert_eq!(*after, *first, "the answer itself is unchanged");
-    }
-
-    /// The four-candidate filesystem probe is memoized per module path.
-    ///
-    /// Uncached it is four `ProjectFile` constructions and four `exists()`
-    /// calls, asked once per import specifier per file. `module_probe_
-    /// computations` counts the executions, so the pin is a count and not a
-    /// timing: reverting `probe_module_files` to compute unconditionally makes
-    /// the repeat loop bump the counter once per ask.
-    #[test]
-    fn the_module_probe_runs_once_per_module_path_per_generation() {
-        let (_temp, analyzer) = project(&[
-            ("src/lib.rs", "pub mod service;\n"),
-            ("src/service.rs", "pub struct Widget;\n"),
-        ]);
-        let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
-        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token())
-            .expect("Cargo routes available for the fixture");
-        let importer = file(&analyzer, "lib.rs");
-
-        let before = walks.caches.module_probe_computations();
-        let first = walks.probed_module_files_from_path(&importer, "crate::service");
-        assert_eq!(
-            walks.caches.module_probe_computations(),
-            before + 1,
-            "the first ask must run the probe"
-        );
-        assert_eq!(
-            *first,
-            rust_module_files_from_path(&importer, "crate::service"),
-            "the memo must answer what the unmemoized probe answers"
-        );
-
-        for _ in 0..8 {
-            let again = walks.probed_module_files_from_path(&importer, "crate::service");
-            assert!(
-                Arc::ptr_eq(&first, &again),
-                "a repeat ask must hit the memo"
-            );
-        }
-        // A second walker in the same generation shares the analyzer's caches.
-        let sibling = RustUsageWalks::new(&analyzer, analyzer_scope.token())
-            .expect("Cargo routes available for the fixture")
-            .probed_module_files_from_path(&importer, "crate::service");
-        assert!(Arc::ptr_eq(&first, &sibling));
-        assert_eq!(
-            walks.caches.module_probe_computations(),
-            before + 1,
-            "no ask after the first may run the probe again"
-        );
-
-        // A miss is memoized too: most probes find nothing, and that is the
-        // case the caches exist for.
-        let missing = walks.probed_module_files_from_path(&importer, "crate::absent");
-        assert!(missing.is_empty());
-        let after_miss = walks.caches.module_probe_computations();
-        let missing_again = walks.probed_module_files_from_path(&importer, "crate::absent");
-        assert!(Arc::ptr_eq(&missing, &missing_again));
-        assert_eq!(walks.caches.module_probe_computations(), after_miss);
-
-        // The generation is the invalidation, exactly as for every other walk
-        // cache: a fresh analyzer probes the filesystem again.
-        let updated = analyzer.update_all();
-        let updated_scope = AnalyzerQueryScope::new(&updated);
-        let next = RustUsageWalks::new(&updated, updated_scope.token())
-            .expect("Cargo routes available after update");
-        let importer = file(&updated, "lib.rs");
-        let fresh = next.probed_module_files_from_path(&importer, "crate::service");
-        assert_eq!(next.caches.module_probe_computations(), 1);
-        assert_eq!(*fresh, *first, "the answer itself is unchanged");
-    }
-
-    /// The re-export closure asks for the import edges binding one identity per
-    /// importer of a name. Which module a candidate's `use` reaches is a fact
-    /// about the candidate, not about the identity asked for, so the routes a
-    /// candidate resolves must be resolved once per generation and reused by
-    /// every later identity.
-    ///
-    /// Issue #2632: `scan_usages_by_location` on this repository asked
-    /// `edges_binding_identity` for 328 identities named `WorkspaceAnalyzer`
-    /// over the same 291 candidate files, and each ask re-resolved every
-    /// candidate's `use` paths. That made the closure quadratic in the import
-    /// count and spent 39 s of a 47 s scan re-deriving routes it already had.
-    /// The counter here is the resolver work: flat across identities with the
-    /// per-file memo, and one candidate scan per identity without it.
-    #[test]
-    fn binding_edges_resolve_each_candidate_route_once_per_generation() {
-        const IMPORTERS: usize = 12;
-        let mut lib = String::from("pub mod service;\n");
-        for index in 0..IMPORTERS {
-            lib.push_str(&format!("pub mod m{index};\n"));
-        }
-        let mut sources: Vec<(String, String)> = vec![
-            ("src/lib.rs".to_string(), lib),
-            (
-                "src/service.rs".to_string(),
-                "pub struct Widget;\n".to_string(),
-            ),
-        ];
-        for index in 0..IMPORTERS {
-            sources.push((
-                format!("src/m{index}.rs"),
-                format!(
-                    "pub use crate::service::Widget;\n\
-                     pub fn take{index}(_: Widget) {{}}\n"
-                ),
-            ));
-        }
-        let borrowed: Vec<(&str, &str)> = sources
-            .iter()
-            .map(|(rel, body)| (rel.as_str(), body.as_str()))
-            .collect();
-        let (_temp, analyzer) = project(&borrowed);
-        let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
-        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token()).unwrap();
-        let service = file(&analyzer, "service.rs");
-        let root = identity_named(&walks, &service, "Widget");
-
-        let before = walks.caches.route_resolutions();
-        let root_edges = walks.edges_binding_identity(&root).unwrap();
-        let after_root = walks.caches.route_resolutions();
-        assert!(
-            after_root > before,
-            "the first ask must resolve the candidates' module routes"
-        );
-
-        // The identities the closure in `usage.rs` derives from those edges:
-        // one per module-scope importer, all naming the same item.
-        let aliases: Vec<RustSymbolIdentity> = root_edges
-            .iter()
-            .filter(|edge| edge.propagate_alias)
-            .map(|edge| RustSymbolIdentity {
-                file: edge.importer.clone(),
-                module: edge.importer_module.clone(),
-                name: root.name.clone(),
-                namespace: root.namespace,
-            })
-            .collect();
-        assert_eq!(
-            aliases.len(),
-            IMPORTERS,
-            "every importer re-exports the name, so every importer binds an alias: {root_edges:?}"
-        );
-
-        for alias in &aliases {
-            walks.edges_binding_identity(alias).unwrap();
-        }
-        assert_eq!(
-            walks.caches.route_resolutions(),
-            after_root,
-            "no identity after the first may resolve a candidate's routes again"
-        );
-    }
-
-    /// The workspace declaration lookup behind `files_in_module_package` is
-    /// keyed on the module's short name, so it runs once per short name even
-    /// when many module packages end in it.
-    ///
-    /// Issue #2622: one warm whole-workspace usage scan asked about 29,014
-    /// distinct module packages -- most of them speculative ancestor
-    /// candidates that no file declares -- and each ask paid its own candidate
-    /// query plus `CodeUnit` hydration, about half the scan's CPU. Every file's
-    /// `mod tests` shares one short name, so the counter here is 1 with the
-    /// grouped index and one per package without it.
-    #[test]
-    fn module_declaration_lookups_run_once_per_short_name_per_generation() {
-        const MODULES: usize = 12;
-        let mut lib = String::new();
-        for index in 0..MODULES {
-            lib.push_str(&format!("pub mod m{index};\n"));
-        }
-        let mut sources: Vec<(String, String)> = vec![("src/lib.rs".to_string(), lib)];
-        for index in 0..MODULES {
-            sources.push((
-                format!("src/m{index}.rs"),
-                format!(
-                    "pub struct Item{index};\n\
-                     #[cfg(test)]\nmod tests {{\n    use super::*;\n    #[test]\n    fn works() {{ let _ = Item{index}; }}\n}}\n"
-                ),
-            ));
-        }
-        let borrowed: Vec<(&str, &str)> = sources
-            .iter()
-            .map(|(rel, body)| (rel.as_str(), body.as_str()))
-            .collect();
-        let (_temp, analyzer) = project(&borrowed);
-        let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
-        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token()).unwrap();
-
-        let before = walks.caches.module_declaration_lookups();
-        for index in 0..MODULES {
-            let package = format!("m{index}.tests");
-            assert_eq!(
-                *walks.files_in_module_package(&package),
-                vec![file(&analyzer, &format!("m{index}.rs"))],
-                "{package} is declared by exactly the file that writes it"
-            );
-        }
-        assert_eq!(
-            walks.caches.module_declaration_lookups(),
-            before + 1,
-            "every `mod tests` package shares one short name, so one store lookup answers them all"
-        );
-
-        // The empty answer is grouped too: a short name no module declares
-        // must not re-ask per speculative package.
-        let missing = walks.caches.module_declaration_lookups();
-        for index in 0..MODULES {
-            assert!(
-                walks
-                    .files_in_module_package(&format!("m{index}.absent"))
-                    .is_empty()
-            );
-        }
-        assert_eq!(
-            walks.caches.module_declaration_lookups(),
-            missing + 1,
-            "an undeclared short name costs one lookup, not one per package"
-        );
-
-        // The generation is the invalidation, as for every other walk cache.
-        let updated = analyzer.update_all();
-        let updated_scope = AnalyzerQueryScope::new(&updated);
-        let next = RustUsageWalks::new(&updated, updated_scope.token()).unwrap();
-        assert_eq!(
-            *next.files_in_module_package("m0.tests"),
-            vec![file(&updated, "m0.rs")],
-            "the answer itself is unchanged"
-        );
-        assert_eq!(next.caches.module_declaration_lookups(), 1);
-    }
-
-    /// The segment form resolves to the same candidate path as the specifier
-    /// form, so the two share one memo entry.
-    #[test]
-    fn the_segment_and_specifier_probes_share_one_memo_entry() {
-        let (_temp, analyzer) = project(&[
-            ("src/lib.rs", "pub mod service;\n"),
-            ("src/service.rs", "pub struct Widget;\n"),
-        ]);
-        let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
-        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token())
-            .expect("Cargo routes available for the fixture");
-        let importer = file(&analyzer, "lib.rs");
-        let segments = vec!["crate".to_string(), "service".to_string()];
-
-        let by_segments = walks.probed_module_files_from_segments(&importer, &segments);
-        let unmemoized = rust_relative_module_segments(&importer, &segments)
-            .map(|relative| rust_module_files_at(&importer, &relative))
-            .unwrap_or_default();
-        assert_eq!(*by_segments, unmemoized);
-
-        let count = walks.caches.module_probe_computations();
-        let by_specifier = walks.probed_module_files_from_path(&importer, "crate::service");
-        assert!(Arc::ptr_eq(&by_segments, &by_specifier));
-        assert_eq!(walks.caches.module_probe_computations(), count);
-    }
-
     /// The export-chain walk replaced a global worklist with recursion, so it
     /// owns the termination the worklist's `visited` set used to provide. Two
     /// modules that publish each other's name are a cycle; the walk must still
     /// return the declaration each name really reaches.
     #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
+    #[hardwon(
+        "#549: The test prevents export-cycle traversal from losing its declared origin or failing to terminate."
+    )]
     fn an_export_chain_cycle_terminates_and_keeps_the_declared_origin() {
         let (_temp, analyzer) = project(&[
             ("src/lib.rs", "pub mod alpha;\npub mod beta;\n"),
@@ -715,6 +310,9 @@ mod tests {
     /// demonstrated failing before the fixed-point iteration landed.
     #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
+    #[hardwon(
+        "#549: It protects import-domain selection when a module republishes a neighboring declaration name."
+    )]
     fn a_module_republishing_a_name_declared_beside_it_keeps_the_import_domain() {
         let (_temp, analyzer) = project(&[
             ("src/lib.rs", "#[macro_use]\npub mod defs;\npub mod user;\n"),
@@ -747,147 +345,11 @@ mod tests {
         );
     }
 
-    /// #1809: a cyclic module import graph must not cost exponential time.
-    ///
-    /// Twenty-four modules, each re-exporting a name from four of its
-    /// successors modulo the count, so the import graph is one strongly
-    /// connected component. The first cycle handling answered a re-entry from
-    /// the value so far and then iterated THAT frame to a local fixed point,
-    /// keeping the result out of the analyzer cache because it came out of a
-    /// partial. In a cycle every member does both, so every member re-runs
-    /// every other member's whole subtree and nothing is ever memoized: the
-    /// recursion body ran 25,214 times at eight modules with three neighbours,
-    /// growing about fourfold per added module. Measured on this exact fixture
-    /// against the previous implementation: 0.19 s at six modules, 3.05 s at
-    /// eight, 69.4 s at ten, and no result in 420 s at twelve. At the
-    /// twenty-four used here it does not finish at all, which is this test's
-    /// fail-before evidence and is what issue #1809 recorded as ">600 s at
-    /// twenty-four modules". The previous implementation answered with the
-    /// same names and origins this asserts, so the fix is a cost change only.
-    ///
-    /// The bound is on the recursion count rather than on the wall clock
-    /// because the count is what changed: it is now 6 per module, and a
-    /// timing assertion at that ratio would only be a slower way of saying so.
-    #[test]
-    fn a_cyclic_module_graph_costs_a_bounded_number_of_recursions() {
-        const MODULES: usize = 24;
-        const NEIGHBOURS: usize = 4;
-        let (_temp, analyzer) = cyclic_project(MODULES, NEIGHBOURS);
-        let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
-        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token())
-            .expect("Cargo routes available for the fixture");
-        let head = file(&analyzer, "m0.rs");
-        let head_module = walks.physical_root_of(&head).expect("m0 is analyzed");
-
-        let bindings = walks
-            .bindings_at(&head, &head_module)
-            .expect("uncancelled cyclic walk");
-
-        // The cycle must still answer, and answer with the real declarations:
-        // `m0` publishes its own `Item0` and the four names it re-exports,
-        // each keeping the module that declares it as its origin.
-        let published: BTreeSet<(String, String)> = bindings
-            .iter()
-            .map(|binding| {
-                (
-                    binding.name.clone(),
-                    binding
-                        .origin
-                        .file
-                        .rel_path()
-                        .to_string_lossy()
-                        .replace('\\', "/"),
-                )
-            })
-            .collect();
-        assert_eq!(
-            published,
-            (0..=NEIGHBOURS)
-                .map(|index| (format!("Item{index}"), format!("src/m{index}.rs")))
-                .collect::<BTreeSet<_>>(),
-            "the cycle must resolve every re-exported name to its declaration"
-        );
-        assert!(
-            walks.recursion_computations() <= 16 * MODULES,
-            "a cyclic module graph must cost a bounded number of recursions, \
-             not one per path through the cycle: {} for {MODULES} modules",
-            walks.recursion_computations()
-        );
-        assert!(
-            walks.import_binding_computations() <= (MODULES + 1) as u64,
-            "cyclic fixed-point rounds must decode each import-bearing file once: {} for {MODULES} modules",
-            walks.import_binding_computations()
-        );
-    }
-
-    /// A walk whose budget expired must stop doing work, and must publish
-    /// nothing. Bifrost treats an expired scan that keeps working as a defect
-    /// in its own right: the Milestone 4 rerun killed a v2 scan at 1800 s
-    /// under a 120 s budget with the walk layer still running.
-    ///
-    /// Both halves fail before the fix, demonstrated by removing them:
-    /// without the polls, the walk keeps recursing (10 computations rather
-    /// than the 1 it is allowed); without the cache gates, the truncated
-    /// answer is memoized for the generation and the second, uncancelled
-    /// walker reads it back as the complete one.
-    #[test]
-    fn a_cancelled_walk_stops_promptly_and_memoizes_nothing() {
-        let (_temp, analyzer) = cyclic_project(8, 3);
-        let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
-        let head = file(&analyzer, "m0.rs");
-
-        let complete = {
-            let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token())
-                .expect("Cargo routes available for the fixture");
-            let module = walks.physical_root_of(&head).expect("m0 is analyzed");
-            walks
-                .bindings_at(&head, &module)
-                .expect("uncancelled cyclic walk")
-                .as_ref()
-                .clone()
-        };
-        assert!(
-            complete.iter().any(|binding| binding.name == "Item1"),
-            "the uncancelled answer carries the re-exported names: {complete:?}"
-        );
-
-        let updated = analyzer.update_all();
-        let updated_scope = AnalyzerQueryScope::new(&updated);
-        // Warm the Cargo routes on the new generation: the constructor's own
-        // cancellation point is not what this test is about, and a cold build
-        // there would stop the walker before it ever walked.
-        let module = RustUsageWalks::new(&updated, updated_scope.token())
-            .expect("Cargo routes available after update")
-            .physical_root_of(&head)
-            .expect("m0 is analyzed");
-        let keep_going = || false;
-        let walks = RustUsageWalks::new_while(&updated, updated_scope.token(), &keep_going)
-            .expect("routes build before the poll");
-        assert_eq!(
-            walks.bindings_at(&head, &module).unwrap_err(),
-            RustCargoRouteError::Cancelled,
-            "a cancelled walk must report cancellation, not a truncated success"
-        );
-        assert_eq!(
-            walks.recursion_computations(),
-            1,
-            "a cancelled walk must stop after the frame it was already inside"
-        );
-        let after = RustUsageWalks::new(&updated, updated_scope.token())
-            .expect("Cargo routes available after update");
-        assert_eq!(
-            *after
-                .bindings_at(&head, &module)
-                .expect("uncancelled walk after cancellation"),
-            complete,
-            "a cancelled walk must not memoize its truncated answer"
-        );
-    }
-
     /// A deep re-export chain must not exhaust the stack. This is deliberately
     /// far deeper than a normal module tree: the explicit work queue must
     /// carry the ladder instead of consuming one Rust stack frame per link.
     #[test]
+    #[hardwon("#549: The test pins target preservation through a deep re-export ladder.")]
     fn an_export_chain_survives_a_deep_re_export_ladder() {
         const LINKS: usize = 512;
         let mut files: Vec<(String, String)> = Vec::new();
@@ -957,6 +419,9 @@ mod tests {
     /// Choosing the prefix before filtering by domain is what keeps a private
     /// alias from shadowing the public one the source means.
     #[test]
+    #[hardwon(
+        "#549: It protects longest-prefix selection and prevents searching beyond the winning alias."
+    )]
     fn the_longest_alias_prefix_wins_and_the_search_stops_there() {
         let (_temp, analyzer) = project(&[
             (
@@ -1022,6 +487,9 @@ mod tests {
     /// half of Milestone 3 and the `2ba5dda4` counter idiom.
     #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
+    #[hardwon(
+        "#549: The test prevents a usage query from reusing stale import facts after a single-file edit."
+    )]
     fn a_single_file_edit_is_reflected_by_the_next_usage_query() {
         let (temp, analyzer) = project(&[
             (
@@ -1095,6 +563,9 @@ mod tests {
     /// The counter is the `2ba5dda4` structural-pin idiom.
     #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
+    #[hardwon(
+        "#549: This issue regression prevents returning to a whole-workspace declaration scan for a usage query."
+    )]
     fn a_usage_query_performs_no_whole_workspace_declaration_scan() {
         let (_temp, analyzer) = project(&[
             (
@@ -1135,6 +606,9 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2128: raw-identifier module routes must preserve glob re-export reachability"
+    )]
     fn raw_identifier_glob_reexports_reach_the_consumer() {
         let (_temp, analyzer) = project(&[
             (
@@ -1188,6 +662,9 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3363: macro-use visibility must select the exact invocation target"
+    )]
     fn macro_use_module_route_selects_the_exact_invocation_target() {
         let (_temp, analyzer) = project(&[
             (
@@ -1224,5 +701,240 @@ mod tests {
             exact.route,
             RustMacroInvocationRoute::MacroUseModule { .. }
         ));
+    }
+
+    #[test]
+    fn a_candidate_importer_whose_import_resolves_elsewhere_is_rejected() {
+        let (_temp, analyzer) = project(&[
+            (
+                "src/lib.rs",
+                "pub mod service;\npub mod decoy;\npub mod consumer;\npub mod bystander;\npub mod impostor;\n",
+            ),
+            ("src/service.rs", "pub struct Widget;\n"),
+            ("src/decoy.rs", "pub struct Widget;\n"),
+            (
+                "src/consumer.rs",
+                "use crate::service::Widget;\npub fn take(_: Widget) {}\n",
+            ),
+            (
+                "src/impostor.rs",
+                "use crate::decoy::Widget;\npub fn take(_: Widget) {}\n",
+            ),
+            (
+                "src/bystander.rs",
+                "pub fn describe() -> &'static str { \"Widget\" }\npub struct Widget;\n",
+            ),
+        ]);
+        let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
+        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token())
+            .expect("Cargo routes available for the fixture");
+        let service = file(&analyzer, "service.rs");
+        let consumer = file(&analyzer, "consumer.rs");
+        let target = identity_named(&walks, &service, "Widget");
+
+        let candidates = walks
+            .importer_candidates_for(&target)
+            .expect("uncancelled fixture importer candidates");
+        assert!(
+            candidates.contains(&file(&analyzer, "impostor.rs"))
+                && candidates.contains(&file(&analyzer, "bystander.rs")),
+            "the offered candidates must include the files this test rejects: {candidates:?}"
+        );
+
+        let importers: BTreeSet<ProjectFile> = walks
+            .edges_binding_identity(&target)
+            .expect("uncancelled fixture binding-edge walk")
+            .into_iter()
+            .map(|edge| edge.importer)
+            .collect();
+        assert_eq!(
+            importers,
+            BTreeSet::from([consumer]),
+            "only the import that resolves to the declaring module binds the target"
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "bd33e1b59a9f: failed Rust include-fact reads were cached as successful empty import routes"
+    )]
+    fn failed_include_fact_read_does_not_cache_empty_routes() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file("src/lib.rs", "include!(\"generated.rs\");\n")
+            .file("src/generated.rs", "pub fn generated() {}\n")
+            .build();
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        assert_eq!(analyzer.get_analyzed_files().len(), 2);
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let includes = RustIncludeRoutes::new(&analyzer, scope.token()).unwrap();
+        let generated = fixture.file("src/generated.rs");
+        analyzer
+            .analyzer_store()
+            .with_unreadable_rust_identifier_occurrences_for_test(|| {
+                // Include verification hydrates the host's complete fact families;
+                // a failed family read must not publish an empty include route.
+                assert_eq!(
+                    includes.include_routes_for(&generated).unwrap_err(),
+                    RustCargoRouteError::Unavailable
+                );
+                assert_eq!(
+                    includes.all_included_files().unwrap_err(),
+                    RustCargoRouteError::Unavailable
+                );
+            });
+        assert!(scope.store_error().is_some());
+        let routes = includes.include_routes_for(&generated).unwrap();
+        assert!(
+            routes
+                .iter()
+                .any(|route| route.root_file == fixture.file("src/lib.rs")),
+            "{routes:?}"
+        );
+        assert_eq!(includes.all_included_files().unwrap(), vec![generated]);
+    }
+
+    #[test]
+    fn walk_results_are_memoized_per_generation_and_retire_with_the_analyzer() {
+        let (_temp, analyzer) = project(&[
+            ("src/lib.rs", "pub mod service;\n"),
+            ("src/service.rs", "pub struct Widget;\n"),
+        ]);
+        let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
+        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token())
+            .expect("Cargo routes available for the fixture");
+        let first = walks.files_in_module_package("service");
+        let second = RustUsageWalks::new(&analyzer, analyzer_scope.token())
+            .expect("Cargo routes available for the fixture")
+            .files_in_module_package("service");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a second walker in the same generation must hit the cache"
+        );
+        // Both the file whose package IS the module and the file that
+        // declares `mod service;` back it, which is what `RustModuleFiles`
+        // held in its two maps.
+        assert_eq!(
+            *first,
+            vec![file(&analyzer, "lib.rs"), file(&analyzer, "service.rs")],
+            "files were {first:?}"
+        );
+
+        let updated = analyzer.update_all();
+        let updated_scope = AnalyzerQueryScope::new(&updated);
+        let after = RustUsageWalks::new(&updated, updated_scope.token())
+            .expect("Cargo routes available after update")
+            .files_in_module_package("service");
+        assert!(
+            !Arc::ptr_eq(&first, &after),
+            "a generation bump must not serve the previous generation's entry"
+        );
+        assert_eq!(*after, *first, "the answer itself is unchanged");
+    }
+
+    #[test]
+    fn a_cyclic_module_graph_costs_a_bounded_number_of_recursions() {
+        const MODULES: usize = 24;
+        const NEIGHBOURS: usize = 4;
+        let (_temp, analyzer) = cyclic_project(MODULES, NEIGHBOURS);
+        let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
+        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token())
+            .expect("Cargo routes available for the fixture");
+        let head = file(&analyzer, "m0.rs");
+        let head_module = walks.physical_root_of(&head).expect("m0 is analyzed");
+
+        let bindings = walks
+            .bindings_at(&head, &head_module)
+            .expect("uncancelled cyclic walk");
+
+        // The cycle must still answer, and answer with the real declarations:
+        // `m0` publishes its own `Item0` and the four names it re-exports,
+        // each keeping the module that declares it as its origin.
+        let published: BTreeSet<(String, String)> = bindings
+            .iter()
+            .map(|binding| {
+                (
+                    binding.name.clone(),
+                    binding
+                        .origin
+                        .file
+                        .rel_path()
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            published,
+            (0..=NEIGHBOURS)
+                .map(|index| (format!("Item{index}"), format!("src/m{index}.rs")))
+                .collect::<BTreeSet<_>>(),
+            "the cycle must resolve every re-exported name to its declaration"
+        );
+        assert!(
+            walks.recursion_computations() <= 16 * MODULES,
+            "a cyclic module graph must cost a bounded number of recursions, \
+             not one per path through the cycle: {} for {MODULES} modules",
+            walks.recursion_computations()
+        );
+        assert!(
+            walks.import_binding_computations() <= (MODULES + 1) as u64,
+            "cyclic fixed-point rounds must decode each import-bearing file once: {} for {MODULES} modules",
+            walks.import_binding_computations()
+        );
+    }
+
+    #[test]
+    fn a_cancelled_walk_stops_promptly_and_memoizes_nothing() {
+        let (_temp, analyzer) = cyclic_project(8, 3);
+        let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
+        let head = file(&analyzer, "m0.rs");
+
+        let complete = {
+            let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token())
+                .expect("Cargo routes available for the fixture");
+            let module = walks.physical_root_of(&head).expect("m0 is analyzed");
+            walks
+                .bindings_at(&head, &module)
+                .expect("uncancelled cyclic walk")
+                .as_ref()
+                .clone()
+        };
+        assert!(
+            complete.iter().any(|binding| binding.name == "Item1"),
+            "the uncancelled answer carries the re-exported names: {complete:?}"
+        );
+
+        let updated = analyzer.update_all();
+        let updated_scope = AnalyzerQueryScope::new(&updated);
+        // Warm the Cargo routes in this query scope: the constructor's own
+        // cancellation point is not what this test is about, and a cold build
+        // there would stop the walker before it ever walked. The route memo
+        // lives in the open scope and is returned without polling keep_going.
+        let module = RustUsageWalks::new(&updated, updated_scope.token())
+            .expect("Cargo routes available after update")
+            .physical_root_of(&head)
+            .expect("m0 is analyzed");
+        let keep_going = || false;
+        let walks = RustUsageWalks::new_while(&updated, updated_scope.token(), &keep_going)
+            .expect("routes build before the poll");
+        assert_eq!(
+            walks.bindings_at(&head, &module).unwrap_err(),
+            RustCargoRouteError::Cancelled,
+            "a cancelled walk must report cancellation, not a truncated success"
+        );
+        assert_eq!(
+            walks.recursion_computations(),
+            1,
+            "a cancelled walk must stop after the frame it was already inside"
+        );
+        let after = RustUsageWalks::new(&updated, updated_scope.token())
+            .expect("Cargo routes available after update");
+        assert_eq!(
+            *after
+                .bindings_at(&head, &module)
+                .expect("uncancelled walk after cancellation"),
+            complete,
+            "a cancelled walk must not memoize its truncated answer"
+        );
     }
 }

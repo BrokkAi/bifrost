@@ -269,11 +269,7 @@ where
 }
 
 fn unique_units(units: Vec<CodeUnit>) -> Vec<CodeUnit> {
-    let mut seen = HashSet::default();
-    units
-        .into_iter()
-        .filter(|unit| seen.insert(unit.clone()))
-        .collect()
+    brokk_bifrost_core::analyzer::usages::inverted_edges::dedup_preserving_order(units)
 }
 
 /// The nearest parser-proven type binding which intentionally has no stable

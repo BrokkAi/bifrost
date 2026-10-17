@@ -1,4 +1,3 @@
-use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 
@@ -45,32 +44,13 @@ fn cargo_vcs_identity(manifest_dir: &Path) -> Option<String> {
 }
 
 fn dirty_fingerprint() -> Option<String> {
-    let diff = Command::new("git")
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .args(
-            ["diff", "--binary", "HEAD", "--"]
-                .iter()
-                .chain(COMPILED_INPUTS.iter()),
-        )
-        .output()
-        .ok()?;
-    if !diff.status.success() || diff.stdout.is_empty() {
+    let CompiledInputsFingerprint::HashOutput(hash) =
+        compiled_inputs_fingerprint_at(Path::new(env!("CARGO_MANIFEST_DIR")))
+    else {
         return None;
-    }
-    let mut child = Command::new("git")
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .args(["hash-object", "--stdin"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .ok()?;
-    child.stdin.take()?.write_all(&diff.stdout).ok()?;
-    let output = child.wait_with_output().ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        .filter(|hash| !hash.is_empty())
+    };
+    let fingerprint = String::from_utf8_lossy(&hash).trim().to_string();
+    (!fingerprint.is_empty()).then_some(fingerprint)
 }
 
 fn main() {

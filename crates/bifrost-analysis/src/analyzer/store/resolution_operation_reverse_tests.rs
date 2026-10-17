@@ -1,9 +1,13 @@
 use super::*;
+use brokk_bifrost_test_macros::hardwon;
 
 /// The main hydration statement must seek a fixed requested declaration,
 /// even when the workspace or that declaration's own blob grows. VM steps
 /// measure SQLite work; the mount-visit regression below measures Rust work.
 #[test]
+#[hardwon(
+    "ed9135b9cc0a: definition hydration scanned units outside the requested declaration keys"
+)]
 fn selected_definition_hydration_vm_work_is_bounded_by_requested_keys() {
     use crate::analyzer::CodeUnitType;
     use crate::analyzer::store::selected_definition::{
@@ -253,6 +257,7 @@ fn selected_definition_hydration_vm_work_is_bounded_by_requested_keys() {
 /// the audit asked for; the totals are equal because the fixture asks the same
 /// question of both workspaces.
 #[test]
+#[hardwon("1b8b6ec326d9: reverse answers and definition projection walked the entire mount table")]
 fn a_reverse_answer_and_a_definition_projection_do_not_walk_the_mount_table() {
     let rows = [16usize, 48].map(|files| {
         let fixture = RustRootResolutionOperationFixture::new_with_source_mount_count(files);

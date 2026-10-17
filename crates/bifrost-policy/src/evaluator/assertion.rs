@@ -1,19 +1,22 @@
 use brokk_bifrost_analysis::analyzer::usages::UsageHitKind;
+use brokk_bifrost_analysis::path_utils::workspace_relative_slash_path;
 use brokk_bifrost_rql::structural::CodeQueryRowScalarRef;
 use brokk_bifrost_rql::structural::edges::EdgeProvenance;
 use brokk_bifrost_rql::structural::search::{DetailedCodeQueryResult, MergedUnitRows};
 use std::collections::HashSet;
-use std::rc::Rc;
+use std::sync::Arc;
 
+#[cfg(test)]
+mod occurrence_parity;
 mod subject_batch;
 pub(crate) use subject_batch::SubjectQueryBatch;
 
 use crate::definition::PolicyAssertId;
-use crate::relational::{RelationalPlanIr, lower_occurrence_assert, validate_plan_ir};
+use crate::relational::{
+    RelationalPlanIr, lower_occurrence_assert, lower_relational_assertion_plan, validate_plan_ir,
+};
 
-#[cfg(test)]
-mod occurrence_parity;
-
+use super::super::finding::InconclusiveScope;
 use super::super::units::AssertFileProduct;
 use super::*;
 
@@ -131,20 +134,6 @@ impl ExecutedQueryRows {
     }
 }
 
-/// The row-family executor one assertion run uses for every file.
-///
-/// Chosen once per run from the asserts: deriving an occurrence row's resolved
-/// target is one definition resolution per reference-class row, and only the
-/// occurrence family's `:require-target` reads it (#1452).
-type AssertRowQueryExecutor = fn(
-    &dyn IAnalyzer,
-    &CodeQuery,
-    brokk_bifrost_rql::structural::CodeQueryExecutionLimits,
-    Option<&CancellationToken>,
-    &mut CodeQueryRowFamilySession,
-    CodeQueryExecutionScope<'_>,
-) -> brokk_bifrost_rql::structural::search::DetailedCodeQueryResult;
-
 /// Everything one assert-file iteration reads that the run computed once from
 /// the policy alone.
 ///
@@ -161,7 +150,7 @@ struct AssertRunPlan<'a> {
     needs_generation: bool,
     needs_declaration_state: bool,
     needs_identity_producers: bool,
-    execute_row_query: AssertRowQueryExecutor,
+    occurrence_target_fields: Vec<&'static str>,
     severity: FindingSeverity,
     message: String,
     classification: super::super::classification::FindingClassification,
@@ -205,11 +194,10 @@ impl<'a> AssertRunPlan<'a> {
             matches!(assertion, PolicyAssert::ValueOrigin(_))
         });
         // Both families read the same binding-of rows, keyed by the role each
-        // assert names. The value-origin family needs one more role --
-        // `value_reference`, the class an assignment's left operand carries --
-        // but only for a file that actually has an assignment inside a
-        // subject's region. That is decided per file, after the assignment
-        // query runs.
+        // assert names. The value-origin family also needs assignment-target
+        // roles, `value_reference` and `binder`, but only for a file that
+        // actually has an assignment inside a subject's region. That is
+        // decided per file, after the assignment query runs.
         let mut binding_row_roles = asserted_roles(spec, |assertion| {
             matches!(
                 assertion,
@@ -231,14 +219,6 @@ impl<'a> AssertRunPlan<'a> {
                 _ => None,
             })
             .collect();
-        let needs_occurrence_targets = spec.asserts.iter().any(|assertion| {
-            matches!(assertion, PolicyAssert::Occurrence(assertion) if assertion.require_target)
-        });
-        let execute_row_query: AssertRowQueryExecutor = if needs_occurrence_targets {
-            execute_code_query_detailed_eager_index_with_row_family_session_in_scope
-        } else {
-            execute_code_query_detailed_eager_index_without_targets_with_row_family_session_in_scope
-        };
         let metadata = &policy.definition().metadata;
         let PolicyMessageSpec::Static { text } = &metadata.message else {
             return Err("assertion policy presentation could not be projected into a finding");
@@ -250,7 +230,7 @@ impl<'a> AssertRunPlan<'a> {
         ) else {
             return Err("assertion policy classification could not be reduced");
         };
-        let occurrence_plans = spec
+        let occurrence_plans: HashMap<PolicyAssertId, RelationalPlanIr> = spec
             .asserts
             .iter()
             .filter_map(|assertion| {
@@ -263,6 +243,12 @@ impl<'a> AssertRunPlan<'a> {
                 Some((assertion.id.clone(), lowered))
             })
             .collect();
+        let mut occurrence_target_fields = occurrence_plans
+            .values()
+            .flat_map(|plan| plan.occurrence_target_fields_for_source("occurrence"))
+            .collect::<Vec<_>>();
+        occurrence_target_fields.sort_unstable();
+        occurrence_target_fields.dedup();
         Ok(Self {
             spec,
             occurrence_plans,
@@ -287,7 +273,7 @@ impl<'a> AssertRunPlan<'a> {
                         | PolicyAssert::RoundTrip(_)
                 )
             }),
-            execute_row_query,
+            occurrence_target_fields,
             severity: finding_severity(&metadata.severity, None),
             message: text.clone(),
             classification,
@@ -380,6 +366,10 @@ enum AssertFileFailure {
 struct AssertionRunTotals {
     findings: Vec<PolicyFinding>,
     unconcluded_files: Vec<(String, Vec<PolicyIncompleteReason>)>,
+    /// Whether a file-set assert could not conclude a file. Its one finding is
+    /// anchored at the run's first subject, which need not lie in that file,
+    /// so the run cannot promise which files its verdict concerns (#5433).
+    unconcluded_file_set: bool,
     row_completions: Vec<CodeQueryCompletion>,
     query_diagnostics: Vec<CodeQueryDiagnostic>,
     work: CodeQueryExecutionWork,
@@ -392,6 +382,7 @@ impl AssertionRunTotals {
         Self {
             findings: Vec::new(),
             unconcluded_files: Vec::new(),
+            unconcluded_file_set: false,
             row_completions: Vec::new(),
             query_diagnostics: rows.diagnostics.clone(),
             work: rows.work,
@@ -784,15 +775,22 @@ fn whole_assertion_run(
         });
         match subject_batch {
             Some(batch) => batch.execute(subject_query, context, budget),
-            None => Rc::new(ExecutedQueryRows::of_detailed(
-                execute_code_query_detailed_eager_index_in_scope(
+            None => Arc::new(ExecutedQueryRows::of_detailed(match context.workspace {
+                Some(workspace) => execute_code_query_detailed_eager_index_workspace_in_scope(
+                    workspace,
+                    subject_query,
+                    budget.query_limits(),
+                    context.cancellation,
+                    execution_scope.unwrap_or_else(CodeQueryExecutionScope::whole_workspace),
+                ),
+                None => execute_code_query_detailed_eager_index_in_scope(
                     context.analyzer,
                     subject_query,
                     budget.query_limits(),
                     context.cancellation,
                     execution_scope.unwrap_or_else(CodeQueryExecutionScope::whole_workspace),
                 ),
-            )),
+            })),
         }
     };
     let _timing = brokk_bifrost_analysis::profiling::scope_with(|| {
@@ -907,6 +905,7 @@ fn whole_assertion_run(
             let derived = rewrite_assert_context.for_file(&file);
             let key = workspace_relative_key(&file);
             if !derived.completeness.covers(assertion.domain) {
+                totals.unconcluded_file_set = true;
                 totals.unconcluded_files.push((
                     key,
                     derived
@@ -938,6 +937,7 @@ fn whole_assertion_run(
                     // so this file concludes nothing in either direction. It
                     // is never a finding and never a pass.
                     TerminationVerdict::Inconclusive => {
+                        totals.unconcluded_file_set = true;
                         totals
                             .unconcluded_files
                             .push((key.clone(), vec![PolicyIncompleteReason::PartialDiscovery]));
@@ -1215,6 +1215,21 @@ fn finish_assertion_run(
     let adapted = adapt_query_diagnostics(&totals.query_diagnostics, budget.max_diagnostics());
     let mut diagnostics = adapted.diagnostics;
     let mut diagnostics_truncated = adapted.truncated;
+    // A per-file assert decides each file from that file alone, so a finding
+    // this run could not decide lies in one of its unconcluded files (#5433).
+    // A file-set assert, a retention reason and an unconcluded path that is
+    // not workspace-relative cannot keep that promise.
+    let scope = match totals
+        .unconcluded_files
+        .iter()
+        .map(|(path, _)| WorkspaceRelativePath::new(path.as_str()))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(files) if !diagnostics_truncated && !totals.unconcluded_file_set => {
+            InconclusiveScope::of_files(&files)
+        }
+        _ => InconclusiveScope::Run,
+    };
     let mut run_incomplete: Vec<PolicyIncompleteReason> = totals
         .unconcluded_files
         .iter()
@@ -1259,7 +1274,7 @@ fn finish_assertion_run(
         }
         completion
     } else {
-        PolicyRunCompletion::inconclusive(run_incomplete)
+        PolicyRunCompletion::inconclusive_in(run_incomplete, scope)
             .expect("typed per-file incomplete reasons are canonical")
     };
     let work = work_report(totals.work, totals.findings.len(), 0);
@@ -1331,13 +1346,13 @@ fn evaluate_assert_file(
                 return Err(Box::new(AssertFileFailure::QueryPlan(message)));
             }
         };
-        let outcome = (plan.execute_row_query)(
+        let outcome = execute_code_query_detailed_eager_index_with_row_family_session_in_scope(
             context.analyzer,
             &query,
             budget.query_limits(),
             context.cancellation,
             &mut row_family_session,
-            execution_scope,
+            execution_scope.clone(),
         );
         file_incomplete.extend(incomplete_reasons(
             &outcome.result.completion(),
@@ -1378,7 +1393,7 @@ fn evaluate_assert_file(
     };
     let mut binding_row_roles = plan.binding_row_roles.clone();
     if assignments_in_region {
-        binding_row_roles.push(OccurrenceRole::ValueReference);
+        binding_row_roles.extend([OccurrenceRole::ValueReference, OccurrenceRole::Binder]);
         binding_row_roles.sort();
         binding_row_roles.dedup();
     }
@@ -1386,7 +1401,14 @@ fn evaluate_assert_file(
     let mut queries: Vec<CodeQuery> = Vec::new();
     if !plan.occurrence_roles.is_empty() {
         match assertion_occurrence_query(&file_paths, &plan.occurrence_roles, Vec::new(), budget) {
-            Ok(query) => queries.push(query),
+            Ok(mut query) => {
+                if let Err(message) =
+                    append_occurrence_target_projection(&mut query, &plan.occurrence_target_fields)
+                {
+                    return Err(Box::new(AssertFileFailure::QueryPlan(message)));
+                }
+                queries.push(query);
+            }
             Err(message) => {
                 return Err(Box::new(AssertFileFailure::QueryPlan(message)));
             }
@@ -1457,13 +1479,13 @@ fn evaluate_assert_file(
 
     let mut executed = Vec::new();
     for query in &queries {
-        let outcome = (plan.execute_row_query)(
+        let outcome = execute_code_query_detailed_eager_index_with_row_family_session_in_scope(
             context.analyzer,
             query,
             budget.query_limits(),
             context.cancellation,
             &mut row_family_session,
-            execution_scope,
+            execution_scope.clone(),
         );
         file_incomplete.extend(incomplete_reasons(
             &outcome.result.completion(),
@@ -1662,7 +1684,6 @@ fn evaluate_assert_file(
             }
         }
     }
-
     let mut states_by_ast_id: HashMap<String, Vec<&DeclarationStateRow>> = HashMap::new();
     for result in &state_results {
         for row in &result.states {
@@ -2135,16 +2156,9 @@ fn retain_unconcluded_files_diagnostic(
     if omitted > 0 {
         message.push_str(&format!(" ... and {omitted} more unconcluded files"));
     }
-    match PolicyDiagnostic::try_new(
-        PolicyDiagnosticCode::EvaluationFailure,
-        PolicyDiagnosticSeverity::Warning,
-        PolicyDiagnosticImpact::RunIncomplete,
-        &message,
-        None,
-        Vec::new(),
-    ) {
-        Ok(diagnostic) => diagnostics.push(diagnostic),
-        Err(_) => *diagnostics_truncated = true,
+    match super::incomplete_run_diagnostic(PolicyDiagnosticCode::EvaluationFailure, &message) {
+        Some(diagnostic) => diagnostics.push(diagnostic),
+        None => *diagnostics_truncated = true,
     }
 }
 
@@ -2168,6 +2182,8 @@ fn evaluate_relational_assertion_policy(
         RowBindingName, RowBindingSource, relational_binding_selector_path,
     };
 
+    let relational_ir = lower_relational_assertion_plan(plan)
+        .expect("a loaded relational assertion plan lowers before evaluation");
     let mut binding_queries: Vec<CodeQuery> = Vec::with_capacity(plan.bindings.len());
     let mut binding_index_by_name: HashMap<&RowBindingName, usize> = HashMap::new();
     for (index, binding) in plan.bindings.iter().enumerate() {
@@ -2203,6 +2219,18 @@ fn evaluate_relational_assertion_policy(
                 let mut query = query.clone();
                 query.result_detail = CodeQueryResultDetail::Full;
                 query.limit = budget.query_limits().max_pipeline_rows;
+                let target_fields =
+                    relational_ir.occurrence_target_fields_for_source(binding.name.as_str());
+                if let Err(message) =
+                    append_occurrence_target_projection(&mut query, &target_fields)
+                {
+                    return failed_policy_run(
+                        policy,
+                        PolicyAnalysisType::Assertion,
+                        message,
+                        budget,
+                    );
+                }
                 query
             }
         };
@@ -2301,14 +2329,18 @@ fn whole_relational_bindings(
                     query,
                     budget.query_limits(),
                     context.cancellation,
-                    execution_scope.unwrap_or_else(CodeQueryExecutionScope::whole_workspace),
+                    execution_scope
+                        .clone()
+                        .unwrap_or_else(CodeQueryExecutionScope::whole_workspace),
                 ),
                 None => execute_code_query_detailed_eager_index_in_scope(
                     context.analyzer,
                     query,
                     budget.query_limits(),
                     context.cancellation,
-                    execution_scope.unwrap_or_else(CodeQueryExecutionScope::whole_workspace),
+                    execution_scope
+                        .clone()
+                        .unwrap_or_else(CodeQueryExecutionScope::whole_workspace),
                 ),
             })
         })
@@ -2377,6 +2409,66 @@ fn sliced_relational_bindings(
     // another run replays to reproduce the product without executing anything.
     incremental.record_units(policy.definition().metadata.id.clone(), keys);
     Ok(executed)
+}
+
+/// Which files an inconclusive relational run concerns (#5451).
+///
+/// A plan whose every missed finding is anchored at a row the run did not see
+/// concerns only the files of those rows. The run knows them when every gap in
+/// every binding is a query diagnostic that names the file of the rows it
+/// withheld. Any other cause can hide a row anywhere: a truncated, cancelled
+/// or deliberately restricted row set, a solver partition named by a root
+/// rather than a file, an evaluator limit, an unnamed diagnostic. Each of
+/// those, and every other plan, concerns the whole run.
+fn relational_inconclusive_scope(
+    plan: &super::super::definition::RelationalAssertionPlan,
+    executed: &[ExecutedQueryRows],
+    binding_coverage: &[super::super::relational::RelationCoverage],
+    evaluation: &super::super::relational::RelationalAssertionEvaluation,
+) -> InconclusiveScope {
+    use super::super::relational::{CoverageExtent, RelationalObligationKind};
+
+    let anchored = lower_relational_assertion_plan(plan)
+        .is_ok_and(|ir| ir.anchors_missed_findings_at_missed_rows());
+    if !anchored
+        || evaluation.limit_exceeded
+        || evaluation.obligations_truncated
+        || evaluation.unmet_obligations.iter().any(|obligation| {
+            obligation.kind != RelationalObligationKind::AbsenceRequiresExhaustiveCoverage
+        })
+    {
+        return InconclusiveScope::Run;
+    }
+    let mut files = Vec::new();
+    for (rows, coverage) in executed.iter().zip(binding_coverage) {
+        let attributable = !rows.truncated
+            && matches!(
+                rows.completion,
+                CodeQueryCompletion::Complete | CodeQueryCompletion::Incomplete { .. }
+            )
+            && matches!(
+                coverage.extent(),
+                CoverageExtent::Exhaustive | CoverageExtent::Incomplete { .. }
+            )
+            && coverage.partition().is_query_scope();
+        if !attributable {
+            return InconclusiveScope::Run;
+        }
+        for diagnostic in &rows.diagnostics {
+            if diagnostic.impact != CodeQueryDiagnosticImpact::Incomplete {
+                continue;
+            }
+            match diagnostic
+                .withheld_rows_path
+                .as_deref()
+                .map(WorkspaceRelativePath::new)
+            {
+                Some(Ok(path)) => files.push(path),
+                _ => return InconclusiveScope::Run,
+            }
+        }
+    }
+    InconclusiveScope::of_files(&files)
 }
 
 /// Evaluate one relational plan over the rows its bindings produced.
@@ -2487,6 +2579,11 @@ fn relational_run(
 
     let capability = assertion_capabilities(&query_diagnostics);
     let adapted = adapt_query_diagnostics(&query_diagnostics, budget.max_diagnostics());
+    let scope = if adapted.truncated || adapted.adaptation_failed {
+        InconclusiveScope::Run
+    } else {
+        relational_inconclusive_scope(plan, executed, &binding_coverage, &evaluation)
+    };
     let mut diagnostics = adapted.diagnostics;
     let mut diagnostics_truncated = adapted.truncated;
     if diagnostics_truncated {
@@ -2545,7 +2642,7 @@ fn relational_run(
             budget.max_diagnostics(),
             &evaluation,
         );
-        PolicyRunCompletion::inconclusive(run_incomplete)
+        PolicyRunCompletion::inconclusive_in(run_incomplete, scope)
             .expect("typed relational incomplete reasons are canonical")
     };
 
@@ -2615,35 +2712,6 @@ fn relational_run(
         )
         .ok()
     };
-    // A conflict row states two access sites beside its own anchor, and both
-    // are read from the row's declared field surface: the projected row is
-    // what every path carries, and the surface is what the row publishes.
-    let row_endpoint_locations =
-        |row: &RelationalViolationRow| -> Option<Vec<PolicySourceLocation>> {
-            let index = *binding_index_by_name.get(&row.binding)?;
-            let item = executed[index].items.get(row.row)?;
-            if item.domain != DetailedCodeQueryDomain::ConcurrentAccessConflict {
-                return Some(Vec::new());
-            }
-            let endpoint = |site: &str| -> Option<PolicySourceLocation> {
-                let path =
-                    WorkspaceRelativePath::new(row_text(item, &format!("{site}_path"))?).ok()?;
-                let byte_span = PolicyByteSpan::new(
-                    row_number(item, &format!("{site}_start_byte"))?,
-                    row_number(item, &format!("{site}_end_byte"))?,
-                )
-                .ok()?;
-                let region = PolicyDisplayRegion::new(
-                    row_number(item, &format!("{site}_start_line"))?,
-                    row_number(item, &format!("{site}_start_column"))?,
-                    row_number(item, &format!("{site}_end_line"))?,
-                    row_number(item, &format!("{site}_end_column"))?,
-                )
-                .ok()?;
-                Some(PolicySourceLocation::span(path, byte_span, region))
-            };
-            Some(vec![endpoint("first")?, endpoint("second")?])
-        };
     let row_also_fails_at_locations =
         |row: &RelationalViolationRow| -> Option<Vec<PolicySourceLocation>> {
             let index = *binding_index_by_name.get(&row.binding)?;
@@ -2659,16 +2727,16 @@ fn relational_run(
                 .iter()
                 .map(|location| {
                     let path = WorkspaceRelativePath::new(location.path.as_ref()).ok()?;
-                    let byte_span =
-                        PolicyByteSpan::new(location.start_byte, location.end_byte).ok()?;
-                    let region = PolicyDisplayRegion::new(
+                    PolicySourceLocation::span_from_coordinates(
+                        path,
+                        location.start_byte,
+                        location.end_byte,
                         u64::try_from(location.range.start_line).ok()?,
                         u64::try_from(location.range.start_column).ok()?,
                         u64::try_from(location.range.end_line).ok()?,
                         u64::try_from(location.range.end_column).ok()?,
                     )
-                    .ok()?;
-                    Some(PolicySourceLocation::span(path, byte_span, region))
+                    .ok()
                 })
                 .collect()
         };
@@ -2756,43 +2824,6 @@ fn relational_run(
                     );
                 };
                 related.push(entry);
-                let Some(endpoint_locations) = row_endpoint_locations(row) else {
-                    return failed_policy_run_with_reason(
-                        policy,
-                        PolicyAnalysisType::Assertion,
-                        findings,
-                        PolicyFailureReason::InternalInvariant,
-                        "a concurrent access row could not project its endpoint locations",
-                        work,
-                        budget,
-                    );
-                };
-                for location in endpoint_locations {
-                    if related.iter().any(|entry| entry.location() == &location) {
-                        continue;
-                    }
-                    if related.len() == budget.max_related_locations_per_finding() {
-                        related_truncated = true;
-                        omitted_related = omitted_related.saturating_add(1);
-                        continue;
-                    }
-                    let Ok(entry) = RelatedPolicyLocation::try_new(
-                        PolicyLocationRelationship::Evidence,
-                        location,
-                        Vec::new(),
-                    ) else {
-                        return failed_policy_run_with_reason(
-                            policy,
-                            PolicyAnalysisType::Assertion,
-                            findings,
-                            PolicyFailureReason::InternalInvariant,
-                            "a concurrent access endpoint could not be retained as finding evidence",
-                            work,
-                            budget,
-                        );
-                    };
-                    related.push(entry);
-                }
                 let Some(additional_locations) = row_also_fails_at_locations(row) else {
                     return failed_policy_run_with_reason(
                         policy,
@@ -2983,6 +3014,7 @@ fn row_text<'a>(item: &'a UnitRowItem, field: &str) -> Option<&'a str> {
         | CodeQueryRowScalarRef::ConstrainedEnum(value)
         | CodeQueryRowScalarRef::DeclarationIdentity(value) => Some(value),
         CodeQueryRowScalarRef::StringList(_)
+        | CodeQueryRowScalarRef::IntegerList(_)
         | CodeQueryRowScalarRef::Integer(_)
         | CodeQueryRowScalarRef::Boolean(_) => None,
     }
@@ -2994,6 +3026,7 @@ fn row_boolean(item: &UnitRowItem, field: &str) -> Option<bool> {
         CodeQueryRowScalarRef::Boolean(value) => Some(value),
         CodeQueryRowScalarRef::Integer(_)
         | CodeQueryRowScalarRef::StringList(_)
+        | CodeQueryRowScalarRef::IntegerList(_)
         | CodeQueryRowScalarRef::StableId(_)
         | CodeQueryRowScalarRef::String(_)
         | CodeQueryRowScalarRef::ConstrainedEnum(_)
@@ -3007,6 +3040,7 @@ fn row_number(item: &UnitRowItem, field: &str) -> Option<u64> {
         CodeQueryRowScalarRef::Integer(value) => Some(value),
         CodeQueryRowScalarRef::StableId(_)
         | CodeQueryRowScalarRef::StringList(_)
+        | CodeQueryRowScalarRef::IntegerList(_)
         | CodeQueryRowScalarRef::String(_)
         | CodeQueryRowScalarRef::ConstrainedEnum(_)
         | CodeQueryRowScalarRef::DeclarationIdentity(_)
@@ -3122,16 +3156,9 @@ fn retain_incomplete_run_diagnostic(
         *diagnostics_truncated = true;
         return;
     }
-    match PolicyDiagnostic::try_new(
-        PolicyDiagnosticCode::EvaluationFailure,
-        PolicyDiagnosticSeverity::Warning,
-        PolicyDiagnosticImpact::RunIncomplete,
-        message,
-        None,
-        Vec::new(),
-    ) {
-        Ok(diagnostic) => diagnostics.push(diagnostic),
-        Err(_) => *diagnostics_truncated = true,
+    match super::incomplete_run_diagnostic(PolicyDiagnosticCode::EvaluationFailure, message) {
+        Some(diagnostic) => diagnostics.push(diagnostic),
+        None => *diagnostics_truncated = true,
     }
 }
 
@@ -3273,6 +3300,7 @@ fn render_relational_key(key: &[Option<super::super::assertion_policy::RowScalar
             Some(RowScalar::Integer(value)) => value.to_string(),
             Some(RowScalar::Boolean(value)) => value.to_string(),
             Some(RowScalar::StringList(values)) => format!("{values:?}"),
+            Some(RowScalar::IntegerList(values)) => format!("{values:?}"),
         })
         .collect::<Vec<_>>()
         .join("|")
@@ -3302,10 +3330,25 @@ fn joined_role_rows(
     rows_by_ast_id: &HashMap<&str, Vec<&CodeQueryOccurrence>>,
     role: OccurrenceRole,
 ) -> bool {
-    ast_ids.iter().any(|ast_id| {
+    matching_role_rows(ast_ids, rows_by_ast_id, role)
+        .next()
+        .is_some()
+}
+
+fn matching_role_rows<'a, 'rows: 'a>(
+    ast_ids: &'a [&'a str],
+    rows_by_ast_id: &'a HashMap<&'a str, Vec<&'rows CodeQueryOccurrence>>,
+    role: OccurrenceRole,
+) -> impl Iterator<Item = &'rows CodeQueryOccurrence> + 'a {
+    ast_ids.iter().flat_map(move |ast_id| {
         rows_by_ast_id
             .get(ast_id)
-            .is_some_and(|rows| rows.iter().any(|row| row.role == role.label()))
+            .into_iter()
+            .flat_map(move |rows| {
+                rows.iter()
+                    .copied()
+                    .filter(move |row| row.role == role.label())
+            })
     })
 }
 
@@ -3749,18 +3792,7 @@ fn edge_subject_rows<'rows>(
     ast_ids: &[&str],
     rows_by_ast_id: &HashMap<&str, Vec<&'rows CodeQueryOccurrence>>,
 ) -> Vec<&'rows CodeQueryOccurrence> {
-    let mut rows = Vec::new();
-    for ast_id in ast_ids {
-        if let Some(joined) = rows_by_ast_id.get(ast_id) {
-            rows.extend(
-                joined
-                    .iter()
-                    .copied()
-                    .filter(|row| row.role == role.label()),
-            );
-        }
-    }
-    rows
+    matching_role_rows(ast_ids, rows_by_ast_id, role).collect()
 }
 
 /// The forward edges whose site is exactly one subject token.
@@ -4145,12 +4177,10 @@ impl<'context> RewriteAssertContext<'context> {
         if let Some(cached) = self.files.get(file) {
             return Arc::clone(cached);
         }
-        let token = self.cancellation.cloned().unwrap_or_default();
-        let derived = Arc::new(rewrite_paths_for_file(
-            self.analyzer,
-            file,
-            &mut RewritePathRequest::new(&token),
-        ));
+        let derived = Arc::new(
+            brokk_bifrost_analysis::analyzer::structural::rewrite_paths::
+                rewrite_paths_for_file_with_cancellation(self.analyzer, file, self.cancellation),
+        );
         self.files.insert(file.clone(), Arc::clone(&derived));
         derived
     }
@@ -4216,10 +4246,12 @@ impl<'context> FlowStateAssertContext<'context> {
         if let Some(cached) = self.files.get(&key) {
             return Some(Arc::clone(cached));
         }
-        let token = self.cancellation.cloned().unwrap_or_default();
-        let mut request = FlowStateRequest::new(&token)
-            .with_active_semantic_model_snapshot(self.active_semantic_model_snapshot.clone());
-        let derived = Arc::new(flow_state_for_file(workspace, &file, &mut request));
+        let derived = Arc::new(flow_state_for_file_with_snapshot(
+            workspace,
+            &file,
+            self.cancellation,
+            self.active_semantic_model_snapshot.clone(),
+        ));
         self.files.insert(key, Arc::clone(&derived));
         Some(derived)
     }
@@ -4692,26 +4724,26 @@ fn ordered_candidates<'rows>(
     rows
 }
 
-fn evaluate_binding_scope_assert<'rows>(
-    assertion: &BindingScopeAssert,
+fn binding_origin_for_capture<'rows>(
     subject: &AssertionSubject,
+    relative_to: &str,
     ast_ids: &[&str],
     bindings_by_occurrence: &HashMap<(&str, &str), Vec<&'rows CodeQueryBinding>>,
     scopes_by_index: &HashMap<(&str, u32), &'rows CodeQueryLexicalScope>,
     late_incomplete: &mut Vec<PolicyIncompleteReason>,
-) -> Option<AssertionViolation<'rows>> {
-    let mut reached: Vec<&CodeQueryBinding> = Vec::new();
+) -> Option<(
+    &'rows CodeQueryBinding,
+    &'rows CodeQueryLexicalScope,
+    CodeQueryRange,
+)> {
+    let mut reached = Vec::new();
     for ast_id in ast_ids {
         if let Some(rows) = bindings_by_occurrence.get(&(subject.path.as_str(), *ast_id)) {
             reached.extend(rows.iter().copied().filter(|row| !row.shadowed));
         }
     }
-    // "No binding of this name is in effect here" is a complete answer, not an
-    // incomplete one: the name resolves to something other than a lexical
-    // binding, so there is no declaring scope for a containment requirement to
-    // constrain. An environment that could not state its intervals is a
-    // different case and has already made the run inconclusive through the
-    // query's own diagnostics.
+    // No lexical binding is a complete answer; missing scope or capture rows
+    // mean the adapter did not provide enough evidence.
     let binding = reached.first().copied()?;
     let Some(scope) = scopes_by_index
         .get(&(binding.path.as_str(), binding.declaring_scope_index))
@@ -4720,22 +4752,14 @@ fn evaluate_binding_scope_assert<'rows>(
         late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
         return None;
     };
-    // A capture with no node range cannot bound anything, and guessing one
-    // from the subject's own span would be answering a different question.
     let Some(related) = subject
         .captures
-        .get(&assertion.relative_to)
+        .get(relative_to)
         .and_then(|captures| captures.iter().find_map(|capture| capture.range))
     else {
         late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
         return None;
     };
-    // Containment is a comparison of two display regions, which means anything
-    // at all only within one file. The binding was reached from an occurrence
-    // this subject row captured, and the related capture belongs to the same
-    // structural match, so both address nodes of the subject's file by
-    // construction. State it rather than assume it: a coordinate comparison
-    // across two files would answer confidently and wrongly.
     assert_eq!(
         binding.path.as_str(),
         subject.path.as_str(),
@@ -4746,6 +4770,25 @@ fn evaluate_binding_scope_assert<'rows>(
         subject.path.as_str(),
         "a declaring scope must belong to the file of the binding that names it"
     );
+    Some((binding, scope, related))
+}
+
+fn evaluate_binding_scope_assert<'rows>(
+    assertion: &BindingScopeAssert,
+    subject: &AssertionSubject,
+    ast_ids: &[&str],
+    bindings_by_occurrence: &HashMap<(&str, &str), Vec<&'rows CodeQueryBinding>>,
+    scopes_by_index: &HashMap<(&str, u32), &'rows CodeQueryLexicalScope>,
+    late_incomplete: &mut Vec<PolicyIncompleteReason>,
+) -> Option<AssertionViolation<'rows>> {
+    let (binding, scope, related) = binding_origin_for_capture(
+        subject,
+        &assertion.relative_to,
+        ast_ids,
+        bindings_by_occurrence,
+        scopes_by_index,
+        late_incomplete,
+    )?;
     let contained = region_contains(related, scope.range);
     if assertion.containment.satisfied_by(contained) {
         return None;
@@ -4799,41 +4842,14 @@ fn evaluate_value_origin_assert<'rows>(
     assigned_positions: &[(&str, CodeQueryRange)],
     late_incomplete: &mut Vec<PolicyIncompleteReason>,
 ) -> Option<AssertionViolation<'rows>> {
-    let mut reached: Vec<&CodeQueryBinding> = Vec::new();
-    for ast_id in ast_ids {
-        if let Some(rows) = bindings_by_occurrence.get(&(subject.path.as_str(), *ast_id)) {
-            reached.extend(rows.iter().copied().filter(|row| !row.shadowed));
-        }
-    }
-    // As for the binding-scope family: a name that resolves to something other
-    // than a lexical binding has no origin for this assert to constrain, and
-    // that is a complete answer rather than an incomplete one.
-    let binding = reached.first().copied()?;
-    let Some(scope) = scopes_by_index
-        .get(&(binding.path.as_str(), binding.declaring_scope_index))
-        .copied()
-    else {
-        late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
-        return None;
-    };
-    let Some(related) = subject
-        .captures
-        .get(&assertion.relative_to)
-        .and_then(|captures| captures.iter().find_map(|capture| capture.range))
-    else {
-        late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
-        return None;
-    };
-    assert_eq!(
-        binding.path.as_str(),
-        subject.path.as_str(),
-        "a binding-of answer must belong to the file of the occurrence it was reached from"
-    );
-    assert_eq!(
-        scope.path.as_str(),
-        subject.path.as_str(),
-        "a declaring scope must belong to the file of the binding that names it"
-    );
+    let (binding, scope, related) = binding_origin_for_capture(
+        subject,
+        &assertion.relative_to,
+        ast_ids,
+        bindings_by_occurrence,
+        scopes_by_index,
+        late_incomplete,
+    )?;
 
     let declared_inside = region_contains(related, scope.range);
     let assigned_inside = assigned_positions.iter().any(|(ast_id, range)| {
@@ -4951,20 +4967,23 @@ fn collect_assertion_subjects(
     }
     let mut subjects = Vec::with_capacity(results.len());
     for (item, evidence) in results.iter().zip(evidence) {
-        let Some(UnitRowItemTerminal::StructuralMatch {
-            node_range,
-            captures: row_captures,
-            ..
-        }) = &item.terminal
-        else {
-            return Err(
-                "an assertion subject selector must produce structural matches carrying captures",
-            );
+        let (node_range, row_captures) = match &item.terminal {
+            Some(UnitRowItemTerminal::StructuralMatch {
+                node_range,
+                captures,
+                ..
+            }) => (*node_range, captures.as_slice()),
+            Some(UnitRowItemTerminal::CallEffect { captures }) => (item.range, captures.as_slice()),
+            _ => {
+                return Err(
+                    "an assertion subject selector must produce structural matches carrying captures",
+                );
+            }
         };
         let Ok(path) = WorkspaceRelativePath::new(evidence.rel_path.as_ref()) else {
             return Err("an assertion subject row has no workspace-relative path");
         };
-        let (Some(byte_span), Some(range)) = (evidence.byte_span.as_ref(), *node_range) else {
+        let (Some(byte_span), Some(range)) = (evidence.byte_span.as_ref(), node_range) else {
             return Err("an assertion subject row is missing its exact source span");
         };
         let Ok(location) = policy_span_location(path.clone(), byte_span, range) else {
@@ -5010,37 +5029,108 @@ fn assertion_occurrence_query(
     let Ok(seed) = OccurrenceSeed::for_exact_paths(paths.iter().copied(), roles.to_vec()) else {
         return Err("an assertion subject path is not a valid scan pattern");
     };
-    Ok(CodeQuery {
-        schema_version: SCHEMA_VERSION,
-        plan: CodeQueryPlan {
+    Ok(assertion_code_query(
+        CodeQueryPlan {
             source: CodeQueryPlanSource::Occurrences(Box::new(seed)),
             steps,
         },
+        budget,
+    ))
+}
+
+/// Preserve the query's visible row fields and append fields read by a later
+/// relational operator. The terminal project makes the consumer visible to
+/// RQL's ordinary lazy target planner, after that query's earlier filters.
+fn append_occurrence_target_projection(
+    query: &mut CodeQuery,
+    target_fields: &[&'static str],
+) -> Result<(), &'static str> {
+    if target_fields.is_empty() {
+        return Ok(());
+    }
+    let Ok((kind, fields)) = query.validate_row_fields() else {
+        return Err("a relational target consumer has an invalid row query");
+    };
+    if kind != QueryValueKind::Occurrence {
+        return Ok(());
+    }
+
+    let mut columns = fields
+        .into_iter()
+        .map(
+            |(name, _)| brokk_bifrost_rql::query::QueryRowProjectionColumn {
+                source: name.clone(),
+                name,
+            },
+        )
+        .collect::<Vec<_>>();
+    for &field in target_fields {
+        if !columns.iter().any(|column| column.name == field) {
+            columns.push(brokk_bifrost_rql::query::QueryRowProjectionColumn {
+                source: field.to_owned(),
+                name: field.to_owned(),
+            });
+        }
+    }
+    query.plan.steps.push(QueryStep::Project(columns));
+    Ok(())
+}
+
+/// Full detail preserves the capture AST identities every assertion join uses.
+fn assertion_code_query(plan: CodeQueryPlan, budget: &PolicyBudget) -> CodeQuery {
+    CodeQuery {
+        schema_version: SCHEMA_VERSION,
+        plan,
         limit: budget.query_limits().max_pipeline_rows,
-        // Full detail is what emits `ast_id`, which is the whole join.
         result_detail: CodeQueryResultDetail::Full,
         execution_mode: Default::default(),
-    })
+    }
+}
+
+fn assertion_where_globs(
+    paths: &[&str],
+    empty_paths_message: &'static str,
+) -> Result<brokk_bifrost_rql::query::QueryPathScope, &'static str> {
+    assert!(!paths.is_empty(), "{empty_paths_message}");
+    exact_path_globs(paths.iter().copied())
+        .map_err(|_| "an assertion subject path is not a valid scan pattern")
+}
+
+fn assertion_seed_code_query(
+    paths: &[&str],
+    languages: Vec<brokk_bifrost_analysis::analyzer::Language>,
+    root: Pattern,
+    budget: &PolicyBudget,
+    empty_paths_message: &'static str,
+) -> Result<CodeQuery, &'static str> {
+    let where_globs = assertion_where_globs(paths, empty_paths_message)?;
+    Ok(assertion_code_query(
+        CodeQueryPlan {
+            source: CodeQueryPlanSource::Seed(Box::new(CodeQuerySeed {
+                where_globs,
+                languages,
+                root,
+                inside: None,
+                inside_decl: None,
+                not_inside: None,
+            })),
+            steps: Vec::new(),
+        },
+        budget,
+    ))
 }
 
 /// Every assignment of the subject file whose left operand is a named value,
 /// with that operand captured so its binding-of answer can be joined.
 ///
-/// A declaration's initializer is deliberately not special-cased here: its
-/// left operand is a binder rather than a value reference, so it carries no
-/// binding-of row and never joins. Declarations are already the other origin
-/// this family reads, through the declaring scope.
+/// Assignment targets can be binders as well as value references. Both roles
+/// participate in the binding-of join: a binder's declaring scope can be
+/// outside the region even when the assignment establishes its value inside
+/// it, as with Python's function-scoped locals.
 fn assertion_assignment_query(
     paths: &[&str],
     budget: &PolicyBudget,
 ) -> Result<CodeQuery, &'static str> {
-    assert!(
-        !paths.is_empty(),
-        "assertion assignment queries require subject paths"
-    );
-    let Ok(where_globs) = exact_path_globs(paths.iter().copied()) else {
-        return Err("an assertion subject path is not a valid scan pattern");
-    };
     let assigned = Pattern {
         kinds: vec![NormalizedKind::Identifier],
         capture: Some(ASSIGNED_VALUE_CAPTURE.to_owned()),
@@ -5051,24 +5141,13 @@ fn assertion_assignment_query(
         left: Some(Box::new(assigned)),
         ..Pattern::default()
     };
-    Ok(CodeQuery {
-        schema_version: SCHEMA_VERSION,
-        plan: CodeQueryPlan {
-            source: CodeQueryPlanSource::Seed(Box::new(CodeQuerySeed {
-                where_globs,
-                languages: Vec::new(),
-                root,
-                inside: None,
-                inside_decl: None,
-                not_inside: None,
-            })),
-            steps: Vec::new(),
-        },
-        limit: budget.query_limits().max_pipeline_rows,
-        // Full detail is what emits each capture's `ast_id`, which is the join.
-        result_detail: CodeQueryResultDetail::Full,
-        execution_mode: Default::default(),
-    })
+    assertion_seed_code_query(
+        paths,
+        Vec::new(),
+        root,
+        budget,
+        "assertion assignment queries require subject paths",
+    )
 }
 
 /// Every for-each loop of the subject file with its iterated expression
@@ -5079,13 +5158,6 @@ fn origin_shape_iterable_query(
     paths: &[&str],
     budget: &PolicyBudget,
 ) -> Result<CodeQuery, &'static str> {
-    assert!(
-        !paths.is_empty(),
-        "assertion row queries require subject paths"
-    );
-    let Ok(where_globs) = exact_path_globs(paths.iter().copied()) else {
-        return Err("an assertion subject path is not a valid scan pattern");
-    };
     let iterable = Pattern {
         capture: Some(ORIGIN_ITERABLE_CAPTURE.to_owned()),
         ..Pattern::default()
@@ -5096,43 +5168,28 @@ fn origin_shape_iterable_query(
         capture: Some(ORIGIN_LOOP_CAPTURE.to_owned()),
         ..Pattern::default()
     };
-    Ok(CodeQuery {
-        schema_version: SCHEMA_VERSION,
-        plan: CodeQueryPlan {
-            source: CodeQueryPlanSource::Seed(Box::new(CodeQuerySeed {
-                where_globs,
-                languages: Vec::new(),
-                root,
-                inside: None,
-                inside_decl: None,
-                not_inside: None,
-            })),
-            steps: Vec::new(),
-        },
-        limit: budget.query_limits().max_pipeline_rows,
-        result_detail: CodeQueryResultDetail::Full,
-        execution_mode: Default::default(),
-    })
+    assertion_seed_code_query(
+        paths,
+        Vec::new(),
+        root,
+        budget,
+        "assertion row queries require subject paths",
+    )
 }
 
-/// Every assignment of the subject file with both operands captured, for the
-/// origin-shape family (#2647). Unlike [`assertion_assignment_query`], the
-/// left operand is joined two ways -- by binding-of row for a reassignment,
-/// and by binder AST identity for a declaration initializer -- so the query
-/// does not care which occurrence class the left operand carries, and the
-/// right operand is captured because *it* is the establishing value whose
-/// shape the assert checks.
+/// Every assignment in a language with supported declarator-origin evidence,
+/// with both operands captured, for the origin-shape family (#2647). Unlike
+/// [`assertion_assignment_query`], the left operand is joined two ways -- by
+/// binding-of row for a reassignment, and by binder AST identity for a
+/// declaration initializer -- and the right operand is captured because *it*
+/// is the establishing value whose shape the assert checks. Python's
+/// assignment rows do not establish this proof, so Python collections remain
+/// open when reached through a local name; direct iterable literals are still
+/// checked by `origin_shape_literal_query`.
 fn origin_shape_assignment_query(
     paths: &[&str],
     budget: &PolicyBudget,
 ) -> Result<CodeQuery, &'static str> {
-    assert!(
-        !paths.is_empty(),
-        "assertion row queries require subject paths"
-    );
-    let Ok(where_globs) = exact_path_globs(paths.iter().copied()) else {
-        return Err("an assertion subject path is not a valid scan pattern");
-    };
     let left = Pattern {
         kinds: vec![NormalizedKind::Identifier],
         capture: Some(ORIGIN_LEFT_CAPTURE.to_owned()),
@@ -5148,70 +5205,70 @@ fn origin_shape_assignment_query(
         right: Some(Box::new(right)),
         ..Pattern::default()
     };
-    Ok(CodeQuery {
-        schema_version: SCHEMA_VERSION,
-        plan: CodeQueryPlan {
-            source: CodeQueryPlanSource::Seed(Box::new(CodeQuerySeed {
-                where_globs,
-                languages: Vec::new(),
-                root,
-                inside: None,
-                inside_decl: None,
-                not_inside: None,
-            })),
-            steps: Vec::new(),
-        },
-        limit: budget.query_limits().max_pipeline_rows,
-        result_detail: CodeQueryResultDetail::Full,
-        execution_mode: Default::default(),
-    })
+    assertion_seed_code_query(
+        paths,
+        vec![
+            brokk_bifrost_analysis::analyzer::Language::Java,
+            brokk_bifrost_analysis::analyzer::Language::JavaScript,
+            brokk_bifrost_analysis::analyzer::Language::TypeScript,
+            brokk_bifrost_analysis::analyzer::Language::Rust,
+        ],
+        root,
+        budget,
+        "assertion row queries require subject paths",
+    )
 }
 
 /// Every collection literal of the subject file with at most `max_elements`
-/// elements, for the origin-shape family (#2647). The element bound rides the
-/// arity predicate, which counts a collection literal's `elements` role edges
+/// elements, for the origin-shape family (#2647). The normalized model gives
+/// lists and tuples their own kinds, while sets and dictionaries use
+/// `collection_literal`, so query all three exact kinds. The element bound
+/// rides the arity predicate, which counts the literal's `elements` role edges
 /// the same way it counts a call's `args`.
 fn origin_shape_literal_query(
     paths: &[&str],
     max_elements: u32,
     budget: &PolicyBudget,
 ) -> Result<CodeQuery, &'static str> {
-    assert!(
-        !paths.is_empty(),
-        "assertion row queries require subject paths"
-    );
-    let Ok(where_globs) = exact_path_globs(paths.iter().copied()) else {
-        return Err("an assertion subject path is not a valid scan pattern");
+    let where_globs = assertion_where_globs(paths, "assertion row queries require subject paths")?;
+    let branch = |kinds, languages| CodeQueryPlan {
+        source: CodeQueryPlanSource::Seed(Box::new(CodeQuerySeed {
+            where_globs: where_globs.clone(),
+            languages,
+            root: Pattern {
+                kinds,
+                // At least one element: a Rust repeat array emits no element
+                // edges precisely so it can never qualify, and an empty
+                // display literal has nothing bounded to prove either.
+                arity: Some(ArityConstraint {
+                    min: Some(1),
+                    max: Some(max_elements),
+                }),
+                capture: Some(format!("{ORIGIN_LITERAL_CAPTURE_PREFIX}{max_elements}")),
+                ..Pattern::default()
+            },
+            inside: None,
+            inside_decl: None,
+            not_inside: None,
+        })),
+        steps: Vec::new(),
     };
-    let root = Pattern {
-        kinds: vec![NormalizedKind::CollectionLiteral],
-        // At least one element: a Rust repeat array emits no element edges
-        // precisely so it can never qualify, and an empty display literal has
-        // nothing bounded to prove either.
-        arity: Some(ArityConstraint {
-            min: Some(1),
-            max: Some(max_elements),
-        }),
-        capture: Some(format!("{ORIGIN_LITERAL_CAPTURE_PREFIX}{max_elements}")),
-        ..Pattern::default()
-    };
-    Ok(CodeQuery {
-        schema_version: SCHEMA_VERSION,
-        plan: CodeQueryPlan {
-            source: CodeQueryPlanSource::Seed(Box::new(CodeQuerySeed {
-                where_globs,
-                languages: Vec::new(),
-                root,
-                inside: None,
-                inside_decl: None,
-                not_inside: None,
-            })),
+    Ok(assertion_code_query(
+        CodeQueryPlan {
+            source: CodeQueryPlanSource::Set {
+                op: brokk_bifrost_rql::SetOperator::Union,
+                branches: vec![
+                    branch(vec![NormalizedKind::CollectionLiteral], Vec::new()),
+                    branch(
+                        vec![NormalizedKind::ListLiteral, NormalizedKind::TupleLiteral],
+                        vec![brokk_bifrost_analysis::analyzer::Language::Python],
+                    ),
+                ],
+            },
             steps: Vec::new(),
         },
-        limit: budget.query_limits().max_pipeline_rows,
-        result_detail: CodeQueryResultDetail::Full,
-        execution_mode: Default::default(),
-    })
+        budget,
+    ))
 }
 
 /// The exclusion half of a review-prompt policy (#2647): does the value read
@@ -5353,16 +5410,13 @@ fn assertion_scope_query(paths: &[&str], budget: &PolicyBudget) -> Result<CodeQu
     let Ok(seed) = ScopeSeed::for_exact_paths(paths.iter().copied()) else {
         return Err("an assertion subject path is not a valid scan pattern");
     };
-    Ok(CodeQuery {
-        schema_version: SCHEMA_VERSION,
-        plan: CodeQueryPlan {
+    Ok(assertion_code_query(
+        CodeQueryPlan {
             source: CodeQueryPlanSource::Scopes(Box::new(seed)),
             steps: Vec::new(),
         },
-        limit: budget.query_limits().max_pipeline_rows,
-        result_detail: CodeQueryResultDetail::Full,
-        execution_mode: Default::default(),
-    })
+        budget,
+    ))
 }
 
 /// Every generation site of the subject files, joined to captures by the
@@ -5380,16 +5434,13 @@ fn assertion_generation_query(
     let Ok(seed) = GenerationSiteSeed::for_exact_paths(paths.iter().copied()) else {
         return Err("an assertion subject path is not a valid scan pattern");
     };
-    Ok(CodeQuery {
-        schema_version: SCHEMA_VERSION,
-        plan: CodeQueryPlan {
+    Ok(assertion_code_query(
+        CodeQueryPlan {
             source: CodeQueryPlanSource::GenerationSites(Box::new(seed)),
             steps: Vec::new(),
         },
-        limit: budget.query_limits().max_pipeline_rows,
-        result_detail: CodeQueryResultDetail::Full,
-        execution_mode: Default::default(),
-    })
+        budget,
+    ))
 }
 
 fn assertion_related_locations(
@@ -5550,11 +5601,7 @@ impl IdentityAssertSupport {
 /// The stable workspace-relative key an analyzed file is addressed by: path
 /// components joined with `/`, matching how subject paths are rendered.
 fn workspace_relative_key(file: &ProjectFile) -> String {
-    file.rel_path()
-        .components()
-        .map(|component| component.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
+    workspace_relative_slash_path(file.rel_path())
 }
 
 /// The declarations one internal occurrence row names: its resolved targets
@@ -5890,18 +5937,25 @@ fn candidate_row_location(row: &CodeQueryResolutionCandidate) -> Result<PolicySo
     {
         return Ok(PolicySourceLocation::artifact(path));
     }
-    let path = WorkspaceRelativePath::new(&row.path).map_err(|_| ())?;
-    policy_span_location(path, &(row.start_byte..row.end_byte), row.range)
+    row_location(&row.path, row.start_byte, row.end_byte, row.range)
 }
 
 fn binding_row_location(row: &CodeQueryBinding) -> Result<PolicySourceLocation, ()> {
-    let path = WorkspaceRelativePath::new(&row.path).map_err(|_| ())?;
-    policy_span_location(path, &(row.start_byte..row.end_byte), row.range)
+    row_location(&row.path, row.start_byte, row.end_byte, row.range)
 }
 
 fn scope_row_location(row: &CodeQueryLexicalScope) -> Result<PolicySourceLocation, ()> {
-    let path = WorkspaceRelativePath::new(&row.path).map_err(|_| ())?;
-    policy_span_location(path, &(row.start_byte..row.end_byte), row.range)
+    row_location(&row.path, row.start_byte, row.end_byte, row.range)
+}
+
+fn row_location(
+    path: &str,
+    start_byte: usize,
+    end_byte: usize,
+    range: CodeQueryRange,
+) -> Result<PolicySourceLocation, ()> {
+    let path = WorkspaceRelativePath::new(path).map_err(|_| ())?;
+    policy_span_location(path, &(start_byte..end_byte), range)
 }
 
 fn occurrence_row_location(

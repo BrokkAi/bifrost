@@ -495,14 +495,9 @@ impl<'a> RustIncludeRoutes<'a> {
         name: &str,
     ) -> Result<Option<RustSymbolIdentity>, RustCargoRouteError> {
         Ok(self
-            .walks
-            .queries()
-            .identities_in_file_named(file, name)?
+            .value_identities_named_in(file, name)?
             .into_iter()
-            .map(|(identity, _)| identity)
-            .find(|identity| {
-                identity.namespace == RustSymbolNamespace::Value && identity.module == *module
-            }))
+            .find(|identity| identity.module == *module))
     }
 
     /// Every value-namespace identity `file` declares as `name`, in any module.
@@ -511,14 +506,15 @@ impl<'a> RustIncludeRoutes<'a> {
         file: &ProjectFile,
         name: &str,
     ) -> Result<Vec<RustSymbolIdentity>, RustCargoRouteError> {
-        Ok(self
+        let identities = self
             .walks
             .queries()
             .identities_in_file_named(file, name)?
             .into_iter()
             .map(|(identity, _)| identity)
             .filter(|identity| identity.namespace == RustSymbolNamespace::Value)
-            .collect())
+            .collect();
+        Ok(identities)
     }
 }
 

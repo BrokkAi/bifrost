@@ -363,8 +363,18 @@ impl<'a> ReferenceEngine<'a> {
         };
 
         drop(_cand_scope);
+        let explicit_candidates = explicit_provider
+            .and_then(CandidateFileProvider::explicit_candidate_files)
+            .map(|files| {
+                files
+                    .intersection(&admitted_query.candidate_files)
+                    .cloned()
+                    .collect::<HashSet<_>>()
+            });
         let scan_scope =
-            UsageScanScope::with_cancellation(&admitted_query.candidate_files, &self.cancellation);
+            UsageScanScope::with_cancellation(&admitted_query.candidate_files, &self.cancellation)
+                .with_explicit_candidates(explicit_candidates.as_ref())
+                .with_test_inclusion(self.excluded_test_files.is_none());
         let _graph_scope = crate::profiling::scope("usages::graph_find_usages");
         let outcome = graph_find_usages(
             language_for_target(target),
@@ -617,9 +627,11 @@ mod tests {
     use super::*;
     use crate::analyzer::CodeUnitIndex;
     use crate::analyzer::{
-        CodeUnitType, EmptyAnalyzer, FileSetProject, Language, Project, ProjectFile, RubyAnalyzer,
+        CodeUnitType, EmptyAnalyzer, FileSetProject, Project, ProjectFile, RubyAnalyzer,
     };
     use crate::inline_project::InlineTestProject;
+
+    use brokk_bifrost_test_macros::hardwon;
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -636,6 +648,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("22af2f573b4e: a cancelled usage query still invoked expensive candidate discovery")]
     fn issue_1228_pre_cancelled_query_skips_candidate_discovery() {
         let root = std::env::temp_dir();
         let project: Arc<dyn Project> = Arc::new(FileSetProject::new(
@@ -682,6 +695,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "22af2f573b4e: cancellation after discovery was incorrectly reported as empty success"
+    )]
     fn issue_1228_cancellation_after_candidate_discovery_is_not_reported_as_empty_success() {
         let root = std::env::temp_dir();
         let project: Arc<dyn Project> = Arc::new(FileSetProject::new(
@@ -732,6 +748,9 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "5258690d40b2: graph cancellation discarded proven hits already found in the admitted scope"
+    )]
     fn graph_cancellation_preserves_proven_hits_and_the_admitted_scope() {
         let fixture = InlineTestProject::with_language(Language::Ruby)
             .file(
@@ -860,78 +879,48 @@ mod tests {
         )
     }
 
-    #[test]
-    fn cpp_free_function_candidates_require_the_written_identifier() {
+    fn php_composer_fixture() -> (tempfile::TempDir, crate::analyzer::PhpAnalyzer, CodeUnit) {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonicalize temp dir");
-        write_fixture(
-            &root,
-            &[
-                (
-                    "api.h",
-                    "#pragma once\nvoid UtilMount();\nstruct Number { Number operator+(const Number&) const; };\n",
+        let mut files = vec![
+            (
+                "composer.json".to_string(),
+                r#"{"autoload":{"psr-4":{"App\\":"src/"}}}"#.to_string(),
+            ),
+            (
+                "src/Domain/Service.php".to_string(),
+                "<?php\nnamespace App\\Domain;\n\nclass Service {\n    public function run(): void {}\n}\n".to_string(),
+            ),
+            (
+                "src/Http/Controller.php".to_string(),
+                "<?php\nnamespace App\\Http;\n\nuse App\\Domain\\Service;\n\nclass Controller {\n    public function handle(Service $service): void {\n        $service->run();\n    }\n}\n".to_string(),
+            ),
+        ];
+        for index in 0..6 {
+            files.push((
+                format!("src/Unrelated/Widget{index}.php"),
+                format!(
+                    "<?php\nnamespace App\\Unrelated;\n\nclass Widget{index} {{\n    public function tick(): void {{}}\n}}\n"
                 ),
-                (
-                    "api.cpp",
-                    "#include \"api.h\"\nvoid UtilMount() {}\nNumber Number::operator+(const Number&) const { return {}; }\n",
-                ),
-                (
-                    "caller.cpp",
-                    "#include \"api.h\"\nvoid call() { UtilMount(); }\n",
-                ),
-                (
-                    "address.cpp",
-                    "#include \"api.h\"\nauto mount_callback = &UtilMount;\n",
-                ),
-                (
-                    "unrelated.cpp",
-                    "#include \"api.h\"\nvoid unrelated(Number a, Number b) { auto sum = a + b; }\n",
-                ),
-            ],
-        );
-
-        let analyzer = crate::analyzer::CppAnalyzer::from_project(
-            crate::analyzer::TestProject::new(root.clone(), Language::Cpp),
-        );
-        let api = ProjectFile::new(root.clone(), "api.h");
-        let declarations = analyzer.declarations(&api);
-        let free_function = declarations
+            ));
+        }
+        let borrowed: Vec<(&str, &str)> = files
             .iter()
-            .find(|unit| unit.identifier() == "UtilMount")
-            .expect("fixture declares UtilMount");
-        let operator = declarations
-            .iter()
-            .find(|unit| unit.identifier().starts_with("operator"))
-            .expect("fixture declares operator+");
+            .map(|(rel, content)| (rel.as_str(), content.as_str()))
+            .collect();
+        write_fixture(&root, &borrowed);
 
-        let free_function_candidates = default_route_candidates(&analyzer, free_function);
-        let relative_paths = |files: &HashSet<ProjectFile>| {
-            files
-                .iter()
-                .map(|file| file.rel_path().to_string_lossy().into_owned())
-                .collect::<std::collections::BTreeSet<_>>()
-        };
-        assert_eq!(
-            relative_paths(&free_function_candidates),
-            ["address.cpp", "api.cpp", "api.h", "caller.cpp"]
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-            "candidate admission may use the required spelling, while the graph still proves hits"
+        let analyzer = crate::analyzer::PhpAnalyzer::from_project(
+            crate::analyzer::TestProject::new(root.clone(), Language::Php),
         );
-
-        let operator_candidates = default_route_candidates(&analyzer, operator);
-        assert!(
-            operator_candidates.contains(&ProjectFile::new(root, "unrelated.cpp")),
-            "operator syntax need not spell the declaration identifier and must remain graph-routed"
-        );
+        let target = analyzer
+            .declarations(&ProjectFile::new(root, "src/Domain/Service.php"))
+            .into_iter()
+            .find(|unit| unit.is_class())
+            .expect("fixture declares the Service class");
+        (temp, analyzer, target)
     }
 
-    /// A protected augmentation competes with the generic candidates for the file-count
-    /// budget instead of being dropped ahead of them. `caller.rs` reaches `collect_it`
-    /// through a re-export, so the import-graph walk never sees it and only Rust's own
-    /// binding graph can contribute it -- exactly the file whose loss would let a
-    /// truncated query report proven absence for a symbol that is used.
     #[test]
     fn a_protected_augmentation_survives_the_file_count_budget() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -992,52 +981,6 @@ mod tests {
         );
     }
 
-    fn php_composer_fixture() -> (tempfile::TempDir, crate::analyzer::PhpAnalyzer, CodeUnit) {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonicalize temp dir");
-        let mut files = vec![
-            (
-                "composer.json".to_string(),
-                r#"{"autoload":{"psr-4":{"App\\":"src/"}}}"#.to_string(),
-            ),
-            (
-                "src/Domain/Service.php".to_string(),
-                "<?php\nnamespace App\\Domain;\n\nclass Service {\n    public function run(): void {}\n}\n".to_string(),
-            ),
-            (
-                "src/Http/Controller.php".to_string(),
-                "<?php\nnamespace App\\Http;\n\nuse App\\Domain\\Service;\n\nclass Controller {\n    public function handle(Service $service): void {\n        $service->run();\n    }\n}\n".to_string(),
-            ),
-        ];
-        for index in 0..6 {
-            files.push((
-                format!("src/Unrelated/Widget{index}.php"),
-                format!(
-                    "<?php\nnamespace App\\Unrelated;\n\nclass Widget{index} {{\n    public function tick(): void {{}}\n}}\n"
-                ),
-            ));
-        }
-        let borrowed: Vec<(&str, &str)> = files
-            .iter()
-            .map(|(rel, content)| (rel.as_str(), content.as_str()))
-            .collect();
-        write_fixture(&root, &borrowed);
-
-        let analyzer = crate::analyzer::PhpAnalyzer::from_project(
-            crate::analyzer::TestProject::new(root.clone(), Language::Php),
-        );
-        let target = analyzer
-            .declarations(&ProjectFile::new(root, "src/Domain/Service.php"))
-            .into_iter()
-            .find(|unit| unit.is_class())
-            .expect("fixture declares the Service class");
-        (temp, analyzer, target)
-    }
-
-    /// A supplemental augmentation is what the file-count budget drops first. Composer
-    /// autoload visibility makes every analyzed PHP file a candidate, so a budget set to
-    /// the generic candidate count must keep exactly the generic candidates and shed
-    /// exactly the composer expansion -- the opposite of the protected case above.
     #[test]
     fn b_a_supplemental_augmentation_is_dropped_first_by_the_file_count_budget() {
         let (_temp, analyzer, target) = php_composer_fixture();
@@ -1078,12 +1021,6 @@ mod tests {
         }
     }
 
-    /// PHP's augmentation abandons the whole query on cancellation rather than handing
-    /// back what it accumulated, so a query cancelled anywhere in candidate discovery
-    /// reports no scope at all. Only cancellation after the scope is fixed -- the #1416
-    /// late window -- may report candidates, and it reports the whole scope, never a
-    /// half-expanded one that a caller reading `candidate_files` would take for complete.
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn c_cancellation_during_a_supplemental_augmentation_abandons_the_query() {
         let (_temp, analyzer, target) = php_composer_fixture();

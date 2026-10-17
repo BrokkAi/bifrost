@@ -189,3 +189,49 @@ fn go_spelling_persisted_and_unsaved_content_match_preload() {
         );
     }
 }
+
+#[test]
+fn go_universe_lookup_survives_the_selected_context_overlay() {
+    let consumer = "package consumer\nfunc caller(values []int) { _ = len(values) }\n";
+    let fixture = GoRootResolutionOperationFixture::with_consumer(consumer);
+    let cancellation = CancellationToken::default();
+    let reference = fixture
+        .consumer_facts
+        .identifiers
+        .iter()
+        .find(|identifier| {
+            identifier.role == ResolutionIdentifierRole::Reference
+                && fixture.consumer_facts.names[identifier.name.index()].spelling == "len"
+                && fixture.consumer_facts.sites[identifier.site.index()].start_byte
+                    == consumer.find("len(values)").unwrap()
+        })
+        .expect("the Go builtin call has a structured callee reference");
+    let operation = fixture.open_ready(&cancellation);
+    let contexts = operation
+        .empty_contexts(&ResolutionCompletion::Complete)
+        .expect("empty Go context is available");
+    let locator = SelectedSemanticLocator::new(
+        "go",
+        GO_ROOT_CONSUMER_PATH,
+        reference.site,
+        LoweredSemanticRole::Reference,
+    );
+    let SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Found(answer)) =
+        operation
+            .resolve_reference(
+                contexts,
+                &locator,
+                &cancellation,
+                &mut SelectedResolutionContextMetrics,
+            )
+            .expect("selected Go builtin lookup succeeds")
+    else {
+        panic!("Go builtin answer must be native")
+    };
+    assert_eq!(answer.binding().targets().len(), 1, "{answer:#?}");
+    assert_eq!(
+        answer.binding().completion(),
+        &ResolutionCompletion::Complete,
+        "{answer:#?}"
+    );
+}

@@ -12,10 +12,11 @@ pub(crate) use brokk_bifrost_jvm::scala::graph::{inverted, resolver, syntax};
 
 use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::inverted_edges::{UsageEdgeBuildResult, UsageEdgeWeights, UsageEdges};
+#[cfg(test)]
 use crate::analyzer::usages::model::FuzzyResult;
-use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
+use crate::analyzer::usages::outcome::GraphUsageOutcome;
 use crate::analyzer::usages::scala_graph::shared::{ScalaEdgeResolver, ScalaQueryResolver};
-use crate::analyzer::usages::traits::{UsageQueryResolver, UsageScanScope};
+use crate::analyzer::usages::traits::{GraphUsageDispatchSpec, UsageScanScope};
 use crate::analyzer::{
     CodeUnit, IAnalyzer, Language, ProjectFile, ScalaAnalyzer, resolve_analyzer,
 };
@@ -76,7 +77,7 @@ where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     let resolver = ScalaEdgeResolver::try_new(analyzer)?;
-    Some(resolver.build_edge_weights(analyzer, token, nodes, keep_file))
+    Some(resolver.build_edges(analyzer, token, nodes, keep_file))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -185,39 +186,60 @@ impl GraphUsageAnalyzer for ScalaUsageGraphStrategy {
         scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
-        if overloads.is_empty() {
-            return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
-        }
-
-        let target = &overloads[0];
-        if language_for_target(target) != Language::Scala {
-            return GraphUsageOutcome::fallback_safe(
-                target.fq_name(),
-                GraphFailureReason::UnsupportedTargetLanguage("target is not Scala"),
-                "ScalaUsageGraphStrategy",
-            );
-        }
-
-        let Some(resolver) = ScalaQueryResolver::try_new(analyzer) else {
-            return GraphUsageOutcome::fallback_safe(
-                target.fq_name(),
-                GraphFailureReason::MissingAnalyzerCapability(
-                    "analyzer does not expose ScalaAnalyzer",
-                ),
-                "ScalaUsageGraphStrategy",
-            );
-        };
-
-        resolver.find_usages(analyzer, overloads, scan_scope, max_usages)
+        crate::analyzer::usages::traits::dispatch_graph_usage_query::<ScalaQueryResolver<'_>>(
+            analyzer,
+            overloads,
+            scan_scope,
+            max_usages,
+            GraphUsageDispatchSpec {
+                target_language: Language::Scala,
+                unsupported_target: "target is not Scala",
+                missing_analyzer: "analyzer does not expose ScalaAnalyzer",
+                strategy: "ScalaUsageGraphStrategy",
+            },
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::{AnalyzerQueryScope, QueryScope};
+
+    use crate::analyzer::AnalyzerQueryScope;
+    use crate::analyzer::QueryScope;
     use crate::analyzer::{Project, TestProject};
+    use brokk_bifrost_test_macros::hardwon;
     use std::sync::Arc;
+
+    #[test]
+    #[hardwon(
+        "#2844: A complete real Scala inbound graph is reused by dead-code lookup without invoking the builder again"
+    )]
+    fn complete_inbound_graph_is_reused_by_the_dead_code_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let file = ProjectFile::new(root.clone(), "Target.scala");
+        file.write("package app\nclass Target\n").unwrap();
+        let analyzer = ScalaAnalyzer::new(Arc::new(TestProject::new(root, Language::Scala)));
+        let callees = HashSet::from_iter(["app.Target".to_string()]);
+
+        let first = crate::analyzer::usages::inverted_edges::cached_dead_code_usage_edges(
+            &analyzer,
+            &analyzer.dead_code_usage_edges,
+            &callees,
+            |token| build_inbound_scala_usage_edges_with_completeness(&analyzer, token, &callees),
+        )
+        .expect("complete Scala graph should be cached");
+        let second = crate::analyzer::usages::inverted_edges::cached_dead_code_usage_edges(
+            &analyzer,
+            &analyzer.dead_code_usage_edges,
+            &callees,
+            |_| panic!("canonical target set should hit the Scala dead-code cache"),
+        )
+        .expect("cached Scala graph should be returned");
+
+        assert!(Arc::ptr_eq(&first, &second));
+    }
 
     #[test]
     fn scala_inverted_keeps_companion_bare_field_owners_exact() {
@@ -571,6 +593,7 @@ object Use {
     /// workspace spreads one package per file, the scan set is one file, and
     /// the target's package closure is one more: the touched set is a
     /// handful, not the workspace.
+
     #[test]
     fn scala_targeted_query_materializes_facts_only_for_touched_files() {
         const FILE_COUNT: usize = 132;
@@ -635,32 +658,5 @@ object Use {
             touched, 2,
             "only the target's file and the scanned file materialize full per-file facts",
         );
-    }
-
-    #[test]
-    fn complete_inbound_graph_is_reused_by_the_dead_code_cache() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let file = ProjectFile::new(root.clone(), "Target.scala");
-        file.write("package app\nclass Target\n").unwrap();
-        let analyzer = ScalaAnalyzer::new(Arc::new(TestProject::new(root, Language::Scala)));
-        let callees = HashSet::from_iter(["app.Target".to_string()]);
-
-        let first = crate::analyzer::usages::inverted_edges::cached_dead_code_usage_edges(
-            &analyzer,
-            &analyzer.dead_code_usage_edges,
-            &callees,
-            |token| build_inbound_scala_usage_edges_with_completeness(&analyzer, token, &callees),
-        )
-        .expect("complete Scala graph should be cached");
-        let second = crate::analyzer::usages::inverted_edges::cached_dead_code_usage_edges(
-            &analyzer,
-            &analyzer.dead_code_usage_edges,
-            &callees,
-            |_| panic!("canonical target set should hit the Scala dead-code cache"),
-        )
-        .expect("cached Scala graph should be returned");
-
-        assert!(Arc::ptr_eq(&first, &second));
     }
 }

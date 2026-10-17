@@ -1,0 +1,2309 @@
+//! Opt-in acquisition of semantic packs from the release bundle.
+//!
+//! The downloader is deliberately downstream of analysis. Analysis supplies
+//! the catalog and one [`AcquisitionRequest`] naming what it could not build
+//! locally: an exact generated production, or a declared dependency that has
+//! no artifact to produce from at all (#2957). This module only downloads,
+//! verifies, and installs a release bundle. Analysis re-reads the catalog
+//! after the hook returns, so a downloaded bundle cannot bypass catalog
+//! validation.
+//!
+//! One release archive carries every shipped pack and generated production.
+//! Acquisition verifies the whole archive envelope, then installs the packs
+//! relevant to the request; explicit release verification and installation
+//! remain exhaustive.
+
+use std::collections::HashSet;
+use std::error::Error;
+use std::ffi::OsStr;
+use std::fmt::{self, Display, Formatter};
+use std::fs::{self, OpenOptions};
+use std::io;
+use std::path::{Component, Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use brokk_bifrost_analysis::analyzer::semantic_model::{
+    AcquisitionReceiptLookup, AcquisitionReceiptRelease, AcquisitionReceiptRequest,
+    AcquisitionRequest, GENERATED_PRODUCTION_CACHE_VERSION, SEMANTIC_MODEL_SCHEMA_VERSION,
+    SemanticPackCatalog,
+};
+use flate2::read::GzDecoder;
+use serde::{Deserialize, Serialize};
+use tar::Archive;
+use tempfile::{Builder as TempDirBuilder, NamedTempFile};
+
+const RELEASE_REPOSITORY: &str = "BrokkAi/bifrost";
+const RELEASE_VERSION: &str = env!("CARGO_PKG_VERSION");
+const RELEASE_TAG: &str = concat!("v", env!("CARGO_PKG_VERSION"));
+const ARCHIVE_NAME: &str = concat!(
+    "bifrost-semantic-packs-v",
+    env!("CARGO_PKG_VERSION"),
+    ".tar.gz"
+);
+const CHECKSUM_NAME: &str = concat!(
+    "bifrost-semantic-packs-v",
+    env!("CARGO_PKG_VERSION"),
+    ".tar.gz.sha256"
+);
+const EXPECTED_TOP_LEVEL: &str = "bifrost-semantic-packs";
+const DOWNLOAD_MODE_ENV: &str = "BIFROST_SEMANTIC_PACK_DOWNLOAD";
+const DOWNLOAD_CACHE_DIR: &str = "semantic-pack-downloads";
+const NEGATIVE_CACHE_DIR: &str = "semantic-pack-negative-cache";
+const NEGATIVE_CACHE_SCHEMA_VERSION: u32 = 1;
+const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const USER_AGENT_PREFIX: &str = "brokk-bifrost-semantic-packs";
+const MAX_REDIRECTS: u32 = 3;
+const GLOBAL_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_CHECKSUM_BYTES: u64 = 4 * 1024;
+const MAX_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_EXTRACTED_BYTES: u64 = 512 * 1024 * 1024;
+// Rotate when acquisition or reader compatibility changes without a schema,
+// generated-cache, or release identity change.
+const ABSENCE_RECEIPT_CLIENT_EPOCH: u32 = 3;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AttemptKey {
+    catalog_root: PathBuf,
+    request_digest: String,
+    release_tag: &'static str,
+    archive_digest: String,
+    client_epoch: u32,
+}
+
+static ATTEMPTED_REQUESTS: OnceLock<Mutex<HashSet<AttemptKey>>> = OnceLock::new();
+/// The release checksum sidecar this process resolved, or the error that
+/// resolving it produced. See [`ReleaseChecksumMemoTransport`].
+type ReleaseChecksumMemo = Mutex<Option<Result<Vec<u8>, DownloadError>>>;
+
+static RELEASE_CHECKSUM: ReleaseChecksumMemo = Mutex::new(None);
+
+/// The request and immutable release identity that key one negative-cache
+/// entry. `path` is absent only when this host has no machine-local cache root.
+struct NegativeCacheIdentity<'a> {
+    request_digest: &'a str,
+    release_digest: &'a str,
+    path: Option<&'a Path>,
+}
+
+impl<'a> NegativeCacheIdentity<'a> {
+    fn path(&self) -> Option<&'a Path> {
+        self.path
+    }
+}
+
+/// The machine-local half of acquisition absence. The catalog receipt remains
+/// authoritative for the catalog that observed the failed install; this entry
+/// carries the same immutable release and build identity to a fresh catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct NegativeCacheEntry {
+    schema_version: u32,
+    request_digest: String,
+    release_repository: String,
+    release_tag: String,
+    archive_name: String,
+    archive_digest: String,
+    bundle_schema_version: u32,
+    bundle_generator_name: String,
+    bundle_generator_version: String,
+    semantic_schema_version: u32,
+    generated_cache_version: u32,
+    client_epoch: u32,
+    release_digest: String,
+    created_at: i64,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+enum TestNegativeCache {
+    Disabled,
+    Root(PathBuf),
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_NEGATIVE_CACHE: std::cell::RefCell<Option<TestNegativeCache>> =
+        const { std::cell::RefCell::new(Some(TestNegativeCache::Disabled)) };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DownloadMode {
+    Off,
+    On,
+}
+
+impl DownloadMode {
+    fn from_env() -> Self {
+        Self::from_env_value(std::env::var(DOWNLOAD_MODE_ENV).ok().as_deref())
+    }
+
+    fn from_env_value(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            Some(value) if value.eq_ignore_ascii_case("off") => Self::Off,
+            _ => Self::On,
+        }
+    }
+}
+
+/// Attempt to acquire the semantic pack requested by analysis.
+///
+/// This function is suitable for registration with
+/// `set_semantic_pack_acquisition_hook`. It returns successfully when
+/// acquisition is disabled, because disabled downloading is an intentional
+/// local fallback: an exact generated production is produced locally instead,
+/// and a declared dependency stays unavailable. For every other path, only a
+/// verified catalog lookup can turn the attempt into a hit.
+pub fn acquire_semantic_pack(
+    catalog: &SemanticPackCatalog,
+    request: &AcquisitionRequest<'_>,
+) -> Result<(), String> {
+    if DownloadMode::from_env() == DownloadMode::Off {
+        return Ok(());
+    }
+
+    let transport = ReleaseChecksumMemoTransport {
+        inner: &UreqTransport::new(),
+        memo: &RELEASE_CHECKSUM,
+    };
+    acquire_with_transport(catalog, request, &transport).map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+fn acquire_with_mode(
+    catalog: &SemanticPackCatalog,
+    request: &AcquisitionRequest<'_>,
+    mode: DownloadMode,
+    transport: &dyn HttpTransport,
+) -> Result<(), DownloadError> {
+    if mode == DownloadMode::Off {
+        return Ok(());
+    }
+    acquire_with_negative_cache(catalog, request, transport, None)
+}
+
+#[cfg(test)]
+fn acquire_with_negative_cache(
+    catalog: &SemanticPackCatalog,
+    request: &AcquisitionRequest<'_>,
+    transport: &dyn HttpTransport,
+    negative_cache_root: Option<&Path>,
+) -> Result<(), DownloadError> {
+    TEST_NEGATIVE_CACHE.with(|root| {
+        *root.borrow_mut() = Some(
+            negative_cache_root
+                .map(|path| TestNegativeCache::Root(path.to_path_buf()))
+                .unwrap_or(TestNegativeCache::Disabled),
+        );
+    });
+    let result = acquire_with_transport(catalog, request, transport);
+    TEST_NEGATIVE_CACHE.with(|root| {
+        *root.borrow_mut() = Some(TestNegativeCache::Disabled);
+    });
+    result
+}
+
+fn negative_cache_root() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(cache) = TEST_NEGATIVE_CACHE.with(|cache| cache.borrow().clone()) {
+        return match cache {
+            TestNegativeCache::Disabled => None,
+            TestNegativeCache::Root(root) => Some(root),
+        };
+    }
+    brokk_bifrost_analysis::gitblob::machine_cache_dir()
+}
+
+fn negative_cache_path(
+    request_digest: &str,
+    release_digest: &str,
+) -> Result<Option<PathBuf>, DownloadError> {
+    let Some(root) = negative_cache_root() else {
+        return Ok(None);
+    };
+    Ok(Some(
+        root.join(NEGATIVE_CACHE_DIR)
+            .join(format!("{release_digest}-{request_digest}.json")),
+    ))
+}
+
+fn negative_cache_now() -> i64 {
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time is after the Unix epoch")
+            .as_secs(),
+    )
+    .expect("Unix seconds fit in i64")
+}
+
+fn negative_cache_entry(
+    request_digest: &str,
+    release_digest: &str,
+    release: &AcquisitionReceiptRelease,
+    created_at: i64,
+) -> NegativeCacheEntry {
+    NegativeCacheEntry {
+        schema_version: NEGATIVE_CACHE_SCHEMA_VERSION,
+        request_digest: request_digest.to_owned(),
+        release_repository: release.repository.clone(),
+        release_tag: release.tag.clone(),
+        archive_name: release.archive_name.clone(),
+        archive_digest: release.archive_digest.clone(),
+        bundle_schema_version: release.bundle_schema_version,
+        bundle_generator_name: release.bundle_generator_name.clone(),
+        bundle_generator_version: release.bundle_generator_version.clone(),
+        semantic_schema_version: release.semantic_schema_version,
+        generated_cache_version: release.generated_cache_version,
+        client_epoch: release.client_epoch,
+        release_digest: release_digest.to_owned(),
+        created_at,
+    }
+}
+
+fn negative_cache_contains(
+    path: &Path,
+    request_digest: &str,
+    release_digest: &str,
+    release: &AcquisitionReceiptRelease,
+) -> bool {
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    let Ok(entry) = serde_json::from_slice::<NegativeCacheEntry>(&bytes) else {
+        return false;
+    };
+    if entry != negative_cache_entry(request_digest, release_digest, release, entry.created_at) {
+        return false;
+    }
+    let now = negative_cache_now();
+    entry.created_at <= now && now - entry.created_at < NEGATIVE_CACHE_TTL.as_secs() as i64
+}
+
+fn record_negative_cache(
+    path: &Path,
+    request_digest: &str,
+    release_digest: &str,
+    release: &AcquisitionReceiptRelease,
+) -> Result<(), DownloadError> {
+    let parent = path
+        .parent()
+        .expect("a negative-cache file path has a parent");
+    fs::create_dir_all(parent).map_err(|error| {
+        DownloadError::new(format!(
+            "create semantic-pack negative cache {}: {error}",
+            parent.display()
+        ))
+    })?;
+    let temporary = NamedTempFile::new_in(parent).map_err(|error| {
+        DownloadError::new(format!(
+            "create semantic-pack negative cache entry: {error}"
+        ))
+    })?;
+    let created_at = negative_cache_now();
+    serde_json::to_writer_pretty(
+        temporary.as_file(),
+        &negative_cache_entry(request_digest, release_digest, release, created_at),
+    )
+    .map_err(|error| {
+        DownloadError::new(format!("write semantic-pack negative cache entry: {error}"))
+    })?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| DownloadError::new(format!("sync negative cache entry: {error}")))?;
+    if let Err(error) = temporary.persist(path) {
+        // Another process may have published the identical request/release
+        // entry between the persist attempt and its rename. Only identical
+        // content is a successful race; anything else reports the failure.
+        let identical = fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<NegativeCacheEntry>(&bytes).ok())
+            .is_some_and(|existing| {
+                let expected = negative_cache_entry(
+                    request_digest,
+                    release_digest,
+                    release,
+                    existing.created_at,
+                );
+                existing == expected
+            });
+        if !identical {
+            return Err(DownloadError::new(format!(
+                "publish semantic-pack negative cache {}: {}",
+                path.display(),
+                error.error
+            )));
+        }
+    }
+    Ok(())
+}
+fn canonical_catalog_root(catalog: &SemanticPackCatalog) -> Result<PathBuf, DownloadError> {
+    fs::canonicalize(catalog.root()).map_err(|error| {
+        DownloadError::new(format!(
+            "canonicalize semantic-pack catalog root {}: {error}",
+            catalog.root().display()
+        ))
+    })
+}
+
+fn claim_catalog_attempt(
+    root: PathBuf,
+    request: &AcquisitionRequest<'_>,
+    archive_digest: &str,
+) -> bool {
+    let attempted = ATTEMPTED_REQUESTS.get_or_init(|| Mutex::new(HashSet::new()));
+    attempted
+        .lock()
+        .expect("semantic-pack download attempt mutex poisoned")
+        .insert(AttemptKey {
+            catalog_root: root,
+            request_digest: receipt_request(request).digest(),
+            release_tag: RELEASE_TAG,
+            archive_digest: archive_digest.to_owned(),
+            client_epoch: ABSENCE_RECEIPT_CLIENT_EPOCH,
+        })
+}
+
+trait HttpTransport {
+    fn fetch(&self, url: &str, max_bytes: u64) -> Result<Vec<u8>, DownloadError>;
+}
+
+struct UreqTransport {
+    agent: ureq::Agent,
+}
+
+impl UreqTransport {
+    fn new() -> Self {
+        let config = ureq::Agent::config_builder()
+            .https_only(true)
+            .max_redirects(MAX_REDIRECTS)
+            .max_redirects_will_error(true)
+            .timeout_global(Some(GLOBAL_TIMEOUT))
+            .user_agent(format!("{USER_AGENT_PREFIX}/{RELEASE_VERSION}"))
+            .build();
+        Self {
+            agent: ureq::Agent::new_with_config(config),
+        }
+    }
+}
+
+impl HttpTransport for UreqTransport {
+    fn fetch(&self, url: &str, max_bytes: u64) -> Result<Vec<u8>, DownloadError> {
+        let mut response = self
+            .agent
+            .get(url)
+            .header("Accept", "application/octet-stream")
+            .call()
+            .map_err(|error| DownloadError::new(format!("GET {url}: {error}")))?;
+        response
+            .body_mut()
+            .with_config()
+            .limit(max_bytes)
+            .read_to_vec()
+            .map_err(|error| DownloadError::new(format!("read {url}: {error}")))
+    }
+}
+
+/// Resolves the release checksum at most once per `memo`, which production
+/// keeps for the whole process.
+///
+/// Every acquisition in a process targets the same release, so its identity
+/// is resolved once. A failure is remembered too: an unpublished release
+/// answers 404 to every dependency, and refetching it cost about 11 s per warm
+/// start on an npm workspace (#3748). The next process fetches again. A
+/// remembered failure is only a failed acquisition; it records no absence,
+/// because absence still requires a catalog proof.
+struct ReleaseChecksumMemoTransport<'a> {
+    inner: &'a dyn HttpTransport,
+    memo: &'a ReleaseChecksumMemo,
+}
+
+impl HttpTransport for ReleaseChecksumMemoTransport<'_> {
+    fn fetch(&self, url: &str, max_bytes: u64) -> Result<Vec<u8>, DownloadError> {
+        if url != release_asset_url(CHECKSUM_NAME) {
+            return self.inner.fetch(url, max_bytes);
+        }
+        // Holding the lock across the fetch makes concurrent acquisitions
+        // wait for one request instead of each sending their own.
+        self.memo
+            .lock()
+            .expect("release checksum mutex poisoned")
+            .get_or_insert_with(|| {
+                let bytes = self.inner.fetch(url, max_bytes)?;
+                parse_checksum_sidecar(&bytes, ARCHIVE_NAME)?;
+                Ok(bytes)
+            })
+            .clone()
+    }
+}
+
+fn acquire_with_transport(
+    catalog: &SemanticPackCatalog,
+    request: &AcquisitionRequest<'_>,
+    transport: &dyn HttpTransport,
+) -> Result<(), DownloadError> {
+    let archive_url = release_asset_url(ARCHIVE_NAME);
+    let checksum_url = release_asset_url(CHECKSUM_NAME);
+    let checksum = {
+        let _scope =
+            brokk_bifrost_analysis::profiling::scope("semantic_pack.acquire_bundle.fetch_checksum");
+        transport.fetch(&checksum_url, MAX_CHECKSUM_BYTES)?
+    };
+    let expected_digest = parse_checksum_sidecar(&checksum, ARCHIVE_NAME)?;
+    let receipt_request = receipt_request(request);
+    let receipt_request_digest = receipt_request.digest();
+    let release = receipt_release(&expected_digest);
+    let release_digest = release.digest().map_err(|error| {
+        DownloadError::new(format!("build acquisition release identity: {error}"))
+    })?;
+    let negative_cache_path = negative_cache_path(&receipt_request_digest, &release_digest)?;
+    let negative_cache = NegativeCacheIdentity {
+        request_digest: &receipt_request_digest,
+        release_digest: &release_digest,
+        path: negative_cache_path.as_deref(),
+    };
+    let lookup = {
+        let _scope =
+            brokk_bifrost_analysis::profiling::scope("semantic_pack.acquire_bundle.receipt_lookup");
+        catalog
+            .acquisition_receipt_lookup(&receipt_request, &release)
+            .map_err(|error| DownloadError::new(format!("check acquisition receipt: {error}")))?
+    };
+    match lookup {
+        AcquisitionReceiptLookup::Satisfied => return Ok(()),
+        AcquisitionReceiptLookup::KnownVerifiedAbsence => {
+            return Err(unsatisfied_error(request));
+        }
+        AcquisitionReceiptLookup::ReceiptMiss => {}
+    }
+    // Use the same canonical identity as the process memoization. This keeps
+    // equivalent catalog paths from creating separate download caches and
+    // prevents a catalog-root symlink from redirecting the cache elsewhere.
+    let catalog_root = canonical_catalog_root(catalog)?;
+    let cache_dir = cache_dir(&catalog_root, &expected_digest);
+    if let Some(path) = negative_cache.path()
+        && negative_cache_contains(path, &receipt_request_digest, &release_digest, &release)
+    {
+        brokk_bifrost_analysis::profiling::note_with(|| {
+            format!(
+                "semantic_pack.acquire_bundle.negative_cache request_digest={receipt_request_digest} archive_digest={expected_digest}"
+            )
+        });
+        return Err(negative_cache_error(request));
+    }
+
+    if cache_dir.exists() {
+        verify_and_install_bundle(
+            &cache_dir,
+            catalog,
+            request,
+            &receipt_request,
+            &release,
+            &negative_cache,
+        )?;
+        return Ok(());
+    }
+
+    // A catalog mutation invalidates its receipt but must still permit repair
+    // from the local verified archive in this process. Bound only acquisition
+    // attempts, not verification and installation of an existing cache.
+    if !claim_catalog_attempt(catalog_root, request, &expected_digest) {
+        return Err(DownloadError::new(
+            "semantic-pack download was already attempted for this exact request and release",
+        ));
+    }
+
+    let archive = {
+        let _scope =
+            brokk_bifrost_analysis::profiling::scope("semantic_pack.acquire_bundle.fetch_archive");
+        transport.fetch(&archive_url, MAX_ARCHIVE_BYTES)?
+    };
+    verify_digest(&archive, &expected_digest)?;
+
+    let cache_parent = cache_dir
+        .parent()
+        .ok_or_else(|| DownloadError::new("semantic-pack cache has no parent directory"))?;
+    fs::create_dir_all(cache_parent).map_err(|error| {
+        DownloadError::new(format!(
+            "create semantic-pack cache directory {}: {error}",
+            cache_parent.display()
+        ))
+    })?;
+    let temporary = TempDirBuilder::new()
+        .prefix(".semantic-pack-download-")
+        .tempdir_in(cache_parent)
+        .map_err(|error| {
+            DownloadError::new(format!("create semantic-pack staging directory: {error}"))
+        })?;
+    let bundle_root = {
+        let _scope =
+            brokk_bifrost_analysis::profiling::scope("semantic_pack.acquire_bundle.extract");
+        safe_extract_archive(&archive, temporary.path())?
+    };
+    let verified = {
+        let _scope = brokk_bifrost_analysis::profiling::scope(
+            "semantic_pack.acquire_bundle.verify_download",
+        );
+        crate::release_bundle::verify_release_bundle_for_acquisition(&bundle_root, &receipt_request)
+            .map_err(|error| {
+                DownloadError::new(format!("verify downloaded semantic-pack bundle: {error}"))
+            })?
+    };
+    if let Err(error) = fs::rename(&bundle_root, &cache_dir) {
+        // A concurrent process may have published the same content-addressed
+        // directory between the existence check above and this rename. Unix
+        // and Windows report that race with different io::ErrorKind values.
+        // The cache is keyed by the archive digest this process verified, so
+        // fall through and install this process's verified copy rather than
+        // re-verifying the winner's bytes.
+        if !cache_dir.is_dir() {
+            return Err(DownloadError::new(format!(
+                "publish semantic-pack cache {}: {error}",
+                cache_dir.display()
+            )));
+        }
+    }
+
+    let proof =
+        crate::release_bundle::install_verified_acquisition_bundle(verified, catalog, &release)
+            .map_err(|error| {
+                DownloadError::new(format!("install semantic-pack bundle: {error}"))
+            })?;
+    finish_acquisition(
+        catalog,
+        request,
+        &receipt_request,
+        &release,
+        proof,
+        &negative_cache,
+    )
+}
+
+fn release_asset_url(asset_name: &str) -> String {
+    format!("https://github.com/{RELEASE_REPOSITORY}/releases/download/{RELEASE_TAG}/{asset_name}")
+}
+
+fn cache_dir(catalog_root: &Path, archive_digest: &str) -> PathBuf {
+    catalog_root
+        .join(DOWNLOAD_CACHE_DIR)
+        .join(RELEASE_TAG)
+        .join(archive_digest)
+}
+
+/// Verify compatible packs from a bundle this process did not verify, then
+/// install them and report whether the request analysis made is satisfiable.
+///
+/// This is the cached-archive path: the bytes on disk were written by another
+/// process, so installation begins by fully re-verifying the bundle
+/// immediately before catalog mutation. Only the verified request slice is
+/// installed. Analysis re-reads the catalog through its own verified path and
+/// remains authoritative.
+fn verify_and_install_bundle(
+    bundle_root: &Path,
+    catalog: &SemanticPackCatalog,
+    request: &AcquisitionRequest<'_>,
+    receipt_request: &AcquisitionReceiptRequest,
+    release: &AcquisitionReceiptRelease,
+    negative_cache: &NegativeCacheIdentity<'_>,
+) -> Result<(), DownloadError> {
+    let proof = {
+        let _scope =
+            brokk_bifrost_analysis::profiling::scope("semantic_pack.acquire_bundle.install");
+        crate::release_bundle::install_acquisition_bundle(
+            bundle_root,
+            catalog,
+            release,
+            receipt_request,
+        )
+        .map_err(|error| DownloadError::new(format!("install semantic-pack bundle: {error}")))?
+    };
+    finish_acquisition(
+        catalog,
+        request,
+        receipt_request,
+        release,
+        proof,
+        negative_cache,
+    )
+}
+
+fn finish_acquisition(
+    catalog: &SemanticPackCatalog,
+    request: &AcquisitionRequest<'_>,
+    receipt_request: &AcquisitionReceiptRequest,
+    release: &AcquisitionReceiptRelease,
+    proof: crate::release_bundle::AcquisitionInstallationProof,
+    negative_cache: &NegativeCacheIdentity<'_>,
+) -> Result<(), DownloadError> {
+    assert_eq!(proof.request(), receipt_request);
+    let satisfied = match request {
+        AcquisitionRequest::GeneratedProduction(key) => catalog
+            .generated_production(key)
+            .map_err(|error| {
+                DownloadError::new(format!("check acquired generated production: {error}"))
+            })?
+            .is_some(),
+        AcquisitionRequest::DeclaredPack(query) => {
+            let candidates = catalog.dependency_candidates(query).map_err(|error| {
+                DownloadError::new(format!("check acquired declared dependency pack: {error}"))
+            })?;
+            !candidates.is_empty()
+        }
+    };
+    if satisfied {
+        return Ok(());
+    }
+    let Some(sources) = proof.sources() else {
+        return Err(unsatisfied_error(request));
+    };
+    match catalog
+        .record_acquisition_absence(receipt_request, release, sources)
+        .map_err(|error| DownloadError::new(format!("record acquisition absence: {error}")))?
+    {
+        AcquisitionReceiptLookup::Satisfied => Ok(()),
+        AcquisitionReceiptLookup::KnownVerifiedAbsence => {
+            if let Some(path) = negative_cache.path() {
+                record_negative_cache(
+                    path,
+                    negative_cache.request_digest,
+                    negative_cache.release_digest,
+                    release,
+                )?;
+            }
+            Err(unsatisfied_error(request))
+        }
+        AcquisitionReceiptLookup::ReceiptMiss => unreachable!("receipt write returns final state"),
+    }
+}
+
+fn receipt_request(request: &AcquisitionRequest<'_>) -> AcquisitionReceiptRequest {
+    match request {
+        AcquisitionRequest::GeneratedProduction(key) => AcquisitionReceiptRequest::generated(key),
+        AcquisitionRequest::DeclaredPack(query) => AcquisitionReceiptRequest::declared(query),
+    }
+}
+
+fn receipt_release(archive_digest: &str) -> AcquisitionReceiptRelease {
+    AcquisitionReceiptRelease {
+        repository: RELEASE_REPOSITORY.to_owned(),
+        tag: RELEASE_TAG.to_owned(),
+        archive_name: ARCHIVE_NAME.to_owned(),
+        archive_digest: archive_digest.to_owned(),
+        bundle_schema_version: crate::release_bundle::RELEASE_BUNDLE_SCHEMA_VERSION,
+        bundle_generator_name: "brokk-bifrost-semantic-packs".to_owned(),
+        bundle_generator_version: RELEASE_VERSION.to_owned(),
+        semantic_schema_version: SEMANTIC_MODEL_SCHEMA_VERSION,
+        generated_cache_version: GENERATED_PRODUCTION_CACHE_VERSION,
+        client_epoch: ABSENCE_RECEIPT_CLIENT_EPOCH,
+    }
+}
+
+fn unsatisfied_error(request: &AcquisitionRequest<'_>) -> DownloadError {
+    DownloadError::new(format!(
+        "verified semantic-pack bundle {}",
+        unsatisfied_detail(request)
+    ))
+}
+
+fn negative_cache_error(request: &AcquisitionRequest<'_>) -> DownloadError {
+    DownloadError::new(format!(
+        "known negative cache: verified release {}",
+        unsatisfied_detail(request)
+    ))
+}
+
+fn unsatisfied_detail(request: &AcquisitionRequest<'_>) -> String {
+    match request {
+        AcquisitionRequest::GeneratedProduction(_) => {
+            "did not install the requested generated production".to_owned()
+        }
+        AcquisitionRequest::DeclaredPack(query) => {
+            format!("installed no {} pack for {query:?}", query.ecosystem)
+        }
+    }
+}
+
+fn parse_checksum_sidecar(bytes: &[u8], expected_name: &str) -> Result<String, DownloadError> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|error| DownloadError::new(format!("checksum sidecar is not UTF-8: {error}")))?;
+    let mut lines = text.lines();
+    let line = lines
+        .next()
+        .ok_or_else(|| DownloadError::new("checksum sidecar is empty"))?;
+    if lines.next().is_some() {
+        return Err(DownloadError::new(
+            "checksum sidecar must contain exactly one line",
+        ));
+    }
+    let (digest, name) = line
+        .split_once("  ")
+        .ok_or_else(|| DownloadError::new("checksum sidecar must use SHA256SUMS spacing"))?;
+    if name != expected_name {
+        return Err(DownloadError::new(format!(
+            "checksum sidecar names {name:?}, expected {expected_name:?}"
+        )));
+    }
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(DownloadError::new(
+            "checksum sidecar does not contain a 64-character hexadecimal digest",
+        ));
+    }
+    if digest.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        return Err(DownloadError::new(
+            "checksum sidecar digest must use lowercase hexadecimal",
+        ));
+    }
+    Ok(digest.to_owned())
+}
+
+fn verify_digest(bytes: &[u8], expected: &str) -> Result<(), DownloadError> {
+    let actual = hex_digest(bytes);
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(DownloadError::new(format!(
+            "semantic-pack archive digest {actual} does not match sidecar {expected}"
+        )))
+    }
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    brokk_bifrost_analysis::analyzer::semantic_model::csmi::sha256_hex(bytes)
+}
+
+fn safe_extract_archive(
+    archive_bytes: &[u8],
+    destination: &Path,
+) -> Result<PathBuf, DownloadError> {
+    let decoder = GzDecoder::new(archive_bytes);
+    let mut archive = Archive::new(decoder);
+    let mut seen = HashSet::new();
+    let mut files = HashSet::new();
+    let mut directories = HashSet::new();
+    let mut extracted_bytes = 0_u64;
+    let mut saw_top_level_directory = false;
+
+    for entry in archive
+        .entries()
+        .map_err(|error| DownloadError::new(format!("read semantic-pack tar entries: {error}")))?
+    {
+        let mut entry = entry.map_err(|error| {
+            DownloadError::new(format!("read semantic-pack tar entry: {error}"))
+        })?;
+        let path = entry
+            .path()
+            .map_err(|error| DownloadError::new(format!("read semantic-pack tar path: {error}")))?
+            .into_owned();
+        let relative = validate_archive_path(&path)?;
+        if !seen.insert(relative.clone()) {
+            return Err(DownloadError::new(format!(
+                "semantic-pack archive contains duplicate path {}",
+                relative.display()
+            )));
+        }
+        let entry_type = entry.header().entry_type();
+        let destination_path = destination.join(&relative);
+        if relative == Path::new(EXPECTED_TOP_LEVEL) {
+            if !entry_type.is_dir() {
+                return Err(DownloadError::new(
+                    "semantic-pack archive top-level entry is not a directory",
+                ));
+            }
+            saw_top_level_directory = true;
+        }
+        match () {
+            _ if entry_type.is_dir() => {
+                reject_file_ancestor(&relative, &files)?;
+                if !directories.insert(relative) {
+                    return Err(DownloadError::new(
+                        "semantic-pack archive contains duplicate directory",
+                    ));
+                }
+                fs::create_dir_all(&destination_path).map_err(|error| {
+                    DownloadError::new(format!(
+                        "create extracted directory {}: {error}",
+                        destination_path.display()
+                    ))
+                })?;
+            }
+            _ if entry_type.is_file() => {
+                if relative == Path::new(EXPECTED_TOP_LEVEL) {
+                    return Err(DownloadError::new(
+                        "semantic-pack archive top-level entry is a file",
+                    ));
+                }
+                reject_file_ancestor(&relative, &files)?;
+                if directories.contains(&relative) {
+                    return Err(DownloadError::new(format!(
+                        "semantic-pack archive changes directory into a file: {}",
+                        relative.display()
+                    )));
+                }
+                let size = entry.header().size().map_err(|error| {
+                    DownloadError::new(format!("read extracted file size: {error}"))
+                })?;
+                extracted_bytes = extracted_bytes
+                    .checked_add(size)
+                    .ok_or_else(|| DownloadError::new("semantic-pack extracted size overflow"))?;
+                if extracted_bytes > MAX_EXTRACTED_BYTES {
+                    return Err(DownloadError::new(
+                        "semantic-pack extracted bytes exceed limit",
+                    ));
+                }
+                if let Some(parent) = destination_path.parent() {
+                    fs::create_dir_all(parent).map_err(|error| {
+                        DownloadError::new(format!(
+                            "create extracted parent directory {}: {error}",
+                            parent.display()
+                        ))
+                    })?;
+                }
+                let mut output = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&destination_path)
+                    .map_err(|error| {
+                        DownloadError::new(format!(
+                            "create extracted file {}: {error}",
+                            destination_path.display()
+                        ))
+                    })?;
+                let written = io::copy(&mut entry, &mut output).map_err(|error| {
+                    DownloadError::new(format!(
+                        "extract semantic-pack file {}: {error}",
+                        relative.display()
+                    ))
+                })?;
+                if written != size {
+                    return Err(DownloadError::new(format!(
+                        "semantic-pack file {} declared {size} bytes but extracted {written}",
+                        relative.display()
+                    )));
+                }
+                files.insert(relative);
+            }
+            _ => {
+                return Err(DownloadError::new(format!(
+                    "semantic-pack archive entry {} is not a regular file or directory",
+                    relative.display()
+                )));
+            }
+        }
+    }
+    if !saw_top_level_directory {
+        return Err(DownloadError::new(format!(
+            "semantic-pack archive must contain one {EXPECTED_TOP_LEVEL:?} top-level directory"
+        )));
+    }
+    Ok(destination.join(EXPECTED_TOP_LEVEL))
+}
+
+fn validate_archive_path(path: &Path) -> Result<PathBuf, DownloadError> {
+    let mut components = path.components();
+    let top_level = match components.next() {
+        Some(Component::Normal(component)) if component == OsStr::new(EXPECTED_TOP_LEVEL) => {
+            component
+        }
+        Some(component) => {
+            return Err(DownloadError::new(format!(
+                "semantic-pack archive has invalid top-level path component {component:?}"
+            )));
+        }
+        None => {
+            return Err(DownloadError::new(
+                "semantic-pack archive contains an empty path",
+            ));
+        }
+    };
+    let mut normalized = PathBuf::from(top_level);
+    for component in components {
+        match component {
+            Component::Normal(component) => normalized.push(component),
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => {
+                return Err(DownloadError::new(format!(
+                    "semantic-pack archive path contains traversal: {}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+fn reject_file_ancestor(path: &Path, files: &HashSet<PathBuf>) -> Result<(), DownloadError> {
+    let mut ancestor = path.parent();
+    while let Some(candidate) = ancestor {
+        if files.contains(candidate) {
+            return Err(DownloadError::new(format!(
+                "semantic-pack archive descends through file {}",
+                candidate.display()
+            )));
+        }
+        ancestor = candidate.parent();
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DownloadError(String);
+
+impl DownloadError {
+    fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+}
+
+impl Display for DownloadError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        crate::fmt_string_error(&self.0, formatter)
+    }
+}
+
+impl Error for DownloadError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::release_bundle::{
+        PACK_SPEC_SCHEMA_VERSION, PinnedArtifact, PinnedLookupQuery, PinnedPackKind,
+        PinnedPackSpec, ReleaseBundleIndex, generate_release_bundle, merge_release_bundles,
+        verify_release_bundle_for_acquisition,
+    };
+    use brokk_bifrost_analysis::analyzer::semantic_model::{
+        ActivationSelector, ArtifactProducerLimits, CatalogCoordinate, CatalogOpenMode,
+        Compatibility, GeneratedProductionKey, NameSelector, Provenance, Safety,
+        SemanticPackSelectorQuery, VersionConstraint, read_exact_source_set,
+    };
+    use brokk_bifrost_test_macros::hardwon;
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use tar::EntryType;
+    use tempfile::tempdir;
+
+    #[derive(Debug)]
+    struct FakeTransport {
+        responses: HashMap<String, Vec<u8>>,
+        requests: Mutex<Vec<String>>,
+    }
+
+    impl FakeTransport {
+        fn new(responses: HashMap<String, Vec<u8>>) -> Self {
+            Self {
+                responses,
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl HttpTransport for FakeTransport {
+        fn fetch(&self, url: &str, max_bytes: u64) -> Result<Vec<u8>, DownloadError> {
+            self.requests
+                .lock()
+                .expect("fake transport mutex poisoned")
+                .push(url.to_owned());
+            let bytes = self
+                .responses
+                .get(url)
+                .ok_or_else(|| DownloadError::new(format!("fake response missing for {url}")))?;
+            if bytes.len() as u64 > max_bytes {
+                return Err(DownloadError::new("fake response exceeds configured limit"));
+            }
+            Ok(bytes.clone())
+        }
+    }
+
+    struct GeneratedBundleFixture {
+        _directory: tempfile::TempDir,
+        key: GeneratedProductionKey,
+        archive: Vec<u8>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum Entry<'a> {
+        Directory(&'a str),
+        File(&'a str, &'a [u8]),
+        Symlink(&'a str, &'a str),
+    }
+
+    fn tiny_archive(entries: &[Entry<'_>]) -> Vec<u8> {
+        let encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        for entry in entries {
+            let mut header = tar::Header::new_gnu();
+            match entry {
+                Entry::Directory(path) => {
+                    header.set_entry_type(EntryType::dir());
+                    header.set_size(0);
+                    header.set_cksum();
+                    builder.append_data(&mut header, path, io::empty()).unwrap();
+                }
+                Entry::File(path, bytes) => {
+                    header.set_entry_type(EntryType::Regular);
+                    header.set_size(bytes.len() as u64);
+                    header.set_cksum();
+                    builder.append_data(&mut header, path, *bytes).unwrap();
+                }
+                Entry::Symlink(path, target) => {
+                    header.set_entry_type(EntryType::symlink());
+                    header.set_size(0);
+                    header.set_link_name(target).unwrap();
+                    header.set_cksum();
+                    builder.append_data(&mut header, path, io::empty()).unwrap();
+                }
+            }
+        }
+        builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    fn archive_bundle(root: &Path) -> Vec<u8> {
+        fn collect_files(root: &Path, current: &Path, files: &mut Vec<PathBuf>) {
+            for entry in fs::read_dir(current).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    collect_files(root, &path, files);
+                } else {
+                    assert!(path.is_file(), "bundle contains a non-file entry");
+                    files.push(path.strip_prefix(root).unwrap().to_owned());
+                }
+            }
+        }
+
+        let mut files = Vec::new();
+        collect_files(root, root, &mut files);
+        files.sort();
+        let encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        let mut directory = tar::Header::new_gnu();
+        directory.set_entry_type(EntryType::dir());
+        directory.set_size(0);
+        directory.set_cksum();
+        builder
+            .append_data(&mut directory, EXPECTED_TOP_LEVEL, io::empty())
+            .unwrap();
+        for relative in files {
+            let path = root.join(&relative);
+            let bytes = fs::read(path).unwrap();
+            let archive_path = format!(
+                "{EXPECTED_TOP_LEVEL}/{}",
+                relative.to_string_lossy().replace('\\', "/")
+            );
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(EntryType::Regular);
+            header.set_size(bytes.len() as u64);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, archive_path, bytes.as_slice())
+                .unwrap();
+        }
+        builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    fn generated_bundle_fixture() -> GeneratedBundleFixture {
+        generated_bundle_fixture_for("21.0.8")
+    }
+
+    fn assert_failed_generated_production_is_not_installed(
+        catalog: &SemanticPackCatalog,
+        key: &GeneratedProductionKey,
+        archive_digest: &str,
+    ) {
+        assert!(catalog.generated_production(key).unwrap().is_none());
+        assert_eq!(
+            catalog
+                .acquisition_receipt_lookup(
+                    &receipt_request(&AcquisitionRequest::GeneratedProduction(key)),
+                    &receipt_release(archive_digest),
+                )
+                .unwrap(),
+            AcquisitionReceiptLookup::ReceiptMiss,
+            "failed verification must not create an absence receipt"
+        );
+    }
+
+    fn generated_bundle_fixture_for(version: &str) -> GeneratedBundleFixture {
+        let directory = tempdir().unwrap();
+        let (input, _) = crate::release_bundle::jdk_generated_bundle_input(
+            directory.path(),
+            version,
+            &format!("={version}"),
+        );
+        let root = directory.path().join("bundle");
+        let bundle = generate_release_bundle(&root, &[input]).unwrap();
+        let generated = bundle.index.generated_productions.first().unwrap();
+        let key = GeneratedProductionKey::new(
+            generated.input_digest.clone(),
+            generated.producer_name.clone(),
+            generated.producer_version.clone(),
+            generated.schema_version,
+        )
+        .unwrap();
+        let archive = archive_bundle(&root);
+        GeneratedBundleFixture {
+            _directory: directory,
+            key,
+            archive,
+        }
+    }
+
+    fn mixed_language_bundle_fixture() -> GeneratedBundleFixture {
+        let jdk = generated_bundle_fixture();
+        let directory = tempdir().unwrap();
+        let jdk_root = safe_extract_archive(&jdk.archive, directory.path()).unwrap();
+        let stubs = directory.path().join("stubs");
+        fs::create_dir(&stubs).unwrap();
+        fs::write(stubs.join("sample.pyi"), "class Widget: ...\n").unwrap();
+        fs::write(directory.path().join("NOTICE.txt"), "fixture notice\n").unwrap();
+        let artifact_sha256 = read_exact_source_set(
+            &stubs,
+            &[PathBuf::from("sample.pyi")],
+            100_000,
+            64,
+            &ArtifactProducerLimits::default(),
+        )
+        .unwrap()
+        .sha256()
+        .to_owned();
+        let activation = ActivationSelector {
+            package: Some(NameSelector {
+                name: "sample".to_owned(),
+                version: Some("=1.0.0".to_owned()),
+            }),
+            module: None,
+            toolchain: Some(NameSelector {
+                name: "python".to_owned(),
+                version: Some("=3.12.0".to_owned()),
+            }),
+            targets: Vec::new(),
+            configurations: Vec::new(),
+            artifact_sha256: None,
+        };
+        let pinned = PinnedPackSpec {
+            schema_version: PACK_SPEC_SCHEMA_VERSION,
+            pack_id: "python-sample-fixture".to_owned(),
+            pack_version: "1.0.0".to_owned(),
+            ecosystem: "pypi".to_owned(),
+            kind: PinnedPackKind::PythonStub {
+                stubs: vec!["sample.pyi".to_owned()],
+            },
+            artifact: PinnedArtifact {
+                file_name: "stubs".to_owned(),
+                sha256: artifact_sha256,
+                url: Some("https://example.invalid/stubs".to_owned()),
+                container: None,
+            },
+            compatibility: Compatibility {
+                bifrost: None,
+                toolchains: vec![VersionConstraint {
+                    name: "python".to_owned(),
+                    requirement: "=3.12.0".to_owned(),
+                }],
+            },
+            activation: vec![activation.clone()],
+            provenance: Provenance {
+                source: "fixture".to_owned(),
+                revision: Some("fixture-v1".to_owned()),
+            },
+            license: "Apache-2.0".to_owned(),
+            safety: Safety {
+                generated_code_only: false,
+                review_required: false,
+            },
+            notices: vec!["NOTICE.txt".to_owned()],
+            measurement_activation: activation,
+            measurement_queries: vec![PinnedLookupQuery::Type {
+                name: "sample.Widget".to_owned(),
+            }],
+        };
+        let spec = directory.path().join("python.json");
+        fs::write(&spec, serde_json::to_vec(&pinned).unwrap()).unwrap();
+        let python_root = directory.path().join("python-bundle");
+        generate_release_bundle(
+            &python_root,
+            &[crate::release_bundle::BundleInput {
+                spec_path: spec,
+                artifact_path: stubs,
+            }],
+        )
+        .unwrap();
+        let merged_root = directory.path().join("merged");
+        merge_release_bundles(&merged_root, &[jdk_root, python_root]).unwrap();
+        GeneratedBundleFixture {
+            _directory: directory,
+            key: jdk.key,
+            archive: archive_bundle(&merged_root),
+        }
+    }
+
+    fn python_pack_query() -> SemanticPackSelectorQuery {
+        SemanticPackSelectorQuery {
+            language: "python".to_owned(),
+            ecosystem: "pypi".to_owned(),
+            package: Some(CatalogCoordinate {
+                name: "sample".to_owned(),
+                version: Some(semver::Version::parse("1.0.0").unwrap()),
+            }),
+            module: None,
+            toolchain: Some(CatalogCoordinate {
+                name: "python".to_owned(),
+                version: Some(semver::Version::parse("3.12.0").unwrap()),
+            }),
+            target: None,
+            configuration: None,
+            artifact_sha256: None,
+            bifrost_version: semver::Version::parse(RELEASE_VERSION).unwrap(),
+        }
+    }
+
+    /// The evidence-only query analysis builds for an artifact-less declared
+    /// dependency. The bundle fixture pins `jdk` to 21.0.8, so a different
+    /// version names a coordinate the bundle does not carry.
+    fn declared_pack_query(version: &str) -> SemanticPackSelectorQuery {
+        SemanticPackSelectorQuery {
+            language: "java".to_owned(),
+            ecosystem: "jdk".to_owned(),
+            package: None,
+            module: None,
+            toolchain: Some(CatalogCoordinate {
+                name: "jdk".to_owned(),
+                version: Some(semver::Version::parse(version).expect("toolchain version parses")),
+            }),
+            target: None,
+            configuration: None,
+            artifact_sha256: None,
+            bifrost_version: semver::Version::parse(RELEASE_VERSION)
+                .expect("Bifrost package version must be semantic"),
+        }
+    }
+
+    fn test_key() -> GeneratedProductionKey {
+        GeneratedProductionKey::new(
+            "0".repeat(64),
+            "test-producer".to_owned(),
+            "1.0.0".to_owned(),
+            brokk_bifrost_analysis::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2957: generated semantic-pack download, verification, installation, and cache reuse must work end to end"
+    )]
+    fn fake_transport_downloads_verifies_extracts_installs_and_caches_generated_bundle() {
+        let fixture = generated_bundle_fixture();
+        let catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
+        let archive_digest = hex_digest(&fixture.archive);
+        let archive_url = release_asset_url(ARCHIVE_NAME);
+        let checksum_url = release_asset_url(CHECKSUM_NAME);
+        let checksum = format!("{archive_digest}  {ARCHIVE_NAME}\n").into_bytes();
+        let transport = FakeTransport::new(HashMap::from([
+            (checksum_url.clone(), checksum.clone()),
+            (archive_url.clone(), fixture.archive.clone()),
+        ]));
+
+        acquire_with_mode(
+            &catalog,
+            &AcquisitionRequest::GeneratedProduction(&fixture.key),
+            DownloadMode::On,
+            &transport,
+        )
+        .unwrap();
+
+        assert_eq!(
+            transport.requests.lock().unwrap().as_slice(),
+            &[checksum_url.clone(), archive_url.clone()]
+        );
+        assert!(
+            catalog
+                .generated_production(&fixture.key)
+                .unwrap()
+                .is_some()
+        );
+        let catalog_root = canonical_catalog_root(&catalog).unwrap();
+        let cached = cache_dir(&catalog_root, &archive_digest);
+        assert_eq!(
+            cached,
+            catalog_root
+                .join(DOWNLOAD_CACHE_DIR)
+                .join(RELEASE_TAG)
+                .join(&archive_digest)
+        );
+        assert!(cached.join("index.json").is_file());
+        assert!(cached.join("SHA256SUMS").is_file());
+
+        // The newly installed candidate wins before the process attempt guard.
+        // Only the checksum is fetched; the cached archive is not reinstalled.
+        acquire_with_transport(
+            &catalog,
+            &AcquisitionRequest::GeneratedProduction(&fixture.key),
+            &transport,
+        )
+        .unwrap();
+        assert_eq!(
+            transport.requests.lock().unwrap().as_slice(),
+            &[checksum_url.clone(), archive_url, checksum_url]
+        );
+    }
+
+    /// A declared dependency has no generated-production key (#2957). Its
+    /// request installs curated and eligible generated packs in the matching
+    /// language and ecosystem.
+    #[test]
+    #[hardwon("#2957: declared pack requests must acquire matching generated production")]
+    fn declared_pack_request_installs_same_language_generated_production() {
+        let fixture = generated_bundle_fixture();
+        let catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
+        let archive_digest = hex_digest(&fixture.archive);
+        let archive_url = release_asset_url(ARCHIVE_NAME);
+        let checksum_url = release_asset_url(CHECKSUM_NAME);
+        let checksum = format!("{archive_digest}  {ARCHIVE_NAME}\n").into_bytes();
+        let transport = FakeTransport::new(HashMap::from([
+            (checksum_url.clone(), checksum),
+            (archive_url.clone(), fixture.archive.clone()),
+        ]));
+        let query = declared_pack_query("21.0.8");
+
+        acquire_with_mode(
+            &catalog,
+            &AcquisitionRequest::DeclaredPack(&query),
+            DownloadMode::On,
+            &transport,
+        )
+        .unwrap();
+
+        assert_eq!(
+            transport.requests.lock().unwrap().as_slice(),
+            &[checksum_url, archive_url]
+        );
+        assert!(!catalog.dependency_candidates(&query).unwrap().is_empty());
+        // Generated candidates participate in ordinary declared selection.
+        assert!(
+            catalog
+                .generated_production(&fixture.key)
+                .unwrap()
+                .is_some()
+        );
+        acquire_with_transport(
+            &catalog,
+            &AcquisitionRequest::GeneratedProduction(&fixture.key),
+            &transport,
+        )
+        .unwrap();
+        assert!(
+            catalog
+                .generated_production(&fixture.key)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn scoped_acquisition_matches_full_install_and_supports_later_language_request() {
+        let fixture = mixed_language_bundle_fixture();
+        let extraction = tempdir().unwrap();
+        let root = safe_extract_archive(&fixture.archive, extraction.path()).unwrap();
+        let full = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
+        crate::release_bundle::install_release_bundle(&root, &full).unwrap();
+        let scoped = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
+        let release = receipt_release(&hex_digest(&fixture.archive));
+        let python = python_pack_query();
+        let proof = crate::release_bundle::install_acquisition_bundle(
+            &root,
+            &scoped,
+            &release,
+            &AcquisitionReceiptRequest::declared(&python),
+        )
+        .unwrap();
+        assert!(matches!(
+            proof,
+            crate::release_bundle::AcquisitionInstallationProof::Complete { .. }
+        ));
+        let normalized = |catalog: &SemanticPackCatalog, query: &SemanticPackSelectorQuery| {
+            catalog
+                .dependency_candidates(query)
+                .unwrap()
+                .iter()
+                .map(|candidate| {
+                    (
+                        candidate.manifest_digest().to_owned(),
+                        candidate.shard_id().to_owned(),
+                        candidate.descriptor().semantic_sha256.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(!normalized(&full, &python).is_empty());
+        assert_eq!(normalized(&scoped, &python), normalized(&full, &python));
+        let active_hash = |catalog: &SemanticPackCatalog, query: &SemanticPackSelectorQuery| {
+            use brokk_bifrost_analysis::analyzer::semantic_model::{
+                SemanticModelActivationEvidence, SemanticModelActivationRequest,
+                SemanticModelResolutionOutcome, resolve_active_semantic_models,
+            };
+            let outcome = resolve_active_semantic_models(
+                catalog,
+                &SemanticModelActivationRequest {
+                    bifrost_version: query.bifrost_version.clone(),
+                    evidence: vec![SemanticModelActivationEvidence {
+                        language: query.language.clone(),
+                        ecosystem: query.ecosystem.clone(),
+                        package: query.package.clone(),
+                        module: query.module.clone(),
+                        toolchain: query.toolchain.clone(),
+                        target: query.target.clone(),
+                        configuration: query.configuration.clone(),
+                        artifact_sha256: query.artifact_sha256.clone(),
+                    }],
+                    controls: Vec::new(),
+                    limits: Default::default(),
+                },
+                &brokk_bifrost_analysis::CancellationToken::default(),
+            );
+            let SemanticModelResolutionOutcome::Ready(active) = outcome else {
+                panic!("fixture pack must activate: {outcome:?}");
+            };
+            active.active_model_set_hash().to_owned()
+        };
+        assert_eq!(active_hash(&scoped, &python), active_hash(&full, &python));
+        let java = declared_pack_query("21.0.8");
+        assert!(normalized(&scoped, &java).is_empty());
+        assert!(scoped.generated_production(&fixture.key).unwrap().is_none());
+        crate::release_bundle::install_acquisition_bundle(
+            &root,
+            &scoped,
+            &release,
+            &AcquisitionReceiptRequest::declared(&java),
+        )
+        .unwrap();
+        assert_eq!(normalized(&scoped, &java), normalized(&full, &java));
+        assert_eq!(active_hash(&scoped, &java), active_hash(&full, &java));
+        assert!(scoped.generated_production(&fixture.key).unwrap().is_some());
+        crate::release_bundle::install_acquisition_bundle(
+            &root,
+            &scoped,
+            &release,
+            &AcquisitionReceiptRequest::generated(&fixture.key),
+        )
+        .unwrap();
+        assert!(scoped.generated_production(&fixture.key).unwrap().is_some());
+    }
+
+    #[test]
+    fn scoped_verification_rejects_unselected_corruption_and_manifest_index_mismatch() {
+        let fixture = mixed_language_bundle_fixture();
+        let extraction = tempdir().unwrap();
+        let root = safe_extract_archive(&fixture.archive, extraction.path()).unwrap();
+        let request = AcquisitionReceiptRequest::declared(&python_pack_query());
+        let index_path = root.join("index.json");
+        let original_index = fs::read(&index_path).unwrap();
+        let index: ReleaseBundleIndex = serde_json::from_slice(&original_index).unwrap();
+        let java_shard = &index
+            .packs
+            .iter()
+            .find(|pack| pack.language == "java")
+            .unwrap()
+            .shards[0];
+        let shard_path = root.join(&java_shard.asset.path);
+        let original_shard = fs::read(&shard_path).unwrap();
+        fs::write(&shard_path, b"corrupt unselected shard").unwrap();
+        assert!(verify_release_bundle_for_acquisition(&root, &request).is_err());
+        fs::write(&shard_path, original_shard).unwrap();
+
+        let python_shard = &index
+            .packs
+            .iter()
+            .find(|pack| pack.language == "python")
+            .unwrap()
+            .shards[0];
+        let selected_path = root.join(&python_shard.asset.path);
+        let selected_bytes = fs::read(&selected_path).unwrap();
+        fs::write(&selected_path, b"corrupt selected shard").unwrap();
+        assert!(verify_release_bundle_for_acquisition(&root, &request).is_err());
+        fs::write(&selected_path, selected_bytes).unwrap();
+
+        let mut mismatched = index;
+        mismatched
+            .packs
+            .iter_mut()
+            .find(|pack| pack.language == "java")
+            .unwrap()
+            .ecosystem = "different".to_owned();
+        fs::write(&index_path, serde_json::to_vec(&mismatched).unwrap()).unwrap();
+        let checksums = root.join("SHA256SUMS");
+        let original_checksums = fs::read_to_string(&checksums).unwrap();
+        let changed = original_checksums
+            .lines()
+            .map(|line| {
+                if line.ends_with("  index.json") {
+                    format!(
+                        "{}  index.json",
+                        hex_digest(&fs::read(&index_path).unwrap())
+                    )
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(&checksums, changed).unwrap();
+        let error = verify_release_bundle_for_acquisition(&root, &request).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("metadata does not match manifest"),
+            "{error}"
+        );
+    }
+
+    /// The bundle is installed either way, so a request the bundle cannot
+    /// satisfy is reported rather than silently counted as a hit.
+    #[test]
+    #[hardwon("#2957: a declared dependency with no matching release pack must remain unsatisfied")]
+    fn a_declared_pack_request_the_bundle_cannot_satisfy_is_an_error() {
+        let fixture = generated_bundle_fixture();
+        let catalog_directory = tempdir().unwrap();
+        let catalog = SemanticPackCatalog::open(
+            catalog_directory.path(),
+            CatalogOpenMode::ReadWrite,
+            Default::default(),
+        )
+        .unwrap();
+        let archive_digest = hex_digest(&fixture.archive);
+        let checksum = format!("{archive_digest}  {ARCHIVE_NAME}\n").into_bytes();
+        let transport = FakeTransport::new(HashMap::from([
+            (release_asset_url(CHECKSUM_NAME), checksum),
+            (release_asset_url(ARCHIVE_NAME), fixture.archive.clone()),
+        ]));
+        let query = declared_pack_query("17.0.10");
+
+        let error = acquire_with_mode(
+            &catalog,
+            &AcquisitionRequest::DeclaredPack(&query),
+            DownloadMode::On,
+            &transport,
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("installed no jdk pack"),
+            "{error}"
+        );
+        assert!(catalog.dependency_candidates(&query).unwrap().is_empty());
+        let initial_request = receipt_request(&AcquisitionRequest::DeclaredPack(&query));
+        assert_eq!(
+            catalog
+                .acquisition_receipt_lookup(&initial_request, &receipt_release(&archive_digest))
+                .unwrap(),
+            AcquisitionReceiptLookup::KnownVerifiedAbsence
+        );
+
+        // A second process resolves the immutable release checksum, then the
+        // durable receipt suppresses archive verification and installation.
+        drop(catalog);
+        let reopened = SemanticPackCatalog::open(
+            catalog_directory.path(),
+            CatalogOpenMode::ReadWrite,
+            Default::default(),
+        )
+        .unwrap();
+        let restart_transport = FakeTransport::new(HashMap::from([(
+            release_asset_url(CHECKSUM_NAME),
+            format!("{archive_digest}  {ARCHIVE_NAME}\n").into_bytes(),
+        )]));
+        let restart_error = acquire_with_transport(
+            &reopened,
+            &AcquisitionRequest::DeclaredPack(&query),
+            &restart_transport,
+        )
+        .unwrap_err();
+        assert!(
+            restart_error.to_string().contains("installed no jdk pack"),
+            "{restart_error}"
+        );
+        assert_eq!(
+            restart_transport.requests.lock().unwrap().as_slice(),
+            &[release_asset_url(CHECKSUM_NAME)]
+        );
+
+        let source_id = reopened
+            .inventory_bounded(usize::MAX)
+            .unwrap()
+            .packs
+            .into_iter()
+            .flat_map(|pack| pack.sources)
+            .find(|source| source.source_kind == "pre_shipped")
+            .expect("release installation records a pre-shipped source")
+            .source_id;
+        assert!(
+            reopened
+                .remove_source(
+                    &brokk_bifrost_analysis::analyzer::semantic_model::DurablePackSource {
+                        kind: brokk_bifrost_analysis::analyzer::semantic_model::DurablePackSourceKind::PreShipped,
+                        source_id,
+                    },
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            reopened
+                .acquisition_receipt_lookup(
+                    &receipt_request(&AcquisitionRequest::DeclaredPack(&query)),
+                    &receipt_release(&archive_digest),
+                )
+                .unwrap(),
+            AcquisitionReceiptLookup::ReceiptMiss,
+            "source removal must invalidate the receipt"
+        );
+
+        // A new immutable archive identity invalidates the receipt and reaches
+        // the archive fetch path rather than freezing a mutable release.
+        let changed_digest = "0".repeat(64);
+        let changed_transport = FakeTransport::new(HashMap::from([(
+            release_asset_url(CHECKSUM_NAME),
+            format!("{changed_digest}  {ARCHIVE_NAME}\n").into_bytes(),
+        )]));
+        assert!(
+            acquire_with_transport(
+                &reopened,
+                &AcquisitionRequest::DeclaredPack(&query),
+                &changed_transport,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            changed_transport.requests.lock().unwrap().as_slice(),
+            &[
+                release_asset_url(CHECKSUM_NAME),
+                release_asset_url(ARCHIVE_NAME),
+            ]
+        );
+
+        // The first process already attempted this request, but source removal
+        // requires a repair. Reuse the local archive without downloading it.
+        let repair_error = acquire_with_transport(
+            &reopened,
+            &AcquisitionRequest::DeclaredPack(&query),
+            &restart_transport,
+        )
+        .unwrap_err();
+        assert!(repair_error.to_string().contains("installed no jdk pack"));
+        assert_eq!(
+            reopened
+                .acquisition_receipt_lookup(
+                    &receipt_request(&AcquisitionRequest::DeclaredPack(&query)),
+                    &receipt_release(&archive_digest),
+                )
+                .unwrap(),
+            AcquisitionReceiptLookup::KnownVerifiedAbsence,
+        );
+
+        let satisfying_fixture = generated_bundle_fixture_for("17.0.10");
+        let satisfying_extraction = tempdir().unwrap();
+        let satisfying_root =
+            safe_extract_archive(&satisfying_fixture.archive, satisfying_extraction.path())
+                .unwrap();
+        crate::release_bundle::install_release_bundle(&satisfying_root, &reopened).unwrap();
+        assert_eq!(
+            reopened
+                .acquisition_receipt_lookup(
+                    &receipt_request(&AcquisitionRequest::DeclaredPack(&query)),
+                    &receipt_release(&archive_digest),
+                )
+                .unwrap(),
+            AcquisitionReceiptLookup::Satisfied,
+            "a newly satisfying verified pack must win before receipt lookup"
+        );
+    }
+
+    /// A stale generated production yields an empty request slice. It cannot
+    /// certify absence, even though the archive contains a curated pack.
+    #[test]
+    fn stale_generated_production_does_not_create_an_absence_receipt_or_negative_cache() {
+        let fixture = generated_bundle_fixture();
+        let extraction = tempdir().unwrap();
+        let bundle_root = safe_extract_archive(&fixture.archive, extraction.path()).unwrap();
+        let index_path = bundle_root.join("index.json");
+        let mut index: ReleaseBundleIndex =
+            serde_json::from_slice(&fs::read(&index_path).unwrap()).unwrap();
+        let generated = index
+            .generated_productions
+            .first_mut()
+            .expect("fixture has a generated production");
+        generated.cache_version = GENERATED_PRODUCTION_CACHE_VERSION - 1;
+        generated.production_digest =
+            brokk_bifrost_analysis::analyzer::semantic_model::recorded_generated_production_digest(
+                &generated.input_digest,
+                &generated.producer_name,
+                &generated.producer_version,
+                generated.schema_version,
+                generated.cache_version,
+            )
+            .unwrap();
+        fs::write(&index_path, serde_json::to_vec(&index).unwrap()).unwrap();
+        let index_checksum = hex_digest(&fs::read(&index_path).unwrap());
+        let sums_path = bundle_root.join("SHA256SUMS");
+        let sums = fs::read_to_string(&sums_path).unwrap();
+        let mut sums_lines: Vec<_> = sums.lines().map(ToOwned::to_owned).collect();
+        let (_, index_path_in_sums) = sums_lines
+            .first()
+            .expect("bundle checksums are non-empty")
+            .split_once("  ")
+            .expect("bundle checksum uses SHA256SUMS spacing");
+        assert_eq!(index_path_in_sums, "index.json");
+        sums_lines[0] = format!("{index_checksum}  index.json");
+        fs::write(&sums_path, sums_lines.join("\n") + "\n").unwrap();
+        let incompatible_archive = archive_bundle(&bundle_root);
+        let archive_digest = hex_digest(&incompatible_archive);
+        let archive_url = release_asset_url(ARCHIVE_NAME);
+        let checksum_url = release_asset_url(CHECKSUM_NAME);
+        let checksum = format!("{archive_digest}  {ARCHIVE_NAME}\n").into_bytes();
+
+        let negative_cache = tempdir().unwrap();
+        let first_catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
+        let transport = FakeTransport::new(HashMap::from([
+            (checksum_url.clone(), checksum.clone()),
+            (archive_url.clone(), incompatible_archive.clone()),
+        ]));
+        let error = acquire_with_negative_cache(
+            &first_catalog,
+            &AcquisitionRequest::GeneratedProduction(&fixture.key),
+            &transport,
+            Some(negative_cache.path()),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("did not install the requested generated production"),
+            "{error}"
+        );
+        assert_eq!(
+            transport.requests.lock().unwrap().as_slice(),
+            &[checksum_url.clone(), archive_url.clone()]
+        );
+        assert_eq!(
+            first_catalog
+                .acquisition_receipt_lookup(
+                    &receipt_request(&AcquisitionRequest::GeneratedProduction(&fixture.key)),
+                    &receipt_release(&archive_digest),
+                )
+                .unwrap(),
+            AcquisitionReceiptLookup::ReceiptMiss,
+        );
+        assert!(!negative_cache.path().join(NEGATIVE_CACHE_DIR).exists());
+
+        let second_catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
+        let second_transport = FakeTransport::new(HashMap::from([
+            (checksum_url.clone(), checksum.clone()),
+            (archive_url.clone(), incompatible_archive.clone()),
+        ]));
+        let second_error = acquire_with_negative_cache(
+            &second_catalog,
+            &AcquisitionRequest::GeneratedProduction(&fixture.key),
+            &second_transport,
+            Some(negative_cache.path()),
+        )
+        .unwrap_err();
+        assert!(
+            second_error.to_string().contains("did not install"),
+            "{second_error}"
+        );
+        assert_eq!(
+            second_transport.requests.lock().unwrap().as_slice(),
+            &[checksum_url.clone(), archive_url.clone()]
+        );
+        assert!(
+            second_catalog
+                .generated_production(&fixture.key)
+                .unwrap()
+                .is_none()
+        );
+
+        // A cached archive can be checked again without claiming a durable
+        // negative result from the unrelated curated source.
+        let third_transport = FakeTransport::new(HashMap::from([
+            (checksum_url.clone(), checksum),
+            (archive_url.clone(), incompatible_archive),
+        ]));
+        let third_error = acquire_with_negative_cache(
+            &second_catalog,
+            &AcquisitionRequest::GeneratedProduction(&fixture.key),
+            &third_transport,
+            Some(negative_cache.path()),
+        )
+        .unwrap_err();
+        assert!(
+            third_error
+                .to_string()
+                .contains("did not install the requested generated production"),
+            "{third_error}"
+        );
+        assert_eq!(
+            third_transport.requests.lock().unwrap().as_slice(),
+            &[checksum_url]
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#3357: concurrent absence writes and a satisfying install must leave one valid receipt"
+    )]
+    fn concurrent_absence_writers_preserve_one_valid_receipt() {
+        let fixture = generated_bundle_fixture();
+        let archive_digest = hex_digest(&fixture.archive);
+        let extraction = tempdir().unwrap();
+        let bundle_root = safe_extract_archive(&fixture.archive, extraction.path()).unwrap();
+        let catalog_directory = tempdir().unwrap();
+        let catalog = SemanticPackCatalog::open(
+            catalog_directory.path(),
+            CatalogOpenMode::ReadWrite,
+            Default::default(),
+        )
+        .unwrap();
+        let release = receipt_release(&archive_digest);
+        let proof = crate::release_bundle::install_release_bundle_with_proof(
+            &bundle_root,
+            &catalog,
+            &release,
+        )
+        .unwrap();
+        let concurrent_catalog = SemanticPackCatalog::open(
+            catalog_directory.path(),
+            CatalogOpenMode::ReadWrite,
+            Default::default(),
+        )
+        .unwrap();
+        let query = declared_pack_query("17.0.10");
+        let request = receipt_request(&AcquisitionRequest::DeclaredPack(&query));
+        let wrong_release = receipt_release(&"0".repeat(64));
+        assert!(
+            catalog
+                .record_acquisition_absence(&request, &wrong_release, &proof.sources)
+                .unwrap_err()
+                .to_string()
+                .contains("different release")
+        );
+        assert_eq!(
+            catalog
+                .acquisition_receipt_lookup(&request, &wrong_release)
+                .unwrap(),
+            AcquisitionReceiptLookup::ReceiptMiss
+        );
+        let barrier = std::sync::Barrier::new(3);
+
+        std::thread::scope(|scope| {
+            let handles = [&catalog, &concurrent_catalog]
+                .into_iter()
+                .map(|catalog| {
+                    let request = request.clone();
+                    let release = release.clone();
+                    let sources = proof.sources.clone();
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        catalog.record_acquisition_absence(&request, &release, &sources)
+                    })
+                })
+                .collect::<Vec<_>>();
+            barrier.wait();
+            for handle in handles {
+                assert_eq!(
+                    handle.join().unwrap().unwrap(),
+                    AcquisitionReceiptLookup::KnownVerifiedAbsence
+                );
+            }
+        });
+        assert_eq!(
+            catalog
+                .acquisition_receipt_lookup(&request, &release)
+                .unwrap(),
+            AcquisitionReceiptLookup::KnownVerifiedAbsence
+        );
+
+        // A second absent request for this same immutable release will run the
+        // installer again. An exact no-op reinstall must not mutate semantic
+        // state and invalidate the first request's receipt.
+        crate::release_bundle::install_release_bundle_with_proof(&bundle_root, &catalog, &release)
+            .unwrap();
+        assert_eq!(
+            concurrent_catalog
+                .acquisition_receipt_lookup(&request, &release)
+                .unwrap(),
+            AcquisitionReceiptLookup::KnownVerifiedAbsence
+        );
+
+        let satisfying_fixture = generated_bundle_fixture_for("17.0.10");
+        let satisfying_extraction = tempdir().unwrap();
+        let satisfying_root =
+            safe_extract_archive(&satisfying_fixture.archive, satisfying_extraction.path())
+                .unwrap();
+        let race_barrier = std::sync::Barrier::new(3);
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                race_barrier.wait();
+                catalog.record_acquisition_absence(&request, &release, &proof.sources)
+            });
+            let installer = scope.spawn(|| {
+                race_barrier.wait();
+                crate::release_bundle::install_release_bundle(&satisfying_root, &concurrent_catalog)
+            });
+            race_barrier.wait();
+            assert!(matches!(
+                writer.join().unwrap().unwrap(),
+                AcquisitionReceiptLookup::Satisfied
+                    | AcquisitionReceiptLookup::KnownVerifiedAbsence
+            ));
+            installer.join().unwrap().unwrap();
+        });
+        assert_eq!(
+            catalog
+                .acquisition_receipt_lookup(&request, &release)
+                .unwrap(),
+            AcquisitionReceiptLookup::Satisfied,
+            "a concurrent satisfying install must win over any absence receipt"
+        );
+    }
+
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
+    #[test]
+    fn checksum_mismatch_does_not_install_requested_generated_production() {
+        let fixture = generated_bundle_fixture();
+        let catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
+        let archive_url = release_asset_url(ARCHIVE_NAME);
+        let checksum_url = release_asset_url(CHECKSUM_NAME);
+        let transport = FakeTransport::new(HashMap::from([
+            (
+                checksum_url,
+                format!("{}  {ARCHIVE_NAME}\n", "0".repeat(64)).into_bytes(),
+            ),
+            (archive_url, fixture.archive.clone()),
+        ]));
+        assert!(
+            acquire_with_mode(
+                &catalog,
+                &AcquisitionRequest::GeneratedProduction(&fixture.key),
+                DownloadMode::On,
+                &transport,
+            )
+            .is_err()
+        );
+        assert_failed_generated_production_is_not_installed(
+            &catalog,
+            &fixture.key,
+            &"0".repeat(64),
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3364: corrupt inner bundle must not publish a generated production or an absence receipt"
+    )]
+    fn corrupt_inner_bundle_does_not_install_requested_generated_production() {
+        let fixture = generated_bundle_fixture();
+        let catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
+        let archive = tiny_archive(&[
+            Entry::Directory(EXPECTED_TOP_LEVEL),
+            Entry::File("bifrost-semantic-packs/index.json", b"not-json"),
+        ]);
+        let archive_digest = hex_digest(&archive);
+        let archive_url = release_asset_url(ARCHIVE_NAME);
+        let checksum_url = release_asset_url(CHECKSUM_NAME);
+        let transport = FakeTransport::new(HashMap::from([
+            (
+                checksum_url,
+                format!("{archive_digest}  {ARCHIVE_NAME}\n").into_bytes(),
+            ),
+            (archive_url, archive),
+        ]));
+        assert!(
+            acquire_with_mode(
+                &catalog,
+                &AcquisitionRequest::GeneratedProduction(&fixture.key),
+                DownloadMode::On,
+                &transport,
+            )
+            .is_err()
+        );
+        assert_failed_generated_production_is_not_installed(
+            &catalog,
+            &fixture.key,
+            &archive_digest,
+        );
+    }
+
+    /// A bundle whose generated schema this build cannot decode is rejected
+    /// from the index before any asset is read: acquisition names the recorded
+    /// version, installs nothing, and records no absence receipt, so the next
+    /// session is not frozen away from a future compatible release (#3364).
+    #[test]
+    #[hardwon(
+        "#3364: incompatible schema detection must precede asset reads and must not cache absence"
+    )]
+    fn an_undecodable_generated_schema_fails_acquisition_before_asset_reads() {
+        let index = crate::release_bundle::ReleaseBundleIndex {
+            schema_version: crate::release_bundle::RELEASE_BUNDLE_SCHEMA_VERSION,
+            generator: crate::release_bundle::ReleaseGenerator {
+                name: "brokk-bifrost-semantic-packs".to_owned(),
+                version: RELEASE_VERSION.to_owned(),
+            },
+            packs: Vec::new(),
+            generated_productions: vec![crate::release_bundle::ReleaseGeneratedProduction {
+                source_pack_id: "bifrost.jdk".to_owned(),
+                source_pack_version: "21.0.8".to_owned(),
+                artifact_sha256: "a".repeat(64),
+                input_digest: "b".repeat(64),
+                producer_name: "fixture-producer".to_owned(),
+                producer_version: "1.0.0".to_owned(),
+                schema_version: SEMANTIC_MODEL_SCHEMA_VERSION + 1,
+                cache_version: GENERATED_PRODUCTION_CACHE_VERSION,
+                production_digest: "c".repeat(64),
+                pack_id: "bifrost.jdk.generated".to_owned(),
+                pack_version: "21.0.8".to_owned(),
+                language: "java".to_owned(),
+                ecosystem: "jdk".to_owned(),
+                manifest: crate::release_bundle::ReleaseAsset {
+                    path: "manifests/fixture.json".to_owned(),
+                    sha256: "d".repeat(64),
+                    bytes: 1,
+                },
+                manifest_semantic_sha256: "e".repeat(64),
+                manifest_content_sha256: "f".repeat(64),
+                completeness:
+                    brokk_bifrost_analysis::analyzer::semantic_model::Completeness::Complete,
+                shards: Vec::new(),
+                rejects: Vec::new(),
+                suppressed_rejects: 0,
+            }],
+        };
+        // The archive holds nothing but the index: verification cannot have
+        // read a `SHA256SUMS` or any asset when it reports the schema version.
+        let archive = tiny_archive(&[
+            Entry::Directory(EXPECTED_TOP_LEVEL),
+            Entry::File(
+                "bifrost-semantic-packs/index.json",
+                &serde_json::to_vec(&index).unwrap(),
+            ),
+        ]);
+        let archive_digest = hex_digest(&archive);
+        let archive_url = release_asset_url(ARCHIVE_NAME);
+        let checksum_url = release_asset_url(CHECKSUM_NAME);
+        let transport = FakeTransport::new(HashMap::from([
+            (
+                checksum_url.clone(),
+                format!("{archive_digest}  {ARCHIVE_NAME}\n").into_bytes(),
+            ),
+            (archive_url.clone(), archive),
+        ]));
+        let catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
+
+        let error = acquire_with_mode(
+            &catalog,
+            &AcquisitionRequest::GeneratedProduction(&test_key()),
+            DownloadMode::On,
+            &transport,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("unsupported generated production semantic schema"),
+            "{error}"
+        );
+        assert_eq!(
+            transport.requests.lock().unwrap().as_slice(),
+            &[checksum_url, archive_url]
+        );
+        assert_failed_generated_production_is_not_installed(&catalog, &test_key(), &archive_digest);
+    }
+
+    #[test]
+    #[hardwon(
+        "#3748: a failed checksum fetch must be reused without freezing a false absence receipt"
+    )]
+    fn failed_release_checksum_fetch_is_remembered_without_recording_absence() {
+        let catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
+        let negative_cache_root = tempdir().unwrap();
+        let checksum_url = release_asset_url(CHECKSUM_NAME);
+        // An unpublished release: the fake has no checksum response.
+        let unpublished = FakeTransport::new(HashMap::new());
+        let memo = ReleaseChecksumMemo::new(None);
+        let transport = ReleaseChecksumMemoTransport {
+            inner: &unpublished,
+            memo: &memo,
+        };
+        let first_key = test_key();
+        let second_key = GeneratedProductionKey::new(
+            "1".repeat(64),
+            "test-producer".to_owned(),
+            "1.0.0".to_owned(),
+            SEMANTIC_MODEL_SCHEMA_VERSION,
+        )
+        .unwrap();
+        let errors = [&first_key, &second_key].map(|key| {
+            acquire_with_negative_cache(
+                &catalog,
+                &AcquisitionRequest::GeneratedProduction(key),
+                &transport,
+                Some(negative_cache_root.path()),
+            )
+            .unwrap_err()
+        });
+        assert_eq!(
+            unpublished.requests.lock().unwrap().as_slice(),
+            std::slice::from_ref(&checksum_url),
+            "a second dependency must reuse the remembered failure"
+        );
+        assert_eq!(errors[0], errors[1]);
+        for (key, error) in [&first_key, &second_key].into_iter().zip(&errors) {
+            assert_ne!(
+                *error,
+                unsatisfied_error(&AcquisitionRequest::GeneratedProduction(key)),
+                "a failed checksum fetch is not proven absence"
+            );
+        }
+
+        // The next process starts with an empty memo and fetches again.
+        let digest = "a".repeat(64);
+        let published = FakeTransport::new(HashMap::from([(
+            checksum_url.clone(),
+            format!("{digest}  {ARCHIVE_NAME}\n").into_bytes(),
+        )]));
+        let next_memo = ReleaseChecksumMemo::new(None);
+        let next_process = ReleaseChecksumMemoTransport {
+            inner: &published,
+            memo: &next_memo,
+        };
+        let checksum = next_process
+            .fetch(&checksum_url, MAX_CHECKSUM_BYTES)
+            .unwrap();
+        assert_eq!(
+            parse_checksum_sidecar(&checksum, ARCHIVE_NAME).unwrap(),
+            digest
+        );
+        assert_eq!(published.requests.lock().unwrap().len(), 1);
+
+        // Neither failure recorded absence: no machine-local negative-cache
+        // entry and no catalog receipt for the release that is now published.
+        assert!(!negative_cache_root.path().join(NEGATIVE_CACHE_DIR).exists());
+        for key in [&first_key, &second_key] {
+            assert_eq!(
+                catalog
+                    .acquisition_receipt_lookup(
+                        &receipt_request(&AcquisitionRequest::GeneratedProduction(key)),
+                        &receipt_release(&digest),
+                    )
+                    .unwrap(),
+                AcquisitionReceiptLookup::ReceiptMiss,
+            );
+        }
+    }
+
+    #[test]
+    fn checksum_sidecar_requires_one_lowercase_named_digest() {
+        let digest = "a".repeat(64);
+        assert_eq!(
+            parse_checksum_sidecar(
+                format!("{digest}  {ARCHIVE_NAME}\n").as_bytes(),
+                ARCHIVE_NAME
+            )
+            .unwrap(),
+            digest
+        );
+        assert!(
+            parse_checksum_sidecar(
+                format!("{}  {ARCHIVE_NAME}\nextra\n", "a".repeat(64)).as_bytes(),
+                ARCHIVE_NAME
+            )
+            .is_err()
+        );
+        assert!(
+            parse_checksum_sidecar(
+                format!("{}  other.tar.gz\n", "a".repeat(64)).as_bytes(),
+                ARCHIVE_NAME
+            )
+            .is_err()
+        );
+        assert!(
+            parse_checksum_sidecar(
+                format!("{}  {ARCHIVE_NAME}\n", "A".repeat(64)).as_bytes(),
+                ARCHIVE_NAME
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn safe_extraction_rejects_traversal_and_links() {
+        let destination = tempfile::tempdir().unwrap();
+        assert!(validate_archive_path(Path::new("bifrost-semantic-packs/../escape")).is_err());
+
+        let link = tiny_archive(&[
+            Entry::Directory(EXPECTED_TOP_LEVEL),
+            Entry::Symlink("bifrost-semantic-packs/link", "../escape"),
+        ]);
+        assert!(safe_extract_archive(&link, destination.path()).is_err());
+    }
+
+    #[test]
+    fn off_mode_makes_no_transport_calls_without_environment_mutation() {
+        assert_eq!(
+            DownloadMode::from_env_value(Some(" off ")),
+            DownloadMode::Off
+        );
+        assert_eq!(DownloadMode::from_env_value(Some("on")), DownloadMode::On);
+        let catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
+        let transport = FakeTransport::new(HashMap::new());
+        acquire_with_mode(
+            &catalog,
+            &AcquisitionRequest::GeneratedProduction(&test_key()),
+            DownloadMode::Off,
+            &transport,
+        )
+        .unwrap();
+        assert!(transport.requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn fake_transport_records_bounded_requests() {
+        let archive = tiny_archive(&[
+            Entry::Directory(EXPECTED_TOP_LEVEL),
+            Entry::File("bifrost-semantic-packs/index.json", b"{}"),
+        ]);
+        let url = release_asset_url(ARCHIVE_NAME);
+        let transport = FakeTransport::new(HashMap::from([(url.clone(), archive.clone())]));
+        assert_eq!(
+            transport.fetch(&url, archive.len() as u64).unwrap(),
+            archive
+        );
+        assert!(transport.fetch(&url, 1).is_err());
+        assert_eq!(
+            transport.requests.lock().unwrap().as_slice(),
+            &[url.clone(), url]
+        );
+    }
+
+    #[test]
+    fn outer_archive_digest_is_strict() {
+        let bytes = b"semantic-pack archive";
+        let digest = hex_digest(bytes);
+        assert!(verify_digest(bytes, &digest).is_ok());
+        assert!(verify_digest(b"tampered", &digest).is_err());
+    }
+
+    #[test]
+    fn safe_extraction_accepts_one_regular_bundle_tree() {
+        let archive = tiny_archive(&[
+            Entry::Directory(EXPECTED_TOP_LEVEL),
+            Entry::Directory("bifrost-semantic-packs/nested"),
+            Entry::File("bifrost-semantic-packs/nested/index.json", b"{}"),
+        ]);
+        let destination = tempfile::tempdir().unwrap();
+        let root = safe_extract_archive(&archive, destination.path()).unwrap();
+        assert_eq!(root, destination.path().join(EXPECTED_TOP_LEVEL));
+        assert_eq!(fs::read(root.join("nested/index.json")).unwrap(), b"{}");
+    }
+}

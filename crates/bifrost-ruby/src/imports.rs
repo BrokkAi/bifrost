@@ -13,6 +13,7 @@ use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::ruby_facts::{RubyLoadInfo, RubyLoadKind};
 use brokk_bifrost_core::analyzer::{CodeUnit, Language, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 use tree_sitter::Node;
@@ -114,6 +115,12 @@ pub fn resolve_required_file(file: &ProjectFile, load: &RubyLoadInfo) -> Option<
     }
 }
 
+fn resolve_generic_load(file: &ProjectFile, load: &RubyLoadInfo) -> Option<ProjectFile> {
+    load.generic
+        .then(|| resolve_required_file(file, load))
+        .flatten()
+}
+
 fn resolve_relative_required_file(file: &ProjectFile, path: &Path) -> Option<ProjectFile> {
     resolve_candidate(file, path, false)
 }
@@ -154,20 +161,9 @@ fn resolve_candidate(
 /// Resolves `.`/`..` components without touching the filesystem. Returns `None`
 /// if the path escapes the project root.
 fn normalize_relative(path: &Path) -> Option<PathBuf> {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !out.pop() {
-                    return None;
-                }
-            }
-            Component::Normal(part) => out.push(part),
-            Component::RootDir | Component::Prefix(_) => return None,
-        }
-    }
-    (!out.as_os_str().is_empty()).then_some(out)
+    let normalized =
+        brokk_bifrost_core::path_utils::normalize_relative_path_from(Path::new(""), path)?;
+    (!normalized.as_os_str().is_empty()).then_some(normalized)
 }
 
 pub fn parse_ruby_autoload_call(node: Node<'_>, source: &str) -> Option<(String, String)> {
@@ -300,8 +296,7 @@ pub fn ruby_required_files_checked(
         ruby.source_facts(file)?
             .loads
             .iter()
-            .filter(|load| load.generic)
-            .filter_map(|load| resolve_required_file(file, load))
+            .filter_map(|load| resolve_generic_load(file, load))
             .collect(),
     )
 }
@@ -372,29 +367,24 @@ fn ruby_project_file_contents(ruby: &dyn RubySource, rel_path: &str) -> Option<S
     ruby.project().read_source(&file).ok()
 }
 
-pub fn build_zeitwerk_autoload_files(ruby: &dyn RubySource) -> HashSet<ProjectFile> {
+fn zeitwerk_consumer_files(ruby: &dyn RubySource) -> BTreeSet<ProjectFile> {
     if !ruby.has_zeitwerk_autoload_conventions() {
-        return HashSet::default();
+        return BTreeSet::default();
     }
     ruby.project()
         .analyzable_files(Language::Ruby)
-        .map(|files| {
-            files
-                .into_iter()
-                .filter(is_zeitwerk_autoload_file)
-                .collect()
-        })
         .unwrap_or_default()
 }
 
+pub fn build_zeitwerk_autoload_files(ruby: &dyn RubySource) -> HashSet<ProjectFile> {
+    zeitwerk_consumer_files(ruby)
+        .into_iter()
+        .filter(is_zeitwerk_autoload_file)
+        .collect()
+}
+
 pub fn build_zeitwerk_consumer_files(ruby: &dyn RubySource) -> HashSet<ProjectFile> {
-    if !ruby.has_zeitwerk_autoload_conventions() {
-        return HashSet::default();
-    }
-    ruby.project()
-        .analyzable_files(Language::Ruby)
-        .map(|files| files.into_iter().collect())
-        .unwrap_or_default()
+    zeitwerk_consumer_files(ruby).into_iter().collect()
 }
 
 pub fn build_zeitwerk_autoload_code_units(ruby: &dyn RubySource) -> HashSet<CodeUnit> {
@@ -471,8 +461,8 @@ pub fn ruby_imported_files_from_infos(
     Some(
         loads
             .iter()
-            .filter(|load| load.generic && imports.contains(&load.import))
-            .filter_map(|load| resolve_required_file(file, load))
+            .filter(|load| imports.contains(&load.import))
+            .filter_map(|load| resolve_generic_load(file, load))
             .collect(),
     )
 }

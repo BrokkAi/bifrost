@@ -10,7 +10,13 @@ use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::tree_walk::push_named_children_reversed_as;
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
-use brokk_bifrost_ruby::graph::resolver::RubyMethodFind;
+use brokk_bifrost_core::analyzer::usages::reference_site::node_range as ruby_node_range;
+use brokk_bifrost_ruby::graph::resolver::{
+    RubyMethodFind, RubyMethodLookupMode, ruby_dispatch_matches_lookup_mode,
+};
+use brokk_bifrost_ruby::graph::scope::{RubyScopeExit, exit_scope};
+use brokk_bifrost_ruby::hierarchy::ruby_direct_ancestors;
+use brokk_bifrost_ruby::mixins::{ruby_forward_mixin_specs, ruby_forward_superclass_targets};
 
 mod instance_fields;
 use brokk_bifrost_ruby::local_bindings::{LocalBindingBudget, collect_local_write};
@@ -31,15 +37,12 @@ impl<'a> RubyDefinitionProvider<'a> {
     }
 
     pub(crate) fn members_for_owner_name(&self, owner_fqn: &str, name: &str) -> Vec<CodeUnit> {
-        let mut units = self.session.query_limited_rows(|limit| {
+        super::query_limited_definition_units(self.session, |limit| {
             self.ruby
                 .member_candidates_for_owner_limited(owner_fqn, name, limit, || {
                     self.session.observe_cancellation()
                 })
-        });
-        sort_units(&mut units);
-        units.dedup();
-        units
+        })
     }
 
     fn ranges(&self, unit: &CodeUnit) -> Vec<Range> {
@@ -134,7 +137,7 @@ impl BoundedDefinitionLookup for RubyDefinitionProvider<'_> {
     }
 
     fn file_identifier(&self, file: &ProjectFile, ident: &str) -> Vec<CodeUnit> {
-        let mut units = self
+        let units = self
             .session
             .query_limited_rows(|limit| {
                 self.ruby
@@ -145,29 +148,18 @@ impl BoundedDefinitionLookup for RubyDefinitionProvider<'_> {
             .into_iter()
             .filter(|unit| unit.source() == file)
             .collect::<Vec<_>>();
-        sort_units(&mut units);
-        units.dedup();
-        units
+        crate::analyzer::definition_lookup::sort_dedup_units(units)
     }
 
     fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit> {
-        let mut children = Vec::new();
-        for owner in self.fqn(fqn) {
-            children.extend(
+        super::fqn_direct_children(
+            self.fqn(fqn),
+            |owner| {
                 self.session
-                    .query_limited_rows(|limit| self.ruby.direct_children_limited(&owner, limit)),
-            );
-            if !self.session.observe_cancellation() {
-                return Vec::new();
-            }
-        }
-        sort_units(&mut children);
-        children.dedup();
-        children
-    }
-
-    fn fqn_exists(&self, fqn: &str) -> bool {
-        !self.fqn(fqn).is_empty()
+                    .query_limited_rows(|limit| self.ruby.direct_children_limited(owner, limit))
+            },
+            || self.session.observe_cancellation(),
+        )
     }
 
     fn package_exists(&self, _package: &str) -> bool {
@@ -192,6 +184,54 @@ pub(crate) struct RubyTypeLookupResolution {
     pub(crate) target_kind: TypeLookupTargetKind,
 }
 
+pub(crate) enum RubyBoundedPreflight<'a> {
+    Ready {
+        ruby: &'a RubyAnalyzer,
+        tree: &'a Tree,
+    },
+    AnalyzerUnavailable,
+    ParseFailed,
+    SourceFactsUnavailable,
+}
+
+pub(crate) fn ruby_bounded_preflight<'a>(
+    analyzer: &'a dyn IAnalyzer,
+    tree: Option<&'a Tree>,
+    session: &ResolutionSession,
+) -> RubyBoundedPreflight<'a> {
+    let Some(ruby) = resolve_analyzer::<RubyAnalyzer>(analyzer) else {
+        return RubyBoundedPreflight::AnalyzerUnavailable;
+    };
+    let Some(tree) = tree else {
+        return RubyBoundedPreflight::ParseFailed;
+    };
+    if !session.observe_cancellation() || !ruby.canonical_sources_ready() {
+        return RubyBoundedPreflight::SourceFactsUnavailable;
+    }
+    RubyBoundedPreflight::Ready { ruby, tree }
+}
+
+fn ruby_unshadowed_external_type<'a>(
+    ruby: &RubyAnalyzer,
+    session: &ResolutionSession,
+    constants: RubyOverlayConstants<'a>,
+    qualified_name: &str,
+) -> Option<&'a crate::analyzer::semantic_model::SemanticModelSymbol> {
+    let result = constants.unique_type(qualified_name)?;
+    let workspace_owners = session.query_limited_rows(|limit| {
+        ruby.declaration_candidates_by_identifier_limited(&result.name, limit, || {
+            session.observe_cancellation()
+        })
+    });
+    if workspace_owners
+        .iter()
+        .any(|unit| unit.fq_segment_texts().join("::") == result.qualified_name)
+    {
+        return None;
+    }
+    Some(result)
+}
+
 pub(crate) fn resolve_ruby_bounded(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
@@ -202,24 +242,27 @@ pub(crate) fn resolve_ruby_bounded(
     cancellation: Option<&CancellationToken>,
 ) -> BoundedResolution<DefinitionLookupOutcome> {
     let session = ResolutionSession::bounded(budget, cancellation);
-    let Some(ruby) = resolve_analyzer::<RubyAnalyzer>(analyzer) else {
-        return session.finish(no_definition(
-            "ruby_analyzer_unavailable",
-            "Ruby analyzer is unavailable",
-        ));
+    let (ruby, tree) = match ruby_bounded_preflight(analyzer, tree, &session) {
+        RubyBoundedPreflight::Ready { ruby, tree } => (ruby, tree),
+        RubyBoundedPreflight::AnalyzerUnavailable => {
+            return session.finish(no_definition(
+                "ruby_analyzer_unavailable",
+                "Ruby analyzer is unavailable",
+            ));
+        }
+        RubyBoundedPreflight::ParseFailed => {
+            return session.finish(no_definition(
+                "ruby_parse_failed",
+                "Ruby source could not be parsed",
+            ));
+        }
+        RubyBoundedPreflight::SourceFactsUnavailable => {
+            return session.finish(no_definition(
+                "ruby_source_facts_unavailable",
+                "Canonical Ruby source facts are unavailable",
+            ));
+        }
     };
-    let Some(tree) = tree else {
-        return session.finish(no_definition(
-            "ruby_parse_failed",
-            "Ruby source could not be parsed",
-        ));
-    };
-    if !session.observe_cancellation() || !ruby.canonical_sources_ready() {
-        return session.finish(no_definition(
-            "ruby_source_facts_unavailable",
-            "Canonical Ruby source facts are unavailable",
-        ));
-    }
     let provider = RubyDefinitionProvider::new(ruby, &session);
     let outcome = resolve_ruby_bounded_in_session(&provider, file, source, tree.root_node(), site);
     session.finish(outcome)
@@ -460,22 +503,15 @@ pub(crate) fn ruby_modeled_result_class_bounded(
             return None;
         }
         let constants = RubyOverlayConstants::new(Some(&overlay));
-        let result = constants.unique_type(&receiver.owner_fq_name)?;
-        let workspace_owners = session.query_limited_rows(|limit| {
-            ruby.declaration_candidates_by_identifier_limited(&result.name, limit, || {
-                session.observe_cancellation()
-            })
-        });
-        if workspace_owners
-            .iter()
-            .any(|unit| unit.fq_segment_texts().join("::") == result.qualified_name)
-        {
-            return None;
-        }
-        Some(crate::analyzer::semantic::ClassIdentity::External {
-            qualified_name: result.qualified_name.clone().into_boxed_str(),
-            symbol_id: result.id.clone().into_boxed_str(),
-        })
+        let result =
+            ruby_unshadowed_external_type(ruby, &session, constants, &receiver.owner_fq_name)?;
+        crate::analyzer::semantic::type_flow::external_class_identity(
+            Some(&overlay),
+            Language::Ruby,
+            &result.qualified_name,
+            Some(&result.id),
+            &mut crate::analyzer::semantic::type_flow::ExternalClassCache::default(),
+        )
     })();
     session.finish(result)
 }
@@ -584,14 +620,13 @@ fn ruby_dispatch_mode_matches(
     declaration: RubyMethodDispatchMode,
     receiver: RubyReceiverMode,
 ) -> bool {
-    matches!(
-        (declaration, receiver),
-        (
-            RubyMethodDispatchMode::Instance,
-            RubyReceiverMode::Instance | RubyReceiverMode::TopLevel
-        ) | (RubyMethodDispatchMode::Singleton, RubyReceiverMode::Class)
-            | (RubyMethodDispatchMode::ModuleFunction, _)
-    )
+    let mode = match receiver {
+        RubyReceiverMode::Instance | RubyReceiverMode::TopLevel => {
+            RubyMethodLookupMode::InstanceMethod
+        }
+        RubyReceiverMode::Class => RubyMethodLookupMode::SingletonMethod,
+    };
+    ruby_dispatch_matches_lookup_mode(declaration, mode)
 }
 
 fn ruby_default_constructor_candidates(
@@ -1177,16 +1212,7 @@ impl<'a, 'tree> BoundedRubyLookupContext<'a, 'tree> {
     }
 
     fn enclosing_receiver(&self) -> Option<RubyReceiverType> {
-        let owner_fq_name = self.lexical_stack.last()?.clone();
-        let mode = self
-            .method_stack
-            .last()
-            .copied()
-            .unwrap_or(RubyReceiverMode::Class);
-        Some(RubyReceiverType {
-            owner_fq_name,
-            mode,
-        })
+        ruby_enclosing_receiver(&self.lexical_stack, &self.method_stack)
     }
 
     fn constant_receiver_type(&self, node: Node<'_>) -> Option<RubyReceiverType> {
@@ -1247,6 +1273,10 @@ impl<'a, 'tree> BoundedRubyLookupContext<'a, 'tree> {
             node = ruby_first_named_child(node)?;
         }
         match node.kind() {
+            "string" | "string_content" => Some(RubyReceiverType {
+                owner_fq_name: "String".to_owned(),
+                mode: RubyReceiverMode::Instance,
+            }),
             "constant" | "scope_resolution" => self.constant_receiver_type(node),
             "self" => self.enclosing_receiver(),
             "identifier" => {
@@ -1578,47 +1608,23 @@ enum BoundedRubyExit {
 
 fn ruby_smallest_named_node_covering_bounded<'tree>(
     provider: &RubyDefinitionProvider<'_>,
-    mut node: Node<'tree>,
+    node: Node<'tree>,
     start: usize,
     end: usize,
 ) -> Option<Node<'tree>> {
     if start > end || start < node.start_byte() || end > node.end_byte() {
         return None;
     }
-    loop {
-        if !provider.scope_step() {
-            return None;
-        }
-        let mut next = None;
-        for index in 0..node.named_child_count() {
-            if !provider.scope_step() {
-                return None;
-            }
-            let child = node.named_child(index)?;
-            if child.start_byte() <= start && end <= child.end_byte() {
-                next = Some(child);
-                break;
-            }
-        }
-        match next {
-            Some(child) => node = child,
-            None => return Some(node),
-        }
-    }
-}
-
-fn ruby_node_range(node: Node<'_>) -> Range {
-    Range {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_line: node.start_position().row,
-        end_line: node.end_position().row,
-    }
+    brokk_bifrost_core::analyzer::usages::reference_site::smallest_named_node_covering_with_scope(
+        node,
+        start,
+        end,
+        || provider.scope_step(),
+    )
 }
 
 fn ruby_first_named_child(node: Node<'_>) -> Option<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).next()
+    brokk_bifrost_core::analyzer::structural::adapter_helpers::first_named_child(node)
 }
 
 pub(super) fn resolve_ruby(
@@ -2159,7 +2165,34 @@ pub(super) fn exact_ruby_external_call(
     }
     let context =
         BoundedRubyLookupContext::build(&provider, file, source, root, site.focus_start_byte);
-    let receiver_node = call.child_by_field_name("receiver")?;
+    let receiver_node = call.child_by_field_name("receiver");
+    let member_name = ruby_node_text(callee, source);
+    let parameter_count = ruby_positional_argument_count(call)?;
+
+    if receiver_node.is_none() && member_name == "system" {
+        if !ruby_bare_core_method_is_proven(&provider, &context, call, source) {
+            return None;
+        }
+        let constants = RubyOverlayConstants::new(overlay.as_deref());
+        let owner = ruby_unshadowed_external_type(ruby, &session, constants, "Kernel")?;
+        let member = constants.callable(owner, "system", parameter_count)?;
+        let proof = ExactExternalCallProof::ruby_bound_external_member(
+            &owner.qualified_name,
+            &member.name,
+            u32::try_from(parameter_count).ok()?,
+        );
+        let identity = ResolverOwnedExternalCalleeIdentity::new(
+            Language::Ruby,
+            owner.qualified_name.clone(),
+            member.name.clone(),
+        );
+        return match session.finish((proof, identity)) {
+            BoundedResolution::Complete { value, .. } => Some(value),
+            _ => None,
+        };
+    }
+
+    let receiver_node = receiver_node?;
     let receiver = context
         .expression_receiver_type(receiver_node)
         .or_else(|| {
@@ -2181,23 +2214,10 @@ pub(super) fn exact_ruby_external_call(
         return None;
     }
     let constants = RubyOverlayConstants::new(overlay.as_deref());
-    let owner = constants.unique_type(&receiver.owner_fq_name)?;
     // The declared result can name a different class from the constructor's
-    // owner. Check its workspace identity too, using CodeUnit segments rather
-    // than reparsing the model's rendered name.
-    let workspace_owners = session.query_limited_rows(|limit| {
-        ruby.declaration_candidates_by_identifier_limited(&owner.name, limit, || {
-            session.observe_cancellation()
-        })
-    });
-    if workspace_owners
-        .iter()
-        .any(|unit| unit.fq_segment_texts().join("::") == owner.qualified_name)
-    {
-        return None;
-    }
-    let parameter_count = ruby_positional_argument_count(call)?;
-    let member = constants.callable(owner, ruby_node_text(callee, source), parameter_count)?;
+    // owner, so check this result identity independently.
+    let owner = ruby_unshadowed_external_type(ruby, &session, constants, &receiver.owner_fq_name)?;
+    let member = constants.callable(owner, member_name, parameter_count)?;
     if member.is_static() != (receiver.mode == RubyReceiverMode::Class) {
         return None;
     }
@@ -2215,6 +2235,301 @@ pub(super) fn exact_ruby_external_call(
         BoundedResolution::Complete { value, .. } => Some(value),
         _ => None,
     }
+}
+
+/// Bare Ruby calls use the enclosing receiver and can fall through to Kernel.
+/// The fallback is deliberately narrower than the ordinary method resolver:
+/// unknown class ancestry, workspace dynamic hooks, or a lexical refinement
+/// means that `system` may select something other than Kernel#system.
+fn ruby_bare_core_method_is_proven(
+    provider: &RubyDefinitionProvider<'_>,
+    context: &BoundedRubyLookupContext<'_, '_>,
+    call: Node<'_>,
+    source: &str,
+) -> bool {
+    if ruby_has_active_refinement(context.root, call, source)
+        || ruby_has_dynamic_bare_dispatch(context.root, &context.lexical_stack, call, source)
+        || ruby_has_unknown_receiver_ancestry(provider, context, call, source)
+    {
+        return false;
+    }
+    let Some(receiver) = context.enclosing_receiver() else {
+        return false;
+    };
+    let Some(system_candidates) =
+        ruby_bare_method_candidates(provider, context, &receiver, "system")
+    else {
+        return false;
+    };
+    if !system_candidates.is_empty() {
+        return false;
+    }
+    let Some(method_missing_candidates) =
+        ruby_bare_method_candidates(provider, context, &receiver, "method_missing")
+    else {
+        return false;
+    };
+    method_missing_candidates.is_empty()
+}
+
+fn ruby_bare_method_candidates(
+    provider: &RubyDefinitionProvider<'_>,
+    context: &BoundedRubyLookupContext<'_, '_>,
+    receiver: &RubyReceiverType,
+    member: &str,
+) -> Option<Vec<CodeUnit>> {
+    let mut candidates = ruby_bounded_method_candidates(provider, context, receiver, member)?;
+    if receiver.mode != RubyReceiverMode::TopLevel {
+        return Some(candidates);
+    }
+
+    // The normal Ruby graph keeps a top-level bare call separate from the
+    // Object/Kernel ancestry. A workspace can still reopen either owner and
+    // change the implicit-self lookup, so inspect those structured owners
+    // before accepting the builtin fall-through.
+    let object = RubyReceiverType {
+        owner_fq_name: "Object".to_owned(),
+        mode: RubyReceiverMode::Instance,
+    };
+    let object_candidates = ruby_bounded_method_candidates(provider, context, &object, member)?;
+    candidates.extend(object_candidates);
+    for owner in ["BasicObject", "Kernel"] {
+        candidates.extend(
+            provider
+                .members_for_owner_name(owner, member)
+                .into_iter()
+                .filter(|unit| {
+                    unit.is_function()
+                        && matches!(
+                            provider.method_dispatch_mode(unit),
+                            Some(
+                                RubyMethodDispatchMode::Instance
+                                    | RubyMethodDispatchMode::ModuleFunction
+                            )
+                        )
+                }),
+        );
+    }
+    sort_units(&mut candidates);
+    candidates.dedup();
+    Some(candidates)
+}
+
+fn ruby_has_active_refinement(root: Node<'_>, call: Node<'_>, source: &str) -> bool {
+    let mut ancestor = call;
+    while let Some(parent) = ancestor.parent() {
+        if parent.kind() == "call"
+            && parent
+                .child_by_field_name("method")
+                .is_some_and(|method| ruby_node_text(method, source) == "refine")
+        {
+            return true;
+        }
+        ancestor = parent;
+    }
+
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if node.start_byte() >= call.start_byte() {
+            continue;
+        }
+        if node.kind() == "call"
+            && node.end_byte() <= call.start_byte()
+            && node
+                .child_by_field_name("method")
+                .is_some_and(|method| ruby_node_text(method, source) == "using")
+        {
+            return true;
+        }
+        for index in (0..node.named_child_count()).rev() {
+            pending.push(node.named_child(index).expect("named child exists"));
+        }
+    }
+    false
+}
+
+fn ruby_has_dynamic_bare_dispatch(
+    root: Node<'_>,
+    lexical_stack: &[String],
+    call: Node<'_>,
+    source: &str,
+) -> bool {
+    let mut enclosing_types = Vec::new();
+    let mut ancestor = call;
+    while let Some(parent) = ancestor.parent() {
+        if matches!(parent.kind(), "class" | "module" | "singleton_class") {
+            enclosing_types.push(parent);
+        }
+        ancestor = parent;
+    }
+    if enclosing_types.is_empty() && lexical_stack.is_empty() {
+        return ruby_type_contains_dynamic_dispatch(root, source);
+    }
+    enclosing_types
+        .into_iter()
+        .any(|owner| ruby_type_contains_dynamic_dispatch(owner, source))
+}
+
+fn ruby_type_contains_dynamic_dispatch(root: Node<'_>, source: &str) -> bool {
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if node != root && matches!(node.kind(), "class" | "module" | "singleton_class") {
+            continue;
+        }
+        if matches!(node.kind(), "method" | "singleton_method")
+            && node
+                .child_by_field_name("name")
+                .is_some_and(|name| ruby_node_text(name, source) == "method_missing")
+        {
+            return true;
+        }
+        if node.kind() == "call"
+            && node.child_by_field_name("method").is_some_and(|method| {
+                matches!(
+                    ruby_node_text(method, source),
+                    "define_method" | "define_singleton_method"
+                )
+            })
+        {
+            return true;
+        }
+        for index in (0..node.named_child_count()).rev() {
+            pending.push(node.named_child(index).expect("named child exists"));
+        }
+    }
+    false
+}
+
+fn ruby_has_unknown_receiver_ancestry(
+    provider: &RubyDefinitionProvider<'_>,
+    context: &BoundedRubyLookupContext<'_, '_>,
+    call: Node<'_>,
+    source: &str,
+) -> bool {
+    let mut enclosing_types = Vec::new();
+    let mut ancestor = call;
+    while let Some(parent) = ancestor.parent() {
+        if parent.kind() == "class" {
+            enclosing_types.push(parent);
+        }
+        ancestor = parent;
+    }
+    for owner in enclosing_types {
+        if owner.kind() == "singleton_class" {
+            return true;
+        }
+        let Some(owner_name) = owner
+            .child_by_field_name("name")
+            .and_then(|name| context.resolve_constant_owner(name))
+        else {
+            return true;
+        };
+        if ruby_owner_ancestry_is_unknown(provider, &owner_name) {
+            return true;
+        }
+        if let Some(superclass) = owner.child_by_field_name("superclass")
+            && !ruby_known_core_ancestor(superclass, context)
+            && context.resolve_constant_owner(superclass).is_none()
+        {
+            return true;
+        }
+        let mut pending = vec![owner];
+        while let Some(node) = pending.pop() {
+            if node != owner && matches!(node.kind(), "class" | "module" | "singleton_class") {
+                continue;
+            }
+            if node.kind() == "call"
+                && node.child_by_field_name("method").is_some_and(|method| {
+                    matches!(
+                        ruby_node_text(method, source),
+                        "include" | "prepend" | "extend"
+                    )
+                })
+            {
+                let Some(arguments) = node.child_by_field_name("arguments") else {
+                    return true;
+                };
+                let Some(argument) = arguments.named_child(0) else {
+                    return true;
+                };
+                if context.resolve_constant_owner(argument).is_none() {
+                    return true;
+                }
+            }
+            for index in (0..node.named_child_count()).rev() {
+                pending.push(node.named_child(index).expect("named child exists"));
+            }
+        }
+    }
+    false
+}
+
+fn ruby_owner_ancestry_is_unknown(provider: &RubyDefinitionProvider<'_>, owner: &str) -> bool {
+    let mut pending = vec![owner.to_owned()];
+    let mut visited = HashSet::default();
+    while let Some(owner) = pending.pop() {
+        if !provider.scope_step() {
+            return true;
+        }
+        if !visited.insert(owner.clone()) {
+            continue;
+        }
+        let mut declarations = provider
+            .fqn(&owner)
+            .into_iter()
+            .filter(|unit| unit.is_class() || unit.is_module())
+            .collect::<Vec<_>>();
+        sort_units(&mut declarations);
+        declarations.dedup();
+        let [declaration] = declarations.as_slice() else {
+            return true;
+        };
+        let raw_ancestors = ruby_forward_superclass_targets(provider.ruby, declaration);
+        if raw_ancestors.len() > 1 {
+            return true;
+        }
+        let resolved_ancestors = ruby_direct_ancestors(provider.ruby, declaration);
+        if raw_ancestors.is_empty() {
+            continue;
+        }
+        let raw = &raw_ancestors[0];
+        if ruby_known_core_superclass(raw) {
+        } else {
+            let [ancestor] = resolved_ancestors.as_slice() else {
+                return true;
+            };
+            pending.push(ancestor.fq_name().to_owned());
+        }
+        let raw_mixins = ruby_forward_mixin_specs(provider.ruby, declaration);
+        let resolved_mixins = provider
+            .ruby
+            .mixin_relations()
+            .iter()
+            .filter(|relation| relation.from == *declaration)
+            .map(|relation| relation.to.fq_name().to_owned())
+            .collect::<Vec<_>>();
+        if resolved_mixins.len() != raw_mixins.len() {
+            return true;
+        }
+        pending.extend(resolved_mixins);
+    }
+    false
+}
+
+fn ruby_known_core_superclass(raw: &str) -> bool {
+    matches!(raw, "Object" | "BasicObject" | "Kernel" | "String")
+}
+
+fn ruby_known_core_ancestor(node: Node<'_>, context: &BoundedRubyLookupContext<'_, '_>) -> bool {
+    let Some(path) = context.constant_name_path(node) else {
+        return false;
+    };
+    path.segments.len() == 1
+        && matches!(
+            path.segments[0].as_str(),
+            "Object" | "BasicObject" | "Kernel" | "String"
+        )
+        && !path.absolute
 }
 
 /// A splat, keyword group or block argument does not prove written positional
@@ -2406,7 +2721,7 @@ struct RubyLookupContext<'a> {
     lexical_stack: Vec<String>,
     method_stack: Vec<RubyReceiverMode>,
     receiver_context: Vec<RubyReceiverMode>,
-    exits: Vec<RubyExit>,
+    exits: Vec<RubyScopeExit>,
     focus_start: usize,
 }
 
@@ -2481,7 +2796,7 @@ impl<'a> RubyLookupContext<'a> {
                     self.lexical_stack.push(owner.clone());
                 }
                 self.receiver_context.push(RubyReceiverMode::Instance);
-                self.exits.push(RubyExit::Type {
+                self.exits.push(RubyScopeExit::Type {
                     has_lexical_owner: owner.is_some(),
                 });
                 return RubyWalkAction::DescendWithExit;
@@ -2493,19 +2808,19 @@ impl<'a> RubyLookupContext<'a> {
                     node,
                     self.receiver_context.last().copied(),
                 ));
-                self.exits.push(RubyExit::Method);
+                self.exits.push(RubyScopeExit::Method);
                 return RubyWalkAction::DescendWithExit;
             }
             "singleton_class" => {
                 self.locals.enter_scope();
                 self.method_stack.push(RubyReceiverMode::Class);
                 self.receiver_context.push(RubyReceiverMode::Class);
-                self.exits.push(RubyExit::SingletonClass);
+                self.exits.push(RubyScopeExit::SingletonClass);
                 return RubyWalkAction::DescendWithExit;
             }
             "block" | "do_block" => {
                 self.locals.enter_scope();
-                self.exits.push(RubyExit::LocalScope);
+                self.exits.push(RubyScopeExit::LocalScope);
                 return RubyWalkAction::DescendWithExit;
             }
             "assignment" => self.seed_assignment(node),
@@ -2515,36 +2830,13 @@ impl<'a> RubyLookupContext<'a> {
     }
 
     fn exit(&mut self) {
-        match self.exits.pop() {
-            Some(RubyExit::Type { has_lexical_owner }) => {
-                assert!(
-                    matches!(
-                        self.receiver_context.pop(),
-                        Some(RubyReceiverMode::Instance)
-                    ),
-                    "type receiver context must match its exit"
-                );
-                if has_lexical_owner {
-                    self.lexical_stack.pop();
-                }
-            }
-            Some(RubyExit::Method) => {
-                self.method_stack.pop();
-                self.locals.exit_scope();
-            }
-            Some(RubyExit::SingletonClass) => {
-                assert!(
-                    matches!(self.receiver_context.pop(), Some(RubyReceiverMode::Class)),
-                    "singleton-class receiver context must match its exit"
-                );
-                self.method_stack.pop();
-                self.locals.exit_scope();
-            }
-            Some(RubyExit::LocalScope) => {
-                self.locals.exit_scope();
-            }
-            None => {}
-        }
+        exit_scope(
+            self.exits.pop(),
+            &mut self.receiver_context,
+            &mut self.lexical_stack,
+            &mut self.method_stack,
+            &mut self.locals,
+        );
     }
 
     fn type_owner(&self, node: Node<'_>) -> Option<String> {
@@ -2639,13 +2931,6 @@ enum RubyWalkAction {
     Skip,
 }
 
-enum RubyExit {
-    Type { has_lexical_owner: bool },
-    Method,
-    SingletonClass,
-    LocalScope,
-}
-
 fn ruby_is_dynamic_dispatch(call: Node<'_>, source: &str) -> bool {
     let Some(method) = call.child_by_field_name("method") else {
         return false;
@@ -2665,125 +2950,13 @@ fn ruby_is_dynamic_dispatch(call: Node<'_>, source: &str) -> bool {
 #[cfg(test)]
 mod bounded_tests {
     use super::*;
-    use crate::analyzer::CodeUnitIndex;
     use crate::analyzer::ruby::parse_ruby_tree;
     use crate::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
-    use crate::analyzer::{AnalyzerConfig, Project, TestProject, WorkspaceAnalyzer};
+
+    use crate::analyzer::usages::traits::{GraphUsageAnalyzer, UsageScanScope};
     use crate::path_utils::rel_path_string;
     use crate::test_support::AnalyzerFixture;
-    use git2::{IndexAddOption, Repository, Signature};
-    use std::sync::Arc;
-
-    fn member_fixture() -> (
-        AnalyzerFixture,
-        ProjectFile,
-        String,
-        Tree,
-        ResolvedReferenceSite,
-    ) {
-        let source = r#"
-class Service
-  def run
-  end
-end
-
-class Other
-  def run
-  end
-end
-
-def invoke
-  service = Service.new
-  service.run
-end
-"#
-        .to_string();
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Ruby,
-            &[("bounded_definition.rb", &source)],
-        );
-        let file = ProjectFile::new(fixture.project_root(), "bounded_definition.rb");
-        let tree = parse_ruby_tree(&source).expect("Ruby tree");
-        let call_start = source.rfind("service.run").expect("member call");
-        let start_byte = call_start + "service.".len();
-        let end_byte = start_byte + "run".len();
-        let start_line = source[..start_byte]
-            .bytes()
-            .filter(|byte| *byte == b'\n')
-            .count();
-        let site = ResolvedReferenceSite {
-            path: rel_path_string(&file),
-            text: "run".to_string(),
-            range: Range {
-                start_byte,
-                end_byte,
-                start_line,
-                end_line: start_line,
-            },
-            focus_start_byte: start_byte,
-            focus_end_byte: end_byte,
-        };
-        (fixture, file, source, tree, site)
-    }
-
-    fn wide_deep_member_fixture() -> (
-        AnalyzerFixture,
-        ProjectFile,
-        String,
-        Tree,
-        ResolvedReferenceSite,
-    ) {
-        let statements = (0..96)
-            .map(|index| format!("  value{index} = {index}\n"))
-            .collect::<String>();
-        let expression = format!("{}service{}.run", "(".repeat(24), ")".repeat(24));
-        let source = format!(
-            "class Service\n  def run\n  end\nend\n\n\
-             def invoke(service)\n{statements}  {expression}\nend\n"
-        );
-        let fixture =
-            AnalyzerFixture::new_for_language(Language::Ruby, &[("wide_receiver.rb", &source)]);
-        let file = ProjectFile::new(fixture.project_root(), "wide_receiver.rb");
-        let tree = parse_ruby_tree(&source).expect("Ruby tree");
-        let expression_start = source.rfind(&expression).expect("Ruby member call");
-        let start_byte = expression_start + expression.rfind("run").expect("member name");
-        let end_byte = start_byte + "run".len();
-        let start_line = source[..start_byte]
-            .bytes()
-            .filter(|byte| *byte == b'\n')
-            .count();
-        let site = ResolvedReferenceSite {
-            path: rel_path_string(&file),
-            text: "run".to_string(),
-            range: Range {
-                start_byte,
-                end_byte,
-                start_line,
-                end_line: start_line,
-            },
-            focus_start_byte: start_byte,
-            focus_end_byte: end_byte,
-        };
-        (fixture, file, source, tree, site)
-    }
-
-    fn dispatch_mode_outcome(
-        fixture: &AnalyzerFixture,
-        method_fqn: &str,
-        budget: ReceiverAnalysisBudget,
-        cancellation: Option<&CancellationToken>,
-    ) -> BoundedResolution<Option<RubyMethodDispatchMode>> {
-        let ruby =
-            resolve_analyzer::<RubyAnalyzer>(fixture.analyzer.analyzer()).expect("Ruby analyzer");
-        let methods = ruby.get_definitions(method_fqn);
-        let [method] = methods.as_slice() else {
-            panic!("expected one Ruby method for {method_fqn}: {methods:#?}");
-        };
-        let session = ResolutionSession::bounded(budget, cancellation);
-        let provider = RubyDefinitionProvider::new(ruby, &session);
-        let mode = provider.method_dispatch_mode(method);
-        session.finish(mode)
-    }
+    use brokk_bifrost_test_macros::hardwon;
 
     fn ruby_site(
         source: &str,
@@ -2798,48 +2971,68 @@ end
             .bytes()
             .filter(|byte| *byte == b'\n')
             .count();
-        ResolvedReferenceSite {
-            path: rel_path_string(file),
-            text: member.to_string(),
-            range: Range {
+        crate::test_support::resolved_reference_site(
+            rel_path_string(file),
+            member.to_string(),
+            Range {
                 start_byte: member_start,
                 end_byte: member_start + member.len(),
                 start_line: line,
                 end_line: line,
             },
-            focus_start_byte: member_start,
-            focus_end_byte: member_start + member.len(),
-        }
+        )
     }
 
     #[test]
-    fn bounded_definition_lookup_resolves_constructed_local_receiver() {
-        let (fixture, file, source, tree, site) = member_fixture();
-        let outcome = resolve_ruby_bounded(
-            fixture.analyzer.analyzer(),
-            &file,
-            &source,
-            Some(&tree),
-            &site,
-            ReceiverAnalysisBudget::default(),
-            None,
-        );
+    #[hardwon(
+        "#4271: a class-body call must resolve a singleton method through the implicit class receiver"
+    )]
+    fn class_body_call_resolves_singleton_method_in_lookup_and_graph() {
+        let source = "class Widget\n  def self.helper; end\n  helper\nend\n";
+        let fixture =
+            AnalyzerFixture::new_for_language(Language::Ruby, &[("class_body.rb", source)]);
+        let analyzer = fixture.analyzer.analyzer();
+        let file = analyzer
+            .analyzed_files()
+            .into_iter()
+            .next()
+            .expect("fixture Ruby file");
+        let tree = parse_ruby_tree(source).expect("Ruby tree");
+        let site = ruby_site(source, &file, "helper\nend", "helper");
+        let support = AnalyzerDefinitionLookup::new(analyzer, Language::None);
 
-        let BoundedResolution::Complete { value, work } = outcome else {
-            panic!("Ruby member lookup should complete");
-        };
-        assert!(work.scope_nodes > 0);
-        assert_eq!(value.status, DefinitionLookupStatus::Resolved, "{value:#?}");
+        let legacy = resolve_ruby(analyzer, &support, &file, source, Some(&tree), &site);
+        let lookup_resolved = legacy.status == DefinitionLookupStatus::Resolved
+            && legacy
+                .definitions
+                .iter()
+                .any(|unit| unit.fq_name() == "Widget.helper");
+
+        let ruby = resolve_analyzer::<RubyAnalyzer>(analyzer).expect("Ruby analyzer");
+        let target = ruby
+            .get_definitions("Widget.helper")
+            .into_iter()
+            .find(CodeUnit::is_function)
+            .expect("class-side helper");
+        let candidates = analyzer.analyzed_files().into_iter().collect();
+        let usages = crate::analyzer::usages::ruby_graph::RubyUsageGraphStrategy::new()
+            .find_graph_usages(analyzer, &[target], &UsageScanScope::new(&candidates), 100);
+        let graph_resolved = matches!(
+            &usages,
+            crate::analyzer::usages::outcome::GraphUsageOutcome::Resolved(
+                crate::analyzer::usages::model::FuzzyResult::Success { hits_by_overload, .. }
+            ) if hits_by_overload.values().any(|hits| !hits.is_empty())
+        );
         assert!(
-            matches!(
-                value.definitions.as_slice(),
-                [definition] if definition.fq_name() == "Service.run"
-            ),
-            "{value:#?}"
+            lookup_resolved && graph_resolved,
+            "legacy lookup: {legacy:#?}; graph extraction: {usages:#?}"
         );
     }
 
     #[test]
+    #[hardwon(
+        "#3529: Ruby conditional-flow fixture requires receiver alternatives to agree before publishing one method target"
+    )]
     fn completed_conditional_locals_require_agreeing_receivers() {
         for (alternative, expected) in [("Service.new", true), ("Other.new", false)] {
             let source = format!(
@@ -2894,6 +3087,9 @@ end
     }
 
     #[test]
+    #[hardwon(
+        "#3529: Checks a completed conditional-flow join does not erase an earlier traversal-budget stop"
+    )]
     fn completed_conditional_join_preserves_budget_exhaustion() {
         let source = format!(
             "class Service\n def run; end\nend\ndef invoke(flag)\n{}service.run\nend\n",
@@ -2925,485 +3121,67 @@ end
         );
     }
 
-    #[test]
-    fn bounded_dispatch_mode_projection_respects_budget_and_cancellation() {
-        let source = r#"
-class Service
-  def self.build
-  end
-end
-"#;
-        let fixture = AnalyzerFixture::new_for_language(Language::Ruby, &[("dispatch.rb", source)]);
-
-        assert!(matches!(
-            dispatch_mode_outcome(
-                &fixture,
-                "Service.build",
-                ReceiverAnalysisBudget::default(),
-                None,
-            ),
-            BoundedResolution::Complete {
-                value: Some(RubyMethodDispatchMode::Singleton),
-                ..
-            }
-        ));
-
-        let budget = ReceiverAnalysisBudget::tiny();
-        assert!(matches!(
-            dispatch_mode_outcome(&fixture, "Service.build", budget, None),
-            BoundedResolution::Exceeded {
-                limit: ReceiverBudgetLimit::ScopeNodes,
-                work,
-            } if work.scope_nodes == budget.max_scope_nodes
-        ));
-
-        let cancellation = CancellationToken::cancel_after_checks_for_test(2);
-        assert!(matches!(
-            dispatch_mode_outcome(
-                &fixture,
-                "Service.build",
-                ReceiverAnalysisBudget::default(),
-                Some(&cancellation),
-            ),
-            BoundedResolution::Cancelled { work } if work.scope_nodes > 0
-        ));
-    }
-
-    #[test]
-    fn cold_cross_file_dispatch_collision_uses_limited_mode_projection() {
-        let _gc_guard = crate::analyzer::store::gc::set_min_interval_secs_for_test(i64::MAX);
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        let instance_source = "class Service\n  def collide\n  end\nend\n";
-        let singleton_source = "class Service\n  def self.collide\n  end\nend\n";
-        let other_owner_source = "class OtherService\n  def self.collide\n  end\nend\n";
-        let caller_source = "class App\n  def run\n    Service.collide\n    Service.new.collide\n    OtherService.collide\n  end\nend\n";
-        for (path, source) in [
-            ("instance.rb", instance_source),
-            ("singleton.rb", singleton_source),
-            ("other_owner.rb", other_owner_source),
-            ("caller.rb", caller_source),
-        ] {
-            ProjectFile::new(root.clone(), path)
-                .write(source)
-                .unwrap_or_else(|error| panic!("write {path}: {error}"));
-        }
-        let repository = Repository::init(&root).expect("git repository");
-        let mut config = repository.config().expect("git config");
-        config
-            .set_str("user.name", "Bifrost Test")
-            .expect("git user name");
-        config
-            .set_str("user.email", "bifrost@example.com")
-            .expect("git user email");
-        let mut index = repository.index().expect("git index");
-        index
-            .add_all(["*"], IndexAddOption::DEFAULT, None)
-            .expect("stage Ruby fixture");
-        index.write().expect("write git index");
-        let tree_id = index.write_tree().expect("write git tree");
-        let tree = repository.find_tree(tree_id).expect("git tree");
-        let signature =
-            Signature::now("Bifrost Test", "bifrost@example.com").expect("git signature");
-        repository
-            .commit(Some("HEAD"), &signature, &signature, "init", &tree, &[])
-            .expect("commit Ruby fixture");
-
-        let project: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Ruby));
-        let cold =
-            WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default())
-                .expect("cold persisted Ruby analyzer");
-        drop(cold);
-        let warm = WorkspaceAnalyzer::build_persisted(project, AnalyzerConfig::default())
-            .expect("warm persisted Ruby analyzer");
-        let analyzer = warm.analyzer();
-        analyzer
-            .test_hooks()
-            .reset_candidate_hydration_count_for_test();
-        let ruby = resolve_analyzer::<RubyAnalyzer>(analyzer).expect("warm Ruby analyzer");
-        let projection_session =
-            ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
-        let projection_provider = RubyDefinitionProvider::new(ruby, &projection_session);
-        let candidates = projection_provider.members_for_owner_name("Service", "collide");
-        let projected = candidates
-            .iter()
-            .map(|candidate| {
-                (
-                    rel_path_string(candidate.source()),
-                    projection_provider.method_dispatch_mode(candidate),
-                )
-            })
-            .collect::<Vec<_>>();
-        let projection_outcome = projection_session.finish(projected);
-        assert!(
-            matches!(
-                projection_outcome,
-                BoundedResolution::Complete { ref value, .. }
-                    if value
-                        == &vec![
-                            (
-                                "instance.rb".to_string(),
-                                Some(RubyMethodDispatchMode::Instance),
-                            ),
-                            (
-                                "singleton.rb".to_string(),
-                                Some(RubyMethodDispatchMode::Singleton),
-                            ),
-                        ]
-            ),
-            "cold dispatch projection mismatch: {projection_outcome:#?}"
+    fn parenthesized_receiver_outcome(
+        depth: usize,
+        budget: ReceiverAnalysisBudget,
+        cancellation: Option<&CancellationToken>,
+    ) -> BoundedResolution<bool> {
+        let expression = format!("{}Service{}", "(".repeat(depth), ")".repeat(depth));
+        let source = format!("class Service\nend\n{expression}\n");
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Ruby,
+            &[("parenthesized_receiver.rb", &source)],
         );
-
-        let caller = ProjectFile::new(root, "caller.rb");
-        let tree = parse_ruby_tree(caller_source).expect("Ruby caller tree");
-        for (needle, expected_path) in [
-            ("Service.collide", "singleton.rb"),
-            ("Service.new.collide", "instance.rb"),
-            ("OtherService.collide", "other_owner.rb"),
-        ] {
-            let site = ruby_site(caller_source, &caller, needle, "collide");
-            let outcome = resolve_ruby_bounded(
-                analyzer,
-                &caller,
-                caller_source,
-                Some(&tree),
-                &site,
-                ReceiverAnalysisBudget::default(),
-                None,
-            );
-            let BoundedResolution::Complete { value, .. } = outcome else {
-                panic!("cold Ruby `{needle}` lookup did not complete: {outcome:#?}");
-            };
-            assert!(
-                matches!(
-                    value.definitions.as_slice(),
-                    [definition]
-                        if rel_path_string(definition.source()) == expected_path
-                ),
-                "{needle}: {value:#?}"
-            );
-        }
-        assert_eq!(
-            analyzer
-                .test_hooks()
-                .full_candidate_hydration_count_for_test(),
-            0,
-            "bounded dispatch-mode lookup must not hydrate singleton/instance owner files"
-        );
-        assert_eq!(
-            analyzer
-                .test_hooks()
-                .bulk_candidate_hydration_count_for_test(),
-            0
-        );
-    }
-
-    #[test]
-    fn bounded_definition_lookup_does_not_fall_back_to_unrelated_same_name_methods() {
-        let source = r#"
-class Service
-  def run
-  end
-end
-
-class Other
-  def run
-  end
-end
-
-def invoke(unknown)
-  unknown.run
-end
-"#
-        .to_string();
-        let fixture =
-            AnalyzerFixture::new_for_language(Language::Ruby, &[("dynamic_receiver.rb", &source)]);
-        let file = ProjectFile::new(fixture.project_root(), "dynamic_receiver.rb");
+        let file = ProjectFile::new(fixture.project_root(), "parenthesized_receiver.rb");
         let tree = parse_ruby_tree(&source).expect("Ruby tree");
-        let call_start = source.rfind("unknown.run").expect("member call");
-        let start_byte = call_start + "unknown.".len();
-        let end_byte = start_byte + "run".len();
-        let line = source[..start_byte]
-            .bytes()
-            .filter(|byte| *byte == b'\n')
-            .count();
-        let site = ResolvedReferenceSite {
-            path: rel_path_string(&file),
-            text: "run".to_string(),
-            range: Range {
-                start_byte,
-                end_byte,
-                start_line: line,
-                end_line: line,
-            },
-            focus_start_byte: start_byte,
-            focus_end_byte: end_byte,
-        };
-
-        let outcome = resolve_ruby_bounded(
-            fixture.analyzer.analyzer(),
-            &file,
-            &source,
-            Some(&tree),
-            &site,
-            ReceiverAnalysisBudget::default(),
-            None,
-        );
-        let BoundedResolution::Complete { value, .. } = outcome else {
-            panic!("unsupported dynamic receiver should complete explicitly");
-        };
-        assert!(value.definitions.is_empty(), "{value:#?}");
-        assert!(
-            value
-                .diagnostics
-                .iter()
-                .any(|diagnostic| { diagnostic.kind == "unsupported_ruby_receiver" })
-        );
-    }
-
-    #[test]
-    fn bounded_type_lookup_resolves_constructed_local_receiver() {
-        let (fixture, file, source, tree, method_site) = member_fixture();
-        let receiver_start = source.rfind("service.run").expect("member call");
-        let receiver_site = ResolvedReferenceSite {
-            path: rel_path_string(&file),
-            text: "service".to_string(),
-            range: Range {
-                start_byte: receiver_start,
-                end_byte: receiver_start + "service".len(),
-                start_line: method_site.range.start_line,
-                end_line: method_site.range.end_line,
-            },
-            focus_start_byte: receiver_start,
-            focus_end_byte: receiver_start + "service".len(),
-        };
-        let session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
+        let expression_node = tree
+            .root_node()
+            .named_child(tree.root_node().named_child_count().saturating_sub(1))
+            .expect("parenthesized receiver expression");
+        let session = ResolutionSession::bounded(budget, cancellation);
         let ruby =
             resolve_analyzer::<RubyAnalyzer>(fixture.analyzer.analyzer()).expect("Ruby analyzer");
         let support = RubyDefinitionProvider::new(ruby, &session);
-        let resolution = ruby_type_lookup_resolution_bounded(
+        let context = BoundedRubyLookupContext::build(
             &support,
             &file,
             &source,
             tree.root_node(),
-            &receiver_site,
+            expression_node.start_byte(),
         );
-
-        let BoundedResolution::Complete {
-            value: Some(resolution),
-            ..
-        } = session.finish(resolution)
-        else {
-            panic!("Ruby receiver type lookup should complete");
-        };
-        assert_eq!(resolution.fqn, "Service");
-        assert_eq!(
-            resolution.target_kind,
-            TypeLookupTargetKind::ValueExpression
-        );
-    }
-
-    #[test]
-    fn bounded_factory_return_resolves_exact_tail_allocation_type_and_member() {
-        let source = r#"
-class Service
-  def run
-  end
-end
-
-class Other
-  def run
-  end
-end
-
-class Factory
-  def self.make_service
-    Service.new
-  end
-end
-
-def invoke
-  Factory.make_service.run
-end
-"#
-        .to_string();
-        let fixture =
-            AnalyzerFixture::new_for_language(Language::Ruby, &[("factory_return.rb", &source)]);
-        let file = ProjectFile::new(fixture.project_root(), "factory_return.rb");
-        let tree = parse_ruby_tree(&source).expect("Ruby tree");
-        let receiver_start = source
-            .rfind("Factory.make_service.run")
-            .expect("factory member call");
-        let member_start = receiver_start + "Factory.make_service.".len();
-        let line = source[..member_start]
-            .bytes()
-            .filter(|byte| *byte == b'\n')
-            .count();
-        let member_site = ResolvedReferenceSite {
-            path: rel_path_string(&file),
-            text: "run".to_string(),
-            range: Range {
-                start_byte: member_start,
-                end_byte: member_start + "run".len(),
-                start_line: line,
-                end_line: line,
-            },
-            focus_start_byte: member_start,
-            focus_end_byte: member_start + "run".len(),
-        };
-
-        let member_outcome = resolve_ruby_bounded(
-            fixture.analyzer.analyzer(),
-            &file,
-            &source,
-            Some(&tree),
-            &member_site,
-            ReceiverAnalysisBudget::default(),
-            None,
-        );
-        let BoundedResolution::Complete { value, .. } = member_outcome else {
-            panic!("Ruby factory member lookup should complete");
-        };
-        assert_eq!(value.status, DefinitionLookupStatus::Resolved, "{value:#?}");
-        assert!(
-            matches!(
-                value.definitions.as_slice(),
-                [definition] if definition.fq_name() == "Service.run"
-            ),
-            "{value:#?}"
-        );
-
-        let receiver_site = ResolvedReferenceSite {
-            path: rel_path_string(&file),
-            text: "Factory.make_service".to_string(),
-            range: Range {
-                start_byte: receiver_start,
-                end_byte: receiver_start + "Factory.make_service".len(),
-                start_line: line,
-                end_line: line,
-            },
-            focus_start_byte: receiver_start,
-            focus_end_byte: receiver_start + "Factory.make_service".len(),
-        };
-        let session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
-        let ruby =
-            resolve_analyzer::<RubyAnalyzer>(fixture.analyzer.analyzer()).expect("Ruby analyzer");
-        let support = RubyDefinitionProvider::new(ruby, &session);
-        let resolution = ruby_type_lookup_resolution_bounded(
-            &support,
-            &file,
-            &source,
-            tree.root_node(),
-            &receiver_site,
-        );
-        let BoundedResolution::Complete {
-            value: Some(resolution),
-            ..
-        } = session.finish(resolution)
-        else {
-            panic!("Ruby factory return type lookup should complete");
-        };
-        assert_eq!(resolution.fqn, "Service");
-        assert_eq!(
-            resolution.target_kind,
-            TypeLookupTargetKind::ValueExpression
-        );
-    }
-
-    #[test]
-    fn bounded_factory_return_flows_through_a_plain_local_assignment() {
-        let source = r#"
-class Service
-  def run
-  end
-end
-
-class Factory
-  def self.make_service
-    service = Service.new
-    return service
-  end
-end
-
-def invoke
-  made = Factory.make_service
-  made.run
-end
-"#
-        .to_string();
-        let fixture =
-            AnalyzerFixture::new_for_language(Language::Ruby, &[("factory_local.rb", &source)]);
-        let file = ProjectFile::new(fixture.project_root(), "factory_local.rb");
-        let tree = parse_ruby_tree(&source).expect("Ruby tree");
-        let call_start = source.rfind("made.run").expect("local member call");
-        let member_start = call_start + "made.".len();
-        let line = source[..member_start]
-            .bytes()
-            .filter(|byte| *byte == b'\n')
-            .count();
-        let site = ResolvedReferenceSite {
-            path: rel_path_string(&file),
-            text: "run".to_string(),
-            range: Range {
-                start_byte: member_start,
-                end_byte: member_start + "run".len(),
-                start_line: line,
-                end_line: line,
-            },
-            focus_start_byte: member_start,
-            focus_end_byte: member_start + "run".len(),
-        };
-
-        let outcome = resolve_ruby_bounded(
-            fixture.analyzer.analyzer(),
-            &file,
-            &source,
-            Some(&tree),
-            &site,
-            ReceiverAnalysisBudget::default(),
-            None,
-        );
-        let BoundedResolution::Complete { value, .. } = outcome else {
-            panic!("Ruby factory-local member lookup should complete");
-        };
-        assert!(
-            matches!(
-                value.definitions.as_slice(),
-                [definition] if definition.fq_name() == "Service.run"
-            ),
-            "{value:#?}"
-        );
+        let resolved = context.expression_receiver_type(expression_node).is_some();
+        session.finish(resolved)
     }
 
     #[test]
     fn bounded_factory_return_uses_exact_limited_parent_owner() {
         let source = r#"
-module Outer
-  class Factory
-    class Product
-      def run
+    module Outer
+      class Factory
+        class Product
+          def run
+          end
+        end
+
+        def self.make
+          Product.new
+        end
       end
     end
 
-    def self.make
-      Product.new
-    end
-  end
-end
-
-module Unrelated
-  class Factory
-    class Product
-      def run
+    module Unrelated
+      class Factory
+        class Product
+          def run
+          end
+        end
       end
     end
-  end
-end
 
-def invoke
-  Outer::Factory.make.run
-end
-"#
+    def invoke
+      Outer::Factory.make.run
+    end
+    "#
         .to_string();
         let fixture =
             AnalyzerFixture::new_for_language(Language::Ruby, &[("nested_factory.rb", &source)]);
@@ -3479,6 +3257,51 @@ end
     }
 
     #[test]
+    fn parenthesized_receiver_unwrap_is_fully_budgeted_and_cancellable() {
+        let BoundedResolution::Complete {
+            value: true,
+            work: shallow_work,
+        } = parenthesized_receiver_outcome(1, ReceiverAnalysisBudget::default(), None)
+        else {
+            panic!("shallow parenthesized Ruby receiver should resolve");
+        };
+        let BoundedResolution::Complete {
+            value: true,
+            work: deep_work,
+        } = parenthesized_receiver_outcome(256, ReceiverAnalysisBudget::default(), None)
+        else {
+            panic!("deep parenthesized Ruby receiver should resolve iteratively");
+        };
+        assert!(
+            deep_work.scope_nodes >= shallow_work.scope_nodes + 255,
+            "each parenthesis transition must be charged: shallow={shallow_work:?}, deep={deep_work:?}"
+        );
+
+        let budget = ReceiverAnalysisBudget {
+            max_scope_nodes: deep_work.scope_nodes.saturating_sub(1),
+            ..ReceiverAnalysisBudget::default()
+        };
+        assert!(matches!(
+            parenthesized_receiver_outcome(256, budget, None),
+            BoundedResolution::Exceeded {
+                limit: ReceiverBudgetLimit::ScopeNodes,
+                work,
+            } if work.scope_nodes == budget.max_scope_nodes
+        ));
+
+        let cancellation =
+            CancellationToken::cancel_after_checks_for_test(shallow_work.scope_nodes + 16);
+        assert!(matches!(
+            parenthesized_receiver_outcome(
+                256,
+                ReceiverAnalysisBudget::default(),
+                Some(&cancellation),
+            ),
+            BoundedResolution::Cancelled { .. }
+        ));
+    }
+
+    #[test]
     fn bounded_constant_path_walk_is_iterative_and_budgeted() {
         let expected = (0..128)
             .map(|index| format!("Namespace{index}"))
@@ -3526,147 +3349,5 @@ end
                 work,
             } if work.scope_nodes == budget.max_scope_nodes
         ));
-    }
-
-    #[test]
-    fn bounded_definition_lookup_stops_at_scope_budget() {
-        let (fixture, file, source, tree, site) = wide_deep_member_fixture();
-        let budget = ReceiverAnalysisBudget::tiny();
-        let outcome = resolve_ruby_bounded(
-            fixture.analyzer.analyzer(),
-            &file,
-            &source,
-            Some(&tree),
-            &site,
-            budget,
-            None,
-        );
-
-        assert!(matches!(
-            outcome,
-            BoundedResolution::Exceeded {
-                limit: ReceiverBudgetLimit::ScopeNodes,
-                work,
-            } if work.scope_nodes == budget.max_scope_nodes
-        ));
-    }
-
-    #[test]
-    fn bounded_definition_lookup_stops_on_cancellation() {
-        let (fixture, file, source, tree, site) = wide_deep_member_fixture();
-        let cancellation = CancellationToken::cancel_after_checks_for_test(12);
-        let outcome = resolve_ruby_bounded(
-            fixture.analyzer.analyzer(),
-            &file,
-            &source,
-            Some(&tree),
-            &site,
-            ReceiverAnalysisBudget::default(),
-            Some(&cancellation),
-        );
-
-        assert!(matches!(outcome, BoundedResolution::Cancelled { .. }));
-    }
-
-    fn parenthesized_receiver_outcome(
-        depth: usize,
-        budget: ReceiverAnalysisBudget,
-        cancellation: Option<&CancellationToken>,
-    ) -> BoundedResolution<bool> {
-        let expression = format!("{}Service{}", "(".repeat(depth), ")".repeat(depth));
-        let source = format!("class Service\nend\n{expression}\n");
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Ruby,
-            &[("parenthesized_receiver.rb", &source)],
-        );
-        let file = ProjectFile::new(fixture.project_root(), "parenthesized_receiver.rb");
-        let tree = parse_ruby_tree(&source).expect("Ruby tree");
-        let expression_node = tree
-            .root_node()
-            .named_child(tree.root_node().named_child_count().saturating_sub(1))
-            .expect("parenthesized receiver expression");
-        let session = ResolutionSession::bounded(budget, cancellation);
-        let ruby =
-            resolve_analyzer::<RubyAnalyzer>(fixture.analyzer.analyzer()).expect("Ruby analyzer");
-        let support = RubyDefinitionProvider::new(ruby, &session);
-        let context = BoundedRubyLookupContext::build(
-            &support,
-            &file,
-            &source,
-            tree.root_node(),
-            expression_node.start_byte(),
-        );
-        let resolved = context.expression_receiver_type(expression_node).is_some();
-        session.finish(resolved)
-    }
-
-    #[test]
-    fn parenthesized_receiver_unwrap_is_fully_budgeted_and_cancellable() {
-        let BoundedResolution::Complete {
-            value: true,
-            work: shallow_work,
-        } = parenthesized_receiver_outcome(1, ReceiverAnalysisBudget::default(), None)
-        else {
-            panic!("shallow parenthesized Ruby receiver should resolve");
-        };
-        let BoundedResolution::Complete {
-            value: true,
-            work: deep_work,
-        } = parenthesized_receiver_outcome(256, ReceiverAnalysisBudget::default(), None)
-        else {
-            panic!("deep parenthesized Ruby receiver should resolve iteratively");
-        };
-        assert!(
-            deep_work.scope_nodes >= shallow_work.scope_nodes + 255,
-            "each parenthesis transition must be charged: shallow={shallow_work:?}, deep={deep_work:?}"
-        );
-
-        let budget = ReceiverAnalysisBudget {
-            max_scope_nodes: deep_work.scope_nodes.saturating_sub(1),
-            ..ReceiverAnalysisBudget::default()
-        };
-        assert!(matches!(
-            parenthesized_receiver_outcome(256, budget, None),
-            BoundedResolution::Exceeded {
-                limit: ReceiverBudgetLimit::ScopeNodes,
-                work,
-            } if work.scope_nodes == budget.max_scope_nodes
-        ));
-
-        let cancellation =
-            CancellationToken::cancel_after_checks_for_test(shallow_work.scope_nodes + 16);
-        assert!(matches!(
-            parenthesized_receiver_outcome(
-                256,
-                ReceiverAnalysisBudget::default(),
-                Some(&cancellation),
-            ),
-            BoundedResolution::Cancelled { .. }
-        ));
-    }
-
-    #[test]
-    fn reference_focus_only_lifts_direct_constants_and_constructors() {
-        fn focused_target(source: &str) -> String {
-            let tree = parse_ruby_tree(source).expect("Ruby tree");
-            let start_byte = source.rfind("call").expect("call");
-            let site = ResolvedReferenceSite {
-                path: "focus.rb".to_owned(),
-                text: "call".to_owned(),
-                range: Range {
-                    start_byte,
-                    end_byte: start_byte + 4,
-                    start_line: 1,
-                    end_line: 1,
-                },
-                focus_start_byte: start_byte,
-                focus_end_byte: start_byte + 4,
-            };
-            ruby_site_for_focus(site, &tree, source).text
-        }
-
-        assert_eq!(focused_target("Widget.call\n"), "Widget.call");
-        assert_eq!(focused_target("Widget.new.call\n"), "Widget#call");
-        assert_eq!(focused_target("Widget.factory.call\n"), "call");
     }
 }

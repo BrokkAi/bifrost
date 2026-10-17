@@ -14,13 +14,13 @@
 use std::{error::Error, fmt};
 
 use crate::analyzer::semantic::{
-    IcfgNodeId, IcfgProvider, IcfgSnapshot, ProcedureHandle, ProgramPointHandle, SemanticBudget,
-    SemanticWork,
+    IcfgNodeId, IcfgProvider, IcfgSnapshot, OracleLimits, ProcedureHandle, ProgramPointHandle,
+    SemanticBudget, SemanticWork,
 };
 use crate::dataflow::{
     DataflowDirection, DataflowDirectionCapabilities, DataflowDirectionEstimate,
     DataflowDirectionPlan, DataflowDirectionPlanningError, DataflowDirectionRequirements,
-    DataflowRequest, IcfgSolveInput, NormalizedWitnessAvailability,
+    DataflowRequest, IcfgInputStatus, IcfgSolveInput, NormalizedWitnessAvailability,
     NormalizedWitnessUnavailableReason, PathQualityFrontier, PlannedDataflowCompletion,
     PlannedDataflowResult, SnapshotReplayProvider, WitnessRetentionLimits,
     plan_snapshot_dataflow_direction, snapshot_node_ids_for_points,
@@ -59,16 +59,21 @@ impl ValueFlowSnapshotObservationBindings {
     }
 
     pub fn source_nodes_for(&self, source: ValueFlowSourceId) -> Option<&[IcfgNodeId]> {
-        self.sources
-            .iter()
-            .find_map(|(candidate, nodes)| (*candidate == source).then_some(nodes.as_ref()))
+        observation_nodes_for(&self.sources, source)
     }
 
     pub fn sink_nodes_for(&self, sink: ValueFlowSinkId) -> Option<&[IcfgNodeId]> {
-        self.sinks
-            .iter()
-            .find_map(|(candidate, nodes)| (*candidate == sink).then_some(nodes.as_ref()))
+        observation_nodes_for(&self.sinks, sink)
     }
+}
+
+fn observation_nodes_for<I: Copy + PartialEq>(
+    bindings: &[(I, Box<[IcfgNodeId]>)],
+    id: I,
+) -> Option<&[IcfgNodeId]> {
+    bindings
+        .iter()
+        .find_map(|(candidate, nodes)| (*candidate == id).then_some(nodes.as_ref()))
 }
 
 /// Value-flow-specific direction plan and its shared-snapshot observation
@@ -147,7 +152,8 @@ impl ValueFlowCanonicalMeeting {
 
 /// Direction-specific value-flow evidence retained by a planned solve.
 ///
-/// Forward evidence remains the existing reusable-summary result.  Backward
+/// Forward evidence retains summary results, including query-local contextual
+/// capture execution. Backward
 /// evidence retains the native root-scoped snapshot result and reverse-call
 /// index; it is never coerced into a summary result.
 #[derive(Debug, Clone)]
@@ -237,6 +243,7 @@ pub fn solve_value_flow_planned<Provider>(
     input: IcfgSolveInput<'_>,
     snapshot_work: SemanticWork,
     witness_retention: WitnessRetentionLimits,
+    oracle_limits: OracleLimits,
     semantic_budget: &mut SemanticBudget,
     request: &mut DataflowRequest<'_>,
 ) -> Result<ValueFlowPlannedResult, ValueFlowPlannedSolveError>
@@ -252,6 +259,7 @@ where
             input,
             snapshot_work,
             witness_retention,
+            oracle_limits,
             semantic_budget,
             request,
         ),
@@ -296,7 +304,7 @@ pub fn solve_value_flow_planned_backward(
     Ok(PlannedDataflowResult::new(
         direction_plan.dataflow_plan(),
         snapshot_work,
-        native.work(),
+        result.work(),
         completion,
         findings,
         ValueFlowPlannedEvidence::Backward(result),
@@ -308,9 +316,10 @@ pub fn solve_value_flow_planned_backward(
 
 /// Solve the selected forward value-flow direction over the supplied input.
 ///
-/// The summary solver still owns forward summary semantics, but its provider
-/// is wrapped so the root snapshot is replayed from `input` at zero semantic
-/// snapshot work. Other semantic queries continue to the supplied provider.
+/// Native argument-callable proof selects contextual summary capture execution
+/// under the supplied oracle limits. Other inputs retain ordinary summary
+/// execution. Both routes replay the paid root snapshot and retain its status;
+/// projection selection, capture projection, and propagation share one budget.
 #[allow(clippy::too_many_arguments)]
 pub fn solve_value_flow_planned_forward<Provider>(
     direction_plan: &ValueFlowDirectionPlan,
@@ -320,6 +329,7 @@ pub fn solve_value_flow_planned_forward<Provider>(
     input: IcfgSolveInput<'_>,
     snapshot_work: SemanticWork,
     witness_retention: WitnessRetentionLimits,
+    oracle_limits: OracleLimits,
     semantic_budget: &mut SemanticBudget,
     request: &mut DataflowRequest<'_>,
 ) -> Result<ValueFlowPlannedResult, ValueFlowPlannedSolveError>
@@ -340,20 +350,46 @@ where
     {
         return Err(ValueFlowPlannedSolveError::WitnessRetentionRequired);
     }
-    let replay = SnapshotReplayProvider::new(provider, input);
-    let summary = super::client::solve_value_flow_with_witnesses(
-        root,
-        &replay,
-        plan,
-        witness_retention,
-        semantic_budget,
-        request,
-    )?;
+    if root != plan.root() {
+        return Err(ValueFlowSolveError::RootMismatch.into());
+    }
+    let initial_work = request.budget.used();
+    let mut has_argument_captures = plan.has_contextual_bindings();
+    for node in input.snapshot().nodes() {
+        super::client::charge_capture_projection(request).map_err(ValueFlowSolveError::from)?;
+        if node.argument_callable().is_some() {
+            has_argument_captures = true;
+            break;
+        }
+    }
+    let mut summary = if has_argument_captures {
+        super::client::solve_value_flow_summaries_on_snapshot(
+            provider,
+            plan,
+            input,
+            oracle_limits,
+            witness_retention,
+            semantic_budget,
+            request,
+        )?
+    } else {
+        let replay = SnapshotReplayProvider::new(provider, input);
+        super::client::solve_value_flow_with_witnesses(
+            root,
+            &replay,
+            plan,
+            witness_retention,
+            semantic_budget,
+            request,
+        )?
+    };
+    summary.set_query_work(request.budget.used().saturating_sub(initial_work));
     adapt_value_flow_summary_result_with_witness_retention(
         direction_plan,
         summary,
         witness_retention,
         snapshot_work,
+        input.status(),
     )
 }
 
@@ -371,6 +407,7 @@ pub fn adapt_value_flow_summary_result(
         summary,
         WitnessRetentionLimits::disabled(),
         SemanticWork::default(),
+        IcfgInputStatus::Complete,
     )
 }
 
@@ -379,6 +416,7 @@ fn adapt_value_flow_summary_result_with_witness_retention(
     summary: ValueFlowSummaryResult,
     witness_retention: WitnessRetentionLimits,
     snapshot_work: SemanticWork,
+    input_status: IcfgInputStatus,
 ) -> Result<ValueFlowPlannedResult, ValueFlowPlannedSolveError> {
     if direction_plan.direction() != DataflowDirection::Forward {
         return Err(ValueFlowPlannedSolveError::wrong_direction(
@@ -389,7 +427,7 @@ fn adapt_value_flow_summary_result_with_witness_retention(
     let native = summary.result();
     let findings = canonical_summary_findings(summary.meetings());
     let completion = PlannedDataflowCompletion::new(
-        native.coverage().semantic_status(),
+        input_status.merge(native.coverage().semantic_status()),
         native.termination(),
         summary.is_complete(),
     );
@@ -418,16 +456,12 @@ fn adapt_value_flow_summary_result_with_witness_retention(
 fn reject_unsupported_output_contract(
     direction_plan: &ValueFlowDirectionPlan,
 ) -> Result<(), ValueFlowPlannedSolveError> {
-    let requirements = direction_plan.dataflow_plan().requirements();
-    if requirements.reusable_summaries {
-        return Err(ValueFlowPlannedSolveError::UnsupportedOutputContract {
-            capability: crate::dataflow::DataflowDirectionCapability::ReusableSummaries,
-        });
-    }
-    if requirements.normalized_witnesses {
-        return Err(ValueFlowPlannedSolveError::UnsupportedOutputContract {
-            capability: crate::dataflow::DataflowDirectionCapability::NormalizedWitnesses,
-        });
+    if let Some(capability) = direction_plan
+        .dataflow_plan()
+        .requirements()
+        .unsupported_backward_output()
+    {
+        return Err(ValueFlowPlannedSolveError::UnsupportedOutputContract { capability });
     }
     Ok(())
 }
@@ -435,37 +469,57 @@ fn reject_unsupported_output_contract(
 fn canonical_summary_findings(
     meetings: &[super::ValueFlowMeeting],
 ) -> Box<[ValueFlowCanonicalMeeting]> {
-    let findings = meetings
-        .iter()
-        .map(|meeting| ValueFlowCanonicalMeeting {
-            source: meeting.source(),
-            sink: meeting.sink(),
-            path_qualities: meeting.path_qualities(),
-            may: meeting.may_status(),
-            uncertain: meeting.is_uncertain(),
-        })
-        .collect::<Vec<_>>();
-    canonicalize_findings(findings)
+    canonicalize_findings_from(meetings, |meeting| {
+        canonical_meeting(
+            meeting.source(),
+            meeting.sink(),
+            meeting.path_qualities(),
+            meeting.may_status(),
+            meeting.is_uncertain(),
+        )
+    })
 }
 
 fn canonical_backward_findings(
     meetings: &[super::BackwardValueFlowMeeting],
 ) -> Box<[ValueFlowCanonicalMeeting]> {
-    let findings = meetings
-        .iter()
-        .map(|meeting| ValueFlowCanonicalMeeting {
-            source: meeting.source(),
-            sink: meeting.sink(),
-            path_qualities: meeting.path_qualities(),
-            may: if meeting.is_uncertain() {
+    canonicalize_findings_from(meetings, |meeting| {
+        let uncertain = meeting.is_uncertain();
+        canonical_meeting(
+            meeting.source(),
+            meeting.sink(),
+            meeting.path_qualities(),
+            if uncertain {
                 ValueFlowMayStatus::Unproven
             } else {
                 ValueFlowMayStatus::Proven
             },
-            uncertain: meeting.is_uncertain(),
-        })
-        .collect::<Vec<_>>();
-    canonicalize_findings(findings)
+            uncertain,
+        )
+    })
+}
+
+fn canonical_meeting(
+    source: ValueFlowSourceId,
+    sink: ValueFlowSinkId,
+    path_qualities: PathQualityFrontier,
+    may: ValueFlowMayStatus,
+    uncertain: bool,
+) -> ValueFlowCanonicalMeeting {
+    ValueFlowCanonicalMeeting {
+        source,
+        sink,
+        path_qualities,
+        may,
+        uncertain,
+    }
+}
+
+fn canonicalize_findings_from<T>(
+    meetings: &[T],
+    to_finding: impl FnMut(&T) -> ValueFlowCanonicalMeeting,
+) -> Box<[ValueFlowCanonicalMeeting]> {
+    canonicalize_findings(meetings.iter().map(to_finding).collect())
 }
 
 fn canonicalize_findings(
@@ -640,27 +694,4 @@ fn bind_observations(
         source_nodes: source_nodes.into_boxed_slice(),
         sink_nodes: sink_nodes.into_boxed_slice(),
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn bindings_expose_context_nodes_by_observation_id() {
-        let source = ValueFlowSourceId::new(2);
-        let sink = ValueFlowSinkId::new(3);
-        let source_node = IcfgNodeId::new(5);
-        let sink_node = IcfgNodeId::new(8);
-        let bindings = ValueFlowSnapshotObservationBindings {
-            sources: Box::new([(source, Box::new([source_node]))]),
-            sinks: Box::new([(sink, Box::new([sink_node]))]),
-            source_nodes: Box::new([source_node]),
-            sink_nodes: Box::new([sink_node]),
-        };
-        assert_eq!(bindings.source_nodes_for(source), Some(&[source_node][..]));
-        assert_eq!(bindings.sink_nodes_for(sink), Some(&[sink_node][..]));
-        assert_eq!(bindings.source_nodes(), &[source_node]);
-        assert_eq!(bindings.sink_nodes(), &[sink_node]);
-    }
 }

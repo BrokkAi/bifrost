@@ -16,14 +16,14 @@ test("normalizes capability order and builds existing Bifrost toolsets", () => {
     normalizeCapabilities(["text", "policies", "symbols", "quality", "symbols", "unknown"]),
     ["symbols", "policies", "quality", "text"],
   );
-  assert.equal(serverToolsetExpression(["symbols"]), "symbol|slopcop");
+  assert.equal(serverToolsetExpression(["symbols"]), "symbol|diff|slopcop");
   assert.equal(
     serverToolsetExpression(DEFAULT_BIFROST_CAPABILITIES),
-    "symbol|extended|slopcop",
+    "symbol|extended|diff|slopcop",
   );
   assert.equal(
     serverToolsetExpression(["symbols", "query", "files", "quality"]),
-    "symbol|extended|slopcop",
+    "symbol|extended|diff|slopcop",
   );
   assert.equal(serverToolsetExpression([]), "");
 });

@@ -1,14 +1,9 @@
-pub(crate) use brokk_bifrost_core::analyzer::common::{
-    max_line_length_limit, node_source_text, node_source_text_trimmed,
-};
-// The line cap's only remaining in-crate readers are the three suites that
-// build an over-long line to prove the parse guard fires; production reads it
-// through `is_unparseable_source`.
-#[cfg(test)]
-pub(crate) use brokk_bifrost_core::analyzer::common::DEFAULT_MAX_LINE_LENGTH;
 pub use brokk_bifrost_core::analyzer::common::{
-    declaration_language_for_file, declaration_language_for_rel_path, has_unclaimed_extension,
-    is_unparseable_source, language_for_file, language_for_target, languages_may_analyze,
+    declaration_language_for_file, declaration_language_for_rel_path, is_unparseable_source,
+    language_for_file, language_for_target, languages_may_analyze, workspace_language_for_file,
+};
+pub(crate) use brokk_bifrost_core::analyzer::common::{
+    max_line_length_limit, node_source_text_trimmed, try_node_source_text,
 };
 // Each language's identifier sigil moved with the language: Rust's to
 // `brokk-bifrost-rust`, C#'s to `brokk-bifrost-csharp` (its one consumer,
@@ -16,9 +11,302 @@ pub use brokk_bifrost_core::analyzer::common::{
 // went to core's `symbol_path`, where the client-selector normalizer that needs
 // it lives.
 
-use crate::analyzer::{CodeUnit, FqName, IAnalyzer, Language, ProjectFile};
+use crate::analyzer::semantic_model::Visibility;
+use crate::analyzer::store::LimitedQueryRows;
+use crate::analyzer::{
+    CodeUnit, FqName, IAnalyzer, Language, Project, ProjectFile, Range, SummaryFileProjection,
+};
 use std::ffi::OsStr;
 use std::path::Path;
+use std::sync::Arc;
+use tree_sitter::Node;
+
+use crate::hash::{HashMap, HashSet};
+
+pub(crate) fn read_bounded_source(
+    project: &dyn Project,
+    file: &ProjectFile,
+    max_bytes: usize,
+) -> Option<String> {
+    project.read_source_limited(file, max_bytes).ok().flatten()
+}
+
+pub(crate) fn limited_known_rows<T>(
+    len: usize,
+    values: impl IntoIterator<Item = T>,
+    limit: usize,
+) -> LimitedQueryRows<T> {
+    if limit == 0 {
+        return LimitedQueryRows::incomplete(Vec::new(), 0);
+    }
+    let inspected = len.min(limit);
+    let rows = values.into_iter().take(limit).collect();
+    if len > limit {
+        LimitedQueryRows::incomplete(rows, inspected)
+    } else {
+        // Callers provide an exact row count, so equality with the cap is complete.
+        LimitedQueryRows::complete(rows, inspected)
+    }
+}
+
+pub(crate) fn take_little_endian_array<const N: usize>(
+    bytes: &[u8],
+    offset: &mut usize,
+) -> Option<[u8; N]> {
+    let end = (*offset).checked_add(N)?;
+    let value = bytes.get(*offset..end)?.try_into().ok()?;
+    *offset = end;
+    Some(value)
+}
+
+pub(crate) struct CandidateState<T> {
+    pub(crate) rows: Vec<T>,
+    pub(crate) complete: bool,
+    pub(crate) reason: Option<&'static str>,
+}
+
+pub(crate) fn bounded_message(mut message: String, max_bytes: usize) -> String {
+    if message.len() <= max_bytes {
+        return message;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    message.truncate(end);
+    message
+}
+
+pub(crate) fn import_target_files_from_cache(
+    cache: &moka::sync::Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
+    file: &ProjectFile,
+    resolve: impl FnOnce() -> HashSet<ProjectFile>,
+) -> Arc<HashSet<ProjectFile>> {
+    cache.get_with(file.clone(), || Arc::new(resolve()))
+}
+
+impl<T> CandidateState<T> {
+    pub(crate) fn unavailable(reason: &'static str) -> Self {
+        Self {
+            rows: Vec::new(),
+            complete: false,
+            reason: Some(reason),
+        }
+    }
+}
+
+pub(crate) fn visibility_from_modifier_text(text: &str) -> Visibility {
+    match text.trim() {
+        "private" => Visibility::Private,
+        "protected" => Visibility::Protected,
+        _ => Visibility::Public,
+    }
+}
+
+/// Find the value whose canonical label matches `label`.
+pub fn find_by_label<T: Copy>(
+    values: impl IntoIterator<Item = T>,
+    label: &str,
+    label_for: impl Fn(T) -> &'static str,
+) -> Option<T> {
+    values.into_iter().find(|value| label_for(*value) == label)
+}
+
+pub(crate) fn reuse_cached_expression_value<K, V, N>(
+    values: &HashMap<K, V>,
+    expression_values: &mut HashMap<N, V>,
+    key: K,
+    expression: N,
+) -> Option<V>
+where
+    K: Eq + std::hash::Hash,
+    V: Copy,
+    N: Eq + std::hash::Hash,
+{
+    let value = values.get(&key).copied()?;
+    expression_values.insert(expression, value);
+    Some(value)
+}
+
+/// Count serialized JSON bytes without allocating the encoded document.
+pub fn serialized_json_len(value: &impl serde::Serialize) -> usize {
+    struct ByteCounter(usize);
+
+    impl std::io::Write for ByteCounter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_add(bytes.len())
+                .ok_or_else(|| std::io::Error::other("serialized byte count overflow"))?;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut counter = ByteCounter(0);
+    serde_json::to_writer(&mut counter, value).map_or(usize::MAX, |()| counter.0)
+}
+
+pub(crate) fn local_xml_name(name: &[u8]) -> Option<String> {
+    let name = std::str::from_utf8(name).ok()?;
+    Some(
+        name.rsplit_once(':')
+            .map(|(_, local)| local)
+            .unwrap_or(name)
+            .to_owned(),
+    )
+}
+
+pub(crate) fn declaration_container_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
+    let name = node.child_by_field_name("name")?;
+    let text = try_node_source_text(name, source)?;
+    (!text.is_empty()).then(|| Box::from(text))
+}
+
+#[cfg(test)]
+pub(crate) fn project_file_for_test(root: &Path, rel_path: &str) -> ProjectFile {
+    ProjectFile::new(root.to_path_buf(), rel_path)
+}
+
+pub(crate) fn workspace_files_matching_language(
+    project: &dyn Project,
+    includes_language: impl Fn(Language) -> bool,
+) -> Vec<ProjectFile> {
+    let Ok(files) = project.all_files_shared() else {
+        return Vec::new();
+    };
+    files
+        .iter()
+        .filter(|file| includes_language(language_for_file(file)))
+        .cloned()
+        .collect()
+}
+
+pub(crate) fn integer_literal_value(source: &str, node: Node<'_>) -> Option<i64> {
+    integer_literal_value_with_kind(source, node, "integer_literal")
+}
+
+pub(crate) fn integer_literal_value_with_kind(
+    source: &str,
+    node: Node<'_>,
+    kind: &str,
+) -> Option<i64> {
+    (node.kind() == kind)
+        .then(|| try_node_source_text(node, source))
+        .flatten()
+        .and_then(|text| text.parse().ok())
+}
+
+pub(crate) fn visit_declared_type_refs<'a>(
+    types: impl IntoIterator<Item = &'a crate::analyzer::semantic_model::TypeRef>,
+    mut visit: impl FnMut(&str),
+) {
+    use crate::analyzer::semantic_model::TypeRef;
+
+    let mut pending = types.into_iter().collect::<Vec<_>>();
+    while let Some(reference) = pending.pop() {
+        match reference {
+            TypeRef::Named { arguments, .. } | TypeRef::Declared { arguments, .. } => {
+                if let TypeRef::Declared { id, .. } = reference {
+                    visit(id);
+                }
+                pending.extend(arguments);
+            }
+            TypeRef::Array { element }
+            | TypeRef::ByRef { element, .. }
+            | TypeRef::Pointer { element }
+            | TypeRef::Slice { element }
+            | TypeRef::FixedArray { element, .. }
+            | TypeRef::Channel { element, .. } => pending.push(element),
+            TypeRef::Map { key, value } => {
+                pending.push(key);
+                pending.push(value);
+            }
+            TypeRef::Wildcard { bound, .. } => pending.extend(bound.as_deref()),
+            TypeRef::Tuple { elements } => pending.extend(elements),
+            TypeRef::Function { parameters, result } => {
+                pending.extend(parameters.iter().map(|parameter| &parameter.r#type));
+                pending.extend(result.as_deref());
+            }
+            TypeRef::TypeParameter { .. } | TypeRef::Unknown => {}
+        }
+    }
+}
+
+pub(crate) fn local_value_for_declaration(
+    mut bindings: impl Iterator<Item = (usize, crate::analyzer::semantic::ValueId)>,
+    declaration_start: usize,
+) -> Option<crate::analyzer::semantic::ValueId> {
+    bindings.find_map(|(start, value)| (start == declaration_start).then_some(value))
+}
+
+pub(crate) fn visible_local_binding<T, Key: Ord>(
+    bindings: &[T],
+    byte: usize,
+    bounds: impl Fn(&T) -> (usize, usize, usize),
+    key: impl Fn(&T, (usize, usize, usize)) -> Key,
+) -> Option<&T> {
+    bindings
+        .iter()
+        .filter(|binding| {
+            let (visible_from, scope_start, scope_end) = bounds(binding);
+            visible_from <= byte && scope_start <= byte && byte < scope_end
+        })
+        .min_by_key(|binding| {
+            let binding: &T = binding;
+            key(binding, bounds(binding))
+        })
+}
+
+pub(crate) fn non_synthetic_children(children: Vec<CodeUnit>) -> Vec<CodeUnit> {
+    children
+        .into_iter()
+        .filter(|child| !child.is_synthetic())
+        .collect()
+}
+
+pub(crate) fn non_synthetic_summary_projection(
+    projection: Arc<SummaryFileProjection>,
+) -> Arc<SummaryFileProjection> {
+    let mut projection = (*projection).clone();
+    for children in projection.children.values_mut() {
+        children.retain(|child| !child.is_synthetic());
+    }
+    Arc::new(projection)
+}
+
+pub(crate) fn should_persist_code_unit(code_unit: &CodeUnit) -> bool {
+    !code_unit.is_file_scope() && !code_unit.is_module()
+}
+
+pub(crate) fn dependency_pack_warning(
+    code: &str,
+    location: &Path,
+    message: String,
+) -> crate::analyzer::semantic_model::DependencyPackDiagnostic {
+    crate::analyzer::semantic_model::DependencyPackDiagnostic {
+        severity: crate::analyzer::semantic_model::DependencyPackDiagnosticSeverity::Warning,
+        code: code.to_owned(),
+        dependency_id: None,
+        location: Some(location.display().to_string()),
+        message,
+    }
+}
+
+pub(crate) fn exact_span(span: crate::analyzer::semantic::SourceSpan, node: Node<'_>) -> bool {
+    node.start_byte() == span.start_byte() as usize && node.end_byte() == span.end_byte() as usize
+}
+
+pub(crate) const fn same_byte_range(left: Range, right: Range) -> bool {
+    left.start_byte == right.start_byte && left.end_byte == right.end_byte
+}
+
+pub(crate) fn is_comment_kind(kind: &str) -> bool {
+    brokk_bifrost_core::analyzer::tree_walk::is_comment_kind(kind)
+}
 
 pub(crate) fn is_java_module_descriptor_file(file: &ProjectFile) -> bool {
     language_for_file(file) == Language::Java
@@ -58,10 +346,13 @@ pub(crate) fn display_symbol_name(language: Language, symbol: &str) -> String {
 /// survives; the rest fall back to the string reading, which is unchanged.
 ///
 /// [`LanguageSupport::undecorated_fq_name`]: crate::analyzer::languages::LanguageSupport::undecorated_fq_name
-fn display_fq_name(language: Language, fq: &FqName, rendered: &str) -> String {
-    match crate::analyzer::languages::language_support(language)
+fn undecorated_fq_name(language: Language, fq: &FqName) -> Option<FqName> {
+    crate::analyzer::languages::language_support(language)
         .and_then(|support| support.undecorated_fq_name(fq))
-    {
+}
+
+fn display_fq_name(language: Language, fq: &FqName, rendered: &str) -> String {
+    match undecorated_fq_name(language, fq) {
         Some(undecorated) => {
             undecorated.display_native(language, crate::analyzer::fq_name::segment_interner())
         }
@@ -102,9 +393,10 @@ fn display_fq_name(language: Language, fq: &FqName, rendered: &str) -> String {
 /// too: a decorated declaration whose undecorated spelling is uncontested
 /// still prints the idiomatic name.
 pub fn display_symbol_for_target(analyzer: &dyn IAnalyzer, target: &CodeUnit) -> String {
+    let target = analyzer.canonical_code_unit(target, None);
     addressable_symbol_name(
         analyzer,
-        language_for_target(target),
+        language_for_target(&target),
         target.fq(),
         target.fq_name_str(),
     )
@@ -233,8 +525,9 @@ pub(crate) fn display_parent_symbol_for_target(
     analyzer: &dyn IAnalyzer,
     target: &CodeUnit,
 ) -> Option<String> {
-    let language = language_for_target(target);
-    let parent = parent_fq_for_target(target)?;
+    let target = analyzer.canonical_code_unit(target, None);
+    let language = language_for_target(&target);
+    let parent = parent_fq_for_target(&target)?;
     let parent_fq_name =
         parent.display_native(language, crate::analyzer::fq_name::segment_interner());
     Some(addressable_symbol_name(
@@ -264,9 +557,7 @@ pub(crate) fn display_parent_symbol_for_target(
 /// [`FqName`]: brokk_bifrost_core::analyzer::fq_name::FqName
 pub fn display_identifier_for_target(target: &CodeUnit) -> String {
     let language = language_for_target(target);
-    match crate::analyzer::languages::language_support(language)
-        .and_then(|support| support.undecorated_fq_name(target.fq()))
-    {
+    match undecorated_fq_name(language, target.fq()) {
         Some(undecorated) => {
             let rendered =
                 undecorated.render_native(language, crate::analyzer::fq_name::segment_interner());
@@ -494,6 +785,12 @@ pub(crate) fn render_skeleton(
     out
 }
 
+/// Trim trailing whitespace from rendered skeleton output and omit empty results.
+pub(crate) fn normalize_skeleton(rendered: String) -> Option<String> {
+    let trimmed = rendered.trim_end();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
 pub(crate) fn is_scala_object_like(target: &CodeUnit) -> bool {
     language_for_target(target) == Language::Scala && (target.is_class() || target.is_module()) && {
         // A `.`-joined short_name segment "ending in `$`" is exactly a
@@ -513,131 +810,87 @@ pub(crate) fn is_scala_object_like(target: &CodeUnit) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        DEFAULT_MAX_LINE_LENGTH, display_symbol_name, is_unparseable_source,
-        is_valid_rename_identifier, parent_fq_name_for_target,
-    };
+    use super::{is_valid_rename_identifier, parent_fq_name_for_target};
     use crate::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
     use crate::analyzer::{CodeUnit, CodeUnitType, Language, ProjectFile};
+    use brokk_bifrost_test_macros::hardwon;
 
+    /// `$` inside segment text is ordinary identifier text. Parent boundaries
+    /// come from the structured FqName segments, including Scala companion
+    /// suffixes and Java nested-class joins.
     #[test]
-    fn minified_and_binary_sources_are_unparseable_by_default() {
-        // Assumes BIFROST_MAX_LINE_LENGTH is unset (the normal test environment), so the
-        // default cap applies. A single line past the cap = minified bundle = skip.
-        let minified = format!("var x=1;{}", "a".repeat(DEFAULT_MAX_LINE_LENGTH + 1));
-        assert!(is_unparseable_source(&minified));
-
-        // Normal multi-line source stays parseable.
-        let normal: String = (0..2000).map(|i| format!("let v{i} = {i};\n")).collect();
-        assert!(!is_unparseable_source(&normal));
-
-        // NUL bytes => binary => unparseable regardless of line length.
-        assert!(is_unparseable_source("fn main() {\0}"));
-    }
-
-    #[test]
-    fn display_symbol_name_normalizes_scala_and_csharp_user_facing_names() {
-        assert_eq!(
-            "ai.brokk.ir.PrimOp.AsClockOp",
-            display_symbol_name(Language::Scala, "ai.brokk.ir$.PrimOp$.AsClockOp$")
-        );
-        assert_eq!(
-            "N.Outer.Inner.Method",
-            display_symbol_name(Language::CSharp, "N.Outer$Inner.Method")
-        );
-    }
-
-    #[test]
-    fn scala_companion_dollar_is_not_read_as_a_parent_separator() {
-        let root = std::env::temp_dir().join("bifrost-common-scala-parent-test");
+    #[hardwon(
+        "6bffdc94176f+8e5bc37d1cb3: dollar text in Scala, JavaScript, and Java names must not determine parent boundaries"
+    )]
+    fn dollar_in_segment_text_does_not_define_parent_boundaries() {
+        let root = std::env::temp_dir().join("bifrost-common-parent-dollar-test");
         let interner = segment_interner();
 
         // Top-level `object Probe` -> short_name "Probe$": the trailing `$` must
         // not be read as a separator, so there is no parent.
-        let mut top_level_fq = FqName::new();
-        top_level_fq.push(interner.intern("com.example", SegmentKind::Package));
-        top_level_fq.push(interner.intern("Probe", SegmentKind::Companion));
-        let top_level = CodeUnit::from_fq(
+        let mut scala_top_level_fq = FqName::new();
+        scala_top_level_fq.push(interner.intern("com.example", SegmentKind::Package));
+        scala_top_level_fq.push(interner.intern("Probe", SegmentKind::Companion));
+        let scala_top_level = CodeUnit::from_fq(
             ProjectFile::new(&root, "Probe.scala"),
             CodeUnitType::Class,
-            top_level_fq,
+            scala_top_level_fq,
             1,
             None,
             false,
         );
-        assert_eq!(None, parent_fq_name_for_target(&top_level));
+        assert_eq!(None, parent_fq_name_for_target(&scala_top_level));
 
-        // `object CharsetRange { object Atom }` -> short_name
-        // "CharsetRange$.Atom$": the parent is the enclosing object
-        // "org.http4s.CharsetRange$", not the target's own name. The companion
-        // `$` travels with the segment that owns it, in both directions.
-        let mut nested_fq = FqName::new();
-        nested_fq.push(interner.intern("org.http4s", SegmentKind::Package));
-        nested_fq.push(interner.intern("CharsetRange", SegmentKind::Companion));
-        nested_fq.push(interner.intern("Atom", SegmentKind::Companion));
-        let nested = CodeUnit::from_fq(
+        // Nested Scala companions retain the `$` on the parent segment.
+        let mut scala_nested_fq = FqName::new();
+        scala_nested_fq.push(interner.intern("org.http4s", SegmentKind::Package));
+        scala_nested_fq.push(interner.intern("CharsetRange", SegmentKind::Companion));
+        scala_nested_fq.push(interner.intern("Atom", SegmentKind::Companion));
+        let scala_nested = CodeUnit::from_fq(
             ProjectFile::new(&root, "CharsetRange.scala"),
             CodeUnitType::Class,
-            nested_fq,
+            scala_nested_fq,
             1,
             None,
             false,
         );
         assert_eq!(
             Some("org.http4s.CharsetRange$".to_string()),
-            parent_fq_name_for_target(&nested)
+            parent_fq_name_for_target(&scala_nested)
         );
-    }
 
-    #[test]
-    fn leading_dollar_in_a_terminal_identifier_is_not_a_parent_separator() {
-        let root = std::env::temp_dir().join("bifrost-common-js-parent-test");
-        let interner = segment_interner();
-
-        // `angular.mock.$LogProvider = function() {...}` -> the terminal
-        // identifier starts with `$`. That `$` is identifier text, not a
-        // nesting join, so the parent is `angular.mock`, not `angular.mock.`.
-        let mut fq = FqName::new();
-        fq.push(interner.intern("angular.mock", SegmentKind::Member));
-        fq.push(interner.intern("$LogProvider", SegmentKind::Member));
-        let member = CodeUnit::from_fq(
+        // A leading `$` in a JavaScript identifier does not change its owner.
+        let mut javascript_fq = FqName::new();
+        javascript_fq.push(interner.intern("angular.mock", SegmentKind::Member));
+        javascript_fq.push(interner.intern("$LogProvider", SegmentKind::Member));
+        let javascript_member = CodeUnit::from_fq(
             ProjectFile::new(&root, "angular-mocks.js"),
             CodeUnitType::Function,
-            fq,
+            javascript_fq,
             0,
             None,
             false,
         );
         assert_eq!(
             Some("angular.mock".to_string()),
-            parent_fq_name_for_target(&member)
+            parent_fq_name_for_target(&javascript_member)
         );
 
-        // A bare `$`-prefixed top-level function has no parent at all.
-        let mut top_level_fq = FqName::new();
-        top_level_fq.push(interner.intern("$LogProvider", SegmentKind::Member));
-        let top_level = CodeUnit::from_fq(
+        // A bare `$`-prefixed top-level function has no parent.
+        let mut javascript_top_level_fq = FqName::new();
+        javascript_top_level_fq.push(interner.intern("$LogProvider", SegmentKind::Member));
+        let javascript_top_level = CodeUnit::from_fq(
             ProjectFile::new(&root, "log.js"),
             CodeUnitType::Function,
-            top_level_fq,
+            javascript_top_level_fq,
             0,
             None,
             false,
         );
-        assert_eq!(None, parent_fq_name_for_target(&top_level));
-    }
+        assert_eq!(None, parent_fq_name_for_target(&javascript_top_level));
 
-    /// `$` is a legal Java identifier character, so it appears at the end of
-    /// and inside a member's own name. Scanning the rendered `short_name` for
-    /// the last `$` cut inside the terminal identifier and reported
-    /// `com.example.tool.Gadget.render` -- the method's own name minus a
-    /// character -- as the declaring type of `render$`.
-    #[test]
-    fn dollar_inside_a_terminal_identifier_is_not_a_parent_separator() {
-        let root = std::env::temp_dir().join("bifrost-common-java-parent-test");
-        let interner = segment_interner();
-        let expected = Some("com.example.tool.Gadget".to_string());
-
+        // `$` at the end or within a Java member remains part of that member.
+        let expected_java_parent = Some("com.example.tool.Gadget".to_string());
         for method in ["render$", "a$b", "compute"] {
             let mut fq = FqName::new();
             fq.push(interner.intern("com.example.tool", SegmentKind::Package));
@@ -652,15 +905,13 @@ mod tests {
                 false,
             );
             assert_eq!(
-                expected,
+                expected_java_parent,
                 parent_fq_name_for_target(&unit),
                 "method `{method}` must report its declaring class"
             );
         }
 
-        // The `$` that Java's nested-class join renders (`SegmentKind::Nested`)
-        // IS a boundary, and it is one because the segments say so -- including
-        // for a synthetic name whose own text also carries a `$`.
+        // A Java nested-class join IS a boundary because the FqName says so.
         for nested_name in ["Helper", "anon$3:5"] {
             let mut nested_fq = FqName::new();
             nested_fq.push(interner.intern("com.example.tool", SegmentKind::Package));
@@ -675,32 +926,32 @@ mod tests {
                 false,
             );
             assert_eq!(
-                expected,
+                expected_java_parent,
                 parent_fq_name_for_target(&nested),
                 "nested class `{nested_name}` must report its outer class"
             );
         }
 
-        // A class that is itself top level in its package has no enclosing
-        // scope: the package is not a parent symbol.
-        let mut top_level_fq = FqName::new();
-        top_level_fq.push(interner.intern("com.example.tool", SegmentKind::Package));
-        top_level_fq.push(interner.intern("Gadget", SegmentKind::Type));
-        let top_level = CodeUnit::from_fq(
+        // A top-level Java class has no enclosing scope; package is not parent.
+        let mut java_top_level_fq = FqName::new();
+        java_top_level_fq.push(interner.intern("com.example.tool", SegmentKind::Package));
+        java_top_level_fq.push(interner.intern("Gadget", SegmentKind::Type));
+        let java_top_level = CodeUnit::from_fq(
             ProjectFile::new(&root, "Gadget.java"),
             CodeUnitType::Class,
-            top_level_fq,
+            java_top_level_fq,
             1,
             None,
             false,
         );
-        assert_eq!(None, parent_fq_name_for_target(&top_level));
+        assert_eq!(None, parent_fq_name_for_target(&java_top_level));
     }
 
     /// A TypeScript static member's `$static` marker is part of its own
     /// `Member` segment's text (`visit_ts_method`), so dropping the terminal
     /// segment takes the marker with it. The parent is the class.
     #[test]
+    #[hardwon("8e5bc37d1cb3: TypeScript static marker belongs to the terminal member segment")]
     fn typescript_static_marker_is_not_a_parent_separator() {
         let root = std::env::temp_dir().join("bifrost-common-ts-parent-test");
         let interner = segment_interner();

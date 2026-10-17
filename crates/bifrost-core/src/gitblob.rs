@@ -11,6 +11,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use git2::{
     AttrCheckFlags, AttrValue, ErrorCode, IndexEntry, ObjectType, Oid, Repository, Status,
@@ -1281,19 +1282,30 @@ pub fn uncommitted_oids(root: &Path) -> Result<HashSet<String>> {
 /// `root`'s working tree.
 ///
 /// GC must retain the bytes analyzers actually parsed, even when Git considers
-/// those bytes clean after line-ending conversion. Missing tracked files and
-/// files that cannot be hashed are skipped because they cannot back an active
-/// working-tree analysis.
+/// those bytes clean after line-ending conversion. Missing files are skipped.
+/// An unreadable worktree or file does not prove that its
+/// cached bytes are dead, so errors abort collection instead of omitting them.
 pub fn existing_working_tree_oids(root: &Path) -> Result<HashSet<String>> {
-    let Some(repo) = discover(root) else {
+    // Git retains prunable registrations for worktrees whose directories were
+    // removed. They cannot own current working files; an existing directory
+    // whose repository cannot be opened is a different, uncertain case.
+    if !root.try_exists().map_err(|error| error.to_string())? {
         return Ok(HashSet::new());
-    };
+    }
+    let repo = Repository::open(root)
+        .map_err(|error| format!("opening GC worktree {}: {error}", root.display()))?;
     let workdir = workdir(&repo)?;
     let mut out = HashSet::new();
     for rel in all_working_tree_paths(&repo)? {
-        if workdir.join(&rel).is_file()
-            && let Ok(oid) = hash_working_file(workdir, &rel)
-        {
+        let path = workdir.join(&rel);
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("inspecting GC file {}: {error}", path.display())),
+        };
+        if metadata.is_file() {
+            let oid = hash_working_file(workdir, &rel)
+                .map_err(|error| format!("hashing GC file {}: {error}", path.display()))?;
             out.insert(oid.to_string());
         }
     }
@@ -1315,7 +1327,8 @@ fn workdir(repo: &Repository) -> Result<&Path> {
 /// back. `GIT_OPTIONAL_LOCKS=0` is git's documented contract for exactly
 /// this kind of tooling -- the command completes without performing any
 /// optional sub-operation that requires a lock. Every git spawn goes through
-/// here so no future call site can reintroduce the race.
+/// this helper, or explicitly supplies that environment to the shared bounded
+/// process runner, so no call site can reintroduce the race.
 fn background_git(workdir: &Path) -> Command {
     let mut command = Command::new("git");
     command.current_dir(workdir).env("GIT_OPTIONAL_LOCKS", "0");
@@ -1401,18 +1414,39 @@ fn dirty_worktree_paths(repo: &Repository, subtree: Option<&str>) -> Result<Hash
     // one entry at a time. Native Git uses its optimized index and filesystem
     // checks for the same dirty overlay. This matters for repositories such as
     // Firefox, where the libgit2 scan exceeded the MCP request budget.
-    let mut command = background_git(workdir);
-    command.args(["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+    let mut args: Vec<std::ffi::OsString> =
+        ["status", "--porcelain=v1", "-z", "--untracked-files=all"]
+            .into_iter()
+            .map(Into::into)
+            .collect();
     if let Some(subtree) = subtree {
         // Porcelain paths stay relative to the working directory root, so the
         // pathspec changes only which part of the tree Git walks. `:(literal)`
         // keeps a directory name containing `*`, `?`, `[`, or a leading `:`
         // from being read as pathspec magic.
-        command.arg("--").arg(format!(":(literal){subtree}"));
+        args.push("--".into());
+        args.push(format!(":(literal){subtree}").into());
     }
-    let output = command
-        .output()
-        .map_err(|error| format!("git status failed to spawn: {error}"))?;
+    // A regular file read can block in a worktree's filesystem provider. GC
+    // joins its worker on workspace shutdown, so an unbounded status child
+    // previously prevented the workspace from closing. The shared runner
+    // terminates and reaps the child and its descendants on timeout. Preserve
+    // the complete porcelain stream; no output is silently truncated.
+    let output = crate::process::run_bounded_process(
+        &crate::process::BoundedProcessRequest {
+            program: "git".into(),
+            args,
+            env: vec![("GIT_OPTIONAL_LOCKS".into(), "0".into())],
+            clear_env: false,
+            cwd: workdir.to_path_buf(),
+            stdin: None,
+            timeout: Duration::from_secs(30),
+            stdout_limit: usize::MAX,
+            stderr_limit: usize::MAX,
+            description: format!("git status in {}", workdir.display()),
+        },
+        || false,
+    )?;
     if !output.status.success() {
         return Err(format!(
             "git status failed: {}",
@@ -1461,7 +1495,12 @@ fn dirty_flags() -> Status {
 fn hash_working_file(workdir: &Path, rel: &str) -> Result<Oid> {
     #[cfg(test)]
     HASH_WORKING_FILE_CALLS.with(|calls| calls.set(calls.get() + 1));
-    Oid::hash_file(ObjectType::Blob, workdir.join(rel)).map_err(|e| e.to_string())
+    working_tree_file_oid(&workdir.join(rel))
+}
+
+/// Hash one working-tree file as a Git blob without resolving it through an index.
+pub fn working_tree_file_oid(path: &Path) -> Result<Oid> {
+    Oid::hash_file(ObjectType::Blob, path).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -1476,7 +1515,7 @@ thread_local! {
 /// gate as the `*_for_test` entry points in [`crate::cache_gc`].
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_repo {
-    use git2::{IndexAddOption, IndexTime, Oid, Repository, Signature};
+    use git2::{IndexTime, Oid, Repository, Signature};
     use std::path::Path;
     use std::time::UNIX_EPOCH;
 
@@ -1490,40 +1529,14 @@ pub mod test_repo {
         repo
     }
 
-    fn commit_index(repo: &Repository, message: &str) -> Oid {
-        let mut index = repo.index().unwrap();
-        let tree_id = index.write_tree().unwrap();
-        let tree = repo.find_tree(tree_id).unwrap();
-        let sig = Signature::now("T", "t@example.com").unwrap();
-        let parent = repo.head().ok().and_then(|head| head.peel_to_commit().ok());
-        match parent {
-            Some(parent) => repo
-                .commit(Some("HEAD"), &sig, &sig, message, &tree, &[&parent])
-                .unwrap(),
-            None => repo
-                .commit(Some("HEAD"), &sig, &sig, message, &tree, &[])
-                .unwrap(),
-        }
-    }
-
     pub fn commit_all(repo: &Repository, message: &str) -> Oid {
-        let mut index = repo.index().unwrap();
-        index
-            .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
-            .unwrap();
-        index.write().unwrap();
-        drop(index);
-        commit_index(repo, message)
+        let signature = Signature::now("T", "t@example.com").unwrap();
+        crate::test_git_support::commit_all(repo, message, &signature)
     }
 
     pub fn commit_paths(repo: &Repository, paths: &[&str], message: &str) -> Oid {
-        let mut index = repo.index().unwrap();
-        for path in paths {
-            index.add_path(Path::new(path)).unwrap();
-        }
-        index.write().unwrap();
-        drop(index);
-        commit_index(repo, message)
+        let signature = Signature::now("T", "t@example.com").unwrap();
+        crate::test_git_support::commit_paths(repo, paths, message, &signature)
     }
 
     /// Refresh the index stat for a worktree file while preserving its OID.
@@ -1559,6 +1572,7 @@ mod tests {
         commit_all, commit_paths, init_repo, refresh_index_stat_preserving_oid,
     };
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
 
     fn reset_hash_calls() {
         HASH_WORKING_FILE_CALLS.with(|calls| calls.set(0));
@@ -1634,6 +1648,610 @@ mod tests {
                 .to_string_lossy()
                 .starts_with("shared-name-")
         );
+    }
+
+    #[test]
+    #[hardwon("#1469: local promisor transports must not be mistaken for network remotes")]
+    fn promisor_remote_detection_distinguishes_local_paths_from_network_transports() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+
+        for url in [
+            "https://example.invalid/repo.git",
+            "ssh://example.invalid/repo.git",
+            "git@example.invalid:repo.git",
+        ] {
+            set_promisor_url(&repo, url);
+            assert!(
+                has_network_promisor_remote(&repo).unwrap(),
+                "{url} is network-backed"
+            );
+        }
+        for url in [
+            "file:///tmp/source.git",
+            "../source.git",
+            "source.git",
+            "~/source.git",
+        ] {
+            set_promisor_url(&repo, url);
+            assert!(
+                !has_network_promisor_remote(&repo).unwrap(),
+                "{url} is a local-path remote"
+            );
+        }
+
+        let absolute = temp.path().join("source.git");
+        set_promisor_url(&repo, absolute.to_str().expect("UTF-8 temporary path"));
+        assert!(
+            !has_network_promisor_remote(&repo).unwrap(),
+            "an absolute local promisor path must remain eligible"
+        );
+
+        repo.config()
+            .unwrap()
+            .set_bool("remote.origin.promisor", false)
+            .unwrap();
+        repo.remote_set_url("origin", "https://example.invalid/repo.git")
+            .unwrap();
+        assert!(!has_network_promisor_remote(&repo).unwrap());
+    }
+
+    #[test]
+    #[hardwon("#1469: blobless partial-clone reachability could trigger an unbounded remote fetch")]
+    fn reachable_bloom_refuses_network_promisor_enumeration_before_spawning_git() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        set_promisor_url(&repo, "https://example.invalid/repo.git");
+
+        let error = reachable_bloom(&repo).expect_err("network promisor walk must be refused");
+        assert!(error.contains("refusing to enumerate"), "{error}");
+    }
+
+    #[test]
+    fn all_working_tree_paths_use_index_and_dirty_overlay() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        std::fs::write(temp.path().join("tracked.rs"), "fn tracked() {}\n").unwrap();
+        commit_all(&repo, "init");
+        std::fs::write(temp.path().join("dirty.rs"), "fn dirty() {}\n").unwrap();
+
+        let paths = all_working_tree_paths(&repo).unwrap();
+        assert!(paths.contains("tracked.rs"), "{paths:?}");
+        assert!(paths.contains("dirty.rs"), "{paths:?}");
+
+        std::fs::remove_file(temp.path().join("tracked.rs")).unwrap();
+        let paths = all_working_tree_paths(&repo).unwrap();
+        assert!(!paths.contains("tracked.rs"), "{paths:?}");
+        assert!(paths.contains("dirty.rs"), "{paths:?}");
+    }
+
+    fn initialized_child(parent: &Repository, rel: &str) -> Repository {
+        let root = parent.workdir().unwrap();
+        let child = init_repo(&root.join(rel));
+        std::fs::write(
+            child.workdir().unwrap().join("tracked.py"),
+            "def tracked(): return 1\n",
+        )
+        .unwrap();
+        let oid = commit_all(&child, "child");
+        register_gitlink(parent, rel, oid);
+        child
+    }
+
+    fn register_gitlink(parent: &Repository, rel: &str, oid: Oid) {
+        let root = parent.workdir().unwrap();
+        let modules = root.join(".gitmodules");
+        let mut text = if modules.exists() {
+            std::fs::read_to_string(&modules).unwrap()
+        } else {
+            String::new()
+        };
+        text.push_str(&format!(
+            "[submodule \"{rel}\"]\n\tpath = {rel}\n\turl = https://example.invalid/child.git\n"
+        ));
+        std::fs::write(modules, text).unwrap();
+        let mut index = parent.index().unwrap();
+        index
+            .add(&IndexEntry {
+                ctime: git2::IndexTime::new(0, 0),
+                mtime: git2::IndexTime::new(0, 0),
+                dev: 0,
+                ino: 0,
+                mode: 0o160000,
+                uid: 0,
+                gid: 0,
+                file_size: 0,
+                id: oid,
+                flags: 0,
+                flags_extended: 0,
+                path: rel.as_bytes().to_vec(),
+            })
+            .unwrap();
+        index.write().unwrap();
+        drop(index);
+        commit_paths(parent, &[".gitmodules"], "register child");
+    }
+
+    #[test]
+    #[hardwon(
+        "#3772: initialized Git submodule sources were omitted from parent workspace analysis"
+    )]
+    fn materialized_submodules_preserve_nested_source_scope_and_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = init_repo(temp.path());
+        std::fs::write(temp.path().join("parent.py"), "def parent(): return 1\n").unwrap();
+        commit_all(&parent, "parent");
+        let child = initialized_child(&parent, "vendor/child");
+        let nested = initialized_child(&child, "nested");
+        let nested_root = nested.workdir().unwrap();
+        std::fs::write(nested_root.join(".gitignore"), "ignored.py\ntracked.py\n").unwrap();
+        std::fs::write(nested_root.join("ignored.py"), "ignored").unwrap();
+        std::fs::write(nested_root.join("new.py"), "def new(): return 2\n").unwrap();
+        let changed = b"def tracked(): return 42\n";
+        std::fs::write(nested_root.join("tracked.py"), changed).unwrap();
+
+        let paths = all_working_tree_paths(&parent).unwrap();
+        for path in [
+            "parent.py",
+            "vendor/child/tracked.py",
+            "vendor/child/nested/tracked.py",
+            "vendor/child/nested/new.py",
+        ] {
+            assert!(paths.contains(path), "{paths:?}");
+            assert!(
+                working_tree_path_is_listed(&parent, Path::new(path)).unwrap(),
+                "point membership rejected listed path {path:?}: {paths:?}"
+            );
+        }
+        for path in [
+            "vendor/child",
+            "vendor/child/nested",
+            "vendor/child/nested/ignored.py",
+            "vendor/child/.git/config",
+        ] {
+            assert!(!paths.contains(path), "{paths:?}");
+            assert!(!working_tree_path_is_listed(&parent, Path::new(path)).unwrap());
+        }
+        let scoped = working_tree_paths_under(&parent, "vendor/child/nested/").unwrap();
+        assert_eq!(
+            scoped,
+            paths
+                .iter()
+                .filter(|path| path.starts_with("vendor/child/nested/"))
+                .cloned()
+                .collect()
+        );
+        assert!(
+            !working_tree_paths_under(&parent, "vendor/childish/")
+                .unwrap()
+                .contains("vendor/child/tracked.py")
+        );
+        let oid = Oid::hash_object(ObjectType::Blob, changed)
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            working_tree_oids_full(&parent).unwrap()["vendor/child/nested/tracked.py"],
+            oid
+        );
+        assert!(
+            existing_working_tree_oids(temp.path())
+                .unwrap()
+                .contains(&oid)
+        );
+        assert!(parent.find_blob(Oid::from_str(&oid).unwrap()).is_err());
+        std::fs::remove_file(nested_root.join("tracked.py")).unwrap();
+        assert!(
+            !all_working_tree_paths(&parent)
+                .unwrap()
+                .contains("vendor/child/nested/tracked.py")
+        );
+        assert!(
+            !working_tree_path_is_listed(&parent, Path::new("vendor/child/nested/tracked.py"))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    #[hardwon("#3772: uninitialized gitlinks must not be fetched or treated as discovered source")]
+    fn materialized_submodules_skip_uninitialized_and_unregistered_repositories() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = init_repo(temp.path());
+        std::fs::write(temp.path().join("parent.py"), "parent").unwrap();
+        commit_all(&parent, "parent");
+        let child = initialized_child(&parent, "child");
+        let oid = child.head().unwrap().target().unwrap();
+        register_gitlink(&parent, "missing", oid);
+        let unrelated = init_repo(&temp.path().join("unregistered"));
+        std::fs::write(
+            unrelated.workdir().unwrap().join("private.py"),
+            "unregistered",
+        )
+        .unwrap();
+        commit_all(&unrelated, "unregistered");
+        let paths = all_working_tree_paths(&parent).unwrap();
+        assert!(paths.contains("child/tracked.py"), "{paths:?}");
+        assert!(!paths.contains("missing"), "{paths:?}");
+        assert!(!paths.contains("unregistered/private.py"), "{paths:?}");
+        assert!(
+            !working_tree_path_is_listed(&parent, Path::new("unregistered/private.py")).unwrap()
+        );
+        assert!(!working_tree_path_is_listed(&parent, Path::new("missing/tracked.py")).unwrap());
+    }
+
+    #[test]
+    #[hardwon("#3772: conflicted gitlink stages duplicated or desynchronized submodule membership")]
+    fn materialized_submodule_conflict_keeps_point_membership_in_sync() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = init_repo(temp.path());
+        initialized_child(&parent, "child");
+        let mut index = parent.index().unwrap();
+        let mut entry = index.get_path(Path::new("child"), 0).unwrap();
+        index.remove_path(Path::new("child")).unwrap();
+        for stage in 1..=3 {
+            entry.flags = (entry.flags & !0x3000) | (stage << 12);
+            index.add(&entry).unwrap();
+        }
+        index.write().unwrap();
+        assert!(index.has_conflicts());
+        assert!(index.get_path(Path::new("child"), 0).is_none());
+        let paths = all_working_tree_paths(&parent).unwrap();
+        assert!(paths.contains("child/tracked.py"), "{paths:?}");
+        assert!(working_tree_path_is_listed(&parent, Path::new("child/tracked.py")).unwrap());
+    }
+
+    #[test]
+    #[hardwon("#3772: initialized submodule source discovery failed for gitfile checkouts")]
+    fn materialized_submodules_support_gitfile_checkouts() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = init_repo(temp.path());
+        let child = initialized_child(&parent, "child");
+        let child_root = child.workdir().unwrap().to_path_buf();
+        child
+            .config()
+            .unwrap()
+            .set_str("core.worktree", child_root.to_str().unwrap())
+            .unwrap();
+        let gitdir = parent.path().join("modules/child");
+        std::fs::create_dir_all(gitdir.parent().unwrap()).unwrap();
+        drop(child);
+        std::fs::rename(child_root.join(".git"), &gitdir).unwrap();
+        std::fs::write(
+            child_root.join(".git"),
+            format!("gitdir: {}\n", gitdir.display()),
+        )
+        .unwrap();
+        let paths = all_working_tree_paths(&parent).unwrap();
+        assert!(paths.contains("child/tracked.py"), "{paths:?}");
+        assert!(!paths.contains("child/.git"), "{paths:?}");
+        assert!(working_tree_path_is_listed(&parent, Path::new("child/tracked.py")).unwrap());
+        let project = crate::analyzer::project::FilesystemProject::new(temp.path()).unwrap();
+        use crate::analyzer::project::Project;
+        assert!(
+            project
+                .analyzable_files(crate::analyzer::Language::Python)
+                .unwrap()
+                .iter()
+                .any(|file| file.rel_path() == Path::new("child/tracked.py"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[hardwon("#3772: submodule discovery must not admit symlink paths outside its parent root")]
+    fn materialized_submodules_reject_source_and_directory_symlink_escapes() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let parent = init_repo(temp.path());
+        let child = initialized_child(&parent, "child");
+        std::fs::write(outside.path().join("private.py"), "private").unwrap();
+        symlink(
+            outside.path().join("private.py"),
+            child.workdir().unwrap().join("escape.py"),
+        )
+        .unwrap();
+        assert!(
+            all_working_tree_paths(&parent)
+                .unwrap_err()
+                .contains("escapes")
+        );
+        assert!(
+            working_tree_path_is_listed(&parent, Path::new("child/escape.py"))
+                .unwrap_err()
+                .contains("escapes")
+        );
+        std::fs::remove_file(child.workdir().unwrap().join("escape.py")).unwrap();
+        let external = init_repo(outside.path());
+        commit_all(&external, "external");
+        register_gitlink(
+            &parent,
+            "linked",
+            external.head().unwrap().target().unwrap(),
+        );
+        symlink(outside.path(), temp.path().join("linked")).unwrap();
+        // Native Git may reject the replaced gitlink during status before
+        // the explicit containment check. Either path must fail closed.
+        assert!(all_working_tree_paths(&parent).is_err());
+        assert!(
+            working_tree_path_is_listed(&parent, Path::new("linked/private.py"))
+                .unwrap_err()
+                .contains("symlink")
+        );
+    }
+
+    #[test]
+    #[hardwon("#2742: subtree enumeration must use workdir-relative pathspecs without siblings")]
+    fn subtree_pathspec_selects_the_workdir_relative_directory() {
+        let workdir = Path::new("/repo");
+        assert_eq!(subtree_pathspec(workdir, workdir), None);
+        assert_eq!(
+            subtree_pathspec(workdir, Path::new("/repo/packages/app")).as_deref(),
+            Some("packages/app/")
+        );
+        assert_eq!(subtree_pathspec(workdir, Path::new("/elsewhere")), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[hardwon(
+        "#2742: Windows subtree pathspecs must spell the root-relative path with forward slashes"
+    )]
+    fn subtree_pathspec_spells_windows_roots_with_forward_slashes() {
+        assert_eq!(
+            subtree_pathspec(Path::new(r"C:\repo"), Path::new(r"C:\repo\packages\app")).as_deref(),
+            Some("packages/app/")
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#2742: subtree queries scanned ancestor repositories instead of the requested workspace scope"
+    )]
+    fn working_tree_paths_under_returns_only_the_subtree() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        for rel in ["sub/tracked.rs", "outside/tracked.rs"] {
+            let path = temp.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "fn tracked() {}\n").unwrap();
+        }
+        commit_all(&repo, "init");
+        for rel in ["sub/untracked.rs", "outside/untracked.rs"] {
+            std::fs::write(temp.path().join(rel), "fn untracked() {}\n").unwrap();
+        }
+
+        let paths = working_tree_paths_under(&repo, "sub/").unwrap();
+        assert_eq!(
+            paths,
+            HashSet::from(["sub/tracked.rs".to_string(), "sub/untracked.rs".to_string()])
+        );
+        assert!(all_working_tree_paths(&repo).unwrap().is_superset(&paths));
+    }
+
+    #[test]
+    #[hardwon("#1742: clean CRLF checkout identity disagreed with the bytes visible to analysis")]
+    fn clean_eol_transformed_file_oid_matches_visible_bytes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        let source_path = temp.path().join("a.cs");
+        std::fs::write(&source_path, "class A {}\n").unwrap();
+        commit_all(&repo, "source");
+
+        std::fs::write(temp.path().join(".gitattributes"), "*.cs text eol=crlf\n").unwrap();
+        commit_paths(&repo, &[".gitattributes"], "attributes");
+        std::fs::write(&source_path, "class A {}\r\n").unwrap();
+
+        // Match the index stat Git records after a transformed checkout while
+        // retaining the canonical LF blob OID.
+        let index_oid = refresh_index_stat_preserving_oid(&repo, "a.cs");
+        let visible_oid = Oid::hash_object(ObjectType::Blob, b"class A {}\r\n").unwrap();
+        assert_ne!(visible_oid, index_oid, "LF and CRLF OIDs must differ");
+
+        reset_hash_calls();
+        let resolved = working_tree_oids(&repo, &["a.cs".to_string()]).unwrap();
+        let visible_oid_hex = visible_oid.to_string();
+        let index_oid_hex = index_oid.to_string();
+        assert_eq!(resolved.get("a.cs"), Some(&visible_oid_hex));
+        assert_ne!(resolved.get("a.cs"), Some(&index_oid_hex));
+        assert_eq!(hash_calls(), 1);
+    }
+
+    #[test]
+    #[hardwon(
+        "#1742: same-size working-tree filters were incorrectly trusted as canonical index bytes"
+    )]
+    fn equal_size_filter_attribute_hashes_working_tree_bytes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        let source_path = temp.path().join("a.txt");
+        std::fs::write(&source_path, "hello\n").unwrap();
+        commit_all(&repo, "source");
+
+        // The explicit filter has equal-size output in this fixture. The
+        // attribute guard must still avoid trusting the index OID.
+        std::fs::write(temp.path().join(".gitattributes"), "*.txt filter=opaque\n").unwrap();
+        commit_paths(&repo, &[".gitattributes"], "attributes");
+
+        let index_oid = repo
+            .index()
+            .unwrap()
+            .get_path(Path::new("a.txt"), 0)
+            .expect("source index entry")
+            .id;
+        let visible_oid = Oid::hash_object(ObjectType::Blob, b"hello\n").unwrap();
+        assert_eq!(visible_oid, index_oid);
+
+        reset_hash_calls();
+        let resolved = working_tree_oids(&repo, &["a.txt".to_string()]).unwrap();
+        assert_eq!(resolved.get("a.txt"), Some(&visible_oid.to_string()));
+        assert_eq!(hash_calls(), 1);
+    }
+
+    #[test]
+    fn dirty_file_oid_reflects_working_tree() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        std::fs::write(temp.path().join("a.txt"), "hello\n").unwrap();
+        commit_all(&repo, "init");
+        std::fs::write(temp.path().join("a.txt"), "changed\n").unwrap();
+
+        reset_hash_calls();
+        let oids = working_tree_oids(&repo, &["a.txt".to_string()]).unwrap();
+        assert_eq!(
+            oids["a.txt"],
+            Oid::hash_object(ObjectType::Blob, b"changed\n")
+                .unwrap()
+                .to_string()
+        );
+        assert_eq!(hash_calls(), 1);
+
+        let uncommitted = uncommitted_oids(temp.path()).unwrap();
+        assert!(uncommitted.contains(&oids["a.txt"]));
+    }
+
+    #[test]
+    fn targeted_matches_bulk_for_clean_dirty_and_untracked() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        std::fs::write(temp.path().join("clean.txt"), "clean\n").unwrap();
+        std::fs::write(temp.path().join("dirty.txt"), "committed\n").unwrap();
+        commit_all(&repo, "init");
+        std::fs::write(temp.path().join("dirty.txt"), "working\n").unwrap();
+        std::fs::write(temp.path().join("new.txt"), "fresh\n").unwrap();
+
+        let paths = vec![
+            "clean.txt".to_string(),
+            "dirty.txt".to_string(),
+            "new.txt".to_string(),
+        ];
+        let bulk = working_tree_oids(&repo, &paths).unwrap();
+        let targeted = working_tree_oids_targeted(&repo, &paths).unwrap();
+        assert_eq!(bulk, targeted);
+        assert_eq!(
+            targeted["clean.txt"],
+            Oid::hash_object(ObjectType::Blob, b"clean\n")
+                .unwrap()
+                .to_string()
+        );
+        assert_eq!(
+            targeted["dirty.txt"],
+            Oid::hash_object(ObjectType::Blob, b"working\n")
+                .unwrap()
+                .to_string()
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#2542: file identity batching read stale metadata and needlessly hashed clean files"
+    )]
+    fn batched_identity_pairs_current_metadata_with_clean_dirty_and_untracked_oids() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        std::fs::write(temp.path().join("clean.txt"), "clean\n").unwrap();
+        std::fs::write(temp.path().join("dirty.txt"), "committed\n").unwrap();
+        commit_all(&repo, "init");
+        std::fs::write(temp.path().join("dirty.txt"), "working\n").unwrap();
+        std::fs::write(temp.path().join("new.txt"), "fresh\n").unwrap();
+
+        let identity = working_tree_identity(&repo).unwrap();
+        reset_hash_calls();
+        let resolved = identity
+            .resolve_with_metadata(
+                &repo,
+                &[
+                    "clean.txt".to_string(),
+                    "dirty.txt".to_string(),
+                    "new.txt".to_string(),
+                ],
+            )
+            .unwrap();
+
+        for (path, bytes) in [
+            ("clean.txt", b"clean\n".as_slice()),
+            ("dirty.txt", b"working\n".as_slice()),
+            ("new.txt", b"fresh\n".as_slice()),
+        ] {
+            let resolution = &resolved[path];
+            assert_eq!(
+                resolution.oid,
+                Oid::hash_object(ObjectType::Blob, bytes).unwrap()
+            );
+            assert_eq!(resolution.metadata.len(), bytes.len() as u64);
+            assert!(metadata_same(
+                &resolution.metadata,
+                &std::fs::metadata(temp.path().join(path)).unwrap()
+            ));
+        }
+        assert_eq!(
+            hash_calls(),
+            2,
+            "only dirty and untracked files should read visible bytes"
+        );
+    }
+
+    #[test]
+    #[hardwon("#1679: announced edits stayed invisible because Git file identities were stale")]
+    fn invalidating_one_path_retains_other_clean_index_identities() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        std::fs::write(temp.path().join("changed.txt"), "before!\n").unwrap();
+        std::fs::write(temp.path().join("untouched.txt"), "stable\n").unwrap();
+        commit_all(&repo, "init");
+
+        let identity = working_tree_identity(&repo).unwrap();
+        identity.invalidate_paths(["changed.txt".to_string()]);
+        reset_hash_calls();
+        let resolved = identity
+            .resolve_with_metadata(
+                &repo,
+                &["changed.txt".to_string(), "untouched.txt".to_string()],
+            )
+            .unwrap();
+
+        assert_eq!(
+            resolved["changed.txt"].oid,
+            Oid::hash_object(ObjectType::Blob, b"before!\n").unwrap()
+        );
+        assert_eq!(
+            resolved["untouched.txt"].oid,
+            Oid::hash_object(ObjectType::Blob, b"stable\n").unwrap()
+        );
+        assert_eq!(
+            hash_calls(),
+            1,
+            "only the explicitly invalidated path should leave the index fast path"
+        );
+    }
+
+    #[test]
+    fn gc_oids_include_existing_tracked_and_untracked_bytes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        std::fs::write(temp.path().join("clean.txt"), "clean\n").unwrap();
+        std::fs::write(temp.path().join("changed.txt"), "committed\n").unwrap();
+        std::fs::write(temp.path().join("deleted.txt"), "deleted\n").unwrap();
+        commit_all(&repo, "init");
+
+        std::fs::write(temp.path().join("changed.txt"), "working\r\n").unwrap();
+        std::fs::remove_file(temp.path().join("deleted.txt")).unwrap();
+        std::fs::write(temp.path().join("untracked.txt"), "untracked\n").unwrap();
+
+        let oids = existing_working_tree_oids(temp.path()).unwrap();
+        for bytes in [
+            b"clean\n".as_slice(),
+            b"working\r\n".as_slice(),
+            b"untracked\n".as_slice(),
+        ] {
+            let oid = Oid::hash_object(ObjectType::Blob, bytes)
+                .unwrap()
+                .to_string();
+            assert!(oids.contains(&oid), "missing working-tree OID {oid}");
+        }
+        let deleted_oid = Oid::hash_object(ObjectType::Blob, b"deleted\n")
+            .unwrap()
+            .to_string();
+        assert!(!oids.contains(&deleted_oid));
     }
 
     #[test]
@@ -1740,633 +2358,5 @@ mod tests {
             machine_cache_root_with_overrides(Some(one.as_os_str().to_owned())),
             Some(one)
         );
-    }
-
-    #[test]
-    fn exact_cache_directory_override_wins_over_cache_root() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let workspace = temp.path().join("workspace");
-        std::fs::create_dir(&workspace).unwrap();
-        let exact = temp.path().join("exact");
-        let root = temp.path().join("root");
-
-        assert_eq!(
-            cache_db_path_with_overrides(
-                &workspace,
-                Some(exact.as_os_str().to_owned()),
-                Some(root.as_os_str().to_owned()),
-            ),
-            exact.join(crate::cache_db::cache_db_file_name())
-        );
-        assert_eq!(
-            cache_dir_path_with_overrides(
-                &workspace,
-                Some(exact.as_os_str().to_owned()),
-                Some(root.as_os_str().to_owned()),
-            ),
-            exact
-        );
-    }
-
-    #[test]
-    fn promisor_remote_detection_distinguishes_local_paths_from_network_transports() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let repo = init_repo(temp.path());
-
-        for url in [
-            "https://example.invalid/repo.git",
-            "ssh://example.invalid/repo.git",
-            "git@example.invalid:repo.git",
-        ] {
-            set_promisor_url(&repo, url);
-            assert!(
-                has_network_promisor_remote(&repo).unwrap(),
-                "{url} is network-backed"
-            );
-        }
-        for url in [
-            "file:///tmp/source.git",
-            "../source.git",
-            "source.git",
-            "~/source.git",
-        ] {
-            set_promisor_url(&repo, url);
-            assert!(
-                !has_network_promisor_remote(&repo).unwrap(),
-                "{url} is a local-path remote"
-            );
-        }
-
-        let absolute = temp.path().join("source.git");
-        set_promisor_url(&repo, absolute.to_str().expect("UTF-8 temporary path"));
-        assert!(
-            !has_network_promisor_remote(&repo).unwrap(),
-            "an absolute local promisor path must remain eligible"
-        );
-
-        repo.config()
-            .unwrap()
-            .set_bool("remote.origin.promisor", false)
-            .unwrap();
-        repo.remote_set_url("origin", "https://example.invalid/repo.git")
-            .unwrap();
-        assert!(!has_network_promisor_remote(&repo).unwrap());
-    }
-
-    #[test]
-    fn reachable_bloom_refuses_network_promisor_enumeration_before_spawning_git() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let repo = init_repo(temp.path());
-        set_promisor_url(&repo, "https://example.invalid/repo.git");
-
-        let error = reachable_bloom(&repo).expect_err("network promisor walk must be refused");
-        assert!(error.contains("refusing to enumerate"), "{error}");
-    }
-
-    #[test]
-    fn clean_file_oid_matches_git_hash_object() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let repo = init_repo(temp.path());
-        std::fs::write(temp.path().join("a.txt"), "hello\n").unwrap();
-        commit_all(&repo, "init");
-
-        reset_hash_calls();
-        let oids = working_tree_oids(&repo, &["a.txt".to_string()]).unwrap();
-        assert_eq!(
-            oids["a.txt"],
-            Oid::hash_object(ObjectType::Blob, b"hello\n")
-                .unwrap()
-                .to_string()
-        );
-        assert_eq!(
-            hash_calls(),
-            0,
-            "clean tracked content must use its index OID"
-        );
-    }
-
-    #[test]
-    fn all_working_tree_paths_use_index_and_dirty_overlay() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let repo = init_repo(temp.path());
-        std::fs::write(temp.path().join("tracked.rs"), "fn tracked() {}\n").unwrap();
-        commit_all(&repo, "init");
-        std::fs::write(temp.path().join("dirty.rs"), "fn dirty() {}\n").unwrap();
-
-        let paths = all_working_tree_paths(&repo).unwrap();
-        assert!(paths.contains("tracked.rs"), "{paths:?}");
-        assert!(paths.contains("dirty.rs"), "{paths:?}");
-
-        std::fs::remove_file(temp.path().join("tracked.rs")).unwrap();
-        let paths = all_working_tree_paths(&repo).unwrap();
-        assert!(!paths.contains("tracked.rs"), "{paths:?}");
-        assert!(paths.contains("dirty.rs"), "{paths:?}");
-    }
-
-    fn initialized_child(parent: &Repository, rel: &str) -> Repository {
-        let root = parent.workdir().unwrap();
-        let child = init_repo(&root.join(rel));
-        std::fs::write(
-            child.workdir().unwrap().join("tracked.py"),
-            "def tracked(): return 1\n",
-        )
-        .unwrap();
-        let oid = commit_all(&child, "child");
-        register_gitlink(parent, rel, oid);
-        child
-    }
-
-    fn register_gitlink(parent: &Repository, rel: &str, oid: Oid) {
-        let root = parent.workdir().unwrap();
-        let modules = root.join(".gitmodules");
-        let mut text = if modules.exists() {
-            std::fs::read_to_string(&modules).unwrap()
-        } else {
-            String::new()
-        };
-        text.push_str(&format!(
-            "[submodule \"{rel}\"]\n\tpath = {rel}\n\turl = https://example.invalid/child.git\n"
-        ));
-        std::fs::write(modules, text).unwrap();
-        let mut index = parent.index().unwrap();
-        index
-            .add(&IndexEntry {
-                ctime: git2::IndexTime::new(0, 0),
-                mtime: git2::IndexTime::new(0, 0),
-                dev: 0,
-                ino: 0,
-                mode: 0o160000,
-                uid: 0,
-                gid: 0,
-                file_size: 0,
-                id: oid,
-                flags: 0,
-                flags_extended: 0,
-                path: rel.as_bytes().to_vec(),
-            })
-            .unwrap();
-        index.write().unwrap();
-        drop(index);
-        commit_paths(parent, &[".gitmodules"], "register child");
-    }
-
-    #[test]
-    fn materialized_submodules_preserve_nested_source_scope_and_identity() {
-        let temp = tempfile::tempdir().unwrap();
-        let parent = init_repo(temp.path());
-        std::fs::write(temp.path().join("parent.py"), "def parent(): return 1\n").unwrap();
-        commit_all(&parent, "parent");
-        let child = initialized_child(&parent, "vendor/child");
-        let nested = initialized_child(&child, "nested");
-        let nested_root = nested.workdir().unwrap();
-        std::fs::write(nested_root.join(".gitignore"), "ignored.py\ntracked.py\n").unwrap();
-        std::fs::write(nested_root.join("ignored.py"), "ignored").unwrap();
-        std::fs::write(nested_root.join("new.py"), "def new(): return 2\n").unwrap();
-        let changed = b"def tracked(): return 42\n";
-        std::fs::write(nested_root.join("tracked.py"), changed).unwrap();
-
-        let paths = all_working_tree_paths(&parent).unwrap();
-        for path in [
-            "parent.py",
-            "vendor/child/tracked.py",
-            "vendor/child/nested/tracked.py",
-            "vendor/child/nested/new.py",
-        ] {
-            assert!(paths.contains(path), "{paths:?}");
-            assert!(
-                working_tree_path_is_listed(&parent, Path::new(path)).unwrap(),
-                "point membership rejected listed path {path:?}: {paths:?}"
-            );
-        }
-        for path in [
-            "vendor/child",
-            "vendor/child/nested",
-            "vendor/child/nested/ignored.py",
-            "vendor/child/.git/config",
-        ] {
-            assert!(!paths.contains(path), "{paths:?}");
-            assert!(!working_tree_path_is_listed(&parent, Path::new(path)).unwrap());
-        }
-        let scoped = working_tree_paths_under(&parent, "vendor/child/nested/").unwrap();
-        assert_eq!(
-            scoped,
-            paths
-                .iter()
-                .filter(|path| path.starts_with("vendor/child/nested/"))
-                .cloned()
-                .collect()
-        );
-        assert!(
-            !working_tree_paths_under(&parent, "vendor/childish/")
-                .unwrap()
-                .contains("vendor/child/tracked.py")
-        );
-        let oid = Oid::hash_object(ObjectType::Blob, changed)
-            .unwrap()
-            .to_string();
-        assert_eq!(
-            working_tree_oids_full(&parent).unwrap()["vendor/child/nested/tracked.py"],
-            oid
-        );
-        assert!(
-            existing_working_tree_oids(temp.path())
-                .unwrap()
-                .contains(&oid)
-        );
-        assert!(parent.find_blob(Oid::from_str(&oid).unwrap()).is_err());
-        std::fs::remove_file(nested_root.join("tracked.py")).unwrap();
-        assert!(
-            !all_working_tree_paths(&parent)
-                .unwrap()
-                .contains("vendor/child/nested/tracked.py")
-        );
-        assert!(
-            !working_tree_path_is_listed(&parent, Path::new("vendor/child/nested/tracked.py"))
-                .unwrap()
-        );
-    }
-
-    #[test]
-    fn materialized_submodules_skip_uninitialized_and_unregistered_repositories() {
-        let temp = tempfile::tempdir().unwrap();
-        let parent = init_repo(temp.path());
-        std::fs::write(temp.path().join("parent.py"), "parent").unwrap();
-        commit_all(&parent, "parent");
-        let child = initialized_child(&parent, "child");
-        let oid = child.head().unwrap().target().unwrap();
-        register_gitlink(&parent, "missing", oid);
-        let unrelated = init_repo(&temp.path().join("unregistered"));
-        std::fs::write(
-            unrelated.workdir().unwrap().join("private.py"),
-            "unregistered",
-        )
-        .unwrap();
-        commit_all(&unrelated, "unregistered");
-        let paths = all_working_tree_paths(&parent).unwrap();
-        assert!(paths.contains("child/tracked.py"), "{paths:?}");
-        assert!(!paths.contains("missing"), "{paths:?}");
-        assert!(!paths.contains("unregistered/private.py"), "{paths:?}");
-        assert!(
-            !working_tree_path_is_listed(&parent, Path::new("unregistered/private.py")).unwrap()
-        );
-        assert!(!working_tree_path_is_listed(&parent, Path::new("missing/tracked.py")).unwrap());
-    }
-
-    #[test]
-    fn materialized_submodule_conflict_keeps_point_membership_in_sync() {
-        let temp = tempfile::tempdir().unwrap();
-        let parent = init_repo(temp.path());
-        initialized_child(&parent, "child");
-        let mut index = parent.index().unwrap();
-        let mut entry = index.get_path(Path::new("child"), 0).unwrap();
-        index.remove_path(Path::new("child")).unwrap();
-        for stage in 1..=3 {
-            entry.flags = (entry.flags & !0x3000) | (stage << 12);
-            index.add(&entry).unwrap();
-        }
-        index.write().unwrap();
-        assert!(index.has_conflicts());
-        assert!(index.get_path(Path::new("child"), 0).is_none());
-        let paths = all_working_tree_paths(&parent).unwrap();
-        assert!(paths.contains("child/tracked.py"), "{paths:?}");
-        assert!(working_tree_path_is_listed(&parent, Path::new("child/tracked.py")).unwrap());
-    }
-
-    #[test]
-    fn materialized_submodules_support_gitfile_checkouts() {
-        let temp = tempfile::tempdir().unwrap();
-        let parent = init_repo(temp.path());
-        let child = initialized_child(&parent, "child");
-        let child_root = child.workdir().unwrap().to_path_buf();
-        child
-            .config()
-            .unwrap()
-            .set_str("core.worktree", child_root.to_str().unwrap())
-            .unwrap();
-        let gitdir = parent.path().join("modules/child");
-        std::fs::create_dir_all(gitdir.parent().unwrap()).unwrap();
-        drop(child);
-        std::fs::rename(child_root.join(".git"), &gitdir).unwrap();
-        std::fs::write(
-            child_root.join(".git"),
-            format!("gitdir: {}\n", gitdir.display()),
-        )
-        .unwrap();
-        let paths = all_working_tree_paths(&parent).unwrap();
-        assert!(paths.contains("child/tracked.py"), "{paths:?}");
-        assert!(!paths.contains("child/.git"), "{paths:?}");
-        assert!(working_tree_path_is_listed(&parent, Path::new("child/tracked.py")).unwrap());
-        let project = crate::analyzer::project::FilesystemProject::new(temp.path()).unwrap();
-        use crate::analyzer::project::Project;
-        assert!(
-            project
-                .analyzable_files(crate::analyzer::Language::Python)
-                .unwrap()
-                .iter()
-                .any(|file| file.rel_path() == Path::new("child/tracked.py"))
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn materialized_submodules_reject_source_and_directory_symlink_escapes() {
-        use std::os::unix::fs::symlink;
-        let temp = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let parent = init_repo(temp.path());
-        let child = initialized_child(&parent, "child");
-        std::fs::write(outside.path().join("private.py"), "private").unwrap();
-        symlink(
-            outside.path().join("private.py"),
-            child.workdir().unwrap().join("escape.py"),
-        )
-        .unwrap();
-        assert!(
-            all_working_tree_paths(&parent)
-                .unwrap_err()
-                .contains("escapes")
-        );
-        assert!(
-            working_tree_path_is_listed(&parent, Path::new("child/escape.py"))
-                .unwrap_err()
-                .contains("escapes")
-        );
-        std::fs::remove_file(child.workdir().unwrap().join("escape.py")).unwrap();
-        let external = init_repo(outside.path());
-        commit_all(&external, "external");
-        register_gitlink(
-            &parent,
-            "linked",
-            external.head().unwrap().target().unwrap(),
-        );
-        symlink(outside.path(), temp.path().join("linked")).unwrap();
-        // Native Git may reject the replaced gitlink during status before
-        // the explicit containment check. Either path must fail closed.
-        assert!(all_working_tree_paths(&parent).is_err());
-        assert!(
-            working_tree_path_is_listed(&parent, Path::new("linked/private.py"))
-                .unwrap_err()
-                .contains("symlink")
-        );
-    }
-
-    #[test]
-    fn subtree_pathspec_selects_the_workdir_relative_directory() {
-        let workdir = Path::new("/repo");
-        assert_eq!(subtree_pathspec(workdir, workdir), None);
-        assert_eq!(
-            subtree_pathspec(workdir, Path::new("/repo/packages/app")).as_deref(),
-            Some("packages/app/")
-        );
-        assert_eq!(subtree_pathspec(workdir, Path::new("/elsewhere")), None);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn subtree_pathspec_spells_windows_roots_with_forward_slashes() {
-        assert_eq!(
-            subtree_pathspec(Path::new(r"C:\repo"), Path::new(r"C:\repo\packages\app")).as_deref(),
-            Some("packages/app/")
-        );
-    }
-
-    #[test]
-    fn working_tree_paths_under_returns_only_the_subtree() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let repo = init_repo(temp.path());
-        for rel in ["sub/tracked.rs", "outside/tracked.rs"] {
-            let path = temp.path().join(rel);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, "fn tracked() {}\n").unwrap();
-        }
-        commit_all(&repo, "init");
-        for rel in ["sub/untracked.rs", "outside/untracked.rs"] {
-            std::fs::write(temp.path().join(rel), "fn untracked() {}\n").unwrap();
-        }
-
-        let paths = working_tree_paths_under(&repo, "sub/").unwrap();
-        assert_eq!(
-            paths,
-            HashSet::from(["sub/tracked.rs".to_string(), "sub/untracked.rs".to_string()])
-        );
-        assert!(all_working_tree_paths(&repo).unwrap().is_superset(&paths));
-    }
-
-    #[test]
-    fn clean_eol_transformed_file_oid_matches_visible_bytes() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let repo = init_repo(temp.path());
-        let source_path = temp.path().join("a.cs");
-        std::fs::write(&source_path, "class A {}\n").unwrap();
-        commit_all(&repo, "source");
-
-        std::fs::write(temp.path().join(".gitattributes"), "*.cs text eol=crlf\n").unwrap();
-        commit_paths(&repo, &[".gitattributes"], "attributes");
-        std::fs::write(&source_path, "class A {}\r\n").unwrap();
-
-        // Match the index stat Git records after a transformed checkout while
-        // retaining the canonical LF blob OID.
-        let index_oid = refresh_index_stat_preserving_oid(&repo, "a.cs");
-        let visible_oid = Oid::hash_object(ObjectType::Blob, b"class A {}\r\n").unwrap();
-        assert_ne!(visible_oid, index_oid, "LF and CRLF OIDs must differ");
-
-        reset_hash_calls();
-        let resolved = working_tree_oids(&repo, &["a.cs".to_string()]).unwrap();
-        let visible_oid_hex = visible_oid.to_string();
-        let index_oid_hex = index_oid.to_string();
-        assert_eq!(resolved.get("a.cs"), Some(&visible_oid_hex));
-        assert_ne!(resolved.get("a.cs"), Some(&index_oid_hex));
-        assert_eq!(hash_calls(), 1);
-    }
-
-    #[test]
-    fn equal_size_filter_attribute_hashes_working_tree_bytes() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let repo = init_repo(temp.path());
-        let source_path = temp.path().join("a.txt");
-        std::fs::write(&source_path, "hello\n").unwrap();
-        commit_all(&repo, "source");
-
-        // The explicit filter has equal-size output in this fixture. The
-        // attribute guard must still avoid trusting the index OID.
-        std::fs::write(temp.path().join(".gitattributes"), "*.txt filter=opaque\n").unwrap();
-        commit_paths(&repo, &[".gitattributes"], "attributes");
-
-        let index_oid = repo
-            .index()
-            .unwrap()
-            .get_path(Path::new("a.txt"), 0)
-            .expect("source index entry")
-            .id;
-        let visible_oid = Oid::hash_object(ObjectType::Blob, b"hello\n").unwrap();
-        assert_eq!(visible_oid, index_oid);
-
-        reset_hash_calls();
-        let resolved = working_tree_oids(&repo, &["a.txt".to_string()]).unwrap();
-        assert_eq!(resolved.get("a.txt"), Some(&visible_oid.to_string()));
-        assert_eq!(hash_calls(), 1);
-    }
-
-    #[test]
-    fn dirty_file_oid_reflects_working_tree() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let repo = init_repo(temp.path());
-        std::fs::write(temp.path().join("a.txt"), "hello\n").unwrap();
-        commit_all(&repo, "init");
-        std::fs::write(temp.path().join("a.txt"), "changed\n").unwrap();
-
-        reset_hash_calls();
-        let oids = working_tree_oids(&repo, &["a.txt".to_string()]).unwrap();
-        assert_eq!(
-            oids["a.txt"],
-            Oid::hash_object(ObjectType::Blob, b"changed\n")
-                .unwrap()
-                .to_string()
-        );
-        assert_eq!(hash_calls(), 1);
-
-        let uncommitted = uncommitted_oids(temp.path()).unwrap();
-        assert!(uncommitted.contains(&oids["a.txt"]));
-    }
-
-    #[test]
-    fn targeted_matches_bulk_for_clean_dirty_and_untracked() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let repo = init_repo(temp.path());
-        std::fs::write(temp.path().join("clean.txt"), "clean\n").unwrap();
-        std::fs::write(temp.path().join("dirty.txt"), "committed\n").unwrap();
-        commit_all(&repo, "init");
-        std::fs::write(temp.path().join("dirty.txt"), "working\n").unwrap();
-        std::fs::write(temp.path().join("new.txt"), "fresh\n").unwrap();
-
-        let paths = vec![
-            "clean.txt".to_string(),
-            "dirty.txt".to_string(),
-            "new.txt".to_string(),
-        ];
-        let bulk = working_tree_oids(&repo, &paths).unwrap();
-        let targeted = working_tree_oids_targeted(&repo, &paths).unwrap();
-        assert_eq!(bulk, targeted);
-        assert_eq!(
-            targeted["clean.txt"],
-            Oid::hash_object(ObjectType::Blob, b"clean\n")
-                .unwrap()
-                .to_string()
-        );
-        assert_eq!(
-            targeted["dirty.txt"],
-            Oid::hash_object(ObjectType::Blob, b"working\n")
-                .unwrap()
-                .to_string()
-        );
-    }
-
-    #[test]
-    fn batched_identity_pairs_current_metadata_with_clean_dirty_and_untracked_oids() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let repo = init_repo(temp.path());
-        std::fs::write(temp.path().join("clean.txt"), "clean\n").unwrap();
-        std::fs::write(temp.path().join("dirty.txt"), "committed\n").unwrap();
-        commit_all(&repo, "init");
-        std::fs::write(temp.path().join("dirty.txt"), "working\n").unwrap();
-        std::fs::write(temp.path().join("new.txt"), "fresh\n").unwrap();
-
-        let identity = working_tree_identity(&repo).unwrap();
-        reset_hash_calls();
-        let resolved = identity
-            .resolve_with_metadata(
-                &repo,
-                &[
-                    "clean.txt".to_string(),
-                    "dirty.txt".to_string(),
-                    "new.txt".to_string(),
-                ],
-            )
-            .unwrap();
-
-        for (path, bytes) in [
-            ("clean.txt", b"clean\n".as_slice()),
-            ("dirty.txt", b"working\n".as_slice()),
-            ("new.txt", b"fresh\n".as_slice()),
-        ] {
-            let resolution = &resolved[path];
-            assert_eq!(
-                resolution.oid,
-                Oid::hash_object(ObjectType::Blob, bytes).unwrap()
-            );
-            assert_eq!(resolution.metadata.len(), bytes.len() as u64);
-            assert!(metadata_same(
-                &resolution.metadata,
-                &std::fs::metadata(temp.path().join(path)).unwrap()
-            ));
-        }
-        assert_eq!(
-            hash_calls(),
-            2,
-            "only dirty and untracked files should read visible bytes"
-        );
-    }
-
-    #[test]
-    fn invalidating_one_path_retains_other_clean_index_identities() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let repo = init_repo(temp.path());
-        std::fs::write(temp.path().join("changed.txt"), "before!\n").unwrap();
-        std::fs::write(temp.path().join("untouched.txt"), "stable\n").unwrap();
-        commit_all(&repo, "init");
-
-        let identity = working_tree_identity(&repo).unwrap();
-        identity.invalidate_paths(["changed.txt".to_string()]);
-        reset_hash_calls();
-        let resolved = identity
-            .resolve_with_metadata(
-                &repo,
-                &["changed.txt".to_string(), "untouched.txt".to_string()],
-            )
-            .unwrap();
-
-        assert_eq!(
-            resolved["changed.txt"].oid,
-            Oid::hash_object(ObjectType::Blob, b"before!\n").unwrap()
-        );
-        assert_eq!(
-            resolved["untouched.txt"].oid,
-            Oid::hash_object(ObjectType::Blob, b"stable\n").unwrap()
-        );
-        assert_eq!(
-            hash_calls(),
-            1,
-            "only the explicitly invalidated path should leave the index fast path"
-        );
-    }
-
-    #[test]
-    fn gc_oids_include_existing_tracked_and_untracked_bytes() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let repo = init_repo(temp.path());
-        std::fs::write(temp.path().join("clean.txt"), "clean\n").unwrap();
-        std::fs::write(temp.path().join("changed.txt"), "committed\n").unwrap();
-        std::fs::write(temp.path().join("deleted.txt"), "deleted\n").unwrap();
-        commit_all(&repo, "init");
-
-        std::fs::write(temp.path().join("changed.txt"), "working\r\n").unwrap();
-        std::fs::remove_file(temp.path().join("deleted.txt")).unwrap();
-        std::fs::write(temp.path().join("untracked.txt"), "untracked\n").unwrap();
-
-        let oids = existing_working_tree_oids(temp.path()).unwrap();
-        for bytes in [
-            b"clean\n".as_slice(),
-            b"working\r\n".as_slice(),
-            b"untracked\n".as_slice(),
-        ] {
-            let oid = Oid::hash_object(ObjectType::Blob, bytes)
-                .unwrap()
-                .to_string();
-            assert!(oids.contains(&oid), "missing working-tree OID {oid}");
-        }
-        let deleted_oid = Oid::hash_object(ObjectType::Blob, b"deleted\n")
-            .unwrap()
-            .to_string();
-        assert!(!oids.contains(&deleted_oid));
     }
 }

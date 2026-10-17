@@ -26,6 +26,7 @@ pub(super) struct ArgumentConversion {
     pub range: Range,
     pub formal: usize,
     pub transfer: Result<Option<ValueTransfer>, ConversionUnknown>,
+    pub incomplete_reason: Option<String>,
 }
 
 impl WorkspaceSemanticOracle<'_> {
@@ -90,6 +91,8 @@ impl WorkspaceSemanticOracle<'_> {
             ..SemanticWork::default()
         });
         let mut examined = 0;
+        let mut lookup_status_incomplete = false;
+        let mut lookup_incomplete_reason = None;
         let result = (|| {
             let shapes = call_shapes_in_file(&facts, file, facts.nodes().len());
             let mut matches = shapes.into_iter().filter(|shape| {
@@ -121,15 +124,27 @@ impl WorkspaceSemanticOracle<'_> {
             )
             .into_iter()
             .next()?;
-            if lookup.outcome.status != DefinitionLookupStatus::Resolved
-                || lookup.truncated
-                || lookup.structure_unavailable
-                || lookup.unproven_link_unit
-            {
+            lookup_status_incomplete = lookup.outcome.status == DefinitionLookupStatus::Incomplete;
+            lookup_incomplete_reason = lookup_status_incomplete.then(|| {
+                lookup
+                    .outcome
+                    .diagnostics
+                    .iter()
+                    .find(|diagnostic| diagnostic.kind == "incomplete_binding")
+                    .expect("an incomplete selected-native lookup retains its gap diagnostic")
+                    .message
+                    .clone()
+            });
+            if lookup.truncated || lookup.structure_unavailable || lookup.unproven_link_unit {
                 return None;
             }
-            let [target] = lookup.outcome.definitions.as_slice() else {
-                return None;
+            let target = if lookup.outcome.status == DefinitionLookupStatus::Resolved {
+                let [target] = lookup.outcome.definitions.as_slice() else {
+                    return None;
+                };
+                target
+            } else {
+                lookup.unique_incomplete_native_source_candidate()?.0
             };
             if target.source() != &sources[1].0 {
                 return None;
@@ -210,6 +225,7 @@ impl WorkspaceSemanticOracle<'_> {
                             .as_ref()
                             .map(|_| fact.transfer())
                             .map_err(|reason| *reason),
+                        incomplete_reason: lookup_incomplete_reason.clone(),
                     })
                 })
                 .collect();
@@ -225,6 +241,13 @@ impl WorkspaceSemanticOracle<'_> {
                 work,
             });
         };
-        Ok(SemanticOutcome::Complete { value, work })
+        if lookup_status_incomplete {
+            Ok(SemanticOutcome::Unknown {
+                partial: Some(value),
+                work,
+            })
+        } else {
+            Ok(SemanticOutcome::Complete { value, work })
+        }
     }
 }

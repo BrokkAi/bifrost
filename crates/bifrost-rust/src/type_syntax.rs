@@ -365,9 +365,8 @@ mod type_forms_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brokk_bifrost_core::analyzer::source_facts::{
-        PrimarySourceFactCollector, SourceOccurrenceProvenance,
-    };
+    use brokk_bifrost_core::analyzer::source_facts::PrimarySourceFactCollector;
+    use brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceProvenance;
     use tree_sitter::Parser;
 
     fn target<'tree>(tree: &'tree tree_sitter::Tree) -> Node<'tree> {
@@ -411,41 +410,6 @@ mod tests {
             .clone();
         let facts = collector.into_facts();
         (fact, facts, sink.finish())
-    }
-
-    #[test]
-    fn retains_raw_name_and_primary_occurrence() {
-        let source = "impl r#Type {}";
-        let (fact, rows) = parse_fact(source);
-        let RustTypeSourceShape::Path { segments, .. } = fact.shape else {
-            panic!("raw identifier is a path");
-        };
-        assert_eq!(segments[0].name, "Type");
-        assert_eq!(fact.occurrence, segments[0].occurrence);
-        assert_eq!(
-            rows.occurrence(fact.occurrence).provenance,
-            SourceOccurrenceProvenance::PrimaryNode
-        );
-    }
-
-    #[test]
-    fn retains_leading_absolute_path() {
-        let (fact, _) = parse_fact("impl ::external::Type {}");
-        let RustTypeSourceShape::Path {
-            leading_absolute,
-            segments,
-        } = fact.shape
-        else {
-            panic!("absolute path is supported");
-        };
-        assert!(leading_absolute);
-        assert_eq!(
-            segments
-                .iter()
-                .map(|segment| segment.name.as_str())
-                .collect::<Vec<_>>(),
-            ["external", "Type"]
-        );
     }
 
     #[test]
@@ -498,6 +462,49 @@ mod tests {
     }
 
     #[test]
+    fn deeply_nested_references_use_iterative_walk() {
+        let source = format!("impl {}Type {{}}", "&".repeat(2048));
+        let (fact, _) = parse_fact(&source);
+        assert_eq!(fact.wrappers.len(), 2048);
+        assert!(declaration_owner_path(&fact).is_some());
+    }
+
+    #[test]
+    fn retains_raw_name_and_primary_occurrence() {
+        let source = "impl r#Type {}";
+        let (fact, rows) = parse_fact(source);
+        let RustTypeSourceShape::Path { segments, .. } = fact.shape else {
+            panic!("raw identifier is a path");
+        };
+        assert_eq!(segments[0].name, "Type");
+        assert_eq!(fact.occurrence, segments[0].occurrence);
+        assert_eq!(
+            rows.occurrence(fact.occurrence).provenance,
+            SourceOccurrenceProvenance::PrimaryNode
+        );
+    }
+
+    #[test]
+    fn retains_leading_absolute_path() {
+        let (fact, _) = parse_fact("impl ::external::Type {}");
+        let RustTypeSourceShape::Path {
+            leading_absolute,
+            segments,
+        } = fact.shape
+        else {
+            panic!("absolute path is supported");
+        };
+        assert!(leading_absolute);
+        assert_eq!(
+            segments
+                .iter()
+                .map(|segment| segment.name.as_str())
+                .collect::<Vec<_>>(),
+            ["external", "Type"]
+        );
+    }
+
+    #[test]
     fn qualified_type_is_explicitly_unsupported() {
         let (fact, _) = parse_fact("impl <T as Trait>::Assoc {}");
         assert!(matches!(
@@ -505,14 +512,6 @@ mod tests {
             RustTypeSourceShape::Unsupported { occurrence, ref syntax_kind }
                 if occurrence == fact.occurrence && syntax_kind == "scoped_type_identifier"
         ));
-    }
-
-    #[test]
-    fn deeply_nested_references_use_iterative_walk() {
-        let source = format!("impl {}Type {{}}", "&".repeat(2048));
-        let (fact, _) = parse_fact(&source);
-        assert_eq!(fact.wrappers.len(), 2048);
-        assert!(declaration_owner_path(&fact).is_some());
     }
 
     #[test]

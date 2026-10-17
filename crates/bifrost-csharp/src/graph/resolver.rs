@@ -1,37 +1,29 @@
-use crate::declarations::CSHARP_IDENTIFIER_SIGIL;
 use crate::graph::CSharpGraphSource;
+use crate::graph::extractor::member_access_name;
 use crate::graph_support::{self, CSharpSource};
 use crate::hierarchy;
+pub use crate::syntax::csharp_identifier_text as node_text;
 use crate::syntax::{
-    CSharpMemberName, CSharpRelationalGenericCall, csharp_attribute_type_names,
-    csharp_callable_arity, csharp_callable_arity_from_metadata, csharp_conditional_member_access,
-    csharp_member_name, csharp_normalize_full_name, csharp_source_identifier,
+    CSharpMemberName, CSharpRelationalGenericCall, csharp_arity_preserving_full_name,
+    csharp_attribute_type_names, csharp_callable_arity, csharp_callable_arity_from_metadata,
+    csharp_conditional_member_access, csharp_is_member_variable_owner_kind, csharp_member_name,
+    csharp_normalize_full_name, csharp_parameter_name_and_type, csharp_source_identifier,
     csharp_type_leftmost_identifier, csharp_type_node_identity, csharp_type_reference_root,
     csharp_using_directive_is_global, csharp_using_directive_is_static,
-    csharp_using_directive_namespace, csharp_using_directive_target,
+    csharp_using_directive_namespace, csharp_using_directive_target, map_csharp_type_arguments,
 };
 use brokk_bifrost_core::analyzer::model::{
     CallableArity, ClassLikeKind, SignatureMetadata, StructuredTypeIdentity, StructuredTypeName,
 };
 use brokk_bifrost_core::analyzer::query_batch::LimitedQueryRows;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
+use brokk_bifrost_core::analyzer::semantic_diagnostics::contains_node as node_covers;
+use brokk_bifrost_core::analyzer::tree_walk::{
+    child_by_field_or_named_child_of_kinds, first_named_child_of_kind, named_children_iter,
+    push_named_children_reversed,
+};
 pub(super) use brokk_bifrost_core::analyzer::usages::common::same_node;
 
-/// Trimmed C# node text with the verbatim-identifier `@` sigil normalized off
-/// identifier tokens (`@class` -> `class`). Declaration short/fq names already
-/// strip `@` when built, so the reference/get-definition side must strip it too
-/// for a verbatim-identifier usage to resolve to its declaration (previously it
-/// did not — the same normalization-agreement class as Rust's `r#`). Gated to
-/// the `identifier` kind so `@"..."` verbatim strings and attribute markers are
-/// untouched.
-pub fn node_text<'a>(node: tree_sitter::Node<'_>, source: &'a str) -> &'a str {
-    brokk_bifrost_core::analyzer::common::node_ident_text(
-        node,
-        source,
-        true,
-        &CSHARP_IDENTIFIER_SIGIL,
-    )
-}
 use brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex;
 use brokk_bifrost_core::analyzer::usages::local_inference::{
     LocalInferenceEngine, SymbolResolution,
@@ -43,17 +35,14 @@ use std::sync::Arc;
 use tree_sitter::Node;
 
 fn resolution_scope_step(session: Option<&ResolutionSession>) -> bool {
-    session.is_none_or(ResolutionSession::scope_step)
+    ResolutionSession::scope_step_with_optional_session(session)
 }
 
 fn resolution_query<T>(
     session: Option<&ResolutionSession>,
     query: impl FnOnce() -> T,
 ) -> Option<T> {
-    match session {
-        Some(session) => session.query(query),
-        None => Some(query()),
-    }
+    ResolutionSession::query_with_optional_session(session, query)
 }
 
 fn resolution_query_rows<T>(
@@ -71,10 +60,11 @@ fn resolution_query_limited_rows<T>(
     limited_query: impl FnOnce(usize) -> LimitedQueryRows<T>,
     unbounded_query: impl FnOnce() -> Vec<T>,
 ) -> Vec<T> {
-    match session {
-        Some(session) => session.query_limited_rows(limited_query),
-        None => unbounded_query(),
-    }
+    ResolutionSession::query_limited_rows_with_optional_session(
+        session,
+        limited_query,
+        unbounded_query,
+    )
 }
 
 fn resolution_summary_rows<T>(
@@ -141,16 +131,24 @@ fn unique_resolved_metadata_type(
     resolved
 }
 
+fn signature_metadata_for_unit(
+    csharp: &dyn CSharpSource,
+    unit: &CodeUnit,
+    session: Option<&ResolutionSession>,
+) -> Vec<SignatureMetadata> {
+    resolution_query_limited_rows(
+        session,
+        |limit| csharp.signature_metadata_limited(unit, limit),
+        || csharp.signature_metadata(unit),
+    )
+}
+
 fn method_generic_arity_for_unit(
     csharp: &dyn CSharpSource,
     unit: &CodeUnit,
     session: Option<&ResolutionSession>,
 ) -> Option<usize> {
-    let metadata = resolution_query_limited_rows(
-        session,
-        |limit| csharp.signature_metadata_limited(unit, limit),
-        || csharp.signature_metadata(unit),
-    );
+    let metadata = signature_metadata_for_unit(csharp, unit, session);
     unique_metadata_type_parameter_arity(&metadata)
 }
 
@@ -159,11 +157,7 @@ fn callable_arity_for_unit(
     unit: &CodeUnit,
     session: Option<&ResolutionSession>,
 ) -> Option<CallableArity> {
-    let metadata = resolution_query_limited_rows(
-        session,
-        |limit| csharp.signature_metadata_limited(unit, limit),
-        || csharp.signature_metadata(unit),
-    );
+    let metadata = signature_metadata_for_unit(csharp, unit, session);
     csharp_callable_arity_from_metadata(&metadata)
 }
 
@@ -255,7 +249,16 @@ pub fn seed_bindings_before(
     source: &str,
     bindings: &mut LocalInferenceEngine<CSharpDeclaredType>,
 ) {
-    seed_bindings_before_inner(node, cutoff_start, csharp, token, file, source, bindings);
+    walk_named_nodes_before(node, cutoff_start, |current| {
+        match current.kind() {
+            "parameter" => seed_parameter(current, csharp, token, file, source, bindings),
+            "variable_declaration" => {
+                seed_variable_declaration(current, csharp, token, file, source, bindings)
+            }
+            _ => {}
+        }
+        NamedNodeWalk::Descend
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -269,72 +272,63 @@ pub fn seed_bindings_before_in_session(
     bindings: &mut LocalInferenceEngine<CSharpDeclaredType>,
     session: &ResolutionSession,
 ) {
-    // Mirror `seed_bindings_before_inner` iteratively so deep local syntax is
-    // stack-safe and each visited node is charged exactly once.
+    walk_named_nodes_before(node, cutoff_start, |current| {
+        if !session.scope_step() {
+            return NamedNodeWalk::SkipChildren;
+        }
+        match current.kind() {
+            "parameter" => {
+                seed_parameter_in_session(current, csharp, token, file, source, bindings, session);
+                if !session.observe_cancellation() {
+                    return NamedNodeWalk::Stop;
+                }
+            }
+            "variable_declaration" => {
+                seed_variable_declaration_in_session(
+                    current, csharp, token, file, source, bindings, session,
+                );
+                if !session.observe_cancellation() {
+                    return NamedNodeWalk::Stop;
+                }
+            }
+            _ => {}
+        }
+        NamedNodeWalk::Descend
+    });
+}
+
+enum NamedNodeWalk {
+    Descend,
+    SkipChildren,
+    Stop,
+}
+
+fn walk_named_nodes_before(
+    node: Node<'_>,
+    cutoff_start: usize,
+    mut visit: impl FnMut(Node<'_>) -> NamedNodeWalk,
+) {
     let mut stack = vec![(node, 0usize)];
     while let Some((current, next_child)) = stack.pop() {
         if next_child == 0 {
-            if current.start_byte() >= cutoff_start || !session.scope_step() {
+            if current.start_byte() >= cutoff_start {
                 continue;
             }
-            match current.kind() {
-                "parameter" => {
-                    seed_parameter_in_session(
-                        current, csharp, token, file, source, bindings, session,
-                    );
-                    if !session.observe_cancellation() {
-                        return;
-                    }
-                }
-                "variable_declaration" => {
-                    seed_variable_declaration_in_session(
-                        current, csharp, token, file, source, bindings, session,
-                    );
-                    if !session.observe_cancellation() {
-                        return;
-                    }
-                }
-                _ => {}
+            match visit(current) {
+                NamedNodeWalk::Stop => return,
+                NamedNodeWalk::SkipChildren => continue,
+                NamedNodeWalk::Descend => {}
             }
         }
         let Some(child) = current.named_child(next_child) else {
             continue;
         };
-        if child.start_byte() >= cutoff_start {
-            continue;
+        if child.start_byte() < cutoff_start {
+            stack.push((current, next_child + 1));
+            stack.push((child, 0));
+        } else {
+            stack.push((current, next_child + 1));
         }
-        stack.push((current, next_child + 1));
-        stack.push((child, 0));
-    }
-}
-
-fn seed_bindings_before_inner(
-    node: Node<'_>,
-    cutoff_start: usize,
-    csharp: &dyn CSharpSource,
-    token: QueryToken<'_>,
-    file: &ProjectFile,
-    source: &str,
-    bindings: &mut LocalInferenceEngine<CSharpDeclaredType>,
-) {
-    if node.start_byte() >= cutoff_start {
-        return;
-    }
-
-    match node.kind() {
-        "parameter" => seed_parameter(node, csharp, token, file, source, bindings),
-        "variable_declaration" => {
-            seed_variable_declaration(node, csharp, token, file, source, bindings)
-        }
-        _ => {}
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.start_byte() >= cutoff_start {
-            break;
-        }
-        seed_bindings_before_inner(child, cutoff_start, csharp, token, file, source, bindings);
     }
 }
 
@@ -395,10 +389,6 @@ fn seed_visible_bindings_inner(
     }
 }
 
-fn node_covers(container: Node<'_>, target: Node<'_>) -> bool {
-    container.start_byte() <= target.start_byte() && target.end_byte() <= container.end_byte()
-}
-
 fn seed_usage_parameter(
     node: Node<'_>,
     csharp: &dyn CSharpSource,
@@ -407,13 +397,29 @@ fn seed_usage_parameter(
     source: &str,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
-    let Some(name_node) = node.child_by_field_name("name") else {
-        return;
-    };
-    let Some(type_node) = node.child_by_field_name("type") else {
+    let Some((name_node, type_node)) = csharp_parameter_name_and_type(node) else {
         return;
     };
     seed_usage_symbol_for_type(name_node, type_node, csharp, token, file, source, bindings);
+}
+
+pub(super) fn for_local_variable_declarators<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    mut visit: impl FnMut(Node<'tree>, &str, Node<'tree>),
+) {
+    if is_member_variable_declaration(node) {
+        return;
+    }
+    let Some(type_node) = node.child_by_field_name("type") else {
+        return;
+    };
+    let type_text = reference_type_text(type_node, source);
+    for declarator in named_children_iter(node) {
+        if declarator.kind() == "variable_declarator" {
+            visit(type_node, &type_text, declarator);
+        }
+    }
 }
 
 fn seed_parameter(
@@ -424,10 +430,7 @@ fn seed_parameter(
     source: &str,
     bindings: &mut LocalInferenceEngine<CSharpDeclaredType>,
 ) {
-    let Some(name_node) = node.child_by_field_name("name") else {
-        return;
-    };
-    let Some(type_node) = node.child_by_field_name("type") else {
+    let Some((name_node, type_node)) = csharp_parameter_name_and_type(node) else {
         return;
     };
     seed_symbol_for_type(name_node, type_node, csharp, token, file, source, bindings);
@@ -442,10 +445,7 @@ fn seed_parameter_in_session(
     bindings: &mut LocalInferenceEngine<CSharpDeclaredType>,
     session: &ResolutionSession,
 ) {
-    let Some(name_node) = node.child_by_field_name("name") else {
-        return;
-    };
-    let Some(type_node) = node.child_by_field_name("type") else {
+    let Some((name_node, type_node)) = csharp_parameter_name_and_type(node) else {
         return;
     };
     seed_symbol_for_type_in_session(
@@ -461,21 +461,9 @@ fn seed_usage_variable_declaration(
     source: &str,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
-    if is_member_variable_declaration(node) {
-        return;
-    }
-    let Some(type_node) = node.child_by_field_name("type") else {
-        return;
-    };
-    let type_text = reference_type_text(type_node, source);
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.kind() != "variable_declarator" {
-            continue;
-        }
+    for_local_variable_declarators(node, source, |type_node, type_text, child| {
         let Some(name_node) = child.child_by_field_name("name") else {
-            continue;
+            return;
         };
         if type_text == "var" {
             if let Some(initializer_type) = object_created_type(child)
@@ -497,7 +485,7 @@ fn seed_usage_variable_declaration(
         } else {
             seed_usage_symbol_for_type(name_node, type_node, csharp, token, file, source, bindings);
         }
-    }
+    });
 }
 
 fn seed_variable_declaration(
@@ -508,21 +496,9 @@ fn seed_variable_declaration(
     source: &str,
     bindings: &mut LocalInferenceEngine<CSharpDeclaredType>,
 ) {
-    if is_member_variable_declaration(node) {
-        return;
-    }
-    let Some(type_node) = node.child_by_field_name("type") else {
-        return;
-    };
-    let type_text = reference_type_text(type_node, source);
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.kind() != "variable_declarator" {
-            continue;
-        }
+    for_local_variable_declarators(node, source, |type_node, type_text, child| {
         let Some(name_node) = child.child_by_field_name("name") else {
-            continue;
+            return;
         };
         if type_text == "var" {
             if let Some(initializer_type) = object_created_type(child)
@@ -550,7 +526,7 @@ fn seed_variable_declaration(
         } else {
             seed_symbol_for_type(name_node, type_node, csharp, token, file, source, bindings);
         }
-    }
+    });
 }
 
 fn seed_variable_declaration_in_session(
@@ -609,12 +585,8 @@ fn seed_variable_declaration_in_session(
 }
 
 pub(super) fn is_member_variable_declaration(node: Node<'_>) -> bool {
-    node.parent().is_some_and(|parent| {
-        matches!(
-            parent.kind(),
-            "field_declaration" | "event_field_declaration"
-        )
-    })
+    node.parent()
+        .is_some_and(|parent| csharp_is_member_variable_owner_kind(parent.kind()))
 }
 
 fn var_initializer_member_type<T: DeclaredTypeName>(
@@ -630,29 +602,7 @@ fn var_initializer_member_type<T: DeclaredTypeName>(
     expression_type_fq_name_inner(initializer, csharp, token, file, source, bindings, usage)
 }
 
-fn variable_declarator_initializer(declarator: Node<'_>) -> Option<Node<'_>> {
-    declarator
-        .child_by_field_name("value")
-        .or_else(|| declarator.child_by_field_name("initializer"))
-        .or_else(|| {
-            let mut cursor = declarator.walk();
-            declarator
-                .named_children(&mut cursor)
-                .find(|child| child.kind() == "equals_value_clause")
-                .and_then(|clause| {
-                    clause
-                        .child_by_field_name("value")
-                        .or_else(|| clause.named_child(0))
-                })
-        })
-        .or_else(|| {
-            let name = declarator.child_by_field_name("name")?;
-            let mut cursor = declarator.walk();
-            declarator
-                .named_children(&mut cursor)
-                .find(|child| child.start_byte() > name.end_byte())
-        })
-}
+use crate::syntax::variable_declarator_initializer;
 
 fn expression_type_fq_name<T: DeclaredTypeName>(
     expression: Node<'_>,
@@ -677,7 +627,7 @@ fn expression_type_fq_name_inner<T: DeclaredTypeName>(
     match expression.kind() {
         "identifier" => {
             let name = node_text(expression, source);
-            first_precise_binding(bindings, name).or_else(|| {
+            unique_precise_binding(bindings, name).or_else(|| {
                 let owner = enclosing_declared_type(expression, csharp, token, file, source)?;
                 member_declared_type_fq_name_for_scope(csharp, token, &owner, name, usage)
             })
@@ -817,7 +767,7 @@ fn receiver_type_units<T: DeclaredTypeName>(
     match receiver.kind() {
         "identifier" => {
             let name = node_text(receiver, source);
-            if let Some(target) = first_precise_binding(bindings, name) {
+            if let Some(target) = unique_precise_binding(bindings, name) {
                 return usage_type_declarations_for_fq_name(csharp, token, &target);
             }
             if bindings.is_shadowed(name) {
@@ -847,16 +797,11 @@ fn receiver_type_units<T: DeclaredTypeName>(
 /// Both engine flavours answer the same way here: this walk consumes the name
 /// as a lookup key, which is what a written spelling still needs and what a
 /// proved identity already is.
-fn first_precise_binding<T: DeclaredTypeName>(
+fn unique_precise_binding<T: DeclaredTypeName>(
     bindings: &LocalInferenceEngine<T>,
     name: &str,
 ) -> Option<String> {
-    let SymbolResolution::Precise(targets) = bindings.resolve_symbol(name) else {
-        return None;
-    };
-    (targets.len() == 1)
-        .then(|| targets.iter().next())
-        .flatten()
+    brokk_bifrost_core::analyzer::usages::inverted_edges::unique_precise(bindings, name)
         .map(|target| target.type_name().to_string())
 }
 
@@ -869,15 +814,6 @@ fn member_access_receiver(node: Node<'_>) -> Option<Node<'_>> {
             node.named_children(&mut cursor)
                 .find(|child| child.kind() != "identifier")
         })
-}
-
-fn member_access_name(node: Node<'_>) -> Option<Node<'_>> {
-    node.child_by_field_name("name").or_else(|| {
-        let mut cursor = node.walk();
-        node.named_children(&mut cursor)
-            .filter(|child| child.kind() == "identifier")
-            .last()
-    })
 }
 
 pub(super) fn enclosing_declared_type(
@@ -898,9 +834,8 @@ pub(super) fn class_unit_for_fq_name(
     token: QueryToken<'_>,
     fqn: &str,
 ) -> Option<CodeUnit> {
-    let mut candidates = usage_type_declarations_for_fq_name(csharp, token, fqn);
-    graph_support::sort_dedup_type_candidates(&mut candidates);
-    (candidates.len() == 1).then(|| candidates.remove(0))
+    let candidates = usage_type_declarations_for_fq_name(csharp, token, fqn);
+    unique_type_candidate(candidates)
 }
 
 pub fn usage_direct_base(
@@ -930,7 +865,17 @@ fn csharp_is_class_base_declaration(graph: &CSharpGraphSource<'_>, candidate: &C
 fn forward_class_unit_for_fq_name(csharp: &dyn CSharpSource, fqn: &str) -> Option<CodeUnit> {
     let mut candidates = forward_type_declarations_for_fq_name(csharp, fqn);
     graph_support::sort_dedup_type_candidates(&mut candidates);
+    unique_type_candidate(candidates)
+}
+
+fn unique_type_candidate(mut candidates: Vec<CodeUnit>) -> Option<CodeUnit> {
     (candidates.len() == 1).then(|| candidates.remove(0))
+}
+
+fn unique_type_name(mut names: Vec<String>) -> Option<String> {
+    names.sort();
+    names.dedup();
+    (names.len() == 1).then(|| names.remove(0))
 }
 
 fn usage_type_declarations_for_fq_name(
@@ -943,19 +888,29 @@ fn usage_type_declarations_for_fq_name(
     candidates
 }
 
-fn forward_type_declarations_for_fq_name(csharp: &dyn CSharpSource, fqn: &str) -> Vec<CodeUnit> {
-    let mut candidates = graph_support::declaration_candidates_by_fqn(csharp, fqn, false)
+fn forward_type_declarations_for_fq_name_with(
+    mut candidates_by_match: impl FnMut(bool) -> Vec<CodeUnit>,
+) -> Vec<CodeUnit> {
+    let mut candidates = candidates_by_match(false)
         .into_iter()
         .filter(|unit| unit.is_class())
         .collect::<Vec<_>>();
     if candidates.is_empty() {
-        candidates = graph_support::declaration_candidates_by_fqn(csharp, fqn, true)
+        candidates = candidates_by_match(true)
             .into_iter()
             .filter(|unit| unit.is_class())
             .collect();
     }
     graph_support::sort_dedup_type_candidates(&mut candidates);
     candidates
+}
+
+fn forward_type_declarations_for_fq_name(csharp: &dyn CSharpSource, fqn: &str) -> Vec<CodeUnit> {
+    forward_type_declarations_for_fq_name_with(|relaxed| {
+        graph_support::declaration_candidates_by_fqn(csharp, fqn, relaxed)
+            .into_iter()
+            .collect()
+    })
 }
 
 fn forward_type_declarations_for_fq_name_in_session(
@@ -963,32 +918,17 @@ fn forward_type_declarations_for_fq_name_in_session(
     fqn: &str,
     session: &ResolutionSession,
 ) -> Vec<CodeUnit> {
-    let mut candidates = session
-        .query_limited_rows(|limit| {
-            graph_support::declaration_candidates_by_fqn_limited(csharp, fqn, false, limit, || {
-                session.observe_cancellation()
-            })
+    forward_type_declarations_for_fq_name_with(|relaxed| {
+        session.query_limited_rows(|limit| {
+            graph_support::declaration_candidates_by_fqn_limited(
+                csharp,
+                fqn,
+                relaxed,
+                limit,
+                || session.observe_cancellation(),
+            )
         })
-        .into_iter()
-        .filter(|unit| unit.is_class())
-        .collect::<Vec<_>>();
-    if candidates.is_empty() {
-        candidates = session
-            .query_limited_rows(|limit| {
-                graph_support::declaration_candidates_by_fqn_limited(
-                    csharp,
-                    fqn,
-                    true,
-                    limit,
-                    || session.observe_cancellation(),
-                )
-            })
-            .into_iter()
-            .filter(|unit| unit.is_class())
-            .collect();
-    }
-    graph_support::sort_dedup_type_candidates(&mut candidates);
-    candidates
+    })
 }
 
 fn forward_class_unit_for_fq_name_in_session(
@@ -996,8 +936,9 @@ fn forward_class_unit_for_fq_name_in_session(
     fqn: &str,
     session: &ResolutionSession,
 ) -> Option<CodeUnit> {
-    let mut candidates = forward_type_declarations_for_fq_name_in_session(csharp, fqn, session);
-    (candidates.len() == 1).then(|| candidates.remove(0))
+    unique_type_candidate(forward_type_declarations_for_fq_name_in_session(
+        csharp, fqn, session,
+    ))
 }
 
 fn using_aliases_for_file_in_session(
@@ -1122,35 +1063,26 @@ fn forward_direct_ancestors_in_session(
         parts.push(owner.clone());
     }
 
-    let mut ancestors = Vec::new();
-    for part in parts {
-        if !session.scope_step() {
-            return Vec::new();
-        }
-        let raw_supertypes =
-            session.query_limited_rows(|limit| csharp.raw_supertypes_limited(&part, limit));
-        if !session.observe_cancellation() {
-            return Vec::new();
-        }
-        for raw in raw_supertypes {
+    graph_support::logical_direct_ancestors(
+        parts,
+        |part| {
             if !session.scope_step() {
-                return Vec::new();
+                return None;
             }
-            let candidates = supertype_candidates_in_session(csharp, token, &part, &raw, session);
-            if !session.observe_cancellation() {
-                return Vec::new();
-            }
-            let Some(ancestor) = graph_support::unique_logical_type(candidates) else {
-                continue;
-            };
+            let raw =
+                session.query_limited_rows(|limit| csharp.raw_supertypes_limited(part, limit));
+            session.observe_cancellation().then_some(raw)
+        },
+        |part, raw| {
             if !session.scope_step() {
-                return Vec::new();
+                return None;
             }
-            ancestors.push(ancestor);
-        }
-    }
-    graph_support::sort_dedup_type_candidates(&mut ancestors);
-    ancestors
+            let candidates = supertype_candidates_in_session(csharp, token, part, raw, session);
+            session.observe_cancellation().then_some(candidates)
+        },
+        |_| session.scope_step().then_some(()),
+    )
+    .unwrap_or_default()
 }
 
 pub fn member_declared_type_fq_name(
@@ -1220,12 +1152,9 @@ pub fn member_declared_collection_element_type_fq_name_in_session(
             let Some(identity) = metadata.return_type_identity().cloned() else {
                 continue;
             };
-            let element = if identity.is_array() {
-                identity.into_container_element_with(|| session.scope_step())
-            } else {
-                identity.into_single_generic_argument_with(|| session.scope_step())
-            };
-            let Some(element) = element else {
+            let Some(element) =
+                member_collection_element_identity(identity, || session.scope_step())
+            else {
                 continue;
             };
             if let Some(resolved) = resolve_structured_member_type_fq_name_in_session(
@@ -1240,9 +1169,7 @@ pub fn member_declared_collection_element_type_fq_name_in_session(
             }
         }
     }
-    resolved_types.sort();
-    resolved_types.dedup();
-    (resolved_types.len() == 1).then(|| resolved_types.remove(0))
+    unique_type_name(resolved_types)
 }
 
 pub fn member_declared_collection_element_type_fq_name(
@@ -1252,7 +1179,7 @@ pub fn member_declared_collection_element_type_fq_name(
     member_name: &str,
 ) -> Option<String> {
     let member_fqn = format!("{}.{}", owner.fq_name(), member_name);
-    let mut resolved_types = csharp
+    let resolved_types = csharp
         .member_candidates_for_owner(owner.fq_name().as_str(), member_name)
         .into_iter()
         .filter(|unit| unit.is_field() && unit.fq_name() == member_fqn)
@@ -1262,11 +1189,7 @@ pub fn member_declared_collection_element_type_fq_name(
                 .into_iter()
                 .filter_map(move |metadata| {
                     let identity = metadata.return_type_identity()?.clone();
-                    let element = if identity.is_array() {
-                        identity.into_container_element_with(|| true)
-                    } else {
-                        identity.into_single_generic_argument_with(|| true)
-                    }?;
+                    let element = member_collection_element_identity(identity, || true)?;
                     resolve_structured_member_type_fq_name(
                         csharp,
                         token,
@@ -1277,9 +1200,18 @@ pub fn member_declared_collection_element_type_fq_name(
                 })
         })
         .collect::<Vec<_>>();
-    resolved_types.sort();
-    resolved_types.dedup();
-    (resolved_types.len() == 1).then(|| resolved_types.remove(0))
+    unique_type_name(resolved_types)
+}
+
+fn member_collection_element_identity(
+    identity: StructuredTypeIdentity,
+    scope_step: impl FnMut() -> bool,
+) -> Option<StructuredTypeIdentity> {
+    if identity.is_array() {
+        identity.into_container_element_with(scope_step)
+    } else {
+        identity.into_single_generic_argument_with(scope_step)
+    }
 }
 
 pub(super) fn usage_member_declared_type_fq_name(
@@ -1288,7 +1220,7 @@ pub(super) fn usage_member_declared_type_fq_name(
     owner: &CodeUnit,
     member_name: &str,
 ) -> Option<String> {
-    member_declared_type_fq_name_inner(csharp, token, owner, member_name, true, None)
+    member_declared_type_fq_name_for_scope(csharp, token, owner, member_name, true)
 }
 
 fn member_declared_type_fq_name_for_scope(
@@ -1478,35 +1410,53 @@ fn method_return_type_fq_name_for_arity_inner(
         usage,
         session,
     );
+    unique_candidate_return_type(candidates, session, |unit| {
+        if !unit.is_function() {
+            return CandidateReturnType::Skip;
+        }
+        let Some(callable_arity) = callable_arity_for_unit(csharp, unit, session) else {
+            return CandidateReturnType::Abort;
+        };
+        if arity.is_some_and(|call_arity| !callable_arity.accepts(call_arity)) {
+            return CandidateReturnType::Skip;
+        }
+        CandidateReturnType::Resolved(callable_return_type_fq_name(
+            csharp,
+            token,
+            unit,
+            owner,
+            explicit_type_arguments,
+            usage,
+            session,
+        ))
+    })
+}
+
+enum CandidateReturnType {
+    Skip,
+    Abort,
+    Resolved(Option<String>),
+}
+
+fn unique_candidate_return_type(
+    candidates: impl IntoIterator<Item = CodeUnit>,
+    session: Option<&ResolutionSession>,
+    mut resolve: impl FnMut(&CodeUnit) -> CandidateReturnType,
+) -> Option<String> {
     let mut resolved = Vec::new();
     for unit in candidates {
         if !resolution_scope_step(session) {
             return None;
         }
-        if !unit.is_function() {
-            continue;
-        }
-        let callable_arity = callable_arity_for_unit(csharp, &unit, session)?;
-        if arity.is_some_and(|call_arity| !callable_arity.accepts(call_arity)) {
-            continue;
-        }
-        if let Some(resolved_type) = callable_return_type_fq_name(
-            csharp,
-            token,
-            &unit,
-            owner,
-            explicit_type_arguments,
-            usage,
-            session,
-        ) {
-            resolved.push(resolved_type);
-        } else if session.is_some() {
-            return None;
+        match resolve(&unit) {
+            CandidateReturnType::Skip => {}
+            CandidateReturnType::Abort => return None,
+            CandidateReturnType::Resolved(Some(resolved_type)) => resolved.push(resolved_type),
+            CandidateReturnType::Resolved(None) if session.is_some() => return None,
+            CandidateReturnType::Resolved(None) => {}
         }
     }
-    resolved.sort();
-    resolved.dedup();
-    (resolved.len() == 1).then(|| resolved.remove(0))
+    unique_type_name(resolved)
 }
 
 /// Resolve a callable's declared return type to a fully-qualified type name,
@@ -1662,28 +1612,17 @@ fn extension_invocation_return_type_fq_name_inner(
         usage,
         session,
     );
-    let mut resolved = Vec::new();
-    for unit in candidates {
-        if !resolution_scope_step(session) {
-            return None;
-        }
-        if let Some(resolved_type) = callable_return_type_fq_name(
+    unique_candidate_return_type(candidates, session, |unit| {
+        CandidateReturnType::Resolved(callable_return_type_fq_name(
             csharp,
             token,
-            &unit,
-            &unit,
+            unit,
+            unit,
             explicit_type_arguments,
             usage,
             session,
-        ) {
-            resolved.push(resolved_type);
-        } else if session.is_some() {
-            return None;
-        }
-    }
-    resolved.sort();
-    resolved.dedup();
-    (resolved.len() == 1).then(|| resolved.remove(0))
+        ))
+    })
 }
 
 fn resolved_type_arguments(
@@ -1694,20 +1633,15 @@ fn resolved_type_arguments(
     source: &str,
     usage: bool,
 ) -> Option<Vec<String>> {
-    let arguments = name.type_arguments?;
-    let mut cursor = arguments.walk();
-    arguments
-        .named_children(&mut cursor)
-        .map(|argument| {
-            resolve_type_fq_name_for_scope(
-                csharp,
-                token,
-                file,
-                &reference_type_text(argument, source),
-                usage,
-            )
-        })
-        .collect()
+    map_csharp_type_arguments(name.type_arguments, |argument| {
+        resolve_type_fq_name_for_scope(
+            csharp,
+            token,
+            file,
+            &reference_type_text(argument, source),
+            usage,
+        )
+    })
 }
 
 fn substituted_method_type_parameter(
@@ -1813,15 +1747,11 @@ pub fn csharp_invocation_member<'tree>(
 }
 
 pub fn call_argument_node(call: Node<'_>, index: usize) -> Option<Node<'_>> {
-    let arguments = call
-        .child_by_field_name("arguments")
-        .or_else(|| first_named_child_of_kind(call, "argument_list"))?;
+    let arguments = child_by_field_or_named_child_of_kinds(call, "arguments", &["argument_list"])?;
     if arguments.kind() != "argument_list" {
         return None;
     }
-    let mut cursor = arguments.walk();
-    arguments
-        .named_children(&mut cursor)
+    named_children_iter(arguments)
         .filter(|argument| argument.kind() == "argument")
         .nth(index)
 }
@@ -1847,6 +1777,53 @@ pub fn call_argument_parameter_index(
         .position(|parameter| parameter.label() == name)
 }
 
+/// Map a unique call candidate and argument to its declared parameter owners.
+/// Callers supply direction-specific candidate and type lookup operations.
+pub fn resolve_call_argument_owners(
+    call: Node<'_>,
+    index: usize,
+    source: &str,
+    method_candidates: Vec<CodeUnit>,
+    mut signature_metadata: impl FnMut(&CodeUnit) -> Vec<SignatureMetadata>,
+    mut parameter_owners: impl FnMut(&CodeUnit, usize) -> Vec<CodeUnit>,
+) -> CSharpCallArgumentOwners {
+    if method_candidates.len() != 1 {
+        return CSharpCallArgumentOwners {
+            owners: Vec::new(),
+            ambiguous_call_candidates: method_candidates,
+        };
+    }
+    let method = &method_candidates[0];
+    let metadata = signature_metadata(method);
+    let Some(metadata) = metadata.first() else {
+        return CSharpCallArgumentOwners {
+            owners: Vec::new(),
+            ambiguous_call_candidates: Vec::new(),
+        };
+    };
+    let Some(parameter_index) = call_argument_parameter_index(call, index, metadata, source) else {
+        return CSharpCallArgumentOwners {
+            owners: Vec::new(),
+            ambiguous_call_candidates: Vec::new(),
+        };
+    };
+    CSharpCallArgumentOwners {
+        owners: parameter_owners(method, parameter_index),
+        ambiguous_call_candidates: Vec::new(),
+    }
+}
+
+fn callable_parameter_type_text(
+    metadata: &[SignatureMetadata],
+    parameter_index: usize,
+) -> Option<&str> {
+    metadata
+        .iter()
+        .find_map(|metadata| metadata.callable_parameter_types())
+        .and_then(|types| types.get(parameter_index))
+        .map(String::as_str)
+}
+
 /// Resolve a callable parameter's declared type in the callable's declaring
 /// type scope. The caller has already chosen the method candidate; this helper
 /// only reads its recorded parameter spelling and resolves that spelling where
@@ -1858,10 +1835,7 @@ pub fn callable_parameter_type_fq_name(
     parameter_index: usize,
 ) -> Option<String> {
     let metadata = csharp.signature_metadata(method);
-    let type_text = metadata
-        .iter()
-        .find_map(|metadata| metadata.callable_parameter_types())
-        .and_then(|types| types.get(parameter_index))?;
+    let type_text = callable_parameter_type_text(&metadata, parameter_index)?;
     let owner = csharp.parent_of(method)?;
     resolve_member_type_fq_name(csharp, token, method.source(), &owner, type_text, true)
 }
@@ -1874,10 +1848,7 @@ pub fn callable_parameter_type_fq_name_for_forward(
     parameter_index: usize,
 ) -> Option<String> {
     let metadata = csharp.signature_metadata(method);
-    let type_text = metadata
-        .iter()
-        .find_map(|metadata| metadata.callable_parameter_types())
-        .and_then(|types| types.get(parameter_index))?;
+    let type_text = callable_parameter_type_text(&metadata, parameter_index)?;
     let owner = csharp.parent_of(method)?;
     resolve_member_type_fq_name(csharp, token, method.source(), &owner, type_text, false)
 }
@@ -1895,10 +1866,7 @@ pub fn callable_parameter_type_fq_name_in_session(
     if !session.observe_cancellation() {
         return None;
     }
-    let type_text = metadata
-        .iter()
-        .find_map(|metadata| metadata.callable_parameter_types())
-        .and_then(|types| types.get(parameter_index))?;
+    let type_text = callable_parameter_type_text(&metadata, parameter_index)?;
     let owner = session.query(|| csharp.parent_of(method)).flatten()?;
     if !session.observe_cancellation() {
         return None;
@@ -1951,10 +1919,10 @@ fn resolve_structured_member_type_fq_name_in_session(
     session: &ResolutionSession,
 ) -> Option<String> {
     let name = identity.nominal_name_with(|| session.scope_step())?;
-    if csharp_owner_chain_declares_type_parameter_in_session(csharp, owner, name, session) {
-        return None;
-    }
-    resolve_structured_type_fq_name_in_session(csharp, token, file, name, session)
+    resolve_structured_member_type_fq_name_with(
+        || csharp_owner_chain_declares_type_parameter_in_session(csharp, owner, name, session),
+        || resolve_structured_type_fq_name_in_session(csharp, token, file, name, session),
+    )
 }
 
 fn resolve_structured_member_type_fq_name(
@@ -1965,16 +1933,44 @@ fn resolve_structured_member_type_fq_name(
     identity: &StructuredTypeIdentity,
 ) -> Option<String> {
     let name = identity.nominal_name()?;
-    if csharp_owner_chain_declares_type_parameter(csharp, owner, name) {
-        return None;
-    }
-    resolve_structured_type_fq_name(csharp, token, file, name)
+    resolve_structured_member_type_fq_name_with(
+        || csharp_owner_chain_declares_type_parameter(csharp, owner, name),
+        || resolve_structured_type_fq_name(csharp, token, file, name),
+    )
+}
+
+fn resolve_structured_member_type_fq_name_with(
+    is_shadowed: impl FnOnce() -> bool,
+    resolve: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    if is_shadowed() { None } else { resolve() }
 }
 
 fn csharp_owner_chain_declares_type_parameter(
     csharp: &dyn CSharpSource,
     owner: &CodeUnit,
     name: &StructuredTypeName,
+) -> bool {
+    csharp_owner_chain_declares_type_parameter_with(
+        owner,
+        name,
+        |unit, candidate| {
+            Some(csharp.signature_metadata(unit).iter().any(|metadata| {
+                metadata
+                    .type_parameters()
+                    .iter()
+                    .any(|parameter| parameter == candidate)
+            }))
+        },
+        |unit| Some(csharp.parent_of(unit)),
+    )
+}
+
+fn csharp_owner_chain_declares_type_parameter_with(
+    owner: &CodeUnit,
+    name: &StructuredTypeName,
+    mut declares_parameter: impl FnMut(&CodeUnit, &str) -> Option<bool>,
+    mut parent_of: impl FnMut(&CodeUnit) -> Option<Option<CodeUnit>>,
 ) -> bool {
     let [candidate] = name.path() else {
         return false;
@@ -1987,14 +1983,15 @@ fn csharp_owner_chain_declares_type_parameter(
         if !unit.is_class() {
             return false;
         }
-        if csharp
-            .signature_metadata(&unit)
-            .iter()
-            .any(|metadata| metadata.type_parameters().contains(candidate))
-        {
-            return true;
+        match declares_parameter(&unit, candidate) {
+            Some(true) => return true,
+            Some(false) => {}
+            None => return false,
         }
-        current = csharp.parent_of(&unit);
+        current = match parent_of(&unit) {
+            Some(parent) => parent,
+            None => return false,
+        };
     }
     false
 }
@@ -2013,34 +2010,29 @@ fn csharp_owner_chain_declares_type_parameter_in_session(
     name: &StructuredTypeName,
     session: &ResolutionSession,
 ) -> bool {
-    let [candidate] = name.path() else {
-        return false;
-    };
-    if name.is_absolute() {
-        return false;
-    }
-    let mut current = Some(owner.clone());
-    while let Some(unit) = current {
-        if !unit.is_class() || !session.scope_step() {
-            return false;
-        }
-        let metadata =
-            session.query_limited_rows(|limit| csharp.signature_metadata_limited(&unit, limit));
-        if !session.observe_cancellation() {
-            return false;
-        }
-        if metadata
-            .iter()
-            .any(|metadata| metadata.type_parameters().contains(candidate))
-        {
-            return true;
-        }
-        current = session.query(|| csharp.parent_of(&unit)).flatten();
-        if !session.observe_cancellation() {
-            return false;
-        }
-    }
-    false
+    csharp_owner_chain_declares_type_parameter_with(
+        owner,
+        name,
+        |unit, candidate| {
+            if !session.scope_step() {
+                return None;
+            }
+            let metadata =
+                session.query_limited_rows(|limit| csharp.signature_metadata_limited(unit, limit));
+            session.observe_cancellation().then(|| {
+                metadata.iter().any(|metadata| {
+                    metadata
+                        .type_parameters()
+                        .iter()
+                        .any(|parameter| parameter == candidate)
+                })
+            })
+        },
+        |unit| {
+            let parent = session.query(|| csharp.parent_of(unit)).flatten();
+            session.observe_cancellation().then_some(parent)
+        },
+    )
 }
 
 fn resolve_structured_type_fq_name_in_session(
@@ -2090,16 +2082,7 @@ fn resolve_structured_type_fq_name(
             }
         }
     }
-    let rendered = if let Some(alias) = alias_qualified {
-        let suffix = render_csharp_structured_path(&[], &path[1..], false);
-        if suffix.is_empty() {
-            alias.to_string()
-        } else {
-            format!("{alias}::{suffix}")
-        }
-    } else {
-        render_csharp_structured_path(&[], path, name.is_absolute())
-    };
+    let rendered = render_structured_type_lookup_name(name);
     let candidates = if name.is_absolute() {
         forward_type_declarations_for_fq_name(csharp, &rendered)
     } else {
@@ -2141,16 +2124,7 @@ fn resolve_non_builtin_structured_type_fq_name_in_session(
         }
     }
 
-    let rendered = if let Some(alias) = alias_qualified {
-        let suffix = render_csharp_structured_path(&[], &path[1..], false);
-        if suffix.is_empty() {
-            alias.to_string()
-        } else {
-            format!("{alias}::{suffix}")
-        }
-    } else {
-        render_csharp_structured_path(&[], path, name.is_absolute())
-    };
+    let rendered = render_structured_type_lookup_name(name);
     let candidates = if name.is_absolute() {
         forward_type_declarations_for_fq_name_in_session(csharp, &rendered, session)
     } else {
@@ -2160,6 +2134,23 @@ fn resolve_non_builtin_structured_type_fq_name_in_session(
         return None;
     }
     unique_logical_type_fq_name(&candidates, session)
+}
+
+fn render_structured_type_lookup_name(name: &StructuredTypeName) -> String {
+    let path = name.path();
+    if let Some(alias) = path
+        .first()
+        .and_then(|component| component.strip_suffix("::"))
+    {
+        let suffix = render_csharp_structured_path(&[], &path[1..], false);
+        if suffix.is_empty() {
+            alias.to_string()
+        } else {
+            format!("{alias}::{suffix}")
+        }
+    } else {
+        render_csharp_structured_path(&[], path, name.is_absolute())
+    }
 }
 
 fn render_csharp_structured_path(prefix: &[String], path: &[String], absolute: bool) -> String {
@@ -2279,19 +2270,13 @@ fn seed_symbol_for_type(
         return;
     }
     let normalized = normalize_type_text(&reference);
+    let identity = csharp_arity_preserving_full_name(&reference);
     let raw_type = csharp
         .using_aliases_of(file)
         .get(&normalized)
         .cloned()
-        .unwrap_or(normalized);
-    if raw_type.is_empty() || raw_type == "var" {
-        bindings.declare_shadow(node_text(name_node, source));
-    } else {
-        bindings.seed_symbol(
-            node_text(name_node, source),
-            CSharpDeclaredType::Spelling(raw_type),
-        );
-    }
+        .unwrap_or(identity);
+    seed_unresolved_symbol(name_node, source, raw_type, bindings);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2318,10 +2303,20 @@ fn seed_symbol_for_type_in_session(
         return;
     }
     let normalized = normalize_type_text(&reference);
+    let identity = csharp_arity_preserving_full_name(&reference);
     let raw_type = using_aliases_for_file_in_session(csharp, file, session)
         .get(&normalized)
         .cloned()
-        .unwrap_or(normalized);
+        .unwrap_or(identity);
+    seed_unresolved_symbol(name_node, source, raw_type, bindings);
+}
+
+fn seed_unresolved_symbol(
+    name_node: Node<'_>,
+    source: &str,
+    raw_type: String,
+    bindings: &mut LocalInferenceEngine<CSharpDeclaredType>,
+) {
     if raw_type.is_empty() || raw_type == "var" {
         bindings.declare_shadow(node_text(name_node, source));
     } else {
@@ -2332,17 +2327,18 @@ fn seed_symbol_for_type_in_session(
     }
 }
 
+fn explicit_object_created_type(node: Node<'_>) -> Option<Node<'_>> {
+    node.child_by_field_name("type")
+        .or_else(|| first_type_child(node))
+}
+
 pub fn object_created_type(node: Node<'_>) -> Option<Node<'_>> {
-    if node.kind() == "object_creation_expression" {
-        return node
-            .child_by_field_name("type")
-            .or_else(|| first_type_child(node));
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if let Some(found) = object_created_type(child) {
-            return Some(found);
+    let mut stack = vec![node];
+    while let Some(candidate) = stack.pop() {
+        if candidate.kind() == "object_creation_expression" {
+            return explicit_object_created_type(candidate);
         }
+        push_named_children_reversed(candidate, &mut stack);
     }
     None
 }
@@ -2384,7 +2380,7 @@ pub(super) fn resolve_type_fq_name_at(
     node: Node<'_>,
     source: &str,
 ) -> Option<String> {
-    let normalized = expand_alias_qualified_type(csharp, file, &normalize_type_text(reference));
+    let normalized = normalize_and_expand_type_reference(csharp, file, reference);
     if normalized.is_empty() || type_parameter_shadows_reference(node, source, &normalized) {
         return None;
     }
@@ -2410,7 +2406,7 @@ pub(super) fn resolve_arity_free_type_fq_name_at(
     node: Node<'_>,
     source: &str,
 ) -> Option<String> {
-    let normalized = expand_alias_qualified_type(csharp, file, &normalize_type_text(reference));
+    let normalized = normalize_and_expand_type_reference(csharp, file, reference);
     if normalized.is_empty() || type_parameter_shadows_reference(node, source, &normalized) {
         return None;
     }
@@ -2459,7 +2455,7 @@ pub fn resolve_type_fq_name(
     file: &ProjectFile,
     reference: &str,
 ) -> Option<String> {
-    let normalized = expand_alias_qualified_type(csharp, file, &normalize_type_text(reference));
+    let normalized = normalize_and_expand_type_reference(csharp, file, reference);
     if let Some(canonical) = canonical_builtin_type_identity(&normalized) {
         return Some(canonical.to_string());
     }
@@ -2495,7 +2491,7 @@ fn resolve_usage_type_fq_name(
     file: &ProjectFile,
     reference: &str,
 ) -> Option<String> {
-    let normalized = expand_alias_qualified_type(csharp, file, &normalize_type_text(reference));
+    let normalized = normalize_and_expand_type_reference(csharp, file, reference);
     if let Some(canonical) = canonical_builtin_type_identity(&normalized) {
         return Some(canonical.to_string());
     }
@@ -2549,10 +2545,7 @@ fn resolve_visible_type_fq_name(
     file: &ProjectFile,
     reference: &str,
 ) -> Option<String> {
-    let candidates = graph_support::visible_type_candidates(csharp, token, file, reference);
-    (graph_support::logical_type_count(&candidates) == 1)
-        .then(|| graph_support::first_logical_type_fqn(&candidates))
-        .flatten()
+    graph_support::resolve_visible_type(csharp, token, file, reference).map(|unit| unit.fq_name())
 }
 
 fn resolve_usage_visible_type_fq_name(
@@ -2561,10 +2554,8 @@ fn resolve_usage_visible_type_fq_name(
     file: &ProjectFile,
     reference: &str,
 ) -> Option<String> {
-    let candidates = graph_support::usage_visible_type_candidates(csharp, token, file, reference);
-    (graph_support::logical_type_count(&candidates) == 1)
-        .then(|| graph_support::first_logical_type_fqn(&candidates))
-        .flatten()
+    graph_support::resolve_usage_visible_type(csharp, token, file, reference)
+        .map(|unit| unit.fq_name())
 }
 
 /// The attribute classes an attribute's `name` node names, on the usage side.
@@ -4124,6 +4115,14 @@ fn reference_matches_target_fq_name(reference: &str, target: &CodeUnit) -> bool 
     reference == target.fq_name() || reference == target.fq_name().replace('$', ".")
 }
 
+fn normalize_and_expand_type_reference(
+    csharp: &dyn CSharpSource,
+    file: &ProjectFile,
+    reference: &str,
+) -> String {
+    expand_alias_qualified_type(csharp, file, &normalize_type_text(reference))
+}
+
 pub(super) fn normalize_type_text(reference: &str) -> String {
     let mut normalized = reference.trim();
     loop {
@@ -4957,9 +4956,7 @@ pub fn object_initializer_for_label(node: Node<'_>) -> Option<Node<'_>> {
 pub fn object_initializer_owner_type_node(initializer: Node<'_>) -> Option<Node<'_>> {
     let object_creation = initializer.parent()?;
     match object_creation.kind() {
-        "object_creation_expression" => object_creation
-            .child_by_field_name("type")
-            .or_else(|| first_type_child(object_creation))
+        "object_creation_expression" => explicit_object_created_type(object_creation)
             .or_else(|| implicit_object_creation_target_type(object_creation)),
         "implicit_object_creation_expression" => {
             implicit_object_creation_target_type(object_creation)
@@ -4975,13 +4972,7 @@ pub fn object_creation_assignment_target(initializer: Node<'_>) -> Option<Node<'
     if object_creation.kind() != "implicit_object_creation_expression" {
         return None;
     }
-    let assignment = object_creation.parent()?;
-    if assignment.kind() != "assignment_expression" {
-        return None;
-    }
-    if assignment.child_by_field_name("right") != Some(object_creation) {
-        return None;
-    }
+    let assignment = implicit_object_creation_assignment(object_creation)?;
     assignment.child_by_field_name("left")
 }
 
@@ -5034,10 +5025,7 @@ pub fn object_creation_collection_target(initializer: Node<'_>) -> Option<Node<'
         return None;
     }
 
-    if let Some(assignment) = object_creation.parent()
-        && assignment.kind() == "assignment_expression"
-        && assignment.child_by_field_name("right") == Some(object_creation)
-    {
+    if let Some(assignment) = implicit_object_creation_assignment(object_creation) {
         let left = assignment.child_by_field_name("left")?;
         if left.kind() == "element_access_expression" {
             return left
@@ -5046,10 +5034,7 @@ pub fn object_creation_collection_target(initializer: Node<'_>) -> Option<Node<'
         }
     }
 
-    let mut current = object_creation.parent()?;
-    while matches!(current.kind(), "expression_element" | "collection_element") {
-        current = current.parent()?;
-    }
+    let current = object_creation_parent_skipping_collection_elements(object_creation)?;
     if current.kind() != "collection_expression" {
         return None;
     }
@@ -5060,6 +5045,23 @@ pub fn object_creation_collection_target(initializer: Node<'_>) -> Option<Node<'
         return None;
     }
     assignment.child_by_field_name("left")
+}
+
+fn implicit_object_creation_assignment(object_creation: Node<'_>) -> Option<Node<'_>> {
+    let assignment = object_creation.parent()?;
+    (assignment.kind() == "assignment_expression"
+        && assignment.child_by_field_name("right") == Some(object_creation))
+    .then_some(assignment)
+}
+
+fn object_creation_parent_skipping_collection_elements(
+    object_creation: Node<'_>,
+) -> Option<Node<'_>> {
+    let mut parent = object_creation.parent()?;
+    while matches!(parent.kind(), "expression_element" | "collection_element") {
+        parent = parent.parent()?;
+    }
+    Some(parent)
 }
 
 /// Where the owner type of a C# object initializer comes from.
@@ -5353,10 +5355,7 @@ pub fn object_initializer_owners(
 /// field, which is why the declarator is matched here rather than through the
 /// clause.
 fn implicit_object_creation_target_type(object_creation: Node<'_>) -> Option<Node<'_>> {
-    if let Some(mut parent) = object_creation.parent() {
-        while matches!(parent.kind(), "expression_element" | "collection_element") {
-            parent = parent.parent()?;
-        }
+    if let Some(parent) = object_creation_parent_skipping_collection_elements(object_creation) {
         match parent.kind() {
             // `T[] values = [new() { ... }]`: the collection expression takes
             // its target from the outer declaration, while the implicit object
@@ -5703,8 +5702,7 @@ fn error_recovered_implicit_declarator_type<'tree>(
 }
 
 fn count_named_children_of_kind(node: Node<'_>, kind: &str) -> usize {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
+    named_children_iter(node)
         .filter(|child| child.kind() == kind)
         .count()
 }
@@ -5720,10 +5718,4 @@ fn is_type_syntax_kind(kind: &str) -> bool {
         kind,
         "identifier" | "qualified_name" | "generic_name" | "nullable_type" | "array_type" | "type"
     )
-}
-
-fn first_named_child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .find(|child| child.kind() == kind)
 }

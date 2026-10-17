@@ -5,6 +5,77 @@ analysis behavior, integrations, and release artifacts. It is curated from the
 complete private release range because the public open-core repository is a
 projection and its commit history does not contain every source commit.
 
+## Unreleased
+
+### Fixed
+
+- Python calls retain saved default arguments when a dynamic attribute write
+  cannot reach their function objects, including writes in settings helpers.
+
+## [0.13.1] - 2026-10-17
+
+### Added
+
+- RQL unions can combine rows of different kinds when subsequent filters and projections
+  use fields shared by those rows. Selected-property reads, static Cargo dependency
+  queries, and explicit code/configuration relations add queryable evidence while
+  keeping unsupported or ambiguous matches open.
+
+- Flow and taint `why-not` queries explain named candidates. Public SARIF scans can
+  acquire pinned external rule releases with their semantic dependencies.
+
+- Rust analysis reads Cargo configuration for target settings and dependency routes. PHP
+  import queries follow supported workspace-local `include` and `require` paths, and
+  Python local-read analysis attributes failures only to matching exception handlers.
+
+- Code-smell policies recognize more discarded-result cases, including native must-use
+  results in C++ and Rust.
+
+### Changed
+
+- Independent policies can run with bounded parallelism.
+
+- Inconclusive policy reports identify affected files when their missing findings
+  can be attributed safely; other uncertainty remains scoped to the whole run.
+
+- The engine no longer ships the Go data-race analyzer or its associated policy.
+
+- Some latency scenarios were slower than the previous measured baseline; this trade-off
+  was accepted for v0.13.1.
+
+### Fixed
+
+- Fresh Rust crate consumers can resolve the supported ZIP dependency; existing
+  compression-backend behavior is preserved.
+
+- Schema-2 pack acquisition permits verified integrity with pending behavior
+  qualification, retaining compatibility receipts without claiming behavioral
+  qualification.
+
+- JavaScript/TypeScript object keys are decoded before indexing. Python loop locals
+  remain visible to after-loop reads and captures.
+
+- TypeScript preserves calls named `using` instead of parsing them as resource
+  declarations. PHP clone-with expressions and direct JavaScript/TypeScript re-export
+  dependencies are handled correctly.
+
+- Secret-like-code reports redact Unicode samples safely and no longer treat public
+  Firebase web configuration keys as leaked Google API keys.
+
+- Cache upgrades serialize their probe and clean up staged copies left by interrupted
+  upgrades.
+
+- Java explicit superclass calls resolve to the nearest supported superclass
+  implementation. Scala resolution follows supported inherited import members,
+  scoped extensions, and companion and enum-case ownership.
+
+- Python call binding expands literal argument packs, preserves explicit tuple
+  arity when element values are unknown, and locates open hierarchy diagnostics
+  at the affected source declaration.
+
+- C and C++ analysis admits bounded generated numeric initializer tables at the
+  default setting while retaining physical-line limits for the remaining source.
+
 ## [0.13.0] - 2026-10-06
 
 ### Added

@@ -30,7 +30,9 @@ use crate::graph::resolver::{
 use crate::identity::CppCallableUnitRole;
 use crate::imports::{IncludeTargetIndex, canonical_include_paths, canonical_include_statements};
 use brokk_bifrost_core::analyzer::capabilities::{TypeAliasProvider, TypeHierarchyProvider};
-use brokk_bifrost_core::analyzer::model::{CppFieldLinkage, CppTemplateMetadata};
+use brokk_bifrost_core::analyzer::model::{
+    CppFieldLinkage, CppTemplateMetadata, SignatureMetadata,
+};
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, ProjectFile};
@@ -108,19 +110,7 @@ pub trait CppSource:
         Some(
             facts
                 .into_iter()
-                .map(|fact| {
-                    let declaration = source.source.declaration(fact.declaration);
-                    let range = source.source.occurrence(declaration.occurrence).range;
-                    let conditional_family = fact.conditional_family.map(|id| {
-                        let range = source.source.occurrence(id).range;
-                        (range.start_byte, range.end_byte)
-                    });
-                    crate::source_facts::CppNavigationOccurrence {
-                        range,
-                        role: fact.occurrence_role,
-                        conditional_family,
-                    }
-                })
+                .map(|fact| source.navigation_occurrence(&fact))
                 .collect(),
         )
     }
@@ -166,6 +156,14 @@ pub trait CppSource:
     /// The callable role recorded for a physical stored declaration, without
     /// consulting reconciliation fallbacks that may themselves be building.
     fn stored_callable_unit_role(&self, callable: &CodeUnit) -> CppCallableUnitRole;
+
+    /// The physical signature rows for one stored declaration, without
+    /// resolution-time reconciliation. Linkage and arity are stored facts;
+    /// callers that need those facts must not rebuild the visibility joins
+    /// used to decorate an out-of-line member's metadata.
+    fn stored_signature_metadata(&self, callable: &CodeUnit) -> Vec<SignatureMetadata> {
+        self.signature_metadata(callable)
+    }
 
     /// The workspace-wide `#include` resolution table, built once per analyzer
     /// generation from [`IncludeTargetIndex::build`].
@@ -234,14 +232,14 @@ pub trait CppSource:
 
     /// The cached result of a preprocessor-visible include-reachability walk.
     ///
-    /// The reference language affects only `__cplusplus` guards. Callers pass
-    /// that fact as a Boolean so cache keys do not retain the full reference
-    /// path.
+    /// The reference language and the source-only language proof affect
+    /// `__cplusplus` guards. The reference root identifies those facts within
+    /// one immutable analyzer generation; the proof stays lazy on cache hits.
     fn cached_unconditional_include_reachability(
         &self,
         first: &ProjectFile,
         donor_source: &ProjectFile,
-        reference_is_c: bool,
+        reference_file: &ProjectFile,
     ) -> Option<bool>;
 
     /// Store a completed preprocessor-visible include-reachability walk.
@@ -249,7 +247,7 @@ pub trait CppSource:
         &self,
         first: &ProjectFile,
         donor_source: &ProjectFile,
-        reference_is_c: bool,
+        reference_file: &ProjectFile,
         reaches: bool,
     );
 

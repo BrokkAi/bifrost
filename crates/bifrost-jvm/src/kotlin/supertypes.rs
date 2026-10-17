@@ -81,9 +81,8 @@ fn delegation_user_type(specifier: Node<'_>) -> Option<Node<'_>> {
 /// `type_identifier` children are already exactly the path segments in source
 /// order — `Outer.Base<Int>` yields `["Outer", "Base"]` with no text splitting.
 pub fn kotlin_user_type_segments(user_type: Node<'_>, source: &str) -> Vec<String> {
-    named_children(user_type)
+    crate::kotlin::syntax::kotlin_user_type_segments(user_type)
         .into_iter()
-        .filter(|child| child.kind() == "type_identifier")
         .map(|segment| kotlin_identifier_text(segment, source).to_string())
         .filter(|segment| !segment.is_empty())
         .collect()
@@ -116,6 +115,17 @@ mod tests {
     }
 
     #[test]
+    fn interface_delegation_names_the_interface_not_the_delegate() {
+        assert_eq!(
+            supertypes_of(
+                "class Child(logger: Logged) : Contract, Logged by logger",
+                "Child"
+            ),
+            vec!["Contract".to_string(), "Logged".to_string()]
+        );
+    }
+
+    #[test]
     fn constructor_call_and_plain_interfaces_keep_source_order() {
         assert_eq!(
             supertypes_of(
@@ -135,17 +145,6 @@ mod tests {
         assert_eq!(
             supertypes_of("class Child : lib.Base<Int, String>()", "Child"),
             vec!["lib.Base".to_string()]
-        );
-    }
-
-    #[test]
-    fn interface_delegation_names_the_interface_not_the_delegate() {
-        assert_eq!(
-            supertypes_of(
-                "class Child(logger: Logged) : Contract, Logged by logger",
-                "Child"
-            ),
-            vec!["Contract".to_string(), "Logged".to_string()]
         );
     }
 

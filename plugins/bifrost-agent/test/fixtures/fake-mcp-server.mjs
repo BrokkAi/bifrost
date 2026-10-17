@@ -72,9 +72,13 @@ process.on("SIGTERM", () => {
 });
 
 function respond(id, result) {
-  process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, result })}\n`);
+  writeResponse(id, { result });
 }
 
 function respondError(id, code, message) {
-  process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, error: { code, message } })}\n`);
+  writeResponse(id, { error: { code, message } });
+}
+
+function writeResponse(id, body) {
+  process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, ...body })}\n`);
 }

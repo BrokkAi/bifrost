@@ -55,24 +55,130 @@ labelled_enum! {
     }
 }
 
-labelled_enum! {
-    /// How strong a resolution candidate is. Declaration order is precedence
-    /// order, strongest first, and `Ord` is derived from it, so a policy that
-    /// asks for "at least this tier" is a comparison rather than a table.
-    ///
-    /// `NameOnlyFallback` is last on purpose: it is the tier a resolver selects
-    /// at when it scans a bare-name index after a structured route was
-    /// available, which is exactly the selection the anti-fallback contract
-    /// forbids.
-    PrecedenceTier, ALL_PRECEDENCE_TIERS {
-        LexicalBinding => "lexical_binding",
-        OwnMember => "own_member",
-        InheritedMember => "inherited_member",
-        ExplicitImport => "explicit_import",
-        PackageOrModule => "package_or_module",
-        WildcardImport => "wildcard_import",
-        ExternalRoot => "external_root",
-        NameOnlyFallback => "name_only_fallback",
+/// How strong a resolution candidate is. The repr ordinal is the persisted
+/// vocabulary code; `Ord` is the semantic precedence order. Keeping those
+/// orders separate lets a language add a tier without renumbering existing
+/// path rows.
+///
+/// `NameOnlyFallback` remains the weakest resolution tier: it is selected only
+/// when a resolver scans a bare-name index after a structured route was
+/// available, which the anti-fallback contract forbids. `CandidateOriginRank`
+/// sorts after it because it is a marker consumed by the dedicated origin-rank
+/// comparison before the ordinary precedence walk, not a resolved tier.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrecedenceTier {
+    LexicalBinding,
+    OwnMember,
+    InheritedMember,
+    ExplicitImport,
+    PackageOrModule,
+    WildcardImport,
+    ExternalRoot,
+    NameOnlyFallback,
+    OtherCompilationUnitPackage,
+    DefaultImport,
+    /// Candidate origin rank, compared across lexical choice points before
+    /// their ordinary precedence traces.
+    CandidateOriginRank,
+}
+
+/// Values in declaration order, which is the stable persisted code order.
+pub const ALL_PRECEDENCE_TIERS: &[PrecedenceTier] = &[
+    PrecedenceTier::LexicalBinding,
+    PrecedenceTier::OwnMember,
+    PrecedenceTier::InheritedMember,
+    PrecedenceTier::ExplicitImport,
+    PrecedenceTier::PackageOrModule,
+    PrecedenceTier::WildcardImport,
+    PrecedenceTier::ExternalRoot,
+    PrecedenceTier::NameOnlyFallback,
+    PrecedenceTier::OtherCompilationUnitPackage,
+    PrecedenceTier::DefaultImport,
+    PrecedenceTier::CandidateOriginRank,
+];
+
+impl PrecedenceTier {
+    pub const LABELS: &'static [&'static str] = &[
+        "lexical_binding",
+        "own_member",
+        "inherited_member",
+        "explicit_import",
+        "package_or_module",
+        "wildcard_import",
+        "external_root",
+        "name_only_fallback",
+        "other_compilation_unit_package",
+        "default_import",
+        "candidate_origin_rank",
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::LexicalBinding => "lexical_binding",
+            Self::OwnMember => "own_member",
+            Self::InheritedMember => "inherited_member",
+            Self::ExplicitImport => "explicit_import",
+            Self::PackageOrModule => "package_or_module",
+            Self::WildcardImport => "wildcard_import",
+            Self::ExternalRoot => "external_root",
+            Self::NameOnlyFallback => "name_only_fallback",
+            Self::OtherCompilationUnitPackage => "other_compilation_unit_package",
+            Self::DefaultImport => "default_import",
+            Self::CandidateOriginRank => "candidate_origin_rank",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        ALL_PRECEDENCE_TIERS
+            .iter()
+            .copied()
+            .find(|tier| tier.label() == label)
+    }
+
+    const fn precedence_rank(self) -> u8 {
+        match self {
+            Self::LexicalBinding => 0,
+            Self::OwnMember => 1,
+            Self::InheritedMember => 2,
+            Self::ExplicitImport => 3,
+            Self::PackageOrModule => 4,
+            Self::WildcardImport => 5,
+            Self::OtherCompilationUnitPackage => 6,
+            Self::DefaultImport => 7,
+            Self::ExternalRoot => 8,
+            Self::NameOnlyFallback => 9,
+            Self::CandidateOriginRank => 10,
+        }
+    }
+}
+
+impl crate::analyzer::structural::code::VocabularyCode for PrecedenceTier {
+    fn code(self) -> u8 {
+        self as u8
+    }
+
+    fn from_code(code: u8) -> Option<Self> {
+        ALL_PRECEDENCE_TIERS.get(code as usize).copied()
+    }
+}
+
+impl PartialOrd for PrecedenceTier {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PrecedenceTier {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.precedence_rank().cmp(&other.precedence_rank())
+    }
+}
+
+impl fmt::Display for PrecedenceTier {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.label())
     }
 }
 
@@ -323,6 +429,9 @@ labelled_enum! {
     /// An item-position invocation whose visible definition writes only
     /// `impl` blocks no row holds.
         UnexpandedImplMacro => "unexpanded_impl_macro",
+    /// Every authored reference below the expression was lowered; only its resulting
+    /// type or value remains unknown.
+        UnsupportedExpressionType => "unsupported_expression_type",
     }
 }
 
@@ -376,7 +485,7 @@ impl ScopeFormation {
 /// Callables scope their parameters, classes scope their members and type
 /// parameters, loops scope their headers, catch clauses scope their exception
 /// parameter, and [`NormalizedKind::Block`] scopes a statement list. This is
-/// the C-family and Python answer; a language whose loops and rescue clauses
+/// the C-family answer; a language whose loops and rescue clauses
 /// do not open variable scopes, or whose class bodies hold real locals,
 /// overrides [`super::spec::StructuralSpec::scope_formation`] instead of
 /// bending its kind table to fit.
@@ -393,12 +502,30 @@ pub fn default_scope_formation(kind: NormalizedKind) -> ScopeFormation {
     }
 }
 
+/// One ancestor in the shared binding-owner walk. File scope has no AST fact.
+#[derive(Debug, Clone, Copy)]
+pub enum BindingScopeCandidate<'tree> {
+    File { root: tree_sitter::Node<'tree> },
+    Syntax(tree_sitter::Node<'tree>),
+}
+
+/// The adapter's decision for one binder and one ancestor scope (#5574).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingScopeSelection {
+    /// This ancestor owns the binding and supplies its activation range.
+    Use,
+    /// Ask about the next parent in the existing scope-row chain.
+    Continue,
+    /// Ownership cannot be proven; do not construct a partial binding row.
+    Unknown,
+}
+
 /// Everything an adapter states about one binder token: what kind of binding
 /// it introduces, when that binding starts being in effect, and the exact byte
 /// interval over which it is in effect.
 ///
-/// This is the whole per-language input to the binding-of algorithm. The
-/// algorithm itself (name equality, scope ancestry, nearest scope wins,
+/// Together with owner selection this is the per-language input to binding-of.
+/// The algorithm itself (name equality, scope ancestry, nearest scope wins,
 /// rebinding order) is language-neutral and lives in the derivation layer, so
 /// an adapter that can answer this one question gets correct binding-of answers
 /// without contributing any resolution logic.
@@ -637,16 +764,14 @@ impl LexicalEnvironmentSupport {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.support.iter().all(|support| !support.is_supported())
+        super::support_is_empty(self.support.iter().map(|support| support.is_supported()))
     }
 
     /// Iterate in the stable order declared by [`ALL_ENVIRONMENT_AXES`].
     pub fn iter(
         &self,
     ) -> impl ExactSizeIterator<Item = (EnvironmentAxis, EnvironmentSupport)> + '_ {
-        ALL_ENVIRONMENT_AXES
-            .iter()
-            .map(|&axis| (axis, self.support(axis)))
+        super::support_iter(ALL_ENVIRONMENT_AXES, |axis| self.support(axis))
     }
 }
 
@@ -785,22 +910,45 @@ mod tests {
         );
     }
 
-    /// Precedence is a comparison, not a table: the derived `Ord` must follow
-    /// declaration order, strongest tier first.
+    /// Persisted codes remain append-only while `Ord` follows semantic rank.
     #[test]
     fn precedence_tiers_are_ordered_strongest_first() {
+        use crate::analyzer::structural::code::VocabularyCode;
+
+        for (ordinal, &tier) in ALL_PRECEDENCE_TIERS.iter().enumerate() {
+            assert_eq!(tier.code(), ordinal as u8);
+            assert_eq!(PrecedenceTier::from_code(tier.code()), Some(tier));
+        }
+
         let mut sorted = ALL_PRECEDENCE_TIERS.to_vec();
         sorted.sort();
-        assert_eq!(sorted, ALL_PRECEDENCE_TIERS);
+        assert_eq!(
+            sorted,
+            [
+                PrecedenceTier::LexicalBinding,
+                PrecedenceTier::OwnMember,
+                PrecedenceTier::InheritedMember,
+                PrecedenceTier::ExplicitImport,
+                PrecedenceTier::PackageOrModule,
+                PrecedenceTier::WildcardImport,
+                PrecedenceTier::OtherCompilationUnitPackage,
+                PrecedenceTier::DefaultImport,
+                PrecedenceTier::ExternalRoot,
+                PrecedenceTier::NameOnlyFallback,
+                PrecedenceTier::CandidateOriginRank,
+            ]
+        );
 
         assert!(PrecedenceTier::LexicalBinding < PrecedenceTier::OwnMember);
         assert!(PrecedenceTier::OwnMember < PrecedenceTier::InheritedMember);
         assert!(PrecedenceTier::ExplicitImport < PrecedenceTier::WildcardImport);
+        assert!(PrecedenceTier::WildcardImport < PrecedenceTier::OtherCompilationUnitPackage);
+        assert!(PrecedenceTier::WildcardImport < PrecedenceTier::DefaultImport);
+        assert!(PrecedenceTier::OtherCompilationUnitPackage < PrecedenceTier::DefaultImport);
+        assert!(PrecedenceTier::DefaultImport < PrecedenceTier::ExternalRoot);
         assert!(PrecedenceTier::ExternalRoot < PrecedenceTier::NameOnlyFallback);
-        assert_eq!(
-            ALL_PRECEDENCE_TIERS.last(),
-            Some(&PrecedenceTier::NameOnlyFallback)
-        );
+        assert!(PrecedenceTier::NameOnlyFallback < PrecedenceTier::CandidateOriginRank);
+        assert_eq!(sorted.last(), Some(&PrecedenceTier::CandidateOriginRank));
 
         let mut dispatch = ALL_MEMBER_DISPATCH_TIERS.to_vec();
         dispatch.sort();

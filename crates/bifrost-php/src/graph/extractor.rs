@@ -12,7 +12,7 @@ use crate::graph::resolver::{
 };
 use crate::graph::syntax::{
     assignment_parts, assignment_value_type_fq_name, captured_local_scope_bindings,
-    declared_instance_callable, declared_instance_field, direct_variable_receiver_type_fq_names,
+    declared_instance_callable, declared_instance_field, direct_receiver_union_member,
     instance_receiver_type_fq_name, is_local_scope, literal_member_identifier,
     seed_assignment_binding, seed_parameter_types, static_member_parts, static_property_identifier,
     static_scope_type_fq_name,
@@ -290,6 +290,11 @@ fn candidate_resolves_to_type(
         return false;
     }
     let raw = qualified_candidate_text(node, source);
+    if matches!(raw.as_str(), "self" | "static" | "parent") && node_is_within_trait(node) {
+        // Trait-relative scopes resolve in each consuming class. The trait
+        // declaration itself is never the type denoted by these keywords.
+        return false;
+    }
     let enclosing_owner = matches!(raw.as_str(), "self" | "static" | "parent")
         .then(|| {
             enclosing_owner_fq_name_at(
@@ -303,6 +308,22 @@ fn candidate_resolves_to_type(
         .flatten();
     static_scope_type_fq_name(php, analyzer, &raw, ctx, enclosing_owner.as_deref())
         .is_some_and(|fq| fq == target_fq_name)
+}
+
+fn node_is_within_trait(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        if parent.kind() == "trait_declaration" {
+            return true;
+        }
+        if matches!(
+            parent.kind(),
+            "class_declaration" | "interface_declaration" | "enum_declaration"
+        ) {
+            return false;
+        }
+        node = parent;
+    }
+    false
 }
 
 fn is_constructor_reference(
@@ -732,7 +753,7 @@ fn record_member_hit(
     }
 }
 
-fn static_member_identifier<'a>(
+pub(crate) fn static_member_identifier<'a>(
     parent: Node<'_>,
     member: Node<'_>,
     source: &'a str,
@@ -769,23 +790,12 @@ fn direct_receiver_union_resolves_to_target(
     bindings: &LocalInferenceEngine<String>,
     spec: &TargetSpec,
 ) -> bool {
-    let owners = direct_variable_receiver_type_fq_names(receiver, source, bindings);
-    if owners.len() < 2 {
-        return false;
-    }
-    let mut candidates = owners
-        .into_iter()
-        .filter_map(|owner| match spec.kind {
-            TargetKind::Method => {
-                declared_instance_callable(php, analyzer, &owner, &spec.member_name)
-            }
-            TargetKind::Field => declared_instance_field(php, analyzer, &owner, &spec.member_name),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    candidates.sort();
-    candidates.dedup();
-    matches!(candidates.as_slice(), [candidate] if candidate.fq_name() == spec.target_fq_name)
+    direct_receiver_union_member(receiver, source, bindings, |owner| match spec.kind {
+        TargetKind::Method => declared_instance_callable(php, analyzer, owner, &spec.member_name),
+        TargetKind::Field => declared_instance_field(php, analyzer, owner, &spec.member_name),
+        _ => None,
+    })
+    .is_some_and(|candidate| candidate.fq_name() == spec.target_fq_name)
 }
 
 #[allow(clippy::too_many_arguments)]

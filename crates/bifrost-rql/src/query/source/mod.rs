@@ -4,11 +4,13 @@ mod rql;
 mod shared;
 
 use rql::{analyze_rql, validate_rql_query};
+pub(super) use shared::EnvironmentOptionKind;
 use shared::*;
 
 use super::ir::{
     ConfigurationCompletenessFilter, ConfigurationNodeKindFilter, MAX_BINDING_NAME_LENGTH,
-    MAX_CONFIGURATION_KEY_LENGTH, MAX_DECORATOR_BINDING_FILTER_LENGTH,
+    MAX_CONFIGURATION_KEY_LENGTH, MAX_CONFIGURATION_VALUE_LENGTH,
+    MAX_DECORATOR_BINDING_FILTER_LENGTH,
 };
 use super::schema;
 use super::schema::{
@@ -24,22 +26,22 @@ use super::schema::{
     reference_kind_from_label, usage_kind_from_label, usage_proof_from_label,
     usage_surface_from_label,
 };
-use super::schema::{ExportFilterField, GenerationSiteFilterField};
+use super::schema::{
+    ExportFilterField, GenerationSiteFilterField, export_form_labels, generation_input_labels,
+    generation_kind_labels,
+};
 use super::sexp::{parse_query_sexp, query_to_json};
 use super::{
-    CodeQuery, CodeQueryResultDetail, MAX_ARITY, MAX_GLOB_LENGTH, MAX_KIND_LIST_ENTRIES,
-    MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_QUERY_BRANCHES,
-    MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES, MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH,
-    MAX_WHERE_GLOBS,
+    CodeQuery, CodeQueryResultDetail, LanguageRule, MAX_ARITY, MAX_GLOB_LENGTH,
+    MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT,
+    MAX_QUERY_BRANCHES, MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES, MAX_ROLE_LIST_ENTRIES,
+    MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS,
 };
 use crate::sexp::{Expr, ExprKind};
 use brokk_bifrost_core::analyzer::Language;
 use brokk_bifrost_core::analyzer::structural::edges::{OwnerRelation, SiteClass};
 use brokk_bifrost_core::analyzer::structural::kinds::{
     ALL_KINDS, ALL_ROLES, NormalizedKind, Role, RoleValueShape,
-};
-use brokk_bifrost_core::analyzer::structural::materialization::{
-    ALL_EXPORT_FORMS, ALL_GENERATION_INPUT_CLASSES, ALL_GENERATION_KINDS,
 };
 use brokk_bifrost_core::analyzer::structural::resolution::{
     ALL_DECLARED_VISIBILITIES, DeclaredVisibility,
@@ -227,22 +229,24 @@ fn rql_form_candidates(class: Option<RqlFormClass>) -> Vec<SuggestionCandidate> 
 
 fn rql_pattern_head_candidates() -> Vec<SuggestionCandidate> {
     let mut candidates = rql_form_candidates(Some(RqlFormClass::Predicate));
-    candidates.extend(
-        ALL_KINDS
-            .iter()
-            .map(|kind| (kind.label().to_string(), kind.label().to_string())),
-    );
+    add_kind_candidates(&mut candidates);
     candidates
 }
 
 fn rql_query_head_candidates() -> Vec<SuggestionCandidate> {
-    let mut candidates = rql_form_candidates(None);
+    // A relation form is never a query head, so it is not a suggestion for one.
+    let mut candidates = rql_form_candidates(Some(RqlFormClass::Wrapper));
+    candidates.extend(rql_form_candidates(Some(RqlFormClass::Predicate)));
+    add_kind_candidates(&mut candidates);
+    candidates
+}
+
+fn add_kind_candidates(candidates: &mut Vec<SuggestionCandidate>) {
     candidates.extend(
         ALL_KINDS
             .iter()
             .map(|kind| (kind.label().to_string(), kind.label().to_string())),
     );
-    candidates
 }
 
 fn rql_property_candidates() -> Vec<SuggestionCandidate> {
@@ -326,15 +330,7 @@ struct Analysis {
 
 impl Analysis {
     fn error(&mut self, range: Range<usize>, code: &'static str, message: impl Into<String>) {
-        if self.diagnostics.len() >= MAX_SOURCE_DIAGNOSTICS {
-            return;
-        }
-        self.diagnostics.push(QuerySourceDiagnostic {
-            range,
-            code,
-            message: message.into(),
-            fix: None,
-        });
+        self.push_error(range, code, message, None);
     }
 
     fn error_with_fix(
@@ -344,6 +340,16 @@ impl Analysis {
         message: impl Into<String>,
         fix: QuerySourceFix,
     ) {
+        self.push_error(range, code, message, Some(fix));
+    }
+
+    fn push_error(
+        &mut self,
+        range: Range<usize>,
+        code: &'static str,
+        message: impl Into<String>,
+        fix: Option<QuerySourceFix>,
+    ) {
         if self.diagnostics.len() >= MAX_SOURCE_DIAGNOSTICS {
             return;
         }
@@ -351,7 +357,7 @@ impl Analysis {
             range,
             code,
             message: message.into(),
-            fix: Some(fix),
+            fix,
         });
     }
 
@@ -411,17 +417,19 @@ impl Analysis {
 }
 
 pub(super) fn query_expr_range_for_path(expr: &Expr, path: &str) -> Range<usize> {
-    let mut analysis = Analysis::default();
-    let mut plan_budget = SourcePlanBudget::default();
-    validate_rql_query(expr, "", &mut analysis, 0, &mut plan_budget);
+    let analysis = analyze_query_expr(expr);
     analysis.range_for_path(path, expr.range.clone())
 }
 
 pub(super) fn query_expr_path_for_range(expr: &Expr, range: &Range<usize>) -> Option<String> {
+    analyze_query_expr(expr).path_for_range(range)
+}
+
+fn analyze_query_expr(expr: &Expr) -> Analysis {
     let mut analysis = Analysis::default();
     let mut plan_budget = SourcePlanBudget::default();
     validate_rql_query(expr, "", &mut analysis, 0, &mut plan_budget);
-    analysis.path_for_range(range)
+    analysis
 }
 
 #[cfg(test)]

@@ -72,6 +72,10 @@ pub enum CodeQueryOccurrenceTarget {
 #[cfg_attr(feature = "query-result-fixtures", derive(Default))]
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryCallSite {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub site_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub program_point_id: Option<String>,
     pub path: String,
     pub language: &'static str,
     pub range: CodeQueryRange,
@@ -80,6 +84,19 @@ pub struct CodeQueryCallSite {
     pub callee: CodeQueryDeclaration,
     pub call_kind: &'static str,
     pub proof: &'static str,
+    /// Structured receiver syntax for the call. `this` is kept distinct from
+    /// an arbitrary explicit receiver so policies can express receiver identity
+    /// without inspecting source text.
+    pub receiver_kind: &'static str,
+    /// Resolver identity of the first written actual, when it is a lexical
+    /// binding. This is paired with `caller_parameter_identity` for identity
+    /// joins such as recursive self-calls.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub argument_identity: Option<String>,
+    /// Stable identity of the caller's first formal parameter aligned with the
+    /// first written actual, when the enclosing declaration exposes one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller_parameter_identity: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub receiver: Option<CodeQueryRange>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -105,6 +122,10 @@ pub struct CodeQueryCallArgument {
     #[serde(skip_serializing_if = "is_false")]
     #[schemars(default)]
     pub spread: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller_parameter_identity: Option<String>,
 }
 
 #[cfg_attr(feature = "query-result-fixtures", derive(Default))]
@@ -527,6 +548,11 @@ pub struct CodeQueryDispatchTarget {
     pub target_id: String,
     /// The workspace-relative path the target locator names.
     pub target_path: String,
+    /// The resolver-owned canonical owner/member identity, when this arm
+    /// names an external callable. This remains available when the workspace
+    /// has no declaration row for the target.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_fq_name: Option<String>,
     /// The target rendered as a workspace declaration, when the workspace can
     /// still locate one for the exact procedure. Absent for an external or
     /// unmaterialized arm, and for a materialized procedure whose declaration
@@ -651,6 +677,101 @@ pub struct CodeQueryMemberFamilyEdge {
     pub coverage: &'static str,
 }
 
+/// One typed fact from Python's class hierarchy, C3 MRO, effective member or
+/// override selection, or a selected override paired with its signature rows.
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CodeQueryPythonHierarchyFact {
+    pub id: String,
+    pub root_id: String,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root: Option<CodeQueryDeclaration>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_declaration_id: Option<String>,
+    pub fact_kind: &'static str,
+    pub outcome: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+    pub coverage: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ordinal: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_spelling: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_resolution: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declaration: Option<CodeQueryDeclaration>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declaration_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<CodeQueryDeclaration>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<CodeQueryDeclaration>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_owner: Option<CodeQueryDeclaration>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_owner_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub member_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mro_rank: Option<usize>,
+    /// Whether a resolved lifecycle target has a substantive body.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_non_trivial: Option<bool>,
+    /// Whether a subclass override reads its instance receiver.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_reads_self: Option<bool>,
+    /// Number of distinct declarations visible through the class's direct-base branches.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_branch_definition_count: Option<usize>,
+    /// Whether the effective MRO has a strict comparison method.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_strict_ordering: Option<bool>,
+    /// Whether the effective MRO has a non-strict comparison method.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_non_strict_ordering: Option<bool>,
+    /// Whether the class decorator resolves to functools.total_ordering.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_ordering_decorator: Option<bool>,
+    /// Whether an inherited __ne__ remains effective without a direct override.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inherited_ne_present: Option<bool>,
+    /// Whether the effective inherited __ne__ delegates to __eq__.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inherited_ne_delegates: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_signature_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_signature_ordinal: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_signature_coverage: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_required_arity: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_total_arity: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_repeated_arity: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_signature_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_signature_ordinal: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_signature_coverage: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_required_arity: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_total_arity: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_repeated_arity: Option<bool>,
+}
+
 /// One typed receiver value retained for a site. Nested factory returns are
 /// flattened into a parent-linked chain instead of nested presentation data.
 #[cfg_attr(feature = "query-result-fixtures", derive(Default))]
@@ -683,6 +804,28 @@ pub struct CodeQueryReceiverEvidence {
     pub completeness: &'static str,
 }
 
+/// One semantic points-to object candidate, kept separate from merged
+/// receiver/type evidence so identity remains aligned with the oracle row.
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CodeQueryPointsToCandidate {
+    pub id: String,
+    pub site_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub program_point_id: Option<String>,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub candidate_index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub object_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub object_cardinality: Option<&'static str>,
+    pub proof: &'static str,
+    pub completeness: &'static str,
+    pub coverage: &'static str,
+}
+
 /// The mandatory structured call-shape outcome row for one exact call site.
 /// Group and argument rows may be empty, but this row always states the
 /// call kind and how much of the shape the analyzer could see.
@@ -699,6 +842,10 @@ pub struct CodeQueryCallShape {
     pub callee_range: Option<CodeQueryRange>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub callee_name: Option<String>,
+    /// Exact Python external callee identity supplied by the opt-in
+    /// `exact_external_callee` query step.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_external_callee: Option<String>,
     pub call_kind: &'static str,
     pub coverage: &'static str,
     pub group_count: usize,
@@ -730,6 +877,10 @@ pub struct CodeQueryCallShapeArgument {
     pub argument_index: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Decoded value when this positional argument is a string literal.
+    /// Dynamic and non-string arguments remain `None`.
+    #[serde(skip)]
+    pub literal_value: Option<String>,
     pub spread: bool,
 }
 
@@ -760,6 +911,10 @@ pub struct CodeQueryCallBinding {
     /// The facts-arena AST identity of the call node, so a binding row joins an
     /// occurrence or dispatch row without comparing positions.
     pub site_ast_id: String,
+    /// Exact semantic program point of the call site, when the source call
+    /// maps uniquely into the semantic artifact.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub program_point_id: Option<String>,
     pub path: String,
     pub language: &'static str,
     /// The actual's own span, or the whole call's span on a terminal row.
@@ -771,6 +926,19 @@ pub struct CodeQueryCallBinding {
     /// a defaulted formal, neither of which has a source actual.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub argument_id: Option<String>,
+    /// Lexical binding identity of the actual argument, when the existing
+    /// occurrence/environment facts establish one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binding_id: Option<String>,
+    /// Decoded string value of a direct literal actual, when the structural
+    /// facts adapter publishes one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub literal_value: Option<String>,
+    /// Correlation identity for a lexical binding or direct decoded literal.
+    /// The value carries a disjoint domain prefix and is only published when
+    /// the corresponding structural identity is complete.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_identity: Option<String>,
     /// The exact callee declaration the production resolver named, when the
     /// workspace still indexes a range for it. This remains the source
     /// declaration identity used by source joins.
@@ -1014,6 +1182,12 @@ pub struct CodeQueryCallEffect {
     /// Arms a unique activated summary modeled.
     pub modeled_arm_count: usize,
     pub terminal: bool,
+    /// Captures from the structural call-shape seed. This is an internal
+    /// assertion-policy join surface, not a public call-effect field.
+    #[serde(skip)]
+    #[schemars(skip)]
+    #[doc(hidden)]
+    pub(crate) captures: Vec<CodeQueryCapture>,
 }
 
 /// One reviewed condition that must be established before a normal call result
@@ -1104,8 +1278,8 @@ pub struct CodeQueryCallResultContract {
     pub possible_success_guard_edges: Vec<crate::analyzer::semantic::ControlEdgeLocator>,
 }
 
-/// One exact Java call result-use obligation, or an explicit terminal row
-/// stating why the relation cannot close for this call.
+/// One exact call result-use obligation, or an explicit terminal row stating
+/// why the relation cannot close for this call.
 #[cfg_attr(feature = "query-result-fixtures", derive(Default))]
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryCallResultObligation {
@@ -1121,7 +1295,16 @@ pub struct CodeQueryCallResultObligation {
     pub obligation_kind: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_predicate: Option<&'static str>,
+    /// Serialized separately from the query item's traversal provenance.
+    /// The typed row projection field remains `provenance`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "obligation_provenance")]
+    pub provenance: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub obligation_basis: Option<&'static str>,
     pub result_use: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_use_detail: Option<&'static str>,
     pub coverage: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'static str>,
@@ -1367,68 +1550,7 @@ pub struct CodeQueryAssignmentRelation {
     pub replacement_events: Vec<CodeQueryStateEventRef>,
 }
 
-/// One same-location ordinary-access pair in a bounded concurrent task slice.
-/// The row retains both defects and structured safe explanations. Built-in
-/// policies select only `conflict`, `proven`, and `exhaustive` rows whose
-/// ordering is `unordered` and whose protection is `unprotected`.
-#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
-pub struct CodeQueryUnresolvedCall {
-    /// Exact package/member identity when target resolution established one.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub callee: Option<String>,
-    /// Why the call boundary remains open, such as `unmodeled_external` or
-    /// `dynamic_dispatch`.
-    pub reason: String,
-    pub path: String,
-    pub range: CodeQueryRange,
-}
-
-#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-pub struct CodeQueryConcurrentAccessConflict {
-    pub id: String,
-    pub root_procedure_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ast_id: Option<String>,
-    pub path: String,
-    pub language: &'static str,
-    pub range: CodeQueryRange,
-    pub location_id: String,
-    pub location_kind: String,
-    pub first_procedure_id: String,
-    pub first_point_id: u32,
-    pub first_access: &'static str,
-    pub first_path: String,
-    pub first_range: CodeQueryRange,
-    #[serde(skip)]
-    pub first_start_byte: usize,
-    #[serde(skip)]
-    pub first_end_byte: usize,
-    pub second_procedure_id: String,
-    pub second_point_id: u32,
-    pub second_access: &'static str,
-    pub second_path: String,
-    pub second_range: CodeQueryRange,
-    #[serde(skip)]
-    pub second_start_byte: usize,
-    #[serde(skip)]
-    pub second_end_byte: usize,
-    pub task_relation: &'static str,
-    pub ordering: &'static str,
-    pub protection: &'static str,
-    pub verdict: &'static str,
-    pub proof: &'static str,
-    pub coverage: &'static str,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    #[schemars(default)]
-    pub reasons: Vec<String>,
-    /// Call boundaries that contribute `unresolved_target` to this row.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    #[schemars(default)]
-    pub unresolved_calls: Vec<CodeQueryUnresolvedCall>,
-}
-
+/// One value transferred from a detached task's call site into its body.
 #[cfg_attr(feature = "query-result-fixtures", derive(Default))]
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryDetachedTaskTransfer {
@@ -1527,9 +1649,11 @@ pub struct CodeQueryResultContractFailureUse {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryProcedureEffect {
     pub id: String,
-    /// Equal to the `declaration` domain's `id` for the same procedure.
+    /// The exact input procedure identity; for declaration inputs this is the
+    /// declaration identity, and for procedure inputs it is the procedure row
+    /// identity (including anonymous closures).
     pub procedure_id: String,
-    /// The procedure declaration id plus this row's exact byte span.
+    /// The enclosing declaration id plus the exact procedure input span.
     pub site_id: String,
     pub procedure_name: String,
     pub path: String,
@@ -1592,13 +1716,14 @@ pub struct CodeQueryProcedureEffect {
 /// The mandatory row for one persisted signature entry of one declaration
 /// (#1478 M2).
 ///
-/// Projected from the analyzer's own `SignatureMetadata`, never re-parsed, so
-/// a warm cache and a cold run agree by construction. Exactly one row exists
-/// per persisted entry, and a declaration whose language publishes no metadata
-/// at all still gets one row whose `coverage` is `unrecorded` -- zero
-/// parameter rows can therefore never be read as a proven-empty parameter
-/// list. An overload set that shares one fully qualified name separates into
-/// one row per overload, distinguished by `ordinal`.
+/// Projected from the analyzer's own `SignatureMetadata`, with a Python
+/// special-method contract derived from that declaration's prepared syntax.
+/// Exactly one row exists per persisted entry, and a declaration whose
+/// language publishes no metadata at all still gets one row whose `coverage`
+/// is `unrecorded` -- zero parameter rows can therefore never be read as a
+/// proven-empty parameter list. An overload set that shares one fully
+/// qualified name separates into one row per overload, distinguished by
+/// `ordinal`.
 ///
 /// A fact the adapter did not record is absent, never defaulted. The arity
 /// fields are absent when the language records no arity, and
@@ -1622,6 +1747,9 @@ pub struct CodeQueryCallableSignature {
     /// `function`, `method`, `constructor`, `field`, `class`, `module`,
     /// `macro`, or `file_scope`.
     pub role: &'static str,
+    /// Name of the first declared formal parameter, when one exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_parameter: Option<String>,
     /// The rendered signature header the adapter published. Evidence for a
     /// human reading a finding; never parsed.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1641,11 +1769,82 @@ pub struct CodeQueryCallableSignature {
     /// persisted facts decide it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub receiver_contract: Option<&'static str>,
+    /// Python method kind derived from structured declaration syntax:
+    /// `instance`, `static`, `class`, or `unknown`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub python_method_kind: Option<&'static str>,
+    /// Whether the owning class derives from the exact builtin `type` class.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub python_owner_is_metaclass: Option<bool>,
+    /// Whether the owning class derives from the exact Zope interface base.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub python_owner_is_zope_interface: Option<bool>,
+    /// Whether a call or decorator expression in the class body uses this
+    /// function's exact declaration identity, which CodeQL excludes from the
+    /// ordinary-self check.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub python_used_in_class_body: Option<bool>,
+    /// Whether the function has no formals and at least one decorator.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub python_no_args_with_decorator: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub return_type: Option<String>,
     /// Whether this entry is a declaration without a body.
     pub declaration_only: bool,
     pub parameter_count: usize,
+    /// The Python special-method signature verdict, when this declaration is
+    /// a recognized special method. Other declarations omit these fields.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub special_method_status: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub special_method_expected_minimum: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub special_method_expected_maximum: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub special_method_reason: Option<&'static str>,
+}
+
+/// One scalar literal occurrence, with its nearest source-backed scope and
+/// optional structured call-argument context. Identity is absent when the
+/// language adapter could not decode the selected literal completely.
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CodeQueryLiteralOccurrence {
+    pub id: String,
+    pub scope_id: String,
+    pub scope_kind: &'static str,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+    pub coverage: &'static str,
+    pub trivial: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub argument_index: Option<usize>,
+}
+/// Query-local structured metrics for one source-backed callable site.
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CodeQueryCallableMetrics {
+    pub id: String,
+    pub callable_id: Option<String>,
+    pub site_id: String,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub declaration: CodeQueryDeclaration,
+    /// `exact`, `incomplete`, or `unrecorded`.
+    pub coverage: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_nesting: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cognitive_complexity: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owned_body_span_lines: Option<usize>,
 }
 
 /// One ordered declared parameter of one callable signature (#1478 M2).

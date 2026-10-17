@@ -20,7 +20,7 @@ use crate::analyzer::usages::inverted_edges::{
 };
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::traits::{UsageQueryResolver, UsageScanScope};
+use crate::analyzer::usages::traits::{GraphUsageDispatchSpec, UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{
     AnalyzerDefinitionLookup, BoundedDefinitionLookup, CodeUnit, IAnalyzer, Language, ProjectFile,
     RubyAnalyzer, resolve_analyzer,
@@ -138,7 +138,7 @@ pub(crate) fn build_ruby_usage_edge_weights(
     keep_file: impl Fn(&ProjectFile) -> bool + Sync,
 ) -> Option<UsageEdgeWeights> {
     let resolver = RubyEdgeResolver::try_new(analyzer)?;
-    resolver.build_edge_weights(analyzer, nodes, keep_file)
+    resolver.build_edges(analyzer, nodes, keep_file)
 }
 
 /// Ruby's implementation of the shared query-path contract.
@@ -293,31 +293,25 @@ impl GraphUsageAnalyzer for RubyUsageGraphStrategy {
         scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
-        let Some(target) = overloads.first() else {
-            return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
-        };
-        if language_for_target(target) != Language::Ruby {
-            return GraphUsageOutcome::fallback_safe(
-                target.fq_name(),
-                GraphFailureReason::UnsupportedTargetLanguage("target is not Ruby"),
-                STRATEGY,
-            );
-        }
-        let Some(resolver) = RubyQueryResolver::try_new(analyzer) else {
-            return GraphUsageOutcome::fallback_safe(
-                target.fq_name(),
-                GraphFailureReason::MissingAnalyzerCapability("Ruby analyzer is unavailable"),
-                STRATEGY,
-            );
-        };
-
-        resolver.find_usages(analyzer, overloads, scan_scope, max_usages)
+        crate::analyzer::usages::traits::dispatch_graph_usage_query::<RubyQueryResolver<'_>>(
+            analyzer,
+            overloads,
+            scan_scope,
+            max_usages,
+            GraphUsageDispatchSpec {
+                target_language: Language::Ruby,
+                unsupported_target: "target is not Ruby",
+                missing_analyzer: "Ruby analyzer is unavailable",
+                strategy: STRATEGY,
+            },
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::analyzer::usages::model::UsageAnalysisDiagnostic;
     use crate::analyzer::{CodeUnitIndex, CodeUnitType, PythonAnalyzer, TestProject};
     use crate::cancellation::CancellationToken;
@@ -326,12 +320,7 @@ mod tests {
     fn write_project(files: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf) {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonicalize temp dir");
-        for (path, contents) in files {
-            let full = root.join(path);
-            std::fs::create_dir_all(full.parent().expect("file has a parent"))
-                .expect("create parent dir");
-            std::fs::write(full, contents).expect("write fixture file");
-        }
+        crate::test_support::write_fixture_files(&root, files);
         (temp, root)
     }
 
@@ -384,100 +373,6 @@ mod tests {
                 .collect(),
             other => panic!("expected a resolved success, got {other:?}"),
         }
-    }
-
-    /// The three gate strings and the strategy label are a stable contract of the Ruby
-    /// path: the capability message in particular is deliberately *not* the siblings'
-    /// "analyzer does not expose XAnalyzer" wording.
-    #[test]
-    fn the_three_ruby_gates_keep_their_exact_diagnostics() {
-        let (_temp, root) = zeitwerk_project();
-        let analyzer = ruby_analyzer(&root);
-        let candidates = HashSet::default();
-        let scope = UsageScanScope::new(&candidates);
-        let strategy = RubyUsageGraphStrategy::new();
-
-        let python_target = CodeUnit::new(
-            ProjectFile::new(root.clone(), PathBuf::from("app/models/user.py")),
-            CodeUnitType::Function,
-            "app.models.user",
-            "build",
-        );
-        let language_gate = fallback_diagnostic(strategy.find_graph_usages(
-            &analyzer,
-            &[python_target],
-            &scope,
-            100,
-        ));
-        assert_eq!(language_gate.strategy, "RubyUsageGraphStrategy");
-        assert_eq!(language_gate.reason_kind, "unsupported_target_language");
-        assert_eq!(
-            language_gate.reason,
-            "RubyUsageGraphStrategy: target is not Ruby"
-        );
-
-        let user_file = ProjectFile::new(root.clone(), PathBuf::from("app/models/user.rb"));
-        let target = declaration(&analyzer, &user_file, "build");
-        let not_ruby_analyzer =
-            PythonAnalyzer::from_project(TestProject::new(root.clone(), Language::Python));
-        let capability_gate = fallback_diagnostic(strategy.find_graph_usages(
-            &not_ruby_analyzer,
-            std::slice::from_ref(&target),
-            &scope,
-            100,
-        ));
-        assert_eq!(capability_gate.strategy, "RubyUsageGraphStrategy");
-        assert_eq!(capability_gate.reason_kind, "missing_analyzer_capability");
-        assert_eq!(
-            capability_gate.reason,
-            "RubyUsageGraphStrategy: Ruby analyzer is unavailable"
-        );
-
-        let macro_target = CodeUnit::new(user_file, CodeUnitType::Macro, "", "User.build");
-        let shape_gate = fallback_diagnostic(strategy.find_graph_usages(
-            &analyzer,
-            &[macro_target],
-            &scope,
-            100,
-        ));
-        assert_eq!(shape_gate.strategy, "RubyUsageGraphStrategy");
-        assert_eq!(shape_gate.reason_kind, "unsupported_target_shape");
-        assert_eq!(
-            shape_gate.reason,
-            "RubyUsageGraphStrategy: target shape is unsupported"
-        );
-    }
-
-    /// The shared planner admits Zeitwerk consumers from persisted identifier
-    /// facts before the budgets run. Ruby execution neither builds the old
-    /// whole-workspace reference map nor the global semantic inversion.
-    #[test]
-    fn zeitwerk_candidates_are_planned_without_global_reference_indexes() {
-        let (_temp, root) = zeitwerk_project();
-        let analyzer = ruby_analyzer(&root);
-        let user_file = ProjectFile::new(root.clone(), PathBuf::from("app/models/user.rb"));
-        let target = declaration(&analyzer, &user_file, "build");
-
-        assert!(!analyzer.global_semantic_index_initialized_for_test());
-        let query = crate::analyzer::usages::UsageFinder::new().query(
-            &analyzer,
-            std::slice::from_ref(&target),
-            100,
-            100,
-        );
-        assert!(
-            query
-                .result
-                .all_hits()
-                .iter()
-                .any(|hit| hit.enclosing.fq_name().contains("show")),
-            "the indexed planner must admit the Zeitwerk referrer: {:?}",
-            query.result.all_hits()
-        );
-        assert!(
-            !analyzer.global_semantic_index_initialized_for_test(),
-            "a target query must not materialize the repository-wide Ruby semantic index"
-        );
     }
 
     /// Ruby breaks its scan loop on cancellation and returns what it already proved.
@@ -545,8 +440,96 @@ mod tests {
         assert!(partial < complete);
     }
 
-    /// The cap is a `Resolved` outcome carrying `TooManyCallsites`, not a failure
-    /// variant, so callers see a guardrail rather than a broken query.
+    // Restored Ruby usage-query gates and bounded-query behavior.
+
+    #[test]
+    fn the_three_ruby_gates_keep_their_exact_diagnostics() {
+        let (_temp, root) = zeitwerk_project();
+        let analyzer = ruby_analyzer(&root);
+        let candidates = HashSet::default();
+        let scope = UsageScanScope::new(&candidates);
+        let strategy = RubyUsageGraphStrategy::new();
+
+        let python_target = CodeUnit::new(
+            ProjectFile::new(root.clone(), PathBuf::from("app/models/user.py")),
+            CodeUnitType::Function,
+            "app.models.user",
+            "build",
+        );
+        let language_gate = fallback_diagnostic(strategy.find_graph_usages(
+            &analyzer,
+            &[python_target],
+            &scope,
+            100,
+        ));
+        assert_eq!(language_gate.strategy, "RubyUsageGraphStrategy");
+        assert_eq!(language_gate.reason_kind, "unsupported_target_language");
+        assert_eq!(
+            language_gate.reason,
+            "RubyUsageGraphStrategy: target is not Ruby"
+        );
+
+        let user_file = ProjectFile::new(root.clone(), PathBuf::from("app/models/user.rb"));
+        let target = declaration(&analyzer, &user_file, "build");
+        let not_ruby_analyzer =
+            PythonAnalyzer::from_project(TestProject::new(root.clone(), Language::Python));
+        let capability_gate = fallback_diagnostic(strategy.find_graph_usages(
+            &not_ruby_analyzer,
+            std::slice::from_ref(&target),
+            &scope,
+            100,
+        ));
+        assert_eq!(capability_gate.strategy, "RubyUsageGraphStrategy");
+        assert_eq!(capability_gate.reason_kind, "missing_analyzer_capability");
+        assert_eq!(
+            capability_gate.reason,
+            "RubyUsageGraphStrategy: Ruby analyzer is unavailable"
+        );
+
+        let macro_target = CodeUnit::new(user_file, CodeUnitType::Macro, "", "User.build");
+        let shape_gate = fallback_diagnostic(strategy.find_graph_usages(
+            &analyzer,
+            &[macro_target],
+            &scope,
+            100,
+        ));
+        assert_eq!(shape_gate.strategy, "RubyUsageGraphStrategy");
+        assert_eq!(shape_gate.reason_kind, "unsupported_target_shape");
+        assert_eq!(
+            shape_gate.reason,
+            "RubyUsageGraphStrategy: target shape is unsupported"
+        );
+    }
+
+    #[test]
+    fn zeitwerk_candidates_are_planned_without_global_reference_indexes() {
+        let (_temp, root) = zeitwerk_project();
+        let analyzer = ruby_analyzer(&root);
+        let user_file = ProjectFile::new(root.clone(), PathBuf::from("app/models/user.rb"));
+        let target = declaration(&analyzer, &user_file, "build");
+
+        assert!(!analyzer.global_semantic_index_initialized_for_test());
+        let query = crate::analyzer::usages::UsageFinder::new().query(
+            &analyzer,
+            std::slice::from_ref(&target),
+            100,
+            100,
+        );
+        assert!(
+            query
+                .result
+                .all_hits()
+                .iter()
+                .any(|hit| hit.enclosing.fq_name().contains("show")),
+            "the indexed planner must admit the Zeitwerk referrer: {:?}",
+            query.result.all_hits()
+        );
+        assert!(
+            !analyzer.global_semantic_index_initialized_for_test(),
+            "a target query must not materialize the repository-wide Ruby semantic index"
+        );
+    }
+
     #[test]
     fn exceeding_the_usage_cap_resolves_to_too_many_callsites() {
         let (_temp, root) = zeitwerk_project();

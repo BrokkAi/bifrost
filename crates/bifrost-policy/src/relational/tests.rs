@@ -13,17 +13,14 @@ use brokk_bifrost_rql::structural::search::{
     CodeQueryCallShapeArgument, CodeQueryClassSetRow, CodeQueryFlowCarrierSymbol,
     CodeQueryFlowCertainty, CodeQueryFlowEndpoint, CodeQueryFlowEvent, CodeQueryFlowReachability,
     CodeQueryFlowStatus, CodeQueryFlowSymbolSite, CodeQueryResultItem,
-    CodeQueryRowFieldUnknownReason, CodeQuerySemanticCompleteness, CodeQuerySemanticEvidence,
-    CodeQuerySemanticProof, CodeQuerySourceSite, CodeQueryTaintFinding,
-    CodeQueryTypestateCertainty, CodeQueryTypestateFinding, CodeQueryTypestateFindingKind,
-    CodeQueryTypestateSubject, DetailedCodeQueryDomain, UnitRowField, UnitRowItem, UnitRowScalar,
-    UnitRowUnknownField,
+    CodeQuerySemanticCompleteness, CodeQuerySemanticEvidence, CodeQuerySemanticProof,
+    CodeQuerySourceSite, CodeQueryTaintFinding, CodeQueryTypestateCertainty,
+    CodeQueryTypestateFinding, CodeQueryTypestateFindingKind, CodeQueryTypestateSubject,
+    DetailedCodeQueryDomain, UnitRowField, UnitRowItem, UnitRowScalar,
 };
 use brokk_bifrost_rql::structural::{CodeQueryCompletion, CodeQueryRange, CodeQueryResultValue};
 
 use brokk_bifrost_flow::type_flow::ClassSetStatus;
-
-use brokk_bifrost_analysis::analyzer::usages::call_conversion::ConversionUnknown;
 
 use crate::definition::{AssertCardinality, PolicyAssertId, RowBindingName, RowLiteral};
 use crate::finding::PolicyIncompleteReason;
@@ -37,6 +34,69 @@ use super::ir::{
 };
 use super::validate::{RelationalAssertionPlanError, validate_plan_ir};
 
+fn ten_matching_join_pairs() -> (Vec<UnitRowItem>, Vec<UnitRowItem>) {
+    let left = vec![
+        argument("site", "arg-0", 0, None, false),
+        argument("site", "arg-1", 1, None, false),
+    ];
+    let right = (0..5)
+        .map(|index| argument("site", &format!("other-{index}"), index, None, false))
+        .collect();
+    (left, right)
+}
+
+fn indexed_rows() -> Vec<UnitRowItem> {
+    vec![
+        argument("site", "arg-0", 0, Some("name"), false),
+        argument("site", "arg-1", 1, None, true),
+        argument("site", "arg-2", 2, Some("greeting"), false),
+    ]
+}
+
+fn filtered_count(predicates: Vec<IrPredicate>, rows: &[UnitRowItem]) -> u64 {
+    let arg = source(0, "arg");
+    let filtered = filter(1, "kept", &arg, predicates);
+    let grouped = group(
+        2,
+        "by-site",
+        &filtered,
+        vec![column("arg", "site_id")],
+        vec![fold("by-site", "calls", IrAggregateOp::Count, None)],
+    );
+    let assert = assertion("kept", &grouped, "calls", AssertCardinality::AtMost(0));
+    let plan = plan(vec![arg, filtered, grouped], vec![assert]);
+    let evaluation = evaluate(&plan, &[("arg", rows, RelationCoverage::exhaustive())]);
+    evaluation
+        .violations
+        .first()
+        .map(|violation| violation.actual)
+        .unwrap_or(0)
+}
+
+fn flow_counting_plan(cardinality: AssertCardinality) -> RelationalPlanIr {
+    let flow = IrRelation {
+        id: IrRelationId(0),
+        name: "flow".to_string(),
+        op: IrRelationOp::Source {
+            binding: binding("flow"),
+            schema: domain_schema("flow", DetailedCodeQueryDomain::FlowEndpoint),
+        },
+        schema: domain_schema("flow", DetailedCodeQueryDomain::FlowEndpoint),
+    };
+    let grouped = group(
+        1,
+        "by-plan",
+        &flow,
+        vec![column("flow", "plan_ref")],
+        vec![fold("by-plan", "endpoints", IrAggregateOp::Count, None)],
+    );
+    let assert = assertion("flow-endpoints", &grouped, "endpoints", cardinality);
+    plan(vec![flow, grouped], vec![assert])
+}
+
+/// Anti join one call-site relation against the flow endpoints reaching it, and
+/// assert that no site is left unmatched. `(at-most 0)` over the anti join is
+/// the shape a "no unguarded sink" policy takes.
 const DOMAIN: DetailedCodeQueryDomain = DetailedCodeQueryDomain::CallArgument;
 
 fn binding(name: &str) -> RowBindingName {
@@ -66,6 +126,7 @@ fn argument(site: &str, id: &str, index: usize, name: Option<&str>, spread: bool
                 },
                 argument_index: index,
                 name: name.map(str::to_string),
+                literal_value: None,
                 spread,
             }),
         },
@@ -73,86 +134,6 @@ fn argument(site: &str, id: &str, index: usize, name: Option<&str>, spread: bool
         provenance_truncated: false,
         row_projection: Vec::new(),
     })
-}
-
-/// One call-binding row with the small field surface the evaluator tests.
-/// Fields not read by a plan need not be projected, while an unavailable
-/// registered field is carried separately so it cannot become `None`.
-fn call_binding(
-    site: &str,
-    id: &str,
-    index: Option<usize>,
-    terminal: Option<bool>,
-    conversion: Option<&str>,
-    unknown_field: Option<&str>,
-) -> UnitRowItem {
-    let mut fields = vec![
-        UnitRowField {
-            name: "id".into(),
-            value: UnitRowScalar::StableId(id.into()),
-        },
-        UnitRowField {
-            name: "site_id".into(),
-            value: UnitRowScalar::StableId(site.into()),
-        },
-        UnitRowField {
-            name: "mapping".into(),
-            value: UnitRowScalar::ConstrainedEnum("exact".into()),
-        },
-    ];
-    if let Some(index) = index {
-        fields.push(UnitRowField {
-            name: "actual_index".into(),
-            value: UnitRowScalar::Integer(index as u64),
-        });
-    }
-    if let Some(terminal) = terminal {
-        fields.push(UnitRowField {
-            name: "terminal".into(),
-            value: UnitRowScalar::Boolean(terminal),
-        });
-    }
-    if let Some(conversion) = conversion {
-        fields.push(UnitRowField {
-            name: "conversion".into(),
-            value: UnitRowScalar::ConstrainedEnum(conversion.into()),
-        });
-    }
-    let unknown_fields = unknown_field
-        .map(|name| {
-            vec![UnitRowUnknownField {
-                name: name.into(),
-                reason: CodeQueryRowFieldUnknownReason::CallConversion(
-                    ConversionUnknown::UnsupportedConversion,
-                ),
-            }]
-        })
-        .unwrap_or_default();
-    UnitRowItem {
-        domain: DetailedCodeQueryDomain::CallBinding,
-        path: "app.ts".into(),
-        range: None,
-        evidence: None,
-        coverage: None,
-        fields,
-        unknown_fields,
-        projected_field_names: Vec::new(),
-        terminal: None,
-        provenance: Vec::new(),
-        provenance_truncated: false,
-    }
-}
-
-fn call_binding_source(id: usize, name: &str) -> IrRelation {
-    IrRelation {
-        id: IrRelationId(id),
-        name: name.to_string(),
-        op: IrRelationOp::Source {
-            binding: binding(name),
-            schema: domain_schema(name, DetailedCodeQueryDomain::CallBinding),
-        },
-        schema: domain_schema(name, DetailedCodeQueryDomain::CallBinding),
-    }
 }
 
 fn source(id: usize, name: &str) -> IrRelation {
@@ -343,17 +324,6 @@ fn an_exceeded_upper_bound_is_published_from_a_proven_subset() {
     }
 }
 
-/// The same rule for `exactly`, whose upper bound is the half that can be
-/// exceeded.
-#[test]
-fn an_exceeded_exact_bound_is_published_from_a_proven_subset() {
-    let plan = counting_plan(AssertCardinality::Exactly(1));
-    let rows = two_rows_at_one_site();
-    let evaluation = evaluate(&plan, &[("arg", &rows, RelationCoverage::proven_subset())]);
-    assert_eq!(verdicts(&evaluation), vec![("site".to_string(), 2)]);
-    assert!(evaluation.unmet_obligations.is_empty());
-}
-
 /// A clean upper-bound verdict states that no further row exists, which only an
 /// exhaustive relation can support.
 #[test]
@@ -445,403 +415,6 @@ fn an_unsupported_relation_blocks_the_clean_verdict_with_a_capability_reason() {
         evaluation.unmet_obligations[0].reasons,
         vec![PolicyIncompleteReason::CapabilityIncomplete]
     );
-}
-
-fn conversion_filter_plan(
-    predicate: IrPredicate,
-    cardinality: AssertCardinality,
-) -> RelationalPlanIr {
-    let calls = call_binding_source(0, "calls");
-    let filtered = filter(1, "filtered", &calls, vec![predicate]);
-    let grouped = group(
-        2,
-        "by-site",
-        &filtered,
-        vec![column("calls", "site_id")],
-        vec![fold("by-site", "calls", IrAggregateOp::Count, None)],
-    );
-    let assertion = assertion("conversion", &grouped, "calls", cardinality);
-    plan(vec![calls, filtered, grouped], vec![assertion])
-}
-
-fn call_count_plan(cardinality: AssertCardinality) -> RelationalPlanIr {
-    let calls = call_binding_source(0, "calls");
-    let grouped = group(
-        1,
-        "by-site",
-        &calls,
-        vec![column("calls", "site_id")],
-        vec![fold("by-site", "calls", IrAggregateOp::Count, None)],
-    );
-    let assertion = assertion("call-count", &grouped, "calls", cardinality);
-    plan(vec![calls, grouped], vec![assertion])
-}
-
-fn mapping_filter_plan(cardinality: AssertCardinality) -> RelationalPlanIr {
-    let calls = call_binding_source(0, "calls");
-    let filtered = filter(
-        1,
-        "mapped",
-        &calls,
-        vec![IrPredicate::Compare {
-            left: column("calls", "mapping"),
-            op: IrCompareOp::Eq,
-            right: IrOperand::Literal(RowLiteral::ConstrainedEnum("exact".to_string())),
-        }],
-    );
-    let grouped = group(
-        2,
-        "by-site",
-        &filtered,
-        vec![column("calls", "site_id")],
-        vec![fold("by-site", "calls", IrAggregateOp::Count, None)],
-    );
-    let assertion = assertion("mapping-count", &grouped, "calls", cardinality);
-    plan(vec![calls, filtered, grouped], vec![assertion])
-}
-
-fn conversion_join_plan(kind: IrJoinKind, cardinality: AssertCardinality) -> RelationalPlanIr {
-    let left = call_binding_source(0, "left");
-    let right = call_binding_source(1, "right");
-    let joined = join(
-        2,
-        &left,
-        &right,
-        kind,
-        vec![IrEquiKey {
-            left: column("left", "conversion"),
-            right: column("right", "conversion"),
-        }],
-    );
-    let grouped = group(
-        3,
-        "by-site",
-        &joined,
-        vec![column("left", "site_id")],
-        vec![fold("by-site", "calls", IrAggregateOp::Count, None)],
-    );
-    let assertion = assertion("conversion-join", &grouped, "calls", cardinality);
-    plan(vec![left, right, joined, grouped], vec![assertion])
-}
-
-fn conversion_aggregate_plan(
-    op: IrAggregateOp,
-    value: &str,
-    cardinality: AssertCardinality,
-) -> RelationalPlanIr {
-    let calls = call_binding_source(0, "calls");
-    let grouped = group(
-        1,
-        "by-site",
-        &calls,
-        vec![column("calls", "site_id")],
-        vec![fold("by-site", "value", op, Some(column("calls", value)))],
-    );
-    let assertion = assertion("conversion-aggregate", &grouped, "value", cardinality);
-    plan(vec![calls, grouped], vec![assertion])
-}
-
-// ---------------------------------------------------------------------------
-// Field-scoped unknown evidence.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn an_unrelated_unknown_conversion_does_not_degrade_mapping_or_count() {
-    let plan = call_count_plan(AssertCardinality::AtMost(1));
-    let rows = vec![
-        call_binding(
-            "site",
-            "unknown",
-            Some(0),
-            Some(false),
-            None,
-            Some("conversion"),
-        ),
-        call_binding(
-            "site",
-            "known",
-            Some(1),
-            Some(false),
-            Some("typescript_identity"),
-            None,
-        ),
-    ];
-    let evaluation = evaluate(&plan, &[("calls", &rows, RelationCoverage::exhaustive())]);
-    assert_eq!(verdicts(&evaluation), vec![("site".to_string(), 2)]);
-    assert!(evaluation.unmet_obligations.is_empty());
-    assert!(evaluation.exhaustive);
-}
-
-#[test]
-fn mapping_only_filter_remains_exhaustive_with_unknown_conversion() {
-    let plan = mapping_filter_plan(AssertCardinality::AtMost(1));
-    let rows = vec![
-        call_binding(
-            "site",
-            "unknown",
-            Some(0),
-            Some(false),
-            None,
-            Some("conversion"),
-        ),
-        call_binding(
-            "site",
-            "known",
-            Some(1),
-            Some(false),
-            Some("typescript_identity"),
-            None,
-        ),
-    ];
-    let evaluation = evaluate(&plan, &[("calls", &rows, RelationCoverage::exhaustive())]);
-    assert_eq!(verdicts(&evaluation), vec![("site".to_string(), 2)]);
-    assert!(evaluation.unmet_obligations.is_empty());
-    assert!(evaluation.exhaustive);
-}
-
-#[test]
-fn conversion_equality_does_not_treat_unknown_as_a_known_value() {
-    let plan = conversion_filter_plan(
-        IrPredicate::Compare {
-            left: column("calls", "conversion"),
-            op: IrCompareOp::Eq,
-            right: IrOperand::Literal(RowLiteral::ConstrainedEnum(
-                "typescript_identity".to_string(),
-            )),
-        },
-        AssertCardinality::AtMost(0),
-    );
-    let rows = vec![
-        call_binding(
-            "site",
-            "unknown",
-            Some(0),
-            Some(false),
-            None,
-            Some("conversion"),
-        ),
-        call_binding(
-            "site",
-            "known",
-            Some(1),
-            Some(false),
-            Some("typescript_identity"),
-            None,
-        ),
-    ];
-    let evaluation = evaluate(&plan, &[("calls", &rows, RelationCoverage::exhaustive())]);
-    assert!(evaluation.violations.is_empty());
-    assert_eq!(evaluation.unmet_obligations.len(), 1);
-    assert_eq!(
-        evaluation.unmet_obligations[0].kind,
-        RelationalObligationKind::VerdictRequiresWitnessedRows
-    );
-    assert!(!evaluation.exhaustive);
-}
-
-#[test]
-fn conversion_null_tests_do_not_treat_unknown_as_absent() {
-    let rows = vec![
-        call_binding(
-            "site",
-            "unknown",
-            Some(0),
-            Some(false),
-            None,
-            Some("conversion"),
-        ),
-        call_binding("site", "absent", Some(1), Some(false), None, None),
-    ];
-    let is_null = conversion_filter_plan(
-        IrPredicate::IsNull {
-            column: column("calls", "conversion"),
-            negated: false,
-        },
-        AssertCardinality::AtMost(0),
-    );
-    let evaluation = evaluate(
-        &is_null,
-        &[("calls", &rows, RelationCoverage::exhaustive())],
-    );
-    assert!(evaluation.violations.is_empty());
-    assert_eq!(evaluation.unmet_obligations.len(), 1);
-    assert_eq!(
-        evaluation.unmet_obligations[0].kind,
-        RelationalObligationKind::VerdictRequiresWitnessedRows
-    );
-    assert!(!evaluation.exhaustive);
-
-    let is_not_null = conversion_filter_plan(
-        IrPredicate::IsNull {
-            column: column("calls", "conversion"),
-            negated: true,
-        },
-        AssertCardinality::AtMost(1),
-    );
-    let evaluation = evaluate(
-        &is_not_null,
-        &[("calls", &rows, RelationCoverage::exhaustive())],
-    );
-    assert!(evaluation.violations.is_empty());
-    assert_eq!(evaluation.unmet_obligations.len(), 1);
-    assert_eq!(
-        evaluation.unmet_obligations[0].kind,
-        RelationalObligationKind::AbsenceRequiresExhaustiveCoverage
-    );
-    assert!(!evaluation.exhaustive);
-}
-
-#[test]
-fn conversion_join_drops_unknown_keys_without_matching_nulls() {
-    let plan = conversion_join_plan(IrJoinKind::Inner, AssertCardinality::AtMost(0));
-    let left = vec![call_binding(
-        "site",
-        "unknown-left",
-        Some(0),
-        Some(false),
-        None,
-        Some("conversion"),
-    )];
-    let right = vec![call_binding(
-        "site",
-        "absent-right",
-        Some(0),
-        Some(false),
-        None,
-        None,
-    )];
-    let evaluation = evaluate(
-        &plan,
-        &[
-            ("left", &left, RelationCoverage::exhaustive()),
-            ("right", &right, RelationCoverage::exhaustive()),
-        ],
-    );
-    assert!(evaluation.violations.is_empty());
-    assert_eq!(evaluation.unmet_obligations.len(), 1);
-    assert_eq!(
-        evaluation.unmet_obligations[0].kind,
-        RelationalObligationKind::AbsenceRequiresExhaustiveCoverage
-    );
-    assert!(!evaluation.exhaustive);
-}
-
-#[test]
-fn conversion_anti_join_does_not_publish_unwitnessed_unmatched_rows() {
-    let plan = conversion_join_plan(IrJoinKind::Anti, AssertCardinality::AtMost(0));
-    let left = vec![call_binding(
-        "site",
-        "known-left",
-        Some(0),
-        Some(false),
-        Some("typescript_identity"),
-        None,
-    )];
-    let right = vec![call_binding(
-        "site",
-        "unknown-right",
-        Some(0),
-        Some(false),
-        None,
-        Some("conversion"),
-    )];
-    let evaluation = evaluate(
-        &plan,
-        &[
-            ("left", &left, RelationCoverage::exhaustive()),
-            ("right", &right, RelationCoverage::exhaustive()),
-        ],
-    );
-    assert!(evaluation.violations.is_empty());
-    assert_eq!(evaluation.unmet_obligations.len(), 1);
-    assert_eq!(
-        evaluation.unmet_obligations[0].kind,
-        RelationalObligationKind::VerdictRequiresWitnessedRows
-    );
-    assert!(!evaluation.exhaustive);
-}
-
-#[test]
-fn unknown_value_blocks_all_min_max_and_all_aggregate_witnesses() {
-    let all =
-        conversion_aggregate_plan(IrAggregateOp::All, "terminal", AssertCardinality::AtMost(0));
-    let all_rows = vec![
-        call_binding("site", "known", Some(0), Some(true), None, None),
-        call_binding("site", "unknown", None, None, None, Some("terminal")),
-    ];
-    let all_evaluation = evaluate(
-        &all,
-        &[("calls", &all_rows, RelationCoverage::exhaustive())],
-    );
-    assert!(all_evaluation.violations.is_empty());
-    assert_eq!(all_evaluation.unmet_obligations.len(), 1);
-    assert_eq!(
-        all_evaluation.unmet_obligations[0].kind,
-        RelationalObligationKind::VerdictRequiresWitnessedRows
-    );
-
-    for op in [IrAggregateOp::Min, IrAggregateOp::Max] {
-        let plan = conversion_aggregate_plan(op, "actual_index", AssertCardinality::AtMost(0));
-        let rows = vec![
-            call_binding("site", "known", Some(5), Some(false), None, None),
-            call_binding(
-                "site",
-                "unknown",
-                None,
-                Some(false),
-                None,
-                Some("actual_index"),
-            ),
-        ];
-        let evaluation = evaluate(&plan, &[("calls", &rows, RelationCoverage::exhaustive())]);
-        assert!(evaluation.violations.is_empty(), "{op:?}");
-        assert_eq!(evaluation.unmet_obligations.len(), 1, "{op:?}");
-        assert_eq!(
-            evaluation.unmet_obligations[0].kind,
-            RelationalObligationKind::VerdictRequiresWitnessedRows,
-            "{op:?}"
-        );
-    }
-}
-
-#[test]
-fn unknown_conversion_count_clean_upper_bound_is_inconclusive() {
-    let plan = conversion_filter_plan(
-        IrPredicate::Compare {
-            left: column("calls", "conversion"),
-            op: IrCompareOp::Eq,
-            right: IrOperand::Literal(RowLiteral::ConstrainedEnum(
-                "typescript_identity".to_string(),
-            )),
-        },
-        AssertCardinality::AtMost(1),
-    );
-    let rows = vec![
-        call_binding(
-            "site",
-            "unknown",
-            Some(0),
-            Some(false),
-            None,
-            Some("conversion"),
-        ),
-        call_binding(
-            "site",
-            "known",
-            Some(1),
-            Some(false),
-            Some("typescript_identity"),
-            None,
-        ),
-    ];
-    let evaluation = evaluate(&plan, &[("calls", &rows, RelationCoverage::exhaustive())]);
-    assert!(evaluation.violations.is_empty());
-    assert_eq!(evaluation.unmet_obligations.len(), 1);
-    assert_eq!(
-        evaluation.unmet_obligations[0].kind,
-        RelationalObligationKind::VerdictRequiresWitnessedRows
-    );
-    assert!(!evaluation.exhaustive);
 }
 
 // ---------------------------------------------------------------------------
@@ -978,41 +551,6 @@ fn a_left_join_keeps_an_unmatched_left_row_with_null_right_fields() {
     );
 }
 
-/// A matched left-join pair has the same rows and cardinality as an inner
-/// join, including both contributors in the retained evidence.
-#[test]
-fn a_left_join_matches_inner_join_for_matching_pairs() {
-    let left = [argument("site", "arg-0", 0, None, false)];
-    let right = [argument("site", "other-0", 0, None, false)];
-    let inputs = [
-        ("arg", &left[..], RelationCoverage::exhaustive()),
-        ("other", &right[..], RelationCoverage::exhaustive()),
-    ];
-    let left_join = evaluate(
-        &join_plan(IrJoinKind::Left, AssertCardinality::AtMost(0)),
-        &inputs,
-    );
-    let inner = evaluate(
-        &join_plan(IrJoinKind::Inner, AssertCardinality::AtMost(0)),
-        &inputs,
-    );
-
-    assert_eq!(verdicts(&left_join), verdicts(&inner));
-    assert_eq!(
-        left_join.violations[0].representatives,
-        vec![vec![
-            RelationalViolationRow {
-                binding: binding("arg"),
-                row: 0,
-            },
-            RelationalViolationRow {
-                binding: binding("other"),
-                row: 0,
-            },
-        ]]
-    );
-}
-
 /// A matching left row still expands once per duplicate right row, just like
 /// an inner join, while an unmatched row would expand only once.
 #[test]
@@ -1134,73 +672,6 @@ fn a_left_join_retains_right_witness_and_coverage_reasons() {
     );
 }
 
-/// Every right-side duplicate is retained in source order, and each pair is
-/// emitted left-major before the next left tuple is probed.
-#[test]
-fn an_inner_join_preserves_duplicate_order_and_contributors() {
-    let left = vec![
-        argument("site", "arg-0", 0, None, false),
-        argument("site", "arg-1", 0, None, false),
-    ];
-    let right = vec![
-        argument("site", "other-0", 0, None, false),
-        argument("site", "other-1", 0, None, false),
-    ];
-    let evaluation = evaluate(
-        &join_plan(IrJoinKind::Inner, AssertCardinality::AtMost(0)),
-        &[
-            ("arg", &left, RelationCoverage::exhaustive()),
-            ("other", &right, RelationCoverage::exhaustive()),
-        ],
-    );
-    assert_eq!(verdicts(&evaluation), vec![("site".to_string(), 4)]);
-    assert_eq!(
-        evaluation.violations[0].representatives,
-        vec![
-            vec![
-                RelationalViolationRow {
-                    binding: binding("arg"),
-                    row: 0,
-                },
-                RelationalViolationRow {
-                    binding: binding("other"),
-                    row: 0,
-                },
-            ],
-            vec![
-                RelationalViolationRow {
-                    binding: binding("arg"),
-                    row: 0,
-                },
-                RelationalViolationRow {
-                    binding: binding("other"),
-                    row: 1,
-                },
-            ],
-            vec![
-                RelationalViolationRow {
-                    binding: binding("arg"),
-                    row: 1,
-                },
-                RelationalViolationRow {
-                    binding: binding("other"),
-                    row: 0,
-                },
-            ],
-            vec![
-                RelationalViolationRow {
-                    binding: binding("arg"),
-                    row: 1,
-                },
-                RelationalViolationRow {
-                    binding: binding("other"),
-                    row: 1,
-                },
-            ],
-        ]
-    );
-}
-
 /// A composite key only joins when every equality component matches; matching
 /// the site while differing in argument position is a near miss.
 #[test]
@@ -1258,28 +729,6 @@ fn nullable_join_keys_use_option_equality() {
     assert_eq!(verdicts(&evaluation), vec![("site".to_string(), 1)]);
 }
 
-/// A left row with no partner is dropped by a semi join and kept by an anti
-/// join.
-#[test]
-fn semi_and_anti_joins_select_opposite_row_sets() {
-    let left = vec![argument("site", "arg-0", 0, None, false)];
-    let right = vec![argument("elsewhere", "other-0", 0, None, false)];
-    let inputs: &[(&str, &[UnitRowItem], RelationCoverage)] = &[
-        ("arg", &left, RelationCoverage::exhaustive()),
-        ("other", &right, RelationCoverage::exhaustive()),
-    ];
-    let semi = evaluate(
-        &join_plan(IrJoinKind::Semi, AssertCardinality::AtMost(0)),
-        inputs,
-    );
-    assert!(semi.violations.is_empty(), "no left row has a partner");
-    let anti = evaluate(
-        &join_plan(IrJoinKind::Anti, AssertCardinality::AtMost(0)),
-        inputs,
-    );
-    assert_eq!(verdicts(&anti), vec![("site".to_string(), 1)]);
-}
-
 /// Anti-join output over a non-exhaustive right relation exists only because
 /// nothing was found to remove it, so it can support no verdict at all.
 #[test]
@@ -1307,25 +756,6 @@ fn anti_join_output_is_witness_unsound_over_a_partial_right_relation() {
     );
 }
 
-/// The left side's own coverage is unaffected by the right side of an anti
-/// join, so an exhaustive left relation whose rows all matched still concludes
-/// cleanly.
-#[test]
-fn an_anti_join_that_removed_every_row_still_concludes() {
-    let left = vec![argument("site", "arg-0", 0, None, false)];
-    let right = vec![argument("site", "other-0", 0, None, false)];
-    let evaluation = evaluate(
-        &join_plan(IrJoinKind::Anti, AssertCardinality::AtMost(0)),
-        &[
-            ("arg", &left, RelationCoverage::exhaustive()),
-            ("other", &right, RelationCoverage::exhaustive()),
-        ],
-    );
-    assert!(evaluation.violations.is_empty());
-    assert!(evaluation.unmet_obligations.is_empty());
-    assert!(evaluation.exhaustive);
-}
-
 /// An inner join is no more covered than its weaker side.
 #[test]
 fn an_inner_join_meets_both_coverages() {
@@ -1348,41 +778,6 @@ fn an_inner_join_meets_both_coverages() {
 // ---------------------------------------------------------------------------
 // Bounds.
 // ---------------------------------------------------------------------------
-
-#[test]
-fn the_source_bound_truncates_and_degrades_coverage() {
-    let mut plan = counting_plan(AssertCardinality::AtMost(2));
-    plan.limits.max_source_rows = 1;
-    let rows = two_rows_at_one_site();
-    let evaluation = evaluate(&plan, &[("arg", &rows, RelationCoverage::exhaustive())]);
-    assert!(evaluation.limit_exceeded);
-    assert!(!evaluation.exhaustive);
-    assert_eq!(
-        evaluation.unmet_obligations[0].reasons,
-        vec![PolicyIncompleteReason::PipelineRowBudget]
-    );
-}
-
-#[test]
-fn the_comparison_and_joined_row_bounds_truncate() {
-    let rows = two_rows_at_one_site();
-    for limits in [
-        |limits: &mut IrLimits| limits.max_join_comparisons = 1,
-        |limits: &mut IrLimits| limits.max_joined_rows = 1,
-    ] {
-        let mut plan = join_plan(IrJoinKind::Inner, AssertCardinality::AtMost(0));
-        limits(&mut plan.limits);
-        let evaluation = evaluate(
-            &plan,
-            &[
-                ("arg", &rows, RelationCoverage::exhaustive()),
-                ("other", &rows, RelationCoverage::exhaustive()),
-            ],
-        );
-        assert!(evaluation.limit_exceeded);
-        assert!(!evaluation.exhaustive);
-    }
-}
 
 /// Duplicate matches can produce a Cartesian number of output rows without
 /// consuming one comparison budget unit per pair.
@@ -1410,46 +805,6 @@ fn the_probe_budget_allows_a_large_duplicate_cartesian_output() {
     assert!(evaluation.exhaustive);
 }
 
-/// Even an empty right relation consumes one probe per left tuple, so a plan
-/// with more left keys than its budget remains incomplete.
-#[test]
-fn too_many_left_probes_still_truncate_the_join() {
-    let left = vec![
-        argument("site-a", "arg-0", 0, None, false),
-        argument("site-b", "arg-1", 0, None, false),
-        argument("site-c", "arg-2", 0, None, false),
-    ];
-    let right = Vec::new();
-    let mut plan = join_plan(IrJoinKind::Semi, AssertCardinality::AtMost(0));
-    plan.limits.max_join_comparisons = 2;
-    let evaluation = evaluate(
-        &plan,
-        &[
-            ("arg", &left, RelationCoverage::exhaustive()),
-            ("other", &right, RelationCoverage::exhaustive()),
-        ],
-    );
-    assert!(evaluation.limit_exceeded);
-    assert!(!evaluation.exhaustive);
-}
-
-#[test]
-fn the_group_bound_truncates_the_group_relation() {
-    let mut plan = counting_plan(AssertCardinality::AtMost(0));
-    plan.limits.max_groups = 1;
-    let rows = vec![
-        argument("site-a", "arg-0", 0, None, false),
-        argument("site-b", "arg-1", 0, None, false),
-    ];
-    let evaluation = evaluate(&plan, &[("arg", &rows, RelationCoverage::exhaustive())]);
-    assert!(evaluation.limit_exceeded);
-    assert_eq!(
-        evaluation.violations.len(),
-        1,
-        "the group that was formed is still evidence"
-    );
-}
-
 /// Per-group truncation degrades exactly the group it truncated. The other
 /// group's verdict is untouched, which is the whole point of tracking the
 /// witness per group rather than per run.
@@ -1473,48 +828,6 @@ fn a_truncated_group_loses_its_verdict_and_no_other_group_does() {
         evaluation.unmet_obligations[0].key,
         vec![Some(RowScalar::StableId("site-a".to_string()))]
     );
-}
-
-fn ten_matching_join_pairs() -> (Vec<UnitRowItem>, Vec<UnitRowItem>) {
-    let left = vec![
-        argument("site", "arg-0", 0, None, false),
-        argument("site", "arg-1", 1, None, false),
-    ];
-    let right = (0..5)
-        .map(|index| argument("site", &format!("other-{index}"), index, None, false))
-        .collect();
-    (left, right)
-}
-
-#[test]
-fn representative_tuple_retention_defaults_to_eight() {
-    assert_eq!(IrLimits::default().max_representative_tuples, 8);
-    let (left, right) = ten_matching_join_pairs();
-    let evaluation = evaluate(
-        &join_plan(IrJoinKind::Inner, AssertCardinality::AtMost(0)),
-        &[
-            ("arg", &left, RelationCoverage::exhaustive()),
-            ("other", &right, RelationCoverage::exhaustive()),
-        ],
-    );
-    assert_eq!(verdicts(&evaluation), vec![("site".to_string(), 10)]);
-    assert_eq!(evaluation.violations[0].representatives.len(), 8);
-}
-
-#[test]
-fn representative_tuple_retention_accepts_a_bound_above_eight() {
-    let (left, right) = ten_matching_join_pairs();
-    let mut plan = join_plan(IrJoinKind::Inner, AssertCardinality::AtMost(0));
-    plan.limits.max_representative_tuples = 12;
-    let evaluation = evaluate(
-        &plan,
-        &[
-            ("arg", &left, RelationCoverage::exhaustive()),
-            ("other", &right, RelationCoverage::exhaustive()),
-        ],
-    );
-    assert_eq!(verdicts(&evaluation), vec![("site".to_string(), 10)]);
-    assert_eq!(evaluation.violations[0].representatives.len(), 10);
 }
 
 // ---------------------------------------------------------------------------
@@ -1570,509 +883,13 @@ fn published_verdicts_do_not_depend_on_input_row_order() {
 // Predicates the syntax cannot spell yet.
 // ---------------------------------------------------------------------------
 
-/// Count the rows a filter admits.
-fn filtered_count(predicates: Vec<IrPredicate>, rows: &[UnitRowItem]) -> u64 {
-    let arg = source(0, "arg");
-    let filtered = filter(1, "kept", &arg, predicates);
-    let grouped = group(
-        2,
-        "by-site",
-        &filtered,
-        vec![column("arg", "site_id")],
-        vec![fold("by-site", "calls", IrAggregateOp::Count, None)],
-    );
-    let assert = assertion("kept", &grouped, "calls", AssertCardinality::AtMost(0));
-    let plan = plan(vec![arg, filtered, grouped], vec![assert]);
-    let evaluation = evaluate(&plan, &[("arg", rows, RelationCoverage::exhaustive())]);
-    evaluation
-        .violations
-        .first()
-        .map(|violation| violation.actual)
-        .unwrap_or(0)
-}
-
-fn indexed_rows() -> Vec<UnitRowItem> {
-    vec![
-        argument("site", "arg-0", 0, Some("name"), false),
-        argument("site", "arg-1", 1, None, true),
-        argument("site", "arg-2", 2, Some("greeting"), false),
-    ]
-}
-
-#[test]
-fn ordered_comparisons_select_integer_ranges() {
-    let rows = indexed_rows();
-    let cases = [
-        (IrCompareOp::Lt, 1_u64, 1_u64),
-        (IrCompareOp::Le, 1, 2),
-        (IrCompareOp::Gt, 1, 1),
-        (IrCompareOp::Ge, 1, 2),
-        (IrCompareOp::Eq, 1, 1),
-        (IrCompareOp::Ne, 1, 2),
-    ];
-    for (op, bound, expected) in cases {
-        assert_eq!(
-            filtered_count(
-                vec![IrPredicate::Compare {
-                    left: column("arg", "argument_index"),
-                    op,
-                    right: IrOperand::Literal(RowLiteral::Integer(bound)),
-                }],
-                &rows,
-            ),
-            expected,
-            "{}",
-            op.label()
-        );
-    }
-}
-
-/// An absent value satisfies no comparison, including `ne`. The row whose name
-/// is absent is not counted as "not equal to name".
-#[test]
-fn an_absent_value_satisfies_no_comparison() {
-    let rows = indexed_rows();
-    assert_eq!(
-        filtered_count(
-            vec![IrPredicate::Compare {
-                left: column("arg", "name"),
-                op: IrCompareOp::Ne,
-                right: IrOperand::Literal(RowLiteral::String("name".to_string())),
-            }],
-            &rows,
-        ),
-        1,
-        "only the row that states a different name qualifies"
-    );
-}
-
-#[test]
-fn null_tests_select_absent_and_present_values() {
-    let rows = indexed_rows();
-    assert_eq!(
-        filtered_count(
-            vec![IrPredicate::IsNull {
-                column: column("arg", "name"),
-                negated: false,
-            }],
-            &rows,
-        ),
-        1
-    );
-    assert_eq!(
-        filtered_count(
-            vec![IrPredicate::IsNull {
-                column: column("arg", "name"),
-                negated: true,
-            }],
-            &rows,
-        ),
-        2
-    );
-}
-
-#[test]
-fn set_membership_admits_any_listed_literal() {
-    let rows = indexed_rows();
-    assert_eq!(
-        filtered_count(
-            vec![IrPredicate::InSet {
-                column: column("arg", "name"),
-                values: vec![
-                    RowLiteral::String("name".to_string()),
-                    RowLiteral::String("greeting".to_string()),
-                ],
-            }],
-            &rows,
-        ),
-        2
-    );
-}
-
-/// A comparison between two columns of one joined relation.
-#[test]
-fn a_field_to_field_comparison_reads_both_sides() {
-    let left = source(0, "arg");
-    let right = source(1, "other");
-    let joined = join(
-        2,
-        &left,
-        &right,
-        IrJoinKind::Inner,
-        vec![IrEquiKey {
-            left: column("arg", "site_id"),
-            right: column("other", "site_id"),
-        }],
-    );
-    let filtered = filter(
-        3,
-        "aligned",
-        &joined,
-        vec![IrPredicate::Compare {
-            left: column("arg", "argument_index"),
-            op: IrCompareOp::Lt,
-            right: IrOperand::Column(column("other", "argument_index")),
-        }],
-    );
-    let grouped = group(
-        4,
-        "by-site",
-        &filtered,
-        vec![column("arg", "site_id")],
-        vec![fold("by-site", "pairs", IrAggregateOp::Count, None)],
-    );
-    let assert = assertion("pairs", &grouped, "pairs", AssertCardinality::AtMost(0));
-    let plan = plan(vec![left, right, joined, filtered, grouped], vec![assert]);
-    let rows = vec![
-        argument("site", "arg-0", 0, None, false),
-        argument("site", "arg-1", 1, None, false),
-    ];
-    let evaluation = evaluate(
-        &plan,
-        &[
-            ("arg", &rows, RelationCoverage::exhaustive()),
-            ("other", &rows, RelationCoverage::exhaustive()),
-        ],
-    );
-    assert_eq!(
-        verdicts(&evaluation),
-        vec![("site".to_string(), 1)],
-        "exactly the ordered pair (0, 1) qualifies"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // Folds the syntax cannot spell yet.
 // ---------------------------------------------------------------------------
 
-fn folded(op: IrAggregateOp, value: &str, rows: &[UnitRowItem]) -> u64 {
-    let arg = source(0, "arg");
-    let grouped = group(
-        1,
-        "by-site",
-        &arg,
-        vec![column("arg", "site_id")],
-        vec![fold("by-site", "value", op, Some(column("arg", value)))],
-    );
-    // `at-most 0` publishes the fold's exact value as the violation's actual.
-    let assert = assertion("value", &grouped, "value", AssertCardinality::AtMost(0));
-    let plan = plan(vec![arg, grouped], vec![assert]);
-    let evaluation = evaluate(&plan, &[("arg", rows, RelationCoverage::exhaustive())]);
-    evaluation
-        .violations
-        .first()
-        .map(|violation| violation.actual)
-        .unwrap_or(0)
-}
-
-#[test]
-fn max_and_min_fold_an_integer_column() {
-    let rows = indexed_rows();
-    assert_eq!(folded(IrAggregateOp::Max, "argument_index", &rows), 2);
-    assert_eq!(folded(IrAggregateOp::Min, "argument_index", &rows), 0);
-}
-
-#[test]
-fn any_and_all_fold_a_boolean_column() {
-    let mixed = indexed_rows();
-    assert_eq!(folded(IrAggregateOp::Any, "spread", &mixed), 1);
-    assert_eq!(folded(IrAggregateOp::All, "spread", &mixed), 0);
-
-    let every = vec![
-        argument("site", "arg-0", 0, None, true),
-        argument("site", "arg-1", 1, None, true),
-    ];
-    assert_eq!(folded(IrAggregateOp::All, "spread", &every), 1);
-    assert_eq!(folded(IrAggregateOp::Any, "spread", &every), 1);
-
-    let none = vec![argument("site", "arg-0", 0, None, false)];
-    assert_eq!(folded(IrAggregateOp::Any, "spread", &none), 0);
-}
-
-#[test]
-fn count_distinct_folds_repeated_values_once() {
-    let rows = vec![
-        argument("site", "arg-0", 0, Some("name"), false),
-        argument("site", "arg-1", 0, Some("name"), false),
-        argument("site", "arg-2", 1, Some("name"), false),
-    ];
-    assert_eq!(
-        folded(IrAggregateOp::CountDistinct, "argument_index", &rows),
-        2
-    );
-}
-
 // ---------------------------------------------------------------------------
 // Validation.
 // ---------------------------------------------------------------------------
-
-#[test]
-fn a_group_key_that_is_not_a_column_is_rejected() {
-    let arg = source(0, "arg");
-    let mut grouped = group(
-        1,
-        "by-site",
-        &arg,
-        vec![column("arg", "site_id")],
-        vec![fold("by-site", "calls", IrAggregateOp::Count, None)],
-    );
-    let IrRelationOp::Group { by, .. } = &mut grouped.op else {
-        panic!("the relation under test is a group");
-    };
-    by[0] = column("arg", "source_range");
-    let assert = assertion("calls", &grouped, "calls", AssertCardinality::AtMost(0));
-    assert_eq!(
-        validate_plan_ir(&plan(vec![arg, grouped], vec![assert])),
-        Err(RelationalAssertionPlanError::UnknownField {
-            binding: "arg".to_string(),
-            field: "source_range".to_string(),
-            known_fields: DOMAIN
-                .row_fields()
-                .iter()
-                .map(|field| field.name.to_string())
-                .collect(),
-        })
-    );
-}
-
-/// The unknown-field diagnostic must publish the complete alternative set and
-/// the flag that prints the whole catalog (issue #2517). A misspelled column is
-/// the most common relational authoring mistake, and the author has no other
-/// way to see the binding's columns at the point of failure.
-#[test]
-fn an_unknown_field_names_every_column_the_binding_carries() {
-    let arg = source(0, "arg");
-    let mut grouped = group(
-        1,
-        "by-site",
-        &arg,
-        vec![column("arg", "site_id")],
-        vec![fold("by-site", "calls", IrAggregateOp::Count, None)],
-    );
-    let IrRelationOp::Group { by, .. } = &mut grouped.op else {
-        panic!("the relation under test is a group");
-    };
-    by[0] = column("arg", "argument_indices");
-    let assert = assertion("calls", &grouped, "calls", AssertCardinality::AtMost(0));
-    let message = validate_plan_ir(&plan(vec![arg, grouped], vec![assert]))
-        .expect_err("`argument_indices` is not a call-argument column")
-        .to_string();
-    assert!(
-        message.starts_with("unknown field `arg.argument_indices`; `arg` has fields: "),
-        "{message}"
-    );
-    for field in DOMAIN.row_fields() {
-        assert!(
-            message.contains(field.name),
-            "{message} omits {}",
-            field.name
-        );
-    }
-    assert!(
-        message.ends_with("see `bifrost --list-row-schemas`"),
-        "{message}"
-    );
-}
-
-/// One filter predicate under test, validated rather than evaluated.
-fn validate_predicate(predicate: IrPredicate) -> Result<(), RelationalAssertionPlanError> {
-    let arg = source(0, "arg");
-    let filtered = filter(1, "kept", &arg, vec![predicate]);
-    let grouped = group(
-        2,
-        "by-site",
-        &filtered,
-        vec![column("arg", "site_id")],
-        vec![fold("by-site", "calls", IrAggregateOp::Count, None)],
-    );
-    let assert = assertion("calls", &grouped, "calls", AssertCardinality::AtMost(0));
-    validate_plan_ir(&plan(vec![arg, filtered, grouped], vec![assert]))
-}
-
-#[test]
-fn comparing_two_different_scalar_types_is_rejected() {
-    assert!(matches!(
-        validate_predicate(IrPredicate::Compare {
-            left: column("arg", "site_id"),
-            op: IrCompareOp::Eq,
-            right: IrOperand::Column(column("arg", "argument_index")),
-        }),
-        Err(RelationalAssertionPlanError::ComparisonTypeMismatch { .. })
-    ));
-}
-
-#[test]
-fn an_ordered_comparison_over_an_unordered_scalar_is_rejected() {
-    assert!(matches!(
-        validate_predicate(IrPredicate::Compare {
-            left: column("arg", "site_id"),
-            op: IrCompareOp::Gt,
-            right: IrOperand::Column(column("arg", "group_id")),
-        }),
-        Err(RelationalAssertionPlanError::UnorderedComparison { .. })
-    ));
-}
-
-#[test]
-fn a_literal_of_the_wrong_kind_is_rejected() {
-    assert!(matches!(
-        validate_predicate(IrPredicate::Compare {
-            left: column("arg", "argument_index"),
-            op: IrCompareOp::Eq,
-            right: IrOperand::Literal(RowLiteral::String("zero".to_string())),
-        }),
-        Err(RelationalAssertionPlanError::PredicateTypeMismatch { .. })
-    ));
-}
-
-/// A null test over a field the registry always populates is a constant, not a
-/// question. The same test over the nullable field is admitted.
-#[test]
-fn a_null_test_is_admitted_only_over_a_nullable_field() {
-    assert_eq!(
-        validate_predicate(IrPredicate::IsNull {
-            column: column("arg", "site_id"),
-            negated: false,
-        }),
-        Err(RelationalAssertionPlanError::NullTestOnRequiredField {
-            field: "arg.site_id".to_string(),
-        })
-    );
-    assert_eq!(
-        validate_predicate(IrPredicate::IsNull {
-            column: column("arg", "name"),
-            negated: false,
-        }),
-        Ok(())
-    );
-}
-
-#[test]
-fn an_empty_membership_test_is_rejected() {
-    assert!(matches!(
-        validate_predicate(IrPredicate::InSet {
-            column: column("arg", "name"),
-            values: Vec::new(),
-        }),
-        Err(RelationalAssertionPlanError::InvalidSetMembership { .. })
-    ));
-}
-
-#[test]
-fn folds_reject_a_value_column_of_the_wrong_type() {
-    let cases = [
-        (IrAggregateOp::Max, "name"),
-        (IrAggregateOp::Any, "argument_index"),
-        (IrAggregateOp::All, "site_id"),
-    ];
-    for (op, value) in cases {
-        let arg = source(0, "arg");
-        let grouped = group(
-            1,
-            "by-site",
-            &arg,
-            vec![column("arg", "site_id")],
-            vec![fold("by-site", "value", op, Some(column("arg", value)))],
-        );
-        let assert = assertion("value", &grouped, "value", AssertCardinality::AtMost(0));
-        assert!(
-            matches!(
-                validate_plan_ir(&plan(vec![arg, grouped], vec![assert])),
-                Err(RelationalAssertionPlanError::InvalidAggregateValueType { .. })
-            ),
-            "{} over {value}",
-            op.label()
-        );
-    }
-}
-
-#[test]
-fn a_fold_that_reads_no_column_rejects_one() {
-    let arg = source(0, "arg");
-    let grouped = group(
-        1,
-        "by-site",
-        &arg,
-        vec![column("arg", "site_id")],
-        vec![fold(
-            "by-site",
-            "calls",
-            IrAggregateOp::Count,
-            Some(column("arg", "argument_index")),
-        )],
-    );
-    let assert = assertion("calls", &grouped, "calls", AssertCardinality::AtMost(0));
-    assert!(matches!(
-        validate_plan_ir(&plan(vec![arg, grouped], vec![assert])),
-        Err(RelationalAssertionPlanError::AggregateValueForbidden { .. })
-    ));
-}
-
-/// An operator that reads a relation defined after it has no evaluation order,
-/// so it is rejected before any row is read.
-#[test]
-fn a_relation_that_reads_a_later_relation_is_rejected() {
-    let arg = source(0, "arg");
-    let mut grouped = group(
-        1,
-        "by-site",
-        &arg,
-        vec![column("arg", "site_id")],
-        vec![fold("by-site", "calls", IrAggregateOp::Count, None)],
-    );
-    let IrRelationOp::Group { input, .. } = &mut grouped.op else {
-        panic!("the relation under test is a group");
-    };
-    *input = IrRelationId(1);
-    let assert = assertion("calls", &grouped, "calls", AssertCardinality::AtMost(0));
-    assert_eq!(
-        validate_plan_ir(&plan(vec![arg, grouped], vec![assert])),
-        Err(RelationalAssertionPlanError::RelationCycle {
-            relation: "by-site".to_string(),
-        })
-    );
-}
-
-#[test]
-fn a_join_without_equality_keys_is_rejected() {
-    let left = source(0, "arg");
-    let right = source(1, "other");
-    let joined = join(2, &left, &right, IrJoinKind::Inner, Vec::new());
-    let grouped = group(
-        3,
-        "by-site",
-        &joined,
-        vec![column("arg", "site_id")],
-        vec![fold("by-site", "calls", IrAggregateOp::Count, None)],
-    );
-    let assert = assertion("calls", &grouped, "calls", AssertCardinality::AtMost(0));
-    assert!(matches!(
-        validate_plan_ir(&plan(vec![left, right, joined, grouped], vec![assert])),
-        Err(RelationalAssertionPlanError::EmptyJoin { .. })
-    ));
-}
-
-#[test]
-fn a_zero_bound_is_rejected() {
-    let mut plan = counting_plan(AssertCardinality::AtMost(0));
-    plan.limits.max_groups = 0;
-    assert_eq!(
-        validate_plan_ir(&plan),
-        Err(RelationalAssertionPlanError::ZeroLimit { name: "max_groups" })
-    );
-}
-
-#[test]
-fn a_zero_representative_bound_is_rejected() {
-    let mut plan = counting_plan(AssertCardinality::AtMost(0));
-    plan.limits.max_representative_tuples = 0;
-    assert_eq!(
-        validate_plan_ir(&plan),
-        Err(RelationalAssertionPlanError::ZeroLimit {
-            name: "max_representative_tuples"
-        })
-    );
-}
 
 /// Cancel at each checkpoint until execution completes. The work ledger shows
 /// which operator was interrupted, without timers or races with another thread.
@@ -2234,21 +1051,6 @@ fn cancellation_during_assertion_discards_already_computed_violations() {
         coverage: RelationCoverage::exhaustive(),
     }];
     cancellation_witness(&plan, &inputs, |work| work.assertion_checks == 1);
-}
-
-#[test]
-fn cancellation_without_assertions_still_reports_cancelled() {
-    let mut plan = counting_plan(AssertCardinality::Exactly(0));
-    plan.assertions.clear();
-    let token = brokk_bifrost_analysis::CancellationToken::new();
-    token.cancel();
-    let result = evaluate_plan_ir(&plan, &[], Some(&token)).unwrap();
-    assert!(!result.exhaustive);
-    assert!(result.violations.is_empty());
-    assert_eq!(
-        result.incomplete_reasons,
-        vec![PolicyIncompleteReason::Cancelled]
-    );
 }
 
 /// Certainty must come from all contributing rows, not the bounded source
@@ -2540,25 +1342,6 @@ fn only_a_complete_flow_status_establishes_the_endpoint_set() {
     );
 }
 
-/// An unsupported capability is not a partial result: nothing the family
-/// produced describes the partition at all.
-#[test]
-fn an_unsupported_flow_capability_dominates_the_relation_envelope() {
-    let rows = vec![
-        flow_endpoint("endpoint-0", "plan-a", CodeQueryFlowStatus::Complete),
-        flow_endpoint("endpoint-1", "plan-b", CodeQueryFlowStatus::Unsupported),
-    ];
-    let coverage = envelope_of_complete_query(&rows);
-    assert_eq!(
-        coverage.incomplete_reasons(),
-        vec![PolicyIncompleteReason::CapabilityIncomplete]
-    );
-    assert!(matches!(
-        coverage.extent(),
-        super::coverage::CoverageExtent::Unsupported { .. }
-    ));
-}
-
 /// The typestate report's completeness and a finding's own abstention are both
 /// per-partition facts that a clean query envelope does not carry.
 #[test]
@@ -2631,86 +1414,6 @@ fn only_a_known_class_set_establishes_the_receiver_atoms() {
             status.label()
         );
     }
-}
-
-/// The verdict truth table over flow-backed rows. A count above an upper bound
-/// is positive evidence whatever the solve did; the clean verdict is the one
-/// that needs the partition to have been enumerated.
-#[test]
-fn the_flow_backed_truth_table_matches_the_row_set_table() {
-    let plan_exceeded = flow_counting_plan(AssertCardinality::AtMost(1));
-    let plan_clean = flow_counting_plan(AssertCardinality::AtMost(5));
-    for status in [
-        CodeQueryFlowStatus::Complete,
-        CodeQueryFlowStatus::SolverBudgetExhausted,
-    ] {
-        let rows = vec![
-            flow_endpoint("endpoint-0", "plan-a", status),
-            flow_endpoint("endpoint-1", "plan-a", status),
-        ];
-        let coverage = envelope_of_complete_query(&rows);
-
-        let exceeded = evaluate(&plan_exceeded, &[("flow", &rows, coverage.clone())]);
-        assert_eq!(
-            verdicts(&exceeded),
-            vec![("plan-a".to_string(), 2)],
-            "{}",
-            status.label()
-        );
-        assert!(exceeded.unmet_obligations.is_empty(), "{}", status.label());
-
-        let clean = evaluate(&plan_clean, &[("flow", &rows, coverage)]);
-        assert!(clean.violations.is_empty(), "{}", status.label());
-        match status {
-            CodeQueryFlowStatus::Complete => {
-                assert!(clean.unmet_obligations.is_empty(), "{}", status.label());
-                assert!(clean.exhaustive);
-            }
-            _ => {
-                let obligation = clean
-                    .unmet_obligations
-                    .first()
-                    .expect("an unenumerated partition blocks the clean upper bound");
-                assert_eq!(
-                    obligation.kind,
-                    RelationalObligationKind::AbsenceRequiresExhaustiveCoverage
-                );
-                assert_eq!(
-                    obligation
-                        .partition
-                        .roots()
-                        .iter()
-                        .map(|root| (root.family.label(), root.root.as_ref()))
-                        .collect::<Vec<_>>(),
-                    vec![("flow_endpoint", "plan-a")],
-                    "the blocked verdict names the flow partition that blocked it"
-                );
-                assert!(!clean.exhaustive);
-            }
-        }
-    }
-}
-
-/// Group flow endpoint rows by their plan and count them.
-fn flow_counting_plan(cardinality: AssertCardinality) -> RelationalPlanIr {
-    let flow = IrRelation {
-        id: IrRelationId(0),
-        name: "flow".to_string(),
-        op: IrRelationOp::Source {
-            binding: binding("flow"),
-            schema: domain_schema("flow", DetailedCodeQueryDomain::FlowEndpoint),
-        },
-        schema: domain_schema("flow", DetailedCodeQueryDomain::FlowEndpoint),
-    };
-    let grouped = group(
-        1,
-        "by-plan",
-        &flow,
-        vec![column("flow", "plan_ref")],
-        vec![fold("by-plan", "endpoints", IrAggregateOp::Count, None)],
-    );
-    let assert = assertion("flow-endpoints", &grouped, "endpoints", cardinality);
-    plan(vec![flow, grouped], vec![assert])
 }
 
 /// Anti join one call-site relation against the flow endpoints reaching it, and
@@ -2824,10 +1527,264 @@ fn an_anti_join_over_an_unfinished_flow_solve_names_the_flow_partition() {
     );
 }
 
-/// A published unit carries its rows as JSON, and a later run evaluates from
-/// that copy. A coverage that did not survive the round trip would let a
-/// replayed relation read as exhaustive where the live one did not, which is
-/// exactly the false green the envelope exists to prevent.
+#[test]
+fn an_inner_join_preserves_duplicate_order_and_contributors() {
+    let left = vec![
+        argument("site", "arg-0", 0, None, false),
+        argument("site", "arg-1", 0, None, false),
+    ];
+    let right = vec![
+        argument("site", "other-0", 0, None, false),
+        argument("site", "other-1", 0, None, false),
+    ];
+    let evaluation = evaluate(
+        &join_plan(IrJoinKind::Inner, AssertCardinality::AtMost(0)),
+        &[
+            ("arg", &left, RelationCoverage::exhaustive()),
+            ("other", &right, RelationCoverage::exhaustive()),
+        ],
+    );
+    assert_eq!(verdicts(&evaluation), vec![("site".to_string(), 4)]);
+    assert_eq!(
+        evaluation.violations[0].representatives,
+        vec![
+            vec![
+                RelationalViolationRow {
+                    binding: binding("arg"),
+                    row: 0,
+                },
+                RelationalViolationRow {
+                    binding: binding("other"),
+                    row: 0,
+                },
+            ],
+            vec![
+                RelationalViolationRow {
+                    binding: binding("arg"),
+                    row: 0,
+                },
+                RelationalViolationRow {
+                    binding: binding("other"),
+                    row: 1,
+                },
+            ],
+            vec![
+                RelationalViolationRow {
+                    binding: binding("arg"),
+                    row: 1,
+                },
+                RelationalViolationRow {
+                    binding: binding("other"),
+                    row: 0,
+                },
+            ],
+            vec![
+                RelationalViolationRow {
+                    binding: binding("arg"),
+                    row: 1,
+                },
+                RelationalViolationRow {
+                    binding: binding("other"),
+                    row: 1,
+                },
+            ],
+        ]
+    );
+}
+
+#[test]
+fn the_source_bound_truncates_and_degrades_coverage() {
+    let mut plan = counting_plan(AssertCardinality::AtMost(2));
+    plan.limits.max_source_rows = 1;
+    let rows = two_rows_at_one_site();
+    let evaluation = evaluate(&plan, &[("arg", &rows, RelationCoverage::exhaustive())]);
+    assert!(evaluation.limit_exceeded);
+    assert!(!evaluation.exhaustive);
+    assert_eq!(
+        evaluation.unmet_obligations[0].reasons,
+        vec![PolicyIncompleteReason::PipelineRowBudget]
+    );
+}
+
+#[test]
+fn too_many_left_probes_still_truncate_the_join() {
+    let left = vec![
+        argument("site-a", "arg-0", 0, None, false),
+        argument("site-b", "arg-1", 0, None, false),
+        argument("site-c", "arg-2", 0, None, false),
+    ];
+    let right = Vec::new();
+    let mut plan = join_plan(IrJoinKind::Semi, AssertCardinality::AtMost(0));
+    plan.limits.max_join_comparisons = 2;
+    let evaluation = evaluate(
+        &plan,
+        &[
+            ("arg", &left, RelationCoverage::exhaustive()),
+            ("other", &right, RelationCoverage::exhaustive()),
+        ],
+    );
+    assert!(evaluation.limit_exceeded);
+    assert!(!evaluation.exhaustive);
+}
+
+#[test]
+fn representative_tuple_retention_defaults_to_eight() {
+    assert_eq!(IrLimits::default().max_representative_tuples, 8);
+    let (left, right) = ten_matching_join_pairs();
+    let evaluation = evaluate(
+        &join_plan(IrJoinKind::Inner, AssertCardinality::AtMost(0)),
+        &[
+            ("arg", &left, RelationCoverage::exhaustive()),
+            ("other", &right, RelationCoverage::exhaustive()),
+        ],
+    );
+    assert_eq!(verdicts(&evaluation), vec![("site".to_string(), 10)]);
+    assert_eq!(evaluation.violations[0].representatives.len(), 8);
+}
+
+#[test]
+fn representative_tuple_retention_accepts_a_bound_above_eight() {
+    let (left, right) = ten_matching_join_pairs();
+    let mut plan = join_plan(IrJoinKind::Inner, AssertCardinality::AtMost(0));
+    plan.limits.max_representative_tuples = 12;
+    let evaluation = evaluate(
+        &plan,
+        &[
+            ("arg", &left, RelationCoverage::exhaustive()),
+            ("other", &right, RelationCoverage::exhaustive()),
+        ],
+    );
+    assert_eq!(verdicts(&evaluation), vec![("site".to_string(), 10)]);
+    assert_eq!(evaluation.violations[0].representatives.len(), 10);
+}
+
+#[test]
+fn an_absent_value_satisfies_no_comparison() {
+    let rows = indexed_rows();
+    assert_eq!(
+        filtered_count(
+            vec![IrPredicate::Compare {
+                left: column("arg", "name"),
+                op: IrCompareOp::Ne,
+                right: IrOperand::Literal(RowLiteral::String("name".to_string())),
+            }],
+            &rows,
+        ),
+        1,
+        "only the row that states a different name qualifies"
+    );
+}
+
+#[test]
+fn a_relation_that_reads_a_later_relation_is_rejected() {
+    let arg = source(0, "arg");
+    let mut grouped = group(
+        1,
+        "by-site",
+        &arg,
+        vec![column("arg", "site_id")],
+        vec![fold("by-site", "calls", IrAggregateOp::Count, None)],
+    );
+    let IrRelationOp::Group { input, .. } = &mut grouped.op else {
+        panic!("the relation under test is a group");
+    };
+    *input = IrRelationId(1);
+    let assert = assertion("calls", &grouped, "calls", AssertCardinality::AtMost(0));
+    assert_eq!(
+        validate_plan_ir(&plan(vec![arg, grouped], vec![assert])),
+        Err(RelationalAssertionPlanError::RelationCycle {
+            relation: "by-site".to_string(),
+        })
+    );
+}
+
+#[test]
+fn cancellation_without_assertions_still_reports_cancelled() {
+    let mut plan = counting_plan(AssertCardinality::Exactly(0));
+    plan.assertions.clear();
+    let token = brokk_bifrost_analysis::CancellationToken::new();
+    token.cancel();
+    let result = evaluate_plan_ir(&plan, &[], Some(&token)).unwrap();
+    assert!(!result.exhaustive);
+    assert!(result.violations.is_empty());
+    assert_eq!(
+        result.incomplete_reasons,
+        vec![PolicyIncompleteReason::Cancelled]
+    );
+}
+
+#[test]
+fn an_unsupported_flow_capability_dominates_the_relation_envelope() {
+    let rows = vec![
+        flow_endpoint("endpoint-0", "plan-a", CodeQueryFlowStatus::Complete),
+        flow_endpoint("endpoint-1", "plan-b", CodeQueryFlowStatus::Unsupported),
+    ];
+    let coverage = envelope_of_complete_query(&rows);
+    assert_eq!(
+        coverage.incomplete_reasons(),
+        vec![PolicyIncompleteReason::CapabilityIncomplete]
+    );
+    assert!(matches!(
+        coverage.extent(),
+        super::coverage::CoverageExtent::Unsupported { .. }
+    ));
+}
+
+#[test]
+fn the_flow_backed_truth_table_matches_the_row_set_table() {
+    let plan_exceeded = flow_counting_plan(AssertCardinality::AtMost(1));
+    let plan_clean = flow_counting_plan(AssertCardinality::AtMost(5));
+    for status in [
+        CodeQueryFlowStatus::Complete,
+        CodeQueryFlowStatus::SolverBudgetExhausted,
+    ] {
+        let rows = vec![
+            flow_endpoint("endpoint-0", "plan-a", status),
+            flow_endpoint("endpoint-1", "plan-a", status),
+        ];
+        let coverage = envelope_of_complete_query(&rows);
+
+        let exceeded = evaluate(&plan_exceeded, &[("flow", &rows, coverage.clone())]);
+        assert_eq!(
+            verdicts(&exceeded),
+            vec![("plan-a".to_string(), 2)],
+            "{}",
+            status.label()
+        );
+        assert!(exceeded.unmet_obligations.is_empty(), "{}", status.label());
+
+        let clean = evaluate(&plan_clean, &[("flow", &rows, coverage)]);
+        assert!(clean.violations.is_empty(), "{}", status.label());
+        match status {
+            CodeQueryFlowStatus::Complete => {
+                assert!(clean.unmet_obligations.is_empty(), "{}", status.label());
+                assert!(clean.exhaustive);
+            }
+            _ => {
+                let obligation = clean
+                    .unmet_obligations
+                    .first()
+                    .expect("an unenumerated partition blocks the clean upper bound");
+                assert_eq!(
+                    obligation.kind,
+                    RelationalObligationKind::AbsenceRequiresExhaustiveCoverage
+                );
+                assert_eq!(
+                    obligation
+                        .partition
+                        .roots()
+                        .iter()
+                        .map(|root| (root.family.label(), root.root.as_ref()))
+                        .collect::<Vec<_>>(),
+                    vec![("flow_endpoint", "plan-a")],
+                    "the blocked verdict names the flow partition that blocked it"
+                );
+                assert!(!clean.exhaustive);
+            }
+        }
+    }
+}
+
 #[test]
 fn a_persisted_row_replays_the_coverage_the_live_row_published() {
     let rows = vec![

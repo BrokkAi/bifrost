@@ -6,8 +6,15 @@
 
 use std::collections::HashSet;
 
+use brokk_bifrost_analysis::analyzer::semantic_model::compact_json_bytes;
 use serde_json::{Map, Value, json};
 
+use super::canonical::{
+    binding_index_to_json, binding_name_to_json, binding_tag_to_json, endpoint_binding_to_json,
+    policy_port_to_json, policy_semantic_event_to_json, policy_severity_to_json,
+    sorted_identifier_refs, taint_port_fields_to_json, taint_transfer_to_json,
+    typestate_automaton_projection_to_json, typestate_call_binding_to_json,
+};
 use super::definition::*;
 use super::identity::ResolvedPolicyAnalysisRef;
 use super::resolved::*;
@@ -35,14 +42,18 @@ pub(crate) fn loaded_endpoint_analysis_projection_to_json(
     let object = semantic.as_object().ok_or_else(|| {
         LoadedModelError::CanonicalProjection("endpoint projection is not an object".to_string())
     })?;
-    Ok(json!({
-        "schema_version": definition.schema_version.version,
-        "selector": object["selector"].clone(),
-        "role": object["role"].clone(),
-        "binding": object["binding"].clone(),
-        "taint": object.get("taint").cloned(),
-        "supersedes": object["supersedes"].clone(),
-    }))
+    let mut projection = endpoint_model_analysis_fields_to_json(
+        object["role"].clone(),
+        object["binding"].clone(),
+        object.get("taint").cloned(),
+        object["supersedes"].clone(),
+    );
+    projection.insert(
+        "schema_version".to_string(),
+        json!(definition.schema_version.version),
+    );
+    projection.insert("selector".to_string(), object["selector"].clone());
+    Ok(Value::Object(projection))
 }
 
 pub(crate) fn composed_endpoint_semantic_to_json(
@@ -64,14 +75,32 @@ pub(crate) fn composed_endpoint_analysis_projection_to_json(
     selector: &ResolvedPolicySelector,
     model: &ResolvedEndpointModel,
 ) -> Value {
-    json!({
-        "definition_schema_version": definition_schema.version(),
-        "selector": resolved_selector_to_json(selector),
-        "role": endpoint_role_label(model.role),
-        "binding": endpoint_binding_to_json(&model.binding),
-        "taint": model.taint.as_ref().map(endpoint_taint_to_json),
-        "supersedes": sorted_endpoint_identities(&model.supersedes),
-    })
+    let mut projection = endpoint_model_analysis_fields_to_json(
+        json!((model.role).label()),
+        endpoint_binding_to_json(&model.binding),
+        model.taint.as_ref().map(endpoint_taint_to_json),
+        json!(sorted_endpoint_identities(&model.supersedes)),
+    );
+    projection.insert(
+        "definition_schema_version".to_string(),
+        json!(definition_schema.version()),
+    );
+    projection.insert("selector".to_string(), resolved_selector_to_json(selector));
+    Value::Object(projection)
+}
+
+fn endpoint_model_analysis_fields_to_json(
+    role: Value,
+    binding: Value,
+    taint: Option<Value>,
+    supersedes: Value,
+) -> Map<String, Value> {
+    Map::from_iter([
+        ("role".to_string(), role),
+        ("binding".to_string(), binding),
+        ("taint".to_string(), json!(taint)),
+        ("supersedes".to_string(), supersedes),
+    ])
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -263,7 +292,7 @@ pub(crate) fn resolved_typestate_to_json(
     dependencies.sort_by(|left, right| left.identity.cmp(&right.identity));
     Ok(json!({
         "type": "typestate",
-        "mode": may_mode_label(spec.mode),
+        "mode": spec.mode.label(),
         "call_modeling": {
             "unmodeled": spec.call_modeling.unmodeled.label(),
         },
@@ -272,7 +301,7 @@ pub(crate) fn resolved_typestate_to_json(
             .map(resolved_typestate_subject_to_json)
             .collect::<Vec<_>>(),
         "uncertainty": {
-            "escape": inconclusive_label(spec.uncertainty.escape),
+            "escape": spec.uncertainty.escape.label(),
         },
         "automaton": resolved_typestate_automaton_to_json(&spec.automaton),
         "endpoint_dependencies": dependencies
@@ -289,17 +318,13 @@ pub(crate) fn match_set_semantic_to_json(
     categories: &CategoryPredicate,
     selected: &[ResolvedEndpointManifestEntry],
 ) -> Value {
-    let mut selected = selected.iter().collect::<Vec<_>>();
-    selected.sort_by(|left, right| left.identity.cmp(&right.identity));
-    json!({
-        "scope": directory_scope_label(scope),
-        "role": role.map(endpoint_role_label),
-        "categories": category_predicate_to_json(categories),
-        "selected": selected
-            .into_iter()
-            .map(resolved_manifest_entry_to_json)
-            .collect::<Vec<_>>(),
-    })
+    match_set_projection_to_json(
+        scope,
+        role,
+        categories,
+        selected,
+        resolved_manifest_entry_to_json,
+    )
 }
 
 /// Canonical public hash projection for one selected match set.
@@ -315,19 +340,28 @@ pub(crate) fn match_set_hash_projection_to_json(
     categories: &CategoryPredicate,
     selected: &[ResolvedEndpointManifestEntry],
 ) -> Value {
+    match_set_projection_to_json(scope, role, categories, selected, |entry| {
+        json!({
+            "identity": resolved_endpoint_identity_to_json(&entry.identity),
+            "semantic_hash": entry.semantic_hash.to_string(),
+        })
+    })
+}
+
+fn match_set_projection_to_json(
+    scope: DirectoryScope,
+    role: Option<EndpointRole>,
+    categories: &CategoryPredicate,
+    selected: &[ResolvedEndpointManifestEntry],
+    encode: impl Fn(&ResolvedEndpointManifestEntry) -> Value,
+) -> Value {
     let mut selected = selected.iter().collect::<Vec<_>>();
     selected.sort_by(|left, right| left.identity.cmp(&right.identity));
     json!({
-        "scope": directory_scope_label(scope),
-        "role": role.map(endpoint_role_label),
-        "categories": category_predicate_to_json(categories),
-        "selected": selected
-            .into_iter()
-            .map(|entry| json!({
-                "identity": resolved_endpoint_identity_to_json(&entry.identity),
-                "semantic_hash": entry.semantic_hash.to_string(),
-            }))
-            .collect::<Vec<_>>(),
+        "scope": scope.label(),
+        "role": role.map(EndpointRole::label),
+        "categories": super::canonical::category_predicate_to_json(categories),
+        "selected": selected.into_iter().map(encode).collect::<Vec<_>>(),
     })
 }
 
@@ -356,10 +390,15 @@ fn resolved_taint_to_json(
 
     let mut value = json!({
         "type": "taint",
-        "mode": may_mode_label(spec.mode),
+        "mode": spec.mode.label(),
         "call_modeling": {
             "unmodeled": spec.call_modeling.unmodeled.label(),
         },
+        "threat_models": spec
+            .threat_models
+            .iter()
+            .map(|model| model.label())
+            .collect::<Vec<_>>(),
         "sources": sources
             .into_iter()
             .map(|endpoint| resolved_taint_source_to_json(endpoint, selectors))
@@ -391,6 +430,15 @@ fn resolved_taint_to_json(
             .map(resolved_finding_combination_to_json)
             .collect::<Vec<_>>(),
     });
+    if !spec.barriers.is_empty() {
+        let mut barriers = spec.barriers.iter().collect::<Vec<_>>();
+        barriers.sort_by(|left, right| left.id.cmp(&right.id));
+        value.as_object_mut().expect("taint projection is an object").insert("barriers".into(),
+            Value::Array(barriers.into_iter().map(|entry| json!({
+                "id": entry.id.as_str(),
+                "value_type": crate::canonical::value_type_predicate_to_json(entry.value_type),
+            })).collect()));
+    }
     // `stores` is omitted entirely when the policy declares none, which keeps
     // every loaded projection authored before persistence stores existed
     // byte-identical, and therefore keeps its hashes valid.
@@ -419,15 +467,16 @@ fn taint_store_write_to_json(
 ) -> Result<Value, LoadedModelError> {
     let selector = selector_by_path(selectors, &entry.selector_path)?;
     let definition = &entry.definition;
+    let mut definition_fields = resolved_taint_store_common_fields_to_json(
+        selector,
+        definition.store.as_str(),
+        definition.key.as_ref(),
+        definition.instance.as_ref(),
+    );
+    definition_fields.insert("input".to_string(), policy_port_to_json(&definition.input));
     Ok(json!({
         "identity": resolved_endpoint_identity_to_json(&entry.identity),
-        "definition": {
-            "selector": resolved_selector_to_json(selector),
-            "store": definition.store.as_str(),
-            "key": definition.key.as_ref().map(policy_port_to_json),
-            "instance": definition.instance.as_ref().map(policy_port_to_json),
-            "input": policy_port_to_json(&definition.input),
-        },
+        "definition": Value::Object(definition_fields),
     }))
 }
 
@@ -437,16 +486,37 @@ fn taint_store_read_to_json(
 ) -> Result<Value, LoadedModelError> {
     let selector = selector_by_path(selectors, &entry.selector_path)?;
     let definition = &entry.definition;
+    let mut definition_fields = resolved_taint_store_common_fields_to_json(
+        selector,
+        definition.store.as_str(),
+        definition.key.as_ref(),
+        definition.instance.as_ref(),
+    );
+    definition_fields.insert(
+        "output".to_string(),
+        policy_port_to_json(&definition.output),
+    );
     Ok(json!({
         "identity": resolved_endpoint_identity_to_json(&entry.identity),
-        "definition": {
-            "selector": resolved_selector_to_json(selector),
-            "store": definition.store.as_str(),
-            "key": definition.key.as_ref().map(policy_port_to_json),
-            "instance": definition.instance.as_ref().map(policy_port_to_json),
-            "output": policy_port_to_json(&definition.output),
-        },
+        "definition": Value::Object(definition_fields),
     }))
+}
+
+fn resolved_taint_store_common_fields_to_json(
+    selector: &ResolvedPolicySelector,
+    store: &str,
+    key: Option<&PolicyPort>,
+    instance: Option<&PolicyPort>,
+) -> Map<String, Value> {
+    Map::from_iter([
+        ("selector".to_string(), resolved_selector_to_json(selector)),
+        ("store".to_string(), json!(store)),
+        ("key".to_string(), json!(key.map(policy_port_to_json))),
+        (
+            "instance".to_string(),
+            json!(instance.map(policy_port_to_json)),
+        ),
+    ])
 }
 
 fn resolved_taint_source_to_json(
@@ -455,19 +525,20 @@ fn resolved_taint_source_to_json(
 ) -> Result<Value, LoadedModelError> {
     let definition = &endpoint.definition;
     let selector = selector_by_path(selectors, &definition.selector_path)?;
-    Ok(json!({
-        "identity": resolved_endpoint_identity_to_json(&endpoint.identity),
-        "semantic_hash": endpoint.semantic_hash.to_string(),
-        "analysis_projection_hash": endpoint.analysis_projection_hash.to_string(),
-        "definition": {
+    Ok(resolved_taint_endpoint_to_json(
+        &endpoint.identity,
+        endpoint.semantic_hash.to_string(),
+        endpoint.analysis_projection_hash.to_string(),
+        json!({
             "display_name": definition.display_name,
             "categories": sorted_ids(&definition.categories),
             "selector": resolved_selector_to_json(selector),
             "bind": policy_port_to_json(&definition.bind),
             "labels": sorted_ids(&definition.labels),
+            "threat_model": definition.threat_model.map(|model| model.label()),
             "evidence": definition.evidence.as_ref().map(taint_source_evidence_to_json),
-        },
-    }))
+        }),
+    ))
 }
 
 fn resolved_taint_sink_to_json(
@@ -476,11 +547,11 @@ fn resolved_taint_sink_to_json(
 ) -> Result<Value, LoadedModelError> {
     let definition = &endpoint.definition;
     let selector = selector_by_path(selectors, &definition.selector_path)?;
-    Ok(json!({
-        "identity": resolved_endpoint_identity_to_json(&endpoint.identity),
-        "semantic_hash": endpoint.semantic_hash.to_string(),
-        "analysis_projection_hash": endpoint.analysis_projection_hash.to_string(),
-        "definition": {
+    Ok(resolved_taint_endpoint_to_json(
+        &endpoint.identity,
+        endpoint.semantic_hash.to_string(),
+        endpoint.analysis_projection_hash.to_string(),
+        json!({
             "display_name": definition.display_name,
             "categories": sorted_ids(&definition.categories),
             "selector": resolved_selector_to_json(selector),
@@ -488,8 +559,22 @@ fn resolved_taint_sink_to_json(
             "accepts": sorted_ids(&definition.accepts),
             "tags": sorted_ids(&definition.tags),
             "impacts": sorted_ids(&definition.impacts),
-        },
-    }))
+        }),
+    ))
+}
+
+fn resolved_taint_endpoint_to_json(
+    identity: &ResolvedEndpointIdentity,
+    semantic_hash: String,
+    analysis_projection_hash: String,
+    definition: Value,
+) -> Value {
+    json!({
+        "identity": resolved_endpoint_identity_to_json(identity),
+        "semantic_hash": semantic_hash,
+        "analysis_projection_hash": analysis_projection_hash,
+        "definition": definition,
+    })
 }
 
 fn taint_sanitizer_to_json(
@@ -498,14 +583,18 @@ fn taint_sanitizer_to_json(
 ) -> Result<Value, LoadedModelError> {
     let selector = selector_by_path(selectors, &entry.selector_path)?;
     let definition = &entry.definition;
+    let mut definition_fields = taint_port_fields_to_json(
+        resolved_selector_to_json(selector),
+        policy_port_to_json(&definition.input),
+        policy_port_to_json(&definition.output),
+    );
+    definition_fields.insert(
+        "removes".to_string(),
+        json!(sorted_ids(&definition.removes)),
+    );
     Ok(json!({
         "identity": resolved_endpoint_identity_to_json(&entry.identity),
-        "definition": {
-            "selector": resolved_selector_to_json(selector),
-            "input": policy_port_to_json(&definition.input),
-            "output": policy_port_to_json(&definition.output),
-            "removes": sorted_ids(&definition.removes),
-        },
+        "definition": Value::Object(definition_fields),
     }))
 }
 
@@ -515,15 +604,19 @@ fn taint_transform_to_json(
 ) -> Result<Value, LoadedModelError> {
     let selector = selector_by_path(selectors, &entry.selector_path)?;
     let definition = &entry.definition;
+    let mut definition_fields = taint_port_fields_to_json(
+        resolved_selector_to_json(selector),
+        policy_port_to_json(&definition.input),
+        policy_port_to_json(&definition.output),
+    );
+    definition_fields.insert(
+        "removes".to_string(),
+        json!(sorted_ids(&definition.removes)),
+    );
+    definition_fields.insert("adds".to_string(), json!(sorted_ids(&definition.adds)));
     Ok(json!({
         "identity": resolved_endpoint_identity_to_json(&entry.identity),
-        "definition": {
-            "selector": resolved_selector_to_json(selector),
-            "input": policy_port_to_json(&definition.input),
-            "output": policy_port_to_json(&definition.output),
-            "removes": sorted_ids(&definition.removes),
-            "adds": sorted_ids(&definition.adds),
-        },
+        "definition": Value::Object(definition_fields),
     }))
 }
 
@@ -546,30 +639,6 @@ fn taint_external_model_to_json(
             "transfers": transfers,
         },
     }))
-}
-
-fn taint_transfer_to_json(transfer: &TaintTransferSpec) -> Value {
-    json!({
-        "from": policy_port_to_json(&transfer.from),
-        "to": policy_port_to_json(&transfer.to),
-        "labels": sorted_ids(&transfer.labels),
-        "effect": taint_transfer_effect_to_json(&transfer.effect),
-    })
-}
-
-fn taint_transfer_effect_to_json(effect: &TaintTransferEffect) -> Value {
-    match effect {
-        TaintTransferEffect::Propagate => json!({ "type": "propagate" }),
-        TaintTransferEffect::Sanitize { removes } => json!({
-            "type": "sanitize",
-            "removes": sorted_ids(removes),
-        }),
-        TaintTransferEffect::Transform { removes, adds } => json!({
-            "type": "transform",
-            "removes": sorted_ids(removes),
-            "adds": sorted_ids(adds),
-        }),
-    }
 }
 
 fn resolved_finding_combination_to_json(combination: &ResolvedFindingCombination) -> Value {
@@ -603,37 +672,45 @@ fn resolved_typestate_automaton_to_json(automaton: &ResolvedTypestateAutomatonSp
     });
     let mut expectations = automaton.terminal_expectations.iter().collect::<Vec<_>>();
     expectations.sort_by(|left, right| left.id.cmp(&right.id));
-    json!({
-        "states": sorted_ids(&automaton.states),
-        "initial": automaton.initial.as_str(),
-        "accepting_states": sorted_ids(&automaton.accepting_states),
-        "error_states": sorted_ids(&automaton.error_states),
-        "events": events
-            .into_iter()
-            .map(resolved_typestate_event_to_json)
-            .collect::<Vec<_>>(),
-        "transitions": transitions
-            .into_iter()
-            .map(|transition| json!({
-                "from": transition.from.as_str(),
-                "on": transition.on.as_str(),
-                "to": transition.to.as_str(),
-            }))
-            .collect::<Vec<_>>(),
-        "terminal_expectations": expectations
-            .into_iter()
-            .map(resolved_typestate_expectation_to_json)
-            .collect::<Vec<_>>(),
-    })
+    typestate_automaton_projection_to_json(
+        json!(sorted_ids(&automaton.states)),
+        automaton.initial.as_str(),
+        json!(sorted_ids(&automaton.accepting_states)),
+        json!(sorted_ids(&automaton.error_states)),
+        Value::Array(
+            events
+                .into_iter()
+                .map(resolved_typestate_event_to_json)
+                .collect(),
+        ),
+        Value::Array(
+            transitions
+                .into_iter()
+                .map(|transition| {
+                    json!({
+                        "from": transition.from.as_str(),
+                        "on": transition.on.as_str(),
+                        "to": transition.to.as_str(),
+                    })
+                })
+                .collect(),
+        ),
+        Value::Array(
+            expectations
+                .into_iter()
+                .map(resolved_typestate_expectation_to_json)
+                .collect(),
+        ),
+    )
 }
 
 fn resolved_typestate_event_to_json(event: &ResolvedTypestateEventSpec) -> Value {
-    json!({
-        "id": event.id.as_str(),
-        "trigger": resolved_typestate_event_trigger_to_json(&event.trigger),
-        "applies_to_subjects": sorted_endpoint_identities(&event.applies_to_subjects),
-        "supersedes": sorted_ids(&event.supersedes),
-    })
+    resolved_typestate_entry_to_json(
+        event.id.as_str(),
+        resolved_typestate_event_trigger_to_json(&event.trigger),
+        &event.applies_to_subjects,
+        &event.supersedes,
+    )
 }
 
 fn resolved_typestate_event_trigger_to_json(trigger: &ResolvedTypestateEventTrigger) -> Value {
@@ -642,17 +719,37 @@ fn resolved_typestate_event_trigger_to_json(trigger: &ResolvedTypestateEventTrig
             selector_path,
             subject,
             phase,
-        } => json!({
-            "type": "calls",
-            "selector_path": selector_path.as_str(),
-            "subject": typestate_call_binding_to_json(subject),
-            "phase": observation_phase_label(*phase),
-        }),
-        ResolvedTypestateEventTrigger::MatchEndpoints { endpoints, phase } => json!({
-            "type": "match_endpoints",
-            "endpoints": sorted_endpoint_identities(endpoints),
-            "phase": observation_phase_label(*phase),
-        }),
+            argument_condition,
+        } => {
+            let mut object = Map::from_iter([
+                ("type".to_string(), Value::String("calls".to_string())),
+                (
+                    "selector_path".to_string(),
+                    Value::String(selector_path.as_str().to_string()),
+                ),
+                (
+                    "subject".to_string(),
+                    typestate_call_binding_to_json(subject),
+                ),
+                (
+                    "phase".to_string(),
+                    Value::String(observation_phase_label(*phase).to_string()),
+                ),
+            ]);
+            if let Some(condition) = argument_condition {
+                object.insert(
+                    "condition".to_string(),
+                    json!({
+                        "argument_index": condition.index,
+                        "equals": condition.equals,
+                    }),
+                );
+            }
+            Value::Object(object)
+        }
+        ResolvedTypestateEventTrigger::MatchEndpoints { endpoints, phase } => {
+            resolved_match_endpoint_trigger_to_json(endpoints, *phase)
+        }
         ResolvedTypestateEventTrigger::SemanticEvent { event } => json!({
             "type": "semantic_event",
             "event": policy_semantic_event_to_json(*event),
@@ -663,12 +760,44 @@ fn resolved_typestate_event_trigger_to_json(trigger: &ResolvedTypestateEventTrig
 fn resolved_typestate_expectation_to_json(
     expectation: &ResolvedTypestateTerminalExpectationSpec,
 ) -> Value {
+    let mut value = resolved_typestate_entry_to_json(
+        expectation.id.as_str(),
+        resolved_typestate_terminal_trigger_to_json(&expectation.trigger),
+        &expectation.applies_to_subjects,
+        &expectation.supersedes,
+    );
+    value
+        .as_object_mut()
+        .expect("resolved typestate entry projection is an object")
+        .insert(
+            "expected_states".to_string(),
+            json!(sorted_ids(&expectation.expected_states)),
+        );
+    value
+}
+
+fn resolved_typestate_entry_to_json<T: AsRef<str>>(
+    id: &str,
+    trigger: Value,
+    applies_to_subjects: &[ResolvedEndpointIdentity],
+    supersedes: &[T],
+) -> Value {
     json!({
-        "id": expectation.id.as_str(),
-        "trigger": resolved_typestate_terminal_trigger_to_json(&expectation.trigger),
-        "applies_to_subjects": sorted_endpoint_identities(&expectation.applies_to_subjects),
-        "expected_states": sorted_ids(&expectation.expected_states),
-        "supersedes": sorted_ids(&expectation.supersedes),
+        "id": id,
+        "trigger": trigger,
+        "applies_to_subjects": sorted_endpoint_identities(applies_to_subjects),
+        "supersedes": sorted_ids(supersedes),
+    })
+}
+
+fn resolved_match_endpoint_trigger_to_json(
+    endpoints: &[ResolvedEndpointIdentity],
+    phase: EndpointObservationPhase,
+) -> Value {
+    json!({
+        "type": "match_endpoints",
+        "endpoints": sorted_endpoint_identities(endpoints),
+        "phase": observation_phase_label(phase),
     })
 }
 
@@ -676,11 +805,9 @@ fn resolved_typestate_terminal_trigger_to_json(
     trigger: &ResolvedTypestateTerminalTrigger,
 ) -> Value {
     match trigger {
-        ResolvedTypestateTerminalTrigger::MatchEndpoints { endpoints, phase } => json!({
-            "type": "match_endpoints",
-            "endpoints": sorted_endpoint_identities(endpoints),
-            "phase": observation_phase_label(*phase),
-        }),
+        ResolvedTypestateTerminalTrigger::MatchEndpoints { endpoints, phase } => {
+            resolved_match_endpoint_trigger_to_json(endpoints, *phase)
+        }
         ResolvedTypestateTerminalTrigger::SemanticEvent { event } => json!({
             "type": "semantic_event",
             "event": policy_semantic_event_to_json(*event),
@@ -713,12 +840,11 @@ fn sorted_catalogs(catalogs: &[ResolvedCatalogIdentity]) -> Vec<Value> {
 }
 
 fn sorted_dependencies(endpoints: &[ResolvedEndpointDependency]) -> Vec<Value> {
-    let mut endpoints = endpoints.iter().collect::<Vec<_>>();
-    endpoints.sort_by(|left, right| left.identity.cmp(&right.identity));
-    endpoints
-        .into_iter()
-        .map(resolved_endpoint_dependency_to_json)
-        .collect()
+    sorted_by_endpoint_identity(
+        endpoints,
+        |dependency| &dependency.identity,
+        resolved_endpoint_dependency_to_json,
+    )
 }
 
 fn sorted_manifests(
@@ -778,26 +904,36 @@ fn resolved_catalog_identity_to_json(catalog: &ResolvedCatalogIdentity) -> Value
 }
 
 fn resolved_endpoint_dependency_to_json(dependency: &ResolvedEndpointDependency) -> Value {
-    let mut value = json!({
-        "identity": resolved_endpoint_identity_to_json(&dependency.identity),
-        "definition_schema_version": dependency.definition_schema.version(),
-        "model": resolved_endpoint_model_to_json(&dependency.model),
-        "semantic_hash": dependency.semantic_hash.to_string(),
-        "analysis_projection_hash": dependency.analysis_projection_hash.to_string(),
-    });
-    insert_selector_schemas(&mut value, &dependency.selector_schemas);
+    let mut value = resolved_endpoint_manifest_fields_to_json(
+        &dependency.identity,
+        dependency.definition_schema.version(),
+        dependency.semantic_hash.to_string(),
+        dependency.analysis_projection_hash.to_string(),
+        &dependency.selector_schemas,
+    );
+    value
+        .as_object_mut()
+        .expect("resolved endpoint projection is an object")
+        .insert(
+            "model".to_string(),
+            resolved_endpoint_model_to_json(&dependency.model),
+        );
     value
 }
 
 fn resolved_endpoint_model_to_json(model: &ResolvedEndpointModel) -> Value {
-    json!({
-        "role": endpoint_role_label(model.role),
-        "display_name": model.display_name,
-        "categories": sorted_ids(&model.categories),
-        "binding": endpoint_binding_to_json(&model.binding),
-        "taint": model.taint.as_ref().map(endpoint_taint_to_json),
-        "supersedes": sorted_endpoint_identities(&model.supersedes),
-    })
+    let mut fields = endpoint_model_analysis_fields_to_json(
+        json!((model.role).label()),
+        endpoint_binding_to_json(&model.binding),
+        model.taint.as_ref().map(endpoint_taint_to_json),
+        json!(sorted_endpoint_identities(&model.supersedes)),
+    );
+    fields.insert("display_name".to_string(), json!(model.display_name));
+    fields.insert(
+        "categories".to_string(),
+        json!(sorted_ids(&model.categories)),
+    );
+    Value::Object(fields)
 }
 
 fn resolved_manifest_to_json(manifest: &ResolvedMatchDirectoryManifest) -> Value {
@@ -818,13 +954,29 @@ fn resolved_manifest_to_json(manifest: &ResolvedMatchDirectoryManifest) -> Value
 }
 
 fn resolved_manifest_entry_to_json(entry: &ResolvedEndpointManifestEntry) -> Value {
+    resolved_endpoint_manifest_fields_to_json(
+        &entry.identity,
+        entry.definition_schema.version(),
+        entry.semantic_hash.to_string(),
+        entry.analysis_projection_hash.to_string(),
+        &entry.selector_schemas,
+    )
+}
+
+fn resolved_endpoint_manifest_fields_to_json(
+    identity: &ResolvedEndpointIdentity,
+    definition_schema_version: u32,
+    semantic_hash: String,
+    analysis_projection_hash: String,
+    selector_schemas: &ResolvedEndpointSelectorSchemas,
+) -> Value {
     let mut value = json!({
-        "identity": resolved_endpoint_identity_to_json(&entry.identity),
-        "definition_schema_version": entry.definition_schema.version(),
-        "semantic_hash": entry.semantic_hash.to_string(),
-        "analysis_projection_hash": entry.analysis_projection_hash.to_string(),
+        "identity": resolved_endpoint_identity_to_json(identity),
+        "definition_schema_version": definition_schema_version,
+        "semantic_hash": semantic_hash,
+        "analysis_projection_hash": analysis_projection_hash,
     });
-    insert_selector_schemas(&mut value, &entry.selector_schemas);
+    insert_selector_schemas(&mut value, selector_schemas);
     value
 }
 
@@ -909,34 +1061,28 @@ fn resolved_endpoint_identity_to_json(identity: &ResolvedEndpointIdentity) -> Va
 }
 
 fn sorted_endpoint_identities(identities: &[ResolvedEndpointIdentity]) -> Vec<Value> {
-    let mut identities = identities.iter().collect::<Vec<_>>();
-    identities.sort();
-    identities
-        .into_iter()
-        .map(resolved_endpoint_identity_to_json)
-        .collect()
+    sorted_by_endpoint_identity(
+        identities,
+        |identity| identity,
+        resolved_endpoint_identity_to_json,
+    )
 }
 
-fn endpoint_binding_to_json(binding: &PolicyEndpointBinding) -> Value {
-    match binding {
-        PolicyEndpointBinding::MatchedValue => json!({ "type": "matched_value" }),
-        PolicyEndpointBinding::Receiver => json!({ "type": "receiver" }),
-        PolicyEndpointBinding::ReturnValue => json!({ "type": "return_value" }),
-        PolicyEndpointBinding::ResultIndex { index } => {
-            json!({ "type": "result_index", "index": index })
-        }
-        PolicyEndpointBinding::ArgumentIndex { index } => {
-            json!({ "type": "argument_index", "index": index })
-        }
-        PolicyEndpointBinding::ArgumentName { name } => {
-            json!({ "type": "argument_name", "name": name })
-        }
-    }
+fn sorted_by_endpoint_identity<'a, T>(
+    values: &'a [T],
+    identity: impl Fn(&'a T) -> &'a ResolvedEndpointIdentity,
+    encode: impl Fn(&'a T) -> Value,
+) -> Vec<Value> {
+    let mut values = values.iter().collect::<Vec<_>>();
+    values.sort_by(|left, right| identity(*left).cmp(identity(*right)));
+    values.into_iter().map(encode).collect()
 }
 
 fn endpoint_taint_to_json(taint: &EndpointTaintSemantics) -> Value {
     match taint {
-        EndpointTaintSemantics::Source { labels, evidence } => json!({
+        EndpointTaintSemantics::Source {
+            labels, evidence, ..
+        } => json!({
             "type": "source",
             "labels": sorted_ids(labels),
             "evidence": evidence.as_ref().map(taint_source_evidence_to_json),
@@ -954,91 +1100,28 @@ fn endpoint_taint_to_json(taint: &EndpointTaintSemantics) -> Value {
     }
 }
 
-fn policy_port_to_json(port: &PolicyPort) -> Value {
-    match port {
-        PolicyPort::MatchedValue => json!({ "type": "matched_value" }),
-        PolicyPort::Receiver => json!({ "type": "receiver" }),
-        PolicyPort::ReturnValue => json!({ "type": "return_value" }),
-        PolicyPort::ResultIndex { index } => {
-            json!({ "type": "result_index", "index": index })
-        }
-        PolicyPort::ArgumentIndex { index } => {
-            json!({ "type": "argument_index", "index": index })
-        }
-        PolicyPort::ArgumentName { name } => {
-            json!({ "type": "argument_name", "name": name })
-        }
-        PolicyPort::FieldOf { base, name } => {
-            json!({ "type": "field", "name": name, "of": policy_port_to_json(base) })
-        }
-    }
-}
-
 fn resolved_typestate_binding_to_json(binding: &ResolvedTypestateBinding) -> Value {
     match binding {
-        ResolvedTypestateBinding::MatchedValue => json!({ "type": "matched_value" }),
-        ResolvedTypestateBinding::Receiver => json!({ "type": "receiver" }),
-        ResolvedTypestateBinding::ReturnValue => json!({ "type": "return_value" }),
+        ResolvedTypestateBinding::MatchedValue => binding_tag_to_json("matched_value"),
+        ResolvedTypestateBinding::Receiver => binding_tag_to_json("receiver"),
+        ResolvedTypestateBinding::ReturnValue => binding_tag_to_json("return_value"),
         ResolvedTypestateBinding::ResultIndex { index } => {
-            json!({ "type": "result_index", "index": index })
+            binding_index_to_json("result_index", *index)
         }
         ResolvedTypestateBinding::ArgumentIndex { index } => {
-            json!({ "type": "argument_index", "index": index })
+            binding_index_to_json("argument_index", *index)
         }
         ResolvedTypestateBinding::ArgumentName { name } => {
-            json!({ "type": "argument_name", "name": name })
-        }
-    }
-}
-
-fn typestate_call_binding_to_json(binding: &TypestateCallBinding) -> Value {
-    match binding {
-        TypestateCallBinding::Receiver => json!({ "type": "receiver" }),
-        TypestateCallBinding::ReturnValue => json!({ "type": "return_value" }),
-        TypestateCallBinding::ResultIndex { index } => {
-            json!({ "type": "result_index", "index": index })
-        }
-        TypestateCallBinding::ArgumentIndex { index } => {
-            json!({ "type": "argument_index", "index": index })
-        }
-        TypestateCallBinding::ArgumentName { name } => {
-            json!({ "type": "argument_name", "name": name })
+            binding_name_to_json("argument_name", name)
         }
     }
 }
 
 fn taint_source_evidence_to_json(evidence: &TaintSourceEvidence) -> Value {
     json!({
-        "trust_boundary": evidence.trust_boundary.map(trust_boundary_label),
-        "system_entry": evidence.system_entry.map(system_entry_label),
+        "trust_boundary": evidence.trust_boundary.map(TaintTrustBoundary::label),
+        "system_entry": evidence.system_entry.map(TaintSystemEntry::label),
     })
-}
-
-fn category_predicate_to_json(predicate: &CategoryPredicate) -> Value {
-    match predicate {
-        CategoryPredicate::Any { categories } => json!({
-            "type": "any",
-            "categories": sorted_ids(categories),
-        }),
-        CategoryPredicate::All { categories } => json!({
-            "type": "all",
-            "categories": sorted_ids(categories),
-        }),
-    }
-}
-
-fn policy_severity_to_json(severity: &PolicySeveritySpec) -> Value {
-    match severity {
-        PolicySeveritySpec::Fixed { level } => json!({
-            "type": "fixed",
-            "level": policy_level_label(*level),
-        }),
-        PolicySeveritySpec::Unrated => json!({ "type": "unrated" }),
-        PolicySeveritySpec::Cvss { when_unscored } => json!({
-            "type": "cvss",
-            "when_unscored": finding_severity_label(*when_unscored),
-        }),
-    }
 }
 
 fn sorted_classifications(classifications: &[TaxonomyClassificationSpec]) -> Vec<Value> {
@@ -1184,13 +1267,9 @@ fn selector_at<'a>(
     selectors: &'a [ResolvedPolicySelector],
     path: &str,
 ) -> Result<&'a ResolvedPolicySelector, LoadedModelError> {
-    selectors
-        .iter()
-        .find(|selector| selector.path.as_str() == path)
-        .ok_or_else(|| LoadedModelError::MissingSelectorPath {
-            path: PolicySelectorPath::new(path)
-                .expect("internally generated selector paths are valid"),
-        })
+    let path =
+        PolicySelectorPath::new(path).expect("internally generated selector paths are valid");
+    selector_by_path(selectors, &path)
 }
 
 fn selector_by_path<'a>(
@@ -1204,98 +1283,16 @@ fn selector_by_path<'a>(
 }
 
 fn sorted_ids<T: AsRef<str>>(values: &[T]) -> Vec<&str> {
-    let mut values = values.iter().map(AsRef::as_ref).collect::<Vec<_>>();
-    values.sort_unstable();
-    values.dedup();
-    values
+    sorted_identifier_refs(values.iter().map(AsRef::as_ref))
 }
 
 fn canonical_sort_key(value: &Value) -> String {
-    serde_json::to_string(value).expect("serde_json::Value serialization is infallible")
-}
-
-const fn may_mode_label(mode: MayMode) -> &'static str {
-    match mode {
-        MayMode::May => "may",
-    }
-}
-
-const fn inconclusive_label(policy: InconclusivePolicy) -> &'static str {
-    match policy {
-        InconclusivePolicy::Inconclusive => "inconclusive",
-    }
-}
-
-const fn endpoint_role_label(role: EndpointRole) -> &'static str {
-    match role {
-        EndpointRole::Source => "source",
-        EndpointRole::Sink => "sink",
-    }
-}
-
-const fn directory_scope_label(scope: DirectoryScope) -> &'static str {
-    match scope {
-        DirectoryScope::Direct => "direct",
-        DirectoryScope::Recursive => "recursive",
-    }
+    String::from_utf8(
+        compact_json_bytes(value).expect("serde_json::Value serialization is infallible"),
+    )
+    .expect("serde_json::Value serialization is valid UTF-8")
 }
 
 const fn observation_phase_label(phase: EndpointObservationPhase) -> &'static str {
     phase.label()
-}
-
-fn policy_semantic_event_to_json(event: PolicySemanticEvent) -> Value {
-    match event {
-        PolicySemanticEvent::NormalProcedureExit { scope } => json!({
-            "type": "normal_procedure_exit",
-            "scope": typestate_exit_scope_label(scope),
-        }),
-        PolicySemanticEvent::ExceptionalProcedureExit { scope } => json!({
-            "type": "exceptional_procedure_exit",
-            "scope": typestate_exit_scope_label(scope),
-        }),
-        PolicySemanticEvent::SuspensionBoundary { scope } => json!({
-            "type": "suspension_boundary",
-            "scope": typestate_exit_scope_label(scope),
-        }),
-    }
-}
-
-const fn typestate_exit_scope_label(scope: TypestateExitScope) -> &'static str {
-    scope.label()
-}
-
-const fn trust_boundary_label(boundary: TaintTrustBoundary) -> &'static str {
-    match boundary {
-        TaintTrustBoundary::External => "external",
-        TaintTrustBoundary::Internal => "internal",
-        TaintTrustBoundary::SameTrustZone => "same_trust_zone",
-    }
-}
-
-const fn system_entry_label(entry: TaintSystemEntry) -> &'static str {
-    match entry {
-        TaintSystemEntry::VulnerableSystemNetworkStack => "vulnerable_system_network_stack",
-        TaintSystemEntry::DownloadedArtifact => "downloaded_artifact",
-        TaintSystemEntry::LocalInput => "local_input",
-        TaintSystemEntry::AdjacentNetwork => "adjacent_network",
-        TaintSystemEntry::Physical => "physical",
-    }
-}
-
-const fn policy_level_label(level: PolicyLevel) -> &'static str {
-    match level {
-        PolicyLevel::Note => "note",
-        PolicyLevel::Warning => "warning",
-        PolicyLevel::Error => "error",
-    }
-}
-
-const fn finding_severity_label(severity: FindingSeverity) -> &'static str {
-    match severity {
-        FindingSeverity::Unrated => "unrated",
-        FindingSeverity::Note => "note",
-        FindingSeverity::Warning => "warning",
-        FindingSeverity::Error => "error",
-    }
 }

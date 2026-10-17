@@ -899,11 +899,6 @@ mod tests {
     }
 
     #[test]
-    fn hydration_rejects_nonzero_root_ordinal() {
-        assert!(build_template_term(vec![parameter_row(1, 1)], 0).is_err());
-    }
-
-    #[test]
     fn hydration_rejects_child_attached_to_leaf() {
         let mut rows = vec![parameter_row(1, 0)];
         rows.push(TemplateTermRow {

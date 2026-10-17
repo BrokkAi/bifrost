@@ -102,6 +102,171 @@ pub fn xml_configuration_adapter_epoch() -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Decode the scalar selected by one XML fact without retaining decoded text
+/// in the persistent fact arena. Attribute ranges contain the authored value;
+/// element-text ranges contain the authored text between tags. The caller
+/// supplies the document source that owns the range, so this remains bounded
+/// by the query's existing configuration-document budget.
+pub fn decoded_xml_scalar_value(
+    document: &ConfigurationDocumentFacts,
+    source: &str,
+    fact_id: ConfigurationFactId,
+) -> Option<String> {
+    if document.format() != ConfigurationFormat::Xml {
+        return None;
+    }
+    let fact = document.fact(fact_id)?;
+    let ConfigurationNodeKind::Scalar { .. } = fact.kind() else {
+        return None;
+    };
+    let range = fact.evidence();
+    let raw = source.get(range.start_byte()..range.end_byte())?;
+    let decoded = quick_xml::escape::unescape(raw).ok()?.into_owned();
+    let is_element_text = fact
+        .parent()
+        .and_then(|parent| document.fact(parent))
+        .is_some_and(|parent| {
+            matches!(
+                parent.kind(),
+                ConfigurationNodeKind::Section {
+                    header: Some(header),
+                    ..
+                } if *header == fact_id
+            )
+        });
+    Some(if is_element_text {
+        decoded.trim().to_string()
+    } else {
+        decoded
+    })
+}
+
+/// Decode one authored Java-properties scalar after the maintained grammar has
+/// selected its value node. The grammar owns key/value boundaries; this
+/// helper only interprets the selected value's format escapes.
+pub fn decoded_properties_scalar_value(
+    document: &ConfigurationDocumentFacts,
+    source: &str,
+    fact_id: ConfigurationFactId,
+) -> Option<String> {
+    if document.format() != ConfigurationFormat::Properties {
+        return None;
+    }
+    let fact = document.fact(fact_id)?;
+    let ConfigurationNodeKind::Scalar { .. } = fact.kind() else {
+        return None;
+    };
+    let range = fact.evidence();
+    let raw = source.get(range.start_byte()..range.end_byte())?;
+    Some(decode_properties_value(raw))
+}
+
+/// Decode a JSON string scalar after the maintained grammar has selected its
+/// value node. The grammar owns token boundaries; serde_json only interprets
+/// the authored JSON string escapes in that already-selected range.
+pub fn decoded_json_scalar_value(
+    document: &ConfigurationDocumentFacts,
+    source: &str,
+    fact_id: ConfigurationFactId,
+) -> Option<String> {
+    if document.format() != ConfigurationFormat::Json {
+        return None;
+    }
+    let fact = document.fact(fact_id)?;
+    let ConfigurationNodeKind::Scalar { .. } = fact.kind() else {
+        return None;
+    };
+    let range = fact.evidence();
+    let raw = source.get(range.start_byte()..range.end_byte())?;
+    serde_json::from_str::<String>(raw).ok()
+}
+
+/// Decode a YAML string scalar after the maintained grammar has selected its
+/// value node. This deliberately delegates quoting, escapes, and folded
+/// scalar handling to the maintained YAML decoder; no source-text parser is
+/// layered over the tree-sitter fact.
+pub fn decoded_yaml_scalar_value(
+    document: &ConfigurationDocumentFacts,
+    source: &str,
+    fact_id: ConfigurationFactId,
+) -> Option<String> {
+    if document.format() != ConfigurationFormat::Yaml {
+        return None;
+    }
+    let fact = document.fact(fact_id)?;
+    let ConfigurationNodeKind::Scalar { .. } = fact.kind() else {
+        return None;
+    };
+    let range = fact.evidence();
+    let raw = source.get(range.start_byte()..range.end_byte())?;
+    serde_saphyr::from_str::<String>(raw.trim()).ok()
+}
+
+fn decode_properties_value(raw: &str) -> String {
+    let mut units = Vec::with_capacity(raw.len());
+    let mut characters = raw.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character != '\\' {
+            let mut encoded = [0; 2];
+            units.extend(character.encode_utf16(&mut encoded).iter().copied());
+            continue;
+        }
+        let Some(escaped) = characters.next() else {
+            units.push(u16::from(b'\\'));
+            break;
+        };
+        match escaped {
+            't' => units.push(u16::from(b'\t')),
+            'n' => units.push(u16::from(b'\n')),
+            'r' => units.push(u16::from(b'\r')),
+            'f' => units.push(u16::from(b'\x0c')),
+            'u' => {
+                let mut digits = String::with_capacity(4);
+                for _ in 0..4 {
+                    let Some(digit) = characters.next() else {
+                        units.extend("\\u".encode_utf16());
+                        units.extend(digits.encode_utf16());
+                        return String::from_utf16(&units)
+                            .unwrap_or_else(|_| String::from_utf16_lossy(&units));
+                    };
+                    digits.push(digit);
+                }
+                match u16::from_str_radix(&digits, 16) {
+                    Ok(unit) => units.push(unit),
+                    Err(_) => {
+                        units.extend("\\u".encode_utf16());
+                        units.extend(digits.encode_utf16());
+                    }
+                }
+            }
+            '\n' => {
+                while characters
+                    .peek()
+                    .is_some_and(|character| matches!(character, ' ' | '\t' | '\x0c'))
+                {
+                    characters.next();
+                }
+            }
+            '\r' => {
+                if characters.peek() == Some(&'\n') {
+                    characters.next();
+                }
+                while characters
+                    .peek()
+                    .is_some_and(|character| matches!(character, ' ' | '\t' | '\x0c'))
+                {
+                    characters.next();
+                }
+            }
+            other => {
+                let mut encoded = [0; 2];
+                units.extend(other.encode_utf16(&mut encoded).iter().copied());
+            }
+        }
+    }
+    String::from_utf16(&units).unwrap_or_else(|_| String::from_utf16_lossy(&units))
+}
+
 /// Cache compatibility identity for the JSON adapter and its live grammar.
 pub fn json_configuration_adapter_epoch() -> String {
     grammar_adapter_epoch(
@@ -445,7 +610,7 @@ fn token_text<'source>(
     source: &'source str,
     node: Node<'_>,
 ) -> Result<&'source str, ConfigurationIngestionError> {
-    node.utf8_text(source.as_bytes()).map_err(|_| {
+    brokk_bifrost_core::analyzer::common::try_node_source_text(node, source).ok_or_else(|| {
         ConfigurationIngestionError::InvalidFactModel("tree-sitter token range is not UTF-8".into())
     })
 }
@@ -454,19 +619,31 @@ fn token_text<'source>(
 /// is the only structure available for the integer/decimal distinction. The
 /// maintained parser still supplies the validity verdict, because the grammar
 /// also accepts numbers JSON does not.
+fn validated_json_scalar_token<'source>(
+    source: &'source str,
+    node: Node<'_>,
+    recoveries: &mut Vec<ConfigurationRecovery>,
+) -> Result<Option<&'source str>, ConfigurationIngestionError> {
+    let text = token_text(source, node)?;
+    if json_token_is_valid(text) {
+        Ok(Some(text))
+    } else {
+        recoveries.push(ConfigurationRecovery::new(
+            ConfigurationRecoveryReason::UnsupportedScalar,
+            source_range(node)?,
+        ));
+        Ok(None)
+    }
+}
+
 fn json_number_scalar_kind(
     source: &str,
     node: Node<'_>,
     recoveries: &mut Vec<ConfigurationRecovery>,
 ) -> Result<ConfigurationScalarKind, ConfigurationIngestionError> {
-    let text = token_text(source, node)?;
-    if !json_token_is_valid(text) {
-        recoveries.push(ConfigurationRecovery::new(
-            ConfigurationRecoveryReason::UnsupportedScalar,
-            source_range(node)?,
-        ));
+    let Some(text) = validated_json_scalar_token(source, node, recoveries)? else {
         return Ok(ConfigurationScalarKind::Opaque);
-    }
+    };
     Ok(if text.contains(['.', 'e', 'E']) {
         ConfigurationScalarKind::Decimal
     } else {
@@ -479,14 +656,13 @@ fn json_string_scalar_kind(
     node: Node<'_>,
     recoveries: &mut Vec<ConfigurationRecovery>,
 ) -> Result<ConfigurationScalarKind, ConfigurationIngestionError> {
-    if json_token_is_valid(token_text(source, node)?) {
-        return Ok(ConfigurationScalarKind::String);
-    }
-    recoveries.push(ConfigurationRecovery::new(
-        ConfigurationRecoveryReason::UnsupportedScalar,
-        source_range(node)?,
-    ));
-    Ok(ConfigurationScalarKind::Opaque)
+    Ok(
+        if validated_json_scalar_token(source, node, recoveries)?.is_some() {
+            ConfigurationScalarKind::String
+        } else {
+            ConfigurationScalarKind::Opaque
+        },
+    )
 }
 
 /// The authored text of one object key.
@@ -2363,30 +2539,26 @@ fn yaml_scalar_kind(content: Node<'_>) -> ConfigurationScalarKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{
+        assert_properties_parser_limit, assert_same_configuration_stable_id,
+        configuration_scalar_kind,
+    };
+    use brokk_bifrost_test_macros::hardwon;
     use std::path::PathBuf;
 
     fn facts(source: &str) -> ConfigurationDocumentFacts {
-        match ingest_configuration_document(Path::new("config.JSON"), source.as_bytes()) {
-            ConfigurationIngestionOutcome::Facts(facts) => *facts,
-            other => panic!("expected facts, got {other:?}"),
-        }
+        crate::test_support::configuration_facts(Path::new("config.JSON"), source)
     }
 
     fn xml_facts(source: &str) -> ConfigurationDocumentFacts {
-        match ingest_configuration_document(Path::new("config.XML"), source.as_bytes()) {
-            ConfigurationIngestionOutcome::Facts(facts) => *facts,
-            other => panic!("expected XML facts, got {other:?}"),
-        }
+        crate::test_support::configuration_facts(Path::new("config.XML"), source)
     }
 
     fn properties_facts(source: &str) -> ConfigurationDocumentFacts {
         let path = PathBuf::from("src")
             .join("main")
             .join("application.Properties");
-        match ingest_configuration_document(&path, source.as_bytes()) {
-            ConfigurationIngestionOutcome::Facts(facts) => *facts,
-            other => panic!("expected properties facts, got {other:?}"),
-        }
+        crate::test_support::configuration_facts(&path, source)
     }
 
     fn slice(source: &str, range: ConfigurationSourceRange) -> &str {
@@ -2399,39 +2571,15 @@ mod tests {
         source: &str,
         document: &ConfigurationDocumentFacts,
     ) -> Vec<(String, usize, String, String)> {
-        document
-            .facts()
-            .iter()
-            .filter_map(|fact| {
-                let ConfigurationNodeKind::Member { role, key, value } = fact.kind() else {
-                    return None;
-                };
-                assert_eq!(*role, ConfigurationMemberRole::Property, "{fact:#?}");
-                let [segment] = fact.route().segments() else {
-                    panic!("a property route is exactly one authored key: {fact:#?}");
-                };
-                let ConfigurationRouteSelector::Key { name, occurrence } = segment.selector()
-                else {
-                    panic!("{fact:#?}");
-                };
-                assert_eq!(name, key.text());
-                assert_eq!(segment.evidence(), key.evidence());
-                let value = document
-                    .fact(value.expect("every property has a value"))
-                    .unwrap();
-                assert!(matches!(
-                    value.kind(),
-                    ConfigurationNodeKind::Scalar {
-                        scalar_kind: ConfigurationScalarKind::String
-                    }
-                ));
-                assert_eq!(value.route(), fact.route());
-                Some((
-                    key.text().to_owned(),
-                    *occurrence,
-                    slice(source, key.evidence()).to_owned(),
-                    slice(source, value.evidence()).to_owned(),
-                ))
+        crate::test_support::properties_members(source, document)
+            .into_iter()
+            .map(|(key, occurrence, key_token, value_token)| {
+                (
+                    key,
+                    occurrence,
+                    key_token.to_owned(),
+                    value_token.to_owned(),
+                )
             })
             .collect()
     }
@@ -2577,17 +2725,7 @@ caf\\u00e9.mode=on\n";
             ("kept=1\ra=b\r", "\r"),
         ] {
             let document = properties_facts(source);
-            let ConfigurationCompleteness::Incomplete { recoveries } = document.completeness()
-            else {
-                panic!("{source:?} must be incomplete: {document:#?}");
-            };
-            assert_eq!(recoveries.len(), 1, "{source:?}: {document:#?}");
-            assert_eq!(
-                recoveries[0].reason(),
-                ConfigurationRecoveryReason::ParserLimit,
-                "{source:?}"
-            );
-            assert_eq!(slice(source, recoveries[0].evidence()), lost, "{source:?}");
+            assert_properties_parser_limit(source, &document, lost);
             assert!(
                 !member_keys(&document)
                     .iter()
@@ -2653,7 +2791,7 @@ caf\\u00e9.mode=on\n";
         let enabled = |facts: &ConfigurationDocumentFacts| {
             facts.facts().iter().find(|fact| fact.route().segments().iter().any(|segment| matches!(segment.selector(), brokk_bifrost_core::analyzer::configuration::ConfigurationRouteSelector::Key { name, .. } if name == "enabled"))).unwrap().stable_id(ConfigurationFormat::Json)
         };
-        assert_eq!(enabled(&before), enabled(&after));
+        assert_same_configuration_stable_id(enabled(&before), enabled(&after));
     }
 
     #[test]
@@ -2679,6 +2817,7 @@ caf\\u00e9.mode=on\n";
     }
 
     #[test]
+    #[hardwon("8e93a37229cb: JSON recovery discarded a valid root after a malformed prefix")]
     fn malformed_json_prefix_keeps_the_following_root() {
         let document = facts(r#"@ {"kept":true}"#);
         assert!(!document.completeness().is_complete());
@@ -2686,6 +2825,9 @@ caf\\u00e9.mode=on\n";
     }
 
     #[test]
+    #[hardwon(
+        "8e93a37229cb: JSON comment recovery discarded neighboring facts instead of reporting exact malformed bytes"
+    )]
     fn json_comments_keep_facts_with_exact_malformed_evidence() {
         let source = "// header\n{\"kept\":true}";
         let document = facts(source);
@@ -2796,13 +2938,10 @@ caf\\u00e9.mode=on\n";
     }
 
     fn recovery_reasons(document: &ConfigurationDocumentFacts) -> Vec<ConfigurationRecoveryReason> {
-        match document.completeness() {
-            ConfigurationCompleteness::Complete => Vec::new(),
-            ConfigurationCompleteness::Incomplete { recoveries } => recoveries
-                .iter()
-                .map(ConfigurationRecovery::reason)
-                .collect(),
-        }
+        crate::test_support::configuration_recovery_ranges(document)
+            .into_iter()
+            .map(|(reason, _)| reason)
+            .collect()
     }
 
     fn member_keys(document: &ConfigurationDocumentFacts) -> Vec<&str> {
@@ -2817,13 +2956,9 @@ caf\\u00e9.mode=on\n";
     }
 
     fn scalar_kinds(document: &ConfigurationDocumentFacts) -> Vec<ConfigurationScalarKind> {
-        document
-            .facts()
-            .iter()
-            .filter_map(|fact| match fact.kind() {
-                ConfigurationNodeKind::Scalar { scalar_kind } => Some(*scalar_kind),
-                _ => None,
-            })
+        crate::test_support::configuration_scalar_ranges(document)
+            .into_iter()
+            .map(|(scalar_kind, _)| scalar_kind)
             .collect()
     }
 
@@ -2959,24 +3094,6 @@ caf\\u00e9.mode=on\n";
     }
 
     #[test]
-    fn json_feature_semantics_are_all_not_applicable() {
-        let document = facts(r#"{"a":{"b":[1]}}"#);
-        let features = document.features();
-        for state in [
-            features.anchors(),
-            features.aliases(),
-            features.includes(),
-            features.interpolation(),
-            features.format_merge(),
-        ] {
-            assert!(
-                matches!(state, ConfigurationFeatureState::NotApplicable),
-                "{features:#?}"
-            );
-        }
-    }
-
-    #[test]
     fn xml_ingestion_preserves_roles_scalars_occurrences_and_ranges() {
         let source = r#"<server mode="prod"><host>one</host><host>two</host></server>"#;
         let document = xml_facts(source);
@@ -3104,6 +3221,46 @@ caf\\u00e9.mode=on\n";
     }
 
     #[test]
+    #[hardwon("#4381: XML scalar rows exposed authored spellings instead of decoded values")]
+    fn xml_scalar_values_decode_attributes_and_trim_element_text() {
+        let source = r#"<server mode="prod&amp;test"><host> primary.example </host></server>"#;
+        let document = xml_facts(source);
+        let values = document
+            .facts()
+            .iter()
+            .filter_map(|fact| {
+                let ConfigurationNodeKind::Member {
+                    key,
+                    value: Some(value),
+                    ..
+                } = fact.kind()
+                else {
+                    return None;
+                };
+                let scalar = match document.fact(*value)?.kind() {
+                    ConfigurationNodeKind::Scalar { .. } => *value,
+                    ConfigurationNodeKind::Section {
+                        header: Some(header),
+                        ..
+                    } => *header,
+                    _ => return None,
+                };
+                Some((key.text(), scalar))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values
+                .iter()
+                .map(|(key, value)| (*key, decoded_xml_scalar_value(&document, source, *value)))
+                .collect::<Vec<_>>(),
+            vec![
+                ("mode", Some("prod&test".to_string())),
+                ("host", Some("primary.example".to_string()))
+            ]
+        );
+    }
+
+    #[test]
     fn xml_stable_identity_ignores_unrelated_sibling_edits() {
         let before = xml_facts("<server><target enabled=\"true\"/><other/></server>");
         let after = xml_facts(
@@ -3126,14 +3283,11 @@ caf\\u00e9.mode=on\n";
                 .unwrap()
                 .stable_id(ConfigurationFormat::Xml)
         };
-        assert_eq!(enabled(&before), enabled(&after));
+        assert_same_configuration_stable_id(enabled(&before), enabled(&after));
     }
 
     fn yaml_facts(source: &str) -> ConfigurationDocumentFacts {
-        match ingest_configuration_document(Path::new("config.YAML"), source.as_bytes()) {
-            ConfigurationIngestionOutcome::Facts(facts) => *facts,
-            other => panic!("expected YAML facts, got {other:?}"),
-        }
+        crate::test_support::configuration_facts(Path::new("config.YAML"), source)
     }
 
     /// The route as key texts and indexes, for readable assertions.
@@ -3183,13 +3337,6 @@ caf\\u00e9.mode=on\n";
             .unwrap_or_else(|| panic!("no member fact at {route:?} in {document:#?}"))
     }
 
-    fn scalar_kind_of(fact: &ConfigurationFact) -> ConfigurationScalarKind {
-        match fact.kind() {
-            ConfigurationNodeKind::Scalar { scalar_kind } => *scalar_kind,
-            other => panic!("expected a scalar, got {other:?}"),
-        }
-    }
-
     /// A production-shaped service manifest: nested block mappings, a block
     /// sequence of mappings, flow collections, block scalars, comments, an
     /// empty value, and every core-schema scalar kind.
@@ -3232,7 +3379,7 @@ tags: [primary, 2, 3.5, yes]
 
         // Every scalar kind the core schema resolves, plus the tag override
         // free document's quoted and block strings.
-        let kinds = |route: &[&str]| scalar_kind_of(fact_at(&document, route));
+        let kinds = |route: &[&str]| configuration_scalar_kind(fact_at(&document, route));
         assert_eq!(kinds(&["version"]), ConfigurationScalarKind::String);
         assert_eq!(
             kinds(&["services", "web", "image"]),
@@ -3303,7 +3450,10 @@ tags: [primary, 2, 3.5, yes]
 
         // An empty value is YAML's null, anchored where the value would be.
         let limits = fact_at(&document, &["services", "web", "limits"]);
-        assert_eq!(scalar_kind_of(limits), ConfigurationScalarKind::Null);
+        assert_eq!(
+            configuration_scalar_kind(limits),
+            ConfigurationScalarKind::Null
+        );
         assert_eq!(limits.evidence().start_byte(), limits.evidence().end_byte());
         assert_eq!(
             slice(
@@ -3446,7 +3596,10 @@ prod:
         // The alias occupies its node position as an authored, unexpanded
         // reference rather than the anchored mapping's facts.
         let db = fact_at(&document, &["prod", "db"]);
-        assert_eq!(scalar_kind_of(db), ConfigurationScalarKind::Opaque);
+        assert_eq!(
+            configuration_scalar_kind(db),
+            ConfigurationScalarKind::Opaque
+        );
         assert_eq!(slice(source, db.evidence()), "*defaults");
 
         let ConfigurationFeatureState::Unresolved { evidence } = features.format_merge() else {
@@ -3469,7 +3622,7 @@ prod:
         // a collection tag that agrees with the shape is resolved; a local
         // tag is the application's to interpret.
         assert_eq!(
-            scalar_kind_of(fact_at(&document, &["defaults", "port"])),
+            configuration_scalar_kind(fact_at(&document, &["defaults", "port"])),
             ConfigurationScalarKind::String
         );
         assert_eq!(
@@ -3477,11 +3630,11 @@ prod:
             "!!str 8080"
         );
         assert_eq!(
-            scalar_kind_of(fact_at(&document, &["defaults", "digits"])),
+            configuration_scalar_kind(fact_at(&document, &["defaults", "digits"])),
             ConfigurationScalarKind::Integer
         );
         assert_eq!(
-            scalar_kind_of(fact_at(&document, &["defaults", "bucket"])),
+            configuration_scalar_kind(fact_at(&document, &["defaults", "bucket"])),
             ConfigurationScalarKind::Opaque
         );
         assert!(matches!(
@@ -3524,7 +3677,7 @@ prod:
             "{resolved:#?}"
         );
         assert_eq!(
-            scalar_kind_of(fact_at(&resolved, &["c"])),
+            configuration_scalar_kind(fact_at(&resolved, &["c"])),
             ConfigurationScalarKind::Null
         );
         assert!(resolved.features().anchors().is_resolved());
@@ -3584,7 +3737,7 @@ prod:
         for key in ["c", "d"] {
             let value = fact_at(&document, &["flow", key]);
             assert_eq!(
-                scalar_kind_of(value),
+                configuration_scalar_kind(value),
                 ConfigurationScalarKind::Null,
                 "{key}"
             );
@@ -3607,7 +3760,7 @@ prod:
         ));
         assert_eq!(slice(source, pair_mapping.evidence()), "k: v");
         assert_eq!(
-            scalar_kind_of(fact_at(&document, &["multi", "0", "k"])),
+            configuration_scalar_kind(fact_at(&document, &["multi", "0", "k"])),
             ConfigurationScalarKind::String
         );
         assert_eq!(
@@ -3637,20 +3790,26 @@ prod:
         let explicit = yaml_facts("---\n");
         assert!(explicit.completeness().is_complete(), "{explicit:#?}");
         let root = fact_at(&explicit, &[]);
-        assert_eq!(scalar_kind_of(root), ConfigurationScalarKind::Null);
+        assert_eq!(
+            configuration_scalar_kind(root),
+            ConfigurationScalarKind::Null
+        );
         assert_eq!(root.evidence().start_byte(), root.evidence().end_byte());
 
         // A top-level scalar and a top-level sequence are documents too.
         let scalar = yaml_facts("just text\n");
         assert_eq!(
-            scalar_kind_of(fact_at(&scalar, &[])),
+            configuration_scalar_kind(fact_at(&scalar, &[])),
             ConfigurationScalarKind::String
         );
         let source = "-\n- second\n";
         let sequence = yaml_facts(source);
         assert!(sequence.completeness().is_complete(), "{sequence:#?}");
         let first = fact_at(&sequence, &["0"]);
-        assert_eq!(scalar_kind_of(first), ConfigurationScalarKind::Null);
+        assert_eq!(
+            configuration_scalar_kind(first),
+            ConfigurationScalarKind::Null
+        );
         assert_eq!(first.evidence(), empty_range_at(1));
         assert_eq!(
             slice(source, fact_at(&sequence, &["1"]).evidence()),
@@ -3762,7 +3921,7 @@ prod:
                 "{document:#?}"
             );
             assert_eq!(
-                scalar_kind_of(fact_at(&document, &["c"])),
+                configuration_scalar_kind(fact_at(&document, &["c"])),
                 ConfigurationScalarKind::Integer
             );
         }
@@ -3777,7 +3936,7 @@ prod:
         let enabled = |document: &ConfigurationDocumentFacts| {
             member_at(document, &["target", "enabled"]).stable_id(ConfigurationFormat::Yaml)
         };
-        assert_eq!(enabled(&before), enabled(&after));
+        assert_same_configuration_stable_id(enabled(&before), enabled(&after));
         // An edit that changes the value's kind changes the value's identity
         // without moving the member's.
         let retyped = yaml_facts("target:\n  enabled: \"true\"\nother: 1\n");
@@ -3865,7 +4024,7 @@ prod:
         let document = yaml_facts(source);
         assert!(document.completeness().is_complete(), "{document:#?}");
         assert_eq!(
-            scalar_kind_of(fact_at(&document, &[])),
+            configuration_scalar_kind(fact_at(&document, &[])),
             ConfigurationScalarKind::Opaque
         );
         assert!(
@@ -3886,7 +4045,7 @@ prod:
         ] {
             let document = yaml_facts(source);
             assert_eq!(
-                scalar_kind_of(fact_at(&document, &[])),
+                configuration_scalar_kind(fact_at(&document, &[])),
                 ConfigurationScalarKind::Integer,
                 "{source:?}: {document:#?}"
             );

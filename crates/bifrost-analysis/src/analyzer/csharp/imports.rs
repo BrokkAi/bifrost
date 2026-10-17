@@ -351,8 +351,10 @@ mod tests {
     use super::*;
     use crate::analyzer::Language;
     use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
+    #[hardwon("bfa4064d30d5: C# global using dependencies recover after missing publication")]
     fn global_using_dependencies_recover_after_missing_publication() {
         let fixture = InlineTestProject::with_language(Language::CSharp)
             .file("A/GlobalUsings.cs", "global using Shared;")

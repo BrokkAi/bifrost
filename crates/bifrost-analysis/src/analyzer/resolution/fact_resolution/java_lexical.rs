@@ -1,6 +1,15 @@
-//! Query-local Java hierarchy branches, replayed before lexical memo publication.
-use super::super::fact_source::MAX_TYPED_FACT_REQUESTS_PER_BATCH;
+//! Query-local JVM hierarchy branches, replayed before lexical memo publication.
+use super::super::fact_source::{
+    MAX_TYPED_FACT_REQUESTS_PER_BATCH, language_uses_enclosing_companion_members,
+};
 use super::*;
+use crate::analyzer::resolution::language_has_jvm_semantics;
+
+#[derive(Debug)]
+pub(super) struct JavaLexicalMemberOrigin {
+    pub(super) owner: FactMemberOwner,
+    pub(super) steps: Box<[WitnessStep]>,
+}
 
 pub(super) struct PendingLexicalHierarchy {
     answers: Vec<(SemanticId, SharedAnswer)>,
@@ -15,10 +24,14 @@ struct JavaLexicalReplay {
     rerun_key: Option<JavaLexicalRerunKey>,
     /// Whether the answer being replayed already binds a target.
     resolved: bool,
-    shape: HierarchyLookupShape,
-    branches: Vec<(SemanticId, CandidatePathIdentity, PartialPath)>,
+    branches: Vec<(
+        HierarchyLookupShape,
+        SemanticId,
+        CandidatePathIdentity,
+        PartialPath,
+    )>,
     cursor: usize,
-    group: Option<DemandQualifiedHierarchyGroup>,
+    group: Option<DemandHierarchyOwnerFrame>,
     additions: Vec<(CandidatePathIdentity, PartialPath)>,
     removals: Vec<CandidatePathIdentity>,
     overlay: Option<Box<SelectedContextOverlayFragmentSourceBlueprint>>,
@@ -122,13 +135,6 @@ impl JavaLexicalReplay {
         reference: SemanticId,
         answer: &ResolutionAnswer,
     ) -> StoreResult<Option<Self>> {
-        if !evaluation
-            .session
-            .typed_source
-            .selection_has_java_semantics()
-        {
-            return Ok(None);
-        }
         let ResolutionCompletion::Incomplete(reasons) = answer.completion() else {
             return Ok(None);
         };
@@ -142,15 +148,31 @@ impl JavaLexicalReplay {
         if reasons.is_empty() {
             return Ok(None);
         }
+        let has_jvm_selection = evaluation
+            .session
+            .typed_source
+            .selection_has_jvm_semantics();
         let read = evaluation
             .session
             .gap_reason_provenance_for_reasons(&reasons)?;
         let Some(provenance) = evaluation.accept_session_read(read) else {
             return Ok(None);
         };
-        let gaps = provenance
+        let provenance = provenance
             .into_iter()
             .map(|row| *row.get(evaluation.session))
+            .collect::<Vec<_>>();
+        let call_applicability_reasons = provenance
+            .iter()
+            .filter(|row| {
+                row.origin()
+                    == LoweringGapOrigin::Extracted(ResolutionGapKind::UnsupportedCallApplicability)
+            })
+            .map(|row| row.reason())
+            .collect::<BTreeSet<_>>();
+        let gaps = provenance
+            .iter()
+            .copied()
             .filter(|row| {
                 row.origin()
                     == LoweringGapOrigin::Extracted(
@@ -158,7 +180,31 @@ impl JavaLexicalReplay {
                     )
             })
             .collect::<Vec<_>>();
-        if gaps.is_empty() {
+        if gaps.is_empty() && call_applicability_reasons.is_empty() {
+            return Ok(None);
+        }
+        let read = evaluation.session.calls_for_references(&[reference])?;
+        let Some(calls) = evaluation.accept_session_read(read) else {
+            return Ok(None);
+        };
+        let has_jvm_call = calls.iter().any(|call| {
+            let call = call.get(evaluation.session).row();
+            call.callee_reference() == reference
+                && (language_has_jvm_semantics(call.language())
+                    || (call.language() == Language::None && has_jvm_selection))
+        });
+        let applicability_call = calls.iter().any(|call| {
+            let call = call.get(evaluation.session).row();
+            call.callee_reference() == reference
+                && call_applicability_reasons.contains(&call.applicability_reason())
+                && matches!(call.language(), Language::Kotlin | Language::Scala)
+        });
+        let companion_member_call = calls.iter().any(|call| {
+            let call = call.get(evaluation.session).row();
+            call.callee_reference() == reference
+                && language_uses_enclosing_companion_members(call.language())
+        });
+        if gaps.is_empty() && !applicability_call {
             return Ok(None);
         }
         let mut owners = HashMap::<SemanticId, BTreeSet<SemanticId>>::default();
@@ -199,27 +245,27 @@ impl JavaLexicalReplay {
                 return Ok(None);
             }
         }
-        let mut definitions = owners.values().flatten().copied().collect::<Vec<_>>();
-        definitions.sort_unstable();
-        definitions.dedup();
-        let Some(java) = evaluation
-            .session
-            .typed_source
-            .java_inheritance_declarations(&definitions, evaluation.cancellation)?
-        else {
-            evaluation.cancellation_observed = true;
-            return Ok(None);
-        };
-        let java = java
-            .into_iter()
-            .map(|row| row.definition)
-            .collect::<HashSet<_>>();
-        owners.retain(|_, candidates| {
-            candidates.retain(|owner| java.contains(owner));
-            !candidates.is_empty()
-        });
-        if owners.is_empty() {
-            return Ok(None);
+        if !gaps.is_empty() {
+            let definitions = owners.values().flatten().copied().collect::<Vec<_>>();
+            let Some(jvm_declarations) = evaluation
+                .session
+                .typed_source
+                .java_inheritance_declarations(&definitions, evaluation.cancellation)?
+            else {
+                evaluation.cancellation_observed = true;
+                return Ok(None);
+            };
+            let jvm_declarations = jvm_declarations
+                .into_iter()
+                .map(|row| row.definition)
+                .collect::<HashSet<_>>();
+            owners.retain(|_, candidates| {
+                candidates.retain(|owner| jvm_declarations.contains(owner));
+                !candidates.is_empty()
+            });
+            if owners.is_empty() {
+                return Ok(None);
+            }
         }
         let Some(seed) = evaluation
             .session
@@ -234,27 +280,156 @@ impl JavaLexicalReplay {
         if !metadata.unqualified()
             || !matches!(
                 metadata.namespace(),
-                ResolutionNamespace::Type | ResolutionNamespace::Value
+                ResolutionNamespace::Type
+                    | ResolutionNamespace::Value
+                    | ResolutionNamespace::Callable
+                    | ResolutionNamespace::TypeOrValue
             )
         {
             return Ok(None);
         }
-        // Source-issued reference paths carry the lookup symbol. Never recover it
-        // from spelling or turn the whole reference into an enclosing-type lookup.
-        let paths = evaluation.lexical_paths_at(closed_endpoint(seed.node(), []))?;
-        let mut lookups = BTreeSet::new();
-        for (_, path) in paths {
-            if let [symbol] = path.end().symbols().fixed()
-                && symbol.scopes().is_none()
-            {
-                lookups.insert(symbol.symbol());
-            }
-        }
-        if lookups.len() != 1 {
+        if gaps.is_empty()
+            && !matches!(
+                metadata.namespace(),
+                ResolutionNamespace::Value | ResolutionNamespace::Callable
+            )
+        {
             return Ok(None);
         }
-        let lookup = lookups.pop_first().unwrap();
+        let lookups = evaluation.reference_lookup_symbols(seed.node())?;
+        if lookups.is_empty() {
+            return Ok(None);
+        }
+        // Traversal and applicability placeholders do not change the enclosing
+        // template's nominal identity. Infer it from declaration ownership even
+        // while those later phases are pending.
+        let mut current_type = {
+            // This replay has the reference seed, but it does not add it to the
+            // evaluation's root or qualified-seed metadata cache.
+            let Some(Some(reference_owner)) = metadata.reference_owner() else {
+                return Ok(None);
+            };
+            let scope_read = evaluation
+                .session
+                .member_scopes_for_definitions(&[reference_owner])?;
+            let Some(scopes) = evaluation.accept_session_read(scope_read) else {
+                return Ok(None);
+            };
+            let owner_read = evaluation
+                .session
+                .member_owners_for_definitions(&[reference_owner])?;
+            let Some(owners) = evaluation.accept_session_read(owner_read) else {
+                return Ok(None);
+            };
+            if scopes.len() == 1
+                && scopes[0].get(evaluation.session).row().definition() == reference_owner
+            {
+                Some(reference_owner)
+            } else if !scopes.is_empty()
+                || owners.len() != 1
+                || owners[0].get(evaluation.session).row().definition() != reference_owner
+            {
+                None
+            } else {
+                Some(owners[0].get(evaluation.session).row().owner_definition())
+            }
+        };
+        if let Some(owner) = current_type
+            && provenance.iter().any(|gap| {
+                gap.origin()
+                    == LoweringGapOrigin::Extracted(ResolutionGapKind::UnsupportedScopeOrBinder)
+                    && super::super::fact_lowering::site_semantic(gap.fragment(), gap.source_site())
+                        == owner
+            })
+        {
+            current_type = None;
+        }
+        let current_type_is_jvm = if let Some(current_type) = current_type {
+            let Some(jvm_declarations) = evaluation
+                .session
+                .typed_source
+                .java_inheritance_declarations(&[current_type], evaluation.cancellation)?
+            else {
+                evaluation.cancellation_observed = true;
+                return Ok(None);
+            };
+            jvm_declarations
+                .iter()
+                .any(|declaration| declaration.definition == current_type)
+        } else {
+            false
+        };
+        if gaps.is_empty() && !current_type_is_jvm {
+            return Ok(None);
+        }
+        if !current_type_is_jvm {
+            current_type = None;
+        }
+        if lookups.len() != 1
+            && (!matches!(
+                metadata.namespace(),
+                ResolutionNamespace::Value
+                    | ResolutionNamespace::Callable
+                    | ResolutionNamespace::TypeOrValue
+            ) || (!matches!(metadata.namespace(), ResolutionNamespace::TypeOrValue)
+                && !calls.iter().any(|call| {
+                    let call = call.get(evaluation.session).row();
+                    call.callee_reference() == reference
+                        && matches!(call.language(), Language::Kotlin | Language::Scala)
+                })))
+        {
+            return Ok(None);
+        }
+        let callable_overload_set = has_jvm_call;
+        if metadata.namespace() == ResolutionNamespace::Callable && !callable_overload_set {
+            return Ok(None);
+        }
+        let call_namespace_ladder = calls.iter().any(|call| {
+            let call = call.get(evaluation.session).row();
+            call.callee_reference() == reference
+                && super::super::fact_lowering::call_target_lookup_routes(call.language(), true)
+                    .is_some()
+        });
+        let mut shapes = Vec::with_capacity(lookups.len());
+        for lookup in lookups {
+            // Scala calls carry Callable, Value and Type lookup routes. Each
+            // route keeps its own namespace, including singleton Value fields.
+            let namespace = if metadata.namespace() == ResolutionNamespace::TypeOrValue
+                || call_namespace_ladder
+            {
+                let Some(namespace) = evaluation
+                    .session
+                    .typed_source
+                    .lookup_namespace(lookup, evaluation.cancellation)?
+                else {
+                    return Ok(None);
+                };
+                namespace
+            } else {
+                metadata.namespace()
+            };
+            let shape = HierarchyLookupShape::new(
+                lookup,
+                namespace,
+                if namespace == ResolutionNamespace::Type {
+                    QualifierCategory::Type
+                } else {
+                    QualifierCategory::Runtime
+                },
+                0,
+            );
+            shapes.push(
+                if callable_overload_set
+                    && (!call_namespace_ladder || namespace == ResolutionNamespace::Callable)
+                {
+                    shape.with_callable_overload_set()
+                } else {
+                    shape
+                },
+            );
+        }
         let mut branches = Vec::new();
+        let mut enclosing_type_branches = Vec::new();
         for chunk in gaps.chunks(MAX_TYPED_FACT_REQUESTS_PER_BATCH) {
             let Some(terminals) = evaluation
                 .session
@@ -285,14 +460,87 @@ impl JavaLexicalReplay {
                     // A forward point operation has no reverse inventory. This
                     // exact head/lookup seek reuses the already visited lexical
                     // relation; the terminal distinguishes the source obligation.
-                    for (identity, path) in
-                        evaluation.lexical_paths_at(closed_endpoint(head, [lookup]))?
+                    for &shape in &shapes {
+                        for (identity, path) in
+                            evaluation.lexical_paths_at(closed_endpoint(head, [shape.lookup]))?
+                        {
+                            if path.end().node() == terminal {
+                                assert_eq!(path.start().node(), head);
+                                evaluation.observe_cancellation_completion(path.completion());
+                                branches.push((shape, owner, identity, path));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if applicability_call && current_type_is_jvm {
+            let owner = current_type.expect("a selected JVM current type exists");
+            let read = evaluation.session.member_scopes_for_definitions(&[owner])?;
+            let Some(scopes) = evaluation.accept_session_read(read) else {
+                return Ok(None);
+            };
+            for scope in scopes {
+                if evaluation.poll_cancelled() {
+                    return Ok(None);
+                }
+                let row = scope.get(evaluation.session).row();
+                assert_eq!(row.definition(), owner);
+                let head = row.scope_head();
+                for &shape in &shapes {
+                    let paths =
+                        evaluation.lexical_paths_at(closed_endpoint(head, [shape.lookup]))?;
+                    enclosing_type_branches.extend(
+                        paths
+                            .iter()
+                            .map(|(identity, path)| (shape, *identity, path.clone())),
+                    );
+                    let nodes = paths
+                        .iter()
+                        .map(|(_, path)| path.end().node())
+                        .collect::<Vec<_>>();
+                    let classifications = evaluation
+                        .session
+                        .lexical_source
+                        .classify_endpoint_nodes(&nodes, evaluation.cancellation)?;
+                    assert_eq!(
+                        classifications.len(),
+                        paths.len(),
+                        "every selected member-scope path has one endpoint classification"
+                    );
+                    for ((identity, path), classification) in paths.into_iter().zip(classifications)
                     {
-                        if path.end().node() == terminal {
+                        if classification
+                            .definition()
+                            .is_some_and(|definition| answer.targets().contains(&definition))
+                        {
                             assert_eq!(path.start().node(), head);
                             evaluation.observe_cancellation_completion(path.completion());
-                            branches.push((owner, identity, path));
+                            branches.push((shape, owner, identity, path));
                         }
+                    }
+                }
+            }
+            if companion_member_call {
+                let relation_read = evaluation
+                    .session
+                    .companion_relations_for_enclosing_types(&[owner])?;
+                let Some(relations) = evaluation.accept_session_read(relation_read) else {
+                    return Ok(None);
+                };
+                for relation in relations {
+                    if evaluation.poll_cancelled() {
+                        return Ok(None);
+                    }
+                    let relation = relation.get(evaluation.session).row();
+                    assert_eq!(
+                        relation.enclosing_type(),
+                        owner,
+                        "selected companion relation belongs to the requested class body"
+                    );
+                    let companion = relation.companion_type();
+                    for (shape, identity, path) in &enclosing_type_branches {
+                        branches.push((*shape, companion, *identity, path.clone()));
                     }
                 }
             }
@@ -300,22 +548,12 @@ impl JavaLexicalReplay {
         if branches.is_empty() || evaluation.poll_cancelled() {
             return Ok(None);
         }
-        branches.sort_unstable_by_key(|(_, identity, _)| *identity);
-        branches.dedup_by_key(|(_, identity, _)| *identity);
+        branches.sort_unstable_by_key(|(shape, _, identity, _)| (shape.lookup, *identity));
+        branches.dedup_by_key(|(shape, _, identity, _)| (shape.lookup, *identity));
         Ok(Some(Self {
             seed,
             rerun_key: None,
             resolved: !answer.targets().is_empty(),
-            shape: HierarchyLookupShape::new(
-                lookup,
-                metadata.namespace(),
-                if metadata.namespace() == ResolutionNamespace::Type {
-                    QualifierCategory::Type
-                } else {
-                    QualifierCategory::Runtime
-                },
-                0,
-            ),
             branches,
             cursor: 0,
             group: None,
@@ -339,7 +577,7 @@ impl JavaLexicalReplay {
     }
 
     fn cancel(self, evaluation: &mut FactEvaluation<'_, '_>) {
-        for (_, _, path) in &self.branches {
+        for (_, _, _, path) in &self.branches {
             evaluation.observe_cancellation_completion(path.completion());
         }
         for (_, path) in &self.additions {
@@ -408,33 +646,47 @@ impl JavaLexicalReplay {
             else {
                 return Ok(Ready(None));
             };
-            let (owner, identity, branch) = &self.branches[self.cursor];
-            // JLS 4.3.2: java.lang.Object declares methods only. A member-type
-            // lookup whose inherited walk is sealed except for the implicit
-            // unindexed Object superclass has an exhaustive negative answer at
-            // this owner, so the raw hierarchy branch is retired without a
-            // replacement. Only a resolved answer can become complete this way:
+            let (shape, owner, identity, branch) = &self.branches[self.cursor];
+            // A lookup whose inherited walk is sealed except for the implicit
+            // root supertype (Java's unindexed `Object` edge, or no edge at
+            // all for Kotlin's `Any` and Scala's `Any` and `AnyRef`) has an
+            // exhaustive negative answer at this owner when the root declares
+            // no member of that name (`language_implicit_root_member_names`).
+            // The raw hierarchy branch is then retired without a replacement.
+            // A lookup that finds no owner is absent from the indexed
+            // ancestry. The shared shape-specific closure searches every
+            // indexed parent alternative for this lookup, including plural
+            // edges. Unknown parents leave it open. Only a resolved answer
+            // can become complete this way:
             // a lookup nothing answers still reaches the compilation unit's
             // placement boundary, so it keeps this reason conservatively and
-            // is not re-evaluated.
+            // is not re-evaluated. A selected declaration in any namespace
+            // must keep its hierarchy branch until the member bridges below
+            // are added; otherwise an inherited field can lose to an enclosing
+            // class's declaration (JLS 6.4.1).
             if self.resolved
-                && (selected.owners.is_empty()
-                    || self.shape.namespace == ResolutionNamespace::Value)
+                && selected.owners.is_empty()
+                && evaluation.hierarchy.hierarchy_closed(*shape, *owner)
             {
-                let Some(only_object) =
-                    evaluation.java_hierarchy_open_only_at_implicit_object(*owner)?
+                let Some(outside_root) = evaluation
+                    .lookup_is_outside_implicit_root(identity.fragment(), shape.lookup)?
                 else {
                     return Ok(Ready(None));
                 };
-                if only_object {
+                if outside_root {
                     self.removals.push(*identity);
                     self.group = None;
                     self.cursor += 1;
                     return Ok(Continue);
                 }
             }
-            let (paths, remove_branch) =
-                evaluation.java_lexical_bridges(self.shape, *identity, branch, selected)?;
+            let (paths, remove_branch) = evaluation.java_lexical_bridges(
+                self.seed.reference(),
+                *shape,
+                *identity,
+                branch,
+                selected,
+            )?;
             if remove_branch {
                 self.removals.push(*identity);
             }
@@ -444,21 +696,22 @@ impl JavaLexicalReplay {
             return Ok(Continue);
         }
         if self.cursor < self.branches.len() {
-            let owner = self.branches[self.cursor].0;
+            let (shape, owner, _, _) = &self.branches[self.cursor];
+            let owner = *owner;
             let roots = [HierarchyRoot {
                 owner,
                 value: ResolutionSlotValue::type_object(ResolutionTypeRef::new(owner, 0)),
                 route_ordinal: 0,
             }];
-            let Some(roots) = evaluation.prepare_hierarchy_roots(self.shape, &roots) else {
+            let Some(roots) = evaluation.prepare_hierarchy_roots(*shape, &roots) else {
                 return Ok(Ready(None));
             };
             let Some(local) = DemandHierarchyLocalFrame::new(evaluation, &roots.root_keys) else {
                 return Ok(Ready(None));
             };
-            self.group = Some(DemandQualifiedHierarchyGroup {
+            self.group = Some(DemandHierarchyOwnerFrame {
                 precedence: 0,
-                shape: self.shape,
+                shape: *shape,
                 roots: Some(roots),
                 local,
                 inherited: None,
@@ -633,7 +886,7 @@ impl FactEvaluation<'_, '_> {
         Ok(Some(answer))
     }
 
-    fn lexical_paths_at(
+    pub(super) fn lexical_paths_at(
         &mut self,
         endpoint: EndpointSignature,
     ) -> StoreResult<Vec<(CandidatePathIdentity, PartialPath)>> {
@@ -726,6 +979,7 @@ impl FactEvaluation<'_, '_> {
     /// whether that branch is retired.
     fn java_lexical_bridges(
         &mut self,
+        reference: SemanticId,
         shape: HierarchyLookupShape,
         branch_identity: CandidatePathIdentity,
         branch: &PartialPath,
@@ -794,11 +1048,20 @@ impl FactEvaluation<'_, '_> {
                 ) else {
                     return Ok((additions, false));
                 };
-                let mut hash = CanonicalHasher::new(b"bifrost-java-lexical-hierarchy-frontier:v1");
-                hash.field("branch", &branch_identity.path().as_bytes());
-                hash.field("branch-fragment", &branch_identity.fragment().as_bytes());
-                hash.field("lookup", &shape.lookup.as_bytes());
-                let path_id = self.hierarchy.operation_path(hash.finish());
+                let mut descriptor = CanonicalIdentityDescriptor::new(
+                    b"bifrost-java-lexical-hierarchy-frontier:v1",
+                    |key| self.session.identity_digest(self.hierarchy, key),
+                );
+                descriptor.field(
+                    "branch",
+                    CanonicalIdentityPart::identity(branch_identity.path()),
+                )?;
+                descriptor.field(
+                    "branch-fragment",
+                    CanonicalIdentityPart::identity(branch_identity.fragment()),
+                )?;
+                descriptor.field("lookup", CanonicalIdentityPart::identity(shape.lookup))?;
+                let path_id = self.hierarchy.operation_path(descriptor.finish());
                 additions.push((
                     CandidatePathIdentity::new(branch_identity.fragment(), path_id),
                     path,
@@ -870,14 +1133,79 @@ impl FactEvaluation<'_, '_> {
                     if !local.direct_definitions.contains(&definition) {
                         continue;
                     }
-                    let mut hash =
-                        CanonicalHasher::new(b"bifrost-java-lexical-hierarchy-bridge:v1");
-                    hash.field("branch", &branch_identity.path().as_bytes());
-                    hash.field("branch-fragment", &branch_identity.fragment().as_bytes());
-                    hash.field("candidate", &identity.path().as_bytes());
-                    hash.field("candidate-fragment", &identity.fragment().as_bytes());
-                    hash.field("lookup", &shape.lookup.as_bytes());
-                    let path_id = self.hierarchy.operation_path(hash.finish());
+                    if shape.namespace == ResolutionNamespace::Callable
+                        && shape.inherited_member_kind() == Some(ResolutionMemberKind::Method)
+                        && let Some(ExactMemberOwnerMetadata::Unique(property)) =
+                            self.hierarchy.member_owner_metadata.get(&definition)
+                    {
+                        let property = property.get(self.session).row();
+                        if property.kind() == ResolutionMemberKind::Field
+                            && property.owner_definition() == selected.owner
+                            && property.owner_scope_head() == head
+                            && qualifier_compatible(
+                                property.qualifier_compatibility(),
+                                shape.category,
+                            )
+                        {
+                            let origin = CallableValueAliasOrigin {
+                                key: HierarchyNodeKey {
+                                    shape,
+                                    owner: selected.owner,
+                                },
+                                scope_head: head,
+                            };
+                            let origins = self
+                                .callable_value_alias_origins
+                                .entry((reference, definition))
+                                .or_default();
+                            if !origins.contains(&origin) {
+                                origins.push(origin);
+                            }
+                        }
+                    }
+                    if shape.namespace == ResolutionNamespace::Callable {
+                        let owner = self.fact_member_owner(
+                            definition,
+                            ResolutionMemberKind::Method,
+                            selected.owner_path.clone(),
+                            false,
+                        );
+                        let origins = self
+                            .hierarchy
+                            .java_lexical_member_owners
+                            .entry((reference, definition))
+                            .or_default();
+                        if !origins.iter().any(|origin| {
+                            origin.owner == owner && origin.steps.as_ref() == composed.witness()
+                        }) {
+                            origins.push(JavaLexicalMemberOrigin {
+                                owner,
+                                steps: composed.witness().to_vec().into_boxed_slice(),
+                            });
+                        }
+                    }
+                    let mut descriptor = CanonicalIdentityDescriptor::new(
+                        b"bifrost-java-lexical-hierarchy-bridge:v1",
+                        |key| self.session.identity_digest(self.hierarchy, key),
+                    );
+                    descriptor.field(
+                        "branch",
+                        CanonicalIdentityPart::identity(branch_identity.path()),
+                    )?;
+                    descriptor.field(
+                        "branch-fragment",
+                        CanonicalIdentityPart::identity(branch_identity.fragment()),
+                    )?;
+                    descriptor.field(
+                        "candidate",
+                        CanonicalIdentityPart::identity(identity.path()),
+                    )?;
+                    descriptor.field(
+                        "candidate-fragment",
+                        CanonicalIdentityPart::identity(identity.fragment()),
+                    )?;
+                    descriptor.field("lookup", CanonicalIdentityPart::identity(shape.lookup))?;
+                    let path_id = self.hierarchy.operation_path(descriptor.finish());
                     additions.push((
                         CandidatePathIdentity::new(branch_identity.fragment(), path_id),
                         composed,
@@ -889,62 +1217,21 @@ impl FactEvaluation<'_, '_> {
         Ok((additions, remove_branch))
     }
 
-    /// Whether every supertype edge reachable from `owner` is resolved, apart
-    /// from implicit `java.lang.Object` superclass edges whose absolute route
-    /// is unindexed. `None` reports cancellation. An owner without a sealed
-    /// edge node, an ambiguous edge, or an unresolved authored supertype makes
-    /// this `false`.
-    fn java_hierarchy_open_only_at_implicit_object(
+    /// Whether the lookup `lookup`, filed in `fragment`, spells no member of
+    /// its language's implicit root supertype. `None` reports cancellation.
+    pub(super) fn lookup_is_outside_implicit_root(
         &mut self,
-        owner: SemanticId,
+        fragment: BindingFragmentId,
+        lookup: SemanticId,
     ) -> StoreResult<Option<bool>> {
-        let mut pending = vec![owner];
-        let mut visited = HashSet::default();
-        while let Some(current) = pending.pop() {
-            if self.poll_cancelled() {
-                return Ok(None);
-            }
-            if !visited.insert(current) {
-                continue;
-            }
-            let Some(node) = self.hierarchy.edge_node_snapshot(current) else {
-                return Ok(Some(false));
-            };
-            if !matches!(node.evidence, HierarchyEvidence::Complete) {
-                return Ok(Some(false));
-            }
-            let mut unresolved = Vec::new();
-            for ordinal in 0..node.edge_count {
-                if self.poll_cancelled() {
-                    return Ok(None);
-                }
-                let edge = self.hierarchy.edge_snapshot(current, ordinal);
-                match edge.target_count {
-                    1 => pending.push(self.hierarchy.edge_target(current, ordinal, 0)),
-                    0 => unresolved.push(edge.reference),
-                    _ => return Ok(Some(false)),
-                }
-            }
-            if unresolved.is_empty() {
-                continue;
-            }
-            let read = self.session.supertypes_for_definitions(&[current])?;
-            let Some(supertypes) = self.accept_session_read(read) else {
-                return Ok(None);
-            };
-            let implicit = supertypes
-                .iter()
-                .map(|row| row.get(self.session).row())
-                .filter(|row| row.kind() == ResolutionSupertypeKind::ImplicitSuperclass)
-                .map(|row| row.reference())
-                .collect::<HashSet<_>>();
-            if unresolved
-                .iter()
-                .any(|reference| !implicit.contains(reference))
-            {
-                return Ok(Some(false));
-            }
-        }
-        Ok(Some(true))
+        let Some(outside) = self
+            .session
+            .typed_source
+            .lookups_outside_implicit_root(&[(fragment, lookup)], self.cancellation)?
+        else {
+            self.cancellation_observed = true;
+            return Ok(None);
+        };
+        Ok(Some(outside.contains(&lookup)))
     }
 }

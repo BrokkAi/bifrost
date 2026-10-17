@@ -1,5 +1,4 @@
 use super::*;
-use crate::catalog::CatalogRegistryLimits;
 
 const STORE: &str = r#"(endpoint-set-document :schema-version 1 :kind stores
   :set (endpoint-set :entries [
@@ -28,14 +27,7 @@ fn reference(path: &str) -> String {
 }
 
 fn registry(root: &Path) -> PolicyRegistry {
-    PolicyRegistry::new_for_workspace(
-        root.to_path_buf(),
-        Arc::new(TaintCatalogRegistry::new_without_workspace(
-            CatalogRegistryLimits::default(),
-        )),
-        PolicyRegistryLimits::default(),
-    )
-    .unwrap()
+    crate::test_registry_for_workspace(root)
 }
 
 #[test]
@@ -335,34 +327,6 @@ fn wrong_kind_missing_cycles_and_hash_mismatches_fail_transactionally() {
 }
 
 #[test]
-fn cancellation_and_entry_budget_never_register_a_partial_policy() {
-    let temp = tempfile::tempdir().unwrap();
-    std::fs::write(temp.path().join("db.rqlp"), STORE).unwrap();
-    let mut registry = registry(temp.path());
-    registry.limits = registry.limits.with_max_endpoint_set_entries(3).unwrap();
-    assert!(
-        registry
-            .register_policy_bytes(
-                "p.rqlp".into(),
-                policy("test", &reference("db.rqlp")).as_bytes()
-            )
-            .is_err()
-    );
-    assert_eq!(registry.policies().len(), 0);
-    let token = CancellationToken::new();
-    token.cancel();
-    registry.set_cancellation(Some(token));
-    assert!(matches!(
-        registry.register_policy_bytes(
-            "p.rqlp".into(),
-            policy("test", &reference("db.rqlp")).as_bytes()
-        ),
-        Err(PolicyRegistryError::Cancelled)
-    ));
-    assert_eq!(registry.policies().len(), 0);
-}
-
-#[test]
 fn exhausted_import_bytes_and_mid_closure_cancellation_do_not_commit_cache() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("db.rqlp"), STORE).unwrap();
@@ -426,4 +390,153 @@ fn imported_symlink_cannot_escape_workspace() {
             )
             .is_err()
     );
+}
+
+#[test]
+fn cancellation_and_entry_budget_never_register_a_partial_policy() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("db.rqlp"), STORE).unwrap();
+    let mut registry = registry(temp.path());
+    registry.limits = registry.limits.with_max_endpoint_set_entries(3).unwrap();
+    assert!(
+        registry
+            .register_policy_bytes(
+                "p.rqlp".into(),
+                policy("test", &reference("db.rqlp")).as_bytes()
+            )
+            .is_err()
+    );
+    assert_eq!(registry.policies().len(), 0);
+    let token = CancellationToken::new();
+    token.cancel();
+    registry.set_cancellation(Some(token));
+    assert!(matches!(
+        registry.register_policy_bytes(
+            "p.rqlp".into(),
+            policy("test", &reference("db.rqlp")).as_bytes()
+        ),
+        Err(PolicyRegistryError::Cancelled)
+    ));
+    assert_eq!(registry.policies().len(), 0);
+}
+
+#[test]
+fn value_type_barrier_imports_preserve_proofs_provenance_and_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let leaf = r#"(endpoint-set-document :kind barriers :set (endpoint-set :entries [
+      (barrier :id boolean :value-type (intrinsic bool))]))"#;
+    let parent = r#"(endpoint-set-document :kind barriers :set (endpoint-set
+      :include-files [(endpoint-set-file :path "boolean.rqlp")]
+      :entries [(barrier :id fieldless :value-type (enum :fieldless true))]))"#;
+    std::fs::write(temp.path().join("boolean.rqlp"), leaf).unwrap();
+    std::fs::write(temp.path().join("types.rqlp"), parent).unwrap();
+    let source = policy("barrier-import", &reference("types.rqlp")).replace(":stores", ":barriers");
+    let mut first_registry = registry(temp.path());
+    let loaded = first_registry
+        .register_policy_bytes("policy.rqlp".into(), source.as_bytes())
+        .unwrap();
+    let barriers = &loaded.resolved_taint().unwrap().barriers;
+    assert_eq!(barriers.len(), 2);
+    assert_eq!(barriers[0].value_type, ValueTypePredicate::IntrinsicBool);
+    assert_eq!(barriers[1].value_type, ValueTypePredicate::FieldlessEnum);
+    assert_eq!(loaded.endpoint_set_dependencies().len(), 2);
+    assert!(barriers[0].origins.iter().any(|origin| matches!(origin,
+        EndpointOrigin::EndpointSetFile { source, .. } if source.as_str() == "boolean.rqlp"
+    )));
+    assert!(
+        loaded
+            .resolved_selectors()
+            .iter()
+            .all(|selector| !selector.path.as_str().starts_with("/analysis/barriers/"))
+    );
+    let first_hash = loaded.semantic_hash();
+    std::fs::write(
+        temp.path().join("boolean.rqlp"),
+        leaf.replace("(intrinsic bool)", "(enum :fieldless true)"),
+    )
+    .unwrap();
+    let mut changed_registry = registry(temp.path());
+    let changed = changed_registry
+        .register_policy_bytes("policy.rqlp".into(), source.as_bytes())
+        .unwrap();
+    assert_ne!(
+        first_hash,
+        changed.semantic_hash(),
+        "imported type predicates change policy meaning"
+    );
+
+    std::fs::write(
+        temp.path().join("boolean.rqlp"),
+        leaf.replace(":id boolean", ":id source"),
+    )
+    .unwrap();
+    let duplicate = registry(temp.path())
+        .register_policy_bytes("policy.rqlp".into(), source.as_bytes())
+        .unwrap_err();
+    assert!(
+        duplicate
+            .to_string()
+            .contains("duplicate endpoint entry ID `source`"),
+        "{duplicate}"
+    );
+    std::fs::write(
+        temp.path().join("types.rqlp"),
+        "(endpoint-set-document :kind sanitizers :set (endpoint-set))",
+    )
+    .unwrap();
+    let wrong_kind = registry(temp.path())
+        .register_policy_bytes("policy.rqlp".into(), source.as_bytes())
+        .unwrap_err();
+    assert!(
+        wrong_kind.to_string().contains("expected barriers"),
+        "{wrong_kind}"
+    );
+
+    let empty = policy("barrier-empty", "");
+    let explicit_empty = empty.replace(":stores", ":barriers");
+    let original_hash = registry(temp.path())
+        .register_policy_bytes("empty.rqlp".into(), empty.as_bytes())
+        .unwrap()
+        .semantic_hash();
+    let empty_hash = registry(temp.path())
+        .register_policy_bytes("empty.rqlp".into(), explicit_empty.as_bytes())
+        .unwrap()
+        .semantic_hash();
+    assert_eq!(
+        original_hash, empty_hash,
+        "empty barriers preserve pre-barrier policy hashes"
+    );
+}
+
+#[test]
+fn value_type_barrier_vocabulary_formats_hovers_and_rejects_unproven_syntax() {
+    use crate::source::{parse_rqlp_source, rqlp_source_help_at};
+    let document = r#"(endpoint-set-document :kind barriers :set (endpoint-set :entries [
+      (barrier :id boolean :value-type (intrinsic bool))
+      (barrier :id status :value-type (enum :fieldless true))]))"#;
+    let parsed = parse_rqlp_source(document, "barriers.rqlp".into()).unwrap();
+    let formatted = crate::format::format_rqlp_source(document).unwrap();
+    let reparsed = parse_rqlp_source(&formatted, "barriers.rqlp".into()).unwrap();
+    assert_eq!(
+        parsed.document().to_normalized_authored_json(),
+        reparsed.document().to_normalized_authored_json()
+    );
+    let hover = rqlp_source_help_at(document, document.find(":value-type").unwrap() + 2).unwrap();
+    assert!(hover.signature.contains("intrinsic bool"), "{hover:?}");
+    let intrinsic = rqlp_source_help_at(document, document.find("intrinsic").unwrap() + 2).unwrap();
+    assert_eq!(intrinsic.signature, "(intrinsic bool)");
+    for (old, new, rejected) in [
+        ("intrinsic bool", "intrinsic i32", "i32"),
+        ("fieldless true", "fieldless false", "false"),
+        (":id boolean", ":input return-value :id boolean", ":input"),
+        (":id status", ":id boolean", "boolean"),
+    ] {
+        let invalid = document.replace(old, new);
+        let error = parse_rqlp_source(&invalid, "barriers.rqlp".into()).unwrap_err();
+        assert_eq!(
+            &invalid[error.diagnostic.range.clone()],
+            rejected,
+            "{error:?}"
+        );
+    }
 }

@@ -11,6 +11,15 @@ MostRelevantFilesRankingModeValue = Literal[
 ]
 MostRelevantFilesIncompleteReasonValue = Literal["cancelled", "time_budget"]
 SymbolSourcesIncompleteReasonValue = Literal["cancelled"]
+DefinitionLookupIncompleteReasonValue = Literal[
+    "cancelled",
+    "time_budget",
+    "resolution_budget",
+    "analysis_failure",
+    "structure_unavailable",
+    "navigation_targets",
+]
+TooBroadMatchValue = Literal["files", "declarations"]
 TestFileKindValue = Literal["test", "test_support", "production", "ambiguous"]
 FileGraphCompletionValue = Literal["complete", "incomplete"]
 BlastRadiusBaseRecoveryValue = Literal["not_needed", "complete", "cancelled"]
@@ -54,10 +63,14 @@ MissingTestsIncompleteReasonValue = Literal[
     "reference_graph_stale",
 ]
 CyclomaticComplexityChangeValue = Literal["introduced", "edited"]
+DiffCallEdgeScopeValue = Literal["changed_lines", "changed_files", "omit"]
+CallAnalysisStatusValue = Literal["complete", "incomplete", "omitted"]
 _CODE_QUERY_EXECUTION_MODES = get_args(CodeQueryExecutionMode)
 _MOST_RELEVANT_FILES_RANKING_MODES = get_args(MostRelevantFilesRankingModeValue)
 _MOST_RELEVANT_FILES_INCOMPLETE_REASONS = get_args(MostRelevantFilesIncompleteReasonValue)
 _SYMBOL_SOURCES_INCOMPLETE_REASONS = get_args(SymbolSourcesIncompleteReasonValue)
+_DEFINITION_LOOKUP_INCOMPLETE_REASONS = get_args(DefinitionLookupIncompleteReasonValue)
+_TOO_BROAD_MATCH_KINDS = get_args(TooBroadMatchValue)
 _TEST_FILE_KINDS = get_args(TestFileKindValue)
 _FILE_GRAPH_COMPLETIONS = get_args(FileGraphCompletionValue)
 _BLAST_RADIUS_BASE_RECOVERIES = get_args(BlastRadiusBaseRecoveryValue)
@@ -67,6 +80,8 @@ _BLAST_RADIUS_SCOPE_KINDS = get_args(BlastRadiusScopeKindValue)
 _MISSING_TESTS_MODES = get_args(MissingTestsModeValue)
 _MISSING_TESTS_INCOMPLETE_REASONS = get_args(MissingTestsIncompleteReasonValue)
 _CYCLOMATIC_COMPLEXITY_CHANGES = get_args(CyclomaticComplexityChangeValue)
+_DIFF_CALL_EDGE_SCOPES = get_args(DiffCallEdgeScopeValue)
+_CALL_ANALYSIS_STATUSES = get_args(CallAnalysisStatusValue)
 _MISSING = object()
 
 
@@ -126,21 +141,32 @@ def _most_relevant_files_incomplete_reason(
 ) -> MostRelevantFilesIncompleteReasonValue | None:
     if value is None:
         return None
-    if value not in _MOST_RELEVANT_FILES_INCOMPLETE_REASONS:
-        expected = ", ".join(
-            repr(reason) for reason in _MOST_RELEVANT_FILES_INCOMPLETE_REASONS
-        )
-        raise ValueError(f"incomplete_reason must be one of {expected}, got {value!r}")
-    return cast(MostRelevantFilesIncompleteReasonValue, value)
+    return cast(
+        MostRelevantFilesIncompleteReasonValue,
+        _closed_value(
+            value,
+            _MOST_RELEVANT_FILES_INCOMPLETE_REASONS,
+            "incomplete_reason",
+        ),
+    )
+
+
+def _definition_lookup_incomplete_reason(
+    value: Any,
+) -> DefinitionLookupIncompleteReasonValue | None:
+    if value is None:
+        return None
+    return cast(
+        DefinitionLookupIncompleteReasonValue,
+        _closed_value(value, _DEFINITION_LOOKUP_INCOMPLETE_REASONS, "incomplete_reason"),
+    )
 
 
 def _symbol_sources_incomplete_reason(value: Any) -> SymbolSourcesIncompleteReasonValue:
-    if value not in _SYMBOL_SOURCES_INCOMPLETE_REASONS:
-        expected = ", ".join(
-            repr(reason) for reason in _SYMBOL_SOURCES_INCOMPLETE_REASONS
-        )
-        raise ValueError(f"reason must be one of {expected}, got {value!r}")
-    return cast(SymbolSourcesIncompleteReasonValue, value)
+    return cast(
+        SymbolSourcesIncompleteReasonValue,
+        _closed_value(value, _SYMBOL_SOURCES_INCOMPLETE_REASONS, "reason"),
+    )
 
 
 def _test_file_kind(value: Any) -> TestFileKindValue:
@@ -167,6 +193,90 @@ def _render_block(text: str, start_line: int, render_line_numbers: bool) -> str:
     if not render_line_numbers:
         return text
     return _render_numbered_block(text, start_line)
+
+
+def _render_path_range(
+    path: str, start_line: int, end_line: int, render_line_numbers: bool
+) -> str:
+    if render_line_numbers:
+        return f"{path}:{start_line}..{end_line}"
+    return path
+
+
+def _render_witness(
+    path: str,
+    location: CodeQueryRange,
+    witness_kind: str,
+    step_count: int,
+    truncated: bool,
+    reference: str,
+) -> str:
+    suffix = "; truncated" if truncated else ""
+    return (
+        f"{path}:{location.start_line}:{location.start_column} "
+        f"[{witness_kind} witness; {step_count} steps{suffix}; {reference}]"
+    )
+
+
+def _render_call_summary(
+    path: str,
+    location: CodeQueryRange,
+    label: str,
+    subject: str,
+    callee_symbol: str | None,
+    metric: str,
+    reason: str | None,
+) -> str:
+    header = (
+        f"{path}:{location.start_line}:{location.start_column} "
+        f"[{label}] {subject}"
+    )
+    detail = f"  {callee_symbol or 'unmodeled callee'}, {metric}"
+    if reason is not None:
+        detail += f", reason {reason}"
+    return f"{header}\n{detail}"
+
+
+def _render_symbol_result_sections(
+    blocks: list[str],
+    not_found: list[str],
+    ambiguous: list[Any],
+    empty_text: str,
+    trailing_blocks: list[str] | None = None,
+) -> str:
+    rendered_blocks = list(blocks)
+    if not_found:
+        rendered_blocks.append(f"Not found: {', '.join(not_found)}")
+    rendered_blocks.extend(item.render_text() for item in ambiguous)
+    if trailing_blocks:
+        rendered_blocks.extend(trailing_blocks)
+    return "\n\n".join(rendered_blocks) if rendered_blocks else empty_text
+
+
+def _render_file_search_results(
+    rendered_text: str | None,
+    files: list[Any],
+    truncated: bool,
+    total_files: int,
+    empty_text: str,
+) -> str:
+    if rendered_text is not None:
+        return rendered_text
+    blocks = [file.render_text() for file in files]
+    if not blocks:
+        return empty_text
+    text = "\n\n".join(blocks)
+    if truncated:
+        text += (
+            f"\n\nResults truncated: showing {len(files)} of {total_files} "
+            "files selected by recent activity when available. "
+            "Results are displayed alphabetically."
+        )
+    return text
+
+
+def _render_ambiguity(subject: str, matches: list[str]) -> str:
+    return f"Ambiguous {subject}: {', '.join(matches)}"
 
 
 @dataclass(frozen=True)
@@ -318,18 +428,13 @@ class SearchSymbolsResult:
         return len(self.files)
 
     def render_text(self) -> str:
-        if self.rendered_text is not None:
-            return self.rendered_text
-        blocks = [file.render_text() for file in self.files]
-        if not blocks:
-            return "No matching symbols found."
-        text = "\n\n".join(blocks)
-        if self.truncated:
-            text += (
-                f"\n\nResults truncated: showing {len(self.files)} of {self.total_files} "
-                "files selected by recent activity when available. Results are displayed alphabetically."
-            )
-        return text
+        return _render_file_search_results(
+            self.rendered_text,
+            self.files,
+            self.truncated,
+            self.total_files,
+            "No matching symbols found.",
+        )
 
 
 @dataclass(frozen=True)
@@ -479,6 +584,134 @@ def _query_provenance(data: dict) -> list[CodeQueryProvenance]:
     return [CodeQueryProvenance.from_dict(item) for item in data.get("provenance", [])]
 
 
+def _query_source_location_fields(data: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "path": data["path"],
+        "language": data["language"],
+        "range": CodeQueryRange.from_dict(data["range"]),
+    }
+
+
+def _query_record_location_fields(data: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": data["id"],
+        **_query_source_location_fields(data),
+        "start_byte": data["start_byte"],
+        "end_byte": data["end_byte"],
+    }
+
+
+def _query_ast_record_location_fields(data: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": data["id"],
+        "ast_id": data["ast_id"],
+        **_query_source_location_fields(data),
+        "start_byte": data["start_byte"],
+        "end_byte": data["end_byte"],
+    }
+
+
+def _query_provenance_fields(data: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "provenance": _query_provenance(data),
+        "provenance_truncated": bool(data.get("provenance_truncated", False)),
+    }
+
+
+def _result_contract_site_fields(data: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": data["id"],
+        "acquisition_id": data["acquisition_id"],
+        "acquisition_site_id": data["acquisition_site_id"],
+        "acquisition_site_ast_id": data["acquisition_site_ast_id"],
+        **_query_source_location_fields(data),
+        **_query_provenance_fields(data),
+    }
+
+
+def _receiver_dispatch_outcome_fields(data: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": data["id"],
+        "site_id": data["site_id"],
+        **_query_source_location_fields(data),
+        "outcome": data["outcome"],
+        "coverage": data["coverage"],
+        "site_ast_id": data.get("site_ast_id"),
+        "semantic_unsupported": data.get("semantic_unsupported"),
+        **_query_provenance_fields(data),
+    }
+
+
+def _query_analysis_fields(data: dict[str, Any]) -> dict[str, Any]:
+    return {
+        **_query_source_location_fields(data),
+        "text": data["text"],
+        "input_kind": data["input_kind"],
+        "outcome": data["outcome"],
+        "capture": data.get("capture"),
+        "reason": data.get("reason"),
+        "limit": data.get("limit"),
+        **_query_provenance_fields(data),
+    }
+
+
+def _query_declaration_line_fields(data: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "path": data["path"],
+        "language": data["language"],
+        "kind": data["kind"],
+        "start_line": int(data["start_line"]),
+        "end_line": int(data["end_line"]),
+        **_query_provenance_fields(data),
+    }
+
+
+def _bounded_witness_fields(data: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "witness_index": _strict_nonnegative_int(data, "witness_index"),
+        "evidence": CodeQuerySemanticEvidence.from_dict(data["evidence"]),
+        "steps": tuple(
+            CodeQueryFlowWitnessStep.from_dict(step)
+            for step in _strict_list(data, "steps")
+        ),
+        "retained_bytes": _strict_nonnegative_int(data, "retained_bytes"),
+        "omitted_steps_lower_bound": _strict_nonnegative_int(
+            data, "omitted_steps_lower_bound"
+        ),
+        "truncated": _strict_bool(data, "truncated", False),
+        "alternatives_truncated": _strict_bool(
+            data, "alternatives_truncated", False
+        ),
+        "retention_truncated": _strict_bool(data, "retention_truncated", False),
+    }
+
+
+def _typestate_context_fields(data: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "subject": CodeQueryTypestateSubject.from_dict(data["subject"]),
+        "uncertainty": tuple(
+            CodeQueryTypestateUncertainty(value)
+            for value in _strict_list(data, "uncertainty", [])
+        ),
+        "abstained": _strict_bool(data, "abstained", False),
+        **_query_provenance_fields(data),
+    }
+
+
+def _query_reference_site_fields(data: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "target": CodeQueryDeclaration.from_dict(data["target"]),
+        "enclosing_declaration": CodeQueryDeclaration.from_dict(
+            data["enclosing_declaration"]
+        )
+        if "enclosing_declaration" in data
+        else None,
+        "usage_kind": data["usage_kind"],
+        "proof": data["proof"],
+        "reference_kind": data.get("reference_kind"),
+    }
+
+
 def _optional_range(data: dict, key: str) -> CodeQueryRange | None:
     value = data.get(key)
     return CodeQueryRange.from_dict(value) if value is not None else None
@@ -509,11 +742,7 @@ class CodeQueryMatch:
     @classmethod
     def from_dict(cls, data: dict) -> CodeQueryMatch:
         return cls(
-            path=data["path"],
-            language=data["language"],
-            kind=data["kind"],
-            start_line=int(data["start_line"]),
-            end_line=int(data["end_line"]),
+            **_query_declaration_line_fields(data),
             text=data["text"],
             captures=[
                 CodeQueryCapture.from_dict(item) for item in data.get("captures", [])
@@ -530,8 +759,6 @@ class CodeQueryMatch:
                 for item in data.get("decorator_ranges", [])
             ],
             enclosing_symbol=data.get("enclosing_symbol"),
-            provenance=_query_provenance(data),
-            provenance_truncated=bool(data.get("provenance_truncated", False)),
         )
 
     def render_text(self) -> str:
@@ -567,20 +794,14 @@ class CodeQueryDeclaration:
     @classmethod
     def from_dict(cls, data: dict) -> CodeQueryDeclaration:
         return cls(
-            path=data["path"],
-            language=data["language"],
-            kind=data["kind"],
+            **_query_declaration_line_fields(data),
             fq_name=data["fq_name"],
-            start_line=int(data["start_line"]),
-            end_line=int(data["end_line"]),
             signature=data.get("signature"),
             id=data.get("id"),
             site_id=data.get("site_id"),
             node_range=CodeQueryRange.from_dict(data["node_range"])
             if "node_range" in data
             else None,
-            provenance=_query_provenance(data),
-            provenance_truncated=bool(data.get("provenance_truncated", False)),
         )
 
     def render_text(self) -> str:
@@ -626,6 +847,19 @@ class CodeQuerySemanticEvidence:
         )
 
 
+def _render_evidence_location(
+    path: str,
+    location: CodeQueryRange,
+    evidence: CodeQuerySemanticEvidence,
+    description: str,
+) -> str:
+    return (
+        f"{path}:{location.start_line}:{location.start_column} "
+        f"[{description}; proof={evidence.proof.value}; "
+        f"completeness={evidence.completeness.value}]"
+    )
+
+
 @dataclass(frozen=True)
 class CodeQueryProgramPointRef:
     id: str
@@ -666,20 +900,18 @@ class CodeQueryProcedure:
         return cls(
             id=data["id"],
             artifact_id=data["artifact_id"],
-            path=data["path"],
-            language=data["language"],
+            **_query_source_location_fields(data),
             procedure_kind=data["procedure_kind"],
-            range=CodeQueryRange.from_dict(data["range"]),
             evidence=CodeQuerySemanticEvidence.from_dict(data["evidence"]),
-            provenance=_query_provenance(data),
-            provenance_truncated=bool(data.get("provenance_truncated", False)),
+            **_query_provenance_fields(data),
         )
 
     def render_text(self) -> str:
-        return (
-            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
-            f"[procedure; {self.procedure_kind}; proof={self.evidence.proof.value}; "
-            f"completeness={self.evidence.completeness.value}]"
+        return _render_evidence_location(
+            self.path,
+            self.range,
+            self.evidence,
+            f"procedure; {self.procedure_kind}",
         )
 
 
@@ -701,9 +933,7 @@ class CodeQueryProgramPoint:
         return cls(
             id=data["id"],
             procedure_id=data["procedure_id"],
-            path=data["path"],
-            language=data["language"],
-            range=CodeQueryRange.from_dict(data["range"]),
+            **_query_source_location_fields(data),
             boundary=(
                 CodeQueryProgramPointBoundary(data["boundary"])
                 if data.get("boundary") is not None
@@ -711,17 +941,16 @@ class CodeQueryProgramPoint:
             ),
             event_count=int(data["event_count"]),
             evidence=CodeQuerySemanticEvidence.from_dict(data["evidence"]),
-            provenance=_query_provenance(data),
-            provenance_truncated=bool(data.get("provenance_truncated", False)),
+            **_query_provenance_fields(data),
         )
 
     def render_text(self) -> str:
         boundary = self.boundary.value if self.boundary is not None else "ordinary"
-        return (
-            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
-            f"[program point; {boundary}; {self.event_count} events; "
-            f"proof={self.evidence.proof.value}; "
-            f"completeness={self.evidence.completeness.value}]"
+        return _render_evidence_location(
+            self.path,
+            self.range,
+            self.evidence,
+            f"program point; {boundary}; {self.event_count} events",
         )
 
 
@@ -744,23 +973,23 @@ class CodeQueryControlEdge:
         return cls(
             id=data["id"],
             procedure_id=data["procedure_id"],
-            path=data["path"],
-            language=data["language"],
-            range=CodeQueryRange.from_dict(data["range"]),
+            **_query_source_location_fields(data),
             edge_kind=data["edge_kind"],
             source=CodeQueryProgramPointRef.from_dict(data["source"]),
             target=CodeQueryProgramPointRef.from_dict(data["target"]),
             evidence=CodeQuerySemanticEvidence.from_dict(data["evidence"]),
-            provenance=_query_provenance(data),
-            provenance_truncated=bool(data.get("provenance_truncated", False)),
+            **_query_provenance_fields(data),
         )
 
     def render_text(self) -> str:
         return (
-            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
-            f"[control edge; {self.edge_kind}; proof={self.evidence.proof.value}; "
-            f"completeness={self.evidence.completeness.value}] "
-            f"{self.source.id} -> {self.target.id}"
+            _render_evidence_location(
+                self.path,
+                self.range,
+                self.evidence,
+                f"control edge; {self.edge_kind}",
+            )
+            + f" {self.source.id} -> {self.target.id}"
         )
 
 
@@ -854,24 +1083,15 @@ class CodeQueryTypestateFinding:
             protocol_ref=data["protocol_ref"],
             protocol_hash=data["protocol_hash"],
             binding_plan_hash=data["binding_plan_hash"],
-            subject=CodeQueryTypestateSubject.from_dict(data["subject"]),
             finding_kind=CodeQueryTypestateFindingKind.from_dict(data["finding_kind"]),
             certainty=CodeQueryTypestateCertainty(data["certainty"]),
-            path=data["path"],
-            language=data["language"],
-            range=CodeQueryRange.from_dict(data["range"]),
+            **_query_source_location_fields(data),
             path_proven=_strict_bool(data, "path_proven"),
             path_complete=_strict_bool(data, "path_complete"),
             analysis_complete=_strict_bool(data, "analysis_complete"),
             retained_witnesses=_strict_nonnegative_int(data, "retained_witnesses"),
             omitted_witnesses=_strict_nonnegative_int(data, "omitted_witnesses"),
-            uncertainty=tuple(
-                CodeQueryTypestateUncertainty(value)
-                for value in _strict_list(data, "uncertainty", [])
-            ),
-            abstained=_strict_bool(data, "abstained", False),
-            provenance=_query_provenance(data),
-            provenance_truncated=bool(data.get("provenance_truncated", False)),
+            **_typestate_context_fields(data),
         )
 
     def render_text(self) -> str:
@@ -904,6 +1124,24 @@ class CodeQueryTypestateWitnessStepKind:
         return cls(type=kind)
 
 
+def _witness_step_fields(data: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "kind": CodeQueryTypestateWitnessStepKind.from_dict(data["kind"]),
+        "source": CodeQuerySourceSite.from_dict(data["source"]),
+        "evidence": CodeQuerySemanticEvidence.from_dict(data["evidence"]),
+        "target": (
+            CodeQuerySourceSite.from_dict(data["target"])
+            if "target" in data
+            else None
+        ),
+        "origin": (
+            CodeQuerySourceSite.from_dict(data["origin"])
+            if "origin" in data
+            else None
+        ),
+    }
+
+
 @dataclass(frozen=True)
 class CodeQueryTypestateWitnessStep:
     kind: CodeQueryTypestateWitnessStepKind
@@ -914,21 +1152,7 @@ class CodeQueryTypestateWitnessStep:
 
     @classmethod
     def from_dict(cls, data: dict) -> CodeQueryTypestateWitnessStep:
-        return cls(
-            kind=CodeQueryTypestateWitnessStepKind.from_dict(data["kind"]),
-            source=CodeQuerySourceSite.from_dict(data["source"]),
-            evidence=CodeQuerySemanticEvidence.from_dict(data["evidence"]),
-            target=(
-                CodeQuerySourceSite.from_dict(data["target"])
-                if "target" in data
-                else None
-            ),
-            origin=(
-                CodeQuerySourceSite.from_dict(data["origin"])
-                if "origin" in data
-                else None
-            ),
-        )
+        return cls(**_witness_step_fields(data))
 
 
 @dataclass(frozen=True)
@@ -964,18 +1188,11 @@ class CodeQueryTypestateWitness:
             protocol_ref=data["protocol_ref"],
             protocol_hash=data["protocol_hash"],
             binding_plan_hash=data["binding_plan_hash"],
-            subject=CodeQueryTypestateSubject.from_dict(data["subject"]),
-            witness_index=_strict_nonnegative_int(data, "witness_index"),
             observed_state=data.get("observed_state"),
-            path=data["path"],
-            language=data["language"],
-            range=CodeQueryRange.from_dict(data["range"]),
+            **_query_source_location_fields(data),
+            witness_index=_strict_nonnegative_int(data, "witness_index"),
             evidence=CodeQuerySemanticEvidence.from_dict(data["evidence"]),
-            uncertainty=tuple(
-                CodeQueryTypestateUncertainty(value)
-                for value in _strict_list(data, "uncertainty", [])
-            ),
-            abstained=_strict_bool(data, "abstained", False),
+            **_typestate_context_fields(data),
             steps=tuple(
                 CodeQueryTypestateWitnessStep.from_dict(step)
                 for step in _strict_list(data, "steps")
@@ -989,15 +1206,16 @@ class CodeQueryTypestateWitness:
                 data, "alternatives_truncated", False
             ),
             retention_truncated=_strict_bool(data, "retention_truncated", False),
-            provenance=_query_provenance(data),
-            provenance_truncated=bool(data.get("provenance_truncated", False)),
         )
 
     def render_text(self) -> str:
-        suffix = "; truncated" if self.truncated else ""
-        return (
-            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
-            f"[typestate witness; {len(self.steps)} steps{suffix}; {self.protocol_ref}]"
+        return _render_witness(
+            self.path,
+            self.range,
+            "typestate",
+            len(self.steps),
+            self.truncated,
+            self.protocol_ref,
         )
 
 
@@ -1326,19 +1544,7 @@ class CodeQueryFlowWitnessStep:
     @classmethod
     def from_dict(cls, data: dict) -> CodeQueryFlowWitnessStep:
         return cls(
-            kind=CodeQueryTypestateWitnessStepKind.from_dict(data["kind"]),
-            source=CodeQuerySourceSite.from_dict(data["source"]),
-            evidence=CodeQuerySemanticEvidence.from_dict(data["evidence"]),
-            target=(
-                CodeQuerySourceSite.from_dict(data["target"])
-                if "target" in data
-                else None
-            ),
-            origin=(
-                CodeQuerySourceSite.from_dict(data["origin"])
-                if "origin" in data
-                else None
-            ),
+            **_witness_step_fields(data),
             boundary=data.get("boundary"),
             source_symbol=(
                 CodeQueryFlowSymbolSite.from_dict(data["source_symbol"])
@@ -1393,33 +1599,19 @@ class CodeQueryFlowWitness:
             id=data["id"],
             endpoint_id=data["endpoint_id"],
             plan_ref=data["plan_ref"],
-            witness_index=_strict_nonnegative_int(data, "witness_index"),
-            path=data["path"],
-            language=data["language"],
-            range=CodeQueryRange.from_dict(data["range"]),
-            evidence=CodeQuerySemanticEvidence.from_dict(data["evidence"]),
-            steps=tuple(
-                CodeQueryFlowWitnessStep.from_dict(step)
-                for step in _strict_list(data, "steps")
-            ),
-            retained_bytes=_strict_nonnegative_int(data, "retained_bytes"),
-            omitted_steps_lower_bound=_strict_nonnegative_int(
-                data, "omitted_steps_lower_bound"
-            ),
-            truncated=_strict_bool(data, "truncated", False),
-            alternatives_truncated=_strict_bool(
-                data, "alternatives_truncated", False
-            ),
-            retention_truncated=_strict_bool(data, "retention_truncated", False),
-            provenance=_query_provenance(data),
-            provenance_truncated=bool(data.get("provenance_truncated", False)),
+            **_query_source_location_fields(data),
+            **_bounded_witness_fields(data),
+            **_query_provenance_fields(data),
         )
 
     def render_text(self) -> str:
-        suffix = "; truncated" if self.truncated else ""
-        return (
-            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
-            f"[flow witness; {len(self.steps)} steps{suffix}; {self.plan_ref}]"
+        return _render_witness(
+            self.path,
+            self.range,
+            "flow",
+            len(self.steps),
+            self.truncated,
+            self.plan_ref,
         )
 
 
@@ -1459,24 +1651,8 @@ class CodeQueryAbsentMemberWitness:
         return cls(
             id=data["id"],
             finding_id=data["finding_id"],
-            witness_index=_strict_nonnegative_int(data, "witness_index"),
-            path=data["path"],
-            language=data["language"],
-            range=CodeQueryRange.from_dict(data["range"]),
-            evidence=CodeQuerySemanticEvidence.from_dict(data["evidence"]),
-            steps=tuple(
-                CodeQueryFlowWitnessStep.from_dict(step)
-                for step in _strict_list(data, "steps")
-            ),
-            retained_bytes=_strict_nonnegative_int(data, "retained_bytes"),
-            omitted_steps_lower_bound=_strict_nonnegative_int(
-                data, "omitted_steps_lower_bound"
-            ),
-            truncated=_strict_bool(data, "truncated", False),
-            alternatives_truncated=_strict_bool(
-                data, "alternatives_truncated", False
-            ),
-            retention_truncated=_strict_bool(data, "retention_truncated", False),
+            **_query_source_location_fields(data),
+            **_bounded_witness_fields(data),
             witness_status=CodeQueryAbsentMemberWitnessStatus(data["witness_status"]),
             unavailable_reason=data.get("unavailable_reason"),
         )
@@ -1526,8 +1702,7 @@ class CodeQueryClassSetRow:
             class_name=data.get("class"),
             origin=data["origin"],
             status=CodeQueryClassSetStatus(data["status"]),
-            provenance=_query_provenance(data),
-            provenance_truncated=bool(data.get("provenance_truncated", False)),
+            **_query_provenance_fields(data),
         )
 
     def render_text(self) -> str:
@@ -1616,24 +1791,8 @@ class CodeQueryTaintWitness:
         return cls(
             id=data["id"],
             finding_id=data["finding_id"],
-            witness_index=_strict_nonnegative_int(data, "witness_index"),
-            path=data["path"],
-            language=data["language"],
-            range=CodeQueryRange.from_dict(data["range"]),
-            evidence=CodeQuerySemanticEvidence.from_dict(data["evidence"]),
-            steps=tuple(
-                CodeQueryFlowWitnessStep.from_dict(step)
-                for step in _strict_list(data, "steps")
-            ),
-            retained_bytes=_strict_nonnegative_int(data, "retained_bytes"),
-            omitted_steps_lower_bound=_strict_nonnegative_int(
-                data, "omitted_steps_lower_bound"
-            ),
-            truncated=_strict_bool(data, "truncated", False),
-            alternatives_truncated=_strict_bool(
-                data, "alternatives_truncated", False
-            ),
-            retention_truncated=_strict_bool(data, "retention_truncated", False),
+            **_query_source_location_fields(data),
+            **_bounded_witness_fields(data),
         )
 
 
@@ -1714,8 +1873,7 @@ class CodeQueryFile:
             language=data["language"],
             package_fq=data.get("package_fq"),
             package_syntactic=data.get("package_syntactic"),
-            provenance=_query_provenance(data),
-            provenance_truncated=bool(data.get("provenance_truncated", False)),
+            **_query_provenance_fields(data),
         )
 
     def render_text(self) -> str:
@@ -1742,20 +1900,9 @@ class CodeQueryReferenceSite:
     @classmethod
     def from_dict(cls, data: dict) -> CodeQueryReferenceSite:
         return cls(
-            path=data["path"],
-            language=data["language"],
-            range=CodeQueryRange.from_dict(data["range"]),
-            target=CodeQueryDeclaration.from_dict(data["target"]),
-            enclosing_declaration=CodeQueryDeclaration.from_dict(
-                data["enclosing_declaration"]
-            )
-            if "enclosing_declaration" in data
-            else None,
-            usage_kind=data["usage_kind"],
-            proof=data["proof"],
-            reference_kind=data.get("reference_kind"),
-            provenance=_query_provenance(data),
-            provenance_truncated=bool(data.get("provenance_truncated", False)),
+            **_query_source_location_fields(data),
+            **_query_reference_site_fields(data),
+            **_query_provenance_fields(data),
         )
 
     def render_text(self) -> str:
@@ -1808,9 +1955,7 @@ class CodeQueryCallSite:
     @classmethod
     def from_dict(cls, data: dict) -> CodeQueryCallSite:
         return cls(
-            path=data["path"],
-            language=data["language"],
-            range=CodeQueryRange.from_dict(data["range"]),
+            **_query_source_location_fields(data),
             callee_range=CodeQueryRange.from_dict(data["callee_range"]),
             caller=CodeQueryDeclaration.from_dict(data["caller"]),
             callee=CodeQueryDeclaration.from_dict(data["callee"]),
@@ -1823,8 +1968,7 @@ class CodeQueryCallSite:
                 CodeQueryCallArgument.from_dict(item)
                 for item in data.get("arguments", [])
             ],
-            provenance=_query_provenance(data),
-            provenance_truncated=bool(data.get("provenance_truncated", False)),
+            **_query_provenance_fields(data),
         )
 
     def render_text(self) -> str:
@@ -1975,13 +2119,7 @@ class CodeQueryReceiverAnalysis:
     def from_dict(cls, data: dict) -> CodeQueryReceiverAnalysis:
         return cls(
             analysis_kind=data["analysis_kind"],
-            path=data["path"],
-            language=data["language"],
-            range=CodeQueryRange.from_dict(data["range"]),
-            text=data["text"],
-            input_kind=data["input_kind"],
-            outcome=data["outcome"],
-            capture=data.get("capture"),
+            **_query_analysis_fields(data),
             values=[
                 CodeQueryReceiverValue.from_dict(item)
                 for item in data.get("values", [])
@@ -1990,10 +2128,6 @@ class CodeQueryReceiverAnalysis:
                 CodeQueryDeclaration.from_dict(item)
                 for item in data.get("member_targets", [])
             ],
-            reason=data.get("reason"),
-            limit=data.get("limit"),
-            provenance=_query_provenance(data),
-            provenance_truncated=bool(data.get("provenance_truncated", False)),
         )
 
     def render_text(self) -> str:
@@ -2097,8 +2231,7 @@ class CodeQueryOccurrence:
             target=CodeQueryOccurrenceTarget.from_dict(data["target"]),
             enclosing_symbol=data.get("enclosing_symbol"),
             decoded_spelling=data.get("decoded_spelling"),
-            provenance=_query_provenance(data),
-            provenance_truncated=bool(data.get("provenance_truncated", False)),
+            **_query_provenance_fields(data),
         )
 
     @property
@@ -2154,8 +2287,7 @@ class CodeQueryLexicalScope:
             ast_id=data.get("ast_id"),
             kind=data.get("kind"),
             parent_index=data.get("parent_index"),
-            provenance=_query_provenance(data),
-            provenance_truncated=bool(data.get("provenance_truncated", False)),
+            **_query_provenance_fields(data),
         )
 
     def render_text(self) -> str:
@@ -2343,13 +2475,7 @@ class CodeQueryResolutionCandidate:
     @classmethod
     def from_dict(cls, data: dict) -> CodeQueryResolutionCandidate:
         return cls(
-            id=data["id"],
-            ast_id=data["ast_id"],
-            path=data["path"],
-            language=data["language"],
-            range=CodeQueryRange.from_dict(data["range"]),
-            start_byte=data["start_byte"],
-            end_byte=data["end_byte"],
+            **_query_ast_record_location_fields(data),
             ordinal=data["ordinal"],
             outcome=data["outcome"],
             boundary=data["boundary"],
@@ -2359,8 +2485,7 @@ class CodeQueryResolutionCandidate:
             tier=data.get("tier"),
             rejection_reason=data.get("rejection_reason"),
             external_target=data.get("external_target"),
-            provenance=_query_provenance(data),
-            provenance_truncated=bool(data.get("provenance_truncated", False)),
+            **_query_provenance_fields(data),
         )
 
     def render_text(self) -> str:
@@ -2424,28 +2549,14 @@ class CodeQueryReferenceEdge:
     @classmethod
     def from_dict(cls, data: dict) -> CodeQueryReferenceEdge:
         return cls(
-            id=data["id"],
-            path=data["path"],
-            language=data["language"],
-            range=CodeQueryRange.from_dict(data["range"]),
-            start_byte=data["start_byte"],
-            end_byte=data["end_byte"],
-            target=CodeQueryDeclaration.from_dict(data["target"]),
-            proof=data["proof"],
-            usage_kind=data["usage_kind"],
+            **_query_record_location_fields(data),
+            **_query_reference_site_fields(data),
             site_class=data["site_class"],
             owner_relation=data["owner_relation"],
             provenance_direction=data["edge_provenance"],
             generation=int(data["generation"]),
             ast_id=data.get("ast_id"),
-            enclosing_declaration=CodeQueryDeclaration.from_dict(
-                data["enclosing_declaration"]
-            )
-            if "enclosing_declaration" in data
-            else None,
-            reference_kind=data.get("reference_kind"),
-            provenance=_query_provenance(data),
-            provenance_truncated=bool(data.get("provenance_truncated", False)),
+            **_query_provenance_fields(data),
         )
 
     def render_text(self) -> str:
@@ -2460,6 +2571,19 @@ class CodeQueryReferenceEdge:
             f"generation {self.generation}"
         )
         return f"{header}\n{detail}"
+
+
+def _query_state_event_fields(data: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": data["id"],
+        "path": data["path"],
+        "range": CodeQueryRange.from_dict(data["range"]),
+        "event_class": data["event_class"],
+        "subject": data["subject"],
+        "program_point": int(data["program_point"]),
+        "ast_id": data.get("ast_id"),
+        "member": data.get("member"),
+    }
 
 
 @dataclass(frozen=True)
@@ -2477,16 +2601,7 @@ class CodeQueryStateEventRef:
 
     @classmethod
     def from_dict(cls, data: dict) -> CodeQueryStateEventRef:
-        return cls(
-            id=data["id"],
-            path=data["path"],
-            range=CodeQueryRange.from_dict(data["range"]),
-            event_class=data["event_class"],
-            subject=data["subject"],
-            program_point=int(data["program_point"]),
-            ast_id=data.get("ast_id"),
-            member=data.get("member"),
-        )
+        return cls(**_query_state_event_fields(data))
 
 
 @dataclass(frozen=True)
@@ -2531,25 +2646,17 @@ class CodeQueryStateEvent:
     @classmethod
     def from_dict(cls, data: dict) -> CodeQueryStateEvent:
         return cls(
-            id=data["id"],
+            **_query_state_event_fields(data),
             procedure_id=data["procedure_id"],
-            path=data["path"],
             language=data["language"],
-            range=CodeQueryRange.from_dict(data["range"]),
             start_byte=data["start_byte"],
             end_byte=data["end_byte"],
-            event_class=data["event_class"],
-            subject=data["subject"],
             subject_value=int(data["subject_value"]),
-            program_point=int(data["program_point"]),
             value=int(data["value"]),
             completeness=data["completeness"],
             generation=int(data["generation"]),
-            ast_id=data.get("ast_id"),
-            member=data.get("member"),
             uncovered_axes=list(data.get("uncovered_axes", [])),
-            provenance=_query_provenance(data),
-            provenance_truncated=bool(data.get("provenance_truncated", False)),
+            **_query_provenance_fields(data),
         )
 
     def render_text(self) -> str:
@@ -2566,6 +2673,23 @@ class CodeQueryStateEvent:
         if self.uncovered_axes:
             lines.append(f"  uncovered axes: {', '.join(self.uncovered_axes)}")
         return "\n".join(lines)
+
+
+def _query_relation_identity_fields(data: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": data["id"],
+        "procedure_id": data["procedure_id"],
+        **_query_source_location_fields(data),
+        "relation": data["relation"],
+        "certainty": data["certainty"],
+    }
+
+
+def _query_relation_completion_fields(data: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "completeness": data["completeness"],
+        "generation": int(data["generation"]),
+    }
 
 
 @dataclass(frozen=True)
@@ -2600,20 +2724,12 @@ class CodeQueryFlowRelation:
     @classmethod
     def from_dict(cls, data: dict) -> CodeQueryFlowRelation:
         return cls(
-            id=data["id"],
-            procedure_id=data["procedure_id"],
-            path=data["path"],
-            language=data["language"],
-            range=CodeQueryRange.from_dict(data["range"]),
-            relation=data["relation"],
-            certainty=data["certainty"],
+            **_query_relation_identity_fields(data),
             source=CodeQueryStateEventRef.from_dict(data["source"]),
             target=CodeQueryStateEventRef.from_dict(data["target"]),
-            completeness=data["completeness"],
-            generation=int(data["generation"]),
+            **_query_relation_completion_fields(data),
             uncovered_axes=list(data.get("uncovered_axes", [])),
-            provenance=_query_provenance(data),
-            provenance_truncated=bool(data.get("provenance_truncated", False)),
+            **_query_provenance_fields(data),
         )
 
     def render_text(self) -> str:
@@ -2764,16 +2880,9 @@ class CodeQueryQualifiedPath:
     @classmethod
     def from_dict(cls, data: dict) -> CodeQueryQualifiedPath:
         return cls(
-            id=data["id"],
-            ast_id=data["ast_id"],
-            path=data["path"],
-            language=data["language"],
-            range=CodeQueryRange.from_dict(data["range"]),
-            start_byte=data["start_byte"],
-            end_byte=data["end_byte"],
+            **_query_ast_record_location_fields(data),
             segment_count=data["segment_count"],
-            provenance=_query_provenance(data),
-            provenance_truncated=bool(data.get("provenance_truncated", False)),
+            **_query_provenance_fields(data),
         )
 
     def render_text(self) -> str:
@@ -2815,12 +2924,7 @@ class CodeQueryPathSegment:
     @classmethod
     def from_dict(cls, data: dict) -> CodeQueryPathSegment:
         return cls(
-            id=data["id"],
-            path=data["path"],
-            language=data["language"],
-            range=CodeQueryRange.from_dict(data["range"]),
-            start_byte=data["start_byte"],
-            end_byte=data["end_byte"],
+            **_query_record_location_fields(data),
             path_ast_id=data["path_ast_id"],
             ordinal=data["ordinal"],
             text=data["text"],
@@ -2829,8 +2933,7 @@ class CodeQueryPathSegment:
             generic_arity=data.get("generic_arity"),
             resolution_status=data.get("resolution_status"),
             target_count=data.get("target_count"),
-            provenance=_query_provenance(data),
-            provenance_truncated=bool(data.get("provenance_truncated", False)),
+            **_query_provenance_fields(data),
         )
 
     def render_text(self) -> str:
@@ -2899,12 +3002,7 @@ class CodeQueryGenerationSite:
     @classmethod
     def from_dict(cls, data: dict) -> CodeQueryGenerationSite:
         return cls(
-            id=data["id"],
-            path=data["path"],
-            language=data["language"],
-            range=CodeQueryRange.from_dict(data["range"]),
-            start_byte=data["start_byte"],
-            end_byte=data["end_byte"],
+            **_query_record_location_fields(data),
             kind=data["kind"],
             input=data["input"],
             generated_count=data["generated_count"],
@@ -2913,8 +3011,7 @@ class CodeQueryGenerationSite:
                 for entry in data.get("generated", [])
             ],
             ast_id=data.get("ast_id"),
-            provenance=_query_provenance(data),
-            provenance_truncated=bool(data.get("provenance_truncated", False)),
+            **_query_provenance_fields(data),
         )
 
     def render_text(self) -> str:
@@ -2948,18 +3045,12 @@ class CodeQueryExport:
     @classmethod
     def from_dict(cls, data: dict) -> CodeQueryExport:
         return cls(
-            id=data["id"],
-            path=data["path"],
-            language=data["language"],
-            range=CodeQueryRange.from_dict(data["range"]),
-            start_byte=data["start_byte"],
-            end_byte=data["end_byte"],
+            **_query_record_location_fields(data),
             form=data["form"],
             exported_name=data["exported_name"],
             ast_id=data.get("ast_id"),
             target_fq_name=data.get("target_fq_name"),
-            provenance=_query_provenance(data),
-            provenance_truncated=bool(data.get("provenance_truncated", False)),
+            **_query_provenance_fields(data),
         )
 
     def render_text(self) -> str:
@@ -3060,9 +3151,7 @@ class CodeQueryJsxAttributeValue:
         return cls(
             id=data["id"],
             ast_id=data["ast_id"],
-            path=data["path"],
-            language=data["language"],
-            range=CodeQueryRange.from_dict(data["range"]),
+            **_query_source_location_fields(data),
             text=data["text"],
             element_identity=data["element_identity"],
             attribute_kind=data["attribute_kind"],
@@ -3073,8 +3162,7 @@ class CodeQueryJsxAttributeValue:
             reason=data.get("reason"),
             component=_optional_declaration(data, "component"),
             attribute_target=_optional_declaration(data, "attribute_target"),
-            provenance=_query_provenance(data),
-            provenance_truncated=bool(data.get("provenance_truncated", False)),
+            **_query_provenance_fields(data),
         )
 
     def render_text(self) -> str:
@@ -3179,24 +3267,14 @@ class CodeQueryMemberTargetAnalysis:
     def from_dict(cls, data: dict) -> CodeQueryMemberTargetAnalysis:
         return cls(
             site_id=data["site_id"],
-            path=data["path"],
-            language=data["language"],
-            range=CodeQueryRange.from_dict(data["range"]),
-            text=data["text"],
-            input_kind=data["input_kind"],
-            outcome=data["outcome"],
+            **_query_analysis_fields(data),
             coverage=data["coverage"],
             site_ast_id=data.get("site_ast_id"),
             member_range=_optional_range(data, "member_range"),
-            capture=data.get("capture"),
             member_targets=[
                 CodeQueryMemberTarget.from_dict(item)
                 for item in data.get("member_targets", [])
             ],
-            reason=data.get("reason"),
-            limit=data.get("limit"),
-            provenance=_query_provenance(data),
-            provenance_truncated=bool(data.get("provenance_truncated", False)),
         )
 
     def render_text(self) -> str:
@@ -3244,25 +3322,15 @@ class CodeQueryReceiverOutcome:
     @classmethod
     def from_dict(cls, data: dict) -> CodeQueryReceiverOutcome:
         return cls(
-            id=data["id"],
-            site_id=data["site_id"],
-            path=data["path"],
-            language=data["language"],
-            range=CodeQueryRange.from_dict(data["range"]),
+            **_receiver_dispatch_outcome_fields(data),
             analysis_kind=data["analysis_kind"],
-            outcome=data["outcome"],
-            coverage=data["coverage"],
             candidate_count=int(data["candidate_count"]),
             candidates_truncated=bool(data["candidates_truncated"]),
             setup_nodes=int(data["setup_nodes"]),
             summary_expansions=int(data["summary_expansions"]),
             scope_nodes=int(data["scope_nodes"]),
-            site_ast_id=data.get("site_ast_id"),
             reason=data.get("reason"),
             limit=data.get("limit"),
-            semantic_unsupported=data.get("semantic_unsupported"),
-            provenance=_query_provenance(data),
-            provenance_truncated=bool(data.get("provenance_truncated", False)),
         )
 
     def render_text(self) -> str:
@@ -3517,17 +3585,14 @@ class CodeQueryCallShape:
             id=data["id"],
             site_id=data["site_id"],
             site_ast_id=data["site_ast_id"],
-            path=data["path"],
-            language=data["language"],
-            range=CodeQueryRange.from_dict(data["range"]),
+            **_query_source_location_fields(data),
             call_kind=data["call_kind"],
             coverage=data["coverage"],
             group_count=int(data["group_count"]),
             argument_count=int(data["argument_count"]),
             callee_range=_optional_range(data, "callee_range"),
             callee_name=data.get("callee_name"),
-            provenance=_query_provenance(data),
-            provenance_truncated=bool(data.get("provenance_truncated", False)),
+            **_query_provenance_fields(data),
         )
 
     def render_text(self) -> str:
@@ -3839,9 +3904,7 @@ class CodeQueryCallEffect:
             id=data["id"],
             site_id=data["site_id"],
             site_ast_id=data["site_ast_id"],
-            path=data["path"],
-            language=data["language"],
-            range=CodeQueryRange.from_dict(data["range"]),
+            **_query_source_location_fields(data),
             classification=data["classification"],
             derivation=data["derivation"],
             coverage=data["coverage"],
@@ -3860,24 +3923,24 @@ class CodeQueryCallEffect:
             pack_id=data.get("pack_id"),
             model_id=data.get("model_id"),
             summary_id=data.get("summary_id"),
-            provenance=_query_provenance(data),
-            provenance_truncated=bool(data.get("provenance_truncated", False)),
+            **_query_provenance_fields(data),
         )
 
     def render_text(self) -> str:
         subject = self.effect_id or "terminal"
-        header = (
-            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
-            f"[call effect; {self.derivation}; {self.coverage}] {subject}"
-        )
-        detail = (
-            f"  {self.callee_symbol or 'unmodeled callee'}, "
+        metric = (
             f"{self.modeled_arm_count} of {self.arm_count} arm"
             f"{'' if self.arm_count == 1 else 's'} modeled"
         )
-        if self.reason is not None:
-            detail += f", reason {self.reason}"
-        return f"{header}\n{detail}"
+        return _render_call_summary(
+            self.path,
+            self.range,
+            f"call effect; {self.derivation}; {self.coverage}",
+            subject,
+            self.callee_symbol,
+            metric,
+            self.reason,
+        )
 
 
 @dataclass(frozen=True)
@@ -3909,15 +3972,12 @@ class CodeQueryCallResult:
             call_id=data["call_id"],
             procedure_id=data["procedure_id"],
             point_id=data["point_id"],
-            path=data["path"],
-            language=data["language"],
-            range=CodeQueryRange.from_dict(data["range"]),
+            **_query_source_location_fields(data),
             ordinal=int(data["ordinal"]),
             value_id=int(data["value_id"]),
             proof=data["proof"],
             completeness=data["completeness"],
-            provenance=_query_provenance(data),
-            provenance_truncated=bool(data.get("provenance_truncated", False)),
+            **_query_provenance_fields(data),
         )
 
     def render_text(self) -> str:
@@ -3976,9 +4036,7 @@ class CodeQueryCallResultContract:
             id=data["id"],
             site_id=data["site_id"],
             site_ast_id=data["site_ast_id"],
-            path=data["path"],
-            language=data["language"],
-            range=CodeQueryRange.from_dict(data["range"]),
+            **_query_source_location_fields(data),
             coverage=data["coverage"],
             arm_count=int(data["arm_count"]),
             modeled_arm_count=int(data["modeled_arm_count"]),
@@ -4004,24 +4062,24 @@ class CodeQueryCallResultContract:
             ),
             use_validation=data.get("use_validation"),
             use_validation_coverage=data.get("use_validation_coverage"),
-            provenance=_query_provenance(data),
-            provenance_truncated=bool(data.get("provenance_truncated", False)),
+            **_query_provenance_fields(data),
         )
 
     def render_text(self) -> str:
         subject = self.predicate or "terminal"
-        header = (
-            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
-            f"[call result contract; {self.coverage}] {subject}"
-        )
-        detail = (
-            f"  {self.callee_symbol or 'unmodeled callee'}, "
+        metric = (
             f"{self.success_guard_count} success guard"
             f"{'' if self.success_guard_count == 1 else 's'}"
         )
-        if self.reason is not None:
-            detail += f", reason {self.reason}"
-        return f"{header}\n{detail}"
+        return _render_call_summary(
+            self.path,
+            self.range,
+            f"call result contract; {self.coverage}",
+            subject,
+            self.callee_symbol,
+            metric,
+            self.reason,
+        )
 
 
 @dataclass(frozen=True)
@@ -4065,14 +4123,8 @@ class CodeQueryResultContractUse:
     @classmethod
     def from_dict(cls, data: dict) -> CodeQueryResultContractUse:
         return cls(
-            id=data["id"],
-            acquisition_id=data["acquisition_id"],
-            acquisition_site_id=data["acquisition_site_id"],
-            acquisition_site_ast_id=data["acquisition_site_ast_id"],
+            **_result_contract_site_fields(data),
             operation_point_id=data["operation_point_id"],
-            path=data["path"],
-            language=data["language"],
-            range=CodeQueryRange.from_dict(data["range"]),
             result_ordinal=int(data["result_ordinal"]),
             use_kind=data["use_kind"],
             timing=data["timing"],
@@ -4092,8 +4144,6 @@ class CodeQueryResultContractUse:
             pack_id=data.get("pack_id"),
             model_id=data.get("model_id"),
             summary_id=data.get("summary_id"),
-            provenance=_query_provenance(data),
-            provenance_truncated=bool(data.get("provenance_truncated", False)),
         )
 
     def render_text(self) -> str:
@@ -4142,16 +4192,10 @@ class CodeQueryResultContractFailureUse:
     @classmethod
     def from_dict(cls, data: dict) -> CodeQueryResultContractFailureUse:
         return cls(
-            id=data["id"],
-            acquisition_id=data["acquisition_id"],
-            acquisition_site_id=data["acquisition_site_id"],
-            acquisition_site_ast_id=data["acquisition_site_ast_id"],
+            **_result_contract_site_fields(data),
             procedure_id=data["procedure_id"],
             condition_result_ordinal=int(data["condition_result_ordinal"]),
             consumer_point_id=data["consumer_point_id"],
-            path=data["path"],
-            language=data["language"],
-            range=CodeQueryRange.from_dict(data["range"]),
             operand_value_id=int(data["operand_value_id"]),
             failure_provenance=data["failure_provenance"],
             consumer=data["consumer"],
@@ -4170,8 +4214,6 @@ class CodeQueryResultContractFailureUse:
             pack_id=data.get("pack_id"),
             model_id=data.get("model_id"),
             summary_id=data.get("summary_id"),
-            provenance=_query_provenance(data),
-            provenance_truncated=bool(data.get("provenance_truncated", False)),
         )
 
     def render_text(self) -> str:
@@ -4296,92 +4338,6 @@ class CodeQuerySwitchCoverage:
         if self.reason is not None:
             rendered += f", reason {self.reason}"
         return rendered
-
-
-@dataclass(frozen=True)
-class CodeQueryConcurrentAccessConflict:
-    """One pair of accesses to the same location that may run concurrently.
-
-    ``verdict`` is the conclusion, and ``proof``/``coverage`` are what say
-    whether it can support a negative claim. ``reasons`` lists the typed
-    reasons the analysis recorded, and is empty for a clean verdict.
-    """
-
-    id: str
-    root_procedure_id: str
-    path: str
-    language: str
-    range: CodeQueryRange
-    location_id: str
-    location_kind: str
-    first_procedure_id: str
-    first_point_id: int
-    first_access: str
-    first_path: str
-    first_range: CodeQueryRange
-    second_procedure_id: str
-    second_point_id: int
-    second_access: str
-    second_path: str
-    second_range: CodeQueryRange
-    task_relation: str
-    ordering: str
-    protection: str
-    verdict: str
-    proof: str
-    coverage: str
-    ast_id: str | None = None
-    reasons: list[str] = field(default_factory=list)
-    provenance: list[CodeQueryProvenance] = field(default_factory=list)
-    provenance_truncated: bool = False
-
-    @classmethod
-    def from_dict(cls, data: dict) -> CodeQueryConcurrentAccessConflict:
-        return cls(
-            id=data["id"],
-            root_procedure_id=data["root_procedure_id"],
-            path=data["path"],
-            language=data["language"],
-            range=CodeQueryRange.from_dict(data["range"]),
-            location_id=data["location_id"],
-            location_kind=data["location_kind"],
-            first_procedure_id=data["first_procedure_id"],
-            first_point_id=int(data["first_point_id"]),
-            first_access=data["first_access"],
-            first_path=data["first_path"],
-            first_range=CodeQueryRange.from_dict(data["first_range"]),
-            second_procedure_id=data["second_procedure_id"],
-            second_point_id=int(data["second_point_id"]),
-            second_access=data["second_access"],
-            second_path=data["second_path"],
-            second_range=CodeQueryRange.from_dict(data["second_range"]),
-            task_relation=data["task_relation"],
-            ordering=data["ordering"],
-            protection=data["protection"],
-            verdict=data["verdict"],
-            proof=data["proof"],
-            coverage=data["coverage"],
-            ast_id=data.get("ast_id"),
-            reasons=list(data.get("reasons", [])),
-            provenance=_query_provenance(data),
-            provenance_truncated=bool(data.get("provenance_truncated", False)),
-        )
-
-    def render_text(self) -> str:
-        header = (
-            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
-            f"[concurrent access conflict; {self.verdict}; {self.proof}/"
-            f"{self.coverage}] {self.location_kind} {self.location_id}"
-        )
-        detail = (
-            f"  {self.first_access} at {self.first_path}:"
-            f"{self.first_range.start_line} vs {self.second_access} at "
-            f"{self.second_path}:{self.second_range.start_line}; "
-            f"{self.task_relation}, {self.ordering}, {self.protection}"
-        )
-        if self.reasons:
-            detail += f"; reasons {', '.join(self.reasons)}"
-        return f"{header}\n{detail}"
 
 
 @dataclass(frozen=True)
@@ -4753,17 +4709,14 @@ class CodeQueryCallableApplicability:
         return cls(
             id=data["id"],
             site_ast_id=data["site_ast_id"],
-            path=data["path"],
-            language=data["language"],
-            range=CodeQueryRange.from_dict(data["range"]),
+            **_query_source_location_fields(data),
             ordinal=int(data["ordinal"]),
             verdict=data["verdict"],
             selected=bool(data["selected"]),
             candidate=CodeQueryCandidateRef.from_dict(data["candidate"]),
             reason=data.get("reason"),
             tier=data.get("tier"),
-            provenance=_query_provenance(data),
-            provenance_truncated=bool(data.get("provenance_truncated", False)),
+            **_query_provenance_fields(data),
         )
 
     def render_text(self) -> str:
@@ -4809,17 +4762,14 @@ class CodeQueryOverloadSelection:
         return cls(
             id=data["id"],
             site_ast_id=data["site_ast_id"],
-            path=data["path"],
-            language=data["language"],
-            range=CodeQueryRange.from_dict(data["range"]),
+            **_query_source_location_fields(data),
             resolution=data["resolution"],
             supported=bool(data["supported"]),
             considered_count=int(data["considered_count"]),
             applicable_count=int(data["applicable_count"]),
             inapplicable_count=int(data["inapplicable_count"]),
             unknown_count=int(data["unknown_count"]),
-            provenance=_query_provenance(data),
-            provenance_truncated=bool(data.get("provenance_truncated", False)),
+            **_query_provenance_fields(data),
         )
 
     def render_text(self) -> str:
@@ -4863,9 +4813,7 @@ class CodeQueryMemberSelection:
         return cls(
             id=data["id"],
             site_ast_id=data["site_ast_id"],
-            path=data["path"],
-            language=data["language"],
-            range=CodeQueryRange.from_dict(data["range"]),
+            **_query_source_location_fields(data),
             member=data["member"],
             role=data["role"],
             outcome=data["outcome"],
@@ -4873,8 +4821,7 @@ class CodeQueryMemberSelection:
             candidate_count=int(data["candidate_count"]),
             trace_completeness=data["trace_completeness"],
             coverage=data["coverage"],
-            provenance=_query_provenance(data),
-            provenance_truncated=bool(data.get("provenance_truncated", False)),
+            **_query_provenance_fields(data),
         )
 
     def render_text(self) -> str:
@@ -4915,21 +4862,11 @@ class CodeQueryDispatchOutcome:
     @classmethod
     def from_dict(cls, data: dict) -> CodeQueryDispatchOutcome:
         return cls(
-            id=data["id"],
-            site_id=data["site_id"],
-            path=data["path"],
-            language=data["language"],
-            range=CodeQueryRange.from_dict(data["range"]),
-            outcome=data["outcome"],
-            coverage=data["coverage"],
+            **_receiver_dispatch_outcome_fields(data),
             call_site_count=int(data["call_site_count"]),
             target_count=int(data["target_count"]),
             targets_truncated=bool(data["targets_truncated"]),
-            site_ast_id=data.get("site_ast_id"),
-            semantic_unsupported=data.get("semantic_unsupported"),
             exceeded_limit=data.get("exceeded_limit"),
-            provenance=_query_provenance(data),
-            provenance_truncated=bool(data.get("provenance_truncated", False)),
         )
 
     def render_text(self) -> str:
@@ -5216,22 +5153,14 @@ class CodeQueryControlRelation:
     @classmethod
     def from_dict(cls, data: dict) -> CodeQueryControlRelation:
         return cls(
-            id=data["id"],
-            procedure_id=data["procedure_id"],
-            path=data["path"],
-            language=data["language"],
-            range=CodeQueryRange.from_dict(data["range"]),
-            relation=data["relation"],
-            certainty=data["certainty"],
+            **_query_relation_identity_fields(data),
             exit_partition=data["exit_partition"],
             source=CodeQueryProgramPointRef.from_dict(data["source"]),
             target=CodeQueryProgramPointRef.from_dict(data["target"]),
-            completeness=data["completeness"],
-            generation=int(data["generation"]),
+            **_query_relation_completion_fields(data),
             controlling_edge_id=data.get("controlling_edge_id"),
             uncovered_relations=list(data.get("uncovered_relations", [])),
-            provenance=_query_provenance(data),
-            provenance_truncated=bool(data.get("provenance_truncated", False)),
+            **_query_provenance_fields(data),
         )
 
     def render_text(self) -> str:
@@ -5339,8 +5268,7 @@ class CodeQuerySourceSet:
             build_file=data["build_file"],
             completeness=data["completeness"],
             target_id=data.get("target_id"),
-            provenance=_query_provenance(data),
-            provenance_truncated=bool(data.get("provenance_truncated", False)),
+            **_query_provenance_fields(data),
         )
 
     def render_text(self) -> str:
@@ -5372,8 +5300,7 @@ class CodeQueryBuildTarget:
             build_file=data["build_file"],
             completeness=data["completeness"],
             build_project_id=data.get("build_project_id"),
-            provenance=_query_provenance(data),
-            provenance_truncated=bool(data.get("provenance_truncated", False)),
+            **_query_provenance_fields(data),
         )
 
     def render_text(self) -> str:
@@ -5484,6 +5411,80 @@ class CodeQueryConfigurationFact:
         )
 
 
+@dataclass(frozen=True)
+class CodeQueryCrossDomain:
+    """One row of a registered cross-domain operator.
+
+    ``domain`` discriminates the row. A ``correlated`` row carries one code row
+    and one configuration fact that ``relation`` proved related, with the
+    ``key`` that related them and a ``binding`` of ``unique`` or ``ambiguous``.
+    A ``code`` or ``configuration`` row carries one contributing input row of a
+    satisfied ``require_both`` and relates it to nothing. ``code`` references the
+    code row by its own ``result_type``, location, and identity fields;
+    ``configuration`` is the whole authored fact.
+    """
+
+    id: str
+    operator: str
+    domain: str
+    path: str
+    range: CodeQueryRange | None = None
+    relation: str | None = None
+    binding: str | None = None
+    key: str | None = None
+    code_id: str | None = None
+    code_path: str | None = None
+    code: CodeQueryResultRef | None = None
+    configuration_id: str | None = None
+    configuration_path: str | None = None
+    configuration: CodeQueryConfigurationFact | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryCrossDomain:
+        code = data.get("code")
+        configuration = data.get("configuration")
+        anchor = data.get("range")
+        return cls(
+            id=data["id"],
+            operator=data["operator"],
+            domain=data["domain"],
+            path=data["path"],
+            range=CodeQueryRange.from_dict(anchor) if anchor is not None else None,
+            relation=data.get("relation"),
+            binding=data.get("binding"),
+            key=data.get("key"),
+            code_id=data.get("code_id"),
+            code_path=data.get("code_path"),
+            code=CodeQueryResultRef.from_dict(code) if code is not None else None,
+            configuration_id=data.get("configuration_id"),
+            configuration_path=data.get("configuration_path"),
+            configuration=(
+                CodeQueryConfigurationFact.from_dict(configuration)
+                if configuration is not None
+                else None
+            ),
+        )
+
+    def render_text(self) -> str:
+        anchor = self.path
+        if self.range is not None:
+            anchor = f"{anchor}:{self.range.start_line}:{self.range.start_column}"
+        label = " ".join(
+            part
+            for part in (self.operator, self.domain, self.relation, self.binding)
+            if part is not None
+        )
+        text = f"{anchor} [cross_domain; {label}]"
+        if self.key is not None:
+            text += f" key {self.key!r}"
+        if self.configuration is not None:
+            text += (
+                f" -> {self.configuration.path}:{self.configuration.range.start_line}:"
+                f"{self.configuration.range.start_column} {self.configuration.route}"
+            )
+        return text
+
+
 CodeQueryResultItem = (
     CodeQueryMatch
     | CodeQueryDeclaration
@@ -5491,7 +5492,6 @@ CodeQueryResultItem = (
     | CodeQueryProgramPoint
     | CodeQueryControlEdge
     | CodeQueryTypestateFinding
-    | CodeQueryConcurrentAccessConflict
     | CodeQueryTypestateWitness
     | CodeQueryFlowEndpoint
     | CodeQueryFlowWitness
@@ -5553,6 +5553,7 @@ CodeQueryResultItem = (
     | CodeQueryBuildTarget
     | CodeQueryTopologyEdge
     | CodeQueryConfigurationFact
+    | CodeQueryCrossDomain
 )
 
 _CODE_QUERY_RESULT_ITEM_TYPES = {
@@ -5562,7 +5563,6 @@ _CODE_QUERY_RESULT_ITEM_TYPES = {
     "program_point": CodeQueryProgramPoint,
     "control_edge": CodeQueryControlEdge,
     "typestate_finding": CodeQueryTypestateFinding,
-    "concurrent_access_conflict": CodeQueryConcurrentAccessConflict,
     "typestate_witness": CodeQueryTypestateWitness,
     "flow_endpoint": CodeQueryFlowEndpoint,
     "flow_witness": CodeQueryFlowWitness,
@@ -5624,6 +5624,7 @@ _CODE_QUERY_RESULT_ITEM_TYPES = {
     "build_target": CodeQueryBuildTarget,
     "topology_edge": CodeQueryTopologyEdge,
     "configuration_fact": CodeQueryConfigurationFact,
+    "cross_domain": CodeQueryCrossDomain,
 }
 
 
@@ -5644,6 +5645,7 @@ class CodeQueryDiagnosticCode(StrEnum):
     CANCELLED = "cancelled"
     UNSUPPORTED_STRUCTURAL_FEATURE = "unsupported_structural_feature"
     MISSING_STRUCTURAL_ADAPTER = "missing_structural_adapter"
+    RECOVERED_SYNTAX_INCOMPLETE = "recovered_syntax_incomplete"
     UNSUPPORTED_IMPORT_ANALYSIS = "unsupported_import_analysis"
     SEMANTIC_RESULTS_OMITTED = "semantic_results_omitted"
     SEMANTIC_WORKSPACE_REQUIRED = "semantic_workspace_required"
@@ -5731,6 +5733,10 @@ class CodeQueryDiagnosticCode(StrEnum):
     EFFECT_BUDGET_EXHAUSTED = "effect_budget_exhausted"
     CALL_SHAPE_COVERAGE_INCOMPLETE = "call_shape_coverage_incomplete"
     JSX_PROJECTION_INCOMPLETE = "jsx_projection_incomplete"
+    CROSS_DOMAIN_BINDING_UNPROVEN = "cross_domain_binding_unproven"
+    CROSS_DOMAIN_KEY_UNSUPPORTED = "cross_domain_key_unsupported"
+    CROSS_DOMAIN_DOCUMENT_INCOMPLETE = "cross_domain_document_incomplete"
+    CROSS_DOMAIN_CORRELATION_AMBIGUOUS = "cross_domain_correlation_ambiguous"
     RESULT_LIMIT_REACHED = "result_limit_reached"
     BROAD_QUERY = "broad_query"
 
@@ -6447,6 +6453,16 @@ class CodeQueryCacheMetricsKind(StrEnum):
     STRUCTURAL_FACTS = "structural_facts"
 
 
+def _cache_counter_fields(
+    data: dict[str, Any], counters: set[str]
+) -> dict[str, Any]:
+    return {
+        "kind": CodeQueryCacheMetricsKind(data["kind"]),
+        **{key: int(data.get(key, 0)) for key in counters},
+        "extra": _extra_fields(data, {"kind", *counters}),
+    }
+
+
 @dataclass(frozen=True)
 class CodeQueryProfileCacheCounters:
     kind: CodeQueryCacheMetricsKind = CodeQueryCacheMetricsKind.COMPLETE_VALUE
@@ -6480,11 +6496,7 @@ class CodeQueryProfileCacheCounters:
             "unknown_outcomes",
             "replayed_items",
         }
-        return cls(
-            kind=CodeQueryCacheMetricsKind(data["kind"]),
-            **{key: int(data.get(key, 0)) for key in counters},
-            extra=_extra_fields(data, {"kind", *counters}),
-        )
+        return cls(**_cache_counter_fields(data, counters))
 
 
 @dataclass(frozen=True)
@@ -6525,11 +6537,7 @@ class CodeQueryDerivedLayerCacheCounters(CodeQueryProfileCacheCounters):
             "retained_bytes",
         }
         counters = common | derived
-        return cls(
-            kind=CodeQueryCacheMetricsKind(data["kind"]),
-            **{key: int(data.get(key, 0)) for key in counters},
-            extra=_extra_fields(data, {"kind", *counters}),
-        )
+        return cls(**_cache_counter_fields(data, counters))
 
 
 @dataclass(frozen=True)
@@ -6557,11 +6565,7 @@ class CodeQueryStructuralFactsCacheCounters:
             "unknown_outcomes",
             "replayed_files",
         }
-        return cls(
-            kind=CodeQueryCacheMetricsKind(data["kind"]),
-            **{key: int(data.get(key, 0)) for key in counters},
-            extra=_extra_fields(data, {"kind", *counters}),
-        )
+        return cls(**_cache_counter_fields(data, counters))
 
 
 CodeQueryCacheMetrics = (
@@ -7037,9 +7041,13 @@ class SymbolLocation:
         )
 
     def render_text(self) -> str:
-        if self.render_line_numbers:
-            return f"{self.symbol}: {self.path}:{self.start_line}..{self.end_line}"
-        return f"{self.symbol}: {self.path}"
+        location = _render_path_range(
+            self.path,
+            self.start_line,
+            self.end_line,
+            self.render_line_numbers,
+        )
+        return f"{self.symbol}: {location}"
 
 
 @dataclass(frozen=True)
@@ -7120,11 +7128,12 @@ class SymbolAncestorsResult:
         if self.rendered_text is not None:
             return self.rendered_text
         blocks = [item.render_text() for item in self.ancestors]
-        if self.not_found:
-            blocks.append(f"Not found: {', '.join(self.not_found)}")
-        if self.ambiguous:
-            blocks.extend(item.render_text() for item in self.ambiguous)
-        return "\n\n".join(blocks) if blocks else "No matching ancestors found."
+        return _render_symbol_result_sections(
+            blocks,
+            self.not_found,
+            self.ambiguous,
+            "No matching ancestors found.",
+        )
 
 
 @dataclass(frozen=True)
@@ -7137,7 +7146,7 @@ class AmbiguousSymbol:
         return cls(target=data["target"], matches=list(data["matches"]))
 
     def render_text(self) -> str:
-        return f"Ambiguous {self.target}: {', '.join(self.matches)}"
+        return _render_ambiguity(self.target, self.matches)
 
 
 @dataclass(frozen=True)
@@ -7219,6 +7228,53 @@ class DefinitionReferenceSite:
         return cls(path=data["path"], target=data["target"])
 
 
+def _lookup_fields(data: dict, result_key: str) -> dict[str, Any]:
+    # Rust omits `complete` when true and `incomplete_reason` when absent.
+    return {
+        "query": dict(data["query"]),
+        "status": data["status"],
+        "complete": bool(data.get("complete", True)),
+        "incomplete_reason": _definition_lookup_incomplete_reason(
+            data.get("incomplete_reason")
+        ),
+        result_key: [
+            DefinitionCandidate.from_dict(item)
+            for item in data.get(result_key, [])
+        ],
+        "diagnostics": [
+            DefinitionDiagnostic.from_dict(item)
+            for item in data.get("diagnostics", [])
+        ],
+    }
+
+
+def _lookup_operation_reference_fields(data: dict) -> dict[str, Any]:
+    return {
+        "operation": NavigationOperation(data["operation"]),
+        "reference": (
+            DefinitionReferenceSite.from_dict(data["reference"])
+            if data.get("reference") is not None
+            else None
+        ),
+    }
+
+
+def _render_lookup_result(
+    status: str,
+    entries: list[Any],
+    diagnostics: list[DefinitionDiagnostic],
+    operation: str | None = None,
+    reference: DefinitionReferenceSite | None = None,
+) -> str:
+    lines = [f"operation: {operation}"] if operation is not None else []
+    lines.append(f"status: {status}")
+    if reference is not None:
+        lines.append(f"reference: {reference.path} -> {reference.target}")
+    lines.extend(entry.render_text() for entry in entries)
+    lines.extend(diagnostic.render_text() for diagnostic in diagnostics)
+    return "\n".join(lines)
+
+
 @dataclass(frozen=True)
 class DefinitionLookupResult:
     query: dict
@@ -7227,35 +7283,24 @@ class DefinitionLookupResult:
     reference: DefinitionReferenceSite | None
     definitions: list[DefinitionCandidate]
     diagnostics: list[DefinitionDiagnostic]
+    complete: bool = True
+    incomplete_reason: DefinitionLookupIncompleteReasonValue | None = None
 
     @classmethod
     def from_dict(cls, data: dict) -> DefinitionLookupResult:
         return cls(
-            query=dict(data["query"]),
-            operation=NavigationOperation(data["operation"]),
-            status=data["status"],
-            reference=(
-                DefinitionReferenceSite.from_dict(data["reference"])
-                if data.get("reference") is not None
-                else None
-            ),
-            definitions=[
-                DefinitionCandidate.from_dict(item)
-                for item in data.get("definitions", [])
-            ],
-            diagnostics=[
-                DefinitionDiagnostic.from_dict(item)
-                for item in data.get("diagnostics", [])
-            ],
+            **_lookup_fields(data, "definitions"),
+            **_lookup_operation_reference_fields(data),
         )
 
     def render_text(self) -> str:
-        lines = [f"operation: {self.operation.value}", f"status: {self.status}"]
-        if self.reference is not None:
-            lines.append(f"reference: {self.reference.path} -> {self.reference.target}")
-        lines.extend(definition.render_text() for definition in self.definitions)
-        lines.extend(diagnostic.render_text() for diagnostic in self.diagnostics)
-        return "\n".join(lines)
+        return _render_lookup_result(
+            self.status,
+            self.definitions,
+            self.diagnostics,
+            operation=self.operation.value,
+            reference=self.reference,
+        )
 
 
 @dataclass(frozen=True)
@@ -7266,35 +7311,24 @@ class DeclarationLookupResult:
     reference: DefinitionReferenceSite | None
     declarations: list[DefinitionCandidate]
     diagnostics: list[DefinitionDiagnostic]
+    complete: bool = True
+    incomplete_reason: DefinitionLookupIncompleteReasonValue | None = None
 
     @classmethod
     def from_dict(cls, data: dict) -> DeclarationLookupResult:
         return cls(
-            query=dict(data["query"]),
-            operation=NavigationOperation(data["operation"]),
-            status=data["status"],
-            reference=(
-                DefinitionReferenceSite.from_dict(data["reference"])
-                if data.get("reference") is not None
-                else None
-            ),
-            declarations=[
-                DefinitionCandidate.from_dict(item)
-                for item in data.get("declarations", [])
-            ],
-            diagnostics=[
-                DefinitionDiagnostic.from_dict(item)
-                for item in data.get("diagnostics", [])
-            ],
+            **_lookup_fields(data, "declarations"),
+            **_lookup_operation_reference_fields(data),
         )
 
     def render_text(self) -> str:
-        lines = [f"operation: {self.operation.value}", f"status: {self.status}"]
-        if self.reference is not None:
-            lines.append(f"reference: {self.reference.path} -> {self.reference.target}")
-        lines.extend(declaration.render_text() for declaration in self.declarations)
-        lines.extend(diagnostic.render_text() for diagnostic in self.diagnostics)
-        return "\n".join(lines)
+        return _render_lookup_result(
+            self.status,
+            self.declarations,
+            self.diagnostics,
+            operation=self.operation.value,
+            reference=self.reference,
+        )
 
 
 @dataclass(frozen=True)
@@ -7354,12 +7388,12 @@ class TypeLookupResult:
         )
 
     def render_text(self) -> str:
-        lines = [f"status: {self.status}"]
-        if self.reference is not None:
-            lines.append(f"reference: {self.reference.path} -> {self.reference.target}")
-        lines.extend(item.render_text() for item in self.types)
-        lines.extend(diagnostic.render_text() for diagnostic in self.diagnostics)
-        return "\n".join(lines)
+        return _render_lookup_result(
+            self.status,
+            self.types,
+            self.diagnostics,
+            reference=self.reference,
+        )
 
 
 @dataclass(frozen=True)
@@ -7465,27 +7499,17 @@ class DefinitionByReferenceLookupResult:
     status: str
     definitions: list[DefinitionCandidate]
     diagnostics: list[DefinitionDiagnostic]
+    complete: bool = True
+    incomplete_reason: DefinitionLookupIncompleteReasonValue | None = None
 
     @classmethod
     def from_dict(cls, data: dict) -> DefinitionByReferenceLookupResult:
         return cls(
-            query=dict(data["query"]),
-            status=data["status"],
-            definitions=[
-                DefinitionCandidate.from_dict(item)
-                for item in data.get("definitions", [])
-            ],
-            diagnostics=[
-                DefinitionDiagnostic.from_dict(item)
-                for item in data.get("diagnostics", [])
-            ],
+            **_lookup_fields(data, "definitions"),
         )
 
     def render_text(self) -> str:
-        lines = [f"status: {self.status}"]
-        lines.extend(definition.render_text() for definition in self.definitions)
-        lines.extend(diagnostic.render_text() for diagnostic in self.diagnostics)
-        return "\n".join(lines)
+        return _render_lookup_result(self.status, self.definitions, self.diagnostics)
 
 
 @dataclass(frozen=True)
@@ -7603,10 +7627,11 @@ class TypeListingEntry:
     end_line: int
 
     def render_text(self, render_line_numbers: bool = True) -> str:
-        location = (
-            f"{self.path}:{self.start_line}..{self.end_line}"
-            if render_line_numbers
-            else self.path
+        location = _render_path_range(
+            self.path,
+            self.start_line,
+            self.end_line,
+            render_line_numbers,
         )
         return f"[type; {self.language}] {self.symbol}: {location}"
 
@@ -7687,12 +7712,60 @@ class ContainerListing:
 
 
 @dataclass(frozen=True)
+class TooBroadScope:
+    """A request target the engine skipped because it matched too much.
+
+    ``matched_kind`` is ``files`` for a path or glob target over the per-target
+    file cap, and ``declarations`` for a symbol selector over the resolution cap.
+    """
+
+    target: str
+    matched: int
+    cap: int
+    matched_kind: TooBroadMatchValue
+    sample: list[str]
+    note: str
+
+    @classmethod
+    def from_dict(cls, data: dict) -> TooBroadScope:
+        return cls(
+            target=data["target"],
+            matched=int(data["matched"]),
+            cap=int(data["cap"]),
+            matched_kind=cast(
+                TooBroadMatchValue,
+                _closed_value(data["matched_kind"], _TOO_BROAD_MATCH_KINDS, "matched_kind"),
+            ),
+            sample=list(data.get("sample", [])),
+            note=data["note"],
+        )
+
+    def render_text(self) -> str:
+        if self.matched_kind == "files":
+            summary = (
+                f"Too broad: target {self.target} matched {self.matched} files, "
+                f"over the {self.cap} file limit for one target, so it was skipped."
+            )
+            return "\n".join(
+                [summary, f"Sample of the match: {', '.join(self.sample)}", self.note]
+            )
+        summary = (
+            f"Too broad: target {self.target} matched {self.matched} declarations, "
+            f"over the {self.cap}-declaration resolution limit for one selector, "
+            "so no candidate list was produced."
+        )
+        return "\n".join([summary, self.note])
+
+
+@dataclass(frozen=True)
 class SymbolSummariesResult:
     summaries: list[SummaryBlock]
     listings: list[ContainerListing]
     compact_symbols: SkimFilesResult | None
     not_found: list[str]
     ambiguous: list[AmbiguousSymbol]
+    ambiguous_paths: list[AmbiguousPath] = field(default_factory=list)
+    too_broad: list[TooBroadScope] = field(default_factory=list)
     render_line_numbers: bool = True
     rendered_text: str | None = None
 
@@ -7718,6 +7791,8 @@ class SymbolSummariesResult:
             ambiguous=[
                 AmbiguousSymbol.from_dict(item) for item in data.get("ambiguous", [])
             ],
+            ambiguous_paths=_ambiguous_paths(data),
+            too_broad=[TooBroadScope.from_dict(item) for item in data.get("too_broad", [])],
             render_line_numbers=render_line_numbers,
             rendered_text=rendered_text,
         )
@@ -7735,10 +7810,13 @@ class SymbolSummariesResult:
         blocks.extend(listing.render_text() for listing in self.listings)
         if self.compact_symbols is not None:
             blocks.append(self.compact_symbols.render_text())
-        if self.not_found:
-            blocks.append(f"Not found: {', '.join(self.not_found)}")
-        blocks.extend(item.render_text() for item in self.ambiguous)
-        return "\n\n".join(blocks) if blocks else "No matching summaries found."
+        return _render_symbol_result_sections(
+            blocks,
+            self.not_found,
+            [*self.ambiguous, *self.ambiguous_paths],
+            "No matching summaries found.",
+            [scope.render_text() for scope in self.too_broad],
+        )
 
 
 FileSummariesResult = SymbolSummariesResult
@@ -7765,11 +7843,13 @@ class SourceBlock:
         )
 
     def render_text(self) -> str:
-        header = (
-            f"{self.label} ({self.path}:{self.start_line}..{self.end_line})"
-            if self.render_line_numbers
-            else f"{self.label} ({self.path})"
+        location = _render_path_range(
+            self.path,
+            self.start_line,
+            self.end_line,
+            self.render_line_numbers,
         )
+        header = f"{self.label} ({location})"
         return "\n".join(
             [header, _render_block(self.text, self.start_line, self.render_line_numbers)]
         )
@@ -7835,19 +7915,24 @@ class SymbolSourcesResult:
         if self.rendered_text is not None:
             return self.rendered_text
         blocks = [source.render_text() for source in self.sources]
-        if self.not_found:
-            blocks.append(f"Not found: {', '.join(self.not_found)}")
-        blocks.extend(item.render_text() for item in self.ambiguous)
+        trailing_blocks = []
         if self.incomplete:
-            blocks.append(
+            trailing_blocks.append(
                 "Incomplete: "
                 + ", ".join(item.render_text() for item in self.incomplete)
             )
-        if blocks:
-            return "\n\n".join(blocks)
-        if not self.complete:
-            return "Incomplete source lookup."
-        return "No matching sources found."
+        empty_text = (
+            "Incomplete source lookup."
+            if not self.complete
+            else "No matching sources found."
+        )
+        return _render_symbol_result_sections(
+            blocks,
+            self.not_found,
+            self.ambiguous,
+            empty_text,
+            trailing_blocks,
+        )
 
 
 @dataclass(frozen=True)
@@ -8063,18 +8148,13 @@ class SkimFilesResult:
         return len(self.files)
 
     def render_text(self) -> str:
-        if self.rendered_text is not None:
-            return self.rendered_text
-        blocks = [file.render_text() for file in self.files]
-        if not blocks:
-            return "No matching files found."
-        text = "\n\n".join(blocks)
-        if self.truncated:
-            text += (
-                f"\n\nResults truncated: showing {len(self.files)} of {self.total_files} "
-                "files selected by recent activity when available. Results are displayed alphabetically."
-            )
-        return text
+        return _render_file_search_results(
+            self.rendered_text,
+            self.files,
+            self.truncated,
+            self.total_files,
+            "No matching files found.",
+        )
 
 
 @dataclass(frozen=True)
@@ -8203,6 +8283,10 @@ class UsageGraphCallSite:
         return cls(path=data["path"], line=data["line"])
 
 
+def _call_edge_weight(data: dict[str, Any]) -> int:
+    return int(data["weight"])
+
+
 @dataclass(frozen=True)
 class UsageGraphEdge:
     """A weighted caller -> callee reference edge.
@@ -8230,12 +8314,19 @@ class UsageGraphEdge:
             from_fqn=data["from"],
             to_fqn=data["to"],
             language=data["language"],
-            weight=data["weight"],
+            weight=_call_edge_weight(data),
             sites=[
                 UsageGraphCallSite.from_dict(item)
                 for item in data.get("sites", [])
             ],
         )
+
+
+def _callsite_limit_fields(data: dict[str, Any]) -> dict[str, int]:
+    return {
+        "total_callsites": int(data["total_callsites"]),
+        "limit": int(data["limit"]),
+    }
 
 
 @dataclass(frozen=True)
@@ -8255,8 +8346,7 @@ class UsageGraphTruncatedSymbol:
         return cls(
             fqn=data["fqn"],
             language=data["language"],
-            total_callsites=data["total_callsites"],
-            limit=data["limit"],
+            **_callsite_limit_fields(data),
         )
 
 
@@ -8909,6 +8999,24 @@ class CommitSymbol:
         )
 
 
+def _commit_symbol_pair_fields(data: dict[str, Any]) -> dict[str, CommitSymbol]:
+    return {
+        "before": CommitSymbol.from_dict(data["before"]),
+        "after": CommitSymbol.from_dict(data["after"]),
+    }
+
+
+def _callee_change_fields(data: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "to_fqn": data["to"],
+        "language": data["language"],
+        "weight": _call_edge_weight(data),
+        "sites": [
+            UsageGraphCallSite.from_dict(item) for item in data.get("sites", [])
+        ],
+    }
+
+
 @dataclass(frozen=True)
 class CalleeChange:
     """One outgoing call edge a patch symbol gained or lost.
@@ -8925,12 +9033,18 @@ class CalleeChange:
 
     @classmethod
     def from_dict(cls, data: dict) -> CalleeChange:
-        return cls(
-            to_fqn=data["to"],
-            language=data["language"],
-            weight=int(data["weight"]),
-            sites=[UsageGraphCallSite.from_dict(item) for item in data.get("sites", [])],
-        )
+        return cls(**_callee_change_fields(data))
+
+
+def _callee_change_list_fields(data: dict[str, Any]) -> dict[str, list[CalleeChange]]:
+    return {
+        "added_calls": [
+            CalleeChange.from_dict(item) for item in data.get("added_calls", [])
+        ],
+        "removed_calls": [
+            CalleeChange.from_dict(item) for item in data.get("removed_calls", [])
+        ],
+    }
 
 
 @dataclass(frozen=True)
@@ -8952,14 +9066,10 @@ class EditedSymbolPair:
     @classmethod
     def from_dict(cls, data: dict) -> EditedSymbolPair:
         return cls(
-            before=CommitSymbol.from_dict(data["before"]),
-            after=CommitSymbol.from_dict(data["after"]),
+            **_commit_symbol_pair_fields(data),
             touched_old_lines=[int(item) for item in data.get("touched_old_lines", [])],
             touched_new_lines=[int(item) for item in data.get("touched_new_lines", [])],
-            added_calls=[CalleeChange.from_dict(item) for item in data.get("added_calls", [])],
-            removed_calls=[
-                CalleeChange.from_dict(item) for item in data.get("removed_calls", [])
-            ],
+            **_callee_change_list_fields(data),
         )
 
 
@@ -9016,12 +9126,8 @@ class MovedSymbol:
     @classmethod
     def from_dict(cls, data: dict) -> MovedSymbol:
         return cls(
-            before=CommitSymbol.from_dict(data["before"]),
-            after=CommitSymbol.from_dict(data["after"]),
-            added_calls=[CalleeChange.from_dict(item) for item in data.get("added_calls", [])],
-            removed_calls=[
-                CalleeChange.from_dict(item) for item in data.get("removed_calls", [])
-            ],
+            **_commit_symbol_pair_fields(data),
+            **_callee_change_list_fields(data),
         )
 
 
@@ -9033,8 +9139,7 @@ class SignatureChange:
     @classmethod
     def from_dict(cls, data: dict) -> SignatureChange:
         return cls(
-            before=CommitSymbol.from_dict(data["before"]),
-            after=CommitSymbol.from_dict(data["after"]),
+            **_commit_symbol_pair_fields(data),
         )
 
 
@@ -9097,10 +9202,7 @@ class CallEdgeChange:
         return cls(
             change=data["change"],
             from_fqn=data["from"],
-            to_fqn=data["to"],
-            language=data["language"],
-            weight=int(data["weight"]),
-            sites=[UsageGraphCallSite.from_dict(item) for item in data.get("sites", [])],
+            **_callee_change_fields(data),
         )
 
 
@@ -9116,8 +9218,102 @@ class LargeCallsiteSymbol:
         return cls(
             fqn=data["fqn"],
             language=data["language"],
-            total_callsites=int(data["total_callsites"]),
-            limit=int(data["limit"]),
+            **_callsite_limit_fields(data),
+        )
+
+
+@dataclass(frozen=True)
+class CallAnalysisIncompleteReason:
+    code: str
+    message: str
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CallAnalysisIncompleteReason:
+        code = data["code"]
+        message = data["message"]
+        if type(code) is not str or type(message) is not str:
+            raise TypeError("call-analysis incomplete reasons require string code and message")
+        return cls(code=code, message=message)
+
+
+@dataclass(frozen=True)
+class CallAnalysisEndpoint:
+    complete: bool
+    incomplete_reasons: list[CallAnalysisIncompleteReason]
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CallAnalysisEndpoint:
+        reasons = _strict_list(data, "incomplete_reasons")
+        if any(not isinstance(item, dict) for item in reasons):
+            raise TypeError("incomplete_reasons must contain objects")
+        return cls(
+            complete=_strict_bool(data, "complete"),
+            incomplete_reasons=[
+                CallAnalysisIncompleteReason.from_dict(item) for item in reasons
+            ],
+        )
+
+
+@dataclass(frozen=True)
+class CallAnalysis:
+    scope: DiffCallEdgeScopeValue
+    status: CallAnalysisStatusValue
+    base: CallAnalysisEndpoint | None
+    target: CallAnalysisEndpoint | None
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CallAnalysis:
+        scope = _closed_value(data["scope"], _DIFF_CALL_EDGE_SCOPES, "scope")
+        status = _closed_value(
+            data["status"], _CALL_ANALYSIS_STATUSES, "status"
+        )
+        base_data = data.get("base")
+        target_data = data.get("target")
+        for name, value in (("base", base_data), ("target", target_data)):
+            if value is not None and not isinstance(value, dict):
+                raise TypeError(f"call_analysis.{name} must be an object or null")
+        base = CallAnalysisEndpoint.from_dict(base_data) if base_data is not None else None
+        target = (
+            CallAnalysisEndpoint.from_dict(target_data)
+            if target_data is not None
+            else None
+        )
+        if scope == "omit" or status == "omitted":
+            if scope != "omit" or status != "omitted":
+                raise ValueError("omitted call analysis must use scope 'omit'")
+            if base is not None or target is not None:
+                raise ValueError("omitted call analysis must omit endpoint records")
+            return cls(
+                scope=cast(DiffCallEdgeScopeValue, scope),
+                status=cast(CallAnalysisStatusValue, status),
+                base=None,
+                target=None,
+            )
+        if base is None or target is None:
+            raise ValueError("non-omitted call analysis requires base and target records")
+        endpoints = (("base", base), ("target", target))
+        for name, endpoint in endpoints:
+            if endpoint.complete and endpoint.incomplete_reasons:
+                raise ValueError(
+                    f"complete call-analysis {name} endpoint cannot have incomplete reasons"
+                )
+            if not endpoint.complete and not endpoint.incomplete_reasons:
+                raise ValueError(
+                    f"incomplete call-analysis {name} endpoint requires incomplete reasons"
+                )
+        if status == "complete" and (
+            not base.complete or not target.complete
+        ):
+            raise ValueError("complete call analysis requires complete base and target endpoints")
+        if status == "incomplete" and base.complete and target.complete:
+            raise ValueError(
+                "incomplete call analysis requires an incomplete base or target endpoint"
+            )
+        return cls(
+            scope=cast(DiffCallEdgeScopeValue, scope),
+            status=cast(CallAnalysisStatusValue, status),
+            base=base,
+            target=target,
         )
 
 
@@ -9132,6 +9328,7 @@ class DiffAnalysisResult:
     """Call-edge changes left over after every patch symbol took the edges it calls."""
 
     large_callsite_symbols: list[LargeCallsiteSymbol]
+    call_analysis: CallAnalysis
 
     @classmethod
     def from_dict(cls, data: dict) -> DiffAnalysisResult:
@@ -9151,6 +9348,7 @@ class DiffAnalysisResult:
                 LargeCallsiteSymbol.from_dict(item)
                 for item in data.get("large_callsite_symbols", [])
             ],
+            call_analysis=CallAnalysis.from_dict(data["call_analysis"]),
         )
 
 
@@ -9175,7 +9373,7 @@ class AmbiguousPath:
         return cls(input=data["input"], matches=list(data["matches"]))
 
     def render_text(self) -> str:
-        return f"Ambiguous {self.input}: {', '.join(self.matches)}"
+        return _render_ambiguity(self.input, self.matches)
 
 
 def _ambiguous_paths(data: dict) -> list[AmbiguousPath]:
@@ -9440,14 +9638,14 @@ class CodeQualityReport:
         return self.report
 
     def __str__(self) -> str:
-        return self.report
+        return self.render_text()
 
 
 # Query-result wire models are generated from the Rust serialization schema.
 # Keep presentation methods handwritten by attaching the existing renderers to
 # the generated data classes; fields, enums, defaults, and decoding all come
 # from the producer contract.
-from . import _generated_query_models as _generated_query_models
+from . import _generated_query_models as _generated_query_models  # noqa: E402
 
 _legacy_query_models = dict(globals())
 for _generated_name in dir(_generated_query_models):
@@ -9573,8 +9771,15 @@ setattr(
     "provenance_direction",
     property(lambda self: self.edge_provenance),
 )
+# The generated variant numbers are positional, so adding a candidate kind
+# renumbers them; an earlier kind's ordinal then names a shape that carries no
+# workspace declaration. Resolve the declaration-bearing shape from the
+# generator's published tag map instead of a fixed ordinal.
+_code_query_candidate_ref_variants = _generated_query_models.TAGGED_UNION_VARIANTS[
+    "CodeQueryCandidateRef"
+][1]
 setattr(
-    _generated_query_models.CodeQueryCandidateRefVariant1,
+    _code_query_candidate_ref_variants["unit"],
     "name",
     property(lambda self: self.unit.fq_name),
 )
@@ -9586,7 +9791,7 @@ setattr(
 
 _generated_subset = _generated_query_models.SubsetCoverage
 setattr(_generated_subset, "render_text", _legacy_query_models["SessionSubset"].render_text)
-SessionSubset = _generated_subset
+SessionSubset = _generated_subset  # noqa: F811
 
 _CODE_QUERY_RESULT_ITEM_TYPES = (
     _generated_query_models.CODE_QUERY_RESULT_ITEM_TYPES

@@ -154,6 +154,30 @@ pub const RUST_PRELUDE_NAMES: &[RustPreludeName] = &[
     name("IntoFuture", Type, false, E2024),
 ];
 
+/// The canonical module of a trait injected by a standard prelude. This is
+/// language-owned name routing, not evidence that a source name resolves to
+/// the trait: callers must first prove the selected prelude binding.
+pub fn rust_prelude_trait_module(name: &str) -> Option<&'static str> {
+    match name {
+        "Clone" => Some("clone"),
+        "Copy" | "Send" | "Sized" | "Sync" | "Unpin" => Some("marker"),
+        "Drop" => Some("ops"),
+        "Eq" | "Ord" | "PartialEq" | "PartialOrd" => Some("cmp"),
+        "AsMut" | "AsRef" | "From" | "Into" | "TryFrom" | "TryInto" => Some("convert"),
+        "Default" => Some("default"),
+        "DoubleEndedIterator"
+        | "ExactSizeIterator"
+        | "Extend"
+        | "IntoIterator"
+        | "Iterator"
+        | "FromIterator" => Some("iter"),
+        "ToOwned" => Some("borrow"),
+        "ToString" => Some("string"),
+        "Future" | "IntoFuture" => Some("future"),
+        _ => None,
+    }
+}
+
 /// A `core`/`std` marker trait whose own surface declares no associated items.
 /// The standard crate path is `core::<module>::<name>` or its `std` re-export.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,6 +246,237 @@ pub fn rust_marker_trait_without_associated_items(
         .find(|marker| marker.name == name)
 }
 
+/// What dropping a value of a reviewed standard type can execute (#3757).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RustStdDropGlue {
+    /// The destructor only releases memory the value owns. It runs no user
+    /// code and moves no value anywhere the program can observe.
+    OwnedMemoryOnly,
+    /// The destructor drops the values of its type arguments, then releases
+    /// memory the value owns. It runs user code only through those values.
+    TypeArguments,
+}
+
+/// A reviewed fact about one prelude type of the standard library (#3757).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RustStdTypeFact {
+    /// The prelude type name.
+    pub name: &'static str,
+    /// The type's canonical path in `std`, outermost segment first.
+    pub path: &'static [&'static str],
+    /// How many type arguments the written type carries.
+    pub type_arguments: usize,
+    pub drop_glue: RustStdDropGlue,
+}
+
+/// The reviewed standard prelude types whose destructors run no user code of
+/// their own.
+///
+/// This table is the interim home of these facts. The follow-up is a
+/// drop-glue fact in the semantic-model declaration schema, carried by a
+/// regenerated std pack. A type that is not listed here stays unproven.
+pub const RUST_STD_TYPE_FACTS: &[RustStdTypeFact] = &[
+    RustStdTypeFact {
+        name: "String",
+        path: &["std", "string", "String"],
+        type_arguments: 0,
+        drop_glue: RustStdDropGlue::OwnedMemoryOnly,
+    },
+    RustStdTypeFact {
+        name: "Option",
+        path: &["std", "option", "Option"],
+        type_arguments: 1,
+        drop_glue: RustStdDropGlue::TypeArguments,
+    },
+    RustStdTypeFact {
+        name: "Result",
+        path: &["std", "result", "Result"],
+        type_arguments: 2,
+        drop_glue: RustStdDropGlue::TypeArguments,
+    },
+    RustStdTypeFact {
+        name: "Vec",
+        path: &["std", "vec", "Vec"],
+        type_arguments: 1,
+        drop_glue: RustStdDropGlue::TypeArguments,
+    },
+    RustStdTypeFact {
+        name: "Box",
+        path: &["std", "boxed", "Box"],
+        type_arguments: 1,
+        drop_glue: RustStdDropGlue::TypeArguments,
+    },
+];
+
+/// The reviewed fact for one prelude type name, if any.
+///
+/// Like [`rust_marker_trait_without_associated_items`], this lookup does not
+/// resolve the spelling. Callers may use it only after the type reference's
+/// selected resolution proves the `std` or `core` prelude item.
+pub fn rust_std_type_fact(name: &str) -> Option<&'static RustStdTypeFact> {
+    RUST_STD_TYPE_FACTS.iter().find(|fact| fact.name == name)
+}
+
+/// The value a reviewed standard operation produces (#3757).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RustStdValue {
+    /// A value of the named [`RUST_STD_TYPE_FACTS`] type.
+    StdType(&'static str),
+    /// A value of the named primitive type.
+    Primitive(&'static str),
+}
+
+/// A receiver type whose standard methods the reviewed facts describe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RustStdReceiver {
+    /// `str`, reached from a string literal or a `&str` binding through
+    /// built-in reference dereferences only.
+    Str,
+    /// `String`, whose inherent methods may use the built-in `str`
+    /// dereference but retain the owned receiver's standard identity.
+    String,
+}
+
+impl RustStdReceiver {
+    /// The canonical owner path the receiver's methods are published under.
+    /// `std::primitive::str` is the standard path that names the primitive.
+    pub const fn owner_path(self) -> &'static [&'static str] {
+        match self {
+            Self::Str => &["std", "primitive", "str"],
+            Self::String => &["std", "string", "String"],
+        }
+    }
+}
+
+/// The result type of one standard method on a reviewed receiver type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RustStdMethodFact {
+    pub receiver: RustStdReceiver,
+    pub method: &'static str,
+    /// The written argument count, excluding the receiver.
+    pub arity: usize,
+    pub result: RustStdValue,
+}
+
+/// Reviewed standard method result types.
+///
+/// `str` has no inherent `to_owned`; the call reaches `<str as
+/// ToOwned>::to_owned`, whose `Owned` type is `String`. A method that is not
+/// listed here leaves its result type unproven. The taint transfer of each
+/// method is not a type fact: it ships as a reviewed procedure summary.
+pub const RUST_STD_METHOD_FACTS: &[RustStdMethodFact] = &[
+    RustStdMethodFact {
+        receiver: RustStdReceiver::Str,
+        method: "to_owned",
+        arity: 0,
+        result: RustStdValue::StdType("String"),
+    },
+    RustStdMethodFact {
+        receiver: RustStdReceiver::Str,
+        method: "len",
+        arity: 0,
+        result: RustStdValue::Primitive("usize"),
+    },
+    RustStdMethodFact {
+        receiver: RustStdReceiver::String,
+        method: "len",
+        arity: 0,
+        result: RustStdValue::Primitive("usize"),
+    },
+];
+
+/// The reviewed result type of `method` with `arity` written arguments on a
+/// receiver of type `receiver`, if any.
+pub fn rust_std_method_fact(
+    receiver: RustStdReceiver,
+    method: &str,
+    arity: usize,
+) -> Option<&'static RustStdMethodFact> {
+    RUST_STD_METHOD_FACTS
+        .iter()
+        .find(|fact| fact.receiver == receiver && fact.method == method && fact.arity == arity)
+}
+
+/// The result type of one associated function of a reviewed std prelude
+/// type, called through the type's path, such as `String::new()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RustStdAssociatedFact {
+    /// The [`RUST_STD_TYPE_FACTS`] type the function is associated with.
+    pub owner: &'static str,
+    pub function: &'static str,
+    /// The written argument count.
+    pub arity: usize,
+    pub result: RustStdValue,
+}
+
+/// Reviewed associated-function result types. A function that is not listed
+/// leaves its result type unproven.
+pub const RUST_STD_ASSOCIATED_FACTS: &[RustStdAssociatedFact] = &[RustStdAssociatedFact {
+    owner: "String",
+    function: "new",
+    arity: 0,
+    result: RustStdValue::StdType("String"),
+}];
+
+/// The reviewed result type of `owner::function` with `arity` written
+/// arguments, if any. Callers may use it only after the owner's selected
+/// resolution proves the `std` prelude type.
+pub fn rust_std_associated_fact(
+    owner: &str,
+    function: &str,
+    arity: usize,
+) -> Option<&'static RustStdAssociatedFact> {
+    RUST_STD_ASSOCIATED_FACTS
+        .iter()
+        .find(|fact| fact.owner == owner && fact.function == function && fact.arity == arity)
+}
+
+/// `String + &str` is `<String as Add<&str>>::add`, whose output is
+/// `String`. It is the only standard `Add` implementation with a `String`
+/// left operand, and the right operand must be proven to be `&str`.
+pub const RUST_STD_STRING_ADD_STR: RustStdValue = RustStdValue::StdType("String");
+
+/// A prelude value that constructs a variant of a reviewed standard type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RustStdConstructorFact {
+    /// The prelude value name.
+    pub name: &'static str,
+    /// The [`RUST_STD_TYPE_FACTS`] type it constructs.
+    pub constructs: &'static str,
+    /// The written argument count.
+    pub arity: usize,
+}
+
+/// `Ok(x)` and `Err(x)` construct a `Result` and `Some(x)` an `Option`. The
+/// constructed variant holds its argument; the transfer itself ships as a
+/// reviewed procedure summary on the constructor's canonical identity.
+pub const RUST_STD_CONSTRUCTOR_FACTS: &[RustStdConstructorFact] = &[
+    RustStdConstructorFact {
+        name: "Ok",
+        constructs: "Result",
+        arity: 1,
+    },
+    RustStdConstructorFact {
+        name: "Err",
+        constructs: "Result",
+        arity: 1,
+    },
+    RustStdConstructorFact {
+        name: "Some",
+        constructs: "Option",
+        arity: 1,
+    },
+];
+
+/// The reviewed fact for one prelude value constructor, if any. Callers may
+/// use it only after the callee's selected resolution proves the `std` or
+/// `core` prelude value.
+pub fn rust_std_constructor_fact(name: &str) -> Option<&'static RustStdConstructorFact> {
+    RUST_STD_CONSTRUCTOR_FACTS
+        .iter()
+        .find(|fact| fact.name == name)
+}
+
 /// Whether any edition's std or core prelude injects `name` into
 /// `namespace`. A producer that does not know the crate asks this; the crate
 /// context narrows it with [`rust_prelude_name`].
@@ -250,6 +505,7 @@ pub fn rust_prelude_name(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
 
     fn names(edition: RustEdition, prelude: RustPreludeCrate) -> Vec<&'static str> {
         let mut names = RUST_PRELUDE_NAMES
@@ -270,10 +526,31 @@ mod tests {
             .collect()
     }
 
-    /// The documented edition preludes differ only by the names each edition
-    /// added: `rust_2018` equals `rust_2015` (the v1 prelude), `rust_2021`
-    /// adds `TryFrom`, `TryInto` and `FromIterator`, and `rust_2024` adds
-    /// `Future` and `IntoFuture`. No edition removes a name.
+    #[test]
+    #[hardwon(
+        "#3746: standard marker traits were treated as traits with associated member surfaces"
+    )]
+    fn itemless_standard_marker_traits_are_distinct_from_clone() {
+        let mut entries = RUST_MARKER_TRAITS_WITHOUT_ASSOCIATED_ITEMS
+            .iter()
+            .map(|entry| (entry.name, entry.module, entry.in_prelude))
+            .collect::<Vec<_>>();
+        entries.sort_unstable();
+        assert_eq!(
+            entries,
+            vec![
+                ("Copy", "marker", true),
+                ("RefUnwindSafe", "panic", false),
+                ("Send", "marker", true),
+                ("Sized", "marker", true),
+                ("Sync", "marker", true),
+                ("Unpin", "marker", true),
+                ("UnwindSafe", "panic", false),
+            ]
+        );
+        assert!(rust_marker_trait_without_associated_items("Clone").is_none());
+    }
+
     #[test]
     fn edition_preludes_differ_by_the_documented_additions() {
         for prelude in [RustPreludeCrate::Std, RustPreludeCrate::Core] {
@@ -297,8 +574,6 @@ mod tests {
         }
     }
 
-    /// std's prelude is core's plus the allocator names `Box`, `String`,
-    /// `ToOwned`, `ToString` and `Vec`, in every edition.
     #[test]
     fn std_adds_exactly_the_allocator_names_to_core() {
         for edition in [
@@ -316,8 +591,6 @@ mod tests {
         }
     }
 
-    /// Value-namespace names are the variants and functions the prelude
-    /// re-exports; every other name is a type or trait.
     #[test]
     fn the_value_namespace_holds_the_variants_and_functions() {
         let mut values = RUST_PRELUDE_NAMES
@@ -340,27 +613,5 @@ mod tests {
                 "size_of_val"
             ]
         );
-    }
-
-    #[test]
-    fn itemless_standard_marker_traits_are_distinct_from_clone() {
-        let mut entries = RUST_MARKER_TRAITS_WITHOUT_ASSOCIATED_ITEMS
-            .iter()
-            .map(|entry| (entry.name, entry.module, entry.in_prelude))
-            .collect::<Vec<_>>();
-        entries.sort_unstable();
-        assert_eq!(
-            entries,
-            vec![
-                ("Copy", "marker", true),
-                ("RefUnwindSafe", "panic", false),
-                ("Send", "marker", true),
-                ("Sized", "marker", true),
-                ("Sync", "marker", true),
-                ("Unpin", "marker", true),
-                ("UnwindSafe", "panic", false),
-            ]
-        );
-        assert!(rust_marker_trait_without_associated_items("Clone").is_none());
     }
 }

@@ -53,10 +53,11 @@ impl JavaIntegralDomain {
 
 /// Parse one unsuffixed decimal-literal token before Java's `int` range check.
 pub(crate) fn decimal_integer_value(source: &str, node: Node<'_>) -> Option<i64> {
-    (node.kind() == "decimal_integer_literal")
-        .then(|| source.get(node.byte_range()))
-        .flatten()
-        .and_then(|text| text.parse::<i64>().ok())
+    crate::analyzer::common::integer_literal_value_with_kind(
+        source,
+        node,
+        "decimal_integer_literal",
+    )
 }
 
 /// Decode an unsuffixed Java decimal `int` literal and its direct unary sign.
@@ -257,8 +258,12 @@ pub fn java_scalar_binding_types(
 #[cfg(test)]
 mod tests {
     use super::JavaIntegralDomain;
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
+    #[hardwon(
+        "be0eb46d6b9a: Java decimal literal ranges must preserve exact integral assignment facts"
+    )]
     fn unsuffixed_decimal_assignment_respects_java_primitive_ranges() {
         assert!(JavaIntegralDomain::Signed(8).accepts_decimal_int_literal(127));
         assert!(!JavaIntegralDomain::Signed(8).accepts_decimal_int_literal(128));

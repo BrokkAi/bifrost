@@ -237,7 +237,7 @@ fn resolve_qualified_type<'a>(
         };
         visible
             .iter()
-            .find(|candidate| cpp_name_for(candidate) == qualified)
+            .find(|candidate| crate::graph::resolver::cpp_name_for(candidate) == qualified)
     })
 }
 
@@ -253,14 +253,5 @@ fn namespace_search_order(package_name: &str) -> Vec<&str> {
             return namespaces;
         };
         current = parent;
-    }
-}
-
-fn cpp_name_for(unit: &CodeUnit) -> String {
-    let short = unit.short_name().replace(['.', '$'], "::");
-    if unit.package_name().is_empty() {
-        short
-    } else {
-        format!("{}::{}", unit.package_name(), short)
     }
 }

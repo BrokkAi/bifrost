@@ -15,37 +15,11 @@ pub struct ScalaFileSourceFacts {
 
 impl ScalaFileSourceFacts {
     pub fn estimated_retained_bytes(&self) -> usize {
-        self.source
-            .estimated_bytes()
-            .saturating_add(self.facts.estimated_retained_bytes())
-            .saturating_add(
-                self.declaration_units
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<(SourceDeclarationId, Vec<CodeUnit>)>()),
-            )
-            .saturating_add(
-                self.declaration_units
-                    .values()
-                    .map(|units| {
-                        units
-                            .capacity()
-                            .saturating_mul(std::mem::size_of::<CodeUnit>())
-                            .saturating_add(
-                                units
-                                    .iter()
-                                    .map(|unit| {
-                                        unit.fq_name()
-                                            .len()
-                                            .saturating_add(unit.signature().map_or(0, str::len))
-                                            .saturating_add(
-                                                unit.source().rel_path().to_string_lossy().len(),
-                                            )
-                                    })
-                                    .sum::<usize>(),
-                            )
-                    })
-                    .sum::<usize>(),
-            )
+        brokk_bifrost_core::analyzer::source_facts::source_projection_retained_bytes(
+            &self.source,
+            self.facts.estimated_retained_bytes(),
+            &self.declaration_units,
+        )
     }
 }
 
@@ -55,10 +29,11 @@ impl ScalaFileSourceFacts {
         unit: &'a CodeUnit,
     ) -> impl Iterator<Item = &'a brokk_bifrost_core::analyzer::scala_facts::ScalaDeclarationSourceFact>
     {
-        self.facts.declarations.iter().filter(move |fact| {
-            self.declaration_units
-                .get(&fact.declaration)
-                .is_some_and(|units| units.contains(unit))
-        })
+        brokk_bifrost_core::analyzer::source_facts::declarations_for_unit(
+            &self.facts.declarations,
+            &self.declaration_units,
+            unit,
+            |fact| fact.declaration,
+        )
     }
 }

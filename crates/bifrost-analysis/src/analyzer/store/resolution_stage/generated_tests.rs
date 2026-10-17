@@ -22,8 +22,7 @@ fn host(
     ordinal: u32,
 ) -> std::sync::Arc<SelectedResolutionMountRecord> {
     selection
-        .persisted_mount_record(SelectedResolutionMountOrdinal::new(ordinal))
-        .unwrap()
+        .mount_record_by_ordinal(SelectedResolutionMountOrdinal::new(ordinal))
         .unwrap()
 }
 
@@ -61,17 +60,7 @@ fn snapshot(connection: &Connection) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
 // exact endpoint identities and variable aliasing across both endpoint stacks;
 // the allocation ceiling is derived metadata, not part of that behavior.
 fn assert_path_body(actual: &PartialPath, expected: &PartialPath) {
-    assert_eq!(
-        actual
-            .stack_effect_alpha_key_with_poll(&mut || false)
-            .unwrap(),
-        expected
-            .stack_effect_alpha_key_with_poll(&mut || false)
-            .unwrap(),
-    );
-    assert_eq!(actual.precedence(), expected.precedence());
-    assert_eq!(actual.witness(), expected.witness());
-    assert_eq!(actual.completion(), expected.completion());
+    super::super::assert_partial_path_bodies_equal(actual, expected);
 }
 
 fn assert_paths(
@@ -124,6 +113,14 @@ fn macro_pair_preserves_constructor_paths_same_host_and_cross_host_and_repeats()
                 &target_host,
                 definition,
                 definition_node,
+                brokk_bifrost_core::analyzer::canonical_hash::hash_domain_bytes(
+                    b"test-generated-reference-content:v1",
+                    &[],
+                ),
+                brokk_bifrost_core::analyzer::canonical_hash::hash_domain_bytes(
+                    b"test-generated-definition-content:v1",
+                    &[],
+                ),
                 &cancellation,
             )
         };
@@ -168,7 +165,15 @@ fn macro_pair_preserves_constructor_paths_same_host_and_cross_host_and_repeats()
                     &target_host,
                     definition,
                     BindingNodeId::context_local((1 << 53) + 62),
-                    &cancellation
+                    brokk_bifrost_core::analyzer::canonical_hash::hash_domain_bytes(
+                        b"test-generated-reference-content:v1",
+                        &[]
+                    ),
+                    brokk_bifrost_core::analyzer::canonical_hash::hash_domain_bytes(
+                        b"test-generated-definition-content:v1",
+                        &[]
+                    ),
+                    &cancellation,
                 )
                 .is_err()
         );
@@ -225,6 +230,14 @@ fn include_pair_preserves_borrowed_runtime_body_and_allocates_fresh_after_clear(
                 original_identity,
                 &original,
                 BindingNodeKind::Definition(definition),
+                brokk_bifrost_core::analyzer::canonical_hash::hash_domain_bytes(
+                    b"test-generated-path-content:v1",
+                    &[],
+                ),
+                brokk_bifrost_core::analyzer::canonical_hash::hash_domain_bytes(
+                    b"test-generated-scope-content:v1",
+                    &[],
+                ),
                 &cancellation,
             )
         };
@@ -265,7 +278,15 @@ fn include_pair_preserves_borrowed_runtime_body_and_allocates_fresh_after_clear(
                     original_identity,
                     &changed,
                     BindingNodeKind::Definition(definition),
-                    &cancellation
+                    brokk_bifrost_core::analyzer::canonical_hash::hash_domain_bytes(
+                        b"test-generated-path-content:v1",
+                        &[]
+                    ),
+                    brokk_bifrost_core::analyzer::canonical_hash::hash_domain_bytes(
+                        b"test-generated-scope-content:v1",
+                        &[]
+                    ),
+                    &cancellation,
                 )
                 .is_err()
         );
@@ -434,7 +455,15 @@ fn cancelled_second_half_rolls_back_both_halves_and_all_counter_reservations() {
                     &target_host,
                     SemanticId::context_local(20),
                     BindingNodeId::context_local(21),
-                    &token
+                    brokk_bifrost_core::analyzer::canonical_hash::hash_domain_bytes(
+                        b"test-generated-reference-content:v1",
+                        &[]
+                    ),
+                    brokk_bifrost_core::analyzer::canonical_hash::hash_domain_bytes(
+                        b"test-generated-definition-content:v1",
+                        &[]
+                    ),
+                    &token,
                 )
                 .unwrap(),
             None
@@ -462,7 +491,15 @@ fn cancelled_second_half_rolls_back_both_halves_and_all_counter_reservations() {
                     &target_host,
                     SemanticId::context_local(20),
                     BindingNodeId::context_local(21),
-                    &CancellationToken::new()
+                    brokk_bifrost_core::analyzer::canonical_hash::hash_domain_bytes(
+                        b"test-generated-reference-content:v1",
+                        &[]
+                    ),
+                    brokk_bifrost_core::analyzer::canonical_hash::hash_domain_bytes(
+                        b"test-generated-definition-content:v1",
+                        &[]
+                    ),
+                    &CancellationToken::new(),
                 )
                 .unwrap(),
             Some(())
@@ -492,7 +529,15 @@ fn existing_source_half_still_validates_its_body_and_rebuilds_missing_target_ato
                 &target,
                 definition,
                 definition_node,
-                &cancellation
+                brokk_bifrost_core::analyzer::canonical_hash::hash_domain_bytes(
+                    b"test-generated-reference-content:v1",
+                    &[]
+                ),
+                brokk_bifrost_core::analyzer::canonical_hash::hash_domain_bytes(
+                    b"test-generated-definition-content:v1",
+                    &[]
+                ),
+                &cancellation,
             )
             .unwrap(),
         Some(())
@@ -517,7 +562,15 @@ fn existing_source_half_still_validates_its_body_and_rebuilds_missing_target_ato
                 &target,
                 definition,
                 definition_node,
-                &cancellation
+                brokk_bifrost_core::analyzer::canonical_hash::hash_domain_bytes(
+                    b"test-generated-reference-content:v1",
+                    &[]
+                ),
+                brokk_bifrost_core::analyzer::canonical_hash::hash_domain_bytes(
+                    b"test-generated-definition-content:v1",
+                    &[]
+                ),
+                &cancellation,
             )
             .is_err()
     );
@@ -532,7 +585,15 @@ fn existing_source_half_still_validates_its_body_and_rebuilds_missing_target_ato
                 &target,
                 definition,
                 definition_node,
-                &cancellation
+                brokk_bifrost_core::analyzer::canonical_hash::hash_domain_bytes(
+                    b"test-generated-reference-content:v1",
+                    &[]
+                ),
+                brokk_bifrost_core::analyzer::canonical_hash::hash_domain_bytes(
+                    b"test-generated-definition-content:v1",
+                    &[]
+                ),
+                &cancellation,
             )
             .unwrap(),
         Some(())
@@ -579,7 +640,15 @@ fn existing_target_mismatch_rolls_back_a_new_source_half() {
                 &target,
                 definition,
                 BindingNodeId::context_local(21),
-                &cancellation
+                brokk_bifrost_core::analyzer::canonical_hash::hash_domain_bytes(
+                    b"test-generated-reference-content:v1",
+                    &[]
+                ),
+                brokk_bifrost_core::analyzer::canonical_hash::hash_domain_bytes(
+                    b"test-generated-definition-content:v1",
+                    &[]
+                ),
+                &cancellation,
             )
             .unwrap(),
         Some(())
@@ -604,6 +673,14 @@ fn existing_target_mismatch_rolls_back_a_new_source_half() {
             &target,
             definition,
             BindingNodeId::context_local(22),
+            brokk_bifrost_core::analyzer::canonical_hash::hash_domain_bytes(
+                b"test-generated-reference-content:v1",
+                &[],
+            ),
+            brokk_bifrost_core::analyzer::canonical_hash::hash_domain_bytes(
+                b"test-generated-definition-content:v1",
+                &[],
+            ),
             &cancellation,
         )
         .unwrap_err();

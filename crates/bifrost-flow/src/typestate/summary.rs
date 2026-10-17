@@ -5,15 +5,17 @@ use std::fmt;
 use std::mem::size_of;
 
 use crate::analyzer::semantic::{
-    DeclarationLocator, DurableValueIdentity, IcfgProvider, ProcedureHandle, ReturnTransferKind,
-    SemanticArtifactKey, SemanticBudget, SemanticLocator,
+    DurableValueIdentity, IcfgProvider, ProcedureHandle, ReturnTransferKind, SemanticBudget,
+    SemanticLocator,
 };
 use crate::dataflow::{
     DataflowRequest, PathQuality, PathQualityFrontier, ProcedureSummaryKey, ReusableEndSummary,
     ReusableProcedureSummary, ReusableReachedFact, ReusableSummaryError, ReusableSummaryProvider,
-    SemanticProcedureSummary, SemanticSummarySetValidationError, SolverTermination,
-    SummaryCallCycle, SummaryCalledProcedures, SummaryDependencyKey, SummaryExitKind,
-    SummaryRecursiveGroupKey, canonicalize_semantic_summary_items,
+    SemanticProcedureSummary, SemanticSummaryArtifactIndex, SemanticSummarySetValidationError,
+    SolverTermination, SummaryCallCycle, SummaryCalledProcedures, SummaryDependencyKey,
+    SummaryExitKind, SummaryRecursiveGroupKey, canonical_semantic_summaries_by_artifact,
+    path_evidence_from_frontier, path_evidence_has_complete_path,
+    path_evidence_has_proven_complete_path, path_evidence_has_proven_path, path_evidence_qualities,
     validate_recursive_summary_batch,
 };
 
@@ -112,14 +114,14 @@ impl ProtocolSummaryKey {
 #[derive(Debug)]
 pub struct ProtocolSemanticSummarySet<'summary> {
     summaries: Box<[&'summary SemanticProcedureSummary]>,
-    by_artifact: HashMap<SemanticArtifactKey, HashMap<DeclarationLocator, usize>>,
+    by_artifact: SemanticSummaryArtifactIndex,
 }
 
 impl<'summary> ProtocolSemanticSummarySet<'summary> {
     pub fn try_new(
         summaries: Vec<&'summary SemanticProcedureSummary>,
     ) -> Result<Self, ProtocolSummaryError> {
-        let summaries = canonicalize_semantic_summary_items(summaries, |summary| *summary, true)
+        let (summaries, by_artifact) = canonical_semantic_summaries_by_artifact(summaries)
             .map_err(|error| match error {
                 SemanticSummarySetValidationError::Incomplete => {
                     ProtocolSummaryError::IncompleteSemanticSummary
@@ -128,18 +130,6 @@ impl<'summary> ProtocolSemanticSummarySet<'summary> {
                     ProtocolSummaryError::AmbiguousSemanticSummary
                 }
             })?;
-        let mut by_artifact =
-            HashMap::<SemanticArtifactKey, HashMap<DeclarationLocator, usize>>::new();
-        for (index, summary) in summaries.iter().enumerate() {
-            if by_artifact
-                .entry(summary.key().artifact().clone())
-                .or_default()
-                .insert(summary.key().declaration().clone(), index)
-                .is_some()
-            {
-                return Err(ProtocolSummaryError::AmbiguousSemanticSummary);
-            }
-        }
         Ok(Self {
             summaries,
             by_artifact,
@@ -155,11 +145,11 @@ impl<'summary> ProtocolSemanticSummarySet<'summary> {
     }
 
     fn unique_summary_for(&self, procedure: &ProcedureHandle) -> Option<&SemanticProcedureSummary> {
-        let index = self
-            .by_artifact
-            .get(procedure.artifact().key())?
-            .get(procedure.semantics().locator().declaration())?;
-        self.summaries.get(*index).copied()
+        crate::semantic_summary::unique_semantic_summary(
+            &self.by_artifact,
+            &self.summaries,
+            procedure,
+        )
     }
 
     pub(super) fn compatible_repository(
@@ -672,41 +662,23 @@ pub struct ProtocolPathEvidence(u8);
 
 impl ProtocolPathEvidence {
     pub const fn has_proven_path(self) -> bool {
-        self.0 & 0b1100 != 0
+        path_evidence_has_proven_path(self.0)
     }
 
     pub const fn has_complete_path(self) -> bool {
-        self.0 & 0b1010 != 0
+        path_evidence_has_complete_path(self.0)
     }
 
     pub const fn has_proven_complete_path(self) -> bool {
-        self.0 & 0b1000 != 0
+        path_evidence_has_proven_complete_path(self.0)
     }
 
     fn from_frontier(frontier: PathQualityFrontier) -> Self {
-        let mut bits = 0;
-        for quality in frontier.iter() {
-            bits |= match (quality.is_proven(), quality.is_complete()) {
-                (false, false) => 0b0001,
-                (false, true) => 0b0010,
-                (true, false) => 0b0100,
-                (true, true) => 0b1000,
-            };
-        }
-        Self(bits)
+        Self(path_evidence_from_frontier(frontier))
     }
 
     fn qualities(self) -> Box<[PathQuality]> {
-        [
-            (0b0001, PathQuality::UNPROVEN_PARTIAL),
-            (0b0010, PathQuality::UNPROVEN_COMPLETE),
-            (0b0100, PathQuality::PROVEN_PARTIAL),
-            (0b1000, PathQuality::PROVEN_COMPLETE),
-        ]
-        .into_iter()
-        .filter_map(|(bit, quality)| (self.0 & bit != 0).then_some(quality))
-        .collect::<Vec<_>>()
-        .into_boxed_slice()
+        path_evidence_qualities(self.0)
     }
 }
 
@@ -807,9 +779,7 @@ impl ProtocolSummary {
     }
 
     fn row_range(&self, input: &ProtocolFactKey) -> std::ops::Range<usize> {
-        let start = self.rows.partition_point(|row| row.input < *input);
-        let end = start + self.rows[start..].partition_point(|row| row.input == *input);
-        start..end
+        crate::dataflow::sorted_equal_range_by(&self.rows, input, |row, input| row.input.cmp(input))
     }
 
     fn effect_range(&self, input: &ProtocolFactKey) -> std::ops::Range<usize> {
@@ -906,7 +876,7 @@ impl ProtocolSummary {
             .saturating_add(self.effects.iter().fold(0_usize, |total, effect| {
                 total
                     .saturating_add(protocol_fact_heap_bytes(&effect.input))
-                    .saturating_add(semantic_locator_heap_bytes(&effect.site))
+                    .saturating_add(crate::value_flow::semantic_locator_heap_bytes(&effect.site))
                     .saturating_add(protocol_fact_heap_bytes(&effect.observation))
             }))
     }
@@ -1076,7 +1046,7 @@ impl CompleteProtocolSummaryRepository {
         &mut self,
         summary: ProtocolSummary,
     ) -> Result<ProtocolSummaryPublicationOutcome, ProtocolSummaryPublicationError> {
-        if summary.key.procedure().recursive_group().is_some() {
+        if summary.key.procedure().is_recursive() {
             return Err(ProtocolSummaryPublicationError::RecursiveSummaryRequiresBatch);
         }
         self.publish_preflighted(summary)
@@ -1193,15 +1163,18 @@ impl CompleteProtocolSummaryRepository {
         &self,
         additions: &[&ProtocolSummary],
     ) -> Result<(), ProtocolSummaryPublicationError> {
-        let entries = self.entries.len().saturating_add(additions.len());
+        let added_bytes = additions.iter().fold(0_usize, |total, summary| {
+            total.saturating_add(protocol_repository_entry_bytes(summary))
+        });
+        let (entries, bytes) = crate::dataflow::summary_capacity_totals(
+            self.entries.len(),
+            self.retained_bytes,
+            additions.len(),
+            added_bytes,
+        );
         if entries > self.limits.max_entries {
             return Err(ProtocolSummaryPublicationError::EntryLimitExceeded);
         }
-        let bytes = additions
-            .iter()
-            .fold(self.retained_bytes, |total, summary| {
-                total.saturating_add(protocol_repository_entry_bytes(summary))
-            });
         if bytes > self.limits.max_bytes {
             return Err(ProtocolSummaryPublicationError::ByteLimitExceeded);
         }
@@ -1742,7 +1715,7 @@ where
     let root_semantic = semantic_summaries
         .unique_summary_for(root)
         .ok_or(ProtocolSummaryError::ProcedureMismatch)?;
-    if !procedure_matches(root, root_semantic.key()) {
+    if !root_semantic.key().matches_procedure(root) {
         return Err(ProtocolSummaryError::ProcedureMismatch.into());
     }
     let binding_contracts = semantic_summaries
@@ -1810,7 +1783,7 @@ where
         .summaries
         .iter()
         .find(|summary| {
-            procedure_matches(root, summary.key.procedure())
+            summary.key.procedure().matches_procedure(root)
                 && summary.key.entry_facts() == root_entries.as_slice()
         })
         .map(|summary| {
@@ -2119,11 +2092,6 @@ fn validate_key_inputs(
     Ok(())
 }
 
-fn procedure_matches(procedure: &ProcedureHandle, key: &ProcedureSummaryKey) -> bool {
-    procedure.artifact().key() == key.artifact()
-        && procedure.semantics().locator().declaration() == key.declaration()
-}
-
 fn exit_kind(kind: ReturnTransferKind) -> SummaryExitKind {
     match kind {
         ReturnTransferKind::Normal => SummaryExitKind::Normal,
@@ -2315,21 +2283,28 @@ fn protocol_fact_heap_bytes(fact: &ProtocolFactKey) -> usize {
 }
 
 fn event_key_heap_bytes(key: &ProtocolEventBindingKey) -> usize {
-    key.event
-        .as_str()
-        .len()
-        .saturating_add(subject_key_heap_bytes(&key.subject))
-        .saturating_add(semantic_locator_heap_bytes(&key.site))
-        .saturating_add(context_key_heap_bytes(&key.context))
+    observation_key_heap_bytes(key.event.as_str(), &key.subject, &key.site, &key.context)
 }
 
 fn terminal_key_heap_bytes(key: &ProtocolTerminalBindingKey) -> usize {
-    key.expectation
-        .as_str()
-        .len()
-        .saturating_add(subject_key_heap_bytes(&key.subject))
-        .saturating_add(semantic_locator_heap_bytes(&key.site))
-        .saturating_add(context_key_heap_bytes(&key.context))
+    observation_key_heap_bytes(
+        key.expectation.as_str(),
+        &key.subject,
+        &key.site,
+        &key.context,
+    )
+}
+
+fn observation_key_heap_bytes(
+    name: &str,
+    subject: &TypestateSubjectKey,
+    site: &SemanticLocator,
+    context: &TypestateContextKey,
+) -> usize {
+    name.len()
+        .saturating_add(subject_key_heap_bytes(subject))
+        .saturating_add(crate::value_flow::semantic_locator_heap_bytes(site))
+        .saturating_add(context_key_heap_bytes(context))
 }
 
 fn subject_key_heap_bytes(key: &TypestateSubjectKey) -> usize {
@@ -2341,14 +2316,21 @@ fn subject_key_heap_bytes(key: &TypestateSubjectKey) -> usize {
 
 fn object_key_heap_bytes(key: &TypestateObjectKey) -> usize {
     match key {
+        TypestateObjectKey::FieldPath { base, member } => object_key_heap_bytes(base)
+            .saturating_add(crate::value_flow::semantic_locator_heap_bytes(member)),
+        TypestateObjectKey::CallSubstitution { context, base } => {
+            context_key_heap_bytes(context).saturating_add(object_key_heap_bytes(base))
+        }
         TypestateObjectKey::Value(locator)
         | TypestateObjectKey::Allocation(locator)
         | TypestateObjectKey::Static(locator)
         | TypestateObjectKey::TypeSummary(locator)
         | TypestateObjectKey::ModuleObject(locator)
-        | TypestateObjectKey::External(locator) => semantic_locator_heap_bytes(locator),
+        | TypestateObjectKey::External(locator) => {
+            crate::value_flow::semantic_locator_heap_bytes(locator)
+        }
         TypestateObjectKey::LexicalCell { locator, binding } => {
-            semantic_locator_heap_bytes(locator)
+            crate::value_flow::semantic_locator_heap_bytes(locator)
                 .saturating_add(durable_value_identity_heap_bytes(binding))
         }
         TypestateObjectKey::CallResult {
@@ -2357,14 +2339,14 @@ fn object_key_heap_bytes(key: &TypestateObjectKey) -> usize {
             callee,
             caller_context,
             callee_context,
-        } => semantic_locator_heap_bytes(call)
-            .saturating_add(semantic_locator_heap_bytes(result))
-            .saturating_add(semantic_locator_heap_bytes(callee))
+        } => crate::value_flow::semantic_locator_heap_bytes(call)
+            .saturating_add(crate::value_flow::semantic_locator_heap_bytes(result))
+            .saturating_add(crate::value_flow::semantic_locator_heap_bytes(callee))
             .saturating_add(context_key_heap_bytes(caller_context))
             .saturating_add(context_key_heap_bytes(callee_context)),
         TypestateObjectKey::ProcedurePort { procedure, .. }
         | TypestateObjectKey::CaptureSlot { procedure, .. } => {
-            semantic_locator_heap_bytes(procedure)
+            crate::value_flow::semantic_locator_heap_bytes(procedure)
         }
         TypestateObjectKey::RuntimeObject {
             runtime_profile_digest,
@@ -2394,30 +2376,14 @@ fn object_key_heap_bytes(key: &TypestateObjectKey) -> usize {
 }
 
 fn durable_value_identity_heap_bytes(value: &DurableValueIdentity) -> usize {
-    semantic_locator_heap_bytes(&value.locator).saturating_add(value.role.len())
+    crate::value_flow::semantic_locator_heap_bytes(&value.locator).saturating_add(value.role.len())
 }
 
 fn context_key_heap_bytes(key: &TypestateContextKey) -> usize {
     size_of_val(key.calls()).saturating_add(
         key.calls()
             .iter()
-            .map(semantic_locator_heap_bytes)
+            .map(crate::value_flow::semantic_locator_heap_bytes)
             .fold(0_usize, usize::saturating_add),
     )
-}
-
-fn semantic_locator_heap_bytes(locator: &SemanticLocator) -> usize {
-    let segments = locator.declaration().segments();
-    locator
-        .path()
-        .as_str()
-        .len()
-        .saturating_add(size_of_val(segments))
-        .saturating_add(
-            segments
-                .iter()
-                .filter_map(|segment| segment.name())
-                .map(str::len)
-                .fold(0_usize, usize::saturating_add),
-        )
 }

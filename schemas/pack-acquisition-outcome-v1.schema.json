@@ -1,0 +1,263 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bifrost.dev/schemas/pack-acquisition-outcome-v1.schema.json",
+  "title": "Open Pack Acquisition Outcome",
+  "description": "The machine-readable result of one prepare-open-packs invocation that passed argument validation.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "outcome_schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "selected",
+        "failed"
+      ]
+    },
+    "engine": {
+      "$ref": "#/$defs/OutcomeEngine"
+    },
+    "request": {
+      "anyOf": [
+        {
+          "$ref": "pack-request-v1.schema.json"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "failure": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Failure"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "rejections": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {
+        "$ref": "pack-selection-receipt-v3.schema.json#/$defs/Rejection"
+      }
+    },
+    "inventory": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/OutcomeInventory"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "selection": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/OutcomeSelection"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "required": [
+    "outcome_schema_version",
+    "status",
+    "engine",
+    "request",
+    "failure",
+    "rejections",
+    "inventory",
+    "selection",
+    "created_at"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "selected"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "failure": {
+            "type": "null"
+          },
+          "selection": {
+            "$ref": "#/$defs/OutcomeSelection"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "failed"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "failure": {
+            "$ref": "#/$defs/Failure"
+          },
+          "selection": {
+            "type": "null"
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "Sha256": {
+      "type": "string",
+      "pattern": "^[A-Fa-f0-9]{64}$"
+    },
+    "OutcomeEngine": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "build_identity": {
+          "type": "string",
+          "minLength": 1
+        },
+        "executable_sha256": {
+          "$ref": "#/$defs/Sha256"
+        }
+      },
+      "required": [
+        "version",
+        "build_identity",
+        "executable_sha256"
+      ]
+    },
+    "Failure": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "class": {
+          "type": "string",
+          "enum": [
+            "invalid-configuration",
+            "invalid-source",
+            "invalid-profile",
+            "invalid-manifest",
+            "missing-strict-selection",
+            "incompatible-strict-selection",
+            "no-compatible-release",
+            "integrity",
+            "access-denied",
+            "unavailable",
+            "offline-cache-miss",
+            "pending",
+            "unqualified"
+          ]
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "message": {
+          "type": "string",
+          "maxLength": 1024
+        }
+      },
+      "required": [
+        "class",
+        "retryable",
+        "message"
+      ]
+    },
+    "OutcomeInventory": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "index_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "fetched_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "fetched_online": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "index_sha256",
+        "fetched_at",
+        "fetched_online"
+      ]
+    },
+    "OutcomeSelection": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "selection_id": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "selection_reason": {
+          "type": "string",
+          "enum": [
+            "strict-lock",
+            "preferred-version",
+            "highest-eligible"
+          ]
+        },
+        "cache_reused": {
+          "type": "boolean"
+        },
+        "receipt_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "policy_pack_root": {
+          "type": "string",
+          "minLength": 1
+        },
+        "semantic_bundle_root": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "receipt": {
+          "$ref": "pack-selection-receipt-v3.schema.json"
+        }
+      },
+      "required": [
+        "selection_id",
+        "selection_reason",
+        "cache_reused",
+        "receipt_path",
+        "policy_pack_root",
+        "semantic_bundle_root",
+        "receipt"
+      ]
+    }
+  }
+}

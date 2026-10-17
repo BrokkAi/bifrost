@@ -1,3 +1,4 @@
+use super::child_path;
 use super::domain::ConfigurationFormat;
 use super::schema::{
     CallTraversalCompleteness, CodeQueryExecutionMode, QuerySemanticFacet, QueryStepOp,
@@ -5,16 +6,23 @@ use super::schema::{
 };
 use crate::refs::{ProtocolRef, TaintResultRef, ValueFlowPlanRef};
 use crate::structural::{CodeQueryRowField, CodeQueryRowScalarType, DetailedCodeQueryDomain};
+use brokk_bifrost_analysis::analyzer::common::find_by_label;
 use brokk_bifrost_core::analyzer::Language;
 use brokk_bifrost_core::analyzer::configuration::{
     ConfigurationMemberRole, ConfigurationScalarKind, ConfigurationValueProvenance,
 };
+use brokk_bifrost_core::analyzer::cpp_class_facts::CppClassFactKind;
+use brokk_bifrost_core::analyzer::cpp_facts::CppProvenanceRule;
+use brokk_bifrost_core::analyzer::statement_facts::StatementFactKind;
+use brokk_bifrost_core::analyzer::structural::body_relations::{BodyOwner, BodyState};
 use brokk_bifrost_core::analyzer::structural::control_relation::{
     ControlExitPartition, ControlRelationKind,
 };
 use brokk_bifrost_core::analyzer::structural::edges::{OwnerRelation, SiteClass};
+use brokk_bifrost_core::analyzer::structural::facts::AssignmentSequenceKind;
 use brokk_bifrost_core::analyzer::structural::flow_state::{
     FlowCertainty, FlowRelation as FlowRelationLabel, FlowSubjectKind, StateEventClass,
+    StateEventReadCause,
 };
 use brokk_bifrost_core::analyzer::structural::kinds::{NormalizedKind, Role};
 use brokk_bifrost_core::analyzer::structural::materialization::{
@@ -37,6 +45,7 @@ use regex::Regex;
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::ops::Range;
+use std::sync::LazyLock;
 
 /// Error returned when conjoined path-scope groups exceed the query budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,6 +232,8 @@ pub const MAX_DECORATOR_BINDING_FILTER_LENGTH: usize = 4096;
 pub const MAX_CONFIGURATION_FILTER_ENTRIES: usize = 32;
 /// Upper bound on one exact configuration key in a route filter.
 pub const MAX_CONFIGURATION_KEY_LENGTH: usize = 4096;
+/// Upper bound on one decoded configuration scalar value in a seed filter.
+pub const MAX_CONFIGURATION_VALUE_LENGTH: usize = 16 * 1024;
 /// Upper bound on ordered segments in one configuration route alternative.
 pub const MAX_CONFIGURATION_ROUTE_SEGMENTS: usize = 64;
 /// The single supported CodeQuery/RQL schema version. The pre-1.0 lineage of
@@ -239,6 +250,245 @@ pub const MAX_CONFIGURATION_ROUTE_SEGMENTS: usize = 64;
 /// version once an out-of-repository consumer exists.
 pub const SCHEMA_VERSION: u64 = 1;
 
+/// Closed C/C++ declaration and preprocessor relations supported by the
+/// declaration parity adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CppRule {
+    DuplicateIncludeGuard,
+    MissingHeaderGuard,
+    DeclarationHidesParameter,
+    DeclarationHidesVariable,
+    FunctionInBlock,
+    LocalVariableHidesGlobalVariable,
+    ShortGlobalName,
+    CallWithNullSal,
+    IgnoreReturnValueSal,
+    InconsistentSal,
+}
+
+impl CppRule {
+    pub const ALL: [Self; 10] = [
+        Self::DuplicateIncludeGuard,
+        Self::MissingHeaderGuard,
+        Self::DeclarationHidesParameter,
+        Self::DeclarationHidesVariable,
+        Self::FunctionInBlock,
+        Self::LocalVariableHidesGlobalVariable,
+        Self::ShortGlobalName,
+        Self::CallWithNullSal,
+        Self::IgnoreReturnValueSal,
+        Self::InconsistentSal,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::DuplicateIncludeGuard => "cpp/duplicate-include-guard",
+            Self::MissingHeaderGuard => "cpp/missing-header-guard",
+            Self::DeclarationHidesParameter => "cpp/declaration-hides-parameter",
+            Self::DeclarationHidesVariable => "cpp/declaration-hides-variable",
+            Self::FunctionInBlock => "cpp/function-in-block",
+            Self::LocalVariableHidesGlobalVariable => "cpp/local-variable-hides-global-variable",
+            Self::ShortGlobalName => "cpp/short-global-name",
+            Self::CallWithNullSal => "cpp/call-with-null-sal",
+            Self::IgnoreReturnValueSal => "cpp/ignore-return-value-sal",
+            Self::InconsistentSal => "cpp/inconsistent-sal",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        find_by_label(Self::ALL.iter().copied(), label, Self::label)
+    }
+}
+
+/// Closed C# structural relations that remain language-specific after generic
+/// RQL facts have selected the ordinary declaration shapes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CSharpRule {
+    StaticArray,
+    UseNumberConstant,
+}
+
+impl CSharpRule {
+    pub const ALL: [Self; 2] = [Self::StaticArray, Self::UseNumberConstant];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::StaticArray => "cs/static-array",
+            Self::UseNumberConstant => "cs/use-number-constant",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|rule| rule.label() == label)
+    }
+}
+
+/// Closed Java structural and declaration/type-shape relations used by the
+/// CodeQL parity adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum JavaRule {
+    NonFinalImmutableField,
+    NonPrivateField,
+    MisnamedConstant,
+    MisnamedVariable,
+    UnderscoreIdentifier,
+    EnumIdentifier,
+    ConstructorTypo,
+    RawConstructorInvocation,
+    RawReturnType,
+    RawVariable,
+    TypeBoundExtendsFinal,
+    TypeVariableHidesType,
+    InconsistentJavadocThrows,
+    UnknownJavadocParameter,
+    UndocumentedException,
+    UndocumentedFunction,
+    UndocumentedParameter,
+    UndocumentedReturnValue,
+    UndocumentedType,
+}
+
+impl JavaRule {
+    pub const ALL: [Self; 19] = [
+        Self::NonFinalImmutableField,
+        Self::NonPrivateField,
+        Self::MisnamedConstant,
+        Self::MisnamedVariable,
+        Self::UnderscoreIdentifier,
+        Self::EnumIdentifier,
+        Self::ConstructorTypo,
+        Self::RawConstructorInvocation,
+        Self::RawReturnType,
+        Self::RawVariable,
+        Self::TypeBoundExtendsFinal,
+        Self::TypeVariableHidesType,
+        Self::InconsistentJavadocThrows,
+        Self::UnknownJavadocParameter,
+        Self::UndocumentedException,
+        Self::UndocumentedFunction,
+        Self::UndocumentedParameter,
+        Self::UndocumentedReturnValue,
+        Self::UndocumentedType,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::NonFinalImmutableField => "java/non-final-immutable-field",
+            Self::NonPrivateField => "java/non-private-field",
+            Self::MisnamedConstant => "java/misnamed-constant",
+            Self::MisnamedVariable => "java/misnamed-variable",
+            Self::UnderscoreIdentifier => "java/underscore-identifier",
+            Self::EnumIdentifier => "java/enum-identifier",
+            Self::ConstructorTypo => "java/constructor-typo",
+            Self::RawConstructorInvocation => "java/raw-constructor-invocation",
+            Self::RawReturnType => "java/raw-return-type",
+            Self::RawVariable => "java/raw-variable",
+            Self::TypeBoundExtendsFinal => "java/type-bound-extends-final",
+            Self::TypeVariableHidesType => "java/type-variable-hides-type",
+            Self::InconsistentJavadocThrows => "java/inconsistent-javadoc-throws",
+            Self::UnknownJavadocParameter => "java/unknown-javadoc-parameter",
+            Self::UndocumentedException => "java/undocumented-exception",
+            Self::UndocumentedFunction => "java/undocumented-function",
+            Self::UndocumentedParameter => "java/undocumented-parameter",
+            Self::UndocumentedReturnValue => "java/undocumented-return-value",
+            Self::UndocumentedType => "java/undocumented-type",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|rule| rule.label() == label)
+    }
+}
+
+/// Closed JavaScript/TypeScript declaration, scope, and structural relations
+/// used by the CodeQL parity adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum JsRule {
+    FunctionDeclarationConflict,
+    VariableRedeclaration,
+    VariableInitializationConflict,
+    MissingVariableDeclaration,
+    NestedFunctionReferenceInDefaultParameter,
+    MissingThisQualifier,
+    MixedStaticInstanceThisAccess,
+    OverwrittenProperty,
+    MisspelledIdentifier,
+}
+
+impl JsRule {
+    pub const ALL: [Self; 9] = [
+        Self::FunctionDeclarationConflict,
+        Self::VariableRedeclaration,
+        Self::VariableInitializationConflict,
+        Self::MissingVariableDeclaration,
+        Self::NestedFunctionReferenceInDefaultParameter,
+        Self::MissingThisQualifier,
+        Self::MixedStaticInstanceThisAccess,
+        Self::OverwrittenProperty,
+        Self::MisspelledIdentifier,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::FunctionDeclarationConflict => "js/function-declaration-conflict",
+            Self::VariableRedeclaration => "js/variable-redeclaration",
+            Self::VariableInitializationConflict => "js/variable-initialization-conflict",
+            Self::MissingVariableDeclaration => "js/missing-variable-declaration",
+            Self::NestedFunctionReferenceInDefaultParameter => {
+                "js/nested-function-reference-in-default-parameter"
+            }
+            Self::MissingThisQualifier => "js/missing-this-qualifier",
+            Self::MixedStaticInstanceThisAccess => "js/mixed-static-instance-this-access",
+            Self::OverwrittenProperty => "js/overwritten-property",
+            Self::MisspelledIdentifier => "js/misspelled-identifier",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|rule| rule.label() == label)
+    }
+}
+
+/// One language-owned relation selected by the shared RQL seed path. The
+/// prefixed CodeQL id determines which language hook evaluates the relation;
+/// decoding and seed handling remain language-neutral.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LanguageRule {
+    Cpp(CppRule),
+    CSharp(CSharpRule),
+    Java(JavaRule),
+    Js(JsRule),
+}
+
+impl LanguageRule {
+    pub fn from_label(label: &str) -> Option<Self> {
+        CppRule::from_label(label)
+            .map(Self::Cpp)
+            .or_else(|| CSharpRule::from_label(label).map(Self::CSharp))
+            .or_else(|| JavaRule::from_label(label).map(Self::Java))
+            .or_else(|| JsRule::from_label(label).map(Self::Js))
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Cpp(rule) => rule.label(),
+            Self::CSharp(rule) => rule.label(),
+            Self::Java(rule) => rule.label(),
+            Self::Js(rule) => rule.label(),
+        }
+    }
+
+    pub fn all_labels() -> Vec<&'static str> {
+        CppRule::ALL
+            .iter()
+            .map(|rule| rule.label())
+            .chain(CSharpRule::ALL.iter().map(|rule| rule.label()))
+            .chain(JavaRule::ALL.iter().map(|rule| rule.label()))
+            .chain(JsRule::ALL.iter().map(|rule| rule.label()))
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryValueKind {
     StructuralMatch,
@@ -247,7 +497,6 @@ pub enum QueryValueKind {
     ProgramPoint,
     ControlEdge,
     TypestateFinding,
-    ConcurrentAccessConflict,
     TypestateWitness,
     FlowEndpoint,
     FlowWitness,
@@ -269,6 +518,7 @@ pub enum QueryValueKind {
     KeyedReadValue,
     ReceiverOutcome,
     ReceiverEvidence,
+    PointsToCandidate,
     /// Exact right-hand operand of a proven static member assignment.
     FieldWriteValue,
     CallShape,
@@ -288,6 +538,8 @@ pub enum QueryValueKind {
     DetachedTaskTransfer,
     ProcedureEffect,
     CallableSignature,
+    LiteralOccurrence,
+    CallableMetrics,
     SignatureParameter,
     DecoratedParameter,
     CallableApplicability,
@@ -297,6 +549,7 @@ pub enum QueryValueKind {
     DispatchTarget,
     MemberFamily,
     MemberFamilyEdge,
+    PythonHierarchyFact,
     Occurrence,
     LexicalScope,
     Binding,
@@ -304,12 +557,17 @@ pub enum QueryValueKind {
     CandidateHop,
     ReferenceEdge,
     StateEvent,
+    BindingInitializerCall,
     FlowRelation,
     ControlRelation,
     BranchRelation,
+    CppExpression,
     LoopRelation,
     FailureHandlerState,
     StatementReachability,
+    PendingCleanupFlow,
+    PythonRuleFact,
+    RustPointerFinding,
     Guard,
     SourceSet,
     BuildTarget,
@@ -321,11 +579,188 @@ pub enum QueryValueKind {
     Export,
     DeclarationState,
     ConfigurationFact,
+    CrossDomain,
+    DependencyEvidence,
     File,
 }
 
+/// The value kinds `file_of` accepts. Its transition arm, its validator
+/// message ([`file_of_input_expectation`]), and its registry signature
+/// (`schema.rs`) all read this list.
+pub const FILE_OF_INPUT_KINDS: &[QueryValueKind] = &[
+    QueryValueKind::StructuralMatch,
+    QueryValueKind::Declaration,
+    QueryValueKind::Procedure,
+    QueryValueKind::ProgramPoint,
+    QueryValueKind::ControlEdge,
+    QueryValueKind::TypestateFinding,
+    QueryValueKind::TypestateWitness,
+    QueryValueKind::FlowEndpoint,
+    QueryValueKind::FlowWitness,
+    QueryValueKind::ClassSetRow,
+    QueryValueKind::AbsentMemberFinding,
+    QueryValueKind::AbsentMemberWitness,
+    QueryValueKind::TaintFinding,
+    QueryValueKind::ReferenceSite,
+    QueryValueKind::CallSite,
+    QueryValueKind::ExpressionSite,
+    QueryValueKind::JsxAttributeValue,
+    QueryValueKind::ReceiverAnalysis,
+    QueryValueKind::MemberTargetAnalysis,
+    QueryValueKind::KeyedReadValue,
+    QueryValueKind::ReceiverOutcome,
+    QueryValueKind::ReceiverEvidence,
+    QueryValueKind::FieldWriteValue,
+    QueryValueKind::CallShape,
+    QueryValueKind::CallResult,
+    QueryValueKind::ResultSubjectUse,
+    QueryValueKind::CallArgumentGroup,
+    QueryValueKind::CallArgument,
+    QueryValueKind::CallBinding,
+    QueryValueKind::CallEffect,
+    QueryValueKind::CallResultContract,
+    QueryValueKind::CallResultObligation,
+    QueryValueKind::ResultContractUse,
+    QueryValueKind::ResultContractFailureUse,
+    QueryValueKind::ProcedureEffect,
+    QueryValueKind::CallableSignature,
+    QueryValueKind::LiteralOccurrence,
+    QueryValueKind::CallableMetrics,
+    QueryValueKind::SignatureParameter,
+    QueryValueKind::DecoratedParameter,
+    QueryValueKind::CallableApplicability,
+    QueryValueKind::OverloadSelection,
+    QueryValueKind::MemberSelection,
+    QueryValueKind::DispatchOutcome,
+    QueryValueKind::DispatchTarget,
+    QueryValueKind::MemberFamily,
+    QueryValueKind::MemberFamilyEdge,
+    QueryValueKind::PythonHierarchyFact,
+    QueryValueKind::Occurrence,
+    QueryValueKind::LexicalScope,
+    QueryValueKind::Binding,
+    QueryValueKind::QualifiedPath,
+    QueryValueKind::PathSegment,
+    QueryValueKind::StateEvent,
+    QueryValueKind::BranchRelation,
+    QueryValueKind::CppExpression,
+    QueryValueKind::LoopRelation,
+    QueryValueKind::FailureHandlerState,
+    QueryValueKind::StatementReachability,
+    QueryValueKind::PendingCleanupFlow,
+];
+
+/// [`FILE_OF_INPUT_KINDS`] as the validator's English list, `a, b, or c`.
+pub fn file_of_input_expectation() -> &'static str {
+    static TEXT: LazyLock<String> = LazyLock::new(|| {
+        let labels = FILE_OF_INPUT_KINDS
+            .iter()
+            .map(|kind| kind.label())
+            .collect::<Vec<_>>();
+        let (last, leading) = labels
+            .split_last()
+            .expect("file_of accepts at least one kind");
+        format!("{}, or {last}", leading.join(", "))
+    });
+    TEXT.as_str()
+}
+
 impl QueryValueKind {
-    pub fn label(self) -> &'static str {
+    /// The input domain this row kind belongs to. Heterogeneous cross-domain
+    /// rows belong to neither single domain, and neither does dependency
+    /// evidence: it has an ecosystem axis rather than a programming-language
+    /// or configuration-format axis, so it stays outside the code and
+    /// configuration composition rules.
+    pub const fn domain_kind(self) -> Option<super::domain::DomainKind> {
+        match self {
+            Self::ConfigurationFact => Some(super::domain::DomainKind::Configuration),
+            Self::CrossDomain | Self::DependencyEvidence => None,
+            Self::StructuralMatch
+            | Self::Declaration
+            | Self::Procedure
+            | Self::ProgramPoint
+            | Self::ControlEdge
+            | Self::TypestateFinding
+            | Self::TypestateWitness
+            | Self::FlowEndpoint
+            | Self::FlowWitness
+            | Self::ClassSetRow
+            | Self::AbsentMemberFinding
+            | Self::AbsentMemberWitness
+            | Self::TaintFinding
+            | Self::ReferenceSite
+            | Self::CallSite
+            | Self::ExpressionSite
+            | Self::JsxAttributeValue
+            | Self::ReceiverAnalysis
+            | Self::MemberTargetAnalysis
+            | Self::KeyedReadValue
+            | Self::ReceiverOutcome
+            | Self::ReceiverEvidence
+            | Self::PointsToCandidate
+            | Self::FieldWriteValue
+            | Self::CallShape
+            | Self::CallResult
+            | Self::ResultSubjectUse
+            | Self::CallArgumentGroup
+            | Self::CallArgument
+            | Self::CallBinding
+            | Self::CallEffect
+            | Self::CallResultContract
+            | Self::CallResultObligation
+            | Self::ResultContractUse
+            | Self::ResultContractFailureUse
+            | Self::NilnessOperation
+            | Self::SwitchCoverage
+            | Self::AssignmentRelation
+            | Self::DetachedTaskTransfer
+            | Self::ProcedureEffect
+            | Self::CallableSignature
+            | Self::LiteralOccurrence
+            | Self::CallableMetrics
+            | Self::SignatureParameter
+            | Self::DecoratedParameter
+            | Self::CallableApplicability
+            | Self::OverloadSelection
+            | Self::MemberSelection
+            | Self::DispatchOutcome
+            | Self::DispatchTarget
+            | Self::MemberFamily
+            | Self::MemberFamilyEdge
+            | Self::PythonHierarchyFact
+            | Self::Occurrence
+            | Self::LexicalScope
+            | Self::Binding
+            | Self::ResolutionCandidate
+            | Self::CandidateHop
+            | Self::ReferenceEdge
+            | Self::StateEvent
+            | Self::BindingInitializerCall
+            | Self::FlowRelation
+            | Self::ControlRelation
+            | Self::BranchRelation
+            | Self::CppExpression
+            | Self::LoopRelation
+            | Self::FailureHandlerState
+            | Self::StatementReachability
+            | Self::PendingCleanupFlow
+            | Self::PythonRuleFact
+            | Self::RustPointerFinding
+            | Self::Guard
+            | Self::SourceSet
+            | Self::BuildTarget
+            | Self::TopologyEdge
+            | Self::RewritePath
+            | Self::QualifiedPath
+            | Self::PathSegment
+            | Self::GenerationSite
+            | Self::Export
+            | Self::DeclarationState
+            | Self::File => Some(super::domain::DomainKind::Code),
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
         match self {
             Self::StructuralMatch => "structural_match",
             Self::Declaration => "declaration",
@@ -333,7 +768,6 @@ impl QueryValueKind {
             Self::ProgramPoint => "program_point",
             Self::ControlEdge => "control_edge",
             Self::TypestateFinding => "typestate_finding",
-            Self::ConcurrentAccessConflict => "concurrent_access_conflict",
             Self::TypestateWitness => "typestate_witness",
             Self::FlowEndpoint => "flow_endpoint",
             Self::FlowWitness => "flow_witness",
@@ -350,6 +784,7 @@ impl QueryValueKind {
             Self::KeyedReadValue => "keyed_read_value",
             Self::ReceiverOutcome => "receiver_outcome",
             Self::ReceiverEvidence => "receiver_evidence",
+            Self::PointsToCandidate => "points_to_candidate",
             Self::FieldWriteValue => "field_write_value",
             Self::CallShape => "call_shape",
             Self::CallResult => "call_result",
@@ -368,6 +803,8 @@ impl QueryValueKind {
             Self::DetachedTaskTransfer => "detached_task_transfer",
             Self::ProcedureEffect => "procedure_effect",
             Self::CallableSignature => "callable_signature",
+            Self::LiteralOccurrence => "literal_occurrence",
+            Self::CallableMetrics => "callable_metrics",
             Self::SignatureParameter => "signature_parameter",
             Self::DecoratedParameter => "decorated_parameter",
             Self::CallableApplicability => "callable_applicability",
@@ -377,6 +814,7 @@ impl QueryValueKind {
             Self::DispatchTarget => "dispatch_target",
             Self::MemberFamily => "member_family",
             Self::MemberFamilyEdge => "member_family_edge",
+            Self::PythonHierarchyFact => "python_hierarchy_fact",
             Self::Occurrence => "occurrence",
             Self::LexicalScope => "lexical_scope",
             Self::Binding => "binding",
@@ -384,12 +822,17 @@ impl QueryValueKind {
             Self::CandidateHop => "candidate_hop",
             Self::ReferenceEdge => "reference_edge",
             Self::StateEvent => "state_event",
+            Self::BindingInitializerCall => "binding_initializer_call",
             Self::FlowRelation => "flow_relation",
             Self::ControlRelation => "control_relation",
             Self::BranchRelation => "branch_relation",
+            Self::CppExpression => "cpp_expression",
             Self::LoopRelation => "loop_relation",
             Self::FailureHandlerState => "failure_handler_state",
             Self::StatementReachability => "statement_reachability",
+            Self::PendingCleanupFlow => "pending_cleanup_flow",
+            Self::PythonRuleFact => "python_rule_fact",
+            Self::RustPointerFinding => "rust_pointer_finding",
             Self::Guard => "guard",
             Self::SourceSet => "source_set",
             Self::BuildTarget => "build_target",
@@ -401,6 +844,8 @@ impl QueryValueKind {
             Self::Export => "export",
             Self::DeclarationState => "declaration_state",
             Self::ConfigurationFact => "configuration_fact",
+            Self::CrossDomain => "cross_domain",
+            Self::DependencyEvidence => "dependency_evidence",
             Self::File => "file",
         }
     }
@@ -442,7 +887,7 @@ impl ConfigurationNodeKindFilter {
     }
 
     pub fn from_label(label: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|value| value.label() == label)
+        find_by_label(Self::ALL.iter().copied(), label, Self::label)
     }
 }
 
@@ -469,7 +914,7 @@ impl ConfigurationCompletenessFilter {
     }
 
     pub fn from_label(label: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|value| value.label() == label)
+        find_by_label(Self::ALL, label, Self::label)
     }
 }
 
@@ -507,6 +952,54 @@ pub struct ConfigurationFactsFilter {
     pub roles: Vec<ConfigurationMemberRole>,
     pub scalar_kinds: Vec<ConfigurationScalarKind>,
     pub keys: Vec<String>,
+    pub values: Vec<String>,
+    pub values_ignore_case: Vec<String>,
+    pub value_lt: Option<String>,
+    pub value_le: Option<String>,
+    pub value_gt: Option<String>,
+    pub value_ge: Option<String>,
+    /// Require an XML fact to be enclosed by an element whose exact name is
+    /// one of these keys. The relation is structural and applies only to
+    /// XML element/attribute facts.
+    pub xml_parent_keys: Vec<String>,
+    /// Require an XML fact to have a preceding element sibling whose exact
+    /// name is one of these keys. This preserves authored sibling order for
+    /// configuration policies without making order a source-text concern.
+    pub xml_preceding_sibling_keys: Vec<String>,
+    /// Require an XML fact's containing element to have a sibling attribute
+    /// with this exact key.
+    pub xml_sibling_attribute_keys: Vec<String>,
+    /// Constrain the value of the required sibling attribute by exact
+    /// decoded equality.
+    pub xml_sibling_attribute_values: Vec<String>,
+    /// Constrain the value of the required sibling attribute by
+    /// case-insensitive decoded equality.
+    pub xml_sibling_attribute_values_ignore_case: Vec<String>,
+    /// On an XML declaration element, require an incoming same-document
+    /// reference whose attribute key is one of these values. On an XML child
+    /// element, these keys identify the outgoing reference attributes used by
+    /// the target-child comparison relation.
+    pub xml_reference_source_keys: Vec<String>,
+    /// Attribute keys on the target XML element that identify a reference
+    /// target, such as `id` or `name`.
+    pub xml_reference_target_keys: Vec<String>,
+    /// Optional element names that are allowed to receive a same-document
+    /// reference. This remains a generic XML shape constraint.
+    pub xml_reference_target_element_keys: Vec<String>,
+    /// Require an XML child element to equal a child of its referenced target
+    /// element, using these target-child element names.
+    pub xml_reference_target_child_keys: Vec<String>,
+    /// Peer XML element names considered by the generic same-class/property
+    /// set relation.
+    pub xml_peer_element_keys: Vec<String>,
+    /// Attribute keys whose decoded values must match on peer elements.
+    pub xml_peer_attribute_keys: Vec<String>,
+    /// Direct child XML element names whose structural signatures are
+    /// compared between peer elements.
+    pub xml_peer_child_keys: Vec<String>,
+    /// Minimum number of equal child signatures required for the peer
+    /// relation. The compared sets must also have equal cardinality.
+    pub xml_peer_min_shared_children: Option<u32>,
     pub routes: Vec<ConfigurationRouteFilter>,
     pub fact_ordinals: Vec<u32>,
     pub provenances: Vec<ConfigurationValueProvenance>,
@@ -520,6 +1013,25 @@ impl ConfigurationFactsFilter {
             && self.roles.is_empty()
             && self.scalar_kinds.is_empty()
             && self.keys.is_empty()
+            && self.values.is_empty()
+            && self.values_ignore_case.is_empty()
+            && self.value_lt.is_none()
+            && self.value_le.is_none()
+            && self.value_gt.is_none()
+            && self.value_ge.is_none()
+            && self.xml_parent_keys.is_empty()
+            && self.xml_preceding_sibling_keys.is_empty()
+            && self.xml_sibling_attribute_keys.is_empty()
+            && self.xml_sibling_attribute_values.is_empty()
+            && self.xml_sibling_attribute_values_ignore_case.is_empty()
+            && self.xml_reference_source_keys.is_empty()
+            && self.xml_reference_target_keys.is_empty()
+            && self.xml_reference_target_element_keys.is_empty()
+            && self.xml_reference_target_child_keys.is_empty()
+            && self.xml_peer_element_keys.is_empty()
+            && self.xml_peer_attribute_keys.is_empty()
+            && self.xml_peer_child_keys.is_empty()
+            && self.xml_peer_min_shared_children.is_none()
             && self.routes.is_empty()
             && self.fact_ordinals.is_empty()
             && self.provenances.is_empty()
@@ -536,6 +1048,141 @@ impl ConfigurationFactsFilter {
 pub struct ConfigurationFactsSeed {
     pub where_globs: QueryPathScope,
     pub filter: ConfigurationFactsFilter,
+}
+
+/// Upper bound on documents one configuration-key relation may declare.
+pub const MAX_CORRELATION_DOCUMENTS: usize = 32;
+pub const MAX_DEPENDENCY_CONFIGURATION_OWNER_LENGTH: usize = 1024;
+pub const MAX_DEPENDENCY_CONFIGURATION_OVERRIDES: usize = 128;
+pub const MAX_DEPENDENCY_CONFIGURATION_VALUES: usize = 32;
+pub const MAX_DEPENDENCY_CONFIGURATION_VALUE_LENGTH: usize = 16 * 1024;
+
+/// The typed relation a `correlate` source uses to pair a code row with a
+/// configuration row. A relation is structural evidence, never a name,
+/// spelling, file-name, or co-occurrence join.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CrossDomainRelation {
+    ConfigurationKey(ConfigurationKeyRelation),
+    ConfigurationCode(ConfigurationCodeRelation),
+    DependencyConfiguration(DependencyConfigurationRelation),
+}
+
+impl CrossDomainRelation {
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::ConfigurationKey(_) => "configuration_key",
+            Self::ConfigurationCode(_) => "configuration_code",
+            Self::DependencyConfiguration(_) => "dependency_configuration",
+        }
+    }
+
+    /// The registered operator that evaluates this relation.
+    pub const fn operator(&self) -> super::domain::CrossDomainOperatorKind {
+        match self {
+            Self::ConfigurationKey(_) => {
+                super::domain::CrossDomainOperatorKind::CorrelateConfigurationKey
+            }
+            Self::ConfigurationCode(_) => {
+                super::domain::CrossDomainOperatorKind::CorrelateConfigurationCode
+            }
+            Self::DependencyConfiguration(_) => {
+                super::domain::CrossDomainOperatorKind::CorrelateDependencyConfiguration
+            }
+        }
+    }
+}
+
+/// A plain string literal passed at a resolver-proven call input names one
+/// flat key of a configuration document the author declares explicitly.
+///
+/// The code row must be an `expression_site`: the actual argument bound to a
+/// formal parameter of a resolved callee. The configuration row must be a
+/// member whose route is exactly one key segment equal to the decoded
+/// literal, inside one of `documents`. Documents are exact workspace-relative
+/// paths rather than globs, because a glob would turn the declaration back
+/// into a same-repository co-occurrence join.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigurationKeyRelation {
+    /// Canonical (sorted, deduplicated) `/`-separated relative paths.
+    pub documents: Vec<String>,
+}
+
+/// The structured join a configuration scalar/document makes to a code
+/// declaration or same-project code fact. Negative forms are anti-joins: they
+/// emit a configuration witness only after both inputs are complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConfigurationCodeMatch {
+    ScalarDeclaration,
+    ScalarOwner,
+    ScalarMember,
+    SameProject,
+}
+
+impl ConfigurationCodeMatch {
+    pub const ALL: [Self; 4] = [
+        Self::ScalarDeclaration,
+        Self::ScalarOwner,
+        Self::ScalarMember,
+        Self::SameProject,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ScalarDeclaration => "scalar-declaration",
+            Self::ScalarOwner => "scalar-owner",
+            Self::ScalarMember => "scalar-member",
+            Self::SameProject => "same-project",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "scalar-declaration" | "scalar_declaration" => Some(Self::ScalarDeclaration),
+            "scalar-owner" | "scalar_owner" => Some(Self::ScalarOwner),
+            "scalar-member" | "scalar_member" => Some(Self::ScalarMember),
+            "same-project" | "same_project" => Some(Self::SameProject),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigurationCodeRelation {
+    pub match_kind: ConfigurationCodeMatch,
+    pub absence: bool,
+}
+
+/// Explicit reviewed applicability and precedence for a version-specific
+/// dependency mitigation. Identity is the shared declared_by topology identity;
+/// no path or repository co-occurrence establishes the relation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependencyConfigurationRelation {
+    pub owner: String,
+    pub ecosystem: String,
+    pub version_ranges: Vec<String>,
+    pub documents: Vec<String>,
+    /// Authored lower-to-higher edges; order is preserved.
+    pub overrides: Vec<[String; 2]>,
+    pub values: Vec<String>,
+}
+
+/// A `correlate` plan source: typed related pairs or retained dependency
+/// witnesses whose mitigation could not be proved.
+#[derive(Debug, Clone)]
+pub struct CrossDomainCorrelation {
+    pub relation: CrossDomainRelation,
+    pub code: CodeQueryPlan,
+    pub configuration: CodeQueryPlan,
+}
+
+/// A `require-both` plan source: boolean satisfaction of a code predicate
+/// and a configuration predicate. It never pairs rows; it returns each
+/// contributing row tagged with its own domain, and only when both inputs
+/// produced rows.
+#[derive(Debug, Clone)]
+pub struct CrossDomainRequirement {
+    pub code: CodeQueryPlan,
+    pub configuration: CodeQueryPlan,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -583,11 +1230,12 @@ impl EdgeFilter {
 pub struct StateEventFilter {
     pub classes: Vec<StateEventClass>,
     pub subjects: Vec<FlowSubjectKind>,
+    pub read_causes: Vec<StateEventReadCause>,
 }
 
 impl StateEventFilter {
     pub fn is_empty(&self) -> bool {
-        self.classes.is_empty() && self.subjects.is_empty()
+        self.classes.is_empty() && self.subjects.is_empty() && self.read_causes.is_empty()
     }
 }
 
@@ -634,7 +1282,7 @@ impl FailureUseProvenance {
     }
 
     pub fn from_label(label: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|value| value.label() == label)
+        find_by_label(Self::ALL, label, Self::label)
     }
 }
 
@@ -658,7 +1306,7 @@ impl FailureUseConsumer {
     }
 
     pub fn from_label(label: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|value| value.label() == label)
+        find_by_label(Self::ALL, label, Self::label)
     }
 }
 
@@ -701,6 +1349,7 @@ pub struct ControlRelationFilter {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssignmentRelationKind {
     SelfAssignment,
+    SelfInitializer,
     FailedSwap,
     OverwrittenUnread,
 }
@@ -709,6 +1358,7 @@ impl AssignmentRelationKind {
     pub const fn label(self) -> &'static str {
         match self {
             Self::SelfAssignment => "self_assignment",
+            Self::SelfInitializer => "self_initializer",
             Self::FailedSwap => "failed_swap",
             Self::OverwrittenUnread => "overwritten_unread",
         }
@@ -717,6 +1367,7 @@ impl AssignmentRelationKind {
     pub fn from_label(label: &str) -> Option<Self> {
         match label {
             "self_assignment" => Some(Self::SelfAssignment),
+            "self_initializer" => Some(Self::SelfInitializer),
             "failed_swap" => Some(Self::FailedSwap),
             "overwritten_unread" => Some(Self::OverwrittenUnread),
             _ => None,
@@ -731,7 +1382,11 @@ pub enum AbsentMemberProofFilter {
     #[default]
     Proven,
     /// Findings for a class that certainly reaches the access and lacks the
-    /// member while other unclassified values may also reach it.
+    /// member while other receiver values may remain unclassified. It can also
+    /// retain listed global writes only when every write has no receiver bound
+    /// and an Any member-name set, or a DeclaredParameter whose annotation
+    /// names one closed workspace class with no subclasses, unresolved or
+    /// unmodeled external bases, or attribute hooks.
     Conditional,
     Any,
 }
@@ -748,7 +1403,7 @@ impl AbsentMemberProofFilter {
     }
 
     pub fn from_label(label: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|proof| proof.label() == label)
+        find_by_label(Self::ALL, label, Self::label)
     }
 }
 
@@ -781,6 +1436,7 @@ pub enum BranchRelationKind {
     ContradictoryCondition,
     SubsumedCondition,
     RedundantBooleanReturn,
+    EmptyArm,
 }
 
 impl BranchRelationKind {
@@ -790,6 +1446,7 @@ impl BranchRelationKind {
         Self::ContradictoryCondition,
         Self::SubsumedCondition,
         Self::RedundantBooleanReturn,
+        Self::EmptyArm,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -799,17 +1456,31 @@ impl BranchRelationKind {
             Self::ContradictoryCondition => "contradictory_condition",
             Self::SubsumedCondition => "subsumed_condition",
             Self::RedundantBooleanReturn => "redundant_boolean_return",
+            Self::EmptyArm => "empty_arm",
         }
     }
 
     pub fn from_label(label: &str) -> Option<Self> {
-        Self::ALL.iter().copied().find(|kind| kind.label() == label)
+        find_by_label(Self::ALL.iter().copied(), label, Self::label)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct BranchRelationFilter {
     pub relations: Vec<BranchRelationKind>,
+}
+
+/// Restrict direct C/C++ provenance observations to one or more rule families.
+/// An empty selection means every rule supported by the adapter.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CppProvenanceFilter {
+    pub rules: Vec<CppProvenanceRule>,
+}
+
+impl CppProvenanceFilter {
+    pub fn accepts(&self, rule: CppProvenanceRule) -> bool {
+        self.rules.is_empty() || self.rules.contains(&rule)
+    }
 }
 
 impl BranchRelationFilter {
@@ -1107,15 +1778,35 @@ pub struct ResolvedCallFilter {
     pub receiver_type: Option<ResolvedCallReceiverType>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedValueFilter {
+    pub resolves_to: CallIdentity,
+    pub proof: ResolvedCallProof,
+}
+
 /// One typed scalar literal in a row-local query predicate.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum QueryRowLiteral {
     String(String),
     StringList(Vec<String>),
+    IntegerList(Vec<u64>),
     Integer(u64),
     Boolean(bool),
     /// A public label from the selected field's constrained value domain.
     ConstrainedEnum(String),
+}
+
+impl QueryRowLiteral {
+    pub const fn scalar_type(&self) -> CodeQueryRowScalarType {
+        match self {
+            Self::String(_) => CodeQueryRowScalarType::String,
+            Self::StringList(_) => CodeQueryRowScalarType::StringList,
+            Self::IntegerList(_) => CodeQueryRowScalarType::IntegerList,
+            Self::Integer(_) => CodeQueryRowScalarType::Integer,
+            Self::Boolean(_) => CodeQueryRowScalarType::Boolean,
+            Self::ConstrainedEnum(_) => CodeQueryRowScalarType::ConstrainedEnum,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1126,6 +1817,10 @@ pub enum QueryRowPredicateOp {
     Le,
     Gt,
     Ge,
+    /// Match a bounded regular expression against a string-valued row field.
+    /// The field is already selected structurally by the query row domain;
+    /// this operator classifies its published value.
+    Regex,
     IsNull,
     IsNotNull,
     In,
@@ -1139,6 +1834,7 @@ impl QueryRowPredicateOp {
         Self::Le,
         Self::Gt,
         Self::Ge,
+        Self::Regex,
         Self::IsNull,
         Self::IsNotNull,
         Self::In,
@@ -1152,6 +1848,7 @@ impl QueryRowPredicateOp {
             Self::Le => "le",
             Self::Gt => "gt",
             Self::Ge => "ge",
+            Self::Regex => "regex",
             Self::IsNull => "is-null",
             Self::IsNotNull => "is-not-null",
             Self::In => "in",
@@ -1159,7 +1856,7 @@ impl QueryRowPredicateOp {
     }
 
     pub fn from_label(label: &str) -> Option<Self> {
-        Self::ALL.iter().copied().find(|op| op.label() == label)
+        find_by_label(Self::ALL.iter().copied(), label, Self::label)
     }
 }
 
@@ -1201,8 +1898,14 @@ pub enum HierarchyTraversal {
 pub enum QueryStep {
     Filter(Vec<QueryRowPredicate>),
     Project(Vec<QueryRowProjectionColumn>),
+    CaptureAnchor(String),
+    ConfigurationAbsence(Box<ConfigurationFactsFilter>),
+    StatementFacts(StatementFactKind),
+    CppFacts(CppClassFactKind),
     EnclosingDecl,
     ProcedureOf,
+    ProgramPointOf,
+    ProgramPointById { id: String },
     CfgEntry,
     CfgExits,
     CfgSuccessorEdges,
@@ -1210,7 +1913,6 @@ pub enum QueryStep {
     CfgEdgeSource,
     CfgEdgeTarget,
     Typestate(TypestateTraversal),
-    ConcurrentAccessConflicts,
     ValueFlow(ValueFlowTraversal),
     ClassSet,
     AbsentMember(AbsentMemberProofFilter),
@@ -1219,8 +1921,18 @@ pub enum QueryStep {
     FileOf,
     ImportsOf,
     ImportersOf,
+    PythonImportSite,
+    PythonImportCycles,
+    PythonCommentedOutCode,
     Supertypes(HierarchyTraversal),
     Subtypes(HierarchyTraversal),
+    ClassHierarchy,
+    ClassBases,
+    ClassMro,
+    MroMembers,
+    PythonOverrides,
+    PythonCallRelations,
+    PythonOverrideSignatures,
     Members,
     Owner,
     ReferencesOf(ReferenceTraversalFilter),
@@ -1239,18 +1951,51 @@ pub enum QueryStep {
     FieldWriteValue(FieldWriteValueTraversal),
     ReceiverOutcome,
     ReceiverEvidence,
+    PointsToCandidates,
     CallShape,
+    ExactExternalCallee,
     CallResults,
     ResultSubjectUses,
     CallArgumentGroups,
     CallArguments,
     CallBindings,
     ResolvedCall(ResolvedCallFilter),
+    ResolvedValue(ResolvedValueFilter),
     CallArgument(CallArgumentSelector),
+    CppBadStrncpySize,
+    CppNetworkToHostFunctionAsArrayBound,
+    CppNonConstantFormat,
+    CppWrongNumberFormatArguments,
+    CppTooManyFormatArguments,
+    CppWrongTypeFormatArgument,
+    CppNonPortablePrintf,
+    CppOverflowingSnprintf,
     CallEffects,
     ResultContractCalls,
     CallResultContracts,
     CallResultObligations,
+    ProcedureReturnProfile,
+    PythonIteratorReturnProtocol,
+    PythonBuiltinIdentity,
+    PythonUninitializedVariable,
+    PythonRaiseNotImplemented,
+    PythonUnsafeCyclicImport,
+    PythonDocumentation,
+    PythonUselessClass,
+    PythonAttributeShadowsMethod,
+    PythonModificationOfDefaultValue,
+    PythonOverlyComplexDelete,
+    CallResultUse,
+    PythonAssertionContext,
+    TupleReturnAssignment,
+    PythonImplicitStringConcatenation,
+    TupleReturnGroups,
+    LambdaForwarding,
+    PythonFormatIssues,
+    PythonUrlConstruction,
+
+    PythonRaiseLegality,
+    PythonSpecialMethodRaise,
     ResultContractUses,
     ResultContractOperationUses,
     ResultContractFailureUses(ResultContractFailureUseFilter),
@@ -1260,6 +2005,8 @@ pub enum QueryStep {
     DetachedTaskTransfers,
     ProcedureEffects,
     CallableSignature,
+    LiteralOccurrences,
+    CallableMetrics,
     SignatureParameters,
     DecoratorBindings(DecoratorBindingFilter),
     CallableApplicability,
@@ -1276,7 +2023,18 @@ pub enum QueryStep {
     ScopeAncestors,
     BindingsIn(BindingFilter),
     BindingOf(BindingOfOptions),
+    PythonComparisonConstants,
+    PythonComparisonUsingIs,
+    PythonComparisonUsingIsNonPortable,
     BindingOccurrence,
+    BindingUses,
+    PythonVariableOf,
+    PythonVariableDefinitions,
+    PythonVariableUses,
+    PythonVariablePeers,
+    PythonVariableNestedLoops,
+    IdenticalOperands,
+    PythonMissingSelf,
     CandidatesOf(CandidateFilter),
     CandidateHierarchy,
     CandidateTarget,
@@ -1284,14 +2042,22 @@ pub enum QueryStep {
     EdgesFrom(EdgeFilter),
     EdgeTarget,
     StateEventsOf(StateEventFilter),
+    BindingInitializerCallsOf,
+    SelectedPropertyRelationsOf,
     FlowRelationsOf(FlowRelationFilter),
     FlowSource,
     FlowTarget,
     ControlRelations(ControlRelationFilter),
     BranchRelations(BranchRelationFilter),
+    CppExpressions,
+    CppInconsistentLoopDirection,
+    CppUnsafeArrayForDaysOfTheYear,
+    CppProvenance(CppProvenanceFilter),
     LoopRelations,
     FailureHandlerState,
     StatementReachability,
+    PendingCleanupFlows,
+    RustPointerFindings,
     GuardsOf,
     TargetOf,
     SourceSetOf,
@@ -1749,11 +2515,17 @@ impl QueryStep {
     /// condition proof; the structural branch families do not materialize IR.
     pub fn semantic_facets(&self) -> &'static [QuerySemanticFacet] {
         match self {
+            Self::StatementFacts(StatementFactKind::NestedLoopsWithSameVariable) => {
+                &[QuerySemanticFacet::Procedures]
+            }
             Self::BranchRelations(filter)
                 if filter.relations.is_empty()
                     || filter
                         .relations
-                        .contains(&BranchRelationKind::ContradictoryCondition) =>
+                        .contains(&BranchRelationKind::ContradictoryCondition)
+                    || filter
+                        .relations
+                        .contains(&BranchRelationKind::RepeatedCondition) =>
             {
                 &[
                     QuerySemanticFacet::Procedures,
@@ -1769,8 +2541,14 @@ impl QueryStep {
         match self {
             Self::Filter(_) => QueryStepOp::Filter,
             Self::Project(_) => QueryStepOp::Project,
+            Self::CaptureAnchor(_) => QueryStepOp::CaptureAnchor,
+            Self::ConfigurationAbsence(_) => QueryStepOp::ConfigurationAbsence,
+            Self::StatementFacts(_) => QueryStepOp::StatementFacts,
+            Self::CppFacts(_) => QueryStepOp::CppFacts,
             Self::EnclosingDecl => QueryStepOp::EnclosingDecl,
             Self::ProcedureOf => QueryStepOp::ProcedureOf,
+            Self::ProgramPointOf => QueryStepOp::ProgramPointOf,
+            Self::ProgramPointById { .. } => QueryStepOp::ProgramPointById,
             Self::CfgEntry => QueryStepOp::CfgEntry,
             Self::CfgExits => QueryStepOp::CfgExits,
             Self::CfgSuccessorEdges => QueryStepOp::CfgSuccessorEdges,
@@ -1778,7 +2556,6 @@ impl QueryStep {
             Self::CfgEdgeSource => QueryStepOp::CfgEdgeSource,
             Self::CfgEdgeTarget => QueryStepOp::CfgEdgeTarget,
             Self::Typestate(_) => QueryStepOp::Typestate,
-            Self::ConcurrentAccessConflicts => QueryStepOp::ConcurrentAccessConflicts,
             Self::ValueFlow(_) => QueryStepOp::ValueFlow,
             Self::ClassSet => QueryStepOp::ClassSet,
             Self::AbsentMember(_) => QueryStepOp::AbsentMember,
@@ -1787,8 +2564,18 @@ impl QueryStep {
             Self::FileOf => QueryStepOp::FileOf,
             Self::ImportsOf => QueryStepOp::ImportsOf,
             Self::ImportersOf => QueryStepOp::ImportersOf,
+            Self::PythonImportSite => QueryStepOp::PythonImportSite,
+            Self::PythonImportCycles => QueryStepOp::PythonImportCycles,
+            Self::PythonCommentedOutCode => QueryStepOp::PythonCommentedOutCode,
             Self::Supertypes(_) => QueryStepOp::Supertypes,
             Self::Subtypes(_) => QueryStepOp::Subtypes,
+            Self::ClassHierarchy => QueryStepOp::ClassHierarchy,
+            Self::ClassBases => QueryStepOp::ClassBases,
+            Self::ClassMro => QueryStepOp::ClassMro,
+            Self::MroMembers => QueryStepOp::MroMembers,
+            Self::PythonOverrides => QueryStepOp::PythonOverrides,
+            Self::PythonCallRelations => QueryStepOp::PythonCallRelations,
+            Self::PythonOverrideSignatures => QueryStepOp::PythonOverrideSignatures,
             Self::Members => QueryStepOp::Members,
             Self::Owner => QueryStepOp::Owner,
             Self::ReferencesOf(_) => QueryStepOp::ReferencesOf,
@@ -1807,18 +2594,55 @@ impl QueryStep {
             Self::FieldWriteValue(_) => QueryStepOp::FieldWriteValue,
             Self::ReceiverOutcome => QueryStepOp::ReceiverOutcome,
             Self::ReceiverEvidence => QueryStepOp::ReceiverEvidence,
+            Self::PointsToCandidates => QueryStepOp::PointsToCandidates,
             Self::CallShape => QueryStepOp::CallShape,
+            Self::ExactExternalCallee => QueryStepOp::ExactExternalCallee,
             Self::CallResults => QueryStepOp::CallResults,
             Self::ResultSubjectUses => QueryStepOp::ResultSubjectUses,
             Self::CallArgumentGroups => QueryStepOp::CallArgumentGroups,
             Self::CallArguments => QueryStepOp::CallArguments,
             Self::CallBindings => QueryStepOp::CallBindings,
             Self::ResolvedCall(_) => QueryStepOp::ResolvedCall,
+            Self::ResolvedValue(_) => QueryStepOp::ResolvedValue,
             Self::CallArgument(_) => QueryStepOp::CallArgument,
+            Self::CppBadStrncpySize => QueryStepOp::CppBadStrncpySize,
+            Self::CppNetworkToHostFunctionAsArrayBound => {
+                QueryStepOp::CppNetworkToHostFunctionAsArrayBound
+            }
+            Self::CppNonConstantFormat => QueryStepOp::CppNonConstantFormat,
+            Self::CppWrongNumberFormatArguments => QueryStepOp::CppWrongNumberFormatArguments,
+            Self::CppTooManyFormatArguments => QueryStepOp::CppTooManyFormatArguments,
+            Self::CppWrongTypeFormatArgument => QueryStepOp::CppWrongTypeFormatArgument,
+            Self::CppNonPortablePrintf => QueryStepOp::CppNonPortablePrintf,
+            Self::CppOverflowingSnprintf => QueryStepOp::CppOverflowingSnprintf,
             Self::CallEffects => QueryStepOp::CallEffects,
             Self::ResultContractCalls => QueryStepOp::ResultContractCalls,
             Self::CallResultContracts => QueryStepOp::CallResultContracts,
             Self::CallResultObligations => QueryStepOp::CallResultObligations,
+            Self::ProcedureReturnProfile => QueryStepOp::ProcedureReturnProfile,
+            Self::PythonIteratorReturnProtocol => QueryStepOp::PythonIteratorReturnProtocol,
+            Self::PythonBuiltinIdentity => QueryStepOp::PythonBuiltinIdentity,
+            Self::PythonUninitializedVariable => QueryStepOp::PythonUninitializedVariable,
+            Self::PythonRaiseNotImplemented => QueryStepOp::PythonRaiseNotImplemented,
+            Self::PythonUnsafeCyclicImport => QueryStepOp::PythonUnsafeCyclicImport,
+            Self::PythonDocumentation => QueryStepOp::PythonDocumentation,
+            Self::PythonUselessClass => QueryStepOp::PythonUselessClass,
+            Self::PythonAttributeShadowsMethod => QueryStepOp::PythonAttributeShadowsMethod,
+            Self::PythonModificationOfDefaultValue => QueryStepOp::PythonModificationOfDefaultValue,
+            Self::PythonOverlyComplexDelete => QueryStepOp::PythonOverlyComplexDelete,
+            Self::CallResultUse => QueryStepOp::CallResultUse,
+            Self::PythonAssertionContext => QueryStepOp::PythonAssertionContext,
+            Self::TupleReturnAssignment => QueryStepOp::TupleReturnAssignment,
+            Self::PythonImplicitStringConcatenation => {
+                QueryStepOp::PythonImplicitStringConcatenation
+            }
+            Self::TupleReturnGroups => QueryStepOp::TupleReturnGroups,
+            Self::LambdaForwarding => QueryStepOp::LambdaForwarding,
+            Self::PythonFormatIssues => QueryStepOp::PythonFormatIssues,
+            Self::PythonUrlConstruction => QueryStepOp::PythonUrlConstruction,
+
+            Self::PythonRaiseLegality => QueryStepOp::PythonRaiseLegality,
+            Self::PythonSpecialMethodRaise => QueryStepOp::PythonSpecialMethodRaise,
             Self::ResultContractUses => QueryStepOp::ResultContractUses,
             Self::ResultContractOperationUses => QueryStepOp::ResultContractOperationUses,
             Self::ResultContractFailureUses(_) => QueryStepOp::ResultContractFailureUses,
@@ -1828,6 +2652,8 @@ impl QueryStep {
             Self::DetachedTaskTransfers => QueryStepOp::DetachedTaskTransfers,
             Self::ProcedureEffects => QueryStepOp::ProcedureEffects,
             Self::CallableSignature => QueryStepOp::CallableSignature,
+            Self::LiteralOccurrences => QueryStepOp::LiteralOccurrences,
+            Self::CallableMetrics => QueryStepOp::CallableMetrics,
             Self::SignatureParameters => QueryStepOp::SignatureParameters,
             Self::DecoratorBindings(_) => QueryStepOp::DecoratorBindings,
             Self::CallableApplicability => QueryStepOp::CallableApplicability,
@@ -1844,7 +2670,20 @@ impl QueryStep {
             Self::ScopeAncestors => QueryStepOp::ScopeAncestors,
             Self::BindingsIn(_) => QueryStepOp::BindingsIn,
             Self::BindingOf(_) => QueryStepOp::BindingOf,
+            Self::PythonComparisonConstants => QueryStepOp::PythonComparisonConstants,
+            Self::PythonComparisonUsingIs => QueryStepOp::PythonComparisonUsingIs,
+            Self::PythonComparisonUsingIsNonPortable => {
+                QueryStepOp::PythonComparisonUsingIsNonPortable
+            }
             Self::BindingOccurrence => QueryStepOp::BindingOccurrence,
+            Self::BindingUses => QueryStepOp::BindingUses,
+            Self::PythonVariableOf => QueryStepOp::PythonVariableOf,
+            Self::PythonVariableDefinitions => QueryStepOp::PythonVariableDefinitions,
+            Self::PythonVariableUses => QueryStepOp::PythonVariableUses,
+            Self::PythonVariablePeers => QueryStepOp::PythonVariablePeers,
+            Self::PythonVariableNestedLoops => QueryStepOp::PythonVariableNestedLoops,
+            Self::IdenticalOperands => QueryStepOp::IdenticalOperands,
+            Self::PythonMissingSelf => QueryStepOp::PythonMissingSelf,
             Self::CandidatesOf(_) => QueryStepOp::CandidatesOf,
             Self::CandidateHierarchy => QueryStepOp::CandidateHierarchy,
             Self::Generates => QueryStepOp::Generates,
@@ -1858,14 +2697,22 @@ impl QueryStep {
             Self::EdgesFrom(_) => QueryStepOp::EdgesFrom,
             Self::EdgeTarget => QueryStepOp::EdgeTarget,
             Self::StateEventsOf(_) => QueryStepOp::StateEventsOf,
+            Self::BindingInitializerCallsOf => QueryStepOp::BindingInitializerCallsOf,
+            Self::SelectedPropertyRelationsOf => QueryStepOp::SelectedPropertyRelationsOf,
             Self::FlowRelationsOf(_) => QueryStepOp::FlowRelationsOf,
             Self::FlowSource => QueryStepOp::FlowSource,
             Self::FlowTarget => QueryStepOp::FlowTarget,
             Self::ControlRelations(_) => QueryStepOp::ControlRelations,
             Self::BranchRelations(_) => QueryStepOp::BranchRelations,
+            Self::CppExpressions => QueryStepOp::CppExpressions,
+            Self::CppInconsistentLoopDirection => QueryStepOp::CppInconsistentLoopDirection,
+            Self::CppUnsafeArrayForDaysOfTheYear => QueryStepOp::CppUnsafeArrayForDaysOfTheYear,
+            Self::CppProvenance(_) => QueryStepOp::CppProvenance,
             Self::LoopRelations => QueryStepOp::LoopRelations,
             Self::FailureHandlerState => QueryStepOp::FailureHandlerState,
             Self::StatementReachability => QueryStepOp::StatementReachability,
+            Self::PendingCleanupFlows => QueryStepOp::PendingCleanupFlows,
+            Self::RustPointerFindings => QueryStepOp::RustPointerFindings,
             Self::GuardsOf => QueryStepOp::GuardsOf,
             Self::TargetOf => QueryStepOp::TargetOf,
             Self::SourceSetOf => QueryStepOp::SourceSetOf,
@@ -1879,8 +2726,18 @@ impl QueryStep {
     pub fn from_label(label: &str) -> Option<Self> {
         match QueryStepOp::from_label(label)? {
             QueryStepOp::Filter | QueryStepOp::Project => None,
+            QueryStepOp::CaptureAnchor => Some(Self::CaptureAnchor(String::new())),
+            QueryStepOp::ConfigurationAbsence => Some(Self::ConfigurationAbsence(Box::default())),
+            QueryStepOp::StatementFacts => {
+                Some(Self::StatementFacts(StatementFactKind::AllocaInLoop))
+            }
+            QueryStepOp::CppFacts => Some(Self::CppFacts(
+                CppClassFactKind::AssignmentDoesNotReturnThis,
+            )),
             QueryStepOp::EnclosingDecl => Some(Self::EnclosingDecl),
             QueryStepOp::ProcedureOf => Some(Self::ProcedureOf),
+            QueryStepOp::ProgramPointOf => Some(Self::ProgramPointOf),
+            QueryStepOp::ProgramPointById => None,
             QueryStepOp::CfgEntry => Some(Self::CfgEntry),
             QueryStepOp::CfgExits => Some(Self::CfgExits),
             QueryStepOp::CfgSuccessorEdges => Some(Self::CfgSuccessorEdges),
@@ -1891,7 +2748,6 @@ impl QueryStep {
             | QueryStepOp::ValueFlow
             | QueryStepOp::Taint
             | QueryStepOp::Witness => None,
-            QueryStepOp::ConcurrentAccessConflicts => Some(Self::ConcurrentAccessConflicts),
             QueryStepOp::ClassSet => Some(Self::ClassSet),
             QueryStepOp::AbsentMember => {
                 Some(Self::AbsentMember(AbsentMemberProofFilter::default()))
@@ -1899,8 +2755,18 @@ impl QueryStep {
             QueryStepOp::FileOf => Some(Self::FileOf),
             QueryStepOp::ImportsOf => Some(Self::ImportsOf),
             QueryStepOp::ImportersOf => Some(Self::ImportersOf),
+            QueryStepOp::PythonImportSite => Some(Self::PythonImportSite),
+            QueryStepOp::PythonImportCycles => Some(Self::PythonImportCycles),
+            QueryStepOp::PythonCommentedOutCode => Some(Self::PythonCommentedOutCode),
             QueryStepOp::Supertypes => Some(Self::Supertypes(HierarchyTraversal::Direct)),
             QueryStepOp::Subtypes => Some(Self::Subtypes(HierarchyTraversal::Direct)),
+            QueryStepOp::ClassHierarchy => Some(Self::ClassHierarchy),
+            QueryStepOp::ClassBases => Some(Self::ClassBases),
+            QueryStepOp::ClassMro => Some(Self::ClassMro),
+            QueryStepOp::MroMembers => Some(Self::MroMembers),
+            QueryStepOp::PythonOverrides => Some(Self::PythonOverrides),
+            QueryStepOp::PythonCallRelations => Some(Self::PythonCallRelations),
+            QueryStepOp::PythonOverrideSignatures => Some(Self::PythonOverrideSignatures),
             QueryStepOp::Members => Some(Self::Members),
             QueryStepOp::Owner => Some(Self::Owner),
             QueryStepOp::ReferencesOf => {
@@ -1933,17 +2799,57 @@ impl QueryStep {
             }
             QueryStepOp::ReceiverOutcome => Some(Self::ReceiverOutcome),
             QueryStepOp::ReceiverEvidence => Some(Self::ReceiverEvidence),
+            QueryStepOp::PointsToCandidates => Some(Self::PointsToCandidates),
             QueryStepOp::CallShape => Some(Self::CallShape),
+            QueryStepOp::ExactExternalCallee => Some(Self::ExactExternalCallee),
             QueryStepOp::CallResults => Some(Self::CallResults),
             QueryStepOp::ResultSubjectUses => Some(Self::ResultSubjectUses),
             QueryStepOp::CallArgumentGroups => Some(Self::CallArgumentGroups),
             QueryStepOp::CallArguments => Some(Self::CallArguments),
             QueryStepOp::CallBindings => Some(Self::CallBindings),
-            QueryStepOp::ResolvedCall | QueryStepOp::CallArgument => None,
+            QueryStepOp::ResolvedCall | QueryStepOp::ResolvedValue | QueryStepOp::CallArgument => {
+                None
+            }
+            QueryStepOp::CppBadStrncpySize => Some(Self::CppBadStrncpySize),
+            QueryStepOp::CppNetworkToHostFunctionAsArrayBound => {
+                Some(Self::CppNetworkToHostFunctionAsArrayBound)
+            }
+            QueryStepOp::CppNonConstantFormat => Some(Self::CppNonConstantFormat),
+            QueryStepOp::CppWrongNumberFormatArguments => Some(Self::CppWrongNumberFormatArguments),
+            QueryStepOp::CppTooManyFormatArguments => Some(Self::CppTooManyFormatArguments),
+            QueryStepOp::CppWrongTypeFormatArgument => Some(Self::CppWrongTypeFormatArgument),
+            QueryStepOp::CppNonPortablePrintf => Some(Self::CppNonPortablePrintf),
+            QueryStepOp::CppOverflowingSnprintf => Some(Self::CppOverflowingSnprintf),
             QueryStepOp::CallEffects => Some(Self::CallEffects),
             QueryStepOp::ResultContractCalls => Some(Self::ResultContractCalls),
             QueryStepOp::CallResultContracts => Some(Self::CallResultContracts),
             QueryStepOp::CallResultObligations => Some(Self::CallResultObligations),
+            QueryStepOp::ProcedureReturnProfile => Some(Self::ProcedureReturnProfile),
+            QueryStepOp::PythonIteratorReturnProtocol => Some(Self::PythonIteratorReturnProtocol),
+            QueryStepOp::PythonBuiltinIdentity => Some(Self::PythonBuiltinIdentity),
+            QueryStepOp::PythonUninitializedVariable => Some(Self::PythonUninitializedVariable),
+            QueryStepOp::PythonRaiseNotImplemented => Some(Self::PythonRaiseNotImplemented),
+            QueryStepOp::PythonUnsafeCyclicImport => Some(Self::PythonUnsafeCyclicImport),
+            QueryStepOp::PythonDocumentation => Some(Self::PythonDocumentation),
+            QueryStepOp::PythonUselessClass => Some(Self::PythonUselessClass),
+            QueryStepOp::PythonAttributeShadowsMethod => Some(Self::PythonAttributeShadowsMethod),
+            QueryStepOp::PythonModificationOfDefaultValue => {
+                Some(Self::PythonModificationOfDefaultValue)
+            }
+            QueryStepOp::PythonOverlyComplexDelete => Some(Self::PythonOverlyComplexDelete),
+            QueryStepOp::CallResultUse => Some(Self::CallResultUse),
+            QueryStepOp::PythonAssertionContext => Some(Self::PythonAssertionContext),
+            QueryStepOp::TupleReturnAssignment => Some(Self::TupleReturnAssignment),
+            QueryStepOp::PythonImplicitStringConcatenation => {
+                Some(Self::PythonImplicitStringConcatenation)
+            }
+            QueryStepOp::TupleReturnGroups => Some(Self::TupleReturnGroups),
+            QueryStepOp::LambdaForwarding => Some(Self::LambdaForwarding),
+            QueryStepOp::PythonFormatIssues => Some(Self::PythonFormatIssues),
+            QueryStepOp::PythonUrlConstruction => Some(Self::PythonUrlConstruction),
+
+            QueryStepOp::PythonRaiseLegality => Some(Self::PythonRaiseLegality),
+            QueryStepOp::PythonSpecialMethodRaise => Some(Self::PythonSpecialMethodRaise),
             QueryStepOp::ResultContractUses => Some(Self::ResultContractUses),
             QueryStepOp::ResultContractOperationUses => Some(Self::ResultContractOperationUses),
             QueryStepOp::ResultContractFailureUses => Some(Self::ResultContractFailureUses(
@@ -1957,6 +2863,8 @@ impl QueryStep {
             QueryStepOp::DetachedTaskTransfers => Some(Self::DetachedTaskTransfers),
             QueryStepOp::ProcedureEffects => Some(Self::ProcedureEffects),
             QueryStepOp::CallableSignature => Some(Self::CallableSignature),
+            QueryStepOp::LiteralOccurrences => Some(Self::LiteralOccurrences),
+            QueryStepOp::CallableMetrics => Some(Self::CallableMetrics),
             QueryStepOp::SignatureParameters => Some(Self::SignatureParameters),
             QueryStepOp::DecoratorBindings => {
                 Some(Self::DecoratorBindings(DecoratorBindingFilter::default()))
@@ -1975,7 +2883,20 @@ impl QueryStep {
             QueryStepOp::ScopeAncestors => Some(Self::ScopeAncestors),
             QueryStepOp::BindingsIn => Some(Self::BindingsIn(BindingFilter::default())),
             QueryStepOp::BindingOf => Some(Self::BindingOf(BindingOfOptions::default())),
+            QueryStepOp::PythonComparisonConstants => Some(Self::PythonComparisonConstants),
+            QueryStepOp::PythonComparisonUsingIs => Some(Self::PythonComparisonUsingIs),
+            QueryStepOp::PythonComparisonUsingIsNonPortable => {
+                Some(Self::PythonComparisonUsingIsNonPortable)
+            }
             QueryStepOp::BindingOccurrence => Some(Self::BindingOccurrence),
+            QueryStepOp::BindingUses => Some(Self::BindingUses),
+            QueryStepOp::PythonVariableOf => Some(Self::PythonVariableOf),
+            QueryStepOp::PythonVariableDefinitions => Some(Self::PythonVariableDefinitions),
+            QueryStepOp::PythonVariableUses => Some(Self::PythonVariableUses),
+            QueryStepOp::PythonVariablePeers => Some(Self::PythonVariablePeers),
+            QueryStepOp::PythonVariableNestedLoops => Some(Self::PythonVariableNestedLoops),
+            QueryStepOp::IdenticalOperands => Some(Self::IdenticalOperands),
+            QueryStepOp::PythonMissingSelf => Some(Self::PythonMissingSelf),
             QueryStepOp::CandidatesOf => Some(Self::CandidatesOf(CandidateFilter::default())),
             QueryStepOp::CandidateHierarchy => Some(Self::CandidateHierarchy),
             QueryStepOp::CandidateTarget => Some(Self::CandidateTarget),
@@ -1983,6 +2904,8 @@ impl QueryStep {
             QueryStepOp::EdgesFrom => Some(Self::EdgesFrom(EdgeFilter::default())),
             QueryStepOp::EdgeTarget => Some(Self::EdgeTarget),
             QueryStepOp::StateEventsOf => Some(Self::StateEventsOf(StateEventFilter::default())),
+            QueryStepOp::BindingInitializerCallsOf => Some(Self::BindingInitializerCallsOf),
+            QueryStepOp::SelectedPropertyRelationsOf => Some(Self::SelectedPropertyRelationsOf),
             QueryStepOp::FlowRelationsOf => {
                 Some(Self::FlowRelationsOf(FlowRelationFilter::default()))
             }
@@ -1999,8 +2922,16 @@ impl QueryStep {
             QueryStepOp::BranchRelations => {
                 Some(Self::BranchRelations(BranchRelationFilter::default()))
             }
+            QueryStepOp::CppExpressions => Some(Self::CppExpressions),
+            QueryStepOp::CppInconsistentLoopDirection => Some(Self::CppInconsistentLoopDirection),
+            QueryStepOp::CppUnsafeArrayForDaysOfTheYear => {
+                Some(Self::CppUnsafeArrayForDaysOfTheYear)
+            }
+            QueryStepOp::CppProvenance => Some(Self::CppProvenance(CppProvenanceFilter::default())),
             QueryStepOp::LoopRelations => Some(Self::LoopRelations),
             QueryStepOp::StatementReachability => Some(Self::StatementReachability),
+            QueryStepOp::PendingCleanupFlows => Some(Self::PendingCleanupFlows),
+            QueryStepOp::RustPointerFindings => Some(Self::RustPointerFindings),
             QueryStepOp::RewritePathsOf => Some(Self::RewritePathsOf(RewritePathFilter::default())),
             QueryStepOp::SegmentsOf => Some(Self::SegmentsOf(SegmentsOfOptions::default())),
             QueryStepOp::SegmentTarget => Some(Self::SegmentTarget),
@@ -2018,11 +2949,27 @@ impl QueryStep {
     pub fn output_kind(&self, input: QueryValueKind) -> Option<QueryValueKind> {
         match (self, input) {
             (Self::Filter(_) | Self::Project(_), input) => Some(input),
-            (Self::EnclosingDecl, QueryValueKind::StructuralMatch) => {
-                Some(QueryValueKind::Declaration)
+            (Self::CaptureAnchor(_), QueryValueKind::StructuralMatch) => {
+                Some(QueryValueKind::StructuralMatch)
             }
+            (Self::ConfigurationAbsence(_), QueryValueKind::ConfigurationFact) => {
+                Some(QueryValueKind::ConfigurationFact)
+            }
+            (Self::StatementFacts(_) | Self::CppFacts(_), QueryValueKind::StructuralMatch) => {
+                Some(QueryValueKind::StructuralMatch)
+            }
+            (
+                Self::EnclosingDecl,
+                QueryValueKind::StructuralMatch | QueryValueKind::DispatchTarget,
+            ) => Some(QueryValueKind::Declaration),
             (Self::ProcedureOf, QueryValueKind::StructuralMatch | QueryValueKind::Declaration) => {
                 Some(QueryValueKind::Procedure)
+            }
+            (Self::ProgramPointOf, QueryValueKind::StructuralMatch) => {
+                Some(QueryValueKind::ProgramPoint)
+            }
+            (Self::ProgramPointById { .. }, QueryValueKind::Procedure) => {
+                Some(QueryValueKind::ProgramPoint)
             }
             (Self::CfgEntry | Self::CfgExits, QueryValueKind::Procedure) => {
                 Some(QueryValueKind::ProgramPoint)
@@ -2035,9 +2982,6 @@ impl QueryStep {
             }
             (Self::Typestate(_), QueryValueKind::Procedure) => {
                 Some(QueryValueKind::TypestateFinding)
-            }
-            (Self::ConcurrentAccessConflicts, QueryValueKind::Procedure) => {
-                Some(QueryValueKind::ConcurrentAccessConflict)
             }
             (Self::ValueFlow(_), QueryValueKind::Procedure) => Some(QueryValueKind::FlowEndpoint),
             (Self::ClassSet, QueryValueKind::Procedure) => Some(QueryValueKind::ClassSetRow),
@@ -2052,72 +2996,33 @@ impl QueryStep {
             (Self::Witness(_), QueryValueKind::AbsentMemberFinding) => {
                 Some(QueryValueKind::AbsentMemberWitness)
             }
-            (
-                Self::FileOf,
-                QueryValueKind::StructuralMatch
-                | QueryValueKind::Declaration
-                | QueryValueKind::Procedure
-                | QueryValueKind::ProgramPoint
-                | QueryValueKind::ControlEdge
-                | QueryValueKind::TypestateFinding
-                | QueryValueKind::ConcurrentAccessConflict
-                | QueryValueKind::TypestateWitness
-                | QueryValueKind::FlowEndpoint
-                | QueryValueKind::FlowWitness
-                | QueryValueKind::ClassSetRow
-                | QueryValueKind::AbsentMemberFinding
-                | QueryValueKind::AbsentMemberWitness
-                | QueryValueKind::TaintFinding
-                | QueryValueKind::ReferenceSite
-                | QueryValueKind::CallSite
-                | QueryValueKind::ExpressionSite
-                | QueryValueKind::JsxAttributeValue
-                | QueryValueKind::ReceiverAnalysis
-                | QueryValueKind::MemberTargetAnalysis
-                | QueryValueKind::KeyedReadValue
-                | QueryValueKind::ReceiverOutcome
-                | QueryValueKind::ReceiverEvidence
-                | QueryValueKind::FieldWriteValue
-                | QueryValueKind::CallShape
-                | QueryValueKind::CallResult
-                | QueryValueKind::ResultSubjectUse
-                | QueryValueKind::CallArgumentGroup
-                | QueryValueKind::CallArgument
-                | QueryValueKind::CallBinding
-                | QueryValueKind::CallEffect
-                | QueryValueKind::CallResultContract
-                | QueryValueKind::CallResultObligation
-                | QueryValueKind::ResultContractUse
-                | QueryValueKind::ResultContractFailureUse
-                | QueryValueKind::ProcedureEffect
-                | QueryValueKind::CallableSignature
-                | QueryValueKind::SignatureParameter
-                | QueryValueKind::DecoratedParameter
-                | QueryValueKind::CallableApplicability
-                | QueryValueKind::OverloadSelection
-                | QueryValueKind::MemberSelection
-                | QueryValueKind::DispatchOutcome
-                | QueryValueKind::DispatchTarget
-                | QueryValueKind::MemberFamily
-                | QueryValueKind::MemberFamilyEdge
-                | QueryValueKind::Occurrence
-                | QueryValueKind::LexicalScope
-                | QueryValueKind::Binding
-                | QueryValueKind::QualifiedPath
-                | QueryValueKind::PathSegment
-                | QueryValueKind::StateEvent
-                | QueryValueKind::BranchRelation
-                | QueryValueKind::LoopRelation
-                | QueryValueKind::FailureHandlerState
-                | QueryValueKind::StatementReachability,
-            ) => Some(QueryValueKind::File),
+            (Self::FileOf, kind) if FILE_OF_INPUT_KINDS.contains(&kind) => {
+                Some(QueryValueKind::File)
+            }
             (Self::ImportsOf | Self::ImportersOf, QueryValueKind::File) => {
                 Some(QueryValueKind::File)
+            }
+            (Self::PythonImportSite, QueryValueKind::StructuralMatch) => {
+                Some(QueryValueKind::StructuralMatch)
+            }
+            (Self::PythonImportCycles, QueryValueKind::StructuralMatch) => {
+                Some(QueryValueKind::StructuralMatch)
+            }
+            (Self::PythonCommentedOutCode, QueryValueKind::StructuralMatch) => {
+                Some(QueryValueKind::PythonRuleFact)
             }
             (
                 Self::Supertypes(_) | Self::Subtypes(_) | Self::Members | Self::Owner,
                 QueryValueKind::Declaration,
             ) => Some(QueryValueKind::Declaration),
+            (
+                Self::ClassHierarchy | Self::ClassBases | Self::ClassMro | Self::MroMembers,
+                QueryValueKind::Declaration,
+            ) => Some(QueryValueKind::PythonHierarchyFact),
+            (
+                Self::PythonOverrides | Self::PythonCallRelations | Self::PythonOverrideSignatures,
+                QueryValueKind::Declaration,
+            ) => Some(QueryValueKind::PythonHierarchyFact),
             (Self::ReferencesOf(_), QueryValueKind::Declaration) => {
                 Some(QueryValueKind::ReferenceSite)
             }
@@ -2127,6 +3032,7 @@ impl QueryStep {
             (Self::Callers(_) | Self::Callees(_), QueryValueKind::Declaration) => {
                 Some(QueryValueKind::Declaration)
             }
+            (Self::Callees(_), QueryValueKind::Procedure) => Some(QueryValueKind::Procedure),
             (Self::CallSitesTo(_) | Self::CallSitesFrom(_), QueryValueKind::Declaration) => {
                 Some(QueryValueKind::CallSite)
             }
@@ -2180,12 +3086,18 @@ impl QueryStep {
                 | QueryValueKind::Occurrence
                 | QueryValueKind::ReceiverAnalysis,
             ) => Some(QueryValueKind::ReceiverEvidence),
+            (Self::PointsToCandidates, QueryValueKind::ReceiverAnalysis) => {
+                Some(QueryValueKind::PointsToCandidate)
+            }
             (
                 Self::CallShape,
                 QueryValueKind::StructuralMatch
                 | QueryValueKind::CallSite
                 | QueryValueKind::Occurrence,
             ) => Some(QueryValueKind::CallShape),
+            (Self::ExactExternalCallee, QueryValueKind::CallShape) => {
+                Some(QueryValueKind::CallShape)
+            }
             (Self::CallArgumentGroups, QueryValueKind::CallShape) => {
                 Some(QueryValueKind::CallArgumentGroup)
             }
@@ -2200,6 +3112,23 @@ impl QueryStep {
             (Self::ResolvedCall(_) | Self::CallArgument(_), QueryValueKind::CallBinding) => {
                 Some(QueryValueKind::CallBinding)
             }
+            (
+                Self::CppBadStrncpySize | Self::CppNetworkToHostFunctionAsArrayBound,
+                QueryValueKind::CallBinding,
+            ) => Some(QueryValueKind::StructuralMatch),
+            (
+                Self::CppNonConstantFormat
+                | Self::CppWrongNumberFormatArguments
+                | Self::CppTooManyFormatArguments
+                | Self::CppWrongTypeFormatArgument
+                | Self::CppNonPortablePrintf
+                | Self::CppOverflowingSnprintf,
+                QueryValueKind::CallBinding,
+            ) => Some(QueryValueKind::StructuralMatch),
+            (
+                Self::ResolvedValue(_),
+                input @ (QueryValueKind::CallBinding | QueryValueKind::StructuralMatch),
+            ) => Some(input),
             (Self::CallEffects, QueryValueKind::CallShape) => Some(QueryValueKind::CallEffect),
             (Self::ResultContractCalls, QueryValueKind::CallShape) => {
                 Some(QueryValueKind::CallShape)
@@ -2210,6 +3139,65 @@ impl QueryStep {
             (Self::CallResultObligations, QueryValueKind::CallShape) => {
                 Some(QueryValueKind::CallResultObligation)
             }
+            (Self::ProcedureReturnProfile | Self::TupleReturnGroups, QueryValueKind::Procedure) => {
+                Some(QueryValueKind::PythonRuleFact)
+            }
+            (Self::PythonIteratorReturnProtocol, QueryValueKind::Procedure) => {
+                Some(QueryValueKind::PythonRuleFact)
+            }
+            (Self::PythonBuiltinIdentity, QueryValueKind::Occurrence) => {
+                Some(QueryValueKind::PythonRuleFact)
+            }
+            (Self::PythonUninitializedVariable, QueryValueKind::Occurrence) => {
+                Some(QueryValueKind::PythonRuleFact)
+            }
+            (Self::PythonRaiseNotImplemented, QueryValueKind::StructuralMatch) => {
+                Some(QueryValueKind::PythonRuleFact)
+            }
+            (Self::PythonUnsafeCyclicImport, QueryValueKind::StructuralMatch) => {
+                Some(QueryValueKind::PythonRuleFact)
+            }
+            (Self::PythonDocumentation, QueryValueKind::Declaration) => {
+                Some(QueryValueKind::PythonRuleFact)
+            }
+            (Self::PythonUselessClass, QueryValueKind::Declaration) => {
+                Some(QueryValueKind::PythonRuleFact)
+            }
+            (Self::PythonAttributeShadowsMethod, QueryValueKind::Declaration) => {
+                Some(QueryValueKind::PythonRuleFact)
+            }
+            (Self::PythonModificationOfDefaultValue, QueryValueKind::Declaration) => {
+                Some(QueryValueKind::PythonRuleFact)
+            }
+            (Self::PythonOverlyComplexDelete, QueryValueKind::Declaration) => {
+                Some(QueryValueKind::PythonRuleFact)
+            }
+            (Self::CallResultUse, QueryValueKind::CallShape) => {
+                Some(QueryValueKind::PythonRuleFact)
+            }
+            (Self::PythonAssertionContext, QueryValueKind::StructuralMatch) => {
+                Some(QueryValueKind::PythonRuleFact)
+            }
+            (Self::TupleReturnAssignment, QueryValueKind::StructuralMatch) => {
+                Some(QueryValueKind::PythonRuleFact)
+            }
+            (Self::PythonImplicitStringConcatenation, QueryValueKind::StructuralMatch) => {
+                Some(QueryValueKind::PythonRuleFact)
+            }
+            (Self::LambdaForwarding, QueryValueKind::StructuralMatch) => {
+                Some(QueryValueKind::PythonRuleFact)
+            }
+            (Self::PythonFormatIssues, QueryValueKind::StructuralMatch) => {
+                Some(QueryValueKind::PythonRuleFact)
+            }
+            (Self::PythonUrlConstruction, QueryValueKind::StructuralMatch) => {
+                Some(QueryValueKind::PythonRuleFact)
+            }
+
+            (
+                Self::PythonRaiseLegality | Self::PythonSpecialMethodRaise,
+                QueryValueKind::StructuralMatch,
+            ) => Some(QueryValueKind::PythonRuleFact),
             (Self::ResultContractUses, QueryValueKind::CallResultContract) => {
                 Some(QueryValueKind::CallResultContract)
             }
@@ -2231,11 +3219,17 @@ impl QueryStep {
             (Self::DetachedTaskTransfers, QueryValueKind::Procedure) => {
                 Some(QueryValueKind::DetachedTaskTransfer)
             }
-            (Self::ProcedureEffects, QueryValueKind::Declaration) => {
+            (Self::ProcedureEffects, QueryValueKind::Declaration | QueryValueKind::Procedure) => {
                 Some(QueryValueKind::ProcedureEffect)
             }
             (Self::CallableSignature, QueryValueKind::Declaration) => {
                 Some(QueryValueKind::CallableSignature)
+            }
+            (Self::LiteralOccurrences, QueryValueKind::StructuralMatch) => {
+                Some(QueryValueKind::LiteralOccurrence)
+            }
+            (Self::CallableMetrics, QueryValueKind::Declaration) => {
+                Some(QueryValueKind::CallableMetrics)
             }
             (Self::SignatureParameters, QueryValueKind::CallableSignature) => {
                 Some(QueryValueKind::SignatureParameter)
@@ -2273,9 +3267,13 @@ impl QueryStep {
             (Self::OccurrencesOf(_), QueryValueKind::Declaration) => {
                 Some(QueryValueKind::Occurrence)
             }
-            (Self::OccurrencesIn(_), QueryValueKind::StructuralMatch | QueryValueKind::File) => {
-                Some(QueryValueKind::Occurrence)
-            }
+            (
+                Self::OccurrencesIn(_),
+                QueryValueKind::StructuralMatch
+                | QueryValueKind::CallShape
+                | QueryValueKind::LexicalScope
+                | QueryValueKind::File,
+            ) => Some(QueryValueKind::Occurrence),
             (Self::OccurrenceTarget, QueryValueKind::Occurrence) => {
                 Some(QueryValueKind::Declaration)
             }
@@ -2294,6 +3292,28 @@ impl QueryStep {
             ) => Some(QueryValueKind::Binding),
             (Self::BindingOf(_), QueryValueKind::Occurrence) => Some(QueryValueKind::Binding),
             (Self::BindingOccurrence, QueryValueKind::Binding) => Some(QueryValueKind::Occurrence),
+            (Self::BindingUses, QueryValueKind::Binding) => Some(QueryValueKind::Occurrence),
+            (Self::PythonVariableOf, QueryValueKind::Binding | QueryValueKind::Occurrence) => {
+                Some(QueryValueKind::PythonRuleFact)
+            }
+            (
+                Self::PythonVariableDefinitions | Self::PythonVariableUses,
+                QueryValueKind::PythonRuleFact,
+            ) => Some(QueryValueKind::PythonRuleFact),
+            (Self::PythonVariablePeers, QueryValueKind::PythonRuleFact) => {
+                Some(QueryValueKind::PythonRuleFact)
+            }
+            (Self::PythonVariableNestedLoops, QueryValueKind::PythonRuleFact) => {
+                Some(QueryValueKind::PythonRuleFact)
+            }
+            (
+                Self::IdenticalOperands
+                | Self::PythonMissingSelf
+                | Self::PythonComparisonConstants
+                | Self::PythonComparisonUsingIs
+                | Self::PythonComparisonUsingIsNonPortable,
+                QueryValueKind::StructuralMatch,
+            ) => Some(QueryValueKind::StructuralMatch),
             (Self::CandidatesOf(_), QueryValueKind::Occurrence) => {
                 Some(QueryValueKind::ResolutionCandidate)
             }
@@ -2328,6 +3348,12 @@ impl QueryStep {
             (Self::StateEventsOf(_), QueryValueKind::Procedure | QueryValueKind::Declaration) => {
                 Some(QueryValueKind::StateEvent)
             }
+            (Self::BindingInitializerCallsOf, QueryValueKind::StateEvent) => {
+                Some(QueryValueKind::BindingInitializerCall)
+            }
+            (Self::SelectedPropertyRelationsOf, QueryValueKind::ProgramPoint) => {
+                Some(QueryValueKind::FlowRelation)
+            }
             (Self::FlowRelationsOf(_), QueryValueKind::StateEvent | QueryValueKind::Procedure) => {
                 Some(QueryValueKind::FlowRelation)
             }
@@ -2343,9 +3369,26 @@ impl QueryStep {
             (Self::BranchRelations(_), QueryValueKind::StructuralMatch) => {
                 Some(QueryValueKind::BranchRelation)
             }
+            (Self::CppExpressions, QueryValueKind::StructuralMatch) => {
+                Some(QueryValueKind::CppExpression)
+            }
+            (
+                Self::CppInconsistentLoopDirection | Self::CppUnsafeArrayForDaysOfTheYear,
+                QueryValueKind::StructuralMatch,
+            ) => Some(QueryValueKind::StructuralMatch),
+            (
+                Self::CppProvenance(_),
+                QueryValueKind::StructuralMatch | QueryValueKind::CallBinding,
+            ) => Some(QueryValueKind::StructuralMatch),
             (Self::LoopRelations, QueryValueKind::Procedure) => Some(QueryValueKind::LoopRelation),
             (Self::StatementReachability, QueryValueKind::Procedure) => {
                 Some(QueryValueKind::StatementReachability)
+            }
+            (Self::PendingCleanupFlows, QueryValueKind::Procedure) => {
+                Some(QueryValueKind::PendingCleanupFlow)
+            }
+            (Self::RustPointerFindings, QueryValueKind::Procedure) => {
+                Some(QueryValueKind::RustPointerFinding)
             }
             (Self::GuardsOf, QueryValueKind::Procedure) => Some(QueryValueKind::Guard),
             // Project topology (#2448). A file's owner is what the build
@@ -2423,30 +3466,44 @@ fn validate_query_steps(
         }
         let expected_input = match step {
             QueryStep::Filter(_) | QueryStep::Project(_) => "a typed row",
-            QueryStep::EnclosingDecl => "structural_match",
+            QueryStep::CaptureAnchor(_) => "structural_match",
+            QueryStep::ConfigurationAbsence(_) => "configuration_fact",
+            QueryStep::StatementFacts(_) => "structural_match",
+            QueryStep::CppFacts(_) => "structural_match",
+            QueryStep::EnclosingDecl => "structural_match or dispatch_target",
             QueryStep::ProcedureOf => "structural_match or declaration",
+            QueryStep::ProgramPointOf => "structural_match",
+            QueryStep::ProgramPointById { .. } => "procedure",
             QueryStep::CfgEntry | QueryStep::CfgExits => "procedure",
             QueryStep::CfgSuccessorEdges | QueryStep::CfgPredecessorEdges => "program_point",
             QueryStep::CfgEdgeSource | QueryStep::CfgEdgeTarget => "control_edge",
             QueryStep::Typestate(_) => "procedure",
-            QueryStep::ConcurrentAccessConflicts => "procedure",
             QueryStep::ValueFlow(_) => "procedure",
             QueryStep::ClassSet | QueryStep::AbsentMember(_) => "procedure",
             QueryStep::Taint(_) => "procedure",
             QueryStep::Witness(_) => "typestate_finding, flow_endpoint, or absent_member_finding",
-            QueryStep::FileOf => {
-                "structural_match, declaration, procedure, program_point, control_edge, branch_relation, typestate_finding, typestate_witness, flow_endpoint, flow_witness, class_set_row, absent_member_finding, absent_member_witness, taint_finding, reference_site, call_site, expression_site, jsx_attribute_value, receiver_analysis, receiver_outcome, receiver_evidence, result_contract_failure_use, occurrence, lexical_scope, or binding"
-            }
+            QueryStep::FileOf => file_of_input_expectation(),
             QueryStep::ImportsOf | QueryStep::ImportersOf => "file",
+            QueryStep::PythonImportSite
+            | QueryStep::PythonImportCycles
+            | QueryStep::PythonCommentedOutCode
+            | QueryStep::PythonUnsafeCyclicImport => "structural_match",
             QueryStep::Supertypes(_)
             | QueryStep::Subtypes(_)
+            | QueryStep::ClassHierarchy
+            | QueryStep::ClassBases
+            | QueryStep::ClassMro
+            | QueryStep::MroMembers
+            | QueryStep::PythonOverrides
+            | QueryStep::PythonCallRelations
+            | QueryStep::PythonOverrideSignatures
             | QueryStep::Members
             | QueryStep::Owner => "declaration",
             QueryStep::ReferencesOf(_) | QueryStep::UsedBy(_) | QueryStep::Uses(_) => "declaration",
-            QueryStep::Callers(_)
-            | QueryStep::Callees(_)
-            | QueryStep::CallSitesTo(_)
-            | QueryStep::CallSitesFrom(_) => "declaration",
+            QueryStep::Callees(_) => "declaration or procedure",
+            QueryStep::Callers(_) | QueryStep::CallSitesTo(_) | QueryStep::CallSitesFrom(_) => {
+                "declaration"
+            }
             QueryStep::CallInput(_) => "call_site",
             QueryStep::JsxAttributeValue(_) => "structural_match",
             QueryStep::ReceiverTargets(_) => {
@@ -2464,17 +3521,50 @@ fn validate_query_steps(
             QueryStep::ReceiverEvidence => {
                 "structural_match, reference_site, call_site, expression_site, occurrence, or receiver_analysis"
             }
+            QueryStep::PointsToCandidates => "receiver_analysis",
             QueryStep::CallShape => "structural_match, call_site, or occurrence",
+            QueryStep::ExactExternalCallee => "call_shape",
             QueryStep::CallResults => "call_shape",
             QueryStep::ResultSubjectUses => "call_result",
             QueryStep::CallArgumentGroups => "call_shape",
             QueryStep::CallArguments => "call_argument_group",
             QueryStep::CallBindings => "call_shape",
-            QueryStep::ResolvedCall(_) | QueryStep::CallArgument(_) => "call_binding",
+            QueryStep::ResolvedCall(_)
+            | QueryStep::CallArgument(_)
+            | QueryStep::CppBadStrncpySize
+            | QueryStep::CppNetworkToHostFunctionAsArrayBound
+            | QueryStep::CppNonConstantFormat
+            | QueryStep::CppWrongNumberFormatArguments
+            | QueryStep::CppTooManyFormatArguments
+            | QueryStep::CppWrongTypeFormatArgument
+            | QueryStep::CppNonPortablePrintf
+            | QueryStep::CppOverflowingSnprintf => "call_binding",
+            QueryStep::ResolvedValue(_) => "call_binding or structural_match",
             QueryStep::CallEffects => "call_shape",
             QueryStep::ResultContractCalls => "call_shape",
             QueryStep::CallResultContracts => "call_shape",
             QueryStep::CallResultObligations => "call_shape",
+            QueryStep::ProcedureReturnProfile | QueryStep::TupleReturnGroups => "procedure",
+            QueryStep::PythonIteratorReturnProtocol => "procedure",
+            QueryStep::PythonBuiltinIdentity => "occurrence",
+            QueryStep::PythonUninitializedVariable => "occurrence",
+            QueryStep::PythonRaiseNotImplemented => "structural_match",
+            QueryStep::PythonDocumentation => "declaration",
+            QueryStep::PythonUselessClass => "declaration",
+            QueryStep::PythonAttributeShadowsMethod => "declaration",
+            QueryStep::PythonModificationOfDefaultValue => "declaration",
+            QueryStep::PythonOverlyComplexDelete => "declaration",
+            QueryStep::CallResultUse => "call_shape",
+            QueryStep::LambdaForwarding => "structural_match",
+            QueryStep::PythonAssertionContext => "structural_match",
+            QueryStep::TupleReturnAssignment => "structural_match",
+            QueryStep::PythonImplicitStringConcatenation => "structural_match",
+            QueryStep::PythonFormatIssues => "structural_match",
+            QueryStep::PythonUrlConstruction => "structural_match",
+
+            QueryStep::PythonRaiseLegality | QueryStep::PythonSpecialMethodRaise => {
+                "structural_match"
+            }
             QueryStep::ResultContractUses
             | QueryStep::ResultContractOperationUses
             | QueryStep::ResultContractFailureUses(_) => "call_result_contract",
@@ -2482,8 +3572,10 @@ fn validate_query_steps(
             QueryStep::SwitchCoverage => "procedure",
             QueryStep::AssignmentRelations(_) => "procedure",
             QueryStep::DetachedTaskTransfers => "procedure",
-            QueryStep::ProcedureEffects => "declaration",
+            QueryStep::ProcedureEffects => "declaration or procedure",
             QueryStep::CallableSignature => "declaration",
+            QueryStep::LiteralOccurrences => "structural_match",
+            QueryStep::CallableMetrics => "declaration",
             QueryStep::SignatureParameters => "callable_signature",
             QueryStep::DecoratorBindings(_) => "structural_match",
             QueryStep::CallableApplicability | QueryStep::OverloadSelection => "occurrence",
@@ -2493,13 +3585,25 @@ fn validate_query_steps(
             }
             QueryStep::MemberFamily | QueryStep::FamilyEdges => "declaration",
             QueryStep::OccurrencesOf(_) => "declaration",
-            QueryStep::OccurrencesIn(_) => "structural_match or file",
+            QueryStep::OccurrencesIn(_) => "structural_match, call_shape, lexical_scope, or file",
             QueryStep::OccurrenceTarget => "occurrence",
             QueryStep::ScopeOf => "binding, occurrence, or structural_match",
             QueryStep::ScopeAncestors => "lexical_scope",
             QueryStep::BindingsIn(_) => "lexical_scope or structural_match",
             QueryStep::BindingOf(_) => "occurrence",
             QueryStep::BindingOccurrence => "binding",
+            QueryStep::BindingUses => "binding",
+            QueryStep::PythonVariableOf => "binding or occurrence",
+            QueryStep::PythonVariableDefinitions | QueryStep::PythonVariableUses => {
+                "python_rule_fact"
+            }
+            QueryStep::PythonVariablePeers => "python_rule_fact",
+            QueryStep::PythonVariableNestedLoops => "python_rule_fact",
+            QueryStep::IdenticalOperands
+            | QueryStep::PythonMissingSelf
+            | QueryStep::PythonComparisonConstants
+            | QueryStep::PythonComparisonUsingIs
+            | QueryStep::PythonComparisonUsingIsNonPortable => "structural_match",
             QueryStep::CandidatesOf(_) => "occurrence",
             QueryStep::CandidateHierarchy => "occurrence",
             QueryStep::CandidateTarget => "resolution_candidate",
@@ -2507,11 +3611,21 @@ fn validate_query_steps(
             QueryStep::EdgesFrom(_) => "occurrence",
             QueryStep::EdgeTarget => "reference_edge",
             QueryStep::StateEventsOf(_) => "procedure or declaration",
+            QueryStep::BindingInitializerCallsOf => "state_event",
+            QueryStep::SelectedPropertyRelationsOf => "program_point",
             QueryStep::FlowRelationsOf(_) => "state_event or procedure",
             QueryStep::FlowSource | QueryStep::FlowTarget => "flow_relation",
             QueryStep::ControlRelations(_) => "procedure",
             QueryStep::BranchRelations(_) | QueryStep::FailureHandlerState => "structural_match",
-            QueryStep::LoopRelations | QueryStep::StatementReachability => "procedure",
+            QueryStep::CppExpressions => "structural_match",
+            QueryStep::CppInconsistentLoopDirection | QueryStep::CppUnsafeArrayForDaysOfTheYear => {
+                "structural_match"
+            }
+            QueryStep::CppProvenance(_) => "structural_match or call_binding",
+            QueryStep::LoopRelations
+            | QueryStep::StatementReachability
+            | QueryStep::PendingCleanupFlows
+            | QueryStep::RustPointerFindings => "procedure",
             QueryStep::GuardsOf => "procedure",
             QueryStep::TargetOf | QueryStep::SourceSetOf => "file",
             QueryStep::TopologyEdgesOf => "build_target",
@@ -2628,6 +3742,36 @@ fn validate_row_predicates(
                 validate_ordered_row_operator(op, *field, &predicate_path)?;
                 validate_row_literal(value, *field, &format!("{predicate_path}.value"))?;
             }
+            (
+                QueryRowPredicateOp::Regex,
+                QueryRowPredicateOperand::Literal(QueryRowLiteral::String(pattern)),
+            ) => {
+                if !matches!(
+                    field.scalar_type,
+                    CodeQueryRowScalarType::StableId
+                        | CodeQueryRowScalarType::String
+                        | CodeQueryRowScalarType::DeclarationIdentity
+                ) {
+                    return Err(QueryError::new(
+                        predicate_path,
+                        "regex is defined only for string row fields",
+                    ));
+                }
+                if pattern.is_empty() || pattern.len() > MAX_STRING_PREDICATE_LENGTH {
+                    return Err(QueryError::new(
+                        format!("{predicate_path}.value"),
+                        format!(
+                            "regex must contain from 1 through {MAX_STRING_PREDICATE_LENGTH} bytes"
+                        ),
+                    ));
+                }
+                regex::Regex::new(pattern).map_err(|error| {
+                    QueryError::new(
+                        format!("{predicate_path}.value"),
+                        format!("invalid regex: {error}"),
+                    )
+                })?;
+            }
             (op, QueryRowPredicateOperand::Field(other))
                 if matches!(
                     op,
@@ -2703,24 +3847,9 @@ fn validate_row_literal(
             "constrained-enum labels must not be empty",
         ));
     }
-    let type_matches = matches!(
-        (field.scalar_type, literal),
-        (
-            CodeQueryRowScalarType::StableId
-                | CodeQueryRowScalarType::String
-                | CodeQueryRowScalarType::DeclarationIdentity,
-            QueryRowLiteral::String(_)
-        ) | (CodeQueryRowScalarType::Integer, QueryRowLiteral::Integer(_))
-            | (
-                CodeQueryRowScalarType::StringList,
-                QueryRowLiteral::StringList(_)
-            )
-            | (CodeQueryRowScalarType::Boolean, QueryRowLiteral::Boolean(_))
-            | (
-                CodeQueryRowScalarType::ConstrainedEnum,
-                QueryRowLiteral::ConstrainedEnum(_)
-            )
-    );
+    let type_matches = field
+        .scalar_type
+        .accepts_literal_type(literal.scalar_type());
     if !type_matches {
         return Err(QueryError::new(
             path,
@@ -2802,13 +3931,17 @@ fn validate_row_projection(
 }
 
 fn validate_row_field_name(name: &str, path: &str, what: &str) -> Result<(), QueryError> {
-    if name.is_empty() || name.len() > MAX_ROW_FIELD_NAME_LENGTH {
+    if !is_valid_row_field_name(name) {
         return Err(QueryError::new(
             path,
             format!("{what} must contain from 1 through {MAX_ROW_FIELD_NAME_LENGTH} bytes"),
         ));
     }
     Ok(())
+}
+
+pub(super) fn is_valid_row_field_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= MAX_ROW_FIELD_NAME_LENGTH
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2905,6 +4038,22 @@ impl CodeQuerySeed {
                 .is_some_and(Pattern::constrains_callable_signature)
     }
 
+    pub fn constrains_local_value(&self) -> bool {
+        self.root.constrains_local_value()
+            || self
+                .inside
+                .as_ref()
+                .is_some_and(Pattern::constrains_local_value)
+            || self
+                .inside_decl
+                .as_ref()
+                .is_some_and(Pattern::constrains_local_value)
+            || self
+                .not_inside
+                .as_ref()
+                .is_some_and(Pattern::constrains_local_value)
+    }
+
     /// Whether any pattern in this seed filters on an exact normalized
     /// boolean-literal value.
     pub fn constrains_boolean_value(&self) -> bool {
@@ -2922,6 +4071,130 @@ impl CodeQuerySeed {
                 .as_ref()
                 .is_some_and(Pattern::constrains_boolean_value)
     }
+
+    /// Whether any pattern in this seed filters on AST-backed callable asyncness.
+    pub fn constrains_async_callable(&self) -> bool {
+        self.root.constrains_async_callable()
+            || self
+                .inside
+                .as_ref()
+                .is_some_and(Pattern::constrains_async_callable)
+            || self
+                .inside_decl
+                .as_ref()
+                .is_some_and(Pattern::constrains_async_callable)
+            || self
+                .not_inside
+                .as_ref()
+                .is_some_and(Pattern::constrains_async_callable)
+    }
+
+    /// Whether any pattern in this seed filters on a decoded string-literal
+    /// value.
+    pub fn constrains_string_value(&self) -> bool {
+        self.root.constrains_string_value()
+            || self
+                .inside
+                .as_ref()
+                .is_some_and(Pattern::constrains_string_value)
+            || self
+                .inside_decl
+                .as_ref()
+                .is_some_and(Pattern::constrains_string_value)
+            || self
+                .not_inside
+                .as_ref()
+                .is_some_and(Pattern::constrains_string_value)
+    }
+
+    /// Whether any pattern in this seed asks for decoded dictionary-key
+    /// equality.
+    pub fn constrains_duplicate_dictionary_key(&self) -> bool {
+        self.root.constrains_duplicate_dictionary_key()
+            || self
+                .inside
+                .as_ref()
+                .is_some_and(Pattern::constrains_duplicate_dictionary_key)
+            || self
+                .inside_decl
+                .as_ref()
+                .is_some_and(Pattern::constrains_duplicate_dictionary_key)
+            || self
+                .not_inside
+                .as_ref()
+                .is_some_and(Pattern::constrains_duplicate_dictionary_key)
+    }
+
+    /// Whether any pattern in this seed selects direct assignment shapes.
+    pub fn constrains_assignment_shape(&self) -> bool {
+        self.root.constrains_assignment_shape()
+            || self
+                .inside
+                .as_ref()
+                .is_some_and(Pattern::constrains_assignment_shape)
+            || self
+                .inside_decl
+                .as_ref()
+                .is_some_and(Pattern::constrains_assignment_shape)
+            || self
+                .not_inside
+                .as_ref()
+                .is_some_and(Pattern::constrains_assignment_shape)
+    }
+
+    /// Whether any pattern in this seed selects exact integer-literal values.
+    pub fn constrains_integer_literal_value(&self) -> bool {
+        self.root.constrains_integer_literal_value()
+            || self
+                .inside
+                .as_ref()
+                .is_some_and(Pattern::constrains_integer_literal_value)
+            || self
+                .inside_decl
+                .as_ref()
+                .is_some_and(Pattern::constrains_integer_literal_value)
+            || self
+                .not_inside
+                .as_ref()
+                .is_some_and(Pattern::constrains_integer_literal_value)
+    }
+
+    /// Whether any pattern selects comment-block text, which needs one
+    /// request-local grouping pass for the file being matched.
+    pub fn constrains_comment_block_text(&self) -> bool {
+        self.root.constrains_comment_block_text()
+            || self
+                .inside
+                .as_ref()
+                .is_some_and(Pattern::constrains_comment_block_text)
+            || self
+                .inside_decl
+                .as_ref()
+                .is_some_and(Pattern::constrains_comment_block_text)
+            || self
+                .not_inside
+                .as_ref()
+                .is_some_and(Pattern::constrains_comment_block_text)
+    }
+}
+
+/// Filters are exact alternatives within each axis, combined with AND across axes.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DependencyEvidenceFilter {
+    pub ecosystems: Vec<String>,
+    pub packages: Vec<String>,
+    pub kinds: Vec<String>,
+    pub exact_versions: Vec<String>,
+    pub version_ranges: Vec<String>,
+    pub sources: Vec<String>,
+    pub declared_by: Vec<String>,
+    pub scopes: Vec<String>,
+}
+#[derive(Debug, Clone)]
+pub struct DependencyEvidenceSeed {
+    pub where_globs: QueryPathScope,
+    pub filter: DependencyEvidenceFilter,
 }
 
 /// The source of values entering one typed pipeline suffix.
@@ -2935,10 +4208,73 @@ pub enum CodeQueryPlanSource {
     GenerationSites(Box<GenerationSiteSeed>),
     Exports(Box<ExportSeed>),
     ConfigurationFacts(Box<ConfigurationFactsSeed>),
+    DependencyEvidence(Box<DependencyEvidenceSeed>),
     Set {
         op: SetOperator,
         branches: Vec<CodeQueryPlan>,
     },
+    Correlate(Box<CrossDomainCorrelation>),
+    RequireBoth(Box<CrossDomainRequirement>),
+}
+
+impl CodeQueryPlanSource {
+    /// The nested plans this source reads, in authored order.
+    pub fn child_plans(&self) -> Vec<&CodeQueryPlan> {
+        match self {
+            Self::Set { branches, .. } => branches.iter().collect(),
+            Self::Correlate(correlation) => vec![&correlation.code, &correlation.configuration],
+            Self::RequireBoth(requirement) => vec![&requirement.code, &requirement.configuration],
+            Self::Seed(_)
+            | Self::Occurrences(_)
+            | Self::Scopes(_)
+            | Self::Bindings(_)
+            | Self::Paths(_)
+            | Self::GenerationSites(_)
+            | Self::Exports(_)
+            | Self::DependencyEvidence(_)
+            | Self::ConfigurationFacts(_) => Vec::new(),
+        }
+    }
+
+    /// The nested plans this source reads, mutably, in authored order.
+    pub fn child_plans_mut(&mut self) -> Vec<&mut CodeQueryPlan> {
+        match self {
+            Self::Set { branches, .. } => branches.iter_mut().collect(),
+            Self::Correlate(correlation) => {
+                vec![&mut correlation.code, &mut correlation.configuration]
+            }
+            Self::RequireBoth(requirement) => {
+                vec![&mut requirement.code, &mut requirement.configuration]
+            }
+            Self::Seed(_)
+            | Self::Occurrences(_)
+            | Self::Scopes(_)
+            | Self::Bindings(_)
+            | Self::Paths(_)
+            | Self::GenerationSites(_)
+            | Self::Exports(_)
+            | Self::DependencyEvidence(_)
+            | Self::ConfigurationFacts(_) => Vec::new(),
+        }
+    }
+}
+
+impl CodeQueryPlanSource {
+    /// Static file publications have their own selected inputs; programming
+    /// language source files are not their enumeration or execution units.
+    pub fn uses_only_file_facts(&self) -> bool {
+        let mut pending = vec![self];
+        while let Some(source) = pending.pop() {
+            match source {
+                Self::DependencyEvidence(_) | Self::ConfigurationFacts(_) => {}
+                Self::Set { branches, .. } => {
+                    pending.extend(branches.iter().map(|branch| &branch.source))
+                }
+                _ => return false,
+            }
+        }
+        true
+    }
 }
 
 /// A structural seed or compatible set composition followed by typed steps.
@@ -2968,8 +4304,11 @@ impl CodeQuery {
             | CodeQueryPlanSource::Paths(_)
             | CodeQueryPlanSource::GenerationSites(_)
             | CodeQueryPlanSource::Exports(_)
+            | CodeQueryPlanSource::DependencyEvidence(_)
             | CodeQueryPlanSource::ConfigurationFacts(_)
-            | CodeQueryPlanSource::Set { .. } => None,
+            | CodeQueryPlanSource::Set { .. }
+            | CodeQueryPlanSource::Correlate(_)
+            | CodeQueryPlanSource::RequireBoth(_) => None,
         }
     }
 
@@ -2983,7 +4322,13 @@ impl CodeQuery {
             if plan.steps.iter().any(|step| {
                 !matches!(
                     step,
-                    QueryStep::FileOf | QueryStep::ImportsOf | QueryStep::ImportersOf
+                    QueryStep::FileOf
+                        | QueryStep::ImportsOf
+                        | QueryStep::ImportersOf
+                        | QueryStep::PythonImportSite
+                        | QueryStep::PythonImportCycles
+                        | QueryStep::PythonCommentedOutCode
+                        | QueryStep::PythonUnsafeCyclicImport
                 )
             }) {
                 return true;
@@ -3011,9 +4356,11 @@ impl CodeQuery {
                             return true;
                         }
                         patterns.extend(pattern.has.as_deref());
+                        patterns.extend(pattern.local_value.as_deref());
                         patterns.extend(pattern.not_has.as_deref());
                     }
                 }
+                CodeQueryPlanSource::DependencyEvidence(_) => {}
                 _ => return true,
             }
         }
@@ -3023,8 +4370,21 @@ impl CodeQuery {
     /// Validate the semantic pipeline independently of its JSON/RQL origin.
     /// Embedders may construct this public IR directly, so execution cannot
     /// rely solely on decoder validation.
+    ///
+    /// A union of different row kinds reports its first branch's kind here;
+    /// [`Self::validate_row_kinds`] lists every kind such a plan produces.
     pub fn validate_steps(&self) -> Result<QueryValueKind, QueryError> {
         self.validate_row_fields().map(|(kind, _)| kind)
+    }
+
+    /// Validate the plan and return every row kind its terminal can produce,
+    /// in first-appearance order. The list has one entry unless a `union`
+    /// combines branches of different row kinds, which is allowed when only
+    /// `filter` and `project` follow it: each row keeps its own kind, and a
+    /// consumer that admits rows by kind must admit every listed kind.
+    pub fn validate_row_kinds(&self) -> Result<Vec<QueryValueKind>, QueryError> {
+        let mut nodes = 0;
+        validate_plan(&self.plan, "", 0, &mut nodes).map(|domain| domain.row_kinds)
     }
 
     /// Validate the complete plan and return its visible terminal row schema.
@@ -3044,11 +4404,27 @@ impl CodeQuery {
     }
 }
 
+impl CodeQueryPlan {
+    /// The kind of this plan's rows. The plan must be part of a validated
+    /// query.
+    pub(crate) fn value_kind(&self) -> QueryValueKind {
+        let mut nodes = 0;
+        validate_plan(self, "", 0, &mut nodes)
+            .expect("a plan of a validated query validates")
+            .kind
+    }
+}
+
 #[derive(Debug)]
 struct ValidatedDomain {
+    /// The kind the typed step contract sees. A union of different row kinds
+    /// reports its first branch's kind here; `row_kinds` lists every kind.
     kind: QueryValueKind,
     captures: Option<std::collections::HashSet<String>>,
     projected_fields: Option<Vec<(String, CodeQueryRowField)>>,
+    /// Every row kind the plan can produce, in first-appearance order. One
+    /// entry unless a union combines branches of different row kinds (#5352).
+    row_kinds: Vec<QueryValueKind>,
 }
 
 fn validate_plan(
@@ -3076,44 +4452,135 @@ fn validate_plan(
             kind: QueryValueKind::StructuralMatch,
             captures: Some(seed.positive_capture_names()),
             projected_fields: None,
+            row_kinds: vec![QueryValueKind::StructuralMatch],
         },
         CodeQueryPlanSource::Occurrences(_) => ValidatedDomain {
             kind: QueryValueKind::Occurrence,
             captures: None,
             projected_fields: None,
+            row_kinds: vec![QueryValueKind::Occurrence],
         },
         CodeQueryPlanSource::Paths(_) => ValidatedDomain {
             kind: QueryValueKind::QualifiedPath,
             captures: None,
             projected_fields: None,
+            row_kinds: vec![QueryValueKind::QualifiedPath],
         },
         CodeQueryPlanSource::Scopes(_) => ValidatedDomain {
             kind: QueryValueKind::LexicalScope,
             captures: None,
             projected_fields: None,
+            row_kinds: vec![QueryValueKind::LexicalScope],
         },
         CodeQueryPlanSource::Bindings(_) => ValidatedDomain {
             kind: QueryValueKind::Binding,
             captures: None,
             projected_fields: None,
+            row_kinds: vec![QueryValueKind::Binding],
         },
         CodeQueryPlanSource::GenerationSites(_) => ValidatedDomain {
             kind: QueryValueKind::GenerationSite,
             captures: None,
             projected_fields: None,
+            row_kinds: vec![QueryValueKind::GenerationSite],
         },
         CodeQueryPlanSource::Exports(_) => ValidatedDomain {
             kind: QueryValueKind::Export,
             captures: None,
             projected_fields: None,
+            row_kinds: vec![QueryValueKind::Export],
         },
+        CodeQueryPlanSource::DependencyEvidence(seed) => {
+            super::decode::validate_dependency_evidence_filter(
+                &seed.filter,
+                &child_path(path, "dependency_evidence"),
+            )?;
+            ValidatedDomain {
+                kind: QueryValueKind::DependencyEvidence,
+                captures: None,
+                projected_fields: None,
+                row_kinds: vec![QueryValueKind::DependencyEvidence],
+            }
+        }
         CodeQueryPlanSource::ConfigurationFacts(_) => ValidatedDomain {
             kind: QueryValueKind::ConfigurationFact,
             captures: None,
             projected_fields: None,
+            row_kinds: vec![QueryValueKind::ConfigurationFact],
         },
+        CodeQueryPlanSource::Correlate(correlation) => {
+            let op_path = child_path(path, "correlate");
+            let (code, _) = validate_cross_domain_inputs(
+                correlation.relation.operator(),
+                &correlation.code,
+                &correlation.configuration,
+                &op_path,
+                depth,
+                nodes,
+            )?;
+            match &correlation.relation {
+                CrossDomainRelation::ConfigurationKey(relation) => {
+                    if code.kind != QueryValueKind::ExpressionSite {
+                        return Err(QueryError::new(
+                            child_path(&op_path, "code"),
+                            format!(
+                                "the configuration_key relation correlates expression_site rows (a call input bound to a resolved callee), but the code input produces {}",
+                                code.kind.label()
+                            ),
+                        ));
+                    }
+                    validate_configuration_key_documents(
+                        &relation.documents,
+                        correlation.relation.operator(),
+                        &child_path(&op_path, "relation.configuration_key.documents"),
+                    )?;
+                }
+                CrossDomainRelation::ConfigurationCode(relation) => {
+                    if !matches!(relation.match_kind, ConfigurationCodeMatch::SameProject)
+                        && code.kind != QueryValueKind::Declaration
+                    {
+                        return Err(QueryError::new(
+                            child_path(&op_path, "code"),
+                            format!(
+                                "the configuration_code {} relation correlates declaration rows, but the code input produces {}",
+                                relation.match_kind.label(),
+                                code.kind.label()
+                            ),
+                        ));
+                    }
+                }
+                CrossDomainRelation::DependencyConfiguration(relation) => {
+                    validate_dependency_configuration_relation(
+                        relation,
+                        &child_query_path(&op_path, "relation.dependency_configuration"),
+                    )?;
+                }
+            }
+            ValidatedDomain {
+                kind: QueryValueKind::CrossDomain,
+                captures: None,
+                projected_fields: None,
+                row_kinds: vec![QueryValueKind::CrossDomain],
+            }
+        }
+        CodeQueryPlanSource::RequireBoth(requirement) => {
+            validate_cross_domain_inputs(
+                super::domain::CrossDomainOperatorKind::RequireBoth,
+                &requirement.code,
+                &requirement.configuration,
+                &child_path(path, "require_both"),
+                depth,
+                nodes,
+            )?;
+            ValidatedDomain {
+                kind: QueryValueKind::CrossDomain,
+                captures: None,
+                projected_fields: None,
+                row_kinds: vec![QueryValueKind::CrossDomain],
+            }
+        }
         CodeQueryPlanSource::Set { op, branches } => {
-            let op_path = child_query_path(path, op.label());
+            let op_path = child_path(path, op.label());
             if branches.len() < 2 {
                 return Err(QueryError::new(
                     &op_path,
@@ -3132,17 +4599,33 @@ fn validate_plan(
                 branch_domains.push(validate_plan(branch, &branch_path, depth + 1, nodes)?);
             }
             let expected = branch_domains[0].kind;
+            let mut row_kinds = Vec::new();
+            for branch in &branch_domains {
+                for kind in &branch.row_kinds {
+                    if !row_kinds.contains(kind) {
+                        row_kinds.push(*kind);
+                    }
+                }
+            }
             for (index, branch) in branch_domains.iter().enumerate().skip(1) {
-                if branch.kind != expected {
+                validate_set_branch_domain(*op, expected, branch.kind)
+                    .map_err(|message| QueryError::new(format!("{op_path}[{index}]"), message))?;
+                // Intersection and difference compare row identities across
+                // branches, and rows of different kinds never share one, so
+                // only a union may combine different row kinds (#5352).
+                if branch.row_kinds != branch_domains[0].row_kinds && *op != SetOperator::Union {
                     return Err(QueryError::new(
                         format!("{op_path}[{index}]"),
                         format!(
-                            "{} branch produces {}, but the first branch produces {}",
+                            "{} branch produces {}, but the first branch produces {}; only union combines different row kinds",
                             op.label(),
-                            branch.kind.label(),
-                            expected.label()
+                            row_kind_labels(&branch.row_kinds),
+                            row_kind_labels(&branch_domains[0].row_kinds)
                         ),
                     ));
+                }
+                if row_kinds.len() > 1 {
+                    continue;
                 }
                 let expected_fields =
                     input_row_fields(branch_domains[0].projected_fields.as_deref(), expected);
@@ -3160,31 +4643,38 @@ fn validate_plan(
                     ));
                 }
             }
-            let captures = if expected == QueryValueKind::StructuralMatch {
-                let mut common = branch_domains[0].captures.clone().unwrap_or_default();
-                if *op != SetOperator::Except {
-                    for branch in &branch_domains[1..] {
-                        common.retain(|capture| {
-                            branch
-                                .captures
-                                .as_ref()
-                                .is_some_and(|captures| captures.contains(capture))
-                        });
+            if row_kinds.len() > 1 {
+                // The rows keep their own kinds through execution; a consumer
+                // reads them by their shared fields, their source location and
+                // their finding terminal. Any step that needs one row kind is
+                // refused here, before the typed step contract reports the
+                // first branch's kind as if it were the only one.
+                let steps_path = child_path(path, "steps");
+                for (index, step) in plan.steps.iter().enumerate() {
+                    if !matches!(step, QueryStep::Filter(_) | QueryStep::Project(_)) {
+                        return Err(QueryError::new(
+                            format!("{steps_path}[{index}]"),
+                            format!(
+                                "step {} requires rows of one kind, but the union produces {}; only filter and project may follow a union of different row kinds",
+                                step.label(),
+                                row_kind_labels(&row_kinds)
+                            ),
+                        ));
                     }
                 }
-                Some(common)
+                ValidatedDomain {
+                    kind: expected,
+                    captures: None,
+                    projected_fields: Some(shared_row_fields(&branch_domains)),
+                    row_kinds,
+                }
             } else {
-                None
-            };
-            ValidatedDomain {
-                kind: expected,
-                captures,
-                projected_fields: branch_domains[0].projected_fields.clone(),
+                validate_same_kind_set(*op, expected, &branch_domains)
             }
         }
     };
 
-    let steps_path = child_query_path(path, "steps");
+    let steps_path = child_path(path, "steps");
     let (output, projected_fields) = validate_query_steps(
         &plan.steps,
         domain.kind,
@@ -3193,18 +4683,14 @@ fn validate_plan(
     )?;
     let mut input = domain.kind;
     for (index, step) in plan.steps.iter().enumerate() {
-        let filter = match step {
+        let capture = match step {
+            QueryStep::CaptureAnchor(capture) => Some(capture.as_str()),
             QueryStep::ReceiverTargets(filter)
             | QueryStep::PointsTo(filter)
-            | QueryStep::MemberTargets(filter) => filter,
-            _ => {
-                input = step
-                    .output_kind(input)
-                    .expect("typed steps were validated above");
-                continue;
-            }
+            | QueryStep::MemberTargets(filter) => filter.capture.as_deref(),
+            _ => None,
         };
-        if let Some(capture) = &filter.capture {
+        if let Some(capture) = capture {
             let capture_path = format!("{steps_path}[{index}].capture");
             if input != QueryValueKind::StructuralMatch {
                 return Err(QueryError::new(
@@ -3243,10 +4729,477 @@ fn validate_plan(
     }
     domain.kind = output;
     domain.projected_fields = projected_fields;
+    if domain.row_kinds.len() <= 1 {
+        domain.row_kinds = vec![output];
+    }
     if output != QueryValueKind::StructuralMatch {
         domain.captures = None;
     }
     Ok(domain)
+}
+
+/// A set operation whose branches all produce one row kind: the branches must
+/// also publish one row schema, and a structural capture survives only when
+/// every contributing branch binds it.
+fn validate_same_kind_set(
+    op: SetOperator,
+    expected: QueryValueKind,
+    branch_domains: &[ValidatedDomain],
+) -> ValidatedDomain {
+    let captures = if expected == QueryValueKind::StructuralMatch {
+        let mut common = branch_domains[0].captures.clone().unwrap_or_default();
+        if op != SetOperator::Except {
+            for branch in &branch_domains[1..] {
+                common.retain(|capture| {
+                    branch
+                        .captures
+                        .as_ref()
+                        .is_some_and(|captures| captures.contains(capture))
+                });
+            }
+        }
+        Some(common)
+    } else {
+        None
+    };
+    ValidatedDomain {
+        kind: expected,
+        captures,
+        projected_fields: branch_domains[0].projected_fields.clone(),
+        row_kinds: vec![expected],
+    }
+}
+
+/// The fields every branch of a union of different row kinds publishes under
+/// one name with one scalar type and value domain, in first-branch order. A
+/// field that any branch may leave null is nullable in the union.
+fn shared_row_fields(branches: &[ValidatedDomain]) -> Vec<(String, CodeQueryRowField)> {
+    let mut shared = input_row_fields(branches[0].projected_fields.as_deref(), branches[0].kind);
+    for branch in &branches[1..] {
+        let fields = input_row_fields(branch.projected_fields.as_deref(), branch.kind);
+        shared.retain_mut(|(name, field)| {
+            fields
+                .iter()
+                .find(|(other_name, other)| {
+                    other_name == name
+                        && other.scalar_type == field.scalar_type
+                        && other.value_domain == field.value_domain
+                })
+                .map(|(_, other)| field.nullable |= other.nullable)
+                .is_some()
+        });
+    }
+    shared
+}
+
+fn row_kind_labels(kinds: &[QueryValueKind]) -> String {
+    kinds
+        .iter()
+        .map(|kind| kind.label())
+        .collect::<Vec<_>>()
+        .join(" and ")
+}
+
+/// The representative row domain of a set branch for the #3274 composition
+/// rules. Only the domain kind matters here: language and format selections
+/// are checked where an operator consumes them. A kind outside the code and
+/// configuration domains (dependency evidence) has no contract domain; the
+/// ordinary same-kind rule alone governs its set operations.
+fn set_branch_row_domain(kind: QueryValueKind) -> Option<super::domain::RowDomain> {
+    use super::domain::{CrossDomainOperatorKind, DomainKind, RowDomain};
+    match kind.domain_kind() {
+        Some(DomainKind::Code) => Some(
+            RowDomain::code(Language::ANALYZABLE)
+                .expect("every analyzable language forms a code row domain"),
+        ),
+        Some(DomainKind::Configuration) => Some(
+            RowDomain::configuration(ConfigurationFormat::ALL)
+                .expect("every configuration format forms a configuration row domain"),
+        ),
+        None if kind == QueryValueKind::CrossDomain => Some(
+            CrossDomainOperatorKind::RequireBoth
+                .descriptor()
+                .output()
+                .clone(),
+        ),
+        None => None,
+    }
+}
+
+/// Ordinary set composition stays single-domain. Code and configuration
+/// branches, or heterogeneous cross-domain rows, are refused through the
+/// contract's own composition functions so the refusal names its typed cause.
+fn validate_set_branch_domain(
+    op: SetOperator,
+    first: QueryValueKind,
+    branch: QueryValueKind,
+) -> Result<(), String> {
+    let (Some(left), Some(right)) = (set_branch_row_domain(first), set_branch_row_domain(branch))
+    else {
+        return Ok(());
+    };
+    let composed = match op {
+        SetOperator::Union => left.union(&right, None, false).map(drop),
+        SetOperator::Intersect | SetOperator::Except => left.intersect(&right).map(drop),
+    };
+    composed.map_err(|error| {
+        format!(
+            "{} cannot compose {} with {}: {error}; code and configuration rows combine only through a registered cross-domain operator (correlate or require-both)",
+            op.label(),
+            first.label(),
+            branch.label()
+        )
+    })
+}
+
+/// The programming languages a code plan can select. An unconstrained seed
+/// selects every analyzable language.
+fn plan_code_languages(plan: &CodeQueryPlan) -> Vec<Language> {
+    let mut languages = Vec::new();
+    let mut pending = vec![plan];
+    while let Some(plan) = pending.pop() {
+        let selected = match &plan.source {
+            CodeQueryPlanSource::Seed(seed) => &seed.languages,
+            CodeQueryPlanSource::Occurrences(seed) => &seed.languages,
+            CodeQueryPlanSource::Scopes(seed) => &seed.languages,
+            CodeQueryPlanSource::Bindings(seed) => &seed.languages,
+            CodeQueryPlanSource::Paths(seed) => &seed.languages,
+            CodeQueryPlanSource::GenerationSites(seed) => &seed.languages,
+            CodeQueryPlanSource::Exports(seed) => &seed.languages,
+            CodeQueryPlanSource::DependencyEvidence(_)
+            | CodeQueryPlanSource::ConfigurationFacts(_)
+            | CodeQueryPlanSource::Set { .. }
+            | CodeQueryPlanSource::Correlate(_)
+            | CodeQueryPlanSource::RequireBoth(_) => {
+                pending.extend(plan.source.child_plans());
+                continue;
+            }
+        };
+        if selected.is_empty() {
+            return Language::ANALYZABLE.to_vec();
+        }
+        languages.extend(selected.iter().copied());
+    }
+    languages
+}
+
+/// The configuration formats a configuration plan can select. A seed with no
+/// format filter selects every registered format.
+fn plan_configuration_formats(plan: &CodeQueryPlan) -> Vec<ConfigurationFormat> {
+    let mut formats = Vec::new();
+    let mut pending = vec![plan];
+    while let Some(plan) = pending.pop() {
+        match &plan.source {
+            CodeQueryPlanSource::ConfigurationFacts(seed) => {
+                if seed.filter.formats.is_empty() {
+                    return ConfigurationFormat::ALL.to_vec();
+                }
+                formats.extend(seed.filter.formats.iter().copied());
+            }
+            source => pending.extend(source.child_plans()),
+        }
+    }
+    formats
+}
+
+/// Validate the two inputs of a registered cross-domain operator and compose
+/// them through the operator's typed descriptor.
+fn validate_cross_domain_inputs(
+    operator: super::domain::CrossDomainOperatorKind,
+    code: &CodeQueryPlan,
+    configuration: &CodeQueryPlan,
+    op_path: &str,
+    depth: usize,
+    nodes: &mut usize,
+) -> Result<(ValidatedDomain, ValidatedDomain), QueryError> {
+    use super::domain::{
+        CapabilityRequirementSet, DomainKind, PackRequirementSet, QueryDomain, QueryRequirement,
+        RowDomain,
+    };
+    let code_path = child_path(op_path, "code");
+    let configuration_path = child_path(op_path, "configuration");
+    let code_domain = validate_plan(code, &code_path, depth + 1, nodes)?;
+    let configuration_domain = validate_plan(configuration, &configuration_path, depth + 1, nodes)?;
+    let dependency_relation =
+        operator == super::domain::CrossDomainOperatorKind::CorrelateDependencyConfiguration;
+    if dependency_relation && code_domain.kind != QueryValueKind::DependencyEvidence {
+        return Err(QueryError::new(
+            &code_path,
+            format!(
+                "the dependency_configuration relation requires dependency_evidence rows, but the code input produces {}",
+                code_domain.kind.label()
+            ),
+        ));
+    }
+    if !dependency_relation && code_domain.kind.domain_kind() != Some(DomainKind::Code) {
+        return Err(QueryError::new(
+            code_path,
+            format!(
+                "the code input of {} must produce programming-code rows, but it produces {}",
+                operator.operator_label(),
+                code_domain.kind.label()
+            ),
+        ));
+    }
+    if configuration_domain.kind != QueryValueKind::ConfigurationFact {
+        return Err(QueryError::new(
+            configuration_path,
+            format!(
+                "the configuration input of {} must produce configuration_fact rows, but it produces {}",
+                operator.operator_label(),
+                configuration_domain.kind.label()
+            ),
+        ));
+    }
+    for (input_path, domain) in [
+        (&code_path, &code_domain),
+        (&configuration_path, &configuration_domain),
+    ] {
+        if domain.projected_fields.is_some() {
+            return Err(QueryError::new(
+                input_path.as_str(),
+                "a cross-domain input must keep its registered row domain; apply project after the operator",
+            ));
+        }
+    }
+
+    let descriptor = operator.descriptor();
+    let accepted_code = QueryDomain::code(operator.code_languages().iter().copied())
+        .expect("registered operators accept at least one language");
+    let selected_code_languages = if dependency_relation {
+        Language::ANALYZABLE.to_vec()
+    } else {
+        plan_code_languages(code)
+    };
+    let code_input = QueryDomain::code(selected_code_languages)
+        .expect("a validated code plan selects at least one analyzable language")
+        .intersect(&accepted_code)
+        .map_err(|error| {
+            QueryError::new(
+                &code_path,
+                format!(
+                    "{error}: {} accepts {:?} code, but the code input selects {:?}",
+                    operator.operator_label(),
+                    operator.code_languages(),
+                    plan_code_languages(code)
+                ),
+            )
+        })?;
+    let accepted_configuration =
+        QueryDomain::configuration(operator.configuration_formats().iter().copied())
+            .expect("registered operators accept at least one format");
+    let configuration_input = QueryDomain::configuration(plan_configuration_formats(configuration))
+        .expect("a validated configuration plan selects at least one format")
+        .intersect(&accepted_configuration)
+        .map_err(|error| {
+            QueryError::new(
+                &configuration_path,
+                format!(
+                    "{error}: {} accepts {:?} configuration, but the configuration input selects {:?}",
+                    operator.operator_label(),
+                    operator.configuration_formats(),
+                    plan_configuration_formats(configuration)
+                ),
+            )
+        })?;
+    let requirement = |input: QueryDomain| {
+        let row = match &input {
+            QueryDomain::Code { languages } => RowDomain::code(languages.iter().copied()),
+            QueryDomain::Configuration { formats } => {
+                RowDomain::configuration(formats.iter().copied())
+            }
+        }
+        .expect("an intersected selection is non-empty");
+        QueryRequirement::new(
+            input,
+            row,
+            CapabilityRequirementSet::default(),
+            PackRequirementSet::default(),
+        )
+    };
+    let composed = requirement(code_input)
+        .through_cross_domain_operator(&requirement(configuration_input), &descriptor)
+        .expect("inputs inside the operator's declared domains compose through it");
+    debug_assert_eq!(
+        composed
+            .input()
+            .operator()
+            .map(super::domain::OperatorId::as_str),
+        Some(operator.id_label())
+    );
+    Ok((code_domain, configuration_domain))
+}
+
+/// Declared documents are exact relative paths of a format the operator
+/// accepts. The checks use path components rather than text scanning, except
+/// for the separator and glob characters a canonical declaration must not
+/// contain.
+fn validate_configuration_key_documents(
+    documents: &[String],
+    operator: super::domain::CrossDomainOperatorKind,
+    path: &str,
+) -> Result<(), QueryError> {
+    use brokk_bifrost_core::analyzer::configuration::{
+        ConfigurationPathClassification, classify_configuration_path,
+    };
+    if documents.is_empty() || documents.len() > MAX_CORRELATION_DOCUMENTS {
+        return Err(QueryError::new(
+            path,
+            format!("the relation declares from 1 through {MAX_CORRELATION_DOCUMENTS} documents"),
+        ));
+    }
+    for (index, document) in documents.iter().enumerate() {
+        let document_path = format!("{path}[{index}]");
+        let relative = std::path::Path::new(document);
+        let exact = !document.is_empty()
+            && document.len() <= MAX_GLOB_LENGTH
+            && !document.contains(['\\', ':', '\0', '*', '?', '[', ']', '{', '}'])
+            && document
+                .split('/')
+                .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
+            && relative
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_)));
+        if !exact {
+            return Err(QueryError::new(
+                document_path,
+                format!(
+                    "declared document {document:?} must be an exact `/`-separated workspace-relative path without globs, `.` or `..` segments"
+                ),
+            ));
+        }
+        let format = match classify_configuration_path(relative) {
+            ConfigurationPathClassification::Supported(format) => Some(format.into()),
+            ConfigurationPathClassification::Unsupported => None,
+        };
+        if !format.is_some_and(|format| operator.configuration_formats().contains(&format)) {
+            return Err(QueryError::new(
+                document_path,
+                format!(
+                    "declared document {document:?} is not a {:?} document",
+                    operator.configuration_formats()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn validate_dependency_configuration_relation(
+    relation: &DependencyConfigurationRelation,
+    path: &str,
+) -> Result<(), QueryError> {
+    if relation.owner.trim().is_empty()
+        || relation.owner.len() > MAX_DEPENDENCY_CONFIGURATION_OWNER_LENGTH
+    {
+        return Err(QueryError::new(
+            child_query_path(path, "owner"),
+            "owner must be a nonempty exact topology identity of at most 1024 bytes",
+        ));
+    }
+    if !["npm", "cargo"].contains(&relation.ecosystem.as_str()) {
+        return Err(QueryError::new(
+            child_query_path(path, "ecosystem"),
+            "dependency_configuration supports exactly npm or cargo",
+        ));
+    }
+    if relation.version_ranges.is_empty() || relation.version_ranges.len() > 32 {
+        return Err(QueryError::new(
+            child_query_path(path, "version_ranges"),
+            "version_ranges requires from 1 through 32 supported ranges",
+        ));
+    }
+    super::decode::validate_dependency_evidence_filter(
+        &DependencyEvidenceFilter {
+            ecosystems: vec![relation.ecosystem.clone()],
+            version_ranges: relation.version_ranges.clone(),
+            ..Default::default()
+        },
+        path,
+    )?;
+    validate_configuration_key_documents(
+        &relation.documents,
+        super::domain::CrossDomainOperatorKind::CorrelateDependencyConfiguration,
+        &child_query_path(path, "documents"),
+    )?;
+    let mut declared_documents = std::collections::HashSet::new();
+    for (index, document) in relation.documents.iter().enumerate() {
+        if !declared_documents.insert(document) {
+            return Err(QueryError::new(
+                format!("{path}.documents[{index}]"),
+                "dependency_configuration documents must be unique",
+            ));
+        }
+    }
+    if relation.values.is_empty() || relation.values.len() > MAX_DEPENDENCY_CONFIGURATION_VALUES {
+        return Err(QueryError::new(
+            child_query_path(path, "values"),
+            "values requires from 1 through 32 exact property value strings",
+        ));
+    }
+    for (index, value) in relation.values.iter().enumerate() {
+        if value.len() > MAX_DEPENDENCY_CONFIGURATION_VALUE_LENGTH {
+            return Err(QueryError::new(
+                format!("{}.values[{index}]", path),
+                "property value must be at most 16384 bytes",
+            ));
+        }
+    }
+    if relation.overrides.len() > MAX_DEPENDENCY_CONFIGURATION_OVERRIDES {
+        return Err(QueryError::new(
+            child_query_path(path, "overrides"),
+            "overrides accepts at most 128 precedence edges",
+        ));
+    }
+    let mut edges = std::collections::HashSet::new();
+    let mut indegree = vec![0usize; relation.documents.len()];
+    let mut outgoing = vec![Vec::new(); relation.documents.len()];
+    for (index, edge) in relation.overrides.iter().enumerate() {
+        let edge_path = format!("{}.overrides[{index}]", path);
+        let mut endpoints = [0usize; 2];
+        for (endpoint, document) in edge.iter().enumerate() {
+            endpoints[endpoint] = relation
+                .documents
+                .iter()
+                .position(|declared| declared == document)
+                .ok_or_else(|| {
+                    QueryError::new(
+                        format!("{edge_path}[{endpoint}]"),
+                        "override endpoints must be declared documents",
+                    )
+                })?;
+        }
+        if endpoints[0] == endpoints[1] || !edges.insert(edge) {
+            return Err(QueryError::new(
+                edge_path,
+                "override edges must be unique and nonself",
+            ));
+        }
+        outgoing[endpoints[0]].push(endpoints[1]);
+        indegree[endpoints[1]] += 1;
+    }
+    let mut pending = indegree
+        .iter()
+        .enumerate()
+        .filter_map(|(index, degree)| (*degree == 0).then_some(index))
+        .collect::<Vec<_>>();
+    let mut visited = 0;
+    while let Some(document) = pending.pop() {
+        visited += 1;
+        for &higher in &outgoing[document] {
+            indegree[higher] -= 1;
+            if indegree[higher] == 0 {
+                pending.push(higher);
+            }
+        }
+    }
+    if visited != relation.documents.len() {
+        return Err(QueryError::new(
+            child_query_path(path, "overrides"),
+            "override precedence must be acyclic",
+        ));
+    }
+    Ok(())
 }
 
 fn row_schemas_compatible(
@@ -3297,6 +5250,8 @@ impl CodeQuerySeed {
             if let Some(has) = pattern.has.as_deref() {
                 stack.push(has);
             }
+            stack.extend(pattern.all.iter());
+            stack.extend(pattern.any.iter());
             for role in Role::single_target_roles() {
                 if let Some(child) = pattern.single_role_pattern(*role) {
                     stack.push(child);
@@ -3458,9 +5413,52 @@ pub struct Pattern {
     pub not_kinds: Vec<NormalizedKind>,
     pub name: Option<StringPredicate>,
     pub text: Option<StringPredicate>,
+    /// Match a comment by applying a regular expression to the maximal
+    /// consecutive comment block that contains it.
+    pub comment_block_text: Option<StringPredicate>,
     /// Exact language-neutral value of a normalized boolean literal. This is
     /// semantic fact data, not a symbol name or a source-text predicate.
     pub boolean_value: Option<bool>,
+    /// AST-backed async modifier of a callable fact. `None` means unconstrained.
+    pub is_async: Option<bool>,
+    /// A declaration modifier read from the declaration's structured modifier
+    /// nodes. This is a generic source relation, not a language/framework rule.
+    pub modifier: Option<DeclarationModifier>,
+    /// Decoded value of a normalized string literal. This is semantic fact
+    /// data, not a predicate over the source spelling.
+    pub string_value: Option<StringPredicate>,
+    /// Language-owned relation selected by the root structural seed. The
+    /// shared seed runner dispatches the selected id to its language hook.
+    pub language_rule: Option<LanguageRule>,
+    /// Structured state of a directly-owned branch or loop block. These
+    /// source-backed constraints are evaluated by the structural seed
+    /// relation, not by the persisted normalized node row.
+    pub body_state: Option<BodyState>,
+    pub body_owner: Option<BodyOwner>,
+    /// Whether a Python string literal expression is parenthesized.
+    pub parenthesized: Option<bool>,
+    /// Exact canonical decimal value of a supported nonnegative integer
+    /// literal, represented as text to preserve Python's unbounded integers.
+    pub integer_value: Option<String>,
+    /// Whether a Python dictionary entry repeats an earlier decoded literal
+    /// key; absent when its key form is unsupported.
+    pub duplicate_key: Option<bool>,
+    pub integer_has_any_bits: Option<u32>,
+    pub integer_has_all_bits: Option<u32>,
+    pub integer_has_no_bits: Option<u32>,
+    /// Exact shape of a direct tuple/list assignment when its adapter
+    /// publishes the paired target and value sequences.
+    pub assignment_target_kind: Option<AssignmentSequenceKind>,
+    pub assignment_value_kind: Option<AssignmentSequenceKind>,
+    pub assignment_target_unstarred_count: Option<u32>,
+    pub assignment_value_unstarred_count: Option<u32>,
+    pub assignment_target_starred: Option<bool>,
+    pub assignment_value_starred: Option<bool>,
+    /// Whether the sides' unstarred element counts differ.
+    pub assignment_unstarred_count_mismatch: Option<bool>,
+    /// Exact zero-based slot in the ordered parent role list. Valid only on a
+    /// child pattern nested in an ordered list role such as `elements`.
+    pub index: Option<u32>,
     /// Constraint on the matched fact's positional-child count. `None`
     /// leaves arity unconstrained. Meaningful on `call` facts (`args` role
     /// edges) and `collection_literal` facts (`elements` role edges, #2647);
@@ -3477,8 +5475,19 @@ pub struct Pattern {
     pub parameter_type: Option<StringPredicate>,
     pub capture: Option<String>,
     pub has: Option<Box<Pattern>>,
+    /// Match the exact RHS of a unique direct function-local assignment
+    /// guaranteed before this read by unconditional or earlier same-suite
+    /// execution. Captures in the nested value pattern
+    /// are scoped to that value and do not escape to the enclosing match.
+    pub local_value: Option<Box<Pattern>>,
     /// Verifier-only: never used for candidate pruning.
     pub not_has: Option<Box<Pattern>>,
+    /// Generic same-node boolean composition. Negative and alternative
+    /// branches are verifier constraints and are never used for candidate
+    /// pruning.
+    pub not: Option<Box<Pattern>>,
+    pub all: Vec<Pattern>,
+    pub any: Vec<Pattern>,
     // Role sub-patterns. Only valid when `kind` is declared and the role is
     // valid for at least one of its kinds (see `Role::valid_for`).
     pub callee: Option<Box<Pattern>>,
@@ -3509,10 +5518,45 @@ pub struct Pattern {
     pub attributes: Vec<Pattern>,
     /// Source children of a JSX element in source order.
     pub children: Vec<Pattern>,
+    /// Literal parts of one implicitly concatenated string, in source order.
+    pub parts: Vec<Pattern>,
     /// The exact value expression of an attribute or object property.
     pub value: Option<Box<Pattern>>,
     /// The static key of an object property.
     pub key: Option<Box<Pattern>>,
+    /// The expression tested by an assertion statement.
+    pub test: Option<Box<Pattern>>,
+    /// Each listed pattern constrains a written generic type argument on a
+    /// call callee, in source order.
+    pub type_arguments: Vec<Pattern>,
+}
+
+/// A declaration modifier that can be selected without naming a framework or
+/// library. The source adapter remains responsible for reading its grammar's
+/// modifier nodes; unsupported or unread declarations do not match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DeclarationModifier {
+    Static,
+    Abstract,
+}
+
+impl DeclarationModifier {
+    pub const ALL: [Self; 2] = [Self::Static, Self::Abstract];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Static => "static",
+            Self::Abstract => "abstract",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "static" => Some(Self::Static),
+            "abstract" => Some(Self::Abstract),
+            _ => None,
+        }
+    }
 }
 
 impl Pattern {
@@ -3520,14 +5564,39 @@ impl Pattern {
         self.kinds.is_empty()
             && self.not_kinds.is_empty()
             && self.name.is_none()
+            && self.is_async.is_none()
+            && self.modifier.is_none()
+            && self.string_value.is_none()
+            && self.language_rule.is_none()
+            && self.body_state.is_none()
+            && self.body_owner.is_none()
             && self.text.is_none()
+            && self.comment_block_text.is_none()
             && self.boolean_value.is_none()
+            && self.parenthesized.is_none()
+            && self.integer_value.is_none()
+            && self.duplicate_key.is_none()
+            && self.integer_has_any_bits.is_none()
+            && self.integer_has_all_bits.is_none()
+            && self.integer_has_no_bits.is_none()
+            && self.assignment_target_kind.is_none()
+            && self.assignment_value_kind.is_none()
+            && self.assignment_target_unstarred_count.is_none()
+            && self.assignment_value_unstarred_count.is_none()
+            && self.assignment_target_starred.is_none()
+            && self.assignment_value_starred.is_none()
+            && self.assignment_unstarred_count_mismatch.is_none()
+            && self.index.is_none()
             && self.arity.is_none()
             && self.visibility.is_empty()
             && self.parameter_type.is_none()
             && self.capture.is_none()
             && self.has.is_none()
+            && self.local_value.is_none()
             && self.not_has.is_none()
+            && self.not.is_none()
+            && self.all.is_empty()
+            && self.any.is_empty()
             && !self.constrains_roles()
     }
 
@@ -3555,12 +5624,15 @@ impl Pattern {
             Role::Tag => self.tag.as_deref(),
             Role::Value => self.value.as_deref(),
             Role::Key => self.key.as_deref(),
+            Role::Test => self.test.as_deref(),
             Role::Arg
             | Role::Kwarg
             | Role::Decorator
             | Role::Element
             | Role::Attributes
-            | Role::Children => None,
+            | Role::Children
+            | Role::Part
+            | Role::TypeArguments => None,
         }
     }
 
@@ -3571,6 +5643,8 @@ impl Pattern {
             Role::Element => &self.elements,
             Role::Attributes => &self.attributes,
             Role::Children => &self.children,
+            Role::TypeArguments => &self.type_arguments,
+            Role::Part => &self.parts,
             Role::Callee
             | Role::Receiver
             | Role::Kwarg
@@ -3583,7 +5657,8 @@ impl Pattern {
             | Role::Iterable
             | Role::Tag
             | Role::Value
-            | Role::Key => &[],
+            | Role::Key
+            | Role::Test => &[],
         }
     }
 
@@ -3605,6 +5680,16 @@ impl Pattern {
                 .not_has
                 .as_deref()
                 .is_some_and(Self::constrains_callable_signature)
+            || self
+                .local_value
+                .as_deref()
+                .is_some_and(Self::constrains_callable_signature)
+            || self
+                .not
+                .as_deref()
+                .is_some_and(Self::constrains_callable_signature)
+            || self.all.iter().any(Self::constrains_callable_signature)
+            || self.any.iter().any(Self::constrains_callable_signature)
         {
             return true;
         }
@@ -3644,6 +5729,16 @@ impl Pattern {
                 .not_has
                 .as_deref()
                 .is_some_and(Self::constrains_boolean_value)
+            || self
+                .local_value
+                .as_deref()
+                .is_some_and(Self::constrains_boolean_value)
+            || self
+                .not
+                .as_deref()
+                .is_some_and(Self::constrains_boolean_value)
+            || self.all.iter().any(Self::constrains_boolean_value)
+            || self.any.iter().any(Self::constrains_boolean_value)
         {
             return true;
         }
@@ -3667,6 +5762,80 @@ impl Pattern {
         self.kwargs
             .iter()
             .any(|(_, pattern)| pattern.constrains_boolean_value())
+    }
+
+    fn any_nested_pattern(&self, mut predicate: impl FnMut(&Pattern) -> bool) -> bool {
+        if self.has.as_deref().is_some_and(&mut predicate)
+            || self.not_has.as_deref().is_some_and(&mut predicate)
+            || self.local_value.as_deref().is_some_and(&mut predicate)
+            || self.not.as_deref().is_some_and(&mut predicate)
+            || self.all.iter().any(&mut predicate)
+            || self.any.iter().any(&mut predicate)
+        {
+            return true;
+        }
+        for &role in Role::single_target_roles() {
+            if self.single_role_pattern(role).is_some_and(&mut predicate) {
+                return true;
+            }
+        }
+        for &role in Role::list_target_roles() {
+            if self.list_role_patterns(role).iter().any(&mut predicate) {
+                return true;
+            }
+        }
+        self.kwargs.iter().any(|(_, pattern)| predicate(pattern))
+    }
+
+    /// Whether this pattern or a nested pattern constrains callable asyncness.
+    pub fn constrains_async_callable(&self) -> bool {
+        self.is_async.is_some() || self.any_nested_pattern(Self::constrains_async_callable)
+    }
+
+    /// Whether this pattern or a nested pattern constrains a decoded string value.
+    pub fn constrains_string_value(&self) -> bool {
+        self.string_value.is_some() || self.any_nested_pattern(Self::constrains_string_value)
+    }
+
+    /// Whether this pattern or a nested pattern reads its comment block.
+    pub fn constrains_comment_block_text(&self) -> bool {
+        self.comment_block_text.is_some()
+            || self.any_nested_pattern(Self::constrains_comment_block_text)
+    }
+
+    /// Whether this pattern or any nested pattern selects direct assignment
+    /// shape facts.
+    pub fn constrains_assignment_shape(&self) -> bool {
+        self.assignment_target_kind.is_some()
+            || self.assignment_value_kind.is_some()
+            || self.assignment_target_unstarred_count.is_some()
+            || self.assignment_value_unstarred_count.is_some()
+            || self.assignment_target_starred.is_some()
+            || self.assignment_value_starred.is_some()
+            || self.assignment_unstarred_count_mismatch.is_some()
+            || self.any_nested_pattern(Self::constrains_assignment_shape)
+    }
+
+    /// Whether this pattern or any nested pattern selects exact integer values.
+    pub fn constrains_integer_literal_value(&self) -> bool {
+        self.integer_value.is_some()
+            || self.integer_has_any_bits.is_some()
+            || self.integer_has_all_bits.is_some()
+            || self.integer_has_no_bits.is_some()
+            || self.any_nested_pattern(Self::constrains_integer_literal_value)
+    }
+
+    /// Whether this pattern or any nested pattern asks for dictionary-key
+    /// equality facts.
+    pub fn constrains_duplicate_dictionary_key(&self) -> bool {
+        self.duplicate_key.is_some()
+            || self.any_nested_pattern(Self::constrains_duplicate_dictionary_key)
+    }
+
+    /// Whether this pattern or any nested pattern traverses a local assignment
+    /// value.
+    pub fn constrains_local_value(&self) -> bool {
+        self.local_value.is_some() || self.any_nested_pattern(Self::constrains_local_value)
     }
 }
 

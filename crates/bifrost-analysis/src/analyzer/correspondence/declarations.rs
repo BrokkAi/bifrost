@@ -739,6 +739,7 @@ fn index_by(
 mod tests {
     use super::{CorrespondenceLimits, correspond_revisions};
     use crate::gitblob::test_repo;
+    use crate::test_support::cache_row_count;
     use std::fs;
     use std::path::Path;
 
@@ -766,15 +767,6 @@ mod tests {
         .unwrap();
         let head = test_repo::commit_all(&repo, "target");
         (base.to_string(), head.to_string())
-    }
-
-    fn cache_row_count(root: &Path, table: &str) -> i64 {
-        rusqlite::Connection::open(crate::analyzer::store::analyzer_db_path(root))
-            .expect("open the shared analyzer cache")
-            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-                row.get(0)
-            })
-            .expect("count cache rows")
     }
 
     /// Both revision exports read and write the repository's shared cache, so a
@@ -813,12 +805,16 @@ mod tests {
         assert_eq!(0, cache_row_count(root, "workspace_file_versions"));
     }
 
+    use brokk_bifrost_test_macros::hardwon;
     /// A comparison that cannot open the repository's shared cache is a hard
     /// error, not a silently slower ephemeral rebuild of both revisions. This
     /// is the same contract `an_immutable_request_fails_when_the_shared_cache_cannot_be_opened`
     /// pins for `blast_radius`; the equality this test used to assert is
     /// covered by `repeated_correspondence_parses_nothing_the_second_time`.
     #[test]
+    #[hardwon(
+        "2b220df3e1ac: A cache-open failure must reach the caller and a later retry must recover"
+    )]
     fn a_comparison_fails_when_the_shared_cache_cannot_be_opened() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -827,15 +823,11 @@ mod tests {
         // Occupying the cache file's path with a directory is the portable way
         // to make the store refuse to open, which is what a read-only cache
         // location does in production.
-        let db_path = crate::analyzer::store::analyzer_db_path(root);
-        fs::create_dir_all(&db_path).expect("block the cache path");
+        let db_path = crate::test_support::block_shared_analyzer_cache(root);
 
         let error = correspond_revisions(root, &base, &head, CorrespondenceLimits::default())
             .expect_err("a blocked shared cache must fail the comparison, not downgrade it");
-        assert!(
-            error.contains(&db_path.display().to_string()),
-            "the error must name the cache it could not open: {error}"
-        );
+        crate::test_support::assert_shared_analyzer_cache_error(&error, &db_path);
 
         fs::remove_dir(&db_path).expect("unblock the cache path");
         correspond_revisions(root, &base, &head, CorrespondenceLimits::default())

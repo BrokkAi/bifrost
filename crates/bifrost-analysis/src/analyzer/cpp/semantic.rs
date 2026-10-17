@@ -4,16 +4,26 @@
 //! Graph construction, abrupt-completion routing, cleanup specialization, and
 //! physical adjacency storage remain owned by the shared semantic substrate.
 
+use crate::analyzer::declared_scalar::{DeclaredScalarType, binding_nodes};
+use crate::analyzer::semantic::lowering::{
+    ConditionTargets, ProcedureWork, ProcedureWorkHandler, ShortCircuitKind,
+    dispatch_procedure_work, emit_cleanup_completion_route, field_matches,
+    schedule_sequential_work, schedule_short_circuit_condition, unique_map_value,
+};
+use crate::analyzer::tree_walk::call_arguments;
 use brokk_bifrost_core::analyzer::model::{StructuredTypeIdentity, StructuredTypeNodeView};
 use brokk_bifrost_core::analyzer::tree_walk::ParentIndex;
 use brokk_bifrost_cpp::call_match::cpp_literal_arg_type;
+use brokk_bifrost_cpp::declarations::enclosing_cpp_namespace_nodes;
 use brokk_bifrost_cpp::declarations::{
     cpp_callable_declaration_return_type_identity, cpp_declaration_type_identity,
-    cpp_structured_type_path,
+    cpp_structured_type_path, normalize_cpp_whitespace,
 };
 use brokk_bifrost_cpp::raii::CppTemporaryFreeCallIndex;
+use brokk_bifrost_cpp::structural::{constructor_scope_matches_name, declarator_name_node};
 use tree_sitter::Node;
 
+use crate::analyzer::cpp::expression_branch_facts::{has_atomic_qualifier, has_object_qualifier};
 use crate::analyzer::cpp::external::{
     CppExternalTypeModelResolution, external_namespace_model_resolution,
     external_structured_type_model_resolution,
@@ -35,23 +45,127 @@ use crate::analyzer::usages::callable_signature::{
     agreed_callable_identity, callable_signature_reports,
 };
 use crate::analyzer::usages::get_definition::{
-    BoundedResolution, DefinitionLookupStatus, resolve_cpp_bounded,
+    BoundedResolution, CppBoundedLocalBindingIndex, DefinitionLookupRequest,
+    DefinitionLookupStatus, cpp_bounded_local_binding_index, resolve_call_target_batch_with_source,
+    resolve_cpp_bounded, resolve_cpp_bounded_with_known_local_names,
 };
 use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
 use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
-use crate::analyzer::{CodeUnit, CodeUnitIndex, CppAnalyzer, IAnalyzer, Language, ProjectFile};
+use crate::analyzer::{
+    AnalyzerQueryScope, CodeUnit, CodeUnitIndex, CppAnalyzer, IAnalyzer, Language, ProjectFile,
+    QueryScope,
+};
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::find_line_index_for_offset;
 use std::sync::Arc;
 
-// Bumped for #3508: the declared type of a call whose target declaration
+// Bumped for #3508, B2/B3, and call-site control hazards: the declared type of a call whose target declaration
 // publishes several occurrence rows -- an in-class prototype beside the
 // definition that completes it -- now reads the body-bearing row from an
 // occurrence query that asks for one row beyond the pair it decides, so a warm
 // value-semantics result computed while that reader refused the declaration
 // must not be reused. That covers results written before the lookahead row
 // stopped a capped store answer from being read as a refusal.
-const ADAPTER_VERSION: &[u8] = b"cpp-cfg-values-v18";
+// Bumping this rotates every public wire id hashed from the adapter
+// fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
+// golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
+// change; the code-query tutorial pages elide such ids (#5016).
+// #5441: C compound assignment cannot invoke C++ operators or conversions.
+const ADAPTER_VERSION: &[u8] = b"cpp-cfg-values-v36";
+
+/// Procedure-local source roles for both C and C++. The two dialects share
+/// tree-sitter syntax for the control constructs covered by B2 and B3; their
+/// semantic lowerings publish the exact entries and loop sites below.
+pub(crate) const PROCEDURE_SYNTAX_ROLES: crate::analyzer::languages::ProcedureSyntaxRoles =
+    crate::analyzer::languages::ProcedureSyntaxRoles {
+        statement_kind: cpp_statement_kind,
+        loop_site: cpp_loop_site,
+        loop_site_with_source: None,
+        procedure_matches: cpp_procedure_matches,
+        nested_procedure: cpp_nested_execution_boundary_for_roles,
+    };
+
+fn cpp_statement_kind(node: Node<'_>) -> Option<&'static str> {
+    // A switch compound statement is a label-dispatch region, not an
+    // executable statement with an entry of its own. The statements before
+    // the first case label remain children of this region and are still
+    // candidates: they have no legal switch entry and are genuinely
+    // unreachable.
+    if node.kind() == "compound_statement"
+        && node.parent().is_some_and(|parent| {
+            parent.kind() == "switch_statement"
+                && parent
+                    .child_by_field_name("body")
+                    .is_some_and(|body| body.id() == node.id())
+        })
+    {
+        return None;
+    }
+    Some(match node.kind() {
+        "compound_statement" => "block",
+        "expression_statement" => "expression",
+        "declaration"
+        | "field_declaration"
+        | "field_initializer"
+        | "field_initializer_list"
+        | "init_statement" => "declaration",
+        "return_statement" | "co_return_statement" => "return",
+        "throw_statement" => "throw",
+        "break_statement" => "break",
+        "continue_statement" => "continue",
+        "goto_statement" | "seh_leave_statement" => "goto",
+        "if_statement" => "if",
+        "while_statement" => "while",
+        "do_statement" => "do",
+        "for_statement" => "for",
+        // C++ range-for is a statement for B2, but is deliberately not a B3
+        // conditional loop site because it is an iteration construct.
+        "for_range_loop" => "enhanced_for",
+        "switch_statement" => "switch",
+        "case_statement" => "case",
+        "try_statement" | "seh_try_statement" => "try",
+        "co_yield_statement" => "yield",
+        "empty_statement" => "empty",
+        "attributed_statement" => "attributed",
+        _ => return None,
+    })
+}
+
+fn cpp_loop_site(node: Node<'_>) -> Option<crate::analyzer::loop_facts::LoopSyntax<'_>> {
+    use crate::analyzer::loop_facts::{LoopKind, LoopSyntax};
+    let kind = match node.kind() {
+        "while_statement" => LoopKind::While,
+        "do_statement" => LoopKind::Do,
+        "for_statement" => LoopKind::For,
+        _ => return None,
+    };
+    Some(LoopSyntax {
+        kind,
+        body: node.child_by_field_name("body"),
+        condition: node.child_by_field_name("condition"),
+    })
+}
+
+fn cpp_procedure_matches(kind: ProcedureKind, node: Node<'_>) -> bool {
+    match kind {
+        ProcedureKind::Lambda => node.kind() == "lambda_expression",
+        _ => node.kind() == "function_definition",
+    }
+}
+
+fn cpp_nested_execution_boundary_for_roles(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "function_definition"
+            | "lambda_expression"
+            | "namespace_definition"
+            | "class_specifier"
+            | "struct_specifier"
+            | "union_specifier"
+            | "enum_specifier"
+            | "template_declaration"
+    )
+}
 
 /// Occurrence rows of one declaration the declared-type reader decides: an
 /// in-class member prototype beside the out-of-line definition that completes
@@ -68,14 +182,10 @@ struct CppSemanticLowerer<'a> {
 
 impl<'a> CppSemanticLowerer<'a> {
     fn new(analyzer: &'a CppAnalyzer) -> Self {
-        let dependencies = analyzer.active_semantic_model_snapshot().map_or_else(
-            || DependencyFingerprint::hash_bytes(b"no-intrafile-dependencies"),
-            |snapshot| {
-                let mut identity = b"cpp-semantic-model-set-v1\0".to_vec();
-                identity
-                    .extend_from_slice(snapshot.active_models().active_model_set_hash().as_bytes());
-                DependencyFingerprint::hash_bytes(&identity)
-            },
+        let snapshot = analyzer.active_semantic_model_snapshot();
+        let dependencies = semantic_model_dependency_fingerprint(
+            snapshot.as_deref(),
+            b"cpp-semantic-model-set-v1\0",
         );
         Self {
             analyzer,
@@ -86,14 +196,12 @@ impl<'a> CppSemanticLowerer<'a> {
 
 impl ProgramSemanticsLowerer for CppSemanticLowerer<'_> {
     fn identity(&self) -> SemanticAdapterIdentity {
-        SemanticAdapterIdentity {
-            adapter: AdapterSemanticsVersion::hash_bytes("cpp", ADAPTER_VERSION)
-                .expect("adapter name is non-empty"),
-            configuration: ConfigurationFingerprint::hash_bytes(
-                b"cpp-intrafile-execution-defaults-v1",
-            ),
-            dependencies: self.dependencies,
-        }
+        SemanticAdapterIdentity::for_adapter(
+            "cpp",
+            ADAPTER_VERSION,
+            b"cpp-intrafile-execution-defaults-v1",
+            self.dependencies,
+        )
     }
 
     fn capabilities(&self) -> SemanticCapabilities {
@@ -108,33 +216,36 @@ impl ProgramSemanticsLowerer for CppSemanticLowerer<'_> {
         cancellation: &CancellationToken,
     ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
         let (inventory, initial_work) =
-            match enumerate_procedures(file, prepared, budget, cancellation)? {
-                ProcedureEnumeration::Complete {
+            match enumerate_procedures(self.analyzer, file, prepared, budget, cancellation)?
+                .into_lowering_input()
+            {
+                ProcedureLoweringInput::Complete {
                     value,
                     initial_work,
-                    ..
                 } => (value, initial_work),
-                ProcedureEnumeration::ExceededBudget { exceeded, work } => {
-                    return Ok(SemanticOutcome::ExceededBudget {
-                        partial: None,
-                        exceeded,
-                        work,
-                    });
-                }
-                ProcedureEnumeration::Cancelled { work } => {
-                    return Ok(SemanticOutcome::Cancelled {
-                        partial: None,
-                        work,
-                    });
-                }
+                ProcedureLoweringInput::Stopped(outcome) => return Ok(outcome),
             };
 
         let function_procedures = Arc::new(FunctionProcedureIndex::new(&inventory.specs));
+        let resolved_call_facts = resolve_function_declaration_calls(
+            self.analyzer,
+            file,
+            prepared,
+            &inventory.specs,
+            cancellation,
+        );
+        let resolved_call_ids = Arc::new(resolved_call_facts.resolved_call_ids);
+        let resolved_function_targets = Arc::new(resolved_call_facts.resolved_function_targets);
         let ProcedureInventory {
             specs,
             member_declarations,
-            trivial_types,
+            file_facts,
         } = inventory;
+        // Parent lookup is a property of the prepared translation unit, not
+        // of an individual callable.  Building this index inside
+        // `lower_procedure` rebuilt one hash table for every procedure and
+        // made large headers quadratic in their number of callables.
+        let ancestry = ParentIndex::new(prepared.tree().root_node());
         lower_procedure_batch(
             &specs,
             initial_work,
@@ -146,8 +257,15 @@ impl ProgramSemanticsLowerer for CppSemanticLowerer<'_> {
                     file,
                     prepared,
                     spec,
+                    &ancestry,
                     &member_declarations,
-                    &trivial_types,
+                    &file_facts.trivial_types,
+                    &file_facts.scalar_types,
+                    &file_facts.function_like_macros,
+                    &file_facts.object_like_macros,
+                    &file_facts.noreturn_names,
+                    Arc::clone(&resolved_call_ids),
+                    Arc::clone(&resolved_function_targets),
                     Arc::clone(&function_procedures),
                     staged_budget,
                     cancellation,
@@ -157,35 +275,336 @@ impl ProgramSemanticsLowerer for CppSemanticLowerer<'_> {
     }
 }
 
-fn cpp_capabilities() -> SemanticCapabilities {
-    let mut builder = SemanticCapabilities::builder();
-    for capability in [
-        SemanticCapability::Procedures,
-        SemanticCapability::EntryBoundary,
-        SemanticCapability::NormalExitBoundary,
-        SemanticCapability::ExceptionalExitBoundary,
-        SemanticCapability::BasicBlocks,
-        SemanticCapability::ProgramPoints,
-        SemanticCapability::ReturnFlow,
-        SemanticCapability::NormalCallContinuation,
-        SemanticCapability::ExceptionalCallContinuation,
-    ] {
-        builder = builder.complete(capability);
+/// Resolve C/C++ call declarations once for the translation unit. The normal
+/// lowering call effect deliberately keeps local call-target dispatch open,
+/// but B2 also needs to distinguish an unresolved C call that could be a
+/// header macro from a call whose callee is a structured function declaration.
+/// Keeping this as one source batch avoids repeating a resolver walk for every
+/// procedure or every candidate.
+#[derive(Default)]
+struct ResolvedCallFacts {
+    resolved_call_ids: HashSet<usize>,
+    resolved_function_targets: HashMap<usize, CodeUnit>,
+}
+
+fn resolve_function_declaration_calls(
+    analyzer: &CppAnalyzer,
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    specs: &[ProcedureSpec<'_>],
+    cancellation: &CancellationToken,
+) -> ResolvedCallFacts {
+    let is_c_source = file
+        .rel_path()
+        .extension()
+        .and_then(|extension| extension.to_str())
+        == Some("c");
+    let mut requests = Vec::new();
+    let mut call_ids = Vec::new();
+    let mut local_names_by_request = Vec::new();
+    let mut local_bindings_by_request = Vec::new();
+    let mut macro_names_by_request = Vec::new();
+    if is_c_source {
+        let mut stack = vec![prepared.tree().root_node()];
+        while let Some(node) = stack.pop() {
+            add_function_declaration_request(
+                node,
+                file,
+                &mut requests,
+                &mut call_ids,
+                None,
+                prepared.source(),
+            );
+            stack.extend(named_children(node));
+        }
+    } else {
+        // A C++ unresolved call is relevant to the semantic gap only when an
+        // argument can carry a local or parameter value. Walk each callable
+        // separately so a large header does not resolve calls in declarations,
+        // namespace initializers, or unrelated functions that cannot affect
+        // this procedure's local-argument proof. Nested callables have their
+        // own spec and are skipped here.
+        let macro_names = Arc::new(cpp_macro_names_in_tree(
+            prepared.tree().root_node(),
+            prepared.source(),
+        ));
+        for spec in specs {
+            let local_names = Arc::new(local_names_for_call_resolution(
+                spec.callable,
+                prepared.source(),
+            ));
+            let local_bindings = Arc::new(cpp_bounded_local_binding_index(
+                spec.callable,
+                prepared.source(),
+            ));
+            let request_start = requests.len();
+            let mut stack = vec![spec.callable];
+            while let Some(node) = stack.pop() {
+                if node.id() != spec.callable.id() && cpp_nested_execution_boundary(node) {
+                    continue;
+                }
+                add_function_declaration_request(
+                    node,
+                    file,
+                    &mut requests,
+                    &mut call_ids,
+                    Some(local_names.as_ref()),
+                    prepared.source(),
+                );
+                stack.extend(named_children(node));
+            }
+            for _ in request_start..requests.len() {
+                local_names_by_request.push(Arc::clone(&local_names));
+                local_bindings_by_request.push(Arc::clone(&local_bindings));
+                macro_names_by_request.push(Arc::clone(&macro_names));
+            }
+        }
     }
+    if requests.is_empty() {
+        return ResolvedCallFacts::default();
+    }
+    let mut facts = ResolvedCallFacts::default();
+    if is_c_source {
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let outcomes = resolve_call_target_batch_with_source(
+            analyzer,
+            scope.token(),
+            requests,
+            file.clone(),
+            Arc::from(prepared.source()),
+            Some(cancellation),
+        );
+        for (call_id, outcome) in call_ids.into_iter().zip(outcomes) {
+            record_resolved_call_fact(&mut facts, call_id, &outcome.outcome);
+        }
+    } else {
+        // The full C++ navigation batch performs declaration-occurrence and
+        // body-selection work for every request. Semantic lowering needs only
+        // the bounded callable target, so use the receiver resolver directly
+        // for C++ calls and retain the same resolved/ambiguous distinction.
+        // Keep one analyzer query scope for the whole translation unit: the
+        // bounded resolver is still per-call, but its relational definition
+        // memo is safely reusable across those calls.
+        let scope = AnalyzerQueryScope::with_cancellation(analyzer, cancellation);
+        assert_eq!(local_names_by_request.len(), requests.len());
+        assert_eq!(local_bindings_by_request.len(), requests.len());
+        assert_eq!(macro_names_by_request.len(), requests.len());
+        for ((((call_id, request), local_names), local_bindings), macro_names) in call_ids
+            .into_iter()
+            .zip(requests)
+            .zip(local_names_by_request)
+            .zip(local_bindings_by_request)
+            .zip(macro_names_by_request)
+        {
+            if let Some(outcome) = resolve_cpp_call_target(
+                analyzer,
+                file,
+                prepared,
+                &request,
+                local_names.as_ref(),
+                local_bindings.as_ref(),
+                macro_names.as_ref(),
+                cancellation,
+            ) {
+                record_resolved_call_fact(&mut facts, call_id, &outcome);
+            }
+        }
+        if let Err(reason) = scope.read_completion() {
+            analyzer.record_query_incomplete(reason);
+        }
+    }
+    facts
+}
+
+fn record_resolved_call_fact(
+    facts: &mut ResolvedCallFacts,
+    call_id: usize,
+    outcome: &crate::analyzer::usages::get_definition::DefinitionLookupOutcome,
+) {
+    if outcome.status == DefinitionLookupStatus::Resolved
+        && outcome.definitions.iter().any(CodeUnit::is_function)
+    {
+        facts.resolved_call_ids.insert(call_id);
+        if let [definition] = outcome.definitions.as_slice() {
+            facts
+                .resolved_function_targets
+                .insert(call_id, definition.clone());
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_cpp_call_target(
+    analyzer: &CppAnalyzer,
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    request: &DefinitionLookupRequest,
+    known_local_names: &HashSet<Box<str>>,
+    local_bindings: &CppBoundedLocalBindingIndex<'_>,
+    macro_names: &HashSet<Box<str>>,
+    cancellation: &CancellationToken,
+) -> Option<crate::analyzer::usages::get_definition::DefinitionLookupOutcome> {
+    let site = cpp_call_reference_site(file, prepared, request)?;
+    match resolve_cpp_bounded_with_known_local_names(
+        analyzer,
+        file,
+        prepared.source(),
+        Some(prepared.tree()),
+        &site,
+        ReceiverAnalysisBudget::default(),
+        Some(cancellation),
+        known_local_names,
+        Some(local_bindings),
+        Some(macro_names),
+    ) {
+        BoundedResolution::Complete { value, .. } => Some(value),
+        BoundedResolution::Exceeded { .. } | BoundedResolution::Cancelled { .. } => None,
+    }
+}
+
+fn cpp_call_reference_site(
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    request: &DefinitionLookupRequest,
+) -> Option<ResolvedReferenceSite> {
+    let start = request.start_byte?;
+    let end = request.end_byte?;
+    let text = prepared.source().get(start..end)?.to_owned();
+    let line_starts = prepared.line_starts();
+    Some(ResolvedReferenceSite {
+        path: crate::path_utils::rel_path_string(file),
+        text,
+        range: crate::analyzer::Range {
+            start_byte: start,
+            end_byte: end,
+            start_line: find_line_index_for_offset(line_starts, start) + 1,
+            end_line: find_line_index_for_offset(line_starts, end.saturating_sub(1)) + 1,
+        },
+        focus_start_byte: start,
+        focus_end_byte: end,
+    })
+}
+
+fn add_function_declaration_request(
+    node: Node<'_>,
+    file: &ProjectFile,
+    requests: &mut Vec<DefinitionLookupRequest>,
+    call_ids: &mut Vec<usize>,
+    local_names: Option<&HashSet<Box<str>>>,
+    source: &str,
+) {
+    if node.kind() != "call_expression"
+        || local_names.is_some_and(|names| !call_has_local_argument(node, names, source))
+    {
+        return;
+    }
+    let Some(function) = node.child_by_field_name("function") else {
+        return;
+    };
+    requests.push(DefinitionLookupRequest {
+        file: file.clone(),
+        line: None,
+        column: None,
+        start_byte: Some(function.start_byte()),
+        end_byte: Some(function.end_byte()),
+    });
+    call_ids.push(node.id());
+}
+
+fn call_has_local_argument(call: Node<'_>, local_names: &HashSet<Box<str>>, source: &str) -> bool {
+    let mut stack = call_arguments(call);
+    while let Some(node) = stack.pop() {
+        if node.kind() == "identifier"
+            && nonempty_node_text(source, node).is_some_and(|name| local_names.contains(name))
+        {
+            return true;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    false
+}
+
+fn local_names_for_call_resolution(callable: Node<'_>, source: &str) -> HashSet<Box<str>> {
+    let mut names = HashSet::default();
+    let mut stack = vec![callable];
+    while let Some(node) = stack.pop() {
+        if node.id() != callable.id() && cpp_nested_execution_boundary(node) {
+            continue;
+        }
+        match node.kind() {
+            "parameter_declaration" | "optional_parameter_declaration" => {
+                if let Some(declarator) = node.child_by_field_name("declarator")
+                    && let Some(name) = declarator_name_node(declarator)
+                    && let Some(text) = nonempty_node_text(source, name)
+                {
+                    names.insert(Box::<str>::from(text));
+                }
+            }
+            "declaration" => {
+                for declarator in cpp_local_declarators(node) {
+                    if let Some(name) = declarator_name_node(declarator)
+                        && let Some(text) = nonempty_node_text(source, name)
+                    {
+                        names.insert(Box::<str>::from(text));
+                    }
+                }
+            }
+            "catch_clause" => {
+                if let Some(parameter) = catch_clause_parameter(node)
+                    && let Some(declarator) = parameter.child_by_field_name("declarator")
+                    && let Some(name) = declarator_name_node(declarator)
+                    && let Some(text) = nonempty_node_text(source, name)
+                {
+                    names.insert(Box::<str>::from(text));
+                }
+            }
+            "structured_binding_declarator" | "lambda_capture" => {
+                let mut bindings = vec![node];
+                while let Some(binding) = bindings.pop() {
+                    if binding.kind() == "identifier"
+                        && let Some(text) = nonempty_node_text(source, binding)
+                    {
+                        names.insert(Box::<str>::from(text));
+                    }
+                    bindings.extend(named_children(binding));
+                }
+            }
+            "lambda_capture_initializer" => {
+                if let Some(left) = node.child_by_field_name("left") {
+                    let name = declarator_name_node(left).unwrap_or(left);
+                    if name.kind() == "identifier"
+                        && let Some(text) = nonempty_node_text(source, name)
+                    {
+                        names.insert(Box::<str>::from(text));
+                    }
+                }
+            }
+            _ => {}
+        }
+        stack.extend(named_children(node));
+    }
+    names
+}
+
+fn cpp_macro_names_in_tree(root: Node<'_>, source: &str) -> HashSet<Box<str>> {
+    let mut names = HashSet::default();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if matches!(node.kind(), "preproc_def" | "preproc_function_def")
+            && let Some(name) = node.child_by_field_name("name")
+            && let Some(text) = nonempty_node_text(source, name)
+        {
+            names.insert(Box::<str>::from(text));
+        }
+        stack.extend(named_children(node));
+    }
+    names
+}
+
+fn cpp_capabilities() -> SemanticCapabilities {
+    let mut builder = crate::analyzer::semantic::capabilities::tree_sitter_adapter_capabilities();
     for capability in [
-        SemanticCapability::NormalControlFlow,
-        SemanticCapability::ExceptionalControlFlow,
-        SemanticCapability::CleanupControlFlow,
-        SemanticCapability::Assignments,
-        SemanticCapability::Allocations,
-        SemanticCapability::Calls,
-        SemanticCapability::DynamicDispatch,
-        SemanticCapability::Captures,
-        SemanticCapability::CallableReferences,
-        SemanticCapability::Values,
-        SemanticCapability::LocalFlow,
-        SemanticCapability::ParameterFlow,
-        SemanticCapability::ReceiverFlow,
         // Partial, not complete: a write or read through a member, element, or
         // static target becomes a `MemoryStore`/`MemoryLoad` against a
         // structured location, but whether that location is the *declared*
@@ -193,23 +612,17 @@ fn cpp_capabilities() -> SemanticCapabilities {
         // an element is only addressed when the subscript is constant and the
         // base is provably an array. Every other occurrence publishes its own
         // location-subject gap (#2666, #2665).
-        SemanticCapability::FieldMemory,
         SemanticCapability::StaticMemory,
-        SemanticCapability::IndexMemory,
-        SemanticCapability::NonLocalControl,
-        SemanticCapability::ResourceManagement,
-        SemanticCapability::DeferredExecution,
         SemanticCapability::ConcurrentSpawn,
         SemanticCapability::AsyncSuspendResume,
         SemanticCapability::GeneratorSuspension,
-        // Partial: every decision this adapter's condition lowering reaches
-        // publishes a row, and a literal constant condition publishes the
-        // constant it folded on. Comparisons, null tests, and every other
-        // condition are recorded `Opaque` rather than normalized (#2443).
-        SemanticCapability::GuardFacts,
     ] {
         builder = builder.partial(capability);
     }
+    // GuardFacts stays partial: every decision this adapter's condition lowering reaches
+    // publishes a row, and a literal constant condition publishes the
+    // constant it folded on. Comparisons, null tests, and every other
+    // condition are recorded `Opaque` rather than normalized (#2443).
     builder.build()
 }
 
@@ -228,6 +641,7 @@ struct ProcedureSpec<'tree> {
     has_preprocessing: bool,
     has_syntax_errors: bool,
     noexcept: NoexceptSpecification,
+    is_noreturn: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -277,8 +691,8 @@ struct TypeMemberKey {
     name: Box<str>,
 }
 
-/// The class, struct, and union names this file declares whose construction
-/// and destruction provably run no user code.
+/// The class, struct, union, and enum names this file declares whose
+/// construction and destruction provably run no user code.
 ///
 /// A C++ automatic object of such a type opens no RAII boundary: there is no
 /// destructor to run at scope exit and no constructor or conversion function
@@ -288,8 +702,8 @@ struct TypeMemberKey {
 /// unqualified "this scope has an automatic object" made every C++ procedure
 /// holding a plain aggregate unprovable (#2666).
 ///
-/// The proof is deliberately narrow and purely structural. A name qualifies
-/// only when every declaration of it in this file is a class body that
+/// The proof is deliberately narrow and purely structural. A class name
+/// qualifies only when every declaration of it in this file is a class body
 ///
 /// - has no base-class clause,
 /// - declares nothing but data members and access specifiers, so no
@@ -298,12 +712,18 @@ struct TypeMemberKey {
 /// - gives every member a type that is fundamental, a pointer or reference, or
 ///   another name proved trivial the same way.
 ///
+/// An enum name qualifies when this file contains exactly one complete enum
+/// definition for it and no struct, class, union, or alias reuses the name.
+/// Forward declarations do not prove an enum's underlying object type is
+/// available here, and repeated definitions remain ambiguous.
+///
 /// Anything this file cannot see -- a type from a header, a template
 /// parameter, a name declared twice -- is absent from the set, and its objects
 /// keep every boundary they had.
 #[derive(Debug, Default)]
-struct TrivialTypeIndex {
+pub(crate) struct TrivialTypeIndex {
     names: HashSet<Box<str>>,
+    enum_names: HashSet<Box<str>>,
 }
 
 impl TrivialTypeIndex {
@@ -313,17 +733,35 @@ impl TrivialTypeIndex {
     /// admits the candidates all of whose member types are already admitted,
     /// and the loop stops when a pass admits nothing new. At most one name is
     /// admitted per pass, so the iteration is bounded by the candidate count.
-    fn build(source: &str, root: Node<'_>) -> Self {
+    fn build(source: &str, root: Node<'_>, include_cpp_types: bool) -> Self {
         // name -> member type names it depends on; `None` once a second,
         // conflicting declaration of the name is seen.
         let mut candidates: HashMap<Box<str>, Option<Vec<Box<str>>>> = HashMap::default();
+        let mut conflicting_type_names = HashSet::default();
         let mut stack = vec![root];
         while let Some(node) = stack.pop() {
             stack.extend(named_children(node));
+            match node.kind() {
+                "struct_specifier" | "class_specifier" | "union_specifier" => {
+                    if let Some(name) = node
+                        .child_by_field_name("name")
+                        .and_then(|name| nonempty_node_text(source, name))
+                    {
+                        conflicting_type_names.insert(Box::<str>::from(name));
+                    }
+                }
+                "type_definition" | "alias_declaration" | "namespace_alias_definition" => {
+                    conflicting_type_names.extend(declared_alias_names(source, node));
+                }
+                _ => {}
+            }
             if !matches!(
                 node.kind(),
                 "struct_specifier" | "class_specifier" | "union_specifier"
             ) {
+                continue;
+            }
+            if !include_cpp_types {
                 continue;
             }
             let Some(name) = node
@@ -347,7 +785,10 @@ impl TrivialTypeIndex {
                 }
             }
         }
-        let mut names: HashSet<Box<str>> = HashSet::default();
+        let mut names: HashSet<Box<str>> = CPP_EXACT_SCALAR_TYPE_NAMES
+            .iter()
+            .map(|name| Box::<str>::from(*name))
+            .collect();
         loop {
             let mut admitted = false;
             for (name, dependencies) in &candidates {
@@ -369,21 +810,709 @@ impl TrivialTypeIndex {
                 break;
             }
         }
-        Self { names }
+        let mut enum_definitions: HashMap<Box<str>, usize> = HashMap::default();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            stack.extend(named_children(node));
+            if node.kind() != "enum_specifier" || node.child_by_field_name("body").is_none() {
+                continue;
+            }
+            let Some(name) = node
+                .child_by_field_name("name")
+                .and_then(|name| nonempty_node_text(source, name))
+            else {
+                continue;
+            };
+            *enum_definitions.entry(Box::from(name)).or_default() += 1;
+        }
+        let enum_names = enum_definitions
+            .into_iter()
+            .filter_map(|(name, definitions)| {
+                (definitions == 1 && !conflicting_type_names.contains(&name)).then_some(name)
+            })
+            .collect();
+        Self { names, enum_names }
     }
 
     fn contains(&self, name: &str) -> bool {
         self.names.contains(name)
     }
 
+    fn contains_enum(&self, name: &str) -> bool {
+        self.enum_names.contains(name)
+    }
+
+    /// A named enum is safe for an ordinary assignment only when its spelling
+    /// cannot be shadowed by a nested namespace or class scope. The file-wide
+    /// identity set has already rejected duplicate enum definitions and every
+    /// struct/class/union/alias collision.
+    pub(crate) fn named_enum_use_is_unambiguous(&self, source: &str, type_node: Node<'_>) -> bool {
+        if type_node.kind() != "type_identifier"
+            || !self.contains_enum(nonempty_node_text(source, type_node).unwrap_or_default())
+        {
+            return false;
+        }
+        let mut current = type_node.parent();
+        while let Some(parent) = current {
+            if matches!(
+                parent.kind(),
+                "namespace_definition" | "struct_specifier" | "class_specifier" | "union_specifier"
+            ) {
+                return false;
+            }
+            current = parent.parent();
+        }
+        true
+    }
+
+    fn declaration_is_enum(&self, source: &str, declaration: Node<'_>) -> bool {
+        declared_type_name(source, declaration).is_some_and(|name| self.contains_enum(&name))
+            && !cpp_declaration_is_function(declaration)
+    }
+
     /// Whether every object `declaration` declares is of a proved-trivial
     /// type, so its construction and destruction run no user code.
     fn declaration_is_trivial(&self, source: &str, declaration: Node<'_>) -> bool {
         declared_type_name(source, declaration)
-            .is_some_and(|name| self.contains(&name))
+            .is_some_and(|name| self.contains(&name) || self.contains_enum(&name))
             // A declarator that introduces a function is not an object at all,
             // and the `type` field then names the return type.
             && !cpp_declaration_is_function(declaration)
+    }
+
+    fn estimated_retained_bytes(&self) -> usize {
+        fn set_bytes(set: &HashSet<Box<str>>) -> usize {
+            set.iter()
+                .map(|name| std::mem::size_of::<Box<str>>() + name.len())
+                .sum::<usize>()
+                .saturating_add(std::mem::size_of_val(set))
+        }
+        set_bytes(&self.names).saturating_add(set_bytes(&self.enum_names))
+    }
+}
+
+/// Structured facts that are constant for one prepared translation unit.
+///
+/// The assignment policy and C++ semantic lowering both need the trivial-type
+/// table. Keeping the macro names beside it prevents each procedure candidate
+/// from re-walking the file and gives both consumers one bounded cache entry.
+#[derive(Debug, Default)]
+pub(crate) struct CppFileFacts {
+    pub(crate) trivial_types: TrivialTypeIndex,
+    pub(crate) scalar_types: CppScalarTypeIndex,
+    pub(crate) function_like_macros: HashSet<Box<str>>,
+    pub(crate) object_like_macros: HashSet<Box<str>>,
+    pub(crate) noreturn_names: HashSet<Box<str>>,
+}
+
+/// Exact scalar aliases proved from the translation unit's structured type
+/// declarations. Plain C and C++ `int`/`long` spellings are intentionally
+/// absent: this adapter has no configured target data model, so their width is
+/// implementation-defined. The reserved fixed-width implementation spellings
+/// below are accepted as exact bases, and same-file typedef chains are reduced
+/// to them once at file-facts construction.
+#[derive(Debug, Default)]
+pub(crate) struct CppScalarTypeIndex {
+    aliases: HashMap<Box<str>, DeclaredScalarType>,
+    ambiguous: HashSet<Box<str>>,
+    /// Byte ranges of operands whose address is taken. The ranges are
+    /// collected with the other file facts so each scalar candidate can
+    /// exclude an escaped binding without re-walking the translation unit.
+    address_taken_operands: Vec<(usize, usize)>,
+    /// Initializer operands of local reference bindings. A direct binding
+    /// aliases its initializer's storage, so the referent cannot keep a
+    /// closed scalar fact when the alias identity is not modeled.
+    reference_binding_operands: Vec<(usize, usize)>,
+}
+
+impl CppScalarTypeIndex {
+    fn build(source: &str, root: Node<'_>) -> Self {
+        let mut targets = HashMap::<Box<str>, Option<Box<str>>>::default();
+        let mut ambiguous = HashSet::default();
+        let mut non_scalar_aliases = HashSet::default();
+        let mut conflicting_type_names = HashSet::default();
+        let mut address_taken_operands = Vec::new();
+        let mut reference_binding_operands = Vec::new();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            stack.extend(named_children(node));
+            if node.kind() == "pointer_expression"
+                && has_direct_token(node, "&")
+                && let Some(argument) = node.child_by_field_name("argument")
+            {
+                address_taken_operands.push((argument.start_byte(), argument.end_byte()));
+            }
+            if node.kind() == "declaration" {
+                for declarator in cpp_local_declarators(node) {
+                    if cpp_declarator_contains_kind(declarator, "reference_declarator")
+                        && let Some(initializer) = cpp_declarator_initializer(node, declarator)
+                    {
+                        reference_binding_operands
+                            .push((initializer.start_byte(), initializer.end_byte()));
+                    }
+                }
+            }
+            if matches!(
+                node.kind(),
+                "struct_specifier" | "class_specifier" | "union_specifier" | "enum_specifier"
+            ) && let Some(name) = node
+                .child_by_field_name("name")
+                .and_then(|name| nonempty_node_text(source, name))
+            {
+                conflicting_type_names.insert(Box::<str>::from(name));
+            }
+            let names = match node.kind() {
+                "type_definition" => cpp_local_declarators(node)
+                    .into_iter()
+                    .filter_map(|declarator| {
+                        let name = declarator_name_node(declarator)
+                            .and_then(|name| nonempty_node_text(source, name))
+                            .map(Box::<str>::from)?;
+                        if [
+                            "pointer_declarator",
+                            "reference_declarator",
+                            "array_declarator",
+                            "function_declarator",
+                        ]
+                        .into_iter()
+                        .any(|kind| cpp_declarator_contains_kind(declarator, kind))
+                            || has_object_qualifier(source, node, declarator, "volatile")
+                            || has_atomic_qualifier(source, node, declarator)
+                        {
+                            non_scalar_aliases.insert(name.clone());
+                        }
+                        Some(name)
+                    })
+                    .collect::<Vec<_>>(),
+                "alias_declaration" => {
+                    let Some(name) = node
+                        .child_by_field_name("name")
+                        .and_then(|name| nonempty_node_text(source, name))
+                    else {
+                        continue;
+                    };
+                    if node
+                        .child_by_field_name("type")
+                        .is_some_and(|type_node| cpp_type_node_is_non_scalar(source, type_node))
+                    {
+                        non_scalar_aliases.insert(Box::<str>::from(name));
+                    }
+                    vec![Box::<str>::from(name)]
+                }
+                _ => continue,
+            };
+            let target = node
+                .child_by_field_name("type")
+                .and_then(|type_node| {
+                    cpp_exact_scalar_type_node(source, type_node)
+                        .and_then(|_| {
+                            source
+                                .get(type_node.byte_range())
+                                .map(normalize_cpp_whitespace)
+                        })
+                        .or_else(|| {
+                            cpp_structured_type_path(type_node, source).map(|path| path.join("::"))
+                        })
+                })
+                .map(Box::<str>::from);
+            let file_scope = node
+                .parent()
+                .is_some_and(|parent| parent.kind() == "translation_unit");
+            for name in names {
+                if !file_scope {
+                    ambiguous.insert(name);
+                    continue;
+                }
+                match targets.entry(name) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(target.clone());
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        entry.insert(None);
+                    }
+                }
+            }
+        }
+
+        let mut aliases = HashMap::default();
+        for (name, target) in &targets {
+            let Some(target) = target else {
+                ambiguous.insert(name.clone());
+                continue;
+            };
+            if non_scalar_aliases.contains(name.as_ref())
+                || conflicting_type_names.contains(name.as_ref())
+            {
+                ambiguous.insert(name.clone());
+                continue;
+            }
+            if let Some(scalar_type) = cpp_exact_scalar_type_name(target) {
+                aliases.insert(name.clone(), scalar_type);
+            }
+        }
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for (name, target) in &targets {
+                if aliases.contains_key(name) || ambiguous.contains(name) {
+                    continue;
+                }
+                let Some(target) = target else {
+                    continue;
+                };
+                if let Some(scalar_type) = aliases.get(target).copied() {
+                    aliases.insert(name.clone(), scalar_type);
+                    changed = true;
+                }
+            }
+        }
+        address_taken_operands.sort_unstable();
+        reference_binding_operands.sort_unstable();
+        Self {
+            aliases,
+            ambiguous,
+            address_taken_operands,
+            reference_binding_operands,
+        }
+    }
+
+    fn scalar_type(&self, source: &str, type_node: Node<'_>) -> Option<DeclaredScalarType> {
+        if let Some(scalar_type) = cpp_exact_scalar_type_node(source, type_node) {
+            return Some(scalar_type);
+        }
+        if cpp_type_use_has_shadowing_scope(type_node) {
+            return None;
+        }
+        let path = cpp_structured_type_path(type_node, source)?;
+        let [name] = path.as_slice() else {
+            return None;
+        };
+        let name = name.as_str();
+        (!self.ambiguous.contains(name))
+            .then(|| self.aliases.get(name).copied())
+            .flatten()
+    }
+
+    fn estimated_retained_bytes(&self) -> usize {
+        fn map_bytes<V>(map: &HashMap<Box<str>, V>) -> usize {
+            map.keys()
+                .map(|name| std::mem::size_of::<Box<str>>() + name.len())
+                .sum::<usize>()
+                .saturating_add(std::mem::size_of_val(map))
+        }
+        fn set_bytes(set: &HashSet<Box<str>>) -> usize {
+            set.iter()
+                .map(|name| std::mem::size_of::<Box<str>>() + name.len())
+                .sum::<usize>()
+                .saturating_add(std::mem::size_of_val(set))
+        }
+        std::mem::size_of::<Self>()
+            .saturating_add(map_bytes(&self.aliases))
+            .saturating_add(set_bytes(&self.ambiguous))
+            .saturating_add(
+                self.address_taken_operands
+                    .len()
+                    .saturating_mul(std::mem::size_of::<(usize, usize)>()),
+            )
+            .saturating_add(
+                self.reference_binding_operands
+                    .len()
+                    .saturating_mul(std::mem::size_of::<(usize, usize)>()),
+            )
+    }
+}
+
+fn cpp_type_use_has_shadowing_scope(mut node: Node<'_>) -> bool {
+    loop {
+        if matches!(
+            node.kind(),
+            "namespace_definition"
+                | "class_specifier"
+                | "struct_specifier"
+                | "union_specifier"
+                | "template_declaration"
+                | "template_parameter_list"
+        ) {
+            return true;
+        }
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        node = parent;
+    }
+}
+
+fn cpp_type_node_is_non_scalar(source: &str, root: Node<'_>) -> bool {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if matches!(
+            node.kind(),
+            "pointer_type"
+                | "reference_type"
+                | "array_type"
+                | "function_type"
+                | "pointer_declarator"
+                | "reference_declarator"
+                | "array_declarator"
+                | "function_declarator"
+        ) {
+            return true;
+        }
+        if node.kind() == "type_qualifier"
+            && nonempty_node_text(source, node).is_some_and(|text| text == "volatile")
+        {
+            return true;
+        }
+        if matches!(node.kind(), "atomic_type_specifier" | "atomic_type")
+            || nonempty_node_text(source, node).is_some_and(|text| text == "_Atomic")
+        {
+            return true;
+        }
+        stack.extend(named_children(node));
+    }
+    false
+}
+
+impl CppFileFacts {
+    pub(crate) fn build(source: &str, root: Node<'_>, is_c_source: bool) -> Self {
+        let mut trivial_types = TrivialTypeIndex::build(source, root, !is_c_source);
+        let scalar_types = CppScalarTypeIndex::build(source, root);
+        trivial_types
+            .names
+            .extend(scalar_types.aliases.keys().cloned());
+        let mut function_like_macros = HashSet::default();
+        let mut object_like_macros = HashSet::default();
+        let mut noreturn_names = HashSet::default();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            match node.kind() {
+                "preproc_function_def" => {
+                    if let Some(name) = node
+                        .child_by_field_name("name")
+                        .and_then(|name| nonempty_node_text(source, name))
+                    {
+                        function_like_macros.insert(Box::<str>::from(name));
+                    }
+                }
+                "preproc_def" => {
+                    if let Some(name) = node
+                        .child_by_field_name("name")
+                        .and_then(|name| nonempty_node_text(source, name))
+                    {
+                        object_like_macros.insert(Box::<str>::from(name));
+                    }
+                }
+                "function_definition"
+                    if cpp_function_is_noreturn(source, node)
+                        && callable_name(source, node).is_some() =>
+                {
+                    noreturn_names.insert(callable_name(source, node).expect("checked name"));
+                }
+                _ => {}
+            }
+            stack.extend(named_children(node));
+        }
+        Self {
+            trivial_types,
+            scalar_types,
+            function_like_macros,
+            object_like_macros,
+            noreturn_names,
+        }
+    }
+
+    pub(crate) fn estimated_retained_bytes(&self) -> usize {
+        fn set_bytes(set: &HashSet<Box<str>>) -> usize {
+            set.iter()
+                .map(|name| std::mem::size_of::<Box<str>>() + name.len())
+                .sum::<usize>()
+                .saturating_add(std::mem::size_of_val(set))
+        }
+        std::mem::size_of::<Self>()
+            .saturating_add(set_bytes(&self.function_like_macros))
+            .saturating_add(set_bytes(&self.object_like_macros))
+            .saturating_add(set_bytes(&self.noreturn_names))
+            .saturating_add(self.scalar_types.estimated_retained_bytes())
+            .saturating_add(self.trivial_types.estimated_retained_bytes())
+    }
+}
+
+const CPP_EXACT_SCALAR_TYPE_NAMES: &[&str] = &[
+    "bool",
+    "_Bool",
+    "__int8",
+    "signed __int8",
+    "__int16",
+    "signed __int16",
+    "__int32",
+    "signed __int32",
+    "__int64",
+    "signed __int64",
+    "unsigned __int8",
+    "unsigned __int16",
+    "unsigned __int32",
+    "unsigned __int64",
+];
+
+fn cpp_exact_scalar_type_name(name: &str) -> Option<DeclaredScalarType> {
+    match name {
+        "bool" | "_Bool" => Some(DeclaredScalarType::Boolean),
+        "__int8" => Some(DeclaredScalarType::Signed(8)),
+        "signed __int8" => Some(DeclaredScalarType::Signed(8)),
+        "__int16" => Some(DeclaredScalarType::Signed(16)),
+        "signed __int16" => Some(DeclaredScalarType::Signed(16)),
+        "__int32" => Some(DeclaredScalarType::Signed(32)),
+        "signed __int32" => Some(DeclaredScalarType::Signed(32)),
+        "__int64" => Some(DeclaredScalarType::Signed(64)),
+        "signed __int64" => Some(DeclaredScalarType::Signed(64)),
+        "unsigned __int8" => Some(DeclaredScalarType::Unsigned(8)),
+        "unsigned __int16" => Some(DeclaredScalarType::Unsigned(16)),
+        "unsigned __int32" => Some(DeclaredScalarType::Unsigned(32)),
+        "unsigned __int64" => Some(DeclaredScalarType::Unsigned(64)),
+        _ => None,
+    }
+}
+
+fn cpp_exact_scalar_type_node(source: &str, type_node: Node<'_>) -> Option<DeclaredScalarType> {
+    cpp_exact_scalar_type_name(&normalize_cpp_whitespace(
+        source.get(type_node.byte_range())?,
+    ))
+}
+
+fn cpp_exact_scalar_value_node(source: &str, value_node: Node<'_>) -> Option<DeclaredScalarType> {
+    if matches!(value_node.kind(), "true" | "false")
+        || source
+            .get(value_node.byte_range())
+            .is_some_and(|text| matches!(text, "true" | "false"))
+    {
+        return Some(DeclaredScalarType::Boolean);
+    }
+    cpp_exact_scalar_type_node(source, value_node)
+}
+
+fn cpp_scalar_type_for_declaration(
+    source: &str,
+    declaration: Node<'_>,
+    declarator: Node<'_>,
+    scalar_types: &CppScalarTypeIndex,
+) -> Option<DeclaredScalarType> {
+    if has_object_qualifier(source, declaration, declarator, "volatile")
+        || has_atomic_qualifier(source, declaration, declarator)
+        || has_storage_class(source, declaration, "static")
+        || has_storage_class(source, declaration, "thread_local")
+        || has_storage_class(source, declaration, "_Thread_local")
+        || cpp_declarator_contains_kind(declarator, "pointer_declarator")
+        || cpp_declarator_contains_kind(declarator, "reference_declarator")
+        || cpp_declarator_contains_kind(declarator, "array_declarator")
+        || cpp_declarator_contains_kind(declarator, "function_declarator")
+    {
+        return None;
+    }
+    let type_node = declaration.child_by_field_name("type")?;
+    scalar_types.scalar_type(source, type_node).or_else(|| {
+        (type_node.kind() == "placeholder_type_specifier")
+            .then(|| cpp_declarator_initializer(declaration, declarator))
+            .flatten()
+            .and_then(|initializer| cpp_exact_scalar_value_node(source, initializer))
+    })
+}
+
+pub(super) fn cpp_binding_declaration<'tree>(
+    parameter: bool,
+    node: Node<'tree>,
+) -> Option<(Node<'tree>, Node<'tree>)> {
+    if parameter {
+        let declaration =
+            std::iter::successors(Some(node), |current| current.parent()).find(|current| {
+                matches!(
+                    current.kind(),
+                    "parameter_declaration" | "optional_parameter_declaration"
+                )
+            })?;
+        return declaration
+            .child_by_field_name("declarator")
+            .map(|declarator| (declaration, declarator));
+    }
+    let declaration = std::iter::successors(Some(node), |current| current.parent())
+        .find(|current| current.kind() == "declaration")?;
+    let name = node.id();
+    cpp_local_declarators(declaration)
+        .into_iter()
+        .find(|declarator| {
+            declarator_name_node(*declarator).is_some_and(|candidate| candidate.id() == name)
+        })
+        .map(|declarator| (declaration, declarator))
+}
+
+/// The C/C++ scalar type of each non-volatile, by-value local or parameter
+/// whose exact representation is established by this file's structured type
+/// facts. Implementation-defined `int`, `long`, ordinary `char`, enums,
+/// floating types and user-defined aliases remain untyped.
+pub(crate) fn cpp_declared_scalar_types(
+    procedure: &ProcedureHandle,
+    prepared: &PreparedSyntaxTree,
+    scalar_types: &CppScalarTypeIndex,
+) -> Vec<(ValueId, DeclaredScalarType)> {
+    let unstable_bindings = cpp_unstable_scalar_bindings(procedure, prepared, scalar_types);
+    binding_nodes(procedure, prepared)
+        .into_iter()
+        .filter_map(|(value, parameter, node)| {
+            if unstable_bindings.contains(&value) {
+                return None;
+            }
+            let (declaration, declarator) = cpp_binding_declaration(parameter, node)?;
+            let scalar_type = cpp_scalar_type_for_declaration(
+                prepared.source(),
+                declaration,
+                declarator,
+                scalar_types,
+            )?;
+            Some((value, scalar_type))
+        })
+        .collect::<Vec<_>>()
+}
+
+/// Resolve cached address-of operand ranges back to this procedure's binding
+/// values.  A file-level range list avoids a translation-unit walk for every
+/// procedure, while the lexical scope selection keeps a same-named nested
+/// local from escaping its outer binding's scalar proof.
+pub(crate) fn cpp_unstable_scalar_bindings(
+    procedure: &ProcedureHandle,
+    prepared: &PreparedSyntaxTree,
+    scalar_types: &CppScalarTypeIndex,
+) -> HashSet<ValueId> {
+    let semantics = procedure.semantics();
+    let procedure_mapping = semantics
+        .source_mapping(semantics.source())
+        .expect("validated procedure owns its source mapping");
+    if procedure_mapping.kind != SourceMappingKind::Exact {
+        return HashSet::default();
+    }
+    let span = procedure_mapping.locator.anchor().span();
+    let Some(callable) = prepared
+        .tree()
+        .root_node()
+        .descendant_for_byte_range(span.start_byte() as usize, span.end_byte() as usize)
+        .filter(|callable| {
+            callable.start_byte() == span.start_byte() as usize
+                && callable.end_byte() == span.end_byte() as usize
+                && !callable.has_error()
+        })
+    else {
+        return HashSet::default();
+    };
+
+    let source = prepared.source();
+    let mut bindings = Vec::new();
+    for (value, parameter, node) in binding_nodes(procedure, prepared) {
+        let Some((declaration, declarator)) = cpp_binding_declaration(parameter, node) else {
+            continue;
+        };
+        let Some(name_node) = declarator_name_node(declarator) else {
+            continue;
+        };
+        let Some(name) = nonempty_node_text(source, name_node) else {
+            continue;
+        };
+        let (scope_start, scope_end) = if parameter {
+            (callable.start_byte(), callable.end_byte())
+        } else {
+            let Some(scope) = cpp_local_scope(node, callable) else {
+                continue;
+            };
+            scope
+        };
+        bindings.push((
+            Box::<str>::from(name),
+            name_node.end_byte(),
+            scope_start,
+            scope_end,
+            declaration.start_byte(),
+            value,
+        ));
+    }
+
+    let mut escaped = HashSet::default();
+    let callable_start = callable.start_byte();
+    let callable_end = callable.end_byte();
+    for (ranges, reference_binding) in [
+        (&scalar_types.address_taken_operands, false),
+        (&scalar_types.reference_binding_operands, true),
+    ] {
+        let first = ranges.partition_point(|&(start, _)| start < callable_start);
+        for &(start, end) in &ranges[first..] {
+            if start >= callable_end {
+                break;
+            }
+            if end > callable_end {
+                continue;
+            }
+            let Some(mut operand) = prepared
+                .tree()
+                .root_node()
+                .descendant_for_byte_range(start, end)
+                .filter(|node| node.start_byte() == start && node.end_byte() == end)
+            else {
+                continue;
+            };
+            while operand.kind() == "parenthesized_expression" {
+                let Some(inner) = first_named_child(operand) else {
+                    break;
+                };
+                operand = inner;
+            }
+            let Some(name) = (operand.kind() == "identifier")
+                .then(|| nonempty_node_text(source, operand))
+                .flatten()
+            else {
+                continue;
+            };
+            let byte = operand.start_byte();
+            let Some((_, _, _, _, _, value)) = bindings
+                .iter()
+                .filter(|(candidate, visible_from, scope_start, scope_end, _, _)| {
+                    candidate.as_ref() == name
+                        && *visible_from <= byte
+                        && *scope_start <= byte
+                        && byte < *scope_end
+                })
+                .min_by_key(
+                    |(_, visible_from, scope_start, scope_end, declaration_start, _)| {
+                        (
+                            scope_end.saturating_sub(*scope_start),
+                            std::cmp::Reverse(*visible_from),
+                            std::cmp::Reverse(*declaration_start),
+                        )
+                    },
+                )
+            else {
+                if reference_binding {
+                    escaped.extend(bindings.iter().map(|(_, _, _, _, _, value)| *value));
+                }
+                continue;
+            };
+            escaped.insert(*value);
+        }
+    }
+    escaped
+}
+
+fn declared_alias_names(source: &str, node: Node<'_>) -> Vec<Box<str>> {
+    match node.kind() {
+        "alias_declaration" | "namespace_alias_definition" => node
+            .child_by_field_name("name")
+            .and_then(|name| nonempty_node_text(source, name))
+            .map(|name| vec![Box::<str>::from(name)])
+            .unwrap_or_default(),
+        "type_definition" => cpp_local_declarators(node)
+            .into_iter()
+            .filter_map(|declarator| {
+                declarator_name_node(declarator)
+                    .and_then(|name| nonempty_node_text(source, name))
+                    .map(Box::<str>::from)
+            })
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -441,7 +1570,7 @@ fn trivial_body_dependencies(source: &str, specifier: Node<'_>) -> Option<Vec<Bo
 struct ProcedureInventory<'tree> {
     specs: Vec<ProcedureSpec<'tree>>,
     member_declarations: MemberDeclarations,
-    trivial_types: TrivialTypeIndex,
+    file_facts: Arc<CppFileFacts>,
 }
 
 /// Function definitions mounted from this artifact, keyed by their exact
@@ -451,11 +1580,12 @@ struct FunctionProcedureIndex {
     procedures: Vec<FunctionProcedure>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct FunctionProcedure {
     start_byte: usize,
     end_byte: usize,
     procedure: ProcedureId,
+    is_noreturn: bool,
 }
 
 impl FunctionProcedureIndex {
@@ -472,6 +1602,7 @@ impl FunctionProcedureIndex {
                 start_byte: spec.callable.start_byte(),
                 end_byte: spec.callable.end_byte(),
                 procedure: spec.id,
+                is_noreturn: spec.is_noreturn,
             })
             .collect();
         Self { procedures }
@@ -506,6 +1637,13 @@ impl FunctionProcedureIndex {
             _ => None,
         }
     }
+
+    fn is_noreturn(&self, procedure: ProcedureId) -> bool {
+        self.procedures
+            .iter()
+            .find(|candidate| candidate.procedure == procedure)
+            .is_some_and(|candidate| candidate.is_noreturn)
+    }
 }
 
 type ProcedureEnumeration<'tree> = ProcedureInventoryOutcome<ProcedureInventory<'tree>>;
@@ -539,6 +1677,7 @@ enum CallablePreflightStop {
 }
 
 fn enumerate_procedures<'tree>(
+    analyzer: &CppAnalyzer,
     file: &ProjectFile,
     prepared: &'tree PreparedSyntaxTree,
     budget: &SemanticBudget,
@@ -567,11 +1706,7 @@ fn enumerate_procedures<'tree>(
     }
     // Built before the enumeration walk, because a callable's RAII preflight
     // asks about a type that may be declared later in the file.
-    let trivial_types = if is_c_source {
-        TrivialTypeIndex::default()
-    } else {
-        TrivialTypeIndex::build(prepared.source(), root)
-    };
+    let file_facts = analyzer.file_facts_for(file, prepared.source(), root, is_c_source);
     let mut specs: Vec<ProcedureSpec<'tree>> = Vec::new();
     let mut member_declarations = MemberDeclarations::default();
     let mut stack = vec![ProcedureEnumerationFrame {
@@ -647,7 +1782,7 @@ fn enumerate_procedures<'tree>(
             let scan = match callable_preflight(
                 frame.node,
                 prepared.source(),
-                &trivial_types,
+                &file_facts.trivial_types,
                 temporary_free_calls.as_ref(),
                 budget,
                 inventory.observed_work(),
@@ -714,9 +1849,11 @@ fn enumerate_procedures<'tree>(
                 has_implicit_object_context,
                 has_raii_boundaries: scan.has_raii_boundaries,
                 has_vla_boundaries: scan.has_vla_boundaries,
-                has_preprocessing: scan.has_preprocessing || has_preprocessing_ancestor(frame.node),
+                has_preprocessing: scan.has_preprocessing,
                 has_syntax_errors: scan.has_syntax_errors,
                 noexcept: noexcept_specification(frame.node),
+                is_noreturn: frame.node.kind() == "function_definition"
+                    && cpp_function_is_noreturn(prepared.source(), frame.node),
             });
             let direct_body = (body.id() != frame.node.id()).then_some(body.id());
             callable_body_scope = Some((direct_body, identity.id, identity.declaration_path));
@@ -745,7 +1882,7 @@ fn enumerate_procedures<'tree>(
     Ok(inventory.complete(ProcedureInventory {
         specs,
         member_declarations,
-        trivial_types,
+        file_facts,
     }))
 }
 
@@ -817,10 +1954,7 @@ fn record_member_declarations(
 fn enclosing_member_owner(node: Node<'_>) -> Option<Node<'_>> {
     let mut current = node.parent();
     while let Some(parent) = current {
-        if matches!(
-            parent.kind(),
-            "struct_specifier" | "class_specifier" | "union_specifier"
-        ) {
+        if is_cpp_type_specifier(parent) {
             return Some(parent);
         }
         if parent.kind() == "function_definition" {
@@ -860,15 +1994,19 @@ fn declared_type_name(source: &str, declaration: Node<'_>) -> Option<Box<str>> {
 fn enclosing_type_node(node: Node<'_>) -> Option<Node<'_>> {
     let mut current = node.parent();
     while let Some(parent) = current {
-        if matches!(
-            parent.kind(),
-            "struct_specifier" | "class_specifier" | "union_specifier"
-        ) {
+        if is_cpp_type_specifier(parent) {
             return Some(parent);
         }
         current = parent.parent();
     }
     None
+}
+
+fn is_cpp_type_specifier(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "struct_specifier" | "class_specifier" | "union_specifier"
+    )
 }
 
 /// The single named parameter a catch clause binds, if it has one.
@@ -886,21 +2024,18 @@ fn catch_clause_parameter<'tree>(catch: Node<'tree>) -> Option<Node<'tree>> {
 /// The enclosing `namespace` names, outermost first.
 fn enclosing_namespace_path(source: &str, node: Node<'_>) -> Box<[Box<str>]> {
     let mut path = Vec::new();
-    let mut current = node.parent();
-    while let Some(parent) = current {
-        if parent.kind() == "namespace_definition"
-            && let Some(name) = parent
-                .child_by_field_name("name")
-                .and_then(|name| nonempty_node_text(source, name))
+    for parent in enclosing_cpp_namespace_nodes(node) {
+        if let Some(name) = parent
+            .child_by_field_name("name")
+            .and_then(|name| nonempty_node_text(source, name))
         {
             path.push(Box::<str>::from(name));
         }
-        current = parent.parent();
     }
-    path.reverse();
     path.into_boxed_slice()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn callable_preflight(
     root: Node<'_>,
     source: &str,
@@ -921,17 +2056,14 @@ fn callable_preflight(
     while let Some(node) = stack.pop() {
         if cancellation.is_cancelled() {
             return Err(CallablePreflightStop::Cancelled {
-                work: Box::new(sum_lowering_work(observed, result.work)),
+                work: Box::new(observed.conservative_add(result.work)),
             });
         }
-        let candidate = sum_lowering_work(
-            result.work,
-            SemanticWork {
-                nested_entries: 1,
-                ..SemanticWork::default()
-            },
-        );
-        let total = sum_lowering_work(observed, candidate);
+        let candidate = result.work.conservative_add(SemanticWork {
+            nested_entries: 1,
+            ..SemanticWork::default()
+        });
+        let total = observed.conservative_add(candidate);
         if let Err(exceeded) = budget.check(total) {
             return Err(CallablePreflightStop::ExceededBudget {
                 exceeded,
@@ -991,17 +2123,11 @@ fn declaration_container_kind(node: Node<'_>) -> Option<DeclarationSegmentKind> 
     }
 }
 
-fn declaration_container_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
-    node.child_by_field_name("name")
-        .and_then(|name| nonempty_node_text(source, name))
-        .map(Box::<str>::from)
-}
+use crate::analyzer::common::{declaration_container_name, is_comment_kind};
 
 fn callable_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
     match node.kind() {
-        "function_definition" => node
-            .child_by_field_name("declarator")
-            .and_then(declarator_name_node)
+        "function_definition" => callable_name_node(node)
             .and_then(|name| nonempty_node_text(source, name))
             .map(Box::<str>::from),
         "lambda_expression" => enclosing_initializer_name(source, node),
@@ -1012,6 +2138,34 @@ fn callable_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
             .map(|name| format!("<initializer:{name}>").into_boxed_str()),
         _ => None,
     }
+}
+
+/// Whether a function definition carries a structured C or C++ no-return
+/// declaration. The function body is excluded so an attribute on a nested
+/// statement cannot annotate its enclosing callable.
+fn cpp_function_is_noreturn(source: &str, node: Node<'_>) -> bool {
+    assert_eq!(node.kind(), "function_definition");
+    let body = node.child_by_field_name("body");
+    let mut stack = named_children(node)
+        .into_iter()
+        .filter(|child| body.is_none_or(|body| child.id() != body.id()))
+        .collect::<Vec<_>>();
+    while let Some(node) = stack.pop() {
+        if (node.kind() == "attribute"
+            && node
+                .child_by_field_name("name")
+                .and_then(|name| nonempty_node_text(source, name))
+                == Some("noreturn"))
+            || (matches!(
+                node.kind(),
+                "storage_class_specifier" | "type_qualifier" | "_Noreturn"
+            ) && nonempty_node_text(source, node) == Some("_Noreturn"))
+        {
+            return true;
+        }
+        stack.extend(named_children(node));
+    }
+    false
 }
 
 fn enclosing_initializer_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
@@ -1152,7 +2306,7 @@ fn constructor_name_matches_scope(source: &str, declarator: Option<Node<'_>>) ->
         .child_by_field_name("name")
         .and_then(declarator_name_node);
     match (scope, name) {
-        (Some(scope), Some(name)) => node_text(source, scope) == node_text(source, name),
+        (Some(scope), Some(name)) => constructor_scope_matches_name(scope, name, source),
         _ => false,
     }
 }
@@ -1174,42 +2328,7 @@ fn qualified_declarator(mut node: Node<'_>) -> Option<Node<'_>> {
     }
 }
 
-pub(super) fn declarator_name_node(mut node: Node<'_>) -> Option<Node<'_>> {
-    loop {
-        match node.kind() {
-            "identifier"
-            | "field_identifier"
-            | "namespace_identifier"
-            | "type_identifier"
-            | "destructor_name"
-            | "operator_name"
-            | "operator_cast"
-            | "primitive_type" => return Some(node),
-            "qualified_identifier" => {
-                node = last_named_field_child(node, "name")?;
-            }
-            "dependent_name" | "template_function" | "template_method" | "template_type" => {
-                node = node.child_by_field_name("name")?;
-            }
-            "function_declarator"
-            | "pointer_declarator"
-            | "array_declarator"
-            | "init_declarator"
-            | "attributed_declarator" => node = node.child_by_field_name("declarator")?,
-            "reference_declarator" | "parenthesized_declarator" => {
-                node = first_named_child(node)?;
-            }
-            _ => return None,
-        }
-    }
-}
-
-fn last_named_field_child<'tree>(node: Node<'tree>, field: &str) -> Option<Node<'tree>> {
-    let mut cursor = node.walk();
-    node.children_by_field_name(field, &mut cursor)
-        .filter(|child| child.is_named())
-        .last()
-}
+use brokk_bifrost_core::analyzer::tree_walk::last_named_field_child;
 
 fn initializer_declarator(node: Node<'_>) -> Option<Node<'_>> {
     node.child_by_field_name("declarator")
@@ -1234,48 +2353,11 @@ fn has_storage_class(source: &str, node: Node<'_>, expected: &str) -> bool {
     })
 }
 
-fn has_preprocessing_ancestor(mut node: Node<'_>) -> bool {
-    while let Some(parent) = node.parent() {
-        if parent.kind().starts_with("preproc_") {
-            return true;
-        }
-        node = parent;
-    }
-    false
-}
-
-fn field_matches(parent: Node<'_>, field: &str, child: Node<'_>) -> bool {
-    parent
-        .child_by_field_name(field)
-        .is_some_and(|candidate| candidate.id() == child.id())
-}
-
 type CppLoweringError = ProcedureLoweringError;
 
 type EdgeTarget = ControlTarget;
 
-#[derive(Debug, Clone, Copy)]
-enum Work<'tree> {
-    Statement {
-        node: Node<'tree>,
-        entry: ProgramPointId,
-        next: EdgeTarget,
-        scope: ScopeFrameId,
-    },
-    Expression {
-        node: Node<'tree>,
-        entry: ProgramPointId,
-        next: EdgeTarget,
-        scope: ScopeFrameId,
-    },
-    Condition {
-        node: Node<'tree>,
-        entry: ProgramPointId,
-        when_true: EdgeTarget,
-        when_false: EdgeTarget,
-        scope: ScopeFrameId,
-    },
-}
+type Work<'tree> = ProcedureWork<'tree>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct GapFact {
@@ -1288,7 +2370,7 @@ struct LoweringContext<'tree, 'targets> {
     analyzer: &'targets CppAnalyzer,
     file: &'targets ProjectFile,
     source: &'tree str,
-    ancestry: ParentIndex<'tree>,
+    ancestry: &'targets ParentIndex<'tree>,
     session: ProcedureLoweringSession<'targets>,
     expression_values: HashMap<usize, ValueId>,
     parameters: HashMap<Box<str>, ValueId>,
@@ -1304,6 +2386,18 @@ struct LoweringContext<'tree, 'targets> {
     /// Class names this file proves trivially constructible and destructible,
     /// so an automatic object of one opens no RAII boundary.
     trivial_types: &'targets TrivialTypeIndex,
+    /// Exact scalar representations proved once from this file's structured
+    /// type declarations. Ordinary C/C++ `int` and `long` remain absent.
+    scalar_types: &'targets CppScalarTypeIndex,
+    /// Function-like macros declared in this translation unit. A call through
+    /// one cannot inherit the ordinary call's exact control continuation.
+    function_like_macros: &'targets HashSet<Box<str>>,
+    /// Object-like macros declared in this translation unit. A condition that
+    /// names one has an unavailable replacement value and remains open.
+    object_like_macros: &'targets HashSet<Box<str>>,
+    /// Exact scalar type for each local or by-value parameter in this
+    /// procedure, used by guard normalization and update lowering.
+    scalar_bindings: HashMap<ValueId, DeclaredScalarType>,
     /// Bindings declared with a pointer declarator, whose `->` is the built-in
     /// indirection operator rather than a user-defined `operator->`.
     pointer_bindings: HashSet<ValueId>,
@@ -1329,6 +2423,17 @@ struct LoweringContext<'tree, 'targets> {
     /// Function definitions mounted from this exact artifact, available for
     /// joining a resolver-proven address-of-function target to its procedure.
     function_procedures: Arc<FunctionProcedureIndex>,
+    /// Names worth resolving for an exact local no-return target. This is a
+    /// per-file prefilter; the target's declaration and mounted procedure are
+    /// still checked before removing a call's normal continuation.
+    noreturn_function_names: &'targets HashSet<Box<str>>,
+    /// Call expressions whose function operand resolved to a structured C/C++
+    /// function declaration in the one per-file navigation batch.
+    resolved_call_ids: Arc<HashSet<usize>>,
+    /// One exact function declaration per resolved call when the batch had no
+    /// competing targets. C uses this normal call resolver because the C++
+    /// bounded receiver route deliberately declines plain C nodes.
+    resolved_function_targets: Arc<HashMap<usize, CodeUnit>>,
     /// Local bindings proved stable and initialized from one exact function.
     function_pointer_targets: HashMap<ValueId, ProcedureId>,
     /// The immutable syntax backing every node and source location in context.
@@ -1361,6 +2466,57 @@ struct LoweringContext<'tree, 'targets> {
     has_implicit_object_context: bool,
     raii_possible: bool,
     vla_possible: bool,
+}
+
+impl<'tree, 'targets> ProcedureWorkHandler<'tree> for LoweringContext<'tree, 'targets> {
+    fn cancellation_token(&self) -> &CancellationToken {
+        self.session.cancellation()
+    }
+
+    fn lower_statement(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: ControlTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<ProcedureWork<'tree>>,
+    ) -> Result<(), CppLoweringError> {
+        self.session.record_statement_entry(builder, node, entry)?;
+        self.statement(builder, node, entry, next, scope, stack)
+    }
+
+    fn lower_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: ControlTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<ProcedureWork<'tree>>,
+    ) -> Result<(), CppLoweringError> {
+        self.expression(builder, node, entry, next, scope, stack)
+    }
+
+    fn lower_condition(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        targets: ConditionTargets,
+        scope: ScopeFrameId,
+        stack: &mut Vec<ProcedureWork<'tree>>,
+    ) -> Result<(), CppLoweringError> {
+        self.condition(
+            builder,
+            node,
+            entry,
+            targets.when_true,
+            targets.when_false,
+            scope,
+            stack,
+        )
+    }
 }
 
 /// One structured heap location an access expression names, together with what
@@ -1455,8 +2611,15 @@ fn lower_procedure<'tree, 'targets>(
     file: &'targets ProjectFile,
     prepared: &'tree PreparedSyntaxTree,
     spec: &ProcedureSpec<'tree>,
+    ancestry: &'targets ParentIndex<'tree>,
     member_declarations: &'targets MemberDeclarations,
     trivial_types: &'targets TrivialTypeIndex,
+    scalar_types: &'targets CppScalarTypeIndex,
+    function_like_macros: &'targets HashSet<Box<str>>,
+    object_like_macros: &'targets HashSet<Box<str>>,
+    noreturn_function_names: &'targets HashSet<Box<str>>,
+    resolved_call_ids: Arc<HashSet<usize>>,
+    resolved_function_targets: Arc<HashMap<usize, CodeUnit>>,
     function_procedures: Arc<FunctionProcedureIndex>,
     budget: &'targets SemanticBudget,
     cancellation: &'targets CancellationToken,
@@ -1491,7 +2654,7 @@ fn lower_procedure<'tree, 'targets>(
         analyzer,
         file,
         source: prepared.source(),
-        ancestry: ParentIndex::new(prepared.tree().root_node()),
+        ancestry,
         session,
         expression_values: HashMap::default(),
         parameters: HashMap::default(),
@@ -1500,6 +2663,10 @@ fn lower_procedure<'tree, 'targets>(
         fundamental_bindings: HashSet::default(),
         member_declarations,
         trivial_types,
+        scalar_types,
+        function_like_macros,
+        object_like_macros,
+        scalar_bindings: HashMap::default(),
         pointer_bindings: HashSet::default(),
         array_bindings: HashSet::default(),
         fundamental_storage_bindings: HashSet::default(),
@@ -1507,6 +2674,9 @@ fn lower_procedure<'tree, 'targets>(
         binding_type_identities: HashMap::default(),
         binding_model_type_ids: HashMap::default(),
         function_procedures,
+        noreturn_function_names,
+        resolved_call_ids,
+        resolved_function_targets,
         function_pointer_targets: HashMap::default(),
         prepared_tree: prepared,
         implicit_move_return_parameters: HashSet::default(),
@@ -1516,7 +2686,12 @@ fn lower_procedure<'tree, 'targets>(
         constant_index_values: HashMap::default(),
         receiver: None,
         is_c_source,
-        return_transfer_is_exact: cpp_callable_return_transfer_is_exact(spec.callable, is_c_source),
+        return_transfer_is_exact: cpp_callable_return_transfer_is_exact(
+            spec.callable,
+            is_c_source,
+            prepared.source(),
+            scalar_types,
+        ),
         labels: HashMap::default(),
         switch_case_entries: HashMap::default(),
         published_gaps: HashSet::default(),
@@ -1533,7 +2708,7 @@ fn lower_procedure<'tree, 'targets>(
     context.return_model_type_id = cpp_callable_declaration_return_type_identity(
         spec.callable,
         context.source,
-        &context.ancestry,
+        context.ancestry,
     )
     .and_then(|identity| context.resolved_model_owner(&identity));
 
@@ -1762,8 +2937,12 @@ fn lower_procedure<'tree, 'targets>(
         )?;
     }
 
-    let body_entry = context.point(&mut builder, spec.body, Vec::new())?;
-    context.edge(&mut builder, entry, EdgeTarget::normal(body_entry))?;
+    let body_entry = context
+        .session
+        .add_node_point(&mut builder, spec.body, Vec::new())?;
+    context
+        .session
+        .add_target_edge(&mut builder, entry, EdgeTarget::normal(body_entry))?;
     let mut pending = vec![Work::Statement {
         node: spec.body,
         entry: body_entry,
@@ -1778,7 +2957,7 @@ fn lower_procedure<'tree, 'targets>(
         normal_exit,
         exceptional_exit,
         cancellation,
-        |builder, work, stack| context.step(builder, work, stack),
+        |builder, work, stack| dispatch_procedure_work(&mut context, builder, work, stack),
     )
 }
 
@@ -1823,7 +3002,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 .unwrap_or(callable);
             let mapping_node =
                 cpp_formal_name_node(declaration, self.source, &slot.names).unwrap_or(declaration);
-            let metadata = self.value_mapping(builder, mapping_node)?;
+            let metadata = self.session.add_value_mapping(builder, mapping_node)?;
             let parameter_name = slot.unique_name().map(Box::<str>::from);
             let passing_mode = slot.passing_mode;
             let value = if slot.receiver {
@@ -1849,16 +3028,38 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 ordinal = ordinal.checked_add(1).ok_or_else(|| {
                     CppLoweringError::Invalid("too many C++ formal parameters".into())
                 })?;
-                if cpp_declaration_value_transfer_is_exact(declaration, self.is_c_source) {
+                if cpp_declaration_value_transfer_is_exact(
+                    self.source,
+                    declaration,
+                    self.is_c_source,
+                    self.scalar_types,
+                ) || self
+                    .trivial_types
+                    .declaration_is_enum(self.source, declaration)
+                {
                     self.identity_bindings.insert(value);
                 }
-                if cpp_declaration_binds_fundamental_value(declaration) {
+                if cpp_declaration_binds_fundamental_value(declaration)
+                    || self
+                        .trivial_types
+                        .declaration_is_enum(self.source, declaration)
+                {
                     self.fundamental_bindings.insert(value);
                 }
                 if let Some(type_name) = declared_type_name(self.source, declaration) {
                     self.binding_type_names.insert(value, type_name);
                 }
                 if let Some(declarator) = declaration.child_by_field_name("declarator") {
+                    if let Some(scalar_type) = cpp_scalar_type_for_declaration(
+                        self.source,
+                        declaration,
+                        declarator,
+                        self.scalar_types,
+                    ) {
+                        self.scalar_bindings.insert(value, scalar_type);
+                        self.identity_bindings.insert(value);
+                        self.fundamental_bindings.insert(value);
+                    }
                     if cpp_parameter_is_nonconst_by_value(declaration, declarator, self.source) {
                         self.implicit_move_return_parameters.insert(value);
                     }
@@ -1866,7 +3067,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         declaration,
                         declarator,
                         self.source,
-                        &self.ancestry,
+                        self.ancestry,
                     ) {
                         if let Some(owner_id) = self.resolved_model_owner(&identity) {
                             self.binding_model_type_ids.insert(value, owner_id);
@@ -1930,7 +3131,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         }
 
         if self.receiver.is_none() && has_implicit_object_context {
-            let metadata = self.value_mapping(builder, callable)?;
+            let metadata = self.session.add_value_mapping(builder, callable)?;
             let receiver = self.session.add_value_with_metadata(
                 builder,
                 metadata,
@@ -1979,7 +3180,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let Some(name) = nonempty_node_text(self.source, function_pointer.name) else {
                     return Ok(WalkControl::Continue);
                 };
-                let metadata = self.value_mapping(builder, function_pointer.name)?;
+                let metadata = self
+                    .session
+                    .add_value_mapping(builder, function_pointer.name)?;
                 let value = self.session.add_value_with_metadata(
                     builder,
                     metadata,
@@ -2015,16 +3218,25 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let Some(name) = nonempty_node_text(self.source, name_node) else {
                     continue;
                 };
-                let metadata = self.value_mapping(builder, name_node)?;
+                let metadata = self.session.add_value_mapping(builder, name_node)?;
                 let value = self.session.add_value_with_metadata(
                     builder,
                     metadata,
                     SemanticValueKind::Local,
                 )?;
-                if cpp_value_transfer_is_exact(node, declarator, self.is_c_source) {
+                if cpp_value_transfer_is_exact(
+                    self.source,
+                    node,
+                    declarator,
+                    self.is_c_source,
+                    self.scalar_types,
+                ) || self.trivial_types.declaration_is_enum(self.source, node)
+                {
                     self.identity_bindings.insert(value);
                 }
-                if cpp_binding_is_fundamental(node, declarator) {
+                if cpp_binding_is_fundamental(node, declarator)
+                    || self.trivial_types.declaration_is_enum(self.source, node)
+                {
                     self.fundamental_bindings.insert(value);
                 }
                 if cpp_declarator_contains_kind(declarator, "array_declarator") {
@@ -2033,29 +3245,23 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 if cpp_declarator_contains_kind(declarator, "pointer_declarator") {
                     self.pointer_bindings.insert(value);
                 }
+                if let Some(scalar_type) = cpp_scalar_type_for_declaration(
+                    self.source,
+                    node,
+                    declarator,
+                    self.scalar_types,
+                ) {
+                    self.scalar_bindings.insert(value, scalar_type);
+                    self.identity_bindings.insert(value);
+                    self.fundamental_bindings.insert(value);
+                }
                 if node
                     .child_by_field_name("type")
                     .is_some_and(cpp_type_is_fundamental)
                 {
                     self.fundamental_storage_bindings.insert(value);
                 }
-                if let Some(type_name) = declared_type_name(self.source, node) {
-                    self.binding_type_names.insert(value, type_name);
-                }
-                if let Some(identity) =
-                    cpp_declaration_type_identity(node, declarator, self.source, &self.ancestry)
-                {
-                    if let Some(owner_id) = self.resolved_model_owner(&identity) {
-                        self.binding_model_type_ids.insert(value, owner_id);
-                    }
-                    if cpp_binding_return_selects_copy(node, declarator, &identity, self.source) {
-                        self.exact_copy_return_bindings.insert(value);
-                    }
-                    if cpp_declaration_is_const_qualified(node, self.source) {
-                        self.const_qualified_bindings.insert(value);
-                    }
-                    self.binding_type_identities.insert(value, identity);
-                }
+                self.record_declared_binding_type(value, node, declarator);
                 self.locals
                     .entry(name.into())
                     .or_default()
@@ -2089,31 +3295,25 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let Some(name) = nonempty_node_text(self.source, name_node) else {
             return Ok(());
         };
-        let metadata = self.value_mapping(builder, name_node)?;
+        let metadata = self.session.add_value_mapping(builder, name_node)?;
         let value =
             self.session
                 .add_value_with_metadata(builder, metadata, SemanticValueKind::Local)?;
         self.identity_bindings.insert(value);
-        if cpp_binding_is_fundamental(parameter, declarator) {
+        if let Some(scalar_type) =
+            cpp_scalar_type_for_declaration(self.source, parameter, declarator, self.scalar_types)
+        {
+            self.scalar_bindings.insert(value, scalar_type);
             self.fundamental_bindings.insert(value);
         }
-        if let Some(type_name) = declared_type_name(self.source, parameter) {
-            self.binding_type_names.insert(value, type_name);
-        }
-        if let Some(identity) =
-            cpp_declaration_type_identity(parameter, declarator, self.source, &self.ancestry)
+        if cpp_binding_is_fundamental(parameter, declarator)
+            || self
+                .trivial_types
+                .declaration_is_enum(self.source, parameter)
         {
-            if let Some(owner_id) = self.resolved_model_owner(&identity) {
-                self.binding_model_type_ids.insert(value, owner_id);
-            }
-            if cpp_binding_return_selects_copy(parameter, declarator, &identity, self.source) {
-                self.exact_copy_return_bindings.insert(value);
-            }
-            if cpp_declaration_is_const_qualified(parameter, self.source) {
-                self.const_qualified_bindings.insert(value);
-            }
-            self.binding_type_identities.insert(value, identity);
+            self.fundamental_bindings.insert(value);
         }
+        self.record_declared_binding_type(value, parameter, declarator);
         self.locals
             .entry(name.into())
             .or_default()
@@ -2127,28 +3327,54 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         Ok(())
     }
 
+    fn record_declared_binding_type(
+        &mut self,
+        value: ValueId,
+        declaration: Node<'tree>,
+        declarator: Node<'tree>,
+    ) {
+        if let Some(type_name) = declared_type_name(self.source, declaration) {
+            self.binding_type_names.insert(value, type_name);
+        }
+        if let Some(identity) =
+            cpp_declaration_type_identity(declaration, declarator, self.source, self.ancestry)
+        {
+            if let Some(owner_id) = self.resolved_model_owner(&identity) {
+                self.binding_model_type_ids.insert(value, owner_id);
+            }
+            if cpp_binding_return_selects_copy(declaration, declarator, &identity, self.source) {
+                self.exact_copy_return_bindings.insert(value);
+            }
+            if cpp_declaration_is_const_qualified(declaration, self.source) {
+                self.const_qualified_bindings.insert(value);
+            }
+            self.binding_type_identities.insert(value, identity);
+        }
+    }
+
     fn local_at(&self, name: &str, byte: usize) -> Option<ValueId> {
-        self.locals
-            .get(name)?
-            .iter()
-            .filter(|binding| {
-                binding.visible_from <= byte
-                    && binding.scope_start <= byte
-                    && byte < binding.scope_end
-            })
-            .min_by_key(|binding| {
+        crate::analyzer::common::visible_local_binding(
+            self.locals.get(name)?,
+            byte,
+            |binding| (binding.visible_from, binding.scope_start, binding.scope_end),
+            |binding, (_, scope_start, scope_end)| {
                 (
-                    binding.scope_end.saturating_sub(binding.scope_start),
+                    scope_end.saturating_sub(scope_start),
                     std::cmp::Reverse(binding.visible_from),
                 )
-            })
-            .map(|binding| binding.value)
+            },
+        )
+        .map(|binding| binding.value)
     }
 
     fn local_declaration_value(&self, name: &str, declaration_start: usize) -> Option<ValueId> {
-        self.locals.get(name)?.iter().find_map(|binding| {
-            (binding.declaration_start == declaration_start).then_some(binding.value)
-        })
+        crate::analyzer::common::local_value_for_declaration(
+            self.locals
+                .get(name)?
+                .iter()
+                .map(|binding| (binding.declaration_start, binding.value)),
+            declaration_start,
+        )
     }
 
     fn binding_value(&self, name: &str, byte: usize) -> Option<ValueId> {
@@ -2157,13 +3383,434 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     }
 
     fn binding_flow_kind(&self, name: &str, byte: usize, value: ValueId) -> ValueFlowKind {
-        if Some(value) == self.receiver {
-            ValueFlowKind::Receiver
-        } else if self.local_at(name, byte) == Some(value) {
-            ValueFlowKind::Local
-        } else {
-            ValueFlowKind::Parameter
+        crate::analyzer::semantic::lowering::binding_flow_kind(
+            value,
+            self.receiver,
+            self.local_at(name, byte),
+        )
+    }
+
+    fn scalar_binding_operand(
+        &self,
+        mut node: Node<'tree>,
+    ) -> Option<(ValueId, DeclaredScalarType)> {
+        while node.kind() == "parenthesized_expression" {
+            node = first_named_child(node)?;
         }
+        if node.kind() != "identifier" {
+            return None;
+        }
+        let name = nonempty_node_text(self.source, node)?;
+        let value = self.binding_value(name, node.start_byte())?;
+        self.scalar_bindings
+            .get(&value)
+            .copied()
+            .map(|scalar_type| (value, scalar_type))
+    }
+
+    fn normalize_condition(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+    ) -> Result<Option<(GuardPredicate, ValueId)>, CppLoweringError> {
+        let scalar_binding = self.scalar_binding_operand(node);
+        if scalar_binding
+            .is_some_and(|(_, scalar_type)| matches!(scalar_type, DeclaredScalarType::Boolean))
+        {
+            let subject =
+                self.expression_value(builder, node, cpp_expression_value_kind(self.source, node))?;
+            return Ok(Some((GuardPredicate::Truthy { value: subject }, subject)));
+        }
+        if node.kind() != "binary_expression" {
+            return Ok(None);
+        }
+        let (Some(operator), Some(raw_left), Some(raw_right)) = (
+            node.child_by_field_name("operator"),
+            node.child_by_field_name("left"),
+            node.child_by_field_name("right"),
+        ) else {
+            return Ok(None);
+        };
+        let mut left = raw_left;
+        let mut right = raw_right;
+        while left.kind() == "parenthesized_expression" {
+            left = first_named_child(left).ok_or(CppLoweringError::Invalid(
+                "parenthesized C++ condition has no operand".into(),
+            ))?;
+        }
+        while right.kind() == "parenthesized_expression" {
+            right = first_named_child(right).ok_or(CppLoweringError::Invalid(
+                "parenthesized C++ condition has no operand".into(),
+            ))?;
+        }
+        let operator = operator.kind();
+        let left_binding = self.scalar_binding_operand(left);
+        let right_binding = self.scalar_binding_operand(right);
+        if let (Some((left_value, left_type)), Some((right_value, right_type))) =
+            (left_binding, right_binding)
+            && left_value == right_value
+            && left_type == right_type
+        {
+            let value = match operator {
+                "<" | ">" | "!=" => false,
+                "<=" | ">=" | "==" => true,
+                _ => return Ok(None),
+            };
+            if matches!(
+                left_type,
+                DeclaredScalarType::Boolean
+                    if !matches!(operator, "==" | "!=")
+            ) {
+                return Ok(None);
+            }
+            return Ok(Some((
+                GuardPredicate::ConstantBoolean { value },
+                self.expression_value(builder, left, cpp_expression_value_kind(self.source, left))?,
+            )));
+        }
+
+        let (subject, subject_type, constant, reversed) = match (
+            left_binding,
+            right_binding,
+            cpp_expression_value_kind(self.source, left),
+            cpp_expression_value_kind(self.source, right),
+        ) {
+            (
+                Some((_, subject_type)),
+                None,
+                _,
+                SemanticValueKind::Boolean(_)
+                | SemanticValueKind::UnsignedInteger(_)
+                | SemanticValueKind::SignedInteger(_),
+            ) => (left, subject_type, right, false),
+            (
+                None,
+                Some((_, subject_type)),
+                SemanticValueKind::Boolean(_)
+                | SemanticValueKind::UnsignedInteger(_)
+                | SemanticValueKind::SignedInteger(_),
+                _,
+            ) => (right, subject_type, left, true),
+            _ => return Ok(None),
+        };
+        let constant_kind = cpp_expression_value_kind(self.source, constant);
+        let subject_is_integer = matches!(
+            subject_type,
+            DeclaredScalarType::Signed(_) | DeclaredScalarType::Unsigned(_)
+        );
+        let subject_is_boolean = subject_type == DeclaredScalarType::Boolean;
+        let constant_is_integer = matches!(
+            constant_kind,
+            SemanticValueKind::UnsignedInteger(_) | SemanticValueKind::SignedInteger(_)
+        );
+        let constant_is_boolean = matches!(constant_kind, SemanticValueKind::Boolean(_));
+        let constant = self.expression_value(builder, constant, constant_kind)?;
+        let predicate = if subject_is_boolean && constant_is_boolean {
+            match operator {
+                "==" => GuardPredicate::ConstantEquality {
+                    negated: false,
+                    constant,
+                },
+                "!=" => GuardPredicate::ConstantEquality {
+                    negated: true,
+                    constant,
+                },
+                _ => return Ok(None),
+            }
+        } else if subject_is_integer && constant_is_integer {
+            let relation = match operator {
+                "<" => Some(IntegerComparison::LessThan),
+                "<=" => Some(IntegerComparison::LessThanOrEqual),
+                ">" => Some(IntegerComparison::GreaterThan),
+                ">=" => Some(IntegerComparison::GreaterThanOrEqual),
+                _ => None,
+            };
+            match (relation, operator) {
+                (Some(relation), _) => GuardPredicate::OrderedIntegerComparison {
+                    relation: if reversed {
+                        relation.reverse()
+                    } else {
+                        relation
+                    },
+                    constant,
+                },
+                (None, "==") => GuardPredicate::ConstantEquality {
+                    negated: false,
+                    constant,
+                },
+                (None, "!=") => GuardPredicate::ConstantEquality {
+                    negated: true,
+                    constant,
+                },
+                (None, _) => return Ok(None),
+            }
+        } else {
+            return Ok(None);
+        };
+        let subject = self.expression_value(
+            builder,
+            subject,
+            cpp_expression_value_kind(self.source, subject),
+        )?;
+        Ok(Some((predicate, subject)))
+    }
+
+    fn integral_update_target(
+        &self,
+        node: Node<'tree>,
+    ) -> Option<(Node<'tree>, ValueId, ValueFlowKind)> {
+        if node.kind() != "update_expression" {
+            return None;
+        }
+        let operand = node
+            .child_by_field_name("argument")
+            .or_else(|| first_named_child(node))?;
+        let operand = {
+            let mut current = operand;
+            while current.kind() == "parenthesized_expression" {
+                current = first_named_child(current)?;
+            }
+            current
+        };
+        let name = nonempty_node_text(self.source, operand)?;
+        if operand.kind() != "identifier" {
+            return None;
+        }
+        let target = self.binding_value(name, operand.start_byte())?;
+        matches!(
+            self.scalar_bindings.get(&target),
+            Some(DeclaredScalarType::Signed(_) | DeclaredScalarType::Unsigned(_))
+        )
+        .then_some((
+            operand,
+            target,
+            self.binding_flow_kind(name, operand.start_byte(), target),
+        ))
+    }
+
+    fn fundamental_binding_target(
+        &self,
+        node: Node<'tree>,
+    ) -> Option<(Node<'tree>, ValueId, ValueFlowKind)> {
+        let mut node = node;
+        while node.kind() == "parenthesized_expression" {
+            node = first_named_child(node)?;
+        }
+        if node.kind() != "identifier" {
+            return None;
+        }
+        let name = nonempty_node_text(self.source, node)?;
+        let target = self.binding_value(name, node.start_byte())?;
+        self.fundamental_bindings.contains(&target).then_some((
+            node,
+            target,
+            self.binding_flow_kind(name, node.start_byte(), target),
+        ))
+    }
+
+    fn fundamental_update_target(
+        &self,
+        node: Node<'tree>,
+    ) -> Option<(Node<'tree>, ValueId, ValueFlowKind)> {
+        if node.kind() != "update_expression" {
+            return None;
+        }
+        let operand = node
+            .child_by_field_name("argument")
+            .or_else(|| first_named_child(node))?;
+        self.fundamental_binding_target(operand)
+    }
+
+    fn integral_compound_offset(
+        &self,
+        node: Node<'tree>,
+    ) -> Option<(Node<'tree>, ValueId, ValueFlowKind, SignedIntegerMagnitude)> {
+        if node.kind() != "assignment_expression" {
+            return None;
+        }
+        let operator = assignment_operator(node)?;
+        let subtract = match operator {
+            "+=" => false,
+            "-=" => true,
+            _ => return None,
+        };
+        let left = node.child_by_field_name("left")?;
+        let (left, target, flow_kind) = self.integral_binding_target(left)?;
+        let right = node.child_by_field_name("right")?;
+        let right_kind = cpp_expression_value_kind(self.source, right);
+        let (rhs_negative, magnitude) = match right_kind {
+            SemanticValueKind::UnsignedInteger(value) => (false, value),
+            SemanticValueKind::SignedInteger(value) => (value < 0, value.unsigned_abs()),
+            _ => return None,
+        };
+        Some((
+            left,
+            target,
+            flow_kind,
+            SignedIntegerMagnitude::new(subtract != rhs_negative, magnitude),
+        ))
+    }
+
+    fn integral_binding_target(
+        &self,
+        node: Node<'tree>,
+    ) -> Option<(Node<'tree>, ValueId, ValueFlowKind)> {
+        let mut node = node;
+        while node.kind() == "parenthesized_expression" {
+            node = first_named_child(node)?;
+        }
+        if node.kind() != "identifier" {
+            return None;
+        }
+        let name = nonempty_node_text(self.source, node)?;
+        let target = self.binding_value(name, node.start_byte())?;
+        matches!(
+            self.scalar_bindings.get(&target),
+            Some(DeclaredScalarType::Signed(_) | DeclaredScalarType::Unsigned(_))
+        )
+        .then_some((
+            node,
+            target,
+            self.binding_flow_kind(name, node.start_byte(), target),
+        ))
+    }
+
+    fn integral_update(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), CppLoweringError> {
+        let (operand, target, flow_kind) = self
+            .integral_update_target(node)
+            .expect("an integral update has a lowered scalar target");
+        let operator = node
+            .child_by_field_name("operator")
+            .ok_or_else(|| missing_field(node, "operator"))?;
+        let operation = self.session.add_node_point(builder, node, Vec::new())?;
+        let terminal = self.session.add_node_point(builder, node, Vec::new())?;
+        let old = self.expression_value(builder, operand, SemanticValueKind::Temporary)?;
+        let computed = self.value(builder, terminal, SemanticValueKind::Temporary)?;
+        let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
+        self.append_effect(
+            builder,
+            terminal,
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::IntegerOffset {
+                    offset: SignedIntegerMagnitude::new(operator.kind() == "--", 1),
+                },
+                source: old,
+                target: computed,
+            },
+        )?;
+        self.append_effect(
+            builder,
+            terminal,
+            SemanticEffect::Assignment {
+                target,
+                value: computed,
+            },
+        )?;
+        self.append_effect(
+            builder,
+            terminal,
+            SemanticEffect::ValueFlow {
+                kind: flow_kind,
+                source: computed,
+                target,
+            },
+        )?;
+        let postfix = operator.start_byte() > operand.start_byte();
+        self.append_effect(
+            builder,
+            terminal,
+            SemanticEffect::Assignment {
+                target: result,
+                value: if postfix { old } else { computed },
+            },
+        )?;
+        self.session
+            .add_target_edge(builder, operation, EdgeTarget::normal(terminal))?;
+        self.session.add_target_edge(builder, terminal, next)?;
+        self.schedule_expressions(
+            builder,
+            entry,
+            &[operand],
+            EdgeTarget::normal(operation),
+            scope,
+            stack,
+        )
+    }
+
+    fn fundamental_update(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), CppLoweringError> {
+        let (operand, target, flow_kind) = self
+            .fundamental_update_target(node)
+            .expect("a fundamental update has a lowered binding target");
+        let operator = node
+            .child_by_field_name("operator")
+            .ok_or_else(|| missing_field(node, "operator"))?;
+        let operation = self.session.add_node_point(builder, node, Vec::new())?;
+        let terminal = self.session.add_node_point(builder, node, Vec::new())?;
+        let old = self.expression_value(builder, operand, SemanticValueKind::Temporary)?;
+        let computed = self.value(builder, terminal, SemanticValueKind::Temporary)?;
+        let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
+        self.append_effect(
+            builder,
+            terminal,
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::LanguageDefined,
+                source: old,
+                target: computed,
+            },
+        )?;
+        self.append_effect(
+            builder,
+            terminal,
+            SemanticEffect::Assignment {
+                target,
+                value: computed,
+            },
+        )?;
+        self.append_effect(
+            builder,
+            terminal,
+            SemanticEffect::ValueFlow {
+                kind: flow_kind,
+                source: computed,
+                target,
+            },
+        )?;
+        let postfix = operator.start_byte() > operand.start_byte();
+        self.append_effect(
+            builder,
+            terminal,
+            SemanticEffect::Assignment {
+                target: result,
+                value: if postfix { old } else { computed },
+            },
+        )?;
+        self.session
+            .add_target_edge(builder, operation, EdgeTarget::normal(terminal))?;
+        self.session.add_target_edge(builder, terminal, next)?;
+        self.schedule_expressions(
+            builder,
+            entry,
+            &[operand],
+            EdgeTarget::normal(operation),
+            scope,
+            stack,
+        )
     }
 
     /// Prove a local function-pointer binding denotes one exact function.
@@ -2354,6 +4001,44 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let definition = self.exact_function_definition(target)?;
         self.function_procedures
             .exact_procedure(self.analyzer, self.file, &definition)
+    }
+
+    fn exact_noreturn_target(&self, call: Node<'tree>, target: Node<'tree>) -> Option<ProcedureId> {
+        let name = nonempty_node_text(self.source, target)?;
+        if target.kind() != "identifier" || !self.noreturn_function_names.contains(name) {
+            return None;
+        }
+        // A local function-pointer parameter or variable shadows a same-named
+        // no-return function. The bounded resolver must prove the declaration
+        // target rather than letting the file-wide name prefilter decide it.
+        if self.binding_value(name, target.start_byte()).is_some() {
+            return None;
+        }
+        if self.is_c_source {
+            let definition = self.resolved_function_targets.get(&call.id())?;
+            self.function_procedures
+                .exact_procedure(self.analyzer, self.file, definition)
+        } else {
+            self.exact_function_target(target)
+        }
+    }
+
+    /// Whether a condition names an object-like macro declared in this
+    /// translation unit. The replacement value is not present in the
+    /// structured expression tree, so retaining the condition as exact would
+    /// publish a branch fact for a value the adapter cannot prove.
+    fn condition_uses_object_like_macro(&self, root: Node<'tree>) -> bool {
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "identifier"
+                && nonempty_node_text(self.source, node)
+                    .is_some_and(|name| self.object_like_macros.contains(name))
+            {
+                return true;
+            }
+            stack.extend(named_children(node));
+        }
+        false
     }
 
     fn exact_function_definition(&self, target: Node<'tree>) -> Option<CodeUnit> {
@@ -2721,13 +4406,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     /// The bound object a written receiver names, together with the exact
     /// modeled owner of its declared type.
     fn modeled_receiver_binding(&self, receiver: Node<'tree>) -> Option<(ValueId, Box<str>)> {
-        if receiver.kind() != "identifier" {
-            return None;
-        }
-        let name = nonempty_node_text(self.source, receiver)?;
-        let value = self.binding_value(name, receiver.start_byte())?;
-        let owner = self.binding_model_type_ids.get(&value)?;
-        Some((value, owner.clone()))
+        let (value, owner) = self.modeled_binding(receiver)?;
+        Some((value, owner.into()))
     }
 
     /// A relative namespace name can be rebound by a local namespace or
@@ -2891,13 +4571,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     /// declared type is the same exact modeled owner as the declared return
     /// type.
     fn returned_binding_of_model_return_type(&self, returned: Node<'tree>) -> Option<ValueId> {
-        if returned.kind() != "identifier" {
+        let (source, owner) = self.modeled_binding(returned)?;
+        (self.return_model_type_id.as_deref() == Some(owner)).then_some(source)
+    }
+
+    fn modeled_binding(&self, node: Node<'tree>) -> Option<(ValueId, &str)> {
+        if node.kind() != "identifier" {
             return None;
         }
-        let name = nonempty_node_text(self.source, returned)?;
-        let source = self.binding_value(name, returned.start_byte())?;
-        let return_owner = self.return_model_type_id.as_ref()?;
-        (self.binding_model_type_ids.get(&source) == Some(return_owner)).then_some(source)
+        let name = nonempty_node_text(self.source, node)?;
+        let value = self.binding_value(name, node.start_byte())?;
+        Some((value, self.binding_model_type_ids.get(&value)?.as_ref()))
     }
 
     fn modeled_transfer_locator(
@@ -2959,9 +4643,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     ) -> Result<(), CppLoweringError> {
         let locator = self.modeled_transfer_locator(&transfer)?;
         let resolution = CallableTargetResolution::Proven(CallableTarget::External(locator));
-        let callee = self.source_value(builder, operation_node, SemanticValueKind::Callable)?;
-        let thrown = self.source_value(builder, operation_node, SemanticValueKind::Exception)?;
-        let exceptional = self.point(builder, operation_node, Vec::new())?;
+        let callee =
+            self.session
+                .add_node_value(builder, operation_node, SemanticValueKind::Callable)?;
+        let thrown =
+            self.session
+                .add_node_value(builder, operation_node, SemanticValueKind::Exception)?;
+        let exceptional = self
+            .session
+            .add_node_point(builder, operation_node, Vec::new())?;
         let metadata = self.metadata(point)?;
         let (callable_kind, bound_receiver) = match transfer.operation {
             ExactModeledOperation::CopyConstructor
@@ -3036,7 +4726,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 },
             )?;
         }
-        self.edge(
+        self.session.add_target_edge(
             builder,
             point,
             EdgeTarget {
@@ -3053,31 +4743,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         node: Node<'tree>,
         kind: SemanticValueKind,
     ) -> Result<ValueId, CppLoweringError> {
-        if let Some(value) = self.expression_values.get(&node.id()) {
-            return Ok(*value);
-        }
-        let metadata = self.value_mapping(builder, node)?;
-        let value = self.session.insert_cached_value_with_metadata(
+        self.session.cached_node_value(
             builder,
             &mut self.expression_values,
-            node.id(),
-            metadata,
+            node,
             kind,
-        )?;
-        Ok(value)
+            |session, builder, node| session.add_value_mapping(builder, node),
+        )
     }
-
-    fn source_value(
-        &mut self,
-        builder: &mut ProcedureCfgBuilder,
-        node: Node<'tree>,
-        kind: SemanticValueKind,
-    ) -> Result<ValueId, CppLoweringError> {
-        let metadata = self.value_mapping(builder, node)?;
-        self.session
-            .add_value_with_metadata(builder, metadata, kind)
-    }
-
     /// Whether every leaf of `node` is provably of fundamental type, so the
     /// whole expression is built out of built-in operators only.
     ///
@@ -3241,17 +4914,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let Some(source) = self.binding_value(name, node.start_byte()) else {
             return Ok(());
         };
-        if source != target {
-            self.append_effect(
-                builder,
-                point,
-                SemanticEffect::ValueFlow {
-                    kind: self.binding_flow_kind(name, node.start_byte(), source),
-                    source,
-                    target,
-                },
-            )?;
-        }
+        self.session.append_value_flow_if_distinct(
+            builder,
+            point,
+            self.binding_flow_kind(name, node.start_byte(), source),
+            source,
+            target,
+        )?;
         Ok(())
     }
 
@@ -3404,7 +5073,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             identity: if !self.base_is_array(base) {
                 MemoryIdentity::UserDefinedAccessor
             } else if subscript.is_some_and(|subscript| {
-                cpp_expression_value_kind(subscript) == SemanticValueKind::Constant
+                cpp_expression_value_kind(self.source, subscript).is_constant()
             }) {
                 MemoryIdentity::Resolved
             } else {
@@ -3420,8 +5089,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         builder: &mut ProcedureCfgBuilder,
         node: Node<'tree>,
     ) -> Result<ValueId, CppLoweringError> {
-        let kind = cpp_expression_value_kind(node);
-        if kind != SemanticValueKind::Constant {
+        let kind = cpp_expression_value_kind(self.source, node);
+        if !kind.is_constant() {
             return self.expression_value(builder, node, kind);
         }
         let Some(text) = nonempty_node_text(self.source, node) else {
@@ -3463,7 +5132,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         {
             return Ok(None);
         }
-        self.expression_value(builder, base, cpp_expression_value_kind(base))
+        self.expression_value(builder, base, cpp_expression_value_kind(self.source, base))
             .map(Some)
     }
 
@@ -3513,7 +5182,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             owner: Box::from(owner),
             name: Box::from(name),
         };
-        self.member_declarations.get(&key)?.clone()
+        unique_map_value(self.member_declarations, &key)
     }
 
     /// Anchor a member location to its *declaration* when one is known, so two
@@ -3529,14 +5198,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             None => source_anchor(occurrence, 0).map_err(CppLoweringError::Invalid)?,
         };
         let procedure = self.session.locator();
-        Ok(SemanticLocator::new(
-            procedure.mount(),
-            procedure.path().clone(),
-            procedure.language(),
-            procedure.declaration().clone(),
-            SemanticRole::MemoryLocation,
-            anchor,
-        ))
+        Ok(procedure.memory_location_at(anchor))
     }
 
     /// Publish a read of a member or an element as a `MemoryLoad` into the
@@ -3554,7 +5216,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let Some(load) = self.memory_access_target(builder, point, access)? else {
             return self.decline_unstructured_access(builder, point, access);
         };
-        let result = self.expression_value(builder, access, cpp_expression_value_kind(access))?;
+        let result = self.expression_value(
+            builder,
+            access,
+            cpp_expression_value_kind(self.source, access),
+        )?;
         self.append_effect(
             builder,
             point,
@@ -3656,7 +5322,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         point: ProgramPointId,
         access: Node<'tree>,
     ) -> Result<(), CppLoweringError> {
-        let result = self.expression_value(builder, access, cpp_expression_value_kind(access))?;
+        let result = self.expression_value(
+            builder,
+            access,
+            cpp_expression_value_kind(self.source, access),
+        )?;
         let (capability, detail) = if access.kind() == "subscript_expression" {
             (
                 SemanticCapability::IndexMemory,
@@ -3796,7 +5466,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     let source = self.expression_value(
                         builder,
                         initializer,
-                        cpp_expression_value_kind(initializer),
+                        cpp_expression_value_kind(self.source, initializer),
                     )?;
                     self.append_effect(
                         builder,
@@ -3839,7 +5509,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     let source = self.expression_value(
                         builder,
                         initializer,
-                        cpp_expression_value_kind(initializer),
+                        cpp_expression_value_kind(self.source, initializer),
                     )?;
                     self.exact_modeled_character_data_construction(&owner_id, initializer, source)
                 } else {
@@ -3892,38 +5562,6 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         )
     }
 
-    fn step(
-        &mut self,
-        builder: &mut ProcedureCfgBuilder,
-        work: Work<'tree>,
-        stack: &mut Vec<Work<'tree>>,
-    ) -> Result<(), CppLoweringError> {
-        if self.session.cancellation().is_cancelled() {
-            return Err(CppLoweringError::Cancelled(Box::default()));
-        }
-        match work {
-            Work::Statement {
-                node,
-                entry,
-                next,
-                scope,
-            } => self.statement(builder, node, entry, next, scope, stack),
-            Work::Expression {
-                node,
-                entry,
-                next,
-                scope,
-            } => self.expression(builder, node, entry, next, scope, stack),
-            Work::Condition {
-                node,
-                entry,
-                when_true,
-                when_false,
-                scope,
-            } => self.condition(builder, node, entry, when_true, when_false, scope, stack),
-        }
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn condition(
         &mut self,
@@ -3935,12 +5573,22 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), CppLoweringError> {
+        if self.condition_uses_object_like_macro(node) {
+            self.add_gap(
+                builder,
+                entry,
+                SemanticGapSubject::Point,
+                SemanticCapability::NormalControlFlow,
+                SemanticGapKind::Unsupported,
+                "object-like macro replacement may change the condition",
+            )?;
+        }
         // A folded literal keeps exactly one arm. Recording the guard is what
         // keeps the fold legible: nothing else in the frozen artifact says the
         // branch was constant (#2443).
         if let Some(value) = cpp_folded_boolean_constant(self.source, node) {
             let taken = if value { when_true } else { when_false };
-            self.edge(builder, entry, taken)?;
+            self.session.add_target_edge(builder, entry, taken)?;
             return self.record_guard(
                 builder,
                 entry,
@@ -3951,57 +5599,40 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             );
         }
         match (node.kind(), binary_operator(node)) {
-            ("binary_expression", Some("&&")) => {
+            ("binary_expression", Some(operator @ ("&&" | "||"))) => {
                 let left = required_field(node, "left")?;
                 let right = required_field(node, "right")?;
-                let right_entry = self.point(builder, right, Vec::new())?;
-                stack.push(Work::Condition {
-                    node: right,
-                    entry: right_entry,
+                let right_entry = self.session.add_node_point(builder, right, Vec::new())?;
+                let kind = match operator {
+                    "&&" => ShortCircuitKind::And,
+                    "||" => ShortCircuitKind::Or,
+                    _ => unreachable!("the match arm selects C/C++ boolean operators"),
+                };
+                schedule_short_circuit_condition(
+                    stack,
+                    kind,
+                    (left, entry),
+                    (right, right_entry),
                     when_true,
                     when_false,
                     scope,
-                });
-                stack.push(Work::Condition {
-                    node: left,
-                    entry,
-                    when_true: EdgeTarget {
-                        point: right_entry,
-                        kind: ControlEdgeKind::ConditionalTrue,
+                    |node, entry, when_true, when_false, scope| Work::Condition {
+                        node,
+                        entry,
+                        when_true,
+                        when_false,
+                        scope,
                     },
-                    when_false,
-                    scope,
-                });
-                Ok(())
-            }
-            ("binary_expression", Some("||")) => {
-                let left = required_field(node, "left")?;
-                let right = required_field(node, "right")?;
-                let right_entry = self.point(builder, right, Vec::new())?;
-                stack.push(Work::Condition {
-                    node: right,
-                    entry: right_entry,
-                    when_true,
-                    when_false,
-                    scope,
-                });
-                stack.push(Work::Condition {
-                    node: left,
-                    entry,
-                    when_true,
-                    when_false: EdgeTarget {
-                        point: right_entry,
-                        kind: ControlEdgeKind::ConditionalFalse,
-                    },
-                    scope,
-                });
+                );
                 Ok(())
             }
             ("conditional_expression", _) => {
                 let predicate = required_field(node, "condition")?;
                 let consequence = node.child_by_field_name("consequence");
                 let alternative = required_field(node, "alternative")?;
-                let alternative_entry = self.point(builder, alternative, Vec::new())?;
+                let alternative_entry =
+                    self.session
+                        .add_node_point(builder, alternative, Vec::new())?;
                 stack.push(Work::Condition {
                     node: alternative,
                     entry: alternative_entry,
@@ -4010,7 +5641,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     scope,
                 });
                 let true_target = if let Some(consequence) = consequence {
-                    let consequence_entry = self.point(builder, consequence, Vec::new())?;
+                    let consequence_entry =
+                        self.session
+                            .add_node_point(builder, consequence, Vec::new())?;
                     stack.push(Work::Condition {
                         node: consequence,
                         entry: consequence_entry,
@@ -4041,7 +5674,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             ("condition_clause", _) => {
                 let value = required_field(node, "value")?;
                 if let Some(initializer) = node.child_by_field_name("initializer") {
-                    let value_entry = self.point(builder, value, Vec::new())?;
+                    let value_entry = self.session.add_node_point(builder, value, Vec::new())?;
                     stack.push(Work::Condition {
                         node: value,
                         entry: value_entry,
@@ -4067,7 +5700,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 Ok(())
             }
             ("declaration", _) => {
-                let decision = self.point(builder, node, Vec::new())?;
+                let decision = self.session.add_node_point(builder, node, Vec::new())?;
                 if self.declaration_runs_lifetime_code(node) {
                     self.add_implicit_operator_gaps(
                         builder,
@@ -4075,8 +5708,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         "contextual conversion of a condition-declared object to bool may invoke user-defined code",
                     )?;
                 }
-                self.edge(builder, decision, when_true)?;
-                self.edge(builder, decision, when_false)?;
+                self.session.add_target_edge(builder, decision, when_true)?;
+                self.session
+                    .add_target_edge(builder, decision, when_false)?;
                 self.record_guard(
                     builder,
                     decision,
@@ -4106,21 +5740,59 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 });
                 Ok(())
             }
+            ("unary_expression", _)
+                if node
+                    .child_by_field_name("operator")
+                    .is_some_and(|operator| operator.kind() == "!")
+                    && node
+                        .child_by_field_name("argument")
+                        .or_else(|| first_named_child(node))
+                        .and_then(|operand| self.scalar_binding_operand(operand))
+                        .is_some_and(|(_, scalar_type)| {
+                            scalar_type == DeclaredScalarType::Boolean
+                        }) =>
+            {
+                let operand = node
+                    .child_by_field_name("argument")
+                    .or_else(|| first_named_child(node))
+                    .ok_or_else(|| missing_field(node, "argument"))?;
+                stack.push(Work::Condition {
+                    node: operand,
+                    entry,
+                    when_true: when_false,
+                    when_false: when_true,
+                    scope,
+                });
+                Ok(())
+            }
             _ => {
-                let decision = self.point(builder, node, Vec::new())?;
-                self.edge(builder, decision, when_true)?;
-                self.edge(builder, decision, when_false)?;
-                // The condition's own value is the one thing an unnormalized
-                // guard can honestly name: the decision tested it, whatever it
-                // means.
-                let subject =
-                    self.expression_value(builder, node, cpp_expression_value_kind(node))?;
+                let decision = self.session.add_node_point(builder, node, Vec::new())?;
+                self.session.add_target_edge(builder, decision, when_true)?;
+                self.session
+                    .add_target_edge(builder, decision, when_false)?;
+                let (predicate, subject) =
+                    if let Some(normalized) = self.normalize_condition(builder, node)? {
+                        normalized
+                    } else {
+                        // The condition's own value is the one thing an
+                        // unnormalized guard can honestly name: the decision
+                        // tested it, whatever it means.
+                        let subject = self.expression_value(
+                            builder,
+                            node,
+                            cpp_expression_value_kind(self.source, node),
+                        )?;
+                        (
+                            GuardPredicate::Opaque {
+                                digest: GuardConditionDigest::from_syntax_kind(node.kind()),
+                            },
+                            subject,
+                        )
+                    };
                 self.record_guard(
                     builder,
                     decision,
-                    GuardPredicate::Opaque {
-                        digest: GuardConditionDigest::from_syntax_kind(node.kind()),
-                    },
+                    predicate,
                     Some(subject),
                     Some(when_true),
                     Some(when_false),
@@ -4150,20 +5822,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         when_true: Option<EdgeTarget>,
         when_false: Option<EdgeTarget>,
     ) -> Result<(), CppLoweringError> {
-        let arm = |target: Option<EdgeTarget>| {
-            target.map(|target| GuardArm {
-                target_point: target.point,
-                kind: target.kind,
-            })
-        };
-        self.session.add_guard_fact(
-            builder,
-            point,
-            predicate,
-            subject,
-            arm(when_true),
-            arm(when_false),
-        )?;
+        self.session
+            .add_guard_for_targets(builder, point, predicate, subject, when_true, when_false)?;
         Ok(())
     }
 
@@ -4195,7 +5855,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let has_vla_cleanup =
                     nested_scope && self.is_c_source && block_has_potential_vla(node);
                 if has_raii_cleanup || has_vla_cleanup {
-                    let scope_exit = self.point(builder, node, Vec::new())?;
+                    let scope_exit = self.session.add_node_point(builder, node, Vec::new())?;
                     if has_raii_cleanup {
                         self.add_raii_gaps(
                             builder,
@@ -4211,7 +5871,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                             "normal block exit may release variably modified automatic array storage declared in this lexical scope",
                         )?;
                     }
-                    self.edge(builder, scope_exit, next)?;
+                    self.session.add_target_edge(builder, scope_exit, next)?;
                     self.schedule_execution_nodes(
                         builder,
                         entry,
@@ -4234,11 +5894,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         let target = self
                             .local_declaration_value(name, function_pointer.name.start_byte())
                             .ok_or_else(|| missing_field(expression, "local binding"))?;
-                        let terminal = self.point(builder, expression, Vec::new())?;
+                        let terminal =
+                            self.session
+                                .add_node_point(builder, expression, Vec::new())?;
                         let value = self.expression_value(
                             builder,
                             function_pointer.initializer,
-                            cpp_expression_value_kind(function_pointer.initializer),
+                            cpp_expression_value_kind(self.source, function_pointer.initializer),
                         )?;
                         self.append_effect(
                             builder,
@@ -4254,7 +5916,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                                 target,
                             },
                         )?;
-                        self.edge(builder, terminal, next)?;
+                        self.session.add_target_edge(builder, terminal, next)?;
                         stack.push(Work::Expression {
                             node: function_pointer.initializer,
                             entry,
@@ -4271,7 +5933,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     });
                     Ok(())
                 } else {
-                    self.edge(builder, entry, next)
+                    self.session.add_target_edge(builder, entry, next)
                 }
             }
             "init_statement" => {
@@ -4352,9 +6014,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     )
                 } else {
                     let terminal = if node.kind() == "declaration" {
-                        let terminal = self.point(builder, node, Vec::new())?;
+                        let terminal = self.session.add_node_point(builder, node, Vec::new())?;
                         self.emit_declaration_identity(builder, node, terminal, next, scope)?;
-                        self.edge(builder, terminal, next)?;
+                        self.session.add_target_edge(builder, terminal, next)?;
                         Some(terminal)
                     } else {
                         None
@@ -4372,11 +6034,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "return_statement" | "co_return_statement" => {
                 let value_node = first_runtime_named_child(node);
                 let terminal = if let Some(value_node) = value_node {
-                    let terminal = self.point(builder, node, Vec::new())?;
+                    let terminal = self.session.add_node_point(builder, node, Vec::new())?;
                     let source = self.expression_value(
                         builder,
                         value_node,
-                        cpp_expression_value_kind(value_node),
+                        cpp_expression_value_kind(self.source, value_node),
                     )?;
                     let value = self.value(builder, terminal, SemanticValueKind::Return)?;
                     // Only a `return` whose declared return type introduces a
@@ -4398,7 +6060,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         })
                         .flatten();
                     let expression_continuation = if let Some(transfer) = exact_return_transfer {
-                        let transfer_point = self.point(builder, value_node, Vec::new())?;
+                        let transfer_point =
+                            self.session
+                                .add_node_point(builder, value_node, Vec::new())?;
                         let transferred =
                             self.value(builder, transfer_point, SemanticValueKind::Temporary)?;
                         self.emit_exact_modeled_transfer(
@@ -4411,7 +6075,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                             None,
                             transfer,
                         )?;
-                        self.edge(builder, transfer_point, EdgeTarget::normal(terminal))?;
+                        self.session.add_target_edge(
+                            builder,
+                            transfer_point,
+                            EdgeTarget::normal(terminal),
+                        )?;
                         self.append_effect(
                             builder,
                             terminal,
@@ -4481,7 +6149,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "throw_statement" => {
                 let value_node = first_runtime_named_child(node);
                 let terminal = if value_node.is_some() {
-                    self.point(builder, node, Vec::new())?
+                    self.session.add_node_point(builder, node, Vec::new())?
                 } else {
                     entry
                 };
@@ -4502,7 +6170,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     let thrown = self.expression_value(
                         builder,
                         value_node,
-                        cpp_expression_value_kind(value_node),
+                        cpp_expression_value_kind(self.source, value_node),
                     )?;
                     self.append_effect(
                         builder,
@@ -4545,6 +6213,18 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
             "goto_statement" => self.goto_statement(builder, node, entry),
             "labeled_statement" => {
+                if self.is_cpp_access_specifier_label(node) {
+                    let label = required_field(node, "label")?;
+                    let body = named_children(node)
+                        .into_iter()
+                        .find(|child| child.id() != label.id());
+                    if let Some(body) = body {
+                        stack.push(self.execution_work(body, entry, next, scope));
+                    } else {
+                        self.session.add_target_edge(builder, entry, next)?;
+                    }
+                    return Ok(());
+                }
                 let label = required_field(node, "label")?;
                 let label_name = node_text(self.source, label)
                     .ok_or_else(|| missing_field(node, "label text"))?;
@@ -4553,7 +6233,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         "preallocated C/C++ label {label_name:?} is missing"
                     ))
                 })?;
-                self.edge(builder, entry, EdgeTarget::normal(target))?;
+                self.session
+                    .add_target_edge(builder, entry, EdgeTarget::normal(target))?;
                 let body = named_children(node)
                     .into_iter()
                     .find(|child| child.id() != label.id())
@@ -4574,7 +6255,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "try_statement" => self.try_statement(builder, node, entry, next, scope, stack),
             "co_yield_statement" => {
                 let value = first_runtime_named_child(node);
-                let suspend = self.point(builder, node, Vec::new())?;
+                let suspend = self.session.add_node_point(builder, node, Vec::new())?;
                 self.add_coroutine_gap(
                     builder,
                     suspend,
@@ -4588,7 +6269,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     SemanticGapKind::Unsupported,
                     "co_yield suspension and repeated resumption are not represented",
                 )?;
-                self.edge(builder, suspend, next)?;
+                self.session.add_target_edge(builder, suspend, next)?;
                 if let Some(value) = value {
                     stack.push(Work::Expression {
                         node: value,
@@ -4597,7 +6278,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         scope,
                     });
                 } else {
-                    self.edge(builder, entry, EdgeTarget::normal(suspend))?;
+                    self.session
+                        .add_target_edge(builder, entry, EdgeTarget::normal(suspend))?;
                 }
                 Ok(())
             }
@@ -4611,7 +6293,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     stack.push(self.execution_work(body, entry, next, scope));
                     Ok(())
                 } else {
-                    self.edge(builder, entry, next)
+                    self.session.add_target_edge(builder, entry, next)
                 }
             }
             "empty_statement"
@@ -4625,7 +6307,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             | "alias_declaration"
             | "using_declaration"
             | "static_assert_declaration"
-            | "attribute_declaration" => self.edge(builder, entry, next),
+            | "attribute_declaration" => self.session.add_target_edge(builder, entry, next),
             _ if is_cpp_expression(node.kind()) => {
                 stack.push(Work::Expression {
                     node,
@@ -4673,11 +6355,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             )?;
         }
         let consequence = required_field(node, "consequence")?;
-        let consequence_entry = self.point(builder, consequence, Vec::new())?;
+        let consequence_entry = self
+            .session
+            .add_node_point(builder, consequence, Vec::new())?;
         stack.push(self.execution_work(consequence, consequence_entry, completion, scope));
         let when_false = if let Some(alternative) = node.child_by_field_name("alternative") {
             let body = first_runtime_named_child(alternative).unwrap_or(alternative);
-            let alternative_entry = self.point(builder, body, Vec::new())?;
+            let alternative_entry = self.session.add_node_point(builder, body, Vec::new())?;
             stack.push(self.execution_work(body, alternative_entry, completion, scope));
             EdgeTarget {
                 point: alternative_entry,
@@ -4702,6 +6386,35 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         Ok(())
     }
 
+    fn loop_condition_cleanup_targets(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        condition: Option<Node<'tree>>,
+        exit: EdgeTarget,
+        iteration: EdgeTarget,
+        exit_reason: &str,
+        iteration_reason: &str,
+    ) -> Result<(EdgeTarget, EdgeTarget), CppLoweringError> {
+        let Some(condition) = condition.filter(|condition| {
+            !self.is_c_source
+                && syntax_has_automatic_object(self.source, self.trivial_types, *condition)
+        }) else {
+            return Ok((exit, iteration));
+        };
+        let iteration_kind = iteration.kind;
+        let exit = EdgeTarget::normal(self.normal_cleanup_boundary(
+            builder,
+            condition,
+            exit,
+            exit_reason,
+        )?);
+        let iteration = EdgeTarget {
+            point: self.normal_cleanup_boundary(builder, condition, iteration, iteration_reason)?,
+            kind: iteration_kind,
+        };
+        Ok((exit, iteration))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn while_statement(
         &mut self,
@@ -4714,39 +6427,23 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     ) -> Result<(), CppLoweringError> {
         let condition = required_field(node, "condition")?;
         let body = required_field(node, "body")?;
-        let condition_entry = self.point(builder, condition, Vec::new())?;
-        let body_entry = self.point(builder, body, Vec::new())?;
-        let condition_declares_object = !self.is_c_source
-            && syntax_has_automatic_object(self.source, self.trivial_types, condition);
-        let exit_target = if condition_declares_object {
-            EdgeTarget::normal(self.normal_cleanup_boundary(
-                builder,
-                condition,
-                next,
-                "leaving a while statement may destroy an object declared by its condition",
-            )?)
-        } else {
-            next
-        };
-        let iteration_target = if condition_declares_object {
-            EdgeTarget {
-                point: self.normal_cleanup_boundary(
-                    builder,
-                    condition,
-                    EdgeTarget {
-                        point: condition_entry,
-                        kind: ControlEdgeKind::LoopBack,
-                    },
-                    "finishing a while iteration may destroy an object declared by its condition before reevaluation",
-                )?,
-                kind: ControlEdgeKind::LoopBack,
-            }
-        } else {
+        let condition_entry = self
+            .session
+            .add_node_point(builder, condition, Vec::new())?;
+        let body_entry = self.session.add_node_point(builder, body, Vec::new())?;
+        self.session
+            .record_loop_site(builder, node, condition_entry, body_entry)?;
+        let (exit_target, iteration_target) = self.loop_condition_cleanup_targets(
+            builder,
+            Some(condition),
+            next,
             EdgeTarget {
                 point: condition_entry,
                 kind: ControlEdgeKind::LoopBack,
-            }
-        };
+            },
+            "leaving a while statement may destroy an object declared by its condition",
+            "finishing a while iteration may destroy an object declared by its condition before reevaluation",
+        )?;
         let loop_scope = builder.push_scope(
             Some(scope),
             ScopeBinding::Loop {
@@ -4771,7 +6468,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             },
             scope: loop_scope,
         });
-        self.edge(builder, entry, EdgeTarget::normal(condition_entry))
+        self.session
+            .add_target_edge(builder, entry, EdgeTarget::normal(condition_entry))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4786,7 +6484,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     ) -> Result<(), CppLoweringError> {
         let body = required_field(node, "body")?;
         let condition = required_field(node, "condition")?;
-        let condition_entry = self.point(builder, condition, Vec::new())?;
+        let condition_entry = self
+            .session
+            .add_node_point(builder, condition, Vec::new())?;
+        let body_entry = self.session.add_node_point(builder, body, Vec::new())?;
+        self.session
+            .record_loop_site(builder, node, condition_entry, body_entry)?;
         let loop_scope = builder.push_scope(
             Some(scope),
             ScopeBinding::Loop {
@@ -4801,7 +6504,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             node: condition,
             entry: condition_entry,
             when_true: EdgeTarget {
-                point: entry,
+                point: body_entry,
                 kind: ControlEdgeKind::LoopBack,
             },
             when_false: EdgeTarget {
@@ -4812,11 +6515,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         });
         stack.push(self.execution_work(
             body,
-            entry,
+            body_entry,
             EdgeTarget::normal(condition_entry),
             loop_scope,
         ));
-        Ok(())
+        self.session
+            .add_target_edge(builder, entry, EdgeTarget::normal(body_entry))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4833,18 +6537,18 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let initializer = node.child_by_field_name("initializer");
         let condition = node.child_by_field_name("condition");
         let update = node.child_by_field_name("update");
-        let condition_entry = self.point(builder, condition.unwrap_or(node), Vec::new())?;
-        let body_entry = self.point(builder, body, Vec::new())?;
+        let condition_entry =
+            self.session
+                .add_node_point(builder, condition.unwrap_or(node), Vec::new())?;
+        let body_entry = self.session.add_node_point(builder, body, Vec::new())?;
+        self.session
+            .record_loop_site(builder, node, condition_entry, body_entry)?;
         let update_entry = update
-            .map(|update| self.point(builder, update, Vec::new()))
+            .map(|update| self.session.add_node_point(builder, update, Vec::new()))
             .transpose()?;
         let initializer_declares_object = !self.is_c_source
             && initializer.is_some_and(|initializer| {
                 syntax_has_automatic_object(self.source, self.trivial_types, initializer)
-            });
-        let condition_declares_object = !self.is_c_source
-            && condition.is_some_and(|condition| {
-                syntax_has_automatic_object(self.source, self.trivial_types, condition)
             });
         let initializer_exit = if initializer_declares_object {
             EdgeTarget::normal(self.normal_cleanup_boundary(
@@ -4856,36 +6560,18 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         } else {
             next
         };
-        let loop_exit = if condition_declares_object {
-            EdgeTarget::normal(self.normal_cleanup_boundary(
-                builder,
-                condition.expect("object declaration requires a condition"),
-                initializer_exit,
-                "leaving a for statement may destroy an object declared by its condition",
-            )?)
-        } else {
-            initializer_exit
-        };
         let update_target = update_entry.unwrap_or(condition_entry);
-        let iteration_target = if condition_declares_object {
-            EdgeTarget {
-                point: self.normal_cleanup_boundary(
-                    builder,
-                    condition.expect("object declaration requires a condition"),
-                    EdgeTarget {
-                        point: update_target,
-                        kind: ControlEdgeKind::LoopBack,
-                    },
-                    "finishing a for iteration may destroy an object declared by its condition before update and reevaluation",
-                )?,
-                kind: ControlEdgeKind::LoopBack,
-            }
-        } else {
+        let (loop_exit, iteration_target) = self.loop_condition_cleanup_targets(
+            builder,
+            condition,
+            initializer_exit,
             EdgeTarget {
                 point: update_target,
                 kind: ControlEdgeKind::LoopBack,
-            }
-        };
+            },
+            "leaving a for statement may destroy an object declared by its condition",
+            "finishing a for iteration may destroy an object declared by its condition before update and reevaluation",
+        )?;
         let loop_scope = builder.push_scope(
             Some(scope),
             ScopeBinding::Loop {
@@ -4923,7 +6609,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 scope: loop_scope,
             });
         } else {
-            self.edge(
+            self.session.add_target_edge(
                 builder,
                 condition_entry,
                 EdgeTarget {
@@ -4948,7 +6634,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             stack.push(self.execution_work(initializer, entry, first_arrival, loop_scope));
             Ok(())
         } else {
-            self.edge(builder, entry, first_arrival)
+            self.session.add_target_edge(builder, entry, first_arrival)
         }
     }
 
@@ -4965,9 +6651,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let range = required_field(node, "right")?;
         let body = required_field(node, "body")?;
         let initializer = node.child_by_field_name("initializer");
-        let test = self.point(builder, node, Vec::new())?;
-        let binding = self.point(builder, node, Vec::new())?;
-        let body_entry = self.point(builder, body, Vec::new())?;
+        let test = self.session.add_node_point(builder, node, Vec::new())?;
+        let binding = self.session.add_node_point(builder, node, Vec::new())?;
+        let body_entry = self.session.add_node_point(builder, body, Vec::new())?;
         let loop_exit = self.normal_cleanup_boundary(
             builder,
             node,
@@ -5039,7 +6725,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 detail,
             )?;
         }
-        self.edge(
+        self.session.add_target_edge(
             builder,
             test,
             EdgeTarget {
@@ -5047,7 +6733,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 kind: ControlEdgeKind::ConditionalTrue,
             },
         )?;
-        self.edge(
+        self.session.add_target_edge(
             builder,
             test,
             EdgeTarget {
@@ -5055,10 +6741,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 kind: ControlEdgeKind::ConditionalFalse,
             },
         )?;
-        self.edge(builder, binding, EdgeTarget::normal(body_entry))?;
+        self.session
+            .add_target_edge(builder, binding, EdgeTarget::normal(body_entry))?;
         stack.push(self.execution_work(body, body_entry, iteration_target, loop_scope));
         let range_entry = if let Some(initializer) = initializer {
-            let range_entry = self.point(builder, range, Vec::new())?;
+            let range_entry = self.session.add_node_point(builder, range, Vec::new())?;
             stack.push(Work::Expression {
                 node: range,
                 entry: range_entry,
@@ -5096,7 +6783,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     ) -> Result<(), CppLoweringError> {
         let condition = required_field(node, "condition")?;
         let body = required_field(node, "body")?;
-        let dispatch = self.point(builder, node, Vec::new())?;
+        let dispatch = self.session.add_node_point(builder, node, Vec::new())?;
         if !self.is_c_source
             && condition_value_declaration(condition).is_some_and(declaration_may_construct_object)
         {
@@ -5120,7 +6807,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         };
         let cases = switch_cases(body);
         if cases.is_empty() {
-            self.edge(builder, dispatch, completion)?;
+            self.session
+                .add_target_edge(builder, dispatch, completion)?;
             stack.push(Work::Expression {
                 node: condition,
                 entry,
@@ -5146,11 +6834,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             {
                 entry
             } else {
-                let entry = self.point(builder, *case, Vec::new())?;
+                let entry = self.session.add_node_point(builder, *case, Vec::new())?;
                 self.switch_case_entries.insert(case.id(), entry);
                 entry
             };
-            self.edge(
+            self.session.add_target_edge(
                 builder,
                 dispatch,
                 EdgeTarget {
@@ -5160,7 +6848,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             )?;
         }
         if !has_default {
-            self.edge(
+            self.session.add_target_edge(
                 builder,
                 dispatch,
                 EdgeTarget {
@@ -5173,7 +6861,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         // intentionally detached from dispatch; reachability sealing removes
         // its synthetic edge to the first case while preserving the case
         // entries reached directly from the dispatcher.
-        let body_entry = self.point(builder, body, Vec::new())?;
+        let body_entry = self.session.add_node_point(builder, body, Vec::new())?;
         stack.push(self.execution_work(body, body_entry, completion, switch_scope));
         stack.push(Work::Expression {
             node: condition,
@@ -5205,12 +6893,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .collect::<Result<Vec<_>, _>>()?;
         let catch_entries = catches
             .iter()
-            .map(|catch| self.point(builder, *catch, Vec::new()))
+            .map(|catch| self.session.add_node_point(builder, *catch, Vec::new()))
             .collect::<Result<Vec<_>, _>>()?;
         let try_scope = if catch_entries.is_empty() {
             scope
         } else {
-            let dispatcher = self.point(builder, node, Vec::new())?;
+            let dispatcher = self.session.add_node_point(builder, node, Vec::new())?;
             self.add_gap(
                 builder,
                 dispatcher,
@@ -5226,7 +6914,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "catch type matching, base conversions, catch-all selection, and exception copying are not lowered",
             )?;
             for catch_entry in &catch_entries {
-                self.edge(
+                self.session.add_target_edge(
                     builder,
                     dispatcher,
                     EdgeTarget {
@@ -5235,8 +6923,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     },
                 )?;
             }
-            let unmatched = self.point(builder, node, Vec::new())?;
-            self.edge(
+            let unmatched = self.session.add_node_point(builder, node, Vec::new())?;
+            self.session.add_target_edge(
                 builder,
                 dispatcher,
                 EdgeTarget {
@@ -5325,8 +7013,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         }
 
         let body = required_field(node, "body")?;
-        let body_entry = self.point(builder, body, Vec::new())?;
-        self.edge(builder, entry, EdgeTarget::normal(body_entry))?;
+        let body_entry = self.session.add_node_point(builder, body, Vec::new())?;
+        self.session
+            .add_target_edge(builder, entry, EdgeTarget::normal(body_entry))?;
         let clause = named_children(node)
             .into_iter()
             .find(|child| matches!(child.kind(), "seh_except_clause" | "seh_finally_clause"));
@@ -5334,7 +7023,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         match clause.map(|clause| (clause.kind(), clause)) {
             Some(("seh_finally_clause", clause)) => {
                 let finally_body = required_field(clause, "body")?;
-                let finally_entry = self.point(builder, clause, Vec::new())?;
+                let finally_entry = self.session.add_node_point(builder, clause, Vec::new())?;
                 stack.push(self.execution_work(finally_body, finally_entry, next, scope));
                 stack.push(self.execution_work(
                     body,
@@ -5346,9 +7035,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
             Some(("seh_except_clause", clause)) => {
                 let handler_body = required_field(clause, "body")?;
-                let dispatcher = self.point(builder, clause, Vec::new())?;
-                let handler_entry = self.point(builder, handler_body, Vec::new())?;
-                self.edge(
+                let dispatcher = self.session.add_node_point(builder, clause, Vec::new())?;
+                let handler_entry =
+                    self.session
+                        .add_node_point(builder, handler_body, Vec::new())?;
+                self.session.add_target_edge(
                     builder,
                     entry,
                     EdgeTarget {
@@ -5361,7 +7052,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 stack.push(self.execution_work(handler_body, handler_entry, next, scope));
 
                 if let Some(filter) = clause.child_by_field_name("filter") {
-                    let unmatched = self.point(builder, clause, Vec::new())?;
+                    let unmatched = self.session.add_node_point(builder, clause, Vec::new())?;
                     self.abrupt(builder, unmatched, scope, CompletionKind::Throw, None)?;
                     stack.push(Work::Condition {
                         node: filter,
@@ -5377,7 +7068,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         scope,
                     });
                 } else {
-                    self.edge(
+                    self.session.add_target_edge(
                         builder,
                         dispatcher,
                         EdgeTarget {
@@ -5487,7 +7178,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "goto may enter or leave scopes containing variably modified automatic arrays",
             )?;
         }
-        self.edge(builder, entry, EdgeTarget::normal(target))
+        self.session
+            .add_target_edge(builder, entry, EdgeTarget::normal(target))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5528,11 +7220,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .filter(|child| is_statement_or_declaration(child.kind()))
             .collect::<Vec<_>>();
         if branches.is_empty() {
-            return self.edge(builder, entry, next);
+            return self.session.add_target_edge(builder, entry, next);
         }
         for branch in branches {
-            let branch_entry = self.point(builder, branch, Vec::new())?;
-            self.edge(
+            let branch_entry = self.session.add_node_point(builder, branch, Vec::new())?;
+            self.session.add_target_edge(
                 builder,
                 entry,
                 EdgeTarget {
@@ -5542,7 +7234,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             )?;
             stack.push(self.execution_work(branch, branch_entry, next, scope));
         }
-        self.edge(
+        self.session.add_target_edge(
             builder,
             entry,
             EdgeTarget {
@@ -5562,7 +7254,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), CppLoweringError> {
-        let result = self.expression_value(builder, node, cpp_expression_value_kind(node))?;
+        let result =
+            self.expression_value(builder, node, cpp_expression_value_kind(self.source, node))?;
         if matches!(node.kind(), "identifier" | "this") {
             self.emit_lexical_input_flow(builder, node, entry, result)?;
         }
@@ -5584,7 +7277,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     SemanticGapKind::Unsupported,
                     "calls nested in noexcept/typeid operands are intentionally not emitted as immediate call sites",
                 )?;
-                self.edge(builder, entry, next)
+                self.session.add_target_edge(builder, entry, next)
             }
             "call_expression" | "new_expression" => {
                 self.call_expression(builder, node, entry, next, scope, stack)
@@ -5596,7 +7289,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let condition = required_field(node, "condition")?;
                 let consequence = node.child_by_field_name("consequence");
                 let alternative = required_field(node, "alternative")?;
-                let alternative_entry = self.point(builder, alternative, Vec::new())?;
+                let alternative_entry =
+                    self.session
+                        .add_node_point(builder, alternative, Vec::new())?;
                 stack.push(Work::Expression {
                     node: alternative,
                     entry: alternative_entry,
@@ -5604,7 +7299,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     scope,
                 });
                 let when_true = if let Some(consequence) = consequence {
-                    let consequence_entry = self.point(builder, consequence, Vec::new())?;
+                    let consequence_entry =
+                        self.session
+                            .add_node_point(builder, consequence, Vec::new())?;
                     stack.push(Work::Expression {
                         node: consequence,
                         entry: consequence_entry,
@@ -5633,7 +7330,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "binary_expression" if matches!(binary_operator(node), Some("&&" | "||")) => {
                 let left = required_field(node, "left")?;
                 let right = required_field(node, "right")?;
-                let right_entry = self.point(builder, right, Vec::new())?;
+                let right_entry = self.session.add_node_point(builder, right, Vec::new())?;
                 stack.push(Work::Expression {
                     node: right,
                     entry: right_entry,
@@ -5675,7 +7372,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "comma_expression" => {
                 let left = required_field(node, "left")?;
                 let right = required_field(node, "right")?;
-                let right_entry = self.point(builder, right, Vec::new())?;
+                let right_entry = self.session.add_node_point(builder, right, Vec::new())?;
                 stack.push(Work::Expression {
                     node: right,
                     entry: right_entry,
@@ -5693,7 +7390,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "assignment_expression" => {
                 let left = required_field(node, "left")?;
                 let right = required_field(node, "right")?;
-                let assignment = self.point(builder, node, Vec::new())?;
+                let assignment = self.session.add_node_point(builder, node, Vec::new())?;
                 let exact_modeled_assignment = (assignment_operator(node) == Some("=")
                     && left.kind() == "identifier")
                     .then(|| {
@@ -5735,6 +7432,27 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                             .then_some((name, target))
                     })
                     .flatten();
+                let exact_scalar_compound = self.integral_compound_offset(node);
+                let fundamental_compound = (assignment_operator(node) != Some("="))
+                    .then(|| {
+                        let left = node.child_by_field_name("left")?;
+                        let right = node.child_by_field_name("right")?;
+                        if !self.expression_is_fundamental(left, false)
+                            || !self.expression_is_fundamental(right, false)
+                        {
+                            return None;
+                        }
+                        let (left, target, flow_kind) = self.fundamental_binding_target(left)?;
+                        Some((left, target, flow_kind))
+                    })
+                    .flatten();
+                // A direct identifier target is a binding write. Evaluating
+                // that target must not publish a value read of the old
+                // binding: `x = value` overwrites x without observing x.
+                // Compound assignments still evaluate their left operand
+                // below because they need its old value.
+                let direct_binding_assignment =
+                    exact_modeled_assignment.is_some() || exact_target.is_some();
                 if let Some((target, transfer)) = exact_modeled_assignment {
                     self.emit_exact_modeled_transfer(
                         builder,
@@ -5751,8 +7469,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     // receiver already holds, so it publishes dependence
                     // without replacing the receiver's value and without
                     // claiming the receiver now has the operand's class.
-                    let value =
-                        self.expression_value(builder, right, cpp_expression_value_kind(right))?;
+                    let value = self.expression_value(
+                        builder,
+                        right,
+                        cpp_expression_value_kind(self.source, right),
+                    )?;
                     self.append_effect(
                         builder,
                         assignment,
@@ -5770,9 +7491,90 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                             value: target,
                         },
                     )?;
+                } else if let Some((left, target, flow_kind, offset)) = exact_scalar_compound {
+                    let old = self.expression_value(
+                        builder,
+                        left,
+                        cpp_expression_value_kind(self.source, left),
+                    )?;
+                    let computed = self.value(builder, assignment, SemanticValueKind::Temporary)?;
+                    self.append_effect(
+                        builder,
+                        assignment,
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::IntegerOffset { offset },
+                            source: old,
+                            target: computed,
+                        },
+                    )?;
+                    self.append_effect(
+                        builder,
+                        assignment,
+                        SemanticEffect::Assignment {
+                            target,
+                            value: computed,
+                        },
+                    )?;
+                    self.append_effect(
+                        builder,
+                        assignment,
+                        SemanticEffect::ValueFlow {
+                            kind: flow_kind,
+                            source: computed,
+                            target,
+                        },
+                    )?;
+                    self.append_effect(
+                        builder,
+                        assignment,
+                        SemanticEffect::Assignment {
+                            target: result,
+                            value: computed,
+                        },
+                    )?;
+                } else if let Some((left, target, flow_kind)) = fundamental_compound {
+                    let old = self.expression_value(builder, left, SemanticValueKind::Temporary)?;
+                    let computed = self.value(builder, assignment, SemanticValueKind::Temporary)?;
+                    self.append_effect(
+                        builder,
+                        assignment,
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::LanguageDefined,
+                            source: old,
+                            target: computed,
+                        },
+                    )?;
+                    self.append_effect(
+                        builder,
+                        assignment,
+                        SemanticEffect::Assignment {
+                            target,
+                            value: computed,
+                        },
+                    )?;
+                    self.append_effect(
+                        builder,
+                        assignment,
+                        SemanticEffect::ValueFlow {
+                            kind: flow_kind,
+                            source: computed,
+                            target,
+                        },
+                    )?;
+                    self.append_effect(
+                        builder,
+                        assignment,
+                        SemanticEffect::Assignment {
+                            target: result,
+                            value: computed,
+                        },
+                    )?;
                 } else if let Some((name, target)) = exact_target {
-                    let value =
-                        self.expression_value(builder, right, cpp_expression_value_kind(right))?;
+                    let value = self.expression_value(
+                        builder,
+                        right,
+                        cpp_expression_value_kind(self.source, right),
+                    )?;
                     self.append_effect(
                         builder,
                         assignment,
@@ -5799,8 +7601,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     // A member or element target writes a *location*, so it
                     // becomes a `MemoryStore` against a structured location and
                     // deliberately carries no value edge (#2666, #2665).
-                    let value =
-                        self.expression_value(builder, right, cpp_expression_value_kind(right))?;
+                    let value = self.expression_value(
+                        builder,
+                        right,
+                        cpp_expression_value_kind(self.source, right),
+                    )?;
                     let store = if assignment_operator(node) == Some("=") {
                         self.memory_access_target(builder, assignment, left)?
                     } else {
@@ -5855,7 +7660,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         "assignment operand evaluation order is C/C++-standard dependent; RHS-first lowering is only a deterministic bounded order without a configured language standard",
                     )?;
                 }
-                if assignment_operator(node).is_some_and(|operator| operator != "=")
+                if !self.is_c_source
+                    && assignment_operator(node).is_some_and(|operator| operator != "=")
                     && !(self.expression_is_fundamental(left, false)
                         && self.expression_is_fundamental(right, false))
                 {
@@ -5865,33 +7671,49 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         "compound assignment may invoke an overloaded operator",
                     )?;
                 }
-                self.edge(builder, assignment, next)?;
-                let right_entry = self.point(builder, right, Vec::new())?;
-                let left_entry = self.point(builder, left, Vec::new())?;
-                self.edge(builder, entry, EdgeTarget::normal(right_entry))?;
-                stack.push(Work::Expression {
-                    node: left,
-                    entry: left_entry,
-                    next: EdgeTarget::normal(assignment),
-                    scope,
-                });
-                stack.push(Work::Expression {
-                    node: right,
-                    entry: right_entry,
-                    next: EdgeTarget::normal(left_entry),
-                    scope,
-                });
+                self.session.add_target_edge(builder, assignment, next)?;
+                let right_entry = self.session.add_node_point(builder, right, Vec::new())?;
+                self.session
+                    .add_target_edge(builder, entry, EdgeTarget::normal(right_entry))?;
+                if direct_binding_assignment {
+                    stack.push(Work::Expression {
+                        node: right,
+                        entry: right_entry,
+                        next: EdgeTarget::normal(assignment),
+                        scope,
+                    });
+                } else {
+                    let left_entry = self.session.add_node_point(builder, left, Vec::new())?;
+                    stack.push(Work::Expression {
+                        node: left,
+                        entry: left_entry,
+                        next: EdgeTarget::normal(assignment),
+                        scope,
+                    });
+                    stack.push(Work::Expression {
+                        node: right,
+                        entry: right_entry,
+                        next: EdgeTarget::normal(left_entry),
+                        scope,
+                    });
+                }
                 Ok(())
+            }
+            "update_expression" if self.integral_update_target(node).is_some() => {
+                self.integral_update(builder, node, entry, next, scope, stack)
+            }
+            "update_expression" if self.fundamental_update_target(node).is_some() => {
+                self.fundamental_update(builder, node, entry, next, scope, stack)
             }
             "co_await_expression" => {
                 let argument = required_field(node, "argument")?;
-                let suspend = self.point(builder, node, Vec::new())?;
+                let suspend = self.session.add_node_point(builder, node, Vec::new())?;
                 self.add_coroutine_gap(
                     builder,
                     suspend,
                     "await transformation, awaiter calls, suspension, resumption, and symmetric transfer are not lowered",
                 )?;
-                self.edge(builder, suspend, next)?;
+                self.session.add_target_edge(builder, suspend, next)?;
                 stack.push(Work::Expression {
                     node: argument,
                     entry,
@@ -5922,7 +7744,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     SemanticGapKind::Unsupported,
                     "potential calls in unevaluated operands are intentionally not emitted as call sites; VLA and polymorphic typeid exceptions require refinement",
                 )?;
-                self.edge(builder, entry, next)
+                self.session.add_target_edge(builder, entry, next)
             }
             "generic_expression" => {
                 self.add_gap(
@@ -5933,7 +7755,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     SemanticGapKind::Unsupported,
                     "C _Generic association selection requires type refinement; unselected expressions are not executed",
                 )?;
-                self.edge(builder, entry, next)
+                self.session.add_target_edge(builder, entry, next)
             }
             "gnu_asm_expression" => {
                 for (capability, detail) in [
@@ -5981,13 +7803,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
             "parenthesized_expression" => {
                 let Some(value_node) = first_runtime_named_child(node) else {
-                    return self.edge(builder, entry, next);
+                    return self.session.add_target_edge(builder, entry, next);
                 };
-                let terminal = self.point(builder, node, Vec::new())?;
+                let terminal = self.session.add_node_point(builder, node, Vec::new())?;
                 let value = self.expression_value(
                     builder,
                     value_node,
-                    cpp_expression_value_kind(value_node),
+                    cpp_expression_value_kind(self.source, value_node),
                 )?;
                 self.append_effect(
                     builder,
@@ -6009,7 +7831,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         target: result,
                     },
                 )?;
-                self.edge(builder, terminal, next)?;
+                self.session.add_target_edge(builder, terminal, next)?;
                 stack.push(Work::Expression {
                     node: value_node,
                     entry,
@@ -6029,7 +7851,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             // published at a terminal point the base reaches first, so the
             // location's base value is already produced when the load runs.
             "field_expression" | "subscript_expression" => {
-                let terminal = self.point(builder, node, Vec::new())?;
+                let terminal = self.session.add_node_point(builder, node, Vec::new())?;
                 let children = runtime_expression_children(node);
                 // `operator.` cannot be declared in C++, so a `.` member access
                 // never runs user code. `->` on a raw pointer and `[]` on an
@@ -6066,7 +7888,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     )?;
                 }
                 self.emit_memory_load(builder, terminal, node)?;
-                self.edge(builder, terminal, next)?;
+                self.session.add_target_edge(builder, terminal, next)?;
                 self.schedule_expressions(
                     builder,
                     entry,
@@ -6092,11 +7914,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     && has_direct_token(node, "&")
                     && let Some(operand) = node.child_by_field_name("argument")
                 {
-                    let terminal = self.point(builder, node, Vec::new())?;
+                    let terminal = self.session.add_node_point(builder, node, Vec::new())?;
                     let source = self.expression_value(
                         builder,
                         operand,
-                        cpp_expression_value_kind(operand),
+                        cpp_expression_value_kind(self.source, operand),
                     )?;
                     self.append_effect(
                         builder,
@@ -6115,7 +7937,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                             target: result,
                         },
                     )?;
-                    self.edge(builder, terminal, next)?;
+                    self.session.add_target_edge(builder, terminal, next)?;
                     return self.schedule_expressions(
                         builder,
                         entry,
@@ -6165,16 +7987,20 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 // the target, so a second operand would erase what the first
                 // contributed, and it would claim the result is the operand
                 // object for the points-to trace.
-                let terminal = self.point(builder, node, Vec::new())?;
+                let terminal = self.session.add_node_point(builder, node, Vec::new())?;
                 let operands = children
                     .iter()
                     .map(|child| {
-                        self.expression_value(builder, *child, cpp_expression_value_kind(*child))
+                        self.expression_value(
+                            builder,
+                            *child,
+                            cpp_expression_value_kind(self.source, *child),
+                        )
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 self.session
                     .append_language_defined_value_flows(builder, terminal, operands, result)?;
-                self.edge(builder, terminal, next)?;
+                self.session.add_target_edge(builder, terminal, next)?;
                 self.schedule_expressions(
                     builder,
                     entry,
@@ -6221,15 +8047,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     SemanticGapKind::Unsupported,
                     "macro invocation expansion is unavailable and no textual mini-parser is used",
                 )?;
-                self.edge(builder, entry, next)
+                self.session.add_target_edge(builder, entry, next)
             }
             "lambda_capture_initializer" => {
                 let children = runtime_expression_children(node);
                 self.schedule_expressions(builder, entry, &children, next, scope, stack)
             }
-            "function_definition" => self.edge(builder, entry, next),
+            "function_definition" => self.session.add_target_edge(builder, entry, next),
             _ if is_runtime_leaf(node.kind()) || is_type_syntax(node.kind()) => {
-                self.edge(builder, entry, next)
+                self.session.add_target_edge(builder, entry, next)
             }
             _ => {
                 let children = runtime_expression_children(node);
@@ -6252,25 +8078,41 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), CppLoweringError> {
-        let invoke = self.point(builder, node, Vec::new())?;
-        let normal = self.point(builder, node, Vec::new())?;
-        let exceptional = self.point(builder, node, Vec::new())?;
+        let invoke = self.session.add_node_point(builder, node, Vec::new())?;
+        let exceptional = self.session.add_node_point(builder, node, Vec::new())?;
 
         let function = if node.kind() == "new_expression" {
             required_field(node, "type")?
         } else {
             required_field(node, "function")?
         };
-        let callee = self.source_value(builder, function, SemanticValueKind::Callable)?;
+        let callee = self
+            .session
+            .add_node_value(builder, function, SemanticValueKind::Callable)?;
         let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
-        let thrown = self.source_value(builder, function, SemanticValueKind::Exception)?;
+        let thrown =
+            self.session
+                .add_node_value(builder, function, SemanticValueKind::Exception)?;
         let receiver_node = cpp_call_receiver(function);
         let receiver = receiver_node
             .map(|receiver| {
-                self.expression_value(builder, receiver, cpp_expression_value_kind(receiver))
+                self.expression_value(
+                    builder,
+                    receiver,
+                    cpp_expression_value_kind(self.source, receiver),
+                )
             })
             .transpose()?;
         let constructor = node.kind() == "new_expression" || cpp_direct_constructor_call(function);
+        let function_like_macro = !constructor
+            && function.kind() == "identifier"
+            && nonempty_node_text(self.source, function)
+                .is_some_and(|name| self.function_like_macros.contains(name));
+        let noreturn_target = (!constructor && !function_like_macro)
+            .then(|| self.exact_noreturn_target(node, function))
+            .flatten();
+        let is_noreturn =
+            noreturn_target.is_some_and(|target| self.function_procedures.is_noreturn(target));
         let indirect = !constructor && call_target_requires_dispatch_gap(function);
         let callable_kind = if constructor {
             CallableReferenceKind::Constructor
@@ -6279,7 +8121,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         } else {
             CallableReferenceKind::Function
         };
-        let resolution = if indirect {
+        let resolution = if function_like_macro {
+            CallableTargetResolution::Unknown
+        } else if let Some(target) = noreturn_target {
+            CallableTargetResolution::Proven(CallableTarget::Local(target))
+        } else if indirect {
             match self.stable_local_function_target(function) {
                 Some(target) => CallableTargetResolution::Proven(CallableTarget::Local(target)),
                 None => CallableTargetResolution::Unsupported,
@@ -6307,44 +8153,86 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         )?;
 
         let arguments = call_arguments(node);
+        let unresolved_local_argument = !self.resolved_call_ids.contains(&node.id())
+            && matches!(
+                resolution,
+                CallableTargetResolution::Unknown | CallableTargetResolution::Unsupported
+            )
+            && arguments.iter().any(|argument| {
+                argument.kind() == "identifier"
+                    && nonempty_node_text(self.source, *argument).is_some_and(|name| {
+                        self.binding_value(name, argument.start_byte()).is_some()
+                    })
+            });
         let argument_values = arguments
             .iter()
             .map(|argument| {
-                self.expression_value(builder, *argument, cpp_expression_value_kind(*argument))
+                self.expression_value(
+                    builder,
+                    *argument,
+                    cpp_expression_value_kind(self.source, *argument),
+                )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let call_site = self.session.add_call_site(
-            builder,
-            CallSiteScaffold {
-                point: invoke,
-                callee,
-                receiver,
-                arguments: argument_values
-                    .iter()
-                    .map(|value| SemanticCallArgument::direct(*value, ArgumentDomain::Positional))
-                    .collect(),
-                normal_results: Box::new([]),
-                result: Some(result),
-                thrown: Some(thrown),
-                declared_targets: resolution.clone(),
-                normal_continuation: normal,
-                exceptional_continuation: exceptional,
-            },
-        )?;
-        if constructor {
+        let call_site = if is_noreturn {
+            self.session.add_diverging_call_site(
+                builder,
+                DivergingCallSiteScaffold {
+                    point: invoke,
+                    callee,
+                    receiver,
+                    arguments: argument_values
+                        .iter()
+                        .map(|value| {
+                            SemanticCallArgument::direct(*value, ArgumentDomain::Positional)
+                        })
+                        .collect(),
+                    result: Some(result),
+                    thrown: Some(thrown),
+                    declared_targets: resolution.clone(),
+                    exceptional_continuation: exceptional,
+                },
+            )?
+        } else {
+            let normal = self.session.add_node_point(builder, node, Vec::new())?;
+            let call_site = self.session.add_call_site(
+                builder,
+                CallSiteScaffold {
+                    point: invoke,
+                    callee,
+                    receiver,
+                    arguments: argument_values
+                        .iter()
+                        .map(|value| {
+                            SemanticCallArgument::direct(*value, ArgumentDomain::Positional)
+                        })
+                        .collect(),
+                    normal_results: Box::new([]),
+                    result: Some(result),
+                    thrown: Some(thrown),
+                    declared_targets: resolution.clone(),
+                    normal_continuation: normal,
+                    exceptional_continuation: exceptional,
+                },
+            )?;
+            if constructor {
+                self.session
+                    .add_allocation(builder, normal, result, AllocationKind::Object)?;
+            }
+            self.emit_exact_modeled_receiver_operation(
+                builder,
+                normal,
+                call_site,
+                node,
+                &argument_values,
+                result,
+            )?;
             self.session
-                .add_allocation(builder, normal, result, AllocationKind::Object)?;
-        }
-        self.emit_exact_modeled_receiver_operation(
-            builder,
-            normal,
-            call_site,
-            node,
-            &argument_values,
-            result,
-        )?;
-        self.edge(builder, invoke, EdgeTarget::normal(normal))?;
-        self.edge(
+                .add_target_edge(builder, invoke, EdgeTarget::normal(normal))?;
+            self.session.add_target_edge(builder, normal, next)?;
+            call_site
+        };
+        self.session.add_target_edge(
             builder,
             invoke,
             EdgeTarget {
@@ -6352,9 +8240,26 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 kind: ControlEdgeKind::Exceptional,
             },
         )?;
-        self.edge(builder, normal, next)?;
         self.abrupt(builder, exceptional, scope, CompletionKind::Throw, None)?;
         self.resolution_gaps(builder, invoke, callee, call_site, &resolution)?;
+
+        if unresolved_local_argument {
+            self.add_call_control_gap(
+                builder,
+                invoke,
+                call_site,
+                "an unresolved call with a local or parameter argument may be a macro or non-local control transfer",
+            )?;
+        }
+
+        if function_like_macro {
+            self.add_call_control_gap(
+                builder,
+                invoke,
+                call_site,
+                "function-like macro expansion may change normal control flow",
+            )?;
+        }
 
         if indirect && !matches!(resolution, CallableTargetResolution::Proven(_)) {
             self.add_gap(
@@ -6467,7 +8372,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let creation = if captures.is_empty() {
             entry
         } else {
-            self.point(builder, node, Vec::new())?
+            self.session.add_node_point(builder, node, Vec::new())?
         };
         let result = self.expression_value(builder, node, SemanticValueKind::Callable)?;
         let metadata = self.metadata(creation)?;
@@ -6476,13 +8381,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             creation,
             SemanticEffect::CallableCreation {
                 result,
-                callable: CallableValue {
-                    kind: CallableReferenceKind::Lambda,
-                    targets: CallableTargetResolution::Unknown,
-                    target_evidence: metadata.evidence,
-                    bound_receiver: None,
-                    environment: None,
-                },
+                callable: CallableValue::unknown_target(
+                    CallableReferenceKind::Lambda,
+                    metadata.evidence,
+                ),
             },
         )?;
         self.add_gap(
@@ -6501,7 +8403,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             SemanticGapKind::Unknown,
             "lambda capture modes, lifetime extension, and closure storage are not represented",
         )?;
-        self.edge(builder, creation, next)?;
+        self.session.add_target_edge(builder, creation, next)?;
         if captures.is_empty() {
             Ok(())
         } else {
@@ -6532,10 +8434,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 continue;
             }
             if node.kind() == "labeled_statement" {
+                if self.is_cpp_access_specifier_label(node) {
+                    stack.extend(named_children(node).into_iter().rev());
+                    continue;
+                }
                 let label = required_field(node, "label")?;
                 let name = node_text(self.source, label)
                     .ok_or_else(|| missing_field(node, "label text"))?;
-                let point = self.point(builder, node, Vec::new())?;
+                let point = self.session.add_node_point(builder, node, Vec::new())?;
                 if self.labels.insert(Box::<str>::from(name), point).is_some() {
                     return Err(CppLoweringError::Invalid(format!(
                         "duplicate C/C++ label {name:?} in one callable"
@@ -6545,6 +8451,35 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             stack.extend(named_children(node).into_iter().rev());
         }
         Ok(())
+    }
+
+    fn is_cpp_access_specifier_label(&self, node: Node<'tree>) -> bool {
+        if self.is_c_source || node.kind() != "labeled_statement" {
+            return false;
+        }
+        let Some(label) = node.child_by_field_name("label") else {
+            return false;
+        };
+        if !matches!(
+            node_text(self.source, label),
+            Some("private") | Some("protected") | Some("public")
+        ) {
+            return false;
+        }
+        let mut current = self.ancestry.parent(node);
+        while let Some(parent) = current {
+            if matches!(
+                parent.kind(),
+                "class_specifier" | "struct_specifier" | "union_specifier"
+            ) {
+                return true;
+            }
+            if matches!(parent.kind(), "function_definition" | "lambda_expression") {
+                return false;
+            }
+            current = self.ancestry.parent(parent);
+        }
+        false
     }
 
     fn execution_work(
@@ -6622,9 +8557,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         next: EdgeTarget,
         context: &str,
     ) -> Result<ProgramPointId, CppLoweringError> {
-        let cleanup = self.point(builder, node, Vec::new())?;
+        let cleanup = self.session.add_cleanup_boundary_point(builder, node)?;
         self.add_raii_gaps(builder, cleanup, context)?;
-        self.edge(builder, cleanup, next)?;
+        self.session.add_target_edge(builder, cleanup, next)?;
         Ok(cleanup)
     }
 
@@ -6638,7 +8573,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         {
             return Ok(entry);
         }
-        self.point(builder, node, Vec::new())
+        self.session.add_node_point(builder, node, Vec::new())
     }
 
     fn schedule_execution_nodes(
@@ -6651,21 +8586,22 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), CppLoweringError> {
         if children.is_empty() {
-            return self.edge(builder, entry, next);
+            return self.session.add_target_edge(builder, entry, next);
         }
         let mut entries = Vec::with_capacity(children.len());
         for child in children {
             entries.push(self.execution_entry(builder, *child)?);
         }
-        self.edge(builder, entry, EdgeTarget::normal(entries[0]))?;
-        for index in (0..children.len()).rev() {
-            let child_next = entries
-                .get(index + 1)
-                .copied()
-                .map(EdgeTarget::normal)
-                .unwrap_or(next);
-            stack.push(self.execution_work(children[index], entries[index], child_next, scope));
-        }
+        self.session
+            .add_target_edge(builder, entry, EdgeTarget::normal(entries[0]))?;
+        schedule_sequential_work(
+            stack,
+            children,
+            &entries,
+            next,
+            scope,
+            |_, node, entry, next, scope| self.execution_work(node, entry, next, scope),
+        );
         Ok(())
     }
 
@@ -6704,8 +8640,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "the once-only initialization guard, concurrent initialization, recursive entry, and prior failure state are not modeled",
         )?;
 
-        let initialize = self.point(builder, node, Vec::new())?;
-        self.edge(
+        let initialize = self.session.add_node_point(builder, node, Vec::new())?;
+        self.session.add_target_edge(
             builder,
             entry,
             EdgeTarget {
@@ -6713,7 +8649,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 kind: ControlEdgeKind::ConditionalTrue,
             },
         )?;
-        self.edge(
+        self.session.add_target_edge(
             builder,
             entry,
             EdgeTarget {
@@ -6722,7 +8658,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             },
         )?;
         if values.is_empty() {
-            self.edge(builder, initialize, next)
+            self.session.add_target_edge(builder, initialize, next)
         } else {
             self.schedule_expressions(builder, initialize, values, next, scope, stack)
         }
@@ -6738,26 +8674,27 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), CppLoweringError> {
         if children.is_empty() {
-            return self.edge(builder, entry, next);
+            return self.session.add_target_edge(builder, entry, next);
         }
         let entries = children
             .iter()
-            .map(|child| self.point(builder, *child, Vec::new()))
+            .map(|child| self.session.add_node_point(builder, *child, Vec::new()))
             .collect::<Result<Vec<_>, _>>()?;
-        self.edge(builder, entry, EdgeTarget::normal(entries[0]))?;
-        for index in (0..children.len()).rev() {
-            let child_next = entries
-                .get(index + 1)
-                .copied()
-                .map(EdgeTarget::normal)
-                .unwrap_or(next);
-            stack.push(Work::Expression {
-                node: children[index],
-                entry: entries[index],
-                next: child_next,
+        self.session
+            .add_target_edge(builder, entry, EdgeTarget::normal(entries[0]))?;
+        schedule_sequential_work(
+            stack,
+            children,
+            &entries,
+            next,
+            scope,
+            |_, node, entry, next, scope| Work::Expression {
+                node,
+                entry,
+                next,
                 scope,
-            });
-        }
+            },
+        );
         Ok(())
     }
 
@@ -6768,19 +8705,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
     ) -> Result<(), CppLoweringError> {
-        let detail = format!(
-            "{} runtime/control syntax is not yet lowered structurally",
-            node.kind()
-        );
-        self.add_gap(
-            builder,
-            entry,
-            SemanticGapSubject::Point,
-            SemanticCapability::NormalControlFlow,
-            SemanticGapKind::Unsupported,
-            &detail,
-        )?;
-        self.edge(builder, entry, next)
+        self.session
+            .add_unhandled_control_syntax_gap(builder, entry, node.kind())
+            .map(|_| ())?;
+        self.session.add_target_edge(builder, entry, next)
     }
 
     fn unhandled_expression_syntax(
@@ -6802,7 +8730,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             SemanticGapKind::Unsupported,
             &detail,
         )?;
-        self.edge(builder, entry, next)
+        self.session.add_target_edge(builder, entry, next)
     }
 
     fn abrupt(
@@ -6816,23 +8744,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let Some(route) = builder.resolve_completion(scope, &CompletionRequest::new(kind, label))
         else {
             if matches!(kind, CompletionKind::Break | CompletionKind::Continue) {
-                let detail = format!(
-                    "{} completion has no matching represented target",
-                    completion_label(kind)
-                );
-                self.add_gap(
+                self.session.add_unmatched_completion_gap(
                     builder,
                     from,
-                    SemanticGapSubject::Point,
+                    kind,
                     SemanticCapability::NonLocalControl,
-                    SemanticGapKind::Unsupported,
-                    &detail,
                 )?;
                 return Ok(());
             }
             return Err(CppLoweringError::Invalid(format!(
                 "{} completion has no matching structured continuation",
-                completion_label(kind)
+                kind.label()
             )));
         };
         if self.raii_possible {
@@ -6850,14 +8772,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "abrupt completion may leave scopes containing variably modified automatic arrays",
             )?;
         }
-        self.edge(
-            builder,
-            from,
-            EdgeTarget {
-                point: route.destination().target(),
-                kind: route.destination().edge_kind(),
-            },
-        )
+        emit_cleanup_completion_route(builder, &mut self.session, from, &route)
     }
 
     fn resolution_gaps(
@@ -7067,34 +8982,6 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         )
     }
 
-    fn point(
-        &mut self,
-        builder: &mut ProcedureCfgBuilder,
-        node: Node<'tree>,
-        effects: Vec<SemanticEffect>,
-    ) -> Result<ProgramPointId, CppLoweringError> {
-        let metadata = self.mapping(builder, node)?;
-        self.session.add_point(builder, metadata, effects)
-    }
-
-    fn mapping(
-        &mut self,
-        builder: &mut ProcedureCfgBuilder,
-        node: Node<'tree>,
-    ) -> Result<PointMetadata, CppLoweringError> {
-        self.session.add_node_mapping(builder, node)
-    }
-
-    fn value_mapping(
-        &mut self,
-        builder: &mut ProcedureCfgBuilder,
-        node: Node<'tree>,
-    ) -> Result<PointMetadata, CppLoweringError> {
-        let anchor = source_anchor(node, 0).map_err(CppLoweringError::Invalid)?;
-        self.session
-            .add_mapping(builder, anchor, SourceMappingKind::Exact)
-    }
-
     fn metadata(&self, point: ProgramPointId) -> Result<PointMetadata, CppLoweringError> {
         self.session.metadata(point)
     }
@@ -7160,14 +9047,32 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         Ok(())
     }
 
-    fn edge(
-        &self,
+    fn add_call_control_gap(
+        &mut self,
         builder: &mut ProcedureCfgBuilder,
-        source_point: ProgramPointId,
-        target: EdgeTarget,
+        point: ProgramPointId,
+        call_site: CallSiteId,
+        detail: &str,
     ) -> Result<(), CppLoweringError> {
-        self.session
-            .add_edge(builder, source_point, target.point, target.kind)
+        let subject = SemanticGapSubject::CallSite(call_site);
+        if !self.published_gaps.insert(GapFact {
+            point,
+            subject,
+            capability: SemanticCapability::NormalControlFlow,
+        }) {
+            return Ok(());
+        }
+        self.session.add_gap_with_impacts_and_discharge(
+            builder,
+            point,
+            subject,
+            SemanticCapability::NormalControlFlow,
+            SemanticGapImpacts::NONE,
+            SemanticGapKind::Unknown,
+            SemanticGapDischarge::CallResolution,
+            detail,
+        )?;
+        Ok(())
     }
 }
 
@@ -7324,8 +9229,12 @@ fn cpp_integer_literal_is_nonzero(text: &str) -> Option<bool> {
 
 /// The value of an integer literal token, when it fits an `i64`.
 fn cpp_integer_literal_value(text: &str) -> Option<i64> {
+    i64::try_from(brokk_bifrost_cpp::graph::resolver::parse_cpp_integer_literal(text)?).ok()
+}
+
+fn cpp_integer_literal_unsigned_value(text: &str) -> Option<u128> {
     let (digits, radix) = cpp_integer_literal_digits(text)?;
-    i64::from_str_radix(&digits.replace('\'', ""), radix).ok()
+    u128::from_str_radix(&digits.replace('\'', ""), radix).ok()
 }
 
 /// Whether a C-style `for` condition is already true when the loop is first
@@ -7424,9 +9333,11 @@ fn locator_is_c_source(locator: &SemanticLocator) -> bool {
 /// storage is modelled by allocations and the heap stratum, not by a scalar
 /// value transfer, and a whole-object initializer is not one.
 fn cpp_value_transfer_is_exact(
+    source: &str,
     declaration: Node<'_>,
     declarator: Node<'_>,
     is_c_source: bool,
+    scalar_types: &CppScalarTypeIndex,
 ) -> bool {
     if cpp_declarator_preserves_identity(declarator) {
         return true;
@@ -7439,7 +9350,10 @@ fn cpp_value_transfer_is_exact(
     is_c_source
         || declaration
             .child_by_field_name("type")
-            .is_some_and(cpp_type_is_fundamental)
+            .is_some_and(|type_node| {
+                cpp_type_is_fundamental(type_node)
+                    || scalar_types.scalar_type(source, type_node).is_some()
+            })
 }
 
 /// Whether the value `declarator` binds always has a fundamental type, so
@@ -7459,10 +9373,17 @@ fn cpp_binding_is_fundamental(declaration: Node<'_>, declarator: Node<'_>) -> bo
             .is_some_and(cpp_type_is_fundamental)
 }
 
-fn cpp_declaration_value_transfer_is_exact(declaration: Node<'_>, is_c_source: bool) -> bool {
+fn cpp_declaration_value_transfer_is_exact(
+    source: &str,
+    declaration: Node<'_>,
+    is_c_source: bool,
+    scalar_types: &CppScalarTypeIndex,
+) -> bool {
     cpp_local_declarators(declaration)
         .into_iter()
-        .any(|declarator| cpp_value_transfer_is_exact(declaration, declarator, is_c_source))
+        .any(|declarator| {
+            cpp_value_transfer_is_exact(source, declaration, declarator, is_c_source, scalar_types)
+        })
 }
 
 fn cpp_declaration_binds_fundamental_value(declaration: Node<'_>) -> bool {
@@ -7546,7 +9467,12 @@ fn cpp_binding_return_selects_copy(
 /// the operand's own object, C has no user-defined conversions, and a C++
 /// fundamental return type admits no copy constructor or conversion function.
 /// A C++ class, template, or deduced return type keeps its conservative gap.
-fn cpp_callable_return_transfer_is_exact(callable: Node<'_>, is_c_source: bool) -> bool {
+fn cpp_callable_return_transfer_is_exact(
+    callable: Node<'_>,
+    is_c_source: bool,
+    source: &str,
+    scalar_types: &CppScalarTypeIndex,
+) -> bool {
     let Some(declarator) = callable.child_by_field_name("declarator") else {
         return false;
     };
@@ -7559,7 +9485,10 @@ fn cpp_callable_return_transfer_is_exact(callable: Node<'_>, is_c_source: bool) 
     is_c_source
         || callable
             .child_by_field_name("type")
-            .is_some_and(cpp_type_is_fundamental)
+            .is_some_and(|type_node| {
+                cpp_type_is_fundamental(type_node)
+                    || scalar_types.scalar_type(source, type_node).is_some()
+            })
 }
 
 fn cpp_declaration_is_function(declaration: Node<'_>) -> bool {
@@ -7593,7 +9522,7 @@ fn cpp_local_scope(node: Node<'_>, body: Node<'_>) -> Option<(usize, usize)> {
         .then_some((body.start_byte(), body.end_byte()))
 }
 
-fn cpp_declarator_initializer<'tree>(
+pub(super) fn cpp_declarator_initializer<'tree>(
     declaration: Node<'tree>,
     declarator: Node<'tree>,
 ) -> Option<Node<'tree>> {
@@ -7742,17 +9671,50 @@ fn cpp_subscript_indices(access: Node<'_>) -> Vec<Node<'_>> {
     access.child_by_field_name("index").into_iter().collect()
 }
 
-fn cpp_expression_value_kind(node: Node<'_>) -> SemanticValueKind {
+fn cpp_expression_value_kind(source: &str, node: Node<'_>) -> SemanticValueKind {
+    if node.kind() == "parenthesized_expression"
+        && let Some(inner) = first_named_child(node)
+    {
+        return cpp_expression_value_kind(source, inner);
+    }
+    if node.kind() == "unary_expression"
+        && let Some(operator) = node.child_by_field_name("operator")
+        && let Some(argument) = node
+            .child_by_field_name("argument")
+            .or_else(|| first_named_child(node))
+    {
+        let inner = cpp_expression_value_kind(source, argument);
+        return match (operator.kind(), inner) {
+            ("-", SemanticValueKind::UnsignedInteger(value)) => i128::try_from(value)
+                .ok()
+                .and_then(i128::checked_neg)
+                .map_or(
+                    SemanticValueKind::Constant,
+                    SemanticValueKind::SignedInteger,
+                ),
+            (
+                "+",
+                value @ (SemanticValueKind::UnsignedInteger(_)
+                | SemanticValueKind::SignedInteger(_)),
+            ) => value,
+            _ => SemanticValueKind::Temporary,
+        };
+    }
     match node.kind() {
-        "number_literal"
-        | "char_literal"
+        "number_literal" => nonempty_node_text(source, node)
+            .and_then(cpp_integer_literal_unsigned_value)
+            .map_or(
+                SemanticValueKind::Constant,
+                SemanticValueKind::UnsignedInteger,
+            ),
+        "char_literal"
         | "string_literal"
         | "raw_string_literal"
         | "concatenated_string"
-        | "true"
-        | "false"
         | "null"
         | "nullptr" => SemanticValueKind::Constant,
+        "true" => SemanticValueKind::Boolean(true),
+        "false" => SemanticValueKind::Boolean(false),
         "lambda_expression" => SemanticValueKind::Callable,
         _ => SemanticValueKind::Temporary,
     }
@@ -7879,7 +9841,7 @@ fn declaration_may_construct_object(node: Node<'_>) -> bool {
     let type_node = node
         .child_by_field_name("type")
         .or_else(|| first_named_child(node));
-    if type_node.is_some_and(|ty| ty.kind() == "primitive_type") {
+    if type_node.is_some_and(cpp_type_is_fundamental) {
         return false;
     }
 
@@ -7918,13 +9880,7 @@ fn syntax_has_automatic_object(source: &str, trivial: &TrivialTypeIndex, root: N
         {
             continue;
         }
-        if matches!(node.kind(), "declaration" | "field_declaration")
-            && declaration_may_construct_object(node)
-            && !trivial.declaration_is_trivial(source, node)
-            && !["static", "extern", "thread_local"]
-                .into_iter()
-                .any(|storage| has_storage_class(source, node, storage))
-        {
+        if declaration_is_automatic_object(source, trivial, node) {
             return true;
         }
         stack.extend(named_children(node));
@@ -7935,13 +9891,7 @@ fn syntax_has_automatic_object(source: &str, trivial: &TrivialTypeIndex, root: N
 fn block_has_automatic_object(source: &str, trivial: &TrivialTypeIndex, block: Node<'_>) -> bool {
     let mut stack = named_children(block);
     while let Some(node) = stack.pop() {
-        if matches!(node.kind(), "declaration" | "field_declaration")
-            && declaration_may_construct_object(node)
-            && !trivial.declaration_is_trivial(source, node)
-            && !["static", "extern", "thread_local"]
-                .into_iter()
-                .any(|storage| has_storage_class(source, node, storage))
-        {
+        if declaration_is_automatic_object(source, trivial, node) {
             return true;
         }
         if matches!(
@@ -7953,6 +9903,19 @@ fn block_has_automatic_object(source: &str, trivial: &TrivialTypeIndex, block: N
         }
     }
     false
+}
+
+fn declaration_is_automatic_object(
+    source: &str,
+    trivial: &TrivialTypeIndex,
+    declaration: Node<'_>,
+) -> bool {
+    matches!(declaration.kind(), "declaration" | "field_declaration")
+        && declaration_may_construct_object(declaration)
+        && !trivial.declaration_is_trivial(source, declaration)
+        && !["static", "extern", "thread_local"]
+            .into_iter()
+            .any(|storage| has_storage_class(source, declaration, storage))
 }
 
 fn block_has_potential_vla(block: Node<'_>) -> bool {
@@ -8006,12 +9969,6 @@ fn case_runtime_children(node: Node<'_>) -> Vec<Node<'_>> {
                 && is_statement_or_declaration(child.kind())
         })
         .collect()
-}
-
-fn call_arguments(node: Node<'_>) -> Vec<Node<'_>> {
-    node.child_by_field_name("arguments")
-        .map(named_children)
-        .unwrap_or_default()
 }
 
 fn is_unevaluated_builtin_call(source: &str, node: Node<'_>) -> bool {
@@ -8354,39 +10311,22 @@ fn is_type_syntax(kind: &str) -> bool {
 }
 
 fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
+    brokk_bifrost_core::analyzer::tree_walk::named_children_vec(node)
+        .into_iter()
         .filter(|child| !is_comment_kind(child.kind()))
         .collect()
 }
 
 fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .find(|child| !is_comment_kind(child.kind()))
+    brokk_bifrost_core::analyzer::tree_walk::first_named_child_matching(node, |child| {
+        !is_comment_kind(child.kind())
+    })
 }
 
-fn has_direct_token(node: Node<'_>, kind: &str) -> bool {
-    let mut cursor = node.walk();
-    node.children(&mut cursor).any(|child| child.kind() == kind)
-}
-
-fn is_comment_kind(kind: &str) -> bool {
-    matches!(kind, "comment" | "line_comment" | "block_comment")
-}
+use brokk_bifrost_core::analyzer::tree_walk::has_child_of_kind as has_direct_token;
 
 fn required_field<'tree>(node: Node<'tree>, field: &str) -> Result<Node<'tree>, CppLoweringError> {
-    node.child_by_field_name(field)
-        .ok_or_else(|| missing_field(node, field))
-}
-
-fn missing_field(node: Node<'_>, field: &str) -> CppLoweringError {
-    CppLoweringError::Invalid(format!(
-        "{} node at bytes {}..{} is missing structured field {field}",
-        node.kind(),
-        node.start_byte(),
-        node.end_byte()
-    ))
+    crate::analyzer::semantic::lowering::required_field_or_else(node, field, missing_field)
 }
 
 fn binary_operator(node: Node<'_>) -> Option<&'static str> {
@@ -8402,19 +10342,9 @@ fn assignment_operator(node: Node<'_>) -> Option<&str> {
         .map(|operator| operator.kind())
 }
 
-const fn completion_label(kind: CompletionKind) -> &'static str {
-    match kind {
-        CompletionKind::Normal => "normal",
-        CompletionKind::Return => "return",
-        CompletionKind::Throw => "throw",
-        CompletionKind::Break => "break",
-        CompletionKind::Continue => "continue",
-        CompletionKind::Yield => "yield",
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use brokk_bifrost_test_macros::hardwon;
     use std::sync::Arc;
 
     use super::*;
@@ -8503,6 +10433,7 @@ mod tests {
 
     /// A by-value scalar relay is a value transfer, not a decline (#2666, #2665).
     #[test]
+    #[hardwon("#2666: by-value scalar returns and local initializers lost value flow")]
     fn by_value_scalar_return_and_local_publish_value_flow_without_a_gap() {
         const SOURCE: &str = r#"
 int produce();
@@ -8572,6 +10503,7 @@ void run() {
     /// adapter's decision (`Unsupported`), it names the declared object rather
     /// than the statement, and it leaves the proven siblings alone (#2666).
     #[test]
+    #[hardwon("#2666: a class initializer decline hid valid sibling value flow")]
     fn class_typed_by_value_initializer_declines_only_its_own_object() {
         const SOURCE: &str = r#"
 struct Holder {
@@ -8629,6 +10561,7 @@ void run() {
     /// runs no constructor and needs no destructor. Declining its cleanup or
     /// its lifetime calls would claim code exists where none does (#2666).
     #[test]
+    #[hardwon("#2666: trivial C++ objects were incorrectly treated as RAII gaps")]
     fn a_trivially_destructible_automatic_object_opens_no_lifetime_decline() {
         const SOURCE: &str = r#"
 struct Trivial {
@@ -8649,6 +10582,30 @@ void run() {
             )),
             "a trivially destructible automatic object opens no RAII boundary: {:#?}",
             run.gaps
+        );
+    }
+
+    #[test]
+    fn local_class_access_specifiers_are_not_lowered_as_goto_labels() {
+        const SOURCE: &str = r#"
+void run() {
+    class Local {
+    public:
+        int value;
+    private:
+        int hidden;
+    protected:
+        int guarded;
+    };
+    int result = 1;
+    result = result;
+}
+"#;
+
+        let run = lower_procedure_named(SOURCE, "run");
+        assert!(
+            !run.points.is_empty(),
+            "access specifiers must not prevent the local class procedure from lowering"
         );
     }
 }

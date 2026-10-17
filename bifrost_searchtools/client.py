@@ -15,6 +15,7 @@ from typing import Any, get_args, overload
 from .models import (
     BlastRadiusResult,
     CyclomaticComplexityDiffResult,
+    DiffCallEdgeScopeValue,
     DiffAnalysisResult,
     CodeQualityReport,
     CodeQueryExecutionMode,
@@ -70,6 +71,24 @@ class MostRelevantFilesRankingMode(StrEnum):
 
 
 _CODE_QUERY_EXECUTION_MODES = frozenset(get_args(CodeQueryExecutionMode))
+# Wire keys of the CodeQuery sources the decoder accepts. `pattern` is sent as
+# `match`, and `except_` as `except`.
+_CODE_QUERY_SOURCE_FIELDS = (
+    "match",
+    "occurrences",
+    "scopes",
+    "bindings",
+    "generation_sites",
+    "exports",
+    "dependency_evidence",
+    "configuration_facts",
+    "correlate",
+    "require_both",
+    "paths",
+    "union",
+    "intersect",
+    "except",
+)
 
 
 @dataclass(frozen=True)
@@ -193,9 +212,20 @@ class SearchToolsClient:
         self,
         pattern: dict[str, Any] | None = None,
         *,
+        occurrences: dict[str, Any] | None = None,
+        scopes: dict[str, Any] | None = None,
+        bindings: dict[str, Any] | None = None,
+        generation_sites: dict[str, Any] | None = None,
+        exports: dict[str, Any] | None = None,
+        dependency_evidence: dict[str, Any] | None = None,
+        configuration_facts: dict[str, Any] | None = None,
+        correlate: dict[str, Any] | None = None,
+        require_both: dict[str, Any] | None = None,
+        paths: dict[str, Any] | None = None,
         union: list[dict[str, Any]] | None = None,
         intersect: list[dict[str, Any]] | None = None,
         except_: list[dict[str, Any]] | None = None,
+        query_file: str | None = None,
         inside: dict[str, Any] | None = None,
         inside_decl: dict[str, Any] | None = None,
         not_inside: dict[str, Any] | None = None,
@@ -208,6 +238,22 @@ class SearchToolsClient:
         execution_mode: CodeQueryExecutionMode | None = None,
     ) -> CodeQueryResponse:
         """Query normalized code structure across supported languages.
+
+        Pass exactly one query source. ``pattern`` is a structural query and is
+        sent as the tool's ``match`` object. The other sources are the
+        ``occurrences``, ``scopes``, ``bindings``, ``generation_sites``,
+        ``exports``, ``dependency_evidence``, ``configuration_facts``,
+        ``correlate``, ``require_both``, and ``paths`` objects, each a
+        source-specific filter. ``union``, ``intersect``, and ``except_`` take
+        at least two branches, and each branch is a complete canonical
+        query-plan dictionary that must produce the same typed domain.
+        ``correlate`` pairs code and configuration rows through a registered
+        relation; ``require_both`` requires both inputs to produce rows without
+        pairing them.
+
+        ``query_file`` names a workspace-relative ``.rql`` or ``.json`` file that
+        holds the complete query. It is exclusive: pass it alone, with no other
+        query argument.
 
         ``schema_version`` is optional. Version ``1`` is the only supported
         version; omit it or pin it explicitly. Other versions are rejected.
@@ -285,17 +331,21 @@ class SearchToolsClient:
         which exists even when the language records no candidate trace.
         Hierarchy steps are direct by default and accept a positive ``depth`` or
         ``transitive=True``. Declaration results are limited to declarations
-        indexed by the workspace analyzer. Pass exactly one of ``pattern``,
-        ``union``, ``intersect``, or ``except_``. Set operands are complete
-        canonical query-plan dictionaries and must produce the same typed
-        domain. ``pattern`` is sent as the tool's ``match`` object. Structural
-        scope arguments apply only with ``pattern``. ``where`` accepts project-relative globs or absolute
-        in-workspace paths/globs. ``result_detail="full"`` adds stable IDs and
+        indexed by the workspace analyzer. ``inside``, ``inside_decl``, and
+        ``not_inside`` apply only to a ``pattern`` query; put structural
+        containment inside each set branch. ``where`` accepts project-relative
+        globs or absolute in-workspace paths/globs, and ``languages`` filters by
+        language. Both apply to the sources that have those axes; the engine
+        rejects ``languages`` for ``dependency_evidence`` and
+        ``configuration_facts``, which have no programming-language axis.
+        ``result_detail="full"`` adds stable IDs and
         precise ranges; compact mode retains minimal pipeline provenance.
         ``execution_mode="results"`` returns ordinary matches,
         ``execution_mode="explain"`` returns the parsed, logical, and selected
         physical plan without executing it, and ``execution_mode="profile"``
         executes the query and returns both results and structured observations.
+
+        Invalid query arguments raise ``ValueError`` with the engine's message.
         """
         if (
             execution_mode is not None
@@ -303,47 +353,48 @@ class SearchToolsClient:
         ):
             accepted = ", ".join(sorted(_CODE_QUERY_EXECUTION_MODES))
             raise ValueError(f"execution_mode must be one of: {accepted}")
-        sources = {
+        fields: dict[str, Any] = {
             "match": pattern,
+            "occurrences": occurrences,
+            "scopes": scopes,
+            "bindings": bindings,
+            "generation_sites": generation_sites,
+            "exports": exports,
+            "dependency_evidence": dependency_evidence,
+            "configuration_facts": configuration_facts,
+            "correlate": correlate,
+            "require_both": require_both,
+            "paths": paths,
             "union": union,
             "intersect": intersect,
             "except": except_,
+            "query_file": query_file,
+            "inside": inside,
+            "inside_decl": inside_decl,
+            "not_inside": not_inside,
+            "where": where,
+            "languages": languages,
+            "steps": steps,
+            "limit": limit,
+            "result_detail": result_detail,
+            "schema_version": schema_version,
+            "execution_mode": execution_mode,
         }
-        selected = [(name, value) for name, value in sources.items() if value is not None]
-        if len(selected) != 1:
-            raise ValueError(
-                "query_code requires exactly one of pattern, union, intersect, or except_"
-            )
-        source_name, source_value = selected[0]
-        if source_name != "match" and any(
-            value is not None
-            for value in (inside, inside_decl, not_inside, where, languages)
-        ):
-            raise ValueError(
-                "inside, inside_decl, not_inside, where, and languages apply only to a pattern query; "
-                "put structural scope fields inside each set branch"
-            )
-        arguments: dict[str, Any] = {source_name: source_value}
-        if inside is not None:
-            arguments["inside"] = inside
-        if inside_decl is not None:
-            arguments["inside_decl"] = inside_decl
-        if not_inside is not None:
-            arguments["not_inside"] = not_inside
-        if where is not None:
-            arguments["where"] = list(where)
-        if languages is not None:
-            arguments["languages"] = list(languages)
-        if steps is not None:
-            arguments["steps"] = list(steps)
-        if limit is not None:
-            arguments["limit"] = limit
-        if result_detail is not None:
-            arguments["result_detail"] = result_detail
-        if schema_version is not None:
-            arguments["schema_version"] = schema_version
-        if execution_mode is not None:
-            arguments["execution_mode"] = execution_mode
+        arguments = {name: value for name, value in fields.items() if value is not None}
+        if "query_file" in arguments:
+            if len(arguments) != 1:
+                raise ValueError(
+                    "query_file is exclusive; put the complete query in the referenced file"
+                )
+        else:
+            sources = [name for name in _CODE_QUERY_SOURCE_FIELDS if name in arguments]
+            if len(sources) != 1:
+                raise ValueError(
+                    "query_code requires exactly one source (pattern, occurrences, scopes, "
+                    "bindings, generation_sites, exports, dependency_evidence, "
+                    "configuration_facts, correlate, require_both, paths, union, intersect, "
+                    f"or except_) or query_file, got {sources!r}"
+                )
         payload = self._call_tool_payload("query_code", arguments)
         return parse_code_query_response(
             payload.structured,
@@ -356,10 +407,7 @@ class SearchToolsClient:
         *,
         kind_filter: SymbolKindFilter = SymbolKindFilter.ANY,
     ) -> SymbolLocationsResult:
-        payload = self._call_tool_payload(
-            "get_symbol_locations",
-            {"symbols": symbols, "kind_filter": kind_filter.value},
-        )
+        payload = self._get_symbol_payload("get_symbol_locations", symbols, kind_filter)
         return SymbolLocationsResult.from_dict(
             payload.structured,
             render_line_numbers=self._render_line_numbers,
@@ -372,10 +420,7 @@ class SearchToolsClient:
         *,
         kind_filter: SymbolKindFilter = SymbolKindFilter.CLASS,
     ) -> SymbolAncestorsResult:
-        payload = self._call_tool_payload(
-            "get_symbol_ancestors",
-            {"symbols": symbols, "kind_filter": kind_filter.value},
-        )
+        payload = self._get_symbol_payload("get_symbol_ancestors", symbols, kind_filter)
         return SymbolAncestorsResult.from_dict(
             payload.structured,
             rendered_text=payload.rendered_text,
@@ -387,10 +432,7 @@ class SearchToolsClient:
         *,
         kind_filter: SymbolKindFilter = SymbolKindFilter.ANY,
     ) -> SymbolSourcesResult:
-        payload = self._call_tool_payload(
-            "get_symbol_sources",
-            {"symbols": symbols, "kind_filter": kind_filter.value},
-        )
+        payload = self._get_symbol_payload("get_symbol_sources", symbols, kind_filter)
         return SymbolSourcesResult.from_dict(
             payload.structured,
             render_line_numbers=self._render_line_numbers,
@@ -453,14 +495,16 @@ class SearchToolsClient:
         path: str,
         *,
         new_name: str,
-        line: int | None = None,
-        column: int | None = None,
+        line: int,
+        column: int,
     ) -> RenameSymbolResult:
-        arguments: dict[str, Any] = {"path": path, "new_name": new_name}
-        if line is not None:
-            arguments["line"] = line
-        if column is not None:
-            arguments["column"] = column
+        """Return the edit set for renaming the identifier at a 1-based line and column."""
+        arguments: dict[str, Any] = {
+            "path": path,
+            "new_name": new_name,
+            "line": line,
+            "column": column,
+        }
         result = self._call_tool("rename_symbol", arguments)
         return RenameSymbolResult.from_dict(result)
 
@@ -509,37 +553,53 @@ class SearchToolsClient:
         symbols: list[str],
         *,
         include_tests: bool = False,
+        include_same_owner: bool = False,
         paths: list[str] | None = None,
     ) -> ScanUsagesResult:
         arguments: dict[str, Any] = {
             "include_tests": include_tests,
+            "include_same_owner": include_same_owner,
         }
         arguments["symbols"] = symbols
         if paths is not None:
             arguments["paths"] = paths
-        payload = self._call_tool_payload("scan_usages_by_reference", arguments)
-        return ScanUsagesResult.from_dict(
-            payload.structured,
-            rendered_text=payload.rendered_text,
-        )
+        return self._scan_usages_result("scan_usages_by_reference", arguments)
 
     def scan_usages_by_location(
         self,
         targets: list[dict[str, Any]],
         *,
         include_tests: bool = False,
+        include_same_owner: bool = False,
         paths: list[str] | None = None,
     ) -> ScanUsagesResult:
         arguments: dict[str, Any] = {
             "targets": targets,
             "include_tests": include_tests,
+            "include_same_owner": include_same_owner,
         }
         if paths is not None:
             arguments["paths"] = paths
-        payload = self._call_tool_payload("scan_usages_by_location", arguments)
+        return self._scan_usages_result("scan_usages_by_location", arguments)
+
+    def _scan_usages_result(
+        self, name: str, arguments: dict[str, Any]
+    ) -> ScanUsagesResult:
+        payload = self._call_tool_payload(name, arguments)
         return ScanUsagesResult.from_dict(
             payload.structured,
             rendered_text=payload.rendered_text,
+        )
+
+    def _get_symbol_payload(
+        self,
+        name: str,
+        symbols: list[str],
+        kind_filter: SymbolKindFilter,
+    ) -> _ToolPayload:
+        return self._call_tool_payload(
+            name,
+            {"symbols": symbols, "kind_filter": kind_filter.value},
         )
 
     @overload
@@ -684,6 +744,7 @@ class SearchToolsClient:
         *,
         base: str | None = None,
         include_tests: bool = True,
+        call_edges: DiffCallEdgeScopeValue = "changed_lines",
     ) -> DiffAnalysisResult:
         """Diff two endpoints and return semantic effects.
 
@@ -692,8 +753,21 @@ class SearchToolsClient:
         by ``origin/HEAD`` (falling back to ``HEAD`` when unavailable). An
         explicit commit ``target`` still defaults to its first parent. Merge and
         root commits require an explicit ``base``.
+
+        ``call_edges`` selects call facts from changed reference start-line
+        inventories (``changed_lines``), the full changed-file inventory
+        (``changed_files``), or omits call-edge analysis (``omit``). Selected
+        line facts do not describe whole-function or whole-caller relationship
+        changes; unchanged sites and import-only rebinding outside the selected
+        lines are intentionally omitted. Selected-line additions and removals
+        require completeness on the opposite endpoint to be precise; full
+        changed-file results may retain incumbent best-effort deltas when
+        ``call_analysis`` reports incompleteness.
         """
-        arguments: dict[str, Any] = {"include_tests": include_tests}
+        arguments: dict[str, Any] = {
+            "include_tests": include_tests,
+            "call_edges": call_edges,
+        }
         if target is not None:
             arguments["target"] = target
         if base is not None:
@@ -998,22 +1072,7 @@ class SearchToolsClient:
         )
 
     def _call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        runtime = self._ensure_started()
-        try:
-            payload = runtime.native.call_tool_payload_json(
-                name,
-                json.dumps(arguments),
-                self._render_line_numbers,
-            )
-        except Exception as exc:
-            raise SearchToolsError(str(exc)) from exc
-
-        try:
-            decoded = json.loads(payload)
-        except json.JSONDecodeError as exc:
-            raise SearchToolsError(
-                f"Native searchtools call returned invalid JSON: {exc}"
-            ) from exc
+        decoded = self._call_tool_json(name, arguments)
         if not isinstance(decoded, dict):
             raise SearchToolsError("Native searchtools call did not return a JSON object")
         structured = decoded.get("structured")
@@ -1029,6 +1088,8 @@ class SearchToolsClient:
         runtime = self._ensure_started()
         try:
             payload = runtime.native.call_tool_json(name, json.dumps(arguments))
+        except ValueError:
+            raise
         except Exception as exc:
             raise SearchToolsError(str(exc)) from exc
 
@@ -1043,22 +1104,7 @@ class SearchToolsClient:
         return decoded
 
     def _call_tool_payload(self, name: str, arguments: dict[str, Any]) -> _ToolPayload:
-        runtime = self._ensure_started()
-        try:
-            payload = runtime.native.call_tool_payload_json(
-                name,
-                json.dumps(arguments),
-                self._render_line_numbers,
-            )
-        except Exception as exc:
-            raise SearchToolsError(str(exc)) from exc
-
-        try:
-            decoded = json.loads(payload)
-        except json.JSONDecodeError as exc:
-            raise SearchToolsError(
-                f"Native searchtools call returned invalid JSON: {exc}"
-            ) from exc
+        decoded = self._call_tool_json(name, arguments)
         if not isinstance(decoded, dict):
             raise SearchToolsError(
                 "Native searchtools call did not return a JSON object payload"
@@ -1074,6 +1120,28 @@ class SearchToolsClient:
                 "Native searchtools payload returned a non-string rendered_text"
             )
         return _ToolPayload(structured=structured, rendered_text=rendered_text)
+
+    def _call_tool_json(self, name: str, arguments: dict[str, Any]) -> Any:
+        runtime = self._ensure_started()
+        try:
+            payload = runtime.native.call_tool_payload_json(
+                name,
+                json.dumps(arguments),
+                self._render_line_numbers,
+            )
+        except ValueError:
+            # The native layer raises ValueError for invalid arguments and stale
+            # workspace generations (src/python_module.rs). Those are caller errors.
+            raise
+        except Exception as exc:
+            raise SearchToolsError(str(exc)) from exc
+
+        try:
+            return json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise SearchToolsError(
+                f"Native searchtools call returned invalid JSON: {exc}"
+            ) from exc
 
     def _ensure_started(self) -> _RuntimeState:
         with self._runtime_lock:

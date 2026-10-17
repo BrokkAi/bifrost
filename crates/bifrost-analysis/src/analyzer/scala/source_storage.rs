@@ -28,7 +28,7 @@ pub(in crate::analyzer) const SCALA_SOURCE_HEADER_SQL: &str =
        AND source.publication_state = 'complete' AND meta.is_complete = 1 AND ready.available = 1";
 
 fn required<T>(value: Option<T>, label: &str) -> Result<T> {
-    value.ok_or_else(|| StoreError::new(format!("Scala source syntax is missing {label}")))
+    crate::analyzer::store::required_source_value(value, "Scala source syntax", label)
 }
 
 fn decode_kind(value: i64) -> Result<ScalaDeclarationKind> {

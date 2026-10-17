@@ -10,12 +10,22 @@
 //! means, which is the caller's business; what is the same is the algorithm
 //! around it, which is this module's.
 //!
-//! The algorithm is the plan's head algorithm
-//! (`.agents/plans/impact-sliced-diff-base.md`, "The head algorithm") applied
-//! to one policy: classify, enumerate, key, prefetch, verify-or-recompute,
-//! check exhaustiveness, publish, merge, check the merged limits. Every step
-//! that can refuse returns a typed [`WidenReason`], which the caller reports
-//! beside a full evaluation rather than swallowing.
+//! The algorithm applied to one policy is: classify, enumerate, key, prefetch,
+//! verify or recompute, check exhaustiveness, publish, merge, and check merged
+//! limits. Every step that can refuse returns a typed [`WidenReason`], which
+//! the caller reports beside a full evaluation rather than swallowing.
+//!
+//! Reuse follows one contract: publish a unit only with the read ledger that
+//! licenses it, and verify every ledger entry against the head workspace before
+//! reuse. A summary read identity excludes the workspace digest because the
+//! unit's `File` and `Artifact` keys verify the precise workspace inputs. A
+//! result-cache hit records no read set and cannot publish a unit. Shared budget
+//! lanes remain request-wide: reused root products replay their solver,
+//! semantic, execution, artifact-lease, and finding-lane charges, and reaching
+//! a shared limit widens the policy with `MergedLimitReached`. A typestate root
+//! key includes its compiled protocol and binding-plan hashes, so a product from
+//! one compiled plan is not served under another. Adding an admitted partition
+//! or product kind requires updating the `policy_units` check constraint.
 
 use std::sync::Arc;
 
@@ -107,6 +117,9 @@ impl UnitAttempt {
             units_recomputed: self.recomputed,
             units_unbounded: self.unbounded,
             widen_reason,
+            base_units_reused: 0,
+            base_units_recomputed: 0,
+            base_widen_reason: None,
         }
     }
 }
@@ -164,7 +177,8 @@ impl<'a> UnitReuse<'a> {
         if let Err(error) = self
             .incremental
             .store()
-            .borrow_mut()
+            .lock()
+            .expect("policy-unit store mutex poisoned")
             .prefetch(keys, self.budget)
         {
             let policy_id = self.policy_id;
@@ -190,7 +204,11 @@ impl<'a> UnitReuse<'a> {
         if !self.incremental.reuses_existing() {
             return Ok(None);
         }
-        let store = self.incremental.store().borrow();
+        let store = self
+            .incremental
+            .store()
+            .lock()
+            .expect("policy-unit store mutex poisoned");
         let Some(unit) = store.lookup(key) else {
             return Ok(None);
         };
@@ -208,10 +226,41 @@ impl<'a> UnitReuse<'a> {
             DerivedArtifactKind::PolicyEvaluationUnit,
             unit.read_digest().digest(),
         );
+        // The store holds one unit per key, whichever run published it last:
+        // a full scan of another revision, an earlier head of the same pull
+        // request. Only its name-index reads are proved relative to a
+        // snapshot; every other read is checked against this head itself. So
+        // a unit without index reads is verified wherever it came from, and
+        // one with index reads from a snapshot this comparison is not between
+        // is recomputed rather than verified against the wrong difference.
+        let changed = match self.incremental.changed_since(unit.snapshot()) {
+            Some(changed) => changed,
+            None if !unit.reads_name_index() => self.incremental.changed(),
+            None => {
+                let policy_id = self.policy_id;
+                brokk_bifrost_analysis::profiling::note_with(|| {
+                    format!(
+                        "policy.units policy={policy_id} partition={:?} foreign_snapshot={}",
+                        key.partition,
+                        unit.snapshot()
+                    )
+                });
+                self.incremental
+                    .verdicts()
+                    .record(ArtifactVerdict::Invalidated(
+                        InvalidationReason::InputContentChanged {
+                            artifact,
+                            before: unit.snapshot(),
+                            after: self.incremental.snapshot(),
+                        },
+                    ));
+                return Ok(None);
+            }
+        };
         match verify_read_set_for_artifact(
             artifact,
             self.incremental.workspace(),
-            self.incremental.changed(),
+            changed,
             &self.head_inputs,
             unit.reads(),
             self.replay_limits,
@@ -221,8 +270,7 @@ impl<'a> UnitReuse<'a> {
             // retains no summary under any identity, so the question cannot be
             // asked here at all; what carries the dependency is the closure
             // the recorder names beside each summary, one `Artifact` key per
-            // member, which verification re-derives from the head's own bytes
-            // (`.agents/plans/impact-sliced-diff-base.md`, Decision Log (5b)).
+            // member, which verification re-derives from the head's own bytes.
             &NoSummaryAnswers,
             &mut self.memo,
         ) {
@@ -273,9 +321,10 @@ impl<'a> UnitReuse<'a> {
         product: PolicyUnitProduct,
         reads: Vec<ReadKey>,
     ) {
+        let snapshot = self.incremental.publication_snapshot(&reads);
         self.incremental.stage_unit(
             self.policy_id.clone(),
-            PolicyUnit::new(key, product, reads, BudgetMode::Exhaustive),
+            PolicyUnit::new(key, product, reads, BudgetMode::Exhaustive, snapshot),
         );
     }
 }
@@ -382,6 +431,30 @@ pub(crate) fn query_slicing_widen_reason(query: &CodeQuery) -> Option<WidenReaso
     if query.plan.requires_workspace_field_index() {
         Some(WidenReason::WorkspacePreparationRequired)
     } else if !PlanPartitioning::classify(&query.plan).is_by_seed() {
+        Some(WidenReason::PlanCrossesSeeds)
+    } else {
+        None
+    }
+}
+
+/// Why the taint composition's frontier cannot evaluate `query` on one blob,
+/// or `None` when it can.
+///
+/// The frontier reads one blob's rows and merges nothing, so it accepts what
+/// [`query_slicing_widen_reason`] accepts plus an `except` over rows whose
+/// identity names their file ([`PlanPartitioning::restricts_to_seed_file`]).
+/// Unit reuse keeps the stricter rule: a unit's rows must merge into the whole
+/// execution's rows, and an `except` there consults rows of every seed. The
+/// workspace field-index prepass would be repeated per blob either way. A plan
+/// with a step that can move its rows out of the seed's file (a reverse or
+/// forward relation, see `QueryStepOp::rows_may_leave_seed_file`) has rows
+/// not at its seed's file, so one blob's slice does not hold the rows that lie in that
+/// blob; the frontier evaluates it once over the workspace and indexes the
+/// rows by where they lie.
+pub(crate) fn frontier_slicing_widen_reason(query: &CodeQuery) -> Option<WidenReason> {
+    if query.plan.requires_workspace_field_index() {
+        Some(WidenReason::WorkspacePreparationRequired)
+    } else if !PlanPartitioning::restricts_to_seed_file(&query.plan) {
         Some(WidenReason::PlanCrossesSeeds)
     } else {
         None
@@ -499,7 +572,7 @@ pub(crate) fn sliced_query_units(
 /// Exhaustiveness is checked on the product rather than on how it was obtained:
 /// a unit that truncated or raised a diagnostic is not a partition of a whole
 /// execution, whichever run computed it.
-fn check_exhaustive_rows(rows: &UnitExecutionResult) -> Result<(), WidenReason> {
+pub(super) fn check_exhaustive_rows(rows: &UnitExecutionResult) -> Result<(), WidenReason> {
     if rows.truncated {
         return Err(WidenReason::UnitNotExhaustive);
     }

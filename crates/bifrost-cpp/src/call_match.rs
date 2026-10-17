@@ -17,6 +17,20 @@ pub struct CppArgType {
     pub pointee_const: bool,
 }
 
+/// The portion of C++ argument applicability that the declaration metadata can
+/// prove without running overload resolution or a conversion engine.
+///
+/// `Unknown` is intentional for user-defined conversions, standard
+/// conversions, templates, and incomplete argument/signature facts. The
+/// existing candidate filter remains conservative in all of those cases; this
+/// value only gives the trace a typed explanation for the evidence it has.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CppArgumentApplicability {
+    Applicable,
+    Inapplicable,
+    Unknown,
+}
+
 pub fn cpp_signature_param_types(signature: &str) -> Option<Vec<String>> {
     let inner = cpp_signature_parameter_text(signature)
         .unwrap_or(signature)
@@ -250,6 +264,60 @@ pub fn cpp_filter_candidates_by_args_with_parameter_types(
         candidates
     } else {
         filtered
+    }
+}
+
+/// Classify one candidate using the same structured parameter/type comparison
+/// as [`cpp_filter_candidates_by_args_with_parameter_types`]. This is a
+/// deliberately narrower question than overload selection: an exact written
+/// type match is applicable, a proven pointer-shape mismatch is inapplicable,
+/// and every conversion or incomplete fact stays unknown.
+pub fn cpp_candidate_argument_applicability(
+    candidate: &CodeUnit,
+    arg_types: &[Option<CppArgType>],
+    parameter_types: &dyn Fn(&CodeUnit) -> Option<Vec<String>>,
+    is_template: &dyn Fn(&CodeUnit) -> bool,
+    resolve_type: &dyn Fn(&str) -> Option<CodeUnit>,
+    assignable: &dyn Fn(&CodeUnit, &CodeUnit) -> bool,
+) -> CppArgumentApplicability {
+    let Some(parameters) = parameter_types(candidate) else {
+        return CppArgumentApplicability::Unknown;
+    };
+    if arg_types.iter().any(Option::is_none) || is_template(candidate) {
+        return CppArgumentApplicability::Unknown;
+    }
+    if parameters.len() != arg_types.len() {
+        return CppArgumentApplicability::Inapplicable;
+    }
+    let args: Vec<&CppArgType> = arg_types.iter().flatten().collect();
+    debug_assert_eq!(args.len(), arg_types.len());
+
+    let mut uncertain = false;
+    for (parameter, argument) in parameters.iter().zip(args) {
+        if cpp_type_text_pointer_depth(parameter) != argument.indirection
+            || (argument.pointee_const && !cpp_type_text_pointee_is_const(parameter))
+        {
+            return CppArgumentApplicability::Inapplicable;
+        }
+        if cpp_param_matches_arg(parameter, argument, false, resolve_type, assignable) {
+            continue;
+        }
+        // This is a known closed-list conversion in the existing filter. It
+        // is not a direct written type match, so leave it open to the future
+        // C++ conversion producer rather than claiming a rule-level answer.
+        if cpp_standard_conversion_applies(argument, parameter) {
+            uncertain = true;
+            continue;
+        }
+        // A same-shaped but differently named type may be accepted by a
+        // user-defined conversion or a constructor. The adapter has no
+        // complete conversion graph here, so it cannot reject it.
+        uncertain = true;
+    }
+    if uncertain {
+        CppArgumentApplicability::Unknown
+    } else {
+        CppArgumentApplicability::Applicable
     }
 }
 
@@ -543,15 +611,7 @@ fn cpp_parameter_name_token(token: &str) -> bool {
             .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
-fn strip_tag_type_prefix(value: &str) -> &str {
-    let value = value.trim_start_matches("const ");
-    value
-        .strip_prefix("struct ")
-        .or_else(|| value.strip_prefix("class "))
-        .or_else(|| value.strip_prefix("enum "))
-        .unwrap_or(value)
-        .trim()
-}
+use crate::declarations::strip_tag_type_prefix;
 
 fn cpp_number_literal_is_float(text: &str) -> bool {
     let text = text.trim();
@@ -563,6 +623,7 @@ mod tests {
     use super::*;
     use brokk_bifrost_core::analyzer::ProjectFile;
     use brokk_bifrost_core::analyzer::model::CodeUnitType;
+    use brokk_bifrost_test_macros::hardwon;
 
     fn test_file() -> ProjectFile {
         ProjectFile::new(std::env::temp_dir(), "test.cpp")
@@ -584,6 +645,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#427: overload call filtering conflated different callable candidates")]
     fn cpp_filter_candidates_matches_named_unindexed_types() {
         let candidates = vec![
             function("format", "std::string format(const std::string& value)"),
@@ -605,6 +667,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#427: overload call filtering conflated different callable candidates")]
     fn cpp_filter_candidates_matches_assignable_units() {
         let arg = class("Arg");
         let param = class("Param");
@@ -623,6 +686,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#427: overload call filtering conflated different callable candidates")]
     fn cpp_filter_candidates_rejects_pointer_depth_mismatch() {
         let candidates = vec![
             function("take", "void take(int* value)"),
@@ -644,6 +708,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#427: string literal types were missing from overload matching")]
     fn cpp_filter_candidates_uses_const_string_literal_pointer_evidence() {
         let literal = Some(CppArgType {
             name: "char".to_string(),
@@ -690,6 +755,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#427: parameter pointer const was confused with pointee const")]
     fn cpp_parameter_type_keeps_pointer_const_distinct_from_pointee_const() {
         assert_eq!("char*", cpp_parameter_type_text("char * const value"));
         assert_eq!(
@@ -700,6 +766,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#427: unknown argument types must preserve conservative overload candidates")]
     fn cpp_filter_candidates_keeps_all_for_unknown_arguments() {
         let candidates = vec![
             function("format", "void format(std::string value)"),
@@ -711,6 +778,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#427: unmatched implicit conversions must preserve conservative candidates")]
     fn cpp_filter_candidates_keeps_all_when_no_candidate_matches() {
         let candidates = vec![
             function("format", "void format(std::string value)"),
@@ -746,17 +814,14 @@ mod tests {
     }
 
     fn parse(source: &str) -> tree_sitter::Tree {
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_cpp::LANGUAGE.into())
-            .expect("the C++ grammar loads");
-        parser.parse(source, None).expect("the fixture parses")
+        crate::diagnostics::parse_cpp_tree(source)
     }
 
     /// #2552 shape 4. `std::move` and `std::forward` forward one argument, and
     /// its type is the call's type. Nothing else is that, including the same
     /// names outside `std` and a call with the wrong argument count.
     #[test]
+    #[hardwon("#2894: C++ call argument typing left forwarding/member-field calls ambiguous")]
     fn a_forwarding_call_reports_the_one_argument_it_forwards() {
         let source = r#"void f() {
    sink(std::move(a));
@@ -791,6 +856,7 @@ mod tests {
     /// A contiguous owning range now satisfies a span over the same element,
     /// including a span that adds `const`.
     #[test]
+    #[hardwon("#2894: owning contiguous ranges were excluded from span overloads")]
     fn a_contiguous_range_satisfies_a_span_over_its_element() {
         for arg in ["std::vector<uint8_t>", "std::array<uint8_t, 16>"] {
             for param in ["std::span<const uint8_t>", "std::span<uint8_t>"] {
@@ -817,6 +883,7 @@ mod tests {
     /// The near misses the issue asked for: a different element type, and an
     /// element that would lose its `const`.
     #[test]
+    #[hardwon("#2894: span conversion accepted incompatible element shapes")]
     fn a_range_over_another_element_does_not_satisfy_a_span() {
         for (arg, param) in [
             ("std::vector<int>", "std::span<const uint8_t>"),
@@ -842,6 +909,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2894: string and character pointers did not match string_view overloads")]
     fn an_owned_string_and_a_character_pointer_satisfy_a_string_view() {
         let literal = Some(CppArgType {
             name: "char".to_string(),
@@ -875,6 +943,7 @@ mod tests {
     /// that has both keeps resolving to the exact one, as it did before the
     /// conversion table existed.
     #[test]
+    #[hardwon("#2894: a standard conversion outranked an exact overload")]
     fn an_exact_match_outranks_a_standard_conversion() {
         let candidates = vec![
             function("own", "void own(std::vector<uint8_t> bytes)"),
@@ -894,6 +963,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("02186273bdc4: unknown template deductions discarded compatible overloads")]
     fn cpp_filter_candidates_keeps_templates_when_only_type_shape_is_unknown() {
         let candidates = vec![
             function("take", "void take(Vec256<float> value)"),
@@ -914,6 +984,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2909: an lvalue receiver retained an rvalue-qualified member")]
     fn signature_ref_qualifier_comes_from_the_ast_normalized_suffix() {
         assert_eq!(
             cpp_signature_ref_qualifier("() const & noexcept"),

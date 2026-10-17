@@ -11,14 +11,14 @@ use brokk_bifrost_core::analyzer::resolution_facts::{
 };
 
 use super::fact_lowering::{
-    LoweredResolutionFragment, LoweredSemanticRole, lookup_routes, lookup_semantic,
-    mounted_site_semantic,
+    LoweredResolutionFragment, LoweredSemanticRole, lexical_lookup_routes, lookup_routes,
+    lookup_semantic, mounted_site_semantic,
 };
 use super::fact_resolution::{
     FactBatchedReferenceAnswer, FactCallableReceiverTargetDisposition, FactReferenceBatchAnswer,
     FactReferenceReceiverGap, FactResolutionBatchSummary, SelectedFactResolutionSnapshot,
 };
-use super::fact_source::FactResolutionSource;
+use super::fact_source::{FactResolutionSource, language_callables_occupy_value_namespace};
 use super::typed_fact_lowering::LoweredTypedFragment;
 use super::{
     BindingFragmentId, FactReferenceSiteMetadata, MAX_REFERENCE_SEEDS_PER_BATCH, ResolutionAnswer,
@@ -34,18 +34,32 @@ use crate::analyzer::store::{Result as StoreResult, StoreError};
 use crate::analyzer::structural::reference_edges::EdgeDerivationResult;
 use crate::analyzer::structural::reference_edges::{
     EdgeCompleteness, EdgeIncompleteReason, EdgeSite, OwnerRelationMemo, ReferenceEdgeRow,
-    ReferenceSiteClassifier, is_same_owner_member_reference,
+    ReferenceSiteClassifier, SelectedReferenceFileState, is_same_owner_member_reference,
 };
 use crate::analyzer::structural::{EdgeAxis, EdgeProvenance, OwnerRelation, SiteClass};
-use crate::analyzer::usages::{UsageHitKind, UsageProof};
+use crate::analyzer::usages::{UsageHitKind, UsageHitSurface, UsageProof};
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};
 use crate::hash::{HashMap, HashSet};
-use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 #[cfg(any(test, feature = "test-support"))]
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::Arc;
+
+fn forward_only_covers(completeness: &EdgeCompleteness, axis: EdgeAxis) -> bool {
+    axis != EdgeAxis::InverseProjection && completeness.covers(axis)
+}
+
+fn domain_completeness<'a>(
+    domain: FactReferenceEdgeDeclarationDomain,
+    type_or_callable: &'a EdgeCompleteness,
+    field: &'a EdgeCompleteness,
+) -> &'a EdgeCompleteness {
+    match domain {
+        FactReferenceEdgeDeclarationDomain::TypeOrCallable => type_or_callable,
+        FactReferenceEdgeDeclarationDomain::Field => field,
+    }
+}
 
 /// One selected file-local fact artifact whose semantic identities must be
 /// crosswalked to the current analyzer snapshot.
@@ -182,6 +196,7 @@ fn reference_gap_domain(
     site_kind: ResolutionSiteKind,
 ) -> Option<FactReferenceEdgeGapDomain> {
     reference_gap_domain_for_receiver_dependency(
+        file.file().declaration_language(),
         namespace,
         site_kind,
         file.receiver_dependency(reference),
@@ -189,10 +204,19 @@ fn reference_gap_domain(
 }
 
 fn reference_gap_domain_for_receiver_dependency(
+    language: Language,
     namespace: ResolutionNamespace,
     site_kind: ResolutionSiteKind,
     receiver_dependency: Option<bool>,
 ) -> Option<FactReferenceEdgeGapDomain> {
+    // A bare value reference is a field occurrence, unless the language files
+    // its callables under the Value namespace too (Scala): then it can name a
+    // def, and an unresolved one cannot exclude the callable graph domain.
+    let value_domain = if language_callables_occupy_value_namespace(language) {
+        FactReferenceEdgeGapDomain::AnyGraphDeclaration
+    } else {
+        FactReferenceEdgeGapDomain::Field
+    };
     match namespace {
         ResolutionNamespace::Type
         | ResolutionNamespace::Callable
@@ -203,15 +227,18 @@ fn reference_gap_domain_for_receiver_dependency(
         ResolutionNamespace::Value if site_kind == ResolutionSiteKind::CallableReference => {
             Some(FactReferenceEdgeGapDomain::AnyGraphDeclaration)
         }
-        ResolutionNamespace::Value => Some(FactReferenceEdgeGapDomain::Field),
+        ResolutionNamespace::Value => Some(value_domain),
         ResolutionNamespace::Constant => Some(FactReferenceEdgeGapDomain::Field),
         ResolutionNamespace::Macro | ResolutionNamespace::Package => None,
         ResolutionNamespace::TypeOrValue
-            if matches!(site_kind, ResolutionSiteKind::ValueReference) =>
+            if matches!(
+                site_kind,
+                ResolutionSiteKind::ValueReference | ResolutionSiteKind::ImportQualifierReference
+            ) =>
         {
             match receiver_dependency {
                 Some(true) => None,
-                Some(false) => Some(FactReferenceEdgeGapDomain::Field),
+                Some(false) => Some(value_domain),
                 None => Some(FactReferenceEdgeGapDomain::AnyGraphDeclaration),
             }
         }
@@ -333,6 +360,41 @@ fn select_graph_declaration(
     if let Some(innermost_span) = candidates.iter().map(|(_, span)| *span).min() {
         candidates.retain(|(_, span)| *span == innermost_span);
     }
+    if candidates.is_empty()
+        && definition.site.kind == ResolutionSiteKind::ConstructorDeclaration
+        && let Some(owner) = owner
+    {
+        // The class declares no constructor unit that contains this site. When
+        // it declares none at all, the site is the constructor the language
+        // supplies. The class declares that constructor itself and the graph
+        // has no node for it apart from the class, which is where a call that
+        // selects it leads.
+        for candidate in current_graph_declarations {
+            if cancellation.is_cancelled() {
+                return Ok(None);
+            }
+            if candidate.declaration.terminal_name() != definition.name
+                || !expected_graph_kind.matches(&candidate.declaration)
+            {
+                continue;
+            }
+            let Some(has_owner) = declaration_has_structured_owner(
+                analyzer,
+                &candidate.declaration,
+                owner,
+                cancellation,
+            )?
+            else {
+                return Ok(None);
+            };
+            if has_owner {
+                return Err(StoreError::new(format!(
+                    "the class declares a constructor that does not contain selected native definition in {file:?}: definition={definition:?}, owner={owner:?}, constructor={candidate:?}"
+                )));
+            }
+        }
+        return Ok(Some(owner.clone()));
+    }
     if candidates.len() != 1 {
         return Err(StoreError::new(format!(
             "one current analyzer graph declaration must own selected native definition in {file:?}: definition={definition:?}, owner={owner:?}, candidates={candidates:?}, current_graph_declarations={current_graph_declarations:?}"
@@ -355,12 +417,12 @@ struct FactReferenceEdgeFile<'analyzer> {
 
 impl<'analyzer> FactReferenceEdgeFile<'analyzer> {
     fn new(analyzer: &'analyzer dyn IAnalyzer, file: ProjectFile, source: &str) -> Self {
-        let classifier = ReferenceSiteClassifier::new(analyzer, &file);
+        let selected = SelectedReferenceFileState::new(analyzer, &file, source);
         Self {
             file,
-            source_len: source.len(),
-            line_starts: compute_line_starts(source).into_boxed_slice(),
-            classifier,
+            source_len: selected.source_len,
+            line_starts: selected.line_starts,
+            classifier: selected.classifier,
             receiver_dependencies: None,
         }
     }
@@ -389,12 +451,13 @@ impl<'analyzer> FactReferenceEdgeFile<'analyzer> {
                 self.file, self.source_len
             )));
         }
-        Ok(Range {
-            start_byte,
-            end_byte,
-            start_line: find_line_index_for_offset(&self.line_starts, start_byte) + 1,
-            end_line: find_line_index_for_offset(&self.line_starts, end_byte.saturating_sub(1)) + 1,
-        })
+        Ok(
+            brokk_bifrost_core::analyzer::semantic_diagnostics::range_for_byte_span(
+                &self.line_starts,
+                start_byte,
+                end_byte,
+            ),
+        )
     }
 }
 
@@ -423,6 +486,65 @@ pub struct FactReferenceEdgeCatalog<'analyzer> {
     declarations: HashMap<SemanticId, FactReferenceEdgeDeclaration>,
     lookup_impacts_by_reference: HashMap<SemanticId, Vec<FactReferenceEdgeLookupImpact>>,
     targets_by_lookup: HashMap<SemanticId, Vec<CodeUnit>>,
+}
+
+/// Request-scoped catalog and memo shared by native forward graph providers.
+///
+/// Language-specific providers resolve selected definition identities into
+/// current source declarations; this helper owns the common batch identity,
+/// deduplication, and canonical row projection lifecycle.
+pub(crate) struct NativeReferenceEdgeBatchProjector<'analyzer> {
+    catalog: FactReferenceEdgeCatalog<'analyzer>,
+    owner_relations: OwnerRelationMemo,
+    projected_definitions: HashSet<SemanticId>,
+}
+
+impl<'analyzer> NativeReferenceEdgeBatchProjector<'analyzer> {
+    pub(crate) fn new(analyzer: &'analyzer dyn IAnalyzer) -> Self {
+        Self {
+            catalog: FactReferenceEdgeCatalog::new(analyzer),
+            owner_relations: OwnerRelationMemo::default(),
+            projected_definitions: HashSet::default(),
+        }
+    }
+
+    pub(crate) fn catalog_mut(&mut self) -> &mut FactReferenceEdgeCatalog<'analyzer> {
+        &mut self.catalog
+    }
+
+    pub(crate) fn pending_definitions(&self, batch: &FactReferenceBatchAnswer) -> Vec<SemanticId> {
+        let mut definitions = HashSet::default();
+        for answer in batch.answers() {
+            definitions.extend(answer.answer().binding().targets().iter().copied());
+            if let Some(owner) = answer.reference_owner().flatten() {
+                definitions.insert(owner);
+            }
+        }
+        definitions
+            .into_iter()
+            .filter(|definition| !self.projected_definitions.contains(definition))
+            .collect()
+    }
+
+    pub(crate) fn mark_projected(&mut self, definition: SemanticId) {
+        assert!(
+            self.projected_definitions.insert(definition),
+            "one native graph stage projects each selected definition once: {definition:?}"
+        );
+    }
+
+    pub(crate) fn project_batch(
+        &mut self,
+        batch: &FactReferenceBatchAnswer,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<FactReferenceEdgeBatch> {
+        project_fact_reference_edge_batch(
+            &self.catalog,
+            batch,
+            &mut self.owner_relations,
+            cancellation,
+        )
+    }
 }
 
 impl<'analyzer> FactReferenceEdgeCatalog<'analyzer> {
@@ -974,8 +1096,8 @@ impl<'analyzer> FactReferenceEdgeCatalog<'analyzer> {
                         expected.site.kind,
                         ResolutionSiteKind::CallableReference | ResolutionSiteKind::MemberReference
                     )
-                    || (expected.identifier.qualifier.is_none()
-                        != (origin == ResolutionCallableReceiverOrigin::Implicit))
+                    || !origin
+                        .is_reference_qualification_valid(expected.identifier.qualifier.is_none())
             }) {
                 return Err(StoreError::new(format!(
                     "selected native reference-edge callable receiver origin is misaligned in {file:?}: reference={reference:?}, origin={origin:?}, expected={expected:?}"
@@ -1141,19 +1263,43 @@ impl<'analyzer> FactReferenceEdgeCatalog<'analyzer> {
                     }
                     let receiver_dependency = expected.identifier.namespace
                         == ResolutionNamespace::TypeOrValue
-                        && expected.site.kind == ResolutionSiteKind::ValueReference
+                        && matches!(
+                            expected.site.kind,
+                            ResolutionSiteKind::ValueReference
+                                | ResolutionSiteKind::ImportQualifierReference
+                        )
                         && lowered_receiver_dependencies.contains(&lowered.semantic());
                     if receiver_dependency {
                         receiver_dependencies.insert(lowered.semantic());
                     }
                     let gap_domain = reference_gap_domain_for_receiver_dependency(
+                        lexical.language(),
                         expected.identifier.namespace,
                         expected.site.kind,
                         Some(receiver_dependency),
                     );
                     let mut impacts = Vec::new();
                     if let Some(gap_domain) = gap_domain {
-                        for &(_, namespace) in lookup_routes(expected.identifier.namespace) {
+                        let routes = if metadata.unqualified() {
+                            lexical_lookup_routes(lexical.language(), expected.identifier.namespace)
+                        } else {
+                            lookup_routes(expected.identifier.namespace)
+                        };
+                        // Lowering publishes such a language's callable under
+                        // the Value lookup as well (`language_callables_occupy_value_namespace`),
+                        // so a Value route also reaches the callables that
+                        // the catalog files under their own Callable lookup.
+                        let value_aliased_callables =
+                            (language_callables_occupy_value_namespace(lexical.language())
+                                && routes.iter().any(|&(_, namespace)| {
+                                    namespace == ResolutionNamespace::Value
+                                }))
+                            .then_some(ResolutionNamespace::Callable);
+                        for namespace in routes
+                            .iter()
+                            .map(|&(_, namespace)| namespace)
+                            .chain(value_aliased_callables)
+                        {
                             let domain = lookup_declaration_domain(namespace);
                             if gap_domain.affects(domain) {
                                 impacts.push(FactReferenceEdgeLookupImpact {
@@ -1404,7 +1550,7 @@ impl FactReferenceEdgeDomainStatus<'_> {
     }
 
     pub fn covers(&self, axis: EdgeAxis) -> bool {
-        axis != EdgeAxis::InverseProjection && self.completeness.covers(axis)
+        forward_only_covers(self.completeness, axis)
     }
 }
 
@@ -1477,22 +1623,25 @@ impl FactReferenceEdgeBatch {
         FactReferenceEdgeDomainStatus {
             domain,
             generation: self.generation,
-            completeness: self.domain_completeness(domain),
+            completeness: domain_completeness(
+                domain,
+                &self.type_or_callable_completeness,
+                &self.field_completeness,
+            ),
         }
     }
 
     fn domain_completeness(&self, domain: FactReferenceEdgeDeclarationDomain) -> &EdgeCompleteness {
-        match domain {
-            FactReferenceEdgeDeclarationDomain::TypeOrCallable => {
-                &self.type_or_callable_completeness
-            }
-            FactReferenceEdgeDeclarationDomain::Field => &self.field_completeness,
-        }
+        domain_completeness(
+            domain,
+            &self.type_or_callable_completeness,
+            &self.field_completeness,
+        )
     }
 
     /// Whether this forward-only batch completely answers one edge axis.
     pub fn covers(&self, axis: EdgeAxis) -> bool {
-        axis != EdgeAxis::InverseProjection && self.completeness.covers(axis)
+        forward_only_covers(&self.completeness, axis)
     }
 }
 
@@ -1524,16 +1673,14 @@ impl FactReferenceEdgeSummary {
         &self,
         domain: FactReferenceEdgeDeclarationDomain,
     ) -> FactReferenceEdgeDomainStatus<'_> {
-        let completeness = match domain {
-            FactReferenceEdgeDeclarationDomain::TypeOrCallable => {
-                &self.type_or_callable_completeness
-            }
-            FactReferenceEdgeDeclarationDomain::Field => &self.field_completeness,
-        };
         FactReferenceEdgeDomainStatus {
             domain,
             generation: self.generation,
-            completeness,
+            completeness: domain_completeness(
+                domain,
+                &self.type_or_callable_completeness,
+                &self.field_completeness,
+            ),
         }
     }
 
@@ -1556,7 +1703,7 @@ impl FactReferenceEdgeSummary {
 
     /// Whether this forward-only operation completely answers one edge axis.
     pub fn covers(&self, axis: EdgeAxis) -> bool {
-        axis != EdgeAxis::InverseProjection && self.completeness.covers(axis)
+        forward_only_covers(&self.completeness, axis)
     }
 }
 
@@ -2101,12 +2248,7 @@ fn inverse_reasons(forward: &EdgeCompleteness) -> Vec<EdgeIncompleteReason> {
 
 #[cfg(any(test, feature = "test-support"))]
 fn inverse_index_completeness(forward: &EdgeCompleteness) -> EdgeCompleteness {
-    let reasons = inverse_reasons(forward);
-    if reasons.is_empty() {
-        EdgeCompleteness::Complete
-    } else {
-        EdgeCompleteness::Incomplete { reasons }
-    }
+    completeness_from_reasons(inverse_reasons(forward))
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -2586,10 +2728,12 @@ impl<'answer> FactCallableReceiverTargetProjection<'answer> {
     }
 }
 
-fn current_target_usage_proof(targets: &[SemanticId]) -> Option<UsageProof> {
-    match targets {
+fn current_target_usage_proof(binding: &ResolutionAnswer) -> Option<UsageProof> {
+    let ambiguous = matches!(binding.completion(), ResolutionCompletion::Incomplete(reasons)
+        if reasons.iter().any(|reason| matches!(reason, ResolutionIncompleteReason::InconsistentPrecedence(_))));
+    match binding.targets() {
         [] => None,
-        [_] => Some(UsageProof::Proven),
+        [_] if !ambiguous => Some(UsageProof::Proven),
         _ => Some(UsageProof::Unproven),
     }
 }
@@ -2597,7 +2741,8 @@ fn current_target_usage_proof(targets: &[SemanticId]) -> Option<UsageProof> {
 /// Project one callable target without collapsing sibling receiver channels.
 ///
 /// `UsageProof` retains the incumbent current-world contract: one selected
-/// target is proven and several selected alternatives are unproven. Binding
+/// target is proven when selection is unique. An ambiguous selection remains
+/// unproven even when its paths reach the same declaration. Binding
 /// completion and receiver admission remain independently available through
 /// `binding_shape` and `admission`; an open strict diagnostic does not rewrite
 /// the cardinality of the targets already selected by the resolver.
@@ -2615,7 +2760,7 @@ pub fn project_fact_callable_receiver_target(
         target: target.target(),
         binding_shape,
         admission,
-        proof: current_target_usage_proof(binding.targets())
+        proof: current_target_usage_proof(binding)
             .expect("a callable target disposition requires one retained binding target"),
     }
 }
@@ -2720,8 +2865,10 @@ pub fn classify_fact_reference_binding(
 /// Project current binding cardinality and strict completion into orthogonal
 /// graph fields.
 ///
-/// One retained current target carries the incumbent `Proven` value even when
-/// strict semantic completion remains open. Multiple retained alternatives
+/// One uniquely selected current target carries the incumbent `Proven` value
+/// even when strict semantic completion remains open. An inconsistent
+/// precedence marks ambiguous selection, separately from incompleteness, and
+/// cannot prove an edge even if its paths reach one declaration. Multiple retained alternatives
 /// remain `Unproven`. The projection status continues to report complete,
 /// ambiguous, binding-incomplete, and receiver-incomplete states without
 /// suppressing or relabeling the current target inventory. Structured
@@ -2749,7 +2896,7 @@ pub fn project_fact_reference_targets<'answer>(
         return FactReferenceTargetProjection {
             binding_shape,
             targets: binding.targets(),
-            proof: current_target_usage_proof(binding.targets()),
+            proof: current_target_usage_proof(binding),
             status: FactReferenceProjectionStatus::Excluded(admission),
         };
     }
@@ -2760,7 +2907,7 @@ pub fn project_fact_reference_targets<'answer>(
         return FactReferenceTargetProjection {
             binding_shape,
             targets: binding.targets(),
-            proof: current_target_usage_proof(binding.targets()),
+            proof: current_target_usage_proof(binding),
             status: FactReferenceProjectionStatus::AdmissionIncomplete(gap),
         };
     }
@@ -2790,7 +2937,7 @@ pub fn project_fact_reference_targets<'answer>(
         } => FactReferenceTargetProjection {
             binding_shape,
             targets: retained_targets,
-            proof: current_target_usage_proof(retained_targets),
+            proof: current_target_usage_proof(binding),
             status: FactReferenceProjectionStatus::Incomplete(completion),
         },
     }
@@ -2821,16 +2968,15 @@ pub fn project_fact_reference_targets<'answer>(
 /// any other combination, so the site shape is read from the origin alone.
 fn undecided_callable_receiver_site(answer: &FactBatchedReferenceAnswer) -> bool {
     let binding = answer.answer().binding();
+    let origin = answer.callable_receiver_origin();
     binding.targets().is_empty()
-        && answer.callable_receiver_origin().is_some()
+        && origin.is_some()
         && (answer.answer().type_bound_receiver()
-            || binding.completion() != &ResolutionCompletion::Complete)
+            || super::callable_receiver_is_incomplete(origin, binding.completion()))
 }
 
 fn push_edge_reason(reasons: &mut Vec<EdgeIncompleteReason>, reason: EdgeIncompleteReason) {
-    if !reasons.contains(&reason) {
-        reasons.push(reason);
-    }
+    brokk_bifrost_core::util::push_if_absent(reasons, reason);
 }
 
 fn push_edge_gap(gaps: &mut Vec<FactReferenceEdgeGap>, gap: FactReferenceEdgeGap) {
@@ -2957,11 +3103,25 @@ fn finish_fact_reference_edge_batch(
 fn graph_target(
     catalog: &FactReferenceEdgeCatalog<'_>,
     semantic: SemanticId,
+    source_language: Language,
 ) -> StoreResult<Option<CodeUnit>> {
-    Ok(match catalog.declaration(semantic)? {
-        FactReferenceEdgeDeclaration::Graph(declaration) => Some(declaration.clone()),
-        FactReferenceEdgeDeclaration::OutOfGraphDomain => None,
-    })
+    let target = match catalog.declaration(semantic)? {
+        FactReferenceEdgeDeclaration::Graph(declaration) => declaration.clone(),
+        FactReferenceEdgeDeclaration::OutOfGraphDomain => return Ok(None),
+    };
+    let target_language = target.source().declaration_language();
+    if !selected_edge_languages_can_reach(source_language, target_language) {
+        return Err(StoreError::new(format!(
+            "selected native reference edge crosses unsupported languages: source={source_language:?}, target={target_language:?}, target={target:?}"
+        )));
+    }
+    Ok(Some(target))
+}
+
+fn selected_edge_languages_can_reach(source: Language, target: Language) -> bool {
+    let source_is_jvm = matches!(source, Language::Java | Language::Kotlin | Language::Scala);
+    let target_is_jvm = matches!(target, Language::Java | Language::Kotlin | Language::Scala);
+    source == target || (source_is_jvm && target_is_jvm)
 }
 
 fn binding_may_contribute_graph(
@@ -3058,6 +3218,7 @@ fn push_reference_edges(
     target: CodeUnit,
     owner_relation: OwnerRelation,
     proof: UsageProof,
+    ambiguous_candidate: bool,
     usage_kinds: &[UsageHitKind],
     emitted: &mut HashSet<(CodeUnit, UsageHitKind)>,
     missing_reference_kinds: &mut HashSet<(SemanticId, SemanticId)>,
@@ -3112,6 +3273,8 @@ fn push_reference_edges(
             target: target.clone(),
             reference_kind,
             proof,
+            ambiguous_candidate: ambiguous_candidate
+                && usage_kind.included_in(UsageHitSurface::ExternalUsages),
             usage_kind,
             site_class: SiteClass::UseSite,
             provenance: EdgeProvenance::Forward,
@@ -3329,7 +3492,12 @@ pub fn project_fact_reference_edge_batch(
                 }
                 let projection = project_fact_callable_receiver_target(binding, disposition);
                 let admission = projection.admission();
-                let Some(target) = graph_target(catalog, projection.target())? else {
+                let Some(target) = graph_target(
+                    catalog,
+                    projection.target(),
+                    file.file().declaration_language(),
+                )?
+                else {
                     continue;
                 };
                 if let Some(gap) = admission.gap() {
@@ -3394,6 +3562,10 @@ pub fn project_fact_reference_edge_batch(
                     target,
                     owner_relation,
                     projection.proof(),
+                    matches!(
+                        projection.binding_shape(),
+                        FactReferenceBindingShape::CompleteAmbiguity(_)
+                    ),
                     usage_kinds,
                     &mut emitted,
                     &mut missing_reference_kinds,
@@ -3415,7 +3587,9 @@ pub fn project_fact_reference_edge_batch(
             if cancellation.is_cancelled() {
                 return Ok(cancelled_edge_batch(batch.fragment(), catalog.generation));
             }
-            let Some(target) = graph_target(catalog, target_semantic)? else {
+            let Some(target) =
+                graph_target(catalog, target_semantic, file.file().declaration_language())?
+            else {
                 continue;
             };
             graph_targets.push((target_semantic, target));
@@ -3483,6 +3657,7 @@ pub fn project_fact_reference_edge_batch(
                 target,
                 owner_relation,
                 proof,
+                projection.status() == FactReferenceProjectionStatus::Ambiguous,
                 if metadata.site_kind() == ResolutionSiteKind::ImportDeclaration {
                     &[UsageHitKind::Import]
                 } else if same_owner_inventory {
@@ -3701,9 +3876,31 @@ mod tests {
         FileResolutionFacts, ResolutionIdentifierRole,
     };
     use brokk_bifrost_core::analyzer::{CodeUnitIndex, Language};
+    use brokk_bifrost_test_macros::hardwon;
     use std::collections::{BTreeMap, BTreeSet};
 
     const PROJECTOR_SOURCE: &str = "package demo;\n\nclass External {}\n\nclass Owner {\n    int value;\n    void write(External external) {\n        value = 1;\n    }\n}\n";
+
+    #[test]
+    fn edge_target_language_reach_is_jvm_wide_and_keeps_other_ecosystems_local() {
+        for source in [Language::Java, Language::Kotlin, Language::Scala] {
+            for target in [Language::Java, Language::Kotlin, Language::Scala] {
+                assert!(selected_edge_languages_can_reach(source, target));
+            }
+        }
+        assert!(!selected_edge_languages_can_reach(
+            Language::Rust,
+            Language::Go
+        ));
+        assert!(!selected_edge_languages_can_reach(
+            Language::Java,
+            Language::Rust
+        ));
+        assert!(!selected_edge_languages_can_reach(
+            Language::Go,
+            Language::Kotlin
+        ));
+    }
 
     struct NativeEdgeProjectionFixture {
         _project: BuiltInlineTestProject,
@@ -3888,7 +4085,706 @@ mod tests {
         )
     }
 
+    fn semantic(label: &[u8]) -> SemanticId {
+        SemanticId::for_test(label)
+    }
+
     #[test]
+    fn fact_target_projection_uses_current_cardinality_and_retains_strict_status() {
+        let first = semantic(b"fact-target-projection-first");
+        let second = semantic(b"fact-target-projection-second");
+        let reason = ResolutionIncompleteReason::UnsupportedSemantic(semantic(
+            b"fact-target-projection-open-boundary",
+        ));
+
+        let singleton = ResolutionAnswer::new([first], [], ResolutionCompletion::Complete);
+        let projected =
+            project_fact_reference_targets(&singleton, FactReferenceGraphAdmission::GraphCandidate);
+        assert_eq!(projected.targets(), &[first]);
+        assert_eq!(projected.proof(), Some(UsageProof::Proven));
+        assert_eq!(projected.status(), FactReferenceProjectionStatus::Complete);
+
+        let ambiguity = ResolutionAnswer::new([first, second], [], ResolutionCompletion::Complete);
+        let projected =
+            project_fact_reference_targets(&ambiguity, FactReferenceGraphAdmission::GraphCandidate);
+        assert_eq!(projected.targets(), &[first, second]);
+        assert_eq!(projected.proof(), Some(UsageProof::Unproven));
+        assert_eq!(projected.status(), FactReferenceProjectionStatus::Ambiguous);
+
+        let completion = ResolutionCompletion::incomplete([reason]);
+        let incomplete = ResolutionAnswer::new([first], [], completion.clone());
+        let projected = project_fact_reference_targets(
+            &incomplete,
+            FactReferenceGraphAdmission::GraphCandidate,
+        );
+        assert_eq!(projected.targets(), &[first]);
+        assert_eq!(projected.proof(), Some(UsageProof::Proven));
+        assert_eq!(
+            projected.status(),
+            FactReferenceProjectionStatus::Incomplete(&completion)
+        );
+
+        let incomplete_ambiguity = ResolutionAnswer::new([first, second], [], completion.clone());
+        let projected = project_fact_reference_targets(
+            &incomplete_ambiguity,
+            FactReferenceGraphAdmission::GraphCandidate,
+        );
+        assert_eq!(projected.targets(), &[first, second]);
+        assert_eq!(projected.proof(), Some(UsageProof::Unproven));
+        assert_eq!(
+            projected.status(),
+            FactReferenceProjectionStatus::Incomplete(&completion)
+        );
+    }
+
+    #[test]
+    fn receiver_dependencies_suppress_only_type_or_value_value_qualifiers() {
+        const SOURCE: &str = "package demo;\n\
+class Leaf { int terminal; }\n\
+class Owner {\n\
+    int bareField;\n\
+    Leaf valueQualifier;\n\
+    static Leaf memberQualifier;\n\
+    int bare() { return bareField; }\n\
+    int viaValue() { return valueQualifier.terminal; }\n\
+    int viaLocal(Leaf localQualifier) { return localQualifier.terminal; }\n\
+    int viaType() { return Owner.memberQualifier.terminal; }\n\
+}\n";
+
+        let fixture = native_edge_projection_fixture_for(
+            "Owner.java",
+            SOURCE,
+            b"native-edge-receiver-dependency-law",
+            b"native-edge-receiver-dependency-law:demo",
+        );
+        let hostile_typed = crate::analyzer::resolution::lower_for_test(
+            fixture.fragment,
+            Language::Java,
+            &FileResolutionFacts::default(),
+        )
+        .typed()
+        .clone();
+        let mismatch = FactReferenceEdgeCatalog::from_selected_fragments(
+            &fixture.analyzer,
+            [FactReferenceEdgeSelectedFragment::new(
+                fixture.file.clone(),
+                SOURCE,
+                &fixture.facts,
+                &fixture.lexical,
+                &hostile_typed,
+                crate::analyzer::resolution::test_shared_names(),
+            )],
+            &CancellationToken::new(),
+        );
+        let error = match mismatch {
+            Ok(_) => panic!("same-fragment typed receiver drift must fail atomically"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("typed receiver dependencies are misaligned"),
+            "unexpected typed receiver drift error: {error}"
+        );
+
+        let catalog = native_edge_catalog(&fixture);
+        let projected = project_fact_reference_edge_batch(
+            &catalog,
+            &fixture.batch,
+            &mut OwnerRelationMemo::default(),
+            &CancellationToken::new(),
+        )
+        .expect("receiver-dependency law source must project");
+
+        let bare_start =
+            SOURCE.find("return bareField").expect("bare field read") + "return ".len();
+        let value_start = SOURCE
+            .find("return valueQualifier")
+            .expect("field-valued qualifier")
+            + "return ".len();
+        let local_start = SOURCE
+            .find("return localQualifier")
+            .expect("local-valued qualifier")
+            + "return ".len();
+        let type_start = SOURCE
+            .find("return Owner.memberQualifier")
+            .expect("type qualifier")
+            + "return ".len();
+        let intermediate_member_start = type_start + "Owner.".len();
+        let value_terminal_start = value_start + "valueQualifier.".len();
+        let local_terminal_start = local_start + "localQualifier.".len();
+        let type_terminal_start = intermediate_member_start + "memberQualifier.".len();
+
+        let bare = exact_site_row(&projected, bare_start, bare_start + "bareField".len());
+        assert!(bare.target.is_field());
+        assert_eq!(bare.target.terminal_name(), "bareField");
+        let intermediate_member = exact_site_row(
+            &projected,
+            intermediate_member_start,
+            intermediate_member_start + "memberQualifier".len(),
+        );
+        assert!(intermediate_member.target.is_field());
+        assert_eq!(
+            intermediate_member.target.terminal_name(),
+            "memberQualifier"
+        );
+        for terminal_start in [
+            value_terminal_start,
+            local_terminal_start,
+            type_terminal_start,
+        ] {
+            let terminal = exact_site_row(
+                &projected,
+                terminal_start,
+                terminal_start + "terminal".len(),
+            );
+            assert!(terminal.target.is_field());
+            assert_eq!(terminal.target.terminal_name(), "terminal");
+        }
+        for (start, name) in [
+            (value_start, "valueQualifier"),
+            (local_start, "localQualifier"),
+            (type_start, "Owner"),
+        ] {
+            assert!(
+                projected.edges().iter().all(|row| {
+                    row.site.range.start_byte != start
+                        || row.site.range.end_byte != start + name.len()
+                }),
+                "a source-proven ValueReference receiver dependency must not publish a canonical row: start={start}, name={name:?}, edges={:?}",
+                projected.edges()
+            );
+        }
+
+        let file = catalog.file(fixture.fragment).expect("selected file");
+        let (bare_reference, bare_namespace, bare_kind) =
+            reference_semantic_at(&fixture, bare_start, bare_start + "bareField".len());
+        assert_eq!(
+            reference_gap_domain(file, bare_reference, bare_namespace, bare_kind),
+            Some(FactReferenceEdgeGapDomain::Field),
+            "a selected bare Java value expression is field-domain, not a qualifier"
+        );
+        for (start, name) in [
+            (value_start, "valueQualifier"),
+            (local_start, "localQualifier"),
+            (type_start, "Owner"),
+        ] {
+            let (reference, namespace, kind) =
+                reference_semantic_at(&fixture, start, start + name.len());
+            assert_eq!(
+                reference_gap_domain(file, reference, namespace, kind),
+                None,
+                "the exact projection-to-receiver join must suppress {name:?}"
+            );
+        }
+        let (member_reference, member_namespace, member_kind) = reference_semantic_at(
+            &fixture,
+            intermediate_member_start,
+            intermediate_member_start + "memberQualifier".len(),
+        );
+        assert_eq!(
+            reference_gap_domain(file, member_reference, member_namespace, member_kind),
+            Some(FactReferenceEdgeGapDomain::AnyGraphDeclaration),
+            "an intermediate MemberReference remains canonical even when its value feeds a receiver"
+        );
+
+        let mut manual = FactReferenceEdgeCatalog::new(&fixture.analyzer);
+        manual
+            .insert_file(fixture.fragment, fixture.file.clone())
+            .expect("manual catalog file");
+        let manual_file = manual.file(fixture.fragment).expect("manual file");
+        let (type_reference, type_namespace, type_kind) =
+            reference_semantic_at(&fixture, type_start, type_start + "Owner".len());
+        assert_eq!(
+            reference_gap_domain(manual_file, type_reference, type_namespace, type_kind),
+            Some(FactReferenceEdgeGapDomain::AnyGraphDeclaration),
+            "a manual catalog without the structured join must fail conservative"
+        );
+    }
+
+    fn selected_inverse_index(
+        outcome: SelectedReferenceInverseIndexBuildOutcome,
+    ) -> SelectedReferenceInverseIndex {
+        match outcome {
+            SelectedReferenceInverseIndexBuildOutcome::Complete(index)
+            | SelectedReferenceInverseIndexBuildOutcome::Incomplete(index) => index,
+            SelectedReferenceInverseIndexBuildOutcome::Cancelled => {
+                panic!("an uncancelled selected inverse-index law must not cancel")
+            }
+            SelectedReferenceInverseIndexBuildOutcome::Stale => {
+                panic!("a current selected inverse-index law must not become stale")
+            }
+        }
+    }
+
+    fn graph_targets(catalog: &FactReferenceEdgeCatalog<'_>) -> Vec<CodeUnit> {
+        let mut targets = catalog
+            .declarations
+            .values()
+            .filter_map(|declaration| match declaration {
+                FactReferenceEdgeDeclaration::Graph(target) => Some(target.clone()),
+                FactReferenceEdgeDeclaration::OutOfGraphDomain => None,
+            })
+            .collect::<Vec<_>>();
+        targets.sort_unstable();
+        targets.dedup();
+        targets
+    }
+
+    fn reference_semantic_named(
+        fixture: &NativeEdgeProjectionFixture,
+        spelling: &str,
+        namespace: ResolutionNamespace,
+        kind: ResolutionSiteKind,
+    ) -> SemanticId {
+        let names = fixture
+            .facts
+            .names
+            .iter()
+            .map(|name| (name.id, name.spelling.as_str()))
+            .collect::<HashMap<_, _>>();
+        let sites = fixture
+            .facts
+            .sites
+            .iter()
+            .map(|site| (site.id, site))
+            .collect::<HashMap<_, _>>();
+        let matches = fixture
+            .facts
+            .identifiers
+            .iter()
+            .filter(|identifier| {
+                identifier.role == ResolutionIdentifierRole::Reference
+                    && identifier.namespace == namespace
+                    && names[&identifier.name] == spelling
+                    && sites[&identifier.site].kind == kind
+            })
+            .map(|identifier| reference_semantic(fixture.fragment, identifier.site))
+            .collect::<Vec<_>>();
+        let [reference] = matches.as_slice() else {
+            panic!(
+                "one exact reference must match spelling={spelling:?}, namespace={namespace:?}, kind={kind:?}: {matches:?}"
+            );
+        };
+        *reference
+    }
+
+    fn inverse_index_for_binding_gap(
+        catalog: &FactReferenceEdgeCatalog<'_>,
+        fragment: BindingFragmentId,
+        reference: SemanticId,
+        domain: FactReferenceEdgeGapDomain,
+    ) -> SelectedReferenceInverseIndex {
+        let target_domains = graph_targets(catalog)
+            .into_iter()
+            .map(|target| {
+                let domain = declaration_domain(&target);
+                (target, domain)
+            })
+            .collect::<HashMap<_, _>>();
+        let open = EdgeCompleteness::Incomplete {
+            reasons: vec![EdgeIncompleteReason::ForwardResolutionIncomplete],
+        };
+        let domain_completeness = |candidate| {
+            if domain.affects(candidate) {
+                open.clone()
+            } else {
+                EdgeCompleteness::Complete
+            }
+        };
+        let batch = FactReferenceEdgeBatch {
+            fragment,
+            generation: catalog.generation(),
+            reference_count: 1,
+            edges: Box::new([]),
+            gaps: vec![FactReferenceEdgeGap::IncompleteBinding { reference, domain }]
+                .into_boxed_slice(),
+            unresolved_names: None,
+            completeness: open.clone(),
+            type_or_callable_completeness: domain_completeness(
+                FactReferenceEdgeDeclarationDomain::TypeOrCallable,
+            ),
+            field_completeness: domain_completeness(FactReferenceEdgeDeclarationDomain::Field),
+        };
+        let mut accumulator =
+            SelectedReferenceInverseIndexAccumulator::new(catalog.generation(), target_domains);
+        assert!(
+            accumulator
+                .stage(catalog, &batch, &CancellationToken::new())
+                .expect("the structured lookup-impact gap must stage")
+        );
+        selected_inverse_index(accumulator.finish(
+            FactReferenceEdgeSummary {
+                generation: catalog.generation(),
+                completeness: open,
+                type_or_callable_completeness: batch.type_or_callable_completeness.clone(),
+                field_completeness: batch.field_completeness.clone(),
+                reference_count: 1,
+                edge_count: 0,
+                batch_count: 1,
+                root_binding_metrics: ResolutionBatchMetrics::default(),
+            },
+            &CancellationToken::new(),
+        ))
+    }
+
+    fn assert_lookup_resolution_status(
+        index: &SelectedReferenceInverseIndex,
+        target: &CodeUnit,
+        incomplete: bool,
+    ) {
+        let expected = if incomplete {
+            EdgeCompleteness::Incomplete {
+                reasons: vec![EdgeIncompleteReason::InverseIndexResolutionIncomplete],
+            }
+        } else {
+            EdgeCompleteness::Complete
+        };
+        assert_eq!(
+            index.inverse_for(target).completeness,
+            expected,
+            "{target:?}"
+        );
+    }
+
+    fn assert_same_inverse_index(
+        left: &SelectedReferenceInverseIndex,
+        right: &SelectedReferenceInverseIndex,
+        targets: &[CodeUnit],
+    ) {
+        assert_eq!(left.generation(), right.generation());
+        assert_eq!(left.run_completeness(), right.run_completeness());
+        assert_eq!(left.target_count(), right.target_count());
+        assert_eq!(left.nonempty_target_count(), right.nonempty_target_count());
+        assert_eq!(left.reference_count(), right.reference_count());
+        assert_eq!(left.edge_count(), right.edge_count());
+        for target in targets {
+            let left = left.inverse_for(target);
+            let right = right.inverse_for(target);
+            assert_eq!(left.edges, right.edges, "row order differs for {target:?}");
+            assert_eq!(left.completeness, right.completeness);
+            assert_eq!(left.provenance, right.provenance);
+            assert_eq!(left.generation, right.generation);
+        }
+    }
+
+    #[test]
+    fn selected_inverse_index_localizes_open_bindings_by_exact_lookup_impact() {
+        const SOURCE: &str = "package demo;\nclass Owner {\n    class open {}\n    int open;\n    int closed;\n    void open() {}\n    void open(int value) {}\n    void closedCall() {}\n    void use(Owner receiver) {\n        int bare = open;\n        open();\n        Object member = receiver.open;\n        missing();\n    }\n}\n";
+        let fixture = native_edge_projection_fixture_for(
+            "Owner.java",
+            SOURCE,
+            b"selected-inverse-lookup-impact-law",
+            b"selected-inverse-lookup-impact-law:demo",
+        );
+        let catalog = native_edge_catalog(&fixture);
+        let targets = graph_targets(&catalog);
+        let named_targets = |spelling: &str| {
+            targets
+                .iter()
+                .filter(|target| target.terminal_name() == spelling)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let open_targets = named_targets("open");
+        let open_field = open_targets
+            .iter()
+            .find(|target| target.is_field())
+            .expect("the law source must retain the open field");
+        let closed_field = named_targets("closed")
+            .into_iter()
+            .find(CodeUnit::is_field)
+            .expect("the law source must retain the closed field");
+        let open_type = open_targets
+            .iter()
+            .find(|target| target.is_class())
+            .expect("the law source must retain the nested open type");
+        let open_callables = open_targets
+            .iter()
+            .filter(|target| target.is_callable())
+            .collect::<Vec<_>>();
+        assert_eq!(open_callables.len(), 2, "both overloads must be indexed");
+
+        let bare_open = reference_semantic_named(
+            &fixture,
+            "open",
+            ResolutionNamespace::Value,
+            ResolutionSiteKind::ValueReference,
+        );
+        assert_eq!(
+            catalog
+                .reference_lookup_impacts(bare_open)
+                .expect("the bare reference must own lookup impacts"),
+            &[FactReferenceEdgeLookupImpact {
+                lookup: lookup_semantic(
+                    crate::analyzer::resolution::test_shared_names(),
+                    Language::Java,
+                    ResolutionNamespace::Value,
+                    "open"
+                ),
+                domain: FactReferenceEdgeDeclarationDomain::Field,
+            }],
+            "a Java value occurrence is admitted only as a field"
+        );
+        let bare_index = inverse_index_for_binding_gap(
+            &catalog,
+            fixture.fragment,
+            bare_open,
+            FactReferenceEdgeGapDomain::Field,
+        );
+        assert!(!bare_index.run_completeness().is_complete());
+        assert_lookup_resolution_status(&bare_index, open_field, true);
+        assert_lookup_resolution_status(&bare_index, &closed_field, false);
+        assert_lookup_resolution_status(&bare_index, open_type, false);
+        for callable in &open_callables {
+            assert_lookup_resolution_status(&bare_index, callable, false);
+        }
+
+        let callable_open = reference_semantic_named(
+            &fixture,
+            "open",
+            ResolutionNamespace::Callable,
+            ResolutionSiteKind::CallableReference,
+        );
+        let callable_index = inverse_index_for_binding_gap(
+            &catalog,
+            fixture.fragment,
+            callable_open,
+            FactReferenceEdgeGapDomain::TypeOrCallable,
+        );
+        for callable in &open_callables {
+            assert_lookup_resolution_status(&callable_index, callable, true);
+        }
+        assert_lookup_resolution_status(&callable_index, open_field, false);
+        assert_lookup_resolution_status(&callable_index, open_type, false);
+
+        let member_open = reference_semantic_named(
+            &fixture,
+            "open",
+            ResolutionNamespace::TypeOrValue,
+            ResolutionSiteKind::MemberReference,
+        );
+        let mut expected_member_impacts = vec![
+            FactReferenceEdgeLookupImpact {
+                lookup: lookup_semantic(
+                    crate::analyzer::resolution::test_shared_names(),
+                    Language::Java,
+                    ResolutionNamespace::Value,
+                    "open",
+                ),
+                domain: FactReferenceEdgeDeclarationDomain::Field,
+            },
+            FactReferenceEdgeLookupImpact {
+                lookup: lookup_semantic(
+                    crate::analyzer::resolution::test_shared_names(),
+                    Language::Java,
+                    ResolutionNamespace::Type,
+                    "open",
+                ),
+                domain: FactReferenceEdgeDeclarationDomain::TypeOrCallable,
+            },
+        ];
+        expected_member_impacts.sort_unstable();
+        assert_eq!(
+            catalog
+                .reference_lookup_impacts(member_open)
+                .expect("the member reference must own both exact routes"),
+            expected_member_impacts,
+        );
+        let member_index = inverse_index_for_binding_gap(
+            &catalog,
+            fixture.fragment,
+            member_open,
+            FactReferenceEdgeGapDomain::AnyGraphDeclaration,
+        );
+        assert_lookup_resolution_status(&member_index, open_field, true);
+        assert_lookup_resolution_status(&member_index, open_type, true);
+        for callable in &open_callables {
+            assert_lookup_resolution_status(&member_index, callable, false);
+        }
+        assert_lookup_resolution_status(&member_index, &closed_field, false);
+
+        let missing = reference_semantic_named(
+            &fixture,
+            "missing",
+            ResolutionNamespace::Callable,
+            ResolutionSiteKind::CallableReference,
+        );
+        let missing_index = inverse_index_for_binding_gap(
+            &catalog,
+            fixture.fragment,
+            missing,
+            FactReferenceEdgeGapDomain::TypeOrCallable,
+        );
+        assert!(!missing_index.run_completeness().is_complete());
+        for target in targets {
+            assert_lookup_resolution_status(&missing_index, &target, false);
+        }
+    }
+
+    #[test]
+    fn selected_inverse_index_keeps_covered_empty_target_complete_across_field_only_gaps() {
+        const SOURCE: &str =
+            "package demo;\nclass Owner {\n    int value;\n    void write() { value = 1; }\n}\n";
+        let fixture = native_edge_projection_fixture_for(
+            "Owner.java",
+            SOURCE,
+            b"selected-inverse-empty-domain-law",
+            b"selected-inverse-empty-domain-law:demo",
+        );
+        let catalog = native_edge_catalog(&fixture);
+        let base_service = native_edge_selected_java_base_service(&fixture);
+        let engine = SelectedFactResolutionEngine::new(&base_service);
+        let snapshot = engine
+            .snapshot(&CancellationToken::new())
+            .expect("the selected inverse-index snapshot must assemble");
+        let index = selected_inverse_index(
+            build_selected_reference_inverse_index(
+                &fixture.analyzer,
+                &snapshot,
+                &catalog,
+                1,
+                &CancellationToken::new(),
+            )
+            .expect("the field-local selected inverse index must build"),
+        );
+        assert!(
+            !index.run_completeness().covers(EdgeAxis::InverseProjection),
+            "the aggregate run must retain the field gap"
+        );
+        let targets = graph_targets(&catalog);
+        let empty_type_or_callable = targets
+            .iter()
+            .filter(|target| !target.is_field())
+            .map(|target| (target, index.inverse_for(target)))
+            .find(|(_, result)| result.edges.is_empty())
+            .expect("the law source must contain one covered empty type/callable target");
+        assert_eq!(
+            empty_type_or_callable.1.completeness,
+            EdgeCompleteness::Complete,
+            "field-only gaps must not overtaint a covered empty type/callable"
+        );
+        assert!(
+            targets
+                .iter()
+                .filter(|target| target.is_field())
+                .any(|target| {
+                    !index
+                        .inverse_for(target)
+                        .completeness
+                        .covers(EdgeAxis::KindClassification)
+                })
+        );
+
+        let uncovered = CodeUnit::new(
+            fixture.file.clone(),
+            crate::analyzer::CodeUnitType::Class,
+            "demo",
+            "NotSelected",
+        );
+        let uncovered = index.inverse_for(&uncovered);
+        assert!(uncovered.edges.is_empty());
+        assert_eq!(
+            uncovered.completeness,
+            EdgeCompleteness::Incomplete {
+                reasons: vec![EdgeIncompleteReason::InverseIndexTargetUncovered]
+            }
+        );
+        assert!(!uncovered.covers(EdgeAxis::InverseProjection));
+    }
+
+    #[test]
+    fn selected_inverse_index_localizes_receiver_gap_to_one_exact_sibling_target() {
+        let fixture = native_edge_projection_fixture();
+        let catalog = native_edge_catalog(&fixture);
+        let mut siblings = catalog
+            .declarations
+            .iter()
+            .filter_map(|(&semantic, declaration)| match declaration {
+                FactReferenceEdgeDeclaration::Graph(target) if !target.is_field() => {
+                    Some((semantic, target.clone()))
+                }
+                FactReferenceEdgeDeclaration::Graph(_)
+                | FactReferenceEdgeDeclaration::OutOfGraphDomain => None,
+            })
+            .collect::<Vec<_>>();
+        siblings.sort_unstable_by(|left, right| left.1.cmp(&right.1));
+        siblings.dedup_by(|left, right| left.1 == right.1);
+        let [(open_semantic, open_target), (_, unaffected_target), ..] = siblings.as_slice() else {
+            panic!("the law source must contain two type/callable sibling targets: {siblings:?}");
+        };
+        let mut target_domains = HashMap::default();
+        assert!(
+            target_domains
+                .insert(
+                    open_target.clone(),
+                    FactReferenceEdgeDeclarationDomain::TypeOrCallable,
+                )
+                .is_none()
+        );
+        assert!(
+            target_domains
+                .insert(
+                    unaffected_target.clone(),
+                    FactReferenceEdgeDeclarationDomain::TypeOrCallable,
+                )
+                .is_none()
+        );
+        let open = EdgeCompleteness::Incomplete {
+            reasons: vec![EdgeIncompleteReason::ForwardAdmissionIncomplete],
+        };
+        let batch = FactReferenceEdgeBatch {
+            fragment: fixture.fragment,
+            generation: catalog.generation(),
+            reference_count: 1,
+            edges: Box::new([]),
+            gaps: vec![FactReferenceEdgeGap::ReceiverAdmission {
+                reference: semantic(b"selected-inverse-local-receiver-gap"),
+                target: *open_semantic,
+                gap: FactReferenceReceiverGap::MissingOrigin,
+                domain: FactReferenceEdgeGapDomain::TypeOrCallable,
+            }]
+            .into_boxed_slice(),
+            unresolved_names: None,
+            completeness: open.clone(),
+            type_or_callable_completeness: open.clone(),
+            field_completeness: EdgeCompleteness::Complete,
+        };
+        let mut accumulator =
+            SelectedReferenceInverseIndexAccumulator::new(catalog.generation(), target_domains);
+        assert!(
+            accumulator
+                .stage(&catalog, &batch, &CancellationToken::new())
+                .expect("the exact target-local gap must stage")
+        );
+        let index = selected_inverse_index(accumulator.finish(
+            FactReferenceEdgeSummary {
+                generation: catalog.generation(),
+                completeness: open.clone(),
+                type_or_callable_completeness: open,
+                field_completeness: EdgeCompleteness::Complete,
+                reference_count: 1,
+                edge_count: 0,
+                batch_count: 1,
+                root_binding_metrics: ResolutionBatchMetrics::default(),
+            },
+            &CancellationToken::new(),
+        ));
+        assert_eq!(
+            index.inverse_for(open_target).completeness,
+            EdgeCompleteness::Incomplete {
+                reasons: vec![EdgeIncompleteReason::InverseIndexAdmissionIncomplete]
+            }
+        );
+        assert_eq!(
+            index.inverse_for(unaffected_target).completeness,
+            EdgeCompleteness::Complete,
+            "a target-local receiver gap must not overtaint a same-domain sibling"
+        );
+    }
+
+    #[test]
+    #[hardwon("3bf50ffa2952: a proven call was dropped when its owner was outside the graph")]
     fn native_edge_projection_retains_calls_with_out_of_graph_owners() {
         let fixture = native_edge_projection_fixture_for(
             "Projector.java",
@@ -4899,10 +5795,6 @@ mod tests {
         );
     }
 
-    fn semantic(label: &[u8]) -> SemanticId {
-        SemanticId::for_test(label)
-    }
-
     #[test]
     fn fact_binding_shape_distinguishes_complete_negative_singleton_ambiguity_and_incomplete() {
         let first = semantic(b"fact-binding-shape-first");
@@ -4965,54 +5857,6 @@ mod tests {
         assert_eq!(
             classify_fact_reference_binding(&binding),
             FactReferenceBindingShape::CompleteSingleton(target)
-        );
-    }
-
-    #[test]
-    fn fact_target_projection_uses_current_cardinality_and_retains_strict_status() {
-        let first = semantic(b"fact-target-projection-first");
-        let second = semantic(b"fact-target-projection-second");
-        let reason = ResolutionIncompleteReason::UnsupportedSemantic(semantic(
-            b"fact-target-projection-open-boundary",
-        ));
-
-        let singleton = ResolutionAnswer::new([first], [], ResolutionCompletion::Complete);
-        let projected =
-            project_fact_reference_targets(&singleton, FactReferenceGraphAdmission::GraphCandidate);
-        assert_eq!(projected.targets(), &[first]);
-        assert_eq!(projected.proof(), Some(UsageProof::Proven));
-        assert_eq!(projected.status(), FactReferenceProjectionStatus::Complete);
-
-        let ambiguity = ResolutionAnswer::new([first, second], [], ResolutionCompletion::Complete);
-        let projected =
-            project_fact_reference_targets(&ambiguity, FactReferenceGraphAdmission::GraphCandidate);
-        assert_eq!(projected.targets(), &[first, second]);
-        assert_eq!(projected.proof(), Some(UsageProof::Unproven));
-        assert_eq!(projected.status(), FactReferenceProjectionStatus::Ambiguous);
-
-        let completion = ResolutionCompletion::incomplete([reason]);
-        let incomplete = ResolutionAnswer::new([first], [], completion.clone());
-        let projected = project_fact_reference_targets(
-            &incomplete,
-            FactReferenceGraphAdmission::GraphCandidate,
-        );
-        assert_eq!(projected.targets(), &[first]);
-        assert_eq!(projected.proof(), Some(UsageProof::Proven));
-        assert_eq!(
-            projected.status(),
-            FactReferenceProjectionStatus::Incomplete(&completion)
-        );
-
-        let incomplete_ambiguity = ResolutionAnswer::new([first, second], [], completion.clone());
-        let projected = project_fact_reference_targets(
-            &incomplete_ambiguity,
-            FactReferenceGraphAdmission::GraphCandidate,
-        );
-        assert_eq!(projected.targets(), &[first, second]);
-        assert_eq!(projected.proof(), Some(UsageProof::Unproven));
-        assert_eq!(
-            projected.status(),
-            FactReferenceProjectionStatus::Incomplete(&completion)
         );
     }
 
@@ -5186,171 +6030,6 @@ mod tests {
             Some(FactReferenceReceiverGap::UnresolvedReceiver)
         );
         assert_eq!(gap_only.proof(), UsageProof::Proven);
-    }
-
-    #[test]
-    fn receiver_dependencies_suppress_only_type_or_value_value_qualifiers() {
-        const SOURCE: &str = "package demo;\n\
-class Leaf { int terminal; }\n\
-class Owner {\n\
-    int bareField;\n\
-    Leaf valueQualifier;\n\
-    static Leaf memberQualifier;\n\
-    int bare() { return bareField; }\n\
-    int viaValue() { return valueQualifier.terminal; }\n\
-    int viaLocal(Leaf localQualifier) { return localQualifier.terminal; }\n\
-    int viaType() { return Owner.memberQualifier.terminal; }\n\
-}\n";
-
-        let fixture = native_edge_projection_fixture_for(
-            "Owner.java",
-            SOURCE,
-            b"native-edge-receiver-dependency-law",
-            b"native-edge-receiver-dependency-law:demo",
-        );
-        let hostile_typed = crate::analyzer::resolution::lower_for_test(
-            fixture.fragment,
-            Language::Java,
-            &FileResolutionFacts::default(),
-        )
-        .typed()
-        .clone();
-        let mismatch = FactReferenceEdgeCatalog::from_selected_fragments(
-            &fixture.analyzer,
-            [FactReferenceEdgeSelectedFragment::new(
-                fixture.file.clone(),
-                SOURCE,
-                &fixture.facts,
-                &fixture.lexical,
-                &hostile_typed,
-                crate::analyzer::resolution::test_shared_names(),
-            )],
-            &CancellationToken::new(),
-        );
-        let error = match mismatch {
-            Ok(_) => panic!("same-fragment typed receiver drift must fail atomically"),
-            Err(error) => error,
-        };
-        assert!(
-            error
-                .to_string()
-                .contains("typed receiver dependencies are misaligned"),
-            "unexpected typed receiver drift error: {error}"
-        );
-
-        let catalog = native_edge_catalog(&fixture);
-        let projected = project_fact_reference_edge_batch(
-            &catalog,
-            &fixture.batch,
-            &mut OwnerRelationMemo::default(),
-            &CancellationToken::new(),
-        )
-        .expect("receiver-dependency law source must project");
-
-        let bare_start =
-            SOURCE.find("return bareField").expect("bare field read") + "return ".len();
-        let value_start = SOURCE
-            .find("return valueQualifier")
-            .expect("field-valued qualifier")
-            + "return ".len();
-        let local_start = SOURCE
-            .find("return localQualifier")
-            .expect("local-valued qualifier")
-            + "return ".len();
-        let type_start = SOURCE
-            .find("return Owner.memberQualifier")
-            .expect("type qualifier")
-            + "return ".len();
-        let intermediate_member_start = type_start + "Owner.".len();
-        let value_terminal_start = value_start + "valueQualifier.".len();
-        let local_terminal_start = local_start + "localQualifier.".len();
-        let type_terminal_start = intermediate_member_start + "memberQualifier.".len();
-
-        let bare = exact_site_row(&projected, bare_start, bare_start + "bareField".len());
-        assert!(bare.target.is_field());
-        assert_eq!(bare.target.terminal_name(), "bareField");
-        let intermediate_member = exact_site_row(
-            &projected,
-            intermediate_member_start,
-            intermediate_member_start + "memberQualifier".len(),
-        );
-        assert!(intermediate_member.target.is_field());
-        assert_eq!(
-            intermediate_member.target.terminal_name(),
-            "memberQualifier"
-        );
-        for terminal_start in [
-            value_terminal_start,
-            local_terminal_start,
-            type_terminal_start,
-        ] {
-            let terminal = exact_site_row(
-                &projected,
-                terminal_start,
-                terminal_start + "terminal".len(),
-            );
-            assert!(terminal.target.is_field());
-            assert_eq!(terminal.target.terminal_name(), "terminal");
-        }
-        for (start, name) in [
-            (value_start, "valueQualifier"),
-            (local_start, "localQualifier"),
-            (type_start, "Owner"),
-        ] {
-            assert!(
-                projected.edges().iter().all(|row| {
-                    row.site.range.start_byte != start
-                        || row.site.range.end_byte != start + name.len()
-                }),
-                "a source-proven ValueReference receiver dependency must not publish a canonical row: start={start}, name={name:?}, edges={:?}",
-                projected.edges()
-            );
-        }
-
-        let file = catalog.file(fixture.fragment).expect("selected file");
-        let (bare_reference, bare_namespace, bare_kind) =
-            reference_semantic_at(&fixture, bare_start, bare_start + "bareField".len());
-        assert_eq!(
-            reference_gap_domain(file, bare_reference, bare_namespace, bare_kind),
-            Some(FactReferenceEdgeGapDomain::Field),
-            "a selected bare Java value expression is field-domain, not a qualifier"
-        );
-        for (start, name) in [
-            (value_start, "valueQualifier"),
-            (local_start, "localQualifier"),
-            (type_start, "Owner"),
-        ] {
-            let (reference, namespace, kind) =
-                reference_semantic_at(&fixture, start, start + name.len());
-            assert_eq!(
-                reference_gap_domain(file, reference, namespace, kind),
-                None,
-                "the exact projection-to-receiver join must suppress {name:?}"
-            );
-        }
-        let (member_reference, member_namespace, member_kind) = reference_semantic_at(
-            &fixture,
-            intermediate_member_start,
-            intermediate_member_start + "memberQualifier".len(),
-        );
-        assert_eq!(
-            reference_gap_domain(file, member_reference, member_namespace, member_kind),
-            Some(FactReferenceEdgeGapDomain::AnyGraphDeclaration),
-            "an intermediate MemberReference remains canonical even when its value feeds a receiver"
-        );
-
-        let mut manual = FactReferenceEdgeCatalog::new(&fixture.analyzer);
-        manual
-            .insert_file(fixture.fragment, fixture.file.clone())
-            .expect("manual catalog file");
-        let manual_file = manual.file(fixture.fragment).expect("manual file");
-        let (type_reference, type_namespace, type_kind) =
-            reference_semantic_at(&fixture, type_start, type_start + "Owner".len());
-        assert_eq!(
-            reference_gap_domain(manual_file, type_reference, type_namespace, type_kind),
-            Some(FactReferenceEdgeGapDomain::AnyGraphDeclaration),
-            "a manual catalog without the structured join must fail conservative"
-        );
     }
 
     #[test]
@@ -5720,172 +6399,6 @@ class Owner {\n\
         );
     }
 
-    fn selected_inverse_index(
-        outcome: SelectedReferenceInverseIndexBuildOutcome,
-    ) -> SelectedReferenceInverseIndex {
-        match outcome {
-            SelectedReferenceInverseIndexBuildOutcome::Complete(index)
-            | SelectedReferenceInverseIndexBuildOutcome::Incomplete(index) => index,
-            SelectedReferenceInverseIndexBuildOutcome::Cancelled => {
-                panic!("an uncancelled selected inverse-index law must not cancel")
-            }
-            SelectedReferenceInverseIndexBuildOutcome::Stale => {
-                panic!("a current selected inverse-index law must not become stale")
-            }
-        }
-    }
-
-    fn graph_targets(catalog: &FactReferenceEdgeCatalog<'_>) -> Vec<CodeUnit> {
-        let mut targets = catalog
-            .declarations
-            .values()
-            .filter_map(|declaration| match declaration {
-                FactReferenceEdgeDeclaration::Graph(target) => Some(target.clone()),
-                FactReferenceEdgeDeclaration::OutOfGraphDomain => None,
-            })
-            .collect::<Vec<_>>();
-        targets.sort_unstable();
-        targets.dedup();
-        targets
-    }
-
-    fn reference_semantic_named(
-        fixture: &NativeEdgeProjectionFixture,
-        spelling: &str,
-        namespace: ResolutionNamespace,
-        kind: ResolutionSiteKind,
-    ) -> SemanticId {
-        let names = fixture
-            .facts
-            .names
-            .iter()
-            .map(|name| (name.id, name.spelling.as_str()))
-            .collect::<HashMap<_, _>>();
-        let sites = fixture
-            .facts
-            .sites
-            .iter()
-            .map(|site| (site.id, site))
-            .collect::<HashMap<_, _>>();
-        let matches = fixture
-            .facts
-            .identifiers
-            .iter()
-            .filter(|identifier| {
-                identifier.role == ResolutionIdentifierRole::Reference
-                    && identifier.namespace == namespace
-                    && names[&identifier.name] == spelling
-                    && sites[&identifier.site].kind == kind
-            })
-            .map(|identifier| reference_semantic(fixture.fragment, identifier.site))
-            .collect::<Vec<_>>();
-        let [reference] = matches.as_slice() else {
-            panic!(
-                "one exact reference must match spelling={spelling:?}, namespace={namespace:?}, kind={kind:?}: {matches:?}"
-            );
-        };
-        *reference
-    }
-
-    fn inverse_index_for_binding_gap(
-        catalog: &FactReferenceEdgeCatalog<'_>,
-        fragment: BindingFragmentId,
-        reference: SemanticId,
-        domain: FactReferenceEdgeGapDomain,
-    ) -> SelectedReferenceInverseIndex {
-        let target_domains = graph_targets(catalog)
-            .into_iter()
-            .map(|target| {
-                let domain = declaration_domain(&target);
-                (target, domain)
-            })
-            .collect::<HashMap<_, _>>();
-        let open = EdgeCompleteness::Incomplete {
-            reasons: vec![EdgeIncompleteReason::ForwardResolutionIncomplete],
-        };
-        let domain_completeness = |candidate| {
-            if domain.affects(candidate) {
-                open.clone()
-            } else {
-                EdgeCompleteness::Complete
-            }
-        };
-        let batch = FactReferenceEdgeBatch {
-            fragment,
-            generation: catalog.generation(),
-            reference_count: 1,
-            edges: Box::new([]),
-            gaps: vec![FactReferenceEdgeGap::IncompleteBinding { reference, domain }]
-                .into_boxed_slice(),
-            unresolved_names: None,
-            completeness: open.clone(),
-            type_or_callable_completeness: domain_completeness(
-                FactReferenceEdgeDeclarationDomain::TypeOrCallable,
-            ),
-            field_completeness: domain_completeness(FactReferenceEdgeDeclarationDomain::Field),
-        };
-        let mut accumulator =
-            SelectedReferenceInverseIndexAccumulator::new(catalog.generation(), target_domains);
-        assert!(
-            accumulator
-                .stage(catalog, &batch, &CancellationToken::new())
-                .expect("the structured lookup-impact gap must stage")
-        );
-        selected_inverse_index(accumulator.finish(
-            FactReferenceEdgeSummary {
-                generation: catalog.generation(),
-                completeness: open,
-                type_or_callable_completeness: batch.type_or_callable_completeness.clone(),
-                field_completeness: batch.field_completeness.clone(),
-                reference_count: 1,
-                edge_count: 0,
-                batch_count: 1,
-                root_binding_metrics: ResolutionBatchMetrics::default(),
-            },
-            &CancellationToken::new(),
-        ))
-    }
-
-    fn assert_lookup_resolution_status(
-        index: &SelectedReferenceInverseIndex,
-        target: &CodeUnit,
-        incomplete: bool,
-    ) {
-        let expected = if incomplete {
-            EdgeCompleteness::Incomplete {
-                reasons: vec![EdgeIncompleteReason::InverseIndexResolutionIncomplete],
-            }
-        } else {
-            EdgeCompleteness::Complete
-        };
-        assert_eq!(
-            index.inverse_for(target).completeness,
-            expected,
-            "{target:?}"
-        );
-    }
-
-    fn assert_same_inverse_index(
-        left: &SelectedReferenceInverseIndex,
-        right: &SelectedReferenceInverseIndex,
-        targets: &[CodeUnit],
-    ) {
-        assert_eq!(left.generation(), right.generation());
-        assert_eq!(left.run_completeness(), right.run_completeness());
-        assert_eq!(left.target_count(), right.target_count());
-        assert_eq!(left.nonempty_target_count(), right.nonempty_target_count());
-        assert_eq!(left.reference_count(), right.reference_count());
-        assert_eq!(left.edge_count(), right.edge_count());
-        for target in targets {
-            let left = left.inverse_for(target);
-            let right = right.inverse_for(target);
-            assert_eq!(left.edges, right.edges, "row order differs for {target:?}");
-            assert_eq!(left.completeness, right.completeness);
-            assert_eq!(left.provenance, right.provenance);
-            assert_eq!(left.generation, right.generation);
-        }
-    }
-
     #[test]
     fn selected_inverse_index_preserves_multi_target_rows_and_batch_independent_order() {
         let fixture = native_edge_projection_fixture();
@@ -5956,160 +6469,6 @@ class Owner {\n\
                     .iter()
                     .all(|row| row.provenance == EdgeProvenance::Inverse)
             );
-        }
-    }
-
-    #[test]
-    fn selected_inverse_index_localizes_open_bindings_by_exact_lookup_impact() {
-        const SOURCE: &str = "package demo;\nclass Owner {\n    class open {}\n    int open;\n    int closed;\n    void open() {}\n    void open(int value) {}\n    void closedCall() {}\n    void use(Owner receiver) {\n        int bare = open;\n        open();\n        Object member = receiver.open;\n        missing();\n    }\n}\n";
-        let fixture = native_edge_projection_fixture_for(
-            "Owner.java",
-            SOURCE,
-            b"selected-inverse-lookup-impact-law",
-            b"selected-inverse-lookup-impact-law:demo",
-        );
-        let catalog = native_edge_catalog(&fixture);
-        let targets = graph_targets(&catalog);
-        let named_targets = |spelling: &str| {
-            targets
-                .iter()
-                .filter(|target| target.terminal_name() == spelling)
-                .cloned()
-                .collect::<Vec<_>>()
-        };
-        let open_targets = named_targets("open");
-        let open_field = open_targets
-            .iter()
-            .find(|target| target.is_field())
-            .expect("the law source must retain the open field");
-        let closed_field = named_targets("closed")
-            .into_iter()
-            .find(CodeUnit::is_field)
-            .expect("the law source must retain the closed field");
-        let open_type = open_targets
-            .iter()
-            .find(|target| target.is_class())
-            .expect("the law source must retain the nested open type");
-        let open_callables = open_targets
-            .iter()
-            .filter(|target| target.is_callable())
-            .collect::<Vec<_>>();
-        assert_eq!(open_callables.len(), 2, "both overloads must be indexed");
-
-        let bare_open = reference_semantic_named(
-            &fixture,
-            "open",
-            ResolutionNamespace::Value,
-            ResolutionSiteKind::ValueReference,
-        );
-        assert_eq!(
-            catalog
-                .reference_lookup_impacts(bare_open)
-                .expect("the bare reference must own lookup impacts"),
-            &[FactReferenceEdgeLookupImpact {
-                lookup: lookup_semantic(
-                    crate::analyzer::resolution::test_shared_names(),
-                    Language::Java,
-                    ResolutionNamespace::Value,
-                    "open"
-                ),
-                domain: FactReferenceEdgeDeclarationDomain::Field,
-            }],
-            "a Java value occurrence is admitted only as a field"
-        );
-        let bare_index = inverse_index_for_binding_gap(
-            &catalog,
-            fixture.fragment,
-            bare_open,
-            FactReferenceEdgeGapDomain::Field,
-        );
-        assert!(!bare_index.run_completeness().is_complete());
-        assert_lookup_resolution_status(&bare_index, open_field, true);
-        assert_lookup_resolution_status(&bare_index, &closed_field, false);
-        assert_lookup_resolution_status(&bare_index, open_type, false);
-        for callable in &open_callables {
-            assert_lookup_resolution_status(&bare_index, callable, false);
-        }
-
-        let callable_open = reference_semantic_named(
-            &fixture,
-            "open",
-            ResolutionNamespace::Callable,
-            ResolutionSiteKind::CallableReference,
-        );
-        let callable_index = inverse_index_for_binding_gap(
-            &catalog,
-            fixture.fragment,
-            callable_open,
-            FactReferenceEdgeGapDomain::TypeOrCallable,
-        );
-        for callable in &open_callables {
-            assert_lookup_resolution_status(&callable_index, callable, true);
-        }
-        assert_lookup_resolution_status(&callable_index, open_field, false);
-        assert_lookup_resolution_status(&callable_index, open_type, false);
-
-        let member_open = reference_semantic_named(
-            &fixture,
-            "open",
-            ResolutionNamespace::TypeOrValue,
-            ResolutionSiteKind::MemberReference,
-        );
-        let mut expected_member_impacts = vec![
-            FactReferenceEdgeLookupImpact {
-                lookup: lookup_semantic(
-                    crate::analyzer::resolution::test_shared_names(),
-                    Language::Java,
-                    ResolutionNamespace::Value,
-                    "open",
-                ),
-                domain: FactReferenceEdgeDeclarationDomain::Field,
-            },
-            FactReferenceEdgeLookupImpact {
-                lookup: lookup_semantic(
-                    crate::analyzer::resolution::test_shared_names(),
-                    Language::Java,
-                    ResolutionNamespace::Type,
-                    "open",
-                ),
-                domain: FactReferenceEdgeDeclarationDomain::TypeOrCallable,
-            },
-        ];
-        expected_member_impacts.sort_unstable();
-        assert_eq!(
-            catalog
-                .reference_lookup_impacts(member_open)
-                .expect("the member reference must own both exact routes"),
-            expected_member_impacts,
-        );
-        let member_index = inverse_index_for_binding_gap(
-            &catalog,
-            fixture.fragment,
-            member_open,
-            FactReferenceEdgeGapDomain::AnyGraphDeclaration,
-        );
-        assert_lookup_resolution_status(&member_index, open_field, true);
-        assert_lookup_resolution_status(&member_index, open_type, true);
-        for callable in &open_callables {
-            assert_lookup_resolution_status(&member_index, callable, false);
-        }
-        assert_lookup_resolution_status(&member_index, &closed_field, false);
-
-        let missing = reference_semantic_named(
-            &fixture,
-            "missing",
-            ResolutionNamespace::Callable,
-            ResolutionSiteKind::CallableReference,
-        );
-        let missing_index = inverse_index_for_binding_gap(
-            &catalog,
-            fixture.fragment,
-            missing,
-            FactReferenceEdgeGapDomain::TypeOrCallable,
-        );
-        assert!(!missing_index.run_completeness().is_complete());
-        for target in targets {
-            assert_lookup_resolution_status(&missing_index, &target, false);
         }
     }
 
@@ -6206,167 +6565,6 @@ class Owner {\n\
             .find(|target| target.is_callable() && target.terminal_name() == "unrelated")
             .expect("the law source must retain an unrelated callable target");
         assert_lookup_resolution_status(&retry, &unrelated, false);
-    }
-
-    #[test]
-    fn selected_inverse_index_keeps_covered_empty_target_complete_across_field_only_gaps() {
-        const SOURCE: &str =
-            "package demo;\nclass Owner {\n    int value;\n    void write() { value = 1; }\n}\n";
-        let fixture = native_edge_projection_fixture_for(
-            "Owner.java",
-            SOURCE,
-            b"selected-inverse-empty-domain-law",
-            b"selected-inverse-empty-domain-law:demo",
-        );
-        let catalog = native_edge_catalog(&fixture);
-        let base_service = native_edge_selected_java_base_service(&fixture);
-        let engine = SelectedFactResolutionEngine::new(&base_service);
-        let snapshot = engine
-            .snapshot(&CancellationToken::new())
-            .expect("the selected inverse-index snapshot must assemble");
-        let index = selected_inverse_index(
-            build_selected_reference_inverse_index(
-                &fixture.analyzer,
-                &snapshot,
-                &catalog,
-                1,
-                &CancellationToken::new(),
-            )
-            .expect("the field-local selected inverse index must build"),
-        );
-        assert!(
-            !index.run_completeness().covers(EdgeAxis::InverseProjection),
-            "the aggregate run must retain the field gap"
-        );
-        let targets = graph_targets(&catalog);
-        let empty_type_or_callable = targets
-            .iter()
-            .filter(|target| !target.is_field())
-            .map(|target| (target, index.inverse_for(target)))
-            .find(|(_, result)| result.edges.is_empty())
-            .expect("the law source must contain one covered empty type/callable target");
-        assert_eq!(
-            empty_type_or_callable.1.completeness,
-            EdgeCompleteness::Complete,
-            "field-only gaps must not overtaint a covered empty type/callable"
-        );
-        assert!(
-            targets
-                .iter()
-                .filter(|target| target.is_field())
-                .any(|target| {
-                    !index
-                        .inverse_for(target)
-                        .completeness
-                        .covers(EdgeAxis::KindClassification)
-                })
-        );
-
-        let uncovered = CodeUnit::new(
-            fixture.file.clone(),
-            crate::analyzer::CodeUnitType::Class,
-            "demo",
-            "NotSelected",
-        );
-        let uncovered = index.inverse_for(&uncovered);
-        assert!(uncovered.edges.is_empty());
-        assert_eq!(
-            uncovered.completeness,
-            EdgeCompleteness::Incomplete {
-                reasons: vec![EdgeIncompleteReason::InverseIndexTargetUncovered]
-            }
-        );
-        assert!(!uncovered.covers(EdgeAxis::InverseProjection));
-    }
-
-    #[test]
-    fn selected_inverse_index_localizes_receiver_gap_to_one_exact_sibling_target() {
-        let fixture = native_edge_projection_fixture();
-        let catalog = native_edge_catalog(&fixture);
-        let mut siblings = catalog
-            .declarations
-            .iter()
-            .filter_map(|(&semantic, declaration)| match declaration {
-                FactReferenceEdgeDeclaration::Graph(target) if !target.is_field() => {
-                    Some((semantic, target.clone()))
-                }
-                FactReferenceEdgeDeclaration::Graph(_)
-                | FactReferenceEdgeDeclaration::OutOfGraphDomain => None,
-            })
-            .collect::<Vec<_>>();
-        siblings.sort_unstable_by(|left, right| left.1.cmp(&right.1));
-        siblings.dedup_by(|left, right| left.1 == right.1);
-        let [(open_semantic, open_target), (_, unaffected_target), ..] = siblings.as_slice() else {
-            panic!("the law source must contain two type/callable sibling targets: {siblings:?}");
-        };
-        let mut target_domains = HashMap::default();
-        assert!(
-            target_domains
-                .insert(
-                    open_target.clone(),
-                    FactReferenceEdgeDeclarationDomain::TypeOrCallable,
-                )
-                .is_none()
-        );
-        assert!(
-            target_domains
-                .insert(
-                    unaffected_target.clone(),
-                    FactReferenceEdgeDeclarationDomain::TypeOrCallable,
-                )
-                .is_none()
-        );
-        let open = EdgeCompleteness::Incomplete {
-            reasons: vec![EdgeIncompleteReason::ForwardAdmissionIncomplete],
-        };
-        let batch = FactReferenceEdgeBatch {
-            fragment: fixture.fragment,
-            generation: catalog.generation(),
-            reference_count: 1,
-            edges: Box::new([]),
-            gaps: vec![FactReferenceEdgeGap::ReceiverAdmission {
-                reference: semantic(b"selected-inverse-local-receiver-gap"),
-                target: *open_semantic,
-                gap: FactReferenceReceiverGap::MissingOrigin,
-                domain: FactReferenceEdgeGapDomain::TypeOrCallable,
-            }]
-            .into_boxed_slice(),
-            unresolved_names: None,
-            completeness: open.clone(),
-            type_or_callable_completeness: open.clone(),
-            field_completeness: EdgeCompleteness::Complete,
-        };
-        let mut accumulator =
-            SelectedReferenceInverseIndexAccumulator::new(catalog.generation(), target_domains);
-        assert!(
-            accumulator
-                .stage(&catalog, &batch, &CancellationToken::new())
-                .expect("the exact target-local gap must stage")
-        );
-        let index = selected_inverse_index(accumulator.finish(
-            FactReferenceEdgeSummary {
-                generation: catalog.generation(),
-                completeness: open.clone(),
-                type_or_callable_completeness: open,
-                field_completeness: EdgeCompleteness::Complete,
-                reference_count: 1,
-                edge_count: 0,
-                batch_count: 1,
-                root_binding_metrics: ResolutionBatchMetrics::default(),
-            },
-            &CancellationToken::new(),
-        ));
-        assert_eq!(
-            index.inverse_for(open_target).completeness,
-            EdgeCompleteness::Incomplete {
-                reasons: vec![EdgeIncompleteReason::InverseIndexAdmissionIncomplete]
-            }
-        );
-        assert_eq!(
-            index.inverse_for(unaffected_target).completeness,
-            EdgeCompleteness::Complete,
-            "a target-local receiver gap must not overtaint a same-domain sibling"
-        );
     }
 
     #[test]

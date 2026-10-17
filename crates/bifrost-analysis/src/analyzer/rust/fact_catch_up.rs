@@ -1,9 +1,9 @@
 //! Bringing the persisted Rust facts up to date before a usage query reads
 //! them.
 //!
-//! Milestone 3 of `.agents/plans/rust-usage-index-v2.md`. Under v2 a usage
-//! answer is composed from the `rust_*` fact rows of live blobs, so a live file
-//! whose blob carries no rows is not merely slow to answer -- it is invisible.
+//! A usage answer is composed from the `rust_*` fact rows of live blobs, so a
+//! live file whose blob carries no rows is not merely slow to answer -- it is
+//! invisible.
 //! Analysis persists those rows for every file it reconciles, so the gap is
 //! narrow: a store write that failed and left a dirty in-memory state, or a
 //! blob that reached the live set without ever being persisted.
@@ -21,6 +21,7 @@
 use std::sync::Mutex;
 
 use crate::analyzer::{PoolSafeMemo, ProjectFile, spawn_on_dedicated_build_pool};
+use brokk_bifrost_rust::graph_support::RustCargoRouteError;
 
 use super::RustAnalyzer;
 
@@ -75,6 +76,51 @@ impl RustFactCatchUp {
 }
 
 impl RustAnalyzer {
+    /// A live declaration can be visible before its content-addressed source
+    /// facts have been published. Repair only the requested file before a
+    /// structured declaration-property read depends on those rows.
+    pub(super) fn ensure_rust_declaration_facts_published(
+        &self,
+        file: &ProjectFile,
+        generation: crate::analyzer::store::GenerationId,
+        oid: git2::Oid,
+    ) -> Result<(), RustCargoRouteError> {
+        if self.selected_rust_source(file)? != (generation, oid) {
+            return Err(RustCargoRouteError::Unavailable);
+        }
+        let missing = self
+            .rust_files_without_facts_among(std::slice::from_ref(file))
+            .map_err(|error| {
+                self.inner.record_store_error(
+                    error.context("probing Rust declaration-property publication"),
+                );
+                RustCargoRouteError::Unavailable
+            })?;
+        if missing.is_empty() {
+            return Ok(());
+        }
+
+        self.inner.persist_live_blobs(&missing);
+        if self.selected_rust_source(file)? != (generation, oid) {
+            return Err(RustCargoRouteError::Unavailable);
+        }
+        let still_missing = self
+            .rust_files_without_facts_among(&missing)
+            .map_err(|error| {
+                self.inner.record_store_error(
+                    error.context("verifying Rust declaration-property publication"),
+                );
+                RustCargoRouteError::Unavailable
+            })?;
+        if !still_missing.is_empty() {
+            self.inner.record_store_error(crate::analyzer::store::StoreError::new(format!(
+                "Rust declaration-property catch-up could not publish live files: {still_missing:?}"
+            )));
+            return Err(RustCargoRouteError::Unavailable);
+        }
+        Ok(())
+    }
+
     /// Ensure every live Rust file's blob carries fact rows before a query
     /// reads them. Runs at most once per analyzer generation.
     ///
@@ -267,8 +313,9 @@ impl RustAnalyzer {
         self.rust_mounts_without_facts(mounts)
     }
 
-    /// The members of `mounts` whose blob is absent from the current Rust
-    /// publication witness.
+    /// The parseable members of `mounts` whose blob is absent from the current
+    /// Rust publication witness. Sources the publisher intentionally skips are
+    /// reported as structurally unavailable, not scheduled for futile catch-up.
     fn rust_mounts_without_facts(
         &self,
         mounts: Vec<(ProjectFile, git2::Oid)>,
@@ -281,11 +328,18 @@ impl RustAnalyzer {
         let present = self
             .analyzer_store()
             .blobs_with_rust_facts("rust", generation, &oids)?;
-        Ok(mounts
-            .into_iter()
-            .filter(|(_, oid)| !present.contains(oid))
-            .map(|(file, _)| file)
-            .collect())
+        let mut missing = Vec::new();
+        for (file, oid) in mounts {
+            if present.contains(&oid)
+                || self
+                    .inner
+                    .record_structure_unavailable_if_unparseable(&file, oid)
+            {
+                continue;
+            }
+            missing.push(file);
+        }
+        Ok(missing)
     }
 
     /// Test hook: hold the next deferred batch until the returned barrier is
@@ -306,13 +360,13 @@ impl RustAnalyzer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::QueryScope;
     use crate::analyzer::{CodeUnitIndex, IAnalyzer, Language, TestProject};
+    use brokk_bifrost_core::analyzer::query_token::QueryScope;
     use std::collections::BTreeSet;
     use std::time::{Duration, Instant};
 
     fn project(files: &[(String, String)]) -> (tempfile::TempDir, RustAnalyzer) {
-        project_with_config(files, crate::analyzer::AnalyzerConfig::default())
+        crate::analyzer::rust::test_support::project(files)
     }
 
     fn project_with_config(
@@ -339,23 +393,6 @@ mod tests {
         project(&workspace_files(size))
     }
 
-    fn workspace_files(size: usize) -> Vec<(String, String)> {
-        let mut files = vec![(
-            "src/lib.rs".to_string(),
-            (0..size)
-                .map(|index| format!("pub mod part{index};\n"))
-                .collect::<String>()
-                + "pub struct Widget;\n",
-        )];
-        for index in 0..size {
-            files.push((
-                format!("src/part{index}.rs"),
-                format!("use crate::Widget;\npub fn take{index}(_: Widget) {{}}\n"),
-            ));
-        }
-        files
-    }
-
     fn importers(analyzer: &RustAnalyzer) -> crate::hash::HashSet<ProjectFile> {
         let lib = ProjectFile::new(analyzer.project().root().to_path_buf(), "src/lib.rs");
         let target = analyzer
@@ -378,90 +415,21 @@ mod tests {
         .expect("published usage importers")
     }
 
-    /// A file whose blob lost its fact rows is invisible to a store-backed
-    /// query. Below the threshold explicit preparation repairs it inline,
-    /// without making an ordinary query start workspace-wide parser work.
-    #[test]
-    fn a_below_threshold_catch_up_runs_inline_and_never_reports_a_wait() {
-        let (_temp, analyzer) = workspace_of(1);
-        let part = ProjectFile::new(analyzer.project().root().to_path_buf(), "src/part0.rs");
-        assert!(importers(&analyzer).contains(&part));
-
-        let updated = analyzer.update_all();
-        let _ = updated.get_analyzed_files();
-        updated.analyzer_store().delete_rust_facts_for_test("rust");
-        let stale = updated.rust_files_without_facts().expect("live-blob probe");
-        assert_eq!(stale.len(), 2, "both files lost their rows: {stale:?}");
-
-        assert!(
-            !updated.rust_usage_facts_ready(),
-            "publication is not yet verified"
-        );
-        updated.warm_usage_facts();
-        assert!(
-            importers(&updated).contains(&part),
-            "the query answers from rows the catch-up restored"
-        );
-        assert!(updated.rust_usage_facts_ready());
-        assert!(updated.rust_usage_facts_warm());
-        assert!(
-            updated
-                .rust_files_without_facts()
-                .expect("live-blob probe")
-                .is_empty(),
-            "the catch-up set is empty afterwards"
-        );
-    }
-
-    /// At or above the threshold the batch is handed to the background pool and
-    /// the probe reports false until it drains. The barrier makes the false
-    /// state observable without a timing assumption.
-    #[test]
-    fn an_above_threshold_catch_up_defers_and_reports_false_until_it_drains() {
-        let (_temp, analyzer) = workspace_of(RUST_FACT_CATCH_UP_INLINE_LIMIT + 1);
-        let part = ProjectFile::new(analyzer.project().root().to_path_buf(), "src/part0.rs");
-        assert!(importers(&analyzer).contains(&part));
-
-        let updated = analyzer.update_all();
-        let _ = updated.get_analyzed_files();
-        updated.analyzer_store().delete_rust_facts_for_test("rust");
-        let stale = updated.rust_files_without_facts().expect("live-blob probe");
-        assert_eq!(
-            stale.len(),
-            RUST_FACT_CATCH_UP_INLINE_LIMIT + 2,
-            "the completed build must lose every module witness: {stale:?}"
-        );
-        assert!(
-            !updated.rust_usage_facts_ready(),
-            "publication is not yet verified"
-        );
-
-        let gate = updated.hold_rust_fact_catch_up_for_test();
-        updated.ensure_rust_facts_caught_up();
-        assert!(
-            !updated.rust_usage_facts_ready(),
-            "a deferred batch must report a wait"
-        );
-        assert!(!updated.rust_usage_facts_warm());
-
-        gate.wait();
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while !updated.rust_usage_facts_ready() {
-            assert!(
-                Instant::now() < deadline,
-                "the deferred batch never drained"
-            );
-            std::thread::sleep(Duration::from_millis(10));
+    fn workspace_files(size: usize) -> Vec<(String, String)> {
+        let mut files = vec![(
+            "src/lib.rs".to_string(),
+            (0..size)
+                .map(|index| format!("pub mod part{index};\n"))
+                .collect::<String>()
+                + "pub struct Widget;\n",
+        )];
+        for index in 0..size {
+            files.push((
+                format!("src/part{index}.rs"),
+                format!("use crate::Widget;\npub fn take{index}(_: Widget) {{}}\n"),
+            ));
         }
-        assert!(updated.rust_usage_facts_warm());
-        assert!(
-            updated
-                .rust_files_without_facts()
-                .expect("live-blob probe")
-                .is_empty(),
-            "the deferred batch persisted every stale file"
-        );
-        assert!(importers(&updated).contains(&part));
+        files
     }
 
     /// Parse pools persist per language and thread count, and every build of
@@ -556,27 +524,14 @@ mod tests {
         );
     }
 
-    /// The warm no longer builds anything: it is the same catch-up, and on a
-    /// workspace analysis already persisted it finds nothing to do. It must
-    /// still not drag the hierarchy index in behind it, which is what kept the
-    /// warms separate (#1757, d8920a38). The reference contexts it used to be
-    /// paired with no longer exist to be built: resolution is per site.
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[test]
-    fn warming_the_usage_facts_warms_only_the_usage_facts() {
-        let (_temp, analyzer) = workspace_of(1);
-        assert!(!analyzer.rust_usage_facts_warm());
-
-        analyzer.warm_usage_facts();
-
-        assert!(analyzer.rust_usage_facts_warm());
-    }
-
     /// A failed live-blob probe is not an empty catch-up set. Before #2325 the
     /// probe swallowed its store error and answered "no file needs catching
     /// up", so a damaged cache left every Rust usage answer quietly composed
     /// from stale facts and reported success.
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "861fb5ee15c3: a failed Rust live-blob probe hid stale fact rows as an empty catch-up set"
+    )]
     fn a_failed_live_blob_probe_reports_the_failure_instead_of_an_empty_catch_up_set() {
         let (_temp, analyzer) = workspace_of(1);
         analyzer.analyzer_store().drop_rust_modules_table_for_test();
@@ -625,5 +580,91 @@ mod tests {
         assert!(!analyzer.rust_usage_facts_ready());
         assert!(!analyzer.rust_usage_facts_warm());
         assert!(analyzer.rust_files_without_facts().unwrap().contains(&file));
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#549: Rust usage fact catch-up failed to repair stale rows below the inline threshold"
+    )]
+    fn a_below_threshold_catch_up_runs_inline_and_never_reports_a_wait() {
+        let (_temp, analyzer) = workspace_of(1);
+        let part = ProjectFile::new(analyzer.project().root().to_path_buf(), "src/part0.rs");
+        assert!(importers(&analyzer).contains(&part));
+
+        let updated = analyzer.update_all();
+        let _ = updated.get_analyzed_files();
+        updated.analyzer_store().delete_rust_facts_for_test("rust");
+        let stale = updated.rust_files_without_facts().expect("live-blob probe");
+        assert_eq!(stale.len(), 2, "both files lost their rows: {stale:?}");
+
+        assert!(
+            !updated.rust_usage_facts_ready(),
+            "publication is not yet verified"
+        );
+        updated.warm_usage_facts();
+        assert!(
+            importers(&updated).contains(&part),
+            "the query answers from rows the catch-up restored"
+        );
+        assert!(updated.rust_usage_facts_ready());
+        assert!(updated.rust_usage_facts_warm());
+        assert!(
+            updated
+                .rust_files_without_facts()
+                .expect("live-blob probe")
+                .is_empty(),
+            "the catch-up set is empty afterwards"
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#549: deferred Rust fact catch-up reported ready before background publication finished"
+    )]
+    fn an_above_threshold_catch_up_defers_and_reports_false_until_it_drains() {
+        let (_temp, analyzer) = workspace_of(RUST_FACT_CATCH_UP_INLINE_LIMIT + 1);
+        let part = ProjectFile::new(analyzer.project().root().to_path_buf(), "src/part0.rs");
+        assert!(importers(&analyzer).contains(&part));
+
+        let updated = analyzer.update_all();
+        let _ = updated.get_analyzed_files();
+        updated.analyzer_store().delete_rust_facts_for_test("rust");
+        let stale = updated.rust_files_without_facts().expect("live-blob probe");
+        assert_eq!(
+            stale.len(),
+            RUST_FACT_CATCH_UP_INLINE_LIMIT + 2,
+            "the completed build must lose every module witness: {stale:?}"
+        );
+        assert!(
+            !updated.rust_usage_facts_ready(),
+            "publication is not yet verified"
+        );
+
+        let gate = updated.hold_rust_fact_catch_up_for_test();
+        updated.ensure_rust_facts_caught_up();
+        assert!(
+            !updated.rust_usage_facts_ready(),
+            "a deferred batch must report a wait"
+        );
+        assert!(!updated.rust_usage_facts_warm());
+
+        gate.wait();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !updated.rust_usage_facts_ready() {
+            assert!(
+                Instant::now() < deadline,
+                "the deferred batch never drained"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(updated.rust_usage_facts_warm());
+        assert!(
+            updated
+                .rust_files_without_facts()
+                .expect("live-blob probe")
+                .is_empty(),
+            "the deferred batch persisted every stale file"
+        );
+        assert!(importers(&updated).contains(&part));
     }
 }

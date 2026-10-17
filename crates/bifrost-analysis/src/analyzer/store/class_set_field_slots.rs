@@ -3,14 +3,12 @@
 use std::path::Path;
 
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 
 use super::{AnalyzerStore, Result, StoreError};
 use crate::CancellationToken;
 use crate::analyzer::Language;
-use crate::analyzer::semantic::{
-    SemanticWork, SourcePosition, SourceSpan, StableDigest, WorkspaceRelativePath,
-};
+use crate::analyzer::semantic::{SemanticWork, SourcePosition, SourceSpan, StableDigest};
 
 pub type ClassSetFieldSlotDigest = [u8; 32];
 
@@ -136,7 +134,7 @@ impl ClassSetFieldSlotIndexRow {
                     }
                     ClassSetFieldSlotAtomValueRow::Unknown(_) => {}
                 }
-                if !valid_rel_path(&atom.source.rel_path)
+                if !super::valid_workspace_relative_path(Path::new(&atom.source.rel_path))
                     || SourceSpan::new(
                         SourcePosition::new(
                             atom.source.start_byte,
@@ -201,7 +199,8 @@ impl ClassSetFieldSlotIndexRow {
             .windows(2)
             .any(|pair| pair[0].rel_path >= pair[1].rel_path)
             || artifacts.iter().any(|artifact| {
-                !valid_rel_path(&artifact.rel_path) || artifact.work.source_bytes != 0
+                !super::valid_workspace_relative_path(Path::new(&artifact.rel_path))
+                    || artifact.work.source_bytes != 0
             })
         {
             return Err(StoreError::new(
@@ -413,7 +412,10 @@ fn validate_class(class: &ClassSetFieldSlotClassRow) -> Result<()> {
             declaration_id,
             fq_name,
             rel_path,
-        } if !declaration_id.is_empty() && !fq_name.is_empty() && valid_rel_path(rel_path) => {
+        } if !declaration_id.is_empty()
+            && !fq_name.is_empty()
+            && super::valid_workspace_relative_path(Path::new(rel_path)) =>
+        {
             Ok(())
         }
         ClassSetFieldSlotClassRow::External { fq_name, symbol_id }
@@ -423,11 +425,6 @@ fn validate_class(class: &ClassSetFieldSlotClassRow) -> Result<()> {
         }
         _ => Err(StoreError::new("class-set field-slot class is invalid")),
     }
-}
-
-fn valid_rel_path(path: &str) -> bool {
-    WorkspaceRelativePath::try_from_path(Path::new(path))
-        .is_ok_and(|normalized| normalized.as_str() == path)
 }
 
 fn payload_text_bytes_cancellable(
@@ -571,26 +568,23 @@ struct FieldSlotDigest(Sha256);
 
 impl FieldSlotDigest {
     fn new(domain: &[u8]) -> Self {
-        let mut hash = Self(Sha256::new());
-        hash.bytes(domain);
-        hash
+        Self(super::new_sha256_with_length_prefixed_domain(domain))
     }
 
     fn bytes(&mut self, value: &[u8]) {
-        self.0.update((value.len() as u64).to_le_bytes());
-        self.0.update(value);
+        super::update_sha256_with_length_prefix(&mut self.0, value);
     }
 
     fn text(&mut self, value: &str) {
-        self.bytes(value.as_bytes());
+        super::update_sha256_with_length_prefixed_text(&mut self.0, value);
     }
 
     fn tag(&mut self, value: u8) {
-        self.bytes(&[value]);
+        super::update_sha256_with_length_prefixed_byte(&mut self.0, value);
     }
 
     fn u64(&mut self, value: u64) {
-        self.bytes(&value.to_le_bytes());
+        super::update_sha256_with_length_prefixed_u64(&mut self.0, value);
     }
 
     fn class(&mut self, class: &ClassSetFieldSlotClassRow) {
@@ -620,7 +614,7 @@ impl FieldSlotDigest {
     }
 
     fn finish(self) -> [u8; 32] {
-        self.0.finalize().into()
+        brokk_bifrost_core::analyzer::canonical_hash::finish_sha256(self.0)
     }
 }
 
@@ -1463,15 +1457,7 @@ fn semantic_work_from_values(values: &[i64]) -> Result<SemanticWork> {
 }
 
 fn bounded_count(value: i64, max: usize, name: &str) -> Result<usize> {
-    let value = usize::try_from(value).map_err(|_| {
-        StoreError::corrupt(format!("class-set field-slot {name} count is invalid"))
-    })?;
-    if value > max {
-        return Err(StoreError::resource_bound(format!(
-            "class-set field-slot {name} count exceeds {max}"
-        )));
-    }
-    Ok(value)
+    super::class_set_bounded_count(value, max, name, "field-slot")
 }
 
 fn bool_value(value: i64, name: &str) -> Result<bool> {
@@ -1485,20 +1471,13 @@ fn bool_value(value: i64, name: &str) -> Result<bool> {
 }
 
 fn admit_text_bytes(total: &mut usize, row_bytes: i64) -> Result<()> {
-    let row_bytes = bounded_count(
+    super::admit_class_set_text_bytes(
+        total,
         row_bytes,
         MAX_FIELD_SLOT_TEXT_BYTES,
-        "payload row text byte",
-    )?;
-    *total = total.checked_add(row_bytes).ok_or_else(|| {
-        StoreError::resource_bound("class-set field-slot payload text size overflows usize")
-    })?;
-    if *total > MAX_FIELD_SLOT_TEXT_BYTES {
-        return Err(StoreError::resource_bound(format!(
-            "class-set field-slot payload text exceeds {MAX_FIELD_SLOT_TEXT_BYTES} bytes"
-        )));
-    }
-    Ok(())
+        "field-slot",
+        "payload text",
+    )
 }
 
 fn dense_index(value: i64, len: usize, name: &str) -> Result<usize> {
@@ -1513,27 +1492,19 @@ fn dense_index(value: i64, len: usize, name: &str) -> Result<usize> {
 }
 
 fn u32_value(value: i64, name: &str) -> Result<u32> {
-    u32::try_from(value)
-        .map_err(|_| StoreError::corrupt(format!("class-set field-slot {name} exceeds u32")))
+    super::class_set_u32(value, name, "field-slot")
 }
 
 fn digest(bytes: Vec<u8>, name: &str) -> Result<[u8; 32]> {
-    bytes.try_into().map_err(|bytes: Vec<u8>| {
+    super::checked_fixed_digest(bytes).map_err(|length| {
         StoreError::corrupt(format!(
-            "class-set field-slot {name} digest has {} bytes",
-            bytes.len()
+            "class-set field-slot {name} digest has {length} bytes"
         ))
     })
 }
 
 fn ensure_not_cancelled(cancellation: &CancellationToken) -> Result<()> {
-    if cancellation.is_cancelled() {
-        Err(StoreError::new(
-            "class-set field-slot publication cancelled",
-        ))
-    } else {
-        Ok(())
-    }
+    super::ensure_store_not_cancelled(cancellation, "class-set field-slot publication cancelled")
 }
 
 fn ensure_optional_cancellation(cancellation: Option<&CancellationToken>) -> Result<()> {
@@ -1547,7 +1518,7 @@ fn ensure_optional_cancellation(cancellation: Option<&CancellationToken>) -> Res
 mod tests {
     use super::*;
     use crate::analyzer::store::StoreErrorKind;
-    use crate::analyzer::store::planner_statistics::tests::{explain_pin, pinned};
+    use crate::analyzer::store::planner_statistics::tests::assert_pinned_query_uses_index;
     use brokk_bifrost_core::cache_gc::PlannerStatisticsState;
     use std::sync::{Arc, Barrier};
 
@@ -1738,7 +1709,6 @@ mod tests {
             "unknown reasons use the persisted vocabulary"
         );
     }
-
     #[test]
     fn persisted_field_slots_bound_headers_digests_and_child_cardinality() {
         let store = AnalyzerStore::open_ephemeral().unwrap();
@@ -2261,7 +2231,6 @@ mod tests {
         );
         assert_eq!(load(&store, &key()).unwrap(), Some(replacement));
     }
-
     #[test]
     fn field_slot_queries_seek_persisted_indexes() {
         for state in PlannerStatisticsState::BOTH {
@@ -2294,18 +2263,12 @@ mod tests {
                     "class_set_field_slot_indexes_recent",
                 ),
             ] {
-                let plan = explain_pin(&conn, &pinned(name));
-                assert!(
-                    plan.iter().any(|detail| detail.contains(expected)),
-                    "{state} {name}: {plan:#?}"
-                );
-                assert!(
-                    plan.iter().all(|detail| {
-                        !detail.contains("AUTOMATIC")
-                            && !detail.contains("TEMP B-TREE")
-                            && !detail.contains("SCAN ")
-                    }),
-                    "{state} {name}: {plan:#?}"
+                assert_pinned_query_uses_index(
+                    &conn,
+                    state,
+                    name,
+                    expected,
+                    &["AUTOMATIC", "TEMP B-TREE", "SCAN "],
                 );
             }
         }

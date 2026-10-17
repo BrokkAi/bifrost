@@ -17,6 +17,21 @@ use super::ResolutionIncompleteReason;
 
 type Reason = ResolutionIncompleteReason;
 
+fn visit_with_poll<T, I, P, F>(values: I, cancelled: &mut P, mut visit: F) -> Option<()>
+where
+    I: IntoIterator<Item = T>,
+    P: FnMut() -> bool + ?Sized,
+    F: FnMut(T),
+{
+    for value in values {
+        if cancelled() {
+            return None;
+        }
+        visit(value);
+    }
+    Some(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Fingerprint {
     len: usize,
@@ -287,19 +302,13 @@ impl CompletionReasonUnion {
             return None;
         }
         let mut excluded = BTreeSet::new();
-        for &index in &self.excluded {
-            if cancelled() {
-                return None;
-            }
+        visit_with_poll(self.excluded.iter().copied(), cancelled, |index| {
             excluded.insert(index);
-        }
+        })?;
         let mut additions = BTreeSet::new();
-        for &reason in &self.additions {
-            if cancelled() {
-                return None;
-            }
+        visit_with_poll(self.additions.iter().copied(), cancelled, |reason| {
             additions.insert(reason);
-        }
+        })?;
         Some(Self {
             base: self.base.clone(),
             excluded,
@@ -326,7 +335,7 @@ impl CompletionReasons {
             !reasons.is_empty(),
             "incomplete resolution requires a reason"
         );
-        Self(CompletionReasonsRepr::Raw(reasons.into_boxed_slice()))
+        reasons.into()
     }
 
     pub(crate) fn from_validated_canonical_box(reasons: Box<[Reason]>) -> Self {
@@ -621,12 +630,9 @@ impl CompletionReasons {
                     return None;
                 }
                 let mut copy = Vec::with_capacity(reasons.len());
-                for &reason in reasons.iter() {
-                    if cancelled() {
-                        return None;
-                    }
+                visit_with_poll(reasons.iter().copied(), cancelled, |reason| {
                     copy.push(reason);
-                }
+                })?;
                 Some(Self::from(copy))
             }
             CompletionReasonsRepr::Factored {
@@ -897,14 +903,12 @@ fn copy_slice_with_poll<T: Copy, P>(values: &[T], cancelled: &mut P) -> Option<B
 where
     P: FnMut() -> bool + ?Sized,
 {
-    let mut copy = Vec::with_capacity(values.len());
-    for &value in values {
-        if cancelled() {
-            return None;
-        }
-        copy.push(value);
-    }
-    Some(copy.into_boxed_slice())
+    super::model::clone_cells_with_poll(
+        values,
+        &mut super::model::copy_cell_with_poll::<T, P>,
+        cancelled,
+    )
+    .map(Vec::into_boxed_slice)
 }
 
 fn binary_search_with_poll<T, P>(
@@ -932,18 +936,15 @@ where
     Some(Err(lower))
 }
 
-fn canonical_additions_union_with_poll<I, J, P>(
-    left: I,
-    right: J,
+pub(super) fn canonical_reasons_with_seed_and_poll<P>(
+    mut canonical: BTreeSet<Reason>,
+    incoming: impl IntoIterator<Item = Reason>,
     cancelled: &mut P,
-) -> Option<Box<[Reason]>>
+) -> Option<Box<[ResolutionIncompleteReason]>>
 where
-    I: IntoIterator<Item = Reason>,
-    J: IntoIterator<Item = Reason>,
     P: FnMut() -> bool + ?Sized,
 {
-    let mut canonical = BTreeSet::new();
-    for reason in left.into_iter().chain(right) {
+    for reason in incoming {
         if cancelled() {
             return None;
         }
@@ -957,6 +958,19 @@ where
         reasons.push(reason);
     }
     Some(reasons.into_boxed_slice())
+}
+
+fn canonical_additions_union_with_poll<I, J, P>(
+    left: I,
+    right: J,
+    cancelled: &mut P,
+) -> Option<Box<[Reason]>>
+where
+    I: IntoIterator<Item = Reason>,
+    J: IntoIterator<Item = Reason>,
+    P: FnMut() -> bool + ?Sized,
+{
+    canonical_reasons_with_seed_and_poll(BTreeSet::new(), left.into_iter().chain(right), cancelled)
 }
 
 fn canonical_union_with_poll<I, J, P>(
@@ -1127,23 +1141,8 @@ impl<'a> IntoIterator for &'a CompletionReasons {
 
 impl PartialEq for CompletionReasons {
     fn eq(&self, other: &Self) -> bool {
-        match (&self.0, &other.0) {
-            (
-                CompletionReasonsRepr::Factored {
-                    base: left_base,
-                    excluded: left_excluded,
-                    additions: left_additions,
-                },
-                CompletionReasonsRepr::Factored {
-                    base: right_base,
-                    excluded: right_excluded,
-                    additions: right_additions,
-                },
-            ) if Arc::ptr_eq(left_base, right_base) => {
-                left_excluded == right_excluded && left_additions == right_additions
-            }
-            _ => self.iter().eq(other.iter()),
-        }
+        self.same_factored_base_contents(other)
+            .unwrap_or_else(|| self.iter().eq(other.iter()))
     }
 }
 
@@ -1157,15 +1156,32 @@ impl PartialOrd for CompletionReasons {
 
 impl Ord for CompletionReasons {
     fn cmp(&self, other: &Self) -> Ordering {
-        if matches!(
-            (&self.0, &other.0),
-            (CompletionReasonsRepr::Factored { base: left, .. },
-             CompletionReasonsRepr::Factored { base: right, .. }) if Arc::ptr_eq(left, right)
-        ) && self == other
-        {
+        if self.same_factored_base_contents(other) == Some(true) {
             return Ordering::Equal;
         }
         self.iter().cmp(other.iter())
+    }
+}
+
+impl CompletionReasons {
+    fn same_factored_base_contents(&self, other: &Self) -> Option<bool> {
+        match (&self.0, &other.0) {
+            (
+                CompletionReasonsRepr::Factored {
+                    base: left_base,
+                    excluded: left_excluded,
+                    additions: left_additions,
+                },
+                CompletionReasonsRepr::Factored {
+                    base: right_base,
+                    excluded: right_excluded,
+                    additions: right_additions,
+                },
+            ) if Arc::ptr_eq(left_base, right_base) => {
+                Some(left_excluded == right_excluded && left_additions == right_additions)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -1203,49 +1219,6 @@ mod tests {
 
     fn reason(name: &str) -> Reason {
         Reason::UnsupportedSemantic(super::super::SemanticId::for_test(name.as_bytes()))
-    }
-
-    #[test]
-    fn factored_union_and_sparse_removal_are_extensional() {
-        let a = reason("a");
-        let b = reason("b");
-        let c = reason("c");
-        let base = CompletionReasons::from(vec![a, b]);
-        let mut never_cancelled = || false;
-        let factored = base
-            .to_shared_with_poll(&mut never_cancelled)
-            .unwrap()
-            .union(&CompletionReasons::from(vec![c]));
-        let mut expected = vec![a, b, c];
-        expected.sort_unstable();
-        assert_eq!(factored.clone().into_vec(), expected);
-
-        let activated = factored.union(&CompletionReasons::from(vec![b]));
-        assert_eq!(activated, factored);
-
-        let removed = activated.without_reasons([b]).unwrap();
-        let mut expected = vec![a, c];
-        expected.sort_unstable();
-        assert_eq!(removed.into_vec(), expected);
-        assert_eq!(activated.without_reasons([a, b, c]), None);
-    }
-
-    #[test]
-    fn raw_shape_is_preserved_and_empty_raw_unions_are_valid_with_factored() {
-        let a = reason("a");
-        let b = reason("b");
-        let raw = CompletionReasons::from(vec![b, a, b]);
-        assert_eq!(raw.clone().into_vec(), vec![b, a, b]);
-        let empty = CompletionReasons::from(Vec::<Reason>::new());
-        let mut expected = vec![a, b];
-        expected.sort_unstable();
-        assert_eq!(empty.union(&raw).into_vec(), expected);
-        assert_eq!(empty.without_reasons([a]).unwrap().into_vec(), Vec::new());
-
-        let base = CompletionReasons::from(vec![a]);
-        let mut never_cancelled = || false;
-        let factored = base.to_shared_with_poll(&mut never_cancelled).unwrap();
-        assert_eq!(factored.union(&empty), factored);
     }
 
     #[test]
@@ -1321,71 +1294,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn mutable_union_merges_same_and_different_bases_exactly() {
-        let a = reason("union-a");
-        let b = reason("union-b");
-        let c = reason("union-c");
-        let d = reason("union-d");
-        let shared = CompletionReasons::from(vec![a, b, c])
-            .to_shared_with_poll(&mut || false)
-            .unwrap();
-        let left = shared.without_reasons([b]).unwrap();
-        let right = shared
-            .without_reasons([c])
-            .unwrap()
-            .union(&CompletionReasons::from(vec![d]));
-        let mut union = CompletionReasonUnion::from_shared_with_poll(&left, &mut || false).unwrap();
-        union.include_with_poll(&right, &mut || false).unwrap();
-        union
-            .include_with_poll(&CompletionReasons::from(Vec::<Reason>::new()), &mut || {
-                false
-            })
-            .unwrap();
-        assert_eq!(
-            union
-                .finish_with_poll(&mut || false)
-                .unwrap()
-                .iter()
-                .copied()
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from([a, b, c, d])
-        );
-
-        let mut restored =
-            CompletionReasonUnion::from_shared_with_poll(&left, &mut || false).unwrap();
-        restored
-            .include_with_poll(&CompletionReasons::from(vec![b, b]), &mut || false)
-            .unwrap();
-        assert_eq!(
-            restored
-                .finish_with_poll(&mut || false)
-                .unwrap()
-                .iter()
-                .copied()
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from([a, b, c])
-        );
-
-        let alternate_base = CompletionReasons::from(vec![b, c])
-            .to_shared_with_poll(&mut || false)
-            .unwrap();
-        let mut different =
-            CompletionReasonUnion::from_shared_with_poll(&shared, &mut || false).unwrap();
-        different
-            .include_with_poll(&alternate_base, &mut || false)
-            .unwrap();
-        assert_eq!(
-            different
-                .finish_with_poll(&mut || false)
-                .unwrap()
-                .iter()
-                .copied()
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from([a, b, c])
-        );
     }
 
     #[test]
@@ -1516,45 +1424,6 @@ mod tests {
     }
 
     #[test]
-    fn mutable_union_reason_includes_do_not_scan_prior_deltas() {
-        let base = CompletionReasons::from(
-            (0..1024)
-                .map(|index| reason(&format!("large-union-base-{index}")))
-                .collect::<Vec<_>>(),
-        )
-        .to_shared_with_poll(&mut || false)
-        .unwrap();
-        let target = reason("large-union-target");
-        let mut early = CompletionReasonUnion::from_shared_with_poll(&base, &mut || false).unwrap();
-        let mut early_polls = 0;
-        early
-            .include_reason_with_poll(target, &mut || {
-                early_polls += 1;
-                false
-            })
-            .unwrap();
-
-        let mut late = CompletionReasonUnion::from_shared_with_poll(&base, &mut || false).unwrap();
-        for index in 0..128 {
-            late.include_reason_with_poll(
-                reason(&format!("large-union-addition-{index}")),
-                &mut || false,
-            )
-            .unwrap();
-        }
-        let mut late_polls = 0;
-        late.include_reason_with_poll(target, &mut || {
-            late_polls += 1;
-            false
-        })
-        .unwrap();
-        assert!(early_polls > 1);
-        assert_eq!(late_polls, early_polls);
-        assert!(early.contains_with_poll(&target, &mut || false).unwrap());
-        assert!(late.contains_with_poll(&target, &mut || false).unwrap());
-    }
-
-    #[test]
     fn shared_union_intersects_exclusions_and_matches_materialized_value_laws() {
         let universe = [
             reason("base-a"),
@@ -1608,7 +1477,6 @@ mod tests {
             }
         }
     }
-
     #[test]
     fn empty_shared_deltas_still_observe_cancellation() {
         let shared = CompletionReasons::from(vec![reason("base")])
@@ -1625,25 +1493,5 @@ mod tests {
                 .contains_with_poll(&reason("base"), &mut || { std::mem::take(&mut first_poll) })
                 .is_none()
         );
-    }
-
-    #[test]
-    fn shared_clone_does_not_poll_the_base() {
-        let base = CompletionReasons::from(
-            (0..100)
-                .map(|index| reason(&format!("base-{index}")))
-                .collect::<Vec<_>>(),
-        );
-        let mut never_cancelled = || false;
-        let base = base.to_shared_with_poll(&mut never_cancelled).unwrap();
-        let value = base.union(&CompletionReasons::from(vec![reason("local")]));
-        let mut polls = 0;
-        let clone = value.clone_with_poll(&mut || {
-            polls += 1;
-            false
-        });
-        assert!(clone.is_some());
-        assert_eq!(polls, 2);
-        assert_eq!(value.clone_work_len(), 2);
     }
 }

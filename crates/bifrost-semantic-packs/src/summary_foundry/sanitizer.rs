@@ -284,7 +284,6 @@ fn probe(
 mod tests {
     use super::*;
 
-    /// The guava HtmlEscapers entry, in the exact held shape.
     const GUAVA_HTML_ESCAPER: &str = r#"{
       "target": {
         "path": "com/google/common/html/HtmlEscapers.java",
@@ -302,51 +301,6 @@ mod tests {
       "confidence": "medium",
       "citations": "Javadoc of HtmlEscapers"
     }"#;
-
-    #[test]
-    fn every_vocabulary_token_has_a_breakout_metacharacter() {
-        for context in InjectionContext::ALL {
-            assert!(
-                context.breakout_metacharacter().is_some(),
-                "{} has no breakout metacharacter",
-                context.as_str()
-            );
-        }
-    }
-
-    #[test]
-    fn the_held_sanitizer_shape_parses_and_gates_to_adversarial_probes() {
-        let entry: SanitizerEntry =
-            serde_json::from_str(GUAVA_HTML_ESCAPER).expect("the held shape parses");
-        let suite = gate_sanitizer(&entry).expect("a well-formed sanitizer gates");
-
-        // Three neutralized contexts, nine does-not-neutralize contexts.
-        assert_eq!(suite.probes.len(), 12);
-        let neutralized = suite
-            .probes
-            .iter()
-            .filter(|probe| probe.expectation == SanitizerExpectation::Neutralized)
-            .map(|probe| (probe.context, probe.metacharacter.as_str()))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            neutralized,
-            vec![
-                (InjectionContext::Html, "<"),
-                (InjectionContext::HtmlAttr, "\""),
-                (InjectionContext::Xml, "<"),
-            ]
-        );
-        // No probe injects a benign payload: every payload is a known breakout
-        // metacharacter for its context.
-        for probe in &suite.probes {
-            assert_eq!(
-                Some(probe.metacharacter.as_str()),
-                probe.context.breakout_metacharacter(),
-                "probe for {} does not inject its context metacharacter",
-                probe.context.as_str()
-            );
-        }
-    }
 
     /// The exact failure the Decision Log records: a URL percent-encoder claimed
     /// as a `sql` sanitizer. The gate injects the SQL breakout metacharacter
@@ -382,6 +336,40 @@ mod tests {
         // The payload is a grammar metacharacter, not an alphanumeric benign
         // string that the encoder would pass unchanged.
         assert!(!sql.metacharacter.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn the_held_sanitizer_shape_parses_and_gates_to_adversarial_probes() {
+        let entry: SanitizerEntry =
+            serde_json::from_str(GUAVA_HTML_ESCAPER).expect("the held shape parses");
+        let suite = gate_sanitizer(&entry).expect("a well-formed sanitizer gates");
+
+        // Three neutralized contexts, nine does-not-neutralize contexts.
+        assert_eq!(suite.probes.len(), 12);
+        let neutralized = suite
+            .probes
+            .iter()
+            .filter(|probe| probe.expectation == SanitizerExpectation::Neutralized)
+            .map(|probe| (probe.context, probe.metacharacter.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            neutralized,
+            vec![
+                (InjectionContext::Html, "<"),
+                (InjectionContext::HtmlAttr, "\""),
+                (InjectionContext::Xml, "<"),
+            ]
+        );
+        // No probe injects a benign payload: every payload is a known breakout
+        // metacharacter for its context.
+        for probe in &suite.probes {
+            assert_eq!(
+                Some(probe.metacharacter.as_str()),
+                probe.context.breakout_metacharacter(),
+                "probe for {} does not inject its context metacharacter",
+                probe.context.as_str()
+            );
+        }
     }
 
     #[test]

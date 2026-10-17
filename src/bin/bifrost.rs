@@ -14,11 +14,12 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 
 use std::env;
 use std::fs;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use chrono::{Datelike, Utc};
+use sha2::{Digest, Sha256};
 #[path = "bifrost/code_query_repl.rs"]
 mod code_query_repl;
 
@@ -29,16 +30,16 @@ use brokk_bifrost::mcp_registry::{
     single_shot_only_tool_descriptors,
 };
 use brokk_bifrost::policy::{
-    BuiltInPolicyCatalogManifest, BuiltInPolicySelection, ExplanationCandidate,
-    ExplanationGeneration, ExplanationLimits, ExplanationTarget, HumanRenderColor,
-    HumanRenderDetail, HumanRenderOptions, NearMissCandidates, POLICY_EXIT_CLEAN,
-    POLICY_EXIT_UNRELIABLE, PolicyBaselineDocument, PolicyBaselineOptions, PolicyBaselineSource,
-    PolicyBatchOutcome, PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions,
-    PolicyExecutionStage, PolicyFailOn, PolicyFindingId, PolicyRenderError, PolicyScopeOptions,
-    PolicyScopeSource, PolicySuppressionOptions, PolicySuppressionSource, SarifToolIdentity,
-    built_in_policy_catalog, escape_terminal_text, evaluate_policy_inputs, explain_policy_inputs,
-    rank_policy_near_misses, relation_schema_catalog, write_policy_human, write_policy_json,
-    write_policy_sarif_for_outcome,
+    BuiltInPolicyCatalogManifest, BuiltInPolicySelection, BuiltInPolicySelectionRecord,
+    ExplanationCandidate, ExplanationGeneration, ExplanationLimits, ExplanationTarget,
+    FlowExplanationCandidate, HumanRenderColor, HumanRenderDetail, HumanRenderOptions,
+    NearMissCandidates, POLICY_EXIT_CLEAN, POLICY_EXIT_UNRELIABLE, PolicyBaselineDocument,
+    PolicyBaselineOptions, PolicyBaselineSource, PolicyBatchOutcome, PolicyEvaluationDate,
+    PolicyEvaluationInput, PolicyEvaluationOptions, PolicyExecutionStage, PolicyFailOn,
+    PolicyFindingId, PolicyRangeRequest, PolicyRenderError, PolicyScopeOptions, PolicyScopeSource,
+    PolicySuppressionOptions, PolicySuppressionSource, SarifToolIdentity, built_in_policy_catalog,
+    escape_terminal_text, evaluate_policy_inputs, explain_policy_inputs, rank_policy_near_misses,
+    relation_schema_catalog, write_policy_human, write_policy_json, write_policy_sarif_for_outcome,
 };
 use brokk_bifrost::rmcp_host::{
     NamedWorkspace, run_named_workspace_stdio_server_with_build_identity,
@@ -59,6 +60,7 @@ const LSP_SERVER_MOVED: &str = "the LSP server has moved out of this repository"
 
 enum CliRunResult {
     Complete,
+    Exit(u8),
     PolicyStatus(u8),
 }
 
@@ -121,6 +123,8 @@ enum PolicyColorMode {
     Never,
 }
 
+const CLI_STACK_BYTES: usize = 8 * 1024 * 1024;
+
 fn main() -> ExitCode {
     let args = env::args().skip(1).collect::<Vec<_>>();
     let result = if let Some(result) = run_portable_runtime_command(&args) {
@@ -130,14 +134,17 @@ fn main() -> ExitCode {
         })
     } else {
         brokk_bifrost::ensure_global_rayon_pool();
-        if let Err(error) = brokk_bifrost::install_bifrost_semantic_model_packs() {
-            Err(CliRunError {
-                message: error,
-                policy_invocation: false,
-            })
-        } else {
-            run(args.into_iter())
-        }
+        // Windows gives the main thread a 1 MiB stack, Linux 8 MiB. RQL
+        // policy lowering recurses once per query nesting level with large
+        // frames, and overflowed on Windows (#4573). Run with the Linux
+        // size so every platform has the same headroom.
+        std::thread::Builder::new()
+            .name("bifrost-cli".into())
+            .stack_size(CLI_STACK_BYTES)
+            .spawn(move || run(args.into_iter()))
+            .expect("spawn the CLI thread")
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
     };
     // A one-shot run has no MCP request boundary to close, so this is the only
     // place the reader seam's counts can be made complete. Both instruments do
@@ -146,6 +153,7 @@ fn main() -> ExitCode {
     brokk_bifrost::cache_db::sql_profile::flush();
     match result {
         Ok(CliRunResult::Complete) => ExitCode::SUCCESS,
+        Ok(CliRunResult::Exit(status)) => ExitCode::from(status),
         Ok(CliRunResult::PolicyStatus(status)) => ExitCode::from(status),
         Err(err) => {
             eprintln!("{}", escape_terminal_text(&err.message));
@@ -155,6 +163,88 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         }
+    }
+}
+
+fn acquire_open_packs_for_process() -> Result<(), String> {
+    const SEMANTIC_BUNDLE_ENV: &str = "BIFROST_OPEN_SEMANTIC_PACK_BUNDLE";
+    const POLICY_ROOT_ENV: &str = "BIFROST_OPEN_POLICY_PACK_ROOT";
+    const SEMANTIC_CACHE_ROOT_ENV: &str = "BIFROST_SEMANTIC_PACK_CACHE_ROOT";
+
+    if open_packs_disabled() {
+        return Ok(());
+    }
+    if std::env::var_os(SEMANTIC_BUNDLE_ENV).is_some()
+        || std::env::var_os(POLICY_ROOT_ENV).is_some()
+    {
+        return Ok(());
+    }
+    let profile = brokk_bifrost::open_pack_engine_profile();
+    match brokk_bifrost_semantic_packs::download::prepare_open_packs_for_runtime(&profile) {
+        Ok(brokk_bifrost_semantic_packs::download::OpenPackRuntimeOutcome::Selected(selection)) => {
+            let selection = *selection;
+            // Set the roots before semantic catalogs or workspaces initialize.
+            unsafe {
+                if let Some(bundle_root) = selection.semantic_bundle_root.as_ref() {
+                    std::env::set_var(SEMANTIC_BUNDLE_ENV, bundle_root);
+                }
+                std::env::set_var(POLICY_ROOT_ENV, selection.policy_pack_root);
+                if std::env::var_os(SEMANTIC_CACHE_ROOT_ENV).is_none() {
+                    std::env::set_var(SEMANTIC_CACHE_ROOT_ENV, selection.semantic_cache_root);
+                }
+            }
+            Ok(())
+        }
+        Ok(brokk_bifrost_semantic_packs::download::OpenPackRuntimeOutcome::EmbeddedFallback {
+            kind,
+            message,
+        }) => {
+            if should_warn_open_pack_fallback(&kind, open_packs_offline_requested()) {
+                eprintln!(
+                    "[bifrost] Open-pack acquisition {kind}: {message}. Using embedded packs."
+                );
+            }
+            Ok(())
+        }
+        Err(error) => Err(format!("open pack acquisition failed: {error}")),
+    }
+}
+
+fn install_semantic_model_packs_for_process() -> Result<(), String> {
+    brokk_bifrost::install_bifrost_semantic_model_packs().map_err(|error| error.to_string())
+}
+
+fn tool_activates_open_packs(tool_name: &str) -> bool {
+    tool_name == "run_policy"
+}
+
+fn open_packs_disabled() -> bool {
+    matches!(
+        std::env::var("BIFROST_OPEN_PACKS_DISABLE").as_deref(),
+        Ok("1" | "true")
+    )
+}
+
+fn open_packs_offline_requested() -> bool {
+    matches!(
+        std::env::var("BIFROST_OPEN_PACKS_OFFLINE").as_deref(),
+        Ok("1" | "true")
+    ) || std::env::var("BIFROST_LAUNCHER_AUTO_INSTALL").as_deref() == Ok("0")
+}
+
+fn should_warn_open_pack_fallback(
+    kind: &brokk_bifrost_semantic_packs::download::OpenPackFallbackKind,
+    offline_requested: bool,
+) -> bool {
+    use brokk_bifrost_semantic_packs::download::OpenPackFallbackKind;
+
+    match kind {
+        OpenPackFallbackKind::NetworkUnavailable => true,
+        OpenPackFallbackKind::OfflineCacheMiss => !offline_requested,
+        OpenPackFallbackKind::Disabled
+        | OpenPackFallbackKind::NoCompatibleRelease
+        | OpenPackFallbackKind::Pending
+        | OpenPackFallbackKind::Unsupported => false,
     }
 }
 
@@ -201,9 +291,234 @@ fn run_portable_runtime_command(args: &[String]) -> Option<Result<CliRunResult, 
                 install_semantic_packs(Path::new(&args[1]), Path::new(&args[2]))
             }
         }
+        Some("prepare-open-packs") => match run_prepare_open_packs(&args[1..]) {
+            Ok(result) => Ok(result),
+            Err(message) => {
+                eprintln!("{}", escape_terminal_text(&message));
+                Ok(CliRunResult::Exit(2))
+            }
+        },
         _ => return None,
     };
     Some(result)
+}
+
+fn run_prepare_open_packs(args: &[String]) -> Result<CliRunResult, String> {
+    let mut cache_dir = None;
+    let mut receipt_path = None;
+    let mut env_path = None;
+    let mut request_path = None;
+    let mut identity_only = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--identity-only" if !identity_only => identity_only = true,
+            "--cache-dir" => {
+                if cache_dir.is_some() || args.get(index + 1).is_none_or(String::is_empty) {
+                    return Err(
+                        "--cache-dir requires one nonempty path and may appear once".to_owned()
+                    );
+                }
+                index += 1;
+                cache_dir = Some(PathBuf::from(&args[index]));
+            }
+            "--receipt-path" => {
+                if receipt_path.is_some() || args.get(index + 1).is_none_or(String::is_empty) {
+                    return Err(
+                        "--receipt-path requires one nonempty path and may appear once".to_owned(),
+                    );
+                }
+                index += 1;
+                receipt_path = Some(PathBuf::from(&args[index]));
+            }
+            "--env-path" => {
+                if env_path.is_some() || args.get(index + 1).is_none_or(String::is_empty) {
+                    return Err(
+                        "--env-path requires one nonempty path and may appear once".to_owned()
+                    );
+                }
+                index += 1;
+                env_path = Some(PathBuf::from(&args[index]));
+            }
+            "--request-path" => {
+                if request_path.is_some() || args.get(index + 1).is_none_or(String::is_empty) {
+                    return Err(
+                        "--request-path requires one nonempty path and may appear once".to_owned(),
+                    );
+                }
+                index += 1;
+                request_path = Some(PathBuf::from(&args[index]));
+            }
+            option => return Err(format!("unknown prepare-open-packs option: {option}")),
+        }
+        index += 1;
+    }
+    if identity_only && request_path.is_some() {
+        return Err("--request-path cannot be combined with --identity-only".to_owned());
+    }
+    let Some(cache_dir) = cache_dir else {
+        return Err("usage: bifrost prepare-open-packs --cache-dir DIR --receipt-path FILE --env-path FILE [--request-path FILE] [--identity-only]".to_owned());
+    };
+    let profile = brokk_bifrost::open_pack_engine_profile();
+    if identity_only {
+        if receipt_path.is_some() || env_path.is_some() {
+            return Err(
+                "--identity-only cannot be combined with receipt or environment outputs".to_owned(),
+            );
+        }
+        let identity =
+            brokk_bifrost_semantic_packs::download::open_packs_cache_identity(&profile, &cache_dir)
+                .map_err(|error| format!("cannot compute open-pack cache identity: {error}"))?;
+        println!("{identity}");
+        return Ok(CliRunResult::Complete);
+    }
+    let receipt_path = receipt_path
+        .ok_or_else(|| "--receipt-path is required unless --identity-only is used".to_owned())?;
+    let env_path = env_path
+        .ok_or_else(|| "--env-path is required unless --identity-only is used".to_owned())?;
+    if receipt_path == env_path {
+        return Err("receipt and environment output paths must differ".to_owned());
+    }
+    if request_path
+        .as_ref()
+        .is_some_and(|request| request == &receipt_path || request == &env_path)
+    {
+        return Err("request and output paths must differ".to_owned());
+    }
+    remove_prepare_output(&receipt_path)?;
+    remove_prepare_output(&env_path)?;
+    let executable_sha256 = executable_sha256()?;
+    let request_result = match request_path.as_ref() {
+        Some(_) if env::var_os("PACK_SOURCE").is_some_and(|value| !value.is_empty()) => Err(
+            brokk_bifrost_semantic_packs::download::OpenPackError::Configuration(
+                "PACK_SOURCE cannot be combined with --request-path".to_owned(),
+            ),
+        ),
+        Some(path) => {
+            let request_bytes = fs::read(path).map_err(|error| {
+                format!("cannot read request file `{}`: {error}", path.display())
+            })?;
+            brokk_bifrost_semantic_packs::download::parse_pack_request(&request_bytes)
+        }
+        None => brokk_bifrost_semantic_packs::download::default_pack_request(),
+    };
+    let (request, selection_result) = match request_result {
+        Ok(request) => {
+            let selection = brokk_bifrost_semantic_packs::download::prepare_pack_request_at(
+                &profile,
+                &request,
+                Some(cache_dir.as_path()),
+            );
+            (Some(request), selection)
+        }
+        Err(error) => (None, Err(error)),
+    };
+    let selected = selection_result.as_ref().ok().cloned();
+    let mut outcome = brokk_bifrost_semantic_packs::download::acquisition_outcome(
+        &profile,
+        request.as_ref(),
+        selection_result,
+    );
+    outcome["engine"]["executable_sha256"] = json!(executable_sha256);
+    let is_selected = outcome["status"] == "selected";
+    let outcome_bytes = serde_json::to_vec_pretty(&outcome)
+        .map_err(|error| format!("cannot encode pack acquisition outcome: {error}"))?;
+
+    if is_selected {
+        let selection = selected
+            .as_ref()
+            .expect("selected acquisition outcome has selected roots");
+        let mut environment = json!({
+            "BIFROST_OPEN_POLICY_PACK_ROOT": selection.policy_pack_root.to_string_lossy(),
+            "BIFROST_SEMANTIC_PACK_CACHE_ROOT": selection.semantic_cache_root.to_string_lossy(),
+        });
+        if let Some(bundle_root) = selection.semantic_bundle_root.as_ref() {
+            environment["BIFROST_OPEN_SEMANTIC_PACK_BUNDLE"] = json!(bundle_root.to_string_lossy());
+        }
+        let environment = serde_json::to_vec_pretty(&environment)
+            .map_err(|error| format!("cannot encode selected pack environment: {error}"))?;
+        write_prepare_output(&env_path, &environment)?;
+    }
+    if let Err(message) = write_prepare_output(&receipt_path, &outcome_bytes) {
+        if is_selected && let Err(cleanup_error) = remove_prepare_output(&env_path) {
+            return Err(format!(
+                "{message}; cannot remove environment output after outcome write failure: {cleanup_error}"
+            ));
+        }
+        return Err(message);
+    }
+
+    if is_selected {
+        let selection = selected.expect("selected acquisition outcome has selected roots");
+        println!("Verified open-pack selection {}", selection.selection_id);
+        Ok(CliRunResult::Exit(0))
+    } else {
+        let failure_class = outcome["failure"]["class"]
+            .as_str()
+            .expect("failed acquisition outcome has a failure class");
+        println!("Open-pack acquisition failed: {failure_class}");
+        Ok(CliRunResult::Exit(1))
+    }
+}
+
+fn executable_sha256() -> Result<String, String> {
+    let path = env::current_exe().map_err(|error| format!("cannot locate executable: {error}"))?;
+    let mut executable = fs::File::open(&path)
+        .map_err(|error| format!("cannot read executable `{}`: {error}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let bytes_read = executable
+            .read(&mut buffer)
+            .map_err(|error| format!("cannot hash executable `{}`: {error}", path.display()))?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn remove_prepare_output(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => fs::remove_file(path).map_err(|error| {
+            format!(
+                "cannot clear stale prepare output `{}`: {error}",
+                path.display()
+            )
+        }),
+        Ok(_) => Err(format!(
+            "prepare output path `{}` is not a regular file",
+            path.display()
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "cannot inspect prepare output `{}`: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn write_prepare_output(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("cannot create prepare output directory: {error}"))?;
+    let mut output = NamedTempFile::new_in(parent)
+        .map_err(|error| format!("cannot create prepare output temporary file: {error}"))?;
+    output
+        .write_all(bytes)
+        .map_err(|error| format!("cannot write prepare output temporary file: {error}"))?;
+    output.persist(path).map_err(|error| {
+        format!(
+            "cannot write prepare output `{}`: {}",
+            path.display(),
+            error.error
+        )
+    })?;
+    Ok(())
 }
 
 fn install_semantic_packs(bundle_dir: &Path, cache_root: &Path) -> Result<CliRunResult, String> {
@@ -268,6 +583,7 @@ fn has_policy_syntax(args: &[String]) -> bool {
                 | "--policy-pack"
                 | "--policy-category"
                 | "--policy-id"
+                | "--exclude-policy-id"
                 | "--list-policies"
                 | "--list-row-schemas"
                 | "--format"
@@ -278,6 +594,7 @@ fn has_policy_syntax(args: &[String]) -> bool {
                 | "--accept-current"
                 | "--evaluation-date"
                 | "--diff-base"
+                | "--diff-scoped"
                 | "--no-incremental"
                 | "--policy-timings"
                 | "--output"
@@ -286,6 +603,7 @@ fn has_policy_syntax(args: &[String]) -> bool {
                 | "--require-explicit-schema-versions"
                 | "--explain-finding"
                 | "--explain-candidate"
+                | "--explain-candidate-source"
                 | "--explain-near-misses"
                 | "--explain-generation"
         ) {
@@ -316,6 +634,7 @@ fn option_requires_value(argument: &str) -> bool {
             | "--policy-pack"
             | "--policy-category"
             | "--policy-id"
+            | "--exclude-policy-id"
             | "--format"
             | "--fail-on"
             | "--suppressions-file"
@@ -327,29 +646,30 @@ fn option_requires_value(argument: &str) -> bool {
             | "--color"
             | "--explain-finding"
             | "--explain-candidate"
+            | "--explain-candidate-source"
             | "--explain-near-misses"
             | "--explain-generation"
     )
 }
 
-/// One `--explain-candidate` value: `PATH:BYTE_START` or
-/// `PATH:BYTE_START-BYTE_END`.
+/// One `--explain-candidate` or `--explain-candidate-source` value:
+/// `PATH:BYTE_START` or `PATH:BYTE_START-BYTE_END`. `flag` names the option
+/// in every error.
 ///
 /// The separator is the *last* colon before the offset, so a Windows-style
 /// drive letter or a path containing a colon still parses. The offsets are
 /// bytes, not lines or columns, because that is the domain key the explanation
 /// library takes and inventing a second one would need a source read.
-fn parse_explain_candidate(value: &str) -> Result<(String, u64, Option<u64>), String> {
-    let (path, span) = value.rsplit_once(':').ok_or_else(|| {
-        format!("Invalid --explain-candidate `{value}`: expected PATH:BYTE_START[-BYTE_END]")
-    })?;
+fn parse_explain_position(flag: &str, value: &str) -> Result<(String, u64, Option<u64>), String> {
+    let (path, span) = value
+        .rsplit_once(':')
+        .ok_or_else(|| format!("Invalid {flag} `{value}`: expected PATH:BYTE_START[-BYTE_END]"))?;
     if path.is_empty() {
-        return Err(format!("Invalid --explain-candidate `{value}`: empty path"));
+        return Err(format!("Invalid {flag} `{value}`: empty path"));
     }
     let parse_offset = |text: &str| -> Result<u64, String> {
-        text.parse::<u64>().map_err(|error| {
-            format!("Invalid --explain-candidate byte offset `{text}` in `{value}`: {error}")
-        })
+        text.parse::<u64>()
+            .map_err(|error| format!("Invalid {flag} byte offset `{text}` in `{value}`: {error}"))
     };
     match span.split_once('-') {
         Some((start, end)) => Ok((
@@ -402,6 +722,8 @@ fn run_inner(
     // Reuse is on by default; the switch exists to take it away for a run that
     // needs to compare against the full dual-snapshot evaluation.
     let mut policy_incremental = true;
+    // Scope taint sink procedures to changed hunks from the diff base.
+    let mut policy_diff_scoped = false;
     let mut policy_timings = false;
     let mut policy_output: Option<PathBuf> = None;
     let mut policy_verbose = false;
@@ -411,6 +733,7 @@ fn run_inner(
     let mut require_explicit_schema_versions = false;
     let mut explain_finding: Option<String> = None;
     let mut explain_candidate: Option<(String, u64, Option<u64>)> = None;
+    let mut explain_candidate_source: Option<(String, u64, Option<u64>)> = None;
     let mut explain_generation: Option<ExplanationGeneration> = None;
     let mut explain_near_misses: Option<usize> = None;
 
@@ -547,6 +870,12 @@ fn run_inner(
                     .ok_or_else(|| "--policy-id requires an id".to_string())?;
                 policy_selection.policy_ids.push(value);
             }
+            "--exclude-policy-id" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--exclude-policy-id requires an id".to_string())?;
+                policy_selection.excluded_policy_ids.push(value);
+            }
             "--list-policies" => select_listing(&mut listing, PolicyListing::Policies)?,
             "--list-row-schemas" => select_listing(&mut listing, PolicyListing::RowSchemas)?,
             "--explain-finding" => {
@@ -565,7 +894,19 @@ fn run_inner(
                 if explain_candidate.is_some() {
                     return Err("--explain-candidate may only be provided once".to_string());
                 }
-                explain_candidate = Some(parse_explain_candidate(&value)?);
+                explain_candidate = Some(parse_explain_position("--explain-candidate", &value)?);
+            }
+            "--explain-candidate-source" => {
+                let value = args.next().ok_or_else(|| {
+                    "--explain-candidate-source requires PATH:BYTE_START[-BYTE_END]".to_string()
+                })?;
+                if explain_candidate_source.is_some() {
+                    return Err("--explain-candidate-source may only be provided once".to_string());
+                }
+                explain_candidate_source = Some(parse_explain_position(
+                    "--explain-candidate-source",
+                    &value,
+                )?);
             }
             "--explain-generation" => {
                 let value = args.next().ok_or_else(|| {
@@ -583,7 +924,8 @@ fn run_inner(
             "--explain-near-misses" => {
                 let value = args.next().ok_or_else(|| {
                     format!(
-                        "--explain-near-misses requires how many ranked subjects to retain,                          between 1 and {MAX_EXPLAIN_NEAR_MISSES}"
+                        "--explain-near-misses requires how many ranked subjects to retain, \
+                         between 1 and {MAX_EXPLAIN_NEAR_MISSES}"
                     )
                 })?;
                 if explain_near_misses.is_some() {
@@ -685,6 +1027,12 @@ fn run_inner(
                     return Err("--diff-base may only be provided once".to_string());
                 }
             }
+            "--diff-scoped" => {
+                if policy_diff_scoped {
+                    return Err("--diff-scoped may only be provided once".to_string());
+                }
+                policy_diff_scoped = true;
+            }
             "--output" => {
                 let value = args
                     .next()
@@ -777,11 +1125,12 @@ fn run_inner(
             let flag = listing.flag();
             if explain_finding.is_some()
                 || explain_candidate.is_some()
+                || explain_candidate_source.is_some()
                 || explain_near_misses.is_some()
                 || explain_generation.is_some()
             {
                 return Err(format!(
-                    "{flag} cannot be combined with --explain-finding, --explain-candidate, --explain-near-misses, or --explain-generation"
+                    "{flag} cannot be combined with --explain-finding, --explain-candidate, --explain-candidate-source, --explain-near-misses, or --explain-generation"
                 ));
             }
             if !policy_files.is_empty()
@@ -827,7 +1176,7 @@ fn run_inner(
         if no_builtin_policies {
             if !policy_selection.is_empty() {
                 return Err(
-                    "--no-builtin-policies cannot be combined with --policy-pack, --policy-category, or --policy-id"
+                    "--no-builtin-policies cannot be combined with --policy-pack, --policy-category, --policy-id, or --exclude-policy-id"
                         .to_string(),
                 );
             }
@@ -851,8 +1200,18 @@ fn run_inner(
             }
             policy_fail_on = PolicyFailOn::Never;
         }
-        let explain_mode =
-            explanation_mode(explain_finding, explain_candidate, explain_near_misses)?;
+        if policy_diff_scoped && policy_diff_base.is_none() {
+            return Err("--diff-scoped requires --diff-base REV".to_string());
+        }
+        if policy_diff_scoped && !policy_incremental {
+            return Err("--diff-scoped cannot be combined with --no-incremental".to_string());
+        }
+        let explain_mode = explanation_mode(
+            explain_finding,
+            explain_candidate,
+            explain_candidate_source,
+            explain_near_misses,
+        )?;
         if explain_mode.is_none() && explain_generation.is_some() {
             return Err(
                 "--explain-generation requires --explain-finding, --explain-candidate, or --explain-near-misses"
@@ -877,7 +1236,7 @@ fn run_inner(
                 || !tool_sources.is_empty()
             {
                 return Err(
-                    "--explain-finding, --explain-candidate, and --explain-near-misses cannot be combined with --format, --fail-on, --suppressions-file, --scope-file, --baseline-file, --accept-current, --evaluation-date, --diff-base, --verbose, --color, or --sources"
+                    "--explain-finding, --explain-candidate, and --explain-near-misses cannot be combined with --format, --fail-on, --suppressions-file, --scope-file, --baseline-file, --accept-current, --evaluation-date, --diff-base, --policy-timings, --verbose, --color, or --sources"
                         .to_string(),
                 );
             }
@@ -895,28 +1254,44 @@ fn run_inner(
                     .to_string(),
             );
         }
-        let catalog = built_in_policy_catalog().map_err(|error| error.to_string())?;
-        let effective_selection = if use_builtin_default {
-            BuiltInPolicySelection {
-                packs: catalog
-                    .document()
-                    .packs
-                    .iter()
-                    .map(|pack| pack.id.clone())
-                    .collect(),
-                ..BuiltInPolicySelection::default()
-            }
-        } else {
-            policy_selection
-        };
-        let mut policy_inputs = catalog
-            .select(&effective_selection)
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .map(|policy| {
-                PolicyEvaluationInput::embedded(policy.source_identity(), policy.source())
-            })
-            .collect::<Vec<_>>();
+        acquire_open_packs_for_process()?;
+        install_semantic_model_packs_for_process()?;
+        let (mut policy_inputs, builtin_selection) =
+            if use_builtin_default || !policy_selection.is_empty() {
+                let catalog = built_in_policy_catalog().map_err(|error| error.to_string())?;
+                let effective_selection = if use_builtin_default {
+                    BuiltInPolicySelection {
+                        packs: catalog
+                            .document()
+                            .packs
+                            .iter()
+                            .map(|pack| pack.id.clone())
+                            .collect(),
+                        ..BuiltInPolicySelection::default()
+                    }
+                } else {
+                    policy_selection
+                };
+                let selected = catalog
+                    .select(&effective_selection)
+                    .map_err(|error| error.to_string())?;
+                // A run with no built-in selector ran no built-in policy, so it has no
+                // built-in selection to record.
+                let builtin_selection = (!effective_selection.is_empty()).then(|| {
+                    BuiltInPolicySelectionRecord::new(
+                        catalog,
+                        &selected,
+                        &effective_selection.excluded_policy_ids,
+                    )
+                });
+                let policy_inputs = selected
+                    .into_iter()
+                    .map(PolicyEvaluationInput::selected_builtin)
+                    .collect::<Vec<_>>();
+                (policy_inputs, builtin_selection)
+            } else {
+                (Vec::new(), None)
+            };
         policy_inputs.extend(
             policy_files
                 .into_iter()
@@ -952,6 +1327,7 @@ fn run_inner(
                 baseline: policy_baseline,
                 accept_current,
                 diff_base: policy_diff_base,
+                diff_scoped: policy_diff_scoped,
                 incremental: policy_incremental,
                 policy_timings,
                 output: policy_output,
@@ -959,6 +1335,7 @@ fn run_inner(
                 color: policy_color,
                 require_explicit_schema_versions,
                 sources: tool_sources,
+                builtin_selection,
             },
             &policy_inputs,
         );
@@ -999,6 +1376,7 @@ fn run_inner(
         if !tool_sources.is_empty() {
             return Err("--query-file cannot be combined with --sources".to_string());
         }
+        install_semantic_model_packs_for_process()?;
         return run_tool(
             root,
             "query_code",
@@ -1022,6 +1400,14 @@ fn run_inner(
         let diff_snapshot_object_dir = diff_snapshot_object_dir
             .map(validate_diff_snapshot_object_dir)
             .transpose()?;
+        let canonical_root = root.canonicalize().map_err(|error| {
+            format!("Failed to resolve project root {}: {error}", root.display())
+        })?;
+        normalize_tool_arguments_for_cli(&tool_name, tool_args.clone(), &canonical_root)?;
+        if tool_activates_open_packs(&tool_name) {
+            acquire_open_packs_for_process()?;
+        }
+        install_semantic_model_packs_for_process()?;
         return run_tool(
             root,
             &tool_name,
@@ -1053,6 +1439,7 @@ fn run_inner(
         if diff_snapshot_object_dir.is_some() {
             return Err("--diff-snapshot-object-dir is only valid with --tool or MCP server mode; it cannot be combined with --repl".to_string());
         }
+        install_semantic_model_packs_for_process()?;
         return run_code_query_repl(root).map(|()| CliRunResult::Complete);
     }
 
@@ -1071,6 +1458,8 @@ fn run_inner(
     let diff_snapshot_object_dir = diff_snapshot_object_dir
         .map(validate_diff_snapshot_object_dir)
         .transpose()?;
+    acquire_open_packs_for_process()?;
+    install_semantic_model_packs_for_process()?;
     if named_workspaces.is_empty() {
         run_stdio_server_with_build_identity(
             initial_root,
@@ -1249,15 +1638,24 @@ fn run_scan(mut args: impl Iterator<Item = String>) -> Result<CliRunResult, Stri
         return Err(format!("scan path is not a directory: {}", root.display()));
     }
 
+    acquire_open_packs_for_process()?;
+    install_semantic_model_packs_for_process()?;
     let catalog = built_in_policy_catalog().map_err(|error| error.to_string())?;
     let document = catalog.document();
+    let selection = BuiltInPolicySelection {
+        packs: document.packs.iter().map(|pack| pack.id.clone()).collect(),
+        ..BuiltInPolicySelection::default()
+    };
+    let selected = catalog
+        .select(&selection)
+        .map_err(|error| error.to_string())?;
     // The witness surface: which shipped packs this run activates, in the
     // exact line shape `--version` prints, followed by one activation
     // summary. It goes to stderr so stdout stays a single machine document.
     for line in builtin_pack_witness_lines(document, catalog.digest()) {
         eprintln!("{line}");
     }
-    eprintln!("{}", scan_activation_summary(document));
+    eprintln!("{}", scan_activation_summary(document, selected.len()));
 
     if document.packs.is_empty() {
         // No policy evaluation occurred. Keep that distinct from a clean
@@ -1276,15 +1674,10 @@ fn run_scan(mut args: impl Iterator<Item = String>) -> Result<CliRunResult, Stri
         return Ok(CliRunResult::PolicyStatus(POLICY_EXIT_CLEAN));
     }
 
-    let selection = BuiltInPolicySelection {
-        packs: document.packs.iter().map(|pack| pack.id.clone()).collect(),
-        ..BuiltInPolicySelection::default()
-    };
-    let policy_inputs = catalog
-        .select(&selection)
-        .map_err(|error| error.to_string())?
+    let builtin_selection = Some(BuiltInPolicySelectionRecord::new(catalog, &selected, &[]));
+    let policy_inputs = selected
         .into_iter()
-        .map(|policy| PolicyEvaluationInput::embedded(policy.source_identity(), policy.source()))
+        .map(PolicyEvaluationInput::selected_builtin)
         .collect::<Vec<_>>();
     let status = run_policy_mode(
         PolicyModeRequest {
@@ -1297,12 +1690,14 @@ fn run_scan(mut args: impl Iterator<Item = String>) -> Result<CliRunResult, Stri
             baseline: PolicyBaselineOptions::default(),
             accept_current: false,
             diff_base: None,
+            diff_scoped: false,
             incremental,
             policy_timings: false,
             output,
             verbose,
             color,
             require_explicit_schema_versions: false,
+            builtin_selection,
             sources: Vec::new(),
         },
         &policy_inputs,
@@ -1333,16 +1728,16 @@ fn builtin_pack_witness_lines(
 }
 
 /// One stderr summary of what a scan activated, honest about a build that
-/// ships nothing.
-fn scan_activation_summary(document: &BuiltInPolicyCatalogManifest) -> String {
-    let policies: usize = document.packs.iter().map(|pack| pack.policies.len()).sum();
+/// ships nothing. `evaluated` is the size of the scan's own selection: opt-in
+/// policies that only a `--policy-id` names are shipped but not evaluated.
+fn scan_activation_summary(document: &BuiltInPolicyCatalogManifest, evaluated: usize) -> String {
     if document.packs.is_empty() {
         "bifrost scan: no host-supplied rule packs are active; no rules were evaluated".to_string()
     } else {
+        let shipped: usize = document.packs.iter().map(|pack| pack.policies.len()).sum();
         format!(
-            "bifrost scan: activated {} built-in policy packs ({} policies)",
+            "bifrost scan: activated {} built-in policy packs ({shipped} policies shipped, {evaluated} evaluated)",
             document.packs.len(),
-            policies
         )
     }
 }
@@ -1485,8 +1880,16 @@ enum ExplanationMode {
 fn explanation_mode(
     finding: Option<String>,
     candidate: Option<(String, u64, Option<u64>)>,
+    candidate_source: Option<(String, u64, Option<u64>)>,
     near_misses: Option<usize>,
 ) -> Result<Option<ExplanationMode>, String> {
+    if candidate_source.is_some() && candidate.is_none() {
+        return Err(
+            "--explain-candidate-source is the source half of a flow or taint candidate and \
+             requires --explain-candidate"
+                .to_string(),
+        );
+    }
     let asked = usize::from(finding.is_some())
         + usize::from(candidate.is_some())
         + usize::from(near_misses.is_some());
@@ -1504,15 +1907,23 @@ fn explanation_mode(
             ExplanationTarget::Finding(parsed),
         )));
     }
-    if let Some((path, byte_start, byte_end)) = candidate {
-        let parsed = match byte_end {
+    let position = |flag: &str, (path, byte_start, byte_end): (String, u64, Option<u64>)| {
+        match byte_end {
             Some(byte_end) => ExplanationCandidate::in_range(&path, byte_start, byte_end),
             None => ExplanationCandidate::at_offset(&path, byte_start),
         }
-        .map_err(|error| format!("Invalid --explain-candidate: {error}"))?;
-        return Ok(Some(ExplanationMode::Explanation(
-            ExplanationTarget::Candidate(parsed),
-        )));
+        .map_err(|error| format!("Invalid {flag}: {error}"))
+    };
+    if let Some(candidate) = candidate {
+        let observation = position("--explain-candidate", candidate)?;
+        let target = match candidate_source {
+            Some(source) => ExplanationTarget::FlowCandidate(FlowExplanationCandidate::new(
+                position("--explain-candidate-source", source)?,
+                observation,
+            )),
+            None => ExplanationTarget::Candidate(observation),
+        };
+        return Ok(Some(ExplanationMode::Explanation(target)));
     }
     Ok(near_misses.map(ExplanationMode::NearMiss))
 }
@@ -1545,13 +1956,7 @@ fn run_policy_explain_mode(
         &ExplanationLimits::default(),
     ) {
         Ok(explanation) => explanation,
-        Err(error) => {
-            eprintln!(
-                "bifrost: policy explanation failed: {}",
-                escape_terminal_text(&error.to_string())
-            );
-            return POLICY_EXIT_UNRELIABLE;
-        }
+        Err(error) => return policy_explanation_failure("explanation", error),
     };
     write_explanation_json(&explanation.to_json(), output)
 }
@@ -1591,15 +1996,17 @@ fn run_policy_near_miss_mode(
         &ExplanationLimits::default().with_max_near_miss_candidates(max_candidates),
     ) {
         Ok(ranking) => ranking,
-        Err(error) => {
-            eprintln!(
-                "bifrost: policy near-miss ranking failed: {}",
-                escape_terminal_text(&error.to_string())
-            );
-            return POLICY_EXIT_UNRELIABLE;
-        }
+        Err(error) => return policy_explanation_failure("near-miss ranking", error),
     };
     write_explanation_json(&ranking.to_json(), output)
+}
+
+fn policy_explanation_failure(operation: &str, error: impl std::fmt::Display) -> u8 {
+    eprintln!(
+        "bifrost: policy {operation} failed: {}",
+        escape_terminal_text(&error.to_string())
+    );
+    POLICY_EXIT_UNRELIABLE
 }
 
 /// Emit one explanation or ranking document, to a file or to stdout.
@@ -1669,6 +2076,7 @@ struct PolicyModeRequest {
     baseline: PolicyBaselineOptions,
     accept_current: bool,
     diff_base: Option<String>,
+    diff_scoped: bool,
     incremental: bool,
     policy_timings: bool,
     output: Option<PathBuf>,
@@ -1676,6 +2084,7 @@ struct PolicyModeRequest {
     color: PolicyColorMode,
     require_explicit_schema_versions: bool,
     sources: Vec<String>,
+    builtin_selection: Option<BuiltInPolicySelectionRecord>,
 }
 
 fn run_policy_mode(request: PolicyModeRequest, policy_inputs: &[PolicyEvaluationInput]) -> u8 {
@@ -1705,6 +2114,12 @@ fn run_policy_mode(request: PolicyModeRequest, policy_inputs: &[PolicyEvaluation
             .with_policy_timings(request.policy_timings);
     if let Some(revision) = request.diff_base.clone() {
         options = options.with_diff_base(revision);
+    }
+    if request.diff_scoped {
+        options = options.with_range(PolicyRangeRequest::DiffBase);
+    }
+    if let Some(selection) = &request.builtin_selection {
+        options = options.with_builtin_selection(selection.clone());
     }
     let evaluation = if request.sources.is_empty() {
         evaluate_policy_inputs(&request.root, policy_inputs, &options)
@@ -2143,7 +2558,7 @@ fn print_help(topic: Option<&str>) -> Result<(), String> {
 
 fn print_general_help() {
     println!(
-        "bifrost {} — Tree-sitter-backed code analyzer with MCP search-tool and LSP servers (stdio).",
+        "bifrost {} — Tree-sitter-backed code analyzer with an MCP server over stdio and one-shot CLI modes.",
         env!("CARGO_PKG_VERSION")
     );
     // Static sections, printed via variables so the JSON braces in the examples
@@ -2161,6 +2576,8 @@ USAGE:
     bifrost --query-file PATH  Run a .rql or .json code query once, print JSON result, and exit
     bifrost --install          Register brokk with installed coding hosts and exit
     bifrost pack-engine-profile Print the portable pack-consumer profile as JSON
+    bifrost prepare-open-packs --cache-dir DIR --receipt-path FILE --env-path FILE
+                               Select packs and write a typed outcome; accepts --request-path FILE
     bifrost install-semantic-packs BUNDLE_DIR CACHE_ROOT
                                Verify and install a native semantic-pack bundle
     bifrost --policy           Evaluate host-supplied policy packs on the project and exit
@@ -2173,7 +2590,9 @@ OPTIONS:
     --install              Register a user-scoped brokk MCP server with Codex, Claude Code,
                            OpenCode, Kimi Code, Hermes, and Oh My Pi. This option does not
                            install host applications, skills, instructions, or Pi extensions.
-    --root DIR             Project root to analyze (default: current directory)
+    --root DIR             Project root to analyze (default: current directory; with --mcp
+                           and no --root, the server starts with no workspace and waits for
+                           the client to supply one)
     --workspace NAME=PATH  Named project root for MCP mode; repeat as needed.
                            Cannot be combined with --root. Requires --mcp.
                            Root and nested .bifrostignore files exclude matching tracked or
@@ -2199,7 +2618,8 @@ OPTIONS:
                            policy pack; any explicit selection replaces that default.
     --no-builtin-policies  Refuse the built-in default: evaluate only explicit --policy-file
                            inputs. Requires at least one --policy-file and cannot be combined
-                           with --policy-pack, --policy-category, or --policy-id.
+                           with --policy-pack, --policy-category, --policy-id, or
+                           --exclude-policy-id.
     --policy-file PATH     Evaluate a workspace-relative .rqlp policy. Repeatable.
     --policy-pack ID       Evaluate every built-in policy in a pack. Repeatable.
     --policy-category NAME Evaluate built-in policies in a category. Repeatable.
@@ -2207,6 +2627,9 @@ OPTIONS:
                            Repeating one selector widens it; combining different
                            selectors narrows: --policy-pack P --policy-id I runs I
                            only, and errors when I is not in P.
+    --exclude-policy-id ID Skip one built-in policy by stable id after the selectors above
+                           resolve. Repeatable. Needs a pack, category, or id selector; the id
+                           must be selected, and at least one policy must remain.
     --list-policies        Print the deterministic built-in policy catalog as JSON
     --list-row-schemas     Print the deterministic bifrost_relation_schema/v1 catalog as JSON:
                            every row domain a relational policy may bind, each field's scalar
@@ -2220,14 +2643,18 @@ OPTIONS:
                            (default: warning; finding includes unrated findings)
     --suppressions-file PATH
                            Load accepted findings from this workspace-relative JSON file
-                           (default: .bifrost/suppressions.json)
+                           instead of the three default files, which are read in this order
+                           when present: .bifrost/suppressions.json,
+                           .bifrost/suppressions.private.json, .bifrost/suppressions.local.json
     --scope-file PATH      Load directory acceptance and root exclusions from a workspace-relative JSON file
                            (default: .bifrost/policy-scope.json)
     --baseline-file PATH   Load bulk-accepted finding identities from this workspace-relative
                            JSON file (default: .bifrost/baseline.json)
     --accept-current       Run the selected policies and write the baseline document accepting
                            every current strong unclaimed finding, then exit 0. An unreliable
-                           run refuses to define a baseline and exits 2 without writing.
+                           run refuses to define a baseline and exits 2 without writing. An
+                           orphaned suppression (a reviewed record that no longer matches any
+                           finding) exits 1 without writing.
                            Cannot be combined with --fail-on or --diff-base
     --evaluation-date YYYY-MM-DD
                            Evaluate suppression expiration on this UTC date (default: today)
@@ -2235,6 +2662,10 @@ OPTIONS:
                            each finding as new or persisting against it, and fail only on new
                            findings. REV is any revision git rev-parse accepts; pass the pull
                            request's merge base in CI. An unresolvable base is unreliable (exit 2)
+    --diff-scoped          With --diff-base, bind the taint composition's sinks only in procedures
+                           overlapping a changed hunk. The run names the examined procedure
+                           ranges; an empty result claims nothing about sinks outside them.
+                           Requires --diff-base; cannot be combined with --no-incremental
     --no-incremental       Evaluate every policy in full without reading or publishing policy
                            units in this repository's analyzer cache. By default full scans publish
                            complete units and diff scans reuse only verified units; this switch
@@ -2248,7 +2679,13 @@ OPTIONS:
     --explain-candidate PATH:BYTE_START[-BYTE_END]
                            Explain why the selected policy did not report this exact position,
                            and print the bounded explanation JSON. Nothing is scanned for: the
-                           position you pass is the one explained
+                           position you pass is the one explained. For a flow or taint policy
+                           this is the observation (sink) position
+    --explain-candidate-source PATH:BYTE_START[-BYTE_END]
+                           With --explain-candidate, for a flow or taint policy only: the origin
+                           (source) position the tracked value enters at. The answer runs the
+                           production solver over only the analysis regions that bind both
+                           positions
     --explain-near-misses N
                            Rank the N subjects that came closest to satisfying the selected
                            policy, and print the bounded ranking JSON. Each entry says how many
@@ -2268,7 +2705,8 @@ OPTIONS:
                            ranking is empty, and only a failure to produce one exits 2. They
                            exclude each other, and none can be combined with --format,
                            --fail-on, --suppressions-file, --scope-file, --baseline-file,
-                           --accept-current, --evaluation-date, --diff-base, --verbose, or --color
+                           --accept-current, --evaluation-date, --diff-base, --policy-timings,
+                           --verbose, --color, or --sources
     --output PATH          Atomically write policy output to PATH instead of stdout
     --no-line-numbers      Render source output without leading line numbers
     -h, --help [TOOL]      Show this help, or a single tool's description and parameters
@@ -2339,9 +2777,7 @@ EXAMPLES:
     # One-shot against a subset workspace built from a directory and a glob:
     bifrost --root /path/to/project --tool get_symbol_sources --sources src --sources 'tests/**/*.rs' --args '{"symbols":["src/main.rs"]}'
 
-    # Language server over stdio:
-
-Servers speak their protocol over stdio (no network port). The workspace index is built
+The MCP server speaks its protocol over stdio (no network port). The workspace index is built
 in the background: the server is ready immediately and the first request waits for indexing.
 "#;
     print!("{bottom}");
@@ -2352,6 +2788,41 @@ mod portable_runtime_cli_tests {
     use super::*;
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#4625: pack fallback diagnostics polluted expected quiet policy output"
+    )]
+    fn runtime_pack_fallback_warnings_match_the_outcome_policy() {
+        use brokk_bifrost_semantic_packs::download::OpenPackFallbackKind as Kind;
+
+        for kind in [
+            Kind::Disabled,
+            Kind::NoCompatibleRelease,
+            Kind::Pending,
+            Kind::Unsupported,
+        ] {
+            assert!(!should_warn_open_pack_fallback(&kind, false), "{kind:?}");
+        }
+        assert!(should_warn_open_pack_fallback(
+            &Kind::NetworkUnavailable,
+            false
+        ));
+        assert!(should_warn_open_pack_fallback(
+            &Kind::OfflineCacheMiss,
+            false
+        ));
+        assert!(!should_warn_open_pack_fallback(
+            &Kind::OfflineCacheMiss,
+            true
+        ));
+    }
+
+    #[test]
+    fn only_the_one_shot_policy_tool_requires_open_pack_acquisition() {
+        assert!(tool_activates_open_packs("run_policy"));
+        assert!(!tool_activates_open_packs("get_symbol_sources"));
+    }
 
     fn authored_release_bundle(root: &Path) -> PathBuf {
         let mut authored: Value = serde_json::from_slice(include_bytes!(
@@ -2444,17 +2915,6 @@ mod portable_runtime_cli_tests {
     }
 
     #[test]
-    fn pack_engine_profile_rejects_arguments() {
-        let result = run_portable_runtime_command(&[
-            "pack-engine-profile".to_owned(),
-            "unexpected".to_owned(),
-        ]);
-        assert!(
-            matches!(result, Some(Err(message)) if message == "pack-engine-profile takes no arguments")
-        );
-    }
-
-    #[test]
     fn install_semantic_packs_installs_a_generated_authored_bundle() {
         let fixture = tempdir().expect("temporary install fixture");
         let bundle = authored_release_bundle(fixture.path());
@@ -2506,7 +2966,7 @@ fn print_tool_help(name: &str) -> Result<(), String> {
         .chain(single_shot_only_tool_descriptors())
         .find(|descriptor| descriptor.get("name").and_then(Value::as_str) == Some(name))
         .ok_or_else(|| {
-            format!("unknown tool: {name}\nRun `bifrost --help` to list available tools.")
+            format!("unknown tool: {name}; run `bifrost --help` to list available tools")
         })?;
 
     match toolset_of(name) {
@@ -2624,53 +3084,6 @@ fn toolset_of(name: &str) -> Option<&'static str> {
     })
 }
 
-#[cfg(test)]
-mod policy_color_tests {
-    use super::auto_color_enabled;
-
-    #[test]
-    fn auto_color_requires_an_ansi_terminal_and_respects_no_color() {
-        assert!(auto_color_enabled(true, false, true));
-        assert!(!auto_color_enabled(false, false, true));
-        assert!(!auto_color_enabled(true, true, true));
-        assert!(!auto_color_enabled(true, false, false));
-    }
-}
-
-#[cfg(test)]
-mod named_workspace_cli_tests {
-    use super::run;
-
-    #[test]
-    fn named_workspace_requires_mcp_mode() {
-        let error = match run(["--workspace".to_string(), "api=/repo/api".to_string()].into_iter())
-        {
-            Err(error) => error,
-            Ok(_) => panic!("workspace without MCP must fail"),
-        };
-        assert_eq!(error.message, "--workspace requires --mcp");
-    }
-
-    #[test]
-    fn named_workspace_and_root_are_mutually_exclusive() {
-        let error = match run([
-            "--root",
-            "/repo",
-            "--workspace",
-            "api=/repo/api",
-            "--mcp",
-            "core",
-        ]
-        .into_iter()
-        .map(str::to_string))
-        {
-            Err(error) => error,
-            Ok(_) => panic!("root and workspace must fail"),
-        };
-        assert_eq!(error.message, "--workspace cannot be combined with --root");
-    }
-}
-
 /// Flag-level coverage for the three policy explanation flags (issue 2439
 /// slice 3, issue 2500).
 ///
@@ -2681,16 +3094,13 @@ mod named_workspace_cli_tests {
 mod policy_explain_cli_tests {
     use super::{
         ExplanationMode, ExplanationTarget, MAX_EXPLAIN_NEAR_MISSES, explanation_mode,
-        has_policy_syntax, parse_explain_candidate, parse_explain_near_misses, run,
+        has_policy_syntax, parse_explain_near_misses, parse_explain_position, run,
     };
 
     fn run_error(args: &[&str]) -> String {
         match run(args.iter().map(|argument| (*argument).to_string())) {
             Err(error) => {
-                assert!(
-                    error.policy_invocation,
-                    "an explanation flag is a policy invocation, so its failure exits 2"
-                );
+                assert!(error.policy_invocation, "{args:?} is a policy invocation");
                 error.message
             }
             Ok(_) => panic!("expected {args:?} to fail"),
@@ -2698,34 +3108,26 @@ mod policy_explain_cli_tests {
     }
 
     #[test]
-    fn the_explanation_flags_are_policy_syntax() {
-        for flag in [
-            "--explain-finding",
-            "--explain-candidate",
-            "--explain-near-misses",
-        ] {
-            assert!(has_policy_syntax(&[flag.to_string(), "x".to_string()]));
-        }
-    }
-
-    #[test]
     fn a_candidate_parses_a_point_and_a_range() {
         assert_eq!(
-            parse_explain_candidate("src/app.ts:42").expect("a point candidate"),
+            parse_explain_position("--explain-candidate", "src/app.ts:42")
+                .expect("a point candidate"),
             (String::from("src/app.ts"), 42, None)
         );
         assert_eq!(
-            parse_explain_candidate("src/app.ts:42-50").expect("a range candidate"),
+            parse_explain_position("--explain-candidate", "src/app.ts:42-50")
+                .expect("a range candidate"),
             (String::from("src/app.ts"), 42, Some(50))
         );
         // The separator is the last colon, so a path containing one survives.
         assert_eq!(
-            parse_explain_candidate("a:b/app.ts:7").expect("a colon in the path"),
+            parse_explain_position("--explain-candidate", "a:b/app.ts:7")
+                .expect("a colon in the path"),
             (String::from("a:b/app.ts"), 7, None)
         );
-        assert!(parse_explain_candidate("src/app.ts").is_err());
-        assert!(parse_explain_candidate("src/app.ts:notanumber").is_err());
-        assert!(parse_explain_candidate(":7").is_err());
+        assert!(parse_explain_position("--explain-candidate", "src/app.ts").is_err());
+        assert!(parse_explain_position("--explain-candidate", "src/app.ts:notanumber").is_err());
+        assert!(parse_explain_position("--explain-candidate", ":7").is_err());
     }
 
     #[test]
@@ -2751,7 +3153,7 @@ mod policy_explain_cli_tests {
     #[test]
     fn a_mode_refuses_more_than_one_question_and_validates_each_one() {
         assert_eq!(
-            explanation_mode(None, None, None).expect("no question"),
+            explanation_mode(None, None, None, None).expect("no question"),
             None
         );
         for (finding, candidate, near_misses) in [
@@ -2764,147 +3166,76 @@ mod policy_explain_cli_tests {
             (None, Some((String::from("app.ts"), 0, None)), Some(4)),
         ] {
             assert_eq!(
-                explanation_mode(finding, candidate, near_misses)
+                explanation_mode(finding, candidate, None, near_misses)
                     .expect_err("two questions have two answers"),
                 "--explain-finding, --explain-candidate, and --explain-near-misses exclude each \
                  other"
             );
         }
         assert!(matches!(
-            explanation_mode(Some("0".repeat(64)), None, None).expect("a valid identity"),
+            explanation_mode(Some("0".repeat(64)), None, None, None).expect("a valid identity"),
             Some(ExplanationMode::Explanation(ExplanationTarget::Finding(_)))
         ));
         assert!(
-            explanation_mode(Some(String::from("nope")), None, None)
+            explanation_mode(Some(String::from("nope")), None, None, None)
                 .expect_err("a finding id is a lowercase sha-256")
                 .contains("Invalid --explain-finding")
         );
         assert!(matches!(
-            explanation_mode(None, Some((String::from("app.ts"), 3, Some(9))), None)
+            explanation_mode(None, Some((String::from("app.ts"), 3, Some(9))), None, None)
                 .expect("a valid candidate"),
             Some(ExplanationMode::Explanation(ExplanationTarget::Candidate(
                 _
             )))
         ));
         assert_eq!(
-            explanation_mode(None, None, Some(7)).expect("a valid ranking size"),
+            explanation_mode(None, None, None, Some(7)).expect("a valid ranking size"),
             Some(ExplanationMode::NearMiss(7))
         );
         // A path outside the workspace and a reversed range are both refused.
         assert!(
-            explanation_mode(None, Some((String::from("../outside.ts"), 0, None)), None)
-                .expect_err("a candidate stays inside the workspace")
-                .contains("Invalid --explain-candidate")
+            explanation_mode(
+                None,
+                Some((String::from("../outside.ts"), 0, None)),
+                None,
+                None
+            )
+            .expect_err("a candidate stays inside the workspace")
+            .contains("Invalid --explain-candidate")
         );
         assert!(
-            explanation_mode(None, Some((String::from("app.ts"), 9, Some(4))), None)
+            explanation_mode(None, Some((String::from("app.ts"), 9, Some(4))), None, None)
                 .expect_err("a range does not end before it starts")
                 .contains("exceeds end")
         );
-    }
-
-    #[test]
-    fn an_explanation_cannot_be_combined_with_a_gate() {
-        for gate in [
-            vec!["--format", "json"],
-            vec!["--fail-on", "error"],
-            vec!["--suppressions-file", "s.json"],
-            vec!["--scope-file", "s.json"],
-            vec!["--baseline-file", "b.json"],
-            vec!["--accept-current"],
-            vec!["--evaluation-date", "2026-08-20"],
-            vec!["--diff-base", "HEAD~1"],
-            vec!["--verbose"],
-            vec!["--color", "never"],
-        ] {
-            for question in [
-                vec!["--explain-candidate", "app.ts:0"],
-                vec!["--explain-near-misses", "5"],
-            ] {
-                let mut args = vec!["--policy-file", "policies/p.rqlp"];
-                args.extend(question.iter().copied());
-                args.extend(gate.iter().copied());
-                let message = run_error(&args);
-                assert!(
-                    message.contains(
-                        "--explain-finding, --explain-candidate, and --explain-near-misses cannot \
-                         be combined"
-                    ),
-                    "{gate:?} must be refused beside {question:?}: {message}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn an_explanation_cannot_be_combined_with_listing_or_the_other_question() {
-        for question in [
-            vec!["--explain-candidate", "app.ts:0"],
-            vec!["--explain-near-misses", "5"],
-        ] {
-            let mut args = vec!["--list-policies"];
-            args.extend(question.iter().copied());
-            let message = run_error(&args);
-            assert!(
-                message.contains("--list-policies cannot be combined"),
-                "{message}"
-            );
-        }
-
-        let message = run_error(&[
-            "--policy-file",
-            "policies/p.rqlp",
-            "--explain-finding",
-            &"0".repeat(64),
-            "--explain-candidate",
-            "app.ts:0",
-        ]);
-        assert_eq!(
-            message,
-            "--explain-finding, --explain-candidate, and --explain-near-misses exclude each other"
-        );
-    }
-
-    #[test]
-    fn each_explanation_flag_may_be_given_once_and_requires_a_value() {
-        let message = run_error(&[
-            "--policy-file",
-            "policies/p.rqlp",
-            "--explain-candidate",
-            "app.ts:0",
-            "--explain-candidate",
-            "app.ts:1",
-        ]);
-        assert_eq!(message, "--explain-candidate may only be provided once");
-
-        let message = run_error(&["--policy-file", "policies/p.rqlp", "--explain-finding"]);
-        assert!(message.contains("--explain-finding requires"), "{message}");
-
-        let message = run_error(&[
-            "--policy-file",
-            "policies/p.rqlp",
-            "--explain-near-misses",
-            "5",
-            "--explain-near-misses",
-            "6",
-        ]);
-        assert_eq!(message, "--explain-near-misses may only be provided once");
-
-        let message = run_error(&["--policy-file", "policies/p.rqlp", "--explain-near-misses"]);
+        // A flow or taint candidate is the observation plus its source; the
+        // source alone is not a question, and each half is validated.
+        assert!(matches!(
+            explanation_mode(
+                None,
+                Some((String::from("app.ts"), 30, Some(40))),
+                Some((String::from("app.ts"), 3, Some(9))),
+                None
+            )
+            .expect("a valid flow candidate"),
+            Some(ExplanationMode::Explanation(
+                ExplanationTarget::FlowCandidate(_)
+            ))
+        ));
         assert!(
-            message.contains("--explain-near-misses requires"),
-            "{message}"
+            explanation_mode(None, None, Some((String::from("app.ts"), 3, None)), None)
+                .expect_err("a source is half of a candidate")
+                .contains("requires --explain-candidate")
         );
-
-        let message = run_error(&[
-            "--policy-file",
-            "policies/p.rqlp",
-            "--explain-near-misses",
-            "0",
-        ]);
         assert!(
-            message.contains("Invalid --explain-near-misses count"),
-            "{message}"
+            explanation_mode(
+                None,
+                Some((String::from("app.ts"), 0, None)),
+                Some((String::from("../outside.ts"), 0, None)),
+                None
+            )
+            .expect_err("a source stays inside the workspace")
+            .contains("Invalid --explain-candidate-source")
         );
     }
 
@@ -2961,187 +3292,6 @@ mod policy_explain_cli_tests {
             "--explain-generation".to_string(),
             "0".repeat(64)
         ]));
-    }
-
-    #[test]
-    fn an_explanation_still_requires_a_policy_selection() {
-        for question in [
-            vec!["--explain-candidate", "app.ts:0"],
-            vec!["--explain-near-misses", "5"],
-        ] {
-            let message = run_error(&question);
-            assert!(
-                message.contains(
-                    "policy explanation requires an explicit --policy-file or built-in policy \
-                     selector"
-                ),
-                "{message}"
-            );
-        }
-    }
-}
-
-/// Flag-level coverage for the zero-configuration built-in default (issue
-/// 2853): the explicit policy-mode entry and the controlled-run opt-out.
-///
-/// Only refusals are exercised in-process; the default catalog run itself
-/// builds a workspace and lives in the workspace-level CLI suite.
-#[cfg(test)]
-mod builtin_default_cli_tests {
-    use super::{has_policy_syntax, run};
-
-    fn run_error(args: &[&str]) -> String {
-        match run(args.iter().map(|argument| (*argument).to_string())) {
-            Err(error) => {
-                assert!(error.policy_invocation, "{args:?} is a policy invocation");
-                error.message
-            }
-            Ok(_) => panic!("expected {args:?} to fail"),
-        }
-    }
-
-    #[test]
-    fn the_policy_entry_and_the_opt_out_are_policy_syntax() {
-        assert!(has_policy_syntax(&["--policy".to_string()]));
-        assert!(has_policy_syntax(&["--no-builtin-policies".to_string()]));
-    }
-
-    #[test]
-    fn the_opt_out_refuses_builtin_selectors_and_requires_a_policy_file() {
-        for selector in [
-            vec!["--policy-pack", "bifrost.code-smells"],
-            vec!["--policy-category", "correctness"],
-            vec!["--policy-id", "bifrost.correctness.dynamic-evaluation"],
-        ] {
-            let mut args = vec!["--no-builtin-policies"];
-            args.extend(selector.iter().copied());
-            let message = run_error(&args);
-            assert_eq!(
-                message,
-                "--no-builtin-policies cannot be combined with --policy-pack, \
-                 --policy-category, or --policy-id"
-            );
-        }
-        for args in [
-            vec!["--no-builtin-policies"],
-            vec!["--policy", "--no-builtin-policies"],
-        ] {
-            let message = run_error(&args);
-            assert_eq!(
-                message,
-                "--no-builtin-policies requires at least one --policy-file"
-            );
-        }
-    }
-
-    #[test]
-    fn listing_refuses_the_policy_entry_flags() {
-        for flag in ["--policy", "--no-builtin-policies"] {
-            let message = run_error(&["--list-policies", flag]);
-            assert!(
-                message.contains("--list-policies cannot be combined"),
-                "{message}"
-            );
-        }
-    }
-}
-
-/// Flag-level coverage for the row-schema listing (issue #2517).
-///
-/// The printed catalog itself is asserted end to end in the policy CLI suite,
-/// which can read the process's stdout; these cases pin the refusals, which is
-/// the part a caller cannot discover from the output.
-#[cfg(test)]
-mod row_schema_listing_cli_tests {
-    use super::{CliRunResult, has_policy_syntax, run};
-
-    fn run_error(args: &[&str]) -> String {
-        match run(args.iter().map(|argument| (*argument).to_string())) {
-            Err(error) => {
-                assert!(
-                    error.policy_invocation,
-                    "a listing flag is a policy invocation, so its failure exits 2"
-                );
-                error.message
-            }
-            Ok(_) => panic!("expected {args:?} to fail"),
-        }
-    }
-
-    #[test]
-    fn the_listing_flag_is_policy_syntax_and_needs_no_workspace() {
-        assert!(has_policy_syntax(&["--list-row-schemas".to_string()]));
-        match run(["--list-row-schemas".to_string()].into_iter()) {
-            Ok(CliRunResult::Complete) => {}
-            Ok(CliRunResult::PolicyStatus(status)) => {
-                panic!("a listing completes rather than gating, got status {status}")
-            }
-            Err(error) => panic!("{}", error.message),
-        }
-    }
-
-    #[test]
-    fn the_two_listings_exclude_each_other_and_repeat_once() {
-        assert_eq!(
-            run_error(&["--list-row-schemas", "--list-policies"]),
-            "--list-policies cannot be combined with --list-row-schemas"
-        );
-        assert_eq!(
-            run_error(&["--list-policies", "--list-row-schemas"]),
-            "--list-row-schemas cannot be combined with --list-policies"
-        );
-        assert_eq!(
-            run_error(&["--list-row-schemas", "--list-row-schemas"]),
-            "--list-row-schemas may only be provided once"
-        );
-        assert_eq!(
-            run_error(&["--list-policies", "--list-policies"]),
-            "--list-policies may only be provided once"
-        );
-    }
-
-    #[test]
-    fn policy_timings_are_policy_syntax_and_reject_duplicates() {
-        assert!(has_policy_syntax(&["--policy-timings".to_string()]));
-        assert_eq!(
-            run_error(&["--policy-timings", "--policy-timings"]),
-            "--policy-timings may only be provided once"
-        );
-    }
-
-    #[test]
-    fn the_listing_refuses_selection_evaluation_and_explanation_options() {
-        for options in [
-            vec!["--policy-file", "policies/p.rqlp"],
-            vec!["--policy-pack", "bifrost.code-smells"],
-            vec!["--policy"],
-            vec!["--format", "json"],
-            vec!["--fail-on", "error"],
-            vec!["--accept-current"],
-            vec!["--diff-base", "HEAD"],
-            vec!["--policy-timings"],
-        ] {
-            let mut args = vec!["--list-row-schemas"];
-            args.extend(options.iter().copied());
-            assert_eq!(
-                run_error(&args),
-                "--list-row-schemas cannot be combined with policy selection or evaluation options",
-                "{options:?} must be refused beside the listing"
-            );
-        }
-        for question in [
-            vec!["--explain-candidate", "app.ts:0"],
-            vec!["--explain-near-misses", "5"],
-        ] {
-            let mut args = vec!["--list-row-schemas"];
-            args.extend(question.iter().copied());
-            assert_eq!(
-                run_error(&args),
-                "--list-row-schemas cannot be combined with --explain-finding, \
-                 --explain-candidate, --explain-near-misses, or --explain-generation",
-                "{question:?} must be refused beside the listing"
-            );
-        }
     }
 }
 
@@ -3313,152 +3463,5 @@ mod policy_explain_exit_status_tests {
             None,
         );
         assert_eq!(status, POLICY_EXIT_UNRELIABLE);
-    }
-}
-
-/// Flag-level coverage for the `scan` subcommand (issue #2882): parsing
-/// refusals, the witness/summary shape including the honest empty-catalog
-/// case, and the isolation of the flag surface. The zero-configuration run
-/// itself builds a workspace and lives in the workspace-level CLI suite.
-#[cfg(test)]
-mod scan_cli_tests {
-    use super::{
-        BuiltInPolicyCatalogManifest, built_in_policy_catalog, builtin_pack_witness_lines, run,
-        scan_activation_summary,
-    };
-
-    fn run_error(args: &[&str]) -> (String, bool) {
-        match run(args.iter().map(|argument| (*argument).to_string())) {
-            Err(error) => (error.message, error.policy_invocation),
-            Ok(_) => panic!("expected {args:?} to fail"),
-        }
-    }
-
-    fn empty_manifest() -> BuiltInPolicyCatalogManifest {
-        BuiltInPolicyCatalogManifest {
-            schema_version: 2,
-            packs: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn a_scan_failure_reports_through_the_policy_exit_contract() {
-        let (message, policy_invocation) = run_error(&["scan", "--format", "yaml"]);
-        assert!(message.contains("Invalid --format value"), "{message}");
-        assert!(
-            policy_invocation,
-            "a scan error is an unreliable policy run"
-        );
-    }
-
-    #[test]
-    fn scan_is_a_subcommand_only_in_the_first_position() {
-        // The flag surface is untouched: everywhere else `scan` and the
-        // scan-only listing flag remain unknown arguments, so no existing
-        // invocation can change behavior.
-        let (message, policy_invocation) = run_error(&["--root", "/tmp", "scan"]);
-        assert_eq!(message, "Unknown argument: scan");
-        assert!(!policy_invocation);
-        let (message, _) = run_error(&["--list-builtin-policies"]);
-        assert_eq!(message, "Unknown argument: --list-builtin-policies");
-    }
-
-    #[test]
-    fn scan_parsing_refuses_ambiguous_and_repeated_input() {
-        assert_eq!(
-            run_error(&["scan", "a", "b"]).0,
-            "scan accepts at most one project path"
-        );
-        assert_eq!(
-            run_error(&["scan", "--fail-on", "never", "--fail-on", "error"]).0,
-            "--fail-on may only be provided once"
-        );
-        let (message, _) = run_error(&["scan", "--policy-file", "p.rqlp"]);
-        assert!(
-            message.contains("Unknown scan argument: --policy-file"),
-            "explicit selection belongs to the flag surface, not to scan: {message}"
-        );
-        assert_eq!(
-            run_error(&["scan", "--format", "json", "--verbose"]).0,
-            "--verbose and --color are only valid with --format human"
-        );
-        assert_eq!(
-            run_error(&["scan", "--no-incremental", "--no-incremental"]).0,
-            "--no-incremental may only be provided once"
-        );
-    }
-
-    #[test]
-    fn the_builtin_listing_answers_without_running_anything() {
-        for options in [
-            vec!["--list-builtin-policies", "some/path"],
-            vec!["--list-builtin-policies", "--format", "json"],
-            vec!["--list-builtin-policies", "--fail-on", "never"],
-            vec!["--list-builtin-policies", "--no-incremental"],
-            vec!["--list-builtin-policies", "--output", "out.json"],
-        ] {
-            let mut args = vec!["scan"];
-            args.extend(options.iter().copied());
-            assert_eq!(
-                run_error(&args).0,
-                "--list-builtin-policies cannot be combined with a project path or evaluation \
-                 options",
-                "{options:?} must be refused beside the listing"
-            );
-        }
-    }
-
-    #[test]
-    fn a_nonexistent_scan_path_is_refused_before_evaluation() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let missing = temp.path().join("absent");
-        let missing = missing.to_string_lossy().into_owned();
-        let (message, policy_invocation) = run_error(&["scan", &missing]);
-        assert!(
-            message.starts_with("scan path is not a directory:"),
-            "{message}"
-        );
-        assert!(policy_invocation);
-    }
-
-    #[test]
-    fn the_witness_records_an_empty_pack_set_honestly() {
-        let manifest = empty_manifest();
-        assert_eq!(
-            builtin_pack_witness_lines(&manifest, "0".repeat(64).as_str()),
-            vec![format!("builtin-policy-catalog sha256={}", "0".repeat(64))]
-        );
-        assert_eq!(
-            scan_activation_summary(&manifest),
-            "bifrost scan: no host-supplied rule packs are active; no rules were evaluated"
-        );
-    }
-
-    #[test]
-    fn the_witness_shares_the_version_line_shape_for_the_shipped_catalog() {
-        let catalog = built_in_policy_catalog().expect("valid built-in catalog");
-        let lines = builtin_pack_witness_lines(catalog.document(), catalog.digest());
-        assert_eq!(lines.len(), catalog.document().packs.len() + 1);
-        for (line, pack) in lines.iter().zip(&catalog.document().packs) {
-            assert_eq!(
-                line,
-                &format!(
-                    "builtin-policy-pack {}@{} policies={}",
-                    pack.id,
-                    pack.version,
-                    pack.policies.len()
-                )
-            );
-        }
-        assert_eq!(
-            lines.last().expect("digest line"),
-            &format!("builtin-policy-catalog sha256={}", catalog.digest())
-        );
-        let summary = scan_activation_summary(catalog.document());
-        assert!(
-            summary.starts_with("bifrost scan: activated ")
-                && summary.contains("built-in policy packs"),
-            "{summary}"
-        );
     }
 }

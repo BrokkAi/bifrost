@@ -30,6 +30,18 @@ pub(crate) const CPP_C_STORAGE_LANGUAGE_KEY: &str = "cpp:c";
 pub struct CppAdapter;
 
 impl LanguageAdapter for CppAdapter {
+    fn supports_structural_line_data(&self) -> bool {
+        true
+    }
+
+    fn is_structural_line_data(
+        &self,
+        node: tree_sitter::Node<'_>,
+        should_stop: &mut dyn FnMut() -> bool,
+    ) -> std::ops::ControlFlow<(), bool> {
+        brokk_bifrost_cpp::adapter::is_numeric_initializer_data(node, should_stop)
+    }
+
     fn source_fact_storage(&self) -> Option<&'static crate::analyzer::store::SourceFactStorage> {
         Some(&crate::analyzer::cpp::source_publication::SOURCE_STORAGE)
     }
@@ -76,7 +88,7 @@ impl LanguageAdapter for CppAdapter {
         if LanguageDialect::for_path(Language::Cpp, file.rel_path()) == LanguageDialect::CppC {
             return CPP_C_STORAGE_LANGUAGE_KEY;
         }
-        if crate::analyzer::common::has_unclaimed_extension(file) {
+        if file.has_unclaimed_extension() {
             return Language::Cpp.config_label();
         }
         crate::analyzer::common::language_for_file(file).config_label()
@@ -102,6 +114,13 @@ impl LanguageAdapter for CppAdapter {
         should_stop: &mut dyn FnMut() -> bool,
     ) -> std::ops::ControlFlow<(), Option<Vec<tree_sitter::Range>>> {
         brokk_bifrost_cpp::graph::syntax::function_macro_included_ranges(source, tree, should_stop)
+    }
+
+    fn unclosed_construct_openers<'tree>(
+        &self,
+        root: tree_sitter::Node<'tree>,
+    ) -> Vec<tree_sitter::Node<'tree>> {
+        brokk_bifrost_cpp::declarations::cpp_unclosed_construct_openers(root)
     }
 
     fn contains_tests(

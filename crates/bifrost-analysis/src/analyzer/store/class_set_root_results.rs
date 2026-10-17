@@ -4,14 +4,14 @@ use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-use rusqlite::{OptionalExtension, TransactionBehavior, params};
-use sha2::{Digest, Sha256};
+use rusqlite::{TransactionBehavior, params};
+use sha2::Sha256;
 
 use super::class_set_summaries::ClassSetSummaryAttachment;
 use super::{AnalyzerStore, PARSED_BLOB_COMPLETE_CONDITION, Result, StoreError};
 use crate::CancellationToken;
 use crate::analyzer::Language;
-use crate::analyzer::semantic::{SourcePosition, SourceSpan, UnknownReason, WorkspaceRelativePath};
+use crate::analyzer::semantic::{SourcePosition, SourceSpan, UnknownReason};
 
 macro_rules! generation_params {
     ($key:expr) => {
@@ -1012,27 +1012,15 @@ fn live_owner_blob_id(
     conn: &rusqlite::Connection,
     result: &FindingFreeClassSetRootResult,
 ) -> Result<i64> {
-    conn.query_row(
-        &format!(
-            "SELECT meta.blob_id FROM blob_meta AS meta
-             JOIN blobs ON blobs.id=meta.blob_id
-             WHERE blobs.blob_oid=?1 AND blobs.lang=?2
-               AND {PARSED_BLOB_COMPLETE_CONDITION}"
-        ),
-        params![
-            &result.attachment.blob_oid,
-            result.key.generation.language.config_label()
-        ],
-        |row| row.get(0),
+    let language = result.key.generation.language.config_label();
+    super::live_class_set_owner_blob_id(conn, &result.attachment.blob_oid, language)?.ok_or_else(
+        || {
+            StoreError::new(format!(
+                "class-set root-result owner blob {}/{} is absent",
+                result.attachment.blob_oid, language
+            ))
+        },
     )
-    .optional()?
-    .ok_or_else(|| {
-        StoreError::new(format!(
-            "class-set root-result owner blob {}/{} is absent",
-            result.attachment.blob_oid,
-            result.key.generation.language.config_label()
-        ))
-    })
 }
 
 fn validate_key_and_attachment(
@@ -1042,7 +1030,7 @@ fn validate_key_and_attachment(
     validate_generation_key(&key.generation)?;
     if attachment.language != key.generation.language
         || attachment.rel_path.is_empty()
-        || !valid_rel_path(Path::new(&attachment.rel_path))
+        || !super::valid_workspace_relative_path(Path::new(&attachment.rel_path))
         || git2::Oid::from_str(&attachment.blob_oid).is_err()
     {
         return Err(StoreError::new(
@@ -1069,7 +1057,7 @@ fn validate_generation_key(key: &ClassSetRootResultGenerationKey) -> Result<()> 
 }
 
 fn validate_row(row: &PersistedClassSetRootRow) -> Result<()> {
-    if !valid_rel_path(&row.relative_path) || row.member.is_empty() {
+    if !super::valid_workspace_relative_path(&row.relative_path) || row.member.is_empty() {
         return Err(StoreError::new("class-set root-result row is invalid"));
     }
     match &row.atom {
@@ -1090,17 +1078,9 @@ fn validate_row(row: &PersistedClassSetRootRow) -> Result<()> {
     }
 }
 
-fn valid_rel_path(path: &Path) -> bool {
-    path.to_str().is_some_and(|path_text| {
-        !path_text.is_empty()
-            && WorkspaceRelativePath::try_from_path(path)
-                .is_ok_and(|normalized| normalized.as_str() == path_text)
-    })
-}
-
 fn path_text(path: &Path) -> Result<&str> {
     path.to_str()
-        .filter(|_| valid_rel_path(path))
+        .filter(|_| super::valid_workspace_relative_path(path))
         .ok_or_else(|| StoreError::new("class-set root-result path is not portable"))
 }
 
@@ -1197,31 +1177,17 @@ fn atom_kind(atom: &PersistedClassSetAtom) -> &'static str {
 }
 
 fn bounded_count(value: i64, max: usize, name: &str) -> Result<usize> {
-    let value = usize::try_from(value).map_err(|_| {
-        StoreError::corrupt(format!("class-set root-result {name} count is invalid"))
-    })?;
-    if value > max {
-        return Err(StoreError::resource_bound(format!(
-            "class-set root-result {name} count exceeds {max}"
-        )));
-    }
-    Ok(value)
+    super::class_set_bounded_count(value, max, name, "root-result")
 }
 
 fn admit_text_bytes(total: &mut usize, row_bytes: i64, declared_text_bytes: usize) -> Result<()> {
-    let row_bytes = bounded_count(
+    super::admit_class_set_text_bytes(
+        total,
         row_bytes,
         MAX_CLASS_SET_ROOT_TEXT_BYTES,
-        "payload row text byte",
+        "root-result",
+        "text",
     )?;
-    *total = total.checked_add(row_bytes).ok_or_else(|| {
-        StoreError::resource_bound("class-set root-result text size overflows usize")
-    })?;
-    if *total > MAX_CLASS_SET_ROOT_TEXT_BYTES {
-        return Err(StoreError::resource_bound(format!(
-            "class-set root-result text exceeds {MAX_CLASS_SET_ROOT_TEXT_BYTES} bytes"
-        )));
-    }
     if *total > declared_text_bytes {
         return Err(StoreError::corrupt(
             "class-set root-result row text exceeds its declared size",
@@ -1231,15 +1197,13 @@ fn admit_text_bytes(total: &mut usize, row_bytes: i64, declared_text_bytes: usiz
 }
 
 fn u32_value(value: i64, name: &str) -> Result<u32> {
-    u32::try_from(value)
-        .map_err(|_| StoreError::corrupt(format!("class-set root-result {name} exceeds u32")))
+    super::class_set_u32(value, name, "root-result")
 }
 
 fn digest(bytes: Vec<u8>, name: &str) -> Result<ClassSetRootResultDigest> {
-    bytes.try_into().map_err(|bytes: Vec<u8>| {
+    super::checked_fixed_digest(bytes).map_err(|length| {
         StoreError::corrupt(format!(
-            "class-set root-result {name} digest has {} bytes",
-            bytes.len()
+            "class-set root-result {name} digest has {length} bytes"
         ))
     })
 }
@@ -1280,11 +1244,7 @@ fn snapshot_published_at(value: i64) -> Result<u64> {
 }
 
 fn ensure_not_cancelled(cancellation: &CancellationToken) -> Result<()> {
-    if cancellation.is_cancelled() {
-        Err(StoreError::new("class-set root-result operation cancelled"))
-    } else {
-        Ok(())
-    }
+    super::ensure_store_not_cancelled(cancellation, "class-set root-result operation cancelled")
 }
 
 fn ensure_optional_cancellation(cancellation: Option<&CancellationToken>) -> Result<()> {
@@ -1298,26 +1258,23 @@ struct RootResultDigest(Sha256);
 
 impl RootResultDigest {
     fn new(domain: &[u8]) -> Self {
-        let mut digest = Self(Sha256::new());
-        digest.bytes(domain);
-        digest
+        Self(super::new_sha256_with_length_prefixed_domain(domain))
     }
 
     fn bytes(&mut self, value: &[u8]) {
-        self.0.update((value.len() as u64).to_le_bytes());
-        self.0.update(value);
+        super::update_sha256_with_length_prefix(&mut self.0, value);
     }
 
     fn text(&mut self, value: &str) {
-        self.bytes(value.as_bytes());
+        super::update_sha256_with_length_prefixed_text(&mut self.0, value);
     }
 
     fn tag(&mut self, value: u8) {
-        self.bytes(&[value]);
+        super::update_sha256_with_length_prefixed_byte(&mut self.0, value);
     }
 
     fn u64(&mut self, value: u64) {
-        self.bytes(&value.to_le_bytes());
+        super::update_sha256_with_length_prefixed_u64(&mut self.0, value);
     }
 
     fn span(&mut self, span: SourceSpan) {
@@ -1330,44 +1287,20 @@ impl RootResultDigest {
     }
 
     fn finish(self) -> ClassSetRootResultDigest {
-        self.0.finalize().into()
+        brokk_bifrost_core::analyzer::canonical_hash::finish_sha256(self.0)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::store::planner_statistics::tests::{explain_pin, pinned};
+    use crate::analyzer::store::planner_statistics::tests::assert_pinned_query_uses_index;
+    use crate::analyzer::store::test_adapters::ephemeral_store_with_complete_python_blob;
     use brokk_bifrost_core::cache_gc::PlannerStatisticsState;
+    use brokk_bifrost_test_macros::hardwon;
     use std::sync::{Arc, Barrier};
 
     const BLOB: &str = "1111111111111111111111111111111111111111";
-
-    fn insert_complete_blob(store: &AnalyzerStore) {
-        let conn = store.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'python', 0)",
-            params![BLOB],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO blob_meta(
-               blob_id, lang, contains_tests, content_package, stored_unit_count,
-               range_count, signature_count, signature_metadata_count, supertype_count,
-               child_count, import_statement_count, type_identifier_count, is_complete
-             )
-             SELECT id, lang, 0, '', 0, 0, 0, 0, 0, 0, 0, 0, 1
-             FROM blobs WHERE blob_oid = ?1 AND lang = 'python'",
-            params![BLOB],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO blob_payload_costs(blob_id, payload_bytes)
-             SELECT id, 0 FROM blobs WHERE blob_oid = ?1 AND lang = 'python'",
-            params![BLOB],
-        )
-        .unwrap();
-    }
 
     fn generation(seed: u8) -> ClassSetRootResultGenerationKey {
         ClassSetRootResultGenerationKey {
@@ -1461,9 +1394,7 @@ mod tests {
     }
 
     fn store_with_blob() -> AnalyzerStore {
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        insert_complete_blob(&store);
-        store
+        ephemeral_store_with_complete_python_blob(BLOB, 0)
     }
 
     fn load(
@@ -1681,6 +1612,111 @@ mod tests {
     }
 
     #[test]
+    fn operational_failures_and_cancellation_remain_distinct_from_rejections() {
+        let store = store_with_blob();
+        let expected = result(1);
+        store.set_class_set_root_result_operational_failure_for_test(true);
+        assert!(load(&store, &expected.key).is_err());
+        assert!(
+            store
+                .publish_finding_free_class_set_root_result(
+                    expected.clone(),
+                    &CancellationToken::new(),
+                )
+                .is_err()
+        );
+        store.set_class_set_root_result_operational_failure_for_test(false);
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(
+            store
+                .publish_finding_free_class_set_root_result(expected, &cancelled)
+                .is_err()
+        );
+        let conn = store.conn.lock().unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM class_set_finding_free_root_results",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn root_result_queries_seek_persisted_indexes() {
+        for state in PlannerStatisticsState::BOTH {
+            let store = AnalyzerStore::open_ephemeral().unwrap();
+            let conn = store.conn.lock().unwrap();
+            state.install(&conn);
+            for (name, expected) in [
+                (
+                    "class_set_root_result_header",
+                    "sqlite_autoindex_class_set_root_result_generations_1",
+                ),
+                ("class_set_root_result_rows", "USING PRIMARY KEY"),
+                (
+                    "prune_old_class_set_root_result_generations",
+                    "class_set_root_result_generations_recent",
+                ),
+            ] {
+                assert_pinned_query_uses_index(
+                    &conn,
+                    state,
+                    name,
+                    expected,
+                    &["AUTOMATIC", "TEMP B-TREE", "CO-ROUTINE", "SCAN "],
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn test_support_snapshot_and_mutations_use_stable_complete_rows() {
+        let store = store_with_blob();
+        let expected = result(1);
+        store
+            .publish_finding_free_class_set_root_result(expected.clone(), &CancellationToken::new())
+            .unwrap();
+        let before = store
+            .class_set_root_result_store_snapshot_for_test()
+            .unwrap();
+        assert_eq!(before.generations.len(), 1);
+        assert_eq!(before.results.len(), 1);
+        assert_eq!(before.results[0].result, expected);
+        assert_eq!(
+            before,
+            store
+                .class_set_root_result_store_snapshot_for_test()
+                .unwrap()
+        );
+
+        store
+            .corrupt_only_class_set_root_result_content_digest_for_test()
+            .unwrap();
+        assert_eq!(
+            load(&store, &expected.key).unwrap(),
+            ClassSetRootResultLookup::Rejected(ClassSetRootResultRejection::Validation)
+        );
+
+        let oversize_store = store_with_blob();
+        oversize_store
+            .publish_finding_free_class_set_root_result(expected.clone(), &CancellationToken::new())
+            .unwrap();
+        oversize_store
+            .oversize_only_class_set_root_result_row_count_for_test()
+            .unwrap();
+        assert_eq!(
+            load(&oversize_store, &expected.key).unwrap(),
+            ClassSetRootResultLookup::Rejected(ClassSetRootResultRejection::ResourceBound)
+        );
+    }
+
+    #[test]
     fn root_result_collision_is_rejected_and_corruption_is_repairable() {
         let store = store_with_blob();
         let expected = result(1);
@@ -1733,6 +1769,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "080b24744111: untrusted root-result text was decoded before its declared size was admitted"
+    )]
     fn corrupt_declared_sizes_reject_before_invalid_header_or_child_text_is_hydrated() {
         let header_store = store_with_blob();
         let header_result = result(1);
@@ -1785,6 +1824,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "080b24744111: final cancellation was not checked before idempotent publication commit"
+    )]
     fn idempotent_publication_checks_cancellation_immediately_before_commit() {
         let store = store_with_blob();
         let expected = result(1);
@@ -1844,41 +1886,6 @@ mod tests {
         assert_eq!(
             load(&store, &result(9).key).unwrap(),
             ClassSetRootResultLookup::Miss
-        );
-    }
-
-    #[test]
-    fn operational_failures_and_cancellation_remain_distinct_from_rejections() {
-        let store = store_with_blob();
-        let expected = result(1);
-        store.set_class_set_root_result_operational_failure_for_test(true);
-        assert!(load(&store, &expected.key).is_err());
-        assert!(
-            store
-                .publish_finding_free_class_set_root_result(
-                    expected.clone(),
-                    &CancellationToken::new(),
-                )
-                .is_err()
-        );
-        store.set_class_set_root_result_operational_failure_for_test(false);
-
-        let cancelled = CancellationToken::new();
-        cancelled.cancel();
-        assert!(
-            store
-                .publish_finding_free_class_set_root_result(expected, &cancelled)
-                .is_err()
-        );
-        let conn = store.conn.lock().unwrap();
-        assert_eq!(
-            conn.query_row(
-                "SELECT COUNT(*) FROM class_set_finding_free_root_results",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap(),
-            0
         );
     }
 
@@ -1955,83 +1962,6 @@ mod tests {
         assert_eq!(
             load(&store, &expected.key).unwrap(),
             ClassSetRootResultLookup::Hit(Box::new(expected))
-        );
-    }
-
-    #[test]
-    fn root_result_queries_seek_persisted_indexes() {
-        for state in PlannerStatisticsState::BOTH {
-            let store = AnalyzerStore::open_ephemeral().unwrap();
-            let conn = store.conn.lock().unwrap();
-            state.install(&conn);
-            for (name, expected) in [
-                (
-                    "class_set_root_result_header",
-                    "sqlite_autoindex_class_set_root_result_generations_1",
-                ),
-                ("class_set_root_result_rows", "USING PRIMARY KEY"),
-                (
-                    "prune_old_class_set_root_result_generations",
-                    "class_set_root_result_generations_recent",
-                ),
-            ] {
-                let plan = explain_pin(&conn, &pinned(name));
-                assert!(
-                    plan.iter().any(|detail| detail.contains(expected)),
-                    "{state} {name}: {plan:#?}"
-                );
-                assert!(
-                    plan.iter().all(|detail| {
-                        !detail.contains("AUTOMATIC")
-                            && !detail.contains("TEMP B-TREE")
-                            && !detail.contains("CO-ROUTINE")
-                            && !detail.contains("SCAN ")
-                    }),
-                    "{state} {name}: {plan:#?}"
-                );
-            }
-        }
-    }
-
-    #[cfg(feature = "test-support")]
-    #[test]
-    fn test_support_snapshot_and_mutations_use_stable_complete_rows() {
-        let store = store_with_blob();
-        let expected = result(1);
-        store
-            .publish_finding_free_class_set_root_result(expected.clone(), &CancellationToken::new())
-            .unwrap();
-        let before = store
-            .class_set_root_result_store_snapshot_for_test()
-            .unwrap();
-        assert_eq!(before.generations.len(), 1);
-        assert_eq!(before.results.len(), 1);
-        assert_eq!(before.results[0].result, expected);
-        assert_eq!(
-            before,
-            store
-                .class_set_root_result_store_snapshot_for_test()
-                .unwrap()
-        );
-
-        store
-            .corrupt_only_class_set_root_result_content_digest_for_test()
-            .unwrap();
-        assert_eq!(
-            load(&store, &expected.key).unwrap(),
-            ClassSetRootResultLookup::Rejected(ClassSetRootResultRejection::Validation)
-        );
-
-        let oversize_store = store_with_blob();
-        oversize_store
-            .publish_finding_free_class_set_root_result(expected.clone(), &CancellationToken::new())
-            .unwrap();
-        oversize_store
-            .oversize_only_class_set_root_result_row_count_for_test()
-            .unwrap();
-        assert_eq!(
-            load(&oversize_store, &expected.key).unwrap(),
-            ClassSetRootResultLookup::Rejected(ClassSetRootResultRejection::ResourceBound)
         );
     }
 }

@@ -13,8 +13,13 @@
 use crate::declarations::rust_node_text;
 use crate::graph_support::{rust_path_is_leading_absolute, rust_path_segments};
 use crate::imports::{RustImportBindingName, rust_imports_with_visibility_from_use_declaration};
-use crate::syntax::{outer_attributes, unwrap_attributes};
+use crate::syntax::unwrap_attributes;
+use brokk_bifrost_core::analyzer::tree_walk::{
+    has_child_of_kind as has_anonymous_child, named_children_vec as named_children,
+};
 use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tree_sitter::Node;
 
 /// The ownership fact used by Rust semantic lowering.
@@ -116,9 +121,13 @@ impl TraitEvidence {
 struct NominalDeclaration<'tree> {
     identity: RustNominalIdentity,
     payload_types: Vec<Node<'tree>>,
+    struct_drop_fields: Option<Vec<(Option<Node<'tree>>, Node<'tree>)>>,
     generic: bool,
+    generic_drop_obligation: bool,
     malformed_payload: bool,
     evidence: TraitEvidence,
+    drop_impl_method: Option<Node<'tree>>,
+    drop_impl_ambiguous: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -170,6 +179,10 @@ pub struct RustOwnershipIndex<'tree, 'source> {
     imports: Vec<ImportBinding>,
     shadowed_names: HashSet<ShadowedBinding>,
     states: HashMap<usize, NominalState>,
+    module_context_by_node: HashMap<usize, Option<usize>>,
+    lexical_modules: Vec<LexicalModuleContext>,
+    #[cfg(test)]
+    lexical_module_context_steps: AtomicUsize,
 }
 
 impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
@@ -183,15 +196,20 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
         let mut pending_impls = Vec::new();
         let mut imports = Vec::new();
         let mut shadowed_names = HashSet::new();
+        let mut module_context_by_node = HashMap::new();
+        let mut lexical_modules = Vec::new();
         let mut stack = vec![ScanFrame {
             node: root,
             module_path: Vec::new(),
+            module_context: None,
             under_macro: false,
         }];
 
         while let Some(frame) = stack.pop() {
             charge(1)?;
             let node = unwrap_attributes(frame.node);
+            module_context_by_node.insert(frame.node.id(), frame.module_context);
+            module_context_by_node.insert(node.id(), frame.module_context);
             let macro_context =
                 frame.under_macro || matches!(node.kind(), "macro_invocation" | "macro_definition");
 
@@ -227,13 +245,20 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
             }
 
             let mut child_module_path = frame.module_path.clone();
+            let mut child_module_context = frame.module_context;
             if !macro_context
                 && node.kind() == "mod_item"
                 && let Some(name) = node
                     .child_by_field_name("name")
+                    .filter(|name| name.kind() == "identifier")
                     .map(|name| rust_node_text(name, source).to_string())
             {
-                child_module_path.push(name);
+                child_module_path.push(name.clone());
+                child_module_context = Some(lexical_modules.len());
+                lexical_modules.push(LexicalModuleContext {
+                    parent: frame.module_context,
+                    name,
+                });
             }
 
             let children = named_children(node);
@@ -244,6 +269,11 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
                         child_module_path.clone()
                     } else {
                         frame.module_path.clone()
+                    },
+                    module_context: if node.kind() == "mod_item" {
+                        child_module_context
+                    } else {
+                        frame.module_context
                     },
                     under_macro: macro_context,
                 });
@@ -265,6 +295,10 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
             imports,
             shadowed_names,
             states: HashMap::new(),
+            module_context_by_node,
+            lexical_modules,
+            #[cfg(test)]
+            lexical_module_context_steps: AtomicUsize::new(0),
         };
         for declaration_index in 0..index.declarations.len() {
             index
@@ -304,7 +338,29 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
     }
 
     /// Classify an exact Rust type node from the tree used to build this
-    /// index.  Nodes from another tree are conservatively unresolved.
+    /// index.
+    /// Give admitted operand nodes their opaque anchor's lexical module.
+    /// This does not promote macro-written declarations or imports to primary
+    /// authority; it only lets ordinary expression queries use exact nodes.
+    pub fn register_embedded_syntax<F, E>(
+        &mut self,
+        forest: &brokk_bifrost_core::analyzer::structural::spec::EmbeddedSyntaxForest,
+        mut charge: F,
+    ) -> Result<(), E>
+    where
+        F: FnMut(usize) -> Result<(), E>,
+    {
+        forest.for_each_node(|anchor, node| {
+            charge(1)?;
+            let context = *self
+                .module_context_by_node
+                .get(&anchor)
+                .expect("embedded syntax anchor belongs to the indexed primary or parent fragment");
+            self.module_context_by_node.insert(node.id(), context);
+            Ok(())
+        })
+    }
+
     pub fn classify_type(&self, type_node: Node<'tree>) -> RustOwnershipClass {
         if has_macro_ancestor(type_node) {
             return RustOwnershipClass::Incomplete(RustOwnershipIncomplete::MacroExpansion);
@@ -336,6 +392,154 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
             };
         }
         state.into_public()
+    }
+
+    /// Classify a local nominal declaration for destructor queries.
+    ///
+    /// Unlike a transfer, destructor behavior does not depend on whether the
+    /// type mention is inside unsafe code. A raw-pointer read can duplicate
+    /// storage, but cannot change the declaration's Copy or Drop evidence.
+    /// Macro expansion remains incomplete, as it does for transfer queries.
+    pub fn classify_nominal_type_for_drop(&self, type_node: Node<'tree>) -> RustOwnershipClass {
+        if has_macro_ancestor(type_node) {
+            return RustOwnershipClass::Incomplete(RustOwnershipIncomplete::MacroExpansion);
+        }
+        self.classify_nominal_reference(type_node).into_public()
+    }
+
+    /// Resolve a local nominal type's exact, nongeneric `Drop::drop` body.
+    ///
+    /// This returns a method only when the impl's trait path resolved to the
+    /// builtin `core::ops::Drop`/`std::ops::Drop` identity while building this
+    /// index and the target type names one unique local declaration.
+    pub fn drop_impl_method_for_type(
+        &self,
+        type_node: Node<'tree>,
+    ) -> Result<Option<Node<'tree>>, RustOwnershipIncomplete> {
+        let index = self.unique_nominal_candidate_index(type_node)?;
+        let declaration = &self.declarations[index];
+        if declaration.generic_drop_obligation {
+            return Err(RustOwnershipIncomplete::GenericObligation);
+        }
+        match declaration.evidence.drop_count {
+            0 => Ok(None),
+            1 if !declaration.drop_impl_ambiguous => declaration
+                .drop_impl_method
+                .map(Some)
+                .ok_or(RustOwnershipIncomplete::UnsupportedType),
+            _ => Err(RustOwnershipIncomplete::AmbiguousIdentity),
+        }
+    }
+
+    /// Return a local struct's fields in declaration order for Rust drop glue.
+    ///
+    /// Enum fields are variant-dependent and unions have no implicit field
+    /// drop order, so those shapes remain explicitly incomplete to the caller.
+    pub fn drop_fields_for_type(
+        &self,
+        type_node: Node<'tree>,
+    ) -> Result<Vec<(Option<Node<'tree>>, Node<'tree>)>, RustOwnershipIncomplete> {
+        let index = self.unique_nominal_candidate_index(type_node)?;
+        let declaration = &self.declarations[index];
+        if declaration.generic_drop_obligation {
+            return Err(RustOwnershipIncomplete::GenericObligation);
+        }
+        declaration
+            .struct_drop_fields
+            .clone()
+            .ok_or(RustOwnershipIncomplete::UnsupportedType)
+    }
+
+    /// Prove that one structured Rust path from the indexed tree names an
+    /// exact standard-library item, accounting for lexical imports, aliases,
+    /// and shadowing.
+    ///
+    /// `expected` is the canonical path, such as `core::ptr::read`. The
+    /// standard prelude is consulted only for language-defined names and only
+    /// when no local or imported binding shadows that name.
+    pub fn resolves_standard_path(&self, path_node: Node<'tree>, expected: &[&str]) -> bool {
+        let Some(segments) = rust_path_segments(path_node) else {
+            return false;
+        };
+        let names = segments
+            .iter()
+            .map(|segment| rust_node_text(*segment, self.source).to_string())
+            .collect::<Vec<_>>();
+        if names.is_empty() {
+            return false;
+        }
+        let module_path = self.lexical_module_path(path_node);
+        let absolute = rust_path_is_leading_absolute(path_node);
+        let mut resolved = Vec::<Vec<String>>::new();
+
+        if absolute {
+            resolved.push(names.clone());
+        } else {
+            let first = names.first().expect("nonempty path has a first segment");
+            let named_imports = self
+                .imports
+                .iter()
+                .filter(|import| is_lexically_visible(&module_path, &import.module_path))
+                .filter(|import| !import.wildcard && import.local_name == *first)
+                .collect::<Vec<_>>();
+
+            for import in &named_imports {
+                let mut target =
+                    resolve_standard_import_path(&import.module_path, &import.target_path);
+                target.extend(names.iter().skip(1).cloned());
+                resolved.push(target);
+            }
+
+            if named_imports.is_empty() && is_standard_root(first) {
+                if !self.name_is_shadowed(&module_path, first) {
+                    resolved.push(names.clone());
+                }
+            } else if named_imports.is_empty() {
+                for import in self.imports.iter().filter(|import| {
+                    import.wildcard && is_lexically_visible(&module_path, &import.module_path)
+                }) {
+                    let mut target =
+                        resolve_standard_import_path(&import.module_path, &import.target_path);
+                    target.extend(names.iter().cloned());
+                    resolved.push(target);
+                }
+                if resolved.is_empty()
+                    && is_standard_prelude_path(expected, &names)
+                    && !self.name_is_shadowed(&module_path, first)
+                {
+                    resolved.push(expected.iter().map(|part| (*part).to_string()).collect());
+                }
+            }
+        }
+
+        resolved.sort_unstable();
+        resolved.dedup();
+        resolved.len() == 1
+            && resolved[0]
+                .iter()
+                .map(String::as_str)
+                .eq(expected.iter().copied())
+    }
+
+    fn lexical_module_path(&self, node: Node<'tree>) -> Vec<String> {
+        let mut context = *self
+            .module_context_by_node
+            .get(&node.id())
+            .expect("RustOwnershipIndex query nodes must come from its indexed syntax tree");
+        let mut reversed = Vec::new();
+        while let Some(context_id) = context {
+            #[cfg(test)]
+            self.lexical_module_context_steps
+                .fetch_add(1, Ordering::Relaxed);
+            let module = self
+                .lexical_modules
+                .get(context_id)
+                .expect("module context id is recorded during the ownership scan");
+            reversed.push(module.name.clone());
+            context = module.parent;
+        }
+        reversed.reverse();
+        reversed
     }
 
     /// Classify a literal transfer only when its AST category agrees with an
@@ -408,9 +612,9 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
                 }
                 "array_type" => {
                     let left_element =
-                        array_element(left).ok_or(RustOwnershipIncomplete::MissingType)?;
+                        sequence_element(left).ok_or(RustOwnershipIncomplete::MissingType)?;
                     let right_element =
-                        array_element(right).ok_or(RustOwnershipIncomplete::MissingType)?;
+                        sequence_element(right).ok_or(RustOwnershipIncomplete::MissingType)?;
                     match (
                         left.child_by_field_name("length"),
                         right.child_by_field_name("length"),
@@ -439,9 +643,9 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
                 }
                 "slice_type" => {
                     let left_element =
-                        slice_element(left).ok_or(RustOwnershipIncomplete::MissingType)?;
+                        sequence_element(left).ok_or(RustOwnershipIncomplete::MissingType)?;
                     let right_element =
-                        slice_element(right).ok_or(RustOwnershipIncomplete::MissingType)?;
+                        sequence_element(right).ok_or(RustOwnershipIncomplete::MissingType)?;
                     pending.push((left_element, right_element));
                 }
                 "type_identifier"
@@ -515,10 +719,10 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
             && source_referent.child_by_field_name("length").is_some()
             && target_referent.child_by_field_name("length").is_none()
         {
-            let Some(source_element) = array_element(source_referent) else {
+            let Some(source_element) = sequence_element(source_referent) else {
                 return RustReferenceCoercion::Incomplete(RustOwnershipIncomplete::MissingType);
             };
-            let Some(target_element) = array_element(target_referent) else {
+            let Some(target_element) = sequence_element(target_referent) else {
                 return RustReferenceCoercion::Incomplete(RustOwnershipIncomplete::MissingType);
             };
             match self.exact_type_equivalence(source_element, target_element) {
@@ -540,7 +744,7 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
             }
             if finish {
                 let result = if node.kind() == "array_type" {
-                    let Some(element) = array_element(node) else {
+                    let Some(element) = sequence_element(node) else {
                         values.insert(
                             key,
                             EvalState::Incomplete(RustOwnershipIncomplete::MissingType),
@@ -584,7 +788,7 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
             match node.kind() {
                 "array_type" => {
                     stack.push((node, true));
-                    if let Some(element) = array_element(node) {
+                    if let Some(element) = sequence_element(node) {
                         stack.push((element, false));
                     }
                 }
@@ -661,23 +865,13 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
         if !valid_path_shape(type_node) {
             return EvalState::Incomplete(RustOwnershipIncomplete::UnsupportedType);
         }
-        let Some(path_nodes) = rust_path_segments(type_node) else {
-            return EvalState::Incomplete(RustOwnershipIncomplete::UnresolvedPath);
+        let index = match self.unique_nominal_candidate_index(type_node) {
+            Ok(index) => index,
+            Err(reason) => return EvalState::Incomplete(reason),
         };
-        let path = path_nodes
-            .iter()
-            .map(|segment| rust_node_text(*segment, self.source).to_string())
-            .collect::<Vec<_>>();
-        let module_path = lexical_module_path(type_node, self.source);
-        let Some(candidates) = self.resolve_nominal_candidates(&module_path, &path) else {
-            return EvalState::Incomplete(RustOwnershipIncomplete::UnresolvedPath);
-        };
-        if candidates.len() != 1 {
-            return EvalState::Incomplete(RustOwnershipIncomplete::AmbiguousIdentity);
-        }
         match self
             .states
-            .get(&candidates[0])
+            .get(&index)
             .copied()
             .expect("nominal candidate is indexed")
         {
@@ -695,29 +889,37 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
         if !valid_path_shape(type_node) || contains_generic(type_node) {
             return Err(RustOwnershipIncomplete::GenericObligation);
         }
+        let index = self.unique_nominal_candidate_index(type_node)?;
+        match self
+            .states
+            .get(&index)
+            .copied()
+            .expect("nominal candidate is indexed")
+        {
+            NominalState::Pending => Err(RustOwnershipIncomplete::CyclicNominal),
+            NominalState::Incomplete(reason) => Err(reason),
+            NominalState::Copy | NominalState::Move => Ok(index),
+        }
+    }
+
+    fn unique_nominal_candidate_index(
+        &self,
+        type_node: Node<'tree>,
+    ) -> Result<usize, RustOwnershipIncomplete> {
         let path_nodes =
             rust_path_segments(type_node).ok_or(RustOwnershipIncomplete::UnresolvedPath)?;
         let path = path_nodes
             .iter()
             .map(|segment| rust_node_text(*segment, self.source).to_string())
             .collect::<Vec<_>>();
-        let module_path = lexical_module_path(type_node, self.source);
+        let module_path = self.lexical_module_path(type_node);
         let candidates = self
             .resolve_nominal_candidates(&module_path, &path)
             .ok_or(RustOwnershipIncomplete::UnresolvedPath)?;
         if candidates.len() != 1 {
             return Err(RustOwnershipIncomplete::AmbiguousIdentity);
         }
-        match self
-            .states
-            .get(&candidates[0])
-            .copied()
-            .expect("nominal candidate is indexed")
-        {
-            NominalState::Pending => Err(RustOwnershipIncomplete::CyclicNominal),
-            NominalState::Incomplete(reason) => Err(reason),
-            NominalState::Copy | NominalState::Move => Ok(candidates[0]),
-        }
+        Ok(candidates[0])
     }
 
     fn resolve_nominal_candidates(
@@ -839,7 +1041,7 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
             }
             return;
         }
-        let declaration = &mut self.declarations[candidates[0]];
+        let declaration_index = candidates[0];
         let Some(trait_node) = implementation.trait_node else {
             return;
         };
@@ -850,20 +1052,49 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
             &self.shadowed_names,
         ) else {
             if path_terminal_is_builtin(trait_node, self.source) {
-                declaration.evidence.wrong_builtin_count += 1;
+                self.declarations[declaration_index]
+                    .evidence
+                    .wrong_builtin_count += 1;
             }
             return;
         };
         if implementation.negative {
             if trait_kind == BuiltinTrait::Copy {
-                declaration.evidence.negative_copy = true;
+                self.declarations[declaration_index].evidence.negative_copy = true;
             }
             return;
         }
+        let drop_method = if trait_kind == BuiltinTrait::Drop {
+            let methods = implementation
+                .node
+                .child_by_field_name("body")
+                .map(named_children)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|member| {
+                    member.kind() == "function_item"
+                        && member
+                            .child_by_field_name("name")
+                            .is_some_and(|name| rust_node_text(name, self.source) == "drop")
+                })
+                .collect::<Vec<_>>();
+            (methods.len() == 1).then(|| methods[0])
+        } else {
+            None
+        };
+        let declaration = &mut self.declarations[declaration_index];
         match trait_kind {
             BuiltinTrait::Copy => declaration.evidence.copy_count += 1,
             BuiltinTrait::Clone => declaration.evidence.clone_count += 1,
-            BuiltinTrait::Drop => declaration.evidence.drop_count += 1,
+            BuiltinTrait::Drop => {
+                declaration.evidence.drop_count += 1;
+                match (declaration.drop_impl_method, drop_method) {
+                    (None, Some(method)) if !declaration.drop_impl_ambiguous => {
+                        declaration.drop_impl_method = Some(method);
+                    }
+                    _ => declaration.drop_impl_ambiguous = true,
+                }
+            }
         }
     }
 
@@ -891,9 +1122,16 @@ enum BuiltinTrait {
 }
 
 #[derive(Clone, Debug)]
+struct LexicalModuleContext {
+    parent: Option<usize>,
+    name: String,
+}
+
+#[derive(Clone, Debug)]
 struct ScanFrame<'tree> {
     node: Node<'tree>,
     module_path: Vec<String>,
+    module_context: Option<usize>,
     under_macro: bool,
 }
 
@@ -935,14 +1173,52 @@ fn nominal_declaration<'tree>(
         source_start: node.start_byte(),
     };
     let (payload_types, malformed_payload) = payload_types(node, expected_kind);
+    let struct_drop_fields = (expected_kind == "struct")
+        .then(|| struct_drop_fields(node))
+        .flatten();
     let evidence = derive_evidence(node, source);
     Some(NominalDeclaration {
         identity,
         payload_types,
+        struct_drop_fields,
         generic: node.child_by_field_name("type_parameters").is_some() || has_where_clause(node),
+        generic_drop_obligation: has_where_clause(node)
+            || node
+                .child_by_field_name("type_parameters")
+                .is_some_and(|parameters| {
+                    named_children(parameters)
+                        .into_iter()
+                        .any(|parameter| parameter.kind() != "lifetime_parameter")
+                }),
         malformed_payload,
         evidence,
+        drop_impl_method: None,
+        drop_impl_ambiguous: false,
     })
+}
+
+fn struct_drop_fields<'tree>(node: Node<'tree>) -> Option<Vec<(Option<Node<'tree>>, Node<'tree>)>> {
+    let Some(body) = node.child_by_field_name("body") else {
+        return Some(Vec::new());
+    };
+    match body.kind() {
+        "field_declaration_list" => named_children(body)
+            .into_iter()
+            .filter(|field| field.kind() == "field_declaration")
+            .map(|field| {
+                Some((
+                    field.child_by_field_name("name"),
+                    field.child_by_field_name("type")?,
+                ))
+            })
+            .collect(),
+        "ordered_field_declaration_list" => named_children(body)
+            .into_iter()
+            .filter(|node| is_type_node(*node))
+            .map(|ty| Some((None, ty)))
+            .collect(),
+        _ => None,
+    }
 }
 
 fn payload_types<'tree>(node: Node<'tree>, expected_kind: &str) -> (Vec<Node<'tree>>, bool) {
@@ -997,15 +1273,23 @@ fn collect_body_types<'tree>(
 
 fn derive_evidence(node: Node<'_>, source: &str) -> TraitEvidence {
     let mut evidence = TraitEvidence::default();
-    for attribute_item in outer_attributes(node) {
-        let Some(attribute) = attribute_item.named_child(0) else {
-            break;
-        };
-        let Some(path) = attribute.named_child(0) else {
+    let Some(attributes) = crate::resolution::rust_item_effective_attributes(node, source) else {
+        return evidence;
+    };
+    for attribute in attributes {
+        let Some(path) = attribute.path.first().copied() else {
             continue;
         };
-        if path.kind() == "identifier" && rust_node_text(path, source) == "derive" {
-            let Some(arguments) = attribute.child_by_field_name("arguments") else {
+        if attribute.path.len() == 1
+            && path.kind() == "identifier"
+            && rust_node_text(path, source) == "derive"
+        {
+            // A conditional derive is not evidence that the type implements
+            // Copy or Clone in every configuration.
+            if attribute.from_cfg_attr {
+                continue;
+            }
+            let Some(arguments) = attribute.arguments else {
                 evidence.malformed_derive = true;
                 continue;
             };
@@ -1273,22 +1557,13 @@ fn declaration_path<'tree>(declaration: &NominalDeclaration<'tree>) -> Vec<Strin
     path
 }
 
-fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).collect()
-}
-
-fn has_anonymous_child(node: Node<'_>, kind: &str) -> bool {
-    (0..node.child_count()).any(|index| node.child(index).is_some_and(|child| child.kind() == kind))
-}
-
 fn has_where_clause(node: Node<'_>) -> bool {
     named_children(node)
         .into_iter()
         .any(|child| child.kind() == "where_clause")
 }
 
-fn has_macro_ancestor(mut node: Node<'_>) -> bool {
+pub(crate) fn has_macro_ancestor(mut node: Node<'_>) -> bool {
     while let Some(parent) = node.parent() {
         if matches!(parent.kind(), "macro_invocation" | "macro_definition") {
             return true;
@@ -1357,41 +1632,18 @@ fn reference_referent(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn reference_is_mutable(node: Node<'_>) -> bool {
-    node.kind() == "reference_type"
-        && named_children(node)
-            .into_iter()
-            .any(|child| child.kind() == "mutable_specifier")
+    node.kind() == "reference_type" && has_mutable_reference_specifier(node)
 }
 
-fn array_element(node: Node<'_>) -> Option<Node<'_>> {
-    (node.kind() == "array_type").then(|| node.child_by_field_name("element"))?
+fn has_mutable_reference_specifier(node: Node<'_>) -> bool {
+    named_children(node)
+        .into_iter()
+        .any(|child| child.kind() == "mutable_specifier")
 }
 
-fn slice_element(node: Node<'_>) -> Option<Node<'_>> {
-    (node.kind() == "slice_type").then(|| node.child_by_field_name("element"))?
-}
-
-fn lexical_module_path(mut node: Node<'_>, source: &str) -> Vec<String> {
-    let mut reversed = Vec::new();
-    while let Some(parent) = node.parent() {
-        if parent.kind() == "mod_item"
-            && parent
-                .child_by_field_name("name")
-                .is_some_and(|name| name.kind() == "identifier")
-        {
-            let name = rust_node_text(
-                parent
-                    .child_by_field_name("name")
-                    .expect("checked module name"),
-                source,
-            )
-            .to_string();
-            reversed.push(name);
-        }
-        node = parent;
-    }
-    reversed.reverse();
-    reversed
+fn sequence_element(node: Node<'_>) -> Option<Node<'_>> {
+    matches!(node.kind(), "array_type" | "slice_type")
+        .then(|| node.child_by_field_name("element"))?
 }
 
 fn is_lexically_visible(current: &[String], binding_module: &[String]) -> bool {
@@ -1421,6 +1673,71 @@ fn resolve_relative_path(base: &[String], path: &[String]) -> Option<Vec<String>
     Some(result)
 }
 
+fn resolve_standard_import_path(base: &[String], path: &[String]) -> Vec<String> {
+    if path.first().is_some_and(|first| is_standard_root(first)) {
+        path.to_vec()
+    } else {
+        resolve_relative_path(base, path).unwrap_or_else(|| path.to_vec())
+    }
+}
+
+fn is_standard_root(name: &str) -> bool {
+    matches!(name, "alloc" | "core" | "std")
+}
+
+fn is_standard_prelude_path(expected: &[&str], names: &[String]) -> bool {
+    match expected {
+        ["alloc" | "std", "boxed", "Box", suffix @ ..] => {
+            names.first().is_some_and(|name| name == "Box")
+                && names
+                    .iter()
+                    .skip(1)
+                    .map(String::as_str)
+                    .eq(suffix.iter().copied())
+        }
+        ["alloc" | "std", "vec", "Vec", suffix @ ..] => {
+            names.first().is_some_and(|name| name == "Vec")
+                && names
+                    .iter()
+                    .skip(1)
+                    .map(String::as_str)
+                    .eq(suffix.iter().copied())
+        }
+        ["alloc" | "std", "string", "String", suffix @ ..] => {
+            names.first().is_some_and(|name| name == "String")
+                && names
+                    .iter()
+                    .skip(1)
+                    .map(String::as_str)
+                    .eq(suffix.iter().copied())
+        }
+        [
+            "core" | "std",
+            "option",
+            item @ ("Option" | "Some" | "None"),
+            suffix @ ..,
+        ] => {
+            names.first().is_some_and(|name| name == item)
+                && names
+                    .iter()
+                    .skip(1)
+                    .map(String::as_str)
+                    .eq(suffix.iter().copied())
+        }
+        ["core" | "std", "result", "Result", suffix @ ..] => {
+            names.first().is_some_and(|name| name == "Result")
+                && names
+                    .iter()
+                    .skip(1)
+                    .map(String::as_str)
+                    .eq(suffix.iter().copied())
+        }
+        ["core" | "std", "mem", "drop"] => names == ["drop"],
+        ["core" | "std", "panic", "panic"] => names == ["panic"],
+        _ => false,
+    }
+}
+
 /// The value operand of `&`/`&mut`; the mutable specifier is deliberately not
 /// returned as an operand.  This is the AST-backed fix for the old
 /// first-named-child bug (`&mut *source`).
@@ -1436,9 +1753,7 @@ pub fn rust_reference_type_referent(node: Node<'_>) -> Option<Node<'_>> {
 /// Whether a reference type or reference expression is mutable.
 pub fn rust_reference_is_mutable(node: Node<'_>) -> bool {
     (node.kind() == "reference_type" || node.kind() == "reference_expression")
-        && named_children(node)
-            .into_iter()
-            .any(|child| child.kind() == "mutable_specifier")
+        && has_mutable_reference_specifier(node)
 }
 
 /// Whether a node is nested in an unsafe block, item, or function.
@@ -1459,15 +1774,7 @@ pub fn rust_dereference_operand(node: Node<'_>) -> Option<Node<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tree_sitter::Parser;
-
-    fn parse(source: &str) -> tree_sitter::Tree {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .expect("load Rust grammar");
-        parser.parse(source, None).expect("parse Rust source")
-    }
+    use crate::test_helpers::parse_rust as parse;
 
     fn all_type_nodes<'tree>(root: Node<'tree>) -> Vec<Node<'tree>> {
         let mut result = Vec::new();
@@ -1489,30 +1796,6 @@ mod tests {
     }
 
     #[test]
-    fn proves_scalars_recursive_aggregates_and_references() {
-        let source = "struct Pair(u8, (bool, [i32; 2]));\nfn f(x: &u8, y: &mut u8) {}\n";
-        let tree = parse(source);
-        let index =
-            RustOwnershipIndex::build(tree.root_node(), source, |_| Ok::<_, ()>(())).unwrap();
-        assert_eq!(
-            index.classify_type(type_named(tree.root_node(), source, "u8")),
-            RustOwnershipClass::ScalarCopy
-        );
-        assert_eq!(
-            index.classify_type(type_named(tree.root_node(), source, "(bool, [i32; 2])")),
-            RustOwnershipClass::AggregateCopy
-        );
-        assert_eq!(
-            index.classify_type(type_named(tree.root_node(), source, "&u8")),
-            RustOwnershipClass::SharedReference
-        );
-        assert_eq!(
-            index.classify_type(type_named(tree.root_node(), source, "&mut u8")),
-            RustOwnershipClass::MutableReference
-        );
-    }
-
-    #[test]
     fn mutable_reference_payload_prevents_an_aggregate_copy_proof() {
         let source = "#[derive(core::marker::Copy, core::clone::Clone)] struct NotCopy(&'static mut u8); fn f(value: NotCopy) {}\n";
         let tree = parse(source);
@@ -1521,35 +1804,6 @@ mod tests {
         assert_ne!(
             index.classify_type(type_named(tree.root_node(), source, "NotCopy")),
             RustOwnershipClass::AggregateCopy
-        );
-    }
-
-    #[test]
-    fn literal_transfer_uses_the_exact_destination_primitive_category() {
-        let source = "fn f() -> i32 { 1 } fn g() -> bool { true }\n";
-        let tree = parse(source);
-        let index =
-            RustOwnershipIndex::build(tree.root_node(), source, |_| Ok::<_, ()>(())).unwrap();
-        let mut nodes = Vec::new();
-        let mut stack = vec![tree.root_node()];
-        while let Some(node) = stack.pop() {
-            nodes.push(node);
-            stack.extend(named_children(node));
-        }
-        let integer = nodes
-            .iter()
-            .copied()
-            .find(|node| node.kind() == "integer_literal")
-            .expect("integer literal");
-        let integer_type = type_named(tree.root_node(), source, "i32");
-        let boolean_type = type_named(tree.root_node(), source, "bool");
-        assert_eq!(
-            index.classify_literal_for_type(integer, integer_type),
-            RustOwnershipClass::ScalarCopy
-        );
-        assert_eq!(
-            index.classify_literal_for_type(integer, boolean_type),
-            RustOwnershipClass::Incomplete(RustOwnershipIncomplete::UnsupportedType)
         );
     }
 
@@ -1578,18 +1832,6 @@ mod tests {
     }
 
     #[test]
-    fn unqualified_builtin_trait_spelling_is_not_exact_identity() {
-        let source = "struct Spelled(u8);\nimpl Copy for Spelled {}\nimpl Clone for Spelled {}\n";
-        let tree = parse(source);
-        let index =
-            RustOwnershipIndex::build(tree.root_node(), source, |_| Ok::<_, ()>(())).unwrap();
-        assert_eq!(
-            index.classify_type(type_named(tree.root_node(), source, "Spelled")),
-            RustOwnershipClass::Incomplete(RustOwnershipIncomplete::WrongTraitIdentity)
-        );
-    }
-
-    #[test]
     fn rejects_generic_raw_wrong_identity_and_ambiguous_types() {
         let source = "struct A<T>(T);\nstruct S(u8);\nstruct S(u8);\nimpl foo::Copy for S {}\nfn f(a: A<u8>, p: *const u8) {}\n";
         let tree = parse(source);
@@ -1607,6 +1849,45 @@ mod tests {
             index.classify_type(type_named(tree.root_node(), source, "S")),
             RustOwnershipClass::Incomplete(RustOwnershipIncomplete::AmbiguousIdentity)
         ));
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#4975: unsafe type mentions suppressed declaration-based destructor proofs"
+    )]
+    fn destructor_classification_preserves_unsafe_transfer_and_macro_boundaries() {
+        let source = "#[derive(core::marker::Copy, core::clone::Clone)] struct Pair(u32); unsafe fn f(value: Pair, unknown: Missing) {} opaque!(Pair);";
+        let tree = parse(source);
+        let index =
+            RustOwnershipIndex::build(tree.root_node(), source, |_| Ok::<_, ()>(())).unwrap();
+        let ty = all_type_nodes(tree.root_node())
+            .into_iter()
+            .find(|node| rust_node_text(*node, source) == "Pair" && has_unsafe_ancestor(*node))
+            .expect("unsafe parameter type");
+        assert_eq!(
+            index.classify_type(ty),
+            RustOwnershipClass::Incomplete(RustOwnershipIncomplete::UnsupportedType)
+        );
+        assert_eq!(
+            index.classify_nominal_type_for_drop(ty),
+            RustOwnershipClass::AggregateCopy
+        );
+        assert_eq!(
+            index.classify_nominal_type_for_drop(type_named(tree.root_node(), source, "Missing")),
+            RustOwnershipClass::Incomplete(RustOwnershipIncomplete::UnresolvedPath)
+        );
+        let mut stack = vec![tree.root_node()];
+        let macro_type = loop {
+            let node = stack.pop().expect("macro argument exists");
+            if has_macro_ancestor(node) && rust_node_text(node, source) == "Pair" {
+                break node;
+            }
+            stack.extend(named_children(node));
+        };
+        assert_eq!(
+            index.classify_nominal_type_for_drop(macro_type),
+            RustOwnershipClass::Incomplete(RustOwnershipIncomplete::MacroExpansion)
+        );
     }
 
     #[test]
@@ -1665,6 +1946,159 @@ mod tests {
             index.classify_type(type_named(tree.root_node(), source, "Bad")),
             RustOwnershipClass::Incomplete(RustOwnershipIncomplete::WrongTraitIdentity)
         ));
+
+        let source = "struct Spelled(u8);\nimpl Copy for Spelled {}\nimpl Clone for Spelled {}\n";
+        let tree = parse(source);
+        let index =
+            RustOwnershipIndex::build(tree.root_node(), source, |_| Ok::<_, ()>(())).unwrap();
+        assert_eq!(
+            index.classify_type(type_named(tree.root_node(), source, "Spelled")),
+            RustOwnershipClass::Incomplete(RustOwnershipIncomplete::WrongTraitIdentity)
+        );
+    }
+
+    #[test]
+    fn resolves_standard_pointer_paths_through_exact_imports_and_shadowing() {
+        let source = "use core::ptr as raw; use std::boxed::Box as HeapBox; struct LocalBox(u8); fn f(pointer: *mut u8) { let _ = raw::read(pointer); let _ = HeapBox::from_raw(pointer); let _ = Box::into_raw(pointer); } mod ptr { fn read() {} } fn shadowed() { ptr::read(); }";
+        let tree = parse(source);
+        let index =
+            RustOwnershipIndex::build(tree.root_node(), source, |_| Ok::<_, ()>(())).unwrap();
+        let mut stack = vec![tree.root_node()];
+        let mut read_path = None;
+        let mut box_path = None;
+        let mut prelude_box_path = None;
+        let mut local_path = None;
+        while let Some(node) = stack.pop() {
+            if node.kind() == "call_expression"
+                && let Some(function) = node.child_by_field_name("function")
+            {
+                match rust_node_text(function, source) {
+                    "raw::read" => read_path = Some(function),
+                    "HeapBox::from_raw" => box_path = Some(function),
+                    "Box::into_raw" => prelude_box_path = Some(function),
+                    "ptr::read" => local_path = Some(function),
+                    _ => {}
+                }
+            }
+            stack.extend(named_children(node));
+        }
+        assert!(index.resolves_standard_path(
+            read_path.expect("imported pointer read call"),
+            &["core", "ptr", "read"]
+        ));
+        assert!(index.resolves_standard_path(
+            box_path.expect("aliased Box constructor"),
+            &["std", "boxed", "Box", "from_raw"]
+        ));
+        assert!(index.resolves_standard_path(
+            prelude_box_path.expect("prelude Box constructor"),
+            &["std", "boxed", "Box", "into_raw"]
+        ));
+        assert!(!index.resolves_standard_path(
+            local_path.expect("local ptr module call"),
+            &["core", "ptr", "read"]
+        ));
+
+        let source = "struct Box(u8); fn f() { let _value: Box = Box(0); }";
+        let tree = parse(source);
+        let index =
+            RustOwnershipIndex::build(tree.root_node(), source, |_| Ok::<_, ()>(())).unwrap();
+        let mut stack = vec![tree.root_node()];
+        let mut box_type = None;
+        while let Some(node) = stack.pop() {
+            if node.kind() == "type_identifier" && rust_node_text(node, source) == "Box" {
+                box_type = Some(node);
+            }
+            stack.extend(named_children(node));
+        }
+        assert!(!index.resolves_standard_path(
+            box_type.expect("shadowed Box type"),
+            &["std", "boxed", "Box"]
+        ));
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#4848: standard path lowering repeated tree-sitter parent searches per call"
+    )]
+    fn resolves_many_standard_paths_from_nested_module_contexts() {
+        let module_depth = 24;
+        let call_count = 48;
+        let calls = "core::mem::drop(());".repeat(call_count);
+        let mut source = format!("fn f() {{ {calls} }}");
+        for depth in (0..module_depth).rev() {
+            source = format!("mod m{depth} {{ {source} }}");
+        }
+
+        let tree = parse(&source);
+        let index =
+            RustOwnershipIndex::build(tree.root_node(), &source, |_| Ok::<_, ()>(())).unwrap();
+        let mut paths = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "call_expression"
+                && let Some(function) = node.child_by_field_name("function")
+            {
+                paths.push(function);
+            }
+            stack.extend(named_children(node));
+        }
+        assert_eq!(paths.len(), call_count);
+
+        for path in paths {
+            assert!(index.resolves_standard_path(path, &["core", "mem", "drop"]));
+        }
+        assert_eq!(
+            index.lexical_module_context_steps.load(Ordering::Relaxed),
+            call_count * module_depth
+        );
+    }
+
+    #[test]
+    fn resolves_only_the_exact_local_drop_impl_body() {
+        let source = "struct Owned; impl core::ops::Drop for Owned { fn drop(&mut self) {} } fn f(value: Owned) {}";
+        let tree = parse(source);
+        let index =
+            RustOwnershipIndex::build(tree.root_node(), source, |_| Ok::<_, ()>(())).unwrap();
+        let ty = type_named(tree.root_node(), source, "Owned");
+        let method = index
+            .drop_impl_method_for_type(ty)
+            .expect("exact Drop type")
+            .expect("Drop impl method");
+        assert_eq!(method.kind(), "function_item");
+        assert_eq!(
+            method
+                .child_by_field_name("name")
+                .map(|name| rust_node_text(name, source)),
+            Some("drop")
+        );
+
+        let source =
+            "struct Owned; mod custom { pub trait Drop {} } impl custom::Drop for Owned {}";
+        let tree = parse(source);
+        let index =
+            RustOwnershipIndex::build(tree.root_node(), source, |_| Ok::<_, ()>(())).unwrap();
+        assert_eq!(
+            index.drop_impl_method_for_type(type_named(tree.root_node(), source, "Owned")),
+            Ok(None)
+        );
+
+        let source = "struct Field; struct Owner { first: Field, second: u8 }";
+        let tree = parse(source);
+        let index =
+            RustOwnershipIndex::build(tree.root_node(), source, |_| Ok::<_, ()>(())).unwrap();
+        let fields = index
+            .drop_fields_for_type(type_named(tree.root_node(), source, "Owner"))
+            .expect("nongeneric local struct fields");
+        assert_eq!(fields.len(), 2);
+        assert_eq!(
+            fields[0].0.map(|name| rust_node_text(name, source)),
+            Some("first")
+        );
+        assert_eq!(
+            fields[1].0.map(|name| rust_node_text(name, source)),
+            Some("second")
+        );
     }
 
     #[test]

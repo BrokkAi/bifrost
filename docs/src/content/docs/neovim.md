@@ -1,9 +1,13 @@
 ---
 title: Neovim and Vim LSP
-description: Configure Neovim or classic Vim to run Bifrost as a stdio language server.
+description: Configure Neovim or classic Vim to start the bifrost-lsp language server.
 ---
 
-Neovim can run Bifrost directly through its built-in LSP client. No Bifrost-specific Neovim plugin is required. Classic Vim works too through a generic LSP client such as [vim-lsp](https://github.com/prabirshrestha/vim-lsp) or [coc.nvim](https://github.com/neoclide/coc.nvim): every client on this page starts the same stdio server with `bifrost --root <project> --lsp`.
+Neovim can start the Bifrost language server through its built-in LSP client. Classic Vim can use a generic LSP client such as [vim-lsp](https://github.com/prabirshrestha/vim-lsp), [coc.nvim](https://github.com/neoclide/coc.nvim), or [ALE](https://github.com/dense-analysis/ale). No Bifrost-specific plugin is needed. Every configuration on this page starts the same stdio server with `bifrost-lsp --root <project>`.
+
+:::caution[bifrost-lsp is not released yet]
+Bifrost built after release 0.12.0 does not serve LSP: `bifrost --lsp` exits with an error. The language server is now the separate `bifrost-lsp` program, and `bifrost-lsp` has no release yet. The configurations below are ready for its first release. See [LSP Server](/lsp/) for the status and for what to use until then.
+:::
 
 ## Neovim 0.11 or Newer (Built-In Client)
 
@@ -13,7 +17,7 @@ Use Neovim 0.11 or newer for `vim.lsp.config`. Put this in `~/.config/nvim/after
 local root = vim.fn.getcwd()
 
 vim.lsp.config('bifrost', {
-  cmd = { 'bifrost', '--root', root, '--lsp' },
+  cmd = { 'bifrost-lsp', '--root', root },
   filetypes = {
     'c',
     'cpp',
@@ -37,58 +41,17 @@ vim.lsp.config('bifrost', {
 vim.lsp.enable('bifrost')
 ```
 
-This assumes `bifrost` is installed on `PATH`:
-
-```bash
-cargo install brokk-bifrost --locked --force
-```
-
-For local development, build this checkout and use an absolute binary path:
-
-```bash
-cargo build --bin bifrost
-```
-
-Then update the Neovim config:
-
-```lua
-local root = vim.fn.getcwd()
-local bifrost = '/path/to/bifrost/target/debug/bifrost'
-
-vim.lsp.config('bifrost', {
-  cmd = { bifrost, '--root', root, '--lsp' },
-  filetypes = {
-    'c',
-    'cpp',
-    'cs',
-    'go',
-    'java',
-    'javascript',
-    'javascriptreact',
-    'kotlin',
-    'php',
-    'python',
-    'ruby',
-    'rust',
-    'scala',
-    'typescript',
-    'typescriptreact',
-  },
-  root_dir = root,
-})
-
-vim.lsp.enable('bifrost')
-```
+This assumes `bifrost-lsp` is on `PATH`. If it is not, replace `'bifrost-lsp'` in `cmd` with the absolute path to the binary.
 
 ## Large Workspaces
 
-Bifrost also accepts the same LSP initialization options used by the VS Code extension for scoped indexing. Paths are resolved from the `--root` directory:
+To limit indexing, send the same LSP initialization options that the VS Code extension sends. The extension sends absolute paths, so build them from the root. See [LSP Server](/lsp/) for all four options.
 
 ```lua
 local root = vim.fn.getcwd()
 
 vim.lsp.config('bifrost', {
-  cmd = { 'bifrost', '--root', root, '--lsp' },
+  cmd = { 'bifrost-lsp', '--root', root },
   filetypes = {
     'c',
     'cpp',
@@ -108,8 +71,8 @@ vim.lsp.config('bifrost', {
   },
   root_dir = root,
   init_options = {
-    roots = { 'src', 'tests' },
-    exclude = { 'target', 'vendor/generated' },
+    roots = { root .. '/src', root .. '/tests' },
+    exclude = { root .. '/target', root .. '/vendor/generated' },
   },
 })
 
@@ -123,7 +86,7 @@ Use `roots` when a repository has a small set of directories that should be inde
 If you do not always start Neovim from the workspace root, use an autocmd and `vim.lsp.start` so the Bifrost command can include the root found for each buffer:
 
 ```lua
-local bifrost = 'bifrost'
+local bifrost = 'bifrost-lsp'
 local filetypes = {
   c = true,
   cpp = true,
@@ -152,11 +115,11 @@ vim.api.nvim_create_autocmd('FileType', {
 
     vim.lsp.start({
       name = 'bifrost',
-      cmd = { bifrost, '--root', root, '--lsp' },
+      cmd = { bifrost, '--root', root },
       root_dir = root,
       init_options = {
-        roots = { 'src', 'tests' },
-        exclude = { 'target', 'vendor/generated' },
+        roots = { root .. '/src', root .. '/tests' },
+        exclude = { root .. '/target', root .. '/vendor/generated' },
       },
     }, { bufnr = args.buf })
   end,
@@ -171,10 +134,12 @@ On Neovim releases before 0.11, `vim.lsp.config` does not exist. Use [nvim-lspco
 local lspconfig = require('lspconfig')
 local configs = require('lspconfig.configs')
 
+local root = vim.fn.getcwd()
+
 if not configs.bifrost then
   configs.bifrost = {
     default_config = {
-      cmd = { 'bifrost', '--root', vim.fn.getcwd(), '--lsp' },
+      cmd = { 'bifrost-lsp', '--root', root },
       filetypes = {
         'c',
         'cpp',
@@ -194,8 +159,8 @@ if not configs.bifrost then
       },
       root_dir = lspconfig.util.root_pattern('.git'),
       init_options = {
-        roots = { 'src', 'tests' },
-        exclude = { 'target', 'vendor/generated' },
+        roots = { root .. '/src', root .. '/tests' },
+        exclude = { root .. '/target', root .. '/vendor/generated' },
       },
     },
   }
@@ -204,7 +169,7 @@ end
 lspconfig.bifrost.setup({})
 ```
 
-`root_dir` finds the Git root per buffer, but `cmd` is fixed when the server starts, so start Neovim from the workspace root or replace `vim.fn.getcwd()` with your project's absolute path. The `init_options` block is optional; drop it when you want the whole workspace indexed.
+`root_dir` finds the Git root per buffer, but `cmd` and `init_options` are fixed when the server starts. Start Neovim from the workspace root, or replace `vim.fn.getcwd()` with your project's absolute path. The `init_options` block is optional; drop it when you want the whole workspace indexed.
 
 ## Classic Vim with vim-lsp
 
@@ -216,24 +181,20 @@ function! s:bifrost_lsp_root() abort
   return empty(l:root) ? getcwd() : l:root
 endfunction
 
-if executable('bifrost')
+if executable('bifrost-lsp')
   augroup BifrostLsp
     autocmd!
     autocmd User lsp_setup call lsp#register_server({
       \ 'name': 'bifrost',
-      \ 'cmd': {server_info->['bifrost', '--root', s:bifrost_lsp_root(), '--lsp']},
+      \ 'cmd': {server_info->['bifrost-lsp', '--root', s:bifrost_lsp_root()]},
       \ 'root_uri': {server_info->lsp#utils#path_to_uri(s:bifrost_lsp_root())},
       \ 'allowlist': ['c', 'cpp', 'cs', 'go', 'java', 'javascript', 'javascriptreact', 'kotlin', 'php', 'python', 'ruby', 'rust', 'scala', 'typescript', 'typescriptreact'],
-      \ 'initialization_options': {
-      \   'roots': ['src', 'tests'],
-      \   'exclude': ['target', 'vendor/generated'],
-      \ },
       \ })
   augroup END
 endif
 ```
 
-Check the server with `:LspStatus` after opening a supported file. Remove the `initialization_options` block when you want the whole workspace indexed.
+Check the server with `:LspStatus` after opening a supported file. To limit indexing, add an `'initialization_options'` entry with absolute `roots` and `exclude` paths, as in [Large Workspaces](#large-workspaces).
 
 ## Classic Vim or Neovim with coc.nvim
 
@@ -243,24 +204,24 @@ Install [coc.nvim](https://github.com/neoclide/coc.nvim), then run `:CocConfig` 
 {
   "languageserver": {
     "bifrost": {
-      "command": "bifrost",
-      "args": ["--root", "/path/to/project", "--lsp"],
+      "command": "bifrost-lsp",
+      "args": ["--root", "/path/to/project"],
       "filetypes": ["c", "cpp", "cs", "go", "java", "javascript", "javascriptreact", "kotlin", "php", "python", "ruby", "rust", "scala", "typescript", "typescriptreact"],
       "rootPatterns": [".git"],
       "initializationOptions": {
-        "roots": ["src", "tests"],
-        "exclude": ["target", "vendor/generated"]
+        "roots": ["/path/to/project/src", "/path/to/project/tests"],
+        "exclude": ["/path/to/project/target", "/path/to/project/vendor/generated"]
       }
     }
   }
 }
 ```
 
-Replace `/path/to/project` with your workspace root. coc.nvim sends the workspace folder at initialization, so `--root` acts as the fallback there; keep it pointed at the project you open most often. The `initializationOptions` block is optional. Verify with `:CocInfo` and look for a running `bifrost` service after opening a supported file.
+Replace `/path/to/project` with your workspace root. `--root` is the fallback root; coc.nvim also sends the workspace folder at initialization. The `initializationOptions` block is optional. Verify with `:CocInfo` and look for a running `bifrost` service after opening a supported file.
 
 ## Classic Vim or Neovim with ALE
 
-[ALE](https://github.com/dense-analysis/ale) can start Bifrost as a stdio LSP linter. This configuration derives both ALE's process directory and Bifrost's fallback root from the current buffer, so it works across repositories without a project list:
+[ALE](https://github.com/dense-analysis/ale) can start `bifrost-lsp` as a stdio LSP linter. This configuration derives both ALE's process directory and Bifrost's fallback root from the current buffer, so it works across repositories without a project list:
 
 ```vim
 function! s:bifrost_root(buffer) abort
@@ -278,8 +239,8 @@ for s:ft in s:bifrost_filetypes
   call ale#linter#Define(s:ft, {
   \ 'name': 'bifrost',
   \ 'lsp': 'stdio',
-  \ 'executable': 'bifrost',
-  \ 'command': 'bifrost --root . --lsp',
+  \ 'executable': 'bifrost-lsp',
+  \ 'command': 'bifrost-lsp --root .',
   \ 'cwd': function('s:bifrost_root'),
   \ 'project_root': function('s:bifrost_root'),
   \ })
@@ -291,7 +252,7 @@ for s:ft in s:bifrost_filetypes
 endfor
 ```
 
-`project_root` finds the Git root per buffer and ALE sends it as the LSP workspace root. The `cwd` setting makes the relative `--root .` fallback resolve to that same directory. For completion, also set `let g:ale_completion_enabled = 1`, `let g:ale_completion_timeout = 10`, and `set omnifunc=ale#completion#OmniFunc`; trigger it manually with `CTRL-X CTRL-O` if your Vim does not show automatic suggestions. The longer timeout allows Bifrost's initial workspace index to finish before ALE gives up. Bifrost's current completion support is intentionally limited to simple identifier prefixes; completion after `.` or `::` is not supported yet. Navigation uses ALE's LSP commands, such as `:ALEGoToDefinition`, `:ALEFindReferences`, and `:ALEHover`.
+`project_root` finds the Git root per buffer and ALE sends it as the LSP workspace root. The `cwd` setting makes the relative `--root .` fallback resolve to that same directory. For completion, also set `let g:ale_completion_enabled = 1`, `let g:ale_completion_timeout = 10`, and `set omnifunc=ale#completion#OmniFunc`; trigger it manually with `CTRL-X CTRL-O` if your Vim does not show automatic suggestions. The longer timeout lets the first workspace index finish before ALE gives up. Navigation uses ALE's LSP commands, such as `:ALEGoToDefinition`, `:ALEFindReferences`, and `:ALEHover`.
 
 ## Confirm Bifrost Is Running
 

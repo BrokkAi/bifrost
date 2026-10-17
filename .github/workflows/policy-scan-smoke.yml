@@ -6,8 +6,8 @@ name: policy-scan-smoke
 # fixtures at run time into an untracked directory instead.
 
 # Leg B asserts that a planted finding trips the action's default gate. The
-# v0.13 core uses an explicit host-authored rule after verifying its empty
-# catalog; legacy engines retain bifrost.code-smells. The pack is in the path
+# core without rules uses an explicit host-authored rule after verifying its
+# empty catalog; legacy engines retain bifrost.code-smells. The pack is in the path
 # filter because a severity
 # demotion is exactly what silently turns leg B into a no-op: #2641 moved the
 # *-in-loop family to note, the planted fixture stopped gating, and nothing
@@ -17,12 +17,16 @@ on:
     paths:
       - .github/actions/policy-scan/**
       - .github/workflows/policy-scan-smoke.yml
+      - scripts/public/policy-sarif-catalog.test.mjs
+      - crates/bifrost-semantic-packs/src/prepared_registry.rs
       - crates/bifrost-policy/policy-packs/**
   push:
     branches: [master]
     paths:
       - .github/actions/policy-scan/**
       - .github/workflows/policy-scan-smoke.yml
+      - scripts/public/policy-sarif-catalog.test.mjs
+      - crates/bifrost-semantic-packs/src/prepared_registry.rs
       - crates/bifrost-policy/policy-packs/**
   schedule:
     # Sunday 04:17 UTC, off peak.
@@ -39,6 +43,12 @@ concurrency:
 jobs:
   smoke:
     name: policy action (${{ matrix.os }})
+    # Public contributors use ordinary PR CI; private sources use merge batches.
+    if: >-
+      github.event_name != 'pull_request' || !github.event.repository.private ||
+      (github.event.pull_request.user.login == 'mergemarshall[bot]' &&
+       startsWith(github.head_ref, 'mergemarshall/batch-') &&
+       github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     strategy:
@@ -75,7 +85,26 @@ jobs:
           node-version: 22
 
       - name: Build the policy runner
-        run: cargo build --locked --bin bifrost
+        run: >-
+          cargo build --locked --bin bifrost --bin bifrost-semantic-pack
+          -p brokk-bifrost -p brokk-bifrost-semantic-packs
+          --features brokk-bifrost-semantic-packs/release-tooling
+
+      - name: Verify complete prepared semantic selection
+        env:
+          BIFROST_PARALLELISM: 1
+          RAYON_NUM_THREADS: 1
+          JAVA_HOME: ''
+          BIFROST_OPEN_PACKS_DISABLE: '1'
+        run: >-
+          cargo test --locked --lib -p brokk-bifrost-semantic-packs
+          --features release-tooling prepared_registry
+
+      - name: Verify acquired host catalog against the actual engine
+        shell: bash
+        env:
+          BIFROST_BIN: ${{ github.workspace }}/target/debug/bifrost
+        run: node --test scripts/public/policy-sarif-catalog.test.mjs
 
       - name: Write the fixtures
         shell: bash
@@ -112,11 +141,12 @@ jobs:
           }
           EOF
 
-      - name: Select the version-bound host rule source
+      - name: Select the catalog-bound host rule source
         id: rule-source
         shell: bash
         run: |
           node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
           import { execFile } from 'node:child_process';
           import fs from 'node:fs/promises';
           import path from 'node:path';
@@ -124,7 +154,14 @@ jobs:
           const execute = promisify(execFile);
           const binary = path.resolve('target/debug', process.platform === 'win32' ? 'bifrost.exe' : 'bifrost');
           const { stdout: version } = await execute(binary, ['--version']);
-          const coreWithoutRules = /^bifrost 0\.13\.0(?:\s|$)/u.test(version);
+          // Authoring branches may remove rules before the release version bump.
+          const env = { ...process.env };
+          delete env.BIFROST_OPEN_POLICY_PACK_ROOT;
+          const { stdout: catalogJson } = await execute(binary, ['scan', '--list-builtin-policies'], { env });
+          const catalog = JSON.parse(catalogJson);
+          assert.equal(catalog.schema_version, 2);
+          assert.ok(Array.isArray(catalog.packs), 'policy catalog has no packs array');
+          const coreWithoutRules = /^bifrost 0\.13\.0(?:\s|$)/u.test(version) || catalog.packs.length === 0;
           await fs.appendFile(process.env.GITHUB_OUTPUT, `core_without_rules=${coreWithoutRules}\n`);
           let packs = 'bifrost.code-smells';
           let files = '';

@@ -5,8 +5,8 @@ use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::rust_facts::RUST_OCCURRENCE_MACRO;
 use brokk_bifrost_core::analyzer::rust_facts::{
-    RustDeclarationBoundary, RustDeclarationKind, RustSourceContextKind,
-    RustValueConstructorProperties,
+    RustDeclarationBoundary, RustDeclarationKind, RustImplSourceFact, RustSourceContextKind,
+    RustTypeSourceFact, RustValueConstructorProperties,
 };
 use brokk_bifrost_core::analyzer::structural::rewrite_path::{
     ALIAS_SUBSTITUTION_RULE, RewriteOutcome, RewriteStep, RewriteTrace,
@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tree_sitter::Node;
 
+use crate::cargo_manifest::normalize_crate_name;
 use crate::cargo_routes::{RustCargoRouteIndex, RustCargoTargetRelation};
 use crate::crate_naming;
 use crate::declarations::{rust_node_text, rust_package_name};
@@ -246,6 +247,7 @@ pub trait RustSource:
 
     /// Exact declaration candidates before display-oriented module deduplication.
     /// Cargo targets may share a module name and must be disambiguated afterward.
+    #[track_caller]
     fn declaration_candidates_by_fqn_while(
         &self,
         fq_name: &str,
@@ -285,7 +287,11 @@ pub trait RustSource:
         keep_going: &dyn Fn() -> bool,
     ) -> Result<Arc<RustCargoRouteIndex>, RustCargoRouteError>;
 
-    fn package_file_index(&self) -> Arc<RustPackageFileIndex>;
+    fn package_file_index_while(
+        &self,
+        token: QueryToken<'_>,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Result<Arc<RustPackageFileIndex>, RustCargoRouteError>;
 
     fn import_binder_of(&self, file: &ProjectFile) -> ImportBinder;
 
@@ -875,6 +881,7 @@ impl<'a> RustReferenceContext<'a> {
             if is_rooted_rust_module_path(path)
                 && let Some(shared) = resolve_target_kind_root_module_with_progress(
                     self.rust,
+                    self.token,
                     &self.file,
                     &resolved,
                     Some(&*self.keep_going),
@@ -1161,7 +1168,7 @@ pub fn forward_reference_context_of<'a>(
     token: QueryToken<'a>,
     file: &ProjectFile,
 ) -> RustReferenceContext<'a> {
-    RustReferenceContext::new(rust, token, file, true, Box::new(|| true))
+    forward_reference_context_of_while(rust, token, file, || true)
 }
 
 pub fn forward_reference_context_of_while<'a>(
@@ -1173,12 +1180,8 @@ pub fn forward_reference_context_of_while<'a>(
     RustReferenceContext::new(rust, token, file, true, Box::new(keep_going))
 }
 
-fn join_rust_fqn(package: &str, name: &str) -> String {
-    if package.is_empty() {
-        name.to_string()
-    } else {
-        format!("{package}.{name}")
-    }
+pub(crate) fn join_rust_fqn(package: &str, name: &str) -> String {
+    brokk_bifrost_core::analyzer::common::qualify_dotted_name(package, name)
 }
 
 /// The analyzed Rust files bucketed by their path-derived package name — the
@@ -1196,32 +1199,56 @@ fn join_rust_fqn(package: &str, name: &str) -> String {
 /// what a resolution answers.
 #[derive(Debug, Default)]
 pub struct RustPackageFileIndex {
-    /// Every analyzed file, in `get_analyzed_files` (sorted) order so membership
-    /// is a binary search rather than a second owned copy of each file.
     files: Vec<ProjectFile>,
-    /// Package name -> indices into `files`, ascending.
     by_package: HashMap<String, Vec<u32>>,
-    /// Import crate name -> root package names, from nearby Cargo manifests.
     crate_packages_by_name: HashMap<String, Vec<String>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct RustPackageFileRow {
+    pub file: ProjectFile,
+    pub package_components: Vec<String>,
+    pub crate_name: String,
+    pub target_kind: String,
+    pub is_root_member: bool,
+}
+
 impl RustPackageFileIndex {
-    pub fn build(files: BTreeSet<ProjectFile>) -> Self {
-        let files: Vec<ProjectFile> = files.into_iter().collect();
-        let mut by_package: HashMap<String, Vec<u32>> = HashMap::default();
+    pub fn from_summary_rows(rows: Vec<RustPackageFileRow>) -> Self {
+        let mut package_by_file: HashMap<ProjectFile, Vec<String>> = HashMap::default();
         let mut crate_packages_by_name: HashMap<String, Vec<String>> = HashMap::default();
-        for (index, file) in files.iter().enumerate() {
-            let package = rust_package_name(file);
-            by_package
-                .entry(package.clone())
-                .or_default()
-                .push(u32::try_from(index).unwrap_or(u32::MAX));
-            if let Some(crate_name) = manifest_crate_name(file) {
-                let packages = crate_packages_by_name.entry(crate_name).or_default();
+        for row in rows {
+            let package = row.package_components.join(".");
+            if let Some(previous) = package_by_file.get(&row.file) {
+                assert_eq!(
+                    previous, &row.package_components,
+                    "live Rust summaries agree on package naming for {:?}",
+                    row.file
+                );
+            } else {
+                package_by_file.insert(row.file.clone(), row.package_components);
+            }
+            if row.is_root_member && matches!(row.target_kind.as_str(), "lib" | "bin") {
+                let packages = crate_packages_by_name
+                    .entry(normalize_crate_name(&row.crate_name))
+                    .or_default();
                 if !packages.contains(&package) {
                     packages.push(package);
                 }
             }
+        }
+        let mut files = package_by_file.keys().cloned().collect::<Vec<_>>();
+        files.sort();
+        let mut by_package: HashMap<String, Vec<u32>> = HashMap::default();
+        for (index, file) in files.iter().enumerate() {
+            let package = package_by_file
+                .get(file)
+                .expect("every file key retains its package components")
+                .join(".");
+            by_package
+                .entry(package)
+                .or_default()
+                .push(u32::try_from(index).expect("Rust file index fits u32"));
         }
         Self {
             files,
@@ -1248,36 +1275,6 @@ impl RustPackageFileIndex {
             .map(Vec::as_slice)
             .unwrap_or_default()
     }
-}
-
-fn manifest_crate_name(file: &ProjectFile) -> Option<String> {
-    let rel_path = file.rel_path();
-    if !matches!(
-        rel_path.file_name().and_then(|name| name.to_str()),
-        Some("lib.rs" | "main.rs")
-    ) {
-        return None;
-    }
-    let source_dir = rel_path.parent()?;
-    if source_dir.file_name().and_then(|name| name.to_str()) != Some("src") {
-        return None;
-    }
-    let manifest =
-        std::fs::read_to_string(file.root().join(source_dir.parent()?.join("Cargo.toml")))
-            .ok()?
-            .parse::<toml::Value>()
-            .ok()?;
-    let name = manifest
-        .get("lib")
-        .and_then(|lib| lib.get("name"))
-        .and_then(toml::Value::as_str)
-        .or_else(|| {
-            manifest
-                .get("package")
-                .and_then(|package| package.get("name"))
-                .and_then(toml::Value::as_str)
-        })?;
-    Some(name.replace('-', "_"))
 }
 
 fn single_reexport_target_fqn(
@@ -1318,7 +1315,7 @@ fn single_rust_target_fqn(
     Ok((fq_names.len() == 1).then(|| fq_names.remove(0)))
 }
 
-fn is_rooted_rust_module_path(path: &str) -> bool {
+pub fn is_rooted_rust_module_path(path: &str) -> bool {
     path == "crate"
         || path == "self"
         || path == "super"
@@ -1990,107 +1987,21 @@ fn resolve_import_alias_exported_module_package_with_progress(
     aliased_specifier: &str,
     progress: Option<&dyn Fn() -> bool>,
 ) -> ReferenceContextResult<Option<String>> {
-    route_progress_checkpoint(progress)?;
-    let segments = parse_symbol_path(Language::Rust, aliased_specifier);
-    let Some((root, suffix)) = segments.split_first() else {
-        return Ok(None);
-    };
-    let Some(suffix) = (!suffix.is_empty()).then_some(suffix) else {
-        return Ok(None);
-    };
-    if rust_apply_import_alias(rust, importing_file, root).is_some() {
-        return Ok(None);
+    let always = || true;
+    let package_files = rust.package_file_index_while(token, progress.unwrap_or(&always))?;
+    match run_module_resolution(
+        rust,
+        token,
+        &package_files,
+        ModuleResolutionTask::AliasPackage {
+            importing_file: importing_file.clone(),
+            module_specifier: aliased_specifier.to_string(),
+        },
+        progress,
+    )? {
+        ModuleResolutionValue::Package(package) => Ok(package),
+        _ => unreachable!("alias package resolution returns a package result"),
     }
-    let mut files =
-        resolve_module_files_with_progress(rust, token, importing_file, root, progress)?;
-    if files.is_empty() {
-        return Ok(None);
-    }
-    let mut package = None;
-    for segment in suffix {
-        route_progress_checkpoint(progress)?;
-        let Some(target) =
-            forward_exported_module_fqn_with_progress(rust, token, &files, segment, progress)?
-        else {
-            return Ok(None);
-        };
-        package = Some(target.clone());
-        files = resolve_module_files_with_progress(rust, token, importing_file, &target, progress)?;
-        if files.is_empty() {
-            return Ok(None);
-        }
-    }
-    Ok(package)
-}
-
-fn forward_exported_module_fqn_with_progress(
-    rust: &dyn RustSource,
-    token: QueryToken<'_>,
-    module_files: &[ProjectFile],
-    name: &str,
-    progress: Option<&dyn Fn() -> bool>,
-) -> ReferenceContextResult<Option<String>> {
-    let mut pending = module_files
-        .iter()
-        .cloned()
-        .map(|file| (file, name.to_string(), false))
-        .collect::<Vec<_>>();
-    let mut visited = HashSet::default();
-    let mut targets = BTreeSet::new();
-    while let Some((file, name, reached_through_reexport)) = pending.pop() {
-        route_progress_checkpoint(progress)?;
-        if !visited.insert((file.clone(), name.clone(), reached_through_reexport)) {
-            continue;
-        }
-        let export_index = match progress {
-            Some(progress) => rust.export_index_of_while(&file, progress)?,
-            None => rust.export_index_of(&file)?,
-        };
-        match export_index.exports_by_name.get(&name) {
-            Some(ExportEntry::Local { local_name }) => {
-                targets.extend(
-                    rust.definitions(&format!("{}.{}", rust_package_name(&file), local_name))
-                        .filter(|unit| unit.is_module())
-                        .map(|unit| unit.fq_name()),
-                );
-            }
-            Some(ExportEntry::ReexportedNamed {
-                module_specifier,
-                imported_name,
-            }) => {
-                pending.extend(
-                    resolve_module_files_with_progress(
-                        rust,
-                        token,
-                        &file,
-                        module_specifier,
-                        progress,
-                    )?
-                    .into_iter()
-                    .map(|target| (target, imported_name.clone(), true)),
-                );
-            }
-            Some(ExportEntry::Default { .. } | ExportEntry::ReexportedModule { .. }) => {}
-            None if reached_through_reexport => {
-                targets.extend(
-                    rust.definitions(&format!("{}.{}", rust_package_name(&file), name))
-                        .filter(|unit| unit.is_module())
-                        .map(|unit| unit.fq_name()),
-                );
-            }
-            None => {}
-        }
-        for ReexportStar { module_specifier } in &export_index.reexport_stars {
-            pending.extend(
-                resolve_module_files_with_progress(rust, token, &file, module_specifier, progress)?
-                    .into_iter()
-                    .map(|target| (target, name.clone(), true)),
-            );
-        }
-    }
-    Ok((targets.len() == 1)
-        .then(|| targets.into_iter().next())
-        .flatten())
 }
 
 /// Resolve one export name after the caller has resolved the module files.
@@ -2177,79 +2088,20 @@ fn forward_exported_targets_from_files_with_progress(
     export_name: &str,
     progress: &dyn Fn() -> bool,
 ) -> ReferenceContextResult<BTreeSet<(ProjectFile, String)>> {
-    let mut targets = BTreeSet::new();
-    let mut visited = HashSet::default();
-    let mut pending: Vec<_> = module_files
-        .iter()
-        .cloned()
-        .map(|file| (file, export_name.to_string(), false))
-        .collect();
-    while let Some((file, name, reached_through_reexport)) = pending.pop() {
-        reference_context_checkpoint(progress)?;
-        if !visited.insert((file.clone(), name.clone(), reached_through_reexport)) {
-            continue;
-        }
-        let index = rust.export_index_of_while(&file, progress)?;
-        match index.exports_by_name.get(&name) {
-            Some(ExportEntry::Local { local_name }) => {
-                targets.insert((file.clone(), local_name.clone()));
-            }
-            Some(ExportEntry::ReexportedNamed {
-                module_specifier,
-                imported_name,
-            }) => {
-                let module_files =
-                    resolve_module_files_while(rust, token, &file, module_specifier, progress)?;
-                if module_files.is_empty() {
-                    targets.extend(rust_member_reexport_targets_while(
-                        rust,
-                        token,
-                        &file,
-                        module_specifier,
-                        imported_name,
-                        progress,
-                    )?);
-                } else {
-                    pending.extend(
-                        module_files
-                            .into_iter()
-                            .map(|target_file| (target_file, imported_name.clone(), true)),
-                    );
-                }
-            }
-            Some(ExportEntry::Default {
-                local_name: Some(local_name),
-            }) => {
-                targets.insert((file.clone(), local_name.clone()));
-            }
-            Some(ExportEntry::Default { local_name: None })
-            | Some(ExportEntry::ReexportedModule { .. }) => {}
-            None if reached_through_reexport => {
-                let properties = declaration_source_properties_while(rust, &file, progress)?;
-                for unit in rust.declarations(&file) {
-                    reference_context_checkpoint(progress)?;
-                    if unit.identifier() == name {
-                        let rows = properties
-                            .get(&unit)
-                            .ok_or(RustCargoRouteError::Unavailable)?;
-                        if declaration_properties_are_export_visible(rows, progress)? {
-                            targets.insert((file.clone(), unit.identifier().to_string()));
-                        }
-                    }
-                }
-            }
-            None => {}
-        }
-        for star in &index.reexport_stars {
-            pending.extend(
-                resolve_module_files_while(rust, token, &file, &star.module_specifier, progress)?
-                    .into_iter()
-                    .map(|target_file| (target_file, name.clone(), true)),
-            );
-        }
+    let package_files = rust.package_file_index_while(token, progress)?;
+    match run_module_resolution(
+        rust,
+        token,
+        &package_files,
+        ModuleResolutionTask::ForwardTargets {
+            module_files: module_files.to_vec(),
+            name: export_name.to_string(),
+        },
+        Some(progress),
+    )? {
+        ModuleResolutionValue::Targets(targets) => Ok(targets),
+        _ => unreachable!("forward export walk returns targets"),
     }
-    reference_context_checkpoint(progress)?;
-    Ok(targets)
 }
 
 pub fn rust_member_reexport_targets(
@@ -2259,19 +2111,7 @@ pub fn rust_member_reexport_targets(
     owner_path: &str,
     member_name: &str,
 ) -> ReferenceContextResult<BTreeSet<(ProjectFile, String)>> {
-    let Some(owner_fqn) = resolve_module_package(rust, token, file, owner_path)? else {
-        return Ok(BTreeSet::new());
-    };
-    let target_fqn = join_rust_fqn(&owner_fqn, member_name);
-    Ok(rust
-        .definitions(&target_fqn)
-        .map(|candidate| {
-            (
-                candidate.source().clone(),
-                candidate.identifier().to_string(),
-            )
-        })
-        .collect())
+    rust_member_reexport_targets_while(rust, token, file, owner_path, member_name, &|| true)
 }
 
 fn rust_member_reexport_targets_while(
@@ -2380,115 +2220,34 @@ fn resolve_module_files_with_progress(
     module_specifier: &str,
     progress: Option<&dyn Fn() -> bool>,
 ) -> ReferenceContextResult<Vec<ProjectFile>> {
-    route_progress_checkpoint(progress)?;
-    rust.note_module_file_resolution();
-    let analyzed_files = rust.package_file_index();
-    let package = rust_package_name(importing_file);
-    let crate_package = rust_crate_root_package(importing_file);
-    let rooted = is_rooted_rust_module_path(module_specifier);
-    // Keep the local declaration witness through file selection. Independent
-    // Cargo targets can have the same rendered package/module name.
-    let declared_local_module = if rooted {
-        None
-    } else {
-        resolve_declared_local_module_package_with_progress(
-            rust,
-            importing_file,
-            module_specifier,
-            progress,
-        )?
-    };
-    let local_target = rooted || declared_local_module.is_some();
-    let Some(mut resolved_module) = (if rooted {
-        resolve_rust_module_path_with_crate(&package, &crate_package, module_specifier)
-    } else if let Some(module) = declared_local_module {
-        Some(module)
-    } else {
-        resolve_module_package_traced_with_progress(
-            rust,
-            token,
-            importing_file,
-            module_specifier,
-            None,
-            progress,
-        )?
-    }) else {
-        return Ok(rust_module_files_from_path(
-            importing_file,
-            module_specifier,
-        ));
-    };
-
-    let mut files =
-        resolved_module_files_with_progress(rust, importing_file, &resolved_module, progress)?;
-    if !rooted
-        && files.is_empty()
-        && let Some(root_file) = cargo_routes_for_progress(rust, progress)?
-            .resolve_crate_root_file(importing_file, module_specifier)
-        && analyzed_files.contains(&root_file)
-    {
-        files.push(root_file);
+    let always = || true;
+    let package_files = rust.package_file_index_while(token, progress.unwrap_or(&always))?;
+    match run_module_resolution(
+        rust,
+        token,
+        &package_files,
+        ModuleResolutionTask::Files {
+            importing_file: importing_file.clone(),
+            module_specifier: module_specifier.to_string(),
+        },
+        progress,
+    )? {
+        ModuleResolutionValue::Files(files) => Ok(files),
+        _ => unreachable!("module-file resolution returns a file result"),
     }
-    files.extend(rust_module_files_from_path(
-        importing_file,
-        module_specifier,
-    ));
-    files.sort();
-    files.dedup();
-
-    // A crate-root path can name a module re-exported by the crate facade
-    // rather than a physical child of that crate. `crate::api` in a facade
-    // that says `pub use engine::api` is one namespace with the physical
-    // `engine::api`; treating the path-derived `facade.api` spelling as final
-    // reports an indexed workspace target as an external boundary. Follow the
-    // crate root's structured export graph only after the ordinary physical
-    // route misses, so a real local module keeps Rust's normal precedence.
-    if files.is_empty()
-        && let Some(exported_module) = resolve_exported_module_package(
-            rust,
-            token,
-            importing_file,
-            module_specifier,
-            progress,
-        )?
-    {
-        resolved_module = exported_module;
-        files =
-            resolved_module_files_with_progress(rust, importing_file, &resolved_module, progress)?;
-    }
-
-    // Path-derived Rust package names are shared by independent Cargo
-    // examples, benches, and binaries. Rooted and declared local paths are crate-relative, so
-    // only disambiguate when the package lookup actually collided: retain
-    // physically shared targets when known, otherwise preserve unknown
-    // relationships conservatively, and never cross a proven-disjoint root.
-    if local_target && files.len() > 1 {
-        let routes = cargo_routes_for_progress(rust, progress)?;
-        let mut shared = Vec::new();
-        let mut unknown = Vec::new();
-        for candidate in files {
-            route_progress_checkpoint(progress)?;
-            match routes.target_relation(importing_file, &candidate) {
-                RustCargoTargetRelation::Shared => shared.push(candidate),
-                RustCargoTargetRelation::Unknown => unknown.push(candidate),
-                RustCargoTargetRelation::Disjoint => {}
-            }
-        }
-        return Ok(if shared.is_empty() { unknown } else { shared });
-    }
-    Ok(files)
 }
 
 fn resolved_module_files_with_progress(
     rust: &dyn RustSource,
+    _token: QueryToken<'_>,
+    package_files: &RustPackageFileIndex,
     importing_file: &ProjectFile,
     resolved_module: &str,
     progress: Option<&dyn Fn() -> bool>,
 ) -> ReferenceContextResult<Vec<ProjectFile>> {
     route_progress_checkpoint(progress)?;
-    let analyzed_files = rust.package_file_index();
     let mut files = Vec::new();
-    for file in analyzed_files.files_in_package(resolved_module) {
+    for file in package_files.files_in_package(resolved_module) {
         route_progress_checkpoint(progress)?;
         files.push(file.clone());
     }
@@ -2514,6 +2273,1004 @@ fn resolved_module_files_with_progress(
     Ok(files)
 }
 
+enum ModuleResolutionTask {
+    Files {
+        importing_file: ProjectFile,
+        module_specifier: String,
+    },
+    ExportedPackage {
+        importing_file: ProjectFile,
+        module_specifier: String,
+    },
+    AliasPackage {
+        importing_file: ProjectFile,
+        module_specifier: String,
+    },
+    ForwardFqn {
+        module_files: Vec<ProjectFile>,
+        name: String,
+    },
+    ForwardTargets {
+        module_files: Vec<ProjectFile>,
+        name: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum ModuleResolutionTaskKey {
+    Files {
+        importing_file: ProjectFile,
+        module_specifier: String,
+    },
+    ExportedPackage {
+        importing_file: ProjectFile,
+        module_specifier: String,
+    },
+    AliasPackage {
+        importing_file: ProjectFile,
+        module_specifier: String,
+    },
+    ForwardFqn {
+        module_files: Vec<ProjectFile>,
+        name: String,
+    },
+    ForwardTargets {
+        module_files: Vec<ProjectFile>,
+        name: String,
+    },
+}
+
+impl ModuleResolutionTask {
+    fn key(&self) -> ModuleResolutionTaskKey {
+        match self {
+            Self::Files {
+                importing_file,
+                module_specifier,
+            } => ModuleResolutionTaskKey::Files {
+                importing_file: importing_file.clone(),
+                module_specifier: module_specifier.clone(),
+            },
+            Self::ExportedPackage {
+                importing_file,
+                module_specifier,
+            } => ModuleResolutionTaskKey::ExportedPackage {
+                importing_file: importing_file.clone(),
+                module_specifier: module_specifier.clone(),
+            },
+            Self::AliasPackage {
+                importing_file,
+                module_specifier,
+            } => ModuleResolutionTaskKey::AliasPackage {
+                importing_file: importing_file.clone(),
+                module_specifier: module_specifier.clone(),
+            },
+            Self::ForwardFqn { module_files, name } => {
+                let mut module_files = module_files.clone();
+                module_files.sort();
+                module_files.dedup();
+                ModuleResolutionTaskKey::ForwardFqn {
+                    module_files,
+                    name: name.clone(),
+                }
+            }
+            Self::ForwardTargets { module_files, name } => {
+                let mut module_files = module_files.clone();
+                module_files.sort();
+                module_files.dedup();
+                ModuleResolutionTaskKey::ForwardTargets {
+                    module_files,
+                    name: name.clone(),
+                }
+            }
+        }
+    }
+
+    fn cycle_value(&self) -> ModuleResolutionValue {
+        match self {
+            Self::Files { .. } => ModuleResolutionValue::Files(Vec::new()),
+            Self::ExportedPackage { .. } | Self::AliasPackage { .. } => {
+                ModuleResolutionValue::Package(None)
+            }
+            Self::ForwardFqn { .. } => ModuleResolutionValue::Fqn(None),
+            Self::ForwardTargets { .. } => ModuleResolutionValue::Targets(BTreeSet::new()),
+        }
+    }
+}
+
+#[derive(Clone)]
+enum ModuleResolutionValue {
+    Files(Vec<ProjectFile>),
+    Package(Option<String>),
+    Fqn(Option<String>),
+    Targets(BTreeSet<(ProjectFile, String)>),
+}
+
+enum ModuleResolutionAction {
+    Continue,
+    Push(ModuleResolutionTask),
+    Complete(ModuleResolutionValue),
+}
+
+enum ModuleResolutionFrame {
+    Files(ResolveModuleFilesFrame),
+    ExportedPackage(ExportedModulePackageFrame),
+    AliasPackage(AliasModulePackageFrame),
+    ForwardFqn(ForwardModuleFqnFrame),
+    ForwardTargets(ForwardExportedTargetsFrame),
+}
+
+fn run_module_resolution(
+    rust: &dyn RustSource,
+    token: QueryToken<'_>,
+    package_files: &RustPackageFileIndex,
+    task: ModuleResolutionTask,
+    progress: Option<&dyn Fn() -> bool>,
+) -> ReferenceContextResult<ModuleResolutionValue> {
+    let root_key = task.key();
+    // These sets describe only this resolver query. The vector stores the
+    // active path, so a repeated active key closes a cycle and a completed key
+    // reuses its exact value; no workspace-scale state escapes this call.
+    let mut active = HashSet::from_iter([root_key.clone()]);
+    let mut completed = HashMap::default();
+    let mut frames = vec![(root_key.clone(), ModuleResolutionFrame::new(task))];
+    loop {
+        debug_assert_eq!(frames.len(), active.len());
+        let action = frames
+            .last_mut()
+            .expect("module resolution keeps a root frame until completion")
+            .1
+            .step(rust, token, package_files, progress)?;
+        match action {
+            ModuleResolutionAction::Continue => {}
+            ModuleResolutionAction::Push(task) => {
+                let key = task.key();
+                let cached = completed.get(&key).cloned();
+                let active_cycle = active.contains(&key);
+                debug_assert!(!(cached.is_some() && active_cycle));
+                if let Some(value) = cached {
+                    route_progress_checkpoint(progress)?;
+                    frames
+                        .last_mut()
+                        .expect("module resolution keeps a parent for every child request")
+                        .1
+                        .accept(value, rust, token, package_files, progress)?;
+                } else if active_cycle {
+                    route_progress_checkpoint(progress)?;
+                    frames
+                        .last_mut()
+                        .expect("module resolution keeps a parent for every child request")
+                        .1
+                        .accept(task.cycle_value(), rust, token, package_files, progress)?;
+                } else {
+                    assert!(active.insert(key.clone()));
+                    frames.push((key, ModuleResolutionFrame::new(task)));
+                }
+            }
+            ModuleResolutionAction::Complete(value) => {
+                let (key, _) = frames
+                    .pop()
+                    .expect("module resolution keeps a root frame until completion");
+                assert!(active.remove(&key));
+                let Some(parent) = frames.last_mut() else {
+                    return Ok(value);
+                };
+                assert!(completed.insert(key, value.clone()).is_none());
+                parent
+                    .1
+                    .accept(value, rust, token, package_files, progress)?;
+            }
+        }
+    }
+}
+
+impl ModuleResolutionFrame {
+    fn new(task: ModuleResolutionTask) -> Self {
+        match task {
+            ModuleResolutionTask::Files {
+                importing_file,
+                module_specifier,
+            } => Self::Files(ResolveModuleFilesFrame {
+                importing_file,
+                module_specifier,
+                stage: FilesStage::Start,
+                files: Vec::new(),
+                local_target: false,
+            }),
+            ModuleResolutionTask::ExportedPackage {
+                importing_file,
+                module_specifier,
+            } => Self::ExportedPackage(ExportedModulePackageFrame {
+                importing_file,
+                module_specifier,
+                stage: PackageStage::Start,
+                segments: Vec::new(),
+                next_segment: 0,
+                files: Vec::new(),
+                package: None,
+                _guard: None,
+            }),
+            ModuleResolutionTask::AliasPackage {
+                importing_file,
+                module_specifier,
+            } => Self::AliasPackage(AliasModulePackageFrame {
+                importing_file,
+                module_specifier,
+                stage: AliasPackageStage::Start,
+                root: String::new(),
+                suffix: Vec::new(),
+                next_segment: 0,
+                files: Vec::new(),
+                package: None,
+            }),
+            ModuleResolutionTask::ForwardFqn { module_files, name } => {
+                Self::ForwardFqn(ForwardModuleFqnFrame {
+                    pending: module_files
+                        .into_iter()
+                        .map(|file| (file, name.clone(), false))
+                        .collect(),
+                    visited: HashSet::default(),
+                    targets: BTreeSet::new(),
+                    child_requests: Vec::new(),
+                    child_results: Vec::new(),
+                    awaiting: None,
+                })
+            }
+            ModuleResolutionTask::ForwardTargets { module_files, name } => {
+                Self::ForwardTargets(ForwardExportedTargetsFrame {
+                    pending: module_files
+                        .into_iter()
+                        .map(|file| (file, name.clone(), false))
+                        .collect(),
+                    visited: HashSet::default(),
+                    targets: BTreeSet::new(),
+                    child_requests: Vec::new(),
+                    child_results: Vec::new(),
+                    awaiting: None,
+                })
+            }
+        }
+    }
+
+    fn step(
+        &mut self,
+        rust: &dyn RustSource,
+        token: QueryToken<'_>,
+        package_files: &RustPackageFileIndex,
+        progress: Option<&dyn Fn() -> bool>,
+    ) -> ReferenceContextResult<ModuleResolutionAction> {
+        match self {
+            Self::Files(frame) => frame.step(rust, token, package_files, progress),
+            Self::ExportedPackage(frame) => frame.step(rust, token, package_files, progress),
+            Self::AliasPackage(frame) => frame.step(rust, token, progress),
+            Self::ForwardFqn(frame) => frame.step(rust, token, progress),
+            Self::ForwardTargets(frame) => frame.step(rust, token, progress),
+        }
+    }
+
+    fn accept(
+        &mut self,
+        value: ModuleResolutionValue,
+        rust: &dyn RustSource,
+        token: QueryToken<'_>,
+        package_files: &RustPackageFileIndex,
+        progress: Option<&dyn Fn() -> bool>,
+    ) -> ReferenceContextResult<()> {
+        match self {
+            Self::Files(frame) => frame.accept(value, rust, token, package_files, progress),
+            Self::ExportedPackage(frame) => {
+                frame.accept(value, rust, token, package_files, progress)
+            }
+            Self::AliasPackage(frame) => frame.accept(value),
+            Self::ForwardFqn(frame) => frame.accept(value),
+            Self::ForwardTargets(frame) => frame.accept(value, rust, token, progress),
+        }
+    }
+}
+
+enum FilesStage {
+    Start,
+    AwaitExport,
+    Finalize,
+}
+
+struct ResolveModuleFilesFrame {
+    importing_file: ProjectFile,
+    module_specifier: String,
+    stage: FilesStage,
+    files: Vec<ProjectFile>,
+    local_target: bool,
+}
+
+impl ResolveModuleFilesFrame {
+    fn step(
+        &mut self,
+        rust: &dyn RustSource,
+        token: QueryToken<'_>,
+        package_files: &RustPackageFileIndex,
+        progress: Option<&dyn Fn() -> bool>,
+    ) -> ReferenceContextResult<ModuleResolutionAction> {
+        match self.stage {
+            FilesStage::Start => {
+                let direct = resolve_module_files_direct_with_progress(
+                    rust,
+                    token,
+                    package_files,
+                    &self.importing_file,
+                    &self.module_specifier,
+                    progress,
+                )?;
+                self.files = direct.files;
+                self.local_target = direct.local_target;
+                if direct.follow_exports {
+                    self.stage = FilesStage::AwaitExport;
+                    Ok(ModuleResolutionAction::Push(
+                        ModuleResolutionTask::ExportedPackage {
+                            importing_file: self.importing_file.clone(),
+                            module_specifier: self.module_specifier.clone(),
+                        },
+                    ))
+                } else {
+                    self.stage = FilesStage::Finalize;
+                    Ok(ModuleResolutionAction::Continue)
+                }
+            }
+            FilesStage::AwaitExport => {
+                unreachable!("an exported package child must complete before its parent steps")
+            }
+            FilesStage::Finalize => Ok(ModuleResolutionAction::Complete(
+                ModuleResolutionValue::Files(disambiguate_local_module_files(
+                    rust,
+                    &self.importing_file,
+                    std::mem::take(&mut self.files),
+                    self.local_target,
+                    progress,
+                )?),
+            )),
+        }
+    }
+
+    fn accept(
+        &mut self,
+        value: ModuleResolutionValue,
+        rust: &dyn RustSource,
+        token: QueryToken<'_>,
+        package_files: &RustPackageFileIndex,
+        progress: Option<&dyn Fn() -> bool>,
+    ) -> ReferenceContextResult<()> {
+        assert!(matches!(self.stage, FilesStage::AwaitExport));
+        let ModuleResolutionValue::Package(package) = value else {
+            unreachable!("module file fallback receives an exported package result")
+        };
+        if let Some(package) = package {
+            self.files = resolved_module_files_with_progress(
+                rust,
+                token,
+                package_files,
+                &self.importing_file,
+                &package,
+                progress,
+            )?;
+        }
+        self.stage = FilesStage::Finalize;
+        Ok(())
+    }
+}
+
+struct DirectModuleFiles {
+    files: Vec<ProjectFile>,
+    local_target: bool,
+    follow_exports: bool,
+}
+
+fn resolve_module_files_direct_with_progress(
+    rust: &dyn RustSource,
+    token: QueryToken<'_>,
+    package_files: &RustPackageFileIndex,
+    importing_file: &ProjectFile,
+    module_specifier: &str,
+    progress: Option<&dyn Fn() -> bool>,
+) -> ReferenceContextResult<DirectModuleFiles> {
+    route_progress_checkpoint(progress)?;
+    rust.note_module_file_resolution();
+    let package = rust_package_name(importing_file);
+    let crate_package = rust_crate_root_package(importing_file);
+    let rooted = is_rooted_rust_module_path(module_specifier);
+    let declared_local_module = if rooted {
+        None
+    } else {
+        resolve_declared_local_module_package_with_progress(
+            rust,
+            importing_file,
+            module_specifier,
+            progress,
+        )?
+    };
+    let local_target = rooted || declared_local_module.is_some();
+    let Some(resolved_module) = (if rooted {
+        resolve_rust_module_path_with_crate(&package, &crate_package, module_specifier)
+    } else if let Some(module) = declared_local_module {
+        Some(module)
+    } else {
+        resolve_module_package_traced_with_progress(
+            rust,
+            token,
+            importing_file,
+            module_specifier,
+            None,
+            progress,
+        )?
+    }) else {
+        return Ok(DirectModuleFiles {
+            files: rust_module_files_from_path(importing_file, module_specifier),
+            local_target: false,
+            follow_exports: false,
+        });
+    };
+
+    let mut files = resolved_module_files_with_progress(
+        rust,
+        token,
+        package_files,
+        importing_file,
+        &resolved_module,
+        progress,
+    )?;
+    if !rooted
+        && files.is_empty()
+        && let Some(root_file) = cargo_routes_for_progress(rust, progress)?
+            .resolve_crate_root_file(importing_file, module_specifier)
+        && package_files.contains(&root_file)
+    {
+        files.push(root_file);
+    }
+    files.extend(rust_module_files_from_path(
+        importing_file,
+        module_specifier,
+    ));
+    files.sort();
+    files.dedup();
+    let follow_exports = files.is_empty();
+    Ok(DirectModuleFiles {
+        files,
+        local_target,
+        follow_exports,
+    })
+}
+
+fn disambiguate_local_module_files(
+    rust: &dyn RustSource,
+    importing_file: &ProjectFile,
+    files: Vec<ProjectFile>,
+    local_target: bool,
+    progress: Option<&dyn Fn() -> bool>,
+) -> ReferenceContextResult<Vec<ProjectFile>> {
+    if !local_target || files.len() <= 1 {
+        return Ok(files);
+    }
+    let routes = cargo_routes_for_progress(rust, progress)?;
+    let mut shared = Vec::new();
+    let mut unknown = Vec::new();
+    for candidate in files {
+        route_progress_checkpoint(progress)?;
+        match routes.target_relation(importing_file, &candidate) {
+            RustCargoTargetRelation::Shared => shared.push(candidate),
+            RustCargoTargetRelation::Unknown => unknown.push(candidate),
+            RustCargoTargetRelation::Disjoint => {}
+        }
+    }
+    Ok(if shared.is_empty() { unknown } else { shared })
+}
+
+enum PackageStage {
+    Start,
+    Walk,
+    AwaitFqn,
+    Done(Option<String>),
+}
+
+struct ExportedModulePackageFrame {
+    importing_file: ProjectFile,
+    module_specifier: String,
+    stage: PackageStage,
+    segments: Vec<String>,
+    next_segment: usize,
+    files: Vec<ProjectFile>,
+    package: Option<String>,
+    _guard: Option<ExportedModuleWalkGuard>,
+}
+
+impl ExportedModulePackageFrame {
+    fn step(
+        &mut self,
+        rust: &dyn RustSource,
+        _token: QueryToken<'_>,
+        _package_files: &RustPackageFileIndex,
+        progress: Option<&dyn Fn() -> bool>,
+    ) -> ReferenceContextResult<ModuleResolutionAction> {
+        match std::mem::replace(&mut self.stage, PackageStage::AwaitFqn) {
+            PackageStage::Start => {
+                route_progress_checkpoint(progress)?;
+                let segments = parse_symbol_path(Language::Rust, &self.module_specifier);
+                let Some((root, nested)) = segments.split_first() else {
+                    self.stage = PackageStage::Done(None);
+                    return Ok(ModuleResolutionAction::Continue);
+                };
+                if nested.is_empty() || matches!(root.as_str(), "self" | "super") {
+                    self.stage = PackageStage::Done(None);
+                    return Ok(ModuleResolutionAction::Continue);
+                }
+                self.files = if root == "crate" {
+                    let mut roots = cargo_routes_for_progress(rust, progress)?
+                        .target_roots_for_file(&self.importing_file);
+                    if roots.is_empty()
+                        && rust.is_analyzed(&self.importing_file)
+                        && rust_package_name(&self.importing_file)
+                            == rust_crate_root_package(&self.importing_file)
+                    {
+                        roots.push(self.importing_file.clone());
+                    }
+                    roots
+                } else {
+                    let Some(root_file) = cargo_routes_for_progress(rust, progress)?
+                        .resolve_crate_root_file(&self.importing_file, root)
+                    else {
+                        self.stage = PackageStage::Done(None);
+                        return Ok(ModuleResolutionAction::Continue);
+                    };
+                    vec![root_file]
+                };
+                self.files.retain(|file| rust.is_analyzed(file));
+                self.files.sort();
+                self.files.dedup();
+                self._guard =
+                    ExportedModuleWalkGuard::enter(&self.importing_file, &self.module_specifier);
+                if self._guard.is_none() {
+                    self.stage = PackageStage::Done(None);
+                } else {
+                    self.segments = nested.to_vec();
+                    self.stage = PackageStage::Walk;
+                }
+                Ok(ModuleResolutionAction::Continue)
+            }
+            PackageStage::Walk => {
+                if self.next_segment == self.segments.len() {
+                    self.stage = PackageStage::Done(self.package.take());
+                    return Ok(ModuleResolutionAction::Continue);
+                }
+                route_progress_checkpoint(progress)?;
+                let name = self.segments[self.next_segment].clone();
+                self.next_segment += 1;
+                self.stage = PackageStage::AwaitFqn;
+                Ok(ModuleResolutionAction::Push(
+                    ModuleResolutionTask::ForwardFqn {
+                        module_files: self.files.clone(),
+                        name,
+                    },
+                ))
+            }
+            PackageStage::AwaitFqn => {
+                unreachable!("an exported module FQN child must complete before its parent steps")
+            }
+            PackageStage::Done(package) => Ok(ModuleResolutionAction::Complete(
+                ModuleResolutionValue::Package(package),
+            )),
+        }
+    }
+
+    fn accept(
+        &mut self,
+        value: ModuleResolutionValue,
+        rust: &dyn RustSource,
+        token: QueryToken<'_>,
+        package_files: &RustPackageFileIndex,
+        progress: Option<&dyn Fn() -> bool>,
+    ) -> ReferenceContextResult<()> {
+        assert!(matches!(self.stage, PackageStage::AwaitFqn));
+        let ModuleResolutionValue::Fqn(resolved) = value else {
+            unreachable!("exported package walk receives a module FQN")
+        };
+        let Some(resolved) = resolved else {
+            self.stage = PackageStage::Done(None);
+            return Ok(());
+        };
+        self.files = resolved_module_files_with_progress(
+            rust,
+            token,
+            package_files,
+            &self.importing_file,
+            &resolved,
+            progress,
+        )?;
+        if self.files.is_empty() {
+            self.stage = PackageStage::Done(None);
+        } else {
+            self.package = Some(resolved);
+            self.stage = PackageStage::Walk;
+        }
+        Ok(())
+    }
+}
+
+enum AliasPackageStage {
+    Start,
+    RootFiles,
+    AwaitRootFiles,
+    Walk,
+    AwaitFqn,
+    TargetFiles(String),
+    AwaitTargetFiles,
+    Done(Option<String>),
+}
+
+struct AliasModulePackageFrame {
+    importing_file: ProjectFile,
+    module_specifier: String,
+    stage: AliasPackageStage,
+    root: String,
+    suffix: Vec<String>,
+    next_segment: usize,
+    files: Vec<ProjectFile>,
+    package: Option<String>,
+}
+
+impl AliasModulePackageFrame {
+    fn step(
+        &mut self,
+        rust: &dyn RustSource,
+        _token: QueryToken<'_>,
+        progress: Option<&dyn Fn() -> bool>,
+    ) -> ReferenceContextResult<ModuleResolutionAction> {
+        match &self.stage {
+            AliasPackageStage::Start => {
+                route_progress_checkpoint(progress)?;
+                let segments = parse_symbol_path(Language::Rust, &self.module_specifier);
+                let Some((root, suffix)) = segments.split_first() else {
+                    self.stage = AliasPackageStage::Done(None);
+                    return Ok(ModuleResolutionAction::Continue);
+                };
+                if suffix.is_empty()
+                    || rust_apply_import_alias(rust, &self.importing_file, root).is_some()
+                {
+                    self.stage = AliasPackageStage::Done(None);
+                } else {
+                    self.root = root.clone();
+                    self.suffix = suffix.to_vec();
+                    self.stage = AliasPackageStage::RootFiles;
+                }
+                Ok(ModuleResolutionAction::Continue)
+            }
+            AliasPackageStage::RootFiles => {
+                self.stage = AliasPackageStage::AwaitRootFiles;
+                Ok(ModuleResolutionAction::Push(ModuleResolutionTask::Files {
+                    importing_file: self.importing_file.clone(),
+                    module_specifier: self.root.clone(),
+                }))
+            }
+            AliasPackageStage::AwaitRootFiles => {
+                unreachable!("alias root files must complete before the parent steps")
+            }
+            AliasPackageStage::Walk => {
+                if self.next_segment == self.suffix.len() {
+                    self.stage = AliasPackageStage::Done(self.package.take());
+                    return Ok(ModuleResolutionAction::Continue);
+                }
+                route_progress_checkpoint(progress)?;
+                let name = self.suffix[self.next_segment].clone();
+                self.next_segment += 1;
+                self.stage = AliasPackageStage::AwaitFqn;
+                Ok(ModuleResolutionAction::Push(
+                    ModuleResolutionTask::ForwardFqn {
+                        module_files: self.files.clone(),
+                        name,
+                    },
+                ))
+            }
+            AliasPackageStage::AwaitFqn => {
+                unreachable!("alias module FQN must complete before the parent steps")
+            }
+            AliasPackageStage::TargetFiles(target) => {
+                let target = target.clone();
+                self.stage = AliasPackageStage::AwaitTargetFiles;
+                Ok(ModuleResolutionAction::Push(ModuleResolutionTask::Files {
+                    importing_file: self.importing_file.clone(),
+                    module_specifier: target,
+                }))
+            }
+            AliasPackageStage::AwaitTargetFiles => {
+                unreachable!("alias target files must complete before the parent steps")
+            }
+            AliasPackageStage::Done(package) => Ok(ModuleResolutionAction::Complete(
+                ModuleResolutionValue::Package(package.clone()),
+            )),
+        }
+    }
+
+    fn accept(&mut self, value: ModuleResolutionValue) -> ReferenceContextResult<()> {
+        match self.stage {
+            AliasPackageStage::AwaitRootFiles => {
+                let ModuleResolutionValue::Files(files) = value else {
+                    unreachable!("alias root lookup returns files")
+                };
+                if files.is_empty() {
+                    self.stage = AliasPackageStage::Done(None);
+                } else {
+                    self.files = files;
+                    self.stage = AliasPackageStage::Walk;
+                }
+            }
+            AliasPackageStage::AwaitFqn => {
+                let ModuleResolutionValue::Fqn(package) = value else {
+                    unreachable!("alias path walk returns an FQN")
+                };
+                if let Some(package) = package {
+                    self.package = Some(package.clone());
+                    self.stage = AliasPackageStage::TargetFiles(package);
+                } else {
+                    self.stage = AliasPackageStage::Done(None);
+                }
+            }
+            AliasPackageStage::AwaitTargetFiles => {
+                let ModuleResolutionValue::Files(files) = value else {
+                    unreachable!("alias target lookup returns files")
+                };
+                if files.is_empty() {
+                    self.stage = AliasPackageStage::Done(None);
+                } else {
+                    self.files = files;
+                    self.stage = AliasPackageStage::Walk;
+                }
+            }
+            _ => unreachable!("alias package child returned while no child was pending"),
+        }
+        Ok(())
+    }
+}
+
+struct ForwardModuleFqnFrame {
+    pending: Vec<(ProjectFile, String, bool)>,
+    visited: HashSet<(ProjectFile, String, bool)>,
+    targets: BTreeSet<String>,
+    child_requests: Vec<(ProjectFile, String, String)>,
+    child_results: Vec<(Vec<ProjectFile>, String, bool)>,
+    awaiting: Option<(String, bool)>,
+}
+
+impl ForwardModuleFqnFrame {
+    fn step(
+        &mut self,
+        rust: &dyn RustSource,
+        _token: QueryToken<'_>,
+        progress: Option<&dyn Fn() -> bool>,
+    ) -> ReferenceContextResult<ModuleResolutionAction> {
+        if let Some((importing_file, module_specifier, target_name)) = self.child_requests.pop() {
+            self.awaiting = Some((target_name, true));
+            return Ok(ModuleResolutionAction::Push(ModuleResolutionTask::Files {
+                importing_file,
+                module_specifier,
+            }));
+        }
+        for (files, name, reached_through_reexport) in self.child_results.drain(..) {
+            self.pending.extend(
+                files
+                    .into_iter()
+                    .map(|file| (file, name.clone(), reached_through_reexport)),
+            );
+        }
+        let Some((file, name, reached_through_reexport)) = self.pending.pop() else {
+            let fqn = (self.targets.len() == 1).then(|| {
+                self.targets
+                    .iter()
+                    .next()
+                    .expect("one target exists")
+                    .clone()
+            });
+            return Ok(ModuleResolutionAction::Complete(
+                ModuleResolutionValue::Fqn(fqn),
+            ));
+        };
+        route_progress_checkpoint(progress)?;
+        if !self
+            .visited
+            .insert((file.clone(), name.clone(), reached_through_reexport))
+        {
+            return Ok(ModuleResolutionAction::Continue);
+        }
+        let export_index = match progress {
+            Some(progress) => rust.export_index_of_while(&file, progress)?,
+            None => rust.export_index_of(&file)?,
+        };
+        match export_index.exports_by_name.get(&name) {
+            Some(ExportEntry::Local { local_name }) => {
+                self.targets.extend(
+                    rust.definitions(&format!("{}.{}", rust_package_name(&file), local_name))
+                        .filter(|unit| unit.is_module())
+                        .map(|unit| unit.fq_name()),
+                );
+            }
+            Some(ExportEntry::ReexportedNamed {
+                module_specifier,
+                imported_name,
+            }) => self.child_requests.push((
+                file.clone(),
+                module_specifier.clone(),
+                imported_name.clone(),
+            )),
+            Some(ExportEntry::Default { .. } | ExportEntry::ReexportedModule { .. }) => {}
+            None if reached_through_reexport => {
+                self.targets.extend(
+                    rust.definitions(&format!("{}.{}", rust_package_name(&file), name))
+                        .filter(|unit| unit.is_module())
+                        .map(|unit| unit.fq_name()),
+                );
+            }
+            None => {}
+        }
+        for ReexportStar { module_specifier } in &export_index.reexport_stars {
+            self.child_requests
+                .push((file.clone(), module_specifier.clone(), name.clone()));
+        }
+        self.child_requests.reverse();
+        Ok(ModuleResolutionAction::Continue)
+    }
+
+    fn accept(&mut self, value: ModuleResolutionValue) -> ReferenceContextResult<()> {
+        let awaiting = self
+            .awaiting
+            .take()
+            .expect("forward module child result has a request");
+        let ModuleResolutionValue::Files(files) = value else {
+            unreachable!("forward module walk child lookup returns files")
+        };
+        self.child_results.push((files, awaiting.0, awaiting.1));
+        Ok(())
+    }
+}
+
+enum ForwardTargetChildKind {
+    Named,
+    Star,
+}
+
+struct ForwardTargetChildRequest {
+    importing_file: ProjectFile,
+    module_specifier: String,
+    target_name: String,
+    kind: ForwardTargetChildKind,
+}
+
+struct ForwardExportedTargetsFrame {
+    pending: Vec<(ProjectFile, String, bool)>,
+    visited: HashSet<(ProjectFile, String, bool)>,
+    targets: BTreeSet<(ProjectFile, String)>,
+    child_requests: Vec<ForwardTargetChildRequest>,
+    child_results: Vec<(Vec<ProjectFile>, String)>,
+    awaiting: Option<ForwardTargetChildRequest>,
+}
+
+impl ForwardExportedTargetsFrame {
+    fn step(
+        &mut self,
+        rust: &dyn RustSource,
+        _token: QueryToken<'_>,
+        progress: Option<&dyn Fn() -> bool>,
+    ) -> ReferenceContextResult<ModuleResolutionAction> {
+        if let Some(request) = self.child_requests.pop() {
+            self.awaiting = Some(ForwardTargetChildRequest {
+                importing_file: request.importing_file.clone(),
+                module_specifier: request.module_specifier.clone(),
+                target_name: request.target_name.clone(),
+                kind: match request.kind {
+                    ForwardTargetChildKind::Named => ForwardTargetChildKind::Named,
+                    ForwardTargetChildKind::Star => ForwardTargetChildKind::Star,
+                },
+            });
+            return Ok(ModuleResolutionAction::Push(ModuleResolutionTask::Files {
+                importing_file: request.importing_file,
+                module_specifier: request.module_specifier,
+            }));
+        }
+        for (files, name) in self.child_results.drain(..) {
+            self.pending
+                .extend(files.into_iter().map(|file| (file, name.clone(), true)));
+        }
+        let Some((file, name, reached_through_reexport)) = self.pending.pop() else {
+            route_progress_checkpoint(progress)?;
+            return Ok(ModuleResolutionAction::Complete(
+                ModuleResolutionValue::Targets(std::mem::take(&mut self.targets)),
+            ));
+        };
+        reference_context_checkpoint(progress.unwrap_or(&|| true))?;
+        if !self
+            .visited
+            .insert((file.clone(), name.clone(), reached_through_reexport))
+        {
+            return Ok(ModuleResolutionAction::Continue);
+        }
+        let index = rust.export_index_of_while(&file, progress.unwrap_or(&|| true))?;
+        match index.exports_by_name.get(&name) {
+            Some(ExportEntry::Local { local_name }) => {
+                self.targets.insert((file.clone(), local_name.clone()));
+            }
+            Some(ExportEntry::ReexportedNamed {
+                module_specifier,
+                imported_name,
+            }) => self.child_requests.push(ForwardTargetChildRequest {
+                importing_file: file.clone(),
+                module_specifier: module_specifier.clone(),
+                target_name: imported_name.clone(),
+                kind: ForwardTargetChildKind::Named,
+            }),
+            Some(ExportEntry::Default {
+                local_name: Some(local_name),
+            }) => {
+                self.targets.insert((file.clone(), local_name.clone()));
+            }
+            Some(ExportEntry::Default { local_name: None })
+            | Some(ExportEntry::ReexportedModule { .. }) => {}
+            None if reached_through_reexport => {
+                let properties =
+                    declaration_source_properties_while(rust, &file, progress.unwrap_or(&|| true))?;
+                for unit in rust.declarations(&file) {
+                    reference_context_checkpoint(progress.unwrap_or(&|| true))?;
+                    if unit.identifier() == name {
+                        let rows = properties
+                            .get(&unit)
+                            .ok_or(RustCargoRouteError::Unavailable)?;
+                        if declaration_properties_are_export_visible(
+                            rows,
+                            progress.unwrap_or(&|| true),
+                        )? {
+                            self.targets
+                                .insert((file.clone(), unit.identifier().to_string()));
+                        }
+                    }
+                }
+            }
+            None => {}
+        }
+        for star in &index.reexport_stars {
+            self.child_requests.push(ForwardTargetChildRequest {
+                importing_file: file.clone(),
+                module_specifier: star.module_specifier.clone(),
+                target_name: name.clone(),
+                kind: ForwardTargetChildKind::Star,
+            });
+        }
+        self.child_requests.reverse();
+        Ok(ModuleResolutionAction::Continue)
+    }
+
+    fn accept(
+        &mut self,
+        value: ModuleResolutionValue,
+        rust: &dyn RustSource,
+        token: QueryToken<'_>,
+        progress: Option<&dyn Fn() -> bool>,
+    ) -> ReferenceContextResult<()> {
+        let request = self
+            .awaiting
+            .take()
+            .expect("forward target child result has a request");
+        let ModuleResolutionValue::Files(files) = value else {
+            unreachable!("forward export child lookup returns files")
+        };
+        if files.is_empty() && matches!(request.kind, ForwardTargetChildKind::Named) {
+            let always = || true;
+            self.targets.extend(rust_member_reexport_targets_while(
+                rust,
+                token,
+                &request.importing_file,
+                &request.module_specifier,
+                &request.target_name,
+                progress.unwrap_or(&always),
+            )?);
+        } else {
+            self.child_results.push((files, request.target_name));
+        }
+        Ok(())
+    }
+}
+
 /// Follow a crate-root or dependency-crate module path through public facade
 /// exports. The crate-root helper above is retained for the explicit `crate::`
 /// path used by local module resolution; this variant also admits a routed
@@ -2525,54 +3282,21 @@ fn resolve_exported_module_package(
     module_specifier: &str,
     progress: Option<&dyn Fn() -> bool>,
 ) -> ReferenceContextResult<Option<String>> {
-    route_progress_checkpoint(progress)?;
-    let segments = parse_symbol_path(Language::Rust, module_specifier);
-    let Some((root, nested)) = segments.split_first() else {
-        return Ok(None);
-    };
-    if nested.is_empty() || matches!(root.as_str(), "self" | "super") {
-        return Ok(None);
+    let always = || true;
+    let package_files = rust.package_file_index_while(token, progress.unwrap_or(&always))?;
+    match run_module_resolution(
+        rust,
+        token,
+        &package_files,
+        ModuleResolutionTask::ExportedPackage {
+            importing_file: importing_file.clone(),
+            module_specifier: module_specifier.to_string(),
+        },
+        progress,
+    )? {
+        ModuleResolutionValue::Package(package) => Ok(package),
+        _ => unreachable!("exported-module resolution returns a package result"),
     }
-    let mut files = if root == "crate" {
-        let mut roots =
-            cargo_routes_for_progress(rust, progress)?.target_roots_for_file(importing_file);
-        if roots.is_empty()
-            && rust.is_analyzed(importing_file)
-            && rust_package_name(importing_file) == rust_crate_root_package(importing_file)
-        {
-            roots.push(importing_file.clone());
-        }
-        roots
-    } else {
-        let Some(root_file) = cargo_routes_for_progress(rust, progress)?
-            .resolve_crate_root_file(importing_file, root)
-        else {
-            return Ok(None);
-        };
-        vec![root_file]
-    };
-    files.retain(|file| rust.is_analyzed(file));
-    files.sort();
-    files.dedup();
-    let _guard = ExportedModuleWalkGuard::enter(importing_file, module_specifier);
-    let Some(_guard) = _guard else {
-        return Ok(None);
-    };
-    let mut package = None;
-    for segment in nested {
-        route_progress_checkpoint(progress)?;
-        let Some(resolved) =
-            forward_exported_module_fqn_with_progress(rust, token, &files, segment, progress)?
-        else {
-            return Ok(None);
-        };
-        files = resolved_module_files_with_progress(rust, importing_file, &resolved, progress)?;
-        if files.is_empty() {
-            return Ok(None);
-        }
-        package = Some(resolved);
-    }
-    Ok(package)
 }
 
 /// Resolve an item below a module path whose public spelling reaches the
@@ -2609,15 +3333,15 @@ fn resolve_exported_module_item_fqn(
 
 thread_local! {
     /// The (importing file, module specifier) pairs whose crate-root export
-    /// walk is in progress on this thread. Thread-local because the walk is
-    /// one call stack, and the walks run on rayon workers in parallel.
+    /// walk is in progress on this thread. The iterative resolver keeps one
+    /// active walk per frame stack, and walks run on rayon workers in parallel.
     static EXPORTED_MODULE_WALKS: RefCell<HashSet<(ProjectFile, String)>> =
         RefCell::new(HashSet::default());
 }
 
-/// Marks one crate-root export walk as in progress for as long as it is on the
-/// stack. [`ExportedModuleWalkGuard::enter`] answers `None` when the same walk
-/// is already running, which is the cycle.
+/// Marks one crate-root export walk as active until its resolver frame drops.
+/// [`ExportedModuleWalkGuard::enter`] answers `None` when the same walk is
+/// already running, which is the cycle.
 struct ExportedModuleWalkGuard {
     key: (ProjectFile, String),
 }
@@ -2647,12 +3371,14 @@ impl Drop for ExportedModuleWalkGuard {
 /// never admitted here.
 fn resolve_target_kind_root_module_with_progress(
     rust: &dyn RustSource,
+    token: QueryToken<'_>,
     importing_file: &ProjectFile,
     resolved: &str,
     progress: Option<&dyn Fn() -> bool>,
 ) -> ReferenceContextResult<Option<String>> {
     route_progress_checkpoint(progress)?;
-    let files = rust.package_file_index();
+    let always = || true;
+    let files = rust.package_file_index_while(token, progress.unwrap_or(&always))?;
     let routes = cargo_routes_for_progress(rust, progress)?;
     if files.files_in_package(resolved).next().is_some() {
         return Ok(None);
@@ -2745,13 +3471,7 @@ pub fn trait_implementer_names(
         }
         let facts = rust.canonical_rust_hierarchy_source_facts(&file, keep_going)?;
         let contexts = RustSourceContextIndex::new(facts.as_ref(), keep_going)?;
-        let mut types: HashMap<SourceOccurrenceId, _> = HashMap::default();
-        for ty in &facts.types {
-            assert!(
-                types.insert(ty.occurrence, ty).is_none(),
-                "one source occurrence cannot own two Rust type facts"
-            );
-        }
+        let types = rust_hierarchy_types_by_occurrence(facts.as_ref());
 
         for impl_fact in &facts.items.impls {
             if !keep_going() {
@@ -2768,31 +3488,22 @@ pub fn trait_implementer_names(
             let Some(target_occurrence) = impl_fact.target_type else {
                 continue;
             };
-            let trait_ref = types
-                .get(&trait_occurrence)
-                .copied()
-                .expect("published impl trait type has a type source fact");
             let target = types
                 .get(&target_occurrence)
                 .copied()
                 .expect("published impl target type has a type source fact");
-            let binder =
-                contexts.visible_import_binder(facts.as_ref(), impl_fact.context, keep_going)?;
-            let Some(resolved_trait) = resolve_rust_hierarchy_source_ref(
+            if !rust_impl_resolves_to_trait_owner(
                 rust,
                 token,
                 &file,
-                &contexts,
                 facts.as_ref(),
-                impl_fact.context,
-                &binder,
-                trait_ref,
-                |candidate| is_rust_trait_declaration(rust, candidate),
-            )?
-            else {
-                continue;
-            };
-            if resolved_trait != *trait_owner {
+                &contexts,
+                impl_fact,
+                trait_occurrence,
+                &types,
+                trait_owner,
+                keep_going,
+            )? {
                 continue;
             }
             if let Some(name) = source_type_identifier(target) {
@@ -2804,6 +3515,57 @@ pub fn trait_implementer_names(
         return Err(RustCargoRouteError::Cancelled);
     }
     Ok(implementer_names)
+}
+
+fn rust_hierarchy_types_by_occurrence(
+    facts: &RustHierarchySourceFacts,
+) -> HashMap<SourceOccurrenceId, &RustTypeSourceFact> {
+    let mut types = HashMap::default();
+    for ty in &facts.types {
+        assert!(
+            types.insert(ty.occurrence, ty).is_none(),
+            "one source occurrence cannot own two Rust type facts"
+        );
+    }
+    types
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "trait implementation resolution needs its file-scoped source indexes"
+)]
+fn rust_impl_resolves_to_trait_owner(
+    rust: &dyn RustFactSource,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+    facts: &RustHierarchySourceFacts,
+    contexts: &RustSourceContextIndex,
+    impl_fact: &RustImplSourceFact,
+    trait_occurrence: SourceOccurrenceId,
+    types: &HashMap<SourceOccurrenceId, &RustTypeSourceFact>,
+    trait_owner: &CodeUnit,
+    keep_going: &dyn Fn() -> bool,
+) -> ReferenceContextResult<bool> {
+    let trait_ref = types
+        .get(&trait_occurrence)
+        .copied()
+        .expect("published impl trait type has a type source fact");
+    let binder = contexts.visible_import_binder(facts, impl_fact.context, keep_going)?;
+    let Some(resolved_trait) = resolve_rust_hierarchy_source_ref(
+        rust,
+        token,
+        file,
+        contexts,
+        facts,
+        impl_fact.context,
+        &binder,
+        trait_ref,
+        |candidate| is_rust_trait_declaration(rust, candidate),
+    )?
+    else {
+        return Ok(false);
+    };
+    Ok(resolved_trait == *trait_owner)
 }
 
 /// The files that hold an `impl` of one trait.
@@ -2912,13 +3674,7 @@ pub fn rust_trait_member_implementations(
     for file in impl_files_of_trait(rust, &trait_owner)? {
         let facts = rust.canonical_rust_hierarchy_source_facts(&file, &|| true)?;
         let contexts = RustSourceContextIndex::new(facts.as_ref(), &|| true)?;
-        let mut types = HashMap::default();
-        for ty in &facts.types {
-            assert!(
-                types.insert(ty.occurrence, ty).is_none(),
-                "one source occurrence cannot own two Rust type facts"
-            );
-        }
+        let types = rust_hierarchy_types_by_occurrence(facts.as_ref());
         let mut declarations: HashMap<SourceDeclarationId, Vec<&CodeUnit>> = HashMap::default();
         for (declaration, unit) in &facts.declaration_units {
             declarations.entry(*declaration).or_default().push(unit);
@@ -2933,27 +3689,18 @@ pub fn rust_trait_member_implementations(
             let Some(trait_occurrence) = impl_fact.trait_type else {
                 continue;
             };
-            let trait_ref = types
-                .get(&trait_occurrence)
-                .copied()
-                .expect("published impl trait type has a type source fact");
-            let binder =
-                contexts.visible_import_binder(facts.as_ref(), impl_fact.context, &|| true)?;
-            let Some(resolved_trait) = resolve_rust_hierarchy_source_ref(
+            if !rust_impl_resolves_to_trait_owner(
                 rust,
                 token,
                 &file,
-                &contexts,
                 facts.as_ref(),
-                impl_fact.context,
-                &binder,
-                trait_ref,
-                |candidate| is_rust_trait_declaration(rust, candidate),
-            )?
-            else {
-                continue;
-            };
-            if resolved_trait != trait_owner {
+                &contexts,
+                impl_fact,
+                trait_occurrence,
+                &types,
+                &trait_owner,
+                &|| true,
+            )? {
                 continue;
             }
             let expected_syntax_kind = match member_kind {
@@ -3080,12 +3827,15 @@ pub fn is_rust_type_member_declaration(
     code_unit: &CodeUnit,
 ) -> Result<bool, RustCargoRouteError> {
     any_canonical_declaration_property(rust, code_unit, |property| {
-        property.has_impl_or_trait_ancestor
-            && matches!(
-                property.kind,
-                RustDeclarationKind::TypeAlias | RustDeclarationKind::AssociatedType
-            )
+        property.has_impl_or_trait_ancestor && rust_declaration_kind_is_type_member(&property.kind)
     })
+}
+
+fn rust_declaration_kind_is_type_member(kind: &RustDeclarationKind) -> bool {
+    matches!(
+        kind,
+        RustDeclarationKind::TypeAlias | RustDeclarationKind::AssociatedType
+    )
 }
 
 pub fn is_rust_free_function_declaration(
@@ -3199,33 +3949,32 @@ fn is_module_export_candidate_while(
     if !export_visible.contains(code_unit) {
         return Ok(false);
     }
-
-    let mut current = code_unit.clone();
-    loop {
-        reference_context_checkpoint(progress)?;
-        let parent = match rust_export_parent_while(rust, &current, progress)? {
-            RustExportParent::Parent(parent) => parent,
-            RustExportParent::Root => return Ok(true),
-            RustExportParent::Ambiguous => return Ok(false),
-        };
-        let parent_is_export_visible = if parent.source() == file {
-            export_visible.contains(&parent)
-        } else if let Some(visible) = external_visibility.get(&parent) {
-            *visible
-        } else {
-            let properties = declaration_source_properties_while(rust, parent.source(), progress)?;
-            let rows = properties
-                .get(&parent)
-                .ok_or(RustCargoRouteError::Unavailable)?;
-            let visible = declaration_properties_are_export_visible(rows, progress)?;
-            external_visibility.insert(parent.clone(), visible);
-            visible
-        };
-        if !parent.is_module() || !parent_is_export_visible {
-            return Ok(false);
-        }
-        current = parent;
-    }
+    walk_export_module_ancestors(
+        rust,
+        code_unit.clone(),
+        progress,
+        |_| {
+            reference_context_checkpoint(progress)?;
+            Ok(true)
+        },
+        |parent| {
+            let parent_is_export_visible = if parent.source() == file {
+                export_visible.contains(parent)
+            } else if let Some(visible) = external_visibility.get(parent) {
+                *visible
+            } else {
+                let properties =
+                    declaration_source_properties_while(rust, parent.source(), progress)?;
+                let rows = properties
+                    .get(parent)
+                    .ok_or(RustCargoRouteError::Unavailable)?;
+                let visible = declaration_properties_are_export_visible(rows, progress)?;
+                external_visibility.insert(parent.clone(), visible);
+                visible
+            };
+            Ok(parent.is_module() && parent_is_export_visible)
+        },
+    )
 }
 
 enum RustExportParent {
@@ -3271,23 +4020,40 @@ fn is_visible_module_path_while(
     code_unit: &CodeUnit,
     progress: &dyn Fn() -> bool,
 ) -> ReferenceContextResult<bool> {
-    let mut current = code_unit.clone();
+    walk_export_module_ancestors(
+        rust,
+        code_unit.clone(),
+        progress,
+        |current| {
+            reference_context_checkpoint(progress)?;
+            if !current.is_module() {
+                return Ok(false);
+            }
+            let properties = declaration_source_properties_while(rust, current.source(), progress)?;
+            let rows = properties
+                .get(current)
+                .ok_or(RustCargoRouteError::Unavailable)?;
+            declaration_properties_are_export_visible(rows, progress)
+        },
+        |_| Ok(true),
+    )
+}
+
+fn walk_export_module_ancestors(
+    rust: &dyn RustSource,
+    mut current: CodeUnit,
+    progress: &dyn Fn() -> bool,
+    mut visible_current: impl FnMut(&CodeUnit) -> ReferenceContextResult<bool>,
+    mut accept_parent: impl FnMut(&CodeUnit) -> ReferenceContextResult<bool>,
+) -> ReferenceContextResult<bool> {
     loop {
-        reference_context_checkpoint(progress)?;
-        if !current.is_module() {
-            return Ok(false);
-        }
-        let properties = declaration_source_properties_while(rust, current.source(), progress)?;
-        let rows = properties
-            .get(&current)
-            .ok_or(RustCargoRouteError::Unavailable)?;
-        if !declaration_properties_are_export_visible(rows, progress)? {
+        if !visible_current(&current)? {
             return Ok(false);
         }
         current = match rust_export_parent_while(rust, &current, progress)? {
-            RustExportParent::Parent(parent) => parent,
+            RustExportParent::Parent(parent) if accept_parent(&parent)? => parent,
+            RustExportParent::Parent(_) | RustExportParent::Ambiguous => return Ok(false),
             RustExportParent::Root => return Ok(true),
-            RustExportParent::Ambiguous => return Ok(false),
         };
     }
 }
@@ -3559,10 +4325,7 @@ fn rust_trait_member_kind(
     }
     if (trait_member.is_field() || trait_member.is_class())
         && any_canonical_declaration_property(rust, trait_member, |property| {
-            matches!(
-                property.kind,
-                RustDeclarationKind::TypeAlias | RustDeclarationKind::AssociatedType
-            )
+            rust_declaration_kind_is_type_member(&property.kind)
         })?
     {
         return Ok(Some(RustTraitMemberKind::AssociatedType));
@@ -3600,21 +4363,7 @@ pub fn rust_module_files_from_path(file: &ProjectFile, module_specifier: &str) -
     let Some(relative_module) = rust_relative_module_path(file, module_specifier) else {
         return Vec::new();
     };
-    let mut files = Vec::new();
-    for rel_path in [
-        relative_module.with_extension("rs"),
-        relative_module.join("mod.rs"),
-        PathBuf::from("src")
-            .join(&relative_module)
-            .with_extension("rs"),
-        PathBuf::from("src").join(&relative_module).join("mod.rs"),
-    ] {
-        let candidate = ProjectFile::new(file.root().to_path_buf(), rel_path);
-        if candidate.exists() {
-            files.push(candidate);
-        }
-    }
-    files
+    rust_module_files_at(file, &relative_module)
 }
 
 pub fn rust_module_files_from_segments(
@@ -3624,21 +4373,7 @@ pub fn rust_module_files_from_segments(
     let Some(relative_module) = rust_relative_module_segments(file, segments) else {
         return Vec::new();
     };
-    let mut files = Vec::new();
-    for rel_path in [
-        relative_module.with_extension("rs"),
-        relative_module.join("mod.rs"),
-        PathBuf::from("src")
-            .join(&relative_module)
-            .with_extension("rs"),
-        PathBuf::from("src").join(&relative_module).join("mod.rs"),
-    ] {
-        let candidate = ProjectFile::new(file.root().to_path_buf(), rel_path);
-        if candidate.exists() {
-            files.push(candidate);
-        }
-    }
-    files
+    rust_module_files_at(file, &relative_module)
 }
 
 pub fn rust_relative_module_segments(file: &ProjectFile, segments: &[String]) -> Option<PathBuf> {
@@ -3721,11 +4456,10 @@ pub fn rust_relative_module_path(file: &ProjectFile, module_specifier: &str) -> 
 }
 
 pub fn resolve_direct_import_files(
-    rust: &dyn RustSource,
+    package_files: &RustPackageFileIndex,
     importing_file: &ProjectFile,
     segments: &[String],
 ) -> Vec<ProjectFile> {
-    let analyzed_files = rust.package_file_index();
     let package = rust_package_name(importing_file);
     let crate_package = rust_crate_root_package(importing_file);
 
@@ -3738,10 +4472,10 @@ pub fn resolve_direct_import_files(
                 .into_iter()
                 .collect::<Vec<_>>()
         } else if let Some((root, nested)) = prefix.split_first()
-            && !analyzed_files.crate_packages(root).is_empty()
+            && !package_files.crate_packages(root).is_empty()
         {
             let suffix = nested.join(".");
-            analyzed_files
+            package_files
                 .crate_packages(root)
                 .iter()
                 .map(|package| {
@@ -3760,7 +4494,7 @@ pub fn resolve_direct_import_files(
         let files = resolved_modules
             .into_iter()
             .flat_map(|module| {
-                analyzed_files
+                package_files
                     .files_in_package(&module)
                     .cloned()
                     .collect::<Vec<_>>()

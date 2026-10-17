@@ -5,6 +5,7 @@ use super::{
 };
 use crate::extension::ExtensionOutcome;
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use std::fmt;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,12 +32,12 @@ pub struct ExtensionDecodeError(pub Box<str>);
 pub struct ExtensionEncodeError(pub Box<str>);
 impl fmt::Display for ExtensionDecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        super::fmt_text(&self.0, f)
     }
 }
 impl fmt::Display for ExtensionEncodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        super::fmt_text(&self.0, f)
     }
 }
 impl std::error::Error for ExtensionDecodeError {}
@@ -47,12 +48,41 @@ pub fn decode_request_json(bytes: &[u8]) -> Result<ExtensionRequest, ExtensionDe
         .map_err(|error| ExtensionDecodeError(error.to_string().into_boxed_str()))
 }
 pub fn encode_request_json(request: &ExtensionRequest) -> Result<Vec<u8>, ExtensionEncodeError> {
-    serde_json::to_vec(request)
-        .map_err(|error| ExtensionEncodeError(error.to_string().into_boxed_str()))
+    encode_json(request)
 }
 pub fn encode_response_json(response: &ExtensionResponse) -> Result<Vec<u8>, ExtensionEncodeError> {
-    serde_json::to_vec(response)
+    encode_json(response)
+}
+
+fn encode_json(value: &impl Serialize) -> Result<Vec<u8>, ExtensionEncodeError> {
+    serde_json::to_vec(value)
         .map_err(|error| ExtensionEncodeError(error.to_string().into_boxed_str()))
+}
+
+pub(super) fn canonical_json_bytes(value: &impl Serialize) -> Result<Vec<u8>, serde_json::Error> {
+    let value = serde_json::to_value(value)?;
+    let mut bytes = serde_json::to_vec(&canonical_json_value(value))?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+fn canonical_json_value(value: Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut entries = map.into_iter().collect::<Vec<_>>();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key, canonical_json_value(value)))
+                    .collect::<Map<_, _>>(),
+            )
+        }
+        Value::Array(values) => {
+            Value::Array(values.into_iter().map(canonical_json_value).collect())
+        }
+        other => other,
+    }
 }
 
 impl ExtensionWorkspace {

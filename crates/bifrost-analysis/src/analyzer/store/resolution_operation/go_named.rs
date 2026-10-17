@@ -1,14 +1,15 @@
 //! File-local Go import bindings from selected source and package authority.
 
-use super::go_context::GoDotImportContext;
+use super::go_context::{GoContextSelection, GoDotImportContext, GoPackageInventoryState};
 use super::*;
-use crate::analyzer::resolution::{LoweredGoPackageImport, SelectedGoImportBindingDescriptor};
+use crate::analyzer::resolution::{
+    LoweredGoPackageImport, SelectedGoImportBindingDescriptor, SharedNameInterner,
+};
 use crate::analyzer::store::resolution_stage::codec;
 use brokk_bifrost_core::analyzer::resolution_facts::{
     ResolutionGoPackageImportKind, ResolutionNamespace, ResolutionSiteId,
 };
 
-#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum GoExternalPackageProvenance {
     GoTool {
@@ -24,7 +25,6 @@ pub(crate) enum GoExternalPackageProvenance {
     },
 }
 
-#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GoSelectedExternalImport {
     pub(crate) source_spelling: String,
@@ -33,7 +33,155 @@ pub(crate) struct GoSelectedExternalImport {
     pub(crate) provenance: GoExternalPackageProvenance,
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct GoPackageStageUnit {
+    pub(crate) context_id: i64,
+    pub(crate) package_id: i64,
+    pub(crate) source_role: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub(crate) enum GoPreparedContextKind {
+    File,
+}
+
+#[derive(Clone)]
+pub(crate) struct GoDemandContext {
+    pub(crate) context_id: i64,
+    pub(crate) import_packages: HashMap<(SelectedResolutionMountOrdinal, SemanticId), i64>,
+    pub(crate) context_completions: HashMap<SelectedResolutionMountOrdinal, ResolutionCompletion>,
+    pub(crate) modeled_imports:
+        HashMap<(SelectedResolutionMountOrdinal, SemanticId), GoSelectedExternalImport>,
+}
+
+impl GoDemandContext {
+    pub(crate) fn needs_demand_provider_for(&self, mount: SelectedResolutionMountOrdinal) -> bool {
+        self.import_packages
+            .keys()
+            .any(|(source, _)| *source == mount)
+            || self
+                .context_completions
+                .get(&mount)
+                .is_some_and(|completion| completion != &ResolutionCompletion::Complete)
+    }
+
+    pub(crate) fn merge(&mut self, other: Self) {
+        assert_eq!(
+            self.context_id, other.context_id,
+            "one selected Go operation uses one publication context"
+        );
+        for (key, package) in other.import_packages {
+            if let Some(previous) = self.import_packages.insert(key, package) {
+                assert_eq!(
+                    previous, package,
+                    "one selected Go import binding has one package provider"
+                );
+            }
+        }
+        for (key, provider) in other.modeled_imports {
+            if let Some(previous) = self.modeled_imports.insert(key, provider.clone()) {
+                assert_eq!(
+                    previous, provider,
+                    "one selected Go import has one model provider"
+                );
+            }
+        }
+        for (mount, completion) in other.context_completions {
+            if let Some(previous) = self.context_completions.insert(mount, completion.clone()) {
+                assert_eq!(
+                    previous, completion,
+                    "one selected Go caller mount has one prepared context completion"
+                );
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub(crate) struct GoPreparedContextCacheKey {
+    kind: GoPreparedContextKind,
+    routing_digest: [u8; 32],
+    publication: super::super::GoContextIdentity,
+    caller_mount: SelectedResolutionMountOrdinal,
+    caller_path: String,
+    source_role: String,
+    derivation_version: i64,
+    active_model_set_hash: Option<String>,
+}
+
+#[derive(Clone)]
+pub(crate) struct GoPreparedImportContext {
+    pub(crate) context: SelectedResolutionContextSet,
+    pub(crate) demand: GoDemandContext,
+    pub(crate) package_inventory: GoPackageInventoryState,
+}
+
+/// One bounded cache entry retains only shared names referenced by its file
+/// context. Numeric keys are snapshot-local and never installed in a request.
+#[derive(Clone)]
+pub(crate) struct GoPreparedImportContextSnapshot {
+    prepared: GoPreparedImportContext,
+    shared_names: HashMap<SemanticId, [u8; 32]>,
+}
+
+impl GoPreparedImportContext {
+    fn cache_snapshot(
+        &self,
+        source: &dyn BatchResolutionFragmentSource,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<GoPreparedImportContextSnapshot>> {
+        let identities = self.context.identity_space().isolated_clone();
+        let mut context = self.context.clone().with_identity_space(identities);
+        let mut shared_names = HashMap::default();
+        context.remap_shared_names(|identity| {
+            if let Some(digest) = source.shared_name_digest_for_identity(identity, cancellation)? {
+                shared_names.insert(identity, digest);
+            }
+            Ok(identity)
+        })?;
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        Ok(Some(GoPreparedImportContextSnapshot {
+            prepared: Self {
+                context,
+                demand: self.demand.clone(),
+                package_inventory: self.package_inventory.clone(),
+            },
+            shared_names,
+        }))
+    }
+}
+
+impl GoPreparedImportContextSnapshot {
+    fn restored_for_request(
+        &self,
+        identities: &SelectedContextIdentities,
+        names: &dyn SharedNameInterner,
+    ) -> Result<GoPreparedImportContext> {
+        let mut context = self.prepared.context.clone();
+        context.remap_shared_names(|identity| {
+            let digest = self
+                .shared_names
+                .get(&identity)
+                .expect("a cached context retains every referenced shared-name digest");
+            Ok(SemanticId::shared_name(names.intern(*digest)))
+        })?;
+        identities.copy_from_empty(&self.prepared.context.identity_space());
+        Ok(GoPreparedImportContext {
+            context: context.with_identity_space(identities.clone()),
+            demand: self.prepared.demand.clone(),
+            package_inventory: self.prepared.package_inventory.clone(),
+        })
+    }
+}
+
+pub(crate) enum GoPreparedImportContextOutcome {
+    Ready(Box<GoPreparedImportContext>),
+    Unavailable,
+    Cancelled,
+}
+
 impl GoSelectedExternalImport {
     pub(crate) fn has_authoritative_provenance(&self) -> bool {
         match &self.provenance {
@@ -55,7 +203,6 @@ impl GoSelectedExternalImport {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
 const SELECTED_EXTERNAL_IMPORTS: &str = r#"
 SELECT imports.source_spelling,target.tool_import_path,target.package_name,
        target.provider_kind,target.provider_module_path,target.provider_module_version
@@ -79,7 +226,6 @@ WHERE caller.context_id=?1 AND caller.file_version_id=?2
 ORDER BY imports.source_spelling,target.tool_import_path
 "#;
 
-#[cfg(any(test, feature = "test-support"))]
 const SELECTED_UNRESOLVED_IMPORTS: &str = r#"
 SELECT DISTINCT imports.source_spelling
 FROM main.go_context_source_files caller
@@ -146,7 +292,7 @@ ORDER BY rel_path, source_role
 pub(in crate::analyzer::store) const CALLER_SOURCE_ROLE: &str = r#"
 SELECT caller.source_role
 FROM main.go_context_source_files caller
-JOIN main.go_package_instances package
+CROSS JOIN main.go_package_instances package
   ON package.context_id=caller.context_id AND package.package_id=caller.package_id
 WHERE caller.context_id=?1 AND caller.file_version_id=?2
  AND ((caller.source_role='go' AND package.for_test='')
@@ -166,36 +312,134 @@ WHERE caller.context_id=?1 AND caller.file_version_id=?2
    OR (caller.source_role IN ('test','xtest') AND package.provider_provenance='source_inventory'))
 "#;
 
+// Import bindings of every listed mount, one statement for the whole request.
+// `?1` is a JSON array of mount ordinals. The scope-mount join keeps the read
+// inside the request closure, and the last column names the mount a row
+// belongs to.
 pub(in crate::analyzer::store) const ORDINARY_IMPORT_BINDINGS: &str = r#"
 SELECT p.definition_key,p.source_site,p.file_scope_key,p.spelling_choice_key,
-       p.start_byte,p.end_byte,p.kind,i.import_id
-FROM temp.selected_resolution_scope_mounts selected
+       p.start_byte,p.end_byte,p.kind,i.import_id,selected.mount_ordinal
+FROM json_each(?1) requested
+CROSS JOIN temp.selected_resolution_scope_mounts selected ON selected.mount_ordinal=requested.value
 JOIN temp.selected_resolution_mounts mounted ON mounted.mount_ordinal=selected.mount_ordinal
 JOIN main.resolution_go_package_imports p ON p.blob_id=mounted.blob_id
 LEFT JOIN main.source_imports i ON i.blob_id=p.blob_id
  AND i.declaration_start_byte=p.start_byte AND i.declaration_end_byte=p.end_byte
-WHERE selected.mount_ordinal=?1
 "#;
 
 pub(in crate::analyzer::store) const STAGED_IMPORT_BINDINGS: &str = r#"
 SELECT p.definition_key,p.source_site,p.file_scope_key,p.spelling_choice_key,
-       p.start_byte,p.end_byte,p.kind,i.import_id
-FROM temp.selected_resolution_scope_mounts selected
+       p.start_byte,p.end_byte,p.kind,i.import_id,selected.mount_ordinal
+FROM json_each(?1) requested
+CROSS JOIN temp.selected_resolution_scope_mounts selected ON selected.mount_ordinal=requested.value
 JOIN temp.selected_resolution_mounts mounted ON mounted.mount_ordinal=selected.mount_ordinal
 JOIN temp.selected_resolution_stage_go_package_imports p ON p.host_ordinal=selected.mount_ordinal
 LEFT JOIN main.source_imports i ON i.blob_id=mounted.blob_id
  AND i.declaration_start_byte=p.start_byte AND i.declaration_end_byte=p.end_byte
-WHERE selected.mount_ordinal=?1
 "#;
 
-pub(in crate::analyzer::store) const IMPORT_PACKAGE_NAME: &str = r#"
-SELECT target.package_name,target.package_id
-FROM main.go_package_imports imports
-JOIN main.go_package_instances target
- ON target.context_id=imports.context_id AND target.package_id=imports.target_package_id
-WHERE imports.context_id=?1 AND imports.importer_package_id=?2
- AND imports.import_role=?3 AND imports.source_spelling=?4
+// Every source import of every listed file, joined to the selected package
+// import row of that spelling and to the provider package. `?1` is the Go
+// context and `?2` a JSON array of `[mount_ordinal, file_version_id,
+// source_role]` triples. The import spelling is the source import's path
+// segments joined by `/`, read from `source_import_segments`. The caller
+// package is the one the exact selected placement admits (the CALLER_PACKAGE
+// predicate in go_same_package.rs), so a file version placed in several
+// packages does not mix their imports. A package's other imports are never
+// read: the join starts from the file's own source imports. An import without
+// a provider yields NULL provider columns. Every join is a CROSS JOIN so the
+// planner keeps the request list outermost; without that, it starts from the
+// context's packages and probes the list per package. The segment subquery
+// orders by `ordinal` on the primary key, which needs no sort.
+pub(in crate::analyzer::store) const GO_FILE_IMPORT_ROWS: &str = r#"
+SELECT requested.value ->> 0, imports.source_spelling, imports.complete,
+       json(imports.gaps), NULLIF(target.package_name,''), target.package_id,
+       mounted.semantic_language
+FROM json_each(?2) requested
+CROSS JOIN temp.selected_resolution_mounts mounted ON mounted.mount_ordinal=requested.value ->> 0
+CROSS JOIN main.go_context_source_files caller
+  ON caller.context_id=?1 AND caller.file_version_id=requested.value ->> 1
+ AND caller.source_role=requested.value ->> 2
+JOIN main.go_package_instances package
+  ON package.context_id=caller.context_id AND package.package_id=caller.package_id
+ AND ((caller.source_role='go' AND package.for_test='')
+   OR (caller.source_role IN ('test','xtest') AND package.for_test<>'')
+   OR (caller.source_role='test' AND package.for_test='' AND package.complete=0
+       AND NOT EXISTS(
+         SELECT 1
+         FROM main.go_context_source_files selected_test
+         JOIN main.go_package_instances selected_package
+           ON selected_package.context_id=selected_test.context_id
+          AND selected_package.package_id=selected_test.package_id
+         WHERE selected_test.context_id=caller.context_id
+           AND selected_test.file_version_id=caller.file_version_id
+           AND selected_test.source_role='test'
+           AND selected_package.for_test<>''
+       ))
+   OR (caller.source_role IN ('test','xtest') AND package.provider_provenance='source_inventory'))
+CROSS JOIN main.source_imports i ON i.blob_id=mounted.blob_id
+CROSS JOIN main.go_package_imports imports
+  ON imports.context_id=caller.context_id AND imports.importer_package_id=caller.package_id
+ AND imports.import_role=caller.source_role
+ AND imports.source_spelling=(
+   SELECT group_concat(segment, '/')
+   FROM (SELECT segment.segment FROM main.source_import_segments segment
+         WHERE segment.blob_id=i.blob_id AND segment.import_id=i.import_id
+         ORDER BY segment.ordinal))
+LEFT JOIN main.go_package_instances target
+  ON target.context_id=imports.context_id AND target.package_id=imports.target_package_id
 "#;
+
+// Which of the listed mounts import a package with the `.` alias. `?1` is a
+// JSON array of mount ordinals. Only a dot import publishes a root import path
+// (a named import binds through `go_package_imports`), so a file without one
+// has no root import halves to read.
+pub(in crate::analyzer::store) const GO_DOT_IMPORT_MOUNTS: &str = r#"
+SELECT DISTINCT requested.value
+FROM json_each(?1) requested
+CROSS JOIN temp.selected_resolution_mounts mounted ON mounted.mount_ordinal=requested.value
+CROSS JOIN main.source_imports i ON i.blob_id=mounted.blob_id
+WHERE i.alias='.'
+"#;
+
+/// One selected import row of a Go file: its publication completeness and the
+/// selected provider package.
+#[derive(Clone)]
+pub(super) struct GoFileImportRow {
+    pub(super) complete: bool,
+    pub(super) gaps: String,
+    /// A missing or nameless tool provider has no authoritative package clause.
+    pub(super) package_name: Option<String>,
+    /// Retained as provider evidence even when its package clause is unknown.
+    pub(super) package_id: Option<i64>,
+    pub(super) modeled_provider: Option<GoSelectedExternalImport>,
+}
+
+/// What one prepared Go file mount needs from SQL: its import bindings and
+/// the selected import rows of its source imports, by source spelling.
+#[derive(Clone, Default)]
+struct GoMountImportInputs {
+    bindings: BTreeMap<SemanticId, GoImportBindingRow>,
+    imports: HashMap<String, GoFileImportRow>,
+    has_dot_import: bool,
+}
+
+/// Import inputs of the Go files this one operation has prepared, filled one
+/// statement per batch and dropped with the operation. Its size is the number
+/// of files the request prepares, not the workspace.
+#[derive(Default)]
+pub(in crate::analyzer::store) struct GoImportInputCache {
+    mounts: HashMap<u32, GoMountImportInputs>,
+    /// A captured absence must not fall through to a later publication.
+    model_overlay: Option<Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>>,
+}
+
+#[cfg(test)]
+impl GoImportInputCache {
+    pub(in crate::analyzer::store) fn is_empty(&self) -> bool {
+        self.mounts.is_empty()
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct GoImportBindingRow {
@@ -227,7 +471,8 @@ impl GoImportBindingRow {
         })
     }
 
-    fn ordinary(row: &rusqlite::Row<'_>, ordinal: u32) -> Result<Self> {
+    fn ordinary(row: &rusqlite::Row<'_>) -> Result<Self> {
+        let ordinal: u32 = row.get(8)?;
         Self::source(
             row,
             SemanticId::local(ordinal, row.get(0)?),
@@ -247,9 +492,63 @@ impl GoImportBindingRow {
 }
 
 impl SelectedResolutionOperation<'_, '_> {
+    /// Capture the caller's overlay rather than the language delegate's cache.
+    /// A multi-language analyzer can activate models without populating its
+    /// Go delegate. This authority lives only for the selected operation.
+    pub(crate) fn with_go_model_authority(
+        self,
+        overlay: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+    ) -> Self {
+        {
+            let mut inputs = self.go_import_inputs.borrow_mut();
+            assert!(
+                inputs.model_overlay.is_none() && inputs.mounts.is_empty(),
+                "Go model authority is captured before import preparation"
+            );
+            inputs.model_overlay = Some(overlay);
+        }
+        self
+    }
+
+    fn go_semantic_model_overlay(
+        &self,
+    ) -> Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>> {
+        self.go_import_inputs
+            .borrow()
+            .model_overlay
+            .clone()
+            .unwrap_or_else(|| self.ready.analyzer.and_then(|a| a.semantic_model_overlay()))
+    }
+
+    /// Overlay authority precedes missing durable import authority, like
+    /// `model_declared_jvm_owner` in the JVM context. The registered language
+    /// hook supplies the package clause name and provider identity; no basename
+    /// is evidence.
+    /// Typed durable provider rows are deferred until a typed reader needs them.
+    fn model_declared_go_package(
+        &self,
+        language: Language,
+        import_path: &str,
+    ) -> Option<GoSelectedExternalImport> {
+        let overlay = self.go_semantic_model_overlay()?;
+        let support = crate::analyzer::languages::language_support(language)
+            .expect("selected import mount language must have registered support");
+        let identity = support.modeled_external_package_identity(&overlay, import_path)?;
+        Some(GoSelectedExternalImport {
+            source_spelling: import_path.to_owned(),
+            import_path: import_path.to_owned(),
+            package_name: identity.package_name,
+            provenance: GoExternalPackageProvenance::SemanticModel {
+                symbol_id: identity.symbol_id,
+                pack_id: identity.pack_id,
+                pack_digest: identity.pack_digest,
+                record_id: identity.record_id,
+            },
+        })
+    }
+
     /// Return this caller's complete, source-less standard/dependency import
     /// targets. The vector is request-owned and bounded by this file's imports.
-    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn go_selected_external_imports(
         &self,
         context_id: i64,
@@ -292,13 +591,29 @@ impl SelectedResolutionOperation<'_, '_> {
                 },
             });
         }
+        drop(rows);
+        drop(statement);
+        if self.go_semantic_model_overlay().is_none() {
+            return Ok(imports);
+        }
+        for spelling in
+            self.go_selected_unresolved_imports(context_id, caller_path, cancellation)?
+        {
+            if cancellation.is_cancelled() {
+                return Ok(Vec::new());
+            }
+            if let Some(provider) =
+                self.model_declared_go_package(source.semantic_language(), &spelling)
+            {
+                imports.push(provider);
+            }
+        }
         Ok(imports)
     }
 
     /// Return only exact unresolved import spellings from this selected
     /// source file. A caller may match these to a semantic model by exact
     /// import path; no path-derived package name is supplied here.
-    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn go_selected_unresolved_imports(
         &self,
         context_id: i64,
@@ -335,107 +650,447 @@ impl SelectedResolutionOperation<'_, '_> {
         Ok(imports)
     }
 
-    /// Choose the caller role from its exact selected package membership.
-    /// Filename spelling cannot authorize an ordinary or test-package query,
-    /// and an unsaved replacement uses its predecessor's membership only when
-    /// the membership digests prove the Go tool would place it identically.
-    pub(crate) fn go_selected_import_context(
+    /// Prepare only this file's package and import context. Other Go files are
+    /// admitted by the demand provider when resolution reaches their mounts.
+    pub(crate) fn go_file_import_context(
         &self,
         context_id: i64,
-        caller_path: &str,
+        path: &str,
         cancellation: &CancellationToken,
-    ) -> Result<GoDotImportContext> {
+    ) -> Result<GoPreparedImportContextOutcome> {
         if cancellation.is_cancelled() {
-            return Ok(GoDotImportContext::Cancelled);
+            return Ok(GoPreparedImportContextOutcome::Cancelled);
         }
-        let Some(source) = self.mount_table().mount_for_path("go", caller_path)? else {
-            return Ok(GoDotImportContext::Unavailable);
+        let Some(source) = self.mount_table().mount_for_path("go", path)? else {
+            return Ok(GoPreparedImportContextOutcome::Unavailable);
         };
-        let record = self
-            .ready
-            .inventory
-            .mount_record_by_ordinal(source.ordinal())?;
+        let Some(source_role) =
+            self.go_source_role_for_mount(context_id, source.ordinal(), cancellation)?
+        else {
+            return Ok(if cancellation.is_cancelled() {
+                GoPreparedImportContextOutcome::Cancelled
+            } else {
+                GoPreparedImportContextOutcome::Unavailable
+            });
+        };
+        self.go_file_import_context_with_role(context_id, path, &source_role, cancellation)
+    }
+
+    pub(crate) fn go_source_role_for_mount(
+        &self,
+        context_id: i64,
+        mount: SelectedResolutionMountOrdinal,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<String>> {
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let record = self.ready.inventory.mount_record_by_ordinal(mount)?;
+        assert_eq!(record.semantic_language(), Language::Go);
         let connection = self.ready.inventory.connection();
         let Some(version) = super::go_context::go_placement_file_version(connection, &record)?
         else {
-            return Ok(GoDotImportContext::Unavailable);
+            return Ok(None);
         };
         let mut statement = connection.prepare_cached(CALLER_SOURCE_ROLE)?;
         let mut rows = statement.query(rusqlite::params![context_id, version])?;
         let mut source_role = None;
         while let Some(row) = rows.next()? {
             if cancellation.is_cancelled() {
-                return Ok(GoDotImportContext::Cancelled);
+                return Ok(None);
             }
             let role: String = row.get(0)?;
             if source_role
                 .as_ref()
                 .is_some_and(|previous| previous != &role)
             {
-                return Ok(GoDotImportContext::Unavailable);
+                return Ok(None);
             }
             source_role = Some(role);
         }
         drop(rows);
         drop(statement);
-        let Some(_source_role) = source_role else {
-            return Ok(GoDotImportContext::Unavailable);
+        Ok(source_role)
+    }
+
+    pub(crate) fn go_package_stage_unit_for_path(
+        &self,
+        context_id: i64,
+        path: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<GoPackageStageUnit>> {
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let Some(source) = self.mount_table().mount_for_path("go", path)? else {
+            return Ok(None);
         };
-        let mut statement = connection.prepare_cached(SELECTED_IMPORT_CONTEXT_FILES)?;
-        let mut rows = statement.query(rusqlite::params![context_id, version])?;
-        let mut files = Vec::new();
+        let Some(source_role) =
+            self.go_source_role_for_mount(context_id, source.ordinal(), cancellation)?
+        else {
+            return Ok(None);
+        };
+        let record = self
+            .ready
+            .inventory
+            .mount_record_by_ordinal(source.ordinal())?;
+        let Some(version) = super::go_context::go_placement_file_version(
+            self.ready.inventory.connection(),
+            &record,
+        )?
+        else {
+            return Ok(None);
+        };
+        let package_id = self.go_selected_package_id(context_id, version, &source_role)?;
+        Ok(package_id.map(|package_id| GoPackageStageUnit {
+            context_id,
+            package_id,
+            source_role,
+        }))
+    }
+
+    pub(super) fn go_file_import_context_with_member_cache(
+        &self,
+        context_id: i64,
+        path: &str,
+        source_role: &str,
+        cancellation: &CancellationToken,
+        member_cache: &mut super::go_same_package::GoPackageMemberIndexCache,
+    ) -> Result<GoPreparedImportContextOutcome> {
+        if cancellation.is_cancelled() {
+            return Ok(GoPreparedImportContextOutcome::Cancelled);
+        }
+        let Some(source) = self.mount_table().mount_for_path("go", path)? else {
+            return Ok(GoPreparedImportContextOutcome::Unavailable);
+        };
+        assert_eq!(source.semantic_language(), Language::Go);
+        let key = (
+            GoPreparedContextKind::File,
+            context_id,
+            source.ordinal(),
+            path.to_owned(),
+            source_role.to_owned(),
+        );
+        if let Some(context) = self.go_prepared_contexts.borrow().get(&key).cloned() {
+            self.record_go_package_inventory_state(&context.package_inventory);
+            return Ok(GoPreparedImportContextOutcome::Ready(Box::new(context)));
+        }
+        let Some(selection) = self.go_context_selection(context_id, source_role)? else {
+            return Ok(GoPreparedImportContextOutcome::Unavailable);
+        };
+        let cache_key = GoPreparedContextCacheKey {
+            kind: GoPreparedContextKind::File,
+            routing_digest: self.ready.inventory.routing_digest(),
+            publication: selection.identity.clone(),
+            caller_mount: source.ordinal(),
+            caller_path: path.to_owned(),
+            source_role: source_role.to_owned(),
+            derivation_version: super::super::go_package_context::DERIVATION_VERSION,
+            active_model_set_hash: self
+                .go_semantic_model_overlay()
+                .map(|overlay| overlay.active_model_set_hash().to_owned()),
+        };
+        if self.ready.context_identities.is_empty()
+            && let Some(cached) = self.ready.store.go_prepared_context_cache().get(&cache_key)
+        {
+            let context = cached
+                .restored_for_request(&self.ready.context_identities, &self.ready.shared_names())?;
+            self.record_go_package_inventory_state(&context.package_inventory);
+            self.go_prepared_contexts
+                .borrow_mut()
+                .insert(key, context.clone());
+            return Ok(GoPreparedImportContextOutcome::Ready(Box::new(context)));
+        }
+        // A cached file context is read only into an empty identity table (the
+        // lookup above). Its snapshot would also carry the request's other
+        // identities. Publish only a context built from an empty table.
+        let publishable = self.ready.context_identities.is_empty();
+        match self.go_import_binding_context_for_selection(
+            context_id,
+            path,
+            source_role,
+            &selection,
+            cancellation,
+            member_cache,
+        )? {
+            GoPreparedImportContextOutcome::Ready(context) => {
+                if publishable
+                    && let Some(snapshot) =
+                        context.cache_snapshot(&self.ready.lexical_source(), cancellation)?
+                {
+                    let cache_value = Arc::new(snapshot);
+                    self.ready
+                        .store
+                        .go_prepared_context_cache()
+                        .insert(cache_key, cache_value);
+                }
+                self.go_prepared_contexts
+                    .borrow_mut()
+                    .insert(key, (*context).clone());
+                Ok(GoPreparedImportContextOutcome::Ready(context))
+            }
+            outcome => Ok(outcome),
+        }
+    }
+
+    pub(crate) fn go_file_import_context_with_role(
+        &self,
+        context_id: i64,
+        path: &str,
+        source_role: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<GoPreparedImportContextOutcome> {
+        let mut member_cache = self.go_package_member_indexes.borrow_mut();
+        self.go_file_import_context_with_member_cache(
+            context_id,
+            path,
+            source_role,
+            cancellation,
+            &mut member_cache,
+        )
+    }
+
+    pub(super) fn go_import_inputs_loaded(&self, mount: SelectedResolutionMountOrdinal) -> bool {
+        self.go_import_inputs
+            .borrow()
+            .mounts
+            .contains_key(&mount.get())
+    }
+
+    /// Whether a loaded mount has a dot import.
+    pub(super) fn go_mount_has_dot_import(&self, mount: SelectedResolutionMountOrdinal) -> bool {
+        self.go_import_inputs
+            .borrow()
+            .mounts
+            .get(&mount.get())
+            .is_some_and(|inputs| inputs.has_dot_import)
+    }
+
+    /// The selected import row of a loaded mount for one source spelling.
+    pub(super) fn go_import_row(
+        &self,
+        mount: SelectedResolutionMountOrdinal,
+        spelling: &str,
+    ) -> Option<GoFileImportRow> {
+        self.go_import_inputs
+            .borrow()
+            .mounts
+            .get(&mount.get())
+            .and_then(|inputs| inputs.imports.get(spelling).cloned())
+    }
+
+    /// Read the import bindings and selected import rows of every listed Go
+    /// file in one statement each and keep them for the rest of this
+    /// operation. A request that prepares many Go files calls this once before
+    /// its per-file loop; a single file is the one-element batch. Returns false
+    /// when cancelled.
+    pub(crate) fn prefetch_go_import_inputs(
+        &self,
+        context_id: i64,
+        files: &[(&str, &str)],
+        cancellation: &CancellationToken,
+    ) -> Result<bool> {
+        let connection = self.ready.inventory.connection();
+        let mut pending = Vec::new();
+        for &(path, source_role) in files {
+            let Some(source) = self.mount_table().mount_for_path("go", path)? else {
+                continue;
+            };
+            if self
+                .go_import_inputs
+                .borrow()
+                .mounts
+                .contains_key(&source.ordinal().get())
+            {
+                continue;
+            }
+            let record = self
+                .ready
+                .inventory
+                .mount_record_by_ordinal(source.ordinal())?;
+            if let Some(version) =
+                super::go_context::go_placement_file_version(connection, &record)?
+            {
+                pending.push((source.ordinal(), version, source_role));
+            }
+        }
+        self.load_go_import_inputs(context_id, &pending, cancellation)
+    }
+
+    /// One statement for the bindings of all listed mounts (staged rows first,
+    /// then ordinary rows, as the single-file reader merged them) and one for
+    /// their selected import rows.
+    pub(super) fn load_go_import_inputs(
+        &self,
+        context_id: i64,
+        files: &[(SelectedResolutionMountOrdinal, i64, &str)],
+        cancellation: &CancellationToken,
+    ) -> Result<bool> {
+        if files.is_empty() {
+            return Ok(true);
+        }
+        let connection = self.ready.inventory.connection();
+        let mut loaded: HashMap<u32, GoMountImportInputs> = files
+            .iter()
+            .map(|(mount, _, _)| (mount.get(), GoMountImportInputs::default()))
+            .collect();
+        let mounts = serde_json::to_string(
+            &files
+                .iter()
+                .map(|(mount, _, _)| mount.get())
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|error| StoreError::new(format!("Go mount request is not JSON: {error}")))?;
+        let mut statement = connection.prepare_cached(STAGED_IMPORT_BINDINGS)?;
+        let mut rows = statement.query([&mounts])?;
         while let Some(row) = rows.next()? {
             if cancellation.is_cancelled() {
-                return Ok(GoDotImportContext::Cancelled);
+                return Ok(false);
             }
-            files.push((row.get::<_, String>(0)?, row.get::<_, String>(1)?));
+            let fact = GoImportBindingRow::staged(row)?;
+            let inputs = loaded
+                .get_mut(&row.get::<_, u32>(8)?)
+                .expect("Go import binding row names a requested mount");
+            if inputs
+                .bindings
+                .insert(fact.metadata.definition, fact)
+                .is_some_and(|prior| prior != fact)
+            {
+                return Err(StoreError::corrupt(
+                    "contradictory staged Go import binding metadata",
+                ));
+            }
         }
         drop(rows);
         drop(statement);
-        let mut context: Option<SelectedResolutionContextSet> = None;
-        for (path, role) in files {
+        let mut statement = connection.prepare_cached(ORDINARY_IMPORT_BINDINGS)?;
+        let mut rows = statement.query([&mounts])?;
+        while let Some(row) = rows.next()? {
             if cancellation.is_cancelled() {
-                return Ok(GoDotImportContext::Cancelled);
+                return Ok(false);
             }
-            let next =
-                match self.go_import_binding_context(context_id, &path, &role, cancellation)? {
-                    GoDotImportContext::Ready(context) => context,
-                    GoDotImportContext::Unavailable => return Ok(GoDotImportContext::Unavailable),
-                    GoDotImportContext::Cancelled => return Ok(GoDotImportContext::Cancelled),
-                };
-            context = Some(if let Some(context) = context {
-                let mounts = self.mount_table();
-                let Some(context) = context.merge(next, cancellation, &|fragment| {
-                    Ok(mounts
-                        .mount_for_fragment(fragment)?
-                        .map(|mount| (mount.ordinal(), mount.semantic_language())))
-                })?
-                else {
-                    return Ok(GoDotImportContext::Cancelled);
-                };
-                context
-            } else {
-                next
-            });
+            let fact = GoImportBindingRow::ordinary(row)?;
+            loaded
+                .get_mut(&row.get::<_, u32>(8)?)
+                .expect("Go import binding row names a requested mount")
+                .bindings
+                .entry(fact.metadata.definition)
+                .or_insert(fact);
         }
-        Ok(context.map_or(GoDotImportContext::Unavailable, GoDotImportContext::Ready))
+        drop(rows);
+        drop(statement);
+        let requested = serde_json::to_string(
+            &files
+                .iter()
+                .map(|(mount, version, role)| (mount.get(), version, role))
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|error| StoreError::new(format!("Go file request is not JSON: {error}")))?;
+        let mut statement = connection.prepare_cached(GO_FILE_IMPORT_ROWS)?;
+        let mut rows = statement.query(rusqlite::params![context_id, requested])?;
+        while let Some(row) = rows.next()? {
+            if cancellation.is_cancelled() {
+                return Ok(false);
+            }
+            let mount: u32 = row.get(0)?;
+            let package_name: Option<String> = row.get(4)?;
+            let package_id: Option<i64> = row.get(5)?;
+            let spelling: String = row.get(1)?;
+            let language_label: String = row.get(6)?;
+            let language = Language::from_config_label(&language_label).ok_or_else(|| {
+                StoreError::corrupt(format!("unknown selected language {language_label:?}"))
+            })?;
+            let modeled_provider = if package_name.is_none() {
+                self.model_declared_go_package(language, &spelling)
+            } else {
+                None
+            };
+            loaded
+                .get_mut(&mount)
+                .expect("Go import row names a requested mount")
+                .imports
+                .insert(
+                    spelling,
+                    GoFileImportRow {
+                        complete: modeled_provider.is_some() || row.get::<_, bool>(2)?,
+                        gaps: row.get(3)?,
+                        package_name,
+                        package_id,
+                        modeled_provider,
+                    },
+                );
+        }
+        drop(rows);
+        drop(statement);
+        let mut statement = connection.prepare_cached(GO_DOT_IMPORT_MOUNTS)?;
+        let mut rows = statement.query([&mounts])?;
+        while let Some(row) = rows.next()? {
+            if cancellation.is_cancelled() {
+                return Ok(false);
+            }
+            loaded
+                .get_mut(&row.get::<_, u32>(0)?)
+                .expect("Go dot import row names a requested mount")
+                .has_dot_import = true;
+        }
+        drop(rows);
+        drop(statement);
+        self.go_import_inputs.borrow_mut().mounts.extend(loaded);
+        Ok(true)
     }
 
     /// Bind explicit aliases and selected canonical package names in this file.
-    /// Then resolve positioned prefixes and admit only their exact package
-    /// exports. Package bindings never establish a nominal receiver type.
+    /// Positioned prefixes are answered later by the demand-root provider.
+    /// Package bindings never establish a nominal receiver type.
     pub(crate) fn go_import_binding_context(
         &self,
         context_id: i64,
         caller_path: &str,
         source_role: &str,
         cancellation: &CancellationToken,
-    ) -> Result<GoDotImportContext> {
-        let context =
-            match self.go_package_context(context_id, caller_path, source_role, cancellation)? {
-                GoDotImportContext::Ready(context) => context,
-                other => return Ok(other),
-            };
+    ) -> Result<GoPreparedImportContextOutcome> {
+        if cancellation.is_cancelled() {
+            return Ok(GoPreparedImportContextOutcome::Cancelled);
+        }
+        let Some(selection) = self.go_context_selection(context_id, source_role)? else {
+            return Ok(GoPreparedImportContextOutcome::Unavailable);
+        };
+        let mut member_cache = self.go_package_member_indexes.borrow_mut();
+        self.go_import_binding_context_for_selection(
+            context_id,
+            caller_path,
+            source_role,
+            &selection,
+            cancellation,
+            &mut member_cache,
+        )
+    }
+
+    fn go_import_binding_context_for_selection(
+        &self,
+        context_id: i64,
+        caller_path: &str,
+        source_role: &str,
+        selection: &GoContextSelection,
+        cancellation: &CancellationToken,
+        member_cache: &mut super::go_same_package::GoPackageMemberIndexCache,
+    ) -> Result<GoPreparedImportContextOutcome> {
+        let (context, package_inventory) = match self.go_package_context_for_selection(
+            context_id,
+            caller_path,
+            source_role,
+            selection,
+            cancellation,
+            member_cache,
+        )? {
+            GoDotImportContext::Ready { context, inventory } => (context, inventory),
+            GoDotImportContext::Unavailable => {
+                return Ok(GoPreparedImportContextOutcome::Unavailable);
+            }
+            GoDotImportContext::Cancelled => {
+                return Ok(GoPreparedImportContextOutcome::Cancelled);
+            }
+        };
         let source = self
             .mount_table()
             .mount_for_path("go", caller_path)?
@@ -447,54 +1102,42 @@ impl SelectedResolutionOperation<'_, '_> {
         let connection = self.ready.inventory.connection();
         let version = super::go_context::go_placement_file_version(connection, &record)?
             .expect("package context requires a selected placement");
-        let package: i64 = connection
-            .prepare_cached(super::go_same_package::CALLER_PACKAGE)?
-            .query_row(rusqlite::params![context_id, version, source_role], |row| {
-                row.get(0)
-            })?;
+        if !self
+            .go_import_inputs
+            .borrow()
+            .mounts
+            .contains_key(&source.ordinal().get())
+            && !self.load_go_import_inputs(
+                context_id,
+                &[(source.ordinal(), version, source_role)],
+                cancellation,
+            )?
+        {
+            return Ok(GoPreparedImportContextOutcome::Cancelled);
+        }
+        let inputs = self
+            .go_import_inputs
+            .borrow()
+            .mounts
+            .get(&source.ordinal().get())
+            .expect("Go import inputs were loaded for the caller mount")
+            .clone();
         let Some(imports) =
             super::super::source_facts::read_source_imports(connection, record.blob_id(), &|| {
                 !cancellation.is_cancelled()
             })?
         else {
-            return Ok(GoDotImportContext::Cancelled);
+            return Ok(GoPreparedImportContextOutcome::Cancelled);
         };
-        let mut metadata = BTreeMap::new();
-        let mut statement = connection.prepare_cached(STAGED_IMPORT_BINDINGS)?;
-        let mut rows = statement.query([source.ordinal().get()])?;
-        while let Some(row) = rows.next()? {
-            if cancellation.is_cancelled() {
-                return Ok(GoDotImportContext::Cancelled);
-            }
-            let fact = GoImportBindingRow::staged(row)?;
-            if metadata
-                .insert(fact.metadata.definition, fact)
-                .is_some_and(|prior| prior != fact)
-            {
-                return Err(StoreError::corrupt(
-                    "contradictory staged Go import binding metadata",
-                ));
-            }
-        }
-        drop(rows);
-        let mut statement = connection.prepare_cached(ORDINARY_IMPORT_BINDINGS)?;
-        let mut rows = statement.query([source.ordinal().get()])?;
-        while let Some(row) = rows.next()? {
-            if cancellation.is_cancelled() {
-                return Ok(GoDotImportContext::Cancelled);
-            }
-            let fact = GoImportBindingRow::ordinary(row, source.ordinal().get())?;
-            metadata.entry(fact.metadata.definition).or_insert(fact);
-        }
-        drop(rows);
         let names = self.ready.shared_names();
         let lexical = self.ready.lexical_source();
         let completion = context.inventory_completion().clone();
         let mut bindings = Vec::new();
-        let mut providers = HashMap::default();
-        for row in metadata.into_values() {
+        let mut import_packages = HashMap::default();
+        let mut modeled_imports = HashMap::default();
+        for row in inputs.bindings.into_values() {
             if cancellation.is_cancelled() {
-                return Ok(GoDotImportContext::Cancelled);
+                return Ok(GoPreparedImportContextOutcome::Cancelled);
             }
             if row.metadata.kind == ResolutionGoPackageImportKind::Blank {
                 continue;
@@ -508,40 +1151,62 @@ impl SelectedResolutionOperation<'_, '_> {
                 ));
             };
             let spelling = path.segments.join("/");
-            let package_target: Option<(String, i64)> = connection
-                .prepare_cached(IMPORT_PACKAGE_NAME)?
-                .query_row(
-                    rusqlite::params![context_id, package, source_role, spelling],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?;
+            let selected = inputs.imports.get(&spelling);
+            let import_completion = self.go_import_completion_for(
+                context_id,
+                version,
+                source_role,
+                &spelling,
+                selected,
+                &completion,
+            );
+            let package_name = selected.and_then(|row| row.package_name.as_deref());
+            let package_id = selected.and_then(|row| row.package_id);
+            let modeled_provider = selected.and_then(|row| row.modeled_provider.as_ref());
+            let presumed =
+                import.alias.is_none() && package_name.is_none() && modeled_provider.is_none();
             let Some(name) = import
                 .alias
                 .as_deref()
-                .or(package_target.as_ref().map(|(name, _)| name.as_str()))
+                .or(package_name)
+                .or(modeled_provider.map(|provider| provider.package_name.as_str()))
+                .or_else(|| {
+                    presumed
+                        .then(|| path.segments.last().map(String::as_str))
+                        .flatten()
+                })
             else {
-                // Canonical publication keeps a missing provider explicitly
-                // incomplete; no path basename may invent the default name.
-                assert!(
-                    !matches!(completion, ResolutionCompletion::Complete),
-                    "missing canonical import name requires incomplete publication"
-                );
                 continue;
             };
+            if presumed {
+                assert!(
+                    !matches!(import_completion, ResolutionCompletion::Complete),
+                    "a presumed binder requires an unresolved provider"
+                );
+            }
             let Some(definition_node) =
                 lexical.lookup_definition_node(row.metadata.definition, cancellation)?
             else {
                 if cancellation.is_cancelled() {
-                    return Ok(GoDotImportContext::Cancelled);
+                    return Ok(GoPreparedImportContextOutcome::Cancelled);
                 }
                 return Err(StoreError::corrupt(
                     "Go import metadata has no selected definition node",
                 ));
             };
-            if let Some((_, package)) = &package_target {
-                providers.insert(row.metadata.definition, *package);
+            if package_name.is_some() {
+                import_packages.insert(
+                    (source.ordinal(), row.metadata.definition),
+                    package_id.expect("a durable package clause has a provider row"),
+                );
             }
-            bindings.push(SelectedGoImportBindingDescriptor::new(
+            if let Some(provider) = modeled_provider {
+                modeled_imports.insert(
+                    (source.ordinal(), row.metadata.definition),
+                    provider.clone(),
+                );
+            }
+            let binding = SelectedGoImportBindingDescriptor::new(
                 source.fragment(),
                 &row.metadata,
                 definition_node,
@@ -551,8 +1216,13 @@ impl SelectedResolutionOperation<'_, '_> {
                     name,
                 )
                 .semantic(&names),
-                completion.clone(),
-            ));
+                import_completion,
+            );
+            bindings.push(if presumed {
+                binding.with_presumed_provider(spelling.into(), package_id)
+            } else {
+                binding
+            });
         }
         let mounts = self.mount_table();
         let Some(context) =
@@ -562,25 +1232,82 @@ impl SelectedResolutionOperation<'_, '_> {
                     .map(|mount| (mount.ordinal(), mount.semantic_language())))
             })?
         else {
-            return Ok(GoDotImportContext::Cancelled);
+            return Ok(GoPreparedImportContextOutcome::Cancelled);
         };
-        self.go_qualified_import_context(
-            context,
+        let demand = GoDemandContext {
+            context_id,
+            import_packages,
+            modeled_imports,
+            context_completions: HashMap::from_iter([(
+                source.ordinal(),
+                context.inventory_completion().clone(),
+            )]),
+        };
+        self.record_go_package_inventory_state(&package_inventory);
+        Ok(GoPreparedImportContextOutcome::Ready(Box::new(
+            GoPreparedImportContext {
+                context,
+                demand,
+                package_inventory,
+            },
+        )))
+    }
+
+    /// Test-only oracle for the historical eager qualified-prefix compiler.
+    #[cfg(test)]
+    pub(crate) fn go_eager_import_binding_context(
+        &self,
+        context_id: i64,
+        caller_path: &str,
+        source_role: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<GoDotImportContext> {
+        let prepared = match self.go_import_binding_context(
+            context_id,
+            caller_path,
+            source_role,
+            cancellation,
+        )? {
+            GoPreparedImportContextOutcome::Ready(prepared) => prepared,
+            GoPreparedImportContextOutcome::Unavailable => {
+                return Ok(GoDotImportContext::Unavailable);
+            }
+            GoPreparedImportContextOutcome::Cancelled => {
+                return Ok(GoDotImportContext::Cancelled);
+            }
+        };
+        let source = self
+            .mount_table()
+            .mount_for_path("go", caller_path)?
+            .expect("prepared Go context has a selected source mount");
+        let providers = prepared
+            .demand
+            .import_packages
+            .iter()
+            .filter_map(|((mount, semantic), package)| {
+                (*mount == source.ordinal()).then_some((*semantic, *package))
+            })
+            .collect::<HashMap<_, _>>();
+        self.go_eager_qualified_import_context(
+            prepared.context,
             source.ordinal(),
             context_id,
             &providers,
+            prepared.package_inventory,
             cancellation,
         )
     }
 
     /// Authorize package exports only through definitions actually reached by
     /// the positioned lexical prefix. Local values and types remain blockers.
-    fn go_qualified_import_context(
+    #[cfg(test)]
+    fn go_eager_qualified_import_context(
         &self,
         context: SelectedResolutionContextSet,
         source: SelectedResolutionMountOrdinal,
         context_id: i64,
         providers: &HashMap<SemanticId, i64>,
+        inventory: GoPackageInventoryState,
         cancellation: &CancellationToken,
     ) -> Result<GoDotImportContext> {
         let lexical = self.ready.lexical_source();
@@ -613,7 +1340,7 @@ impl SelectedResolutionOperation<'_, '_> {
             return Ok(GoDotImportContext::Cancelled);
         }
         if halves.is_empty() {
-            return Ok(GoDotImportContext::Ready(context));
+            return Ok(GoDotImportContext::Ready { context, inventory });
         }
         let mut references = halves
             .iter()
@@ -766,7 +1493,7 @@ impl SelectedResolutionOperation<'_, '_> {
                     .mount_for_fragment(fragment)?
                     .map(|mount| (mount.ordinal(), mount.semantic_language())))
             })? {
-                Some(context) => GoDotImportContext::Ready(context),
+                Some(context) => GoDotImportContext::Ready { context, inventory },
                 None => GoDotImportContext::Cancelled,
             },
         )

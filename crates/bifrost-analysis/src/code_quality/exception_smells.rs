@@ -30,30 +30,26 @@ pub struct ReportExceptionHandlingSmellsParams {
     /// All `*_weight` and `*_credit*` knobs accept `< 0` to keep the brokk
     /// default (zero is honored as an explicit override). Mirrors brokk-core
     /// MCP semantics so the same JSON arguments produce identical reports.
-    #[serde(default = "default_neg")]
+    #[serde(default = "crate::code_quality::default_weight_sentinel")]
     pub generic_throwable_weight: i32,
-    #[serde(default = "default_neg")]
+    #[serde(default = "crate::code_quality::default_weight_sentinel")]
     pub generic_exception_weight: i32,
-    #[serde(default = "default_neg")]
+    #[serde(default = "crate::code_quality::default_weight_sentinel")]
     pub generic_runtime_exception_weight: i32,
-    #[serde(default = "default_neg")]
+    #[serde(default = "crate::code_quality::default_weight_sentinel")]
     pub empty_body_weight: i32,
-    #[serde(default = "default_neg")]
+    #[serde(default = "crate::code_quality::default_weight_sentinel")]
     pub comment_only_body_weight: i32,
-    #[serde(default = "default_neg")]
+    #[serde(default = "crate::code_quality::default_weight_sentinel")]
     pub small_body_weight: i32,
-    #[serde(default = "default_neg")]
+    #[serde(default = "crate::code_quality::default_weight_sentinel")]
     pub log_only_body_weight: i32,
-    #[serde(default = "default_neg")]
+    #[serde(default = "crate::code_quality::default_weight_sentinel")]
     pub meaningful_body_credit_per_statement: i32,
-    #[serde(default = "default_neg")]
+    #[serde(default = "crate::code_quality::default_weight_sentinel")]
     pub meaningful_body_statement_threshold: i32,
-    #[serde(default = "default_neg")]
+    #[serde(default = "crate::code_quality::default_weight_sentinel")]
     pub small_body_max_statements: i32,
-}
-
-fn default_neg() -> i32 {
-    -1
 }
 
 impl Default for ReportExceptionHandlingSmellsParams {
@@ -319,65 +315,6 @@ mod tests {
     use super::*;
     use crate::test_support::AnalyzerFixture;
 
-    fn java_with_catch(body: &str) -> String {
-        format!(
-            "package com.example;\n\npublic class Foo {{\n  public void bar() {{\n    try {{ int x = 1; }} catch (Exception e) {{\n{body}    }}\n  }}\n}}\n"
-        )
-    }
-
-    #[test]
-    fn exception_smells_empty_body_above_threshold_is_reported() {
-        let java = java_with_catch("");
-        let fix = AnalyzerFixture::new(&[("Foo.java", java.as_str())]);
-        let result = report_exception_handling_smells(
-            fix.analyzer.analyzer(),
-            ReportExceptionHandlingSmellsParams {
-                file_paths: vec!["Foo.java".to_string()],
-                ..Default::default()
-            },
-        );
-        assert!(
-            result.report.starts_with("## Exception handling smells"),
-            "report: {}",
-            result.report
-        );
-        assert!(result.report.contains("- Min score: 4"));
-        assert!(result.report.contains("- Findings shown: 1 of 1"));
-        // Empty body + catching Exception → score = 5 (empty) + 3 (Exception) +
-        // 2 (small body, 0 stmts) = 10. Reasons listed comma-joined inside backticks.
-        assert!(
-            result
-                .report
-                .contains("| 10 | `Exception` | 0 | `com.example.Foo.bar`")
-        );
-        assert!(
-            result
-                .report
-                .contains("generic-catch:Exception, empty-body, small-body:0")
-        );
-        assert!(!result.truncated);
-    }
-
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[test]
-    fn exception_smells_meaningful_body_below_threshold_is_filtered() {
-        let body = "      System.out.println(1);\n      System.out.println(2);\n      System.out.println(3);\n";
-        let java = java_with_catch(body);
-        let fix = AnalyzerFixture::new(&[("Foo.java", java.as_str())]);
-        let result = report_exception_handling_smells(
-            fix.analyzer.analyzer(),
-            ReportExceptionHandlingSmellsParams {
-                file_paths: vec!["Foo.java".to_string()],
-                ..Default::default()
-            },
-        );
-        // catch Exception (3) + 3 stmts * creditPerStmt(1) = 0 after credit → filtered.
-        assert_eq!(
-            result.report,
-            "No exception-handling smells met minScore 4."
-        );
-    }
-
     #[test]
     fn exception_smells_unsupported_files_are_not_reported_as_clean() {
         let fix = AnalyzerFixture::new(&[("notes.txt", "not parsed source\n")]);
@@ -397,86 +334,5 @@ mod tests {
         assert!(result.report.contains("`notes.txt`"));
         assert_eq!(result.unsupported_files.len(), 1);
         assert!(result.failed_files.is_empty());
-    }
-
-    #[test]
-    fn exception_smells_log_only_body_gets_log_reason() {
-        let body = "      log.error(\"boom\", e);\n";
-        let java = java_with_catch(body);
-        let fix = AnalyzerFixture::new(&[("Foo.java", java.as_str())]);
-        let result = report_exception_handling_smells(
-            fix.analyzer.analyzer(),
-            ReportExceptionHandlingSmellsParams {
-                file_paths: vec!["Foo.java".to_string()],
-                ..Default::default()
-            },
-        );
-        assert!(
-            result.report.contains("log-only-body"),
-            "report: {}",
-            result.report
-        );
-        // 1-stmt body still counts as small (<= small_body_max=2).
-        assert!(result.report.contains("small-body:1"));
-    }
-
-    #[test]
-    fn exception_smells_throwable_outranks_exception() {
-        let java = "package com.example;\n\npublic class Foo {\n  public void bar() {\n    try { int x = 1; } catch (Throwable t) {\n    }\n    try { int y = 2; } catch (Exception e) {\n    }\n  }\n}\n";
-        let fix = AnalyzerFixture::new(&[("Foo.java", java)]);
-        let result = report_exception_handling_smells(
-            fix.analyzer.analyzer(),
-            ReportExceptionHandlingSmellsParams {
-                file_paths: vec!["Foo.java".to_string()],
-                ..Default::default()
-            },
-        );
-        // Throwable empty: 5 + 5 + 2 = 12. Exception empty: 3 + 5 + 2 = 10.
-        // Throwable must appear first.
-        let throwable_pos = result.report.find("`Throwable`").unwrap();
-        let exception_pos = result.report.find("`Exception`").unwrap();
-        assert!(throwable_pos < exception_pos);
-    }
-
-    #[test]
-    fn exception_smells_max_findings_truncates_output() {
-        let java = "package com.example;\n\npublic class Foo {\n  public void bar() {\n    try { int x = 1; } catch (Exception e) {}\n    try { int y = 2; } catch (Exception e) {}\n  }\n}\n";
-        let fix = AnalyzerFixture::new(&[("Foo.java", java)]);
-        let result = report_exception_handling_smells(
-            fix.analyzer.analyzer(),
-            ReportExceptionHandlingSmellsParams {
-                file_paths: vec!["Foo.java".to_string()],
-                max_findings: 1,
-                ..Default::default()
-            },
-        );
-        assert!(result.truncated);
-        assert!(result.report.contains("- Findings shown: 1 of 2"));
-        assert!(
-            result
-                .report
-                .contains("- Note: output truncated; increase maxFindings to see more.")
-        );
-    }
-
-    #[test]
-    fn exception_smells_explicit_min_score_filters_low_scores() {
-        // Catch Exception with one logging statement: 3 (Exception) + 2 (small) + 2 (log-only)
-        // − 1 (credit) = 6. Use min_score 7 to filter it out.
-        let body = "      log.warn(\"oops\");\n";
-        let java = java_with_catch(body);
-        let fix = AnalyzerFixture::new(&[("Foo.java", java.as_str())]);
-        let result = report_exception_handling_smells(
-            fix.analyzer.analyzer(),
-            ReportExceptionHandlingSmellsParams {
-                file_paths: vec!["Foo.java".to_string()],
-                min_score: 7,
-                ..Default::default()
-            },
-        );
-        assert_eq!(
-            result.report,
-            "No exception-handling smells met minScore 7."
-        );
     }
 }

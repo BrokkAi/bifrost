@@ -500,14 +500,6 @@ mod tests {
     }
 
     #[test]
-    fn a_proven_subset_met_with_an_incomplete_relation_is_incomplete() {
-        assert_eq!(
-            RelationCoverage::proven_subset().meet(incomplete(PolicyIncompleteReason::Cancelled)),
-            incomplete(PolicyIncompleteReason::Cancelled)
-        );
-    }
-
-    #[test]
     fn unsupported_dominates_every_other_coverage() {
         let unsupported = RelationCoverage::unsupported_row_set();
         for coverage in [
@@ -608,8 +600,28 @@ mod tests {
         assert_eq!(named(right.meet(left).partition()), expected);
     }
 
-    /// The fold is bounded, and a fold that drops a name says so rather than
-    /// publishing a partition list that reads as complete.
+    /// A coverage nothing narrowed is a claim about the query's own scope, and
+    /// says so rather than naming an empty partition set that reads the same as
+    /// a dropped one.
+    #[test]
+    fn an_unnarrowed_coverage_is_a_query_scope_claim() {
+        assert!(RelationCoverage::exhaustive().partition().is_query_scope());
+        assert!(RelationCoverage::row_budget().partition().is_query_scope());
+        assert!(
+            !RelationCoverage::exhaustive()
+                .in_partition(root(DetailedCodeQueryDomain::FlowEndpoint, "plan-a"))
+                .partition()
+                .is_query_scope()
+        );
+    }
+
+    #[test]
+    fn a_proven_subset_met_with_an_incomplete_relation_is_incomplete() {
+        assert_eq!(
+            RelationCoverage::proven_subset().meet(incomplete(PolicyIncompleteReason::Cancelled)),
+            incomplete(PolicyIncompleteReason::Cancelled)
+        );
+    }
     #[test]
     fn a_partition_fold_is_bounded_and_records_what_it_dropped() {
         let mut coverage = incomplete(PolicyIncompleteReason::Cancelled)
@@ -628,22 +640,6 @@ mod tests {
         );
         assert!(coverage.partition().truncated());
     }
-
-    /// A coverage nothing narrowed is a claim about the query's own scope, and
-    /// says so rather than naming an empty partition set that reads the same as
-    /// a dropped one.
-    #[test]
-    fn an_unnarrowed_coverage_is_a_query_scope_claim() {
-        assert!(RelationCoverage::exhaustive().partition().is_query_scope());
-        assert!(RelationCoverage::row_budget().partition().is_query_scope());
-        assert!(
-            !RelationCoverage::exhaustive()
-                .in_partition(root(DetailedCodeQueryDomain::FlowEndpoint, "plan-a"))
-                .partition()
-                .is_query_scope()
-        );
-    }
-
     #[test]
     fn an_incomplete_coverage_always_states_a_reason() {
         assert_eq!(

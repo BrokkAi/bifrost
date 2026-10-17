@@ -1,21 +1,25 @@
+use super::EnvironmentOptionKind;
 use super::ir::{
     AbsentMemberProofFilter, CallIdentity, CodeQuery, CodeQueryPlan, CodeQueryPlanSource,
-    CodeQueryResultDetail, MAX_DECORATOR_BINDING_FILTER_LENGTH, QueryStep,
+    CodeQueryResultDetail, DeclarationModifier, MAX_DECORATOR_BINDING_FILTER_LENGTH, QueryStep,
     ResolvedCallReceiverType,
 };
 use super::schema::{
-    BINDING_OF_STEP_OPTIONS, CodeQueryExecutionMode, ConfigurationFactsFilterField,
-    DECORATOR_BINDING_STEP_OPTIONS, QueryStepField, QueryStepOp, ReceiverTypeConstraintForm,
-    RqlForm, RqlFormClass, RqlProperty, SCOPE_SEED_RQL_LABELS, ScopeFilterField,
-    binding_option_for_rql_label, candidate_option_for_rql_label,
-    configuration_facts_field_for_rql_label, constrained_step_option_labels,
-    declaration_state_option_for_rql_label, export_field_for_rql_label,
-    generation_site_field_for_rql_label, occurrence_option_for_rql_label,
-    resolve_rql_schema_version,
+    ALL_RQL_FORMS, BINDING_OF_STEP_OPTIONS, CodeQueryExecutionMode, ConfigurationCodeRelationField,
+    ConfigurationFactsFilterField, ConfigurationKeyRelationField, CrossDomainField,
+    DECORATOR_BINDING_STEP_OPTIONS, DependencyConfigurationRelationField, QueryStepField,
+    QueryStepOp, ReceiverTypeConstraintForm, RqlForm, RqlFormClass, RqlProperty,
+    SCOPE_SEED_RQL_LABELS, ScopeFilterField, binding_option_for_rql_label,
+    candidate_option_for_rql_label, configuration_code_relation_field_for_rql_label,
+    configuration_facts_field_for_rql_label, configuration_key_relation_field_for_rql_label,
+    constrained_step_option_labels, cross_domain_field_for_rql_label,
+    declaration_state_option_for_rql_label, dependency_configuration_relation_field_for_rql_label,
+    export_field_for_rql_label, generation_site_field_for_rql_label,
+    occurrence_option_for_rql_label, resolve_rql_schema_version,
 };
-#[cfg(test)]
-use crate::sexp::MAX_SEXP_DEPTH;
 use crate::sexp::{Expr, ExprKind, ParseError, ParsedSexp, parse_sexp};
+use brokk_bifrost_core::analyzer::cpp_class_facts::CppClassFactKind;
+use brokk_bifrost_core::analyzer::structural::facts::AssignmentSequenceKind;
 use brokk_bifrost_core::analyzer::structural::kinds::{NormalizedKind, Role, RoleValueShape};
 use brokk_bifrost_core::schema_version::SchemaVersionResolution;
 use serde_json::{Map, Number, Value, json};
@@ -193,15 +197,53 @@ pub fn code_query_from_expr(
 }
 
 fn annotate_call_identity_ranges(plan: &mut CodeQueryPlan, expr: &Expr, path: &str) {
-    if let CodeQueryPlanSource::Set { op, branches } = &mut plan.source {
-        for (index, branch) in branches.iter_mut().enumerate() {
-            let branch_path = if path.is_empty() {
-                format!("{}[{index}]", op.label())
-            } else {
-                format!("{path}.{}[{index}]", op.label())
-            };
-            annotate_call_identity_ranges(branch, expr, &branch_path);
+    let child_path = |field: String| {
+        if path.is_empty() {
+            field
+        } else {
+            format!("{path}.{field}")
         }
+    };
+    match &mut plan.source {
+        CodeQueryPlanSource::Set { op, branches } => {
+            for (index, branch) in branches.iter_mut().enumerate() {
+                let branch_path = child_path(format!("{}[{index}]", op.label()));
+                annotate_call_identity_ranges(branch, expr, &branch_path);
+            }
+        }
+        CodeQueryPlanSource::Correlate(correlation) => {
+            annotate_call_identity_ranges(
+                &mut correlation.code,
+                expr,
+                &child_path("correlate.code".to_owned()),
+            );
+            annotate_call_identity_ranges(
+                &mut correlation.configuration,
+                expr,
+                &child_path("correlate.configuration".to_owned()),
+            );
+        }
+        CodeQueryPlanSource::RequireBoth(requirement) => {
+            annotate_call_identity_ranges(
+                &mut requirement.code,
+                expr,
+                &child_path("require_both.code".to_owned()),
+            );
+            annotate_call_identity_ranges(
+                &mut requirement.configuration,
+                expr,
+                &child_path("require_both.configuration".to_owned()),
+            );
+        }
+        CodeQueryPlanSource::Seed(_)
+        | CodeQueryPlanSource::Occurrences(_)
+        | CodeQueryPlanSource::Scopes(_)
+        | CodeQueryPlanSource::Bindings(_)
+        | CodeQueryPlanSource::Paths(_)
+        | CodeQueryPlanSource::GenerationSites(_)
+        | CodeQueryPlanSource::Exports(_)
+        | CodeQueryPlanSource::DependencyEvidence(_)
+        | CodeQueryPlanSource::ConfigurationFacts(_) => {}
     }
     let steps_path = if path.is_empty() {
         "steps".to_owned()
@@ -209,26 +251,33 @@ fn annotate_call_identity_ranges(plan: &mut CodeQueryPlan, expr: &Expr, path: &s
         format!("{path}.steps")
     };
     for (index, step) in plan.steps.iter_mut().enumerate() {
-        let QueryStep::ResolvedCall(filter) = step else {
-            continue;
-        };
-        annotate_call_identity_range(
-            &mut filter.resolves_to,
-            expr,
-            &format!("{steps_path}[{index}].resolves_to"),
-        );
-        if let Some(receiver_type) = &mut filter.receiver_type {
-            let path_suffix =
-                if matches!(receiver_type, ResolvedCallReceiverType::AssignableTo { .. }) {
-                    ".assignable_to"
-                } else {
-                    ""
-                };
-            annotate_call_identity_range(
-                receiver_type.root_mut(),
+        match step {
+            QueryStep::ResolvedCall(filter) => {
+                annotate_call_identity_range(
+                    &mut filter.resolves_to,
+                    expr,
+                    &format!("{steps_path}[{index}].resolves_to"),
+                );
+                if let Some(receiver_type) = &mut filter.receiver_type {
+                    let path_suffix =
+                        if matches!(receiver_type, ResolvedCallReceiverType::AssignableTo { .. }) {
+                            ".assignable_to"
+                        } else {
+                            ""
+                        };
+                    annotate_call_identity_range(
+                        receiver_type.root_mut(),
+                        expr,
+                        &format!("{steps_path}[{index}].receiver_type{path_suffix}"),
+                    );
+                }
+            }
+            QueryStep::ResolvedValue(filter) => annotate_call_identity_range(
+                &mut filter.resolves_to,
                 expr,
-                &format!("{steps_path}[{index}].receiver_type{path_suffix}"),
-            );
+                &format!("{steps_path}[{index}].resolves_to"),
+            ),
+            _ => {}
         }
     }
 }
@@ -430,6 +479,17 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
             insert_unique(&mut query, field, pattern_to_json(&items[1])?).at(expr)?;
             Ok(Some(Value::Object(query)))
         }
+        RqlForm::Correlate | RqlForm::RequireBoth => {
+            let operator = cross_domain_inputs_to_json(expr, head, &items[1..])?;
+            let mut query = Map::new();
+            let field = if form == RqlForm::Correlate {
+                "correlate"
+            } else {
+                "require_both"
+            };
+            query.insert(field.to_string(), Value::Object(operator));
+            Ok(Some(Value::Object(query)))
+        }
         RqlForm::Union | RqlForm::Intersect | RqlForm::Except => {
             if items.len() < 3 {
                 return Err(lower_error(
@@ -471,8 +531,116 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
             step.insert("columns".to_string(), columns);
             append_step(expr, &items[3], step)
         }
+        RqlForm::Anchor => {
+            if items.len() != 4 || items[1].as_symbol() != Some(":capture") {
+                return Err(lower_error(
+                    expr,
+                    "(anchor ...) expects :capture, a capture name, and a query",
+                ));
+            }
+            let capture = string_arg(&items[2])?;
+            let mut step = Map::new();
+            step.insert("op".to_string(), Value::String("anchor".to_string()));
+            step.insert("capture".to_string(), Value::String(capture));
+            append_step(expr, &items[3], step)
+        }
+        RqlForm::StatementFacts => {
+            if items.len() != 4 || items[1].as_symbol() != Some(":kind") {
+                return Err(lower_error(
+                    expr,
+                    "(statement-facts ...) expects :kind, a statement fact label, and a query",
+                ));
+            }
+            let label = symbol_or_string(&items[2])?;
+            let kind =
+                brokk_bifrost_core::analyzer::statement_facts::StatementFactKind::from_label(
+                    &label,
+                )
+                .ok_or_else(|| {
+                    lower_error(&items[2], format!("unknown statement fact `{label}`"))
+                })?;
+            let mut step = Map::new();
+            step.insert(
+                "op".to_string(),
+                Value::String("statement_facts".to_string()),
+            );
+            step.insert(
+                QueryStepField::StatementFactKind.label().to_string(),
+                Value::String(kind.label().to_string()),
+            );
+            append_step(expr, &items[3], step)
+        }
+        RqlForm::CppFacts => {
+            let option = items
+                .get(1)
+                .and_then(Expr::as_symbol)
+                .and_then(|label| QueryStepOp::CppFacts.option_for_rql_label(label));
+            if items.len() != 4
+                || option.is_none_or(|option| option.field() != QueryStepField::CppFactKind)
+            {
+                return Err(lower_error(
+                    expr,
+                    "(cpp-facts ...) expects :kind RULE followed by a query",
+                ));
+            }
+            let kind_expr = &items[2];
+            let kind_label = symbol_or_string(kind_expr)?;
+            if CppClassFactKind::from_label(&kind_label).is_none() {
+                return Err(lower_error(
+                    kind_expr,
+                    format!(
+                        "(cpp-facts :kind ...) must be one of {}",
+                        CppClassFactKind::ALL
+                            .iter()
+                            .map(|kind| kind.label())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                ));
+            }
+            let mut step = Map::new();
+            step.insert(
+                "op".to_string(),
+                Value::String(QueryStepOp::CppFacts.label().to_string()),
+            );
+            step.insert(
+                QueryStepField::CppFactKind.json_label().to_string(),
+                Value::String(kind_label),
+            );
+            append_step(expr, &items[3], step)
+        }
+        RqlForm::ProgramPointById => {
+            let op = form
+                .query_step_op()
+                .expect("program-point-by-id declares a query step");
+            let option = items
+                .get(1)
+                .and_then(Expr::as_symbol)
+                .and_then(|label| op.option_for_rql_label(label));
+            if items.len() != 4
+                || option.is_none_or(|option| option.field() != QueryStepField::ProgramPointId)
+            {
+                return Err(lower_error(
+                    expr,
+                    "(program-point-by-id ...) expects :id, a public program-point id string, and a procedure query",
+                ));
+            }
+            let id = string_arg(&items[2])?;
+            let mut step = Map::new();
+            step.insert("op".to_string(), Value::String(op.label().to_string()));
+            step.insert(
+                option
+                    .expect("validated program-point-by-id option")
+                    .field()
+                    .label()
+                    .to_string(),
+                Value::String(id),
+            );
+            append_step(expr, &items[3], step)
+        }
         RqlForm::EnclosingDecl
         | RqlForm::ProcedureOf
+        | RqlForm::ProgramPointOf
         | RqlForm::CfgEntry
         | RqlForm::CfgExits
         | RqlForm::CfgSuccessorEdges
@@ -480,9 +648,13 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
         | RqlForm::CfgEdgeSource
         | RqlForm::CfgEdgeTarget
         | RqlForm::ClassSet
+        | RqlForm::RustPointerFindings
         | RqlForm::FileOf
         | RqlForm::ImportsOf
         | RqlForm::ImportersOf
+        | RqlForm::PythonImportSite
+        | RqlForm::PythonImportCycles
+        | RqlForm::PythonCommentedOutCode
         | RqlForm::Members
         | RqlForm::Owner => {
             expect_len(expr, items, 2, head)?;
@@ -926,6 +1098,46 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
             }
             append_step(expr, &items[items.len() - 1], step)
         }
+        RqlForm::ResolvedValue => {
+            if items.len() < 6 || !(items.len() - 2).is_multiple_of(2) {
+                return Err(lower_error(
+                    expr,
+                    "(resolved-value ...) expects :resolves-to, :proof, and a query",
+                ));
+            }
+            let mut step = Map::new();
+            step.insert(
+                "op".to_string(),
+                Value::String(QueryStepOp::ResolvedValue.label().to_string()),
+            );
+            for pair in items[1..items.len() - 1].chunks_exact(2) {
+                let key = pair[0].as_symbol().ok_or_else(|| {
+                    lower_error(&pair[0], "resolved-value option names must be symbols")
+                })?;
+                let option = QueryStepOp::ResolvedValue
+                    .option_for_rql_label(key)
+                    .ok_or_else(|| {
+                        lower_error(&pair[0], format!("unknown resolved-value option {key}"))
+                    })?;
+                let value = match option.field() {
+                    QueryStepField::ResolvesTo => call_identity_value(&pair[1], head)?,
+                    QueryStepField::CallProof => {
+                        Value::String(symbol_or_string(&pair[1])?.replace('-', "_"))
+                    }
+                    _ => unreachable!("resolved-value registry contains only its two options"),
+                };
+                if step
+                    .insert(option.field().label().to_string(), value)
+                    .is_some()
+                {
+                    return Err(lower_error(
+                        &pair[0],
+                        format!("resolved-value repeats option {key}"),
+                    ));
+                }
+            }
+            append_step(expr, &items[items.len() - 1], step)
+        }
         RqlForm::CallArgument => {
             if items.len() != 4 {
                 return Err(lower_error(
@@ -1045,30 +1257,71 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
         }
         RqlForm::ReceiverOutcome
         | RqlForm::ReceiverEvidence
+        | RqlForm::PointsToCandidates
         | RqlForm::MemberSelection
         | RqlForm::CandidateHierarchy
         | RqlForm::DispatchOutcome
         | RqlForm::DispatchTargets
         | RqlForm::MemberFamily
         | RqlForm::FamilyEdges
+        | RqlForm::ClassHierarchy
+        | RqlForm::ClassBases
+        | RqlForm::ClassMro
+        | RqlForm::MroMembers
+        | RqlForm::PythonOverrides
+        | RqlForm::PythonCallRelations
+        | RqlForm::PythonOverrideSignatures
+        | RqlForm::PythonDocumentation
+        | RqlForm::PythonUselessClass
+        | RqlForm::PythonAttributeShadowsMethod
+        | RqlForm::PythonModificationOfDefaultValue
+        | RqlForm::PythonOverlyComplexDelete
         | RqlForm::CallShape
+        | RqlForm::ExactExternalCallee
         | RqlForm::CallResults
         | RqlForm::CallArgumentGroups
         | RqlForm::CallArguments
         | RqlForm::CallBindings
+        | RqlForm::CppBadStrncpySize
+        | RqlForm::CppNetworkToHostFunctionAsArrayBound
+        | RqlForm::CppNonConstantFormat
+        | RqlForm::CppWrongNumberFormatArguments
+        | RqlForm::CppTooManyFormatArguments
+        | RqlForm::CppWrongTypeFormatArgument
+        | RqlForm::CppNonPortablePrintf
+        | RqlForm::CppOverflowingSnprintf
+        | RqlForm::CppInconsistentLoopDirection
+        | RqlForm::CppUnsafeArrayForDaysOfTheYear
         | RqlForm::CallEffects
         | RqlForm::ResultContractCalls
         | RqlForm::CallResultContracts
         | RqlForm::CallResultObligations
+        | RqlForm::ProcedureReturnProfile
+        | RqlForm::PythonIteratorReturnProtocol
+        | RqlForm::PythonBuiltinIdentity
+        | RqlForm::PythonUninitializedVariable
+        | RqlForm::PythonRaiseNotImplemented
+        | RqlForm::PythonUnsafeCyclicImport
+        | RqlForm::CallResultUse
+        | RqlForm::PythonAssertionContext
+        | RqlForm::TupleReturnAssignment
+        | RqlForm::PythonImplicitStringConcatenation
+        | RqlForm::TupleReturnGroups
+        | RqlForm::LambdaForwarding
+        | RqlForm::PythonFormatIssues
+        | RqlForm::PythonUrlConstruction
+        | RqlForm::PythonRaiseLegality
+        | RqlForm::PythonSpecialMethodRaise
         | RqlForm::ResultContractUses
         | RqlForm::ResultSubjectUses
         | RqlForm::ResultContractOperationUses
         | RqlForm::NilnessOperations
         | RqlForm::SwitchCoverage
-        | RqlForm::ConcurrentAccessConflicts
         | RqlForm::DetachedTaskTransfers
         | RqlForm::ProcedureEffects
         | RqlForm::CallableSignature
+        | RqlForm::LiteralOccurrences
+        | RqlForm::CallableMetrics
         | RqlForm::SignatureParameters
         | RqlForm::CallableApplicability
         | RqlForm::OverloadSelection => {
@@ -1077,24 +1330,59 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
             let op = match form {
                 RqlForm::ReceiverOutcome => "receiver_outcome",
                 RqlForm::ReceiverEvidence => "receiver_evidence",
+                RqlForm::PointsToCandidates => "points_to_candidates",
                 RqlForm::CallShape => "call_shape",
+                RqlForm::ExactExternalCallee => "exact_external_callee",
                 RqlForm::CallResults => "call_results",
                 RqlForm::CallArgumentGroups => "call_argument_groups",
                 RqlForm::CallArguments => "call_arguments",
                 RqlForm::CallBindings => "call_bindings",
+                RqlForm::CppBadStrncpySize => "cpp_bad_strncpy_size",
+                RqlForm::CppNetworkToHostFunctionAsArrayBound => {
+                    "cpp_network_to_host_function_as_array_bound"
+                }
+                RqlForm::CppNonConstantFormat => "cpp_non_constant_format",
+                RqlForm::CppWrongNumberFormatArguments => "cpp_wrong_number_format_arguments",
+                RqlForm::CppTooManyFormatArguments => "cpp_too_many_format_arguments",
+                RqlForm::CppWrongTypeFormatArgument => "cpp_wrong_type_format_argument",
+                RqlForm::CppNonPortablePrintf => "cpp_non_portable_printf",
+                RqlForm::CppOverflowingSnprintf => "cpp_overflowing_snprintf",
+                RqlForm::CppInconsistentLoopDirection => "cpp_inconsistent_loop_direction",
+                RqlForm::CppUnsafeArrayForDaysOfTheYear => "cpp_unsafe_array_for_days_of_the_year",
                 RqlForm::CallEffects => "call_effects",
                 RqlForm::ResultContractCalls => "result_contract_calls",
                 RqlForm::CallResultContracts => "call_result_contracts",
                 RqlForm::CallResultObligations => "call_result_obligations",
+                RqlForm::ProcedureReturnProfile => "procedure_return_profile",
+                RqlForm::PythonIteratorReturnProtocol => "python_iterator_return_protocol",
+                RqlForm::PythonBuiltinIdentity => "python_builtin_identity",
+                RqlForm::PythonUninitializedVariable => "python_uninitialized_variable",
+                RqlForm::PythonRaiseNotImplemented => "python_raise_not_implemented",
+                RqlForm::PythonUnsafeCyclicImport => "python_unsafe_cyclic_import",
+                RqlForm::PythonCommentedOutCode => "python_commented_out_code",
+                RqlForm::CallResultUse => "call_result_use",
+                RqlForm::PythonAssertionContext => "python_assertion_context",
+                RqlForm::TupleReturnAssignment => "tuple_return_assignment",
+                RqlForm::PythonImplicitStringConcatenation => {
+                    "python_implicit_string_concatenation"
+                }
+                RqlForm::TupleReturnGroups => "tuple_return_groups",
+                RqlForm::LambdaForwarding => "lambda_forwarding",
+                RqlForm::PythonFormatIssues => "python_format_issues",
+                RqlForm::PythonUrlConstruction => "python_url_construction",
+
+                RqlForm::PythonRaiseLegality => "python_raise_legality",
+                RqlForm::PythonSpecialMethodRaise => "python_special_method_raise",
                 RqlForm::ResultContractUses => "result_contract_uses",
                 RqlForm::ResultSubjectUses => "result_subject_uses",
                 RqlForm::ResultContractOperationUses => "result_contract_operation_uses",
                 RqlForm::NilnessOperations => "nilness_operations",
                 RqlForm::SwitchCoverage => "switch_coverage",
-                RqlForm::ConcurrentAccessConflicts => "concurrent_access_conflicts",
                 RqlForm::DetachedTaskTransfers => "detached_task_transfers",
                 RqlForm::ProcedureEffects => "procedure_effects",
                 RqlForm::CallableSignature => "callable_signature",
+                RqlForm::LiteralOccurrences => "literal_occurrences",
+                RqlForm::CallableMetrics => "callable_metrics",
                 RqlForm::SignatureParameters => "signature_parameters",
                 RqlForm::CallableApplicability => "callable_applicability",
                 RqlForm::OverloadSelection => "overload_selection",
@@ -1104,6 +1392,18 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                 RqlForm::DispatchTargets => "dispatch_targets",
                 RqlForm::MemberFamily => "member_family",
                 RqlForm::FamilyEdges => "family_edges",
+                RqlForm::ClassHierarchy => "class_hierarchy",
+                RqlForm::ClassBases => "class_bases",
+                RqlForm::ClassMro => "class_mro",
+                RqlForm::MroMembers => "mro_members",
+                RqlForm::PythonOverrides => "python_overrides",
+                RqlForm::PythonCallRelations => "python_call_relations",
+                RqlForm::PythonOverrideSignatures => "python_override_signatures",
+                RqlForm::PythonDocumentation => "python_documentation",
+                RqlForm::PythonUselessClass => "python_useless_class",
+                RqlForm::PythonAttributeShadowsMethod => "python_attribute_shadows_method",
+                RqlForm::PythonModificationOfDefaultValue => "python_modification_of_default_value",
+                RqlForm::PythonOverlyComplexDelete => "python_overly_complex_delete",
                 _ => unreachable!("receiver row wrapper filtered above"),
             };
             query
@@ -1312,6 +1612,17 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                 .push(json!({ "op": QueryStepOp::OccurrenceTarget.label() }));
             Ok(Some(Value::Object(query)))
         }
+        RqlForm::CppExpressions => {
+            expect_len(expr, items, 2, head)?;
+            let mut query = query_object(&items[1])?;
+            query
+                .entry("steps".to_string())
+                .or_insert_with(|| Value::Array(Vec::new()))
+                .as_array_mut()
+                .ok_or_else(|| lower_error(expr, "internal error: steps must be an array"))?
+                .push(json!({ "op": QueryStepOp::CppExpressions.label() }));
+            Ok(Some(Value::Object(query)))
+        }
         RqlForm::Scopes => {
             let filter =
                 environment_filter_to_json(expr, head, &items[1..], EnvironmentFilterKind::Scope)?;
@@ -1341,11 +1652,53 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
             query.insert("exports".to_string(), Value::Object(filter));
             Ok(Some(Value::Object(query)))
         }
+        RqlForm::DependencyEvidence => {
+            let mut filter = Map::new();
+            if !items[1..].len().is_multiple_of(2) {
+                return Err(lower_error(
+                    expr,
+                    "dependency-evidence options must be pairs",
+                ));
+            }
+            for pair in items[1..].chunks_exact(2) {
+                let key = pair[0]
+                    .as_symbol()
+                    .ok_or_else(|| lower_error(&pair[0], "expected option name"))?;
+                let field = super::schema::dependency_evidence_field_for_rql_label(key)
+                    .ok_or_else(|| lower_error(&pair[0], "unknown dependency-evidence option"))?;
+                let labels = match pair[1].as_sequence() {
+                    Some(entries) => entries
+                        .iter()
+                        .map(symbol_or_string)
+                        .collect::<Result<Vec<_>, _>>()?,
+                    None => vec![symbol_or_string(&pair[1])?],
+                };
+                insert_unique(&mut filter, field.label(), array_of_strings(labels)).at(&pair[0])?;
+            }
+            let mut query = Map::new();
+            query.insert("dependency_evidence".into(), Value::Object(filter));
+            Ok(Some(Value::Object(query)))
+        }
         RqlForm::ConfigurationFacts => {
             let filter = configuration_facts_filter_to_json(expr, head, &items[1..])?;
             let mut query = Map::new();
             query.insert("configuration_facts".to_string(), Value::Object(filter));
             Ok(Some(Value::Object(query)))
+        }
+        RqlForm::ConfigurationAbsence => {
+            if items.len() < 2 {
+                return Err(lower_error(
+                    expr,
+                    format!("({head} ...) expects filter options followed by a query"),
+                ));
+            }
+            let mut step =
+                configuration_facts_filter_to_json(expr, head, &items[1..items.len() - 1])?;
+            step.insert(
+                "op".to_string(),
+                Value::String(QueryStepOp::ConfigurationAbsence.label().to_string()),
+            );
+            append_step(expr, &items[items.len() - 1], step)
         }
         RqlForm::DeclarationStateOf => {
             if items.len() < 2 {
@@ -1547,11 +1900,21 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
             step.insert("op".to_string(), Value::String(op.label().to_string()));
             append_step(expr, &items[1], step)
         }
+        RqlForm::BindingInitializerCallsOf | RqlForm::SelectedPropertyRelationsOf => {
+            expect_len(expr, items, 2, head)?;
+            let op = form
+                .query_step_op()
+                .expect("unit wrapper declares a query step");
+            let mut step = Map::new();
+            step.insert("op".to_string(), Value::String(op.label().to_string()));
+            append_step(expr, &items[1], step)
+        }
         RqlForm::ResultContractFailureUses
         | RqlForm::StateEventsOf
         | RqlForm::FlowRelationsOf
         | RqlForm::ControlRelations
         | RqlForm::AssignmentRelations
+        | RqlForm::CppProvenance
         | RqlForm::LoopRelations
         | RqlForm::StatementReachability
         | RqlForm::BranchRelations
@@ -1609,7 +1972,8 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
         | RqlForm::SourceSetOf
         | RqlForm::TopologyEdgesOf
         | RqlForm::GuardsOf
-        | RqlForm::FailureHandlerState => {
+        | RqlForm::FailureHandlerState
+        | RqlForm::PendingCleanupFlows => {
             expect_len(expr, items, 2, head)?;
             let op = form
                 .query_step_op()
@@ -1621,6 +1985,17 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
         RqlForm::ScopeOf
         | RqlForm::ScopeAncestors
         | RqlForm::BindingOccurrence
+        | RqlForm::BindingUses
+        | RqlForm::PythonVariableOf
+        | RqlForm::PythonVariableDefinitions
+        | RqlForm::PythonVariableUses
+        | RqlForm::PythonVariablePeers
+        | RqlForm::PythonVariableNestedLoops
+        | RqlForm::PythonComparisonConstants
+        | RqlForm::PythonComparisonUsingIs
+        | RqlForm::PythonComparisonUsingIsNonPortable
+        | RqlForm::IdenticalOperands
+        | RqlForm::PythonMissingSelf
         | RqlForm::CandidateTarget
         | RqlForm::Generates
         | RqlForm::GeneratedBy
@@ -1637,9 +2012,31 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
             append_step(expr, &items[1], step)
         }
         RqlForm::Name
+        | RqlForm::StringValue
         | RqlForm::NameRegex
         | RqlForm::TextRegex
         | RqlForm::BooleanValue
+        | RqlForm::DuplicateKey
+        | RqlForm::Parenthesized
+        | RqlForm::IntegerValue
+        | RqlForm::IntegerHasAnyBits
+        | RqlForm::IntegerHasAllBits
+        | RqlForm::IntegerHasNoBits
+        | RqlForm::AssignmentTargetKind
+        | RqlForm::AssignmentValueKind
+        | RqlForm::AssignmentTargetUnstarredCount
+        | RqlForm::AssignmentValueUnstarredCount
+        | RqlForm::AssignmentTargetStarred
+        | RqlForm::AssignmentValueStarred
+        | RqlForm::AssignmentUnstarredCountMismatch
+        | RqlForm::Index
+        | RqlForm::Async
+        | RqlForm::Modifier
+        | RqlForm::StringValueRegex
+        | RqlForm::Not
+        | RqlForm::All
+        | RqlForm::Any
+        | RqlForm::LocalValue
         | RqlForm::Capture
         | RqlForm::Has
         | RqlForm::NotHas
@@ -1647,7 +2044,15 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
         | RqlForm::Arity
         | RqlForm::Visibility
         | RqlForm::ParameterType
-        | RqlForm::ParameterTypeRegex => unreachable!("predicate filtered above"),
+        | RqlForm::ParameterTypeRegex
+        | RqlForm::BodyState
+        | RqlForm::BodyOwner => unreachable!("predicate filtered above"),
+        RqlForm::ConfigurationKey
+        | RqlForm::ConfigurationCode
+        | RqlForm::DependencyConfiguration
+        | RqlForm::LanguageRule => {
+            unreachable!("relation forms are not wrappers")
+        }
     }
 }
 
@@ -1682,9 +2087,9 @@ enum MaterializationFilterKind {
 impl MaterializationFilterKind {
     fn accepted_options(self) -> &'static str {
         match self {
-            Self::GenerationSite => ":kind and :input",
-            Self::Export => ":form and :name",
-            Self::DeclarationState => ":origin, :declaration-only, and :config-gated",
+            Self::GenerationSite => EnvironmentOptionKind::GenerationSite.accepted(),
+            Self::Export => EnvironmentOptionKind::Export.accepted(),
+            Self::DeclarationState => EnvironmentOptionKind::DeclarationState.accepted(),
         }
     }
 }
@@ -1698,80 +2103,51 @@ fn materialization_filter_to_json(
     options: &[Expr],
     kind: MaterializationFilterKind,
 ) -> LowerResult<Map<String, Value>> {
-    if !options.len().is_multiple_of(2) {
-        return Err(lower_error(
-            expr,
-            format!("({head} ...) filter options must be name/value pairs"),
-        ));
-    }
+    validate_filter_option_pairs(expr, head, options)?;
     let mut object = Map::new();
     for pair in options.chunks_exact(2) {
-        let key = pair[0].as_symbol().ok_or_else(|| {
-            lower_error(
-                &pair[0],
-                format!("({head} ...) option names must be symbols"),
-            )
-        })?;
+        let (key_expr, key, value) = filter_option_pair(pair, head)?;
         let unknown = || {
             lower_error(
-                &pair[0],
+                key_expr,
                 format!("({head} ...) accepts only {}", kind.accepted_options()),
             )
         };
         match kind {
             MaterializationFilterKind::GenerationSite => {
                 let field = generation_site_field_for_rql_label(key).ok_or_else(unknown)?;
-                let labels = match pair[1].as_sequence() {
-                    Some(entries) => entries
-                        .iter()
-                        .map(symbol_or_string)
-                        .collect::<Result<Vec<_>, _>>()?,
-                    None => vec![symbol_or_string(&pair[1])?],
-                };
-                insert_unique(&mut object, field.label(), array_of_strings(labels)).at(&pair[0])?;
+                insert_unique(&mut object, field.label(), filter_labels_value(value)?)
+                    .at(key_expr)?;
             }
             MaterializationFilterKind::Export => {
                 let field = export_field_for_rql_label(key).ok_or_else(unknown)?;
-                let labels = match pair[1].as_sequence() {
-                    Some(entries) => entries
-                        .iter()
-                        .map(symbol_or_string)
-                        .collect::<Result<Vec<_>, _>>()?,
-                    None => vec![symbol_or_string(&pair[1])?],
-                };
-                insert_unique(&mut object, field.label(), array_of_strings(labels)).at(&pair[0])?;
+                insert_unique(&mut object, field.label(), filter_labels_value(value)?)
+                    .at(key_expr)?;
             }
             MaterializationFilterKind::DeclarationState => {
                 let option = declaration_state_option_for_rql_label(key).ok_or_else(unknown)?;
                 match option.field().value_shape() {
                     super::schema::ValueShape::Boolean => {
-                        let value = match &pair[1].kind {
+                        let value = match &value.kind {
                             ExprKind::Symbol(text) if text == "true" => true,
                             ExprKind::Symbol(text) if text == "false" => false,
                             _ => {
                                 return Err(lower_error(
-                                    &pair[1],
+                                    value,
                                     format!("{key} must be true or false"),
                                 ));
                             }
                         };
                         insert_unique(&mut object, option.field().label(), Value::Bool(value))
-                            .at(&pair[0])?;
+                            .at(key_expr)?;
                     }
                     _ => {
-                        let labels = match pair[1].as_sequence() {
-                            Some(entries) => entries
-                                .iter()
-                                .map(symbol_or_string)
-                                .collect::<Result<Vec<_>, _>>()?,
-                            None => vec![symbol_or_string(&pair[1])?],
-                        };
                         insert_unique(
                             &mut object,
                             option.field().label(),
-                            array_of_strings(labels),
+                            filter_labels_value(value)?,
                         )
-                        .at(&pair[0])?;
+                        .at(key_expr)?;
                     }
                 }
             }
@@ -1783,6 +2159,170 @@ fn materialization_filter_to_json(
 /// Lower the configuration-fact filter options into canonical JSON. Enum-like
 /// axes accept one label or a vector; route syntax is structural and validated
 /// here so bad route nesting cannot look like a missing nested query.
+/// Lower the `:relation`, `:code`, and `:configuration` option pairs of a
+/// cross-domain operator. Presence rules (a relation only on `correlate`,
+/// both inputs required) belong to the canonical decoder, so RQL and JSON
+/// report them identically.
+fn cross_domain_inputs_to_json(
+    expr: &Expr,
+    head: &str,
+    options: &[Expr],
+) -> LowerResult<Map<String, Value>> {
+    if !options.len().is_multiple_of(2) {
+        return Err(lower_error(
+            expr,
+            format!("({head} ...) expects :relation, :code, and :configuration option/value pairs"),
+        ));
+    }
+    let mut object = Map::new();
+    for pair in options.chunks_exact(2) {
+        let key = pair[0].as_symbol().ok_or_else(|| {
+            lower_error(
+                &pair[0],
+                format!("({head} ...) option names must be symbols"),
+            )
+        })?;
+        let field = cross_domain_field_for_rql_label(key).ok_or_else(|| {
+            lower_error(
+                &pair[0],
+                format!("({head} ...) accepts only :relation, :code, and :configuration"),
+            )
+        })?;
+        let value = match field {
+            CrossDomainField::Relation => cross_domain_relation_to_json(&pair[1])?,
+            CrossDomainField::Code | CrossDomainField::Configuration => query_to_json(&pair[1])?,
+        };
+        insert_unique(&mut object, field.label(), value).at(&pair[0])?;
+    }
+    Ok(object)
+}
+
+fn cross_domain_relation_to_json(expr: &Expr) -> LowerResult<Value> {
+    let relation_forms = ALL_RQL_FORMS
+        .iter()
+        .filter(|form| form.class() == RqlFormClass::Relation)
+        .map(|form| form.label())
+        .collect::<Vec<_>>();
+    let items = expr.as_list().ok_or_else(|| {
+        lower_error(
+            expr,
+            format!("a relation is one registered relation form: {relation_forms:?}"),
+        )
+    })?;
+    let form = head_symbol(items)?
+        .and_then(RqlForm::from_label)
+        .filter(|form| form.class() == RqlFormClass::Relation)
+        .ok_or_else(|| {
+            lower_error(
+                expr,
+                format!("unknown cross-domain relation; expected one of {relation_forms:?}"),
+            )
+        })?;
+    let head = form.label();
+    let options = &items[1..];
+    if !options.len().is_multiple_of(2) {
+        return Err(lower_error(
+            expr,
+            format!("({head} ...) options must be name/value pairs"),
+        ));
+    }
+    let mut body = Map::new();
+    for pair in options.chunks_exact(2) {
+        let key = pair[0].as_symbol().ok_or_else(|| {
+            lower_error(
+                &pair[0],
+                format!("({head} ...) option names must be symbols"),
+            )
+        })?;
+        let (label, value) = match form {
+            RqlForm::ConfigurationKey => {
+                let field =
+                    configuration_key_relation_field_for_rql_label(key).ok_or_else(|| {
+                        lower_error(&pair[0], format!("({head} ...) accepts only :documents"))
+                    })?;
+                let ConfigurationKeyRelationField::Documents = field;
+                let documents = match pair[1].as_sequence() {
+                    Some(entries) => entries.iter().map(string_arg).collect::<Result<_, _>>()?,
+                    None => vec![string_arg(&pair[1])?],
+                };
+                (field.label(), array_of_strings(documents))
+            }
+            RqlForm::ConfigurationCode => {
+                let field =
+                    configuration_code_relation_field_for_rql_label(key).ok_or_else(|| {
+                        lower_error(&pair[0], format!("unknown ({head} ...) option {key}"))
+                    })?;
+                let value = match field {
+                    ConfigurationCodeRelationField::Match => {
+                        Value::String(symbol_or_string(&pair[1])?)
+                    }
+                    ConfigurationCodeRelationField::Absence => {
+                        let value = pair[1].as_symbol().ok_or_else(|| {
+                            lower_error(&pair[1], ":absence expects true or false")
+                        })?;
+                        Value::Bool(match value {
+                            "true" => true,
+                            "false" => false,
+                            _ => {
+                                return Err(lower_error(
+                                    &pair[1],
+                                    ":absence expects true or false",
+                                ));
+                            }
+                        })
+                    }
+                };
+                (field.label(), value)
+            }
+            RqlForm::DependencyConfiguration => {
+                let field = dependency_configuration_relation_field_for_rql_label(key).ok_or_else(
+                    || lower_error(&pair[0], format!("unknown ({head} ...) option {key}")),
+                )?;
+                let value = match field {
+                    DependencyConfigurationRelationField::Owner => {
+                        Value::String(string_arg(&pair[1])?)
+                    }
+                    DependencyConfigurationRelationField::Ecosystem => {
+                        Value::String(symbol_or_string(&pair[1])?)
+                    }
+                    DependencyConfigurationRelationField::VersionRanges
+                    | DependencyConfigurationRelationField::Documents
+                    | DependencyConfigurationRelationField::Values => {
+                        let entries = match pair[1].as_sequence() {
+                            Some(entries) => {
+                                entries.iter().map(string_arg).collect::<Result<_, _>>()?
+                            }
+                            None => vec![string_arg(&pair[1])?],
+                        };
+                        array_of_strings(entries)
+                    }
+                    DependencyConfigurationRelationField::Overrides => {
+                        let edges = pair[1].as_sequence().ok_or_else(|| {
+                            lower_error(&pair[1], "overrides requires an array of document pairs")
+                        })?;
+                        Value::Array(edges.iter().map(|edge| {
+                            let endpoints = edge.as_sequence().filter(|entries| entries.len() == 2).ok_or_else(|| lower_error(edge, "override edge requires exactly two document strings"))?;
+                            Ok(array_of_strings(endpoints.iter().map(string_arg).collect::<Result<_, _>>()?))
+                        }).collect::<LowerResult<Vec<_>>>()?)
+                    }
+                };
+                (field.label(), value)
+            }
+            _ => unreachable!("only registered relations reach this lowerer"),
+        };
+        insert_unique(&mut body, label, value).at(&pair[0])?;
+    }
+    let mut relation = Map::new();
+    let relation_label = match form {
+        RqlForm::ConfigurationKey => "configuration_key",
+        RqlForm::ConfigurationCode => "configuration_code",
+        RqlForm::DependencyConfiguration => "dependency_configuration",
+        _ => unreachable!("only relation-class forms reach relation lowering"),
+    };
+    relation.insert(relation_label.to_string(), Value::Object(body));
+    Ok(Value::Object(relation))
+}
+
 fn configuration_facts_filter_to_json(
     expr: &Expr,
     head: &str,
@@ -1806,7 +2346,7 @@ fn configuration_facts_filter_to_json(
             lower_error(
                 &pair[0],
                 format!(
-                    "({head} ...) accepts only :format, :node-kind, :role, :scalar-kind, :key, :route, :fact-ordinal, :provenance, and :completeness"
+                    "({head} ...) accepts configuration axes and XML structural-relation options"
                 ),
             )
         })?;
@@ -1829,7 +2369,24 @@ fn configuration_facts_filter_to_json(
                 routes.push(Value::Array(json_route));
             }
             Value::Array(routes)
-        } else if field == ConfigurationFactsFilterField::Keys {
+        } else if matches!(
+            field,
+            ConfigurationFactsFilterField::Keys
+                | ConfigurationFactsFilterField::Values
+                | ConfigurationFactsFilterField::ValuesIgnoreCase
+                | ConfigurationFactsFilterField::XmlParentKeys
+                | ConfigurationFactsFilterField::XmlPrecedingSiblingKeys
+                | ConfigurationFactsFilterField::XmlSiblingAttributeKeys
+                | ConfigurationFactsFilterField::XmlSiblingAttributeValues
+                | ConfigurationFactsFilterField::XmlSiblingAttributeValuesIgnoreCase
+                | ConfigurationFactsFilterField::XmlReferenceSourceKeys
+                | ConfigurationFactsFilterField::XmlReferenceTargetKeys
+                | ConfigurationFactsFilterField::XmlReferenceTargetElementKeys
+                | ConfigurationFactsFilterField::XmlReferenceTargetChildKeys
+                | ConfigurationFactsFilterField::XmlPeerElementKeys
+                | ConfigurationFactsFilterField::XmlPeerAttributeKeys
+                | ConfigurationFactsFilterField::XmlPeerChildKeys
+        ) {
             let labels = match pair[1].as_sequence() {
                 Some(entries) => entries
                     .iter()
@@ -1844,6 +2401,8 @@ fn configuration_facts_filter_to_json(
                 })?],
             };
             Value::Array(labels.into_iter().map(Value::String).collect())
+        } else if field == ConfigurationFactsFilterField::XmlPeerMinSharedChildren {
+            number_value(&pair[1], key)?
         } else if field == ConfigurationFactsFilterField::FactOrdinals {
             let values = match pair[1].as_sequence() {
                 Some(entries) => entries.iter().collect(),
@@ -1854,6 +2413,23 @@ fn configuration_facts_filter_to_json(
                 ordinals.push(number_value(value, head)?);
             }
             Value::Array(ordinals)
+        } else if matches!(
+            field,
+            ConfigurationFactsFilterField::ValueLt
+                | ConfigurationFactsFilterField::ValueLe
+                | ConfigurationFactsFilterField::ValueGt
+                | ConfigurationFactsFilterField::ValueGe
+        ) {
+            let value = pair[1].as_string().ok_or_else(|| {
+                lower_error(&pair[1], format!("{key} must be a finite numeric string"))
+            })?;
+            if !value.parse::<f64>().is_ok_and(|number| number.is_finite()) {
+                return Err(lower_error(
+                    &pair[1],
+                    format!("{key} must be a finite numeric string"),
+                ));
+            }
+            Value::String(value.to_string())
         } else {
             let labels = match pair[1].as_sequence() {
                 Some(entries) => entries
@@ -1915,10 +2491,10 @@ fn configuration_route_segment_to_json(expr: &Expr) -> LowerResult<Value> {
 impl EnvironmentFilterKind {
     fn accepted_options(self) -> &'static str {
         match self {
-            Self::Scope => ":kind",
-            Self::Binding => ":kind, :name, and :hoisting",
-            Self::Candidate => ":tier, :outcome, and :boundary",
-            Self::BindingOf => ":include-shadowed",
+            Self::Scope => EnvironmentOptionKind::Scope.accepted(),
+            Self::Binding => EnvironmentOptionKind::Binding.accepted(),
+            Self::Candidate => EnvironmentOptionKind::Candidate.accepted(),
+            Self::BindingOf => EnvironmentOptionKind::BindingOf.accepted(),
         }
     }
 }
@@ -1969,23 +2545,13 @@ fn environment_filter_to_json(
     options: &[Expr],
     kind: EnvironmentFilterKind,
 ) -> LowerResult<Map<String, Value>> {
-    if !options.len().is_multiple_of(2) {
-        return Err(lower_error(
-            expr,
-            format!("({head} ...) filter options must be name/value pairs"),
-        ));
-    }
+    validate_filter_option_pairs(expr, head, options)?;
     let mut object = Map::new();
     for pair in options.chunks_exact(2) {
-        let key = pair[0].as_symbol().ok_or_else(|| {
-            lower_error(
-                &pair[0],
-                format!("({head} ...) option names must be symbols"),
-            )
-        })?;
+        let (key_expr, key, value) = filter_option_pair(pair, head)?;
         let unknown = || {
             lower_error(
-                &pair[0],
+                key_expr,
                 format!("({head} ...) accepts only {}", kind.accepted_options()),
             )
         };
@@ -1996,14 +2562,14 @@ fn environment_filter_to_json(
                     .copied()
                     .find(|option| option.accepts_rql_label(key))
                     .ok_or_else(unknown)?;
-                if !matches!(pair[1].kind, ExprKind::Symbol(ref text) if text == "true") {
+                if !matches!(&value.kind, ExprKind::Symbol(text) if text == "true") {
                     return Err(lower_error(
-                        &pair[1],
+                        value,
                         format!("{key} must be true when present"),
                     ));
                 }
                 insert_unique(&mut object, option.field().label(), Value::Bool(true))
-                    .at(&pair[0])?;
+                    .at(key_expr)?;
             }
             _ => {
                 let field = match kind {
@@ -2022,14 +2588,7 @@ fn environment_filter_to_json(
                         .field()
                         .label(),
                 };
-                let labels = match pair[1].as_sequence() {
-                    Some(entries) => entries
-                        .iter()
-                        .map(symbol_or_string)
-                        .collect::<Result<Vec<_>, _>>()?,
-                    None => vec![symbol_or_string(&pair[1])?],
-                };
-                insert_unique(&mut object, field, array_of_strings(labels)).at(&pair[0])?;
+                insert_unique(&mut object, field, filter_labels_value(value)?).at(key_expr)?;
             }
         }
     }
@@ -2046,41 +2605,60 @@ fn occurrence_filter_to_json(
     head: &str,
     options: &[Expr],
 ) -> LowerResult<Map<String, Value>> {
-    if !options.len().is_multiple_of(2) {
-        return Err(lower_error(
-            expr,
-            format!("({head} ...) filter options must be name/value pairs"),
-        ));
-    }
+    validate_filter_option_pairs(expr, head, options)?;
     let mut object = Map::new();
     for pair in options.chunks_exact(2) {
-        let key = pair[0].as_symbol().ok_or_else(|| {
-            lower_error(
-                &pair[0],
-                format!("({head} ...) option names must be symbols"),
-            )
-        })?;
+        let (key_expr, key, value) = filter_option_pair(pair, head)?;
         let option = occurrence_option_for_rql_label(key).ok_or_else(|| {
             lower_error(
-                &pair[0],
+                key_expr,
                 format!("({head} ...) accepts only :class, :role, and :namespace"),
             )
         })?;
-        let labels = match pair[1].as_sequence() {
-            Some(entries) => entries
-                .iter()
-                .map(symbol_or_string)
-                .collect::<Result<Vec<_>, _>>()?,
-            None => vec![symbol_or_string(&pair[1])?],
-        };
         insert_unique(
             &mut object,
             option.field().label(),
-            array_of_strings(labels),
+            filter_labels_value(value)?,
         )
-        .at(&pair[0])?;
+        .at(key_expr)?;
     }
     Ok(object)
+}
+
+fn validate_filter_option_pairs(expr: &Expr, head: &str, options: &[Expr]) -> LowerResult<()> {
+    if options.len().is_multiple_of(2) {
+        Ok(())
+    } else {
+        Err(lower_error(
+            expr,
+            format!("({head} ...) filter options must be name/value pairs"),
+        ))
+    }
+}
+
+fn filter_option_pair<'a>(
+    pair: &'a [Expr],
+    head: &str,
+) -> LowerResult<(&'a Expr, &'a str, &'a Expr)> {
+    let key_expr = &pair[0];
+    let key = key_expr.as_symbol().ok_or_else(|| {
+        lower_error(
+            key_expr,
+            format!("({head} ...) option names must be symbols"),
+        )
+    })?;
+    Ok((key_expr, key, &pair[1]))
+}
+
+fn filter_labels_value(expr: &Expr) -> LowerResult<Value> {
+    let labels = match expr.as_sequence() {
+        Some(entries) => entries
+            .iter()
+            .map(symbol_or_string)
+            .collect::<Result<Vec<_>, _>>()?,
+        None => vec![symbol_or_string(expr)?],
+    };
+    Ok(array_of_strings(labels))
 }
 
 fn query_object(expr: &Expr) -> LowerResult<Map<String, Value>> {
@@ -2111,6 +2689,14 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
             format!("unknown S-expression form `{head}`"),
         ));
     };
+    if form.class() == RqlFormClass::Relation {
+        return Err(lower_error(
+            &items[0],
+            format!(
+                "`{head}` is a cross-domain relation, valid only as the :relation of correlate"
+            ),
+        ));
+    }
     if form.class() != RqlFormClass::Predicate {
         return Err(lower_error(
             &items[0],
@@ -2121,6 +2707,15 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         RqlForm::Name => {
             expect_len(expr, items, 2, "name")?;
             insert_unique(&mut object, "name", Value::String(string_arg(&items[1])?)).at(expr)?;
+        }
+        RqlForm::StringValue => {
+            expect_len(expr, items, 2, "string-value")?;
+            insert_unique(
+                &mut object,
+                "string_value",
+                Value::String(string_arg(&items[1])?),
+            )
+            .at(expr)?;
         }
         RqlForm::NameRegex => {
             expect_len(expr, items, 2, "name/regex")?;
@@ -2146,6 +2741,177 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
                 &mut object,
                 "boolean_value",
                 Value::Bool(boolean_arg(&items[1])?),
+            )
+            .at(expr)?;
+        }
+        RqlForm::DuplicateKey => {
+            expect_len(expr, items, 2, "duplicate-key")?;
+            insert_unique(
+                &mut object,
+                "duplicate_key",
+                Value::Bool(boolean_arg(&items[1])?),
+            )
+            .at(expr)?;
+        }
+        RqlForm::Async => {
+            expect_len(expr, items, 2, "async")?;
+            insert_unique(&mut object, "async", Value::Bool(boolean_arg(&items[1])?)).at(expr)?;
+        }
+        RqlForm::Modifier => {
+            expect_len(expr, items, 2, "modifier")?;
+            let label = symbol_or_string(&items[1])?;
+            if DeclarationModifier::from_label(&label).is_none() {
+                return Err(lower_error(
+                    &items[1],
+                    "modifier must be static or abstract",
+                ));
+            }
+            insert_unique(&mut object, "modifier", Value::String(label)).at(expr)?;
+        }
+        RqlForm::Parenthesized => {
+            expect_len(expr, items, 2, "parenthesized")?;
+            insert_unique(
+                &mut object,
+                "parenthesized",
+                Value::Bool(boolean_arg(&items[1])?),
+            )
+            .at(expr)?;
+        }
+        RqlForm::IntegerValue => {
+            expect_len(expr, items, 2, "integer-value")?;
+            insert_unique(
+                &mut object,
+                "integer_value",
+                canonical_integer_decimal_value(&items[1])?,
+            )
+            .at(expr)?;
+        }
+        RqlForm::IntegerHasAnyBits => {
+            expect_len(expr, items, 2, "integer-has-any-bits")?;
+            insert_unique(
+                &mut object,
+                "integer_has_any_bits",
+                permission_bit_mask_value(&items[1])?,
+            )
+            .at(expr)?;
+        }
+        RqlForm::IntegerHasAllBits => {
+            expect_len(expr, items, 2, "integer-has-all-bits")?;
+            insert_unique(
+                &mut object,
+                "integer_has_all_bits",
+                permission_bit_mask_value(&items[1])?,
+            )
+            .at(expr)?;
+        }
+        RqlForm::IntegerHasNoBits => {
+            expect_len(expr, items, 2, "integer-has-no-bits")?;
+            insert_unique(
+                &mut object,
+                "integer_has_no_bits",
+                permission_bit_mask_value(&items[1])?,
+            )
+            .at(expr)?;
+        }
+        RqlForm::AssignmentTargetKind => {
+            expect_len(expr, items, 2, "assignment-target-kind")?;
+            insert_unique(
+                &mut object,
+                "assignment_target_kind",
+                assignment_sequence_kind_value(&items[1])?,
+            )
+            .at(expr)?;
+        }
+        RqlForm::AssignmentValueKind => {
+            expect_len(expr, items, 2, "assignment-value-kind")?;
+            insert_unique(
+                &mut object,
+                "assignment_value_kind",
+                assignment_sequence_kind_value(&items[1])?,
+            )
+            .at(expr)?;
+        }
+        RqlForm::AssignmentTargetUnstarredCount => {
+            expect_len(expr, items, 2, "assignment-target-unstarred-count")?;
+            insert_unique(
+                &mut object,
+                "assignment_target_unstarred_count",
+                non_negative_integer_value(&items[1])?,
+            )
+            .at(expr)?;
+        }
+        RqlForm::AssignmentValueUnstarredCount => {
+            expect_len(expr, items, 2, "assignment-value-unstarred-count")?;
+            insert_unique(
+                &mut object,
+                "assignment_value_unstarred_count",
+                non_negative_integer_value(&items[1])?,
+            )
+            .at(expr)?;
+        }
+        RqlForm::AssignmentTargetStarred => {
+            expect_len(expr, items, 2, "assignment-target-starred")?;
+            insert_unique(
+                &mut object,
+                "assignment_target_starred",
+                Value::Bool(boolean_arg(&items[1])?),
+            )
+            .at(expr)?;
+        }
+        RqlForm::AssignmentValueStarred => {
+            expect_len(expr, items, 2, "assignment-value-starred")?;
+            insert_unique(
+                &mut object,
+                "assignment_value_starred",
+                Value::Bool(boolean_arg(&items[1])?),
+            )
+            .at(expr)?;
+        }
+        RqlForm::AssignmentUnstarredCountMismatch => {
+            expect_len(expr, items, 2, "assignment-unstarred-count-mismatch")?;
+            insert_unique(
+                &mut object,
+                "assignment_unstarred_count_mismatch",
+                Value::Bool(boolean_arg(&items[1])?),
+            )
+            .at(expr)?;
+        }
+        RqlForm::Index => {
+            expect_len(expr, items, 2, "index")?;
+            insert_unique(&mut object, "index", non_negative_integer_value(&items[1])?).at(expr)?;
+        }
+        RqlForm::StringValueRegex => {
+            expect_len(expr, items, 2, "value/regex")?;
+            insert_unique(
+                &mut object,
+                "string_value".to_string(),
+                json!({ "regex": string_arg(&items[1])? }),
+            )
+            .at(expr)?;
+        }
+        RqlForm::Not => {
+            expect_len(expr, items, 2, "not")?;
+            insert_unique(&mut object, "not", pattern_to_json(&items[1])?).at(expr)?;
+        }
+        RqlForm::LocalValue => {
+            expect_len(expr, items, 2, "local-value")?;
+            insert_unique(&mut object, "local_value", pattern_to_json(&items[1])?).at(expr)?;
+        }
+        RqlForm::All | RqlForm::Any => {
+            if items.len() < 2 {
+                return Err(lower_error(
+                    expr,
+                    format!("{head} expects at least one pattern"),
+                ));
+            }
+            let patterns = items[1..]
+                .iter()
+                .map(pattern_to_json)
+                .collect::<LowerResult<Vec<_>>>()?;
+            insert_unique(
+                &mut object,
+                if form == RqlForm::All { "all" } else { "any" },
+                Value::Array(patterns),
             )
             .at(expr)?;
         }
@@ -2201,12 +2967,40 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
             )
             .at(expr)?;
         }
+        RqlForm::LanguageRule => {
+            expect_len(expr, items, 2, "language-rule")?;
+            insert_unique(
+                &mut object,
+                "language_rule",
+                Value::String(string_arg(&items[1])?),
+            )
+            .at(expr)?;
+        }
+        RqlForm::BodyState => {
+            expect_len(expr, items, 2, "body-state")?;
+            insert_unique(
+                &mut object,
+                "body_state",
+                Value::String(symbol_or_string(&items[1])?),
+            )
+            .at(expr)?;
+        }
+        RqlForm::BodyOwner => {
+            expect_len(expr, items, 2, "body-owner")?;
+            insert_unique(
+                &mut object,
+                "body_owner",
+                Value::String(symbol_or_string(&items[1])?),
+            )
+            .at(expr)?;
+        }
         RqlForm::Where
         | RqlForm::Language
         | RqlForm::Limit
         | RqlForm::ResultDetail
         | RqlForm::Explain
         | RqlForm::Profile
+        | RqlForm::CppFacts
         | RqlForm::Inside
         | RqlForm::InsideDecl
         | RqlForm::NotInside
@@ -2215,8 +3009,12 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::Except
         | RqlForm::Filter
         | RqlForm::Project
+        | RqlForm::Anchor
+        | RqlForm::StatementFacts
         | RqlForm::EnclosingDecl
         | RqlForm::ProcedureOf
+        | RqlForm::ProgramPointOf
+        | RqlForm::ProgramPointById
         | RqlForm::CfgEntry
         | RqlForm::CfgExits
         | RqlForm::CfgSuccessorEdges
@@ -2230,6 +3028,9 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::FileOf
         | RqlForm::ImportsOf
         | RqlForm::ImportersOf
+        | RqlForm::PythonImportSite
+        | RqlForm::PythonImportCycles
+        | RqlForm::PythonCommentedOutCode
         | RqlForm::Supertypes
         | RqlForm::Subtypes
         | RqlForm::Members
@@ -2250,17 +3051,46 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::FieldWriteValue
         | RqlForm::ReceiverOutcome
         | RqlForm::ReceiverEvidence
+        | RqlForm::PointsToCandidates
         | RqlForm::CallShape
+        | RqlForm::ExactExternalCallee
         | RqlForm::CallResults
         | RqlForm::CallArgumentGroups
         | RqlForm::CallArguments
         | RqlForm::CallBindings
+        | RqlForm::CppBadStrncpySize
+        | RqlForm::CppNetworkToHostFunctionAsArrayBound
+        | RqlForm::CppNonConstantFormat
+        | RqlForm::CppWrongNumberFormatArguments
+        | RqlForm::CppTooManyFormatArguments
+        | RqlForm::CppWrongTypeFormatArgument
+        | RqlForm::CppNonPortablePrintf
+        | RqlForm::CppOverflowingSnprintf
+        | RqlForm::CppInconsistentLoopDirection
+        | RqlForm::CppUnsafeArrayForDaysOfTheYear
         | RqlForm::ResolvedCall
+        | RqlForm::ResolvedValue
         | RqlForm::CallArgument
         | RqlForm::CallEffects
         | RqlForm::ResultContractCalls
         | RqlForm::CallResultContracts
         | RqlForm::CallResultObligations
+        | RqlForm::ProcedureReturnProfile
+        | RqlForm::PythonIteratorReturnProtocol
+        | RqlForm::PythonBuiltinIdentity
+        | RqlForm::PythonUninitializedVariable
+        | RqlForm::PythonRaiseNotImplemented
+        | RqlForm::PythonUnsafeCyclicImport
+        | RqlForm::CallResultUse
+        | RqlForm::PythonAssertionContext
+        | RqlForm::TupleReturnAssignment
+        | RqlForm::PythonImplicitStringConcatenation
+        | RqlForm::TupleReturnGroups
+        | RqlForm::LambdaForwarding
+        | RqlForm::PythonFormatIssues
+        | RqlForm::PythonUrlConstruction
+        | RqlForm::PythonRaiseLegality
+        | RqlForm::PythonSpecialMethodRaise
         | RqlForm::ResultContractUses
         | RqlForm::ResultSubjectUses
         | RqlForm::ResultContractOperationUses
@@ -2270,6 +3100,8 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::DetachedTaskTransfers
         | RqlForm::ProcedureEffects
         | RqlForm::CallableSignature
+        | RqlForm::LiteralOccurrences
+        | RqlForm::CallableMetrics
         | RqlForm::SignatureParameters
         | RqlForm::DecoratorBindings
         | RqlForm::CallableApplicability
@@ -2286,16 +3118,46 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::BindingsIn
         | RqlForm::BindingOf
         | RqlForm::BindingOccurrence
+        | RqlForm::BindingUses
+        | RqlForm::PythonVariableOf
+        | RqlForm::PythonVariableDefinitions
+        | RqlForm::PythonVariableUses
+        | RqlForm::PythonVariablePeers
+        | RqlForm::PythonVariableNestedLoops
+        | RqlForm::PythonComparisonConstants
+        | RqlForm::PythonComparisonUsingIs
+        | RqlForm::PythonComparisonUsingIsNonPortable
+        | RqlForm::IdenticalOperands
+        | RqlForm::PythonMissingSelf
         | RqlForm::CandidatesOf
         | RqlForm::CandidateHierarchy
         | RqlForm::DispatchOutcome
         | RqlForm::DispatchTargets
         | RqlForm::MemberFamily
         | RqlForm::FamilyEdges
+        | RqlForm::ClassHierarchy
+        | RqlForm::ClassBases
+        | RqlForm::ClassMro
+        | RqlForm::MroMembers
+        | RqlForm::PythonOverrides
+        | RqlForm::PythonCallRelations
+        | RqlForm::PythonOverrideSignatures
+        | RqlForm::PythonDocumentation
+        | RqlForm::PythonUselessClass
+        | RqlForm::PythonAttributeShadowsMethod
+        | RqlForm::PythonModificationOfDefaultValue
+        | RqlForm::PythonOverlyComplexDelete
         | RqlForm::CandidateTarget
         | RqlForm::GenerationSites
         | RqlForm::Exports
+        | RqlForm::DependencyEvidence
         | RqlForm::ConfigurationFacts
+        | RqlForm::ConfigurationAbsence
+        | RqlForm::ConfigurationCode
+        | RqlForm::Correlate
+        | RqlForm::RequireBoth
+        | RqlForm::ConfigurationKey
+        | RqlForm::DependencyConfiguration
         | RqlForm::Generates
         | RqlForm::GeneratedBy
         | RqlForm::DeclarationStateOf
@@ -2305,6 +3167,8 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::EdgesOf
         | RqlForm::EdgesFrom
         | RqlForm::EdgeTarget
+        | RqlForm::BindingInitializerCallsOf
+        | RqlForm::SelectedPropertyRelationsOf
         | RqlForm::StateEventsOf
         | RqlForm::FlowRelationsOf
         | RqlForm::FlowSource
@@ -2313,15 +3177,17 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::TopologyEdgesOf
         | RqlForm::GuardsOf
         | RqlForm::FailureHandlerState
+        | RqlForm::PendingCleanupFlows
         | RqlForm::FlowTarget
         | RqlForm::ControlRelations
         | RqlForm::AssignmentRelations
+        | RqlForm::CppExpressions
+        | RqlForm::CppProvenance
         | RqlForm::LoopRelations
         | RqlForm::StatementReachability
         | RqlForm::BranchRelations
         | RqlForm::RewritePathsOf => unreachable!("wrapper filtered above"),
-        RqlForm::ConcurrentAccessConflicts => unreachable!("wrapper filtered above"),
-        RqlForm::ClassSet | RqlForm::AbsentMember => {
+        RqlForm::ClassSet | RqlForm::AbsentMember | RqlForm::RustPointerFindings => {
             unreachable!("wrapper filtered above")
         }
         RqlForm::Paths | RqlForm::SegmentsOf | RqlForm::SegmentTarget => {
@@ -2369,10 +3235,20 @@ fn insert_keyword(
     key: &str,
     value: &Expr,
 ) -> LowerResult<()> {
-    if let Some(property) = RqlProperty::from_label(key) {
+    let value_is_role_pattern = key == Role::Value.label()
+        && object
+            .get("kind")
+            .and_then(Value::as_str)
+            .and_then(NormalizedKind::from_label)
+            .is_some_and(|kind| Role::Value.valid_for(kind));
+    if !value_is_role_pattern && let Some(property) = RqlProperty::from_label(key) {
         return match property {
             RqlProperty::Name => {
                 insert_unique(object, "name", Value::String(string_arg(value)?)).at(key_expr)
+            }
+            RqlProperty::StringValue => {
+                insert_unique(object, "string_value", Value::String(string_arg(value)?))
+                    .at(key_expr)
             }
             RqlProperty::NameRegex => {
                 insert_unique(object, "name", json!({ "regex": string_arg(value)? })).at(key_expr)
@@ -2380,10 +3256,109 @@ fn insert_keyword(
             RqlProperty::TextRegex => {
                 insert_unique(object, "text", json!({ "regex": string_arg(value)? })).at(key_expr)
             }
+            RqlProperty::CommentBlockRegex => insert_unique(
+                object,
+                "comment_block_text",
+                json!({ "regex": string_arg(value)? }),
+            )
+            .at(key_expr),
             RqlProperty::BooleanValue => {
                 insert_unique(object, "boolean_value", Value::Bool(boolean_arg(value)?))
                     .at(key_expr)
             }
+            RqlProperty::DuplicateKey => {
+                insert_unique(object, "duplicate_key", Value::Bool(boolean_arg(value)?))
+                    .at(key_expr)
+            }
+            RqlProperty::Async => {
+                insert_unique(object, "async", Value::Bool(boolean_arg(value)?)).at(key_expr)
+            }
+            RqlProperty::Modifier => {
+                let label = symbol_or_string(value)?;
+                if DeclarationModifier::from_label(&label).is_none() {
+                    return Err(lower_error(value, ":modifier must be static or abstract"));
+                }
+                insert_unique(object, "modifier", Value::String(label)).at(key_expr)
+            }
+            RqlProperty::Parenthesized => {
+                insert_unique(object, "parenthesized", Value::Bool(boolean_arg(value)?))
+                    .at(key_expr)
+            }
+            RqlProperty::IntegerValue => insert_unique(
+                object,
+                "integer_value",
+                canonical_integer_decimal_value(value)?,
+            )
+            .at(key_expr),
+            RqlProperty::IntegerHasAnyBits => insert_unique(
+                object,
+                "integer_has_any_bits",
+                permission_bit_mask_value(value)?,
+            )
+            .at(key_expr),
+            RqlProperty::IntegerHasAllBits => insert_unique(
+                object,
+                "integer_has_all_bits",
+                permission_bit_mask_value(value)?,
+            )
+            .at(key_expr),
+            RqlProperty::IntegerHasNoBits => insert_unique(
+                object,
+                "integer_has_no_bits",
+                permission_bit_mask_value(value)?,
+            )
+            .at(key_expr),
+            RqlProperty::AssignmentTargetKind => insert_unique(
+                object,
+                "assignment_target_kind",
+                assignment_sequence_kind_value(value)?,
+            )
+            .at(key_expr),
+            RqlProperty::AssignmentValueKind => insert_unique(
+                object,
+                "assignment_value_kind",
+                assignment_sequence_kind_value(value)?,
+            )
+            .at(key_expr),
+            RqlProperty::AssignmentTargetUnstarredCount => insert_unique(
+                object,
+                "assignment_target_unstarred_count",
+                non_negative_integer_value(value)?,
+            )
+            .at(key_expr),
+            RqlProperty::AssignmentValueUnstarredCount => insert_unique(
+                object,
+                "assignment_value_unstarred_count",
+                non_negative_integer_value(value)?,
+            )
+            .at(key_expr),
+            RqlProperty::AssignmentTargetStarred => insert_unique(
+                object,
+                "assignment_target_starred",
+                Value::Bool(boolean_arg(value)?),
+            )
+            .at(key_expr),
+            RqlProperty::AssignmentValueStarred => insert_unique(
+                object,
+                "assignment_value_starred",
+                Value::Bool(boolean_arg(value)?),
+            )
+            .at(key_expr),
+            RqlProperty::AssignmentUnstarredCountMismatch => insert_unique(
+                object,
+                "assignment_unstarred_count_mismatch",
+                Value::Bool(boolean_arg(value)?),
+            )
+            .at(key_expr),
+            RqlProperty::Index => {
+                insert_unique(object, "index", non_negative_integer_value(value)?).at(key_expr)
+            }
+            RqlProperty::StringValueRegex => insert_unique(
+                object,
+                "string_value".to_string(),
+                json!({ "regex": string_arg(value)? }),
+            )
+            .at(key_expr),
             RqlProperty::Capture => {
                 insert_unique(object, "capture", Value::String(string_arg(value)?)).at(key_expr)
             }
@@ -2406,10 +3381,40 @@ fn insert_keyword(
                 json!({ "regex": string_arg(value)? }),
             )
             .at(key_expr),
+            RqlProperty::LanguageRule => {
+                insert_unique(object, "language_rule", Value::String(string_arg(value)?))
+                    .at(key_expr)
+            }
+            RqlProperty::BodyState => insert_unique(
+                object,
+                "body_state",
+                Value::String(symbol_or_string(value)?),
+            )
+            .at(key_expr),
+            RqlProperty::BodyOwner => insert_unique(
+                object,
+                "body_owner",
+                Value::String(symbol_or_string(value)?),
+            )
+            .at(key_expr),
             RqlProperty::Has => insert_unique(object, "has", pattern_to_json(value)?).at(key_expr),
             RqlProperty::NotHas => {
                 insert_unique(object, "not_has", pattern_to_json(value)?).at(key_expr)
             }
+            RqlProperty::LocalValue => {
+                insert_unique(object, "local_value", pattern_to_json(value)?).at(key_expr)
+            }
+            RqlProperty::Not => insert_unique(object, "not", pattern_to_json(value)?).at(key_expr),
+            RqlProperty::All | RqlProperty::Any => insert_unique(
+                object,
+                if property == RqlProperty::All {
+                    "all"
+                } else {
+                    "any"
+                },
+                pattern_array(value)?,
+            )
+            .at(key_expr),
         };
     }
     let Some(role) = Role::from_label(key) else {
@@ -2707,9 +3712,7 @@ fn visibility_value(expr: &Expr) -> LowerResult<Value> {
         return Ok(Value::Array(labels));
     }
     match &expr.kind {
-        ExprKind::Symbol(label) | ExprKind::String(label) => {
-            Ok(Value::String(label.replace('-', "_")))
-        }
+        ExprKind::Symbol(_) | ExprKind::String(_) => Ok(Value::String(visibility_label(expr)?)),
         _ => Err(lower_error(
             expr,
             "visibility must be a label or a non-empty vector of labels",
@@ -2739,6 +3742,52 @@ fn arity_property_value(expr: &Expr) -> LowerResult<Value> {
     }
 }
 
+fn non_negative_integer_value(expr: &Expr) -> LowerResult<Value> {
+    match expr.as_number() {
+        Some(value) => Ok(Value::Number(value.into())),
+        None => Err(lower_error(expr, "index takes a non-negative integer")),
+    }
+}
+
+fn canonical_integer_decimal_value(expr: &Expr) -> LowerResult<Value> {
+    let Some(value) = expr.as_string() else {
+        return Err(lower_error(
+            expr,
+            "expected a quoted canonical non-negative decimal integer",
+        ));
+    };
+    let bytes = value.as_bytes();
+    if bytes.is_empty()
+        || !((bytes[0] == b'0' && bytes.len() == 1)
+            || (matches!(bytes[0], b'1'..=b'9')
+                && bytes[1..].iter().all(|byte| byte.is_ascii_digit())))
+    {
+        return Err(lower_error(
+            expr,
+            "expected a quoted canonical non-negative decimal integer",
+        ));
+    }
+    Ok(Value::String(value.to_owned()))
+}
+
+fn permission_bit_mask_value(expr: &Expr) -> LowerResult<Value> {
+    let Some(value) = expr.as_number() else {
+        return Err(lower_error(expr, "expected a positive u32 bit mask"));
+    };
+    if value == 0 || value > u64::from(u32::MAX) {
+        return Err(lower_error(expr, "expected a positive u32 bit mask"));
+    }
+    Ok(Value::Number(value.into()))
+}
+
+fn assignment_sequence_kind_value(expr: &Expr) -> LowerResult<Value> {
+    let label = symbol_or_string(expr)?;
+    if AssignmentSequenceKind::from_label(&label).is_none() {
+        return Err(lower_error(expr, "expected `list` or `tuple`"));
+    }
+    Ok(Value::String(label))
+}
+
 fn symbol_or_string(expr: &Expr) -> LowerResult<String> {
     expr.as_string()
         .or_else(|| expr.as_symbol())
@@ -2753,7 +3802,7 @@ fn symbol_or_string(expr: &Expr) -> LowerResult<String> {
 
 fn row_field_name(expr: &Expr, what: &str) -> LowerResult<String> {
     let name = symbol_or_string(expr)?;
-    if name.is_empty() || name.len() > super::ir::MAX_ROW_FIELD_NAME_LENGTH {
+    if !super::ir::is_valid_row_field_name(&name) {
         return Err(lower_error(
             expr,
             format!(
@@ -2794,15 +3843,42 @@ fn row_literal_value(expr: &Expr) -> LowerResult<Value> {
             literal.insert("enum".to_string(), Value::String(label.to_owned()));
         }
         ExprKind::List(values) | ExprKind::Vector(values) => {
-            let strings = values
-                .iter()
-                .map(|value| {
-                    value.as_string().map(str::to_owned).ok_or_else(|| {
-                        lower_error(value, "string-list row literals contain only strings")
+            if values.first().and_then(Expr::as_symbol) == Some("integer-list") {
+                let integers = values[1..]
+                    .iter()
+                    .map(|value| match &value.kind {
+                        ExprKind::Number(number) => Ok(Value::Number((*number).into())),
+                        _ => Err(lower_error(
+                            value,
+                            "integer-list row literals contain only non-negative integers",
+                        )),
                     })
-                })
-                .collect::<LowerResult<Vec<_>>>()?;
-            literal.insert("string_list".to_string(), json!(strings));
+                    .collect::<LowerResult<Vec<_>>>()?;
+                literal.insert("integer_list".to_string(), Value::Array(integers));
+            } else if !values.is_empty()
+                && values
+                    .iter()
+                    .all(|value| matches!(&value.kind, ExprKind::Number(_)))
+            {
+                let integers = values
+                    .iter()
+                    .map(|value| match &value.kind {
+                        ExprKind::Number(number) => Ok(Value::Number((*number).into())),
+                        _ => unreachable!("the row literal was checked as numeric"),
+                    })
+                    .collect::<LowerResult<Vec<_>>>()?;
+                literal.insert("integer_list".to_string(), Value::Array(integers));
+            } else {
+                let strings = values
+                    .iter()
+                    .map(|value| {
+                        value.as_string().map(str::to_owned).ok_or_else(|| {
+                            lower_error(value, "string-list row literals contain only strings")
+                        })
+                    })
+                    .collect::<LowerResult<Vec<_>>>()?;
+                literal.insert("string_list".to_string(), json!(strings));
+            }
         }
     }
     Ok(Value::Object(literal))
@@ -2882,9 +3958,15 @@ fn row_predicates_value(expr: &Expr) -> LowerResult<Value> {
                         "comparison row predicate requires an operand",
                     ));
                 };
+                let sequence_head = operand
+                    .as_sequence()
+                    .and_then(|items| items.first())
+                    .and_then(Expr::as_symbol);
+                let is_vector_literal = matches!(&operand.kind, ExprKind::Vector(_));
                 let value = if let Some(field_operand) = operand.as_sequence()
-                    && field_operand.first().and_then(Expr::as_symbol)
-                        != Some(super::schema::ROW_ENUM_LITERAL.label)
+                    && !is_vector_literal
+                    && sequence_head != Some(super::schema::ROW_ENUM_LITERAL.label)
+                    && sequence_head != Some("integer-list")
                 {
                     if field_operand.len() != 2 || field_operand[0].as_symbol() != Some("field") {
                         return Err(lower_error(
@@ -3076,70 +4158,40 @@ mod tests {
         resolve_rql_schema_version(None).unwrap()
     }
 
-    /// The materialization forms lower to their canonical JSON (#1476,
-    /// `stubs-of` from #1660): seed filters keep their registry field
-    /// spellings, the filtered step carries its options, and the filterless
-    /// steps are bare ops.
     #[test]
-    fn materialization_forms_lower_to_canonical_json() {
-        let version = rql_schema_resolution().version.to_string();
-        assert_eq!(
-            canonical(
-                "(generated-by (generates (generation-sites :kind accessor_macro :input literal)))"
-            ),
-            json!({
-                "generation_sites": { "kind": ["accessor_macro"], "input": ["literal"] },
-                "steps": [ { "op": "generates" }, { "op": "generated_by" } ],
-                "limit": 100,
-                "result_detail": "compact",
-                "execution_mode": "results",
-                "schema_version": version,
-            })
+    fn decoded_string_value_and_boolean_composition_lower_to_json() {
+        let query = canonical(
+            r#"(string_literal
+                (value/regex "^http://")
+                (not (or
+                    (value/regex "localhost")
+                    (value/regex "127\\.0\\.0\\.1"))) )"#,
         );
         assert_eq!(
-            canonical("(export-target (exports :form default_anonymous :name \"default\"))"),
-            json!({
-                "exports": { "form": ["default_anonymous"], "name": ["default"] },
-                "steps": [ { "op": "export_target" } ],
-                "limit": 100,
-                "result_detail": "compact",
-                "execution_mode": "results",
-                "schema_version": version,
-            })
+            query["match"]["string_value"],
+            json!({ "regex": "^http://" })
         );
         assert_eq!(
-            canonical(
-                "(implementation-of (declaration-state-of :origin parsed :declaration-only true \
-                 :config-gated false (enclosing-decl (function))))"
-            ),
-            json!({
-                "match": { "kind": "function" },
-                "steps": [
-                    { "op": "enclosing_decl" },
-                    {
-                        "op": "declaration_state_of",
-                        "origin": ["parsed"],
-                        "declaration_only": true,
-                        "config_gated": false,
-                    },
-                    { "op": "implementation_of" },
-                ],
-                "limit": 100,
-                "result_detail": "compact",
-                "execution_mode": "results",
-                "schema_version": version,
-            })
+            query["match"]["not"]["any"],
+            json!([
+                { "string_value": { "regex": "localhost" } },
+                { "string_value": { "regex": "127\\.0\\.0\\.1" } }
+            ])
         );
+    }
+
+    #[test]
+    fn decoded_string_value_accepts_exact_json_predicates() {
+        let query = CodeQuery::from_json(&json!({
+            "match": {
+                "kind": "string_literal",
+                "string_value": "https://example.com"
+            }
+        }))
+        .expect("decoded string value is a valid pattern");
         assert_eq!(
-            canonical("(stubs-of (enclosing-decl (function)))"),
-            json!({
-                "match": { "kind": "function" },
-                "steps": [ { "op": "enclosing_decl" }, { "op": "stubs_of" } ],
-                "limit": 100,
-                "result_detail": "compact",
-                "execution_mode": "results",
-                "schema_version": version,
-            })
+            query.to_canonical_json()["match"]["string_value"],
+            json!("https://example.com")
         );
     }
 
@@ -3190,18 +4242,7 @@ mod tests {
     #[test]
     fn parsed_subtree_error_retains_semantic_path_and_original_range() {
         let source = "(policy :selector (limit 0 (call)))";
-        let parsed = parse_sexp(source).unwrap();
-        let document = parsed.expr.unwrap();
-        let selector = document
-            .as_list()
-            .and_then(|items| items.last())
-            .expect("selector subtree");
-
-        let error = code_query_from_expr(selector, rql_schema_resolution())
-            .expect_err("zero limit must fail");
-
-        assert_eq!(error.path, "limit");
-        assert_eq!(&source[error.range], "0");
+        assert_parsed_subtree_error(source, "limit", "0");
     }
 
     #[test]
@@ -3210,57 +4251,23 @@ mod tests {
         let source = format!(
             r#"(policy :selector (union (call) (intersect (call) (call :name "{invalid_name}"))))"#
         );
-        let parsed = parse_sexp(&source).unwrap();
-        let document = parsed.expr.unwrap();
-        let selector = document
-            .as_list()
-            .and_then(|items| items.last())
-            .expect("selector subtree");
-
-        let error = code_query_from_expr(selector, rql_schema_resolution())
-            .expect_err("oversized nested name must fail");
-
-        assert_eq!(error.path, "union[1].intersect[1].match.name");
-        assert_eq!(&source[error.range], format!(r#""{invalid_name}""#));
+        let expected_leaf = format!(r#""{invalid_name}""#);
+        assert_parsed_subtree_error(&source, "union[1].intersect[1].match.name", &expected_leaf);
     }
 
     #[test]
     fn nested_wrapper_semantic_error_retains_canonical_path_and_absolute_leaf_range() {
         let source = r#"(policy :selector (union (call) (intersect (where "[" (call)) (call))))"#;
-        let parsed = parse_sexp(source).unwrap();
-        let document = parsed.expr.unwrap();
-        let selector = document
-            .as_list()
-            .and_then(|items| items.last())
-            .expect("selector subtree");
-
-        let error = code_query_from_expr(selector, rql_schema_resolution())
-            .expect_err("invalid nested glob must fail");
-
-        assert_eq!(error.path, "union[1].intersect[0].where[0]");
-        assert_eq!(&source[error.range], r#""[""#);
-    }
-
-    #[test]
-    fn parsed_subtree_lowering_error_retains_narrow_original_range() {
-        let source = r#"(policy :selector (call :unknown "value"))"#;
-        let parsed = parse_sexp(source).unwrap();
-        let document = parsed.expr.unwrap();
-        let selector = document
-            .as_list()
-            .and_then(|items| items.last())
-            .expect("selector subtree");
-
-        let error = code_query_from_expr(selector, rql_schema_resolution())
-            .expect_err("unknown field must fail");
-
-        assert_eq!(error.path, "match");
-        assert_eq!(&source[error.range], ":unknown");
+        assert_parsed_subtree_error(source, "union[1].intersect[0].where[0]", r#""[""#);
     }
 
     #[test]
     fn parsed_subtree_incomplete_property_error_retains_keyword_range() {
         let source = "(policy :selector (call :callee))";
+        assert_parsed_subtree_error(source, "match", ":callee");
+    }
+
+    fn assert_parsed_subtree_error(source: &str, expected_path: &str, expected_leaf: &str) {
         let parsed = parse_sexp(source).unwrap();
         let document = parsed.expr.unwrap();
         let selector = document
@@ -3269,10 +4276,10 @@ mod tests {
             .expect("selector subtree");
 
         let error = code_query_from_expr(selector, rql_schema_resolution())
-            .expect_err("missing property value must fail");
+            .expect_err("invalid selector subtree must fail");
 
-        assert_eq!(error.path, "match");
-        assert_eq!(&source[error.range], ":callee");
+        assert_eq!(error.path, expected_path);
+        assert_eq!(&source[error.range], expected_leaf);
     }
 
     #[test]
@@ -3311,101 +4318,6 @@ mod tests {
 
         assert!(error.message.contains("unknown pattern field"), "{error}");
         assert_eq!(&source[error.range], ":unknown");
-    }
-
-    #[test]
-    fn standalone_rql_preserves_query_specific_trailing_input_wording() {
-        let error = CodeQuery::from_sexp("(call) (call)").unwrap_err();
-
-        assert_eq!(error, "unexpected input after the query");
-    }
-
-    #[test]
-    fn structural_query_sexp_lowers_call_with_callee_and_capture() {
-        assert_eq!(
-            canonical(r#"(call :callee (name "eval") :args [(capture "arg")])"#),
-            canonical_json(json!({
-                "match": {
-                    "kind": "call",
-                    "callee": { "name": "eval" },
-                    "args": [{ "capture": "arg" }]
-                }
-            }))
-        );
-    }
-
-    #[test]
-    fn structural_query_sexp_lowers_wrappers() {
-        assert_eq!(
-            canonical(
-                r#"(where "src/**/*.py" (language python (limit 25 (call :callee (name "eval")))))"#
-            ),
-            canonical_json(json!({
-                "where": ["src/**/*.py"],
-                "languages": ["python"],
-                "limit": 25,
-                "match": { "kind": "call", "callee": { "name": "eval" } }
-            }))
-        );
-    }
-
-    #[test]
-    fn structural_query_sexp_lowers_result_detail_wrapper() {
-        assert_eq!(
-            canonical(r#"(result-detail full (call :callee (name "eval")))"#),
-            canonical_json(json!({
-                "result_detail": "full",
-                "match": { "kind": "call", "callee": { "name": "eval" } }
-            }))
-        );
-    }
-
-    #[test]
-    fn structural_query_sexp_lowers_execution_mode_wrappers() {
-        for (source, expected) in [
-            ("(explain (call))", "explain"),
-            ("(profile (call))", "profile"),
-        ] {
-            assert_eq!(canonical(source)["execution_mode"], expected, "{source}");
-        }
-
-        let source = "(profile (explain (call)))";
-        let error = CodeQuery::from_sexp(source).unwrap_err();
-        assert!(error.contains("duplicate S-expression field `execution_mode`"));
-    }
-
-    #[test]
-    fn structural_query_sexp_lowers_typed_steps_in_execution_order() {
-        assert_eq!(
-            canonical(r#"(imports-of (file-of (call :callee (name "load"))))"#),
-            canonical_json(json!({
-                "match": { "kind": "call", "callee": { "name": "load" } },
-                "steps": [
-                    { "op": "file_of" },
-                    { "op": "imports_of" }
-                ]
-            }))
-        );
-    }
-
-    #[test]
-    fn reference_traversal_options_lower_in_any_order() {
-        assert_eq!(
-            canonical(
-                r#"(references-of :surface external-usages :proof proven :reference-kinds [field-write method-call] (enclosing-decl (class :name "Target")))"#,
-            ),
-            canonical_json(json!({
-                "match": { "kind": "class", "name": "Target" },
-                "steps": [
-                    { "op": "enclosing_decl" },
-                    {
-                        "op": "references_of",
-                        "reference_kinds": ["field_write", "method_call"],
-                        "proof": "proven"
-                    }
-                ]
-            }))
-        );
     }
 
     #[test]
@@ -3632,152 +4544,6 @@ mod tests {
     }
 
     #[test]
-    fn structural_query_sexp_lowers_hierarchy_options_and_members() {
-        assert_eq!(
-            canonical(
-                r#"(owner (members (subtypes :transitive true (supertypes :depth 2 (enclosing-decl (class :name "Service"))))))"#
-            ),
-            canonical_json(json!({
-                "match": { "kind": "class", "name": "Service" },
-                "steps": [
-                    { "op": "enclosing_decl" },
-                    { "op": "supertypes", "depth": 2 },
-                    { "op": "subtypes", "transitive": true },
-                    { "op": "members" },
-                    { "op": "owner" }
-                ]
-            }))
-        );
-
-        for invalid in [
-            r#"(supertypes :depth 0 (enclosing-decl (class)))"#,
-            r#"(subtypes :transitive false (enclosing-decl (class)))"#,
-            r#"(subtypes :transitive "true" (enclosing-decl (class)))"#,
-            r#"(supertypes :unknown 2 (enclosing-decl (class)))"#,
-        ] {
-            assert!(CodeQuery::from_sexp(invalid).is_err(), "{invalid}");
-        }
-    }
-
-    #[test]
-    fn structural_query_sexp_rejects_result_detail_as_pattern_field() {
-        let error = CodeQuery::from_sexp(r#"(call :callee (name "eval") :result-detail full)"#)
-            .unwrap_err();
-        assert!(
-            error.contains("unknown pattern field `:result-detail`"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn structural_query_sexp_lowers_string_role_shorthand() {
-        assert_eq!(
-            canonical(r#"(import :module "os")"#),
-            canonical_json(json!({
-                "match": {
-                    "kind": "import",
-                    "module": { "name": "os" }
-                }
-            }))
-        );
-    }
-
-    /// `:visibility` accepts a bare label, a vector of labels, and a list of
-    /// labels, matching the sequence handling the editor validator already
-    /// allows. Hyphenated spellings canonicalize to their underscore form.
-    #[test]
-    fn structural_query_sexp_lowers_visibility_label_and_sequences() {
-        assert_eq!(
-            canonical("(method :visibility package-private)"),
-            canonical_json(json!({
-                "match": { "kind": "method", "visibility": "package_private" }
-            }))
-        );
-        let expected = canonical_json(json!({
-            "match": { "kind": "method", "visibility": ["public", "protected"] }
-        }));
-        assert_eq!(
-            canonical("(method :visibility [public protected])"),
-            expected
-        );
-        assert_eq!(
-            canonical("(method :visibility (public protected))"),
-            expected
-        );
-        assert_eq!(
-            canonical("(method (visibility (public protected)))"),
-            expected
-        );
-    }
-
-    #[test]
-    fn structural_query_sexp_lowers_containment() {
-        assert_eq!(
-            canonical(r#"(inside (function :name "handler") (call :callee (name "eval")))"#),
-            canonical_json(json!({
-                "inside": { "kind": "function", "name": "handler" },
-                "match": { "kind": "call", "callee": { "name": "eval" } }
-            }))
-        );
-    }
-
-    #[test]
-    fn structural_query_sexp_reports_parser_errors() {
-        let error = CodeQuery::from_sexp(r#"(call :callee (name "eval")"#).unwrap_err();
-        assert!(error.contains("missing `)`"), "{error}");
-    }
-
-    #[test]
-    fn structural_query_sexp_reports_unknown_forms() {
-        let error = CodeQuery::from_sexp("(banana)").unwrap_err();
-        assert!(
-            error.contains("unknown S-expression form `banana`"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn structural_query_sexp_reports_bad_language() {
-        let error = CodeQuery::from_sexp("(language klingon (call))").unwrap_err();
-        assert!(
-            error.contains("unknown language label `klingon`"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn structural_query_sexp_reports_duplicate_keyword_fields() {
-        let error = CodeQuery::from_sexp(r#"(class :name "A" :name "B")"#).unwrap_err();
-        assert!(
-            error.contains("duplicate S-expression field `name`"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn structural_query_sexp_reports_excessive_parser_depth() {
-        let mut input = String::new();
-        for _ in 0..=MAX_SEXP_DEPTH + 1 {
-            input.push('(');
-        }
-        input.push_str("call");
-        for _ in 0..=MAX_SEXP_DEPTH + 1 {
-            input.push(')');
-        }
-        let error = CodeQuery::from_sexp(&input).unwrap_err();
-        assert!(
-            error.contains("S-expression nesting exceeds maximum depth"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn structural_query_sexp_preserves_pathful_validation_errors() {
-        let error = CodeQuery::from_sexp("(assignment :callee (name \"run\"))").unwrap_err();
-        assert!(error.contains("match.callee"), "{error}");
-    }
-
-    #[test]
     fn configuration_facts_json_and_rql_have_one_canonical_meaning() {
         let json = json!({
             "configuration_facts": {
@@ -3812,6 +4578,195 @@ mod tests {
             from_sexp.to_canonical_json()["configuration_facts"]["formats"],
             json!(["properties"])
         );
+    }
+
+    const BOUND_KEYS: &str = r#"(call-input :parameter-index 0
+        (call-sites-to :proof proven (enclosing-decl (method (name "get")))))"#;
+
+    #[test]
+    fn cross_domain_operators_have_one_canonical_meaning_in_json_and_rql() {
+        let code = CodeQuery::from_sexp(BOUND_KEYS)
+            .expect("code input")
+            .to_canonical_query_plan_json();
+        let mut code = code.as_object().expect("plan object").clone();
+        code.remove("schema_version");
+        let configuration = json!({ "configuration_facts": { "formats": ["properties"] } });
+        let correlate_json = json!({
+            "correlate": {
+                "relation": { "configuration_key": {
+                    "documents": ["src/main/resources/b.properties", "a.properties", "a.properties"]
+                } },
+                "code": code,
+                "configuration": configuration,
+            }
+        });
+        let correlate_rql = format!(
+            r#"(correlate
+              :relation (configuration-key :documents ["src/main/resources/b.properties" "a.properties"])
+              :code {BOUND_KEYS}
+              :configuration (configuration-facts :format properties))"#
+        );
+        let from_json = CodeQuery::from_json(&correlate_json).expect("valid JSON correlate");
+        assert_eq!(canonical(&correlate_rql), from_json.to_canonical_json());
+        // Declared documents are canonical: sorted and deduplicated.
+        assert_eq!(
+            from_json.to_canonical_json()["correlate"]["relation"]["configuration_key"]["documents"],
+            json!(["a.properties", "src/main/resources/b.properties"])
+        );
+
+        let require_rql = format!(
+            "(require-both :code {BOUND_KEYS} :configuration (configuration-facts :format properties))"
+        );
+        let require_json =
+            json!({ "require_both": { "code": code, "configuration": configuration } });
+        assert_eq!(canonical(&require_rql), canonical_json(require_json));
+    }
+
+    #[test]
+    fn dependency_configuration_has_one_canonical_json_and_rql_meaning() {
+        let rql = r#"(correlate
+            :relation (dependency-configuration :owner "npm:workspace:packages/a"
+                :ecosystem npm :version-range "<2.0.0"
+                :documents ["a/base.properties" "a/override.properties"]
+                :overrides [["a/base.properties" "a/override.properties"]] :value "true")
+            :code (dependency-evidence :ecosystem npm :kind locked)
+            :configuration (configuration-facts :format properties :key "feature.enabled"))"#;
+        let parsed = CodeQuery::from_sexp(rql).expect("dependency configuration relation");
+        let canonical = parsed.to_canonical_json();
+        let decoded = CodeQuery::from_json(&canonical).expect("canonical JSON relation");
+        assert_eq!(canonical, decoded.to_canonical_json());
+        assert_eq!(
+            canonical["correlate"]["relation"]["dependency_configuration"]["overrides"],
+            json!([["a/base.properties", "a/override.properties"]])
+        );
+        let wrong_kind = rql.replace(
+            "(dependency-evidence :ecosystem npm :kind locked)",
+            "(call)",
+        );
+        assert!(
+            CodeQuery::from_sexp(&wrong_kind)
+                .unwrap_err()
+                .to_string()
+                .contains("requires dependency_evidence")
+        );
+    }
+
+    #[test]
+    fn direct_ir_dependency_configuration_rejects_duplicate_documents() {
+        let mut query = CodeQuery::from_sexp(
+            r#"(correlate
+            :relation (dependency-configuration :owner "npm:workspace:packages/a"
+                :ecosystem npm :version-range "<2.0.0" :documents ["a.properties"] :value "true")
+            :code (dependency-evidence :ecosystem npm :kind locked)
+            :configuration (configuration-facts :format properties :key "feature.enabled"))"#,
+        )
+        .expect("valid relation");
+        let CodeQueryPlanSource::Correlate(correlation) = &mut query.plan.source else {
+            panic!("correlation source");
+        };
+        let super::super::ir::CrossDomainRelation::DependencyConfiguration(relation) =
+            &mut correlation.relation
+        else {
+            panic!("dependency configuration relation");
+        };
+        relation.documents.push("a.properties".to_owned());
+        let error = query
+            .validate_steps()
+            .expect_err("duplicate direct IR documents");
+        assert_eq!(
+            error.path,
+            "correlate.relation.dependency_configuration.documents[1]"
+        );
+        assert!(error.message.contains("must be unique"));
+    }
+
+    #[test]
+    fn cross_domain_operators_validate_their_typed_inputs() {
+        let relation = r#"(configuration-key :documents ["app.properties"])"#;
+        let configuration = "(configuration-facts :format properties)";
+        for (source, expected) in [
+            (
+                format!("(correlate :code {BOUND_KEYS} :configuration {configuration})"),
+                "requires a registered relation",
+            ),
+            (
+                format!(
+                    "(require-both :relation {relation} :code {BOUND_KEYS} :configuration {configuration})"
+                ),
+                "require_both never relates rows",
+            ),
+            (
+                format!(
+                    "(correlate :relation {relation} :code (call) :configuration {configuration})"
+                ),
+                "correlates expression_site rows",
+            ),
+            (
+                format!(
+                    "(correlate :relation {relation} :code {configuration} :configuration {configuration})"
+                ),
+                "must produce programming-code rows",
+            ),
+            (
+                format!(
+                    "(correlate :relation {relation} :code {BOUND_KEYS} :configuration {BOUND_KEYS})"
+                ),
+                "must produce configuration_fact rows",
+            ),
+            (
+                format!(
+                    "(correlate :relation {relation} :code (language python {BOUND_KEYS}) :configuration {configuration})"
+                ),
+                "domain intersection is disjoint",
+            ),
+            (
+                format!(
+                    "(correlate :relation {relation} :code {BOUND_KEYS} :configuration (configuration-facts :format yaml))"
+                ),
+                "domain intersection is disjoint",
+            ),
+            (
+                format!(
+                    r#"(correlate :relation (configuration-key :documents ["conf/*.properties"]) :code {BOUND_KEYS} :configuration {configuration})"#
+                ),
+                "exact `/`-separated workspace-relative path",
+            ),
+            (
+                format!(
+                    r#"(correlate :relation (configuration-key :documents ["../app.properties"]) :code {BOUND_KEYS} :configuration {configuration})"#
+                ),
+                "exact `/`-separated workspace-relative path",
+            ),
+            (
+                format!(
+                    r#"(correlate :relation (configuration-key :documents ["application.yml"]) :code {BOUND_KEYS} :configuration {configuration})"#
+                ),
+                "is not a [Properties] document",
+            ),
+            (
+                format!(
+                    "(correlate :relation (configuration-key :documents []) :code {BOUND_KEYS} :configuration {configuration})"
+                ),
+                "declares from 1 through",
+            ),
+            (
+                format!("(union {BOUND_KEYS} {configuration})"),
+                "heterogeneous union requires a domain discriminator",
+            ),
+            (
+                format!(
+                    "(except (correlate :relation {relation} :code {BOUND_KEYS} :configuration {configuration}) (correlate :relation {relation} :code {BOUND_KEYS} :configuration {configuration}))"
+                ),
+                "heterogeneous rows cannot be intersected",
+            ),
+            (
+                relation.to_string(),
+                "cross-domain relation, valid only as the :relation of correlate",
+            ),
+        ] {
+            let error = CodeQuery::from_sexp(&source).expect_err(&source);
+            assert!(error.contains(expected), "{source}: {error}");
+        }
     }
 
     #[test]

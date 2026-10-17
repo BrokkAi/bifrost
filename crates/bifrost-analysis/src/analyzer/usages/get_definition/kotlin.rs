@@ -57,9 +57,12 @@ use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::analyzer::{
     BoundedDefinitionLookup, ForwardQueryProvider, SignatureMetadata, StructuredTypeIdentity,
 };
+use brokk_bifrost_core::analyzer::common::node_source_text;
 use brokk_bifrost_core::analyzer::fq_name::segment_interner;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
-use brokk_bifrost_jvm::kotlin::declarations::{kotlin_identifier_text, kotlin_package_name};
+use brokk_bifrost_jvm::kotlin::declarations::{
+    kotlin_callable_metadata_accepts_arity, kotlin_identifier_text, kotlin_package_name,
+};
 use brokk_bifrost_jvm::kotlin::syntax::{
     kotlin_call_arity, kotlin_call_with_callee, kotlin_callee, kotlin_declaration_node,
     kotlin_enclosing_import_header, kotlin_is_declaration_name, kotlin_is_expression_kind,
@@ -69,6 +72,48 @@ use brokk_bifrost_jvm::kotlin::types::{KotlinNameScope, KotlinTypeName, resolve_
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
+
+/// Expand a point inside a Kotlin named-argument label to the exact parsed
+/// identifier token. The generic location resolver treats the opening
+/// backtick as punctuation, while the producer publishes the full AST span.
+pub(super) fn kotlin_site_for_focus(
+    mut site: ResolvedReferenceSite,
+    tree: &Tree,
+    source: &str,
+) -> ResolvedReferenceSite {
+    let Some(node) =
+        smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)
+    else {
+        return site;
+    };
+    let Some(parent) = node.parent() else {
+        return site;
+    };
+    if node.kind() != "simple_identifier"
+        || parent.kind() != "value_argument"
+        || !kotlin_named_argument_label(parent, node)
+    {
+        return site;
+    }
+    let (start, end) = (node.start_byte(), node.end_byte());
+    if start == site.focus_start_byte && end == site.focus_end_byte {
+        return site;
+    }
+    let Some(_) = source.get(start..end) else {
+        return site;
+    };
+    let line_starts = compute_line_starts(source);
+    site.text = kotlin_identifier_text(node, source).to_owned();
+    site.range = Range {
+        start_byte: start,
+        end_byte: end,
+        start_line: find_line_index_for_offset(&line_starts, start) + 1,
+        end_line: find_line_index_for_offset(&line_starts, end.saturating_sub(1)) + 1,
+    };
+    site.focus_start_byte = start;
+    site.focus_end_byte = end;
+    site
+}
 
 /// How many levels of ancestor scope a name lookup inherits.
 ///
@@ -103,12 +148,10 @@ impl<'a> KotlinDefinitionProvider<'a> {
 
 impl BoundedDefinitionLookup for KotlinDefinitionProvider<'_> {
     fn fqn(&self, fqn: &str) -> Vec<CodeUnit> {
-        let mut units = self
+        let units = self
             .session
             .query_rows(|| self.kotlin.forward_definition_fqn(fqn));
-        sort_units(&mut units);
-        units.dedup();
-        units
+        crate::analyzer::definition_lookup::sort_dedup_units(units)
     }
 
     fn fqn_in_language(&self, fqn: &str, language: Language) -> Vec<CodeUnit> {
@@ -120,32 +163,21 @@ impl BoundedDefinitionLookup for KotlinDefinitionProvider<'_> {
     }
 
     fn file_identifier(&self, file: &ProjectFile, ident: &str) -> Vec<CodeUnit> {
-        let mut units = self
-            .session
-            .query_rows(|| self.kotlin.forward_file_identifier(file, ident));
-        sort_units(&mut units);
-        units.dedup();
-        units
+        crate::analyzer::definition_lookup::sort_dedup_units(
+            self.session
+                .query_rows(|| self.kotlin.forward_file_identifier(file, ident)),
+        )
     }
 
     fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit> {
-        let mut children = Vec::new();
-        for owner in self.fqn(fqn) {
-            children.extend(
+        super::fqn_direct_children(
+            self.fqn(fqn),
+            |owner| {
                 self.session
-                    .query_rows(|| self.kotlin.forward_direct_children(&owner)),
-            );
-            if !self.session.observe_cancellation() {
-                return Vec::new();
-            }
-        }
-        sort_units(&mut children);
-        children.dedup();
-        children
-    }
-
-    fn fqn_exists(&self, fqn: &str) -> bool {
-        !self.fqn(fqn).is_empty()
+                    .query_rows(|| self.kotlin.forward_direct_children(owner))
+            },
+            || self.session.observe_cancellation(),
+        )
     }
 
     fn package_exists(&self, package: &str) -> bool {
@@ -213,16 +245,16 @@ pub(crate) fn resolve_kotlin_bounded(
     budget: ReceiverAnalysisBudget,
     cancellation: Option<&CancellationToken>,
 ) -> BoundedResolution<DefinitionLookupOutcome> {
-    let session = ResolutionSession::bounded(budget, cancellation);
-    let Some(kotlin) = resolve_analyzer::<KotlinAnalyzer>(analyzer) else {
-        return session.finish(no_definition(
-            "kotlin_analyzer_unavailable",
-            "Kotlin analyzer is unavailable",
-        ));
-    };
-    let support = KotlinDefinitionProvider::new(kotlin, &session);
-    let outcome = resolve_kotlin_in_session(analyzer, &support, &session, file, source, tree, site);
-    session.finish(outcome)
+    ResolutionSession::run_bounded(budget, cancellation, |session| {
+        let Some(kotlin) = resolve_analyzer::<KotlinAnalyzer>(analyzer) else {
+            return no_definition(
+                "kotlin_analyzer_unavailable",
+                "Kotlin analyzer is unavailable",
+            );
+        };
+        let support = KotlinDefinitionProvider::new(kotlin, session);
+        resolve_kotlin_in_session(analyzer, &support, session, file, source, tree, site)
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -564,7 +596,7 @@ impl<'a> KotlinCtx<'a> {
     }
 
     fn text(&self, node: Node<'_>) -> &'a str {
-        node.utf8_text(self.source.as_bytes()).unwrap_or_default()
+        node_source_text(node, self.source)
     }
 
     /// The names visible at `byte` of the requesting file.
@@ -631,7 +663,7 @@ impl<'a> KotlinCtx<'a> {
     }
 
     fn model_types_named(&self, fqn: &str) -> Vec<&SemanticModelSymbol> {
-        self.model_symbols_named(fqn, |kind| {
+        self.model_non_package_symbols_named(fqn, |kind| {
             matches!(
                 kind,
                 SemanticModelSymbolKind::Class
@@ -642,14 +674,6 @@ impl<'a> KotlinCtx<'a> {
                     | SemanticModelSymbolKind::TypeAlias
             )
         })
-        .into_iter()
-        .filter(|symbol| {
-            !symbol
-                .aliases
-                .iter()
-                .any(|alias| alias == KOTLIN_PACKAGE_MARKER)
-        })
-        .collect()
     }
 
     fn model_package_exists(&self, fqn: &str) -> bool {
@@ -701,7 +725,7 @@ impl<'a> KotlinCtx<'a> {
     }
 
     fn model_values_named(&self, fqn: &str) -> Vec<&SemanticModelSymbol> {
-        self.model_symbols_named(fqn, |kind| {
+        self.model_non_package_symbols_named(fqn, |kind| {
             matches!(
                 kind,
                 SemanticModelSymbolKind::Property
@@ -710,14 +734,22 @@ impl<'a> KotlinCtx<'a> {
                     | SemanticModelSymbolKind::Module
             )
         })
-        .into_iter()
-        .filter(|symbol| {
-            !symbol
-                .aliases
-                .iter()
-                .any(|alias| alias == KOTLIN_PACKAGE_MARKER)
-        })
-        .collect()
+    }
+
+    fn model_non_package_symbols_named(
+        &self,
+        fqn: &str,
+        accepts: impl Fn(SemanticModelSymbolKind) -> bool,
+    ) -> Vec<&SemanticModelSymbol> {
+        self.model_symbols_named(fqn, accepts)
+            .into_iter()
+            .filter(|symbol| {
+                !symbol
+                    .aliases
+                    .iter()
+                    .any(|alias| alias == KOTLIN_PACKAGE_MARKER)
+            })
+            .collect()
     }
 
     fn model_members_named(&self, fqn: &str, arity: Option<usize>) -> Vec<&SemanticModelSymbol> {
@@ -744,43 +776,15 @@ impl<'a> KotlinCtx<'a> {
         result
     }
 
-    fn model_extension_candidates(
+    fn model_extension_candidates_for_conforming<'names>(
         &self,
         token: QueryToken<'_>,
-        owner: &str,
+        conforming: impl Iterator<Item = &'names str>,
         member: &str,
         arity: Option<usize>,
         site_byte: usize,
     ) -> Vec<&SemanticModelSymbol> {
-        let conforming = self
-            .model_owner_and_ancestors(owner)
-            .into_iter()
-            .map(|symbol| symbol.qualified_name.as_str())
-            .collect::<Vec<_>>();
-        let scope = self.scope_at(token, site_byte);
-        let resolution = resolve_kotlin_type_name(member, &scope.as_name_scope(), |candidate| {
-            self.model_callables_named(candidate, arity)
-                .iter()
-                .any(|symbol| model_extension_symbol_matches(symbol, &conforming))
-        });
-        let Some(fqn) = resolution.resolved() else {
-            return Vec::new();
-        };
-        self.model_callables_named(&fqn, arity)
-            .into_iter()
-            .filter(|symbol| model_extension_symbol_matches(symbol, &conforming))
-            .collect()
-    }
-
-    fn model_extension_candidates_for_conforming(
-        &self,
-        token: QueryToken<'_>,
-        conforming: &[String],
-        member: &str,
-        arity: Option<usize>,
-        site_byte: usize,
-    ) -> Vec<&SemanticModelSymbol> {
-        let conforming = conforming.iter().map(String::as_str).collect::<Vec<_>>();
+        let conforming = conforming.collect::<Vec<_>>();
         let scope = self.scope_at(token, site_byte);
         let resolution = resolve_kotlin_type_name(member, &scope.as_name_scope(), |candidate| {
             self.model_callables_named(candidate, arity)
@@ -837,15 +841,16 @@ impl<'a> KotlinCtx<'a> {
         names
     }
 
-    fn model_members_for_conforming(
+    fn model_members_for_conforming<'names>(
         &self,
         token: QueryToken<'_>,
-        conforming: &[String],
+        conforming: impl Iterator<Item = &'names str>,
         static_qualifier: bool,
         member: &str,
         arity: Option<usize>,
         site_byte: usize,
     ) -> Vec<&SemanticModelSymbol> {
+        let conforming = conforming.collect::<Vec<_>>();
         for (index, owner) in conforming.iter().enumerate() {
             let direct = self.model_members_named(&format!("{owner}.{member}"), arity);
             if !direct.is_empty() {
@@ -859,7 +864,13 @@ impl<'a> KotlinCtx<'a> {
                 }
             }
         }
-        self.model_extension_candidates_for_conforming(token, conforming, member, arity, site_byte)
+        self.model_extension_candidates_for_conforming(
+            token,
+            conforming.iter().copied(),
+            member,
+            arity,
+            site_byte,
+        )
     }
 
     fn model_members_for_receiver(
@@ -871,21 +882,16 @@ impl<'a> KotlinCtx<'a> {
         arity: Option<usize>,
         site_byte: usize,
     ) -> Vec<&SemanticModelSymbol> {
-        for modeled_owner in self.model_owner_and_ancestors(owner) {
-            let inherited_owner = &modeled_owner.qualified_name;
-            let direct = self.model_members_named(&format!("{inherited_owner}.{member}"), arity);
-            if !direct.is_empty() {
-                return direct;
-            }
-            if static_qualifier && inherited_owner == owner {
-                let companion =
-                    self.model_members_named(&format!("{owner}.Companion.{member}"), arity);
-                if !companion.is_empty() {
-                    return companion;
-                }
-            }
-        }
-        self.model_extension_candidates(token, owner, member, arity, site_byte)
+        self.model_members_for_conforming(
+            token,
+            self.model_owner_and_ancestors(owner)
+                .into_iter()
+                .map(|symbol| symbol.qualified_name.as_str()),
+            static_qualifier,
+            member,
+            arity,
+            site_byte,
+        )
     }
 
     fn model_outcome(
@@ -893,40 +899,11 @@ impl<'a> KotlinCtx<'a> {
         records: Vec<&SemanticModelSymbol>,
         subject: &str,
     ) -> DefinitionLookupOutcome {
-        if records.is_empty() {
-            return no_definition(
-                "no_indexed_definition",
-                format!("`{subject}` is not indexed as a Kotlin model definition"),
-            );
-        }
-        if records.iter().any(|record| record.provenance.ambiguous) {
-            // no candidates: the conflicting records are semantic-model symbols,
-            // not indexed code units, so none can be offered as a target.
-            return ambiguous_without_candidates(format!(
-                "`{subject}` matches conflicting active Kotlin model declarations"
-            ));
-        }
-        let target = if records.len() == 1 {
-            records[0].id.clone()
-        } else {
-            records[0].qualified_name.clone()
-        };
-        let mut reference = self.site.clone();
-        reference.text = target;
-        DefinitionLookupOutcome {
-            modeled_definitions: Vec::new(),
-            status: DefinitionLookupStatus::Resolved,
-            reference: Some(reference),
-            definitions: Vec::new(),
-            lexical_definition: None,
-            diagnostics: Vec::new(),
-        }
+        kotlin_model_outcome(self.site, records, subject)
     }
 
     fn is_constructor(&self, unit: &CodeUnit) -> bool {
-        self.signature_metadata(unit)
-            .iter()
-            .any(SignatureMetadata::callable_is_constructor)
+        crate::analyzer::usages::common::is_constructor_metadata(&self.signature_metadata(unit))
     }
 
     /// Ordinary callables declared at `fqn`. Constructors are excluded by
@@ -987,14 +964,7 @@ impl<'a> KotlinCtx<'a> {
     /// candidate would turn a gap in indexing into a confident wrong answer.
     fn accepts_arity(&self, unit: &CodeUnit, arity: usize) -> bool {
         let metadata = self.signature_metadata(unit);
-        if metadata.is_empty() {
-            return true;
-        }
-        metadata.iter().any(|entry| {
-            entry
-                .callable_arity()
-                .is_none_or(|callable| callable.accepts(arity))
-        })
+        kotlin_callable_metadata_accepts_arity(&metadata, arity)
     }
 
     /// Whether `unit` declares a parameter spelled `label`.
@@ -1081,14 +1051,8 @@ impl<'a> KotlinCtx<'a> {
                 end_line: 0,
             },
         )?;
-        let mut current = Some(start);
-        while let Some(unit) = current {
-            if unit.is_class() {
-                return Some(unit);
-            }
-            current = self.parent_of(&unit);
-        }
-        None
+        crate::analyzer::usages::common::enclosing_owner_chain(start, |unit| self.parent_of(unit))
+            .find(CodeUnit::is_class)
     }
 
     /// The type a declaration carries: a property's or parameter's written
@@ -1268,12 +1232,10 @@ impl<'a> KotlinCtx<'a> {
             return Vec::new();
         };
 
-        let mut lexical = Vec::new();
-        let mut current = Some(start);
-        while let Some(unit) = current {
-            current = self.parent_of(&unit);
-            lexical.push(unit);
-        }
+        let lexical =
+            brokk_bifrost_jvm::kotlin::types::kotlin_lexical_owner_chain(Some(start), |unit| {
+                self.parent_of(unit)
+            });
 
         let mut owners: Vec<String> = Vec::new();
         for unit in &lexical {
@@ -1374,23 +1336,7 @@ fn kotlin_import_reference_outcome(
             format!("`{candidate}` names a package, which has no declaration to navigate to"),
         );
     }
-    let modeled = ctx.model_symbols_named(&candidate, |kind| {
-        matches!(
-            kind,
-            SemanticModelSymbolKind::Class
-                | SemanticModelSymbolKind::Annotation
-                | SemanticModelSymbolKind::Interface
-                | SemanticModelSymbolKind::Enum
-                | SemanticModelSymbolKind::Module
-                | SemanticModelSymbolKind::TypeAlias
-                | SemanticModelSymbolKind::Constructor
-                | SemanticModelSymbolKind::Method
-                | SemanticModelSymbolKind::Function
-                | SemanticModelSymbolKind::Field
-                | SemanticModelSymbolKind::Property
-                | SemanticModelSymbolKind::Constant
-        )
-    });
+    let modeled = ctx.model_symbols_named(&candidate, kotlin_import_target_kind);
     if !modeled.is_empty() {
         return ctx.model_outcome(modeled, &candidate);
     }
@@ -1404,6 +1350,96 @@ fn kotlin_import_reference_outcome(
         "no_indexed_definition",
         format!("`{candidate}` is not indexed as a Kotlin definition"),
     )
+}
+
+fn kotlin_import_target_kind(kind: SemanticModelSymbolKind) -> bool {
+    matches!(
+        kind,
+        SemanticModelSymbolKind::Class
+            | SemanticModelSymbolKind::Annotation
+            | SemanticModelSymbolKind::Interface
+            | SemanticModelSymbolKind::Enum
+            | SemanticModelSymbolKind::Module
+            | SemanticModelSymbolKind::TypeAlias
+            | SemanticModelSymbolKind::Constructor
+            | SemanticModelSymbolKind::Method
+            | SemanticModelSymbolKind::Function
+            | SemanticModelSymbolKind::Field
+            | SemanticModelSymbolKind::Property
+            | SemanticModelSymbolKind::Constant
+    )
+}
+
+fn kotlin_model_outcome(
+    site: &ResolvedReferenceSite,
+    records: Vec<&SemanticModelSymbol>,
+    subject: &str,
+) -> DefinitionLookupOutcome {
+    if records.is_empty() {
+        return no_definition(
+            "no_indexed_definition",
+            format!("`{subject}` is not indexed as a Kotlin model definition"),
+        );
+    }
+    if records.iter().any(|record| record.provenance.ambiguous) {
+        // no candidates: the conflicting records are semantic-model symbols,
+        // not indexed code units, so none can be offered as a target.
+        return ambiguous_without_candidates(format!(
+            "`{subject}` matches conflicting active Kotlin model declarations"
+        ));
+    }
+    let target = if records.len() == 1 {
+        records[0].id.clone()
+    } else {
+        records[0].qualified_name.clone()
+    };
+    let mut reference = site.clone();
+    reference.text = target;
+    DefinitionLookupOutcome {
+        modeled_definitions: Vec::new(),
+        status: DefinitionLookupStatus::Resolved,
+        reference: Some(reference),
+        definitions: Vec::new(),
+        lexical_definition: None,
+        diagnostics: Vec::new(),
+    }
+}
+
+/// Project an exact active Kotlin model declaration selected by an import.
+///
+/// The native JVM point resolver owns workspace bindings. This is the external
+/// model half of that same import lookup, with the outcome construction shared
+/// with Kotlin's ordinary definition path.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn kotlin_import_model_outcome(
+    analyzer: &dyn IAnalyzer,
+    site: &ResolvedReferenceSite,
+    candidate: &str,
+) -> Option<DefinitionLookupOutcome> {
+    let overlay = analyzer.semantic_model_overlay()?;
+    let records = overlay.symbols_named(candidate).records;
+    if records.iter().any(|symbol| {
+        symbol.language == "kotlin"
+            && symbol.kind == SemanticModelSymbolKind::Module
+            && symbol
+                .aliases
+                .iter()
+                .any(|alias| alias == KOTLIN_PACKAGE_MARKER)
+    }) {
+        return Some(no_definition(
+            "package_reference",
+            format!("`{candidate}` names a package, which has no declaration to navigate to"),
+        ));
+    }
+    let modeled = records
+        .into_iter()
+        .filter(|symbol| {
+            symbol.language == "kotlin"
+                && symbol.externally_visible()
+                && kotlin_import_target_kind(symbol.kind)
+        })
+        .collect::<Vec<_>>();
+    (!modeled.is_empty()).then(|| kotlin_model_outcome(site, modeled, candidate))
 }
 
 /// Resolve a focus on a `type_identifier`: a type annotation, a supertype, an
@@ -1467,10 +1503,7 @@ fn kotlin_type_spelling_segments<'a>(ctx: &KotlinCtx<'a>, node: Node<'_>) -> Vec
     let Some(parent) = node.parent().filter(|parent| parent.kind() == "user_type") else {
         return vec![ctx.text(node)];
     };
-    let segments = named_children(parent)
-        .into_iter()
-        .filter(|child| child.kind() == "type_identifier")
-        .collect::<Vec<_>>();
+    let segments = brokk_bifrost_jvm::kotlin::syntax::kotlin_user_type_segments(parent);
     let last = segments
         .iter()
         .position(|segment| segment.id() == node.id())
@@ -1925,7 +1958,7 @@ fn kotlin_member_outcome(
         for required_arity in [arity, None] {
             let modeled = ctx.model_members_for_conforming(
                 token,
-                &conforming,
+                conforming.iter().map(String::as_str),
                 receiver.static_qualifier,
                 member,
                 required_arity,
@@ -2034,21 +2067,17 @@ fn kotlin_unresolved_receiver_outcome(
         // workspace declaration of the owner type, or of a member on it,
         // would have answered there rather than here.
         let canonical = declared.fqn().to_owned();
-        trace::record_named_boundary(canonical.clone());
-        let mut outcome = boundary_unchecked(
-            format!(
-                "`{canonical}` names a member of a JVM type declared outside the indexed workspace"
-            ),
-            UnindexedClaim::external_boundary(canonical.clone(), ClaimSubjectRole::Member),
-        );
         // The canonical identity is the one publication both consumers read:
         // the call-binding path re-resolves it through the same surface, and
         // the trace names the declaration the reference landed on rather than
         // the receiver variable it was written through (#3466).
-        let mut reference = ctx.site.clone();
-        reference.text = canonical;
-        outcome.reference = Some(reference);
-        return outcome;
+        return super::external_member_boundary_outcome(
+            canonical.clone(),
+            format!(
+                "`{canonical}` names a member of a JVM type declared outside the indexed workspace"
+            ),
+            Some(ctx.site.clone()),
+        );
     }
     // gated upstream is *not* claimed here: the closure below is the workspace
     // check itself. The surface reads only jar-indexed and pack-declared
@@ -2123,7 +2152,7 @@ fn kotlin_value_receiver_owner_spelling(
         // read exactly as a binding's written type is.
         "as_expression" => {
             let asserted = named_children(node).into_iter().next_back()?;
-            kotlin_type_node_spelling(ctx, asserted)
+            brokk_bifrost_jvm::kotlin::syntax::kotlin_type_spelling(asserted, ctx.source)
         }
         "simple_identifier" => {
             let binding = kotlin_local_binding(node, ctx.source, ctx.text(node))?;
@@ -2202,29 +2231,25 @@ fn kotlin_receiver_name_path<'tree>(
     ctx: &KotlinCtx<'_>,
     receiver: Node<'tree>,
 ) -> Option<(Node<'tree>, String)> {
-    let mut segments: Vec<&str> = Vec::new();
-    let mut current = receiver;
-    for _ in 0..=MAX_RECEIVER_DEPTH {
-        match current.kind() {
-            "simple_identifier" => {
-                segments.push(ctx.text(current));
-                segments.reverse();
-                return Some((current, segments.join(".")));
-            }
-            "navigation_expression" => {
-                let children = named_children(current);
-                let (suffix, rest) = children.split_last()?;
-                let next = *rest.first()?;
-                if suffix.kind() != "navigation_suffix" {
-                    return None;
-                }
-                segments.push(ctx.text(first_named_child_of_kind(*suffix, "simple_identifier")?));
-                current = next;
-            }
-            _ => return None,
-        }
+    if receiver.kind() == "simple_identifier" {
+        return Some((receiver, ctx.text(receiver).to_string()));
     }
-    None
+    if receiver.kind() != "navigation_expression" {
+        return None;
+    }
+    let segments =
+        brokk_bifrost_jvm::kotlin::syntax::kotlin_dotted_navigation_segments_with_max_depth(
+            receiver,
+            MAX_RECEIVER_DEPTH,
+        )?;
+    let (head, _) = segments.split_first()?;
+    let head = *head;
+    let path = segments
+        .into_iter()
+        .map(|segment| ctx.text(segment))
+        .collect::<Vec<_>>()
+        .join(".");
+    Some((head, path))
 }
 
 fn nominal_type_name(reference: &TypeRef) -> Option<&str> {
@@ -2235,6 +2260,9 @@ fn nominal_type_name(reference: &TypeRef) -> Option<&str> {
 }
 
 fn model_extension_receiver_matches(reference: &TypeRef, conforming: &[&str]) -> bool {
+    if reference.contains_unknown() {
+        return false;
+    }
     match reference {
         TypeRef::Named { name, .. } => name == "kotlin.Any" || conforming.contains(&name.as_str()),
         TypeRef::TypeParameter { .. } => true,
@@ -2271,7 +2299,8 @@ fn kotlin_model_receiver(
         ),
         "as_expression" => {
             let asserted = named_children(node).into_iter().next_back()?;
-            let spelled = kotlin_type_node_spelling(ctx, asserted)?;
+            let spelled =
+                brokk_bifrost_jvm::kotlin::syntax::kotlin_type_spelling(asserted, ctx.source)?;
             let fqn = ctx
                 .resolve_name(&spelled, &ctx.scope_at(token, node.start_byte()))
                 .resolved()?;
@@ -2319,7 +2348,7 @@ fn kotlin_model_receiver(
                     let conforming = ctx.authored_receiver_model_names(token, &authored);
                     ctx.model_members_for_conforming(
                         token,
-                        &conforming,
+                        conforming.iter().map(String::as_str),
                         authored.static_qualifier,
                         ctx.text(member_node),
                         arity,
@@ -2426,7 +2455,7 @@ fn kotlin_member_candidates(
 
                 let expanded = ctx.direct_ancestors(owner);
                 if let Some(state) = member_trace.as_mut() {
-                    state.record_supertypes(owner, &expanded);
+                    super::record_hierarchy_parents(&mut state.parents, owner, &expanded);
                 }
                 next.extend(expanded);
             }
@@ -2489,19 +2518,9 @@ struct KotlinMemberTrace {
 }
 
 impl KotlinMemberTrace {
-    fn record_supertypes(&mut self, owner: &CodeUnit, ancestors: &[CodeUnit]) {
-        for ancestor in ancestors {
-            self.parents
-                .entry(ancestor.clone())
-                .or_insert_with(|| owner.clone());
-        }
-    }
-
     fn record_companions(&mut self, owner: &CodeUnit, companions: &[CodeUnit]) {
         for companion in companions {
-            self.companion_of
-                .entry(companion.clone())
-                .or_insert_with(|| owner.clone());
+            super::record_companion_owner(&mut self.companion_of, owner, companion);
         }
     }
 
@@ -2535,35 +2554,31 @@ impl KotlinMemberTrace {
         let Some(find) = self.found.get(candidate) else {
             return Vec::new();
         };
-        let mut reversed: Vec<(CodeUnit, CodeUnit, HierarchyRelation)> = Vec::new();
-        let mut current = find.owner.clone();
-        while &current != base {
-            let step = if let Some(class) = self.companion_of.get(&current) {
-                (class.clone(), HierarchyRelation::Embedded)
-            } else if let Some(parent) = self.parents.get(&current) {
-                (parent.clone(), HierarchyRelation::Supertype)
-            } else {
-                break;
-            };
-            reversed.push((step.0.clone(), current, step.1));
-            current = step.0;
-        }
+        let (route, _) = trace::hierarchy_route_from_predecessors(
+            &find.owner,
+            find.depth,
+            |current, _| current == base,
+            |current| {
+                self.companion_of
+                    .get(current)
+                    .cloned()
+                    .map(|class| (class, HierarchyRelation::Embedded))
+                    .or_else(|| {
+                        self.parents
+                            .get(current)
+                            .cloned()
+                            .map(|parent| (parent, HierarchyRelation::Supertype))
+                    })
+            },
+            |unit| Some(unit.clone()),
+        )
+        .expect("Kotlin hierarchy route nodes always have declaration identities");
         debug_assert_eq!(
-            reversed.len(),
+            route.len(),
             find.depth,
             "the first-discovery route must be exactly the recorded depth"
         );
-        reversed.reverse();
-        reversed
-            .into_iter()
-            .enumerate()
-            .map(|(hop, (from, to, relation))| trace::HierarchyHopRecord {
-                hop,
-                from,
-                to,
-                relation,
-            })
-            .collect()
+        route
     }
 
     fn enrichment(
@@ -2573,26 +2588,22 @@ impl KotlinMemberTrace {
         applicability: brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict,
     ) -> Option<trace::MemberEnrichment> {
         let find = self.found.get(candidate)?;
-        Some(trace::MemberEnrichment {
-            owner: find.owner.clone(),
-            hierarchy_depth: find.depth,
-            dispatch_tier: find.dispatch_tier,
+        Some(trace::member_enrichment_with_tier(
+            find.owner.clone(),
+            find.depth,
+            find.dispatch_tier,
             applicability,
-            route: self.route(base, candidate),
-        })
+            self.route(base, candidate),
+        ))
     }
 
     /// Kotlin's precedence ladder for a member find, which follows the
     /// hierarchy level: a companion of the receiver's own type is that type's
     /// own member, not an inherited one.
     fn precedence_tier(&self, candidate: &CodeUnit) -> Option<PrecedenceTier> {
-        self.found.get(candidate).map(|find| {
-            if find.level == 0 {
-                PrecedenceTier::OwnMember
-            } else {
-                PrecedenceTier::InheritedMember
-            }
-        })
+        self.found
+            .get(candidate)
+            .map(|find| super::member_precedence_tier(find.level))
     }
 
     /// Record the candidates this scope computed and then discarded because
@@ -2607,21 +2618,13 @@ impl KotlinMemberTrace {
                 continue;
             }
             let loser = &verdict.candidate;
-            let mut row = trace::TraceCandidate::rejected(
-                trace::TraceCandidateRef::Unit(loser.clone()),
+            trace::record_rejected_unit(
+                loser,
                 self.precedence_tier(loser),
                 RejectionReason::CallableApplicabilityDeferred,
-            )
-            .with_callable(trace::CallableApplicabilityRecord {
-                verdict: verdict.verdict,
-                reason: verdict.reason,
-            });
-            if let Some(enrichment) =
-                self.enrichment(base, loser, ApplicabilityVerdict::Inapplicable)
-            {
-                row = row.with_member(enrichment);
-            }
-            trace::record(row);
+                Some(trace::CallableApplicabilityRecord::from(verdict)),
+                self.enrichment(base, loser, ApplicabilityVerdict::Inapplicable),
+            );
         }
     }
 
@@ -2633,49 +2636,13 @@ impl KotlinMemberTrace {
         applicability: &ApplicabilityOutcome,
         winners: &[CodeUnit],
     ) {
-        use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
-
-        if let Some(tier) = winners
-            .iter()
-            .filter_map(|unit| self.precedence_tier(unit))
-            .min()
-        {
-            trace::stage_tier(tier, winners.iter().map(|unit| unit.fq_name()).collect());
-        }
-        let verdict_of = |unit: &CodeUnit| {
-            applicability
-                .verdicts
-                .iter()
-                .find(|verdict| verdict.candidate == *unit)
-        };
-        trace::stage_member_context(
-            winners
-                .iter()
-                .filter_map(|unit| {
-                    let verdict = verdict_of(unit)
-                        .map(|verdict| verdict.verdict)
-                        .unwrap_or(ApplicabilityVerdict::Unknown);
-                    self.enrichment(base, unit, verdict)
-                        .map(|enrichment| (unit.fq_name(), enrichment))
-                })
-                .collect(),
+        trace::stage_winner_tier(
+            winners,
+            winners.iter().filter_map(|unit| self.precedence_tier(unit)),
         );
-        trace::stage_callable_context(
-            winners
-                .iter()
-                .filter_map(|unit| {
-                    verdict_of(unit).map(|verdict| {
-                        (
-                            unit.fq_name(),
-                            trace::CallableApplicabilityRecord {
-                                verdict: verdict.verdict,
-                                reason: verdict.reason,
-                            },
-                        )
-                    })
-                })
-                .collect(),
-        );
+        trace::stage_applicability_context(winners, applicability, |unit, verdict| {
+            self.enrichment(base, unit, verdict)
+        });
     }
 }
 
@@ -2783,7 +2750,7 @@ fn kotlin_receiver(
             let asserted = named_children(node).into_iter().next_back()?;
             Some(KotlinReceiver {
                 owner: ctx.resolve_type_unit(
-                    &kotlin_type_node_spelling(ctx, asserted)?,
+                    &brokk_bifrost_jvm::kotlin::syntax::kotlin_type_spelling(asserted, ctx.source)?,
                     &ctx.scope_at(token, node.start_byte()),
                 )?,
                 static_qualifier: false,
@@ -2850,7 +2817,7 @@ fn kotlin_this_owner(
     token: QueryToken<'_>,
     node: Node<'_>,
 ) -> Option<CodeUnit> {
-    let label = first_named_child_of_kind(node, "label").map(|label| {
+    let label = first_named_child_of_kind(node, "type_identifier").map(|label| {
         ctx.text(label)
             .trim_start_matches('@')
             .trim_end_matches('@')
@@ -2861,7 +2828,8 @@ fn kotlin_this_owner(
     // Only `this@Owner` reaches that dispatch receiver.
     if label.is_none()
         && let Some(receiver) = kotlin_enclosing_extension_receiver(node)
-        && let Some(spelled) = kotlin_type_node_spelling(ctx, receiver)
+        && let Some(spelled) =
+            brokk_bifrost_jvm::kotlin::syntax::kotlin_type_spelling(receiver, ctx.source)
     {
         let scope = ctx.scope_at(token, receiver.start_byte());
         return ctx.resolve_type_unit(&spelled, &scope);
@@ -2869,7 +2837,12 @@ fn kotlin_this_owner(
     let mut current = ctx.enclosing_class_at(node.start_byte());
     while let Some(unit) = current {
         match label.as_deref() {
-            Some(label) if unit.identifier() != label => {
+            Some(label)
+                if !brokk_bifrost_jvm::kotlin::syntax::kotlin_owner_label_matches(
+                    unit.terminal_name(),
+                    label,
+                ) =>
+            {
                 current = ctx.parent_of(&unit).filter(CodeUnit::is_class);
             }
             _ => return Some(unit),
@@ -2911,8 +2884,9 @@ fn kotlin_enclosing_extension_receiver<'tree>(node: Node<'tree>) -> Option<Node<
 /// enclosing class, or the named one in `super<Base>`.
 fn kotlin_super_owner(ctx: &KotlinCtx<'_>, node: Node<'_>) -> Option<CodeUnit> {
     let enclosing = ctx.enclosing_class_at(node.start_byte())?;
-    let named = first_named_child_of_kind(node, "user_type")
-        .and_then(|user_type| kotlin_type_node_spelling(ctx, user_type));
+    let named = first_named_child_of_kind(node, "user_type").and_then(|user_type| {
+        brokk_bifrost_jvm::kotlin::syntax::kotlin_type_spelling(user_type, ctx.source)
+    });
     let ancestors = ctx.direct_ancestors(&enclosing);
     match named {
         Some(named) => ancestors
@@ -2978,7 +2952,7 @@ fn kotlin_expression_type(
         "as_expression" => {
             let asserted = named_children(node).into_iter().next_back()?;
             ctx.resolve_type_unit(
-                &kotlin_type_node_spelling(ctx, asserted)?,
+                &brokk_bifrost_jvm::kotlin::syntax::kotlin_type_spelling(asserted, ctx.source)?,
                 &ctx.scope_at(token, node.start_byte()),
             )
         }
@@ -3093,36 +3067,14 @@ fn kotlin_local_binding<'tree>(node: Node<'tree>, source: &str, name: &str) -> O
 }
 
 fn kotlin_binding_name<'a>(binding: Node<'_>, source: &'a str) -> Option<&'a str> {
-    first_named_child_of_kind(binding, "simple_identifier")?
-        .utf8_text(source.as_bytes())
-        .ok()
-}
-
-/// The dotted name a type node spells, or `None` for a shape that names no
-/// nominal type (a function type, a star projection).
-fn kotlin_type_node_spelling(ctx: &KotlinCtx<'_>, node: Node<'_>) -> Option<String> {
-    match node.kind() {
-        "user_type" => {
-            let segments = named_children(node)
-                .into_iter()
-                .filter(|child| child.kind() == "type_identifier")
-                .map(|child| ctx.text(child))
-                .collect::<Vec<_>>();
-            (!segments.is_empty()).then(|| segments.join("."))
-        }
-        "nullable_type" | "not_nullable_type" | "parenthesized_type" | "receiver_type"
-        | "type_projection" => named_children(node)
-            .into_iter()
-            .find_map(|child| kotlin_type_node_spelling(ctx, child)),
-        _ => None,
-    }
+    first_named_child_of_kind(binding, "simple_identifier")
+        .map(|name| kotlin_identifier_text(name, source))
 }
 
 /// The type written on a binding, if it was written at all.
 fn kotlin_declared_type_spelling(ctx: &KotlinCtx<'_>, binding: Node<'_>) -> Option<String> {
-    named_children(binding)
-        .into_iter()
-        .find_map(|child| kotlin_type_node_spelling(ctx, child))
+    brokk_bifrost_jvm::kotlin::syntax::kotlin_binding_type_node(binding)
+        .and_then(|node| brokk_bifrost_jvm::kotlin::syntax::kotlin_type_spelling(node, ctx.source))
 }
 
 // ---------------------------------------------------------------------------
@@ -3253,4 +3205,86 @@ pub(super) fn kotlin_call_reference_candidate(node: Node<'_>) -> bool {
         .filter(|parent| parent.kind() == "user_type")
         .and_then(|user_type| user_type.parent())
         .is_some_and(|parent| parent.kind() == "constructor_invocation")
+}
+
+#[cfg(test)]
+mod local_binding_tests {
+    use super::*;
+
+    #[test]
+    fn backtick_quoted_local_binding_resolves_from_reference() {
+        let source = "fun caller() { val `localName` = 1; localName }";
+        let tree = parse_kotlin_tree(source).expect("Kotlin syntax tree");
+        let mut stack = vec![tree.root_node()];
+        let mut reference = None;
+        while let Some(node) = stack.pop() {
+            if node.kind() == "simple_identifier"
+                && node.utf8_text(source.as_bytes()).ok() == Some("localName")
+            {
+                reference = Some(node);
+                break;
+            }
+            stack.extend(named_children(node));
+        }
+        let reference = reference.expect("unquoted local reference");
+        let binding = kotlin_local_binding(reference, source, "localName")
+            .expect("backtick-quoted local declaration resolves");
+        assert_eq!(kotlin_binding_name(binding, source), Some("localName"));
+    }
+}
+
+#[cfg(test)]
+mod this_owner_regression_tests {
+    use super::*;
+    use crate::inline_project::InlineTestProject;
+    use std::sync::Arc;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#4271: this@Inner failed when the nested Kotlin owner identifier carried its outer prefix"
+    )]
+    fn this_label_resolves_nested_class_member_by_simple_name() {
+        let source = "package example\n\
+class Outer {\n\
+    val selected = 1\n\
+    inner class Inner {\n\
+        val selected = 2\n\
+        inner class Nested {\n\
+            val selected = 3\n\
+            fun read(): Int = this@Inner.selected\n\
+        }\n\
+    }\n\
+}\n";
+        let fixture = InlineTestProject::with_language(Language::Kotlin)
+            .file("Main.kt", source)
+            .build();
+        let analyzer = KotlinAnalyzer::new(fixture.project_arc());
+        let file = fixture.file("Main.kt");
+        let start = source.rfind("selected").expect("member reference");
+        let request = DefinitionLookupRequest {
+            file: file.clone(),
+            line: None,
+            column: None,
+            start_byte: Some(start),
+            end_byte: Some(start + "selected".len()),
+        };
+
+        let outcome =
+            resolve_definition_batch_with_source(&analyzer, vec![request], file, Arc::from(source))
+                .pop()
+                .expect("one Kotlin definition outcome");
+
+        assert_eq!(
+            outcome.status,
+            DefinitionLookupStatus::Resolved,
+            "{outcome:#?}"
+        );
+        assert!(
+            outcome
+                .definitions
+                .iter()
+                .any(|unit| unit.fq_name() == "example.Outer.Inner.selected"),
+            "this@Inner must select Inner's member: {outcome:#?}"
+        );
+    }
 }

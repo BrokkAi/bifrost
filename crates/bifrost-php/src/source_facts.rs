@@ -19,11 +19,12 @@ impl PhpFileSourceFacts {
         &'a self,
         unit: &'a CodeUnit,
     ) -> impl Iterator<Item = &'a PhpDeclarationSourceFact> + 'a {
-        self.facts.declarations.iter().filter(|fact| {
-            self.declaration_units
-                .get(&fact.declaration)
-                .is_some_and(|units| units.contains(unit))
-        })
+        brokk_bifrost_core::analyzer::source_facts::declarations_for_unit(
+            &self.facts.declarations,
+            &self.declaration_units,
+            unit,
+            |fact| fact.declaration,
+        )
     }
 
     pub fn estimated_retained_bytes(&self) -> usize {

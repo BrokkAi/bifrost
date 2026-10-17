@@ -24,6 +24,7 @@ const POLICY = "brokk-bifrost-policy";
 const RUNTIME = "brokk-bifrost-runtime";
 const MCP = "brokk-bifrost-mcp";
 const SEMANTIC_PACKS = "brokk-bifrost-semantic-packs";
+const TEST_MACROS = "brokk-bifrost-test-macros";
 
 const EXPECTED_MEMBERS = new Set([
   FACADE,
@@ -44,6 +45,7 @@ const EXPECTED_MEMBERS = new Set([
   RUNTIME,
   MCP,
   SEMANTIC_PACKS,
+  TEST_MACROS,
 ]);
 // Core is the bottom of the graph and depends on no workspace package; the
 // analysis crate sits above core and the language crates. Flow owns solver
@@ -69,7 +71,10 @@ const ALLOWED_WORKSPACE_DEPENDENCIES = new Map([
   [RUST, new Set([CORE])],
   [ANALYSIS, new Set([CORE, CPP, CSHARP, GO, JS_TS, JVM, PHP, PYTHON, RUBY, RUST])],
   [FLOW, new Set([CORE, ANALYSIS])],
-  [RQL, new Set([CORE, ANALYSIS, FLOW])],
+  // Query execution uses the C++, Python, JVM and JS/TS crates' structured
+  // grammar hooks. JS/TS property rules reuse the syntax and TypeScript object
+  // helpers; these language crates remain below analysis and depend on core.
+  [RQL, new Set([CORE, ANALYSIS, FLOW, CPP, PYTHON, JVM, JS_TS])],
   [POLICY, new Set([ANALYSIS, FLOW, RQL])],
   [SEMANTIC_PACKS, new Set([ANALYSIS, FLOW])],
   [RUNTIME, new Set([ANALYSIS, FLOW, POLICY, RQL])],
@@ -213,7 +218,18 @@ export function validateWorkspaceGraph(metadata) {
       errors.push(`${pkg.name} must depend on workspace package ${missing}`);
     }
     for (const dependency of pkg.dependencies) {
+      if (
+        dependency.name === TEST_MACROS &&
+        (dependency.kind !== "dev" || dependency.req !== "*" || dependency.source !== null)
+      ) {
+        errors.push(
+          `${pkg.name} dependency on ${TEST_MACROS} must be a path-only development dependency`,
+        );
+        continue;
+      }
       const isAllowed = allowed.has(dependency.name) ||
+        // The shared test marker is available everywhere, but never at runtime.
+        (dependency.name === TEST_MACROS && dependency.kind === "dev") ||
         (dependency.kind === "dev" &&
           ALLOWED_DEVELOPMENT_DEPENDENCIES.get(pkg.name)?.has(dependency.name));
       if (EXPECTED_MEMBERS.has(dependency.name) && !isAllowed) {
@@ -222,6 +238,7 @@ export function validateWorkspaceGraph(metadata) {
       if (
         EXPECTED_MEMBERS.has(dependency.name) &&
         isAllowed &&
+        dependency.name !== TEST_MACROS &&
         dependency.req !== `=${facade.version}`
       ) {
         errors.push(

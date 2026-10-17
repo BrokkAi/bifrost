@@ -3,17 +3,18 @@
 use crate::analyzer::semantic::{
     EvidenceCompleteness, EvidenceHandle, EvidenceId, OracleContractError, ProcedureHandle,
     ProofStatus, SemanticArtifactCollector, SemanticBudget, SemanticBudgetExceeded,
-    SemanticExecutionBudget, SemanticProviderError, SemanticRequest, SemanticWork, ValueHandle,
-    ValueId,
+    SemanticCapability, SemanticExecutionBudget, SemanticProviderError, SemanticRequest,
+    SemanticWork, ValueHandle, ValueId,
 };
+use crate::hash::HashSet;
 
 #[derive(Debug)]
-pub(super) enum Interruption {
+pub(crate) enum Interruption {
     Budget(SemanticBudgetExceeded),
     Cancelled,
 }
 
-pub(super) struct WorkStager {
+pub(crate) struct WorkStager {
     pub(super) budget: SemanticBudget,
     pub(super) work: SemanticWork,
     execution: Option<SemanticExecutionBudget>,
@@ -65,6 +66,21 @@ pub(super) fn internal_contract(
     SemanticProviderError::internal(format!("{context}: {error}"))
 }
 
+pub(super) fn value_flow_core_capabilities_are_open(procedure: &ProcedureHandle) -> bool {
+    let capabilities = procedure.artifact().capabilities();
+    [
+        SemanticCapability::Values,
+        SemanticCapability::Assignments,
+        SemanticCapability::Allocations,
+        SemanticCapability::LocalFlow,
+        SemanticCapability::ParameterFlow,
+        SemanticCapability::ReceiverFlow,
+        SemanticCapability::ReturnFlow,
+    ]
+    .into_iter()
+    .any(|capability| !capabilities.is_available(capability))
+}
+
 pub(super) fn evidence_handle(
     procedure: &ProcedureHandle,
     id: EvidenceId,
@@ -77,9 +93,13 @@ pub(super) fn evidence_handle(
 pub(super) fn dedup_evidence(
     evidence: impl IntoIterator<Item = EvidenceHandle>,
 ) -> Vec<EvidenceHandle> {
+    // Handles compare by artifact instance, procedure, and evidence row, so a
+    // request-local set gives the same exact members as the former linear
+    // membership test without rescanning the retained prefix.
+    let mut seen: HashSet<EvidenceHandle> = HashSet::default();
     let mut result = Vec::new();
     for handle in evidence {
-        if !result.contains(&handle) {
+        if seen.insert(handle.clone()) {
             result.push(handle);
         }
     }

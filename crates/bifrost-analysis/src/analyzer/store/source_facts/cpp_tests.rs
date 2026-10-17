@@ -1,53 +1,3 @@
-use crate::analyzer::cpp::source_publication::cost;
-use brokk_bifrost_core::analyzer::cpp_facts::{
-    CppDeclarationSourceFact, CppDeclaredFieldTypeFact, CppSourceFacts,
-};
-use brokk_bifrost_core::analyzer::model::{CppTemplateExpression, CppTemplateTerm};
-use brokk_bifrost_core::analyzer::source_facts::SourceDeclarationId;
-
-#[test]
-fn cpp_cost_counts_relational_template_terms_and_payload() {
-    let mut declaration = CppDeclarationSourceFact::new(SourceDeclarationId::new(0));
-    declaration.field_type = Some(CppDeclaredFieldTypeFact {
-        type_text: "vector".to_owned(),
-        indirection: 0,
-        binds_indirectly: false,
-        template_arguments: Some(vec![CppTemplateExpression {
-            text: "T::value".to_owned(),
-            term: CppTemplateTerm::Node {
-                kind: "qualified".to_owned(),
-                children: vec![
-                    CppTemplateTerm::Parameter("T".to_owned()),
-                    CppTemplateTerm::Atom {
-                        kind: "identifier".to_owned(),
-                        text: "value".to_owned(),
-                    },
-                ],
-            },
-        }]),
-    });
-    declaration.lexical_path = vec!["Ns".to_owned(), "Value".to_owned()];
-    let facts = CppSourceFacts {
-        declarations: vec![declaration],
-        ..CppSourceFacts::default()
-    };
-
-    let (rows, bytes) = cost(&facts);
-    // The declaration's context is a separately sealed relational row.
-    assert_eq!(rows, 1 + 1 + 2 + 1 + 3 + 1);
-    assert_eq!(
-        bytes,
-        "vector".len()
-            + "Ns".len()
-            + "Value".len()
-            + "T::value".len()
-            + "qualified".len()
-            + "T".len()
-            + "identifier".len()
-            + "value".len()
-    );
-}
-
 use crate::analyzer::cpp::CppAdapter;
 use crate::analyzer::cpp::CppAnalyzer;
 use crate::analyzer::store::AnalyzerStore;
@@ -110,16 +60,24 @@ fn cpp_source_facts_reopen_without_source_and_mount_exact_bridges() {
     std::fs::remove_file(file.abs_path()).unwrap();
     let store = AnalyzerStore::open_persistent(&path).unwrap();
     let generation = store.current_generation("cpp").unwrap();
-    let first = store
-        .cpp_source_facts(oid, generation, "cpp", &CppAdapter, &file, &|| true)
-        .unwrap()
-        .unwrap();
-    let mounted = store
-        .cpp_source_facts(oid, generation, "cpp", &CppAdapter, &second, &|| true)
-        .unwrap()
-        .unwrap();
-    assert_eq!(&first.facts, expected);
-    assert_eq!(first.facts, mounted.facts);
+    let (first, mounted) = super::assert_source_facts_match_across_mounts(
+        &store,
+        generation,
+        &file,
+        &second,
+        |store, generation, file, cancellation| {
+            store.cpp_source_facts(oid, generation, "cpp", &CppAdapter, file, cancellation)
+        },
+        |read| &read.facts,
+    );
+    // Expression and statement rows are query-lifetime projections. The
+    // canonical declaration rows, includes, and using directives are the
+    // persisted source-facts contract exercised by this cold reopen.
+    assert_eq!(first.facts.includes, expected.includes);
+    assert_eq!(first.facts.declarations, expected.declarations);
+    assert_eq!(first.facts.using_namespaces, expected.using_namespaces);
+    assert!(first.facts.expressions.is_empty());
+    assert_eq!(first.facts.statement_facts, Default::default());
     assert_eq!(
         first.source,
         state.source_facts.as_ref().unwrap().occurrences
@@ -354,28 +312,25 @@ fn cpp_source_reader_rejects_corrupt_cpp_accounting() {
     store
         .write_parsed_blob(oid, "cpp", &CppAdapter, &state)
         .unwrap();
-    store
-        .conn
-        .execute(|conn| {
-            assert!(
-                conn.execute(
-                    "UPDATE source_cpp_manifests SET payload_bytes = payload_bytes",
-                    []
-                )
-                .is_err()
-            );
-            conn.execute_batch(
-                "DROP TRIGGER source_cpp_manifests_no_update_after_seal;
-                 UPDATE source_cpp_manifests
-                 SET payload_bytes = payload_bytes + 1;",
-            )?;
-            Ok::<_, crate::analyzer::store::StoreError>(())
-        })
-        .unwrap();
-    assert!(
-        store
-            .cpp_source_facts(oid, generation, "cpp", &CppAdapter, &file, &|| true)
-            .is_err()
+    super::assert_reader_rejects_tampering(
+        || {
+            store.conn.execute(|conn| {
+                assert!(
+                    conn.execute(
+                        "UPDATE source_cpp_manifests SET payload_bytes = payload_bytes",
+                        []
+                    )
+                    .is_err()
+                );
+                conn.execute_batch(
+                    "DROP TRIGGER source_cpp_manifests_no_update_after_seal;
+                     UPDATE source_cpp_manifests
+                     SET payload_bytes = payload_bytes + 1;",
+                )?;
+                Ok::<_, crate::analyzer::store::StoreError>(())
+            })
+        },
+        || store.cpp_source_facts(oid, generation, "cpp", &CppAdapter, &file, &|| true),
     );
 }
 
@@ -392,28 +347,25 @@ fn cpp_source_reader_rejects_corrupt_global_accounting() {
     store
         .write_parsed_blob(oid, "cpp", &CppAdapter, &state)
         .unwrap();
-    store
-        .conn
-        .execute(|conn| {
-            assert!(
-                conn.execute(
-                    "UPDATE source_fact_manifests SET declaration_unit_count = declaration_unit_count",
-                    []
-                )
-                .is_err()
-            );
-            conn.execute_batch(
-                "DROP TRIGGER source_fact_manifests_declared_fields_are_immutable;
-                 UPDATE source_fact_manifests
-                 SET declaration_unit_count = declaration_unit_count + 1;",
-            )?;
-            Ok::<_, crate::analyzer::store::StoreError>(())
-        })
-        .unwrap();
-    assert!(
-        store
-            .cpp_source_facts(oid, generation, "cpp", &CppAdapter, &file, &|| true)
-            .is_err()
+    super::assert_reader_rejects_tampering(
+        || {
+            store.conn.execute(|conn| {
+                assert!(
+                    conn.execute(
+                        "UPDATE source_fact_manifests SET declaration_unit_count = declaration_unit_count",
+                        []
+                    )
+                    .is_err()
+                );
+                conn.execute_batch(
+                    "DROP TRIGGER source_fact_manifests_declared_fields_are_immutable;
+                     UPDATE source_fact_manifests
+                     SET declaration_unit_count = declaration_unit_count + 1;",
+                )?;
+                Ok::<_, crate::analyzer::store::StoreError>(())
+            })
+        },
+        || store.cpp_source_facts(oid, generation, "cpp", &CppAdapter, &file, &|| true),
     );
 }
 
@@ -438,13 +390,10 @@ fn cpp_source_lookup_seeks_populated_publications_before_and_after_statistics() 
             .write_parsed_blob(other, "cpp", &CppAdapter, &state)
             .unwrap();
     }
-    for refreshed in [false, true] {
-        if refreshed {
-            store.refresh_planner_statistics().unwrap();
-        }
-        let conn = store.read_conn().unwrap();
-        let plan = conn
-            .prepare(&format!(
+    super::assert_source_lookup_plan(
+        &store,
+        |conn| {
+            conn.prepare(&format!(
                 "EXPLAIN QUERY PLAN {}",
                 crate::analyzer::cpp::source_storage::CPP_SOURCE_HEADER_SQL
             ))
@@ -461,24 +410,15 @@ fn cpp_source_lookup_seeks_populated_publications_before_and_after_statistics() 
             )
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        assert!(
-            plan.iter()
-                .any(|step| step.contains("SEARCH blob") && step.contains("INDEX")),
-            "{plan:#?}"
-        );
-        assert!(
-            plan.iter().all(|step| !step.starts_with("SCAN ")),
-            "source publication lookup must seek its exact blob: {plan:#?}"
-        );
-        drop(conn);
-        assert!(
+            .unwrap()
+        },
+        || {
             store
                 .cpp_source_facts(oid, generation, "cpp", &CppAdapter, &file, &|| true)
                 .unwrap()
                 .is_some()
-        );
-    }
+        },
+    );
     store
         .conn
         .execute(|conn| {

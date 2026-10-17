@@ -28,16 +28,17 @@ use super::results::{
     CodeQueryDiagnostic, CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact, CodeQueryImportBinder,
     CodeQueryLexicalScope, CodeQueryRange, CodeQueryResolutionCandidate,
 };
-use crate::analyzer::semantic::LengthDelimitedDigest;
+use crate::analyzer::semantic::{ContentIdentity, LengthDelimitedDigest};
 use crate::analyzer::usages::get_definition::trace::HierarchyHopRecord;
 use crate::analyzer::usages::get_definition::{
     ResolutionTraceResult, TraceCandidate, TraceCandidateRef,
 };
-use crate::analyzer::{IAnalyzer, Language, ProjectFile};
+use crate::analyzer::{IAnalyzer, Language, ProjectFile, Range};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_rql::{BindingFilter, CandidateFilter, ScopeFilter};
 use std::sync::{Arc, Mutex};
+use tree_sitter::{Parser, Tree};
 
 /// Complete environment products retained by an explicitly scoped row-family
 /// session. Query-local diagnostic suppression never enters this store.
@@ -72,19 +73,231 @@ const CANDIDATE_ID_DOMAIN: &[u8] = b"bifrost.code_query.resolution_candidate.v1"
 /// Domain separator for a candidate-hierarchy hop row's stable id.
 const CANDIDATE_HOP_ID_DOMAIN: &[u8] = b"bifrost.code_query.candidate_hop.v1";
 
+type PythonSyntaxTree = (
+    ProjectFile,
+    ContentIdentity,
+    Result<Arc<Tree>, &'static str>,
+);
+type PythonVariableIndexCache = (
+    ProjectFile,
+    ContentIdentity,
+    Arc<super::python_variables::PythonVariableIndex>,
+);
+
 /// Per-request memo of derived environments plus the diagnostics already
 /// reported, so one file is derived once and one axis gap is reported once.
 #[derive(Default)]
 pub(super) struct EnvironmentTraversalCache {
     files: HashMap<ProjectFile, Arc<EnvironmentFileResult>>,
+    python_dynamic_scope_calls: HashMap<ProjectFile, Arc<Vec<Range>>>,
+    binding_use_completeness: HashMap<BindingKey, bool>,
     traced: HashMap<ProjectFile, Arc<OccurrenceFileResult>>,
+    python_syntax_tree: Option<PythonSyntaxTree>,
+    python_variable_index: Option<PythonVariableIndexCache>,
+    // One exact target revision, never a workspace-lived proof map.
+    python_return_binding_proof: Option<(
+        ProjectFile,
+        ContentIdentity,
+        super::python_variables::PythonInitializerProof,
+    )>,
     shared: Option<Arc<Mutex<EnvironmentTraversalStore>>>,
     select_joined_scopes: bool,
     reported: HashSet<(ProjectFile, CodeQueryDiagnosticCode)>,
     reported_axes: HashSet<(Language, EnvironmentAxis)>,
 }
 
+/// All source-bearing rows must belong to the exact parsed target. A valid
+/// synthetic root is a premise, not a consequence of a cache hit.
+fn python_environment_matches_source(
+    environment: &EnvironmentFileResult,
+    file: &ProjectFile,
+    content: ContentIdentity,
+    source: &str,
+) -> bool {
+    use super::super::lexical_environment::ScopeAnchor;
+    if ContentIdentity::hash_bytes(source.as_bytes()) != content {
+        return false;
+    }
+    let Some(root) = environment.scopes.first() else {
+        return false;
+    };
+    environment.package.file == *file
+        && root.index == 0
+        && root.anchor == ScopeAnchor::File
+        && root.parent_scope.is_none()
+        && root.range.start_byte == 0
+        && root.range.end_byte == source.len()
+        && environment
+            .scopes
+            .iter()
+            .all(|row| row.file == *file && row.content_identity == content)
+        && environment
+            .bindings
+            .iter()
+            .all(|row| row.file == *file && row.content_identity == content)
+}
+
+fn python_dynamic_scope_calls_from_facts(facts: &super::super::facts::FileFacts) -> Vec<Range> {
+    facts
+        .nodes()
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| {
+            node.kind == brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind::Call
+        })
+        .filter_map(|(index, node)| {
+            let node_id = u32::try_from(index).expect("normalized node ids fit in u32");
+            if facts
+                .role_targets(
+                    node_id,
+                    brokk_bifrost_core::analyzer::structural::kinds::Role::Receiver,
+                )
+                .next()
+                .is_some()
+            {
+                return None;
+            }
+            let name = node.name?;
+            let spelling = facts.source().get(name.start_byte..name.end_byte)?;
+            matches!(spelling, "locals" | "globals" | "vars" | "eval" | "exec")
+                .then_some(node.range)
+        })
+        .collect()
+}
+
 impl EnvironmentTraversalCache {
+    /// Qualify the target procedure's snapshot independently of file-only
+    /// environment/dynamic-call caches. Missing facts are not an empty proof.
+    pub(super) fn python_return_binding_proof_for(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        procedure: &super::semantic::SemanticProcedureValue,
+    ) -> Option<super::python_variables::PythonInitializerProof> {
+        let file = procedure.file();
+        let content = procedure.handle.artifact().key().revision().content();
+        let facts = analyzer
+            .structural_fact_providers()
+            .into_iter()
+            .find(|provider| provider.structural_language() == Language::Python)?
+            .structural_facts(file)?;
+        if facts.source_identity() != content
+            || ContentIdentity::hash_bytes(procedure.source_text().as_bytes()) != content
+            || facts.source() != procedure.source_text()
+        {
+            return None;
+        }
+        if let Some((cached_file, cached_content, proof)) = &self.python_return_binding_proof
+            && cached_file == file
+            && *cached_content == content
+        {
+            return Some(proof.clone());
+        }
+        let environment = self.environment_for(analyzer, file);
+        if !python_environment_matches_source(&environment, file, content, facts.source())
+            || !environment.completeness.covers(EnvironmentAxis::Scopes)
+            || !environment
+                .completeness
+                .covers(EnvironmentAxis::BindingIntervals)
+        {
+            return None;
+        }
+        let index = self.python_variable_index_for(file, content, facts.source(), &environment)?;
+        let proof = super::python_variables::PythonInitializerProof {
+            index,
+            dynamic_scope_calls: Arc::new(python_dynamic_scope_calls_from_facts(&facts)),
+        };
+        self.python_return_binding_proof = Some((file.clone(), content, proof.clone()));
+        Some(proof)
+    }
+
+    pub(super) fn python_initializer_proof_for(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        facts: &super::super::facts::FileFacts,
+    ) -> Option<super::python_variables::PythonInitializerProof> {
+        let environment = self.environment_for(analyzer, file);
+        let index = self.python_variable_index_for(
+            file,
+            facts.source_identity(),
+            facts.source(),
+            &environment,
+        )?;
+        Some(super::python_variables::PythonInitializerProof {
+            index,
+            dynamic_scope_calls: self.python_dynamic_scope_calls(analyzer, file),
+        })
+    }
+
+    /// Retain only the most recently used file's Python variable grouping.
+    /// Each emitted variable row keeps its own facts; this cache never grows
+    /// with the number of files visited by a workspace query.
+    pub(super) fn python_variable_index_for(
+        &mut self,
+        file: &ProjectFile,
+        content_identity: ContentIdentity,
+        source: &str,
+        environment: &EnvironmentFileResult,
+    ) -> Option<Arc<super::python_variables::PythonVariableIndex>> {
+        if let Some((cached_file, cached_content, index)) = &self.python_variable_index
+            && cached_file == file
+            && cached_content == &content_identity
+        {
+            return Some(Arc::clone(index));
+        }
+        // Qualify the environment once when building an inventory, not on
+        // every variable-row cache hit. Return proofs additionally validate
+        // their current environment before reusing this exact-content index.
+        if !python_environment_matches_source(environment, file, content_identity, source) {
+            return None;
+        }
+        let tree = super::python_rule_facts::parse_python(source)?;
+        let index = Arc::new(super::python_variables::derive(
+            file,
+            source,
+            &tree,
+            environment,
+        ));
+        self.python_variable_index = Some((file.clone(), content_identity, Arc::clone(&index)));
+        Some(index)
+    }
+
+    /// Retain the most recently used Python syntax tree for this query request.
+    /// Row-local Python relations visit many rows from one file, so this avoids
+    /// reparsing that source per row without retaining ASTs for multiple files.
+    pub(super) fn python_syntax_tree_for(
+        &mut self,
+        file: &ProjectFile,
+        content_identity: ContentIdentity,
+        source: &str,
+    ) -> Result<Arc<Tree>, &'static str> {
+        if let Some((cached_file, cached_content, result)) = &self.python_syntax_tree
+            && cached_file == file
+            && cached_content == &content_identity
+        {
+            return result.clone();
+        }
+
+        let result = (|| {
+            let Some(language) = crate::analyzer::parser_language_for(Language::Python) else {
+                return Err("the Python parser is unavailable");
+            };
+            let mut parser = Parser::new();
+            parser
+                .set_language(&language)
+                .map_err(|_| "the Python grammar is unavailable")?;
+            let tree = parser
+                .parse(source, None)
+                .ok_or("the selected Python source could not be parsed")?;
+            if tree.root_node().has_error() {
+                return Err("the selected Python source has recovered syntax");
+            }
+            Ok(Arc::new(tree))
+        })();
+        self.python_syntax_tree = Some((file.clone(), content_identity, result.clone()));
+        result
+    }
+
     pub(super) fn with_shared_store(
         shared: Arc<Mutex<EnvironmentTraversalStore>>,
         select_joined_scopes: bool,
@@ -147,6 +360,24 @@ impl EnvironmentTraversalCache {
         )
     }
 
+    pub(super) fn record_binding_use_completeness(&mut self, value: &BindingValue, complete: bool) {
+        let key = value.set_difference_key();
+        if let Some(previous) = self.binding_use_completeness.get(&key) {
+            assert_eq!(
+                *previous, complete,
+                "one query derives stable binding-use completeness for each binder"
+            );
+        } else {
+            self.binding_use_completeness.insert(key, complete);
+        }
+    }
+
+    pub(super) fn binding_use_completeness(&self, value: &BindingValue) -> Option<bool> {
+        self.binding_use_completeness
+            .get(&value.set_difference_key())
+            .copied()
+    }
+
     /// Derive (or replay) one file's lexical environment.
     ///
     /// `environment_for_file` takes no cancellation token because it resolves
@@ -186,6 +417,33 @@ impl EnvironmentTraversalCache {
         }
         self.files.insert(file.clone(), Arc::clone(&derived));
         derived
+    }
+
+    /// Python calls that make lexical reads dynamic within their containing
+    /// scope. The ranges come from normalized call facts, not source scanning.
+    pub(super) fn python_dynamic_scope_calls(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+    ) -> Arc<Vec<Range>> {
+        if let Some(cached) = self.python_dynamic_scope_calls.get(file) {
+            return Arc::clone(cached);
+        }
+        let calls = if crate::analyzer::common::language_for_file(file) == Language::Python {
+            analyzer
+                .structural_fact_providers()
+                .into_iter()
+                .find(|provider| provider.structural_language() == Language::Python)
+                .and_then(|provider| provider.structural_facts(file))
+                .map(|facts| python_dynamic_scope_calls_from_facts(&facts))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let calls = Arc::new(calls);
+        self.python_dynamic_scope_calls
+            .insert(file.clone(), Arc::clone(&calls));
+        calls
     }
 
     /// Derive (or replay) one file's occurrence rows *with* resolution traces.
@@ -276,6 +534,7 @@ impl EnvironmentTraversalCache {
                     continue;
                 }
                 diagnostics.push(CodeQueryDiagnostic {
+                    source: None,
                     code,
                     impact: CodeQueryDiagnosticImpact::Incomplete,
                     branch: Vec::new(),
@@ -286,6 +545,7 @@ impl EnvironmentTraversalCache {
                         axis.label()
                     ),
                 exhausted_roots: Vec::new(),
+                    withheld_rows_path: None,
                 });
                 continue;
             }
@@ -293,6 +553,7 @@ impl EnvironmentTraversalCache {
                 continue;
             }
             diagnostics.push(CodeQueryDiagnostic {
+                source: None,
                 code,
                 impact: CodeQueryDiagnosticImpact::Incomplete,
                 branch: Vec::new(),
@@ -308,6 +569,7 @@ impl EnvironmentTraversalCache {
                     axis.label()
                 ),
             exhausted_roots: Vec::new(),
+                withheld_rows_path: None,
             });
         }
     }
@@ -330,6 +592,7 @@ impl EnvironmentTraversalCache {
             return;
         }
         diagnostics.push(CodeQueryDiagnostic {
+            source: None,
             code,
             impact: CodeQueryDiagnosticImpact::Incomplete,
             branch: Vec::new(),
@@ -340,6 +603,7 @@ impl EnvironmentTraversalCache {
                 trace.completeness.label()
             ),
         exhausted_roots: Vec::new(),
+            withheld_rows_path: None,
         });
     }
 }
@@ -434,6 +698,15 @@ impl BindingValue {
         }
     }
 
+    pub(super) fn set_difference_key(&self) -> BindingKey {
+        BindingKey {
+            file: self.file.clone(),
+            index: self.index,
+            shadowed: false,
+            reached_from: None,
+        }
+    }
+
     pub(super) fn file(&self) -> &ProjectFile {
         &self.file
     }
@@ -495,9 +768,12 @@ impl CandidateValue {
 /// RQLP join between the two domains lands.
 fn candidate_row_id(occurrence: &OccurrenceRow, ordinal: usize) -> String {
     let mut digest = LengthDelimitedDigest::new(CANDIDATE_ID_DOMAIN);
-    digest.push(occurrence.content_identity.as_bytes());
-    digest.push(&occurrence.node.to_le_bytes());
-    digest.push(occurrence.role.label().as_bytes());
+    brokk_bifrost_analysis::analyzer::structural::occurrence_rows::push_occurrence_id_fields(
+        &mut digest,
+        occurrence.content_identity,
+        occurrence.node,
+        occurrence.role,
+    );
     digest.push(&ordinal.to_le_bytes());
     digest.finish().to_string()
 }
@@ -597,16 +873,17 @@ pub(super) const BINDING_QUERY_AXES: &[EnvironmentAxis] =
 /// The public projection of one scope row.
 pub(super) fn public_scope(value: &ScopeValue, range: CodeQueryRange) -> CodeQueryLexicalScope {
     let row = value.row();
+    let metadata = super::public_source_metadata(&row.file, row.range, range);
     CodeQueryLexicalScope {
         id: value.id(),
         ast_id: row.ast_id(),
-        path: super::rel_path_string(&row.file),
-        language: crate::analyzer::common::language_for_file(&row.file).config_label(),
+        path: metadata.path,
+        language: metadata.language,
         index: row.index,
         kind: row.anchor.kind().map(|kind| kind.label()),
-        range,
-        start_byte: row.range.start_byte,
-        end_byte: row.range.end_byte,
+        range: metadata.range,
+        start_byte: metadata.start_byte,
+        end_byte: metadata.end_byte,
         parent_index: row.parent_scope,
     }
 }
@@ -712,10 +989,120 @@ pub(super) fn public_candidate_hop(
 pub(super) fn candidate_unit(candidate: &TraceCandidateRef) -> Option<&crate::analyzer::CodeUnit> {
     match candidate {
         TraceCandidateRef::Unit(unit) => Some(unit),
-        TraceCandidateRef::Modeled { .. }
+        TraceCandidateRef::Intrinsic { .. }
+        | TraceCandidateRef::Modeled { .. }
         | TraceCandidateRef::Lexical(_)
         | TraceCandidateRef::Binding { .. }
         | TraceCandidateRef::ImportBinder { .. }
         | TraceCandidateRef::ExternalRoute { .. } => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon(
+        "#5559: a file-only environment/index hit did not certify the target source revision"
+    )]
+    fn python_return_binding_proof_rejects_stale_environment_rows() {
+        use super::super::tests::inline_project::InlineTestProject;
+        use crate::analyzer::AnalyzerConfig;
+
+        let source = "def factory(marker):\n    def inner():\n        pass\n    return inner\n";
+        let project = InlineTestProject::with_language(Language::Python)
+            .file("factory.py", source)
+            .file("other.py", "pass\n")
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let analyzer = workspace.analyzer();
+        let file = project.file("factory.py");
+        let content = ContentIdentity::hash_bytes(source.as_bytes());
+        let mut context = super::super::semantic::SemanticQueryContext::new(
+            &workspace,
+            None,
+            super::super::CodeQuerySemanticLimits::default(),
+        );
+        let procedures = context.procedure_of_source_range(
+            &file,
+            Range {
+                start_byte: 0,
+                end_byte: source.len() - 1,
+                start_line: 1,
+                end_line: 4,
+            },
+            content,
+        );
+        let [procedure] = procedures.as_slice() else {
+            panic!("one exact factory")
+        };
+        let environment = environment_for_file(analyzer, &file);
+        let mut cache = EnvironmentTraversalCache::default();
+        assert!(
+            cache
+                .python_variable_index_for(&file, content, source, &environment)
+                .is_some()
+        );
+        assert!(
+            cache
+                .python_return_binding_proof_for(analyzer, procedure)
+                .is_some()
+        );
+        // Keep the populated index, but force proof acquisition to inspect
+        // poisoned file-only environment entries before any cached-index hit.
+        cache.python_return_binding_proof = None;
+        let stale = ContentIdentity::hash_bytes(b"another source revision");
+        let mut bad = environment.clone();
+        bad.scopes[1].content_identity = stale;
+        cache.files.insert(file.clone(), Arc::new(bad));
+        assert!(
+            cache
+                .python_return_binding_proof_for(analyzer, procedure)
+                .is_none()
+        );
+        // Function declarations do not create activation rows in this producer.
+        // Poison a real parameter binding rather than assuming a first row.
+        let marker = environment
+            .bindings
+            .iter()
+            .position(|binding| binding.name == "marker")
+            .expect("factory parameter has a binding row");
+        let mut bad = environment.clone();
+        bad.bindings[marker].content_identity = stale;
+        cache.files.insert(file.clone(), Arc::new(bad));
+        assert!(
+            cache
+                .python_return_binding_proof_for(analyzer, procedure)
+                .is_none()
+        );
+        let mut bad = environment.clone();
+        bad.bindings[marker].file = project.file("other.py");
+        cache.files.insert(file.clone(), Arc::new(bad));
+        assert!(
+            cache
+                .python_return_binding_proof_for(analyzer, procedure)
+                .is_none()
+        );
+        let mut bad = environment.clone();
+        bad.scopes.clear();
+        cache.files.insert(file.clone(), Arc::new(bad));
+        assert!(
+            cache
+                .python_return_binding_proof_for(analyzer, procedure)
+                .is_none()
+        );
+        assert!(
+            cache
+                .python_variable_index_for(&file, stale, source, &environment)
+                .is_none()
+        );
+        cache.files.insert(file.clone(), Arc::new(environment));
+        assert!(
+            cache
+                .python_return_binding_proof_for(analyzer, procedure)
+                .is_some()
+        );
     }
 }

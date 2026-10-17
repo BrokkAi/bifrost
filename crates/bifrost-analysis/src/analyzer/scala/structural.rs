@@ -12,8 +12,8 @@ mod structural_spec_tests {
         assert_occurrence_role, occurrence_roles_of,
     };
     use brokk_bifrost_core::analyzer::structural::occurrences::OccurrenceRole;
-    use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
     use brokk_bifrost_jvm::scala::structural::{SCALA_KIND_TABLE, SCALA_STRUCTURAL_SPEC};
+    use brokk_bifrost_test_macros::hardwon;
 
     fn roles_of(source: &str) -> Vec<(usize, &str, OccurrenceRole)> {
         occurrence_roles_of(
@@ -23,10 +23,102 @@ mod structural_spec_tests {
         )
     }
 
+    /// A qualified name spells its scope and its tail with the same node kind,
+    /// and only the tail is what the chain denotes (#1644).
+    ///
+    /// Scala uses two different shapes for the same-looking source. A type
+    /// path is a left-nested `stable_type_identifier` chain with no grammar
+    /// fields at all, so the classifier reads each link's own segment
+    /// positionally; a value path is a `field_expression` selection, where the
+    /// receiver and member split is spelled in fields. Both must leave the
+    /// package segments as segments so a package never becomes an edge target.
+    #[hardwon(
+        "#1644: Scala qualified tails acquired the wrong occurrence role or became scope edges"
+    )]
+    #[hardwon(
+        "#1644: Issue #1644 fixed role classification for nested Scala type/value paths while preserving scope segments"
+    )]
+    #[test]
+    fn scala_qualified_tails_carry_the_role_and_their_scopes_stay_segments() {
+        let source = concat!(
+            "object Store {\n",
+            "  val items: scala.collection.Seq[Int] = null\n",
+            "  val head = Outer.Inner.value\n",
+            "  def make(): Unit = scala.util.Try(1)\n",
+            "}\n",
+        );
+        let found = roles_of(source);
+        let at = |needle: &str| source.find(needle).expect("fixture token");
+
+        assert_occurrence_role(&found, at("scala.collection"), OccurrenceRole::PathSegment);
+        assert_occurrence_role(&found, at("collection.Seq"), OccurrenceRole::PathSegment);
+        assert_occurrence_role(&found, at("Seq[Int]"), OccurrenceRole::TypeOperand);
+        assert_occurrence_role(&found, at("Int]"), OccurrenceRole::TypeOperand);
+
+        assert_occurrence_role(&found, at("Outer"), OccurrenceRole::ReceiverPosition);
+        assert_occurrence_role(&found, at("Inner"), OccurrenceRole::MemberPosition);
+        assert_occurrence_role(&found, at("value"), OccurrenceRole::MemberPosition);
+
+        assert_occurrence_role(&found, at("scala.util"), OccurrenceRole::ReceiverPosition);
+        assert_occurrence_role(&found, at("util.Try"), OccurrenceRole::MemberPosition);
+        assert_occurrence_role(&found, at("Try"), OccurrenceRole::MemberPosition);
+    }
+
+    /// Patterns and `for` comprehensions are where Scala separates a name it
+    /// binds from a name it matches.
+    ///
+    /// A bare identifier in a pattern slot binds, and the grammar spells
+    /// `case other =>` exactly like `case Other =>`, so this classifier never
+    /// reads a spelling to tell them apart. What it does read is structure: an
+    /// extractor's own name, an infix extractor's operator and a qualified
+    /// constant all name something declared elsewhere, which is what
+    /// `pattern_position` states.
+    #[hardwon("#1644: Scala pattern and comprehension binders were confused with matched names")]
+    #[test]
+    fn scala_patterns_and_comprehensions_separate_binders_from_matched_names() {
+        let source = concat!(
+            "object Match {\n",
+            "  def pick(value: Any, rows: List[String]): Any = {\n",
+            "    val lengths = for (row <- rows if row.nonEmpty) yield row.length\n",
+            "    value match {\n",
+            "      case whole @ Widget(inner) => inner\n",
+            "      case Colors.Red => lengths\n",
+            "      case head :: rest => rest\n",
+            "      case other => other\n",
+            "    }\n",
+            "  }\n",
+            "}\n",
+        );
+        let found = roles_of(source);
+        let at = |needle: &str| source.find(needle).expect("fixture token");
+
+        assert_occurrence_role(&found, at("lengths ="), OccurrenceRole::Binder);
+        assert_occurrence_role(&found, at("row <-"), OccurrenceRole::Binder);
+        assert_occurrence_role(&found, at("rows if"), OccurrenceRole::ValueReference);
+        assert_occurrence_role(&found, at("row.nonEmpty"), OccurrenceRole::ReceiverPosition);
+        assert_occurrence_role(&found, at("nonEmpty"), OccurrenceRole::MemberPosition);
+        assert_occurrence_role(&found, at("row.length"), OccurrenceRole::ReceiverPosition);
+        assert_occurrence_role(&found, at("length\n"), OccurrenceRole::MemberPosition);
+
+        assert_occurrence_role(&found, at("value match"), OccurrenceRole::ValueReference);
+        assert_occurrence_role(&found, at("whole @"), OccurrenceRole::Binder);
+        assert_occurrence_role(&found, at("Widget(inner)"), OccurrenceRole::PatternPosition);
+        assert_occurrence_role(&found, at("inner)"), OccurrenceRole::Binder);
+        assert_occurrence_role(&found, at("Colors"), OccurrenceRole::PathSegment);
+        assert_occurrence_role(&found, at("Red"), OccurrenceRole::PatternPosition);
+        assert_occurrence_role(&found, at("head ::"), OccurrenceRole::Binder);
+        assert_occurrence_role(&found, at("::"), OccurrenceRole::PatternPosition);
+        assert_occurrence_role(&found, at("rest =>"), OccurrenceRole::Binder);
+        assert_occurrence_role(&found, at("other =>"), OccurrenceRole::Binder);
+    }
+
     /// The declaration, binding, type and import positions #1473 names, in one
     /// file: a package clause, a renaming import, a plain import, a class and
     /// its constructor parameter, a method and its parameters, a local
     /// definition, a selection, and a named argument.
+    #[hardwon(
+        "#1644: Scala declaration, binder, type, and import positions had incorrect occurrence roles"
+    )]
     #[test]
     fn scala_classifies_declaration_binder_type_and_import_positions() {
         let source = concat!(
@@ -93,81 +185,9 @@ mod structural_spec_tests {
     /// positionally; a value path is a `field_expression` selection, where the
     /// receiver and member split is spelled in fields. Both must leave the
     /// package segments as segments so a package never becomes an edge target.
-    #[test]
-    fn scala_qualified_tails_carry_the_role_and_their_scopes_stay_segments() {
-        let source = concat!(
-            "object Store {\n",
-            "  val items: scala.collection.Seq[Int] = null\n",
-            "  val head = Outer.Inner.value\n",
-            "  def make(): Unit = scala.util.Try(1)\n",
-            "}\n",
-        );
-        let found = roles_of(source);
-        let at = |needle: &str| source.find(needle).expect("fixture token");
-
-        assert_occurrence_role(&found, at("scala.collection"), OccurrenceRole::PathSegment);
-        assert_occurrence_role(&found, at("collection.Seq"), OccurrenceRole::PathSegment);
-        assert_occurrence_role(&found, at("Seq[Int]"), OccurrenceRole::TypeOperand);
-        assert_occurrence_role(&found, at("Int]"), OccurrenceRole::TypeOperand);
-
-        assert_occurrence_role(&found, at("Outer"), OccurrenceRole::ReceiverPosition);
-        assert_occurrence_role(&found, at("Inner"), OccurrenceRole::MemberPosition);
-        assert_occurrence_role(&found, at("value"), OccurrenceRole::MemberPosition);
-
-        assert_occurrence_role(&found, at("scala.util"), OccurrenceRole::ReceiverPosition);
-        assert_occurrence_role(&found, at("util.Try"), OccurrenceRole::MemberPosition);
-        assert_occurrence_role(&found, at("Try"), OccurrenceRole::MemberPosition);
-    }
-
-    /// Patterns and `for` comprehensions are where Scala separates a name it
-    /// binds from a name it matches.
-    ///
-    /// A bare identifier in a pattern slot binds, and the grammar spells
-    /// `case other =>` exactly like `case Other =>`, so this classifier never
-    /// reads a spelling to tell them apart. What it does read is structure: an
-    /// extractor's own name, an infix extractor's operator and a qualified
-    /// constant all name something declared elsewhere, which is what
-    /// `pattern_position` states.
-    #[test]
-    fn scala_patterns_and_comprehensions_separate_binders_from_matched_names() {
-        let source = concat!(
-            "object Match {\n",
-            "  def pick(value: Any, rows: List[String]): Any = {\n",
-            "    val lengths = for (row <- rows if row.nonEmpty) yield row.length\n",
-            "    value match {\n",
-            "      case whole @ Widget(inner) => inner\n",
-            "      case Colors.Red => lengths\n",
-            "      case head :: rest => rest\n",
-            "      case other => other\n",
-            "    }\n",
-            "  }\n",
-            "}\n",
-        );
-        let found = roles_of(source);
-        let at = |needle: &str| source.find(needle).expect("fixture token");
-
-        assert_occurrence_role(&found, at("lengths ="), OccurrenceRole::Binder);
-        assert_occurrence_role(&found, at("row <-"), OccurrenceRole::Binder);
-        assert_occurrence_role(&found, at("rows if"), OccurrenceRole::ValueReference);
-        assert_occurrence_role(&found, at("row.nonEmpty"), OccurrenceRole::ReceiverPosition);
-        assert_occurrence_role(&found, at("nonEmpty"), OccurrenceRole::MemberPosition);
-        assert_occurrence_role(&found, at("row.length"), OccurrenceRole::ReceiverPosition);
-        assert_occurrence_role(&found, at("length\n"), OccurrenceRole::MemberPosition);
-
-        assert_occurrence_role(&found, at("value match"), OccurrenceRole::ValueReference);
-        assert_occurrence_role(&found, at("whole @"), OccurrenceRole::Binder);
-        assert_occurrence_role(&found, at("Widget(inner)"), OccurrenceRole::PatternPosition);
-        assert_occurrence_role(&found, at("inner)"), OccurrenceRole::Binder);
-        assert_occurrence_role(&found, at("Colors"), OccurrenceRole::PathSegment);
-        assert_occurrence_role(&found, at("Red"), OccurrenceRole::PatternPosition);
-        assert_occurrence_role(&found, at("head ::"), OccurrenceRole::Binder);
-        assert_occurrence_role(&found, at("::"), OccurrenceRole::PatternPosition);
-        assert_occurrence_role(&found, at("rest =>"), OccurrenceRole::Binder);
-        assert_occurrence_role(&found, at("other =>"), OccurrenceRole::Binder);
-    }
-
     /// Support is a declaration, not a description of what happened to be
     /// emitted: every role Scala emits must be one it declares.
+    #[hardwon("#1644: Scala emitted occurrence roles outside its declared support inventory")]
     #[test]
     fn scala_emits_only_roles_it_declares_as_supported() {
         let source = concat!(
@@ -177,16 +197,12 @@ mod structural_spec_tests {
             "  def f(g: Int): Int = h.i(j = g) match { case D(k) => k; case _ => 0 }\n",
             "}\n",
         );
-        let found = roles_of(source);
-        assert!(!found.is_empty());
-        for (_, text, role) in &found {
-            assert!(
-                SCALA_STRUCTURAL_SPEC
-                    .occurrence_role_support()
-                    .is_supported(*role),
-                "scala emitted undeclared role {role:?} for {text:?}"
-            );
-        }
+        crate::analyzer::structural::adapter_helpers::assert_occurrence_roles_are_supported(
+            &SCALA_STRUCTURAL_SPEC,
+            &brokk_bifrost_jvm::scala::language::LANGUAGE.into(),
+            source,
+            "scala",
+        );
     }
 
     #[test]

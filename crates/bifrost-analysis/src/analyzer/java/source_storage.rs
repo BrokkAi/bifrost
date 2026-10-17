@@ -29,7 +29,7 @@ pub(in crate::analyzer) const JAVA_SOURCE_HEADER_SQL: &str =
        AND source.publication_state = 'complete' AND meta.is_complete = 1 AND ready.available = 1";
 
 fn required<T>(value: Option<T>, label: &str) -> Result<T> {
-    value.ok_or_else(|| StoreError::new(format!("Java source syntax is missing {label}")))
+    crate::analyzer::store::required_source_value(value, "Java source syntax", label)
 }
 
 impl AnalyzerStore {
@@ -74,7 +74,7 @@ impl AnalyzerStore {
                 expected_declarations,
                 expected_bridges,
             ) = header.ok_or_else(|| {
-                StoreError::new(format!(
+                StoreError::missing_required_source_facts(format!(
                     "canonical Java source facts unavailable for {file:?} ({oid})"
                 ))
             })?;

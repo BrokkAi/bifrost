@@ -1,3 +1,5 @@
+use crate::analyzer::semantic::lowering::schedule_sequential_work;
+
 use super::numeric::{
     JavaFloatingType, JavaNumericLiteral, integral_domain_contains, java_numeric_literal,
 };
@@ -745,29 +747,18 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 self.edge(builder, entry, when_false)?;
                 self.record_guard(builder, entry, node, None, Some(when_false))
             }
-            ("binary_expression", Some("&&")) => {
+            ("binary_expression", Some(operator @ ("&&" | "||"))) => {
                 let left = required_field(node, "left")?;
                 let right = required_field(node, "right")?;
                 let right_entry = self.point(builder, right, Vec::new())?;
+                let kind = match operator {
+                    "&&" => ShortCircuitKind::And,
+                    "||" => ShortCircuitKind::Or,
+                    _ => unreachable!("the match arm selects Java boolean operators"),
+                };
                 schedule_short_circuit_condition(
                     stack,
-                    ShortCircuitKind::And,
-                    (left, entry),
-                    (right, right_entry),
-                    when_true,
-                    when_false,
-                    scope,
-                    Work::condition,
-                );
-                Ok(())
-            }
-            ("binary_expression", Some("||")) => {
-                let left = required_field(node, "left")?;
-                let right = required_field(node, "right")?;
-                let right_entry = self.point(builder, right, Vec::new())?;
-                schedule_short_circuit_condition(
-                    stack,
-                    ShortCircuitKind::Or,
+                    kind,
                     (left, entry),
                     (right, right_entry),
                     when_true,
@@ -1341,6 +1332,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     | "do_statement"
                     | "for_statement"
                     | "enhanced_for_statement"
+                    | "switch_statement"
                     | "switch_expression"
             ) {
             builder.push_scope(
@@ -1605,7 +1597,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 attached_label,
                 stack,
             ),
-            "switch_expression" => self.switch(
+            "switch_statement" | "switch_expression" => self.switch(
                 builder,
                 node,
                 entry,
@@ -2294,7 +2286,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     .map(|entry| (initializer, entry))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        schedule_c_style_loop(
+        schedule_loop_flow(
             builder,
             &self.session,
             entry,
@@ -2329,6 +2321,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             Work::statement,
             Work::condition,
         )
+        .map(|_| ())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2486,6 +2479,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let condition = required_field(node, "condition")?;
         let body = required_field(node, "body")?;
         let dispatch = self.point(builder, node, Vec::new())?;
+        let selector =
+            self.expression_value(builder, condition, expression_value_kind(condition))?;
         let switch_next = if expression_mode {
             let merge = self.point(builder, node, Vec::new())?;
             self.edge(builder, merge, next)?;
@@ -2526,6 +2521,18 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             } else {
                 self.edge(builder, dispatch, switch_next)?;
             }
+            self.session.add_switch_fact(
+                builder,
+                SwitchFactScaffold {
+                    point: dispatch,
+                    kind: SwitchFactKind::Expression,
+                    selector: Some(selector),
+                    selector_domain: SwitchSelectorDomain::Open,
+                    cases: Vec::new(),
+                    default_edge: None,
+                    default_present: false,
+                },
+            )?;
             stack.push(Work::Expression {
                 node: condition,
                 entry,
@@ -2632,14 +2639,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
         }
 
-        let default_target = arms.iter().enumerate().find_map(|(index, arm)| {
+        let default_arm = arms.iter().enumerate().find_map(|(index, arm)| {
             arm.labels
                 .iter()
                 .any(|label| switch_label_is_default(*label))
-                .then_some(EdgeTarget::normal(arm_entries[index]))
+                .then_some(index)
         });
-        let mut no_match = if let Some(default_target) = default_target {
-            default_target
+        let default_point = default_arm.map(|index| arm_entries[index]);
+        let mut no_match = if let Some(default_point) = default_point {
+            EdgeTarget::normal(default_point)
         } else if expression_mode {
             let missing_match = self.point(builder, node, Vec::new())?;
             self.add_gap(
@@ -2654,6 +2662,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         } else {
             switch_next
         };
+        let mut cases = Vec::new();
+        let mut default_edge_source = None;
 
         for (arm_index, arm) in arms.iter().enumerate().rev() {
             for switch_label in arm.labels.iter().rev() {
@@ -2671,7 +2681,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         "pattern compatibility requires type refinement",
                     )?;
                 }
-                if let Some(guard) = switch_label_guard(*switch_label) {
+                let case_edge_source = if let Some(guard) = switch_label_guard(*switch_label) {
                     let guard_entry = self.point(builder, guard, Vec::new())?;
                     self.edge(
                         builder,
@@ -2694,6 +2704,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         },
                         scope: switch_scope,
                     });
+                    if default_point == Some(no_match.point) {
+                        default_edge_source = Some(guard_entry);
+                    }
+                    guard_entry
                 } else {
                     self.edge(
                         builder,
@@ -2703,6 +2717,29 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                             kind: ControlEdgeKind::SwitchCase,
                         },
                     )?;
+                    if default_point == Some(no_match.point) {
+                        default_edge_source = Some(comparison);
+                    }
+                    comparison
+                };
+                for case_value in named_children(*switch_label)
+                    .into_iter()
+                    .filter(|child| child.kind() != "guard")
+                {
+                    cases.push(SwitchCaseFactParts {
+                        value: self.expression_value(
+                            builder,
+                            case_value,
+                            expression_value_kind(case_value),
+                        )?,
+                        edge: SwitchEdgeParts {
+                            source_point: case_edge_source,
+                            arm: GuardArm {
+                                target_point: arm_entries[arm_index],
+                                kind: ControlEdgeKind::SwitchCase,
+                            },
+                        },
+                    });
                 }
                 self.edge(
                     builder,
@@ -2716,6 +2753,28 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
         }
         self.edge(builder, dispatch, no_match)?;
+        let default_edge = default_point.map(|target_point| {
+            let (source_point, kind) = default_edge_source
+                .map_or((dispatch, ControlEdgeKind::SwitchCase), |source_point| {
+                    (source_point, ControlEdgeKind::ConditionalFalse)
+                });
+            SwitchEdgeParts {
+                source_point,
+                arm: GuardArm { target_point, kind },
+            }
+        });
+        self.session.add_switch_fact(
+            builder,
+            SwitchFactScaffold {
+                point: dispatch,
+                kind: SwitchFactKind::Expression,
+                selector: Some(selector),
+                selector_domain: SwitchSelectorDomain::Open,
+                cases,
+                default_edge,
+                default_present: default_point.is_some(),
+            },
+        )?;
         stack.push(Work::Expression {
             node: condition,
             entry,
@@ -3509,19 +3568,19 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .map(|child| self.point(builder, *child, Vec::new()))
             .collect::<Result<Vec<_>, _>>()?;
         self.edge(builder, entry, EdgeTarget::normal(entries[0]))?;
-        for index in (0..children.len()).rev() {
-            let child_next = entries
-                .get(index + 1)
-                .copied()
-                .map(EdgeTarget::normal)
-                .unwrap_or(next);
-            stack.push(Work::Statement {
-                node: children[index],
-                entry: entries[index],
-                next: child_next,
+        schedule_sequential_work(
+            stack,
+            children,
+            &entries,
+            next,
+            scope,
+            |_, node, entry, next, scope| Work::Statement {
+                node,
+                entry,
+                next,
                 scope,
-            });
-        }
+            },
+        );
         Ok(())
     }
 
@@ -3542,19 +3601,19 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .map(|child| self.point(builder, *child, Vec::new()))
             .collect::<Result<Vec<_>, _>>()?;
         self.edge(builder, entry, EdgeTarget::normal(entries[0]))?;
-        for index in (0..children.len()).rev() {
-            let child_next = entries
-                .get(index + 1)
-                .copied()
-                .map(EdgeTarget::normal)
-                .unwrap_or(next);
-            stack.push(Work::Expression {
-                node: children[index],
-                entry: entries[index],
-                next: child_next,
+        schedule_sequential_work(
+            stack,
+            children,
+            &entries,
+            next,
+            scope,
+            |_, node, entry, next, scope| Work::Expression {
+                node,
+                entry,
+                next,
                 scope,
-            });
-        }
+            },
+        );
         Ok(())
     }
 
@@ -3575,7 +3634,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             ) {
                 let detail = format!(
                     "{} completion has no matching represented target",
-                    completion_label(kind)
+                    kind.label()
                 );
                 self.add_gap(
                     builder,
@@ -3589,7 +3648,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
             return Err(JavaLoweringError::Invalid(format!(
                 "{} completion has no matching structured continuation",
-                completion_label(kind)
+                kind.label()
             )));
         };
         self.route(builder, from, &route, stack)
@@ -3877,7 +3936,7 @@ fn literal_offset(constant: i64, subtract: bool) -> SignedIntegerMagnitude {
     } else {
         i128::from(constant)
     };
-    SignedIntegerMagnitude::new(offset < 0, offset.unsigned_abs())
+    SignedIntegerMagnitude::from_i128(offset)
 }
 
 /// The resource value expressions of a try-with-resources statement, in

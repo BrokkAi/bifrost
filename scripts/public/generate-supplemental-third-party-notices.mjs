@@ -115,14 +115,6 @@ async function legalFile(metadata, name, relativePath, component, scope) {
   return { component, packageInfo, relativePath, scope, text };
 }
 
-async function vendoredLegalFile(relativePath, component, source, scope) {
-  const text = (await readFile(path.join(repositoryRoot, relativePath), "utf8")).trimEnd();
-  if (!text) {
-    throw new Error(`${relativePath} is empty`);
-  }
-  return { component, relativePath, scope, source, text };
-}
-
 async function sqliteNotice(metadata) {
   const packageInfo = resolvedPackage(metadata, "libsqlite3-sys");
   const relativePath = "sqlite3/sqlite3.c";
@@ -230,10 +222,11 @@ async function main() {
       "Unicode data used by tree-sitter",
       "compiled into the tree-sitter runtime used on every release target",
     ),
-    await vendoredLegalFile(
-      "crates/bifrost-jvm/src/scala/grammar/LICENSE",
-      "tree-sitter-scala parser (vendored with a Bifrost correction)",
-      "https://github.com/tree-sitter/tree-sitter-scala at 0.26.2, corrected as recorded in crates/bifrost-jvm/src/scala/grammar/README.md",
+    await legalFile(
+      metadata,
+      "brokk-tree-sitter-scala",
+      "LICENSE",
+      "brokk-tree-sitter-scala parser",
       "compiled into Bifrost on every release target",
     ),
     await legalFile(

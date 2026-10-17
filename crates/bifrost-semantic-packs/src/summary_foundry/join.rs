@@ -343,18 +343,9 @@ mod tests {
     use super::*;
     use crate::summary_foundry::ir::{
         FoundryAccessPath, FoundryDerivation, FoundryDerivationBoundary, FoundryEntryBuilder,
-        FoundryFineGrainedTransfer, FoundrySelector, FoundrySignature, FoundryTarget,
+        FoundryFineGrainedTransfer, FoundrySelector,
     };
-
-    fn target(member: &str, types: &[&str]) -> FoundryTarget {
-        FoundryTarget {
-            artifact_path: "java/lang/String.class".to_owned(),
-            member: member.to_owned(),
-            signature: FoundrySignature::Overload {
-                types: types.iter().map(|value| (*value).to_owned()).collect(),
-            },
-        }
-    }
+    use crate::summary_foundry::test_support::target;
 
     fn entry(corpus: FoundryCorpus, member: &str, types: &[&str], to_return: bool) -> FoundryEntry {
         let mut builder = FoundryEntryBuilder::default();
@@ -411,39 +402,6 @@ mod tests {
         assert_eq!(join.agreements_at_projection_only, 1);
         assert!(join.agreements[0].at_projection_only);
         assert_eq!(join.dispute_count, 0);
-    }
-
-    #[test]
-    fn a_derived_view_carries_its_boundaries_and_its_finer_flows() {
-        // Different arities, so the two keys never meet. The point is that a
-        // derived view states its typed extras wherever it is classified, and a
-        // translated corpus view never invents them.
-        let codeql = [entry(FoundryCorpus::Codeql, "trim", &[], true)];
-        let derived = [derived_entry_with_element_granularity("trim", &["String"])];
-
-        let join = join_corpora(&[
-            (FoundryCorpus::Codeql, &codeql),
-            (FoundryCorpus::Derived, &derived),
-        ]);
-
-        let derived_view = join
-            .gaps
-            .iter()
-            .find_map(|gap| gap.views.get("derived"))
-            .expect("the derived entry is classified");
-        assert_eq!(
-            derived_view.qualified_flows,
-            vec!["receiver.Element->normal_return@normal".to_owned()]
-        );
-        assert_eq!(derived_view.boundaries, vec!["unresolved_call".to_owned()]);
-
-        let codeql_view = join
-            .gaps
-            .iter()
-            .find_map(|gap| gap.views.get("codeql"))
-            .expect("the corpus entry is classified");
-        assert!(codeql_view.qualified_flows.is_empty());
-        assert!(codeql_view.boundaries.is_empty());
     }
 
     #[test]

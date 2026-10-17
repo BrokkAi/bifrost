@@ -315,34 +315,29 @@ fn is_runtime_wrapper(node: Node<'_>, source: &str) -> bool {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn return_annotations_preserve_qualified_generic_and_quoted_runtime_owners() {
-        for (annotation, expected) in [
-            ("models.Manager[A, B]", Some(vec!["models", "Manager"])),
-            ("typing.Optional[models.User]", Some(vec!["models", "User"])),
-            ("type[models.User]", Some(vec!["models", "User"])),
-            ("\"models.User\"", Some(vec!["models", "User"])),
-            ("models.User | None", Some(vec!["models", "User"])),
-            ("Union[models.User, None]", Some(vec!["models", "User"])),
-            ("models.User | models.Group", None),
-            ("\"models.User[\"", None),
-        ] {
-            let source = format!("def create() -> {annotation}:\n    pass\n");
-            let tree = crate::declarations::parse_python_tree(&source).expect("Python tree");
-            let function = tree.root_node().named_child(0).expect("function");
-            let annotation = function
-                .child_by_field_name("return_type")
-                .expect("annotation");
-            let identity = python_return_type_identity(annotation, &source);
-            let path = identity
-                .as_ref()
-                .and_then(StructuredTypeIdentity::nominal_name)
-                .map(|name| name.path().iter().map(String::as_str).collect::<Vec<_>>());
-            assert_eq!(path, expected, "{source}");
-        }
+#[test]
+fn return_annotations_preserve_qualified_generic_and_quoted_runtime_owners() {
+    for (annotation, expected) in [
+        ("models.Manager[A, B]", Some(vec!["models", "Manager"])),
+        ("typing.Optional[models.User]", Some(vec!["models", "User"])),
+        ("type[models.User]", Some(vec!["models", "User"])),
+        ("\"models.User\"", Some(vec!["models", "User"])),
+        ("models.User | None", Some(vec!["models", "User"])),
+        ("Union[models.User, None]", Some(vec!["models", "User"])),
+        ("models.User | models.Group", None),
+        ("\"models.User[\"", None),
+    ] {
+        let source = format!("def create() -> {annotation}:\n    pass\n");
+        let tree = crate::declarations::parse_python_tree(&source).expect("Python tree");
+        let function = tree.root_node().named_child(0).expect("function");
+        let annotation = function
+            .child_by_field_name("return_type")
+            .expect("annotation");
+        let identity = python_return_type_identity(annotation, &source);
+        let path = identity
+            .as_ref()
+            .and_then(StructuredTypeIdentity::nominal_name)
+            .map(|name| name.path().iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(path, expected, "{source}");
     }
 }

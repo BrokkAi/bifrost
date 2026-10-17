@@ -18,11 +18,7 @@ pub mod return_type;
 use brokk_bifrost_core::analyzer::capabilities::TypeHierarchyProvider;
 use brokk_bifrost_core::analyzer::fq_name::FqName;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
-use brokk_bifrost_core::analyzer::{
-    CodeUnit, CodeUnitIndex, DefinitionLanguageScope, RelationalDefinitionFrontier,
-    RelationalDefinitionQuery, RelationalDefinitionQuestion, RelationalDefinitionValue,
-    RelationalName,
-};
+use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, RelationalDefinitionFrontier};
 
 /// The *dispatching* analyzer's side of a Java usage-graph scan.
 ///
@@ -51,16 +47,7 @@ impl JavaGraphSource<'_> {
     /// request-local relational frontier. The owner is already a structured
     /// declaration identity, so no rendered Java name is reconstructed here.
     pub fn structural_members(&self, owner: &FqName, identifier: &str) -> Vec<CodeUnit> {
-        let question = RelationalDefinitionQuestion {
-            language_scope: DefinitionLanguageScope::Workspace,
-            name: RelationalName::stable(owner.clone()),
-            query: RelationalDefinitionQuery::StructuralMembers {
-                identifier: identifier.to_string(),
-            },
-        };
-        match self.relational_definitions.ask(&question) {
-            RelationalDefinitionValue::Definitions(units) => units,
-            _ => panic!("a structural-member question returned the wrong shape"),
-        }
+        self.relational_definitions
+            .structural_members(owner, identifier)
     }
 }

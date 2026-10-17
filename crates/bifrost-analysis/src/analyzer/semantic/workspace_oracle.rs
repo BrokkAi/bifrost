@@ -5,6 +5,7 @@ mod conversions;
 mod dispatch;
 mod heap;
 mod runtime_values;
+mod rust;
 pub(crate) use runtime_values::{RuntimeSyntaxCache, runtime_syntax_cache};
 mod source;
 pub use runtime_values::{
@@ -12,24 +13,31 @@ pub use runtime_values::{
     RuntimeKeyedReadResult, RuntimeReadLimitation, RuntimeReadSourceOrigin,
 };
 mod value_flow;
+pub(crate) use common::{Interruption, WorkStager};
+pub(crate) use value_flow::project_procedure_relations;
+pub(crate) use value_flow::{LocalStoreBases, RelationProjectionHost, StrongUpdateStop};
 
 #[doc(hidden)]
 pub use dispatch::PreparedWorkspaceDispatchPool;
 pub use dispatch::procedures_for_definition_with_limits;
-pub(super) use dispatch::semantic_locator_work;
 #[cfg(test)]
-pub(super) use dispatch::{
-    CallableDefinitionIdentity, retain_dispatch_candidate, scoped_procedure_dispatch_gap,
+pub(super) use dispatch::retain_dispatch_candidate;
+pub(super) use dispatch::semantic_locator_work;
+pub use dispatch::{
+    PreparedWorkspaceDispatchSession, ProcedureRangeLookupStatus, procedures_for_source_ranges,
+    procedures_in_artifact,
 };
 pub(crate) use dispatch::{
-    PreparedWorkspaceDispatchSession, exact_call_range, exact_source_for_procedure,
-    external_constant_field_read_discharges_gap,
+    attach_dispatch_provenance, dispatch_result_work, scoped_call_dispatch_gap,
+    scoped_procedure_dispatch_gap,
 };
-// Policy lowering resolves authored source ranges to procedures through these,
-// so they are public where the rest of dispatch stays crate-internal.
-pub use dispatch::{
-    ProcedureRangeLookupStatus, procedures_for_source_ranges, procedures_in_artifact,
+pub(crate) use dispatch::{
+    exact_call_range, exact_source_for_procedure, external_constant_field_read_discharges_gap,
+    inert_drop_glue_discharges_gap, python_workspace_module_member_mutation_free,
+    residual_conversion_discharges_gap,
 };
+// Policy lowering consumes this intentionally Rust-specific semantic API.
+pub use rust::{RustStdBuiltinCall, RustStdBuiltinTransfer, rust_std_builtin_call};
 #[doc(hidden)]
 pub use source::PreparedSourceDispatchSession;
 // Read-set verification replays dispatch on the head workspace and must fold
@@ -42,15 +50,17 @@ pub(crate) use source::{dispatch_answer_digest, procedure_dispatch_question};
 // whether a snapshot's residual openness was refined by its own complete
 // call resolutions (#1952).
 pub use value_flow::{
-    abort_paths_run_user_code, abort_paths_run_user_code_bounded, allocation_call_is_dischargeable,
-    call_target_refinement_call, constructor_call_gap_is_discharged, gap_impacts_value_flow,
-    implicit_abort_gap_is_discharged, value_flow_capabilities_are_open,
+    GapOpenness, ProcedureOpenness, abort_paths_run_user_code, abort_paths_run_user_code_bounded,
+    allocation_call_is_dischargeable, call_target_refinement_call, classify_gap_openness,
+    constructor_call_gap_is_discharged, gap_impacts_value_flow, implicit_abort_gap_is_discharged,
+    value_flow_capabilities_are_open,
 };
 
 use std::fmt;
 use std::sync::Arc;
 
-use crate::analyzer::languages::language_support;
+use crate::analyzer::languages::{SavedDefaultArgumentSafety, language_support};
+use crate::analyzer::semantic::{FormalParameterPassingMode, ProcedureHandle};
 use crate::analyzer::semantic_model::{
     ActiveSemanticModelSnapshot, ResolvedActiveSemanticModels, SemanticModelOverlay,
 };
@@ -65,16 +75,49 @@ pub struct WorkspaceSemanticOracle<'a> {
     runtime_reads: runtime_values::RuntimeReadCache,
     runtime_syntax: runtime_values::RuntimeSyntaxCache,
     runtime_write_footprints: runtime_values::WorkspaceRuntimeWriteFootprintCache,
+    // Completed incoming bindings live only as long as this query provider.
+    incoming_actuals: Arc<
+        std::sync::Mutex<crate::hash::HashMap<heap::IncomingActualKey, heap::IncomingActualSet>>,
+    >,
     limits: OracleLimits,
     hierarchy_expansion: DispatchHierarchyExpansion,
     active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
     dispatch_hints: Arc<DispatchHints>,
-    // Capture the bounded workspace authority once per provider, including an
-    // incomplete answer. A failed scan is not repeatedly retried per call.
-    python_saved_defaults_available: Option<bool>,
+    // Share bounded metadata evidence from this analyzer generation (#5112).
+    python_saved_default_safety: Option<Arc<SavedDefaultArgumentSafety>>,
 }
 
 impl<'a> WorkspaceSemanticOracle<'a> {
+    /// Admit reverse caller sites under their languages' selected build
+    /// configurations. Unknown activity retains today's exploration behavior.
+    /// The answers and language set live only for this caller query.
+    pub fn caller_sites_compiled(
+        &self,
+        sites: &[crate::analyzer::usages::CallSite],
+        cancellation: &crate::CancellationToken,
+    ) -> Result<Vec<bool>, crate::analyzer::semantic::SemanticProviderError> {
+        let mut compiled = vec![true; sites.len()];
+        let languages = sites
+            .iter()
+            .map(|site| site.file.language())
+            .collect::<crate::hash::HashSet<_>>();
+        for language in languages {
+            let Some(support) = language_support(language) else {
+                continue;
+            };
+            let answers = support
+                .caller_sites_compiled(self.workspace, sites, cancellation)
+                .map_err(|error| {
+                    crate::analyzer::semantic::SemanticProviderError::internal(error.to_string())
+                })?;
+            assert_eq!(answers.len(), sites.len());
+            for (compiled, answer) in compiled.iter_mut().zip(answers) {
+                *compiled &= answer;
+            }
+        }
+        Ok(compiled)
+    }
+
     pub(crate) fn new(workspace: &'a WorkspaceAnalyzer) -> Self {
         Self::with_limits(workspace, OracleLimits::default())
     }
@@ -135,6 +178,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
         Self {
             workspace,
             runtime_reads: runtime_values::runtime_read_cache(),
+            incoming_actuals: Arc::default(),
             runtime_syntax: workspace
                 .analyzer()
                 .snapshot_caches()
@@ -146,14 +190,23 @@ impl<'a> WorkspaceSemanticOracle<'a> {
             hierarchy_expansion,
             active_semantic_model_snapshot,
             dispatch_hints: Arc::new(dispatch_hints),
-            python_saved_defaults_available: language_support(Language::Python)
+            python_saved_default_safety: language_support(Language::Python)
                 .expect("Python support is registered")
-                .saved_default_arguments_available(workspace.analyzer()),
+                .saved_default_argument_safety(workspace.analyzer()),
         }
     }
 
-    pub(crate) const fn python_saved_defaults_available(&self) -> Option<bool> {
-        self.python_saved_defaults_available
+    pub(crate) fn python_saved_default_safety(&self) -> Option<&SavedDefaultArgumentSafety> {
+        self.python_saved_default_safety.as_deref()
+    }
+
+    pub(crate) fn python_saved_default_is_available(
+        &self,
+        callee: &ProcedureHandle,
+        passing_mode: FormalParameterPassingMode,
+    ) -> Option<bool> {
+        self.python_saved_default_safety()
+            .map(|safety| safety.default_is_available(callee.semantics().locator(), passing_mode))
     }
 
     pub const fn workspace(&self) -> &'a WorkspaceAnalyzer {
@@ -176,7 +229,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
         }
     }
 
-    pub(super) fn active_semantic_model_snapshot(
+    pub(crate) fn active_semantic_model_snapshot(
         &self,
     ) -> Option<Arc<ActiveSemanticModelSnapshot>> {
         self.active_semantic_model_snapshot.as_ref().map(Arc::clone)
@@ -185,7 +238,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
     pub(super) fn semantic_model_overlay(&self) -> Option<Arc<SemanticModelOverlay>> {
         self.active_semantic_model_snapshot
             .as_ref()
-            .and_then(|snapshot| snapshot.semantic_model_overlay().map(Arc::clone))
+            .and_then(|snapshot| snapshot.overlay())
     }
 
     pub const fn dispatch_hints(&self) -> &Arc<DispatchHints> {

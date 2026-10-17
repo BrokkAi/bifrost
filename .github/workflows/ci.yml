@@ -61,6 +61,7 @@ jobs:
       - name: Run source-owned unit tests
         env:
           JAVA_HOME: ''
+          BIFROST_OPEN_PACKS_DISABLE: '1'
         # One outer scheduler covers every library; Cargo runs libraries serially.
         # Preserve the ordinary ignored-test selection and expose first failures.
         run: /usr/bin/time -v cargo nextest run --workspace --lib --locked --max-fail 100 --retries 0
@@ -70,6 +71,8 @@ jobs:
         run: df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
 
       - name: Run public doctests
+        env:
+          BIFROST_OPEN_PACKS_DISABLE: '1'
         run: /usr/bin/time -v cargo test --workspace --doc --locked
 
       - name: Record runner storage after doctests
@@ -138,7 +141,9 @@ jobs:
                   targets.append(target['name'])
           assert targets, f'Missing MCP binary and integration targets: {mcp}'
           print(f'MCP contract targets: {targets}', flush=True)
-          subprocess.run(command, check=True)
+          test_environment = os.environ.copy()
+          test_environment.setdefault('BIFROST_OPEN_PACKS_DISABLE', '1')
+          subprocess.run(command, check=True, env=test_environment)
           PYTEST
 
       - name: Record runner storage after MCP tests

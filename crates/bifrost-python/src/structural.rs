@@ -5,23 +5,29 @@
 
 use brokk_bifrost_core::analyzer::common::node_source_text;
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
-    attach_argument_role_with_derived_name, attach_role_with_derived_name, attach_terminal_callee,
-    field_name_in_parent, first_named_child, nearest_ancestor, node_range,
+    CalleeSpineStep, attach_argument_role_with_derived_name, attach_role_with_derived_name,
+    attach_terminal_callee, field_name_in_parent, nearest_ancestor, node_range,
+    terminal_callee_leaf,
 };
 use brokk_bifrost_core::analyzer::structural::callable::CallSiteContext;
 use brokk_bifrost_core::analyzer::structural::edges::{
     DEEP_REFERENCE_EDGE_SUPPORT, ReferenceEdgeSupport,
 };
+use brokk_bifrost_core::analyzer::structural::facts::{
+    AssignmentSequenceKind, AssignmentShape, IntegerLiteralValue, Span,
+    decode_integer_literal_digits,
+};
 use brokk_bifrost_core::analyzer::structural::kinds::{NormalizedKind, Role};
 use brokk_bifrost_core::analyzer::structural::materialization::{
-    DeclarationMaterializationSupport, PYTHON_MATERIALIZATION_SUPPORT,
+    DeclarationMaterializationSupport, PYTHON_MATERIALIZATION_SUPPORT, SourceExportBinding,
+    SourceExportBindingKind, SourceExportFact, SourceExportFacts, SourceExportLocalDefinition,
 };
 use brokk_bifrost_core::analyzer::structural::occurrences::{
-    Namespace, OccurrenceRole, OccurrenceRoleSupport, default_occurrence_namespace,
+    Namespace, OccurrenceRole, OccurrenceRoleSupport, module_path_occurrence_namespace,
 };
 use brokk_bifrost_core::analyzer::structural::resolution::{
     BindingActivation, BindingKind, DEEP_LEXICAL_ENVIRONMENT_SUPPORT, HoistingClass,
-    LexicalEnvironmentSupport,
+    LexicalEnvironmentSupport, ScopeFormation, default_scope_formation,
 };
 use brokk_bifrost_core::analyzer::structural::routes::{
     CuratedExportSurface, DEEP_IDENTITY_AXES, IdentityRouteSupport, RouteHopKind,
@@ -29,9 +35,14 @@ use brokk_bifrost_core::analyzer::structural::routes::{
 use brokk_bifrost_core::analyzer::structural::spec::{EmbeddedLeafFact, RoleSink, StructuralSpec};
 use brokk_bifrost_core::analyzer::{Language, Range};
 use brokk_bifrost_core::cancellation::CancellationToken;
-use brokk_bifrost_core::hash::HashSet;
+use brokk_bifrost_core::hash::{HashMap, HashSet};
 use tree_sitter::Node;
 
+use crate::bindings::{
+    PythonDirectScopeBindingKind, python_direct_scope_bindings_bounded,
+    python_executable_scope_children,
+};
+use crate::imports::python_import_bindings_from_tree;
 use crate::syntax::{
     expression_name_node, python_deferred_annotation_identifier_ranges,
     python_keyword_argument_label, python_node_is_in_annotation, python_plain_string_literal,
@@ -42,6 +53,574 @@ pub struct PythonStructuralSpec;
 
 pub static PYTHON_STRUCTURAL_SPEC: PythonStructuralSpec = PythonStructuralSpec;
 
+/// Tree-sitter interleaves grammar extras (`comment`, `line_continuation`)
+/// between the operands of a Python node wherever whitespace is allowed. A
+/// backslash newline is the `line_continuation` extra, so an operand that is
+/// selected by position among every named child can land on an extra instead.
+/// Structural roles and shapes describe the operands, so selection skips extras.
+fn python_first_named_operand(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| !child.is_extra())
+}
+
+/// The test operand of a Python conditional expression (`value if test else
+/// alternative`).
+///
+/// The grammar leaves `conditional_expression` without fields, so its operands
+/// can only be selected positionally. Skipping extras is required: a backslash
+/// line continuation before `else` otherwise appears as a fourth named child
+/// and trips the operand-count check (#4797).
+fn python_conditional_expression_test(node: Node<'_>) -> Node<'_> {
+    assert_eq!(node.kind(), "conditional_expression");
+    let mut cursor = node.walk();
+    let operands: Vec<Node<'_>> = node
+        .named_children(&mut cursor)
+        .filter(|child| !child.is_extra())
+        .collect();
+    assert_eq!(
+        operands.len(),
+        3,
+        "conditional expression operands: {node:?}"
+    );
+    operands[1]
+}
+
+pub(crate) fn python_parenthesized_expression_child(node: Node<'_>) -> Option<Node<'_>> {
+    assert_eq!(node.kind(), "parenthesized_expression");
+    let mut cursor = node.walk();
+    let mut children = node
+        .named_children(&mut cursor)
+        .filter(|child| !child.is_extra());
+    let child = children.next()?;
+    children.next().is_none().then_some(child)
+}
+
+fn python_unwrap_parenthesized(mut node: Node<'_>) -> Node<'_> {
+    while node.kind() == "parenthesized_expression" {
+        let Some(child) = python_parenthesized_expression_child(node) else {
+            break;
+        };
+        node = child;
+    }
+    node
+}
+
+fn python_unstarred_sequence_shape(node: Node<'_>, starred_node_kinds: &[&str]) -> (u32, bool) {
+    let mut unstarred_count = 0u32;
+    let mut starred = false;
+    for index in 0..node.named_child_count() {
+        let child = node
+            .named_child(index)
+            .expect("named child index is below the named child count");
+        if child.is_extra() {
+            continue;
+        }
+        match child.kind() {
+            kind if starred_node_kinds.contains(&kind) => starred = true,
+            _ => unstarred_count += 1,
+        }
+    }
+    (unstarred_count, starred)
+}
+
+/// Expand only displays whose argument names and cardinality are known from
+/// syntax. Validate the entire pack before attaching any ordinary arguments.
+fn python_literal_pack_arguments(argument: Node<'_>, sink: &mut RoleSink<'_>) -> bool {
+    let Some(operand) = python_first_named_operand(argument) else {
+        return false;
+    };
+    let operand = python_unwrap_parenthesized(operand);
+    match (argument.kind(), operand.kind()) {
+        ("list_splat", "tuple" | "list") => {
+            let mut cursor = operand.walk();
+            let elements: Vec<_> = operand
+                .named_children(&mut cursor)
+                .filter(|child| !child.is_extra())
+                .collect();
+            if elements
+                .iter()
+                .any(|element| element.kind() == "list_splat")
+            {
+                return false;
+            }
+            for element in elements {
+                attach_argument_role_with_derived_name(sink, element, expression_name_node);
+            }
+            true
+        }
+        ("dictionary_splat", "dictionary") => {
+            let mut entries = Vec::new();
+            let mut indices = HashMap::default();
+            let mut cursor = operand.walk();
+            for pair in operand
+                .named_children(&mut cursor)
+                .filter(|child| !child.is_extra())
+            {
+                if pair.kind() != "pair" {
+                    return false;
+                }
+                let (Some(key), Some(value)) = (
+                    pair.child_by_field_name("key"),
+                    pair.child_by_field_name("value"),
+                ) else {
+                    return false;
+                };
+                let Some(name) = python_plain_string_literal(key, sink.source()) else {
+                    return false;
+                };
+                // Plain strings have no escapes. Select their content using
+                // grammar nodes, including the zero-width content of "".
+                let mut key_cursor = key.walk();
+                let Some(content) = key
+                    .named_children(&mut key_cursor)
+                    .find(|child| matches!(child.kind(), "string_content" | "string_end"))
+                else {
+                    return false;
+                };
+                let span = Span {
+                    start_byte: content.start_byte(),
+                    end_byte: content.start_byte() + name.len(),
+                };
+                // Dict construction overwrites duplicate keys without moving
+                // their insertion position. Only the retained value is passed.
+                if let Some(&index) = indices.get(name) {
+                    entries[index] = (span, value);
+                } else {
+                    indices.insert(name, entries.len());
+                    entries.push((span, value));
+                }
+            }
+            for (keyword, value) in entries {
+                sink.kwarg_span(keyword, value);
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+fn python_assignment_target_shape(node: Node<'_>) -> Option<(AssignmentSequenceKind, u32, bool)> {
+    let node = python_unwrap_parenthesized(node);
+    let kind = match node.kind() {
+        "tuple_pattern" | "pattern_list" => AssignmentSequenceKind::Tuple,
+        "list_pattern" => AssignmentSequenceKind::List,
+        _ => return None,
+    };
+    let (count, starred) =
+        python_unstarred_sequence_shape(node, &["list_splat_pattern", "splat_pattern"]);
+    Some((kind, count, starred))
+}
+
+fn python_assignment_value_shape(node: Node<'_>) -> Option<(AssignmentSequenceKind, u32, bool)> {
+    let node = python_unwrap_parenthesized(node);
+    let kind = match node.kind() {
+        "tuple" | "expression_list" => AssignmentSequenceKind::Tuple,
+        "list" => AssignmentSequenceKind::List,
+        _ => return None,
+    };
+    let (count, starred) = python_unstarred_sequence_shape(node, &["list_splat"]);
+    Some((kind, count, starred))
+}
+
+fn python_assignment_shape(node: Node<'_>) -> Option<AssignmentShape> {
+    if node.kind() != "assignment" {
+        return None;
+    }
+    let (target_kind, target_unstarred_count, target_starred) =
+        python_assignment_target_shape(node.child_by_field_name("left")?)?;
+    let (value_kind, value_unstarred_count, value_starred) =
+        python_assignment_value_shape(node.child_by_field_name("right")?)?;
+    Some(AssignmentShape {
+        target_kind,
+        value_kind,
+        target_unstarred_count,
+        value_unstarred_count,
+        target_starred,
+        value_starred,
+    })
+}
+
+fn python_integer_literal_value(node: Node<'_>, source: &str) -> Option<IntegerLiteralValue> {
+    if node.kind() != "integer" {
+        return None;
+    }
+
+    let text = node_source_text(node, source).as_bytes();
+    let (radix, digits) = match (text.first(), text.get(1)) {
+        (Some(b'0'), Some(b'b' | b'B')) => (2u32, &text[2..]),
+        (Some(b'0'), Some(b'o' | b'O')) => (8u32, &text[2..]),
+        (Some(b'0'), Some(b'x' | b'X')) => (16u32, &text[2..]),
+        _ => (10u32, text),
+    };
+    decode_integer_literal_digits(radix, digits)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PythonDictionaryKeyValue {
+    String(String),
+    Integer { negative: bool, magnitude: String },
+    Boolean(bool),
+    None,
+}
+
+impl PythonDictionaryKeyValue {
+    fn equals(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::String(left), Self::String(right)) => left == right,
+            (Self::None, Self::None) => true,
+            (
+                Self::Integer {
+                    negative: left_negative,
+                    magnitude: left_magnitude,
+                },
+                Self::Integer {
+                    negative: right_negative,
+                    magnitude: right_magnitude,
+                },
+            ) => left_negative == right_negative && left_magnitude == right_magnitude,
+            (Self::Boolean(value), Self::Boolean(other)) => value == other,
+            (
+                Self::Boolean(value),
+                Self::Integer {
+                    negative,
+                    magnitude,
+                },
+            )
+            | (
+                Self::Integer {
+                    negative,
+                    magnitude,
+                },
+                Self::Boolean(value),
+            ) => !negative && magnitude == if *value { "1" } else { "0" },
+            _ => false,
+        }
+    }
+}
+
+fn python_string_key_value(node: Node<'_>, source: &str) -> Option<String> {
+    if node.kind() == "concatenated_string" {
+        let mut value = String::new();
+        let mut cursor = node.walk();
+        for part in node.named_children(&mut cursor) {
+            if part.kind() != "string" {
+                return None;
+            }
+            value.push_str(&python_string_key_value(part, source)?);
+        }
+        return Some(value);
+    }
+    if node.kind() != "string" {
+        return None;
+    }
+
+    let mut raw = false;
+    let mut content = String::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "string_start" => {
+                let start = node_source_text(child, source).as_bytes();
+                let prefix_end = start
+                    .iter()
+                    .position(|byte| matches!(byte, b'\'' | b'"'))
+                    .unwrap_or(start.len());
+                let prefix = std::str::from_utf8(&start[..prefix_end]).ok()?;
+                if !prefix.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+                    return None;
+                }
+                let prefix = prefix.to_ascii_lowercase();
+                if prefix.contains('b') || prefix.contains('f') {
+                    return None;
+                }
+                raw = prefix.contains('r');
+            }
+            "string_content" => content.push_str(node_source_text(child, source)),
+            "escape_sequence" => content.push_str(node_source_text(child, source)),
+            "string_end" => {}
+            _ => return None,
+        }
+    }
+    python_decode_string_content(&content, raw)
+}
+
+fn python_decode_string_content(content: &str, raw: bool) -> Option<String> {
+    if raw {
+        return Some(content.to_owned());
+    }
+    let mut chars = content.chars().peekable();
+    let mut decoded = String::with_capacity(content.len());
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            decoded.push(character);
+            continue;
+        }
+        let escaped = chars.next()?;
+        let replacement = match escaped {
+            '\n' => continue,
+            '\r' => {
+                chars.next_if_eq(&'\n')?;
+                continue;
+            }
+            '\\' => '\\',
+            '\'' => '\'',
+            '"' => '"',
+            'a' => '\u{0007}',
+            'b' => '\u{0008}',
+            'f' => '\u{000c}',
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            'v' => '\u{000b}',
+            'x' => python_escape_codepoint(&mut chars, 2)?,
+            'u' => python_escape_codepoint(&mut chars, 4)?,
+            'U' => python_escape_codepoint(&mut chars, 8)?,
+            'N' => return None,
+            '0'..='7' => {
+                let mut value = escaped.to_digit(8)?;
+                for _ in 0..2 {
+                    let Some(next) = chars.peek().copied().filter(char::is_ascii_digit) else {
+                        break;
+                    };
+                    let Some(digit) = next.to_digit(8) else {
+                        break;
+                    };
+                    chars.next();
+                    value = value * 8 + digit;
+                }
+                char::from_u32(value)?
+            }
+            other => {
+                decoded.push('\\');
+                other
+            }
+        };
+        decoded.push(replacement);
+    }
+    Some(decoded)
+}
+
+fn python_escape_codepoint(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    digits: usize,
+) -> Option<char> {
+    let mut value = 0u32;
+    for _ in 0..digits {
+        value = value
+            .checked_mul(16)?
+            .checked_add(chars.next()?.to_digit(16)?)?;
+    }
+    char::from_u32(value)
+}
+
+fn python_dictionary_key_value(node: Node<'_>, source: &str) -> Option<PythonDictionaryKeyValue> {
+    let node = python_unwrap_parenthesized(node);
+    if matches!(node.kind(), "string" | "concatenated_string") {
+        return python_string_key_value(node, source).map(PythonDictionaryKeyValue::String);
+    }
+    if matches!(node.kind(), "true" | "false") {
+        return Some(PythonDictionaryKeyValue::Boolean(node.kind() == "true"));
+    }
+    if node.kind() == "none" {
+        return Some(PythonDictionaryKeyValue::None);
+    }
+
+    let (integer, negative) = if node.kind() == "unary_operator" {
+        let operator = node.child_by_field_name("operator")?;
+        match node_source_text(operator, source) {
+            "+" => (
+                python_unwrap_parenthesized(node.child_by_field_name("argument")?),
+                false,
+            ),
+            "-" => (
+                python_unwrap_parenthesized(node.child_by_field_name("argument")?),
+                true,
+            ),
+            _ => return None,
+        }
+    } else {
+        (node, false)
+    };
+    let value = python_integer_literal_value(integer, source)?;
+    let magnitude = value.decimal?;
+    let negative = negative && magnitude != "0";
+    Some(PythonDictionaryKeyValue::Integer {
+        negative,
+        magnitude,
+    })
+}
+
+fn python_duplicate_dictionary_key(node: Node<'_>, source: &str) -> Option<bool> {
+    if node.kind() != "pair" {
+        return None;
+    }
+    let dictionary = node
+        .parent()
+        .filter(|parent| parent.kind() == "dictionary")?;
+    let current_key = python_dictionary_key_value(node.child_by_field_name("key")?, source)?;
+    let mut earlier_unknown = false;
+    let mut all_entries = dictionary.walk();
+    let has_unpacked_entry = dictionary
+        .named_children(&mut all_entries)
+        .any(|entry| !entry.is_extra() && entry.kind() != "pair");
+    let mut cursor = dictionary.walk();
+    for entry in dictionary.named_children(&mut cursor) {
+        if entry.id() == node.id() {
+            return if earlier_unknown || has_unpacked_entry {
+                None
+            } else {
+                Some(false)
+            };
+        }
+        match entry.kind() {
+            "pair" => {
+                let previous_key = entry
+                    .child_by_field_name("key")
+                    .and_then(|key| python_dictionary_key_value(key, source));
+                if previous_key
+                    .as_ref()
+                    .is_some_and(|previous| current_key.equals(previous))
+                {
+                    return Some(true);
+                }
+                earlier_unknown |= previous_key.is_none();
+            }
+            _ if entry.is_extra() => {}
+            _ => {
+                earlier_unknown = true;
+            }
+        }
+    }
+    None
+}
+
+#[derive(Clone, Copy)]
+struct PythonComparisonShape<'tree> {
+    operator_count: usize,
+    operand_count: usize,
+    left: Option<Node<'tree>>,
+    right: Option<Node<'tree>>,
+    operator: Option<Node<'tree>>,
+}
+
+/// Read comparison operands and operator tokens from the grammar node. Python
+/// comparison operators are repeated fields; named operator aliases such as
+/// `is not` are distinguished from operands by their field name.
+fn python_comparison_shape(node: Node<'_>) -> PythonComparisonShape<'_> {
+    let mut operator_count = 0usize;
+    let mut operand_count = 0usize;
+    let mut left = None;
+    let mut right = None;
+    let mut operator = None;
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            let child = cursor.node();
+            if cursor.field_name() == Some("operators") {
+                operator_count += 1;
+                operator.get_or_insert(child);
+            } else if child.is_named() && !child.is_extra() {
+                operand_count += 1;
+                if left.is_none() {
+                    left = Some(child);
+                } else if right.is_none() {
+                    right = Some(child);
+                }
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+    debug_assert!(
+        node.has_error() || operand_count == operator_count.saturating_add(1),
+        "well-formed Python comparison must have one more operand than operators: {node:?}"
+    );
+    PythonComparisonShape {
+        operator_count,
+        operand_count,
+        left,
+        right,
+        operator,
+    }
+}
+
+/// Whether a wrapper is a constant form used by comparison-of-constants:
+/// parenthesized scalar literals and unary signs over numeric literals. This
+/// deliberately does not fold arbitrary expressions such as `1 + 2`.
+fn python_comparison_constant(node: Node<'_>) -> bool {
+    let mut current = node;
+    let mut signed = false;
+    loop {
+        match current.kind() {
+            "parenthesized_expression" => {
+                let Some(expression) = python_parenthesized_expression_child(current) else {
+                    return false;
+                };
+                current = expression;
+            }
+            "unary_operator" => {
+                if !current
+                    .child_by_field_name("operator")
+                    .is_some_and(|operator| matches!(operator.kind(), "+" | "-"))
+                {
+                    return false;
+                }
+                let Some(argument) = current.child_by_field_name("argument") else {
+                    return false;
+                };
+                signed = true;
+                current = argument;
+            }
+            "integer" | "float" => return true,
+            "true" | "false" | "none" => return !signed,
+            "string" | "concatenated_string" => {
+                return !signed && python_plain_string_constant(current);
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// Accept ordinary string tokens and implicit literal concatenation, but not
+/// interpolated strings. Tree structure, rather than source-text scanning,
+/// distinguishes the interpolation form.
+fn python_plain_string_constant(node: Node<'_>) -> bool {
+    let mut pending = vec![node];
+    let mut saw_string = false;
+    while let Some(current) = pending.pop() {
+        match current.kind() {
+            "string" => {
+                saw_string = true;
+                let mut cursor = current.walk();
+                if current
+                    .named_children(&mut cursor)
+                    .any(|child| child.kind() == "interpolation")
+                {
+                    return false;
+                }
+            }
+            "concatenated_string" => {
+                let mut cursor = current.walk();
+                let mut parts = 0;
+                for child in current.named_children(&mut cursor) {
+                    if child.kind() != "string" {
+                        return false;
+                    }
+                    parts += 1;
+                    pending.push(child);
+                }
+                if parts == 0 {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    saw_string
+}
+
 /// Grammar node-type → normalized kind. Every name here must exist in the
 /// tree-sitter-python grammar; `tests::python_kind_table_matches_grammar`
 /// asserts that, so a grammar bump that renames a node fails loudly.
@@ -50,8 +629,20 @@ pub const PYTHON_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("attribute", NormalizedKind::FieldAccess),
     ("function_definition", NormalizedKind::Function),
     ("lambda", NormalizedKind::Lambda),
+    ("await", NormalizedKind::Await),
+    ("yield", NormalizedKind::Yield),
+    ("module", NormalizedKind::Module),
     ("class_definition", NormalizedKind::Class),
     ("assignment", NormalizedKind::Assignment),
+    ("binary_operator", NormalizedKind::BinaryExpression),
+    ("boolean_operator", NormalizedKind::BinaryExpression),
+    ("comparison_operator", NormalizedKind::Comparison),
+    ("assert_statement", NormalizedKind::Assertion),
+    ("conditional_expression", NormalizedKind::If),
+    // These wrappers are emitted as literals only for supported constant
+    // forms; `should_extract` rejects computed or interpolated expressions.
+    ("parenthesized_expression", NormalizedKind::Literal),
+    ("unary_operator", NormalizedKind::Literal),
     // The implicit `__exit__` of a `with` statement runs at the construct's
     // own exit, so the statement is the source fact the resource-lifecycle
     // selector names for that release.
@@ -71,17 +662,16 @@ pub const PYTHON_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("except_clause", NormalizedKind::Catch),
     ("if_statement", NormalizedKind::If),
     ("for_statement", NormalizedKind::ForLoop),
-    ("list", NormalizedKind::CollectionLiteral),
+    ("list", NormalizedKind::ListLiteral),
     ("set", NormalizedKind::CollectionLiteral),
     ("dictionary", NormalizedKind::CollectionLiteral),
-    ("tuple", NormalizedKind::CollectionLiteral),
+    ("tuple", NormalizedKind::TupleLiteral),
+    ("pair", NormalizedKind::ObjectProperty),
     ("while_statement", NormalizedKind::WhileLoop),
-    // Python's indented suite. The module node is deliberately absent: a file
-    // scope is not a statement list nested inside another one, and making the
-    // root a fact in one language only would give Python a scope shape no
-    // other adapter has.
+    // Python's indented suite.
     ("block", NormalizedKind::Block),
     ("decorator", NormalizedKind::Decorator),
+    ("comment", NormalizedKind::Comment),
 ];
 
 /// Attach `decorators` edges for a definition wrapped in Python's
@@ -113,7 +703,9 @@ static PYTHON_OCCURRENCE_ROLE_SUPPORT: OccurrenceRoleSupport = OccurrenceRoleSup
     .supported(OccurrenceRole::ImportTarget)
     .supported(OccurrenceRole::ReceiverPosition)
     .supported(OccurrenceRole::MemberPosition)
-    .supported(OccurrenceRole::ValueReference);
+    .supported(OccurrenceRole::ValueReference)
+    .supported(OccurrenceRole::GlobalDirective)
+    .supported(OccurrenceRole::NonlocalDirective);
 
 /// Whether a `dotted_name` names an imported module rather than an ordinary
 /// attribute chain, which decides whether its tail is an import target.
@@ -149,6 +741,8 @@ fn python_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
     let parent = node.parent()?;
     let field = field_name_in_parent(parent, node);
     let role = match parent.kind() {
+        "global_statement" => OccurrenceRole::GlobalDirective,
+        "nonlocal_statement" => OccurrenceRole::NonlocalDirective,
         "function_definition" | "class_definition" if field == Some("name") => {
             OccurrenceRole::DeclarationName
         }
@@ -170,6 +764,7 @@ fn python_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
             OccurrenceRole::Binder
         }
         "for_statement" | "for_in_clause" if field == Some("left") => OccurrenceRole::Binder,
+        "assignment" if field == Some("left") => OccurrenceRole::Binder,
         "keyword_argument" if python_keyword_argument_label(node) => OccurrenceRole::LabelOrKey,
         "attribute" => match field {
             Some("attribute") => OccurrenceRole::MemberPosition,
@@ -190,6 +785,34 @@ fn python_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
         _ => OccurrenceRole::ValueReference,
     };
     Some(role)
+}
+
+/// Whether `node` is the identifier token that binds one formal parameter.
+///
+/// Tree-sitter uses a bare identifier directly under `parameters` or
+/// `lambda_parameters`, and wrapper nodes for annotations, defaults, and
+/// splats. The shared label helper selects the exact name child for each
+/// wrapper so identifiers in annotations/default values do not become
+/// parameter facts.
+fn python_identifier_is_parameter(node: Node<'_>) -> bool {
+    if node.kind() != "identifier" {
+        return false;
+    }
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    match parent.kind() {
+        "parameters" | "lambda_parameters" => true,
+        "typed_parameter"
+        | "default_parameter"
+        | "typed_default_parameter"
+        | "list_splat_pattern"
+        | "dictionary_splat_pattern"
+        | "keyword_separator" => {
+            crate::declarations::python_parameter_label_node(parent) == Some(node)
+        }
+        _ => false,
+    }
 }
 
 /// Whether a `def` declares a method, that is, whether the suite it sits in
@@ -238,6 +861,7 @@ fn python_binding_activation(binder: Node<'_>, scope: Range) -> Option<BindingAc
             kind,
             "parameters"
                 | "lambda_parameters"
+                | "assignment"
                 | "for_statement"
                 | "for_in_clause"
                 | "as_pattern"
@@ -245,7 +869,6 @@ fn python_binding_activation(binder: Node<'_>, scope: Range) -> Option<BindingAc
                 | "set_comprehension"
                 | "dictionary_comprehension"
                 | "generator_expression"
-                | "function_definition"
         )
     }) else {
         return Some(BindingActivation {
@@ -255,8 +878,13 @@ fn python_binding_activation(binder: Node<'_>, scope: Range) -> Option<BindingAc
         });
     };
     match form.kind() {
-        "parameters" | "lambda_parameters" | "function_definition" => Some(BindingActivation {
+        "parameters" | "lambda_parameters" => Some(BindingActivation {
             kind: BindingKind::Parameter,
+            hoisting: HoistingClass::ScopeWide,
+            activation: scope,
+        }),
+        "assignment" => Some(BindingActivation {
+            kind: BindingKind::Local,
             hoisting: HoistingClass::ScopeWide,
             activation: scope,
         }),
@@ -306,13 +934,19 @@ enum ReadableSurface {
     No,
 }
 
+#[derive(Debug, Clone)]
+struct PythonExportMember {
+    name: String,
+    range: Range,
+}
+
 /// Collect the members of an `__all__` value into `names`, reporting whether
 /// every member was readable. Only a list or tuple display of plain string
 /// literals is; anything else is a value the source computes.
 fn python_collect_all_members(
     value: Node<'_>,
     source: &str,
-    names: &mut HashSet<String>,
+    members: &mut Vec<PythonExportMember>,
 ) -> ReadableSurface {
     if !matches!(value.kind(), "list" | "tuple") {
         return ReadableSurface::No;
@@ -321,7 +955,10 @@ fn python_collect_all_members(
     for element in value.named_children(&mut cursor) {
         match python_plain_string_literal(element, source) {
             Some(text) => {
-                names.insert(text.to_owned());
+                members.push(PythonExportMember {
+                    name: text.to_owned(),
+                    range: node_range(element),
+                });
             }
             None => return ReadableSurface::No,
         }
@@ -329,57 +966,220 @@ fn python_collect_all_members(
     ReadableSurface::Yes
 }
 
-/// The names a Python module curates as its public surface: the value of its
-/// module-level `__all__`.
+/// Find a recovered `__all__` identifier inside a syntax error node.
+fn python_error_contains_all_identifier(error: Node<'_>, source: &str) -> bool {
+    let mut pending = vec![error];
+    while let Some(node) = pending.pop() {
+        if node.kind() == "identifier" && node_source_text(node, source) == "__all__" {
+            return true;
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+    }
+    false
+}
+
+fn python_module_export_bindings(
+    root: Node<'_>,
+    source: &str,
+) -> HashMap<Box<str>, SourceExportBinding> {
+    let mut bindings = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        for binding in python_direct_scope_bindings_bounded(node, source, || true)
+            .expect("unbounded Python module binding scan completes")
+        {
+            let name = node_source_text(binding.declaration, source);
+            if name.is_empty() {
+                continue;
+            }
+            let kind = match binding.kind {
+                PythonDirectScopeBindingKind::ClassDeclaration => SourceExportBindingKind::Class,
+                PythonDirectScopeBindingKind::FunctionDeclaration => {
+                    SourceExportBindingKind::Function
+                }
+                PythonDirectScopeBindingKind::Import => SourceExportBindingKind::Import,
+                PythonDirectScopeBindingKind::Other => SourceExportBindingKind::Binding,
+            };
+            bindings.push(SourceExportBinding {
+                name: name.to_owned(),
+                kind,
+                range: node_range(binding.declaration),
+            });
+        }
+        stack.extend(python_executable_scope_children(node));
+    }
+    bindings.sort_unstable_by_key(|binding| binding.range.start_byte);
+    let mut by_name = HashMap::default();
+    for binding in bindings {
+        by_name
+            .entry(binding.name.clone().into())
+            .or_insert(binding);
+    }
+    by_name
+}
+
+fn python_call_function_name<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
+    if node.kind() != "call" {
+        return None;
+    }
+    let function = node.child_by_field_name("function")?;
+    (function.kind() == "identifier").then(|| node_source_text(function, source))
+}
+
+fn python_current_module_expression(
+    expression: Node<'_>,
+    source: &str,
+    sys_bindings: &HashSet<Box<str>>,
+    module_aliases: &HashSet<Box<str>>,
+) -> bool {
+    let expression = python_unwrap_parenthesized(expression);
+    if expression.kind() == "identifier"
+        && module_aliases.contains(node_source_text(expression, source))
+    {
+        return true;
+    }
+    if expression.kind() == "subscript"
+        && let (Some(value), Some(subscript)) = (
+            expression.child_by_field_name("value"),
+            expression.child_by_field_name("subscript"),
+        )
+        && subscript.kind() == "identifier"
+        && node_source_text(subscript, source) == "__name__"
+        && value.kind() == "attribute"
+        && value
+            .child_by_field_name("attribute")
+            .is_some_and(|attribute| node_source_text(attribute, source) == "modules")
+        && value.child_by_field_name("object").is_some_and(|object| {
+            object.kind() == "identifier" && sys_bindings.contains(node_source_text(object, source))
+        })
+    {
+        return true;
+    }
+    python_call_function_name(expression, source) == Some("__import__")
+        && expression
+            .child_by_field_name("arguments")
+            .and_then(python_first_named_operand)
+            .is_some_and(|argument| {
+                argument.kind() == "identifier" && node_source_text(argument, source) == "__name__"
+            })
+}
+
+fn python_module_definition_is_dynamic(root: Node<'_>, source: &str) -> bool {
+    let sys_bindings: HashSet<Box<str>> = python_import_bindings_from_tree(root, source)
+        .into_iter()
+        .filter(|binding| binding.qualified_name == "sys")
+        .map(|binding| binding.local_name.into_boxed_str())
+        .collect();
+    let mut assignments = Vec::new();
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if node.kind() == "assignment"
+            && let (Some(left), Some(right)) = (
+                node.child_by_field_name("left"),
+                node.child_by_field_name("right"),
+            )
+            && left.kind() == "identifier"
+        {
+            assignments.push((node.start_byte(), left, right));
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+    }
+    assignments.sort_unstable_by_key(|(start, _, _)| *start);
+    let mut module_aliases = HashSet::default();
+    for (_, left, right) in assignments {
+        if python_current_module_expression(right, source, &sys_bindings, &module_aliases) {
+            module_aliases.insert(node_source_text(left, source).into());
+        }
+    }
+
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if node.kind() == "wildcard_import"
+            || python_call_function_name(node, source) == Some("globals")
+        {
+            return true;
+        }
+        if python_call_function_name(node, source) == Some("setattr")
+            && node
+                .child_by_field_name("arguments")
+                .and_then(python_first_named_operand)
+                .is_some_and(|object| {
+                    python_current_module_expression(object, source, &sys_bindings, &module_aliases)
+                })
+        {
+            return true;
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+    }
+    root.has_error()
+}
+
+/// Parse the source-backed member rows for the module's explicit `__all__`.
 ///
-/// Only the module's own statements are read. An `__all__` inside a function
-/// is a local rather than the module's surface, and a name the module binds
-/// conditionally is still bound by the statement this reader already sees.
-/// A statement that assigns, extends, or mutates `__all__` with anything but a
-/// list or tuple of plain string literals makes the surface unreadable: the
-/// members are then unknown, and no import is classified from them.
-fn python_curated_export_surface(root: Node<'_>, source: &str) -> CuratedExportSurface {
+/// Known literals are retained if another member makes the complete surface
+/// unreadable. The materialization query then returns those useful rows and
+/// reports that absence of additional rows is not proof of completeness.
+fn python_source_export_facts(root: Node<'_>, source: &str) -> SourceExportFacts {
     let names_all = |node: Option<Node<'_>>| {
         node.is_some_and(|node| {
             node.kind() == "identifier" && node_source_text(node, source) == "__all__"
         })
     };
-    let mut names: HashSet<String> = HashSet::default();
+    let mut members = Vec::new();
     let mut stated = false;
     let mut readable = ReadableSurface::Yes;
+    let module_bindings = python_module_export_bindings(root, source);
+    let definitions_complete = !python_module_definition_is_dynamic(root, source);
     let mut cursor = root.walk();
     for statement in root.named_children(&mut cursor) {
+        if statement.kind() == "ERROR" && python_error_contains_all_identifier(statement, source) {
+            stated = true;
+            readable = ReadableSurface::No;
+            continue;
+        }
         if statement.kind() != "expression_statement" {
             continue;
         }
         let mut inner = statement.walk();
         for expression in statement.named_children(&mut inner) {
             match expression.kind() {
+                "ERROR" if python_error_contains_all_identifier(expression, source) => {
+                    stated = true;
+                    readable = ReadableSurface::No;
+                }
                 "assignment" | "augmented_assignment" => {
                     if !names_all(expression.child_by_field_name("left")) {
                         continue;
                     }
                     stated = true;
-                    // An annotation without a value (`__all__: list[str]`)
-                    // binds nothing, so it states no members either way.
                     let Some(value) = expression.child_by_field_name("right") else {
+                        let mut cursor = expression.walk();
+                        let has_assignment_operator = expression
+                            .children(&mut cursor)
+                            .any(|child| child.kind() == "=");
+                        let annotation_only = expression.kind() == "assignment"
+                            && expression.child_by_field_name("type").is_some()
+                            && !has_assignment_operator
+                            && !expression.has_error();
+                        if !annotation_only {
+                            readable = ReadableSurface::No;
+                        }
                         continue;
                     };
-                    // `+=` extends the surface; every other augmentation is a
-                    // value this reader does not compute.
                     let extends = expression.kind() == "assignment"
                         || expression
                             .child_by_field_name("operator")
                             .is_some_and(|operator| operator.kind() == "+=");
                     if !extends
-                        || python_collect_all_members(value, source, &mut names)
+                        || python_collect_all_members(value, source, &mut members)
                             == ReadableSurface::No
                     {
                         readable = ReadableSurface::No;
                     }
                 }
-                // `__all__.extend(other)` and its siblings rewrite the surface
-                // from a value the reader cannot see.
                 "call" => {
                     let Some(function) = expression.child_by_field_name("function") else {
                         continue;
@@ -395,10 +1195,59 @@ fn python_curated_export_surface(root: Node<'_>, source: &str) -> CuratedExportS
             }
         }
     }
-    match (stated, readable) {
+
+    let mut names = HashSet::default();
+    let exports = if stated {
+        members
+            .into_iter()
+            .filter(|member| names.insert(member.name.clone()))
+            .map(|member| {
+                let local_definition = match module_bindings.get(member.name.as_str()) {
+                    Some(binding) => SourceExportLocalDefinition::Defined {
+                        binding: binding.clone(),
+                    },
+                    None if definitions_complete => SourceExportLocalDefinition::Undefined,
+                    None => SourceExportLocalDefinition::Unknown,
+                };
+                SourceExportFact {
+                    range: member.range,
+                    exported_name: member.name,
+                    local_definition,
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    SourceExportFacts {
+        exports,
+        declared: stated,
+        complete: !stated || readable == ReadableSurface::Yes,
+        definitions_complete,
+    }
+}
+
+/// The names a Python module curates as its public surface: the value of its
+/// module-level `__all__`.
+///
+/// Only the module's own statements are read. An `__all__` inside a function
+/// is a local rather than the module's surface, and a name the module binds
+/// conditionally is still bound by the statement this reader already sees.
+/// A statement that assigns, extends, or mutates `__all__` with anything but a
+/// list or tuple of plain string literals makes the surface unreadable: the
+/// members are then unknown, and no import is classified from them.
+fn python_curated_export_surface(root: Node<'_>, source: &str) -> CuratedExportSurface {
+    let facts = python_source_export_facts(root, source);
+    match (facts.declared, facts.complete) {
         (false, _) => CuratedExportSurface::Absent,
-        (true, ReadableSurface::Yes) => CuratedExportSurface::Listed(names),
-        (true, ReadableSurface::No) => CuratedExportSurface::Unreadable,
+        (true, false) => CuratedExportSurface::Unreadable,
+        (true, true) => CuratedExportSurface::Listed(
+            facts
+                .exports
+                .into_iter()
+                .map(|export| export.exported_name)
+                .collect(),
+        ),
     }
 }
 
@@ -484,6 +1333,16 @@ fn python_indirection_relation(
     }
 }
 
+/// Grammar steps for the shared call-callee spine. A value expression has no step.
+pub fn callee_spine_step(kind: &str) -> Option<CalleeSpineStep> {
+    use CalleeSpineStep::{Field, Name};
+    match kind {
+        "identifier" => Some(Name),
+        "attribute" => Some(Field("attribute")),
+        _ => None,
+    }
+}
+
 impl StructuralSpec for PythonStructuralSpec {
     fn language(&self) -> Language {
         Language::Python
@@ -491,6 +1350,59 @@ impl StructuralSpec for PythonStructuralSpec {
 
     fn supports_boolean_literal_value(&self) -> bool {
         true
+    }
+
+    fn supports_string_literal_parenthesized(&self) -> bool {
+        true
+    }
+
+    fn supports_string_literal_value(&self) -> bool {
+        true
+    }
+
+    fn string_literal_value(&self, node: Node<'_>, source: &str) -> Option<String> {
+        python_string_key_value(node, source)
+    }
+
+    fn supports_assignment_shape(&self) -> bool {
+        true
+    }
+
+    fn assignment_shape(&self, node: Node<'_>) -> Option<AssignmentShape> {
+        python_assignment_shape(node)
+    }
+
+    fn supports_integer_literal_value(&self) -> bool {
+        true
+    }
+
+    fn integer_literal_value(&self, node: Node<'_>, source: &str) -> Option<IntegerLiteralValue> {
+        python_integer_literal_value(node, source)
+    }
+
+    fn supports_duplicate_dictionary_keys(&self) -> bool {
+        true
+    }
+
+    fn duplicate_dictionary_key(&self, node: Node<'_>, source: &str) -> Option<bool> {
+        python_duplicate_dictionary_key(node, source)
+    }
+
+    fn string_literal_parenthesized(&self, node: Node<'_>) -> Option<bool> {
+        if !matches!(node.kind(), "string" | "concatenated_string") {
+            return None;
+        }
+        let mut current = node;
+        let mut parenthesized = false;
+        while let Some(parent) = current.parent() {
+            if parent.kind() != "parenthesized_expression" {
+                break;
+            }
+            assert_eq!(python_parenthesized_expression_child(parent), Some(current));
+            current = parent;
+            parenthesized = true;
+        }
+        Some(parenthesized)
     }
 
     fn reference_edge_support(&self) -> &ReferenceEdgeSupport {
@@ -542,6 +1454,20 @@ impl StructuralSpec for PythonStructuralSpec {
         python_indirection_relation(token, source, surface)
     }
 
+    fn scope_formation(&self, kind: NormalizedKind) -> ScopeFormation {
+        match kind {
+            // The normalized module fact is the file root, not a nested scope.
+            // Top-level imports and assignments belong to the synthetic file scope.
+            NormalizedKind::Module => ScopeFormation::NotAScope,
+            // Python blocks do not introduce local-variable scopes. Names
+            // assigned in an if/loop/try body remain function or module locals.
+            NormalizedKind::Block | NormalizedKind::ForLoop | NormalizedKind::WhileLoop => {
+                ScopeFormation::NotAScope
+            }
+            _ => default_scope_formation(kind),
+        }
+    }
+
     fn kind_table(&self) -> &'static [(&'static str, NormalizedKind)] {
         PYTHON_KIND_TABLE
     }
@@ -554,23 +1480,65 @@ impl StructuralSpec for PythonStructuralSpec {
         _source: &str,
         _context: &CallSiteContext,
     ) -> NormalizedKind {
-        if kind == NormalizedKind::Function && python_definition_is_method(node) {
-            NormalizedKind::Method
-        } else {
-            kind
+        match kind {
+            NormalizedKind::Identifier if python_identifier_is_parameter(node) => {
+                NormalizedKind::Parameter
+            }
+            NormalizedKind::Function if python_definition_is_method(node) => NormalizedKind::Method,
+            NormalizedKind::Comparison if python_comparison_shape(node).operator_count > 1 => {
+                NormalizedKind::ComparisonChain
+            }
+            _ => kind,
         }
     }
 
     fn should_extract(&self, node: Node<'_>, kind: NormalizedKind) -> bool {
-        kind != NormalizedKind::Assignment || node.child_by_field_name("right").is_some()
+        if kind == NormalizedKind::Module && node.byte_range().is_empty() {
+            return false;
+        }
+        match node.kind() {
+            "parenthesized_expression" | "unary_operator" => {
+                kind == NormalizedKind::Literal && python_comparison_constant(node)
+            }
+            _ => kind != NormalizedKind::Assignment || node.child_by_field_name("right").is_some(),
+        }
     }
 
     fn supports_kind(&self, kind: NormalizedKind) -> bool {
-        kind == NormalizedKind::Method
-            || self
-                .kind_table()
-                .iter()
-                .any(|(_, fact_kind)| fact_kind.satisfies(kind))
+        brokk_bifrost_core::analyzer::structural::spec::supports_kind_from_table(
+            kind,
+            &[
+                NormalizedKind::Method,
+                // Module facts select the parser's file root for Python policies.
+                NormalizedKind::Module,
+                NormalizedKind::Parameter,
+                NormalizedKind::SyntaxError,
+                NormalizedKind::ComparisonChain,
+                NormalizedKind::RegexPattern,
+                NormalizedKind::RegexSequence,
+                NormalizedKind::RegexGroup,
+                NormalizedKind::RegexAlternation,
+                NormalizedKind::RegexCharacterClass,
+                NormalizedKind::RegexCharacterRange,
+                NormalizedKind::RegexQuantifier,
+                NormalizedKind::RegexAnchor,
+                NormalizedKind::RegexEscape,
+                NormalizedKind::RegexLiteral,
+                NormalizedKind::RegexWildcard,
+                NormalizedKind::RegexRiskHostname,
+                NormalizedKind::RegexRiskRange,
+                NormalizedKind::RegexRiskBadTag,
+                NormalizedKind::RegexRiskExponential,
+                NormalizedKind::RegexIncomplete,
+                NormalizedKind::RegexRiskBackspaceEscape,
+                NormalizedKind::RegexRiskDuplicateClassCharacter,
+                NormalizedKind::RegexRiskUnmatchableCaret,
+                NormalizedKind::RegexRiskUnmatchableDollar,
+                NormalizedKind::RegexRiskIncompleteSpecialGroup,
+                NormalizedKind::RegexRiskPolynomial,
+            ],
+            self.kind_table(),
+        )
     }
 
     fn occurrence_role_support(&self) -> &OccurrenceRoleSupport {
@@ -585,6 +1553,10 @@ impl StructuralSpec for PythonStructuralSpec {
         &PYTHON_MATERIALIZATION_SUPPORT
     }
 
+    fn source_export_facts(&self, root: Node<'_>, source: &str) -> Option<SourceExportFacts> {
+        Some(python_source_export_facts(root, source))
+    }
+
     fn binding_activation(&self, binder: Node<'_>, scope: Range) -> Option<BindingActivation> {
         python_binding_activation(binder, scope)
     }
@@ -596,10 +1568,7 @@ impl StructuralSpec for PythonStructuralSpec {
         role: OccurrenceRole,
         declares: Option<NormalizedKind>,
     ) -> Option<Namespace> {
-        match role {
-            OccurrenceRole::PathSegment => Some(Namespace::Module),
-            _ => default_occurrence_namespace(role, declares),
-        }
+        module_path_occurrence_namespace(role, declares)
     }
 
     fn embedded_leaf_facts(
@@ -609,22 +1578,34 @@ impl StructuralSpec for PythonStructuralSpec {
         source: &str,
         cancellation: Option<&CancellationToken>,
     ) -> Vec<EmbeddedLeafFact> {
-        if kind != NormalizedKind::StringLiteral
-            || node.kind() != "string"
-            || !python_node_is_in_annotation(node)
-        {
+        if kind == NormalizedKind::Module {
+            return crate::regex::module_assigned_facts(node, source);
+        }
+        if kind == NormalizedKind::Call {
+            return crate::regex::embedded_facts(node, source);
+        }
+        if kind != NormalizedKind::StringLiteral {
             return Vec::new();
         }
 
-        python_deferred_annotation_identifier_ranges(node, source, cancellation)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|range| EmbeddedLeafFact {
-                kind: NormalizedKind::Identifier,
-                range,
-                occurrence_role: OccurrenceRole::TypeOperand,
-            })
-            .collect()
+        let mut facts = crate::regex::embedded_facts(node, source);
+        if node.kind() != "string" || !python_node_is_in_annotation(node) {
+            return facts;
+        }
+
+        facts.extend(
+            python_deferred_annotation_identifier_ranges(node, source, cancellation)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|range| EmbeddedLeafFact {
+                    kind: NormalizedKind::Identifier,
+                    range,
+                    parent: None,
+                    construct: None,
+                    occurrence_role: Some(OccurrenceRole::TypeOperand),
+                }),
+        );
+        facts
     }
 
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {
@@ -636,7 +1617,11 @@ impl StructuralSpec for PythonStructuralSpec {
                 if let Some(function) = node.child_by_field_name("function") {
                     // A call's own name is its callee's, so
                     // { "kind": "call", "name": "eval" } reads naturally.
-                    attach_terminal_callee(sink, function, expression_name_node(function));
+                    attach_terminal_callee(
+                        sink,
+                        function,
+                        terminal_callee_leaf(function, callee_spine_step),
+                    );
                     if function.kind() == "attribute"
                         && let Some(object) = function.child_by_field_name("object")
                     {
@@ -656,8 +1641,10 @@ impl StructuralSpec for PythonStructuralSpec {
                         let Some(argument) = arguments.named_child(index) else {
                             continue;
                         };
+                        if argument.is_extra() {
+                            continue;
+                        }
                         match argument.kind() {
-                            "comment" => {}
                             "keyword_argument" => {
                                 if let (Some(keyword), Some(value)) = (
                                     argument.child_by_field_name("name"),
@@ -666,6 +1653,8 @@ impl StructuralSpec for PythonStructuralSpec {
                                     sink.kwarg(keyword, value);
                                 }
                             }
+                            "list_splat" | "dictionary_splat"
+                                if python_literal_pack_arguments(argument, sink) => {}
                             _ => attach_argument_role_with_derived_name(
                                 sink,
                                 argument,
@@ -698,6 +1687,66 @@ impl StructuralSpec for PythonStructuralSpec {
                     attach_role_with_derived_name(sink, Role::Right, right, expression_name_node);
                 }
             }
+            NormalizedKind::BinaryExpression => {
+                if let Some(left) = node.child_by_field_name("left") {
+                    attach_role_with_derived_name(sink, Role::Left, left, expression_name_node);
+                }
+                if let Some(right) = node.child_by_field_name("right") {
+                    attach_role_with_derived_name(sink, Role::Right, right, expression_name_node);
+                }
+                if let Some(operator) = node.child_by_field_name("operator") {
+                    sink.role_named(Role::Operator, operator, operator);
+                }
+            }
+            NormalizedKind::Comparison => {
+                let shape = python_comparison_shape(node);
+                if shape.operator_count == 1 && shape.operand_count == 2 {
+                    if let Some(left) = shape.left {
+                        attach_role_with_derived_name(sink, Role::Left, left, expression_name_node);
+                    }
+                    if let Some(right) = shape.right {
+                        attach_role_with_derived_name(
+                            sink,
+                            Role::Right,
+                            right,
+                            expression_name_node,
+                        );
+                    }
+                    if let Some(operator) = shape.operator {
+                        sink.role_named(Role::Operator, operator, operator);
+                    }
+                }
+            }
+            NormalizedKind::Assertion => {
+                if let Some(test) = python_first_named_operand(node) {
+                    sink.role(Role::Test, test);
+                }
+            }
+            NormalizedKind::If => {
+                // The grammar names the `if` statement condition, but its
+                // conditional expression has no fields: its three named
+                // operands are value, condition, and alternative. Grammar
+                // extras (`comment`, `line_continuation`) can be interleaved
+                // between them, so select among the operands (#4797).
+                let test = if node.kind() == "conditional_expression" {
+                    Some(python_conditional_expression_test(node))
+                } else {
+                    node.child_by_field_name("condition")
+                };
+                if let Some(test) = test {
+                    sink.role(Role::Test, test);
+                }
+            }
+            NormalizedKind::Return => {
+                if let Some(value) = python_first_named_operand(node) {
+                    sink.role(Role::Value, value);
+                }
+            }
+            NormalizedKind::Throw => {
+                if let Some(value) = python_first_named_operand(node) {
+                    sink.role(Role::Value, value);
+                }
+            }
             NormalizedKind::Import => match node.kind() {
                 "import_from_statement" => {
                     if let Some(module) = node.child_by_field_name("module_name") {
@@ -724,9 +1773,10 @@ impl StructuralSpec for PythonStructuralSpec {
                     }
                 }
             },
-            NormalizedKind::Identifier => sink.set_name(node),
+            NormalizedKind::Identifier | NormalizedKind::Parameter => sink.set_name(node),
             NormalizedKind::Decorator => {
-                if let Some(name) = first_named_child(node).and_then(expression_name_node) {
+                if let Some(name) = python_first_named_operand(node).and_then(expression_name_node)
+                {
                     sink.set_name(name);
                 }
             }
@@ -740,18 +1790,300 @@ impl StructuralSpec for PythonStructuralSpec {
                     );
                 }
             }
-            NormalizedKind::CollectionLiteral => {
+            NormalizedKind::CollectionLiteral
+            | NormalizedKind::TupleLiteral
+            | NormalizedKind::ListLiteral => {
                 for index in 0..node.named_child_count() {
                     let Some(child) = node.named_child(index) else {
                         continue;
                     };
-                    if child.kind() == "comment" {
+                    if child.is_extra() {
                         continue;
                     }
-                    attach_role_with_derived_name(sink, Role::Element, child, expression_name_node);
+                    let element = python_unwrap_parenthesized(child);
+                    attach_role_with_derived_name(
+                        sink,
+                        Role::Element,
+                        element,
+                        expression_name_node,
+                    );
+                }
+            }
+            NormalizedKind::ObjectProperty => {
+                if let Some(key) = node.child_by_field_name("key") {
+                    sink.role(Role::Key, key);
+                }
+                if let Some(value) = node.child_by_field_name("value") {
+                    sink.role(Role::Value, value);
+                }
+            }
+            NormalizedKind::StringLiteral if node.kind() == "concatenated_string" => {
+                for index in 0..node.named_child_count() {
+                    let Some(part) = node.named_child(index) else {
+                        continue;
+                    };
+                    if part.kind() == "string" {
+                        sink.role(Role::Part, part);
+                    }
                 }
             }
             _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    fn node_of_kind<'tree>(root: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
+        let mut pending = vec![root];
+        while let Some(node) = pending.pop() {
+            if node.kind() == kind {
+                return Some(node);
+            }
+            let mut cursor = node.walk();
+            pending.extend(node.named_children(&mut cursor));
+        }
+        None
+    }
+
+    fn string_literal_parenthesization(root: Node<'_>) -> (usize, usize) {
+        let mut pending = vec![root];
+        let mut string_count = 0;
+        let mut parenthesized_count = 0;
+        while let Some(node) = pending.pop() {
+            if matches!(node.kind(), "string" | "concatenated_string") {
+                string_count += 1;
+                if PYTHON_STRUCTURAL_SPEC
+                    .string_literal_parenthesized(node)
+                    .expect("Python string-literal parenthesization is supported")
+                {
+                    parenthesized_count += 1;
+                }
+            }
+            let mut cursor = node.walk();
+            pending.extend(node.named_children(&mut cursor));
+        }
+        (string_count, parenthesized_count)
+    }
+
+    fn parse_python(source: &str) -> tree_sitter::Tree {
+        crate::declarations::parse_python_tree(source).expect("Python source tree")
+    }
+
+    #[test]
+    fn missing_python_all_value_is_incomplete_after_parser_recovery() {
+        let source = "__all__ =\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .expect("Python parser");
+        let tree = parser.parse(source, None).expect("Python source tree");
+        let root = tree.root_node();
+        let facts = python_source_export_facts(root, source);
+
+        assert!(facts.declared, "recovered AST: {}", root.to_sexp());
+        assert!(!facts.complete, "recovered AST: {}", root.to_sexp());
+    }
+
+    #[test]
+    fn parenthesized_string_literals_allow_comment_children() {
+        for (case, source) in [
+            (
+                "one comment between concatenated strings",
+                "VALUE = (\n    r\"\\.\"  # dot\n    r\"(?!-)\"\n)\n",
+            ),
+            (
+                "several comments between concatenated strings",
+                "VALUE = (\n    r\"a\"  # first\n    # between\n    r\"b\"  # second\n    # trailing\n)\n",
+            ),
+            (
+                "comment before the string",
+                "VALUE = (\n    # starts below\n    r\"value\"\n)\n",
+            ),
+            (
+                "nested parentheses with a comment",
+                "VALUE = (\n    (\n        # nested\n        r\"value\"  # closes inner value\n    )\n)\n",
+            ),
+        ] {
+            let tree = parse_python(source);
+            let root = tree.root_node();
+            assert!(!root.has_error(), "{case}: {}", root.to_sexp());
+            let (string_count, parenthesized_count) = string_literal_parenthesization(root);
+            assert!(string_count > 0, "{case}: {}", root.to_sexp());
+            assert!(parenthesized_count > 0, "{case}: {}", root.to_sexp());
+        }
+
+        let tree = parse_python("VALUE = (\n    # comment\n    1  # trailing comment\n)\n");
+        let mut pending = vec![tree.root_node()];
+        let parenthesized = loop {
+            let node = pending.pop().expect("parenthesized expression exists");
+            if node.kind() == "parenthesized_expression" {
+                break node;
+            }
+            let mut cursor = node.walk();
+            pending.extend(node.named_children(&mut cursor));
+        };
+        assert!(python_comparison_constant(parenthesized));
+        assert_eq!(python_unwrap_parenthesized(parenthesized).kind(), "integer");
+    }
+
+    #[test]
+    #[hardwon(
+        "#4797: a backslash continuation before `else` counted as a fourth conditional-expression operand"
+    )]
+    fn conditional_expression_selects_condition_past_extras() {
+        for (case, source) in [
+            (
+                "line continuation",
+                "def f(a, b):\n    return a if b \\\n        else c\n",
+            ),
+            (
+                "comment",
+                "def f(a, b, c):\n    return (a if b\n            # why not\n            else c)\n",
+            ),
+            (
+                "plain",
+                "def f(a, b, c):\n    return (a if b\n            else c)\n",
+            ),
+        ] {
+            let tree = parse_python(source);
+            let root = tree.root_node();
+            assert!(!root.has_error(), "{case}: {}", root.to_sexp());
+            let conditional = node_of_kind(root, "conditional_expression").unwrap_or_else(|| {
+                panic!("{case}: no conditional expression in {}", root.to_sexp())
+            });
+            let test = python_conditional_expression_test(conditional);
+            assert_eq!(test.kind(), "identifier", "{case}");
+            assert_eq!(
+                test.utf8_text(source.as_bytes()).unwrap(),
+                "b",
+                "{case}: {}",
+                root.to_sexp()
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#4797: a line continuation inside parentheses hid the sole operand from the parenthesization check"
+    )]
+    fn parenthesized_expression_skips_line_continuation() {
+        let source = "VALUE = (\n    \"value\"\\\n)\n";
+        let tree = parse_python(source);
+        let root = tree.root_node();
+        assert!(!root.has_error(), "{}", root.to_sexp());
+        let string = node_of_kind(root, "string").expect("string literal");
+        assert_eq!(
+            PYTHON_STRUCTURAL_SPEC.string_literal_parenthesized(string),
+            Some(true),
+            "{}",
+            root.to_sexp()
+        );
+    }
+
+    #[test]
+    #[hardwon("#4797: a line continuation in a dict literal disabled duplicate-key detection")]
+    fn duplicate_dictionary_key_skips_extras() {
+        let source = "D = {1: 2, \\\n 1: 3}\n";
+        let tree = parse_python(source);
+        let root = tree.root_node();
+        assert!(!root.has_error(), "{}", root.to_sexp());
+        let dictionary = node_of_kind(root, "dictionary").expect("dictionary literal");
+        let mut cursor = dictionary.walk();
+        let pairs: Vec<Node<'_>> = dictionary
+            .named_children(&mut cursor)
+            .filter(|child| child.kind() == "pair")
+            .collect();
+        assert_eq!(pairs.len(), 2, "{}", root.to_sexp());
+        assert_eq!(
+            PYTHON_STRUCTURAL_SPEC.duplicate_dictionary_key(pairs[1], source),
+            Some(true),
+            "{}",
+            root.to_sexp()
+        );
+    }
+
+    #[test]
+    fn django_domain_validator_strings_parse_without_parenthesization_panics() {
+        let source = r#"
+class DomainNameValidator(RegexValidator):
+    message = _("Enter a valid domain name.")
+    ul = "\u00a1-\uffff"  # Unicode letters range (must not be a raw string).
+    # Host patterns.
+    hostname_re = (
+        r"[a-z" + ul + r"0-9](?:[a-z" + ul + r"0-9-]{0,61}[a-z" + ul + r"0-9])?"
+    )
+    # Max length for domain name labels is 63 characters per RFC 1034 sec. 3.1.
+    domain_re = r"(?:\.(?!-)[a-z" + ul + r"0-9-]{1,63}(?<!-))*"
+    # Top-level domain.
+    tld_no_fqdn_re = (
+        r"\."  # dot
+        r"(?!-)"  # can't start with a dash
+        r"(?:[a-z" + ul + "-]{2,63}"  # domain label
+        r"|xn--[a-z0-9]{1,59})"  # or punycode label
+        r"(?<!-)"  # can't end with a dash
+    )
+    tld_re = tld_no_fqdn_re + r"\.?"
+    ascii_only_hostname_re = r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?"
+    ascii_only_domain_re = r"(?:\.(?!-)[a-zA-Z0-9-]{1,63}(?<!-))*"
+    ascii_only_tld_re = (
+        r"\."  # dot
+        r"(?!-)"  # can't start with a dash
+        r"(?:[a-zA-Z0-9-]{2,63})"  # domain label
+        r"(?<!-)"  # can't end with a dash
+        r"\.?"  # may have a trailing dot
+    )
+"#;
+        let tree = parse_python(source);
+        let root = tree.root_node();
+        assert!(!root.has_error(), "{}", root.to_sexp());
+        let (string_count, parenthesized_count) = string_literal_parenthesization(root);
+        assert!(string_count > 0, "{}", root.to_sexp());
+        assert!(parenthesized_count > 0, "{}", root.to_sexp());
+    }
+
+    #[test]
+    fn decoded_string_values_match_python_escape_and_concatenation_semantics() {
+        for (source, expected) in [
+            (
+                r#"MIDDLEWARE = "\x64jango.middleware.csrf.CsrfViewMiddleware""#,
+                Some("django.middleware.csrf.CsrfViewMiddleware"),
+            ),
+            (
+                r#"MIDDLEWARE = "django.middleware.csrf." "CsrfViewMiddleware""#,
+                Some("django.middleware.csrf.CsrfViewMiddleware"),
+            ),
+            (
+                r#"MIDDLEWARE = b"django.middleware.csrf.CsrfViewMiddleware""#,
+                None,
+            ),
+        ] {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_python::LANGUAGE.into())
+                .expect("Python parser");
+            let tree = parser.parse(source, None).expect("Python source tree");
+            let mut pending = vec![tree.root_node()];
+            let assignment = loop {
+                let node = pending.pop().expect("Python tree has an assignment");
+                if node.kind() == "assignment" {
+                    break node;
+                }
+                let mut cursor = node.walk();
+                pending.extend(node.named_children(&mut cursor));
+            };
+            let value = assignment
+                .child_by_field_name("right")
+                .expect("assignment value");
+            assert_eq!(
+                python_string_key_value(value, source).as_deref(),
+                expected,
+                "{}",
+                tree.root_node().to_sexp()
+            );
         }
     }
 }

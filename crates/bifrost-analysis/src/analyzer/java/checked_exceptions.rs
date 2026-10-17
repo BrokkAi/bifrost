@@ -348,24 +348,37 @@ mod tests {
         )
     }
 
+    use brokk_bifrost_test_macros::hardwon;
     #[test]
+    #[hardwon(
+        "#2314: A resolved callee without throws was incorrectly allowed to reach checked catches"
+    )]
     fn a_callee_without_throws_cannot_reach_a_checked_catch() {
         assert!(cannot_reach("quietCaught"));
         assert!(cannot_reach("deepCaught"));
     }
 
     #[test]
+    #[hardwon(
+        "#2314: An implicit default constructor was incorrectly treated as throwing a checked exception"
+    )]
     fn an_implicit_default_constructor_cannot_reach_a_checked_catch() {
         assert!(cannot_reach("implicitCaught"));
     }
 
     #[test]
+    #[hardwon(
+        "#2314: Declared method and constructor throws clauses were ignored when retaining catch bindings"
+    )]
     fn a_declared_throws_clause_keeps_the_binding() {
         assert!(!cannot_reach("loudCaught"));
         assert!(!cannot_reach("explicitCaught"));
     }
 
     #[test]
+    #[hardwon(
+        "#2314: Broad, unchecked, and multi-catch clauses were incorrectly treated as unreachable"
+    )]
     fn a_catch_that_receives_unchecked_exceptions_keeps_the_binding() {
         assert!(!cannot_reach("broadCaught"));
         assert!(!cannot_reach("uncheckedCaught"));
@@ -373,6 +386,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#2314: Unresolved exception ancestry and anonymous initializers incorrectly lost conservative catch bindings"
+    )]
     fn unproven_shapes_keep_the_binding() {
         assert!(!cannot_reach("remoteCaught"));
         assert!(!cannot_reach("anonymousCaught"));

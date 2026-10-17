@@ -18,9 +18,10 @@ use super::{
     ResolvedActiveSemanticModels, RuleEmission, RuleTrigger, RuntimeGlobalBindingEvidence,
     RuntimeGlobalExposure, RuntimeValuesPayload, SemanticModelActivationStatus, SemanticModelMatch,
     SemanticModelMatchDisposition, Signature, StructuredTypeExpression, TemplateExpression,
-    TemplateSignature, TemplateTypeRef, TypeFact, TypeKind, TypeParameterConstraint, TypeRef,
-    TypeRefReferenceKind, TypeValueSemantics, Visibility,
+    TemplateParameter, TemplateSignature, TemplateTypeRef, TypeFact, TypeKind,
+    TypeParameterConstraint, TypeRef, TypeRefReferenceKind, TypeValueSemantics, Visibility,
 };
+use crate::analyzer::dependency_support::dependency_locator_path as locator_path;
 use crate::analyzer::semantic::LengthDelimitedDigest;
 use crate::analyzer::structural::{FileFacts, NormalizedKind, Role};
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
@@ -55,6 +56,15 @@ pub enum SemanticModelCompleteness {
     Complete,
 }
 
+impl SemanticModelCompleteness {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Partial => "partial",
+            Self::Complete => "complete",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticModelSymbolKind {
@@ -78,6 +88,29 @@ pub enum SemanticModelSymbolKind {
     Static,
     Macro,
     Event,
+}
+
+impl SemanticModelSymbolKind {
+    /// Whether this kind is a type declaration, the only shape a hierarchy
+    /// edge can cross to. Members and values never are, so a pack that
+    /// publishes a constant beside a same-named class cannot answer a base
+    /// clause with the constant.
+    fn is_type_declaration(self) -> bool {
+        matches!(
+            self,
+            Self::Class
+                | Self::Annotation
+                | Self::Delegate
+                | Self::Interface
+                | Self::Trait
+                | Self::Struct
+                | Self::Union
+                | Self::Enum
+                | Self::Record
+                | Self::Module
+                | Self::TypeAlias
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -224,8 +257,12 @@ pub struct SemanticModelSymbol {
     pub(crate) has_explicit_type_terms: bool,
     #[serde(skip)]
     pub(crate) callable_shape: Option<String>,
+    #[serde(skip)]
+    callable_shape_evidence_complete: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub callable_family_complete: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub exact_return_classes: Vec<TypeRef>,
     pub aliases: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub type_parameter_constraints: Vec<TypeParameterConstraint>,
@@ -247,6 +284,10 @@ pub struct SemanticModelSymbol {
     /// pack record. `None` means the producer did not review it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ambient_use: Option<AmbientUseRole>,
+    #[serde(skip)]
+    pub(crate) value_type: Option<TypeRef>,
+    #[serde(skip)]
+    pub(crate) proxied_type: Option<TypeRef>,
     #[serde(skip)]
     pub(crate) extension_receiver: Option<TypeRef>,
     #[serde(skip)]
@@ -415,6 +456,31 @@ pub fn semantic_model_callable_family_id(records: &[&SemanticModelSymbol]) -> Op
         return None;
     }
     if records.len() == 1 {
+        // A generated C function has no overload family within its header
+        // owner. Keep its authored owner/member locator as the family
+        // identity even when the variadic signature deliberately cannot
+        // certify complete callable-family coverage. The signature remains
+        // incomplete for binding purposes; this only gives policy locators a
+        // stable identity to resolve.
+        if first.language == "cpp"
+            && first.kind == SemanticModelSymbolKind::Function
+            && first.owner_id.is_some()
+            && !first.has_receiver()
+            && !first.callable_family_complete
+            && !first.provenance.ambiguous
+            && first.provenance.origin == SemanticModelOriginKind::ExactGeneratedOutput
+            && first
+                .structured_signature
+                .as_ref()
+                .is_some_and(|signature| {
+                    signature
+                        .parameters
+                        .last()
+                        .is_some_and(|parameter| parameter.variadic)
+                })
+        {
+            return Some(first.qualified_name.clone());
+        }
         return (!first.provenance.ambiguous
             && (first.provenance.completeness == SemanticModelCompleteness::Complete
                 || first.callable_family_complete))
@@ -488,6 +554,14 @@ pub(crate) enum SemanticModelOverlayBuildError {
 pub struct SemanticModelOverlayMatch<'a, T> {
     pub records: Vec<&'a T>,
     pub disposition: SemanticModelOverlayDisposition,
+}
+
+impl<'a, T> SemanticModelOverlayMatch<'a, T> {
+    pub(crate) fn unique(&self) -> Option<&'a T> {
+        (self.disposition == SemanticModelOverlayDisposition::Unique)
+            .then(|| self.records.first().copied())
+            .flatten()
+    }
 }
 
 /// Result of resolving one static member from one exact modeled owner.
@@ -590,6 +664,35 @@ struct ResolvedEdgeTarget<'a> {
     defect: Option<SemanticModelEdgeDefect>,
 }
 
+/// What declaration kinds a hierarchy edge may name.
+///
+/// The edge label alone does not fix the target's kind, because each producer
+/// spends the label vocabulary its own way: the JVM external packs record every
+/// supertype as `extends`, whether it names a class, an interface or a trait,
+/// and Rust records a trait implementation as `implements`, naming a trait.
+/// A pack that records a supertype by name does not record its kind at all, so
+/// [`HierarchyTargetShape::Type`] admits every type declaration and still
+/// rejects a same-named method, field or constant, which is what keeps a value
+/// from answering a class base.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HierarchyTargetShape {
+    /// One specific declaration kind, where the caller knows it. Java
+    /// `implements` always names an interface, so the widening walk asks for
+    /// that kind and not merely for a type.
+    Kind(SemanticModelSymbolKind),
+    /// Any type declaration.
+    Type,
+}
+
+impl HierarchyTargetShape {
+    fn admits(self, record: &SemanticModelSymbol) -> bool {
+        match self {
+            Self::Kind(kind) => record.kind == kind,
+            Self::Type => record.kind.is_type_declaration(),
+        }
+    }
+}
+
 /// A reason one owner's inherited surface may not be all of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SemanticModelSurfaceGap {
@@ -636,6 +739,14 @@ pub struct SemanticModelOwnerSurface<'a> {
     /// the gaps in gate order: unresolved edges first, then the types whose own
     /// provenance does not support a proof.
     pub gaps: Vec<SemanticModelSurfaceGap>,
+}
+
+/// One callable's declaring owner and the typed hierarchy path from its receiver.
+/// This is a query result; no candidate or path survives the query.
+#[derive(Debug)]
+pub(crate) struct SemanticModelCallableOwner<'a> {
+    pub owner: &'a SemanticModelSymbol,
+    pub hierarchy: Vec<HierarchyFact>,
 }
 
 impl SemanticModelOwnerSurface<'_> {
@@ -748,16 +859,14 @@ pub struct DeferredYieldContract {
 impl DeferredYieldContract {
     pub fn is_complete(&self) -> bool {
         self.coverage == Some(Completeness::Complete)
-            && self.provenance.completeness == SemanticModelCompleteness::Complete
-            && !self.provenance.ambiguous
+            && self.provenance.is_complete_and_unambiguous()
     }
 }
 
 impl CollectionFlowContract {
     pub fn is_complete(&self) -> bool {
         self.coverage == Some(Completeness::Complete)
-            && self.provenance.completeness == SemanticModelCompleteness::Complete
-            && !self.provenance.ambiguous
+            && self.provenance.is_complete_and_unambiguous()
     }
 }
 
@@ -1164,6 +1273,20 @@ impl SemanticModelOverlay {
         self.collection_flow_match(self.collection_flows_by_callable.get(callable))
     }
 
+    pub(crate) fn unique_complete_collection_flow(
+        &self,
+        callable: &str,
+    ) -> Option<&CollectionFlowContract> {
+        let flows = self.collection_flows_for(callable);
+        if flows.disposition != SemanticModelOverlayDisposition::Unique {
+            return None;
+        }
+        let [flow] = flows.records.as_slice() else {
+            return None;
+        };
+        flow.is_complete().then_some(flow)
+    }
+
     /// Local declaration IDs are meaningful only within the publishing pack.
     pub fn conditional_type_refinements_for<'a>(
         &'a self,
@@ -1252,6 +1375,22 @@ impl SemanticModelOverlay {
         self.symbol_match(self.symbols_by_name.get(name))
     }
 
+    pub(crate) fn visible_public_symbol(
+        &self,
+        qualified_name: &str,
+        language: &str,
+    ) -> Option<&SemanticModelSymbol> {
+        let matched = self.symbols_named(qualified_name);
+        let symbol = (matched.disposition == SemanticModelOverlayDisposition::Unique)
+            .then(|| matched.records.first().copied())
+            .flatten()?;
+        Self::symbol_is_visible_public(symbol, language).then_some(symbol)
+    }
+
+    pub(crate) fn symbol_is_visible_public(symbol: &SemanticModelSymbol, language: &str) -> bool {
+        symbol.language == language && symbol.visibility == Visibility::Public
+    }
+
     pub fn symbols_at_uri(&self, uri: &str) -> SemanticModelOverlayMatch<'_, SemanticModelSymbol> {
         self.symbol_match(self.symbols_by_uri.get(uri))
     }
@@ -1265,6 +1404,31 @@ impl SemanticModelOverlay {
 
     pub fn members_of(&self, owner_id: &str) -> SemanticModelOverlayMatch<'_, SemanticModelSymbol> {
         self.symbol_match(self.symbols_by_owner.get(owner_id))
+    }
+
+    /// Return owner members with this exact symbol name and their disposition.
+    pub fn members_named(
+        &self,
+        owner_id: &str,
+        name: &str,
+    ) -> SemanticModelOverlayMatch<'_, SemanticModelSymbol> {
+        let records = self
+            .members_of(owner_id)
+            .records
+            .into_iter()
+            .filter(|symbol| symbol.name == name)
+            .collect::<Vec<_>>();
+        let disposition = if records.is_empty() {
+            SemanticModelOverlayDisposition::Empty
+        } else if records.len() == 1 && !records[0].provenance.ambiguous {
+            SemanticModelOverlayDisposition::Unique
+        } else {
+            SemanticModelOverlayDisposition::Conflict
+        };
+        SemanticModelOverlayMatch {
+            records,
+            disposition,
+        }
     }
 
     /// Resolve a static member through one exact modeled owner identity.
@@ -1703,16 +1867,7 @@ impl SemanticModelOverlay {
         &self,
         key: SemanticModelCallableKey<'_>,
     ) -> Option<String> {
-        let owners = self
-            .symbols_named(key.owner)
-            .records
-            .into_iter()
-            .filter(|symbol| {
-                symbol.owner_id.is_none()
-                    && symbol.qualified_name == key.owner
-                    && symbol.language == key.language
-            })
-            .collect::<Vec<_>>();
+        let owners = self.callable_owner_candidates(key);
         let [owner] = owners.as_slice() else {
             return None;
         };
@@ -1761,6 +1916,91 @@ impl SemanticModelOverlay {
         semantic_model_callable_family_id(&records)
     }
 
+    /// Collect declaring owners without imposing a language's selection policy.
+    /// The ordinary surface supplies edge resolution and completeness checks;
+    /// original declaration facts retain generic arguments erased by name edges.
+    /// Rust ranks all visible traits, whereas JVM consumers retain first match.
+    pub(crate) fn callable_owners_on_surface<'a>(
+        &'a self,
+        active: &ResolvedActiveSemanticModels,
+        owner: &'a SemanticModelSymbol,
+        member: &str,
+    ) -> Option<Vec<SemanticModelCallableOwner<'a>>> {
+        let surface = self.owner_surface(owner);
+        if surface.gaps.iter().any(|gap| {
+            matches!(
+                gap,
+                SemanticModelSurfaceGap::UnresolvedEdge(_)
+                    | SemanticModelSurfaceGap::AmbiguousType { .. }
+            )
+        }) {
+            return None;
+        }
+        // Partial inventories retain positive typed implementation paths. The
+        // callable matcher, not whole-pack absence, certifies a complete family.
+        let mut candidates: Vec<SemanticModelCallableOwner<'_>> = Vec::new();
+        let mut pending = vec![(owner, Vec::<HierarchyFact>::new())];
+        let mut expanded = HashSet::default();
+        while let Some((declaring, path)) = pending.pop() {
+            // Expand an instantiated owner once. Retaining every route through
+            // a diamond would grow exponentially even though it adds no member.
+            if !expanded.insert((
+                declaring.id.as_str(),
+                path.last().map(|edge| edge.target.clone()),
+            )) {
+                continue;
+            }
+            if self
+                .members_of(&declaring.id)
+                .records
+                .iter()
+                .any(|symbol| symbol.name == member && member_is_callable(symbol))
+                && !candidates.iter().any(|candidate| {
+                    candidate.owner.id == declaring.id
+                        && candidate.hierarchy.last().map(|edge| &edge.target)
+                            == path.last().map(|edge| &edge.target)
+                })
+            {
+                candidates.push(SemanticModelCallableOwner {
+                    owner: declaring,
+                    hierarchy: path.clone(),
+                });
+            }
+            let ancestors = self.direct_ancestors_of(declaring);
+            let declarations = active.types_with_id(&declaring.id);
+            for declaration in declarations.records {
+                for edge in &declaration.record.hierarchy {
+                    let target = match &edge.target {
+                        TypeRef::Named { name, .. } => name,
+                        TypeRef::Declared { id, .. } => id,
+                        _ => return None,
+                    };
+                    let resolved = self.resolve_edge_target(
+                        target,
+                        &declaring.language,
+                        HierarchyTargetShape::Type,
+                    );
+                    if resolved.defect.is_some() {
+                        return None;
+                    }
+                    for ancestor in resolved.records {
+                        if !ancestors
+                            .records
+                            .iter()
+                            .any(|allowed| allowed.id == ancestor.id)
+                        {
+                            continue;
+                        }
+                        let mut hierarchy = path.clone();
+                        hierarchy.push(edge.clone());
+                        pending.push((ancestor, hierarchy));
+                    }
+                }
+            }
+        }
+        Some(candidates)
+    }
+
     /// Resolve one oracle-owned external callable identity against the active
     /// declaration model and one structured call application.
     ///
@@ -1783,16 +2023,7 @@ impl SemanticModelOverlay {
                 ),
             };
         };
-        let owners = self
-            .symbols_named(key.owner)
-            .records
-            .into_iter()
-            .filter(|symbol| {
-                symbol.owner_id.is_none()
-                    && symbol.qualified_name == key.owner
-                    && symbol.language == key.language
-            })
-            .collect::<Vec<_>>();
+        let owners = self.callable_owner_candidates(key);
 
         if owners.is_empty() {
             return SemanticModelCallableMatch {
@@ -1879,10 +2110,12 @@ impl SemanticModelOverlay {
         if candidates.is_empty() {
             return SemanticModelCallableMatch {
                 records: Vec::new(),
-                disposition: if application_mismatches {
-                    SemanticModelCallableDisposition::Incomplete(
-                        SemanticModelCallableIncompleteReason::ApplicationMismatch,
-                    )
+                disposition: if application_mismatches || owner_model_is_partial {
+                    SemanticModelCallableDisposition::Incomplete(if application_mismatches {
+                        SemanticModelCallableIncompleteReason::ApplicationMismatch
+                    } else {
+                        SemanticModelCallableIncompleteReason::PartialModel
+                    })
                 } else {
                     SemanticModelCallableDisposition::Empty
                 },
@@ -1906,12 +2139,31 @@ impl SemanticModelOverlay {
         let callable_family_is_complete = candidates
             .iter()
             .all(|candidate| candidate.callable_family_complete);
+        // Python's complete callable-shape evidence describes one exact
+        // declaration. It can bind that declaration without claiming that
+        // the partial pack enumerates its overload family.
+        let python_single_declaration_has_shape = key.language == "python"
+            && candidates.len() == 1
+            && candidates[0].has_complete_callable_shape_evidence()
+            && owners.len() == 1
+            && self
+                .members_of(&owners[0].id)
+                .records
+                .into_iter()
+                .filter(|member| {
+                    member.language == key.language
+                        && member.name == key.member
+                        && member_is_callable(member)
+                        && member_has_receiver(member) == key.has_receiver
+                })
+                .eq(candidates.iter().copied());
         let disposition = if owner_model_is_ambiguous || candidate_model_is_ambiguous {
             SemanticModelCallableDisposition::Incomplete(
                 SemanticModelCallableIncompleteReason::AmbiguousModel,
             )
-        } else if (owner_model_is_partial && !callable_family_is_complete)
-            || candidate_model_is_partial
+        } else if !python_single_declaration_has_shape
+            && ((owner_model_is_partial && !callable_family_is_complete)
+                || candidate_model_is_partial)
         {
             SemanticModelCallableDisposition::Incomplete(
                 SemanticModelCallableIncompleteReason::PartialModel,
@@ -1958,6 +2210,49 @@ impl SemanticModelOverlay {
         SemanticModelCallableMatch {
             records: candidates,
             disposition,
+        }
+    }
+
+    /// Owners with the requested callable member are the only owners that can
+    /// make a callable lookup ambiguous. A generated C header module and a
+    /// typedef or class may deliberately share a qualified name (for example
+    /// `sqlite3`); the unrelated type must not conflict with the module's
+    /// file-scope function declarations. If no owner publishes that member,
+    /// retain the exact owners so their partial coverage cannot become an
+    /// empty, complete callable result.
+    fn callable_owner_candidates(
+        &self,
+        key: SemanticModelCallableKey<'_>,
+    ) -> Vec<&SemanticModelSymbol> {
+        let owners = self
+            .symbols_named(key.owner)
+            .records
+            .into_iter()
+            .filter(|owner| {
+                owner.owner_id.is_none()
+                    && owner.qualified_name == key.owner
+                    && owner.language == key.language
+            })
+            .collect::<Vec<_>>();
+        let matching = owners
+            .iter()
+            .copied()
+            .filter(|owner| {
+                self.members_of(&owner.id)
+                    .records
+                    .into_iter()
+                    .any(|member| {
+                        member.language == key.language
+                            && member.name == key.member
+                            && member_is_callable(member)
+                            && member_has_receiver(member) == key.has_receiver
+                    })
+            })
+            .collect::<Vec<_>>();
+        if matching.is_empty() {
+            owners
+        } else {
+            matching
         }
     }
 
@@ -2116,7 +2411,21 @@ impl SemanticModelOverlay {
             .iter()
             .any(|relation| relation.provenance.ambiguous);
         for relation in hierarchy {
-            let resolved = self.resolve_edge_target(&relation.to, &symbol.language);
+            let target = self.ancestry_target_name(symbol, &relation.to);
+            // Declaration IDs are not module-relative names.
+            let target = if self.symbols_with_id(&relation.to).records.is_empty() {
+                target.as_ref()
+            } else {
+                &relation.to
+            };
+            // The label does not name the target's kind. A pack records a
+            // supertype by name, and each producer labels its own way: the JVM
+            // external packs call a trait or interface supertype `extends`, and
+            // Rust calls a trait implementation `implements`. The target is a
+            // type either way, so ask for that and let the language's own kind
+            // decide the rest.
+            let resolved =
+                self.resolve_edge_target(target, &symbol.language, HierarchyTargetShape::Type);
             conflict |= resolved.defect == Some(SemanticModelEdgeDefect::Ambiguous);
             if let Some(defect) = resolved.defect {
                 defects.push(SemanticModelUnresolvedEdge {
@@ -2135,7 +2444,8 @@ impl SemanticModelOverlay {
             && let Some(root_name) =
                 universal_root_name(symbol).filter(|root| *root != symbol.qualified_name)
         {
-            let resolved = self.resolve_edge_target(root_name, &symbol.language);
+            let resolved =
+                self.resolve_edge_target(root_name, &symbol.language, HierarchyTargetShape::Type);
             conflict |= resolved.defect == Some(SemanticModelEdgeDefect::Ambiguous);
             if let Some(defect) = resolved.defect {
                 defects.push(SemanticModelUnresolvedEdge {
@@ -2161,6 +2471,44 @@ impl SemanticModelOverlay {
         }
     }
 
+    /// Same-qualified-name class records describe one class. Prefer a complete
+    /// surface, then the smallest ID, as in external class identity (#4942).
+    pub(crate) fn class_representative<'a>(
+        &self,
+        records: impl IntoIterator<Item = &'a SemanticModelSymbol>,
+    ) -> Option<&'a SemanticModelSymbol> {
+        records.into_iter().min_by_key(|record| {
+            (
+                record.provenance.completeness != SemanticModelCompleteness::Complete,
+                &record.id,
+            )
+        })
+    }
+
+    /// Qualify a bare hierarchy-edge target through the declaring language's
+    /// own rule. A legacy Python pack records `class Child(Base)` as `Base`,
+    /// which means the `Base` in the declaring class's own module; every other
+    /// language's producer records a target that is already complete.
+    pub(crate) fn ancestry_target_name<'a>(
+        &self,
+        class: &SemanticModelSymbol,
+        target: &'a str,
+    ) -> std::borrow::Cow<'a, str> {
+        let qualified = Language::from_config_label(&class.language)
+            .and_then(crate::analyzer::languages::language_support)
+            .and_then(|support| {
+                support.qualified_hierarchy_target(
+                    class.locator_path.as_deref(),
+                    &class.qualified_name,
+                    target,
+                )
+            });
+        match qualified {
+            Some(qualified) => std::borrow::Cow::Owned(qualified),
+            None => target.into(),
+        }
+    }
+
     /// Resolve one hierarchy edge target to the declarations it names, and say
     /// whether that resolution is clean enough to carry a proof.
     ///
@@ -2179,8 +2527,16 @@ impl SemanticModelOverlay {
     /// qualified name does (#2958). Aliases also carry bare export spellings,
     /// which another language's pack can hold by coincidence, so an alias match
     /// counts only for the language that spelled the edge.
-    fn resolve_edge_target(&self, target: &str, language: &str) -> ResolvedEdgeTarget<'_> {
-        let by_id = self.symbols_with_id(target);
+    fn resolve_edge_target(
+        &self,
+        target: &str,
+        language: &str,
+        shape: HierarchyTargetShape,
+    ) -> ResolvedEdgeTarget<'_> {
+        let mut by_id = self.symbols_with_id(target);
+        by_id.records.retain(|record| {
+            shape.admits(record) && record.owner_id.is_none() && record.language == language
+        });
         if !by_id.records.is_empty() {
             return ResolvedEdgeTarget {
                 defect: (by_id.disposition == SemanticModelOverlayDisposition::Conflict)
@@ -2188,7 +2544,10 @@ impl SemanticModelOverlay {
                 records: by_id.records,
             };
         }
-        let by_name = self.symbols_named(target);
+        let mut by_name = self.symbols_named(target);
+        by_name.records.retain(|record| {
+            shape.admits(record) && record.owner_id.is_none() && record.language == language
+        });
         if by_name.records.is_empty() {
             return ResolvedEdgeTarget {
                 records: Vec::new(),
@@ -2205,6 +2564,29 @@ impl SemanticModelOverlay {
                         && record.aliases.iter().any(|alias| alias == target))
             })
             .collect::<Vec<_>>();
+        // Same-qualified-name class records describe one class (#4942), so a
+        // class base that several packs publish resolves to one representative
+        // instead of reading as ambiguous. The rule is about the group being
+        // class records, not about the edge's shape, because the generic pack
+        // path asks for any type and cannot say "class" on the caller's behalf.
+        if !exact.is_empty()
+            && exact
+                .iter()
+                .all(|record| record.kind == SemanticModelSymbolKind::Class)
+            && exact.iter().all(|record| {
+                !record.provenance.ambiguous
+                    && record.qualified_name == exact[0].qualified_name
+                    && record.language == language
+            })
+        {
+            return ResolvedEdgeTarget {
+                records: vec![
+                    self.class_representative(exact)
+                        .expect("exact class group is nonempty"),
+                ],
+                defect: None,
+            };
+        }
         match exact.as_slice() {
             [] => ResolvedEdgeTarget {
                 records: by_name.records,
@@ -2588,6 +2970,13 @@ fn binding_layouts_match(left: &Signature, right: &Signature) -> bool {
 }
 
 impl SemanticModelSymbol {
+    /// Whether the active declaration carries enough validated evidence to
+    /// bind one exact callable shape. Python CSMI shape evidence is independent
+    /// of native callable-family completeness.
+    pub fn has_complete_callable_shape_evidence(&self) -> bool {
+        self.callable_shape_evidence_complete
+    }
+
     /// Abstractness published by the declaration producer. Consumers must
     /// separately require complete, unambiguous declaration provenance.
     pub fn declaration_is_abstract(&self) -> bool {
@@ -2608,10 +2997,7 @@ impl SemanticModelSymbol {
     }
 
     pub fn externally_visible(&self) -> bool {
-        matches!(
-            self.visibility,
-            Visibility::Public | Visibility::Protected | Visibility::ProtectedInternal
-        )
+        self.visibility.is_externally_visible()
     }
 
     /// The structured callable signature, when the model published one.
@@ -2642,13 +3028,17 @@ impl SemanticModelSymbol {
     }
 }
 
-fn member_is_callable(symbol: &SemanticModelSymbol) -> bool {
+pub(crate) fn symbol_kind_is_callable(kind: SemanticModelSymbolKind) -> bool {
     matches!(
-        symbol.kind,
+        kind,
         SemanticModelSymbolKind::Constructor
             | SemanticModelSymbolKind::Method
             | SemanticModelSymbolKind::Function
     )
+}
+
+fn member_is_callable(symbol: &SemanticModelSymbol) -> bool {
+    symbol_kind_is_callable(symbol.kind)
 }
 
 fn member_has_receiver(symbol: &SemanticModelSymbol) -> bool {
@@ -2702,6 +3092,10 @@ fn universal_root_name(symbol: &SemanticModelSymbol) -> Option<&'static str> {
 }
 
 impl SemanticModelProvenance {
+    fn is_complete_and_unambiguous(&self) -> bool {
+        self.completeness == SemanticModelCompleteness::Complete && !self.ambiguous
+    }
+
     fn retained_string_bytes(&self) -> usize {
         let evidence = &self.activation.matched_evidence;
         self.active_model_set_hash
@@ -2844,10 +3238,12 @@ fn augment_go_overlay_surface(
 
     let mut promoted = Vec::new();
     let mut traversal_steps = 0usize;
-    for owner in type_indices.values().map(|index| &symbols[*index]) {
+    for &owner_index in type_indices.values() {
+        let owner = &symbols[owner_index];
         if cancellation.is_cancelled() {
             return Err(SemanticModelOverlayBuildError::Cancelled);
         }
+        let mut incomplete_embedded_surface = false;
         let mut resolved_names = direct_members
             .get(&owner.id)
             .into_iter()
@@ -2857,10 +3253,21 @@ fn augment_go_overlay_surface(
         let mut current = HashMap::<(String, bool), u8>::default();
         for embedded in &owner.embedded_types {
             if let Some(target) = overlay_declared_type_id(&embedded.target, &qualified_type_ids) {
+                if let Some(&target_index) = type_indices.get(&target) {
+                    if symbols[target_index].provenance.completeness
+                        != SemanticModelCompleteness::Complete
+                    {
+                        incomplete_embedded_surface = true;
+                    }
+                } else {
+                    incomplete_embedded_surface = true;
+                }
                 current
                     .entry((target, embedded.pointer))
                     .and_modify(|count| *count = 2)
                     .or_insert(1);
+            } else {
+                incomplete_embedded_surface = true;
             }
         }
         let mut seen_depth = HashMap::<(String, bool), usize>::default();
@@ -2893,14 +3300,25 @@ fn augment_go_overlay_surface(
                     }
                 }
                 let Some(&embedded_index) = type_indices.get(&type_id) else {
+                    incomplete_embedded_surface = true;
                     continue;
                 };
                 for embedded in &symbols[embedded_index].embedded_types {
                     let Some(target) =
                         overlay_declared_type_id(&embedded.target, &qualified_type_ids)
                     else {
+                        incomplete_embedded_surface = true;
                         continue;
                     };
+                    let Some(&target_index) = type_indices.get(&target) else {
+                        incomplete_embedded_surface = true;
+                        continue;
+                    };
+                    if symbols[target_index].provenance.completeness
+                        != SemanticModelCompleteness::Complete
+                    {
+                        incomplete_embedded_surface = true;
+                    }
                     let state = (target, pointer_available || embedded.pointer);
                     match seen_depth.get(&state).copied() {
                         Some(previous) if previous < depth + 1 => continue,
@@ -2933,6 +3351,9 @@ fn augment_go_overlay_surface(
             }
             current = next;
             depth += 1;
+        }
+        if incomplete_embedded_surface {
+            symbols[owner_index].provenance.completeness = SemanticModelCompleteness::Partial;
         }
     }
     symbols.extend(promoted);
@@ -3007,7 +3428,12 @@ fn augment_go_overlay_surface(
                 || !required_methods.iter().all(|required| {
                     candidate_methods.iter().any(|method| {
                         !method.receiver.is_some_and(|receiver| receiver.pointer)
-                            && overlay_go_method_matches(method, required)
+                            && go_method_signatures_match(
+                                &method.name,
+                                method.structured_signature.as_ref(),
+                                &required.name,
+                                required.structured_signature.as_ref(),
+                            )
                     })
                 })
             {
@@ -3033,6 +3459,9 @@ fn overlay_declared_type_id(
     reference: &TypeRef,
     qualified_type_ids: &HashMap<String, String>,
 ) -> Option<String> {
+    if reference.contains_unknown() {
+        return None;
+    }
     match reference {
         TypeRef::Declared { id, .. } => Some(id.clone()),
         TypeRef::Named { name, .. } => qualified_type_ids.get(name).cloned(),
@@ -3041,30 +3470,31 @@ fn overlay_declared_type_id(
     }
 }
 
-fn overlay_go_method_matches(
-    candidate: &SemanticModelSymbol,
-    required: &SemanticModelSymbol,
+pub(crate) fn go_method_signatures_match(
+    candidate_name: &str,
+    candidate: Option<&Signature>,
+    required_name: &str,
+    required: Option<&Signature>,
 ) -> bool {
-    if candidate.name != required.name {
+    if candidate_name != required_name {
         return false;
     }
-    match (
-        candidate.structured_signature.as_ref(),
-        required.structured_signature.as_ref(),
-    ) {
-        (Some(candidate), Some(required)) => {
-            candidate.type_parameters.len() == required.type_parameters.len()
-                && candidate.parameters.len() == required.parameters.len()
-                && candidate.parameters.iter().zip(&required.parameters).all(
-                    |(candidate, required)| {
-                        candidate.r#type == required.r#type
-                            && candidate.variadic == required.variadic
-                    },
-                )
-                && candidate.returns == required.returns
-        }
-        _ => false,
+    let (Some(candidate), Some(required)) = (candidate, required) else {
+        return false;
+    };
+    if candidate.contains_unknown_types() || required.contains_unknown_types() {
+        return false;
     }
+    candidate.type_parameters.len() == required.type_parameters.len()
+        && candidate.parameters.len() == required.parameters.len()
+        && candidate
+            .parameters
+            .iter()
+            .zip(&required.parameters)
+            .all(|(candidate, required)| {
+                candidate.r#type == required.r#type && candidate.variadic == required.variadic
+            })
+        && candidate.returns == required.returns
 }
 
 pub const SEMANTIC_MODEL_MATCH_EXPLANATION_FORMAT: &str =
@@ -3728,8 +4158,7 @@ pub fn run_semantic_model_conformance(
                     .starts_with(&expected.location_prefix)
                 && symbol.provenance.pack_id == expected.pack_id
                 && symbol.provenance.rule_id == expected.rule_id
-                && semantic_completeness_name(symbol.provenance.completeness)
-                    == expected.completeness
+                && symbol.provenance.completeness.label() == expected.completeness
         });
         if !matched {
             report
@@ -3824,13 +4253,6 @@ pub fn run_semantic_model_conformance(
     }
     report.passed = report.complete && report.failures.is_empty();
     report
-}
-
-fn semantic_completeness_name(completeness: SemanticModelCompleteness) -> &'static str {
-    match completeness {
-        SemanticModelCompleteness::Partial => "partial",
-        SemanticModelCompleteness::Complete => "complete",
-    }
 }
 
 struct GeneratedOverlayFacts {
@@ -4016,13 +4438,13 @@ fn rule_trigger_matches(
                 })
         }
         RuleTrigger::MacroInvocation { name: expected } => {
-            node.kind == NormalizedKind::Call
+            node.kind.satisfies(NormalizedKind::Call)
                 && (crate::analyzer::common::language_for_file(file) != Language::Rust
                     || node.construct.as_deref() == Some("rust_macro_invocation"))
                 && name.is_some_and(|actual| exact_trigger_name_matches(expected, actual))
         }
         RuleTrigger::GeneratorInvocation { name: expected } => {
-            node.kind == NormalizedKind::Call
+            node.kind.satisfies(NormalizedKind::Call)
                 && name.is_some_and(|actual| exact_trigger_name_matches(expected, actual))
         }
         RuleTrigger::ResolvedOwner { .. } | RuleTrigger::ResolvedCall { .. } => false,
@@ -4464,18 +4886,18 @@ fn span_anchor(
     span: crate::analyzer::structural::Span,
     enclosing: Option<&CodeUnit>,
 ) -> SemanticModelAuthoredAnchor {
-    SemanticModelAuthoredAnchor {
-        path: file.rel_path().to_string_lossy().replace('\\', "/"),
-        symbol: enclosing
+    make_authored_anchor(
+        file.rel_path(),
+        enclosing
             .map(CodeUnit::fq_name)
             .unwrap_or_else(|| span.text(facts.source()).to_owned()),
-        range: SemanticModelRange {
+        SemanticModelRange {
             start_byte: span.start_byte,
             end_byte: span.end_byte,
             start_line: facts.line_of_byte(span.start_byte),
             end_line: facts.line_of_byte(span.end_byte),
         },
-    }
+    )
 }
 
 fn code_unit_anchor(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> SemanticModelAuthoredAnchor {
@@ -4483,19 +4905,27 @@ fn code_unit_anchor(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> SemanticModelA
         .ranges(unit)
         .into_iter()
         .min_by_key(|range| (range.start_line, range.start_byte));
-    SemanticModelAuthoredAnchor {
-        path: unit
-            .source()
-            .rel_path()
-            .to_string_lossy()
-            .replace('\\', "/"),
-        symbol: unit.fq_name(),
-        range: range.map(Into::into).unwrap_or(SemanticModelRange {
+    make_authored_anchor(
+        unit.source().rel_path(),
+        unit.fq_name(),
+        range.map(Into::into).unwrap_or(SemanticModelRange {
             start_byte: 0,
             end_byte: 0,
             start_line: 0,
             end_line: 0,
         }),
+    )
+}
+
+fn make_authored_anchor(
+    path: &Path,
+    symbol: String,
+    range: SemanticModelRange,
+) -> SemanticModelAuthoredAnchor {
+    SemanticModelAuthoredAnchor {
+        path: path.to_string_lossy().replace('\\', "/"),
+        symbol,
+        range,
     }
 }
 
@@ -4652,7 +5082,9 @@ fn emit_rule_match(
                         structured_signature: None,
                         has_explicit_type_terms: false,
                         callable_shape: None,
+                        callable_shape_evidence_complete: false,
                         callable_family_complete: false,
+                        exact_return_classes: Vec::new(),
                         aliases: Vec::new(),
                         type_parameter_constraints: Vec::new(),
                         underlying_type: None,
@@ -4663,6 +5095,8 @@ fn emit_rule_match(
                         explicit_operation: None,
                         extension_receiver: None,
                         extension_receiver_constraints: Vec::new(),
+                        value_type: None,
+                        proxied_type: None,
                         locator_path: None,
                         locator_symbol: None,
                         rust_generated_scope: None,
@@ -4686,6 +5120,12 @@ fn emit_rule_match(
                             }
                             None => None,
                         };
+                        let structured_signature = signature
+                            .as_ref()
+                            .and_then(|signature| evaluate_template_signature(signature, captures));
+                        let callable_shape_evidence_complete = structured_signature
+                            .as_ref()
+                            .is_some_and(signature_has_complete_callable_shape);
                         SemanticModelSymbol {
                             non_overridable: None,
                             ambient_use: None,
@@ -4706,14 +5146,14 @@ fn emit_rule_match(
                             signature: signature.as_ref().and_then(|signature| {
                                 render_template_signature(&name, signature, captures)
                             }),
-                            structured_signature: signature.as_ref().and_then(|signature| {
-                                evaluate_template_signature(signature, captures)
-                            }),
+                            structured_signature,
                             has_explicit_type_terms: false,
                             callable_shape: signature.as_ref().and_then(|signature| {
                                 render_template_callable_shape(signature, captures)
                             }),
+                            callable_shape_evidence_complete,
                             callable_family_complete: false,
+                            exact_return_classes: Vec::new(),
                             aliases: Vec::new(),
                             type_parameter_constraints: Vec::new(),
                             underlying_type: None,
@@ -4722,6 +5162,8 @@ fn emit_rule_match(
                             receiver: None,
                             implicit_operation: None,
                             explicit_operation: None,
+                            value_type: None,
+                            proxied_type: None,
                             extension_receiver: None,
                             extension_receiver_constraints: Vec::new(),
                             locator_path: None,
@@ -4882,15 +5324,7 @@ fn render_template_signature(
     let mut parameters = signature
         .parameters
         .iter()
-        .map(|parameter| {
-            Some(format!(
-                "{}: {}{}{}",
-                evaluate_template(&parameter.name, captures)?,
-                render_template_type(&parameter.r#type, captures)?,
-                if parameter.optional { "?" } else { "" },
-                if parameter.variadic { "..." } else { "" },
-            ))
-        })
+        .map(|parameter| render_template_parameter(parameter, captures))
         .collect::<Option<Vec<_>>>()?;
     parameters.extend(render_repeated_parameters(signature, captures)?);
     let returns = match &signature.returns {
@@ -4898,6 +5332,29 @@ fn render_template_signature(
         None => String::new(),
     };
     Some(format!("{name}({}){returns}", parameters.join(", ")))
+}
+
+fn render_template_parameter(
+    parameter: &TemplateParameter,
+    captures: &GeneratorRuleMatch,
+) -> Option<String> {
+    Some(format!(
+        "{}: {}",
+        evaluate_template(&parameter.name, captures)?,
+        render_template_parameter_type(parameter, captures)?,
+    ))
+}
+
+fn render_template_parameter_type(
+    parameter: &TemplateParameter,
+    captures: &GeneratorRuleMatch,
+) -> Option<String> {
+    Some(format!(
+        "{}{}{}",
+        render_template_type(&parameter.r#type, captures)?,
+        if parameter.optional { "?" } else { "" },
+        if parameter.variadic { "..." } else { "" },
+    ))
 }
 
 fn evaluate_template_signature(
@@ -4913,6 +5370,7 @@ fn evaluate_template_signature(
                 r#type: evaluate_template_type(&parameter.r#type, captures)?,
                 optional: parameter.optional,
                 variadic: parameter.variadic,
+                role: None,
                 passing_mode: Default::default(),
             })
         })
@@ -4924,6 +5382,7 @@ fn evaluate_template_signature(
                 r#type: evaluate_template_type(&parameter.r#type, &row)?,
                 optional: parameter.optional,
                 variadic: parameter.variadic,
+                role: None,
                 passing_mode: Default::default(),
             });
         }
@@ -4981,29 +5440,16 @@ fn render_template_callable_shape(
     let mut parameters = signature
         .parameters
         .iter()
-        .map(|parameter| {
-            Some(format!(
-                "{}{}{}",
-                render_template_type(&parameter.r#type, captures)?,
-                if parameter.optional { "?" } else { "" },
-                if parameter.variadic { "..." } else { "" },
-            ))
-        })
+        .map(|parameter| render_template_parameter_type(parameter, captures))
         .collect::<Option<Vec<_>>>()?;
     for row in repeated_parameter_rows(signature, captures)? {
         for parameter in &signature.repeated_parameters {
-            parameters.push(format!(
-                "{}{}{}",
-                render_template_type(&parameter.r#type, &row)?,
-                if parameter.optional { "?" } else { "" },
-                if parameter.variadic { "..." } else { "" },
-            ));
+            parameters.push(render_template_parameter_type(parameter, &row)?);
         }
     }
-    Some(format!(
-        "{}<{}>",
+    Some(render_callable_shape_from_parts(
         signature.type_parameters.len(),
-        parameters.join(",")
+        parameters,
     ))
 }
 
@@ -5045,13 +5491,7 @@ fn render_repeated_parameters(
     let mut rendered = Vec::new();
     for row in repeated_parameter_rows(signature, captures)? {
         for parameter in &signature.repeated_parameters {
-            rendered.push(format!(
-                "{}: {}{}{}",
-                evaluate_template(&parameter.name, &row)?,
-                render_template_type(&parameter.r#type, &row)?,
-                if parameter.optional { "?" } else { "" },
-                if parameter.variadic { "..." } else { "" },
-            ));
+            rendered.push(render_template_parameter(parameter, &row)?);
         }
     }
     Some(rendered)
@@ -5126,7 +5566,9 @@ fn type_symbol(
         structured_signature: None,
         has_explicit_type_terms: record.has_explicit_type_terms,
         callable_shape: None,
+        callable_shape_evidence_complete: false,
         callable_family_complete: false,
+        exact_return_classes: Vec::new(),
         aliases: record.aliases.clone(),
         type_parameter_constraints: record.type_parameter_constraints.clone(),
         underlying_type: record.underlying_type.clone(),
@@ -5136,6 +5578,8 @@ fn type_symbol(
         implicit_operation: None,
         explicit_operation: None,
         ambient_use: record.ambient_use,
+        value_type: None,
+        proxied_type: None,
         extension_receiver: None,
         extension_receiver_constraints: Vec::new(),
         locator_path: Some(locator_path(&record.locator).to_owned()),
@@ -5193,8 +5637,14 @@ fn member_symbol(
             .map(|signature| render_signature(&record.name, signature)),
         structured_signature: record.signature.clone(),
         has_explicit_type_terms: false,
-        callable_shape: record.signature.as_ref().map(render_callable_shape),
+        callable_shape: record
+            .signature
+            .as_ref()
+            .filter(|signature| !signature.contains_unknown_types())
+            .map(render_callable_shape),
+        callable_shape_evidence_complete: member_callable_shape_evidence_complete(record),
         callable_family_complete: record.callable_family_complete,
+        exact_return_classes: record.exact_return_classes.clone(),
         aliases: record.aliases.clone(),
         type_parameter_constraints: Vec::new(),
         underlying_type: None,
@@ -5204,6 +5654,8 @@ fn member_symbol(
         implicit_operation: record.implicit_operation.clone(),
         explicit_operation: record.explicit_operation,
         ambient_use: record.ambient_use,
+        value_type: record.value_type.clone(),
+        proxied_type: record.proxied_type.clone(),
         extension_receiver: record.extension_receiver.clone(),
         extension_receiver_constraints: record.extension_receiver_constraints.clone(),
         locator_path: Some(locator_path(&record.locator).to_owned()),
@@ -5221,12 +5673,49 @@ fn member_symbol(
     }
 }
 
-fn locator_path(locator: &Locator) -> &str {
-    match locator {
-        Locator::Source { path, .. }
-        | Locator::Artifact { path, .. }
-        | Locator::Interchange { path, .. } => path,
+fn member_callable_shape_evidence_complete(record: &MemberFact) -> bool {
+    let Some(signature) = record.signature.as_ref() else {
+        return false;
+    };
+    if !signature_has_complete_callable_shape(signature) {
+        return false;
     }
+    match &record.locator {
+        Locator::Interchange {
+            symbol,
+            callable_shape_evidence: Some(evidence),
+            ..
+        } => {
+            evidence.statement.family == "declaration-aspects"
+                && evidence.statement.status == super::csmi::CsmiCoverageStatus::Complete
+                && evidence
+                    .statement
+                    .scope
+                    .get("symbol")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(symbol.as_str())
+                && evidence
+                    .statement
+                    .scope
+                    .get("aspect")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("callable-shape")
+                && evidence.statement.limitations.is_empty()
+                && evidence.statement.extensions.is_empty()
+        }
+        Locator::Interchange {
+            callable_shape_evidence: None,
+            ..
+        } => false,
+        _ => true,
+    }
+}
+
+fn signature_has_complete_callable_shape(signature: &Signature) -> bool {
+    signature
+        .parameters
+        .iter()
+        .all(|parameter| parameter.name.is_some())
 }
 
 fn locator_symbol(locator: &Locator) -> Option<&str> {
@@ -5260,6 +5749,9 @@ fn hierarchy_relation(
     hierarchy: &HierarchyFact,
     ambiguous: bool,
 ) -> SemanticModelRelation {
+    // Schema validation rejects unknown hierarchy targets, which must never
+    // be converted into a rendered edge identity.
+    debug_assert!(!hierarchy.target.contains_unknown());
     let target = match &hierarchy.target {
         TypeRef::Declared { id, .. } => id.clone(),
         TypeRef::Named { name, .. } => name.clone(),
@@ -5475,7 +5967,7 @@ fn origin(shard: &ActiveSemanticModelShard, locator: Option<&Locator>) -> Semant
     }
 }
 
-fn matched_evidence(
+pub(crate) fn matched_evidence(
     evidence: &super::SemanticModelActivationEvidence,
 ) -> SemanticModelMatchedEvidence {
     SemanticModelMatchedEvidence {
@@ -5576,13 +6068,20 @@ fn render_callable_shape(signature: &super::Signature) -> String {
                 if parameter.variadic { "..." } else { "" },
             )
         })
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("{}<{parameters}>", signature.type_parameters.len())
+        .collect::<Vec<_>>();
+    render_callable_shape_from_parts(signature.type_parameters.len(), parameters)
+}
+
+fn render_callable_shape_from_parts(
+    type_parameter_count: usize,
+    parameters: Vec<String>,
+) -> String {
+    format!("{type_parameter_count}<{}>", parameters.join(","))
 }
 
 fn render_type_ref(reference: &TypeRef) -> String {
     match reference {
+        TypeRef::Unknown => "<unknown>".to_owned(),
         TypeRef::Named {
             name,
             arguments,
@@ -5675,8 +6174,10 @@ pub(crate) mod tests {
     use crate::analyzer::Language;
     use crate::analyzer::semantic_model::ParameterPassingMode;
     use crate::test_support::AnalyzerFixture;
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
+    #[hardwon("#2634: unavailable dependency source locations lost their durable model anchor")]
     fn unavailable_dependency_source_uses_a_durable_model_location() {
         let fixture = AnalyzerFixture::new_for_language(
             Language::Java,
@@ -5700,6 +6201,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[hardwon("#2634: carried source locations lost the authored declaration anchor")]
     fn carried_dependency_source_preserves_the_authored_anchor() {
         let fixture = AnalyzerFixture::new_for_language(
             Language::Java,
@@ -5816,6 +6318,34 @@ pub(crate) mod tests {
         );
         string.receiver = Some(ReceiverFact { pointer: false });
 
+        let mut sync_package = class("sync", "go");
+        sync_package.kind = SemanticModelSymbolKind::Module;
+        sync_package.visibility = Visibility::Package;
+        sync_package.aliases = vec!["sync".to_owned()];
+        let mut once = class("sync.Once", "go");
+        once.kind = SemanticModelSymbolKind::Struct;
+        let mut once_do = method(
+            &once,
+            "sync.Once.Do",
+            "Do",
+            Some(signature(&[Some("f")], false)),
+        );
+        once_do.receiver = Some(ReceiverFact { pointer: true });
+
+        let mut embed_package = class("embed", "go");
+        embed_package.kind = SemanticModelSymbolKind::Module;
+        embed_package.visibility = Visibility::Package;
+        embed_package.aliases = vec!["embed".to_owned()];
+        let mut embed_fs = class("embed.FS", "go");
+        embed_fs.kind = SemanticModelSymbolKind::Struct;
+        let mut embed_open = method(
+            &embed_fs,
+            "embed.FS.Open",
+            "Open",
+            Some(signature(&[Some("name")], false)),
+        );
+        embed_open.receiver = Some(ReceiverFact { pointer: false });
+
         std::sync::Arc::new(overlay(
             vec![
                 strings_package,
@@ -5830,6 +6360,12 @@ pub(crate) mod tests {
                 image_package,
                 point,
                 string,
+                sync_package,
+                once,
+                once_do,
+                embed_package,
+                embed_fs,
+                embed_open,
             ],
             Vec::new(),
         ))
@@ -5896,6 +6432,58 @@ pub(crate) mod tests {
         assert_eq!(conflict.records.len(), 2);
     }
 
+    pub(crate) fn go_callback_source_field_test_overlay(
+        artifact_sha256: &str,
+    ) -> SemanticModelOverlay {
+        let mut overlay =
+            go_callback_field_test_overlay(artifact_sha256, Visibility::Public, false);
+        for symbol in &mut overlay.symbols {
+            symbol.locator_path = Some("api.go".to_owned());
+            symbol.locator_symbol = Some(if symbol.owner_id.is_none() {
+                "example.test/ssh.Config".to_owned()
+            } else {
+                "example.test/ssh.Config.Callback".to_owned()
+            });
+        }
+        overlay
+    }
+
+    pub(crate) fn go_callback_field_test_overlay(
+        artifact_sha256: &str,
+        field_visibility: Visibility,
+        conflict: bool,
+    ) -> SemanticModelOverlay {
+        let mut owner = class("example.test/ssh.Config", "go");
+        owner.kind = SemanticModelSymbolKind::Struct;
+        let mut callback = field(&owner, "field.callback", "Callback");
+        callback.structured_signature = Some(Signature {
+            type_parameters: Vec::new(),
+            parameters: Vec::new(),
+            returns: Some(TypeRef::Function {
+                parameters: Vec::new(),
+                result: None,
+            }),
+        });
+        callback.visibility = field_visibility;
+        for record in [&mut owner, &mut callback] {
+            record.provenance.proof = SemanticModelProof::ExactArtifact;
+            record.provenance.activation.matched_evidence.language = "go".to_owned();
+            record
+                .provenance
+                .activation
+                .matched_evidence
+                .artifact_sha256 = Some(artifact_sha256.to_owned());
+        }
+        let mut records = vec![owner, callback];
+        if conflict {
+            let mut other = records[1].clone();
+            other.id = "other.callback".to_owned();
+            other.provenance.pack_digest = "other pack".to_owned();
+            records.push(other);
+        }
+        overlay(records, Vec::new())
+    }
+
     fn provenance(completeness: SemanticModelCompleteness) -> SemanticModelProvenance {
         SemanticModelProvenance {
             active_model_set_hash: "test".to_string(),
@@ -5955,7 +6543,9 @@ pub(crate) mod tests {
             structured_signature: None,
             has_explicit_type_terms: false,
             callable_shape: None,
+            callable_shape_evidence_complete: false,
             callable_family_complete: false,
+            exact_return_classes: Vec::new(),
             aliases: Vec::new(),
             type_parameter_constraints: Vec::new(),
             underlying_type: None,
@@ -5964,6 +6554,8 @@ pub(crate) mod tests {
             receiver: None,
             implicit_operation: None,
             explicit_operation: None,
+            value_type: None,
+            proxied_type: None,
             extension_receiver: None,
             extension_receiver_constraints: Vec::new(),
             locator_path: None,
@@ -5983,6 +6575,9 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "6ecf92322c56: Ruby constructor results used receiver instead of declared return type"
+    )]
     fn ruby_constructor_result_uses_the_declared_type_instead_of_the_receiver() {
         use crate::analyzer::ruby::constant_identity::RubyOverlayConstants;
 
@@ -6062,6 +6657,71 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    #[hardwon("#4619: a colliding class alias hid the canonical open() return class")]
+    fn type_flow_external_class_identity_prefers_exact_names_and_resolves_unique_aliases() {
+        use crate::analyzer::semantic::type_flow::{ExternalClassCache, external_class_identity};
+
+        let mut alias = class("_io.TextIOWrapper", "python");
+        alias.aliases.push("io.TextIOWrapper".to_string());
+        let canonical = class("io.TextIOWrapper", "python");
+        let model = overlay(vec![alias, canonical], Vec::new());
+        let exact = external_class_identity(
+            Some(&model),
+            Language::Python,
+            "io.TextIOWrapper",
+            None,
+            &mut ExternalClassCache::default(),
+        )
+        .expect("a canonical class name wins over another class's alias");
+        assert_eq!(exact.qualified_name(), "io.TextIOWrapper");
+
+        let mut lock = class("_thread.LockType", "python");
+        lock.aliases.push("threading.Lock".to_string());
+        let model = overlay(vec![lock], Vec::new());
+        let alias = external_class_identity(
+            Some(&model),
+            Language::Python,
+            "threading.Lock",
+            None,
+            &mut ExternalClassCache::default(),
+        )
+        .expect("a unique class record resolves through its published alias");
+        assert_eq!(alias.qualified_name(), "_thread.LockType");
+    }
+
+    #[test]
+    #[hardwon("#4619: a same-module short base name blocked inherited __exit__ lookup")]
+    fn python_external_member_lookup_resolves_unqualified_bases_in_the_stub_module() {
+        let mut base = class("_io._IOBase", "python");
+        base.locator_path = Some("_io.pyi".to_string());
+        let mut derived = class("_io._BufferedIOBase", "python");
+        derived.locator_path = Some("_io.pyi".to_string());
+        let exit = method(
+            &base,
+            "member.io-base-exit",
+            "__exit__",
+            Some(Signature {
+                type_parameters: Vec::new(),
+                parameters: Vec::new(),
+                returns: Some(TypeRef::Named {
+                    name: "None".to_string(),
+                    arguments: Vec::new(),
+                    nullable: true,
+                }),
+            }),
+        );
+        let model = overlay(
+            vec![base.clone(), derived.clone(), exit],
+            vec![extends(&derived, "_IOBase")],
+        );
+
+        let declaration =
+            crate::analyzer::python_external_member_declaration(&model, &derived.id, "__exit__")
+                .expect("the declared same-module base contributes its effective method");
+        assert_eq!(declaration.qualified_name, "_io._IOBase.__exit__");
+    }
+
     fn extends(from: &SemanticModelSymbol, to: &str) -> SemanticModelRelation {
         SemanticModelRelation {
             id: format!("hierarchy:{}:extends:{to}", from.id),
@@ -6119,7 +6779,9 @@ pub(crate) mod tests {
             structured_signature: signature,
             has_explicit_type_terms: false,
             callable_shape: None,
+            callable_shape_evidence_complete: false,
             callable_family_complete: false,
+            exact_return_classes: Vec::new(),
             aliases: Vec::new(),
             type_parameter_constraints: Vec::new(),
             underlying_type: None,
@@ -6128,6 +6790,8 @@ pub(crate) mod tests {
             receiver: None,
             implicit_operation: None,
             explicit_operation: None,
+            value_type: None,
+            proxied_type: None,
             extension_receiver: None,
             extension_receiver_constraints: Vec::new(),
             locator_path: None,
@@ -6148,6 +6812,10 @@ pub(crate) mod tests {
             .structured_signature
             .as_ref()
             .map(render_callable_shape);
+        symbol.callable_shape_evidence_complete = symbol
+            .structured_signature
+            .as_ref()
+            .is_some_and(signature_has_complete_callable_shape);
         symbol
     }
 
@@ -6200,6 +6868,7 @@ pub(crate) mod tests {
                         },
                         optional: false,
                         variadic: variadic && ordinal + 1 == names.len(),
+                        role: None,
                         passing_mode: Default::default(),
                     },
                 )
@@ -6217,6 +6886,35 @@ pub(crate) mod tests {
         parameter_count: u32,
     ) -> SemanticModelCallableMatch<'_> {
         overlay.callable_for_target(callable_key(parameter_count))
+    }
+
+    #[test]
+    fn callable_lookup_ignores_an_unrelated_same_named_owner() {
+        let mut header = class("sqlite3", "cpp");
+        header.id = "module.sqlite3".to_string();
+        header.kind = SemanticModelSymbolKind::Module;
+        let typedef = class("sqlite3", "cpp");
+        let mut function = method(
+            &header,
+            "member.sqlite3.sqlite3_exec",
+            "sqlite3_exec",
+            Some(signature(&[Some("sql")], false)),
+        );
+        function.kind = SemanticModelSymbolKind::Function;
+        function.is_static = true;
+        function.receiver = None;
+        let overlay = overlay(vec![header, typedef, function], Vec::new());
+        let key = SemanticModelCallableKey::new("cpp", "sqlite3", "sqlite3_exec", false, 1);
+
+        let result =
+            overlay.callable_for_application(key, &SemanticModelCallApplication::positional(1));
+
+        assert_eq!(result.disposition, SemanticModelCallableDisposition::Unique);
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(
+            overlay.callable_family_id_for_target(key),
+            Some(result.records[0].id.clone())
+        );
     }
 
     fn go_package_function(
@@ -6241,28 +6939,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn external_callable_lookup_returns_the_structured_signature() {
-        let owner = class("pkg.Owner", "java");
-        let member = method(
-            &owner,
-            "member.run",
-            "run",
-            Some(signature(&[Some("value")], false)),
-        );
-        let overlay = overlay(vec![owner, member], Vec::new());
-
-        let result = lookup(&overlay, 1);
-
-        assert_eq!(result.disposition, SemanticModelCallableDisposition::Unique);
-        let selected = result.unique().expect("one exact callable");
-        assert_eq!(
-            selected.structured_signature().unwrap().parameters[0].name,
-            Some("value".to_string())
-        );
-        assert!(selected.has_receiver());
-    }
-
-    #[test]
+    #[hardwon("#3312: same-arity Java overloads selected by argument layout")]
     fn external_callable_lookup_keeps_same_arity_overloads_layout_compatible() {
         let mut owner = class("pkg.Owner", "java");
         owner.provenance.completeness = SemanticModelCompleteness::Partial;
@@ -6413,6 +7090,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[hardwon("#3312: same-layout overloads with different formal names were conflated")]
     fn external_callable_application_keeps_different_formal_names_in_one_layout() {
         let owner = class("pkg.Owner", "java");
         let first = method(
@@ -6481,28 +7159,45 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn external_callable_application_keeps_spread_incomplete() {
-        let owner = class("pkg.Owner", "java");
-        let member = method(
+    fn generated_c_variadic_function_uses_qualified_family_identity() {
+        let mut owner = class("fcntl", "cpp");
+        owner.kind = SemanticModelSymbolKind::Module;
+        let mut member = method(
             &owner,
-            "member.run",
-            "run",
-            Some(signature(&[Some("values")], true)),
+            "member.content-derived-digest",
+            "open",
+            Some(signature(
+                &[Some("path"), Some("flags"), Some("args")],
+                true,
+            )),
         );
-        let overlay = overlay(vec![owner, member], Vec::new());
-        let application = SemanticModelCallApplication::structured(0, Vec::new(), true);
+        member.kind = SemanticModelSymbolKind::Function;
+        member.is_static = true;
+        member.provenance.origin = SemanticModelOriginKind::ExactGeneratedOutput;
+        member.provenance.completeness = SemanticModelCompleteness::Partial;
+        member.provenance.activation.matched_evidence.language = "cpp".to_owned();
 
+        let overlay = overlay(vec![owner, member], Vec::new());
+        let records = overlay
+            .symbols_named("fcntl.open")
+            .records
+            .into_iter()
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 1);
+        assert!(!records[0].callable_family_complete);
+        assert_eq!(records[0].id, "member.content-derived-digest");
         assert_eq!(
-            overlay
-                .callable_for_application(callable_key(1), &application)
-                .disposition,
-            SemanticModelCallableDisposition::Incomplete(
-                SemanticModelCallableIncompleteReason::UnexpandedSpread
-            )
+            semantic_model_callable_family_id(&records),
+            Some("fcntl.open".to_owned())
+        );
+        assert_eq!(
+            overlay.callable_family_id_for_symbol(records[0]),
+            Some("fcntl.open".to_owned())
         );
     }
 
     #[test]
+    #[hardwon("ae5ec7304945: callable owner filtering hid partial sibling coverage")]
     fn external_callable_lookup_uses_scoped_completeness_without_promoting_provenance() {
         let mut owner = class("pkg.Owner", "java");
         owner.provenance.completeness = SemanticModelCompleteness::Partial;
@@ -6527,6 +7222,18 @@ pub(crate) mod tests {
             selected.provenance.completeness,
             SemanticModelCompleteness::Partial,
             "the family claim must not promote pack provenance"
+        );
+        assert_eq!(
+            claimed_overlay
+                .callable_for_application(
+                    SemanticModelCallableKey::new("java", "pkg.Owner", "unmodeled", true, 1),
+                    &SemanticModelCallApplication::positional(1),
+                )
+                .disposition,
+            SemanticModelCallableDisposition::Incomplete(
+                SemanticModelCallableIncompleteReason::PartialModel
+            ),
+            "a scoped callable claim does not close an unmodeled sibling name"
         );
 
         claimed.callable_family_complete = false;
@@ -6592,46 +7299,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn external_callable_lookup_preserves_variadic_metadata_for_the_binder() {
-        let owner = class("pkg.Owner", "java");
-        let member = method(
-            &owner,
-            "member.run.variadic",
-            "run",
-            Some(signature(&[Some("values")], true)),
-        );
-        let overlay = overlay(vec![owner, member], Vec::new());
-
-        let result = lookup(&overlay, 1);
-
-        assert_eq!(result.disposition, SemanticModelCallableDisposition::Unique);
-        assert!(
-            result
-                .unique()
-                .unwrap()
-                .structured_signature()
-                .unwrap()
-                .parameters[0]
-                .variadic
-        );
-
-        let repeated = lookup(&overlay, 3);
-        assert_eq!(
-            repeated.disposition,
-            SemanticModelCallableDisposition::Unique
-        );
-        assert!(
-            repeated
-                .unique()
-                .unwrap()
-                .structured_signature()
-                .unwrap()
-                .parameters[0]
-                .variadic
-        );
-    }
-
-    #[test]
+    #[hardwon("#2482: exact declared arity lost to a variadic fallback")]
     fn external_callable_lookup_prefers_declared_arity_over_variadic_fallback() {
         let owner = class("pkg.Owner", "java");
         let variadic = method(
@@ -6690,40 +7358,6 @@ pub(crate) mod tests {
                 .visible_symbol("example.com/external.Widget")
                 .is_none(),
             "one individually ambiguous record is not visible"
-        );
-    }
-
-    #[test]
-    fn go_modeled_package_identity_uses_exact_declared_name_and_pack_provenance() {
-        use crate::analyzer::go::package_identity::GoOverlayPackages;
-
-        let mut package = class("example.com/acme/codec", "go");
-        package.kind = SemanticModelSymbolKind::Module;
-        package.aliases = vec!["wire".to_owned()];
-        package.provenance.pack_id = "go.api.codec".to_owned();
-        package.provenance.pack_digest = "a1b2".to_owned();
-        package.provenance.record_id = "package:codec".to_owned();
-        let symbol_id = package.id.clone();
-        let overlay = overlay(vec![package], Vec::new());
-
-        assert_eq!(
-            GoOverlayPackages::new(Some(&overlay))
-                .modeled_package_identity("example.com/acme/codec"),
-            Some(
-                crate::analyzer::go::package_identity::GoModeledPackageIdentity {
-                    package_name: "wire".to_owned(),
-                    symbol_id,
-                    pack_id: "go.api.codec".to_owned(),
-                    pack_digest: "a1b2".to_owned(),
-                    record_id: "package:codec".to_owned(),
-                }
-            )
-        );
-        assert!(
-            GoOverlayPackages::new(Some(&overlay))
-                .modeled_package_identity("example.com/acme/other")
-                .is_none(),
-            "a different import path has no package authority"
         );
     }
 
@@ -7241,6 +7875,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[hardwon("#2741: incomplete TypeScript stdlib inventory produced a false member proof")]
     fn typescript_global_value_follows_declared_constructor_to_exact_member() {
         let global = class("global.es5", "typescript");
         let constructor = class("ArrayConstructor", "typescript");
@@ -7572,6 +8207,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[hardwon("#1789: unpublished ancestor edges were omitted from absence proofs")]
     fn a_direct_edge_to_an_unpublished_target_is_reported_rather_than_dropped() {
         let child = class("pkg.Child", "php");
         let edge = extends(&child, "vendor.Base");
@@ -7592,14 +8228,60 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_type_that_declares_no_supertype_bottoms_out_cleanly() {
-        let root = class("pkg.Root", "php");
-        let overlay = overlay(vec![root], Vec::new());
+    fn go_embedded_type_gaps_make_the_owner_surface_partial_at_every_depth() {
+        let embed = |owner: &mut SemanticModelSymbol, target: TypeRef| {
+            owner.embedded_types.push(EmbeddedTypeFact {
+                target,
+                pointer: false,
+            });
+        };
+        let declared = |id: &str| TypeRef::Declared {
+            id: id.to_owned(),
+            arguments: Vec::new(),
+            nullable: false,
+        };
+        let owner_is_partial = |mut symbols: Vec<SemanticModelSymbol>, owner_id: &str| {
+            let mut relations = Vec::new();
+            augment_go_overlay_surface(
+                &mut symbols,
+                &mut relations,
+                &crate::CancellationToken::default(),
+            )
+            .expect("bounded Go surface augmentation succeeds");
+            assert_eq!(
+                symbols
+                    .iter()
+                    .find(|symbol| symbol.id == owner_id)
+                    .unwrap()
+                    .provenance
+                    .completeness,
+                SemanticModelCompleteness::Partial,
+                "a missing embedded method surface cannot prove absence"
+            );
+        };
 
-        let surface = overlay.owner_surface(named(&overlay, "pkg.Root"));
+        let mut unknown_owner = class("pkg.UnknownOwner", "go");
+        embed(&mut unknown_owner, TypeRef::Unknown);
+        owner_is_partial(vec![unknown_owner.clone()], &unknown_owner.id);
 
-        assert!(surface.proves_absence(), "{surface:#?}");
-        assert_eq!(vec!["pkg.Root"], closure_names(&surface));
+        let mut absent_owner = class("pkg.AbsentOwner", "go");
+        embed(&mut absent_owner, declared("type.pkg.Missing"));
+        owner_is_partial(vec![absent_owner.clone()], &absent_owner.id);
+
+        let mut partial_target = class("pkg.PartialTarget", "go");
+        partial_target.provenance.completeness = SemanticModelCompleteness::Partial;
+        let mut partial_owner = class("pkg.PartialOwner", "go");
+        embed(&mut partial_owner, declared(&partial_target.id));
+        owner_is_partial(
+            vec![partial_owner.clone(), partial_target],
+            &partial_owner.id,
+        );
+
+        let mut nested_owner = class("pkg.NestedOwner", "go");
+        let mut nested_middle = class("pkg.NestedMiddle", "go");
+        embed(&mut nested_owner, declared(&nested_middle.id));
+        embed(&mut nested_middle, declared("type.pkg.NestedMissing"));
+        owner_is_partial(vec![nested_owner.clone(), nested_middle], &nested_owner.id);
     }
 
     #[test]
@@ -7631,19 +8313,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_fully_qualified_edge_across_a_complete_closure_proves_absence() {
-        let child = class("pkg.Child", "php");
-        let base = class("pkg.Base", "php");
-        let edge = extends(&child, "pkg.Base");
-        let overlay = overlay(vec![child, base], vec![edge]);
-
-        let surface = overlay.owner_surface(named(&overlay, "pkg.Child"));
-
-        assert!(surface.proves_absence(), "{surface:#?}");
-        assert_eq!(vec!["pkg.Child", "pkg.Base"], closure_names(&surface));
-    }
-
-    #[test]
+    #[hardwon("#2958: exact wildcard re-export alias failed across a hierarchy edge")]
     fn an_exact_re_export_alias_crosses_a_hierarchy_edge_and_proves_absence() {
         let mut declaring = class("typing.MutableSet", "python");
         declaring.aliases.push("shim.MutableSet".to_string());
@@ -7674,6 +8344,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[hardwon("#2958: cross-language alias falsely proved hierarchy absence")]
     fn an_alias_another_language_published_never_crosses_a_hierarchy_edge() {
         let mut foreign = class("widget.Local", "typescript");
         foreign.aliases.push("Base".to_string());
@@ -7856,74 +8527,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn exact_owner_implicit_operation_lookup_uses_owner_id_and_role() {
-        let owner = class("std.basic_string", "cpp");
-        let other_owner = class("other.basic_string", "cpp");
-        let mut copy = method(&owner, "member.copy_assignment", "operator=", None);
-        copy.implicit_operation = Some(ImplicitOperation::CopyAssignment);
-        let mut move_member = method(&owner, "member.move_assignment", "operator=", None);
-        move_member.implicit_operation = Some(ImplicitOperation::MoveAssignment);
-        let mut same_name_other_owner = method(
-            &other_owner,
-            "member.other.copy_assignment",
-            "operator=",
-            None,
-        );
-        same_name_other_owner.implicit_operation = Some(ImplicitOperation::CopyAssignment);
-        let overlay = overlay(
-            vec![
-                owner.clone(),
-                copy.clone(),
-                move_member.clone(),
-                other_owner,
-                same_name_other_owner,
-            ],
-            Vec::new(),
-        );
-        assert_eq!(
-            overlay.members_of(&owner.id).disposition,
-            SemanticModelOverlayDisposition::Conflict,
-            "the broad member posting contains both operation roles"
-        );
-
-        let copy_match =
-            overlay.implicit_member_target_on_owner(&owner.id, &ImplicitOperation::CopyAssignment);
-        assert_eq!(
-            copy_match.disposition,
-            SemanticModelMemberTargetDisposition::Unique
-        );
-        assert_eq!(copy_match.records.len(), 1);
-        assert_eq!(copy_match.records[0].id, copy.id);
-        assert_eq!(
-            copy_match.records[0].provenance.pack_id, "test.pack",
-            "the selected operation keeps its model provenance"
-        );
-
-        let move_match =
-            overlay.implicit_member_target_on_owner(&owner.id, &ImplicitOperation::MoveAssignment);
-        assert_eq!(
-            move_match.disposition,
-            SemanticModelMemberTargetDisposition::Unique
-        );
-        assert_eq!(move_match.records[0].id, move_member.id);
-
-        let missing_role =
-            overlay.implicit_member_target_on_owner(&owner.id, &ImplicitOperation::CopyConstructor);
-        assert_eq!(
-            missing_role.disposition,
-            SemanticModelMemberTargetDisposition::Incomplete,
-            "a zero operation match is not a proved absence"
-        );
-
-        let missing_owner = overlay
-            .implicit_member_target_on_owner("type.missing", &ImplicitOperation::CopyAssignment);
-        assert_eq!(
-            missing_owner.disposition,
-            SemanticModelMemberTargetDisposition::Incomplete
-        );
-    }
-
-    #[test]
     fn exact_owner_implicit_operation_lookup_preserves_conflicts_and_incompleteness() {
         let owner = class("std.basic_string", "cpp");
         let mut first = method(&owner, "member.copy_assignment.first", "operator=", None);
@@ -8038,22 +8641,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_python_class_reaches_the_published_object_root() {
-        let klass = class("theta.Klass", "python");
-        let object = class("builtins.object", "python");
-        let overlay = overlay(vec![klass, object], Vec::new());
-
-        let surface = overlay.owner_surface(named(&overlay, "theta.Klass"));
-
-        assert!(surface.proves_absence(), "{surface:#?}");
-        assert_eq!(
-            vec!["theta.Klass", "builtins.object"],
-            closure_names(&surface),
-            "Python's implicit `object` base contributes universal members"
-        );
-    }
-
-    #[test]
     fn a_python_class_without_a_published_object_root_cannot_prove_absence() {
         let klass = class("theta.Klass", "python");
         let overlay = overlay(vec![klass], Vec::new());
@@ -8071,17 +8658,6 @@ pub(crate) mod tests {
             surface.gaps,
             "an unseen `object` surface is a hole, not a clean bottom"
         );
-    }
-
-    #[test]
-    fn the_object_root_itself_does_not_inherit_itself() {
-        let object = class("builtins.object", "python");
-        let overlay = overlay(vec![object], Vec::new());
-
-        let surface = overlay.owner_surface(named(&overlay, "builtins.object"));
-
-        assert!(surface.proves_absence(), "{surface:#?}");
-        assert_eq!(vec!["builtins.object"], closure_names(&surface));
     }
 
     fn java_hierarchy_fixture() -> SemanticModelOverlay {
@@ -8110,6 +8686,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[hardwon("#3713: Java widening lost the exact hierarchy witness")]
     fn java_hierarchy_witness_retains_exact_path() {
         let result = java_hierarchy_fixture();
         let answer = result.java_reference_widening(
@@ -8134,24 +8711,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn java_hierarchy_budget_and_cancellation_stay_typed() {
-        let result = java_hierarchy_fixture();
-        let source = named(&result, "example.Child");
-        let target = named(&result, "example.Parent");
-        let answer = result.java_reference_widening(source, target, 0, None);
-        assert_eq!(
-            answer.incomplete,
-            vec![JavaHierarchyIncomplete::BudgetExhausted]
-        );
-        assert!(answer.witness.is_none());
-        let cancellation = crate::CancellationToken::new();
-        cancellation.cancel();
-        let answer = result.java_reference_widening(source, target, 8, Some(&cancellation));
-        assert_eq!(answer.incomplete, vec![JavaHierarchyIncomplete::Cancelled]);
-        assert!(answer.witness.is_none());
-    }
-
-    #[test]
+    #[hardwon("#3713: partial Java hierarchy erased a known positive path")]
     fn java_hierarchy_partialness_does_not_erase_positive_path() {
         let mut result = java_hierarchy_fixture();
         let child = result
@@ -8174,6 +8734,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[hardwon("#3713: missing or ambiguous generic hierarchy evidence proved widening")]
     fn java_hierarchy_missing_generic_and_ambiguous_do_not_prove_widening() {
         for reason in [
             JavaHierarchyIncomplete::MissingHierarchy,
@@ -8217,6 +8778,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[hardwon("#3713: implements and unrelated Java types shared a widening result")]
     fn java_hierarchy_implements_and_unrelated_types_keep_distinct_proof() {
         let mut result = java_hierarchy_fixture();
         let parent_id = named(&result, "example.Parent").id.clone();
@@ -8250,5 +8812,268 @@ pub(crate) mod tests {
                 .witness
                 .is_none()
         );
+    }
+
+    #[test]
+    fn external_callable_application_keeps_spread_incomplete() {
+        let owner = class("pkg.Owner", "java");
+        let member = method(
+            &owner,
+            "member.run",
+            "run",
+            Some(signature(&[Some("values")], true)),
+        );
+        let overlay = overlay(vec![owner, member], Vec::new());
+        let application = SemanticModelCallApplication::structured(0, Vec::new(), true);
+
+        assert_eq!(
+            overlay
+                .callable_for_application(callable_key(1), &application)
+                .disposition,
+            SemanticModelCallableDisposition::Incomplete(
+                SemanticModelCallableIncompleteReason::UnexpandedSpread
+            )
+        );
+    }
+
+    #[test]
+    fn external_callable_lookup_preserves_variadic_metadata_for_the_binder() {
+        let owner = class("pkg.Owner", "java");
+        let member = method(
+            &owner,
+            "member.run.variadic",
+            "run",
+            Some(signature(&[Some("values")], true)),
+        );
+        let overlay = overlay(vec![owner, member], Vec::new());
+
+        let result = lookup(&overlay, 1);
+
+        assert_eq!(result.disposition, SemanticModelCallableDisposition::Unique);
+        assert!(
+            result
+                .unique()
+                .unwrap()
+                .structured_signature()
+                .unwrap()
+                .parameters[0]
+                .variadic
+        );
+
+        let repeated = lookup(&overlay, 3);
+        assert_eq!(
+            repeated.disposition,
+            SemanticModelCallableDisposition::Unique
+        );
+        assert!(
+            repeated
+                .unique()
+                .unwrap()
+                .structured_signature()
+                .unwrap()
+                .parameters[0]
+                .variadic
+        );
+    }
+
+    #[test]
+    fn go_modeled_package_identity_uses_exact_declared_name_and_pack_provenance() {
+        use crate::analyzer::languages::{ModeledExternalPackageIdentity, language_support};
+
+        let mut package = class("example.com/acme/codec", "go");
+        package.kind = SemanticModelSymbolKind::Module;
+        package.aliases = vec!["wire".to_owned()];
+        package.provenance.pack_id = "go.api.codec".to_owned();
+        package.provenance.pack_digest = "a1b2".to_owned();
+        package.provenance.record_id = "package:codec".to_owned();
+        let symbol_id = package.id.clone();
+        let selected_overlay = overlay(vec![package.clone()], Vec::new());
+        let go_support = language_support(Language::Go).expect("Go support is registered");
+        let rejects = |package| {
+            go_support
+                .modeled_external_package_identity(
+                    &overlay(vec![package], Vec::new()),
+                    "example.com/acme/codec",
+                )
+                .is_none()
+        };
+
+        assert_eq!(
+            go_support
+                .modeled_external_package_identity(&selected_overlay, "example.com/acme/codec"),
+            Some(ModeledExternalPackageIdentity {
+                package_name: "wire".to_owned(),
+                symbol_id,
+                pack_id: "go.api.codec".to_owned(),
+                pack_digest: "a1b2".to_owned(),
+                record_id: "package:codec".to_owned(),
+            })
+        );
+        assert!(
+            go_support
+                .modeled_external_package_identity(&selected_overlay, "example.com/acme/other")
+                .is_none(),
+            "a different import path has no package authority"
+        );
+
+        let mut private_package = package.clone();
+        private_package.visibility = Visibility::Private;
+        assert!(
+            rejects(private_package),
+            "private package records do not authorize imports"
+        );
+
+        let mut other_language_package = package.clone();
+        other_language_package.language = "rust".to_owned();
+        assert!(
+            rejects(other_language_package),
+            "a package record owned by another language is not Go import authority"
+        );
+
+        let mut ambiguous_package = package;
+        ambiguous_package.provenance.ambiguous = true;
+        assert!(
+            rejects(ambiguous_package),
+            "ambiguous package provenance does not authorize imports"
+        );
+    }
+
+    #[test]
+    fn a_type_that_declares_no_supertype_bottoms_out_cleanly() {
+        let root = class("pkg.Root", "php");
+        let overlay = overlay(vec![root], Vec::new());
+
+        let surface = overlay.owner_surface(named(&overlay, "pkg.Root"));
+
+        assert!(surface.proves_absence(), "{surface:#?}");
+        assert_eq!(vec!["pkg.Root"], closure_names(&surface));
+    }
+
+    #[test]
+    fn a_fully_qualified_edge_across_a_complete_closure_proves_absence() {
+        let child = class("pkg.Child", "php");
+        let base = class("pkg.Base", "php");
+        let edge = extends(&child, "pkg.Base");
+        let overlay = overlay(vec![child, base], vec![edge]);
+
+        let surface = overlay.owner_surface(named(&overlay, "pkg.Child"));
+
+        assert!(surface.proves_absence(), "{surface:#?}");
+        assert_eq!(vec!["pkg.Child", "pkg.Base"], closure_names(&surface));
+    }
+
+    #[test]
+    fn exact_owner_implicit_operation_lookup_uses_owner_id_and_role() {
+        let owner = class("std.basic_string", "cpp");
+        let other_owner = class("other.basic_string", "cpp");
+        let mut copy = method(&owner, "member.copy_assignment", "operator=", None);
+        copy.implicit_operation = Some(ImplicitOperation::CopyAssignment);
+        let mut move_member = method(&owner, "member.move_assignment", "operator=", None);
+        move_member.implicit_operation = Some(ImplicitOperation::MoveAssignment);
+        let mut same_name_other_owner = method(
+            &other_owner,
+            "member.other.copy_assignment",
+            "operator=",
+            None,
+        );
+        same_name_other_owner.implicit_operation = Some(ImplicitOperation::CopyAssignment);
+        let overlay = overlay(
+            vec![
+                owner.clone(),
+                copy.clone(),
+                move_member.clone(),
+                other_owner,
+                same_name_other_owner,
+            ],
+            Vec::new(),
+        );
+        assert_eq!(
+            overlay.members_of(&owner.id).disposition,
+            SemanticModelOverlayDisposition::Conflict,
+            "the broad member posting contains both operation roles"
+        );
+
+        let copy_match =
+            overlay.implicit_member_target_on_owner(&owner.id, &ImplicitOperation::CopyAssignment);
+        assert_eq!(
+            copy_match.disposition,
+            SemanticModelMemberTargetDisposition::Unique
+        );
+        assert_eq!(copy_match.records.len(), 1);
+        assert_eq!(copy_match.records[0].id, copy.id);
+        assert_eq!(
+            copy_match.records[0].provenance.pack_id, "test.pack",
+            "the selected operation keeps its model provenance"
+        );
+
+        let move_match =
+            overlay.implicit_member_target_on_owner(&owner.id, &ImplicitOperation::MoveAssignment);
+        assert_eq!(
+            move_match.disposition,
+            SemanticModelMemberTargetDisposition::Unique
+        );
+        assert_eq!(move_match.records[0].id, move_member.id);
+
+        let missing_role =
+            overlay.implicit_member_target_on_owner(&owner.id, &ImplicitOperation::CopyConstructor);
+        assert_eq!(
+            missing_role.disposition,
+            SemanticModelMemberTargetDisposition::Incomplete,
+            "a zero operation match is not a proved absence"
+        );
+
+        let missing_owner = overlay
+            .implicit_member_target_on_owner("type.missing", &ImplicitOperation::CopyAssignment);
+        assert_eq!(
+            missing_owner.disposition,
+            SemanticModelMemberTargetDisposition::Incomplete
+        );
+    }
+
+    #[test]
+    fn a_python_class_reaches_the_published_object_root() {
+        let klass = class("theta.Klass", "python");
+        let object = class("builtins.object", "python");
+        let overlay = overlay(vec![klass, object], Vec::new());
+
+        let surface = overlay.owner_surface(named(&overlay, "theta.Klass"));
+
+        assert!(surface.proves_absence(), "{surface:#?}");
+        assert_eq!(
+            vec!["theta.Klass", "builtins.object"],
+            closure_names(&surface),
+            "Python's implicit `object` base contributes universal members"
+        );
+    }
+
+    #[test]
+    fn the_object_root_itself_does_not_inherit_itself() {
+        let object = class("builtins.object", "python");
+        let overlay = overlay(vec![object], Vec::new());
+
+        let surface = overlay.owner_surface(named(&overlay, "builtins.object"));
+
+        assert!(surface.proves_absence(), "{surface:#?}");
+        assert_eq!(vec!["builtins.object"], closure_names(&surface));
+    }
+    #[hardwon(
+        "#3713: Java hierarchy proof exhaustion and cancellation were not kept as typed incomplete evidence"
+    )]
+    #[test]
+    fn java_hierarchy_budget_and_cancellation_stay_typed() {
+        let result = java_hierarchy_fixture();
+        let source = named(&result, "example.Child");
+        let target = named(&result, "example.Parent");
+        let answer = result.java_reference_widening(source, target, 0, None);
+        assert_eq!(
+            answer.incomplete,
+            vec![JavaHierarchyIncomplete::BudgetExhausted]
+        );
+        assert!(answer.witness.is_none());
+        let cancellation = crate::CancellationToken::new();
+        cancellation.cancel();
+        let answer = result.java_reference_widening(source, target, 8, Some(&cancellation));
+        assert_eq!(answer.incomplete, vec![JavaHierarchyIncomplete::Cancelled]);
+        assert!(answer.witness.is_none());
     }
 }

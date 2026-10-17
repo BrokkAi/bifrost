@@ -13,7 +13,7 @@ use crate::analyzer::semantic::{
     ContentIdentity, SemanticProviderError, StableDigest, StructuralNodeIdentity,
 };
 use crate::analyzer::structural::extract::{
-    LimitedFileFacts, extract_file_facts_from_tree_limited,
+    LimitedFileFacts, extract_file_facts_from_forest_limited,
 };
 use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
 use crate::hash::HashMap;
@@ -44,13 +44,44 @@ impl StructuralNodeIndex {
         max_work_items: usize,
         cancellation: &CancellationToken,
     ) -> Result<StructuralNodeIndexOutcome, SemanticProviderError> {
+        let forest =
+            match brokk_bifrost_core::analyzer::structural::spec::EmbeddedSyntaxForest::parse(
+                spec,
+                prepared.tree().root_node(),
+                prepared.source(),
+                max_work_items,
+                Some(cancellation),
+            ) {
+                Ok(forest) => forest,
+                Err(
+                    brokk_bifrost_core::analyzer::structural::spec::EmbeddedSyntaxStop::Cancelled,
+                ) => return Ok(StructuralNodeIndexOutcome::Cancelled),
+                Err(
+                    brokk_bifrost_core::analyzer::structural::spec::EmbeddedSyntaxStop::Exceeded,
+                ) => {
+                    return Ok(StructuralNodeIndexOutcome::Exceeded {
+                        minimum_work_items: max_work_items.saturating_add(1),
+                    });
+                }
+            };
+        Self::for_source_with_forest(spec, prepared, &forest, max_work_items, cancellation)
+    }
+
+    pub(crate) fn for_source_with_forest(
+        spec: &dyn StructuralSpec,
+        prepared: &PreparedSyntaxTree,
+        forest: &brokk_bifrost_core::analyzer::structural::spec::EmbeddedSyntaxForest,
+        max_work_items: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<StructuralNodeIndexOutcome, SemanticProviderError> {
         let grammar = parser_language_for_dialect(prepared.dialect()).ok_or_else(|| {
             SemanticProviderError::internal("semantic lowering has no structural parser language")
         })?;
-        let extracted = extract_file_facts_from_tree_limited(
+        let extracted = extract_file_facts_from_forest_limited(
             spec,
             &grammar,
             prepared.tree(),
+            forest,
             prepared.source(),
             max_work_items,
             Some(cancellation),

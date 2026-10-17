@@ -3,6 +3,7 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+use super::super::StableDigest;
 use super::super::ir::{
     CallSiteHandle, EvidenceCompleteness, EvidenceHandle, ProcedureHandle, ProofStatus,
 };
@@ -13,6 +14,7 @@ use super::model::{
     FreshObjectPublication, FreshObjectPublicationQuery, OracleCallContext, StoreAtPoint,
     ValueAtPoint,
 };
+use super::value_flow::MemoryRelationOrigin;
 
 /// A materialization-local identity for one derivation relation.
 ///
@@ -128,6 +130,24 @@ impl OracleRelationKind {
 pub enum OracleRelationSubject {
     DispatchCandidate(ProcedureHandle),
     DispatchBoundary(DispatchBoundaryKind),
+    MemoryOperation(MemoryRelationBinding),
+}
+
+/// Immutable origin authority for one value-flow memory-operation relation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MemoryRelationBinding {
+    origin: MemoryRelationOrigin,
+    seal: StableDigest,
+}
+
+impl MemoryRelationBinding {
+    pub const fn origin(&self) -> &MemoryRelationOrigin {
+        &self.origin
+    }
+
+    pub(crate) const fn seal(&self) -> StableDigest {
+        self.seal
+    }
 }
 
 /// Captured dependency identity for a runtime-model interpretation of a load.
@@ -233,6 +253,26 @@ impl OracleRelationRecord {
     pub(crate) fn with_runtime_read(mut self, evidence: RuntimeReadRelationEvidence) -> Self {
         self.runtime_read = Some(evidence);
         self
+    }
+
+    pub(crate) fn with_memory_origin(
+        mut self,
+        origin: MemoryRelationOrigin,
+        seal: StableDigest,
+    ) -> Self {
+        assert_eq!(self.kind, OracleRelationKind::ValueFlow);
+        assert!(self.subject.is_none());
+        self.subject = Some(OracleRelationSubject::MemoryOperation(
+            MemoryRelationBinding { origin, seal },
+        ));
+        self
+    }
+
+    pub(crate) fn memory_origin_binding(&self) -> Option<&MemoryRelationBinding> {
+        match self.subject.as_ref() {
+            Some(OracleRelationSubject::MemoryOperation(binding)) => Some(binding),
+            _ => None,
+        }
     }
 
     pub fn runtime_read(&self) -> Option<&RuntimeReadRelationEvidence> {
@@ -354,6 +394,28 @@ impl OracleRelationArena {
         &self.records
     }
 
+    pub(super) fn retained_bytes(&self) -> usize {
+        self.records.iter().fold(
+            std::mem::size_of::<OracleRelationRecord>().saturating_mul(self.records.len()),
+            |retained, record| {
+                let evidence_bytes = std::mem::size_of_val(record.evidence.as_ref());
+                let runtime_read_bytes = record.runtime_read.as_ref().map_or(0, |runtime_read| {
+                    runtime_read
+                        .active_model_set_hash
+                        .capacity()
+                        .saturating_add(runtime_read.runtime_profile_digest.capacity())
+                        .saturating_add(runtime_read.manifest_digest.capacity())
+                        .saturating_add(runtime_read.shard_id.capacity())
+                        .saturating_add(runtime_read.exposure_id.capacity())
+                        .saturating_add(runtime_read.behavior_id.capacity())
+                });
+                retained
+                    .saturating_add(evidence_bytes)
+                    .saturating_add(runtime_read_bytes)
+            },
+        )
+    }
+
     pub fn handle(self: &Arc<Self>, id: OracleRelationId) -> Option<OracleRelationHandle> {
         self.records.get(id.index())?;
         Some(OracleRelationHandle {
@@ -418,8 +480,7 @@ impl Eq for OracleRelationHandle {}
 
 impl Hash for OracleRelationHandle {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        Arc::as_ptr(&self.arena).hash(state);
-        self.id.hash(state);
+        crate::analyzer::semantic::hash_arc_key(&self.arena, &self.id, state);
     }
 }
 
@@ -604,8 +665,7 @@ impl<T> OracleCandidate<T> {
     }
 
     pub const fn is_proven_complete(&self) -> bool {
-        matches!(self.proof, ProofStatus::Proven)
-            && matches!(self.completeness, EvidenceCompleteness::Complete)
+        self.proof.establishes_complete_evidence(&self.completeness)
     }
 
     pub fn value(&self) -> &T {
@@ -727,24 +787,47 @@ pub(super) fn validate_candidate_provenance<T>(
         .next();
     let mut seen = std::collections::HashSet::new();
     for candidate in candidates {
-        if candidate.provenance().is_empty()
-            || candidate.provenance().iter().any(|relation| {
-                relation.owner() != owner
-                    || relation.record().kind() != kind
-                    || relation.record().evidence().is_empty()
-                    || first.is_some_and(|first| !first.same_arena(relation))
-                    || !seen.insert(relation.clone())
-            })
-        {
-            return Err(OracleContractError::InvalidRelationIdentity);
-        }
-        if candidate.provenance().iter().any(|relation| {
-            !relation
-                .record()
-                .supports_quality(candidate.proof(), candidate.completeness())
-        }) {
-            return Err(OracleContractError::InvalidRelationQuality);
-        }
+        validate_provenance_identity(candidate.provenance(), owner, kind, first, &mut seen)?;
+        validate_provenance_quality(
+            candidate.provenance(),
+            candidate.proof(),
+            candidate.completeness(),
+        )?;
+    }
+    Ok(())
+}
+
+pub(super) fn validate_provenance_identity(
+    relations: &[OracleRelationHandle],
+    owner: &OracleRelationOwner,
+    kind: OracleRelationKind,
+    first: Option<&OracleRelationHandle>,
+    seen: &mut std::collections::HashSet<OracleRelationHandle>,
+) -> Result<(), OracleContractError> {
+    if relations.is_empty()
+        || relations.iter().any(|relation| {
+            relation.owner() != owner
+                || relation.record().kind() != kind
+                || relation.record().evidence().is_empty()
+                || first.is_some_and(|first| !first.same_arena(relation))
+                || !seen.insert(relation.clone())
+        })
+    {
+        return Err(OracleContractError::InvalidRelationIdentity);
+    }
+    Ok(())
+}
+
+pub(super) fn validate_provenance_quality(
+    relations: &[OracleRelationHandle],
+    proof: &ProofStatus,
+    completeness: &EvidenceCompleteness,
+) -> Result<(), OracleContractError> {
+    if relations
+        .iter()
+        .any(|relation| !relation.record().supports_quality(proof, completeness))
+    {
+        return Err(OracleContractError::InvalidRelationQuality);
     }
     Ok(())
 }

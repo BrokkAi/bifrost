@@ -1,12 +1,10 @@
 use std::mem::{align_of, size_of};
 use std::sync::Arc;
 
-use super::concurrency::{
-    ConcurrentAccessConflictValue, WorkspaceConcurrencyProvider, WorkspaceConcurrencyQueryCache,
-};
 use super::taint::{SemanticTaintFindingValue, TaintQueryState};
 use super::typestate::{SemanticTypestateFindingValue, TypestateQueryState};
 use super::value_flow::{SemanticFlowEndpointValue, SemanticFlowWitnessValue, ValueFlowQueryState};
+use super::witness_projection::{bounded_reason, saturating_u64};
 use super::{
     CodeQueryCallResult, CodeQueryControlEdge, CodeQueryDiagnostic, CodeQueryDiagnosticCode,
     CodeQueryDiagnosticImpact, CodeQueryExhaustedCharge, CodeQueryExhaustedRoot,
@@ -22,27 +20,34 @@ use crate::analyzer::semantic::workspace_oracle::{
     RuntimeKeyedReadResult, procedures_for_definition_with_limits, procedures_for_source_ranges,
 };
 use crate::analyzer::semantic::{
-    AllocationSite, BasicBlock, CallSiteHandle, CapabilitySupport, CaptureBinding, ContentIdentity,
-    ControlEdge, ControlEdgeHandle, ControlEdgeId, DeclarationSegmentKind, DispatchBoundaryKind,
-    DispatchHints, Evidence, EvidenceCompleteness, ExecutionTiming, HeapOracle,
-    LengthDelimitedDigest, MemoryLocation, ObservationPhase, OracleCallContext, ProcedureHandle,
-    ProcedureSemantics, ProgramPoint, ProgramPointHandle, ProgramPointId, ProofStatus,
-    SemanticArtifact, SemanticArtifactLeaseChild, SemanticArtifactLeaseError,
-    SemanticArtifactLeaseLiveReservation, SemanticArtifactLeaseSet, SemanticArtifactLeaseSnapshot,
-    SemanticArtifactLeaseWindow, SemanticBudget, SemanticBudgetDimension,
-    SemanticBudgetScopeSnapshot, SemanticCallSite, SemanticCapability, SemanticEvent,
-    SemanticExecutionBudget, SemanticExecutionBudgetSnapshot, SemanticGap, SemanticLocator,
-    SemanticOutcome, SemanticRequest, SemanticValue, SemanticWork, SourceMapping, ValueAtPoint,
-    ValueHandle, ValueId, WorkspaceIcfgProvider,
+    AllocationSite, BasicBlock, CallBinding, CallSiteHandle, CallableTarget,
+    CallableTargetResolution, CapabilitySupport, CaptureBinding, ContentIdentity, ControlEdge,
+    ControlEdgeHandle, ControlEdgeId, DeclarationSegmentKind, DispatchBoundaryKind, DispatchHints,
+    DispatchOracle, DurableCallContext, DurableObjectIdentity, Evidence, EvidenceCompleteness,
+    ExecutionTiming, FILE_INITIALIZER_SEGMENT_NAME, HeapOracle, LengthDelimitedDigest,
+    MemoryLocation, ObservationPhase, OracleCallContext, OracleLimits, ProcedureHandle,
+    ProcedureKind, ProcedurePortKind, ProcedureSemantics, ProgramPoint, ProgramPointHandle,
+    ProgramPointId, ProofStatus, SemanticArtifact, SemanticArtifactLeaseChild,
+    SemanticArtifactLeaseError, SemanticArtifactLeaseLiveReservation, SemanticArtifactLeaseSet,
+    SemanticArtifactLeaseSnapshot, SemanticArtifactLeaseWindow, SemanticBudget,
+    SemanticBudgetDimension, SemanticBudgetScopeSnapshot, SemanticCallSite, SemanticCapability,
+    SemanticEffect, SemanticEvent, SemanticExecutionBudget, SemanticExecutionBudgetSnapshot,
+    SemanticGap, SemanticLocator, SemanticOutcome, SemanticRequest, SemanticRole, SemanticValue,
+    SemanticWork, SourceMapping, SourceMappingKind, StructuralNodeIdentity, ValueAtPoint,
+    ValueFlowEndpoint, ValueFlowOracle, ValueFlowRelationKind, ValueHandle, ValueId,
 };
-use crate::analyzer::semantic_model::{ActiveSemanticModelSnapshot, SemanticModelOverlay};
+use crate::analyzer::semantic_model::{
+    ActiveSemanticModelSnapshot, CompiledConcurrencyEffect, CompiledSummaryInput, Completeness,
+    ProcedureSummaryMemberKey, SemanticModelMatchDisposition, SemanticModelOverlay,
+};
 use crate::analyzer::{ProjectFile, WorkspaceAnalyzer};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use crate::structural::analysis_context::{
     ProtocolRef, QueryAnalysisContext, TaintResultRef, ValueFlowPlanRef,
 };
-use crate::text_utils::{compute_line_starts, line_column_for_offset};
+use crate::text_utils::compute_line_starts;
+use brokk_bifrost_core::analyzer::model::Language;
 use brokk_bifrost_rql::WitnessTraversal;
 
 #[derive(Debug, Clone)]
@@ -110,6 +115,20 @@ impl SemanticQueryQuality {
 
     fn is_complete(&self) -> bool {
         self.proof_reason.is_none() && self.completeness_reason.is_none()
+    }
+
+    fn exact_selection_incomplete_reason(&self) -> Option<String> {
+        if self.is_complete() {
+            return None;
+        }
+        let mut reasons = Vec::new();
+        if let Some(reason) = &self.proof_reason {
+            reasons.push(format!("proof: {reason}"));
+        }
+        if let Some(reason) = &self.completeness_reason {
+            reasons.push(format!("coverage: {reason}"));
+        }
+        Some(reasons.join("; "))
     }
 }
 
@@ -236,42 +255,22 @@ enum CachedSemanticMaterialization {
     RetainedBudgetExhausted,
 }
 
+/// Most files whose parsed exact syntax one query retains for call-site
+/// dispatch. The pipeline visits call sites grouped by file, so a small
+/// least-recently-used set reuses each file's parse across its call sites.
+/// An unbounded set would hold a parsed tree for every file that a
+/// whole-workspace selector touches, for the whole query.
+const PREPARED_SOURCE_DISPATCH_FILE_CAP: usize = 16;
+
 struct PreparedSourceDispatchCache<'a> {
     file: ProjectFile,
     session: PreparedSourceDispatchSession<'a>,
     retained_bytes: usize,
 }
 
-/// Attribute the first refusal of a query's shared semantic budget seen by a
-/// concurrency root: the root (unless the budget refused a charge before the
-/// root began), the internal dimension, the code that asked for the charge,
-/// and the charge itself.
-fn concurrency_budget_exhaustion(
-    root: &SemanticProcedureValue,
-    refused_before_root: bool,
-    refusal: Option<crate::analyzer::semantic::SemanticBudgetRefusal>,
-) -> CodeQueryExhaustedRoot {
-    CodeQueryExhaustedRoot {
-        path: crate::path_utils::rel_path_string(root.file()),
-        procedure: (!refused_before_root).then(|| super::type_flow::procedure_name(&root.handle)),
-        lane: refusal.map_or_else(
-            || "semantic/unrecorded".to_string(),
-            |refusal| format!("semantic/{}", refusal.exceeded.dimension().label()),
-        ),
-        // `file!()` uses the host separator; render the site the same on every OS.
-        stage: refusal.map(|refusal| {
-            format!(
-                "{}:{}",
-                refusal.site.file().replace('\\', "/"),
-                refusal.site.line()
-            )
-        }),
-        charge: refusal.map(|refusal| CodeQueryExhaustedCharge {
-            attempted: refusal.exceeded.attempted(),
-            limit: refusal.exceeded.limit(),
-        }),
-        feedback_iteration: None,
-    }
+struct ProcedureRangeLookupDiagnostics {
+    budget_reason: &'static str,
+    cancellation_message: &'static str,
 }
 
 pub(super) struct SemanticQueryContext<'a> {
@@ -285,12 +284,8 @@ pub(super) struct SemanticQueryContext<'a> {
     workspace_generation: u64,
     analysis_context: Option<&'a QueryAnalysisContext>,
     /// The activation snapshot shared by every semantic row family in this
-    /// query, including each ICFG provider created on a cache miss.
+    /// query.
     active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
-    /// Complete race answers shared by every root while this query's semantic
-    /// budget is active. The store is dropped with this query context.
-    concurrency_query_cache: WorkspaceConcurrencyQueryCache,
-    semantic_summaries: Arc<brokk_bifrost_flow::dataflow::ProductionSemanticSummaryRepository>,
     budget: SemanticBudget,
     cache: HashMap<ProjectFile, CachedSemanticMaterialization>,
     diagnostics: Vec<CodeQueryDiagnostic>,
@@ -310,19 +305,161 @@ pub(super) struct SemanticQueryContext<'a> {
     traversal_steps: usize,
     indexed_source_identities: HashMap<ProjectFile, Option<ContentIdentity>>,
     source_call_indexes: HashMap<ProjectFile, Option<SemanticSourceCallIndex>>,
-    prepared_source_dispatch: Option<PreparedSourceDispatchCache<'a>>,
+    prepared_source_dispatch: Vec<PreparedSourceDispatchCache<'a>>,
     budget_exhausted: bool,
-    /// Where the first concurrency root found the shared budget exhausted.
-    /// Later roots name it, so their gaps are not read as caused by the
-    /// phase that happened to ask next.
-    concurrency_budget_exhaustion: Option<CodeQueryExhaustedRoot>,
     typestate: TypestateQueryState,
     value_flow: ValueFlowQueryState,
     taint: TaintQueryState,
     type_flow: super::type_flow::TypeFlowQueryState,
 }
 
+pub(super) struct ModeledTaskSpawn {
+    pub(super) call: CallSiteHandle,
+    pub(super) callable: ValueId,
+}
+
+/// One typed semantic call edge retained for procedure-scoped `callees`.
+/// Callback edges keep the exact registering call and the oracle's independent
+/// proof and completeness axes; their target is the closure procedure whose
+/// identity was substituted through the callee's invoked formal.
+#[derive(Debug, Clone)]
+pub(super) struct SemanticProcedureCallEdge {
+    pub(super) call: CallSiteHandle,
+    pub(super) target: SemanticProcedureValue,
+    pub(super) proof: ProofStatus,
+    pub(super) completeness: EvidenceCompleteness,
+    pub(super) callback_invocation: bool,
+}
+
+fn quality_for_oracle_evidence(
+    proof: &ProofStatus,
+    completeness: &EvidenceCompleteness,
+) -> SemanticQueryQuality {
+    SemanticQueryQuality {
+        proof_reason: match proof {
+            ProofStatus::Proven => None,
+            ProofStatus::Unproven(reason) => Some(Arc::from(reason.as_ref())),
+        },
+        completeness_reason: match completeness {
+            EvidenceCompleteness::Complete => None,
+            EvidenceCompleteness::Partial(reason) => Some(Arc::from(reason.as_ref())),
+        },
+    }
+}
+
+fn quality_from_oracle_outcome<T>(
+    outcome: &SemanticOutcome<T>,
+    operation: &str,
+) -> SemanticQueryQuality {
+    if outcome.is_complete() {
+        SemanticQueryQuality::default()
+    } else {
+        SemanticQueryQuality::partial(format!(
+            "{operation} returned a non-complete semantic outcome"
+        ))
+    }
+}
+
+fn proof_from_query_quality(quality: &SemanticQueryQuality) -> ProofStatus {
+    quality
+        .proof_reason
+        .as_ref()
+        .map_or(ProofStatus::Proven, |reason| {
+            ProofStatus::Unproven(reason.to_string().into_boxed_str())
+        })
+}
+
+fn completeness_from_query_quality(quality: &SemanticQueryQuality) -> EvidenceCompleteness {
+    quality
+        .completeness_reason
+        .as_ref()
+        .map_or(EvidenceCompleteness::Complete, |reason| {
+            EvidenceCompleteness::Partial(reason.to_string().into_boxed_str())
+        })
+}
+
+fn callback_invoked_formals(
+    procedure: &ProcedureHandle,
+    snapshot: &crate::analyzer::semantic::ValueFlowSnapshot,
+) -> Vec<(CallSiteHandle, u32, SemanticQueryQuality)> {
+    let semantics = procedure.semantics();
+    let mut invocations = Vec::new();
+    let mut seen = HashSet::default();
+    for point in semantics.points() {
+        for event in &point.events {
+            let crate::analyzer::semantic::SemanticEffect::Invoke { call_site } = event.effect
+            else {
+                continue;
+            };
+            let Some(evidence) = semantics.evidence_row(event.evidence) else {
+                continue;
+            };
+            if !matches!(evidence.proof, ProofStatus::Proven)
+                || !matches!(evidence.completeness, EvidenceCompleteness::Complete)
+            {
+                continue;
+            }
+            let Some(call) = procedure.call_site_handle(call_site) else {
+                continue;
+            };
+            let Some(call_row) = semantics.call_site(call_site) else {
+                continue;
+            };
+            let callee = procedure
+                .value_handle(call_row.callee)
+                .expect("validated callback invocation callee is a live value");
+            let start = ValueFlowEndpoint::for_value(callee);
+            let mut pending = vec![start];
+            let mut visited = HashSet::default();
+            let mut ordinals = HashSet::default();
+            while let Some(endpoint) = pending.pop() {
+                if !visited.insert(endpoint.clone()) {
+                    continue;
+                }
+                if let ValueFlowEndpoint::Port(port) = &endpoint
+                    && let ProcedurePortKind::Parameter { ordinal } = port.kind()
+                {
+                    ordinals.insert(ordinal);
+                }
+                for relation in snapshot.relations().iter().filter(|relation| {
+                    relation.target == endpoint
+                        && relation.is_proven_complete()
+                        && matches!(
+                            relation.kind,
+                            ValueFlowRelationKind::Assignment | ValueFlowRelationKind::Parameter
+                        )
+                        && relation
+                            .transfer
+                            .is_none_or(|transfer| transfer.preserves_runtime_class())
+                }) {
+                    pending.push(relation.source.clone());
+                }
+            }
+            let invoke_quality =
+                quality_for_oracle_evidence(&evidence.proof, &evidence.completeness);
+            for ordinal in ordinals {
+                if seen.insert((call.clone(), ordinal)) {
+                    invocations.push((call.clone(), ordinal, invoke_quality.clone()));
+                }
+            }
+        }
+    }
+    invocations
+}
+
 impl<'a> SemanticQueryContext<'a> {
+    pub(super) fn prefetch_call_bindings(
+        &self,
+        bindings: &mut crate::analyzer::usages::call_relations::CallBindingCache,
+        candidates: impl IntoIterator<Item = (ProjectFile, crate::analyzer::Range)>,
+    ) -> crate::analyzer::store::Result<()> {
+        let _models = crate::analyzer::AnalyzerQueryScope::with_active_semantic_model_snapshot(
+            self.workspace.analyzer(),
+            self.active_semantic_model_snapshot.clone(),
+        );
+        bindings.prefetch_selected_call_targets(self.workspace, candidates, self.cancellation)
+    }
+
     /// Resolve one exact runtime keyed read through the workspace oracle while
     /// charging this query's shared semantic budget and cancellation token.
     pub(super) fn runtime_keyed_read_at_source(
@@ -370,7 +507,6 @@ impl<'a> SemanticQueryContext<'a> {
             active_semantic_model_snapshot,
             None,
             None,
-            None,
         )
     }
 
@@ -385,9 +521,6 @@ impl<'a> SemanticQueryContext<'a> {
         workspace_generation: u64,
         analysis_context: Option<&'a QueryAnalysisContext>,
         active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
-        semantic_summaries: Option<
-            Arc<brokk_bifrost_flow::dataflow::ProductionSemanticSummaryRepository>,
-        >,
         value_flow_cache: Option<brokk_bifrost_flow::value_flow::ValueFlowCache>,
         type_flow_summaries: Option<brokk_bifrost_flow::type_flow::TypeFlowSummaryState>,
     ) -> Self {
@@ -404,7 +537,6 @@ impl<'a> SemanticQueryContext<'a> {
             workspace_generation,
             analysis_context,
             active_semantic_model_snapshot,
-            semantic_summaries,
             value_flow_cache,
             type_flow_summaries,
             budget,
@@ -424,9 +556,6 @@ impl<'a> SemanticQueryContext<'a> {
         workspace_generation: u64,
         analysis_context: Option<&'a QueryAnalysisContext>,
         active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
-        semantic_summaries: Option<
-            Arc<brokk_bifrost_flow::dataflow::ProductionSemanticSummaryRepository>,
-        >,
         value_flow_cache: Option<brokk_bifrost_flow::value_flow::ValueFlowCache>,
         type_flow_summaries: Option<brokk_bifrost_flow::type_flow::TypeFlowSummaryState>,
         parent_scope: &SemanticBudgetScopeSnapshot,
@@ -446,7 +575,6 @@ impl<'a> SemanticQueryContext<'a> {
             workspace_generation,
             analysis_context,
             active_semantic_model_snapshot,
-            semantic_summaries,
             value_flow_cache,
             type_flow_summaries,
             budget,
@@ -466,9 +594,6 @@ impl<'a> SemanticQueryContext<'a> {
         workspace_generation: u64,
         analysis_context: Option<&'a QueryAnalysisContext>,
         active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
-        semantic_summaries: Option<
-            Arc<brokk_bifrost_flow::dataflow::ProductionSemanticSummaryRepository>,
-        >,
         value_flow_cache: Option<brokk_bifrost_flow::value_flow::ValueFlowCache>,
         type_flow_summaries: Option<brokk_bifrost_flow::type_flow::TypeFlowSummaryState>,
         budget: SemanticBudget,
@@ -499,10 +624,6 @@ impl<'a> SemanticQueryContext<'a> {
             workspace_generation,
             analysis_context,
             active_semantic_model_snapshot,
-            concurrency_query_cache: WorkspaceConcurrencyQueryCache::default(),
-            semantic_summaries: semantic_summaries.unwrap_or_else(|| {
-                Arc::new(brokk_bifrost_flow::dataflow::ProductionSemanticSummaryRepository::new())
-            }),
             budget,
             cache: HashMap::default(),
             diagnostics: Vec::new(),
@@ -522,9 +643,8 @@ impl<'a> SemanticQueryContext<'a> {
             traversal_steps: 0,
             indexed_source_identities: HashMap::default(),
             source_call_indexes: HashMap::default(),
-            prepared_source_dispatch: None,
+            prepared_source_dispatch: Vec::new(),
             budget_exhausted: false,
-            concurrency_budget_exhaustion: None,
             typestate: TypestateQueryState::default(),
             value_flow: ValueFlowQueryState::default(),
             taint: TaintQueryState::default(),
@@ -563,8 +683,7 @@ impl<'a> SemanticQueryContext<'a> {
         let publishes_surface = self
             .active_semantic_model_snapshot
             .as_ref()
-            .and_then(|snapshot| snapshot.semantic_model_overlay())
-            .is_some_and(|overlay| overlay.publishes_complete_declaration_surface_for("python"));
+            .is_some_and(|snapshot| snapshot.publishes_complete_declaration_surface_for("python"));
         if !publishes_surface {
             self.push_diagnostic(
                 CodeQueryDiagnosticCode::SemanticCapabilityUnsupported,
@@ -629,8 +748,22 @@ impl<'a> SemanticQueryContext<'a> {
         })
     }
 
-    fn take_prepared_source_dispatch(&mut self) -> Option<PreparedSourceDispatchCache<'a>> {
-        let prepared = self.prepared_source_dispatch.take()?;
+    /// Remove one file's retained syntax from the query cache and release its
+    /// bytes from the active retention total.
+    fn take_prepared_source_dispatch(
+        &mut self,
+        file: &ProjectFile,
+    ) -> Option<PreparedSourceDispatchCache<'a>> {
+        let position = self
+            .prepared_source_dispatch
+            .iter()
+            .position(|prepared| &prepared.file == file)?;
+        let prepared = self.prepared_source_dispatch.remove(position);
+        self.unaccount_prepared_source_dispatch(&prepared);
+        Some(prepared)
+    }
+
+    fn unaccount_prepared_source_dispatch(&mut self, prepared: &PreparedSourceDispatchCache<'a>) {
         assert!(
             prepared.retained_bytes > 0,
             "only an initialized dispatch session enters the retained cache"
@@ -644,11 +777,14 @@ impl<'a> SemanticQueryContext<'a> {
             .active_retained_bytes
             .checked_sub(prepared.retained_bytes)
             .expect("prepared dispatch bytes are included in active retention");
-        Some(prepared)
     }
 
+    /// Drop every retained file's syntax. Retained syntax is optional, so any
+    /// mandatory row, lease, or budget decision may displace all of it.
     fn evict_prepared_source_dispatch(&mut self) {
-        drop(self.take_prepared_source_dispatch());
+        for prepared in std::mem::take(&mut self.prepared_source_dispatch) {
+            self.unaccount_prepared_source_dispatch(&prepared);
+        }
     }
 
     fn try_retain_prepared_source_dispatch(
@@ -677,13 +813,42 @@ impl<'a> SemanticQueryContext<'a> {
         {
             return;
         }
-        debug_assert_eq!(self.artifact_window_file.as_ref(), Some(&file));
         self.record_active_retained_bytes(retained_bytes);
-        self.prepared_source_dispatch = Some(PreparedSourceDispatchCache {
-            file,
-            session,
-            retained_bytes,
-        });
+        self.prepared_source_dispatch
+            .push(PreparedSourceDispatchCache {
+                file,
+                session,
+                retained_bytes,
+            });
+        if self.prepared_source_dispatch.len() > PREPARED_SOURCE_DISPATCH_FILE_CAP {
+            let evicted = self.prepared_source_dispatch.remove(0);
+            self.unaccount_prepared_source_dispatch(&evicted);
+        }
+    }
+
+    fn run_prepared_dispatch_at_source(
+        &mut self,
+        file: ProjectFile,
+        mut session: PreparedSourceDispatchSession<'a>,
+        range: crate::analyzer::Range,
+        expected_retained_bytes: Option<usize>,
+    ) -> Result<
+        SemanticOutcome<crate::analyzer::semantic::workspace_oracle::SourceDispatchResult>,
+        crate::analyzer::semantic::SemanticProviderError,
+    > {
+        let cancellation = self.cancellation.unwrap_or(&self.uncancelled);
+        let artifact_collector = self
+            .artifact_window
+            .as_ref()
+            .map(SemanticArtifactLeaseWindow::collector);
+        let mut request = SemanticRequest::new(&mut self.budget, cancellation);
+        if let Some(collector) = &artifact_collector {
+            request = request.with_artifact_collector(collector);
+        }
+        let outcome = session.resolve_at_source_recorded(range, &mut request);
+        drop(request);
+        self.try_retain_prepared_source_dispatch(file, session, expected_retained_bytes);
+        outcome
     }
 
     fn prepared_dispatch_at_source(
@@ -696,86 +861,37 @@ impl<'a> SemanticQueryContext<'a> {
             crate::analyzer::semantic::SemanticProviderError,
         >,
     > {
-        if &self.prepared_source_dispatch.as_ref()?.file != file {
-            return None;
-        }
-        let cached = self
-            .take_prepared_source_dispatch()
-            .expect("matching prepared dispatch cache remains available");
+        let cached = self.take_prepared_source_dispatch(file)?;
         let PreparedSourceDispatchCache {
             file: prepared_file,
-            mut session,
+            session,
             retained_bytes,
         } = cached;
-        let cancellation = self.cancellation.unwrap_or(&self.uncancelled);
-        let artifact_collector = self
-            .artifact_window
-            .as_ref()
-            .map(SemanticArtifactLeaseWindow::collector);
-        let mut request = SemanticRequest::new(&mut self.budget, cancellation);
-        if let Some(collector) = &artifact_collector {
-            request = request.with_artifact_collector(collector);
-        }
-        let outcome = session.resolve_at_source(range, &mut request);
-        drop(request);
-        self.try_retain_prepared_source_dispatch(prepared_file, session, Some(retained_bytes));
-        Some(outcome)
+        Some(self.run_prepared_dispatch_at_source(
+            prepared_file,
+            session,
+            range,
+            Some(retained_bytes),
+        ))
     }
 
-    fn one_shot_dispatch_at_source(
+    /// Open a dispatch session over one materialized file, resolve the range
+    /// through it, and retain its parsed syntax for the file's later call
+    /// sites in this query. The session is the only route to the exact source
+    /// dispatch path, so a file's source is parsed and charged once per
+    /// retained session rather than once per call site.
+    fn begin_prepared_dispatch_at_source(
         &mut self,
+        file: &ProjectFile,
         materialized: SemanticOutcome<Arc<SemanticArtifact>>,
         range: crate::analyzer::Range,
     ) -> Result<
         SemanticOutcome<crate::analyzer::semantic::workspace_oracle::SourceDispatchResult>,
         crate::analyzer::semantic::SemanticProviderError,
     > {
-        let cancellation = self.cancellation.unwrap_or(&self.uncancelled);
         let oracle = self.workspace.semantic_oracle_provider();
-        let artifact_collector = self
-            .artifact_window
-            .as_ref()
-            .map(SemanticArtifactLeaseWindow::collector);
-        let mut request = SemanticRequest::new(&mut self.budget, cancellation);
-        if let Some(collector) = &artifact_collector {
-            request = request.with_artifact_collector(collector);
-        }
-        oracle.dispatch_at_source_in_artifact(materialized, range, &mut request)
-    }
-
-    /// Try the retained source/tree optimization for the first real dispatch
-    /// cache miss in an active file window. Construction is transient; only
-    /// exact syntax bytes left after mandatory target dependencies are known
-    /// may enter the optional query-local cache.
-    fn begin_prepared_dispatch_at_source(
-        &mut self,
-        file: &ProjectFile,
-        materialized: SemanticOutcome<Arc<SemanticArtifact>>,
-        range: crate::analyzer::Range,
-    ) -> Option<
-        Result<
-            SemanticOutcome<crate::analyzer::semantic::workspace_oracle::SourceDispatchResult>,
-            crate::analyzer::semantic::SemanticProviderError,
-        >,
-    > {
-        if self.artifact_window_file.as_ref() != Some(file) || self.artifact_window.is_none() {
-            return None;
-        }
-        let oracle = self.workspace.semantic_oracle_provider();
-        let mut prepared = oracle.prepare_source_dispatch_session_in_artifact(materialized);
-        let cancellation = self.cancellation.unwrap_or(&self.uncancelled);
-        let artifact_collector = self
-            .artifact_window
-            .as_ref()
-            .map(SemanticArtifactLeaseWindow::collector);
-        let mut request = SemanticRequest::new(&mut self.budget, cancellation);
-        if let Some(collector) = &artifact_collector {
-            request = request.with_artifact_collector(collector);
-        }
-        let outcome = prepared.resolve_at_source(range, &mut request);
-        drop(request);
-        self.try_retain_prepared_source_dispatch(file.clone(), prepared, None);
-        Some(outcome)
+        let prepared = oracle.prepare_source_dispatch_session_in_artifact(materialized);
+        self.run_prepared_dispatch_at_source(file.clone(), prepared, range, None)
     }
 
     /// Bounded dispatch for one exact source position.
@@ -821,10 +937,7 @@ impl<'a> SemanticQueryContext<'a> {
                     }
                 };
 
-                match self.begin_prepared_dispatch_at_source(file, materialized.clone(), range) {
-                    Some(outcome) => outcome,
-                    None => self.one_shot_dispatch_at_source(materialized, range),
-                }
+                self.begin_prepared_dispatch_at_source(file, materialized, range)
             }
         };
         let artifact_window_fits = self.artifact_window_fits(file);
@@ -895,6 +1008,7 @@ impl<'a> SemanticQueryContext<'a> {
                 .is_some_and(|unit| self.locator_exactly_names_unit(caller_locator, unit));
             let call_context = call_contexts.len();
             call_contexts.push(super::dispatch::DispatchCallContext {
+                procedure_id: procedure_wire_id(call.procedure()),
                 caller,
                 caller_is_exact,
                 unnamed_boundaries: observation
@@ -1098,6 +1212,44 @@ impl<'a> SemanticQueryContext<'a> {
                     .collect::<Vec<_>>()
             })
             .collect()
+    }
+
+    /// Correlate an exact source call occurrence with its semantic invoke
+    /// point. Ambiguous or non-exact mappings stay absent for the caller to
+    /// report as open evidence.
+    pub(super) fn call_site_identity_at_source(
+        &mut self,
+        file: &ProjectFile,
+        range: crate::analyzer::Range,
+    ) -> Option<(String, String)> {
+        let (artifact, _, _) = self.materialize(file)?;
+        let index = self.source_call_index(file, &artifact)?;
+        let exact_key = (range.start_byte, range.end_byte);
+        let start = index
+            .candidates
+            .partition_point(|candidate| (candidate.span.start, candidate.span.end) < exact_key);
+        let end = index
+            .candidates
+            .partition_point(|candidate| (candidate.span.start, candidate.span.end) <= exact_key);
+        if end.saturating_sub(start) != 1 {
+            self.push_diagnostic(
+                CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                CodeQueryDiagnosticImpact::Incomplete,
+                file,
+                "structural call site has no unique exact semantic call-point mapping",
+            );
+            return None;
+        }
+        let candidate = index.candidates[start].clone();
+        let call = candidate
+            .procedure
+            .semantics()
+            .call_site(candidate.call.id())?;
+        let point = candidate.procedure.point_handle(call.point)?;
+        Some((
+            call_site_wire_id(&candidate.call),
+            program_point_wire_id(&point),
+        ))
     }
 
     /// The exact artifact outcome already retained for this file.
@@ -1402,16 +1554,188 @@ impl<'a> SemanticQueryContext<'a> {
     }
 
     pub(super) fn procedure_of_match(&mut self, seed: &SeedMatch) -> Vec<SemanticProcedureValue> {
-        let ranges = [seed_range(seed)];
-        let Some((artifact, source, quality)) = self.materialize(&seed.file) else {
+        self.procedure_of_source_range(&seed.file, seed_range(seed), seed.facts.source_identity())
+    }
+
+    /// Return structured type-flow proof that a Python member call's receiver
+    /// is exactly the builtin `str` class. The result is intentionally strict:
+    /// a subclass, union, unknown flow, or more than one class atom remains
+    /// open for the reviewed builtin-receiver assumption.
+    pub(super) fn python_exact_builtin_str_receiver(
+        &mut self,
+        shape: &super::CallShapeValue,
+    ) -> bool {
+        let outcome = &shape.report.outcome;
+        if crate::analyzer::common::language_for_file(&outcome.file)
+            != crate::analyzer::Language::Python
+        {
+            return false;
+        }
+        let Some(receiver_range) = outcome.receiver_range else {
+            return false;
+        };
+        let Some(member) = outcome.callee_name.as_deref() else {
+            return false;
+        };
+        let Some(facts) = shape.facts.as_ref() else {
+            return false;
+        };
+        let procedures =
+            self.procedure_of_source_range(&outcome.file, outcome.range, facts.source_identity());
+        let [procedure] = procedures.as_slice() else {
+            return false;
+        };
+        let rows = self.class_set_rows(procedure);
+        let mut matching = rows
+            .iter()
+            .filter(|row| row.range == receiver_range && row.member == member);
+        let Some(row) = matching.next() else {
+            return false;
+        };
+        matching.next().is_none()
+            && row.class.as_deref() == Some("builtins.str")
+            && row.origin == "external"
+            && row.status == "known"
+            && !row.guard_only
+    }
+
+    /// Return structured type-flow proof that a TypeScript member call's
+    /// receiver is exactly the modeled builtin `String` class. TypeScript's
+    /// reviewed policy deliberately accepts annotated and inferred `string`
+    /// values under the typed `builtin_receiver_assumption` basis; unions,
+    /// subclasses, and unknown flow remain open because they do not produce
+    /// one exact external class row.
+    pub(super) fn typescript_exact_builtin_string_receiver(
+        &mut self,
+        shape: &super::CallShapeValue,
+    ) -> bool {
+        self.exact_external_string_receiver(shape, crate::analyzer::Language::TypeScript)
+    }
+
+    /// Return structured proof for the JavaScript forms covered by the
+    /// reviewed String obligations: an exact string/template literal or an
+    /// unshadowed builtin `String(...)` call. A variable that happens to carry
+    /// a string is intentionally not enough; JavaScript has no assumption
+    /// basis for that flow.
+    pub(super) fn javascript_exact_string_receiver(
+        &mut self,
+        shape: &super::CallShapeValue,
+    ) -> bool {
+        let outcome = &shape.report.outcome;
+        if crate::analyzer::common::language_for_file(&outcome.file)
+            != crate::analyzer::Language::JavaScript
+        {
+            return false;
+        }
+        let Some(receiver_range) = outcome.receiver_range else {
+            return false;
+        };
+        let Some(source) = shape.source.as_deref() else {
+            return false;
+        };
+        let Some(form) = javascript_exact_receiver_form(source, receiver_range) else {
+            return false;
+        };
+        if form == JavascriptExactReceiverForm::StringConstructor {
+            return self.javascript_string_constructor_receiver(shape);
+        }
+        self.exact_external_string_receiver(shape, crate::analyzer::Language::JavaScript)
+    }
+
+    fn javascript_string_constructor_receiver(&mut self, shape: &super::CallShapeValue) -> bool {
+        let outcome = &shape.report.outcome;
+        let Some(receiver_range) = outcome.receiver_range else {
+            return false;
+        };
+        let Some(member) = outcome.callee_name.as_deref() else {
+            return false;
+        };
+        let Some(facts) = shape.facts.as_ref() else {
+            return false;
+        };
+        let procedures =
+            self.procedure_of_source_range(&outcome.file, outcome.range, facts.source_identity());
+        let [procedure] = procedures.as_slice() else {
+            return false;
+        };
+        let rows = self.class_set_rows(procedure);
+        let matching = rows
+            .iter()
+            .filter(|row| row.range == receiver_range && row.member == member);
+        let mut has_external_string = false;
+        for row in matching {
+            if let Some(class) = row.class.as_deref() {
+                if class == "String" && row.origin == "external" && !row.guard_only {
+                    has_external_string = true;
+                } else {
+                    return false;
+                }
+            }
+        }
+        // `String(value)` converts every argument to a primitive string. The
+        // class solver may retain an argument-flow unknown beside the exact
+        // conversion atom, but that unknown cannot change the call result's
+        // runtime class.
+        has_external_string
+    }
+
+    fn exact_external_string_receiver(
+        &mut self,
+        shape: &super::CallShapeValue,
+        language: crate::analyzer::Language,
+    ) -> bool {
+        let outcome = &shape.report.outcome;
+        if crate::analyzer::common::language_for_file(&outcome.file) != language {
+            return false;
+        }
+        let Some(receiver_range) = outcome.receiver_range else {
+            return false;
+        };
+        let Some(member) = outcome.callee_name.as_deref() else {
+            return false;
+        };
+        let Some(facts) = shape.facts.as_ref() else {
+            return false;
+        };
+        let procedures =
+            self.procedure_of_source_range(&outcome.file, outcome.range, facts.source_identity());
+        let [procedure] = procedures.as_slice() else {
+            return false;
+        };
+        let rows = self.class_set_rows(procedure);
+        let mut matching = rows
+            .iter()
+            .filter(|row| row.range == receiver_range && row.member == member);
+        let Some(row) = matching.next() else {
+            return false;
+        };
+        matching.next().is_none()
+            && row.class.as_deref() == Some("String")
+            && row.origin == "external"
+            && row.status == "known"
+            && !row.guard_only
+    }
+
+    /// Resolve the exact enclosing procedure for a source-backed row whose
+    /// originating structural seed is no longer available in the pipeline.
+    /// The row's content identity keeps this lookup on the same source
+    /// generation as its lexical and occurrence facts.
+    pub(super) fn procedure_of_source_range(
+        &mut self,
+        file: &ProjectFile,
+        range: crate::analyzer::Range,
+        source_identity: ContentIdentity,
+    ) -> Vec<SemanticProcedureValue> {
+        let ranges = [range];
+        let Some((artifact, source, quality)) = self.materialize(file) else {
             return Vec::new();
         };
-        if seed.facts.source_identity() != artifact.key().revision().content() {
-            self.push_source_generation_changed(&seed.file);
+        if source_identity != artifact.key().revision().content() {
+            self.push_source_generation_changed(file);
             return Vec::new();
         }
         let quality = quality.combine(&self.capability_quality(
-            &seed.file,
+            file,
             artifact.as_ref(),
             &[SemanticCapability::Procedures],
         ));
@@ -1424,44 +1748,204 @@ impl<'a> SemanticQueryContext<'a> {
             self.cancellation.unwrap_or(&self.uncancelled),
         );
         self.traversal_steps = self.traversal_steps.saturating_add(lookup.examined);
-        match lookup.status {
+        self.finish_procedure_range_lookup(
+            file,
+            source,
+            quality,
+            lookup.handles,
+            lookup.status,
+            ProcedureRangeLookupDiagnostics {
+                budget_reason: "enclosing-procedure lookup",
+                cancellation_message: "enclosing-procedure lookup was cancelled",
+            },
+        )
+    }
+
+    fn finish_procedure_range_lookup(
+        &mut self,
+        file: &ProjectFile,
+        source: SemanticSourceSnapshot,
+        quality: SemanticQueryQuality,
+        handles: Vec<ProcedureHandle>,
+        status: ProcedureRangeLookupStatus,
+        diagnostics: ProcedureRangeLookupDiagnostics,
+    ) -> Vec<SemanticProcedureValue> {
+        match status {
             ProcedureRangeLookupStatus::Complete => {
-                self.finish_procedure_lookup(&seed.file, source, lookup.handles, quality)
+                self.finish_procedure_lookup(file, source, handles, quality)
             }
             ProcedureRangeLookupStatus::BudgetExhausted => {
-                self.exhaust_traversal_budget(&seed.file, "enclosing-procedure lookup");
+                self.exhaust_traversal_budget(file, diagnostics.budget_reason);
                 Vec::new()
             }
             ProcedureRangeLookupStatus::Cancelled => {
                 self.push_diagnostic(
                     CodeQueryDiagnosticCode::Cancelled,
                     CodeQueryDiagnosticImpact::Incomplete,
-                    &seed.file,
-                    "enclosing-procedure lookup was cancelled",
+                    file,
+                    diagnostics.cancellation_message,
                 );
                 Vec::new()
             }
             ProcedureRangeLookupStatus::SourceChanged => {
-                self.push_source_generation_changed(&seed.file);
+                self.push_source_generation_changed(file);
                 Vec::new()
             }
         }
     }
 
+    fn program_point_of_match(&mut self, seed: &SeedMatch) -> Vec<SemanticProgramPointValue> {
+        let procedures = self.procedure_of_match(seed);
+        let identity =
+            StructuralNodeIdentity::new(seed.facts.source_identity(), seed.fact_match.node);
+        let is_await = seed.facts.node(seed.fact_match.node).kind
+            == brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind::Await;
+        let mut points = Vec::new();
+        for procedure in procedures {
+            // Await selection uses the observed suspend event below.
+            // Uniqueness depends on the complete point inventory, even
+            // when one point has an exact structural source mapping.
+            let quality = procedure.quality.combine(&self.capability_quality(
+                &procedure.file,
+                procedure.handle.artifact().as_ref(),
+                &[SemanticCapability::ProgramPoints],
+            ));
+            let semantics = procedure.handle.semantics();
+            for point in semantics.points() {
+                if !self.charge_consumer_traversal(&procedure.file, 1, "program-point selection") {
+                    return Vec::new();
+                }
+                let point_matches = semantics
+                    .source_mapping(point.source)
+                    .is_some_and(|mapping| mapping.ast_identity == Some(identity));
+                if !point_matches {
+                    continue;
+                }
+                if is_await {
+                    let mut suspend_matches = false;
+                    for event in &point.events {
+                        if !self.charge_consumer_traversal(
+                            &procedure.file,
+                            1,
+                            "program-point suspend selection",
+                        ) {
+                            return Vec::new();
+                        }
+                        if matches!(event.effect, SemanticEffect::AsyncSuspend { .. }) {
+                            suspend_matches = true;
+                            break;
+                        }
+                    }
+                    if !suspend_matches {
+                        continue;
+                    }
+                }
+                if let Some(mut value) = procedure.point_value(point.id) {
+                    value.quality = quality.clone();
+                    points.push(value);
+                }
+            }
+        }
+        if points.len() == 1 {
+            return points;
+        }
+        let mapped_ids = points
+            .iter()
+            .map(|point| point.handle.id())
+            .collect::<Vec<_>>();
+        let purpose = if is_await {
+            "unique AsyncSuspend point"
+        } else {
+            "unique source-mapped point"
+        };
+        self.push_diagnostic(
+            CodeQueryDiagnosticCode::SemanticCapabilityUnsupported,
+            CodeQueryDiagnosticImpact::Incomplete,
+            &seed.file,
+            &format!(
+                "program-point-of requires a {purpose} for structural node {:?}; matched program point ids: {mapped_ids:?}",
+                seed.fact_match.node
+            ),
+        );
+        Vec::new()
+    }
+
+    fn program_point_by_id(
+        &mut self,
+        procedure: &SemanticProcedureValue,
+        id: &str,
+    ) -> Vec<SemanticProgramPointValue> {
+        if !self.source_generation_is_current(
+            &procedure.file,
+            procedure.handle.artifact().key().revision().content(),
+        ) {
+            return Vec::new();
+        }
+        let quality = procedure.quality.combine(&self.capability_quality(
+            &procedure.file,
+            procedure.handle.artifact().as_ref(),
+            &[SemanticCapability::ProgramPoints],
+        ));
+        let mut points = Vec::new();
+        for point in procedure.handle.semantics().points() {
+            if !self.charge_consumer_traversal(&procedure.file, 1, "program-point ID selection") {
+                return Vec::new();
+            }
+            let handle = procedure
+                .handle
+                .point_handle(point.id)
+                .expect("a validated procedure owns its points");
+            if program_point_wire_id(&handle) != id {
+                continue;
+            }
+            points.push(SemanticProgramPointValue {
+                handle,
+                file: procedure.file.clone(),
+                source: procedure.source.clone(),
+                quality: quality.clone(),
+            });
+        }
+        if points.len() == 1 {
+            return points;
+        }
+        let matched_ids = points
+            .iter()
+            .map(|point| point.handle.id())
+            .collect::<Vec<_>>();
+        self.push_diagnostic(
+            CodeQueryDiagnosticCode::SemanticCapabilityUnsupported,
+            CodeQueryDiagnosticImpact::Incomplete,
+            &procedure.file,
+            &format!(
+                "program-point-by-id requires one content-scoped point {id:?} in procedure {}; matched program point ids: {matched_ids:?}",
+                procedure.wire_id()
+            ),
+        );
+        Vec::new()
+    }
+
     pub(super) fn seed_generation_is_current(&mut self, seed: &SeedMatch) -> bool {
+        self.source_generation_is_current(&seed.file, seed.facts.source_identity())
+    }
+
+    fn source_generation_is_current(
+        &mut self,
+        file: &ProjectFile,
+        identity: ContentIdentity,
+    ) -> bool {
         let current = *self
             .indexed_source_identities
-            .entry(seed.file.clone())
+            .entry(file.clone())
             .or_insert_with(|| {
                 self.workspace
                     .analyzer()
-                    .indexed_source(&seed.file)
+                    .indexed_source(file)
                     .map(|source| ContentIdentity::hash_bytes(source.as_bytes()))
             });
-        if current == Some(seed.facts.source_identity()) {
+        if current == Some(identity) {
             return true;
         }
-        self.push_source_generation_changed(&seed.file);
+        self.push_source_generation_changed(file);
         false
     }
 
@@ -1488,28 +1972,17 @@ impl<'a> SemanticQueryContext<'a> {
             self.cancellation.unwrap_or(&self.uncancelled),
         );
         self.traversal_steps = self.traversal_steps.saturating_add(lookup.examined);
-        match lookup.status {
-            ProcedureRangeLookupStatus::Complete => {
-                self.finish_procedure_lookup(file, source, lookup.handles, quality)
-            }
-            ProcedureRangeLookupStatus::BudgetExhausted => {
-                self.exhaust_traversal_budget(file, "declaration-to-procedure lookup");
-                Vec::new()
-            }
-            ProcedureRangeLookupStatus::Cancelled => {
-                self.push_diagnostic(
-                    CodeQueryDiagnosticCode::Cancelled,
-                    CodeQueryDiagnosticImpact::Incomplete,
-                    file,
-                    "declaration-to-procedure lookup was cancelled",
-                );
-                Vec::new()
-            }
-            ProcedureRangeLookupStatus::SourceChanged => {
-                self.push_source_generation_changed(file);
-                Vec::new()
-            }
-        }
+        self.finish_procedure_range_lookup(
+            file,
+            source,
+            quality,
+            lookup.handles,
+            lookup.status,
+            ProcedureRangeLookupDiagnostics {
+                budget_reason: "declaration-to-procedure lookup",
+                cancellation_message: "declaration-to-procedure lookup was cancelled",
+            },
+        )
     }
 
     /// Resolve one workspace declaration to one exact request-retained
@@ -1743,10 +2216,279 @@ impl<'a> SemanticQueryContext<'a> {
         )
     }
 
-    pub(super) fn concurrent_access_conflicts(
+    pub(super) fn modeled_task_spawns(
         &mut self,
         procedure: &SemanticProcedureValue,
-    ) -> Vec<ConcurrentAccessConflictValue> {
+    ) -> Vec<ModeledTaskSpawn> {
+        let rust_provider = self
+            .workspace
+            .analyzer()
+            .structural_fact_providers()
+            .into_iter()
+            .find(|provider| provider.structural_language() == Language::Rust);
+        let Some(rust_provider) = rust_provider else {
+            return Vec::new();
+        };
+        let Some(facts) = rust_provider.structural_facts(&procedure.file) else {
+            return Vec::new();
+        };
+        let spawn_ranges = facts
+            .nodes()
+            .iter()
+            .filter(|node| node.kind == crate::structural::NormalizedKind::ConcurrentSpawn)
+            .map(|node| (node.range.start_byte, node.range.end_byte))
+            .collect::<HashSet<_>>();
+        if spawn_ranges.is_empty() {
+            return Vec::new();
+        }
+
+        let mut spawns = Vec::new();
+        let mut pending_diagnostics = Vec::new();
+        for site in procedure.handle.semantics().call_sites() {
+            let Some(mapping) = procedure.handle.semantics().source_mapping(site.source) else {
+                continue;
+            };
+            let span = mapping.locator.anchor().span();
+            let source_file =
+                super::witness_projection::locator_file(self.workspace, &mapping.locator);
+            if source_file != procedure.file
+                || !spawn_ranges.contains(&(span.start_byte() as usize, span.end_byte() as usize))
+            {
+                continue;
+            }
+            let call = procedure
+                .handle
+                .call_site_handle(site.id)
+                .expect("validated task spawn call resolves");
+            let call_range = crate::analyzer::Range {
+                start_byte: span.start_byte() as usize,
+                end_byte: span.end_byte() as usize,
+                start_line: span.start().line() as usize + 1,
+                end_line: span.end().line() as usize + 1,
+            };
+            let dispatch = self.dispatch_at_source(&procedure.file, call_range);
+            let exact_target = match (
+                dispatch.coverage.is_exhaustive(),
+                dispatch.unnamed_boundaries.is_empty(),
+                dispatch.arms.as_slice(),
+            ) {
+                (true, true, [arm]) if arm.proof == "proven" => {
+                    arm.external_callee_identity.as_ref().and_then(|identity| {
+                        let call_shape = arm
+                            .exact_external_target
+                            .as_ref()
+                            .map(|target| (target.has_receiver(), target.parameter_count()))
+                            .or_else(|| {
+                                arm.unmaterialized_target
+                                    .as_ref()
+                                    .filter(|target| {
+                                        target.has_resolver_owned_call_shape()
+                                            && target.owner_fqn() == identity.owner_fqn()
+                                            && target.member() == identity.member()
+                                    })
+                                    .map(|target| (target.has_receiver(), target.arity()))
+                            });
+                        call_shape.map(|(has_receiver, parameter_count)| {
+                            (identity.clone(), has_receiver, parameter_count)
+                        })
+                    })
+                }
+                _ => None,
+            };
+            let Some((identity, has_receiver, parameter_count)) = exact_target else {
+                pending_diagnostics.push((
+                    CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                    format!("task spawn has no unique exact external target: {dispatch:#?}"),
+                ));
+                continue;
+            };
+            let Some(active_models) = self
+                .active_semantic_model_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.active_models())
+            else {
+                pending_diagnostics.push((
+                    CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                    format!(
+                        "task spawn model lookup has no active model snapshot for {}.{}",
+                        identity.owner_fqn(),
+                        identity.member(),
+                    ),
+                ));
+                continue;
+            };
+            let matched =
+                active_models.procedure_summaries_for_member(ProcedureSummaryMemberKey::new(
+                    identity.language().config_label(),
+                    identity.owner_fqn(),
+                    identity.member(),
+                    has_receiver,
+                    parameter_count,
+                ));
+            if matched.disposition == SemanticModelMatchDisposition::Conflict {
+                pending_diagnostics.push((
+                    CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                    format!(
+                        "task spawn model lookup is ambiguous for {}.{} (receiver={has_receiver}, parameter_count={parameter_count})",
+                        identity.owner_fqn(),
+                        identity.member(),
+                    ),
+                ));
+                continue;
+            }
+            let Some(selected) = matched.records.first() else {
+                pending_diagnostics.push((
+                    CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                    format!(
+                        "task spawn has no reviewed model for {}.{} (receiver={has_receiver}, parameter_count={parameter_count})",
+                        identity.owner_fqn(),
+                        identity.member(),
+                    ),
+                ));
+                continue;
+            };
+            if selected.record.completeness != Completeness::Complete {
+                pending_diagnostics.push((
+                    CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                    format!(
+                        "task spawn model is incomplete for {}.{}",
+                        identity.owner_fqn(),
+                        identity.member(),
+                    ),
+                ));
+                continue;
+            }
+
+            let mut found_task_spawn = false;
+            for effect in &selected.record.concurrency_effects {
+                let CompiledConcurrencyEffect::TaskSpawn { callable, .. } = effect else {
+                    continue;
+                };
+                found_task_spawn = true;
+                let callable = match callable {
+                    CompiledSummaryInput::Receiver {} => site.receiver,
+                    CompiledSummaryInput::Parameter { ordinal } => {
+                        let index = usize::try_from(*ordinal)
+                            .expect("u32 call parameter ordinal fits usize");
+                        site.arguments.get(index).map(|argument| argument.value)
+                    }
+                };
+                let Some(callable) = callable else {
+                    pending_diagnostics.push((
+                        CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                        format!(
+                            "task spawn model input is not bound at {}.{} (receiver={has_receiver}, parameter_count={parameter_count}): {effect:#?}",
+                            identity.owner_fqn(),
+                            identity.member(),
+                        ),
+                    ));
+                    continue;
+                };
+                spawns.push(ModeledTaskSpawn {
+                    call: call.clone(),
+                    callable,
+                });
+            }
+            if !found_task_spawn {
+                pending_diagnostics.push((
+                    CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                    format!(
+                        "exact model has no TaskSpawn effect for {}.{}",
+                        identity.owner_fqn(),
+                        identity.member(),
+                    ),
+                ));
+            }
+        }
+        for (code, message) in pending_diagnostics {
+            self.push_diagnostic(
+                code,
+                CodeQueryDiagnosticImpact::Incomplete,
+                &procedure.file,
+                &message,
+            );
+        }
+        spawns
+    }
+
+    pub(super) fn callback_invocation_edges(
+        &mut self,
+        caller: &SemanticProcedureValue,
+        max_outputs: usize,
+    ) -> Vec<SemanticProcedureCallEdge> {
+        let caller_semantics = caller.handle.semantics();
+        let mut creations = HashMap::default();
+        for point in caller_semantics.points() {
+            for event in &point.events {
+                let SemanticEffect::CallableCreation { result, callable } = &event.effect else {
+                    continue;
+                };
+                let CallableTargetResolution::Proven(CallableTarget::Local(target_id)) =
+                    &callable.targets
+                else {
+                    continue;
+                };
+                let Some(target) = caller.handle.artifact().procedure_handle(*target_id) else {
+                    continue;
+                };
+                let value = caller
+                    .handle
+                    .value_handle(*result)
+                    .expect("validated callable creation result resolves");
+                let identity = DurableObjectIdentity::Value(
+                    crate::analyzer::semantic::DurableValueIdentity::of(&value)
+                        .expect("callable creation result has a durable identity"),
+                );
+                let environment_identity = callable.environment.map(|environment_id| {
+                    let environment = caller
+                        .handle
+                        .allocation_handle(environment_id)
+                        .expect("validated callable creation environment resolves");
+                    crate::analyzer::semantic::AbstractObjectIdentity::Allocation(environment)
+                        .durable_identity()
+                        .expect("callable creation environment has a durable identity")
+                });
+                let creation_evidence = caller_semantics
+                    .evidence_row(event.evidence)
+                    .expect("validated callable creation evidence resolves");
+                let target_evidence = caller_semantics
+                    .evidence_row(callable.target_evidence)
+                    .expect("validated callable target evidence resolves");
+                let quality = caller
+                    .quality
+                    .combine(&quality_for_oracle_evidence(
+                        &creation_evidence.proof,
+                        &creation_evidence.completeness,
+                    ))
+                    .combine(&quality_for_oracle_evidence(
+                        &target_evidence.proof,
+                        &target_evidence.completeness,
+                    ));
+                assert!(
+                    creations
+                        .insert(identity, (target.clone(), quality.clone()))
+                        .is_none(),
+                    "one callable value has one creation target"
+                );
+                if let Some(environment_identity) = environment_identity {
+                    assert!(
+                        creations
+                            .insert(environment_identity, (target, quality))
+                            .is_none(),
+                        "one closure environment has one creation target"
+                    );
+                }
+            }
+        }
+        if creations.is_empty() || max_outputs == 0 {
+            return Vec::new();
+        }
+
+        let oracle = crate::analyzer::semantic::WorkspaceSemanticOracle::with_dispatch_hints(
+            self.workspace,
+            self.active_semantic_model_snapshot.clone(),
+            DispatchHints::empty(),
+        );
         let cancellation = self.cancellation.unwrap_or(&self.uncancelled);
         let artifact_collector = self
             .artifact_window
@@ -1756,192 +2498,369 @@ impl<'a> SemanticQueryContext<'a> {
         if let Some(collector) = &artifact_collector {
             request = request.with_artifact_collector(collector);
         }
-        let refused_before_root = request.budget.first_refusal().is_some();
-        let icfg = WorkspaceIcfgProvider::with_active_semantic_model_snapshot(
-            self.workspace,
-            self.active_semantic_model_snapshot.clone(),
-        );
-        let summary_reads =
-            brokk_bifrost_flow::dataflow::SummaryReadRecorder::new(self.workspace.analyzer());
-        let projection_concurrency = WorkspaceConcurrencyProvider::new_with_query_cache(
-            self.workspace,
-            self.active_semantic_model_snapshot.clone(),
-            None,
-            &self.concurrency_query_cache,
-        );
-        let summaries = match brokk_bifrost_flow::typestate::acquire_production_semantic_summaries_with_concurrency(
-            std::slice::from_ref(&procedure.handle),
-            &icfg,
-            &projection_concurrency,
-            self.semantic_summaries.as_ref(),
-            &summary_reads,
-            &mut request,
-        ) {
-            Ok(acquired) => {
-                let kind = acquired.kind();
-                let summaries = acquired.into_summaries();
-                if kind
-                    == brokk_bifrost_flow::typestate::ProductionSemanticSummaryAcquisitionKind::Projected
-                    && let Err(error) = self
-                        .semantic_summaries
-                        .publish_components(summaries.summaries(), summaries.components())
-                {
-                    self.diagnostics.push(CodeQueryDiagnostic {
-                        code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
-                        impact: CodeQueryDiagnosticImpact::Incomplete,
-                        branch: Vec::new(),
-                        language: "workspace",
-                        message: format!(
-                            "complete concurrency summaries exceeded workspace retention: {error}"
-                        ),
-                        exhausted_roots: Vec::new(),
-                    });
-                }
-                Some(summaries)
+        let mut edges = Vec::new();
+        let mut edge_keys = HashSet::default();
+        let mut pending_diagnostics = Vec::new();
+        'caller_calls: for call_row in caller_semantics.call_sites() {
+            if edges.len() >= max_outputs {
+                break;
             }
-            Err(error) => {
-                use brokk_bifrost_flow::typestate::ProductionSummaryProjectionError as Error;
-                let budget_error = matches!(
-                    error,
-                    Error::CallTransferBudgetExceeded { .. }
-                        | Error::PublicationBudgetExceeded { .. }
-                        | Error::RetainedClosureBudgetExceeded(_)
-                );
-                let (message, exhausted_roots) = match &self.concurrency_budget_exhaustion {
-                    Some(first) if budget_error => (
-                        format!(
-                            "concurrency summary projection was incomplete because the query's \
-                             shared semantic budget was already exhausted at {}: {error}",
-                            first.render()
-                        ),
-                        Vec::new(),
+            let call = caller
+                .handle
+                .call_site_handle(call_row.id)
+                .expect("validated caller call site resolves");
+            let dispatch_outcome = match oracle.resolve_call(&call, &mut request) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    pending_diagnostics.push((
+                        CodeQueryDiagnosticCode::SemanticProviderFailed,
+                        format!("callback dispatch resolution failed: {error}"),
+                    ));
+                    continue;
+                }
+            };
+            let Some(dispatch) = dispatch_outcome.available_value() else {
+                if !dispatch_outcome.is_complete() {
+                    pending_diagnostics.push((
+                        CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                        "callback dispatch resolution produced no available target set".to_owned(),
+                    ));
+                }
+                continue;
+            };
+            let dispatch_quality =
+                quality_from_oracle_outcome(&dispatch_outcome, "callback dispatch resolution");
+            if !dispatch.coverage().is_exhaustive() || !dispatch.boundaries().is_empty() {
+                pending_diagnostics.push((
+                    CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                    format!(
+                        "callback dispatch has open target coverage: coverage={}, boundaries={:?}",
+                        dispatch.coverage().label(),
+                        dispatch.boundaries()
                     ),
-                    None if budget_error => {
-                        let entry = concurrency_budget_exhaustion(
-                            procedure,
-                            refused_before_root,
-                            request.budget.first_refusal(),
-                        );
-                        self.concurrency_budget_exhaustion = Some(entry.clone());
-                        (
-                            format!(
-                                "concurrency summary projection exhausted the query's shared \
-                                 semantic budget: {error}: {}",
-                                entry.render()
-                            ),
-                            vec![entry],
-                        )
+                ));
+            }
+            let dispatch_candidates = dispatch.candidates().to_vec();
+            for candidate in &dispatch_candidates {
+                if !matches!(candidate.proof(), ProofStatus::Proven) {
+                    pending_diagnostics.push((
+                        CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                        "callback callee body has no proven dispatch candidate".to_owned(),
+                    ));
+                    continue;
+                }
+                // A resolved body with no calls cannot invoke a callback formal.
+                // In particular, storing a closure argument alone must not
+                // manufacture an execution edge or an incomplete-result warning.
+                if candidate.target().semantics().call_sites().is_empty() {
+                    continue;
+                }
+                let empty_context = OracleCallContext::empty();
+                let relations_outcome = match oracle.procedure_relations(
+                    candidate.target(),
+                    &empty_context,
+                    &mut request,
+                ) {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        pending_diagnostics.push((
+                            CodeQueryDiagnosticCode::SemanticProviderFailed,
+                            format!("callback body value-flow query failed: {error}"),
+                        ));
+                        continue;
                     }
-                    _ => (
-                        format!("concurrency summary projection was incomplete: {error}"),
-                        Vec::new(),
-                    ),
                 };
-                self.diagnostics.push(CodeQueryDiagnostic {
-                    code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
-                    impact: CodeQueryDiagnosticImpact::Incomplete,
-                    branch: Vec::new(),
-                    language: "workspace",
-                    message,
-                    exhausted_roots,
-                });
-                None
-            }
-        };
-        let provider = WorkspaceConcurrencyProvider::new_with_query_cache(
-            self.workspace,
-            self.active_semantic_model_snapshot.clone(),
-            summaries,
-            &self.concurrency_query_cache,
-        );
-        match brokk_bifrost_flow::concurrency::concurrent_access_conflicts_with_query_cache(
-            &provider,
-            &procedure.handle,
-            &mut request,
-            self.concurrency_query_cache.flow_cache(),
-        ) {
-            Ok(report) => {
-                if !report.reasons.is_empty() {
-                    let exhausted = report.reasons.contains(
-                        &brokk_bifrost_flow::concurrency::ConcurrencyOpenReason::BudgetExhausted,
-                    );
-                    let code = if exhausted {
-                        CodeQueryDiagnosticCode::SemanticBudgetExhausted
-                    } else {
-                        CodeQueryDiagnosticCode::SemanticAnalysisPartial
-                    };
-                    let (message, exhausted_roots) =
-                        match (exhausted, &self.concurrency_budget_exhaustion) {
-                            (true, Some(first)) => (
-                                format!(
-                                    "concurrent access analysis retained incomplete task slices \
-                                     because the query's shared semantic budget was already \
-                                     exhausted at {}: {:?}",
-                                    first.render(),
-                                    report.reasons
-                                ),
-                                Vec::new(),
-                            ),
-                            (true, None) => {
-                                let entry = concurrency_budget_exhaustion(
-                                    procedure,
-                                    refused_before_root,
-                                    request.budget.first_refusal(),
-                                );
-                                self.concurrency_budget_exhaustion = Some(entry.clone());
-                                (
-                                    format!(
-                                        "concurrent access analysis exhausted the query's shared \
-                                         semantic budget and retained incomplete task slices: \
-                                         {:?}: {}",
-                                        report.reasons,
-                                        entry.render()
-                                    ),
-                                    vec![entry],
-                                )
-                            }
-                            (false, _) => (
-                                format!(
-                                    "concurrent access analysis retained incomplete task slices: \
-                                     {:?}",
-                                    report.reasons
-                                ),
-                                Vec::new(),
-                            ),
-                        };
-                    self.diagnostics.push(CodeQueryDiagnostic {
-                        code,
-                        impact: CodeQueryDiagnosticImpact::Incomplete,
-                        branch: Vec::new(),
-                        language: "go",
-                        message,
-                        exhausted_roots,
-                    });
+                let Some(relations) = relations_outcome.available_value() else {
+                    pending_diagnostics.push((
+                        CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                        "callback callee body has no available value-flow snapshot".to_owned(),
+                    ));
+                    continue;
+                };
+                let relation_quality =
+                    quality_from_oracle_outcome(&relations_outcome, "callback body value flow");
+                if !relations.coverage().is_exhaustive() {
+                    pending_diagnostics.push((
+                        CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                        format!(
+                            "callback body value-flow coverage is {}",
+                            relations.coverage().label()
+                        ),
+                    ));
                 }
-                report
-                    .conflicts
-                    .into_iter()
-                    .map(|conflict| {
-                        super::concurrency::project_conflict(
-                            self.workspace,
-                            &procedure.handle,
-                            conflict,
+                let invoked_formals = callback_invoked_formals(candidate.target(), relations);
+                if invoked_formals.is_empty() {
+                    continue;
+                }
+                let bindings_outcome =
+                    match oracle.call_bindings(&call, candidate, &empty_context, &mut request) {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            pending_diagnostics.push((
+                                CodeQueryDiagnosticCode::SemanticProviderFailed,
+                                format!("callback call-binding query failed: {error}"),
+                            ));
+                            continue;
+                        }
+                    };
+                let Some(bindings) = bindings_outcome.available_value() else {
+                    pending_diagnostics.push((
+                        CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                        "callback call binding produced no available argument mapping".to_owned(),
+                    ));
+                    continue;
+                };
+                let bindings_quality =
+                    quality_from_oracle_outcome(&bindings_outcome, "callback call bindings");
+                if !bindings.coverage().is_exhaustive() {
+                    pending_diagnostics.push((
+                        CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                        format!(
+                            "callback call-binding coverage is {}",
+                            bindings.coverage().label()
+                        ),
+                    ));
+                }
+                let mut mappings = Vec::new();
+                for binding in bindings.bindings() {
+                    let CallBinding::ArgumentGroup(group) = binding else {
+                        continue;
+                    };
+                    for mapping in group.mappings() {
+                        let ProcedurePortKind::Parameter { ordinal } =
+                            mapping.value().formal().kind()
+                        else {
+                            continue;
+                        };
+                        if invoked_formals
+                            .iter()
+                            .any(|(_, invoked, _)| *invoked == ordinal)
+                            && matches!(mapping.proof(), ProofStatus::Proven)
+                        {
+                            mappings.push((ordinal, group.coverage(), mapping.clone()));
+                        }
+                    }
+                }
+                if mappings.is_empty() {
+                    continue;
+                }
+                for (invoked_call, formal_ordinal, invoke_quality) in &invoked_formals {
+                    let Some(invoked_row) = invoked_call
+                        .procedure()
+                        .semantics()
+                        .call_site(invoked_call.id())
+                    else {
+                        continue;
+                    };
+                    let Some(invoked_point) =
+                        invoked_call.procedure().point_handle(invoked_row.point)
+                    else {
+                        continue;
+                    };
+                    let invocation_context =
+                        OracleCallContext::bounded(vec![call.clone()], OracleLimits::default());
+                    let invocation_durable_context = DurableCallContext::of(&invocation_context)
+                        .expect("callback call context has a durable identity");
+                    let invoked_value = invoked_call
+                        .procedure()
+                        .value_handle(invoked_row.callee)
+                        .expect("validated indirect invocation callee resolves");
+                    let invoked_observation = ValueAtPoint::new(
+                        invoked_value,
+                        invoked_point,
+                        ObservationPhase::BeforeEffects,
+                        invocation_context,
+                    )
+                    .expect("callback invocation value and point share one procedure");
+                    let invoked_objects_outcome =
+                        match oracle.pointees(&invoked_observation, &mut request) {
+                            Ok(outcome) => outcome,
+                            Err(error) => {
+                                pending_diagnostics.push((
+                                    CodeQueryDiagnosticCode::SemanticProviderFailed,
+                                    format!("callback invocation points-to query failed: {error}"),
+                                ));
+                                continue;
+                            }
+                        };
+                    let Some(invoked_objects) = invoked_objects_outcome.available_value() else {
+                        pending_diagnostics.push((
+                            CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                            "callback invocation points-to query produced no candidate set"
+                                .to_owned(),
+                        ));
+                        continue;
+                    };
+                    let invoked_candidates = invoked_objects
+                        .objects()
+                        .candidates()
+                        .iter()
+                        .filter(|object| matches!(object.proof(), ProofStatus::Proven))
+                        .filter_map(|object| {
+                            object
+                                .value()
+                                .identity()
+                                .durable_identity()
+                                .ok()
+                                .map(|identity| {
+                                    (
+                                        identity,
+                                        object.proof().clone(),
+                                        object.completeness().clone(),
+                                    )
+                                })
+                        })
+                        .collect::<Vec<_>>();
+                    for (_ordinal, group_coverage, mapping) in mappings
+                        .iter()
+                        .filter(|(ordinal, _, _)| ordinal == formal_ordinal)
+                    {
+                        let actual_point = caller
+                            .handle
+                            .point_handle(call_row.point)
+                            .expect("validated callback caller point resolves");
+                        let actual_value = mapping.value().actual().value().clone();
+                        let actual_observation = ValueAtPoint::new(
+                            actual_value,
+                            actual_point,
+                            ObservationPhase::BeforeEffects,
+                            OracleCallContext::empty(),
                         )
-                    })
-                    .collect()
-            }
-            Err(error) => {
-                self.diagnostics.push(CodeQueryDiagnostic {
-                    code: CodeQueryDiagnosticCode::SemanticProviderFailed,
-                    impact: CodeQueryDiagnosticImpact::Incomplete,
-                    branch: Vec::new(),
-                    language: "workspace",
-                    message: format!("concurrent access analysis failed: {error}"),
-                    exhausted_roots: Vec::new(),
-                });
-                Vec::new()
+                        .expect("callback actual and caller point share one procedure");
+                        let actual_objects_outcome =
+                            match oracle.pointees(&actual_observation, &mut request) {
+                                Ok(outcome) => outcome,
+                                Err(error) => {
+                                    pending_diagnostics.push((
+                                        CodeQueryDiagnosticCode::SemanticProviderFailed,
+                                        format!("callback actual points-to query failed: {error}"),
+                                    ));
+                                    continue;
+                                }
+                            };
+                        let Some(actual_objects) = actual_objects_outcome.available_value() else {
+                            pending_diagnostics.push((
+                                CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                                "callback actual points-to query produced no candidate set"
+                                    .to_owned(),
+                            ));
+                            continue;
+                        };
+                        for actual_object in actual_objects.objects().candidates() {
+                            if !matches!(actual_object.proof(), ProofStatus::Proven) {
+                                continue;
+                            }
+                            let Ok(actual_identity) =
+                                actual_object.value().identity().durable_identity()
+                            else {
+                                continue;
+                            };
+                            let Some((target, creation_quality)) = creations.get(&actual_identity)
+                            else {
+                                continue;
+                            };
+                            for (invoked_identity, invoked_proof, invoked_completeness) in
+                                &invoked_candidates
+                            {
+                                // Incoming substitution rehomes the object in the callee;
+                                // match its exact caller context and durable base identity.
+                                let DurableObjectIdentity::CallSubstitution { context, base } =
+                                    invoked_identity
+                                else {
+                                    continue;
+                                };
+                                if context != &invocation_durable_context
+                                    || base.as_ref() != &actual_identity
+                                {
+                                    continue;
+                                }
+                                let mut quality = caller
+                                    .quality
+                                    .combine(&dispatch_quality)
+                                    .combine(&quality_for_oracle_evidence(
+                                        candidate.proof(),
+                                        candidate.completeness(),
+                                    ))
+                                    .combine(&relation_quality)
+                                    .combine(invoke_quality)
+                                    .combine(&bindings_quality)
+                                    .combine(&quality_for_oracle_evidence(
+                                        mapping.proof(),
+                                        mapping.completeness(),
+                                    ))
+                                    .combine(&quality_for_oracle_evidence(
+                                        invoked_proof,
+                                        invoked_completeness,
+                                    ))
+                                    .combine(&quality_for_oracle_evidence(
+                                        actual_object.proof(),
+                                        actual_object.completeness(),
+                                    ))
+                                    .combine(creation_quality);
+                                quality = quality.combine(&quality_from_oracle_outcome(
+                                    &invoked_objects_outcome,
+                                    "callback invocation points-to query",
+                                ));
+                                quality = quality.combine(&quality_from_oracle_outcome(
+                                    &actual_objects_outcome,
+                                    "callback actual points-to query",
+                                ));
+                                if !group_coverage.is_exhaustive() {
+                                    quality = quality.combine(&SemanticQueryQuality::partial(
+                                        "callback argument group has open coverage",
+                                    ));
+                                }
+                                let target = target.clone();
+                                if !edge_keys.insert((call.clone(), target.clone())) {
+                                    continue;
+                                }
+                                let target_value = SemanticProcedureValue {
+                                    handle: target,
+                                    file: caller.file.clone(),
+                                    source: caller.source.clone(),
+                                    quality: caller.quality.combine(&quality),
+                                };
+                                let edge = SemanticProcedureCallEdge {
+                                    call: call.clone(),
+                                    target: target_value,
+                                    proof: proof_from_query_quality(&quality),
+                                    completeness: completeness_from_query_quality(&quality),
+                                    callback_invocation: true,
+                                };
+                                assert_eq!(
+                                    edge.call, call,
+                                    "callback edge retains its exact call site"
+                                );
+                                assert_eq!(
+                                    edge.proof.label(),
+                                    proof_from_query_quality(&quality).label(),
+                                    "callback edge retains substituted proof quality"
+                                );
+                                assert_eq!(
+                                    edge.completeness.label(),
+                                    completeness_from_query_quality(&quality).label(),
+                                    "callback edge retains substituted completeness"
+                                );
+                                edges.push(edge);
+                                if edges.len() >= max_outputs {
+                                    break 'caller_calls;
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
+        drop(request);
+        for (code, message) in pending_diagnostics {
+            self.push_diagnostic(
+                code,
+                CodeQueryDiagnosticImpact::Incomplete,
+                &caller.file,
+                &message,
+            );
+        }
+        edges
     }
 
     pub(super) fn typestate_witness_truncated(&mut self, count: usize) {
@@ -1984,6 +2903,48 @@ impl<'a> SemanticQueryContext<'a> {
     ) -> Vec<super::type_flow::ClassSetRowValue> {
         let cancellation = self.cancellation.unwrap_or(&self.uncancelled);
         self.type_flow.class_sets(
+            self.workspace,
+            procedure,
+            &mut self.budget,
+            self.value_flow_limits,
+            cancellation,
+            self.active_semantic_model_snapshot.clone(),
+        )
+    }
+
+    pub(super) fn receiver_dispatch_assessment(
+        &mut self,
+        file: &ProjectFile,
+        range: crate::analyzer::Range,
+    ) -> super::type_flow::ReceiverDispatchAssessment {
+        let Some((artifact, _, _)) = self.materialize(file) else {
+            return super::type_flow::ReceiverDispatchAssessment::NotApplicable;
+        };
+        let source_identity = artifact.key().revision().content();
+        let procedures = self.procedure_of_source_range(file, range, source_identity);
+        let [procedure] = procedures.as_slice() else {
+            return super::type_flow::ReceiverDispatchAssessment::NotApplicable;
+        };
+        let cancellation = self.cancellation.unwrap_or(&self.uncancelled);
+        self.type_flow
+            .receiver_dispatch_assessment(super::type_flow::ReceiverDispatchQuery {
+                workspace: self.workspace,
+                procedure,
+                file,
+                range,
+                semantic_budget: &mut self.budget,
+                limits: self.value_flow_limits,
+                cancellation,
+                active_semantic_model_snapshot: self.active_semantic_model_snapshot.clone(),
+            })
+    }
+
+    pub(super) fn python_iterator_return_sets(
+        &mut self,
+        procedure: &SemanticProcedureValue,
+    ) -> Vec<brokk_bifrost_flow::type_flow::ReceiverClassSet> {
+        let cancellation = self.cancellation.unwrap_or(&self.uncancelled);
+        self.type_flow.python_iterator_return_sets(
             self.workspace,
             procedure,
             &mut self.budget,
@@ -2047,6 +3008,50 @@ impl<'a> SemanticQueryContext<'a> {
         )
     }
 
+    pub(super) fn rust_pointer_findings(
+        &mut self,
+        procedure: &SemanticProcedureValue,
+    ) -> Vec<super::rust_pointer_safety::RustPointerFindingValue> {
+        if crate::analyzer::common::language_for_file(procedure.file())
+            != crate::analyzer::Language::Rust
+        {
+            return Vec::new();
+        }
+        let cancellation = self.cancellation.unwrap_or(&self.uncancelled);
+        match super::rust_pointer_safety::analyze(
+            self.workspace,
+            &procedure.handle,
+            self.active_semantic_model_snapshot.clone(),
+            &mut self.budget,
+            self.value_flow_limits.solver_work,
+            cancellation,
+        ) {
+            Ok(findings) => {
+                if !findings.complete {
+                    self.push_diagnostic(
+                        CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                        CodeQueryDiagnosticImpact::Incomplete,
+                        procedure.file(),
+                        &format!(
+                            "Rust pointer provenance is incomplete: {:#?}",
+                            findings.reasons
+                        ),
+                    );
+                }
+                findings.rows
+            }
+            Err(error) => {
+                self.push_diagnostic(
+                    CodeQueryDiagnosticCode::SemanticProviderFailed,
+                    CodeQueryDiagnosticImpact::Incomplete,
+                    procedure.file(),
+                    &format!("Rust pointer provenance failed: {error}"),
+                );
+                Vec::new()
+            }
+        }
+    }
+
     fn finish_procedure_lookup(
         &mut self,
         file: &ProjectFile,
@@ -2054,17 +3059,40 @@ impl<'a> SemanticQueryContext<'a> {
         mut candidates: Vec<ProcedureHandle>,
         mut quality: SemanticQueryQuality,
     ) -> Vec<SemanticProcedureValue> {
+        let procedure_span = |candidate: &ProcedureHandle| {
+            candidate
+                .semantics()
+                .source_mappings()
+                .iter()
+                .find(|mapping| {
+                    mapping.kind == SourceMappingKind::Exact
+                        && mapping.locator.role() == SemanticRole::SourceMapping
+                })
+                .map(|mapping| mapping.locator.anchor().span())
+                .unwrap_or_else(|| candidate.semantics().locator().anchor().span())
+        };
         let smallest_span = candidates
             .iter()
             .map(|candidate| {
-                let span = candidate.semantics().locator().anchor().span();
+                let span = procedure_span(candidate);
                 span.end_byte().saturating_sub(span.start_byte())
             })
             .min();
         if let Some(smallest_span) = smallest_span {
             candidates.retain(|candidate| {
-                let span = candidate.semantics().locator().anchor().span();
+                let span = procedure_span(candidate);
                 span.end_byte().saturating_sub(span.start_byte()) == smallest_span
+            });
+        }
+        if candidates.len() > 1 {
+            let before_nesting = candidates.clone();
+            candidates.retain(|candidate| {
+                !before_nesting.iter().any(|descendant| {
+                    descendant.id() != candidate.id()
+                        && procedure_span(descendant) == procedure_span(candidate)
+                        && (procedure_is_lexically_nested_in(descendant, candidate)
+                            || procedure_is_owned_by_root_initializer(descendant, candidate))
+                })
             });
         }
         if candidates.len() > 1 {
@@ -2291,7 +3319,7 @@ impl<'a> SemanticQueryContext<'a> {
 
     fn record_active_retained_bytes(&mut self, bytes: usize) {
         self.active_retained_bytes = self.active_retained_bytes.saturating_add(bytes);
-        self.peak_retained_bytes = self.peak_retained_bytes.max(self.physical_retained_bytes());
+        self.observe_transient_active_retained_bytes(0);
     }
 
     fn observe_transient_active_retained_bytes(&mut self, bytes: usize) {
@@ -2526,7 +3554,7 @@ impl<'a> SemanticQueryContext<'a> {
         self.cache.is_empty()
             && self.indexed_source_identities.is_empty()
             && self.source_call_indexes.is_empty()
-            && self.prepared_source_dispatch.is_none()
+            && self.prepared_source_dispatch.is_empty()
             && self.active_retained_bytes == 0
             && self.artifact_window.is_none()
             && self.artifact_window_file.is_none()
@@ -2597,6 +3625,10 @@ impl<'a> SemanticQueryContext<'a> {
     }
 
     pub(super) fn into_receipt(mut self) -> Option<CodeQuerySemanticReceipt> {
+        // Retained dispatch syntax is the query's optional cache. Sessions over
+        // files outside a lease window hold artifacts that no lease accounts
+        // for, so they are dropped with the query rather than handed on.
+        self.evict_prepared_source_dispatch();
         let (execution_before, execution_child) = self.receipt_execution.take()?;
         assert!(
             execution_child.charge_traversal(self.traversal_steps),
@@ -2614,7 +3646,7 @@ impl<'a> SemanticQueryContext<'a> {
         assert!(
             self.artifact_window.is_none()
                 && self.artifact_window_file.is_none()
-                && self.prepared_source_dispatch.is_none(),
+                && self.prepared_source_dispatch.is_empty(),
             "the pipeline releases its final result-contract file window"
         );
         let artifact_charge = self.artifact_leases.into_charge();
@@ -2855,22 +3887,13 @@ impl<'a> SemanticQueryContext<'a> {
             feedback_iteration: None,
         };
         let message = format!("{reason}: {}", entry.render());
-        let key = (
+        self.record_diagnostic(
             CodeQueryDiagnosticCode::SemanticBudgetExhausted,
-            file.clone(),
-            message.clone(),
-        );
-        if !self.reported.insert(key) {
-            return;
-        }
-        self.diagnostics.push(CodeQueryDiagnostic {
-            code: CodeQueryDiagnosticCode::SemanticBudgetExhausted,
-            impact: CodeQueryDiagnosticImpact::Incomplete,
-            branch: Vec::new(),
-            language: crate::analyzer::common::language_for_file(file).config_label(),
+            CodeQueryDiagnosticImpact::Incomplete,
+            file,
             message,
-            exhausted_roots: vec![entry],
-        });
+            vec![entry],
+        );
     }
 
     fn push_diagnostic(
@@ -2880,19 +3903,92 @@ impl<'a> SemanticQueryContext<'a> {
         file: &ProjectFile,
         message: &str,
     ) {
-        let key = (code, file.clone(), message.to_string());
+        self.record_diagnostic(code, impact, file, message.to_string(), Vec::new());
+    }
+
+    fn record_diagnostic(
+        &mut self,
+        code: CodeQueryDiagnosticCode,
+        impact: CodeQueryDiagnosticImpact,
+        file: &ProjectFile,
+        message: String,
+        exhausted_roots: Vec<CodeQueryExhaustedRoot>,
+    ) {
+        let key = (code, file.clone(), message.clone());
         if !self.reported.insert(key) {
             return;
         }
         self.diagnostics.push(CodeQueryDiagnostic {
+            source: None,
             code,
             impact,
             branch: Vec::new(),
             language: crate::analyzer::common::language_for_file(file).config_label(),
-            message: message.to_string(),
-            exhausted_roots: Vec::new(),
+            message,
+            exhausted_roots,
+            withheld_rows_path: None,
         });
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JavascriptExactReceiverForm {
+    Literal,
+    Template,
+    StringConstructor,
+}
+
+fn javascript_exact_receiver_form(
+    source: &str,
+    range: crate::analyzer::Range,
+) -> Option<JavascriptExactReceiverForm> {
+    let language = crate::analyzer::parser_language_for(crate::analyzer::Language::JavaScript)?;
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&language).is_err() {
+        return None;
+    }
+    let tree = parser.parse(source, None)?;
+    let mut node = node_at_exact_range(tree.root_node(), range)?;
+    while node.kind() == "parenthesized_expression" && node.named_child_count() == 1 {
+        node = node.named_child(0)?;
+    }
+    match node.kind() {
+        "string" => Some(JavascriptExactReceiverForm::Literal),
+        "template_string" => (!node.parent().is_some_and(|parent| {
+            parent.kind() == "call_expression"
+                && parent
+                    .child_by_field_name("arguments")
+                    .is_some_and(|arguments| arguments.id() == node.id())
+        }))
+        .then_some(JavascriptExactReceiverForm::Template),
+        "call_expression" => {
+            let function = node.child_by_field_name("function")?;
+            (function.kind() == "identifier"
+                && function
+                    .utf8_text(source.as_bytes())
+                    .is_ok_and(|name| name == "String")
+                && node.child_by_field_name("arguments").is_some())
+            .then_some(JavascriptExactReceiverForm::StringConstructor)
+        }
+        _ => None,
+    }
+}
+
+fn node_at_exact_range<'tree>(
+    root: tree_sitter::Node<'tree>,
+    range: crate::analyzer::Range,
+) -> Option<tree_sitter::Node<'tree>> {
+    let mut found = None;
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.start_byte() == range.start_byte && node.end_byte() == range.end_byte {
+            found = Some(node);
+        }
+        for index in (0..node.named_child_count()).rev() {
+            stack.push(node.named_child(index).expect("named child exists"));
+        }
+    }
+    found
 }
 
 /// Refine source-call timing with facts that apply only to one dispatch arm.
@@ -2928,11 +4024,34 @@ impl CfgQueryAdapter<'_, '_> {
         self.context.procedure_of_match(seed)
     }
 
+    pub(super) fn program_point_of_match(
+        &mut self,
+        seed: &SeedMatch,
+    ) -> Vec<SemanticProgramPointValue> {
+        self.context.program_point_of_match(seed)
+    }
+
+    pub(super) fn program_point_by_id(
+        &mut self,
+        procedure: &SemanticProcedureValue,
+        id: &str,
+    ) -> Vec<SemanticProgramPointValue> {
+        self.context.program_point_by_id(procedure, id)
+    }
+
     pub(super) fn procedure_of_declaration(
         &mut self,
         declaration: &DeclarationValue,
     ) -> Vec<SemanticProcedureValue> {
         self.context.procedure_of_declaration(declaration)
+    }
+
+    pub(super) fn callback_invocation_edges(
+        &mut self,
+        caller: &SemanticProcedureValue,
+        max_outputs: usize,
+    ) -> Vec<SemanticProcedureCallEdge> {
+        self.context.callback_invocation_edges(caller, max_outputs)
     }
 
     pub(super) fn entry(
@@ -2986,17 +4105,7 @@ impl SemanticProcedureValue {
     /// partial. Local row families may still expose proven facts, but must not
     /// promote them to a complete selection while this quality is open.
     pub(super) fn exact_selection_incomplete_reason(&self) -> Option<String> {
-        if self.quality.is_complete() {
-            return None;
-        }
-        let mut reasons = Vec::new();
-        if let Some(reason) = &self.quality.proof_reason {
-            reasons.push(format!("proof: {reason}"));
-        }
-        if let Some(reason) = &self.quality.completeness_reason {
-            reasons.push(format!("coverage: {reason}"));
-        }
-        Some(reasons.join("; "))
+        self.quality.exact_selection_incomplete_reason()
     }
 
     /// The procedure's public wire identity, so a derived row family can name
@@ -3005,9 +4114,27 @@ impl SemanticProcedureValue {
         procedure_wire_id(&self.handle)
     }
 
+    /// Locate the affected procedure using its held, validated source snapshot.
+    /// This is not a source location for an unavailable dependency of the read.
+    pub(super) fn diagnostic_source(&self) -> Option<super::CodeQuerySourceSpan> {
+        let mapping = procedure_source_mapping(&self.handle);
+        if mapping.kind != SourceMappingKind::Exact {
+            return None;
+        }
+        let location = public_semantic_location(mapping, &self.source);
+        let span = byte_span(mapping);
+        Some(super::CodeQuerySourceSpan {
+            path: location.path,
+            range: location.range,
+            start_byte: span.start,
+            end_byte: span.end,
+        })
+    }
+
     pub(super) fn public(&self) -> CodeQueryProcedure {
         let procedure = self.handle.semantics();
         let mapping = procedure_source_mapping(&self.handle);
+        let location = public_semantic_location(mapping, &self.source);
         CodeQueryProcedure {
             id: procedure_wire_id(&self.handle),
             artifact_id: self
@@ -3016,11 +4143,11 @@ impl SemanticProcedureValue {
                 .key()
                 .public_fingerprint()
                 .to_string(),
-            path: mapping.locator.path().as_str().to_string(),
-            language: mapping.locator.language().language().config_label(),
+            path: location.path,
+            language: location.language,
             dialect: self.handle.artifact().key().language().stable_label(),
             procedure_kind: procedure.kind().label(),
-            range: public_range(mapping, &self.source),
+            range: location.range,
             evidence: public_evidence(procedure_evidence(&self.handle), &self.quality),
         }
     }
@@ -3041,6 +4168,10 @@ impl SemanticProcedureValue {
 
     pub(super) fn byte_span(&self) -> std::ops::Range<usize> {
         byte_span(procedure_source_mapping(&self.handle))
+    }
+
+    pub(super) fn source_text(&self) -> &str {
+        &self.source.source
     }
 
     /// One of the procedure's own program points as a pipeline value.
@@ -3071,6 +4202,20 @@ impl SemanticProcedureValue {
 }
 
 impl SemanticProgramPointValue {
+    pub(super) fn exact_selection_incomplete_reason(&self) -> Option<String> {
+        self.quality.exact_selection_incomplete_reason()
+    }
+
+    fn source_mapping(&self) -> &SourceMapping {
+        let procedure = self.handle.procedure().semantics();
+        let point = procedure
+            .point(self.handle.id())
+            .expect("validated program-point handle resolves in its procedure");
+        procedure
+            .source_mapping(point.source)
+            .expect("validated program point has a source mapping")
+    }
+
     pub(super) fn public(&self) -> CodeQueryProgramPoint {
         let procedure = self.handle.procedure();
         let point = procedure
@@ -3081,12 +4226,13 @@ impl SemanticProgramPointValue {
             .semantics()
             .source_mapping(point.source)
             .expect("validated program point has a source mapping");
+        let location = public_semantic_location(mapping, &self.source);
         CodeQueryProgramPoint {
             id: program_point_wire_id(&self.handle),
             procedure_id: procedure_wire_id(procedure),
-            path: mapping.locator.path().as_str().to_string(),
-            language: mapping.locator.language().language().config_label(),
-            range: public_range(mapping, &self.source),
+            path: location.path,
+            language: location.language,
+            range: location.range,
             boundary: point_boundary(&self.handle),
             event_count: point.events.len(),
             evidence: public_evidence(
@@ -3100,14 +4246,7 @@ impl SemanticProgramPointValue {
     }
 
     pub(super) fn public_ref(&self) -> super::CodeQueryResultRef {
-        let public = self.public();
-        super::CodeQueryResultRef::ProgramPoint {
-            id: public.id,
-            procedure_id: public.procedure_id,
-            path: public.path,
-            range: public.range,
-            boundary: public.boundary,
-        }
+        program_point_result_ref(self.point_ref())
     }
 
     pub(super) fn point_ref(&self) -> CodeQueryProgramPointRef {
@@ -3129,18 +4268,7 @@ impl SemanticProgramPointValue {
     /// family that anchors its evidence on a program point rather than on a
     /// rendered row of its own (#2443).
     pub(super) fn source_range(&self) -> crate::analyzer::Range {
-        let point = self
-            .handle
-            .procedure()
-            .semantics()
-            .point(self.handle.id())
-            .expect("validated program-point handle resolves in its procedure");
-        let mapping = self
-            .handle
-            .procedure()
-            .semantics()
-            .source_mapping(point.source)
-            .expect("validated program point has a source mapping");
+        let mapping = self.source_mapping();
         let span = mapping.locator.anchor().span();
         crate::analyzer::Range {
             start_byte: span.start_byte() as usize,
@@ -3151,19 +4279,17 @@ impl SemanticProgramPointValue {
     }
 
     pub(super) fn byte_span(&self) -> std::ops::Range<usize> {
-        let point = self
-            .handle
-            .procedure()
-            .semantics()
-            .point(self.handle.id())
-            .expect("validated program-point handle resolves in its procedure");
-        byte_span(
-            self.handle
-                .procedure()
-                .semantics()
-                .source_mapping(point.source)
-                .expect("validated program point has a source mapping"),
-        )
+        byte_span(self.source_mapping())
+    }
+}
+
+fn program_point_result_ref(point: CodeQueryProgramPointRef) -> super::CodeQueryResultRef {
+    super::CodeQueryResultRef::ProgramPoint {
+        id: point.id,
+        procedure_id: point.procedure_id,
+        path: point.path,
+        range: point.range,
+        boundary: point.boundary,
     }
 }
 
@@ -3178,6 +4304,7 @@ impl SemanticControlEdgeValue {
             .semantics()
             .source_mapping(edge.source)
             .expect("validated control edge has a source mapping");
+        let location = public_semantic_location(mapping, &self.source);
         let source = SemanticProgramPointValue {
             handle: procedure
                 .point_handle(edge.source_point)
@@ -3197,9 +4324,9 @@ impl SemanticControlEdgeValue {
         CodeQueryControlEdge {
             id: control_edge_wire_id(&self.handle),
             procedure_id: procedure_wire_id(procedure),
-            path: mapping.locator.path().as_str().to_string(),
-            language: mapping.locator.language().language().config_label(),
-            range: public_range(mapping, &self.source),
+            path: location.path,
+            language: location.language,
+            range: location.range,
             edge_kind: edge.kind.label(),
             source: source.point_ref(),
             target: target.point_ref(),
@@ -3256,7 +4383,12 @@ impl SemanticCallResultValue {
         &self,
         range: crate::analyzer::Range,
     ) -> CodeQueryRange {
-        public_range_for_offsets(range.start_byte, range.end_byte, &self.source)
+        super::render::range_for_offsets(
+            &self.source.source,
+            &self.source.line_starts,
+            range.start_byte,
+            range.end_byte,
+        )
     }
 
     pub(super) fn public(&self) -> CodeQueryCallResult {
@@ -3430,22 +4562,57 @@ fn public_evidence(
                 Some(bounded_reason(reason)),
             ),
         };
-    CodeQuerySemanticEvidence::from_axis_reasons(
-        proof,
-        completeness,
+    super::results::public_semantic_evidence(
+        proof == CodeQuerySemanticProof::Proven,
+        completeness == CodeQuerySemanticCompleteness::Complete,
         proof_reason,
         completeness_reason,
     )
 }
 
-fn bounded_reason(reason: &str) -> String {
-    const MAX_REASON_CHARS: usize = 256;
-    let mut chars = reason.chars();
-    let mut bounded = chars.by_ref().take(MAX_REASON_CHARS).collect::<String>();
-    if chars.next().is_some() {
-        bounded.push('…');
+fn procedure_is_lexically_nested_in(
+    descendant: &ProcedureHandle,
+    ancestor: &ProcedureHandle,
+) -> bool {
+    if !Arc::ptr_eq(descendant.artifact(), ancestor.artifact()) {
+        return false;
     }
-    bounded
+    let artifact = descendant.artifact();
+    let mut parent = descendant.semantics().lexical_parent();
+    while let Some(parent_id) = parent {
+        if parent_id == ancestor.id() {
+            return true;
+        }
+        parent = artifact
+            .procedure(parent_id)
+            .expect("validated procedure parent exists")
+            .lexical_parent();
+    }
+    false
+}
+
+/// A file-level callable can be a source child of the synthetic program
+/// initializer without being a lexical capture child. When both source
+/// mappings cover the entire file, the root initializer still owns that
+/// callable for structural selection, while the callable's semantic
+/// `lexical_parent` correctly remains absent for capture analysis.
+fn procedure_is_owned_by_root_initializer(
+    descendant: &ProcedureHandle,
+    ancestor: &ProcedureHandle,
+) -> bool {
+    let is_root_initializer = ancestor.semantics().kind() == ProcedureKind::Initializer
+        && ancestor.semantics().lexical_parent().is_none()
+        && ancestor
+            .semantics()
+            .locator()
+            .declaration()
+            .segments()
+            .last()
+            .is_some_and(|segment| {
+                segment.kind() == DeclarationSegmentKind::Initializer
+                    && segment.name() == Some(FILE_INITIALIZER_SEGMENT_NAME)
+            });
+    is_root_initializer && descendant.id() != ancestor.id()
 }
 
 fn procedure_source_mapping(handle: &ProcedureHandle) -> &SourceMapping {
@@ -3462,31 +4629,36 @@ fn procedure_evidence(handle: &ProcedureHandle) -> &Evidence {
         .expect("validated procedure has evidence")
 }
 
-fn public_range(mapping: &SourceMapping, source: &SemanticSourceSnapshot) -> CodeQueryRange {
-    let span = mapping.locator.anchor().span();
-    public_range_for_offsets(span.start_byte() as usize, span.end_byte() as usize, source)
+struct PublicSemanticLocation {
+    path: String,
+    language: &'static str,
+    range: CodeQueryRange,
 }
 
-fn public_range_for_offsets(
-    start_offset: usize,
-    end_offset: usize,
+fn public_semantic_location(
+    mapping: &SourceMapping,
     source: &SemanticSourceSnapshot,
-) -> CodeQueryRange {
-    let (start_line, start_column) =
-        line_column_for_offset(&source.source, &source.line_starts, start_offset);
-    let (end_line, end_column) =
-        line_column_for_offset(&source.source, &source.line_starts, end_offset);
-    CodeQueryRange {
-        start_line,
-        start_column,
-        end_line,
-        end_column,
+) -> PublicSemanticLocation {
+    PublicSemanticLocation {
+        path: mapping.locator.path().as_str().to_string(),
+        language: mapping.locator.language().language().config_label(),
+        range: public_range(mapping, source),
     }
+}
+
+fn public_range(mapping: &SourceMapping, source: &SemanticSourceSnapshot) -> CodeQueryRange {
+    let span = mapping.locator.anchor().span();
+    super::render::range_for_offsets(
+        &source.source,
+        &source.line_starts,
+        span.start_byte() as usize,
+        span.end_byte() as usize,
+    )
 }
 
 fn byte_span(mapping: &SourceMapping) -> std::ops::Range<usize> {
     let span = mapping.locator.anchor().span();
-    span.start_byte() as usize..span.end_byte() as usize
+    super::byte_span_from_offsets(span.start_byte() as usize, span.end_byte() as usize)
 }
 
 fn point_boundary(handle: &ProgramPointHandle) -> Option<CodeQueryProgramPointBoundary> {
@@ -3630,10 +4802,6 @@ fn push_evidence(
     }
 }
 
-fn saturating_u64(value: usize) -> u64 {
-    u64::try_from(value).unwrap_or(u64::MAX)
-}
-
 #[cfg(test)]
 #[allow(clippy::duplicate_mod)]
 #[path = "../../../../../test-support/inline_project.rs"]
@@ -3651,9 +4819,10 @@ mod tests {
         DeclarationSegmentKind, DeferredInvocationKind, DependencyFingerprint, EvidenceId,
         ProcedureId, ProcedureKind, ProcedureSemanticsParts, ProgramPointId, SemanticArtifactKey,
         SemanticArtifactLeaseSet, SemanticCapabilities, SemanticEvent, SemanticIrVersion,
-        SemanticLanguage, SemanticRole, SourceAnchor, SourceMappingId, SourceMappingKind,
-        SourcePosition, SourceRevision, SourceSpan, WorkspaceMountId, WorkspaceRelativePath,
+        SemanticLanguage, SemanticRole, SourceMappingId, SourceMappingKind, SourceRevision,
+        WorkspaceMountId, WorkspaceRelativePath,
     };
+    use brokk_bifrost_analysis::test_support::source_anchor;
 
     #[test]
     fn semantic_source_snapshot_retained_bytes_include_both_arc_allocations() {
@@ -3738,6 +4907,18 @@ mod tests {
     const PREPARED_DISPATCH_SOURCE: &str =
         "package subject\n\nfunc target() {}\nfunc caller() { target() }\n";
 
+    fn dispatch_call_range(source: &str, line: usize) -> crate::analyzer::Range {
+        let start = source
+            .rfind("target()")
+            .expect("fixture caller contains its target invocation");
+        crate::analyzer::Range {
+            start_byte: start,
+            end_byte: start + "target()".len(),
+            start_line: line,
+            end_line: line,
+        }
+    }
+
     fn prepared_dispatch_workspace() -> (BuiltInlineTestProject, WorkspaceAnalyzer) {
         let project = InlineTestProject::with_language(Language::Go)
             .file("subject.go", PREPARED_DISPATCH_SOURCE)
@@ -3750,15 +4931,7 @@ mod tests {
     }
 
     fn prepared_dispatch_call_range() -> crate::analyzer::Range {
-        let start = PREPARED_DISPATCH_SOURCE
-            .rfind("target()")
-            .expect("fixture caller contains its target invocation");
-        crate::analyzer::Range {
-            start_byte: start,
-            end_byte: start + "target()".len(),
-            start_line: 3,
-            end_line: 3,
-        }
+        dispatch_call_range(PREPARED_DISPATCH_SOURCE, 3)
     }
 
     const CROSS_FILE_DISPATCH_CALLER: &str = "package subject\n\nfunc caller() { target() }\n";
@@ -3777,15 +4950,7 @@ mod tests {
     }
 
     fn cross_file_dispatch_call_range() -> crate::analyzer::Range {
-        let start = CROSS_FILE_DISPATCH_CALLER
-            .rfind("target()")
-            .expect("fixture caller contains its cross-file invocation");
-        crate::analyzer::Range {
-            start_byte: start,
-            end_byte: start + "target()".len(),
-            start_line: 2,
-            end_line: 2,
-        }
+        dispatch_call_range(CROSS_FILE_DISPATCH_CALLER, 2)
     }
 
     fn continuation_context<'a>(
@@ -3824,7 +4989,6 @@ mod tests {
             0,
             None,
             workspace.analyzer().active_semantic_model_snapshot(),
-            None,
             None,
             None,
             &parent_scope,
@@ -3877,7 +5041,7 @@ mod tests {
         );
         let prepared_bytes = calibration
             .prepared_source_dispatch
-            .as_ref()
+            .last()
             .expect("the default cap retains calibrated dispatch syntax")
             .retained_bytes;
         let mandatory_bytes = calibration
@@ -3922,7 +5086,7 @@ mod tests {
             .collect::<Vec<_>>();
         let prepared = fitting
             .prepared_source_dispatch
-            .as_ref()
+            .last()
             .expect("an exactly fitting window retains its parsed dispatch session");
         assert_eq!(prepared.retained_bytes, prepared_bytes);
         assert_eq!(prepared.session.retained_bytes(), prepared.retained_bytes);
@@ -3968,7 +5132,7 @@ mod tests {
             fitting_targets,
             "the optional-retention refusal falls back to the same one-shot answer"
         );
-        assert!(refusing.prepared_source_dispatch.is_none());
+        assert!(refusing.prepared_source_dispatch.is_empty());
         assert_eq!(
             refusing.physical_retained_bytes(),
             mandatory_bytes,
@@ -4000,7 +5164,7 @@ mod tests {
             },
         );
         assert_eq!(no_call_answer.outcome, "unknown", "{no_call_answer:#?}");
-        assert!(no_call.prepared_source_dispatch.is_none());
+        assert!(no_call.prepared_source_dispatch.is_empty());
         assert_eq!(
             no_call.physical_retained_bytes(),
             mandatory_bytes,
@@ -4048,7 +5212,7 @@ mod tests {
         let expected_unnamed_boundaries = answer.unnamed_boundaries.clone();
         let prepared = calibration
             .prepared_source_dispatch
-            .as_ref()
+            .last()
             .expect("the default cap retains the cross-file caller syntax");
         let prepared_bytes = prepared.retained_bytes;
         assert_eq!(prepared.session.retained_bytes(), prepared_bytes);
@@ -4113,7 +5277,7 @@ mod tests {
                 .all(|arm| arm.proof == "proven" && arm.completeness == "complete"),
             "the optional-cache refusal leaves the complete target answer unchanged"
         );
-        assert!(fitting.prepared_source_dispatch.is_none());
+        assert!(fitting.prepared_source_dispatch.is_empty());
         assert_eq!(fitting.physical_retained_bytes(), mandatory_bytes);
         assert!(
             fitting
@@ -4718,17 +5882,6 @@ mod tests {
         assert!(parent_execution.work().exhausted);
     }
 
-    fn test_anchor(offset: u32) -> SourceAnchor {
-        SourceAnchor::new(
-            SourceSpan::new(
-                SourcePosition::new(offset, 0, offset),
-                SourcePosition::new(offset + 1, 0, offset + 1),
-            )
-            .expect("ordered test span"),
-            0,
-        )
-    }
-
     fn parallel_edge_artifact(reverse_edges: bool) -> Arc<SemanticArtifact> {
         let key = SemanticArtifactKey::new(
             WorkspaceMountId::hash_bytes(b"test mount"),
@@ -4743,10 +5896,15 @@ mod tests {
             ConfigurationFingerprint::hash_bytes(b"configuration"),
             DependencyFingerprint::hash_bytes(b"dependencies"),
         );
-        let procedure_anchor = test_anchor(1);
+        let procedure_anchor = source_anchor(1, 2, 0);
         let declaration = DeclarationLocator::new(vec![
-            DeclarationSegment::named(DeclarationSegmentKind::File, "Test.java", test_anchor(0), 0)
-                .expect("valid file segment"),
+            DeclarationSegment::named(
+                DeclarationSegmentKind::File,
+                "Test.java",
+                source_anchor(0, 1, 0),
+                0,
+            )
+            .expect("valid file segment"),
             DeclarationSegment::named(
                 DeclarationSegmentKind::Function,
                 "target",

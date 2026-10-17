@@ -315,11 +315,13 @@ fn selected_module_path(directory: &Path, module: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::Language;
     use crate::analyzer::java::JavaAdapter;
     use crate::analyzer::store::{WorkspaceConfigurationInput, WorkspaceFileRow, WorkspaceId};
     use crate::analyzer::tree_sitter_analyzer::{TreeSitterAnalyzer, ephemeral_store_context};
-    use crate::analyzer::{AnalyzerConfig, IAnalyzer, Language};
+    use crate::analyzer::{AnalyzerConfig, IAnalyzer};
     use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_test_macros::hardwon;
     use git2::{ObjectType, Oid};
     use std::cell::RefCell;
     use std::collections::BTreeSet;
@@ -394,6 +396,86 @@ mod tests {
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .unwrap()
         })
+    }
+
+    #[test]
+    #[hardwon(
+        "bee8b6fe1e65: Kotlin source access missed a Java file under the same Maven main root"
+    )]
+    fn selected_jvm_source_access_uses_shared_maven_roots_for_cross_language_files() {
+        const POM: &str = "<project><modelVersion>4.0.0</modelVersion><groupId>test</groupId><artifactId>jvm-call-bindings</artifactId><version>1</version></project>";
+        const KOTLIN_CALLER: &str = "src/main/kotlin/jdbc.kt";
+        const JAVA_CALLER: &str = "src/main/java/JdbcCall.java";
+        const JAVA_TARGET: &str = "src/main/java/java/sql/Statement.java";
+
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let java_snapshot = snapshot(
+            &store,
+            "java",
+            &[
+                (JAVA_CALLER, "class JdbcCall {}"),
+                (
+                    JAVA_TARGET,
+                    "package java.sql; public interface Statement {}",
+                ),
+            ],
+            &[("pom.xml", POM)],
+        );
+        let kotlin_snapshot = snapshot(
+            &store,
+            "kotlin",
+            &[(KOTLIN_CALLER, "fun use() = Unit")],
+            &[("pom.xml", POM)],
+        );
+        let java_context = store.reconcile_jvm_package_context(&java_snapshot).unwrap();
+        let kotlin_context = store
+            .reconcile_jvm_package_context(&kotlin_snapshot)
+            .unwrap();
+
+        let (java_rows, kotlin_rows, java_access, kotlin_access) =
+            store.conn.execute(move |connection| {
+                let file_version = |context, path: &str| {
+                    connection
+                        .query_row(
+                            "SELECT file_version_id FROM jvm_selected_source_files WHERE context_id=?1 AND rel_path=?2",
+                            rusqlite::params![context, path],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .unwrap()
+                };
+                let row_count = |context, path: &str| {
+                    connection
+                        .query_row(
+                            "SELECT count(*) FROM jvm_selected_source_root_files WHERE context_id=?1 AND rel_path=?2",
+                            rusqlite::params![context, path],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .unwrap()
+                };
+                let access = |context, caller, caller_path: &str, target| {
+                    connection
+                        .query_row(
+                            super::super::resolution_operation::jvm_context::SOURCE_ACCESS,
+                            rusqlite::params![context, caller, caller_path, target, JAVA_TARGET],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .unwrap()
+                };
+                let java_caller = file_version(java_context, JAVA_CALLER);
+                let kotlin_caller = file_version(kotlin_context, KOTLIN_CALLER);
+                let java_target = file_version(java_context, JAVA_TARGET);
+                (
+                    (row_count(java_context, JAVA_CALLER), row_count(java_context, JAVA_TARGET)),
+                    (row_count(kotlin_context, KOTLIN_CALLER), row_count(kotlin_context, JAVA_TARGET)),
+                    access(java_context, java_caller, JAVA_CALLER, java_target),
+                    access(kotlin_context, kotlin_caller, KOTLIN_CALLER, java_target),
+                )
+            });
+
+        assert_eq!(java_rows, (1, 1));
+        assert_eq!(kotlin_rows, (1, 0));
+        assert_eq!(java_access, "known");
+        assert_eq!(kotlin_access, "known");
     }
 
     enum BusyHandlerCommand {

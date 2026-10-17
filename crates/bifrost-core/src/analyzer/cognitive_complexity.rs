@@ -87,6 +87,36 @@ pub struct Config {
     pub named_function_boundary_predicate: Option<NamedFunctionBoundaryPredicate>,
 }
 
+/// Whether the shared callable metrics walk had enough structured evidence to
+/// make a complete claim for one callable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallableMetricsCoverage {
+    Exact,
+    Incomplete,
+}
+
+impl CallableMetricsCoverage {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Incomplete => "incomplete",
+        }
+    }
+}
+
+/// The query-local metrics derived from one callable's AST.
+///
+/// The optional values are absent when the corresponding structured evidence
+/// was not available. Consumers must use [`Self::coverage`] before treating
+/// any metric as an exact budget fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallableMetrics {
+    pub coverage: CallableMetricsCoverage,
+    pub max_nesting: Option<u32>,
+    pub cognitive_complexity: Option<u32>,
+    pub owned_body_span_lines: Option<u32>,
+}
+
 impl Config {
     /// Const constructor producing a no-op config. Language configs override
     /// the relevant slices in their static initializer.

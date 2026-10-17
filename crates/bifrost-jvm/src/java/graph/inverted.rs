@@ -20,16 +20,18 @@
 
 use super::JavaGraphSource;
 use super::resolver::{
-    constructor_method_reference_receiver, is_ignored_type_context, is_module_type_reference,
-    is_non_type_module_reference, is_record_pattern_type_reference, java_callable_arity, node_text,
-    resolve_field_access_type, resolve_nested_type_for_owner, resolve_type_segments,
+    argument_list_arity, constructor_method_reference_receiver, is_ignored_type_context,
+    is_module_type_reference, is_non_type_module_reference, is_record_pattern_type_reference,
+    java_callable_arity, method_reference_parts, node_text, resolve_field_access_type,
+    resolve_full_type_from_node, resolve_nested_type_for_owner, resolve_non_nested_type_for_graph,
+    resolve_type_segments,
 };
 use super::return_type::{
-    FileReturnCache, JavaReturnTypeContext, LexicalTypeResolution, METHOD_RECEIVER_CHAIN_LIMIT,
+    FileReturnCache, JavaReturnTypeContext, METHOD_RECEIVER_CHAIN_LIMIT,
     METHOD_RECEIVER_CHAIN_LIMIT_NAME, MethodAnonymousReturnCache, MethodReturnCache,
-    java_lexical_type_from_node, java_type_name_components, merge_receiver_type_outcomes,
-    method_return_type_for_owner_fqn,
+    merge_receiver_type_outcomes, method_return_type_for_owner_fqn,
 };
+use crate::java::declarations::{JavaScopeDeclaration, java_scope_declarations};
 use crate::java::graph_support::{JavaSource, resolve_java_usage_type_components_in};
 use crate::java::hierarchy::{JavaHierarchyFactError, java_nearest_declaring_ancestors};
 use brokk_bifrost_core::analyzer::model::{CodeUnit, ProjectFile};
@@ -107,35 +109,23 @@ impl JavaScan<'_> {
     }
 
     fn resolve_type(&self, token: QueryToken<'_>, node: Node<'_>) -> Option<CodeUnit> {
-        if matches!(node.kind(), "scoped_identifier" | "scoped_type_identifier") {
-            return resolve_type_segments(
-                node,
-                self.source,
-                |candidate| self.resolve_non_nested_type(token, candidate),
-                |owner, name| self.resolve_nested_type(owner, name),
-            )
-            .into_iter()
-            .last()
-            .map(|(resolved, _)| resolved);
-        }
-        self.resolve_non_nested_type(token, node)
+        resolve_full_type_from_node(
+            node,
+            self.source,
+            |candidate| self.resolve_non_nested_type(token, candidate),
+            |owner, name| self.resolve_nested_type(owner, name),
+        )
     }
 
     fn resolve_non_nested_type(&self, token: QueryToken<'_>, node: Node<'_>) -> Option<CodeUnit> {
-        match java_lexical_type_from_node(
+        resolve_non_nested_type_for_graph(
             self.java,
             token,
             self.graph,
             self.file,
             self.source,
             node,
-        ) {
-            LexicalTypeResolution::Resolved(unit) => return Some(unit),
-            LexicalTypeResolution::Blocked => return None,
-            LexicalTypeResolution::NotFound => {}
-        }
-        let components = java_type_name_components(node, self.source)?;
-        self.resolve_realm_type_name(&components)
+        )
     }
 
     /// Resolve a spelled type name through Java's own import and package tiers,
@@ -187,7 +177,7 @@ impl JavaScan<'_> {
 
     fn record_unproven(&mut self, name: &str, node: Node<'_>) {
         self.edges
-            .record_unproven_name(self.input, name, node.start_byte(), node.end_byte());
+            .record_unproven_name_at_node(self.input, name, node);
     }
 }
 
@@ -470,14 +460,6 @@ fn record_constructor_reference_for_type(
     }
 }
 
-fn method_reference_parts(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
-    let mut cursor = node.walk();
-    let children: Vec<_> = node.named_children(&mut cursor).collect();
-    let (member, rest) = children.split_last()?;
-    let receiver = rest.last().copied()?;
-    Some((receiver, *member))
-}
-
 /// Which declaration a member named on a receiver of a given static type
 /// actually is -- the one seam both the invocation and the method-reference
 /// arms resolve through.
@@ -682,28 +664,21 @@ fn seed_declarations(
     ctx: &JavaScan<'_>,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
-    match node.kind() {
-        "method_declaration" | "constructor_declaration" | "compact_constructor_declaration" => {
-            if let Some(parameters) = node.child_by_field_name("parameters") {
-                let mut cursor = parameters.walk();
-                for child in parameters.named_children(&mut cursor) {
-                    if child.kind() == "formal_parameter" {
-                        seed_typed_binding(child, token, ctx, bindings);
-                    }
-                }
-            }
-        }
-        "catch_clause" => {
-            if let Some(parameter) = node.child_by_field_name("parameter") {
+    for declaration in java_scope_declarations(node) {
+        match declaration {
+            JavaScopeDeclaration::MethodParameter(parameter)
+                if parameter.kind() == "formal_parameter" =>
+            {
                 seed_typed_binding(parameter, token, ctx, bindings);
             }
-        }
-        "enhanced_for_statement" => {
-            if let Some(name) = node.child_by_field_name("name") {
+            JavaScopeDeclaration::MethodParameter(_) => {}
+            JavaScopeDeclaration::CatchParameter(parameter) => {
+                seed_typed_binding(parameter, token, ctx, bindings);
+            }
+            JavaScopeDeclaration::EnhancedForName(name) => {
                 bindings.declare_shadow(node_text(name, ctx.source).to_string());
             }
         }
-        _ => {}
     }
 }
 
@@ -744,15 +719,15 @@ fn seed_variable_declaration(
             continue;
         }
         if let Some(fqn) = resolved_type.as_ref() {
-            bindings.seed_symbol(binding_name.to_string(), fqn.clone());
+            bindings.seed_or_shadow(binding_name.to_string(), Some(fqn.clone()));
             continue;
         }
-        match child
+        let target = match child
             .child_by_field_name("value")
             .map(|value| receiver_type_outcome(value, token, ctx, bindings))
         {
             Some(ReceiverAnalysisOutcome::Precise(values)) if values.len() == 1 => {
-                bindings.seed_symbol(binding_name.to_string(), values[0].clone());
+                Some(values[0].clone())
             }
             Some(
                 ReceiverAnalysisOutcome::Precise(_)
@@ -761,8 +736,9 @@ fn seed_variable_declaration(
                 | ReceiverAnalysisOutcome::ExceededBudget { .. }
                 | ReceiverAnalysisOutcome::Unknown,
             )
-            | None => bindings.declare_shadow(binding_name.to_string()),
-        }
+            | None => None,
+        };
+        bindings.seed_or_shadow(binding_name.to_string(), target);
     }
 }
 
@@ -779,18 +755,14 @@ fn seed_typed_binding(
     if binding_name.is_empty() {
         return;
     }
-    match node
+    let resolved = node
         .child_by_field_name("type")
-        .and_then(|type_node| ctx.resolve_type_fqn(token, type_node))
-    {
-        Some(fqn) => bindings.seed_symbol(binding_name.to_string(), fqn),
-        None => bindings.declare_shadow(binding_name.to_string()),
-    }
+        .and_then(|type_node| ctx.resolve_type_fqn(token, type_node));
+    bindings.seed_or_shadow(binding_name.to_string(), resolved);
 }
 
 fn single_precise_binding(bindings: &LocalInferenceEngine<String>, name: &str) -> Option<String> {
-    let targets = bindings.resolve_symbol_ref(name)?.as_precise()?;
-    (targets.len() == 1).then(|| targets.iter().next().expect("len checked").clone())
+    brokk_bifrost_core::analyzer::usages::inverted_edges::unique_precise(bindings, name)
 }
 
 fn receiver_type_outcome(
@@ -867,12 +839,5 @@ fn method_invocation_return_type_outcome(
     let Some(owner) = method_owner_fqn_at_depth(invocation, token, ctx, bindings, depth) else {
         return ReceiverAnalysisOutcome::Unknown;
     };
-    method_return_type_for_owner_fqn(&owner, token, name, argument_count(invocation), ctx)
-}
-
-fn argument_count(invocation: Node<'_>) -> usize {
-    invocation
-        .child_by_field_name("arguments")
-        .map(|arguments| arguments.named_child_count())
-        .unwrap_or(0)
+    method_return_type_for_owner_fqn(&owner, token, name, argument_list_arity(invocation), ctx)
 }

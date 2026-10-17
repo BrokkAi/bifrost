@@ -1,37 +1,134 @@
 use brokk_bifrost_core::analyzer::Range;
+use brokk_bifrost_core::analyzer::common::node_source_text as node_text;
 use brokk_bifrost_core::cancellation::CancellationToken;
 use brokk_bifrost_core::hash::HashSet;
 use tree_sitter::{Node, Tree};
+
+pub(crate) fn python_parameter_name(node: Node<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "identifier" => Some(node_text(node, source).trim().to_string()),
+        "typed_parameter"
+        | "typed_default_parameter"
+        | "default_parameter"
+        | "list_splat_pattern"
+        | "dictionary_splat_pattern" => node
+            .child_by_field_name("name")
+            .or_else(|| {
+                let mut cursor = node.walk();
+                node.named_children(&mut cursor)
+                    .find(|child| child.kind() == "identifier")
+            })
+            .and_then(|name| python_parameter_name(name, source)),
+        _ => None,
+    }
+    .filter(|name| !name.is_empty())
+}
+
+pub fn leftmost_identifier(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        match node.kind() {
+            "identifier" => return Some(node),
+            "attribute" => node = node.child_by_field_name("object")?,
+            _ => return None,
+        }
+    }
+}
+
+pub(crate) fn attribute_chain<'tree>(node: Node<'tree>) -> Option<(Node<'tree>, Vec<Node<'tree>>)> {
+    let mut attributes = Vec::new();
+    let mut current = node;
+    loop {
+        if current.kind() != "attribute" {
+            return None;
+        }
+        attributes.push(current.child_by_field_name("attribute")?);
+        current = current.child_by_field_name("object")?;
+        if current.kind() == "identifier" {
+            attributes.reverse();
+            return Some((current, attributes));
+        }
+    }
+}
+
+pub fn python_reference_is_deferred_function_body(node: Node<'_>) -> bool {
+    let site_start = node.start_byte();
+    let site_end = node.end_byte();
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if matches!(parent.kind(), "function_definition" | "lambda")
+            && parent
+                .child_by_field_name("body")
+                .is_some_and(|body| body.start_byte() <= site_start && site_end <= body.end_byte())
+        {
+            return true;
+        }
+        current = parent;
+    }
+    false
+}
 
 /// The identifier nodes in one static Python value path, from root to leaf.
 ///
 /// Dynamic receivers and subscripts have no static path. Keeping the nodes
 /// lets callers combine the parser shape with lexical/import binding facts
 /// without reparsing a dotted source spelling.
-pub fn python_static_attribute_path<'tree>(mut node: Node<'tree>) -> Option<Vec<Node<'tree>>> {
-    if !matches!(node.kind(), "identifier" | "attribute") {
-        return None;
-    }
+pub fn python_static_attribute_path<'tree>(node: Node<'tree>) -> Option<Vec<Node<'tree>>> {
+    python_static_value_path_with(node, || true, |_| None)
+        .expect("unbounded static path lookup completes")
+}
+
+/// A metered static value path, including transparent parentheses. The outer
+/// `None` means exhaustion; `Some(None)` means the receiver is not static.
+pub fn python_static_value_path_bounded<'tree>(
+    node: Node<'tree>,
+    scope_step: impl FnMut() -> bool,
+) -> Option<Option<Vec<Node<'tree>>>> {
+    python_static_value_path_with(
+        node,
+        scope_step,
+        crate::structural::python_parenthesized_expression_child,
+    )
+}
+
+fn python_static_value_path_with<'tree>(
+    mut node: Node<'tree>,
+    mut scope_step: impl FnMut() -> bool,
+    mut parenthesized_child: impl FnMut(Node<'tree>) -> Option<Node<'tree>>,
+) -> Option<Option<Vec<Node<'tree>>>> {
     let mut path = Vec::new();
     loop {
+        if !scope_step() {
+            return None;
+        }
         match node.kind() {
             "identifier" => {
                 path.push(node);
                 break;
             }
             "attribute" => {
-                let attribute = node.child_by_field_name("attribute")?;
-                if attribute.kind() != "identifier" {
-                    return None;
-                }
-                path.push(attribute);
-                node = node.child_by_field_name("object")?;
+                let Some(object) = push_static_attribute_segment(node, &mut path) else {
+                    return Some(None);
+                };
+                node = object;
             }
-            _ => return None,
+            "parenthesized_expression" => {
+                // The shared grammar helper skips comments. Charge all of its
+                // immediate inputs before it inspects them.
+                for _ in brokk_bifrost_core::analyzer::tree_walk::named_children_iter(node) {
+                    if !scope_step() {
+                        return None;
+                    }
+                }
+                let Some(child) = parenthesized_child(node) else {
+                    return Some(None);
+                };
+                node = child;
+            }
+            _ => return Some(None),
         }
     }
     path.reverse();
-    Some(path)
+    Some(Some(path))
 }
 
 /// The identifier nodes in one static Python annotation name, root to leaf.
@@ -47,12 +144,7 @@ pub fn python_static_type_path<'tree>(mut node: Node<'tree>) -> Option<Vec<Node<
             }
             "type" | "generic_type" | "subscript" => node = node.named_child(0)?,
             "attribute" => {
-                let attribute = node.child_by_field_name("attribute")?;
-                if attribute.kind() != "identifier" {
-                    return None;
-                }
-                path.push(attribute);
-                node = node.child_by_field_name("object")?;
+                node = push_static_attribute_segment(node, &mut path)?;
             }
             "member_type" => {
                 let mut cursor = node.walk();
@@ -70,6 +162,18 @@ pub fn python_static_type_path<'tree>(mut node: Node<'tree>) -> Option<Vec<Node<
     }
     path.reverse();
     Some(path)
+}
+
+fn push_static_attribute_segment<'tree>(
+    node: Node<'tree>,
+    path: &mut Vec<Node<'tree>>,
+) -> Option<Node<'tree>> {
+    let attribute = node.child_by_field_name("attribute")?;
+    if attribute.kind() != "identifier" {
+        return None;
+    }
+    path.push(attribute);
+    node.child_by_field_name("object")
 }
 
 /// The text one plain string literal denotes.
@@ -202,10 +306,6 @@ fn is_typing_module(module: &str) -> bool {
     matches!(module, "typing" | "typing_extensions")
 }
 
-fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    brokk_bifrost_core::analyzer::common::node_source_text(node, source)
-}
-
 /// Return the name-bearing node of a Python expression using tree-sitter fields.
 pub fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Node<'tree>> {
     let mut current = expression;
@@ -238,7 +338,12 @@ pub fn decorator_callee<'tree>(decorator: Node<'tree>) -> Option<Node<'tree>> {
     if decorator.kind() != "decorator" {
         return None;
     }
-    let mut expression = decorator.named_child(0)?;
+    // The grammar can interleave a `line_continuation` extra before the
+    // decorated expression; skip extras so `@\`-continued names resolve.
+    let mut cursor = decorator.walk();
+    let mut expression = decorator
+        .named_children(&mut cursor)
+        .find(|child| !child.is_extra())?;
     while expression.kind() == "call" {
         expression = expression.child_by_field_name("function")?;
     }
@@ -407,5 +512,46 @@ fn python_literal_annotation_base(value: Node<'_>, source: &str) -> bool {
             )
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#5044: commented parentheses must preserve import identity and budget exhaustion")]
+    fn static_paths_keep_parentheses_comments_and_exhaustion_distinct() {
+        let source = "(  # receiver\n    module).function\n";
+        let tree = crate::declarations::parse_python_tree(source).unwrap();
+        let expression = tree
+            .root_node()
+            .named_child(0)
+            .unwrap()
+            .named_child(0)
+            .unwrap();
+        // Preserve the producer-facing helper's existing admission contract.
+        assert!(super::python_static_attribute_path(expression).is_none());
+        assert!(super::python_static_value_path_bounded(expression, || false).is_none());
+        let path = super::python_static_value_path_bounded(expression, || true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            path.iter()
+                .map(|node| node.utf8_text(source.as_bytes()).unwrap())
+                .collect::<Vec<_>>(),
+            ["module", "function"]
+        );
+        let dynamic = crate::declarations::parse_python_tree("factory().function\n").unwrap();
+        let expression = dynamic
+            .root_node()
+            .named_child(0)
+            .unwrap()
+            .named_child(0)
+            .unwrap();
+        assert!(matches!(
+            super::python_static_value_path_bounded(expression, || true),
+            Some(None)
+        ));
     }
 }

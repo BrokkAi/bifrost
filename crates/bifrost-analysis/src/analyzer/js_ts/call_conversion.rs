@@ -19,6 +19,7 @@ use crate::analyzer::usages::call_conversion::{
     ArgumentTypeConversion, CallArgumentConversionProver, ConversionKind, ConversionUnknown,
     ResolvedConversionType, TypeScriptPrimitive,
 };
+use brokk_bifrost_core::analyzer::tree_walk::root_node;
 use brokk_bifrost_js_ts::providers::JsTsSource;
 use brokk_bifrost_js_ts::syntax::{
     JsTsImportBinder, compute_import_binder, compute_import_binder_for_root, parse_js_ts_tree,
@@ -72,9 +73,9 @@ pub(super) fn prove_argument(
     formal: Node<'_>,
     formal_source: &str,
 ) -> Result<ArgumentTypeConversion, ConversionUnknown> {
-    let actual_root = node_root(actual);
+    let actual_root = root_node(actual);
     let actual_imports = compute_import_binder_for_root(source, actual_root);
-    let formal_imports = compute_import_binder_for_root(formal_source, node_root(formal));
+    let formal_imports = compute_import_binder_for_root(formal_source, root_node(formal));
 
     let Some(host) = resolve_js_ts_source(analyzer, Language::TypeScript) else {
         return Err(ConversionUnknown::UnresolvedSourceType);
@@ -193,7 +194,7 @@ fn actual_type(
             .named_child(0)
             .ok_or(ConversionUnknown::UnsupportedExpression)?;
     }
-    let root = node_root(actual);
+    let root = root_node(actual);
     if matches!(
         actual.kind(),
         "as_expression" | "satisfies_expression" | "type_assertion" | "non_null_expression"
@@ -517,13 +518,6 @@ fn type_from_node_for_shape(
     .ok()
 }
 
-fn node_root(mut node: Node<'_>) -> Node<'_> {
-    while let Some(parent) = node.parent() {
-        node = parent;
-    }
-    node
-}
-
 fn declaration_has_type_parameters(
     analyzer: &dyn IAnalyzer,
     unit: &crate::analyzer::CodeUnit,
@@ -553,9 +547,7 @@ fn declaration_has_type_parameters(
 }
 
 fn has_anonymous_child(node: Node<'_>, kind: &str) -> bool {
-    let mut cursor = node.walk();
-    node.children(&mut cursor)
-        .any(|child| !child.is_named() && child.kind() == kind)
+    brokk_bifrost_core::analyzer::tree_walk::has_token_child(node, kind)
 }
 
 fn has_accessibility(node: Node<'_>, expected: &str) -> bool {
@@ -570,13 +562,7 @@ mod tests {
     use super::*;
 
     fn parse_tree(source: &str) -> Tree {
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
-            .expect("TypeScript grammar");
-        parser
-            .parse(source, None)
-            .expect("TypeScript source parses")
+        brokk_bifrost_js_ts::test_support::parse_typescript(source)
     }
 
     #[test]

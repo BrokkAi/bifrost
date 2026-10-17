@@ -306,6 +306,7 @@ fn key_predicate(field: &str, value: &Option<RowScalar>) -> QueryRowPredicate {
         | RowScalar::String(value)
         | RowScalar::DeclarationIdentity(value) => QueryRowLiteral::String(value.clone()),
         RowScalar::StringList(value) => QueryRowLiteral::StringList(value.clone()),
+        RowScalar::IntegerList(value) => QueryRowLiteral::IntegerList(value.clone()),
         RowScalar::ConstrainedEnum(value) => QueryRowLiteral::ConstrainedEnum(value.clone()),
         RowScalar::Integer(value) => QueryRowLiteral::Integer(*value),
         RowScalar::Boolean(value) => QueryRowLiteral::Boolean(*value),

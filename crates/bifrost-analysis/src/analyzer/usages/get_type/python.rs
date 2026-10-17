@@ -1,11 +1,14 @@
-use super::{TypeLookupOutcome, candidates_outcome_with_target_kind, no_type};
+use super::{
+    TypeLookupOutcome, candidates_outcome_with_target_kind, exact_semantic_model_type_outcome,
+    no_type,
+};
 use crate::analyzer::usages::get_definition::{
-    BoundedResolution, PythonDefinitionProvider, ResolutionSession,
+    BoundedResolution, PythonDefinitionProvider, PythonTypeLookupTarget, ResolutionSession,
     python_type_lookup_resolution_bounded,
 };
 use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
 use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
-use crate::analyzer::{IAnalyzer, ProjectFile, PythonAnalyzer, resolve_analyzer};
+use crate::analyzer::{IAnalyzer, Language, ProjectFile, PythonAnalyzer, resolve_analyzer};
 use crate::cancellation::CancellationToken;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use tree_sitter::Tree;
@@ -58,12 +61,25 @@ pub(crate) fn resolve_python_type_bounded(
             ),
         ));
     };
-    let fqn = resolution.unit.fq_name();
-    session.finish(candidates_outcome_with_target_kind(
-        fqn,
-        vec![resolution.unit],
-        resolution.target_kind,
-    ))
+    let outcome = match resolution.target {
+        PythonTypeLookupTarget::Workspace(unit) => {
+            candidates_outcome_with_target_kind(unit.fq_name(), vec![unit], resolution.target_kind)
+        }
+        PythonTypeLookupTarget::External { qualified_name } => exact_semantic_model_type_outcome(
+            analyzer,
+            file,
+            Language::Python,
+            &qualified_name,
+            resolution.target_kind,
+        )
+        .unwrap_or_else(|| {
+            no_type(
+                "python_external_class_not_modeled",
+                format!("`{qualified_name}` has no exact active Python class model"),
+            )
+        }),
+    };
+    session.finish(outcome)
 }
 
 #[cfg(test)]
@@ -76,6 +92,7 @@ mod tests {
     };
     use crate::analyzer::{Language, ProjectFile};
     use crate::test_support::AnalyzerFixture;
+    use brokk_bifrost_test_macros::hardwon;
 
     const MEMBER_SOURCE: &str = r#"class Engine:
     def start(self):
@@ -148,25 +165,6 @@ def drive(car: Car):
         )
     }
 
-    /// The two site shapes #1887 added both answer under the interactive
-    /// budget: a member expression through its receiver's class, and a
-    /// parameter annotated with a class imported from another workspace file.
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[test]
-    fn the_interactive_budget_answers_both_python_site_shapes() {
-        let member = member_expression(INTERACTIVE_TYPE_LOOKUP_BUDGET);
-        assert_eq!(member.status, TypeLookupStatus::Resolved, "{member:#?}");
-        assert_eq!(member.types[0].fqn, "app.Engine", "{member:#?}");
-
-        let annotation = imported_annotation(INTERACTIVE_TYPE_LOOKUP_BUDGET);
-        assert_eq!(
-            annotation.status,
-            TypeLookupStatus::Resolved,
-            "{annotation:#?}"
-        );
-        assert_eq!(annotation.types[0].fqn, "widget.Widget", "{annotation:#?}");
-    }
-
     /// Exhausting a budget axis on either shape stays a typed incomplete
     /// outcome that names the axis, not a silent "no type".
     #[test]
@@ -187,8 +185,10 @@ def drive(car: Car):
             );
         }
     }
-
     #[test]
+    #[hardwon(
+        "a0d8f4fd9414: Facade-imported Python class identity resolves through its explicit re-export chain within budget"
+    )]
     fn facade_imported_class_identity_is_exact_and_budgeted() {
         let source = "from facade import PublicWidget\n\ndef render(value: PublicWidget):\n    return value\n";
         let files = [

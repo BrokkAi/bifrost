@@ -16,6 +16,50 @@ pub(crate) struct TransferScratch<Fact> {
     emitted_outputs: HashSet<Fact>,
 }
 
+fn evaluate_transfer_with<Fact>(
+    zero_fact: Fact,
+    preserve_zero: bool,
+    scratch: &mut TransferScratch<Fact>,
+    request: &mut DataflowRequest<'_>,
+    apply: impl FnOnce(&mut dyn DataflowOutput<Fact>),
+) -> TransferEvaluation<Fact>
+where
+    Fact: Copy + Eq + std::hash::Hash + Ord,
+{
+    if let Some(termination) = request.reserve(SolverWork {
+        flow_evaluations: 1,
+        ..SolverWork::default()
+    }) {
+        return TransferEvaluation::Terminated(termination);
+    }
+
+    scratch.emitted_outputs.clear();
+    let sink_exceeded = {
+        let mut outputs = BoundedFactOutputs::new(
+            &mut scratch.emitted_outputs,
+            request.budget,
+            request.cancellation,
+        );
+        apply(&mut outputs);
+        if preserve_zero {
+            let _ = outputs.emit(zero_fact);
+        }
+        outputs.exceeded()
+    };
+
+    // A callback may cancel cooperatively; do not retain its partial relation.
+    if request.cancellation.is_cancelled() {
+        return TransferEvaluation::Terminated(SolverTermination::Cancelled);
+    }
+    if let Some(exceeded) = sink_exceeded {
+        return TransferEvaluation::Terminated(SolverTermination::ExceededBudget(exceeded));
+    }
+
+    let mut outputs = scratch.emitted_outputs.iter().copied().collect::<Vec<_>>();
+    outputs.sort_unstable();
+    TransferEvaluation::Outputs(outputs)
+}
+
 impl<Fact> TransferScratch<Fact> {
     pub(crate) fn new() -> Self {
         Self {
@@ -58,27 +102,18 @@ where
     Fact: Copy + Eq + std::hash::Hash,
 {
     fn should_continue(&self) -> bool {
-        !self.cancellation.is_cancelled() && self.exceeded.is_none()
+        super::should_continue(self.cancellation, false, self.exceeded.is_some())
     }
 
     fn emit(&mut self, value: Fact) -> bool {
         if !self.should_continue() {
             return false;
         }
-        if self.values.contains(&value) {
-            return true;
-        }
-
-        let callback_rows = self.values.len().saturating_add(1);
-        if let Err(exceeded) = self.budget.check(SolverWork {
-            callback_rows,
-            ..SolverWork::uniform(0)
-        }) {
+        if let Err(exceeded) = super::emit_bounded_callback_output(self.values, value, self.budget)
+        {
             self.exceeded = Some(exceeded);
             return false;
         }
-
-        self.values.insert(value);
         true
     }
 }
@@ -95,39 +130,9 @@ pub(crate) fn evaluate_transfer<P>(
 where
     P: DistributiveDataflowProblem,
 {
-    if let Some(termination) = request.reserve(SolverWork {
-        flow_evaluations: 1,
-        ..SolverWork::default()
-    }) {
-        return TransferEvaluation::Terminated(termination);
-    }
-
-    scratch.emitted_outputs.clear();
-    let sink_exceeded = {
-        let mut outputs = BoundedFactOutputs::new(
-            &mut scratch.emitted_outputs,
-            request.budget,
-            request.cancellation,
-        );
-        apply_transfer(problem, edge, fact, &mut outputs);
-        if preserve_zero {
-            let _ = outputs.emit(zero_fact);
-        }
-        outputs.exceeded()
-    };
-
-    // A callback may cooperatively cancel through a shared token. Its
-    // retained relation must not become visible after that checkpoint.
-    if request.cancellation.is_cancelled() {
-        return TransferEvaluation::Terminated(SolverTermination::Cancelled);
-    }
-    if let Some(exceeded) = sink_exceeded {
-        return TransferEvaluation::Terminated(SolverTermination::ExceededBudget(exceeded));
-    }
-
-    let mut outputs = scratch.emitted_outputs.iter().copied().collect::<Vec<_>>();
-    outputs.sort_unstable();
-    TransferEvaluation::Outputs(outputs)
+    evaluate_transfer_with(zero_fact, preserve_zero, scratch, request, |outputs| {
+        apply_transfer(problem, edge, fact, outputs)
+    })
 }
 
 pub(crate) fn evaluate_backward_transfer<P>(
@@ -142,37 +147,9 @@ pub(crate) fn evaluate_backward_transfer<P>(
 where
     P: BackwardDistributiveDataflowProblem,
 {
-    if let Some(termination) = request.reserve(SolverWork {
-        flow_evaluations: 1,
-        ..SolverWork::default()
-    }) {
-        return TransferEvaluation::Terminated(termination);
-    }
-
-    scratch.emitted_outputs.clear();
-    let sink_exceeded = {
-        let mut outputs = BoundedFactOutputs::new(
-            &mut scratch.emitted_outputs,
-            request.budget,
-            request.cancellation,
-        );
-        apply_backward_transfer(problem, edge, output_fact, &mut outputs);
-        if preserve_zero {
-            let _ = outputs.emit(zero_fact);
-        }
-        outputs.exceeded()
-    };
-
-    if request.cancellation.is_cancelled() {
-        return TransferEvaluation::Terminated(SolverTermination::Cancelled);
-    }
-    if let Some(exceeded) = sink_exceeded {
-        return TransferEvaluation::Terminated(SolverTermination::ExceededBudget(exceeded));
-    }
-
-    let mut outputs = scratch.emitted_outputs.iter().copied().collect::<Vec<_>>();
-    outputs.sort_unstable();
-    TransferEvaluation::Outputs(outputs)
+    evaluate_transfer_with(zero_fact, preserve_zero, scratch, request, |outputs| {
+        apply_backward_transfer(problem, edge, output_fact, outputs)
+    })
 }
 
 fn apply_transfer<P>(

@@ -2,9 +2,98 @@ use super::rust_privacy::complete_access_source_read;
 use super::*;
 use crate::analyzer::resolution::{
     DeclarationAccessDecision, DeclarationAccessRequest, DeclarationAccessRow, FactPageVisitor,
-    LoweredRustDeclarationAuthority, LoweredRustReferenceContext, SelectedDeclarationAccessSource,
-    SelectedTypedFactSource, SelectedTypedRow, TypedFactReadOutcome, TypedFactRequest,
+    LoweredRustDeclarationAuthority, LoweredRustReferenceContext, ReasonOwnerRow,
+    SelectedDeclarationAccessSource, SelectedTypedFactSource, SelectedTypedRow,
+    TypedFactReadOutcome, TypedFactRequest,
 };
+
+pub(crate) const REASON_OWNERS_SQL: &str = "SELECT gap.reason, authority.semantic_key
+FROM resolution_gap_reasons AS gap
+CROSS JOIN resolution_sites AS site
+  ON site.blob_id=gap.blob_id AND site.site=gap.site AND site.role=1
+CROSS JOIN resolution_rust_declaration_authorities AS authority
+  ON authority.blob_id=site.blob_id AND authority.source_site=site.site
+WHERE gap.blob_id=?1
+  AND gap.reason IN (SELECT value FROM json_each(?2))
+ORDER BY gap.reason";
+
+/// Configuration activity of a caller blob across its selected Cargo routes.
+/// Only `Inactive` is sufficient evidence to exclude a caller from analysis.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RustBlobActivity {
+    Active,
+    Inactive,
+    Unknown,
+}
+
+pub(crate) const BLOB_PLACEMENT_ACTIVITY: &str = "WITH route_evidence AS MATERIALIZED (
+ SELECT unit.workspace_id, unit.generation, json_extract(gap.detail, '$.path') AS path,
+        MIN(gap.gap_kind='inactive_placement'
+            AND json_extract(gap.detail, '$.activation')=0) AS inactive
+ FROM selected_rust_unit_summaries AS unit
+ CROSS JOIN main.rust_resolution_unit_summary_contexts AS context
+  ON context.summary_id=unit.summary_id AND context.target_kind<>'detached'
+ CROSS JOIN main.rust_resolution_unit_summary_gaps AS gap
+  ON gap.summary_id=unit.summary_id
+ AND gap.gap_kind IN ('inactive_placement','unknown_activation','unplaced_module','duplicate_placement')
+ GROUP BY unit.workspace_id, unit.generation, path
+)
+SELECT requested.value,
+ CASE WHEN EXISTS (
+  SELECT 1 FROM selected_rust_module_placements AS placement
+  CROSS JOIN main.rust_resolution_unit_summary_contexts AS context
+   ON context.summary_id=placement.summary_id AND context.target_kind<>'detached'
+  WHERE placement.placement_blob=requested.value
+   AND NOT EXISTS (
+    SELECT 1 FROM main.rust_resolution_unit_summary_gaps AS gap
+    WHERE gap.summary_id=placement.summary_id AND gap.gap_kind='unknown_activation'
+     AND (gap.subject=placement.container_path
+      OR substr(placement.container_path,1,length(gap.subject)+2)=gap.subject || '::')
+   )
+ ) THEN 1
+ WHEN EXISTS (
+  SELECT 1 FROM temp.selected_resolution_mounts AS mount
+  JOIN route_evidence AS evidence
+   ON evidence.workspace_id=mount.workspace_id AND evidence.generation=mount.generation
+  AND evidence.path=mount.persisted_relative_path
+  WHERE mount.blob_id=requested.value AND evidence.inactive=1
+ ) AND NOT EXISTS (
+  SELECT 1 FROM temp.selected_resolution_mounts AS mount
+  JOIN route_evidence AS evidence
+   ON evidence.workspace_id=mount.workspace_id AND evidence.generation=mount.generation
+  AND evidence.path=mount.persisted_relative_path
+  WHERE mount.blob_id=requested.value AND evidence.inactive IS NOT 1
+ ) THEN 0 ELSE -1 END
+FROM json_each(?1) AS requested ORDER BY requested.key";
+
+impl SelectedResolutionOperation<'_, '_> {
+    /// Read one verdict per input blob, preserving input order and duplicates.
+    /// The batch and its evidence live only for this query; detached placements
+    /// cannot prove activity or override positive Cargo inactivity evidence.
+    pub(crate) fn rust_blob_placement_activity(
+        &self,
+        blobs: &[i64],
+    ) -> Result<Vec<(i64, super::RustBlobActivity)>> {
+        let requested = serde_json::to_string(blobs).expect("blob ids serialize");
+        let rows = self
+            .ready
+            .inventory
+            .connection()
+            .prepare_cached(BLOB_PLACEMENT_ACTIVITY)?
+            .query_map([requested], |row| {
+                let activation: i64 = row.get(1)?;
+                debug_assert!((-1..=1).contains(&activation));
+                let activity = match activation {
+                    1 => RustBlobActivity::Active,
+                    0 => RustBlobActivity::Inactive,
+                    _ => RustBlobActivity::Unknown,
+                };
+                Ok((row.get(0)?, activity))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+}
 
 #[derive(Debug)]
 pub(super) struct RustCrateAccessPolicy {
@@ -25,7 +114,7 @@ pub(super) struct RustCrateSetAccessPolicy {
 }
 
 trait RustAccessDecisionSource: Send + Sync {
-    fn access_identity(&self) -> SemanticId;
+    fn identity(&self) -> SemanticId;
     fn decide(
         &self,
         facts: &dyn SelectedTypedFactSource,
@@ -34,9 +123,55 @@ trait RustAccessDecisionSource: Send + Sync {
     ) -> Result<DeclarationAccessDecision>;
 }
 
+/// Rust declaration-authority rows are keyed by a declaration in one source
+/// fragment. A shared name is a lookup recipe, not a concrete declaration.
+fn local_rust_authority_definition(definition: SemanticId) -> Option<SemanticId> {
+    definition.local_key().map(|_| definition)
+}
+
+pub(super) fn site_cfg_activation(
+    atoms: &BTreeSet<String>,
+    detached: bool,
+    condition: &brokk_bifrost_core::analyzer::rust_facts::RustCfgCondition,
+) -> (
+    brokk_bifrost_rust::selected_context::RustSelectedActivation,
+    bool,
+    Option<brokk_bifrost_rust::cfg::RustCfgSiteAssignment>,
+) {
+    if detached {
+        brokk_bifrost_rust::cfg::detached_site_cfg_activation(atoms, condition)
+    } else {
+        brokk_bifrost_rust::cfg::crate_site_cfg_activation(atoms, condition)
+    }
+}
+
+fn site_cfg_context<'a>(
+    rows: impl IntoIterator<Item = (&'a BTreeSet<String>, bool)>,
+    condition: &brokk_bifrost_core::analyzer::rust_facts::RustCfgCondition,
+) -> (
+    brokk_bifrost_rust::selected_context::RustSelectedActivation,
+    bool,
+    Option<brokk_bifrost_rust::cfg::RustCfgSiteAssignment>,
+) {
+    use brokk_bifrost_rust::selected_context::RustSelectedActivation;
+
+    let mut selected = None;
+    for (atoms, detached) in rows {
+        let context = site_cfg_activation(atoms, detached, condition);
+        if selected
+            .as_ref()
+            .is_some_and(|previous| previous != &context)
+        {
+            return (RustSelectedActivation::Unknown, false, None);
+        }
+        selected = Some(context);
+    }
+    selected.unwrap_or((RustSelectedActivation::Unknown, false, None))
+}
+
 impl<T: RustAccessDecisionSource> SelectedDeclarationAccessSource for T {
     fn identity(&self) -> SemanticId {
-        self.access_identity()
+        RustAccessDecisionSource::identity(self)
     }
 
     fn declaration_activation(
@@ -46,6 +181,9 @@ impl<T: RustAccessDecisionSource> SelectedDeclarationAccessSource for T {
         cancellation: &CancellationToken,
         session: Option<&ResolutionSession>,
     ) -> Result<Option<(DeclarationAccessDecision, Option<SemanticId>)>> {
+        let Some(definition) = local_rust_authority_definition(definition) else {
+            return Ok(Some((DeclarationAccessDecision::Allowed, None)));
+        };
         let mut authority = None;
         let mut collect = |rows: &[SelectedTypedRow<LoweredRustDeclarationAuthority>]| {
             for row in rows {
@@ -112,7 +250,10 @@ impl<T: RustAccessDecisionSource> SelectedDeclarationAccessSource for T {
             definitions.insert(request.definition);
         }
         let references = references.into_iter().collect::<Vec<_>>();
-        let definitions = definitions.into_iter().collect::<Vec<_>>();
+        let definitions = definitions
+            .into_iter()
+            .filter_map(local_rust_authority_definition)
+            .collect::<Vec<_>>();
 
         let mut reference_rows = BTreeMap::new();
         let mut collect_references = |rows: &[SelectedTypedRow<LoweredRustReferenceContext>]| {
@@ -225,6 +366,8 @@ impl<T: RustAccessDecisionSource> SelectedDeclarationAccessSource for T {
                 decision,
                 activation_reason: definition
                     .and_then(|definition| definition.row().activation_reason()),
+                visibility_applies: false,
+                subclass_access: None,
             });
             if page.len() == MAX_SOURCE_ROWS_PER_BATCH {
                 if !visitor.visit_page(&page)? {
@@ -256,43 +399,75 @@ impl<T: RustAccessDecisionSource> SelectedDeclarationAccessSource for T {
             TypedFactReadOutcome::exhausted(ResolutionCompletion::Complete)
         })
     }
+
+    fn visit_reason_owners(
+        &self,
+        facts: &dyn SelectedTypedFactSource,
+        reasons: TypedFactRequest<SemanticId>,
+        cancellation: &CancellationToken,
+        visitor: &mut FactPageVisitor<'_, ReasonOwnerRow>,
+    ) -> Result<TypedFactReadOutcome> {
+        let maximum_rows = visitor.maximum_rows().min(MAX_SOURCE_ROWS_PER_BATCH);
+        let session = visitor.resolution_session();
+        let mut adapt = |page: &[(SemanticId, SemanticId)]| {
+            let rows = page
+                .iter()
+                .map(|&(reason, definition)| ReasonOwnerRow { reason, definition })
+                .collect::<Vec<_>>();
+            visitor.visit_page(&rows)
+        };
+        let mut typed_visitor = match session {
+            Some(session) => {
+                FactPageVisitor::with_maximum_rows_in_session(&mut adapt, maximum_rows, session)
+            }
+            None => FactPageVisitor::with_maximum_rows(&mut adapt, maximum_rows),
+        };
+        facts.visit_rust_reason_owners(reasons, cancellation, &mut typed_visitor)
+    }
 }
 
-pub(super) const PLACEMENTS: &str = "WITH RECURSIVE graph(topology_id) AS (
- SELECT topology_id FROM selected_rust_crates WHERE crate_key=?1
- UNION SELECT target.topology_id FROM graph
- CROSS JOIN rust_crate_dependencies AS dependency USING(topology_id)
- CROSS JOIN selected_rust_crates AS target ON target.crate_key=dependency.dependency_crate_key
-) SELECT source.topology_id,source.container_path,json(topology.cfg_atoms)
-FROM source_rust_module_scopes AS scope
-CROSS JOIN rust_crate_container_sources AS source ON source.blob_id=scope.blob_id AND source.scope_ordinal=scope.ordinal
-CROSS JOIN rust_crate_topologies AS topology ON topology.topology_id=source.topology_id
-WHERE scope.blob_id=?2 AND scope.declaration_id IS ?3
-AND source.topology_id IN (SELECT topology_id FROM graph)";
+// Seek the blob's materialized placements before scanning its dependency
+// closure. Driving from graph used to repeat all module alignment per crate.
+pub(crate) const PLACEMENTS: &str =
+    "SELECT placement.topology_id, placement.container_path, json(context.cfg_atoms)
+FROM selected_rust_module_placements AS placement
+CROSS JOIN selected_rust_unit_closure AS graph
+  ON graph.root_unit_key=?1 AND graph.topology_id=placement.topology_id
+CROSS JOIN main.rust_resolution_unit_summary_contexts AS context
+  ON context.summary_id=graph.summary_id
+WHERE placement.placement_blob=?2 AND placement.module_declaration IS ?3";
 
 /// The module placements of a blob in the crate being resolved only, with the
 /// same columns as [`PLACEMENTS`]. See `reference_placements`.
-pub(super) const REFERENCE_PLACEMENTS: &str = "SELECT source.topology_id,source.container_path,json(topology.cfg_atoms)
-FROM source_rust_module_scopes AS scope
-CROSS JOIN rust_crate_container_sources AS source ON source.blob_id=scope.blob_id AND source.scope_ordinal=scope.ordinal
-CROSS JOIN rust_crate_topologies AS topology ON topology.topology_id=source.topology_id
-WHERE scope.blob_id=?2 AND scope.declaration_id IS ?3
-AND source.topology_id IN (SELECT topology_id FROM selected_rust_crates WHERE crate_key=?1)";
+pub(super) const REFERENCE_PLACEMENTS: &str = "SELECT placement.topology_id,
+ placement.container_path, json(context.cfg_atoms)
+FROM selected_rust_module_placements AS placement
+CROSS JOIN selected_rust_unit_summaries AS unit
+  ON unit.topology_id=placement.topology_id
+CROSS JOIN main.rust_resolution_unit_summary_contexts AS context
+  ON context.summary_id=unit.summary_id
+WHERE unit.unit_key=?1 AND placement.placement_blob=?2
+  AND placement.module_declaration IS ?3";
 
-pub(super) const MEMBERSHIPS: &str = "WITH RECURSIVE graph(topology_id) AS (
- SELECT topology_id FROM selected_rust_crates WHERE crate_key=?1
- UNION SELECT target.topology_id FROM graph
- CROSS JOIN rust_crate_dependencies AS dependency USING(topology_id)
- CROSS JOIN selected_rust_crates AS target ON target.crate_key=dependency.dependency_crate_key
-) SELECT DISTINCT source.topology_id,json(topology.cfg_atoms),topology.target_kind
-FROM rust_crate_container_sources AS source
-CROSS JOIN rust_crate_topologies AS topology ON topology.topology_id=source.topology_id
-WHERE source.blob_id=?2 AND source.topology_id IN (SELECT topology_id FROM graph)";
+pub(super) const MEMBERSHIPS: &str =
+    "SELECT graph.topology_id, json(context.cfg_atoms), context.target_kind
+FROM selected_rust_unit_closure AS graph
+CROSS JOIN main.rust_resolution_unit_summary_contexts AS context
+  ON context.summary_id=graph.summary_id
+WHERE graph.root_unit_key=?1 AND EXISTS (
+ SELECT 1 FROM main.resolution_unit_summary_members AS member
+  INDEXED BY resolution_unit_summary_members_blob
+ WHERE member.summary_id=graph.summary_id AND member.blob_id=?2
+)";
 
 pub(super) const VISIBILITY: &str = "SELECT CASE WHEN ?5='public' THEN 1
  WHEN ?1<>?3 THEN 0 WHEN ?5='crate' THEN 1
  WHEN ?5 IN ('private','self') THEN (?2=?4 OR substr(?2,1,length(?4)+2)=?4 || '::')
- ELSE (?2=cr_restriction(?5,?4,?6) OR substr(?2,1,length(cr_restriction(?5,?4,?6))+2)=cr_restriction(?5,?4,?6) || '::') END FROM rust_crate_containers WHERE topology_id=?3 AND container_path=?4";
+ ELSE (?2=cr_restriction(?5,?4,?6) OR substr(?2,1,length(cr_restriction(?5,?4,?6))+2)=cr_restriction(?5,?4,?6) || '::') END
+ FROM selected_rust_unit_summaries AS unit
+ CROSS JOIN main.rust_resolution_unit_summary_containers AS container
+  ON container.summary_id=unit.summary_id
+ WHERE unit.topology_id=?3 AND container.module_path=?4";
 
 // Visibility and activation use persisted crate placement even when the
 // selected canonical artifact is a content-mounted overlay. Its native facts
@@ -320,8 +495,9 @@ type PlacementMemo = HashMap<([u8; 32], i64, Option<u32>), Vec<CratePlacement>>;
 /// Both statements rebuild the dependency closure of the stage's crate before
 /// they look up one blob. On the whole tract graph they ran 757,326 times for
 /// 24 s, asking the same few blobs of the crate again for every access
-/// decision. The rows they read (crate rows, the selection's crates and the
-/// blobs' module scopes) do not change while a stage runs.
+/// decision. The rows they read (selected unit summaries, shared dependency
+/// rows, Rust placements and contexts, and the blob's module scopes) do not
+/// change while a stage runs.
 ///
 /// Only a crate stage holds one, with the export memo beside it: see
 /// `rust_crate_rows::CrateStageMemos`. Outside a crate stage the decisions run
@@ -480,10 +656,40 @@ pub(crate) fn access(
     {
         return Ok(None);
     }
+    // A definition-only check is declaration self-activation (including the
+    // reverse-usage preflight). Its own cfg is the premise until concrete
+    // reference sites are checked below with their site cfgs.
+    let site_condition = reference
+        .map(|row| row.row().cfg_condition())
+        .or_else(|| definition.map(|row| row.row().cfg_condition()))
+        .expect("Rust access has a reference or declaration cfg");
+    let site_rows = if reference.is_some() {
+        &references
+    } else {
+        &definitions
+    };
+    let (site_activation, _, assignment) = site_cfg_context(
+        site_rows.iter().map(|(_, _, atoms)| (atoms, false)),
+        site_condition,
+    );
+    match site_activation {
+        RustSelectedActivation::Unknown => {
+            return Ok(Some(DeclarationAccessDecision::UnknownActivation));
+        }
+        RustSelectedActivation::Inactive => {
+            return Ok(Some(DeclarationAccessDecision::InactiveActivation));
+        }
+        RustSelectedActivation::Active => (),
+    }
     let activation = |rows: &[CratePlacement], condition: &RustCfgCondition| {
         let mut active = false;
         for (_, _, atoms) in rows {
-            match brokk_bifrost_rust::cfg::crate_activation(atoms, condition) {
+            let selected = brokk_bifrost_rust::cfg::crate_activation_under_site_cfg(
+                atoms,
+                condition,
+                assignment.as_ref(),
+            );
+            match selected {
                 RustSelectedActivation::Unknown => return RustSelectedActivation::Unknown,
                 RustSelectedActivation::Active => active = true,
                 RustSelectedActivation::Inactive => (),
@@ -608,13 +814,48 @@ pub(crate) fn set_access(
     {
         return Ok(None);
     }
+    // A definition-only check is declaration self-activation (including the
+    // reverse-usage preflight). Its own cfg is the premise until concrete
+    // reference sites are checked below with their site cfgs.
+    let site_condition = reference
+        .map(|row| row.row().cfg_condition())
+        .or_else(|| definition.map(|row| row.row().cfg_condition()))
+        .expect("Rust access has a reference or declaration cfg");
+    let site_rows = if reference.is_some() {
+        &reference_memberships
+    } else {
+        &definition_memberships
+    };
+    let (site_activation, _, assignment) = site_cfg_context(
+        site_rows
+            .iter()
+            .map(|(_, atoms, kind)| (atoms, kind == "detached")),
+        site_condition,
+    );
+    match site_activation {
+        RustSelectedActivation::Unknown => {
+            return Ok(Some(DeclarationAccessDecision::UnknownActivation));
+        }
+        RustSelectedActivation::Inactive => {
+            return Ok(Some(DeclarationAccessDecision::InactiveActivation));
+        }
+        RustSelectedActivation::Active => (),
+    }
     let activation = |rows: &[CrateMembership], condition: &RustCfgCondition| {
         let mut active = false;
         for (_, atoms, kind) in rows {
             let state = if kind == "detached" {
-                brokk_bifrost_rust::cfg::detached_activation(atoms, condition)
+                brokk_bifrost_rust::cfg::detached_activation_under_site_cfg(
+                    atoms,
+                    condition,
+                    assignment.as_ref(),
+                )
             } else {
-                brokk_bifrost_rust::cfg::crate_activation(atoms, condition)
+                brokk_bifrost_rust::cfg::crate_activation_under_site_cfg(
+                    atoms,
+                    condition,
+                    assignment.as_ref(),
+                )
             };
             match state {
                 RustSelectedActivation::Unknown => return RustSelectedActivation::Unknown,
@@ -698,7 +939,7 @@ fn finish_access(
 }
 
 impl RustAccessDecisionSource for RustCrateAccessPolicy {
-    fn access_identity(&self) -> SemanticId {
+    fn identity(&self) -> SemanticId {
         self.identity
     }
 
@@ -753,7 +994,7 @@ impl RustAccessDecisionSource for RustCrateAccessPolicy {
 }
 
 impl RustAccessDecisionSource for RustCrateSetAccessPolicy {
-    fn access_identity(&self) -> SemanticId {
+    fn identity(&self) -> SemanticId {
         self.identity
     }
 

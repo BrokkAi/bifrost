@@ -2,20 +2,23 @@ use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
 
+use serde::Deserialize;
+
 use crate::CancellationToken;
 use crate::analyzer::DependencyPackEcosystem;
 use crate::analyzer::canonical_hash::{CanonicalHasher, is_lower_sha256, lower_hex_string};
 use crate::analyzer::semantic::StableDigest;
+use crate::analyzer::semantic_model::GoPinnedPackage;
 use crate::analyzer::topology::DependencyScope;
 use crate::hash::{HashSet, set_with_capacity};
 
 use super::{
-    ArtifactProducerLimits, AuthoredSemanticModelPack, CatalogCandidate, CatalogError,
-    CatalogPackSourceKind, CompilerOptions, Completeness, Diagnostic, ExactArtifact,
-    ExactSourceEntry, ExternalArtifactKind, GeneratedProduction, GeneratedProductionKey,
-    PackExtractionAccounting, Producer, ProducerDiagnostic, ProducerDiagnosticSeverity,
-    SEMANTIC_MODEL_SCHEMA_VERSION, SemanticModelActivationEvidence, SemanticModelActivationRequest,
-    SemanticPackCatalog, SemanticPackSelectorQuery, compile_pack,
+    ActivationSelector, ArtifactProducerLimits, AuthoredSemanticModelPack, CatalogCandidate,
+    CatalogCoordinate, CatalogError, CatalogPackSourceKind, CompilerOptions, Completeness,
+    Diagnostic, ExactArtifact, ExactSourceEntry, ExternalArtifactKind, GeneratedProduction,
+    GeneratedProductionKey, NameSelector, PackExtractionAccounting, Producer, ProducerDiagnostic,
+    ProducerDiagnosticSeverity, SEMANTIC_MODEL_SCHEMA_VERSION, SemanticModelActivationEvidence,
+    SemanticModelActivationRequest, SemanticPackCatalog, SemanticPackSelectorQuery, compile_pack,
     producer::{read_exact_artifact_while, read_exact_source_set_while},
 };
 
@@ -83,10 +86,7 @@ pub struct ArtifactSourceIdentity(String);
 
 impl ArtifactSourceIdentity {
     pub fn from_digest(digest: String) -> Self {
-        assert!(
-            is_lower_sha256(&digest),
-            "artifact source identity must be a lowercase SHA-256 digest"
-        );
+        assert_lower_sha256_identity(&digest, "artifact source identity");
         Self(digest)
     }
 
@@ -106,16 +106,20 @@ pub struct DependencySourceIdentity(String);
 
 impl DependencySourceIdentity {
     pub fn from_digest(digest: String) -> Self {
-        assert!(
-            is_lower_sha256(&digest),
-            "dependency source identity must be a lowercase SHA-256 digest"
-        );
+        assert_lower_sha256_identity(&digest, "dependency source identity");
         Self(digest)
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+fn assert_lower_sha256_identity(digest: &str, identity: &str) {
+    assert!(
+        is_lower_sha256(digest),
+        "{identity} must be a lowercase SHA-256 digest"
+    );
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,14 +149,9 @@ impl ResolvedDependencyArtifact {
         path: PathBuf,
         expected_sha256: String,
     ) -> Self {
-        Self {
-            role,
-            kind,
-            module: None,
-            input: ResolvedDependencyArtifactInput::File(path),
-            expected_sha256: Some(expected_sha256),
-            source_identity: None,
-        }
+        let mut artifact = Self::file(role, kind, path);
+        artifact.expected_sha256 = Some(expected_sha256);
+        artifact
     }
 
     pub fn module_file(
@@ -161,14 +160,9 @@ impl ResolvedDependencyArtifact {
         module: String,
         path: PathBuf,
     ) -> Self {
-        Self {
-            role,
-            kind,
-            module: Some(module),
-            input: ResolvedDependencyArtifactInput::File(path),
-            expected_sha256: None,
-            source_identity: None,
-        }
+        let mut artifact = Self::file(role, kind, path);
+        artifact.module = Some(module);
+        artifact
     }
 
     pub fn source_set(
@@ -200,17 +194,9 @@ impl ResolvedDependencyArtifact {
         root: PathBuf,
         relative_paths: Vec<PathBuf>,
     ) -> Self {
-        Self {
-            role,
-            kind,
-            module: Some(module),
-            input: ResolvedDependencyArtifactInput::SourceSet {
-                root,
-                relative_paths,
-            },
-            expected_sha256: None,
-            source_identity: None,
-        }
+        let mut artifact = Self::source_set(role, kind, root, relative_paths);
+        artifact.module = Some(module);
+        artifact
     }
 
     /// Attach the read-free identity an adapter derived for this artifact.
@@ -267,7 +253,32 @@ pub struct ResolvedDependency {
     pub declared_by: Option<String>,
 }
 
+pub(crate) fn activation_selector_for_evidence(
+    evidence: &SemanticModelActivationEvidence,
+) -> ActivationSelector {
+    let name_selector = |coordinate: &CatalogCoordinate| NameSelector {
+        name: coordinate.name.clone(),
+        version: coordinate
+            .version
+            .as_ref()
+            .map(|version| format!("={version}")),
+    };
+    ActivationSelector {
+        package: evidence.package.as_ref().map(name_selector),
+        module: evidence.module.as_ref().map(name_selector),
+        toolchain: evidence.toolchain.as_ref().map(name_selector),
+        targets: evidence.target.clone().into_iter().collect(),
+        configurations: evidence.configuration.clone().into_iter().collect(),
+        artifact_sha256: None,
+    }
+}
+
 impl ResolvedDependency {
+    pub(crate) fn has_language_artifact(&self, language: &str, kind: ExternalArtifactKind) -> bool {
+        self.evidence.language == language
+            && self.artifacts.iter().any(|artifact| artifact.kind == kind)
+    }
+
     /// A dependency whose build scope and declaring entity are not established
     /// by the evidence the resolver read.
     ///
@@ -479,6 +490,112 @@ impl ExactDependencyArtifact {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct GoSourcePackageMetadata {
+    import_path: String,
+    name: String,
+    files: Vec<String>,
+}
+
+struct PreparedExactGoSource<'a> {
+    artifact: &'a ExactArtifact,
+    packages: Vec<GoPinnedPackage>,
+}
+
+fn prepared_exact_go_source<'a>(
+    dependency: &ResolvedDependency,
+    artifacts: &'a [ExactDependencyArtifact],
+) -> Result<Option<PreparedExactGoSource<'a>>, CatalogError> {
+    // Other adapters may use the source-set framing as opaque production
+    // input. Native Go source publication requires Go activation evidence.
+    if dependency.evidence.language != "go" {
+        return Ok(None);
+    }
+    let go_artifacts = artifacts
+        .iter()
+        .filter(|artifact| artifact.kind() == ExternalArtifactKind::GoSourceSet)
+        .collect::<Vec<_>>();
+    if go_artifacts.is_empty() {
+        return Ok(None);
+    }
+    if go_artifacts.len() != 1 {
+        return Err(CatalogError::Integrity(
+            "Go exact source preparation requires exactly one Go source set".to_owned(),
+        ));
+    }
+    let package_metadata = dependency
+        .provenance
+        .iter()
+        .find(|entry| entry.key == "go.packages")
+        .ok_or_else(|| {
+            CatalogError::Integrity(
+                "Go exact source preparation has no selected package metadata".to_owned(),
+            )
+        })?;
+    let packages = serde_json::from_str::<Vec<GoSourcePackageMetadata>>(&package_metadata.value)
+        .map_err(|error| {
+            CatalogError::Integrity(format!(
+                "Go exact source package metadata is invalid: {error}"
+            ))
+        })?;
+    if packages.is_empty() {
+        return Err(CatalogError::Integrity(
+            "Go exact source preparation has no selected packages".to_owned(),
+        ));
+    }
+    for (ordinal, package) in packages.iter().enumerate() {
+        if package.import_path.is_empty() || package.name.is_empty() || package.files.is_empty() {
+            return Err(CatalogError::Integrity(format!(
+                "Go exact source package metadata entry {ordinal} must include a non-empty import path, package name, and file list"
+            )));
+        }
+    }
+    Ok(Some(PreparedExactGoSource {
+        artifact: go_artifacts[0].exact(),
+        packages: packages
+            .into_iter()
+            .map(|package| GoPinnedPackage {
+                import_path: package.import_path,
+                name: package.name,
+                files: package.files,
+            })
+            .collect(),
+    }))
+}
+
+fn register_reused_exact_go_source(
+    catalog: &SemanticPackCatalog,
+    dependency: &ResolvedDependency,
+    manifest_digest: &str,
+    source: Option<&PreparedExactGoSource<'_>>,
+) -> Result<(), CatalogError> {
+    if dependency.evidence.language != "go" {
+        return Ok(());
+    }
+    let source = source.ok_or_else(|| {
+        CatalogError::Integrity(
+            "Go exact source preparation did not produce a selected source set".to_owned(),
+        )
+    })?;
+    catalog.register_exact_go_source(manifest_digest, source.artifact, &source.packages)
+}
+
+fn register_exact_source_for_reused_pack(
+    catalog: &SemanticPackCatalog,
+    dependency: &ResolvedDependency,
+    source: Option<&PreparedExactGoSource<'_>>,
+    manifest_digest: &str,
+    diagnostics: &mut BoundedDependencyDiagnostics,
+) -> bool {
+    match register_reused_exact_go_source(catalog, dependency, manifest_digest, source) {
+        Ok(()) => true,
+        Err(error) => {
+            diagnostics.catalog(Some(&dependency.id), "go.source_registration", error);
+            false
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DependencyPackProduction {
     pub pack: Option<AuthoredSemanticModelPack>,
@@ -577,7 +694,9 @@ fn semantic_pack_acquisition_hook() -> Option<SemanticPackAcquisitionHook> {
 
 pub trait DependencyPackAdapter {
     fn adapter_name(&self) -> &str;
-    fn adapter_version(&self) -> &str;
+    fn adapter_version(&self) -> &str {
+        env!("CARGO_PKG_VERSION")
+    }
     fn producer(&self) -> Producer;
 
     fn can_produce(&self, _dependency: &ResolvedDependency) -> bool {
@@ -762,9 +881,29 @@ pub fn compile_exact_dependency_production(
             suppressed_diagnostics,
         });
     }
+    let go_source_sha256 = {
+        let mut go_sources = artifacts
+            .iter()
+            .filter(|artifact| artifact.kind() == ExternalArtifactKind::GoSourceSet);
+        match (go_sources.next(), go_sources.next()) {
+            (Some(source), None) => Some(source.sha256().to_owned()),
+            (None, None) => None,
+            (_, Some(_)) => {
+                return Err(DependencyProductionFailure::InvalidOutput {
+                    code: "production.go_source_identity".to_owned(),
+                    message: "Go production requires exactly one exact source set".to_owned(),
+                    diagnostics: producer_diagnostics,
+                    suppressed_diagnostics,
+                });
+            }
+        }
+    };
+    let activation_artifact_sha256 = go_source_sha256
+        .as_deref()
+        .unwrap_or_else(|| key.input_digest());
     for shard in &mut pack.shards {
         for selector in &mut shard.activation {
-            selector.artifact_sha256 = Some(key.input_digest().to_owned());
+            selector.artifact_sha256 = Some(activation_artifact_sha256.to_owned());
         }
     }
     let completeness = pack.completeness;
@@ -894,6 +1033,24 @@ pub struct DependencyPackPreparationOutcome {
     pub profile: DependencyPackPreparationProfile,
 }
 
+#[cfg(test)]
+pub(crate) fn assert_path_independent_pack_reuse(
+    first: &DependencyPackPreparationOutcome,
+    second: &DependencyPackPreparationOutcome,
+) {
+    assert!(
+        first.complete && second.complete,
+        "first={:#?}\nsecond={:#?}",
+        first,
+        second
+    );
+    assert_eq!(
+        second.packs[0].status,
+        DependencyPackPreparationStatus::Reused
+    );
+    assert_eq!(first.packs[0].production, second.packs[0].production);
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DependencyDiscoveryProfile {
     pub metadata_inputs_considered: usize,
@@ -908,6 +1065,90 @@ pub enum DependencyDiscoveryInformationalEvidence {
     /// Compile-database source entries structurally inside the workspace but
     /// absent from the analyzer's C/C++ workspace listing.
     CppMissingWorkspaceSources { count: usize, sample: Vec<PathBuf> },
+    /// The standard-library pack this ecosystem's discovery expects for a
+    /// language present in the workspace, and whether the workspace selects
+    /// it. Not selecting a pack is an answer, not a discovery failure.
+    StandardLibraryPack(StandardLibraryPackExpectation),
+}
+
+/// The standard-library semantic pack Bifrost's activation contract expects
+/// for one language present in the workspace (#3464).
+///
+/// Every workspace in a language calls that language's standard library, so
+/// its pack is never optional context. A workspace that declared no toolchain
+/// used to resolve no dependency at all, and the report then said nothing
+/// about the pack: not selected, not rejected, not considered. Discovery
+/// records the expectation instead, so a report names the pack whether or not
+/// it activated, with the reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StandardLibraryPackExpectation {
+    pub language: crate::analyzer::Language,
+    pub pack_id: &'static str,
+    pub selection: StandardLibraryPackSelection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StandardLibraryPackSelection {
+    /// Discovery resolved these artifact-less dependencies from a workspace
+    /// declaration. Preparation and the runtime decide whether the pack
+    /// activates.
+    Declared { dependency_ids: Vec<String> },
+    /// The workspace states nothing that selects the pack, or states it in a
+    /// form discovery refuses to read as exact evidence. The reason names what
+    /// discovery read and what would select the pack.
+    NotSelected { reason: String },
+}
+
+impl StandardLibraryPackExpectation {
+    pub fn declared(
+        language: crate::analyzer::Language,
+        pack_id: &'static str,
+        dependency_ids: Vec<String>,
+    ) -> Self {
+        assert!(
+            !dependency_ids.is_empty(),
+            "a declared {pack_id} expectation names the dependencies that declare it"
+        );
+        Self {
+            language,
+            pack_id,
+            selection: StandardLibraryPackSelection::Declared { dependency_ids },
+        }
+    }
+
+    pub fn not_selected(
+        language: crate::analyzer::Language,
+        pack_id: &'static str,
+        reason: String,
+    ) -> Self {
+        Self {
+            language,
+            pack_id,
+            selection: StandardLibraryPackSelection::NotSelected { reason },
+        }
+    }
+
+    /// The reason a declared expectation reports when no installed pack serves
+    /// the declaration.
+    ///
+    /// Analysis and catalog activation never download packs. The `bifrost`
+    /// executable may acquire open content during bootstrap; other hosts must
+    /// provide packs before activation. A missing pack therefore names the
+    /// installation route, so the remedy is in the report.
+    pub fn not_installed_reason(&self) -> String {
+        let StandardLibraryPackSelection::Declared { dependency_ids } = &self.selection else {
+            panic!(
+                "only a declared {} expectation can lack an installed pack",
+                self.pack_id
+            );
+        };
+        format!(
+            "{} declares it, but no installed pack serves it. Pack acquisition is a bootstrap step and does not run during analysis; \
+             install a Bifrost-packs release with `bifrost install-semantic-packs` or \
+             BIFROST_OPEN_SEMANTIC_PACK_BUNDLE",
+            dependency_ids.join(", ")
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -934,6 +1175,58 @@ impl DependencyDiscoveryOutcome {
             complete: true,
             cancelled: false,
         }
+    }
+
+    pub(crate) fn cancelled(
+        diagnostics: Vec<DependencyPackDiagnostic>,
+        suppressed_diagnostics: SuppressedDiagnostics,
+        profile: DependencyDiscoveryProfile,
+    ) -> Self {
+        Self {
+            dependencies: Vec::new(),
+            diagnostics,
+            suppressed_diagnostics,
+            complete: false,
+            cancelled: true,
+            profile,
+        }
+    }
+
+    pub(crate) fn cancelled_with_message(message: impl Into<String>) -> Self {
+        Self::cancelled(
+            vec![DependencyPackDiagnostic {
+                severity: DependencyPackDiagnosticSeverity::Error,
+                code: "discovery.cancelled".to_owned(),
+                dependency_id: None,
+                location: None,
+                message: message.into(),
+            }],
+            SuppressedDiagnostics::default(),
+            DependencyDiscoveryProfile::default(),
+        )
+    }
+
+    /// The standard-library pack expectations this discovery recorded.
+    pub fn standard_library_pack_expectations(
+        &self,
+    ) -> impl Iterator<Item = &StandardLibraryPackExpectation> {
+        self.profile
+            .informational_evidence
+            .iter()
+            .filter_map(|evidence| match evidence {
+                DependencyDiscoveryInformationalEvidence::StandardLibraryPack(expectation) => {
+                    Some(expectation)
+                }
+                DependencyDiscoveryInformationalEvidence::CppMissingWorkspaceSources { .. } => None,
+            })
+    }
+
+    /// Record one standard-library pack expectation. It never changes
+    /// completeness: declaring nothing is an answer, not a failure.
+    pub fn expect_standard_library_pack(&mut self, expectation: StandardLibraryPackExpectation) {
+        self.profile
+            .informational_evidence
+            .push(DependencyDiscoveryInformationalEvidence::StandardLibraryPack(expectation));
     }
 
     /// Convert discovery completeness into the shared diagnostic suppression
@@ -1097,6 +1390,16 @@ pub enum RetainedDiscoveryVerdict {
     Declared,
     /// Discovery ran completely and the build declares nothing containing it.
     Undeclared,
+}
+
+pub(crate) const fn missing_dependency_boundary(
+    declared: bool,
+) -> crate::analyzer::structural::BoundaryStatus {
+    if declared {
+        crate::analyzer::structural::BoundaryStatus::ExternalDeclaredUnindexed
+    } else {
+        crate::analyzer::structural::BoundaryStatus::ExternalUnknown
+    }
 }
 
 /// Classify `module_path` against retained discovery evidence. This reads what
@@ -1271,10 +1574,6 @@ pub fn prepare_dependency_semantic_packs(
             continue;
         }
 
-        // A read-free identity lets a later process (or the next test in a
-        // suite) find an already produced pack without reading the artifacts at
-        // all. Everything below is unchanged when the accelerator misses: the
-        // exact read is still the one authority for what a production contains.
         let source_identity = dependency_source_identity(adapter, dependency, limits);
         if let Some(identity) = source_identity.as_ref() {
             let reusable = {
@@ -1421,7 +1720,13 @@ pub fn prepare_dependency_semantic_packs(
         if exact_artifacts.len() != dependency.artifacts.len() {
             continue;
         }
-
+        let exact_go_source = match prepared_exact_go_source(dependency, &exact_artifacts) {
+            Ok(source) => source,
+            Err(error) => {
+                diagnostics.catalog(Some(&dependency.id), "go.source_registration", error);
+                continue;
+            }
+        };
         let key = match generated_production_key(adapter, dependency, &exact_artifacts, limits) {
             Ok(key) => key,
             Err(error) => {
@@ -1436,10 +1741,27 @@ pub fn prepare_dependency_semantic_packs(
         }
         let reusable = {
             let _scope = crate::profiling::scope("semantic_pack.lookup_generated");
-            reusable_generated_pack(catalog, &key, dependency, &input_digest)
+            reusable_generated_pack(
+                catalog,
+                &key,
+                dependency,
+                &input_digest,
+                exact_go_source
+                    .as_ref()
+                    .map(|source| source.artifact.sha256()),
+            )
         };
         match reusable {
             Ok(Some(prepared)) => {
+                if !register_exact_source_for_reused_pack(
+                    catalog,
+                    dependency,
+                    exact_go_source.as_ref(),
+                    &prepared.production.manifest_digest,
+                    &mut diagnostics,
+                ) {
+                    continue;
+                }
                 remember_dependency_source_identity(
                     catalog,
                     source_identity.as_ref(),
@@ -1500,10 +1822,27 @@ pub fn prepare_dependency_semantic_packs(
         // process waited for the key-specific lock.
         let reusable = {
             let _scope = crate::profiling::scope("semantic_pack.lookup_generated_after_lock");
-            reusable_generated_pack(catalog, &key, dependency, &input_digest)
+            reusable_generated_pack(
+                catalog,
+                &key,
+                dependency,
+                &input_digest,
+                exact_go_source
+                    .as_ref()
+                    .map(|source| source.artifact.sha256()),
+            )
         };
         match reusable {
             Ok(Some(prepared)) => {
+                if !register_exact_source_for_reused_pack(
+                    catalog,
+                    dependency,
+                    exact_go_source.as_ref(),
+                    &prepared.production.manifest_digest,
+                    &mut diagnostics,
+                ) {
+                    continue;
+                }
                 remember_dependency_source_identity(
                     catalog,
                     source_identity.as_ref(),
@@ -1549,10 +1888,27 @@ pub fn prepare_dependency_semantic_packs(
             let reusable = {
                 let _scope =
                     crate::profiling::scope("semantic_pack.lookup_generated_after_acquire");
-                reusable_generated_pack(catalog, &key, dependency, &input_digest)
+                reusable_generated_pack(
+                    catalog,
+                    &key,
+                    dependency,
+                    &input_digest,
+                    exact_go_source
+                        .as_ref()
+                        .map(|source| source.artifact.sha256()),
+                )
             };
             match reusable {
                 Ok(Some(prepared)) => {
+                    if !register_exact_source_for_reused_pack(
+                        catalog,
+                        dependency,
+                        exact_go_source.as_ref(),
+                        &prepared.production.manifest_digest,
+                        &mut diagnostics,
+                    ) {
+                        continue;
+                    }
                     remember_dependency_source_identity(
                         catalog,
                         source_identity.as_ref(),
@@ -1658,7 +2014,15 @@ pub fn prepare_dependency_semantic_packs(
             let _scope = crate::profiling::scope_with(|| {
                 format!("semantic_pack.install[{}]", dependency.id)
             });
-            catalog.install_generated(&production.key, &production.compiled)
+            match exact_go_source.as_ref() {
+                Some(source) => catalog.install_generated_with_exact_go_source(
+                    &production.key,
+                    &production.compiled,
+                    source.artifact,
+                    &source.packages,
+                ),
+                None => catalog.install_generated(&production.key, &production.compiled),
+            }
         };
         match install {
             Ok(installed) => {
@@ -1672,8 +2036,11 @@ pub fn prepare_dependency_semantic_packs(
                     &dependency.id,
                     &mut diagnostics,
                 );
-                let activation_evidence =
-                    activation_evidence(dependency, production.key.input_digest());
+                let activation_digest = exact_go_source
+                    .as_ref()
+                    .map(|source| source.artifact.sha256())
+                    .unwrap_or_else(|| production.key.input_digest());
+                let activation_evidence = activation_evidence(dependency, activation_digest);
                 evidence.push(activation_evidence.clone());
                 packs.push(PreparedDependencyPack {
                     dependency_id: dependency.id.clone(),
@@ -2023,6 +2390,7 @@ fn reusable_generated_pack(
     key: &GeneratedProductionKey,
     dependency: &ResolvedDependency,
     input_digest: &str,
+    exact_source_sha256: Option<&str>,
 ) -> Result<Option<PreparedDependencyPack>, CatalogError> {
     let Some(production) = catalog.generated_production(key)? else {
         return Ok(None);
@@ -2032,7 +2400,7 @@ fn reusable_generated_pack(
         completeness: production.completeness,
         production,
         status: DependencyPackPreparationStatus::Reused,
-        evidence: activation_evidence(dependency, input_digest),
+        evidence: activation_evidence(dependency, exact_source_sha256.unwrap_or(input_digest)),
     }))
 }
 
@@ -2246,7 +2614,7 @@ fn compatible_installed_pack(
     dependency: &ResolvedDependency,
     diagnostics: &mut BoundedDependencyDiagnostics,
 ) -> Result<Option<PreparedInstalledDependencyPack>, CatalogError> {
-    let Some((installed, not_activation_ready)) =
+    let Some((installed, not_activation_ready, has_complete_candidate)) =
         compatible_installed_pack_evaluation(catalog, dependency)?
     else {
         return Ok(None);
@@ -2258,21 +2626,33 @@ fn compatible_installed_pack(
             message,
         );
     }
+    if !has_complete_candidate && let Some(query) = installed_pack_query(dependency) {
+        for near_miss in catalog.version_near_misses(&query)? {
+            diagnostics.warning(
+                "dependency.pack_version_mismatch",
+                Some(&dependency.id),
+                near_miss.describe(),
+            );
+        }
+    }
     Ok(Some(installed))
 }
 
 fn compatible_installed_pack_evaluation(
     catalog: &SemanticPackCatalog,
     dependency: &ResolvedDependency,
-) -> Result<Option<(PreparedInstalledDependencyPack, Vec<String>)>, CatalogError> {
+) -> Result<Option<(PreparedInstalledDependencyPack, Vec<String>, bool)>, CatalogError> {
     let candidates = compatible_installed_pack_candidates(catalog, dependency)?;
+    let has_complete_candidate = candidates
+        .iter()
+        .any(|candidate| candidate.completeness == Completeness::Complete);
     let not_activation_ready = candidates
         .iter()
         .filter(|candidate| !candidate.activation_ready)
         .map(|candidate| candidate.not_activation_ready.clone())
         .collect();
     Ok(prepared_installed_pack(dependency, &candidates)
-        .map(|installed| (installed, not_activation_ready)))
+        .map(|installed| (installed, not_activation_ready, has_complete_candidate)))
 }
 
 /// Curated partial declaration subsets are trusted only when Bifrost shipped
@@ -2475,6 +2855,9 @@ pub fn dependency_source_identity(
     dependency: &ResolvedDependency,
     limits: &DependencyPackLimits,
 ) -> Option<DependencySourceIdentity> {
+    if dependency.evidence.language == "go" {
+        return None;
+    }
     if dependency.artifacts.is_empty()
         || dependency.artifacts.iter().any(|artifact| {
             artifact.expected_sha256.is_some() || artifact.source_identity.is_none()
@@ -2682,7 +3065,7 @@ fn activation_evidence(
 }
 
 fn is_cancelled(cancellation: Option<&CancellationToken>) -> bool {
-    cancellation.is_some_and(CancellationToken::is_cancelled)
+    brokk_bifrost_core::cancellation::optional_is_cancelled(cancellation)
 }
 
 /// The diagnostics a bounded collector could not retain.
@@ -2851,6 +3234,14 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> String {
 }
 
 #[cfg(test)]
+fn diagnostic_codes(diagnostics: &[DependencyPackDiagnostic]) -> Vec<&str> {
+    diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.code.as_str())
+        .collect()
+}
+
+#[cfg(test)]
 mod semantic_diagnostic_evidence_tests {
     use super::*;
     use crate::analyzer::{SemanticDiagnosticIncompleteReason, structural::BoundaryStatus};
@@ -2919,13 +3310,6 @@ mod bounded_dependency_diagnostics_tests {
         }
     }
 
-    fn codes(diagnostics: &[DependencyPackDiagnostic]) -> Vec<&str> {
-        diagnostics
-            .iter()
-            .map(|diagnostic| diagnostic.code.as_str())
-            .collect()
-    }
-
     #[test]
     fn error_at_the_cap_evicts_the_last_retained_warning() {
         let limits = DependencyPackLimits::default();
@@ -2947,7 +3331,7 @@ mod bounded_dependency_diagnostics_tests {
             .map(|index| format!("warning.{index}"))
             .collect();
         expected.push("compile_pack".to_owned());
-        assert_eq!(codes(&diagnostics), expected);
+        assert_eq!(super::diagnostic_codes(&diagnostics), expected);
         assert_eq!(
             suppressed,
             SuppressedDiagnostics {
@@ -2980,7 +3364,7 @@ mod bounded_dependency_diagnostics_tests {
         let expected: Vec<String> = (0..limits.max_diagnostics)
             .map(|index| format!("error.{index}"))
             .collect();
-        assert_eq!(codes(&diagnostics), expected);
+        assert_eq!(super::diagnostic_codes(&diagnostics), expected);
         assert_eq!(
             suppressed,
             SuppressedDiagnostics {
@@ -3008,7 +3392,10 @@ mod bounded_dependency_diagnostics_tests {
         ));
         let (diagnostics, suppressed) = collector.finish();
 
-        assert_eq!(codes(&diagnostics), vec!["first", "second", "third"]);
+        assert_eq!(
+            super::diagnostic_codes(&diagnostics),
+            vec!["first", "second", "third"]
+        );
         assert_eq!(suppressed, SuppressedDiagnostics::default());
         assert_eq!(suppressed.total(), 0);
     }
@@ -3017,10 +3404,13 @@ mod bounded_dependency_diagnostics_tests {
 #[cfg(test)]
 mod declared_pack_acquisition_tests {
     use super::*;
+    use crate::analyzer::go::GoDependencyPackAdapter;
     use crate::analyzer::semantic_model::{
-        CatalogCoordinate, CatalogOptions, CompiledSemanticModelPack, DurablePackSource,
-        DurablePackSourceKind, SourceFormat, compile_source,
+        CatalogCoordinate, CatalogGoSourceReadLimits, CatalogGoSourceRequest, CatalogOptions,
+        CompiledSemanticModelPack, DurablePackSource, DurablePackSourceKind, SourceFormat,
+        compile_source, read_exact_source_set,
     };
+    use crate::inline_project::InlineTestProject;
     use semver::Version;
     use std::sync::Mutex;
 
@@ -3174,26 +3564,11 @@ mod declared_pack_acquisition_tests {
     /// artifact-less toolchain coordinate that only an installed pack can
     /// satisfy.
     fn declared_php_dependency() -> ResolvedDependency {
-        ResolvedDependency {
-            id: "php:runtime:declared:php:8.2.0".to_owned(),
-            evidence: SemanticModelActivationEvidence {
-                language: "php".to_owned(),
-                ecosystem: "php".to_owned(),
-                package: None,
-                module: None,
-                toolchain: Some(CatalogCoordinate {
-                    name: "php".to_owned(),
-                    version: Some(Version::new(8, 2, 0)),
-                }),
-                target: None,
-                configuration: None,
-                artifact_sha256: None,
-            },
-            provenance: Vec::new(),
-            artifacts: Vec::new(),
-            scope: DependencyScope::Unknown,
-            declared_by: None,
-        }
+        crate::analyzer::php::dependency_discovery::declared_php_runtime_dependency(
+            Version::new(8, 2, 0),
+            "composer.json",
+            "^8.2",
+        )
     }
 
     struct NeverProducingAdapter;
@@ -3276,12 +3651,307 @@ mod declared_pack_acquisition_tests {
         )
     }
 
-    fn codes(outcome: &DependencyPackPreparationOutcome) -> Vec<&str> {
-        outcome
-            .diagnostics
-            .iter()
-            .map(|diagnostic| diagnostic.code.as_str())
-            .collect()
+    const GO_SOURCE: &str = "package api\nfunc Value() int { return 7 }\n";
+    // Independent SHA-256 of the v1 source-set frame for api.go and GO_SOURCE,
+    // calculated with Python hashlib rather than the producer's hashing helper.
+    const GO_SOURCE_SHA256: &str =
+        "99d5982dbaecccf3d40d87607f92fd75f49e4e196cc664d61b96d85bf5c2d98b";
+
+    fn selected_go_dependency(root: &Path) -> ResolvedDependency {
+        ResolvedDependency::undeclared_scope(
+            "go:module:example.test/source@v1.0.0".to_owned(),
+            SemanticModelActivationEvidence {
+                language: "go".to_owned(),
+                ecosystem: "go-module".to_owned(),
+                package: None,
+                module: Some(CatalogCoordinate {
+                    name: "example.test/source".to_owned(),
+                    version: Some(Version::new(1, 0, 0)),
+                }),
+                toolchain: None,
+                target: None,
+                configuration: None,
+                artifact_sha256: None,
+            },
+            vec![DependencyProvenance {
+                key: "go.packages".to_owned(),
+                value: serde_json::json!([{
+                    "import_path": "example.test/source/api",
+                    "name": "api",
+                    "directory": ".",
+                    "files": ["api.go"],
+                    "ignored_go_files": [],
+                    "cgo_files": []
+                }])
+                .to_string(),
+            }],
+            vec![
+                ResolvedDependencyArtifact::source_set(
+                    DependencyArtifactRole::Sources,
+                    ExternalArtifactKind::GoSourceSet,
+                    root.to_path_buf(),
+                    vec![PathBuf::from("api.go")],
+                )
+                .with_source_identity(ArtifactSourceIdentity::from_digest("a".repeat(64))),
+            ],
+        )
+    }
+
+    #[test]
+    fn prepared_exact_go_source_requires_package_name() {
+        let project = InlineTestProject::new().file("api.go", GO_SOURCE).build();
+        let limits = DependencyPackLimits::default();
+        let artifact = read_exact_source_set(
+            project.root(),
+            &[PathBuf::from("api.go")],
+            1,
+            8,
+            &limits.producer,
+        )
+        .unwrap();
+        assert_eq!(artifact.sha256(), GO_SOURCE_SHA256);
+        let artifacts = [ExactDependencyArtifact::from_exact(
+            DependencyArtifactRole::Sources,
+            ExternalArtifactKind::GoSourceSet,
+            None,
+            artifact,
+        )];
+        let valid = selected_go_dependency(project.root());
+        let prepared = prepared_exact_go_source(&valid, &artifacts)
+            .unwrap()
+            .expect("named package metadata is accepted");
+        assert_eq!(prepared.packages[0].name, "api");
+
+        for name in [None, Some("")] {
+            let mut dependency = valid.clone();
+            let mut metadata: serde_json::Value =
+                serde_json::from_str(&dependency.provenance[0].value).unwrap();
+            if let Some(name) = name {
+                metadata[0]["name"] = serde_json::json!(name);
+            } else {
+                metadata[0].as_object_mut().unwrap().remove("name");
+            }
+            dependency.provenance[0].value = metadata.to_string();
+            let error = match prepared_exact_go_source(&dependency, &artifacts) {
+                Err(CatalogError::Integrity(message)) => message,
+                _ => panic!("missing or empty Go package name must fail source preparation"),
+            };
+            assert!(error.contains("name"), "{error}");
+
+            let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+            let outcome = prepare_dependency_semantic_packs(
+                &catalog,
+                &GoDependencyPackAdapter,
+                &[dependency],
+                &limits,
+                None,
+            );
+            assert!(!outcome.complete);
+            assert!(outcome.packs.is_empty());
+            assert!(outcome.evidence.is_empty());
+            assert_eq!(outcome.profile.generated_packs, 0);
+            assert!(
+                outcome.diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == "go.source_registration"
+                        && diagnostic.message.contains("name")
+                }),
+                "{:#?}",
+                outcome.diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn exact_go_preparation_preserves_source_digest_through_reader_and_reuse() {
+        let _hook = HookFixture::install(HookBehavior::RecordOnly);
+        let project = InlineTestProject::new()
+            .file("api.go", GO_SOURCE)
+            .file("unselected.go", "package api\nfunc Unselected() {}\n")
+            .build();
+        let dependency = selected_go_dependency(project.root());
+        let limits = DependencyPackLimits::default();
+        let artifact = read_exact_source_set(
+            project.root(),
+            &[PathBuf::from("api.go")],
+            1,
+            8,
+            &limits.producer,
+        )
+        .unwrap();
+        assert_eq!(artifact.sha256(), GO_SOURCE_SHA256);
+        let artifacts = [ExactDependencyArtifact::from_exact(
+            DependencyArtifactRole::Sources,
+            ExternalArtifactKind::GoSourceSet,
+            None,
+            artifact,
+        )];
+        let compiled = compile_exact_dependency_production(
+            &GoDependencyPackAdapter,
+            &dependency,
+            &artifacts,
+            &limits,
+            None,
+        )
+        .unwrap();
+        assert_ne!(compiled.key.input_digest(), GO_SOURCE_SHA256);
+        assert_ne!(compiled.key.production_digest(), GO_SOURCE_SHA256);
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let reader = catalog.runtime_source_reader();
+
+        for status in [
+            DependencyPackPreparationStatus::Generated,
+            DependencyPackPreparationStatus::Reused,
+        ] {
+            let outcome = prepare_dependency_semantic_packs(
+                &catalog,
+                &GoDependencyPackAdapter,
+                std::slice::from_ref(&dependency),
+                &limits,
+                None,
+            );
+            assert!(outcome.complete, "{outcome:#?}");
+            assert!(outcome.diagnostics.is_empty(), "{outcome:#?}");
+            assert_eq!(outcome.profile.artifacts_read, 1);
+            assert_eq!(outcome.packs.len(), 1);
+            let prepared = &outcome.packs[0];
+            assert_eq!(prepared.status, status);
+            assert_eq!(prepared.production.key, compiled.key);
+            assert_eq!(
+                prepared.production.manifest_digest,
+                compiled.compiled.manifest.content_sha256
+            );
+            assert_eq!(
+                prepared.evidence.artifact_sha256.as_deref(),
+                Some(GO_SOURCE_SHA256)
+            );
+            assert_eq!(outcome.evidence, vec![prepared.evidence.clone()]);
+
+            let query = SemanticPackSelectorQuery {
+                language: prepared.evidence.language.clone(),
+                ecosystem: prepared.evidence.ecosystem.clone(),
+                package: prepared.evidence.package.clone(),
+                module: prepared.evidence.module.clone(),
+                toolchain: prepared.evidence.toolchain.clone(),
+                target: prepared.evidence.target.clone(),
+                configuration: prepared.evidence.configuration.clone(),
+                artifact_sha256: prepared.evidence.artifact_sha256.clone(),
+                bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+            };
+            let candidates = catalog.candidates(&query).unwrap();
+            assert_eq!(candidates.len(), 1);
+            let loaded = catalog.load(&candidates[0]).unwrap();
+            assert_eq!(
+                loaded.shard.activation()[0].artifact_sha256.as_deref(),
+                Some(GO_SOURCE_SHA256)
+            );
+            assert!(
+                catalog
+                    .candidates(&SemanticPackSelectorQuery {
+                        artifact_sha256: Some(compiled.key.input_digest().to_owned()),
+                        ..query
+                    })
+                    .unwrap()
+                    .is_empty()
+            );
+
+            let request = CatalogGoSourceRequest {
+                manifest_digest: &prepared.production.manifest_digest,
+                shard_id: &compiled.compiled.manifest.shards[0].shard_id,
+                artifact_sha256: GO_SOURCE_SHA256,
+                package_import_path: "example.test/source/api",
+                file: "api.go",
+            };
+            let selected = reader
+                .read_go_source(
+                    &request,
+                    CatalogGoSourceReadLimits::default(),
+                    &CancellationToken::new(),
+                )
+                .unwrap()
+                .expect("prepared source is SQL-readable");
+            assert_eq!(selected.artifact.sha256(), GO_SOURCE_SHA256);
+            assert_eq!(selected.artifact.source_entries().len(), 1);
+            assert_eq!(
+                selected.artifact.source_entries()[0].relative_path(),
+                "api.go"
+            );
+            assert_eq!(
+                selected.artifact.source_entries()[0].bytes(),
+                GO_SOURCE.as_bytes()
+            );
+            assert_eq!(
+                selected.packages,
+                vec![GoPinnedPackage {
+                    import_path: "example.test/source/api".to_owned(),
+                    name: "api".to_owned(),
+                    files: vec!["api.go".to_owned()],
+                }]
+            );
+            assert!(
+                reader
+                    .read_go_source(
+                        &CatalogGoSourceRequest {
+                            artifact_sha256: compiled.key.input_digest(),
+                            ..request
+                        },
+                        CatalogGoSourceReadLimits::default(),
+                        &CancellationToken::new(),
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        // The read-free metadata identity stays fixed as the selected bytes
+        // change; another exact acquisition must produce a different key.
+        let changed_source = "package api\nfunc Value() int { return 9 }\n";
+        project.file("api.go").write(changed_source).unwrap();
+        let changed_artifact = read_exact_source_set(
+            project.root(),
+            &[PathBuf::from("api.go")],
+            1,
+            8,
+            &limits.producer,
+        )
+        .unwrap();
+        assert_ne!(changed_artifact.sha256(), GO_SOURCE_SHA256);
+        let changed = prepare_dependency_semantic_packs(
+            &catalog,
+            &GoDependencyPackAdapter,
+            &[dependency],
+            &limits,
+            None,
+        );
+        assert!(changed.complete, "{changed:#?}");
+        assert_eq!(changed.profile.artifacts_read, 1);
+        assert_eq!(changed.packs.len(), 1);
+        assert_eq!(
+            changed.packs[0].status,
+            DependencyPackPreparationStatus::Generated
+        );
+        assert_ne!(changed.packs[0].production.key, compiled.key);
+        assert_eq!(
+            changed.evidence[0].artifact_sha256.as_deref(),
+            Some(changed_artifact.sha256())
+        );
+        let selected = reader
+            .read_go_source(
+                &CatalogGoSourceRequest {
+                    manifest_digest: &changed.packs[0].production.manifest_digest,
+                    shard_id: &compiled.compiled.manifest.shards[0].shard_id,
+                    artifact_sha256: changed_artifact.sha256(),
+                    package_import_path: "example.test/source/api",
+                    file: "api.go",
+                },
+                CatalogGoSourceReadLimits::default(),
+                &CancellationToken::new(),
+            )
+            .unwrap()
+            .expect("changed selected source is SQL-readable");
+        assert_eq!(
+            selected.artifact.source_entries()[0].bytes(),
+            changed_source.as_bytes()
+        );
     }
 
     #[test]
@@ -3294,7 +3964,7 @@ mod declared_pack_acquisition_tests {
         assert_eq!(fixture.requests(), vec!["declared:python:cpython@3.10.0"]);
         assert_eq!(outcome.installed_packs.len(), 0);
         assert_eq!(
-            codes(&outcome),
+            super::diagnostic_codes(&outcome.diagnostics),
             vec![
                 "dependency.pack_unavailable",
                 "preparation.unaccounted-dependency"
@@ -3311,7 +3981,7 @@ mod declared_pack_acquisition_tests {
 
         assert_eq!(fixture.requests(), vec!["declared:php:php@8.2.0"]);
         assert_eq!(
-            codes(&outcome),
+            super::diagnostic_codes(&outcome.diagnostics),
             vec![
                 "dependency.pack_unavailable",
                 "preparation.unaccounted-dependency"
@@ -3344,7 +4014,7 @@ mod declared_pack_acquisition_tests {
         assert!(fixture.requests().is_empty());
         assert_eq!(outcome.installed_packs.len(), 0);
         assert_eq!(
-            codes(&outcome),
+            super::diagnostic_codes(&outcome.diagnostics),
             vec![
                 "dependency.pack_version_mismatch",
                 "preparation.unaccounted-dependency"
@@ -3386,7 +4056,7 @@ mod declared_pack_acquisition_tests {
 
         assert_eq!(fixture.requests(), vec!["declared:python:cpython@3.10.0"]);
         assert_eq!(
-            codes(&outcome),
+            super::diagnostic_codes(&outcome.diagnostics),
             vec![
                 "dependency.acquire",
                 "dependency.pack_unavailable",
@@ -3415,7 +4085,7 @@ mod declared_pack_acquisition_tests {
         // for a dependency that produced no pack. A disabled hook adds nothing
         // of its own: no acquisition attempt was made, so nothing failed.
         assert_eq!(
-            codes(&outcome),
+            super::diagnostic_codes(&outcome.diagnostics),
             vec![
                 "dependency.pack_unavailable",
                 "preparation.unaccounted-dependency"

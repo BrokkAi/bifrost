@@ -296,39 +296,20 @@ fn rust_primary_contexts_cancel_before_and_during_rows_then_retry() {
     drop(fixture);
 }
 
-fn explain_context_query(
+fn explain_context_plan(
     connection: &Connection,
-    blob_id: i64,
-    reference_byte: i64,
+    sql: &str,
+    parameters: &[Value],
+    label: &str,
 ) -> Vec<String> {
     let mut statement = connection
-        .prepare(&format!(
-            "EXPLAIN QUERY PLAN {}",
-            super::source_facts::RUST_PRIMARY_CONTEXTS_AT_SQL
-        ))
-        .expect("context query explains");
-    statement
-        .query_map(
-            params_from_iter([Value::Integer(blob_id), Value::Integer(reference_byte)]),
-            |row| row.get(3),
-        )
-        .expect("context query plan rows")
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .expect("context query plan decodes")
-}
-
-fn explain_context_manifest(connection: &Connection, parameters: &[Value]) -> Vec<String> {
-    let mut statement = connection
-        .prepare(&format!(
-            "EXPLAIN QUERY PLAN {}",
-            super::source_facts::RUST_PRIMARY_CONTEXT_MANIFEST_SQL
-        ))
-        .expect("context manifest query explains");
+        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .unwrap_or_else(|error| panic!("{label} explains: {error}"));
     statement
         .query_map(params_from_iter(parameters), |row| row.get(3))
-        .expect("context manifest query plan rows")
+        .unwrap_or_else(|error| panic!("{label} plan rows: {error}"))
         .collect::<rusqlite::Result<Vec<_>>>()
-        .expect("context manifest query plan decodes")
+        .unwrap_or_else(|error| panic!("{label} plan decodes: {error}"))
 }
 
 fn assert_context_manifest_plan(plan: &[String]) {
@@ -478,8 +459,18 @@ fn rust_primary_context_query_is_populated_blob_first_before_and_after_analyze()
         )
         .expect("published context manifest witness");
     assert_eq!(manifest_blob, blob_id);
-    assert_context_manifest_plan(&explain_context_manifest(&connection, &manifest_parameters));
-    assert_context_query_plan(&explain_context_query(&connection, blob_id, reference_byte));
+    assert_context_manifest_plan(&explain_context_plan(
+        &connection,
+        super::source_facts::RUST_PRIMARY_CONTEXT_MANIFEST_SQL,
+        &manifest_parameters,
+        "context manifest query",
+    ));
+    assert_context_query_plan(&explain_context_plan(
+        &connection,
+        super::source_facts::RUST_PRIMARY_CONTEXTS_AT_SQL,
+        &[Value::Integer(blob_id), Value::Integer(reference_byte)],
+        "context query",
+    ));
     assert!(
         connection
             .prepare(super::source_facts::RUST_PRIMARY_CONTEXTS_AT_SQL)
@@ -504,6 +495,16 @@ fn rust_primary_context_query_is_populated_blob_first_before_and_after_analyze()
         )
         .expect("published context manifest witness after ANALYZE");
     assert_eq!(manifest_blob, blob_id);
-    assert_context_manifest_plan(&explain_context_manifest(&connection, &manifest_parameters));
-    assert_context_query_plan(&explain_context_query(&connection, blob_id, reference_byte));
+    assert_context_manifest_plan(&explain_context_plan(
+        &connection,
+        super::source_facts::RUST_PRIMARY_CONTEXT_MANIFEST_SQL,
+        &manifest_parameters,
+        "context manifest query",
+    ));
+    assert_context_query_plan(&explain_context_plan(
+        &connection,
+        super::source_facts::RUST_PRIMARY_CONTEXTS_AT_SQL,
+        &[Value::Integer(blob_id), Value::Integer(reference_byte)],
+        "context query",
+    ));
 }

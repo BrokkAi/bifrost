@@ -12,6 +12,7 @@ pub mod extractor;
 pub mod hits;
 pub mod inverted;
 pub mod resolver;
+pub mod scope;
 pub mod syntax;
 
 use brokk_bifrost_core::analyzer::query_token::QueryToken;

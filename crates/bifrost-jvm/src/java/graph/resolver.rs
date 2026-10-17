@@ -9,7 +9,7 @@ use super::return_type::{
     method_anonymous_return_type_for_owner_fqn, method_return_type_for_owner_fqns,
 };
 use crate::java::graph_support::{
-    JavaSource, java_callable_facts, normalize_java_type_text,
+    JavaSource, java_callable_facts, java_method_reference_parts, normalize_java_type_text,
     resolve_java_usage_type_components_in,
 };
 use crate::java::hierarchy::{JavaHierarchyFactError, java_nearest_declaring_ancestors};
@@ -24,6 +24,11 @@ use brokk_bifrost_core::analyzer::usages::local_inference::LocalInferenceEngine;
 use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisOutcome;
 use brokk_bifrost_core::hash::HashSet;
 use tree_sitter::Node;
+
+pub(super) fn method_reference_parts(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
+    let (receiver, member) = java_method_reference_parts(node)?;
+    (member.kind() == "identifier").then_some((receiver, member))
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TargetKind {
@@ -123,15 +128,8 @@ impl TargetSpec {
 /// cannot be recovered through the named-child method-reference helper used for
 /// ordinary `Type::method` references.
 pub fn constructor_method_reference_receiver(node: Node<'_>) -> Option<Node<'_>> {
-    if node.kind() != "method_reference" {
-        return None;
-    }
-    let mut cursor = node.walk();
-    let children: Vec<_> = node.children(&mut cursor).collect();
-    if !children.iter().any(|child| child.kind() == "new") {
-        return None;
-    }
-    children.into_iter().find(|child| child.is_named())
+    let (receiver, terminal) = java_method_reference_parts(node)?;
+    (terminal.kind() == "new").then_some(receiver)
 }
 
 fn java_owner_declares_matching_method(
@@ -957,13 +955,12 @@ pub fn resolve_type_from_node(
     token: QueryToken<'_>,
     ctx: &ScanCtx<'_>,
 ) -> Option<CodeUnit> {
-    if matches!(node.kind(), "scoped_type_identifier" | "scoped_identifier")
-        && let Some(resolved) = resolve_nested_type_from_scoped_node(node, token, ctx)
-    {
-        return Some(resolved);
-    }
-
-    resolve_non_nested_type_from_node(node, token, ctx)
+    resolve_full_type_from_node(
+        node,
+        ctx.source,
+        |candidate| resolve_non_nested_type_from_node(candidate, token, ctx),
+        |owner, name| nested_type_for_owner(owner, name, ctx),
+    )
 }
 
 pub fn resolve_non_nested_type_from_node(
@@ -971,14 +968,31 @@ pub fn resolve_non_nested_type_from_node(
     token: QueryToken<'_>,
     ctx: &ScanCtx<'_>,
 ) -> Option<CodeUnit> {
-    match java_lexical_type_from_node(ctx.java, token, ctx.graph, ctx.file, ctx.source, node) {
+    resolve_non_nested_type_for_graph(ctx.java, token, ctx.graph, ctx.file, ctx.source, node)
+}
+
+pub(super) fn resolve_non_nested_type_for_graph(
+    java: &dyn JavaSource,
+    token: QueryToken<'_>,
+    graph: &JavaGraphSource<'_>,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+) -> Option<CodeUnit> {
+    match java_lexical_type_from_node(java, token, graph, file, source, node) {
         LexicalTypeResolution::Resolved(unit) => return Some(unit),
         LexicalTypeResolution::Blocked => return None,
         LexicalTypeResolution::NotFound => {}
     }
 
-    let components = java_type_name_components(node, ctx.source)?;
-    ctx.resolve_realm_type_components(&components)
+    let components = java_type_name_components(node, source)?;
+    resolve_java_usage_type_components_in(
+        java,
+        graph.token,
+        graph.relational_definitions,
+        file,
+        &components,
+    )
 }
 
 /// Resolves each semantic class segment in a Java type reference, preserving the
@@ -1063,6 +1077,26 @@ where
         }
     }
     segments
+}
+
+pub(super) fn resolve_full_type_from_node<'tree, ResolveNode, ResolveNested>(
+    node: Node<'tree>,
+    source: &str,
+    mut resolve_node: ResolveNode,
+    resolve_nested: ResolveNested,
+) -> Option<CodeUnit>
+where
+    ResolveNode: FnMut(Node<'tree>) -> Option<CodeUnit>,
+    ResolveNested: FnMut(&CodeUnit, &str) -> Option<CodeUnit>,
+{
+    if matches!(node.kind(), "scoped_identifier" | "scoped_type_identifier") {
+        let terminal = terminal_type_node(node)?;
+        let (resolved, resolved_terminal) =
+            resolve_type_segments(node, source, resolve_node, resolve_nested).pop()?;
+        return (resolved_terminal.id() == terminal.id()).then_some(resolved);
+    }
+
+    resolve_node(node)
 }
 
 /// Resolve a method-reference receiver that tree-sitter represents as a
@@ -1210,36 +1244,6 @@ fn terminal_type_node(node: Node<'_>) -> Option<Node<'_>> {
             _ => return None,
         }
     }
-}
-
-fn resolve_nested_type_from_scoped_node(
-    node: Node<'_>,
-    token: QueryToken<'_>,
-    ctx: &ScanCtx<'_>,
-) -> Option<CodeUnit> {
-    let mut cursor = node.walk();
-    let typed_children: Vec<_> = node
-        .named_children(&mut cursor)
-        .filter(|child| {
-            matches!(
-                child.kind(),
-                "identifier"
-                    | "type_identifier"
-                    | "scoped_identifier"
-                    | "scoped_type_identifier"
-                    | "generic_type"
-            )
-        })
-        .collect();
-    let (name, qualifier) = typed_children.split_last()?;
-    let qualifier = qualifier.last().copied()?;
-    let qualifier_type = resolve_type_from_node(qualifier, token, ctx)?;
-    let name = node_text(*name, ctx.source);
-    if name.is_empty() {
-        return None;
-    }
-
-    nested_type_for_owner(&qualifier_type, name, ctx)
 }
 
 pub fn nested_type_for_owner(owner: &CodeUnit, name: &str, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {
@@ -1566,7 +1570,7 @@ pub fn is_non_type_module_reference(node: Node<'_>) -> bool {
 }
 
 pub fn is_declaration_name(node: Node<'_>) -> bool {
-    node.parent()
-        .and_then(|parent| parent.child_by_field_name("name"))
-        == Some(node)
+    node.parent().is_some_and(|parent| {
+        brokk_bifrost_core::analyzer::structural::adapter_helpers::is_field_of(parent, node, "name")
+    })
 }

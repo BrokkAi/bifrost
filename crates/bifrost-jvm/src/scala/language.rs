@@ -1,23 +1,21 @@
-use tree_sitter_language::LanguageFn;
+/// Brokk's released Scala grammar, including the contextual field-selector correction.
+pub use brokk_tree_sitter_scala::LANGUAGE;
 
-unsafe extern "C" {
-    fn tree_sitter_scala() -> *const ();
+pub(super) fn parse_tree(
+    source: &str,
+) -> Result<Option<tree_sitter::Tree>, tree_sitter::LanguageError> {
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&LANGUAGE.into())?;
+    Ok(parser.parse(source, None))
 }
-
-/// Scala grammar with the contextual field-selector correction described in grammar/README.md.
-// SAFETY: build.rs compiles the generated tree-sitter language function linked here.
-pub const LANGUAGE: LanguageFn = unsafe { LanguageFn::from_raw(tree_sitter_scala) };
 
 #[cfg(test)]
 mod tests {
-    use super::LANGUAGE;
-
+    use brokk_bifrost_test_macros::hardwon;
     fn parse_without_recovery(source: &str) -> tree_sitter::Tree {
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&LANGUAGE.into())
-            .expect("load Bifrost Scala grammar");
-        let tree = parser.parse(source, None).expect("parse Scala");
+        let tree = super::parse_tree(source)
+            .expect("load Bifrost Scala grammar")
+            .expect("parse Scala");
         assert!(
             !tree.root_node().has_error(),
             "Scala source must parse without recovery:\n{}",
@@ -27,6 +25,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#3499: same-file Scala trait inheritance was reported as an unindexed import boundary"
+    )]
     fn scala2_export_selector_preserves_enclosing_class_and_scala3_exports() {
         let tree = parse_without_recovery(
             r#"class Dialog {
@@ -56,6 +57,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#1070: Scala 2 identifier `extension` and Scala 3 extension definitions were confused during parsing"
+    )]
     fn extension_is_contextual_between_identifier_and_definition() {
         let scala2 = r#"trait Enrichments {
   implicit class Path(filename: String) {
@@ -80,6 +84,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#1104: Scala empty block lambda parsing consumed the enclosing template body")]
     fn empty_block_lambda_does_not_consume_enclosing_template() {
         let tree = parse_without_recovery(
             r#"class SimulationSpec {
@@ -100,6 +105,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#1104: Scala empty block lambda parsing consumed the enclosing template body")]
     fn self_type_only_template_bodies_remain_unambiguous() {
         for source in [
             "trait Braced { self: Product => }",
@@ -115,6 +121,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#1104: Scala empty block lambda parsing consumed the enclosing template body")]
     fn enum_body_accepts_self_type_and_modified_case() {
         let tree = parse_without_recovery(
             r#"enum SymbolKind:

@@ -1,4 +1,4 @@
-use crate::mcp_common::{McpRenderOptions, run_stdio_server, tool_descriptor};
+use crate::mcp_common::{McpRenderOptions, run_named_stdio_server, tool_descriptor};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
@@ -14,20 +14,25 @@ pub fn run_diff_stdio_server(
     root: PathBuf,
     render_options: McpRenderOptions,
 ) -> Result<(), String> {
-    let spec = crate::mcp_registry::resolve_server_spec("diff")?;
-    run_stdio_server(Some(root), render_options, &spec, None)
+    run_named_stdio_server(root, render_options, "diff")
 }
 
 pub(crate) fn diff_tool_descriptors() -> Vec<Value> {
     vec![
         tool_descriptor(
             "analyze_diff",
-            "Diff two endpoints and return Bifrost-resolved semantic patch effects: changed files with `git diff --numstat` insertion/deletion counts, symbols edited (one record naming the symbol at both endpoints, with the old and new lines each hunk touched), introduced, deleted, moved or resignatured, dependency symbols, import changes, and large-callsite truncation notices. Every reported symbol carries `is_test`. Call-edge changes arrive already attributed to the symbol that makes the calls: an edited or moved record carries `added_calls` and `removed_calls`, an introduced record carries `calls`, and a deleted record carries `called`; `unattributed_call_edge_changes` holds only the edges whose caller is no patch symbol. A move that renames a symbol is not itself a call-edge change, because the preimage graph is compared under the postimage names. An explicit endpoint accepts a commit-ish or tree-ish; commit resolution wins when a spelling can resolve to either. Omit both parameters to compare the merge base of HEAD and the default branch against the live working tree; the default branch comes from origin/HEAD, with HEAD as the fallback when that symbolic ref is unavailable. With `target` alone, a commit compares against its first parent; a tree-only target is rejected because a tree has no parent, so provide `base`. Endpoint labels report a full commit hash or `tree:<full-oid>`. When both endpoints are immutable commits or trees, comparison ignores the live working tree, index, and `.gitattributes`. Objects available only in a snapshot store require the host to launch Bifrost with `--diff-snapshot-object-dir`; this tool never accepts an object-store filesystem path argument.",
+            "Compare Git endpoints and return changed files with insertion/deletion counts, edited/introduced/deleted/moved/resignatured symbols, import changes, dependencies and callsite truncation notices. Symbols carry is_test; edited records name both endpoints and touched old/new lines. Edited/moved records carry added_calls/removed_calls, introduced records calls, and deleted records called. Unattributed edges have no patch-symbol caller. call_edges defaults to changed_lines: resolve reference start lines changed on each side, not whole-caller relationships. Unchanged sites and import-only rebinding outside those lines are omitted. An addition needs a complete base scope; a removal needs a complete target scope. Exact selected deltas refuse ambiguous attribution and uncertain moved correspondence. changed_files retains full-file inventory and incumbent best-effort deltas, including renamed preimage comparisons. omit skips call analysis and leaves its arrays empty; import_changes remains available. call_analysis reports scope, complete/incomplete/omitted status and endpoint reasons. Completeness applies only to the requested inventory. Explicit endpoints accept commits or trees; commit resolution wins. With neither endpoint, compare the merge base of HEAD and the default branch against the live worktree (origin/HEAD selects that branch, falling back to HEAD). With target alone, compare a commit against its first parent; a tree target requires base. Labels are full commit hashes or tree:<oid>. Immutable endpoint comparisons ignore the live worktree, index and .gitattributes. Snapshot-only objects require host configuration --diff-snapshot-object-dir; the tool accepts no object-store path.",
             endpoint_schema(json!({
                 "include_tests": {
                     "type": "boolean",
                     "default": true,
                     "description": "Include symbols and call edges from detected test files."
+                },
+                "call_edges": {
+                    "type": "string",
+                    "enum": ["changed_lines", "changed_files", "omit"],
+                    "default": "changed_lines",
+                    "description": "Call-edge inventory: selected changed reference start lines, all declarations in changed files, or omitted."
                 }
             })),
         ),
@@ -62,7 +67,7 @@ pub(crate) fn diff_tool_descriptors() -> Vec<Value> {
         ),
         tool_descriptor(
             "score_diff",
-            "Score how hard a revision range makes future maintenance, as a deterministic vector of raw named features. Four groups plus `excluded`, without weights or a single score. `geometry`: counts of symbols edited/introduced/deleted/moved/resignatured, production and test files changed, distinct directories, insertions/deletions, `edit_clusters` (connected components over changed production files, where two connect when they share a directory or one imports the other in the target revision), and mean/max pairwise directory distance (components up plus down between those files' directories). `coordination`: external caller sites per signature change (reference sites in the target revision lying in files this diff did not touch), added and removed call-edge weight, `unattributed_call_edge_changes` as an opacity signal, and edited symbols whose signature metadata publishes `dispatch_extensibility: open`. `verification`: changed production symbols with zero direct test reference -- SYMBOL-LEVEL AND NON-TRANSITIVE, meaning no reference site for that exact symbol lies in a test file or test region. A symbol a test reaches only through an intermediate is still reported here; this is not coverage. `baseline`: cognitive complexity over the before and after sides of the edited symbol pairs, its delta, and the maximum after-side value, for comparison rather than as a verdict. `excluded` names the binary and unparseable changed files no feature could measure, and `verification.unresolved_symbols` names symbols whose reference scan did not complete, so nothing is dropped silently. Endpoint resolution is identical to analyze_diff. Test symbols and edges are always in scope because verification needs them. References cover the whole target. Verification retains source lines for hot symbols; incomplete scans stay unresolved. Sessions reuse immutable target analysis and the last complete reference query; a first call can be expensive. Worktree calls reuse complete disk workspaces.",
+            "Return raw maintenance features in geometry, coordination, verification, baseline and excluded; no weights or aggregate score. geometry counts changed symbols, production/test files, directories, insertions/deletions, edit_clusters (connected changed-production-file components linked by a shared directory or target import), and mean/max directory distance. coordination reports target caller sites outside changed files per signature change, added/removed call-edge weight, unattributed_call_edge_changes and edited symbols with dispatch_extensibility: open. Call analysis retains full changed-file relationships; it does not inherit analyze_diff's changed_lines default. Incomplete full-file deltas remain incumbent best-effort; analyze_diff exposes their call_analysis status. verification counts changed production symbols with zero direct test references: symbol-level and non-transitive, not coverage. Indirectly reached symbols remain in this count. baseline reports before/after cognitive complexity of edited pairs, its delta and maximum after value for comparison, not verdicts. excluded lists binary/unparseable files; verification.unresolved_symbols lists incomplete scans. Endpoint resolution matches analyze_diff. Tests remain in scope for verification; references cover the whole target. Verification retains hot-symbol source lines; incomplete scans stay unresolved. Sessions reuse immutable target analysis and the last complete reference query; the first call may be expensive. Worktree calls reuse complete disk workspaces.",
             endpoint_schema(json!({})),
         ),
     ]

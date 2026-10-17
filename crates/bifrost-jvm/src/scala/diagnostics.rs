@@ -22,10 +22,12 @@ use brokk_bifrost_core::analyzer::model::{
     SemanticDiagnosticReport,
 };
 use brokk_bifrost_core::analyzer::semantic_diagnostics::{node_range, node_text};
-use brokk_bifrost_core::analyzer::tree_walk::collect_parse_errors;
+use brokk_bifrost_core::analyzer::tree_walk::{
+    WalkControl, collect_parse_errors, walk_named_tree_preorder,
+};
 use brokk_bifrost_core::hash::HashSet;
 use brokk_bifrost_core::text_utils::compute_line_starts;
-use tree_sitter::{Node, Parser, Tree};
+use tree_sitter::{Node, Tree};
 
 pub const SCALA_UNRECOGNIZED_SYMBOL: &str = "scala_unrecognized_symbol";
 pub const SCALA_SEMANTIC_DIAGNOSTIC_SOURCE: &str = "bifrost-scala";
@@ -86,11 +88,7 @@ pub fn collect_scala_semantic_diagnostics(
 }
 
 fn parse_scala_tree(source: &str) -> Option<Tree> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&crate::scala::language::LANGUAGE.into())
-        .ok()?;
-    parser.parse(source, None)
+    crate::scala::language::parse_tree(source).ok()?
 }
 
 struct ScalaDiagnosticCollector<'a> {
@@ -107,12 +105,11 @@ struct ScalaDiagnosticCollector<'a> {
 
 impl ScalaDiagnosticCollector<'_> {
     fn scan_tree(&mut self, root: Node<'_>) {
-        let mut stack = vec![root];
-        while let Some(node) = stack.pop() {
+        let mut truncated = false;
+        walk_named_tree_preorder(root, true, |node| {
             if self.errors >= MAX_SCALA_SEMANTIC_DIAGNOSTICS {
-                self.report
-                    .push_incomplete(None, vec![SemanticDiagnosticIncompleteReason::Truncated]);
-                break;
+                truncated = true;
+                return WalkControl::Break;
             }
             if node.kind() == "type_identifier" && is_bare_type_reference(node) {
                 self.check_type_identifier(node);
@@ -120,9 +117,11 @@ impl ScalaDiagnosticCollector<'_> {
             if node.kind() == "identifier" && is_bare_value_reference(node) {
                 self.check_value_identifier(node);
             }
-            let mut cursor = node.walk();
-            let children = node.named_children(&mut cursor).collect::<Vec<_>>();
-            stack.extend(children.into_iter().rev());
+            WalkControl::Continue
+        });
+        if truncated {
+            self.report
+                .push_incomplete(None, vec![SemanticDiagnosticIncompleteReason::Truncated]);
         }
     }
 
@@ -221,8 +220,7 @@ fn is_bare_value_reference(node: Node<'_>) -> bool {
 
 fn collect_declared_type_names(root: Node<'_>, source: &str) -> HashSet<String> {
     let mut names = HashSet::default();
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
+    walk_named_tree_preorder(root, true, |node| {
         if matches!(node.kind(), "type_parameters" | "type_definition") {
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
@@ -234,17 +232,14 @@ fn collect_declared_type_names(root: Node<'_>, source: &str) -> HashSet<String> 
                 }
             }
         }
-        let mut cursor = node.walk();
-        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
-        stack.extend(children.into_iter().rev());
-    }
+        WalkControl::Continue
+    });
     names
 }
 
 fn collect_declared_value_names(root: Node<'_>, source: &str) -> HashSet<String> {
     let mut names = HashSet::default();
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
+    walk_named_tree_preorder(root, true, |node| {
         if matches!(
             node.kind(),
             "function_definition"
@@ -266,10 +261,8 @@ fn collect_declared_value_names(root: Node<'_>, source: &str) -> HashSet<String>
                 }
             }
         }
-        let mut cursor = node.walk();
-        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
-        stack.extend(children.into_iter().rev());
-    }
+        WalkControl::Continue
+    });
     names
 }
 

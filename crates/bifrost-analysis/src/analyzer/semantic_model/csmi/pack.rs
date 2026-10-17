@@ -41,6 +41,23 @@ pub enum CsmiResourceError {
     },
 }
 
+/// Check a resolved CSMI resource against its declared byte length.
+pub fn validate_resource_size(
+    path: &str,
+    bytes: &[u8],
+    expected_size: u64,
+) -> Result<(), CsmiResourceError> {
+    let actual = u64::try_from(bytes.len()).expect("resource length fits u64");
+    if actual != expected_size {
+        return Err(CsmiResourceError::SizeMismatch {
+            path: path.to_owned(),
+            expected: expected_size,
+            actual,
+        });
+    }
+    Ok(())
+}
+
 impl fmt::Display for CsmiResourceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -138,14 +155,7 @@ impl CsmiResourceResolver for InMemoryCsmiResourceResolver {
             .ok_or_else(|| CsmiResourceError::Missing {
                 path: path.to_owned(),
             })?;
-        let actual = u64::try_from(bytes.len()).expect("resource length fits u64");
-        if actual != expected_size {
-            return Err(CsmiResourceError::SizeMismatch {
-                path: path.to_owned(),
-                expected: expected_size,
-                actual,
-            });
-        }
+        validate_resource_size(path, bytes, expected_size)?;
         Ok(bytes.clone())
     }
 }

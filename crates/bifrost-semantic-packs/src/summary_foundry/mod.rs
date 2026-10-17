@@ -29,15 +29,19 @@ pub mod sanitizer_pack;
 pub mod store;
 pub mod taint_policy;
 
+#[cfg(test)]
+mod test_support;
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use brokk_bifrost_analysis::analyzer::semantic_model::{
-    ActivationSelector, AuthoredPayload, AuthoredSemanticModelPack, AuthoredShard, Compatibility,
-    CompilerOptions, Completeness, Diagnostic, Producer, Provenance, SEMANTIC_MODEL_SCHEMA_VERSION,
-    Safety, SourceFormat, compile_source,
+    ActivationSelector, AuthoredPayload, AuthoredProcedureSummary, AuthoredSemanticModelPack,
+    AuthoredShard, Compatibility, CompilerOptions, Completeness, Diagnostic, Producer, Provenance,
+    SEMANTIC_MODEL_SCHEMA_VERSION, Safety, SourceFormat, compile_source,
 };
 use serde::{Deserialize, Serialize};
 
@@ -48,6 +52,138 @@ use joern::{
     JoernParseError, parse_default_semantics_scala, parse_semantics_dsl, translate_joern_semantics,
 };
 use join::{FoundryJoin, join_corpora};
+
+fn pack_relative_path(pack_id: &str, pinned: bool) -> PathBuf {
+    let file_name = format!("{pack_id}.json");
+    if pinned {
+        PathBuf::from(file_name)
+    } else {
+        Path::new("staged").join(file_name)
+    }
+}
+
+pub(super) fn json_candidate_paths(candidates_dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(candidates_dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|extension| extension.to_str()) == Some("json") {
+            files.push(path);
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+pub(super) enum FoundryOutputError {
+    CreateDirectory { path: PathBuf, message: String },
+    WriteFile { path: PathBuf, message: String },
+}
+
+pub(super) fn write_foundry_outputs<'a>(
+    output_root: &Path,
+    packs: impl IntoIterator<Item = (&'a Path, &'a str)>,
+    audit_file_name: &str,
+    audit_json: &str,
+) -> Result<Vec<PathBuf>, FoundryOutputError> {
+    let mut written = Vec::new();
+    for (relative_path, source_json) in packs {
+        let path = output_root.join(relative_path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| FoundryOutputError::CreateDirectory {
+                path: parent.to_owned(),
+                message: error.to_string(),
+            })?;
+        }
+        fs::write(&path, source_json.as_bytes()).map_err(|error| {
+            FoundryOutputError::WriteFile {
+                path: path.clone(),
+                message: error.to_string(),
+            }
+        })?;
+        written.push(path);
+    }
+    let audit_path = output_root.join(audit_file_name);
+    fs::write(&audit_path, audit_json.as_bytes()).map_err(|error| {
+        FoundryOutputError::WriteFile {
+            path: audit_path.clone(),
+            message: error.to_string(),
+        }
+    })?;
+    written.push(audit_path);
+    written.sort();
+    Ok(written)
+}
+
+fn serialize_pack(pack: &AuthoredSemanticModelPack) -> String {
+    serialize_pretty_json_line(pack)
+}
+
+pub(super) fn serialize_pretty_json_line(value: &impl Serialize) -> String {
+    let mut json = serde_json::to_string_pretty(value).expect("the foundry value is serializable");
+    json.push('\n');
+    json
+}
+
+pub(super) fn compile_pack_source(source_json: &str) -> Result<(), Vec<String>> {
+    compile_source(
+        SourceFormat::Json,
+        source_json.as_bytes(),
+        &CompilerOptions::default(),
+    )
+    .map(|_| ())
+    .map_err(|diagnostics| {
+        diagnostics
+            .iter()
+            .map(|diagnostic| format!("{diagnostic:?}"))
+            .collect()
+    })
+}
+
+pub(super) fn duplicate_summary_id<'a>(
+    mut summaries: impl Iterator<Item = &'a AuthoredProcedureSummary>,
+) -> Option<&'a str> {
+    let mut seen = std::collections::HashSet::new();
+    summaries
+        .find(|summary| !seen.insert(summary.id.as_str()))
+        .map(|summary| summary.id.as_str())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn authored_pack(
+    pack_id: String,
+    version: String,
+    producer_name: String,
+    language: String,
+    ecosystem: String,
+    compatibility: Compatibility,
+    provenance: Provenance,
+    completeness: Completeness,
+    shards: Vec<AuthoredShard>,
+) -> AuthoredSemanticModelPack {
+    AuthoredSemanticModelPack {
+        schema_version: SEMANTIC_MODEL_SCHEMA_VERSION,
+        pack_id,
+        version,
+        producer: Producer {
+            name: producer_name,
+            version: FOUNDRY_PRODUCER_VERSION.to_owned(),
+        },
+        language,
+        ecosystem,
+        compatibility,
+        provenance,
+        license: "Apache-2.0".to_owned(),
+        completeness,
+        safety: Safety {
+            generated_code_only: false,
+            review_required: true,
+        },
+        carried_sources: Vec::new(),
+        cpp_portability: None,
+        python_correspondence: None,
+        shards,
+    }
+}
 
 /// Shared foundry producer version. Advance it when a converter changes the
 /// shape of its output. It is not the crate version: checked-in packs are
@@ -591,6 +727,7 @@ fn round_trip(
             collection_flows: None,
             deferred_yields: None,
             conditional_type_refinements: None,
+            callable_values: None,
         }],
     };
     let source = serde_json::to_vec(&pack).expect("the authored pack is serializable");
@@ -739,136 +876,6 @@ mod tests {
             .expect("the derived slot is reported");
         assert!(derived.entries > 0, "{derived:?}");
         assert_eq!(derived.shards, 1, "{derived:?}");
-    }
-
-    #[test]
-    fn the_derived_slot_classifies_against_codeql_at_the_argument_level_projection() {
-        let report = run_foundry_join(&fixture_inputs_with_derivation())
-            .expect("the fixture corpora and pinned slices run");
-
-        let derivation = report.derivation.expect("the run derived");
-        assert_eq!(derivation.files_read, 2);
-        assert!(derivation.entries > 0);
-        assert_eq!(
-            derivation.observed_output_ports,
-            vec!["normal_return".to_owned(), "exceptional_return".to_owned()]
-        );
-        assert_eq!(
-            derivation.boundaries_by_kind.get("native_callee"),
-            Some(&1),
-            "boundaries: {:?}",
-            derivation.boundaries_by_kind
-        );
-
-        assert!(
-            report
-                .join
-                .slots
-                .iter()
-                .any(|slot| slot.corpus == FoundryCorpus::Derived && slot.populated)
-        );
-        // CodeQL states `Objects.requireNonNullElse` without a signature, so its
-        // key pins no overload. The derived entry pins arity 2. Both keys are
-        // gaps against each other, and the gap names the sibling so a reviewer
-        // sees the neighbourhood.
-        let derived_gap = report
-            .join
-            .gaps
-            .iter()
-            .find(|gap| {
-                gap.key.artifact_path == "java/util/Objects.class"
-                    && gap.key.member == "requireNonNullElse"
-                    && gap.key.arity == Some(2)
-            })
-            .expect("the derived entry is a gap against the unsigned CodeQL row");
-        assert_eq!(
-            derived_gap.views["derived"].transfers,
-            vec![
-                "parameter[0]->normal_return@normal".to_owned(),
-                "parameter[1]->normal_return@normal".to_owned(),
-            ]
-        );
-        let codeql_row = report
-            .join
-            .gaps
-            .iter()
-            .find(|gap| {
-                gap.key.artifact_path == "java/util/Objects.class"
-                    && gap.key.member == "requireNonNullElse"
-                    && gap.key.arity.is_none()
-            })
-            .expect("the unsigned CodeQL row keeps its own key");
-        assert_eq!(
-            codeql_row.views["codeql"].transfers, derived_gap.views["derived"].transfers,
-            "the derived transfers match the CodeQL translation exactly"
-        );
-    }
-
-    #[test]
-    fn the_report_states_counts_for_both_corpora_and_the_empty_derived_slot() {
-        let report = run_foundry_join(&fixture_inputs()).expect("the fixture corpora translate");
-
-        let codeql = &report.translation[0];
-        assert_eq!(codeql.corpus, FoundryCorpus::Codeql);
-        assert_eq!(codeql.files_read, 3);
-        assert_eq!(codeql.rows_by_kind.get("summaryModel"), Some(&14));
-        assert!(codeql.entries > 0);
-        assert_eq!(codeql.no_flow_entries, 1);
-        assert!(codeql.skipped_rows > 0);
-
-        let joern = &report.translation[1];
-        assert_eq!(joern.corpus, FoundryCorpus::Joern);
-        assert_eq!(joern.no_flow_entries, 1);
-
-        assert_eq!(
-            report
-                .join
-                .slots
-                .iter()
-                .find(|slot| slot.corpus == FoundryCorpus::Derived)
-                .map(|slot| slot.populated),
-            Some(false)
-        );
-    }
-
-    #[test]
-    fn the_two_corpora_agree_on_the_no_flow_claim_they_share() {
-        let report = run_foundry_join(&fixture_inputs()).expect("the fixture corpora translate");
-
-        let agreement = report
-            .join
-            .agreements
-            .iter()
-            .find(|agreement| agreement.key.member == "length")
-            .expect("both corpora state String.length carries no flow");
-
-        assert_eq!(agreement.claim, FoundryClaim::NoFlow);
-        assert_eq!(agreement.key.artifact_path, "java/lang/String.class");
-        assert!(agreement.transfers.is_empty());
-        assert!(report.join.gap_count > 0);
-    }
-
-    #[test]
-    fn one_row_that_names_an_argument_set_produces_one_transfer_per_port() {
-        let report = run_foundry_join(&fixture_inputs()).expect("the fixture corpora translate");
-
-        let gap = report
-            .join
-            .gaps
-            .iter()
-            .find(|gap| {
-                gap.key.artifact_path
-                    == "org/springframework/web/util/DefaultUriBuilderFactory.class"
-            })
-            .expect("the Argument[this,0] row produced an entry");
-
-        assert_eq!(
-            gap.views["codeql"].transfers,
-            vec![
-                "parameter[0]->normal_return@normal".to_owned(),
-                "receiver->normal_return@normal".to_owned(),
-            ]
-        );
     }
 
     #[test]

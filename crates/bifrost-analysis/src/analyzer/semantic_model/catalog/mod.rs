@@ -15,14 +15,26 @@ use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 use uuid::Uuid;
 
+use super::csmi::{
+    CsmiCallableValuesModality, CsmiCallableValuesPayload, CsmiCallableValuesShape,
+    CsmiCallableValuesTiming, CsmiCoverageStatus, CsmiInputLocation,
+};
+use super::model::{
+    AnonymousCallableIdentity, CallableValuesCoverage, CallableValuesFact, CallableValuesFamily,
+    CallableValuesPayload, SourceAnchor, SourceByteRange, SourceCallableShape,
+    SourceDeclarationKind, SourceParameterShape, SourceTypeNode,
+};
 use super::validate::is_canonical_relative_path;
 use super::{
-    ActivationSelector, ArtifactEncoding, CompiledPackManifest, CompiledSemanticModelPack,
-    CompiledShard, CompiledShardDescriptor, Completeness, DecodeLimits, NameSelector, PayloadKind,
-    SEMANTIC_MODEL_SCHEMA_VERSION, SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS, decode_manifest,
-    decode_validated_shard_for_manifest, validate_manifest_inventory,
+    ActivationSelector, ArtifactEncoding, ArtifactProducerLimits, CompiledPackManifest,
+    CompiledSemanticModelPack, CompiledShard, CompiledShardDescriptor, Completeness, DecodeLimits,
+    ExactArtifact, NameSelector, PayloadKind, SEMANTIC_MODEL_SCHEMA_VERSION,
+    SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS, decode_manifest, decode_validated_shard_for_manifest,
+    validate_manifest_inventory,
 };
+use crate::CancellationToken;
 use crate::analyzer::canonical_hash::{CanonicalHasher, is_lower_sha256, lower_hex_string};
+use crate::analyzer::semantic_model::GoPinnedPackage;
 use crate::analyzer::store::{
     AnalyzerStore, SemanticPackActivationSourceKind, SemanticPackActiveReference,
     SemanticPackActiveSet,
@@ -108,8 +120,41 @@ pub const CATALOG_SCHEMA_VERSION: i64 = db::CURRENT_CATALOG_VERSION;
 /// 37: Java producers retain explicit final-method evidence independently of virtuality defaults.
 /// 38: Python class hierarchy extraction no longer treats `metaclass=` as an instance base.
 /// 39: TypeScript default exports retain aliases; unsupported exports make packs partial.
-/// 40: combined native schema8 and TypeScript producer changes invalidate both earlier outputs.
-pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 40;
+/// 40: native schema8 compatibility invalidates earlier producer outputs.
+/// 41: schema9 retains explicitly unknown port types; earlier schema8 outputs
+/// and validation certificates cannot certify the combined model.
+/// 42: schema10 carries native callable-values facts and scoped coverage;
+/// earlier generated outputs cannot certify the combined model.
+/// 43: the JMOD producer reads the descriptor's variable-width `opens` table,
+/// skips `classes/` resources, and reads only exported packages; Java class
+/// producers erase a signature that names a type variable outside its
+/// declaration's scope (#3444). Warm JDK packs omit `java.desktop` and
+/// `java.security.jgss` and are marked partial.
+/// 44: exact Go source selectors and activation evidence carry the selected
+/// source-set digest, while the generated production key remains separate.
+/// 45: the origin merge combines generated producer inputs from both branches,
+/// invalidating cache entries produced from either pre-merge model.
+/// 46 (upstream): schema-14 structured variadic procedure formals change the
+/// meaning of generated Python standard-library summaries.
+/// 46 (#4343 branch): C++ external signatures retain declaration-written
+/// formal names so named call-argument selectors can bind generated header
+/// models.
+/// 47 (#4343 branch): generated C/C++ header variadic declarations retain
+/// explicit variadic markers without claiming family completeness, and
+/// callable-owner filtering excludes unrelated same-named types from generated
+/// header publication.
+/// 48: the merge of both branches combines their generated producer changes,
+/// so entries produced by either pre-merge producer are stale.
+/// 49: CSMI callable summaries now retain structured formal binding slots.
+/// 50: CSMI callable summaries retain one exact runtime return-class claim.
+/// 51: schema sixteen replaces that claim with the complete exact runtime
+/// return-class set, which changes the meaning of generated callable facts.
+/// 52: the Python stub producer publishes module-level class aliases and the
+/// source order of every declared class base. Warm packs omit alias identities
+/// and leave ordered multiple inheritance unavailable to C3 (#4860).
+/// 53: C++ grammar 0.24.3 retains the closing language-linkage guard around
+/// header overloads. Warm packs parsed from identical bytes lack that guard.
+pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 53;
 pub const SEMANTIC_PACK_CACHE_ROOT_ENV: &str = "BIFROST_SEMANTIC_PACK_CACHE_ROOT";
 
 /// Resolve the generated catalog used when no explicit catalog is configured.
@@ -188,24 +233,15 @@ pub enum DurablePackSourceKind {
 
 impl DurablePackSourceKind {
     fn as_str(self) -> &'static str {
-        match self {
-            Self::Installed => "installed",
-            Self::Generated => "generated",
-            Self::PreShipped => "pre_shipped",
-            Self::WorkspaceProduced => "workspace_produced",
-        }
+        CatalogPackSourceKind::from(self).as_str()
     }
 
     fn parse(value: &str) -> Result<Self, CatalogError> {
-        match value {
-            "installed" => Ok(Self::Installed),
-            "generated" => Ok(Self::Generated),
-            "pre_shipped" => Ok(Self::PreShipped),
-            "workspace_produced" => Ok(Self::WorkspaceProduced),
-            _ => Err(CatalogError::Integrity(format!(
-                "unknown catalog source kind {value:?}"
-            ))),
-        }
+        parse_semantic_pack_activation_source_kind(value)
+            .and_then(durable_activation_kind)
+            .ok_or_else(|| {
+                CatalogError::Integrity(format!("unknown catalog source kind {value:?}"))
+            })
     }
 }
 
@@ -250,18 +286,23 @@ impl CatalogPackSourceKind {
         }
     }
 
-    fn parse(value: &str) -> Result<Self, CatalogError> {
-        match value {
-            "installed" => Ok(Self::Installed),
-            "generated" => Ok(Self::Generated),
-            "pre_shipped" => Ok(Self::PreShipped),
-            "workspace_produced" => Ok(Self::WorkspaceProduced),
-            "embedded" => Ok(Self::Embedded),
-            "ephemeral_workspace" => Ok(Self::EphemeralWorkspace),
-            _ => Err(CatalogError::Integrity(format!(
-                "unknown catalog source kind {value:?}"
-            ))),
+    pub(crate) const fn precedence(self) -> u8 {
+        match self {
+            Self::Embedded => 0,
+            Self::PreShipped => 1,
+            Self::Installed => 2,
+            Self::Generated => 3,
+            Self::WorkspaceProduced => 4,
+            Self::EphemeralWorkspace => 5,
         }
+    }
+
+    fn parse(value: &str) -> Result<Self, CatalogError> {
+        parse_semantic_pack_activation_source_kind(value)
+            .map(activation_catalog_kind)
+            .ok_or_else(|| {
+                CatalogError::Integrity(format!("unknown catalog source kind {value:?}"))
+            })
     }
 }
 
@@ -338,6 +379,214 @@ impl CatalogCandidate {
 
     pub fn source_id(&self) -> &str {
         &self.source_id
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CatalogCallableValuesQueryLimits {
+    /// Maximum matching facts, coverage claims, and expanded target-identity
+    /// rows materialized by one request.
+    pub max_records: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum CatalogCallableValuesQuestion<'a> {
+    ReturnedCallable {
+        result: u32,
+    },
+    CallbackInvocation {
+        callback: &'a CsmiInputLocation,
+        shape: CsmiCallableValuesShape,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CatalogCallableValuesQuery<'a> {
+    pub manifest_digest: &'a str,
+    pub shard_id: &'a str,
+    pub callable: &'a str,
+    pub question: CatalogCallableValuesQuestion<'a>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogCallableValueFact {
+    pub manifest_digest: String,
+    pub shard_id: String,
+    pub callable: String,
+    pub ordinal: i64,
+    pub fact: CallableValuesFact,
+    /// Present when a returned target has an exact native anonymous identity
+    /// in this same manifest and shard.
+    pub anonymous_callable: Option<AnonymousCallableIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogCallableValueCoverage {
+    pub manifest_digest: String,
+    pub shard_id: String,
+    pub callable: String,
+    pub ordinal: i64,
+    pub coverage: CallableValuesCoverage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogCallableValuesQueryGap {
+    Cancelled,
+    RecordBudgetExhausted { max_records: usize },
+    UnsupportedProjection(super::csmi::CsmiCallableValuesUnsupportedProjection),
+    IndexReconciliationRequired,
+}
+
+#[derive(Debug)]
+pub struct CatalogCallableValuesQueryResult {
+    /// Alternatives remain independent; array order never selects a winner.
+    pub facts: Vec<CatalogCallableValueFact>,
+    /// Producer claims remain independent from executable completeness.
+    pub coverage_claims: Vec<CatalogCallableValueCoverage>,
+    /// SQL catalog evidence alone never establishes execution proof.
+    pub executable_coverage: CsmiCoverageStatus,
+    /// Matching facts, scoped coverage claims, and identity rows materialized
+    /// by this SQL request.
+    pub examined_records: usize,
+    pub gap: Option<CatalogCallableValuesQueryGap>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CatalogGoSourceReadLimits {
+    pub max_files: usize,
+    pub max_source_bytes: u64,
+    pub max_path_depth: usize,
+}
+
+impl Default for CatalogGoSourceReadLimits {
+    fn default() -> Self {
+        Self {
+            max_files: 100_000,
+            max_source_bytes: 256 * 1024 * 1024,
+            max_path_depth: 64,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CatalogGoSourceRequest<'a> {
+    pub manifest_digest: &'a str,
+    pub shard_id: &'a str,
+    pub artifact_sha256: &'a str,
+    pub package_import_path: &'a str,
+    pub file: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogExactGoSourceSet {
+    pub artifact: ExactArtifact,
+    pub packages: Vec<GoPinnedPackage>,
+}
+
+/// A cloneable SQL-only bridge for active runtime publication.
+///
+/// The reader owns fixed database handles and, for an ephemeral catalog, the
+/// root keepalive needed by SQLite. It never retains a catalog borrow or a
+/// workspace-sized source index.
+#[derive(Clone)]
+pub struct CatalogRuntimeSourceReader {
+    durable_connection: Arc<Mutex<Connection>>,
+    session_callable_values: Arc<Mutex<Option<SessionCallableValuesCatalog>>>,
+    _ephemeral_root: Option<Arc<TempDir>>,
+}
+
+impl fmt::Debug for CatalogRuntimeSourceReader {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CatalogRuntimeSourceReader")
+            .finish_non_exhaustive()
+    }
+}
+
+impl CatalogRuntimeSourceReader {
+    pub fn query_callable_values(
+        &self,
+        query: &CatalogCallableValuesQuery<'_>,
+        limits: CatalogCallableValuesQueryLimits,
+        cancellation: &CancellationToken,
+    ) -> Result<CatalogCallableValuesQueryResult, CatalogError> {
+        let durable = self
+            .durable_connection
+            .lock()
+            .expect("semantic-pack catalog connection mutex poisoned");
+        if SemanticPackCatalog::callable_values_publication_present(
+            &durable,
+            query.manifest_digest,
+            query.shard_id,
+        )? {
+            return SemanticPackCatalog::query_callable_values_on_connection(
+                &durable,
+                query,
+                limits,
+                cancellation,
+            );
+        }
+        drop(durable);
+
+        let session = self
+            .session_callable_values
+            .lock()
+            .expect("session callable-values connection mutex poisoned");
+        let Some(session) = session.as_ref() else {
+            return Ok(SemanticPackCatalog::callable_values_index_missing_result(
+                limits,
+            ));
+        };
+        if SemanticPackCatalog::callable_values_publication_present(
+            &session.connection,
+            query.manifest_digest,
+            query.shard_id,
+        )? {
+            return SemanticPackCatalog::query_callable_values_on_connection(
+                &session.connection,
+                query,
+                limits,
+                cancellation,
+            );
+        }
+        Ok(SemanticPackCatalog::callable_values_index_missing_result(
+            limits,
+        ))
+    }
+
+    pub fn read_go_source(
+        &self,
+        request: &CatalogGoSourceRequest<'_>,
+        limits: CatalogGoSourceReadLimits,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<CatalogExactGoSourceSet>, CatalogError> {
+        let durable = self
+            .durable_connection
+            .lock()
+            .expect("semantic-pack catalog connection mutex poisoned");
+        if let Some(source) = SemanticPackCatalog::read_go_source_from_connection(
+            &durable,
+            request,
+            limits,
+            cancellation,
+        )? {
+            return Ok(Some(source));
+        }
+        drop(durable);
+
+        let session = self
+            .session_callable_values
+            .lock()
+            .expect("session callable-values connection mutex poisoned");
+        let Some(session) = session.as_ref() else {
+            return Ok(None);
+        };
+        SemanticPackCatalog::read_go_source_from_connection(
+            &session.connection,
+            request,
+            limits,
+            cancellation,
+        )
     }
 }
 
@@ -931,6 +1180,11 @@ pub enum CatalogError {
         found: i64,
         required: i64,
     },
+    Cancelled,
+    SourceBudgetExhausted {
+        max_files: usize,
+        max_source_bytes: u64,
+    },
     Unavailable,
 }
 
@@ -941,6 +1195,19 @@ impl CatalogError {
 
     fn sqlite(operation: &'static str, source: rusqlite::Error) -> Self {
         Self::Sqlite { operation, source }
+    }
+}
+
+impl From<crate::sqlite_template::TemplateIoError> for CatalogError {
+    fn from(error: crate::sqlite_template::TemplateIoError) -> Self {
+        let source = std::io::Error::new(
+            error.source.kind(),
+            format!("{}: {}", error.path.display(), error.source),
+        );
+        Self::Io {
+            operation: error.operation,
+            source,
+        }
     }
 }
 
@@ -959,6 +1226,14 @@ impl fmt::Display for CatalogError {
                 formatter,
                 "read-only semantic-pack catalog schema is {found}, expected {required}"
             ),
+            Self::Cancelled => formatter.write_str("semantic-pack catalog query was cancelled"),
+            Self::SourceBudgetExhausted {
+                max_files,
+                max_source_bytes,
+            } => write!(
+                formatter,
+                "exact Go source reader budget exhausted (max_files={max_files}, max_source_bytes={max_source_bytes})"
+            ),
             Self::Unavailable => formatter.write_str("catalog candidate is unavailable"),
         }
     }
@@ -975,7 +1250,8 @@ pub struct SemanticPackCatalog {
     // Session packs and SQLite data-version counters belong to one opened
     // catalog. Equal counters in another catalog do not identify its content.
     instance_identity: u64,
-    connection: Mutex<Connection>,
+    connection: Arc<Mutex<Connection>>,
+    session_callable_values: Arc<Mutex<Option<SessionCallableValuesCatalog>>>,
     session_packs: Mutex<Vec<SessionPack>>,
     session_activations: Mutex<HashMap<String, SessionActivation>>,
     rejected_manifests: Mutex<HashSet<String>>,
@@ -996,7 +1272,7 @@ pub struct SemanticPackCatalog {
     // locally used to pay it: 433 opens and about 4 s per warm start of an npm
     // workspace (#3748). A failed open is not kept, so the next use retries.
     shared_generated: OnceLock<Box<SemanticPackCatalog>>,
-    _ephemeral_root: Option<TempDir>,
+    _ephemeral_root: Option<Arc<TempDir>>,
 }
 
 /// Decoded manifests of one catalog, keyed by their content digest.
@@ -1024,7 +1300,11 @@ const DECODED_MANIFEST_MEMO_BYTES: usize = 32 * 1024 * 1024;
 // Increment when artifact semantic validation or normalization changes. A
 // certificate proves those checks for exact bytes under exact decode limits;
 // it never replaces the stored/content digest checks on each load.
-const SHARD_VALIDATION_VERSION: u32 = 3;
+// 7: callable families may be complete when their final declaration formal is
+// variadic, and schema-14 summary formal shapes receive directional validation.
+// 8: schema-16 exact return-class claims receive callable-result validation.
+// 9: schema-16 exact return-class sets receive non-empty nominal-set validation.
+const SHARD_VALIDATION_VERSION: u32 = 9;
 
 fn decode_limits_digest(limits: &DecodeLimits) -> String {
     let mut hasher = CanonicalHasher::new(b"bifrost.semantic-pack.decode-limits.v1");
@@ -1051,6 +1331,67 @@ const CERTIFIED_SHARD_SQL: &str = "SELECT EXISTS(
     SELECT 1 FROM catalog_shard_validations
     WHERE manifest_digest = ?1 AND shard_id = ?2
       AND validation_version = ?3 AND limits_sha256 = ?4)";
+
+const CALLABLE_VALUES_RETURNED_SQL: &str = "SELECT fact.fact_ordinal,
+       fact.result_ordinal, fact.target, fact.provenance_json
+FROM catalog_callable_value_facts AS fact
+JOIN catalog_packs AS pack ON pack.manifest_digest = fact.manifest_digest
+WHERE pack.state = 'verified'
+  AND fact.manifest_digest = ?1 AND fact.shard_id = ?2
+  AND fact.family = 'returned-callables' AND fact.callable = ?3
+  AND fact.result_ordinal = ?4
+ORDER BY fact.fact_ordinal
+LIMIT ?5";
+
+const CALLABLE_VALUES_CALLBACK_SQL: &str = "SELECT fact.fact_ordinal,
+       fact.callback_location_json, fact.callback_parameters,
+       fact.callback_results, fact.arguments_json, fact.timing,
+       fact.modality, fact.provenance_json
+FROM catalog_callable_value_facts AS fact
+JOIN catalog_packs AS pack ON pack.manifest_digest = fact.manifest_digest
+WHERE pack.state = 'verified'
+  AND fact.manifest_digest = ?1 AND fact.shard_id = ?2
+  AND fact.family = 'callback-invocations' AND fact.callable = ?3
+  AND fact.callback_location_json = ?4
+  AND fact.callback_parameters = ?5 AND fact.callback_results = ?6
+ORDER BY fact.fact_ordinal
+LIMIT ?7";
+
+const CALLABLE_VALUES_COVERAGE_SQL: &str = "SELECT coverage.coverage_ordinal,
+       coverage.family, coverage.status, coverage.limitations_json,
+       coverage.provenance_json
+FROM catalog_callable_value_coverage AS coverage
+JOIN catalog_packs AS pack ON pack.manifest_digest = coverage.manifest_digest
+WHERE pack.state = 'verified'
+  AND coverage.manifest_digest = ?1 AND coverage.shard_id = ?2
+  AND coverage.family = ?3 AND coverage.callable = ?4
+ORDER BY coverage.coverage_ordinal
+LIMIT ?5";
+
+const ANONYMOUS_CALLABLE_IDENTITY_SQL: &str = "SELECT identity.artifact_sha256,
+       identity.package_import_path, identity.anchor_file, identity.anchor_start,
+       identity.anchor_end, identity.signature_file, identity.signature_start,
+       identity.signature_end
+FROM catalog_anonymous_callable_identities AS identity
+JOIN catalog_packs AS pack ON pack.manifest_digest = identity.manifest_digest
+WHERE pack.state = 'verified' AND identity.manifest_digest = ?1
+  AND identity.shard_id = ?2 AND identity.callable_id = ?3";
+
+const ANONYMOUS_CALLABLE_IDENTITY_ANCHORS_SQL: &str = "SELECT 'anchor' AS row_kind,
+       chain_kind AS subkind, ordinal, file, byte_start, byte_end,
+       declaration_kind, NULL AS variadic, NULL AS arity
+FROM catalog_anonymous_callable_identity_anchors
+WHERE manifest_digest = ?1 AND shard_id = ?2 AND callable_id = ?3
+ORDER BY chain_kind, ordinal
+LIMIT ?4";
+
+const ANONYMOUS_CALLABLE_IDENTITY_SHAPES_SQL: &str = "SELECT 'shape' AS row_kind,
+       shape_kind AS subkind, ordinal, file, byte_start, byte_end,
+       NULL AS declaration_kind, variadic, arity
+FROM catalog_anonymous_callable_signature_shapes
+WHERE manifest_digest = ?1 AND shard_id = ?2 AND callable_id = ?3
+ORDER BY shape_kind, ordinal
+LIMIT ?4";
 
 fn record_shard_validation(
     connection: &Connection,
@@ -1081,6 +1422,27 @@ struct ValidatedShard {
     descriptor: CompiledShardDescriptor,
     bytes: Vec<u8>,
     selectors: Vec<ActivationSelector>,
+    callable_values: Option<CallableValuesPayload>,
+}
+
+enum CallableValuesIndexReadiness {
+    Ready,
+    Cancelled,
+    Missing,
+}
+
+enum AnonymousCallableIdentityRead {
+    Missing,
+    Found {
+        identity: Box<AnonymousCallableIdentity>,
+        examined: usize,
+    },
+    RecordBudgetExhausted {
+        examined: usize,
+    },
+    Cancelled {
+        examined: usize,
+    },
 }
 
 struct ValidatedPack {
@@ -1092,6 +1454,18 @@ struct SessionPack {
     manifest: Arc<CompiledPackManifest>,
     shards: Vec<ValidatedShard>,
     source: SessionPackSource,
+}
+
+struct SessionCallableValuesCatalog {
+    // Field order closes the SQLite connection before TempDir removes its
+    // database and any SQLite sidecars on Windows.
+    connection: Connection,
+    _root: TempDir,
+}
+
+enum CallableValuesQueryConnection<'a> {
+    Durable(std::sync::MutexGuard<'a, Connection>),
+    Session(std::sync::MutexGuard<'a, Option<SessionCallableValuesCatalog>>),
 }
 
 struct SessionActivation {
@@ -1214,7 +1588,8 @@ impl SemanticPackCatalog {
             mode,
             options,
             instance_identity,
-            connection: Mutex::new(connection),
+            connection: Arc::new(Mutex::new(connection)),
+            session_callable_values: Arc::new(Mutex::new(None)),
             session_packs: Mutex::new(Vec::new()),
             session_activations: Mutex::new(HashMap::new()),
             rejected_manifests: Mutex::new(HashSet::new()),
@@ -1244,12 +1619,20 @@ impl SemanticPackCatalog {
             .tempdir()
             .map_err(|error| CatalogError::io("create ephemeral catalog root", error))?;
         let mut catalog = Self::open(root.path(), CatalogOpenMode::ReadWrite, options)?;
-        catalog._ephemeral_root = Some(root);
+        catalog._ephemeral_root = Some(Arc::new(root));
         Ok(catalog)
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub fn runtime_source_reader(&self) -> CatalogRuntimeSourceReader {
+        CatalogRuntimeSourceReader {
+            durable_connection: Arc::clone(&self.connection),
+            session_callable_values: Arc::clone(&self.session_callable_values),
+            _ephemeral_root: self._ephemeral_root.as_ref().map(Arc::clone),
+        }
     }
 
     fn shared_generated_catalog(&self) -> Option<&Self> {
@@ -1898,35 +2281,26 @@ impl SemanticPackCatalog {
         source: &DurablePackSource,
         extraction: &PackExtractionAccounting,
     ) -> Result<GeneratedInstallOutcome, CatalogError> {
-        validate_generated_pack_identity(key, &pack.manifest)?;
-        validate_extraction_accounting(extraction)?;
         let generated_source = DurablePackSource {
             kind: DurablePackSourceKind::Generated,
             source_id: key.source_id(),
         };
-        let install = self.install_with(pack, source, |transaction, manifest, now| {
-            insert_extraction_accounting(transaction, &manifest.content_sha256, extraction)?;
-            insert_generated_production(transaction, key, manifest, now)?;
-            insert_source(
-                transaction,
-                &manifest.content_sha256,
-                &generated_source,
-                now,
-            )
-        })?;
-        self.retain_shared_generated(&GeneratedProduction {
-            key: key.clone(),
-            manifest_digest: install.manifest_digest.clone(),
-            completeness: pack.manifest.completeness,
-        });
-        Ok(GeneratedInstallOutcome {
-            production: GeneratedProduction {
-                key: key.clone(),
-                manifest_digest: install.manifest_digest.clone(),
-                completeness: pack.manifest.completeness,
+        self.install_generated_with(
+            key,
+            pack,
+            source,
+            || validate_extraction_accounting(extraction),
+            |transaction, manifest, now| {
+                insert_extraction_accounting(transaction, &manifest.content_sha256, extraction)?;
+                insert_generated_production(transaction, key, manifest, now)?;
+                insert_source(
+                    transaction,
+                    &manifest.content_sha256,
+                    &generated_source,
+                    now,
+                )
             },
-            install,
-        })
+        )
     }
 
     /// Install a release-generated pack and return opaque proofs for both the
@@ -2102,27 +2476,111 @@ impl SemanticPackCatalog {
         key: &GeneratedProductionKey,
         pack: &CompiledSemanticModelPack,
     ) -> Result<GeneratedInstallOutcome, CatalogError> {
-        validate_generated_pack_identity(key, &pack.manifest)?;
         let source = DurablePackSource {
             kind: DurablePackSourceKind::Generated,
             source_id: key.source_id(),
         };
-        let install = self.install_with(pack, &source, |transaction, manifest, now| {
-            insert_generated_production(transaction, key, manifest, now)
-        })?;
-        self.retain_shared_generated(&GeneratedProduction {
+        self.install_generated_with(
+            key,
+            pack,
+            &source,
+            || Ok(()),
+            |transaction, manifest, now| {
+                insert_generated_production(transaction, key, manifest, now)
+            },
+        )
+    }
+
+    pub fn install_generated_with_exact_go_source(
+        &self,
+        key: &GeneratedProductionKey,
+        pack: &CompiledSemanticModelPack,
+        artifact: &ExactArtifact,
+        packages: &[GoPinnedPackage],
+    ) -> Result<GeneratedInstallOutcome, CatalogError> {
+        let source = DurablePackSource {
+            kind: DurablePackSourceKind::Generated,
+            source_id: key.source_id(),
+        };
+        self.install_generated_with(
+            key,
+            pack,
+            &source,
+            || validate_exact_go_source(artifact, packages),
+            |transaction, manifest, now| {
+                insert_generated_production(transaction, key, manifest, now)?;
+                insert_exact_go_source_rows(
+                    transaction,
+                    &manifest.content_sha256,
+                    artifact,
+                    packages,
+                )
+            },
+        )
+    }
+
+    fn install_generated_with(
+        &self,
+        key: &GeneratedProductionKey,
+        pack: &CompiledSemanticModelPack,
+        source: &DurablePackSource,
+        validate_install: impl FnOnce() -> Result<(), CatalogError>,
+        record_install: impl FnOnce(
+            &Transaction<'_>,
+            &CompiledPackManifest,
+            i64,
+        ) -> Result<(), CatalogError>,
+    ) -> Result<GeneratedInstallOutcome, CatalogError> {
+        validate_generated_pack_identity(key, &pack.manifest)?;
+        validate_install()?;
+        let install = self.install_with(pack, source, record_install)?;
+        let production = GeneratedProduction {
             key: key.clone(),
             manifest_digest: install.manifest_digest.clone(),
             completeness: pack.manifest.completeness,
-        });
+        };
+        self.retain_shared_generated(&production);
         Ok(GeneratedInstallOutcome {
-            production: GeneratedProduction {
-                key: key.clone(),
-                manifest_digest: install.manifest_digest.clone(),
-                completeness: pack.manifest.completeness,
-            },
+            production,
             install,
         })
+    }
+
+    pub fn register_exact_go_source(
+        &self,
+        manifest_digest: &str,
+        artifact: &ExactArtifact,
+        packages: &[GoPinnedPackage],
+    ) -> Result<(), CatalogError> {
+        self.require_writable()?;
+        validate_exact_go_source(artifact, packages)?;
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("semantic-pack catalog connection mutex poisoned");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| CatalogError::sqlite("begin exact Go source registration", error))?;
+        let applicable: bool = transaction
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM catalog_packs
+                   WHERE manifest_digest = ?1
+                     AND state = 'verified'
+                     AND language = 'go')",
+                [manifest_digest],
+                |row| row.get(0),
+            )
+            .map_err(|error| CatalogError::sqlite("check exact Go source publication", error))?;
+        if !applicable {
+            return Err(CatalogError::Unavailable);
+        }
+        insert_exact_go_source_rows(&transaction, manifest_digest, artifact, packages)?;
+        transaction
+            .commit()
+            .map_err(|error| CatalogError::sqlite("commit exact Go source registration", error))?;
+        self.record_mutation();
+        Ok(())
     }
 
     /// Record that `key` can be found again from a read-free source identity.
@@ -2395,14 +2853,7 @@ impl SemanticPackCatalog {
             })?;
             stored.insert(shard_id, stored_digest);
         }
-        let missing: Vec<&str> = manifest
-            .shards
-            .iter()
-            .filter(|descriptor| {
-                stored.get(&descriptor.shard_id) != Some(&descriptor.stored_sha256)
-            })
-            .map(|descriptor| descriptor.shard_id.as_str())
-            .collect();
+        let missing = missing_manifest_shard_ids(manifest, &stored);
         if !missing.is_empty() {
             return Err(CatalogError::Integrity(format!(
                 "generated production is missing shards {missing:?}"
@@ -2551,7 +3002,7 @@ impl SemanticPackCatalog {
                 != validated.manifest.compatibility.bifrost.as_deref()
             || stored_provenance_json != provenance_json
             || license != validated.manifest.license
-            || completeness != completeness_name(&validated.manifest.completeness)
+            || completeness != validated.manifest.completeness.label()
         {
             return Ok(false);
         }
@@ -2887,6 +3338,12 @@ impl SemanticPackCatalog {
                 &descriptor.shard_id,
                 &decode_limits_digest(&self.options.decode_limits),
             )?;
+            publish_callable_value_rows(
+                &transaction,
+                &validated.manifest.content_sha256,
+                &descriptor.shard_id,
+                shard.callable_values.as_ref(),
+            )?;
             insert_selectors(
                 &transaction,
                 &validated.manifest.content_sha256,
@@ -2999,13 +3456,48 @@ impl SemanticPackCatalog {
         pack: &CompiledSemanticModelPack,
         source: &SessionPackSource,
     ) -> Result<String, CatalogError> {
+        self.register_session_pack_internal(pack, source, None)
+    }
+
+    pub fn register_compiled_pack(
+        &self,
+        pack: &CompiledSemanticModelPack,
+        source: &SessionPackSource,
+    ) -> Result<String, CatalogError> {
+        self.register_session_pack(pack, source)
+    }
+
+    pub fn register_compiled_pack_with_exact_go_source(
+        &self,
+        pack: &CompiledSemanticModelPack,
+        source: &SessionPackSource,
+        artifact: &ExactArtifact,
+        packages: &[GoPinnedPackage],
+    ) -> Result<String, CatalogError> {
+        self.register_session_pack_internal(pack, source, Some((artifact, packages)))
+    }
+
+    fn register_session_pack_internal(
+        &self,
+        pack: &CompiledSemanticModelPack,
+        source: &SessionPackSource,
+        exact_source: Option<(&ExactArtifact, &[GoPinnedPackage])>,
+    ) -> Result<String, CatalogError> {
         if source.source_id.is_empty() {
             return Err(CatalogError::Integrity(
                 "session pack source id must not be empty".to_owned(),
             ));
         }
-        let validated = validate_pack(pack, &self.options.decode_limits)?;
+        let mut validated = validate_pack(pack, &self.options.decode_limits)?;
         let digest = validated.manifest.content_sha256.clone();
+        if let Some((artifact, packages)) = exact_source {
+            if validated.manifest.language != "go" {
+                return Err(CatalogError::Integrity(
+                    "exact Go source can only accompany a Go compiled pack".to_owned(),
+                ));
+            }
+            validate_exact_go_source(artifact, packages)?;
+        }
         let mut session_packs = self
             .session_packs
             .lock()
@@ -3014,6 +3506,68 @@ impl SemanticPackCatalog {
             .iter()
             .any(|entry| entry.manifest.content_sha256 == digest && entry.source == *source)
         {
+            {
+                let mut session_catalog_guard = self
+                    .session_callable_values
+                    .lock()
+                    .expect("session callable-values connection mutex poisoned");
+                if session_catalog_guard.is_none() {
+                    *session_catalog_guard = Some(open_session_callable_values_catalog()?);
+                }
+                let session_catalog = session_catalog_guard
+                    .as_mut()
+                    .expect("session callable-values catalog was just initialized");
+                let transaction = session_catalog
+                    .connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(|error| {
+                        CatalogError::sqlite("begin session callable-values publication", error)
+                    })?;
+                transaction
+                    .execute(
+                        "INSERT OR IGNORE INTO catalog_packs(manifest_digest, state)
+                         VALUES(?1, 'verified')",
+                        [&digest],
+                    )
+                    .map_err(|error| {
+                        CatalogError::sqlite("publish session callable-values pack", error)
+                    })?;
+                for shard in &validated.shards {
+                    transaction
+                        .execute(
+                            "INSERT OR IGNORE INTO catalog_pack_shards(manifest_digest, shard_id)
+                             VALUES(?1, ?2)",
+                            params![&digest, &shard.descriptor.shard_id],
+                        )
+                        .map_err(|error| {
+                            CatalogError::sqlite("publish session callable-values shard", error)
+                        })?;
+                    insert_selectors(
+                        &transaction,
+                        &digest,
+                        &shard.descriptor.shard_id,
+                        &shard.selectors,
+                    )?;
+                    publish_callable_value_rows(
+                        &transaction,
+                        &digest,
+                        &shard.descriptor.shard_id,
+                        shard.callable_values.as_ref(),
+                    )?;
+                }
+                if let Some((artifact, packages)) = exact_source {
+                    insert_exact_go_source_rows(&transaction, &digest, artifact, packages)?;
+                }
+                transaction.commit().map_err(|error| {
+                    CatalogError::sqlite("commit session callable-values publication", error)
+                })?;
+            }
+            for shard in &mut validated.shards {
+                // The query path reads only the SQL sidecar. Keep compiled
+                // bytes/selectors for activation and hydration without
+                // retaining a second Rust fact/coverage/identity index.
+                shard.callable_values = None;
+            }
             session_packs.push(SessionPack {
                 manifest: Arc::new(validated.manifest),
                 shards: validated.shards,
@@ -3855,8 +4409,9 @@ impl SemanticPackCatalog {
             }
         }
         candidates.sort_by(|left, right| {
-            source_precedence(left.source_kind)
-                .cmp(&source_precedence(right.source_kind))
+            left.source_kind
+                .precedence()
+                .cmp(&right.source_kind.precedence())
                 .then_with(|| left.manifest_digest.cmp(&right.manifest_digest))
                 .then_with(|| left.shard_id.cmp(&right.shard_id))
                 .then_with(|| left.source_id.cmp(&right.source_id))
@@ -3976,6 +4531,1130 @@ impl SemanticPackCatalog {
                 Err(CatalogMiss::Quarantined { reason })
             }
         }
+    }
+
+    /// Read one exact callable-values question from the normalized catalog
+    /// rows. The caller is responsible for intersecting catalog availability
+    /// with its active-set and artifact evidence before using returned facts.
+    pub fn query_callable_values(
+        &self,
+        query: &CatalogCallableValuesQuery<'_>,
+        limits: CatalogCallableValuesQueryLimits,
+        cancellation: &CancellationToken,
+    ) -> Result<CatalogCallableValuesQueryResult, CatalogError> {
+        let mut result = CatalogCallableValuesQueryResult {
+            facts: Vec::new(),
+            coverage_claims: Vec::new(),
+            executable_coverage: CsmiCoverageStatus::Unknown,
+            examined_records: 0,
+            gap: None,
+        };
+        if cancellation.is_cancelled() {
+            result.gap = Some(CatalogCallableValuesQueryGap::Cancelled);
+            return Ok(result);
+        }
+        if limits.max_records == 0 {
+            result.gap =
+                Some(CatalogCallableValuesQueryGap::RecordBudgetExhausted { max_records: 0 });
+            return Ok(result);
+        }
+
+        let use_durable_catalog = match self.ensure_callable_values_indexed(
+            query.manifest_digest,
+            query.shard_id,
+            cancellation,
+        )? {
+            CallableValuesIndexReadiness::Ready => true,
+            CallableValuesIndexReadiness::Cancelled => {
+                result.gap = Some(CatalogCallableValuesQueryGap::Cancelled);
+                return Ok(result);
+            }
+            CallableValuesIndexReadiness::Missing => {
+                match self.ensure_session_callable_values_indexed(
+                    query.manifest_digest,
+                    query.shard_id,
+                    cancellation,
+                )? {
+                    CallableValuesIndexReadiness::Ready => false,
+                    CallableValuesIndexReadiness::Cancelled => {
+                        result.gap = Some(CatalogCallableValuesQueryGap::Cancelled);
+                        return Ok(result);
+                    }
+                    CallableValuesIndexReadiness::Missing => {
+                        result.gap =
+                            Some(CatalogCallableValuesQueryGap::IndexReconciliationRequired);
+                        return Ok(result);
+                    }
+                }
+            }
+        };
+
+        let connection_guard = if use_durable_catalog {
+            CallableValuesQueryConnection::Durable(
+                self.connection
+                    .lock()
+                    .expect("semantic-pack catalog connection mutex poisoned"),
+            )
+        } else {
+            CallableValuesQueryConnection::Session(
+                self.session_callable_values
+                    .lock()
+                    .expect("session callable-values connection mutex poisoned"),
+            )
+        };
+        let connection = match &connection_guard {
+            CallableValuesQueryConnection::Durable(guard) => &**guard,
+            CallableValuesQueryConnection::Session(guard) => {
+                &guard
+                    .as_ref()
+                    .expect("session callable-values index was checked before querying")
+                    .connection
+            }
+        };
+        let limit = callable_values_sql_limit(limits.max_records.saturating_add(1));
+        let family = match query.question {
+            CatalogCallableValuesQuestion::ReturnedCallable { .. } => {
+                CallableValuesFamily::ReturnedCallables
+            }
+            CatalogCallableValuesQuestion::CallbackInvocation { .. } => {
+                CallableValuesFamily::CallbackInvocations
+            }
+        };
+
+        match query.question {
+            CatalogCallableValuesQuestion::ReturnedCallable {
+                result: result_ordinal,
+            } => {
+                let mut statement =
+                    connection
+                        .prepare(CALLABLE_VALUES_RETURNED_SQL)
+                        .map_err(|error| {
+                            CatalogError::sqlite("prepare returned-callable query", error)
+                        })?;
+                let rows = statement
+                    .query_map(
+                        params![
+                            query.manifest_digest,
+                            query.shard_id,
+                            query.callable,
+                            result_ordinal,
+                            limit,
+                        ],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                            ))
+                        },
+                    )
+                    .map_err(|error| CatalogError::sqlite("query returned-callable rows", error))?;
+                for row in rows {
+                    if cancellation.is_cancelled() {
+                        result.gap = Some(CatalogCallableValuesQueryGap::Cancelled);
+                        break;
+                    }
+                    let row = row.map_err(|error| {
+                        CatalogError::sqlite("read returned-callable row", error)
+                    })?;
+                    result.examined_records += 1;
+                    if result.examined_records > limits.max_records {
+                        result.gap = Some(CatalogCallableValuesQueryGap::RecordBudgetExhausted {
+                            max_records: limits.max_records,
+                        });
+                        break;
+                    }
+                    let payload = CsmiCallableValuesPayload::ReturnedCallable {
+                        callable: query.callable.to_owned(),
+                        result: u32::try_from(row.1).map_err(|error| {
+                            CatalogError::Integrity(format!(
+                                "stored callable result ordinal is outside u32: {error}"
+                            ))
+                        })?,
+                        target: row.2.clone(),
+                    };
+                    let fact = CallableValuesFact {
+                        payload,
+                        provenance: decode_json_column(&row.3, "callable fact provenance")?,
+                    };
+                    let anonymous_callable = match load_anonymous_callable_identity(
+                        connection,
+                        query.manifest_digest,
+                        query.shard_id,
+                        &row.2,
+                        limits.max_records.saturating_sub(result.examined_records),
+                        cancellation,
+                    )? {
+                        AnonymousCallableIdentityRead::Missing => None,
+                        AnonymousCallableIdentityRead::Found { identity, examined } => {
+                            result.examined_records += examined;
+                            Some(*identity)
+                        }
+                        AnonymousCallableIdentityRead::RecordBudgetExhausted { examined } => {
+                            result.examined_records += examined;
+                            result.gap =
+                                Some(CatalogCallableValuesQueryGap::RecordBudgetExhausted {
+                                    max_records: limits.max_records,
+                                });
+                            None
+                        }
+                        AnonymousCallableIdentityRead::Cancelled { examined } => {
+                            result.examined_records += examined;
+                            result.gap = Some(CatalogCallableValuesQueryGap::Cancelled);
+                            None
+                        }
+                    };
+                    result.facts.push(CatalogCallableValueFact {
+                        manifest_digest: query.manifest_digest.to_owned(),
+                        shard_id: query.shard_id.to_owned(),
+                        callable: query.callable.to_owned(),
+                        ordinal: row.0,
+                        fact,
+                        anonymous_callable,
+                    });
+                    if result.gap.is_some() {
+                        break;
+                    }
+                }
+            }
+            CatalogCallableValuesQuestion::CallbackInvocation { callback, shape } => {
+                let callback_json = json_text(callback, "callback query location")?;
+                let mut statement =
+                    connection
+                        .prepare(CALLABLE_VALUES_CALLBACK_SQL)
+                        .map_err(|error| {
+                            CatalogError::sqlite("prepare callback-invocation query", error)
+                        })?;
+                let rows = statement
+                    .query_map(
+                        params![
+                            query.manifest_digest,
+                            query.shard_id,
+                            query.callable,
+                            callback_json,
+                            shape.parameters,
+                            shape.results,
+                            limit,
+                        ],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, i64>(2)?,
+                                row.get::<_, i64>(3)?,
+                                row.get::<_, String>(4)?,
+                                row.get::<_, String>(5)?,
+                                row.get::<_, String>(6)?,
+                                row.get::<_, String>(7)?,
+                            ))
+                        },
+                    )
+                    .map_err(|error| {
+                        CatalogError::sqlite("query callback-invocation rows", error)
+                    })?;
+                for row in rows {
+                    if cancellation.is_cancelled() {
+                        result.gap = Some(CatalogCallableValuesQueryGap::Cancelled);
+                        break;
+                    }
+                    let row = row.map_err(|error| {
+                        CatalogError::sqlite("read callback-invocation row", error)
+                    })?;
+                    result.examined_records += 1;
+                    if result.examined_records > limits.max_records {
+                        result.gap = Some(CatalogCallableValuesQueryGap::RecordBudgetExhausted {
+                            max_records: limits.max_records,
+                        });
+                        break;
+                    }
+                    let payload = CsmiCallableValuesPayload::CallbackInvocation {
+                        callable: query.callable.to_owned(),
+                        callback: decode_json_column(&row.1, "callback input location")?,
+                        shape: CsmiCallableValuesShape {
+                            parameters: u16::try_from(row.2).map_err(|error| {
+                                CatalogError::Integrity(format!(
+                                    "stored callback parameter shape is outside u16: {error}"
+                                ))
+                            })?,
+                            results: u16::try_from(row.3).map_err(|error| {
+                                CatalogError::Integrity(format!(
+                                    "stored callback result shape is outside u16: {error}"
+                                ))
+                            })?,
+                        },
+                        arguments: decode_json_column(&row.4, "callback arguments")?,
+                        timing: match row.5.as_str() {
+                            "during-call" => CsmiCallableValuesTiming::DuringCall,
+                            value => {
+                                return Err(CatalogError::Integrity(format!(
+                                    "unknown callable callback timing {value:?}"
+                                )));
+                            }
+                        },
+                        modality: match row.6.as_str() {
+                            "may" => CsmiCallableValuesModality::May,
+                            value => {
+                                return Err(CatalogError::Integrity(format!(
+                                    "unknown callable callback modality {value:?}"
+                                )));
+                            }
+                        },
+                    };
+                    if let Err(error) = validate_callable_profile_location(&payload) {
+                        result.gap =
+                            Some(CatalogCallableValuesQueryGap::UnsupportedProjection(error));
+                        break;
+                    }
+                    let fact = CallableValuesFact {
+                        payload,
+                        provenance: decode_json_column(&row.7, "callable fact provenance")?,
+                    };
+                    result.facts.push(CatalogCallableValueFact {
+                        manifest_digest: query.manifest_digest.to_owned(),
+                        shard_id: query.shard_id.to_owned(),
+                        callable: query.callable.to_owned(),
+                        ordinal: row.0,
+                        fact,
+                        anonymous_callable: None,
+                    });
+                }
+            }
+        }
+
+        if result.gap.is_none() && cancellation.is_cancelled() {
+            result.gap = Some(CatalogCallableValuesQueryGap::Cancelled);
+        }
+        if result.gap.is_none() {
+            let remaining = limits.max_records.saturating_sub(result.examined_records);
+            let coverage_limit = callable_values_sql_limit(remaining.saturating_add(1));
+            let mut statement = connection
+                .prepare(CALLABLE_VALUES_COVERAGE_SQL)
+                .map_err(|error| CatalogError::sqlite("prepare callable coverage query", error))?;
+            let rows = statement
+                .query_map(
+                    params![
+                        query.manifest_digest,
+                        query.shard_id,
+                        callable_values_family_name(family),
+                        query.callable,
+                        coverage_limit,
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                        ))
+                    },
+                )
+                .map_err(|error| CatalogError::sqlite("query callable coverage rows", error))?;
+            for row in rows {
+                if cancellation.is_cancelled() {
+                    result.gap = Some(CatalogCallableValuesQueryGap::Cancelled);
+                    break;
+                }
+                let row =
+                    row.map_err(|error| CatalogError::sqlite("read callable coverage row", error))?;
+                result.examined_records += 1;
+                if result.examined_records > limits.max_records {
+                    result.gap = Some(CatalogCallableValuesQueryGap::RecordBudgetExhausted {
+                        max_records: limits.max_records,
+                    });
+                    break;
+                }
+                let coverage = CallableValuesCoverage {
+                    family: parse_callable_values_family(&row.1)?,
+                    callable: query.callable.to_owned(),
+                    status: parse_coverage_status(&row.2)?,
+                    limitations: decode_json_column(&row.3, "callable coverage limitations")?,
+                    provenance: decode_json_column(&row.4, "callable coverage provenance")?,
+                };
+                result.coverage_claims.push(CatalogCallableValueCoverage {
+                    manifest_digest: query.manifest_digest.to_owned(),
+                    shard_id: query.shard_id.to_owned(),
+                    callable: query.callable.to_owned(),
+                    ordinal: row.0,
+                    coverage,
+                });
+            }
+        }
+        if result.gap.is_none() && cancellation.is_cancelled() {
+            result.gap = Some(CatalogCallableValuesQueryGap::Cancelled);
+        }
+        Ok(result)
+    }
+    fn query_callable_values_on_connection(
+        connection: &Connection,
+        query: &CatalogCallableValuesQuery<'_>,
+        limits: CatalogCallableValuesQueryLimits,
+        cancellation: &CancellationToken,
+    ) -> Result<CatalogCallableValuesQueryResult, CatalogError> {
+        let mut result = CatalogCallableValuesQueryResult {
+            facts: Vec::new(),
+            coverage_claims: Vec::new(),
+            executable_coverage: CsmiCoverageStatus::Unknown,
+            examined_records: 0,
+            gap: None,
+        };
+        if cancellation.is_cancelled() {
+            result.gap = Some(CatalogCallableValuesQueryGap::Cancelled);
+            return Ok(result);
+        }
+        if limits.max_records == 0 {
+            result.gap =
+                Some(CatalogCallableValuesQueryGap::RecordBudgetExhausted { max_records: 0 });
+            return Ok(result);
+        }
+
+        let limit = callable_values_sql_limit(limits.max_records.saturating_add(1));
+        let family = match query.question {
+            CatalogCallableValuesQuestion::ReturnedCallable { .. } => {
+                CallableValuesFamily::ReturnedCallables
+            }
+            CatalogCallableValuesQuestion::CallbackInvocation { .. } => {
+                CallableValuesFamily::CallbackInvocations
+            }
+        };
+
+        match query.question {
+            CatalogCallableValuesQuestion::ReturnedCallable {
+                result: result_ordinal,
+            } => {
+                let mut statement =
+                    connection
+                        .prepare(CALLABLE_VALUES_RETURNED_SQL)
+                        .map_err(|error| {
+                            CatalogError::sqlite("prepare returned-callable query", error)
+                        })?;
+                let rows = statement
+                    .query_map(
+                        params![
+                            query.manifest_digest,
+                            query.shard_id,
+                            query.callable,
+                            result_ordinal,
+                            limit,
+                        ],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                            ))
+                        },
+                    )
+                    .map_err(|error| CatalogError::sqlite("query returned-callable rows", error))?;
+                for row in rows {
+                    if cancellation.is_cancelled() {
+                        result.gap = Some(CatalogCallableValuesQueryGap::Cancelled);
+                        break;
+                    }
+                    let row = row.map_err(|error| {
+                        CatalogError::sqlite("read returned-callable row", error)
+                    })?;
+                    result.examined_records += 1;
+                    if result.examined_records > limits.max_records {
+                        result.gap = Some(CatalogCallableValuesQueryGap::RecordBudgetExhausted {
+                            max_records: limits.max_records,
+                        });
+                        break;
+                    }
+                    let payload = CsmiCallableValuesPayload::ReturnedCallable {
+                        callable: query.callable.to_owned(),
+                        result: u32::try_from(row.1).map_err(|error| {
+                            CatalogError::Integrity(format!(
+                                "stored callable result ordinal is outside u32: {error}"
+                            ))
+                        })?,
+                        target: row.2.clone(),
+                    };
+                    let fact = CallableValuesFact {
+                        payload,
+                        provenance: decode_json_column(&row.3, "callable fact provenance")?,
+                    };
+                    let anonymous_callable = match load_anonymous_callable_identity(
+                        connection,
+                        query.manifest_digest,
+                        query.shard_id,
+                        &row.2,
+                        limits.max_records.saturating_sub(result.examined_records),
+                        cancellation,
+                    )? {
+                        AnonymousCallableIdentityRead::Missing => None,
+                        AnonymousCallableIdentityRead::Found { identity, examined } => {
+                            result.examined_records += examined;
+                            Some(*identity)
+                        }
+                        AnonymousCallableIdentityRead::RecordBudgetExhausted { examined } => {
+                            result.examined_records += examined;
+                            result.gap =
+                                Some(CatalogCallableValuesQueryGap::RecordBudgetExhausted {
+                                    max_records: limits.max_records,
+                                });
+                            None
+                        }
+                        AnonymousCallableIdentityRead::Cancelled { examined } => {
+                            result.examined_records += examined;
+                            result.gap = Some(CatalogCallableValuesQueryGap::Cancelled);
+                            None
+                        }
+                    };
+                    result.facts.push(CatalogCallableValueFact {
+                        manifest_digest: query.manifest_digest.to_owned(),
+                        shard_id: query.shard_id.to_owned(),
+                        callable: query.callable.to_owned(),
+                        ordinal: row.0,
+                        fact,
+                        anonymous_callable,
+                    });
+                    if result.gap.is_some() {
+                        break;
+                    }
+                }
+            }
+            CatalogCallableValuesQuestion::CallbackInvocation { callback, shape } => {
+                let callback_json = json_text(callback, "callback query location")?;
+                let mut statement =
+                    connection
+                        .prepare(CALLABLE_VALUES_CALLBACK_SQL)
+                        .map_err(|error| {
+                            CatalogError::sqlite("prepare callback-invocation query", error)
+                        })?;
+                let rows = statement
+                    .query_map(
+                        params![
+                            query.manifest_digest,
+                            query.shard_id,
+                            query.callable,
+                            callback_json,
+                            shape.parameters,
+                            shape.results,
+                            limit,
+                        ],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, i64>(2)?,
+                                row.get::<_, i64>(3)?,
+                                row.get::<_, String>(4)?,
+                                row.get::<_, String>(5)?,
+                                row.get::<_, String>(6)?,
+                                row.get::<_, String>(7)?,
+                            ))
+                        },
+                    )
+                    .map_err(|error| {
+                        CatalogError::sqlite("query callback-invocation rows", error)
+                    })?;
+                for row in rows {
+                    if cancellation.is_cancelled() {
+                        result.gap = Some(CatalogCallableValuesQueryGap::Cancelled);
+                        break;
+                    }
+                    let row = row.map_err(|error| {
+                        CatalogError::sqlite("read callback-invocation row", error)
+                    })?;
+                    result.examined_records += 1;
+                    if result.examined_records > limits.max_records {
+                        result.gap = Some(CatalogCallableValuesQueryGap::RecordBudgetExhausted {
+                            max_records: limits.max_records,
+                        });
+                        break;
+                    }
+                    let payload = CsmiCallableValuesPayload::CallbackInvocation {
+                        callable: query.callable.to_owned(),
+                        callback: decode_json_column(&row.1, "callback input location")?,
+                        shape: CsmiCallableValuesShape {
+                            parameters: u16::try_from(row.2).map_err(|error| {
+                                CatalogError::Integrity(format!(
+                                    "stored callback parameter shape is outside u16: {error}"
+                                ))
+                            })?,
+                            results: u16::try_from(row.3).map_err(|error| {
+                                CatalogError::Integrity(format!(
+                                    "stored callback result shape is outside u16: {error}"
+                                ))
+                            })?,
+                        },
+                        arguments: decode_json_column(&row.4, "callback arguments")?,
+                        timing: match row.5.as_str() {
+                            "during-call" => CsmiCallableValuesTiming::DuringCall,
+                            value => {
+                                return Err(CatalogError::Integrity(format!(
+                                    "unknown callable callback timing {value:?}"
+                                )));
+                            }
+                        },
+                        modality: match row.6.as_str() {
+                            "may" => CsmiCallableValuesModality::May,
+                            value => {
+                                return Err(CatalogError::Integrity(format!(
+                                    "unknown callable callback modality {value:?}"
+                                )));
+                            }
+                        },
+                    };
+                    if let Err(error) = validate_callable_profile_location(&payload) {
+                        result.gap =
+                            Some(CatalogCallableValuesQueryGap::UnsupportedProjection(error));
+                        break;
+                    }
+                    let fact = CallableValuesFact {
+                        payload,
+                        provenance: decode_json_column(&row.7, "callable fact provenance")?,
+                    };
+                    result.facts.push(CatalogCallableValueFact {
+                        manifest_digest: query.manifest_digest.to_owned(),
+                        shard_id: query.shard_id.to_owned(),
+                        callable: query.callable.to_owned(),
+                        ordinal: row.0,
+                        fact,
+                        anonymous_callable: None,
+                    });
+                }
+            }
+        }
+
+        if result.gap.is_none() && cancellation.is_cancelled() {
+            result.gap = Some(CatalogCallableValuesQueryGap::Cancelled);
+        }
+        if result.gap.is_none() {
+            let remaining = limits.max_records.saturating_sub(result.examined_records);
+            let coverage_limit = callable_values_sql_limit(remaining.saturating_add(1));
+            let mut statement = connection
+                .prepare(CALLABLE_VALUES_COVERAGE_SQL)
+                .map_err(|error| CatalogError::sqlite("prepare callable coverage query", error))?;
+            let rows = statement
+                .query_map(
+                    params![
+                        query.manifest_digest,
+                        query.shard_id,
+                        callable_values_family_name(family),
+                        query.callable,
+                        coverage_limit,
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                        ))
+                    },
+                )
+                .map_err(|error| CatalogError::sqlite("query callable coverage rows", error))?;
+            for row in rows {
+                if cancellation.is_cancelled() {
+                    result.gap = Some(CatalogCallableValuesQueryGap::Cancelled);
+                    break;
+                }
+                let row =
+                    row.map_err(|error| CatalogError::sqlite("read callable coverage row", error))?;
+                result.examined_records += 1;
+                if result.examined_records > limits.max_records {
+                    result.gap = Some(CatalogCallableValuesQueryGap::RecordBudgetExhausted {
+                        max_records: limits.max_records,
+                    });
+                    break;
+                }
+                let coverage = CallableValuesCoverage {
+                    family: parse_callable_values_family(&row.1)?,
+                    callable: query.callable.to_owned(),
+                    status: parse_coverage_status(&row.2)?,
+                    limitations: decode_json_column(&row.3, "callable coverage limitations")?,
+                    provenance: decode_json_column(&row.4, "callable coverage provenance")?,
+                };
+                result.coverage_claims.push(CatalogCallableValueCoverage {
+                    manifest_digest: query.manifest_digest.to_owned(),
+                    shard_id: query.shard_id.to_owned(),
+                    callable: query.callable.to_owned(),
+                    ordinal: row.0,
+                    coverage,
+                });
+            }
+        }
+        if result.gap.is_none() && cancellation.is_cancelled() {
+            result.gap = Some(CatalogCallableValuesQueryGap::Cancelled);
+        }
+        Ok(result)
+    }
+
+    fn callable_values_publication_present(
+        connection: &Connection,
+        manifest_digest: &str,
+        shard_id: &str,
+    ) -> Result<bool, CatalogError> {
+        connection
+            .query_row(
+                "SELECT EXISTS(
+               SELECT 1
+               FROM catalog_callable_values_indexed_shards AS indexed
+               JOIN catalog_packs AS pack
+                 ON pack.manifest_digest = indexed.manifest_digest
+               JOIN catalog_pack_shards AS shard
+                 ON shard.manifest_digest = indexed.manifest_digest
+                AND shard.shard_id = indexed.shard_id
+               WHERE indexed.manifest_digest = ?1
+                 AND indexed.shard_id = ?2
+                 AND indexed.index_version = 1
+                 AND pack.state = 'verified')",
+                params![manifest_digest, shard_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| CatalogError::sqlite("check callable-values publication", error))
+    }
+
+    fn callable_values_index_missing_result(
+        limits: CatalogCallableValuesQueryLimits,
+    ) -> CatalogCallableValuesQueryResult {
+        CatalogCallableValuesQueryResult {
+            facts: Vec::new(),
+            coverage_claims: Vec::new(),
+            executable_coverage: CsmiCoverageStatus::Unknown,
+            examined_records: 0,
+            gap: Some(if limits.max_records == 0 {
+                CatalogCallableValuesQueryGap::RecordBudgetExhausted { max_records: 0 }
+            } else {
+                CatalogCallableValuesQueryGap::IndexReconciliationRequired
+            }),
+        }
+    }
+
+    fn read_go_source_from_connection(
+        connection: &Connection,
+        request: &CatalogGoSourceRequest<'_>,
+        limits: CatalogGoSourceReadLimits,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<CatalogExactGoSourceSet>, CatalogError> {
+        if cancellation.is_cancelled() {
+            return Err(CatalogError::Cancelled);
+        }
+        if !is_lower_sha256(request.manifest_digest)
+            || !is_lower_sha256(request.artifact_sha256)
+            || request.manifest_digest.is_empty()
+            || request.shard_id.is_empty()
+            || request.package_import_path.is_empty()
+            || !is_canonical_relative_path(request.file)
+        {
+            return Err(CatalogError::Integrity(
+                "exact Go source request contains a non-canonical identity".to_owned(),
+            ));
+        }
+        if limits.max_files == 0 || limits.max_source_bytes == 0 {
+            return Err(CatalogError::SourceBudgetExhausted {
+                max_files: limits.max_files,
+                max_source_bytes: limits.max_source_bytes,
+            });
+        }
+        let published: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+               SELECT 1
+               FROM catalog_packs AS pack
+               JOIN catalog_pack_shards AS shard
+                 ON shard.manifest_digest = pack.manifest_digest
+               WHERE pack.manifest_digest = ?1
+                 AND pack.state = 'verified'
+                 AND shard.shard_id = ?2)",
+                params![request.manifest_digest, request.shard_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| CatalogError::sqlite("check exact Go source publication", error))?;
+        if !published {
+            return Ok(None);
+        }
+        let artifact_activated: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+               SELECT 1
+               FROM catalog_selectors INDEXED BY catalog_selectors_artifact
+               WHERE manifest_digest = ?1
+                 AND shard_id = ?2
+                 AND artifact_sha256 = ?3)",
+                params![
+                    request.manifest_digest,
+                    request.shard_id,
+                    request.artifact_sha256,
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|error| CatalogError::sqlite("check exact Go source activation", error))?;
+        if !artifact_activated {
+            return Ok(None);
+        }
+        let source_set_present: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+               SELECT 1 FROM catalog_exact_go_source_sets
+               WHERE manifest_digest = ?1 AND artifact_sha256 = ?2)",
+                params![request.manifest_digest, request.artifact_sha256],
+                |row| row.get(0),
+            )
+            .map_err(|error| CatalogError::sqlite("check exact Go source set", error))?;
+        if !source_set_present {
+            return Ok(None);
+        }
+
+        let mut file_statement = connection
+            .prepare(
+                "SELECT relative_path, source_text,
+                    length(CAST(relative_path AS BLOB)),
+                    length(CAST(source_text AS BLOB))
+             FROM catalog_exact_go_source_files
+                  INDEXED BY catalog_exact_go_source_files_read
+             WHERE manifest_digest = ?1 AND artifact_sha256 = ?2
+             ORDER BY relative_path",
+            )
+            .map_err(|error| CatalogError::sqlite("prepare exact Go source files", error))?;
+        let mut file_rows = file_statement
+            .query(params![request.manifest_digest, request.artifact_sha256])
+            .map_err(|error| CatalogError::sqlite("query exact Go source files", error))?;
+        let mut entries = Vec::new();
+        let mut source_bytes = 0_u64;
+        while let Some(row) = file_rows
+            .next()
+            .map_err(|error| CatalogError::sqlite("read exact Go source files", error))?
+        {
+            if cancellation.is_cancelled() {
+                return Err(CatalogError::Cancelled);
+            }
+            if entries.len() >= limits.max_files {
+                return Err(CatalogError::SourceBudgetExhausted {
+                    max_files: limits.max_files,
+                    max_source_bytes: limits.max_source_bytes,
+                });
+            }
+            let path_bytes = row
+                .get::<_, i64>(2)
+                .map_err(|error| CatalogError::sqlite("read exact Go source path length", error))?;
+            let source_text_bytes = row
+                .get::<_, i64>(3)
+                .map_err(|error| CatalogError::sqlite("read exact Go source text length", error))?;
+            let path_bytes = u64::try_from(path_bytes).map_err(|error| {
+                CatalogError::Integrity(format!(
+                    "exact Go source path byte length is invalid: {error}"
+                ))
+            })?;
+            let source_text_bytes = u64::try_from(source_text_bytes).map_err(|error| {
+                CatalogError::Integrity(format!(
+                    "exact Go source text byte length is invalid: {error}"
+                ))
+            })?;
+            source_bytes = source_bytes
+                .checked_add(path_bytes)
+                .and_then(|bytes| bytes.checked_add(source_text_bytes))
+                .ok_or_else(|| {
+                    CatalogError::Integrity("exact Go source byte count overflowed".to_owned())
+                })?;
+            if source_bytes > limits.max_source_bytes {
+                return Err(CatalogError::SourceBudgetExhausted {
+                    max_files: limits.max_files,
+                    max_source_bytes: limits.max_source_bytes,
+                });
+            }
+            let path = row
+                .get::<_, String>(0)
+                .map_err(|error| CatalogError::sqlite("read exact Go source path", error))?;
+            let source = row
+                .get::<_, String>(1)
+                .map_err(|error| CatalogError::sqlite("read exact Go source text", error))?;
+            entries.push((path, source.into_bytes()));
+        }
+        drop(file_rows);
+        drop(file_statement);
+
+        let mut package_statement = connection
+            .prepare(
+                "SELECT package_ordinal, import_path, package_name,
+                    length(CAST(import_path AS BLOB)),
+                    length(CAST(package_name AS BLOB))
+             FROM catalog_exact_go_packages INDEXED BY catalog_exact_go_packages_read
+             WHERE manifest_digest = ?1 AND artifact_sha256 = ?2
+             ORDER BY package_ordinal",
+            )
+            .map_err(|error| CatalogError::sqlite("prepare exact Go packages", error))?;
+        let mut package_rows = package_statement
+            .query(params![request.manifest_digest, request.artifact_sha256])
+            .map_err(|error| CatalogError::sqlite("query exact Go packages", error))?;
+        let mut packages: Vec<(usize, GoPinnedPackage)> = Vec::new();
+        while let Some(row) = package_rows
+            .next()
+            .map_err(|error| CatalogError::sqlite("read exact Go packages", error))?
+        {
+            if cancellation.is_cancelled() {
+                return Err(CatalogError::Cancelled);
+            }
+            if packages.len() >= limits.max_files {
+                return Err(CatalogError::SourceBudgetExhausted {
+                    max_files: limits.max_files,
+                    max_source_bytes: limits.max_source_bytes,
+                });
+            }
+            let import_path_bytes = row
+                .get::<_, i64>(3)
+                .map_err(|error| CatalogError::sqlite("read exact Go import path length", error))?;
+            let package_name_bytes = row.get::<_, i64>(4).map_err(|error| {
+                CatalogError::sqlite("read exact Go package name length", error)
+            })?;
+            let import_path_bytes = u64::try_from(import_path_bytes).map_err(|error| {
+                CatalogError::Integrity(format!(
+                    "exact Go import path byte length is invalid: {error}"
+                ))
+            })?;
+            let package_name_bytes = u64::try_from(package_name_bytes).map_err(|error| {
+                CatalogError::Integrity(format!(
+                    "exact Go package name byte length is invalid: {error}"
+                ))
+            })?;
+            source_bytes = source_bytes
+                .checked_add(import_path_bytes)
+                .and_then(|bytes| bytes.checked_add(package_name_bytes))
+                .ok_or_else(|| {
+                    CatalogError::Integrity("exact Go source byte count overflowed".to_owned())
+                })?;
+            if source_bytes > limits.max_source_bytes {
+                return Err(CatalogError::SourceBudgetExhausted {
+                    max_files: limits.max_files,
+                    max_source_bytes: limits.max_source_bytes,
+                });
+            }
+            let ordinal = row
+                .get::<_, i64>(0)
+                .map_err(|error| CatalogError::sqlite("read exact Go package ordinal", error))?;
+            let import_path = row
+                .get::<_, String>(1)
+                .map_err(|error| CatalogError::sqlite("read exact Go import path", error))?;
+            let name = row
+                .get::<_, String>(2)
+                .map_err(|error| CatalogError::sqlite("read exact Go package name", error))?;
+            let ordinal = usize::try_from(ordinal).map_err(|error| {
+                CatalogError::Integrity(format!(
+                    "stored Go package ordinal is outside usize: {error}"
+                ))
+            })?;
+            if ordinal != packages.len() {
+                return Err(CatalogError::Integrity(format!(
+                    "stored Go package ordinals are not contiguous at {ordinal}"
+                )));
+            }
+            packages.push((
+                ordinal,
+                GoPinnedPackage {
+                    import_path,
+                    name,
+                    files: Vec::new(),
+                },
+            ));
+        }
+        drop(package_rows);
+        drop(package_statement);
+        let mut file_statement = connection
+            .prepare(
+                "SELECT package_ordinal, file_ordinal, relative_path,
+                    length(CAST(relative_path AS BLOB))
+             FROM catalog_exact_go_package_files
+                  INDEXED BY catalog_exact_go_package_files_ordered_read
+             WHERE manifest_digest = ?1 AND artifact_sha256 = ?2
+             ORDER BY package_ordinal, file_ordinal",
+            )
+            .map_err(|error| CatalogError::sqlite("prepare exact Go package files", error))?;
+        let mut file_rows = file_statement
+            .query(params![request.manifest_digest, request.artifact_sha256])
+            .map_err(|error| CatalogError::sqlite("query exact Go package files", error))?;
+        let mut package_index = 0_usize;
+        let mut current_package_ordinal = None;
+        let mut next_file_ordinal = 0_usize;
+        let mut membership_rows = 0_usize;
+        while let Some(row) = file_rows
+            .next()
+            .map_err(|error| CatalogError::sqlite("read exact Go package files", error))?
+        {
+            if cancellation.is_cancelled() {
+                return Err(CatalogError::Cancelled);
+            }
+            if membership_rows >= limits.max_files {
+                return Err(CatalogError::SourceBudgetExhausted {
+                    max_files: limits.max_files,
+                    max_source_bytes: limits.max_source_bytes,
+                });
+            }
+            let file_bytes = row.get::<_, i64>(3).map_err(|error| {
+                CatalogError::sqlite("read exact Go package file path length", error)
+            })?;
+            let file_bytes = u64::try_from(file_bytes).map_err(|error| {
+                CatalogError::Integrity(format!(
+                    "exact Go package file path byte length is invalid: {error}"
+                ))
+            })?;
+            source_bytes = source_bytes.checked_add(file_bytes).ok_or_else(|| {
+                CatalogError::Integrity("exact Go source byte count overflowed".to_owned())
+            })?;
+            if source_bytes > limits.max_source_bytes {
+                return Err(CatalogError::SourceBudgetExhausted {
+                    max_files: limits.max_files,
+                    max_source_bytes: limits.max_source_bytes,
+                });
+            }
+            let ordinal = row
+                .get::<_, i64>(0)
+                .map_err(|error| CatalogError::sqlite("read exact Go package ordinal", error))?;
+            let file_ordinal = row
+                .get::<_, i64>(1)
+                .map_err(|error| CatalogError::sqlite("read exact Go file ordinal", error))?;
+            let file = row
+                .get::<_, String>(2)
+                .map_err(|error| CatalogError::sqlite("read exact Go package file path", error))?;
+            membership_rows += 1;
+            let ordinal = usize::try_from(ordinal).map_err(|error| {
+                CatalogError::Integrity(format!(
+                    "stored Go package ordinal is outside usize: {error}"
+                ))
+            })?;
+            while package_index < packages.len() && packages[package_index].0 < ordinal {
+                package_index += 1;
+            }
+            let Some((package_ordinal, package)) = packages.get_mut(package_index) else {
+                return Err(CatalogError::Integrity(format!(
+                    "exact Go package file references missing package ordinal {ordinal}"
+                )));
+            };
+            if *package_ordinal != ordinal {
+                return Err(CatalogError::Integrity(format!(
+                    "exact Go package file references missing package ordinal {ordinal}"
+                )));
+            }
+            let file_ordinal = usize::try_from(file_ordinal).map_err(|error| {
+                CatalogError::Integrity(format!("stored Go file ordinal is outside usize: {error}"))
+            })?;
+            if current_package_ordinal != Some(ordinal) {
+                next_file_ordinal = 0;
+                current_package_ordinal = Some(ordinal);
+            }
+            if file_ordinal != next_file_ordinal {
+                return Err(CatalogError::Integrity(format!(
+                    "stored Go file ordinals are not contiguous at package {ordinal}, file {file_ordinal}"
+                )));
+            }
+            next_file_ordinal += 1;
+            package.files.push(file);
+        }
+        drop(file_rows);
+        drop(file_statement);
+        let packages = packages
+            .into_iter()
+            .map(|(_, package)| package)
+            .collect::<Vec<_>>();
+        if !packages.iter().any(|package| {
+            package.import_path == request.package_import_path
+                && package.files.iter().any(|file| file == request.file)
+        }) {
+            return Ok(None);
+        }
+        let artifact = ExactArtifact::from_source_entries(
+            PathBuf::from("<catalog exact Go source set>"),
+            entries,
+            limits.max_path_depth,
+            &ArtifactProducerLimits {
+                max_artifact_bytes: u64::MAX,
+                ..ArtifactProducerLimits::default()
+            },
+        )
+        .map_err(|diagnostic| CatalogError::Artifact(diagnostic.message))?;
+        if artifact.sha256() != request.artifact_sha256 {
+            return Err(CatalogError::Integrity(format!(
+                "exact Go source rows hash to {}, expected {}",
+                artifact.sha256(),
+                request.artifact_sha256
+            )));
+        }
+        validate_exact_go_source(&artifact, &packages)?;
+        Ok(Some(CatalogExactGoSourceSet { artifact, packages }))
+    }
+
+    fn ensure_callable_values_indexed(
+        &self,
+        manifest_digest: &str,
+        shard_id: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<CallableValuesIndexReadiness, CatalogError> {
+        if cancellation.is_cancelled() {
+            return Ok(CallableValuesIndexReadiness::Cancelled);
+        }
+        let connection = self
+            .connection
+            .lock()
+            .expect("semantic-pack catalog connection mutex poisoned");
+        let indexed: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM catalog_callable_values_indexed_shards AS indexed
+                   JOIN catalog_packs AS pack
+                     ON pack.manifest_digest = indexed.manifest_digest
+                   WHERE indexed.manifest_digest = ?1 AND indexed.shard_id = ?2
+                     AND indexed.index_version = 1 AND pack.state = 'verified'
+                 )",
+                params![manifest_digest, shard_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| CatalogError::sqlite("check callable-value shard index", error))?;
+        if indexed {
+            return Ok(CallableValuesIndexReadiness::Ready);
+        }
+        if cancellation.is_cancelled() {
+            return Ok(CallableValuesIndexReadiness::Cancelled);
+        }
+        Ok(CallableValuesIndexReadiness::Missing)
+    }
+
+    fn ensure_session_callable_values_indexed(
+        &self,
+        manifest_digest: &str,
+        shard_id: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<CallableValuesIndexReadiness, CatalogError> {
+        if cancellation.is_cancelled() {
+            return Ok(CallableValuesIndexReadiness::Cancelled);
+        }
+        let session_catalog = self
+            .session_callable_values
+            .lock()
+            .expect("session callable-values connection mutex poisoned");
+        let Some(session_catalog) = session_catalog.as_ref() else {
+            return Ok(CallableValuesIndexReadiness::Missing);
+        };
+        let indexed: bool = session_catalog
+            .connection
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM catalog_callable_values_indexed_shards AS indexed
+                   JOIN catalog_packs AS pack
+                     ON pack.manifest_digest = indexed.manifest_digest
+                   JOIN catalog_pack_shards AS shard
+                     ON shard.manifest_digest = indexed.manifest_digest
+                    AND shard.shard_id = indexed.shard_id
+                   WHERE indexed.manifest_digest = ?1 AND indexed.shard_id = ?2
+                     AND indexed.index_version = 1 AND pack.state = 'verified'
+                 )",
+                params![manifest_digest, shard_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                CatalogError::sqlite("check session callable-value shard index", error)
+            })?;
+        if cancellation.is_cancelled() {
+            return Ok(CallableValuesIndexReadiness::Cancelled);
+        }
+        Ok(if indexed {
+            CallableValuesIndexReadiness::Ready
+        } else {
+            CallableValuesIndexReadiness::Missing
+        })
     }
 
     pub fn accounting(&self) -> Result<CatalogAccounting, CatalogError> {
@@ -4114,8 +5793,9 @@ impl SemanticPackCatalog {
             )
             .collect::<Vec<_>>();
         activations.sort_by(|left, right| {
-            source_precedence(left.source_kind)
-                .cmp(&source_precedence(right.source_kind))
+            left.source_kind
+                .precedence()
+                .cmp(&right.source_kind.precedence())
                 .then_with(|| left.source_id.cmp(&right.source_id))
         });
         Ok(CatalogAccounting {
@@ -4173,7 +5853,7 @@ impl SemanticPackCatalog {
         // SQLite once per loaded shard (#3101).
         let manifest = self.stored_manifest(&candidate.manifest_digest)?;
         self.validate_stored_python_profile_pack(&manifest)?;
-        let connection = self
+        let mut connection = self
             .connection
             .lock()
             .expect("semantic-pack catalog connection mutex poisoned");
@@ -4243,6 +5923,35 @@ impl SemanticPackCatalog {
             shard
         };
         if self.mode == CatalogOpenMode::ReadWrite {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|error| {
+                    CatalogError::sqlite("begin callable-value load reconciliation", error)
+                })?;
+            let indexed: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(
+                       SELECT 1 FROM catalog_callable_values_indexed_shards
+                       WHERE manifest_digest = ?1 AND shard_id = ?2 AND index_version = 1
+                     )",
+                    params![&candidate.manifest_digest, &candidate.shard_id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| CatalogError::sqlite("check callable-value load index", error))?;
+            if !indexed {
+                publish_callable_value_rows(
+                    &transaction,
+                    &candidate.manifest_digest,
+                    &candidate.shard_id,
+                    shard.callable_values.as_ref(),
+                )?;
+            }
+            transaction.commit().map_err(|error| {
+                CatalogError::sqlite("commit callable-value load reconciliation", error)
+            })?;
+            if !indexed {
+                self.record_mutation();
+            }
             connection
                 .execute(
                     "UPDATE catalog_packs SET last_used_at = ?2 WHERE manifest_digest = ?1",
@@ -4759,6 +6468,7 @@ fn validate_pack(
             decode_validated_shard_for_manifest(&manifest, descriptor, &artifact.bytes, limits)
                 .map_err(|error| CatalogError::Artifact(error.to_string()))?;
         let selectors = decoded.activation.clone();
+        let callable_values = decoded.callable_values.clone();
         if manifest.language == "python" {
             python_shards.push(decoded);
         }
@@ -4766,6 +6476,7 @@ fn validate_pack(
             descriptor: descriptor.clone(),
             bytes: artifact.bytes.clone(),
             selectors,
+            callable_values,
         });
     }
     if manifest.language == "python" {
@@ -4945,10 +6656,19 @@ fn manifest_shard_rows_present(
         stored.insert(shard_id, stored_digest);
     }
     Ok(stored.len() == manifest.shards.len()
-        && manifest
-            .shards
-            .iter()
-            .all(|descriptor| stored.get(&descriptor.shard_id) == Some(&descriptor.stored_sha256)))
+        && missing_manifest_shard_ids(manifest, &stored).is_empty())
+}
+
+fn missing_manifest_shard_ids<'a>(
+    manifest: &'a CompiledPackManifest,
+    stored: &HashMap<String, String>,
+) -> Vec<&'a str> {
+    manifest
+        .shards
+        .iter()
+        .filter(|descriptor| stored.get(&descriptor.shard_id) != Some(&descriptor.stored_sha256))
+        .map(|descriptor| descriptor.shard_id.as_str())
+        .collect()
 }
 
 fn validate_acquisition_receipt_request(
@@ -5194,7 +6914,7 @@ fn insert_manifest(
                 serde_json::to_vec(&manifest.provenance)
                     .map_err(|error| CatalogError::Integrity(error.to_string()))?,
                 &manifest.license,
-                completeness_name(&manifest.completeness),
+                manifest.completeness.label(),
                 now
             ],
         )
@@ -5316,13 +7036,195 @@ fn validate_generated_pack_identity(
     key: &GeneratedProductionKey,
     manifest: &CompiledPackManifest,
 ) -> Result<(), CatalogError> {
-    if manifest.producer.name != key.producer_name
-        || manifest.producer.version != key.producer_version
-        || manifest.schema_version != key.schema_version
-    {
+    if !manifest.matches_generated_identity(
+        &key.producer_name,
+        &key.producer_version,
+        key.schema_version,
+    ) {
         return Err(CatalogError::Integrity(
             "generated-production producer or schema does not match compiled pack".to_owned(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_exact_go_source(
+    artifact: &ExactArtifact,
+    packages: &[GoPinnedPackage],
+) -> Result<(), CatalogError> {
+    if !is_lower_sha256(artifact.sha256()) {
+        return Err(CatalogError::Integrity(
+            "exact Go source artifact must carry a lowercase SHA-256 digest".to_owned(),
+        ));
+    }
+    let limits = ArtifactProducerLimits::default();
+    let rebuilt = ExactArtifact::from_source_entries(
+        PathBuf::from("<exact Go source registration>"),
+        artifact
+            .source_entries()
+            .iter()
+            .map(|entry| (entry.relative_path().to_owned(), entry.bytes().to_vec()))
+            .collect(),
+        limits.max_signature_depth,
+        &limits,
+    )
+    .map_err(|diagnostic| CatalogError::Artifact(diagnostic.message))?;
+    if rebuilt.sha256() != artifact.sha256() || rebuilt.bytes() != artifact.bytes() {
+        return Err(CatalogError::Integrity(
+            "exact Go source artifact digest does not match its canonical source set".to_owned(),
+        ));
+    }
+    if packages.is_empty() {
+        return Err(CatalogError::Integrity(
+            "exact Go source registration requires at least one package".to_owned(),
+        ));
+    }
+
+    let source_paths = artifact
+        .source_entries()
+        .iter()
+        .map(|entry| {
+            if !is_canonical_relative_path(entry.relative_path()) {
+                return Err(CatalogError::Integrity(format!(
+                    "exact Go source path is not canonical: {:?}",
+                    entry.relative_path()
+                )));
+            }
+            std::str::from_utf8(entry.bytes()).map_err(|_| {
+                CatalogError::Integrity(format!(
+                    "exact Go source file is not UTF-8: {:?}",
+                    entry.relative_path()
+                ))
+            })?;
+            Ok(entry.relative_path())
+        })
+        .collect::<Result<HashSet<_>, CatalogError>>()?;
+    let mut package_imports = HashSet::new();
+    let mut package_files = HashSet::new();
+    for package in packages {
+        if package.import_path.is_empty() || package.name.is_empty() || package.files.is_empty() {
+            return Err(CatalogError::Integrity(
+                "exact Go package metadata must name a package and at least one file".to_owned(),
+            ));
+        }
+        if !package_imports.insert(package.import_path.as_str()) {
+            return Err(CatalogError::Integrity(format!(
+                "exact Go package metadata repeats import path {:?}",
+                package.import_path
+            )));
+        }
+        let mut package_file_paths = HashSet::new();
+        for file in &package.files {
+            if !is_canonical_relative_path(file) || !source_paths.contains(file.as_str()) {
+                return Err(CatalogError::Integrity(format!(
+                    "exact Go package file is outside the selected source set: {file:?}"
+                )));
+            }
+            if !package_file_paths.insert(file.as_str()) || !package_files.insert(file.as_str()) {
+                return Err(CatalogError::Integrity(format!(
+                    "exact Go source file has duplicate package membership: {file:?}"
+                )));
+            }
+        }
+    }
+    if package_files.len() != source_paths.len() {
+        return Err(CatalogError::Integrity(
+            "exact Go package metadata does not cover every selected source file".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn insert_exact_go_source_rows(
+    transaction: &Transaction<'_>,
+    manifest_digest: &str,
+    artifact: &ExactArtifact,
+    packages: &[GoPinnedPackage],
+) -> Result<(), CatalogError> {
+    validate_exact_go_source(artifact, packages)?;
+    transaction
+        .execute(
+            "INSERT OR IGNORE INTO catalog_exact_go_source_sets(
+               manifest_digest, artifact_sha256
+             ) VALUES(?1, ?2)",
+            params![manifest_digest, artifact.sha256()],
+        )
+        .map_err(|error| CatalogError::sqlite("insert exact Go source set", error))?;
+    transaction
+        .execute(
+            "DELETE FROM catalog_exact_go_package_files
+             WHERE manifest_digest = ?1 AND artifact_sha256 = ?2",
+            params![manifest_digest, artifact.sha256()],
+        )
+        .map_err(|error| CatalogError::sqlite("replace exact Go package files", error))?;
+    transaction
+        .execute(
+            "DELETE FROM catalog_exact_go_packages
+             WHERE manifest_digest = ?1 AND artifact_sha256 = ?2",
+            params![manifest_digest, artifact.sha256()],
+        )
+        .map_err(|error| CatalogError::sqlite("replace exact Go packages", error))?;
+    transaction
+        .execute(
+            "DELETE FROM catalog_exact_go_source_files
+             WHERE manifest_digest = ?1 AND artifact_sha256 = ?2",
+            params![manifest_digest, artifact.sha256()],
+        )
+        .map_err(|error| CatalogError::sqlite("replace exact Go source files", error))?;
+    for entry in artifact.source_entries() {
+        let source_text = std::str::from_utf8(entry.bytes()).map_err(|_| {
+            CatalogError::Integrity(format!(
+                "exact Go source file is not UTF-8: {:?}",
+                entry.relative_path()
+            ))
+        })?;
+        transaction
+            .execute(
+                "INSERT INTO catalog_exact_go_source_files(
+                   manifest_digest, artifact_sha256, relative_path, source_text
+                 ) VALUES(?1, ?2, ?3, ?4)",
+                params![
+                    manifest_digest,
+                    artifact.sha256(),
+                    entry.relative_path(),
+                    source_text
+                ],
+            )
+            .map_err(|error| CatalogError::sqlite("insert exact Go source file", error))?;
+    }
+    for (package_ordinal, package) in packages.iter().enumerate() {
+        transaction
+            .execute(
+                "INSERT INTO catalog_exact_go_packages(
+                   manifest_digest, artifact_sha256, package_ordinal,
+                   import_path, package_name
+                 ) VALUES(?1, ?2, ?3, ?4, ?5)",
+                params![
+                    manifest_digest,
+                    artifact.sha256(),
+                    package_ordinal,
+                    &package.import_path,
+                    &package.name,
+                ],
+            )
+            .map_err(|error| CatalogError::sqlite("insert exact Go package", error))?;
+        for (file_ordinal, file) in package.files.iter().enumerate() {
+            transaction
+                .execute(
+                    "INSERT INTO catalog_exact_go_package_files(
+                       manifest_digest, artifact_sha256, package_ordinal,
+                       file_ordinal, relative_path
+                     ) VALUES(?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        manifest_digest,
+                        artifact.sha256(),
+                        package_ordinal,
+                        file_ordinal,
+                        file,
+                    ],
+                )
+                .map_err(|error| CatalogError::sqlite("insert exact Go package file", error))?;
+        }
     }
     Ok(())
 }
@@ -5428,6 +7330,730 @@ fn insert_shard(
         )
         .map_err(|error| CatalogError::sqlite("insert catalog shard", error))?;
     Ok(())
+}
+
+fn publish_callable_value_rows(
+    transaction: &Transaction<'_>,
+    manifest_digest: &str,
+    shard_id: &str,
+    payload: Option<&CallableValuesPayload>,
+) -> Result<(), CatalogError> {
+    // The publication is shared by all source IDs for this manifest/shard.
+    // Replace its marker with the rows in the same transaction so registering
+    // another source cannot leave a stale marker or duplicate the publication.
+    transaction
+        .execute(
+            "DELETE FROM catalog_callable_values_indexed_shards
+             WHERE manifest_digest = ?1 AND shard_id = ?2",
+            params![manifest_digest, shard_id],
+        )
+        .map_err(|error| CatalogError::sqlite("replace callable-value shard marker", error))?;
+    transaction
+        .execute(
+            "DELETE FROM catalog_callable_value_facts
+             WHERE manifest_digest = ?1 AND shard_id = ?2",
+            params![manifest_digest, shard_id],
+        )
+        .map_err(|error| CatalogError::sqlite("replace callable-value facts", error))?;
+    transaction
+        .execute(
+            "DELETE FROM catalog_callable_value_coverage
+             WHERE manifest_digest = ?1 AND shard_id = ?2",
+            params![manifest_digest, shard_id],
+        )
+        .map_err(|error| CatalogError::sqlite("replace callable-value coverage", error))?;
+    transaction
+        .execute(
+            "DELETE FROM catalog_anonymous_callable_identities
+             WHERE manifest_digest = ?1 AND shard_id = ?2",
+            params![manifest_digest, shard_id],
+        )
+        .map_err(|error| CatalogError::sqlite("replace anonymous callable identities", error))?;
+
+    if let Some(payload) = payload {
+        for (ordinal, fact) in payload.facts.iter().enumerate() {
+            let (
+                family,
+                result,
+                target,
+                callback,
+                parameters,
+                results,
+                arguments,
+                timing,
+                modality,
+            ) = match &fact.payload {
+                CsmiCallableValuesPayload::ReturnedCallable {
+                    callable: _,
+                    result,
+                    target,
+                } => (
+                    "returned-callables",
+                    Some(*result),
+                    Some(target.as_str()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                CsmiCallableValuesPayload::CallbackInvocation {
+                    callback,
+                    shape,
+                    arguments,
+                    timing,
+                    modality,
+                    ..
+                } => (
+                    "callback-invocations",
+                    None,
+                    None,
+                    Some(json_text(callback, "callable callback location")?),
+                    Some(shape.parameters),
+                    Some(shape.results),
+                    Some(json_text(arguments, "callable callback arguments")?),
+                    Some(match timing {
+                        CsmiCallableValuesTiming::DuringCall => "during-call",
+                    }),
+                    Some(match modality {
+                        CsmiCallableValuesModality::May => "may",
+                    }),
+                ),
+            };
+            let callable = match &fact.payload {
+                CsmiCallableValuesPayload::ReturnedCallable { callable, .. }
+                | CsmiCallableValuesPayload::CallbackInvocation { callable, .. } => callable,
+            };
+            transaction
+                .execute(
+                    "INSERT INTO catalog_callable_value_facts(
+                       manifest_digest, shard_id, fact_ordinal, family, callable,
+                       result_ordinal, target, callback_location_json,
+                       callback_parameters, callback_results, arguments_json,
+                       timing, modality, provenance_json
+                     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                    params![
+                        manifest_digest,
+                        shard_id,
+                        ordinal,
+                        family,
+                        callable,
+                        result,
+                        target,
+                        callback,
+                        parameters,
+                        results,
+                        arguments,
+                        timing,
+                        modality,
+                        json_text(&fact.provenance, "callable fact provenance")?,
+                    ],
+                )
+                .map_err(|error| CatalogError::sqlite("publish callable-value fact", error))?;
+        }
+
+        for (ordinal, coverage) in payload.coverage.iter().enumerate() {
+            transaction
+                .execute(
+                    "INSERT INTO catalog_callable_value_coverage(
+                       manifest_digest, shard_id, coverage_ordinal, family, callable,
+                       status, limitations_json, provenance_json
+                     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        manifest_digest,
+                        shard_id,
+                        ordinal,
+                        callable_values_family_name(coverage.family),
+                        coverage.callable,
+                        coverage_status_name(coverage.status),
+                        json_text(&coverage.limitations, "callable coverage limitations")?,
+                        json_text(&coverage.provenance, "callable coverage provenance")?,
+                    ],
+                )
+                .map_err(|error| CatalogError::sqlite("publish callable-value coverage", error))?;
+        }
+
+        for identity in &payload.anonymous_callables {
+            assert_eq!(
+                identity.anchor.kind,
+                SourceDeclarationKind::FunctionLiteral,
+                "anonymous callable identity must point to a function literal"
+            );
+            validate_source_path(&identity.anchor.file)?;
+            validate_source_path(&identity.signature.function_type.file)?;
+            transaction
+                .execute(
+                    "INSERT INTO catalog_anonymous_callable_identities(
+                       manifest_digest, shard_id, callable_id, artifact_sha256,
+                       package_import_path, anchor_file, anchor_start, anchor_end,
+                       anchor_kind, signature_file, signature_start, signature_end
+                     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'function-literal',
+                       ?9, ?10, ?11)",
+                    params![
+                        manifest_digest,
+                        shard_id,
+                        identity.id,
+                        identity.artifact_sha256,
+                        identity.package_identity,
+                        identity.anchor.file,
+                        sql_byte(identity.anchor.byte_range.start)?,
+                        sql_byte(identity.anchor.byte_range.end)?,
+                        identity.signature.function_type.file,
+                        sql_byte(identity.signature.function_type.byte_range.start)?,
+                        sql_byte(identity.signature.function_type.byte_range.end)?,
+                    ],
+                )
+                .map_err(|error| {
+                    CatalogError::sqlite("publish anonymous callable identity", error)
+                })?;
+            for (chain_kind, anchors) in [
+                ("lexical_owner", identity.lexical_owner_chain.as_slice()),
+                (
+                    "signature_declaration",
+                    identity.signature.declaration_chain.as_slice(),
+                ),
+            ] {
+                for (ordinal, anchor) in anchors.iter().enumerate() {
+                    validate_source_path(&anchor.file)?;
+                    transaction
+                        .execute(
+                            "INSERT INTO catalog_anonymous_callable_identity_anchors(
+                               manifest_digest, shard_id, callable_id, chain_kind,
+                               ordinal, file, byte_start, byte_end, declaration_kind
+                             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                            params![
+                                manifest_digest,
+                                shard_id,
+                                identity.id,
+                                chain_kind,
+                                ordinal,
+                                anchor.file,
+                                sql_byte(anchor.byte_range.start)?,
+                                sql_byte(anchor.byte_range.end)?,
+                                source_declaration_kind_name(anchor.kind),
+                            ],
+                        )
+                        .map_err(|error| {
+                            CatalogError::sqlite("publish anonymous callable owner anchor", error)
+                        })?;
+                }
+            }
+            for (shape_kind, shapes) in [
+                ("parameter", identity.signature.parameters.as_slice()),
+                ("result", identity.signature.results.as_slice()),
+            ] {
+                for (ordinal, shape) in shapes.iter().enumerate() {
+                    validate_source_path(&shape.type_node.file)?;
+                    transaction
+                        .execute(
+                            "INSERT INTO catalog_anonymous_callable_signature_shapes(
+                               manifest_digest, shard_id, callable_id, shape_kind,
+                               ordinal, file, byte_start, byte_end, variadic, arity
+                             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                            params![
+                                manifest_digest,
+                                shard_id,
+                                identity.id,
+                                shape_kind,
+                                ordinal,
+                                shape.type_node.file,
+                                sql_byte(shape.type_node.byte_range.start)?,
+                                sql_byte(shape.type_node.byte_range.end)?,
+                                i64::from(shape.variadic),
+                                sql_byte(shape.arity)?,
+                            ],
+                        )
+                        .map_err(|error| {
+                            CatalogError::sqlite(
+                                "publish anonymous callable signature shape",
+                                error,
+                            )
+                        })?;
+                }
+            }
+        }
+    }
+
+    transaction
+        .execute(
+            "INSERT INTO catalog_callable_values_indexed_shards(
+               manifest_digest, shard_id, index_version
+             ) VALUES(?1, ?2, 1)",
+            params![manifest_digest, shard_id],
+        )
+        .map_err(|error| CatalogError::sqlite("publish callable-value shard marker", error))?;
+    Ok(())
+}
+
+fn json_text(value: &impl Serialize, description: &str) -> Result<String, CatalogError> {
+    serde_json::to_string(value)
+        .map_err(|error| CatalogError::Integrity(format!("serialize {description}: {error}")))
+}
+
+fn sql_byte(value: usize) -> Result<i64, CatalogError> {
+    i64::try_from(value).map_err(|error| {
+        CatalogError::Integrity(format!(
+            "source byte offset exceeds SQLite integer: {error}"
+        ))
+    })
+}
+
+fn validate_source_path(path: &str) -> Result<(), CatalogError> {
+    if !is_canonical_relative_path(path) {
+        return Err(CatalogError::Integrity(format!(
+            "anonymous callable source path is not canonical and relative: {path:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn source_declaration_kind_name(kind: SourceDeclarationKind) -> &'static str {
+    match kind {
+        SourceDeclarationKind::Function => "function",
+        SourceDeclarationKind::Method => "method",
+        SourceDeclarationKind::FunctionLiteral => "function-literal",
+        SourceDeclarationKind::Type => "type",
+        SourceDeclarationKind::TypeAlias => "type-alias",
+        SourceDeclarationKind::StructField => "struct-field",
+    }
+}
+
+fn parse_source_declaration_kind(value: &str) -> Result<SourceDeclarationKind, CatalogError> {
+    match value {
+        "function" => Ok(SourceDeclarationKind::Function),
+        "method" => Ok(SourceDeclarationKind::Method),
+        "function-literal" => Ok(SourceDeclarationKind::FunctionLiteral),
+        "type" => Ok(SourceDeclarationKind::Type),
+        "type-alias" => Ok(SourceDeclarationKind::TypeAlias),
+        "struct-field" => Ok(SourceDeclarationKind::StructField),
+        _ => Err(CatalogError::Integrity(format!(
+            "unknown source declaration kind {value:?}"
+        ))),
+    }
+}
+
+fn callable_values_family_name(family: CallableValuesFamily) -> &'static str {
+    match family {
+        CallableValuesFamily::ReturnedCallables => "returned-callables",
+        CallableValuesFamily::CallbackInvocations => "callback-invocations",
+    }
+}
+
+fn parse_callable_values_family(value: &str) -> Result<CallableValuesFamily, CatalogError> {
+    match value {
+        "returned-callables" => Ok(CallableValuesFamily::ReturnedCallables),
+        "callback-invocations" => Ok(CallableValuesFamily::CallbackInvocations),
+        _ => Err(CatalogError::Integrity(format!(
+            "unknown callable-value family {value:?}"
+        ))),
+    }
+}
+
+fn coverage_status_name(status: CsmiCoverageStatus) -> &'static str {
+    match status {
+        CsmiCoverageStatus::Unknown => "unknown",
+        CsmiCoverageStatus::Partial => "partial",
+        CsmiCoverageStatus::Complete => "complete",
+    }
+}
+
+fn parse_coverage_status(value: &str) -> Result<CsmiCoverageStatus, CatalogError> {
+    match value {
+        "unknown" => Ok(CsmiCoverageStatus::Unknown),
+        "partial" => Ok(CsmiCoverageStatus::Partial),
+        "complete" => Ok(CsmiCoverageStatus::Complete),
+        _ => Err(CatalogError::Integrity(format!(
+            "unknown callable-value coverage status {value:?}"
+        ))),
+    }
+}
+
+fn callable_values_sql_limit(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn open_session_callable_values_catalog() -> Result<SessionCallableValuesCatalog, CatalogError> {
+    let root = tempfile::Builder::new()
+        .prefix("bifrost-session-callable-values-")
+        .tempdir()
+        .map_err(|error| CatalogError::io("create session callable-values root", error))?;
+    let path = root.path().join("session-callable-values.sqlite");
+    let mut connection = Connection::open(&path)
+        .map_err(|error| CatalogError::sqlite("open session callable-values database", error))?;
+    connection.set_transaction_behavior(TransactionBehavior::Immediate);
+    connection
+        .busy_timeout(Duration::from_secs(5))
+        .map_err(|error| {
+            CatalogError::sqlite("configure session callable-values timeout", error)
+        })?;
+    connection
+        .pragma_update(None, "foreign_keys", true)
+        .map_err(|error| {
+            CatalogError::sqlite("enable session callable-values foreign keys", error)
+        })?;
+    connection
+        .pragma_update(None, "cache_size", -8192_i64)
+        .map_err(|error| CatalogError::sqlite("bound session callable-values page cache", error))?;
+    // This database is deleted with the session; rollback journaling and fsync only add disk flushes.
+    let journal_mode: String = connection
+        .pragma_update_and_check(None, "journal_mode", "MEMORY", |row| row.get(0))
+        .map_err(|error| {
+            CatalogError::sqlite("configure session callable-values journal mode", error)
+        })?;
+    assert_eq!(journal_mode.to_ascii_lowercase(), "memory");
+    connection
+        .execute_batch(
+            "PRAGMA synchronous = OFF;
+             PRAGMA temp_store = FILE;
+             CREATE TABLE catalog_packs(
+               manifest_digest TEXT PRIMARY KEY
+                 CHECK(length(manifest_digest) = 64
+                   AND manifest_digest NOT GLOB '*[^0-9a-f]*'),
+               state TEXT NOT NULL CHECK(state = 'verified')
+             ) STRICT;
+             CREATE TABLE catalog_pack_shards(
+               manifest_digest TEXT NOT NULL,
+               shard_id TEXT NOT NULL CHECK(length(shard_id) > 0),
+               PRIMARY KEY(manifest_digest, shard_id),
+               FOREIGN KEY(manifest_digest)
+                 REFERENCES catalog_packs(manifest_digest) ON DELETE CASCADE
+             ) STRICT;
+             CREATE TABLE catalog_selectors(
+               manifest_digest TEXT NOT NULL,
+               shard_id TEXT NOT NULL,
+               selector_ordinal INTEGER NOT NULL CHECK(selector_ordinal >= 0),
+               package_name TEXT,
+               package_version TEXT,
+               module_name TEXT,
+               module_version TEXT,
+               toolchain_name TEXT,
+               toolchain_version TEXT,
+               artifact_sha256 TEXT,
+               selector_json BLOB NOT NULL,
+               PRIMARY KEY(manifest_digest, shard_id, selector_ordinal),
+               FOREIGN KEY(manifest_digest, shard_id)
+                 REFERENCES catalog_pack_shards(manifest_digest, shard_id)
+                 ON DELETE CASCADE
+             ) STRICT;
+             CREATE INDEX catalog_selectors_artifact
+               ON catalog_selectors(artifact_sha256, manifest_digest, shard_id);
+             CREATE TABLE catalog_selector_targets(
+               manifest_digest TEXT NOT NULL,
+               shard_id TEXT NOT NULL,
+               selector_ordinal INTEGER NOT NULL,
+               target TEXT NOT NULL,
+               PRIMARY KEY(manifest_digest, shard_id, selector_ordinal, target),
+               FOREIGN KEY(manifest_digest, shard_id, selector_ordinal)
+                 REFERENCES catalog_selectors(
+                   manifest_digest, shard_id, selector_ordinal
+                 ) ON DELETE CASCADE
+             ) STRICT;
+             CREATE TABLE catalog_selector_configurations(
+               manifest_digest TEXT NOT NULL,
+               shard_id TEXT NOT NULL,
+               selector_ordinal INTEGER NOT NULL,
+               configuration TEXT NOT NULL,
+               PRIMARY KEY(manifest_digest, shard_id, selector_ordinal, configuration),
+               FOREIGN KEY(manifest_digest, shard_id, selector_ordinal)
+                 REFERENCES catalog_selectors(
+                   manifest_digest, shard_id, selector_ordinal
+                 ) ON DELETE CASCADE
+             ) STRICT;",
+        )
+        .map_err(|error| CatalogError::sqlite("create session callable-values metadata", error))?;
+    connection
+        .execute_batch(db::CALLABLE_VALUE_ROWS_SQL)
+        .map_err(|error| CatalogError::sqlite("create session callable-values rows", error))?;
+    connection
+        .execute_batch(db::EXACT_GO_SOURCE_ROWS_SQL)
+        .map_err(|error| CatalogError::sqlite("create session exact Go source rows", error))?;
+    Ok(SessionCallableValuesCatalog {
+        connection,
+        _root: root,
+    })
+}
+
+fn decode_json_column<T: serde::de::DeserializeOwned>(
+    value: &str,
+    description: &str,
+) -> Result<T, CatalogError> {
+    serde_json::from_str(value)
+        .map_err(|error| CatalogError::Integrity(format!("decode {description}: {error}")))
+}
+
+fn validate_callable_profile_location(
+    payload: &CsmiCallableValuesPayload,
+) -> Result<(), super::csmi::CsmiCallableValuesUnsupportedProjection> {
+    use std::convert::Infallible;
+
+    match payload
+        .clone()
+        .remap_symbols(|symbol| Ok::<_, Infallible>(symbol.to_owned()))
+    {
+        Ok(_) => Ok(()),
+        Err(super::csmi::CsmiCallableValuesRemapError::UnsupportedProjection(error)) => Err(error),
+        Err(super::csmi::CsmiCallableValuesRemapError::Symbol(never)) => match never {},
+    }
+}
+
+fn load_anonymous_callable_identity(
+    connection: &Connection,
+    manifest_digest: &str,
+    shard_id: &str,
+    callable_id: &str,
+    max_records: usize,
+    cancellation: &CancellationToken,
+) -> Result<AnonymousCallableIdentityRead, CatalogError> {
+    if cancellation.is_cancelled() {
+        return Ok(AnonymousCallableIdentityRead::Cancelled { examined: 0 });
+    }
+    let row = connection
+        .query_row(
+            ANONYMOUS_CALLABLE_IDENTITY_SQL,
+            params![manifest_digest, shard_id, callable_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| CatalogError::sqlite("lookup anonymous callable identity", error))?;
+    let Some((
+        artifact_sha256,
+        package_import_path,
+        anchor_file,
+        anchor_start,
+        anchor_end,
+        signature_file,
+        signature_start,
+        signature_end,
+    )) = row
+    else {
+        return Ok(AnonymousCallableIdentityRead::Missing);
+    };
+    let mut examined = 1;
+    if examined > max_records {
+        return Ok(AnonymousCallableIdentityRead::RecordBudgetExhausted { examined });
+    }
+    validate_source_path(&anchor_file)?;
+    validate_source_path(&signature_file)?;
+
+    let mut lexical_owner_chain = Vec::new();
+    let mut declaration_chain = Vec::new();
+    let mut parameters = Vec::new();
+    let mut results = Vec::new();
+    for child_sql in [
+        ANONYMOUS_CALLABLE_IDENTITY_ANCHORS_SQL,
+        ANONYMOUS_CALLABLE_IDENTITY_SHAPES_SQL,
+    ] {
+        if cancellation.is_cancelled() {
+            return Ok(AnonymousCallableIdentityRead::Cancelled { examined });
+        }
+        let limit =
+            callable_values_sql_limit(max_records.saturating_sub(examined).saturating_add(1));
+        let mut statement = connection.prepare(child_sql).map_err(|error| {
+            CatalogError::sqlite("prepare anonymous callable identity children", error)
+        })?;
+        let rows = statement
+            .query_map(
+                params![manifest_digest, shard_id, callable_id, limit],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
+                        row.get::<_, Option<i64>>(8)?,
+                    ))
+                },
+            )
+            .map_err(|error| {
+                CatalogError::sqlite("query anonymous callable identity children", error)
+            })?;
+        for row in rows {
+            if cancellation.is_cancelled() {
+                return Ok(AnonymousCallableIdentityRead::Cancelled { examined });
+            }
+            let (
+                row_kind,
+                subkind,
+                ordinal,
+                file,
+                byte_start,
+                byte_end,
+                declaration_kind,
+                variadic,
+                arity,
+            ) = row.map_err(|error| {
+                CatalogError::sqlite("read anonymous callable identity child", error)
+            })?;
+            examined += 1;
+            if examined > max_records {
+                return Ok(AnonymousCallableIdentityRead::RecordBudgetExhausted { examined });
+            }
+            validate_source_path(&file)?;
+            let ordinal = usize::try_from(ordinal).map_err(|error| {
+                CatalogError::Integrity(format!("anonymous identity ordinal is invalid: {error}"))
+            })?;
+            match row_kind.as_str() {
+                "anchor" => {
+                    let anchor = SourceAnchor {
+                        file,
+                        byte_range: SourceByteRange {
+                            start: usize::try_from(byte_start).map_err(|error| {
+                                CatalogError::Integrity(format!(
+                                    "anonymous identity start offset is invalid: {error}"
+                                ))
+                            })?,
+                            end: usize::try_from(byte_end).map_err(|error| {
+                                CatalogError::Integrity(format!(
+                                    "anonymous identity end offset is invalid: {error}"
+                                ))
+                            })?,
+                        },
+                        kind: parse_source_declaration_kind(
+                            declaration_kind.as_deref().ok_or_else(|| {
+                                CatalogError::Integrity(
+                                    "anonymous identity anchor has no declaration kind".to_owned(),
+                                )
+                            })?,
+                        )?,
+                    };
+                    let destination = match subkind.as_str() {
+                        "lexical_owner" => &mut lexical_owner_chain,
+                        "signature_declaration" => &mut declaration_chain,
+                        _ => {
+                            return Err(CatalogError::Integrity(format!(
+                                "unknown anonymous identity anchor chain {subkind:?}"
+                            )));
+                        }
+                    };
+                    if ordinal != destination.len() {
+                        return Err(CatalogError::Integrity(format!(
+                            "anonymous identity anchor ordinals are not contiguous: {subkind:?} {ordinal}"
+                        )));
+                    }
+                    destination.push(anchor);
+                }
+                "shape" => {
+                    let shape = SourceParameterShape {
+                        type_node: SourceTypeNode {
+                            file,
+                            byte_range: SourceByteRange {
+                                start: usize::try_from(byte_start).map_err(|error| {
+                                    CatalogError::Integrity(format!(
+                                        "anonymous signature start offset is invalid: {error}"
+                                    ))
+                                })?,
+                                end: usize::try_from(byte_end).map_err(|error| {
+                                    CatalogError::Integrity(format!(
+                                        "anonymous signature end offset is invalid: {error}"
+                                    ))
+                                })?,
+                            },
+                        },
+                        variadic: match variadic {
+                            Some(0) => false,
+                            Some(1) => true,
+                            other => {
+                                return Err(CatalogError::Integrity(format!(
+                                    "invalid anonymous signature variadic flag: {other:?}"
+                                )));
+                            }
+                        },
+                        arity: usize::try_from(arity.ok_or_else(|| {
+                            CatalogError::Integrity(
+                                "anonymous signature shape has no arity".to_owned(),
+                            )
+                        })?)
+                        .map_err(|error| {
+                            CatalogError::Integrity(format!(
+                                "anonymous signature arity is invalid: {error}"
+                            ))
+                        })?,
+                    };
+                    let destination = match subkind.as_str() {
+                        "parameter" => &mut parameters,
+                        "result" => &mut results,
+                        _ => {
+                            return Err(CatalogError::Integrity(format!(
+                                "unknown anonymous signature shape kind {subkind:?}"
+                            )));
+                        }
+                    };
+                    if ordinal != destination.len() {
+                        return Err(CatalogError::Integrity(format!(
+                            "anonymous signature ordinals are not contiguous: {subkind:?} {ordinal}"
+                        )));
+                    }
+                    destination.push(shape);
+                }
+                _ => {
+                    return Err(CatalogError::Integrity(format!(
+                        "unknown anonymous identity row kind {row_kind:?}"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(AnonymousCallableIdentityRead::Found {
+        identity: Box::new(AnonymousCallableIdentity {
+            id: callable_id.to_owned(),
+            artifact_sha256,
+            package_identity: package_import_path,
+            anchor: SourceAnchor {
+                file: anchor_file,
+                byte_range: SourceByteRange {
+                    start: usize::try_from(anchor_start).map_err(|error| {
+                        CatalogError::Integrity(format!(
+                            "anonymous identity anchor start is invalid: {error}"
+                        ))
+                    })?,
+                    end: usize::try_from(anchor_end).map_err(|error| {
+                        CatalogError::Integrity(format!(
+                            "anonymous identity anchor end is invalid: {error}"
+                        ))
+                    })?,
+                },
+                kind: SourceDeclarationKind::FunctionLiteral,
+            },
+            lexical_owner_chain,
+            signature: SourceCallableShape {
+                function_type: SourceTypeNode {
+                    file: signature_file,
+                    byte_range: SourceByteRange {
+                        start: usize::try_from(signature_start).map_err(|error| {
+                            CatalogError::Integrity(format!(
+                                "anonymous signature start is invalid: {error}"
+                            ))
+                        })?,
+                        end: usize::try_from(signature_end).map_err(|error| {
+                            CatalogError::Integrity(format!(
+                                "anonymous signature end is invalid: {error}"
+                            ))
+                        })?,
+                    },
+                },
+                parameters,
+                results,
+                declaration_chain,
+            },
+        }),
+        examined,
+    })
 }
 
 fn insert_selectors(
@@ -5620,13 +8246,18 @@ fn coordinate_matches(
 ) -> Result<bool, CatalogError> {
     match (selector, query) {
         (None, _) | (_, None) => Ok(true),
-        (Some(selector), Some(query)) if selector.name != query.name => Ok(false),
+        (Some(selector), Some(query))
+            if !super::runtime::strict_coordinate_names_match(Some(selector), Some(query)) =>
+        {
+            Ok(false)
+        }
         (Some(selector), Some(query)) => match (&selector.version, &query.version) {
             (None, _) => Ok(true),
             (Some(_), None) => Ok(false),
-            (Some(requirement), Some(version)) => VersionReq::parse(requirement)
-                .map(|requirement| requirement.matches(version))
-                .map_err(|error| CatalogError::Integrity(error.to_string())),
+            (Some(requirement), Some(version)) => {
+                super::runtime::coordinate_version_matches(requirement, version)
+                    .map_err(|error| CatalogError::Integrity(error.to_string()))
+            }
         },
     }
 }
@@ -5768,17 +8399,6 @@ fn count(connection: &Connection, table: &str) -> Result<u64, CatalogError> {
         .map_err(|error| CatalogError::sqlite("count catalog rows", error))
 }
 
-fn source_precedence(kind: CatalogPackSourceKind) -> u8 {
-    match kind {
-        CatalogPackSourceKind::Embedded => 0,
-        CatalogPackSourceKind::PreShipped => 1,
-        CatalogPackSourceKind::Installed => 2,
-        CatalogPackSourceKind::Generated => 3,
-        CatalogPackSourceKind::WorkspaceProduced => 4,
-        CatalogPackSourceKind::EphemeralWorkspace => 5,
-    }
-}
-
 fn durable_activation_kind(
     kind: SemanticPackActivationSourceKind,
 ) -> Option<DurablePackSourceKind> {
@@ -5809,7 +8429,23 @@ fn session_activation_kind(
     }
 }
 
-fn activation_catalog_kind(kind: SemanticPackActivationSourceKind) -> CatalogPackSourceKind {
+pub(crate) fn parse_semantic_pack_activation_source_kind(
+    value: &str,
+) -> Option<SemanticPackActivationSourceKind> {
+    match value {
+        "installed" => Some(SemanticPackActivationSourceKind::Installed),
+        "generated" => Some(SemanticPackActivationSourceKind::Generated),
+        "pre_shipped" => Some(SemanticPackActivationSourceKind::PreShipped),
+        "workspace_produced" => Some(SemanticPackActivationSourceKind::WorkspaceProduced),
+        "embedded" => Some(SemanticPackActivationSourceKind::Embedded),
+        "ephemeral_workspace" => Some(SemanticPackActivationSourceKind::EphemeralWorkspace),
+        _ => None,
+    }
+}
+
+pub(crate) fn activation_catalog_kind(
+    kind: SemanticPackActivationSourceKind,
+) -> CatalogPackSourceKind {
     match kind {
         SemanticPackActivationSourceKind::Installed => CatalogPackSourceKind::Installed,
         SemanticPackActivationSourceKind::Generated => CatalogPackSourceKind::Generated,
@@ -5867,13 +8503,6 @@ fn payload_kind_name(kind: PayloadKind) -> &'static str {
         PayloadKind::DeclarationFacts => "declaration_facts",
         PayloadKind::GeneratorRules => "generator_rules",
         PayloadKind::ProcedureSummaries => "procedure_summaries",
-    }
-}
-
-fn completeness_name(completeness: &super::Completeness) -> &'static str {
-    match completeness {
-        super::Completeness::Complete => "complete",
-        super::Completeness::Partial => "partial",
     }
 }
 
@@ -6049,35 +8678,1312 @@ mod python_profile_reopen_tests {
 }
 
 #[cfg(test)]
-mod generated_production_cache_version_tests {
-    use std::ffi::OsString;
-    use std::path::Path;
-
-    use super::{
-        CATALOG_SCHEMA_VERSION, default_semantic_pack_catalog_root_with_override,
-        generated_production_digest_for_cache_version, verify_recorded_generated_production_digest,
+mod callable_value_catalog_tests {
+    use super::*;
+    use crate::CancellationToken;
+    use crate::analyzer::go::{GoPinnedPackage, analyze_go_package_source_identities};
+    use crate::analyzer::semantic_model::csmi::{
+        CsmiCallableValuesArgument, CsmiCallableValuesLimitation, CsmiCallableValuesModality,
+        CsmiCallableValuesPayload, CsmiCallableValuesShape, CsmiCallableValuesTiming,
+        CsmiCoverageStatus, CsmiInputLocation,
     };
+    use crate::analyzer::semantic_model::{
+        AnonymousCallableIdentity, ArtifactProducerLimits, AuthoredSemanticModelPack,
+        CallableValuesCoverage, CallableValuesFact, CallableValuesFamily, CallableValuesPayload,
+        CompilerOptions, ExactArtifact, compile_pack, read_exact_source_set,
+    };
+    use rusqlite::TransactionBehavior;
+    use serde_json::json;
+    use std::fs;
+    use std::path::PathBuf;
+
+    const DECLARATIONS: &[u8] =
+        include_bytes!("../../../../testdata/semantic-model-packs/declarations-v1.json");
+    const CALLABLE: &str = "member.widget.create";
+
+    fn callback_location(position: u32) -> CsmiInputLocation {
+        serde_json::from_value(json!({
+            "root": {"phase": "input", "role": "parameter", "position": position}
+        }))
+        .expect("parameter location is valid")
+    }
+
+    fn callable_pack() -> CompiledSemanticModelPack {
+        let mut authored: AuthoredSemanticModelPack =
+            serde_json::from_slice(DECLARATIONS).expect("declaration fixture is valid");
+        authored.schema_version = 10;
+        authored.compatibility.bifrost = None;
+        let callback = callback_location(0);
+        authored.shards[0].callable_values = Some(CallableValuesPayload {
+            facts: vec![
+                CallableValuesFact {
+                    payload: CsmiCallableValuesPayload::ReturnedCallable {
+                        callable: CALLABLE.to_owned(),
+                        result: 0,
+                        target: CALLABLE.to_owned(),
+                    },
+                    provenance: vec!["factory-return-a".to_owned()],
+                },
+                CallableValuesFact {
+                    payload: CsmiCallableValuesPayload::ReturnedCallable {
+                        callable: CALLABLE.to_owned(),
+                        result: 0,
+                        target: CALLABLE.to_owned(),
+                    },
+                    provenance: vec!["factory-return-b".to_owned()],
+                },
+                CallableValuesFact {
+                    payload: CsmiCallableValuesPayload::CallbackInvocation {
+                        callable: CALLABLE.to_owned(),
+                        callback: callback.clone(),
+                        shape: CsmiCallableValuesShape {
+                            parameters: 1,
+                            results: 1,
+                        },
+                        arguments: vec![CsmiCallableValuesArgument::Unknown {
+                            limitation: CsmiCallableValuesLimitation {
+                                kind: "unmodeled-input".to_owned(),
+                                diagnostic: None,
+                            },
+                        }],
+                        timing: CsmiCallableValuesTiming::DuringCall,
+                        modality: CsmiCallableValuesModality::May,
+                    },
+                    provenance: vec!["callback-edge".to_owned()],
+                },
+            ],
+            coverage: vec![
+                CallableValuesCoverage {
+                    family: CallableValuesFamily::ReturnedCallables,
+                    callable: CALLABLE.to_owned(),
+                    status: CsmiCoverageStatus::Partial,
+                    limitations: Vec::new(),
+                    provenance: vec!["returned-scan".to_owned()],
+                },
+                CallableValuesCoverage {
+                    family: CallableValuesFamily::CallbackInvocations,
+                    callable: CALLABLE.to_owned(),
+                    status: CsmiCoverageStatus::Unknown,
+                    limitations: Vec::new(),
+                    provenance: vec!["callback-scan".to_owned()],
+                },
+            ],
+            anonymous_callables: Vec::new(),
+        });
+        compile_pack(&authored, &CompilerOptions::default()).expect("callable pack compiles")
+    }
+
+    fn install_fixture() -> (SemanticPackCatalog, CompiledSemanticModelPack) {
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let pack = callable_pack();
+        catalog
+            .install(
+                &pack,
+                &DurablePackSource {
+                    kind: DurablePackSourceKind::Installed,
+                    source_id: "callable-values-fixture".to_owned(),
+                },
+            )
+            .unwrap();
+        catalog
+            .install(
+                &pack,
+                &DurablePackSource {
+                    kind: DurablePackSourceKind::Installed,
+                    source_id: "callable-values-fixture-second".to_owned(),
+                },
+            )
+            .expect("same populated publication supports multiple durable source IDs");
+        (catalog, pack)
+    }
+
+    fn anonymous_source_fixture() -> (
+        tempfile::TempDir,
+        ExactArtifact,
+        GoPinnedPackage,
+        AnonymousCallableIdentity,
+    ) {
+        let directory = tempfile::tempdir().expect("Go source fixture directory");
+        let root = directory
+            .path()
+            .canonicalize()
+            .expect("canonical Go source root");
+        fs::write(
+            root.join("callbacks.go"),
+            "package pkg\nfunc factory() func(int) int {\n return func(value int) int { return value }\n}\n",
+        )
+        .expect("write Go source fixture");
+        let artifact = read_exact_source_set(
+            &root,
+            &[PathBuf::from("callbacks.go")],
+            1,
+            8,
+            &ArtifactProducerLimits::default(),
+        )
+        .expect("exact Go source set");
+        let package = GoPinnedPackage {
+            import_path: "example.test/module/pkg".to_owned(),
+            name: "pkg".to_owned(),
+            files: vec!["callbacks.go".to_owned()],
+        };
+        let analysis = analyze_go_package_source_identities(&artifact, &package, 10_000, None);
+        assert!(analysis.is_source_discovery_complete(), "{analysis:#?}");
+        let literal = analysis
+            .identities
+            .iter()
+            .find(|identity| {
+                identity.anchor.kind
+                    == crate::analyzer::go::GoSourceDeclarationKind::FunctionLiteral
+            })
+            .expect("anonymous callback literal is present");
+        let identity = literal
+            .anonymous_callable_identity("go.literal.returned-callback")
+            .expect("literal signature is AST-backed");
+        (directory, artifact, package, identity)
+    }
+
+    fn anonymous_callable_pack(identity: AnonymousCallableIdentity) -> CompiledSemanticModelPack {
+        let mut authored: AuthoredSemanticModelPack =
+            serde_json::from_slice(DECLARATIONS).expect("declaration fixture is valid");
+        authored.schema_version = 10;
+        authored.compatibility.bifrost = None;
+        authored.language = "go".to_owned();
+        authored.ecosystem = "go-module".to_owned();
+        for selector in &mut authored.shards[0].activation {
+            selector.artifact_sha256 = Some(identity.artifact_sha256.clone());
+        }
+        authored.shards[0].callable_values = Some(CallableValuesPayload {
+            facts: vec![CallableValuesFact {
+                payload: CsmiCallableValuesPayload::ReturnedCallable {
+                    callable: CALLABLE.to_owned(),
+                    result: 0,
+                    target: identity.id.clone(),
+                },
+                provenance: vec!["exact-go-source-fixture".to_owned()],
+            }],
+            coverage: vec![CallableValuesCoverage {
+                family: CallableValuesFamily::ReturnedCallables,
+                callable: CALLABLE.to_owned(),
+                status: CsmiCoverageStatus::Partial,
+                limitations: Vec::new(),
+                provenance: vec!["source-coverage".to_owned()],
+            }],
+            anonymous_callables: vec![identity],
+        });
+        compile_pack(&authored, &CompilerOptions::default()).expect("Go callable pack compiles")
+    }
+
+    fn query<'a>(
+        pack: &'a CompiledSemanticModelPack,
+        question: CatalogCallableValuesQuestion<'a>,
+    ) -> CatalogCallableValuesQuery<'a> {
+        CatalogCallableValuesQuery {
+            manifest_digest: &pack.manifest.content_sha256,
+            shard_id: &pack.manifest.shards[0].shard_id,
+            callable: CALLABLE,
+            question,
+        }
+    }
 
     #[test]
-    fn cache_version_separates_generated_production_identity() {
-        let input = "a".repeat(64);
-        let first = generated_production_digest_for_cache_version(
-            &input,
-            "fixture-producer",
-            "1.0.0",
-            1,
-            1,
-        );
-        let second = generated_production_digest_for_cache_version(
-            &input,
-            "fixture-producer",
-            "1.0.0",
-            1,
-            2,
+    fn sql_questions_preserve_alternatives_unknowns_scoped_coverage_and_exact_shape() {
+        let (catalog, pack) = install_fixture();
+        let cancellation = CancellationToken::new();
+        let returned = catalog
+            .query_callable_values(
+                &query(
+                    &pack,
+                    CatalogCallableValuesQuestion::ReturnedCallable { result: 0 },
+                ),
+                CatalogCallableValuesQueryLimits { max_records: 4 },
+                &cancellation,
+            )
+            .unwrap();
+        assert_eq!(returned.facts.len(), 2, "alternatives are retained");
+        assert_eq!(returned.coverage_claims.len(), 1);
+        assert_eq!(returned.examined_records, 3);
+        assert_eq!(returned.executable_coverage, CsmiCoverageStatus::Unknown);
+        assert_eq!(
+            returned.coverage_claims[0].coverage.status,
+            CsmiCoverageStatus::Partial
         );
 
-        assert_ne!(first, second);
+        let callback = callback_location(0);
+        let callbacks = catalog
+            .query_callable_values(
+                &query(
+                    &pack,
+                    CatalogCallableValuesQuestion::CallbackInvocation {
+                        callback: &callback,
+                        shape: CsmiCallableValuesShape {
+                            parameters: 1,
+                            results: 1,
+                        },
+                    },
+                ),
+                CatalogCallableValuesQueryLimits { max_records: 2 },
+                &cancellation,
+            )
+            .unwrap();
+        assert_eq!(callbacks.facts.len(), 1);
+        assert_eq!(callbacks.coverage_claims.len(), 1);
+        let CsmiCallableValuesPayload::CallbackInvocation { arguments, .. } =
+            &callbacks.facts[0].fact.payload
+        else {
+            panic!("callback question returned a non-callback fact");
+        };
+        assert!(matches!(
+            arguments[0],
+            CsmiCallableValuesArgument::Unknown { .. }
+        ));
+        assert_eq!(callbacks.executable_coverage, CsmiCoverageStatus::Unknown);
+
+        let wrong_shape = catalog
+            .query_callable_values(
+                &query(
+                    &pack,
+                    CatalogCallableValuesQuestion::CallbackInvocation {
+                        callback: &callback,
+                        shape: CsmiCallableValuesShape {
+                            parameters: 2,
+                            results: 1,
+                        },
+                    },
+                ),
+                CatalogCallableValuesQueryLimits { max_records: 2 },
+                &cancellation,
+            )
+            .unwrap();
+        assert!(wrong_shape.facts.is_empty());
+        assert_eq!(wrong_shape.coverage_claims.len(), 1);
+
+        let wrong_location = callback_location(1);
+        let near_miss = catalog
+            .query_callable_values(
+                &query(
+                    &pack,
+                    CatalogCallableValuesQuestion::CallbackInvocation {
+                        callback: &wrong_location,
+                        shape: CsmiCallableValuesShape {
+                            parameters: 1,
+                            results: 1,
+                        },
+                    },
+                ),
+                CatalogCallableValuesQueryLimits { max_records: 2 },
+                &cancellation,
+            )
+            .unwrap();
+        assert!(near_miss.facts.is_empty());
+        assert_eq!(near_miss.coverage_claims.len(), 1);
+
+        let bounded = catalog
+            .query_callable_values(
+                &query(
+                    &pack,
+                    CatalogCallableValuesQuestion::ReturnedCallable { result: 0 },
+                ),
+                CatalogCallableValuesQueryLimits { max_records: 1 },
+                &cancellation,
+            )
+            .unwrap();
+        assert_eq!(bounded.facts.len(), 1);
+        assert_eq!(
+            bounded.gap,
+            Some(CatalogCallableValuesQueryGap::RecordBudgetExhausted { max_records: 1 })
+        );
+
+        let canceled = CancellationToken::new();
+        canceled.cancel();
+        let result = catalog
+            .query_callable_values(
+                &query(
+                    &pack,
+                    CatalogCallableValuesQuestion::ReturnedCallable { result: 0 },
+                ),
+                CatalogCallableValuesQueryLimits { max_records: 2 },
+                &canceled,
+            )
+            .unwrap();
+        assert_eq!(result.gap, Some(CatalogCallableValuesQueryGap::Cancelled));
+        assert!(result.facts.is_empty());
     }
+
+    #[test]
+    fn session_sources_publish_queryable_sql_without_writing_read_only_main_catalog() {
+        for (source_kind, source_id) in [
+            (SessionPackSourceKind::Embedded, "embedded-session"),
+            (
+                SessionPackSourceKind::EphemeralWorkspace,
+                "ephemeral-workspace-session",
+            ),
+        ] {
+            let root = tempfile::tempdir().expect("session catalog root");
+            drop(
+                SemanticPackCatalog::open(
+                    root.path(),
+                    CatalogOpenMode::ReadWrite,
+                    CatalogOptions::default(),
+                )
+                .expect("initialize main catalog"),
+            );
+            let catalog = SemanticPackCatalog::open(
+                root.path(),
+                CatalogOpenMode::ReadOnly,
+                CatalogOptions::default(),
+            )
+            .expect("open read-only main catalog");
+            let pack = callable_pack();
+            catalog
+                .register_session_pack(
+                    &pack,
+                    &SessionPackSource {
+                        kind: source_kind,
+                        source_id: source_id.to_owned(),
+                    },
+                )
+                .expect("register validated session pack");
+            catalog
+                .register_session_pack(
+                    &pack,
+                    &SessionPackSource {
+                        kind: source_kind,
+                        source_id: format!("{source_id}-second"),
+                    },
+                )
+                .expect("register the same populated publication under another source ID");
+
+            assert!(
+                catalog.session_packs.lock().unwrap()[0].shards[0]
+                    .callable_values
+                    .is_none()
+            );
+
+            let result = catalog
+                .query_callable_values(
+                    &query(
+                        &pack,
+                        CatalogCallableValuesQuestion::ReturnedCallable { result: 0 },
+                    ),
+                    CatalogCallableValuesQueryLimits { max_records: 4 },
+                    &CancellationToken::new(),
+                )
+                .expect("query session SQL sidecar");
+            assert_eq!(result.facts.len(), 2, "{source_kind:?}");
+            assert_eq!(result.coverage_claims.len(), 1, "{source_kind:?}");
+            assert_eq!(result.gap, None, "{source_kind:?}");
+            assert_eq!(result.executable_coverage, CsmiCoverageStatus::Unknown);
+            assert_eq!(
+                catalog
+                    .connection
+                    .lock()
+                    .unwrap()
+                    .query_row("SELECT count(*) FROM catalog_packs", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                0,
+                "session registration never installs into the read-only durable catalog"
+            );
+            let session_catalog = catalog.session_callable_values.lock().unwrap();
+            assert_eq!(
+                session_catalog
+                    .as_ref()
+                    .unwrap()
+                    .connection
+                    .query_row(
+                        "SELECT count(*) FROM catalog_callable_values_indexed_shards
+                         WHERE manifest_digest = ?1 AND shard_id = ?2",
+                        params![
+                            &pack.manifest.content_sha256,
+                            &pack.manifest.shards[0].shard_id
+                        ],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                1,
+                "session SQL marker is committed with the facts"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_missing_index_is_a_gap_until_bounded_normal_hydration_repairs_it() {
+        let (catalog, pack) = install_fixture();
+        let manifest = &pack.manifest.content_sha256;
+        let shard = &pack.manifest.shards[0].shard_id;
+        {
+            let mut connection = catalog.connection.lock().unwrap();
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            transaction
+                .execute(
+                    "DELETE FROM catalog_anonymous_callable_identities
+                     WHERE manifest_digest = ?1 AND shard_id = ?2",
+                    params![manifest, shard],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "DELETE FROM catalog_callable_value_facts
+                     WHERE manifest_digest = ?1 AND shard_id = ?2",
+                    params![manifest, shard],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "DELETE FROM catalog_callable_value_coverage
+                     WHERE manifest_digest = ?1 AND shard_id = ?2",
+                    params![manifest, shard],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "DELETE FROM catalog_callable_values_indexed_shards
+                     WHERE manifest_digest = ?1 AND shard_id = ?2",
+                    params![manifest, shard],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+        let object_reads = catalog.object_reads.load(Ordering::Relaxed);
+        let no_budget = catalog
+            .query_callable_values(
+                &query(
+                    &pack,
+                    CatalogCallableValuesQuestion::ReturnedCallable { result: 0 },
+                ),
+                CatalogCallableValuesQueryLimits { max_records: 0 },
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            no_budget.gap,
+            Some(CatalogCallableValuesQueryGap::RecordBudgetExhausted { max_records: 0 })
+        );
+        let no_index = catalog
+            .query_callable_values(
+                &query(
+                    &pack,
+                    CatalogCallableValuesQuestion::ReturnedCallable { result: 0 },
+                ),
+                CatalogCallableValuesQueryLimits { max_records: 4 },
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            no_index.gap,
+            Some(CatalogCallableValuesQueryGap::IndexReconciliationRequired)
+        );
+        assert_eq!(catalog.object_reads.load(Ordering::Relaxed), object_reads);
+        assert_eq!(
+            catalog
+                .connection
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM catalog_callable_values_indexed_shards
+                     WHERE manifest_digest = ?1 AND shard_id = ?2",
+                    params![manifest, shard],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "query demand does not repair by decoding an uncharged shard"
+        );
+
+        let candidate = CatalogCandidate {
+            manifest_digest: manifest.clone(),
+            shard_id: shard.clone(),
+            descriptor: pack.manifest.shards[0].clone(),
+            completeness: pack.manifest.completeness,
+            source_kind: CatalogPackSourceKind::Installed,
+            source_id: "callable-values-fixture".to_owned(),
+            location: CatalogCandidateLocation::Durable,
+        };
+        catalog
+            .load(&candidate)
+            .expect("normal shard load succeeds");
+        let repaired = catalog
+            .query_callable_values(
+                &query(
+                    &pack,
+                    CatalogCallableValuesQuestion::ReturnedCallable { result: 0 },
+                ),
+                CatalogCallableValuesQueryLimits { max_records: 4 },
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert_eq!(repaired.facts.len(), 2);
+        assert_eq!(repaired.coverage_claims.len(), 1);
+        assert_eq!(repaired.gap, None);
+    }
+
+    #[test]
+    fn anonymous_sql_rows_rebind_to_fresh_exact_go_ast_and_reject_bad_query_evidence() {
+        let (_directory, artifact, package, identity) = anonymous_source_fixture();
+        let pack = anonymous_callable_pack(identity.clone());
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        catalog
+            .install(
+                &pack,
+                &DurablePackSource {
+                    kind: DurablePackSourceKind::Installed,
+                    source_id: "anonymous-go-fixture".to_owned(),
+                },
+            )
+            .unwrap();
+        catalog
+            .install(
+                &pack,
+                &DurablePackSource {
+                    kind: DurablePackSourceKind::Installed,
+                    source_id: "anonymous-go-fixture-second".to_owned(),
+                },
+            )
+            .expect("repeated publication replaces anonymous identities and child anchors");
+        let rows = catalog
+            .query_callable_values(
+                &query(
+                    &pack,
+                    CatalogCallableValuesQuestion::ReturnedCallable { result: 0 },
+                ),
+                CatalogCallableValuesQueryLimits { max_records: 16 },
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert_eq!(rows.facts.len(), 1);
+        let returned = &rows.facts[0];
+        assert_eq!(returned.anonymous_callable.as_ref(), Some(&identity));
+        let bound = crate::analyzer::go::bind_catalog_go_anonymous_callable_target(
+            returned,
+            &artifact,
+            &package,
+            10_000,
+            &CancellationToken::new(),
+        )
+        .expect("SQL-carried identity rebinds against the exact artifact");
+        assert_eq!(bound.id(), identity.id);
+        assert_eq!(SourceAnchor::from(&bound.source().anchor), identity.anchor);
+
+        let mut missing_identity = returned.clone();
+        missing_identity.anonymous_callable = None;
+        assert_eq!(
+            crate::analyzer::go::bind_catalog_go_anonymous_callable_target(
+                &missing_identity,
+                &artifact,
+                &package,
+                10_000,
+                &CancellationToken::new(),
+            ),
+            Err(
+                crate::analyzer::go::GoCatalogAnonymousCallableBindingError::MissingAnonymousTarget
+            )
+        );
+
+        let mut wrong_target = returned.clone();
+        let CsmiCallableValuesPayload::ReturnedCallable { target, .. } =
+            &mut wrong_target.fact.payload
+        else {
+            panic!("returned-callable query produced another fact kind");
+        };
+        *target = "go.literal.unbound".to_owned();
+        assert_eq!(
+            crate::analyzer::go::bind_catalog_go_anonymous_callable_target(
+                &wrong_target,
+                &artifact,
+                &package,
+                10_000,
+                &CancellationToken::new(),
+            ),
+            Err(crate::analyzer::go::GoCatalogAnonymousCallableBindingError::TargetMismatch)
+        );
+
+        let canceled = CancellationToken::new();
+        canceled.cancel();
+        assert_eq!(
+            crate::analyzer::go::bind_catalog_go_anonymous_callable_target(
+                returned, &artifact, &package, 10_000, &canceled,
+            ),
+            Err(
+                crate::analyzer::go::GoCatalogAnonymousCallableBindingError::Source(
+                    crate::analyzer::go::GoAnonymousCallableIdentityBindingError::Cancelled {
+                        visited_nodes: 0
+                    }
+                )
+            )
+        );
+    }
+
+    #[test]
+    fn runtime_source_reader_reconstructs_exact_go_source_after_catalog_drop() {
+        let (_directory, artifact, package, identity) = anonymous_source_fixture();
+        let pack = anonymous_callable_pack(identity);
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        catalog
+            .install(
+                &pack,
+                &DurablePackSource {
+                    kind: DurablePackSourceKind::Installed,
+                    source_id: "exact-go-source-reader".to_owned(),
+                },
+            )
+            .unwrap();
+        catalog
+            .register_exact_go_source(
+                &pack.manifest.content_sha256,
+                &artifact,
+                std::slice::from_ref(&package),
+            )
+            .unwrap();
+        let reader = catalog.runtime_source_reader();
+        let request = CatalogGoSourceRequest {
+            manifest_digest: &pack.manifest.content_sha256,
+            shard_id: &pack.manifest.shards[0].shard_id,
+            artifact_sha256: artifact.sha256(),
+            package_import_path: &package.import_path,
+            file: &package.files[0],
+        };
+        let canceled = CancellationToken::new();
+        canceled.cancel();
+        assert!(matches!(
+            reader.read_go_source(&request, CatalogGoSourceReadLimits::default(), &canceled,),
+            Err(CatalogError::Cancelled)
+        ));
+        let budget = reader.read_go_source(
+            &request,
+            CatalogGoSourceReadLimits {
+                max_files: 0,
+                ..CatalogGoSourceReadLimits::default()
+            },
+            &CancellationToken::new(),
+        );
+        assert!(matches!(
+            budget,
+            Err(CatalogError::SourceBudgetExhausted { max_files: 0, .. })
+        ));
+        let missing_file = reader
+            .read_go_source(
+                &CatalogGoSourceRequest {
+                    file: "missing.go",
+                    ..request
+                },
+                CatalogGoSourceReadLimits::default(),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert!(missing_file.is_none());
+        let foreign_artifact = ExactArtifact::from_source_entries(
+            PathBuf::from("<foreign exact Go source set>"),
+            vec![("foreign.go".to_owned(), b"package foreign\n".to_vec())],
+            8,
+            &ArtifactProducerLimits::default(),
+        )
+        .unwrap();
+        let foreign_package = GoPinnedPackage {
+            import_path: "example.test/foreign/pkg".to_owned(),
+            name: "foreign".to_owned(),
+            files: vec!["foreign.go".to_owned()],
+        };
+        catalog
+            .register_exact_go_source(
+                &pack.manifest.content_sha256,
+                &foreign_artifact,
+                std::slice::from_ref(&foreign_package),
+            )
+            .unwrap();
+        assert!(
+            reader
+                .read_go_source(
+                    &CatalogGoSourceRequest {
+                        artifact_sha256: foreign_artifact.sha256(),
+                        package_import_path: &foreign_package.import_path,
+                        file: &foreign_package.files[0],
+                        ..request
+                    },
+                    CatalogGoSourceReadLimits::default(),
+                    &CancellationToken::new(),
+                )
+                .unwrap()
+                .is_none(),
+            "a source set registered under the manifest is unreadable without shard activation"
+        );
+        drop(catalog);
+
+        let selected = reader
+            .read_go_source(
+                &request,
+                CatalogGoSourceReadLimits::default(),
+                &CancellationToken::new(),
+            )
+            .unwrap()
+            .expect("registered exact source set");
+        assert_eq!(selected.artifact.sha256(), artifact.sha256());
+        assert_eq!(selected.artifact.bytes(), artifact.bytes());
+        assert_eq!(selected.packages, vec![package]);
+        assert_eq!(
+            selected.artifact.path(),
+            Path::new("<catalog exact Go source set>")
+        );
+    }
+
+    #[test]
+    fn runtime_source_reader_bounds_stored_package_metadata_before_reconstruction() {
+        for column in ["package_name", "import_path"] {
+            let (_directory, artifact, package, identity) = anonymous_source_fixture();
+            let pack = anonymous_callable_pack(identity);
+            let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+            catalog
+                .install(
+                    &pack,
+                    &DurablePackSource {
+                        kind: DurablePackSourceKind::Installed,
+                        source_id: "bounded-go-source-metadata".to_owned(),
+                    },
+                )
+                .unwrap();
+            catalog
+                .register_exact_go_source(
+                    &pack.manifest.content_sha256,
+                    &artifact,
+                    std::slice::from_ref(&package),
+                )
+                .unwrap();
+            // A damaged catalog must be bounded before allocating or attempting
+            // to validate this metadata as a package/source identity.
+            catalog
+                .connection
+                .lock()
+                .unwrap()
+                .execute(
+                    &format!("UPDATE catalog_exact_go_packages SET {column} = ?1"),
+                    params!["x".repeat(4096)],
+                )
+                .unwrap();
+            assert!(matches!(
+                catalog.runtime_source_reader().read_go_source(
+                    &CatalogGoSourceRequest {
+                        manifest_digest: &pack.manifest.content_sha256,
+                        shard_id: &pack.manifest.shards[0].shard_id,
+                        artifact_sha256: artifact.sha256(),
+                        package_import_path: &package.import_path,
+                        file: &package.files[0],
+                    },
+                    CatalogGoSourceReadLimits {
+                        max_files: 8,
+                        max_source_bytes: 2048,
+                        ..CatalogGoSourceReadLimits::default()
+                    },
+                    &CancellationToken::new(),
+                ),
+                Err(CatalogError::SourceBudgetExhausted {
+                    max_source_bytes: 2048,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn session_compiled_pack_registration_publishes_exact_go_source_rows() {
+        let (_directory, artifact, package, identity) = anonymous_source_fixture();
+        let pack = anonymous_callable_pack(identity);
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        catalog
+            .register_compiled_pack_with_exact_go_source(
+                &pack,
+                &SessionPackSource {
+                    kind: SessionPackSourceKind::EphemeralWorkspace,
+                    source_id: "exact-go-source-session".to_owned(),
+                },
+                &artifact,
+                std::slice::from_ref(&package),
+            )
+            .unwrap();
+        let reader = catalog.runtime_source_reader();
+        let selected = reader
+            .read_go_source(
+                &CatalogGoSourceRequest {
+                    manifest_digest: &pack.manifest.content_sha256,
+                    shard_id: &pack.manifest.shards[0].shard_id,
+                    artifact_sha256: artifact.sha256(),
+                    package_import_path: &package.import_path,
+                    file: &package.files[0],
+                },
+                CatalogGoSourceReadLimits::default(),
+                &CancellationToken::new(),
+            )
+            .unwrap()
+            .expect("session exact source rows");
+        assert_eq!(selected.artifact.sha256(), artifact.sha256());
+        assert_eq!(selected.packages, vec![package]);
+    }
+
+    #[test]
+    fn populated_callable_queries_pin_their_exact_lookup_indexes_with_and_without_statistics() {
+        for state in crate::cache_gc::PlannerStatisticsState::BOTH {
+            let (catalog, pack) = install_fixture();
+            let manifest = &pack.manifest.content_sha256;
+            let shard = &pack.manifest.shards[0].shard_id;
+            let callback = callback_location(0);
+            let callback_json = serde_json::to_string(&callback).unwrap();
+            let source_artifact = "a".repeat(64);
+            {
+                let mut connection = catalog.connection.lock().unwrap();
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .unwrap();
+                {
+                    let mut insert = transaction
+                        .prepare_cached(
+                            "INSERT INTO catalog_callable_value_facts(
+                               manifest_digest, shard_id, fact_ordinal, family,
+                               callable, result_ordinal, target, provenance_json
+                             ) VALUES(?1, ?2, ?3, 'returned-callables', ?4, ?5, ?6, '[]')",
+                        )
+                        .unwrap();
+                    for ordinal in 0_i64..2_048 {
+                        let callable = if ordinal % 16 == 0 {
+                            CALLABLE.to_owned()
+                        } else {
+                            format!("member.distractor.{}", ordinal % 127)
+                        };
+                        insert
+                            .execute(params![
+                                manifest,
+                                shard,
+                                10_000 + ordinal,
+                                callable,
+                                ordinal % 4,
+                                CALLABLE,
+                            ])
+                            .unwrap();
+                    }
+                }
+                {
+                    let mut insert = transaction
+                        .prepare_cached(
+                            "INSERT INTO catalog_callable_value_facts(
+                               manifest_digest, shard_id, fact_ordinal, family,
+                               callable, callback_location_json, callback_parameters,
+                               callback_results, arguments_json, timing, modality,
+                               provenance_json
+                             ) VALUES(?1, ?2, ?3, 'callback-invocations', ?4, ?5,
+                                      ?6, ?7, '[]', 'during-call', 'may', '[]')",
+                        )
+                        .unwrap();
+                    for ordinal in 0_i64..2_048 {
+                        let callable = if ordinal % 16 == 0 {
+                            CALLABLE.to_owned()
+                        } else {
+                            format!("member.distractor.{}", ordinal % 127)
+                        };
+                        insert
+                            .execute(params![
+                                manifest,
+                                shard,
+                                20_000 + ordinal,
+                                callable,
+                                callback_json,
+                                ordinal % 4,
+                                ordinal % 3,
+                            ])
+                            .unwrap();
+                    }
+                }
+                {
+                    let mut insert = transaction
+                        .prepare_cached(
+                            "INSERT INTO catalog_callable_value_coverage(
+                               manifest_digest, shard_id, coverage_ordinal, family,
+                               callable, status, limitations_json, provenance_json
+                             ) VALUES(?1, ?2, ?3, ?4, ?5, 'unknown', '[]', '[]')",
+                        )
+                        .unwrap();
+                    for ordinal in 0_i64..512 {
+                        let family = if ordinal % 2 == 0 {
+                            "returned-callables"
+                        } else {
+                            "callback-invocations"
+                        };
+                        let callable = if ordinal % 16 == 0 {
+                            CALLABLE.to_owned()
+                        } else {
+                            format!("member.distractor.{}", ordinal % 127)
+                        };
+                        insert
+                            .execute(params![manifest, shard, 10_000 + ordinal, family, callable])
+                            .unwrap();
+                    }
+                }
+                for ordinal in 0_i64..256 {
+                    let identity_id = format!("go.literal.plan.{ordinal}");
+                    let artifact_sha256 = format!("{ordinal:064x}");
+                    transaction
+                        .execute(
+                            "INSERT INTO catalog_anonymous_callable_identities(
+                               manifest_digest, shard_id, callable_id, artifact_sha256,
+                               package_import_path, anchor_file, anchor_start, anchor_end,
+                               anchor_kind, signature_file, signature_start, signature_end
+                             ) VALUES(?1, ?2, ?3, ?4, 'example.test/module/pkg',
+                                      'callbacks.go', 10, 50, 'function-literal',
+                                      'callbacks.go', 10, 20)",
+                            params![manifest, shard, identity_id, artifact_sha256],
+                        )
+                        .unwrap();
+                    transaction
+                        .execute(
+                            "INSERT INTO catalog_anonymous_callable_identity_anchors(
+                               manifest_digest, shard_id, callable_id, chain_kind,
+                               ordinal, file, byte_start, byte_end, declaration_kind
+                             ) VALUES(?1, ?2, ?3, 'signature_declaration', 0,
+                                      'callbacks.go', 10, 20, 'function')",
+                            params![manifest, shard, identity_id],
+                        )
+                        .unwrap();
+                    transaction
+                        .execute(
+                            "INSERT INTO catalog_anonymous_callable_signature_shapes(
+                               manifest_digest, shard_id, callable_id, shape_kind,
+                               ordinal, file, byte_start, byte_end, variadic, arity
+                             ) VALUES(?1, ?2, ?3, 'parameter', 0,
+                                      'callbacks.go', 11, 15, 0, 1)",
+                            params![manifest, shard, identity_id],
+                        )
+                        .unwrap();
+                }
+                transaction
+                    .execute(
+                        "INSERT INTO catalog_exact_go_source_sets(
+                           manifest_digest, artifact_sha256
+                         ) VALUES(?1, ?2)",
+                        params![manifest, &source_artifact],
+                    )
+                    .unwrap();
+                transaction
+                    .execute(
+                        "INSERT INTO catalog_exact_go_packages(
+                           manifest_digest, artifact_sha256, package_ordinal,
+                           import_path, package_name
+                         ) VALUES(?1, ?2, 0, 'example.test/module/pkg', 'pkg')",
+                        params![manifest, &source_artifact],
+                    )
+                    .unwrap();
+                let mut source_insert = transaction
+                    .prepare_cached(
+                        "INSERT INTO catalog_exact_go_source_files(
+                           manifest_digest, artifact_sha256, relative_path, source_text
+                         ) VALUES(?1, ?2, ?3, 'package pkg\\n')",
+                    )
+                    .unwrap();
+                let mut membership_insert = transaction
+                    .prepare_cached(
+                        "INSERT INTO catalog_exact_go_package_files(
+                           manifest_digest, artifact_sha256, package_ordinal,
+                           file_ordinal, relative_path
+                         ) VALUES(?1, ?2, 0, ?3, ?4)",
+                    )
+                    .unwrap();
+                for ordinal in 0_i64..256 {
+                    let path = format!("pkg/{ordinal:04}.go");
+                    source_insert
+                        .execute(params![manifest, &source_artifact, &path])
+                        .unwrap();
+                    membership_insert
+                        .execute(params![manifest, &source_artifact, ordinal, &path])
+                        .unwrap();
+                }
+                drop(source_insert);
+                drop(membership_insert);
+                transaction.commit().unwrap();
+                state.install(&connection);
+                if state == crate::cache_gc::PlannerStatisticsState::Representative {
+                    // Catalog tables have no captured analyzer-store samples;
+                    // analyze this populated catalog to exercise its own plans.
+                    connection.execute_batch("ANALYZE;").unwrap();
+                }
+
+                let source_files_plan = connection
+                    .prepare(
+                        "EXPLAIN QUERY PLAN
+                         SELECT relative_path, source_text
+                         FROM catalog_exact_go_source_files
+                              INDEXED BY catalog_exact_go_source_files_read
+                         WHERE manifest_digest = ?1 AND artifact_sha256 = ?2
+                         ORDER BY relative_path",
+                    )
+                    .unwrap()
+                    .query_map(params![manifest, &source_artifact], |row| {
+                        row.get::<_, String>(3)
+                    })
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                assert!(
+                    source_files_plan
+                        .iter()
+                        .any(|line| line.contains("catalog_exact_go_source_files_read")),
+                    "{state}: {source_files_plan:?}"
+                );
+                assert!(
+                    !source_files_plan
+                        .iter()
+                        .any(|line| { line.contains("SCAN ") || line.contains("AUTOMATIC") }),
+                    "{state}: {source_files_plan:?}"
+                );
+
+                let source_activation_plan = connection
+                    .prepare(
+                        "EXPLAIN QUERY PLAN
+                         SELECT EXISTS(
+                           SELECT 1
+                           FROM catalog_selectors INDEXED BY catalog_selectors_artifact
+                           WHERE manifest_digest = ?1
+                             AND shard_id = ?2
+                             AND artifact_sha256 = ?3)",
+                    )
+                    .unwrap()
+                    .query_map(params![manifest, shard, &source_artifact], |row| {
+                        row.get::<_, String>(3)
+                    })
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                assert!(
+                    source_activation_plan
+                        .iter()
+                        .any(|line| {
+                            line.starts_with(
+                                "SEARCH catalog_selectors USING COVERING INDEX catalog_selectors_artifact ",
+                            ) && line.contains(
+                                "(artifact_sha256=? AND manifest_digest=? AND shard_id=?)",
+                            )
+                        }),
+                    "{state}: {source_activation_plan:?}"
+                );
+                assert!(
+                    !source_activation_plan.iter().any(|line| {
+                        (line.contains("SCAN ") && line != "SCAN CONSTANT ROW")
+                            || line.contains("AUTOMATIC")
+                    }),
+                    "{state}: {source_activation_plan:?}"
+                );
+
+                let package_plan = connection
+                    .prepare(
+                        "EXPLAIN QUERY PLAN
+                         SELECT package_ordinal, import_path, package_name
+                         FROM catalog_exact_go_packages
+                              INDEXED BY catalog_exact_go_packages_read
+                         WHERE manifest_digest = ?1 AND artifact_sha256 = ?2
+                         ORDER BY package_ordinal",
+                    )
+                    .unwrap()
+                    .query_map(params![manifest, &source_artifact], |row| {
+                        row.get::<_, String>(3)
+                    })
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                assert!(
+                    package_plan
+                        .iter()
+                        .any(|line| line.contains("catalog_exact_go_packages_read")),
+                    "{state}: {package_plan:?}"
+                );
+                assert!(
+                    !package_plan
+                        .iter()
+                        .any(|line| { line.contains("SCAN ") || line.contains("AUTOMATIC") }),
+                    "{state}: {package_plan:?}"
+                );
+
+                let package_files_plan = connection
+                    .prepare(
+                        "EXPLAIN QUERY PLAN
+                         SELECT package_ordinal, file_ordinal, relative_path
+                         FROM catalog_exact_go_package_files
+                              INDEXED BY catalog_exact_go_package_files_ordered_read
+                         WHERE manifest_digest = ?1 AND artifact_sha256 = ?2
+                         ORDER BY package_ordinal, file_ordinal",
+                    )
+                    .unwrap()
+                    .query_map(params![manifest, &source_artifact], |row| {
+                        row.get::<_, String>(3)
+                    })
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                assert!(
+                    package_files_plan.iter().any(|line| {
+                        line.contains("catalog_exact_go_package_files_ordered_read")
+                    }),
+                    "{state}: {package_files_plan:?}"
+                );
+                assert!(
+                    !package_files_plan
+                        .iter()
+                        .any(|line| { line.contains("SCAN ") || line.contains("AUTOMATIC") }),
+                    "{state}: {package_files_plan:?}"
+                );
+
+                let returned = connection
+                    .prepare(&format!(
+                        "EXPLAIN QUERY PLAN {CALLABLE_VALUES_RETURNED_SQL}"
+                    ))
+                    .unwrap()
+                    .query_map(params![manifest, shard, CALLABLE, 0_i64, 16_i64], |row| {
+                        row.get::<_, String>(3)
+                    })
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                assert!(
+                    returned.iter().any(|line| line.contains(
+                        "SEARCH fact USING INDEX catalog_callable_value_returned_lookup"
+                    )),
+                    "{state}: {returned:?}"
+                );
+                assert!(
+                    !returned
+                        .iter()
+                        .any(|line| { line.contains("SCAN fact") || line.contains("AUTOMATIC") }),
+                    "{state}: {returned:?}"
+                );
+
+                let callbacks = connection
+                    .prepare(&format!(
+                        "EXPLAIN QUERY PLAN {CALLABLE_VALUES_CALLBACK_SQL}"
+                    ))
+                    .unwrap()
+                    .query_map(
+                        params![
+                            manifest,
+                            shard,
+                            CALLABLE,
+                            callback_json,
+                            1_i64,
+                            1_i64,
+                            16_i64
+                        ],
+                        |row| row.get::<_, String>(3),
+                    )
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                assert!(
+                    callbacks.iter().any(|line| line.contains(
+                        "SEARCH fact USING INDEX catalog_callable_value_callback_lookup"
+                    )),
+                    "{state}: {callbacks:?}"
+                );
+                assert!(
+                    !callbacks
+                        .iter()
+                        .any(|line| { line.contains("SCAN fact") || line.contains("AUTOMATIC") }),
+                    "{state}: {callbacks:?}"
+                );
+
+                let coverage = connection
+                    .prepare(&format!(
+                        "EXPLAIN QUERY PLAN {CALLABLE_VALUES_COVERAGE_SQL}"
+                    ))
+                    .unwrap()
+                    .query_map(
+                        params![manifest, shard, "returned-callables", CALLABLE, 16_i64],
+                        |row| row.get::<_, String>(3),
+                    )
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                assert!(
+                    coverage.iter().any(|line| line.contains(
+                        "SEARCH coverage USING INDEX catalog_callable_value_coverage_lookup"
+                    )),
+                    "{state}: {coverage:?}"
+                );
+                assert!(
+                    !coverage.iter().any(|line| {
+                        line.contains("SCAN coverage") || line.contains("AUTOMATIC")
+                    }),
+                    "{state}: {coverage:?}"
+                );
+
+                let anonymous_base = connection
+                    .prepare(&format!(
+                        "EXPLAIN QUERY PLAN {ANONYMOUS_CALLABLE_IDENTITY_SQL}"
+                    ))
+                    .unwrap()
+                    .query_map(params![manifest, shard, "go.literal.plan.0"], |row| {
+                        row.get::<_, String>(3)
+                    })
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                assert!(
+                    anonymous_base.iter().any(|line| line.contains(
+                        "SEARCH identity USING INDEX sqlite_autoindex_catalog_anonymous_callable_identities_1"
+                    )),
+                    "{state}: {anonymous_base:?}"
+                );
+                assert!(
+                    !anonymous_base.iter().any(|line| {
+                        line.contains("SCAN ")
+                            || line.contains("AUTOMATIC")
+                            || line.contains("TEMP B-TREE")
+                            || line.contains("CO-ROUTINE")
+                    }),
+                    "{state}: {anonymous_base:?}"
+                );
+
+                for (reader_sql, table_name) in [
+                    (
+                        ANONYMOUS_CALLABLE_IDENTITY_ANCHORS_SQL,
+                        "catalog_anonymous_callable_identity_anchors",
+                    ),
+                    (
+                        ANONYMOUS_CALLABLE_IDENTITY_SHAPES_SQL,
+                        "catalog_anonymous_callable_signature_shapes",
+                    ),
+                ] {
+                    let children = connection
+                        .prepare(&format!("EXPLAIN QUERY PLAN {reader_sql}"))
+                        .unwrap()
+                        .query_map(
+                            params![manifest, shard, "go.literal.plan.0", 16_i64],
+                            |row| row.get::<_, String>(3),
+                        )
+                        .unwrap()
+                        .collect::<Result<Vec<_>, _>>()
+                        .unwrap();
+                    let expected_index =
+                        format!("SEARCH {table_name} USING INDEX sqlite_autoindex_{table_name}_1");
+                    assert!(
+                        children.iter().any(|line| line.contains(&expected_index)),
+                        "{state}: {children:?}"
+                    );
+                    assert!(
+                        !children.iter().any(|line| {
+                            line.contains("SCAN ")
+                                || line.contains("AUTOMATIC")
+                                || line.contains("TEMP B-TREE")
+                                || line.contains("CO-ROUTINE")
+                        }),
+                        "{state}: {children:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod generated_production_cache_version_tests {
+    use super::{
+        generated_production_digest_for_cache_version, verify_recorded_generated_production_digest,
+    };
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
     fn migrated_catalog_preserves_old_epochs_and_reuses_the_new_production() {
@@ -6140,12 +10046,47 @@ mod generated_production_cache_version_tests {
         let retained_key =
             GeneratedProductionKey::new("b".repeat(64), "fixture-producer", "1.0.0", 2).unwrap();
         catalog.install_generated(&retained_key, &old_pack).unwrap();
+        let source_rows = |catalog: &SemanticPackCatalog| {
+            catalog
+                .connection
+                .lock()
+                .unwrap()
+                .prepare(
+                    "SELECT manifest_digest, source_kind, source_id, installed_at
+                     FROM catalog_sources
+                     ORDER BY manifest_digest, source_kind, source_id",
+                )
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let original_sources = source_rows(&catalog);
+        assert_eq!(original_sources.len(), 2);
         // Recreate schema 8, with both an old and a still-current digest.
         catalog.connection.lock().unwrap().execute_batch(
             "CREATE UNIQUE INDEX catalog_generated_productions_identity ON catalog_generated_productions(input_digest, producer_name, producer_version, schema_version);
              ALTER TABLE catalog_generated_productions DROP COLUMN generated_cache_version;
              DROP VIEW catalog_verified_generated_productions;
              DROP TABLE catalog_shard_validations;
+             DROP TABLE catalog_anonymous_callable_signature_shapes;
+             DROP TABLE catalog_anonymous_callable_identity_anchors;
+             DROP TABLE catalog_anonymous_callable_identities;
+             DROP TABLE catalog_callable_value_coverage;
+             DROP TABLE catalog_callable_value_facts;
+             DROP TABLE catalog_callable_values_indexed_shards;
+             DROP TABLE catalog_exact_go_package_files;
+             DROP TABLE catalog_exact_go_packages;
+             DROP TABLE catalog_exact_go_source_files;
+             DROP TABLE catalog_exact_go_source_sets;
              PRAGMA user_version = 8;"
         ).unwrap();
         drop(catalog);
@@ -6156,6 +10097,7 @@ mod generated_production_cache_version_tests {
             CatalogOptions::default(),
         )
         .unwrap();
+        assert_eq!(source_rows(&catalog), original_sources);
         let query = SemanticPackSelectorQuery {
             language: "java".to_owned(),
             ecosystem: "jvm".to_owned(),
@@ -6221,6 +10163,7 @@ mod generated_production_cache_version_tests {
     }
 
     #[test]
+    #[hardwon("#3357: startup cache reuse rejected verified entries after an epoch change")]
     fn recorded_cache_version_verifies_identity_without_current_cache_epoch() {
         let input = "a".repeat(64);
         let recorded = generated_production_digest_for_cache_version(
@@ -6254,6 +10197,32 @@ mod generated_production_cache_version_tests {
         );
     }
 
+    use super::{CATALOG_SCHEMA_VERSION, default_semantic_pack_catalog_root_with_override};
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    #[test]
+    #[hardwon("be576f7e556b: a generated production cache epoch change reused an old identity")]
+    fn cache_version_separates_generated_production_identity() {
+        let input = "a".repeat(64);
+        let first = generated_production_digest_for_cache_version(
+            &input,
+            "fixture-producer",
+            "1.0.0",
+            1,
+            1,
+        );
+        let second = generated_production_digest_for_cache_version(
+            &input,
+            "fixture-producer",
+            "1.0.0",
+            1,
+            2,
+        );
+
+        assert_ne!(first, second);
+    }
+
     #[test]
     fn explicit_cache_root_shares_generated_productions_across_workspaces() {
         let cache_root = OsString::from("shared-semantic-packs");
@@ -6277,6 +10246,7 @@ mod generated_production_cache_version_tests {
 
 #[cfg(test)]
 mod acquisition_receipt_tests {
+    use brokk_bifrost_test_macros::hardwon;
     use std::fs;
 
     use semver::Version;
@@ -6315,6 +10285,7 @@ mod acquisition_receipt_tests {
     }
 
     #[test]
+    #[hardwon("#3357: acquisition absence receipts could replay across different requests")]
     fn receipt_request_digest_binds_kind_coordinate_and_version() {
         let generated = AcquisitionReceiptRequest::generated(&generated_key()).digest();
         let declared = AcquisitionReceiptRequest::declared(&declared_query()).digest();
@@ -6335,6 +10306,7 @@ mod acquisition_receipt_tests {
     }
 
     #[test]
+    #[hardwon("#3357: corrupt or missing receipt objects were accepted as valid")]
     fn receipt_object_validation_rejects_corruption_and_missing_files() {
         let root = TempDir::new().unwrap();
         let bytes = b"receipt-object";
@@ -6360,126 +10332,7 @@ mod acquisition_receipt_tests {
 }
 
 #[cfg(test)]
-mod stored_manifest_memo_tests {
-    /// One stored manifest is deserialized once per catalog, however many
-    /// (shard, selector) rows selection, near-miss attribution, and shard
-    /// loading visit (#3101).
-    ///
-    /// The fixture holds three shards with two selectors each, so the candidate
-    /// query answers with six rows over one manifest. Before the decoded
-    /// manifest memo, every row and every loaded shard decoded the same bytes
-    /// again: one fresh policy process decoded the same JDK manifests hundreds
-    /// of times.
-    #[test]
-    fn a_stored_manifest_is_decoded_once_per_catalog() {
-        use super::{
-            CatalogCoordinate, CatalogOptions, DurablePackSource, DurablePackSourceKind,
-            SemanticPackCatalog, SemanticPackSelectorQuery,
-        };
-        use crate::analyzer::semantic_model::{CompilerOptions, SourceFormat, compile_source};
-        use semver::Version;
-
-        let mut shards = Vec::new();
-        for index in 0..3 {
-            shards.push(serde_json::json!({
-                "id": format!("python.stdlib.{index}"),
-                "activation": [
-                    {"toolchain": {"name": "cpython", "version": ">=3.10.0, <3.15.0"}},
-                    {"toolchain": {"name": "cpython", "version": ">=3.10.0, <3.15.0"}}
-                ],
-                "payload": {
-                    "kind": "declaration_facts",
-                    "types": [{
-                        "id": format!("python.types-none-type-{index}"),
-                        "name": "types.NoneType",
-                        "type_kind": "class",
-                        "visibility": "public",
-                        "type_parameters": [],
-                        "hierarchy": [],
-                        "aliases": [],
-                        "extension_surfaces": [],
-                        "locator": {
-                            "kind": "artifact",
-                            "path": "stdlib/types.pyi",
-                            "symbol": "types.NoneType"
-                        }
-                    }],
-                    "members": [],
-                    "relations": []
-                }
-            }));
-        }
-        let source = serde_json::json!({
-            "schema_version": 2,
-            "pack_id": "fixture.python-stdlib",
-            "version": "2026.9.4",
-            "producer": {"name": "bifrost-fixture", "version": "1.0.0"},
-            "language": "python",
-            "ecosystem": "python",
-            "compatibility": {
-                "bifrost": ">=0.8.0, <1.0.0",
-                "toolchains": [{"name": "cpython", "requirement": ">=3.10.0, <3.15.0"}]
-            },
-            "provenance": {"source": "checked-in test source", "revision": "fixture-v1"},
-            "license": "Apache-2.0",
-            "completeness": "complete",
-            "safety": {"generated_code_only": false, "review_required": false},
-            "shards": shards,
-        });
-        let compiled = compile_source(
-            SourceFormat::Json,
-            &serde_json::to_vec(&source).unwrap(),
-            &CompilerOptions::default(),
-        )
-        .expect("fixture pack compiles");
-        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
-        catalog
-            .install(
-                &compiled,
-                &DurablePackSource {
-                    kind: DurablePackSourceKind::Installed,
-                    source_id: "fixture".to_owned(),
-                },
-            )
-            .unwrap();
-        let query = SemanticPackSelectorQuery {
-            language: "python".to_owned(),
-            ecosystem: "python".to_owned(),
-            package: None,
-            module: None,
-            toolchain: Some(CatalogCoordinate {
-                name: "cpython".to_owned(),
-                version: Some(Version::parse("3.12.0").unwrap()),
-            }),
-            target: None,
-            configuration: None,
-            artifact_sha256: None,
-            bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
-        };
-
-        let candidates = catalog.candidates_bounded(&query, usize::MAX).unwrap();
-        assert_eq!(candidates.len(), 3);
-        assert!(catalog.version_near_misses(&query).unwrap().is_empty());
-        assert_eq!(
-            catalog.manifest_decode_count(),
-            1,
-            "six selector rows must not decode the manifest six times"
-        );
-        for candidate in &candidates {
-            catalog.load(candidate).unwrap();
-        }
-        assert_eq!(
-            catalog.manifest_decode_count(),
-            1,
-            "loading every shard must not decode the manifest again"
-        );
-        assert_eq!(
-            catalog.manifest_inventory_validation_count(),
-            1,
-            "loading every shard must not revalidate the manifest inventory"
-        );
-    }
-}
+mod stored_manifest_memo_tests {}
 
 #[cfg(test)]
 mod native_compatibility_catalog_tests {
@@ -6488,12 +10341,15 @@ mod native_compatibility_catalog_tests {
         DurablePackSourceKind, SemanticPackCatalog, SemanticPackSelectorQuery,
     };
     use crate::analyzer::semantic_model::{CompilerOptions, SourceFormat, compile_source};
+    use brokk_bifrost_test_macros::hardwon;
     use semver::Version;
 
     fn compiled_pack(
         schema_version: u32,
     ) -> crate::analyzer::semantic_model::CompiledSemanticModelPack {
-        let compatibility = if schema_version == 8 {
+        let compatibility = if schema_version
+            >= crate::analyzer::semantic_model::VERSION_INDEPENDENT_COMPATIBILITY_SCHEMA_VERSION
+        {
             serde_json::json!({
                 "toolchains": [{"name": "jdk", "requirement": ">=21.0.0, <22.0.0"}]
             })
@@ -6556,6 +10412,7 @@ mod native_compatibility_catalog_tests {
     }
 
     #[test]
+    #[hardwon("#3815: native pack admission incorrectly inherited the legacy engine-version gate")]
     fn schema_eight_ignores_engine_version_while_legacy_range_still_filters() {
         let root = tempfile::tempdir().unwrap();
         let root_path = std::fs::canonicalize(root.path()).unwrap();

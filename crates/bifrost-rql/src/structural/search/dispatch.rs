@@ -191,6 +191,10 @@ pub(super) struct DispatchArm {
 
 #[derive(Debug, Clone)]
 pub(super) struct DispatchCallContext {
+    /// Stable identity of the semantic procedure that owns this call site.
+    /// Anonymous procedures share their enclosing declaration, so this is
+    /// required when a query is scoped to one exact procedure row.
+    pub(super) procedure_id: String,
     /// The smallest workspace declaration containing the semantic caller.
     /// Anonymous nested callables intentionally map to their lexical parent's
     /// declaration, so consumers must also require `caller_is_exact` before

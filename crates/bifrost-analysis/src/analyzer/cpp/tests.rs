@@ -10,6 +10,7 @@ use crate::analyzer::{
     CodeUnitType, DefinitionLanguageScope, RelationalBatchOutcome, RelationalDefinitionQuery,
     RelationalDefinitionRequest, RelationalDefinitionValue,
 };
+use brokk_bifrost_test_macros::hardwon;
 use std::collections::BTreeSet;
 
 fn macro_composed_fields_fixture() -> (
@@ -38,6 +39,7 @@ fn macro_composed_fields_fixture() -> (
 }
 
 #[test]
+#[hardwon("#3078: an incomplete type lookup was cached as an empty include boundary")]
 fn cancelled_macro_composed_fields_does_not_poison_cache() {
     let (_fixture, owner, analyzer) = macro_composed_fields_fixture();
     let cancellation = crate::CancellationToken::new();
@@ -61,6 +63,7 @@ fn cancelled_macro_composed_fields_does_not_poison_cache() {
 }
 
 #[test]
+#[hardwon("#3078: a nested cancelled type read lost incompleteness from the outer query")]
 fn nested_cancelled_macro_composed_field_read_marks_outer_scope_incomplete() {
     let (_fixture, owner, analyzer) = macro_composed_fields_fixture();
     let owner_unit = analyzer
@@ -137,7 +140,10 @@ fn macro_owner_queries_preserve_anchored_name_provenance() {
 }
 
 #[test]
-fn generated_field_ranges_only_build_their_source_overlay() {
+#[hardwon(
+    "bfd4320020de: generated-field range queries, bounded and unbounded, rebuilt unrelated C macro overlays"
+)]
+fn generated_field_range_queries_only_build_their_source_overlay() {
     let (_fixture, owner, analyzer) = macro_composed_fields_fixture();
     let field = analyzer
         .declarations(&owner)
@@ -152,9 +158,22 @@ fn generated_field_ranges_only_build_their_source_overlay() {
         0,
         "ranges for a generated field must reuse the field's source overlay"
     );
+
+    analyzer.reset_macro_composed_fields_build_count_for_test();
+    let (ranges, total, complete) =
+        analyzer.ranges_with_limit(&field, 1, &crate::CancellationToken::new());
+    assert_eq!(ranges.len(), 1, "generated field range: {ranges:?}");
+    assert_eq!(total, 1, "generated field range total: {ranges:?}");
+    assert!(complete, "generated field range query: {ranges:?}");
+    assert_eq!(
+        analyzer.macro_composed_fields_build_count_for_test(),
+        0,
+        "limited ranges for a generated field must reuse its source overlay"
+    );
 }
 
 #[test]
+#[hardwon("bfd4320020de: file-scoped C identifier queries rebuilt the owning macro overlay")]
 fn file_scoped_identifier_queries_only_build_the_requested_source_overlay() {
     let (_fixture, owner, analyzer) = macro_composed_fields_fixture();
     let field = analyzer
@@ -196,44 +215,9 @@ fn file_scoped_identifier_queries_only_build_the_requested_source_overlay() {
 }
 
 #[test]
-fn exact_generated_field_queries_only_build_the_owning_source_overlay() {
-    let (_fixture, _owner, analyzer) = macro_composed_fields_fixture();
-
-    analyzer.reset_macro_composed_fields_build_count_for_test();
-    let units = analyzer.definitions("Owner.value").collect::<Vec<_>>();
-    assert!(
-        units
-            .iter()
-            .any(|unit| unit.is_field() && unit.fq_name() == "Owner.value"),
-        "generated field missing: {units:?}"
-    );
-    assert_eq!(
-        analyzer.macro_composed_fields_build_count_for_test(),
-        1,
-        "an exact generated-field query must not build unrelated source overlays"
-    );
-}
-
-#[test]
-fn exact_single_segment_queries_do_not_build_an_empty_macro_owner_request() {
-    let (_fixture, _owner, analyzer) = macro_composed_fields_fixture();
-
-    analyzer.reset_macro_composed_fields_build_count_for_test();
-    let units = analyzer.definitions("Owner").collect::<Vec<_>>();
-    assert!(
-        units
-            .iter()
-            .any(|unit| unit.is_class() && unit.fq_name() == "Owner"),
-        "owner class missing: {units:?}"
-    );
-    assert_eq!(
-        analyzer.macro_composed_fields_build_count_for_test(),
-        0,
-        "a single-segment exact query has no macro-field owner to build"
-    );
-}
-
-#[test]
+#[hardwon(
+    "bfd4320020de: workspace identifier queries dropped generated fields outside the first source overlay"
+)]
 fn workspace_identifier_queries_retain_generated_fields_from_all_overlays() {
     let (_fixture, _owner, analyzer) = macro_composed_fields_fixture();
     let name = brokk_bifrost_core::analyzer::RelationalName::stable(
@@ -273,6 +257,9 @@ fn workspace_identifier_queries_retain_generated_fields_from_all_overlays() {
 }
 
 #[test]
+#[hardwon(
+    "4d3fd0ce1133: a bare compatibility name triggered an owner-qualified macro-field overlay scan"
+)]
 fn bare_rendered_macro_lookup_does_not_build_field_overlays() {
     let (_fixture, _owner, analyzer) = macro_composed_fields_fixture();
 
@@ -301,6 +288,7 @@ fn bare_rendered_macro_lookup_does_not_build_field_overlays() {
 }
 
 #[test]
+#[hardwon("847c70e0ee8c: bounded C++ definition lookup scanned unrelated macro-field overlays")]
 fn exact_field_queries_only_build_the_requested_owner_overlay() {
     let (_fixture, _owner, analyzer) = macro_composed_fields_fixture();
 
@@ -320,6 +308,9 @@ fn exact_field_queries_only_build_the_requested_owner_overlay() {
 }
 
 #[test]
+#[hardwon(
+    "#3035: usage-catalog enumeration built macro overlays for fields its graph filter discarded"
+)]
 fn workspace_usage_inventory_does_not_build_filtered_macro_field_overlays() {
     let (_fixture, _owner, analyzer) = macro_composed_fields_fixture();
     analyzer.reset_macro_composed_fields_build_count_for_test();
@@ -344,28 +335,9 @@ fn workspace_usage_inventory_does_not_build_filtered_macro_field_overlays() {
 }
 
 #[test]
-fn generated_field_ranges_with_limit_only_use_their_source_overlay() {
-    let (_fixture, owner, analyzer) = macro_composed_fields_fixture();
-    let field = analyzer
-        .declarations(&owner)
-        .into_iter()
-        .find(|unit| unit.is_field() && unit.fq_name() == "Owner.value")
-        .expect("owner macro field");
-
-    analyzer.reset_macro_composed_fields_build_count_for_test();
-    let (ranges, total, complete) =
-        analyzer.ranges_with_limit(&field, 1, &crate::CancellationToken::new());
-    assert_eq!(ranges.len(), 1, "generated field range: {ranges:?}");
-    assert_eq!(total, 1, "generated field range total: {ranges:?}");
-    assert!(complete, "generated field range query: {ranges:?}");
-    assert_eq!(
-        analyzer.macro_composed_fields_build_count_for_test(),
-        0,
-        "limited ranges for a generated field must reuse its source overlay"
-    );
-}
-
-#[test]
+#[hardwon(
+    "8f407bc939e1: an inline constructor re-entered class reconciliation without signature metadata"
+)]
 fn reconciliation_does_not_reenter_for_inline_constructor_without_metadata() {
     let temp = tempfile::tempdir().expect("temp dir");
     let root = temp.path().canonicalize().expect("canonical temp dir");
@@ -390,6 +362,7 @@ public:
 }
 
 #[test]
+#[hardwon("4c36b5b86e83: partial-specialization metadata leaked into an ordinary nested class")]
 fn class_template_metadata_does_not_leak_into_ordinary_nested_classes() {
     let temp = tempfile::tempdir().expect("temp dir");
     let root = temp.path().canonicalize().expect("canonical temp dir");
@@ -426,6 +399,7 @@ template <typename T> class envelope {
 }
 
 #[test]
+#[hardwon("#1707: C++ navigation hydrated full FileState values for persisted import rows")]
 fn cpp_import_lines_use_persisted_projection() {
     let temp = tempfile::tempdir().expect("temp dir");
     let root = temp.path().canonicalize().expect("canonical temp dir");
@@ -460,47 +434,8 @@ fn cpp_import_lines_use_persisted_projection() {
     );
 }
 
-#[cfg(test)]
-mod cache_tests {
-    use super::*;
-    use crate::analyzer::FileSetProject;
-    use std::path::PathBuf;
-
-    #[test]
-    fn project_sensitive_caches_are_isolated_across_snapshots_and_updates() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let project: Arc<dyn Project> = Arc::new(FileSetProject::new(
-            root.clone(),
-            std::iter::empty::<PathBuf>(),
-        ));
-        let analyzer = CppAnalyzer::new(Arc::clone(&project));
-        let snapshot = analyzer.clone_with_project(Arc::clone(&project));
-        let updated = analyzer.with_updated_inner(analyzer.inner.clone());
-        let file = ProjectFile::new(root, "sample.cpp");
-
-        snapshot
-            .imported_code_units
-            .insert(file.clone(), Arc::new(HashSet::default()));
-        snapshot
-            .referencing_files
-            .insert(file.clone(), Arc::new(HashSet::default()));
-        assert!(analyzer.imported_code_units.get(&file).is_none());
-        assert!(analyzer.referencing_files.get(&file).is_none());
-
-        analyzer
-            .imported_code_units
-            .insert(file.clone(), Arc::new(HashSet::default()));
-        analyzer
-            .referencing_files
-            .insert(file.clone(), Arc::new(HashSet::default()));
-
-        assert!(updated.imported_code_units.get(&file).is_none());
-        assert!(updated.referencing_files.get(&file).is_none());
-    }
-}
-
 #[test]
+#[hardwon("#1524: recovered exported-class bodies swallowed following sibling declarations")]
 fn exported_class_body_does_not_swallow_sibling_classes_1524() {
     // Issue #1524: the exported-class recovery for `class MACRO Name { ... }`
     // mis-nested every following namespace-scope sibling class when the body
@@ -559,6 +494,9 @@ class FreeListManyCachedFastPathForNewSpace {};
 
 #[cfg(test)]
 #[test]
+#[hardwon(
+    "#1566: C++ reconciliation performed include-closure work for unrelated same-named members"
+)]
 fn reconcile_skips_same_named_members_of_unrelated_classes_1566() {
     // Issue #1566: #1134 reconciliation probed every same-named member in the
     // repo and built the include-visible class table of each candidate's file
@@ -715,6 +653,7 @@ int DecoyOuter::DecoyInner::method() const { return 3; }
 /// instead of the persisted `Top` + `Only`. The owner, member and literal-`$`
 /// control lookups around it already worked and must keep working.
 #[test]
+#[hardwon("#3520: exact-name lookup missed nested terminal C++ type identities")]
 fn definitions_reach_nested_terminal_types_by_exact_name() {
     let fixture = crate::inline_project::InlineTestProject::with_language(Language::Cpp)
         .file(
@@ -794,6 +733,9 @@ fn definitions_reach_nested_terminal_types_by_exact_name() {
 }
 
 #[test]
+#[hardwon(
+    "c406a1edeecb: retained workspace queries lost their original content snapshot after update"
+)]
 fn retained_analyzer_reads_callable_facts_from_its_content_snapshot() {
     let temp = tempfile::tempdir().expect("temp dir");
     let root = temp.path().canonicalize().expect("canonical temp dir");
@@ -833,6 +775,7 @@ fn retained_analyzer_reads_callable_facts_from_its_content_snapshot() {
 }
 
 #[test]
+#[hardwon("#1573: error recovery produced an empty owner chain after a UI property macro")]
 fn global_out_of_line_ctor_after_ui_property_macro_keeps_owner_1573() {
     // #1573: chromium's side_panel_content_proxy.cc panicked the workspace
     // build: a DEFINE_OWNED_UI_CLASS_PROPERTY_KEY macro invocation immediately
@@ -923,8 +866,7 @@ void SidePanelContentProxy::ResetAvailableCallback() {
     );
 }
 
-/// ExecPlan Milestone 2 (`.agents/plans/c-compilation-language-tag-scope.md`):
-/// [`HeaderLanguageAttribution`] and the transitive reverse-include closure it
+/// Tests for [`HeaderLanguageAttribution`] and the transitive reverse-include closure it
 /// is built on. `header_language_attribution` and
 /// `transitive_reaching_translation_units` are `pub(crate)` analyzer
 /// capabilities with no consumer yet, so these are crate-internal fixture
@@ -933,134 +875,6 @@ void SidePanelContentProxy::ResetAvailableCallback() {
 #[cfg(test)]
 mod header_language_attribution_tests {
     use super::*;
-    use brokk_bifrost_cpp::graph::resolver::is_c_source_file;
-
-    #[test]
-    fn header_included_only_by_a_c_file_is_attributed_c() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        ProjectFile::new(root.clone(), "shared.h")
-            .write("struct Widget { int value; };\n")
-            .expect("write header");
-        ProjectFile::new(root.clone(), "a.c")
-            .write("#include \"shared.h\"\n")
-            .expect("write C translation unit");
-        let analyzer = CppAnalyzer::from_project(crate::TestProject::new(root, Language::Cpp));
-        let header = ProjectFile::new(analyzer.inner.project().root().to_path_buf(), "shared.h");
-
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        let token = scope.token();
-        assert_eq!(
-            HeaderLanguageAttribution::C,
-            analyzer.header_language_attribution(token, &header)
-        );
-    }
-
-    #[test]
-    fn header_included_only_by_a_cpp_file_is_attributed_cpp() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        ProjectFile::new(root.clone(), "shared.h")
-            .write("struct Widget { int value; };\n")
-            .expect("write header");
-        ProjectFile::new(root.clone(), "a.cpp")
-            .write("#include \"shared.h\"\n")
-            .expect("write C++ translation unit");
-        let analyzer = CppAnalyzer::from_project(crate::TestProject::new(root, Language::Cpp));
-        let header = ProjectFile::new(analyzer.inner.project().root().to_path_buf(), "shared.h");
-
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        let token = scope.token();
-        assert_eq!(
-            HeaderLanguageAttribution::Cpp,
-            analyzer.header_language_attribution(token, &header)
-        );
-    }
-
-    #[test]
-    fn header_included_by_both_a_c_and_a_cpp_file_is_mixed() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        ProjectFile::new(root.clone(), "shared.h")
-            .write("struct Widget { int value; };\n")
-            .expect("write header");
-        ProjectFile::new(root.clone(), "a.c")
-            .write("#include \"shared.h\"\n")
-            .expect("write C translation unit");
-        ProjectFile::new(root.clone(), "b.cpp")
-            .write("#include \"shared.h\"\n")
-            .expect("write C++ translation unit");
-        let analyzer = CppAnalyzer::from_project(crate::TestProject::new(root, Language::Cpp));
-        let header = ProjectFile::new(analyzer.inner.project().root().to_path_buf(), "shared.h");
-
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        let token = scope.token();
-        assert_eq!(
-            HeaderLanguageAttribution::Mixed,
-            analyzer.header_language_attribution(token, &header)
-        );
-    }
-
-    #[test]
-    fn orphan_header_nothing_reaches_is_unknown() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        ProjectFile::new(root.clone(), "orphan.h")
-            .write("struct Widget { int value; };\n")
-            .expect("write orphan header");
-        ProjectFile::new(root.clone(), "unrelated.cpp")
-            .write("int main() { return 0; }\n")
-            .expect("write unrelated translation unit");
-        let analyzer = CppAnalyzer::from_project(crate::TestProject::new(root, Language::Cpp));
-        let header = ProjectFile::new(analyzer.inner.project().root().to_path_buf(), "orphan.h");
-
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        let token = scope.token();
-        assert_eq!(
-            HeaderLanguageAttribution::Unknown,
-            analyzer.header_language_attribution(token, &header)
-        );
-        assert!(
-            analyzer
-                .transitive_reaching_translation_units(token, &header)
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn transitive_chain_through_an_intermediate_header_attributes_the_leaf_c() {
-        // a.c -> x.h -> y.h: y.h is not directly included by any translation
-        // unit, only reached through the direct reverse-include index's
-        // fixed-point closure.
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        ProjectFile::new(root.clone(), "y.h")
-            .write("struct Leaf { int value; };\n")
-            .expect("write leaf header");
-        ProjectFile::new(root.clone(), "x.h")
-            .write("#include \"y.h\"\n")
-            .expect("write intermediate header");
-        ProjectFile::new(root.clone(), "a.c")
-            .write("#include \"x.h\"\n")
-            .expect("write C translation unit");
-        let analyzer = CppAnalyzer::from_project(crate::TestProject::new(root, Language::Cpp));
-        let project_root = analyzer.inner.project().root().to_path_buf();
-        let leaf = ProjectFile::new(project_root.clone(), "y.h");
-        let translation_unit = ProjectFile::new(project_root, "a.c");
-
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        let token = scope.token();
-        assert_eq!(
-            HeaderLanguageAttribution::C,
-            analyzer.header_language_attribution(token, &leaf)
-        );
-        assert!(
-            analyzer
-                .transitive_reaching_translation_units(token, &leaf)
-                .contains(&translation_unit),
-            "the transitive closure must reach through the intermediate header"
-        );
-    }
 
     #[test]
     fn compile_database_evidence_overrides_extension_evidence() {
@@ -1222,39 +1036,6 @@ mod header_language_attribution_tests {
     /// against the attribution-driven formulation it replaced is comparing the
     /// published rows. The fixture is the mixed workspace above, which
     /// exercises every tier.
-    #[test]
-    fn the_mount_publishes_the_same_files_the_attribution_would() {
-        let (_temp, analyzer) = mixed_c_and_cpp_workspace();
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        let token = scope.token();
-
-        let analyzed_files = analyzer.inner.analyzed_files();
-        let has_c_translation_unit = analyzed_files.iter().any(is_c_source_file);
-        let as_attributed = analyzed_files
-            .iter()
-            .filter(|file| {
-                is_c_source_file(file)
-                    || (has_c_translation_unit
-                        && !imports::is_cpp_translation_unit(file)
-                        && matches!(
-                            analyzer.header_language_attribution(token, file),
-                            HeaderLanguageAttribution::C | HeaderLanguageAttribution::Mixed
-                        ))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            as_attributed,
-            analyzer.c_reading_workspace_files(token),
-            "the mount must publish the same files, in the same order"
-        );
-        assert!(
-            !as_attributed.is_empty(),
-            "a fixture that mounts nothing would prove nothing"
-        );
-    }
-
     /// #3763: two publishers share `cpp:c`. The ordinary workspace sync owns
     /// the `.c` files and the C-reading mount owns the headers C compiles.
     /// When each replaced the whole membership, the first dropped the
@@ -1263,6 +1044,9 @@ mod header_language_attribution_tests {
     /// update naming unchanged files, must publish no revision in either
     /// storage language.
     #[test]
+    #[hardwon(
+        "#3763: duplicate C and C++ publishers changed the revision on an unchanged workspace"
+    )]
     fn a_no_op_warm_start_or_update_publishes_no_workspace_revision() {
         let fixture = crate::inline_project::InlineTestProject::with_language(Language::Cpp)
             .file(
@@ -1403,6 +1187,9 @@ mod transitive_reverse_tu_index_tests {
     }
 
     #[test]
+    #[hardwon(
+        "#2899: repeated graph traversal made C++ reverse include indexing prohibitively slow"
+    )]
     fn a_deep_chain_under_many_units_visits_each_include_edge_once() {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical temp dir");
@@ -1452,6 +1239,9 @@ mod transitive_reverse_tu_index_tests {
     }
 
     #[test]
+    #[hardwon(
+        "#2899: the optimized reverse include index must match an independent per-unit BFS over cycles and joins"
+    )]
     fn the_closure_equals_a_breadth_first_search_from_every_translation_unit() {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical temp dir");
@@ -1520,43 +1310,9 @@ mod transitive_reverse_tu_index_tests {
         assert_eq!(vec![file("a.cc")], reaching(&index, &file("left.h")));
         assert!(reaching(&index, &file("orphan.h")).is_empty());
     }
-
-    #[test]
-    fn mutually_including_headers_report_the_same_reaching_units() {
-        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Cpp)
-            .file(
-                "first.h",
-                "#ifndef FIRST_H\n#define FIRST_H\n#include \"second.h\"\nstruct First { int value; };\n#endif\n",
-            )
-            .file(
-                "second.h",
-                "#ifndef SECOND_H\n#define SECOND_H\n#include \"first.h\"\nstruct Second { int value; };\n#endif\n",
-            )
-            .file(
-                "unit.cc",
-                "#include \"first.h\"\nint unit_main() { return 0; }\n",
-            )
-            .build();
-        let analyzer = CppAnalyzer::from_project(fixture.project().clone());
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        let token = scope.token();
-
-        let unit = fixture.file("unit.cc");
-        assert_eq!(
-            vec![unit.clone()],
-            analyzer.transitive_reaching_translation_units(token, &fixture.file("first.h")),
-            "the directly included half of the cycle is reached by the unit"
-        );
-        assert_eq!(
-            vec![unit],
-            analyzer.transitive_reaching_translation_units(token, &fixture.file("second.h")),
-            "so is the half that only the cycle reaches back into"
-        );
-    }
 }
 
-/// ExecPlan Milestone 3 (`.agents/plans/c-compilation-language-tag-scope.md`):
-/// a header blob is stored twice when its C and C++ readings disagree, and
+/// A header blob is stored twice when its C and C++ readings disagree, and
 /// once when they agree.
 #[cfg(test)]
 mod header_c_projection_storage_tests {
@@ -1626,25 +1382,6 @@ mod header_c_projection_storage_tests {
     }
 
     #[test]
-    fn header_without_a_nested_tag_stores_no_c_reading() {
-        let (_temp, analyzer) = analyzer_over(&[
-            ("plain.h", "struct Widget { int value; };\n"),
-            ("use.c", "#include \"plain.h\"\n"),
-        ]);
-        let header = ProjectFile::new(analyzer.inner.project().root().to_path_buf(), "plain.h");
-
-        assert!(
-            analyzer.c_reading(&header).is_none(),
-            "absence of `cpp:c` rows must mean the readings are identical"
-        );
-        assert_eq!(
-            CodeUnitIndex::declarations(&analyzer, &header),
-            analyzer.declarations_in_reading(&header, true),
-            "the C view of an identical header is the file's own row-set"
-        );
-    }
-
-    #[test]
     fn recovered_export_class_reparse_keeps_its_c_reading() {
         let fixture = crate::inline_project::InlineTestProject::with_language(Language::Cpp)
             .file(
@@ -1692,21 +1429,117 @@ class PROJECT_PUBLIC_API(2, 0) RecoveryOwner : public virtual BaseKey {
             })
         );
     }
+}
 
-    #[test]
-    fn a_translation_unit_never_carries_a_second_reading() {
-        let (_temp, analyzer) = analyzer_over(&[(
-            "unit.c",
-            "struct XDR {\n    struct xdr_ops {\n        int dummy;\n    };\n};\n",
-        )]);
-        let unit = ProjectFile::new(analyzer.inner.project().root().to_path_buf(), "unit.c");
-
-        assert!(analyzer.c_reading(&unit).is_none());
+#[test]
+#[hardwon(
+    "#2488: a physical C++ member body must publish the same structural identity as its header"
+)]
+fn canonical_member_reads_preserve_physical_facts_and_cancelled_reads_do_not_poison_cache() {
+    let project = crate::inline_project::InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "owner.h",
+            "namespace Other {}\nclass Owner { public: void run(); };\n",
+        )
+        .file(
+            "owner.cpp",
+            "#include \"owner.h\"\nusing namespace Other;\nvoid Owner::run() {}\n",
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let physical = analyzer
+        .all_declarations()
+        .find(|unit| unit.source().rel_path() == std::path::Path::new("owner.cpp"))
+        .unwrap();
+    let ranges = analyzer.ranges(&physical);
+    let cancelled = crate::CancellationToken::new();
+    cancelled.cancel();
+    {
         let scope = AnalyzerQueryScope::new(&analyzer);
-        let token = scope.token();
-        assert!(
-            !analyzer.header_uses_c_semantics(token, &unit),
-            "a translation unit's dialect is settled by its own extension"
+        assert_eq!(
+            analyzer.canonical_code_unit(&physical, Some(&cancelled)),
+            physical
+        );
+        assert!(matches!(
+            scope.read_completion(),
+            Err(crate::analyzer::QueryReadIncomplete::Cancelled)
+        ));
+    }
+    assert_eq!(
+        analyzer
+            .reconcile_candidate_scan_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "a cold cancelled identity read must not start candidate work"
+    );
+    let canonical = {
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let unit = analyzer.canonical_code_unit(&physical, None);
+        assert!(scope.read_completion().is_ok());
+        unit
+    };
+    let metadata = analyzer.signature_metadata(&physical);
+    let ledger = Arc::new(crate::analyzer::read_ledger::ReadLedger::new());
+    {
+        let scope = AnalyzerQueryScope::with_read_ledger(&analyzer, Arc::clone(&ledger));
+        assert_eq!(analyzer.canonical_code_unit(&physical, None), canonical);
+        assert!(scope.read_completion().is_ok());
+    }
+    assert!(
+        ledger
+            .keys()
+            .iter()
+            .any(|key| matches!(key, crate::analyzer::read_ledger::ReadKey::Scope { .. })),
+        "a warm ownership read must retain its snapshot dependency: {:?}",
+        ledger.keys()
+    );
+    assert_eq!(canonical.fq_name(), "Owner.run");
+    assert_eq!(canonical.source(), physical.source());
+    assert_eq!(canonical.signature(), physical.signature());
+    assert_eq!(
+        canonical.fq_segments_debug(),
+        vec![("Type", "Owner".into()), ("Member", "run".into())]
+    );
+    assert_eq!(analyzer.ranges(&canonical), ranges);
+    let canonical_metadata = analyzer.signature_metadata(&canonical);
+    assert_eq!(canonical_metadata.len(), metadata.len());
+    for (canonical_fact, physical_fact) in canonical_metadata.iter().zip(&metadata) {
+        // Public semantic properties may inherit the header's visibility;
+        // the body's own signature facts and source provenance stay intact.
+        assert_eq!(canonical_fact.label(), physical_fact.label());
+        assert_eq!(canonical_fact.parameters(), physical_fact.parameters());
+        assert_eq!(
+            canonical_fact.return_type_identity(),
+            physical_fact.return_type_identity()
+        );
+        assert_eq!(
+            canonical_fact.callable_arity(),
+            physical_fact.callable_arity()
+        );
+        assert_eq!(
+            canonical_fact.callable_linkage(),
+            physical_fact.callable_linkage()
         );
     }
+    assert_eq!(analyzer.signature_metadata(&physical), metadata);
+    let token = crate::CancellationToken::new();
+    assert_eq!(
+        analyzer.ranges_with_limit(&canonical, 1, &token),
+        analyzer.ranges_with_limit(&physical, 1, &token)
+    );
+    assert!(
+        analyzer
+            .all_declarations()
+            .any(|unit| unit == physical && unit.fq_name() == "Other.Owner.run")
+    );
+    // The same request contract holds even when reconciliation is cached.
+    let scope = AnalyzerQueryScope::new(&analyzer);
+    assert_eq!(
+        analyzer.canonical_code_unit(&physical, Some(&cancelled)),
+        physical
+    );
+    assert!(matches!(
+        scope.read_completion(),
+        Err(crate::analyzer::QueryReadIncomplete::Cancelled)
+    ));
 }

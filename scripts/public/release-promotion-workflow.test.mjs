@@ -434,8 +434,13 @@ test("agent plugin validation remains in post-release smoke and release assets a
     assert.ok(agentPluginSmoke.includes(`tool.name === "${tool}"`));
   }
   assert.doesNotMatch(agentPluginSmoke, /policies\?\.length,\s*\d+/u);
-  assert.match(agentPluginSmoke, /new Set\(policyIds\)\.size/u);
+  // The engine ships no product rules, so the smoke applies the empty-core
+  // contract for every staged version instead of gating on an exact version
+  // string (#5470).
+  assert.match(agentPluginSmoke, /assert\.deepEqual\(packs, \[\]/u);
+  assert.match(agentPluginSmoke, /policy_files: \["host-smoke\.rqlp"\]/u);
   assert.match(agentPluginSmoke, /bifrost\.correctness\.dynamic-evaluation/u);
+  assert.doesNotMatch(agentPluginSmoke, /coreWithoutRules/u);
   assert.match(contributing, /scripts\/public\/smoke-agent-plugin-release\.mjs/u);
 });
 
@@ -671,16 +676,13 @@ readinessTest("release readiness gives the Linux x86 binary an independent criti
 
   const policySmoke = jobBlock(readiness, "policy-scan-smoke");
   assert.match(policySmoke, /^    needs: \[preflight, semantic-pack-tool, build-linux-x86-64\]$/mu);
-  assert.match(policySmoke, /prepare-open-packs\.mjs/u);
-  for (const flag of ["--binary", "--cache-dir", "--receipt-path", "--env-path"]) {
-    assert.ok(policySmoke.includes(flag), "open-pack acquisition omits " + flag);
-  }
+  assert.match(policySmoke, /accept-offline-semantic-pack-install\.sh/u);
+  assert.doesNotMatch(policySmoke, /pack-engine-profile/u);
+  assert.match(policySmoke, /STAGED_BIFROST" prepare-open-packs/u);
+  assert.match(policySmoke, /--cache-dir "\$\{RUNNER_TEMP\}\/open-packs-cache"/u);
   assert.match(policySmoke, /actions\/cache\/restore@/u);
   assert.match(policySmoke, /actions\/cache\/save@/u);
-  assert.match(policySmoke, /steps\.pack-profile\.outputs\.sha256/u);
-  assert.match(policySmoke, /steps\.open-packs\.outputs\.(?:selection_id|receipt_sha256)/u);
-  assert.match(policySmoke, /BIFROST_OPEN_SEMANTIC_PACK_BUNDLE/u);
-  assert.match(policySmoke, /BIFROST_OPEN_POLICY_PACK_ROOT/u);
+  assert.match(policySmoke, /steps\.open-packs\.outputs\.receipt_sha256/u);
   assert.match(policySmoke, /Upload typed policy smoke status and pack selection receipt/u);
   assert.match(offlinePackAcceptance, /docker run --rm --network none/u);
   assert.match(offlinePackAcceptance, /BIFROST_SEMANTIC_PACK_DOWNLOAD=off/u);
@@ -688,7 +690,9 @@ readinessTest("release readiness gives the Linux x86 binary an independent criti
   assert.match(offlinePackAcceptance, /BIFROST_OPEN_POLICY_PACK_ROOT/u);
   assert.match(offlinePackAcceptance, /BIFROST_SEMANTIC_PACK_CACHE_ROOT/u);
   assert.match(offlinePackAcceptance, /open-packs-receipt\.json/u);
-  assert.match(offlinePackAcceptance, /if \[\[ \$# -ne 8 \]\]/u);
+  assert.match(offlinePackAcceptance, /if \[\[ \$# -ne 5 \]\]/u);
+  assert.match(offlinePackAcceptance, /BIFROST_LAUNCHER_CACHE_DIR="\$launcher_cache"/u);
+  assert.match(offlinePackAcceptance, /"\$bifrost" --root/u);
   assert.match(offlinePackAcceptance, /mounted_java_home=/u);
   assert.match(offlinePackAcceptance, /missing-JAVA_HOME acceptance unexpectedly selected/u);
   assert.match(offlinePackAcceptance, /\[\[ "\$label" == "missing" \|\| "\$label" == "positive" \]\]/u);

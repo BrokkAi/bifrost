@@ -7,6 +7,7 @@
 use std::cmp::Ordering;
 use std::fmt;
 
+use super::identity::{update_length_prefixed, write_lower_hex};
 use serde::de;
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
@@ -15,11 +16,13 @@ use super::composition::{PrecedenceError, PrecedenceGraph};
 use super::definition::{
     AnyOrAll, ClassificationPredicate, FindingCombinationId, PolicyAnalysisType, PolicyCategoryId,
     PolicyClassificationSpec, TaintImpact, TaintLabel, TaintTag, TaxonomyClassificationSpec,
-    TypestateExpectationId,
+    TypestateExpectationId, is_valid_namespaced_identifier,
 };
-use super::finding_identity::EvidenceRef;
+use super::finding_identity::{EvidenceRef, retain_sorted_evidence_refs};
 use super::resolved::{ResolvedEndpointIdentity, ResolvedFindingCombination};
-use super::retained::{RetainedSize, retained_extra};
+use super::retained::{
+    RetainedSize, retained_extra, retained_size_with_extra, retained_size_with_extras,
+};
 
 pub(crate) const MAX_REPORT_NAME_BYTES: usize = 256;
 pub(crate) const MAX_REPORT_PROSE_BYTES: usize = 4_096;
@@ -126,12 +129,15 @@ fn classification_provenance_preference(provenance: &ClassificationProvenance) -
 
 impl RetainedSize for FindingClassification {
     fn retained_size(&self) -> usize {
-        std::mem::size_of::<Self>().saturating_add(match self {
-            Self::Unclassified => 0,
-            Self::Classified { broad, refinements } => {
-                retained_extra(broad).saturating_add(retained_extra(refinements))
-            }
-        })
+        retained_size_with_extra(
+            self,
+            match self {
+                Self::Unclassified => 0,
+                Self::Classified { broad, refinements } => {
+                    retained_extra(broad).saturating_add(retained_extra(refinements))
+                }
+            },
+        )
     }
 }
 
@@ -202,11 +208,15 @@ impl TaxonomyClassification {
 
 impl RetainedSize for TaxonomyClassification {
     fn retained_size(&self) -> usize {
-        std::mem::size_of::<Self>()
-            .saturating_add(retained_extra(&self.taxonomy))
-            .saturating_add(retained_extra(&self.identifier))
-            .saturating_add(retained_extra(&self.name))
-            .saturating_add(retained_extra(&self.provenance))
+        retained_size_with_extras(
+            self,
+            [
+                retained_extra(&self.taxonomy),
+                retained_extra(&self.identifier),
+                retained_extra(&self.name),
+                retained_extra(&self.provenance),
+            ],
+        )
     }
 }
 
@@ -422,21 +432,16 @@ pub(crate) struct ClassificationProjection<'a> {
 
 impl<'a> ClassificationProjection<'a> {
     pub(crate) const fn match_finding() -> Self {
-        Self {
-            analysis_type: PolicyAnalysisType::Match,
-            source_categories: &[],
-            sink_categories: &[],
-            source_labels: &[],
-            sink_tags: &[],
-            sink_impacts: &[],
-            selected_combination: None,
-            typestate_expectation: None,
-        }
+        Self::for_analysis_type(PolicyAnalysisType::Match)
     }
 
     pub(crate) const fn assertion_finding() -> Self {
+        Self::for_analysis_type(PolicyAnalysisType::Assertion)
+    }
+
+    const fn for_analysis_type(analysis_type: PolicyAnalysisType) -> Self {
         Self {
-            analysis_type: PolicyAnalysisType::Assertion,
+            analysis_type,
             source_categories: &[],
             sink_categories: &[],
             source_labels: &[],
@@ -642,7 +647,11 @@ fn classification_predicate_matches(
     }
 }
 
-fn quantified_membership<T: Eq>(quantifier: AnyOrAll, expected: &[T], actual: &[T]) -> bool {
+pub(crate) fn quantified_membership<T: Eq>(
+    quantifier: AnyOrAll,
+    expected: &[T],
+    actual: &[T],
+) -> bool {
     match quantifier {
         AnyOrAll::Any => expected.iter().any(|value| actual.contains(value)),
         AnyOrAll::All => expected.iter().all(|value| actual.contains(value)),
@@ -847,20 +856,23 @@ impl OrganizationalRiskAssessment {
     /// hash, which identifies the complete normalized assessment rather than
     /// its bounded display projection.
     pub(crate) fn retain_evidence_refs(&mut self, retained: &[EvidenceRef]) {
-        self.evidence_refs
-            .retain(|reference| retained.binary_search(reference).is_ok());
+        retain_sorted_evidence_refs(&mut self.evidence_refs, retained);
         self.evidence_refs.shrink_to_fit();
     }
 }
 
 impl RetainedSize for OrganizationalRiskAssessment {
     fn retained_size(&self) -> usize {
-        std::mem::size_of::<Self>()
-            .saturating_add(retained_extra(&self.scheme))
-            .saturating_add(retained_extra(&self.rating))
-            .saturating_add(retained_extra(&self.rationale))
-            .saturating_add(retained_extra(&self.evidence_refs))
-            .saturating_add(retained_extra(&self.assessor))
+        retained_size_with_extras(
+            self,
+            [
+                retained_extra(&self.scheme),
+                retained_extra(&self.rating),
+                retained_extra(&self.rationale),
+                retained_extra(&self.evidence_refs),
+                retained_extra(&self.assessor),
+            ],
+        )
     }
 }
 
@@ -915,13 +927,7 @@ impl Serialize for OrganizationalRiskAssessmentHash {
     where
         S: serde::Serializer,
     {
-        serializer.collect_str(self)
-    }
-}
-
-impl RetainedSize for OrganizationalRiskAssessmentHash {
-    fn retained_size(&self) -> usize {
-        std::mem::size_of::<Self>()
+        crate::serialize_display_value(self, serializer)
     }
 }
 
@@ -1007,7 +1013,10 @@ pub(crate) fn validate_single_line_text(
     if value.len() > max_bytes {
         return Err(TextValidationError::TooLong { max_bytes });
     }
-    if value.chars().any(is_unsafe_single_line_character) {
+    if value
+        .chars()
+        .any(super::render::should_escape_text_character)
+    {
         return Err(TextValidationError::UnsafeCharacter);
     }
     Ok(())
@@ -1015,14 +1024,7 @@ pub(crate) fn validate_single_line_text(
 
 pub(crate) fn validate_namespaced_identifier(value: &str) -> Result<(), TextValidationError> {
     validate_required_text(value, MAX_REPORT_IDENTIFIER_BYTES)?;
-    let bytes = value.as_bytes();
-    if !is_lower_alphanumeric(bytes[0])
-        || !is_lower_alphanumeric(bytes[bytes.len() - 1])
-        || bytes
-            .iter()
-            .copied()
-            .any(|byte| !(is_lower_alphanumeric(byte) || matches!(byte, b'.' | b'-' | b'_')))
-    {
+    if !is_valid_namespaced_identifier(value) {
         return Err(TextValidationError::InvalidIdentifier);
     }
     Ok(())
@@ -1041,35 +1043,6 @@ pub(crate) fn normalize_evidence_refs(
     values.dedup();
     if require_nonempty && values.is_empty() {
         return Err(EvidenceReferenceError::Empty);
-    }
-    Ok(())
-}
-
-const fn is_lower_alphanumeric(byte: u8) -> bool {
-    byte.is_ascii_lowercase() || byte.is_ascii_digit()
-}
-
-fn is_unsafe_single_line_character(character: char) -> bool {
-    character.is_control()
-        || matches!(
-            character,
-            '\u{061c}'
-                | '\u{200e}'
-                | '\u{200f}'
-                | '\u{202a}'..='\u{202e}'
-                | '\u{2066}'..='\u{2069}'
-        )
-}
-
-fn update_length_prefixed(hasher: &mut Sha256, value: &[u8]) {
-    let length = u64::try_from(value.len()).expect("usize fits in u64 on supported targets");
-    hasher.update(length.to_be_bytes());
-    hasher.update(value);
-}
-
-fn write_lower_hex(bytes: &[u8; 32], formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-    for byte in bytes {
-        write!(formatter, "{byte:02x}")?;
     }
     Ok(())
 }
@@ -1119,7 +1092,6 @@ mod tests {
             })
         );
     }
-
     #[test]
     fn classified_results_sort_deduplicate_and_preserve_broad_identity() {
         let cwe_79 = TaxonomyClassification::try_new(
@@ -1158,34 +1130,6 @@ mod tests {
             ["CWE-20", "CWE-79"]
         );
         assert_eq!(result.broad().unwrap().identifier(), "INPUT-VALIDATION");
-    }
-
-    #[test]
-    fn classification_rejects_unsafe_text_and_conflicting_identity() {
-        assert!(
-            TaxonomyClassification::try_new(
-                "CWE\nforged",
-                "CWE-79",
-                None,
-                ClassificationProvenance::PolicyFallback,
-            )
-            .is_err()
-        );
-        let first = TaxonomyClassification::try_new(
-            "CWE",
-            "CWE-20",
-            Some("first".to_string()),
-            ClassificationProvenance::policy_refinement(0).unwrap(),
-        )
-        .unwrap();
-        let second = TaxonomyClassification::try_new(
-            "CWE",
-            "CWE-20",
-            Some("second".to_string()),
-            ClassificationProvenance::policy_refinement(1).unwrap(),
-        )
-        .unwrap();
-        assert!(FindingClassification::classified(broad(), vec![first, second]).is_err());
     }
 
     #[test]

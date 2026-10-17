@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use crate::analyzer::common::same_byte_range;
 use crate::analyzer::semantic::{
     EvidenceCompleteness, MemoryLocationId, ProofStatus, SemanticGapId, StableDigest, ValueAtPoint,
 };
@@ -213,7 +214,7 @@ impl WorkspaceSemanticOracle<'_> {
             work = work.conservative_add(outcome.work());
             if let Some(reads) = outcome.available_value() {
                 let candidate_matches = |candidate: &RuntimeKeyedReadCandidate| {
-                    same_byte_span(candidate.anchor, range)
+                    same_byte_range(candidate.anchor, range)
                         && candidate.global == filter.global
                         && candidate.container == filter.container
                         // Missing key identity retains dynamic/unsupported
@@ -221,8 +222,8 @@ impl WorkspaceSemanticOracle<'_> {
                         && candidate.key.as_ref().is_none_or(|key| filter.accepts_key(key))
                 };
                 for endpoint in &reads.endpoints {
-                    if (same_byte_span(endpoint.expression, range)
-                        || same_byte_span(endpoint.candidate_anchor, range))
+                    if (same_byte_range(endpoint.expression, range)
+                        || same_byte_range(endpoint.candidate_anchor, range))
                         && endpoint.runtime == filter.runtime
                         && endpoint.global == filter.global
                         && endpoint.container == filter.container
@@ -937,6 +938,24 @@ impl WorkspaceSemanticOracle<'_> {
         Ok((footprint, work))
     }
 
+    /// Whether the procedure's language proves that dropping every parameter
+    /// and `let` binding runs no user code (#3757), for consumers that judge
+    /// the procedure's raw gaps without the snapshot sweep, such as exit
+    /// profiles. A procedure with no `InertDropGlue` obligation answers
+    /// `false` without reading its source.
+    pub(crate) fn procedure_drops_proven_inert(
+        &self,
+        procedure: &ProcedureHandle,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<bool, SemanticProviderError> {
+        let Some(gap) = procedure.semantics().gaps().iter().find(|gap| {
+            gap.discharge == crate::analyzer::semantic::SemanticGapDischarge::InertDropGlue
+        }) else {
+            return Ok(false);
+        };
+        super::inert_drop_glue_discharges_gap(gap, procedure, self.workspace, request, &mut None)
+    }
+
     /// Ordinary semantic consumers pay no parse cost when the captured model
     /// snapshot has no runtime-value contracts to apply.
     pub(crate) fn runtime_refinements_for_procedure(
@@ -1208,10 +1227,6 @@ impl WorkspaceSemanticOracle<'_> {
             }
         })
     }
-}
-
-fn same_byte_span(left: Range, right: Range) -> bool {
-    left.start_byte == right.start_byte && left.end_byte == right.end_byte
 }
 
 use crate::analyzer::semantic_model::{
@@ -1623,6 +1638,39 @@ mod tests {
     use crate::test_support::AnalyzerFixture;
 
     #[test]
+    fn runtime_query_budget_exhaustion_does_not_certify_absence() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::JavaScript,
+            &[("probe.js", "const value = process.argv[2];")],
+        );
+        let cancellation = crate::CancellationToken::default();
+        let mut budget = SemanticBudget::uniform(1).unwrap();
+        let file = ProjectFile::new(fixture.project_root(), "probe.js");
+        let range = Range {
+            start_byte: 14,
+            end_byte: 29,
+            start_line: 0,
+            end_line: 0,
+        };
+        let outcome = fixture
+            .analyzer
+            .semantic_oracle_provider()
+            .runtime_keyed_read_at_source(
+                &file,
+                range,
+                &RuntimeKeyedReadFilter::default(),
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("budget interruption is a semantic outcome");
+        assert!(matches!(outcome, SemanticOutcome::ExceededBudget { .. }));
+        assert!(
+            outcome
+                .available_value()
+                .is_none_or(|result| result.endpoints.is_empty() && !result.conclusive_exclusion)
+        );
+    }
+
+    #[test]
     fn absent_runtime_activation_is_not_an_exact_or_clean_source() {
         let source = "function run() { return process.env.DFB_INPUT; }";
         let fixture =
@@ -1668,39 +1716,6 @@ mod tests {
             result
                 .limitations
                 .contains(&RuntimeReadLimitation::ActivationMissing)
-        );
-    }
-
-    #[test]
-    fn runtime_query_budget_exhaustion_does_not_certify_absence() {
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::JavaScript,
-            &[("probe.js", "const value = process.argv[2];")],
-        );
-        let cancellation = crate::CancellationToken::default();
-        let mut budget = SemanticBudget::uniform(1).unwrap();
-        let file = ProjectFile::new(fixture.project_root(), "probe.js");
-        let range = Range {
-            start_byte: 14,
-            end_byte: 29,
-            start_line: 0,
-            end_line: 0,
-        };
-        let outcome = fixture
-            .analyzer
-            .semantic_oracle_provider()
-            .runtime_keyed_read_at_source(
-                &file,
-                range,
-                &RuntimeKeyedReadFilter::default(),
-                &mut SemanticRequest::new(&mut budget, &cancellation),
-            )
-            .expect("budget interruption is a semantic outcome");
-        assert!(matches!(outcome, SemanticOutcome::ExceededBudget { .. }));
-        assert!(
-            outcome
-                .available_value()
-                .is_none_or(|result| result.endpoints.is_empty() && !result.conclusive_exclusion)
         );
     }
 

@@ -4,18 +4,65 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::hash::Hash;
 
-use brokk_bifrost_core::analyzer::canonical_hash::{
-    CanonicalHasher, hash_domain_bytes, write_lower_hex,
-};
+use brokk_bifrost_core::analyzer::Language;
+use brokk_bifrost_core::analyzer::canonical_hash::{hash_domain_bytes, write_lower_hex};
 
 use crate::analyzer::structural::{
     BoundaryStatus, CandidateOutcome, PrecedenceTier, ResolutionCompletionKind,
     ResolutionCompletionReasonKind, ResolutionWitnessKind,
 };
-use crate::hash::{HashMap, HashSet};
+use crate::hash::{HashMap, HashSet, set_with_capacity};
 
 use super::completion_reasons::{CompletionReasonUnion, CompletionReasons};
 use super::never_cancelled;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BindingOrigin {
+    LocalOrInherited,
+    ExplicitImport,
+    WildcardImport,
+    SameCompilationUnitPackage,
+    OtherCompilationUnitPackage,
+    SingleTypeImport,
+    OnDemandImport,
+    SamePackage,
+    StarImport,
+    RootPackage,
+}
+
+/// Lower is stronger. Language-specific order is supplied here; path
+/// comparison remains shared and independent of language.
+pub(crate) const fn binding_origin_rank(language: Language, origin: BindingOrigin) -> Option<u32> {
+    use BindingOrigin as Origin;
+    match language {
+        Language::Scala => match origin {
+            Origin::LocalOrInherited | Origin::SameCompilationUnitPackage => Some(0),
+            Origin::ExplicitImport => Some(1),
+            Origin::WildcardImport | Origin::StarImport => Some(2),
+            Origin::OtherCompilationUnitPackage => Some(3),
+            Origin::RootPackage => Some(4),
+            Origin::SingleTypeImport | Origin::OnDemandImport | Origin::SamePackage => None,
+        },
+        Language::Java => match origin {
+            Origin::RootPackage => None,
+            Origin::LocalOrInherited => Some(0),
+            Origin::SingleTypeImport | Origin::ExplicitImport => Some(1),
+            Origin::SamePackage
+            | Origin::SameCompilationUnitPackage
+            | Origin::OtherCompilationUnitPackage => Some(2),
+            Origin::OnDemandImport | Origin::WildcardImport | Origin::StarImport => Some(3),
+        },
+        Language::Kotlin => match origin {
+            Origin::RootPackage => None,
+            Origin::LocalOrInherited => Some(0),
+            Origin::ExplicitImport => Some(1),
+            Origin::SamePackage | Origin::SameCompilationUnitPackage => Some(2),
+            Origin::WildcardImport | Origin::StarImport | Origin::OnDemandImport => Some(3),
+            Origin::OtherCompilationUnitPackage | Origin::SingleTypeImport => None,
+        },
+        _ => None,
+    }
+}
 
 /// Which of the four spaces one runtime identity's payload lives in, read
 /// from the identity's own top three bits.
@@ -89,6 +136,11 @@ pub(crate) const UNMOUNTED_ORDINAL: u32 = MOUNT_ORDINAL_LIMIT - 1;
 /// and `SelectedResolutionContextSet` asserts at attachment that nothing it
 /// carries lands in the operation's half.
 pub(crate) const CONTEXT_OPERATION_BASE: u64 = 1 << 60;
+
+// Fixture aliases occupy a separate test-only range so real query aliases
+// cannot accidentally claim their content in the demand-local registry.
+#[cfg(any(test, feature = "test-support"))]
+pub(super) const FIXTURE_OPERATION_BASE: u64 = 1 << 59;
 
 macro_rules! numeric_id {
     ($name:ident) => {
@@ -217,19 +269,7 @@ macro_rules! numeric_id {
             /// `b"alpha"` stays readable where a bare counter would not.
             #[cfg(any(test, feature = "test-support"))]
             pub(crate) fn for_test(label: impl AsRef<[u8]>) -> Self {
-                Self::operation_local(test_label_number(label.as_ref()))
-            }
-
-            /// This identity's own bytes, big-endian.
-            ///
-            /// It is eight bytes now rather than thirty-two, and it is still
-            /// the whole of the identity: a hash that used to mix in a digest
-            /// mixes in the number that replaced it, and a reason built from
-            /// one identity is as distinct from another's as the identities
-            /// are. Nothing decodes these bytes; the accessors above are how
-            /// an identity is read.
-            pub(crate) const fn as_bytes(self) -> [u8; 8] {
-                self.0.to_be_bytes()
+                Self::operation_local(FIXTURE_OPERATION_BASE | test_label_number(label.as_ref()))
             }
         }
 
@@ -270,11 +310,15 @@ macro_rules! numeric_id {
 /// fixture wants, and a fixture that needs two distinct values writes two
 /// labels.
 #[cfg(any(test, feature = "test-support"))]
-fn test_label_number(label: &[u8]) -> u64 {
+fn test_label_table() -> &'static std::sync::Mutex<HashMap<Vec<u8>, u64>> {
     static LABELS: std::sync::OnceLock<std::sync::Mutex<HashMap<Vec<u8>, u64>>> =
         std::sync::OnceLock::new();
-    let mut labels = LABELS
-        .get_or_init(|| std::sync::Mutex::new(HashMap::default()))
+    LABELS.get_or_init(|| std::sync::Mutex::new(HashMap::default()))
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn test_label_number(label: &[u8]) -> u64 {
+    let mut labels = test_label_table()
         .lock()
         .expect("the fixture label table is not poisoned");
     let next =
@@ -282,10 +326,29 @@ fn test_label_number(label: &[u8]) -> u64 {
     *labels.entry(label.to_vec()).or_insert(next)
 }
 
+#[cfg(any(test, feature = "test-support"))]
+pub(super) fn fixture_label_digest(number: u64) -> Option<[u8; 32]> {
+    let labels = test_label_table()
+        .lock()
+        .expect("the fixture label table is not poisoned");
+    let (label, _) = labels.iter().find(|(_, value)| **value == number)?;
+    Some(
+        brokk_bifrost_core::analyzer::canonical_hash::hash_domain_bytes(
+            b"bifrost-resolution-fixture-label:v1",
+            label,
+        ),
+    )
+}
+
 numeric_id!(BindingNodeId);
 numeric_id!(PartialPathId);
 numeric_id!(SemanticId);
 numeric_id!(StackVariableId);
+
+#[cfg(any(test, feature = "test-support"))]
+pub(super) fn fixture_number_label(number: u64) -> [u8; 8] {
+    number.to_be_bytes()
+}
 
 /// One derivation key: the canonical digest of how a value was derived.
 ///
@@ -364,12 +427,6 @@ impl BindingFragmentId {
 
     pub(crate) const fn ordinal(self) -> u32 {
         self.0
-    }
-
-    /// This fragment's own bytes, big-endian. A hash that used to mix in the
-    /// mount's content digest mixes in its ordinal now.
-    pub(crate) const fn as_bytes(self) -> [u8; 4] {
-        self.0.to_be_bytes()
     }
 }
 
@@ -456,6 +513,12 @@ impl BindingNodeId {
 }
 
 impl SemanticId {
+    /// Whether this operation identity was minted by the selected operation
+    /// rather than by a selected context.
+    pub(crate) fn is_operation_local(self) -> bool {
+        self.operation_local_number().is_some() && !self.is_context_local()
+    }
+
     /// One shared name as the runtime semantic every mount meets it by.
     pub(crate) fn shared_name(id: SharedNameId) -> Self {
         Self::of_kind(ResolutionIdentityKind::Shared, u64::from(id.get()))
@@ -522,23 +585,42 @@ impl AlphaRenaming {
     }
 }
 
-/// Source-declared effective namespaces for one Go lexical definition.
-/// This nonzero scalar is present only for an eligible lexical binder; it is
-/// not inferred from a declaration's primary namespace or its syntax kind.
+/// Effective namespaces for one Go definition, plus whether a structured Go
+/// member relation identifies it as a field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct GoDefinitionNamespaces(u8);
+pub struct GoDefinitionNamespaces {
+    bits: u8,
+    go_field: bool,
+}
 
 impl GoDefinitionNamespaces {
+    /// Go struct fields are values but do not shadow lexical type names.
+    pub(crate) const GO_FIELD_VALUE: Self = Self {
+        bits: 2,
+        go_field: true,
+    };
+
     pub const fn from_bits(bits: u8) -> Self {
         assert!(
             bits > 0 && bits <= 15,
             "Go lexical namespaces use Type=1, Value=2, Callable=4, Package=8"
         );
-        Self(bits)
+        Self {
+            bits,
+            go_field: false,
+        }
     }
 
     pub const fn bits(self) -> u8 {
-        self.0
+        self.bits
+    }
+
+    pub const fn includes_package(self) -> bool {
+        self.bits & 8 != 0
+    }
+
+    pub(crate) const fn is_go_field(self) -> bool {
+        self.go_field
     }
 
     pub(crate) fn admits(
@@ -561,7 +643,7 @@ impl GoDefinitionNamespaces {
             }
             _ => panic!("unsupported Go spelling namespace: {namespace:?}"),
         };
-        self.0 & requested != 0
+        self.bits & requested != 0
     }
 }
 
@@ -572,6 +654,43 @@ impl GoDefinitionNamespaces {
 pub enum BindingCandidateAdmission {
     Target,
     WrongNamespaceBlocker,
+}
+
+/// Namespace admission shared by the full engine and keyed lexical shortcuts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GoBindingClassification {
+    Admitted(BindingCandidateAdmission),
+    Ignored,
+    MissingAuthority,
+}
+
+pub(crate) fn classify_go_binding(
+    requested: Option<brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace>,
+    package_qualifier: bool,
+    namespaces: Option<GoDefinitionNamespaces>,
+) -> GoBindingClassification {
+    use brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace;
+    assert!(!package_qualifier || requested == Some(ResolutionNamespace::TypeOrValue));
+    if namespaces.is_some_and(GoDefinitionNamespaces::is_go_field)
+        && !matches!(
+            requested,
+            None | Some(ResolutionNamespace::Value)
+                | Some(ResolutionNamespace::TypeOrValue) if !package_qualifier
+        )
+    {
+        return GoBindingClassification::Ignored;
+    }
+    let admission = match requested {
+        None => BindingCandidateAdmission::Target,
+        Some(requested) => match namespaces {
+            Some(namespaces) if namespaces.admits(requested, package_qualifier) => {
+                BindingCandidateAdmission::Target
+            }
+            Some(_) => BindingCandidateAdmission::WrongNamespaceBlocker,
+            None => return GoBindingClassification::MissingAuthority,
+        },
+    };
+    GoBindingClassification::Admitted(admission)
 }
 
 /// The stack effect or semantic endpoint represented by one graph node.
@@ -850,16 +969,28 @@ impl<T: Clone> StackSubstitution<T> {
     }
 }
 
-fn clone_cells_with_poll<T, P, C>(
+fn apply_scope_stack_with_poll<P>(
+    substitution: &StackSubstitution<BindingNodeId>,
+    pattern: &ScopeStackPattern,
+    cancelled: &mut P,
+) -> Option<Result<ScopeStackPattern, StackUnificationError>>
+where
+    P: FnMut() -> bool,
+{
+    let mut clone_node = |node: &BindingNodeId, cancelled: &mut P| (!cancelled()).then_some(*node);
+    substitution.apply_with_poll(pattern, &mut clone_node, cancelled)
+}
+
+pub(super) fn clone_cells_with_poll<T, P, C>(
     values: &[T],
     clone_cell: &mut C,
     cancelled: &mut P,
 ) -> Option<Vec<T>>
 where
-    P: FnMut() -> bool,
+    P: FnMut() -> bool + ?Sized,
     C: FnMut(&T, &mut P) -> Option<T>,
 {
-    let mut cloned = Vec::new();
+    let mut cloned = Vec::with_capacity(values.len());
     for value in values {
         cloned.push(clone_cell(value, cancelled)?);
     }
@@ -901,15 +1032,8 @@ fn clone_scoped_symbol_with_poll<P>(
 where
     P: FnMut() -> bool,
 {
-    if cancelled() {
-        return None;
-    }
-    Some(PartialScopedSymbol {
-        symbol: symbol.symbol,
-        scopes: match &symbol.scopes {
-            Some(scopes) => Some(clone_scope_stack_with_poll(scopes, cancelled)?),
-            None => None,
-        },
+    transform_scoped_symbol_with_poll(symbol, cancelled, |scopes, cancelled| {
+        clone_scope_stack_with_poll(scopes, cancelled)
     })
 }
 
@@ -921,15 +1045,27 @@ fn alpha_rename_scoped_symbol_with_poll<P>(
 where
     P: FnMut() -> bool,
 {
+    transform_scoped_symbol_with_poll(symbol, cancelled, |scopes, cancelled| {
+        alpha_rename_scope_stack_with_poll(scopes, renaming, cancelled)
+    })
+}
+
+fn transform_scoped_symbol_with_poll<P, F>(
+    symbol: &PartialScopedSymbol,
+    cancelled: &mut P,
+    transform_scopes: F,
+) -> Option<PartialScopedSymbol>
+where
+    P: FnMut() -> bool,
+    F: FnOnce(&ScopeStackPattern, &mut P) -> Option<ScopeStackPattern>,
+{
     if cancelled() {
         return None;
     }
     Some(PartialScopedSymbol {
         symbol: symbol.symbol,
         scopes: match &symbol.scopes {
-            Some(scopes) => Some(alpha_rename_scope_stack_with_poll(
-                scopes, renaming, cancelled,
-            )?),
+            Some(scopes) => Some(transform_scopes(scopes, cancelled)?),
             None => None,
         },
     })
@@ -943,15 +1079,12 @@ fn alpha_rename_symbol_stack_with_poll<P>(
 where
     P: FnMut() -> bool,
 {
-    // The fixed cells are renamed one at a time rather than through
-    // `clone_cells_with_poll`, because each one needs the renaming, which is
-    // `&mut` and cannot be captured by the shared closure that helper takes.
-    let mut fixed = Vec::with_capacity(pattern.fixed.len());
-    for symbol in &pattern.fixed {
-        fixed.push(alpha_rename_scoped_symbol_with_poll(
-            symbol, renaming, cancelled,
-        )?);
-    }
+    let fixed = {
+        let mut rename_symbol = |symbol: &PartialScopedSymbol, cancelled: &mut P| {
+            alpha_rename_scoped_symbol_with_poll(symbol, renaming, cancelled)
+        };
+        clone_cells_with_poll(&pattern.fixed, &mut rename_symbol, cancelled)?
+    };
     if cancelled() {
         return None;
     }
@@ -1000,14 +1133,10 @@ where
             return None;
         }
         let substituted_scopes = match &symbol.scopes {
-            Some(pattern) => {
-                let mut clone_node =
-                    |node: &BindingNodeId, cancelled: &mut P| (!cancelled()).then_some(*node);
-                match scopes.apply_with_poll(pattern, &mut clone_node, cancelled)? {
-                    Ok(scopes) => Some(scopes),
-                    Err(error) => return Some(Err(error)),
-                }
-            }
+            Some(pattern) => match apply_scope_stack_with_poll(scopes, pattern, cancelled)? {
+                Ok(scopes) => Some(scopes),
+                Err(error) => return Some(Err(error)),
+            },
             None => None,
         };
         fixed.push(PartialScopedSymbol {
@@ -1016,6 +1145,52 @@ where
         });
     }
     Some(Ok(StackPattern::new(fixed, outer.tail)))
+}
+
+fn poll_symbol_stack_application_with_poll<P>(
+    pattern: &SymbolStackPattern,
+    cancelled: &mut P,
+) -> Option<()>
+where
+    P: FnMut() -> bool,
+{
+    // Preserve point-work accounting from the former empty-substitution
+    // application while keeping the stack borrowed and avoiding its temporary
+    // symbol and scope vectors.
+    for symbol in &pattern.fixed {
+        if cancelled() {
+            return None;
+        }
+        if let Some(scopes) = &symbol.scopes {
+            for _ in &scopes.fixed {
+                if cancelled() {
+                    return None;
+                }
+            }
+            if cancelled() {
+                return None;
+            }
+        }
+    }
+    if pattern.tail.is_some() && cancelled() {
+        return None;
+    }
+    for symbol in &pattern.fixed {
+        if cancelled() {
+            return None;
+        }
+        if let Some(scopes) = &symbol.scopes {
+            for _ in &scopes.fixed {
+                if cancelled() {
+                    return None;
+                }
+            }
+            if scopes.tail.is_some() && cancelled() {
+                return None;
+            }
+        }
+    }
+    Some(())
 }
 
 fn unify_symbol_stacks_with_poll<P>(
@@ -1028,14 +1203,12 @@ fn unify_symbol_stacks_with_poll<P>(
 where
     P: FnMut() -> bool,
 {
-    let left = match apply_symbol_stack_with_poll(symbols, scopes, left, cancelled)? {
-        Ok(left) => left,
-        Err(error) => return Some(Err(error)),
-    };
-    let right = match apply_symbol_stack_with_poll(symbols, scopes, right, cancelled)? {
-        Ok(right) => right,
-        Err(error) => return Some(Err(error)),
-    };
+    // This helper is only called with substitutions freshly created by
+    // `unify_middle_endpoints_with_poll`. Keep both input stacks borrowed until
+    // a variable tail actually has to be bound.
+    assert!(symbols.is_empty() && scopes.is_empty());
+    poll_symbol_stack_application_with_poll(left, cancelled)?;
+    poll_symbol_stack_application_with_poll(right, cancelled)?;
     let shared = left.fixed.len().min(right.fixed.len());
     for index in 0..shared {
         if cancelled() {
@@ -1167,6 +1340,10 @@ impl EndpointSignature {
         &self.symbols
     }
 
+    pub(crate) fn first_fixed_symbol(&self) -> Option<&PartialScopedSymbol> {
+        self.symbols.fixed().first()
+    }
+
     pub fn scopes(&self) -> &ScopeStackPattern {
         &self.scopes
     }
@@ -1197,22 +1374,24 @@ impl EndpointSignature {
         {
             return Some(false);
         }
-        for (left, right) in self.symbols.fixed.iter().zip(other.symbols.fixed.iter()) {
-            if cancelled() {
-                return None;
-            }
-            if left.symbol != right.symbol {
-                return Some(false);
-            }
-            match (left.scopes.as_ref(), right.scopes.as_ref()) {
-                (None, None) => {}
-                (Some(left), Some(right)) => {
-                    if !scope_patterns_equal_with_poll(left, right, cancelled)? {
-                        return Some(false);
-                    }
+        if !symbol_stack_cells_equal_with_poll(
+            &self.symbols.fixed,
+            &other.symbols.fixed,
+            cancelled,
+            |left, right, cancelled| {
+                if left.symbol != right.symbol {
+                    return Some(false);
                 }
-                (None, Some(_)) | (Some(_), None) => return Some(false),
-            }
+                match (left.scopes.as_ref(), right.scopes.as_ref()) {
+                    (None, None) => Some(true),
+                    (Some(left), Some(right)) => {
+                        scope_patterns_equal_with_poll(left, right, cancelled)
+                    }
+                    (None, Some(_)) | (Some(_), None) => Some(false),
+                }
+            },
+        )? {
+            return Some(false);
         }
         scope_patterns_equal_with_poll(&self.scopes, &other.scopes, cancelled)
     }
@@ -1227,16 +1406,17 @@ impl EndpointSignature {
     where
         P: FnMut() -> bool,
     {
-        let next = if next.holds_a_variable() {
+        let renamed_next = if next.holds_a_variable() {
             let mut renaming = AlphaRenaming {
                 next: self.operation_local_variable_ceiling(),
                 assigned: Vec::new(),
             };
-            next.alpha_renamed_with_poll(&mut renaming, cancelled)?
+            Some(next.alpha_renamed_with_poll(&mut renaming, cancelled)?)
         } else {
-            next.clone_with_poll(cancelled)?
+            None
         };
-        match unify_middle_endpoints_with_poll(self, &next, cancelled)? {
+        let next = renamed_next.as_ref().unwrap_or(next);
+        match unify_middle_endpoints_with_poll(self, next, cancelled)? {
             Ok(_) => Some(Ok(())),
             Err(error) => Some(Err(error)),
         }
@@ -1324,9 +1504,7 @@ impl EndpointSignature {
             Ok(symbols) => symbols,
             Err(error) => return Some(Err(error)),
         };
-        let mut clone_node =
-            |node: &BindingNodeId, cancelled: &mut P| (!cancelled()).then_some(*node);
-        let scopes = match scopes.apply_with_poll(&self.scopes, &mut clone_node, cancelled)? {
+        let scopes = match apply_scope_stack_with_poll(scopes, &self.scopes, cancelled)? {
             Ok(scopes) => scopes,
             Err(error) => return Some(Err(error)),
         };
@@ -1342,14 +1520,53 @@ fn scope_patterns_equal_with_poll<P>(
 where
     P: FnMut() -> bool,
 {
-    if left.tail != right.tail || left.fixed.len() != right.fixed.len() {
+    stack_patterns_equal_with_poll(&left.fixed, left.tail, &right.fixed, right.tail, cancelled)
+}
+
+fn stack_patterns_equal_with_poll<T, Tail, P>(
+    left_fixed: &[T],
+    left_tail: Option<Tail>,
+    right_fixed: &[T],
+    right_tail: Option<Tail>,
+    cancelled: &mut P,
+) -> Option<bool>
+where
+    T: PartialEq,
+    Tail: PartialEq,
+    P: FnMut() -> bool,
+{
+    if left_tail != right_tail || left_fixed.len() != right_fixed.len() {
         return Some(false);
     }
-    for (left, right) in left.fixed.iter().zip(right.fixed.iter()) {
+    for (left, right) in left_fixed.iter().zip(right_fixed.iter()) {
         if cancelled() {
             return None;
         }
         if left != right {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
+fn symbol_stack_cells_equal_with_poll<Left, Right, P, Equal>(
+    left: &[Left],
+    right: &[Right],
+    cancelled: &mut P,
+    mut equal: Equal,
+) -> Option<bool>
+where
+    P: FnMut() -> bool,
+    Equal: FnMut(&Left, &Right, &mut P) -> Option<bool>,
+{
+    if left.len() != right.len() {
+        return Some(false);
+    }
+    for (left, right) in left.iter().zip(right.iter()) {
+        if cancelled() {
+            return None;
+        }
+        if !equal(left, right, cancelled)? {
             return Some(false);
         }
     }
@@ -1562,6 +1779,30 @@ impl ResolutionCompletion {
             | (Self::Complete, Self::Incomplete(reasons)) => Self::Incomplete(reasons.clone()),
             (Self::Incomplete(left), Self::Incomplete(right)) => {
                 Self::Incomplete(left.union(right))
+            }
+        }
+    }
+
+    pub(crate) fn without_reasons_with_poll<P>(
+        &self,
+        reasons: &[ResolutionIncompleteReason],
+        cancelled: &mut P,
+    ) -> Option<Self>
+    where
+        P: FnMut() -> bool + ?Sized,
+    {
+        if cancelled() {
+            return None;
+        }
+        match self {
+            Self::Complete => Some(Self::Complete),
+            Self::Incomplete(current) => {
+                let filtered =
+                    current.without_reasons_with_poll(reasons.iter().copied(), cancelled)?;
+                if cancelled() {
+                    return None;
+                }
+                Some(filtered.map_or(Self::Complete, Self::Incomplete))
             }
         }
     }
@@ -1927,6 +2168,7 @@ impl TypeTransferRule {
 /// The value alternatives at one point where binding hands work to type flow.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TypedFrontierState {
+    unindexed_external: Box<[UnindexedExternalFrontier]>,
     slot: SemanticId,
     possible_values: Box<[ResolutionSlotValue]>,
     completion: ResolutionCompletion,
@@ -1943,9 +2185,25 @@ impl TypedFrontierState {
         possible_values.dedup();
         Self {
             slot,
+            unindexed_external: Box::new([]),
             possible_values: possible_values.into_boxed_slice(),
             completion,
         }
+    }
+
+    pub(crate) fn unindexed_external(&self) -> &[UnindexedExternalFrontier] {
+        &self.unindexed_external
+    }
+
+    pub(crate) fn with_unindexed_external(
+        mut self,
+        values: impl IntoIterator<Item = UnindexedExternalFrontier>,
+    ) -> Self {
+        let mut values = values.into_iter().collect::<Vec<_>>();
+        values.sort_unstable();
+        values.dedup();
+        self.unindexed_external = values.into_boxed_slice();
+        self
     }
 
     pub const fn slot(&self) -> SemanticId {
@@ -1990,18 +2248,83 @@ impl TypedFrontierState {
         Some(Self {
             slot,
             possible_values,
+            unindexed_external: Box::new([]),
             completion,
         })
     }
 }
 
-/// Stable evidence for one selected or rejected semantic candidate.
+/// A request-local external frontier with no authoritative package clause or
+/// nominal type. A member lookup is a structured recipe, not an inventory row.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct UnindexedExternalFrontier {
+    pub(crate) provider_path: std::sync::Arc<str>,
+    /// A nameless provider row is evidence, not package-name authority.
+    pub(crate) provider_package_id: Option<i64>,
+    pub(crate) member: Option<(BindingFragmentId, SemanticId)>,
+}
+
+/// A selection's rejected routes are shared by its candidate witnesses so a
+/// refinement can remove a candidate without losing operation-local evidence.
+pub(crate) type NativeDefeatedImports =
+    std::sync::Arc<[(SemanticId, PrecedenceTier, Box<[SemanticId]>)]>;
+
+/// Trace evidence owned by one native selection operation. This is never
+/// serialized into a fragment or retained independently of its answer.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct NativeSelectionProvenance {
+    pub(crate) tier: Option<PrecedenceTier>,
+    pub(crate) import_route: Option<Box<(SemanticId, Box<[SemanticId]>)>>,
+    /// An ordered-out root route is still an import binder, not a declaration.
+    pub(crate) defeated_imports: NativeDefeatedImports,
+    pub(crate) rejection_coverage: bool,
+}
+
+/// Stable evidence for one selected or rejected semantic candidate.
+/// Query-only trace annotations do not participate in semantic identity.
+#[derive(Debug, Clone)]
 pub struct ResolutionWitness {
     reference: SemanticId,
     target: SemanticId,
     steps: Box<[WitnessStep]>,
     completion: ResolutionCompletion,
+    native_provenance: Option<Box<NativeSelectionProvenance>>,
+}
+
+impl PartialEq for ResolutionWitness {
+    fn eq(&self, other: &Self) -> bool {
+        self.reference == other.reference
+            && self.target == other.target
+            && self.steps == other.steps
+            && self.completion == other.completion
+    }
+}
+
+impl Eq for ResolutionWitness {}
+
+impl Ord for ResolutionWitness {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.reference
+            .cmp(&other.reference)
+            .then_with(|| self.target.cmp(&other.target))
+            .then_with(|| self.steps.cmp(&other.steps))
+            .then_with(|| self.completion.cmp(&other.completion))
+    }
+}
+
+impl PartialOrd for ResolutionWitness {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl std::hash::Hash for ResolutionWitness {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.reference.hash(state);
+        self.target.hash(state);
+        self.steps.hash(state);
+        self.completion.hash(state);
+    }
 }
 
 impl ResolutionWitness {
@@ -2016,7 +2339,20 @@ impl ResolutionWitness {
             target,
             steps: steps.into(),
             completion,
+            native_provenance: None,
         }
+    }
+
+    pub(crate) fn native_provenance(&self) -> Option<&NativeSelectionProvenance> {
+        self.native_provenance.as_deref()
+    }
+
+    pub(crate) fn with_native_provenance(
+        mut self,
+        provenance: Option<Box<NativeSelectionProvenance>>,
+    ) -> Self {
+        self.native_provenance = provenance;
+        self
     }
 
     pub const fn reference(&self) -> SemanticId {
@@ -2031,6 +2367,16 @@ impl ResolutionWitness {
         &self.steps
     }
 
+    /// The final outcome for this witness's target, excluding prefix lookups.
+    pub(crate) fn candidate_outcome(&self) -> Option<CandidateOutcome> {
+        self.steps.iter().rev().find_map(|step| match step {
+            WitnessStep::Candidate { semantic, outcome } if *semantic == self.target => {
+                Some(*outcome)
+            }
+            _ => None,
+        })
+    }
+
     pub fn completion(&self) -> &ResolutionCompletion {
         &self.completion
     }
@@ -2042,8 +2388,15 @@ impl ResolutionWitness {
         SemanticId,
         Box<[WitnessStep]>,
         ResolutionCompletion,
+        Option<Box<NativeSelectionProvenance>>,
     ) {
-        (self.reference, self.target, self.steps, self.completion)
+        (
+            self.reference,
+            self.target,
+            self.steps,
+            self.completion,
+            self.native_provenance,
+        )
     }
 }
 
@@ -2102,8 +2455,21 @@ impl ResolutionAnswer {
         } = self;
         let mut bytes =
             size_of_val(self) + size_of_val(targets.as_ref()) + size_of_val(witnesses.as_ref());
+        let mut charged_imports = HashSet::default();
         for witness in witnesses {
             bytes += size_of_val(witness.steps());
+            if let Some(provenance) = witness.native_provenance() {
+                bytes += size_of_val(provenance);
+                if let Some(route) = &provenance.import_route {
+                    bytes += size_of_val(route.as_ref()) + size_of_val(route.1.as_ref());
+                }
+                if charged_imports.insert(std::sync::Arc::as_ptr(&provenance.defeated_imports)) {
+                    bytes += size_of_val(provenance.defeated_imports.as_ref());
+                    for (_, _, route) in provenance.defeated_imports.iter() {
+                        bytes += size_of_val(route.as_ref());
+                    }
+                }
+            }
         }
         if let Some(decision) = lookup_decision {
             bytes += size_of_val(decision.as_ref());
@@ -2198,12 +2564,15 @@ impl ResolutionAnswer {
             if cancelled() {
                 return None;
             }
-            witnesses.push(ResolutionWitness::new(
-                witness.reference(),
-                witness.target(),
-                clone_copy_slice_with_poll(witness.steps(), cancelled)?,
-                clone_completion_with_poll(witness.completion(), cancelled)?,
-            ));
+            witnesses.push(
+                ResolutionWitness::new(
+                    witness.reference(),
+                    witness.target(),
+                    clone_copy_slice_with_poll(witness.steps(), cancelled)?,
+                    clone_completion_with_poll(witness.completion(), cancelled)?,
+                )
+                .with_native_provenance(witness.native_provenance.clone()),
+            );
         }
         let lookup_decision = match &self.lookup_decision {
             Some(decision) => {
@@ -2257,7 +2626,7 @@ pub(crate) struct StackEffectAlphaKey {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct AlphaEndpointKey {
+pub(super) struct AlphaEndpointKey {
     node: BindingNodeId,
     symbols: AlphaSymbolStackKey,
     scopes: AlphaStackKey<BindingNodeId>,
@@ -2300,16 +2669,6 @@ impl StackEffectAlphaKey {
             alpha_endpoints_equal_with_poll(&self.start, &other.start, cancelled)?
                 && alpha_endpoints_equal_with_poll(&self.end, &other.end, cancelled)?,
         )
-    }
-
-    pub(crate) fn canonical_digest_with_poll<P>(&self, cancelled: &mut P) -> Option<[u8; 32]>
-    where
-        P: FnMut() -> bool,
-    {
-        let mut hasher = CanonicalHasher::new(b"bifrost-resolution-stack-effect-alpha-key:v1");
-        hash_alpha_endpoint_with_poll(&mut hasher, b"start", &self.start, cancelled)?;
-        hash_alpha_endpoint_with_poll(&mut hasher, b"end", &self.end, cancelled)?;
-        Some(hasher.finish())
     }
 }
 
@@ -2370,22 +2729,24 @@ where
     {
         return Some(false);
     }
-    for (left, right) in left.symbols.fixed.iter().zip(right.symbols.fixed.iter()) {
-        if cancelled() {
-            return None;
-        }
-        if left.symbol != right.symbol {
-            return Some(false);
-        }
-        match (left.scopes.as_ref(), right.scopes.as_ref()) {
-            (None, None) => {}
-            (Some(left), Some(right)) => {
-                if !alpha_scope_stacks_equal_with_poll(left, right, cancelled)? {
-                    return Some(false);
-                }
+    if !symbol_stack_cells_equal_with_poll(
+        &left.symbols.fixed,
+        &right.symbols.fixed,
+        cancelled,
+        |left, right, cancelled| {
+            if left.symbol != right.symbol {
+                return Some(false);
             }
-            (None, Some(_)) | (Some(_), None) => return Some(false),
-        }
+            match (left.scopes.as_ref(), right.scopes.as_ref()) {
+                (None, None) => Some(true),
+                (Some(left), Some(right)) => {
+                    alpha_scope_stacks_equal_with_poll(left, right, cancelled)
+                }
+                (None, Some(_)) | (Some(_), None) => Some(false),
+            }
+        },
+    )? {
+        return Some(false);
     }
     alpha_scope_stacks_equal_with_poll(&left.scopes, &right.scopes, cancelled)
 }
@@ -2398,76 +2759,19 @@ fn alpha_scope_stacks_equal_with_poll<P>(
 where
     P: FnMut() -> bool,
 {
-    if left.tail != right.tail || left.fixed.len() != right.fixed.len() {
-        return Some(false);
-    }
-    for (left, right) in left.fixed.iter().zip(right.fixed.iter()) {
-        if cancelled() {
-            return None;
-        }
-        if left != right {
-            return Some(false);
-        }
-    }
-    Some(true)
+    stack_patterns_equal_with_poll(&left.fixed, left.tail, &right.fixed, right.tail, cancelled)
 }
 
-fn hash_alpha_endpoint_with_poll<P>(
-    hasher: &mut CanonicalHasher,
-    label: &[u8],
-    endpoint: &AlphaEndpointKey,
+/// An operation-local endpoint key. Binder ordinals describe relationships
+/// within this structure, rather than the allocator's runtime numbers.
+pub(super) fn endpoint_alpha_key_with_poll<P>(
+    endpoint: &EndpointSignature,
     cancelled: &mut P,
-) -> Option<()>
+) -> Option<AlphaEndpointKey>
 where
     P: FnMut() -> bool,
 {
-    hasher.value(label);
-    hasher.value(&endpoint.node.as_bytes());
-    hasher.value(&(endpoint.symbols.fixed.len() as u64).to_le_bytes());
-    hash_optional_ordinal(hasher, endpoint.symbols.tail);
-    for symbol in endpoint.symbols.fixed.iter() {
-        if cancelled() {
-            return None;
-        }
-        hasher.value(&symbol.symbol.as_bytes());
-        match symbol.scopes.as_ref() {
-            Some(scopes) => {
-                hasher.value(b"scoped");
-                hash_alpha_scope_stack_with_poll(hasher, scopes, cancelled)?;
-            }
-            None => hasher.value(b"unscoped"),
-        }
-    }
-    hash_alpha_scope_stack_with_poll(hasher, &endpoint.scopes, cancelled)
-}
-
-fn hash_alpha_scope_stack_with_poll<P>(
-    hasher: &mut CanonicalHasher,
-    stack: &AlphaStackKey<BindingNodeId>,
-    cancelled: &mut P,
-) -> Option<()>
-where
-    P: FnMut() -> bool,
-{
-    hasher.value(&(stack.fixed.len() as u64).to_le_bytes());
-    hash_optional_ordinal(hasher, stack.tail);
-    for node in stack.fixed.iter() {
-        if cancelled() {
-            return None;
-        }
-        hasher.value(&node.as_bytes());
-    }
-    Some(())
-}
-
-fn hash_optional_ordinal(hasher: &mut CanonicalHasher, ordinal: Option<u32>) {
-    match ordinal {
-        Some(ordinal) => {
-            hasher.value(b"some");
-            hasher.value(&ordinal.to_le_bytes());
-        }
-        None => hasher.value(b"none"),
-    }
+    AlphaNormalizer::default().endpoint_with_poll(endpoint, cancelled)
 }
 
 #[derive(Default)]
@@ -2478,13 +2782,11 @@ struct AlphaNormalizer {
 
 impl AlphaNormalizer {
     fn symbol_variable(&mut self, variable: StackVariableId) -> u32 {
-        let next = self.symbol_variables.len() as u32;
-        *self.symbol_variables.entry(variable).or_insert(next)
+        alpha_variable_ordinal(&mut self.symbol_variables, variable)
     }
 
     fn scope_variable(&mut self, variable: StackVariableId) -> u32 {
-        let next = self.scope_variables.len() as u32;
-        *self.scope_variables.entry(variable).or_insert(next)
+        alpha_variable_ordinal(&mut self.scope_variables, variable)
     }
 
     fn scope_stack_with_poll<P>(
@@ -2544,6 +2846,14 @@ impl AlphaNormalizer {
     }
 }
 
+fn alpha_variable_ordinal(
+    variables: &mut HashMap<StackVariableId, u32>,
+    variable: StackVariableId,
+) -> u32 {
+    let next = variables.len() as u32;
+    *variables.entry(variable).or_insert(next)
+}
+
 #[derive(Debug, Clone)]
 pub struct PartialPath {
     start: EndpointSignature,
@@ -2551,6 +2861,15 @@ pub struct PartialPath {
     precedence: Box<[PrecedenceStep]>,
     witness: Box<[WitnessStep]>,
     completion: ResolutionCompletion,
+    /// A root route head whose selected owner resolution continues later.
+    owner_continued: bool,
+    /// The source position at which a positional root import (Scala) takes
+    /// effect, ordering that import among its blob's other root imports. None
+    /// for an import in effect across its whole scope, and for every path that
+    /// is not a root import's own row: a composed path is not that row.
+    root_import_activation: Option<u32>,
+    // Runtime bridge provenance is not persisted and never changes path identity.
+    native_import: Option<Box<(SemanticId, Box<[SemanticId]>)>>,
     /// A number past every operation-local variable the two endpoints hold,
     /// which is where a renaming composing against this path starts.
     ///
@@ -2581,6 +2900,9 @@ impl PartialEq for PartialPath {
             precedence,
             witness,
             completion,
+            owner_continued,
+            root_import_activation,
+            native_import: _,
             variable_ceiling: _,
         } = self;
         *start == other.start
@@ -2588,6 +2910,8 @@ impl PartialEq for PartialPath {
             && *precedence == other.precedence
             && *witness == other.witness
             && *completion == other.completion
+            && *owner_continued == other.owner_continued
+            && *root_import_activation == other.root_import_activation
     }
 }
 
@@ -2601,6 +2925,9 @@ impl std::hash::Hash for PartialPath {
             precedence,
             witness,
             completion,
+            owner_continued,
+            root_import_activation,
+            native_import: _,
             variable_ceiling: _,
         } = self;
         start.hash(state);
@@ -2608,24 +2935,43 @@ impl std::hash::Hash for PartialPath {
         precedence.hash(state);
         witness.hash(state);
         completion.hash(state);
+        owner_continued.hash(state);
+        root_import_activation.hash(state);
     }
 }
 
-fn clone_copy_slice_with_poll<T: Copy, P>(values: &[T], cancelled: &mut P) -> Option<Vec<T>>
+fn extend_copy_slice_with_poll<T: Copy, P>(
+    output: &mut Vec<T>,
+    values: &[T],
+    cancelled: &mut P,
+) -> Option<()>
 where
     P: FnMut() -> bool,
 {
     if cancelled() {
         return None;
     }
-    let mut cloned = Vec::with_capacity(values.len());
-    for &value in values {
+    for _ in values {
         if cancelled() {
             return None;
         }
-        cloned.push(value);
     }
-    Some(cloned)
+    output.extend_from_slice(values);
+    Some(())
+}
+
+fn clone_copy_slice_with_poll<T: Copy, P>(values: &[T], cancelled: &mut P) -> Option<Vec<T>>
+where
+    P: FnMut() -> bool,
+{
+    clone_cells_with_poll(values, &mut copy_cell_with_poll::<T, P>, cancelled)
+}
+
+pub(super) fn copy_cell_with_poll<T: Copy, P>(value: &T, cancelled: &mut P) -> Option<T>
+where
+    P: FnMut() -> bool + ?Sized,
+{
+    (!cancelled()).then_some(*value)
 }
 
 pub(crate) fn clone_completion_with_poll<P>(
@@ -2757,6 +3103,9 @@ impl PartialPath {
             precedence,
             witness,
             completion,
+            owner_continued: false,
+            root_import_activation: None,
+            native_import: None,
             variable_ceiling,
         }
     }
@@ -2781,21 +3130,111 @@ impl PartialPath {
         &self.completion
     }
 
+    pub const fn owner_continued(&self) -> bool {
+        self.owner_continued
+    }
+
+    pub(crate) fn native_import(&self) -> Option<&(SemanticId, Box<[SemanticId]>)> {
+        self.native_import.as_deref()
+    }
+
+    /// Interpret the already-ranked path; origin-rank markers are not trace tiers.
+    pub(crate) fn native_trace_tier(&self) -> Option<PrecedenceTier> {
+        self.precedence()
+            .iter()
+            .find(|step| {
+                matches!(
+                    step.tier,
+                    PrecedenceTier::ExplicitImport
+                        | PrecedenceTier::WildcardImport
+                        | PrecedenceTier::DefaultImport
+                        | PrecedenceTier::OtherCompilationUnitPackage
+                )
+            })
+            .or_else(|| {
+                self.precedence()
+                    .iter()
+                    .find(|step| step.tier != PrecedenceTier::CandidateOriginRank)
+            })
+            .map(|step| step.tier)
+    }
+
+    /// An expanded import bridge retains its exact source token and recipe. Before
+    /// expansion, a root endpoint carries the anchor, route, import token and demand.
+    /// Projection verifies the token's persisted provenance before emitting a binder;
+    /// neither shape is treated as a declaration.
+    pub(crate) fn native_import_route(&self) -> Option<(SemanticId, Box<[SemanticId]>)> {
+        if !matches!(
+            self.native_trace_tier(),
+            Some(PrecedenceTier::ExplicitImport | PrecedenceTier::WildcardImport)
+        ) {
+            return None;
+        }
+        if let Some(route) = self.native_import() {
+            return Some(route.clone());
+        }
+        let end = self.end();
+        let symbols = end.symbols().fixed();
+        if end.node() != BindingNodeId::universal_root()
+            || symbols.len() < 3
+            || symbols.iter().any(|symbol| symbol.scopes().is_some())
+        {
+            return None;
+        }
+        Some((
+            symbols[symbols.len() - 2].symbol(),
+            symbols[1..symbols.len() - 2]
+                .iter()
+                .chain(std::iter::once(&symbols[symbols.len() - 1]))
+                .map(|symbol| symbol.symbol())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        ))
+    }
+
+    pub(crate) fn with_native_import(
+        mut self,
+        provenance: Option<Box<(SemanticId, Box<[SemanticId]>)>>,
+    ) -> Self {
+        self.native_import = provenance;
+        self
+    }
+
+    pub(crate) const fn root_import_activation(&self) -> Option<u32> {
+        self.root_import_activation
+    }
+
+    pub(crate) fn with_root_import_activation(mut self, activation: Option<u32>) -> Self {
+        self.root_import_activation = activation;
+        self
+    }
+
+    pub(crate) fn with_owner_continued(mut self) -> Self {
+        self.owner_continued = true;
+        self
+    }
+
     /// The path without the reasons the selected stage proved closed
     /// (`temp.selected_resolution_stage_closed_reasons`). A persisted path
     /// carries every gap reason on its way, and a closed reason must leave the
     /// path the way it leaves a candidate completion.
-    pub(crate) fn without_closed_reasons(mut self, closed: &[ResolutionIncompleteReason]) -> Self {
-        if let ResolutionCompletion::Incomplete(reasons) = &self.completion {
-            self.completion = reasons
-                .without_reasons_with_poll(closed.iter().copied(), &mut || false)
-                .expect("a never-cancelled poll finishes")
-                .map_or(
-                    ResolutionCompletion::Complete,
-                    ResolutionCompletion::Incomplete,
-                );
-        }
-        self
+    pub(crate) fn without_closed_reasons(self, closed: &[ResolutionIncompleteReason]) -> Self {
+        self.without_reasons_with_poll(closed, &mut || false)
+            .expect("a never-cancelled poll finishes")
+    }
+
+    pub(crate) fn without_reasons_with_poll<P>(
+        mut self,
+        reasons: &[ResolutionIncompleteReason],
+        cancelled: &mut P,
+    ) -> Option<Self>
+    where
+        P: FnMut() -> bool + ?Sized,
+    {
+        self.completion = self
+            .completion
+            .without_reasons_with_poll(reasons, cancelled)?;
+        Some(self)
     }
 
     pub(crate) fn with_additional_completion(mut self, completion: &ResolutionCompletion) -> Self {
@@ -2843,6 +3282,8 @@ impl PartialPath {
             || !self.end.equals_with_poll(&other.end, cancelled)?
             || self.precedence.len() != other.precedence.len()
             || self.witness.len() != other.witness.len()
+            || self.owner_continued != other.owner_continued
+            || self.root_import_activation != other.root_import_activation
         {
             return Some(false);
         }
@@ -2913,6 +3354,9 @@ impl PartialPath {
             precedence: clone_copy_slice_with_poll(&self.precedence, cancelled)?.into_boxed_slice(),
             witness: clone_copy_slice_with_poll(&self.witness, cancelled)?.into_boxed_slice(),
             completion: clone_completion_with_poll(&self.completion, cancelled)?,
+            owner_continued: self.owner_continued,
+            root_import_activation: self.root_import_activation,
+            native_import: self.native_import.clone(),
             variable_ceiling: self.variable_ceiling,
         })
     }
@@ -2955,6 +3399,9 @@ impl PartialPath {
             precedence: clone_copy_slice_with_poll(&self.precedence, cancelled)?.into_boxed_slice(),
             witness: clone_copy_slice_with_poll(&self.witness, cancelled)?.into_boxed_slice(),
             completion: clone_completion_with_poll(&self.completion, cancelled)?,
+            owner_continued: self.owner_continued,
+            root_import_activation: self.root_import_activation,
+            native_import: self.native_import.clone(),
             // Every variable the rename touched came from this one renaming,
             // so its next number is the ceiling of what it produced.
             variable_ceiling: renaming.next,
@@ -2979,14 +3426,25 @@ impl PartialPath {
         if cancelled() {
             return None;
         }
-        let next = if next.holds_a_variable() {
+        let (renamed_next, next_ceiling) = if next.holds_a_variable() {
             let mut renaming = AlphaRenaming::after(self);
-            next.alpha_renamed_with_poll(&mut renaming, cancelled)?
+            let start = next
+                .start
+                .alpha_renamed_with_poll(&mut renaming, cancelled)?;
+            let end = next.end.alpha_renamed_with_poll(&mut renaming, cancelled)?;
+            (Some((start, end)), renaming.next)
         } else {
-            next.clone_with_poll(cancelled)?
+            (None, next.variable_ceiling)
         };
+        // Only endpoints contain stack variables. Keep the path evidence
+        // borrowed while composing; cloning it during renaming would duplicate
+        // the copy into the result below.
+        let next_start = renamed_next
+            .as_ref()
+            .map_or(&next.start, |(start, _)| start);
+        let next_end = renamed_next.as_ref().map_or(&next.end, |(_, end)| end);
         let (symbols, scopes) =
-            match unify_middle_endpoints_with_poll(&self.end, &next.start, cancelled)? {
+            match unify_middle_endpoints_with_poll(&self.end, next_start, cancelled)? {
                 Ok(substitutions) => substitutions,
                 Err(error) => return Some(Err(error)),
             };
@@ -2998,22 +3456,33 @@ impl PartialPath {
             Ok(start) => start,
             Err(error) => return Some(Err(PathCompositionError::Substitution(error))),
         };
-        let end = match next
-            .end
-            .substituted_with_poll(&symbols, &scopes, cancelled)?
-        {
+        let end = match next_end.substituted_with_poll(&symbols, &scopes, cancelled)? {
             Ok(end) => end,
             Err(error) => return Some(Err(PathCompositionError::Substitution(error))),
         };
 
         let mut precedence = Vec::with_capacity(self.precedence.len() + next.precedence.len());
-        precedence.extend(clone_copy_slice_with_poll(&self.precedence, cancelled)?);
-        precedence.extend(clone_copy_slice_with_poll(&next.precedence, cancelled)?);
+        extend_copy_slice_with_poll(&mut precedence, &self.precedence, cancelled)?;
+        extend_copy_slice_with_poll(&mut precedence, &next.precedence, cancelled)?;
         let mut witness = Vec::with_capacity(self.witness.len() + next.witness.len());
-        witness.extend(clone_copy_slice_with_poll(&self.witness, cancelled)?);
-        witness.extend(clone_copy_slice_with_poll(&next.witness, cancelled)?);
+        extend_copy_slice_with_poll(&mut witness, &self.witness, cancelled)?;
+        extend_copy_slice_with_poll(&mut witness, &next.witness, cancelled)?;
         let completion =
             combine_completion_with_poll(&self.completion, &next.completion, cancelled)?;
+
+        // Context paths round-trip through query-local SQL without trace
+        // annotations. Retain the source import before its root stack is
+        // consumed by the bridge; no persisted format change is needed.
+        let native_import = self
+            .native_import
+            .as_ref()
+            .or(next.native_import.as_ref())
+            .cloned()
+            .or_else(|| {
+                crate::analyzer::usages::get_definition::trace::native_rejection_projection_active()
+                    .then(|| self.native_import_route().map(Box::new))
+                    .flatten()
+            });
 
         Some(Ok(Self {
             start,
@@ -3021,12 +3490,15 @@ impl PartialPath {
             precedence: precedence.into_boxed_slice(),
             witness: witness.into_boxed_slice(),
             completion,
+            owner_continued: self.owner_continued || next.owner_continued,
+            root_import_activation: None,
+            native_import,
             // Substitution replaces variables with stacks the two sides
             // already held and mints no operation-local number of its own, so
             // the higher of the two inputs' ceilings bounds the result. Taking
             // it rather than walking the result is what keeps a saturation
             // chain linear.
-            variable_ceiling: self.variable_ceiling.max(next.variable_ceiling),
+            variable_ceiling: self.variable_ceiling.max(next_ceiling),
         }))
     }
 }
@@ -3083,8 +3555,11 @@ pub(crate) fn completion_values_equal_with_poll<P>(
     cancelled: &mut P,
 ) -> Option<bool>
 where
-    P: FnMut() -> bool,
+    P: FnMut() -> bool + ?Sized,
 {
+    if cancelled() {
+        return None;
+    }
     match (left, right) {
         (ResolutionCompletion::Complete, ResolutionCompletion::Complete) => Some(true),
         (ResolutionCompletion::Incomplete(left), ResolutionCompletion::Incomplete(right)) => {
@@ -3095,14 +3570,17 @@ where
     }
 }
 
-fn first_occurrences_with_poll<T: Copy + Eq + std::hash::Hash, P>(
+/// Preserve order while deleting later copies of an identical observation.
+/// Canonicalizing before or after appending another trace gives the same
+/// result, and an identical precedence comparison cannot change shadowing.
+pub(super) fn first_occurrences_with_poll<T: Copy + Eq + std::hash::Hash, P>(
     values: &[T],
     cancelled: &mut P,
 ) -> Option<Box<[T]>>
 where
     P: FnMut() -> bool,
 {
-    let mut seen = HashSet::default();
+    let mut seen = set_with_capacity(values.len());
     let mut first = Vec::with_capacity(values.len());
     for &value in values {
         if cancelled() {
@@ -3144,17 +3622,11 @@ impl std::error::Error for PathCompositionError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn semantic(value: &str) -> SemanticId {
-        SemanticId::for_test(value.as_bytes())
-    }
+    use crate::analyzer::resolution::test_support::{endpoint, node, semantic};
+    use brokk_bifrost_test_macros::hardwon;
 
     fn variable(value: &str) -> StackVariableId {
         StackVariableId::for_test(value.as_bytes())
-    }
-
-    fn node(value: &str) -> BindingNodeId {
-        BindingNodeId::for_test(value.as_bytes())
     }
 
     fn unify_patterns(
@@ -3192,19 +3664,26 @@ mod tests {
             .expect("live test alpha-key construction completes")
     }
 
-    fn endpoint(
-        node: BindingNodeId,
-        symbols: Vec<SemanticId>,
-        scopes: Vec<BindingNodeId>,
-    ) -> EndpointSignature {
-        EndpointSignature::new(
-            node,
-            StackPattern::closed(symbols),
-            StackPattern::closed(scopes),
-        )
+    #[test]
+    fn completion_equality_polls_before_the_complete_fast_path() {
+        let mut polls = 0;
+        let equal = completion_values_equal_with_poll(
+            &ResolutionCompletion::Complete,
+            &ResolutionCompletion::Complete,
+            &mut || {
+                polls += 1;
+                true
+            },
+        );
+
+        assert_eq!(equal, None);
+        assert_eq!(polls, 1);
     }
 
     #[test]
+    #[hardwon(
+        "81bb278c4b0f: canonical evidence accumulation lost shared bases or raw evidence normalization"
+    )]
     fn canonical_source_accumulator_preserves_shared_bases_and_normalizes_raw_evidence() {
         let first = ResolutionIncompleteReason::UnsupportedSemantic(SemanticId::for_test(b"first"));
         let second =
@@ -3394,61 +3873,6 @@ mod tests {
     }
 
     #[test]
-    fn polled_path_clone_preserves_every_nested_structure() {
-        let symbol_tail = variable("polled-clone-symbol-tail");
-        let attached_tail = variable("polled-clone-attached-tail");
-        let scope_tail = variable("polled-clone-scope-tail");
-        let path = PartialPath::new(
-            EndpointSignature::new_scoped(
-                node("polled-clone-start"),
-                StackPattern::open(
-                    vec![PartialScopedSymbol::scoped(
-                        semantic("polled-clone-symbol"),
-                        StackPattern::open(
-                            vec![node("polled-clone-captured-scope")],
-                            attached_tail,
-                        ),
-                    )],
-                    symbol_tail,
-                ),
-                StackPattern::open(vec![node("polled-clone-scope")], scope_tail),
-            ),
-            EndpointSignature::new(
-                node("polled-clone-end"),
-                StackPattern::open(vec![semantic("polled-clone-end-symbol")], symbol_tail),
-                StackPattern::open(Vec::new(), scope_tail),
-            ),
-            [PrecedenceStep {
-                tier: PrecedenceTier::OwnMember,
-                ordinal: 7,
-                semantic: semantic("polled-clone-precedence"),
-            }],
-            [
-                WitnessStep::Node(node("polled-clone-witness")),
-                WitnessStep::Candidate {
-                    semantic: semantic("polled-clone-target"),
-                    outcome: CandidateOutcome::Selected,
-                },
-            ],
-            ResolutionCompletion::incomplete([
-                ResolutionIncompleteReason::UnsupportedSemantic(semantic("polled-clone-gap-a")),
-                ResolutionIncompleteReason::UnsupportedSemantic(semantic("polled-clone-gap-b")),
-            ]),
-        );
-        let mut polls = 0_usize;
-
-        let cloned = path
-            .clone_with_poll(&mut || {
-                polls += 1;
-                false
-            })
-            .expect("an uncancelled structural clone completes");
-
-        assert_eq!(cloned, path);
-        assert!(polls > path.precedence().len() + path.witness().len());
-    }
-
-    #[test]
     fn concatenation_unifies_middle_stacks_and_preserves_evidence() {
         let tail = variable("tail");
         let scope_tail = variable("scope-tail");
@@ -3583,78 +4007,6 @@ mod tests {
     }
 
     #[test]
-    fn concatenation_preserves_the_public_two_empty_incomplete_panic() {
-        let seam = node("empty-incomplete-seam");
-        let empty = ResolutionCompletion::Incomplete(CompletionReasons::from(Vec::new()));
-        let left = PartialPath::new(
-            endpoint(node("empty-incomplete-left"), Vec::new(), Vec::new()),
-            endpoint(seam, Vec::new(), Vec::new()),
-            Vec::new(),
-            Vec::new(),
-            empty.clone(),
-        );
-        let right = PartialPath::new(
-            endpoint(seam, Vec::new(), Vec::new()),
-            endpoint(node("empty-incomplete-right"), Vec::new(), Vec::new()),
-            Vec::new(),
-            Vec::new(),
-            empty,
-        );
-
-        assert!(
-            std::panic::catch_unwind(|| {
-                let _ = left.concatenate(&right);
-            })
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn concatenation_rejects_different_endpoint_nodes() {
-        let endpoint = |name| {
-            EndpointSignature::new(
-                node(name),
-                StackPattern::closed(Vec::new()),
-                StackPattern::closed(Vec::new()),
-            )
-        };
-        let path = |start, end| {
-            PartialPath::new(
-                endpoint(start),
-                endpoint(end),
-                Vec::new(),
-                Vec::new(),
-                ResolutionCompletion::Complete,
-            )
-        };
-        let left = path("left-start", "left-end");
-        let right = path("right-start", "right-end");
-
-        assert_eq!(
-            left.concatenate(&right),
-            Err(PathCompositionError::EndpointMismatch {
-                left: node("left-end"),
-                right: node("right-start"),
-            })
-        );
-        assert_eq!(
-            left.concatenate_with_poll(&right, &mut || false,),
-            Some(Err(PathCompositionError::EndpointMismatch {
-                left: node("left-end"),
-                right: node("right-start"),
-            }))
-        );
-        assert_eq!(
-            left.end()
-                .can_concatenate_with_poll(right.start(), &mut || false,),
-            Some(Err(PathCompositionError::EndpointMismatch {
-                left: node("left-end"),
-                right: node("right-start"),
-            }))
-        );
-    }
-
-    #[test]
     fn endpoint_compatibility_matches_full_composition_and_cancels_without_evidence_copy() {
         use super::super::engine::CANCELLATION_QUANTUM;
 
@@ -3734,60 +4086,6 @@ mod tests {
     }
 
     #[test]
-    fn shared_completion_path_construction_and_seed_updates_do_not_scan_the_base() {
-        let mut work_by_size = Vec::new();
-        for count in [8_usize, 4_096] {
-            let expected = ResolutionCompletion::incomplete((0..count).map(|index| {
-                ResolutionIncompleteReason::UnsupportedSemantic(SemanticId::for_test(
-                    index.to_le_bytes(),
-                ))
-            }));
-            let ResolutionCompletion::Incomplete(reasons) = &expected else {
-                unreachable!()
-            };
-            let shared = ResolutionCompletion::Incomplete(
-                reasons.to_shared_with_poll(&mut || false).unwrap(),
-            );
-            let at = endpoint(node("shared-completion-path"), Vec::new(), Vec::new());
-            let mut work = 0;
-            let mut paths = Vec::new();
-            for _ in 0..64 {
-                let mut poll = || {
-                    work += 1;
-                    false
-                };
-                let path = PartialPath::new_with_poll(
-                    at.clone(),
-                    at.clone(),
-                    Box::new([]),
-                    Box::new([]),
-                    shared.clone(),
-                    &mut poll,
-                )
-                .unwrap();
-                let path = path
-                    .with_seed_completion_with_poll(&shared, &mut poll)
-                    .unwrap();
-                let path = path
-                    .with_additional_completion_with_poll(&shared, &mut poll)
-                    .unwrap();
-                let path = path.clone_with_poll(&mut poll).unwrap();
-                assert_eq!(path.completion(), &expected);
-                assert!(
-                    matches!(path.completion(), ResolutionCompletion::Incomplete(reasons) if reasons.clone_work_len() == 1)
-                );
-                paths.push(path);
-            }
-            assert_eq!(paths.len(), 64);
-            work_by_size.push(work);
-        }
-        assert!(
-            work_by_size[1] <= work_by_size[0] * 4,
-            "512-fold base growth permits logarithmic membership work, not full scans per path: {work_by_size:?}"
-        );
-    }
-
-    #[test]
     fn polled_path_construction_matches_public_semantics_and_cancels_inside_completion() {
         use super::super::engine::CANCELLATION_QUANTUM;
 
@@ -3832,6 +4130,42 @@ mod tests {
             .is_none()
         );
         assert_eq!(polls, CANCELLATION_QUANTUM + 1);
+    }
+
+    #[test]
+    fn canonicalized_observations_keep_first_occurrence_order() {
+        let first = PrecedenceStep {
+            tier: PrecedenceTier::LexicalBinding,
+            ordinal: 0,
+            semantic: semantic("canonical-first-choice"),
+        };
+        let second = PrecedenceStep {
+            tier: PrecedenceTier::ExplicitImport,
+            ordinal: 1,
+            semantic: semantic("canonical-second-choice"),
+        };
+        let first_witness = WitnessStep::Node(node("canonical-first-witness"));
+        let second_witness = WitnessStep::Node(node("canonical-second-witness"));
+        let path = PartialPath::new(
+            EndpointSignature::new(
+                node("canonical-observations-start"),
+                StackPattern::closed(Vec::new()),
+                StackPattern::closed(Vec::new()),
+            ),
+            EndpointSignature::new(
+                node("canonical-observations-end"),
+                StackPattern::closed(Vec::new()),
+                StackPattern::closed(Vec::new()),
+            ),
+            vec![first, second, first],
+            vec![first_witness, first_witness, second_witness, first_witness],
+            ResolutionCompletion::Complete,
+        );
+
+        let canonical = path.canonicalized_observations();
+
+        assert_eq!(canonical.precedence(), &[first, second]);
+        assert_eq!(canonical.witness(), &[first_witness, second_witness]);
     }
 
     #[test]
@@ -4100,78 +4434,6 @@ mod tests {
         assert_eq!(addressable_first.addressable(), Some(true));
         assert_eq!(pointer_second.ty().indirection(), 2);
         assert_eq!(pointer_second.ty().identity(), second);
-    }
-
-    #[test]
-    fn address_of_filters_operands_and_produces_non_addressable_pointers() {
-        let ty = semantic("address-operand");
-        for transform in [
-            TypeTransferValueTransform::AddressableOperandOnly,
-            TypeTransferValueTransform::RuntimeOnly,
-        ] {
-            let rule = TypeTransferRule::new(
-                semantic("address-rule"),
-                semantic("address-output"),
-                1,
-                transform,
-                ResolutionCompletion::Complete,
-            );
-            assert_eq!(
-                rule.apply(ResolutionSlotValue::runtime(
-                    ResolutionTypeRef::new(ty, 0),
-                    true
-                )),
-                TypeTransferApplication::Value(ResolutionSlotValue::runtime(
-                    ResolutionTypeRef::new(ty, 1),
-                    false
-                ))
-            );
-            assert_eq!(
-                rule.apply(ResolutionSlotValue::type_object(ResolutionTypeRef::new(
-                    ty,
-                    u32::MAX
-                ))),
-                TypeTransferApplication::NoValue
-            );
-            assert_eq!(
-                rule.apply(ResolutionSlotValue::runtime(
-                    ResolutionTypeRef::new(ty, u32::MAX),
-                    true
-                )),
-                TypeTransferApplication::IndirectionOutOfRange
-            );
-        }
-        let address = TypeTransferRule::new(
-            semantic("address-rule"),
-            semantic("address-output"),
-            1,
-            TypeTransferValueTransform::AddressableOperandOnly,
-            ResolutionCompletion::Complete,
-        );
-        assert_eq!(
-            address.apply(ResolutionSlotValue::runtime(
-                ResolutionTypeRef::new(ty, u32::MAX),
-                false
-            )),
-            TypeTransferApplication::NoValue
-        );
-        let literal = TypeTransferRule::new(
-            semantic("literal-address-rule"),
-            semantic("address-output"),
-            1,
-            TypeTransferValueTransform::RuntimeOnly,
-            ResolutionCompletion::Complete,
-        );
-        assert_eq!(
-            literal.apply(ResolutionSlotValue::runtime(
-                ResolutionTypeRef::new(ty, 0),
-                false
-            )),
-            TypeTransferApplication::Value(ResolutionSlotValue::runtime(
-                ResolutionTypeRef::new(ty, 1),
-                false
-            ))
-        );
     }
 
     #[test]

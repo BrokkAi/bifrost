@@ -543,9 +543,11 @@ pub struct CodeQueryClassSetRow {
 ///
 /// `proof` is `proven` when the receiver class set is fully known, and
 /// `conditional` when the class certainly reaches the access and lacks the
-/// member while other unclassified values may also reach it. A conditional
-/// row lists those open `remainders` (empty for a proven row) and states its
-/// `condition` as one plain sentence.
+/// member while an allowed remainder stays open. Remainders may include other
+/// unclassified receiver values, listed global writes whose receiver and name
+/// are unbounded, or a declared parameter admitted by a single closed
+/// workspace-class annotation. The row lists its `remainders` (empty for a
+/// proven row) and states the assumptions in `condition` as one plain sentence.
 #[cfg_attr(feature = "query-result-fixtures", derive(Default))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct CodeQueryAbsentMemberFinding {
@@ -567,15 +569,7 @@ pub struct CodeQueryAbsentMemberFinding {
     /// Exact byte and display locations retained for policy related locations.
     #[serde(skip)]
     #[schemars(skip)]
-    pub(crate) also_fails_at_locations: Vec<CodeQueryAbsentMemberLocation>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CodeQueryAbsentMemberLocation {
-    pub path: String,
-    pub range: CodeQueryRange,
-    pub start_byte: usize,
-    pub end_byte: usize,
+    pub(crate) also_fails_at_locations: Vec<CodeQuerySourceSpan>,
 }
 
 #[cfg_attr(feature = "query-result-fixtures", derive(Default))]
@@ -722,6 +716,30 @@ pub struct CodeQueryTaintFinding {
     #[serde(skip_serializing_if = "is_false")]
     #[schemars(default)]
     pub ambiguous: bool,
+}
+
+/// The scope-free content of one taint finding: its sink site, reached labels,
+/// and each origin's site and labels.
+pub type CodeQueryTaintFindingKey = (
+    CodeQuerySourceSite,
+    Vec<String>,
+    Vec<(CodeQuerySourceSite, Vec<String>)>,
+);
+
+impl CodeQueryTaintFinding {
+    /// Identifies one leak across projections. The `id` fields are not usable
+    /// for this: they hash the projection scope, which names one root's
+    /// propagation semantics, so each root that reaches a sink gives it a
+    /// different id.
+    pub fn content_key(&self) -> CodeQueryTaintFindingKey {
+        let mut origins = self
+            .origins
+            .iter()
+            .map(|origin| (origin.site.clone(), origin.labels.clone()))
+            .collect::<Vec<_>>();
+        origins.sort();
+        (self.sink.clone(), self.reached_labels.clone(), origins)
+    }
 }
 
 #[cfg_attr(feature = "query-result-fixtures", derive(Default))]
@@ -877,6 +895,71 @@ pub struct CodeQueryLoopRelation {
     pub repeat_edge_id: Option<String>,
 }
 
+/// One AST-occurrence keyed C++ expression fact. Optional fields are unknown
+/// for the selected syntax, never a negative claim.
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct CodeQueryCppExpression {
+    pub id: String,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub type_text: Option<String>,
+    pub type_form: &'static str,
+    pub signedness: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width_bits: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub literal_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integer_value: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub array_extent: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub array_is_reference: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameter_by_value: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bit_field_width: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bit_field_anonymous: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enum_scoped: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enum_ordinal: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enum_value: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_initializer: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enum_has_implicit_before_nonreference: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub return_top_level_const: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub member_function: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub member_function_const: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub type_size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub type_size_exact: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sizeof_operand_kind: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sizeof_operand_is_parameter: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sizeof_has_side_effect: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loop_has_short_ancestor: Option<bool>,
+    pub completeness: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completeness_reason: Option<String>,
+}
+
 /// One exact catch handler and its immediate body shape.
 #[cfg_attr(feature = "query-result-fixtures", derive(Default))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
@@ -893,6 +976,20 @@ pub struct CodeQueryFailureHandlerState {
     pub coverage: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'static str>,
+    /// The canonical caught type, when C# resolution proved one. Other
+    /// handler languages leave this field null.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caught_type: Option<String>,
+    /// `system_exception`, `not_system_exception`, or `unknown` for C#.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caught_type_relation: Option<&'static str>,
+    /// Whether the C# catch clause has a `when` filter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_filter: Option<bool>,
+    /// Whether the handler does not rethrow, or rethrows bare/the caught
+    /// variable. Other handler languages leave this field null.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rethrow_kind: Option<&'static str>,
 }
 
 /// One exact Java syntax statement and its procedure entry reachability.
@@ -907,6 +1004,242 @@ pub struct CodeQueryStatementReachability {
     pub statement_kind: &'static str,
     /// `reachable`, `unreachable`, or `open`.
     pub verdict: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// One cleanup region's effect on a pending abrupt transfer.
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct CodeQueryPendingCleanupFlow {
+    pub id: String,
+    pub procedure_id: String,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub cleanup_id: String,
+    pub cleanup_kind: &'static str,
+    pub pending_kind: &'static str,
+    pub source: CodeQueryProgramPointRef,
+    pub target: CodeQueryProgramPointRef,
+    pub verdict: &'static str,
+    pub proof: &'static str,
+    pub coverage: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// One query-derived Python rule fact. `relation` selects which optional
+/// columns carry meaning; common source identity and proof/coverage columns
+/// remain available to every relation.
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct CodeQueryPythonRuleFact {
+    pub id: String,
+    pub relation: &'static str,
+    pub owner_id: Option<String>,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub outcome: &'static str,
+    pub proof: &'static str,
+    pub completeness: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explicit_value_returns: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub none_returns: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explicit_return_statements: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallthrough_none_returns: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mixed_returns: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_async: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_generator: Option<bool>,
+    /// Whether this assertion is enclosed by a CodeQL-style Python test scope.
+    /// `unknown` means an enclosing class identity could not be resolved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_scope: Option<&'static str>,
+    /// Whether this assertion is a direct statement in the terminal `else`
+    /// suite of an `elif` chain.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_elif_else: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tuple_return_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub distinct_tuple_arities: Option<usize>,
+    /// Sorted, distinct exact arities observed on complete tuple returns.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tuple_return_arities: Option<Vec<u64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assignment_target_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assignment_arity_match: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mixed_tuple_arities: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotated: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub return_contract: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_use: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub forwarded: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callable_evaluation_time: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_equivalent: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub returns_receiver: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameter_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raised_expression: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operand_kind: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exception_class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_exception: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope_is_public: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub docstring_present: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub docstring_value: Option<String>,
+    /// Exact source comment lines in a selected Python commented-out-code block.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comment_block_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comment_block_lines: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lines_of_code: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decorator_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_override: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_property_accessor: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_method_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_inheritance: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_subclasses: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_special_method: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_decorated: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_probable_mixin: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_stateful: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_top_level: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cyclomatic_complexity: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url_prefix: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variable_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope_kind: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_global: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_nonlocal: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_builtin: Option<bool>,
+    /// Positive-only selector for a builtin identifier that is exactly the
+    /// `function` child of a Python call expression.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub call_callee: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_read: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub definition_kind: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub definition_order: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_definition: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub definition_is_unused: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotation_only: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotated_assignment: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_abstract: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_overriding_method: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_overridden_method: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reachability: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_kind: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nested_scope: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_main_guard: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub optimizing_parameter: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub self_assignment: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub related_scope_kind: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub related_has_definition_outside_main: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub related_has_deletion: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub related_has_import: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub related_is_pytest_fixture: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loop_has_body_read: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loop_policy_excluded: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nested_loop_reused: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nested_loop_has_outer_use: Option<bool>,
+}
+
+/// A source-backed Rust raw-pointer safety result derived from the shared
+/// pointer-provenance solver.
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct CodeQueryRustPointerFinding {
+    pub id: String,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub relation: &'static str,
+    pub origin_id: String,
+    pub origin_kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invalidation_cause: Option<&'static str>,
+    pub access_kind: &'static str,
+    pub strength: &'static str,
+    pub path_proven: bool,
+    pub bounds: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub byte_offset: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub byte_extent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_width: Option<String>,
+    pub proof: &'static str,
+    pub completeness: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
@@ -1068,6 +1401,28 @@ impl CodeQuerySemanticEvidence {
             reason,
         }
     }
+}
+
+pub(in crate::structural::search) fn public_semantic_evidence(
+    proven: bool,
+    complete: bool,
+    proof_reason: Option<String>,
+    completeness_reason: Option<String>,
+) -> CodeQuerySemanticEvidence {
+    CodeQuerySemanticEvidence::from_axis_reasons(
+        if proven {
+            CodeQuerySemanticProof::Proven
+        } else {
+            CodeQuerySemanticProof::Unproven
+        },
+        if complete {
+            CodeQuerySemanticCompleteness::Complete
+        } else {
+            CodeQuerySemanticCompleteness::Partial
+        },
+        proof_reason,
+        completeness_reason,
+    )
 }
 
 #[cfg_attr(feature = "query-result-fixtures", derive(Default))]

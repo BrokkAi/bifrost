@@ -11,8 +11,7 @@ use super::vector::score_metrics;
 use super::{
     CvssAssessment, CvssAssessmentProvenance, CvssAssessmentSet, CvssAssessmentVariant,
     CvssBaseMetric, CvssEvidenceBasis, CvssMetric, CvssMetricEvidence, CvssUnscoredReason,
-    CvssValidationError, CvssVersion, PolicyOverlayScope, SourceScenarioSetHash,
-    VulnerabilityIdentity, metric_rank,
+    CvssValidationError, CvssVersion, SourceScenarioSetHash, VulnerabilityIdentity, metric_rank,
 };
 use crate::budget::PolicyBudget;
 use crate::definition::{
@@ -662,11 +661,15 @@ fn reduce_scenario(
     meter: &mut ReductionMeter,
 ) -> Option<ScenarioOutcome> {
     let mut applicable = Vec::new();
+    let scenarios = scenario.map(std::slice::from_ref).unwrap_or(&[]);
     for record in evidence {
         if !meter.charge() {
             return None;
         }
-        if scope_applies(&record.target_scope, policy_id, finding_id, scenario) {
+        if record
+            .target_scope
+            .applies_to(policy_id, &finding_id, scenarios)
+        {
             applicable.push(record.clone());
         }
     }
@@ -698,7 +701,7 @@ fn reduce_scenario(
                 if !meter.charge() {
                     return None;
                 }
-                if scope_strictly_refines(other, candidate) {
+                if other.strictly_refines(candidate) {
                     shadowed = true;
                     break;
                 }
@@ -774,56 +777,6 @@ impl<T> HashlessSet<T> {
     }
 }
 
-fn scope_applies(
-    scope: &PolicyOverlayScope,
-    policy_id: &super::PolicyId,
-    finding_id: PolicyFindingId,
-    scenario: Option<&SourceScenarioId>,
-) -> bool {
-    match scope {
-        PolicyOverlayScope::AllFindings => true,
-        PolicyOverlayScope::Policy {
-            policy_id: expected,
-        } => expected == policy_id,
-        PolicyOverlayScope::Finding {
-            finding_id: expected,
-        } => *expected == finding_id,
-        PolicyOverlayScope::SourceScenario { scenario_id } => scenario == Some(scenario_id),
-        PolicyOverlayScope::FindingScenario {
-            finding,
-            scenario: expected,
-        } => *finding == finding_id && scenario == Some(expected),
-    }
-}
-
-fn scope_strictly_refines(left: &PolicyOverlayScope, right: &PolicyOverlayScope) -> bool {
-    use PolicyOverlayScope as S;
-    match (left, right) {
-        (S::Policy { .. }, S::AllFindings) => true,
-        (S::Finding { .. } | S::SourceScenario { .. }, S::AllFindings | S::Policy { .. }) => true,
-        (
-            S::FindingScenario {
-                finding: left_finding,
-                ..
-            },
-            S::Finding {
-                finding_id: right_finding,
-            },
-        ) => left_finding == right_finding,
-        (
-            S::FindingScenario {
-                scenario: left_scenario,
-                ..
-            },
-            S::SourceScenario {
-                scenario_id: right_scenario,
-            },
-        ) => left_scenario == right_scenario,
-        (S::FindingScenario { .. }, S::AllFindings | S::Policy { .. }) => true,
-        _ => false,
-    }
-}
-
 const fn basis_rank(basis: CvssEvidenceBasis) -> u8 {
     match basis {
         CvssEvidenceBasis::PolicyAssertion => 1,
@@ -833,7 +786,10 @@ const fn basis_rank(basis: CvssEvidenceBasis) -> u8 {
     }
 }
 
-fn compare_scoped_evidence(left: &ScopedMetricEvidence, right: &ScopedMetricEvidence) -> Ordering {
+pub(super) fn compare_scoped_evidence(
+    left: &ScopedMetricEvidence,
+    right: &ScopedMetricEvidence,
+) -> Ordering {
     metric_rank(left.evidence.metric())
         .cmp(&metric_rank(right.evidence.metric()))
         .then_with(|| left.target_scope.cmp(&right.target_scope))
@@ -1168,6 +1124,7 @@ fn budget_outcome(
 
 #[cfg(test)]
 mod tests {
+    use super::super::PolicyOverlayScope;
     use super::*;
     use crate::cvss::CvssEvidenceContentHash;
     use crate::definition::{
@@ -1308,21 +1265,6 @@ mod tests {
         }
     }
 
-    fn default_base_token(metric: CvssBaseMetric) -> CvssMetricValueToken {
-        match metric {
-            CvssBaseMetric::Ac => CvssMetricValueToken::L,
-            CvssBaseMetric::Av | CvssBaseMetric::At | CvssBaseMetric::Pr | CvssBaseMetric::Ui => {
-                CvssMetricValueToken::N
-            }
-            CvssBaseMetric::Vc
-            | CvssBaseMetric::Vi
-            | CvssBaseMetric::Va
-            | CvssBaseMetric::Sc
-            | CvssBaseMetric::Si
-            | CvssBaseMetric::Sa => CvssMetricValueToken::H,
-        }
-    }
-
     fn reduce_one(
         evidence: &[ScopedMetricEvidence],
         policy: &PolicyId,
@@ -1386,10 +1328,10 @@ mod tests {
             finding,
             scenario: scenario.clone(),
         };
-        assert!(!scope_strictly_refines(&finding_scope, &scenario_scope));
-        assert!(!scope_strictly_refines(&scenario_scope, &finding_scope));
-        assert!(scope_strictly_refines(&combined, &finding_scope));
-        assert!(scope_strictly_refines(&combined, &scenario_scope));
+        assert!(!finding_scope.strictly_refines(&scenario_scope));
+        assert!(!scenario_scope.strictly_refines(&finding_scope));
+        assert!(combined.strictly_refines(&finding_scope));
+        assert!(combined.strictly_refines(&scenario_scope));
 
         let other_scenario = PolicyOverlayScope::SourceScenario {
             scenario_id: SourceScenarioId::try_new("test", "other-scenario").unwrap(),
@@ -1403,24 +1345,8 @@ mod tests {
         let other_finding = PolicyOverlayScope::Finding {
             finding_id: PolicyFindingId::from_match_anchor(&policy, &other_anchor),
         };
-        assert!(!scope_strictly_refines(&combined, &other_scenario));
-        assert!(!scope_strictly_refines(&combined, &other_finding));
-    }
-
-    #[test]
-    fn basis_precedence_is_explicit() {
-        assert!(
-            basis_rank(CvssEvidenceBasis::AnalystOverride)
-                > basis_rank(CvssEvidenceBasis::ThreatFeed)
-        );
-        assert_eq!(
-            basis_rank(CvssEvidenceBasis::ThreatFeed),
-            basis_rank(CvssEvidenceBasis::EnvironmentProfile)
-        );
-        assert!(
-            basis_rank(CvssEvidenceBasis::StaticWitness)
-                > basis_rank(CvssEvidenceBasis::PolicyAssertion)
-        );
+        assert!(!combined.strictly_refines(&other_scenario));
+        assert!(!combined.strictly_refines(&other_finding));
     }
 
     #[test]
@@ -1643,7 +1569,7 @@ mod tests {
             .map(|(index, metric)| {
                 scoped_base(
                     metric,
-                    default_base_token(metric),
+                    crate::test_support::cvss_base_metric_token(metric),
                     CvssEvidenceBasis::PolicyAssertion,
                     PolicyOverlayScope::AllFindings,
                     u8::try_from(index + 20).unwrap(),
@@ -1755,7 +1681,7 @@ mod tests {
                 .map(|(index, metric)| {
                     scoped_base_with_reference(
                         metric,
-                        default_base_token(metric),
+                        crate::test_support::cvss_base_metric_token(metric),
                         CvssEvidenceBasis::PolicyAssertion,
                         PolicyOverlayScope::AllFindings,
                         u8::try_from(index + 1).unwrap(),
@@ -1789,7 +1715,7 @@ mod tests {
             .map(|(index, metric)| {
                 scoped_base(
                     metric,
-                    default_base_token(metric),
+                    crate::test_support::cvss_base_metric_token(metric),
                     CvssEvidenceBasis::PolicyAssertion,
                     PolicyOverlayScope::AllFindings,
                     u8::try_from(index + 100).unwrap(),
@@ -1871,7 +1797,7 @@ mod tests {
             .map(|(index, metric)| {
                 scoped_base(
                     metric,
-                    default_base_token(metric),
+                    crate::test_support::cvss_base_metric_token(metric),
                     CvssEvidenceBasis::PolicyAssertion,
                     PolicyOverlayScope::AllFindings,
                     u8::try_from(index + 1).unwrap(),
@@ -1924,52 +1850,6 @@ mod tests {
             serde_json::to_vec(&forward).unwrap(),
             serde_json::to_vec(&reverse).unwrap()
         );
-    }
-
-    #[test]
-    fn evidence_record_budget_is_enforced_across_all_variant_provenance() {
-        let (policy, finding) = test_policy_and_finding();
-        let group = |policy_hash: u8, analyst_hash: u8| {
-            let evidence = vec![
-                scoped_base(
-                    CvssBaseMetric::Av,
-                    CvssMetricValueToken::N,
-                    CvssEvidenceBasis::PolicyAssertion,
-                    PolicyOverlayScope::AllFindings,
-                    policy_hash,
-                ),
-                scoped_base(
-                    CvssBaseMetric::Av,
-                    CvssMetricValueToken::N,
-                    CvssEvidenceBasis::AnalystOverride,
-                    PolicyOverlayScope::AllFindings,
-                    analyst_hash,
-                ),
-            ];
-            let outcome = reduce_one(&evidence, &policy, finding, None);
-            OutcomeGroup {
-                key: outcome.key(),
-                scenarios: Vec::new(),
-                outcome,
-            }
-        };
-        let first = group(80, 81);
-        let second = group(82, 83);
-        let budget = PolicyBudget::builder()
-            .with_max_cvss_evidence_records_per_finding(3)
-            .unwrap()
-            .build()
-            .unwrap();
-
-        assert!(evidence_records_fit_budget(
-            std::slice::from_ref(&first),
-            &budget
-        ));
-        assert!(evidence_records_fit_budget(
-            std::slice::from_ref(&second),
-            &budget
-        ));
-        assert!(!evidence_records_fit_budget(&[first, second], &budget));
     }
 
     #[test]
@@ -2049,6 +1929,51 @@ mod tests {
         assert!(provenance.overlay_scopes().is_empty());
     }
 
+    #[test]
+    fn evidence_record_budget_is_enforced_across_all_variant_provenance() {
+        let (policy, finding) = test_policy_and_finding();
+        let group = |policy_hash: u8, analyst_hash: u8| {
+            let evidence = vec![
+                scoped_base(
+                    CvssBaseMetric::Av,
+                    CvssMetricValueToken::N,
+                    CvssEvidenceBasis::PolicyAssertion,
+                    PolicyOverlayScope::AllFindings,
+                    policy_hash,
+                ),
+                scoped_base(
+                    CvssBaseMetric::Av,
+                    CvssMetricValueToken::N,
+                    CvssEvidenceBasis::AnalystOverride,
+                    PolicyOverlayScope::AllFindings,
+                    analyst_hash,
+                ),
+            ];
+            let outcome = reduce_one(&evidence, &policy, finding, None);
+            OutcomeGroup {
+                key: outcome.key(),
+                scenarios: Vec::new(),
+                outcome,
+            }
+        };
+        let first = group(80, 81);
+        let second = group(82, 83);
+        let budget = PolicyBudget::builder()
+            .with_max_cvss_evidence_records_per_finding(3)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        assert!(evidence_records_fit_budget(
+            std::slice::from_ref(&first),
+            &budget
+        ));
+        assert!(evidence_records_fit_budget(
+            std::slice::from_ref(&second),
+            &budget
+        ));
+        assert!(!evidence_records_fit_budget(&[first, second], &budget));
+    }
     #[test]
     fn display_reference_caps_do_not_change_conflict_or_variant_identity() {
         let (policy, finding) = test_policy_and_finding();

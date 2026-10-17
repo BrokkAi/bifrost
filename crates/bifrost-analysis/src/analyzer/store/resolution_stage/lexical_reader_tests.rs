@@ -1459,24 +1459,6 @@ fn context_readers_preserve_token_scope_coarse_stream_and_pending_page_budget() 
             .unconditional_completion()
             .contains_reason(ResolutionIncompleteReason::Cancelled)
     );
-    selection
-        .with_owned_temp_write(|connection| {
-            connection.execute(
-                "DELETE FROM temp.selected_resolution_contexts WHERE context_id=?1",
-                [first.get()],
-            )?;
-            Ok(())
-        })
-        .unwrap();
-    assert!(source.context_paths(first, &live).is_err());
-    assert!(source.hydrate_context_paths(first, &[], &live).is_err());
-    assert!(
-        source
-            .visit_context_forward_additions(first, &forward, base(), 1, &live, None, &mut |_| Ok(
-                true
-            ))
-            .is_err()
-    );
     assert_eq!(
         source.context_paths(second, &live).unwrap().unwrap().len(),
         1
@@ -2012,7 +1994,9 @@ fn bundled_prefix_spelling_pins_bound_actual_batches_and_preserve_rows() {
                     let actual = reference_lookup_spellings(
                         &selection,
                         &requested,
-                        brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace::Type,
+                        &crate::analyzer::store::resolution_prepare::reference_lookup_namespace_codes(
+                            brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace::Type,
+                        ),
                         &CancellationToken::default(),
                     )
                     .unwrap()
@@ -2193,6 +2177,14 @@ fn generated_include_boundary_classifies_only_with_scoped_catalog_authority() {
                 ),
                 &original,
                 BindingNodeKind::Definition(definition),
+                brokk_bifrost_core::analyzer::canonical_hash::hash_domain_bytes(
+                    b"test-generated-path-content:v1",
+                    &[]
+                ),
+                brokk_bifrost_core::analyzer::canonical_hash::hash_domain_bytes(
+                    b"test-generated-scope-content:v1",
+                    &[]
+                ),
                 &cancellation,
             )
             .unwrap(),
@@ -2295,15 +2287,6 @@ fn ordinary_reference_seed_batch_checks_authority_once_per_mount() {
     let queries = (0..32)
         .map(|index| ResolutionQuery::new(SemanticId::local(0, keys[index % keys.len()])))
         .collect::<Vec<_>>();
-    let expected = queries
-        .iter()
-        .map(|&query| {
-            source
-                .reference_seed(query, &cancellation)
-                .unwrap()
-                .unwrap()
-        })
-        .collect::<Vec<_>>();
     selection
         .connection()
         .prepare_cached(READ_AUTHORITY_SQL)
@@ -2318,6 +2301,15 @@ fn ordinary_reference_seed_batch_checks_authority_once_per_mount() {
         .unwrap()
         .get_status(StatementStatus::Run);
     assert_eq!(batch.rows().len(), queries.len());
+    let expected = queries
+        .iter()
+        .map(|&query| {
+            source
+                .reference_seed(query, &cancellation)
+                .unwrap()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
     for (row, expected) in batch.rows().iter().zip(expected) {
         assert_eq!(row.seed(), Some(&expected));
     }

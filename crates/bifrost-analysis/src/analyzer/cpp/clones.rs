@@ -5,7 +5,9 @@
 //! normalization that knows C++ moved to [`brokk_bifrost_cpp::clones`].
 
 use super::*;
-use crate::analyzer::clone_detection::{CloneCandidateData, compact_clone_excerpt};
+use crate::analyzer::clone_detection::{
+    CloneCandidateData, build_clone_candidate_data as build_shared_clone_candidate_data,
+};
 use brokk_bifrost_cpp::clones::cpp_clone_profile;
 use tree_sitter::Parser;
 
@@ -15,20 +17,10 @@ pub(super) fn build_clone_candidate_data(
     weights: CloneSmellWeights,
     parser: &mut Parser,
 ) -> Option<CloneCandidateData> {
-    analyzer
-        .get_source(code_unit, false)
-        .map(|source| source.trim().to_string())
-        .filter(|source| !source.is_empty())
-        .and_then(|source| {
-            let (normalized_tokens, ast_signature) = cpp_clone_profile(parser, &source);
-            if normalized_tokens.len() < weights.min_normalized_tokens.max(0) as usize {
-                return None;
-            }
-            Some(CloneCandidateData {
-                unit: code_unit.clone(),
-                normalized_tokens,
-                ast_signature,
-                excerpt: compact_clone_excerpt(&source),
-            })
-        })
+    build_shared_clone_candidate_data(
+        analyzer.get_source(code_unit, false),
+        code_unit,
+        weights,
+        |source, _| Some(cpp_clone_profile(parser, source)),
+    )
 }

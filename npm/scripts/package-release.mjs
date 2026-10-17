@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
+import { archiveName as buildArchiveName } from "../../scripts/lib/release-archive.mjs";
 
 const execFile = promisify(execFileCallback);
 const npmRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -120,7 +121,7 @@ export function rootManifest(version) {
   return {
     name: ROOT_PACKAGE,
     ...baseManifest(version),
-    description: "Native Bifrost code analysis CLI, MCP server, and language server",
+    description: "Native Bifrost code analysis CLI and MCP server",
     type: "module",
     bin: { bifrost: "bin/bifrost.js" },
     files: ["bin/", "README.md", "LICENSE.md"],
@@ -140,7 +141,7 @@ function packageDirectory(packageName) {
 }
 
 function archiveName(version, platform) {
-  return `bifrost-v${version}-${platform.target}${platform.extension}`;
+  return buildArchiveName(platform.target, version, platform.extension);
 }
 
 async function writeManifest(directory, manifest) {
@@ -230,18 +231,33 @@ async function pack(directory, outputDirectory) {
   return path.join(outputDirectory, stdout.trim().split("\n").at(-1));
 }
 
-export async function packageRelease({ releaseTag, assetsDirectory, outputDirectory }) {
+// `targets` narrows the platform packages to build; the root package still
+// pins every platform. Release readiness packages all of them from the
+// five-target build matrix, and the release gate packages the Linux/x86
+// archive it built itself (#3472).
+export function selectPlatforms(targets) {
+  if (targets === undefined) return PLATFORMS;
+  const known = new Map(PLATFORMS.map((platform) => [platform.target, platform]));
+  const unknown = targets.filter((target) => !known.has(target));
+  if (targets.length === 0 || unknown.length > 0) {
+    throw new Error(`unknown release targets ${JSON.stringify(unknown)}; known: ${[...known.keys()].join(", ")}`);
+  }
+  return targets.map((target) => known.get(target));
+}
+
+export async function packageRelease({ releaseTag, assetsDirectory, outputDirectory, targets }) {
   const version = versionFromTag(releaseTag);
   const manifestVersion = await cargoVersion();
   if (version !== manifestVersion) {
     throw new Error(`release tag ${releaseTag} does not match Cargo.toml version v${manifestVersion}`);
   }
+  const platforms = selectPlatforms(targets);
   const output = path.resolve(outputDirectory ?? path.join(npmRoot, "dist"));
   await rm(output, { recursive: true, force: true });
   await mkdir(output, { recursive: true });
   const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "bifrost-npm-"));
   try {
-    for (const platform of PLATFORMS) {
+    for (const platform of platforms) {
       const archive = path.join(assetsDirectory, archiveName(version, platform));
       await verifyChecksum(archive);
       const extractDirectory = path.join(temporaryRoot, `extract-${packageDirectory(platform.packageName)}`);
@@ -259,7 +275,7 @@ export async function packageRelease({ releaseTag, assetsDirectory, outputDirect
 }
 
 function usage() {
-  return "Usage: node scripts/package-release.mjs --release-tag vX.Y.Z --assets DIRECTORY [--out DIRECTORY]";
+  return "Usage: node scripts/package-release.mjs --release-tag vX.Y.Z --assets DIRECTORY [--out DIRECTORY] [--targets TARGET,...]";
 }
 
 async function main() {
@@ -267,11 +283,13 @@ async function main() {
   const releaseTag = args[args.indexOf("--release-tag") + 1];
   const assetsDirectory = args[args.indexOf("--assets") + 1];
   const outputArgument = args.includes("--out") ? args[args.indexOf("--out") + 1] : undefined;
+  const targetsArgument = args.includes("--targets") ? args[args.indexOf("--targets") + 1] : undefined;
   if (!releaseTag || !assetsDirectory) throw new Error(usage());
   await packageRelease({
     releaseTag,
     assetsDirectory: path.resolve(assetsDirectory),
     outputDirectory: outputArgument ? path.resolve(outputArgument) : undefined,
+    targets: targetsArgument === undefined ? undefined : targetsArgument.split(","),
   });
 }
 

@@ -143,7 +143,7 @@ impl<Fact> DataflowResult<Fact> {
     }
 
     pub fn fact(&self, id: FactId) -> Option<&Fact> {
-        self.facts.get(id.index())
+        super::fact_by_id(&self.facts, id)
     }
 
     pub fn reached(&self) -> &[ReachedFact] {

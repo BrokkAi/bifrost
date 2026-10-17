@@ -38,26 +38,26 @@ pub(in crate::analyzer::usages) use brokk_bifrost_csharp::graph::resolver::{
     type_parameter_shadows_reference as csharp_type_parameter_shadows_reference,
 };
 
+use crate::analyzer::tree_walk::node_for_exact_range;
 use crate::analyzer::usages::common::language_for_target;
 pub use crate::analyzer::usages::csharp_graph::shared::{
     CSharpAuthoritativeUsageBatch, CSharpAuthoritativeUsageRequest,
 };
 use crate::analyzer::usages::csharp_graph::shared::{CSharpEdgeResolver, CSharpQueryResolver};
 use crate::analyzer::usages::get_definition::ResolutionSession;
+use crate::analyzer::usages::get_definition::parse_tree_for_language;
 use crate::analyzer::usages::inverted_edges::{
     EdgeNodeDomain, UsageEdgeBuildOutput, UsageEdgeBuildResult, UsageEdgeWeights, UsageEdges,
     build_edge_output, build_edge_output_with_completeness, parse_and_collect_with_domain,
 };
-use crate::analyzer::usages::model::FuzzyResult;
-use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::traits::{UsageQueryResolver, UsageScanScope};
+use crate::analyzer::usages::outcome::GraphUsageOutcome;
+use crate::analyzer::usages::traits::{GraphUsageDispatchSpec, UsageScanScope};
 use crate::analyzer::{CSharpAnalyzer, CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::code_quality::dead_code_smells::{
     contains_java_visibility_modifier, declaration_header,
 };
 use crate::hash::HashSet;
 use brokk_bifrost_csharp::graph::CSharpGraphSource;
-use std::sync::LazyLock;
 use tree_sitter::Node;
 
 /// The [`CSharpGraphSource`] built from the *dispatching* analyzer.
@@ -332,42 +332,27 @@ impl GraphUsageAnalyzer for CSharpUsageGraphStrategy {
         scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
-        if overloads.is_empty() {
-            return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
-        }
-
-        let target = &overloads[0];
-        if language_for_target(target) != Language::CSharp {
-            return GraphUsageOutcome::fallback_safe(
-                target.fq_name(),
-                GraphFailureReason::UnsupportedTargetLanguage("target is not C#"),
-                "CSharpUsageGraphStrategy",
-            );
-        }
-
-        let Some(resolver) = CSharpQueryResolver::try_new(analyzer) else {
-            return GraphUsageOutcome::fallback_safe(
-                target.fq_name(),
-                GraphFailureReason::MissingAnalyzerCapability(
-                    "analyzer does not expose CSharpAnalyzer",
-                ),
-                "CSharpUsageGraphStrategy",
-            );
-        };
-
-        resolver.find_usages(analyzer, overloads, scan_scope, max_usages)
+        crate::analyzer::usages::traits::dispatch_graph_usage_query::<CSharpQueryResolver<'_>>(
+            analyzer,
+            overloads,
+            scan_scope,
+            max_usages,
+            GraphUsageDispatchSpec {
+                target_language: Language::CSharp,
+                unsupported_target: "target is not C#",
+                missing_analyzer: "analyzer does not expose CSharpAnalyzer",
+                strategy: "CSharpUsageGraphStrategy",
+            },
+        )
     }
 }
 
 /// C#'s implicit entry points: a `static Main`, and any method carrying an
-/// xUnit/NUnit/MSTest attribute. Both are reachable without an in-workspace
-/// caller, so dead-code scoring must not report them.
+/// attribute recognized by the C# test classifier. Both are reachable without
+/// an in-workspace caller, so dead-code scoring must not report them.
 ///
-/// This lives here rather than inline in `dead_code_smells.rs` for the reason
-/// Go's `go_implicit_entry_point` and C++'s `is_cpp_global_main` do: the
-/// knowledge is which attribute spellings a C# test runner honors, which is
-/// language knowledge, and a framework file carrying it is one the next
-/// language extraction has to find by hand.
+/// The C# crate owns attribute recognition. This adapter pairs it with the
+/// candidate's active source and exact declaration range from `IAnalyzer`.
 pub(crate) fn csharp_implicit_entry_point(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
     if !candidate.is_function() {
         return false;
@@ -376,8 +361,19 @@ pub(crate) fn csharp_implicit_entry_point(analyzer: &dyn IAnalyzer, candidate: &
 }
 
 fn csharp_test_entry_point(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
-    let source = analyzer.get_source(candidate, true).unwrap_or_default();
-    csharp_source_has_test_attribute(&source)
+    let Some(source) = analyzer.indexed_source(candidate.source()) else {
+        return false;
+    };
+    let Some(tree) = parse_tree_for_language(candidate.source(), Language::CSharp, &source) else {
+        return false;
+    };
+    analyzer.ranges_of(candidate).into_iter().any(|range| {
+        node_for_exact_range(tree.root_node(), &range).is_some_and(|method| {
+            brokk_bifrost_csharp::test_detection::csharp_method_has_runnable_test_attribute(
+                method, &source,
+            )
+        })
+    })
 }
 
 fn csharp_main_entry_point(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
@@ -387,14 +383,4 @@ fn csharp_main_entry_point(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bo
     let source = analyzer.get_source(candidate, true).unwrap_or_default();
     let header = declaration_header(&source);
     contains_java_visibility_modifier(header, "static")
-}
-
-fn csharp_source_has_test_attribute(source: &str) -> bool {
-    static TEST_ATTR_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(
-            r"\[(?:[A-Za-z_][A-Za-z0-9_.]*\.)?(?:Test|Fact|Theory|TestMethod)(?:Attribute)?(?:\s*\(|\s*\])",
-        )
-        .expect("valid csharp test regex")
-    });
-    TEST_ATTR_RE.is_match(source)
 }

@@ -128,45 +128,29 @@ fn member_property_range(member: Node<'_>) -> Range {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tree_sitter::{Parser, Tree};
+    use brokk_bifrost_test_macros::hardwon;
+    use tree_sitter::Tree;
 
     fn parse_javascript(source: &str) -> Tree {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_javascript::LANGUAGE.into())
-            .expect("JavaScript grammar");
-        parser.parse(source, None).expect("JavaScript tree")
+        crate::test_support::parse_javascript(source)
     }
 
     fn find_member_expression<'tree>(root: Node<'tree>, source: &str, text: &str) -> Node<'tree> {
-        let mut stack = vec![root];
-        while let Some(node) = stack.pop() {
-            if node.kind() == "member_expression" && slice(node, source) == text {
-                return node;
-            }
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                stack.push(child);
-            }
-        }
-        panic!("missing member expression `{text}`");
+        crate::test_support::first_named_node_matching_reverse_preorder(root, |node| {
+            node.kind() == "member_expression" && slice(node, source) == text
+        })
+        .unwrap_or_else(|| panic!("missing member expression `{text}`"))
     }
 
     fn find_expression<'tree>(root: Node<'tree>, source: &str, text: &str) -> Node<'tree> {
-        let mut stack = vec![root];
-        while let Some(node) = stack.pop() {
-            if slice(node, source) == text {
-                return node;
-            }
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                stack.push(child);
-            }
-        }
-        panic!("missing expression `{text}`");
+        crate::test_support::first_named_node_matching_reverse_preorder(root, |node| {
+            slice(node, source) == text
+        })
+        .unwrap_or_else(|| panic!("missing expression `{text}`"))
     }
 
     #[test]
+    #[hardwon("#3119: computed owner reads were treated as exact member usages")]
     fn dotted_chain_preserves_root_and_ordered_members() {
         let source = "const result = mapping.aliasToReal.each;";
         let tree = parse_javascript(source);
@@ -193,6 +177,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#3119: computed owner reads were treated as exact member usages")]
     fn static_string_subscript_decodes_exact_member() {
         let source = "const result = mapping.aliasToReal['__'];";
         let tree = parse_javascript(source);
@@ -212,6 +197,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#3119: computed owner reads were treated as exact member usages")]
     fn dynamic_subscript_is_typed_and_never_exact() {
         let source = "const result = mapping.aliasToReal[name];";
         let tree = parse_javascript(source);
@@ -231,6 +217,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#3119: computed owner reads were treated as exact member usages")]
     fn private_and_non_identifier_chains_fail_closed() {
         let private_source =
             "class Box { #inner = {}; read(other) { return other.#inner.value; } }";
@@ -260,6 +247,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#3119: computed owner reads were treated as exact member usages")]
     fn oversize_chain_reports_budget_without_truncation() {
         let access = ".member";
         let access_count = MAX_IMPORT_MEMBER_CHAIN_SEGMENTS + 1;

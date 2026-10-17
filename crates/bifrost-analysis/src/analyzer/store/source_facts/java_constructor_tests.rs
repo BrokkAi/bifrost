@@ -11,6 +11,7 @@ use crate::inline_project::InlineTestProject;
 const SOURCE: &str = r#"interface Contract {}
 class Plain {}
 class Explicit { Explicit(int value) {} }
+class Odd { Odd {} }
 record Pair(int value, String... labels) {}
 class Host {
     void body() {
@@ -33,6 +34,9 @@ fn java_type_constructor_shapes_survive_all_metadata_readers_and_reopen() {
         ("Contract", JavaTypeConstructorShape::NoImplicit),
         ("Plain", JavaTypeConstructorShape::Default),
         ("Explicit", JavaTypeConstructorShape::NoImplicit),
+        // A compact constructor in a plain class body is admitted by the
+        // grammar and must count as an explicit constructor (#4391).
+        ("Odd", JavaTypeConstructorShape::NoImplicit),
         (
             "Pair",
             JavaTypeConstructorShape::RecordCanonical(CallableArity::new(1, 2, true)),
@@ -70,7 +74,14 @@ fn java_type_constructor_shapes_survive_all_metadata_readers_and_reopen() {
         let store = AnalyzerStore::open_persistent(&path).unwrap();
         let generation = store.current_generation("java").unwrap();
         store
-            .write_parsed_blob_at_generation(oid, "java", generation, &JavaAdapter, &state)
+            .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
+                oid,
+                "java",
+                generation,
+                &JavaAdapter,
+                &state,
+            )
             .unwrap();
     }
     let store = AnalyzerStore::open_persistent(&path).unwrap();
@@ -142,6 +153,7 @@ fn missing_java_type_constructor_metadata_fails_publication_atomically() {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let generation = store.current_generation("java").unwrap();
         let result = store.write_parsed_blob_at_generation(
+            &crate::analyzer::store::test_blob_file(),
             oid_for(b"missing-constructor-shape"),
             "java",
             generation,
@@ -177,7 +189,14 @@ fn damaged_java_type_constructor_shape_is_unavailable_not_no_implicit_constructo
     let generation = store.current_generation("java").unwrap();
     let oid = oid_for(b"class Plain {}");
     store
-        .write_parsed_blob_at_generation(oid, "java", generation, &JavaAdapter, &state)
+        .write_parsed_blob_at_generation(
+            &crate::analyzer::store::test_blob_file(),
+            oid,
+            "java",
+            generation,
+            &JavaAdapter,
+            &state,
+        )
         .unwrap();
     assert!(
         store

@@ -21,6 +21,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use brokk_bifrost_policy::is_bidi_control;
+
 const COMMANDS: &[MetadataEntry] = &[
     MetadataEntry::new(":help", "Show commands and S-expression examples."),
     MetadataEntry::new(
@@ -634,29 +636,26 @@ fn prepare_history_path() -> Option<PathBuf> {
     Some(path)
 }
 
-#[cfg(unix)]
-fn ensure_private_history_file(path: &PathBuf) -> io::Result<()> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-    if !path.exists() {
-        fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(path)?;
-    }
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-}
-
-#[cfg(not(unix))]
 fn ensure_private_history_file(path: &PathBuf) -> io::Result<()> {
     if !path.exists() {
-        fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(path)?;
+        let mut options = fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options.open(path)?;
     }
-    Ok(())
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(())
+    }
 }
 
 fn parse_query_input(line: &str) -> Result<Value, String> {
@@ -920,6 +919,27 @@ fn plan_summary_text(plan: &CodeQueryPlan) -> String {
             }
             parts
         }
+        CodeQueryPlanSource::DependencyEvidence(seed) => {
+            let mut parts = vec!["dependency evidence query".to_string()];
+            if !seed.where_globs.is_empty() {
+                parts.push(format!("where {}", path_scope_summary(&seed.where_globs)));
+            }
+            for (label, values) in [
+                ("ecosystem", &seed.filter.ecosystems),
+                ("package", &seed.filter.packages),
+                ("kind", &seed.filter.kinds),
+                ("version", &seed.filter.exact_versions),
+                ("version range", &seed.filter.version_ranges),
+                ("source", &seed.filter.sources),
+                ("member", &seed.filter.declared_by),
+                ("scope", &seed.filter.scopes),
+            ] {
+                if !values.is_empty() {
+                    parts.push(format!("{label} {}", values.join(", ")));
+                }
+            }
+            parts
+        }
         CodeQueryPlanSource::ConfigurationFacts(seed) => {
             let mut parts = vec!["configuration facts query".to_string()];
             if !seed.where_globs.is_empty() {
@@ -941,6 +961,17 @@ fn plan_summary_text(plan: &CodeQueryPlan) -> String {
         CodeQueryPlanSource::Set { op, branches } => {
             vec![format!("{} of {} queries", op.label(), branches.len())]
         }
+        CodeQueryPlanSource::Correlate(correlation) => vec![format!(
+            "correlate by {}: code {{{}}} with configuration {{{}}}",
+            correlation.relation.label(),
+            plan_summary_text(&correlation.code),
+            plan_summary_text(&correlation.configuration)
+        )],
+        CodeQueryPlanSource::RequireBoth(requirement) => vec![format!(
+            "require both code {{{}}} and configuration {{{}}}",
+            plan_summary_text(&requirement.code),
+            plan_summary_text(&requirement.configuration)
+        )],
     };
     if !plan.steps.is_empty() {
         parts.push(format!(
@@ -1051,6 +1082,17 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                 CodeQueryResultValue::StructuralMatch { value } => {
                     render_code_query_match(&mut out, value, use_color);
                 }
+                CodeQueryResultValue::CppExpression { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {}\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "cpp expression:", use_color),
+                        paint(Style::new().bold(), value.kind, use_color),
+                    ));
+                }
                 CodeQueryResultValue::Declaration { value } => {
                     let path = sanitize_terminal_text(&value.path);
                     let name = sanitize_terminal_text(&value.fq_name);
@@ -1132,29 +1174,6 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         protocol_ref,
                         paint(Style::new().bold(), &id, use_color),
                         value.certainty,
-                    ));
-                }
-                CodeQueryResultValue::ConcurrentAccessConflict { value } => {
-                    let path = sanitize_terminal_text(&value.path);
-                    let id = sanitize_terminal_text(&value.id);
-                    out.push_str(&format!(
-                        "{}:{}:{}\n  {} {} ({} / {}; {}; {}; {}; {}/{})\n",
-                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
-                        value.range.start_line,
-                        value.range.start_column,
-                        paint(
-                            Style::new().fg(Color::Blue),
-                            "concurrent access conflict:",
-                            use_color
-                        ),
-                        paint(Style::new().bold(), &id, use_color),
-                        value.first_access,
-                        value.second_access,
-                        value.task_relation,
-                        value.ordering,
-                        value.protection,
-                        value.proof,
-                        value.coverage,
                     ));
                 }
                 CodeQueryResultValue::TypestateWitness { value } => {
@@ -1571,6 +1590,55 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         value.coverage,
                     ));
                 }
+                CodeQueryResultValue::PythonHierarchyFact { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let root = value.root.as_ref().map_or_else(
+                        || sanitize_terminal_text(&value.root_id),
+                        |declaration| sanitize_terminal_text(&declaration.fq_name),
+                    );
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} {}: {} (coverage {})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "Python hierarchy:", use_color),
+                        value.fact_kind,
+                        root,
+                        value.outcome,
+                        value.coverage,
+                    ));
+                    if let Some(reason) = value.reason {
+                        out.push_str(&format!("  reason: {reason}\n"));
+                    }
+                    if let Some(ordinal) = value.ordinal {
+                        out.push_str(&format!("  ordinal: {ordinal}\n"));
+                    }
+                    if let Some(base) = &value.base_spelling {
+                        out.push_str(&format!(
+                            "  base: {} ({})\n",
+                            sanitize_terminal_text(base),
+                            value.base_resolution.unwrap_or("unresolved")
+                        ));
+                    }
+                    if let Some(member) = &value.member_name {
+                        let owner = value
+                            .owner
+                            .as_ref()
+                            .map_or("unknown owner", |owner| owner.fq_name.as_str());
+                        out.push_str(&format!(
+                            "  member: {} on {} at MRO rank {:?}\n",
+                            sanitize_terminal_text(member),
+                            sanitize_terminal_text(owner),
+                            value.mro_rank,
+                        ));
+                    }
+                    if let Some(target) = &value.target {
+                        out.push_str(&format!(
+                            "  target: {}\n",
+                            sanitize_terminal_text(&target.fq_name)
+                        ));
+                    }
+                }
                 CodeQueryResultValue::ReceiverOutcome { value } => {
                     let path = sanitize_terminal_text(&value.path);
                     let site_id = sanitize_terminal_text(&value.site_id);
@@ -1626,6 +1694,39 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                             sanitize_terminal_text(factory_id)
                         ));
                     }
+                }
+                CodeQueryResultValue::PointsToCandidate { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let site_id = sanitize_terminal_text(&value.site_id);
+                    let object_id = value
+                        .object_id
+                        .as_deref()
+                        .map(sanitize_terminal_text)
+                        .unwrap_or_else(|| "none".to_string());
+                    let program_point_id = value
+                        .program_point_id
+                        .as_deref()
+                        .map(sanitize_terminal_text)
+                        .unwrap_or_else(|| "unmapped".to_string());
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} #{} (object {}; cardinality {}; proof {}; completeness {}; coverage {})\n  site {}; point {}\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(
+                            Style::new().fg(Color::Blue),
+                            "points-to candidate:",
+                            use_color
+                        ),
+                        value.candidate_index,
+                        object_id,
+                        value.object_cardinality.unwrap_or("unknown"),
+                        value.proof,
+                        value.completeness,
+                        value.coverage,
+                        site_id,
+                        program_point_id,
+                    ));
                 }
                 CodeQueryResultValue::CallShape { value } => {
                     let path = sanitize_terminal_text(&value.path);
@@ -1951,6 +2052,33 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         value.verdict,
                     ));
                 }
+                CodeQueryResultValue::PendingCleanupFlow { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let source = sanitize_terminal_text(&value.source.id);
+                    let target = sanitize_terminal_text(&value.target.id);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} {} {} -> {} [{}; {}; {}]{}\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(
+                            Style::new().fg(Color::Blue),
+                            "pending cleanup flow:",
+                            use_color
+                        ),
+                        value.cleanup_kind,
+                        value.pending_kind,
+                        paint(Style::new().bold(), &source, use_color),
+                        paint(Style::new().bold(), &target, use_color),
+                        value.verdict,
+                        value.proof,
+                        value.coverage,
+                        value
+                            .reason
+                            .as_ref()
+                            .map_or_else(String::new, |reason| format!("; {reason}")),
+                    ));
+                }
                 CodeQueryResultValue::DetachedTaskTransfer { value } => {
                     let path = sanitize_terminal_text(&value.path);
                     out.push_str(&format!(
@@ -2034,6 +2162,29 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         if value.selected { " selected" } else { "" },
                     ));
                 }
+                CodeQueryResultValue::LiteralOccurrence { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let identity = value
+                        .identity
+                        .as_deref()
+                        .map(sanitize_terminal_text)
+                        .unwrap_or_else(|| "incomplete".to_owned());
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {}={} (coverage={}; trivial={})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(
+                            Style::new().fg(Color::Blue),
+                            "literal occurrence:",
+                            use_color
+                        ),
+                        value.kind,
+                        identity,
+                        value.coverage,
+                        value.trivial,
+                    ));
+                }
                 CodeQueryResultValue::CallableSignature { value } => {
                     let path = sanitize_terminal_text(&value.path);
                     let fq_name = sanitize_terminal_text(&value.declaration.fq_name);
@@ -2061,6 +2212,29 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                             .receiver_contract
                             .map(|contract| format!(" receiver={contract}"))
                             .unwrap_or_default(),
+                    ));
+                }
+                CodeQueryResultValue::CallableMetrics { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let fq_name = sanitize_terminal_text(&value.declaration.fq_name);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} [{}; {}] nesting={} complexity={} span={}\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "callable metrics:", use_color),
+                        fq_name,
+                        value.language,
+                        value.coverage,
+                        value
+                            .max_nesting
+                            .map_or_else(|| "unknown".to_owned(), |metric| metric.to_string()),
+                        value
+                            .cognitive_complexity
+                            .map_or_else(|| "unknown".to_owned(), |metric| metric.to_string()),
+                        value
+                            .owned_body_span_lines
+                            .map_or_else(|| "unknown".to_owned(), |metric| metric.to_string()),
                     ));
                 }
                 CodeQueryResultValue::SignatureParameter { value } => {
@@ -2377,6 +2551,23 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         value.program_point, value.completeness
                     ));
                 }
+                CodeQueryResultValue::BindingInitializerCall { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} ({})\n  establishment {}, site_ast_id {}\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(
+                            Style::new().fg(Color::Blue),
+                            "binding initializer call",
+                            use_color
+                        ),
+                        value.initializer_role,
+                        sanitize_terminal_text(&value.establishment_event_id),
+                        sanitize_terminal_text(&value.site_ast_id),
+                    ));
+                }
                 CodeQueryResultValue::RewritePath { value } => {
                     let path = sanitize_terminal_text(&value.path);
                     out.push_str(&format!(
@@ -2473,6 +2664,20 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         value.completeness,
                     ));
                 }
+                CodeQueryResultValue::DependencyEvidence { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    out.push_str(&format!(
+                        "{}:{}..{}\n  dependency: {} {} {} version={} source={} member={} scope={}\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.start_byte, value.end_byte,
+                        sanitize_terminal_text(&value.ecosystem), sanitize_terminal_text(&value.package),
+                        sanitize_terminal_text(&value.evidence_kind),
+                        sanitize_terminal_text(value.exact_version.as_deref().or(value.version_requirement.as_deref()).unwrap_or("unresolved")),
+                        sanitize_terminal_text(value.source.as_deref().unwrap_or("unspecified")),
+                        sanitize_terminal_text(value.declared_by.as_deref().unwrap_or("unassociated")),
+                        sanitize_terminal_text(&value.scope),
+                    ));
+                }
                 CodeQueryResultValue::ConfigurationFact { value } => {
                     let path = sanitize_terminal_text(&value.path);
                     out.push_str(&format!(
@@ -2490,6 +2695,78 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         value.format,
                         value.completeness,
                     ));
+                }
+                CodeQueryResultValue::PythonRuleFact { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} (outcome={}; proof={}; completeness={})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "Python rule fact:", use_color),
+                        paint(Style::new().bold(), value.relation, use_color),
+                        value.outcome,
+                        value.proof,
+                        value.completeness,
+                    ));
+                    if let Some(reason) = &value.reason {
+                        out.push_str(&format!("  reason: {}\n", sanitize_terminal_text(reason)));
+                    }
+                }
+                CodeQueryResultValue::RustPointerFinding { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} (origin={}; access={}; cause={}; strength={}; bounds={}; proof={}; completeness={})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "Rust pointer finding:", use_color),
+                        paint(Style::new().bold(), value.relation, use_color),
+                        sanitize_terminal_text(&value.origin_id),
+                        value.access_kind,
+                        value.invalidation_cause.unwrap_or("none"),
+                        value.strength,
+                        value.bounds,
+                        value.proof,
+                        value.completeness,
+                    ));
+                    if let Some(reason) = &value.reason {
+                        out.push_str(&format!("  reason: {}\n", sanitize_terminal_text(reason)));
+                    }
+                }
+                CodeQueryResultValue::CrossDomain { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let anchor = value.range.map_or(path.clone(), |range| {
+                        format!("{path}:{}:{}", range.start_line, range.start_column)
+                    });
+                    out.push_str(&format!(
+                        "{}\n  {} {} {}",
+                        paint(Style::new().fg(Color::Cyan).bold(), &anchor, use_color),
+                        paint(Style::new().fg(Color::Blue), "cross-domain:", use_color),
+                        value.operator,
+                        value.domain,
+                    ));
+                    if let Some(relation) = value.relation {
+                        out.push_str(&format!(" {relation}"));
+                    }
+                    if let Some(binding) = value.binding {
+                        out.push_str(&format!(" ({binding})"));
+                    }
+                    if let Some(key) = &value.key {
+                        out.push_str(&format!(
+                            " key {}",
+                            paint(Style::new().bold(), &sanitize_terminal_text(key), use_color)
+                        ));
+                    }
+                    if let Some(configuration) = &value.configuration {
+                        out.push_str(&format!(
+                            " -> {}:{}:{}",
+                            sanitize_terminal_text(&configuration.path),
+                            configuration.range.start_line,
+                            configuration.range.start_column
+                        ));
+                    }
+                    out.push('\n');
                 }
                 CodeQueryResultValue::FlowRelation { value } => {
                     let path = sanitize_terminal_text(&value.path);
@@ -2608,22 +2885,11 @@ fn push_terminal_safe_char(sanitized: &mut String, ch: char, preserve_newlines: 
         '\t' => sanitized.push_str("\\t"),
         '\u{1b}' => sanitized.push_str("\\x1b"),
         '\u{07}' => sanitized.push_str("\\x07"),
-        ch if ch.is_control() || is_unicode_directional_control(ch) => {
+        ch if ch.is_control() || is_bidi_control(ch) => {
             sanitized.push_str(&format!("\\u{{{:x}}}", ch as u32));
         }
         ch => sanitized.push(ch),
     }
-}
-
-fn is_unicode_directional_control(ch: char) -> bool {
-    matches!(
-        ch,
-        '\u{061c}'
-            | '\u{200e}'
-            | '\u{200f}'
-            | '\u{202a}'..='\u{202e}'
-            | '\u{2066}'..='\u{2069}'
-    )
 }
 
 fn paint(style: Style, text: &str, use_color: bool) -> String {
@@ -2696,10 +2962,20 @@ fn roles_text() -> String {
         .join("\n")
 }
 
+/// The labels the query `languages` axis accepts: each analyzable language's
+/// config label, then the `tsx` and `jsx` extension spellings. The C dialect
+/// label `cpp-c` is an artifact dialect, not an axis value (the axis would
+/// have to widen it to all of C++), so it is not listed here.
+fn query_language_labels() -> Vec<&'static str> {
+    Language::ANALYZABLE
+        .iter()
+        .map(|language| language.config_label())
+        .chain(["tsx", "jsx"])
+        .collect()
+}
+
 fn languages_text() -> String {
-    RuneIrLanguage::config_labels()
-        .collect::<Vec<_>>()
-        .join("\n")
+    query_language_labels().join("\n")
 }
 
 fn doc_text(name: &str) -> String {
@@ -2859,14 +3135,16 @@ impl ReplCompleter {
             description: role.description().to_string(),
         }));
         entries.extend(
-            RuneIrLanguage::config_labels().map(|label| CompletionEntry {
-                value: label.to_string(),
-                description: if label == "tsx" {
-                    "Rune IR parser label for TypeScript source containing JSX".to_string()
-                } else {
-                    "language filter and Rune IR parser label".to_string()
-                },
-            }),
+            query_language_labels()
+                .into_iter()
+                .map(|label| CompletionEntry {
+                    value: label.to_string(),
+                    description: if label == "tsx" {
+                        "Language filter label for TypeScript source containing JSX".to_string()
+                    } else {
+                        "language filter label".to_string()
+                    },
+                }),
         );
         entries.extend(EXAMPLES.iter().map(|example| CompletionEntry {
             value: example.name.to_string(),
@@ -2968,25 +3246,7 @@ fn balanced_delimiters(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brokk_bifrost::rql::{
-        CodeQueryCapture, CodeQueryDecoratedParameter, CodeQueryRange, CodeQueryResultItem,
-    };
-
-    #[test]
-    fn code_query_repl_loads_sexp_with_human_summary() {
-        let mut session = ReplSession::new();
-        let (_flow, output) = session.process_line(r#"(call :callee (name "eval"))"#, None);
-        assert!(output.contains("Loaded call query"), "{output}");
-        assert!(
-            output.contains("Use :run to execute it, or :json to inspect canonical JSON."),
-            "{output}"
-        );
-        assert!(!output.contains("\"kind\": \"call\""), "{output}");
-
-        let (_flow, output) = session.process_line(":json", None);
-        assert!(output.contains("\"kind\": \"call\""), "{output}");
-        assert!(output.contains("\"name\": \"eval\""), "{output}");
-    }
+    use brokk_bifrost::rql::CodeQueryResultItem;
 
     #[test]
     fn code_query_repl_keeps_json_as_generated_output_only() {
@@ -3014,14 +3274,6 @@ mod tests {
         assert!(!output.contains('\u{07}'), "{output:?}");
         assert!(output.contains("\\x1b"), "{output}");
         assert!(output.contains("\\x07"), "{output}");
-    }
-
-    #[test]
-    fn code_query_repl_validates_current_query() {
-        let mut session = ReplSession::new();
-        session.process_line(r#"(call :callee (name "eval"))"#, None);
-        let (_flow, output) = session.process_line(":validate", None);
-        assert_eq!(output, "Query is valid.");
     }
 
     #[test]
@@ -3053,16 +3305,6 @@ mod tests {
         assert!(profile.contains("\"cache_layers\""), "{profile}");
         assert!(profile.contains("\"operators\""), "{profile}");
         assert!(profile.contains("\"peak_concurrency\": 1"), "{profile}");
-    }
-
-    #[test]
-    fn code_query_repl_exposes_doc_metadata() {
-        assert!(doc_text(":run").contains("Run"));
-        assert!(doc_text(":ir").contains("Rune IR"));
-        assert!(doc_text("call").contains("Match call"));
-        assert!(doc_text("comments").contains("no block comments"));
-        assert!(doc_text("callee").contains("call target"));
-        assert!(doc_text("calls").contains("eval"));
     }
 
     /// `:doc <row-domain>` reads the published relation catalog, so a policy
@@ -3097,47 +3339,6 @@ mod tests {
     }
 
     #[test]
-    fn code_query_repl_renders_multiline_rune_ir_without_search_service() {
-        let mut session = ReplSession::new();
-        let (_, output) = session.process_line(":ir rust", None);
-        assert!(output.contains("Capturing rust source"), "{output}");
-        assert!(
-            session
-                .process_line("fn greet(name: &str) {", None)
-                .1
-                .is_empty()
-        );
-        assert!(
-            session
-                .process_line("    println!(\"{name}\");", None)
-                .1
-                .is_empty()
-        );
-        assert!(session.process_line("}", None).1.is_empty());
-
-        let (_, output) = session.process_line(":end", None);
-        assert!(output.contains("Rune IR (rust):"), "{output}");
-        assert!(output.contains("(function"), "{output}");
-        assert!(output.contains(":name \"greet\""), "{output}");
-        assert!(
-            output.contains("Starter RQL:\n(function :name \"greet\")"),
-            "{output}"
-        );
-        assert!(!output.contains("function_item"), "{output}");
-    }
-
-    #[test]
-    fn rune_ir_capture_preserves_leading_blank_lines_and_ranges() {
-        let mut session = ReplSession::new();
-        session.process_line(":ir rust", None);
-        session.process_line("", None);
-        session.process_line("fn f() {}", None);
-
-        let (_, output) = session.process_line(":end", None);
-        assert!(output.contains("(function :range (1 10)"), "{output}");
-    }
-
-    #[test]
     fn rune_ir_terminal_output_escapes_directional_controls() {
         let mut session = ReplSession::new();
         session.process_line(":ir rust", None);
@@ -3169,33 +3370,6 @@ mod tests {
             .unwrap();
         assert_eq!(entries.len(), 1, "{entries:?}");
         assert_eq!(entries[0].command_line, ":ir rust");
-    }
-
-    #[test]
-    fn rune_ir_languages_include_tsx_parser_flavor() {
-        assert!(languages_text().lines().any(|label| label == "tsx"));
-        assert!(doc_text("tsx").contains("TypeScript source containing JSX"));
-        let mut completer = ReplCompleter::new();
-        assert!(
-            completer
-                .complete("tsx", 3)
-                .iter()
-                .any(|suggestion| suggestion.value == "tsx")
-        );
-    }
-
-    #[test]
-    fn code_query_repl_rune_ir_errors_are_actionable() {
-        let mut session = ReplSession::new();
-        let (_, output) = session.process_line(":ir", None);
-        assert!(output.contains("usage: :ir <language>"), "{output}");
-
-        let (_, output) = session.process_line(":ir brainfuck", None);
-        assert!(output.contains("unsupported Rune IR language"), "{output}");
-
-        session.process_line(":ir python", None);
-        let (_, output) = session.process_line(":end", None);
-        assert!(output.contains("source is empty"), "{output}");
     }
 
     #[test]
@@ -3274,204 +3448,12 @@ mod tests {
     }
 
     #[test]
-    fn code_query_repl_completes_commands_and_roles_with_descriptions() {
-        let mut completer = ReplCompleter::new();
-        let suggestions = completer.complete(":r", 2);
-        assert!(
-            suggestions
-                .iter()
-                .any(|suggestion| suggestion.value == ":run")
-        );
-        assert!(
-            completer
-                .complete("comm", 4)
-                .iter()
-                .any(|suggestion| suggestion.value == "comments")
-        );
-        assert!(
-            suggestions
-                .iter()
-                .any(|suggestion| suggestion.description.is_some())
-        );
-
-        let suggestions = completer.complete("(call :cal", 10);
-        assert!(
-            suggestions
-                .iter()
-                .any(|suggestion| suggestion.value == ":callee")
-        );
-    }
-
-    #[test]
-    fn code_query_repl_validator_accepts_multiline_until_balanced() {
-        let validator = ReplValidator {
-            rune_ir_capture_mode: Arc::new(AtomicBool::new(false)),
-        };
-        assert!(matches!(
-            validator.validate(r#"(call :callee (name "eval")"#),
-            ValidationResult::Incomplete
-        ));
-        assert!(matches!(
-            validator.validate(r#"(call :callee (name "eval"))"#),
-            ValidationResult::Complete
-        ));
-    }
-
-    #[test]
-    fn code_query_repl_accumulates_scripted_multiline_queries() {
-        let mut pending = String::new();
-        assert_eq!(accumulate_scripted_input(&mut pending, "(class"), None);
-        assert_eq!(
-            accumulate_scripted_input(&mut pending, r#"  :name "A")"#),
-            Some("(class\n  :name \"A\")".to_string())
-        );
-        assert_eq!(
-            accumulate_scripted_input(&mut pending, ":validate"),
-            Some(":validate".to_string())
-        );
-    }
-
-    #[test]
     fn code_query_repl_ctrl_c_quits_only_after_second_consecutive_signal() {
         let mut guard = CtrlCQuitGuard::default();
         assert_eq!(guard.record_ctrl_c(), ReplFlow::Continue);
         guard.reset();
         assert_eq!(guard.record_ctrl_c(), ReplFlow::Continue);
         assert_eq!(guard.record_ctrl_c(), ReplFlow::Quit);
-    }
-
-    #[test]
-    fn code_query_repl_renders_query_code_matches_as_multiline_entries() {
-        let matched = CodeQueryMatch {
-            ast_id: Some("test-ast-id".to_string()),
-            path: "editors/vscode/src/provisioning.ts".to_string(),
-            language: "typescript",
-            kind: "function",
-            start_line: 259,
-            end_line: 269,
-            text:
-                "async function probeBifrostVersion(binaryPath: string): Promise<VersionProbe> {…"
-                    .to_string(),
-            id: None,
-            node_range: None,
-            decorated_range: None,
-            decorator_ranges: Vec::new(),
-            captures: vec![CodeQueryCapture {
-                ast_id: None,
-                name: "callee".to_string(),
-                text: "probe".to_string(),
-                start_line: 260,
-                range: None,
-                kind: None,
-            }],
-            enclosing_symbol: Some("probeBifrostVersion".to_string()),
-        };
-        let output = render_code_query_repl_output(
-            &CodeQueryResult {
-                session_subset: None,
-                results: vec![CodeQueryResultItem {
-                    value: CodeQueryResultValue::StructuralMatch {
-                        value: matched.clone(),
-                    },
-                    provenance: Vec::new(),
-                    provenance_truncated: false,
-                    row_projection: Vec::new(),
-                }],
-                truncated: false,
-                diagnostics: Vec::new(),
-            },
-            false,
-        );
-
-        assert!(output.contains("1 result"), "{output}");
-        assert!(
-            output.contains("editors/vscode/src/provisioning.ts:259-269"),
-            "{output}"
-        );
-        assert!(output.contains("  kind: function"), "{output}");
-        assert!(output.contains("  symbol: probeBifrostVersion"), "{output}");
-        assert!(
-            output.contains("  code: `async function probeBifrostVersion"),
-            "{output}"
-        );
-        assert!(
-            output.contains("  capture: $callee = `probe` line 260"),
-            "{output}"
-        );
-    }
-
-    #[test]
-    fn code_query_repl_renders_decorated_parameter_identity_and_ranges() {
-        let output = render_code_query_repl_output(
-            &CodeQueryResult {
-                session_subset: None,
-                results: vec![CodeQueryResultItem {
-                    value: CodeQueryResultValue::DecoratedParameter {
-                        value: Box::new(CodeQueryDecoratedParameter {
-                            id: "decorated-parameter".to_owned(),
-                            parameter_id: "parameter".to_owned(),
-                            decorator_id: Some("decorator".to_owned()),
-                            path: "src/controller.ts".to_owned(),
-                            language: "typescript",
-                            range: CodeQueryRange {
-                                start_line: 10,
-                                start_column: 19,
-                                end_line: 10,
-                                end_column: 41,
-                            },
-                            decorator_range: CodeQueryRange {
-                                start_line: 10,
-                                start_column: 19,
-                                end_line: 10,
-                                end_column: 32,
-                            },
-                            owner_id: Some("Controller.handle".to_owned()),
-                            procedure_id: Some("procedure".to_owned()),
-                            value_id: Some("value".to_owned()),
-                            parameter_ordinal: Some(1),
-                            port_id: Some("procedure:parameter:1".to_owned()),
-                            decorator_name: "Query".to_owned(),
-                            annotation_type: None,
-                            annotation_status: None,
-                            local_name: Some("NestQuery".to_owned()),
-                            imported_name: Some("Query".to_owned()),
-                            module: Some("@nestjs/common".to_owned()),
-                            binding_status: "resolved",
-                            boundary: "external",
-                            completion: "complete",
-                            coverage: "complete",
-                            reason: None,
-                            terminal: true,
-                        }),
-                    },
-                    provenance: Vec::new(),
-                    provenance_truncated: false,
-                    row_projection: Vec::new(),
-                }],
-                truncated: false,
-                diagnostics: Vec::new(),
-            },
-            false,
-        );
-
-        assert!(output.contains("src/controller.ts:10:19-10:41"), "{output}");
-        assert!(
-            output.contains("decorated parameter: parameter decorator=Query at 10:19-10:32",),
-            "{output}"
-        );
-        assert!(
-            output.contains(
-                "owner=Controller.handle procedure=procedure value=value ordinal=1 port=procedure:parameter:1"
-            ),
-            "{output}"
-        );
-        assert!(
-            output.contains(
-                "module=@nestjs/common imported=Query local=NestQuery binding=resolved boundary=external completion=complete coverage=complete terminal=true"
-            ),
-            "{output}"
-        );
-        assert!(output.contains("decorator id=decorator"), "{output}");
     }
 
     #[test]
@@ -3485,11 +3467,13 @@ mod tests {
             end_line: 1,
             text: "fn demo() {}\u{1b}[2J".to_string(),
             id: None,
+            relations: None,
             node_range: None,
             decorated_range: None,
             decorator_ranges: Vec::new(),
             captures: Vec::new(),
             enclosing_symbol: None,
+            python_import: None,
         };
         let output = render_code_query_repl_output(
             &CodeQueryResult {

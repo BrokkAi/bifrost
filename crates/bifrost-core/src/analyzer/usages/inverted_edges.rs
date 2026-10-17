@@ -40,6 +40,25 @@ pub fn first_precise<T: Clone + Eq + Hash>(
         .and_then(|targets| targets.iter().next().cloned())
 }
 
+/// The only target for `name`, when the engine resolved it precisely and
+/// exactly one target remains.
+pub fn unique_precise<T: Clone + Eq + Hash>(
+    bindings: &LocalInferenceEngine<T>,
+    name: &str,
+) -> Option<T> {
+    let targets = bindings.resolve_symbol_ref(name)?.as_precise()?;
+    (targets.len() == 1).then(|| targets.iter().next().expect("len checked").clone())
+}
+
+/// Remove equality-duplicate items while retaining their first occurrence.
+pub fn dedup_preserving_order<T: Clone + Eq + Hash>(items: impl IntoIterator<Item = T>) -> Vec<T> {
+    let mut seen = HashSet::default();
+    items
+        .into_iter()
+        .filter(|item| seen.insert(item.clone()))
+        .collect()
+}
+
 /// Per-file index of class-like declaration spans, for attributing an
 /// unqualified / `this` / `self` reference to its enclosing class. Sources the
 /// analyzer's own fqns, so nested classes resolve to whatever fqn the analyzer
@@ -82,20 +101,20 @@ impl ClassRangeIndex {
 
     /// The fqn of the smallest class declaration containing `byte`.
     pub fn enclosing(&self, byte: usize) -> Option<&str> {
-        self.ranges
-            .iter()
-            .filter(|(start, end, _, _)| *start <= byte && byte < *end)
-            .min_by_key(|(start, end, _, _)| end - start)
+        self.smallest_enclosing(byte)
             .map(|(_, _, _, fqn)| fqn.as_str())
     }
 
     /// The exact declaration identity of the smallest class containing `byte`.
     pub fn enclosing_unit(&self, byte: usize) -> Option<&CodeUnit> {
+        self.smallest_enclosing(byte).map(|(_, _, unit, _)| unit)
+    }
+
+    fn smallest_enclosing(&self, byte: usize) -> Option<&(usize, usize, CodeUnit, String)> {
         self.ranges
             .iter()
             .filter(|(start, end, _, _)| *start <= byte && byte < *end)
             .min_by_key(|(start, end, _, _)| end - start)
-            .map(|(_, _, unit, _)| unit)
     }
 
     /// The indexed class-like declaration whose parser span is exactly
@@ -644,6 +663,13 @@ impl<'a, K: NodeKey> FileEdgeScanInput<'a, K> {
             .map(|(_, _, key)| key)
     }
 
+    fn cloned_enclosing(&self, start: usize, end: usize) -> Option<K>
+    where
+        K: Clone,
+    {
+        self.enclosing(start, end).cloned()
+    }
+
     fn overlaps_definition(&self, callee: &K, start: usize, end: usize) -> bool {
         self.declarations
             .definitions
@@ -710,11 +736,26 @@ impl<K: NodeKey> PerFileEdges<K> {
         if !input.accepts_callee(&callee) {
             return;
         }
-        let caller = match input.enclosing(start, end) {
-            Some(caller) => caller.clone(),
-            None => return,
+        let Some(caller) = input.cloned_enclosing(start, end) else {
+            return;
         };
         self.record_with_caller_kind(input, caller, callee, kind, start, end);
+    }
+
+    /// Record a reference using the call-site classification from its syntax node.
+    pub fn record_reference(
+        &mut self,
+        input: &FileEdgeScanInput<'_, K>,
+        callee: K,
+        node: Node<'_>,
+    ) {
+        self.record_kind(
+            input,
+            callee,
+            classify_reference_node(node),
+            node.start_byte(),
+            node.end_byte(),
+        );
     }
 
     pub fn record_with_caller_kind(
@@ -766,7 +807,7 @@ impl<K: NodeKey> PerFileEdges<K> {
         start: usize,
         end: usize,
     ) {
-        let Some(caller) = input.enclosing(start, end).cloned() else {
+        let Some(caller) = input.cloned_enclosing(start, end) else {
             return;
         };
         self.record_with_caller_exact_kind(input, caller, callee, kind, start, end);
@@ -812,6 +853,16 @@ impl<K: NodeKey> PerFileEdges<K> {
         }
     }
 
+    /// Record a syntax node as an unresolved reference to the matching names.
+    pub fn record_unproven_name_at_node(
+        &mut self,
+        input: &FileEdgeScanInput<'_, K>,
+        name: &str,
+        node: Node<'_>,
+    ) {
+        self.record_unproven_name(input, name, node.start_byte(), node.end_byte());
+    }
+
     /// Record that a structured call/member site matched `callee` exactly but
     /// could not be resolved to a proven edge.
     pub fn record_unproven(
@@ -845,6 +896,7 @@ mod tests {
     use super::*;
     use crate::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
     use crate::analyzer::model::CodeUnitType;
+    use brokk_bifrost_test_macros::hardwon;
 
     /// A Scala declaration whose name is `package.terminal`, with `terminal`
     /// interned verbatim as one segment -- exactly what the Scala declaration
@@ -869,6 +921,9 @@ mod tests {
     /// not the tail of a `.`-split of the rendered name. Split that way,
     /// `` scalaz.`zio.ZIO` `` yields `` ZIO` ``, which no source site spells.
     #[test]
+    #[hardwon(
+        "#3033: inverted-edge lookup derived a false terminal by splitting a dotted Scala name"
+    )]
     fn scala_backtick_quoted_dotted_terminal_is_one_segment() {
         let unit = scala_class("scalaz", "`zio.ZIO`");
         assert_eq!(unit.fq_name(), "scalaz.`zio.ZIO`");
@@ -887,6 +942,7 @@ mod tests {
     /// (`::`, `+`) is still its own terminal -- which is why the rendered-name
     /// splitter, not `symbol_path_segments`, answers here.
     #[test]
+    #[hardwon("#3033: terminal recovery for unaffected names regressed during the Scala fix")]
     fn ordinary_and_symbolic_terminals_are_unchanged() {
         let plain = String::from_unit(&scala_class("scalaz", "Plain"));
         assert_eq!(plain.terminal(Language::Scala), "Plain");
@@ -904,6 +960,9 @@ mod tests {
     /// callee set by that same terminal, so a source site spelling
     /// `` `zio.ZIO` `` reaches its callee.
     #[test]
+    #[hardwon(
+        "#3033: the inverted index stored a derived fragment instead of the recorded Scala terminal"
+    )]
     fn terminal_index_groups_callees_by_recorded_terminal() {
         let quoted = String::from_unit(&scala_class("scalaz", "`zio.ZIO`"));
         let plain = String::from_unit(&scala_class("scalaz", "Plain"));
@@ -921,6 +980,9 @@ mod tests {
     /// A file-scoped key answers from its own fqn, so the module-scoped
     /// ecosystem shares the one derivation.
     #[test]
+    #[hardwon(
+        "#3033: file-scoped usage keys followed a different terminal split from package keys"
+    )]
     fn file_scoped_keys_share_the_terminal_derivation() {
         let key = UsageNodeKey::new(
             ProjectFile::new(std::env::temp_dir(), "src/a.ts"),

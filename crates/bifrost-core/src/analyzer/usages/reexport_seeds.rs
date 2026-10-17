@@ -56,6 +56,17 @@ pub fn seeds_for_target(
             }
         }
     }
+    expand_reexport_seeds(seeds, reexport_edges, star_reexports, |_| true)
+}
+
+/// Follow named and star re-export edges from initial seeds. `include_star_name`
+/// supplies the language's rule for which names pass through star exports.
+pub fn expand_reexport_seeds(
+    mut seeds: BTreeSet<(ProjectFile, String)>,
+    reexport_edges: &HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>>,
+    star_reexports: &HashMap<ProjectFile, Vec<ProjectFile>>,
+    mut include_star_name: impl FnMut(&str) -> bool,
+) -> BTreeSet<(ProjectFile, String)> {
     let mut frontier: VecDeque<(ProjectFile, String)> = seeds.iter().cloned().collect();
     while let Some(seed) = frontier.pop_front() {
         if let Some(reexports) = reexport_edges.get(&seed) {
@@ -65,7 +76,9 @@ pub fn seeds_for_target(
                 }
             }
         }
-        if let Some(star_files) = star_reexports.get(&seed.0) {
+        if include_star_name(&seed.1)
+            && let Some(star_files) = star_reexports.get(&seed.0)
+        {
             for star_file in star_files {
                 let next = (star_file.clone(), seed.1.clone());
                 if seeds.insert(next.clone()) {

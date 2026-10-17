@@ -6,7 +6,7 @@
 //! is a property of the plan structure, never of the policy that authored it.
 //! The caller must also prove cumulative budget headroom before using a merge.
 
-use super::ir::{CodeQueryPlan, CodeQueryPlanSource};
+use super::ir::{CodeQueryPlan, CodeQueryPlanSource, QueryValueKind, SetOperator};
 use super::schema::QueryStepOp;
 
 impl CodeQueryPlan {
@@ -26,9 +26,7 @@ impl CodeQueryPlan {
             {
                 return true;
             }
-            if let CodeQueryPlanSource::Set { branches, .. } = &plan.source {
-                pending.extend(branches);
-            }
+            pending.extend(plan.source.child_plans());
         }
         false
     }
@@ -52,9 +50,11 @@ impl PlanPartitioning {
     ///
     /// Set plans are `Whole` unless they are unions whose leaves are all
     /// seed-partitionable, use one comparator family, and whose only set-node
-    /// suffixes are typed row filters or projections. Those two operations
-    /// distribute over union because they inspect or rename one row without
-    /// consulting any other row. The remaining shapes are `Whole`:
+    /// suffixes are projections. Projection retains the first representative's
+    /// payload and only renames its fields. A filter must run after identity
+    /// deduplication and evidence merging: even compatible branch schemas can
+    /// expose different values for the same identity. Leaf-local filters still
+    /// run before the set and remain eligible. The remaining shapes are `Whole`:
     ///
     /// - An intersect/except source, or a union with a non-distributive suffix.
     ///   Those operators consume cross-seed membership or a deduplicated set
@@ -68,6 +68,9 @@ impl PlanPartitioning {
     ///   `DetailedCodeQueryDecoratedParameterEvidence`, runtime-only semantic
     ///   identity that is deliberately outside the serializable row model, so a
     ///   unit product cannot carry it.
+    /// - A cross-domain source (`correlate`, `require_both`). A correlation
+    ///   pairs rows from different files and a satisfaction check reads both
+    ///   whole inputs, so neither result is a concatenation of per-seed rows.
     /// - A registration-dependent step ([`QueryStepOp::is_registration_dependent`]).
     ///   Those steps read the interprocedural graph and the summary repository
     ///   through funnels that record no read key today, so a per-seed unit over
@@ -85,6 +88,76 @@ impl PlanPartitioning {
         Self::classify_leaf(plan)
     }
 
+    /// Whether one file's rows of `plan` are the rows of `plan` executed with
+    /// its seed enumeration narrowed to that file, for a consumer that reads
+    /// one file's rows at a time and merges nothing across files: the taint
+    /// composition's frontier, which binds the endpoints of one blob.
+    ///
+    /// This differs from [`Self::classify`] on purpose. A unit's per-seed
+    /// rows must merge into the whole execution's rows exactly, with their
+    /// order, first-writer deduplication and cross-seed membership, so an
+    /// `except` is whole there: its result consults rows of every seed. A
+    /// consumer of one file needs only that file's rows. A set-difference key
+    /// that names the row's file (structural matches, occurrences, bindings,
+    /// files: `PipelineKey` in `structural/search/mod.rs`) makes `A except B`
+    /// restricted to one file the difference of `A` and `B` restricted to that
+    /// file, so the narrowed execution answers it when both branches do.
+    /// Every other plan answers it exactly when [`Self::classify`] slices it.
+    /// The reading that a by-seed plan's rows of one file are the rows of
+    /// that file's seeds is the one the frontier already takes for a plan
+    /// without sets.
+    /// It holds only while each row lies in the file of the seed that
+    /// produced it, so a plan with a step that can move its rows out
+    /// of the seed file ([`QueryStepOp::rows_may_leave_seed_file`]) in any branch is not
+    /// restricted: the consumer evaluates it once over the workspace and
+    /// indexes the rows by where they lie.
+    pub fn restricts_to_seed_file(plan: &CodeQueryPlan) -> bool {
+        let mut pending = vec![plan];
+        while let Some(current) = pending.pop() {
+            // A step whose rows can lie in another file than their seed's
+            // makes file F's rows not the rows of F's seeds, so the narrowed
+            // execution of F answers a different question.
+            if current
+                .steps
+                .iter()
+                .any(|step| step.op().rows_may_leave_seed_file())
+            {
+                return false;
+            }
+            match &current.source {
+                CodeQueryPlanSource::Set {
+                    op: SetOperator::Except,
+                    branches,
+                } => {
+                    let row_local_suffix = current.steps.iter().all(|step| {
+                        matches!(step.op(), QueryStepOp::Filter | QueryStepOp::Project)
+                    });
+                    let file_keyed = matches!(
+                        branches
+                            .first()
+                            .expect("a set operation has branches")
+                            .value_kind(),
+                        QueryValueKind::StructuralMatch
+                            | QueryValueKind::Occurrence
+                            | QueryValueKind::Binding
+                            | QueryValueKind::File
+                    );
+                    if !(row_local_suffix && file_keyed) {
+                        return false;
+                    }
+                    pending.extend(branches);
+                }
+                _ => {
+                    if !Self::classify(current).is_by_seed() {
+                        return false;
+                    }
+                    pending.extend(current.source.child_plans());
+                }
+            }
+        }
+        true
+    }
+
     /// Whether this plan may be executed one seed file at a time.
     pub const fn is_by_seed(self) -> bool {
         matches!(self, Self::BySeed | Self::BySeedUnion)
@@ -96,9 +169,15 @@ impl PlanPartitioning {
     }
 
     fn classify_leaf(plan: &CodeQueryPlan) -> Self {
-        if plan.steps.iter().any(|step| {
-            step.op() == QueryStepOp::DecoratorBindings || step.op().is_registration_dependent()
-        }) {
+        if plan.source.uses_only_file_facts()
+            || matches!(
+                &plan.source,
+                CodeQueryPlanSource::Correlate(_) | CodeQueryPlanSource::RequireBoth(_)
+            )
+            || plan.steps.iter().any(|step| {
+                step.op() == QueryStepOp::DecoratorBindings || step.op().is_registration_dependent()
+            })
+        {
             Self::Whole
         } else {
             Self::BySeed
@@ -106,8 +185,8 @@ impl PlanPartitioning {
     }
 
     /// Validate the restricted union shape and return its checked fair-share
-    /// divisor. Every set node must be a union with only distributive row-local
-    /// suffixes, and every leaf must be a seed-partitionable plan with the same
+    /// divisor. Every set node must be a union with only projection suffixes,
+    /// and every leaf must be a seed-partitionable plan with the same
     /// seed ordering family.
     pub(crate) fn classify_union(plan: &CodeQueryPlan) -> Option<usize> {
         let CodeQueryPlanSource::Set { .. } = &plan.source else {
@@ -122,9 +201,10 @@ impl PlanPartitioning {
             match &current.source {
                 CodeQueryPlanSource::Set { op, branches } => {
                     if *op != super::ir::SetOperator::Union
-                        || current.steps.iter().any(|step| {
-                            !matches!(step.op(), QueryStepOp::Filter | QueryStepOp::Project)
-                        })
+                        || current
+                            .steps
+                            .iter()
+                            .any(|step| step.op() != QueryStepOp::Project)
                     {
                         return None;
                     }
@@ -159,13 +239,16 @@ impl PlanPartitioning {
     }
 
     /// Return the non-set leaves and their full branch paths for an eligible
-    /// union. Distributive set-node suffixes are appended to each descendant
+    /// union. Project-only set-node suffixes are appended to each descendant
     /// leaf in execution order, so unit execution applies the same row-local
-    /// transformation before the global branch-order merge. The traversal is
+    /// transformation before the global branch-order merge. Each tuple also
+    /// carries the inherited suffix length: diagnostic selection must preserve
+    /// the original leaf boundary even though those steps now execute locally.
+    /// The traversal is
     /// iterative so query depth cannot consume the Rust call stack.
     pub(crate) fn union_leaf_plans(
         plan: &CodeQueryPlan,
-    ) -> Option<Vec<(CodeQueryPlan, Vec<usize>)>> {
+    ) -> Option<Vec<(CodeQueryPlan, Vec<usize>, usize)>> {
         Self::classify_union(plan)?;
         let mut pending = vec![(plan, Vec::new(), Vec::new())];
         let mut leaves = Vec::new();
@@ -182,8 +265,9 @@ impl PlanPartitioning {
                 }
                 _ => {
                     let mut leaf = current.clone();
+                    let inherited_suffix_steps = inherited_steps.len();
                     leaf.steps.extend(inherited_steps);
-                    leaves.push((leaf, path));
+                    leaves.push((leaf, path, inherited_suffix_steps));
                 }
             }
         }
@@ -200,6 +284,7 @@ mod tests {
     use super::*;
     use crate::query::ir::CodeQuery;
     use crate::query::schema::QueryStepShape;
+    use brokk_bifrost_test_macros::hardwon;
     use serde_json::{Value, json};
 
     fn plan(query: Value) -> CodeQueryPlan {
@@ -209,6 +294,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#3394+#2586: field-index work must be hoisted without disabling seed partitioning")]
     fn field_index_requirement_is_separate_from_seed_partitionability() {
         for operation in ["class_set", "absent_member"] {
             let plan = plan(json!({
@@ -221,6 +307,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#3394+#2586: a nested field-index branch must trigger one workspace prepass")]
     fn nested_set_branch_retains_its_workspace_field_requirement() {
         let field = json!({
             "match": { "kind": "function" },
@@ -238,6 +325,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#3394+#2586: ordinary sliced derivations must not trigger the field-index prepass")]
     fn ordinary_derived_queries_do_not_require_workspace_field_preparation() {
         let plan = plan(json!({
             "union": [
@@ -253,57 +341,179 @@ mod tests {
     }
 
     #[test]
-    fn a_seed_only_plan_is_partitioned_by_seed() {
+    #[hardwon("#5294+#5310: project-only union decomposition must retain original leaf boundaries")]
+    fn union_projections_preserve_leaf_filters_and_boundaries() {
+        let plan = plan(json!({
+            "union": [
+                {
+                    "occurrences": { "class": "reference" },
+                    "steps": [{ "op": "filter", "where": [{ "field": "target_id", "op": "is_not_null" }] }]
+                },
+                {
+                    "occurrences": { "class": "reference" },
+                    "steps": [{ "op": "filter", "where": [{ "field": "target_id", "op": "is_not_null" }] }]
+                }
+            ],
+            "steps": [
+                {
+                    "op": "project",
+                    "columns": [{ "source": "id", "name": "site" }]
+                }
+            ]
+        }));
         assert_eq!(
-            PlanPartitioning::classify(&plan(json!({ "match": { "kind": "function" } }))),
-            PlanPartitioning::BySeed
+            PlanPartitioning::classify(&plan),
+            PlanPartitioning::BySeedUnion
         );
-    }
-
-    #[test]
-    fn every_non_structural_seed_source_is_partitioned_by_seed() {
-        for source in [
-            json!({ "occurrences": { "class": "reference" } }),
-            json!({ "scopes": {} }),
-            json!({ "bindings": {} }),
-            json!({ "paths": {} }),
-            json!({ "generation_sites": {} }),
-            json!({ "exports": {} }),
-        ] {
+        let leaves = PlanPartitioning::union_leaf_plans(&plan).expect("union is sliceable");
+        assert_eq!(leaves.len(), 2);
+        for (leaf, _, inherited_suffix_steps) in leaves {
+            assert_eq!(inherited_suffix_steps, 1);
             assert_eq!(
-                PlanPartitioning::classify(&plan(source.clone())),
-                PlanPartitioning::BySeed,
-                "{source} is a per-file seed enumeration"
+                leaf.steps.iter().map(|step| step.op()).collect::<Vec<_>>(),
+                vec![QueryStepOp::Filter, QueryStepOp::Project]
             );
         }
     }
 
     #[test]
-    fn a_row_local_step_keeps_a_plan_by_seed() {
+    fn mixed_seed_comparators_keep_a_union_whole() {
         let plan = plan(json!({
-            "match": { "kind": "function" },
-            "steps": [{ "op": "enclosing_decl" }, { "op": "file_of" }]
+            "union": [
+                { "match": { "kind": "function" }, "steps": [{ "op": "file_of" }] },
+                { "occurrences": { "class": "reference" }, "steps": [{ "op": "file_of" }] }
+            ]
         }));
-        assert!(
-            plan.steps
-                .iter()
-                .all(|step| step.op().shape() == QueryStepShape::RowLocal)
-        );
-        assert_eq!(PlanPartitioning::classify(&plan), PlanPartitioning::BySeed);
+        assert_eq!(PlanPartitioning::classify(&plan), PlanPartitioning::Whole);
     }
 
     #[test]
-    fn a_derived_value_step_keeps_a_plan_by_seed() {
+    #[hardwon("#5310: filters at any union node must observe merged first-writer representatives")]
+    fn filters_at_root_or_nested_union_nodes_require_whole_execution() {
+        let leaf = json!({ "match": { "kind": "function" } });
+        let filtered = json!({
+            "union": [leaf.clone(), leaf.clone()],
+            "steps": [{ "op": "filter", "where": [{ "field": "name", "op": "is_not_null" }] }]
+        });
+        for query in [filtered.clone(), json!({ "union": [filtered, leaf] })] {
+            let plan = plan(query);
+            assert_eq!(PlanPartitioning::classify(&plan), PlanPartitioning::Whole);
+            assert!(PlanPartitioning::union_leaf_plans(&plan).is_none());
+        }
+    }
+
+    #[test]
+    fn a_union_with_a_set_suffix_stays_whole() {
         let plan = plan(json!({
+            "union": [
+                { "match": { "kind": "function" } },
+                { "match": { "kind": "class" } }
+            ],
+            "steps": [{ "op": "file_of" }]
+        }));
+        assert_eq!(PlanPartitioning::classify(&plan), PlanPartitioning::Whole);
+    }
+
+    #[test]
+    fn intersect_and_except_stay_whole() {
+        let intersect = json!({
+            "intersect": [
+                { "match": { "kind": "function" } },
+                { "match": { "kind": "function" } }
+            ]
+        });
+        let except = json!({
+            "except": [
+                { "match": { "kind": "function" } },
+                { "match": { "kind": "function" } }
+            ]
+        });
+        for query in [intersect, except] {
+            let plan = plan(query);
+            assert_eq!(PlanPartitioning::classify(&plan), PlanPartitioning::Whole);
+        }
+    }
+
+    #[test]
+    fn an_except_of_file_keyed_rows_restricts_to_one_seed_file() {
+        let leaf = json!({ "match": { "kind": "function" } });
+        let except = plan(json!({ "except": [leaf.clone(), leaf.clone()] }));
+        assert!(PlanPartitioning::restricts_to_seed_file(&except));
+        let nested = plan(json!({
+            "except": [{ "union": [leaf.clone(), leaf.clone()] }, { "except": [leaf.clone(), leaf.clone()] }]
+        }));
+        assert!(PlanPartitioning::restricts_to_seed_file(&nested));
+        // A row whose identity does not name its file can be excluded by a
+        // row of another file, and an intersection stays whole.
+        let declarations = plan(json!({
+            "except": [
+                { "match": { "kind": "function" }, "steps": [{ "op": "enclosing_decl" }] },
+                { "match": { "kind": "function" }, "steps": [{ "op": "enclosing_decl" }] }
+            ]
+        }));
+        assert!(!PlanPartitioning::restricts_to_seed_file(&declarations));
+        let intersect = plan(json!({ "intersect": [leaf.clone(), leaf] }));
+        assert!(!PlanPartitioning::restricts_to_seed_file(&intersect));
+    }
+
+    #[test]
+    #[hardwon(
+        "#4863: a call-sites-to selector sliced by blob returned no rows at the callers' files"
+    )]
+    fn a_step_that_moves_rows_out_of_the_seed_file_does_not_restrict_to_one_seed_file() {
+        let call_sites = plan(json!({
             "match": { "kind": "function" },
-            "steps": [{ "op": "enclosing_decl" }, { "op": "callers" }]
+            "steps": [{ "op": "enclosing_decl" }, { "op": "call_sites_to" }]
         }));
         assert_eq!(
-            plan.steps[1].op().shape(),
-            QueryStepShape::DerivedValue,
-            "callers resolves a workspace call relation"
+            PlanPartitioning::classify(&call_sites),
+            PlanPartitioning::BySeed
         );
-        assert_eq!(PlanPartitioning::classify(&plan), PlanPartitioning::BySeed);
+        assert!(!PlanPartitioning::restricts_to_seed_file(&call_sites));
+        let in_file = json!({
+            "match": { "kind": "function" },
+            "steps": [{ "op": "enclosing_decl" }]
+        });
+        assert!(PlanPartitioning::restricts_to_seed_file(&plan(
+            in_file.clone()
+        )));
+        // A forward relation yields the related declaration, which can lie in
+        // another file than the seed.
+        for op in ["callers", "callees", "uses"] {
+            let moved = json!({
+                "match": { "kind": "function" },
+                "steps": [{ "op": "enclosing_decl" }, { "op": op }]
+            });
+            assert!(
+                !PlanPartitioning::restricts_to_seed_file(&plan(moved.clone())),
+                "{op}"
+            );
+            let union = plan(json!({ "union": [in_file.clone(), moved] }));
+            assert!(!PlanPartitioning::restricts_to_seed_file(&union), "{op}");
+        }
+    }
+
+    #[test]
+    fn registration_and_absence_steps_keep_union_whole() {
+        for steps in [
+            json!([
+                { "op": "procedure_of" },
+                { "op": "typestate", "protocol_ref": "test:protocol" }
+            ]),
+            json!([
+                { "op": "procedure_of" },
+                { "op": "absent_member" }
+            ]),
+        ] {
+            let query = json!({
+                "union": [
+                    { "match": { "kind": "function" }, "steps": steps.clone() },
+                    { "match": { "kind": "function" }, "steps": steps }
+                ]
+            });
+            let plan = plan(query);
+            assert_eq!(PlanPartitioning::classify(&plan), PlanPartitioning::Whole);
+        }
     }
 
     #[test]
@@ -373,23 +583,6 @@ mod tests {
         }
     }
 
-    /// The registration-dependent set is exactly those four operations, so a
-    /// new step declared beside them cannot join it by accident and a step
-    /// that leaves it cannot do so silently.
-    #[test]
-    fn the_registration_dependent_operations_are_the_four_declared_ones() {
-        let registration_dependent = crate::query::schema::ALL_QUERY_STEP_OPS
-            .iter()
-            .copied()
-            .filter(|op| op.is_registration_dependent())
-            .map(QueryStepOp::label)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            registration_dependent,
-            vec!["typestate", "value_flow", "taint", "witness"]
-        );
-    }
-
     #[test]
     fn a_suffix_free_union_is_partitioned_by_seed() {
         let plan = plan(json!({
@@ -423,103 +616,5 @@ mod tests {
             PlanPartitioning::classify(&plan),
             PlanPartitioning::BySeedUnion
         );
-    }
-
-    #[test]
-    fn typed_row_steps_on_a_union_are_distributed_to_its_leaves() {
-        let plan = plan(json!({
-            "union": [
-                { "occurrences": { "class": "reference" } },
-                { "occurrences": { "class": "reference" } }
-            ],
-            "steps": [
-                {
-                    "op": "filter",
-                    "where": [{ "field": "target_id", "op": "is_not_null" }]
-                },
-                {
-                    "op": "project",
-                    "columns": [{ "source": "id", "name": "site" }]
-                }
-            ]
-        }));
-        assert_eq!(
-            PlanPartitioning::classify(&plan),
-            PlanPartitioning::BySeedUnion
-        );
-        let leaves = PlanPartitioning::union_leaf_plans(&plan).expect("union is sliceable");
-        assert_eq!(leaves.len(), 2);
-        for (leaf, _) in leaves {
-            assert_eq!(
-                leaf.steps.iter().map(|step| step.op()).collect::<Vec<_>>(),
-                vec![QueryStepOp::Filter, QueryStepOp::Project]
-            );
-        }
-    }
-
-    #[test]
-    fn mixed_seed_comparators_keep_a_union_whole() {
-        let plan = plan(json!({
-            "union": [
-                { "match": { "kind": "function" }, "steps": [{ "op": "file_of" }] },
-                { "occurrences": { "class": "reference" }, "steps": [{ "op": "file_of" }] }
-            ]
-        }));
-        assert_eq!(PlanPartitioning::classify(&plan), PlanPartitioning::Whole);
-    }
-
-    #[test]
-    fn a_union_with_a_set_suffix_stays_whole() {
-        let plan = plan(json!({
-            "union": [
-                { "match": { "kind": "function" } },
-                { "match": { "kind": "class" } }
-            ],
-            "steps": [{ "op": "file_of" }]
-        }));
-        assert_eq!(PlanPartitioning::classify(&plan), PlanPartitioning::Whole);
-    }
-
-    #[test]
-    fn intersect_and_except_stay_whole() {
-        let intersect = json!({
-            "intersect": [
-                { "match": { "kind": "function" } },
-                { "match": { "kind": "function" } }
-            ]
-        });
-        let except = json!({
-            "except": [
-                { "match": { "kind": "function" } },
-                { "match": { "kind": "function" } }
-            ]
-        });
-        for query in [intersect, except] {
-            let plan = plan(query);
-            assert_eq!(PlanPartitioning::classify(&plan), PlanPartitioning::Whole);
-        }
-    }
-
-    #[test]
-    fn registration_and_absence_steps_keep_union_whole() {
-        for steps in [
-            json!([
-                { "op": "procedure_of" },
-                { "op": "typestate", "protocol_ref": "test:protocol" }
-            ]),
-            json!([
-                { "op": "procedure_of" },
-                { "op": "absent_member" }
-            ]),
-        ] {
-            let query = json!({
-                "union": [
-                    { "match": { "kind": "function" }, "steps": steps.clone() },
-                    { "match": { "kind": "function" }, "steps": steps }
-                ]
-            });
-            let plan = plan(query);
-            assert_eq!(PlanPartitioning::classify(&plan), PlanPartitioning::Whole);
-        }
     }
 }

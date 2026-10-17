@@ -106,6 +106,15 @@ def main() -> None:
     if "provenance" in configuration:
         raise AssertionError("omitted result provenance unexpectedly reached the wire")
 
+    # Regression from 01836c5619fe: flattened obligation and trace provenance
+    # previously used the same wire key with incompatible value types.
+    obligation_raw = raw_by_type["call_result_obligation"]
+    obligation = _decode_result_item(obligation_raw)
+    if obligation.obligation_provenance != "native_go_error":
+        raise AssertionError("obligation provenance did not survive Python decoding")
+    if len(obligation.provenance) != 1 or obligation.provenance[0].seed.path != "main.go":
+        raise AssertionError("query trace provenance did not survive Python decoding")
+
     if len(decoded.diagnostics) != 1:
         raise AssertionError("the Rust diagnostic fixture was not decoded")
     diagnostic = decoded.diagnostics[0]

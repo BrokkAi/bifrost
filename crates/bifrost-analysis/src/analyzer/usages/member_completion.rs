@@ -235,7 +235,10 @@ fn member_completion_site_in_tree(
     let prefix = prefix_node
         .and_then(|member| source.get(member.start_byte()..cursor_byte))
         .unwrap_or("");
-    if !prefix.bytes().all(is_identifier_byte) {
+    if !prefix
+        .bytes()
+        .all(brokk_bifrost_core::text_utils::is_ident_byte)
+    {
         return None;
     }
     Some(MemberCompletionSite {
@@ -300,10 +303,6 @@ fn access_member(language: Language, node: Node<'_>) -> Option<Node<'_>> {
     node.child_by_field_name(field)
 }
 
-fn is_identifier_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
-}
-
 pub fn semantic_completion_kind(kind: SemanticModelSymbolKind) -> CodeUnitType {
     match kind {
         SemanticModelSymbolKind::Class
@@ -332,6 +331,7 @@ pub fn semantic_completion_kind(kind: SemanticModelSymbolKind) -> CodeUnitType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
     use tempfile::TempDir;
 
     fn site(path: &str, source: &str, cursor: usize) -> MemberCompletionSite {
@@ -345,6 +345,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#3422: Parses a real incomplete Rust field expression and verifies the adapter reads its receiver with an empty member prefix"
+    )]
     fn incomplete_rust_field_expression_exposes_receiver_and_empty_prefix() {
         let source = "fn main() { let xs = vec![1i32, 2, 3]; xs.\n}";
         let cursor = source.find("xs.\n").unwrap() + "xs.".len();
@@ -357,6 +360,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#3422: Parses recovered Go selector syntax and verifies both receiver range and the written partial member prefix"
+    )]
     fn incomplete_go_selector_exposes_receiver_and_prefix() {
         let source = "package main\nfunc f(xs Widget) { xs.Ru\n}";
         let cursor = source.find("xs.Ru\n").unwrap() + "xs.Ru".len();
@@ -369,6 +375,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#3422: Parses a real trailing Go selector and checks the receiver survives when no member identifier exists yet"
+    )]
     fn incomplete_go_selector_exposes_receiver_and_empty_prefix() {
         let source = "package main\nfunc f() { os.\n}";
         let cursor = source.find("os.\n").unwrap() + "os.".len();

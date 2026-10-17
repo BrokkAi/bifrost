@@ -6,12 +6,15 @@ use crate::analyzer::resolution::{
     BindingFragmentId, BindingNodeId, CandidatePathIdentity, PartialPath, ResolutionNodeIdentity,
     ResolutionSemanticIdentity, SelectedResolutionMountOrdinal, SemanticId,
 };
-use crate::analyzer::store::resolution::with_resolution_read_progress_handler;
+use crate::analyzer::store::resolution::{
+    EndpointLookupShape, endpoint_lookup_shape, read_resolution_statement,
+    with_resolution_read_progress_handler,
+};
 use crate::analyzer::store::resolution_selection::SelectedResolutionMountInventory;
 use crate::analyzer::store::{Result, StoreError};
 use crate::hash::HashMap;
 use brokk_bifrost_core::analyzer::resolution_facts::ResolutionScopeId;
-use rusqlite::Connection;
+use rusqlite::{Connection, Row};
 
 // Every seek binds the selected host as well as the full runtime identity.
 // Producer-local dense keys are never interpreted as ordinary host keys.
@@ -40,27 +43,32 @@ pub(in crate::analyzer::store) fn hydrate_candidate_paths(
             .collect::<Vec<_>>(),
     )
     .expect("stage path requests serialize");
-    read(selection, cancellation, |connection| {
-        let mut result = vec![None; candidates.len()];
-        let mut statement = connection.prepare_cached(HYDRATE_PATHS_SQL)?;
-        let mut rows = statement.query([parameters])?;
-        while let Some(row) = rows.next()? {
-            if cancellation.is_cancelled() {
-                return Ok(None);
+    read_stage(
+        selection,
+        cancellation,
+        || vec![None; candidates.len()],
+        |connection| {
+            let mut result = vec![None; candidates.len()];
+            let mut statement = connection.prepare_cached(HYDRATE_PATHS_SQL)?;
+            let mut rows = statement.query([parameters])?;
+            while let Some(row) = rows.next()? {
+                if cancellation.is_cancelled() {
+                    return Ok(None);
+                }
+                let position: usize = row.get(0)?;
+                assert!(
+                    result[position].is_none(),
+                    "one host owns a path identity once"
+                );
+                result[position] = Some(codec::decode_path(
+                    row.get(1)?,
+                    row.get(2)?,
+                    &row.get::<_, String>(3)?,
+                ));
             }
-            let position: usize = row.get(0)?;
-            assert!(
-                result[position].is_none(),
-                "one host owns a path identity once"
-            );
-            result[position] = Some(codec::decode_path(
-                row.get(1)?,
-                row.get(2)?,
-                &row.get::<_, String>(3)?,
-            ));
-        }
-        Ok(Some(result))
-    })
+            Ok(Some(result))
+        },
+    )
 }
 
 pub(in crate::analyzer::store) const SEMANTIC_IDENTITIES_SQL: &str = r#"
@@ -103,29 +111,16 @@ pub(in crate::analyzer::store) fn semantic_identities(
             .collect::<Vec<_>>(),
     )
     .expect("stage semantic identity requests serialize");
-    read(selection, cancellation, |connection| {
-        let mut result = vec![None; requests.len()];
-        let mut statement = connection.prepare_cached(SEMANTIC_IDENTITIES_SQL)?;
-        let mut rows = statement.query([parameters])?;
-        while let Some(row) = rows.next()? {
-            if cancellation.is_cancelled() {
-                return Ok(None);
-            }
-            let position: usize = row.get(0)?;
-            let semantic = semantic_from_cells(row.get(1)?, row.get(2)?);
-            if let Some(previous) = result[position] {
-                if previous != semantic {
-                    return Err(StoreError::new(format!(
-                        "selected stage semantic identity has conflicting assignments: {:?}, {previous:?}, {semantic:?}",
-                        requests[position]
-                    )));
-                }
-            } else {
-                result[position] = Some(semantic);
-            }
-        }
-        Ok(Some(result))
-    })
+    identity_assignments(
+        selection,
+        &parameters,
+        requests.len(),
+        cancellation,
+        "selected stage semantic identity has conflicting assignments: ",
+        |position| format!("{:?}", requests[position]),
+        SEMANTIC_IDENTITIES_SQL,
+        |row| Ok(semantic_from_cells(row.get(1)?, row.get(2)?)),
+    )
 }
 
 pub(in crate::analyzer::store) const NODE_IDENTITIES_SQL: &str = r#"
@@ -153,29 +148,16 @@ pub(in crate::analyzer::store) fn node_identities(
             .collect::<Vec<_>>(),
     )
     .expect("stage node identity requests serialize");
-    read(selection, cancellation, |connection| {
-        let mut result = vec![None; requests.len()];
-        let mut statement = connection.prepare_cached(NODE_IDENTITIES_SQL)?;
-        let mut rows = statement.query([parameters])?;
-        while let Some(row) = rows.next()? {
-            if cancellation.is_cancelled() {
-                return Ok(None);
-            }
-            let position: usize = row.get(0)?;
-            let node = codec::decode_node(row.get(1)?);
-            if let Some(previous) = result[position] {
-                if previous != node {
-                    return Err(StoreError::new(format!(
-                        "selected stage node identity has conflicting assignments: {:?}, {previous:?}, {node:?}",
-                        requests[position]
-                    )));
-                }
-            } else {
-                result[position] = Some(node);
-            }
-        }
-        Ok(Some(result))
-    })
+    identity_assignments(
+        selection,
+        &parameters,
+        requests.len(),
+        cancellation,
+        "selected stage node identity has conflicting assignments: ",
+        |position| format!("{:?}", requests[position]),
+        NODE_IDENTITIES_SQL,
+        |row| Ok(codec::decode_node(row.get(1)?)),
+    )
 }
 
 pub(in crate::analyzer::store) const NODE_SCOPES_SQL: &str = r#"
@@ -207,7 +189,7 @@ pub(in crate::analyzer::store) fn scope_nodes(
             .collect::<Vec<_>>(),
     )
     .expect("stage scope requests serialize");
-    read(selection, cancellation, |connection| {
+    read_stage(selection, cancellation, HashMap::default, |connection| {
         let mut result = HashMap::default();
         let mut statement = connection.prepare_cached(NODE_SCOPES_SQL)?;
         let mut rows = statement.query([parameters])?;
@@ -248,15 +230,68 @@ fn read<T>(
     cancellation: &CancellationToken,
     job: impl FnOnce(&Connection) -> Result<Option<T>>,
 ) -> Result<Option<T>> {
-    if cancellation.is_cancelled() {
-        return Ok(None);
+    read_resolution_statement(selection.connection(), cancellation, job)
+}
+
+/// A read over stage content tables only. While the operation has committed no
+/// stage content (`stage_has_no_content`), every such statement returns no row,
+/// so the answer is `empty` and no statement runs. One flag on the selection
+/// decides this for every reader that uses this function; a reader that also
+/// reads other tables must use `read`.
+fn read_stage<T>(
+    selection: &SelectedResolutionMountInventory<'_>,
+    cancellation: &CancellationToken,
+    empty: impl FnOnce() -> T,
+    job: impl FnOnce(&Connection) -> Result<Option<T>>,
+) -> Result<Option<T>> {
+    if selection.stage_has_no_content() && !cancellation.is_cancelled() {
+        return Ok(Some(empty()));
     }
-    match with_resolution_read_progress_handler(selection.connection(), cancellation, job) {
-        Err(error) if error.is_sqlite_interrupted() && cancellation.is_cancelled() => Ok(None),
-        Err(error) => Err(error),
-        Ok(_) if cancellation.is_cancelled() => Ok(None),
-        Ok(result) => Ok(result),
-    }
+    read(selection, cancellation, job)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn identity_assignments<T>(
+    selection: &SelectedResolutionMountInventory<'_>,
+    parameters: &str,
+    request_count: usize,
+    cancellation: &CancellationToken,
+    conflict_prefix: &str,
+    request_debug: impl Fn(usize) -> String,
+    sql: &str,
+    decode: impl Fn(&Row<'_>) -> Result<T>,
+) -> Result<Option<Vec<Option<T>>>>
+where
+    T: Copy + PartialEq + std::fmt::Debug,
+{
+    read_stage(
+        selection,
+        cancellation,
+        || vec![None; request_count],
+        |connection| {
+            let mut result = vec![None; request_count];
+            let mut statement = connection.prepare_cached(sql)?;
+            let mut rows = statement.query([parameters])?;
+            while let Some(row) = rows.next()? {
+                if cancellation.is_cancelled() {
+                    return Ok(None);
+                }
+                let position: usize = row.get(0)?;
+                let current = decode(row)?;
+                if let Some(previous) = result[position] {
+                    if previous != current {
+                        return Err(StoreError::new(format!(
+                            "{conflict_prefix}{}, {previous:?}, {current:?}",
+                            request_debug(position)
+                        )));
+                    }
+                } else {
+                    result[position] = Some(current);
+                }
+            }
+            Ok(Some(result))
+        },
+    )
 }
 
 #[cfg(test)]
@@ -355,7 +390,17 @@ CROSS JOIN temp.selected_resolution_stage_paths AS p INDEXED BY selected_resolut
      ELSE substr(r.value ->> 1, 1, length(r.value ->> 1) - 2) || '^' END COLLATE BINARY
 
 CROSS JOIN temp.selected_resolution_scope_mounts AS scope ON scope.mount_ordinal=p.host_ordinal
-WHERE (?1 IS NULL OR scope.mount_ordinal IN (SELECT value FROM json_each(?1))) AND r.value ->> 2 = 1 AND r.value ->> 3 = 1"#, root=codec::encode_node(BindingNodeId::universal_root()));
+WHERE (?1 IS NULL OR scope.mount_ordinal IN (SELECT value FROM json_each(?1))) AND r.value ->> 2 = 1 AND r.value ->> 3 = 1
+UNION ALL
+SELECT r.value ->> 0, p.host_ordinal, p.path, p.end_node, json_extract(p.body, '$[4]', '$[5]', '$[6]', '$[7]')
+FROM json_each(?6) AS r
+CROSS JOIN temp.selected_resolution_stage_paths AS p INDEXED BY selected_resolution_stage_paths_root_terminal
+ ON p.end_node = {root} AND p.root_terminal_shared = r.value ->> 1
+
+CROSS JOIN temp.selected_resolution_scope_mounts AS scope ON scope.mount_ordinal=p.host_ordinal
+WHERE (?1 IS NULL OR scope.mount_ordinal IN (SELECT value FROM json_each(?1)))
+ AND (r.value ->> 2 = 0 OR (json_extract(p.body, '$[8][0][0]') = 0
+  AND json_extract(p.body, '$[8][0][1]') = 0))"#, root=codec::encode_node(BindingNodeId::universal_root()));
         #[cfg(test)]
         crate::analyzer::store::resolution_selection::note_selected_static_sql_capacity(10, sql.capacity());
         sql
@@ -379,21 +424,7 @@ pub(in crate::analyzer::store) fn visit_forward_candidates(
         if cancellation.is_cancelled() {
             return Ok(crate::analyzer::store::resolution_lexical::CandidatePageVisit::Cancelled);
         }
-        let endpoint = request.endpoint();
-        let node = codec::encode_node(endpoint.node());
-        if let Some(symbol) = endpoint.symbols().fixed().first() {
-            let (runtime, shared) = super::lexical::semantic_cells(symbol.symbol());
-            keyed.push(serde_json::json!([
-                ordinal,
-                node,
-                shared,
-                runtime,
-                symbol.scopes().is_some()
-            ]));
-            open.push(serde_json::json!([ordinal, node]));
-        } else {
-            whole.push(serde_json::json!([ordinal, node]));
-        }
+        append_non_root_candidate_request(request, ordinal, &mut keyed, &mut open, &mut whole);
     }
     visit_candidates(
         selection,
@@ -422,32 +453,36 @@ pub(in crate::analyzer::store) fn visit_reverse_candidates(
     let mut open = Vec::new();
     let mut whole = Vec::new();
     let mut root = Vec::new();
+    let mut root_terminals = Vec::new();
     for (ordinal, request) in requests.iter().enumerate() {
         if cancellation.is_cancelled() {
             return Ok(crate::analyzer::store::resolution_lexical::CandidatePageVisit::Cancelled);
         }
-        let endpoint = request.endpoint();
-        let node = codec::encode_node(endpoint.node());
-        if endpoint.node() == BindingNodeId::universal_root() {
-            let Some(encoded) = codec::root_candidate_request(ordinal, request, cancellation)
-            else {
-                return Ok(
-                    crate::analyzer::store::resolution_lexical::CandidatePageVisit::Cancelled,
+        if request.endpoint().node() == BindingNodeId::universal_root() {
+            if let Some(targets) = request.root_terminal_targets() {
+                let mut seen = std::collections::HashSet::new();
+                root_terminals.extend(targets.iter().filter(|target| seen.insert(**target)).map(
+                    |target| {
+                        serde_json::json!([
+                            ordinal,
+                            target.get(),
+                            request.root_terminal_targets_are_imports()
+                        ])
+                    },
+                ));
+            } else {
+                let Some(encoded) = codec::root_candidate_request(ordinal, request, cancellation)
+                else {
+                    return Ok(
+                        crate::analyzer::store::resolution_lexical::CandidatePageVisit::Cancelled,
+                    );
+                };
+                root.push(
+                    serde_json::from_str(&encoded).expect("SC root request is structured JSON"),
                 );
-            };
-            root.push(serde_json::from_str(&encoded).expect("SC root request is structured JSON"));
-        } else if let Some(symbol) = endpoint.symbols().fixed().first() {
-            let (runtime, shared) = super::lexical::semantic_cells(symbol.symbol());
-            keyed.push(serde_json::json!([
-                ordinal,
-                node,
-                shared,
-                runtime,
-                symbol.scopes().is_some()
-            ]));
-            open.push(serde_json::json!([ordinal, node]));
+            }
         } else {
-            whole.push(serde_json::json!([ordinal, node]));
+            append_non_root_candidate_request(request, ordinal, &mut keyed, &mut open, &mut whole);
         }
     }
     visit_candidates(
@@ -459,8 +494,32 @@ pub(in crate::analyzer::store) fn visit_reverse_candidates(
         cancellation,
         visitor,
         reverse_candidate_sql(),
-        vec![keyed, open, whole, root],
+        vec![keyed, open, whole, root, root_terminals],
     )
+}
+
+fn append_non_root_candidate_request(
+    request: &crate::analyzer::resolution::BatchCandidateRequest,
+    ordinal: usize,
+    keyed: &mut Vec<serde_json::Value>,
+    open: &mut Vec<serde_json::Value>,
+    whole: &mut Vec<serde_json::Value>,
+) {
+    let endpoint = request.endpoint();
+    let node = codec::encode_node(endpoint.node());
+    if let Some(symbol) = endpoint.symbols().fixed().first() {
+        let (runtime, shared) = super::lexical::semantic_cells(symbol.symbol());
+        keyed.push(serde_json::json!([
+            ordinal,
+            node,
+            shared,
+            runtime,
+            symbol.scopes().is_some()
+        ]));
+        open.push(serde_json::json!([ordinal, node]));
+    } else {
+        whole.push(serde_json::json!([ordinal, node]));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -490,7 +549,7 @@ fn visit_candidates(
     parameters.extend(arrays.into_iter().map(|rows| {
         Value::Text(serde_json::to_string(&rows).expect("stage candidate request serializes"))
     }));
-    let Some(mut offered) = read(selection, cancellation, |connection| {
+    let Some(mut offered) = read_stage(selection, cancellation, Vec::new, |connection| {
         let mut offered = Vec::new();
         let mut statement = connection.prepare_cached(sql)?;
         let mut rows = statement.query(rusqlite::params_from_iter(parameters))?;
@@ -518,7 +577,9 @@ fn visit_candidates(
     // only the cancellation token makes this visitor Cancelled.
     'requests: for (ordinal, request) in requests.iter().enumerate() {
         assert_eq!(request.request_ordinal(), ordinal);
-        if session.is_some_and(|session| !session.scope_step()) {
+        if !request.uses_root_terminal_targets()
+            && session.is_some_and(|session| !session.scope_step())
+        {
             break;
         }
         if cancellation.is_cancelled() {
@@ -528,7 +589,9 @@ fn visit_candidates(
             .peek()
             .is_some_and(|(position, _, _)| *position == ordinal)
         {
-            if session.is_some_and(|session| !session.scope_step()) {
+            if !request.uses_root_terminal_targets()
+                && session.is_some_and(|session| !session.scope_step())
+            {
                 break 'requests;
             }
             if cancellation.is_cancelled() {
@@ -536,6 +599,11 @@ fn visit_candidates(
             }
             let (_, identity, endpoint) = offered.next().expect("peeked candidate exists");
             if request.admits_candidate(&endpoint) {
+                if request.uses_root_terminal_targets()
+                    && session.is_some_and(|session| !session.scope_step())
+                {
+                    break 'requests;
+                }
                 page.push(BatchCandidateMatch::new(identity, ordinal));
                 if page.len() == maximum_page_rows {
                     let keep_going = visitor(&page)?;
@@ -575,75 +643,95 @@ pub(in crate::analyzer::store) fn semantic_provenance(
         // Shared identity has no producer-local provenance.
         return Ok(Some(None));
     }
-    read(selection, cancellation, |connection| {
-        let mut statement = connection.prepare_cached(
-            r#"
+    identity_provenance(
+        selection,
+        codec::encode_semantic(semantic),
+        SEMANTIC_PROVENANCE_SQL,
+        cancellation,
+        "stage semantic has conflicting provenance: ",
+        &format!("{semantic:?}"),
+        |row| {
+            Ok((
+                SelectedResolutionMountOrdinal::new(row.get(0)?),
+                ResolutionSemanticIdentity::fragment_local(row.get(1)?),
+            ))
+        },
+    )
+}
+
+const SEMANTIC_PROVENANCE_SQL: &str = r#"
 SELECT coordinate.host_ordinal,coordinate.identity_digest
 FROM temp.selected_resolution_stage_semantic_coordinates coordinate INDEXED BY selected_resolution_stage_semantic_runtime
 CROSS JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=coordinate.host_ordinal
 WHERE coordinate.runtime_key=?1 AND coordinate.shared_id IS NULL
-"#,
-        )?;
-        let mut rows = statement.query([codec::encode_semantic(semantic)])?;
-        let mut result = None;
-        while let Some(row) = rows.next()? {
-            if cancellation.is_cancelled() {
-                return Ok(None);
-            }
-            let current = (
-                SelectedResolutionMountOrdinal::new(row.get(0)?),
-                ResolutionSemanticIdentity::fragment_local(row.get(1)?),
-            );
-            if let Some(previous) = result {
-                if previous != current {
-                    return Err(StoreError::new(format!(
-                        "stage semantic has conflicting provenance: {semantic:?}, {previous:?}, {current:?}"
-                    )));
-                }
-            } else {
-                result = Some(current);
-            }
-        }
-        Ok(Some(result))
-    })
-}
+"#;
 
 pub(in crate::analyzer::store) fn node_provenance(
     selection: &SelectedResolutionMountInventory<'_>,
     node: BindingNodeId,
     cancellation: &CancellationToken,
 ) -> Result<Option<Option<(SelectedResolutionMountOrdinal, ResolutionNodeIdentity)>>> {
-    read(selection, cancellation, |connection| {
-        let mut statement = connection.prepare_cached(
-            r#"
+    identity_provenance(
+        selection,
+        codec::encode_node(node),
+        NODE_PROVENANCE_SQL,
+        cancellation,
+        "stage node has conflicting provenance: ",
+        &format!("{node:?}"),
+        |row| {
+            Ok((
+                SelectedResolutionMountOrdinal::new(row.get(0)?),
+                ResolutionNodeIdentity::new(row.get(1)?),
+            ))
+        },
+    )
+}
+
+const NODE_PROVENANCE_SQL: &str = r#"
 SELECT coordinate.host_ordinal,coordinate.identity_digest
 FROM temp.selected_resolution_stage_node_coordinates coordinate INDEXED BY selected_resolution_stage_node_runtime
 CROSS JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=coordinate.host_ordinal
 WHERE coordinate.runtime_key=?1
-"#,
-        )?;
-        let mut rows = statement.query([codec::encode_node(node)])?;
-        let mut result = None;
-        while let Some(row) = rows.next()? {
-            if cancellation.is_cancelled() {
-                return Ok(None);
-            }
-            let current = (
-                SelectedResolutionMountOrdinal::new(row.get(0)?),
-                ResolutionNodeIdentity::new(row.get(1)?),
-            );
-            if let Some(previous) = result {
-                if previous != current {
-                    return Err(StoreError::new(format!(
-                        "stage node has conflicting provenance: {node:?}, {previous:?}, {current:?}"
-                    )));
+"#;
+
+fn identity_provenance<T>(
+    selection: &SelectedResolutionMountInventory<'_>,
+    runtime_key: i64,
+    sql: &str,
+    cancellation: &CancellationToken,
+    conflict_prefix: &str,
+    identity_debug: &str,
+    decode: impl Fn(&Row<'_>) -> Result<T>,
+) -> Result<Option<Option<T>>>
+where
+    T: Copy + PartialEq + std::fmt::Debug,
+{
+    read_stage(
+        selection,
+        cancellation,
+        || None,
+        |connection| {
+            let mut statement = connection.prepare_cached(sql)?;
+            let mut rows = statement.query([runtime_key])?;
+            let mut result = None;
+            while let Some(row) = rows.next()? {
+                if cancellation.is_cancelled() {
+                    return Ok(None);
                 }
-            } else {
-                result = Some(current);
+                let current = decode(row)?;
+                if let Some(previous) = result {
+                    if previous != current {
+                        return Err(StoreError::new(format!(
+                            "{conflict_prefix}{identity_debug}, {previous:?}, {current:?}"
+                        )));
+                    }
+                } else {
+                    result = Some(current);
+                }
             }
-        }
-        Ok(Some(result))
-    })
+            Ok(Some(result))
+        },
+    )
 }
 
 pub(in crate::analyzer::store) const DEFINITION_NODES_SQL: &str = r#"
@@ -665,7 +753,7 @@ WHERE node.kind IN(8,9) AND node.kind=9
 pub(in crate::analyzer::store) fn reference_lookup_spellings(
     selection: &SelectedResolutionMountInventory<'_>,
     references: &[SemanticId],
-    namespace: brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace,
+    namespaces: &[i64],
     cancellation: &CancellationToken,
 ) -> Result<Option<HashMap<SemanticId, String>>> {
     let parameters = serde_json::to_string(
@@ -676,12 +764,13 @@ pub(in crate::analyzer::store) fn reference_lookup_spellings(
             .collect::<Vec<_>>(),
     )
     .expect("reference spelling requests serialize");
-    read(selection, cancellation, |connection| {
+    let namespaces =
+        serde_json::to_string(namespaces).expect("reference lookup namespaces serialize");
+    read_stage(selection, cancellation, HashMap::default, |connection| {
         let mut statement = connection.prepare_cached(REFERENCE_LOOKUP_SPELLINGS_SQL)?;
         let mut rows = statement.query(rusqlite::named_params! {
             ":requests": parameters,
-            ":namespace": super::super::resolution_prepare::resolution_rows::namespace_code(
-                namespace),
+            ":namespaces": namespaces,
         })?;
         let mut result = HashMap::default();
         while let Some(row) = rows.next()? {
@@ -713,7 +802,8 @@ CROSS JOIN temp.selected_resolution_stage_recipes recipe
  ON recipe.producer_id=path.producer_id
  AND COALESCE(recipe.semantic_key,-1)=COALESCE(path.end_lead_key,-1)
  AND COALESCE(recipe.semantic_shared,-1)=COALESCE(path.end_lead_shared,-1)
-WHERE node.kind IN(8,9) AND recipe.namespace=:namespace
+WHERE node.kind IN(8,9)
+ AND recipe.namespace IN (SELECT value FROM json_each(:namespaces))
 AND EXISTS(SELECT 1 FROM temp.selected_resolution_stage_node_owners owner
  CROSS JOIN temp.selected_resolution_stage_producers producer ON producer.producer_id=owner.producer_id
  CROSS JOIN temp.selected_resolution_scope_mounts owner_scope ON owner_scope.mount_ordinal=producer.host_ordinal
@@ -733,29 +823,16 @@ pub(in crate::analyzer::store) fn definition_nodes(
             .collect::<Vec<_>>(),
     )
     .expect("stage definitions serialize");
-    read(selection, cancellation, |connection| {
-        let mut result = vec![None; definitions.len()];
-        let mut statement = connection.prepare_cached(DEFINITION_NODES_SQL)?;
-        let mut rows = statement.query([parameters])?;
-        while let Some(row) = rows.next()? {
-            if cancellation.is_cancelled() {
-                return Ok(None);
-            }
-            let ordinal: usize = row.get(0)?;
-            let node = codec::decode_node(row.get(1)?);
-            if let Some(previous) = result[ordinal] {
-                if previous != node {
-                    return Err(StoreError::new(format!(
-                        "stage definition has conflicting nodes: {:?}, {previous:?}, {node:?}",
-                        definitions[ordinal]
-                    )));
-                }
-            } else {
-                result[ordinal] = Some(node);
-            }
-        }
-        Ok(Some(result))
-    })
+    identity_assignments(
+        selection,
+        &parameters,
+        definitions.len(),
+        cancellation,
+        "stage definition has conflicting nodes: ",
+        |position| format!("{:?}", definitions[position]),
+        DEFINITION_NODES_SQL,
+        |row| Ok(codec::decode_node(row.get(1)?)),
+    )
 }
 
 pub(in crate::analyzer::store) const NODE_PAYLOADS_SQL: &str = r#"
@@ -783,7 +860,7 @@ pub(in crate::analyzer::store) fn node_payloads(
             .collect::<Vec<_>>(),
     )
     .expect("stage node payload requests serialize");
-    read(selection, cancellation, |connection| {
+    read_stage(selection, cancellation, HashMap::default, |connection| {
         let mut result = HashMap::default();
         let mut statement = connection.prepare_cached(NODE_PAYLOADS_SQL)?;
         let mut rows = statement.query([parameters])?;
@@ -831,7 +908,7 @@ pub(in crate::analyzer::store) fn go_definition_namespaces(
             .collect::<Vec<_>>(),
     )
     .expect("stage endpoint requests serialize");
-    read(selection, cancellation, |connection| {
+    read_stage(selection, cancellation, HashMap::default, |connection| {
         let mut result = HashMap::default();
         let mut statement = connection.prepare_cached(GO_DEFINITION_NAMESPACES_SQL)?;
         let mut rows = statement.query([parameters])?;
@@ -853,18 +930,46 @@ pub(in crate::analyzer::store) fn go_definition_namespaces(
     })
 }
 
-pub(in crate::analyzer::store) const MEMBER_SCOPE_OWNERS_SQL: &str = r#"
-SELECT fact.scope_head_node,fact.definition_key,fact.definition_shared
+pub(in crate::analyzer::store) const SCOPE_OWNERS_SQL: &str = r#"
+SELECT fact.scope_head_node,fact.definition_key,fact.definition_shared,fact.scope_kind
 FROM json_each(?1) input
 CROSS JOIN temp.selected_resolution_stage_member_scopes fact ON fact.scope_head_node=input.value
 CROSS JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=fact.host_ordinal
+"#;
+
+pub(in crate::analyzer::store) const MEMBER_SCOPE_OWNERS_SQL: &str = r#"
+SELECT fact.scope_head_node,fact.definition_key,fact.definition_shared,fact.scope_kind
+FROM json_each(?1) input
+CROSS JOIN temp.selected_resolution_stage_member_scopes fact ON fact.scope_head_node=input.value
+CROSS JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=fact.host_ordinal
+WHERE fact.scope_kind='type_body'
 "#;
 
 pub(in crate::analyzer::store) fn member_scope_owners(
     selection: &SelectedResolutionMountInventory<'_>,
     nodes: &[BindingNodeId],
     cancellation: &CancellationToken,
-) -> Result<Option<HashMap<BindingNodeId, SemanticId>>> {
+) -> Result<Option<HashMap<BindingNodeId, crate::analyzer::resolution::LoweredMemberScopeProperty>>>
+{
+    scope_owners_by_query(selection, nodes, MEMBER_SCOPE_OWNERS_SQL, cancellation)
+}
+
+pub(in crate::analyzer::store) fn scope_owners(
+    selection: &SelectedResolutionMountInventory<'_>,
+    nodes: &[BindingNodeId],
+    cancellation: &CancellationToken,
+) -> Result<Option<HashMap<BindingNodeId, crate::analyzer::resolution::LoweredMemberScopeProperty>>>
+{
+    scope_owners_by_query(selection, nodes, SCOPE_OWNERS_SQL, cancellation)
+}
+
+fn scope_owners_by_query(
+    selection: &SelectedResolutionMountInventory<'_>,
+    nodes: &[BindingNodeId],
+    query: &str,
+    cancellation: &CancellationToken,
+) -> Result<Option<HashMap<BindingNodeId, crate::analyzer::resolution::LoweredMemberScopeProperty>>>
+{
     let parameters = serde_json::to_string(
         &nodes
             .iter()
@@ -873,9 +978,9 @@ pub(in crate::analyzer::store) fn member_scope_owners(
             .collect::<Vec<_>>(),
     )
     .expect("stage member scope requests serialize");
-    read(selection, cancellation, |connection| {
+    read_stage(selection, cancellation, HashMap::default, |connection| {
         let mut result = HashMap::default();
-        let mut statement = connection.prepare_cached(MEMBER_SCOPE_OWNERS_SQL)?;
+        let mut statement = connection.prepare_cached(query)?;
         let mut rows = statement.query([parameters])?;
         while let Some(row) = rows.next()? {
             if cancellation.is_cancelled() {
@@ -889,6 +994,8 @@ pub(in crate::analyzer::store) fn member_scope_owners(
                 (None, Some(shared)) => -shared,
                 _ => panic!("a stage member scope owner has exactly one semantic coordinate"),
             });
+            let owner = crate::analyzer::resolution::LoweredMemberScopeProperty::new(owner, node)
+                .with_scope_kind_label(&row.get::<_, String>(3)?);
             if let Some(previous) = result.insert(node, owner)
                 && previous != owner
             {
@@ -920,7 +1027,7 @@ pub(in crate::analyzer::store) fn ordinary_completion_suppression(
 ) -> Result<Option<Vec<crate::analyzer::resolution::ResolutionIncompleteReason>>> {
     use crate::analyzer::resolution::{LoweringGapOrigin, ResolutionIncompleteReason};
     use crate::analyzer::store::resolution_prepare::resolution_rows::gap_origin_code;
-    read(selection, cancellation, |connection| {
+    read_stage(selection, cancellation, Vec::new, |connection| {
         let mut statement = connection.prepare_cached(ORDINARY_COMPLETION_SUPPRESSION_SQL)?;
         let mut rows = statement.query(rusqlite::named_params! {
             ":local_base": codec::encode_semantic(SemanticId::local(0, 0)),
@@ -972,6 +1079,9 @@ pub(in crate::analyzer::store) fn close_completions(
         }
     }
     let semantics = semantics.into_iter().collect::<Vec<_>>();
+    if !selection.decide_derive_helpers_of_semantics(semantics.iter().copied(), cancellation)? {
+        return Ok(None);
+    }
     let parameters = serde_json::to_string(
         &semantics
             .iter()
@@ -980,7 +1090,7 @@ pub(in crate::analyzer::store) fn close_completions(
             .collect::<Vec<_>>(),
     )
     .expect("stage closed reason requests serialize");
-    let Some(closed) = read(selection, cancellation, |connection| {
+    let Some(closed) = read_stage(selection, cancellation, Vec::new, |connection| {
         let mut closed = Vec::new();
         let mut statement=connection.prepare_cached("SELECT input.key FROM json_each(?1) input WHERE EXISTS(SELECT 1 FROM temp.selected_resolution_stage_closed_reasons reason WHERE reason.semantic_key IS input.value->>0 AND reason.semantic_shared IS input.value->>1)")?;
         let mut rows = statement.query([parameters])?;
@@ -1047,7 +1157,7 @@ pub(in crate::analyzer::store) fn semantic_sites_at_range(
     let sql = "SELECT s.semantic_key,s.semantic_shared,s.node,s.namespace FROM temp.selected_resolution_stage_semantics s JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=s.host_ordinal WHERE s.host_ordinal=?1 AND s.start_byte=?2 AND s.end_byte=?3 AND s.role=?4";
     let first = i64::try_from(start).expect("source byte offset fits SQLite integer");
     let second = i64::try_from(end).expect("source byte offset fits SQLite integer");
-    read(selection, cancellation, |connection| {
+    read_stage(selection, cancellation, Vec::new, |connection| {
         let mut result = Vec::new();
         let mut statement = connection.prepare_cached(sql)?;
         let mut rows = statement.query(rusqlite::params![
@@ -1103,7 +1213,7 @@ pub(in crate::analyzer::store) fn lexical_definitions(
             .collect::<Vec<_>>(),
     )
     .expect("stage lexical definition requests serialize");
-    read(selection, cancellation, |connection| {
+    read_stage(selection, cancellation, Vec::new, |connection| {
         let mut result = HashMap::default();
         let mut statement = connection.prepare_cached(
             "SELECT input.key,d.identifier,d.kind,d.name_start_byte,d.name_end_byte,d.name_start_line,d.name_end_line,d.declaration_start_byte,d.declaration_end_byte,d.declaration_start_line,d.declaration_end_line FROM json_each(?1) input CROSS JOIN temp.selected_resolution_stage_declarations d ON d.host_ordinal=input.value->>0 AND d.semantic_key IS input.value->>1 AND d.semantic_shared IS input.value->>2 CROSS JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=d.host_ordinal"
@@ -1189,11 +1299,25 @@ pub(in crate::analyzer::store) fn candidate_completion(
     cancellation: &CancellationToken,
 ) -> Result<crate::analyzer::resolution::BatchCandidateCompletionOutcome> {
     use crate::analyzer::resolution::{
-        BatchCandidateCompletionOutcome, ResolutionCompletion, ResolutionIncompleteReason,
+        BatchCandidateCompletionOutcome, ResolutionIncompleteReason,
     };
     use crate::analyzer::store::resolution_prepare::resolution_rows::{
         covers_candidate_endpoint, covers_candidate_inventory,
     };
+    if selection.stage_has_no_content() {
+        // No stage content: no stage gap row can exist, so no reason qualifies
+        // the unconditional box or any branch.
+        let unconditional = if cancellation.is_cancelled() {
+            vec![ResolutionIncompleteReason::Cancelled]
+        } else {
+            Vec::new()
+        };
+        return Ok(BatchCandidateCompletionOutcome::new(
+            requests.len(),
+            super::completion_from_reasons(unconditional),
+            requests.iter().map(|_| super::completion_from_reasons([])),
+        ));
+    }
     let excluded = serde_json::to_string(
         &excluded
             .iter()
@@ -1211,20 +1335,16 @@ pub(in crate::analyzer::store) fn candidate_completion(
             .iter()
             .map(|request| {
                 let endpoint = request.endpoint();
-                let (key, shared, mode) = match endpoint.symbols().fixed().first() {
-                    Some(symbol) => {
+                let (key, shared, mode) = match endpoint_lookup_shape(
+                    endpoint.symbols().fixed().first(),
+                    endpoint.symbols().tail().is_some(),
+                ) {
+                    EndpointLookupShape::Fixed(symbol) => {
                         let (key, shared) = super::lexical::semantic_cells(symbol.symbol());
                         (key, shared, 1)
                     }
-                    None => (
-                        None,
-                        None,
-                        if endpoint.symbols().tail().is_some() {
-                            2
-                        } else {
-                            0
-                        },
-                    ),
+                    EndpointLookupShape::Unkeyed => (None, None, 0),
+                    EndpointLookupShape::Every => (None, None, 2),
                 };
                 (codec::encode_node(endpoint.node()), key, shared, mode)
             })
@@ -1281,17 +1401,10 @@ pub(in crate::analyzer::store) fn candidate_completion(
     if cancellation.is_cancelled() {
         unconditional.push(ResolutionIncompleteReason::Cancelled);
     }
-    let completion = |reasons: Vec<_>| {
-        if reasons.is_empty() {
-            ResolutionCompletion::Complete
-        } else {
-            ResolutionCompletion::incomplete(reasons)
-        }
-    };
     Ok(BatchCandidateCompletionOutcome::new(
         requests.len(),
-        completion(unconditional),
-        branches.into_iter().map(completion),
+        super::completion_from_reasons(unconditional),
+        branches.into_iter().map(super::completion_from_reasons),
     ))
 }
 
@@ -1337,74 +1450,79 @@ pub(in crate::analyzer::store) fn reference_seed_rows(
             .collect::<Vec<_>>(),
     )
     .expect("stage reference seed requests serialize");
-    read(selection, cancellation, |connection| {
-        let mut result = vec![None; queries.len()];
-        let mut statement = connection.prepare_cached(REFERENCE_SEED_ROWS_SQL)?;
-        let mut rows = statement.query([parameters])?;
-        while let Some(row) = rows.next()? {
-            if cancellation.is_cancelled() {
-                return Ok(None);
-            }
-            let ordinal: usize = row.get(0)?;
-            let kind: Option<i64> = row.get(5)?;
-            let metadata = if let Some(kind) = kind {
-                let owner_kind: i64 = row.get(9)?;
-                let owner = match owner_kind {
-                    0 => None,
-                    1 => Some(None),
-                    2 => {
-                        let key: Option<i64> = row.get(10)?;
-                        let shared: Option<i64> = row.get(11)?;
-                        Some(Some(codec::decode_semantic(key.unwrap_or_else(|| {
-                            -shared.expect("stage reference owner coordinate")
-                        }))))
-                    }
-                    other => unreachable!("invalid stage reference owner kind {other}"),
-                };
-                let origin: Option<i64> = row.get(12)?;
-                Some(
-                    FactReferenceSiteMetadata::new(
-                        ResolutionSiteId::new(row.get(3)?),
-                        namespace_from_code(row.get(4)?),
-                        from_code(ALL_RESOLUTION_SITE_KINDS, kind, "stage reference site kind"),
-                        row.get(6)?,
-                        row.get(7)?,
-                        row.get::<_, i64>(8)? != 0,
-                        owner,
-                        origin.map(|origin| {
-                            from_code(
-                                ALL_RESOLUTION_CALLABLE_RECEIVER_ORIGINS,
-                                origin,
-                                "stage reference receiver origin",
-                            )
-                        }),
-                    )
-                    .with_go_spelling_namespace(
-                        row.get::<_, Option<i64>>(13)?.map(namespace_from_code),
-                    )
-                    .with_go_package_qualifier(row.get(14)?),
-                )
-            } else {
-                None
-            };
-            let current = ReferenceSeedRow {
-                host: BindingFragmentId::at_ordinal(row.get(1)?),
-                node: codec::decode_node(row.get(2)?),
-                metadata,
-            };
-            if let Some(previous) = &result[ordinal] {
-                if previous != &current {
-                    return Err(StoreError::new(format!(
-                        "stage reference seed authority disagrees: {:?}, {previous:?}, {current:?}",
-                        queries[ordinal]
-                    )));
+    read_stage(
+        selection,
+        cancellation,
+        || vec![None; queries.len()],
+        |connection| {
+            let mut result = vec![None; queries.len()];
+            let mut statement = connection.prepare_cached(REFERENCE_SEED_ROWS_SQL)?;
+            let mut rows = statement.query([parameters])?;
+            while let Some(row) = rows.next()? {
+                if cancellation.is_cancelled() {
+                    return Ok(None);
                 }
-            } else {
-                result[ordinal] = Some(current);
+                let ordinal: usize = row.get(0)?;
+                let kind: Option<i64> = row.get(5)?;
+                let metadata = if let Some(kind) = kind {
+                    let owner_kind: i64 = row.get(9)?;
+                    let owner = match owner_kind {
+                        0 => None,
+                        1 => Some(None),
+                        2 => {
+                            let key: Option<i64> = row.get(10)?;
+                            let shared: Option<i64> = row.get(11)?;
+                            Some(Some(codec::decode_semantic(key.unwrap_or_else(|| {
+                                -shared.expect("stage reference owner coordinate")
+                            }))))
+                        }
+                        other => unreachable!("invalid stage reference owner kind {other}"),
+                    };
+                    let origin: Option<i64> = row.get(12)?;
+                    Some(
+                        FactReferenceSiteMetadata::new(
+                            ResolutionSiteId::new(row.get(3)?),
+                            namespace_from_code(row.get(4)?),
+                            from_code(ALL_RESOLUTION_SITE_KINDS, kind, "stage reference site kind"),
+                            row.get(6)?,
+                            row.get(7)?,
+                            row.get::<_, i64>(8)? != 0,
+                            owner,
+                            origin.map(|origin| {
+                                from_code(
+                                    ALL_RESOLUTION_CALLABLE_RECEIVER_ORIGINS,
+                                    origin,
+                                    "stage reference receiver origin",
+                                )
+                            }),
+                        )
+                        .with_go_spelling_namespace(
+                            row.get::<_, Option<i64>>(13)?.map(namespace_from_code),
+                        )
+                        .with_go_package_qualifier(row.get(14)?),
+                    )
+                } else {
+                    None
+                };
+                let current = ReferenceSeedRow {
+                    host: BindingFragmentId::at_ordinal(row.get(1)?),
+                    node: codec::decode_node(row.get(2)?),
+                    metadata,
+                };
+                if let Some(previous) = &result[ordinal] {
+                    if previous != &current {
+                        return Err(StoreError::new(format!(
+                            "stage reference seed authority disagrees: {:?}, {previous:?}, {current:?}",
+                            queries[ordinal]
+                        )));
+                    }
+                } else {
+                    result[ordinal] = Some(current);
+                }
             }
-        }
-        Ok(Some(result))
-    })
+            Ok(Some(result))
+        },
+    )
 }
 
 pub(in crate::analyzer::store) const CONTEXT_FORWARD_CANDIDATES_SQL: &str = r#"
@@ -1474,7 +1592,7 @@ pub(in crate::analyzer::store) fn context_candidate_rows(
     let whole = serde_json::to_string(&whole).expect("whole context requests serialize");
     let keyed = serde_json::to_string(&keyed).expect("keyed context requests serialize");
     read(selection, cancellation, |connection| {
-        super::context::require_context(connection, context)?;
+        super::context::require_context(selection, context)?;
         let mut result = Vec::new();
         let mut statement = connection.prepare_cached(sql)?;
         let mut rows = statement.query(rusqlite::params![context.get(), whole, keyed])?;
@@ -1509,7 +1627,7 @@ pub(in crate::analyzer::store) fn context_paths(
     cancellation: &CancellationToken,
 ) -> Result<Option<Vec<(CandidatePathIdentity, PartialPath)>>> {
     read(selection, cancellation, |connection| {
-        super::context::require_context(connection, context)?;
+        super::context::require_context(selection, context)?;
         let mut result = Vec::new();
         let mut statement=connection.prepare_cached("SELECT host_ordinal,path,start_node,end_node,json(body) FROM temp.selected_resolution_context_paths WHERE context_id=?1 ORDER BY host_ordinal,path")?;
         let mut rows = statement.query([context.get()])?;
@@ -1528,12 +1646,15 @@ pub(in crate::analyzer::store) fn context_paths(
     })
 }
 
+pub(in crate::analyzer::store) type HydratedContextPaths =
+    (Vec<(CandidatePathIdentity, PartialPath)>, usize);
+
 pub(in crate::analyzer::store) fn hydrate_context_paths(
     selection: &SelectedResolutionMountInventory<'_>,
     context: crate::analyzer::resolution::SelectedContextPathToken,
     candidates: &[CandidatePathIdentity],
     cancellation: &CancellationToken,
-) -> Result<Option<Vec<(CandidatePathIdentity, PartialPath)>>> {
+) -> Result<Option<HydratedContextPaths>> {
     let requests = serde_json::to_string(
         &candidates
             .iter()
@@ -1547,15 +1668,19 @@ pub(in crate::analyzer::store) fn hydrate_context_paths(
     )
     .expect("context hydration requests serialize");
     read(selection, cancellation, |connection| {
-        super::context::require_context(connection, context)?;
+        super::context::require_context(selection, context)?;
         let mut result = Vec::new();
         let mut seen = crate::hash::HashSet::default();
+        let mut decoded_rows = 0_usize;
         let mut statement=connection.prepare_cached("SELECT input.key,p.start_node,p.end_node,json(p.body) FROM json_each(?2) input CROSS JOIN temp.selected_resolution_context_paths p ON p.context_id=?1 AND p.host_ordinal=input.value->>0 AND p.path=input.value->>1 ORDER BY input.key")?;
         let mut rows = statement.query(rusqlite::params![context.get(), requests])?;
         while let Some(row) = rows.next()? {
             if cancellation.is_cancelled() {
                 return Ok(None);
             }
+            decoded_rows = decoded_rows
+                .checked_add(1)
+                .expect("selected context hydration row count fits usize");
             let ordinal: usize = row.get(0)?;
             let identity = candidates[ordinal];
             if !seen.insert(identity) {
@@ -1564,7 +1689,7 @@ pub(in crate::analyzer::store) fn hydrate_context_paths(
             let path = codec::decode_path(row.get(1)?, row.get(2)?, &row.get::<_, String>(3)?);
             result.push((identity, path));
         }
-        Ok(Some(result))
+        Ok(Some((result, decoded_rows)))
     })
 }
 
@@ -1578,7 +1703,7 @@ pub(in crate::analyzer::store) fn reference_completions(
     crate::analyzer::resolution::ResolutionCompletion,
     bool,
 )> {
-    use crate::analyzer::resolution::{ResolutionCompletion, ResolutionIncompleteReason};
+    use crate::analyzer::resolution::ResolutionIncompleteReason;
     assert_eq!(queries.len(), seeds.len());
     let requests = serde_json::to_string(
         &queries
@@ -1634,11 +1759,7 @@ pub(in crate::analyzer::store) fn reference_completions(
     let completions = reasons
         .into_iter()
         .map(|reasons| {
-            let completion = if reasons.is_empty() {
-                ResolutionCompletion::Complete
-            } else {
-                ResolutionCompletion::incomplete(reasons)
-            };
+            let completion = super::completion_from_reasons(reasons);
             evidence.include(&completion);
             completion
         })
@@ -1651,18 +1772,11 @@ pub(in crate::analyzer::store) fn reference_inventory_completion(
     fragments: Option<&crate::hash::HashSet<BindingFragmentId>>,
     cancellation: &CancellationToken,
 ) -> Result<crate::analyzer::resolution::ResolutionCompletion> {
-    use crate::analyzer::resolution::{ResolutionCompletion, ResolutionIncompleteReason};
-    let fragments = fragments.map(|fragments| {
-        serde_json::to_string(
-            &fragments
-                .iter()
-                .map(|fragment| fragment.ordinal())
-                .collect::<Vec<_>>(),
-        )
-        .expect("reference inventory fragments serialize")
-    });
+    use crate::analyzer::resolution::ResolutionIncompleteReason;
+    let fragments = fragment_ordinals_json(fragments);
+    let wanted_hosts = wanted_hosts_cte(":fragments");
     let gap_sql = format!(
-        "WITH wanted_hosts AS (SELECT scope.mount_ordinal FROM json_each(:fragments) input CROSS JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=input.value UNION ALL SELECT mount_ordinal FROM temp.selected_resolution_scope_mounts WHERE :fragments IS NULL), raw_gaps(host,reason_key,origin) AS (SELECT mount.mount_ordinal,:local_base+(mount.mount_ordinal<<32)+fact.reason,reason.origin FROM wanted_hosts host CROSS JOIN temp.selected_resolution_mounts mount ON mount.mount_ordinal=host.mount_ordinal CROSS JOIN main.resolution_gaps fact ON fact.blob_id=mount.blob_id AND fact.covers IN(0,1) JOIN main.resolution_gap_reasons reason ON reason.blob_id=fact.blob_id AND reason.reason=fact.reason UNION ALL SELECT fact.host_ordinal,fact.reason_key,fact.origin FROM wanted_hosts host CROSS JOIN temp.selected_resolution_stage_gaps fact ON fact.host_ordinal=host.mount_ordinal AND fact.covers IN(0,1)) SELECT g.reason_key FROM raw_gaps g WHERE {}",
+        "WITH {wanted_hosts}, raw_gaps(host,reason_key,origin) AS (SELECT mount.mount_ordinal,:local_base+(mount.mount_ordinal<<32)+fact.reason,reason.origin FROM wanted_hosts host CROSS JOIN temp.selected_resolution_mounts mount ON mount.mount_ordinal=host.mount_ordinal CROSS JOIN main.resolution_gaps fact ON fact.blob_id=mount.blob_id AND fact.covers IN(0,1) JOIN main.resolution_gap_reasons reason ON reason.blob_id=fact.blob_id AND reason.reason=fact.reason UNION ALL SELECT fact.host_ordinal,fact.reason_key,fact.origin FROM wanted_hosts host CROSS JOIN temp.selected_resolution_stage_gaps fact ON fact.host_ordinal=host.mount_ordinal AND fact.covers IN(0,1)) SELECT g.reason_key FROM raw_gaps g WHERE {}",
         super::frontier_completion::effective_gap_remains_sql()
     );
     let mut reasons = Vec::new();
@@ -1695,11 +1809,7 @@ pub(in crate::analyzer::store) fn reference_inventory_completion(
     if cancellation.is_cancelled() {
         reasons.push(ResolutionIncompleteReason::Cancelled);
     }
-    Ok(if reasons.is_empty() {
-        ResolutionCompletion::Complete
-    } else {
-        ResolutionCompletion::incomplete(reasons)
-    })
+    Ok(super::completion_from_reasons(reasons))
 }
 
 pub(in crate::analyzer::store) fn reference_inventory(
@@ -1718,23 +1828,17 @@ pub(in crate::analyzer::store) fn reference_inventory(
     if cancellation.is_cancelled() {
         return Ok((Vec::new(), completion, true));
     }
-    let fragments = fragments.map(|fragments| {
-        serde_json::to_string(
-            &fragments
-                .iter()
-                .map(|fragment| fragment.ordinal())
-                .collect::<Vec<_>>(),
-        )
-        .expect("reference inventory fragments serialize")
-    });
+    let fragments = fragment_ordinals_json(fragments);
+    let wanted_hosts = wanted_hosts_cte("?1");
+    let sql = format!(
+        "WITH {wanted_hosts}, producers AS (SELECT producer.producer_id,producer.host_ordinal FROM wanted_hosts host CROSS JOIN temp.selected_resolution_stage_producers producer INDEXED BY selected_resolution_stage_capsule ON producer.host_ordinal=host.mount_ordinal AND producer.admission_id IS NOT NULL UNION ALL SELECT producer.producer_id,producer.host_ordinal FROM wanted_hosts host CROSS JOIN temp.selected_resolution_stage_producers producer INDEXED BY selected_resolution_stage_bridge ON producer.host_ordinal=host.mount_ordinal AND producer.bridge_identity IS NOT NULL) SELECT 0,mount.mount_ordinal,?2+(mount.mount_ordinal<<32)+site.site,NULL FROM wanted_hosts host CROSS JOIN temp.selected_resolution_mounts mount ON mount.mount_ordinal=host.mount_ordinal CROSS JOIN main.resolution_sites site ON site.blob_id=mount.blob_id AND site.role=0 UNION ALL SELECT 1,producer.host_ordinal,node.kind_semantic_key,node.kind_shared_id FROM producers producer CROSS JOIN temp.selected_resolution_stage_node_owners owner ON owner.producer_id=producer.producer_id CROSS JOIN temp.selected_resolution_stage_nodes node ON node.node=owner.node WHERE node.kind=8"
+    );
     let mut references = Vec::new();
-    let result = with_resolution_read_progress_handler(
-        selection.connection(),
-        cancellation,
-        |connection| {
+    let result =
+        with_resolution_read_progress_handler(selection.connection(), cancellation, |connection| {
             // Read source-known inventory evidence before any seed can reach a
             // visitor, including gaps from admitted fragments with no references.
-            let mut statement=connection.prepare_cached("WITH wanted_hosts AS (SELECT scope.mount_ordinal FROM json_each(?1) input CROSS JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=input.value UNION ALL SELECT mount_ordinal FROM temp.selected_resolution_scope_mounts WHERE ?1 IS NULL), producers AS (SELECT producer.producer_id,producer.host_ordinal FROM wanted_hosts host CROSS JOIN temp.selected_resolution_stage_producers producer INDEXED BY selected_resolution_stage_capsule ON producer.host_ordinal=host.mount_ordinal AND producer.admission_id IS NOT NULL UNION ALL SELECT producer.producer_id,producer.host_ordinal FROM wanted_hosts host CROSS JOIN temp.selected_resolution_stage_producers producer INDEXED BY selected_resolution_stage_bridge ON producer.host_ordinal=host.mount_ordinal AND producer.bridge_identity IS NOT NULL) SELECT 0,mount.mount_ordinal,?2+(mount.mount_ordinal<<32)+site.site,NULL FROM wanted_hosts host CROSS JOIN temp.selected_resolution_mounts mount ON mount.mount_ordinal=host.mount_ordinal CROSS JOIN main.resolution_sites site ON site.blob_id=mount.blob_id AND site.role=0 UNION ALL SELECT 1,producer.host_ordinal,node.kind_semantic_key,node.kind_shared_id FROM producers producer CROSS JOIN temp.selected_resolution_stage_node_owners owner ON owner.producer_id=producer.producer_id CROSS JOIN temp.selected_resolution_stage_nodes node ON node.node=owner.node WHERE node.kind=8")?;
+            let mut statement = connection.prepare_cached(&sql)?;
             let mut rows = statement.query(rusqlite::params![
                 fragments,
                 codec::encode_semantic(SemanticId::local(0, 0))
@@ -1750,8 +1854,7 @@ pub(in crate::analyzer::store) fn reference_inventory(
                 }
             }
             Ok(())
-        },
-    );
+        });
     match result {
         Err(error) if error.is_sqlite_interrupted() && cancellation.is_cancelled() => {}
         Err(error) => return Err(error),
@@ -1778,6 +1881,26 @@ pub(in crate::analyzer::store) fn reference_inventory(
         completion
     };
     Ok((queries, completion, cancelled))
+}
+
+fn fragment_ordinals_json(
+    fragments: Option<&crate::hash::HashSet<BindingFragmentId>>,
+) -> Option<String> {
+    fragments.map(|fragments| {
+        serde_json::to_string(
+            &fragments
+                .iter()
+                .map(|fragment| fragment.ordinal())
+                .collect::<Vec<_>>(),
+        )
+        .expect("reference inventory fragments serialize")
+    })
+}
+
+fn wanted_hosts_cte(fragment_parameter: &str) -> String {
+    format!(
+        "wanted_hosts AS (SELECT scope.mount_ordinal FROM json_each({fragment_parameter}) input CROSS JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=input.value UNION ALL SELECT mount_ordinal FROM temp.selected_resolution_scope_mounts WHERE {fragment_parameter} IS NULL)"
+    )
 }
 
 pub(in crate::analyzer::store) fn root_terminal_candidates_sql() -> &'static str {
@@ -1821,7 +1944,7 @@ pub(in crate::analyzer::store) fn root_terminal_candidates(
         })
         .collect::<Vec<_>>();
     let names = serde_json::to_string(&names).expect("terminal demands serialize");
-    read(selection, cancellation, |connection| {
+    read_stage(selection, cancellation, Vec::new, |connection| {
         let mut statement = connection.prepare_cached(root_terminal_candidates_sql())?;
         let mut rows = statement.query([names])?;
         let mut result = Vec::new();
@@ -1950,7 +2073,7 @@ pub(in crate::analyzer::store) fn fragment_completion(
     selection: &SelectedResolutionMountInventory<'_>,
     cancellation: &CancellationToken,
 ) -> Result<crate::analyzer::resolution::ResolutionCompletion> {
-    use crate::analyzer::resolution::{ResolutionCompletion, ResolutionIncompleteReason};
+    use crate::analyzer::resolution::ResolutionIncompleteReason;
     let sql = format!(
         "WITH raw_gaps(host,reason_key,origin) AS (SELECT fact.host_ordinal,fact.reason_key,fact.origin FROM temp.selected_resolution_stage_gaps fact CROSS JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=fact.host_ordinal WHERE fact.covers=0) SELECT g.reason_key FROM raw_gaps g WHERE {}",
         super::frontier_completion::effective_gap_remains_sql()
@@ -1984,9 +2107,5 @@ pub(in crate::analyzer::store) fn fragment_completion(
     if cancellation.is_cancelled() {
         reasons.push(ResolutionIncompleteReason::Cancelled);
     }
-    Ok(if reasons.is_empty() {
-        ResolutionCompletion::Complete
-    } else {
-        ResolutionCompletion::incomplete(reasons)
-    })
+    Ok(super::completion_from_reasons(reasons))
 }

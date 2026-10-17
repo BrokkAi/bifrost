@@ -18,13 +18,12 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 use std::time::Instant;
 
+use brokk_bifrost_core::benchmark_provenance::{command_output, git_commit};
 use serde::Serialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 use super::plan::PhysicalQueryOperator;
@@ -644,15 +643,7 @@ fn structural_cache_counts(analyzer: &dyn IAnalyzer) -> StructuralCacheCounts {
 
 fn sha256_json(value: &impl Serialize) -> String {
     let payload = serde_json::to_vec(value).expect("serialize CodeQuery benchmark result");
-    digest_hex(Sha256::digest(payload))
-}
-
-fn digest_hex(bytes: impl AsRef<[u8]>) -> String {
-    bytes
-        .as_ref()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    brokk_bifrost_analysis::analyzer::semantic_model::csmi::sha256_hex(&payload)
 }
 
 fn idealized_headroom(profile: &QueryExecutionProfile) -> Option<IdealizedHeadroom> {
@@ -1674,10 +1665,6 @@ fn assert_complete_expected(sample: &ExecutionSample, expected: usize, name: &st
     }
 }
 
-fn git_commit(root: &Path) -> Option<String> {
-    command_output_in(root, "git", &["rev-parse", "HEAD"])
-}
-
 fn git_dirty(root: &Path) -> Option<bool> {
     command_output_in(
         root,
@@ -1685,16 +1672,6 @@ fn git_dirty(root: &Path) -> Option<bool> {
         &["status", "--porcelain", "--untracked-files=normal"],
     )
     .map(|status| !status.is_empty())
-}
-
-fn command_output(program: &str, arguments: &[&str]) -> Option<String> {
-    Command::new(program)
-        .args(arguments)
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|output| output.trim().to_owned())
 }
 
 fn cpu_model() -> Option<String> {

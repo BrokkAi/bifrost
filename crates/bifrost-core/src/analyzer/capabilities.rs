@@ -3,13 +3,15 @@ use crate::analyzer::model::{CodeUnit, ImportInfo, ProjectFile};
 use crate::analyzer::pool_memo::{KeyedPoolSafeMemo, PoolSafeMemo};
 use crate::analyzer::query_token::QueryToken;
 use crate::cancellation::CancellationToken;
-use crate::compact_graph::{CompactRows, CompactRowsBuilder};
+use crate::compact_graph::{CompactRows, CompactRowsBuilder, normalize_indexed_edges};
 use crate::hash::{HashMap, HashSet};
 use std::any::Any;
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use rayon::prelude::*;
+
+use serde_json::Value;
 
 pub trait CapabilityProvider: Any {
     fn as_any(&self) -> &dyn Any;
@@ -38,6 +40,64 @@ pub struct FileDependencyFacts {
 pub struct AdditionalFileDependencies {
     pub dependencies: HashMap<ProjectFile, HashSet<ProjectFile>>,
     pub complete: bool,
+}
+
+/// One structured name lookup performed while resolving a file's imports.
+/// Candidate invalidation is indexed by the consulted file and looked-up name
+/// so a content edit can invalidate only importers whose resolution consulted
+/// the changed binding. The name `*` is reserved for a glob-surface lookup.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ImportLookupDependency {
+    pub import_ordinal: u32,
+    pub consulted_file: ProjectFile,
+    pub name: String,
+}
+
+/// Positive and negative structured lookups used to resolve one importer's
+/// file edges. Missing module keys let a newly appearing module invalidate
+/// imports that could not resolve before it existed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImportResolutionDependencies {
+    pub lookups: Vec<ImportLookupDependency>,
+    pub missing_module_path_keys: Vec<(u32, String)>,
+}
+
+/// One effective Rust name binding in a source file's module surface.
+///
+/// These rows are computed only for changed files and persisted relationally
+/// so the import graph can compare old and new lookup surfaces without
+/// retaining a workspace-sized Rust index in memory.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ImportGraphBindingSurface {
+    pub module_path: String,
+    pub name: String,
+    pub namespace: String,
+    pub visibility_kind: String,
+    pub visibility_scope: String,
+    pub origin_file: ProjectFile,
+    pub origin_module_path: String,
+    pub origin_name: String,
+    pub route_files: Vec<ProjectFile>,
+}
+
+/// Fixed-width fingerprints of the structured inputs to one file's effective
+/// import bindings. These are cache identities, not serialized fact bundles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImportGraphInputDigests {
+    pub binding_surface: [u8; 32],
+    pub import_rows: [u8; 32],
+}
+
+/// Target-file edges with structured provenance values for each target.
+pub type ImportedFileEdgeTargets = HashMap<ProjectFile, Vec<Value>>;
+
+/// File targets resolved for one import statement. Providers with complete
+/// candidate dependencies emit these separately so an edit can replace only
+/// the statements whose lookup routes consulted the changed file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedFileEdgeFacts {
+    pub import_ordinal: u32,
+    pub edges: ImportedFileEdgeTargets,
 }
 
 impl AdditionalFileDependencies {
@@ -129,6 +189,106 @@ pub trait ImportAnalysisProvider: CapabilityProvider + Send + Sync {
         })
     }
 
+    /// Whether this provider can produce complete structured negative and
+    /// positive import lookup dependencies for every source it analyzes.
+    fn has_complete_import_resolution_dependencies(&self) -> bool {
+        false
+    }
+
+    /// Stable module-path keys backed or declared by this source. They are
+    /// used only to match persisted missing-module lookups after source-set
+    /// changes.
+    fn import_graph_module_path_keys_for_files(
+        &self,
+        _files: &[ProjectFile],
+    ) -> Option<HashMap<ProjectFile, Vec<String>>> {
+        None
+    }
+
+    /// Return the current structured module-level binding surface for the
+    /// selected files. Incremental providers use this to invalidate only the
+    /// names whose bindings changed after a source edit.
+    fn import_graph_binding_surfaces_for_files(
+        &self,
+        _files: &[ProjectFile],
+        _cancellation: Option<&CancellationToken>,
+    ) -> Option<HashMap<ProjectFile, Vec<ImportGraphBindingSurface>>> {
+        None
+    }
+
+    /// Return per-file hashes of the structured declarations/routes and import
+    /// binders that can affect the file's import-graph surface. A provider that
+    /// cannot prove completeness returns None, selecting conservative refresh.
+    fn import_graph_input_digests_for_files(
+        &self,
+        _files: &[ProjectFile],
+        _cancellation: Option<&CancellationToken>,
+    ) -> Option<HashMap<ProjectFile, ImportGraphInputDigests>> {
+        None
+    }
+
+    /// Return complete structured candidate dependencies for each importer.
+    /// Providers without this evidence return None; callers can still build
+    /// correct edges, but must use conservative full invalidation when those
+    /// providers' source contents or source sets change.
+    fn import_resolution_dependencies_for_files(
+        &self,
+        _files: &[ProjectFile],
+        _import_infos: Option<&HashMap<ProjectFile, Vec<ImportInfo>>>,
+        _cancellation: Option<&CancellationToken>,
+    ) -> Option<HashMap<ProjectFile, ImportResolutionDependencies>> {
+        None
+    }
+
+    /// Resolve structured import edges while retaining the source import
+    /// ordinal. `selected_ordinals` lists imports to resolve for files whose
+    /// other import rows will be carried forward; files absent from that map
+    /// are resolved in full. Providers without per-import output return None
+    /// for a partial request, allowing the caller to use its conservative
+    /// source-level path.
+    fn for_each_import_edge_facts_from_infos(
+        &self,
+        files: &[ProjectFile],
+        import_infos: Option<&HashMap<ProjectFile, Vec<ImportInfo>>>,
+        selected_ordinals: &HashMap<ProjectFile, Vec<u32>>,
+        cancellation: Option<&CancellationToken>,
+        visit: &mut dyn FnMut(&ProjectFile, Vec<ImportedFileEdgeFacts>) -> bool,
+    ) -> Option<()> {
+        if !selected_ordinals.is_empty() {
+            return None;
+        }
+        self.for_each_imported_file_edges_from_infos(
+            files,
+            import_infos,
+            cancellation,
+            &mut |file, edges| {
+                visit(
+                    file,
+                    vec![ImportedFileEdgeFacts {
+                        import_ordinal: u32::MAX,
+                        edges,
+                    }],
+                )
+            },
+        )
+    }
+
+    /// Recompute only the candidate dependencies for selected import
+    /// ordinals. The default is conservative: it can only provide all facts
+    /// when the caller did not select a subset.
+    fn import_resolution_dependencies_for_ordinals(
+        &self,
+        files: &[ProjectFile],
+        import_infos: Option<&HashMap<ProjectFile, Vec<ImportInfo>>>,
+        selected_ordinals: &HashMap<ProjectFile, Vec<u32>>,
+        cancellation: Option<&CancellationToken>,
+    ) -> Option<HashMap<ProjectFile, ImportResolutionDependencies>> {
+        if !selected_ordinals.is_empty() {
+            return None;
+        }
+        self.import_resolution_dependencies_for_files(files, import_infos, cancellation)
+    }
+
     /// Return structured direct file dependencies that are not represented by
     /// ordinary import facts.
     ///
@@ -187,6 +347,67 @@ pub trait ImportAnalysisProvider: CapabilityProvider + Send + Sync {
         _imports: &[ImportInfo],
     ) -> Option<HashSet<ProjectFile>> {
         None
+    }
+
+    /// Provenance for file edges resolved from these structured import facts.
+    /// Providers with richer resolution routes can attach those routes to the
+    /// target file; `None` leaves the caller to use the general structured
+    /// import facts as provenance.
+    fn imported_file_edge_provenance_from_infos(
+        &self,
+        _file: &ProjectFile,
+        _imports: &[ImportInfo],
+    ) -> Option<ImportedFileEdgeTargets> {
+        None
+    }
+
+    /// Resolve each file's imports while streaming results to `visit`, so a
+    /// provider can reuse request-scoped resolver state without retaining a
+    /// workspace-sized result collection. Return `None` only when unsupported;
+    /// in that case `visit` must not have been called. Return `Some(())` after
+    /// handling files until the input ends or `visit` returns `false`.
+    fn for_each_imported_files_from_infos(
+        &self,
+        _files: &[ProjectFile],
+        _import_infos: Option<&HashMap<ProjectFile, Vec<ImportInfo>>>,
+        _cancellation: Option<&CancellationToken>,
+        _visit: &mut dyn FnMut(&ProjectFile, HashSet<ProjectFile>) -> bool,
+    ) -> Option<()> {
+        None
+    }
+
+    /// Stream resolved file edges together with their structured provenance.
+    /// The default preserves providers that only expose targets and records
+    /// the parsed import facts that were supplied for each importer.
+    fn for_each_imported_file_edges_from_infos(
+        &self,
+        files: &[ProjectFile],
+        import_infos: Option<&HashMap<ProjectFile, Vec<ImportInfo>>>,
+        cancellation: Option<&CancellationToken>,
+        visit: &mut dyn FnMut(&ProjectFile, ImportedFileEdgeTargets) -> bool,
+    ) -> Option<()> {
+        let mut visit_targets = |file: &ProjectFile, targets: HashSet<ProjectFile>| {
+            let facts = import_infos.and_then(|infos| infos.get(file)).map_or_else(
+                || serde_json::json!({ "kind": "provider_resolved_import_edge" }),
+                |imports| {
+                    serde_json::json!({
+                        "kind": "structured_import_facts",
+                        "facts": imports
+                    })
+                },
+            );
+            let edges = targets
+                .into_iter()
+                .map(|target| (target, vec![facts.clone()]))
+                .collect();
+            visit(file, edges)
+        };
+        self.for_each_imported_files_from_infos(
+            files,
+            import_infos,
+            cancellation,
+            &mut visit_targets,
+        )
     }
 
     fn relevant_imports_for(&self, _code_unit: &CodeUnit) -> HashSet<String> {
@@ -328,14 +549,16 @@ where
 {
     build_reverse_file_index(
         files,
-        |file| {
-            resolve_imported(file)
-                .iter()
-                .map(|code_unit| code_unit.source().clone())
-                .collect::<Vec<_>>()
-        },
+        |file| imported_source_files(&resolve_imported(file)),
         parallel,
     )
+}
+
+fn imported_source_files(imported: &HashSet<CodeUnit>) -> Vec<ProjectFile> {
+    imported
+        .iter()
+        .map(|code_unit| code_unit.source().clone())
+        .collect()
 }
 
 pub type ReverseFileIndex = HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>;
@@ -350,10 +573,7 @@ where
     Files: Fn() -> Vec<ProjectFile> + Copy,
 {
     memoized_reverse_file_index(memo, files, |file| {
-        resolve_imported(file)
-            .iter()
-            .map(|code_unit| code_unit.source().clone())
-            .collect::<Vec<_>>()
+        imported_source_files(&resolve_imported(file))
     })
 }
 
@@ -418,6 +638,14 @@ pub trait TypeAliasProvider: CapabilityProvider + Send + Sync {
     fn is_type_alias(&self, _code_unit: &CodeUnit) -> bool {
         false
     }
+}
+
+/// Whether a capability provider classifies `code_unit` as a type alias.
+pub fn provider_declares_type_alias(
+    provider: Option<&dyn TypeAliasProvider>,
+    code_unit: &CodeUnit,
+) -> bool {
+    provider.is_some_and(|provider| provider.is_type_alias(code_unit))
 }
 
 pub trait TestDetectionProvider: CapabilityProvider {}
@@ -505,6 +733,10 @@ impl<'a> DescendantIndexScope<'a> {
     }
 }
 
+fn query_within_scope<T>(scope: &DescendantIndexScope<'_>, query: impl FnOnce() -> T) -> Option<T> {
+    (!scope.cancellation().is_cancelled()).then(query)
+}
+
 pub trait TypeHierarchyProvider: CapabilityProvider + Send + Sync {
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit>;
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit>;
@@ -536,7 +768,7 @@ pub trait TypeHierarchyProvider: CapabilityProvider + Send + Sync {
         code_unit: &CodeUnit,
         scope: &DescendantIndexScope<'_>,
     ) -> Option<Vec<CodeUnit>> {
-        (!scope.cancellation().is_cancelled()).then(|| self.get_direct_ancestors(code_unit))
+        query_within_scope(scope, || self.get_direct_ancestors(code_unit))
     }
 
     /// [`Self::get_direct_descendants`] under a caller's deadline and workspace
@@ -562,7 +794,7 @@ pub trait TypeHierarchyProvider: CapabilityProvider + Send + Sync {
         code_unit: &CodeUnit,
         scope: &DescendantIndexScope<'_>,
     ) -> Option<HashSet<CodeUnit>> {
-        (!scope.cancellation().is_cancelled()).then(|| self.get_direct_descendants(code_unit))
+        query_within_scope(scope, || self.get_direct_descendants(code_unit))
     }
 
     /// [`Self::get_descendants`] under a caller's deadline and workspace slice,
@@ -612,18 +844,7 @@ impl DirectDescendantIndex {
         index_by_node: HashMap<CodeUnit, u32>,
         mut edges: Vec<(u32, u32)>,
     ) -> Self {
-        assert_eq!(nodes.len(), index_by_node.len());
-        assert!(nodes.iter().enumerate().all(|(index, node)| {
-            index_by_node.get(node).copied()
-                == Some(
-                    u32::try_from(index).expect("hierarchy index declarations must fit in a u32"),
-                )
-        }));
-        assert!(edges.iter().all(|(ancestor, descendant)| {
-            (*ancestor as usize) < nodes.len() && (*descendant as usize) < nodes.len()
-        }));
-        edges.sort_unstable();
-        edges.dedup();
+        normalize_indexed_edges(&nodes, &index_by_node, &mut edges);
 
         let row_count = usize::from(!edges.is_empty())
             + edges

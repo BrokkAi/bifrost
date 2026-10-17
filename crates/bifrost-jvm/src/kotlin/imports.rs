@@ -30,7 +30,6 @@
 
 use std::sync::Arc;
 
-use brokk_bifrost_core::analyzer::capabilities::build_reverse_file_index;
 use brokk_bifrost_core::analyzer::common::language_for_file;
 use brokk_bifrost_core::analyzer::model::{ImportInfo, StructuredImportPath};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
@@ -320,39 +319,29 @@ pub fn compute_kotlin_same_package_reference_index(
     source: &dyn KotlinSource,
     parallel: bool,
 ) -> HashMap<ProjectFile, Arc<HashSet<ProjectFile>>> {
-    let mut targets_by_package_and_name: HashMap<(String, String), Vec<ProjectFile>> =
-        HashMap::default();
-    for file in source.all_files() {
-        if language_for_file(&file) != Language::Kotlin {
-            continue;
-        }
-        let package = source.package_name_of(&file).unwrap_or_default();
-        for declaration in source.top_level_declarations(&file) {
-            targets_by_package_and_name
-                .entry((package.clone(), declaration.identifier().to_string()))
-                .or_default()
-                .push(file.clone());
-        }
-    }
-
     let files: Vec<_> = source.all_files();
-    build_reverse_file_index(
+    crate::same_package_reference_index(
         &files,
+        |file| {
+            if language_for_file(file) != Language::Kotlin {
+                return None;
+            }
+            let package = source.package_name_of(file).unwrap_or_default();
+            let names = source
+                .top_level_declarations(file)
+                .into_iter()
+                .map(|declaration| declaration.identifier().to_string())
+                .collect();
+            Some((package, names))
+        },
         |candidate| {
             if language_for_file(candidate) != Language::Kotlin {
-                return Vec::new();
+                return None;
             }
             let package = source.package_name_of(candidate).unwrap_or_default();
-            let Some(identifiers) = source.type_identifiers_of(candidate) else {
-                return Vec::new();
-            };
-            identifiers
-                .iter()
-                .filter_map(|identifier| {
-                    targets_by_package_and_name.get(&(package.clone(), identifier.clone()))
-                })
-                .flat_map(|targets| targets.iter().cloned())
-                .collect()
+            source
+                .type_identifiers_of(candidate)
+                .map(|identifiers| (package, identifiers.into_iter().collect()))
         },
         parallel,
     )

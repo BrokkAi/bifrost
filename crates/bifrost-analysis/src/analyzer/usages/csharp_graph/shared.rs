@@ -62,6 +62,48 @@ impl<'a> CSharpAuthoritativeUsageRequest<'a> {
     }
 }
 
+fn csharp_target_specs(
+    overloads: &[CodeUnit],
+    mut spec_for: impl FnMut(&CodeUnit) -> Option<TargetSpec>,
+) -> Result<Vec<TargetSpec>, Box<GraphUsageOutcome>> {
+    overloads
+        .iter()
+        .map(|overload| {
+            spec_for(overload).ok_or_else(|| {
+                Box::new(GraphUsageOutcome::fallback_safe(
+                    overload.fq_name(),
+                    GraphFailureReason::UnsupportedTargetShape("target shape is unsupported"),
+                    "CSharpUsageGraphStrategy",
+                ))
+            })
+        })
+        .collect()
+}
+
+fn csharp_usage_outcome(
+    target: &CodeUnit,
+    hits: BTreeSet<UsageHit>,
+    unproven_hits: BTreeSet<UsageHit>,
+    limit_exceeded: bool,
+    max_usages: usize,
+) -> GraphUsageOutcome {
+    let external_callsites = crate::analyzer::usages::common::external_usage_hit_count(&hits);
+    if limit_exceeded || external_callsites > max_usages {
+        return GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {
+            short_name: target.short_name().to_string(),
+            total_callsites: external_callsites,
+            limit: max_usages,
+            sample_hits: hits,
+        });
+    }
+
+    GraphUsageOutcome::Resolved(FuzzyResult::success_with_unproven(
+        target.clone(),
+        hits,
+        unproven_hits,
+    ))
+}
+
 impl<'a> CSharpAuthoritativeUsageBatch<'a> {
     pub fn new(
         analyzer: &'a dyn IAnalyzer,
@@ -131,35 +173,30 @@ impl<'a> CSharpAuthoritativeUsageBatch<'a> {
                 plans.push(None);
                 continue;
             };
-            let mut specs = Vec::with_capacity(request.overloads.len());
-            let mut unsupported = None;
-            for overload in request.overloads {
-                let Some(spec) = TargetSpec::from_target(&graph, overload) else {
-                    unsupported = Some(GraphUsageOutcome::fallback_safe(
-                        overload.fq_name(),
-                        GraphFailureReason::UnsupportedTargetShape("target shape is unsupported"),
-                        "CSharpUsageGraphStrategy",
-                    ));
-                    break;
-                };
-                specs.push(SpecResult {
-                    spec,
-                    hits: BTreeSet::new(),
-                    unproven_hits: BTreeSet::new(),
-                    limit_exceeded: false,
-                });
-            }
-            if let Some(unsupported) = unsupported {
-                outcomes[index] = Some(unsupported);
-                plans.push(None);
-            } else {
-                plans.push(Some(QueryPlan {
-                    target: target.clone(),
-                    candidate_files: request.candidate_files,
-                    max_usages: request.max_usages,
-                    specs,
-                }));
-            }
+            let specs = match csharp_target_specs(request.overloads, |overload| {
+                TargetSpec::from_target(&graph, overload)
+            }) {
+                Ok(specs) => specs
+                    .into_iter()
+                    .map(|spec| SpecResult {
+                        spec,
+                        hits: BTreeSet::new(),
+                        unproven_hits: BTreeSet::new(),
+                        limit_exceeded: false,
+                    })
+                    .collect(),
+                Err(outcome) => {
+                    outcomes[index] = Some(*outcome);
+                    plans.push(None);
+                    continue;
+                }
+            };
+            plans.push(Some(QueryPlan {
+                target: target.clone(),
+                candidate_files: request.candidate_files,
+                max_usages: request.max_usages,
+                specs,
+            }));
         }
 
         for (file, prepared) in &self.prepared_files {
@@ -204,19 +241,12 @@ impl<'a> CSharpAuthoritativeUsageBatch<'a> {
                 unproven_hits.extend(result.unproven_hits);
                 limit_exceeded |= result.limit_exceeded;
             }
-            let external_callsites =
-                crate::analyzer::usages::common::external_usage_hit_count(&hits);
-            outcomes[index] = Some(GraphUsageOutcome::Resolved(
-                if limit_exceeded || external_callsites > plan.max_usages {
-                    FuzzyResult::TooManyCallsites {
-                        short_name: plan.target.short_name().to_string(),
-                        total_callsites: external_callsites,
-                        limit: plan.max_usages,
-                        sample_hits: hits,
-                    }
-                } else {
-                    FuzzyResult::success_with_unproven(plan.target, hits, unproven_hits)
-                },
+            outcomes[index] = Some(csharp_usage_outcome(
+                &plan.target,
+                hits,
+                unproven_hits,
+                limit_exceeded,
+                plan.max_usages,
             ));
         }
 
@@ -274,17 +304,12 @@ impl CSharpQueryResolver<'_> {
             return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
         };
         let graph = csharp_graph_source(analyzer);
-        let mut specs = Vec::with_capacity(overloads.len());
-        for overload in overloads {
-            let Some(spec) = TargetSpec::from_target(&graph, overload) else {
-                return GraphUsageOutcome::fallback_safe(
-                    overload.fq_name(),
-                    GraphFailureReason::UnsupportedTargetShape("target shape is unsupported"),
-                    "CSharpUsageGraphStrategy",
-                );
-            };
-            specs.push(spec);
-        }
+        let specs = match csharp_target_specs(overloads, |overload| {
+            TargetSpec::from_target(&graph, overload)
+        }) {
+            Ok(specs) => specs,
+            Err(outcome) => return *outcome,
+        };
 
         let candidate_files = scan_scope.candidate_files();
         let mut files: HashSet<ProjectFile> = candidate_files
@@ -343,21 +368,7 @@ impl CSharpQueryResolver<'_> {
             }
         }
 
-        let external_callsites = crate::analyzer::usages::common::external_usage_hit_count(&hits);
-        if limit_exceeded || external_callsites > max_usages {
-            return GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {
-                short_name: target.short_name().to_string(),
-                total_callsites: external_callsites,
-                limit: max_usages,
-                sample_hits: hits,
-            });
-        }
-
-        GraphUsageOutcome::Resolved(FuzzyResult::success_with_unproven(
-            target.clone(),
-            hits,
-            unproven_hits,
-        ))
+        csharp_usage_outcome(target, hits, unproven_hits, limit_exceeded, max_usages)
     }
 }
 

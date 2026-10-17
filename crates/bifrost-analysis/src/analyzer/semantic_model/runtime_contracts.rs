@@ -158,10 +158,10 @@ pub fn runtime_contract_envelope_matches(
         return Ok(false);
     };
     let mut wire = Vec::new();
-    for fact in facts.iter().filter(|fact| {
-        fact.get("vocabulary").and_then(Value::as_str) == Some("csmi.runtime-values")
-            && fact.get("version").and_then(Value::as_str) == Some(RUNTIME_VALUES_V2_VERSION)
-    }) {
+    for fact in facts
+        .iter()
+        .filter(|fact| is_runtime_contract_v2_fact(fact))
+    {
         let Some(record) = fact.get("payload") else {
             return Ok(false);
         };
@@ -193,10 +193,7 @@ pub fn normalize_runtime_contract_envelope(
                 continue;
             };
             for fact in facts {
-                if fact.get("vocabulary").and_then(Value::as_str) != Some("csmi.runtime-values")
-                    || fact.get("version").and_then(Value::as_str)
-                        != Some(RUNTIME_VALUES_V2_VERSION)
-                {
+                if !is_runtime_contract_v2_fact(fact) {
                     continue;
                 }
                 let Some(payload) = fact.get_mut("payload") else {
@@ -210,6 +207,11 @@ pub fn normalize_runtime_contract_envelope(
     let normalized: Value = serde_json::from_slice(&core)?;
     *envelope = normalized;
     Ok(())
+}
+
+fn is_runtime_contract_v2_fact(fact: &Value) -> bool {
+    fact.get("vocabulary").and_then(Value::as_str) == Some("csmi.runtime-values")
+        && fact.get("version").and_then(Value::as_str) == Some(RUNTIME_VALUES_V2_VERSION)
 }
 
 // ---------------------------------------------------------------------------
@@ -977,9 +979,15 @@ pub enum RuntimeObservationOriginV2 {
 pub fn runtime_contract_canonical<T: Serialize>(
     value: &T,
 ) -> Result<Vec<u8>, crate::analyzer::semantic_model::csmi::CsmiCanonicalError> {
-    let json = serde_json::to_value(value)?;
-    let normalized = normalize_runtime_contract_sets(json)?;
+    let normalized = normalized_runtime_contract_value(value)?;
     serde_json_canonicalizer::to_vec(&normalized).map_err(Into::into)
+}
+
+fn normalized_runtime_contract_value<T: Serialize + ?Sized>(
+    value: &T,
+) -> Result<Value, crate::analyzer::semantic_model::csmi::CsmiCanonicalError> {
+    let json = serde_json::to_value(value)?;
+    normalize_runtime_contract_sets(json)
 }
 
 /// Compute the SHA-256 digest of a runtime contract's canonical bytes.
@@ -996,8 +1004,7 @@ pub fn runtime_contract_digest<T: Serialize>(
 pub fn normalize_runtime_contract_payload(
     payload: &mut RuntimeContractsPayloadV2,
 ) -> Result<(), crate::analyzer::semantic_model::csmi::CsmiCanonicalError> {
-    let value = serde_json::to_value(&*payload)?;
-    let normalized = normalize_runtime_contract_sets(value)?;
+    let normalized = normalized_runtime_contract_value(&*payload)?;
     *payload = serde_json::from_value(normalized)?;
     Ok(())
 }

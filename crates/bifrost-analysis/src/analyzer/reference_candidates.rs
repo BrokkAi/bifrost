@@ -12,15 +12,13 @@ use brokk_bifrost_go::graph::ast::is_clause_binding_identifier as go_is_clause_b
 use brokk_bifrost_js_ts::syntax::{
     JsTsLexicalBindingIndex, is_catch_clause_binder as jsts_catch_clause_binder,
     is_declaration_identifier as jsts_declaration_identifier, is_export_alias_identifier,
-    is_jsx_intrinsic_element_name as jsts_jsx_intrinsic_element_name,
     is_named_function_expression_declaration as jsts_named_function_expression_declaration,
-    is_object_property_key as jsts_object_property_key,
     is_static_subscript_property_name as jsts_is_static_subscript_property_name,
 };
 use brokk_bifrost_jvm::java::graph::resolver::is_declaration_name as java_is_declaration_name;
 use brokk_bifrost_jvm::scala::bare_name_scopes::ScalaBareNameDeclarationScopes;
 use brokk_bifrost_jvm::scala::graph::syntax::is_recovered_membership_reference as scala_is_recovered_membership_reference;
-use brokk_bifrost_jvm::scala::graph::syntax::named_argument_invocation_owner as scala_named_argument_owner;
+use brokk_bifrost_jvm::scala::graph::syntax::named_argument_label_owner as scala_named_argument_owner;
 use brokk_bifrost_php::bare_name_scopes::PhpBareNameFunctionScopes;
 use brokk_bifrost_php::graph::resolver::is_declaration_name as php_declaration_name;
 use brokk_bifrost_php::graph::resolver::is_recovered_membership_reference as php_is_recovered_membership_reference;
@@ -538,9 +536,7 @@ pub fn python_is_declaration_name(node: Node<'_>) -> bool {
 /// Whether a JavaScript/TypeScript terminal is an object property key: the
 /// `key` field of an object-literal `pair` or of a destructuring
 /// `pair_pattern`.
-pub fn jsts_is_object_property_key(node: Node<'_>) -> bool {
-    jsts_object_property_key(node)
-}
+pub use brokk_bifrost_js_ts::syntax::is_object_property_key as jsts_is_object_property_key;
 
 /// Whether a JavaScript/TypeScript terminal names a function expression, whose
 /// binding is visible only inside that expression's own body.
@@ -555,9 +551,7 @@ pub fn jsts_is_catch_binder(node: Node<'_>) -> bool {
 }
 
 /// Whether a JS/TS terminal is the lowercase name of a JSX intrinsic element.
-pub fn jsts_is_jsx_intrinsic_element_name(node: Node<'_>, source: &str) -> bool {
-    jsts_jsx_intrinsic_element_name(node, source)
-}
+pub use brokk_bifrost_js_ts::syntax::is_jsx_intrinsic_element_name as jsts_is_jsx_intrinsic_element_name;
 
 /// Whether a C# terminal is a bare occurrence of the implicit `value` parameter
 /// of a `set`, `init`, `add` or `remove` accessor. The language-owned helper
@@ -604,7 +598,7 @@ pub fn python_is_keyword_argument_label(node: Node<'_>) -> bool {
 /// `ScalaReferenceNode::NamedArgument`, whose target is a member or parameter of
 /// the callee rather than a name in scope.
 pub fn scala_is_named_argument_label(node: Node<'_>) -> bool {
-    node.kind() == "identifier" && scala_named_argument_owner(node).is_some()
+    scala_named_argument_owner(node).is_some()
 }
 
 /// Whether a Rust identifier is the name field of an indexed item declaration.
@@ -659,10 +653,7 @@ fn rust_type_item_is_associated(mut node: Node<'_>) -> bool {
 }
 
 fn node_is_field(parent: Node<'_>, node: Node<'_>, field: &str) -> bool {
-    (0..parent.child_count()).any(|index| {
-        parent.child(index).is_some_and(|child| child == node)
-            && parent.field_name_for_child(index as u32) == Some(field)
-    })
+    brokk_bifrost_core::analyzer::structural::adapter_helpers::is_field_of(parent, node, field)
 }
 
 fn is_semantic_token_identifier_node(language: Language, kind: &str) -> bool {
@@ -711,33 +702,54 @@ mod tests {
     use super::*;
     use crate::analyzer::ProjectFile;
     use crate::analyzer::usages::get_definition::parse_tree_for_language;
+    use brokk_bifrost_test_macros::hardwon;
 
-    fn reference_candidate_offsets(language: Language, path: &str, source: &str) -> Vec<usize> {
+    fn parsed_candidate_ranges(
+        language: Language,
+        path: &str,
+        source: &str,
+        collect: impl FnOnce(Node<'_>, Language) -> Vec<Range>,
+    ) -> Vec<Range> {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().canonicalize().expect("canonical root");
         let file = ProjectFile::new(&root, path);
         let tree = parse_tree_for_language(&file, language, source)
             .unwrap_or_else(|| panic!("failed to parse {language:?}"));
-        let ReferenceCandidateRanges::Complete(ranges) =
-            reference_candidate_ranges(tree.root_node(), language, 100)
-        else {
-            panic!("reference candidate budget exceeded for {language:?}");
-        };
-        ranges.into_iter().map(|range| range.start_byte).collect()
+        collect(tree.root_node(), language)
+    }
+
+    fn parsed_candidate_offsets(
+        language: Language,
+        path: &str,
+        source: &str,
+        collect: impl FnOnce(Node<'_>, Language) -> Vec<Range>,
+    ) -> Vec<usize> {
+        parsed_candidate_ranges(language, path, source, collect)
+            .into_iter()
+            .map(|range| range.start_byte)
+            .collect()
+    }
+
+    fn reference_candidate_offsets(language: Language, path: &str, source: &str) -> Vec<usize> {
+        parsed_candidate_offsets(language, path, source, |root, language| {
+            let ReferenceCandidateRanges::Complete(ranges) =
+                reference_candidate_ranges(root, language, 100)
+            else {
+                panic!("reference candidate budget exceeded for {language:?}");
+            };
+            ranges
+        })
     }
 
     fn census_ranges(language: Language, path: &str, source: &str) -> Vec<Range> {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().canonicalize().expect("canonical root");
-        let file = ProjectFile::new(&root, path);
-        let tree = parse_tree_for_language(&file, language, source)
-            .unwrap_or_else(|| panic!("failed to parse {language:?}"));
-        let ReferenceCandidateRanges::Complete(ranges) =
-            census_identifier_ranges(tree.root_node(), language, 1000)
-        else {
-            panic!("census budget exceeded for {language:?}");
-        };
-        ranges
+        parsed_candidate_ranges(language, path, source, |root, language| {
+            let ReferenceCandidateRanges::Complete(ranges) =
+                census_identifier_ranges(root, language, 1000)
+            else {
+                panic!("census budget exceeded for {language:?}");
+            };
+            ranges
+        })
     }
 
     fn census_offsets(language: Language, path: &str, source: &str) -> Vec<usize> {
@@ -748,17 +760,14 @@ mod tests {
     }
 
     fn census_membership_offsets(language: Language, path: &str, source: &str) -> Vec<usize> {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().canonicalize().expect("canonical root");
-        let file = ProjectFile::new(&root, path);
-        let tree = parse_tree_for_language(&file, language, source)
-            .unwrap_or_else(|| panic!("failed to parse {language:?}"));
-        let ReferenceCandidateRanges::Complete(ranges) =
-            census_membership_identifier_ranges(tree.root_node(), language, 1000)
-        else {
-            panic!("census membership budget exceeded for {language:?}");
-        };
-        ranges.into_iter().map(|range| range.start_byte).collect()
+        parsed_candidate_offsets(language, path, source, |root, language| {
+            let ReferenceCandidateRanges::Complete(ranges) =
+                census_membership_identifier_ranges(root, language, 1000)
+            else {
+                panic!("census membership budget exceeded for {language:?}");
+            };
+            ranges
+        })
     }
 
     fn census_texts<'a>(language: Language, path: &str, source: &'a str) -> Vec<&'a str> {
@@ -773,6 +782,9 @@ mod tests {
     /// while a prototype/object-literal member of the same name is reachable
     /// only through a receiver and therefore is not bound at a bare call site.
     #[test]
+    #[hardwon(
+        "#1783: JavaScript same-file evidence counted lexical declarations a bare call cannot bind"
+    )]
     fn census_bare_name_bindings_answer_js_lexical_scope() {
         let source = concat!(
             "var toBigNumber = function(value) { return value; };\n",
@@ -819,6 +831,7 @@ mod tests {
     /// method or property of the enclosing class is not evidence -- the premise
     /// that grouped PHP with Ruby and over-graded all 59 census sites.
     #[test]
+    #[hardwon("#1783: PHP same-file evidence counted implicit-receiver methods as free functions")]
     fn census_bare_name_bindings_answer_php_free_functions_only() {
         let source = concat!(
             "<?php\n",
@@ -887,6 +900,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "5ff28afcc765: Rust census accounting omitted matcher-aware macro member and keyword terminals"
+    )]
     fn rust_census_membership_backs_macro_member_keyword_terminals() {
         let source = concat!(
             "macro_rules! wrap { ($e:expr) => { $e } }\n",
@@ -921,6 +937,9 @@ mod tests {
     /// property with (#3215). An object-literal string key is a declaration
     /// name, not a keyed access, and stays out.
     #[test]
+    #[hardwon(
+        "#3215: JavaScript and TypeScript inverse hits lacked structured backing for shorthand and string-keyed writes"
+    )]
     fn js_ts_census_membership_adds_shorthand_and_static_subscript_properties() {
         let source = concat!(
             "const plain = 1;\n",
@@ -992,15 +1011,10 @@ mod tests {
         ");\n",
     );
 
-    /// Brokk's JavaScript grammar accepts `class=` without recovery, so a `.js`
-    /// file carrying JSX grades the later element names and expression reads
-    /// on both reference frontiers (#3342). This preserves the JavaScript
-    /// grammar's ordinary-language behavior instead of parsing `.js` as TSX.
-    #[test]
-    fn js_census_grades_references_after_reserved_jsx_attributes() {
+    fn assert_reserved_jsx_references_are_graded(path: &str, grammar: &str) {
         let source = RESERVED_JSX_ATTRIBUTE;
-        let census = census_offsets(Language::JavaScript, "app.js", source);
-        let membership = census_membership_offsets(Language::JavaScript, "app.js", source);
+        let census = census_offsets(Language::JavaScript, path, source);
+        let membership = census_membership_offsets(Language::JavaScript, path, source);
         let element = source.find("<Button onClick").expect("JSX element name") + 1;
         let read = source.find("{settings.reset}").expect("JSX attribute read") + 1;
         let intact = source.find("(settings)").expect("parameter binder") + 1;
@@ -1008,9 +1022,21 @@ mod tests {
         for offset in [element, read, intact] {
             assert!(
                 census.contains(&offset) && membership.contains(&offset),
-                "the repaired JavaScript grammar grades {offset} on both frontiers: {census:?} {membership:?}"
+                "the {grammar} grades {offset} on both frontiers: {census:?} {membership:?}"
             );
         }
+    }
+
+    /// Brokk's JavaScript grammar accepts `class=` without recovery, so a `.js`
+    /// file carrying JSX grades the later element names and expression reads
+    /// on both reference frontiers (#3342). This preserves the JavaScript
+    /// grammar's ordinary-language behavior instead of parsing `.js` as TSX.
+    #[test]
+    #[hardwon(
+        "#3342: reserved-word JSX attributes disappeared from JavaScript census grades after grammar repair"
+    )]
+    fn js_census_grades_references_after_reserved_jsx_attributes() {
+        assert_reserved_jsx_references_are_graded("app.js", "repaired JavaScript grammar");
     }
 
     /// The same source as a `.jsx` file has no recovery fallout at all: #3322
@@ -1018,23 +1044,17 @@ mod tests {
     /// attribute read are ordinary references both frontiers agree on, and
     /// nothing needs backing that the census cannot also grade.
     #[test]
+    #[hardwon(
+        "#3215: the JavaScript JSX grammar recovery dropped references after a reserved-word attribute"
+    )]
     fn jsx_dialect_grades_the_references_a_reserved_attribute_used_to_derail() {
-        let source = RESERVED_JSX_ATTRIBUTE;
-        let census = census_offsets(Language::JavaScript, "app.jsx", source);
-        let membership = census_membership_offsets(Language::JavaScript, "app.jsx", source);
-        let element = source.find("<Button onClick").expect("JSX element name") + 1;
-        let read = source.find("{settings.reset}").expect("JSX attribute read") + 1;
-        let intact = source.find("(settings)").expect("parameter binder") + 1;
-
-        for offset in [element, read, intact] {
-            assert!(
-                census.contains(&offset) && membership.contains(&offset),
-                "the JSX dialect grades {offset} on both frontiers: {census:?} {membership:?}"
-            );
-        }
+        assert_reserved_jsx_references_are_graded("app.jsx", "JSX dialect");
     }
 
     #[test]
+    #[hardwon(
+        "#2316: deferred annotation references were missed or ordinary strings were admitted as code"
+    )]
     fn python_deferred_annotation_membership_excludes_ordinary_and_literal_strings() {
         let source = concat!(
             "from typing import Literal\n",
@@ -1079,6 +1099,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "b3fdb1b0b54a: Java recovery census membership and semantic reference proposals diverged"
+    )]
     fn java_census_membership_backs_recovered_references_without_proposing_them() {
         let source = concat!(
             "@interface Nullable {}\n",
@@ -1119,6 +1142,7 @@ mod tests {
     /// grade what the parser never gave it a role for; this is the test that
     /// says the parser gives it one.
     #[test]
+    #[hardwon("#3325: Go 1.26 new(expr) parser recovery swallowed genuine reference expressions")]
     fn go_1_26_new_expression_regions_reach_the_graded_census() {
         let source = concat!(
             "package purl\n",
@@ -1163,17 +1187,18 @@ mod tests {
         }
     }
 
-    /// The C# recovery shapes from #3212. A `$@"..."` verbatim interpolation
-    /// (the Rebus `FormatObject` witness) and a `return ref *...` pointer
-    /// dereference (the ComputeSharp `this.pointer` witness) derail
-    /// tree-sitter-c-sharp, and the code that follows survives only below an
-    /// ERROR node. The calls and member reads in that code keep their
+    /// The C# recovery shape from #3212. A `$@"..."` verbatim interpolation
+    /// (the Rebus `FormatObject` witness) derails tree-sitter-c-sharp, and the
+    /// code that follows survives only below an ERROR node. (The issue's other
+    /// witness, a `return ref *...` pointer dereference, parses since grammar
+    /// 0.23.8; see the next test.) The calls and member reads in that code keep their
     /// invocation and member-access structure, and the inverse usage scan
     /// proves them there, so membership must hold them. The forward census
     /// keeps refusing to propose a site it cannot grade, and an intact binder
     /// the recovered tree still states (the typed lambda parameter) stays out,
     /// matching the binder roles the usage extractor itself refuses.
     #[test]
+    #[hardwon("#3212: C# self-receiver references in recovered syntax had no census backing")]
     fn csharp_census_membership_backs_recovered_references_without_proposing_them() {
         let source = concat!(
             "class Logger {\n",
@@ -1216,7 +1241,14 @@ mod tests {
             census.contains(&declaration) && membership.contains(&declaration),
             "the intact declaration keeps both frontiers: {census:?} {membership:?}"
         );
+    }
 
+    /// Unsafe pointer indirection over a cast parses as ordinary syntax since
+    /// brokk-tree-sitter-c-sharp 0.23.8, so a `this` member read inside it is a
+    /// graded forward reference rather than recovered syntax.
+    #[test]
+    #[hardwon("#4410: C# pointer indirection over a cast parsed as an ERROR subtree")]
+    fn csharp_pointer_expression_member_reads_are_ordinary_census_sites() {
         let pointer = concat!(
             "unsafe class TextureView {\n",
             "    private readonly byte* pointer;\n",
@@ -1229,22 +1261,18 @@ mod tests {
         );
         let census = census_offsets(Language::CSharp, "TextureView.cs", pointer);
         let membership = census_membership_offsets(Language::CSharp, "TextureView.cs", pointer);
-        let recovered_member =
-            pointer.find("this.pointer").expect("recovered member") + "this.".len();
+        let member = pointer.find("this.pointer").expect("member read") + "this.".len();
 
         assert!(
-            !census.contains(&recovered_member),
-            "the forward census must keep excluding the ERROR subtree: {census:?}"
-        );
-        assert!(
-            membership.contains(&recovered_member),
-            "the recovered `this` member read must back inverse precision: {membership:?}"
+            census.contains(&member) && membership.contains(&member),
+            "the `this` member read inside pointer indirection is an ordinary site: {census:?} {membership:?}"
         );
     }
 
     /// Control: outside recovery the C# membership frontier is exactly the
     /// forward census frontier, so nothing about an ordinary file moved (#3212).
     #[test]
+    #[hardwon("#3212: C# census membership diverged from its own graded reference sites")]
     fn csharp_census_membership_matches_the_census_without_recovery() {
         let source = concat!(
             "class Logger {\n",
@@ -1262,6 +1290,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#2248: repeated C++ template type arguments produced inverse references without matching forward evidence"
+    )]
     fn cpp_census_membership_backs_only_structured_template_types_inside_recovery() {
         let source = concat!(
             "class Arg {};\n",
@@ -1303,46 +1334,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cpp_census_membership_backs_recovered_p_macro_prototype_reference() {
-        let source = concat!(
-            "#define __P(x) x\n",
-            "static char * __progname __P((char *));\n",
-            "static char *\n",
-            "__progname(nargv0)\n",
-            "    char * nargv0;\n",
-            "{\n",
-            "    return nargv0;\n",
-            "}\n",
-            "int trigger(char *arg) {\n",
-            "    return __progname(arg) != 0;\n",
-            "}\n",
-        );
-        let census = census_offsets(Language::Cpp, "getopt_long.c", source);
-        let membership = census_membership_offsets(Language::Cpp, "getopt_long.c", source);
-        let prototype =
-            source.find("static char * __progname").expect("prototype") + "static char * ".len();
-
-        assert!(
-            !census.contains(&prototype),
-            "the ordinary census must keep excluding the ERROR subtree: {census:?}"
-        );
-        assert!(
-            membership.contains(&prototype),
-            "the valid prototype Reference must back inverse precision: {membership:?}"
-        );
-        let added = membership
-            .iter()
-            .copied()
-            .filter(|offset| !census.contains(offset))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            added,
-            vec![prototype],
-            "only the recovered prototype Reference may extend membership: {membership:?}"
-        );
-    }
-
     /// Membership answers "is there a source occurrence here?", so it must hold
     /// every range the census proposes and grades as one. #2086's declaration
     /// and label test ran on the whole file rather than on recovery, and
@@ -1354,6 +1345,7 @@ mod tests {
     /// `inverse_precision_unbacked_hits` for that reason, 608 of them at byte
     /// ranges the same run graded as census sites (#2185).
     #[test]
+    #[hardwon("#2185: Java census probes were not all represented in inverse membership")]
     fn java_census_membership_holds_every_census_probe_outside_recovery() {
         let source = concat!(
             "import java.util.List;\n",
@@ -1409,7 +1401,8 @@ mod tests {
     }
 
     #[test]
-    fn php_census_membership_backs_only_structured_references_inside_recovery() {
+    #[hardwon("#4408: PHP clone-with arguments must stay backed by the normal census")]
+    fn php_census_membership_matches_normally_parsed_clone_with() {
         let source = r#"<?php
 namespace App\Demo;
 
@@ -1419,43 +1412,71 @@ class Id {
 
 class Result {
     public ?Result $adjacent;
+    public ?string $name;
     public function withInput(): self { return $this; }
     public function copy(): self {
         return clone($this, [
             'id' => Id::make(),
+            'name' => $this->name ?? unknown_token,
             'next' => $this->adjacent?->withInput(),
-            'noise' => unknown_token,
         ]);
+    }
+    public function escaped(): self {
+        return $this->adjacent?->withInput();
     }
 }
 "#;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let file = ProjectFile::new(&root, "Use.php");
+        let tree = parse_tree_for_language(&file, Language::Php, source).expect("php tree");
+        assert!(
+            !tree.root_node().has_error(),
+            "clone-with source must parse without recovery: {}",
+            tree.root_node().to_sexp()
+        );
         let census = census_offsets(Language::Php, "Use.php", source);
         let membership = census_membership_offsets(Language::Php, "Use.php", source);
         let static_scope = source.find("Id::make").expect("static scope");
         let nullsafe_member = source.find("withInput(),").expect("nullsafe member call");
-        let arbitrary_recovery = source.rfind("unknown_token").expect("recovery noise");
+        let same_owner_member =
+            source.find("$this->name ??").expect("same-owner member") + "$this->".len();
+        let escaped_pair = source
+            .find("return $this->adjacent?->withInput()")
+            .expect("escaped normal nullsafe member")
+            + "return $this->adjacent?->".len();
 
+        let missing = census
+            .iter()
+            .copied()
+            .filter(|offset| !membership.contains(offset))
+            .collect::<Vec<_>>();
         assert!(
-            !census.contains(&static_scope) && !census.contains(&nullsafe_member),
-            "ordinary census must continue to skip ERROR subtrees: {census:?}"
+            missing.is_empty(),
+            "normally parsed clone-with census references must all be membership-backed: {missing:?} \
+             from membership {membership:?}"
         );
-        assert!(membership.contains(&static_scope), "{membership:?}");
-        assert!(membership.contains(&nullsafe_member), "{membership:?}");
-        assert!(
-            !membership.contains(&arbitrary_recovery),
-            "arbitrary recovery leaves are not membership references: {membership:?}"
-        );
+        for role in [
+            static_scope,
+            nullsafe_member,
+            same_owner_member,
+            escaped_pair,
+        ] {
+            assert!(
+                census.contains(&role) && membership.contains(&role),
+                "normal clone-with reference at {role} must enter both frontiers: {census:?} \
+                 {membership:?}"
+            );
+        }
     }
 
-    /// #3167: a PHP 8.5 clone-with pair list recovers as ERROR under the
-    /// bundled grammar, and the grammar keeps the member-name field of plain
-    /// member access and call expressions inside that recovery -- the same
-    /// structured reference role the nullsafe and static-scope shapes state.
-    /// Membership must back inverse hits on those terminals
-    /// (`$result->input`, `$validator->getName()` in Respect Validation's
-    /// src/Result.php), while arbitrary recovery leaves stay excluded and the
-    /// forward census keeps refusing to propose the ERROR subtree.
+    /// #3167: PHP membership still descends a genuinely malformed subtree.
+    /// The clone-with grammar now parses its argument list normally, so this
+    /// fixture introduces a separate invalid token sequence. The recovered
+    /// member-name fields remain precise inverse references, while the plain
+    /// identifier in the same ERROR subtree is arbitrary recovery noise.
     #[test]
+    #[hardwon("#3167: PHP recovered plain-member references were missing from inverse membership")]
     fn php_census_membership_backs_recovered_plain_member_references() {
         let source = r#"<?php
 namespace App\Demo;
@@ -1466,39 +1487,49 @@ class Result {
     public ?string $name;
     public function withInput(): self { return $this; }
     public function asAdjacentOf(Result $result): self {
-        return clone ($this, [
-            'input' => $result->input,
-            'next' => $this->adjacent?->withInput(),
-        ]);
-    }
-    public function withNameFrom(Nameable $validator): self {
-        return clone($this, [
-            'noise' => unknown_token,
-            'name' => $this->name ?? $validator->getName(),
-            'adjacent' => $this->adjacent?->withInput(),
-        ]);
+        return clone ($this, {
+            $result->input,
+            $validator->getName(),
+            $this->name,
+            $this->adjacent?->withInput(),
+            unknown_token,
+        });
     }
 }
 "#;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let file = ProjectFile::new(&root, "Result.php");
+        let tree = parse_tree_for_language(&file, Language::Php, source).expect("php tree");
+        let mut stack = vec![tree.root_node()];
+        let mut has_error = false;
+        while let Some(node) = stack.pop() {
+            if node.is_error() {
+                has_error = true;
+                break;
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        assert!(
+            has_error,
+            "the malformed PHP fixture must contain an actual ERROR node: {}",
+            tree.root_node().to_sexp()
+        );
+
         let census = census_offsets(Language::Php, "Result.php", source);
         let membership = census_membership_offsets(Language::Php, "Result.php", source);
         let member_access =
-            source.find("$result->input,").expect("plain member access") + "$result->".len();
+            source.find("$result->input").expect("plain member access") + "$result->".len();
         let member_call = source
             .find("$validator->getName()")
             .expect("plain member call")
             + "$validator->".len();
-        let this_member = source
-            .find("$this->name ??")
-            .expect("same-owner member access")
-            + "$this->".len();
-        let escaped_pair = source
-            .find("'next' => $this->adjacent?->withInput()")
-            .expect("pair surviving outside recovery")
-            + "'next' => $this->adjacent?->".len();
+        let this_member = source.find("$this->name,").expect("same-owner member") + "$this->".len();
+        let nullsafe_member = source.find("withInput(),").expect("nullsafe member call");
         let arbitrary_recovery = source.find("unknown_token").expect("recovery noise");
 
-        for recovered in [member_access, member_call, this_member] {
+        for recovered in [member_access, member_call, this_member, nullsafe_member] {
             assert!(
                 !census.contains(&recovered),
                 "the forward census must keep excluding the ERROR subtree at {recovered}: {census:?}"
@@ -1508,10 +1539,6 @@ class Result {
                 "the structured member reference at {recovered} must back inverse precision: {membership:?}"
             );
         }
-        assert!(
-            census.contains(&escaped_pair) && membership.contains(&escaped_pair),
-            "the pair surviving outside recovery keeps both frontiers: {census:?} {membership:?}"
-        );
         assert!(
             !membership.contains(&arbitrary_recovery),
             "an arbitrary recovery leaf is not a membership reference: {membership:?}"
@@ -1527,6 +1554,9 @@ class Result {
     /// The formerly recovered `Area.export(...)` selection parses normally
     /// after #3499: its owner and arguments must now enter both frontiers.
     #[test]
+    #[hardwon(
+        "#2085: Scala census omitted structured signature and owner references inside recovery"
+    )]
     fn scala_census_membership_backs_only_structured_references_inside_recovery() {
         let signatures = concat!(
             "package probe\n",
@@ -1605,6 +1635,7 @@ class Result {
     /// Control: outside recovery the Scala membership frontier is exactly the
     /// forward census frontier, so nothing about an ordinary file moved (#2085).
     #[test]
+    #[hardwon("#2085: Scala inverse membership diverged from valid census sites outside recovery")]
     fn scala_census_membership_matches_the_census_without_recovery() {
         let source = concat!(
             "package probe\n",
@@ -1635,6 +1666,7 @@ class Result {
     /// another module, and `boolean` is a Flow type keyword that the JavaScript
     /// grammar mistakes for an object-pattern binding.
     #[test]
+    #[hardwon("#1784: tree-sitter ERROR descendants produced false reference-census sites")]
     fn census_skips_identifiers_inside_error_subtrees() {
         let source = concat!(
             "import {registries} from './registries.js';\n",
@@ -1674,6 +1706,9 @@ class Result {
     /// Here recovery consumes only `r:`; `P` recovers as a field definition and
     /// the method body parses cleanly, so every neighbor stays proposed.
     #[test]
+    #[hardwon(
+        "#1784: stopping at a recovered ERROR subtree also dropped valid neighboring references"
+    )]
     fn census_keeps_neighbors_of_a_locally_recoverable_error() {
         let source = concat!(
             "class W {\n",
@@ -1714,6 +1749,9 @@ class Result {
     /// also does not contaminate its neighbors, so the real identifiers around
     /// it stay proposed. Here the JavaScript grammar inserts a MISSING `)`.
     #[test]
+    #[hardwon(
+        "#1784: missing grammar tokens were graded as names or caused neighboring references to disappear"
+    )]
     fn census_ignores_missing_tokens_without_dropping_their_neighbors() {
         let source = concat!(
             "function f() { return call(x; }\n",
@@ -1742,6 +1780,9 @@ class Result {
     }
 
     #[test]
+    #[hardwon(
+        "1afd8b086e57: TypeScript export aliases were incorrectly sampled as source references"
+    )]
     fn js_ts_reference_frontier_excludes_export_alias_but_semantic_frontier_keeps_it() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().canonicalize().expect("canonical root");
@@ -1801,6 +1842,9 @@ class Result {
     }
 
     #[test]
+    #[hardwon(
+        "e59c36b8a244: Go declaration names were sampled as references instead of only their uses"
+    )]
     fn go_reference_frontier_excludes_field_and_type_names_but_keeps_type_and_member_uses() {
         let source = r#"package sample
 
@@ -1849,6 +1893,7 @@ func use(repository Repository) (result Alias) {
     }
 
     #[test]
+    #[hardwon("0be673ef7747: C++ range-for binders created differential reference sites")]
     fn cpp_reference_frontier_excludes_range_for_binders_but_keeps_range_and_body_uses() {
         let source = r#"void consume(int);
 
@@ -1972,6 +2017,7 @@ void check() {
     }
 
     #[test]
+    #[hardwon("#1271: Go package and import declaration heads were sampled as references")]
     fn go_reference_frontier_excludes_package_and_import_declaration_names() {
         let source = r#"package main
 
@@ -2010,6 +2056,9 @@ func run() {
     }
 
     #[test]
+    #[hardwon(
+        "7b4b64862279: Go interface method and value declaration names were sampled as FIRD probes"
+    )]
     fn go_reference_frontier_excludes_interface_methods_and_value_declarations() {
         let source = r#"package sample
 
@@ -2057,6 +2106,9 @@ func use(reader Reader) int {
     }
 
     #[test]
+    #[hardwon(
+        "e59c36b8a244: C# tuple element names were sampled as references while type and member uses must remain"
+    )]
     fn csharp_reference_frontier_excludes_tuple_name_but_keeps_type_and_member_uses() {
         let source = r#"class StylesWriter {
     TableRegion? Read((TableRegion? TableRegion, int Count) value) {
@@ -2090,6 +2142,7 @@ func use(reader Reader) int {
     // The `goto case <constant>;` expression is a real constant reference and
     // stays proposed.
     #[test]
+    #[hardwon("#1799: C# statement labels were treated as same-spelled method references")]
     fn csharp_frontiers_exclude_statement_labels_but_keep_goto_case_constants() {
         let source = r#"class RendererBase {
     const int Retry = 1;
@@ -2135,6 +2188,7 @@ func use(reader Reader) int {
     }
 
     #[test]
+    #[hardwon("#1282: Rust associated-type declaration heads were sampled as references")]
     fn rust_reference_frontier_excludes_associated_type_declaration_name_but_keeps_uses() {
         let source = r#"trait Service {
     type Item;

@@ -1,6 +1,8 @@
 //! Set-oriented, diagnostic-neutral taint analysis over the shared IDE kernel.
 
+mod barriers;
 mod client;
+pub mod compose;
 mod finding;
 mod model;
 mod plan;
@@ -48,3 +50,5 @@ pub use summary::{
     TaintTransferSummaryKey, TaintTransferSummaryRepositoryLimits, TaintTransferSummarySolveError,
     TaintTransferSummarySolveResult, solve_taint_with_reusable_summaries,
 };
+
+pub use barriers::{IcfgBarrierError, IcfgBarrierOutcome, IcfgBarrierSession};

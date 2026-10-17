@@ -33,6 +33,10 @@ pub mod scoped_project;
 pub mod searchtools_service;
 pub mod tool_arguments;
 
+#[cfg(test)]
+#[path = "../../../test-support/git.rs"]
+pub(crate) mod test_git_support;
+
 pub use project_watcher::{ChangeDelta, ProjectChangeWatcher};
 pub use searchtools_service::{
     SearchToolsService, SearchToolsServiceError, SearchToolsServiceErrorCode, ToolOutput,
@@ -48,3 +52,5 @@ pub mod benchmark_api {
     };
     pub use crate::searchtools_service::WORKSPACE_SNAPSHOT_NOT_READY_MESSAGE;
 }
+
+mod workspace_progress;

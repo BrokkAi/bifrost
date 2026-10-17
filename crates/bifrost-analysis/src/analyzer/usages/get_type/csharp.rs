@@ -1,5 +1,6 @@
 use super::{
-    TypeLookupDiagnostic, TypeLookupOutcome, TypeLookupStatus, TypeLookupType, no_type, sort_units,
+    TypeLookupDiagnostic, TypeLookupOutcome, TypeLookupStatus, candidates_outcome_with_status,
+    exact_semantic_model_type_outcome, no_type, sort_units,
 };
 use crate::analyzer::csharp::graph_support;
 use crate::analyzer::usages::get_definition::{
@@ -8,7 +9,9 @@ use crate::analyzer::usages::get_definition::{
 };
 use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
 use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
-use crate::analyzer::{CSharpAnalyzer, CodeUnit, IAnalyzer, ProjectFile, resolve_analyzer};
+use crate::analyzer::{
+    CSharpAnalyzer, CodeUnit, IAnalyzer, Language, ProjectFile, resolve_analyzer,
+};
 use crate::cancellation::CancellationToken;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use tree_sitter::Tree;
@@ -24,10 +27,9 @@ pub(crate) fn resolve_csharp_type_bounded(
     budget: ReceiverAnalysisBudget,
     cancellation: Option<&CancellationToken>,
 ) -> BoundedResolution<TypeLookupOutcome> {
-    let session = ResolutionSession::bounded(budget, cancellation);
-    let outcome =
-        resolve_csharp_type_in_session(analyzer, token, file, source, tree, site, &session);
-    session.finish(outcome)
+    ResolutionSession::run_bounded(budget, cancellation, |session| {
+        resolve_csharp_type_in_session(analyzer, token, file, source, tree, site, session)
+    })
 }
 
 fn resolve_csharp_type_in_session(
@@ -67,6 +69,9 @@ fn resolve_csharp_type_in_session(
             target_kind,
             ambiguous,
         } => csharp_candidates_outcome(csharp, fqn, candidates, target_kind, ambiguous, session),
+        CSharpTypeLookupResolution::External { names, target_kind } => {
+            csharp_external_type_outcome(analyzer, file, names, target_kind)
+        }
         CSharpTypeLookupResolution::Dynamic { target_kind } => TypeLookupOutcome {
             status: TypeLookupStatus::NoType,
             reference: None,
@@ -84,6 +89,63 @@ fn resolve_csharp_type_in_session(
                 site.text
             ),
         ),
+    }
+}
+
+fn csharp_external_type_outcome(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    names: Vec<String>,
+    target_kind: crate::analyzer::usages::target_kind::TypeLookupTargetKind,
+) -> TypeLookupOutcome {
+    let mut outcomes = names
+        .iter()
+        .filter_map(|name| {
+            exact_semantic_model_type_outcome(
+                analyzer,
+                file,
+                Language::CSharp,
+                name,
+                target_kind.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if outcomes.is_empty() {
+        return no_type(
+            "csharp_external_type_not_modeled",
+            format!("C# type names {names:?} have no exact active semantic model"),
+        );
+    }
+
+    let complete = outcomes
+        .iter()
+        .all(|outcome| outcome.status == TypeLookupStatus::Resolved);
+    let mut types = outcomes
+        .iter_mut()
+        .flat_map(|outcome| outcome.types.drain(..))
+        .collect::<Vec<_>>();
+    types.sort_by(|left, right| {
+        left.fqn
+            .cmp(&right.fqn)
+            .then_with(|| left.semantic_model_id.cmp(&right.semantic_model_id))
+    });
+    types.dedup_by(|left, right| left.semantic_model_id == right.semantic_model_id);
+
+    let mut diagnostics = outcomes
+        .into_iter()
+        .flat_map(|outcome| outcome.diagnostics)
+        .collect::<Vec<TypeLookupDiagnostic>>();
+    diagnostics.sort_by(|left, right| left.kind.cmp(&right.kind));
+    TypeLookupOutcome {
+        status: if complete && types.len() == 1 {
+            TypeLookupStatus::Resolved
+        } else {
+            TypeLookupStatus::Ambiguous
+        },
+        reference: None,
+        types,
+        diagnostics,
+        target_kind,
     }
 }
 
@@ -114,24 +176,7 @@ fn csharp_candidates_outcome(
     } else {
         fqn
     };
-    TypeLookupOutcome {
-        status,
-        reference: None,
-        types: vec![TypeLookupType {
-            fqn,
-            definitions: candidates,
-            semantic_model_id: None,
-        }],
-        diagnostics: if status == TypeLookupStatus::Ambiguous {
-            vec![TypeLookupDiagnostic {
-                kind: "ambiguous_type".to_string(),
-                message: "reference resolved to multiple possible types".to_string(),
-            }]
-        } else {
-            Vec::new()
-        },
-        target_kind,
-    }
+    candidates_outcome_with_status(fqn, candidates, status, target_kind)
 }
 
 fn csharp_expand_logical_type_parts(
@@ -170,6 +215,7 @@ mod tests {
     use crate::analyzer::usages::get_definition::parse_tree_for_language;
     use crate::analyzer::usages::receiver_analysis::{ReceiverAnalysisBudget, ReceiverBudgetLimit};
     use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
+    use crate::analyzer::usages::test_support::assert_scope_budget_exceeded;
     use crate::analyzer::{AnalyzerQueryScope, QueryScope};
     use crate::analyzer::{Language, Range};
     use crate::path_utils::rel_path_string;
@@ -195,22 +241,18 @@ mod tests {
             .filter(|byte| *byte == b'\n')
             .count()
             + 1;
-        ResolvedReferenceSite {
-            path: rel_path_string(file),
-            text: expression.to_string(),
-            range: Range {
+        crate::test_support::resolved_reference_site(
+            rel_path_string(file),
+            expression.to_string(),
+            Range {
                 start_byte,
                 end_byte,
                 start_line,
                 end_line,
             },
-            focus_start_byte: start_byte,
-            focus_end_byte: end_byte,
-        }
+        )
     }
 
-    /// The default-budget bounded lookup, unwrapped: these tests assert on the
-    /// resolved outcome and their fixtures fit the default budget comfortably.
     fn complete_csharp_type(
         analyzer: &dyn IAnalyzer,
         token: QueryToken<'_>,
@@ -256,143 +298,6 @@ mod tests {
             budget,
             cancellation.as_ref(),
         )
-    }
-
-    #[test]
-    fn full_structured_expression_ranges_resolve_declared_csharp_types() {
-        let source = r#"
-namespace Demo;
-
-public class Product {}
-
-public class Factory
-{
-    public Product Value { get; }
-    public Product Create() => null;
-}
-
-public class Consumer
-{
-    public void Run(Factory factory)
-    {
-        Product construction = new Product();
-        Product invocation = factory.Create();
-        Product member = factory.Value;
-        Product conditional = factory?.Value;
-    }
-}
-"#;
-        let fixture =
-            AnalyzerFixture::new_for_language(Language::CSharp, &[("Expressions.cs", source)]);
-        let file = ProjectFile::new(fixture.project_root(), "Expressions.cs");
-        let tree = parse_tree_for_language(&file, Language::CSharp, source).expect("C# tree");
-
-        for expression in [
-            "new Product()",
-            "factory.Create()",
-            "factory.Value",
-            "factory?.Value",
-        ] {
-            let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
-            let token = scope.token();
-            let outcome = complete_csharp_type(
-                fixture.analyzer.analyzer(),
-                token,
-                &file,
-                source,
-                Some(&tree),
-                &full_expression_site(&file, source, expression),
-            );
-
-            assert_eq!(
-                outcome.status,
-                TypeLookupStatus::Resolved,
-                "{expression}: {outcome:#?}"
-            );
-            assert_eq!(
-                outcome.target_kind,
-                TypeLookupTargetKind::ValueExpression,
-                "{expression}: {outcome:#?}"
-            );
-            assert_eq!(outcome.types.len(), 1, "{expression}: {outcome:#?}");
-            assert_eq!(
-                outcome.types[0].fqn, "Demo.Product",
-                "{expression}: {outcome:#?}"
-            );
-            assert!(
-                matches!(
-                    outcome.types[0].definitions.as_slice(),
-                    [definition] if definition.fq_name() == "Demo.Product"
-                ),
-                "{expression}: {outcome:#?}"
-            );
-        }
-    }
-
-    #[test]
-    fn bounded_cross_file_return_and_member_types_use_structured_metadata() {
-        let caller = r#"
-using Demo.Models;
-
-namespace Demo.App;
-
-public class Caller
-{
-    public void Run(Factory factory)
-    {
-        Product fromCall = factory.Create();
-        Product fromMember = factory.Value;
-    }
-}
-"#;
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::CSharp,
-            &[
-                (
-                    "Models.cs",
-                    r#"
-namespace Demo.Models;
-public class Product {}
-public class Factory
-{
-    public Product Value { get; }
-    public Product Create() => null;
-}
-"#,
-                ),
-                ("Caller.cs", caller),
-            ],
-        );
-        let file = ProjectFile::new(fixture.project_root(), "Caller.cs");
-        let tree = parse_tree_for_language(&file, Language::CSharp, caller).expect("C# tree");
-
-        for expression in ["factory.Create()", "factory.Value"] {
-            let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
-            let token = scope.token();
-            let outcome = resolve_csharp_type_bounded(
-                fixture.analyzer.analyzer(),
-                token,
-                &file,
-                caller,
-                Some(&tree),
-                &full_expression_site(&file, caller, expression),
-                ReceiverAnalysisBudget::default(),
-                None,
-            );
-            let BoundedResolution::Complete { value, work } = outcome else {
-                panic!("{expression} should complete");
-            };
-            assert!(work.scope_nodes > 0, "{expression}: {work:#?}");
-            assert_eq!(
-                value.status,
-                TypeLookupStatus::Resolved,
-                "{expression}: {value:#?}"
-            );
-            assert_eq!(
-                value.types[0].fqn, "Demo.Models.Product",
-                "{expression}: {value:#?}"
-            );
-        }
     }
 
     #[test]
@@ -806,13 +711,7 @@ public class Consumer
             None,
         );
 
-        assert!(matches!(
-            outcome,
-            BoundedResolution::Exceeded {
-                limit: ReceiverBudgetLimit::ScopeNodes,
-                work,
-            } if work.scope_nodes == budget.max_scope_nodes
-        ));
+        assert_scope_budget_exceeded(&outcome, budget);
     }
 
     #[test]

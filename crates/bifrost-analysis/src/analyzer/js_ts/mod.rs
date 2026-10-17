@@ -12,6 +12,7 @@
 pub(crate) mod cache;
 mod call_conversion;
 pub(crate) mod clones;
+pub mod dependency_evidence;
 pub(crate) mod diagnostics;
 pub(crate) mod external;
 pub(crate) mod providers;
@@ -26,7 +27,11 @@ mod type_flow;
 use crate::analyzer::store::LimitedQueryRows;
 
 pub(crate) use brokk_bifrost_js_ts::imports::resolve_js_ts_module_specifier;
+pub use brokk_bifrost_js_ts::structural::JsTsCallResultUseIndex;
+// Query execution shares these grammar helpers through its analysis boundary.
+pub use brokk_bifrost_js_ts::syntax::{static_member_property, static_property_name};
 pub(crate) use brokk_bifrost_js_ts::tsconfig::AliasResolver;
+pub use brokk_bifrost_js_ts::typescript::ts_object_literal_property_name;
 pub use external::{
     JsTsDependencyPackAdapter, TYPESCRIPT_STDLIB_PACKAGE, TYPESCRIPT_STDLIB_VERSION,
     TypeScriptDeclarationPackProducer, TypeScriptLibraryActivationOutcome,
@@ -54,15 +59,15 @@ use crate::analyzer::{
 };
 use crate::analyzer::{CodeUnit, Language, SummaryFileProjection};
 use crate::hash::{HashMap, HashSet};
-use crate::text_utils::compute_line_starts;
 use brokk_bifrost_core::analyzer::usages::model::ImportKind;
 use brokk_bifrost_js_ts::imports::js_ts_module_identity;
 use brokk_bifrost_js_ts::model::module_code_unit;
 use brokk_bifrost_js_ts::syntax::{
-    JsTsImportBinder, JsTsLexicalBindingIndex, JsTsModuleMemberWrites,
-    compute_import_binder as compute_js_ts_import_binder, js_ts_declaration_name,
+    JsTsImportBinder, JsTsModuleMemberWrites, compute_import_binder as compute_js_ts_import_binder,
+    js_ts_declaration_name, js_ts_var_declarator_binding_scope,
     js_ts_variable_declarator_binding_scope,
 };
+pub use brokk_bifrost_js_ts::syntax::{JsTsLexicalBindingIndex, JsTsLexicalBindingScope};
 use std::path::{Component, Path};
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -81,10 +86,7 @@ fn js_ts_local_declaration_binding_scope<'tree>(
     node: tree_sitter::Node<'tree>,
 ) -> Option<LocalDeclarationBindingScope<'tree>> {
     let scope = js_ts_variable_declarator_binding_scope(node)?;
-    let visibility = if node
-        .parent()
-        .is_some_and(|parent| parent.kind() == "variable_declaration")
-    {
+    let visibility = if js_ts_var_declarator_binding_scope(node).is_some() {
         LocalDeclarationVisibility::Hoisted
     } else {
         LocalDeclarationVisibility::Lexical
@@ -479,6 +481,10 @@ pub(crate) fn path_contains_tests(file: &ProjectFile) -> bool {
         || (has_strong_test_root(file) && has_node_test_filename(file))
 }
 
+pub(crate) fn hydrate_contains_tests(stored: bool, file: &ProjectFile) -> bool {
+    stored || path_contains_tests(file)
+}
+
 pub(crate) fn contains_tests(file: &ProjectFile, source: &str, tree: &tree_sitter::Tree) -> bool {
     path_contains_tests(file)
         || tree_contains_test_dsl_calls(tree, source)
@@ -492,12 +498,9 @@ pub(crate) fn synthesize_hydrated_module(file: &ProjectFile, source: &str, state
     let module = module_code_unit(file);
     state.top_level_declarations.push(module.clone());
     state.declarations.insert(module.clone());
-    state.ranges.entry(module).or_default().push(Range {
-        start_byte: 0,
-        end_byte: source.len(),
-        start_line: 1,
-        end_line: compute_line_starts(source).len(),
-    });
+    state.ranges.entry(module).or_default().push(
+        crate::analyzer::tree_sitter_analyzer::full_source_range(source),
+    );
 }
 
 pub(crate) fn synthesize_summary_module(
@@ -512,15 +515,31 @@ pub(crate) fn synthesize_summary_module(
     let module = module_code_unit(file);
     projection.top_level_declarations.push(module.clone());
     projection.declarations.push(module.clone());
-    projection.ranges.entry(module).or_default().push(Range {
-        start_byte: 0,
-        end_byte: source.len(),
-        start_line: 1,
-        end_line: compute_line_starts(source).len(),
-    });
+    projection.ranges.entry(module).or_default().push(
+        crate::analyzer::tree_sitter_analyzer::full_source_range(source),
+    );
 }
 
 static JS_TS_USAGE_STRATEGY: JsTsExportUsageGraphStrategy = JsTsExportUsageGraphStrategy::new();
+
+fn js_ts_ecosystem() -> UsageEcosystem {
+    UsageEcosystem::JavaScriptTypeScript
+}
+
+fn js_ts_reference_usage_strategy() -> &'static dyn crate::analyzer::usages::GraphUsageAnalyzer {
+    &JS_TS_USAGE_STRATEGY
+}
+
+fn js_ts_reference_graph_backend() -> crate::analyzer::languages::LanguageGraphBackend {
+    crate::analyzer::languages::LanguageGraphBackend::Legacy(&JsTsEdgePass)
+}
+
+fn js_ts_dead_code_support() -> DeadCodeSupport {
+    DeadCodeSupport {
+        strategy: Some(&JS_TS_USAGE_STRATEGY),
+        bulk: Some(&JsTsDeadCodeBulk),
+    }
+}
 
 /// One file's module-member write evidence, keyed by module specifier (#3427).
 ///
@@ -656,6 +675,10 @@ impl LanguageSupport for JavascriptSupport {
         Language::JavaScript
     }
 
+    fn is_configuration_input_path(&self, path: &Path) -> bool {
+        dependency_evidence::is_js_ts_dependency_input(path)
+    }
+
     fn procedure_syntax_roles(&self) -> Option<crate::analyzer::languages::ProcedureSyntaxRoles> {
         Some(semantic::PROCEDURE_SYNTAX_ROLES)
     }
@@ -692,25 +715,23 @@ impl LanguageSupport for JavascriptSupport {
         &self,
         analyzer: &'a dyn IAnalyzer,
     ) -> Option<&'a dyn ForwardQueryProvider> {
-        resolve_analyzer::<JavascriptAnalyzer>(analyzer).map(|value| value as _)
+        crate::analyzer::forward_query_provider::<JavascriptAnalyzer>(analyzer)
     }
 
     fn ecosystem(&self) -> UsageEcosystem {
-        UsageEcosystem::JavaScriptTypeScript
+        js_ts_ecosystem()
     }
 
-    fn reference_plugin(&self) -> crate::analyzer::languages::ReferenceLanguagePlugin {
-        crate::analyzer::languages::ReferenceLanguagePlugin::new(
-            &JS_TS_USAGE_STRATEGY,
-            &JsTsEdgePass,
-        )
+    fn reference_usage_strategy(&self) -> &'static dyn crate::analyzer::usages::GraphUsageAnalyzer {
+        js_ts_reference_usage_strategy()
+    }
+
+    fn reference_graph_backend(&self) -> crate::analyzer::languages::LanguageGraphBackend {
+        js_ts_reference_graph_backend()
     }
 
     fn dead_code(&self) -> DeadCodeSupport {
-        DeadCodeSupport {
-            strategy: Some(&JS_TS_USAGE_STRATEGY),
-            bulk: Some(&JsTsDeadCodeBulk),
-        }
+        js_ts_dead_code_support()
     }
 
     fn receiver_facts(&self) -> Option<&'static dyn ReceiverFactsFactory> {
@@ -776,6 +797,10 @@ pub(crate) struct TypescriptSupport;
 impl LanguageSupport for TypescriptSupport {
     fn language(&self) -> Language {
         Language::TypeScript
+    }
+
+    fn is_configuration_input_path(&self, path: &Path) -> bool {
+        dependency_evidence::is_js_ts_dependency_input(path)
     }
 
     fn procedure_syntax_roles(&self) -> Option<crate::analyzer::languages::ProcedureSyntaxRoles> {
@@ -851,25 +876,23 @@ impl LanguageSupport for TypescriptSupport {
         &self,
         analyzer: &'a dyn IAnalyzer,
     ) -> Option<&'a dyn ForwardQueryProvider> {
-        resolve_analyzer::<TypescriptAnalyzer>(analyzer).map(|value| value as _)
+        crate::analyzer::forward_query_provider::<TypescriptAnalyzer>(analyzer)
     }
 
     fn ecosystem(&self) -> UsageEcosystem {
-        UsageEcosystem::JavaScriptTypeScript
+        js_ts_ecosystem()
     }
 
-    fn reference_plugin(&self) -> crate::analyzer::languages::ReferenceLanguagePlugin {
-        crate::analyzer::languages::ReferenceLanguagePlugin::new(
-            &JS_TS_USAGE_STRATEGY,
-            &JsTsEdgePass,
-        )
+    fn reference_usage_strategy(&self) -> &'static dyn crate::analyzer::usages::GraphUsageAnalyzer {
+        js_ts_reference_usage_strategy()
+    }
+
+    fn reference_graph_backend(&self) -> crate::analyzer::languages::LanguageGraphBackend {
+        js_ts_reference_graph_backend()
     }
 
     fn dead_code(&self) -> DeadCodeSupport {
-        DeadCodeSupport {
-            strategy: Some(&JS_TS_USAGE_STRATEGY),
-            bulk: Some(&JsTsDeadCodeBulk),
-        }
+        js_ts_dead_code_support()
     }
 
     fn receiver_facts(&self) -> Option<&'static dyn ReceiverFactsFactory> {
@@ -991,25 +1014,19 @@ impl DeadCodeBulkProof for JsTsDeadCodeBulk {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tree_sitter::{Parser, Tree};
+    use tree_sitter::Tree;
 
     fn parse_javascript(source: &str) -> Tree {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_javascript::LANGUAGE.into())
-            .expect("javascript grammar");
-        parser.parse(source, None).expect("javascript tree")
+        brokk_bifrost_js_ts::test_support::parse_javascript(source)
     }
 
     fn parse_typescript(source: &str) -> Tree {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
-            .expect("typescript grammar");
-        parser.parse(source, None).expect("typescript tree")
+        brokk_bifrost_js_ts::test_support::parse_typescript(source)
     }
 
+    use brokk_bifrost_test_macros::hardwon;
     #[test]
+    #[hardwon("162329a7af0f: RuleTester suites must remain in changed-test scope")]
     fn rule_tester_commonjs_suite_is_structurally_a_test() {
         let source = r#"
 const RuleTester = require("../../../lib/rule-tester/rule-tester");
@@ -1026,8 +1043,10 @@ ruleTester.run("rule", rule, { valid: [], invalid: [] });
             &tree
         ));
     }
-
     #[test]
+    #[hardwon(
+        "162329a7af0f: JavaScript and TypeScript RuleTester bindings must both be recognized"
+    )]
     fn rule_tester_suite_detection_is_shared_with_typescript() {
         let source = r#"
 const RuleTester = require("eslint");
@@ -1093,8 +1112,8 @@ tester.run("rule", rule, {});
             default_source
         ));
     }
-
     #[test]
+    #[hardwon("162329a7af0f: unrelated bindings and source text must not create a test scope")]
     fn rule_tester_detection_rejects_unrelated_bindings_and_text() {
         let cases = [
             r#"
@@ -1143,8 +1162,10 @@ ruleTester.run("rule", rule, {});
             assert!(!rule_tester_suite_contains_tests(&tree, source), "{source}");
         }
     }
-
     #[test]
+    #[hardwon(
+        "c57bd22bfb18: Source-text matches such as emit/init/split were misclassified as test declarations"
+    )]
     fn test_dsl_detection_uses_call_structure_and_callback_shape() {
         let positive_sources = [
             r#"describe("suite", () => {});"#,
@@ -1198,8 +1219,8 @@ ruleTester.run("rule", rule, {});
             assert_eq!(contains_tests(&file, production, &tree), expected, "{path}");
         }
     }
-
     #[test]
+    #[hardwon("c57bd22bfb18: conventional test suffixes must survive structural detection")]
     fn conventional_test_suffixes_remain_supported_without_source_text() {
         for path in ["src/parser.test.js", "src/parser.spec.ts"] {
             let file = ProjectFile::new(

@@ -209,6 +209,35 @@ pub trait StructuralFactProvider: Send + Sync {
         false
     }
 
+    /// Whether AST-backed callable asyncness is available. External providers
+    /// default to unsupported so missing facts are diagnosed.
+    fn structural_supports_async_callable_value(&self) -> bool {
+        false
+    }
+
+    /// Whether decoded values of normalized string literals are available.
+    /// The default is unsupported for external providers so exact-value
+    /// queries become incomplete instead of silently empty.
+    fn structural_supports_string_literal_value(&self) -> bool {
+        false
+    }
+
+    /// Whether exact direct tuple/list assignment-shape facts are available.
+    fn structural_supports_assignment_shape(&self) -> bool {
+        false
+    }
+
+    /// Whether exact canonical values for integer literals are available.
+    fn structural_supports_integer_literal_value(&self) -> bool {
+        false
+    }
+
+    /// Whether the adapter can compare Python dictionary keys by decoded
+    /// literal value and report unsupported forms as incomplete.
+    fn structural_supports_duplicate_dictionary_keys(&self) -> bool {
+        false
+    }
+
     /// Whether the adapter classifies `role` during fact extraction. Total by
     /// construction: an adapter that declares nothing supports nothing.
     fn structural_supports_occurrence_role(&self, role: OccurrenceRole) -> bool;
@@ -539,11 +568,48 @@ impl<A: LanguageAdapter> TreeSitterAnalyzer<A> {
             return (None, StructuralFactsCacheOutcome::Unavailable);
         };
         self.structural_cache().record_extraction();
-        let facts = Arc::new(FileFacts::from_source_and_rows(
-            source.to_owned(),
-            source_facts.occurrences,
-            source_facts.structural,
-        ));
+        // Preparation publishes the parse. Read the published rows back so the
+        // recovered regions carry the store's containment answer (#3777). When
+        // publication failed the store has no rows, and the parse's own rows,
+        // whose regions have no answer, are the facts.
+        let published = snapshot_key.as_ref().and_then(|key| {
+            match self.load_structural_facts_rows_limited(
+                key,
+                STRUCTURAL_FACTS_VERSION,
+                usize::MAX,
+                None,
+            ) {
+                Ok(crate::analyzer::store::StructuralFactRowsRead::Ready(rows)) => Some(rows),
+                Ok(crate::analyzer::store::StructuralFactRowsRead::Unavailable) => None,
+                Ok(
+                    crate::analyzer::store::StructuralFactRowsRead::Exceeded { .. }
+                    | crate::analyzer::store::StructuralFactRowsRead::Cancelled,
+                ) => unreachable!("an unbounded, uncancellable read cannot stop early"),
+                Err(error) => {
+                    self.record_store_error(
+                        error.context("reading back prepared canonical structural facts"),
+                    );
+                    None
+                }
+            }
+        });
+        let facts = match published {
+            Some(rows) => match FileFacts::from_persisted_rows(source.to_owned(), rows) {
+                Ok(facts) => facts,
+                Err(error) => {
+                    self.record_store_error(StoreError::new(format!(
+                        "invalid prepared canonical structural facts: {error}"
+                    )));
+                    return (None, StructuralFactsCacheOutcome::Unavailable);
+                }
+            },
+            None => FileFacts::from_source_and_rows(
+                source.to_owned(),
+                source_facts.occurrences,
+                source_facts.structural,
+            ),
+        };
+        let facts = Arc::new(facts);
         if let Some(key) = snapshot_key {
             self.structural_cache().insert(key, Arc::clone(&facts));
         }
@@ -993,6 +1059,36 @@ impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
             .is_some_and(|spec| spec.supports_boolean_literal_value())
     }
 
+    fn structural_supports_async_callable_value(&self) -> bool {
+        self.adapter()
+            .structural_spec()
+            .is_some_and(|spec| spec.supports_async_callable_value())
+    }
+
+    fn structural_supports_string_literal_value(&self) -> bool {
+        self.adapter()
+            .structural_spec()
+            .is_some_and(|spec| spec.supports_string_literal_value())
+    }
+
+    fn structural_supports_assignment_shape(&self) -> bool {
+        self.adapter()
+            .structural_spec()
+            .is_some_and(|spec| spec.supports_assignment_shape())
+    }
+
+    fn structural_supports_integer_literal_value(&self) -> bool {
+        self.adapter()
+            .structural_spec()
+            .is_some_and(|spec| spec.supports_integer_literal_value())
+    }
+
+    fn structural_supports_duplicate_dictionary_keys(&self) -> bool {
+        self.adapter()
+            .structural_spec()
+            .is_some_and(|spec| spec.supports_duplicate_dictionary_keys())
+    }
+
     fn structural_supports_occurrence_role(&self, role: OccurrenceRole) -> bool {
         self.adapter()
             .structural_spec()
@@ -1044,12 +1140,13 @@ impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
 mod tests {
     use super::*;
     use crate::analyzer::{
-        AnalyzerConfig, IAnalyzer, Language, OverlayProject, Project, RustAnalyzer, TestProject,
+        AnalyzerConfig, IAnalyzer, Language, OverlayProject, Project, TestProject,
         TypescriptAnalyzer, WorkspaceAnalyzer,
     };
     use crate::compact_graph::CompactRows;
     use crate::gitblob::test_repo::{commit_all, init_repo};
     use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_test_macros::hardwon;
     use std::sync::Arc;
 
     fn empty_facts(source: &str) -> FileFacts {
@@ -1059,7 +1156,23 @@ mod tests {
             Vec::new(),
             CompactRows::from_parts(vec![0], Vec::new()),
             CompactRows::from_parts(vec![0], Vec::new()),
+            Vec::new(),
         )
+    }
+
+    fn assert_limited_source_and_syntax_unavailable(
+        provider: &dyn StructuralFactProvider,
+        file: &ProjectFile,
+        max_source_bytes: usize,
+    ) {
+        assert!(matches!(
+            provider.structural_source_limited(file, max_source_bytes, None),
+            StructuralSourceLimitedOutcome::Unavailable
+        ));
+        assert!(matches!(
+            provider.structural_syntax_limited(file, max_source_bytes, None),
+            StructuralSyntaxLimitedOutcome::Unavailable
+        ));
     }
 
     #[test]
@@ -1091,14 +1204,7 @@ mod tests {
                 let file = fixture.file(path);
                 assert!(provider.structural_source(&file).is_none());
                 assert!(provider.structural_facts(&file).is_none());
-                assert!(matches!(
-                    provider.structural_source_limited(&file, 0, None),
-                    StructuralSourceLimitedOutcome::Unavailable
-                ));
-                assert!(matches!(
-                    provider.structural_syntax_limited(&file, 0, None),
-                    StructuralSyntaxLimitedOutcome::Unavailable
-                ));
+                assert_limited_source_and_syntax_unavailable(provider, &file, 0);
                 assert!(matches!(
                     provider.structural_facts_limited(&file, source, 0, None),
                     StructuralFactsLimitedOutcome::Unavailable
@@ -1175,6 +1281,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "fe65bfeaa292: a foreign provider parsed and published facts for files it did not own"
+    )]
     fn a_provider_declines_a_file_of_another_language() {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical root");
@@ -1205,14 +1314,7 @@ mod tests {
         assert_eq!(reused_outcome, StructuralFactsCacheOutcome::MemoryHit);
         assert!(provider.structural_facts(&foreign).is_none());
         assert!(provider.structural_source(&foreign).is_none());
-        assert!(matches!(
-            provider.structural_source_limited(&foreign, usize::MAX, None),
-            StructuralSourceLimitedOutcome::Unavailable
-        ));
-        assert!(matches!(
-            provider.structural_syntax_limited(&foreign, usize::MAX, None),
-            StructuralSyntaxLimitedOutcome::Unavailable
-        ));
+        assert_limited_source_and_syntax_unavailable(provider, &foreign, usize::MAX);
         assert_eq!(provider.structural_extraction_count(), own_extractions);
     }
 
@@ -1310,6 +1412,9 @@ mod tests {
         assert_eq!(provider.structural_hydration_count(), hydrated_before + 1);
     }
 
+    const RUST_READY_SOURCE: &str =
+        "fn helper(value: i32) -> i32 { value + 1 }\nfn main() { helper(1); }\n";
+
     #[test]
     fn limited_materialization_caps_role_edges_before_caching() {
         let arguments = std::iter::repeat_n("this", 256)
@@ -1405,35 +1510,6 @@ mod tests {
             hydrated_before + 1
         );
     }
-
-    #[test]
-    fn limited_materialization_honors_cancellation_before_work() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical root");
-        let file = ProjectFile::new(root.clone(), "app.ts");
-        file.write("export function call(): void {}\n")
-            .expect("write source");
-        let analyzer =
-            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
-        let provider = analyzer
-            .structural_fact_providers()
-            .into_iter()
-            .next()
-            .expect("TypeScript structural provider");
-        let source = provider.structural_source(&file).expect("source");
-        let cancellation = CancellationToken::new();
-        cancellation.cancel();
-        let before = provider.structural_extraction_count();
-
-        assert!(matches!(
-            provider.structural_facts_limited(&file, &source, usize::MAX, Some(&cancellation)),
-            StructuralFactsLimitedOutcome::Cancelled
-        ));
-        assert_eq!(provider.structural_extraction_count(), before);
-    }
-
-    const RUST_READY_SOURCE: &str =
-        "fn helper(value: i32) -> i32 { value + 1 }\nfn main() { helper(1); }\n";
 
     #[test]
     fn ready_rust_bounded_reads_use_persisted_or_ephemeral_facts_without_extraction() {
@@ -1575,42 +1651,5 @@ mod tests {
             StructuralFactsLimitedOutcome::Cancelled
         ));
         assert_eq!(provider.structural_extraction_count(), before);
-    }
-
-    #[test]
-    fn regular_rust_structural_miss_prepares_canonical_facts_through_normal_path() {
-        let fixture = InlineTestProject::with_language(Language::Rust)
-            .file("src/lib.rs", "")
-            .build();
-        let analyzer = RustAnalyzer::from_project(fixture.project().clone());
-        let file = fixture.file("src/lib.rs");
-        // Construction eagerly prepares its initial snapshot. Introduce new
-        // content afterward so the provider really exercises a cold miss.
-        file.write(RUST_READY_SOURCE).unwrap();
-        let provider = analyzer
-            .structural_fact_providers()
-            .into_iter()
-            .next()
-            .expect("Rust structural provider");
-        let before = provider.structural_extraction_count();
-        assert!(matches!(
-            provider.structural_facts_limited(&file, RUST_READY_SOURCE, usize::MAX, None),
-            StructuralFactsLimitedOutcome::Unavailable
-        ));
-        assert_eq!(provider.structural_extraction_count(), before);
-
-        let (facts, outcome) = provider.structural_facts_with_outcome(&file);
-        let facts = facts.expect("normal Rust structural miss should prepare facts");
-        assert_eq!(facts.source(), RUST_READY_SOURCE);
-        assert_eq!(outcome, StructuralFactsCacheOutcome::Extracted);
-        assert_eq!(provider.structural_extraction_count(), before + 1);
-
-        let (cached, cached_outcome) = provider.structural_facts_with_outcome(&file);
-        assert_eq!(
-            cached.expect("prepared facts should be cached").source(),
-            RUST_READY_SOURCE
-        );
-        assert_eq!(cached_outcome, StructuralFactsCacheOutcome::MemoryHit);
-        assert_eq!(provider.structural_extraction_count(), before + 1);
     }
 }

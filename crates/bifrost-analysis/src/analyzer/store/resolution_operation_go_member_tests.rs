@@ -1,4 +1,159 @@
 use super::*;
+use crate::analyzer::store::resolution_operation::package_context::SelectedPackageRows;
+
+#[test]
+fn selected_go_package_members_group_matches_per_lookup_with_staged_rename() {
+    use crate::analyzer::store::resolution_stage::codec::{encode_node, encode_semantic};
+
+    let provider = "package provider; type Item struct{}; type Replacement struct{}";
+    let fixture = GoRootResolutionOperationFixture::with_sources([
+        GO_ROOT_CONSUMER_SOURCE,
+        provider,
+        GO_ROOT_DECOY_SOURCE,
+    ]);
+    let cancellation = CancellationToken::new();
+    let operation = fixture.open_ready(&cancellation);
+    let mount = operation
+        .mount_table()
+        .mount_for_path("go", GO_ROOT_PROVIDER_PATH)
+        .unwrap()
+        .unwrap();
+    let SelectedPackageRows::Ready(ordinary) = operation
+        .selected_package_members_by_lookup(mount.ordinal(), &cancellation)
+        .unwrap()
+    else {
+        panic!("not cancelled");
+    };
+    let mut members = ordinary.values().flatten().copied().collect::<Vec<_>>();
+    let item = members
+        .iter()
+        .find(|member| {
+            member.source_site
+                == site_for_identifier(
+                    &fixture.provider_facts,
+                    "Item",
+                    ResolutionIdentifierRole::Declaration,
+                    ResolutionNamespace::Type,
+                )
+        })
+        .copied()
+        .expect("Item package member");
+    let replacement_lookup = members
+        .iter()
+        .find(|member| member.lookup != item.lookup)
+        .map(|member| member.lookup)
+        .expect("Replacement package member lookup");
+    members
+        .iter_mut()
+        .find(|member| member.definition == item.definition && member.namespace == item.namespace)
+        .expect("Item package member identity")
+        .lookup = replacement_lookup;
+    let lookups = ordinary.keys().copied().collect::<BTreeSet<_>>();
+
+    operation
+        .ready
+        .inventory
+        .with_owned_temp_write(|connection| {
+            connection.execute(
+                "INSERT INTO temp.selected_resolution_stage_producers(host_ordinal,bridge_identity,content_digest) VALUES(?1,?2,?3)",
+                rusqlite::params![mount.ordinal().get(), [41_u8; 32].as_slice(), [42_u8; 32].as_slice()],
+            )?;
+            let producer = connection.last_insert_rowid();
+            for member in &members {
+                connection.execute(
+                    "INSERT INTO temp.selected_resolution_stage_package_members(host_ordinal,producer_id,token_key,domain_shared,definition_key,source_site,root_scope_key,namespace,lookup_shared) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                    rusqlite::params![
+                        mount.ordinal().get(),
+                        producer,
+                        encode_semantic(member.token),
+                        member.domain.shared_name_id().unwrap().get(),
+                        encode_semantic(member.definition),
+                        member.source_site.get(),
+                        encode_node(member.root_scope),
+                        member.namespace.label(),
+                        member.lookup.shared_name_id().unwrap().get(),
+                    ],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+    let SelectedPackageRows::Ready(grouped) = operation
+        .selected_package_members_by_lookup(mount.ordinal(), &cancellation)
+        .unwrap()
+    else {
+        panic!("not cancelled");
+    };
+    let actual = grouped.values().flatten().copied().collect::<BTreeSet<_>>();
+    let mut oracle = BTreeSet::new();
+    for lookup in lookups {
+        let SelectedPackageRows::Ready(members) = operation
+            .selected_package_members_for_lookup(mount.ordinal(), lookup, &cancellation)
+            .unwrap()
+        else {
+            panic!("not cancelled");
+        };
+        oracle.extend(members);
+    }
+    assert_eq!(actual, oracle);
+    assert!(
+        !actual.contains(&item),
+        "the staged rename withdraws the old key"
+    );
+    assert!(
+        actual
+            .iter()
+            .any(|member| member.definition == item.definition
+                && member.lookup == replacement_lookup),
+        "the staged rename retains Item under its replacement lookup"
+    );
+}
+
+#[test]
+fn selected_go_package_member_mount_queries_seek_in_both_statistics_states() {
+    use super::super::super::planner_statistics::pinned_plans::{explain_pin, pinned};
+    use brokk_bifrost_core::cache_gc::PlannerStatisticsState;
+
+    for statistics in PlannerStatisticsState::BOTH {
+        let fixture = GoRootResolutionOperationFixture::new();
+        fixture
+            .store
+            .conn
+            .execute(move |connection| statistics.install(connection));
+        let cancellation = CancellationToken::new();
+        let operation = fixture.open_ready(&cancellation);
+        let mount = operation
+            .mount_table()
+            .mount_for_path("go", GO_ROOT_PROVIDER_PATH)
+            .unwrap()
+            .unwrap();
+        for (name, index) in [
+            ("native_package_members_by_mount", "PRIMARY KEY"),
+            (
+                "native_stage_package_members_by_mount",
+                "selected_resolution_stage_package_members_host",
+            ),
+        ] {
+            let mut pin = pinned(name);
+            pin.params = vec![rusqlite::types::Value::Integer(i64::from(
+                mount.ordinal().get(),
+            ))];
+            let plan = explain_pin(operation.ready.inventory.connection(), &pin);
+            assert!(
+                plan.iter()
+                    .any(|detail| detail.starts_with("SEARCH p USING") && detail.contains(index)),
+                "{name} with {statistics}: {plan:?}"
+            );
+            assert!(
+                plan.iter().all(|detail| !detail.starts_with("SCAN p")
+                    && !detail.contains("AUTOMATIC")
+                    && !detail.contains("TEMP B-TREE")),
+                "{name} with {statistics}: {plan:?}"
+            );
+        }
+    }
+}
 
 #[test]
 fn selected_go_member_metadata_preserves_embeddings_receivers_and_indexed_access() {
@@ -46,6 +201,7 @@ fn selected_go_member_metadata_preserves_embeddings_receivers_and_indexed_access
         let contract = definition("Contract", ResolutionNamespace::Type);
         let base = definition("Base", ResolutionNamespace::Type);
         let boxed = definition("Box", ResolutionNamespace::Type);
+        let contract_call = definition("Call", ResolutionNamespace::Callable);
         let value = definition("Value", ResolutionNamespace::Callable);
         let pointer = definition("Pointer", ResolutionNamespace::Callable);
         let mut definitions = lowered
@@ -92,7 +248,18 @@ fn selected_go_member_metadata_preserves_embeddings_receivers_and_indexed_access
                     .unwrap()
                     .kind
             };
-            assert_eq!(find(contract), &GoMemberDeclarationKind::Interface);
+            let GoMemberDeclarationKind::Interface { methods } = find(contract) else {
+                panic!("Contract interface metadata")
+            };
+            let call_lookup = crate::analyzer::resolution::ResolutionLookupSemanticRecipe::new(
+                Language::Go,
+                ResolutionNamespace::Callable,
+                "Call",
+            )
+            .semantic(&operation.ready.shared_names());
+            assert!(methods.iter().any(|method| {
+                method.callable_lookup == call_lookup && method.definition == Some(contract_call)
+            }));
             assert_eq!(
                 find(base),
                 &GoMemberDeclarationKind::Struct { fields: vec![] }

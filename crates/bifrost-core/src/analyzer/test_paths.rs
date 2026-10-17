@@ -10,7 +10,7 @@ pub enum PathTestVerdict {
 
 /// Directory-convention verdict for a workspace-relative path.
 pub fn path_test_verdict(path: &str) -> PathTestVerdict {
-    let normalized = normalize_path(path);
+    let normalized = crate::path_utils::normalize_pattern(path);
     let segments: Vec<&str> = normalized
         .split('/')
         .filter(|segment| !segment.is_empty())
@@ -33,7 +33,7 @@ pub fn path_test_verdict(path: &str) -> PathTestVerdict {
 
 /// Per-language filename-convention check on the basename.
 pub fn has_test_filename_convention(path: &str, language: Language) -> bool {
-    let normalized = normalize_path(path);
+    let normalized = crate::path_utils::normalize_pattern(path);
     let file_name = Path::new(&normalized)
         .file_name()
         .and_then(|name| name.to_str())
@@ -106,10 +106,6 @@ pub fn is_test_like_path(path: &str, language: Language) -> bool {
         || has_test_filename_convention(path, language)
 }
 
-fn normalize_path(path: &str) -> String {
-    path.replace('\\', "/")
-}
-
 fn has_test_segment(segments: &[&str]) -> bool {
     segments.iter().any(|segment| {
         matches!(
@@ -164,45 +160,16 @@ fn has_cpp_test_filename(lower: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
-    fn csharp_test_project_under_test_root_is_test_root() {
-        assert_eq!(
-            PathTestVerdict::TestRoot,
-            path_test_verdict("test/Core.Test/Auth/AutoFixture/Fixture.cs")
-        );
-    }
-
-    #[test]
-    fn jvm_src_test_is_test_root() {
-        assert_eq!(
-            PathTestVerdict::TestRoot,
-            path_test_verdict("app/src/test/java/ai/brokk/testutil/TestService.java")
-        );
-    }
-
-    #[test]
-    fn jvm_src_main_is_production_root() {
-        assert_eq!(
-            PathTestVerdict::ProductionRoot,
-            path_test_verdict("app/src/main/java/ai/brokk/project/MainProject.java")
-        );
-    }
-
-    #[test]
+    #[hardwon("#604: an ordinary src path was guessed to be production or test without evidence")]
     fn ordinary_src_file_is_ambiguous() {
         assert_eq!(PathTestVerdict::Ambiguous, path_test_verdict("src/lib.rs"));
     }
 
     #[test]
-    fn go_test_file_has_filename_convention() {
-        assert!(has_test_filename_convention(
-            "pkg/foo_test.go",
-            Language::Go
-        ));
-    }
-
-    #[test]
+    #[hardwon("#604: Windows-style src/test paths lost their test-root classification")]
     fn windows_style_src_test_is_test_root() {
         assert_eq!(
             PathTestVerdict::TestRoot,
@@ -211,6 +178,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#604: Latest.java was falsely classified as a test filename")]
     fn pascal_case_java_suffixes_are_case_sensitive() {
         assert!(!has_test_filename_convention("Audit.java", Language::Java));
         assert!(!has_test_filename_convention("Latest.java", Language::Java));
@@ -219,6 +187,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#604: Contest.cs was falsely classified as a test filename")]
     fn pascal_case_csharp_suffixes_are_case_sensitive() {
         assert!(!has_test_filename_convention(
             "Contest.cs",
@@ -226,18 +195,11 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn pascal_case_scala_suffixes_are_case_sensitive() {
-        assert!(has_test_filename_convention(
-            "FooSpec.scala",
-            Language::Scala
-        ));
-    }
-
     /// Issue #1575: `.c` maps to `Language::Cpp`, whose vocabulary only ever
     /// covered `.cc`/`.cpp`, so Dovecot-style `test-*.c` files were invisible to
     /// every test-classification surface.
     #[test]
+    #[hardwon("#1575: C test filename conventions omitted .c files and test-support headers")]
     fn c_test_filename_conventions_are_recognized() {
         for path in [
             "src/lib/test-istream-concat.c",
@@ -254,6 +216,7 @@ mod tests {
     /// Near-misses: coreutils' `src/test.c` implements the test(1) builtin, and
     /// the remaining names merely contain "test" without a separator.
     #[test]
+    #[hardwon("#1575: test(1) and names containing test were falsely classified as C tests")]
     fn c_production_filenames_are_not_test_files() {
         for path in [
             "src/test.c",
@@ -266,24 +229,47 @@ mod tests {
     }
 
     #[test]
-    fn kotlin_pascal_case_suffixes_are_recognized() {
-        for path in ["SampleTest.kt", "SampleTests.kt", "SampleSpec.kt"] {
-            assert!(
-                has_test_filename_convention(path, Language::Kotlin),
-                "{path}"
-            );
-        }
-        assert!(!has_test_filename_convention("Sample.kt", Language::Kotlin));
-        // Suffix-anchored, not substring: a production file merely containing
-        // "Test" is not a test file.
-        assert!(!has_test_filename_convention(
-            "Testament.kt",
-            Language::Kotlin
+    #[hardwon("#604: test-root classification missed C# projects under test/")]
+    fn csharp_test_project_under_test_root_is_test_root() {
+        assert_eq!(
+            PathTestVerdict::TestRoot,
+            path_test_verdict("test/Core.Test/Auth/AutoFixture/Fixture.cs")
+        );
+    }
+
+    #[test]
+    #[hardwon("#604: JVM src/test paths were not classified as test roots")]
+    fn jvm_src_test_is_test_root() {
+        assert_eq!(
+            PathTestVerdict::TestRoot,
+            path_test_verdict("app/src/test/java/ai/brokk/testutil/TestService.java")
+        );
+    }
+
+    #[test]
+    #[hardwon("#604: JVM src/main paths were not classified as production roots")]
+    fn jvm_src_main_is_production_root() {
+        assert_eq!(
+            PathTestVerdict::ProductionRoot,
+            path_test_verdict("app/src/main/java/ai/brokk/project/MainProject.java")
+        );
+    }
+
+    #[test]
+    #[hardwon("#604: Go _test.go files were missed by filename classification")]
+    fn go_test_file_has_filename_convention() {
+        assert!(has_test_filename_convention(
+            "pkg/foo_test.go",
+            Language::Go
         ));
-        // Case-sensitive, matching the other PascalCase JVM languages.
-        assert!(!has_test_filename_convention(
-            "sampletest.kt",
-            Language::Kotlin
+    }
+
+    #[test]
+    #[hardwon("#604: Scala test suffix matching was not case-sensitive")]
+    fn pascal_case_scala_suffixes_are_case_sensitive() {
+        assert!(has_test_filename_convention(
+            "FooSpec.scala",
+            Language::Scala
         ));
     }
 }

@@ -1,6 +1,6 @@
 use super::{
-    CodeQueryDiagnostic, CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact, CodeQueryResultRef,
-    CodeQueryTaintFinding, CodeQueryTaintLimits, SemanticProcedureValue,
+    CodeQueryDiagnostic, CodeQueryDiagnosticCode, CodeQueryResultRef, CodeQueryTaintFinding,
+    CodeQueryTaintLimits, SemanticProcedureValue, incomplete_diagnostic,
 };
 use crate::analyzer::{ProjectFile, WorkspaceAnalyzer};
 use crate::cancellation::CancellationToken;
@@ -167,14 +167,8 @@ impl TaintQueryState {
     }
 
     fn push_diagnostic(&mut self, code: CodeQueryDiagnosticCode, message: String) {
-        self.diagnostics.push(CodeQueryDiagnostic {
-            code,
-            impact: CodeQueryDiagnosticImpact::Incomplete,
-            branch: Vec::new(),
-            language: "all",
-            message,
-            exhausted_roots: Vec::new(),
-        });
+        self.diagnostics
+            .push(incomplete_diagnostic(code, "all", message, Vec::new()));
     }
 }
 

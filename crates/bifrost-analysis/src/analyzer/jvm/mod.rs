@@ -8,21 +8,204 @@
 
 pub(crate) mod dependency_discovery;
 pub(crate) mod external;
+pub(crate) mod import_routes;
 pub(crate) mod java_artifact;
 pub(crate) mod jdk_artifact;
 pub(crate) mod jmod_artifact;
 pub(crate) mod kotlin_artifact;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) mod native_points;
 pub(crate) mod realm_builder;
 pub(crate) mod scala_artifact;
 pub(crate) mod toolchains_document;
 pub(crate) mod topology;
 
+use crate::analyzer::CodeUnit;
+use crate::analyzer::semantic_model::{
+    ArtifactProduction, BoundedProducerDiagnostics, Completeness, TypeFact, Visibility,
+};
+use crate::analyzer::tree_sitter_analyzer::ParsedFile;
+use crate::hash::HashMap;
 use brokk_bifrost_jvm::proof::{
     JvmActiveSemanticModel, JvmModelDisposition, JvmRetainedExternalIndex,
 };
 use external::JvmExternalDeclarationIndex;
+use tree_sitter::{Language, Node, Parser, Tree};
 
 pub(crate) use dependency_discovery::MAX_BUILD_METADATA_BYTES;
+
+pub(crate) fn take_artifact_record(remaining: &mut usize, record_limit_hit: &mut bool) -> bool {
+    if *remaining == 0 {
+        *record_limit_hit = true;
+        return false;
+    }
+    *remaining -= 1;
+    true
+}
+
+pub(crate) fn visibility_from_java_access_flags(
+    public: bool,
+    protected: bool,
+    private: bool,
+) -> Visibility {
+    if public {
+        Visibility::Public
+    } else if protected {
+        Visibility::Protected
+    } else if private {
+        Visibility::Private
+    } else {
+        Visibility::Package
+    }
+}
+
+/// Count Java array axes from their structural opening-bracket tokens.
+///
+/// Dimension annotations are children of the `dimensions` node too, so its
+/// child count is not a reliable axis count.
+pub(crate) fn java_array_dimension_count(dimensions: Node<'_>) -> usize {
+    let count = (0..dimensions.child_count())
+        .filter_map(|index| dimensions.child(index))
+        .filter(|child| child.kind() == "[")
+        .count();
+    debug_assert!(
+        count > 0,
+        "Java dimensions node contains an array dimension"
+    );
+    count
+}
+
+pub(crate) fn equivalent_java_type_identity(left: &TypeFact, right: &TypeFact) -> bool {
+    left.id == right.id
+        && left.name == right.name
+        && left.type_kind == right.type_kind
+        && left.visibility == right.visibility
+        && left.is_abstract == right.is_abstract
+        && left.is_sealed == right.is_sealed
+        && left.type_parameters == right.type_parameters
+}
+
+#[cfg(test)]
+pub(crate) fn jdk_artifact_request(
+    path: std::path::PathBuf,
+    artifact_kind: crate::analyzer::semantic_model::ExternalArtifactKind,
+    version: &str,
+    targets: Vec<String>,
+) -> crate::analyzer::semantic_model::ArtifactProductionRequest {
+    use crate::analyzer::semantic_model::{
+        ActivationSelector, ArtifactProductionRequest, Compatibility, NameSelector, Provenance,
+        Safety, VersionConstraint,
+    };
+
+    ArtifactProductionRequest {
+        path,
+        artifact_kind,
+        pack_id: "jdk-21".to_owned(),
+        pack_version: version.to_owned(),
+        ecosystem: "jdk".to_owned(),
+        compatibility: Compatibility {
+            bifrost: None,
+            toolchains: vec![VersionConstraint {
+                name: "jdk".to_owned(),
+                requirement: format!("={version}"),
+            }],
+        },
+        activation: vec![ActivationSelector {
+            package: None,
+            module: None,
+            toolchain: Some(NameSelector {
+                name: "jdk".to_owned(),
+                version: Some(format!("={version}")),
+            }),
+            targets,
+            configurations: Vec::new(),
+            artifact_sha256: None,
+        }],
+        provenance: Provenance {
+            source: "OpenJDK".to_owned(),
+            revision: Some(format!("jdk-{version}")),
+        },
+        license: "GPL-2.0-only WITH Classpath-exception-2.0".to_owned(),
+        safety: Safety {
+            generated_code_only: false,
+            review_required: false,
+        },
+    }
+}
+
+pub(crate) fn parse_source_tree(
+    language: Language,
+    source: &str,
+    language_name: &'static str,
+) -> Option<Tree> {
+    let mut parser = Parser::new();
+    parser.set_language(&language).expect(language_name);
+    parser.parse(source, None)
+}
+
+pub(crate) fn parent_index(parsed: &ParsedFile) -> HashMap<CodeUnit, CodeUnit> {
+    let mut parents = HashMap::default();
+    for (parent, children) in &parsed.children {
+        for child in children {
+            parents.insert(child.clone(), parent.clone());
+        }
+    }
+    parents
+}
+
+pub(crate) fn restrict_visibility(declared: Visibility, enclosing: Visibility) -> Visibility {
+    match (declared, enclosing) {
+        (Visibility::Private, _) | (_, Visibility::Private) => Visibility::Private,
+        (Visibility::Package, _) | (_, Visibility::Package) => Visibility::Package,
+        (Visibility::Protected, _) | (_, Visibility::Protected) => Visibility::Protected,
+        _ => Visibility::Public,
+    }
+}
+
+pub(crate) fn restrict_effective_visibility(
+    declared: Visibility,
+    enclosing: impl IntoIterator<Item = Option<Visibility>>,
+) -> Option<Visibility> {
+    let mut visibility = declared;
+    for enclosing in enclosing {
+        visibility = restrict_visibility(enclosing?, visibility);
+    }
+    Some(visibility)
+}
+
+pub(crate) fn valid_module_name(name: &str) -> bool {
+    let mut segment_start = true;
+    for character in name.chars() {
+        if character == '.' {
+            if segment_start {
+                return false;
+            }
+            segment_start = true;
+        } else if segment_start {
+            if character != '_' && !character.is_ascii_alphabetic() {
+                return false;
+            }
+            segment_start = false;
+        } else if character != '_' && !character.is_ascii_alphanumeric() {
+            return false;
+        }
+    }
+    !segment_start
+}
+
+pub(crate) fn failed_with_diagnostics(
+    artifact_sha256: &str,
+    diagnostics: BoundedProducerDiagnostics,
+) -> ArtifactProduction {
+    let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
+    ArtifactProduction {
+        artifact_sha256: Some(artifact_sha256.to_owned()),
+        pack: None,
+        completeness: Completeness::Partial,
+        diagnostics,
+        suppressed_diagnostics,
+    }
+}
 
 /// The build inputs every JVM language captures as selected configuration:
 /// dependency-discovery build files and the toolchain declaration.
@@ -136,5 +319,30 @@ impl JvmActiveSemanticModel for JvmOverlayModel {
             pack_id: gap.pack_id.clone(),
             declaration: gap.declaration.clone(),
         })
+    }
+}
+
+/// Shared interpretation of a proven JVM receiver-to-owner hierarchy route.
+pub(crate) fn native_member_attribution(
+    context: &crate::analyzer::store::resolution_operation::ProjectedNativeMemberContext,
+) -> crate::analyzer::languages::NativeMemberAttribution {
+    use crate::analyzer::structural::{HierarchyRelation, MemberDispatchTier, PrecedenceTier};
+    let direct = context.owner_path.len() == 1;
+    crate::analyzer::languages::NativeMemberAttribution {
+        dispatch_tier: if context.route_kind
+            == crate::analyzer::resolution::FactMemberRouteKind::TypeQualified
+        {
+            MemberDispatchTier::StaticOrCompanion
+        } else if direct {
+            MemberDispatchTier::InherentOrDirect
+        } else {
+            MemberDispatchTier::InheritedOrPromoted
+        },
+        relation: HierarchyRelation::Supertype,
+        precedence_tier: if direct {
+            PrecedenceTier::OwnMember
+        } else {
+            PrecedenceTier::InheritedMember
+        },
     }
 }

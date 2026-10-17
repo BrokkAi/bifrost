@@ -158,9 +158,8 @@ impl CppAnalyzer {
     /// `header_language_attribution` answers the same question, but through the
     /// per-file reaching-translation-unit sets, and materializing those cost
     /// 1,887,205 memberships and 10.2 seconds on every warm Godot startup to
-    /// produce 8,356 booleans. The two must agree file for file; that is what
-    /// `predicate_agrees_with_the_transitive_index_over_a_mixed_workspace` and
-    /// `the_mount_publishes_the_same_files_the_attribution_would` check.
+    /// produce 8,356 booleans. The two must agree file for file; the mixed-workspace regression
+    /// `predicate_agrees_with_the_transitive_index_over_a_mixed_workspace` checks this.
     pub(super) fn c_reading_workspace_files(&self, token: QueryToken<'_>) -> Vec<ProjectFile> {
         let analyzed_files = self.inner.analyzed_files();
         let has_c_translation_unit = analyzed_files.iter().any(is_c_source_file);

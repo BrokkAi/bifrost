@@ -10,20 +10,21 @@ use crate::dataflow::{
     BackwardSnapshotDataflowResult, BackwardSnapshotDemand, BackwardSnapshotProblem,
     DataflowDirectionCapabilities, DataflowDirectionPlan, DataflowDirectionPlanningError,
     DataflowDirectionRequirements, DataflowEdge, DataflowOutput, DataflowRequest,
-    DistributiveDataflowProblem, IcfgInputStatus, IcfgSolveInput, ReusableProcedureSummary,
-    ReusableSummaryError, ReusableSummaryProvider, SummaryBoundaryKind, SummaryDataflowError,
-    SummaryDataflowResult, SummaryPointSeed, SummarySolveInput, SummaryWitnessError,
-    WitnessRetentionLimits, plan_snapshot_dataflow_direction, snapshot_node_ids_for_points,
+    DistributiveDataflowProblem, IcfgSolveInput, NoReusableSummaries, ReusableSummaryProvider,
+    SummaryBoundaryKind, SummaryDataflowError, SummaryDataflowResult, SummaryPointSeed,
+    SummarySolveInput, SummaryWitnessError, WitnessRetentionLimits, acquire_backward_snapshot,
+    plan_snapshot_dataflow_direction, snapshot_node_ids_for_points,
     solve_backward_demands_on_snapshot, solve_with_reusable_end_summaries,
 };
 
 use super::{
     BoundTypestateEvent, BoundTypestateInitialSeed, BoundTypestateTerminal, CompiledProtocol,
-    ProtocolEventId, ProtocolEventOccurrence, ProtocolExpectationKey, ProtocolObservationPhase,
-    ProtocolStateId, ProtocolStateKey, ProtocolTerminalObservationSpec, ProtocolUncertaintyCause,
-    ProtocolUncertaintyResolution, ProtocolUnmatchedEventBehavior, TypestateBindingPlan,
-    TypestateBindingPlanHash, TypestateBindingQuality, TypestateEventBindingId,
-    TypestateProtocolHash, TypestateSubjectId, TypestateSubjectKey, TypestateTerminalBindingId,
+    DirectScalarSource, ProtocolEventId, ProtocolEventOccurrence, ProtocolExpectationKey,
+    ProtocolObservationPhase, ProtocolStateId, ProtocolStateKey, ProtocolTerminalObservationSpec,
+    ProtocolUncertaintyCause, ProtocolUncertaintyResolution, ProtocolUnmatchedEventBehavior,
+    TypestateBindingPlan, TypestateBindingPlanHash, TypestateBindingQuality,
+    TypestateEventBindingId, TypestateEventCondition, TypestateProtocolHash, TypestateSubjectId,
+    TypestateSubjectKey, TypestateTerminalBindingId, direct_scalar_source,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -582,6 +583,10 @@ pub struct TypestateBackwardResult {
     result: BackwardSnapshotDataflowResult<TypestateFact>,
 }
 
+fn all_complete(bindings: bool, execution: bool, result: bool) -> bool {
+    bindings && execution && result
+}
+
 impl TypestateBackwardResult {
     pub const fn protocol_hash(&self) -> TypestateProtocolHash {
         self.protocol_hash
@@ -604,7 +609,11 @@ impl TypestateBackwardResult {
     }
 
     pub fn is_complete(&self) -> bool {
-        self.bindings_complete && self.execution_complete && self.result_complete
+        all_complete(
+            self.bindings_complete,
+            self.execution_complete,
+            self.result_complete,
+        )
     }
 }
 
@@ -651,7 +660,11 @@ impl TypestateSummaryResult {
     }
 
     pub fn is_complete(&self) -> bool {
-        self.bindings_complete && self.execution_complete && self.result_complete
+        all_complete(
+            self.bindings_complete,
+            self.execution_complete,
+            self.result_complete,
+        )
     }
 
     /// Whether this solve is safe to project into a reusable protocol artifact.
@@ -685,6 +698,10 @@ pub struct TypestateFlowProblem<'plan> {
 }
 
 impl<'plan> TypestateFlowProblem<'plan> {
+    fn zero_fact(&self) -> TypestateFact {
+        TypestateFact::zero()
+    }
+
     pub fn try_new(
         protocol: &'plan CompiledProtocol,
         bindings: &'plan TypestateBindingPlan,
@@ -922,55 +939,42 @@ impl<'plan> TypestateFlowProblem<'plan> {
     }
 
     fn bindings_complete(&self, subjects: &BTreeSet<TypestateSubjectId>) -> bool {
-        self.bindings
-            .subjects()
-            .iter()
-            .filter(|binding| subjects.contains(&binding.id()))
-            .all(|binding| binding.quality().is_definitive())
-            && self
-                .bindings
-                .initial_seeds()
-                .iter()
-                .filter(|binding| subjects.contains(&binding.subject()))
-                .all(|binding| binding.quality().is_definitive())
-            && self
-                .bindings
-                .event_bindings()
-                .iter()
-                .filter(|binding| subjects.contains(&binding.subject()))
-                .all(|binding| binding.quality().is_definitive())
-            && self
-                .bindings
-                .terminal_bindings()
-                .iter()
-                .filter(|binding| subjects.contains(&binding.subject()))
-                .all(|binding| binding.quality().is_definitive())
+        self.bindings_have_quality(subjects, |quality| quality.is_definitive())
     }
 
     fn bindings_summary_complete(&self, subjects: &BTreeSet<TypestateSubjectId>) -> bool {
+        self.bindings_have_quality(subjects, |quality| quality.is_complete())
+    }
+
+    fn bindings_have_quality(
+        &self,
+        subjects: &BTreeSet<TypestateSubjectId>,
+        is_quality: impl Fn(&TypestateBindingQuality) -> bool,
+    ) -> bool {
         self.bindings
             .subjects()
             .iter()
-            .filter(|binding| subjects.contains(&binding.id()))
-            .all(|binding| binding.quality().is_complete())
-            && self
-                .bindings
-                .initial_seeds()
-                .iter()
-                .filter(|binding| subjects.contains(&binding.subject()))
-                .all(|binding| binding.quality().is_complete())
-            && self
-                .bindings
-                .event_bindings()
-                .iter()
-                .filter(|binding| subjects.contains(&binding.subject()))
-                .all(|binding| binding.quality().is_complete())
-            && self
-                .bindings
-                .terminal_bindings()
-                .iter()
-                .filter(|binding| subjects.contains(&binding.subject()))
-                .all(|binding| binding.quality().is_complete())
+            .map(|binding| (binding.id(), binding.quality()))
+            .chain(
+                self.bindings
+                    .initial_seeds()
+                    .iter()
+                    .map(|binding| (binding.subject(), binding.quality())),
+            )
+            .chain(
+                self.bindings
+                    .event_bindings()
+                    .iter()
+                    .map(|binding| (binding.subject(), binding.quality())),
+            )
+            .chain(
+                self.bindings
+                    .terminal_bindings()
+                    .iter()
+                    .map(|binding| (binding.subject(), binding.quality())),
+            )
+            .filter(|(subject, _)| subjects.contains(subject))
+            .all(|(_, quality)| is_quality(quality))
     }
 
     fn summary_point_seeds(&self, root: &ProcedureHandle) -> Vec<SummaryPointSeed<TypestateFact>> {
@@ -1416,6 +1420,29 @@ impl<'plan> TypestateFlowProblem<'plan> {
         binding: &BoundTypestateEvent,
         out: &dyn DataflowOutput<TypestateFact>,
     ) -> bool {
+        if let Some(condition) = binding.condition() {
+            match Self::event_condition_matches(binding, condition) {
+                Some(true) => {}
+                Some(false) => return true,
+                None => {
+                    return facts.map_stream(out, |fact, emit| {
+                        if !matches!(fact.0, TypestateFactKind::State { .. })
+                            || fact.subject() != Some(binding.subject())
+                            || fact.abstained()
+                        {
+                            emit(fact)
+                        } else {
+                            self.emit_uncertainty(
+                                fact,
+                                ProtocolUncertaintyCause::IncompleteAnalysis,
+                                &[EligibleEvent::from_binding(binding)],
+                                emit,
+                            )
+                        }
+                    });
+                }
+            }
+        }
         let quality = binding.quality();
         // Subject uncertainty says whether the selected object is really in
         // the policy population; it does not make an authored semantic event
@@ -1501,6 +1528,33 @@ impl<'plan> TypestateFlowProblem<'plan> {
             return false;
         }
         true
+    }
+
+    fn event_condition_matches(
+        binding: &BoundTypestateEvent,
+        condition: TypestateEventCondition,
+    ) -> Option<bool> {
+        let call = binding
+            .site()
+            .call_site_handle()
+            .expect("validated event conditions retain one exact call site");
+        let semantics = call.procedure().semantics();
+        let call_row = semantics
+            .call_site(call.id())
+            .expect("validated event condition call site retains its semantic row");
+        let argument = call_row
+            .arguments
+            .get(condition.argument_index() as usize)
+            .expect("validated event condition retains its selected argument");
+        let source = direct_scalar_source(semantics, argument.value);
+        match source {
+            Some(DirectScalarSource::Boolean(value)) => Some(value == condition.expected()),
+            Some(DirectScalarSource::Port(_))
+            | Some(DirectScalarSource::UnsignedInteger(_))
+            | Some(DirectScalarSource::ConstantString(_))
+            | Some(DirectScalarSource::IntegerOffset { .. })
+            | None => None,
+        }
     }
 
     fn effective_quality_is_definitive(
@@ -1852,7 +1906,7 @@ pub fn solve_typestate_with_summaries<Provider>(
 where
     Provider: IcfgProvider + ?Sized,
 {
-    let mut reusable = NoReusableTypestateSummaries;
+    let mut reusable = NoReusableSummaries;
     solve_typestate_with_reusable_provider(
         root,
         entry_facts,
@@ -1863,20 +1917,6 @@ where
         semantic_budget,
         request,
     )
-}
-
-struct NoReusableTypestateSummaries;
-
-impl ReusableSummaryProvider<TypestateFact> for NoReusableTypestateSummaries {
-    fn summary_for(
-        &mut self,
-        _procedure: &ProcedureHandle,
-        _root: &ProcedureHandle,
-        _entry_fact: TypestateFact,
-        _request: &mut DataflowRequest<'_>,
-    ) -> Result<Option<ReusableProcedureSummary<TypestateFact>>, ReusableSummaryError> {
-        Ok(None)
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2266,18 +2306,15 @@ pub fn solve_typestate_backward_with_snapshot<Provider>(
 where
     Provider: IcfgProvider + ?Sized,
 {
-    let mut semantic_request =
-        crate::analyzer::semantic::SemanticRequest::new(semantic_budget, request.cancellation);
-    let outcome = provider
-        .snapshot(root, limits, &mut semantic_request)
-        .map_err(BackwardSnapshotDataflowError::SemanticProvider)?;
+    let outcome = acquire_backward_snapshot(
+        root,
+        limits,
+        provider,
+        semantic_budget,
+        request.cancellation,
+    )?;
     let snapshot_work = outcome.work();
-    let status = IcfgInputStatus::from_outcome(&outcome);
-    let input = IcfgSolveInput::from_outcome(&outcome).map_err(|_| {
-        TypestateBackwardSolveError::Dataflow(BackwardSnapshotDataflowError::MissingIcfgSnapshot {
-            status,
-        })
-    })?;
+    let input = IcfgSolveInput::try_from(&outcome).expect("the retained snapshot is available");
     solve_typestate_backward_on_snapshot(
         root,
         demands,
@@ -2293,7 +2330,7 @@ impl DistributiveDataflowProblem for TypestateFlowProblem<'_> {
     type Fact = TypestateFact;
 
     fn zero_fact(&self) -> Self::Fact {
-        TypestateFact::zero()
+        self.zero_fact()
     }
 
     fn normal_flow(
@@ -2346,7 +2383,7 @@ impl BackwardDistributiveDataflowProblem for TypestateFlowProblem<'_> {
     type Fact = TypestateFact;
 
     fn zero_fact(&self) -> Self::Fact {
-        TypestateFact::zero()
+        self.zero_fact()
     }
 
     fn normal_predecessor_flow(
@@ -2707,12 +2744,18 @@ fn deferred_boundary(boundary: &crate::analyzer::semantic::DispatchBoundaryKind)
 }
 
 fn point_occurrence(protocol: &CompiledProtocol, event: ProtocolEventId) -> bool {
-    matches!(
+    point_occurrence_kind(
         protocol
             .event(event)
             .expect("binding-plan events retain valid protocol IDs")
             .observation()
             .occurrence,
+    )
+}
+
+fn point_occurrence_kind(occurrence: ProtocolEventOccurrence) -> bool {
+    matches!(
+        occurrence,
         ProtocolEventOccurrence::Allocation
             | ProtocolEventOccurrence::Endpoint {
                 phase: ProtocolObservationPhase::AtMatch
@@ -2745,6 +2788,10 @@ fn call_occurrence(protocol: &CompiledProtocol, event: ProtocolEventId, stage: C
         .expect("binding-plan events retain valid protocol IDs")
         .observation()
         .occurrence;
+    call_occurrence_kind(*occurrence, stage)
+}
+
+fn call_occurrence_kind(occurrence: ProtocolEventOccurrence, stage: CallStage) -> bool {
     matches!(
         (occurrence, stage),
         (
@@ -2776,21 +2823,12 @@ fn terminal_point_occurrence(
     let terminal = protocol
         .terminal_expectation(binding.expectation())
         .expect("binding-plan expectations retain valid protocol IDs");
-    matches!(
-        terminal.on(),
-        ProtocolTerminalObservationSpec::Event { observation }
-            if matches!(
-                observation.occurrence,
-                ProtocolEventOccurrence::Allocation
-                    | ProtocolEventOccurrence::Endpoint {
-                        phase: ProtocolObservationPhase::AtMatch
-                    }
-                    | ProtocolEventOccurrence::FieldRead
-                    | ProtocolEventOccurrence::FieldWrite
-                    | ProtocolEventOccurrence::Escape
-                    | ProtocolEventOccurrence::SuspensionBoundary
-            )
-    )
+    match terminal.on() {
+        ProtocolTerminalObservationSpec::AnalysisRootExit { .. } => false,
+        ProtocolTerminalObservationSpec::Event { observation } => {
+            point_occurrence_kind(observation.occurrence)
+        }
+    }
 }
 
 fn terminal_exit_point_occurrence(
@@ -2822,28 +2860,9 @@ fn terminal_call_occurrence(
         .expect("binding-plan expectations retain valid protocol IDs");
     match terminal.on() {
         ProtocolTerminalObservationSpec::AnalysisRootExit { .. } => false,
-        ProtocolTerminalObservationSpec::Event { observation } => matches!(
-            (&observation.occurrence, stage),
-            (
-                ProtocolEventOccurrence::Endpoint {
-                    phase: ProtocolObservationPhase::BeforeCall
-                },
-                CallStage::BeforeCall
-            ) | (
-                ProtocolEventOccurrence::Endpoint {
-                    phase: ProtocolObservationPhase::AfterNormalReturn
-                },
-                CallStage::AfterNormalReturn
-            ) | (
-                ProtocolEventOccurrence::Endpoint {
-                    phase: ProtocolObservationPhase::AfterExceptionalReturn
-                },
-                CallStage::AfterExceptionalReturn
-            ) | (
-                ProtocolEventOccurrence::ActualToFormal,
-                CallStage::ActualToFormal
-            ) | (ProtocolEventOccurrence::ReturnFlow, CallStage::ReturnFlow)
-        ),
+        ProtocolTerminalObservationSpec::Event { observation } => {
+            call_occurrence_kind(observation.occurrence, stage)
+        }
     }
 }
 
@@ -2851,13 +2870,17 @@ fn point_has_exit_kind(
     point: &crate::analyzer::semantic::ProgramPointHandle,
     kind: super::ProtocolProcedureExitKind,
 ) -> bool {
-    let semantics = point.procedure().semantics();
-    match kind {
-        super::ProtocolProcedureExitKind::Normal => point.id() == semantics.normal_exit_point(),
-        super::ProtocolProcedureExitKind::Exceptional => {
-            point.id() == semantics.exceptional_exit_point()
-        }
-    }
+    crate::dataflow::is_procedure_exit_kind(
+        point,
+        match kind {
+            super::ProtocolProcedureExitKind::Normal => {
+                crate::analyzer::semantic::ReturnTransferKind::Normal
+            }
+            super::ProtocolProcedureExitKind::Exceptional => {
+                crate::analyzer::semantic::ReturnTransferKind::Exceptional
+            }
+        },
+    )
 }
 
 fn is_root_context(site: &super::TypestateObservationSite) -> bool {
@@ -2875,46 +2898,44 @@ const fn uncertainty_kind(cause: ProtocolUncertaintyCause) -> TypestateUncertain
 }
 
 #[cfg(test)]
-mod tests {
-    use std::cell::Cell;
+use std::cell::Cell;
 
-    use super::*;
+#[cfg(test)]
+struct PollingOutput {
+    polls: Cell<usize>,
+}
 
-    struct PollingOutput {
-        polls: Cell<usize>,
+#[cfg(test)]
+impl DataflowOutput<TypestateFact> for PollingOutput {
+    fn should_continue(&self) -> bool {
+        let polls = self.polls.get().saturating_add(1);
+        self.polls.set(polls);
+        polls <= 2
     }
 
-    impl DataflowOutput<TypestateFact> for PollingOutput {
-        fn should_continue(&self) -> bool {
-            let polls = self.polls.get().saturating_add(1);
-            self.polls.set(polls);
-            polls <= 2
-        }
-
-        fn emit(&mut self, _value: TypestateFact) -> bool {
-            true
-        }
+    fn emit(&mut self, _value: TypestateFact) -> bool {
+        true
     }
+}
 
-    #[test]
-    fn streamed_mapper_stops_generation_during_expansion() {
-        let mut facts = TransferFactSet::new(vec![TypestateFact::zero()]);
-        let output = PollingOutput {
-            polls: Cell::new(0),
-        };
-        let generated = Cell::new(0usize);
+#[test]
+fn streamed_mapper_stops_generation_during_expansion() {
+    let mut facts = TransferFactSet::new(vec![TypestateFact::zero()]);
+    let output = PollingOutput {
+        polls: Cell::new(0),
+    };
+    let generated = Cell::new(0usize);
 
-        let completed = facts.map_stream(&output, |_fact, emit| {
-            for _ in 0..1_000_000 {
-                generated.set(generated.get().saturating_add(1));
-                if !emit(TypestateFact::zero()) {
-                    return false;
-                }
+    let completed = facts.map_stream(&output, |_fact, emit| {
+        for _ in 0..1_000_000 {
+            generated.set(generated.get().saturating_add(1));
+            if !emit(TypestateFact::zero()) {
+                return false;
             }
-            true
-        });
+        }
+        true
+    });
 
-        assert!(!completed);
-        assert_eq!(generated.get(), 512);
-    }
+    assert!(!completed);
+    assert_eq!(generated.get(), 512);
 }

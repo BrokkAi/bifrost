@@ -3,9 +3,9 @@ title: Java
 description: Query Java member calls, constructors, annotations, exceptions, and control flow with query_code.
 ---
 
-> Last verified end to end: 2026-09-16 (`query_code` schema version 1).
+> Last verified end to end: 2026-10-01 (`query_code` schema version 1).
 
-For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](../reference-traversal/).
+For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](/code-query-tutorials/reference-traversal/).
 
 Java normalizes methods, constructors, annotations, object creation, member calls, imports, assignments, exceptions, and control flow. The fixture includes two `post` receivers so receiver filtering proves a real exclusion.
 
@@ -173,8 +173,8 @@ Java receiver traversal uses shared semantic value and heap evidence together wi
         "start_line": 25
       },
       "result_type": "receiver_analysis",
-      "site_ast_id": "1e9039cd74fe438f7d1786fd58c0eb27623f441b03d53daefa2c12745dc1adff",
-      "site_id": "092f93072ecc0fa7907f049ba694926e3a98b4520a050f854ae369350878c71c",
+      "site_ast_id": "<public-id>",
+      "site_id": "<public-id>",
       "text": "client",
       "values": [
         {

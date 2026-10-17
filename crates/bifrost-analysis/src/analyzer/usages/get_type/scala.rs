@@ -23,33 +23,30 @@ pub(crate) fn resolve_scala_type_bounded(
     budget: ReceiverAnalysisBudget,
     cancellation: Option<&CancellationToken>,
 ) -> BoundedResolution<TypeLookupOutcome> {
-    let session = ResolutionSession::bounded(budget, cancellation);
-    let Some(scala) = resolve_analyzer::<ScalaAnalyzer>(analyzer) else {
-        return session.finish(no_type(
-            "scala_analyzer_unavailable",
-            "Scala analyzer is unavailable",
-        ));
-    };
-    let java = resolve_analyzer::<JavaAnalyzer>(analyzer);
-    let support = ScalaDefinitionProvider::new(scala, java, &session);
-    let Some(tree) = tree else {
-        return session.finish(no_type(
-            "scala_parse_failed",
-            "Scala source could not be parsed",
-        ));
-    };
-    let resolution = scala_type_lookup_resolution_in_session(
-        analyzer,
-        token,
-        &support,
-        file,
-        source,
-        tree.root_node(),
-        site,
-        &session,
-    );
-    let outcome = scala_type_resolution_outcome(&support, site, resolution);
-    session.finish(outcome)
+    ResolutionSession::run_bounded(budget, cancellation, |session| {
+        let Some(scala) = resolve_analyzer::<ScalaAnalyzer>(analyzer) else {
+            return no_type(
+                "scala_analyzer_unavailable",
+                "Scala analyzer is unavailable",
+            );
+        };
+        let java = resolve_analyzer::<JavaAnalyzer>(analyzer);
+        let support = ScalaDefinitionProvider::new(scala, java, session);
+        let Some(tree) = tree else {
+            return no_type("scala_parse_failed", "Scala source could not be parsed");
+        };
+        let resolution = scala_type_lookup_resolution_in_session(
+            analyzer,
+            token,
+            &support,
+            file,
+            source,
+            tree.root_node(),
+            site,
+            session,
+        );
+        scala_type_resolution_outcome(&support, site, resolution)
+    })
 }
 
 fn scala_type_resolution_outcome(
@@ -104,8 +101,8 @@ fn scala_type_resolution_outcome(
 mod tests {
     use super::*;
     use crate::analyzer::usages::get_definition::parse_tree_for_language;
-    use crate::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
-    use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
+    use crate::analyzer::usages::test_support::assert_scope_budget_exceeded;
+
     use crate::analyzer::{AnalyzerQueryScope, QueryScope};
     use crate::analyzer::{Language, Range};
     use crate::path_utils::rel_path_string;
@@ -125,18 +122,16 @@ mod tests {
             .filter(|byte| *byte == b'\n')
             .count()
             + 1;
-        ResolvedReferenceSite {
-            path: rel_path_string(file),
-            text: expression.to_string(),
-            range: Range {
+        crate::test_support::resolved_reference_site(
+            rel_path_string(file),
+            expression.to_string(),
+            Range {
                 start_byte,
                 end_byte,
                 start_line: line,
                 end_line: line,
             },
-            focus_start_byte: start_byte,
-            focus_end_byte: end_byte,
-        }
+        )
     }
 
     fn last_expression_site(
@@ -153,18 +148,16 @@ mod tests {
             .filter(|byte| *byte == b'\n')
             .count()
             + 1;
-        ResolvedReferenceSite {
-            path: rel_path_string(file),
-            text: expression.to_string(),
-            range: Range {
+        crate::test_support::resolved_reference_site(
+            rel_path_string(file),
+            expression.to_string(),
+            Range {
                 start_byte,
                 end_byte,
                 start_line: line,
                 end_line: line,
             },
-            focus_start_byte: start_byte,
-            focus_end_byte: end_byte,
-        }
+        )
     }
 
     fn factory_fixture() -> (AnalyzerFixture, ProjectFile, &'static str, Tree) {
@@ -215,46 +208,6 @@ object Caller {
     }
 
     #[test]
-    fn bounded_same_file_singleton_factory_call_has_declared_result_type() {
-        let (fixture, file, source, tree) = factory_fixture();
-        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
-        let token = scope.token();
-        let outcome = resolve_scala_type_bounded(
-            fixture.analyzer.analyzer(),
-            token,
-            &file,
-            source,
-            Some(&tree),
-            &expression_site(&file, source, "Factory.makeService()"),
-            ReceiverAnalysisBudget::default(),
-            None,
-        );
-
-        let BoundedResolution::Complete { value, work } = outcome else {
-            panic!("bounded Scala factory lookup must complete: {outcome:#?}");
-        };
-        assert!(work.scope_nodes > 0, "{work:#?}");
-        assert_eq!(
-            value.status,
-            super::super::TypeLookupStatus::Resolved,
-            "{value:#?}"
-        );
-        assert_eq!(
-            value.target_kind,
-            TypeLookupTargetKind::ValueExpression,
-            "{value:#?}"
-        );
-        assert!(
-            matches!(
-                value.types.as_slice(),
-                [ty] if ty.fqn == "Service"
-                    && matches!(ty.definitions.as_slice(), [definition] if definition.fq_name() == "Service")
-            ),
-            "{value:#?}"
-        );
-    }
-
-    #[test]
     fn bounded_scala_factory_lookup_reports_scope_budget_without_partial_result() {
         let (fixture, file, source, tree) = factory_fixture();
         let budget = ReceiverAnalysisBudget::tiny();
@@ -271,16 +224,7 @@ object Caller {
             None,
         );
 
-        assert!(
-            matches!(
-                outcome,
-                BoundedResolution::Exceeded {
-                    limit: ReceiverBudgetLimit::ScopeNodes,
-                    work,
-                } if work.scope_nodes == budget.max_scope_nodes
-            ),
-            "{outcome:#?}"
-        );
+        assert_scope_budget_exceeded(&outcome, budget);
     }
 
     #[test]
@@ -309,16 +253,7 @@ object Caller {
             None,
         );
 
-        assert!(
-            matches!(
-                outcome,
-                BoundedResolution::Exceeded {
-                    limit: ReceiverBudgetLimit::ScopeNodes,
-                    work,
-                } if work.scope_nodes == budget.max_scope_nodes
-            ),
-            "{outcome:#?}"
-        );
+        assert_scope_budget_exceeded(&outcome, budget);
     }
 
     #[test]

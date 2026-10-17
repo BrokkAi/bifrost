@@ -12,10 +12,10 @@ use brokk_bifrost_analysis::schema_version::{SchemaVersionOrigin, SchemaVersionR
 use super::baseline::PolicyBaselineReview;
 use super::budget::PolicyBatchBudget;
 use super::definition::{
-    CategoryPredicate, DirectoryScope, EndpointRole, EndpointTaintSemantics, MatchSetManifestHash,
-    PolicyAnalysisType, PolicyEndpointBinding, PolicyId, PolicyLevel, PolicyMessageSpec,
-    PolicySelectorPath, PolicySeveritySpec, TaintCatalogHash, TaintSourceEvidence,
-    TaintSystemEntry, TaintTrustBoundary,
+    CategoryPredicate, EndpointRole, EndpointTaintSemantics, MatchSetManifestHash,
+    PolicyAnalysisType, PolicyEndpointBinding, PolicyId, PolicyMessageSpec, PolicySelectorPath,
+    PolicySeveritySpec, TaintCatalogHash, TaintSourceEvidence, TaintSystemEntry,
+    TaintTrustBoundary,
 };
 use super::finding::{
     CompletionReasonError, PolicyDiagnostic, PolicyDiagnosticSeverity, PolicyFinding,
@@ -35,7 +35,10 @@ use super::resolved::{
     ResolvedEndpointManifestEntry, ResolvedEndpointModel, ResolvedEndpointSelectorSchemas,
     ResolvedEndpointSetDependency, ResolvedMatchDirectoryManifest, ResolvedPrecedenceEdge,
 };
-use super::retained::{RetainedSize, retained_extra, retained_vec_size_from_parts};
+use super::retained::{
+    RetainedSize, retained_extra, retained_size_with_extra, retained_size_with_extras,
+    retained_size_with_field_extra, retained_vec_size_from_parts,
+};
 use super::scope::{PolicyScopeReview, compare_scope_reviews};
 use super::source::{PolicySourceIdentity, PolicySourceRelatedDiagnostic};
 use super::suppression::{PolicyReportEvaluationContext, PolicySuppressionReview};
@@ -70,7 +73,7 @@ impl SelectorSchemaVersionResolution {
 
 impl RetainedSize for SelectorSchemaVersionResolution {
     fn retained_size(&self) -> usize {
-        size_of::<Self>().saturating_add(retained_extra(&self.path))
+        retained_size_with_field_extra(self, &self.path)
     }
 }
 
@@ -106,25 +109,25 @@ impl PolicyRuleDescriptor {
             })
             .collect::<Vec<_>>();
         selector_schemas.sort_by(|left, right| left.path.cmp(&right.path));
-        tighten_vec(&mut selector_schemas);
+        super::finding::tighten_vec(&mut selector_schemas);
 
         let mut endpoint_dependencies = policy.endpoint_dependencies().to_vec();
         endpoint_dependencies.sort_by(|left, right| left.identity().cmp(right.identity()));
-        tighten_vec(&mut endpoint_dependencies);
+        super::finding::tighten_vec(&mut endpoint_dependencies);
 
         let mut match_directory_manifests = policy.match_directory_manifests().to_vec();
         match_directory_manifests.sort_by(|left, right| left.path().cmp(right.path()));
-        tighten_vec(&mut match_directory_manifests);
+        super::finding::tighten_vec(&mut match_directory_manifests);
 
         let mut endpoint_set_dependencies = policy.endpoint_set_dependencies().to_vec();
         endpoint_set_dependencies.sort_by(|left, right| left.source().cmp(right.source()));
-        tighten_vec(&mut endpoint_set_dependencies);
+        super::finding::tighten_vec(&mut endpoint_set_dependencies);
 
         let mut tags = metadata.tags.clone();
         tags.sort();
         tags.dedup();
         let mut tags = tags.into_iter().map(tight_string).collect::<Vec<_>>();
-        tighten_vec(&mut tags);
+        super::finding::tighten_vec(&mut tags);
 
         Self {
             policy_id: metadata.id.clone(),
@@ -329,7 +332,7 @@ impl Serialize for PolicySeverityWire<'_> {
             PolicySeveritySpec::Fixed { level } => {
                 let mut state = serializer.serialize_struct("PolicySeveritySpec", 2)?;
                 state.serialize_field("type", "fixed")?;
-                state.serialize_field("level", policy_level_label(*level))?;
+                state.serialize_field("level", (*level).label())?;
                 state.end()
             }
             PolicySeveritySpec::Unrated => {
@@ -347,14 +350,6 @@ impl Serialize for PolicySeverityWire<'_> {
     }
 }
 
-const fn policy_level_label(level: PolicyLevel) -> &'static str {
-    match level {
-        PolicyLevel::Note => "note",
-        PolicyLevel::Warning => "warning",
-        PolicyLevel::Error => "error",
-    }
-}
-
 struct EndpointDependenciesWire<'a>(&'a [ResolvedEndpointDependency]);
 
 impl Serialize for EndpointDependenciesWire<'_> {
@@ -362,11 +357,11 @@ impl Serialize for EndpointDependenciesWire<'_> {
     where
         S: Serializer,
     {
-        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
-        for dependency in self.0 {
-            sequence.serialize_element(&EndpointDependencyWire(dependency))?;
-        }
-        sequence.end()
+        serialize_sequence(
+            serializer,
+            self.0.len(),
+            self.0.iter().map(EndpointDependencyWire),
+        )
     }
 }
 
@@ -485,20 +480,13 @@ impl Serialize for EndpointModelWire<'_> {
         S: Serializer,
     {
         let mut state = serializer.serialize_struct("ResolvedEndpointModel", 6)?;
-        state.serialize_field("role", endpoint_role_label(self.0.role))?;
+        state.serialize_field("role", (self.0.role).label())?;
         state.serialize_field("display_name", &self.0.display_name)?;
         state.serialize_field("categories", &IdentifierSlice(&self.0.categories))?;
         state.serialize_field("binding", &EndpointBindingWire(&self.0.binding))?;
         state.serialize_field("taint", &self.0.taint.as_ref().map(EndpointTaintWire))?;
         state.serialize_field("supersedes", &EndpointIdentitiesWire(&self.0.supersedes))?;
         state.end()
-    }
-}
-
-const fn endpoint_role_label(role: EndpointRole) -> &'static str {
-    match role {
-        EndpointRole::Source => "source",
-        EndpointRole::Sink => "sink",
     }
 }
 
@@ -552,10 +540,15 @@ impl Serialize for EndpointTaintWire<'_> {
         S: Serializer,
     {
         match self.0 {
-            EndpointTaintSemantics::Source { labels, evidence } => {
-                let mut state = serializer.serialize_struct("EndpointTaintSemantics", 3)?;
+            EndpointTaintSemantics::Source {
+                labels,
+                threat_model,
+                evidence,
+            } => {
+                let mut state = serializer.serialize_struct("EndpointTaintSemantics", 4)?;
                 state.serialize_field("type", "source")?;
                 state.serialize_field("labels", &IdentifierSlice(labels))?;
+                state.serialize_field("threat_model", &threat_model.map(|model| model.label()))?;
                 state
                     .serialize_field("evidence", &evidence.as_ref().map(TaintSourceEvidenceWire))?;
                 state.end()
@@ -586,28 +579,13 @@ impl Serialize for TaintSourceEvidenceWire<'_> {
         let mut state = serializer.serialize_struct("TaintSourceEvidence", 2)?;
         state.serialize_field(
             "trust_boundary",
-            &self.0.trust_boundary.map(trust_boundary_label),
+            &self.0.trust_boundary.map(TaintTrustBoundary::label),
         )?;
-        state.serialize_field("system_entry", &self.0.system_entry.map(system_entry_label))?;
+        state.serialize_field(
+            "system_entry",
+            &self.0.system_entry.map(TaintSystemEntry::label),
+        )?;
         state.end()
-    }
-}
-
-const fn trust_boundary_label(value: TaintTrustBoundary) -> &'static str {
-    match value {
-        TaintTrustBoundary::External => "external",
-        TaintTrustBoundary::Internal => "internal",
-        TaintTrustBoundary::SameTrustZone => "same_trust_zone",
-    }
-}
-
-const fn system_entry_label(value: TaintSystemEntry) -> &'static str {
-    match value {
-        TaintSystemEntry::VulnerableSystemNetworkStack => "vulnerable_system_network_stack",
-        TaintSystemEntry::DownloadedArtifact => "downloaded_artifact",
-        TaintSystemEntry::LocalInput => "local_input",
-        TaintSystemEntry::AdjacentNetwork => "adjacent_network",
-        TaintSystemEntry::Physical => "physical",
     }
 }
 
@@ -618,11 +596,11 @@ impl Serialize for EndpointOriginsWire<'_> {
     where
         S: Serializer,
     {
-        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
-        for origin in self.0 {
-            sequence.serialize_element(&EndpointOriginWire(origin))?;
-        }
-        sequence.end()
+        serialize_sequence(
+            serializer,
+            self.0.len(),
+            self.0.iter().map(EndpointOriginWire),
+        )
     }
 }
 
@@ -680,11 +658,11 @@ impl Serialize for EndpointSetDependenciesWire<'_> {
     where
         S: Serializer,
     {
-        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
-        for dependency in self.0 {
-            sequence.serialize_element(&EndpointSetDependencyWire(dependency))?;
-        }
-        sequence.end()
+        serialize_sequence(
+            serializer,
+            self.0.len(),
+            self.0.iter().map(EndpointSetDependencyWire),
+        )
     }
 }
 
@@ -710,11 +688,11 @@ impl Serialize for DependencyPathsWire<'_> {
     where
         S: Serializer,
     {
-        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
-        for path in self.0 {
-            sequence.serialize_element(path.as_str())?;
-        }
-        sequence.end()
+        serialize_sequence(
+            serializer,
+            self.0.len(),
+            self.0.iter().map(|path| path.as_str()),
+        )
     }
 }
 
@@ -723,11 +701,11 @@ impl Serialize for MatchDirectoryManifestsWire<'_> {
     where
         S: Serializer,
     {
-        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
-        for manifest in self.0 {
-            sequence.serialize_element(&MatchDirectoryManifestWire(manifest))?;
-        }
-        sequence.end()
+        serialize_sequence(
+            serializer,
+            self.0.len(),
+            self.0.iter().map(MatchDirectoryManifestWire),
+        )
     }
 }
 
@@ -741,19 +719,12 @@ impl Serialize for MatchDirectoryManifestWire<'_> {
         let mut state = serializer.serialize_struct("ResolvedMatchDirectoryManifest", 7)?;
         state.serialize_field("path", self.0.path().as_str())?;
         state.serialize_field("directory", self.0.directory().as_str())?;
-        state.serialize_field("scope", directory_scope_label(self.0.scope()))?;
-        state.serialize_field("role", &self.0.role().map(endpoint_role_label))?;
+        state.serialize_field("scope", self.0.scope().label())?;
+        state.serialize_field("role", &self.0.role().map(EndpointRole::label))?;
         state.serialize_field("categories", &CategoryPredicateWire(self.0.categories()))?;
         state.serialize_field("selected", &ManifestEntriesWire(self.0.selected()))?;
         state.serialize_field("semantic_hash", &DisplayWire(self.0.semantic_hash()))?;
         state.end()
-    }
-}
-
-const fn directory_scope_label(scope: DirectoryScope) -> &'static str {
-    match scope {
-        DirectoryScope::Direct => "direct",
-        DirectoryScope::Recursive => "recursive",
     }
 }
 
@@ -788,11 +759,11 @@ impl Serialize for ManifestEntriesWire<'_> {
     where
         S: Serializer,
     {
-        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
-        for entry in self.0 {
-            sequence.serialize_element(&ManifestEntryWire(entry))?;
-        }
-        sequence.end()
+        serialize_sequence(
+            serializer,
+            self.0.len(),
+            self.0.iter().map(ManifestEntryWire),
+        )
     }
 }
 
@@ -843,11 +814,11 @@ impl Serialize for PrecedenceEdgesWire<'_> {
     where
         S: Serializer,
     {
-        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
-        for edge in self.0 {
-            sequence.serialize_element(&PrecedenceEdgeWire(edge))?;
-        }
-        sequence.end()
+        serialize_sequence(
+            serializer,
+            self.0.len(),
+            self.0.iter().map(PrecedenceEdgeWire),
+        )
     }
 }
 
@@ -903,11 +874,12 @@ fn precedence_endpoint<S>(
 where
     S: Serializer,
 {
-    let mut state = serializer.serialize_struct("ResolvedPrecedenceEdge", 3)?;
-    state.serialize_field("type", kind)?;
-    state.serialize_field("dominant", &EndpointIdentityWire(dominant))?;
-    state.serialize_field("dominated", &EndpointIdentityWire(dominated))?;
-    state.end()
+    serialize_precedence_edge(
+        serializer,
+        kind,
+        &EndpointIdentityWire(dominant),
+        &EndpointIdentityWire(dominated),
+    )
 }
 
 fn precedence_ids<S>(
@@ -918,6 +890,20 @@ fn precedence_ids<S>(
 ) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
+{
+    serialize_precedence_edge(serializer, kind, dominant, dominated)
+}
+
+fn serialize_precedence_edge<S, D, O>(
+    serializer: S,
+    kind: &'static str,
+    dominant: &D,
+    dominated: &O,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+    D: Serialize + ?Sized,
+    O: Serialize + ?Sized,
 {
     let mut state = serializer.serialize_struct("ResolvedPrecedenceEdge", 3)?;
     state.serialize_field("type", kind)?;
@@ -933,11 +919,11 @@ impl Serialize for EndpointIdentitiesWire<'_> {
     where
         S: Serializer,
     {
-        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
-        for identity in self.0 {
-            sequence.serialize_element(&EndpointIdentityWire(identity))?;
-        }
-        sequence.end()
+        serialize_sequence(
+            serializer,
+            self.0.len(),
+            self.0.iter().map(EndpointIdentityWire),
+        )
     }
 }
 
@@ -948,12 +934,25 @@ impl<T: AsRef<str>> Serialize for IdentifierSlice<'_, T> {
     where
         S: Serializer,
     {
-        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
-        for value in self.0 {
-            sequence.serialize_element(value.as_ref())?;
-        }
-        sequence.end()
+        serialize_sequence(
+            serializer,
+            self.0.len(),
+            self.0.iter().map(|value| value.as_ref()),
+        )
     }
+}
+
+fn serialize_sequence<S, I>(serializer: S, len: usize, values: I) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+    I: IntoIterator,
+    I::Item: Serialize,
+{
+    let mut sequence = serializer.serialize_seq(Some(len))?;
+    for value in values {
+        sequence.serialize_element(&value)?;
+    }
+    sequence.end()
 }
 
 struct DisplayWire<T>(T);
@@ -1058,7 +1057,7 @@ impl PolicyReportDiagnostic {
                 ))
         });
         related.dedup();
-        tighten_vec(&mut related);
+        super::finding::tighten_vec(&mut related);
         Ok(Self {
             code,
             severity,
@@ -1118,19 +1117,13 @@ pub enum PolicyReportDiagnosticCode {
     PolicyLoadFailed,
     PolicyParseFailed,
     PolicyValidationFailed,
-    EndpointParseFailed,
-    EndpointValidationFailed,
     NotExecutableEndpoint,
     DuplicatePolicyId,
     DuplicateEndpointId,
     PolicyCountLimit,
     EndpointCountLimit,
     MatchDirectoryLimit,
-    MatchDirectoryChangedDuringLoad,
     MatchDirectoryManifestMismatch,
-    NonEndpointInMatchDirectory,
-    EndpointMissingOrMismatchedTaintSemantics,
-    AmbiguousCombinationPrecedence,
     UnsupportedPolicySchemaVersion,
     UnsupportedRqlSchemaVersion,
     ConflictingRqlSchemaVersion,
@@ -1259,30 +1252,19 @@ fn validate_and_tighten_text(
             max_bytes: MAX_REPORT_TEXT_BYTES,
         });
     }
-    if value.chars().any(is_unsafe_text_character) {
+    if value
+        .chars()
+        .any(crate::render::should_escape_text_character)
+    {
         return Err(PolicyReportValueError::UnsafeText { field });
     }
     Ok(tight_string(value))
 }
 
-fn is_unsafe_text_character(character: char) -> bool {
-    character.is_control()
-        || matches!(
-            character,
-            '\u{061c}'
-                | '\u{200e}'
-                | '\u{200f}'
-                | '\u{202a}'..='\u{202e}'
-                | '\u{2066}'..='\u{2069}'
-        )
-}
-
 fn tight_string(value: String) -> String {
-    value.into_boxed_str().into_string()
-}
-
-fn tighten_vec<T>(values: &mut Vec<T>) {
-    *values = std::mem::take(values).into_boxed_slice().into_vec();
+    let mut value = value;
+    super::finding::tighten_string(&mut value);
+    value
 }
 
 // Retained-size implementations for the exact loaded-policy structures that
@@ -1607,9 +1589,9 @@ impl PolicyExecutionMetadata {
             return Err(PolicyExecutionMetadataError::OverlappingPolicyProgress);
         }
 
-        tighten_vec(&mut stage_timings);
-        tighten_vec(&mut completed_policy_ids);
-        tighten_vec(&mut pending_policy_ids);
+        super::finding::tighten_vec(&mut stage_timings);
+        super::finding::tighten_vec(&mut completed_policy_ids);
+        super::finding::tighten_vec(&mut pending_policy_ids);
         Ok(Self {
             total_elapsed_ms,
             stage_timings,
@@ -1736,7 +1718,7 @@ impl PolicyDiffFixedFinding {
 
 impl RetainedSize for PolicyDiffFixedFinding {
     fn retained_size(&self) -> usize {
-        size_of::<Self>().saturating_add(retained_extra(&self.policy_id))
+        retained_size_with_extra(self, retained_extra(&self.policy_id))
     }
 }
 
@@ -1764,7 +1746,7 @@ impl PolicyDiffUnqualifiedPolicy {
     ) -> Self {
         diagnostics.sort_unstable();
         diagnostics.dedup();
-        tighten_vec(&mut diagnostics);
+        super::finding::tighten_vec(&mut diagnostics);
         let mut completion = completion.into();
         let mut completion_detail = completion_detail.into();
         completion = tight_string(completion);
@@ -1860,7 +1842,7 @@ impl PolicyDiffReview {
                 <= (right.policy_id.as_str(), right.finding_id)),
             "diff review fixed findings arrive sorted by (policy_id, finding_id), got {fixed:?}"
         );
-        tighten_vec(&mut fixed);
+        super::finding::tighten_vec(&mut fixed);
         let fixed_truncated =
             counts.fixed > u64::try_from(fixed.len()).expect("bounded list length fits u64");
         Self {
@@ -2024,9 +2006,7 @@ impl PolicyPackProcedureSummaryEvidence {
 
 impl RetainedSize for PolicyPackProcedureSummaryEvidence {
     fn retained_size(&self) -> usize {
-        size_of::<Self>()
-            .saturating_add(self.summary_id.capacity())
-            .saturating_add(self.symbol.capacity())
+        retained_size_with_extras(self, [self.summary_id.capacity(), self.symbol.capacity()])
     }
 }
 
@@ -2067,7 +2047,7 @@ impl PolicyPackDecision {
         self.summary_matches_truncated =
             summary_matches.len() > MAX_PACK_PROCEDURE_SUMMARY_EVIDENCE;
         summary_matches.truncate(MAX_PACK_PROCEDURE_SUMMARY_EVIDENCE);
-        tighten_vec(&mut summary_matches);
+        super::finding::tighten_vec(&mut summary_matches);
         self.summary_matches = summary_matches;
         self
     }
@@ -2129,7 +2109,7 @@ impl PolicyPackActivationReview {
         decisions.dedup();
         let decisions_truncated = decisions.len() > MAX_PACK_ACTIVATION_DECISIONS;
         decisions.truncate(MAX_PACK_ACTIVATION_DECISIONS);
-        tighten_vec(&mut decisions);
+        super::finding::tighten_vec(&mut decisions);
         Self {
             document_path,
             dependency_mode,
@@ -2183,8 +2163,9 @@ impl RetainedSize for PolicyPackActivationReview {
 
 /// The optional top-level reviews a report attaches when the matching input
 /// (a diff base, workspace pack configuration, or a baseline document) is
-/// present. Each review stays additive: a report without any of them keeps
-/// its exact schema-version-5 shape (#1880, #1868, #1881, #2493).
+/// present. Each review is emitted only when its corresponding input is
+/// present; otherwise the report omits these optional fields (#1880, #1868,
+/// #1881, #2493).
 ///
 /// Folding the three into one collection gives them a single retained-size
 /// accounting site (the `RetainedSize` impl below) instead of a bespoke
@@ -2237,6 +2218,22 @@ impl RetainedSize for PolicyOptionalReviews {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
+fn default_test_evaluation_context() -> PolicyReportEvaluationContext {
+    let options = super::coordinator::PolicyEvaluationOptions::new(
+        super::suppression::PolicyEvaluationDate::from_ymd(2026, 7, 27)
+            .expect("fixed test date is valid"),
+    );
+    PolicyReportEvaluationContext::new(
+        options.evaluation_date(),
+        options
+            .suppressions()
+            .source_states(super::suppression::PolicySuppressionDocumentState::NotFound),
+        options.scope(),
+        super::scope::PolicyScopeDocumentState::NotFound,
+    )
+}
+
 /// The sole canonical input to every policy-report renderer.
 #[derive(Debug, Clone)]
 pub struct PolicyReportDocument {
@@ -2255,7 +2252,7 @@ pub struct PolicyReportDocument {
 }
 
 impl PolicyReportDocument {
-    pub const SCHEMA_VERSION: u32 = 5;
+    pub const SCHEMA_VERSION: u32 = 6;
 
     #[cfg(test)]
     pub(crate) fn try_new(
@@ -2266,19 +2263,8 @@ impl PolicyReportDocument {
         omitted_diagnostics_lower_bound: u64,
         worst_omitted_diagnostic_severity: Option<PolicyDiagnosticSeverity>,
     ) -> Result<Self, PolicyReportDocumentError> {
-        let options = super::coordinator::PolicyEvaluationOptions::new(
-            super::suppression::PolicyEvaluationDate::from_ymd(2026, 7, 27)
-                .expect("fixed test date is valid"),
-        );
         Self::try_new_with_suppression_audit(
-            PolicyReportEvaluationContext::new(
-                options.evaluation_date(),
-                options
-                    .suppressions()
-                    .source_states(super::suppression::PolicySuppressionDocumentState::NotFound),
-                options.scope(),
-                super::scope::PolicyScopeDocumentState::NotFound,
-            ),
+            default_test_evaluation_context(),
             rules,
             runs,
             Vec::new(),
@@ -2341,11 +2327,11 @@ impl PolicyReportDocument {
         suppressions.sort_by(compare_suppression_reviews);
         scope.sort_by(compare_scope_reviews);
         diagnostics.sort_by(compare_report_diagnostics);
-        tighten_vec(&mut rules);
-        tighten_vec(&mut runs);
-        tighten_vec(&mut suppressions);
-        tighten_vec(&mut scope);
-        tighten_vec(&mut diagnostics);
+        super::finding::tighten_vec(&mut rules);
+        super::finding::tighten_vec(&mut runs);
+        super::finding::tighten_vec(&mut suppressions);
+        super::finding::tighten_vec(&mut scope);
+        super::finding::tighten_vec(&mut diagnostics);
         validate_rule_run_joins(&rules, &runs)?;
         validate_suppression_joins(&runs, &suppressions)?;
         validate_scope_joins(&runs, &scope)?;
@@ -2408,8 +2394,8 @@ impl PolicyReportDocument {
     /// anything at all.
     ///
     /// Additive, like the other reviews: a run without a diff base or with
-    /// `--no-incremental` keeps its exact schema-version-5 shape. Nothing here
-    /// is a statement about the workspace -- it is a measurement of the run,
+    /// `--no-incremental` omits this optional field. Nothing here is a
+    /// statement about the workspace -- it is a measurement of the run,
     /// which is why it is not a diagnostic, not a work metric, and not part of
     /// what two runs of the same workspace must agree on.
     pub const fn incremental(&self) -> Option<&PolicyIncrementalReview> {
@@ -2446,9 +2432,7 @@ impl Serialize for PolicyReportDocument {
     where
         S: Serializer,
     {
-        // The `diff`, `packs`, and `baseline` fields are additive and
-        // serialized only when present, so a report without them keeps its
-        // exact schema-version-5 shape.
+        // Optional review fields are serialized only when present.
         let field_count = 11 + self.reviews.present_count();
         let mut state = serializer.serialize_struct("PolicyReportDocument", field_count)?;
         state.serialize_field("schema_version", &self.schema_version)?;
@@ -2486,15 +2470,19 @@ impl Serialize for PolicyReportDocument {
 
 impl RetainedSize for PolicyReportDocument {
     fn retained_size(&self) -> usize {
-        size_of::<Self>()
-            .saturating_add(retained_extra(&self.evaluation))
-            .saturating_add(retained_extra(&self.execution))
-            .saturating_add(retained_extra(&self.rules))
-            .saturating_add(retained_extra(&self.runs))
-            .saturating_add(retained_extra(&self.suppressions))
-            .saturating_add(retained_extra(&self.scope))
-            .saturating_add(retained_extra(&self.reviews))
-            .saturating_add(retained_extra(&self.diagnostics))
+        retained_size_with_extras(
+            self,
+            [
+                retained_extra(&self.evaluation),
+                retained_extra(&self.execution),
+                retained_extra(&self.rules),
+                retained_extra(&self.runs),
+                retained_extra(&self.suppressions),
+                retained_extra(&self.scope),
+                retained_extra(&self.reviews),
+                retained_extra(&self.diagnostics),
+            ],
+        )
     }
 }
 
@@ -2695,26 +2683,15 @@ pub struct PolicyReportBuilder {
 }
 
 impl PolicyReportBuilder {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(
         budget: PolicyBatchBudget,
         expected_inputs: usize,
     ) -> Result<Self, PolicyReportBuilderError> {
-        let options = super::coordinator::PolicyEvaluationOptions::new(
-            super::suppression::PolicyEvaluationDate::from_ymd(2026, 7, 27)
-                .expect("fixed test date is valid"),
-        );
         Self::new_with_suppression_audit(
             budget,
             expected_inputs,
-            PolicyReportEvaluationContext::new(
-                options.evaluation_date(),
-                options
-                    .suppressions()
-                    .source_states(super::suppression::PolicySuppressionDocumentState::NotFound),
-                options.scope(),
-                super::scope::PolicyScopeDocumentState::NotFound,
-            ),
+            default_test_evaluation_context(),
             Vec::new(),
             Vec::new(),
         )
@@ -2741,9 +2718,9 @@ impl PolicyReportBuilder {
         {
             return Err(PolicyReportBuilderError::DuplicateSuppressionReview);
         }
-        tighten_vec(&mut suppressions);
+        super::finding::tighten_vec(&mut suppressions);
         scope.sort_by(compare_scope_reviews);
-        tighten_vec(&mut scope);
+        super::finding::tighten_vec(&mut scope);
         let diagnostics = Vec::with_capacity(expected_inputs);
         let input_skeleton_allowance = expected_inputs
             .checked_mul(SKELETON_ALLOWANCE_PER_INPUT)
@@ -2863,8 +2840,8 @@ impl PolicyReportBuilder {
         runs.push(run.clone());
         rules.sort_by(compare_rule_descriptors);
         runs.sort_by(compare_policy_runs);
-        tighten_vec(&mut rules);
-        tighten_vec(&mut runs);
+        super::finding::tighten_vec(&mut rules);
+        super::finding::tighten_vec(&mut runs);
 
         let policy_index = rules
             .iter()
@@ -2920,7 +2897,7 @@ impl PolicyReportBuilder {
         let mut diagnostics = self.diagnostics.clone();
         diagnostics.push(diagnostic);
         diagnostics.sort_by(compare_report_diagnostics);
-        tighten_vec(&mut diagnostics);
+        super::finding::tighten_vec(&mut diagnostics);
         let next_reserved = self
             .outstanding_skeleton_allowance
             .saturating_sub(SKELETON_ALLOWANCE_PER_INPUT);
@@ -2984,25 +2961,9 @@ impl PolicyReportBuilder {
         candidate_runs[run_index].replace_findings(findings);
         if weak_identity {
             candidate_runs[run_index]
-                .mark_inconclusive(PolicyIncompleteReason::StableAnchorUnavailable)?;
+                .mark_inconclusive(PolicyIncompleteReason::StableAnchorUnavailable);
         }
-        self.refresh_candidate_policy_bytes(&mut candidate_runs, run_index);
-        let policy_bytes = self.policy_retained_bytes(&candidate_runs, run_index);
-        let policy_fits = policy_bytes
-            .checked_add(PER_POLICY_INCOMPLETE_REASON_ALLOWANCE)
-            .is_some_and(|bytes| bytes <= self.budget.per_policy().max_retained_report_bytes());
-        let batch_fits = report_storage_size(
-            &self.evaluation,
-            &self.rules,
-            &candidate_runs,
-            &self.suppressions,
-            &self.scope,
-            &self.diagnostics,
-        )
-        .checked_add(self.reviews_extra())
-        .and_then(|bytes| bytes.checked_add(self.emergency_allowance))
-        .is_some_and(|bytes| bytes <= self.budget.max_retained_report_bytes());
-        if !policy_fits || !batch_fits {
+        if !self.candidate_runs_fit(&mut candidate_runs, run_index) {
             self.record_omitted_finding(run_index, PolicyIncompleteReason::ReportRetentionBudget)?;
             return Ok(PolicyRetentionOutcome::Omitted {
                 reason: PolicyIncompleteReason::ReportRetentionBudget,
@@ -3043,30 +3004,14 @@ impl PolicyReportBuilder {
         candidate_runs[run_index].replace_diagnostics(diagnostics, condensed);
         if condensed {
             candidate_runs[run_index]
-                .mark_inconclusive(PolicyIncompleteReason::ReportRetentionBudget)?;
+                .mark_inconclusive(PolicyIncompleteReason::ReportRetentionBudget);
         }
-        self.refresh_candidate_policy_bytes(&mut candidate_runs, run_index);
-        let policy_fits = self
-            .policy_retained_bytes(&candidate_runs, run_index)
-            .checked_add(PER_POLICY_INCOMPLETE_REASON_ALLOWANCE)
-            .is_some_and(|bytes| bytes <= self.budget.per_policy().max_retained_report_bytes());
-        let batch_fits = report_storage_size(
-            &self.evaluation,
-            &self.rules,
-            &candidate_runs,
-            &self.suppressions,
-            &self.scope,
-            &self.diagnostics,
-        )
-        .checked_add(self.reviews_extra())
-        .and_then(|bytes| bytes.checked_add(self.emergency_allowance))
-        .is_some_and(|bytes| bytes <= self.budget.max_retained_report_bytes());
-        if !policy_fits || !batch_fits {
+        if !self.candidate_runs_fit(&mut candidate_runs, run_index) {
             let mut omitted_runs = self.runs.clone();
             let retained = omitted_runs[run_index].diagnostics().to_vec();
             omitted_runs[run_index].replace_diagnostics(retained, true);
             omitted_runs[run_index]
-                .mark_inconclusive(PolicyIncompleteReason::ReportRetentionBudget)?;
+                .mark_inconclusive(PolicyIncompleteReason::ReportRetentionBudget);
             self.refresh_candidate_policy_bytes(&mut omitted_runs, run_index);
             self.ensure_emergency_update_fits(&omitted_runs, run_index)?;
             self.runs = omitted_runs;
@@ -3088,7 +3033,7 @@ impl PolicyReportBuilder {
         let mut diagnostics = self.diagnostics.clone();
         diagnostics.push(diagnostic);
         diagnostics.sort_by(compare_report_diagnostics);
-        tighten_vec(&mut diagnostics);
+        super::finding::tighten_vec(&mut diagnostics);
         let fits = report_storage_size(
             &self.evaluation,
             &self.rules,
@@ -3213,13 +3158,11 @@ impl PolicyReportBuilder {
     /// The review is bounded by construction; charging it against the batch
     /// budget keeps every later retention decision aware of its bytes.
     pub fn set_diff(&mut self, diff: PolicyDiffReview) -> Result<(), PolicyReportBuilderError> {
-        assert!(
-            self.reviews.diff.is_none(),
-            "diff review is set at most once"
-        );
-        self.ensure_review_fits(retained_extra(&diff))?;
-        self.reviews.diff = Some(diff);
-        Ok(())
+        self.set_review(
+            diff,
+            |reviews| &mut reviews.diff,
+            "diff review is set at most once",
+        )
     }
 
     /// Retain the reuse review for this report.
@@ -3231,13 +3174,11 @@ impl PolicyReportBuilder {
         &mut self,
         incremental: PolicyIncrementalReview,
     ) -> Result<(), PolicyReportBuilderError> {
-        assert!(
-            self.reviews.incremental.is_none(),
-            "incremental review is set at most once"
-        );
-        self.ensure_review_fits(retained_extra(&incremental))?;
-        self.reviews.incremental = Some(incremental);
-        Ok(())
+        self.set_review(
+            incremental,
+            |reviews| &mut reviews.incremental,
+            "incremental review is set at most once",
+        )
     }
 
     /// Retain the pack-activation review for this report.
@@ -3248,13 +3189,11 @@ impl PolicyReportBuilder {
         &mut self,
         packs: PolicyPackActivationReview,
     ) -> Result<(), PolicyReportBuilderError> {
-        assert!(
-            self.reviews.packs.is_none(),
-            "pack-activation review is set at most once"
-        );
-        self.ensure_review_fits(retained_extra(&packs))?;
-        self.reviews.packs = Some(packs);
-        Ok(())
+        self.set_review(
+            packs,
+            |reviews| &mut reviews.packs,
+            "pack-activation review is set at most once",
+        )
     }
 
     /// Retain the baseline review that audits this report's accepted findings.
@@ -3265,13 +3204,11 @@ impl PolicyReportBuilder {
         &mut self,
         baseline: PolicyBaselineReview,
     ) -> Result<(), PolicyReportBuilderError> {
-        assert!(
-            self.reviews.baseline.is_none(),
-            "baseline review is set at most once"
-        );
-        self.ensure_review_fits(retained_extra(&baseline))?;
-        self.reviews.baseline = Some(baseline);
-        Ok(())
+        self.set_review(
+            baseline,
+            |reviews| &mut reviews.baseline,
+            "baseline review is set at most once",
+        )
     }
 
     /// Record that a baselined finding's result was dropped by the retention
@@ -3315,12 +3252,18 @@ impl PolicyReportBuilder {
         .saturating_add(retained_extra(&self.execution))
         .saturating_add(self.reviews_extra())
         .saturating_add(new_review_extra);
-        if retained > self.budget.max_retained_report_bytes() {
-            return Err(PolicyReportBuilderError::BatchRetentionExceeded {
-                retained_bytes: retained,
-                max_bytes: self.budget.max_retained_report_bytes(),
-            });
-        }
+        self.ensure_retained_report_fits(retained)
+    }
+
+    fn set_review<T: RetainedSize>(
+        &mut self,
+        review: T,
+        slot: fn(&mut PolicyOptionalReviews) -> &mut Option<T>,
+        already_set: &'static str,
+    ) -> Result<(), PolicyReportBuilderError> {
+        assert!(slot(&mut self.reviews).is_none(), "{already_set}");
+        self.ensure_review_fits(retained_extra(&review))?;
+        *slot(&mut self.reviews) = Some(review);
         Ok(())
     }
 
@@ -3370,6 +3313,10 @@ impl PolicyReportBuilder {
         .and_then(|value| value.checked_add(outstanding_skeleton_allowance))
         .and_then(|value| value.checked_add(emergency))
         .ok_or(PolicyReportBuilderError::RetainedSizeOverflow)?;
+        self.ensure_retained_report_fits(retained)
+    }
+
+    fn ensure_retained_report_fits(&self, retained: usize) -> Result<(), PolicyReportBuilderError> {
         if retained > self.budget.max_retained_report_bytes() {
             return Err(PolicyReportBuilderError::BatchRetentionExceeded {
                 retained_bytes: retained,
@@ -3411,7 +3358,7 @@ impl PolicyReportBuilder {
     ) -> Result<(), PolicyReportBuilderError> {
         let mut runs = self.runs.clone();
         runs[run_index].increment_omitted_findings();
-        runs[run_index].mark_inconclusive(reason)?;
+        runs[run_index].mark_inconclusive(reason);
         self.refresh_candidate_policy_bytes(&mut runs, run_index);
         self.ensure_emergency_update_fits(&runs, run_index)?;
         self.runs = runs;
@@ -3463,6 +3410,26 @@ impl PolicyReportBuilder {
     fn refresh_candidate_policy_bytes(&self, runs: &mut [PolicyRun], run_index: usize) {
         let bytes = self.policy_retained_bytes(runs, run_index);
         runs[run_index].set_retained_report_bytes(bytes);
+    }
+
+    fn candidate_runs_fit(&self, runs: &mut Vec<PolicyRun>, run_index: usize) -> bool {
+        self.refresh_candidate_policy_bytes(runs, run_index);
+        let policy_fits = self
+            .policy_retained_bytes(runs, run_index)
+            .checked_add(PER_POLICY_INCOMPLETE_REASON_ALLOWANCE)
+            .is_some_and(|bytes| bytes <= self.budget.per_policy().max_retained_report_bytes());
+        let batch_fits = report_storage_size(
+            &self.evaluation,
+            &self.rules,
+            runs,
+            &self.suppressions,
+            &self.scope,
+            &self.diagnostics,
+        )
+        .checked_add(self.reviews_extra())
+        .and_then(|bytes| bytes.checked_add(self.emergency_allowance))
+        .is_some_and(|bytes| bytes <= self.budget.max_retained_report_bytes());
+        policy_fits && batch_fits
     }
 }
 
@@ -3679,21 +3646,51 @@ fn compare_rule_descriptors(
     left: &PolicyRuleDescriptor,
     right: &PolicyRuleDescriptor,
 ) -> std::cmp::Ordering {
-    (left.policy_id().as_str(), left.policy_hash())
-        .cmp(&(right.policy_id().as_str(), right.policy_hash()))
+    compare_policy_identity(
+        left.policy_id(),
+        left.policy_hash(),
+        right.policy_id(),
+        right.policy_hash(),
+    )
 }
 
 fn compare_policy_runs(left: &PolicyRun, right: &PolicyRun) -> std::cmp::Ordering {
-    (left.policy_id().as_str(), left.policy_hash())
-        .cmp(&(right.policy_id().as_str(), right.policy_hash()))
+    compare_policy_identity(
+        left.policy_id(),
+        left.policy_hash(),
+        right.policy_id(),
+        right.policy_hash(),
+    )
+}
+
+fn compare_policy_identity(
+    left_policy_id: &PolicyId,
+    left_policy_hash: PolicySemanticHash,
+    right_policy_id: &PolicyId,
+    right_policy_hash: PolicySemanticHash,
+) -> std::cmp::Ordering {
+    (left_policy_id.as_str(), left_policy_hash).cmp(&(right_policy_id.as_str(), right_policy_hash))
 }
 
 fn compare_suppression_reviews(
     left: &PolicySuppressionReview,
     right: &PolicySuppressionReview,
 ) -> std::cmp::Ordering {
-    (left.policy_id().as_str(), left.finding_id())
-        .cmp(&(right.policy_id().as_str(), right.finding_id()))
+    compare_suppression_identity(
+        left.policy_id(),
+        left.finding_id(),
+        right.policy_id(),
+        right.finding_id(),
+    )
+}
+
+pub(super) fn compare_suppression_identity(
+    left_policy_id: &PolicyId,
+    left_finding_id: PolicyFindingId,
+    right_policy_id: &PolicyId,
+    right_finding_id: PolicyFindingId,
+) -> std::cmp::Ordering {
+    (left_policy_id, left_finding_id).cmp(&(right_policy_id, right_finding_id))
 }
 
 fn compare_report_diagnostics(
@@ -3994,7 +3991,6 @@ fn report_storage_size(
 mod tests {
     use super::*;
     use crate::coordinator::PolicyEvaluationOptions;
-    use crate::definition::{PolicyAnalysis, PolicySelector, RqlpDocument};
     use crate::finding::{
         FindingCertainty, FindingCompleteness, FindingIncompleteReason, MatchFindingEvidence,
         PolicyByteSpan, PolicyCapability, PolicyDiagnosticCode, PolicyDiagnosticImpact,
@@ -4005,13 +4001,12 @@ mod tests {
     use crate::finding_identity::{
         MatchFindingAnchor, MatchResultDomain, OpaqueFindingKey, SourceSliceHash,
     };
-    use crate::resolved::{ResolvedPolicySelector, SelectorOrigin};
-    use crate::source::parse_rqlp_source;
     use crate::suppression::{
         PolicyEvaluationDate, PolicySuppressionDocumentState, PolicySuppressionMatchState,
         PolicySuppressionOrphanState, PolicySuppressionPolicyHashState,
         PolicySuppressionTemporalState, parse_policy_suppression_document,
     };
+    use crate::test_support::load_match_policy;
     use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
     use serde_json::json;
 
@@ -4020,47 +4015,7 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/testdata/policies/dynamic-eval.rqlp"
         ));
-        loaded_match_policy_from_source(source)
-    }
-
-    fn loaded_match_policy_from_source(source: &str) -> LoadedPolicy {
-        let identity = PolicySourceIdentity::new("policy.rqlp");
-        let parsed = parse_rqlp_source(source, identity.clone()).unwrap();
-        let schema_resolution = parsed.schema_resolution();
-        let RqlpDocument::Policy { definition } = parsed.into_document() else {
-            panic!("fixture must be a policy");
-        };
-        let definition = *definition;
-        let PolicyAnalysis::Match { spec } = &definition.analysis else {
-            panic!("fixture must be a match policy");
-        };
-        let PolicySelector::Inline { schema, query, .. } = &spec.selector else {
-            panic!("fixture selector must be inline");
-        };
-        let selector = ResolvedPolicySelector::try_new(
-            PolicySelectorPath::new("/analysis/selector").unwrap(),
-            *schema,
-            query.clone(),
-            SelectorOrigin::Document {
-                source: identity.clone(),
-            },
-        )
-        .unwrap();
-        LoadedPolicy::try_new(
-            definition,
-            identity,
-            source.as_bytes(),
-            schema_resolution,
-            vec![selector],
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            PolicyPrecedenceManifest::default(),
-            None,
-            None,
-        )
-        .unwrap()
+        load_match_policy(source)
     }
 
     fn report_skeleton() -> (PolicyRuleDescriptor, PolicyRun) {
@@ -4191,76 +4146,6 @@ mod tests {
     }
 
     #[test]
-    fn report_diagnostic_codes_use_the_fixed_kebab_case_wire() {
-        assert_eq!(
-            serde_json::to_value(PolicyReportDiagnosticCode::UnsupportedPolicySchemaVersion)
-                .unwrap(),
-            json!("unsupported-policy-schema-version")
-        );
-        assert_eq!(
-            serde_json::to_value(PolicyReportDiagnosticCode::ExplicitRqlSchemaVersionRequired)
-                .unwrap(),
-            json!("explicit-rql-schema-version-required")
-        );
-        assert_eq!(
-            serde_json::to_value(PolicyReportDiagnosticCode::WorkspaceSnapshotDeadlineExceeded)
-                .unwrap(),
-            json!("workspace-snapshot-deadline-exceeded")
-        );
-        assert_eq!(
-            serde_json::to_value(PolicyReportDiagnosticCode::DiffBaseDeadlineExceeded).unwrap(),
-            json!("diff-base-deadline-exceeded")
-        );
-        assert_eq!(
-            serde_json::to_value(PolicyReportDiagnosticCode::PacksLoadFailed).unwrap(),
-            json!("packs-load-failed")
-        );
-        assert_eq!(
-            serde_json::to_value(PolicyReportDiagnosticCode::PackActivationFailed).unwrap(),
-            json!("pack-activation-failed")
-        );
-        assert_eq!(
-            serde_json::to_value(PolicyReportDiagnosticCode::WorkspaceModelLoadFailed).unwrap(),
-            json!("workspace-model-load-failed")
-        );
-        assert_eq!(
-            serde_json::to_value(PolicyReportDiagnosticCode::WorkspaceModelInert).unwrap(),
-            json!("workspace-model-inert")
-        );
-    }
-
-    #[test]
-    fn report_diagnostic_normalizes_related_and_requires_source_for_range() {
-        assert!(matches!(
-            PolicyReportDiagnostic::try_new(
-                PolicyReportDiagnosticCode::PolicyLoadFailed,
-                PolicyDiagnosticSeverity::Error,
-                "failed",
-                None,
-                Some(PolicySourceRange::new(0, 1).unwrap()),
-                Vec::new(),
-            ),
-            Err(PolicyReportValueError::RangeWithoutSource)
-        ));
-
-        let related = PolicySourceRelatedDiagnostic {
-            source: PolicySourceIdentity::new("policy.rqlp"),
-            range: 2..4,
-            message: "detail".to_string(),
-        };
-        let diagnostic = PolicyReportDiagnostic::try_new(
-            PolicyReportDiagnosticCode::PolicyValidationFailed,
-            PolicyDiagnosticSeverity::Error,
-            "invalid policy",
-            Some(PolicySourceIdentity::new("policy.rqlp")),
-            Some(PolicySourceRange::new(0, 1).unwrap()),
-            vec![related.clone(), related],
-        )
-        .unwrap();
-        assert_eq!(diagnostic.related().len(), 1);
-    }
-
-    #[test]
     fn raw_document_assembly_rejects_missing_rule_run_joins() {
         let (descriptor, run) = report_skeleton();
         let error = PolicyReportDocument::try_new(
@@ -4332,7 +4217,7 @@ mod tests {
             "Dynamic evaluation is forbidden",
             "Dynamic evaluation remains forbidden",
         );
-        let second = loaded_match_policy_from_source(&changed_source);
+        let second = load_match_policy(&changed_source);
         assert_eq!(
             first.definition().metadata.id,
             second.definition().metadata.id
@@ -4379,47 +4264,7 @@ mod tests {
     }
 
     #[test]
-    fn builder_preflights_skeletons_and_emits_schema_five_document() {
-        let per_policy = super::super::budget::PolicyBudget::builder()
-            .with_max_retained_report_bytes(1024)
-            .unwrap()
-            .build()
-            .unwrap();
-        let tiny = PolicyBatchBudget::builder()
-            .with_max_retained_report_bytes(1024)
-            .unwrap()
-            .with_per_policy(per_policy)
-            .unwrap()
-            .build()
-            .unwrap();
-        assert!(matches!(
-            PolicyReportBuilder::new(tiny, 1),
-            Err(PolicyReportBuilderError::SkeletonPreflightExceeded { .. })
-        ));
-
-        let (descriptor, run) = report_skeleton();
-        let mut builder = PolicyReportBuilder::new(PolicyBatchBudget::default(), 1).unwrap();
-        builder.register_policy(descriptor, run).unwrap();
-        let document = builder.finish().unwrap();
-        assert_eq!(document.schema_version(), 5);
-        assert_eq!(document.rules().len(), 1);
-        assert_eq!(document.runs().len(), 1);
-        assert_eq!(
-            document.rules()[0].analysis_type(),
-            PolicyAnalysisType::Match
-        );
-        assert_eq!(
-            serde_json::to_value(&document).unwrap()["schema_version"],
-            5
-        );
-        assert_eq!(
-            serde_json::to_value(&document).unwrap()["rules"][0]["analysis_type"],
-            "match"
-        );
-    }
-
-    #[test]
-    fn schema_five_report_exposes_bounded_deadline_execution_metadata() {
+    fn schema_six_report_exposes_bounded_deadline_execution_metadata() {
         let first = PolicyId::new("test.first").unwrap();
         let second = PolicyId::new("test.second").unwrap();
         let execution = PolicyExecutionMetadata::try_new(
@@ -4440,7 +4285,7 @@ mod tests {
         let document = builder.finish().unwrap();
 
         let json = serde_json::to_value(&document).unwrap();
-        assert_eq!(json["schema_version"], 5);
+        assert_eq!(json["schema_version"], 6);
         assert_eq!(json["execution"]["termination"], "deadline_exceeded");
         assert_eq!(json["execution"]["terminal_stage"], "workspace_snapshot");
         assert_eq!(
@@ -4453,185 +4298,6 @@ mod tests {
         );
         assert!(document.rules().is_empty());
         assert!(document.runs().is_empty());
-    }
-
-    #[test]
-    fn execution_metadata_rejects_ambiguous_progress_and_stage_timings() {
-        let policy_id = PolicyId::new("test.duplicate").unwrap();
-        assert_eq!(
-            PolicyExecutionMetadata::try_new(
-                1,
-                vec![
-                    PolicyStageTiming::new(PolicyExecutionStage::PolicySelection, 1),
-                    PolicyStageTiming::new(PolicyExecutionStage::PolicySelection, 1),
-                ],
-                None,
-                None,
-                None,
-                Vec::new(),
-                Vec::new(),
-            ),
-            Err(PolicyExecutionMetadataError::DuplicateStageTiming)
-        );
-        assert_eq!(
-            PolicyExecutionMetadata::try_new(
-                1,
-                Vec::new(),
-                Some(PolicyExecutionTermination::DeadlineExceeded),
-                Some(PolicyExecutionStage::PolicyEvaluation),
-                Some(policy_id.clone()),
-                vec![policy_id],
-                Vec::new(),
-            ),
-            Err(PolicyExecutionMetadataError::OverlappingPolicyProgress)
-        );
-    }
-
-    #[test]
-    fn execution_metadata_reservation_covers_maximum_policy_progress() {
-        let pending = (0..MAX_POLICY_EXECUTION_PROGRESS_IDS)
-            .map(|index| {
-                PolicyId::new(format!("test.policy{index:03}.{}", "x".repeat(180))).unwrap()
-            })
-            .collect::<Vec<_>>();
-        let execution = PolicyExecutionMetadata::try_new(
-            6,
-            vec![
-                PolicyStageTiming::new(PolicyExecutionStage::PolicySelection, 1),
-                PolicyStageTiming::new(PolicyExecutionStage::WorkspaceSnapshot, 1),
-                PolicyStageTiming::new(PolicyExecutionStage::PolicyRegistration, 1),
-                PolicyStageTiming::new(PolicyExecutionStage::PolicyPreparation, 1),
-                PolicyStageTiming::new(PolicyExecutionStage::PolicyEvaluation, 1),
-                PolicyStageTiming::new(PolicyExecutionStage::ReportConstruction, 1),
-            ],
-            Some(PolicyExecutionTermination::DeadlineExceeded),
-            Some(PolicyExecutionStage::PolicyEvaluation),
-            None,
-            Vec::new(),
-            pending,
-        )
-        .unwrap();
-
-        assert!(
-            execution.retained_size()
-                <= PolicyExecutionMetadata::maximum_retained_size(
-                    MAX_POLICY_EXECUTION_PROGRESS_IDS
-                )
-        );
-    }
-
-    #[test]
-    fn builder_distinguishes_suppression_audit_preflight_exhaustion() {
-        let finding_id = "1".repeat(64);
-        let source = format!(
-            r#"{{
-                "schema_version": 1,
-                "suppressions": [{{
-                    "policy_id": "test.dynamic-eval",
-                    "finding_id": "{finding_id}",
-                    "identity_stability": "strong",
-                    "status": "accepted",
-                    "reason": "Reviewed compatibility boundary",
-                    "accepted_at": "2026-07-01"
-                }}]
-            }}"#
-        );
-        let document = parse_policy_suppression_document(&source).unwrap();
-        let review = PolicySuppressionReview::new(
-            &document.suppressions()[0],
-            PolicySuppressionMatchState::StrongFinding,
-            PolicySuppressionTemporalState::Current,
-            PolicySuppressionPolicyHashState::Unknown,
-            PolicySuppressionOrphanState::Resolved,
-            Vec::new(),
-        );
-        let options = PolicyEvaluationOptions::new(
-            PolicyEvaluationDate::from_ymd(2026, 7, 27).expect("fixed test date"),
-        );
-        let evaluation = PolicyReportEvaluationContext::new(
-            options.evaluation_date(),
-            options
-                .suppressions()
-                .source_states(PolicySuppressionDocumentState::Loaded),
-            options.scope(),
-            super::super::scope::PolicyScopeDocumentState::NotFound,
-        );
-        let rules = Vec::new();
-        let runs = Vec::new();
-        let suppressions = vec![review.clone()];
-        let scope = Vec::new();
-        let diagnostics = Vec::new();
-        let without_audit = report_storage_size(
-            &evaluation,
-            &rules,
-            &runs,
-            &Vec::new(),
-            &scope,
-            &diagnostics,
-        )
-        .checked_add(PolicyExecutionMetadata::maximum_retained_size(0))
-        .unwrap()
-        .checked_add(EMERGENCY_DIAGNOSTIC_ALLOWANCE)
-        .unwrap();
-        let with_audit = report_storage_size(
-            &evaluation,
-            &rules,
-            &runs,
-            &suppressions,
-            &scope,
-            &diagnostics,
-        )
-        .checked_add(PolicyExecutionMetadata::maximum_retained_size(0))
-        .unwrap()
-        .checked_add(EMERGENCY_DIAGNOSTIC_ALLOWANCE)
-        .unwrap();
-        assert!(with_audit > without_audit);
-
-        let per_policy = super::super::budget::PolicyBudget::builder()
-            .with_max_retained_report_bytes(without_audit)
-            .unwrap()
-            .build()
-            .unwrap();
-        let budget = PolicyBatchBudget::builder()
-            .with_max_retained_report_bytes(without_audit)
-            .unwrap()
-            .with_per_policy(per_policy)
-            .unwrap()
-            .build()
-            .unwrap();
-        assert!(matches!(
-            PolicyReportBuilder::new_with_suppression_audit(
-                budget,
-                0,
-                evaluation,
-                vec![review],
-                Vec::new(),
-            ),
-            Err(PolicyReportBuilderError::SuppressionAuditPreflightExceeded {
-                required_bytes,
-                max_bytes,
-            }) if required_bytes == with_audit && max_bytes == without_audit
-        ));
-    }
-
-    #[test]
-    fn identical_failed_inputs_keep_one_primary_outcome_each() {
-        let diagnostic = PolicyReportDiagnostic::try_new(
-            PolicyReportDiagnosticCode::PolicyLoadFailed,
-            PolicyDiagnosticSeverity::Error,
-            "failed",
-            Some(PolicySourceIdentity::new("same.rqlp")),
-            None,
-            Vec::new(),
-        )
-        .unwrap();
-        let mut builder = PolicyReportBuilder::new(PolicyBatchBudget::default(), 2).unwrap();
-        builder
-            .register_primary_diagnostic(diagnostic.clone())
-            .unwrap();
-        builder.register_primary_diagnostic(diagnostic).unwrap();
-        let document = builder.finish().unwrap();
-        assert_eq!(document.diagnostics().len(), 2);
     }
 
     #[test]
@@ -4697,7 +4363,7 @@ mod tests {
         assert_eq!(run.work().omitted_findings_lower_bound(), 1);
         assert!(matches!(
             run.completion(),
-            PolicyRunCompletion::Inconclusive { reasons }
+            PolicyRunCompletion::Inconclusive { reasons, .. }
                 if reasons.contains(&PolicyIncompleteReason::ReportRetentionBudget)
         ));
     }
@@ -4724,7 +4390,7 @@ mod tests {
         );
         assert!(matches!(
             run.completion(),
-            PolicyRunCompletion::Inconclusive { reasons }
+            PolicyRunCompletion::Inconclusive { reasons, .. }
                 if reasons == &[PolicyIncompleteReason::StableAnchorUnavailable]
         ));
     }
@@ -4914,97 +4580,6 @@ mod tests {
     }
 
     #[test]
-    fn builder_revalidates_run_skeleton_against_its_lower_per_policy_budget() {
-        let loaded = loaded_match_policy();
-        let descriptor = PolicyRuleDescriptor::from_loaded(&loaded);
-        let diagnostic = PolicyDiagnostic::try_new(
-            PolicyDiagnosticCode::StableAnchorUnavailable,
-            PolicyDiagnosticSeverity::Note,
-            PolicyDiagnosticImpact::Advisory,
-            "advisory",
-            None,
-            Vec::new(),
-        )
-        .unwrap();
-        let run = PolicyRun::try_new(
-            loaded.definition().metadata.id.clone(),
-            loaded.semantic_hash(),
-            super::super::definition::PolicyAnalysisType::Match,
-            PolicyRunCompletion::Complete,
-            Vec::new(),
-            vec![diagnostic],
-            false,
-            PolicyWorkReport::default(),
-            &super::super::budget::PolicyBudget::default(),
-        )
-        .unwrap();
-        let per_policy = super::super::budget::PolicyBudget::builder()
-            .with_max_diagnostics(0)
-            .unwrap()
-            .build()
-            .unwrap();
-        let budget = PolicyBatchBudget::builder()
-            .with_per_policy(per_policy)
-            .unwrap()
-            .build()
-            .unwrap();
-        let mut builder = PolicyReportBuilder::new(budget, 1).unwrap();
-
-        assert!(matches!(
-            builder.register_policy(descriptor, run),
-            Err(PolicyReportBuilderError::RunBudgetViolation(
-                PolicyRunError::TooManyDiagnostics { max: 0 }
-            ))
-        ));
-    }
-
-    #[test]
-    fn builder_omits_a_finding_that_exceeds_its_lower_nested_budget() {
-        let loaded = loaded_match_policy();
-        let descriptor = PolicyRuleDescriptor::from_loaded(&loaded);
-        let run = PolicyRun::try_new(
-            loaded.definition().metadata.id.clone(),
-            loaded.semantic_hash(),
-            super::super::definition::PolicyAnalysisType::Match,
-            PolicyRunCompletion::Complete,
-            Vec::new(),
-            Vec::new(),
-            false,
-            PolicyWorkReport::default(),
-            &super::super::budget::PolicyBudget::default(),
-        )
-        .unwrap();
-        let per_policy = super::super::budget::PolicyBudget::builder()
-            .with_max_evidence_bytes_per_finding(0)
-            .unwrap()
-            .build()
-            .unwrap();
-        let budget = PolicyBatchBudget::builder()
-            .with_per_policy(per_policy)
-            .unwrap()
-            .build()
-            .unwrap();
-        let mut builder = PolicyReportBuilder::new(budget, 1).unwrap();
-        builder.register_policy(descriptor, run).unwrap();
-
-        assert_eq!(
-            builder.retain_finding(report_finding(&loaded)).unwrap(),
-            PolicyRetentionOutcome::Omitted {
-                reason: PolicyIncompleteReason::ReportRetentionBudget,
-            }
-        );
-        let document = builder.finish().unwrap();
-        let run = &document.runs()[0];
-        assert!(run.findings().is_empty());
-        assert_eq!(run.work().omitted_findings_lower_bound(), 1);
-        assert!(matches!(
-            run.completion(),
-            PolicyRunCompletion::Inconclusive { reasons }
-                if reasons.contains(&PolicyIncompleteReason::ReportRetentionBudget)
-        ));
-    }
-
-    #[test]
     fn an_over_budget_duplicate_finding_does_not_increment_the_omission_count() {
         let loaded = loaded_match_policy();
         let path = WorkspaceRelativePath::new("src/app.rs").unwrap();
@@ -5079,6 +4654,353 @@ mod tests {
     }
 
     #[test]
+    fn retaining_a_diagnostic_never_clears_prior_run_truncation() {
+        let loaded = loaded_match_policy();
+        let descriptor = PolicyRuleDescriptor::from_loaded(&loaded);
+        let run = PolicyRun::try_new(
+            loaded.definition().metadata.id.clone(),
+            loaded.semantic_hash(),
+            super::super::definition::PolicyAnalysisType::Match,
+            PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::ReportRetentionBudget])
+                .unwrap(),
+            Vec::new(),
+            Vec::new(),
+            true,
+            PolicyWorkReport::default(),
+            &super::super::budget::PolicyBudget::default(),
+        )
+        .unwrap();
+        let mut builder = PolicyReportBuilder::new(PolicyBatchBudget::default(), 1).unwrap();
+        builder.register_policy(descriptor, run).unwrap();
+        let diagnostic = PolicyDiagnostic::try_new(
+            PolicyDiagnosticCode::ReportRetentionBudget,
+            PolicyDiagnosticSeverity::Warning,
+            PolicyDiagnosticImpact::RunIncomplete,
+            "prior diagnostics were truncated",
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            builder
+                .retain_run_diagnostic(
+                    &loaded.definition().metadata.id,
+                    loaded.semantic_hash(),
+                    diagnostic,
+                )
+                .unwrap(),
+            PolicyRetentionOutcome::Retained
+        );
+        let document = builder.finish().unwrap();
+        assert!(document.runs()[0].diagnostics_truncated());
+        assert!(matches!(
+            document.runs()[0].completion(),
+            PolicyRunCompletion::Inconclusive { reasons, .. }
+                if reasons.contains(&PolicyIncompleteReason::ReportRetentionBudget)
+        ));
+    }
+
+    // The next three tests pin the single-accounting-site property from
+    // #1890: each optional review (diff, packs, baseline) is charged through
+    // the same `ensure_review_fits`/`reviews_extra` pair, so a review whose
+    // own bytes alone exceed the batch budget is rejected the same way -- a
+    // `BatchRetentionExceeded` naming exactly the empty-report bytes plus the
+    // review's own bytes -- regardless of which review kind pushed it over.
+    // Each review is oversized only in one owned string, kept well above the
+    // construction-time preflight floor so it, not that floor, is what trips
+    // the budget.
+
+    #[test]
+    fn report_diagnostic_codes_use_the_fixed_kebab_case_wire() {
+        assert_eq!(
+            serde_json::to_value(PolicyReportDiagnosticCode::UnsupportedPolicySchemaVersion)
+                .unwrap(),
+            json!("unsupported-policy-schema-version")
+        );
+        assert_eq!(
+            serde_json::to_value(PolicyReportDiagnosticCode::ExplicitRqlSchemaVersionRequired)
+                .unwrap(),
+            json!("explicit-rql-schema-version-required")
+        );
+        assert_eq!(
+            serde_json::to_value(PolicyReportDiagnosticCode::WorkspaceSnapshotDeadlineExceeded)
+                .unwrap(),
+            json!("workspace-snapshot-deadline-exceeded")
+        );
+        assert_eq!(
+            serde_json::to_value(PolicyReportDiagnosticCode::DiffBaseDeadlineExceeded).unwrap(),
+            json!("diff-base-deadline-exceeded")
+        );
+        assert_eq!(
+            serde_json::to_value(PolicyReportDiagnosticCode::PacksLoadFailed).unwrap(),
+            json!("packs-load-failed")
+        );
+        assert_eq!(
+            serde_json::to_value(PolicyReportDiagnosticCode::PackActivationFailed).unwrap(),
+            json!("pack-activation-failed")
+        );
+        assert_eq!(
+            serde_json::to_value(PolicyReportDiagnosticCode::WorkspaceModelLoadFailed).unwrap(),
+            json!("workspace-model-load-failed")
+        );
+        assert_eq!(
+            serde_json::to_value(PolicyReportDiagnosticCode::WorkspaceModelInert).unwrap(),
+            json!("workspace-model-inert")
+        );
+    }
+
+    #[test]
+    fn report_diagnostic_normalizes_related_and_requires_source_for_range() {
+        assert!(matches!(
+            PolicyReportDiagnostic::try_new(
+                PolicyReportDiagnosticCode::PolicyLoadFailed,
+                PolicyDiagnosticSeverity::Error,
+                "failed",
+                None,
+                Some(PolicySourceRange::new(0, 1).unwrap()),
+                Vec::new(),
+            ),
+            Err(PolicyReportValueError::RangeWithoutSource)
+        ));
+
+        let related = PolicySourceRelatedDiagnostic {
+            source: PolicySourceIdentity::new("policy.rqlp"),
+            range: 2..4,
+            message: "detail".to_string(),
+        };
+        let diagnostic = PolicyReportDiagnostic::try_new(
+            PolicyReportDiagnosticCode::PolicyValidationFailed,
+            PolicyDiagnosticSeverity::Error,
+            "invalid policy",
+            Some(PolicySourceIdentity::new("policy.rqlp")),
+            Some(PolicySourceRange::new(0, 1).unwrap()),
+            vec![related.clone(), related],
+        )
+        .unwrap();
+        assert_eq!(diagnostic.related().len(), 1);
+    }
+
+    #[test]
+    fn builder_preflights_skeletons_and_emits_schema_six_document() {
+        let per_policy = super::super::budget::PolicyBudget::builder()
+            .with_max_retained_report_bytes(1024)
+            .unwrap()
+            .build()
+            .unwrap();
+        let tiny = PolicyBatchBudget::builder()
+            .with_max_retained_report_bytes(1024)
+            .unwrap()
+            .with_per_policy(per_policy)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(matches!(
+            PolicyReportBuilder::new(tiny, 1),
+            Err(PolicyReportBuilderError::SkeletonPreflightExceeded { .. })
+        ));
+
+        let (descriptor, run) = report_skeleton();
+        let mut builder = PolicyReportBuilder::new(PolicyBatchBudget::default(), 1).unwrap();
+        builder.register_policy(descriptor, run).unwrap();
+        let document = builder.finish().unwrap();
+        assert_eq!(document.schema_version(), 6);
+        assert_eq!(document.rules().len(), 1);
+        assert_eq!(document.runs().len(), 1);
+        assert_eq!(
+            document.rules()[0].analysis_type(),
+            PolicyAnalysisType::Match
+        );
+        assert_eq!(
+            serde_json::to_value(&document).unwrap()["schema_version"],
+            6
+        );
+        assert_eq!(
+            serde_json::to_value(&document).unwrap()["rules"][0]["analysis_type"],
+            "match"
+        );
+    }
+
+    #[test]
+    fn execution_metadata_rejects_ambiguous_progress_and_stage_timings() {
+        let policy_id = PolicyId::new("test.duplicate").unwrap();
+        assert_eq!(
+            PolicyExecutionMetadata::try_new(
+                1,
+                vec![
+                    PolicyStageTiming::new(PolicyExecutionStage::PolicySelection, 1),
+                    PolicyStageTiming::new(PolicyExecutionStage::PolicySelection, 1),
+                ],
+                None,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+            ),
+            Err(PolicyExecutionMetadataError::DuplicateStageTiming)
+        );
+        assert_eq!(
+            PolicyExecutionMetadata::try_new(
+                1,
+                Vec::new(),
+                Some(PolicyExecutionTermination::DeadlineExceeded),
+                Some(PolicyExecutionStage::PolicyEvaluation),
+                Some(policy_id.clone()),
+                vec![policy_id],
+                Vec::new(),
+            ),
+            Err(PolicyExecutionMetadataError::OverlappingPolicyProgress)
+        );
+    }
+
+    #[test]
+    fn execution_metadata_reservation_covers_maximum_policy_progress() {
+        let pending = (0..MAX_POLICY_EXECUTION_PROGRESS_IDS)
+            .map(|index| {
+                PolicyId::new(format!("test.policy{index:03}.{}", "x".repeat(180))).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let execution = PolicyExecutionMetadata::try_new(
+            6,
+            vec![
+                PolicyStageTiming::new(PolicyExecutionStage::PolicySelection, 1),
+                PolicyStageTiming::new(PolicyExecutionStage::WorkspaceSnapshot, 1),
+                PolicyStageTiming::new(PolicyExecutionStage::PolicyRegistration, 1),
+                PolicyStageTiming::new(PolicyExecutionStage::PolicyPreparation, 1),
+                PolicyStageTiming::new(PolicyExecutionStage::PolicyEvaluation, 1),
+                PolicyStageTiming::new(PolicyExecutionStage::ReportConstruction, 1),
+            ],
+            Some(PolicyExecutionTermination::DeadlineExceeded),
+            Some(PolicyExecutionStage::PolicyEvaluation),
+            None,
+            Vec::new(),
+            pending,
+        )
+        .unwrap();
+
+        assert!(
+            execution.retained_size()
+                <= PolicyExecutionMetadata::maximum_retained_size(
+                    MAX_POLICY_EXECUTION_PROGRESS_IDS
+                )
+        );
+    }
+
+    #[test]
+    fn builder_distinguishes_suppression_audit_preflight_exhaustion() {
+        let finding_id = "1".repeat(64);
+        let source = format!(
+            r#"{{
+                "schema_version": 1,
+                "suppressions": [{{
+                    "policy_id": "test.dynamic-eval",
+                    "finding_id": "{finding_id}",
+                    "identity_stability": "strong",
+                    "status": "accepted",
+                    "reason": "Reviewed compatibility boundary",
+                    "accepted_at": "2026-07-01"
+                }}]
+            }}"#
+        );
+        let document = parse_policy_suppression_document(&source).unwrap();
+        let review = PolicySuppressionReview::new(
+            &document.suppressions()[0],
+            PolicySuppressionMatchState::StrongFinding,
+            PolicySuppressionTemporalState::Current,
+            PolicySuppressionPolicyHashState::Unknown,
+            PolicySuppressionOrphanState::Resolved,
+            Vec::new(),
+        );
+        let options = PolicyEvaluationOptions::new(
+            PolicyEvaluationDate::from_ymd(2026, 7, 27).expect("fixed test date"),
+        );
+        let evaluation = PolicyReportEvaluationContext::new(
+            options.evaluation_date(),
+            options
+                .suppressions()
+                .source_states(PolicySuppressionDocumentState::Loaded),
+            options.scope(),
+            super::super::scope::PolicyScopeDocumentState::NotFound,
+        );
+        let rules = Vec::new();
+        let runs = Vec::new();
+        let suppressions = vec![review.clone()];
+        let scope = Vec::new();
+        let diagnostics = Vec::new();
+        let without_audit = report_storage_size(
+            &evaluation,
+            &rules,
+            &runs,
+            &Vec::new(),
+            &scope,
+            &diagnostics,
+        )
+        .checked_add(PolicyExecutionMetadata::maximum_retained_size(0))
+        .unwrap()
+        .checked_add(EMERGENCY_DIAGNOSTIC_ALLOWANCE)
+        .unwrap();
+        let with_audit = report_storage_size(
+            &evaluation,
+            &rules,
+            &runs,
+            &suppressions,
+            &scope,
+            &diagnostics,
+        )
+        .checked_add(PolicyExecutionMetadata::maximum_retained_size(0))
+        .unwrap()
+        .checked_add(EMERGENCY_DIAGNOSTIC_ALLOWANCE)
+        .unwrap();
+        assert!(with_audit > without_audit);
+
+        let per_policy = super::super::budget::PolicyBudget::builder()
+            .with_max_retained_report_bytes(without_audit)
+            .unwrap()
+            .build()
+            .unwrap();
+        let budget = PolicyBatchBudget::builder()
+            .with_max_retained_report_bytes(without_audit)
+            .unwrap()
+            .with_per_policy(per_policy)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(matches!(
+            PolicyReportBuilder::new_with_suppression_audit(
+                budget,
+                0,
+                evaluation,
+                vec![review],
+                Vec::new(),
+            ),
+            Err(PolicyReportBuilderError::SuppressionAuditPreflightExceeded {
+                required_bytes,
+                max_bytes,
+            }) if required_bytes == with_audit && max_bytes == without_audit
+        ));
+    }
+
+    #[test]
+    fn identical_failed_inputs_keep_one_primary_outcome_each() {
+        let diagnostic = PolicyReportDiagnostic::try_new(
+            PolicyReportDiagnosticCode::PolicyLoadFailed,
+            PolicyDiagnosticSeverity::Error,
+            "failed",
+            Some(PolicySourceIdentity::new("same.rqlp")),
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+        let mut builder = PolicyReportBuilder::new(PolicyBatchBudget::default(), 2).unwrap();
+        builder
+            .register_primary_diagnostic(diagnostic.clone())
+            .unwrap();
+        builder.register_primary_diagnostic(diagnostic).unwrap();
+        let document = builder.finish().unwrap();
+        assert_eq!(document.diagnostics().len(), 2);
+    }
+
+    #[test]
     fn retaining_an_identical_diagnostic_at_cap_is_a_no_growth_success() {
         let loaded = loaded_match_policy();
         let descriptor = PolicyRuleDescriptor::from_loaded(&loaded);
@@ -5133,57 +5055,8 @@ mod tests {
         assert!(matches!(run.completion(), PolicyRunCompletion::Complete));
     }
 
-    #[test]
-    fn retaining_a_diagnostic_never_clears_prior_run_truncation() {
-        let loaded = loaded_match_policy();
-        let descriptor = PolicyRuleDescriptor::from_loaded(&loaded);
-        let run = PolicyRun::try_new(
-            loaded.definition().metadata.id.clone(),
-            loaded.semantic_hash(),
-            super::super::definition::PolicyAnalysisType::Match,
-            PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::ReportRetentionBudget])
-                .unwrap(),
-            Vec::new(),
-            Vec::new(),
-            true,
-            PolicyWorkReport::default(),
-            &super::super::budget::PolicyBudget::default(),
-        )
-        .unwrap();
-        let mut builder = PolicyReportBuilder::new(PolicyBatchBudget::default(), 1).unwrap();
-        builder.register_policy(descriptor, run).unwrap();
-        let diagnostic = PolicyDiagnostic::try_new(
-            PolicyDiagnosticCode::ReportRetentionBudget,
-            PolicyDiagnosticSeverity::Warning,
-            PolicyDiagnosticImpact::RunIncomplete,
-            "prior diagnostics were truncated",
-            None,
-            Vec::new(),
-        )
-        .unwrap();
-
-        assert_eq!(
-            builder
-                .retain_run_diagnostic(
-                    &loaded.definition().metadata.id,
-                    loaded.semantic_hash(),
-                    diagnostic,
-                )
-                .unwrap(),
-            PolicyRetentionOutcome::Retained
-        );
-        let document = builder.finish().unwrap();
-        assert!(document.runs()[0].diagnostics_truncated());
-        assert!(matches!(
-            document.runs()[0].completion(),
-            PolicyRunCompletion::Inconclusive { reasons }
-                if reasons.contains(&PolicyIncompleteReason::ReportRetentionBudget)
-        ));
-    }
-
     /// Build a batch budget whose retained-bytes ceiling is exactly `bytes`,
-    /// with a matching per-policy ceiling so `PolicyBatchBudgetBuilder::build`
-    /// accepts it.
+    /// with a matching per-policy ceiling so the builder accepts it.
     fn batch_budget_capped_at(bytes: usize) -> PolicyBatchBudget {
         let per_policy = super::super::budget::PolicyBudget::builder()
             .with_max_retained_report_bytes(bytes)
@@ -5199,9 +5072,6 @@ mod tests {
             .unwrap()
     }
 
-    /// Retained bytes of an empty schema-version-5 document (no reviews, no
-    /// policies, default execution metadata): the base every `set_*` review
-    /// method charges a new review's bytes on top of.
     fn empty_document_retained_bytes() -> usize {
         PolicyReportBuilder::new(PolicyBatchBudget::default(), 0)
             .unwrap()
@@ -5210,12 +5080,6 @@ mod tests {
             .retained_size()
     }
 
-    /// The smallest `max_retained_report_bytes` a zero-input builder can be
-    /// constructed with. Below this, construction itself fails preflight
-    /// (it reserves `PolicyExecutionMetadata::maximum_retained_size` and
-    /// `EMERGENCY_DIAGNOSTIC_ALLOWANCE` before any review exists), so the
-    /// tests below build exactly at this floor and rely on the review's own
-    /// bytes, not construction overhead, to trip the batch budget.
     fn minimum_construction_budget() -> usize {
         match PolicyReportBuilder::new(batch_budget_capped_at(0), 0) {
             Err(PolicyReportBuilderError::SkeletonPreflightExceeded { required_bytes, .. }) => {
@@ -5226,30 +5090,10 @@ mod tests {
         }
     }
 
-    // The next three tests pin the single-accounting-site property from
-    // #1890: each optional review (diff, packs, baseline) is charged through
-    // the same `ensure_review_fits`/`reviews_extra` pair, so a review whose
-    // own bytes alone exceed the batch budget is rejected the same way -- a
-    // `BatchRetentionExceeded` naming exactly the empty-report bytes plus the
-    // review's own bytes -- regardless of which review kind pushed it over.
-    // Each review is oversized only in one owned string, kept well above the
-    // construction-time preflight floor so it, not that floor, is what trips
-    // the budget.
-
-    #[test]
-    fn set_diff_over_budget_hits_the_single_review_retention_treatment() {
-        let review = PolicyDiffReview::new(
-            "x".repeat(10_000),
-            "0".repeat(40),
-            false,
-            Vec::new(),
-            PolicyDiffCounts {
-                new: 1,
-                persisting: 0,
-                fixed: 1,
-            },
-            Vec::new(),
-        );
+    fn assert_review_over_budget<T: RetainedSize>(
+        review: T,
+        set_review: impl FnOnce(&mut PolicyReportBuilder, T) -> Result<(), PolicyReportBuilderError>,
+    ) {
         let review_extra = retained_extra(&review);
         assert!(review_extra > EMERGENCY_DIAGNOSTIC_ALLOWANCE);
 
@@ -5257,7 +5101,7 @@ mod tests {
         let max_bytes = minimum_construction_budget();
         let mut builder = PolicyReportBuilder::new(batch_budget_capped_at(max_bytes), 0).unwrap();
         assert!(matches!(
-            builder.set_diff(review),
+            set_review(&mut builder, review),
             Err(PolicyReportBuilderError::BatchRetentionExceeded {
                 retained_bytes,
                 max_bytes: reported_max,
@@ -5274,19 +5118,7 @@ mod tests {
             true,
             Vec::new(),
         );
-        let review_extra = retained_extra(&review);
-        assert!(review_extra > EMERGENCY_DIAGNOSTIC_ALLOWANCE);
-
-        let empty_bytes = empty_document_retained_bytes();
-        let max_bytes = minimum_construction_budget();
-        let mut builder = PolicyReportBuilder::new(batch_budget_capped_at(max_bytes), 0).unwrap();
-        assert!(matches!(
-            builder.set_packs(review),
-            Err(PolicyReportBuilderError::BatchRetentionExceeded {
-                retained_bytes,
-                max_bytes: reported_max,
-            }) if retained_bytes == empty_bytes + review_extra && reported_max == max_bytes
-        ));
+        assert_review_over_budget(review, |builder, review| builder.set_packs(review));
     }
 
     #[test]
@@ -5307,18 +5139,6 @@ mod tests {
         // content, so it carries no schema length cap and can stand in for
         // an oversized review here.
         let review = PolicyBaselineReview::new(&"x".repeat(10_000), &document, Vec::new());
-        let review_extra = retained_extra(&review);
-        assert!(review_extra > EMERGENCY_DIAGNOSTIC_ALLOWANCE);
-
-        let empty_bytes = empty_document_retained_bytes();
-        let max_bytes = minimum_construction_budget();
-        let mut builder = PolicyReportBuilder::new(batch_budget_capped_at(max_bytes), 0).unwrap();
-        assert!(matches!(
-            builder.set_baseline(review),
-            Err(PolicyReportBuilderError::BatchRetentionExceeded {
-                retained_bytes,
-                max_bytes: reported_max,
-            }) if retained_bytes == empty_bytes + review_extra && reported_max == max_bytes
-        ));
+        assert_review_over_budget(review, |builder, review| builder.set_baseline(review));
     }
 }

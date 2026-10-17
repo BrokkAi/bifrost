@@ -1,22 +1,23 @@
 use super::SearchSymbolsParams;
 use super::navigation::{search_symbols_with_cancellation, search_symbols_with_cap};
 use super::scan_usages::render_symbol_usages;
+use super::scan_usages::usage_failure_hint;
 use super::summaries::SummariesParams;
 use super::{
-    ContainerListingEntry, DefinitionCandidateRenderCache, ScanUsageRequest,
-    ScanUsagesAbsenceCaveat, ScanUsagesByLocationParams, ScanUsagesCandidateFilesSample,
-    ScanUsagesExecutionContext, ScanUsagesIncompleteReason, ScanUsagesStatus, ScanUsagesSurface,
-    ScanUsagesTarget, ScanUsagesWorkEntry, SymbolLookupParams, SymbolSourcesResult,
-    SymbolUsageRenderState, UsageFailureInfo, UsageHitKind, UsageHitRow, UsageRendering,
-    classify_scan_usages_entry, definition_candidate_from_range, get_summaries, get_symbol_sources,
-    list_symbols, resolve_file_patterns, scan_usages_by_location_with_context,
-    symbol_source_candidate_files, trim_summary_signature,
+    DefinitionCandidateRenderCache, ScanUsageRequest, ScanUsagesAbsenceCaveat,
+    ScanUsagesByLocationParams, ScanUsagesCandidateFilesSample, ScanUsagesExecutionContext,
+    ScanUsagesIncompleteReason, ScanUsagesStatus, ScanUsagesSurface, ScanUsagesTarget,
+    ScanUsagesWorkEntry, SymbolLookupParams, SymbolSourcesResult, SymbolUsageRenderState,
+    UsageFailureInfo, UsageHitKind, UsageHitRow, UsageRendering, classify_scan_usages_entry,
+    definition_candidate_from_range, get_summaries, get_symbol_sources, resolve_file_patterns,
+    scan_usages_by_location_with_context, symbol_source_candidate_files,
 };
-use super::{function_like_macro_query, route_summary_targets, usage_failure_hint};
+use super::{function_like_macro_query, route_summary_targets};
 use crate::analyzer::{
     CodeUnit, CodeUnitType, DeclarationInfo, IAnalyzer, Language, Project, ProjectFile, Range,
 };
 use crate::searchtools_render::{RenderOptions, RenderText};
+use crate::test_support::rel_paths;
 use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -144,10 +145,6 @@ impl CodeUnitIndex for CountingAnalyzer {
         None
     }
 
-    fn indexed_source(&self, _file: &ProjectFile) -> Option<String> {
-        None
-    }
-
     fn analyzed_files(&self) -> Vec<ProjectFile> {
         self.analyzed_files_calls.fetch_add(1, Ordering::Relaxed);
         self.project
@@ -254,23 +251,7 @@ impl IAnalyzer for CountingAnalyzer {
     }
 
     fn update_all(&self) -> Self {
-        Self {
-            project: CountingProject::new(self.project.root.clone(), self.project.files.clone()),
-            unanalyzed: self.unanalyzed.clone(),
-            analyzed_files_calls: AtomicUsize::new(self.analyzed_files_calls()),
-            retain_analyzed_candidates: AtomicUsize::new(self.retain_analyzed_candidates()),
-            retain_analyzed_calls: AtomicUsize::new(self.retain_analyzed_calls()),
-            search_definitions_calls: AtomicUsize::new(self.search_definitions_calls()),
-            search_definition_results: self.search_definition_results.clone(),
-        }
-    }
-
-    fn extract_call_receiver(&self, _reference: &str) -> Option<String> {
-        None
-    }
-
-    fn import_statements_of(&self, _file: &ProjectFile) -> Vec<String> {
-        Vec::new()
+        self.update(&BTreeSet::new())
     }
 
     fn is_access_expression(
@@ -295,12 +276,6 @@ impl IAnalyzer for CountingAnalyzer {
     fn list_symbols(&self, file: &ProjectFile) -> String {
         format!("- {}", super::rel_path_string(file).replace('/', "_"))
     }
-}
-
-#[test]
-fn trims_synthetic_summary_lines() {
-    assert_eq!(trim_summary_signature("class A {\n}\n"), "class A");
-    assert_eq!(trim_summary_signature("[...]\n"), "");
 }
 
 #[test]
@@ -358,6 +333,9 @@ fn complete_symbol_index_skips_enclosing_owner_regex_scan() {
     assert_eq!(analyzer.search_definitions_calls(), 0);
 }
 
+#[brokk_bifrost_test_macros::hardwon(
+    "#1707: Runs a real Rust declaration through semantic outcome-key generation twice and verifies cached declaration context is reused once"
+)]
 #[test]
 fn definition_outcome_key_reuses_declaration_context() {
     use crate::analyzer::usages::get_definition::{
@@ -394,6 +372,9 @@ fn definition_outcome_key_reuses_declaration_context() {
     assert_eq!(render_cache.declaration_context_count(), 1);
 }
 
+#[brokk_bifrost_test_macros::hardwon(
+    "0f945d6a0f14: Python file summaries emitted module functions twice through top-level and synthetic-module ownership"
+)]
 #[test]
 fn python_module_functions_are_not_duplicated_in_file_summary() {
     use crate::analyzer::{Language, PythonAnalyzer, TestProject};
@@ -436,6 +417,9 @@ return 0
     );
 }
 
+#[brokk_bifrost_test_macros::hardwon(
+    "#1431: Fix regression #1431: a Java source block using CR-only line endings must report the same multi-line span as its content"
+)]
 #[test]
 fn issue_1431_source_block_end_line_counts_cr_only_terminators() {
     use crate::analyzer::{JavaAnalyzer, Language, TestProject};
@@ -480,29 +464,6 @@ fn issue_1431_source_block_end_line_counts_cr_only_terminators() {
         expected_rows,
         "end_line must count CR-only terminators like start_line does: {block:#?}"
     );
-}
-
-#[test]
-fn literal_file_pattern_uses_project_lookup_without_scanning_analyzed_files() {
-    let root = std::env::current_dir().unwrap();
-    let analyzer = CountingAnalyzer::new(root, &["A.java", "nested/B.java"]);
-    let files = resolve_file_patterns(&analyzer, &["nested/B.java".to_string()], None);
-
-    assert_eq!(vec!["nested/B.java"], rel_paths(&files.files));
-    assert!(files.ambiguous_paths.is_empty());
-    assert_eq!(0, analyzer.analyzed_files_calls());
-}
-
-#[test]
-fn summary_literal_file_target_avoids_directory_scan() {
-    let root = std::env::current_dir().unwrap();
-    let analyzer = CountingAnalyzer::new(root, &["A.java", "nested/B.java"]);
-
-    let targets = route_summary_targets(&analyzer, &["nested/B.java".to_string()]);
-
-    assert_eq!(vec!["nested/B.java"], rel_paths(&targets.file_targets));
-    assert!(targets.listings.is_empty());
-    assert_eq!(0, analyzer.analyzed_files_calls());
 }
 
 #[test]
@@ -641,25 +602,6 @@ fn glob_target_excludes_listed_but_unanalyzed_file() {
     );
 }
 
-#[test]
-fn file_pattern_resolution_deduplicates_literal_and_glob_matches() {
-    let root = std::env::current_dir().unwrap();
-    let analyzer = CountingAnalyzer::new(root, &["A.java", "nested/B.java"]);
-    let files = resolve_file_patterns(
-        &analyzer,
-        &[
-            "nested/B.java".to_string(),
-            "nested/*.java".to_string(),
-            "nested/B.java".to_string(),
-        ],
-        None,
-    );
-
-    assert_eq!(vec!["nested/B.java"], rel_paths(&files.files));
-    assert!(files.ambiguous_paths.is_empty());
-    assert_eq!(0, analyzer.analyzed_files_calls());
-}
-
 /// The fan-out cap decides on the match count alone. A target the tool is going
 /// to skip must not first be validated file by file: that is what made a 1.3 KB
 /// `too_broad` reply cost 248 s on the Firefox tree (#1738).
@@ -701,81 +643,6 @@ fn too_broad_glob_reports_before_validating_any_file() {
         "a rejected target must cost the match count and nothing else"
     );
     assert_eq!(0, analyzer.analyzed_files_calls());
-}
-
-#[test]
-fn bare_filename_repairs_uniquely_without_scanning_analyzed_files() {
-    let root = std::env::current_dir().unwrap();
-    let analyzer = CountingAnalyzer::new(root, &["nested/B.java", "other/C.java"]);
-    let files = resolve_file_patterns(&analyzer, &["B.java".to_string()], None);
-
-    assert_eq!(vec!["nested/B.java"], rel_paths(&files.files));
-    assert!(files.ambiguous_paths.is_empty());
-    assert_eq!(0, analyzer.analyzed_files_calls());
-}
-
-#[test]
-fn bare_filename_reports_ambiguity_without_guessing() {
-    let root = std::env::current_dir().unwrap();
-    let analyzer = CountingAnalyzer::new(root, &["src/B.java", "nested/B.java"]);
-    let files = resolve_file_patterns(&analyzer, &["B.java".to_string()], None);
-
-    assert!(files.files.is_empty());
-    assert_eq!(1, files.ambiguous_paths.len());
-    assert_eq!("B.java", files.ambiguous_paths[0].input);
-    assert_eq!(
-        vec!["nested/B.java".to_string(), "src/B.java".to_string()],
-        files.ambiguous_paths[0].matches
-    );
-    assert_eq!(0, analyzer.analyzed_files_calls());
-}
-
-#[test]
-fn list_symbols_uses_fast_literal_resolution() {
-    let root = std::env::current_dir().unwrap();
-    let analyzer = CountingAnalyzer::new(root, &["A.java"]);
-
-    let _ = list_symbols(
-        &analyzer,
-        super::FilePatternsParams {
-            file_patterns: vec!["A.java".to_string()],
-        },
-    );
-
-    assert_eq!(0, analyzer.analyzed_files_calls());
-}
-
-#[test]
-fn directory_targets_return_immediate_file_listings() {
-    let root = std::env::current_dir().unwrap();
-    let rel_paths: Vec<_> = (0..25)
-        .map(|index| format!("src/File{index}.java"))
-        .collect();
-    let rel_path_refs: Vec<_> = rel_paths.iter().map(String::as_str).collect();
-    let analyzer = CountingAnalyzer::new(root, &rel_path_refs);
-
-    let result = super::get_summaries(
-        &analyzer,
-        super::SummariesParams {
-            targets: vec!["src".to_string()],
-        },
-    );
-
-    assert!(result.summaries.is_empty());
-    assert!(result.not_found.is_empty());
-    assert_eq!(1, result.listings.len());
-    assert_eq!(25, result.listings[0].entries.len());
-    assert!(result.listings[0].entries.iter().all(|entry| matches!(
-        entry,
-        ContainerListingEntry::File { path, .. } if path.starts_with("src/File")
-    )));
-}
-
-fn rel_paths(files: &[ProjectFile]) -> Vec<String> {
-    files
-        .iter()
-        .map(|file| file.rel_path().to_string_lossy().replace('\\', "/"))
-        .collect()
 }
 
 #[test]
@@ -831,6 +698,7 @@ fn usage_row(path: &str, line: usize) -> UsageHitRow {
         end_offset: line,
         enclosing: "Caller.run".to_string(),
         kind: UsageHitKind::Reference,
+        reason_kind: None,
         snippet: "target();".to_string(),
         confidence: 1.0,
     }
@@ -1104,6 +972,9 @@ fn scan_usages_classifies_callsite_cap_and_graph_failure_rows() {
     assert_eq!(Some("no_graph_seed"), failure.reason_kind.as_deref());
 }
 
+#[brokk_bifrost_test_macros::hardwon(
+    "#1228: Uses a zero source-byte budget on a real Rust location scan and ensures an unscanned target is partial, not verified absent"
+)]
 #[test]
 fn issue_1228_source_budget_never_reports_verified_absence() {
     use crate::analyzer::{RustAnalyzer, TestProject};
@@ -1157,6 +1028,9 @@ fn issue_1228_source_budget_never_reports_verified_absence() {
     );
 }
 
+#[brokk_bifrost_test_macros::hardwon(
+    "#3041: Exercises C label lookup with zero source budget and a one-callsite cap, verifying the distinct failure and TooManyCallsites outcomes"
+)]
 #[test]
 fn issue_3041_c_label_usage_respects_source_and_callsite_budgets() {
     use crate::test_support::AnalyzerFixture;
@@ -1223,6 +1097,9 @@ fn issue_3041_c_label_usage_respects_source_and_callsite_budgets() {
     assert_eq!(result.results[0].limit, Some(1));
 }
 
+#[brokk_bifrost_test_macros::hardwon(
+    "#1228: Uses a zero wall-clock budget on a Rust scan and checks explicit time-budget diagnostics and serialized reason without claiming absence"
+)]
 #[test]
 fn issue_1228_time_budget_is_explicit_and_never_reports_verified_absence() {
     use crate::analyzer::{RustAnalyzer, TestProject};
@@ -1284,150 +1161,6 @@ fn issue_1228_time_budget_is_explicit_and_never_reports_verified_absence() {
     assert_eq!(json["results"][0]["reason_kind"], "time_budget");
 }
 
-/// #1100: `TestFileExclusion` decides membership from paths alone instead of
-/// hydrating every file's FileState. This pins the equivalence argument: the
-/// path-only predicate must produce exactly the set the full classification
-/// would exclude (Test and TestSupport are both excluded and both require
-/// `test_like`; Production/Ambiguous are never test_like), across fixtures
-/// covering all classification shapes.
-#[test]
-fn test_file_exclusion_path_predicate_matches_full_classification() {
-    let temp = tempfile::TempDir::new().unwrap();
-    let root = temp.path();
-    for (path, content) in [
-        ("src/prod.ts", "export function prod() { return 1; }\n"),
-        (
-            "tests/spec.test.ts",
-            "import { prod } from '../src/prod';\ntest('t', () => { prod(); });\n",
-        ),
-        (
-            "tests/helper.ts",
-            "import { prod } from '../src/prod';\nexport const h = prod();\n",
-        ),
-        (
-            "src/thing.test.ts",
-            "import { prod } from './prod';\ntest('u', () => { prod(); });\n",
-        ),
-        ("src/other.ts", "export const o = 2;\n"),
-    ] {
-        let full = root.join(path);
-        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
-        std::fs::write(full, content).unwrap();
-    }
-    let project = crate::analyzer::TestProject::new(root.to_path_buf(), Language::TypeScript);
-    let analyzer = crate::analyzer::TypescriptAnalyzer::from_project(project);
-
-    let exclusion =
-        super::scan_usages::test_file_exclusion(&analyzer, false).expect("an exclusion");
-    let by_path: crate::hash::HashSet<ProjectFile> = analyzer
-        .analyzed_files()
-        .into_iter()
-        .filter(|file| exclusion.excludes(file))
-        .collect();
-    let by_classification: crate::hash::HashSet<ProjectFile> = analyzer
-        .analyzed_files()
-        .into_iter()
-        .filter(|file| {
-            matches!(
-                super::scan_usages::classify_resolved_test_file(&analyzer, file).kind,
-                super::scan_usages::TestFileKind::Test
-                    | super::scan_usages::TestFileKind::TestSupport
-            )
-        })
-        .collect();
-    assert_eq!(
-        by_path, by_classification,
-        "path-only exclusion must equal full-classification exclusion"
-    );
-    assert!(
-        !by_path.is_empty(),
-        "fixture must actually produce excluded files or the equivalence is vacuous"
-    );
-}
-
-/// The scan prologue must not pre-classify the workspace. `excluded_test_files`
-/// used to build its exclusion set by asking `is_test_like_file` about every
-/// analyzed file before any symbol work: 29,748 files and 2.30-2.78 s of a 3 s
-/// budget on the rustc tree, with `file_is_test_only` pulling the Rust
-/// cargo-route index in behind it
-/// (`.agents/docs/gate-cell-overhead-2026-08.md`). The classification is now
-/// driven by the candidate filter, so a scan whose target has a handful of
-/// candidate files classifies a handful of files.
-///
-/// The pin is the ratio, not a constant: the fixture's workspace is an order of
-/// magnitude larger than the candidate set, and the count has to track the
-/// candidates. Under the pre-classifying shape this assertion reads the
-/// workspace size and fails.
-#[test]
-fn a_scan_classifies_its_candidate_files_not_its_workspace() {
-    let temp = tempfile::TempDir::new().unwrap();
-    let root = temp.path();
-    // One production file the scan resolves in, one caller that references it,
-    // and a large unrelated remainder — half of it under `tests/`, so the
-    // eager set-build had real work to do on every one of them.
-    std::fs::create_dir_all(root.join("src")).unwrap();
-    std::fs::create_dir_all(root.join("tests")).unwrap();
-    std::fs::write(
-        root.join("src/target.ts"),
-        "export function scanned_target() { return 1; }\n",
-    )
-    .unwrap();
-    std::fs::write(
-        root.join("src/caller.ts"),
-        "import { scanned_target } from './target';\nexport const used = scanned_target();\n",
-    )
-    .unwrap();
-    const UNRELATED: usize = 200;
-    for index in 0..UNRELATED {
-        std::fs::write(
-            root.join(format!("src/unrelated_{index}.ts")),
-            format!("export function unrelated_{index}() {{ return {index}; }}\n"),
-        )
-        .unwrap();
-        std::fs::write(
-            root.join(format!("tests/unrelated_{index}.test.ts")),
-            format!("test('u{index}', () => {{ expect({index}).toBe({index}); }});\n"),
-        )
-        .unwrap();
-    }
-    let project = crate::analyzer::TestProject::new(root.to_path_buf(), Language::TypeScript);
-    let analyzer = crate::analyzer::TypescriptAnalyzer::from_project(project);
-    let workspace_files = analyzer.analyzed_files().len();
-    assert!(
-        workspace_files >= 2 * UNRELATED,
-        "fixture must be workspace-scale: {workspace_files} files"
-    );
-
-    let exclusion =
-        super::scan_usages::test_file_exclusion(&analyzer, false).expect("an exclusion");
-    assert_eq!(
-        0,
-        exclusion.classified_count(),
-        "building the exclusion must classify nothing"
-    );
-
-    let overloads: Vec<CodeUnit> = analyzer.definitions("scanned_target").collect();
-    assert!(!overloads.is_empty(), "fixture target must resolve");
-    let query = super::scan_usages::scoped_usage_finder(Some(&exclusion), None).query(
-        &analyzer,
-        &overloads,
-        crate::analyzer::usages::DEFAULT_MAX_FILES,
-        crate::analyzer::usages::DEFAULT_MAX_USAGES,
-    );
-    assert!(
-        !query.candidate_files.is_empty(),
-        "the scan must have read candidate files: {:?}",
-        query.candidate_files
-    );
-    let classified = exclusion.classified_count();
-    assert!(
-        classified <= 4 * query.candidate_files.len(),
-        "classification must track the candidate set ({} files), not the workspace \
-         ({workspace_files} files): {classified} classified",
-        query.candidate_files.len()
-    );
-}
-
 #[test]
 fn issue_1228_symbol_lookup_batches_have_count_and_byte_limits() {
     let too_many = serde_json::json!({
@@ -1445,6 +1178,9 @@ fn issue_1228_symbol_lookup_batches_have_count_and_byte_limits() {
     assert!(error.to_string().contains("each symbol"), "{error}");
 }
 
+#[brokk_bifrost_test_macros::hardwon(
+    "#1228: Runs location navigation through Rust resolution with a controlled cancellation point and verifies cancellation reaches the result diagnostics"
+)]
 #[test]
 fn issue_1228_navigation_cancellation_reaches_rust_resolution() {
     use crate::analyzer::{RustAnalyzer, TestProject};
@@ -1698,6 +1434,9 @@ fn a_refusing_definition_status_is_never_reported_as_complete() {
     );
 }
 
+#[brokk_bifrost_test_macros::hardwon(
+    "#1228: Retains the ignored #1228 live Rust navigation witness, which compares uncancelled MCP semantics with direct results across imports, calls, fields, macros, and associated types"
+)]
 #[test]
 #[ignore = "finds real bugs: six of twelve definition queries fail for reasons measured to be independent of the qualified type (removing only the `<Service as Runner>::Output` line and its row reproduces the same six): `no_indexed_definition` for the aliased import, the glob import, the trait-receiver method and the `Service` type annotation, and `incomplete_binding` for `Service::new` and `crate::api::helper`. The projection member `Output` additionally has no declaration at all, because trait and inherent impl associated types are skipped as `UnsupportedMemberScope`. The qualified-type poison itself is fixed: the head lowers as ordinary type references and the member as a qualified reference carrying a type-shaped `UnsupportedTypeSyntax` gap, with no `MalformedSyntax` recorded for valid syntax. Measured 2026-09-12 on lane B R2.B Rust reference lowering"]
 fn issue_1228_uncancelled_mcp_rust_navigation_matches_direct_semantics() {
@@ -2030,6 +1769,9 @@ fn search_symbols_under_candidate_cap_ranks_and_reports_files_as_before() {
 /// full of matching symbols. The declarations here go through the real
 /// store-backed candidate path, so the glob interpretation and its
 /// required-literal prefilter are both exercised.
+#[brokk_bifrost_test_macros::hardwon(
+    "#3279: Fix regression #3279: leading-wildcard patterns are parsed as globs, return matching store-backed declarations, and do not become invalid regexes"
+)]
 #[test]
 fn search_symbols_matches_leading_wildcard_patterns_as_globs() {
     use crate::analyzer::{JavaAnalyzer, TestProject};
@@ -2082,6 +1824,9 @@ fn search_symbols_matches_leading_wildcard_patterns_as_globs() {
 
 /// A pattern that is neither regex nor glob is a malformed request, and the
 /// answer must say so instead of reporting the absence of symbols (#3279).
+#[brokk_bifrost_test_macros::hardwon(
+    "#3279: Checks a pattern that is neither valid regex nor glob is reported as invalid while another valid pattern still returns symbols"
+)]
 #[test]
 fn search_symbols_reports_uninterpretable_patterns_instead_of_matching_nothing() {
     use crate::analyzer::{JavaAnalyzer, TestProject};
@@ -2124,6 +1869,9 @@ fn search_symbols_reports_uninterpretable_patterns_instead_of_matching_nothing()
 /// comment ran the attached-comment walk from any one macro back to line 1, so
 /// a one-line macro's `SourceBlock` reported `start_line: 1` and carried the
 /// whole preamble as its text.
+#[brokk_bifrost_test_macros::hardwon(
+    "#1775: Fix regression #1775: C++ preprocessor directives stay outside macro source blocks while an actual null-directive comment remains attached"
+)]
 #[test]
 fn issue_1775_cpp_directive_lines_do_not_join_a_macros_comment_block() {
     use crate::analyzer::{CppAnalyzer, TestProject};
@@ -2240,6 +1988,9 @@ fn preferred_definition_stays_within_the_requested_overload_ranges() {
 /// is declared once per file in it, and the outline lists every defining file,
 /// which is why `definitions` cannot answer this: its definition ordering
 /// keeps one module per name on purpose.
+#[brokk_bifrost_test_macros::hardwon(
+    "#2880: Checks a Java package outline lists all three defining files through indexed lookup without hydrating the workspace declaration inventory"
+)]
 #[test]
 fn module_outline_lists_defining_files_without_a_workspace_declaration_scan() {
     use crate::analyzer::AnalyzerConfig;
@@ -2298,110 +2049,4 @@ fn module_outline_lists_defining_files_without_a_workspace_declaration_scan() {
         0,
         "the module outline must resolve its defining files by name, not by scanning the workspace"
     );
-}
-
-/// Pins the complete output of a usage scan for a method name that many
-/// types share, so work that changes how a scan gets its answer cannot change
-/// the answer (#3761).
-///
-/// The fixture is tract's `name` in miniature: a trait method implemented by
-/// several ops in one crate, an unrelated inherent `name`, and calls through a
-/// trait object, a generic bound, concrete receivers and a second crate. Both
-/// an implementation and the trait method are scanned, and each result is
-/// pinned as its serialized JSON and as the text the MCP tool returns.
-///
-/// Regenerate the expected file only for an intended output change: set
-/// `BIFROST_3761_WRITE_ACTUAL` to a path, run the test, review the file it
-/// writes and copy it over `testdata/scan-usages/issue-3761-shared-name.txt`.
-#[test]
-fn issue_3761_shared_method_name_usages_are_pinned() {
-    use crate::analyzer::RustAnalyzer;
-    use crate::inline_project::InlineTestProject;
-
-    let fixture = InlineTestProject::with_language(Language::Rust)
-        .file(
-            "Cargo.toml",
-            "[workspace]\nmembers = [\"opcore\", \"app\"]\nresolver = \"2\"\n",
-        )
-        .file(
-            "opcore/Cargo.toml",
-            "[package]\nname = \"opcore\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-        )
-        .file(
-            "opcore/src/lib.rs",
-            "pub mod graph;\npub mod ops;\n\npub trait Op {\n    fn name(&self) -> String;\n}\n",
-        )
-        .file(
-            "opcore/src/ops.rs",
-            "use crate::Op;\n\
-             \n\
-             pub struct Add;\n\
-             pub struct Mul;\n\
-             pub struct Tensor {\n    label: String,\n}\n\
-             \n\
-             impl Op for Add {\n    fn name(&self) -> String {\n        \"add\".into()\n    }\n}\n\
-             \n\
-             impl Op for Mul {\n    fn name(&self) -> String {\n        format!(\"mul-{}\", Add.name())\n    }\n}\n\
-             \n\
-             impl Tensor {\n    pub fn name(&self) -> &str {\n        &self.label\n    }\n}\n",
-        )
-        .file(
-            "opcore/src/graph.rs",
-            "use crate::ops::{Add, Mul, Tensor};\n\
-             use crate::Op;\n\
-             \n\
-             pub fn describe(op: &dyn Op) -> String {\n    op.name()\n}\n\
-             \n\
-             pub fn generic<T: Op>(op: &T) -> String {\n    op.name()\n}\n\
-             \n\
-             pub fn concrete(add: &Add, mul: &Mul) -> String {\n    add.name() + &mul.name()\n}\n\
-             \n\
-             pub fn tensor(tensor: &Tensor) -> String {\n    tensor.name().to_string()\n}\n\
-             \n\
-             pub fn qualified(add: &Add) -> String {\n    Op::name(add) + &<Add as Op>::name(add)\n}\n",
-        )
-        .file(
-            "app/Cargo.toml",
-            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
-             [dependencies]\nopcore = { path = \"../opcore\" }\n",
-        )
-        .file(
-            "app/src/main.rs",
-            "use opcore::ops::{Add, Mul};\n\
-             use opcore::Op;\n\
-             \n\
-             fn main() {\n    let ops: Vec<Box<dyn Op>> = vec![Box::new(Add), Box::new(Mul)];\n    for op in &ops {\n        println!(\"{}\", op.name());\n    }\n    println!(\"{}\", Add.name());\n}\n",
-        )
-        .build();
-    let analyzer = RustAnalyzer::new(fixture.project_dyn());
-
-    let mut actual = String::new();
-    // `Add::name` on line 10 of ops.rs, then the trait's `name` on line 5 of lib.rs.
-    for (path, line) in [("opcore/src/ops.rs", 10), ("opcore/src/lib.rs", 5)] {
-        let result = super::scan_usages_by_location(
-            &analyzer,
-            ScanUsagesByLocationParams {
-                targets: vec![ScanUsagesTarget {
-                    path: path.to_string(),
-                    line,
-                    column: None,
-                    symbol: None,
-                }],
-                include_tests: false,
-                paths: None,
-                include_same_owner: false,
-            },
-        );
-        actual.push_str(&format!("=== {path}:{line} json\n"));
-        actual.push_str(&serde_json::to_string_pretty(&result).expect("result serializes"));
-        actual.push_str(&format!("\n=== {path}:{line} text\n"));
-        actual.push_str(&result.render_text(RenderOptions::default()));
-        actual.push('\n');
-    }
-    let expected =
-        include_str!("../../testdata/scan-usages/issue-3761-shared-name.txt").replace("\r\n", "\n");
-    if let Ok(path) = std::env::var("BIFROST_3761_WRITE_ACTUAL") {
-        std::fs::write(path, &actual).expect("write actual scan output");
-    }
-    assert_eq!(expected, actual);
 }

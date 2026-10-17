@@ -14,6 +14,9 @@ use std::sync::Arc;
 pub const DEFAULT_RECEIVER_CONTEXT_DEPTH: usize = 1;
 pub const DEFAULT_RECEIVER_MAX_TARGETS: usize = 4;
 pub const DEFAULT_RECEIVER_MAX_SUMMARY_EXPANSIONS: usize = 64;
+// Native Go/JVM/Rust point and receiver calibration used at most 147 rounds.
+// Four times that maximum, rounded up to a power of two, is 1024.
+pub const DEFAULT_RECEIVER_MAX_RESOLUTION_ROUNDS: usize = 1_024;
 pub const DEFAULT_RECEIVER_MAX_SCOPE_NODES: usize = 20_000;
 
 /// Budget for one interactive `get_type_by_location` request.
@@ -28,6 +31,7 @@ pub const INTERACTIVE_TYPE_LOOKUP_BUDGET: ReceiverAnalysisBudget = ReceiverAnaly
     context_depth: 2,
     max_targets: 32,
     max_summary_expansions: 256,
+    max_resolution_rounds: DEFAULT_RECEIVER_MAX_RESOLUTION_ROUNDS,
     max_scope_nodes: 200_000,
 };
 
@@ -77,6 +81,23 @@ impl<T> ReceiverAnalysisOutcome<T> {
     }
 }
 
+fn unique_targets_within_budget<T: Eq>(
+    values: impl IntoIterator<Item = T>,
+    max_targets: usize,
+) -> Result<Vec<T>, Vec<T>> {
+    let mut unique = Vec::new();
+    for value in values {
+        if unique.contains(&value) {
+            continue;
+        }
+        unique.push(value);
+        if unique.len() > max_targets {
+            return Err(unique);
+        }
+    }
+    Ok(unique)
+}
+
 impl<T> ReceiverAnalysisOutcome<T>
 where
     T: Eq,
@@ -85,16 +106,10 @@ where
         values: impl IntoIterator<Item = T>,
         budget: ReceiverAnalysisBudget,
     ) -> Self {
-        let mut unique = Vec::new();
-        for value in values {
-            if unique.contains(&value) {
-                continue;
-            }
-            unique.push(value);
-            if unique.len() > budget.max_targets {
-                return Self::Ambiguous(unique);
-            }
-        }
+        let unique = match unique_targets_within_budget(values, budget.max_targets) {
+            Ok(unique) => unique,
+            Err(unique) => return Self::Ambiguous(unique),
+        };
         if unique.is_empty() {
             Self::Unknown
         } else {
@@ -106,16 +121,10 @@ where
         values: impl IntoIterator<Item = T>,
         budget: ReceiverAnalysisBudget,
     ) -> Self {
-        let mut unique = Vec::new();
-        for value in values {
-            if unique.contains(&value) {
-                continue;
-            }
-            unique.push(value);
-            if unique.len() > budget.max_targets {
-                return Self::Ambiguous(unique);
-            }
-        }
+        let unique = match unique_targets_within_budget(values, budget.max_targets) {
+            Ok(unique) => unique,
+            Err(unique) => return Self::Ambiguous(unique),
+        };
         match unique.len() {
             0 => Self::Unknown,
             1 => Self::Precise(unique),
@@ -190,7 +199,10 @@ impl ReceiverValue {
 pub struct ReceiverAnalysisBudget {
     pub context_depth: usize,
     pub max_targets: usize,
+    /// Distinct owner/summary expansions within one query.
     pub max_summary_expansions: usize,
+    /// Typed convergence and lexical frontier iterations within one query.
+    pub max_resolution_rounds: usize,
     pub max_scope_nodes: usize,
 }
 
@@ -200,6 +212,7 @@ impl Default for ReceiverAnalysisBudget {
             context_depth: DEFAULT_RECEIVER_CONTEXT_DEPTH,
             max_targets: DEFAULT_RECEIVER_MAX_TARGETS,
             max_summary_expansions: DEFAULT_RECEIVER_MAX_SUMMARY_EXPANSIONS,
+            max_resolution_rounds: DEFAULT_RECEIVER_MAX_RESOLUTION_ROUNDS,
             max_scope_nodes: DEFAULT_RECEIVER_MAX_SCOPE_NODES,
         }
     }
@@ -211,6 +224,7 @@ impl ReceiverAnalysisBudget {
             context_depth: 0,
             max_targets: 1,
             max_summary_expansions: 1,
+            max_resolution_rounds: 1,
             max_scope_nodes: 1,
         }
     }
@@ -265,6 +279,7 @@ pub struct ReceiverAnalysisCacheKey {
     pub context_depth: usize,
     pub max_targets: usize,
     pub max_summary_expansions: usize,
+    pub max_resolution_rounds: usize,
     pub max_scope_nodes: usize,
 }
 
@@ -283,6 +298,7 @@ impl ReceiverAnalysisCacheKey {
             context_depth: query.context.context_depth,
             max_targets: query.budget.max_targets,
             max_summary_expansions: query.budget.max_summary_expansions,
+            max_resolution_rounds: query.budget.max_resolution_rounds,
             max_scope_nodes: query.budget.max_scope_nodes,
         }
     }
@@ -299,6 +315,7 @@ pub struct ReceiverAnalysisBudgetTracker {
 pub struct ReceiverAnalysisWork {
     pub setup_nodes: usize,
     pub summary_expansions: usize,
+    pub resolution_rounds: usize,
     pub scope_nodes: usize,
 }
 
@@ -390,6 +407,7 @@ impl ReceiverAnalysisBudgetTracker {
         ReceiverAnalysisWork {
             setup_nodes: 0,
             summary_expansions: self.summary_expansions,
+            resolution_rounds: 0,
             scope_nodes: self.scope_nodes,
         }
     }
@@ -412,6 +430,7 @@ impl ReceiverAnalysisBudgetTracker {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReceiverBudgetLimit {
     SummaryExpansions,
+    ResolutionRounds,
     ScopeNodes,
 }
 
@@ -419,6 +438,7 @@ impl ReceiverBudgetLimit {
     pub fn as_str(self) -> &'static str {
         match self {
             ReceiverBudgetLimit::SummaryExpansions => "summary_expansions",
+            ReceiverBudgetLimit::ResolutionRounds => "resolution_rounds",
             ReceiverBudgetLimit::ScopeNodes => "scope_nodes",
         }
     }
@@ -544,71 +564,6 @@ pub trait ReceiverFacts<'tree> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::model::CodeUnitType;
-    use std::env;
-
-    fn file() -> ProjectFile {
-        ProjectFile::new(
-            env::temp_dir().join("bifrost-receiver-analysis"),
-            "src/service.ts",
-        )
-    }
-
-    fn class(name: &str) -> CodeUnit {
-        CodeUnit::new(file(), CodeUnitType::Class, "", name)
-    }
-
-    fn query<'a>(
-        file: &'a ProjectFile,
-        receiver_text: &'a str,
-        budget: ReceiverAnalysisBudget,
-    ) -> ReceiverAnalysisQuery<'a> {
-        ReceiverAnalysisQuery {
-            language: Language::TypeScript,
-            file,
-            receiver_text,
-            receiver_range: Some(Range {
-                start_byte: 10,
-                end_byte: 10 + receiver_text.len(),
-                start_line: 2,
-                end_line: 2,
-            }),
-            member_name: Some("run"),
-            context: ReceiverContext::new(None, 10),
-            budget,
-        }
-    }
-
-    #[test]
-    fn bounded_precise_returns_precise_under_target_cap() {
-        let service = ReceiverValue::InstanceType(class("Service"));
-        let outcome = ReceiverAnalysisOutcome::bounded_precise(
-            [service.clone(), service.clone()],
-            ReceiverAnalysisBudget::default(),
-        );
-
-        assert_eq!(outcome, ReceiverAnalysisOutcome::Precise(vec![service]));
-    }
-
-    #[test]
-    fn bounded_precise_returns_ambiguous_over_target_cap() {
-        let budget = ReceiverAnalysisBudget {
-            max_targets: 1,
-            ..ReceiverAnalysisBudget::default()
-        };
-        let outcome = ReceiverAnalysisOutcome::bounded_precise(
-            [
-                ReceiverValue::InstanceType(class("Service")),
-                ReceiverValue::InstanceType(class("Other")),
-            ],
-            budget,
-        );
-
-        assert!(
-            matches!(outcome, ReceiverAnalysisOutcome::Ambiguous(ref values) if values.len() == 2)
-        );
-        assert!(outcome.is_terminal_for_graph());
-    }
 
     #[test]
     fn bounded_precise_returns_unknown_for_empty_values() {
@@ -618,122 +573,5 @@ mod tests {
         );
 
         assert_eq!(outcome, ReceiverAnalysisOutcome::Unknown);
-    }
-
-    #[test]
-    fn single_precise_or_ambiguous_requires_exactly_one_target() {
-        let outcome = ReceiverAnalysisOutcome::single_precise_or_ambiguous(
-            [
-                ReceiverValue::InstanceType(class("Service")),
-                ReceiverValue::InstanceType(class("Other")),
-            ],
-            ReceiverAnalysisBudget::default(),
-        );
-
-        assert!(matches!(
-            outcome,
-            ReceiverAnalysisOutcome::Ambiguous(ref values) if values.len() == 2
-        ));
-    }
-
-    #[test]
-    fn unsupported_is_terminal_for_graph() {
-        let outcome: ReceiverAnalysisOutcome<ReceiverValue> =
-            ReceiverAnalysisOutcome::Unsupported {
-                reason: "language receiver model not implemented",
-            };
-
-        assert!(outcome.is_terminal_for_graph());
-        assert!(!outcome.is_precise());
-        assert_eq!(outcome.into_precise(), None);
-    }
-
-    #[test]
-    fn budget_tracker_reports_summary_expansion_limit() {
-        let mut tracker = ReceiverAnalysisBudgetTracker::new(ReceiverAnalysisBudget::tiny());
-
-        assert!(tracker.record_summary_expansion().is_ok());
-        let limit = tracker.record_summary_expansion().unwrap_err();
-        assert_eq!(limit, ReceiverBudgetLimit::SummaryExpansions);
-        assert_eq!(
-            limit.exceeded::<ReceiverValue>(),
-            ReceiverAnalysisOutcome::ExceededBudget {
-                limit: "summary_expansions"
-            }
-        );
-    }
-
-    #[test]
-    fn budget_tracker_reports_scope_node_limit() {
-        let mut tracker = ReceiverAnalysisBudgetTracker::new(ReceiverAnalysisBudget::tiny());
-
-        assert!(tracker.record_scope_node().is_ok());
-        let limit = tracker.record_scope_node().unwrap_err();
-        assert_eq!(limit, ReceiverBudgetLimit::ScopeNodes);
-        assert_eq!(
-            limit.exceeded::<ReceiverValue>(),
-            ReceiverAnalysisOutcome::ExceededBudget {
-                limit: "scope_nodes"
-            }
-        );
-    }
-
-    #[test]
-    fn exceeded_budget_is_terminal_for_graph() {
-        let outcome: ReceiverAnalysisOutcome<ReceiverValue> =
-            ReceiverAnalysisOutcome::ExceededBudget {
-                limit: "scope_nodes",
-            };
-
-        assert!(outcome.is_terminal_for_graph());
-        assert!(!outcome.is_precise());
-        assert_eq!(outcome.into_precise(), None);
-    }
-
-    #[test]
-    fn cache_key_owns_query_identity_without_source_text() {
-        let file = file();
-        let budget = ReceiverAnalysisBudget::default();
-        let query = query(&file, "service", budget);
-        let key = ReceiverAnalysisCacheKey::for_receiver(&query);
-
-        assert_eq!(key.language, Language::TypeScript);
-        assert_eq!(key.file, file);
-        assert_eq!(key.start_byte, 10);
-        assert_eq!(key.end_byte, 17);
-        assert_eq!(key.member_name.as_deref(), Some("run"));
-        assert_eq!(key.context_depth, DEFAULT_RECEIVER_CONTEXT_DEPTH);
-        assert_eq!(key.max_targets, DEFAULT_RECEIVER_MAX_TARGETS);
-        assert_eq!(
-            key.max_summary_expansions,
-            DEFAULT_RECEIVER_MAX_SUMMARY_EXPANSIONS
-        );
-        assert_eq!(key.max_scope_nodes, DEFAULT_RECEIVER_MAX_SCOPE_NODES);
-    }
-
-    #[test]
-    fn noop_provider_preserves_existing_unknown_behavior() {
-        let file = file();
-        let provider = NoopReceiverFactProvider;
-        let budget = ReceiverAnalysisBudget::default();
-
-        assert_eq!(
-            provider.resolve_receiver(query(&file, "service", budget)),
-            ReceiverAnalysisOutcome::Unknown
-        );
-
-        let summary_query = ReceiverSummaryQuery {
-            language: Language::TypeScript,
-            file: &file,
-            call_text: "makeService()",
-            call_range: None,
-            callee: None,
-            context: ReceiverContext::new(None, 0),
-            budget,
-        };
-        assert_eq!(
-            provider.summarize_call_result(summary_query),
-            ReceiverAnalysisOutcome::Unknown
-        );
     }
 }

@@ -4,6 +4,10 @@
 //! Graph construction, abrupt-completion routing, cleanup specialization, and
 //! physical adjacency storage remain owned by the shared semantic substrate.
 
+use crate::analyzer::semantic::lowering::{
+    ShortCircuitKind, field_matches, schedule_sequential_work, schedule_short_circuit_condition,
+    unique_map_value,
+};
 use tree_sitter::Node;
 
 use crate::analyzer::lexical_definitions::formal_parameter_slots_for_owner;
@@ -19,12 +23,23 @@ use crate::analyzer::semantic::*;
 use crate::analyzer::tree_sitter_analyzer::{
     PreparedSyntaxTree, WalkControl, try_walk_named_tree_preorder,
 };
+use crate::analyzer::tree_walk::call_arguments;
 use crate::analyzer::{CSharpAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_core::analyzer::parsed_file::{CSharpSemanticDeclarationKind, ParsedFile};
 use brokk_bifrost_core::analyzer::tree_walk::ParentIndex;
+use brokk_bifrost_core::analyzer::tree_walk::parent_if_field;
+use brokk_bifrost_csharp::structural::first_argument_value;
+use brokk_bifrost_csharp::syntax::{
+    csharp_accessor_owner, csharp_has_modifier as has_modifier,
+    csharp_is_member_variable_owner_kind, variable_declarator_initializer,
+};
 
-const ADAPTER_VERSION: &[u8] = b"csharp-value-semantics-v15";
+// Bumping this rotates every public wire id hashed from the adapter
+// fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
+// golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
+// change; the code-query tutorial pages elide such ids (#5016).
+const ADAPTER_VERSION: &[u8] = b"csharp-value-semantics-v22";
 
 /// How many declared slots one value-type copy duplicates.
 ///
@@ -38,14 +53,12 @@ struct CSharpSemanticLowerer;
 
 impl ProgramSemanticsLowerer for CSharpSemanticLowerer {
     fn identity(&self) -> SemanticAdapterIdentity {
-        SemanticAdapterIdentity {
-            adapter: AdapterSemanticsVersion::hash_bytes("csharp", ADAPTER_VERSION)
-                .expect("adapter name is non-empty"),
-            configuration: ConfigurationFingerprint::hash_bytes(
-                b"csharp-intrafile-execution-defaults-v1",
-            ),
-            dependencies: DependencyFingerprint::hash_bytes(b"no-intrafile-dependencies"),
-        }
+        SemanticAdapterIdentity::for_adapter(
+            "csharp",
+            ADAPTER_VERSION,
+            b"csharp-intrafile-execution-defaults-v1",
+            DependencyFingerprint::hash_bytes(b"no-intrafile-dependencies"),
+        )
     }
 
     fn capabilities(&self) -> SemanticCapabilities {
@@ -95,25 +108,14 @@ impl PrimaryDeclarationSemanticsLowerer for CSharpSemanticLowerer {
         cancellation: &CancellationToken,
     ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
         let (procedure_inventory, initial_work) =
-            match enumerate_procedures(file, prepared, primary, budget, cancellation)? {
-                ProcedureEnumeration::Complete {
+            match enumerate_procedures(file, prepared, primary, budget, cancellation)?
+                .into_lowering_input()
+            {
+                ProcedureLoweringInput::Complete {
                     value,
                     initial_work,
-                    ..
                 } => (value, initial_work),
-                ProcedureEnumeration::ExceededBudget { exceeded, work } => {
-                    return Ok(SemanticOutcome::ExceededBudget {
-                        partial: None,
-                        exceeded,
-                        work,
-                    });
-                }
-                ProcedureEnumeration::Cancelled { work } => {
-                    return Ok(SemanticOutcome::Cancelled {
-                        partial: None,
-                        work,
-                    });
-                }
+                ProcedureLoweringInput::Stopped(outcome) => return Ok(outcome),
             };
 
         let ProcedureInventory {
@@ -147,48 +149,16 @@ impl PrimaryDeclarationSemanticsLowerer for CSharpSemanticLowerer {
 }
 
 fn csharp_capabilities() -> SemanticCapabilities {
-    let mut builder = SemanticCapabilities::builder();
+    let mut builder = crate::analyzer::semantic::capabilities::tree_sitter_adapter_capabilities();
     for capability in [
-        SemanticCapability::Procedures,
-        SemanticCapability::EntryBoundary,
-        SemanticCapability::NormalExitBoundary,
-        SemanticCapability::ExceptionalExitBoundary,
-        SemanticCapability::BasicBlocks,
-        SemanticCapability::ProgramPoints,
-        SemanticCapability::ReturnFlow,
-        SemanticCapability::NormalCallContinuation,
-        SemanticCapability::ExceptionalCallContinuation,
-    ] {
-        builder = builder.complete(capability);
-    }
-    for capability in [
-        SemanticCapability::NormalControlFlow,
-        SemanticCapability::ExceptionalControlFlow,
-        SemanticCapability::CleanupControlFlow,
-        SemanticCapability::Calls,
-        SemanticCapability::DynamicDispatch,
-        SemanticCapability::CallableReferences,
-        SemanticCapability::Values,
-        SemanticCapability::Assignments,
-        SemanticCapability::Allocations,
-        SemanticCapability::LocalFlow,
-        SemanticCapability::ParameterFlow,
-        SemanticCapability::ReceiverFlow,
         // Partial, not complete: a write through a field, static, or indexer
         // target becomes a `MemoryStore` against a structured location, but
         // whether that location is the *declared* member is only known when
         // this file can resolve the base's type, so an unresolved occurrence
         // still publishes its own location-subject gap (#2661).
-        SemanticCapability::FieldMemory,
         SemanticCapability::StaticMemory,
-        SemanticCapability::IndexMemory,
-        SemanticCapability::Captures,
-        SemanticCapability::NonLocalControl,
-        SemanticCapability::ResourceManagement,
-        SemanticCapability::DeferredExecution,
         SemanticCapability::AsyncSuspendResume,
         SemanticCapability::GeneratorSuspension,
-        SemanticCapability::GuardFacts,
     ] {
         builder = builder.partial(capability);
     }
@@ -241,7 +211,7 @@ struct MemberDeclaration {
 /// A `None` value records a name that more than one declaration in this file
 /// claims. Such a name resolves to no single anchor, so an occurrence of it
 /// must decline rather than pick one arbitrarily -- the same collapse
-/// [`StaticCallableReturnTypes`] performs for an overloaded static method.
+/// [`StaticCallableReturnTypes`] performs for an overloaded method.
 type MemberDeclarations = HashMap<TypeMemberKey, Option<MemberDeclaration>>;
 
 /// One of C#'s predefined types, read from the grammar's `predefined_type`
@@ -478,6 +448,7 @@ enum CSharpDeclaredTypeKind {
 #[derive(Debug, Clone)]
 struct CSharpTypeDeclaration {
     start_byte: usize,
+    name: Box<str>,
     kind: CSharpDeclaredTypeKind,
     /// The declaring type's start byte when this declaration is nested. An
     /// unqualified occurrence outside that type does not name it.
@@ -517,6 +488,10 @@ struct CSharpTypeIndex {
     declarations: TypeDeclarations,
     /// Names bound by a `using X = ...;` alias anywhere in this file.
     aliases: HashSet<Box<str>>,
+    /// Direct base types keyed by the source declaration that names them.
+    /// `None` records a base type that this source-only index could not
+    /// resolve; such a base prevents a user-defined operator proof.
+    base_types: HashMap<usize, Vec<Option<CSharpTypeIdentity>>>,
     /// Instance storage per declared type, keyed by the declaration's start
     /// byte. A value-type copy duplicates exactly these slots.
     members: HashMap<usize, CSharpTypeMembers>,
@@ -547,6 +522,10 @@ struct CSharpTypeMembers {
     /// Declared instance fields, auto-properties, and field-like events, in
     /// declaration order.
     members: Vec<CSharpTypeMember>,
+    /// Whether this type declares a user-defined `operator +` in the source
+    /// visible to this lowering. A partial type keeps `exact` false, so the
+    /// absence of an operator is not treated as proof in that case.
+    has_user_defined_add_operator: bool,
     /// Whether this file enumerated every slot the type holds. A `partial`
     /// declaration, a positional record, and a member whose own type is
     /// another aggregate each leave state a one-level copy does not carry.
@@ -586,6 +565,48 @@ impl CSharpTypeIndex {
                 start_byte,
                 kind: *kind,
             })
+    }
+
+    fn declaration(&self, identity: CSharpTypeIdentity) -> Option<&CSharpTypeDeclaration> {
+        let CSharpTypeIdentity::Declared { start_byte, .. } = identity else {
+            return None;
+        };
+        self.declarations
+            .values()
+            .filter_map(Option::as_ref)
+            .find(|declaration| declaration.start_byte == start_byte)
+    }
+
+    fn has_no_user_defined_add_operator(&self, identity: CSharpTypeIdentity) -> bool {
+        let mut pending = vec![identity];
+        let mut visited = HashSet::default();
+        while let Some(identity) = pending.pop() {
+            match identity {
+                CSharpTypeIdentity::Predefined(CSharpPredefinedType::Object) => {}
+                CSharpTypeIdentity::Predefined(_) => return false,
+                CSharpTypeIdentity::Declared { start_byte, .. } => {
+                    if !visited.insert(start_byte) {
+                        return false;
+                    }
+                    let Some(members) = self.members.get(&start_byte) else {
+                        return false;
+                    };
+                    if !members.exact || members.has_user_defined_add_operator {
+                        return false;
+                    }
+                    let Some(base_types) = self.base_types.get(&start_byte) else {
+                        continue;
+                    };
+                    for base in base_types {
+                        let Some(base) = base else {
+                            return false;
+                        };
+                        pending.push(*base);
+                    }
+                }
+            }
+        }
+        true
     }
 
     fn member(&self, owner: CSharpTypeIdentity, name: &str) -> Option<&CSharpTypeMember> {
@@ -740,6 +761,7 @@ fn record_type_declaration(
     };
     let declaration = CSharpTypeDeclaration {
         start_byte: node.start_byte(),
+        name: Box::from(name.as_ref()),
         kind,
         container: enclosing_type_node(node).map(|owner| owner.start_byte()),
         namespace: enclosing_namespace_path(source, node),
@@ -749,6 +771,7 @@ fn record_type_declaration(
         node.start_byte(),
         CSharpTypeMembers {
             members: Vec::new(),
+            has_user_defined_add_operator: false,
             exact: !has_modifier(source, node, "partial")
                 && node.child_by_field_name("parameters").is_none(),
         },
@@ -774,6 +797,59 @@ struct PendingTypeMember<'tree> {
     owner: usize,
     member: CSharpTypeMember,
     declared_type: Option<Node<'tree>>,
+}
+
+/// One direct base-type reference awaiting the completed source type index.
+struct PendingBaseType<'tree> {
+    owner: usize,
+    base: Node<'tree>,
+}
+
+fn record_type_bases<'tree>(pending: &mut Vec<PendingBaseType<'tree>>, node: Node<'tree>) {
+    if !matches!(
+        node.kind(),
+        "class_declaration"
+            | "interface_declaration"
+            | "struct_declaration"
+            | "record_declaration"
+            | "record_struct_declaration"
+    ) {
+        return;
+    }
+    let Some(base_list) = named_children(node)
+        .into_iter()
+        .find(|child| child.kind() == "base_list")
+    else {
+        return;
+    };
+    for base in named_children(base_list) {
+        pending.push(PendingBaseType {
+            owner: node.start_byte(),
+            base,
+        });
+    }
+}
+
+fn base_type_node(node: Node<'_>) -> Option<Node<'_>> {
+    match node.kind() {
+        "simple_base_type" | "primary_constructor_base_type" => node
+            .child_by_field_name("type")
+            .or_else(|| first_named_child(node)),
+        _ => Some(node),
+    }
+}
+
+fn resolve_base_type(
+    type_index: &CSharpTypeIndex,
+    node: Node<'_>,
+    source: &str,
+) -> Option<CSharpTypeIdentity> {
+    let node = base_type_node(node)?;
+    type_index.resolve(node, source).or_else(|| {
+        let spelling = brokk_bifrost_csharp::syntax::csharp_type_node_identity(node, source);
+        matches!(spelling.as_str(), "object" | "System.Object")
+            .then_some(CSharpTypeIdentity::Predefined(CSharpPredefinedType::Object))
+    })
 }
 
 /// Whether a property declares storage of its own.
@@ -931,6 +1007,7 @@ fn enumerate_procedures<'tree>(
     let mut type_aliases = HashSet::<Box<str>>::default();
     let mut type_members = HashMap::<usize, CSharpTypeMembers>::default();
     let mut type_kinds = HashMap::<usize, CSharpDeclaredTypeKind>::default();
+    let mut pending_base_types: Vec<PendingBaseType<'tree>> = Vec::new();
     let mut pending_members: Vec<PendingTypeMember<'tree>> = Vec::new();
     let mut callable_nodes = Vec::new();
     let mut inexact_types = HashSet::<usize>::default();
@@ -981,6 +1058,17 @@ fn enumerate_procedures<'tree>(
             frame.node,
             prepared.source(),
         );
+        record_type_bases(&mut pending_base_types, frame.node);
+        if frame.node.kind() == "operator_declaration"
+            && frame
+                .node
+                .child_by_field_name("operator")
+                .is_some_and(|operator| operator.kind() == "+")
+            && let Some(owner) = enclosing_type_node(frame.node)
+            && let Some(members) = type_members.get_mut(&owner.start_byte())
+        {
+            members.has_user_defined_add_operator = true;
+        }
         record_type_members(
             &mut pending_members,
             &mut inexact_types,
@@ -1053,6 +1141,7 @@ fn enumerate_procedures<'tree>(
     let mut type_index = CSharpTypeIndex {
         declarations: type_declarations,
         aliases: type_aliases,
+        base_types: HashMap::default(),
         members: type_members,
         kinds: type_kinds,
         callables: HashMap::default(),
@@ -1061,6 +1150,14 @@ fn enumerate_procedures<'tree>(
         if let Some(row) = type_index.members.get_mut(&owner) {
             row.exact = false;
         }
+    }
+    for pending in pending_base_types {
+        let identity = resolve_base_type(&type_index, pending.base, prepared.source());
+        type_index
+            .base_types
+            .entry(pending.owner)
+            .or_default()
+            .push(identity);
     }
     for pending in pending_members {
         if cancellation.is_cancelled() {
@@ -1255,11 +1352,7 @@ fn declaration_container_kind(node: Node<'_>) -> Option<DeclarationSegmentKind> 
     }
 }
 
-fn declaration_container_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
-    node.child_by_field_name("name")
-        .and_then(|name| nonempty_node_text(source, name))
-        .map(Box::<str>::from)
-}
+use crate::analyzer::common::{declaration_container_name, is_comment_kind};
 
 fn callable_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
     if node.kind() == "constructor_declaration" && has_modifier(source, node, "static") {
@@ -1275,7 +1368,10 @@ fn callable_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
         let accessor = node
             .child_by_field_name("name")
             .and_then(|name| nonempty_node_text(source, name))?;
-        let owner = enclosing_accessor_owner(node)
+        let owner = node
+            .parent()
+            .filter(|parent| parent.kind() == "accessor_list")
+            .and_then(|_| csharp_accessor_owner(node, |node| node.parent()))
             .and_then(|owner| accessor_owner_name(source, owner))
             .unwrap_or_else(|| Box::<str>::from("<accessor>"));
         return Some(format!("{owner}.{accessor}").into_boxed_str());
@@ -1338,7 +1434,8 @@ fn primary_declaration_maps(
             .clone()
             .map(String::into_boxed_str);
         match declaration.kind {
-            CSharpSemanticDeclarationKind::StaticMethodReturn => match returns.entry(key) {
+            CSharpSemanticDeclarationKind::StaticMethodReturn
+            | CSharpSemanticDeclarationKind::InstanceMethodReturn => match returns.entry(key) {
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     entry.insert(type_spelling);
                 }
@@ -1404,13 +1501,6 @@ fn enclosing_namespace_path(source: &str, node: Node<'_>) -> Box<[Box<str>]> {
     }
     path.reverse();
     path.into_boxed_slice()
-}
-
-fn enclosing_accessor_owner(node: Node<'_>) -> Option<Node<'_>> {
-    let list = node.parent()?;
-    (list.kind() == "accessor_list")
-        .then(|| list.parent())
-        .flatten()
 }
 
 fn accessor_owner_name(source: &str, owner: Node<'_>) -> Option<Box<str>> {
@@ -1500,7 +1590,9 @@ fn callable_shape<'tree>(
             ProcedureKind::Accessor,
             DeclarationSegmentKind::Method,
             callable_body(node)?,
-            enclosing_accessor_owner(node)
+            node.parent()
+                .filter(|parent| parent.kind() == "accessor_list")
+                .and_then(|_| csharp_accessor_owner(node, |node| node.parent()))
                 .is_some_and(|owner| has_modifier(source, owner, "static")),
         ),
         "property_declaration" | "indexer_declaration"
@@ -1576,36 +1668,14 @@ fn callable_body(node: Node<'_>) -> Option<Node<'_>> {
     }
 }
 
-fn has_modifier(source: &str, node: Node<'_>, modifier: &str) -> bool {
-    named_children(node).into_iter().any(|child| {
-        child.kind() == "modifier" && node_text(source, child).is_some_and(|text| text == modifier)
-    })
-}
-
-fn has_direct_token(node: Node<'_>, kind: &str) -> bool {
-    let mut cursor = node.walk();
-    node.children(&mut cursor).any(|child| child.kind() == kind)
-}
+use brokk_bifrost_core::analyzer::tree_walk::has_child_of_kind as has_direct_token;
 
 fn body_contains_yield(body: Node<'_>) -> bool {
-    let mut stack = vec![body];
-    while let Some(node) = stack.pop() {
-        if node != body && is_callable_kind(node.kind()) {
-            continue;
-        }
-        if node.kind() == "yield_statement" {
-            return true;
-        }
-        let mut cursor = node.walk();
-        stack.extend(node.named_children(&mut cursor));
-    }
-    false
-}
-
-fn field_matches(parent: Node<'_>, field: &str, child: Node<'_>) -> bool {
-    parent
-        .child_by_field_name(field)
-        .is_some_and(|candidate| candidate.id() == child.id())
+    crate::analyzer::tree_walk::body_contains_kind_outside_nested_callables(
+        body,
+        "yield_statement",
+        is_callable_kind,
+    )
 }
 
 type CSharpLoweringError = ProcedureLoweringError;
@@ -1729,7 +1799,13 @@ struct LoweringContext<'tree, 'targets> {
     parameters: HashMap<Box<str>, ValueId>,
     parameter_types: HashMap<Box<str>, Box<str>>,
     parameter_resolved_types: HashMap<Box<str>, CSharpTypeIdentity>,
+    /// `ref`, `out` and `in` formals, which alias storage a call can change.
+    by_reference_parameters: HashSet<Box<str>>,
     locals: HashMap<Box<str>, Vec<LocalBinding>>,
+    /// Labels indexed while a statement list is scheduled. C# labels have
+    /// procedure scope; entries are created before any child work runs, so a
+    /// forward goto in the same enclosing list can target its exact point.
+    labels: HashMap<Box<str>, ProgramPointId>,
     /// `var` declarators awaiting their initializer's resolved type. A local
     /// with no declared type node takes the type of the value it is given, and
     /// that value can name an earlier local, so the resolution runs after
@@ -1814,7 +1890,9 @@ fn lower_procedure<'tree, 'targets>(
         parameters: HashMap::default(),
         parameter_types: HashMap::default(),
         parameter_resolved_types: HashMap::default(),
+        by_reference_parameters: HashSet::default(),
         locals: HashMap::default(),
+        labels: HashMap::default(),
         implicit_locals: Vec::new(),
         receiver: None,
         cleanups: Vec::new(),
@@ -1825,7 +1903,7 @@ fn lower_procedure<'tree, 'targets>(
     context.resolve_implicit_local_types();
 
     if spec.lexical_parent.is_some() {
-        context.add_gap(
+        context.session.record_gap(
             &mut builder,
             entry,
             SemanticGapSubject::Procedure,
@@ -1836,7 +1914,7 @@ fn lower_procedure<'tree, 'targets>(
     }
 
     if spec.kind == ProcedureKind::Initializer {
-        context.add_gap(
+        context.session.record_gap(
             &mut builder,
             entry,
             SemanticGapSubject::Procedure,
@@ -1846,7 +1924,7 @@ fn lower_procedure<'tree, 'targets>(
         )?;
     }
     if spec.callable.kind() == "destructor_declaration" {
-        context.add_gap(
+        context.session.record_gap(
             &mut builder,
             entry,
             SemanticGapSubject::Procedure,
@@ -1856,7 +1934,7 @@ fn lower_procedure<'tree, 'targets>(
         )?;
     }
     if spec.properties.is_async {
-        context.add_gap(
+        context.session.record_gap(
             &mut builder,
             entry,
             SemanticGapSubject::Procedure,
@@ -1866,7 +1944,7 @@ fn lower_procedure<'tree, 'targets>(
         )?;
     }
     if spec.properties.is_generator {
-        context.add_gap(
+        context.session.record_gap(
             &mut builder,
             entry,
             SemanticGapSubject::Procedure,
@@ -1886,7 +1964,7 @@ fn lower_procedure<'tree, 'targets>(
     let implicit_base =
         spec.kind == ProcedureKind::Constructor && constructor_initializer.is_none();
     if implicit_base {
-        context.add_gap(
+        context.session.record_gap(
             &mut builder,
             entry,
             SemanticGapSubject::Point,
@@ -1896,7 +1974,9 @@ fn lower_procedure<'tree, 'targets>(
         )?;
     }
 
-    let body_entry = context.point(&mut builder, spec.body, Vec::new())?;
+    let body_entry = context
+        .session
+        .add_node_point(&mut builder, spec.body, Vec::new())?;
     let body_work = if spec.body.kind() == "block" {
         Work::Statement {
             node: spec.body,
@@ -1912,9 +1992,15 @@ fn lower_procedure<'tree, 'targets>(
             scope: function_scope,
         }
     } else {
-        let implicit_return = context.point(&mut builder, spec.body, Vec::new())?;
-        let source =
-            context.expression_value(&mut builder, spec.body, expression_value_kind(spec.body))?;
+        let implicit_return =
+            context
+                .session
+                .add_node_point(&mut builder, spec.body, Vec::new())?;
+        let source = context.expression_value(
+            &mut builder,
+            spec.body,
+            expression_value_kind(prepared.source(), spec.body),
+        )?;
         let value = context.value(&mut builder, implicit_return, SemanticValueKind::Return)?;
         context.append_effect(
             &mut builder,
@@ -1930,7 +2016,7 @@ fn lower_procedure<'tree, 'targets>(
             implicit_return,
             SemanticEffect::ProcedureReturn { value: Some(value) },
         )?;
-        context.edge(
+        context.session.add_target_edge(
             &mut builder,
             implicit_return,
             EdgeTarget::normal(normal_exit),
@@ -1944,8 +2030,15 @@ fn lower_procedure<'tree, 'targets>(
     };
     let mut pending = vec![body_work];
     if let Some(initializer) = constructor_initializer {
-        let initializer_entry = context.point(&mut builder, initializer, Vec::new())?;
-        context.edge(&mut builder, entry, EdgeTarget::normal(initializer_entry))?;
+        let initializer_entry =
+            context
+                .session
+                .add_node_point(&mut builder, initializer, Vec::new())?;
+        context.session.add_target_edge(
+            &mut builder,
+            entry,
+            EdgeTarget::normal(initializer_entry),
+        )?;
         pending.push(Work::Expression {
             node: initializer,
             entry: initializer_entry,
@@ -1953,7 +2046,9 @@ fn lower_procedure<'tree, 'targets>(
             scope: function_scope,
         });
     } else {
-        context.edge(&mut builder, entry, EdgeTarget::normal(body_entry))?;
+        context
+            .session
+            .add_target_edge(&mut builder, entry, EdgeTarget::normal(body_entry))?;
     }
     // The implicit `base()` runs before the body, outside every handler the
     // body declares, so its exception leaves the constructor.
@@ -2041,7 +2136,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     slot.declaration_range.end_byte,
                 )
                 .unwrap_or(callable);
-            let metadata = self.value_mapping(builder, node)?;
+            let metadata = self.session.add_value_mapping(builder, node)?;
             let parameter_name = slot.unique_name().map(Box::<str>::from);
             let passing_mode = slot.passing_mode;
             let value = if slot.receiver {
@@ -2075,7 +2170,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 .and_then(|type_node| declared_type_spelling(type_node, self.prepared.source()));
             let resolved_type = declared_type
                 .and_then(|type_node| self.type_index.resolve(type_node, self.prepared.source()));
+            let by_reference = !slot.receiver
+                && ["ref", "out", "in"].iter().any(|modifier| {
+                    has_direct_token(node, modifier)
+                        || has_modifier(self.prepared.source(), node, modifier)
+                });
             for name in slot.names {
+                if by_reference {
+                    self.by_reference_parameters
+                        .insert(name.clone().into_boxed_str());
+                }
                 if let Some(type_identity) = &type_identity {
                     self.parameter_types
                         .insert(name.clone().into_boxed_str(), type_identity.clone());
@@ -2098,7 +2202,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     | ProcedureKind::Accessor
             )
         {
-            let metadata = self.value_mapping(builder, callable)?;
+            let metadata = self.session.add_value_mapping(builder, callable)?;
             self.receiver = Some(self.session.add_value_with_metadata(
                 builder,
                 metadata,
@@ -2133,7 +2237,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 && let Some(text) = node_text(self.prepared.source(), name)
                 && let Some((scope_start, scope_end)) = csharp_local_scope(node)
             {
-                let metadata = self.value_mapping(builder, name)?;
+                let metadata = self.session.add_value_mapping(builder, name)?;
                 let value = self.session.add_value_with_metadata(
                     builder,
                     metadata,
@@ -2230,6 +2334,25 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "parenthesized_expression" | "checked_expression" => {
                     current = first_runtime_named_child(current)?;
                 }
+                // A decimal integer literal without a suffix has the first of
+                // `int`, `uint`, `long` and `ulong` that holds its value.
+                "integer_literal" => {
+                    let value = node_text(self.prepared.source(), current)?
+                        .parse::<u64>()
+                        .ok()?;
+                    break CSharpTypeIdentity::Predefined(if value <= i32::MAX as u64 {
+                        CSharpPredefinedType::Int
+                    } else if value <= u32::MAX as u64 {
+                        CSharpPredefinedType::UInt
+                    } else if value <= i64::MAX as u64 {
+                        CSharpPredefinedType::Long
+                    } else {
+                        CSharpPredefinedType::ULong
+                    });
+                }
+                "boolean_literal" => {
+                    break CSharpTypeIdentity::Predefined(CSharpPredefinedType::Bool);
+                }
                 "member_access_expression" => {
                     let name = current.child_by_field_name("name")?;
                     if name.kind() != "identifier" {
@@ -2239,6 +2362,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     current = current.child_by_field_name("expression")?;
                 }
                 "cast_expression" => {
+                    break self.type_node_identity(current.child_by_field_name("type")?)?;
+                }
+                "object_creation_expression" => {
                     break self.type_node_identity(current.child_by_field_name("type")?)?;
                 }
                 "identifier" => {
@@ -2290,9 +2416,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     /// The carry every C# conversion context shares.
     ///
     /// An exact same-type carry copies a value type and aliases a reference
-    /// type. `object` is the one destination no user-defined conversion may
-    /// claim -- the language reserves conversions to and from it -- so a
-    /// carry into it is boxing or a reference alias and nothing else.
+    /// type. A value type to `object` is a language-defined boxing conversion.
+    /// A reference type to `object` remains open: the target's erased type is
+    /// not enough evidence to relabel the source identity (#4379).
     fn language_carry(
         &self,
         source: CSharpTypeIdentity,
@@ -2305,12 +2431,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     .map_or(CSharpValueCarry::Alias, CSharpValueCarry::Transfer),
             );
         }
-        if destination == CSharpTypeIdentity::Predefined(CSharpPredefinedType::Object) {
-            return Some(if source.is_value_type() {
-                CSharpValueCarry::Transfer(TransferKind::Boxing)
-            } else {
-                CSharpValueCarry::Alias
-            });
+        if destination == CSharpTypeIdentity::Predefined(CSharpPredefinedType::Object)
+            && source.is_value_type()
+        {
+            return Some(CSharpValueCarry::Transfer(TransferKind::Boxing));
         }
         None
     }
@@ -2445,10 +2569,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         target: ValueId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<ProgramPointId, CSharpLoweringError> {
-        let normal = self.point(builder, node, Vec::new())?;
-        let exceptional = self.point(builder, node, Vec::new())?;
-        let callee = self.source_value(builder, node, SemanticValueKind::Callable)?;
-        let thrown = self.source_value(builder, node, SemanticValueKind::Exception)?;
+        let normal = self.session.add_node_point(builder, node, Vec::new())?;
+        let exceptional = self.session.add_node_point(builder, node, Vec::new())?;
+        let callee = self
+            .session
+            .add_node_value(builder, node, SemanticValueKind::Callable)?;
+        let thrown = self
+            .session
+            .add_node_value(builder, node, SemanticValueKind::Exception)?;
         let resolution =
             CallableTargetResolution::Proven(CallableTarget::Local(operator.procedure));
         let metadata = self.metadata(point)?;
@@ -2485,8 +2613,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 exceptional_continuation: exceptional,
             },
         )?;
-        self.edge(builder, point, EdgeTarget::normal(normal))?;
-        self.edge(
+        self.session
+            .add_target_edge(builder, point, EdgeTarget::normal(normal))?;
+        self.session.add_target_edge(
             builder,
             point,
             EdgeTarget {
@@ -2506,23 +2635,22 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     }
 
     fn local_binding_at(&self, name: &str, byte: usize) -> Option<&LocalBinding> {
-        self.locals
-            .get(name)?
-            .iter()
-            .filter(|binding| {
-                binding.visible_from <= byte
-                    && binding.scope_start <= byte
-                    && byte < binding.scope_end
-            })
-            .min_by_key(|binding| binding.scope_end - binding.scope_start)
+        crate::analyzer::common::visible_local_binding(
+            self.locals.get(name)?,
+            byte,
+            |binding| (binding.visible_from, binding.scope_start, binding.scope_end),
+            |_, (_, scope_start, scope_end)| scope_end - scope_start,
+        )
     }
 
     fn local_declaration_value(&self, name: &str, declaration_start: usize) -> Option<ValueId> {
-        self.locals
-            .get(name)?
-            .iter()
-            .find(|binding| binding.declaration_start == declaration_start)
-            .map(|binding| binding.value)
+        crate::analyzer::common::local_value_for_declaration(
+            self.locals
+                .get(name)?
+                .iter()
+                .map(|binding| (binding.declaration_start, binding.value)),
+            declaration_start,
+        )
     }
 
     fn expression_value(
@@ -2531,31 +2659,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         node: Node<'tree>,
         kind: SemanticValueKind,
     ) -> Result<ValueId, CSharpLoweringError> {
-        if let Some(value) = self.expression_values.get(&node.id()) {
-            return Ok(*value);
-        }
-        let metadata = self.value_mapping(builder, node)?;
-        let value = self.session.insert_cached_value_with_metadata(
+        self.session.cached_node_value(
             builder,
             &mut self.expression_values,
-            node.id(),
-            metadata,
+            node,
             kind,
-        )?;
-        Ok(value)
+            |session, builder, node| session.add_value_mapping(builder, node),
+        )
     }
-
-    fn source_value(
-        &mut self,
-        builder: &mut ProcedureCfgBuilder,
-        node: Node<'tree>,
-        kind: SemanticValueKind,
-    ) -> Result<ValueId, CSharpLoweringError> {
-        let metadata = self.value_mapping(builder, node)?;
-        self.session
-            .add_value_with_metadata(builder, metadata, kind)
-    }
-
     fn emit_lexical_input_flow(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -2577,18 +2688,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         } else {
             (None, ValueFlowKind::Local)
         };
-        if let Some(source) = source
-            && source != target
-        {
-            self.append_effect(
-                builder,
-                point,
-                SemanticEffect::ValueFlow {
-                    kind,
-                    source,
-                    target,
-                },
-            )?;
+        if let Some(source) = source {
+            self.session
+                .append_value_flow_if_distinct(builder, point, kind, source, target)?;
         }
         Ok(())
     }
@@ -2648,18 +2750,25 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             })
             .collect::<Vec<_>>();
         if initializers.is_empty() {
-            return self.edge(builder, entry, next);
+            return self.session.add_target_edge(builder, entry, next);
         }
 
         let expression_entries = initializers
             .iter()
-            .map(|(_, _, initializer)| self.point(builder, *initializer, Vec::new()))
+            .map(|(_, _, initializer)| {
+                self.session
+                    .add_node_point(builder, *initializer, Vec::new())
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let terminals = initializers
             .iter()
-            .map(|(declarator, _, _)| self.point(builder, *declarator, Vec::new()))
+            .map(|(declarator, _, _)| {
+                self.session
+                    .add_node_point(builder, *declarator, Vec::new())
+            })
             .collect::<Result<Vec<_>, _>>()?;
-        self.edge(builder, entry, EdgeTarget::normal(expression_entries[0]))?;
+        self.session
+            .add_target_edge(builder, entry, EdgeTarget::normal(expression_entries[0]))?;
         for (index, (_, name, initializer)) in initializers.iter().enumerate().rev() {
             let target_name = node_text(self.prepared.source(), *name).ok_or_else(|| {
                 CSharpLoweringError::Invalid("local declaration has invalid name range".into())
@@ -2669,8 +2778,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 .ok_or_else(|| {
                     CSharpLoweringError::Invalid("local declaration was not preindexed".into())
                 })?;
-            let value =
-                self.expression_value(builder, *initializer, expression_value_kind(*initializer))?;
+            let value = self.expression_value(
+                builder,
+                *initializer,
+                expression_value_kind(self.prepared.source(), *initializer),
+            )?;
             // A `var` local has no declared type of its own: it takes the type
             // of the value it is given, so the initializer answers for both
             // ends of the carry.
@@ -2732,7 +2844,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     )?;
                 }
                 None => {
-                    self.add_gap(
+                    self.session.record_gap(
                         builder,
                         terminals[index],
                         SemanticGapSubject::Value(target),
@@ -2747,7 +2859,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 .copied()
                 .map(EdgeTarget::normal)
                 .unwrap_or(next);
-            self.edge(builder, continuation, following)?;
+            self.session
+                .add_target_edge(builder, continuation, following)?;
             stack.push(Work::Expression {
                 node: *initializer,
                 entry: expression_entries[index],
@@ -2829,6 +2942,55 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         self.static_callable_returns.get(&key)?.as_deref()
     }
 
+    /// The return type of an invocation whose source declaration is exact.
+    /// Static calls use the existing type/name key; an instance call also
+    /// resolves the receiver's source-declared type, including implicit
+    /// `this` and a typed local or parameter receiver.
+    fn invocation_return_type(&self, invocation: Node<'tree>) -> Option<&str> {
+        self.static_invocation_return_type(invocation)
+            .or_else(|| self.instance_invocation_return_type(invocation))
+    }
+
+    fn instance_invocation_return_type(&self, invocation: Node<'tree>) -> Option<&str> {
+        let function = invocation.child_by_field_name("function")?;
+        let receiver = csharp_call_receiver(function)?;
+        let name_node = function.child_by_field_name("name")?;
+        let member = super::csharp_member_name(name_node)?;
+        if member.explicit_generic_arity.is_some() {
+            return None;
+        }
+        let name = nonempty_node_text(self.prepared.source(), member.identifier)?;
+        let owner = if receiver.kind() == "identifier" {
+            let receiver_name = nonempty_node_text(self.prepared.source(), receiver)?;
+            if self
+                .local_at(receiver_name, receiver.start_byte())
+                .is_some()
+                || self.parameters.contains_key(receiver_name)
+                || self.callable_type_parameters.contains(receiver_name)
+                || receiver_name_is_lexically_shadowed(
+                    invocation,
+                    receiver_name,
+                    self.type_receiver_shadows,
+                )
+            {
+                self.expression_type_identity(receiver)?
+            } else {
+                self.type_index
+                    .resolve(receiver, self.prepared.source())
+                    .or_else(|| self.expression_type_identity(receiver))?
+            }
+        } else {
+            self.expression_type_identity(receiver)?
+        };
+        let declaration = self.type_index.declaration(owner)?;
+        let key = TypeMemberKey {
+            namespace: declaration.namespace.clone(),
+            owner: declaration.name.clone(),
+            name: Box::from(name),
+        };
+        self.static_callable_returns.get(&key)?.as_deref()
+    }
+
     /// Whether an expression provably denotes a value of a predefined type.
     ///
     /// This is a proof, not a guess: every branch either reads a declared type
@@ -2844,11 +3006,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     self.expression_is_predefined(inner)
                 })
             }
-            "identifier" => node_text(self.prepared.source(), node)
-                .and_then(|name| self.binding_type_at(name, node.start_byte()))
-                .is_some_and(csharp_predefined_type),
+            "identifier" => {
+                node_text(self.prepared.source(), node)
+                    .and_then(|name| self.binding_type_at(name, node.start_byte()))
+                    .is_some_and(csharp_predefined_type)
+                    || self.expression_type_identity(node).is_some_and(|identity| {
+                        matches!(identity, CSharpTypeIdentity::Predefined(_))
+                    })
+            }
             "invocation_expression" => self
-                .static_invocation_return_type(node)
+                .invocation_return_type(node)
                 .is_some_and(csharp_predefined_type),
             "cast_expression" => node
                 .child_by_field_name("type")
@@ -2863,6 +3030,63 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         }
     }
 
+    /// Whether an expression's static type is exactly `string`. This is
+    /// narrower than `expression_is_predefined`: string concatenation needs a
+    /// string operand on one side and treats the other side according to its
+    /// own operator proof.
+    fn expression_is_string(&self, node: Node<'tree>) -> bool {
+        match node.kind() {
+            "string_literal"
+            | "raw_string_literal"
+            | "verbatim_string_literal"
+            | "interpolated_string_expression" => true,
+            "parenthesized_expression" | "checked_expression" => first_runtime_named_child(node)
+                .is_some_and(|inner| self.expression_is_string(inner)),
+            "identifier" => {
+                self.expression_type_identity(node).is_some_and(|identity| {
+                    identity == CSharpTypeIdentity::Predefined(CSharpPredefinedType::String)
+                }) || node_text(self.prepared.source(), node)
+                    .and_then(|name| self.binding_type_at(name, node.start_byte()))
+                    .is_some_and(|type_spelling| type_spelling == "string")
+            }
+            "invocation_expression" => self
+                .invocation_return_type(node)
+                .is_some_and(|returned| returned == "string"),
+            "cast_expression" => node
+                .child_by_field_name("type")
+                .and_then(|target| declared_type_spelling(target, self.prepared.source()))
+                .is_some_and(|target| target.as_ref() == "string"),
+            "binary_expression" => self.is_string_concatenation(node),
+            _ => false,
+        }
+    }
+
+    /// Whether `node` is the predefined C# string-concatenation operator.
+    /// User-defined `operator +` declarations and unresolved operand types
+    /// deliberately do not qualify: their result may be arbitrary user code.
+    fn is_string_concatenation(&self, node: Node<'tree>) -> bool {
+        if node.kind() != "binary_expression"
+            || node
+                .child_by_field_name("operator")
+                .is_none_or(|operator| operator.kind() != "+")
+        {
+            return false;
+        }
+        let operands = runtime_expression_children(node);
+        let [left, right] = operands.as_slice() else {
+            return false;
+        };
+        (self.expression_is_string(*left) && self.string_concatenation_operand(*right))
+            || (self.expression_is_string(*right) && self.string_concatenation_operand(*left))
+    }
+
+    fn string_concatenation_operand(&self, node: Node<'tree>) -> bool {
+        self.expression_is_predefined(node)
+            || self
+                .expression_type_identity(node)
+                .is_some_and(|identity| self.type_index.has_no_user_defined_add_operator(identity))
+    }
+
     /// Whether an operator expression provably runs the language's own
     /// operator rather than a user-defined `operator` declaration (#2661).
     ///
@@ -2874,8 +3098,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     /// regardless of their kind. Operator overloading is impossible when every
     /// operand is of a predefined type, so that is the proof required here.
     ///
-    /// An increment or decrement is excluded: it also writes its operand, and
-    /// that write is not represented yet.
+    /// An increment or decrement is built in exactly when its write is
+    /// lowered (see [`Self::integral_update_target`]); any other update also
+    /// writes its operand, and that write is not represented yet.
     fn operation_is_builtin(&self, node: Node<'tree>) -> bool {
         // Only an operator expression asks this question. Without the kind
         // check every node with predefined-typed children answered "built-in",
@@ -2887,13 +3112,124 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             return false;
         }
         if is_update_expression(node) {
-            return false;
+            return self.integral_update_target(node).is_some();
+        }
+        if self.is_string_concatenation(node) {
+            return true;
         }
         let operands = runtime_expression_children(node);
         !operands.is_empty()
             && operands
                 .iter()
                 .all(|operand| self.expression_is_predefined(*operand))
+    }
+
+    /// The binding `x++` or `x--` writes, when `x` names a local or by-value
+    /// parameter of a predefined integral type, so the operator is the
+    /// built-in one: the operand, the binding and its flow kind. Floating and
+    /// `decimal` operands, enums, members, `ref` locals and formals, and user
+    /// types keep the unlowered-assignment gap. `nint`/`nuint` qualify: the
+    /// write is exact even though their platform width keeps the consumer's
+    /// value unknown.
+    fn integral_update_target(
+        &self,
+        node: Node<'tree>,
+    ) -> Option<(Node<'tree>, ValueId, ValueFlowKind)> {
+        use CSharpPredefinedType::{
+            Byte, Char, Int, Long, NInt, NUInt, SByte, Short, UInt, ULong, UShort,
+        };
+        if !is_update_expression(node) {
+            return None;
+        }
+        let operand = first_runtime_named_child(node)?;
+        if operand.kind() != "identifier" {
+            return None;
+        }
+        let name = node_text(self.prepared.source(), operand)?;
+        let (target, kind) = match self.local_at(name, operand.start_byte()) {
+            Some(local) => (local, ValueFlowKind::Local),
+            None if !self.by_reference_parameters.contains(name) => {
+                (*self.parameters.get(name)?, ValueFlowKind::Parameter)
+            }
+            None => return None,
+        };
+        // A `ref` local resolves no type: its declaration names a `ref_type`,
+        // which the type index does not read, so it stays a gap.
+        matches!(
+            self.binding_resolved_type(name, operand.start_byte())?,
+            CSharpTypeIdentity::Predefined(
+                SByte | Byte | Short | UShort | Int | UInt | Long | ULong | NInt | NUInt | Char
+            )
+        )
+        .then_some((operand, target, kind))
+    }
+
+    /// Lower `x++` or `x--` on an integral binding (see
+    /// [`Self::integral_update_target`]): read `x`, write the value one step
+    /// away back to it, and yield the old value for a postfix operator or the
+    /// new one for a prefix operator. The step is a structured integer offset,
+    /// so a scalar consumer follows a loop counter across it and reports an
+    /// overflowing step as unknown, which is what an unchecked context's wrap
+    /// deserves. A checked context throws instead, before the store: the
+    /// operation point owns the exceptional edge and only its normal successor
+    /// writes the binding.
+    fn integral_update(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), CSharpLoweringError> {
+        let (operand, target, kind) = self
+            .integral_update_target(node)
+            .expect("an integral update has a lowered target");
+        let decrement = unary_operator(node).is_some_and(|operator| operator.kind() == "--");
+        let operation = self.session.add_node_point(builder, node, Vec::new())?;
+        let terminal = self.session.add_node_point(builder, node, Vec::new())?;
+        let old = self.expression_value(builder, operand, SemanticValueKind::Temporary)?;
+        let computed = self.value(builder, terminal, SemanticValueKind::Temporary)?;
+        let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
+        self.append_effect(
+            builder,
+            terminal,
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::IntegerOffset {
+                    offset: SignedIntegerMagnitude::new(decrement, 1),
+                },
+                source: old,
+                target: computed,
+            },
+        )?;
+        self.emit_assignment_flow(builder, terminal, kind, computed, target)?;
+        // The expression's value is exactly one of the two values the update
+        // already holds, so it is a copy rather than an opaque derivation.
+        let yielded = if node.kind() == "postfix_unary_expression" {
+            old
+        } else {
+            computed
+        };
+        self.append_effect(
+            builder,
+            terminal,
+            SemanticEffect::Assignment {
+                target: result,
+                value: yielded,
+            },
+        )?;
+        self.implicit_abort_route(builder, node, operation, scope, stack)?;
+        self.session
+            .add_target_edge(builder, operation, EdgeTarget::normal(terminal))?;
+        self.session.add_target_edge(builder, terminal, next)?;
+        self.schedule_expressions(
+            builder,
+            entry,
+            &[operand],
+            EdgeTarget::normal(operation),
+            scope,
+            stack,
+        )
     }
 
     /// The abstract location an access expression names, when this file can
@@ -3048,7 +3384,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .map(named_children)
             .unwrap_or_default();
         let subscript = match subscripts.as_slice() {
-            [only] => call_argument_value(*only),
+            [only] => first_argument_value(*only),
             _ => None,
         };
         let index = match subscript {
@@ -3084,10 +3420,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             // than an honest partial.
             resolved: self.base_is_array(base)
                 && subscript.is_some_and(|subscript| {
-                    matches!(
-                        expression_value_kind(subscript),
-                        SemanticValueKind::Constant
-                    )
+                    expression_value_kind(self.prepared.source(), subscript).is_constant()
                 }),
         }))
     }
@@ -3099,8 +3432,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         builder: &mut ProcedureCfgBuilder,
         node: Node<'tree>,
     ) -> Result<ValueId, CSharpLoweringError> {
-        let kind = expression_value_kind(node);
-        if kind != SemanticValueKind::Constant {
+        let kind = expression_value_kind(self.prepared.source(), node);
+        if !kind.is_constant() {
             return self.expression_value(builder, node, kind);
         }
         let Some(text) = node_text(self.prepared.source(), node) else {
@@ -3147,8 +3480,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         {
             return Ok(None);
         }
-        self.expression_value(builder, base, expression_value_kind(base))
-            .map(Some)
+        self.expression_value(
+            builder,
+            base,
+            expression_value_kind(self.prepared.source(), base),
+        )
+        .map(Some)
     }
 
     /// The type that declares the member an access names, when this file knows
@@ -3185,7 +3522,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             owner: Box::from(owner),
             name: Box::from(name),
         };
-        self.member_declarations.get(&key)?.clone()
+        unique_map_value(self.member_declarations, &key)
     }
 
     /// The declared type an assignment target holds, when this file knows it.
@@ -3235,14 +3572,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             None => source_anchor(occurrence, 0).map_err(CSharpLoweringError::Invalid)?,
         };
         let procedure = self.session.locator();
-        Ok(SemanticLocator::new(
-            procedure.mount(),
-            procedure.path().clone(),
-            procedure.language(),
-            procedure.declaration().clone(),
-            SemanticRole::MemoryLocation,
-            anchor,
-        ))
+        Ok(procedure.memory_location_at(anchor))
     }
 
     /// Publish a read of a member or an element as a `MemoryLoad` into the
@@ -3260,7 +3590,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let Some(load) = self.memory_access_target(builder, point, access)? else {
             return Ok(());
         };
-        let result = self.expression_value(builder, access, expression_value_kind(access))?;
+        let result = self.expression_value(
+            builder,
+            access,
+            expression_value_kind(self.prepared.source(), access),
+        )?;
         self.append_effect(
             builder,
             point,
@@ -3322,7 +3656,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "field or property access is structured, but its declaration identity is not resolved",
             ),
         };
-        self.add_gap(
+        self.session.record_gap(
             builder,
             point,
             SemanticGapSubject::MemoryLocation(store.location),
@@ -3395,7 +3729,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let exact = storage.exact;
         let slots = storage.members.clone();
         if slots.len() > CSHARP_MAX_COPIED_SLOTS {
-            return self.add_gap(
+            return self.session.record_gap(
                 builder,
                 point,
                 SemanticGapSubject::Value(target),
@@ -3453,7 +3787,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .iter()
             .map(|slot| slot.name.as_ref())
             .collect::<Vec<_>>();
-        self.add_gap(
+        self.session.record_gap(
             builder,
             point,
             SemanticGapSubject::Value(target),
@@ -3469,14 +3803,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     /// very location an ordinary member access addresses.
     fn declared_member_locator(&self, anchor: SourceAnchor) -> SemanticLocator {
         let procedure = self.session.locator();
-        SemanticLocator::new(
-            procedure.mount(),
-            procedure.path().clone(),
-            procedure.language(),
-            procedure.declaration().clone(),
-            SemanticRole::MemoryLocation,
-            anchor,
-        )
+        procedure.memory_location_at(anchor)
     }
 
     /// Publish an object initializer's member write as a store into the
@@ -3507,7 +3834,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let declared_type = declaration
             .as_ref()
             .and_then(|declaration| declaration.type_spelling.clone());
-        let base = self.expression_value(builder, creation, expression_value_kind(creation))?;
+        let base = self.expression_value(
+            builder,
+            creation,
+            expression_value_kind(self.prepared.source(), creation),
+        )?;
         let member = self.member_locator(name_node, declaration.as_ref())?;
         let location = self.session.add_memory_location(
             builder,
@@ -3538,9 +3869,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     ) -> Result<(), CSharpLoweringError> {
         let left = required_field(node, "left")?;
         let right = required_field(node, "right")?;
-        let terminal = self.point(builder, node, Vec::new())?;
-        let value = self.expression_value(builder, right, expression_value_kind(right))?;
-        let result = self.expression_value(builder, node, expression_value_kind(node))?;
+        let terminal = self.session.add_node_point(builder, node, Vec::new())?;
+        let value = self.expression_value(
+            builder,
+            right,
+            expression_value_kind(self.prepared.source(), right),
+        )?;
+        let result = self.expression_value(
+            builder,
+            node,
+            expression_value_kind(self.prepared.source(), node),
+        )?;
 
         let mut continuation = terminal;
         // A simple name that denotes a member writes `this.name`, exactly as
@@ -3617,7 +3956,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         self.emit_assignment_flow(builder, terminal, alias, value, target)?;
                     }
                     None => {
-                        self.add_gap(
+                        self.session.record_gap(
                             builder,
                             terminal,
                             SemanticGapSubject::Value(target),
@@ -3640,7 +3979,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     },
                 )?;
             } else {
-                self.add_gap(
+                self.session.record_gap(
                     builder,
                     terminal,
                     SemanticGapSubject::Value(result),
@@ -3669,7 +4008,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     },
                 )?;
             } else {
-                self.add_gap(
+                self.session.record_gap(
                     builder,
                     terminal,
                     SemanticGapSubject::Value(result),
@@ -3685,7 +4024,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             if let Some(store) = self.memory_access_target(builder, terminal, left)? {
                 self.emit_memory_store(builder, terminal, store, value)?;
             } else {
-                self.add_gap(
+                self.session.record_gap(
                     builder,
                     terminal,
                     SemanticGapSubject::Point,
@@ -3694,7 +4033,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     "tuple, deconstruction, and ref assignment targets are not yet lowered into memory flow",
                 )?;
             }
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 terminal,
                 SemanticGapSubject::Point,
@@ -3705,7 +4044,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             self.implicit_abort_route(builder, node, terminal, scope, stack)?;
             runtime_expression_children(node)
         };
-        self.edge(builder, continuation, next)?;
+        self.session.add_target_edge(builder, continuation, next)?;
         self.schedule_expressions(
             builder,
             entry,
@@ -3727,18 +4066,19 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), CSharpLoweringError> {
-        let terminal = self.point(builder, node, Vec::new())?;
-        let source = self.expression_value(builder, value, expression_value_kind(value))?;
-        let target = self.expression_value(builder, node, expression_value_kind(node))?;
-        self.append_effect(
+        let source = self.expression_value(
             builder,
-            terminal,
-            SemanticEffect::Assignment {
-                target,
-                value: source,
-            },
+            value,
+            expression_value_kind(self.prepared.source(), value),
         )?;
-        self.edge(builder, terminal, next)?;
+        let target = self.expression_value(
+            builder,
+            node,
+            expression_value_kind(self.prepared.source(), node),
+        )?;
+        let terminal = self
+            .session
+            .add_transparent_assignment(builder, node, source, target, next)?;
         stack.push(Work::Expression {
             node: value,
             entry,
@@ -3759,8 +4099,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), CSharpLoweringError> {
-        let terminal = self.point(builder, node, Vec::new())?;
-        let target = self.expression_value(builder, node, expression_value_kind(node))?;
+        let terminal = self.session.add_node_point(builder, node, Vec::new())?;
+        let target = self.expression_value(
+            builder,
+            node,
+            expression_value_kind(self.prepared.source(), node),
+        )?;
         // Only a cast names its result type. `x as T` yields either a `T` or
         // null, and neither the choice nor the null is represented yet.
         let carry = (node.kind() == "cast_expression")
@@ -3774,13 +4118,21 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let mut continuation = terminal;
         match carry {
             Some((CSharpValueCarry::UserDefined(operator), _)) => {
-                let source = self.expression_value(builder, value, expression_value_kind(value))?;
+                let source = self.expression_value(
+                    builder,
+                    value,
+                    expression_value_kind(self.prepared.source(), value),
+                )?;
                 continuation = self.emit_user_defined_conversion(
                     builder, terminal, node, scope, operator, source, target, stack,
                 )?;
             }
             Some((carry, destination)) => {
-                let source = self.expression_value(builder, value, expression_value_kind(value))?;
+                let source = self.expression_value(
+                    builder,
+                    value,
+                    expression_value_kind(self.prepared.source(), value),
+                )?;
                 self.emit_carried_value(
                     builder,
                     terminal,
@@ -3796,7 +4148,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 )?;
             }
             None => {
-                self.add_gap(
+                self.session.record_gap(
                     builder,
                     terminal,
                     SemanticGapSubject::Value(target),
@@ -3815,7 +4167,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             // the one-continuation control-flow contract.
             self.implicit_abort_route(builder, node, terminal, scope, stack)?;
         }
-        self.edge(builder, continuation, next)?;
+        self.session.add_target_edge(builder, continuation, next)?;
         stack.push(Work::Expression {
             node: value,
             entry,
@@ -3838,7 +4190,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     ) -> Result<(), CSharpLoweringError> {
         if let Some(value) = csharp_folded_boolean_constant(self.prepared.source(), node) {
             let taken = if value { when_true } else { when_false };
-            self.edge(builder, entry, taken)?;
+            self.session.add_target_edge(builder, entry, taken)?;
             return self.record_guard(
                 builder,
                 entry,
@@ -3849,29 +4201,18 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             );
         }
         match (node.kind(), binary_operator(node)) {
-            ("binary_expression", Some("&&")) => {
+            ("binary_expression", Some(operator @ ("&&" | "||"))) => {
                 let left = required_field(node, "left")?;
                 let right = required_field(node, "right")?;
-                let right_entry = self.point(builder, right, Vec::new())?;
+                let right_entry = self.session.add_node_point(builder, right, Vec::new())?;
+                let kind = match operator {
+                    "&&" => ShortCircuitKind::And,
+                    "||" => ShortCircuitKind::Or,
+                    _ => unreachable!("the match arm selects C# boolean operators"),
+                };
                 schedule_short_circuit_condition(
                     stack,
-                    ShortCircuitKind::And,
-                    (left, entry),
-                    (right, right_entry),
-                    when_true,
-                    when_false,
-                    scope,
-                    Work::condition,
-                );
-                Ok(())
-            }
-            ("binary_expression", Some("||")) => {
-                let left = required_field(node, "left")?;
-                let right = required_field(node, "right")?;
-                let right_entry = self.point(builder, right, Vec::new())?;
-                schedule_short_circuit_condition(
-                    stack,
-                    ShortCircuitKind::Or,
+                    kind,
                     (left, entry),
                     (right, right_entry),
                     when_true,
@@ -3884,10 +4225,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             ("binary_expression", Some("??")) => {
                 let left = required_field(node, "left")?;
                 let right = required_field(node, "right")?;
-                let right_entry = self.point(builder, right, Vec::new())?;
-                let left_result = self.point(builder, left, Vec::new())?;
-                self.edge(builder, left_result, when_true)?;
-                self.edge(builder, left_result, when_false)?;
+                let right_entry = self.session.add_node_point(builder, right, Vec::new())?;
+                let left_result = self.session.add_node_point(builder, left, Vec::new())?;
+                self.session
+                    .add_target_edge(builder, left_result, when_true)?;
+                self.session
+                    .add_target_edge(builder, left_result, when_false)?;
                 stack.push(Work::Condition {
                     node: right,
                     entry: right_entry,
@@ -3895,8 +4238,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     when_false,
                     scope,
                 });
-                let null_test = self.point(builder, left, Vec::new())?;
-                self.edge(
+                let null_test = self.session.add_node_point(builder, left, Vec::new())?;
+                self.session.add_target_edge(
                     builder,
                     null_test,
                     EdgeTarget {
@@ -3904,7 +4247,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         kind: ControlEdgeKind::ConditionalTrue,
                     },
                 )?;
-                self.edge(
+                self.session.add_target_edge(
                     builder,
                     null_test,
                     EdgeTarget {
@@ -3924,8 +4267,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let condition = required_field(node, "condition")?;
                 let consequence = required_field(node, "consequence")?;
                 let alternative = required_field(node, "alternative")?;
-                let consequence_entry = self.point(builder, consequence, Vec::new())?;
-                let alternative_entry = self.point(builder, alternative, Vec::new())?;
+                let consequence_entry =
+                    self.session
+                        .add_node_point(builder, consequence, Vec::new())?;
+                let alternative_entry =
+                    self.session
+                        .add_node_point(builder, alternative, Vec::new())?;
                 schedule_conditional_choice(
                     stack,
                     (condition, entry),
@@ -3949,17 +4296,46 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 });
                 Ok(())
             }
+            // `!` on a `bool` runs no user code and only swaps the arms. On a
+            // type with a user-defined `!` the operand's own decision is
+            // opaque, so swapping its arms claims nothing more.
+            ("prefix_unary_expression", _)
+                if node.child(0).is_some_and(|operator| operator.kind() == "!") =>
+            {
+                let operand =
+                    first_named_child(node).ok_or_else(|| missing_field(node, "operand"))?;
+                stack.push(Work::Condition {
+                    node: operand,
+                    entry,
+                    when_true: when_false,
+                    when_false: when_true,
+                    scope,
+                });
+                Ok(())
+            }
             _ => {
-                let decision = self.point(builder, node, Vec::new())?;
-                self.edge(builder, decision, when_true)?;
-                self.edge(builder, decision, when_false)?;
-                let subject = self.expression_value(builder, node, expression_value_kind(node))?;
+                let decision = self.session.add_node_point(builder, node, Vec::new())?;
+                self.session.add_target_edge(builder, decision, when_true)?;
+                self.session
+                    .add_target_edge(builder, decision, when_false)?;
+                let (predicate, subject) = match self.normalize_condition(builder, node)? {
+                    Some(normalized) => normalized,
+                    None => {
+                        let subject = self.expression_value(
+                            builder,
+                            node,
+                            expression_value_kind(self.prepared.source(), node),
+                        )?;
+                        let predicate = GuardPredicate::Opaque {
+                            digest: GuardConditionDigest::from_syntax_kind(node.kind()),
+                        };
+                        (predicate, subject)
+                    }
+                };
                 self.record_guard(
                     builder,
                     decision,
-                    GuardPredicate::Opaque {
-                        digest: GuardConditionDigest::from_syntax_kind(node.kind()),
-                    },
+                    predicate,
                     Some(subject),
                     Some(when_true),
                     Some(when_false),
@@ -3973,6 +4349,107 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 Ok(())
             }
         }
+    }
+
+    /// A guard the scalar solver can decide: a truth test, an ordered or
+    /// equality comparison with a decimal integer literal, or a `null` test,
+    /// of one local or by-value parameter whose predefined type makes the
+    /// operator the built-in one. A user-defined type may overload `<`, `==` or `true`,
+    /// and `nint`/`nuint` have a platform width, so every other condition
+    /// stays opaque.
+    fn normalize_condition(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+    ) -> Result<Option<(GuardPredicate, ValueId)>, CSharpLoweringError> {
+        use CSharpPredefinedType::{
+            Bool, Byte, Char, Int, Long, Object, SByte, Short, String, UInt, ULong, UShort,
+        };
+        let source = self.prepared.source();
+        let lexical_type = |this: &Self, operand: Node<'tree>| {
+            if operand.kind() != "identifier" || this.implicit_member(operand).is_some() {
+                return None;
+            }
+            let name = node_text(source, operand)?;
+            if this.local_binding_at(name, operand.start_byte()).is_none()
+                && this.by_reference_parameters.contains(name)
+            {
+                return None;
+            }
+            match this.binding_resolved_type(name, operand.start_byte())? {
+                CSharpTypeIdentity::Predefined(predefined) => Some(predefined),
+                CSharpTypeIdentity::Declared { .. } => None,
+            }
+        };
+        if lexical_type(self, node) == Some(Bool) {
+            let value = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
+            return Ok(Some((GuardPredicate::Truthy { value }, value)));
+        }
+        if node.kind() != "binary_expression" {
+            return Ok(None);
+        }
+        let (Some(operator), Some(left), Some(right)) = (
+            node.child_by_field_name("operator"),
+            node.child_by_field_name("left"),
+            node.child_by_field_name("right"),
+        ) else {
+            return Ok(None);
+        };
+        let equal_on_true = match operator.kind() {
+            "==" => Some(true),
+            "!=" => Some(false),
+            _ => None,
+        };
+        let (subject, constant, reversed) = match (left.kind(), right.kind()) {
+            (_, "null_literal" | "integer_literal") => (left, right, false),
+            ("null_literal" | "integer_literal", _) => (right, left, true),
+            _ => return Ok(None),
+        };
+        let Some(subject_type) = lexical_type(self, subject) else {
+            return Ok(None);
+        };
+        let predicate = if constant.kind() == "null_literal" {
+            // `object` compares references and `string` has the library's
+            // own equality, so neither runs user code against `null`.
+            let (Some(null_on_true), Object | String) = (equal_on_true, subject_type) else {
+                return Ok(None);
+            };
+            GuardPredicate::NullComparison { null_on_true }
+        } else {
+            if !matches!(
+                subject_type,
+                SByte | Byte | Short | UShort | Int | UInt | Long | ULong | Char
+            ) || csharp_integer_literal_value(source, constant).is_none()
+            {
+                return Ok(None);
+            }
+            let constant =
+                self.expression_value(builder, constant, expression_value_kind(source, constant))?;
+            let relation = match operator.kind() {
+                "<" => Some(IntegerComparison::LessThan),
+                "<=" => Some(IntegerComparison::LessThanOrEqual),
+                ">" => Some(IntegerComparison::GreaterThan),
+                ">=" => Some(IntegerComparison::GreaterThanOrEqual),
+                _ => None,
+            };
+            match (relation, equal_on_true) {
+                (Some(relation), _) => GuardPredicate::OrderedIntegerComparison {
+                    relation: if reversed {
+                        relation.reverse()
+                    } else {
+                        relation
+                    },
+                    constant,
+                },
+                (None, Some(equal_on_true)) => GuardPredicate::ConstantEquality {
+                    negated: !equal_on_true,
+                    constant,
+                },
+                (None, None) => return Ok(None),
+            }
+        };
+        let subject = self.expression_value(builder, subject, SemanticValueKind::Temporary)?;
+        Ok(Some((predicate, subject)))
     }
 
     /// Publish one guard fact for a decision this lowerer just made.
@@ -3989,21 +4466,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         when_true: Option<EdgeTarget>,
         when_false: Option<EdgeTarget>,
     ) -> Result<(), CSharpLoweringError> {
-        let arm = |target: Option<EdgeTarget>| {
-            target.map(|target| GuardArm {
-                target_point: target.point,
-                kind: target.kind,
-            })
-        };
-        self.session.add_guard_fact(
-            builder,
-            point,
-            predicate,
-            subject,
-            arm(when_true),
-            arm(when_false),
-        )?;
-        Ok(())
+        self.session
+            .add_guard_for_targets(builder, point, predicate, subject, when_true, when_false)
+            .map(|_| ())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4035,14 +4500,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     });
                     Ok(())
                 } else {
-                    self.edge(builder, entry, next)
+                    self.session.add_target_edge(builder, entry, next)
                 }
             }
             "return_statement" => {
                 let terminal = if let Some(value_node) = first_named_child(node) {
-                    let point = self.point(builder, node, Vec::new())?;
+                    let point = self.session.add_node_point(builder, node, Vec::new())?;
                     let source =
-                        self.expression_value(builder, value_node, expression_value_kind(value_node))?;
+                        self.expression_value(builder, value_node, expression_value_kind(self.prepared.source(), value_node))?;
                     let value = self.value(builder, point, SemanticValueKind::Return)?;
                     // A by-value return leaves the returned expression's
                     // storage behind: the caller receives its own copy, so the
@@ -4107,7 +4572,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "throw_statement" => {
                 let value_node = first_named_child(node);
                 let terminal = if value_node.is_some() {
-                    self.point(builder, node, Vec::new())?
+                    self.session.add_node_point(builder, node, Vec::new())?
                 } else {
                     entry
                 };
@@ -4128,11 +4593,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "yield_statement" => {
                 let value_node = first_named_child(node);
                 let terminal = if value_node.is_some() {
-                    self.point(builder, node, Vec::new())?
+                    self.session.add_node_point(builder, node, Vec::new())?
                 } else {
                     entry
                 };
-                self.add_gap(
+                self.session.record_gap(
                     builder,
                     terminal,
                     SemanticGapSubject::Point,
@@ -4158,23 +4623,44 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 };
                 self.abrupt(builder, entry, scope, kind, None, stack)
             }
-            "goto_statement" => self.add_gap(
-                builder,
-                entry,
-                SemanticGapSubject::Point,
-                SemanticCapability::NonLocalControl,
-                SemanticGapKind::Unsupported,
-                "goto target resolution, including goto case/default, is not lowered",
-            ),
+            "goto_statement" => {
+                let Some(label) = csharp_goto_label(node, self.prepared.source()) else {
+                    return self.session.record_gap(
+                        builder,
+                        entry,
+                        SemanticGapSubject::Point,
+                        SemanticCapability::NonLocalControl,
+                        SemanticGapKind::Unsupported,
+                        "goto case/default and recovered goto targets are not lowered",
+                    );
+                };
+                let Some(target) = self.labels.get(label).copied() else {
+                    return self.session.record_gap(
+                        builder,
+                        entry,
+                        SemanticGapSubject::Point,
+                        SemanticCapability::NonLocalControl,
+                        SemanticGapKind::Unsupported,
+                        "goto target is outside the exact label index",
+                    );
+                };
+                self.session
+                    .add_target_edge(builder, entry, EdgeTarget::normal(target))
+            }
             "labeled_statement" => {
-                self.add_gap(
-                    builder,
-                    entry,
-                    SemanticGapSubject::Point,
-                    SemanticCapability::NonLocalControl,
-                    SemanticGapKind::Unsupported,
-                    "incoming goto edges to this label are not lowered",
-                )?;
+                let exact_label = csharp_labeled_statement_name(node, self.prepared.source())
+                    .and_then(|label| self.labels.get(label).copied())
+                    .is_some_and(|target| target == entry);
+                if !exact_label {
+                    self.session.record_gap(
+                        builder,
+                        entry,
+                        SemanticGapSubject::Point,
+                        SemanticCapability::NonLocalControl,
+                        SemanticGapKind::Unsupported,
+                        "incoming goto edges to this label are not lowered",
+                    )?;
+                }
                 let body = named_children(node)
                     .into_iter()
                     .find(|child| child.kind() != "identifier")
@@ -4191,7 +4677,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let condition = required_field(node, "condition")?;
                 let consequence = required_field(node, "consequence")?;
                 let alternative = node.child_by_field_name("alternative");
-                let consequence_entry = self.point(builder, consequence, Vec::new())?;
+                let consequence_entry = self.session.add_node_point(builder, consequence, Vec::new())?;
                 stack.push(Work::Statement {
                     node: consequence,
                     entry: consequence_entry,
@@ -4199,7 +4685,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     scope,
                 });
                 let false_target = if let Some(alternative) = alternative {
-                    let alternative_entry = self.point(builder, alternative, Vec::new())?;
+                    let alternative_entry = self.session.add_node_point(builder, alternative, Vec::new())?;
                     stack.push(Work::Statement {
                         node: alternative,
                         entry: alternative_entry,
@@ -4231,8 +4717,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "while_statement" => {
                 let condition = required_field(node, "condition")?;
                 let body = required_field(node, "body")?;
-                let condition_entry = self.point(builder, condition, Vec::new())?;
-                let body_entry = self.point(builder, body, Vec::new())?;
+                let condition_entry = self.session.add_node_point(builder, condition, Vec::new())?;
+                let body_entry = self.session.add_node_point(builder, body, Vec::new())?;
                 // Each iteration re-enters the condition.
                 self.session
                     .record_loop_site(builder, node, condition_entry, body_entry)?;
@@ -4268,12 +4754,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     },
                     scope: loop_scope,
                 });
-                self.edge(builder, entry, EdgeTarget::normal(condition_entry))
+                self.session.add_target_edge(builder, entry, EdgeTarget::normal(condition_entry))
             }
             "do_statement" => {
                 let body = required_field(node, "body")?;
                 let condition = required_field(node, "condition")?;
-                let condition_entry = self.point(builder, condition, Vec::new())?;
+                let condition_entry = self.session.add_node_point(builder, condition, Vec::new())?;
                 // A do body starts every iteration, so it is its own header.
                 self.session.record_loop_site(builder, node, entry, entry)?;
                 let loop_scope = builder.push_scope(
@@ -4316,7 +4802,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "fixed_statement" => self.fixed_statement(builder, node, entry, next, scope, stack),
             "checked_statement" | "unsafe_statement" => {
                 if node.kind() == "checked_statement" {
-                    self.add_gap(
+                    self.session.record_gap(
                         builder,
                         entry,
                         SemanticGapSubject::Point,
@@ -4335,7 +4821,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 Ok(())
             }
             kind if is_conditional_compilation_kind(kind) => {
-                self.add_gap(
+                self.session.record_gap(
                     builder,
                     entry,
                     SemanticGapSubject::Point,
@@ -4350,7 +4836,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     .find(|child| child.kind() == "variable_declaration")
                     .ok_or_else(|| missing_field(node, "declaration"))?;
                 if has_direct_token(node, "using") {
-                    self.add_gap(
+                    self.session.record_gap(
                         builder,
                         entry,
                         SemanticGapSubject::Point,
@@ -4358,7 +4844,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         SemanticGapKind::Unsupported,
                         "using-declaration disposal at the enclosing scope boundary is not lowered",
                     )?;
-                    self.add_gap(
+                    self.session.record_gap(
                         builder,
                         entry,
                         SemanticGapSubject::Point,
@@ -4367,7 +4853,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         "using-declaration return and exception cleanup routes are not lowered",
                     )?;
                     if has_direct_token(node, "await") {
-                        self.add_gap(
+                        self.session.record_gap(
                             builder,
                             entry,
                             SemanticGapSubject::Point,
@@ -4395,7 +4881,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             | "struct_declaration"
             | "enum_declaration"
             | "record_declaration"
-            | "record_struct_declaration" => self.edge(builder, entry, next),
+            | "record_struct_declaration" => self.session.add_target_edge(builder, entry, next),
             _ => self.unhandled_control_syntax(builder, node, entry, next),
         }
     }
@@ -4418,7 +4904,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         // `ExceptionalControlFlow` claim: the solver reads a point
         // claim of that capability as an unlowered abort route and
         // reopens every caller's exceptional return (#3679).
-        self.add_gap(
+        self.session.record_gap(
             builder,
             terminal,
             SemanticGapSubject::Point,
@@ -4447,7 +4933,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), CSharpLoweringError> {
-        let result = self.expression_value(builder, node, expression_value_kind(node))?;
+        let result = self.expression_value(
+            builder,
+            node,
+            expression_value_kind(self.prepared.source(), node),
+        )?;
         if matches!(node.kind(), "identifier" | "this" | "base") {
             self.emit_lexical_input_flow(builder, node, entry, result)?;
         }
@@ -4471,19 +4961,27 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let condition = required_field(node, "condition")?;
                 let consequence = required_field(node, "consequence")?;
                 let alternative = required_field(node, "alternative")?;
-                let consequence_entry = self.point(builder, consequence, Vec::new())?;
-                let alternative_entry = self.point(builder, alternative, Vec::new())?;
-                let consequence_terminal = self.point(builder, consequence, Vec::new())?;
-                let alternative_terminal = self.point(builder, alternative, Vec::new())?;
+                let consequence_entry =
+                    self.session
+                        .add_node_point(builder, consequence, Vec::new())?;
+                let alternative_entry =
+                    self.session
+                        .add_node_point(builder, alternative, Vec::new())?;
+                let consequence_terminal =
+                    self.session
+                        .add_node_point(builder, consequence, Vec::new())?;
+                let alternative_terminal =
+                    self.session
+                        .add_node_point(builder, alternative, Vec::new())?;
                 let consequence_value = self.expression_value(
                     builder,
                     consequence,
-                    expression_value_kind(consequence),
+                    expression_value_kind(self.prepared.source(), consequence),
                 )?;
                 let alternative_value = self.expression_value(
                     builder,
                     alternative,
-                    expression_value_kind(alternative),
+                    expression_value_kind(self.prepared.source(), alternative),
                 )?;
                 if conditional_branches_have_identity_preserving_construction(
                     consequence,
@@ -4507,7 +5005,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         },
                     )?;
                 } else {
-                    self.add_gap(
+                    self.session.record_gap(
                         builder,
                         consequence_terminal,
                         SemanticGapSubject::Value(result),
@@ -4516,8 +5014,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         "C# conditional-expression result identity is unavailable until branch conversions are resolved",
                     )?;
                 }
-                self.edge(builder, consequence_terminal, next)?;
-                self.edge(builder, alternative_terminal, next)?;
+                self.session
+                    .add_target_edge(builder, consequence_terminal, next)?;
+                self.session
+                    .add_target_edge(builder, alternative_terminal, next)?;
                 stack.push(Work::Expression {
                     node: alternative,
                     entry: alternative_entry,
@@ -4548,7 +5048,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "binary_expression" if matches!(binary_operator(node), Some("&&" | "||" | "??")) => {
                 let left = required_field(node, "left")?;
                 let right = required_field(node, "right")?;
-                let right_entry = self.point(builder, right, Vec::new())?;
+                let right_entry = self.session.add_node_point(builder, right, Vec::new())?;
                 stack.push(Work::Expression {
                     node: right,
                     entry: right_entry,
@@ -4595,7 +5095,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     .child_by_field_name("operator")
                     .is_some_and(|operator| operator.kind() == "??=") =>
             {
-                self.add_gap(
+                self.session.record_gap(
                     builder,
                     entry,
                     SemanticGapSubject::Point,
@@ -4605,7 +5105,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 )?;
                 let left = required_field(node, "left")?;
                 let right = required_field(node, "right")?;
-                let right_entry = self.point(builder, right, Vec::new())?;
+                let right_entry = self.session.add_node_point(builder, right, Vec::new())?;
                 stack.push(Work::Expression {
                     node: right,
                     entry: right_entry,
@@ -4631,7 +5131,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "throw_expression" => {
                 let value_node = first_named_child(node)
                     .ok_or_else(|| missing_field(node, "thrown expression"))?;
-                let terminal = self.point(builder, node, Vec::new())?;
+                let terminal = self.session.add_node_point(builder, node, Vec::new())?;
                 let value = self.value(builder, terminal, SemanticValueKind::Exception)?;
                 self.append_effect(
                     builder,
@@ -4652,10 +5152,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     .into_iter()
                     .find(|child| child.id() != condition.id())
                     .ok_or_else(|| missing_field(node, "binding"))?;
-                let binding_entry = self.point(builder, binding, Vec::new())?;
-                self.add_gap(
+                let binding_entry = self.session.add_node_point(builder, binding, Vec::new())?;
+                // The gap belongs to this access's own binding point. The
+                // entry is shared with an enclosing access when the grammar
+                // nests one inside another (`a?.b ?? c?.d` parses as
+                // `(a?.b ?? c)?.d`, and `a?.b?.c` nests directly), and two
+                // identical gaps at one point fail the IR gap contract.
+                self.session.record_gap(
                     builder,
-                    entry,
+                    binding_entry,
                     SemanticGapSubject::Point,
                     SemanticCapability::NormalControlFlow,
                     SemanticGapKind::Unsupported,
@@ -4694,7 +5199,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 if let Some(value) = first_runtime_named_child(node) {
                     self.transparent_expression(builder, node, value, entry, next, scope, stack)
                 } else {
-                    self.edge(builder, entry, next)
+                    self.session.add_target_edge(builder, entry, next)
                 }
             }
             "cast_expression" | "as_expression" => {
@@ -4706,8 +5211,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 self.conversion_expression(builder, node, value, entry, next, scope, stack)
             }
             "null_literal" | "default_expression" => {
-                let value = self.expression_value(builder, node, expression_value_kind(node))?;
-                self.add_gap(
+                let value = self.expression_value(
+                    builder,
+                    node,
+                    expression_value_kind(self.prepared.source(), node),
+                )?;
+                self.session.record_gap(
                     builder,
                     entry,
                     SemanticGapSubject::Value(value),
@@ -4715,7 +5224,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     SemanticGapKind::Unknown,
                     "null/default object identity is not represented in the semantic value domain",
                 )?;
-                self.edge(builder, entry, next)
+                self.session.add_target_edge(builder, entry, next)
             }
             "variable_declaration" => {
                 self.local_declaration(builder, node, entry, next, scope, stack)
@@ -4723,10 +5232,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "identifier" if self.implicit_member(node).is_some() => {
                 // A simple name that denotes a member accesses it through the
                 // implicit `this`, like `this.name`.
-                let terminal = self.point(builder, node, Vec::new())?;
+                let terminal = self.session.add_node_point(builder, node, Vec::new())?;
                 self.member_access_terminal(builder, node, terminal, scope, stack)?;
-                self.edge(builder, entry, EdgeTarget::normal(terminal))?;
-                self.edge(builder, terminal, next)
+                self.session
+                    .add_target_edge(builder, entry, EdgeTarget::normal(terminal))?;
+                self.session.add_target_edge(builder, terminal, next)
             }
             "member_access_expression"
             | "member_binding_expression"
@@ -4736,9 +5246,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 // access itself can throw. Keeping the exceptional boundary on
                 // a terminal preserves conservative downstream control flow
                 // without making the already-evaluated receiver incomplete.
-                let terminal = self.point(builder, node, Vec::new())?;
+                let terminal = self.session.add_node_point(builder, node, Vec::new())?;
                 self.member_access_terminal(builder, node, terminal, scope, stack)?;
-                self.edge(builder, terminal, next)?;
+                self.session.add_target_edge(builder, terminal, next)?;
                 let children = runtime_expression_children(node);
                 self.schedule_expressions(
                     builder,
@@ -4750,11 +5260,44 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 )
             }
             "interpolated_string_expression" | "interpolation" => {
-                let values = runtime_expression_children(node);
-                self.schedule_expressions(builder, entry, &values, next, scope, stack)
+                let values = if node.kind() == "interpolated_string_expression" {
+                    named_children(node)
+                        .into_iter()
+                        .filter(|child| child.kind() == "interpolation")
+                        .collect::<Vec<_>>()
+                } else {
+                    runtime_expression_children(node)
+                };
+                let terminal = self.session.add_node_point(builder, node, Vec::new())?;
+                let result = self.expression_value(
+                    builder,
+                    node,
+                    expression_value_kind(self.prepared.source(), node),
+                )?;
+                let operands = values
+                    .iter()
+                    .map(|value| {
+                        self.expression_value(
+                            builder,
+                            *value,
+                            expression_value_kind(self.prepared.source(), *value),
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.session
+                    .append_language_defined_value_flows(builder, terminal, operands, result)?;
+                self.session.add_target_edge(builder, terminal, next)?;
+                self.schedule_expressions(
+                    builder,
+                    entry,
+                    &values,
+                    EdgeTarget::normal(terminal),
+                    scope,
+                    stack,
+                )
             }
             "query_expression" => {
-                self.add_gap(
+                self.session.record_gap(
                     builder,
                     entry,
                     SemanticGapSubject::Point,
@@ -4762,7 +5305,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     SemanticGapKind::Unsupported,
                     "query-expression deferred iterator execution is not lowered",
                 )?;
-                self.add_gap(
+                self.session.record_gap(
                     builder,
                     entry,
                     SemanticGapSubject::Point,
@@ -4773,6 +5316,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let children = runtime_expression_children(node);
                 self.schedule_expressions(builder, entry, &children, next, scope, stack)
             }
+            "prefix_unary_expression" | "postfix_unary_expression"
+                if self.integral_update_target(node).is_some() =>
+            {
+                self.integral_update(builder, node, entry, next, scope, stack)
+            }
             // An operator over predefined operands runs the language's own
             // operator, so its result derives from its operands and the flow
             // is publishable (#2661). An operator that could resolve to a
@@ -4782,12 +5330,20 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 if self.operation_is_builtin(node) =>
             {
                 let children = runtime_expression_children(node);
-                let terminal = self.point(builder, node, Vec::new())?;
-                let result = self.expression_value(builder, node, expression_value_kind(node))?;
+                let terminal = self.session.add_node_point(builder, node, Vec::new())?;
+                let result = self.expression_value(
+                    builder,
+                    node,
+                    expression_value_kind(self.prepared.source(), node),
+                )?;
                 let operands = children
                     .iter()
                     .map(|child| {
-                        self.expression_value(builder, *child, expression_value_kind(*child))
+                        self.expression_value(
+                            builder,
+                            *child,
+                            expression_value_kind(self.prepared.source(), *child),
+                        )
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 self.session
@@ -4797,7 +5353,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     // still throw. Neither embeds an operand value.
                     self.implicit_abort_route(builder, node, terminal, scope, stack)?;
                 }
-                self.edge(builder, terminal, next)?;
+                self.session.add_target_edge(builder, terminal, next)?;
                 self.schedule_expressions(
                     builder,
                     entry,
@@ -4831,7 +5387,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             | "sizeof_expression"
             | "typeof_expression" => {
                 if node.kind() == "assignment_expression" || is_update_expression(node) {
-                    self.add_gap(
+                    self.session.record_gap(
                         builder,
                         entry,
                         SemanticGapSubject::Point,
@@ -4844,7 +5400,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     self.implicit_abort_route(builder, node, entry, scope, stack)?;
                 }
                 if may_invoke_user_code(node) {
-                    self.add_gap(
+                    self.session.record_gap(
                         builder,
                         entry,
                         SemanticGapSubject::Point,
@@ -4856,7 +5412,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let children = runtime_expression_children(node);
                 self.schedule_expressions(builder, entry, &children, next, scope, stack)
             }
-            kind if is_runtime_leaf(kind) => self.edge(builder, entry, next),
+            kind if is_runtime_leaf(kind) => self.session.add_target_edge(builder, entry, next),
             _ => self.unhandled_control_syntax(builder, node, entry, next),
         }
     }
@@ -4889,24 +5445,28 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             &updates,
         );
         let condition_entry = match condition {
-            Some(condition) => self.point(builder, condition, Vec::new())?,
-            None => self.point(builder, node, Vec::new())?,
+            Some(condition) => self
+                .session
+                .add_node_point(builder, condition, Vec::new())?,
+            None => self.session.add_node_point(builder, node, Vec::new())?,
         };
-        let body_entry = self.point(builder, body, Vec::new())?;
+        let body_entry = self.session.add_node_point(builder, body, Vec::new())?;
         // Updates run before the condition, which starts every iteration.
         self.session
             .record_loop_site(builder, node, condition_entry, body_entry)?;
         let updates = updates
             .into_iter()
             .map(|update| {
-                self.point(builder, update, Vec::new())
+                self.session
+                    .add_node_point(builder, update, Vec::new())
                     .map(|entry| (update, entry))
             })
             .collect::<Result<Vec<_>, _>>()?;
         let initializers = initializers
             .into_iter()
             .map(|initializer| {
-                self.point(builder, initializer, Vec::new())
+                self.session
+                    .add_node_point(builder, initializer, Vec::new())
                     .map(|entry| (initializer, entry))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -4915,7 +5475,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         } else {
             ControlTarget::normal(condition_entry)
         };
-        schedule_c_style_loop(
+        schedule_loop_flow(
             builder,
             &self.session,
             entry,
@@ -4934,6 +5494,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             Work::statement,
             Work::condition,
         )
+        .map(|_| ())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4949,9 +5510,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let iterable = required_field(node, "right")?;
         let binding = required_field(node, "left")?;
         let body = required_field(node, "body")?;
-        let test = self.point(builder, node, Vec::new())?;
-        let binding_entry = self.point(builder, binding, Vec::new())?;
-        let body_entry = self.point(builder, body, Vec::new())?;
+        let test = self.session.add_node_point(builder, node, Vec::new())?;
+        let binding_entry = self.session.add_node_point(builder, binding, Vec::new())?;
+        let body_entry = self.session.add_node_point(builder, body, Vec::new())?;
         let loop_scope = builder.push_scope(
             Some(scope),
             ScopeBinding::Loop {
@@ -4962,7 +5523,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 continue_edge_kind: ControlEdgeKind::LoopBack,
             },
         );
-        self.add_gap(
+        self.session.record_gap(
             builder,
             test,
             SemanticGapSubject::Point,
@@ -4970,7 +5531,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             SemanticGapKind::Unsupported,
             "implicit enumerator acquisition and MoveNext calls are not represented as call sites",
         )?;
-        self.add_gap(
+        self.session.record_gap(
             builder,
             test,
             SemanticGapSubject::Point,
@@ -4978,7 +5539,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             SemanticGapKind::Unsupported,
             "implicit enumerator acquisition and advancement exceptions are not lowered",
         )?;
-        self.add_gap(
+        self.session.record_gap(
             builder,
             test,
             SemanticGapSubject::Point,
@@ -4987,7 +5548,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "enumerator disposal and completion-sensitive cleanup are not lowered",
         )?;
         if has_direct_token(node, "await") {
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 test,
                 SemanticGapSubject::Point,
@@ -4996,7 +5557,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "await foreach suspension and asynchronous disposal are not lowered",
             )?;
         }
-        self.edge(
+        self.session.add_target_edge(
             builder,
             test,
             EdgeTarget {
@@ -5004,7 +5565,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 kind: ControlEdgeKind::ConditionalTrue,
             },
         )?;
-        self.edge(
+        self.session.add_target_edge(
             builder,
             test,
             EdgeTarget {
@@ -5012,7 +5573,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 kind: ControlEdgeKind::ConditionalFalse,
             },
         )?;
-        self.edge(builder, binding_entry, EdgeTarget::normal(body_entry))?;
+        self.session
+            .add_target_edge(builder, binding_entry, EdgeTarget::normal(body_entry))?;
         stack.push(Work::Statement {
             node: body,
             entry: body_entry,
@@ -5042,13 +5604,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     ) -> Result<(), CSharpLoweringError> {
         let value = required_field(node, "value")?;
         let body = required_field(node, "body")?;
-        let dispatch = self.point(builder, node, Vec::new())?;
+        let dispatch = self.session.add_node_point(builder, node, Vec::new())?;
         let sections = named_children(body)
             .into_iter()
             .filter(|child| child.kind() == "switch_section")
             .collect::<Vec<_>>();
         if sections.is_empty() {
-            self.edge(builder, dispatch, next)?;
+            self.session.add_target_edge(builder, dispatch, next)?;
             stack.push(Work::Expression {
                 node: value,
                 entry,
@@ -5069,17 +5631,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         );
         let entries = sections
             .iter()
-            .map(|section| self.point(builder, *section, Vec::new()))
+            .map(|section| self.session.add_node_point(builder, *section, Vec::new()))
             .collect::<Result<Vec<_>, _>>()?;
         let mut has_default = false;
         for (index, section) in sections.iter().enumerate() {
             has_default |= has_direct_token(*section, "default");
-            let control = switch_section_control_nodes(*section);
+            let (control, statements) = switch_section_children(*section);
             if control
                 .iter()
                 .any(|child| matches!(child.kind(), "pattern" | "when_clause"))
             {
-                self.add_gap(
+                self.session.record_gap(
                     builder,
                     entries[index],
                     SemanticGapSubject::Point,
@@ -5087,7 +5649,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     SemanticGapKind::Unsupported,
                     "switch pattern and when-clause matching require type refinement",
                 )?;
-                self.add_gap(
+                self.session.record_gap(
                     builder,
                     entries[index],
                     SemanticGapSubject::Point,
@@ -5096,7 +5658,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     "switch when-clause evaluation failures are not lowered",
                 )?;
             }
-            self.edge(
+            self.session.add_target_edge(
                 builder,
                 dispatch,
                 EdgeTarget {
@@ -5104,14 +5666,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     kind: ControlEdgeKind::SwitchCase,
                 },
             )?;
-            let statements = switch_section_statements(*section);
             if statements.is_empty() {
                 let target = entries
                     .get(index + 1)
                     .copied()
                     .map(EdgeTarget::normal)
                     .unwrap_or(next);
-                self.edge(builder, entries[index], target)?;
+                self.session
+                    .add_target_edge(builder, entries[index], target)?;
             } else {
                 self.schedule_statements(
                     builder,
@@ -5124,7 +5686,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
         }
         if !has_default {
-            self.edge(
+            self.session.add_target_edge(
                 builder,
                 dispatch,
                 EdgeTarget {
@@ -5161,10 +5723,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .into_iter()
             .filter(|child| child.kind() == "switch_expression_arm")
             .collect::<Vec<_>>();
-        let dispatch = self.point(builder, node, Vec::new())?;
-        let merge = self.point(builder, node, Vec::new())?;
-        self.edge(builder, merge, next)?;
-        self.add_gap(
+        let dispatch = self.session.add_node_point(builder, node, Vec::new())?;
+        let merge = self.session.add_node_point(builder, node, Vec::new())?;
+        self.session.add_target_edge(builder, merge, next)?;
+        self.session.record_gap(
             builder,
             dispatch,
             SemanticGapSubject::Point,
@@ -5172,7 +5734,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             SemanticGapKind::Unsupported,
             "switch-expression pattern and when-clause selection require type refinement",
         )?;
-        self.add_gap(
+        self.session.record_gap(
             builder,
             dispatch,
             SemanticGapSubject::Point,
@@ -5182,8 +5744,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         )?;
 
         for arm in arms {
-            let arm_entry = self.point(builder, arm, Vec::new())?;
-            self.edge(
+            let arm_entry = self.session.add_node_point(builder, arm, Vec::new())?;
+            self.session.add_target_edge(
                 builder,
                 dispatch,
                 EdgeTarget {
@@ -5200,8 +5762,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 scope,
             });
         }
-        let unmatched = self.point(builder, node, Vec::new())?;
-        self.edge(
+        let unmatched = self.session.add_node_point(builder, node, Vec::new())?;
+        self.session.add_target_edge(
             builder,
             dispatch,
             EdgeTarget {
@@ -5268,8 +5830,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
 
         let normal_destination = if cleanup_region.is_some() && next.kind != ControlEdgeKind::Normal
         {
-            let relay = self.point(builder, node, Vec::new())?;
-            self.edge(builder, relay, next)?;
+            let relay = self.session.add_node_point(builder, node, Vec::new())?;
+            self.session.add_target_edge(builder, relay, next)?;
             relay
         } else {
             next.point
@@ -5283,13 +5845,21 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .collect::<Result<Vec<_>, _>>()?;
         let catch_entries = catch_bodies
             .iter()
-            .map(|body| self.point(builder, *body, Vec::new()))
+            .map(|body| self.session.add_node_point(builder, *body, Vec::new()))
             .collect::<Result<Vec<_>, _>>()?;
+        let exact_single_catch = catches.len() == 1 && csharp_catch_is_unfiltered(catches[0]);
         let try_scope = if catch_entries.is_empty() {
             cleanup_scope
+        } else if exact_single_catch {
+            builder.push_scope(
+                Some(cleanup_scope),
+                ScopeBinding::Handler {
+                    entry: catch_entries[0],
+                },
+            )
         } else {
-            let dispatcher = self.point(builder, node, Vec::new())?;
-            self.add_gap(
+            let dispatcher = self.session.add_node_point(builder, node, Vec::new())?;
+            self.session.record_gap(
                 builder,
                 dispatcher,
                 SemanticGapSubject::Point,
@@ -5298,7 +5868,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "catch-type compatibility and multi-catch selection require type refinement",
             )?;
             for catch_entry in &catch_entries {
-                self.edge(
+                self.session.add_target_edge(
                     builder,
                     dispatcher,
                     EdgeTarget {
@@ -5307,8 +5877,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     },
                 )?;
             }
-            let unmatched = self.point(builder, node, Vec::new())?;
-            self.edge(
+            let unmatched = self.session.add_node_point(builder, node, Vec::new())?;
+            self.session.add_target_edge(
                 builder,
                 dispatcher,
                 EdgeTarget {
@@ -5337,7 +5907,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 .into_iter()
                 .any(|child| child.kind() == "catch_filter_clause")
             {
-                self.add_gap(
+                self.session.record_gap(
                     builder,
                     *catch_entry,
                     SemanticGapSubject::Point,
@@ -5347,7 +5917,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 )?;
             }
             if let Some(route) = &normal_route {
-                let catch_exit = self.point(builder, *catch_body, Vec::new())?;
+                let catch_exit = self
+                    .session
+                    .add_node_point(builder, *catch_body, Vec::new())?;
                 self.route(builder, catch_exit, route, stack)?;
                 stack.push(Work::Statement {
                     node: *catch_body,
@@ -5366,7 +5938,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         }
 
         if let Some(route) = normal_route.as_ref() {
-            let body_exit = self.point(builder, body, Vec::new())?;
+            let body_exit = self.session.add_node_point(builder, body, Vec::new())?;
             self.route(builder, body_exit, route, stack)?;
             stack.push(Work::Statement {
                 node: body,
@@ -5405,8 +5977,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .into_iter()
             .find(|child| child.id() != body.id())
             .ok_or_else(|| missing_field(node, "lock"))?;
-        let monitor = self.point(builder, lock, Vec::new())?;
-        let body_entry = self.point(builder, body, Vec::new())?;
+        let monitor = self.session.add_node_point(builder, lock, Vec::new())?;
+        let body_entry = self.session.add_node_point(builder, body, Vec::new())?;
         let region = CleanupRegionId::new(
             u32::try_from(self.cleanups.len())
                 .map_err(|_| CSharpLoweringError::Invalid("too many cleanup regions".into()))?,
@@ -5417,7 +5989,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             outer_scope: scope,
         });
         let lock_scope = builder.push_scope(Some(scope), ScopeBinding::Cleanup { region });
-        self.add_gap(
+        self.session.record_gap(
             builder,
             monitor,
             SemanticGapSubject::Point,
@@ -5425,7 +5997,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             SemanticGapKind::Unsupported,
             "Monitor ownership and reentrancy effects are represented only as opaque boundaries",
         )?;
-        self.add_gap(
+        self.session.record_gap(
             builder,
             monitor,
             SemanticGapSubject::Point,
@@ -5433,15 +6005,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             SemanticGapKind::Unsupported,
             "implicit Monitor.Enter acquisition exceptions are not lowered",
         )?;
-        self.edge(builder, monitor, EdgeTarget::normal(body_entry))?;
+        self.session
+            .add_target_edge(builder, monitor, EdgeTarget::normal(body_entry))?;
         let cleanup_destination = if next.kind == ControlEdgeKind::Normal {
             next.point
         } else {
-            let relay = self.point(builder, node, Vec::new())?;
-            self.edge(builder, relay, next)?;
+            let relay = self.session.add_node_point(builder, node, Vec::new())?;
+            self.session.add_target_edge(builder, relay, next)?;
             relay
         };
-        let body_exit = self.point(builder, body, Vec::new())?;
+        let body_exit = self.session.add_node_point(builder, body, Vec::new())?;
         let normal_route = builder.normal_cleanup_completion(region, cleanup_destination);
         self.route(builder, body_exit, &normal_route, stack)?;
         stack.push(Work::Statement {
@@ -5486,7 +6059,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             stack,
         )?;
         if has_direct_token(node, "await") {
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 boundary,
                 SemanticGapSubject::Point,
@@ -5545,8 +6118,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         cleanup_body: CleanupBody<'tree>,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<ProgramPointId, CSharpLoweringError> {
-        let boundary = self.point(builder, resource, Vec::new())?;
-        let body_entry = self.point(builder, body, Vec::new())?;
+        let boundary = self.session.add_node_point(builder, resource, Vec::new())?;
+        let body_entry = self.session.add_node_point(builder, body, Vec::new())?;
         let region = CleanupRegionId::new(
             u32::try_from(self.cleanups.len())
                 .map_err(|_| CSharpLoweringError::Invalid("too many cleanup regions".into()))?,
@@ -5557,7 +6130,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             outer_scope: scope,
         });
         let resource_scope = builder.push_scope(Some(scope), ScopeBinding::Cleanup { region });
-        self.add_gap(
+        self.session.record_gap(
             builder,
             boundary,
             SemanticGapSubject::Point,
@@ -5565,7 +6138,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             SemanticGapKind::Unsupported,
             "resource acquisition, value identity, and partial-initialization cleanup are not fully lowered",
         )?;
-        self.add_gap(
+        self.session.record_gap(
             builder,
             boundary,
             SemanticGapSubject::Point,
@@ -5573,15 +6146,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             SemanticGapKind::Unsupported,
             "resource acquisition and cleanup can raise exceptions not fully represented",
         )?;
-        self.edge(builder, boundary, EdgeTarget::normal(body_entry))?;
+        self.session
+            .add_target_edge(builder, boundary, EdgeTarget::normal(body_entry))?;
         let cleanup_destination = if next.kind == ControlEdgeKind::Normal {
             next.point
         } else {
-            let relay = self.point(builder, node, Vec::new())?;
-            self.edge(builder, relay, next)?;
+            let relay = self.session.add_node_point(builder, node, Vec::new())?;
+            self.session.add_target_edge(builder, relay, next)?;
             relay
         };
-        let body_exit = self.point(builder, body, Vec::new())?;
+        let body_exit = self.session.add_node_point(builder, body, Vec::new())?;
         let normal_route = builder.normal_cleanup_completion(region, cleanup_destination);
         self.route(builder, body_exit, &normal_route, stack)?;
         stack.push(Work::Statement {
@@ -5609,13 +6183,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), CSharpLoweringError> {
-        let normal = self.point(builder, node, Vec::new())?;
-        let exceptional = self.point(builder, node, Vec::new())?;
+        let normal = self.session.add_node_point(builder, node, Vec::new())?;
+        let exceptional = self.session.add_node_point(builder, node, Vec::new())?;
         let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
         self.session
             .add_allocation(builder, normal, result, AllocationKind::Object)?;
-        self.edge(builder, entry, EdgeTarget::normal(normal))?;
-        self.edge(
+        self.session
+            .add_target_edge(builder, entry, EdgeTarget::normal(normal))?;
+        self.session.add_target_edge(
             builder,
             entry,
             EdgeTarget {
@@ -5623,7 +6198,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 kind: ControlEdgeKind::Exceptional,
             },
         )?;
-        self.edge(builder, normal, next)?;
+        self.session.add_target_edge(builder, normal, next)?;
         self.abrupt(
             builder,
             exceptional,
@@ -5723,7 +6298,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 return None;
             }
             let identity = callable.parameters[formal].1;
-            if self.expression_type_identity(call_argument_value(argument)?) != Some(identity) {
+            if self.expression_type_identity(first_argument_value(argument)?) != Some(identity) {
                 return None;
             }
             identities.push(identity);
@@ -5741,17 +6316,21 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), CSharpLoweringError> {
-        let invoke = self.point(builder, node, Vec::new())?;
-        let normal = self.point(builder, node, Vec::new())?;
-        let exceptional = self.point(builder, node, Vec::new())?;
+        let invoke = self.session.add_node_point(builder, node, Vec::new())?;
+        let normal = self.session.add_node_point(builder, node, Vec::new())?;
+        let exceptional = self.session.add_node_point(builder, node, Vec::new())?;
         let function = node.child_by_field_name("function");
         let callable_anchor = function
             .or_else(|| node.child_by_field_name("type"))
             .or_else(|| first_named_child(node))
             .unwrap_or(node);
-        let callee = self.source_value(builder, callable_anchor, SemanticValueKind::Callable)?;
+        let callee =
+            self.session
+                .add_node_value(builder, callable_anchor, SemanticValueKind::Callable)?;
         let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
-        let thrown = self.source_value(builder, callable_anchor, SemanticValueKind::Exception)?;
+        let thrown =
+            self.session
+                .add_node_value(builder, callable_anchor, SemanticValueKind::Exception)?;
         let exact = self.exact_static_call(node);
         let receiver_node = if exact.is_some() {
             None
@@ -5760,7 +6339,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         };
         let receiver = receiver_node
             .map(|receiver_node| {
-                self.expression_value(builder, receiver_node, expression_value_kind(receiver_node))
+                self.expression_value(
+                    builder,
+                    receiver_node,
+                    expression_value_kind(self.prepared.source(), receiver_node),
+                )
             })
             .transpose()?;
         let constructor = matches!(
@@ -5810,8 +6393,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 .iter()
                 .any(|identity| identity.same_type_copy().is_some())
         }) {
-            let point = self.point(builder, node, Vec::new())?;
-            self.edge(builder, point, EdgeTarget::normal(invoke))?;
+            let point = self.session.add_node_point(builder, node, Vec::new())?;
+            self.session
+                .add_target_edge(builder, point, EdgeTarget::normal(invoke))?;
             point
         } else {
             invoke
@@ -5821,12 +6405,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let mut argument_values = Vec::with_capacity(arguments.len());
         let mut incomplete_argument_mapping = false;
         for (ordinal, argument) in arguments.into_iter().enumerate() {
-            let Some(value_node) = call_argument_value(argument) else {
+            let Some(value_node) = first_argument_value(argument) else {
                 continue;
             };
             argument_nodes.push(value_node);
-            let mut value =
-                self.expression_value(builder, value_node, expression_value_kind(value_node))?;
+            let mut value = self.expression_value(
+                builder,
+                value_node,
+                expression_value_kind(self.prepared.source(), value_node),
+            )?;
             if let Some((_, identities)) = &exact {
                 let identity = identities[ordinal];
                 if let Some(kind) = identity.same_type_copy() {
@@ -5882,7 +6469,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             },
         )?;
         if incomplete_argument_mapping {
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 invoke,
                 SemanticGapSubject::CallSite(call_site),
@@ -5898,8 +6485,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             self.session
                 .add_allocation(builder, normal, result, AllocationKind::Object)?;
         }
-        self.edge(builder, invoke, EdgeTarget::normal(normal))?;
-        self.edge(
+        self.session
+            .add_target_edge(builder, invoke, EdgeTarget::normal(normal))?;
+        self.session.add_target_edge(
             builder,
             invoke,
             EdgeTarget {
@@ -5916,7 +6504,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 scope,
             });
         } else {
-            self.edge(builder, normal, next)?;
+            self.session.add_target_edge(builder, normal, next)?;
         }
         self.abrupt(
             builder,
@@ -5926,10 +6514,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             None,
             stack,
         )?;
-        self.resolution_gaps(builder, invoke, callee, call_site, &resolution)?;
+        self.session.add_dispatch_resolution_gaps(
+            builder,
+            invoke,
+            callee,
+            call_site,
+            &resolution,
+        )?;
 
         if !constructor && exact.is_none() {
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 invoke,
                 SemanticGapSubject::CallSite(call_site),
@@ -5944,8 +6538,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             let condition = required_field(function, "condition")?;
             let binding = conditional_access_binding(function)
                 .ok_or_else(|| missing_field(function, "binding"))?;
-            let conditional_entry = self.point(builder, function, Vec::new())?;
-            self.add_gap(
+            let conditional_entry = self.session.add_node_point(builder, function, Vec::new())?;
+            self.session.record_gap(
                 builder,
                 conditional_entry,
                 SemanticGapSubject::Point,
@@ -6021,7 +6615,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .add_await_scaffold(builder, |session, builder| {
                 session.add_node_mapping(builder, node)
             })?;
-        self.edge(builder, normal, next)?;
+        self.session.add_target_edge(builder, normal, next)?;
         self.abrupt(
             builder,
             exceptional,
@@ -6038,7 +6632,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 scope,
             });
         } else {
-            self.edge(builder, entry, EdgeTarget::normal(suspend))?;
+            self.session
+                .add_target_edge(builder, entry, EdgeTarget::normal(suspend))?;
         }
         Ok(())
     }
@@ -6051,22 +6646,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         next: EdgeTarget,
     ) -> Result<(), CSharpLoweringError> {
         let result = self.expression_value(builder, node, SemanticValueKind::Callable)?;
-        let resolution = CallableTargetResolution::Unknown;
         let metadata = self.metadata(entry)?;
-        let kind = CallableReferenceKind::Lambda;
-        let callable = CallableValue {
-            kind,
-            targets: resolution,
-            target_evidence: metadata.evidence,
-            bound_receiver: None,
-            environment: None,
-        };
+        let callable =
+            CallableValue::unknown_target(CallableReferenceKind::Lambda, metadata.evidence);
         self.append_effect(
             builder,
             entry,
             SemanticEffect::CallableCreation { result, callable },
         )?;
-        self.add_gap(
+        self.session.record_gap(
             builder,
             entry,
             SemanticGapSubject::Value(result),
@@ -6074,7 +6662,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             SemanticGapKind::Unknown,
             "nested callable target mapping is not yet published",
         )?;
-        self.edge(builder, entry, next)
+        self.session.add_target_edge(builder, entry, next)
     }
 
     /// Lower the route an operation's implicit exception takes, to the
@@ -6108,8 +6696,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "implicit abort has no matching structured continuation".into(),
             ));
         };
-        let abort = self.point(builder, node, Vec::new())?;
-        self.edge(
+        let abort = self.session.add_node_point(builder, node, Vec::new())?;
+        self.session.add_target_edge(
             builder,
             operation,
             EdgeTarget {
@@ -6127,18 +6715,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         _next: EdgeTarget,
     ) -> Result<(), CSharpLoweringError> {
-        let detail = format!(
-            "{} runtime/control syntax is not yet lowered structurally",
-            node.kind()
-        );
-        self.add_gap(
-            builder,
-            entry,
-            SemanticGapSubject::Point,
-            SemanticCapability::NormalControlFlow,
-            SemanticGapKind::Unsupported,
-            &detail,
-        )
+        self.session
+            .add_unhandled_control_syntax_gap(builder, entry, node.kind())
+            .map(|_| ())
     }
 
     fn schedule_statements(
@@ -6151,26 +6730,36 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), CSharpLoweringError> {
         if children.is_empty() {
-            return self.edge(builder, entry, next);
+            return self.session.add_target_edge(builder, entry, next);
         }
         let entries = children
             .iter()
-            .map(|child| self.point(builder, *child, Vec::new()))
+            .map(|child| self.session.add_node_point(builder, *child, Vec::new()))
             .collect::<Result<Vec<_>, _>>()?;
-        self.edge(builder, entry, EdgeTarget::normal(entries[0]))?;
-        for index in (0..children.len()).rev() {
-            let child_next = entries
-                .get(index + 1)
-                .copied()
-                .map(EdgeTarget::normal)
-                .unwrap_or(next);
-            stack.push(Work::Statement {
-                node: children[index],
-                entry: entries[index],
-                next: child_next,
-                scope,
-            });
+        for (child, entry) in children.iter().zip(&entries) {
+            if let Some(label) = csharp_labeled_statement_name(*child, self.prepared.source()) {
+                let previous = self.labels.insert(label.into(), *entry);
+                assert!(
+                    previous.is_none(),
+                    "a C# procedure cannot contain duplicate labels"
+                );
+            }
         }
+        self.session
+            .add_target_edge(builder, entry, EdgeTarget::normal(entries[0]))?;
+        schedule_sequential_work(
+            stack,
+            children,
+            &entries,
+            next,
+            scope,
+            |_, node, entry, next, scope| Work::Statement {
+                node,
+                entry,
+                next,
+                scope,
+            },
+        );
         Ok(())
     }
 
@@ -6184,26 +6773,27 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), CSharpLoweringError> {
         if children.is_empty() {
-            return self.edge(builder, entry, next);
+            return self.session.add_target_edge(builder, entry, next);
         }
         let entries = children
             .iter()
-            .map(|child| self.point(builder, *child, Vec::new()))
+            .map(|child| self.session.add_node_point(builder, *child, Vec::new()))
             .collect::<Result<Vec<_>, _>>()?;
-        self.edge(builder, entry, EdgeTarget::normal(entries[0]))?;
-        for index in (0..children.len()).rev() {
-            let child_next = entries
-                .get(index + 1)
-                .copied()
-                .map(EdgeTarget::normal)
-                .unwrap_or(next);
-            stack.push(Work::Expression {
-                node: children[index],
-                entry: entries[index],
-                next: child_next,
+        self.session
+            .add_target_edge(builder, entry, EdgeTarget::normal(entries[0]))?;
+        schedule_sequential_work(
+            stack,
+            children,
+            &entries,
+            next,
+            scope,
+            |_, node, entry, next, scope| Work::Expression {
+                node,
+                entry,
+                next,
                 scope,
-            });
-        }
+            },
+        );
         Ok(())
     }
 
@@ -6222,23 +6812,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 kind,
                 CompletionKind::Break | CompletionKind::Continue | CompletionKind::Yield
             ) {
-                let detail = format!(
-                    "{} completion has no matching represented target",
-                    completion_label(kind)
-                );
-                self.add_gap(
+                self.session.add_unmatched_completion_gap(
                     builder,
                     from,
-                    SemanticGapSubject::Point,
+                    kind,
                     SemanticCapability::NonLocalControl,
-                    SemanticGapKind::Unsupported,
-                    &detail,
                 )?;
                 return Ok(());
             }
             return Err(CSharpLoweringError::Invalid(format!(
                 "{} completion has no matching structured continuation",
-                completion_label(kind)
+                kind.label()
             )));
         };
         self.route(builder, from, &route, stack)
@@ -6261,13 +6845,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         )? {
             match step.region.body {
                 CleanupBody::Statement(body) => {
-                    let statement_next = if step.next.kind == ControlEdgeKind::Normal {
-                        step.next
-                    } else {
-                        let relay = self.point(builder, body, Vec::new())?;
-                        self.edge(builder, relay, step.next)?;
-                        EdgeTarget::normal(relay)
-                    };
+                    let statement_next =
+                        self.session.cleanup_next_target(builder, body, step.next)?;
                     stack.push(Work::Statement {
                         node: body,
                         entry: step.entry,
@@ -6276,7 +6855,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     });
                 }
                 CleanupBody::OpaqueResource(_) => {
-                    self.add_gap(
+                    self.session.record_gap(
                         builder,
                         step.entry,
                         SemanticGapSubject::Point,
@@ -6284,7 +6863,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         SemanticGapKind::Unsupported,
                         "resource close order, suppression, and value effects are not yet lowered",
                     )?;
-                    self.add_gap(
+                    self.session.record_gap(
                         builder,
                         step.entry,
                         SemanticGapSubject::Point,
@@ -6292,10 +6871,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         SemanticGapKind::Unsupported,
                         "resource close can raise or suppress exceptions not yet represented",
                     )?;
-                    self.edge(builder, step.entry, step.next)?;
+                    self.session
+                        .add_target_edge(builder, step.entry, step.next)?;
                 }
                 CleanupBody::OpaqueFixed(_) => {
-                    self.add_gap(
+                    self.session.record_gap(
                             builder,
                             step.entry,
                             SemanticGapSubject::Point,
@@ -6303,10 +6883,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                             SemanticGapKind::Unsupported,
                             "fixed-region pinning lifetime and pointer invalidation are represented only as an opaque cleanup boundary",
                         )?;
-                    self.edge(builder, step.entry, step.next)?;
+                    self.session
+                        .add_target_edge(builder, step.entry, step.next)?;
                 }
                 CleanupBody::OpaqueMonitor(_) => {
-                    self.add_gap(
+                    self.session.record_gap(
                             builder,
                             step.entry,
                             SemanticGapSubject::Point,
@@ -6314,7 +6895,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                             SemanticGapKind::Unsupported,
                             "monitor release effects are represented only as an opaque cleanup boundary",
                         )?;
-                    self.add_gap(
+                    self.session.record_gap(
                         builder,
                         step.entry,
                         SemanticGapSubject::Point,
@@ -6322,58 +6903,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         SemanticGapKind::Unsupported,
                         "monitor release failure behavior is not yet represented",
                     )?;
-                    self.edge(builder, step.entry, step.next)?;
+                    self.session
+                        .add_target_edge(builder, step.entry, step.next)?;
                 }
             }
         }
-        self.edge(builder, from, plan.target())
-    }
-
-    fn resolution_gaps(
-        &mut self,
-        builder: &mut ProcedureCfgBuilder,
-        point: ProgramPointId,
-        callee: ValueId,
-        call_site: CallSiteId,
-        resolution: &CallableTargetResolution,
-    ) -> Result<(), CSharpLoweringError> {
-        self.session.add_callable_resolution_gaps(
-            builder,
-            point,
-            callee,
-            call_site,
-            resolution,
-            "callable target requires whole-program dispatch refinement",
-            "call target requires whole-program dispatch refinement",
-        )
-    }
-
-    fn point(
-        &mut self,
-        builder: &mut ProcedureCfgBuilder,
-        node: Node<'tree>,
-        effects: Vec<SemanticEffect>,
-    ) -> Result<ProgramPointId, CSharpLoweringError> {
-        let metadata = self.mapping(builder, node)?;
-        self.session.add_point(builder, metadata, effects)
-    }
-
-    fn mapping(
-        &mut self,
-        builder: &mut ProcedureCfgBuilder,
-        node: Node<'tree>,
-    ) -> Result<PointMetadata, CSharpLoweringError> {
-        self.session.add_node_mapping(builder, node)
-    }
-
-    fn value_mapping(
-        &mut self,
-        builder: &mut ProcedureCfgBuilder,
-        node: Node<'tree>,
-    ) -> Result<PointMetadata, CSharpLoweringError> {
-        let anchor = source_anchor(node, 0).map_err(CSharpLoweringError::Invalid)?;
-        self.session
-            .add_mapping(builder, anchor, SourceMappingKind::Exact)
+        self.session.add_target_edge(builder, from, plan.target())
     }
 
     fn metadata(&self, point: ProgramPointId) -> Result<PointMetadata, CSharpLoweringError> {
@@ -6396,30 +6931,6 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         effect: SemanticEffect,
     ) -> Result<(), CSharpLoweringError> {
         self.session.append_effect(builder, point, effect)
-    }
-
-    fn add_gap(
-        &mut self,
-        builder: &mut ProcedureCfgBuilder,
-        point: ProgramPointId,
-        subject: SemanticGapSubject,
-        capability: SemanticCapability,
-        kind: SemanticGapKind,
-        detail: &str,
-    ) -> Result<(), CSharpLoweringError> {
-        self.session
-            .add_gap(builder, point, subject, capability, kind, detail)?;
-        Ok(())
-    }
-
-    fn edge(
-        &self,
-        builder: &mut ProcedureCfgBuilder,
-        source_point: ProgramPointId,
-        target: EdgeTarget,
-    ) -> Result<(), CSharpLoweringError> {
-        self.session
-            .add_edge(builder, source_point, target.point, target.kind)
     }
 }
 
@@ -6537,17 +7048,31 @@ fn is_pattern_syntax(kind: &str) -> bool {
         )
 }
 
-fn expression_value_kind(node: Node<'_>) -> SemanticValueKind {
+/// The value kind of one expression. Decimal integer, Boolean and `null`
+/// literals publish their value, which the scalar solver reads; every other
+/// literal is an opaque constant.
+fn expression_value_kind(source: &str, node: Node<'_>) -> SemanticValueKind {
     match node.kind() {
         "lambda_expression" | "anonymous_method_expression" => SemanticValueKind::Callable,
-        "integer_literal"
-        | "real_literal"
-        | "boolean_literal"
+        "integer_literal" => csharp_integer_literal_value(source, node).map_or(
+            SemanticValueKind::Constant,
+            |value| {
+                SemanticValueKind::UnsignedInteger(
+                    u128::try_from(value).expect("an unsigned literal token is non-negative"),
+                )
+            },
+        ),
+        "boolean_literal" => match node_text(source, node) {
+            Some("true") => SemanticValueKind::Boolean(true),
+            Some("false") => SemanticValueKind::Boolean(false),
+            _ => SemanticValueKind::Constant,
+        },
+        "null_literal" => SemanticValueKind::Null,
+        "real_literal"
         | "character_literal"
         | "string_literal"
         | "verbatim_string_literal"
-        | "raw_string_literal"
-        | "null_literal" => SemanticValueKind::Constant,
+        | "raw_string_literal" => SemanticValueKind::Constant,
         _ => SemanticValueKind::Temporary,
     }
 }
@@ -6584,18 +7109,12 @@ fn is_local_variable_declarator(node: Node<'_>) -> bool {
     node.parent()
         .filter(|parent| parent.kind() == "variable_declaration")
         .and_then(|declaration| declaration.parent())
-        .is_none_or(|owner| {
-            !matches!(
-                owner.kind(),
-                "field_declaration" | "event_field_declaration"
-            )
-        })
+        .is_none_or(|owner| !csharp_is_member_variable_owner_kind(owner.kind()))
 }
 
 fn csharp_local_scope(node: Node<'_>) -> Option<(usize, usize)> {
-    let mut current = node.parent();
-    while let Some(parent) = current {
-        if matches!(
+    brokk_bifrost_core::analyzer::tree_walk::find_ancestor(node, |parent| {
+        matches!(
             parent.kind(),
             "block"
                 | "for_statement"
@@ -6604,15 +7123,9 @@ fn csharp_local_scope(node: Node<'_>) -> Option<(usize, usize)> {
                 | "using_statement"
                 | "fixed_statement"
                 | "catch_clause"
-        ) {
-            return Some((parent.start_byte(), parent.end_byte()));
-        }
-        if is_csharp_nested_execution_boundary(parent) {
-            return Some((parent.start_byte(), parent.end_byte()));
-        }
-        current = parent.parent();
-    }
-    None
+        ) || is_csharp_nested_execution_boundary(parent)
+    })
+    .map(|scope| (scope.start_byte(), scope.end_byte()))
 }
 
 fn is_statement_kind(kind: &str) -> bool {
@@ -6666,6 +7179,7 @@ pub(crate) const PROCEDURE_SYNTAX_ROLES: crate::analyzer::languages::ProcedureSy
                 condition: node.child_by_field_name("condition"),
             })
         },
+        loop_site_with_source: None,
         procedure_matches: |_, node| is_csharp_procedure_node(node),
         nested_procedure: |node| {
             is_csharp_procedure_node(node) || node.kind() == "declaration_list"
@@ -6729,28 +7243,6 @@ fn is_conditional_compilation_kind(kind: &str) -> bool {
     )
 }
 
-fn variable_declarator_initializer(declarator: Node<'_>) -> Option<Node<'_>> {
-    declarator
-        .child_by_field_name("value")
-        .or_else(|| declarator.child_by_field_name("initializer"))
-        .or_else(|| {
-            named_children(declarator)
-                .into_iter()
-                .find(|child| child.kind() == "equals_value_clause")
-                .and_then(|clause| {
-                    clause
-                        .child_by_field_name("value")
-                        .or_else(|| clause.named_child(0))
-                })
-        })
-        .or_else(|| {
-            let name = declarator.child_by_field_name("name")?;
-            named_children(declarator)
-                .into_iter()
-                .find(|child| child.start_byte() > name.end_byte())
-        })
-}
-
 /// Whether a C# `for` statement is known to enter its body before its first
 /// condition check.
 ///
@@ -6770,12 +7262,13 @@ fn csharp_for_has_first_iteration(
         return false;
     };
     let update = updates[0];
+    let Some(operator) = condition.child_by_field_name("operator") else {
+        return false;
+    };
     if initializer.kind() != "variable_declaration"
         || condition.kind() != "binary_expression"
-        || condition
-            .child_by_field_name("operator")
-            .is_none_or(|operator| operator.kind() != "<")
-        || !is_update_expression_shape(update)
+        || !matches!(operator.kind(), "<" | ">")
+        || !is_update_expression(update)
     {
         return false;
     }
@@ -6809,35 +7302,33 @@ fn csharp_for_has_first_iteration(
     else {
         return false;
     };
+    let initially_enters_body = match operator.kind() {
+        "<" => start < limit,
+        ">" => start > limit,
+        _ => unreachable!("the operator was checked above"),
+    };
     let Some(incremented) = first_named_child(update).filter(|node| node.kind() == "identifier")
     else {
         return false;
     };
     node_text(source, name) == node_text(source, left)
         && node_text(source, name) == node_text(source, incremented)
-        && start < limit
+        && initially_enters_body
 }
 
-fn is_update_expression_shape(node: Node<'_>) -> bool {
-    if !matches!(
-        node.kind(),
-        "prefix_unary_expression" | "postfix_unary_expression"
-    ) {
-        return false;
-    }
-    let operator = match node.kind() {
+/// The operator token of a prefix or postfix unary expression. The grammar
+/// gives it no field name: it is the first child of a prefix expression and
+/// the last child of a postfix one.
+fn unary_operator(node: Node<'_>) -> Option<Node<'_>> {
+    match node.kind() {
         "prefix_unary_expression" => node.child(0),
-        "postfix_unary_expression" => node.child(node.child_count().saturating_sub(1)),
+        "postfix_unary_expression" => node.child(node.child_count().checked_sub(1)?),
         _ => None,
-    };
-    operator.is_some_and(|operator| operator.kind() == "++")
+    }
 }
 
 fn csharp_integer_literal_value(source: &str, node: Node<'_>) -> Option<i64> {
-    (node.kind() == "integer_literal")
-        .then(|| node_text(source, node))
-        .flatten()
-        .and_then(|text| text.parse().ok())
+    crate::analyzer::common::integer_literal_value(source, node)
 }
 
 /// The boolean value of a C# condition that bottoms out in a literal through
@@ -7015,21 +7506,16 @@ fn record_type_receiver_shadow(
 }
 
 fn enclosing_type_node(node: Node<'_>) -> Option<Node<'_>> {
-    let mut current = node.parent();
-    while let Some(parent) = current {
-        if matches!(
-            parent.kind(),
+    brokk_bifrost_core::analyzer::structural::adapter_helpers::nearest_ancestor(node, |kind| {
+        matches!(
+            kind,
             "class_declaration"
                 | "interface_declaration"
                 | "struct_declaration"
                 | "record_declaration"
                 | "record_struct_declaration"
-        ) {
-            return Some(parent);
-        }
-        current = parent.parent();
-    }
-    None
+        )
+    })
 }
 
 /// The declared spelling of a type node, array ranks included.
@@ -7105,18 +7591,17 @@ fn conditional_branches_have_identity_preserving_construction(
         && consequence_type == super::csharp_type_node_identity(alternative_type, source)
 }
 
-fn switch_section_control_nodes(section: Node<'_>) -> Vec<Node<'_>> {
-    named_children(section)
-        .into_iter()
-        .filter(|child| !is_statement_kind(child.kind()))
-        .collect()
-}
-
-fn switch_section_statements(section: Node<'_>) -> Vec<Node<'_>> {
-    named_children(section)
-        .into_iter()
-        .filter(|child| is_statement_kind(child.kind()))
-        .collect()
+fn switch_section_children(section: Node<'_>) -> (Vec<Node<'_>>, Vec<Node<'_>>) {
+    let mut control = Vec::new();
+    let mut statements = Vec::new();
+    for child in named_children(section) {
+        if is_statement_kind(child.kind()) {
+            statements.push(child);
+        } else {
+            control.push(child);
+        }
+    }
+    (control, statements)
 }
 
 fn switch_expression_arm_value(arm: Node<'_>) -> Option<Node<'_>> {
@@ -7169,32 +7654,6 @@ fn object_initializer(node: Node<'_>) -> Option<Node<'_>> {
             .into_iter()
             .find(|child| child.kind() == "initializer_expression")
     })
-}
-
-fn call_arguments(node: Node<'_>) -> Vec<Node<'_>> {
-    node.child_by_field_name("arguments")
-        .or_else(|| {
-            named_children(node)
-                .into_iter()
-                .find(|child| child.kind() == "argument_list")
-        })
-        .map(named_children)
-        .unwrap_or_default()
-}
-
-fn call_argument_value(argument: Node<'_>) -> Option<Node<'_>> {
-    if argument.kind() != "argument" {
-        return Some(argument);
-    }
-    let keyword = argument.child_by_field_name("name");
-    argument
-        .child_by_field_name("value")
-        .or_else(|| argument.child_by_field_name("expression"))
-        .or_else(|| {
-            named_children(argument)
-                .into_iter()
-                .find(|child| keyword.is_none_or(|keyword| child.id() != keyword.id()))
-        })
 }
 
 #[derive(Clone, Copy)]
@@ -7254,24 +7713,58 @@ fn access_is_write_target(node: Node<'_>) -> bool {
 /// `obj.Method()` reads no member: `Method` is a method group, and the call
 /// site the invocation publishes already represents it.
 fn access_is_call_target(node: Node<'_>) -> bool {
-    node.parent().is_some_and(|parent| {
-        parent.kind() == "invocation_expression"
-            && parent.child_by_field_name("function") == Some(node)
-    })
+    parent_if_field(node, "invocation_expression", "function").is_some()
 }
 
 fn is_simple_assignment(node: Node<'_>) -> bool {
     node.child_by_field_name("operator")
-        .is_some_and(|operator| operator.kind() == "=")
+        .is_some_and(|operator| {
+            super::super::assignment_facts::is_plain_assignment_operator_kind(operator.kind())
+        })
 }
 
 fn is_update_expression(node: Node<'_>) -> bool {
-    matches!(
-        node.kind(),
-        "prefix_unary_expression" | "postfix_unary_expression"
-    ) && node
-        .child_by_field_name("operator")
-        .is_some_and(|operator| matches!(operator.kind(), "++" | "--"))
+    unary_operator(node).is_some_and(|operator| matches!(operator.kind(), "++" | "--"))
+}
+
+/// The named target of a C# `goto label;`. `goto case` and `goto default`
+/// have no identifier target and stay on the unsupported non-local-control
+/// path.
+fn csharp_goto_label<'source>(node: Node<'_>, source: &'source str) -> Option<&'source str> {
+    node.child_by_field_name("label")
+        .filter(|label| label.kind() == "identifier")
+        .or_else(|| first_named_child(node).filter(|child| child.kind() == "identifier"))
+        .and_then(|label| node_text(source, label))
+}
+
+/// The label name and body of the C# `labeled_statement` grammar are both
+/// named children. Keep the structural selection in the tree and only decode
+/// the selected identifier's value here.
+fn csharp_labeled_statement_name<'source>(
+    node: Node<'_>,
+    source: &'source str,
+) -> Option<&'source str> {
+    if node.kind() != "labeled_statement" {
+        return None;
+    }
+    node.child_by_field_name("label")
+        .filter(|label| label.kind() == "identifier")
+        .or_else(|| {
+            named_children(node)
+                .into_iter()
+                .find(|child| child.kind() == "identifier")
+        })
+        .and_then(|label| node_text(source, label))
+}
+
+/// A bare `catch { ... }` catches every C# exception and has no filter or
+/// type-selection code to model. Typed, filtered, and multi-catch forms keep
+/// the dispatcher and its explicit selection gap.
+fn csharp_catch_is_unfiltered(node: Node<'_>) -> bool {
+    node.kind() == "catch_clause"
+        && named_children(node)
+            .into_iter()
+            .all(|child| !matches!(child.kind(), "catch_declaration" | "catch_filter_clause"))
 }
 
 /// Whether a type spelling names one of C#'s predefined types.
@@ -7339,37 +7832,23 @@ fn may_invoke_user_code(node: Node<'_>) -> bool {
 }
 
 fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
+    brokk_bifrost_core::analyzer::tree_walk::named_children_vec(node)
+        .into_iter()
         .filter(|child| !is_comment_kind(child.kind()))
         .collect()
 }
 
 fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .find(|child| !is_comment_kind(child.kind()))
-}
-
-fn is_comment_kind(kind: &str) -> bool {
-    matches!(kind, "line_comment" | "block_comment" | "comment")
+    brokk_bifrost_core::analyzer::tree_walk::first_named_child_matching(node, |child| {
+        !is_comment_kind(child.kind())
+    })
 }
 
 fn required_field<'tree>(
     node: Node<'tree>,
     field: &str,
 ) -> Result<Node<'tree>, CSharpLoweringError> {
-    node.child_by_field_name(field)
-        .ok_or_else(|| missing_field(node, field))
-}
-
-fn missing_field(node: Node<'_>, field: &str) -> CSharpLoweringError {
-    CSharpLoweringError::Invalid(format!(
-        "{} node at bytes {}..{} is missing structured field {field}",
-        node.kind(),
-        node.start_byte(),
-        node.end_byte()
-    ))
+    crate::analyzer::semantic::lowering::required_field_or_else(node, field, missing_field)
 }
 
 fn binary_operator(node: Node<'_>) -> Option<&'static str> {
@@ -7423,17 +7902,6 @@ fn is_runtime_leaf(kind: &str) -> bool {
     )
 }
 
-const fn completion_label(kind: CompletionKind) -> &'static str {
-    match kind {
-        CompletionKind::Normal => "normal",
-        CompletionKind::Return => "return",
-        CompletionKind::Throw => "throw",
-        CompletionKind::Break => "break",
-        CompletionKind::Continue => "continue",
-        CompletionKind::Yield => "yield",
-    }
-}
-
 #[cfg(test)]
 mod primary_handoff_tests {
     use super::*;
@@ -7475,6 +7943,7 @@ mod tests {
     use crate::analyzer::LanguageDialect;
     use crate::analyzer::tree_sitter_analyzer::{PreparedSourceOrigin, PreparedSyntaxSource};
     use crate::text_utils::compute_line_starts;
+    use brokk_bifrost_test_macros::hardwon;
     use std::sync::Arc;
 
     fn lower(source: &str) -> Vec<ProcedureSemanticsParts> {
@@ -7507,6 +7976,44 @@ mod tests {
             panic!("fixture lowering must complete");
         };
         procedures
+    }
+
+    #[test]
+    #[hardwon("#4271: decrementing counted loops prove the first body entry")]
+    fn decrementing_counted_for_proves_first_iteration() {
+        let source = "class Fixture { static void Run() { for (int i = 1; i > 0; i--) { } } }";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        assert!(!tree.root_node().has_error());
+        let mut pending = vec![tree.root_node()];
+        let mut for_statement = None;
+        while let Some(node) = pending.pop() {
+            if node.kind() == "for_statement" {
+                for_statement = Some(node);
+                break;
+            }
+            pending.extend(named_children(node));
+        }
+        let for_statement = for_statement.expect("fixture contains a for statement");
+        let initializers = children_by_field_name(for_statement, "initializer")
+            .into_iter()
+            .filter(Node::is_named)
+            .collect::<Vec<_>>();
+        let condition = for_statement.child_by_field_name("condition");
+        let updates = children_by_field_name(for_statement, "update")
+            .into_iter()
+            .filter(Node::is_named)
+            .collect::<Vec<_>>();
+
+        assert!(csharp_for_has_first_iteration(
+            source,
+            &initializers,
+            condition,
+            &updates,
+        ));
     }
 
     #[test]
@@ -7575,5 +8082,206 @@ mod tests {
                 )),
             "the argument copy must carry its declared field storage"
         );
+    }
+
+    fn mapping_text<'s>(
+        procedure: &ProcedureSemanticsParts,
+        source: &'s str,
+        mapping: SourceMappingId,
+    ) -> &'s str {
+        crate::analyzer::test_support::source_mapping_text(
+            &procedure.source_mappings[mapping.index()],
+            source,
+        )
+    }
+
+    #[test]
+    #[hardwon("#2731: checked increments lacked normal-edge assignment updates")]
+    fn integral_updates_write_their_binding_after_the_throwing_operation() {
+        let source = "class Fixture { static int Run(int x, double d, ref int r) { int a = x++; int b = ++x; x--; --x; d++; r++; return a + b; } }";
+        let procedures = lower(source);
+        let run = procedures
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("Run")
+            })
+            .unwrap();
+        let value_text =
+            |value: ValueId| mapping_text(run, source, run.values[value.index()].source);
+        fn events(point: &ProgramPoint) -> impl Iterator<Item = SemanticEffect> + '_ {
+            point.events.iter().map(|event| event.effect.clone())
+        }
+        for (expression, negative, yields_old) in [
+            ("x++", false, true),
+            ("++x", false, false),
+            ("x--", true, true),
+            ("--x", true, false),
+        ] {
+            let (write, old, computed) = run
+                .points
+                .iter()
+                .find_map(|point| {
+                    events(point).find_map(|effect| match effect {
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::IntegerOffset { offset },
+                            source: old,
+                            target: computed,
+                        } if mapping_text(run, source, point.source) == expression => {
+                            assert_eq!(
+                                offset,
+                                SignedIntegerMagnitude::new(negative, 1),
+                                "{expression}"
+                            );
+                            Some((point, old, computed))
+                        }
+                        _ => None,
+                    })
+                })
+                .unwrap_or_else(|| panic!("{expression} publishes an integer offset"));
+            assert_eq!(value_text(old), "x", "{expression} reads its operand");
+            let parameter = run
+                .values
+                .iter()
+                .find(|value| matches!(&value.kind, SemanticValueKind::Parameter { name: Some(name), .. } if name.as_ref() == "x"))
+                .unwrap()
+                .id;
+            let yielded = if yields_old { old } else { computed };
+            let result = run
+                .values
+                .iter()
+                .find(|value| value_text(value.id) == expression && value.id != computed)
+                .unwrap()
+                .id;
+            let expected = [
+                SemanticEffect::Assignment {
+                    target: parameter,
+                    value: computed,
+                },
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Parameter,
+                    source: computed,
+                    target: parameter,
+                },
+                SemanticEffect::Assignment {
+                    target: result,
+                    value: yielded,
+                },
+            ];
+            for effect in &expected {
+                assert!(
+                    events(write).any(|candidate| candidate == *effect),
+                    "{expression}: {effect:?} missing from {:?}",
+                    write.events
+                );
+            }
+            // A checked context throws before the store: the exceptional edge
+            // leaves the operation point, whose normal successor writes.
+            let leaving = |point: ProgramPointId, kind: ControlEdgeKind| {
+                run.control_edges
+                    .iter()
+                    .filter(|edge| edge.source_point == point && edge.kind == kind)
+                    .map(|edge| edge.target_point)
+                    .collect::<Vec<_>>()
+            };
+            assert!(
+                leaving(write.id, ControlEdgeKind::Exceptional).is_empty(),
+                "{expression}"
+            );
+            let operations = run
+                .control_edges
+                .iter()
+                .filter(|edge| {
+                    edge.target_point == write.id && edge.kind == ControlEdgeKind::Normal
+                })
+                .map(|edge| edge.source_point)
+                .collect::<Vec<_>>();
+            let [operation] = operations[..] else {
+                panic!("{expression} has one operation predecessor: {operations:?}");
+            };
+            assert_eq!(
+                mapping_text(run, source, run.points[operation.index()].source),
+                expression
+            );
+            assert!(
+                run.points[operation.index()].events.is_empty(),
+                "{expression}"
+            );
+            assert_eq!(
+                leaving(operation, ControlEdgeKind::Exceptional).len(),
+                1,
+                "{expression}"
+            );
+        }
+        // A floating operand and a `ref` formal keep the assignment gap, which
+        // the lowering records at the enclosing statement's entry.
+        let gapped = run
+            .gaps
+            .iter()
+            .filter(|gap| gap.capability == SemanticCapability::Assignments)
+            .map(|gap| mapping_text(run, source, gap.source))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            gapped,
+            ["d++;", "r++;"].into_iter().collect(),
+            "{:?}",
+            run.gaps
+        );
+    }
+
+    /// A conditional access nested inside another shares its entry point:
+    /// `a?.b?.c` nests directly, and the grammar parses `a?.b ?? c?.d` as
+    /// `(a?.b ?? c)?.d`. Each access publishes its own gap at its own binding
+    /// point, so the artifact passes the IR gap contract.
+    #[test]
+    fn nested_conditional_accesses_publish_one_gap_each_and_validate() {
+        let source = "class S { public S Next; public string Name; string F(S a, S b) { return a?.Name ?? b?.Name; } string G(S a) { return a?.Next?.Name; } }";
+        let project = crate::inline_project::InlineTestProject::with_language(Language::CSharp)
+            .file("Fixture.cs", source)
+            .build();
+        let workspace = project.workspace_analyzer(crate::analyzer::AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &project.file("Fixture.cs"),
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("C# semantic materialization")
+            .available_value()
+            .cloned()
+            .expect("the artifact passes IR validation");
+        for (name, accesses) in [("F", 2), ("G", 2)] {
+            let procedure = artifact
+                .procedures()
+                .iter()
+                .find(|procedure| {
+                    procedure
+                        .locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some(name)
+                })
+                .unwrap();
+            let gaps = procedure
+                .gaps()
+                .iter()
+                .filter(|gap| {
+                    gap.detail
+                        .starts_with("conditional-access value propagation")
+                })
+                .map(|gap| gap.point)
+                .collect::<Vec<_>>();
+            assert_eq!(gaps.len(), accesses, "{name}: {gaps:?}");
+            let distinct = gaps.iter().collect::<std::collections::HashSet<_>>();
+            assert_eq!(distinct.len(), accesses, "{name}: {gaps:?}");
+        }
     }
 }

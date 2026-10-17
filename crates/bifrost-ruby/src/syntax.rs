@@ -8,12 +8,73 @@
 use brokk_bifrost_core::analyzer::model::Range;
 use tree_sitter::Node;
 
+pub fn call_method_node(node: Node<'_>) -> Option<Node<'_>> {
+    node.child_by_field_name("method")
+}
+
+/// Return only the binding-name nodes owned by a Ruby formal parameter list.
+/// The callback is charged for each visited node and inspected parameter
+/// child, allowing bounded callers to keep their budget at the call site.
+pub fn ruby_parameter_binding_name_nodes<'tree>(
+    parameters: Node<'tree>,
+    mut step: impl FnMut() -> bool,
+) -> Option<Vec<Node<'tree>>> {
+    let mut stack = vec![parameters];
+    let mut names = Vec::new();
+    while let Some(current) = stack.pop() {
+        if !step() {
+            return None;
+        }
+        match current.kind() {
+            "identifier" => names.push(current),
+            "optional_parameter"
+            | "keyword_parameter"
+            | "splat_parameter"
+            | "hash_splat_parameter"
+            | "block_parameter" => {
+                for index in 0..current.child_count() {
+                    if !step() {
+                        return None;
+                    }
+                    if current.field_name_for_child(index as u32) == Some("name")
+                        && let Some(name) = current.child(index).filter(Node::is_named)
+                    {
+                        stack.push(name);
+                    }
+                }
+            }
+            "method_parameters"
+            | "lambda_parameters"
+            | "block_parameters"
+            | "destructured_parameter" => {
+                let mut cursor = current.walk();
+                for child in current.named_children(&mut cursor) {
+                    if !step() {
+                        return None;
+                    }
+                    stack.push(child);
+                }
+            }
+            _ => {}
+        }
+    }
+    names.sort_unstable_by_key(Node::start_byte);
+    names.dedup_by_key(|node| (node.start_byte(), node.end_byte()));
+    Some(names)
+}
+
 pub fn single_static_string_content_node(node: Node<'_>) -> Option<Node<'_>> {
     if node.named_child_count() != 1 {
         return None;
     }
     let content = node.named_child(0)?;
     (content.kind() == "string_content").then_some(content)
+}
+
+pub fn ruby_static_string_content_node(node: Node<'_>) -> Option<Node<'_>> {
+    (node.kind() == "string")
+        .then(|| single_static_string_content_node(node))
+        .flatten()
 }
 
 pub fn ruby_call_arguments(node: Node<'_>) -> Vec<Node<'_>> {

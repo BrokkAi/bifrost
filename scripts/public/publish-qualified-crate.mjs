@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 
-import { createHash } from "node:crypto";
+import { sha256Hex as sharedSha256Hex } from "../lib/sha256.mjs";
 import fs from "node:fs";
 import { TextDecoder } from "node:util";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { parseMappedCliArgs } from "./cli-argument-helpers.mjs";
 
 const MAX_U32 = 0xffffffff;
 const DEFAULT_REGISTRY_BASE_URL = "https://crates.io";
@@ -111,7 +112,7 @@ export function parsePublishRequest(body) {
 }
 
 export function sha256Hex(value) {
-  return createHash("sha256").update(bytes(value, "Bytes")).digest("hex");
+  return sharedSha256Hex(bytes(value, "Bytes"));
 }
 
 function expectedChecksum(value) {
@@ -291,33 +292,15 @@ function requiredPath(value, name) {
 }
 
 export function parseCliArgs(argv) {
-  const options = {};
-  for (let index = 0; index < argv.length; index += 1) {
-    const flag = argv[index];
-    if (flag === "--help" || flag === "-h") return { help: true };
-    const value = argv[index + 1];
-    if (value === undefined || value.startsWith("--")) throw new Error(`Missing value for ${flag}.`);
-    switch (flag) {
-      case "--metadata-file":
-        options.metadataPath = value;
-        break;
-      case "--crate-file":
-        options.cratePath = value;
-        break;
-      case "--expected-sha256":
-        options.expectedSha256 = value;
-        break;
-      case "--registry-base-url":
-        options.registryBaseUrl = value;
-        break;
-      case "--timeout-ms":
-        options.timeoutMs = Number(value);
-        break;
-      default:
-        throw new Error(`Unknown option: ${flag}.`);
-    }
-    index += 1;
-  }
+  const options = parseMappedCliArgs(argv, {
+    "--metadata-file": "metadataPath",
+    "--crate-file": "cratePath",
+    "--expected-sha256": "expectedSha256",
+    "--registry-base-url": "registryBaseUrl",
+    "--timeout-ms": "timeoutMs",
+  });
+  if (options.help) return options;
+  if (options.timeoutMs !== undefined) options.timeoutMs = Number(options.timeoutMs);
   requiredPath(options.metadataPath, "Metadata");
   requiredPath(options.cratePath, "Crate");
   return options;

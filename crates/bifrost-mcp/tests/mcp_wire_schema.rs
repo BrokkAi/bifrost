@@ -1,7 +1,7 @@
 //! Official MCP wire-schema conformance for the real stdio server.
 //!
-//! Milestone 2 of `.agents/plans/issue-2319-mcp-conformance.md`. Each test
-//! spawns the real Bifrost MCP stdio binary, records every JSON-RPC message
+//! MCP wire-schema conformance (#2319). Each test spawns the real Bifrost MCP
+//! stdio binary, records every JSON-RPC message
 //! that crosses the pipe in both directions, and validates the whole
 //! transcript against the official MCP spec JSON schema checked in under
 //! `tests/conformance/schemas/` for the revision that session negotiated.
@@ -38,7 +38,7 @@ use tempfile::TempDir;
 /// The stateful revision: negotiated by an `initialize` handshake.
 const LEGACY_REVISION: &str = "2025-11-25";
 /// The stateless revision: `server/discover` plus per-request `_meta`.
-const STATELESS_REVISION: &str = "2026-07-28";
+const STATELESS_REVISION: &str = common::mcp_server::STATELESS_REVISION;
 const AGENTS_GUIDANCE_URI: &str = "bifrost://agent-guidance/agents.md";
 
 // This crate's published suite owns its fixtures. Reaching into the private
@@ -171,7 +171,7 @@ fn discovery_2026_07_28_and_stateless_calls_emit_schema_valid_wire() {
         "jsonrpc": "2.0",
         "id": 1,
         "method": "server/discover",
-        "params": { "_meta": stateless_meta() }
+        "params": { "_meta": common::mcp_server::stateless_meta() }
     }));
     assert!(
         discover["result"]["supportedVersions"]
@@ -184,17 +184,17 @@ fn discovery_2026_07_28_and_stateless_calls_emit_schema_valid_wire() {
         "jsonrpc": "2.0",
         "id": 2,
         "method": "tools/list",
-        "params": { "_meta": stateless_meta() }
+        "params": { "_meta": common::mcp_server::stateless_meta() }
     }));
     assert_eq!(tools["result"]["resultType"], "complete", "{tools}");
 
-    let call = session.round_trip(stateless_search_symbols_call(3, "Stateless"));
+    let call = session.round_trip(common::stateless_search_symbols_call(3, "Stateless"));
     assert_eq!(call["result"]["resultType"], "complete", "{call}");
     assert_eq!(call["result"]["isError"], false, "{call}");
 
     // Every stateless request is negotiated on its own, so a version the
     // server does not speak is refused per request rather than per session.
-    let mut unsupported = stateless_search_symbols_call(4, "Stateless");
+    let mut unsupported = common::stateless_search_symbols_call(4, "Stateless");
     unsupported["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] = json!("2099-01-01");
     let refused = session.round_trip(unsupported);
     assert!(
@@ -228,10 +228,10 @@ fn mrtr_roots_2026_07_28_session_emits_schema_valid_wire() {
         "jsonrpc": "2.0",
         "id": 1,
         "method": "server/discover",
-        "params": { "_meta": stateless_meta() }
+        "params": { "_meta": common::mcp_server::stateless_meta() }
     }));
 
-    let activation = session.round_trip(stateless_search_symbols_call(2, "MrtrWorkspace"));
+    let activation = session.round_trip(common::stateless_search_symbols_call(2, "MrtrWorkspace"));
     assert_eq!(
         activation["result"]["resultType"], "input_required",
         "{activation}"
@@ -244,7 +244,7 @@ fn mrtr_roots_2026_07_28_session_emits_schema_valid_wire() {
         .as_str()
         .unwrap_or_else(|| panic!("an activation must carry a requestState: {activation}"));
 
-    let mut retry = stateless_search_symbols_call(3, "MrtrWorkspace");
+    let mut retry = common::stateless_search_symbols_call(3, "MrtrWorkspace");
     retry["params"]["requestState"] = json!(request_state);
     retry["params"]["inputResponses"] =
         json!({ "roots": { "roots": [{ "uri": directory_uri(workspace.root()) }] } });
@@ -269,14 +269,14 @@ fn cache_hints_2026_07_28_session_emits_schema_valid_wire() {
         "jsonrpc": "2.0",
         "id": 1,
         "method": "server/discover",
-        "params": { "_meta": stateless_meta() }
+        "params": { "_meta": common::mcp_server::stateless_meta() }
     }));
 
     let tools = session.round_trip(json!({
         "jsonrpc": "2.0",
         "id": 2,
         "method": "tools/list",
-        "params": { "_meta": stateless_meta() }
+        "params": { "_meta": common::mcp_server::stateless_meta() }
     }));
     assert_eq!(tools["result"]["ttlMs"], 300_000, "{tools}");
     assert_eq!(tools["result"]["cacheScope"], "private", "{tools}");
@@ -285,7 +285,7 @@ fn cache_hints_2026_07_28_session_emits_schema_valid_wire() {
         "jsonrpc": "2.0",
         "id": 3,
         "method": "resources/list",
-        "params": { "_meta": stateless_meta() }
+        "params": { "_meta": common::mcp_server::stateless_meta() }
     }));
     assert_eq!(
         resources["result"]["resources"][0]["uri"], AGENTS_GUIDANCE_URI,
@@ -296,7 +296,7 @@ fn cache_hints_2026_07_28_session_emits_schema_valid_wire() {
         "jsonrpc": "2.0",
         "id": 4,
         "method": "resources/read",
-        "params": { "uri": AGENTS_GUIDANCE_URI, "_meta": stateless_meta() }
+        "params": { "uri": AGENTS_GUIDANCE_URI, "_meta": common::mcp_server::stateless_meta() }
     }));
     assert_eq!(resource["result"]["ttlMs"], 3_600_000, "{resource}");
     assert_eq!(resource["result"]["cacheScope"], "public", "{resource}");
@@ -306,7 +306,7 @@ fn cache_hints_2026_07_28_session_emits_schema_valid_wire() {
             "jsonrpc": "2.0",
             "id": id,
             "method": method,
-            "params": { "_meta": stateless_meta() }
+            "params": { "_meta": common::mcp_server::stateless_meta() }
         }));
         assert_eq!(unsupported["error"]["code"], -32601, "{unsupported}");
     }
@@ -331,6 +331,9 @@ fn cache_hints_2026_07_28_session_emits_schema_valid_wire() {
 /// schema-invalid traffic fails this test.
 #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#4488: a cold stateless task request overflowed the Windows main stack"
+)]
 fn tasks_2026_07_28_session_wire_is_schema_valid_outside_the_extension() {
     let workspace = InlineTestProject::with_language(Language::Python)
         .file("src/app.py", MCP_POLICY_APP)
@@ -338,6 +341,7 @@ fn tasks_2026_07_28_session_wire_is_schema_valid_outside_the_extension() {
         .build();
     let mut session = WireSession::rooted(STATELESS_REVISION, workspace.root());
 
+    // Keep run_policy first: a warm-up hides the Windows bootstrap stack defect.
     let created = session.round_trip(json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -349,7 +353,7 @@ fn tasks_2026_07_28_session_wire_is_schema_valid_outside_the_extension() {
                 "evaluation_date": "2026-07-27",
                 "fail_on": "warning"
             },
-            "_meta": tasks_capable_meta()
+            "_meta": common::mcp_server::stateless_tasks_meta()
         }
     }));
     assert_eq!(created["result"]["resultType"], "task", "{created}");
@@ -382,9 +386,6 @@ fn tasks_2026_07_28_session_wire_is_schema_valid_outside_the_extension() {
     );
 }
 
-/// The gate itself: a malformed response must produce violations, and a
-/// well-formed message must not. Without this a broken validator would report
-/// every session as conformant.
 #[test]
 fn the_wire_schema_gate_rejects_malformed_messages() {
     let mut schemas = RevisionSchemas::load(LEGACY_REVISION);
@@ -425,49 +426,12 @@ fn the_wire_schema_gate_rejects_malformed_messages() {
     );
 }
 
-fn mcp_server_binary() -> &'static str {
-    option_env!("CARGO_BIN_EXE_bifrost-mcp-test-server")
-        .or(option_env!("CARGO_BIN_EXE_bifrost"))
-        .expect("Cargo did not provide an MCP server binary")
-}
-
 fn search_symbols_call(id: i64, pattern: &str) -> Value {
     json!({
         "jsonrpc": "2.0",
         "id": id,
         "method": "tools/call",
         "params": { "name": "search_symbols", "arguments": { "patterns": [pattern] } }
-    })
-}
-
-/// The per-request negotiation keys a stateless `2026-07-28` request carries in
-/// place of a connection-level `initialize`.
-fn stateless_meta() -> Value {
-    json!({
-        "io.modelcontextprotocol/protocolVersion": STATELESS_REVISION,
-        "io.modelcontextprotocol/clientCapabilities": {}
-    })
-}
-
-fn tasks_capable_meta() -> Value {
-    json!({
-        "io.modelcontextprotocol/protocolVersion": STATELESS_REVISION,
-        "io.modelcontextprotocol/clientCapabilities": {
-            "extensions": { "io.modelcontextprotocol/tasks": {} }
-        }
-    })
-}
-
-fn stateless_search_symbols_call(id: i64, pattern: &str) -> Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "method": "tools/call",
-        "params": {
-            "name": "search_symbols",
-            "arguments": { "patterns": [pattern] },
-            "_meta": stateless_meta()
-        }
     })
 }
 
@@ -516,7 +480,7 @@ struct WireSession {
 impl WireSession {
     /// A server given its workspace on the command line.
     fn rooted(revision: &'static str, root: &Path) -> Self {
-        let mut command = Command::new(mcp_server_binary());
+        let mut command = Command::new(common::mcp_server::mcp_server_binary());
         command
             .arg("--root")
             .arg(root)
@@ -528,7 +492,7 @@ impl WireSession {
     /// A server with no workspace of its own, which must obtain one from the
     /// client. Its working directory is deliberately not a workspace.
     fn rootless(revision: &'static str, cwd: &Path) -> Self {
-        let mut command = Command::new(mcp_server_binary());
+        let mut command = Command::new(common::mcp_server::mcp_server_binary());
         command
             .arg("--mcp")
             .arg("workspace|symbol")
@@ -675,7 +639,7 @@ impl WireSession {
                 "jsonrpc": "2.0",
                 "id": id,
                 "method": "tasks/get",
-                "params": { "taskId": task_id, "_meta": tasks_capable_meta() }
+                "params": { "taskId": task_id, "_meta": common::mcp_server::stateless_tasks_meta() }
             }));
             let status = response["result"]["status"]
                 .as_str()

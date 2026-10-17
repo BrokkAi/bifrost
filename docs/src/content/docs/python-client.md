@@ -9,11 +9,20 @@ The Python distribution is `brokk-bifrost-searchtools`. Import it as `bifrost_se
 pip install brokk-bifrost-searchtools
 ```
 
+The package requires Python 3.12 or later. Wheels are `cp312-abi3`, so one
+wheel serves Python 3.12 and every later 3.x release. Wheels exist for Linux
+x86_64 and aarch64 (manylinux2014), macOS x86_64 and arm64, and Windows x86_64.
+On other platforms, pip builds the package from the sdist, which needs a Rust
+toolchain. pip does not install the package on Python 3.11 or earlier.
+
 For repository-local development, build the extension in place with maturin:
 
 ```bash
 uv run --python 3.12 --with maturin maturin develop
 ```
+
+Every class, method, argument, default, and result field is listed in the
+[Python Client API reference](/reference/python-client/).
 
 ## Quick Start
 
@@ -30,14 +39,19 @@ with SearchToolsClient("/path/to/project") as client:
 
     print(client.most_relevant_files(
         ["src/main.py"],
-        include_tests=False,
+        limit=10,
         ranking_mode=MostRelevantFilesRankingMode.USAGE_GRAPH,
     ).render_text())
 ```
 
-The client talks directly to Rust through a native extension module. It does not start an MCP subprocess. Results are typed dataclasses from `bifrost_searchtools.models` plus ready-to-render text helpers.
+The client talks directly to Rust through a native extension module. It does
+not start an MCP subprocess. Results are typed dataclasses from
+`bifrost_searchtools.models`. Most of them have a `render_text()` method that
+returns readable text.
 
-Pass `render_line_numbers=False` to `SearchToolsClient(...)` to omit line numbers from rendered text while keeping structured line metadata in the result objects.
+Pass `render_line_numbers=False` to `SearchToolsClient(...)` to omit line
+numbers from rendered text. The structured line fields stay in the result
+objects.
 
 ## Runnable Example
 
@@ -55,21 +69,50 @@ uv run examples/searchtools_demo.py --root /path/to/repo
 
 See the [`examples/README.md`](https://github.com/BrokkAi/bifrost/blob/master/examples/README.md) for the published-wheel validation script and notes on when the demo imports the PyPI wheel versus local checkout sources.
 
-## Workspace Updates
+## Sessions and Workspace Updates
 
-The client indexes on first use, keeps the index warm for the session, and watches the filesystem so later queries see edits.
+The session starts on the first method call, or when the `with` block starts.
+Leaving the `with` block closes it. Outside a `with` block, call `close()`.
 
-`SearchToolsClient.refresh()` forces a full rebuild. Query methods already apply watcher-detected file changes automatically, so treat `refresh()` as a recovery or explicit full-rescan operation rather than a step before every request.
+By default, the client indexes the project on first use, keeps the index warm
+for the session, and watches the file system so later queries see edits.
 
-Use `manual=True` with `update_paths(...)` when the caller wants to control incremental updates explicitly. Manual sessions reuse the repository's persisted analyzer cache; linked Git worktrees share the primary worktree's cache.
+`refresh()` rescans the project from disk and re-analyzes it. Query methods
+already apply changes that the file watcher detected, so use `refresh()` to
+recover or to force a full rescan, not before every request.
 
-## Methods
+Use `manual=True` with `update_paths(...)` when the caller wants to control
+incremental updates. A manual session has no file watcher.
 
-`SearchToolsClient(root, library_path=None, render_line_numbers=True, manual=False)` exposes the same tool families as MCP:
+Use `sources=[...]` to analyze only some files. Each entry is a
+project-relative file, directory, or glob. Add `revision="<git revision>"` to
+read those files at a Git revision instead of the working tree. A session with
+`sources` is always manual, so `sources` together with `manual=True` raises
+`ValueError`, and `revision` without `sources` raises `ValueError`. Results
+from a scoped session carry `session_subset`, which gives the number of files
+in the session. Read it before you treat an empty result as proof of absence:
+the result covers only those files. `extensions_for_paths(paths)` returns the
+file extensions of the languages in a list of paths, which helps you choose
+`sources` for a diff.
 
-| Family | Methods |
+```python
+from bifrost_searchtools import SearchToolsClient
+
+with SearchToolsClient("/path/to/project", sources=["src/billing"], revision="HEAD~1") as client:
+    result = client.search_symbols(["Invoice*"])
+    print(result.session_subset)
+```
+
+All session types use the repository's persisted analyzer cache. Linked Git
+worktrees share the primary worktree's cache. `gc()` forces a collection of
+that cache and waits until it finishes. See [Data and Trust
+Boundaries](/data-boundaries/) for where the cache lives.
+
+## What the Client Covers
+
+| Area | Methods |
 | --- | --- |
-| Workspace | `refresh()`, `update_paths(...)`, `activate_workspace(...)`, `get_active_workspace()` |
+| Session | `close()`, `gc()`, `refresh()`, `update_paths(...)`, `activate_workspace(...)`, `get_active_workspace()` |
 | Symbols and summaries | `search_symbols(...)`, `get_symbol_locations(...)`, `get_symbol_ancestors(...)`, `get_symbol_sources(...)`, `get_summaries(...)`, `list_symbols(...)`, `classify_test_files(...)` |
 | Declarations, definitions, and types | `get_declarations_by_location(...)`, `get_definitions_by_location(...)`, `get_definitions_by_reference(...)`, `get_type_by_location(...)` |
 | Usages and graph | `scan_usages_by_reference(...)`, `scan_usages_by_location(...)`, `rename_symbol(...)`, `usage_graph(...)`, `most_relevant_files(...)` |
@@ -78,93 +121,200 @@ Use `manual=True` with `update_paths(...)` when the caller wants to control incr
 | Files | `get_file_contents(...)`, `search_file_contents(...)`, `find_files_containing(...)` |
 | Code quality | `compute_cyclomatic_complexity(...)`, `compute_cognitive_complexity(...)`, `report_comment_density_for_code_unit(...)`, `report_comment_density_for_files(...)`, `report_exception_handling_smells(...)`, `report_test_assertion_smells(...)`, `report_structural_clone_smells(...)`, `report_long_method_and_god_object_smells(...)`, `report_dead_code_and_unused_abstraction_smells(...)`, `report_secret_like_code(...)`, `analyze_git_hotspots(...)` |
 
-Code-quality tools return `CodeQualityReport` with `.report`. Most other tools return structured dataclasses with `render_text()`.
+The client wraps most MCP tools. It does not wrap `score_diff`,
+`list_policies`, `run_policy`, or `explain_policy`; use the CLI, MCP, or the
+Rust `SearchToolsService` for those. `list_symbols`, `classify_test_files`, and
+`update_paths` are available through the CLI, Rust, and Python, but not to MCP
+agents.
 
-`blast_radius(target=None, *, base=None, max_scopes=None)` shares
-`analyze_diff` endpoint defaults and returns `BlastRadiusResult`. Its typed
-analysis state, changed callables, and file/directory `TestScope` records are
-structured file-dependency evidence. The graph includes ordinary imports and
+Code-quality methods return `CodeQualityReport`, whose `report` field holds the
+engine's rendered report. The many per-rule tuning settings on the smell
+reports go in an `options` dictionary. Its keys are passed to the Rust tool
+arguments unchanged.
+
+`analyze_diff`, `get_file_contents`, `search_file_contents`, and
+`find_files_containing` return dataclasses without `render_text()`. Usage scans
+return `ScanUsagesResult`, which holds the tool's JSON result in `structured`
+and has `render_text()`.
+
+## Errors
+
+Every failure inside the native module raises `SearchToolsError`, a subclass of
+`RuntimeError`. This includes arguments that the engine rejects, session start
+failures, and calls after `close()`. Argument checks in the Python client raise
+`ValueError`: the `sources` and `revision` rules above, the `query_code` source
+and scope rules, and `usage_graph(depth=0)`. `kind_filter` and `ranking_mode`
+take enum members such as `SymbolKindFilter.CLASS`; a plain string raises
+`AttributeError`.
+
+## Diff Review
+
+With both `target` and `base` omitted, the diff runs from the merge base of
+`HEAD` and the default branch named by `origin/HEAD` to the live working tree.
+An explicit commit target without a base means that single commit.
+
+`blast_radius(target=None, *, base=None, max_scopes=None)` uses the same
+endpoint defaults as `analyze_diff` and returns `BlastRadiusResult`. Its typed
+analysis state, changed callables, and file and directory `TestScope` records
+are structured file-dependency evidence. The graph includes ordinary imports and
 language-owned file relations such as Rust external `mod` declarations. It is
-not an exhaustive test-impact claim, individual test-runner IDs, a method-call
-graph, or runtime coverage. Changed files containing tests appear at dependency
-distance zero. Directory compaction never changes
+not an exhaustive test-impact claim, a list of test-runner IDs, a method-call
+graph, or runtime coverage. Changed files that contain tests appear at
+dependency distance zero. Directory compaction never changes
 `analysis.reached_test_file_count`.
+
 `analysis.analyzer_changed_test_paths` contains the changed target files that
-the analyzer structurally classified as containing test code. They are seeded
-at distance zero even if scope compaction returns a parent directory; the paths
-are not runner-specific test identifiers.
-Callable symbols use `in_test_context` for declarations structurally nested in
-test code or located under a recognized test-tree path. It is contextual and
-does not assert that the declaration is a runnable test or that its file is a
+the analyzer classified as containing test code. They are seeded at distance
+zero even when scope compaction returns a parent directory. The paths are not
+runner-specific test identifiers.
+
+Callable symbols use `in_test_context` for declarations nested in test code or
+located under a recognized test-tree path. It describes context only. It does
+not say that the declaration is a runnable test or that its file is a
 `TestScope`.
-`analysis.graph_completion` describes only construction and traversal of the
-file graph. Inspect it together with `paths_outside_file_graph` and
-`analyzer_changed_test_paths` and `incomplete_reasons`; zero reached tests does
-not prove that no build, data, or workflow validation applies to changed paths
-outside analyzer coverage. The typed `compilation_scope_unresolved` reason
-preserves proven partial evidence while reporting that a language compilation
-boundary could not be established completely.
+
+`analysis.graph_completion` describes only the construction and traversal of
+the file graph. Read it together with `paths_outside_file_graph`,
+`analyzer_changed_test_paths`, and `incomplete_reasons`. Zero reached tests
+does not prove that no build, data, or workflow validation applies to changed
+paths outside analyzer coverage. The `compilation_scope_unresolved` reason
+keeps the proven partial evidence and reports that a language compilation
+boundary could not be fully established.
 
 `cyclomatic_complexity(target=None, *, base=None, include_tests=False)` returns
-`CyclomaticComplexityDiffResult` for functions introduced or patch-edited by
-the selected endpoints. Introduced records have only an `after` score; edited
-records have `before`, `after`, and a signed `delta`, including zero. Deleted
-functions and pure moves are omitted. The result also reports changed paths
-outside analyzer support and analyzer paths that could not be resolved.
+`CyclomaticComplexityDiffResult` for functions that the selected endpoints
+introduce or edit. Introduced records have only an `after` score. Edited
+records have `before`, `after`, and a signed `delta`, which can be zero.
+Deleted functions and pure moves are omitted. The result also reports changed
+paths outside analyzer support and analyzer paths that could not be resolved.
 
 `missing_tests(target=None, *, base=None)` returns `MissingTestsResult`. Its
-file graph bounds batched exact usage scans, so functions called through direct
-or transitive enclosing callers are counted as reached while an uncalled
-sibling in the same file remains a missing candidate. Inspect
-`indeterminate_functions` before acting on an empty or partial result: Bifrost
-places every cancelled, incomplete, unresolved, ambiguous, or unproven negative
-there instead of claiming that the function lacks a test path. This is static
-structured reachability rather than runtime coverage.
+file graph bounds batched exact usage scans. A function called through direct
+or transitive enclosing callers counts as reached. An uncalled sibling in the
+same file stays a missing candidate. Read `indeterminate_functions` before you
+act on an empty or partial result: Bifrost puts every cancelled, incomplete,
+unresolved, ambiguous, or unproven negative there instead of claiming that the
+function has no test path. This is static structured reachability, not runtime
+coverage.
 
-With both endpoints omitted, the diff runs from the merge base of `HEAD` and
-the default branch advertised by `origin/HEAD` through the live working tree.
-An explicit commit target without a base continues to mean that single commit.
+## Navigation Results
 
-`get_declarations_by_location(...)` returns `DeclarationLookupResult` objects with `operation is NavigationOperation.DECLARATION` and a typed `declarations` list. `get_definitions_by_location(...)` returns `DefinitionLookupResult` objects with `operation is NavigationOperation.DEFINITION` and a typed `definitions` list. Their statuses distinguish `no_declaration`, `no_definition`, and `ambiguous`; `get_definitions_by_reference(...)` is unchanged.
+`get_declarations_by_location(...)` returns a list of `DeclarationLookupResult`
+objects with `operation` set to `NavigationOperation.DECLARATION` and a typed
+`declarations` list. `get_definitions_by_location(...)` returns a list of
+`DefinitionLookupResult` objects with `operation` set to
+`NavigationOperation.DEFINITION` and a typed `definitions` list. Their
+`status` values include `no_declaration`, `no_definition`, and `ambiguous`.
+`get_definitions_by_reference(...)` returns a list of
+`DefinitionByReferenceLookupResult` objects, one per reference.
 
-Exact source positions use 1-based lines and 1-based Unicode code-point columns, with exclusive ends. Individual usage hits expose `line`, `column`, `end_line`, and `end_column`; definition, declaration, and nested type candidates expose `start_line`, `start_column`, `end_line`, and `end_column`. Columns are omitted for aggregate rows or candidates without a proven exact token span, and public results do not expose byte offsets.
+Exact source positions use 1-based lines and 1-based Unicode code-point
+columns, with exclusive ends. Individual usage hits expose `line`, `column`,
+`end_line`, and `end_column`. Definition, declaration, and nested type
+candidates expose `start_line`, `start_column`, `end_line`, and `end_column`.
+Columns are omitted for aggregate rows and for candidates without a proven
+exact token span. Public results do not expose byte offsets.
 
-The many per-rule tuning knobs on code-quality smell reports are accepted through an `options` dict whose keys map 1:1 to the underlying Rust tool arguments.
+## Summaries
 
-`get_summaries(...)` is directory-aware for MCP callers: directory targets surface a `compact_symbols` inventory alongside ordinary summaries when mixed with file or class targets. The direct Rust `brokk_bifrost::searchtools::get_summaries(...)` API and the Python client are narrower and report directory targets in `not_found` instead of embedding directory inventory in `SummaryResult`.
+`get_summaries(...)` accepts files, globs, classes, modules, directories, and
+packages in one call. A directory or package target returns a
+`ContainerListing` entry in `listings`, with `kind` set to `directory` or
+`package`. This is the same for MCP, Rust, and Python callers.
+
+One behavior differs by caller: only the MCP server replaces an oversized
+summary response with a compact symbol list (`compact_symbols`). For Python
+callers, `compact_symbols` is always `None`. A glob target that matches too
+many files is reported under `too_broad`, as in the other surfaces.
 
 ## Code Query
 
 [Library Integration](/code-query-tutorials/library-integration/) is the executable walkthrough: it runs one canonical query through `SearchToolsClient.query_code(...)` against a checked-in fixture, consumes the typed `CodeQueryResponse`, and shows how to read `diagnostics`, `truncated`, `provenance_truncated`, and receiver `outcome` before making a completeness-sensitive claim. The same page runs the same query through the Rust `SearchToolsService`, so the two integrations can be compared side by side.
 
-`query_code(...)` speaks one schema version. `schema_version` is optional and `schema_version=1` is the only accepted pin; every other value is rejected. An additive vocabulary change keeps that version, so there is no version lineage and no earlier pin to hold; a new version is minted only when an existing query stops parsing or changes meaning. Pass exactly one source: positional `pattern`, `union=[...]`, `intersect=[...]`, or `except_=[...]`; common `steps` run after composition.
+`query_code(...)` takes exactly one source: the positional `pattern`, one of
+the other root-source parameters (`occurrences`, `scopes`, `bindings`,
+`generation_sites`, `exports`, `dependency_evidence`, `configuration_facts`,
+`correlate`, `require_both`, `paths`), or `union=[...]`, `intersect=[...]`,
+or `except_=[...]`. Alternatively, `query_file` names a workspace query file
+and takes no other query argument. The `steps` list runs after the source.
+`inside`, `inside_decl`, and `not_inside` apply only to `pattern`; for set
+queries, put them inside each branch. `where` and `languages` apply to the
+other sources too. `schema_version` is optional, and
+`schema_version=1` is the only accepted pin.
+Bifrost rejects every other value.
 
-The step vocabulary reaches every retained domain. `{"op":"taint","taint_ref":"request:http-to-database"}` runs from an exact procedure to retained diagnostic-neutral `CodeQueryTaintFinding` rows; the connected in-process host must pre-register the referenced immutable production result for the current workspace, and the query never compiles or solves taint, reconstructs witnesses, or performs policy classification. The occurrence source pairs with `occurrences_in`, `occurrences_of`, and `occurrence_target`. The `scopes` and `bindings` sources pair with `scope_of`, `scope_ancestors`, `bindings_in`, `binding_of`, `binding_occurrence`, `candidates_of`, and `candidate_target`, parsed into `CodeQueryLexicalScope`, `CodeQueryBinding`, and `CodeQueryResolutionCandidate`; the file row carries `package_fq` and `package_syntactic`. `file_of` accepts occurrences, taint findings, and every other semantic source result, including the `inside_decl` structural traversal. The `paths` source pairs with `segments_of` and `segment_target`, parsed into `CodeQueryQualifiedPath` and `CodeQueryPathSegment`: qualified-path rows with ordered decoded segments and per-segment prefix resolution. The canonical reference-edge domain provides `edges_of` from a declaration, `edges_from` from an occurrence, and `edge_target` back to a declaration, parsed into `CodeQueryReferenceEdge`; both edge steps accept `reference_kinds`, `proof`, `surface`, `usage`, `relation`, and `site_class`, and `surface` is optional with no default because the complete edge answer includes editor-only rows. A forward query in a language whose adapter has no forward projection reports `edge_axis_unsupported` rather than an empty answer. The `generation_sites` and `exports` sources pair with `generates`, `generated_by`, `declaration_state_of`, `implementation_of`, and `export_target`, parsed into `CodeQueryGenerationSite`, `CodeQueryExport`, and `CodeQueryDeclarationState`: recorded declaration-materialization provenance with exact generated sets for literal inputs, explicit `dynamic` honesty, export forms, declaration origin/declaration-only/configuration-gate state, and overload-stub implementation linkage. See [Code Querying](../code-querying/) and [JSON CodeQuery](../code-query-json/) for the complete contract.
+Every source in the JSON CodeQuery format has a `query_code` parameter, so a
+Python query can use any of them as its root source. `bifrost --query-file`
+also accepts every source. See [Code Querying](/code-querying/), [JSON CodeQuery](/code-query-json/),
+and the [Code Query reference](/reference/code-query/) for the complete source
+and step vocabulary.
 
-`CodeQueryResult.results` contains typed result classes selected by each item's `result_type`. The result classes are `CodeQueryMatch`, `CodeQueryDeclaration`, `CodeQueryProcedure`, `CodeQueryProgramPoint`, `CodeQueryControlEdge`, `CodeQueryTypestateFinding`, `CodeQueryConcurrentAccessConflict`, `CodeQueryTypestateWitness`, `CodeQueryFlowEndpoint`, `CodeQueryFlowWitness`, `CodeQueryClassSetRow`, `CodeQueryConfigurationFact`, `CodeQueryAbsentMemberFinding`, `CodeQueryAbsentMemberWitness`, `CodeQueryTaintFinding`, `CodeQueryFile`, `CodeQueryReferenceSite`, `CodeQueryCallSite`, `CodeQueryExpressionSite`, `CodeQueryJsxAttributeValue`, `CodeQueryReceiverAnalysis`, `CodeQueryMemberTargetAnalysis`, `CodeQueryReceiverOutcome`, `CodeQueryReceiverEvidence`, `CodeQueryFieldWriteValue`, `CodeQueryRuntimeKeyedReadValue`, `CodeQueryCallShape`, `CodeQueryCallResult`, `CodeQueryCallArgumentGroup`, `CodeQueryCallShapeArgument`, `CodeQueryCallBinding`, `CodeQueryCallEffect`, `CodeQueryCallResultContract`, `CodeQueryResultContractUse`, `CodeQueryResultContractFailureUse`, `CodeQueryNilnessOperation`, `CodeQuerySwitchCoverage`, `CodeQueryDetachedTaskTransfer`, `CodeQueryProcedureEffect`, `CodeQueryCallableSignature`, `CodeQuerySignatureParameter`, `CodeQueryDecoratedParameter`, `CodeQueryCallableApplicability`, `CodeQueryOverloadSelection`, `CodeQueryMemberSelection`, `CodeQueryDispatchOutcome`, `CodeQueryDispatchTarget`, `CodeQueryMemberFamily`, `CodeQueryMemberFamilyEdge`, `CodeQueryOccurrence`, `CodeQueryLexicalScope`, `CodeQueryBinding`, `CodeQueryResolutionCandidate`, `CodeQueryCandidateHop`, `CodeQueryGenerationSite`, `CodeQueryExport`, `CodeQueryDeclarationState`, `CodeQueryReferenceEdge`, `CodeQueryStateEvent`, `CodeQueryFlowRelation`, `CodeQueryControlRelation`, `CodeQueryGuard`, `CodeQueryRewritePath`, `CodeQueryQualifiedPath`, `CodeQueryPathSegment`, `CodeQuerySourceSet`, `CodeQueryBuildTarget`, and `CodeQueryTopologyEdge`. Typestate, flow, and taint models are frozen and strict about required identity/evidence fields and enum values. Semantic rows expose one `CodeQuerySemanticEvidence` with typed `proof`, typed `completeness`, and optional `reason`; witness models call the field `evidence`, not `quality`. `CodeQueryFlowEndpoint.status` is a `CodeQueryFlowStatus`, and its optional `reason` retains semantic, solver, or query limit detail; the old completion/solver/must fields do not exist. Findings and flow endpoints remain diagnostic-neutral; retained taint witnesses reuse ordered `CodeQueryFlowWitnessStep` values and truncation metadata. `code_query_variant_inventory()` returns the engine's own list of result types, diagnostic codes, diagnostic impacts, and completion kinds, so a client can check that its models are not behind the engine it loaded. Always inspect result-level `truncated` and diagnostics before consuming candidates. Compact output is the default; pass `result_detail="full"` when deterministic provenance is required.
+The `taint`, `typestate`, and `value_flow` steps read a result or plan that a
+host registered in the same process. Only the Rust `SearchToolsService` can
+register them, through `register_query_taint_results`,
+`register_query_protocol`, and `register_query_value_flow_plan`. The Python
+client has no registration method, so these steps always return an
+`unresolved_*_reference` diagnostic from Python.
 
-Absent-member witnesses expose a typed `witness_status`: available, truncated,
-or unavailable. An unavailable witness carries its reason and no invented
-steps; it does not revoke the independently Proven finding. Query limits bound
-the retained step prefix, and profile responses expose type-flow witness work.
+`CodeQueryResult.results` contains typed result classes selected by each item's `result_type`. The result classes are `CodeQueryMatch`, `CodeQueryDeclaration`, `CodeQueryProcedure`, `CodeQueryProgramPoint`, `CodeQueryControlEdge`, `CodeQueryTypestateFinding`, `CodeQueryTypestateWitness`, `CodeQueryFlowEndpoint`, `CodeQueryFlowWitness`, `CodeQueryAbsentMemberWitness`, `CodeQueryClassSetRow`, `CodeQueryAbsentMemberFinding`, `CodeQueryTaintFinding`, `CodeQueryFile`, `CodeQueryReferenceSite`, `CodeQueryCallSite`, `CodeQueryExpressionSite`, `CodeQueryJsxAttributeValue`, `CodeQueryReceiverAnalysis`, `CodeQueryMemberTargetAnalysis`, `CodeQueryReceiverOutcome`, `CodeQueryReceiverEvidence`, `CodeQueryFieldWriteValue`, `CodeQueryRuntimeKeyedReadValue`, `CodeQueryCallShape`, `CodeQueryCallResult`, `CodeQueryCallArgumentGroup`, `CodeQueryCallShapeArgument`, `CodeQueryCallBinding`, `CodeQueryCallEffect`, `CodeQueryCallResultContract`, `CodeQueryResultContractUse`, `CodeQueryResultContractFailureUse`, `CodeQueryNilnessOperation`, `CodeQuerySwitchCoverage`, `CodeQueryDetachedTaskTransfer`, `CodeQueryProcedureEffect`, `CodeQueryCallableSignature`, `CodeQuerySignatureParameter`, `CodeQueryDecoratedParameter`, `CodeQueryCallableApplicability`, `CodeQueryOverloadSelection`, `CodeQueryMemberSelection`, `CodeQueryDispatchOutcome`, `CodeQueryDispatchTarget`, `CodeQueryMemberFamily`, `CodeQueryMemberFamilyEdge`, `CodeQueryOccurrence`, `CodeQueryLexicalScope`, `CodeQueryBinding`, `CodeQueryResolutionCandidate`, `CodeQueryCandidateHop`, `CodeQueryGenerationSite`, `CodeQueryExport`, `CodeQueryDeclarationState`, `CodeQueryReferenceEdge`, `CodeQueryStateEvent`, `CodeQueryFlowRelation`, `CodeQueryControlRelation`, `CodeQueryGuard`, `CodeQueryRewritePath`, `CodeQueryQualifiedPath`, `CodeQueryPathSegment`, `CodeQuerySourceSet`, `CodeQueryBuildTarget`, `CodeQueryTopologyEdge`, `CodeQueryConfigurationFact`, and `CodeQueryCrossDomain`, plus generated classes for other row types, such as branch and loop relations. Typestate, flow, and taint models are frozen. They reject missing identity or evidence fields and unknown enum values. Findings and flow endpoints do not classify severity. Retained taint witnesses use ordered `CodeQueryFlowWitnessStep` values and report their own truncation.
 
-`CodeQueryOccurrence` rows expose `class`/`role`/`namespace`, exact byte and line ranges, `raw_spelling`, an optional `decoded_spelling` (with `effective_spelling` returning whichever a consumer should compare against a declared name), and a `CodeQueryOccurrenceTarget` whose `target_kind` is `none`, `resolved`, `lexical`, or `unresolved`. Its `ast_id` is the content-scoped identity of the underlying AST node and is equal to the `ast_id` a full-detail structural capture over the same node reports -- join on that string, never on ranges or spellings. Roles a language's adapter has not declared produce `occurrence_role_unsupported` diagnostics with `incomplete` impact, so an empty occurrence result is only trustworthy when the diagnostics are clean.
+The [Python Client API reference](/reference/python-client/) maps every result type to its class and import path. Some classes, such as `CodeQueryGenerationSite` and the generated row classes, are importable only from `bifrost_searchtools.models`. `CodeQueryFile` rows carry `package_fq` and `package_syntactic`. `package_syntactic` is `True` when the source spells the package and `False` when Bifrost derives it from the file path. When both fields are absent, no package could be named.
 
-The optional `execution_mode` selects the response contract. Omit it or pass
-`"results"` for `CodeQueryResult`. `"explain"` returns `CodeQueryExplain`
-without executing the query; the response exposes `parsed_query`,
-`logical_plan`, `physical_plan`, and the scheduling selection. `"profile"`
-executes the query and returns `CodeQueryProfile`, whose typed `.result` is
-accompanied by `.explain`, `.timings_ns`, `.work`, `.cache_layers`,
-`.scheduling`, and per-operator observations. Timings are elapsed nanoseconds;
-the per-operator `temporary_capacity_bytes_lower_bound` is a lower-bound
-container-capacity estimate rather than peak process memory. In the public v2
-profile contract, top-level and per-operator `.cache_layers` are lists of
-`{layer, metrics}` records. Each nested `metrics` object has
-`kind="structural_facts"` for `seed_structural_facts` and
-`kind="complete_value"` for every other layer. The
-`direct_import_topology` layer exposes snapshot build files, edges, time,
-retained bytes, cancellation/unavailability, and request-local fallbacks.
+Read these fields before you consume rows:
+
+- `truncated` on the result, and every entry in `diagnostics`. A diagnostic
+  with impact `incomplete` or `invalid` means the row set is not complete.
+- On rows that carry semantic evidence, the `evidence` field (a
+  `CodeQuerySemanticEvidence` with `proof`, `completeness`, and an optional
+  `reason`). Witness models use the same field name.
+- On `CodeQueryFlowEndpoint`, `status` (a `CodeQueryFlowStatus`) and its
+  optional `reason`, which carries semantic, solver, or query limit detail.
+
+`code_query_variant_inventory()` returns the engine's own lists of result
+types, diagnostic codes, diagnostic impacts, and completion kinds. Compare
+them with the Python models to check that the client is not older than the
+engine it loaded.
+
+Compact output is the default. Pass `result_detail="full"` when you need
+stable IDs and exact ranges.
+
+Absent-member witnesses expose a typed `witness_status`: `available`,
+`truncated`, or `unavailable`. An unavailable witness carries its reason and no
+invented steps. It does not cancel the independently proven finding. Query
+limits bound the retained step prefix, and profile responses report type-flow
+witness work.
+
+`CodeQueryOccurrence` rows expose `class_` (the JSON field `class`, also
+readable as `occurrence_class`), `role`, and `namespace`, exact byte and line
+ranges, `raw_spelling`, an optional `decoded_spelling`, and a
+`CodeQueryOccurrenceTarget` whose `target_kind` is `none`, `resolved`,
+`lexical`, or `unresolved`. The `effective_spelling` property gives the
+spelling to compare with a declared name. The row's `ast_id` identifies the AST node by
+content and equals the `ast_id` that a full-detail structural capture over the
+same node reports. Join on that string, not on ranges or spellings. A role that
+a language adapter does not declare produces an `occurrence_role_unsupported`
+diagnostic with `incomplete` impact. An empty occurrence result is trustworthy
+only when the diagnostics are clean.
+
+The optional `execution_mode` selects the response type:
+
+- Omit it or pass `"results"` to get `CodeQueryResult`.
+- `"explain"` returns `CodeQueryExplain` without running the query. It exposes
+  `parsed_query`, `logical_plan`, `physical_plan`, and the scheduling choice.
+- `"profile"` runs the query and returns `CodeQueryProfile`. Its `.result` is
+  the ordinary result. It also has `.explain`, `.timings_ns`, `.work`,
+  `.cache_layers`, `.scheduling`, and per-operator observations.
+
+Timings are elapsed nanoseconds. The per-operator
+`temporary_capacity_bytes_lower_bound` is a lower bound on container capacity,
+not peak process memory. In the profile format
+(`bifrost_code_query_profile/v2`), top-level and per-operator `.cache_layers`
+are lists of `{layer, metrics}` records. Each `metrics` object has
+`kind="structural_facts"` for the `seed_structural_facts` layer and
+`kind="complete_value"` for every other layer. The `direct_import_topology`
+layer reports snapshot build files, edges, time, retained bytes, cancellation
+or unavailability, and request-local fallbacks. See [Explain and Profile
+CodeQuery](/code-query-explain-profile/) for the full report format.
 
 ## Tests
 
@@ -174,4 +324,4 @@ Run the Python test suite with:
 scripts/public/test_python.sh
 ```
 
-`scripts/public/test_python.sh` provisions Python 3.12 through `uv`; the default Xcode Python may be older than the package test requirements.
+`scripts/public/test_python.sh` provisions Python 3.12 through `uv`. The default Xcode Python may be older than the package requires.

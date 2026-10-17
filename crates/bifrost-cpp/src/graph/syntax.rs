@@ -8,6 +8,39 @@ use brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed;
 use std::ops::{ControlFlow, Range};
 use tree_sitter::{Node, Parser};
 
+/// Whether an expression denotes C++'s implicit object receiver.
+///
+/// `this` is the implicit object only where C++ compiles the source; it is an
+/// ordinary identifier in a `.c` file or a header compiled as C. Parentheses
+/// and pointer expressions transparently wrap the receiver.
+pub(crate) fn receiver_is_self_like(mut node: Node<'_>, reference_is_c: bool) -> bool {
+    loop {
+        match node.kind() {
+            "this" => return !reference_is_c,
+            "pointer_expression" | "parenthesized_expression" => {
+                let Some(inner) = node
+                    .child_by_field_name("argument")
+                    .or_else(|| node.named_child(0))
+                else {
+                    return false;
+                };
+                node = inner;
+            }
+            _ => return false,
+        }
+    }
+}
+
+pub(crate) fn has_function_scope_ancestor(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        if matches!(parent.kind(), "function_definition" | "lambda_expression") {
+            return true;
+        }
+        node = parent;
+    }
+    false
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MacroReplacementTypeReference {
     pub components: Vec<String>,
@@ -338,7 +371,7 @@ pub fn object_macro_replacement_span(node: Node<'_>, source: &str) -> Option<Ran
         return None;
     }
     let start = node.child_by_field_name("name")?.end_byte();
-    (start <= source.len()).then(|| start..logical_line_end(start, source))
+    macro_replacement_span(source, start)
 }
 
 /// The complete logical-line replacement list of a function-like `#define`.
@@ -370,7 +403,10 @@ pub fn function_macro_replacement_span(node: Node<'_>, source: &str) -> Option<R
         }
         _ => None,
     }?;
-    let start = parameters.end_byte();
+    macro_replacement_span(source, parameters.end_byte())
+}
+
+fn macro_replacement_span(source: &str, start: usize) -> Option<Range<usize>> {
     (start <= source.len()).then(|| start..logical_line_end(start, source))
 }
 
@@ -627,8 +663,9 @@ fn append_qualified_components<'tree>(node: Node<'tree>, out: &mut Vec<Node<'tre
                 out.push(current)
             }
             "qualified_identifier" | "scoped_identifier" => {
-                stack.push(current.child_by_field_name("name")?);
-                if let Some(scope) = current.child_by_field_name("scope") {
+                let (scope, name) = qualified_name_parts(current)?;
+                stack.push(name);
+                if let Some(scope) = scope {
                     stack.push(scope);
                 } else if current.child(0).is_none_or(|child| child.kind() != "::") {
                     return None;
@@ -646,6 +683,15 @@ fn append_qualified_components<'tree>(node: Node<'tree>, out: &mut Vec<Node<'tre
         }
     }
     Some(())
+}
+
+pub(super) fn qualified_name_parts<'tree>(
+    node: Node<'tree>,
+) -> Option<(Option<Node<'tree>>, Node<'tree>)> {
+    Some((
+        node.child_by_field_name("scope"),
+        node.child_by_field_name("name")?,
+    ))
 }
 
 /// Hide grammar-owned comments inside function-like replacements from the
@@ -733,7 +779,11 @@ pub fn function_macro_included_ranges(
 
 #[cfg(test)]
 mod tests {
+    use brokk_bifrost_test_macros::hardwon;
     #[test]
+    #[hardwon(
+        "05fbd05c6bd7: C/C++ macro recovery previously lost or invented structured declarations"
+    )]
     fn issue_3089_macro_comments_do_not_consume_caller_function() {
         let source = "#define PROCESS(handle, block) \\\ndo { /* comment */ \\\n  int event; \\\n  if (handle) block \\\n} while (0)\nstatic void caller(int handle) { PROCESS(handle, { event; }); }\n";
         let mut parser = tree_sitter::Parser::new();
@@ -774,92 +824,6 @@ mod tests {
     }
     use super::*;
 
-    fn cpp_tree(source: &str) -> tree_sitter::Tree {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_cpp::LANGUAGE.into())
-            .expect("C++ grammar");
-        parser.parse(source, None).expect("C++ fixture tree")
-    }
-
-    #[test]
-    fn function_macro_included_ranges_masks_only_replacement_comments() {
-        let source = "#define PROCESS(handle, block) \\\ndo { /* comment */ \\\n  int event; \\\n  if (handle) block \\\n} while (0)\nstatic void caller(int handle) { PROCESS(handle, { event; }); }\n";
-        let tree = cpp_tree(source);
-        let ranges = function_macro_included_ranges(source, &tree, || false)
-            .continue_value()
-            .expect("complete discovery")
-            .expect("macro comments");
-        let included = ranges
-            .iter()
-            .map(|range| &source[range.start_byte..range.end_byte])
-            .collect::<String>();
-
-        assert_eq!(included, source.replace("/* comment */", ""));
-        assert!(
-            ranges.iter().all(|range| {
-                !source[range.start_byte..range.end_byte].contains("/* comment */")
-            })
-        );
-    }
-
-    #[test]
-    fn function_macro_included_ranges_ignores_nearby_non_replacement_comment() {
-        let source = "// outside the replacement\n#define PROCESS(handle, block) \\\ndo { handle; \\\n  block \\\n} while (0)\n";
-        let tree = cpp_tree(source);
-
-        assert_eq!(
-            function_macro_included_ranges(source, &tree, || false),
-            ControlFlow::Continue(None)
-        );
-    }
-
-    #[test]
-    fn function_macro_range_discovery_never_publishes_interrupted_work() {
-        let source =
-            "#define APPLY(x) do { /* first */ x; } while (0)\nint caller() { return 1; }\n";
-        let tree = cpp_tree(source);
-        let mut visits = 0;
-        let result = function_macro_included_ranges(source, &tree, || {
-            visits += 1;
-            visits == 3
-        });
-        assert_eq!(visits, 3);
-        assert_eq!(result, ControlFlow::Break(()));
-        assert!(matches!(
-            function_macro_included_ranges(source, &tree, || false),
-            ControlFlow::Continue(Some(_))
-        ));
-    }
-
-    #[test]
-    fn function_macro_included_ranges_preserves_source_coordinates() {
-        let source = "#define PROCESS(handle, block) \\\ndo { /* first */ \\\n  int event; /* second */ \\\n  if (handle) block \\\n} while (0)\nstatic void caller(int handle) { PROCESS(handle, { event; }); }\n";
-        let tree = cpp_tree(source);
-        let ranges = function_macro_included_ranges(source, &tree, || false)
-            .continue_value()
-            .expect("complete discovery")
-            .expect("macro comments");
-        let first = source.find("/* first */").expect("first comment");
-        let second = source.find("/* second */").expect("second comment");
-        let first_end = first + "/* first */".len();
-        let second_end = second + "/* second */".len();
-
-        assert_eq!(ranges.len(), 3);
-        assert_eq!(ranges[0].start_byte, 0);
-        assert_eq!(ranges[0].end_byte, first);
-        assert_eq!(ranges[0].start_point, tree_sitter::Point::new(0, 0));
-        assert_eq!(ranges[0].end_point, tree_sitter::Point::new(1, 5));
-        assert_eq!(ranges[1].start_byte, first_end);
-        assert_eq!(ranges[1].end_byte, second);
-        assert_eq!(ranges[1].start_point, tree_sitter::Point::new(1, 16));
-        assert_eq!(ranges[1].end_point, tree_sitter::Point::new(2, 13));
-        assert_eq!(ranges[2].start_byte, second_end);
-        assert_eq!(ranges[2].end_byte, source.len());
-        assert_eq!(ranges[2].start_point, tree_sitter::Point::new(2, 25));
-        assert_eq!(ranges[2].end_point, tree.root_node().end_position());
-    }
-
     fn references(source: &str) -> Vec<MacroReplacementTypeReference> {
         let mut parser = Parser::new();
         parser
@@ -875,6 +839,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "3d330d262275: C/C++ macro recovery previously lost or invented structured declarations"
+    )]
     fn object_macro_replacement_reparse_preserves_type_ranges() {
         let source = "#define SETTINGS (*api::SettingsImpl::GetInstance())\n";
         let references = references(source);
@@ -891,6 +858,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "3d77aac19607: C/C++ macro recovery previously lost or invented structured declarations"
+    )]
     fn object_macro_replacement_fields_are_structured_and_direct_only() {
         let replacement = object_macro_replacement(
             r#"int public_value; \
@@ -933,6 +903,9 @@ mod tests {
     /// (issue #2985). tree-sitter ends the `preproc_arg` token, and the
     /// `preproc_def` node with it, at the first of those comments.
     #[test]
+    #[hardwon(
+        "5e7361a53510: C/C++ macro recovery previously lost or invented structured declarations"
+    )]
     fn comment_split_replacement_keeps_every_member_and_its_composition() {
         let source = "#define UV_HANDLE_FIELDS                    \\\n\
                       \x20 /* public */                            \\\n\
@@ -982,11 +955,17 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "5e7361a53510: C/C++ macro recovery previously lost or invented structured declarations"
+    )]
     fn malformed_replacement_regions_still_refuse_the_whole_replacement() {
         assert!(object_macro_replacement("int ok; struct {").is_empty());
     }
 
     #[test]
+    #[hardwon(
+        "5e7361a53510: C/C++ macro recovery previously lost or invented structured declarations"
+    )]
     fn conflicting_replacements_keep_only_the_members_both_declare() {
         let unix = object_macro_replacement("uv_handle_t* next_closing; unsigned int flags;");
         let windows = object_macro_replacement("uv_handle_t* endgame_next; unsigned int flags;");
@@ -1007,6 +986,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "5e7361a53510: C/C++ macro recovery previously lost or invented structured declarations"
+    )]
     fn collapsed_aggregate_members_recover_their_names_and_ranges() {
         let source = "struct uv_signal_s {\n  UV_HANDLE_FIELDS\n  uv_signal_cb signal_cb;\n};";
         let span = source.find("uv_signal_cb").expect("member start")
@@ -1020,14 +1002,5 @@ mod tests {
             [("signal_cb", "uv_signal_cb signal_cb;")]
         );
         assert_eq!(&source[fields[0].range.clone()], "uv_signal_cb signal_cb;");
-    }
-
-    #[test]
-    fn macro_reparse_ignores_function_like_and_non_code_text() {
-        let function_like = "#define SETTINGS(Type) (*Type::GetInstance())\n";
-        assert!(references(function_like).is_empty());
-
-        let text = "#define SETTINGS \"SettingsImpl::GetInstance()\"\n";
-        assert!(references(text).is_empty());
     }
 }

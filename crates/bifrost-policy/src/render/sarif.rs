@@ -6,10 +6,7 @@ use std::io::Write;
 use serde::ser::{Error as _, SerializeSeq};
 use serde::{Serialize, Serializer};
 
-use super::{
-    BoundedWriter, CanonicalJsonFormatter, PolicyRenderError, ensure_supported_schema,
-    map_io_error, map_json_error,
-};
+use super::{PolicyRenderError, ensure_supported_schema, write_canonical_json};
 use crate::display_path::{TaintDisplayPath, TaintDisplayStep, TaintDisplayStepKind};
 use crate::is_false;
 use crate::{
@@ -21,9 +18,9 @@ use crate::{
     PolicyFindingEvidence, PolicyFindingSuppression, PolicyIncrementalReview, PolicyLevel,
     PolicyObligationKind, PolicyPackActivationReview, PolicyReportDiagnostic,
     PolicyReportDiagnosticCode, PolicyReportDocument, PolicyReportEvaluationContext,
-    PolicyRuleDescriptor, PolicyRun, PolicyRunCompletion, PolicySemanticHash, PolicySeveritySpec,
-    PolicySourceLocation, PolicySuppressionPolicyHashState, PolicySuppressionReview,
-    PolicyWorkReport, ProofMetadata, RelatedPolicyLocation,
+    PolicyRuleDescriptor, PolicyRun, PolicyRunCompletion, PolicyRunScope, PolicyRunScopeKind,
+    PolicySemanticHash, PolicySeveritySpec, PolicySourceLocation, PolicySuppressionPolicyHashState,
+    PolicySuppressionReview, PolicyWorkReport, ProofMetadata, RelatedPolicyLocation,
 };
 
 const SARIF_SCHEMA_URI: &str =
@@ -145,22 +142,7 @@ fn write_policy_sarif_internal<W: Write>(
     ensure_supported_schema(report)?;
     tool.validate()?;
     let log = SarifLog::try_from_report(report, tool, exit_status)?;
-    let mut output = BoundedWriter::new(output, max_serialized_bytes);
-    let serialized = {
-        let mut serializer =
-            serde_json::Serializer::with_formatter(&mut output, CanonicalJsonFormatter);
-        log.serialize(&mut serializer)
-    };
-    if let Err(error) = serialized {
-        if output.limit_exceeded() {
-            return Err(PolicyRenderError::SerializedReportLimit {
-                max_serialized_bytes,
-            });
-        }
-        return Err(map_json_error(error, max_serialized_bytes));
-    }
-    output.flush().map_err(map_io_error)?;
-    Ok(output.bytes_written())
+    write_canonical_json(&log, output, max_serialized_bytes)
 }
 
 #[derive(Serialize)]
@@ -258,11 +240,11 @@ impl Serialize for SarifRules<'_> {
     where
         S: Serializer,
     {
-        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
-        for rule in self.0 {
-            sequence.serialize_element(&SarifReportingDescriptor::from_rule(rule))?;
-        }
-        sequence.end()
+        serialize_sequence(
+            serializer,
+            self.0.len(),
+            self.0.iter().map(SarifReportingDescriptor::from_rule),
+        )
     }
 }
 
@@ -295,7 +277,6 @@ impl Serialize for SarifResults<'_> {
                 })
                 .ok_or_else(|| S::Error::custom("a policy run has no exact rule descriptor"))?;
             for finding in run.findings() {
-                note_sarif_result_visit();
                 sequence.serialize_element(&SarifResult::from_finding(finding, run, rule_index))?;
             }
         }
@@ -420,6 +401,7 @@ impl<'a> SarifResult<'a> {
                         .map(|baseline| [SarifSuppression::from_baseline(baseline)])
                 }),
             properties: SarifResultProperties {
+                value_type_barrier_notes: finding.value_type_barrier_notes(),
                 finding_id: finding.id(),
                 policy_hash: finding.policy_hash(),
                 analysis_type: finding.analysis_type(),
@@ -582,6 +564,11 @@ struct SarifPartialFingerprints {
 
 #[derive(Serialize)]
 struct SarifResultProperties<'a> {
+    #[serde(
+        rename = "bifrost.valueTypeBarrierNotes",
+        skip_serializing_if = "crate::ValueTypeBarrierNotes::is_empty"
+    )]
+    value_type_barrier_notes: &'a crate::ValueTypeBarrierNotes,
     #[serde(rename = "bifrost.findingId")]
     finding_id: crate::PolicyFindingId,
     #[serde(rename = "bifrost.policyHash")]
@@ -725,13 +712,12 @@ impl Serialize for SarifArtifactUri<'_> {
     where
         S: Serializer,
     {
-        serializer.collect_str(self)
+        crate::serialize_display_value(self, serializer)
     }
 }
 
 impl fmt::Display for SarifArtifactUri<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        note_sarif_artifact_uri_visit();
         write_artifact_uri(formatter, self.0)
     }
 }
@@ -900,7 +886,7 @@ impl Serialize for SarifNotifications<'_> {
         let completion_notifications = report
             .runs()
             .iter()
-            .filter(|run| !run.completion().is_complete())
+            .filter(|run| SarifNotification::policy_completion(run).is_some())
             .count();
         let notification_count = report
             .diagnostics()
@@ -951,6 +937,7 @@ impl<'a> SarifNotification<'a> {
                 omitted_diagnostics_lower_bound: 0,
                 authored_arm_closures: &[],
                 obligations: None,
+                scope: None,
             },
         }
     }
@@ -975,13 +962,24 @@ impl<'a> SarifNotification<'a> {
                 omitted_diagnostics_lower_bound: report.omitted_diagnostics_lower_bound(),
                 authored_arm_closures: &[],
                 obligations: None,
+                scope: None,
             },
         }
     }
 
+    /// The notification a run owes its reader: its incomplete completion, or
+    /// that it was range-scoped, which a complete run still says.
     fn policy_completion(run: &'a PolicyRun) -> Option<Self> {
         let (descriptor_id, text, level) = match run.completion() {
-            PolicyRunCompletion::Complete => return None,
+            PolicyRunCompletion::Complete => match run.scope() {
+                Some(scope) if scope.kind() == PolicyRunScopeKind::ChangedRange => (
+                    "BIFROST_POLICY_RANGE_SCOPED",
+                    "Bifrost policy evaluation was range-scoped to the changed procedures: an empty \
+                     result claims nothing about sinks outside them",
+                    SarifNotificationLevel::Note,
+                ),
+                _ => return None,
+            },
             PolicyRunCompletion::ProvenSubset { .. } => (
                 "BIFROST_POLICY_PROVEN_SUBSET",
                 "Bifrost policy evaluation reported a proven subset, not an exhaustive result",
@@ -997,6 +995,11 @@ impl<'a> SarifNotification<'a> {
                 "BIFROST_POLICY_INCONCLUSIVE",
                 "Bifrost policy evaluation was inconclusive",
                 SarifNotificationLevel::Warning,
+            ),
+            PolicyRunCompletion::NotRun { .. } => (
+                "BIFROST_POLICY_NOT_RUN",
+                "Bifrost policy was not run because a required capability was unavailable",
+                SarifNotificationLevel::Note,
             ),
             PolicyRunCompletion::Unsupported { .. } => (
                 "BIFROST_POLICY_UNSUPPORTED",
@@ -1024,6 +1027,7 @@ impl<'a> SarifNotification<'a> {
                 omitted_diagnostics_lower_bound: u64::from(run.diagnostics_truncated()),
                 authored_arm_closures: run.authored_arm_closures(),
                 obligations: SarifObligationSummary::from_run(run),
+                scope: run.scope(),
             },
         })
     }
@@ -1049,6 +1053,8 @@ struct SarifNotificationProperties<'a> {
     policy_hash: Option<PolicySemanticHash>,
     #[serde(rename = "bifrost.completion", skip_serializing_if = "Option::is_none")]
     completion: Option<&'a PolicyRunCompletion>,
+    #[serde(rename = "bifrost.scope", skip_serializing_if = "Option::is_none")]
+    scope: Option<&'a PolicyRunScope>,
     #[serde(
         rename = "bifrost.reportDiagnostic",
         skip_serializing_if = "Option::is_none"
@@ -1084,7 +1090,7 @@ struct SarifObligationSummary {
     kinds: Vec<&'static str>,
     #[serde(skip_serializing_if = "is_false")]
     truncated: bool,
-    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(skip_serializing_if = "crate::is_zero")]
     omitted_lower_bound: u64,
 }
 
@@ -1184,12 +1190,25 @@ impl Serialize for SarifPolicyRuns<'_> {
     where
         S: Serializer,
     {
-        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
-        for run in self.0 {
-            sequence.serialize_element(&SarifPolicyRunSummary::from_run(run))?;
-        }
-        sequence.end()
+        serialize_sequence(
+            serializer,
+            self.0.len(),
+            self.0.iter().map(SarifPolicyRunSummary::from_run),
+        )
     }
+}
+
+fn serialize_sequence<S, I>(serializer: S, length: usize, values: I) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+    I: IntoIterator,
+    I::Item: Serialize,
+{
+    let mut sequence = serializer.serialize_seq(Some(length))?;
+    for value in values {
+        sequence.serialize_element(&value)?;
+    }
+    sequence.end()
 }
 
 #[derive(Serialize)]
@@ -1322,42 +1341,6 @@ fn encode_artifact_uri(path: &str) -> String {
     encoded
 }
 
-#[cfg(test)]
-thread_local! {
-    static SARIF_RESULT_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static SARIF_ARTIFACT_URI_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-fn note_sarif_result_visit() {
-    SARIF_RESULT_VISITS.with(|visits| visits.set(visits.get().saturating_add(1)));
-}
-
-#[cfg(not(test))]
-fn note_sarif_result_visit() {}
-
-#[cfg(test)]
-fn note_sarif_artifact_uri_visit() {
-    SARIF_ARTIFACT_URI_VISITS.with(|visits| visits.set(visits.get().saturating_add(1)));
-}
-
-#[cfg(not(test))]
-fn note_sarif_artifact_uri_visit() {}
-
-#[cfg(test)]
-fn reset_sarif_stream_visits() {
-    SARIF_RESULT_VISITS.with(|visits| visits.set(0));
-    SARIF_ARTIFACT_URI_VISITS.with(|visits| visits.set(0));
-}
-
-#[cfg(test)]
-fn sarif_stream_visits() -> (usize, usize) {
-    (
-        SARIF_RESULT_VISITS.with(std::cell::Cell::get),
-        SARIF_ARTIFACT_URI_VISITS.with(std::cell::Cell::get),
-    )
-}
-
 fn normalize_absolute_uri(uri: &str) -> Option<String> {
     let syntax_violation = std::cell::Cell::new(false);
     let record_violation = |_| syntax_violation.set(true);
@@ -1374,10 +1357,6 @@ const fn slice_is_empty<T>(value: &[T]) -> bool {
     value.is_empty()
 }
 
-const fn is_zero(value: &u64) -> bool {
-    *value == 0
-}
-
 #[cfg(test)]
 #[path = "../../../../test-support/scratch_cache.rs"]
 mod scratch_cache;
@@ -1386,6 +1365,7 @@ mod scratch_cache;
 mod tests {
     use super::*;
     use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
     fn artifact_uri_preserves_only_segment_separators_and_unreserved_bytes() {
@@ -1397,15 +1377,9 @@ mod tests {
     }
 
     #[test]
-    fn default_tool_identity_is_stable_and_complete() {
-        let tool = SarifToolIdentity::default();
-        assert_eq!(tool.name(), "Bifrost");
-        assert_eq!(tool.version(), Some(env!("CARGO_PKG_VERSION")));
-        assert_eq!(tool.information_uri(), Some(env!("CARGO_PKG_HOMEPAGE")));
-        tool.validate().unwrap();
-    }
-
-    #[test]
+    #[hardwon(
+        "f39fb41c170a: deadline termination must not turn an unreliable SARIF run into a successful execution"
+    )]
     fn invocation_preserves_exit_status_without_promoting_incomplete_analysis() {
         let mut report =
             PolicyReportDocument::try_new(Vec::new(), Vec::new(), Vec::new(), false, 0, None)
@@ -1454,6 +1428,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "f39fb41c170a: policy report notifications must preserve typed stable SARIF descriptor IDs"
+    )]
     fn report_diagnostic_notifications_use_their_typed_stable_descriptor_ids() {
         for (code, expected_id) in [
             (

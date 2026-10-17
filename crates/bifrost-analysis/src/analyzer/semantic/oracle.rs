@@ -26,3 +26,5 @@ pub use model::*;
 pub use relation::*;
 pub use traits::*;
 pub use value_flow::*;
+
+pub(crate) use value_flow::keyed_property_reads_container_element;

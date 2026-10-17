@@ -20,6 +20,16 @@ pub(crate) enum QueryFeature {
     Role(Role),
     /// Exact language-neutral value of a normalized boolean literal.
     BooleanLiteralValue,
+    /// AST-backed modifier state of callable facts.
+    AsyncCallableValue,
+    /// Decoded value of a normalized string literal.
+    StringLiteralValue,
+    /// Exact canonical decimal value and bit masks for integer literals.
+    IntegerLiteralValue,
+    /// Decoded literal equality for Python dictionary keys.
+    DuplicateDictionaryKey,
+    /// Direct tuple/list assignment side shapes and unstarred element counts.
+    AssignmentShape,
     /// Produced by [`QueryFeatures::for_occurrence_filter`]: the occurrence
     /// roles a query's `:class`/`:role` filter depends on being classified.
     OccurrenceRole(OccurrenceRole),
@@ -88,7 +98,32 @@ impl QueryFeatures {
                 query
                     .constrains_boolean_value()
                     .then_some(QueryFeature::BooleanLiteralValue),
+            )
+            .chain(
+                query
+                    .constrains_async_callable()
+                    .then_some(QueryFeature::AsyncCallableValue),
+            )
+            .chain(
+                query
+                    .constrains_string_value()
+                    .then_some(QueryFeature::StringLiteralValue),
             );
+        let features = features.chain(
+            query
+                .constrains_assignment_shape()
+                .then_some(QueryFeature::AssignmentShape),
+        );
+        let features = features.chain(
+            query
+                .constrains_integer_literal_value()
+                .then_some(QueryFeature::IntegerLiteralValue),
+        );
+        let features = features.chain(
+            query
+                .constrains_duplicate_dictionary_key()
+                .then_some(QueryFeature::DuplicateDictionaryKey),
+        );
         Self::new(features)
     }
 
@@ -126,6 +161,11 @@ impl QueryFeatures {
                 QueryFeature::Kind(kind) => unsupported.kinds.push(kind),
                 QueryFeature::Role(role) => unsupported.roles.push(role),
                 QueryFeature::BooleanLiteralValue => unsupported.boolean_literal_value = true,
+                QueryFeature::AsyncCallableValue => unsupported.async_callable_value = true,
+                QueryFeature::StringLiteralValue => unsupported.string_literal_value = true,
+                QueryFeature::IntegerLiteralValue => unsupported.integer_literal_value = true,
+                QueryFeature::DuplicateDictionaryKey => unsupported.duplicate_dictionary_key = true,
+                QueryFeature::AssignmentShape => unsupported.assignment_shape = true,
                 QueryFeature::OccurrenceRole(role) => unsupported.occurrence_roles.push(role),
                 QueryFeature::EnvironmentAxis(axis) => unsupported.environment_axes.push(axis),
                 QueryFeature::MaterializationAxis(axis) => {
@@ -145,6 +185,11 @@ pub(crate) struct UnsupportedQueryFeatures {
     kinds: Vec<NormalizedKind>,
     roles: Vec<Role>,
     boolean_literal_value: bool,
+    async_callable_value: bool,
+    string_literal_value: bool,
+    integer_literal_value: bool,
+    duplicate_dictionary_key: bool,
+    assignment_shape: bool,
     occurrence_roles: Vec<OccurrenceRole>,
     environment_axes: Vec<EnvironmentAxis>,
     materialization_axes: Vec<MaterializationAxis>,
@@ -172,6 +217,36 @@ impl UnsupportedQueryFeatures {
             diagnostics.push(QueryCapabilityDiagnostic {
                 language,
                 unsupported: UnsupportedFeatureGroup::BooleanLiteralValue,
+            });
+        }
+        if self.async_callable_value {
+            diagnostics.push(QueryCapabilityDiagnostic {
+                language,
+                unsupported: UnsupportedFeatureGroup::AsyncCallableValue,
+            });
+        }
+        if self.string_literal_value {
+            diagnostics.push(QueryCapabilityDiagnostic {
+                language,
+                unsupported: UnsupportedFeatureGroup::StringLiteralValue,
+            });
+        }
+        if self.assignment_shape {
+            diagnostics.push(QueryCapabilityDiagnostic {
+                language,
+                unsupported: UnsupportedFeatureGroup::AssignmentShape,
+            });
+        }
+        if self.integer_literal_value {
+            diagnostics.push(QueryCapabilityDiagnostic {
+                language,
+                unsupported: UnsupportedFeatureGroup::IntegerLiteralValue,
+            });
+        }
+        if self.duplicate_dictionary_key {
+            diagnostics.push(QueryCapabilityDiagnostic {
+                language,
+                unsupported: UnsupportedFeatureGroup::DuplicateDictionaryKey,
             });
         }
         if !self.occurrence_roles.is_empty() {
@@ -243,6 +318,26 @@ impl QueryCapabilityDiagnostic {
                 "structural adapter for {} does not support exact boolean-literal values",
                 self.language.config_label()
             ),
+            UnsupportedFeatureGroup::AsyncCallableValue => format!(
+                "structural adapter for {} does not support AST-backed callable asyncness",
+                self.language.config_label()
+            ),
+            UnsupportedFeatureGroup::StringLiteralValue => format!(
+                "structural adapter for {} does not support decoded string-literal values",
+                self.language.config_label()
+            ),
+            UnsupportedFeatureGroup::AssignmentShape => format!(
+                "structural adapter for {} does not support direct assignment-shape facts",
+                self.language.config_label()
+            ),
+            UnsupportedFeatureGroup::IntegerLiteralValue => format!(
+                "structural adapter for {} does not support exact integer-literal values",
+                self.language.config_label()
+            ),
+            UnsupportedFeatureGroup::DuplicateDictionaryKey => format!(
+                "structural adapter for {} does not support duplicate Python dictionary-key analysis",
+                self.language.config_label()
+            ),
             UnsupportedFeatureGroup::OccurrenceRoles(roles) => format!(
                 "structural adapter for {} does not support occurrence role(s): {}",
                 self.language.config_label(),
@@ -282,6 +377,11 @@ enum UnsupportedFeatureGroup {
     Kinds(Vec<NormalizedKind>),
     Roles(Vec<Role>),
     BooleanLiteralValue,
+    AsyncCallableValue,
+    StringLiteralValue,
+    IntegerLiteralValue,
+    DuplicateDictionaryKey,
+    AssignmentShape,
     OccurrenceRoles(Vec<OccurrenceRole>),
     EnvironmentAxes(Vec<EnvironmentAxis>),
     MaterializationAxes(Vec<MaterializationAxis>),
@@ -354,6 +454,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unsupported_assignment_shapes_have_an_explicit_diagnostic() {
+        let query = CodeQuery::from_json(&json!({
+            "match": {
+                "kind": "assignment",
+                "assignment_target_kind": "tuple"
+            }
+        }))
+        .expect("query should parse");
+
+        let diagnostics = QueryFeatures::for_query(query.seed().unwrap())
+            .unsupported_by(|feature| !matches!(feature, QueryFeature::AssignmentShape))
+            .into_diagnostics(Language::Php);
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].message(),
+            "structural adapter for php does not support direct assignment-shape facts"
+        );
+    }
+
+    #[test]
+    fn unsupported_integer_literal_values_have_an_explicit_diagnostic() {
+        let query = CodeQuery::from_json(&json!({
+            "match": {
+                "kind": "numeric_literal",
+                "integer_has_any_bits": 2
+            }
+        }))
+        .expect("query should parse");
+
+        let diagnostics = QueryFeatures::for_query(query.seed().unwrap())
+            .unsupported_by(|feature| !matches!(feature, QueryFeature::IntegerLiteralValue))
+            .into_diagnostics(Language::Php);
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].message(),
+            "structural adapter for php does not support exact integer-literal values"
+        );
+    }
+
     /// An occurrence role an adapter has not declared must reach the same
     /// `Incomplete` diagnostic spine kinds and roles already use (#1473), so a
     /// query depending on it is never silently answered from zero rows.
@@ -386,18 +528,13 @@ mod tests {
             QueryFeature::EnvironmentAxis(EnvironmentAxis::CandidateRejection),
             QueryFeature::OccurrenceRole(OccurrenceRole::Binder),
         ]);
-        let diagnostics = features
-            .unsupported_by(|_| false)
-            .into_diagnostics(Language::Scala);
-
-        assert_eq!(diagnostics.len(), 2);
-        assert_eq!(
-            diagnostics[0].message(),
-            "structural adapter for scala does not support occurrence role(s): binder"
-        );
-        assert_eq!(
-            diagnostics[1].message(),
-            "structural adapter for scala does not support lexical environment axis(es): scopes, candidate_rejection"
+        assert_unsupported_groups(
+            features,
+            Language::Scala,
+            &[
+                "structural adapter for scala does not support occurrence role(s): binder",
+                "structural adapter for scala does not support lexical environment axis(es): scopes, candidate_rejection",
+            ],
         );
     }
 
@@ -412,18 +549,13 @@ mod tests {
             QueryFeature::EdgeAxis(EdgeAxis::OwnerClassification),
             QueryFeature::EnvironmentAxis(EnvironmentAxis::Scopes),
         ]);
-        let diagnostics = features
-            .unsupported_by(|_| false)
-            .into_diagnostics(Language::Kotlin);
-
-        assert_eq!(diagnostics.len(), 2);
-        assert_eq!(
-            diagnostics[0].message(),
-            "structural adapter for kotlin does not support lexical environment axis(es): scopes"
-        );
-        assert_eq!(
-            diagnostics[1].message(),
-            "structural adapter for kotlin does not support reference-edge axis(es): forward_projection, owner_classification"
+        assert_unsupported_groups(
+            features,
+            Language::Kotlin,
+            &[
+                "structural adapter for kotlin does not support lexical environment axis(es): scopes",
+                "structural adapter for kotlin does not support reference-edge axis(es): forward_projection, owner_classification",
+            ],
         );
     }
 
@@ -464,18 +596,28 @@ mod tests {
             QueryFeature::MaterializationAxis(MaterializationAxis::ImplementationLinkage),
             QueryFeature::EnvironmentAxis(EnvironmentAxis::Scopes),
         ]);
+        assert_unsupported_groups(
+            features,
+            Language::Go,
+            &[
+                "structural adapter for go does not support lexical environment axis(es): scopes",
+                "structural adapter for go does not support declaration materialization axis(es): generation_sites, implementation_linkage",
+            ],
+        );
+    }
+
+    fn assert_unsupported_groups(
+        features: QueryFeatures,
+        language: Language,
+        expected_messages: &[&str],
+    ) {
         let diagnostics = features
             .unsupported_by(|_| false)
-            .into_diagnostics(Language::Go);
-
-        assert_eq!(diagnostics.len(), 2);
-        assert_eq!(
-            diagnostics[0].message(),
-            "structural adapter for go does not support lexical environment axis(es): scopes"
-        );
-        assert_eq!(
-            diagnostics[1].message(),
-            "structural adapter for go does not support declaration materialization axis(es): generation_sites, implementation_linkage"
-        );
+            .into_diagnostics(language);
+        let messages = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message())
+            .collect::<Vec<_>>();
+        assert_eq!(messages, expected_messages);
     }
 }

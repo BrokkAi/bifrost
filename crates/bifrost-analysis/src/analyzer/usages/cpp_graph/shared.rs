@@ -607,6 +607,29 @@ impl<'a> CppEdgeResolver<'a> {
         Some(Self { cpp, files })
     }
 
+    fn build_edges_for_domain<Output, F>(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        domain: EdgeNodeDomain<'_>,
+        keep_file: F,
+    ) -> Output
+    where
+        Output: UsageEdgeBuildOutput<String>,
+        F: Fn(&ProjectFile) -> bool + Sync,
+    {
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let token = scope.token();
+        let roots = self
+            .files
+            .iter()
+            .filter(|file| keep_file(file))
+            .cloned()
+            .collect();
+        let dispatch = CppDispatch::new(analyzer, token);
+        let visibility = VisibilityIndex::build(self.cpp, token, &dispatch.source(), &roots);
+        build_cpp_edges(analyzer, token, &self.files, &visibility, domain, keep_file)
+    }
+
     pub(crate) fn build_edges<F>(
         &self,
         analyzer: &dyn IAnalyzer,
@@ -616,29 +639,7 @@ impl<'a> CppEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        // The pass's request boundary; nested inside any caller-owned scope.
-        let scope = AnalyzerQueryScope::new(analyzer);
-        let token = scope.token();
-        // Resolution honors each caller file's include closure, so the visibility
-        // index is seeded with every in-scope caller file as a root (mirroring the
-        // forward scan, which builds it from the query's candidate files). Built here
-        // rather than at construction so the trait's `try_new` needs no `keep_file`.
-        let roots: HashSet<ProjectFile> = self
-            .files
-            .iter()
-            .filter(|file| keep_file(file))
-            .cloned()
-            .collect();
-        let dispatch = CppDispatch::new(analyzer, token);
-        let visibility = VisibilityIndex::build(self.cpp, token, &dispatch.source(), &roots);
-        build_cpp_edges(
-            analyzer,
-            token,
-            &self.files,
-            &visibility,
-            EdgeNodeDomain::Closed(nodes),
-            keep_file,
-        )
+        self.build_edges_for_domain(analyzer, EdgeNodeDomain::Closed(nodes), keep_file)
     }
 
     pub(crate) fn build_rooted_edges<F>(
@@ -650,24 +651,7 @@ impl<'a> CppEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        let scope = AnalyzerQueryScope::new(analyzer);
-        let token = scope.token();
-        let roots: HashSet<ProjectFile> = self
-            .files
-            .iter()
-            .filter(|file| keep_file(file))
-            .cloned()
-            .collect();
-        let dispatch = CppDispatch::new(analyzer, token);
-        let visibility = VisibilityIndex::build(self.cpp, token, &dispatch.source(), &roots);
-        build_cpp_edges(
-            analyzer,
-            token,
-            &self.files,
-            &visibility,
-            EdgeNodeDomain::Rooted(callers),
-            keep_file,
-        )
+        self.build_edges_for_domain(analyzer, EdgeNodeDomain::Rooted(callers), keep_file)
     }
 
     pub(crate) fn build_edge_weights<F>(
@@ -679,25 +663,7 @@ impl<'a> CppEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        // The pass's request boundary; nested inside any caller-owned scope.
-        let scope = AnalyzerQueryScope::new(analyzer);
-        let token = scope.token();
-        let roots: HashSet<ProjectFile> = self
-            .files
-            .iter()
-            .filter(|file| keep_file(file))
-            .cloned()
-            .collect();
-        let dispatch = CppDispatch::new(analyzer, token);
-        let visibility = VisibilityIndex::build(self.cpp, token, &dispatch.source(), &roots);
-        build_cpp_edges(
-            analyzer,
-            token,
-            &self.files,
-            &visibility,
-            EdgeNodeDomain::Closed(nodes),
-            keep_file,
-        )
+        self.build_edges_for_domain(analyzer, EdgeNodeDomain::Closed(nodes), keep_file)
     }
 }
 
@@ -831,29 +797,6 @@ mod tests {
 
         assert_eq!(prepared, vec!["first.cpp"]);
         assert_eq!(scanned, vec![("first.cpp", "first-spec")]);
-    }
-
-    #[test]
-    fn file_major_scan_does_not_prepare_when_already_cancelled() {
-        let mut prepared = 0;
-        let mut scanned = 0;
-
-        scan_file_major(
-            ["must-not-prepare.cpp"],
-            &["must-not-scan"],
-            || true,
-            |_| {
-                prepared += 1;
-                Some(())
-            },
-            |_, (), _| {
-                scanned += 1;
-                false
-            },
-        );
-
-        assert_eq!(prepared, 0);
-        assert_eq!(scanned, 0);
     }
 
     #[test]

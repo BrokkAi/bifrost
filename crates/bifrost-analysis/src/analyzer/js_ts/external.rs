@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use semver::Version;
@@ -8,6 +7,13 @@ use serde_json::Value;
 use tree_sitter::{Node, Parser};
 
 use crate::CancellationToken;
+use crate::analyzer::common::bounded_message;
+use crate::analyzer::dependency_support::{
+    BoundedReadError, failed_dependency_pack_production as dependency_failure, read_bounded_bytes,
+    resolve_dependency_path as resolve,
+};
+#[cfg(test)]
+use crate::analyzer::semantic_model::ExternalArtifactPackProducer;
 use crate::analyzer::semantic_model::{
     ActivationSelector, ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest,
     AuthoredPayload, AuthoredSemanticModelPack, AuthoredShard, BoundedProducerDiagnostics,
@@ -15,18 +21,19 @@ use crate::analyzer::semantic_model::{
     DependencyDiscoveryOutcome, DependencyDiscoveryProfile, DependencyPackAdapter,
     DependencyPackDiagnostic, DependencyPackDiagnosticSeverity, DependencyPackLimits,
     DependencyPackProduction, DependencyProvenance, ExactArtifact, ExactDependencyArtifact,
-    ExternalArtifactKind, ExternalArtifactPackProducer, HierarchyFact, HierarchyKind, Locator,
-    MemberFact, MemberIdentity, MemberKind, NameSelector, Parameter, Producer, ProducerDiagnostic,
-    ProducerDiagnosticSeverity, Provenance, ResolvedDependency, ResolvedDependencyArtifact, Safety,
-    SemanticModelActivationEvidence, Signature, SuppressedDiagnostics, TypeFact, TypeIdentity,
-    TypeKind, TypeRef, Visibility, carried_source_paths, member_declaration_id,
+    ExternalArtifactKind, HierarchyFact, HierarchyKind, Locator, MemberFact, MemberIdentity,
+    MemberKind, NameSelector, Parameter, Producer, ProducerDiagnostic, ProducerDiagnosticSeverity,
+    Provenance, ResolvedDependency, ResolvedDependencyArtifact, Safety,
+    SemanticModelActivationEvidence, Signature, StandardLibraryPackExpectation,
+    SuppressedDiagnostics, TypeFact, TypeIdentity, TypeKind, TypeRef, Visibility,
+    carried_source_paths, failed_artifact_production, member_declaration_id,
     read_exact_artifact_while, type_declaration_id,
 };
 use crate::analyzer::topology::DependencyScope;
 use crate::analyzer::tree_walk::{
     named_children_iter, push_named_children_reversed, push_named_children_reversed_as,
 };
-use crate::analyzer::{JsTsDependencyDiscoveryConfig, Project};
+use crate::analyzer::{JsTsDependencyDiscoveryConfig, Language, Project};
 use crate::hash::HashMap;
 use brokk_bifrost_js_ts::model::node_text;
 use brokk_bifrost_js_ts::syntax::static_string_literal_fragment;
@@ -34,9 +41,14 @@ use brokk_bifrost_js_ts::tsconfig::{
     TypeScriptLibrarySelection, canonical_library_name, effective_library_selection_for_config,
     typescript_library_activation_closure,
 };
+use brokk_bifrost_js_ts::typescript::ts_is_global_internal_module as is_global_internal_module;
 
 pub const TYPESCRIPT_STDLIB_PACKAGE: &str = "typescript";
 pub const TYPESCRIPT_STDLIB_VERSION: &str = "7.0.2";
+/// The TypeScript library declaration pack the pinned package selects
+/// (`semantic-packs/typescript/typescript-*.json`).
+pub const TYPESCRIPT_STDLIB_PACK_ID: &str = "bifrost.typescript-stdlib";
+const TYPESCRIPT_LIBRARY_ACTIVATION_DIAGNOSTIC: &str = "typescript.library.activation";
 
 /// Built-in TypeScript activation evidence derived from one effective
 /// `tsconfig` selection. Every row is exact about the pinned npm package and
@@ -150,15 +162,17 @@ pub fn resolve_js_ts_semantic_pack_dependencies(
                 continue;
             }
         };
-        let Some(packages) = lock.get("packages").and_then(Value::as_object) else {
-            diagnostics.push(NpmDiagnostic {
-                code: "npm.lockfile.unsupported",
-                dependency_id: None,
-                location: Some(lockfile.display().to_string()),
-                message: "npm lockfile does not contain an exact installed packages table"
-                    .to_owned(),
-            });
-            continue;
+        let packages = match exact_npm_packages_table(&lock) {
+            Ok(packages) => packages,
+            Err(message) => {
+                diagnostics.push(NpmDiagnostic {
+                    code: "npm.lockfile.unsupported",
+                    dependency_id: None,
+                    location: Some(lockfile.display().to_string()),
+                    message,
+                });
+                continue;
+            }
         };
         installed_packages.extend(
             packages
@@ -223,7 +237,7 @@ pub fn resolve_js_ts_semantic_pack_dependencies(
             message: bounded_message(diagnostic.message, limits.max_diagnostic_message_bytes),
         })
         .collect();
-    DependencyDiscoveryOutcome {
+    let mut outcome = DependencyDiscoveryOutcome {
         profile: DependencyDiscoveryProfile {
             metadata_inputs_considered,
             dependencies_resolved: dependencies.len(),
@@ -234,7 +248,88 @@ pub fn resolve_js_ts_semantic_pack_dependencies(
         diagnostics,
         suppressed_diagnostics,
         cancelled: false,
+    };
+    let languages = project.analyzer_languages();
+    if languages.contains(&Language::TypeScript) {
+        let expectation = typescript_stdlib_expectation(&outcome);
+        outcome.expect_standard_library_pack(expectation);
     }
+    if languages.contains(&Language::JavaScript) {
+        outcome.expect_standard_library_pack(StandardLibraryPackExpectation::not_selected(
+            Language::JavaScript,
+            TYPESCRIPT_STDLIB_PACK_ID,
+            "no semantic pack declares the JavaScript standard library; this pack covers \
+             TypeScript sources only"
+                .to_owned(),
+        ));
+    }
+    outcome
+}
+
+/// What TypeScript discovery concluded about the TypeScript standard-library
+/// pack (#3464).
+///
+/// The pack's shards select on the exact npm package
+/// [`TYPESCRIPT_STDLIB_PACKAGE`]@[`TYPESCRIPT_STDLIB_VERSION`] together with
+/// one `typescript-lib:<name>` configuration per library the effective
+/// `tsconfig.json` selects. Locked-package discovery mints exactly those
+/// artifact-less dependencies when the lockfile locks that version and
+/// `node_modules` installs it, so their presence is the declaration.
+fn typescript_stdlib_expectation(
+    outcome: &DependencyDiscoveryOutcome,
+) -> StandardLibraryPackExpectation {
+    let is_typescript = |dependency: &&ResolvedDependency| {
+        dependency
+            .evidence
+            .package
+            .as_ref()
+            .is_some_and(|package| package.name == TYPESCRIPT_STDLIB_PACKAGE)
+    };
+    let library_ids = outcome
+        .dependencies
+        .iter()
+        .filter(is_typescript)
+        .filter(|dependency| dependency.artifacts.is_empty())
+        .map(|dependency| dependency.id.clone())
+        .collect::<Vec<_>>();
+    if !library_ids.is_empty() {
+        return StandardLibraryPackExpectation::declared(
+            Language::TypeScript,
+            TYPESCRIPT_STDLIB_PACK_ID,
+            library_ids,
+        );
+    }
+    let reason = if let Some(refusal) = outcome
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == TYPESCRIPT_LIBRARY_ACTIVATION_DIAGNOSTIC)
+    {
+        format!(
+            "{}: {}",
+            refusal.location.as_deref().unwrap_or("tsconfig.json"),
+            refusal.message
+        )
+    } else if let Some(version) = outcome
+        .dependencies
+        .iter()
+        .filter(is_typescript)
+        .find_map(|dependency| dependency.evidence.package.as_ref()?.version.as_ref())
+    {
+        format!(
+            "the workspace locks {TYPESCRIPT_STDLIB_PACKAGE} {version}; the pack selects only \
+             {TYPESCRIPT_STDLIB_PACKAGE} {TYPESCRIPT_STDLIB_VERSION}"
+        )
+    } else {
+        format!(
+            "the workspace locks no {TYPESCRIPT_STDLIB_PACKAGE} \
+             {TYPESCRIPT_STDLIB_VERSION} in package-lock.json and node_modules"
+        )
+    };
+    StandardLibraryPackExpectation::not_selected(
+        Language::TypeScript,
+        TYPESCRIPT_STDLIB_PACK_ID,
+        reason,
+    )
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -243,24 +338,10 @@ pub struct TypeScriptDeclarationPackProducer;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct JsTsDependencyPackAdapter;
 
-impl ExternalArtifactPackProducer for TypeScriptDeclarationPackProducer {
-    fn produce_exact_artifact(
-        &self,
-        request: &ArtifactProductionRequest,
-        limits: &ArtifactProducerLimits,
-    ) -> ArtifactProduction {
-        self.produce(request, limits, None)
-    }
-
-    fn produce_exact_artifact_with_cancellation(
-        &self,
-        request: &ArtifactProductionRequest,
-        limits: &ArtifactProducerLimits,
-        cancellation: Option<&CancellationToken>,
-    ) -> ArtifactProduction {
-        self.produce(request, limits, cancellation)
-    }
-}
+crate::analyzer::semantic_model::implement_external_artifact_pack_producer!(
+    TypeScriptDeclarationPackProducer,
+    produce
+);
 
 impl TypeScriptDeclarationPackProducer {
     fn produce(
@@ -270,7 +351,7 @@ impl TypeScriptDeclarationPackProducer {
         cancellation: Option<&CancellationToken>,
     ) -> ArtifactProduction {
         if request.artifact_kind != ExternalArtifactKind::TypeScriptDeclarationFile {
-            return failed_production(
+            return failed_artifact_production(
                 "artifact.kind",
                 "TypeScript declaration producer requires a declaration-file artifact",
                 limits,
@@ -369,7 +450,7 @@ impl TypeScriptDeclarationPackProducer {
         declarations: &[(String, String)],
     ) -> ArtifactProduction {
         if request.artifact_kind != ExternalArtifactKind::NpmPackageManifest {
-            return failed_production(
+            return failed_artifact_production(
                 "artifact.kind",
                 "npm package source-set producer requires an npm_package_manifest artifact",
                 limits,
@@ -497,20 +578,9 @@ impl TypeScriptDeclarationPackProducer {
                     .to_owned(),
             });
         }
-        let mut activation = request.activation.clone();
-        for selector in &mut activation {
-            selector.artifact_sha256 = Some(artifact.sha256().to_owned());
-        }
-        let completeness = if diagnostics.is_empty() && suppressed_diagnostics.total() == 0 {
-            Completeness::Complete
-        } else {
-            Completeness::Partial
-        };
-        // Every Source locator in these shards names a declaration module this
-        // producer read and parsed, so the pack carries them all.
-        let shards = vec![AuthoredShard {
+        let shard = AuthoredShard {
             id: "declarations.typescript.external".to_owned(),
-            activation,
+            activation: request.activation.clone(),
             payload: AuthoredPayload::DeclarationFacts {
                 types,
                 members,
@@ -521,33 +591,22 @@ impl TypeScriptDeclarationPackProducer {
             collection_flows: None,
             deferred_yields: None,
             conditional_type_refinements: None,
-        }];
-        ArtifactProduction {
-            artifact_sha256: Some(artifact.sha256().to_owned()),
-            pack: has_declarations.then(|| AuthoredSemanticModelPack {
-                schema_version: crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
-                pack_id: request.pack_id.clone(),
-                version: request.pack_version.clone(),
-                producer: Producer {
-                    name: "bifrost-typescript-declaration".to_owned(),
-                    version: env!("CARGO_PKG_VERSION").to_owned(),
-                },
-                language: "typescript".to_owned(),
-                ecosystem: request.ecosystem.clone(),
-                compatibility: request.compatibility.clone(),
-                provenance: request.provenance.clone(),
-                license: request.license.clone(),
-                completeness,
-                safety: request.safety.clone(),
-                carried_sources: carried_source_paths(&shards),
-                cpp_portability: None,
-                python_correspondence: None,
-                shards,
-            }),
-            completeness,
+            callable_values: None,
+        };
+        let shards = if has_declarations {
+            vec![shard]
+        } else {
+            Vec::new()
+        };
+        crate::analyzer::semantic_model::finish_authored_pack_production(
+            request,
+            artifact.sha256(),
+            "bifrost-typescript-declaration",
+            "typescript",
             diagnostics,
             suppressed_diagnostics,
-        }
+            shards,
+        )
     }
 
     /// Produce one shard per canonical TypeScript built-in library from the
@@ -862,6 +921,7 @@ impl TypeScriptDeclarationPackProducer {
                 collection_flows: None,
                 deferred_yields: None,
                 conditional_type_refinements: None,
+                callable_values: None,
             });
         }
         shards.sort_unstable_by(|left, right| left.id.cmp(&right.id));
@@ -1245,15 +1305,8 @@ impl DependencyPackAdapter for JsTsDependencyPackAdapter {
         "bifrost-js-ts-dependency"
     }
 
-    fn adapter_version(&self) -> &str {
-        env!("CARGO_PKG_VERSION")
-    }
-
     fn producer(&self) -> Producer {
-        Producer {
-            name: "bifrost-typescript-declaration".to_owned(),
-            version: env!("CARGO_PKG_VERSION").to_owned(),
-        }
+        Producer::for_name("bifrost-typescript-declaration")
     }
 
     fn can_produce(&self, dependency: &ResolvedDependency) -> bool {
@@ -1821,18 +1874,27 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
     ) -> Option<String> {
         if let Some(&index) = self.type_index_by_name.get(name) {
             let existing = &mut self.types[index];
-            let compatible_namespace_merge = matches!(
+            // A class that shares a name with an interface, or a class or enum
+            // that shares a name with a namespace, takes over the merged kind,
+            // so the merged type is the value declaration in either source
+            // order. Its type parameters, locator, and abstractness come from
+            // that declaration.
+            if matches!(
                 (existing.type_kind, type_kind),
-                (TypeKind::Class | TypeKind::Enum, TypeKind::Module)
-                    | (TypeKind::Module, TypeKind::Class | TypeKind::Enum)
-            );
-            if existing.type_kind == TypeKind::Module
-                && matches!(type_kind, TypeKind::Class | TypeKind::Enum)
-            {
+                (TypeKind::Module, TypeKind::Class | TypeKind::Enum)
+                    | (TypeKind::Interface, TypeKind::Class)
+            ) {
                 existing.type_kind = type_kind;
                 existing.type_parameters = type_parameters;
                 existing.locator = source_locator(&self.artifact_path, name, node);
-            } else if existing.type_kind != type_kind && !compatible_namespace_merge {
+                existing.is_abstract = node.kind() == "abstract_class_declaration";
+            } else if existing.type_kind != type_kind
+                && !matches!(
+                    (existing.type_kind, type_kind),
+                    (TypeKind::Class | TypeKind::Enum, TypeKind::Module)
+                        | (TypeKind::Class, TypeKind::Interface)
+                )
+            {
                 self.diagnostics.warning(
                     "typescript.declaration.merge",
                     Some(self.artifact_path.clone()),
@@ -1856,6 +1918,8 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
         self.type_index_by_name
             .insert(name.to_owned(), self.types.len());
         self.types.push(TypeFact {
+            jvm_inventory: None,
+            runtime_bases: None,
             ambient_use: None,
             id: id.clone(),
             name: name.to_owned(),
@@ -1914,6 +1978,8 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
         self.members.push(MemberFact {
             non_overridable: None,
             ambient_use: None,
+            value_type: None,
+            proxied_type: None,
             id,
             owner: owner_id.to_owned(),
             name: draft.name.clone(),
@@ -1925,6 +1991,7 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
             implicit_operation: None,
             explicit_operation: None,
             callable_family_complete: false,
+            exact_return_classes: Vec::new(),
             signature: draft.signature,
             receiver: None,
             extension_receiver: None,
@@ -2106,11 +2173,6 @@ fn is_export_assignment(node: Node<'_>) -> bool {
         .any(|child| child.kind() == "=")
 }
 
-fn is_global_internal_module(node: Node<'_>, source: &str) -> bool {
-    node.kind() == "internal_module"
-        && field_text(node, "name", source).is_some_and(|name| name == "global")
-}
-
 fn is_global_ambient_declaration(node: Node<'_>) -> bool {
     node.kind() == "ambient_declaration"
         && (0..node.child_count()).any(|index| {
@@ -2177,6 +2239,7 @@ fn callable_signature(node: Node<'_>, source: &str, max_depth: usize) -> Option<
             r#type: parameter_type,
             optional: parameter.kind() == "optional_parameter",
             variadic,
+            role: None,
             passing_mode: Default::default(),
         });
     }
@@ -2312,22 +2375,16 @@ fn named_type(name: String) -> TypeRef {
     } else {
         name
     };
-    TypeRef::Named {
-        name,
-        arguments: Vec::new(),
-        nullable: false,
-    }
+    TypeRef::named(name)
 }
 
 fn visibility(node: Node<'_>, source: &str) -> Visibility {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "accessibility_modifier" {
-            return match node_text(child, source).trim() {
-                "private" => Visibility::Private,
-                "protected" => Visibility::Protected,
-                _ => Visibility::Public,
-            };
+            return crate::analyzer::common::visibility_from_modifier_text(node_text(
+                child, source,
+            ));
         }
     }
     Visibility::Public
@@ -2354,22 +2411,11 @@ fn finish_typescript_production(
             "declaration file contains no exported or ambient declarations",
         );
     }
-    let mut activation = request.activation.clone();
-    for selector in &mut activation {
-        selector.artifact_sha256 = Some(artifact_sha256.to_owned());
-    }
     let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
-    let completeness = if diagnostics.is_empty() && suppressed_diagnostics.total() == 0 {
-        Completeness::Complete
-    } else {
-        Completeness::Partial
-    };
     let has_declarations = types.len() > 1 || !members.is_empty();
-    // Every Source locator in these shards names a declaration module this
-    // producer read and parsed, so the pack carries them all.
-    let shards = vec![AuthoredShard {
+    let shard = AuthoredShard {
         id: "declarations.typescript.external".to_owned(),
-        activation,
+        activation: request.activation.clone(),
         payload: AuthoredPayload::DeclarationFacts {
             types,
             members,
@@ -2380,33 +2426,22 @@ fn finish_typescript_production(
         collection_flows: None,
         deferred_yields: None,
         conditional_type_refinements: None,
-    }];
-    ArtifactProduction {
-        artifact_sha256: Some(artifact_sha256.to_owned()),
-        pack: has_declarations.then(|| AuthoredSemanticModelPack {
-            schema_version: crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
-            pack_id: request.pack_id.clone(),
-            version: request.pack_version.clone(),
-            producer: Producer {
-                name: "bifrost-typescript-declaration".to_owned(),
-                version: env!("CARGO_PKG_VERSION").to_owned(),
-            },
-            language: "typescript".to_owned(),
-            ecosystem: request.ecosystem.clone(),
-            compatibility: request.compatibility.clone(),
-            provenance: request.provenance.clone(),
-            license: request.license.clone(),
-            completeness,
-            safety: request.safety.clone(),
-            carried_sources: carried_source_paths(&shards),
-            cpp_portability: None,
-            python_correspondence: None,
-            shards,
-        }),
-        completeness,
+        callable_values: None,
+    };
+    let shards = if has_declarations {
+        vec![shard]
+    } else {
+        Vec::new()
+    };
+    crate::analyzer::semantic_model::finish_authored_pack_production(
+        request,
+        artifact_sha256,
+        "bifrost-typescript-declaration",
+        "typescript",
         diagnostics,
         suppressed_diagnostics,
-    }
+        shards,
+    )
 }
 
 fn js_ts_dependency_production_request(
@@ -2473,7 +2508,7 @@ fn typescript_library_production_request(
     ArtifactProductionRequest {
         path: PathBuf::new(),
         artifact_kind: ExternalArtifactKind::TypeScriptLibrarySet,
-        pack_id: "bifrost.typescript-stdlib".to_owned(),
+        pack_id: TYPESCRIPT_STDLIB_PACK_ID.to_owned(),
         pack_version: TYPESCRIPT_STDLIB_VERSION.to_owned(),
         ecosystem: "npm".to_owned(),
         compatibility: Compatibility {
@@ -2508,48 +2543,15 @@ fn typescript_library_production_request(
     }
 }
 
-fn failed_production(
-    code: &str,
-    message: &str,
-    limits: &ArtifactProducerLimits,
-) -> ArtifactProduction {
-    ArtifactProduction::failed(
-        ProducerDiagnostic {
-            severity: ProducerDiagnosticSeverity::Error,
-            source_entry: None,
-            code: code.to_owned(),
-            location: None,
-            declaration: None,
-            message: message.to_owned(),
-        },
-        limits,
-    )
-}
-
 fn failed_loaded_production(
     code: &str,
     message: &str,
     artifact_sha256: &str,
     limits: &ArtifactProducerLimits,
 ) -> ArtifactProduction {
-    let mut production = failed_production(code, message, limits);
+    let mut production = failed_artifact_production(code, message, limits);
     production.artifact_sha256 = Some(artifact_sha256.to_owned());
     production
-}
-
-fn dependency_failure(code: &str, message: &str) -> DependencyPackProduction {
-    DependencyPackProduction {
-        pack: None,
-        diagnostics: vec![ProducerDiagnostic {
-            severity: ProducerDiagnosticSeverity::Error,
-            source_entry: None,
-            code: code.to_owned(),
-            location: None,
-            declaration: None,
-            message: message.to_owned(),
-        }],
-        suppressed_diagnostics: SuppressedDiagnostics::default(),
-    }
 }
 
 fn resolve_locked_package(
@@ -2656,7 +2658,7 @@ fn resolve_locked_package(
         );
         if !activation.selection.is_complete() || activation.evidence.is_empty() {
             return Err(failure(
-                "typescript.library.activation",
+                TYPESCRIPT_LIBRARY_ACTIVATION_DIAGNOSTIC,
                 activation.diagnostics.join("; "),
             ));
         }
@@ -2963,6 +2965,22 @@ fn lockfile_candidates(config: &JsTsDependencyDiscoveryConfig, root: &Path) -> V
     paths.into_iter().collect()
 }
 
+/// Shared exact-table decoder for installed API preparation and files-only
+/// locked evidence. Version 1's dependency tree is deliberately unsupported.
+pub(crate) fn exact_npm_packages_table(
+    lock: &Value,
+) -> Result<&serde_json::Map<String, Value>, String> {
+    if !matches!(
+        lock.get("lockfileVersion").and_then(Value::as_u64),
+        Some(2 | 3)
+    ) {
+        return Err("supported npm lockfileVersion values are 2 and 3".to_owned());
+    }
+    lock.get("packages")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "npm lockfile has no exact packages table".to_owned())
+}
+
 fn approved_package_roots(config: &JsTsDependencyDiscoveryConfig, root: &Path) -> Vec<PathBuf> {
     let candidates: Vec<_> = if config.node_modules_roots.is_empty() {
         vec![root.join("node_modules")]
@@ -3011,25 +3029,14 @@ fn read_json_bounded(path: &Path, max_bytes: u64) -> Result<Value, String> {
     }
     let file =
         File::open(path).map_err(|error| format!("could not open JSON metadata: {error}"))?;
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take(max_bytes.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|error| format!("could not read JSON metadata: {error}"))?;
-    if bytes.len() as u64 > max_bytes {
-        return Err(format!(
-            "JSON metadata exceeds configured limit {max_bytes}"
-        ));
-    }
+    let bytes = read_bounded_bytes(file, max_bytes).map_err(|error| match error {
+        BoundedReadError::Io(error) => format!("could not read JSON metadata: {error}"),
+        BoundedReadError::LimitExceeded => {
+            format!("JSON metadata exceeds configured limit {max_bytes}")
+        }
+    })?;
     serde_json::from_slice(&bytes)
         .map_err(|error| format!("could not parse JSON metadata: {error}"))
-}
-
-fn resolve(root: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        root.join(path)
-    }
 }
 
 fn slash_path(path: &Path) -> String {
@@ -3042,20 +3049,8 @@ fn slash_path(path: &Path) -> String {
         .join("/")
 }
 
-fn bounded_message(mut message: String, max_bytes: usize) -> String {
-    if message.len() <= max_bytes {
-        return message;
-    }
-    let mut end = max_bytes;
-    while end > 0 && !message.is_char_boundary(end) {
-        end -= 1;
-    }
-    message.truncate(end);
-    message
-}
-
 fn cancelled(cancellation: Option<&CancellationToken>) -> bool {
-    cancellation.is_some_and(CancellationToken::is_cancelled)
+    brokk_bifrost_core::cancellation::optional_is_cancelled(cancellation)
 }
 
 /// tree-sitter-typescript 0.23 reports the `in keyof readonly T[]` form used
@@ -3096,20 +3091,7 @@ fn is_known_typescript_computed_property_error(node: Node<'_>) -> bool {
 }
 
 fn cancelled_outcome() -> DependencyDiscoveryOutcome {
-    DependencyDiscoveryOutcome {
-        dependencies: Vec::new(),
-        diagnostics: vec![DependencyPackDiagnostic {
-            severity: DependencyPackDiagnosticSeverity::Error,
-            code: "discovery.cancelled".to_owned(),
-            dependency_id: None,
-            location: None,
-            message: "npm dependency discovery was cancelled".to_owned(),
-        }],
-        complete: false,
-        suppressed_diagnostics: SuppressedDiagnostics::default(),
-        cancelled: true,
-        profile: DependencyDiscoveryProfile::default(),
-    }
+    DependencyDiscoveryOutcome::cancelled_with_message("npm dependency discovery was cancelled")
 }
 
 #[cfg(test)]
@@ -3282,6 +3264,47 @@ declare namespace HiddenSpace { interface Widget { hidden: true } }
         ));
     }
 
+    fn declaration_production(source: &str, limits: &ArtifactProducerLimits) -> ArtifactProduction {
+        let root = tempfile::tempdir().expect("temp root");
+        let path = root.path().join("index.d.ts");
+        std::fs::write(&path, source).expect("write declaration");
+        TypeScriptDeclarationPackProducer.produce_exact_artifact(&request(path), limits)
+    }
+
+    /// Produce a pack for `widget` and require the compiler to accept it,
+    /// as pack installation does.
+    fn compiled_declarations(source: &str) -> (Completeness, Vec<TypeFact>, Vec<MemberFact>) {
+        let production = declaration_production(source, &ArtifactProducerLimits::default());
+        let pack = production.pack.unwrap_or_else(|| {
+            panic!("no pack: {:?}", production.diagnostics);
+        });
+        if let Err(errors) = compile_pack(&pack, &Default::default()) {
+            panic!("pack does not compile: {errors:?}");
+        }
+        let AuthoredPayload::DeclarationFacts { types, members, .. } =
+            pack.shards.into_iter().next().expect("one shard").payload
+        else {
+            panic!("declaration payload expected");
+        };
+        (production.completeness, types, members)
+    }
+
+    fn assert_default_export(source: &str) {
+        let (completeness, _, members) = compiled_declarations(source);
+        assert_eq!(completeness, Completeness::Complete);
+        let value = members
+            .iter()
+            .find(|member| member.name == "create")
+            .expect("local callable");
+        assert!(
+            value.aliases.contains(&"widget.default".to_owned()),
+            "{members:?}"
+        );
+        assert!(value.aliases.contains(&"default".to_owned()));
+        assert_eq!(signature_of(&members, "create").parameters.len(), 1);
+    }
+
+    use brokk_bifrost_test_macros::hardwon;
     #[test]
     fn library_source_set_emits_global_shards_and_requires_reference_closure() {
         let root = tempfile::tempdir().expect("library source root");
@@ -3367,38 +3390,8 @@ declare namespace HiddenSpace { interface Widget { hidden: true } }
 
     #[test]
     fn library_source_set_rejects_missing_triple_slash_reference() {
-        let root = tempfile::tempdir().expect("library source root");
-        std::fs::create_dir_all(root.path().join("lib")).unwrap();
-        std::fs::write(
-            root.path().join("package.json"),
-            r#"{"name":"typescript","version":"7.0.2","license":"Apache-2.0"}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            root.path().join("lib/lib.es5.d.ts"),
+        let production = produce_library_source_set(
             "/// <reference lib=\"dom\" />\ninterface Array<T> { length: number }\n",
-        )
-        .unwrap();
-        let artifact = read_exact_source_set(
-            root.path(),
-            &[
-                PathBuf::from("package.json"),
-                PathBuf::from("lib/lib.es5.d.ts"),
-            ],
-            32,
-            16,
-            &ArtifactProducerLimits::default(),
-        )
-        .unwrap();
-        let mut request = request(PathBuf::new());
-        request.artifact_kind = ExternalArtifactKind::TypeScriptLibrarySet;
-        let production = TypeScriptDeclarationPackProducer.produce_loaded_library_set(
-            &request,
-            &ArtifactProducerLimits::default(),
-            None,
-            &artifact,
-            "package.json",
-            &[("es5".to_owned(), "lib/lib.es5.d.ts".to_owned())],
         );
         assert_eq!(production.completeness, Completeness::Partial);
         assert!(
@@ -3411,6 +3404,18 @@ declare namespace HiddenSpace { interface Widget { hidden: true } }
 
     #[test]
     fn library_source_set_diagnoses_unknown_triple_slash_reference() {
+        let production = produce_library_source_set(
+            "/// <reference lib = \"not-a-real-lib\" />\ninterface Array<T> {}\n",
+        );
+        assert!(
+            production
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "typescript.library.reference_unknown")
+        );
+    }
+
+    fn produce_library_source_set(es5_declaration: &str) -> ArtifactProduction {
         let root = tempfile::tempdir().expect("library source root");
         std::fs::create_dir_all(root.path().join("lib")).unwrap();
         std::fs::write(
@@ -3418,11 +3423,7 @@ declare namespace HiddenSpace { interface Widget { hidden: true } }
             r#"{"name":"typescript","version":"7.0.2","license":"Apache-2.0"}"#,
         )
         .unwrap();
-        std::fs::write(
-            root.path().join("lib/lib.es5.d.ts"),
-            "/// <reference lib = \"not-a-real-lib\" />\ninterface Array<T> {}\n",
-        )
-        .unwrap();
+        std::fs::write(root.path().join("lib/lib.es5.d.ts"), es5_declaration).unwrap();
         let artifact = read_exact_source_set(
             root.path(),
             &[
@@ -3436,20 +3437,14 @@ declare namespace HiddenSpace { interface Widget { hidden: true } }
         .unwrap();
         let mut request = request(PathBuf::new());
         request.artifact_kind = ExternalArtifactKind::TypeScriptLibrarySet;
-        let production = TypeScriptDeclarationPackProducer.produce_loaded_library_set(
+        TypeScriptDeclarationPackProducer.produce_loaded_library_set(
             &request,
             &ArtifactProducerLimits::default(),
             None,
             &artifact,
             "package.json",
             &[("es5".to_owned(), "lib/lib.es5.d.ts".to_owned())],
-        );
-        assert!(
-            production
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "typescript.library.reference_unknown")
-        );
+        )
     }
 
     #[test]
@@ -3632,47 +3627,8 @@ declare namespace HiddenSpace { interface Widget { hidden: true } }
         assert!(!outcome.diagnostics.is_empty());
     }
 
-    fn declaration_production(source: &str, limits: &ArtifactProducerLimits) -> ArtifactProduction {
-        let root = tempfile::tempdir().expect("temp root");
-        let path = root.path().join("index.d.ts");
-        std::fs::write(&path, source).expect("write declaration");
-        TypeScriptDeclarationPackProducer.produce_exact_artifact(&request(path), limits)
-    }
-
-    /// Produce a pack for `widget` and require the compiler to accept it,
-    /// as pack installation does.
-    fn compiled_declarations(source: &str) -> (Completeness, Vec<TypeFact>, Vec<MemberFact>) {
-        let production = declaration_production(source, &ArtifactProducerLimits::default());
-        let pack = production.pack.unwrap_or_else(|| {
-            panic!("no pack: {:?}", production.diagnostics);
-        });
-        if let Err(errors) = compile_pack(&pack, &Default::default()) {
-            panic!("pack does not compile: {errors:?}");
-        }
-        let AuthoredPayload::DeclarationFacts { types, members, .. } =
-            pack.shards.into_iter().next().expect("one shard").payload
-        else {
-            panic!("declaration payload expected");
-        };
-        (production.completeness, types, members)
-    }
-
-    fn assert_default_export(source: &str) {
-        let (completeness, _, members) = compiled_declarations(source);
-        assert_eq!(completeness, Completeness::Complete);
-        let value = members
-            .iter()
-            .find(|member| member.name == "create")
-            .expect("local callable");
-        assert!(
-            value.aliases.contains(&"widget.default".to_owned()),
-            "{members:?}"
-        );
-        assert!(value.aliases.contains(&"default".to_owned()));
-        assert_eq!(signature_of(&members, "create").parameters.len(), 1);
-    }
-
     #[test]
+    #[hardwon("#3765: Regression for top-level `export default` losing its declaration surface")]
     fn default_value_export_at_top_level() {
         assert_default_export(
             "declare function create(input: string): string; export default create;",
@@ -3680,6 +3636,7 @@ declare namespace HiddenSpace { interface Widget { hidden: true } }
     }
 
     #[test]
+    #[hardwon("#3765: Regression for default value exports inside a self-named ambient module")]
     fn default_value_export_in_self_named_module() {
         assert_default_export(
             "declare module 'widget' { function create(input: string): string; export default create; }",
@@ -3693,6 +3650,7 @@ declare namespace HiddenSpace { interface Widget { hidden: true } }
     }
 
     #[test]
+    #[hardwon("#3765: Pins unsupported top-level export-import completeness behavior")]
     fn export_import_at_top_level_is_partial() {
         assert_export_import_partial(
             "export declare const version: string; export import api = require('api');",
@@ -3700,6 +3658,7 @@ declare namespace HiddenSpace { interface Widget { hidden: true } }
     }
 
     #[test]
+    #[hardwon("#3765: Pins unsupported export-import completeness inside an ambient module")]
     fn export_import_in_self_named_module_is_partial() {
         assert_export_import_partial(
             "declare module 'widget' { export const version: string; export import api = require('api'); }",
@@ -3707,6 +3666,9 @@ declare namespace HiddenSpace { interface Widget { hidden: true } }
     }
 
     #[test]
+    #[hardwon(
+        "#3765: Checks named function/class/interface defaults preserve aliases, signatures, and module-wrapped forms"
+    )]
     fn named_default_exports_preserve_declarations_and_signatures() {
         for wrapped in [false, true] {
             for body in [
@@ -3753,6 +3715,9 @@ declare namespace HiddenSpace { interface Widget { hidden: true } }
     }
 
     #[test]
+    #[hardwon(
+        "#3765: Exercises warning caps, unresolved/default and export-import boundaries, and compilable partial packs"
+    )]
     fn unsupported_exports_have_bounded_warnings_and_partial_packs() {
         for (body, code) in [
             (
@@ -3810,6 +3775,9 @@ declare namespace HiddenSpace { interface Widget { hidden: true } }
     }
 
     #[test]
+    #[hardwon(
+        "#3762: Ensures private import aliases and unrelated ambient defaults do not degrade a valid declaration pack"
+    )]
     fn private_import_alias_and_foreign_default_do_not_degrade_pack() {
         let (completeness, _, members) = compiled_declarations(
             "import api = require('api'); export const version: string; declare module 'foreign' { export default class {} }",
@@ -3838,6 +3806,9 @@ declare namespace HiddenSpace { interface Widget { hidden: true } }
     /// Each fixture is the failing shape from one npm package's published
     /// declaration entry (#3762).
     #[test]
+    #[hardwon(
+        "#3762: Uses failing npm declaration examples and checks destructured formal slots compile with stable names"
+    )]
     fn destructured_parameters_produce_compilable_packs() {
         let fixtures = [
             (
@@ -3886,6 +3857,9 @@ declare namespace HiddenSpace { interface Widget { hidden: true } }
 
     /// `@oxc-project/types` declares `decorators?: [];` on AST node interfaces.
     #[test]
+    #[hardwon(
+        "#3762: Checks empty tuple types project as unknown without losing ordinary tuple structure"
+    )]
     fn empty_tuple_type_produces_compilable_pack() {
         let (_, _, members) = compiled_declarations(
             "export interface IdentifierName {\n  decorators?: [];\n  annotated?: [/* none */];\n  pair: [string, number];\n}\n",
@@ -3913,6 +3887,9 @@ declare namespace HiddenSpace { interface Widget { hidden: true } }
     /// 'locate-character' { ... }` with no export clause, so every declaration
     /// in the block is exported, including the ones without `export`.
     #[test]
+    #[hardwon(
+        "#3762: Checks implicit exports in self-named modules while excluding unrelated wildcard declarations"
+    )]
     fn self_named_ambient_module_is_the_module_body() {
         let (completeness, types, members) = compiled_declarations(
             "declare module 'widget' {\n\
@@ -3952,6 +3929,9 @@ declare namespace HiddenSpace { interface Widget { hidden: true } }
     /// `export {};`, so only `export`-marked declarations and the export
     /// clause's names are exported.
     #[test]
+    #[hardwon(
+        "#3762: Checks explicit export clauses prevent hidden ambient declarations from entering the public surface"
+    )]
     fn ambient_module_export_clause_limits_implicit_exports() {
         let (completeness, types, members) = compiled_declarations(
             "declare module 'widget' {\n\
@@ -3978,6 +3958,56 @@ declare namespace HiddenSpace { interface Widget { hidden: true } }
         assert!(renamed.aliases.contains(&"widget.Public".to_owned()));
         assert!(members.iter().any(|member| member.name == "uneval"));
         assert!(!members.iter().any(|member| member.name == "hidden"));
+    }
+
+    /// TypeScript merges a class and an interface of the same name into one
+    /// class type. The interface's members and `extends` targets join the
+    /// class, in either source order.
+    #[test]
+    #[hardwon(
+        "#3765: An interface and a class with the same name were a declaration merge warning instead of one class"
+    )]
+    fn class_and_interface_merge_into_one_class_in_either_order() {
+        let class_first = "declare module 'widget' {\n\
+             \texport abstract class Spring<T> {\n\t\tconstructor(value: T);\n\t\tset(value: T): void;\n\t}\n\
+             \texport interface Spring<T> extends Readable<T> {\n\t\tsubscribe(run: (value: T) => void): void;\n\t}\n\
+             }\n";
+        let interface_first = "declare module 'widget' {\n\
+             \texport interface Spring<T> extends Readable<T> {\n\t\tsubscribe(run: (value: T) => void): void;\n\t}\n\
+             \texport abstract class Spring<T> {\n\t\tconstructor(value: T);\n\t\tset(value: T): void;\n\t}\n\
+             }\n";
+        let mut merged = Vec::new();
+        for source in [class_first, interface_first] {
+            let (completeness, types, members) = compiled_declarations(source);
+            assert_eq!(completeness, Completeness::Complete);
+            let spring = types
+                .iter()
+                .filter(|fact| fact.name == "widget.Spring")
+                .collect::<Vec<_>>();
+            let [spring] = spring.as_slice() else {
+                panic!("one merged type expected: {types:?}");
+            };
+            let mut member_names = members
+                .iter()
+                .filter(|member| member.owner == spring.id)
+                .map(|member| member.name.clone())
+                .collect::<Vec<_>>();
+            member_names.sort_unstable();
+            merged.push((
+                spring.type_kind,
+                spring.is_abstract,
+                spring.type_parameters.clone(),
+                spring.hierarchy.clone(),
+                member_names,
+            ));
+        }
+        assert_eq!(merged[0].0, TypeKind::Class);
+        assert!(merged[0].1, "abstract class keeps its abstractness");
+        assert_eq!(merged[0].2, ["T"]);
+        assert_eq!(merged[0].3.len(), 1, "{:?}", merged[0].3);
+        assert_eq!(merged[0].3[0].hierarchy_kind, HierarchyKind::Extends);
+        assert_eq!(merged[0].4, ["constructor", "set", "subscribe"]);
+        assert_eq!(merged[0], merged[1]);
     }
 
     fn request(path: PathBuf) -> ArtifactProductionRequest {

@@ -53,6 +53,10 @@ an empty complete result.
 Tree-sitter reparses source incrementally through incomplete syntax. Stack
 Graphs resolves names incrementally. IncA updates analyses expressed in its DSL;
 Salsa memoizes on-demand queries and redoes work when their inputs change.
+Bifrost's [Name Resolution Engine](../name-resolution/) follows the Stack Graphs
+design, and its
+[comparison](../name-resolution/#comparison-with-stack-graphs) lists where the
+two differ.
 
 Bifrost persists durable facts and caches reusable semantic artifacts under
 dependency-complete [cache keys](../storage-and-cache/#cache-key-discipline).

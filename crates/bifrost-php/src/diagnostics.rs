@@ -11,17 +11,21 @@ use crate::aliases::{
     resolve_php_type_arms,
 };
 use crate::external_surface::{PhpExternalMember, PhpExternalSurface, PhpExternalSymbol};
+use crate::graph::extractor::static_member_identifier;
+use crate::graph::resolver::{
+    is_bare_constant_reference, is_object_creation_type_name, qualified_candidate_text,
+};
 use crate::graph::syntax::{
-    PhpMagicSurface, instance_receiver_type_fq_name, is_local_scope, literal_member_identifier,
-    magic_member_names, seed_assignment_binding, seed_parameter_types, static_member_parts,
-    static_property_identifier,
+    PhpMagicSurface, instance_receiver_type_fq_name, instanceof_type_node, is_local_scope,
+    literal_member_identifier, magic_member_names, seed_assignment_binding, seed_parameter_types,
+    static_member_parts, static_scope_type_fq_name,
 };
 use crate::graph::{PhpCallableFacts, PhpGraphSource};
 use crate::graph_support::{PhpSource, php_direct_declared_class_parent};
 use brokk_bifrost_core::analyzer::model::{Range, SemanticDiagnostic};
 use brokk_bifrost_core::analyzer::semantic_diagnostics::{node_range, node_text};
 use brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus;
-use brokk_bifrost_core::analyzer::tree_walk::collect_parse_errors;
+use brokk_bifrost_core::analyzer::tree_walk::{collect_parse_errors, find_node_or_ancestor};
 use brokk_bifrost_core::analyzer::usages::local_inference::LocalInferenceEngine;
 use brokk_bifrost_core::analyzer::{
     BoundedDefinitionLookup, CodeUnit, CodeUnitIndex, ProjectFile, SemanticAbsenceProof,
@@ -256,7 +260,7 @@ impl PhpDiagnosticCollector<'_> {
         }
         self.seed_assignment(node, bindings);
         self.check_reference(node, bindings);
-        push_named_children(stack, node);
+        brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed(node, stack);
     }
 
     fn seed_assignment(&self, node: Node<'_>, bindings: &mut LocalInferenceEngine<String>) {
@@ -296,7 +300,7 @@ impl PhpDiagnosticCollector<'_> {
             },
             "named_type" => {
                 let raw = qualified_candidate_text(node, self.source);
-                if !is_builtin_php_type(&raw) && !is_in_object_creation(node) {
+                if !is_builtin_php_type(&raw) && !is_object_creation_type_name(node) {
                     self.check_symbol(node, SymbolKind::Type);
                 }
             }
@@ -324,7 +328,19 @@ impl PhpDiagnosticCollector<'_> {
             "name" | "qualified_name" => {
                 if is_instanceof_type_name(node) {
                     self.check_symbol(node, SymbolKind::Type);
-                } else if is_bare_constant_reference(node) {
+                } else if is_bare_constant_reference(node)
+                    && !has_ancestor_kind(
+                        node,
+                        &[
+                            "variable_name",
+                            "namespace_name",
+                            "namespace_definition",
+                            "property_element",
+                            "simple_parameter",
+                            "property_promotion_parameter",
+                        ],
+                    )
+                {
                     self.check_symbol(node, SymbolKind::Constant);
                 }
             }
@@ -466,6 +482,10 @@ impl PhpDiagnosticCollector<'_> {
             return;
         }
         let owner = self.static_scope_fqn(scope);
+        if owner.is_none() && matches!(node_text(scope, self.source), "self" | "static" | "parent")
+        {
+            return;
+        }
         // An owner the workspace does not declare may still be an indexed
         // Composer type, in which case the member check can continue against
         // the external surface.
@@ -667,15 +687,17 @@ impl PhpDiagnosticCollector<'_> {
 
     fn static_scope_fqn(&self, scope: Node<'_>) -> Option<String> {
         let text = node_text(scope, self.source);
-        match text {
-            "self" | "static" => self.enclosing_owner_fqn(scope),
-            "parent" => {
-                let owner = self.enclosing_owner_fqn(scope)?;
-                let child = self.support.fqn(&owner).into_iter().next()?;
-                php_direct_declared_class_parent(self.php, &child).map(|parent| parent.fq_name())
-            }
-            _ => resolve_php_type(text, self.contexts.context_at(scope.start_byte())),
-        }
+        let enclosing_owner = self.enclosing_owner_fqn(scope);
+        static_scope_type_fq_name(
+            self.php,
+            PhpGraphSource {
+                index: self.index,
+                facts: &PHP_DIAGNOSTIC_CALLABLE_FACTS,
+            },
+            text,
+            self.contexts.context_at(scope.start_byte()),
+            enclosing_owner.as_deref(),
+        )
     }
 
     fn has_magic_member_boundary(&self, owner_fqn: &str, kind: MemberAccessKind) -> bool {
@@ -841,12 +863,6 @@ fn is_dynamic_php_name(raw: &str) -> bool {
     raw.starts_with('$')
 }
 
-fn push_named_children<'tree>(stack: &mut Vec<Node<'tree>>, node: Node<'tree>) {
-    let mut cursor = node.walk();
-    let children: Vec<_> = node.named_children(&mut cursor).collect();
-    stack.extend(children.into_iter().rev());
-}
-
 fn is_non_reference_container(node: Node<'_>) -> bool {
     matches!(
         node.kind(),
@@ -878,108 +894,23 @@ fn object_creation_type(node: Node<'_>) -> Option<Node<'_>> {
         .find(|child| matches!(child.kind(), "name" | "qualified_name"))
 }
 
-fn static_member_identifier<'a>(
-    parent: Node<'_>,
-    member: Node<'_>,
-    source: &'a str,
-) -> Option<&'a str> {
-    if parent.kind() == "scoped_property_access_expression" {
-        static_property_identifier(member, source)
-    } else {
-        literal_member_identifier(member, source)
-    }
-}
-
-fn qualified_candidate_text(node: Node<'_>, source: &str) -> String {
-    let mut candidate = node;
-    let mut parent = node.parent();
-    while let Some(ancestor) = parent {
-        if matches!(ancestor.kind(), "namespace_name" | "qualified_name") {
-            candidate = ancestor;
-            parent = ancestor.parent();
-        } else {
-            break;
-        }
-    }
-    node_text(candidate, source).trim().to_string()
-}
-
 fn is_instanceof_type_name(node: Node<'_>) -> bool {
-    let Some(parent) = node.parent() else {
-        return false;
-    };
-    parent.kind() == "binary_expression"
-        && parent
-            .child_by_field_name("operator")
-            .is_some_and(|operator| operator.kind() == "instanceof")
-        && parent.child_by_field_name("right").is_some_and(|right| {
+    node.parent()
+        .and_then(instanceof_type_node)
+        .is_some_and(|right| {
             right.start_byte() <= node.start_byte() && node.end_byte() <= right.end_byte()
         })
 }
 
-fn is_in_object_creation(node: Node<'_>) -> bool {
-    node.parent()
-        .is_some_and(|parent| parent.kind() == "object_creation_expression")
-}
-
-fn is_bare_constant_reference(node: Node<'_>) -> bool {
-    let Some(parent) = node.parent() else {
-        return false;
-    };
-    if has_ancestor_kind(
-        node,
-        &[
-            "variable_name",
-            "namespace_name",
-            "namespace_definition",
-            "property_element",
-            "simple_parameter",
-            "property_promotion_parameter",
-        ],
-    ) {
-        return false;
-    }
-    !matches!(
-        parent.kind(),
-        "function_call_expression"
-            | "member_access_expression"
-            | "member_call_expression"
-            | "scoped_call_expression"
-            | "class_constant_access_expression"
-            | "named_type"
-            | "object_creation_expression"
-            | "function_definition"
-            | "method_declaration"
-            | "const_element"
-            | "namespace_use_clause"
-            | "namespace_definition"
-            | "namespace_name"
-            | "class_declaration"
-            | "interface_declaration"
-            | "trait_declaration"
-            | "qualified_name"
-            | "variable_name"
-            | "base_clause"
-            | "class_interface_clause"
-    )
-}
-
 fn has_ancestor_kind(node: Node<'_>, kinds: &[&str]) -> bool {
-    let mut current = Some(node);
-    while let Some(candidate) = current {
-        if kinds.contains(&candidate.kind()) {
-            return true;
-        }
-        current = candidate.parent();
-    }
-    false
+    find_node_or_ancestor(node, |candidate| kinds.contains(&candidate.kind())).is_some()
 }
 
 fn is_declaration_name(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
-    parent.child_by_field_name("name") == Some(node)
+    brokk_bifrost_core::analyzer::structural::adapter_helpers::is_field_of(parent, node, "name")
         && matches!(
             parent.kind(),
             "class_declaration"

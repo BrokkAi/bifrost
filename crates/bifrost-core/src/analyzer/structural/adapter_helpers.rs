@@ -4,23 +4,49 @@
 //! across adapters. Grammar-specific decisions, such as how an expression's
 //! terminal name is found, stay in the language adapter.
 
+use super::facts::{IntegerLiteralValue, Span, decode_integer_literal_digits};
 use super::kinds::Role;
 use super::spec::RoleSink;
-use crate::analyzer::Range;
-use crate::analyzer::tree_walk::named_children_iter;
+use crate::analyzer::common::node_source_text;
+pub use crate::analyzer::tree_walk::node_range;
+use crate::analyzer::tree_walk::{expression_target_node, last_named_child, named_children_iter};
 use tree_sitter::Node;
 
-/// The byte-and-line range of one syntax node, in the same 1-based line
-/// convention the facts arena records (see `structural::extract`), so an
-/// activation interval an adapter states is directly comparable with a fact's
-/// range.
-pub fn node_range(node: Node<'_>) -> Range {
-    Range {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_line: node.start_position().row + 1,
-        end_line: node.end_position().row + 1,
+/// Assert that every grammar node name in a language adapter's kind table
+/// exists in the grammar used by that adapter.
+#[cfg(feature = "test-support")]
+pub fn assert_kind_table_matches_grammar(
+    grammar: tree_sitter::Language,
+    grammar_name: &str,
+    table: &[(&str, super::kinds::NormalizedKind)],
+) {
+    for (name, kind) in table {
+        assert_ne!(
+            grammar.id_for_node_kind(name, true),
+            0,
+            "node type {name:?} (mapped to {kind:?}) does not exist in {grammar_name}"
+        );
     }
+}
+
+/// The boolean value of an AST-selected `true` or `false` literal spelling.
+pub fn boolean_literal_value(spelling: &str) -> Option<bool> {
+    match spelling {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// The byte span inside a string node's opening and closing delimiters.
+/// Callers check the language-specific node kind before using this arithmetic.
+pub fn unquoted_string_content_span(node: Node<'_>) -> Option<Span> {
+    let start = node.start_byte().checked_add(1)?;
+    let end = node.end_byte().checked_sub(1)?;
+    (start <= end).then_some(Span {
+        start_byte: start,
+        end_byte: end,
+    })
 }
 
 /// The nearest ancestor of `node` (inclusive of its parent chain, exclusive of
@@ -32,10 +58,22 @@ pub fn node_range(node: Node<'_>) -> Range {
 /// grammar knowledge.
 pub fn nearest_ancestor<'tree>(
     node: Node<'tree>,
+    accept: impl FnMut(&str) -> bool,
+) -> Option<Node<'tree>> {
+    nearest_ancestor_with(node, |node| node.parent(), accept)
+}
+
+/// The nearest ancestor selected with a caller-provided parent lookup.
+///
+/// This keeps the traversal shared for callers that already maintain a parent
+/// index, while `nearest_ancestor` uses tree-sitter's parent links directly.
+pub fn nearest_ancestor_with<'tree>(
+    node: Node<'tree>,
+    mut parent_of: impl FnMut(Node<'tree>) -> Option<Node<'tree>>,
     mut accept: impl FnMut(&str) -> bool,
 ) -> Option<Node<'tree>> {
     let mut current = node;
-    while let Some(parent) = current.parent() {
+    while let Some(parent) = parent_of(current) {
         if accept(parent.kind()) {
             return Some(parent);
         }
@@ -80,6 +118,88 @@ pub fn first_named_child<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
     node.named_child(0)
 }
 
+/// Return the expression assigned by a declarator's initializer clause.
+///
+/// C#'s grammar has used both named `value`/`initializer` fields and an
+/// `equals_value_clause` wrapper across the supported grammar releases. The
+/// tree-shape fallback is shared so declaration extraction and source-backed
+/// structural relations answer the same question.
+pub fn declarator_initializer(node: Node<'_>) -> Option<Node<'_>> {
+    node.child_by_field_name("value")
+        .or_else(|| node.child_by_field_name("initializer"))
+        .or_else(|| {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .find(|child| child.kind() == "equals_value_clause")
+                .and_then(|clause| {
+                    clause
+                        .child_by_field_name("value")
+                        .or_else(|| clause.named_child(0))
+                })
+        })
+        .or_else(|| {
+            let name = node.child_by_field_name("name")?;
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .find(|child| child.start_byte() > name.end_byte())
+        })
+}
+
+/// Decode the C# integer-literal token forms shared by the structural adapter
+/// and source-backed C# relations. Syntax selection remains the caller's AST
+/// work; this helper only classifies an already-selected literal value.
+pub fn csharp_integer_literal_value(node: Node<'_>, source: &str) -> Option<IntegerLiteralValue> {
+    let literal = if node.kind() == "prefix_unary_expression" {
+        let operator = node.child(0)?;
+        if !matches!(operator.kind(), "+" | "-") {
+            return None;
+        }
+        let literal = last_named_child(node).map(expression_target_node)?;
+        let value = decode_csharp_integer_literal_value(literal, source)?;
+        return if operator.kind() == "-" {
+            Some(value.negated())
+        } else {
+            Some(value)
+        };
+    } else {
+        node
+    };
+    decode_csharp_integer_literal_value(literal, source)
+}
+
+fn decode_csharp_integer_literal_value(
+    literal: Node<'_>,
+    source: &str,
+) -> Option<IntegerLiteralValue> {
+    if literal.kind() != "integer_literal" {
+        return None;
+    }
+    let text = node_source_text(literal, source);
+    let suffix_len = text
+        .bytes()
+        .rev()
+        .take_while(|byte| matches!(byte, b'u' | b'U' | b'l' | b'L'))
+        .count();
+    if suffix_len > 2 {
+        return None;
+    }
+    let text = text.get(..text.len().checked_sub(suffix_len)?)?;
+    let (radix, digits) = match text.as_bytes() {
+        [b'0', b'x' | b'X', rest @ ..] => (16, rest),
+        [b'0', b'b' | b'B', rest @ ..] => (2, rest),
+        _ => (10, text.as_bytes()),
+    };
+    decode_integer_literal_digits(radix, digits)
+}
+/// Prefer a grammar field, then the first direct named child.
+pub fn child_by_field_or_first_named_child<'tree>(
+    node: Node<'tree>,
+    field: &str,
+) -> Option<Node<'tree>> {
+    node.child_by_field_name(field)
+        .or_else(|| first_named_child(node))
+}
+
 pub fn attach_role_with_derived_name<'tree>(
     sink: &mut RoleSink<'_>,
     role: Role,
@@ -101,6 +221,28 @@ pub fn attach_argument_role_with_derived_name<'tree>(
     );
 }
 
+/// Attach decorator roles found under a grammar-specific declaration child.
+/// Adapters supply the grammar's container and decorator kinds; the traversal
+/// and role attachment are shared.
+pub fn attach_decorators_under<'tree>(
+    sink: &mut RoleSink<'_>,
+    declaration: Node<'tree>,
+    container_kind: &str,
+    decorator_kinds: &[&str],
+    name_of: impl Fn(Node<'tree>) -> Option<Node<'tree>> + Copy,
+) {
+    for container in named_children_iter(declaration) {
+        if container.kind() != container_kind {
+            continue;
+        }
+        for decorator in named_children_iter(container) {
+            if decorator_kinds.contains(&decorator.kind()) {
+                attach_role_with_derived_name(sink, Role::Decorator, decorator, name_of);
+            }
+        }
+    }
+}
+
 pub fn is_spread_argument_node(node: Node<'_>) -> bool {
     matches!(
         node.kind(),
@@ -109,6 +251,7 @@ pub fn is_spread_argument_node(node: Node<'_>) -> bool {
             | "hash_splat_argument"
             | "list_splat"
             | "dictionary_splat"
+            | "spread_expression"
             | "spread_argument"
             | "variadic_argument"
             | "variadic_unpacking"
@@ -130,6 +273,20 @@ pub fn attach_positional_argument_roles<'tree, F>(
             break;
         }
         attach_argument_role_with_derived_name(sink, argument, name_of);
+    }
+}
+
+/// Visit each named child in an argument list until the visitor says to stop.
+/// Language adapters supply argument classification; the AST walk and cutoff
+/// remain shared.
+pub fn for_each_argument<'tree>(
+    arguments: Node<'tree>,
+    mut visit: impl FnMut(Node<'tree>) -> bool,
+) {
+    for argument in named_children_iter(arguments) {
+        if !visit(argument) {
+            break;
+        }
     }
 }
 
@@ -165,6 +322,19 @@ pub fn qualified_chain_root<'tree>(
         }
     }
     (root.id() != token.id()).then_some(root)
+}
+
+/// Climb from a named type or value token to the qualified chain it belongs
+/// to. Every adapter accepts the same terminal token kinds; only its chain
+/// table is grammar-specific.
+pub fn qualified_path_chain_root<'tree>(
+    token: Node<'tree>,
+    chain: &[(&str, Option<&str>)],
+) -> Option<Node<'tree>> {
+    if !matches!(token.kind(), "identifier" | "type_identifier") {
+        return None;
+    }
+    qualified_chain_root(token, chain)
 }
 
 /// The ordered segment tokens of the left-nested chain rooted at `root`.
@@ -270,5 +440,49 @@ pub fn chain_name_child<'tree>(node: Node<'tree>, name_field: Option<&str>) -> O
             let mut cursor = node.walk();
             node.named_children(&mut cursor).last()
         }
+    }
+}
+
+/// Grammar hooks describe one step; the shared loop owns callee traversal.
+/// Immediate-child selection is needed where a grammar has no name field.
+pub enum CalleeSpineStep {
+    Name,
+    Field(&'static str),
+    ChildKind(&'static str),
+    OnlyChild,
+    FieldOrOnlyChild(&'static str),
+}
+
+/// Follow only the callee's member/name/wrapper spine. Calls, subscripts,
+/// lambdas and other value expressions stop; their descendants cannot name
+/// the declaration invoked by the enclosing call.
+pub fn terminal_callee_leaf(
+    mut node: Node<'_>,
+    step: impl Fn(&str) -> Option<CalleeSpineStep>,
+) -> Option<Node<'_>> {
+    loop {
+        node = match if node.kind() == "parenthesized_expression" {
+            Some(CalleeSpineStep::OnlyChild)
+        } else {
+            step(node.kind())
+        }? {
+            CalleeSpineStep::Name => return Some(node),
+            CalleeSpineStep::Field(field) => {
+                crate::analyzer::tree_walk::last_named_field_child(node, field)?
+            }
+            CalleeSpineStep::ChildKind(kind) => {
+                crate::analyzer::tree_walk::single_named_child_matching(node, |child| {
+                    child.kind() == kind
+                })?
+            }
+            CalleeSpineStep::OnlyChild => {
+                crate::analyzer::tree_walk::single_named_child_matching(node, |_| true)?
+            }
+            CalleeSpineStep::FieldOrOnlyChild(field) => {
+                node.child_by_field_name(field).or_else(|| {
+                    crate::analyzer::tree_walk::single_named_child_matching(node, |_| true)
+                })?
+            }
+        };
     }
 }

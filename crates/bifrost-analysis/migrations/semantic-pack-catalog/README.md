@@ -48,3 +48,33 @@ Current history:
   opening this transaction, checks every foreign key before committing, and
   restores enforcement after success or rollback. Read-only older catalogs
   return `ReadOnlySchema` instead of migrating.
+- `0012-unknown-types.sql`: widens the native, gate-free compatibility shape
+  from schema 8 to schemas 8 and 9. It rebuilds the parent table and dependent
+  view transactionally while preserving pack bytes, child rows, indexes,
+  triggers, and mutation epochs. The caller disables foreign keys before the
+  transaction, checks every foreign key before committing, and restores
+  enforcement after success or rollback.
+- `0013-callable-values.sql`: admits native schema-10 packs without a Bifrost
+  compatibility gate.
+- `0014-callable-value-rows.sql`: adds normalized rows and coverage for
+  callable-value facts, leaving old shards unindexed until exact demand.
+- `0015-structured-formals.sql`: admits native schema-11 packs with structured
+  procedure formals. It rebuilds the parent table and generated-production
+  view transactionally while preserving pack bytes, child rows, indexes,
+  triggers, and mutation epochs; the caller validates foreign keys before
+  publishing the new catalog version.
+- `0016-semantic-model-schema.sql`: admits semantic-model schema 13, combining
+  reviewed channel-close effects, returned-callable bindings, and structured
+  procedure formals. It rebuilds the parent table and dependent view
+  transactionally while preserving pack rows and catalog state.
+- `0017-exact-go-source-rows.sql`: stores verified Go artifact source bytes and
+  package membership as readable rows for exact native callable materialization.
+  It preserves schema-13 compatibility and all existing catalog state.
+- `0018-semantic-model-schema-v14.sql`: admits semantic-model schema 14 while
+  preserving schema-8 through schema-13 pack rows and catalog state.
+- `0019-semantic-model-schema-v15.sql`: admits semantic-model schema 15, whose
+  parameter-role and module-value facts are structured; it preserves earlier
+  pack rows, child rows, indexes, triggers, and mutation epochs.
+- `0020-semantic-model-schema-v16.sql`: admits semantic-model schema 16 with
+  exact runtime return-class sets while preserving earlier pack rows, child
+  rows, indexes, triggers, and mutation epochs.

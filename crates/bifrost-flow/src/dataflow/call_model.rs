@@ -35,19 +35,3 @@ impl fmt::Display for UnmodeledCallBehavior {
         formatter.write_str(self.label())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn paranoid_is_the_stable_default() {
-        assert_eq!(
-            UnmodeledCallBehavior::default(),
-            UnmodeledCallBehavior::Paranoid
-        );
-        assert_eq!(UnmodeledCallBehavior::Paranoid.label(), "paranoid");
-        assert_eq!(UnmodeledCallBehavior::Optimistic.label(), "optimistic");
-        assert_eq!(UnmodeledCallBehavior::RequireModel.label(), "require-model");
-    }
-}

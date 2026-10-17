@@ -13,8 +13,9 @@ use crate::analyzer::semantic::cfg_algorithms::{
     CfgAlgorithmBudget, CfgAlgorithmRequest, DenseBidirectionalGraph, strongly_connected_components,
 };
 use crate::analyzer::semantic::{
-    SemanticArtifactKey, SemanticLocator, SemanticRole, StableDigest, UnmaterializedExternalTarget,
-    authored_procedure_target_identity, is_unmaterialized_external_artifact,
+    DeclarationLocator, ProcedureHandle, SemanticArtifactKey, SemanticLocator, SemanticRole,
+    StableDigest, UnmaterializedExternalTarget, authored_procedure_target_identity,
+    is_unmaterialized_external_artifact,
 };
 use crate::cancellation::CancellationToken;
 use crate::dataflow::{
@@ -37,9 +38,10 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{
     CompiledAtomicOperation, CompiledConcurrencyEffect, CompiledCondWaiters, CompiledLockCondition,
     CompiledLockMode, CompiledProcedureSummary, CompiledProcedureTarget, CompiledSummaryEffect,
     CompiledSummaryExitKind, CompiledSummaryInput, CompiledSummaryLocationKind,
-    CompiledSummaryOutput, CompiledSummaryTransfer, CompiledSyncMapOperation,
+    CompiledSummaryOutput, CompiledSummaryPort, CompiledSummaryTransfer, CompiledSyncMapOperation,
     CompiledTaskSpawnCondition, Completeness, PROCEDURE_SUMMARY_CONTRACT_VERSION,
     ProcedureSummaryMatch, ResolvedActiveSemanticModels, SemanticModelMatchDisposition,
+    compiled_flow_claims_agree,
 };
 
 const LOCATION_KEY_DOMAIN: &[u8] = b"bifrost.semantic-model.procedure-summary.location.v1";
@@ -48,6 +50,25 @@ const CONCURRENCY_EVENT_KEY_DOMAIN: &[u8] =
     b"bifrost.semantic-model.procedure-summary.concurrency-event.v1";
 const MODEL_UNPROVEN_REASON: &str = "external semantic model row is not source-backed proof";
 const MODEL_INCOMPLETE_REASON: &str = "external semantic model summary is partial";
+
+pub(crate) fn unique_semantic_summary<'a, ArtifactHasher, DeclarationHasher>(
+    by_artifact: &std::collections::HashMap<
+        SemanticArtifactKey,
+        std::collections::HashMap<DeclarationLocator, usize, DeclarationHasher>,
+        ArtifactHasher,
+    >,
+    summaries: &[&'a SemanticProcedureSummary],
+    procedure: &ProcedureHandle,
+) -> Option<&'a SemanticProcedureSummary>
+where
+    ArtifactHasher: std::hash::BuildHasher,
+    DeclarationHasher: std::hash::BuildHasher,
+{
+    let index = by_artifact
+        .get(procedure.artifact().key())?
+        .get(procedure.semantics().locator().declaration())?;
+    summaries.get(*index).copied()
+}
 
 /// Explicit receiver metadata for one exact bound procedure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -390,8 +411,13 @@ pub fn bind_active_unmaterialized_procedure_summaries(
                     applicable.push((target, binding));
                 }
             }
-            applicable.sort_unstable_by(|left, right| left.0.cmp(right.0));
-            applicable.dedup_by(|left, right| left.0 == right.0);
+            // Different call sites with the same resolver-owned target
+            // locator are one semantic alias. Their argument value IDs differ,
+            // but the binding and summary locator are identical.
+            applicable.sort_unstable_by(|left, right| {
+                left.1.actual_locator().cmp(right.1.actual_locator())
+            });
+            applicable.dedup_by(|left, right| left.1.actual_locator() == right.1.actual_locator());
             let Some((target, first_binding)) = applicable.first() else {
                 return Err(ProcedureSummaryBindingError::MissingBinding {
                     summary_id: summary.id.clone(),
@@ -505,24 +531,22 @@ fn select_unmaterialized_flow_summary<'matched, 'model>(
                     detail: "conflicting procedure-summary lookup returned one record".to_owned(),
                 });
             }
-            Ok(rest
-                .iter()
-                .all(|other| external_flow_claims_agree(other.record, first.record))
-                .then_some(first))
+            Ok(conflicting_flow_candidates_agree(
+                first.record,
+                rest.iter().map(|other| other.record),
+            )
+            .then_some(first))
         }
     }
 }
 
-fn external_flow_claims_agree(
-    left: &CompiledProcedureSummary,
-    right: &CompiledProcedureSummary,
+fn conflicting_flow_candidates_agree<'a>(
+    first: &CompiledProcedureSummary,
+    others: impl IntoIterator<Item = &'a CompiledProcedureSummary>,
 ) -> bool {
-    left.completeness == right.completeness
-        && left.covers_overrides == right.covers_overrides
-        && left.normal_result_count == right.normal_result_count
-        && left.locations == right.locations
-        && left.transfers == right.transfers
-        && left.effects == right.effects
+    others
+        .into_iter()
+        .all(|other| compiled_flow_claims_agree(other, first))
 }
 
 /// Bind one already-selected compiled summary family to exact mounted procedures.
@@ -787,51 +811,13 @@ fn build_summary_set(
         .iter()
         .map(|binding| (binding.summary_id(), binding))
         .collect::<HashMap<_, _>>();
-    let mut component_by_node = vec![0usize; records.len()];
-    for (component, members) in components.iter().enumerate() {
-        for &member in members.iter() {
-            component_by_node[member] = component;
-        }
-    }
-
-    let mut dependencies_by_component = vec![Vec::<usize>::new(); components.len()];
-    for (component, members) in components.iter().enumerate() {
-        for &member in members.iter() {
-            dependencies_by_component[component].extend(
-                graph.outgoing[member]
-                    .iter()
-                    .map(|edge| component_by_node[graph.edges[*edge].1])
-                    .filter(|&target| target != component),
-            );
-        }
-        dependencies_by_component[component].sort_unstable();
-        dependencies_by_component[component].dedup();
-    }
-    let mut dependents_by_component = vec![Vec::<usize>::new(); components.len()];
-    for (dependent, dependencies) in dependencies_by_component.iter().enumerate() {
-        for &dependency in dependencies {
-            dependents_by_component[dependency].push(dependent);
-        }
-    }
-    for dependents in &mut dependents_by_component {
-        dependents.sort_unstable();
-        dependents.dedup();
-    }
-    let mut remaining_dependencies = dependencies_by_component
-        .iter()
-        .map(Vec::len)
-        .collect::<Vec<_>>();
-    let mut ready = remaining_dependencies
-        .iter()
-        .enumerate()
-        .filter_map(|(component, &remaining)| (remaining == 0).then_some(Reverse(component)))
-        .collect::<BinaryHeap<_>>();
+    let component_order = ProcedureDependencyComponentOrder::new(graph, components, records.len())
+        .ok_or(ProcedureSummaryBindingError::InvalidRecursion)?;
+    let component_by_node = &component_order.component_by_node;
 
     let mut key_by_node = vec![None::<ProcedureSummaryKey>; records.len()];
     let mut summaries = Vec::with_capacity(records.len());
-    let mut emitted_components = 0usize;
-    while let Some(Reverse(component)) = ready.pop() {
-        emitted_components += 1;
+    for &component in &component_order.components {
         let mut members = components[component].to_vec();
         members.sort_unstable();
         let recursive = members.len() > 1
@@ -885,7 +871,7 @@ fn build_summary_set(
                 member,
                 component,
                 graph,
-                &component_by_node,
+                component_by_node,
                 identities,
                 &key_by_node,
             );
@@ -905,7 +891,7 @@ fn build_summary_set(
                 member,
                 component,
                 graph,
-                &component_by_node,
+                component_by_node,
                 identities,
                 &key_by_node,
             );
@@ -980,18 +966,6 @@ fn build_summary_set(
             .map_err(|source| invalid_summary(summary, source))?;
             summaries.push(lowered);
         }
-
-        for &dependent in &dependents_by_component[component] {
-            remaining_dependencies[dependent] = remaining_dependencies[dependent]
-                .checked_sub(1)
-                .ok_or(ProcedureSummaryBindingError::InvalidRecursion)?;
-            if remaining_dependencies[dependent] == 0 {
-                ready.push(Reverse(dependent));
-            }
-        }
-    }
-    if emitted_components != components.len() {
-        return Err(ProcedureSummaryBindingError::InvalidRecursion);
     }
 
     ExternalSemanticSummarySet::try_new(summaries, compatibility).map_err(|error| match error {
@@ -1201,6 +1175,9 @@ fn lower_concurrency_effect(
     let event = SummaryEventKey::from_digest(StableDigest::from_array(hasher.finish()));
     let lower = |input| lower_input(summary, binding, input);
     let path = |input| lower(input).map(SummaryConcurrencyAccessPath::port);
+    let model_port = |port| {
+        lower_model_port(summary, binding, locations, port).map(SummaryConcurrencyAccessPath::port)
+    };
     let identity = |input: &CompiledSummaryInput| match input {
         CompiledSummaryInput::Receiver {} => SummaryConcurrencySubjectIdentity::Backing,
         CompiledSummaryInput::Parameter { .. } => SummaryConcurrencySubjectIdentity::Value,
@@ -1373,6 +1350,29 @@ fn lower_concurrency_effect(
                 identity: identity(timer),
             }
         }
+        CompiledConcurrencyEffect::ChannelClose { channel, fresh } => {
+            SummaryConcurrencyEffectKind::ChannelClose {
+                channel: model_port(channel)?,
+                identity: SummaryConcurrencySubjectIdentity::Backing,
+                fresh: *fresh,
+            }
+        }
+        CompiledConcurrencyEffect::ChannelCloseAsync { channel, fresh } => {
+            SummaryConcurrencyEffectKind::ChannelCloseAsync {
+                channel: model_port(channel)?,
+                identity: SummaryConcurrencySubjectIdentity::Backing,
+                fresh: *fresh,
+            }
+        }
+        CompiledConcurrencyEffect::ChannelClosePropagate {
+            source,
+            target,
+            target_fresh,
+        } => SummaryConcurrencyEffectKind::ChannelClosePropagate {
+            source: model_port(source)?,
+            target: model_port(target)?,
+            target_fresh: *target_fresh,
+        },
         CompiledConcurrencyEffect::SyncMap {
             map,
             key,
@@ -1497,6 +1497,18 @@ fn lower_output(
     }
 }
 
+fn lower_model_port(
+    summary: &CompiledProcedureSummary,
+    binding: &ExactProcedureSummaryTargetBinding,
+    locations: &HashMap<&str, (CompiledSummaryLocationKind, SummaryLocationKey)>,
+    port: &CompiledSummaryPort,
+) -> Result<SummaryPort, ProcedureSummaryBindingError> {
+    match port {
+        CompiledSummaryPort::Input { input } => lower_input(summary, binding, input),
+        CompiledSummaryPort::Output { output } => lower_output(summary, binding, locations, output),
+    }
+}
+
 fn lower_location(
     summary: &CompiledProcedureSummary,
     locations: &HashMap<&str, (CompiledSummaryLocationKind, SummaryLocationKey)>,
@@ -1537,28 +1549,149 @@ fn invalid_summary(
     }
 }
 
+#[cfg(test)]
+mod external_flow_selection_tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    fn summary() -> CompiledProcedureSummary {
+        CompiledProcedureSummary {
+            id: "same-record".to_owned(),
+            model_id: "same-model".to_owned(),
+            contract_version: 1,
+            content_sha256: "a".repeat(64),
+            target: CompiledProcedureTarget {
+                path: "lib.rs".to_owned(),
+                symbol: "module::target".to_owned(),
+                has_receiver: false,
+                variadic: false,
+                parameter_count: 0,
+                formals: Vec::new(),
+            },
+            completeness: Completeness::Complete,
+            ordinary_heap_unchanged: false,
+            no_concurrency_effects: false,
+            covers_overrides: true,
+            normal_continuation_absent: false,
+            normal_result_count: Some(1),
+            locations: Vec::new(),
+            transfers: Vec::new(),
+            transfer_partitions: Vec::new(),
+            effects: Vec::new(),
+            concurrency_effects: Vec::new(),
+            returned_callables: Vec::new(),
+            declared_effects: Vec::new(),
+            preconditions: None,
+            result_contracts: Vec::new(),
+            result_use_obligations: Vec::new(),
+            conditional_result_refinements: Vec::new(),
+            conditional_indirect_writes: Vec::new(),
+            normal_return_refinements: Vec::new(),
+            normal_return_type_refinements: Vec::new(),
+            class_decorator_identity: None,
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "cfc6036c2611: fixed agreement that omitted the normal-continuation claim; this regression prevents conflicting flow summaries from being deduplicated."
+    )]
+    fn conflicting_flow_summaries_must_match_normal_continuation_claim() {
+        let first = summary();
+        let mut candidate = first.clone();
+        candidate.normal_continuation_absent = true;
+
+        assert_eq!(candidate.target, first.target);
+        assert!(!conflicting_flow_candidates_agree(&first, [&candidate]));
+    }
+}
+
 #[derive(Debug)]
-struct ProcedureDependencyGraph {
-    edges: Vec<(usize, usize)>,
-    outgoing: Vec<Vec<usize>>,
-    incoming: Vec<Vec<usize>>,
+pub(crate) struct ProcedureDependencyGraph {
+    pub(crate) edges: Vec<(usize, usize)>,
+    pub(crate) outgoing: Vec<Vec<usize>>,
+    pub(crate) incoming: Vec<Vec<usize>>,
+}
+
+pub(crate) struct ProcedureDependencyComponentOrder {
+    pub(crate) component_by_node: Vec<usize>,
+    pub(crate) components: Vec<usize>,
+}
+
+impl ProcedureDependencyComponentOrder {
+    pub(crate) fn new(
+        graph: &ProcedureDependencyGraph,
+        components: &[Box<[usize]>],
+        node_count: usize,
+    ) -> Option<Self> {
+        let mut component_by_node = vec![0usize; node_count];
+        for (component, members) in components.iter().enumerate() {
+            for &member in members.iter() {
+                component_by_node[member] = component;
+            }
+        }
+        let mut dependencies_by_component = vec![Vec::<usize>::new(); components.len()];
+        for (component, members) in components.iter().enumerate() {
+            for &member in members.iter() {
+                dependencies_by_component[component].extend(
+                    graph.outgoing[member]
+                        .iter()
+                        .map(|edge| component_by_node[graph.edges[*edge].1])
+                        .filter(|&target| target != component),
+                );
+            }
+            dependencies_by_component[component].sort_unstable();
+            dependencies_by_component[component].dedup();
+        }
+        let mut dependents_by_component = vec![Vec::<usize>::new(); components.len()];
+        for (dependent, dependencies) in dependencies_by_component.iter().enumerate() {
+            for &dependency in dependencies {
+                dependents_by_component[dependency].push(dependent);
+            }
+        }
+        for dependents in &mut dependents_by_component {
+            dependents.sort_unstable();
+            dependents.dedup();
+        }
+        let mut remaining_dependencies = dependencies_by_component
+            .iter()
+            .map(Vec::len)
+            .collect::<Vec<_>>();
+        let mut ready = remaining_dependencies
+            .iter()
+            .enumerate()
+            .filter_map(|(component, &remaining)| (remaining == 0).then_some(Reverse(component)))
+            .collect::<BinaryHeap<_>>();
+        let mut ordered_components = Vec::with_capacity(components.len());
+        while let Some(Reverse(component)) = ready.pop() {
+            ordered_components.push(component);
+            for &dependent in &dependents_by_component[component] {
+                let remaining = remaining_dependencies[dependent].checked_sub(1)?;
+                remaining_dependencies[dependent] = remaining;
+                if remaining_dependencies[dependent] == 0 {
+                    ready.push(Reverse(dependent));
+                }
+            }
+        }
+        (ordered_components.len() == components.len()).then_some(Self {
+            component_by_node,
+            components: ordered_components,
+        })
+    }
 }
 
 impl ProcedureDependencyGraph {
-    fn new(dependencies: Vec<Vec<usize>>) -> Self {
-        let mut edges = dependencies
-            .iter()
-            .enumerate()
-            .flat_map(|(caller, callees)| callees.iter().map(move |&callee| (caller, callee)))
-            .collect::<Vec<_>>();
-        edges.sort_unstable();
-        edges.dedup();
-        let mut outgoing = vec![Vec::new(); dependencies.len()];
-        let mut incoming = vec![Vec::new(); dependencies.len()];
-        for (edge, &(caller, callee)) in edges.iter().enumerate() {
-            outgoing[caller].push(edge);
-            incoming[callee].push(edge);
-        }
+    pub(crate) fn new(dependencies: Vec<Vec<usize>>) -> Self {
+        let (edges, outgoing, incoming) =
+            brokk_bifrost_analysis::analyzer::semantic::cfg_algorithms::dense_bidirectional_adjacency(
+                dependencies.len(),
+                dependencies
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(caller, callees)| {
+                        callees.iter().map(move |&callee| (caller, callee))
+                    }),
+            );
         Self {
             edges,
             outgoing,
@@ -1576,11 +1709,17 @@ impl DenseBidirectionalGraph for ProcedureDependencyGraph {
     }
 
     fn node_at(&self, index: usize) -> Option<Self::Node> {
-        (index < self.outgoing.len()).then_some(index)
+        brokk_bifrost_analysis::analyzer::semantic::cfg_algorithms::dense_usize_node_at(
+            &self.outgoing,
+            index,
+        )
     }
 
     fn node_index(&self, node: Self::Node) -> Option<usize> {
-        (node < self.outgoing.len()).then_some(node)
+        brokk_bifrost_analysis::analyzer::semantic::cfg_algorithms::dense_usize_node_index(
+            &self.outgoing,
+            node,
+        )
     }
 
     fn successors(
@@ -1597,13 +1736,17 @@ impl DenseBidirectionalGraph for ProcedureDependencyGraph {
         &self,
         node: Self::Node,
     ) -> impl DoubleEndedIterator<Item = (Self::Edge, Self::Node)> + ExactSizeIterator + '_ {
-        self.incoming[node]
-            .iter()
-            .copied()
-            .map(|edge| (edge, self.edges[edge].0))
+        brokk_bifrost_analysis::analyzer::semantic::cfg_algorithms::dense_usize_predecessors(
+            &self.incoming,
+            &self.edges,
+            node,
+        )
     }
 
     fn edge_endpoints(&self, edge: Self::Edge) -> Option<(Self::Node, Self::Node)> {
-        self.edges.get(edge).copied()
+        brokk_bifrost_analysis::analyzer::semantic::cfg_algorithms::dense_usize_edge_endpoints(
+            &self.edges,
+            edge,
+        )
     }
 }

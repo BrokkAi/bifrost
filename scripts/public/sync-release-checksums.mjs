@@ -19,6 +19,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { archiveName } from "../lib/release-archive.mjs";
 
 import { SUPPORTED_TARGETS, parseSha256 } from "../../plugins/bifrost-agent/bin/bifrost-launcher.mjs";
 import { readCargoVersion, syncReleaseVersion } from "./release-version.mjs";
@@ -48,7 +49,7 @@ const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
 
 export function archiveNameFor(target, version) {
   const suffix = target.includes("windows") ? "zip" : "tar.gz";
-  return `bifrost-v${version}-${target}.${suffix}`;
+  return archiveName(target, version, `.${suffix}`);
 }
 
 // Sidecars are parsed with the launcher's own parseSha256 rather than a local

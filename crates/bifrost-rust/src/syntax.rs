@@ -48,11 +48,31 @@ pub fn parent_outside_attributes(mut node: Node<'_>) -> Option<Node<'_>> {
 /// ungrouped sibling scan or pre-0.24 fallback is involved. Inline member and
 /// parameter groups follow the exact owning list production.
 pub fn outer_attributes<'tree>(node: Node<'tree>) -> impl Iterator<Item = Node<'tree>> {
-    let attributes = attached_attributes(node);
+    let parent = (!ATTRIBUTE_WRAPPER_KINDS.contains(&node.kind()))
+        .then(|| node.parent())
+        .flatten();
+    outer_attributes_with_parent(node, parent)
+}
+
+pub(crate) fn outer_attributes_with_parent<'tree>(
+    node: Node<'tree>,
+    parent: Option<Node<'tree>>,
+) -> impl Iterator<Item = Node<'tree>> {
+    let attributes = attached_attributes(node, parent);
     RustOuterAttributes {
         attributes,
         index: 0,
     }
+}
+
+pub(crate) fn rust_path_root(mut node: Node<'_>) -> Node<'_> {
+    while matches!(node.kind(), "scoped_identifier" | "scoped_type_identifier") {
+        let Some(path) = node.child_by_field_name("path") else {
+            break;
+        };
+        node = path;
+    }
+    node
 }
 
 /// Indexed view over an associated `attributes` group, avoiding allocation in
@@ -78,13 +98,16 @@ impl<'tree> Iterator for RustOuterAttributes<'tree> {
     }
 }
 
-fn attached_attributes(node: Node<'_>) -> Option<Node<'_>> {
+fn attached_attributes<'tree>(
+    node: Node<'tree>,
+    parent: Option<Node<'tree>>,
+) -> Option<Node<'tree>> {
     // A wrapper owns its group. Payload nodes inherit only from the wrapper
     // that names them as its declaration/expression field.
     if ATTRIBUTE_WRAPPER_KINDS.contains(&node.kind()) {
         return node.child_by_field_name("attributes");
     }
-    if let Some(parent) = node.parent()
+    if let Some(parent) = parent
         && ATTRIBUTE_WRAPPER_KINDS.contains(&parent.kind())
         && (parent.child_by_field_name("declaration") == Some(node)
             || parent.child_by_field_name("expression") == Some(node))
@@ -94,7 +117,11 @@ fn attached_attributes(node: Node<'_>) -> Option<Node<'_>> {
     // These productions carry an unnamed attributes child on the owner.
     if matches!(
         node.kind(),
-        "enum_variant" | "match_arm" | "field_initializer" | "shorthand_field_initializer"
+        "enum_variant"
+            | "match_arm"
+            | "field_initializer"
+            | "shorthand_field_initializer"
+            | "field_pattern"
     ) {
         let mut cursor = node.walk();
         return node
@@ -103,7 +130,7 @@ fn attached_attributes(node: Node<'_>) -> Option<Node<'_>> {
     }
     // Delimited lists put one grouped attribute node before its owned entry.
     // Require the exact list production, and never cross a comma or item.
-    let parent = node.parent()?;
+    let parent = parent?;
     if !matches!(
         parent.kind(),
         "field_declaration_list"
@@ -137,7 +164,18 @@ pub fn attribute_item_has_path(attribute_item: Node<'_>, source: &str, expected:
     let Some(path) = attribute.named_child(0) else {
         return false;
     };
+    rust_attribute_path_is(path, source, expected)
+}
+
+pub(crate) fn rust_attribute_path_is(path: Node<'_>, source: &str, expected: &str) -> bool {
     source.get(path.start_byte()..path.end_byte()) == Some(expected)
+}
+
+pub(crate) fn rust_identifier_kind_like(kind: &str) -> bool {
+    matches!(
+        kind,
+        "identifier" | "reserved_identifier" | "_reserved_identifier"
+    )
 }
 
 /// Whether `node` has an attached attribute whose path is exactly `expected`.
@@ -149,6 +187,7 @@ pub fn item_has_path_attribute(node: Node<'_>, source: &str, expected: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
     use tree_sitter::{Parser, Tree};
 
     fn parse(source: &str) -> Tree {
@@ -166,16 +205,10 @@ mod tests {
     }
 
     fn named_descendant<'tree>(root: Node<'tree>, kind: &str) -> Node<'tree> {
-        let mut stack = vec![root];
-        while let Some(node) = stack.pop() {
-            if node.kind() == kind {
-                return node;
-            }
-            let mut cursor = node.walk();
-            let children = node.named_children(&mut cursor).collect::<Vec<_>>();
-            stack.extend(children.into_iter().rev());
-        }
-        panic!("expected {kind}")
+        brokk_bifrost_core::analyzer::tree_walk::first_named_descendant_of_kind_inclusive(
+            root, kind,
+        )
+        .unwrap_or_else(|| panic!("expected {kind}"))
     }
 
     fn attribute_paths<'tree>(node: Node<'tree>, source: &str) -> Vec<String> {
@@ -230,5 +263,56 @@ mod tests {
                 next = node.next_named_sibling();
             }
         }
+    }
+
+    #[test]
+    #[hardwon("deb7edda43fc: valid cfg attributes on struct-pattern fields caused parser recovery")]
+    fn struct_pattern_fields_own_attributes_and_preserve_binding_fields() {
+        let source = r#"fn inspect(value: Pair) {
+            let Pair {
+                #[cfg(test)] left,
+                #[cfg(feature = "probe")] right: renamed,
+                plain,
+                ..
+            } = value;
+        }"#;
+        let tree = parse(source);
+        let pattern = named_descendant(tree.root_node(), "struct_pattern");
+        let fields = brokk_bifrost_core::analyzer::tree_walk::named_children_iter(pattern)
+            .filter(|node| node.kind() == "field_pattern")
+            .collect::<Vec<_>>();
+        assert_eq!(fields.len(), 3);
+        for (field, expected_name, expected_kind) in [
+            (fields[0], "left", "shorthand_field_identifier"),
+            (fields[1], "right", "field_identifier"),
+            (fields[2], "plain", "shorthand_field_identifier"),
+        ] {
+            let name = field
+                .child_by_field_name("name")
+                .expect("pattern field name");
+            assert_eq!(name.kind(), expected_kind);
+            assert_eq!(name.utf8_text(source.as_bytes()).unwrap(), expected_name);
+            assert!(outer_attributes(name).next().is_none());
+        }
+        assert_eq!(attribute_paths(fields[0], source), ["cfg"]);
+        assert_eq!(attribute_paths(fields[1], source), ["cfg"]);
+        assert!(outer_attributes(fields[2]).next().is_none());
+        let renamed = fields[1]
+            .child_by_field_name("pattern")
+            .expect("renamed binding");
+        assert_eq!(renamed.kind(), "identifier");
+        assert_eq!(renamed.utf8_text(source.as_bytes()).unwrap(), "renamed");
+
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let malformed = parser
+            .parse(
+                "fn inspect(value: Pair) { let Pair { #[cfg(test)] left plain } = value; }",
+                None,
+            )
+            .unwrap();
+        assert!(malformed.root_node().has_error());
     }
 }

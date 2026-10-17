@@ -1,12 +1,35 @@
 //! Java method inheritance precedes invocation applicability. All state here
 //! belongs to one selected query; declarations remain indexed source rows.
 
-use super::super::fact_source::{JavaInheritanceDeclaration, JavaInheritanceDeclarationKind};
+use super::super::fact_source::{
+    JavaInheritanceDeclaration, JavaInheritanceDeclarationKind,
+    language_can_close_interface_object_frontier, language_implicit_root_member_names,
+};
 use super::*;
+use crate::analyzer::usages::call_conversion::JavaPrimitive;
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 
+/// The lookup identities of the methods `java.lang.Object` declares, as the
+/// shared-name digests the lowering interns for a callable lookup. A qualified
+/// route names its callee only by that identity, so an absent member is
+/// compared with the Object method names through their digests.
+static JAVA_OBJECT_METHOD_LOOKUP_DIGESTS: std::sync::LazyLock<HashSet<[u8; 32]>> =
+    std::sync::LazyLock::new(|| {
+        language_implicit_root_member_names(Language::Java)
+            .iter()
+            .map(|name| {
+                super::super::local_identity::ResolutionLookupSemanticRecipe::new(
+                    Language::Java,
+                    ResolutionNamespace::Callable,
+                    name,
+                )
+                .name_digest()
+            })
+            .collect()
+    });
+
 impl FactReadSession<'_> {
-    fn java_declarations(
+    pub(super) fn java_declarations(
         &mut self,
         definitions: &[SemanticId],
     ) -> StoreResult<Option<Vec<JavaInheritanceDeclaration>>> {
@@ -47,58 +70,459 @@ impl FactReadSession<'_> {
 }
 
 impl FactEvaluation<'_, '_> {
+    pub(super) fn java_call_candidate_type_frontier_reasons(
+        &mut self,
+        obligation: &LoweredCallApplicabilityObligation,
+        signature: &LoweredCallableSignatureProperty,
+        states: &StateMap,
+    ) -> StoreResult<Option<Option<BTreeSet<SemanticId>>>> {
+        if obligation.explicit_type_argument_count() != 0
+            || signature.completion() != &ResolutionCompletion::Complete
+            || signature.type_parameter_count() != 0
+            || signature
+                .parameters()
+                .iter()
+                .any(|parameter| parameter.repeated())
+            || signature.parameters().len() != obligation.argument_slots().len()
+        {
+            return Ok(Some(None));
+        }
+        let mut reasons = BTreeSet::new();
+        for (&argument, parameter) in obligation
+            .argument_slots()
+            .iter()
+            .zip(signature.parameters())
+        {
+            if self.poll_cancelled() {
+                return Ok(None);
+            }
+            for slot in [argument, parameter.slot()] {
+                let Some(state) = states.get(&slot) else {
+                    return Ok(Some(None));
+                };
+                if state
+                    .possible_values()
+                    .iter()
+                    .any(|value| !matches!(value, ResolutionSlotValue::Runtime { .. }))
+                    || (state.completion() == &ResolutionCompletion::Complete
+                        && state.possible_values().is_empty())
+                {
+                    return Ok(Some(None));
+                }
+                if let ResolutionCompletion::Incomplete(incomplete) = state.completion() {
+                    for reason in incomplete.iter() {
+                        if self.poll_cancelled() {
+                            return Ok(None);
+                        }
+                        let ResolutionIncompleteReason::UnsupportedSemantic(reason) = reason else {
+                            return Ok(Some(None));
+                        };
+                        reasons.insert(*reason);
+                    }
+                }
+            }
+        }
+        Ok(Some(Some(reasons)))
+    }
+
+    /// The traversal reasons of this call that only an unindexed
+    /// `java.lang.Object` can answer, when no candidate or called name can be
+    /// an Object method.
+    ///
+    /// An implicit Object superclass edge (a class with no `extends`) adds only
+    /// the Object methods to a lookup, so for any other name its traversal
+    /// reason does not keep the candidate set open. The edge is identified by
+    /// its supertype row, not by an owner path: a bare call walks the
+    /// hierarchy of every enclosing class and records no owner path at all.
+    /// The called name is the name of the candidates; a call with no candidate
+    /// names no declaration, so its qualified route names the callee through
+    /// its lookup identity instead. An interface with no superinterface
+    /// implicitly declares the Object methods (JLS 9.2), which closes the
+    /// reason on the interface declaration the same way.
+    pub(super) fn java_member_implicit_object_gap_reasons(
+        &mut self,
+        language: Language,
+        reference: SemanticId,
+        answer: &ResolutionAnswer,
+        completion: &ResolutionCompletion,
+        previous_states: &StateMap,
+    ) -> StoreResult<Option<BTreeSet<SemanticId>>> {
+        let mut reasons = BTreeSet::new();
+        if !self.session.typed_source.selection_has_jvm_semantics() {
+            return Ok(Some(reasons));
+        }
+        let mut owners = BTreeSet::new();
+        let mut member_owners = BTreeSet::new();
+        if answer.targets().is_empty() {
+            if language != Language::Java {
+                return Ok(Some(reasons));
+            }
+            let Some(receivers) =
+                self.java_absent_member_receiver_owners(reference, previous_states)?
+            else {
+                return Ok(None);
+            };
+            if receivers.is_empty() {
+                return Ok(Some(reasons));
+            }
+            member_owners.extend(receivers.iter().copied());
+            owners = receivers;
+        }
+        for &target in answer.targets() {
+            match self.member_owner_by_target.get(&target) {
+                Some(Some(owner)) => {
+                    let Some(root) = owner.owner_path.first().copied() else {
+                        return Ok(Some(reasons));
+                    };
+                    owners.insert(root);
+                    member_owners.insert(owner.owner());
+                }
+                // A member that Java's lexical lookup of a bare call reached
+                // records no owner path. It has no receiver type to test for
+                // the interface rule, and the edge rule below needs none.
+                None if language == Language::Java => {}
+                Some(None) | None => return Ok(Some(reasons)),
+            }
+        }
+        let mut requested = answer.targets().iter().copied().collect::<BTreeSet<_>>();
+        requested.extend(owners.iter().copied());
+        requested.extend(member_owners.iter().copied());
+        let Some(declarations) = self
+            .session
+            .java_declarations(&requested.into_iter().collect::<Vec<_>>())?
+        else {
+            self.cancellation_observed = true;
+            return Ok(None);
+        };
+        let declarations = declarations
+            .into_iter()
+            .map(|row| (row.definition, row))
+            .collect::<HashMap<_, _>>();
+        let mut call_name: Option<&str> = None;
+        for &target in answer.targets() {
+            if self.poll_cancelled() {
+                return Ok(None);
+            }
+            let Some(method) = declarations.get(&target) else {
+                return Ok(Some(reasons));
+            };
+            // An implicit java.lang.Object edge cannot add a same-name
+            // candidate when none of the source methods use an Object method
+            // name. Static source methods are covered too: the Object method
+            // inventory is name-based, and static/instance kind cannot make a
+            // differently named method applicable.
+            if !matches!(&method.kind, JavaInheritanceDeclarationKind::Method { .. })
+                || language_implicit_root_member_names(Language::Java)
+                    .contains(&method.name.as_str())
+                || call_name.is_some_and(|name| name != method.name.as_str())
+            {
+                return Ok(Some(reasons));
+            }
+            call_name.get_or_insert(method.name.as_str());
+        }
+
+        let ResolutionCompletion::Incomplete(incomplete) = completion else {
+            return Ok(Some(reasons));
+        };
+        let candidates = incomplete
+            .iter()
+            .filter_map(|reason| match reason {
+                ResolutionIncompleteReason::UnsupportedSemantic(reason) => Some(*reason),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        // A traversal reason is about the supertype edge at its source site.
+        // The edge is the implicit Object superclass of some class when its
+        // supertype row says so, whichever class's hierarchy the lookup walked.
+        let mut edge_reasons = Vec::new();
+        for chunk in candidates.chunks(MAX_TYPED_FACT_REQUESTS_PER_BATCH) {
+            if self.poll_cancelled() {
+                return Ok(None);
+            }
+            let read = self.session.gap_reason_provenance_for_reasons(chunk)?;
+            let Some(provenance) = self.accept_session_read(read) else {
+                return Ok(None);
+            };
+            for provenance in provenance {
+                if self.poll_cancelled() {
+                    return Ok(None);
+                }
+                let provenance = provenance.get(self.session);
+                if provenance.origin()
+                    != LoweringGapOrigin::Extracted(
+                        ResolutionGapKind::UnsupportedHierarchyTraversal,
+                    )
+                {
+                    continue;
+                }
+                let source_site = super::super::fact_lowering::site_semantic(
+                    provenance.fragment(),
+                    provenance.source_site(),
+                );
+                edge_reasons.push((source_site, provenance.reason()));
+            }
+        }
+        // A lexical search can exhaust an inner interface before selecting an
+        // enclosing class member. Its implicit Object frontier still belongs to
+        // this same name lookup, even though no selected method is owned by it.
+        // A source reference must have an exhaustive unique hierarchy binding
+        // before the leaf-interface proof can discharge its traversal marker.
+        let mut interface_references = HashMap::default();
+        if language == Language::Java {
+            for &(reference, reason) in &edge_reasons {
+                if !self.hierarchy.reference_ready(reference) {
+                    continue;
+                }
+                let Some((targets, completion)) =
+                    self.cached_hierarchy_reference_parts(reference, &BTreeSet::from([reason]))?
+                else {
+                    return Ok(None);
+                };
+                if completion == ResolutionCompletion::Complete && targets.len() == 1 {
+                    interface_references.insert(reference, targets[0]);
+                }
+            }
+        }
+        let mut interface_object_gaps = BTreeSet::new();
+        if language_can_close_interface_object_frontier(language) {
+            let mut candidates = member_owners
+                .iter()
+                .copied()
+                .filter(|owner| owners.contains(owner))
+                .collect::<BTreeSet<_>>();
+            if language == Language::Java {
+                candidates.extend(edge_reasons.iter().map(|&(site, _)| site));
+                candidates.extend(interface_references.values().copied());
+            }
+            let Some(rows) = self
+                .session
+                .java_declarations(&candidates.into_iter().collect::<Vec<_>>())?
+            else {
+                self.cancellation_observed = true;
+                return Ok(None);
+            };
+            let interfaces = rows
+                .into_iter()
+                .filter_map(|row| {
+                    matches!(
+                        row.kind,
+                        JavaInheritanceDeclarationKind::Type {
+                            is_interface: true,
+                            ..
+                        }
+                    )
+                    .then_some(row.definition)
+                })
+                .collect::<Vec<_>>();
+            if !interfaces.is_empty() {
+                let read = self.session.supertypes_for_definitions(&interfaces)?;
+                let Some(supertypes) = self.accept_session_read(read) else {
+                    return Ok(None);
+                };
+                let authored = supertypes
+                    .iter()
+                    .map(|row| row.get(self.session).row().definition())
+                    .collect::<HashSet<_>>();
+                interface_object_gaps.extend(
+                    interfaces
+                        .into_iter()
+                        .filter(|owner| !authored.contains(owner)),
+                );
+            }
+        }
+        let proven_interface_references = interface_references
+            .into_iter()
+            .filter_map(|(reference, target)| {
+                interface_object_gaps.contains(&target).then_some(reference)
+            })
+            .collect::<Vec<_>>();
+        interface_object_gaps.extend(proven_interface_references);
+        let edge_references = edge_reasons
+            .iter()
+            .map(|&(reference, _)| reference)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut implicit_object_references = HashSet::default();
+        for chunk in edge_references.chunks(MAX_TYPED_FACT_REQUESTS_PER_BATCH) {
+            if self.poll_cancelled() {
+                return Ok(None);
+            }
+            let read = self.session.supertypes_for_references(chunk)?;
+            let Some(supertypes) = self.accept_session_read(read) else {
+                return Ok(None);
+            };
+            implicit_object_references.extend(
+                supertypes
+                    .iter()
+                    .map(|row| row.get(self.session).row())
+                    .filter(|row| row.kind() == ResolutionSupertypeKind::ImplicitSuperclass)
+                    .map(|row| row.reference()),
+            );
+        }
+        reasons.extend(
+            edge_reasons
+                .into_iter()
+                .filter(|(reference, _)| {
+                    implicit_object_references.contains(reference)
+                        || interface_object_gaps.contains(reference)
+                })
+                .map(|(_, reason)| reason),
+        );
+        Ok(Some(reasons))
+    }
+
+    /// The static types of the receiver of a qualified Java call that found no
+    /// member, when the receiver is exact and the called name is not a method of
+    /// `java.lang.Object`. Empty means no claim: an unqualified call, an open
+    /// member surface, a receiver that is not one complete value, or a name
+    /// that an implicit Object edge could still supply. `None` reports
+    /// cancellation.
+    fn java_absent_member_receiver_owners(
+        &mut self,
+        reference: SemanticId,
+        previous_states: &StateMap,
+    ) -> StoreResult<Option<BTreeSet<SemanticId>>> {
+        let read = self.session.routes_for_references(&[reference])?;
+        let Some(routes) = self.accept_session_read(read) else {
+            return Ok(None);
+        };
+        let mut owners = BTreeSet::new();
+        for route in routes {
+            if self.poll_cancelled() {
+                return Ok(None);
+            }
+            let (namespace, open_member_surface, qualifier_slot, lookup) = {
+                let route = route.get(self.session).row();
+                (
+                    route.namespace(),
+                    route.open_member_surface(),
+                    route.qualifier_slot(),
+                    route.lookup(),
+                )
+            };
+            let Some(qualifier) = previous_states.get(&qualifier_slot) else {
+                return Ok(Some(BTreeSet::new()));
+            };
+            if namespace != ResolutionNamespace::Callable
+                || open_member_surface
+                || qualifier.completion() != &ResolutionCompletion::Complete
+                || qualifier.possible_values().is_empty()
+                || qualifier
+                    .possible_values()
+                    .iter()
+                    .any(|value| value.ty().indirection() != 0)
+            {
+                return Ok(Some(BTreeSet::new()));
+            }
+            let digest = self
+                .session
+                .lexical_source
+                .shared_name_digest_for_identity(lookup, self.cancellation)?;
+            if self.poll_cancelled() {
+                return Ok(None);
+            }
+            if digest.is_none_or(|digest| JAVA_OBJECT_METHOD_LOOKUP_DIGESTS.contains(&digest)) {
+                return Ok(Some(BTreeSet::new()));
+            }
+            owners.extend(
+                qualifier
+                    .possible_values()
+                    .iter()
+                    .map(|value| value.ty().identity()),
+            );
+        }
+        Ok(Some(owners))
+    }
+
     pub(super) fn java_method_origin_owners(
         &mut self,
         selection: &QualifiedOriginSelection,
         rust_owners: &BTreeSet<SemanticId>,
     ) -> StoreResult<Option<BTreeSet<SemanticId>>> {
-        // The Rust classifier already proved these owners' language. Avoid
-        // another source read on the existing Rust point path.
-        let owners = selection
-            .origins
-            .iter()
-            .filter(|origin| {
-                origin.shape.namespace == ResolutionNamespace::Callable
-                    && origin.shape.receiver_indirection == 0
-                    && !rust_owners.contains(&origin.owner)
-            })
-            .map(|origin| origin.owner)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let Some(rows) = self.session.java_declarations(&owners)? else {
-            self.cancellation_observed = true;
-            return Ok(None);
-        };
-        Ok(Some(
-            rows.into_iter()
-                .filter_map(|row| {
-                    matches!(row.kind, JavaInheritanceDeclarationKind::Type { .. })
-                        .then_some(row.definition)
-                })
-                .collect(),
-        ))
+        if !self.session.typed_source.selection_has_java_semantics() {
+            return Ok(Some(BTreeSet::new()));
+        }
+        self.indexed_jvm_type_origin_owners(selection, rust_owners)
     }
 
-    pub(super) fn filter_java_inherited_methods(
+    pub(crate) fn filter_java_inherited_methods(
         &mut self,
         answer: ResolutionAnswer,
+        reference: SemanticId,
         signatures: &HashMap<
             SemanticId,
             InternedFactRow<SelectedTypedRow<LoweredCallableSignatureProperty>>,
         >,
         previous_states: &StateMap,
     ) -> StoreResult<Option<ResolutionAnswer>> {
-        let java = answer.targets().iter().any(|target| {
+        // Replay also explores shadowed enclosing scopes. Only a bridge in a
+        // surviving witness can attribute the call's selected receiver search.
+        for &target in answer.targets() {
+            let Some(origins) = self
+                .hierarchy
+                .java_lexical_member_owners
+                .get(&(reference, target))
+            else {
+                continue;
+            };
+            let mut selected: Option<Option<FactMemberOwner>> = None;
+            for origin in origins {
+                let survives = answer.witnesses().iter().any(|witness| {
+                    witness.target() == target
+                        && (origin.steps.is_empty()
+                            || witness
+                                .steps()
+                                .windows(origin.steps.len())
+                                .any(|steps| steps == origin.steps.as_ref()))
+                });
+                if !survives {
+                    continue;
+                }
+                match &mut selected {
+                    None => selected = Some(Some(origin.owner.clone())),
+                    Some(owner) if owner.as_ref() != Some(&origin.owner) => *owner = None,
+                    Some(_) => {}
+                }
+            }
+            if let Some(owner) = selected {
+                self.member_owner_by_target.insert(target, owner);
+            }
+        }
+        // Bare references have no receiver route. Qualified lookups own their
+        // attribution; reconstructing it from a declaration would replace the
+        // receiver search with the declaring type.
+        let unqualified = self
+            .reference_site_metadata(reference)
+            .is_some_and(|metadata| metadata.unqualified());
+        let missing = answer
+            .targets()
+            .iter()
+            .copied()
+            .filter(|target| unqualified && !self.member_owner_by_target.contains_key(target))
+            .collect::<Vec<_>>();
+        if !self.ensure_hierarchy_member_owner_metadata(&missing)? {
+            return Ok(None);
+        }
+        for target in missing {
+            let Some(ExactMemberOwnerMetadata::Unique(row)) =
+                self.hierarchy.member_owner_metadata.get(&target)
+            else {
+                continue;
+            };
+            let row = row.get(self.session).row();
+            let (owner, kind) = (row.owner_definition(), row.kind());
+            if kind == ResolutionMemberKind::Method {
+                self.record_member_owner(target, kind, Box::new([owner]), false);
+            }
+        }
+        // Constructors and non-member callables do not participate in method
+        // inheritance. Lexical methods now have the same attribution as routes.
+        if !answer.targets().iter().any(|target| {
             self.member_owner_by_target
                 .get(target)
-                .and_then(Option::as_ref)
-                .and_then(|owner| owner.owner_path.first())
-                .and_then(|root| self.session.java_inheritance_declarations.get(root))
-                .and_then(Option::as_ref)
-                .is_some_and(|row| matches!(row.kind, JavaInheritanceDeclarationKind::Type { .. }))
-        });
-        if !java {
+                .is_some_and(Option::is_some)
+        }) {
             return Ok(Some(answer));
         }
         let mut requested = BTreeSet::new();
@@ -156,7 +580,10 @@ impl FactEvaluation<'_, '_> {
             if is_static
                 && matches!(
                     declaration.kind,
-                    JavaInheritanceDeclarationKind::Type { is_interface: true }
+                    JavaInheritanceDeclarationKind::Type {
+                        is_interface: true,
+                        ..
+                    }
                 )
             {
                 removed.insert(target);
@@ -183,72 +610,72 @@ impl FactEvaluation<'_, '_> {
             .copied()
             .filter(|target| !removed.contains(target))
             .collect::<Vec<_>>();
-        for &base in &candidates {
-            let Some(Some(base_owner)) = self.member_owner_by_target.get(&base).cloned() else {
-                continue;
-            };
-            if base_owner.hierarchy_depth == 0 {
-                continue;
-            }
-            for &derived in &candidates {
-                if self.poll_cancelled() {
-                    return Ok(None);
-                }
-                if base == derived {
-                    continue;
-                }
-                let Some(Some(derived_owner)) = self.member_owner_by_target.get(&derived).cloned()
-                else {
-                    continue;
-                };
-                let Some(nearer) = self.java_owner_inherits(derived_owner.owner, base_owner.owner)
-                else {
-                    return Ok(None);
-                };
-                let class_over_interface = matches!(
-                    declarations.get(&base_owner.owner).map(|row| &row.kind),
-                    Some(JavaInheritanceDeclarationKind::Type { is_interface: true })
-                ) && matches!(
-                    declarations.get(&derived_owner.owner).map(|row| &row.kind),
-                    Some(JavaInheritanceDeclarationKind::Type {
-                        is_interface: false
-                    })
-                );
-                if !nearer && !class_over_interface {
-                    continue;
-                }
-                let (Some(base_signature), Some(derived_signature)) =
-                    (signatures.get(&base), signatures.get(&derived))
-                else {
-                    unresolved = true;
-                    continue;
-                };
-                let base_signature = base_signature.get(self.session).row().clone();
-                let derived_signature = derived_signature.get(self.session).row().clone();
-                match self.java_same_method_signature(
-                    &base_signature,
-                    &derived_signature,
-                    previous_states,
-                )? {
-                    Some(true) => {
-                        removed.insert(base);
-                        break;
-                    }
-                    Some(false) => {}
-                    None => unresolved = true,
-                }
-            }
-        }
+        // Java owns static hiding and class-over-interface precedence. The
+        // shared loop supplies the proved owner relation and compares signatures.
+        let static_methods = candidates
+            .iter()
+            .filter_map(|&target| {
+                let owner = self.member_owner_by_target.get(&target)?.as_ref()?;
+                (self.method_access_for_override(
+                    owner,
+                    declarations.get(&target).map(|row| &row.kind),
+                ) == Some(ResolutionMemberAccess::Type))
+                .then_some(target)
+            })
+            .collect::<HashSet<_>>();
+        let additional_dominance = |base: SemanticId,
+                                    derived: SemanticId,
+                                    base_owner: &FactMemberOwner,
+                                    derived_owner: &FactMemberOwner,
+                                    nearer: bool| {
+            let class_over_interface = matches!(
+                declarations.get(&base_owner.owner).map(|row| &row.kind),
+                Some(JavaInheritanceDeclarationKind::Type {
+                    is_interface: true,
+                    ..
+                })
+            ) && matches!(
+                declarations.get(&derived_owner.owner).map(|row| &row.kind),
+                Some(JavaInheritanceDeclarationKind::Type {
+                    is_interface: false,
+                    ..
+                })
+            );
+            let static_family = static_methods.contains(&base) || static_methods.contains(&derived);
+            class_over_interface || (static_family && nearer)
+        };
+        let owners = candidates
+            .iter()
+            .filter_map(|target| {
+                self.member_owner_by_target
+                    .get(target)
+                    .map(|owner| (*target, owner.clone()))
+            })
+            .collect();
+        let Some((overridden, unknown)) = self.overridden_methods(
+            &candidates,
+            &owners,
+            signatures,
+            previous_states,
+            additional_dominance,
+            Language::Java,
+        )?
+        else {
+            return Ok(None);
+        };
+        removed.extend(overridden);
+        unresolved |= unknown;
         if self.cancellation_observed {
             return Ok(None);
         }
         let (targets, witnesses, mut completion) = answer.into_parts();
         if unresolved {
-            completion = completion.combine(&incomplete(service_reason(
+            completion = completion.combine(&incomplete(canonical_service_reason(
+                self.session,
                 &*self.hierarchy,
                 b"java-method-inheritance-unproven",
-                &[self.root.as_bytes().as_slice()],
-            )));
+                &[CanonicalIdentityPart::identity(self.root)],
+            )?));
         }
         let targets = targets
             .into_vec()
@@ -263,99 +690,11 @@ impl FactEvaluation<'_, '_> {
         Ok(Some(ResolutionAnswer::new(targets, witnesses, completion)))
     }
 
-    // A recorded candidate path is just one path through an interface DAG.
-    // Dominance asks whether the declaring owners are related, independently
-    // of which shortest path discovered the base declaration first.
-    fn java_owner_inherits(&mut self, derived: SemanticId, base: SemanticId) -> Option<bool> {
-        if derived == base {
-            return Some(false);
-        }
-        let mut pending = vec![derived];
-        let mut visited = HashSet::default();
-        while let Some(owner) = pending.pop() {
-            if self.poll_cancelled() {
-                return None;
-            }
-            if !visited.insert(owner) {
-                continue;
-            }
-            let node = self
-                .hierarchy
-                .edge_node_snapshot(owner)
-                .expect("Java callable collection sealed the ancestor closure");
-            for ordinal in 0..node.edge_count {
-                if self.poll_cancelled() {
-                    return None;
-                }
-                let edge = self.hierarchy.edge_snapshot(owner, ordinal);
-                // An ambiguous supertype cannot prove overriding. Its existing
-                // hierarchy completion keeps the candidate answer incomplete.
-                if edge.target_count != 1 {
-                    continue;
-                }
-                let target = self.hierarchy.edge_target(owner, ordinal, 0);
-                if target == base {
-                    return Some(true);
-                }
-                pending.push(target);
-            }
-        }
-        Some(false)
-    }
-
-    fn java_same_method_signature(
-        &mut self,
-        base: &LoweredCallableSignatureProperty,
-        derived: &LoweredCallableSignatureProperty,
-        previous_states: &StateMap,
-    ) -> StoreResult<Option<bool>> {
-        if base.parameters().len() != derived.parameters().len() {
-            return Ok(Some(false));
-        }
-        // Erasure/substitution needs its own proof. Unknown generic signatures
-        // remain candidates with explicit incompleteness.
-        if base.type_parameter_count() != 0 || derived.type_parameter_count() != 0 {
-            return Ok(None);
-        }
-        let mut unknown = false;
-        for (left, right) in base.parameters().iter().zip(derived.parameters()) {
-            if self.poll_cancelled() {
-                return Ok(None);
-            }
-            let parameter_slots = [left.slot(), right.slot()];
-            self.demand_slot(left.slot());
-            self.demand_slot(right.slot());
-            let (Some(left), Some(right)) = (
-                previous_states.get(&left.slot()),
-                previous_states.get(&right.slot()),
-            ) else {
-                unknown = true;
-                continue;
-            };
-            if left.completion() != &ResolutionCompletion::Complete
-                || right.completion() != &ResolutionCompletion::Complete
-            {
-                if !self.java_parameter_lookups_equivalent(parameter_slots, previous_states)? {
-                    unknown = true;
-                }
-                continue;
-            }
-            let ([left], [right]) = (left.possible_values(), right.possible_values()) else {
-                unknown = true;
-                continue;
-            };
-            if left.ty() != right.ty() {
-                return Ok(Some(false));
-            }
-        }
-        Ok((!unknown).then_some(true))
-    }
-
     /// Equal ordered lookups can denote the same type while a shared external
     /// hierarchy remains open. Require unchanged identity transfers, selected
     /// access for known candidates, and the same package access domain. Other
     /// gaps (including visibility and activation) cannot supply this proof.
-    fn java_parameter_lookups_equivalent(
+    pub(super) fn java_parameter_lookups_equivalent(
         &mut self,
         slots: [SemanticId; 2],
         states: &StateMap,
@@ -493,7 +832,7 @@ impl FactEvaluation<'_, '_> {
     /// A primitive-to-reference argument needs boxing and cannot compete in
     /// that phase. Unknown conversions remain candidates until
     /// their own applicability/specificity proof is available.
-    pub(super) fn filter_java_boxing_after_strict_invocation(
+    pub(crate) fn filter_java_boxing_after_strict_invocation(
         &mut self,
         answer: ResolutionAnswer,
         obligation: &LoweredCallApplicabilityObligation,
@@ -502,16 +841,19 @@ impl FactEvaluation<'_, '_> {
             InternedFactRow<SelectedTypedRow<LoweredCallableSignatureProperty>>,
         >,
         states: &StateMap,
+        argument_receiver_gap_reason: Option<SemanticId>,
     ) -> StoreResult<Option<ResolutionAnswer>> {
-        if answer.targets().len() < 2
-            || obligation.explicit_type_argument_count() != 0
-            || completion_without_unsupported_semantic(
-                obligation.completion(),
-                obligation.applicability_reason(),
-            ) != ResolutionCompletion::Complete
-        {
+        if answer.targets().len() < 2 || obligation.explicit_type_argument_count() != 0 {
             return Ok(Some(answer));
         }
+        // Candidate method rows are query-local inputs to this native
+        // applicability operation. They are not necessarily cached by the
+        // earlier inheritance refinement (which only needs owner rows).
+        let targets = answer.targets().to_vec();
+        let Some(_) = self.session.java_declarations(&targets)? else {
+            self.cancellation_observed = true;
+            return Ok(None);
+        };
         let java_methods = answer
             .targets()
             .iter()
@@ -532,10 +874,9 @@ impl FactEvaluation<'_, '_> {
         let mut arguments = Vec::new();
         for slot in obligation.argument_slots() {
             self.demand_slot(*slot);
-            let Some(ty) = states
-                .get(slot)
-                .and_then(|state| exact_singleton_runtime_type(state))
-            else {
+            let Some(ty) = states.get(slot).and_then(|state| {
+                java_invocation_argument_type(state, argument_receiver_gap_reason)
+            }) else {
                 return Ok(Some(answer));
             };
             arguments.push(ty);
@@ -549,8 +890,7 @@ impl FactEvaluation<'_, '_> {
                 continue;
             };
             let signature = signature.get(self.session).row().clone();
-            if signature.completion() != &ResolutionCompletion::Complete
-                || signature.type_parameter_count() != 0
+            if signature.type_parameter_count() != 0
                 || signature.parameters().len() != arguments.len()
                 || signature
                     .parameters()
@@ -562,11 +902,9 @@ impl FactEvaluation<'_, '_> {
             let mut parameters = Vec::new();
             for parameter in signature.parameters() {
                 self.demand_slot(parameter.slot());
-                parameters.push(
-                    states
-                        .get(&parameter.slot())
-                        .and_then(|state| exact_singleton_runtime_type(state)),
-                );
+                parameters.push(states.get(&parameter.slot()).and_then(|state| {
+                    java_invocation_argument_type(state, argument_receiver_gap_reason)
+                }));
             }
             candidates.push((
                 target,
@@ -589,8 +927,7 @@ impl FactEvaluation<'_, '_> {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        let read = self.session.intrinsics_for_type_identities(&type_ids)?;
-        let Some(intrinsics) = self.accept_session_read(read) else {
+        let Some(intrinsics) = self.session.intrinsic_type_descriptors(&type_ids)? else {
             return Ok(None);
         };
         let mut primitives = HashMap::default();
@@ -598,14 +935,11 @@ impl FactEvaluation<'_, '_> {
             if self.poll_cancelled() {
                 return Ok(None);
             }
-            let intrinsic = intrinsic.get(self.session).row();
             if intrinsic.kind() == IntrinsicTypeKind::Primitive
                 && let Some(primitive) =
                     crate::analyzer::java::primitive_for_name(intrinsic.spelling())
             {
-                for value in intrinsic.frontier().possible_values() {
-                    primitives.insert(value.ty().identity(), primitive);
-                }
+                primitives.insert(intrinsic.identity(), primitive);
             }
         }
         let strict = candidates.iter().any(|(_, parameters, _)| {
@@ -674,6 +1008,23 @@ impl FactEvaluation<'_, '_> {
         if excluded.is_empty() {
             return Ok(Some(answer));
         }
+        if obligation.callee_reference() == self.root {
+            for &target in &excluded {
+                assert!(
+                    self.callable_candidate_applicability
+                        .insert(
+                            target,
+                            FactCallableCandidateApplicability {
+                                target,
+                                verdict: ApplicabilityVerdict::Inapplicable,
+                                reason: Some(CallableRejectionReason::RequiresBoxing),
+                            },
+                        )
+                        .is_none(),
+                    "one native Java candidate has one final applicability reason"
+                );
+            }
+        }
         let (targets, witnesses, completion) = answer.into_parts();
         let targets = targets
             .iter()
@@ -692,6 +1043,261 @@ impl FactEvaluation<'_, '_> {
         Ok(Some(ResolutionAnswer::new(targets, witnesses, completion)))
     }
 
+    /// Java primitive widening can make several fixed-arity overloads
+    /// applicable, but the JLS chooses the candidate with the most specific
+    /// primitive formals. This operation removes only candidates dominated by
+    /// an applicable sibling whose formal types widen to theirs. Exact
+    /// argument and formal primitive descriptors are required; any gap leaves
+    /// the candidate set open for the later applicability classifier.
+    pub(crate) fn filter_java_primitive_less_specific(
+        &mut self,
+        answer: ResolutionAnswer,
+        obligation: &LoweredCallApplicabilityObligation,
+        signatures: &HashMap<
+            SemanticId,
+            InternedFactRow<SelectedTypedRow<LoweredCallableSignatureProperty>>,
+        >,
+        states: &StateMap,
+        argument_receiver_gap_reason: Option<SemanticId>,
+    ) -> StoreResult<Option<ResolutionAnswer>> {
+        if answer.targets().len() < 2 || obligation.explicit_type_argument_count() != 0 {
+            return Ok(Some(answer));
+        }
+        if !answer.targets().iter().all(|target| {
+            self.session
+                .java_inheritance_declarations
+                .get(target)
+                .and_then(Option::as_ref)
+                .is_some_and(|row| {
+                    matches!(row.kind, JavaInheritanceDeclarationKind::Method { .. })
+                })
+        }) {
+            return Ok(Some(answer));
+        }
+
+        let mut arguments = Vec::with_capacity(obligation.argument_slots().len());
+        for &slot in obligation.argument_slots() {
+            self.demand_slot(slot);
+            let Some(ty) = states
+                .get(&slot)
+                .and_then(|state| {
+                    java_invocation_argument_type(state, argument_receiver_gap_reason)
+                })
+                .filter(|ty| ty.indirection() == 0)
+            else {
+                return Ok(Some(answer));
+            };
+            arguments.push(ty.identity());
+        }
+
+        let mut formal_identities = Vec::new();
+        let mut candidate_formals = Vec::with_capacity(answer.targets().len());
+        for &target in answer.targets() {
+            if self.poll_cancelled() {
+                return Ok(None);
+            }
+            let Some(signature) = signatures.get(&target) else {
+                return Ok(Some(answer));
+            };
+            let signature = signature.get(self.session).row().clone();
+            if signature.parameters().len() != arguments.len() {
+                continue;
+            }
+            if signature.completion() != &ResolutionCompletion::Complete
+                || signature.type_parameter_count() != 0
+                || signature
+                    .parameters()
+                    .iter()
+                    .any(|parameter| parameter.repeated())
+            {
+                return Ok(Some(answer));
+            }
+            let mut formals = Vec::with_capacity(signature.parameters().len());
+            for parameter in signature.parameters() {
+                self.demand_slot(parameter.slot());
+                let Some(ty) = states
+                    .get(&parameter.slot())
+                    .and_then(|state| {
+                        java_invocation_argument_type(state, argument_receiver_gap_reason)
+                    })
+                    .filter(|ty| ty.indirection() == 0)
+                else {
+                    return Ok(Some(answer));
+                };
+                formal_identities.push(ty.identity());
+                formals.push(ty.identity());
+            }
+            candidate_formals.push((target, formals));
+        }
+        if candidate_formals.is_empty() {
+            return Ok(Some(answer));
+        }
+
+        let mut identities = arguments.clone();
+        identities.extend(formal_identities);
+        identities.sort_unstable();
+        identities.dedup();
+        let Some(intrinsics) = self.session.intrinsic_type_descriptors(&identities)? else {
+            return Ok(None);
+        };
+        let mut primitives = HashMap::default();
+        for intrinsic in intrinsics {
+            if self.poll_cancelled() {
+                return Ok(None);
+            }
+            if intrinsic.kind() == IntrinsicTypeKind::Primitive
+                && let Some(primitive) =
+                    crate::analyzer::java::primitive_for_name(intrinsic.spelling())
+            {
+                primitives.insert(intrinsic.identity(), primitive);
+            }
+        }
+        if arguments
+            .iter()
+            .chain(candidate_formals.iter().flat_map(|(_, formals)| formals))
+            .any(|identity| !primitives.contains_key(identity))
+        {
+            return Ok(Some(answer));
+        }
+        let argument_primitives = arguments
+            .iter()
+            .map(|identity| primitives[identity])
+            .collect::<Vec<_>>();
+
+        let candidates = candidate_formals
+            .into_iter()
+            .map(|(target, formals)| {
+                let formals = formals
+                    .into_iter()
+                    .map(|identity| primitives[&identity])
+                    .collect::<Vec<JavaPrimitive>>();
+                let applicable =
+                    argument_primitives
+                        .iter()
+                        .zip(&formals)
+                        .all(|(&argument, &formal)| {
+                            argument == formal
+                                || crate::analyzer::java::primitive_converts(argument, formal)
+                        });
+                (target, formals, applicable)
+            })
+            .collect::<Vec<_>>();
+        if !candidates.iter().any(|(_, _, applicable)| *applicable) {
+            if obligation.callee_reference() == self.root {
+                for (target, _, _) in candidates {
+                    assert!(
+                        self.callable_candidate_applicability
+                            .insert(
+                                target,
+                                FactCallableCandidateApplicability {
+                                    target,
+                                    verdict: ApplicabilityVerdict::Inapplicable,
+                                    reason: Some(CallableRejectionReason::PrimitiveTypeMismatch),
+                                },
+                            )
+                            .is_none(),
+                        "one native Java candidate has one final applicability reason"
+                    );
+                }
+            }
+            return Ok(Some(answer));
+        }
+
+        let dominates = |left: &[JavaPrimitive], right: &[JavaPrimitive]| {
+            let mut strictly_more_specific = false;
+            for (&left, &right) in left.iter().zip(right) {
+                if left == right {
+                    continue;
+                }
+                if !crate::analyzer::java::primitive_converts(left, right) {
+                    return false;
+                }
+                strictly_more_specific = true;
+            }
+            strictly_more_specific
+        };
+        let most_specific = candidates
+            .iter()
+            .filter(|(_, _, applicable)| *applicable)
+            .filter(|(_, formals, _)| {
+                !candidates
+                    .iter()
+                    .any(|(_, other_formals, other_applicable)| {
+                        *other_applicable && dominates(other_formals, formals)
+                    })
+            })
+            .map(|(target, _, _)| *target)
+            .collect::<BTreeSet<_>>();
+        assert!(
+            !most_specific.is_empty(),
+            "an applicable finite primitive overload set has a maximal candidate"
+        );
+        if obligation.callee_reference() == self.root {
+            for (target, _, applicable) in &candidates {
+                let (verdict, reason) = if !applicable {
+                    (
+                        ApplicabilityVerdict::Inapplicable,
+                        Some(CallableRejectionReason::PrimitiveTypeMismatch),
+                    )
+                } else if most_specific.contains(target) {
+                    (ApplicabilityVerdict::Applicable, None)
+                } else {
+                    (
+                        ApplicabilityVerdict::Inapplicable,
+                        Some(CallableRejectionReason::LessSpecificPrimitiveOverload),
+                    )
+                };
+                assert!(
+                    self.callable_candidate_applicability
+                        .insert(
+                            *target,
+                            FactCallableCandidateApplicability {
+                                target: *target,
+                                verdict,
+                                reason,
+                            },
+                        )
+                        .is_none(),
+                    "one native Java candidate has one final applicability reason"
+                );
+            }
+        }
+        let excluded = candidates
+            .iter()
+            .filter_map(|(target, _, applicable)| {
+                if !applicable {
+                    Some((*target, CallableRejectionReason::PrimitiveTypeMismatch))
+                } else if !most_specific.contains(target) {
+                    Some((
+                        *target,
+                        CallableRejectionReason::LessSpecificPrimitiveOverload,
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        if excluded.is_empty() {
+            return Ok(Some(answer));
+        }
+        let excluded = excluded
+            .into_iter()
+            .map(|(target, _)| target)
+            .collect::<BTreeSet<_>>();
+        let (targets, witnesses, completion) = answer.into_parts();
+        let targets = targets
+            .iter()
+            .copied()
+            .filter(|target| !excluded.contains(target))
+            .collect::<Vec<_>>();
+        let witnesses = witnesses
+            .into_vec()
+            .into_iter()
+            .filter(|witness| !excluded.contains(&witness.target()))
+            .collect::<Vec<_>>();
+        Ok(Some(ResolutionAnswer::new(targets, witnesses, completion)))
+    }
+
     /// JLS 15.12.2: a candidate is applicable only if each argument type
     /// converts to its formal. For two Java source class or interface types a
     /// widening reference conversion exists exactly when the formal is a
@@ -702,7 +1308,7 @@ impl FactEvaluation<'_, '_> {
     /// no source type (an unindexed Object cannot equal a source class). Any
     /// other gap keeps the candidate. The filter never removes every
     /// candidate and leaves completion to the call's own obligation.
-    pub(super) fn filter_java_reference_inapplicable(
+    pub(crate) fn filter_java_reference_inapplicable(
         &mut self,
         answer: ResolutionAnswer,
         obligation: &LoweredCallApplicabilityObligation,
@@ -711,6 +1317,7 @@ impl FactEvaluation<'_, '_> {
             InternedFactRow<SelectedTypedRow<LoweredCallableSignatureProperty>>,
         >,
         states: &StateMap,
+        argument_receiver_gap_reason: Option<SemanticId>,
     ) -> StoreResult<Option<ResolutionAnswer>> {
         if answer.targets().len() < 2 || obligation.explicit_type_argument_count() != 0 {
             return Ok(Some(answer));
@@ -720,7 +1327,9 @@ impl FactEvaluation<'_, '_> {
             self.demand_slot(*slot);
             let Some(ty) = states
                 .get(slot)
-                .and_then(|state| exact_singleton_runtime_type(state))
+                .and_then(|state| {
+                    java_invocation_argument_type(state, argument_receiver_gap_reason)
+                })
                 .filter(|ty| ty.indirection() == 0)
             else {
                 return Ok(Some(answer));
@@ -763,7 +1372,9 @@ impl FactEvaluation<'_, '_> {
                 formals.push(
                     states
                         .get(&parameter.slot())
-                        .and_then(|state| exact_singleton_runtime_type(state))
+                        .and_then(|state| {
+                            java_invocation_argument_type(state, argument_receiver_gap_reason)
+                        })
                         .filter(|ty| ty.indirection() == 0)
                         .map(|ty| ty.identity()),
                 );
@@ -842,7 +1453,7 @@ impl FactEvaluation<'_, '_> {
     /// including `root`. The outer `None` reports cancellation; the inner
     /// `None` reports an unresolved authored edge or a frontier not yet
     /// evaluated (it is demanded for the next round).
-    fn java_supertype_closure(
+    pub(super) fn java_supertype_closure(
         &mut self,
         root: SemanticId,
         states: &StateMap,
@@ -866,6 +1477,9 @@ impl FactEvaluation<'_, '_> {
                     let row = row.get(self.session).row();
                     (row.kind(), row.frontier())
                 };
+                if kind == ResolutionSupertypeKind::SelfType {
+                    continue;
+                }
                 self.demand_slot(frontier);
                 let resolved = states.get(&frontier).and_then(|state| {
                     match (state.completion(), state.possible_values()) {
@@ -953,5 +1567,27 @@ impl FactEvaluation<'_, '_> {
             }
         }
         Ok(Some(result))
+    }
+}
+
+/// The static-call producer gap also reaches argument frontiers because the
+/// call expression is one typed graph. Once the native member-owner facts
+/// prove this call uses static methods, discard only that exact receiver gap
+/// while reading the source argument's known type. Call applicability keeps
+/// the original completion, so this local view cannot make the call complete.
+fn java_invocation_argument_type(
+    state: &TypedFrontierState,
+    ignored_receiver_gap: Option<SemanticId>,
+) -> Option<ResolutionTypeRef> {
+    let completion = ignored_receiver_gap.map_or_else(
+        || state.completion().clone(),
+        |reason| completion_without_unsupported_semantic(state.completion(), reason),
+    );
+    if completion != ResolutionCompletion::Complete {
+        return None;
+    }
+    match state.possible_values() {
+        [ResolutionSlotValue::Runtime { ty, .. }] => Some(*ty),
+        _ => None,
     }
 }

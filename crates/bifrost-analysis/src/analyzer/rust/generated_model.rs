@@ -27,11 +27,7 @@ pub(crate) fn is_generated_function(symbol: &SemanticModelSymbol) -> bool {
 }
 
 fn qualified(module: &str, name: &str) -> String {
-    if module.is_empty() {
-        name.to_owned()
-    } else {
-        format!("{module}.{name}")
-    }
+    brokk_bifrost_core::analyzer::common::qualify_dotted_name(module, name)
 }
 
 fn module_at(extents: &[(String, usize, usize)], byte: usize) -> &str {

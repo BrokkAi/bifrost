@@ -160,170 +160,6 @@ mod tests {
         assert!(value.types.is_empty(), "{value:#?}");
     }
 
-    #[test]
-    fn bounded_php_current_receiver_resolves_to_its_exact_owner() {
-        let source = r#"<?php
-namespace Receiver;
-class Service {
-    public function current(): void { $this->run(); }
-    public function run(): void {}
-}
-"#;
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        let file = ProjectFile::new(root.clone(), PathBuf::from("Receiver.php"));
-        file.write(source).expect("write PHP fixture");
-        let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
-            Arc::new(TestProject::new(root, Language::Php)),
-            AnalyzerConfig::default(),
-        )
-        .expect("ephemeral workspace should build");
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
-            .expect("PHP grammar");
-        let tree = parser.parse(source, None).expect("PHP syntax tree");
-        let start = source.find("$this").expect("current receiver");
-        let range = Range {
-            start_byte: start,
-            end_byte: start + "$this".len(),
-            start_line: 0,
-            end_line: 0,
-        };
-        let site = ResolvedReferenceSite {
-            path: "Receiver.php".to_string(),
-            text: "$this".to_string(),
-            range,
-            focus_start_byte: range.start_byte,
-            focus_end_byte: range.end_byte,
-        };
-
-        let outcome = resolve_php_type_bounded(
-            workspace.analyzer(),
-            &file,
-            source,
-            Some(&tree),
-            &site,
-            ReceiverAnalysisBudget::default(),
-            None,
-        );
-        let BoundedResolution::Complete { value, .. } = outcome else {
-            panic!("bounded PHP current-receiver lookup did not complete: {outcome:#?}");
-        };
-        assert_eq!(value.status, TypeLookupStatus::Resolved, "{value:#?}");
-        assert_eq!(value.types.len(), 1, "{value:#?}");
-        assert!(
-            value.types[0].fqn.ends_with("Receiver.Service"),
-            "{value:#?}"
-        );
-        assert_eq!(value.types[0].definitions.len(), 1, "{value:#?}");
-    }
-
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[test]
-    fn bounded_php_nominal_paths_resolve_alias_absolute_relative_and_allocation_forms() {
-        let source = r#"<?php
-namespace App;
-use App\Service as Alias;
-
-class Service { public function run(): void {} }
-
-function call(Alias $alias, \App\Service $absolute, namespace\Service $relative): void {
-    $alias->run();
-    $absolute->run();
-    $relative->run();
-    (new Alias())->run();
-}
-"#;
-
-        for receiver in ["$alias", "$absolute", "$relative", "(new Alias())"] {
-            assert_resolved_fqn(
-                resolve_receiver(source, receiver, ReceiverAnalysisBudget::default(), None),
-                "App.Service",
-            );
-        }
-    }
-
-    #[test]
-    fn bounded_php_reopens_exact_field_return_and_ancestor_declarations() {
-        let source = r#"<?php
-namespace App;
-use App\Product as ProductAlias;
-
-class Product { public function run(): void {} }
-class Holder {
-    public Product $item;
-    public function make(): Product { return new Product(); }
-}
-function makeProduct(): Product { return new Product(); }
-function makeAliased(): ProductAlias { return new Product(); }
-function makeAbsolute(): \App\Product { return new Product(); }
-function makeRelative(): namespace\Product { return new Product(); }
-class Factory {
-    public static function make(): Product { return new Product(); }
-}
-class Base {
-    public function inherited(): Product { return new Product(); }
-}
-class Child extends Base {
-    public function call(Holder $holder): void {
-        $holder->item->run();
-        $holder->make()->run();
-        makeProduct()->run();
-        makeAliased()->run();
-        makeAbsolute()->run();
-        makeRelative()->run();
-        Factory::make()->run();
-        $this->inherited()->run();
-    }
-}
-"#;
-
-        for receiver in [
-            "$holder->item",
-            "$holder->make()",
-            "makeProduct()",
-            "makeAliased()",
-            "makeAbsolute()",
-            "makeRelative()",
-            "Factory::make()",
-            "$this->inherited()",
-        ] {
-            assert_resolved_fqn(
-                resolve_receiver(
-                    source,
-                    receiver,
-                    ReceiverAnalysisBudget {
-                        max_scope_nodes: 100_000,
-                        ..ReceiverAnalysisBudget::default()
-                    },
-                    None,
-                ),
-                "App.Product",
-            );
-        }
-
-        let near_miss_source = r#"<?php
-namespace Wrong {
-    class Product { public function run(): void {} }
-}
-namespace App {
-    function wrongNamespace(): namespace\Product { return new \Wrong\Product(); }
-    function unresolved(): namespace\Missing { return new \Wrong\Product(); }
-    wrongNamespace()->run();
-    unresolved()->run();
-}
-"#;
-        for receiver in ["wrongNamespace()", "unresolved()"] {
-            assert_no_precise_type(resolve_receiver(
-                near_miss_source,
-                receiver,
-                ReceiverAnalysisBudget::default(),
-                None,
-            ));
-        }
-    }
-
     /// The #2030 milestone-2 receiver policy: `?T` resolves as `T` because
     /// `null` has no members, so a member access that could succeed at run
     /// time can only bind through `T`. A finite union of two or more nominal
@@ -458,5 +294,168 @@ function call(Service $service): void { $service->run(); }
             ),
             BoundedResolution::Cancelled { .. }
         ));
+    }
+
+    #[test]
+    fn bounded_php_current_receiver_resolves_to_its_exact_owner() {
+        let source = r#"<?php
+namespace Receiver;
+class Service {
+    public function current(): void { $this->run(); }
+    public function run(): void {}
+}
+"#;
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = ProjectFile::new(root.clone(), PathBuf::from("Receiver.php"));
+        file.write(source).expect("write PHP fixture");
+        let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
+            Arc::new(TestProject::new(root, Language::Php)),
+            AnalyzerConfig::default(),
+        )
+        .expect("ephemeral workspace should build");
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
+            .expect("PHP grammar");
+        let tree = parser.parse(source, None).expect("PHP syntax tree");
+        let start = source.find("$this").expect("current receiver");
+        let range = Range {
+            start_byte: start,
+            end_byte: start + "$this".len(),
+            start_line: 0,
+            end_line: 0,
+        };
+        let site = ResolvedReferenceSite {
+            path: "Receiver.php".to_string(),
+            text: "$this".to_string(),
+            range,
+            focus_start_byte: range.start_byte,
+            focus_end_byte: range.end_byte,
+        };
+
+        let outcome = resolve_php_type_bounded(
+            workspace.analyzer(),
+            &file,
+            source,
+            Some(&tree),
+            &site,
+            ReceiverAnalysisBudget::default(),
+            None,
+        );
+        let BoundedResolution::Complete { value, .. } = outcome else {
+            panic!("bounded PHP current-receiver lookup did not complete: {outcome:#?}");
+        };
+        assert_eq!(value.status, TypeLookupStatus::Resolved, "{value:#?}");
+        assert_eq!(value.types.len(), 1, "{value:#?}");
+        assert!(
+            value.types[0].fqn.ends_with("Receiver.Service"),
+            "{value:#?}"
+        );
+        assert_eq!(value.types[0].definitions.len(), 1, "{value:#?}");
+    }
+
+    #[test]
+    fn bounded_php_nominal_paths_resolve_alias_absolute_relative_and_allocation_forms() {
+        let source = r#"<?php
+namespace App;
+use App\Service as Alias;
+
+class Service { public function run(): void {} }
+
+function call(Alias $alias, \App\Service $absolute, namespace\Service $relative): void {
+    $alias->run();
+    $absolute->run();
+    $relative->run();
+    (new Alias())->run();
+}
+"#;
+
+        for receiver in ["$alias", "$absolute", "$relative", "(new Alias())"] {
+            assert_resolved_fqn(
+                resolve_receiver(source, receiver, ReceiverAnalysisBudget::default(), None),
+                "App.Service",
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_php_reopens_exact_field_return_and_ancestor_declarations() {
+        let source = r#"<?php
+namespace App;
+use App\Product as ProductAlias;
+
+class Product { public function run(): void {} }
+class Holder {
+    public Product $item;
+    public function make(): Product { return new Product(); }
+}
+function makeProduct(): Product { return new Product(); }
+function makeAliased(): ProductAlias { return new Product(); }
+function makeAbsolute(): \App\Product { return new Product(); }
+function makeRelative(): namespace\Product { return new Product(); }
+class Factory {
+    public static function make(): Product { return new Product(); }
+}
+class Base {
+    public function inherited(): Product { return new Product(); }
+}
+class Child extends Base {
+    public function call(Holder $holder): void {
+        $holder->item->run();
+        $holder->make()->run();
+        makeProduct()->run();
+        makeAliased()->run();
+        makeAbsolute()->run();
+        makeRelative()->run();
+        Factory::make()->run();
+        $this->inherited()->run();
+    }
+}
+"#;
+
+        for receiver in [
+            "$holder->item",
+            "$holder->make()",
+            "makeProduct()",
+            "makeAliased()",
+            "makeAbsolute()",
+            "makeRelative()",
+            "Factory::make()",
+            "$this->inherited()",
+        ] {
+            assert_resolved_fqn(
+                resolve_receiver(
+                    source,
+                    receiver,
+                    ReceiverAnalysisBudget {
+                        max_scope_nodes: 100_000,
+                        ..ReceiverAnalysisBudget::default()
+                    },
+                    None,
+                ),
+                "App.Product",
+            );
+        }
+
+        let near_miss_source = r#"<?php
+namespace Wrong {
+    class Product { public function run(): void {} }
+}
+namespace App {
+    function wrongNamespace(): namespace\Product { return new \Wrong\Product(); }
+    function unresolved(): namespace\Missing { return new \Wrong\Product(); }
+    wrongNamespace()->run();
+    unresolved()->run();
+}
+"#;
+        for receiver in ["wrongNamespace()", "unresolved()"] {
+            assert_no_precise_type(resolve_receiver(
+                near_miss_source,
+                receiver,
+                ReceiverAnalysisBudget::default(),
+                None,
+            ));
+        }
     }
 }

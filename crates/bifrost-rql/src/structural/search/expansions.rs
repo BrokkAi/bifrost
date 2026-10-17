@@ -47,6 +47,7 @@ fn finish_call_declaration_expansions(
     }
     diagnostics.extend(traversal_diagnostics);
     diagnostics.push(CodeQueryDiagnostic {
+        source: None,
         code: CodeQueryDiagnosticCode::CallRelationCandidatesOmitted,
         impact: if declared_non_exhaustive {
             CodeQueryDiagnosticImpact::DeclaredNonExhaustive
@@ -63,6 +64,7 @@ fn finish_call_declaration_expansions(
             declaration.unit.fq_name()
         ),
     exhausted_roots: Vec::new(),
+        withheld_rows_path: None,
     });
     // The explicit proven-subset contract declines only the exhaustive
     // negative claim caused by an unrenderable related declaration. It never
@@ -226,7 +228,12 @@ pub(super) fn call_declaration_expansions(
             }
             budget.provenance_steps += next_depth;
             budget.pipeline_rows += 1;
-            let call_site = CallSiteValue(site, CallBindingStatus::Unavailable);
+            let call_site = CallSiteValue::new(
+                site,
+                CallBindingStatus::Unavailable,
+                None,
+                CallSiteIdentityFacts::default(),
+            );
             let path_tail = paths.len();
             paths.push(CallPathNode {
                 value: next.clone(),
@@ -287,23 +294,19 @@ fn call_path_contains(
 
 fn call_trace_values(
     paths: &[CallPathNode],
-    mut tail: usize,
+    tail: usize,
     depth: usize,
 ) -> Vec<(PipelineTraceValue, Option<PipelineVia>)> {
-    let mut values = Vec::with_capacity(depth);
-    loop {
-        let node = &paths[tail];
-        values.push((
-            PipelineTraceValue::Declaration(node.value.clone()),
-            Some(PipelineVia::CallSite(node.via.clone())),
-        ));
-        let Some(parent) = node.parent else {
-            break;
-        };
-        tail = parent;
-    }
-    values.reverse();
-    values
+    super::parent_path_values(tail, depth, |index| {
+        let node = &paths[index];
+        (
+            (
+                PipelineTraceValue::Declaration(node.value.clone()),
+                Some(PipelineVia::CallSite(node.via.clone())),
+            ),
+            node.parent,
+        )
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -387,6 +390,7 @@ pub(super) fn inbound_reference_expansions(
         if report && query.source_bytes_truncated {
             exhausted = true;
             diagnostics.push(CodeQueryDiagnostic {
+                source: None,
                 code: CodeQueryDiagnosticCode::ReferenceSourceBytesTruncated,
                 impact: CodeQueryDiagnosticImpact::Incomplete,
                 branch: Vec::new(),
@@ -397,10 +401,12 @@ pub(super) fn inbound_reference_expansions(
                     declaration.unit.fq_name()
                 ),
                 exhausted_roots: Vec::new(),
+                withheld_rows_path: None,
             });
         } else if report && query.candidate_files_truncated {
             exhausted = true;
             diagnostics.push(CodeQueryDiagnostic {
+                source: None,
                 code: CodeQueryDiagnosticCode::ReferenceCandidateFilesTruncated,
                 impact: CodeQueryDiagnosticImpact::Incomplete,
                 branch: Vec::new(),
@@ -411,6 +417,7 @@ pub(super) fn inbound_reference_expansions(
                     declaration.unit.fq_name()
                 ),
                 exhausted_roots: Vec::new(),
+                withheld_rows_path: None,
             });
         }
         if let FuzzyResult::Incomplete {
@@ -420,6 +427,7 @@ pub(super) fn inbound_reference_expansions(
             && report
         {
             diagnostics.push(CodeQueryDiagnostic {
+                source: None,
                 exhausted_roots: Vec::new(),
                 code: CodeQueryDiagnosticCode::ReferenceAnalysisFailed,
                 impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -430,6 +438,7 @@ pub(super) fn inbound_reference_expansions(
                     "references_of analysis is incomplete for {}: {reasons:?}",
                     declaration.unit.fq_name()
                 ),
+                withheld_rows_path: None,
             });
         }
         match query.result {
@@ -471,6 +480,7 @@ pub(super) fn inbound_reference_expansions(
                         );
                     if omitted > 0 {
                         diagnostics.push(CodeQueryDiagnostic {
+                            source: None,
                             code: CodeQueryDiagnosticCode::ReferenceCandidatesOmitted,
                             impact: CodeQueryDiagnosticImpact::Incomplete,
                             branch: Vec::new(),
@@ -483,6 +493,7 @@ pub(super) fn inbound_reference_expansions(
                                 declaration.unit.fq_name()
                             ),
                         exhausted_roots: Vec::new(),
+                            withheld_rows_path: None,
                         });
                     }
                 }
@@ -500,6 +511,7 @@ pub(super) fn inbound_reference_expansions(
                 }));
                 if report {
                     diagnostics.push(CodeQueryDiagnostic {
+                        source: None,
                         code: CodeQueryDiagnosticCode::ReferenceTargetsAmbiguous,
                         impact: CodeQueryDiagnosticImpact::Advisory,
                         branch: Vec::new(),
@@ -512,6 +524,7 @@ pub(super) fn inbound_reference_expansions(
                             declaration.unit.fq_name()
                         ),
                         exhausted_roots: Vec::new(),
+                        withheld_rows_path: None,
                     });
                 }
             }
@@ -530,6 +543,7 @@ pub(super) fn inbound_reference_expansions(
                 exhausted = true;
                 if report {
                     diagnostics.push(CodeQueryDiagnostic {
+                        source: None,
                         code: CodeQueryDiagnosticCode::ReferenceCallsiteLimit,
                         impact: CodeQueryDiagnosticImpact::Incomplete,
                         branch: Vec::new(),
@@ -542,12 +556,14 @@ pub(super) fn inbound_reference_expansions(
                             declaration.unit.fq_name()
                         ),
                     exhausted_roots: Vec::new(),
+                        withheld_rows_path: None,
                     });
                 }
             }
             FuzzyResult::Failure { reason, .. } => {
                 if report {
                     diagnostics.push(CodeQueryDiagnostic {
+                        source: None,
                         code: CodeQueryDiagnosticCode::ReferenceAnalysisFailed,
                         impact: CodeQueryDiagnosticImpact::Incomplete,
                         branch: Vec::new(),
@@ -560,6 +576,7 @@ pub(super) fn inbound_reference_expansions(
                             declaration.unit.fq_name()
                         ),
                         exhausted_roots: Vec::new(),
+                        withheld_rows_path: None,
                     });
                 }
             }
@@ -603,6 +620,7 @@ pub(super) fn inbound_reference_expansions(
             diagnostic.code != CodeQueryDiagnosticCode::ReferenceTargetsAmbiguous
         });
         diagnostics.push(CodeQueryDiagnostic {
+            source: None,
             code: CodeQueryDiagnosticCode::ReferenceCandidatesOmitted,
             impact: CodeQueryDiagnosticImpact::Incomplete,
             branch: Vec::new(),
@@ -619,6 +637,7 @@ pub(super) fn inbound_reference_expansions(
                 declaration.unit.fq_name()
             ),
         exhausted_roots: Vec::new(),
+            withheld_rows_path: None,
         });
     }
     sort_reference_sites(&mut sites);
@@ -733,6 +752,7 @@ pub(super) fn append_outbound_lookup_diagnostics(
 ) {
     if ambiguous_sites > 0 && ambiguous_candidates_complete {
         diagnostics.push(CodeQueryDiagnostic {
+            source: None,
             code: CodeQueryDiagnosticCode::UsesTargetsAmbiguous,
             impact: CodeQueryDiagnosticImpact::Advisory,
             branch: Vec::new(),
@@ -743,10 +763,12 @@ pub(super) fn append_outbound_lookup_diagnostics(
                 rel_path_string(file)
             ),
             exhausted_roots: Vec::new(),
+            withheld_rows_path: None,
         });
     }
     if omitted > 0 {
         diagnostics.push(CodeQueryDiagnostic {
+            source: None,
             code: CodeQueryDiagnosticCode::UsesCandidatesOmitted,
             impact: CodeQueryDiagnosticImpact::Incomplete,
             branch: Vec::new(),
@@ -757,6 +779,7 @@ pub(super) fn append_outbound_lookup_diagnostics(
                 rel_path_string(file)
             ),
         exhausted_roots: Vec::new(),
+            withheld_rows_path: None,
         });
     }
 }
@@ -776,6 +799,7 @@ pub(super) fn scan_outbound_reference_hits(
     let language = crate::analyzer::common::language_for_file(file);
     let Some(source) = analyzer.indexed_source(file) else {
         diagnostics.push(CodeQueryDiagnostic {
+            source: None,
             code: CodeQueryDiagnosticCode::UsesCandidatesOmitted,
             impact: CodeQueryDiagnosticImpact::Incomplete,
             branch: Vec::new(),
@@ -785,6 +809,7 @@ pub(super) fn scan_outbound_reference_hits(
                 rel_path_string(file)
             ),
             exhausted_roots: Vec::new(),
+            withheld_rows_path: None,
         });
         return (Vec::new(), true);
     };
@@ -800,12 +825,14 @@ pub(super) fn scan_outbound_reference_hits(
     let source = Arc::<str>::from(source);
     let Some(tree) = parse_tree_for_language(file, language, &source) else {
         diagnostics.push(CodeQueryDiagnostic {
+            source: None,
             code: CodeQueryDiagnosticCode::UsesParserUnsupported,
             impact: CodeQueryDiagnosticImpact::Incomplete,
             branch: Vec::new(),
             language: language.config_label(),
             message: format!("uses does not support parsing {}", rel_path_string(file)),
             exhausted_roots: Vec::new(),
+            withheld_rows_path: None,
         });
         return (Vec::new(), false);
     };
@@ -847,6 +874,7 @@ pub(super) fn scan_outbound_reference_hits(
             push_budget_diagnostic(diagnostics, budget);
         } else {
             diagnostics.push(CodeQueryDiagnostic {
+                source: None,
                 code: CodeQueryDiagnosticCode::UsesCandidateLimit,
                 impact: CodeQueryDiagnosticImpact::Incomplete,
                 branch: Vec::new(),
@@ -856,12 +884,14 @@ pub(super) fn scan_outbound_reference_hits(
                     rel_path_string(file)
                 ),
             exhausted_roots: Vec::new(),
+                withheld_rows_path: None,
             });
         }
     }
     if candidate_limit == 0 {
         exhausted = true;
         diagnostics.push(CodeQueryDiagnostic {
+            source: None,
             code: CodeQueryDiagnosticCode::UsesCandidateLimit,
             impact: CodeQueryDiagnosticImpact::Incomplete,
             branch: Vec::new(),
@@ -871,6 +901,7 @@ pub(super) fn scan_outbound_reference_hits(
                 rel_path_string(file)
             ),
             exhausted_roots: Vec::new(),
+            withheld_rows_path: None,
         });
     }
     let requests = ranges
@@ -932,6 +963,7 @@ pub(super) fn scan_outbound_reference_hits(
         } = &result.result
         {
             diagnostics.push(CodeQueryDiagnostic {
+                source: None,
                 exhausted_roots: Vec::new(),
                 code: CodeQueryDiagnosticCode::ReferenceAnalysisFailed,
                 impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -941,6 +973,7 @@ pub(super) fn scan_outbound_reference_hits(
                     "uses analysis is incomplete for {}: {reasons:?}",
                     target.fq_name()
                 ),
+                withheld_rows_path: None,
             });
         }
         let (target_hits, target_truncated) =
@@ -948,6 +981,7 @@ pub(super) fn scan_outbound_reference_hits(
         if target_truncated {
             exhausted = true;
             diagnostics.push(CodeQueryDiagnostic {
+                source: None,
                 code: CodeQueryDiagnosticCode::UsesCandidateLimit,
                 impact: CodeQueryDiagnosticImpact::Incomplete,
                 branch: Vec::new(),
@@ -957,6 +991,7 @@ pub(super) fn scan_outbound_reference_hits(
                     target.fq_name()
                 ),
             exhausted_roots: Vec::new(),
+                withheld_rows_path: None,
             });
         }
         for hit in target_hits {

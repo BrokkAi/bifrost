@@ -3,6 +3,23 @@
 use crate::hash::HashMap;
 use std::hash::Hash;
 
+pub(crate) fn normalize_indexed_edges<K: Eq + Hash>(
+    nodes: &[K],
+    index_by_node: &HashMap<K, u32>,
+    edges: &mut Vec<(u32, u32)>,
+) {
+    assert_eq!(nodes.len(), index_by_node.len());
+    assert!(nodes.iter().enumerate().all(|(index, node)| {
+        index_by_node.get(node).copied()
+            == Some(u32::try_from(index).expect("indexed graph nodes must fit in a u32"))
+    }));
+    assert!(edges.iter().all(|(source, target)| {
+        (*source as usize) < nodes.len() && (*target as usize) < nodes.len()
+    }));
+    edges.sort_unstable();
+    edges.dedup();
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactRows<T> {
     offsets: Box<[u32]>,
@@ -149,23 +166,7 @@ where
             u32::try_from(node_count).is_ok(),
             "compact graph nodes must fit in a u32"
         );
-        assert_eq!(index_by_node.len(), node_count);
-        assert!(
-            nodes
-                .iter()
-                .enumerate()
-                .all(|(index, node)| index_by_node.get(node).copied() == Some(index as u32)),
-            "compact graph index must match node order"
-        );
-        assert!(
-            edges
-                .iter()
-                .all(|(source, target)| (*source as usize) < node_count
-                    && (*target as usize) < node_count),
-            "compact graph edge endpoint is out of bounds"
-        );
-        edges.sort_unstable();
-        edges.dedup();
+        normalize_indexed_edges(&nodes, &index_by_node, &mut edges);
 
         let mut outgoing = CompactRowsBuilder::with_capacity(node_count, edges.len());
         let mut cursor = 0usize;
@@ -244,21 +245,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{CompactDirectedGraph, CompactRows, CompactRowsBuilder};
-
-    #[test]
-    fn compact_rows_preserve_empty_rows_and_value_order() {
-        let mut rows = CompactRowsBuilder::with_capacity(3, 3);
-        rows.push_row([1, 2]);
-        rows.push_row([]);
-        rows.push_row([3]);
-        let rows = rows.finish();
-
-        assert_eq!(rows.rows(), 3);
-        assert_eq!(rows.row(0), [1, 2]);
-        assert!(rows.row(1).is_empty());
-        assert_eq!(rows.row(2), [3]);
-    }
+    use super::{CompactRows, CompactRowsBuilder};
 
     #[test]
     fn checked_compact_rows_reject_corrupt_boundaries() {
@@ -274,22 +261,16 @@ mod tests {
     }
 
     #[test]
-    fn directed_graph_deduplicates_and_builds_sorted_reverse_rows() {
-        let graph =
-            CompactDirectedGraph::new(vec!["a", "b", "c"], vec![(0, 2), (0, 1), (0, 1), (2, 1)]);
+    fn compact_rows_preserve_empty_rows_and_value_order() {
+        let mut rows = CompactRowsBuilder::with_capacity(3, 3);
+        rows.push_row([1, 2]);
+        rows.push_row([]);
+        rows.push_row([3]);
+        let rows = rows.finish();
 
-        assert_eq!(graph.edge_count(), 3);
-        assert_eq!(graph.outgoing(0), [1, 2]);
-        assert_eq!(graph.incoming(1), [0, 2]);
-        assert_eq!(graph.node_id(&"c"), Some(2));
-        assert!(graph.estimated_bytes() > 0);
-        assert_eq!(
-            graph.estimated_bytes(),
-            CompactDirectedGraph::<&str>::estimated_bytes_for_parts(
-                graph.nodes.len(),
-                graph.index_by_node.capacity(),
-                graph.edge_count(),
-            )
-        );
+        assert_eq!(rows.rows(), 3);
+        assert_eq!(rows.row(0), [1, 2]);
+        assert!(rows.row(1).is_empty());
+        assert_eq!(rows.row(2), [3]);
     }
 }

@@ -1,0 +1,414 @@
+{
+  "schema_version": 2,
+  "pack_id": "fixture.rust.modeled-drop",
+  "version": "0.1.0",
+  "producer": {
+    "name": "test-only-5236",
+    "version": "0.1.0"
+  },
+  "language": "rust",
+  "ecosystem": "cargo",
+  "compatibility": {
+    "bifrost": ">=0.13.0, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "Test-only #5236 regression fixture; never registered in production."
+  },
+  "license": "Apache-2.0",
+  "completeness": "complete",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "fixture.declarations",
+      "activation": [
+        {
+          "configurations": [
+            "fixture.rust.modeled-drop"
+          ]
+        }
+      ],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {
+            "id": "fixture.std",
+            "name": "std",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/lib.rs",
+              "symbol": "std"
+            }
+          },
+          {
+            "id": "fixture.std-string",
+            "name": "std.string",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/lib.rs",
+              "symbol": "std.string"
+            }
+          },
+          {
+            "id": "fixture.std-string-string",
+            "name": "std.string.String",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/lib.rs",
+              "symbol": "std.string.String"
+            }
+          },
+          {
+            "id": "fixture.std-io",
+            "name": "std.io",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/lib.rs",
+              "symbol": "std.io"
+            }
+          },
+          {
+            "id": "fixture.std-io-stdio",
+            "name": "std.io.stdio",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/lib.rs",
+              "symbol": "std.io.stdio"
+            }
+          }
+        ],
+        "members": [
+          {
+            "id": "fixture.string.as_str",
+            "owner": "fixture.std-string-string",
+            "name": "as_str",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": {
+                "kind": "by_ref",
+                "element": {
+                  "kind": "named",
+                  "name": "std.primitive.str"
+                }
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/alloc/src/string.rs",
+              "symbol": "std.string.String.as_str"
+            }
+          },
+          {
+            "id": "fixture.string.as_bytes",
+            "owner": "fixture.std-string-string",
+            "name": "as_bytes",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": {
+                "kind": "by_ref",
+                "element": {
+                  "kind": "slice",
+                  "element": {
+                    "kind": "named",
+                    "name": "u8"
+                  }
+                }
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/alloc/src/string.rs",
+              "symbol": "std.string.String.as_bytes"
+            }
+          },
+          {
+            "id": "fixture.string.capacity",
+            "owner": "fixture.std-string-string",
+            "name": "capacity",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "usize"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/alloc/src/string.rs",
+              "symbol": "std.string.String.capacity"
+            }
+          },
+          {
+            "id": "fixture.string.as_ptr",
+            "owner": "fixture.std-string-string",
+            "name": "as_ptr",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": {
+                "kind": "pointer",
+                "element": {
+                  "kind": "named",
+                  "name": "u8"
+                }
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/alloc/src/string.rs",
+              "symbol": "std.string.String.as_ptr"
+            }
+          },
+          {
+            "id": "fixture.string.unused",
+            "owner": "fixture.std-string-string",
+            "name": "unused",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": {
+                "kind": "by_ref",
+                "element": {
+                  "kind": "named",
+                  "name": "untyped"
+                }
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/alloc/src/string.rs",
+              "symbol": "std.string.String.unused"
+            }
+          },
+          {
+            "id": "fixture.print",
+            "owner": "fixture.std-io-stdio",
+            "name": "_print",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "args",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ]
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/io/stdio.rs",
+              "symbol": "std.io.stdio._print"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "fixture.summaries",
+      "activation": [
+        {
+          "configurations": [
+            "fixture.rust.modeled-drop"
+          ]
+        }
+      ],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "summary.fixture.as_str",
+            "target": {
+              "path": "library/alloc/src/string.rs",
+              "symbol": "std.string.String.as_str",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.fixture.as_bytes",
+            "target": {
+              "path": "library/alloc/src/string.rs",
+              "symbol": "std.string.String.as_bytes",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.fixture.capacity",
+            "target": {
+              "path": "library/alloc/src/string.rs",
+              "symbol": "std.string.String.capacity",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.fixture.as_ptr",
+            "target": {
+              "path": "library/alloc/src/string.rs",
+              "symbol": "std.string.String.as_ptr",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.fixture.print",
+            "target": {
+              "path": "library/std/src/io/stdio.rs",
+              "symbol": "std.io.stdio._print",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          }
+        ]
+      }
+    },
+    {
+      "id": "fixture.unused-summary",
+      "activation": [
+        {
+          "configurations": [
+            "fixture.rust.modeled-drop"
+          ]
+        }
+      ],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "summary.fixture.unused",
+            "target": {
+              "path": "src/lib.rs",
+              "symbol": "std.string.String.unused",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.fixture.missing-workspace-target",
+            "target": {
+              "path": "src/lib.rs",
+              "symbol": "lib.rs.missing_workspace_target",
+              "has_receiver": false,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          }
+        ]
+      }
+    }
+  ]
+}

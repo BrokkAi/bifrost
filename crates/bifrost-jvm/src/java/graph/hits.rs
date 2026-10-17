@@ -1,10 +1,11 @@
 use super::extractor::ScanCtx;
+use crate::graph_hits::{HitRecorder, refresh_usage_limit};
 use brokk_bifrost_core::analyzer::model::{CodeUnit, Range};
 use brokk_bifrost_core::analyzer::usages::common::{
-    SNIPPET_CONTEXT_LINES, external_usage_hit_count, reclassify_import_hit_at,
-    reclassify_override_declaration_hit_at, reclassify_self_receiver_hit_at, usage_hit,
+    reclassify_import_hit_at, reclassify_override_declaration_hit_at,
+    reclassify_self_receiver_hit_at,
 };
-use brokk_bifrost_core::text_utils::{find_line_index_for_offset, snippet_around_line};
+use brokk_bifrost_core::text_utils::find_line_index_for_offset;
 use tree_sitter::Node;
 
 #[derive(Clone, Default)]
@@ -19,40 +20,24 @@ pub fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     let start = node.start_byte();
-    let line_idx = find_line_index_for_offset(ctx.line_starts, start);
-    let Some(enclosing) = enclosing_context(node, ctx).enclosing.clone() else {
+    let Some(enclosing) = enclosing_context(node, ctx).enclosing else {
         return;
     };
-    // A reference whose enclosing declaration is a *callable* target is a
-    // recursive call (#1638). It is a real occurrence, so it is recorded and
-    // classified `SelfReceiver`: editor find-references lists it, the external
-    // usage surface omits it. Other targets keep the classification they had:
-    // a class naming itself -- a factory returning its own type, a self-typed
-    // field -- stays an ordinary reference, and everything else stays dropped.
-    if enclosing == ctx.spec.target && !ctx.spec.target.is_function() && !ctx.spec.target.is_class()
-    {
-        return;
-    }
-    let recursive = enclosing == ctx.spec.target && ctx.spec.target.is_function();
     let end = node.end_byte();
-    ctx.hits.insert(usage_hit(
-        ctx.file,
-        line_idx,
+    HitRecorder::new(ctx.file, ctx.source, ctx.line_starts, &ctx.spec.target).record_proven(
+        ctx.hits,
+        ctx.max_usages,
+        ctx.limit_exceeded,
         start,
         end,
         enclosing,
-        snippet_around_line(ctx.source, ctx.line_starts, line_idx, SNIPPET_CONTEXT_LINES),
-    ));
-    if recursive {
-        reclassify_self_receiver_hit_at(ctx.hits, ctx.file, start, end);
-    }
-    refresh_usage_limit(ctx);
+    );
 }
 
 pub fn push_import_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     push_hit(node, ctx);
     reclassify_import_hit_at(ctx.hits, ctx.file, node.start_byte(), node.end_byte());
-    refresh_usage_limit(ctx);
+    refresh_usage_limit(ctx.hits, ctx.max_usages, ctx.limit_exceeded);
 }
 
 pub fn push_override_declaration_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -67,33 +52,18 @@ pub fn push_override_declaration_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 pub fn push_self_receiver_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     push_hit(node, ctx);
     reclassify_self_receiver_hit_at(ctx.hits, ctx.file, node.start_byte(), node.end_byte());
-    refresh_usage_limit(ctx);
-}
-
-fn refresh_usage_limit(ctx: &mut ScanCtx<'_>) {
-    *ctx.limit_exceeded = external_usage_hit_count(ctx.hits) > ctx.max_usages;
+    refresh_usage_limit(ctx.hits, ctx.max_usages, ctx.limit_exceeded);
 }
 
 pub fn push_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let start = node.start_byte();
-    let line_idx = find_line_index_for_offset(ctx.line_starts, start);
-    let Some(enclosing) = enclosing_context(node, ctx).enclosing.clone() else {
-        return;
-    };
-    if enclosing == ctx.spec.target {
-        return;
-    }
     let end = node.end_byte();
-    ctx.unproven_hits.insert(
-        usage_hit(
-            ctx.file,
-            line_idx,
-            start,
-            end,
-            enclosing,
-            snippet_around_line(ctx.source, ctx.line_starts, line_idx, SNIPPET_CONTEXT_LINES),
-        )
-        .into_unproven(),
+    let enclosing = enclosing_context(node, ctx).enclosing;
+    HitRecorder::new(ctx.file, ctx.source, ctx.line_starts, &ctx.spec.target).record_unproven(
+        ctx.unproven_hits,
+        start,
+        end,
+        enclosing,
     );
 }
 

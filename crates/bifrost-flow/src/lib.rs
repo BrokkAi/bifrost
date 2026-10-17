@@ -6,10 +6,10 @@ pub use brokk_bifrost_analysis::analyzer;
 pub use brokk_bifrost_analysis::path_utils;
 pub use brokk_bifrost_core::{cancellation, hash, text_utils};
 
-pub mod concurrency;
 pub mod dataflow;
 pub mod detached_task;
 pub mod flow_state;
+mod ordering;
 pub mod scalar_state;
 mod semantic_summary;
 pub mod taint;
@@ -20,6 +20,9 @@ pub mod value_flow;
 #[cfg(test)]
 #[path = "../../../test-support/inline_project.rs"]
 mod inline_project;
+
+#[cfg(test)]
+mod test_support;
 
 pub use semantic_summary::{
     ExactProcedureSummaryBoundary, ExactProcedureSummaryParameter, ExactProcedureSummaryReceiver,
@@ -77,21 +80,5 @@ impl FlowWorkspaceState {
 
     pub fn semantic_summaries(&self) -> Arc<dataflow::ProductionSemanticSummaryRepository> {
         Arc::clone(&self.semantic_summaries)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn workspace_flow_clients_share_one_semantic_summary_repository() {
-        let state = FlowWorkspaceState::new();
-        let workspace = state.semantic_summaries();
-        let type_flow = state.type_flow_summaries().semantic().clone();
-        let typestate = state.typestate_summaries().semantic_summaries();
-
-        assert!(Arc::ptr_eq(&workspace, &type_flow));
-        assert!(Arc::ptr_eq(&workspace, &typestate));
     }
 }

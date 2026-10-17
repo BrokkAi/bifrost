@@ -82,6 +82,7 @@ use brokk_bifrost_core::analyzer::model::{
     SignatureMetadata,
 };
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
+use brokk_bifrost_core::analyzer::scala_facts::scala_callable_role_for_parent;
 use brokk_bifrost_core::analyzer::tree_walk::ParentIndex;
 use brokk_bifrost_core::analyzer::usages::inverted_edges::{
     ClassRangeIndex, FileEdgeScanInput, PerFileEdges, UsageReferenceKind, classify_reference_node,
@@ -93,9 +94,10 @@ use brokk_bifrost_core::analyzer::usages::model::UsageHitKind;
 use brokk_bifrost_core::analyzer::usages::same_owner::route_same_owner;
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, ProjectFile, Range};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
+use moka::sync::Cache;
 use std::borrow::Borrow;
 use std::sync::{Arc, Mutex, OnceLock};
-use tree_sitter::{Node, Parser, Tree};
+use tree_sitter::{Node, Tree};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ScalaReferenceRole {
@@ -262,7 +264,6 @@ pub trait ScalaReferenceSink {
 
 type PackageTypeEntries = Arc<Vec<(String, CodeUnit)>>;
 type CachedScalaSourceFacts = Arc<ScalaSourceFacts>;
-type ScalaSourceFactsCell = Arc<OnceLock<CachedScalaSourceFacts>>;
 /// Per-file source facts (`stable_owner_ranges`, `case_class_ranges`, ...)
 /// derived by a full tree-sitter parse of the file, shared across every
 /// [`ProjectTypes`] built in one analyzer generation.
@@ -273,9 +274,28 @@ type ScalaSourceFactsCell = Arc<OnceLock<CachedScalaSourceFacts>>;
 /// candidate's file was re-parsed from source per instance per query: on
 /// scalaz a single `CofreeZip` scan re-parsed the workspace until it blew the
 /// 600s probe budget, with tree-sitter at ~36% of process CPU. Owning the cache
-/// at the analyzer and threading it through the seed parses each file once
-/// per generation instead.
-pub type ScalaSourceFactsCache = Arc<Mutex<HashMap<ProjectFile, ScalaSourceFactsCell>>>;
+/// at the analyzer and threading it through the seed reuses a file's
+/// projection while it remains resident. The byte bound permits eviction and
+/// later reparsing, but prevents a workspace-sized map from accumulating
+/// indefinitely.
+pub type ScalaSourceFactsCache = Cache<ProjectFile, Arc<ScalaSourceFacts>>;
+
+const DEFAULT_SCALA_SOURCE_FACTS_CACHE_BYTES: u64 = 8 * 1024 * 1024;
+
+pub(crate) fn weight_scala_source_facts(key: &ProjectFile, facts: &Arc<ScalaSourceFacts>) -> u32 {
+    let bytes = key
+        .retained_bytes()
+        .saturating_add(std::mem::size_of::<(ProjectFile, Arc<ScalaSourceFacts>)>())
+        .saturating_add(facts.estimated_retained_bytes());
+    bytes.clamp(1, u32::MAX as usize) as u32
+}
+
+pub fn new_scala_source_facts_cache(max_weight: u64) -> ScalaSourceFactsCache {
+    Cache::builder()
+        .max_capacity(max_weight.max(1))
+        .weigher(weight_scala_source_facts)
+        .build()
+}
 pub type CachedCallableAlternatives = Arc<Vec<CallableAlternative>>;
 type CallableAlternativesCell = Arc<OnceLock<CachedCallableAlternatives>>;
 type ExtensionOwnerMemberKey = (String, String);
@@ -535,26 +555,34 @@ impl ScalaProjectTypesSweep {
     }
 
     pub fn into_seed(self, facts: Arc<dyn ScalaFileFactsProvider>) -> ScalaProjectTypesSeed {
-        ScalaProjectTypesSeed {
-            type_aliases: Arc::new(self.derived.type_aliases),
-            direct_ancestors_by_owner: None,
-            direct_ancestors_by_unit: None,
-            ambiguous_direct_ancestor_owners: None,
-            structural_parent_by_unit: Arc::new(self.derived.structural_parent_by_unit),
-            scala_trait_fqns: Arc::new(self.derived.scala_trait_fqns),
-            facts: ScalaSeedFileFacts::Targeted {
+        ScalaProjectTypesSeed::from_derived(
+            self.derived,
+            ScalaSeedFileFacts::Targeted {
                 hierarchy_inputs: Some(Arc::new(self.hierarchy_inputs)),
                 facts,
             },
-            source_facts: Arc::new(Mutex::new(HashMap::default())),
-        }
+        )
     }
 }
 
 impl ScalaProjectTypesSeed {
+    fn from_derived(derived: ScalaSeedDerived, facts: ScalaSeedFileFacts) -> Self {
+        Self {
+            type_aliases: Arc::new(derived.type_aliases),
+            direct_ancestors_by_owner: None,
+            direct_ancestors_by_unit: None,
+            ambiguous_direct_ancestor_owners: None,
+            structural_parent_by_unit: Arc::new(derived.structural_parent_by_unit),
+            scala_trait_fqns: Arc::new(derived.scala_trait_fqns),
+            facts,
+            source_facts: new_scala_source_facts_cache(DEFAULT_SCALA_SOURCE_FACTS_CACHE_BYTES),
+        }
+    }
+
     /// Share `cache` with every `ProjectTypes` built from this seed, so the
-    /// per-file source facts are parsed once per analyzer generation rather
-    /// than once per query per instance.
+    /// per-file source facts are reused while resident in the analyzer's
+    /// bounded cache rather than parsed once per query per instance. Evicted
+    /// files may be parsed again when a later query needs them.
     pub fn with_source_facts_cache(mut self, cache: ScalaSourceFactsCache) -> Self {
         self.source_facts = cache;
         self
@@ -613,6 +641,21 @@ fn sorted_unique_units(mut units: Vec<CodeUnit>) -> Vec<CodeUnit> {
     units
 }
 
+fn exact_transitive_closure(
+    mut pending: Vec<CodeUnit>,
+    mut append_neighbors: impl FnMut(&CodeUnit, &mut Vec<CodeUnit>),
+) -> Vec<CodeUnit> {
+    let mut seen = HashSet::default();
+    while let Some(current) = pending.pop() {
+        if seen.insert(current.clone()) {
+            append_neighbors(&current, &mut pending);
+        }
+    }
+    let mut closure = seen.into_iter().collect::<Vec<_>>();
+    closure.sort();
+    closure
+}
+
 /// True when `left` and `right` were one merged CodeUnit before Scala
 /// overloads gained per-overload signature keys (#1327): identical on every
 /// identity field except `signature`. Uniqueness gates that predate the split
@@ -620,20 +663,23 @@ fn sorted_unique_units(mut units: Vec<CodeUnit>) -> Vec<CodeUnit> {
 /// family as a single physical declaration and leave overload selection to the
 /// call-shape machinery downstream.
 pub fn same_overload_family(left: &CodeUnit, right: &CodeUnit) -> bool {
-    left.source() == right.source()
-        && left.kind() == right.kind()
-        && left.package_name() == right.package_name()
-        && left.short_name() == right.short_name()
-        && left.is_synthetic() == right.is_synthetic()
+    left.source() == right.source() && same_replica_family(left, right)
+}
+
+fn single_family_by<'a>(
+    mut units: impl Iterator<Item = &'a CodeUnit>,
+    mut same_family: impl FnMut(&CodeUnit, &CodeUnit) -> bool,
+) -> bool {
+    let Some(first) = units.next() else {
+        return true;
+    };
+    units.all(|unit| same_family(first, unit))
 }
 
 /// True when every unit in the set belongs to one overload family (see
 /// [`same_overload_family`]). Empty sets are vacuously a single family.
-pub fn single_overload_family<'a>(mut units: impl Iterator<Item = &'a CodeUnit>) -> bool {
-    let Some(first) = units.next() else {
-        return true;
-    };
-    units.all(|unit| same_overload_family(first, unit))
+pub fn single_overload_family<'a>(units: impl Iterator<Item = &'a CodeUnit>) -> bool {
+    single_family_by(units, same_overload_family)
 }
 
 /// True when `left` and `right` are two physical declarations of ONE logical
@@ -659,11 +705,8 @@ pub fn same_replica_family(left: &CodeUnit, right: &CodeUnit) -> bool {
 /// [`same_replica_family`]). Empty sets are vacuously a single family, which
 /// matches [`single_overload_family`]; callers that need "at least one" must
 /// check emptiness themselves, and the existing gates do.
-pub fn single_replica_family<'a>(mut units: impl Iterator<Item = &'a CodeUnit>) -> bool {
-    let Some(first) = units.next() else {
-        return true;
-    };
-    units.all(|unit| same_replica_family(first, unit))
+pub fn single_replica_family<'a>(units: impl Iterator<Item = &'a CodeUnit>) -> bool {
+    single_family_by(units, same_replica_family)
 }
 
 impl ProjectTypes {
@@ -707,16 +750,7 @@ impl ProjectTypes {
         for state in file_states.values() {
             derived.fold_file_facts(state);
         }
-        ScalaProjectTypesSeed {
-            type_aliases: Arc::new(derived.type_aliases),
-            direct_ancestors_by_owner: None,
-            direct_ancestors_by_unit: None,
-            ambiguous_direct_ancestor_owners: None,
-            structural_parent_by_unit: Arc::new(derived.structural_parent_by_unit),
-            scala_trait_fqns: Arc::new(derived.scala_trait_fqns),
-            facts: ScalaSeedFileFacts::Eager(file_states),
-            source_facts: Arc::new(Mutex::new(HashMap::default())),
-        }
+        ScalaProjectTypesSeed::from_derived(derived, ScalaSeedFileFacts::Eager(file_states))
     }
 
     pub fn from_seed(
@@ -744,7 +778,7 @@ impl ProjectTypes {
             nested_types_by_owner: Mutex::new(HashMap::default()),
             nested_objects_by_owner: Mutex::new(HashMap::default()),
             wildcard_members_by_owner: Mutex::new(HashMap::default()),
-            source_facts_by_file: Arc::clone(&seed.source_facts),
+            source_facts_by_file: seed.source_facts.clone(),
             file_facts,
             callable_alternatives_by_unit: Mutex::new(HashMap::default()),
             effective_callable_alternatives_by_unit: Mutex::new(HashMap::default()),
@@ -817,7 +851,7 @@ impl ProjectTypes {
                     facts: Arc::clone(facts),
                 },
             },
-            source_facts: Arc::clone(&self.source_facts_by_file),
+            source_facts: self.source_facts_by_file.clone(),
         }
     }
 
@@ -862,16 +896,9 @@ impl ProjectTypes {
     }
 
     pub fn exact_ancestors(&self, owner: &CodeUnit) -> Vec<CodeUnit> {
-        let mut pending = self.exact_direct_ancestors(owner);
-        let mut seen = HashSet::default();
-        while let Some(current) = pending.pop() {
-            if seen.insert(current.clone()) {
-                pending.extend(self.exact_direct_ancestors(&current));
-            }
-        }
-        let mut ancestors = seen.into_iter().collect::<Vec<_>>();
-        ancestors.sort();
-        ancestors
+        exact_transitive_closure(self.exact_direct_ancestors(owner), |current, pending| {
+            pending.extend(self.exact_direct_ancestors(current));
+        })
     }
 
     pub fn exact_descendants(&self, owner: &CodeUnit) -> Vec<CodeUnit> {
@@ -888,18 +915,14 @@ impl ProjectTypes {
                     .push(candidate.clone());
             }
         }
-        let mut pending = direct.remove(owner).unwrap_or_default();
-        let mut seen = HashSet::default();
-        while let Some(current) = pending.pop() {
-            if seen.insert(current.clone())
-                && let Some(children) = direct.get(&current)
-            {
-                pending.extend(children.iter().cloned());
-            }
-        }
-        let mut descendants = seen.into_iter().collect::<Vec<_>>();
-        descendants.sort();
-        descendants
+        exact_transitive_closure(
+            direct.remove(owner).unwrap_or_default(),
+            |current, pending| {
+                if let Some(children) = direct.get(current) {
+                    pending.extend(children.iter().cloned());
+                }
+            },
+        )
     }
 
     pub fn bulk_file_state(&self, file: &ProjectFile) -> Option<ScalaFileFactsRef<'_>> {
@@ -1013,10 +1036,7 @@ impl ProjectTypes {
         owner: &CodeUnit,
         unit: &CodeUnit,
     ) -> bool {
-        match &self.structural_parent_by_unit {
-            Some(parents) => parents.get(unit) == Some(owner),
-            None => scala.structural_parent_of(unit).as_ref() == Some(owner),
-        }
+        self.exact_structural_parent(scala, unit).as_ref() == Some(owner)
     }
 
     fn exact_structural_parent(
@@ -1044,26 +1064,7 @@ impl ProjectTypes {
         fqn: &str,
         owner: &CodeUnit,
     ) -> ScalaTypeNamespaceResolution {
-        let candidates = sorted_unique_units(
-            self.index
-                .by_fqn(fqn)
-                .iter()
-                .filter(|unit| unit.is_class() && unit.fq_name() == fqn)
-                .cloned()
-                .collect::<Vec<_>>(),
-        );
-        let same_source = candidates
-            .iter()
-            .filter(|unit| unit.source() == owner.source())
-            .cloned()
-            .collect::<Vec<_>>();
-        match same_source.as_slice() {
-            [definition] => {
-                return ScalaTypeNamespaceResolution::Resolved((*definition).clone());
-            }
-            [_, _, ..] => return ScalaTypeNamespaceResolution::Ambiguous(same_source),
-            [] => {}
-        }
+        let candidates = self.exact_type_declarations_for_owner_context(fqn, owner);
         match candidates.as_slice() {
             [] => ScalaTypeNamespaceResolution::NoMatch,
             [definition] => ScalaTypeNamespaceResolution::Resolved((*definition).clone()),
@@ -1098,7 +1099,7 @@ impl ProjectTypes {
 
     fn export_infos_for_owner(&self, owner: &CodeUnit) -> Vec<ScalaExportInfo> {
         self.bulk_file_state(owner.source())
-            .and_then(|state| state.scala_exports.get(owner).cloned())
+            .map(|state| crate::scala::scala_export_infos_for_owner(&state.scala_exports, owner))
             .unwrap_or_default()
     }
 
@@ -1139,16 +1140,8 @@ impl ProjectTypes {
         scala: &dyn ScalaSource,
         unit: &CodeUnit,
     ) -> ScalaCallableRole {
-        if unit.is_synthetic() {
-            ScalaCallableRole::PrimaryConstructor
-        } else if self
-            .exact_structural_parent(scala, unit)
-            .is_some_and(|owner| owner.identifier().trim_end_matches('$') == unit.identifier())
-        {
-            ScalaCallableRole::SecondaryConstructor
-        } else {
-            ScalaCallableRole::Ordinary
-        }
+        let parent = self.exact_structural_parent(scala, unit);
+        scala_callable_role_for_parent(unit, parent.as_ref())
     }
 
     fn direct_member_bindings(&self, owner_fqn: &str) -> ExportedMemberBindings {
@@ -1455,6 +1448,26 @@ impl ProjectTypes {
         self.exact_direct_ancestors(owner)
     }
 
+    fn resolve_direct_ancestor_levels<T>(
+        &self,
+        scala: &dyn ScalaSource,
+        mut level: Vec<CodeUnit>,
+        mut resolve_level: impl FnMut(&[CodeUnit]) -> Option<T>,
+    ) -> Option<T> {
+        let mut seen = HashSet::default();
+        while !level.is_empty() {
+            level.retain(|owner| seen.insert(owner.clone()));
+            if let Some(result) = resolve_level(&level) {
+                return Some(result);
+            }
+            level = level
+                .iter()
+                .flat_map(|owner| self.direct_ancestors_for_declaration(scala, owner))
+                .collect();
+        }
+        None
+    }
+
     pub fn exact_owner_inherits(
         &self,
         scala: &dyn ScalaSource,
@@ -1573,15 +1586,10 @@ impl ProjectTypes {
 
     fn direct_field_ancestors_for_owner(
         &self,
-        _scala: &dyn ScalaSource,
+        scala: &dyn ScalaSource,
         owner_fqn: &str,
     ) -> Vec<CodeUnit> {
-        self.direct_ancestors_by_owner
-            .as_ref()
-            .expect("Scala project hierarchy is initialized")
-            .get(owner_fqn)
-            .cloned()
-            .unwrap_or_default()
+        self.direct_ancestors_for_owner(scala, owner_fqn)
     }
 
     pub fn field_for_owner_member(
@@ -1908,22 +1916,6 @@ impl ProjectTypes {
         )
     }
 
-    fn method_declarations_for_members_with_shape<T: Borrow<CodeUnit>>(
-        &self,
-        scala: &dyn ScalaSource,
-        token: QueryToken<'_>,
-        members: &[T],
-        call_shape: &ScalaCallSiteShape,
-    ) -> Vec<CodeUnit> {
-        self.method_declarations_for_members_matching(
-            scala,
-            token,
-            members,
-            ScalaCallMatch::Shape(call_shape),
-            ScalaCallableSiteRole::Ordinary,
-        )
-    }
-
     fn callable_declarations_for_members_with_shape<T: Borrow<CodeUnit>>(
         &self,
         scala: &dyn ScalaSource,
@@ -2089,7 +2081,13 @@ impl ProjectTypes {
             .iter()
             .filter(|unit| unit.is_function())
             .collect::<Vec<_>>();
-        self.method_declarations_for_members_with_shape(scala, token, &members, call_shape)
+        self.callable_declarations_for_members_with_shape(
+            scala,
+            token,
+            &members,
+            call_shape,
+            ScalaCallableSiteRole::Ordinary,
+        )
     }
 
     pub fn bare_member_declarations_for_owner(
@@ -2118,22 +2116,16 @@ impl ProjectTypes {
         if !owner.is_class() {
             return BareMemberResolution::NoMatch;
         }
-        let mut owners = vec![owner.clone()];
-        let mut seen = HashSet::default();
-        while !owners.is_empty() {
+        self.resolve_direct_ancestor_levels(scala, vec![owner.clone()], |owners| {
             let mut matched = Vec::new();
             let mut declaring_owners = HashSet::default();
-            let mut next = Vec::new();
             for owner in owners {
-                if !seen.insert(owner.clone()) {
-                    continue;
-                }
-                let members = self.members_for_exact_owner_unit(scala, &owner, member);
+                let members = self.members_for_exact_owner_unit(scala, owner, member);
                 if members
                     .iter()
                     .any(|member| self.member_blocks_callable_lookup(scala, member))
                 {
-                    return BareMemberResolution::Unresolved;
+                    return Some(BareMemberResolution::Unresolved);
                 }
                 let mut methods = members
                     .into_iter()
@@ -2145,28 +2137,27 @@ impl ProjectTypes {
                     declaring_owners.insert(owner.clone());
                     matched.extend(methods);
                 }
-                next.extend(self.direct_ancestors_for_declaration(scala, &owner));
             }
             // Two replicas of one owner are two distinct CodeUnit values and
             // would trip this count before the family gate below is ever
             // consulted, leaving this path fail-closed for cross-built symbols
             // no matter what that gate says (#2021).
             if declaring_owners.len() > 1 && !single_replica_family(declaring_owners.iter()) {
-                return BareMemberResolution::Unresolved;
+                return Some(BareMemberResolution::Unresolved);
             }
             // A same-file overload family is one declaration (#1327), and a
             // coherent replica family is one declaration cross-built across
             // source sets (#2021); the method-value shape matching downstream
             // selects among their units.
             if matched.is_empty() {
-                owners = next;
+                None
             } else if single_replica_family(matched.iter()) {
-                return BareMemberResolution::Resolved(matched);
+                Some(BareMemberResolution::Resolved(matched))
             } else {
-                return BareMemberResolution::Unresolved;
+                Some(BareMemberResolution::Unresolved)
             }
-        }
-        BareMemberResolution::NoMatch
+        })
+        .unwrap_or(BareMemberResolution::NoMatch)
     }
 
     fn bare_member_declarations_for_owner_matching(
@@ -2180,49 +2171,46 @@ impl ProjectTypes {
         if !owner.is_class() {
             return BareMemberResolution::NoMatch;
         }
-        let mut owners = vec![owner.clone()];
-        let mut seen = HashSet::default();
-        while !owners.is_empty() {
+        self.resolve_direct_ancestor_levels(scala, vec![owner.clone()], |owners| {
             let mut matched = Vec::new();
             let mut declaring_owners = HashSet::default();
-            let mut next = Vec::new();
             for owner in owners {
-                if !seen.insert(owner.clone()) {
-                    continue;
-                }
-                let members = self.members_for_exact_owner_unit(scala, &owner, member);
+                let members = self.members_for_exact_owner_unit(scala, owner, member);
                 if members
                     .iter()
                     .any(|member| self.member_blocks_callable_lookup(scala, member))
                 {
-                    return BareMemberResolution::Unresolved;
+                    return Some(BareMemberResolution::Unresolved);
                 }
                 let methods = match call {
                     ScalaCallMatch::Arities(call_arities) => {
                         self.method_declarations_for_members(scala, token, &members, call_arities)
                     }
                     ScalaCallMatch::Shape(call_shape) => self
-                        .method_declarations_for_members_with_shape(
-                            scala, token, &members, call_shape,
+                        .callable_declarations_for_members_with_shape(
+                            scala,
+                            token,
+                            &members,
+                            call_shape,
+                            ScalaCallableSiteRole::Ordinary,
                         ),
                 };
                 if !methods.is_empty() {
                     declaring_owners.insert(owner.clone());
                     matched.extend(methods);
                 }
-                next.extend(self.direct_ancestors_for_declaration(scala, &owner));
             }
             if declaring_owners.len() > 1 {
-                return BareMemberResolution::Unresolved;
+                return Some(BareMemberResolution::Unresolved);
             }
             if !matched.is_empty() {
                 let mut unique = HashSet::default();
                 matched.retain(|method| unique.insert(method.clone()));
-                return BareMemberResolution::Resolved(matched);
+                return Some(BareMemberResolution::Resolved(matched));
             }
-            owners = next;
-        }
-        BareMemberResolution::NoMatch
+            None
+        })
+        .unwrap_or(BareMemberResolution::NoMatch)
     }
 
     /// Resolve only ordinary methods declared by a class, trait, or stable
@@ -2324,8 +2312,12 @@ impl ProjectTypes {
                         self.method_declarations_for_members(scala, token, &members, call_arities)
                     }
                     ScalaCallMatch::Shape(call_shape) => self
-                        .method_declarations_for_members_with_shape(
-                            scala, token, &members, call_shape,
+                        .callable_declarations_for_members_with_shape(
+                            scala,
+                            token,
+                            &members,
+                            call_shape,
+                            ScalaCallableSiteRole::Ordinary,
                         ),
                 };
                 if !methods.is_empty() {
@@ -2559,9 +2551,13 @@ impl ProjectTypes {
                 ScalaCallMatch::Arities(call_arities) => {
                     self.method_declarations_for_members(scala, token, &members, call_arities)
                 }
-                ScalaCallMatch::Shape(shape) => {
-                    self.method_declarations_for_members_with_shape(scala, token, &members, shape)
-                }
+                ScalaCallMatch::Shape(shape) => self.callable_declarations_for_members_with_shape(
+                    scala,
+                    token,
+                    &members,
+                    shape,
+                    ScalaCallableSiteRole::Ordinary,
+                ),
             };
             if !methods.is_empty() {
                 let replica_conflict = linearized.iter().any(|replica| {
@@ -2591,11 +2587,12 @@ impl ProjectTypes {
                             )
                             .is_empty(),
                         ScalaCallMatch::Shape(shape) => !self
-                            .method_declarations_for_members_with_shape(
+                            .callable_declarations_for_members_with_shape(
                                 scala,
                                 token,
                                 &replica_members,
                                 shape,
+                                ScalaCallableSiteRole::Ordinary,
                             )
                             .is_empty(),
                     }
@@ -2649,9 +2646,13 @@ impl ProjectTypes {
                 ScalaCallMatch::Arities(call_arities) => {
                     self.method_declarations_for_members(scala, token, &members, call_arities)
                 }
-                ScalaCallMatch::Shape(shape) => {
-                    self.method_declarations_for_members_with_shape(scala, token, &members, shape)
-                }
+                ScalaCallMatch::Shape(shape) => self.callable_declarations_for_members_with_shape(
+                    scala,
+                    token,
+                    &members,
+                    shape,
+                    ScalaCallableSiteRole::Ordinary,
+                ),
             };
             if !methods.is_empty() {
                 return BareMemberResolution::Resolved(methods);
@@ -3273,64 +3274,63 @@ impl ProjectTypes {
         member: &str,
         call_arities: Option<&[usize]>,
     ) -> MemberReturnResolution {
-        let mut level = direct_owners.to_vec();
-
-        let mut seen = HashSet::default();
         let mut saw_member = false;
-        while !level.is_empty() {
-            let mut matched_return = None;
-            let mut matched = false;
-            let mut next = Vec::new();
-            for owner in level {
-                if !seen.insert(owner.clone()) {
-                    continue;
-                }
-                let owner_fqn = owner.fq_name();
-                if call_arities.is_none()
-                    && self
-                        .exact_nested_object(scala, &owner_fqn, member)
-                        .is_some()
-                {
-                    return MemberReturnResolution::Unresolved;
-                }
-                let members = self.members_for_exact_owner_unit(scala, &owner, member);
-                saw_member |= !members.is_empty();
-                if members
-                    .iter()
-                    .any(|unit| self.member_blocks_callable_lookup(scala, unit))
-                {
-                    return MemberReturnResolution::Unresolved;
-                }
-                if !self
-                    .method_declarations_for_members(scala, token, &members, call_arities)
-                    .is_empty()
-                {
-                    matched = true;
-                    let Some(return_type) = self.member_return_type_for_members(
-                        scala,
-                        token,
-                        resolver,
-                        &members,
-                        call_arities,
-                    ) else {
-                        return MemberReturnResolution::Unresolved;
-                    };
-                    if matched_return
-                        .as_ref()
-                        .is_some_and(|resolved| resolved != &return_type)
+        if let Some(resolution) =
+            self.resolve_direct_ancestor_levels(scala, direct_owners.to_vec(), |level| {
+                let mut matched_return = None;
+                let mut matched = false;
+                for owner in level {
+                    let owner_fqn = owner.fq_name();
+                    if call_arities.is_none()
+                        && self
+                            .exact_nested_object(scala, &owner_fqn, member)
+                            .is_some()
                     {
-                        return MemberReturnResolution::Unresolved;
+                        return Some(MemberReturnResolution::Unresolved);
                     }
-                    matched_return = Some(return_type);
+                    let members = self.members_for_exact_owner_unit(scala, owner, member);
+                    saw_member |= !members.is_empty();
+                    if members
+                        .iter()
+                        .any(|unit| self.member_blocks_callable_lookup(scala, unit))
+                    {
+                        return Some(MemberReturnResolution::Unresolved);
+                    }
+                    if !self
+                        .method_declarations_for_members(scala, token, &members, call_arities)
+                        .is_empty()
+                    {
+                        matched = true;
+                        let Some(return_type) = self.member_return_type_for_members(
+                            scala,
+                            token,
+                            resolver,
+                            &members,
+                            call_arities,
+                        ) else {
+                            return Some(MemberReturnResolution::Unresolved);
+                        };
+                        if matched_return
+                            .as_ref()
+                            .is_some_and(|resolved| resolved != &return_type)
+                        {
+                            return Some(MemberReturnResolution::Unresolved);
+                        }
+                        matched_return = Some(return_type);
+                    }
                 }
-                next.extend(self.direct_ancestors_for_declaration(scala, &owner));
-            }
-            if matched {
-                return matched_return
-                    .map(MemberReturnResolution::Resolved)
-                    .unwrap_or(MemberReturnResolution::Unresolved);
-            }
-            level = next;
+                if matched {
+                    Some(
+                        matched_return
+                            .map(MemberReturnResolution::Resolved)
+                            .unwrap_or(MemberReturnResolution::Unresolved),
+                    )
+                } else {
+                    None
+                }
+            })
+        {
+            return resolution;
         }
         if saw_member {
             MemberReturnResolution::Unresolved
@@ -3459,8 +3459,7 @@ impl ProjectTypes {
             .cloned()
     }
 
-    fn unique_type_by_normalized_fqn(&self, normalized_fqn: &str) -> Option<CodeUnit> {
-        let units = self.index.by_normalized_fqn(normalized_fqn);
+    fn selected_type_namespace_declarations<'a>(&self, units: &'a [CodeUnit]) -> Vec<&'a CodeUnit> {
         let classes = units
             .iter()
             .filter(|unit| self.is_type_namespace_declaration(unit))
@@ -3470,11 +3469,16 @@ impl ProjectTypes {
             .copied()
             .filter(|unit| self.type_aliases.contains(*unit) || !unit.short_name().ends_with('$'))
             .collect::<Vec<_>>();
-        let selected = if ordinary.is_empty() {
+        if ordinary.is_empty() {
             classes
         } else {
             ordinary
-        };
+        }
+    }
+
+    fn unique_type_by_normalized_fqn(&self, normalized_fqn: &str) -> Option<CodeUnit> {
+        let units = self.index.by_normalized_fqn(normalized_fqn);
+        let selected = self.selected_type_namespace_declarations(&units);
         let [resolved] = selected.as_slice() else {
             return None;
         };
@@ -3483,20 +3487,7 @@ impl ProjectTypes {
 
     fn logical_type_by_normalized_fqn(&self, normalized_fqn: &str) -> Option<String> {
         let units = self.index.by_normalized_fqn(normalized_fqn);
-        let classes = units
-            .iter()
-            .filter(|unit| self.is_type_namespace_declaration(unit))
-            .collect::<Vec<_>>();
-        let ordinary = classes
-            .iter()
-            .copied()
-            .filter(|unit| self.type_aliases.contains(*unit) || !unit.short_name().ends_with('$'))
-            .collect::<Vec<_>>();
-        let selected = if ordinary.is_empty() {
-            classes
-        } else {
-            ordinary
-        };
+        let selected = self.selected_type_namespace_declarations(&units);
         let logical = selected
             .iter()
             .map(|unit| unit.fq_name())
@@ -3635,15 +3626,9 @@ impl ProjectTypes {
         member: &str,
     ) -> Vec<CodeUnit> {
         let candidate = format!("{}.{member}$", owner.fq_name());
-        sorted_unique_units(
-            self.index
-                .by_fqn(&candidate)
-                .iter()
-                .filter(|unit| unit.is_class() && unit.source() == owner.source())
-                .filter(|unit| self.is_exact_structural_child(scala, owner, unit))
-                .cloned()
-                .collect(),
-        )
+        self.owner_candidates_by_fqn(owner, &candidate, |unit| {
+            unit.is_class() && self.is_exact_structural_child(scala, owner, unit)
+        })
     }
 
     /// The nested objects `member` names under `owner`, reading the owner's own
@@ -3696,6 +3681,23 @@ impl ProjectTypes {
         .collect()
     }
 
+    fn owner_candidates_by_fqn(
+        &self,
+        owner: &CodeUnit,
+        candidate_fqn: &str,
+        matches: impl Fn(&CodeUnit) -> bool,
+    ) -> Vec<CodeUnit> {
+        sorted_unique_units(
+            self.index
+                .by_fqn(candidate_fqn)
+                .iter()
+                .filter(|unit| unit.source() == owner.source())
+                .filter(|unit| matches(unit))
+                .cloned()
+                .collect(),
+        )
+    }
+
     pub fn exact_nested_type(&self, owner_fqn: &str, member: &str) -> Option<String> {
         let candidate = format!("{owner_fqn}.{member}");
         let mut matches = self
@@ -3714,17 +3716,10 @@ impl ProjectTypes {
         member: &str,
     ) -> Vec<CodeUnit> {
         let candidate = format!("{}.{member}", owner.fq_name());
-        sorted_unique_units(
-            self.index
-                .by_fqn(&candidate)
-                .iter()
-                .filter(|unit| {
-                    self.is_type_namespace_declaration(unit) && unit.source() == owner.source()
-                })
-                .filter(|unit| self.is_exact_structural_child(scala, owner, unit))
-                .cloned()
-                .collect(),
-        )
+        self.owner_candidates_by_fqn(owner, &candidate, |unit| {
+            self.is_type_namespace_declaration(unit)
+                && self.is_exact_structural_child(scala, owner, unit)
+        })
     }
 
     fn projected_nested_objects_for_owner(
@@ -3734,15 +3729,9 @@ impl ProjectTypes {
         member: &str,
     ) -> Vec<CodeUnit> {
         let candidate = format!("{}.{member}$", owner.fq_name());
-        sorted_unique_units(
-            self.index
-                .by_fqn(&candidate)
-                .iter()
-                .filter(|unit| unit.is_class() && unit.source() == owner.source())
-                .filter(|unit| parents.get(*unit) == Some(owner))
-                .cloned()
-                .collect(),
-        )
+        self.owner_candidates_by_fqn(owner, &candidate, |unit| {
+            unit.is_class() && parents.get(unit) == Some(owner)
+        })
     }
 
     fn projected_nested_types_for_owner(
@@ -3752,17 +3741,9 @@ impl ProjectTypes {
         member: &str,
     ) -> Vec<CodeUnit> {
         let candidate = format!("{}.{member}", owner.fq_name());
-        sorted_unique_units(
-            self.index
-                .by_fqn(&candidate)
-                .iter()
-                .filter(|unit| {
-                    self.is_type_namespace_declaration(unit) && unit.source() == owner.source()
-                })
-                .filter(|unit| parents.get(*unit) == Some(owner))
-                .cloned()
-                .collect(),
-        )
+        self.owner_candidates_by_fqn(owner, &candidate, |unit| {
+            self.is_type_namespace_declaration(unit) && parents.get(unit) == Some(owner)
+        })
     }
 
     fn resolve_type_text(&self, resolver: &NameResolver, type_text: &str) -> Option<String> {
@@ -4298,26 +4279,20 @@ impl ProjectTypes {
 
         let mut values = Vec::new();
         for (simple, units) in self.index.package_types_in(package) {
-            let exact = units
-                .iter()
-                .filter(|unit| {
+            for unit in prefer_declared_object_declarations(
+                units,
+                |unit| {
                     unit.is_class()
                         && is_package_level_type(unit)
                         && unit.short_name().ends_with('$')
-                })
-                .collect::<Vec<_>>();
-            if !exact.is_empty() {
-                for unit in exact {
-                    values.push((simple.clone(), unit.clone()));
-                }
-                continue;
-            }
-            for unit in units.iter().filter(|unit| {
-                unit.is_class()
-                    && is_package_level_type(unit)
-                    && self.type_accepts_object_roles(scala, unit)
-            }) {
-                values.push((simple.clone(), unit.clone()));
+                },
+                |unit| {
+                    unit.is_class()
+                        && is_package_level_type(unit)
+                        && self.type_accepts_object_roles(scala, unit)
+                },
+            ) {
+                values.push((simple.clone(), unit));
             }
         }
         let values = Arc::new(values);
@@ -4482,23 +4457,9 @@ impl ProjectTypes {
         {
             return types;
         }
-        let mut grouped: HashMap<String, Vec<CodeUnit>> = HashMap::default();
-        for owner in self
-            .index
-            .by_normalized_fqn(normalized_owner)
-            .iter()
-            .filter(|unit| unit.is_class() && self.type_is_stable_owner(scala, unit))
-        {
-            for (simple, unit) in self.linearized_nested_declarations(
-                scala,
-                owner,
-                HashSet::default(),
-                |unit| self.is_type_namespace_declaration(unit),
-                scala_simple_type_name,
-            ) {
-                grouped.entry(simple).or_default().push(unit);
-            }
-        }
+        let grouped = self.nested_declarations_grouped_by_owner(scala, normalized_owner, |unit| {
+            self.is_type_namespace_declaration(unit)
+        });
         let mut values = Vec::new();
         for (simple, units) in grouped {
             let ordinary = units
@@ -4540,6 +4501,38 @@ impl ProjectTypes {
         {
             return types;
         }
+        let grouped = self.nested_declarations_grouped_by_owner(scala, normalized_owner, |unit| {
+            unit.is_class() && self.type_accepts_object_roles(scala, unit)
+        });
+        // A declared companion object is the object this name binds. A case
+        // class beside it accepts object roles through its implicit companion,
+        // and counting both would make `object O { case class G(..); object G
+        // { .. } }` an ambiguous binding for `G` -- the same rule
+        // `package_objects_in` applies at package level.
+        let mut values = Vec::new();
+        for (simple, units) in grouped {
+            for unit in prefer_declared_object_declarations(
+                units,
+                |unit| unit.is_class() && unit.short_name().ends_with('$'),
+                |_| true,
+            ) {
+                values.push((simple.clone(), unit));
+            }
+        }
+        let values = Arc::new(values);
+        self.nested_objects_by_owner
+            .lock()
+            .expect("nested Scala object cache poisoned")
+            .insert(normalized_owner.to_string(), values.clone());
+        values
+    }
+
+    fn nested_declarations_grouped_by_owner(
+        &self,
+        scala: &dyn ScalaSource,
+        normalized_owner: &str,
+        accepts: impl Fn(&CodeUnit) -> bool,
+    ) -> HashMap<String, Vec<CodeUnit>> {
         let mut grouped: HashMap<String, Vec<CodeUnit>> = HashMap::default();
         for owner in self
             .index
@@ -4551,35 +4544,13 @@ impl ProjectTypes {
                 scala,
                 owner,
                 HashSet::default(),
-                |unit| unit.is_class() && self.type_accepts_object_roles(scala, unit),
+                &accepts,
                 scala_simple_type_name,
             ) {
                 grouped.entry(simple).or_default().push(unit);
             }
         }
-        // A declared companion object is the object this name binds. A case
-        // class beside it accepts object roles through its implicit companion,
-        // and counting both would make `object O { case class G(..); object G
-        // { .. } }` an ambiguous binding for `G` -- the same rule
-        // `package_objects_in` applies at package level.
-        let mut values = Vec::new();
-        for (simple, units) in grouped {
-            let declared = units
-                .iter()
-                .filter(|unit| unit.short_name().ends_with('$'))
-                .cloned()
-                .collect::<Vec<_>>();
-            let selected = if declared.is_empty() { units } else { declared };
-            for unit in selected {
-                values.push((simple.clone(), unit));
-            }
-        }
-        let values = Arc::new(values);
-        self.nested_objects_by_owner
-            .lock()
-            .expect("nested Scala object cache poisoned")
-            .insert(normalized_owner.to_string(), values.clone());
-        values
+        grouped
     }
 
     fn importable_members_by_normalized_fqn(
@@ -5173,18 +5144,10 @@ impl ProjectTypes {
         if !companion.is_class() || !companion.short_name().ends_with('$') {
             return None;
         }
-        let structural_parent = self.exact_structural_parent(scala, &companion);
         let mut candidates = self
-            .index
-            .by_normalized_fqn(&scala_normalized_fq_name(&companion.fq_name()))
+            .exact_companion_classes(scala, &companion)
             .into_iter()
-            .filter(|candidate| {
-                candidate.is_class()
-                    && !candidate.short_name().ends_with('$')
-                    && candidate.source() == companion.source()
-                    && self.exact_structural_parent(scala, candidate) == structural_parent
-                    && self.is_case_class(scala, candidate)
-            });
+            .filter(|candidate| self.is_case_class(scala, candidate));
         let candidate = candidates.next()?;
         candidates.next().is_none().then_some(candidate)
     }
@@ -5246,25 +5209,52 @@ impl ProjectTypes {
         scala: &dyn ScalaSource,
         target: &CodeUnit,
     ) -> Vec<CodeUnit> {
-        let target_parent = self.exact_structural_parent(scala, target);
-        self.index
-            .by_normalized_fqn(&scala_normalized_fq_name(&target.fq_name()))
-            .iter()
-            .filter(|candidate| {
-                candidate.is_class()
-                    && *candidate != target
-                    && candidate.source() == target.source()
-                    && candidate.short_name().ends_with('$')
-                    && self.exact_structural_parent(scala, candidate) == target_parent
-            })
-            .cloned()
-            .collect()
+        self.exact_companion_declarations(scala, target, |candidate| {
+            candidate.short_name().ends_with('$')
+        })
     }
 
     pub fn exact_companion_classes(
         &self,
         scala: &dyn ScalaSource,
         target: &CodeUnit,
+    ) -> Vec<CodeUnit> {
+        self.exact_companion_declarations(scala, target, |candidate| {
+            !candidate.short_name().ends_with('$')
+        })
+    }
+
+    pub fn unique_inherited_object_companion(
+        &self,
+        scala: &dyn ScalaSource,
+        owner: &CodeUnit,
+    ) -> Option<CodeUnit> {
+        let normalized_owner = scala_normalized_fq_name(&owner.fq_name());
+        let candidates = self.definitions_by_normalized_fqn(&normalized_owner);
+        let mut companions = candidates.iter().filter(|candidate| {
+            candidate.is_class()
+                && *candidate != owner
+                && self.type_accepts_object_roles(scala, candidate)
+        });
+        let companion = companions.next()?;
+        if companions.next().is_some() {
+            return None;
+        }
+        if scala
+            .forward_owner_facts(companion)?
+            .supertype_lookup_paths
+            .is_empty()
+        {
+            return None;
+        }
+        Some(companion.clone())
+    }
+
+    fn exact_companion_declarations(
+        &self,
+        scala: &dyn ScalaSource,
+        target: &CodeUnit,
+        accepts_companion: impl Fn(&CodeUnit) -> bool,
     ) -> Vec<CodeUnit> {
         let target_parent = self.exact_structural_parent(scala, target);
         self.index
@@ -5274,7 +5264,7 @@ impl ProjectTypes {
                 candidate.is_class()
                     && *candidate != target
                     && candidate.source() == target.source()
-                    && !candidate.short_name().ends_with('$')
+                    && accepts_companion(candidate)
                     && self.exact_structural_parent(scala, candidate) == target_parent
             })
             .cloned()
@@ -5322,11 +5312,27 @@ impl ProjectTypes {
         scala: &dyn ScalaSource,
         owner: &CodeUnit,
     ) -> bool {
-        ["unapply", "unapplySeq"].into_iter().any(|member| {
-            self.members_for_exact_owner_unit(scala, owner, member)
-                .iter()
-                .any(|unit| unit.is_function())
-        })
+        self.visit_extractor_entry_points(scala, owner, |_| true)
+    }
+
+    fn visit_extractor_entry_points(
+        &self,
+        scala: &dyn ScalaSource,
+        owner: &CodeUnit,
+        mut visit: impl FnMut(CodeUnit) -> bool,
+    ) -> bool {
+        for member in ["unapply", "unapplySeq"] {
+            for unit in self
+                .members_for_exact_owner_unit(scala, owner, member)
+                .into_iter()
+                .filter(CodeUnit::is_function)
+            {
+                if visit(unit) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// The extractor entry points `owner` declares.
@@ -5343,22 +5349,30 @@ impl ProjectTypes {
         owner: &CodeUnit,
     ) -> Vec<CodeUnit> {
         let mut entry_points = Vec::new();
-        for member in ["unapply", "unapplySeq"] {
-            entry_points.extend(
-                self.members_for_exact_owner_unit(scala, owner, member)
-                    .into_iter()
-                    .filter(|unit| unit.is_function()),
-            );
-        }
+        self.visit_extractor_entry_points(scala, owner, |unit| {
+            entry_points.push(unit);
+            false
+        });
         entry_points
     }
 
     pub fn class_accepts_extractor_role(&self, scala: &dyn ScalaSource, target: &CodeUnit) -> bool {
+        self.class_or_companion_accepts_role(scala, target, |companion| {
+            self.declares_extractor_entry_point(scala, companion)
+        })
+    }
+
+    fn class_or_companion_accepts_role(
+        &self,
+        scala: &dyn ScalaSource,
+        target: &CodeUnit,
+        companion_has_role: impl Fn(&CodeUnit) -> bool,
+    ) -> bool {
         self.is_case_class(scala, target)
             || self
                 .exact_companion_objects(scala, target)
                 .iter()
-                .any(|companion| self.declares_extractor_entry_point(scala, companion))
+                .any(companion_has_role)
     }
 
     fn class_application_matches_with_shape(
@@ -5720,20 +5734,8 @@ impl ProjectTypes {
         companion: &CodeUnit,
         call_shape: Option<&ScalaCallSiteShape>,
     ) -> Option<CodeUnit> {
-        let normalized_owner = scala_normalized_fq_name(&type_target.fq_name());
-        let normalized_owners = self.index.by_normalized_fqn(&normalized_owner);
-        let mut physical_companions = normalized_owners.iter().filter(|candidate| {
-            candidate.is_class()
-                && *candidate != type_target
-                && self.type_accepts_object_roles(scala, candidate)
-        });
-        let physical_companion = physical_companions.next()?;
-        if physical_companion != companion || physical_companions.next().is_some() {
-            return None;
-        }
-
-        let facts = scala.forward_owner_facts(companion)?;
-        if facts.supertype_lookup_paths.is_empty() {
+        let physical_companion = self.unique_inherited_object_companion(scala, type_target)?;
+        if &physical_companion != companion {
             return None;
         }
 
@@ -5754,15 +5756,11 @@ impl ProjectTypes {
     }
 
     pub fn class_accepts_apply_role(&self, scala: &dyn ScalaSource, target: &CodeUnit) -> bool {
-        self.is_case_class(scala, target)
-            || self
-                .exact_companion_objects(scala, target)
+        self.class_or_companion_accepts_role(scala, target, |companion| {
+            self.members_for_exact_owner_unit(scala, companion, "apply")
                 .iter()
-                .any(|companion| {
-                    self.members_for_exact_owner_unit(scala, companion, "apply")
-                        .iter()
-                        .any(|unit| unit.is_function())
-                })
+                .any(|unit| unit.is_function())
+        })
     }
 
     fn class_companion_apply_call_matches_with_shape(
@@ -5906,7 +5904,7 @@ impl ProjectTypes {
         })
     }
 
-    fn declaration_ranges_for(&self, target: &CodeUnit) -> Vec<Range> {
+    pub fn declaration_ranges_for(&self, target: &CodeUnit) -> Vec<Range> {
         self.bulk_file_state(target.source())
             .and_then(|state| state.ranges.get(target).cloned())
             .unwrap_or_default()
@@ -5923,14 +5921,7 @@ impl ProjectTypes {
         scala: &dyn ScalaSource,
         file: &ProjectFile,
     ) -> CachedScalaSourceFacts {
-        let cell = self
-            .source_facts_by_file
-            .lock()
-            .expect("Scala source-facts cache poisoned")
-            .entry(file.clone())
-            .or_insert_with(|| Arc::new(OnceLock::new()))
-            .clone();
-        cell.get_or_init(|| {
+        self.source_facts_by_file.get_with(file.clone(), || {
             Arc::new(
                 scala
                     .canonical_source_facts(file)
@@ -5938,7 +5929,6 @@ impl ProjectTypes {
                     .unwrap_or_default(),
             )
         })
-        .clone()
     }
 
     pub fn source_for_file(&self, scala: &dyn ScalaSource, file: &ProjectFile) -> Option<String> {
@@ -6485,12 +6475,11 @@ impl VisibleNameBindings {
     }
 
     fn resolve_exact(&self, name: &str) -> Option<CodeUnit> {
-        let binding = self.entries.get(name)?;
-        let declarations = binding.declarations.iter().collect::<Vec<_>>();
-        let [declaration] = declarations.as_slice() else {
+        let candidates = self.resolve_exact_candidates(name);
+        let [declaration] = candidates.as_slice() else {
             return None;
         };
-        (binding.candidates.len() == 1).then(|| (*declaration).clone())
+        Some((*declaration).clone())
     }
 
     /// Every physical declaration a bare name binds to when they are all one
@@ -6504,16 +6493,11 @@ impl VisibleNameBindings {
     /// which carries no coherence gate at all because its caller layers an
     /// import-collision check on top instead.
     fn resolve_exact_units(&self, name: &str) -> Vec<CodeUnit> {
-        let Some(binding) = self.entries.get(name) else {
-            return Vec::new();
-        };
-        if binding.candidates.len() != 1
-            || binding.declarations.is_empty()
-            || !single_replica_family(binding.declarations.iter())
-        {
+        let candidates = self.resolve_exact_candidates(name);
+        if candidates.is_empty() || !single_replica_family(candidates.iter()) {
             return Vec::new();
         }
-        sorted_unique_units(binding.declarations.iter().cloned().collect())
+        candidates
     }
 
     fn resolve_exact_candidates(&self, name: &str) -> Vec<CodeUnit> {
@@ -6568,6 +6552,19 @@ fn add_wildcard_member_bindings(
     }
 }
 
+fn hierarchy_package_class_declarations(
+    types: &ProjectTypes,
+    package: &str,
+    simple: &str,
+) -> Vec<CodeUnit> {
+    types
+        .index
+        .types_in_package(package, simple)
+        .into_iter()
+        .filter(|unit| unit.is_class() && is_package_level_type(unit))
+        .collect()
+}
+
 fn add_hierarchy_package_type_bindings<F>(
     names: &mut VisibleNameBindings,
     types: &ProjectTypes,
@@ -6577,12 +6574,7 @@ fn add_hierarchy_package_type_bindings<F>(
 ) where
     F: Fn(&CodeUnit) -> u8,
 {
-    let package_level = types
-        .index
-        .types_in_package(package, simple)
-        .into_iter()
-        .filter(|unit| unit.is_class() && is_package_level_type(unit))
-        .collect::<Vec<_>>();
+    let package_level = hierarchy_package_class_declarations(types, package, simple);
     let ordinary = package_level
         .iter()
         .filter(|unit| !unit.short_name().ends_with('$'))
@@ -6607,13 +6599,9 @@ fn add_hierarchy_package_object_bindings<F>(
 ) where
     F: Fn(&CodeUnit) -> u8,
 {
-    for decl in types
-        .index
-        .types_in_package(package, simple)
+    for decl in hierarchy_package_class_declarations(types, package, simple)
         .into_iter()
-        .filter(|unit| {
-            unit.is_class() && is_package_level_type(unit) && unit.short_name().ends_with('$')
-        })
+        .filter(|unit| unit.short_name().ends_with('$'))
     {
         object_names.add_declaration(simple.to_string(), &decl, priority(&decl));
     }
@@ -7402,19 +7390,18 @@ impl NameResolver {
     }
 
     pub fn type_binding_is_ambiguous(&self, raw: &str) -> bool {
-        let Some(simple) = simple_type_name(raw) else {
-            return false;
-        };
-        self.import_collision_blocks(simple, self.names.priority(simple))
-            || self.names.is_ambiguous(simple)
+        self.binding_is_ambiguous(raw, &self.names)
     }
 
     pub fn object_binding_is_ambiguous(&self, raw: &str) -> bool {
+        self.binding_is_ambiguous(raw, &self.object_names)
+    }
+
+    fn binding_is_ambiguous(&self, raw: &str, names: &VisibleNameBindings) -> bool {
         let Some(simple) = simple_type_name(raw) else {
             return false;
         };
-        self.import_collision_blocks(simple, self.object_names.priority(simple))
-            || self.object_names.is_ambiguous(simple)
+        self.import_collision_blocks(simple, names.priority(simple)) || names.is_ambiguous(simple)
     }
 
     pub fn resolve_object(&self, raw: &str) -> Option<String> {
@@ -7596,6 +7583,26 @@ impl PhysicalCallableTargets {
 /// (#2219).
 pub fn is_package_level_type(unit: &CodeUnit) -> bool {
     unit.declaration_segment_count() == 1
+}
+
+fn prefer_declared_object_declarations(
+    units: Vec<CodeUnit>,
+    is_declared_object: impl Fn(&CodeUnit) -> bool,
+    accepts_implicit_object_role: impl Fn(&CodeUnit) -> bool,
+) -> Vec<CodeUnit> {
+    let declared = units
+        .iter()
+        .filter(|unit| is_declared_object(unit))
+        .cloned()
+        .collect::<Vec<_>>();
+    if declared.is_empty() {
+        units
+            .into_iter()
+            .filter(accepts_implicit_object_role)
+            .collect()
+    } else {
+        declared
+    }
 }
 
 fn method_arities_compatible(method: Option<usize>, ancestor: Option<usize>) -> bool {
@@ -7991,14 +7998,7 @@ pub fn parse_scala_query_file(scala: &dyn ScalaSource, source: &str) -> Option<T
     if source.is_empty() {
         return None;
     }
-    let mut parser = Parser::new();
-    if parser
-        .set_language(&crate::scala::language::LANGUAGE.into())
-        .is_err()
-    {
-        return None;
-    }
-    let tree = parser.parse(source, None)?;
+    let tree = crate::scala::language::parse_tree(source).ok()??;
     #[cfg(any(test, feature = "test-support"))]
     scala.record_query_parse();
     Some(tree)
@@ -8533,9 +8533,24 @@ impl ScalaScan<'_, '_, '_> {
     }
 
     fn visible_type(&self, token: QueryToken<'_>, node: Node<'_>, name: &str) -> Option<String> {
+        self.resolve_visible_type(
+            token,
+            node,
+            |declaration| declaration.fq_name(),
+            || self.resolver.resolve(name),
+        )
+    }
+
+    fn resolve_visible_type<T>(
+        &self,
+        token: QueryToken<'_>,
+        node: Node<'_>,
+        resolved: impl FnOnce(CodeUnit) -> T,
+        no_match: impl FnOnce() -> Option<T>,
+    ) -> Option<T> {
         match self.exact_lexically_visible_type(token, node) {
-            ScalaTypeNamespaceResolution::Resolved(declaration) => Some(declaration.fq_name()),
-            ScalaTypeNamespaceResolution::NoMatch => self.resolver.resolve(name),
+            ScalaTypeNamespaceResolution::Resolved(declaration) => Some(resolved(declaration)),
+            ScalaTypeNamespaceResolution::NoMatch => no_match(),
             ScalaTypeNamespaceResolution::AuthoritativeMiss
             | ScalaTypeNamespaceResolution::Ambiguous(_) => None,
         }
@@ -8547,27 +8562,21 @@ impl ScalaScan<'_, '_, '_> {
         node: Node<'_>,
         name: &str,
     ) -> Option<ScalaResolvedReference> {
-        match self.exact_lexically_visible_type(token, node) {
-            ScalaTypeNamespaceResolution::Resolved(declaration) => {
-                Some(ScalaResolvedReference::Exact(declaration))
-            }
+        self.resolve_visible_type(token, node, ScalaResolvedReference::Exact, || {
             // Single-unit by contract: this produces one
             // `ScalaResolvedReference`, and a cross-built replica falls
             // through to the `Logical` arm below, whose catalog bucket carries
             // every family member's target id since #2021. Migrating this to
             // the plural resolver would duplicate that routing, not extend it.
-            ScalaTypeNamespaceResolution::NoMatch => self
-                .resolver
+            self.resolver
                 .resolve_unit(name)
                 .map(ScalaResolvedReference::Exact)
                 .or_else(|| {
                     self.resolver
                         .resolve(name)
                         .map(ScalaResolvedReference::Logical)
-                }),
-            ScalaTypeNamespaceResolution::AuthoritativeMiss
-            | ScalaTypeNamespaceResolution::Ambiguous(_) => None,
-        }
+                })
+        })
     }
 
     fn lexically_visible_object(&self, byte: usize, name: &str) -> Option<String> {
@@ -8643,14 +8652,7 @@ impl ScalaScan<'_, '_, '_> {
         } else {
             UsageHitKind::Reference
         };
-        self.sink.record(
-            ScalaResolvedReference::Exact(callee),
-            role,
-            classify_reference_node(node),
-            hit_kind,
-            node.start_byte(),
-            node.end_byte(),
-        );
+        self.record_reference(ScalaResolvedReference::Exact(callee), role, node, hit_kind);
     }
 
     fn record_exact_import(&mut self, callee: CodeUnit, role: ScalaReferenceRole, node: Node<'_>) {
@@ -8792,7 +8794,8 @@ impl ScalaScan<'_, '_, '_> {
     }
 
     fn record_exact_callable(&mut self, callee: CodeUnit, node: Node<'_>) {
-        let Some(call_shape) = call_site_shape_for_reference_with_parents(node, self.parents)
+        let Some(call_shape) =
+            call_site_shape_for_reference_with_parents(node, self.parents, self.source)
         else {
             self.record_exact(callee, ScalaReferenceRole::Callable, node);
             return;
@@ -8809,7 +8812,8 @@ impl ScalaScan<'_, '_, '_> {
     /// usage surface must not prove it: navigation at the label names the
     /// argument's own binding, never the callable (#3390).
     fn record_exact_declared_callable(&mut self, callee: CodeUnit, node: Node<'_>) {
-        let Some(call_shape) = call_site_shape_for_reference_with_parents(node, self.parents)
+        let Some(call_shape) =
+            call_site_shape_for_reference_with_parents(node, self.parents, self.source)
         else {
             self.sink.record(
                 ScalaResolvedReference::Exact(callee),
@@ -8854,7 +8858,7 @@ impl ScalaScan<'_, '_, '_> {
         // is the entry point; the shape belongs to the owner, so the site is
         // recorded without one (#2078).
         let call_shape = (role != ScalaReferenceRole::CompanionExtractor)
-            .then(|| call_site_shape_for_reference_with_parents(node, self.parents))
+            .then(|| call_site_shape_for_reference_with_parents(node, self.parents, self.source))
             .flatten();
         let Some(call_shape) = call_shape else {
             self.record_exact(callee, role, node);
@@ -8908,24 +8912,32 @@ impl ScalaScan<'_, '_, '_> {
         role: ScalaReferenceRole,
         node: Node<'_>,
     ) {
+        self.record_reference(callee, role, node, UsageHitKind::Reference);
+    }
+
+    fn record_reference(
+        &mut self,
+        callee: ScalaResolvedReference,
+        role: ScalaReferenceRole,
+        node: Node<'_>,
+        hit_kind: UsageHitKind,
+    ) {
         self.sink.record(
             callee,
             role,
             classify_reference_node(node),
-            UsageHitKind::Reference,
+            hit_kind,
             node.start_byte(),
             node.end_byte(),
         );
     }
 
     fn record_logical(&mut self, callee: String, role: ScalaReferenceRole, node: Node<'_>) {
-        self.sink.record(
+        self.record_reference(
             ScalaResolvedReference::Logical(callee),
             role,
-            classify_reference_node(node),
+            node,
             UsageHitKind::Reference,
-            node.start_byte(),
-            node.end_byte(),
         );
     }
 
@@ -9504,11 +9516,19 @@ fn scala_reference_is_invoked(node: Node<'_>, parents: &ParentIndex<'_>) -> bool
     if is_call_function_reference_with_parents(node, parents) {
         return true;
     }
-    parents.parent(node).is_some_and(|parent| {
-        parent.kind() == "field_expression"
-            && parent.child_by_field_name("field") == Some(node)
-            && is_call_function_reference_with_parents(parent, parents)
-    })
+    parents
+        .parent(node)
+        .is_some_and(|parent| scala_field_reference_is_invoked(parent, node, parents))
+}
+
+fn scala_field_reference_is_invoked(
+    parent: Node<'_>,
+    node: Node<'_>,
+    parents: &ParentIndex<'_>,
+) -> bool {
+    parent.kind() == "field_expression"
+        && parent.child_by_field_name("field") == Some(node)
+        && is_call_function_reference_with_parents(parent, parents)
 }
 
 /// The term field named `member` that the template chain enclosing `byte`
@@ -9651,7 +9671,8 @@ fn record_reference(
                         .or_else(|| ctx.resolver.resolve_object(text))
                         .as_deref(),
                     text,
-                    call_site_shape_for_reference_with_parents(node, ctx.parents).as_ref(),
+                    call_site_shape_for_reference_with_parents(node, ctx.parents, ctx.source)
+                        .as_ref(),
                     TypeApplicationRole::Extractor,
                     Some(ctx.source_file),
                 );
@@ -9705,7 +9726,8 @@ fn record_reference(
                         Some(&fqn),
                         None,
                         text,
-                        call_site_shape_for_reference_with_parents(node, ctx.parents).as_ref(),
+                        call_site_shape_for_reference_with_parents(node, ctx.parents, ctx.source)
+                            .as_ref(),
                         TypeApplicationRole::ExplicitConstructor,
                         Some(ctx.source_file),
                     );
@@ -9783,9 +9805,11 @@ fn record_reference(
                             .and_then(|resolution| resolution.as_precise())
                         && receiver_bindings.len() > 1
                     {
-                        let Some(call_shape) =
-                            call_site_shape_for_reference_with_parents(field, ctx.parents)
-                        else {
+                        let Some(call_shape) = call_site_shape_for_reference_with_parents(
+                            field,
+                            ctx.parents,
+                            ctx.source,
+                        ) else {
                             return;
                         };
                         let mut methods = Vec::new();
@@ -9818,9 +9842,11 @@ fn record_reference(
                         return;
                     }
                     if let Some(owner) = receiver_value_owner(receiver, token, ctx, bindings) {
-                        let Some(call_shape) =
-                            call_site_shape_for_reference_with_parents(field, ctx.parents)
-                        else {
+                        let Some(call_shape) = call_site_shape_for_reference_with_parents(
+                            field,
+                            ctx.parents,
+                            ctx.source,
+                        ) else {
                             return;
                         };
                         let owner_fqn = match &owner {
@@ -9932,7 +9958,7 @@ fn record_reference(
                         && !record_qualified_package_call(field, token, ctx)
                     {
                         let call_arities =
-                            call_arities_for_reference_with_parents(field, ctx.parents);
+                            call_arities_for_reference_with_parents(field, ctx.parents, ctx.source);
                         let extensions =
                             visible_extensions(ctx, token, name, None, call_arities.as_deref());
                         if extensions.is_empty() {
@@ -9948,8 +9974,12 @@ fn record_reference(
                                     name,
                                     ScalaReferenceRole::Callable,
                                     ScalaLogicalReceiver::StaticOwner,
-                                    call_site_shape_for_reference_with_parents(field, ctx.parents)
-                                        .as_ref(),
+                                    call_site_shape_for_reference_with_parents(
+                                        field,
+                                        ctx.parents,
+                                        ctx.source,
+                                    )
+                                    .as_ref(),
                                     field,
                                 );
                             } else {
@@ -9972,9 +10002,11 @@ fn record_reference(
                     if name.is_empty() {
                         return;
                     }
-                    let Some(call_shape) =
-                        call_site_shape_for_reference_with_parents(function, ctx.parents)
-                    else {
+                    let Some(call_shape) = call_site_shape_for_reference_with_parents(
+                        function,
+                        ctx.parents,
+                        ctx.source,
+                    ) else {
                         return;
                     };
                     let method_value_shape =
@@ -10047,11 +10079,12 @@ fn record_reference(
                             return;
                         }
                         let imported_refs = imported_units.iter().collect::<Vec<_>>();
-                        for target in ctx.types.method_declarations_for_members_with_shape(
+                        for target in ctx.types.callable_declarations_for_members_with_shape(
                             ctx.scala,
                             token,
                             &imported_refs,
                             &call_shape,
+                            ScalaCallableSiteRole::Ordinary,
                         ) {
                             ctx.record_exact_callable_with_shape(target, function, &call_shape);
                         }
@@ -10112,7 +10145,8 @@ fn record_reference(
             let Some(owner) = receiver_value_owner(receiver, token, ctx, bindings) else {
                 return;
             };
-            let call_arities = call_arities_for_reference_with_parents(operator, ctx.parents);
+            let call_arities =
+                call_arities_for_reference_with_parents(operator, ctx.parents, ctx.source);
             let resolution = match &owner {
                 ScalaValueOwner::Exact(owner) => {
                     ctx.types.effective_method_declarations_for_exact_owner(
@@ -10399,7 +10433,7 @@ fn record_reference(
             }
             if !is_terminal_stable_field_reference(node)
                 && let Some(call_shape) =
-                    call_site_shape_for_reference_with_parents(node, ctx.parents)
+                    call_site_shape_for_reference_with_parents(node, ctx.parents, ctx.source)
                 && call_shape.type_arguments_only
             {
                 if record_lexically_visible_call(node, token, name, &call_shape, ctx) {
@@ -10564,19 +10598,20 @@ fn record_reference(
                         None
                     }
                 };
-                let call_shape = call_site_shape_for_reference_with_parents(node, ctx.parents)
-                    .map(|shape| shape.with_method_value_shape(method_value_shape.clone()))
-                    .or_else(|| {
-                        method_value_shape.map(|shape| ScalaCallSiteShape {
-                            lists: Vec::new(),
-                            leading_literal_argument_types: None,
-                            method_value_arity: Some(shape.arity),
-                            method_value_parameter_types: shape.parameter_types,
-                            method_value_parameter_types_authoritative: shape
-                                .parameter_types_authoritative,
-                            type_arguments_only: false,
-                        })
-                    });
+                let call_shape =
+                    call_site_shape_for_reference_with_parents(node, ctx.parents, ctx.source)
+                        .map(|shape| shape.with_method_value_shape(method_value_shape.clone()))
+                        .or_else(|| {
+                            method_value_shape.map(|shape| ScalaCallSiteShape {
+                                lists: Vec::new(),
+                                leading_literal_argument_types: None,
+                                method_value_arity: Some(shape.arity),
+                                method_value_parameter_types: shape.parameter_types,
+                                method_value_parameter_types_authoritative: shape
+                                    .parameter_types_authoritative,
+                                type_arguments_only: false,
+                            })
+                        });
                 if record_union_receiver_parameterless_methods(
                     qualifier, token, name, node, ctx, bindings,
                 ) {
@@ -10916,7 +10951,7 @@ fn record_foreign_type_reference(
     // type node rather than from the leaf.
     if let Some(constructed) = foreign_constructed_type_root(node, ctx.parents)
         && let Some(call_shape) =
-            call_site_shape_for_reference_with_parents(constructed, ctx.parents)
+            call_site_shape_for_reference_with_parents(constructed, ctx.parents, ctx.source)
     {
         ctx.sink.record_callable(
             ScalaResolvedReference::Logical(foreign),
@@ -11308,7 +11343,9 @@ fn record_qualified_package_call(
     if reference.segments.len() < 2 {
         return false;
     }
-    let Some(call_shape) = call_site_shape_for_reference_with_parents(field, ctx.parents) else {
+    let Some(call_shape) =
+        call_site_shape_for_reference_with_parents(field, ctx.parents, ctx.source)
+    else {
         return false;
     };
     let fqn = reference.segments.join(".");
@@ -11370,12 +11407,11 @@ fn reference_is_owned_by_invocation(node: Node<'_>, parents: &ParentIndex<'_>) -
     if parent.kind() == "postfix_expression" && scala_postfix_operator_node(parent) == Some(node) {
         return true;
     }
-    parent.kind() == "field_expression"
-        && parent.child_by_field_name("field") == Some(node)
-        && is_call_function_reference_with_parents(parent, parents)
+    scala_field_reference_is_invoked(parent, node, parents)
 }
 
-fn scala_postfix_operator_node(node: Node<'_>) -> Option<Node<'_>> {
+/// Find the identifier or operator node that names a Scala postfix call.
+pub fn scala_postfix_operator_node(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
     let mut operator = None;
     for child in node.named_children(&mut cursor) {
@@ -11386,7 +11422,8 @@ fn scala_postfix_operator_node(node: Node<'_>) -> Option<Node<'_>> {
     operator
 }
 
-fn scala_postfix_receiver_node<'tree>(
+/// Find the receiver child that precedes a Scala postfix call's operator.
+pub fn scala_postfix_receiver_node<'tree>(
     node: Node<'tree>,
     operator: Node<'tree>,
 ) -> Option<Node<'tree>> {
@@ -11511,7 +11548,7 @@ fn resolve_unqualified_type_application(
     if class_fqn.is_none() && object_fqn.is_none() {
         return None;
     }
-    let call_shape = call_site_shape_for_reference_with_parents(function, ctx.parents);
+    let call_shape = call_site_shape_for_reference_with_parents(function, ctx.parents, ctx.source);
     let resolution = ctx.types.resolve_type_application(
         ctx.scala,
         token,
@@ -11551,7 +11588,7 @@ fn record_super_member(
     let Some(owner) = ctx.enclosing_class_unit(node.start_byte()).cloned() else {
         return;
     };
-    let call_shape = call_site_shape_for_reference_with_parents(node, ctx.parents);
+    let call_shape = call_site_shape_for_reference_with_parents(node, ctx.parents, ctx.source);
     let call = match call_shape.as_ref() {
         Some(shape) => ScalaCallMatch::Shape(shape),
         None => ScalaCallMatch::Arities(None),
@@ -11606,7 +11643,7 @@ fn record_explicit_case_class_apply(
         Some(&class.fq_name()),
         None,
         &scala_short_name_terminal_segment(class.short_name()),
-        call_site_shape_for_reference_with_parents(field, ctx.parents).as_ref(),
+        call_site_shape_for_reference_with_parents(field, ctx.parents, ctx.source).as_ref(),
         TypeApplicationRole::BareApplication,
         Some(ctx.source_file),
     );
@@ -11944,7 +11981,8 @@ fn record_qualified_stable_reference(
         class_fqn.as_deref(),
         object_fqn.as_deref(),
         name,
-        call_site_shape_for_reference_with_parents(reference.expression, ctx.parents).as_ref(),
+        call_site_shape_for_reference_with_parents(reference.expression, ctx.parents, ctx.source)
+            .as_ref(),
         role,
         Some(ctx.source_file),
     );
@@ -11972,6 +12010,7 @@ fn record_qualified_stable_reference(
                         call_site_shape_for_reference_with_parents(
                             reference.expression,
                             ctx.parents,
+                            ctx.source,
                         )
                         .as_ref(),
                         ScalaCallableSiteRole::PrimaryConstruction,
@@ -12343,7 +12382,7 @@ fn record_lexically_visible_field_reference(
     // that declares a callable the application can reach yields to the
     // shape-aware callable path instead of answering with its field.
     let applied_call_shape = is_call_function_reference_with_parents(node, ctx.parents)
-        .then(|| call_site_shape_for_reference_with_parents(node, ctx.parents))
+        .then(|| call_site_shape_for_reference_with_parents(node, ctx.parents, ctx.source))
         .flatten();
     let mut owner = ctx.enclosing_class_unit(node.start_byte()).cloned();
     let mut seen = HashSet::default();
@@ -12542,7 +12581,9 @@ fn call_parameter_method_value_context(
         };
         function = inner;
     }
-    let Some(call_arities) = call_arities_for_reference_with_parents(function, ctx.parents) else {
+    let Some(call_arities) =
+        call_arities_for_reference_with_parents(function, ctx.parents, ctx.source)
+    else {
         return ScalaMethodValueContext::Unknown;
     };
     let methods = match function.kind() {
@@ -12919,9 +12960,9 @@ fn record_extension_scope_parameterless_method(
     ctx: &mut ScalaScan<'_, '_, '_>,
 ) -> bool {
     for extension in enclosing_extension_definitions_with_parents(node, ctx.parents) {
-        let Some(receiver_type) =
-            scala_extension_receiver_type_node_local(extension.child_by_field_name("parameters"))
-        else {
+        let Some(receiver_type) = crate::scala::declarations::scala_extension_receiver_type_node(
+            extension.child_by_field_name("parameters"),
+        ) else {
             continue;
         };
         let Some(receiver_owner) = resolve_receiver_type_node(receiver_type, token, ctx) else {
@@ -12997,30 +13038,48 @@ fn enclosing_extension_definitions_with_parents<'tree>(
     definitions
 }
 
-fn scala_extension_receiver_type_node_local(
-    receiver_parameters: Option<Node<'_>>,
-) -> Option<Node<'_>> {
-    let receiver_parameters = receiver_parameters?;
-    let mut cursor = receiver_parameters.walk();
-    let mut receivers = receiver_parameters
-        .named_children(&mut cursor)
-        .filter(|parameter| matches!(parameter.kind(), "parameter" | "class_parameter"));
-    let receiver = receivers.next()?;
-    if receivers.next().is_some() {
-        return None;
-    }
-    receiver.child_by_field_name("type")
-}
-
 fn declaration_within_node(
     ctx: &ScalaScan<'_, '_, '_>,
     declaration: &CodeUnit,
     node: Node<'_>,
 ) -> bool {
+    let node_range = brokk_bifrost_core::analyzer::tree_walk::node_range(node);
     ctx.scala
         .ranges(declaration)
         .iter()
-        .any(|range| range.start_byte >= node.start_byte() && range.end_byte <= node.end_byte())
+        .any(|range| node_range.contains(range))
+}
+
+enum TemplateMemberScope<'a> {
+    Exact(&'a CodeUnit),
+    Inherited(Vec<CodeUnit>),
+    NoMatch,
+    Unresolved,
+}
+
+fn template_member_scope<'ctx>(
+    declaration: Node<'_>,
+    token: QueryToken<'_>,
+    member: &str,
+    ctx: &'ctx ScalaScan<'_, '_, '_>,
+) -> TemplateMemberScope<'ctx> {
+    if let Some(owner) = ctx
+        .class_ranges
+        .unit_for_exact_span(declaration.start_byte(), declaration.end_byte())
+    {
+        return TemplateMemberScope::Exact(owner);
+    }
+    if template_direct_term_member_named(declaration, member, ctx.source) {
+        return TemplateMemberScope::Unresolved;
+    }
+    let Some(owners) = template_supertype_owners(declaration, token, ctx) else {
+        return TemplateMemberScope::Unresolved;
+    };
+    if owners.is_empty() {
+        TemplateMemberScope::NoMatch
+    } else {
+        TemplateMemberScope::Inherited(owners)
+    }
 }
 
 fn ordinary_class_member_declarations_for_template(
@@ -13030,34 +13089,27 @@ fn ordinary_class_member_declarations_for_template(
     call_arities: Option<&[usize]>,
     ctx: &ScalaScan<'_, '_, '_>,
 ) -> BareMemberResolution {
-    if let Some(owner) = ctx
-        .class_ranges
-        .unit_for_exact_span(declaration.start_byte(), declaration.end_byte())
-    {
-        return ctx.types.ordinary_class_member_declarations_for_owner(
-            ctx.scala,
-            token,
-            owner,
-            member,
-            call_arities,
-        );
-    }
-    if template_direct_term_member_named(declaration, member, ctx.source) {
-        return BareMemberResolution::Unresolved;
-    }
-    let Some(owners) = template_supertype_owners(declaration, token, ctx) else {
-        return BareMemberResolution::Unresolved;
-    };
-    if owners.is_empty() {
-        BareMemberResolution::NoMatch
-    } else {
-        ctx.types.ordinary_class_member_declarations_for_owners(
-            ctx.scala,
-            token,
-            &owners,
-            member,
-            call_arities,
-        )
+    match template_member_scope(declaration, token, member, ctx) {
+        TemplateMemberScope::Exact(owner) => {
+            ctx.types.ordinary_class_member_declarations_for_owner(
+                ctx.scala,
+                token,
+                owner,
+                member,
+                call_arities,
+            )
+        }
+        TemplateMemberScope::Inherited(owners) => {
+            ctx.types.ordinary_class_member_declarations_for_owners(
+                ctx.scala,
+                token,
+                &owners,
+                member,
+                call_arities,
+            )
+        }
+        TemplateMemberScope::NoMatch => BareMemberResolution::NoMatch,
+        TemplateMemberScope::Unresolved => BareMemberResolution::Unresolved,
     }
 }
 
@@ -13278,7 +13330,7 @@ fn receiver_type_fqn(
         }),
         "instance_expression" => constructed_type(receiver, token, ctx),
         "call_expression" => call_result_type(receiver, token, ctx, bindings),
-        kind => scala_literal_type_name(kind).map(|name| {
+        _ => scala_literal_type_name(ctx.source, receiver).map(|name| {
             let scala_fqn = format!("scala.{name}");
             let declarations = ctx.types.index.by_fqn(&scala_fqn);
             if declarations.len() == 1 && declarations[0].is_class() {
@@ -13738,7 +13790,7 @@ fn direct_owner_field_owner(node: Node<'_>, ctx: &ScalaScan<'_, '_, '_>) -> Opti
     None
 }
 
-fn scala_named_template_owner(mut template: Node<'_>) -> Option<Node<'_>> {
+pub fn scala_named_template_owner(mut template: Node<'_>) -> Option<Node<'_>> {
     while let Some(parent) = template.parent() {
         match parent.kind() {
             "class_definition" | "object_definition" | "trait_definition" | "enum_definition" => {
@@ -13773,19 +13825,7 @@ fn constructed_type_declaration(
         return exact_constructed_type_target(type_node, token, target, name, ctx);
     }
     let class_fqn = resolve_receiver_type_node(type_node, token, ctx)?;
-    ctx.types
-        .resolve_type_application(
-            ctx.scala,
-            token,
-            &ctx.resolver,
-            Some(&class_fqn),
-            None,
-            name,
-            call_site_shape_for_reference_with_parents(type_node, ctx.parents).as_ref(),
-            TypeApplicationRole::ExplicitConstructor,
-            Some(ctx.source_file),
-        )
-        .type_target
+    resolve_explicit_constructed_type(type_node, token, &class_fqn, name, ctx)
 }
 
 fn constructed_type_node(mut node: Node<'_>) -> Option<Node<'_>> {
@@ -13819,21 +13859,31 @@ fn exact_constructed_type_target(
     name: &str,
     ctx: &ScalaScan<'_, '_, '_>,
 ) -> Option<CodeUnit> {
-    let resolved = ctx
-        .types
+    let target_fqn = target.fq_name();
+    let resolved = resolve_explicit_constructed_type(type_node, token, &target_fqn, name, ctx)?;
+    (resolved == target).then_some(target)
+}
+
+fn resolve_explicit_constructed_type(
+    type_node: Node<'_>,
+    token: QueryToken<'_>,
+    class_fqn: &str,
+    name: &str,
+    ctx: &ScalaScan<'_, '_, '_>,
+) -> Option<CodeUnit> {
+    ctx.types
         .resolve_type_application(
             ctx.scala,
             token,
             &ctx.resolver,
-            Some(&target.fq_name()),
+            Some(class_fqn),
             None,
             name,
-            call_site_shape_for_reference_with_parents(type_node, ctx.parents).as_ref(),
+            call_site_shape_for_reference_with_parents(type_node, ctx.parents, ctx.source).as_ref(),
             TypeApplicationRole::ExplicitConstructor,
             Some(ctx.source_file),
         )
-        .type_target?;
-    (resolved == target).then_some(target)
+        .type_target
 }
 
 fn unwrap_single_scala_expression(mut node: Node<'_>) -> Node<'_> {
@@ -13917,7 +13967,8 @@ fn constructed_or_applied_type(
                     class_fqn.as_deref(),
                     object_fqn.as_deref(),
                     name,
-                    call_site_shape_for_reference_with_parents(function, ctx.parents).as_ref(),
+                    call_site_shape_for_reference_with_parents(function, ctx.parents, ctx.source)
+                        .as_ref(),
                     TypeApplicationRole::BareApplication,
                     Some(ctx.source_file),
                 )
@@ -13960,7 +14011,8 @@ fn call_result_type(
                     ScalaValueOwner::Exact(_) => {}
                 }
             }
-            let call_arities = call_arities_for_reference_with_parents(field, ctx.parents);
+            let call_arities =
+                call_arities_for_reference_with_parents(field, ctx.parents, ctx.source);
             match &owner {
                 ScalaValueOwner::Exact(owner) => ctx.types.member_return_type_for_members(
                     ctx.scala,
@@ -13988,7 +14040,8 @@ fn call_result_type(
             if !bindings.resolve_symbol(method).is_unknown() {
                 return None;
             }
-            let call_arities = call_arities_for_reference_with_parents(function, ctx.parents);
+            let call_arities =
+                call_arities_for_reference_with_parents(function, ctx.parents, ctx.source);
             match lexically_visible_unqualified_member_return_type(
                 function,
                 token,
@@ -14048,32 +14101,27 @@ fn lexically_visible_unqualified_member_return_type(
     ctx: &ScalaScan<'_, '_, '_>,
 ) -> MemberReturnResolution {
     for declaration in enclosing_template_declarations_with_parents(node, ctx.parents) {
-        let resolution = if let Some(owner) = ctx
-            .class_ranges
-            .unit_for_exact_span(declaration.start_byte(), declaration.end_byte())
-        {
-            ctx.types.unqualified_member_return_type(
+        let resolution = match template_member_scope(declaration, token, member, ctx) {
+            TemplateMemberScope::Exact(owner) => ctx.types.unqualified_member_return_type(
                 ctx.scala,
                 token,
                 &ctx.resolver,
                 owner,
                 member,
                 call_arities,
-            )
-        } else if template_direct_term_member_named(declaration, member, ctx.source) {
-            MemberReturnResolution::Unresolved
-        } else {
-            let Some(owners) = template_supertype_owners(declaration, token, ctx) else {
-                return MemberReturnResolution::Unresolved;
-            };
-            ctx.types.unqualified_member_return_type_for_owners(
-                ctx.scala,
-                token,
-                &ctx.resolver,
-                &owners,
-                member,
-                call_arities,
-            )
+            ),
+            TemplateMemberScope::Inherited(owners) => {
+                ctx.types.unqualified_member_return_type_for_owners(
+                    ctx.scala,
+                    token,
+                    &ctx.resolver,
+                    &owners,
+                    member,
+                    call_arities,
+                )
+            }
+            TemplateMemberScope::NoMatch => MemberReturnResolution::NoMatch,
+            TemplateMemberScope::Unresolved => MemberReturnResolution::Unresolved,
         };
         match resolution {
             MemberReturnResolution::NoMatch => {}
@@ -14417,21 +14465,20 @@ fn extension_alternative_receiver_matches(
     )
 }
 
-fn has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {
-    let mut parent = node.parent();
-    while let Some(current) = parent {
-        if current.kind() == kind {
-            return true;
-        }
-        parent = current.parent();
-    }
-    false
-}
+use brokk_bifrost_core::analyzer::tree_walk::has_ancestor_kind;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use brokk_bifrost_core::analyzer::model::CodeUnitType;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#3393: Scala source-facts cache grew with every touched file")]
+    fn scala_source_facts_cache_has_an_explicit_byte_capacity() {
+        let cache = new_scala_source_facts_cache(1024);
+        assert_eq!(cache.policy().max_capacity(), Some(1024));
+    }
 
     /// The cross-built shape of #2021: one logical `com.example.Probe`
     /// declared by a `scala-2` file and a `scala-3` file.
@@ -14481,6 +14528,7 @@ mod tests {
     /// The central case: two declarations that differ only in which file
     /// declares them are one replica family, and are NOT one overload family.
     #[test]
+    #[hardwon("#2021: Scala inverse usage had no identity contract for cross-build replicas")]
     fn a_source_only_difference_is_a_replica_family_but_not_an_overload_family() {
         let left = probe(scala2_file());
         let right = probe(scala3_file());
@@ -14493,6 +14541,7 @@ mod tests {
     /// Signature is excluded from replica identity exactly as it is excluded
     /// from overload identity, so cross-built overloads still group.
     #[test]
+    #[hardwon("#2021: Scala inverse usage had no identity contract for cross-build replicas")]
     fn a_source_and_signature_difference_is_still_a_replica_family() {
         let left = unit(
             scala2_file(),
@@ -14515,6 +14564,7 @@ mod tests {
 
     /// A class and a function of the same name are different declarations.
     #[test]
+    #[hardwon("#2021: Scala inverse usage had no identity contract for cross-build replicas")]
     fn a_kind_mismatch_is_not_a_replica_family() {
         let left = probe(scala2_file());
         let right = unit(
@@ -14530,6 +14580,7 @@ mod tests {
 
     /// Two packages are two symbols however alike their tails read.
     #[test]
+    #[hardwon("#2021: Scala inverse usage had no identity contract for cross-build replicas")]
     fn a_package_mismatch_is_not_a_replica_family() {
         let left = probe(scala2_file());
         let right = unit(
@@ -14547,6 +14598,7 @@ mod tests {
     /// name, so this pins that the predicate reads the short name it is given
     /// rather than a normalized rendering of it.
     #[test]
+    #[hardwon("#2021: Scala inverse usage had no identity contract for cross-build replicas")]
     fn a_class_and_its_object_singleton_are_not_a_replica_family() {
         let left = probe(scala2_file());
         let right = unit(
@@ -14562,6 +14614,7 @@ mod tests {
 
     /// A compiler-implied declaration is not a replica of a written one.
     #[test]
+    #[hardwon("#2021: Scala inverse usage had no identity contract for cross-build replicas")]
     fn a_synthetic_flag_mismatch_is_not_a_replica_family() {
         let left = probe(scala2_file());
         let right = unit(
@@ -14575,42 +14628,9 @@ mod tests {
         assert!(!same_replica_family(&left, &right));
     }
 
-    /// Empty sets are vacuously a single family, matching
-    /// [`single_overload_family`]; gates check emptiness themselves.
-    #[test]
-    fn an_empty_set_is_vacuously_a_single_replica_family() {
-        assert!(single_replica_family(std::iter::empty()));
-        assert!(single_overload_family(std::iter::empty()));
-    }
-
-    /// `same_overload_family` is `same_replica_family` plus source equality,
-    /// so every set the overload gate admits the replica gate admits too. This
-    /// pins the implication in code so a later edit cannot break it silently.
-    #[test]
-    fn a_same_file_overload_family_is_also_a_single_replica_family() {
-        let file = scala2_file();
-        let first = unit(
-            file.clone(),
-            CodeUnitType::Function,
-            "com.example",
-            "Probe.read",
-            Some("()"),
-            false,
-        );
-        let second = unit(
-            file,
-            CodeUnitType::Function,
-            "com.example",
-            "Probe.read",
-            Some("(String)"),
-            false,
-        );
-        assert!(single_overload_family([&first, &second].into_iter()));
-        assert!(single_replica_family([&first, &second].into_iter()));
-    }
-
     /// One disagreeing member spoils the whole set; incoherent sets fail closed.
     #[test]
+    #[hardwon("#2021: Scala inverse usage had no identity contract for cross-build replicas")]
     fn one_incoherent_member_breaks_a_three_element_replica_family() {
         let first = probe(scala2_file());
         let second = probe(scala3_file());
@@ -14637,6 +14657,7 @@ mod tests {
     /// through the provider.
     mod query_seed {
         use super::*;
+        use brokk_bifrost_test_macros::hardwon;
 
         fn empty_facts(package_name: &str) -> ScalaFileFacts {
             ScalaFileFacts {
@@ -14751,19 +14772,7 @@ mod tests {
             }
 
             fn package_types_in(&self, package: &str) -> Vec<(String, Vec<CodeUnit>)> {
-                let mut grouped: Vec<(String, Vec<CodeUnit>)> = Vec::new();
-                for unit in self
-                    .units
-                    .iter()
-                    .filter(|unit| unit.package_name() == package)
-                {
-                    let simple = scala_simple_type_name(unit);
-                    match grouped.iter_mut().find(|(name, _)| *name == simple) {
-                        Some((_, units)) => units.push(unit.clone()),
-                        None => grouped.push((simple, vec![unit.clone()])),
-                    }
-                }
-                grouped
+                crate::scala::scala_group_package_types(package, self.units.iter())
             }
         }
 
@@ -14883,6 +14892,9 @@ mod tests {
         /// structures from the same facts, and the targeted seed keeps
         /// hierarchy inputs only for the file that spells a supertype.
         #[test]
+        #[hardwon(
+            "#3142: a Scala usage query materialized whole-workspace file facts and exhausted memory"
+        )]
         fn targeted_sweep_derives_the_eager_seed_structures() {
             let scenario = scenario();
             let eager = ProjectTypes::seed(Arc::new(scenario.facts.clone()));
@@ -14926,6 +14938,9 @@ mod tests {
         /// same index, and the resolved targeted seed drops the hierarchy
         /// inputs while keeping the lazy per-file facts source.
         #[test]
+        #[hardwon(
+            "#3142: a Scala usage query materialized whole-workspace file facts and exhausted memory"
+        )]
         fn targeted_and_eager_seeds_resolve_the_same_hierarchy() {
             let scenario = scenario();
             let index = stub_index(&scenario);
@@ -14994,6 +15009,9 @@ mod tests {
         /// Prefetch reaches the lazy provider on a targeted seed and is a
         /// no-op on an eager seed, which already holds every file.
         #[test]
+        #[hardwon(
+            "#3142: a Scala usage query materialized whole-workspace file facts and exhausted memory"
+        )]
         fn prefetch_file_facts_warms_only_the_targeted_provider() {
             let scenario = scenario();
             let provider = Arc::new(StubFactsProvider {
@@ -15027,5 +15045,36 @@ mod tests {
                 "an eager seed must not touch the provider",
             );
         }
+    }
+
+    #[test]
+    #[hardwon("#2021: empty replica evidence failed the vacuous single-family rule")]
+    fn an_empty_set_is_vacuously_a_single_replica_family() {
+        assert!(single_replica_family(std::iter::empty()));
+        assert!(single_overload_family(std::iter::empty()));
+    }
+
+    #[test]
+    #[hardwon("#2021: same-file overloads were misclassified as replica families")]
+    fn a_same_file_overload_family_is_also_a_single_replica_family() {
+        let file = scala2_file();
+        let first = unit(
+            file.clone(),
+            CodeUnitType::Function,
+            "com.example",
+            "Probe.read",
+            Some("()"),
+            false,
+        );
+        let second = unit(
+            file,
+            CodeUnitType::Function,
+            "com.example",
+            "Probe.read",
+            Some("(String)"),
+            false,
+        );
+        assert!(single_overload_family([&first, &second].into_iter()));
+        assert!(single_replica_family([&first, &second].into_iter()));
     }
 }

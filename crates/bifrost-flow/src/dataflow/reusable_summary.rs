@@ -17,12 +17,14 @@ use crate::analyzer::invalidation::{
 };
 use crate::analyzer::semantic::{
     DeclarationLocator, DeclarationSegment, DeclarationSegmentKind, DependencyFingerprint,
-    EvidenceCompleteness, ExecutionTiming, LengthDelimitedDigest, ProofStatus, SemanticArtifactKey,
-    SemanticLocator, SemanticRole, StableDigest, SynchronizationOperation, WorkspaceMountId,
-    WorkspaceRelativePath, is_unmaterialized_external_artifact_locator,
+    DispatchBoundaryKind, EvidenceCompleteness, ExecutionTiming, LengthDelimitedDigest,
+    ProofStatus, SemanticArtifactKey, SemanticLocator, SemanticRole, StableDigest,
+    SynchronizationOperation, WorkspaceMountId, WorkspaceRelativePath,
+    is_unmaterialized_external_artifact_locator,
 };
 use crate::analyzer::semantic_model::UnmaterializedExternalSummaryCallShapeBinding;
 use crate::hash::{HashMap, HashSet, map_with_capacity, set_with_capacity};
+use brokk_bifrost_analysis::analyzer::semantic::ids::for_each_declaration_lineage_part;
 
 use super::{PathQuality, PathQualityFrontier, SummaryCallCycle, UnmodeledCallBehavior};
 
@@ -32,7 +34,7 @@ use super::{PathQuality, PathQualityFrontier, SummaryCallCycle, UnmodeledCallBeh
 /// contract. Embedded procedure summaries remain
 /// `PROCEDURE_SUMMARY_CONTRACT_VERSION` 1; this revision invalidates only
 /// carriers whose keys embed this module's internal summary schema.
-pub const SUMMARY_SCHEMA_VERSION: u32 = 9;
+pub const SUMMARY_SCHEMA_VERSION: u32 = 11;
 pub const MAX_SUMMARY_TRANSFERS: usize =
     crate::analyzer::semantic_model::MAX_PROCEDURE_SUMMARY_TRANSFERS;
 pub const MAX_SUMMARY_EFFECTS: usize =
@@ -109,8 +111,8 @@ define_summary_digest!(
 /// identity through the ICFG provider's dispatch universe. The second leaves
 /// that content identity out, for a read ledger's summary key: a recorded read
 /// has to be verifiable against a workspace whose files moved, and a key that
-/// rotated on every edit anywhere could never be
-/// (`.agents/plans/impact-sliced-diff-base.md`, Decision Log (5b)).
+/// rotated on every edit anywhere could never be verified against a head
+/// workspace.
 ///
 /// Hand-written rather than one of the macro's single-digest keys for exactly
 /// that second field. Every constructor but [`Self::from_parts`] sets the two
@@ -535,8 +537,7 @@ impl ProcedureSummaryIdentity {
     /// behavior's read half instead: the same engine (the active model set, the
     /// overlay, the dispatch expansion, the external dispatch surface) without
     /// the workspace's file set, which is what a read set's own `File` and
-    /// `Artifact` keys state exactly and far more precisely
-    /// (`.agents/plans/impact-sliced-diff-base.md`, Decision Log (5b)).
+    /// `Artifact` keys verify precisely against the head workspace.
     ///
     /// Two summaries of one procedure derived under two workspaces therefore
     /// share this identity. That is the intent, and it is sound in both
@@ -564,17 +565,9 @@ impl ProcedureSummaryIdentity {
     }
 
     fn push_declaration_lineage(&self, bytes: &mut Vec<u8>) {
-        for segment in self.declaration.segments() {
-            push_digest_part(bytes, segment.kind().stable_label().as_bytes());
-            match segment.name() {
-                Some(name) => {
-                    push_digest_part(bytes, b"named");
-                    push_digest_part(bytes, name.as_bytes());
-                }
-                None => push_digest_part(bytes, b"anonymous"),
-            }
-            push_digest_part(bytes, &segment.sibling_ordinal().to_le_bytes());
-        }
+        for_each_declaration_lineage_part(&self.declaration, |part| {
+            push_digest_part(bytes, part);
+        });
     }
 
     fn push_summary_contract(&self, bytes: &mut Vec<u8>, behavior: &[u8; 32]) {
@@ -712,8 +705,7 @@ impl SummaryReadObserver for SummaryReadRecorder<'_> {
         // answer is what it would derive from a file, so the closure is
         // recorded as artifacts: one per member, by public fingerprint and
         // workspace-relative path, exactly the shape `materialize_with_lowerer`
-        // records. Those are what verification re-derives and compares
-        // (`.agents/plans/impact-sliced-diff-base.md`, Decision Log (5b)).
+        // records. Verification re-derives and compares those artifacts.
         self.record_artifact(identity.artifact());
         for dependency in dependencies {
             self.record_artifact(dependency.identity().artifact());
@@ -725,11 +717,8 @@ impl SummaryReadRecorder<'_> {
     /// One artifact of a summary's dependency closure, as a read key.
     fn record_artifact(&self, artifact: &SemanticArtifactKey) {
         self.analyzer
-            .record_read(crate::analyzer::read_ledger::ReadKey::artifact(
-                crate::analyzer::invalidation::DerivedArtifactId::semantic_artifact(
-                    artifact.public_fingerprint(),
-                ),
-                Some(artifact.path().as_str()),
+            .record_read(crate::analyzer::read_ledger::ReadKey::semantic_artifact(
+                artifact,
             ));
     }
 }
@@ -833,6 +822,14 @@ impl ProcedureSummaryKey {
         self.identity.artifact()
     }
 
+    pub(crate) fn matches_procedure(
+        &self,
+        procedure: &crate::analyzer::semantic::ProcedureHandle,
+    ) -> bool {
+        procedure.artifact().key() == self.artifact()
+            && procedure.semantics().locator().declaration() == self.declaration()
+    }
+
     pub fn declaration(&self) -> &DeclarationLocator {
         self.identity.declaration()
     }
@@ -863,6 +860,10 @@ impl ProcedureSummaryKey {
 
     pub const fn recursive_group(&self) -> Option<SummaryRecursiveGroupKey> {
         self.recursive_group
+    }
+
+    pub(crate) const fn is_recursive(&self) -> bool {
+        self.recursive_group.is_some()
     }
 
     /// Whether replaying this procedure's summary could skip a call back into
@@ -1036,6 +1037,15 @@ pub enum SummaryPort {
     ExceptionalReturn,
     Capture(SummaryLocationKey),
     Heap(SummaryLocationKey),
+}
+
+impl SummaryPort {
+    fn is_return(&self) -> bool {
+        matches!(
+            self,
+            Self::NormalReturn | Self::IndexedNormalReturn(_) | Self::ExceptionalReturn
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1221,12 +1231,7 @@ impl SummaryTransfer {
         exit: SummaryExit,
         evidence: SummaryEvidence,
     ) -> Result<Self, SummaryValidationError> {
-        if matches!(
-            input,
-            SummaryPort::NormalReturn
-                | SummaryPort::IndexedNormalReturn(_)
-                | SummaryPort::ExceptionalReturn
-        ) {
+        if input.is_return() {
             return Err(SummaryValidationError::InvalidTransferInputPort);
         }
         Ok(Self {
@@ -1443,11 +1448,25 @@ pub struct SummaryConcurrencySourceWitness {
     end_byte: u32,
 }
 
+fn summary_source_witness_parts(
+    procedure: &SemanticLocator,
+    start_byte: u32,
+    end_byte: u32,
+) -> (SummaryProcedureSourceKey, u32, u32) {
+    assert!(start_byte <= end_byte, "summary witness range is ordered");
+    (
+        SummaryProcedureSourceKey::from_locator(procedure),
+        start_byte,
+        end_byte,
+    )
+}
+
 impl SummaryConcurrencySourceWitness {
     pub fn new(procedure: &SemanticLocator, start_byte: u32, end_byte: u32) -> Self {
-        assert!(start_byte <= end_byte, "summary witness range is ordered");
+        let (procedure, start_byte, end_byte) =
+            summary_source_witness_parts(procedure, start_byte, end_byte);
         Self {
-            procedure: SummaryProcedureSourceKey::from_locator(procedure),
+            procedure,
             start_byte,
             end_byte,
         }
@@ -1476,9 +1495,10 @@ pub struct SummaryCallSourceWitness {
 
 impl SummaryCallSourceWitness {
     pub fn new(procedure: &SemanticLocator, start_byte: u32, end_byte: u32) -> Self {
-        assert!(start_byte <= end_byte, "summary witness range is ordered");
+        let (procedure, start_byte, end_byte) =
+            summary_source_witness_parts(procedure, start_byte, end_byte);
         Self {
-            procedure: SummaryProcedureSourceKey::from_locator(procedure),
+            procedure,
             start_byte,
             end_byte,
         }
@@ -1701,6 +1721,25 @@ pub enum SummaryConcurrencyEffectKind {
     TimerReset {
         timer: SummaryConcurrencyAccessPath,
         identity: SummaryConcurrencySubjectIdentity,
+    },
+    /// Close the channel identity named by an authored model port.
+    ChannelClose {
+        channel: SummaryConcurrencyAccessPath,
+        identity: SummaryConcurrencySubjectIdentity,
+        fresh: bool,
+    },
+    /// Close the channel identity from a runtime task, without a caller-task
+    /// prefix that could publish caller memory.
+    ChannelCloseAsync {
+        channel: SummaryConcurrencyAccessPath,
+        identity: SummaryConcurrencySubjectIdentity,
+        fresh: bool,
+    },
+    /// Propagate a close from one exact model port identity to another.
+    ChannelClosePropagate {
+        source: SummaryConcurrencyAccessPath,
+        target: SummaryConcurrencyAccessPath,
+        target_fresh: bool,
     },
 }
 
@@ -1947,6 +1986,16 @@ pub enum SummaryCompleteness {
     Partial(Box<[SummaryIncompleteReason]>),
 }
 
+fn validate_incomplete_reasons(
+    reasons: &[SummaryIncompleteReason],
+) -> Result<(), SummaryValidationError> {
+    let normalized = SummaryCompleteness::partial(reasons.to_vec())?;
+    if normalized.reasons() != reasons {
+        return Err(SummaryValidationError::NonCanonicalIncompleteReasons);
+    }
+    Ok(())
+}
+
 impl SummaryCompleteness {
     pub fn partial(
         mut reasons: Vec<SummaryIncompleteReason>,
@@ -1982,13 +2031,7 @@ impl SummaryCompleteness {
     fn validate(&self) -> Result<(), SummaryValidationError> {
         match self {
             Self::Complete => Ok(()),
-            Self::Partial(reasons) => {
-                let normalized = Self::partial(reasons.to_vec())?;
-                if &normalized != self {
-                    return Err(SummaryValidationError::NonCanonicalIncompleteReasons);
-                }
-                Ok(())
-            }
+            Self::Partial(reasons) => validate_incomplete_reasons(reasons),
         }
     }
 
@@ -2079,13 +2122,7 @@ impl SummaryDimensionStatus {
     fn validate(&self) -> Result<(), SummaryValidationError> {
         match self {
             Self::Complete => Ok(()),
-            Self::Incomplete(reasons) => {
-                let normalized = SummaryCompleteness::partial(reasons.to_vec())?;
-                if normalized.reasons() != reasons.as_ref() {
-                    return Err(SummaryValidationError::NonCanonicalIncompleteReasons);
-                }
-                Ok(())
-            }
+            Self::Incomplete(reasons) => validate_incomplete_reasons(reasons),
         }
     }
 
@@ -2180,17 +2217,12 @@ impl SummaryDimensionCoverage {
     }
 
     pub fn state(&self, dimension: SummaryDimension) -> SummaryDimensionState<'_> {
-        match self
-            .rows
-            .binary_search_by(|row| row.dimension.cmp(&dimension))
-        {
-            Ok(index) => match &self.rows[index].status {
-                SummaryDimensionStatus::Complete => SummaryDimensionState::Complete,
-                SummaryDimensionStatus::Incomplete(reasons) => {
-                    SummaryDimensionState::Incomplete(reasons)
-                }
-            },
-            Err(_) => SummaryDimensionState::Unsupported,
+        match self.status_for(dimension) {
+            Some(SummaryDimensionStatus::Complete) => SummaryDimensionState::Complete,
+            Some(SummaryDimensionStatus::Incomplete(reasons)) => {
+                SummaryDimensionState::Incomplete(reasons)
+            }
+            None => SummaryDimensionState::Unsupported,
         }
     }
 
@@ -2827,15 +2859,7 @@ impl ExternalSummaryTarget {
         push_digest_part(&mut bytes, self.path.as_str().as_bytes());
         push_digest_part(&mut bytes, self.language.stable_label().as_bytes());
         for segment in self.declaration.segments() {
-            push_digest_part(&mut bytes, segment.kind().stable_label().as_bytes());
-            match segment.name() {
-                Some(name) => {
-                    push_digest_part(&mut bytes, b"named");
-                    push_digest_part(&mut bytes, name.as_bytes());
-                }
-                None => push_digest_part(&mut bytes, b"anonymous"),
-            }
-            push_digest_part(&mut bytes, &segment.sibling_ordinal().to_le_bytes());
+            push_portable_declaration_segment(&mut bytes, segment);
         }
         StableDigest::sha256(bytes)
     }
@@ -2865,7 +2889,6 @@ impl ExternalSummaryTarget {
         if self.mount != formal.mount
             || self.path != formal.path
             || self.language != formal.language
-            || !is_full_actual_to_formal_permutation(mapping)
         {
             return false;
         }
@@ -2875,25 +2898,36 @@ impl ExternalSummaryTarget {
         let Some(formal_last) = formal.declaration.segments().last() else {
             return false;
         };
-        let Some(arity) = u32::try_from(mapping.len()).ok() else {
+        let Some(actual_arity) = u32::try_from(mapping.len()).ok() else {
             return false;
         };
+        let formal_arity = formal_last.sibling_ordinal();
+        if !is_valid_actual_to_formal_mapping(mapping, formal_arity) {
+            return false;
+        }
         // The opaque Python binding relates an actual locator carrying a
         // typed call-mapping namespace to its artifact-qualified formal
-        // locator. Their declaration prefixes intentionally differ.
+        // locator. Their declaration prefixes intentionally differ. A default
+        // may leave formal slots without actuals, so the map is injective into
+        // the formal slots rather than necessarily a full permutation.
         actual_last.kind() == formal_last.kind()
             && actual_last.name() == formal_last.name()
             && actual_last.anchor() == formal_last.anchor()
-            && actual_last.sibling_ordinal() == arity
-            && formal_last.sibling_ordinal() == arity
+            && actual_last.sibling_ordinal() == actual_arity
     }
 }
 
-fn is_full_actual_to_formal_permutation(mapping: &[u32]) -> bool {
+fn is_valid_actual_to_formal_mapping(mapping: &[u32], formal_parameter_count: u32) -> bool {
     if u32::try_from(mapping.len()).is_err() {
         return false;
     }
-    let mut seen = vec![false; mapping.len()];
+    let Ok(formal_parameter_count) = usize::try_from(formal_parameter_count) else {
+        return false;
+    };
+    if mapping.len() > formal_parameter_count {
+        return false;
+    }
+    let mut seen = vec![false; formal_parameter_count];
     mapping.iter().all(|formal| {
         let Ok(index) = usize::try_from(*formal) else {
             return false;
@@ -2958,14 +2992,16 @@ fn summary_binding_fingerprint(
 
 #[cfg(test)]
 mod external_summary_mapping_tests {
-    use super::is_identity_actual_to_formal_mapping;
+    use super::is_valid_actual_to_formal_mapping;
 
     #[test]
-    fn identity_call_shape_maps_keep_existing_summary_capabilities() {
-        assert!(is_identity_actual_to_formal_mapping(&[]));
-        assert!(is_identity_actual_to_formal_mapping(&[0, 1, 2]));
-        assert!(!is_identity_actual_to_formal_mapping(&[1, 0]));
-        assert!(!is_identity_actual_to_formal_mapping(&[0, 2, 1]));
+    fn actual_to_formal_maps_can_omit_defaulted_formals_but_must_be_injective() {
+        assert!(is_valid_actual_to_formal_mapping(&[0], 2));
+        assert!(is_valid_actual_to_formal_mapping(&[0, 2], 3));
+        assert!(is_valid_actual_to_formal_mapping(&[], 2));
+        assert!(!is_valid_actual_to_formal_mapping(&[2], 2));
+        assert!(!is_valid_actual_to_formal_mapping(&[0, 0], 2));
+        assert!(!is_valid_actual_to_formal_mapping(&[0, 1, 2], 2));
     }
 }
 
@@ -2995,6 +3031,33 @@ pub(crate) fn canonicalize_semantic_summary_items<T>(
         return Err(SemanticSummarySetValidationError::AmbiguousKey);
     }
     Ok(items.into_boxed_slice())
+}
+
+pub(crate) type SemanticSummaryArtifactIndex =
+    HashMap<SemanticArtifactKey, HashMap<DeclarationLocator, usize>>;
+
+pub(crate) fn canonical_semantic_summaries_by_artifact(
+    summaries: Vec<&SemanticProcedureSummary>,
+) -> Result<
+    (
+        Box<[&SemanticProcedureSummary]>,
+        SemanticSummaryArtifactIndex,
+    ),
+    SemanticSummarySetValidationError,
+> {
+    let summaries = canonicalize_semantic_summary_items(summaries, |summary| *summary, true)?;
+    let mut by_artifact: SemanticSummaryArtifactIndex = HashMap::default();
+    for (index, summary) in summaries.iter().enumerate() {
+        if by_artifact
+            .entry(summary.key().artifact().clone())
+            .or_default()
+            .insert(summary.key().declaration().clone(), index)
+            .is_some()
+        {
+            return Err(SemanticSummarySetValidationError::AmbiguousKey);
+        }
+    }
+    Ok((summaries, by_artifact))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3092,15 +3155,18 @@ impl ExternalSemanticSummarySet {
             let actual_to_formal = binding
                 .actual_to_formal()
                 .map(|mapping| mapping.to_vec().into_boxed_slice());
+            let formal_parameter_count = formal
+                .declaration
+                .segments()
+                .last()
+                .map(|segment| segment.sibling_ordinal())
+                .and_then(|count| usize::try_from(count).ok());
             let valid_alias = match actual_to_formal.as_deref() {
-                Some(mapping) => {
+                Some(mapping) => formal_parameter_count.is_some_and(|formal_count| {
                     actual.is_mapped_call_shape_alias_of(&formal, mapping)
                         && (is_identity_actual_to_formal_mapping(mapping)
-                            || mapped_summary_uses_supported_transfer_ports(
-                                &summary,
-                                mapping.len(),
-                            ))
-                }
+                            || mapped_summary_uses_supported_transfer_ports(&summary, formal_count))
+                }),
                 None => actual.is_call_shape_alias_of(&formal),
             };
             if !valid_alias
@@ -3191,6 +3257,19 @@ impl ExternalSemanticSummarySet {
             fingerprint: ExternalSummarySetFingerprint::hash_bytes(bytes),
             compatibility: Some(compatibility),
         })
+    }
+
+    /// The summary that closes one dispatch boundary, with its
+    /// actual-to-formal mapping. A deferred boundary is never closed by a
+    /// summary.
+    pub fn summary_for_boundary(
+        &self,
+        boundary: &DispatchBoundaryKind,
+    ) -> Option<(&SemanticProcedureSummary, Option<&[u32]>)> {
+        if matches!(boundary, DispatchBoundaryKind::Deferred { .. }) {
+            return None;
+        }
+        self.summary_and_actual_to_formal_for(boundary.target_locator()?)
     }
 
     pub fn summary_for(&self, locator: &SemanticLocator) -> Option<&SemanticProcedureSummary> {
@@ -3355,6 +3434,20 @@ impl CuratedCallModel {
         &self.effects
     }
 
+    /// Whether every transfer the model states is proven and complete, so the
+    /// model is the call's whole behavior at the derived tier (#3757).
+    pub fn is_proven_complete(&self) -> bool {
+        self.transfers.iter().all(|transfer| {
+            transfer
+                .evidence()
+                .alternatives()
+                .iter()
+                .any(|alternative| {
+                    alternative.quality().is_proven() && alternative.quality().is_complete()
+                })
+        })
+    }
+
     /// Conservative retained heap estimate for the model identifier and
     /// transfer evidence owned by this model.
     pub(crate) fn retained_heap_bytes(&self) -> usize {
@@ -3423,12 +3516,7 @@ impl SummaryBoundaryBinding {
         if output == SummaryPort::ExceptionalReturn {
             return Err(SummaryValidationError::InvalidBoundaryOutputPort);
         }
-        if matches!(
-            input,
-            SummaryPort::NormalReturn
-                | SummaryPort::IndexedNormalReturn(_)
-                | SummaryPort::ExceptionalReturn
-        ) {
+        if input.is_return() {
             return Err(SummaryValidationError::InvalidBoundaryInputPort);
         }
         Ok(Self { output, input })
@@ -3669,6 +3757,33 @@ fn substitute_concurrency_effect_kind(
                 operation: *operation,
             }
         }
+        SummaryConcurrencyEffectKind::ChannelClose {
+            channel,
+            identity,
+            fresh,
+        } => SummaryConcurrencyEffectKind::ChannelClose {
+            channel: path(channel)?,
+            identity: *identity,
+            fresh: *fresh,
+        },
+        SummaryConcurrencyEffectKind::ChannelCloseAsync {
+            channel,
+            identity,
+            fresh,
+        } => SummaryConcurrencyEffectKind::ChannelCloseAsync {
+            channel: path(channel)?,
+            identity: *identity,
+            fresh: *fresh,
+        },
+        SummaryConcurrencyEffectKind::ChannelClosePropagate {
+            source,
+            target,
+            target_fresh,
+        } => SummaryConcurrencyEffectKind::ChannelClosePropagate {
+            source: path(source)?,
+            target: path(target)?,
+            target_fresh: *target_fresh,
+        },
         SummaryConcurrencyEffectKind::WaitGroupAdd {
             group,
             identity,
@@ -4099,7 +4214,9 @@ enum RetainedSummaryComponent {
 
 impl Default for ProductionSemanticSummaryRepository {
     fn default() -> Self {
-        Self::with_limits(SummaryRepositoryLimits::default())
+        Self {
+            state: Mutex::new(CompleteSummaryRepository::default()),
+        }
     }
 }
 
@@ -4566,9 +4683,7 @@ impl CompleteSummaryRepository {
         self.preflight_capacity(added_entries, added_bytes)?;
         for summary in summaries {
             if !self.entries.contains_key(&summary.key) {
-                self.retained_bytes = self.retained_bytes.saturating_add(summary.retained_bytes());
-                self.reverse_dependencies.record(&summary);
-                self.entries.insert(summary.key.clone(), summary);
+                self.insert_preflighted(summary);
             }
         }
         Ok(if inserted {
@@ -4587,12 +4702,16 @@ impl CompleteSummaryRepository {
             Some(_) => Err(SummaryPublicationError::ConflictingEntry),
             None => {
                 self.preflight_capacity(1, summary.retained_bytes())?;
-                self.retained_bytes = self.retained_bytes.saturating_add(summary.retained_bytes());
-                self.reverse_dependencies.record(&summary);
-                self.entries.insert(summary.key.clone(), summary);
+                self.insert_preflighted(summary);
                 Ok(SummaryPublicationOutcome::Inserted)
             }
         }
+    }
+
+    fn insert_preflighted(&mut self, summary: SemanticProcedureSummary) {
+        self.retained_bytes = self.retained_bytes.saturating_add(summary.retained_bytes());
+        self.reverse_dependencies.record(&summary);
+        self.entries.insert(summary.key.clone(), summary);
     }
 
     fn validate_dependencies(
@@ -4603,7 +4722,7 @@ impl CompleteSummaryRepository {
         for dependency in &summary.dependencies {
             match dependency {
                 SummaryDependencyKey::Complete(key) => {
-                    if batch_identities.binary_search(key.identity()).is_ok() {
+                    if complete_dependency_is_internal(key, batch_identities) {
                         return Err(SummaryPublicationError::InternalDependencyMustBeRecursive);
                     }
                     if self.entries.contains_key(key) {
@@ -4626,8 +4745,12 @@ impl CompleteSummaryRepository {
         added_entries: usize,
         added_bytes: usize,
     ) -> Result<(), SummaryPublicationError> {
-        let entries = self.entries.len().saturating_add(added_entries);
-        let bytes = self.retained_bytes.saturating_add(added_bytes);
+        let (entries, bytes) = super::summary_capacity_totals(
+            self.entries.len(),
+            self.retained_bytes,
+            added_entries,
+            added_bytes,
+        );
         if entries > self.limits.max_entries || bytes > self.limits.max_bytes {
             return Err(SummaryPublicationError::CapacityExceeded {
                 entries,
@@ -5099,6 +5222,13 @@ fn recursive_edges_for_dependencies(
         .collect()
 }
 
+fn complete_dependency_is_internal(
+    key: &ProcedureSummaryKey,
+    batch_identities: &[ProcedureSummaryIdentity],
+) -> bool {
+    batch_identities.binary_search(key.identity()).is_ok()
+}
+
 fn canonicalize_recursive_topology(
     mut topology: Vec<SummaryRecursiveEdge>,
     owner: &ProcedureSummaryIdentity,
@@ -5252,7 +5382,7 @@ fn procedure_key_heap_bytes(key: &ProcedureSummaryKey) -> usize {
     identity_heap_bytes(key.identity())
 }
 
-fn declaration_locator_heap_bytes(declaration: &DeclarationLocator) -> usize {
+pub(crate) fn declaration_locator_heap_bytes(declaration: &DeclarationLocator) -> usize {
     size_of_val(declaration.segments()).saturating_add(
         declaration
             .segments()
@@ -5390,6 +5520,11 @@ fn concurrency_effect_heap_bytes(effect: &SummaryConcurrencyEffect) -> usize {
         SummaryConcurrencyEffectKind::ModeledCall { .. } => 0,
         SummaryConcurrencyEffectKind::Lock { lock, .. } => path_bytes(lock),
         SummaryConcurrencyEffectKind::Synchronize { subject, .. } => path_bytes(subject),
+        SummaryConcurrencyEffectKind::ChannelClose { channel, .. }
+        | SummaryConcurrencyEffectKind::ChannelCloseAsync { channel, .. } => path_bytes(channel),
+        SummaryConcurrencyEffectKind::ChannelClosePropagate { source, target, .. } => {
+            path_bytes(source).saturating_add(path_bytes(target))
+        }
         SummaryConcurrencyEffectKind::Publish { value, destination } => {
             path_bytes(value).saturating_add(path_bytes(destination))
         }
@@ -5454,6 +5589,22 @@ fn fingerprint_dependencies(dependencies: &[SummaryDependencyKey]) -> StableDige
     StableDigest::sha256(bytes)
 }
 
+fn push_declaration_segment_header(bytes: &mut Vec<u8>, segment: &DeclarationSegment) {
+    push_digest_part(bytes, segment.kind().stable_label().as_bytes());
+    match segment.name() {
+        Some(name) => {
+            push_digest_part(bytes, b"named");
+            push_digest_part(bytes, name.as_bytes());
+        }
+        None => push_digest_part(bytes, b"anonymous"),
+    }
+}
+
+fn push_portable_declaration_segment(bytes: &mut Vec<u8>, segment: &DeclarationSegment) {
+    push_declaration_segment_header(bytes, segment);
+    push_digest_part(bytes, &segment.sibling_ordinal().to_le_bytes());
+}
+
 fn fingerprint_procedure_identity(identity: &ProcedureSummaryIdentity) -> StableDigest {
     let mut bytes = Vec::new();
     push_digest_part(&mut bytes, b"bifrost-procedure-summary-identity-v1");
@@ -5485,17 +5636,10 @@ fn fingerprint_procedure_identity(identity: &ProcedureSummaryIdentity) -> Stable
         push_digest_part(&mut bytes, artifact.as_bytes());
     }
     for segment in identity.declaration.segments() {
-        push_digest_part(&mut bytes, segment.kind().stable_label().as_bytes());
-        match segment.name() {
-            Some(name) => {
-                push_digest_part(&mut bytes, b"named");
-                push_digest_part(&mut bytes, name.as_bytes());
-            }
-            None => push_digest_part(&mut bytes, b"anonymous"),
-        }
         if matches!(identity.origin, SummaryOrigin::External(_)) {
-            push_digest_part(&mut bytes, &segment.sibling_ordinal().to_le_bytes());
+            push_portable_declaration_segment(&mut bytes, segment);
         } else {
+            push_declaration_segment_header(&mut bytes, segment);
             let anchor = segment.anchor();
             let span = anchor.span();
             let start = span.start();
@@ -5592,7 +5736,7 @@ pub(crate) fn validate_recursive_summary_batch(
         for dependency in &summary.dependencies {
             match dependency {
                 SummaryDependencyKey::Complete(key) => {
-                    if identities.binary_search(key.identity()).is_ok() {
+                    if complete_dependency_is_internal(key, &identities) {
                         return Err(SummaryPublicationError::InternalDependencyMustBeRecursive);
                     }
                     external_dependencies.push((**key).clone());

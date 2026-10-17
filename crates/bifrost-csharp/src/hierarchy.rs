@@ -12,8 +12,8 @@ use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::hash::HashSet;
 
 use crate::graph_support::{
-    CSharpSource, logical_type_count, partial_type_parts, sort_dedup_type_candidates,
-    sort_type_candidates, supertype_candidates, unique_logical_type, usage_partial_type_parts,
+    self, CSharpSource, logical_type_count, partial_type_parts, sort_type_candidates,
+    supertype_candidates, usage_partial_type_parts,
 };
 use crate::syntax::csharp_normalize_full_name;
 
@@ -242,13 +242,11 @@ pub fn logical_direct_ancestors(
     if parts.is_empty() {
         parts.push(code_unit.clone());
     }
-
-    let mut ancestors = Vec::new();
-    for part in parts {
-        ancestors.extend(source.raw_supertypes_of(&part).iter().filter_map(|raw| {
-            unique_logical_type(supertype_candidates(source, token, &part, raw, usage))
-        }));
-    }
-    sort_dedup_type_candidates(&mut ancestors);
-    ancestors
+    graph_support::logical_direct_ancestors(
+        parts,
+        |part| Some(source.raw_supertypes_of(part).to_vec()),
+        |part, raw| Some(supertype_candidates(source, token, part, raw, usage)),
+        |_| Some(()),
+    )
+    .unwrap_or_default()
 }

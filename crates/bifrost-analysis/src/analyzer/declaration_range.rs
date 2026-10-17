@@ -2,6 +2,8 @@ use std::sync::{Arc, OnceLock};
 
 use tree_sitter::{Node, Tree};
 
+use brokk_bifrost_core::analyzer::usages::reference_site::node_range as node_byte_range;
+
 use crate::analyzer::common::{
     language_for_file, language_for_target, source_identifier_for_target,
 };
@@ -507,31 +509,26 @@ fn matching_identifier_node<'tree>(
     None
 }
 
-fn node_byte_range(node: Node<'_>) -> Range {
-    Range {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_line: node.start_position().row,
-        end_line: node.end_position().row,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::analyzer::usages::get_definition::parse_tree_for_language;
     use crate::analyzer::{Language, ProjectFile};
+    use brokk_bifrost_test_macros::hardwon;
 
     fn first_node_of_kind<'tree>(root: Node<'tree>, kind: &str) -> Node<'tree> {
-        let mut stack = vec![root];
-        while let Some(node) = stack.pop() {
-            if node.kind() == kind {
-                return node;
-            }
-            let mut cursor = node.walk();
-            stack.extend(node.named_children(&mut cursor));
-        }
-        panic!("missing {kind} node");
+        crate::analyzer::test_support::first_named_node_matching_reverse_preorder(root, |node| {
+            node.kind() == kind
+        })
+        .unwrap_or_else(|| panic!("missing {kind} node"))
+    }
+
+    fn assert_default_export_name_at_header(source: &str, name: Range) -> usize {
+        let expected_start = source.find("export default").expect("header") + "export ".len();
+        assert_eq!(name.start_byte, expected_start);
+        assert_eq!(name.start_line, 0);
+        assert_eq!(&source[name.start_byte..name.end_byte], "default");
+        expected_start
     }
 
     #[test]
@@ -572,6 +569,7 @@ mod tests {
     /// name selection reaches the text search. A builder method whose body
     /// assigns the same-named property must still resolve to the header token.
     #[test]
+    #[hardwon("#2712: a body assignment was selected instead of the Kotlin declaration name")]
     fn kotlin_function_name_is_not_hijacked_by_body_self_assignment() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().canonicalize().expect("canonical root");
@@ -615,6 +613,7 @@ mod tests {
 
     /// The class header token wins over every same-named occurrence in the body.
     #[test]
+    #[hardwon("#2712: a same-named body type use was selected instead of the Kotlin class header")]
     fn kotlin_class_name_is_not_hijacked_by_body_occurrences() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().canonicalize().expect("canonical root");
@@ -642,6 +641,9 @@ mod tests {
     /// named-children text search cannot see it. An anonymous default export
     /// whose body mentions `default` by name must still bind the keyword.
     #[test]
+    #[hardwon(
+        "#2733: a body key named default was selected instead of the anonymous export keyword"
+    )]
     fn js_anonymous_default_export_class_name_is_the_default_keyword() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().canonicalize().expect("canonical root");
@@ -653,7 +655,6 @@ mod tests {
         let tree = parse_tree_for_language(&file, Language::JavaScript, source).expect("js tree");
         let declaration = first_node_of_kind(tree.root_node(), "export_statement");
         let unit = CodeUnit::new(file, crate::analyzer::CodeUnitType::Class, "", "default");
-        let expected_start = source.find("export default").expect("header") + "export ".len();
 
         let exact = code_unit_declaration_name_range_for_range(
             source,
@@ -662,9 +663,7 @@ mod tests {
             node_byte_range(declaration),
         )
         .expect("declaration name");
-        assert_eq!(exact.start_byte, expected_start);
-        assert_eq!(exact.start_line, 0);
-        assert_eq!(&source[exact.start_byte..exact.end_byte], "default");
+        let expected_start = assert_default_export_name_at_header(source, exact);
 
         // A persisted range whose byte offsets no longer fit the current source
         // takes the line-distance fallback, which must agree.
@@ -685,6 +684,9 @@ mod tests {
 
     /// The function form, in TypeScript: same anonymous keyword, same hazard.
     #[test]
+    #[hardwon(
+        "#2733: a body key named default was selected instead of the anonymous export keyword"
+    )]
     fn ts_anonymous_default_export_function_name_is_the_default_keyword() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().canonicalize().expect("canonical root");
@@ -693,7 +695,6 @@ mod tests {
         let tree = parse_tree_for_language(&file, Language::TypeScript, source).expect("ts tree");
         let declaration = first_node_of_kind(tree.root_node(), "export_statement");
         let unit = CodeUnit::new(file, crate::analyzer::CodeUnitType::Function, "", "default");
-        let expected_start = source.find("export default").expect("header") + "export ".len();
 
         let name = code_unit_declaration_name_range_for_range(
             source,
@@ -703,14 +704,14 @@ mod tests {
         )
         .expect("declaration name");
 
-        assert_eq!(name.start_byte, expected_start);
-        assert_eq!(name.start_line, 0);
+        assert_default_export_name_at_header(source, name);
     }
 
     /// `export default <expression>` gives the synthetic `default` field the
     /// whole statement as its declaration; the keyword still wins over an
     /// object key spelled `default` in the expression.
     #[test]
+    #[hardwon("#2733: an object key named default displaced the synthetic export name")]
     fn js_default_export_expression_name_is_the_default_keyword() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().canonicalize().expect("canonical root");
@@ -719,7 +720,6 @@ mod tests {
         let tree = parse_tree_for_language(&file, Language::JavaScript, source).expect("js tree");
         let declaration = first_node_of_kind(tree.root_node(), "export_statement");
         let unit = CodeUnit::new(file, crate::analyzer::CodeUnitType::Field, "", "default");
-        let expected_start = source.find("export default").expect("header") + "export ".len();
 
         let name = code_unit_declaration_name_range_for_range(
             source,
@@ -729,7 +729,7 @@ mod tests {
         )
         .expect("declaration name");
 
-        assert_eq!(name.start_byte, expected_start);
+        assert_default_export_name_at_header(source, name);
     }
 
     /// A named default export keeps its own name: the keyword is spelled
@@ -737,6 +737,7 @@ mod tests {
     /// declaration's `name` field even though the declaration range covers the
     /// whole `export_statement`.
     #[test]
+    #[hardwon("#2733: named default exports resolved to the anonymous export keyword")]
     fn js_named_default_export_name_is_the_declaration_name() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().canonicalize().expect("canonical root");
@@ -762,6 +763,7 @@ mod tests {
     /// Outside an `export_statement` nothing changes: a plain class keeps
     /// binding its `name` field.
     #[test]
+    #[hardwon("#2733: export-keyword recovery displaced an ordinary declaration name")]
     fn js_plain_class_name_is_unaffected_by_default_export_selection() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().canonicalize().expect("canonical root");
@@ -790,6 +792,9 @@ mod tests {
     /// in the file that shares the name, which is what the whole-file walk
     /// answered with for hits inside `simdjson.h`'s unparsed region.
     #[test]
+    #[hardwon(
+        "#3214: whole-file name recovery returned a distant same-spelled token for an empty declaration span"
+    )]
     fn declaration_name_ignores_candidates_off_the_persisted_lines() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().canonicalize().expect("canonical root");
@@ -840,6 +845,7 @@ mod tests {
     /// `simdjson.h` spent 113 s that way, because the region its hits live in
     /// holds no candidate at all and so nothing bounded the walk.
     #[test]
+    #[hardwon("#3214: each recovered symbol walked a 7.7 MB file and exceeded interactive latency")]
     fn line_recovery_cost_does_not_scale_with_the_file() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().canonicalize().expect("canonical root");
@@ -882,6 +888,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("5f5b353ae524: Windows location recovery failed when persisted byte offsets used LF")]
     fn declaration_name_recovers_when_persisted_bytes_use_lf() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().canonicalize().expect("canonical root");

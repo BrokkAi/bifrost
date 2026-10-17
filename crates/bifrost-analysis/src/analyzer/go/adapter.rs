@@ -105,7 +105,11 @@ impl LanguageAdapter for GoAdapter {
     /// which the host reactivates from the changed path itself. A manifest
     /// that names no valid module leaves the inventory incomplete, so it is
     /// compared by content and any edit to it rebuilds.
-    fn workspace_package_identity_digest(&self, source: &[u8]) -> Option<[u8; 32]> {
+    fn workspace_package_identity_digest(
+        &self,
+        _file: &ProjectFile,
+        source: &[u8],
+    ) -> Option<[u8; 32]> {
         use brokk_bifrost_core::analyzer::canonical_hash::{hash_domain_bytes, sha256_bytes};
         Some(
             match std::str::from_utf8(source)

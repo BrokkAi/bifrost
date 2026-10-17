@@ -10,23 +10,20 @@
 //! for checking that call syntax never changes ordinary reference proofs.
 
 use super::RustAnalyzer;
-use super::selected_reverse::{
-    RustSelectedReverseOutcome, with_rust_selected_reverse_queries_in_files,
-};
+use super::selected_reverse::{RustSelectedReverseOutcome, with_rust_selected_reverse_queries};
 use crate::CancellationToken;
 use crate::analyzer::CodeUnit;
 use crate::analyzer::structural::reference_edges::{
     EdgeCompleteness, EdgeDerivationResult, EdgeIncompleteReason,
 };
 use crate::analyzer::usages::call_relations::{
-    CallArgument, CallRelationDiagnostic, CallRelationDiagnosticCode, CallRelationLimits,
-    CallRelationProvider, CallRelationResult, CallSite, is_call_relation_unit,
+    CallDispatchLanguageRequest, CallDispatchLookup, CallRelationDiagnostic,
+    CallRelationDiagnosticCode, CallRelationLimits, CallRelationProvider, CallRelationResult,
+    CallSite, is_call_relation_unit, raw_call_site,
 };
-use crate::analyzer::usages::get_definition::{
-    CallSiteSyntax, CallSyntaxKind, call_site_syntax_for_reference,
-};
-use crate::analyzer::usages::{UsageProof, UsageProofAuthority};
-use crate::analyzer::{CodeUnitIndex, IAnalyzer, Language, ProjectFile, resolve_analyzer};
+use crate::analyzer::usages::get_definition::{CallSiteSyntax, call_site_syntax_for_reference};
+use crate::analyzer::usages::{UsageProof, UsageProofAuthority, proof_rank};
+use crate::analyzer::{CodeUnitIndex, IAnalyzer, ProjectFile, resolve_analyzer};
 use crate::hash::HashMap;
 #[cfg(test)]
 use std::sync::Arc;
@@ -62,42 +59,9 @@ impl CallRelationProvider for RustNativeCallRelations {
                 target,
             );
         };
-        let mut files = rust.analyzed_files_for_language(Language::Rust);
-        files.sort_by(|left, right| {
-            (left != target.source(), left).cmp(&(right != target.source(), right))
+        let selected = with_rust_selected_reverse_queries(rust, cancellation, |queries| {
+            queries.incoming_calls_for(std::slice::from_ref(target), limits)
         });
-        let mut admitted = crate::hash::HashSet::default();
-        let mut omitted = Vec::new();
-        let mut source_bytes = 0usize;
-        for file in files {
-            if cancellation.is_cancelled() {
-                return CallRelationResult {
-                    cancelled: true,
-                    ..CallRelationResult::default()
-                };
-            }
-            if admitted.len() == limits.max_files {
-                omitted.push(file);
-                continue;
-            }
-            let Some(source) = rust.indexed_source(&file) else {
-                return unavailable(
-                    "native_source_unavailable",
-                    format!("indexed Rust source is unavailable for {file}"),
-                    target,
-                );
-            };
-            if source.len() > limits.max_source_bytes.saturating_sub(source_bytes) {
-                omitted.push(file);
-                continue;
-            }
-            source_bytes += source.len();
-            admitted.insert(file);
-        }
-        let selected =
-            with_rust_selected_reverse_queries_in_files(rust, &admitted, cancellation, |queries| {
-                queries.incoming_calls_for(std::slice::from_ref(target), limits)
-            });
         let mut result = match selected {
             RustSelectedReverseOutcome::Ready(Some(mut results)) => {
                 assert_eq!(
@@ -126,19 +90,6 @@ impl CallRelationProvider for RustNativeCallRelations {
                 ..CallRelationResult::default()
             },
         };
-        result.work.scanned_files = admitted.len();
-        result.work.scanned_source_bytes = source_bytes;
-        if !omitted.is_empty() {
-            result.truncated = true;
-            result.diagnostics.push(CallRelationDiagnostic {
-                code: CallRelationDiagnosticCode::BudgetExhausted,
-                message: format!(
-                    "incoming call admission omitted Rust files {omitted:?} under limits {limits:?}"
-                ),
-                context: target.fq_name(),
-                reason_kind: Some("native_call_admission_budget_exhausted".to_owned()),
-            });
-        }
         if cancellation.is_cancelled() {
             result.sites.clear();
             result.cancelled = true;
@@ -163,6 +114,13 @@ impl CallRelationProvider for RustNativeCallRelations {
             );
         };
         super::native_outgoing::outgoing(rust, caller, limits, Default::default(), cancellation)
+    }
+
+    fn dispatch_special_call_site(
+        &self,
+        request: CallDispatchLanguageRequest<'_>,
+    ) -> Option<CallDispatchLookup> {
+        super::format_macro_dispatch::dispatch(request)
     }
 }
 
@@ -194,7 +152,9 @@ pub(crate) fn project_rust_rich_call_relation(
     };
     let mut facts_by_file = HashMap::default();
     let mut rejected_files = crate::hash::HashSet::default();
-    let mut requested = Vec::new();
+    let mut incomplete_binding_references = Vec::new();
+    let mut time_budget_exhausted = false;
+    let mut omitted_by_lane = HashMap::<&str, usize>::default();
     let mut work = CallRelationWork::default();
     for (edge, &reference) in selected.edges.iter().zip(references) {
         if cancellation.is_cancelled() {
@@ -285,7 +245,12 @@ pub(crate) fn project_rust_rich_call_relation(
             ));
             continue;
         };
-        requested.push(reference);
+        // The selected reverse edge already proves this callee binding.
+        // Argument and receiver semantics are independent and are resolved
+        // only for rows whose binding itself is unproven.
+        if edge.proof != UsageProof::Proven {
+            incomplete_binding_references.push(reference);
+        }
         result.sites.push(call_site(
             edge.site.file.clone(),
             caller.clone(),
@@ -294,42 +259,80 @@ pub(crate) fn project_rust_rich_call_relation(
             edge.proof,
         ));
     }
-    for references in requested.chunks(MAX_REFERENCE_SEEDS_PER_BATCH) {
+    let projection_limits_exceeded = result.truncated;
+    for references in incomplete_binding_references.chunks(MAX_REFERENCE_SEEDS_PER_BATCH) {
+        if time_budget_exhausted {
+            *omitted_by_lane.entry("time_budget").or_default() += references.len();
+            result.truncated = true;
+            continue;
+        }
         let Some(answers) = queries.resolve_references(references)? else {
             return Ok(None);
         };
         assert_eq!(answers.len(), references.len());
-        for (&reference, answer) in references.iter().zip(answers) {
-            if answer.completion() != &ResolutionCompletion::Complete {
-                result.diagnostics.push(diagnostic(
+        for (&reference, slot) in references.iter().zip(answers) {
+            use crate::analyzer::store::resolution_operation::{
+                ReferenceOmission, ReferenceResolution,
+            };
+            let answers = match slot {
+                ReferenceResolution::Answered(answers) => answers,
+                ReferenceResolution::Omitted(reason) => {
+                    let (lane, is_time_budget) = match reason {
+                        ReferenceOmission::ReceiverBudget(limit) => (limit.as_str(), false),
+                        ReferenceOmission::TimeBudgetExceeded => ("time_budget", true),
+                    };
+                    *omitted_by_lane.entry(lane).or_default() += 1;
+                    result.truncated = true;
+                    time_budget_exhausted |= is_time_budget;
+                    continue;
+                }
+            };
+            for answer in answers {
+                if answer.completion() != &ResolutionCompletion::Complete {
+                    result.diagnostics.push(diagnostic(
                     "native_call_resolution_incomplete",
                     format!("selected Rust call {reference} has incomplete aggregate evidence: {:?}; receiver dispositions: {:?}",
                         answer.completion(), answer.callable_receiver_dispositions()),
                     reference.to_string(),
                 ));
-            }
-            if answer.binding().targets().len() > 1 {
-                result.diagnostics.push(CallRelationDiagnostic {
-                    code: CallRelationDiagnosticCode::TargetsAmbiguous,
-                    message: format!(
-                        "selected Rust call {reference} has ambiguous targets: {:?}",
-                        answer.binding().targets()
-                    ),
-                    context: reference.to_string(),
-                    reason_kind: Some("native_call_targets_ambiguous".to_owned()),
-                });
+                }
+                if answer.binding().targets().len() > 1 {
+                    result.diagnostics.push(CallRelationDiagnostic {
+                        code: CallRelationDiagnosticCode::TargetsAmbiguous,
+                        message: format!(
+                            "selected Rust call {reference} has ambiguous targets: {:?}",
+                            answer.binding().targets()
+                        ),
+                        context: reference.to_string(),
+                        reason_kind: None,
+                    });
+                }
             }
         }
+    }
+    for (lane, omitted) in omitted_by_lane {
+        if lane == "time_budget" {
+            result.diagnostics.retain(|diagnostic| {
+                !(diagnostic.code == CallRelationDiagnosticCode::AnalysisFailed
+                    && diagnostic.reason_kind.as_deref() == Some("time_budget"))
+            });
+        }
+        result.diagnostics.push(CallRelationDiagnostic {
+            code: CallRelationDiagnosticCode::BudgetExhausted,
+            message: format!("{omitted} incoming call sites kept unproven because the {lane} budget stopped their binding recheck"),
+            context: target.fq_name().to_string(),
+            reason_kind: None,
+        });
     }
     if cancellation.is_cancelled() {
         return Ok(None);
     }
-    if result.truncated {
+    if projection_limits_exceeded {
         result.diagnostics.push(CallRelationDiagnostic {
             code: CallRelationDiagnosticCode::BudgetExhausted,
             message: format!("selected Rust incoming call projection exceeded limits {limits:?}"),
             context: target.fq_name().to_string(),
-            reason_kind: Some("native_call_projection_budget_exhausted".to_owned()),
+            reason_kind: None,
         });
     }
     result.sites.sort_by(|left, right| {
@@ -523,35 +526,7 @@ fn call_site(
     syntax: CallSiteSyntax,
     proof: UsageProof,
 ) -> CallSite {
-    let kind = if target.is_class() || target.kind().display_lowercase() == "constructor" {
-        CallSyntaxKind::Constructor
-    } else {
-        syntax.kind
-    };
-    let arguments = syntax
-        .arguments
-        .into_iter()
-        .map(|argument| CallArgument {
-            range: argument.range,
-            name: argument.name,
-            position: argument.position,
-            formal_index: None,
-            formal_name: None,
-            variadic: false,
-            spread: argument.spread,
-        })
-        .collect();
-    CallSite {
-        file,
-        range: syntax.range,
-        callee_range: syntax.callee_range,
-        caller,
-        callee: target.clone(),
-        kind,
-        proof,
-        receiver: syntax.receiver,
-        arguments,
-    }
+    raw_call_site(file, caller, target.clone(), syntax, proof)
 }
 
 fn incomplete_diagnostics(
@@ -607,19 +582,7 @@ fn incomplete_reason_kind(reason: &EdgeIncompleteReason) -> &'static str {
 }
 
 fn diagnostic(reason_kind: &str, message: String, context: String) -> CallRelationDiagnostic {
-    CallRelationDiagnostic {
-        code: CallRelationDiagnosticCode::AnalysisFailed,
-        message,
-        context,
-        reason_kind: Some(reason_kind.to_owned()),
-    }
-}
-
-fn proof_rank(proof: UsageProof) -> u8 {
-    match proof {
-        UsageProof::Proven => 0,
-        UsageProof::Unproven => 1,
-    }
+    CallRelationDiagnostic::analysis_failed(message, context, reason_kind.to_owned())
 }
 
 #[cfg(test)]
@@ -629,7 +592,8 @@ mod tests {
         RustSelectedReverseOutcome, with_rust_selected_reverse_queries,
     };
     use crate::analyzer::structural::edges::EdgeProvenance;
-    use crate::analyzer::usages::{UsageProof, get_definition::CallSyntaxKind};
+    use crate::analyzer::usages::UsageProof;
+    use crate::analyzer::usages::get_definition::CallSyntaxKind;
     use crate::analyzer::{CodeUnitIndex, Language};
     use crate::inline_project::InlineTestProject;
 
@@ -642,7 +606,7 @@ mod tests {
     }
 
     #[test]
-    fn rich_incoming_preserves_binding_proof_and_aggregate_call_gaps_across_point_sessions() {
+    fn rich_incoming_completes_proven_bindings_without_argument_or_receiver_semantics() {
         use crate::analyzer::resolution::{
             reset_selected_fact_operation_construction_count_for_test,
             selected_fact_operation_construction_count_for_test,
@@ -654,9 +618,8 @@ mod tests {
             )
             .file(
                 "src/lib.rs",
-                // The attributed argument keeps the call-site applicability
-                // gap, so the call aggregate stays incomplete while the
-                // binding is proven.
+                // The attributed argument keeps call applicability open while
+                // the generic callee binding remains exact.
                 concat!(
                     "pub async fn delayed() -> usize { 1 }\n",
                     "pub fn generic<T>(value: T) -> T { value }\n",
@@ -671,28 +634,40 @@ mod tests {
             .filter(|unit| matches!(unit.identifier(), "delayed" | "generic"))
             .collect::<Vec<_>>();
         assert_eq!(targets.len(), 2);
-        reset_selected_fact_operation_construction_count_for_test();
-        let selected =
-            with_rust_selected_reverse_queries(&rust, &CancellationToken::new(), |queries| {
-                let bindings = queries.inverse_for(&targets)?.expect("binding rows");
-                assert!(
-                    bindings
-                        .iter()
-                        .flat_map(|row| &row.edges)
-                        .all(|edge| edge.proof == UsageProof::Proven)
+        // Observe the thread-local demand counter on the same sole worker
+        // that dispatches and confirms the reverse query.
+        let (selected, construction_count) = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(|| {
+                reset_selected_fact_operation_construction_count_for_test();
+                let selected = with_rust_selected_reverse_queries(
+                    &rust,
+                    &CancellationToken::new(),
+                    |queries| {
+                        let bindings = queries.inverse_for(&targets)?.expect("binding rows");
+                        assert!(
+                            bindings
+                                .iter()
+                                .flat_map(|row| &row.edges)
+                                .all(|edge| edge.proof == UsageProof::Proven)
+                        );
+                        queries.incoming_calls_for(&targets, rich_limits())
+                    },
                 );
-                queries.incoming_calls_for(&targets, rich_limits())
+                (
+                    selected,
+                    selected_fact_operation_construction_count_for_test(),
+                )
             });
         let RustSelectedReverseOutcome::Ready(Some(results)) = selected else {
             panic!("rich incoming result must be ready: {selected:?}");
         };
-        // Reverse confirmation now costs one Stage 2 point operation per
-        // candidate blob rather than per candidate site: the inverse pass and
-        // the incoming-discovery pass each confirm two blobs instead of three
-        // sites, and the two rich call projections keep one operation each.
+        // Proven callee bindings need no semantic point operation for their
+        // arguments or receivers, leaving four reverse-confirmation operations.
         assert_eq!(
-            selected_fact_operation_construction_count_for_test(),
-            6,
+            construction_count, 4,
             "reverse confirmation constructs one fact operation per candidate blob"
         );
         assert_eq!(results.len(), 2);
@@ -707,12 +682,31 @@ mod tests {
                 result
                     .diagnostics
                     .iter()
-                    .any(|diagnostic| diagnostic.reason_kind.as_deref()
-                        == Some("native_call_resolution_incomplete")),
-                "{result:?}"
+                    .all(|diagnostic| diagnostic.reason_kind.as_deref()
+                        != Some("native_call_resolution_incomplete")),
+                "a proven incoming binding must not inherit argument or receiver gaps: {result:?}"
             );
             assert!(!result.truncated, "{result:?}");
         }
+
+        let caller = rust
+            .declarations(&fixture.file("src/lib.rs"))
+            .into_iter()
+            .find(|unit| unit.identifier() == "caller")
+            .expect("caller declaration");
+        let outgoing = super::super::native_outgoing::outgoing(
+            &rust,
+            &caller,
+            rich_limits(),
+            Default::default(),
+            &CancellationToken::new(),
+        );
+        assert!(
+            outgoing.diagnostics.iter().any(|diagnostic| {
+                diagnostic.reason_kind.as_deref() == Some("native_call_resolution_incomplete")
+            }),
+            "the argument-consuming outgoing query must still report the call gap: {outgoing:?}"
+        );
     }
 
     #[test]
@@ -816,6 +810,77 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rust_incoming_work_is_bounded_to_target_candidates_and_matches_selected_result() {
+        let mut project = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"native_call_admission\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file("src/lib.rs", source());
+        for index in 0..8 {
+            project = project.file(
+                format!("src/unrelated_{index}.rs"),
+                format!("pub fn unrelated_{index}() {{}}\n"),
+            );
+        }
+        let fixture = project.build();
+        let rust = RustAnalyzer::new(fixture.project_dyn());
+
+        let target = rust
+            .declarations(&fixture.file("src/lib.rs"))
+            .into_iter()
+            .find(|unit| unit.identifier() == "target" && unit.owner_identifier() == Some("left"))
+            .expect("left target declaration");
+        let limits = crate::analyzer::usages::call_relations::CallRelationLimits {
+            max_files: 4,
+            max_source_bytes: 64 * 1024,
+            max_candidates: 64,
+        };
+        let expected =
+            with_rust_selected_reverse_queries(&rust, &CancellationToken::new(), |queries| {
+                let mut results = queries
+                    .incoming_calls_for(std::slice::from_ref(&target), limits)?
+                    .expect("selected incoming result");
+                assert_eq!(results.len(), 1);
+                Ok(results.pop().expect("one target result"))
+            });
+        let RustSelectedReverseOutcome::Ready(expected) = expected else {
+            panic!("selected incoming query must be ready: {expected:?}");
+        };
+
+        let actual = RustNativeCallRelations.incoming(&rust, &target, limits, None);
+        assert_eq!(actual.sites, expected.sites);
+        assert_eq!(actual.diagnostics, expected.diagnostics);
+        assert_eq!(actual.truncated, expected.truncated);
+        assert_eq!(actual.cancelled, expected.cancelled);
+        assert_eq!(actual.proof_authority, expected.proof_authority);
+        assert_eq!(
+            RustNativeCallRelations.proof_authority(),
+            UsageProofAuthority::Native
+        );
+        assert_eq!(actual.sites.len(), 1);
+        assert_eq!(actual.sites[0].proof, UsageProof::Unproven);
+        assert!(
+            actual.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == CallRelationDiagnosticCode::TargetsAmbiguous
+            })
+        );
+        assert_eq!(
+            actual.work.scanned_files, 1,
+            "only the selected edge file is scanned"
+        );
+        assert_eq!(
+            actual.work.scanned_source_bytes,
+            source().len(),
+            "unrelated Rust source bytes are not charged"
+        );
+        assert_eq!(
+            actual.work.examined_candidates,
+            expected.work.examined_candidates
+        );
+    }
+
     fn source() -> &'static str {
         concat!(
             "mod left { pub fn target(value: usize) {} }\n",
@@ -846,6 +911,83 @@ mod tests {
             .build();
         let rust = RustAnalyzer::new(fixture.project_dyn());
         (fixture, rust)
+    }
+
+    #[test]
+    fn projection_keeps_incomplete_diagnostics_and_discards_cancelled_prefix() {
+        let (fixture, rust) = fixture();
+        let method = rust
+            .declarations(&fixture.file("src/lib.rs"))
+            .into_iter()
+            .find(|unit| {
+                unit.identifier() == "method" && unit.owner_identifier() == Some("Service")
+            })
+            .expect("inherent method declaration");
+        // Keep every projection inside the selected operation so its facts
+        // and rows share the operation's finalized source authority.
+        let selected =
+            with_rust_selected_reverse_queries(&rust, &CancellationToken::default(), |queries| {
+                let mut rows = queries
+                    .inverse_for(std::slice::from_ref(&method))?
+                    .expect("method reverse row");
+                let mut incomplete = rows.pop().expect("method reverse row");
+                incomplete.completeness = EdgeCompleteness::Incomplete {
+                    reasons: vec![EdgeIncompleteReason::InverseIndexResolutionIncomplete],
+                };
+                let projected = project_rust_call_relation(
+                    &rust,
+                    &method,
+                    &incomplete,
+                    &CancellationToken::default(),
+                );
+
+                let mut missing_owner = incomplete.clone();
+                missing_owner.edges[0].site.enclosing = None;
+                let missing_owner_projected = project_rust_call_relation(
+                    &rust,
+                    &method,
+                    &missing_owner,
+                    &CancellationToken::default(),
+                );
+
+                let cancelled = CancellationToken::cancel_after_checks_for_test(5);
+                let cancelled_projected =
+                    project_rust_call_relation(&rust, &method, &incomplete, &cancelled);
+                Ok((projected, missing_owner_projected, cancelled_projected))
+            });
+        let RustSelectedReverseOutcome::Ready((
+            projected,
+            missing_owner_projected,
+            cancelled_projected,
+        )) = selected
+        else {
+            panic!("selected reverse rows must be ready: {selected:?}");
+        };
+        assert_eq!(
+            projected.sites.len(),
+            2,
+            "known rows remain visible: {projected:?}"
+        );
+        assert!(!projected.truncated);
+        assert!(projected.diagnostics.iter().any(|diagnostic| {
+            diagnostic.reason_kind.as_deref() == Some("inverse_index_resolution_incomplete")
+        }));
+
+        assert!(
+            missing_owner_projected
+                .diagnostics
+                .iter()
+                .any(|diagnostic| {
+                    diagnostic.reason_kind.as_deref() == Some("enclosing_caller_unavailable")
+                })
+        );
+
+        assert!(cancelled_projected.cancelled);
+        assert!(
+            cancelled_projected.sites.is_empty(),
+            "cancelled projection published a prefix: {cancelled_projected:?}"
+        );
+        assert!(!cancelled_projected.truncated);
     }
 
     #[test]
@@ -983,82 +1125,5 @@ mod tests {
         assert!(!non_call_result.diagnostics.iter().any(|diagnostic| {
             diagnostic.reason_kind.as_deref() == Some("enclosing_caller_unavailable")
         }));
-    }
-
-    #[test]
-    fn projection_keeps_incomplete_diagnostics_and_discards_cancelled_prefix() {
-        let (fixture, rust) = fixture();
-        let method = rust
-            .declarations(&fixture.file("src/lib.rs"))
-            .into_iter()
-            .find(|unit| {
-                unit.identifier() == "method" && unit.owner_identifier() == Some("Service")
-            })
-            .expect("inherent method declaration");
-        // Keep every projection inside the selected operation so its facts
-        // and rows share the operation's finalized source authority.
-        let selected =
-            with_rust_selected_reverse_queries(&rust, &CancellationToken::default(), |queries| {
-                let mut rows = queries
-                    .inverse_for(std::slice::from_ref(&method))?
-                    .expect("method reverse row");
-                let mut incomplete = rows.pop().expect("method reverse row");
-                incomplete.completeness = EdgeCompleteness::Incomplete {
-                    reasons: vec![EdgeIncompleteReason::InverseIndexResolutionIncomplete],
-                };
-                let projected = project_rust_call_relation(
-                    &rust,
-                    &method,
-                    &incomplete,
-                    &CancellationToken::default(),
-                );
-
-                let mut missing_owner = incomplete.clone();
-                missing_owner.edges[0].site.enclosing = None;
-                let missing_owner_projected = project_rust_call_relation(
-                    &rust,
-                    &method,
-                    &missing_owner,
-                    &CancellationToken::default(),
-                );
-
-                let cancelled = CancellationToken::cancel_after_checks_for_test(5);
-                let cancelled_projected =
-                    project_rust_call_relation(&rust, &method, &incomplete, &cancelled);
-                Ok((projected, missing_owner_projected, cancelled_projected))
-            });
-        let RustSelectedReverseOutcome::Ready((
-            projected,
-            missing_owner_projected,
-            cancelled_projected,
-        )) = selected
-        else {
-            panic!("selected reverse rows must be ready: {selected:?}");
-        };
-        assert_eq!(
-            projected.sites.len(),
-            2,
-            "known rows remain visible: {projected:?}"
-        );
-        assert!(!projected.truncated);
-        assert!(projected.diagnostics.iter().any(|diagnostic| {
-            diagnostic.reason_kind.as_deref() == Some("inverse_index_resolution_incomplete")
-        }));
-
-        assert!(
-            missing_owner_projected
-                .diagnostics
-                .iter()
-                .any(|diagnostic| {
-                    diagnostic.reason_kind.as_deref() == Some("enclosing_caller_unavailable")
-                })
-        );
-
-        assert!(cancelled_projected.cancelled);
-        assert!(
-            cancelled_projected.sites.is_empty(),
-            "cancelled projection published a prefix: {cancelled_projected:?}"
-        );
-        assert!(!cancelled_projected.truncated);
     }
 }

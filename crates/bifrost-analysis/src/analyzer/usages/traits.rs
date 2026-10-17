@@ -3,9 +3,10 @@
 // crate can accept one. Its co-residents below all name `IAnalyzer` and stay.
 pub(crate) use brokk_bifrost_core::analyzer::usages::scan_scope::UsageScanScope;
 
+use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::model::{FuzzyResult, UsageProofAuthority};
-use crate::analyzer::usages::outcome::GraphUsageOutcome;
-use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
+use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
+use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::cancellation::CancellationToken;
 use crate::hash::HashSet;
 
@@ -111,11 +112,55 @@ pub(crate) trait UsageQueryResolver<'a>: Sized {
     ) -> GraphUsageOutcome;
 }
 
+pub(crate) struct GraphUsageDispatchSpec {
+    pub(crate) target_language: Language,
+    pub(crate) unsupported_target: &'static str,
+    pub(crate) missing_analyzer: &'static str,
+    pub(crate) strategy: &'static str,
+}
+
+pub(crate) fn dispatch_graph_usage_query<'a, Resolver>(
+    analyzer: &'a dyn IAnalyzer,
+    overloads: &[CodeUnit],
+    scan_scope: &UsageScanScope<'_>,
+    max_usages: usize,
+    dispatch: GraphUsageDispatchSpec,
+) -> GraphUsageOutcome
+where
+    Resolver: UsageQueryResolver<'a>,
+{
+    let Some(target) = overloads.first() else {
+        return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
+    };
+    if language_for_target(target) != dispatch.target_language {
+        return GraphUsageOutcome::fallback_safe(
+            target.fq_name(),
+            GraphFailureReason::UnsupportedTargetLanguage(dispatch.unsupported_target),
+            dispatch.strategy,
+        );
+    }
+    let Some(resolver) = Resolver::try_new(analyzer) else {
+        return GraphUsageOutcome::fallback_safe(
+            target.fq_name(),
+            GraphFailureReason::MissingAnalyzerCapability(dispatch.missing_analyzer),
+            dispatch.strategy,
+        );
+    };
+
+    resolver.find_usages(analyzer, overloads, scan_scope, max_usages)
+}
+
 /// Strategy for narrowing the file set fed into a [`UsageAnalyzer`].
 ///
 /// Implementations should favor false positives over false negatives — over-reporting
 /// candidates is fine; missing real call sites is not.
 pub trait CandidateFileProvider: Send + Sync {
+    /// Files named by the caller, whose publication is part of the request contract.
+    /// Discovery providers leave this absent even when they bound the complete scope.
+    fn explicit_candidate_files(&self) -> Option<&HashSet<ProjectFile>> {
+        None
+    }
+
     fn find_candidates(&self, target: &CodeUnit, analyzer: &dyn IAnalyzer) -> HashSet<ProjectFile>;
 
     /// Whether the returned files are the caller's complete execution scope.

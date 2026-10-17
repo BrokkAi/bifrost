@@ -1,28 +1,15 @@
-use std::sync::Arc;
-
 use super::*;
-use crate::catalog::{CatalogRegistryLimits, TaintCatalogRegistry};
-use crate::definition::{
-    PolicySemanticEvent, TaintLabel, TypestateExitScope, TypestateExpectationId, TypestateStateId,
-};
-use crate::finding_identity::{
-    AnalysisEventRef, AnalysisFindingId, AnalysisSubjectRef, StableSemanticIdentity,
-    TypestateScenarioId,
-};
+use crate::definition::{CvssSystemScope, TaintLabel};
+use crate::finding_identity::{AnalysisEventRef, AnalysisFindingId, StableSemanticIdentity};
 use crate::future_evidence::{
-    ResolvedTypestateTerminal, TaintFindingAnchor, TaintPolicyProjectionFacts,
-    TaintSourceProjectionFact, TypestateBindingPlanHash, TypestateFindingAnchor,
-    TypestatePolicyProjectionFacts, TypestateProtocolHash,
+    TaintFindingAnchor, TaintPolicyProjectionFacts, TaintSourceProjectionFact,
 };
-use crate::projection::{
-    ProjectedFindingReport, TaintOriginProjection, TaintPairProjection, TaintProjectedFinding,
-    TypestateProjectedFinding,
-};
-use crate::registry::{PolicyRegistry, PolicyRegistryLimits};
-use crate::source::PolicySourceIdentity;
+use crate::projection::{TaintOriginProjection, TaintPairProjection, TaintProjectedFinding};
+use crate::registry::PolicyRegistry;
 use crate::{CvssMetricValueToken, EvidenceRef};
 use brokk_bifrost_analysis::analyzer::Language;
-use brokk_bifrost_analysis::analyzer::{ProjectFile, TestProject, TypescriptAnalyzer};
+use brokk_bifrost_analysis::analyzer::{CppAnalyzer, ProjectFile, TestProject, TypescriptAnalyzer};
+use brokk_bifrost_rql::CodeQueryResultDetail;
 use brokk_bifrost_rql::structural::search::DetailedCodeQueryEvidence;
 use brokk_bifrost_rql::structural::search::{
     CodeQueryStableOwnerCandidate, DetailedCodeQueryIdentityCandidate,
@@ -84,15 +71,7 @@ fn classified_match_run(source: &str, budget: PolicyBudget) -> PolicyRun {
 }
 
 fn policy_registry(identity: &str, source: &str) -> PolicyRegistry {
-    let catalogs = Arc::new(TaintCatalogRegistry::new_without_workspace(
-        CatalogRegistryLimits::default(),
-    ));
-    let mut registry =
-        PolicyRegistry::new_without_workspace(catalogs, PolicyRegistryLimits::default());
-    registry
-        .register_policy_bytes(PolicySourceIdentity::new(identity), source.as_bytes())
-        .unwrap();
-    registry
+    crate::test_support::registry_with_policy(identity, source, "valid policy")
 }
 
 fn assembly_analyzer() -> (tempfile::TempDir, TypescriptAnalyzer) {
@@ -110,32 +89,6 @@ struct SizedEvidence(usize);
 impl RetainedSize for SizedEvidence {
     fn retained_size(&self) -> usize {
         self.0
-    }
-}
-
-fn projection_location() -> PolicySourceLocation {
-    PolicySourceLocation::span(
-        WorkspaceRelativePath::new("app.ts").unwrap(),
-        PolicyByteSpan::new(0, 1).unwrap(),
-        PolicyDisplayRegion::new(1, 1, 1, 2).unwrap(),
-    )
-}
-
-fn projected_report(proof_reason: ProofReason) -> ProjectedFindingReport {
-    ProjectedFindingReport {
-        primary: projection_location(),
-        certainty: FindingCertainty::Definite,
-        completeness: FindingCompleteness::Complete,
-        related: Vec::new(),
-        related_truncated: false,
-        omitted_related_locations_lower_bound: 0,
-        evidence_refs_truncated: false,
-        omitted_evidence_refs_lower_bound: 0,
-        proof: ProofMetadata::try_new(ProofState::Proven, vec![proof_reason], Vec::new()).unwrap(),
-        witnesses: Vec::new(),
-        witnesses_truncated: false,
-        omitted_witnesses_lower_bound: 0,
-        display_path: None,
     }
 }
 
@@ -167,34 +120,6 @@ fn taint_policy_source() -> &'static str {
                   :scope vulnerable-system
                   :evidence-refs [policy:self]
                   :rationale "The sink is reachable over the network")])))"#
-}
-
-fn typestate_policy_source() -> &'static str {
-    r#"(policy
-          :id "test.typestate-assembly"
-          :name "Typestate assembly"
-          :message "Resource was not closed"
-          :severity error
-          :analysis (analysis
-            :type typestate
-            :mode may
-            :subjects (subject-set :entries [
-              (subject :id resource :selector (rql (name "resource"))
-                :subject return-value)])
-            :uncertainty (uncertainty :escape inconclusive)
-            :automaton (automaton
-              :states [open closed violated]
-              :initial open
-              :accepting-states [closed]
-              :error-states [violated]
-              :events [
-                (event :id finish :on (normal-procedure-exit :scope analysis-root))]
-              :transitions [
-                (transition :from open :on finish :to closed)]
-              :terminal-expectations [
-                (terminal-expectation :id normal-exit
-                  :on (normal-procedure-exit :scope analysis-root)
-                  :expected-states [closed])])))"#
 }
 
 fn raw_taint_projection(
@@ -255,8 +180,9 @@ fn raw_taint_projection(
             .map(|scenario_id| TaintOriginProjection {
                 source_endpoint: source.identity.clone(),
                 source_label: TaintLabel::new("untrusted").unwrap(),
+                source_threat_model: source.definition.threat_model,
                 source_evidence: source.definition.evidence.clone(),
-                primary: projection_location(),
+                primary: crate::test_support::policy_test_location("app.ts", 0, 1, 1),
                 scenario_id,
                 evidence_refs: vec![evidence_ref.clone()],
             })
@@ -272,79 +198,14 @@ fn raw_taint_projection(
         origins_truncated,
         witness_refs: Vec::new(),
         witness_refs_truncated: false,
-        report: projected_report(ProofReason::DataflowWitness),
+        report: crate::test_support::projected_finding_report(
+            crate::test_support::policy_test_location("app.ts", 0, 1, 1),
+            ProofReason::DataflowWitness,
+        ),
     };
     TaintProjectedFinding {
         facts,
         pairs: vec![pair],
-    }
-}
-
-fn raw_typestate_projection(
-    spec: &ResolvedTypestatePolicySpec,
-    protocol_hash: TypestateProtocolHash,
-    binding_plan_hash: TypestateBindingPlanHash,
-) -> TypestateProjectedFinding {
-    let subject = &spec.subjects[0];
-    let dependency = spec
-        .endpoint_dependencies
-        .iter()
-        .find(|dependency| dependency.identity() == &subject.identity)
-        .unwrap();
-    let site = StableSemanticIdentity::protocol_violation_site(
-        "typescript",
-        WorkspaceRelativePath::new("app.ts").unwrap(),
-        "normal-exit",
-    )
-    .unwrap();
-    let violation = TypestateViolationEvidence::try_terminal_expectation(
-        TypestateExpectationId::new("normal-exit").unwrap(),
-        ResolvedTypestateTerminal::SemanticEvent {
-            event: PolicySemanticEvent::NormalProcedureExit {
-                scope: TypestateExitScope::AnalysisRoot,
-            },
-        },
-        TypestateStateId::new("open").unwrap(),
-        vec![TypestateStateId::new("closed").unwrap()],
-    )
-    .unwrap();
-    let facts = TypestatePolicyProjectionFacts::try_new(
-        spec.authoring_projection_hash,
-        protocol_hash,
-        binding_plan_hash,
-        subject.identity.clone(),
-        subject.semantic_hash,
-        subject.analysis_projection_hash,
-        dependency.model().categories.clone(),
-        dependency.model().display_name.clone(),
-        Some(site.clone()),
-        violation.clone(),
-        vec![TypestateScenarioId::try_new("test", "root").unwrap()],
-        &PolicyBudget::default(),
-    )
-    .unwrap();
-    let subject_identity = StableSemanticIdentity::protocol_subject(
-        "typescript",
-        WorkspaceRelativePath::new("app.ts").unwrap(),
-        "resource-instance",
-    )
-    .unwrap();
-    let anchor = TypestateFindingAnchor::strong(
-        protocol_hash,
-        subject_identity,
-        site,
-        facts.scenario_set_hash,
-        &violation,
-    )
-    .unwrap();
-    TypestateProjectedFinding {
-        facts,
-        analysis_finding_id: AnalysisFindingId::try_new("test", "typestate-finding").unwrap(),
-        anchor,
-        subject: AnalysisSubjectRef::try_new("test", "resource-instance").unwrap(),
-        witness_refs: Vec::new(),
-        witness_refs_truncated: false,
-        report: projected_report(ProofReason::TypestateWitness),
     }
 }
 
@@ -382,6 +243,8 @@ impl TaintPolicyEvaluator for FakeTaintAdapter {
         _budget: &PolicyBudget,
     ) -> TaintProjectionPayload {
         TaintProjectionPayload {
+            engine: None,
+            scope: None,
             projections: vec![raw_taint_projection(
                 spec,
                 self.sink_key,
@@ -393,49 +256,6 @@ impl TaintPolicyEvaluator for FakeTaintAdapter {
             diagnostics_truncated: false,
             work: PolicyWorkReport::default(),
             authored_arm_closures: Vec::new(),
-        }
-    }
-}
-
-struct FakeTypestateAdapter {
-    protocol_hash: TypestateProtocolHash,
-    binding_plan_hash: TypestateBindingPlanHash,
-}
-
-impl crate::projection::sealed::TypestateAdapter for FakeTypestateAdapter {}
-
-impl TypestatePolicyEvaluator for FakeTypestateAdapter {
-    fn compilation_hashes(
-        &self,
-        _policy: &LoadedPolicy,
-        _spec: &ResolvedTypestatePolicySpec,
-        _context: &PolicyEvaluationContext<'_>,
-        _budget: &PolicyBudget,
-    ) -> Result<TypestateCompilationHashes, TypestateCompilationFailure> {
-        Ok(TypestateCompilationHashes::new(
-            self.protocol_hash,
-            self.binding_plan_hash,
-        ))
-    }
-
-    fn evaluate_typestate(
-        &self,
-        _authority: &TypestateProjectionAuthority,
-        _policy: &LoadedPolicy,
-        spec: &ResolvedTypestatePolicySpec,
-        _context: &PolicyEvaluationContext<'_>,
-        _budget: &PolicyBudget,
-    ) -> TypestateProjectionPayload {
-        TypestateProjectionPayload {
-            projections: vec![raw_typestate_projection(
-                spec,
-                self.protocol_hash,
-                self.binding_plan_hash,
-            )],
-            completion: PolicyRunCompletion::Complete,
-            diagnostics: Vec::new(),
-            diagnostics_truncated: false,
-            work: PolicyWorkReport::default(),
         }
     }
 }
@@ -479,7 +299,11 @@ impl TypestatePolicyEvaluator for IncompleteTypestateAdapter {
 #[test]
 fn typestate_compilation_incompleteness_remains_typed_and_non_clean() {
     let (_temp, analyzer) = assembly_analyzer();
-    let registry = policy_registry("test:typestate-incomplete", typestate_policy_source());
+    let typestate_source = crate::test_support::typestate_policy_source(
+        "test.typestate-assembly",
+        "Typestate assembly",
+    );
+    let registry = policy_registry("test:typestate-incomplete", &typestate_source);
     let policy = registry.policies().next().unwrap();
     let adapter = IncompleteTypestateAdapter;
     let run = DefaultPolicyEvaluator::new()
@@ -501,12 +325,11 @@ fn typestate_compilation_incompleteness_remains_typed_and_non_clean() {
 
     assert_eq!(
         run.completion(),
-        &PolicyRunCompletion::Inconclusive {
-            reasons: vec![
-                PolicyIncompleteReason::Cancelled,
-                PolicyIncompleteReason::PartialDiscovery,
-            ],
-        }
+        &PolicyRunCompletion::inconclusive(vec![
+            PolicyIncompleteReason::Cancelled,
+            PolicyIncompleteReason::PartialDiscovery
+        ])
+        .expect("canonical reasons")
     );
     assert_eq!(run.diagnostics().len(), 1);
     assert_eq!(run.work().scanned_files(), 7);
@@ -518,68 +341,6 @@ fn typestate_compilation_incompleteness_remains_typed_and_non_clean() {
         run.diagnostics()[0].impact(),
         PolicyDiagnosticImpact::RunIncomplete
     );
-}
-
-#[test]
-fn default_evaluator_dispatches_valid_taint_and_typestate_adapters() {
-    let (_temp, analyzer) = assembly_analyzer();
-    let context = PolicyEvaluationContext {
-        analyzer: &analyzer,
-        workspace: None,
-        flow_state: &brokk_bifrost_flow::FlowWorkspaceState::new(),
-        cancellation: None,
-        cvss_overlays: &[],
-        organizational_risk: &[],
-        incremental: None,
-    };
-
-    let taint_registry = policy_registry("test:taint-assembly", taint_policy_source());
-    let taint_policy = taint_registry.policies().next().unwrap();
-    let taint_adapter = FakeTaintAdapter::complete(
-        "sink-valid",
-        vec![SourceScenarioId::try_new("test", "root").unwrap()],
-        false,
-    );
-    let protocol_hash = TypestateProtocolHash::from_canonical_bytes(b"protocol");
-    let binding_plan_hash = TypestateBindingPlanHash::from_canonical_bytes(b"bindings");
-    let typestate_adapter = FakeTypestateAdapter {
-        protocol_hash,
-        binding_plan_hash,
-    };
-    let evaluator = DefaultPolicyEvaluator::new()
-        .with_taint(&taint_adapter)
-        .with_typestate(&typestate_adapter);
-    let mut budget = PolicyBudget::default();
-    let taint_run = evaluator
-        .evaluate(taint_policy, &context, &mut budget)
-        .unwrap();
-    assert_eq!(taint_run.completion(), &PolicyRunCompletion::Complete);
-    assert_eq!(taint_run.findings().len(), 1);
-    assert_eq!(
-        taint_run.findings()[0].message(),
-        "user input can reach sensitive store"
-    );
-    assert!(matches!(
-        taint_run.findings()[0].evidence(),
-        PolicyFindingEvidence::Taint { .. }
-    ));
-
-    let typestate_registry = policy_registry("test:typestate-assembly", typestate_policy_source());
-    let typestate_policy = typestate_registry.policies().next().unwrap();
-    let mut budget = PolicyBudget::default();
-    let typestate_run = evaluator
-        .evaluate(typestate_policy, &context, &mut budget)
-        .unwrap();
-    assert_eq!(typestate_run.completion(), &PolicyRunCompletion::Complete);
-    assert_eq!(typestate_run.findings().len(), 1);
-    assert_eq!(
-        typestate_run.findings()[0].message(),
-        "Resource was not closed"
-    );
-    assert!(matches!(
-        typestate_run.findings()[0].evidence(),
-        PolicyFindingEvidence::Typestate { .. }
-    ));
 }
 
 #[test]
@@ -606,6 +367,8 @@ fn duplicate_taint_projection_fails_but_preserves_unrelated_strong_positive() {
         &unique.pairs[0].anchor,
     );
     let batch = authority.seal_batch(TaintProjectionPayload {
+        engine: None,
+        scope: None,
         projections: vec![duplicate.clone(), unique, duplicate],
         completion: PolicyRunCompletion::Complete,
         diagnostics: Vec::new(),
@@ -728,6 +491,8 @@ fn terminal_adapter_completion_survives_secondary_overlay_budget() {
         policy,
         &authority,
         authority.seal_batch(TaintProjectionPayload {
+            engine: None,
+            scope: None,
             projections: vec![projection],
             completion: PolicyRunCompletion::Failed {
                 reasons: vec![PolicyFailureReason::WorkspaceIo],
@@ -891,7 +656,7 @@ fn classified_match_finding_over_host_evidence_cap_is_omitted_not_failed() {
     assert!(run.findings().is_empty());
     assert!(matches!(
         run.completion(),
-        PolicyRunCompletion::Inconclusive { reasons }
+        PolicyRunCompletion::Inconclusive { reasons, .. }
             if reasons.contains(&PolicyIncompleteReason::ReportRetentionBudget)
     ));
     assert_eq!(run.work().omitted_findings_lower_bound(), 1);
@@ -909,6 +674,9 @@ fn classified_match_finding_over_host_evidence_cap_is_omitted_not_failed() {
 /// bare, unexplained reason with an empty diagnostics list -- the OWASP xss
 /// category's actual failure mode.
 #[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#2779: omitted classified findings must report the truncation reason"
+)]
 fn classified_match_run_over_findings_cap_names_the_truncation() {
     let mut source = String::new();
     for index in 0..10 {
@@ -924,7 +692,7 @@ fn classified_match_run_over_findings_cap_names_the_truncation() {
     assert!(
         matches!(
             run.completion(),
-            PolicyRunCompletion::Inconclusive { reasons }
+            PolicyRunCompletion::Inconclusive { reasons, .. }
                 if reasons.contains(&PolicyIncompleteReason::QueryResultLimit)
         ),
         "completion: {:?}",
@@ -1010,7 +778,7 @@ fn aggregate_report_cap_omits_a_stable_finding_prefix() {
     );
     assert!(matches!(
         multi.completion(),
-        PolicyRunCompletion::Inconclusive { reasons }
+        PolicyRunCompletion::Inconclusive { reasons, .. }
             if reasons.contains(&PolicyIncompleteReason::ReportRetentionBudget)
     ));
 }
@@ -1055,10 +823,7 @@ fn cvss_overlay_hash_uses_canonical_labels_and_utc_time() {
     assert_eq!(local.metadata().assessed_at(), "2026-07-18T10:34:56Z");
     assert_eq!(local.content_hash(), utc.content_hash());
     assert_ne!(local.content_hash(), changed.content_hash());
-    assert_eq!(
-        cvss_evidence_basis_label(CvssEvidenceBasis::ThreatFeed),
-        "threat_feed"
-    );
+    assert_eq!(CvssEvidenceBasis::ThreatFeed.label(), "threat_feed");
     assert_eq!(
         cvss_evidence_scope_labels(CvssEvidenceScope::System {
             system: CvssSystemScope::SubsequentSystem,
@@ -1070,12 +835,14 @@ fn cvss_overlay_hash_uses_canonical_labels_and_utc_time() {
 #[test]
 fn broad_advisory_stays_complete_and_untruncated_capability_gap_is_inconclusive() {
     let broad = CodeQueryDiagnostic {
+        source: None,
         code: CodeQueryDiagnosticCode::BroadQuery,
         impact: CodeQueryDiagnosticImpact::Advisory,
         branch: Vec::new(),
         language: "workspace",
         message: "broad query".to_string(),
         exhausted_roots: Vec::new(),
+        withheld_rows_path: None,
     };
     assert!(certainty_reasons(std::slice::from_ref(&broad), &[]).is_empty());
     assert!(incomplete_reasons(&CodeQueryCompletion::Complete, false).is_empty());
@@ -1128,20 +895,24 @@ fn rejected_query_diagnostic_marks_truncation_without_hiding_later_valid_diagnos
     // Any forwarded code will do; deliberately not `broad_query`, which a
     // policy run drops before it can be rejected for its length.
     let rejected = CodeQueryDiagnostic {
+        source: None,
         code: CodeQueryDiagnosticCode::UsesTargetsAmbiguous,
         impact: CodeQueryDiagnosticImpact::Advisory,
         branch: Vec::new(),
         language: "workspace",
         message: "x".repeat(4_097),
         exhausted_roots: Vec::new(),
+        withheld_rows_path: None,
     };
     let valid = CodeQueryDiagnostic {
+        source: None,
         code: CodeQueryDiagnosticCode::ReferenceTargetsAmbiguous,
         impact: CodeQueryDiagnosticImpact::Advisory,
         branch: Vec::new(),
         language: "typescript",
         message: "later valid diagnostic".to_string(),
         exhausted_roots: Vec::new(),
+        withheld_rows_path: None,
     };
 
     let adapted = adapt_query_diagnostics(&[rejected, valid], 1);
@@ -1225,13 +996,14 @@ fn cancellation_after_query_rows_retains_partial_match_candidates() {
             let evaluated = evaluate_match_query_candidates(
                 &policy_id,
                 &analyzer,
+                None,
                 &query,
                 &PolicyBudget::default(),
                 Some(&cancellation),
             );
             (matches!(
                 evaluated.completion,
-                PolicyRunCompletion::Inconclusive { ref reasons }
+                PolicyRunCompletion::Inconclusive { ref reasons, .. }
                     if reasons.contains(&PolicyIncompleteReason::Cancelled)
             ) && !evaluated.candidates.is_empty()
                 && evaluated.candidates.len() < 3)
@@ -1248,7 +1020,7 @@ fn cancellation_after_query_rows_retains_partial_match_candidates() {
 }
 
 #[test]
-fn match_candidate_conversion_accepts_all_positive_domains_and_rejects_receiver_terminal() {
+fn match_candidate_conversion_accepts_positive_domains_and_rejects_receiver_terminal() {
     let source = r#"export function target(payload: string) { return payload; }
 export function caller() { return target("secret"); }
 class Service { run() {} }
@@ -1306,6 +1078,7 @@ export function invoke(service: Service) { service.run(); }
         let evaluated = evaluate_match_query_candidates(
             &policy_id,
             &analyzer,
+            None,
             &query,
             &PolicyBudget::default(),
             None,
@@ -1343,15 +1116,185 @@ export function invoke(service: Service) { service.run(); }
     let evaluated = evaluate_match_query_candidates(
         &policy_id,
         &analyzer,
+        None,
         &receiver,
         &PolicyBudget::default(),
         None,
     );
     assert!(matches!(
         evaluated.completion,
-        PolicyRunCompletion::Failed { .. }
+        PolicyRunCompletion::Failed { ref reasons }
+            if reasons.contains(&PolicyFailureReason::InvalidExecutionPlan)
     ));
+    assert!(evaluated.candidates.is_empty());
     assert_eq!(evaluated.work.pipeline_rows(), 0);
+}
+
+#[test]
+fn source_backed_analysis_terminals_require_exact_callable_row_evidence() {
+    fn row(domain: DetailedCodeQueryDomain) -> (UnitRowItem, UnitRowEvidence) {
+        let key = match domain {
+            DetailedCodeQueryDomain::CallShape => DetailedCodeQueryKey::CallShape {
+                id: "shape-1".to_owned(),
+                site_id: "site-1".to_owned(),
+            },
+            DetailedCodeQueryDomain::CallableSignature => DetailedCodeQueryKey::CallableSignature {
+                id: "signature-1".to_owned(),
+                declaration_id: "declaration-1".to_owned(),
+                site_id: "site-1".to_owned(),
+            },
+            DetailedCodeQueryDomain::SignatureParameter => {
+                DetailedCodeQueryKey::SignatureParameter {
+                    id: "parameter-1".to_owned(),
+                    signature_id: "signature-1".to_owned(),
+                }
+            }
+            _ => panic!("not a source-backed analysis terminal domain: {domain:?}"),
+        };
+        let range = CodeQueryRange {
+            start_line: 1,
+            start_column: 1,
+            end_line: 1,
+            end_column: 6,
+        };
+        (
+            UnitRowItem {
+                domain,
+                path: "app.py".into(),
+                range: Some(range),
+                evidence: None,
+                coverage: None,
+                fields: Vec::new(),
+                projected_field_names: Vec::new(),
+                unknown_fields: Vec::new(),
+                terminal: Some(UnitRowItemTerminal::SourcePosition),
+                provenance: Vec::new(),
+                provenance_truncated: false,
+            },
+            UnitRowEvidence {
+                domain,
+                key,
+                rel_path: "app.py".into(),
+                byte_span: Some(0..5),
+                stable_owner_candidate: None,
+                identities: UnitRowIdentities::None,
+                source_slice_sha256: Some([0x42; 32]),
+                provenance: Vec::new(),
+            },
+        )
+    }
+
+    let policy_id = PolicyId::new("test.source-backed-analysis-terminal").unwrap();
+    for domain in [
+        DetailedCodeQueryDomain::CallShape,
+        DetailedCodeQueryDomain::CallableSignature,
+        DetailedCodeQueryDomain::SignatureParameter,
+    ] {
+        let (item, evidence) = row(domain);
+        let adapted = adapt_match_candidates(&policy_id, vec![item], vec![evidence], &[]);
+        assert!(!adapted.conversion_failed, "{domain:?}");
+        assert_eq!(adapted.candidates.len(), 1, "{domain:?}");
+        assert!(adapted.incomplete_reasons.is_empty(), "{domain:?}");
+    }
+
+    let (item, evidence) = row(DetailedCodeQueryDomain::CallableSignature);
+    for (item, evidence) in [
+        (
+            UnitRowItem {
+                range: None,
+                ..item.clone()
+            },
+            evidence.clone(),
+        ),
+        (
+            item.clone(),
+            UnitRowEvidence {
+                byte_span: None,
+                ..evidence.clone()
+            },
+        ),
+        (
+            item.clone(),
+            UnitRowEvidence {
+                source_slice_sha256: None,
+                ..evidence.clone()
+            },
+        ),
+    ] {
+        let adapted = adapt_match_candidates(&policy_id, vec![item], vec![evidence], &[]);
+        assert!(!adapted.conversion_failed);
+        assert!(adapted.candidates.is_empty());
+        assert!(
+            adapted
+                .incomplete_reasons
+                .contains(&PolicyIncompleteReason::CapabilityIncomplete)
+        );
+    }
+
+    let (item, mut evidence) = row(DetailedCodeQueryDomain::CallableSignature);
+    evidence.key = DetailedCodeQueryKey::SignatureParameter {
+        id: "parameter-1".to_owned(),
+        signature_id: "signature-1".to_owned(),
+    };
+    let adapted = adapt_match_candidates(&policy_id, vec![item], vec![evidence], &[]);
+    assert!(adapted.conversion_failed);
+    assert!(adapted.candidates.is_empty());
+}
+
+#[test]
+fn generation_site_candidate_keeps_typed_identity_and_source_location() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    ProjectFile::new(root.clone(), "main.cpp")
+        .write("#define FUNCTION(x) ((x) + 1)\n")
+        .expect("write source");
+    let analyzer = CppAnalyzer::from_project(TestProject::new(root, Language::Cpp));
+    let policy_id = PolicyId::new("test.generation-site-projection").expect("policy id");
+    let mut query = CodeQuery::from_json(&json!({
+        "generation_sites": { "kind": ["preprocessor_definition"] }
+    }))
+    .expect("query");
+    query.result_detail = CodeQueryResultDetail::Full;
+
+    let evaluated = evaluate_match_query_candidates(
+        &policy_id,
+        &analyzer,
+        None,
+        &query,
+        &PolicyBudget::default(),
+        None,
+    );
+
+    assert_eq!(evaluated.completion, PolicyRunCompletion::Complete);
+    assert_eq!(evaluated.candidates.len(), 1, "{evaluated:#?}");
+    let candidate = &evaluated.candidates[0];
+    assert_eq!(candidate.location.path(), "main.cpp");
+    assert_eq!(
+        candidate
+            .location
+            .region()
+            .expect("generation-site region")
+            .start_line(),
+        1
+    );
+    let PolicyQueryResultRef::GenerationSite {
+        location,
+        id,
+        ast_id,
+        kind,
+    } = candidate.evidence.terminal()
+    else {
+        panic!(
+            "generation-site terminal was not typed: {:?}",
+            candidate.evidence.terminal()
+        );
+    };
+    assert_eq!(location, &candidate.location);
+    assert!(!id.is_empty());
+    if let Some(ast_id) = ast_id {
+        assert!(!ast_id.is_empty());
+    }
+    assert_eq!(kind, "preprocessor_definition");
 }
 
 #[test]
@@ -1380,6 +1323,7 @@ const view = <div dangerouslySetInnerHTML={{ __html: value }} />;
     let evaluated = evaluate_match_query_candidates(
         &policy_id,
         &analyzer,
+        None,
         &query,
         &PolicyBudget::default(),
         None,
@@ -1438,6 +1382,8 @@ fn direct_call_terminal_downgrades_proven_proof_when_caller_identity_is_unavaila
     let item = CodeQueryResultItem {
         value: CodeQueryResultValue::CallSite {
             value: Box::new(CodeQueryCallSite {
+                site_id: Some("call-site:0-1".to_string()),
+                program_point_id: None,
                 path: "app.ts".to_string(),
                 language: "typescript",
                 range: call_range,
@@ -1449,6 +1395,9 @@ fn direct_call_terminal_downgrades_proven_proof_when_caller_identity_is_unavaila
                 // hand-built row must spell them as a real execution does.
                 call_kind: "function",
                 proof: "proven",
+                receiver_kind: "implicit",
+                argument_identity: None,
+                caller_parameter_identity: None,
                 receiver: None,
                 arguments: Vec::new(),
             }),
@@ -1461,6 +1410,7 @@ fn direct_call_terminal_downgrades_proven_proof_when_caller_identity_is_unavaila
         result_index: 0,
         domain: DetailedCodeQueryDomain::CallSite,
         key: DetailedCodeQueryKey::CallSite {
+            site_id: Some("call-site:0-1".to_string()),
             caller_fq_name: "<anonymous>".to_string(),
             callee_fq_name: "target".to_string(),
         },
@@ -1566,6 +1516,7 @@ fn cross_file_provenance_keeps_target_caller_and_callee_identities_distinct() {
         evaluate_match_query_candidates(
             &policy_id,
             &analyzer,
+            None,
             &query,
             &PolicyBudget::default(),
             None,
@@ -1697,12 +1648,14 @@ fn advisory_ambiguity_only_lowers_findings_from_the_affected_set_branch() {
         steps: Vec::new(),
     };
     let diagnostic = CodeQueryDiagnostic {
+        source: None,
         code: CodeQueryDiagnosticCode::ReferenceTargetsAmbiguous,
         impact: CodeQueryDiagnosticImpact::Advisory,
         branch: vec![0],
         language: "typescript",
         message: "branch-local ambiguity".to_string(),
         exhausted_roots: Vec::new(),
+        withheld_rows_path: None,
     };
 
     let projected = |branch| UnitRowProvenance::project(&provenance(branch));
@@ -1840,175 +1793,6 @@ fn configuration_json_fixture(body: &str) -> (tempfile::TempDir, TypescriptAnaly
     (temp, analyzer, body.to_string())
 }
 
-fn configuration_xml_fixture(body: &str) -> (tempfile::TempDir, TypescriptAnalyzer, String) {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let root = temp.path().canonicalize().expect("canonical root");
-    ProjectFile::new(root.clone(), "server.xml")
-        .write(body)
-        .expect("write configuration");
-    let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
-    (temp, analyzer, body.to_string())
-}
-
-fn xml_configuration_policy_source(role: &str) -> String {
-    format!(
-        r#"(policy
-      :id "test.xml-configuration-fact"
-      :name "XML configuration fact"
-      :message "Matched XML server host"
-      :severity warning
-      :analysis (analysis
-        :type match
-        :selector (rql (configuration-facts
-          :format xml
-          :node-kind member
-          :role {role}
-          :key "host"
-          :route [[(key "server") (key "host")]]))))"#
-    )
-}
-
-fn evaluate_xml_configuration_selector_policy(
-    analyzer: &TypescriptAnalyzer,
-    source: &str,
-) -> PolicyRun {
-    let registry = policy_registry("test:xml-configuration-fact", source);
-    let policy = registry.policies().next().unwrap();
-    let context = PolicyEvaluationContext {
-        analyzer,
-        workspace: None,
-        flow_state: &brokk_bifrost_flow::FlowWorkspaceState::new(),
-        cancellation: None,
-        cvss_overlays: &[],
-        organizational_risk: &[],
-        incremental: None,
-    };
-    let mut budget = PolicyBudget::default();
-    DefaultPolicyEvaluator::new()
-        .evaluate(policy, &context, &mut budget)
-        .unwrap()
-}
-
-fn configuration_enabled_query() -> CodeQuery {
-    CodeQuery::from_json(&json!({
-        "configuration_facts": {
-            "formats": ["json"],
-            "node_kinds": ["member"],
-            "roles": ["object_member"],
-            "scalar_kinds": ["boolean"],
-            "keys": ["enabled"],
-            "routes": [[
-                {"kind": "key", "key": "server"},
-                {"kind": "key", "key": "enabled"}
-            ]]
-        }
-    }))
-    .expect("configuration query")
-}
-
-const CONFIGURATION_SELECTOR_POLICY: &str = r#"(policy
-      :id "test.configuration-fact"
-      :name "Configuration fact"
-      :message "Authored enabled flag"
-      :severity warning
-      :analysis (analysis
-        :type match
-        :selector (rql (configuration-facts
-          :format json
-          :node-kind member
-          :role object_member
-          :scalar-kind boolean
-          :key "enabled"
-          :route [[(key "server") (key "enabled")]]))))"#;
-
-fn evaluate_configuration_selector_policy(analyzer: &TypescriptAnalyzer) -> PolicyRun {
-    let registry = policy_registry("test:configuration-fact", CONFIGURATION_SELECTOR_POLICY);
-    let policy = registry.policies().next().unwrap();
-    let context = PolicyEvaluationContext {
-        analyzer,
-        workspace: None,
-        flow_state: &brokk_bifrost_flow::FlowWorkspaceState::new(),
-        cancellation: None,
-        cvss_overlays: &[],
-        organizational_risk: &[],
-        incremental: None,
-    };
-    let mut budget = PolicyBudget::default();
-    DefaultPolicyEvaluator::new()
-        .evaluate(policy, &context, &mut budget)
-        .unwrap()
-}
-
-#[test]
-fn configuration_fact_selector_matches_direct_query_over_the_same_snapshot() {
-    let source = r#"{
-  "server": {
-    "enabled": true,
-    "retries": 2
-  }
-}
-"#;
-    let (_temp, analyzer, source) = configuration_json_fixture(source);
-    let policy_id = PolicyId::new("test.configuration-fact").expect("policy id");
-
-    let direct = evaluate_match_query_candidates(
-        &policy_id,
-        &analyzer,
-        &configuration_enabled_query(),
-        &PolicyBudget::default(),
-        None,
-    );
-    assert_eq!(
-        direct.completion,
-        PolicyRunCompletion::Complete,
-        "{direct:#?}"
-    );
-    assert_eq!(direct.candidates.len(), 1, "{direct:#?}");
-    let candidate = &direct.candidates[0];
-    assert_eq!(
-        candidate.evidence.result_domain(),
-        MatchResultDomain::ConfigurationFact
-    );
-    assert!(
-        candidate.location.path().ends_with("server.json"),
-        "{candidate:#?}"
-    );
-    let member_start = source
-        .rfind("\"enabled\"")
-        .expect("enabled member in fixture");
-    let member_end = member_start + "\"enabled\": true".len();
-    assert_eq!(
-        candidate
-            .location
-            .byte_span()
-            .map(|span| span.start()..span.end()),
-        Some(member_start as u64..member_end as u64),
-        "{candidate:#?}"
-    );
-
-    let selector_run = evaluate_configuration_selector_policy(&analyzer);
-    assert_eq!(
-        selector_run.completion(),
-        &PolicyRunCompletion::Complete,
-        "{selector_run:#?}"
-    );
-    assert_eq!(selector_run.findings().len(), direct.candidates.len());
-    assert_eq!(selector_run.diagnostics().len(), direct.diagnostics.len());
-    let finding = &selector_run.findings()[0];
-    assert_eq!(finding.id(), candidate.id, "same anchor, same id");
-    assert_eq!(finding.primary().path(), candidate.location.path());
-    assert_eq!(
-        finding
-            .primary()
-            .byte_span()
-            .map(|span| span.start()..span.end()),
-        candidate
-            .location
-            .byte_span()
-            .map(|span| span.start()..span.end())
-    );
-}
-
 #[test]
 fn configuration_fact_near_miss_axes_stay_clean_zeroes() {
     let source = r#"{
@@ -2061,6 +1845,7 @@ fn configuration_fact_near_miss_axes_stay_clean_zeroes() {
         let evaluated = evaluate_match_query_candidates(
             &policy_id,
             &analyzer,
+            None,
             &query,
             &PolicyBudget::default(),
             None,
@@ -2075,557 +1860,4 @@ fn configuration_fact_near_miss_axes_stay_clean_zeroes() {
             "axis {axis} must not match: {evaluated:#?}"
         );
     }
-}
-
-#[test]
-fn configuration_fact_recovered_document_stays_typed_incomplete() {
-    // The truncated document recovers the enabled member, but no completion
-    // claim may hide that recovery happened.
-    let source = "{\n  \"server\": {\n    \"enabled\": true\n";
-    let (_temp, analyzer, _source) = configuration_json_fixture(source);
-    let policy_id = PolicyId::new("test.configuration-fact").expect("policy id");
-    let direct = evaluate_match_query_candidates(
-        &policy_id,
-        &analyzer,
-        &configuration_enabled_query(),
-        &PolicyBudget::default(),
-        None,
-    );
-    assert!(
-        matches!(direct.completion, PolicyRunCompletion::Inconclusive { .. }),
-        "{direct:#?}"
-    );
-    // Whatever rows recovery retained keep their exact anchors.
-    for candidate in &direct.candidates {
-        let member_start = source
-            .rfind("\"enabled\"")
-            .expect("recovered enabled member");
-        assert_eq!(
-            candidate.location.byte_span().map(|span| span.start()),
-            Some(member_start as u64),
-            "{candidate:#?}"
-        );
-    }
-}
-
-#[test]
-fn xml_configuration_selector_policy_matches_elements_and_excludes_role_near_miss() {
-    let source = r#"<server>
-  <host>primary.example</host>
-  <host>backup.example</host>
-  <hostname>near-miss.example</hostname>
-</server>
-"#;
-    let (_temp, analyzer, _source) = configuration_xml_fixture(source);
-    let element_run = evaluate_xml_configuration_selector_policy(
-        &analyzer,
-        &xml_configuration_policy_source("xml_element"),
-    );
-    assert_eq!(
-        element_run.completion(),
-        &PolicyRunCompletion::Complete,
-        "{element_run:#?}"
-    );
-    assert_eq!(element_run.findings().len(), 2, "{element_run:#?}");
-    assert!(
-        element_run
-            .findings()
-            .windows(2)
-            .all(|pair| pair[0].id() != pair[1].id())
-    );
-    assert!(
-        element_run
-            .findings()
-            .iter()
-            .all(|finding| finding.primary().path().ends_with("server.xml"))
-    );
-
-    let attribute_run = evaluate_xml_configuration_selector_policy(
-        &analyzer,
-        &xml_configuration_policy_source("xml_attribute"),
-    );
-    assert_eq!(
-        attribute_run.completion(),
-        &PolicyRunCompletion::Complete,
-        "{attribute_run:#?}"
-    );
-    assert!(attribute_run.findings().is_empty(), "{attribute_run:#?}");
-}
-
-#[test]
-fn xml_configuration_recovered_document_stays_typed_incomplete() {
-    let (_temp, analyzer, _source) =
-        configuration_xml_fixture("<server><host>primary.example</host>");
-    let run = evaluate_xml_configuration_selector_policy(
-        &analyzer,
-        &xml_configuration_policy_source("xml_element"),
-    );
-
-    assert!(
-        matches!(run.completion(), PolicyRunCompletion::Inconclusive { .. }),
-        "{run:#?}"
-    );
-    assert!(!run.diagnostics().is_empty(), "{run:#?}");
-}
-
-fn configuration_toml_fixture(
-    body: &str,
-) -> (
-    crate::inline_project::BuiltInlineTestProject,
-    TypescriptAnalyzer,
-    String,
-) {
-    let project = crate::inline_project::InlineTestProject::with_language(Language::TypeScript)
-        .file("server.toml", body)
-        .build();
-    let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
-    (project, analyzer, body.to_string())
-}
-
-fn toml_configuration_policy_source(route: &str) -> String {
-    format!(
-        r#"(policy
-      :id "test.toml-configuration-fact"
-      :name "TOML configuration fact"
-      :message "Matched TOML server host"
-      :severity warning
-      :analysis (analysis
-        :type match
-        :selector (rql (configuration-facts
-          :format toml
-          :node-kind member
-          :role table_entry
-          :scalar-kind string
-          :key "host"
-          :route [[{route}]]))))"#
-    )
-}
-
-fn evaluate_toml_configuration_selector_policy(
-    analyzer: &TypescriptAnalyzer,
-    source: &str,
-) -> PolicyRun {
-    let registry = policy_registry("test:toml-configuration-fact", source);
-    let policy = registry.policies().next().unwrap();
-    let context = PolicyEvaluationContext {
-        analyzer,
-        workspace: None,
-        flow_state: &brokk_bifrost_flow::FlowWorkspaceState::new(),
-        cancellation: None,
-        cvss_overlays: &[],
-        organizational_risk: &[],
-        incremental: None,
-    };
-    let mut budget = PolicyBudget::default();
-    DefaultPolicyEvaluator::new()
-        .evaluate(policy, &context, &mut budget)
-        .unwrap()
-}
-
-#[test]
-fn toml_configuration_selector_policy_anchors_dotted_and_indexed_routes() {
-    let source = r#"[server]
-host = "primary.example"
-hostname = "near-miss.example"
-
-[[route]]
-host = "health.example"
-"#;
-    let (_temp, analyzer, source) = configuration_toml_fixture(source);
-
-    let table_run = evaluate_toml_configuration_selector_policy(
-        &analyzer,
-        &toml_configuration_policy_source(r#"(key "server") (key "host")"#),
-    );
-    assert_eq!(
-        table_run.completion(),
-        &PolicyRunCompletion::Complete,
-        "{table_run:#?}"
-    );
-    assert_eq!(table_run.findings().len(), 1, "{table_run:#?}");
-    let finding = &table_run.findings()[0];
-    assert!(
-        finding.primary().path().ends_with("server.toml"),
-        "{finding:#?}"
-    );
-    let member_start = source
-        .find("host = \"primary.example\"")
-        .expect("host member");
-    assert_eq!(
-        finding
-            .primary()
-            .byte_span()
-            .map(|span| span.start()..span.end()),
-        Some(member_start as u64..(member_start + "host = \"primary.example\"".len()) as u64),
-        "{finding:#?}"
-    );
-
-    // The same key under an array of tables is a different route, and the
-    // index segment is required to reach it.
-    let indexed_run = evaluate_toml_configuration_selector_policy(
-        &analyzer,
-        &toml_configuration_policy_source(r#"(key "route") (index 0) (key "host")"#),
-    );
-    assert_eq!(
-        indexed_run.completion(),
-        &PolicyRunCompletion::Complete,
-        "{indexed_run:#?}"
-    );
-    assert_eq!(indexed_run.findings().len(), 1, "{indexed_run:#?}");
-    assert_ne!(indexed_run.findings()[0].id(), finding.id());
-
-    let near_miss_run = evaluate_toml_configuration_selector_policy(
-        &analyzer,
-        &toml_configuration_policy_source(r#"(key "route") (key "host")"#),
-    );
-    assert_eq!(
-        near_miss_run.completion(),
-        &PolicyRunCompletion::Complete,
-        "{near_miss_run:#?}"
-    );
-    assert!(near_miss_run.findings().is_empty(), "{near_miss_run:#?}");
-}
-
-#[test]
-fn toml_configuration_rejected_document_stays_typed_inconclusive() {
-    // A duplicate key is a TOML error, so no authored row survives and the
-    // run must report absence of evidence rather than a clean pass.
-    let (_temp, analyzer, _source) =
-        configuration_toml_fixture("[server]\nhost = \"one\"\nhost = \"two\"\n");
-    let run = evaluate_toml_configuration_selector_policy(
-        &analyzer,
-        &toml_configuration_policy_source(r#"(key "server") (key "host")"#),
-    );
-
-    assert!(
-        matches!(run.completion(), PolicyRunCompletion::Inconclusive { .. }),
-        "{run:#?}"
-    );
-    assert!(run.findings().is_empty(), "{run:#?}");
-    // The gap is the rejected document itself, not a missing adapter.
-    assert!(
-        run.diagnostics()
-            .iter()
-            .any(|diagnostic| diagnostic.message().contains("malformed syntax")),
-        "{run:#?}"
-    );
-}
-
-fn configuration_properties_fixture(
-    body: &str,
-) -> (
-    crate::inline_project::BuiltInlineTestProject,
-    TypescriptAnalyzer,
-    String,
-) {
-    let project = crate::inline_project::InlineTestProject::with_language(Language::TypeScript)
-        .file("application.properties", body)
-        .build();
-    let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
-    (project, analyzer, body.to_string())
-}
-
-fn properties_configuration_policy_source(role: &str, key: &str) -> String {
-    format!(
-        r#"(policy
-      :id "test.properties-configuration-fact"
-      :name "Properties configuration fact"
-      :message "Matched properties server host"
-      :severity warning
-      :analysis (analysis
-        :type match
-        :selector (rql (configuration-facts
-          :format properties
-          :node-kind member
-          :role {role}
-          :scalar-kind string
-          :key "{key}"
-          :route [[(key "{key}")]]))))"#
-    )
-}
-
-fn evaluate_properties_configuration_selector_policy(
-    analyzer: &TypescriptAnalyzer,
-    source: &str,
-) -> PolicyRun {
-    let registry = policy_registry("test:properties-configuration-fact", source);
-    let policy = registry.policies().next().unwrap();
-    let context = PolicyEvaluationContext {
-        analyzer,
-        workspace: None,
-        flow_state: &brokk_bifrost_flow::FlowWorkspaceState::new(),
-        cancellation: None,
-        cvss_overlays: &[],
-        organizational_risk: &[],
-        incremental: None,
-    };
-    let mut budget = PolicyBudget::default();
-    DefaultPolicyEvaluator::new()
-        .evaluate(policy, &context, &mut budget)
-        .unwrap()
-}
-
-#[test]
-fn properties_configuration_selector_policy_anchors_each_occurrence_and_excludes_near_misses() {
-    let source = "# deployment\n\
-server.host = primary.example\n\
-server.host: backup.example\n\
-server.hostname=near-miss.example\n\
-host=segment-near-miss.example\n";
-    let (_temp, analyzer, source) = configuration_properties_fixture(source);
-
-    let run = evaluate_properties_configuration_selector_policy(
-        &analyzer,
-        &properties_configuration_policy_source("property", "server.host"),
-    );
-    assert_eq!(run.completion(), &PolicyRunCompletion::Complete, "{run:#?}");
-    assert_eq!(run.findings().len(), 2, "{run:#?}");
-    assert_ne!(run.findings()[0].id(), run.findings()[1].id());
-    // Each duplicate occurrence is anchored at the exact bytes of its own
-    // authored logical line.
-    let mut anchored: Vec<_> = run
-        .findings()
-        .iter()
-        .map(|finding| {
-            assert!(
-                finding.primary().path().ends_with("application.properties"),
-                "{finding:#?}"
-            );
-            let span = finding.primary().byte_span().expect("byte span");
-            &source[span.start() as usize..span.end() as usize]
-        })
-        .collect();
-    anchored.sort_unstable();
-    assert_eq!(
-        anchored,
-        vec![
-            "server.host = primary.example",
-            "server.host: backup.example"
-        ],
-        "{run:#?}"
-    );
-
-    // A dotted key is one authored segment, so its last segment alone reaches
-    // only the bare `host` line; the TOML role is a different format's member.
-    let segment_run = evaluate_properties_configuration_selector_policy(
-        &analyzer,
-        &properties_configuration_policy_source("property", "host"),
-    );
-    assert_eq!(
-        segment_run.completion(),
-        &PolicyRunCompletion::Complete,
-        "{segment_run:#?}"
-    );
-    assert_eq!(segment_run.findings().len(), 1, "{segment_run:#?}");
-    let role_run = evaluate_properties_configuration_selector_policy(
-        &analyzer,
-        &properties_configuration_policy_source("table_entry", "server.host"),
-    );
-    assert_eq!(
-        role_run.completion(),
-        &PolicyRunCompletion::Complete,
-        "{role_run:#?}"
-    );
-    assert!(role_run.findings().is_empty(), "{role_run:#?}");
-}
-
-#[test]
-fn properties_configuration_malformed_document_stays_typed_inconclusive() {
-    // A `\u` escape without four hex digits fails `Properties.load`, so the
-    // run must report absence of evidence rather than a clean pass.
-    let (_temp, analyzer, _source) =
-        configuration_properties_fixture("server.host=kept.example\nbroken=\\u12x\n");
-    let run = evaluate_properties_configuration_selector_policy(
-        &analyzer,
-        &properties_configuration_policy_source("property", "server.host"),
-    );
-
-    assert!(
-        matches!(run.completion(), PolicyRunCompletion::Inconclusive { .. }),
-        "{run:#?}"
-    );
-    // The gap is the malformed escape, not a missing adapter.
-    assert!(
-        run.diagnostics()
-            .iter()
-            .any(|diagnostic| diagnostic.message().contains("malformed syntax")),
-        "{run:#?}"
-    );
-}
-
-fn configuration_yaml_fixture(
-    body: &str,
-) -> (
-    crate::inline_project::BuiltInlineTestProject,
-    TypescriptAnalyzer,
-    String,
-) {
-    let project = crate::inline_project::InlineTestProject::with_language(Language::TypeScript)
-        .file("server.yaml", body)
-        .build();
-    let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
-    (project, analyzer, body.to_string())
-}
-
-fn yaml_configuration_policy_source(route: &str) -> String {
-    format!(
-        r#"(policy
-      :id "test.yaml-configuration-fact"
-      :name "YAML configuration fact"
-      :message "Matched YAML server host"
-      :severity warning
-      :analysis (analysis
-        :type match
-        :selector (rql (configuration-facts
-          :format yaml
-          :node-kind member
-          :role object_member
-          :scalar-kind string
-          :key "host"
-          :route [[{route}]]))))"#
-    )
-}
-
-fn evaluate_yaml_configuration_selector_policy(
-    analyzer: &TypescriptAnalyzer,
-    source: &str,
-) -> PolicyRun {
-    let registry = policy_registry("test:yaml-configuration-fact", source);
-    let policy = registry.policies().next().unwrap();
-    let context = PolicyEvaluationContext {
-        analyzer,
-        workspace: None,
-        flow_state: &brokk_bifrost_flow::FlowWorkspaceState::new(),
-        cancellation: None,
-        cvss_overlays: &[],
-        organizational_risk: &[],
-        incremental: None,
-    };
-    let mut budget = PolicyBudget::default();
-    DefaultPolicyEvaluator::new()
-        .evaluate(policy, &context, &mut budget)
-        .unwrap()
-}
-
-#[test]
-fn yaml_configuration_selector_policy_anchors_nested_and_indexed_routes() {
-    let source = r#"server:
-  host: primary.example
-  hostname: near-miss.example
-mirrors:
-  - host: first.example
-  - host: second.example
-"#;
-    let (_temp, analyzer, source) = configuration_yaml_fixture(source);
-
-    let nested_run = evaluate_yaml_configuration_selector_policy(
-        &analyzer,
-        &yaml_configuration_policy_source(r#"(key "server") (key "host")"#),
-    );
-    assert_eq!(
-        nested_run.completion(),
-        &PolicyRunCompletion::Complete,
-        "{nested_run:#?}"
-    );
-    assert_eq!(nested_run.findings().len(), 1, "{nested_run:#?}");
-    let finding = &nested_run.findings()[0];
-    assert!(
-        finding.primary().path().ends_with("server.yaml"),
-        "{finding:#?}"
-    );
-    let member_start = source.find("host: primary.example").expect("host member");
-    assert_eq!(
-        finding
-            .primary()
-            .byte_span()
-            .map(|span| span.start()..span.end()),
-        Some(member_start as u64..(member_start + "host: primary.example".len()) as u64),
-        "{finding:#?}"
-    );
-
-    // The same key under a block sequence is a different route per element,
-    // and the index segment is required to reach it.
-    let indexed_run = evaluate_yaml_configuration_selector_policy(
-        &analyzer,
-        &yaml_configuration_policy_source(r#"(key "mirrors") (index 1) (key "host")"#),
-    );
-    assert_eq!(
-        indexed_run.completion(),
-        &PolicyRunCompletion::Complete,
-        "{indexed_run:#?}"
-    );
-    assert_eq!(indexed_run.findings().len(), 1, "{indexed_run:#?}");
-    assert_ne!(indexed_run.findings()[0].id(), finding.id());
-    let second_start = source.find("host: second.example").expect("second host");
-    assert_eq!(
-        indexed_run.findings()[0]
-            .primary()
-            .byte_span()
-            .map(|span| span.start()),
-        Some(second_start as u64)
-    );
-
-    let near_miss_run = evaluate_yaml_configuration_selector_policy(
-        &analyzer,
-        &yaml_configuration_policy_source(r#"(key "mirrors") (key "host")"#),
-    );
-    assert_eq!(
-        near_miss_run.completion(),
-        &PolicyRunCompletion::Complete,
-        "{near_miss_run:#?}"
-    );
-    assert!(near_miss_run.findings().is_empty(), "{near_miss_run:#?}");
-}
-
-#[test]
-fn yaml_configuration_rejected_and_multi_document_files_stay_typed_inconclusive() {
-    // A tab indent is a YAML error the grammar cannot recover from, so no
-    // authored row survives and the run reports absence of evidence rather
-    // than a clean pass.
-    let (_temp, analyzer, _source) =
-        configuration_yaml_fixture("server:\n\thost: primary.example\n");
-    let run = evaluate_yaml_configuration_selector_policy(
-        &analyzer,
-        &yaml_configuration_policy_source(r#"(key "server") (key "host")"#),
-    );
-    assert!(
-        matches!(run.completion(), PolicyRunCompletion::Inconclusive { .. }),
-        "{run:#?}"
-    );
-    assert!(run.findings().is_empty(), "{run:#?}");
-    assert!(
-        run.diagnostics()
-            .iter()
-            .any(|diagnostic| diagnostic.message().contains("malformed syntax")),
-        "{run:#?}"
-    );
-
-    // A second document in the stream is well-formed authored evidence the
-    // single-root model cannot represent: the first document's finding keeps
-    // its exact anchor, and the run cannot claim completion.
-    let (_temp, analyzer, source) = configuration_yaml_fixture(
-        "server:\n  host: primary.example\n---\nserver:\n  host: shadow.example\n",
-    );
-    let run = evaluate_yaml_configuration_selector_policy(
-        &analyzer,
-        &yaml_configuration_policy_source(r#"(key "server") (key "host")"#),
-    );
-    assert!(
-        matches!(run.completion(), PolicyRunCompletion::Inconclusive { .. }),
-        "{run:#?}"
-    );
-    assert_eq!(run.findings().len(), 1, "{run:#?}");
-    assert_eq!(
-        run.findings()[0]
-            .primary()
-            .byte_span()
-            .map(|span| span.start()),
-        Some(source.find("host: primary.example").unwrap() as u64)
-    );
-    assert!(
-        run.diagnostics()
-            .iter()
-            .any(|diagnostic| diagnostic.message().contains("unsupported construct")),
-        "{run:#?}"
-    );
 }

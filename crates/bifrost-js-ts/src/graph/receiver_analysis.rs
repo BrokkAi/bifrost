@@ -6,6 +6,7 @@
 //! returns a constructed value.
 
 use crate::access_chain::{JsTsImportedMemberChainResolution, resolve_import_member_chain};
+use crate::graph::common::{enclosing_function_scope, simple_identifier_text};
 use crate::imports::{js_ts_module_identity, require_call_module_specifier};
 use crate::imports::{
     resolve_js_ts_direct_import_candidates, resolve_js_ts_imported_member_chain,
@@ -14,18 +15,21 @@ use crate::imports::{
 use crate::providers::{JsTsSource, compute_direct_ancestors};
 use crate::source_facts::JsTsFileSourceFacts;
 use crate::syntax::parse_js_ts_tree;
-use crate::syntax::{JsTsImportBinder, JsTsImportBindingResolution, slice, static_member_property};
+use crate::syntax::{
+    JsTsImportBinder, JsTsImportBindingResolution, js_ts_is_class_scope_kind,
+    pattern_binder_identifiers, slice, static_member_property,
+};
 use crate::ts_owners::{
-    jsts_identifier_candidates, jsts_indexed_callable_node,
+    jsts_identifier_candidates, jsts_indexed_callable_node, ts_nodes_for_code_unit,
     ts_resolve_source_type_to_property_owner_outcome,
-    ts_resolve_type_node_to_property_owner_outcome,
+    ts_resolve_type_node_to_property_owner_outcome, ts_source_type_property_owners,
+    ts_type_node_property_owners,
 };
 use crate::tsconfig::AliasResolver;
 use brokk_bifrost_core::analyzer::js_ts_facts::{
     JsTsComponentPropsFact, JsTsExportKind, JsTsSourceTypeId, JsTsTypeShape,
 };
 use brokk_bifrost_core::analyzer::model::CodeUnitType;
-use brokk_bifrost_core::analyzer::tree_walk::subtree_contains;
 use brokk_bifrost_core::analyzer::tree_walk::{
     BoundedNamedTreeWalk, walk_named_tree_preorder_bounded,
 };
@@ -40,7 +44,7 @@ use brokk_bifrost_core::analyzer::usages::reference_site::{
     node_range, smallest_named_node_covering,
 };
 use brokk_bifrost_core::analyzer::{
-    BoundedDefinitionLookup, CodeUnit, CodeUnitIndex, Language, ProjectFile, Range,
+    BoundedDefinitionLookup, CodeUnit, Language, ProjectFile, Range,
 };
 use brokk_bifrost_core::cancellation::CancellationToken;
 use brokk_bifrost_core::hash::{HashMap, HashSet};
@@ -188,9 +192,21 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         budget: ReceiverAnalysisBudget,
     ) -> ReceiverAnalysisReport<ReceiverValue> {
         let _scope = profiling::scope("jsts.receiver_analysis.resolve_receiver_node");
+        let (outcome, tracker) = self.resolve_receiver_with_tracker(node, budget);
+        tracker.report(outcome)
+    }
+
+    fn resolve_receiver_with_tracker(
+        &self,
+        node: Node<'tree>,
+        budget: ReceiverAnalysisBudget,
+    ) -> (
+        ReceiverAnalysisOutcome<ReceiverValue>,
+        ReceiverAnalysisBudgetTracker,
+    ) {
         let mut tracker = ReceiverAnalysisBudgetTracker::new(budget);
         let outcome = self.resolve_expression(node, 0, budget, &mut tracker);
-        tracker.report(outcome)
+        (outcome, tracker)
     }
 
     pub fn resolve_iterable_element(
@@ -584,20 +600,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
                 self.component_type_props_owners(&name, file, source, imports, aliases)
             }
             JsxPropsSource::Module(specifier) => {
-                if hops == 0 {
-                    return Vec::new();
-                }
-                resolve_js_ts_module_specifier(
-                    file,
-                    &specifier,
-                    Language::TypeScript,
-                    Some(aliases),
-                )
-                .iter()
-                .flat_map(|module| {
-                    self.module_default_component_props_owners(module, aliases, hops - 1)
-                })
-                .collect()
+                self.module_specifier_component_props_owners(file, &specifier, aliases, hops)
             }
             JsxPropsSource::TypeMember {
                 owner_type,
@@ -616,7 +619,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         imports: &JsTsImportBinder,
         aliases: &AliasResolver,
     ) -> Vec<CodeUnit> {
-        ts_resolve_type_node_to_property_owner_outcome(
+        ts_type_node_property_owners(
             self.host,
             self.support,
             file,
@@ -625,11 +628,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             aliases,
             type_node,
             0,
-            ReceiverAnalysisBudget::default(),
         )
-        .values()
-        .map(|values| values.to_vec())
-        .unwrap_or_default()
     }
 
     fn source_type_property_owners(
@@ -638,18 +637,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         file: &ProjectFile,
         facts: &JsTsFileSourceFacts,
     ) -> Vec<CodeUnit> {
-        ts_resolve_source_type_to_property_owner_outcome(
-            self.host,
-            self.support,
-            file,
-            facts,
-            type_id,
-            0,
-            ReceiverAnalysisBudget::default(),
-        )
-        .values()
-        .map(|values| values.to_vec())
-        .unwrap_or_default()
+        ts_source_type_property_owners(self.host, self.support, file, facts, type_id, 0)
     }
 
     fn canonical_props_source_owners(
@@ -680,12 +668,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
                 let [specifier] = path.segments.as_slice() else {
                     return Vec::new();
                 };
-                resolve_js_ts_module_specifier(file, specifier, Language::TypeScript, Some(aliases))
-                    .iter()
-                    .flat_map(|module| {
-                        self.module_default_component_props_owners(module, aliases, hops - 1)
-                    })
-                    .collect()
+                self.module_specifier_component_props_owners(file, specifier, aliases, hops)
             }
             JsTsComponentPropsFact::TypeMember {
                 owner_type,
@@ -695,6 +678,24 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
                 members,
             ),
         }
+    }
+
+    fn module_specifier_component_props_owners(
+        &self,
+        file: &ProjectFile,
+        specifier: &str,
+        aliases: &AliasResolver,
+        hops: usize,
+    ) -> Vec<CodeUnit> {
+        if hops == 0 {
+            return Vec::new();
+        }
+        resolve_js_ts_module_specifier(file, specifier, Language::TypeScript, Some(aliases))
+            .iter()
+            .flat_map(|module| {
+                self.module_default_component_props_owners(module, aliases, hops - 1)
+            })
+            .collect()
     }
 
     /// The props a component *type* declares: `type DevtoolsComponentType =
@@ -1308,39 +1309,20 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         type_node: Node<'tree>,
         budget: ReceiverAnalysisBudget,
     ) -> ReceiverAnalysisOutcome<ReceiverValue> {
-        match ts_resolve_type_node_to_property_owner_outcome(
-            self.host,
-            self.support,
-            self.file,
-            self.source,
-            &self.imports,
-            &self.aliases,
-            type_node,
-            0,
+        source_owner_receiver_outcome(
+            ts_resolve_type_node_to_property_owner_outcome(
+                self.host,
+                self.support,
+                self.file,
+                self.source,
+                &self.imports,
+                &self.aliases,
+                type_node,
+                0,
+                budget,
+            ),
             budget,
-        ) {
-            ReceiverAnalysisOutcome::Precise(values) => ReceiverAnalysisOutcome::Precise(
-                values
-                    .into_iter()
-                    .take(budget.max_targets)
-                    .map(ReceiverValue::InstanceType)
-                    .collect(),
-            ),
-            ReceiverAnalysisOutcome::Ambiguous(values) => ReceiverAnalysisOutcome::Ambiguous(
-                values
-                    .into_iter()
-                    .take(budget.max_targets)
-                    .map(ReceiverValue::InstanceType)
-                    .collect(),
-            ),
-            ReceiverAnalysisOutcome::Unknown => ReceiverAnalysisOutcome::Unknown,
-            ReceiverAnalysisOutcome::Unsupported { reason } => {
-                ReceiverAnalysisOutcome::Unsupported { reason }
-            }
-            ReceiverAnalysisOutcome::ExceededBudget { limit } => {
-                ReceiverAnalysisOutcome::ExceededBudget { limit }
-            }
-        }
+        )
     }
 
     fn iterable_element_type_outcome(
@@ -1493,14 +1475,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             name,
             Some(&self.aliases),
             true,
-        )?
-        .into_iter()
-        .filter(|unit| unit.is_function())
-        .collect::<Vec<_>>();
-        if functions.is_empty() {
-            return None;
-        }
-
+        )?;
         self.summarize_external_functions(functions, depth, budget, tracker)
     }
 
@@ -1512,7 +1487,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         tracker: &mut ReceiverAnalysisBudgetTracker,
     ) -> Option<ReceiverAnalysisOutcome<ReceiverValue>> {
         let mut outcomes = Vec::new();
-        for function in functions {
+        for function in functions.into_iter().filter(CodeUnit::is_function) {
             let Ok(source) = function.source().read_to_string() else {
                 continue;
             };
@@ -1538,7 +1513,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
                 tree.root_node(),
                 imports,
             );
-            for node in nodes_for_code_unit(self.host, &function, tree.root_node()) {
+            for node in ts_nodes_for_code_unit(self.host, &function, tree.root_node()) {
                 // The index holds the DECLARATION; `const f = () => ...` binds
                 // its callable one level down, and the return type and returns
                 // this summary reads both live on the callable.
@@ -1588,10 +1563,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             member,
             Some(&self.aliases),
             true,
-        )
-        .into_iter()
-        .filter(|unit| unit.is_function())
-        .collect::<Vec<_>>();
+        );
         self.summarize_external_functions(functions, depth, budget, tracker)
     }
 
@@ -1634,7 +1606,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         for value in values {
             for factory in self.member_targets_for_value(&value, &member) {
                 methods.extend(
-                    nodes_for_code_unit(self.host, &factory, self.root)
+                    ts_nodes_for_code_unit(self.host, &factory, self.root)
                         .into_iter()
                         .map(|node| (node, factory.clone())),
                 );
@@ -2547,7 +2519,6 @@ impl ReceiverFactProvider for JsTsReceiverFactProvider<'_, '_> {
         query: ReceiverAnalysisQuery<'_>,
     ) -> ReceiverAnalysisOutcome<ReceiverValue> {
         let _scope = profiling::scope("jsts.receiver_analysis.resolve_receiver");
-        let mut tracker = ReceiverAnalysisBudgetTracker::new(query.budget);
         let Some(range) = query.receiver_range else {
             return ReceiverAnalysisOutcome::Unknown;
         };
@@ -2555,7 +2526,8 @@ impl ReceiverFactProvider for JsTsReceiverFactProvider<'_, '_> {
         else {
             return ReceiverAnalysisOutcome::Unknown;
         };
-        self.resolve_expression(node, 0, query.budget, &mut tracker)
+        let (outcome, _) = self.resolve_receiver_with_tracker(node, query.budget);
+        outcome
     }
 
     fn summarize_call_result(
@@ -2648,24 +2620,9 @@ fn variable_declarator_is_const(declarator: Node<'_>) -> bool {
         .any(|child| child.kind() == "const")
 }
 
-fn enclosing_function_scope<'tree>(mut node: Node<'tree>) -> Option<Node<'tree>> {
-    loop {
-        if matches!(
-            node.kind(),
-            "function_declaration" | "function_expression" | "arrow_function" | "method_definition"
-        ) {
-            return Some(node);
-        }
-        node = node.parent()?;
-    }
-}
-
 fn enclosing_class_scope<'tree>(mut node: Node<'tree>) -> Option<Node<'tree>> {
     loop {
-        if matches!(
-            node.kind(),
-            "class_declaration" | "abstract_class_declaration" | "class"
-        ) {
+        if js_ts_is_class_scope_kind(node.kind()) {
             return Some(node);
         }
         node = node.parent()?;
@@ -2676,24 +2633,7 @@ fn object_literal_property_at_key<'tree>(
     node: Node<'tree>,
     source: &str,
 ) -> Option<(Node<'tree>, Node<'tree>, String)> {
-    let property = match node.kind() {
-        "pair" | "shorthand_property_identifier" | "method_definition" => node,
-        _ => node.parent().filter(|parent| {
-            matches!(
-                parent.kind(),
-                "pair" | "shorthand_property_identifier" | "method_definition"
-            ) && parent
-                .child_by_field_name("key")
-                .or_else(|| parent.child_by_field_name("name"))
-                .or_else(|| parent.named_child(0))
-                .is_some_and(|key| key.id() == node.id())
-        })?,
-    };
-    let object = property
-        .parent()
-        .filter(|parent| parent.kind() == "object")?;
-    let member = crate::typescript::ts_object_literal_property_name(property, source)?;
-    Some((property, object, member))
+    crate::typescript::ts_object_literal_property_at_key(node, source)
 }
 
 fn lexical_scope_ids_for_node(node: Node<'_>) -> HashSet<usize> {
@@ -2725,12 +2665,9 @@ fn binding_node_shadows_receiver(node: Node<'_>, source: &str, receiver: &str) -
 }
 
 fn binding_pattern_contains_name(node: Node<'_>, source: &str, receiver: &str) -> bool {
-    subtree_contains(node, |node| {
-        matches!(
-            node.kind(),
-            "identifier" | "type_identifier" | "shorthand_property_identifier_pattern"
-        ) && node_text_matches(node, source, receiver)
-    })
+    pattern_binder_identifiers(node)
+        .into_iter()
+        .any(|binder| node_text_matches(binder, source, receiver))
 }
 
 fn declaration_scope_id(node: Node<'_>) -> Option<usize> {
@@ -2773,39 +2710,15 @@ fn is_nonlinear_control_boundary(kind: &str) -> bool {
     )
 }
 
-fn nodes_for_code_unit<'tree>(
-    unit_index: &dyn CodeUnitIndex,
-    unit: &CodeUnit,
-    root: Node<'tree>,
-) -> Vec<Node<'tree>> {
-    unit_index
-        .ranges(unit)
-        .iter()
-        .filter_map(|range| smallest_named_node_covering(root, range.start_byte, range.end_byte))
-        .map(|node| {
-            node.child_by_field_name("declaration")
-                .filter(|_| node.kind() == "export_statement")
-                .unwrap_or(node)
-        })
-        .collect()
-}
-
 fn is_scope_boundary(kind: &str) -> bool {
-    matches!(
-        kind,
-        "program"
-            | "function_declaration"
-            | "function_expression"
-            | "arrow_function"
-            | "method_definition"
-            | "statement_block"
-            | "class_declaration"
-            | "abstract_class_declaration"
-            | "interface_declaration"
-    )
+    matches!(kind, "program" | "statement_block") || is_declaration_boundary(kind)
 }
 
 fn is_summary_boundary(kind: &str) -> bool {
+    is_declaration_boundary(kind)
+}
+
+fn is_declaration_boundary(kind: &str) -> bool {
     matches!(
         kind,
         "function_declaration"
@@ -2876,16 +2789,6 @@ pub fn build_js_ts_receiver_syntax_index_bounded<'tree>(
     }
 }
 
-fn simple_identifier_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
-    match node.kind() {
-        "identifier" | "type_identifier" => {
-            let text = slice(node, source);
-            (!text.is_empty()).then_some(text)
-        }
-        _ => None,
-    }
-}
-
 fn node_text_matches(node: Node<'_>, source: &str, expected: &str) -> bool {
     slice(node, source) == expected
 }
@@ -2940,4 +2843,31 @@ fn sort_units(units: &mut [CodeUnit]) {
             .cmp(right.source())
             .then_with(|| left.fq_name().cmp(&right.fq_name()))
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::binding_pattern_contains_name;
+    use crate::test_support::parse_javascript;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#4271: a default-value reference was mistaken for a destructuring binder")]
+    fn destructuring_default_reference_is_not_a_binding() {
+        let source = "const { a = b } = obj;\nconst later = b;\n";
+        let tree = parse_javascript(source);
+        let mut stack = vec![tree.root_node()];
+        let mut pattern = None;
+        while let Some(node) = stack.pop() {
+            if node.kind() == "object_pattern" {
+                pattern = Some(node);
+                break;
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+
+        let pattern = pattern.expect("destructuring pattern");
+        assert!(!binding_pattern_contains_name(pattern, source, "b"));
+    }
 }

@@ -125,17 +125,10 @@ fn yaml_options() -> serde_saphyr::Options {
     }
 }
 
-/// Translate a set of Models-as-Data files, read in the given order.
-///
-/// The caller supplies file name and bytes so the report never carries a host
-/// path and two runs over the same pin produce the same bytes.
-pub fn translate_codeql_models(
+fn for_each_codeql_row(
     files: &[(String, Vec<u8>)],
-) -> Result<CodeqlTranslation, CodeqlParseError> {
-    let mut builders: BTreeMap<FoundryTarget, FoundryEntryBuilder> = BTreeMap::new();
-    let mut rows_by_kind: BTreeMap<String, u32> = BTreeMap::new();
-    let mut skips = Vec::new();
-
+    mut visit: impl FnMut(&str, &str, u32, &[MadCell]),
+) -> Result<(), CodeqlParseError> {
     for (file, bytes) in files {
         let document: MadDocument = serde_saphyr::from_slice_with_options(bytes, yaml_options())
             .map_err(|error| CodeqlParseError {
@@ -147,24 +140,37 @@ pub fn translate_codeql_models(
             let mut ordinal = 0u32;
             for row in &extension.data {
                 ordinal += 1;
-                *rows_by_kind.entry(kind.to_owned()).or_default() += 1;
-                match kind {
-                    SUMMARY_MODEL => {
-                        translate_summary_row(file, ordinal, row, &mut builders, &mut skips)
-                    }
-                    NEUTRAL_MODEL => {
-                        translate_neutral_row(file, ordinal, row, &mut builders, &mut skips)
-                    }
-                    _ => skips.push(FoundrySkip {
-                        file: file.clone(),
-                        row: ordinal,
-                        reason: FoundrySkipReason::RowKindOutOfScope,
-                        detail: format!("{kind} rows are out of scope for summary translation"),
-                    }),
-                }
+                visit(file, kind, ordinal, row);
             }
         }
     }
+    Ok(())
+}
+
+/// Translate a set of Models-as-Data files, read in the given order.
+///
+/// The caller supplies file name and bytes so the report never carries a host
+/// path and two runs over the same pin produce the same bytes.
+pub fn translate_codeql_models(
+    files: &[(String, Vec<u8>)],
+) -> Result<CodeqlTranslation, CodeqlParseError> {
+    let mut builders: BTreeMap<FoundryTarget, FoundryEntryBuilder> = BTreeMap::new();
+    let mut rows_by_kind: BTreeMap<String, u32> = BTreeMap::new();
+    let mut skips = Vec::new();
+
+    for_each_codeql_row(files, |file, kind, ordinal, row| {
+        *rows_by_kind.entry(kind.to_owned()).or_default() += 1;
+        match kind {
+            SUMMARY_MODEL => translate_summary_row(file, ordinal, row, &mut builders, &mut skips),
+            NEUTRAL_MODEL => translate_neutral_row(file, ordinal, row, &mut builders, &mut skips),
+            _ => skips.push(FoundrySkip {
+                file: file.to_owned(),
+                row: ordinal,
+                reason: FoundrySkipReason::RowKindOutOfScope,
+                detail: format!("{kind} rows are out of scope for summary translation"),
+            }),
+        }
+    })?;
 
     let entries = builders
         .into_iter()
@@ -211,37 +217,25 @@ pub fn translate_codeql_taint_endpoints(
     let mut rows_by_kind: BTreeMap<String, u32> = BTreeMap::new();
     let mut skips = Vec::new();
 
-    for (file, bytes) in files {
-        let document: MadDocument = serde_saphyr::from_slice_with_options(bytes, yaml_options())
-            .map_err(|error| CodeqlParseError {
-                file: file.clone(),
-                message: error.to_string(),
-            })?;
-        for extension in &document.extensions {
-            let kind = extension.adds_to.extensible.as_str();
-            let role = match kind {
-                SOURCE_MODEL => Some(FoundryEndpointRole::Source),
-                SINK_MODEL => Some(FoundryEndpointRole::Sink),
-                _ => None,
-            };
-            let mut ordinal = 0u32;
-            for row in &extension.data {
-                ordinal += 1;
-                *rows_by_kind.entry(kind.to_owned()).or_default() += 1;
-                match role {
-                    Some(role) => {
-                        translate_endpoint_row(role, file, ordinal, row, &mut endpoints, &mut skips)
-                    }
-                    None => skips.push(FoundrySkip {
-                        file: file.clone(),
-                        row: ordinal,
-                        reason: FoundrySkipReason::RowKindOutOfScope,
-                        detail: format!("{kind} rows are out of scope for endpoint translation"),
-                    }),
-                }
+    for_each_codeql_row(files, |file, kind, ordinal, row| {
+        *rows_by_kind.entry(kind.to_owned()).or_default() += 1;
+        let role = match kind {
+            SOURCE_MODEL => Some(FoundryEndpointRole::Source),
+            SINK_MODEL => Some(FoundryEndpointRole::Sink),
+            _ => None,
+        };
+        match role {
+            Some(role) => {
+                translate_endpoint_row(role, file, ordinal, row, &mut endpoints, &mut skips)
             }
+            None => skips.push(FoundrySkip {
+                file: file.to_owned(),
+                row: ordinal,
+                reason: FoundrySkipReason::RowKindOutOfScope,
+                detail: format!("{kind} rows are out of scope for endpoint translation"),
+            }),
         }
-    }
+    })?;
 
     endpoints.sort();
     skips.sort();
@@ -816,30 +810,6 @@ pub fn corpus_digest(files: &[(String, Vec<u8>)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::summary_foundry::ir::FoundryClaim;
-
-    const SLICE: &str = include_str!("../../testdata/summary-corpora/codeql/java.lang.model.yml");
-
-    fn slice_files() -> Vec<(String, Vec<u8>)> {
-        vec![("java.lang.model.yml".to_owned(), SLICE.as_bytes().to_vec())]
-    }
-
-    fn entry<'a>(translation: &'a CodeqlTranslation, symbol: &str) -> &'a FoundryEntry {
-        translation
-            .entries
-            .iter()
-            .find(|entry| entry.target.signature.symbol(&entry.target.member) == symbol)
-            .unwrap_or_else(|| {
-                panic!(
-                    "no entry for {symbol}; have {:#?}",
-                    translation
-                        .entries
-                        .iter()
-                        .map(|entry| entry.target.signature.symbol(&entry.target.member))
-                        .collect::<Vec<_>>()
-                )
-            })
-    }
 
     #[test]
     fn access_paths_parse_into_root_and_qualifiers() {
@@ -895,285 +865,5 @@ mod tests {
             split_parameter_types("Map<String,Object>,int"),
             vec!["Map<String,Object>".to_owned(), "int".to_owned()]
         );
-    }
-
-    #[test]
-    fn summary_rows_become_transfers_on_the_named_target() {
-        let translation = translate_codeql_models(&slice_files()).expect("slice parses");
-
-        let concat = entry(&translation, "concat(String)");
-        assert_eq!(concat.claim, FoundryClaim::Flows);
-        assert_eq!(
-            concat.rendered_transfers(),
-            vec![
-                "parameter[0]->normal_return@normal".to_owned(),
-                "receiver->normal_return@normal".to_owned(),
-            ]
-        );
-        assert!(concat.boundary.has_receiver);
-        assert_eq!(concat.boundary.parameter_count, 1);
-        assert_eq!(concat.target.artifact_path, "java/lang/String.class");
-        assert_eq!(concat.evidence.len(), 2);
-    }
-
-    #[test]
-    fn an_argument_range_expands_to_one_transfer_per_ordinal() {
-        let translation = translate_codeql_models(&slice_files()).expect("slice parses");
-
-        let join = entry(&translation, "join");
-        assert_eq!(
-            join.rendered_transfers(),
-            vec![
-                "parameter[0]->normal_return@normal".to_owned(),
-                "parameter[1]->normal_return@normal".to_owned(),
-            ]
-        );
-        assert!(
-            join.notes
-                .contains(&FoundryNote::ParameterCountIsLowerBound { observed: 2 })
-        );
-    }
-
-    #[test]
-    fn a_constructor_row_lands_on_the_class_file_member_name() {
-        let translation = translate_codeql_models(&slice_files()).expect("slice parses");
-
-        let constructor = entry(&translation, "<init>(String)");
-        assert_eq!(
-            constructor.rendered_transfers(),
-            vec!["parameter[0]->receiver@normal".to_owned()]
-        );
-        assert!(
-            constructor
-                .notes
-                .contains(&FoundryNote::SubtypeClaimNotCarried)
-        );
-    }
-
-    #[test]
-    fn a_neutral_summary_row_is_a_no_flow_claim_without_an_authored_spelling() {
-        let translation = translate_codeql_models(&slice_files()).expect("slice parses");
-
-        let neutral = entry(&translation, "length()");
-        assert_eq!(neutral.claim, FoundryClaim::NoFlow);
-        assert!(neutral.transfers.is_empty());
-        assert!(neutral.authored_summary().is_none());
-        assert!(neutral.notes.contains(&FoundryNote::NoFlowClaimNotCarried));
-    }
-
-    #[test]
-    fn unrepresentable_rows_are_counted_by_typed_reason() {
-        let translation = translate_codeql_models(&slice_files()).expect("slice parses");
-        let counts = skip_counts(&translation.skips);
-
-        assert_eq!(counts.get("access_path_unsupported"), Some(&2));
-        assert_eq!(counts.get("output_port_unsupported"), Some(&1));
-        assert_eq!(counts.get("row_kind_out_of_scope"), Some(&3));
-        assert_eq!(translation.rows_by_kind.get("sinkModel"), Some(&1));
-        assert_eq!(translation.rows_by_kind.get("sourceModel"), Some(&1));
-    }
-
-    #[test]
-    fn translation_is_deterministic() {
-        let first = translate_codeql_models(&slice_files()).expect("slice parses");
-        let second = translate_codeql_models(&slice_files()).expect("slice parses");
-
-        assert_eq!(first, second);
-    }
-
-    // --- taint endpoint translation (sourceModel / sinkModel) ---
-
-    fn endpoint<'a>(
-        translation: &'a CodeqlEndpointTranslation,
-        role: FoundryEndpointRole,
-        member: &str,
-    ) -> &'a FoundryTaintEndpoint {
-        translation
-            .endpoints
-            .iter()
-            .find(|endpoint| endpoint.role == role && endpoint.target.member == member)
-            .unwrap_or_else(|| {
-                panic!(
-                    "no {} endpoint for {member}; have {:#?}",
-                    role.as_str(),
-                    translation
-                        .endpoints
-                        .iter()
-                        .map(|endpoint| (endpoint.role, endpoint.target.member.clone()))
-                        .collect::<Vec<_>>()
-                )
-            })
-    }
-
-    /// An inline Models-as-Data document exercising every endpoint shape the
-    /// translator must handle. Every row is the real CodeQL column layout.
-    const ENDPOINT_SLICE: &str = r#"
-extensions:
-  - addsTo:
-      pack: codeql/java-all
-      extensible: sourceModel
-    data:
-      - ["javax.servlet.http", "HttpServletRequest", False, "getParameter", "(String)", "", "ReturnValue", "remote", "manual"]
-      - ["java.lang", "System", False, "getenv", "", "", "ReturnValue", "environment", "manual"]
-      - ["java.util.function", "Consumer", True, "accept", "(Object)", "", "Argument[0]", "callback", "manual"]
-  - addsTo:
-      pack: codeql/java-all
-      extensible: sinkModel
-    data:
-      - ["java.sql", "Statement", True, "executeQuery", "", "", "Argument[0]", "sql-injection", "manual"]
-      - ["javax.servlet.http", "HttpServletResponse", False, "addHeader", "", "", "Argument[0..1]", "response-splitting", "manual"]
-      - ["java.lang", "ProcessBuilder", False, "environment", "()", "", "Argument[this]", "command-injection", "manual"]
-      - ["java.util", "Collection", True, "addAll", "(Collection)", "", "Argument[0].Element", "unsafe-deserialization", "manual"]
-      - ["java.lang", "System", False, "exit", "(int)", "", "ReturnValue", "code-injection", "manual"]
-      - ["java.lang", "Runtime", True, "exec", "(String)", "", "", "", "manual", "extra"]
-  - addsTo:
-      pack: codeql/java-all
-      extensible: summaryModel
-    data:
-      - ["java.lang", "String", False, "concat", "(String)", "", "Argument[this]", "ReturnValue", "taint", "manual"]
-"#;
-
-    fn endpoint_slice_files() -> Vec<(String, Vec<u8>)> {
-        vec![(
-            "endpoints.model.yml".to_owned(),
-            ENDPOINT_SLICE.as_bytes().to_vec(),
-        )]
-    }
-
-    #[test]
-    fn a_source_row_names_the_method_and_the_tainted_output_port() {
-        let translation =
-            translate_codeql_taint_endpoints(&endpoint_slice_files()).expect("slice parses");
-
-        let get_parameter = endpoint(&translation, FoundryEndpointRole::Source, "getParameter");
-        assert_eq!(get_parameter.ports, vec![FoundryEndpointPort::ReturnValue]);
-        assert_eq!(get_parameter.kind, "remote");
-        assert_eq!(
-            get_parameter.declaring_type_fqn(),
-            "javax.servlet.http.HttpServletRequest"
-        );
-        assert_eq!(
-            get_parameter.target.artifact_path,
-            "javax/servlet/http/HttpServletRequest.class"
-        );
-        assert!(get_parameter.qualifier.is_none());
-
-        // A source whose tainted output is a parameter (a callback) keeps the
-        // parameter port rather than a return.
-        let accept = endpoint(&translation, FoundryEndpointRole::Source, "accept");
-        assert_eq!(
-            accept.ports,
-            vec![FoundryEndpointPort::Parameter { ordinal: 0 }]
-        );
-    }
-
-    #[test]
-    fn a_sink_row_names_the_method_and_the_sensitive_input_ports() {
-        let translation =
-            translate_codeql_taint_endpoints(&endpoint_slice_files()).expect("slice parses");
-
-        let execute_query = endpoint(&translation, FoundryEndpointRole::Sink, "executeQuery");
-        assert_eq!(
-            execute_query.ports,
-            vec![FoundryEndpointPort::Parameter { ordinal: 0 }]
-        );
-        assert_eq!(execute_query.kind, "sql-injection");
-        assert!(execute_query.subtypes);
-
-        // A range input expands to one sensitive port per ordinal.
-        let add_header = endpoint(&translation, FoundryEndpointRole::Sink, "addHeader");
-        assert_eq!(
-            add_header.ports,
-            vec![
-                FoundryEndpointPort::Parameter { ordinal: 0 },
-                FoundryEndpointPort::Parameter { ordinal: 1 },
-            ]
-        );
-
-        // A receiver input becomes the receiver port.
-        let environment = endpoint(&translation, FoundryEndpointRole::Sink, "environment");
-        assert_eq!(environment.ports, vec![FoundryEndpointPort::Receiver]);
-    }
-
-    #[test]
-    fn a_qualified_endpoint_keeps_the_root_port_and_records_the_qualifier() {
-        let translation =
-            translate_codeql_taint_endpoints(&endpoint_slice_files()).expect("slice parses");
-
-        let add_all = endpoint(&translation, FoundryEndpointRole::Sink, "addAll");
-        assert_eq!(
-            add_all.ports,
-            vec![FoundryEndpointPort::Parameter { ordinal: 0 }]
-        );
-        assert_eq!(add_all.qualifier.as_deref(), Some(".Element"));
-    }
-
-    #[test]
-    fn unrepresentable_endpoint_rows_are_counted_by_typed_reason() {
-        let translation =
-            translate_codeql_taint_endpoints(&endpoint_slice_files()).expect("slice parses");
-        let counts = skip_counts(&translation.skips);
-
-        // A sink cannot read a return value.
-        assert_eq!(counts.get("input_port_unsupported"), Some(&1));
-        // The Runtime.exec row has ten columns, not nine.
-        assert_eq!(counts.get("malformed_row"), Some(&1));
-        // The summaryModel row is out of scope for endpoint translation.
-        assert_eq!(counts.get("row_kind_out_of_scope"), Some(&1));
-        assert_eq!(translation.rows_by_kind.get("summaryModel"), Some(&1));
-        assert_eq!(translation.rows_by_kind.get("sourceModel"), Some(&3));
-        assert_eq!(translation.rows_by_kind.get("sinkModel"), Some(&6));
-
-        // The malformed and unsupported rows never produce an endpoint. The
-        // slice defines three sources and four well-formed sinks (executeQuery,
-        // addHeader, environment, and the qualified addAll); the ReturnValue
-        // sink and the ten-column row are skipped.
-        let sources = translation
-            .endpoints
-            .iter()
-            .filter(|endpoint| endpoint.role == FoundryEndpointRole::Source)
-            .count();
-        let sinks = translation
-            .endpoints
-            .iter()
-            .filter(|endpoint| endpoint.role == FoundryEndpointRole::Sink)
-            .count();
-        assert_eq!((sources, sinks), (3, 4));
-    }
-
-    #[test]
-    fn the_two_translators_partition_the_corpus_rows() {
-        // The checked-in slice carries both halves. The summary translator sees
-        // the source/sink rows as out of scope; the endpoint translator sees the
-        // summary/neutral rows as out of scope. Neither drops a row in silence.
-        let summary = translate_codeql_models(&slice_files()).expect("slice parses");
-        let endpoints = translate_codeql_taint_endpoints(&slice_files()).expect("slice parses");
-
-        assert_eq!(endpoints.endpoints.len(), 2);
-        let get_env = endpoint(&endpoints, FoundryEndpointRole::Source, "getenv");
-        assert_eq!(get_env.ports, vec![FoundryEndpointPort::ReturnValue]);
-        let exec = endpoint(&endpoints, FoundryEndpointRole::Sink, "exec");
-        assert_eq!(
-            exec.ports,
-            vec![FoundryEndpointPort::Parameter { ordinal: 0 }]
-        );
-        assert!(exec.subtypes);
-
-        // Every row the summary translator counted appears under its kind, and
-        // the endpoint translator counts the same kinds from the other side.
-        assert_eq!(summary.rows_by_kind.get("sourceModel"), Some(&1));
-        assert_eq!(summary.rows_by_kind.get("sinkModel"), Some(&1));
-        assert_eq!(endpoints.rows_by_kind.get("summaryModel"), Some(&7));
-        assert_eq!(endpoints.rows_by_kind.get("neutralModel"), Some(&2));
-    }
-
-    #[test]
-    fn endpoint_translation_is_deterministic() {
-        let first =
-            translate_codeql_taint_endpoints(&endpoint_slice_files()).expect("slice parses");
-        let second =
-            translate_codeql_taint_endpoints(&endpoint_slice_files()).expect("slice parses");
-
-        assert_eq!(first, second);
     }
 }

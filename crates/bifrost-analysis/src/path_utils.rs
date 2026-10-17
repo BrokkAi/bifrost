@@ -4,10 +4,14 @@
 //! [`brokk_bifrost_core::path_utils`]; only the resolver, which reads a
 //! workspace listing off an [`IAnalyzer`], stays here.
 
+pub use brokk_bifrost_core::path_utils::contains_glob_syntax;
 pub(crate) use brokk_bifrost_core::path_utils::{
-    has_drive_letter_prefix, normalize_pattern, workspace_rel_path,
+    contains_glob_syntax as is_glob_pattern, has_drive_letter_prefix, workspace_rel_path,
 };
-pub use brokk_bifrost_core::path_utils::{percent_decode, rel_path_string};
+pub use brokk_bifrost_core::path_utils::{
+    is_windows_absolute_path, normalize_pattern, percent_decode, rel_path_string,
+    workspace_relative_slash_path,
+};
 
 use crate::analyzer::store::StoreError;
 use crate::analyzer::{
@@ -27,11 +31,6 @@ pub(crate) const STRICT_SEPARATOR: MatchOptions = MatchOptions {
     require_literal_leading_dot: false,
 };
 
-/// Whether `pattern` is a glob rather than a literal path.
-pub(crate) fn is_glob_pattern(pattern: &str) -> bool {
-    pattern.contains(['*', '?', '['])
-}
-
 /// The workspace-relative directory `target` names, if any: the empty path for
 /// the workspace root, `None` for spellings that cannot name a workspace
 /// directory at all (absolute, root-anchored, or `..`-escaping).
@@ -45,6 +44,22 @@ pub(crate) fn workspace_directory_path(target: &str) -> Option<PathBuf> {
     } else {
         workspace_rel_path(normalized)
     }
+}
+
+/// Normalize a relative path while refusing components that can escape or
+/// change its root.
+pub(crate) fn normalize_relative_components(path: &Path) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => normalized.push(part),
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => return None,
+        }
+    }
+    Some(normalized)
 }
 
 /// The prefix every workspace-relative path under `directory` starts with,
@@ -318,6 +333,9 @@ mod tests {
     /// confident absence. The listing failure must reach the request boundary
     /// instead.
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2325: Injected listing failure crosses resolver and analyzer request boundary, preventing a false confident absence"
+    )]
     fn a_failed_workspace_listing_reports_the_failure_rather_than_a_confident_absence() {
         let (_temp, analyzer) = unlistable_workspace();
         let context = std::sync::Arc::new(AnalyzerQueryContext::default());
@@ -344,6 +362,9 @@ mod tests {
     /// The same resolver on a healthy workspace records nothing: the failure
     /// channel must not fire on a genuine miss.
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2325: Exercises the healthy resolver path alongside the failure contract and distinguishes a real miss from a failed listing"
+    )]
     fn a_healthy_workspace_miss_records_no_failure() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root: PathBuf = temp.path().canonicalize().expect("canonical root");

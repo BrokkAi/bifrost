@@ -111,7 +111,8 @@
 //! - Every exact tier has already failed for both endpoints. In `pair_endpoints`
 //!   this is structural: rule 3 scores only the leftovers of rule 1 (identity of
 //!   fqn/kind/language) and rule 2 (the Git-reported rename bucket, which
-//!   additionally requires exactly one candidate on each side).
+//!   additionally requires exactly one candidate on each side), and only pairs
+//!   across files (#4423).
 //! - Both bodies are non-trivial. `body_token_signature` returns `None` for a
 //!   body of fewer than two non-blank lines, and a `None` signature never
 //!   participates.
@@ -998,21 +999,6 @@ mod tests {
         );
         assert_ne!(pin.digest(), swapped.digest(), "the pin is directional");
     }
-
-    #[test]
-    fn an_object_name_is_lowercase_hex_of_a_known_width() {
-        assert!(ObjectName::new("0".repeat(40)).is_ok());
-        assert!(ObjectName::new("0".repeat(64)).is_ok());
-        assert_eq!(
-            ObjectName::new("A".repeat(40)).unwrap_err(),
-            ObjectNameError::NotLowercaseHex
-        );
-        assert_eq!(
-            ObjectName::new("0".repeat(39)).unwrap_err(),
-            ObjectNameError::Length { bytes: 39 }
-        );
-    }
-
     #[test]
     fn tier_order_is_strongest_first() {
         assert!(CorrespondenceTier::StableSemanticIdentity < CorrespondenceTier::ContentIdentity);

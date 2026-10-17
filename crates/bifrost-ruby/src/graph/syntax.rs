@@ -76,6 +76,35 @@ pub fn is_call_method_identifier(node: Node<'_>) -> bool {
     })
 }
 
+pub fn is_bare_method_reference_identifier(node: Node<'_>) -> bool {
+    node.kind() == "identifier"
+        && !is_declaration_identifier(node)
+        && !is_call_method_identifier(node)
+}
+
+pub fn ruby_call_is_same_owner(node: Node<'_>) -> bool {
+    node.child_by_field_name("receiver")
+        .is_none_or(|receiver| receiver.kind() == "self")
+}
+
+pub fn for_each_ruby_superclass_constant<'tree>(
+    node: Node<'tree>,
+    mut visit: impl FnMut(Node<'tree>),
+) {
+    let Some(superclass) = node.child_by_field_name("superclass") else {
+        return;
+    };
+    let mut stack = vec![superclass];
+    while let Some(current) = stack.pop() {
+        visit(current);
+        for index in (0..current.named_child_count()).rev() {
+            if let Some(child) = current.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+}
+
 pub fn dynamic_dispatch_target_argument<'tree>(
     node: Node<'tree>,
     source: &str,
@@ -114,6 +143,4 @@ pub fn symbol_or_string_value(node: Node<'_>, source: &str) -> Option<String> {
     (!stripped.is_empty()).then(|| stripped.to_string())
 }
 
-pub fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    brokk_bifrost_core::analyzer::common::node_source_text_trimmed(node, source)
-}
+pub use brokk_bifrost_core::analyzer::common::node_source_text_trimmed as node_text;

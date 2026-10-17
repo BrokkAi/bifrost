@@ -1634,7 +1634,21 @@ fn verify_wheel(
             }
         };
         let is_dir = entry.is_dir();
-        let name = entry.name().to_owned();
+        let name = match entry.name() {
+            Ok(name) => name.into_owned(),
+            Err(error) => {
+                diagnostic_for_artifact(
+                    report,
+                    limits,
+                    artifact,
+                    "python.runtime.zip_entry_name",
+                    None,
+                    format!("could not decode wheel entry name {index}: {error}"),
+                );
+                complete = false;
+                continue;
+            }
+        };
         let Some(path) = canonical_member_path(&name, is_dir, limits.max_source_path_depth) else {
             diagnostic_for_artifact(
                 report,

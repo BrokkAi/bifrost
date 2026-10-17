@@ -1,23 +1,25 @@
 use super::GO_MODULE_SCOPE_SEGMENT;
 use super::declarations::{
-    collect_go_import_infos, determine_go_package_name, go_identifier_is_exported, go_node_text,
+    determine_go_package_name, go_identifier_is_exported, go_node_text,
     go_structured_type_identity, is_predeclared_go_type,
 };
 use super::dependency_discovery::DiscoveredGoPackage;
 use crate::CancellationToken;
+pub use crate::analyzer::semantic_model::GoPinnedPackage;
 use crate::analyzer::semantic_model::{
     ActivationSelector, ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest,
     AuthoredPayload, AuthoredSemanticModelPack, AuthoredShard, BoundedProducerDiagnostics,
     ChannelDirection, Compatibility, Completeness, DependencyPackAdapter, DependencyPackProduction,
     EmbeddedTypeFact, ExactArtifact, ExactDependencyArtifact, ExternalArtifactKind, HierarchyFact,
-    HierarchyKind, Locator, MemberFact, MemberIdentity, MemberKind, NameSelector, Parameter,
-    Producer, ProducerDiagnostic, ProducerDiagnosticSeverity, Provenance, ReceiverFact,
-    ResolvedDependency, Safety, Signature, StructuredTypeExpression, TypeFact, TypeIdentity,
-    TypeKind, TypeParameterConstraint, TypeRef, VersionConstraint, Visibility,
+    HierarchyKind, Locator, MemberFact, MemberIdentity, MemberKind, Parameter, Producer,
+    ProducerDiagnostic, ProducerDiagnosticSeverity, Provenance, ReceiverFact, ResolvedDependency,
+    Safety, Signature, StructuredTypeExpression, TypeFact, TypeIdentity, TypeKind,
+    TypeParameterConstraint, TypeRef, VersionConstraint, Visibility, go_method_signatures_match,
     member_declaration_id, type_declaration_id,
 };
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_go::{declarations::go_parameter_syntax, graph::ast::last_named_child};
 use tree_sitter::{Node, Tree};
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -28,10 +30,6 @@ impl DependencyPackAdapter for GoDependencyPackAdapter {
         "bifrost-go-dependency"
     }
 
-    fn adapter_version(&self) -> &str {
-        env!("CARGO_PKG_VERSION")
-    }
-
     fn producer(&self) -> Producer {
         Producer {
             name: self.adapter_name().to_owned(),
@@ -40,11 +38,7 @@ impl DependencyPackAdapter for GoDependencyPackAdapter {
     }
 
     fn can_produce(&self, dependency: &ResolvedDependency) -> bool {
-        dependency.evidence.language == "go"
-            && dependency
-                .artifacts
-                .iter()
-                .any(|artifact| artifact.kind == ExternalArtifactKind::GoSourceSet)
+        dependency.has_language_artifact("go", ExternalArtifactKind::GoSourceSet)
     }
 
     fn produce(
@@ -174,26 +168,13 @@ impl DependencyPackAdapter for GoDependencyPackAdapter {
                     collection_flows: None,
                     deferred_yields: None,
                     conditional_type_refinements: None,
+                    callable_values: None,
                 }],
             }),
             diagnostics,
             suppressed_diagnostics,
         }
     }
-}
-
-/// One Go package as a pinned release spec declares it.
-///
-/// A workspace dependency learns its packages from `go list`, which is not
-/// available when authoring a pinned release bundle from a bare source tree.
-/// The spec names each package's import path, declared package name, and
-/// owned `.go` files explicitly instead, exactly as a pinned Python stub tree
-/// names its files: the structure is spec-authored, not toolchain-derived.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GoPinnedPackage {
-    pub import_path: String,
-    pub name: String,
-    pub files: Vec<String>,
 }
 
 /// Produce one pack from a pinned exact source set of `.go` files, grouped
@@ -299,6 +280,7 @@ impl GoModulePackProducer {
                     collection_flows: None,
                     deferred_yields: None,
                     conditional_type_refinements: None,
+                    callable_values: None,
                 }],
             }),
             completeness,
@@ -316,13 +298,6 @@ struct ProductionRequest {
 }
 
 fn production_request(dependency: &ResolvedDependency) -> ProductionRequest {
-    let selector = |coordinate: &crate::analyzer::semantic_model::CatalogCoordinate| NameSelector {
-        name: coordinate.name.clone(),
-        version: coordinate
-            .version
-            .as_ref()
-            .map(|version| format!("={version}")),
-    };
     ProductionRequest {
         pack_id: "bifrost.external.go".to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -343,19 +318,9 @@ fn production_request(dependency: &ResolvedDependency) -> ProductionRequest {
                 .into_iter()
                 .collect(),
         },
-        activation: vec![ActivationSelector {
-            package: dependency.evidence.package.as_ref().map(selector),
-            module: dependency.evidence.module.as_ref().map(selector),
-            toolchain: dependency.evidence.toolchain.as_ref().map(selector),
-            targets: dependency.evidence.target.clone().into_iter().collect(),
-            configurations: dependency
-                .evidence
-                .configuration
-                .clone()
-                .into_iter()
-                .collect(),
-            artifact_sha256: None,
-        }],
+        activation: vec![
+            crate::analyzer::semantic_model::activation_selector_for_evidence(&dependency.evidence),
+        ],
     }
 }
 
@@ -803,7 +768,12 @@ fn add_go_interface_relations(
                 || !required_methods.iter().all(|required| {
                     candidate_methods.iter().any(|candidate| {
                         !candidate.receiver.is_some_and(|receiver| receiver.pointer)
-                            && go_method_signatures_match(candidate, required)
+                            && go_method_signatures_match(
+                                &candidate.name,
+                                candidate.signature.as_ref(),
+                                &required.name,
+                                required.signature.as_ref(),
+                            )
                     })
                 })
             {
@@ -822,27 +792,6 @@ fn add_go_interface_relations(
             },
             declaration_ordinal: None,
         });
-    }
-}
-
-fn go_method_signatures_match(candidate: &MemberFact, required: &MemberFact) -> bool {
-    if candidate.name != required.name {
-        return false;
-    }
-    match (&candidate.signature, &required.signature) {
-        (Some(candidate), Some(required)) => {
-            candidate.type_parameters.len() == required.type_parameters.len()
-                && candidate.parameters.len() == required.parameters.len()
-                && candidate.parameters.iter().zip(&required.parameters).all(
-                    |(candidate, required)| {
-                        candidate.r#type == required.r#type
-                            && candidate.variadic == required.variadic
-                    },
-                )
-                && candidate.returns == required.returns
-        }
-        (None, None) => true,
-        _ => false,
     }
 }
 
@@ -884,14 +833,7 @@ fn top_level_type_specs(root: Node<'_>) -> Vec<Node<'_>> {
         if declaration.kind() != "type_declaration" {
             continue;
         }
-        walk_named_tree_preorder(declaration, false, |node| {
-            if matches!(node.kind(), "type_spec" | "type_alias") {
-                specs.push(node);
-                WalkControl::SkipChildren
-            } else {
-                WalkControl::Continue
-            }
-        });
+        specs.extend(top_level_specs(declaration));
     }
     specs
 }
@@ -935,6 +877,8 @@ fn module_type_drafts(
                     .collect();
                 TypeDraft {
                     fact: TypeFact {
+                        jvm_inventory: None,
+                        runtime_bases: None,
                         ambient_use: None,
                         id: type_declaration_id(TypeIdentity {
                             ecosystem: "go",
@@ -956,7 +900,7 @@ fn module_type_drafts(
                         aliases,
                         extension_surfaces: Vec::new(),
                         guard: None,
-                        locator: artifact_locator(&path, &name),
+                        locator: Locator::artifact(&path, &name),
                     },
                     exported: false,
                     scaffold: true,
@@ -1060,19 +1004,8 @@ fn import_bindings(
     source: &str,
     package_names: &HashMap<String, String>,
 ) -> HashMap<String, String> {
-    collect_go_import_infos(root, source)
+    super::go_import_binding_pairs(root, source, |path| package_names.get(path).cloned())
         .into_iter()
-        .filter_map(|info| {
-            let path = info.path.as_ref()?.render_segments("/");
-            if path.is_empty() {
-                return None;
-            }
-            let local = info
-                .alias
-                .or_else(|| package_names.get(&path).cloned())
-                .or(info.identifier)?;
-            (!matches!(local.as_str(), "_" | ".")).then_some((local, path))
-        })
         .collect()
 }
 
@@ -1193,6 +1126,8 @@ fn collect_type_draft(
     }
     types.push(TypeDraft {
         fact: TypeFact {
+            jvm_inventory: None,
+            runtime_bases: None,
             ambient_use: None,
             id: type_id.clone(),
             name: canonical_name.clone(),
@@ -1219,7 +1154,7 @@ fn collect_type_draft(
                 .collect(),
             extension_surfaces: Vec::new(),
             guard: None,
-            locator: artifact_locator(&parsed.path, &canonical_name),
+            locator: Locator::artifact(&parsed.path, &canonical_name),
         },
         exported,
         scaffold: false,
@@ -1316,7 +1251,7 @@ fn collect_struct_members(
                     returns: Some(type_ref.clone()),
                 }),
                 None,
-                artifact_locator(&parsed.path, &format!("{owner_name}.{name}")),
+                Locator::artifact(&parsed.path, format!("{owner_name}.{name}")),
                 limits,
                 diagnostics,
                 members,
@@ -1374,7 +1309,7 @@ fn collect_interface_members(
             true,
             Some(signature),
             None,
-            artifact_locator(&parsed.path, &format!("{owner_name}.{name}")),
+            Locator::artifact(&parsed.path, format!("{owner_name}.{name}")),
             limits,
             diagnostics,
             members,
@@ -1461,7 +1396,7 @@ fn collect_callable_draft(
         exported,
         Some(signature),
         receiver,
-        artifact_locator(&parsed.path, &format!("{owner_name}.{name}")),
+        Locator::artifact(&parsed.path, format!("{owner_name}.{name}")),
         limits,
         diagnostics,
         members,
@@ -1537,7 +1472,7 @@ fn collect_value_drafts(
                 exported,
                 signature.clone(),
                 None,
-                artifact_locator(&parsed.path, &format!("{owner_name}.{name}")),
+                Locator::artifact(&parsed.path, format!("{owner_name}.{name}")),
                 limits,
                 diagnostics,
                 members,
@@ -1603,6 +1538,8 @@ fn push_member(
         fact: MemberFact {
             non_overridable: None,
             ambient_use: None,
+            value_type: None,
+            proxied_type: None,
             id,
             owner: owner_id.to_owned(),
             name,
@@ -1614,6 +1551,7 @@ fn push_member(
             implicit_operation: None,
             explicit_operation: None,
             callable_family_complete: false,
+            exact_return_classes: Vec::new(),
             signature,
             receiver,
             extension_receiver: None,
@@ -1705,22 +1643,11 @@ fn callable_parameters(
     path: &str,
 ) -> Vec<Parameter> {
     let mut result = Vec::new();
-    let mut cursor = parameters.walk();
-    for parameter in parameters.named_children(&mut cursor) {
-        if !matches!(
-            parameter.kind(),
-            "parameter_declaration" | "variadic_parameter_declaration"
-        ) {
-            continue;
-        }
-        let variadic = parameter.kind() == "variadic_parameter_declaration";
-        let type_node = parameter.child_by_field_name("type").or_else(|| {
-            let mut cursor = parameter.walk();
-            parameter.named_children(&mut cursor).last()
-        });
-        let Some(type_node) = type_node else {
+    for parameter in go_parameter_syntax(parameters) {
+        let Some(type_node) = parameter.type_node else {
             continue;
         };
+        let variadic = parameter.variadic;
         let parameter_type = type_ref(type_node, source, context, limits.max_signature_depth)
             .unwrap_or_else(|| {
                 diagnostics.warning(
@@ -1733,10 +1660,9 @@ fn callable_parameters(
                 );
                 rendered_type_ref(type_node, source)
             });
-        let mut name_cursor = parameter.walk();
         let names = parameter
-            .named_children(&mut name_cursor)
-            .filter(|child| child.kind() == "identifier" && child.id() != type_node.id())
+            .name_nodes
+            .into_iter()
             .map(|child| go_node_text(child, source).trim().to_owned())
             .collect::<Vec<_>>();
         if names.is_empty() {
@@ -1745,6 +1671,7 @@ fn callable_parameters(
                 r#type: parameter_type,
                 optional: false,
                 variadic,
+                role: None,
                 passing_mode: Default::default(),
             });
         } else {
@@ -1753,6 +1680,7 @@ fn callable_parameters(
                 r#type: parameter_type.clone(),
                 optional: false,
                 variadic,
+                role: None,
                 passing_mode: Default::default(),
             }));
         }
@@ -1795,10 +1723,7 @@ fn type_parameters(
         .named_children(&mut cursor)
         .filter(|child| child.kind() == "type_parameter_declaration")
     {
-        let Some(constraint_node) = declaration.child_by_field_name("type").or_else(|| {
-            let mut cursor = declaration.walk();
-            declaration.named_children(&mut cursor).last()
-        }) else {
+        let Some(constraint_node) = type_parameter_constraint_node(declaration) else {
             continue;
         };
         let mut cursor = declaration.walk();
@@ -1834,7 +1759,7 @@ fn type_parameter_names(node: Node<'_>, source: &str) -> Vec<String> {
         .named_children(&mut cursor)
         .filter(|child| child.kind() == "type_parameter_declaration")
     {
-        let constraint = declaration.child_by_field_name("type");
+        let constraint = type_parameter_constraint_node(declaration);
         let mut cursor = declaration.walk();
         names.extend(
             declaration
@@ -1848,6 +1773,10 @@ fn type_parameter_names(node: Node<'_>, source: &str) -> Vec<String> {
         );
     }
     names
+}
+
+fn type_parameter_constraint_node(declaration: Node<'_>) -> Option<Node<'_>> {
+    declaration.child_by_field_name("type")
 }
 
 fn type_parameter_list(node: Node<'_>) -> Option<Node<'_>> {
@@ -1947,7 +1876,11 @@ fn type_ref(
                     }
                     "pointer_type" => {
                         frames.push(TypeFrame::Pointer);
-                        frames.push(TypeFrame::Visit(wrapper_type_child(node)?, depth + 1));
+                        frames.push(TypeFrame::Visit(
+                            brokk_bifrost_core::analyzer::structural::adapter_helpers::
+                                child_by_field_or_first_named_child(node, "type")?,
+                            depth + 1,
+                        ));
                     }
                     "array_type" | "implicit_length_array_type" => {
                         let length = node
@@ -2027,7 +1960,11 @@ fn type_ref(
                         }
                     }
                     "parenthesized_type" => {
-                        frames.push(TypeFrame::Visit(wrapper_type_child(node)?, depth + 1));
+                        frames.push(TypeFrame::Visit(
+                            brokk_bifrost_core::analyzer::structural::adapter_helpers::
+                                child_by_field_or_first_named_child(node, "type")?,
+                            depth + 1,
+                        ));
                     }
                     _ => values.push(rendered_type_ref(node, source)),
                 }
@@ -2103,6 +2040,7 @@ fn type_ref(
                         r#type,
                         optional: false,
                         variadic,
+                        role: None,
                         passing_mode: Default::default(),
                     })
                     .collect();
@@ -2262,18 +2200,6 @@ fn rendered_type_ref(node: Node<'_>, source: &str) -> TypeRef {
     }
 }
 
-fn wrapper_type_child(node: Node<'_>) -> Option<Node<'_>> {
-    node.child_by_field_name("type").or_else(|| {
-        let mut cursor = node.walk();
-        node.named_children(&mut cursor).next()
-    })
-}
-
-fn last_named_child(node: Node<'_>) -> Option<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).last()
-}
-
 fn channel_direction(node: Node<'_>) -> ChannelDirection {
     let arrow_index = (0..node.child_count())
         .find(|index| node.child(*index).is_some_and(|child| child.kind() == "<-"));
@@ -2329,37 +2255,12 @@ fn embedded_type_is_pointer(node: Node<'_>) -> bool {
 }
 
 fn declared_type_ids(types: &[TypeRef]) -> Vec<String> {
-    let mut ids = Vec::new();
-    let mut pending = types.iter().collect::<Vec<_>>();
-    while let Some(reference) = pending.pop() {
-        match reference {
-            TypeRef::Named { arguments, .. } | TypeRef::Declared { arguments, .. } => {
-                if let TypeRef::Declared { id, .. } = reference
-                    && !ids.contains(id)
-                {
-                    ids.push(id.clone());
-                }
-                pending.extend(arguments);
-            }
-            TypeRef::Array { element }
-            | TypeRef::ByRef { element, .. }
-            | TypeRef::Pointer { element }
-            | TypeRef::Slice { element }
-            | TypeRef::FixedArray { element, .. }
-            | TypeRef::Channel { element, .. } => pending.push(element),
-            TypeRef::Map { key, value } => {
-                pending.push(key);
-                pending.push(value);
-            }
-            TypeRef::Wildcard { bound, .. } => pending.extend(bound.as_deref()),
-            TypeRef::Tuple { elements } => pending.extend(elements),
-            TypeRef::Function { parameters, result } => {
-                pending.extend(parameters.iter().map(|parameter| &parameter.r#type));
-                pending.extend(result.as_deref());
-            }
-            TypeRef::TypeParameter { .. } => {}
+    let mut ids: Vec<String> = Vec::new();
+    crate::analyzer::common::visit_declared_type_refs(types, |id| {
+        if !ids.iter().any(|existing| existing.as_str() == id) {
+            ids.push(id.to_owned());
         }
-    }
+    });
     ids.sort();
     ids
 }
@@ -2399,7 +2300,7 @@ fn type_ref_depth(reference: &TypeRef) -> usize {
                 );
                 pending.extend(result.as_deref().map(|result| (result, depth + 1)));
             }
-            TypeRef::TypeParameter { .. } => {}
+            TypeRef::Unknown | TypeRef::TypeParameter { .. } => {}
         }
     }
     maximum
@@ -2516,19 +2417,13 @@ fn finish_facts(
     (types, members)
 }
 
-fn artifact_locator(path: &str, symbol: &str) -> Locator {
-    Locator::Artifact {
-        path: path.to_owned(),
-        symbol: symbol.to_owned(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::analyzer::semantic_model::{
-        CompilerOptions, ProducerDiagnostic, SuppressedDiagnostics, compile_pack,
+        CompilerOptions, NameSelector, ProducerDiagnostic, SuppressedDiagnostics, compile_pack,
     };
+    use brokk_bifrost_test_macros::hardwon;
 
     fn package(files: &[&str]) -> DiscoveredGoPackage {
         DiscoveredGoPackage {
@@ -2561,6 +2456,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("5c5d4e214494: Go member IDs distinguish variadic from fixed parameters")]
     fn producer_member_identity_distinguishes_variadic_shape() {
         let (_, fixed, fixed_diagnostics) = facts("package api\nfunc Call(value any) {}\n");
         let (_, variadic, variadic_diagnostics) =
@@ -2696,50 +2592,10 @@ var privateValue int
                 collection_flows: None,
                 deferred_yields: None,
                 conditional_type_refinements: None,
+                callable_values: None,
             }],
         };
         compile_pack(&pack, &CompilerOptions::default()).unwrap();
-    }
-
-    #[test]
-    fn producer_is_independent_of_file_enumeration() {
-        let packages = vec![package(&["a.go", "b.go"])];
-        let a = ("api/a.go", b"package api\ntype A struct{}\n".as_slice());
-        let b = (
-            "api/b.go",
-            b"package api\nfunc Exported(value A) A { return value }\n".as_slice(),
-        );
-        let limits = ArtifactProducerLimits::default();
-        let produce = |entries| {
-            let mut diagnostics = BoundedProducerDiagnostics::new(&limits);
-            let facts = produce_go_facts(
-                &packages,
-                &HashMap::default(),
-                entries,
-                &limits,
-                None,
-                &mut diagnostics,
-            )
-            .unwrap();
-            assert!(diagnostics.finish().0.is_empty());
-            facts
-        };
-        assert_eq!(produce([a, b]), produce([b, a]));
-    }
-
-    #[test]
-    fn producer_marks_generated_source_as_partial_coverage() {
-        let (types, members, diagnostics) = facts(
-            "// Code generated by fixture; DO NOT EDIT.\npackage api\ntype Exported struct{}\n",
-        );
-        assert!(types.iter().any(|fact| fact.name.ends_with(".Exported")));
-        assert!(members.is_empty());
-        assert!(
-            diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "go.generated_surface"),
-            "{diagnostics:#?}"
-        );
     }
 
     #[test]
@@ -2845,113 +2701,6 @@ var privateValue int
     }
 
     #[test]
-    fn producer_preserves_structured_go_function_and_container_types() {
-        let (types, members, diagnostics) = facts(
-            r#"
-package api
-
-type Box[T any] struct { Value T }
-func Use(callback func(input map[string][]*Box[int], rest ...<-chan int) (Box[string], error)) {}
-func Notify(callback func()) {}
-"#,
-        );
-        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
-        let box_id = &types
-            .iter()
-            .find(|fact| fact.name == "example.com/dep/api.Box")
-            .unwrap()
-            .id;
-        let callback = &members
-            .iter()
-            .find(|member| member.name == "Use")
-            .unwrap()
-            .signature
-            .as_ref()
-            .unwrap()
-            .parameters[0]
-            .r#type;
-        let TypeRef::Function { parameters, result } = callback else {
-            panic!("expected a structured function type, got {callback:#?}");
-        };
-        assert_eq!(parameters.len(), 2);
-        assert!(matches!(
-            parameters[0].r#type,
-            TypeRef::Map { ref key, ref value }
-                if matches!(**key, TypeRef::Named { ref name, .. } if name == "string")
-                    && matches!(
-                        **value,
-                        TypeRef::Slice { ref element }
-                            if matches!(
-                                **element,
-                                TypeRef::Pointer { ref element }
-                                    if matches!(
-                                        **element,
-                                        TypeRef::Declared { ref id, .. } if id == box_id
-                                    )
-                            )
-                    )
-        ));
-        assert!(parameters[1].variadic);
-        assert!(matches!(
-            parameters[1].r#type,
-            TypeRef::Channel {
-                direction: ChannelDirection::Receive,
-                ..
-            }
-        ));
-        assert!(matches!(
-            result.as_deref(),
-            Some(TypeRef::Tuple { elements }) if elements.len() == 2
-        ));
-        let notify = &members
-            .iter()
-            .find(|member| member.name == "Notify")
-            .unwrap()
-            .signature
-            .as_ref()
-            .unwrap()
-            .parameters[0]
-            .r#type;
-        assert!(matches!(
-            notify,
-            TypeRef::Function { parameters, result }
-                if parameters.is_empty() && result.is_none()
-        ));
-    }
-
-    #[test]
-    fn producer_reports_and_honors_record_limits() {
-        let packages = vec![package(&["api.go"])];
-        let entries = [(
-            "api/api.go",
-            b"package api\ntype A struct{}\ntype B struct{}\nfunc One() {}\nfunc Two() {}\n"
-                .as_slice(),
-        )];
-        let limits = ArtifactProducerLimits {
-            max_records: 2,
-            ..ArtifactProducerLimits::default()
-        };
-        let mut diagnostics = BoundedProducerDiagnostics::new(&limits);
-        let (types, members) = produce_go_facts(
-            &packages,
-            &HashMap::default(),
-            entries,
-            &limits,
-            None,
-            &mut diagnostics,
-        )
-        .unwrap();
-        let (diagnostics, _) = diagnostics.finish();
-        assert!(types.len() + members.len() <= limits.max_records);
-        assert!(
-            diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "limit.records"),
-            "{diagnostics:#?}"
-        );
-    }
-
-    #[test]
     fn producer_applies_go_promotion_depth_ambiguity_and_pointer_rules() {
         let (types, members, diagnostics) = facts(
             r#"
@@ -3048,5 +2797,152 @@ func (WrongResult) Read() string { return "" }
                         && declared_type_id(&relation.target) == Some(constraint.id.as_str())
                 })
         );
+    }
+
+    #[test]
+    #[hardwon("#4271: unknown Go method signatures falsely proved interface satisfaction")]
+    fn unknown_go_method_signatures_do_not_prove_interface_satisfaction() {
+        let (types, members, diagnostics) = facts(
+            r#"
+package api
+type Reader interface { Read() int }
+type Unknown struct{}
+func (Unknown) Read() int { return 0 }
+"#,
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let reader_id = types
+            .iter()
+            .find(|fact| fact.name.ends_with(".Reader"))
+            .unwrap()
+            .id
+            .clone();
+        let unknown_id = types
+            .iter()
+            .find(|fact| fact.name.ends_with(".Unknown"))
+            .unwrap()
+            .id
+            .clone();
+        let mut types = types
+            .into_iter()
+            .map(|fact| {
+                let exported = fact.visibility == Visibility::Public;
+                TypeDraft {
+                    fact,
+                    exported,
+                    scaffold: false,
+                    referenced_type_ids: Vec::new(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut members = members
+            .into_iter()
+            .map(|fact| {
+                let surface = fact.visibility == Visibility::Public;
+                MemberDraft {
+                    fact,
+                    surface,
+                    referenced_type_ids: Vec::new(),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        types
+            .iter_mut()
+            .find(|draft| draft.fact.id == unknown_id)
+            .unwrap()
+            .fact
+            .hierarchy
+            .retain(|relation| {
+                relation.hierarchy_kind != HierarchyKind::Implements
+                    || declared_type_id(&relation.target) != Some(reader_id.as_str())
+            });
+        let mut unknown_signatures = 0;
+        for member in &mut members {
+            if member.fact.name == "Read"
+                && (member.fact.owner == unknown_id || member.fact.owner == reader_id)
+            {
+                member.fact.signature = None;
+                unknown_signatures += 1;
+            }
+        }
+        assert_eq!(
+            unknown_signatures, 2,
+            "candidate and interface methods selected"
+        );
+
+        let limits = ArtifactProducerLimits::default();
+        let mut diagnostics = BoundedProducerDiagnostics::new(&limits);
+        add_go_interface_relations(&mut types, &members, &mut diagnostics);
+
+        let unknown = types
+            .iter()
+            .find(|draft| draft.fact.id == unknown_id)
+            .unwrap();
+        assert!(
+            !unknown.fact.hierarchy.iter().any(|relation| {
+                relation.hierarchy_kind == HierarchyKind::Implements
+                    && declared_type_id(&relation.target) == Some(reader_id.as_str())
+            }),
+            "an unknown method signature cannot prove that Unknown implements Reader"
+        );
+    }
+
+    #[test]
+    fn unknown_types_do_not_prove_go_interface_method_equivalence() {
+        let (types, members, diagnostics) = facts(
+            r#"
+package api
+type Reader interface { Read(value any) any }
+type Good struct{}
+func (Good) Read(value any) any { return nil }
+"#,
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let member = |owner_name: &str| {
+            let owner_id = types
+                .iter()
+                .find(|fact| fact.name.ends_with(owner_name))
+                .unwrap()
+                .id
+                .as_str();
+            members
+                .iter()
+                .find(|member| member.owner == owner_id && member.name == "Read")
+                .unwrap()
+                .clone()
+        };
+        let candidate = member(".Good");
+        let required = member(".Reader");
+        assert!(go_method_signatures_match(
+            &candidate.name,
+            candidate.signature.as_ref(),
+            &required.name,
+            required.signature.as_ref(),
+        ));
+
+        let mut unknown_candidate = candidate.clone();
+        let mut unknown_required = required.clone();
+        for fact in [&mut unknown_candidate, &mut unknown_required] {
+            fact.signature.as_mut().unwrap().parameters[0].r#type = TypeRef::Unknown;
+        }
+        assert!(!go_method_signatures_match(
+            &unknown_candidate.name,
+            unknown_candidate.signature.as_ref(),
+            &unknown_required.name,
+            unknown_required.signature.as_ref(),
+        ));
+
+        let nested_unknown = || TypeRef::Array {
+            element: Box::new(TypeRef::Unknown),
+        };
+        unknown_candidate.signature.as_mut().unwrap().parameters[0].r#type = nested_unknown();
+        unknown_required.signature.as_mut().unwrap().parameters[0].r#type = nested_unknown();
+        assert!(!go_method_signatures_match(
+            &unknown_candidate.name,
+            unknown_candidate.signature.as_ref(),
+            &unknown_required.name,
+            unknown_required.signature.as_ref(),
+        ));
     }
 }

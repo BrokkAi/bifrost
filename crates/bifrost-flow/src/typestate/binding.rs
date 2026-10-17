@@ -7,11 +7,10 @@ use serde::Serialize;
 
 use crate::analyzer::identifier::define_identifier;
 use crate::analyzer::semantic::{
-    AbstractObject, AccessPathRoot, CandidateCoverage, DeclarationLocator, DeclarationSegmentKind,
-    DurableCallContext, DurableObjectIdentity, DurablePortIdentity, DurableValueIdentity,
-    EvidenceCompleteness, ObjectCardinality, OracleCallContext, ProcedureHandle,
-    ProgramPointHandle, ProofStatus, SemanticArtifact, SemanticArtifactKey, SemanticLocator,
-    SourceAnchor,
+    AbstractObject, AccessPathRoot, CandidateCoverage, DeclarationLocator, DurableCallContext,
+    DurableObjectIdentity, DurablePortIdentity, DurableValueIdentity, EvidenceCompleteness,
+    ObjectCardinality, OracleCallContext, ProcedureHandle, ProgramPointHandle, ProofStatus,
+    SemanticArtifact, SemanticArtifactKey, SemanticLocator, SourceAnchor,
 };
 use brokk_bifrost_core::analyzer::dense_id::define_dense_id;
 
@@ -23,7 +22,7 @@ use super::{
     TypestateProtocolHash,
 };
 
-pub const BINDING_PLAN_SCHEMA_VERSION: u32 = 6;
+pub const BINDING_PLAN_SCHEMA_VERSION: u32 = 7;
 pub const MAX_TYPESTATE_SUBJECTS: usize = 4_096;
 pub const MAX_TYPESTATE_INITIAL_SEEDS: usize = 4_096;
 pub const MAX_TYPESTATE_EVENT_BINDINGS: usize = 16_384;
@@ -103,12 +102,20 @@ impl TypestateContextKey {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TypestateObjectKey {
     Value(SemanticLocator),
+    FieldPath {
+        base: Box<TypestateObjectKey>,
+        member: SemanticLocator,
+    },
     CallResult {
         call: SemanticLocator,
         result: SemanticLocator,
         callee: SemanticLocator,
         caller_context: TypestateContextKey,
         callee_context: TypestateContextKey,
+    },
+    CallSubstitution {
+        context: TypestateContextKey,
+        base: Box<TypestateObjectKey>,
     },
     ProcedurePort {
         procedure: SemanticLocator,
@@ -150,8 +157,10 @@ impl TypestateObjectKey {
     /// Render the source-facing stable object identity. This is the object-only
     /// counterpart of `TypestateSubjectKey::public_canonical_rendering`.
     pub fn public_canonical_rendering(&self) -> String {
-        serde_json::to_string(&canonical_object_key(self))
-            .expect("canonical typestate object identities are serializable")
+        canonical_json(
+            &canonical_object_key(self),
+            "canonical typestate object identities are serializable",
+        )
     }
 }
 
@@ -189,8 +198,10 @@ impl TypestateSubjectKey {
     /// it carries no absolute workspace mount (see [`CanonicalLocator`]), so
     /// the same indexed content has the same identity in every checkout.
     pub fn public_canonical_rendering(&self) -> String {
-        serde_json::to_string(&canonical_subject_key(self))
-            .expect("canonical typestate subject identities are serializable")
+        canonical_json(
+            &canonical_subject_key(self),
+            "canonical typestate subject identities are serializable",
+        )
     }
 }
 
@@ -498,15 +509,9 @@ impl TypestateInitialSeedSpec {
         role: TypestateObjectRole,
         quality: TypestateBindingQuality,
     ) -> Self {
-        Self {
-            subject,
-            state,
-            site,
-            activation_edge: Some(activation_edge),
-            role,
-            quality,
-            reviewed_fresh_result: false,
-        }
+        let mut seed = Self::new(subject, state, site, role, quality);
+        seed.activation_edge = Some(activation_edge);
+        seed
     }
 
     pub fn new_reviewed_fresh_result(
@@ -516,15 +521,9 @@ impl TypestateInitialSeedSpec {
         role: TypestateObjectRole,
         quality: TypestateBindingQuality,
     ) -> Self {
-        Self {
-            subject,
-            state,
-            site,
-            activation_edge: None,
-            role,
-            quality,
-            reviewed_fresh_result: true,
-        }
+        let mut seed = Self::new(subject, state, site, role, quality);
+        seed.reviewed_fresh_result = true;
+        seed
     }
 
     pub fn new_reviewed_fresh_result_on_control_edge(
@@ -535,15 +534,10 @@ impl TypestateInitialSeedSpec {
         role: TypestateObjectRole,
         quality: TypestateBindingQuality,
     ) -> Self {
-        Self {
-            subject,
-            state,
-            site,
-            activation_edge: Some(activation_edge),
-            role,
-            quality,
-            reviewed_fresh_result: true,
-        }
+        let mut seed =
+            Self::new_on_control_edge(subject, state, site, activation_edge, role, quality);
+        seed.reviewed_fresh_result = true;
+        seed
     }
 }
 
@@ -556,6 +550,32 @@ pub struct TypestateEventBindingSpec {
     role: TypestateObjectRole,
     quality: TypestateBindingQuality,
     modeled_external_effect: Option<String>,
+    condition: Option<TypestateEventCondition>,
+}
+
+/// A Boolean equality condition evaluated against the selected call's
+/// semantic argument value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TypestateEventCondition {
+    argument_index: u32,
+    expected: bool,
+}
+
+impl TypestateEventCondition {
+    pub const fn boolean_argument(argument_index: u32, expected: bool) -> Self {
+        Self {
+            argument_index,
+            expected,
+        }
+    }
+
+    pub const fn argument_index(self) -> u32 {
+        self.argument_index
+    }
+
+    pub const fn expected(self) -> bool {
+        self.expected
+    }
 }
 
 /// A compiler-proven fact that one call cannot reach one live typestate
@@ -596,6 +616,7 @@ impl TypestateEventBindingSpec {
             role,
             quality,
             modeled_external_effect: None,
+            condition: None,
         }
     }
 
@@ -612,15 +633,14 @@ impl TypestateEventBindingSpec {
             !effect_id.is_empty(),
             "modeled external effect id is non-empty"
         );
-        Self {
-            event,
-            subject,
-            site,
-            order,
-            role,
-            quality,
-            modeled_external_effect: Some(effect_id),
-        }
+        let mut binding = Self::new(event, subject, site, order, role, quality);
+        binding.modeled_external_effect = Some(effect_id);
+        binding
+    }
+
+    pub fn with_condition(mut self, condition: TypestateEventCondition) -> Self {
+        self.condition = Some(condition);
+        self
     }
 }
 
@@ -736,6 +756,7 @@ pub struct BoundTypestateEvent {
     role: TypestateObjectRole,
     quality: TypestateBindingQuality,
     modeled_external_effect: Option<String>,
+    condition: Option<TypestateEventCondition>,
 }
 
 impl BoundTypestateEvent {
@@ -769,6 +790,10 @@ impl BoundTypestateEvent {
 
     pub fn modeled_external_effect(&self) -> Option<&str> {
         self.modeled_external_effect.as_deref()
+    }
+
+    pub const fn condition(&self) -> Option<TypestateEventCondition> {
+        self.condition
     }
 }
 
@@ -1003,6 +1028,9 @@ impl TypestateBindingPlan {
                 .observation()
                 .occurrence;
             validate_observation_shape(occurrence, &binding.site, binding.role)?;
+            if binding.condition.is_some() && binding.site.call_site_handle().is_none() {
+                return Err(TypestateBindingPlanError::InvalidEventConditionSite);
+            }
             compiled_events.push(BoundTypestateEvent {
                 id: TypestateEventBindingId::try_from_index(index)
                     .expect("validated event-binding count fits in u32"),
@@ -1013,6 +1041,7 @@ impl TypestateBindingPlan {
                 role: binding.role,
                 quality: binding.quality.clone(),
                 modeled_external_effect: binding.modeled_external_effect.clone(),
+                condition: binding.condition,
             });
         }
 
@@ -1087,6 +1116,7 @@ impl TypestateBindingPlan {
                     role: binding.role,
                     quality: canonical_quality(&binding.quality),
                     modeled_external_effect: binding.modeled_external_effect.as_deref(),
+                    condition: binding.condition.map(canonical_event_condition),
                 })
                 .collect(),
             call_noninterference_bindings: call_noninterference_bindings
@@ -1179,36 +1209,31 @@ impl TypestateBindingPlan {
     /// Duplicate keys are intentional here: callers that need a set can
     /// deduplicate without this hot-path model retaining another index.
     pub fn for_each_retained_artifact_key(&self, mut visit: impl FnMut(&SemanticArtifactKey)) {
-        for subject in &self.subjects {
-            visit_access_path_root_artifacts(subject.object().identity(), &mut visit);
-        }
-        for site in self
-            .initial_seeds
-            .iter()
-            .map(BoundTypestateInitialSeed::site)
-            .chain(self.event_bindings.iter().map(BoundTypestateEvent::site))
-            .chain(
-                self.call_noninterference_bindings
-                    .iter()
-                    .map(BoundTypestateCallNonInterference::site),
-            )
-            .chain(
-                self.terminal_bindings
-                    .iter()
-                    .map(BoundTypestateTerminal::site),
-            )
-        {
-            visit_observation_site_artifacts(site, &mut visit);
-        }
+        self.for_each_retained_subject_root(|root| {
+            visit_access_path_root_artifacts(root, &mut visit)
+        });
+        self.for_each_retained_site(|site| visit_observation_site_artifacts(site, &mut visit));
     }
 
     /// Visit every concrete semantic artifact allocation retained by handles
     /// in this plan. Key-only scoped locators are intentionally excluded: they
     /// retain identities but do not own semantic IR allocations.
     pub fn for_each_retained_artifact(&self, mut visit: impl FnMut(&Arc<SemanticArtifact>)) {
+        self.for_each_retained_subject_root(|root| {
+            visit_access_path_root_artifact_values(root, &mut visit)
+        });
+        self.for_each_retained_site(|site| {
+            visit_observation_site_artifact_values(site, &mut visit)
+        });
+    }
+
+    fn for_each_retained_subject_root(&self, mut visit: impl FnMut(&AccessPathRoot)) {
         for subject in &self.subjects {
-            visit_access_path_root_artifact_values(subject.object().identity(), &mut visit);
+            visit(subject.object().identity());
         }
+    }
+
+    fn for_each_retained_site(&self, mut visit: impl FnMut(&TypestateObservationSite)) {
         for site in self
             .initial_seeds
             .iter()
@@ -1225,7 +1250,7 @@ impl TypestateBindingPlan {
                     .map(BoundTypestateTerminal::site),
             )
         {
-            visit_observation_site_artifact_values(site, &mut visit);
+            visit(site);
         }
     }
 
@@ -1308,7 +1333,10 @@ impl TypestateBindingPlan {
         point: &ProgramPointHandle,
         context: &OracleCallContext,
     ) -> impl Iterator<Item = &BoundTypestateEvent> {
-        site_indexes(&self.events_by_point, point, context).map(|index| &self.event_bindings[index])
+        indexed_bindings(
+            site_indexes(&self.events_by_point, point, context),
+            &self.event_bindings,
+        )
     }
 
     pub fn event_bindings_at_call_site(
@@ -1316,31 +1344,40 @@ impl TypestateBindingPlan {
         call: &crate::analyzer::semantic::CallSiteHandle,
         context: &OracleCallContext,
     ) -> impl Iterator<Item = &BoundTypestateEvent> {
-        site_indexes(&self.events_by_call, call, context).map(|index| &self.event_bindings[index])
+        indexed_bindings(
+            site_indexes(&self.events_by_call, call, context),
+            &self.event_bindings,
+        )
     }
 
     pub fn event_bindings_at_program_point_all_contexts(
         &self,
         point: &ProgramPointHandle,
     ) -> impl Iterator<Item = &BoundTypestateEvent> {
-        flat_site_indexes(&self.events_by_point_all_contexts, point)
-            .map(|index| &self.event_bindings[index])
+        indexed_bindings(
+            flat_site_indexes(&self.events_by_point_all_contexts, point),
+            &self.event_bindings,
+        )
     }
 
     pub fn event_bindings_at_call_site_all_contexts(
         &self,
         call: &crate::analyzer::semantic::CallSiteHandle,
     ) -> impl Iterator<Item = &BoundTypestateEvent> {
-        flat_site_indexes(&self.events_by_call_all_contexts, call)
-            .map(|index| &self.event_bindings[index])
+        indexed_bindings(
+            flat_site_indexes(&self.events_by_call_all_contexts, call),
+            &self.event_bindings,
+        )
     }
 
     pub fn event_bindings_at_call_program_point_all_contexts(
         &self,
         point: &ProgramPointHandle,
     ) -> impl Iterator<Item = &BoundTypestateEvent> {
-        flat_site_indexes(&self.events_by_call_point_all_contexts, point)
-            .map(|index| &self.event_bindings[index])
+        indexed_bindings(
+            flat_site_indexes(&self.events_by_call_point_all_contexts, point),
+            &self.event_bindings,
+        )
     }
 
     pub fn terminal_bindings_at_program_point(
@@ -1348,8 +1385,10 @@ impl TypestateBindingPlan {
         point: &ProgramPointHandle,
         context: &OracleCallContext,
     ) -> impl Iterator<Item = &BoundTypestateTerminal> {
-        site_indexes(&self.terminals_by_point, point, context)
-            .map(|index| &self.terminal_bindings[index])
+        indexed_bindings(
+            site_indexes(&self.terminals_by_point, point, context),
+            &self.terminal_bindings,
+        )
     }
 
     pub fn terminal_bindings_at_call_site(
@@ -1365,24 +1404,30 @@ impl TypestateBindingPlan {
         &self,
         point: &ProgramPointHandle,
     ) -> impl Iterator<Item = &BoundTypestateTerminal> {
-        flat_site_indexes(&self.terminals_by_point_all_contexts, point)
-            .map(|index| &self.terminal_bindings[index])
+        indexed_bindings(
+            flat_site_indexes(&self.terminals_by_point_all_contexts, point),
+            &self.terminal_bindings,
+        )
     }
 
     pub fn terminal_bindings_at_call_site_all_contexts(
         &self,
         call: &crate::analyzer::semantic::CallSiteHandle,
     ) -> impl Iterator<Item = &BoundTypestateTerminal> {
-        flat_site_indexes(&self.terminals_by_call_all_contexts, call)
-            .map(|index| &self.terminal_bindings[index])
+        indexed_bindings(
+            flat_site_indexes(&self.terminals_by_call_all_contexts, call),
+            &self.terminal_bindings,
+        )
     }
 
     pub fn terminal_bindings_at_call_program_point_all_contexts(
         &self,
         point: &ProgramPointHandle,
     ) -> impl Iterator<Item = &BoundTypestateTerminal> {
-        flat_site_indexes(&self.terminals_by_call_point_all_contexts, point)
-            .map(|index| &self.terminal_bindings[index])
+        indexed_bindings(
+            flat_site_indexes(&self.terminals_by_call_point_all_contexts, point),
+            &self.terminal_bindings,
+        )
     }
 
     pub fn canonical_bytes(&self) -> &[u8] {
@@ -1410,54 +1455,103 @@ impl TypestateBindingPlan {
     }
 }
 
+enum AccessPathRootArtifactReference<'a> {
+    Procedure(&'a ProcedureHandle),
+    ScopedLocator(&'a crate::analyzer::semantic::ScopedSemanticLocator),
+}
+
+fn visit_access_path_root_references<'root>(
+    root: &'root AccessPathRoot,
+    mut visit: impl FnMut(AccessPathRootArtifactReference<'root>),
+) {
+    let mut root = root;
+    loop {
+        match root {
+            AccessPathRoot::FieldPath { base, .. } => {
+                root = base;
+                continue;
+            }
+            AccessPathRoot::Value(value) => visit(AccessPathRootArtifactReference::Procedure(
+                value.procedure(),
+            )),
+            AccessPathRoot::CallResult(result) => {
+                visit(AccessPathRootArtifactReference::Procedure(
+                    result.call().procedure(),
+                ));
+                visit(AccessPathRootArtifactReference::Procedure(
+                    result.result().procedure(),
+                ));
+                visit(AccessPathRootArtifactReference::Procedure(result.callee()));
+                for call in result
+                    .caller_context()
+                    .calls()
+                    .iter()
+                    .chain(result.callee_context().calls())
+                {
+                    visit(AccessPathRootArtifactReference::Procedure(call.procedure()));
+                }
+            }
+            AccessPathRoot::ProcedurePort(port) | AccessPathRoot::CaptureSlot(port) => {
+                visit(AccessPathRootArtifactReference::Procedure(port.procedure()));
+            }
+            AccessPathRoot::Allocation(allocation) => visit(
+                AccessPathRootArtifactReference::Procedure(allocation.procedure()),
+            ),
+            AccessPathRoot::LexicalCell(location) => visit(
+                AccessPathRootArtifactReference::Procedure(location.procedure()),
+            ),
+            AccessPathRoot::Static(locator)
+            | AccessPathRoot::TypeSummary(locator)
+            | AccessPathRoot::ModuleObject(locator)
+            | AccessPathRoot::External(locator) => {
+                visit(AccessPathRootArtifactReference::ScopedLocator(locator))
+            }
+            AccessPathRoot::RuntimeObject(_) => {}
+            AccessPathRoot::CallSubstitution {
+                procedure, context, ..
+            } => {
+                visit(AccessPathRootArtifactReference::Procedure(procedure));
+                for call in context.calls() {
+                    visit(AccessPathRootArtifactReference::Procedure(call.procedure()));
+                }
+            }
+        }
+        break;
+    }
+}
+
 fn visit_access_path_root_artifacts(
     root: &AccessPathRoot,
     visit: &mut impl FnMut(&SemanticArtifactKey),
 ) {
-    let mut visit_procedure = |procedure: &ProcedureHandle| visit(procedure.artifact().key());
-    match root {
-        AccessPathRoot::Value(value) => visit_procedure(value.procedure()),
-        AccessPathRoot::CallResult(result) => {
-            visit_procedure(result.call().procedure());
-            visit_procedure(result.result().procedure());
-            visit_procedure(result.callee());
-            for call in result
-                .caller_context()
-                .calls()
-                .iter()
-                .chain(result.callee_context().calls())
-            {
-                visit_procedure(call.procedure());
-            }
-        }
-        AccessPathRoot::ProcedurePort(port) | AccessPathRoot::CaptureSlot(port) => {
-            visit_procedure(port.procedure());
-        }
-        AccessPathRoot::Allocation(allocation) => visit_procedure(allocation.procedure()),
-        AccessPathRoot::LexicalCell(location) => visit_procedure(location.procedure()),
-        AccessPathRoot::Static(locator)
-        | AccessPathRoot::TypeSummary(locator)
-        | AccessPathRoot::ModuleObject(locator)
-        | AccessPathRoot::External(locator) => visit(locator.scope().key()),
-        AccessPathRoot::RuntimeObject(_) => {}
-    }
+    visit_access_path_root_references(root, |reference| match reference {
+        AccessPathRootArtifactReference::Procedure(procedure) => visit(procedure.artifact().key()),
+        AccessPathRootArtifactReference::ScopedLocator(locator) => visit(locator.scope().key()),
+    });
 }
 
 fn visit_observation_site_artifacts(
     site: &TypestateObservationSite,
     visit: &mut impl FnMut(&SemanticArtifactKey),
 ) {
+    visit_observation_site_procedures(site, |procedure| visit(procedure.artifact().key()));
+}
+
+fn visit_observation_site_procedures(
+    site: &TypestateObservationSite,
+    mut visit: impl FnMut(&ProcedureHandle),
+) {
     match site {
         TypestateObservationSite::ProgramPoint { point, context, .. } => {
-            visit(point.procedure().artifact().key());
+            visit(point.procedure());
             for call in context.runtime().calls() {
-                visit(call.procedure().artifact().key());
+                visit(call.procedure());
             }
         }
         TypestateObservationSite::CallSite { call, context, .. } => {
-            visit(call.procedure().artifact().key());
+            visit(call.procedure());
             for context_call in context.runtime().calls() {
-                visit(context_call.procedure().artifact().key());
+                visit(context_call.procedure());
             }
         }
     }
@@ -1467,53 +1561,18 @@ fn visit_access_path_root_artifact_values(
     root: &AccessPathRoot,
     visit: &mut impl FnMut(&Arc<SemanticArtifact>),
 ) {
-    let mut visit_procedure = |procedure: &ProcedureHandle| visit(procedure.artifact());
-    match root {
-        AccessPathRoot::Value(value) => visit_procedure(value.procedure()),
-        AccessPathRoot::CallResult(result) => {
-            visit_procedure(result.call().procedure());
-            visit_procedure(result.result().procedure());
-            visit_procedure(result.callee());
-            for call in result
-                .caller_context()
-                .calls()
-                .iter()
-                .chain(result.callee_context().calls())
-            {
-                visit_procedure(call.procedure());
-            }
+    visit_access_path_root_references(root, |reference| {
+        if let AccessPathRootArtifactReference::Procedure(procedure) = reference {
+            visit(procedure.artifact());
         }
-        AccessPathRoot::ProcedurePort(port) | AccessPathRoot::CaptureSlot(port) => {
-            visit_procedure(port.procedure());
-        }
-        AccessPathRoot::Allocation(allocation) => visit_procedure(allocation.procedure()),
-        AccessPathRoot::LexicalCell(location) => visit_procedure(location.procedure()),
-        AccessPathRoot::Static(_)
-        | AccessPathRoot::TypeSummary(_)
-        | AccessPathRoot::ModuleObject(_)
-        | AccessPathRoot::External(_) => {}
-        AccessPathRoot::RuntimeObject(_) => {}
-    }
+    });
 }
 
 fn visit_observation_site_artifact_values(
     site: &TypestateObservationSite,
     visit: &mut impl FnMut(&Arc<SemanticArtifact>),
 ) {
-    match site {
-        TypestateObservationSite::ProgramPoint { point, context, .. } => {
-            visit(point.procedure().artifact());
-            for call in context.runtime().calls() {
-                visit(call.procedure().artifact());
-            }
-        }
-        TypestateObservationSite::CallSite { call, context, .. } => {
-            visit(call.procedure().artifact());
-            for context_call in context.runtime().calls() {
-                visit(context_call.procedure().artifact());
-            }
-        }
-    }
+    visit_observation_site_procedures(site, |procedure| visit(procedure.artifact()));
 }
 
 #[derive(Debug)]
@@ -1539,6 +1598,7 @@ pub enum TypestateBindingPlanError {
     UnknownExpectation,
     InvalidSeedSite,
     InvalidCallNonInterferenceSite,
+    InvalidEventConditionSite,
     InvalidObservationShape,
     Canonicalization(serde_json::Error),
 }
@@ -1588,6 +1648,9 @@ impl fmt::Display for TypestateBindingPlanError {
             ),
             Self::InvalidCallNonInterferenceSite => formatter
                 .write_str("call non-interference bindings must retain one exact call site"),
+            Self::InvalidEventConditionSite => {
+                formatter.write_str("event argument conditions must retain one exact call site")
+            }
             Self::InvalidObservationShape => formatter.write_str(
                 "binding site or object role is incompatible with the protocol observation",
             ),
@@ -1616,6 +1679,7 @@ impl std::error::Error for TypestateBindingPlanError {
             | Self::UnknownExpectation
             | Self::InvalidSeedSite
             | Self::InvalidCallNonInterferenceSite
+            | Self::InvalidEventConditionSite
             | Self::InvalidObservationShape => None,
         }
     }
@@ -1650,6 +1714,90 @@ fn typestate_object_key(object: &AbstractObject) -> TypestateObjectKey {
         .expect("abstract object handles are validated at construction");
     match identity {
         DurableObjectIdentity::Value(value) => TypestateObjectKey::Value(value.locator),
+        DurableObjectIdentity::FieldPath { base, member } => TypestateObjectKey::FieldPath {
+            base: Box::new(typestate_durable_object_key(*base)),
+            member,
+        },
+        DurableObjectIdentity::CallSubstitution { context, base } => {
+            TypestateObjectKey::CallSubstitution {
+                context: typestate_context_key(context),
+                base: Box::new(typestate_durable_object_key(*base)),
+            }
+        }
+        DurableObjectIdentity::CallResult {
+            call,
+            result,
+            callee,
+            caller_context,
+            callee_context,
+        } => TypestateObjectKey::CallResult {
+            call,
+            result: result.locator,
+            callee,
+            caller_context: typestate_context_key(caller_context),
+            callee_context: typestate_context_key(callee_context),
+        },
+        DurableObjectIdentity::ProcedurePort { procedure, port } => {
+            TypestateObjectKey::ProcedurePort {
+                procedure,
+                port: procedure_port_key(port),
+            }
+        }
+        DurableObjectIdentity::CaptureSlot { procedure, port } => TypestateObjectKey::CaptureSlot {
+            procedure,
+            port: procedure_port_key(port),
+        },
+        DurableObjectIdentity::Allocation { locator } => TypestateObjectKey::Allocation(locator),
+        DurableObjectIdentity::Static { locator } => TypestateObjectKey::Static(locator),
+        DurableObjectIdentity::LexicalCell { locator, binding } => {
+            TypestateObjectKey::LexicalCell { locator, binding }
+        }
+        DurableObjectIdentity::TypeSummary { locator } => TypestateObjectKey::TypeSummary(locator),
+        DurableObjectIdentity::ModuleObject { locator } => {
+            TypestateObjectKey::ModuleObject(locator)
+        }
+        DurableObjectIdentity::External { locator } => TypestateObjectKey::External(locator),
+        DurableObjectIdentity::RuntimeObject {
+            runtime_profile_digest,
+            realm,
+            exposure_id,
+            container_member,
+            state_boundary,
+            refinement_identity,
+            active_model_set_hash,
+            manifest_digest,
+            shard_id,
+            behavior_id,
+            activation_source,
+        } => TypestateObjectKey::RuntimeObject {
+            runtime_profile_digest,
+            realm,
+            exposure_id,
+            container_member,
+            state_boundary,
+            refinement_identity,
+            active_model_set_hash,
+            manifest_digest,
+            shard_id,
+            behavior_id,
+            activation_source,
+        },
+    }
+}
+
+fn typestate_durable_object_key(identity: DurableObjectIdentity) -> TypestateObjectKey {
+    match identity {
+        DurableObjectIdentity::Value(value) => TypestateObjectKey::Value(value.locator),
+        DurableObjectIdentity::FieldPath { base, member } => TypestateObjectKey::FieldPath {
+            base: Box::new(typestate_durable_object_key(*base)),
+            member,
+        },
+        DurableObjectIdentity::CallSubstitution { context, base } => {
+            TypestateObjectKey::CallSubstitution {
+                context: typestate_context_key(context),
+                base: Box::new(typestate_durable_object_key(*base)),
+            }
+        }
         DurableObjectIdentity::CallResult {
             call,
             result,
@@ -1742,32 +1890,25 @@ fn procedure_port_key(port: DurablePortIdentity) -> TypestateProcedurePortKey {
 }
 
 pub(super) fn program_point_locator(point: &ProgramPointHandle) -> SemanticLocator {
-    let row = point
+    let _row = point
         .procedure()
         .semantics()
         .point(point.id())
         .expect("program-point handles are validated at construction");
-    source_locator(point.procedure(), row.source)
+    point
+        .locator()
+        .expect("validated semantic rows retain source mappings")
+        .clone()
 }
 
 fn call_site_locator(call: &crate::analyzer::semantic::CallSiteHandle) -> SemanticLocator {
-    let row = call
+    let _row = call
         .procedure()
         .semantics()
         .call_site(call.id())
         .expect("call-site handles are validated at construction");
-    source_locator(call.procedure(), row.source)
-}
-
-fn source_locator(
-    procedure: &ProcedureHandle,
-    source: crate::analyzer::semantic::SourceMappingId,
-) -> SemanticLocator {
-    procedure
-        .semantics()
-        .source_mapping(source)
+    call.locator()
         .expect("validated semantic rows retain source mappings")
-        .locator
         .clone()
 }
 
@@ -1894,11 +2035,17 @@ fn site_has_exit_kind(site: &TypestateObservationSite, kind: ProtocolProcedureEx
     let TypestateObservationSite::ProgramPoint { point, .. } = site else {
         return false;
     };
-    let semantics = point.procedure().semantics();
-    match kind {
-        ProtocolProcedureExitKind::Normal => point.id() == semantics.normal_exit_point(),
-        ProtocolProcedureExitKind::Exceptional => point.id() == semantics.exceptional_exit_point(),
-    }
+    crate::dataflow::is_procedure_exit_kind(
+        point,
+        match kind {
+            ProtocolProcedureExitKind::Normal => {
+                crate::analyzer::semantic::ReturnTransferKind::Normal
+            }
+            ProtocolProcedureExitKind::Exceptional => {
+                crate::analyzer::semantic::ReturnTransferKind::Exceptional
+            }
+        },
+    )
 }
 
 fn subject_id(
@@ -1959,15 +2106,14 @@ fn compare_event_specs(
     left: &TypestateEventBindingSpec,
     right: &TypestateEventBindingSpec,
 ) -> Ordering {
-    compare_sites(&left.site, &right.site)
-        .then_with(|| left.order.cmp(&right.order))
-        .then_with(|| left.subject.cmp(&right.subject))
+    compare_event_order_keys(left, right)
         .then_with(|| left.event.cmp(&right.event))
         .then_with(|| left.role.cmp(&right.role))
         .then_with(|| {
             left.modeled_external_effect
                 .cmp(&right.modeled_external_effect)
         })
+        .then_with(|| left.condition.cmp(&right.condition))
 }
 
 fn compare_event_order_keys(
@@ -2205,11 +2351,12 @@ fn site_indexes<'plan, K>(
 where
     K: Eq + std::hash::Hash,
 {
-    indexes
-        .get(site)
-        .and_then(|contexts| contexts.get(context))
-        .into_iter()
-        .flat_map(|indexes| indexes.iter().copied())
+    copied_site_indexes(
+        indexes
+            .get(site)
+            .and_then(|contexts| contexts.get(context))
+            .map(|indexes| indexes.as_ref()),
+    )
 }
 
 fn flat_site_indexes<'plan, K>(
@@ -2219,10 +2366,26 @@ fn flat_site_indexes<'plan, K>(
 where
     K: Eq + std::hash::Hash,
 {
+    copied_site_indexes(indexes.get(site).map(|indexes| indexes.as_ref()))
+}
+
+fn copied_site_indexes<'plan>(
+    indexes: Option<&'plan [usize]>,
+) -> impl Iterator<Item = usize> + 'plan {
     indexes
-        .get(site)
         .into_iter()
         .flat_map(|indexes| indexes.iter().copied())
+}
+
+fn indexed_bindings<'plan, Binding>(
+    indexes: impl Iterator<Item = usize> + 'plan,
+    bindings: &'plan [Binding],
+) -> impl Iterator<Item = &'plan Binding> + 'plan {
+    indexes.map(move |index| &bindings[index])
+}
+
+fn canonical_json<T: serde::Serialize + ?Sized>(value: &T, invariant: &str) -> String {
+    serde_json::to_string(value).expect(invariant)
 }
 
 #[derive(Default)]
@@ -2359,6 +2522,7 @@ fn procedure_summary_hashes(
                         role: binding.role,
                         quality: canonical_quality(&binding.quality),
                         modeled_external_effect: binding.modeled_external_effect.as_deref(),
+                        condition: binding.condition.map(canonical_event_condition),
                     }
                 })
                 .collect(),
@@ -2449,6 +2613,14 @@ enum CanonicalObjectKey<'a> {
     Value {
         identity: CanonicalLocator<'a>,
     },
+    FieldPath {
+        base: Box<CanonicalObjectKey<'a>>,
+        member: CanonicalLocator<'a>,
+    },
+    CallSubstitution {
+        context: CanonicalContext<'a>,
+        base: Box<CanonicalObjectKey<'a>>,
+    },
     CallResult {
         call: CanonicalLocator<'a>,
         result: CanonicalLocator<'a>,
@@ -2538,6 +2710,21 @@ struct CanonicalEventBinding<'a> {
     quality: CanonicalQuality,
     #[serde(skip_serializing_if = "Option::is_none")]
     modeled_external_effect: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    condition: Option<CanonicalEventCondition>,
+}
+
+#[derive(Serialize)]
+struct CanonicalEventCondition {
+    argument_index: u32,
+    expected: bool,
+}
+
+fn canonical_event_condition(condition: TypestateEventCondition) -> CanonicalEventCondition {
+    CanonicalEventCondition {
+        argument_index: condition.argument_index(),
+        expected: condition.expected(),
+    }
 }
 
 #[derive(Serialize)]
@@ -2697,6 +2884,16 @@ fn canonical_object_key(key: &TypestateObjectKey) -> CanonicalObjectKey<'_> {
         TypestateObjectKey::Value(identity) => CanonicalObjectKey::Value {
             identity: canonical_locator(identity),
         },
+        TypestateObjectKey::FieldPath { base, member } => CanonicalObjectKey::FieldPath {
+            base: Box::new(canonical_object_key(base)),
+            member: canonical_locator(member),
+        },
+        TypestateObjectKey::CallSubstitution { context, base } => {
+            CanonicalObjectKey::CallSubstitution {
+                context: canonical_context_key(context),
+                base: Box::new(canonical_object_key(base)),
+            }
+        }
         TypestateObjectKey::CallResult {
             call,
             result,
@@ -2850,7 +3047,7 @@ fn canonical_locator(locator: &SemanticLocator) -> CanonicalLocator<'_> {
             .segments()
             .iter()
             .map(|segment| CanonicalDeclarationSegment {
-                kind: declaration_kind_label(segment.kind()),
+                kind: segment.kind().stable_label(),
                 name: segment.name(),
                 sibling_ordinal: segment.sibling_ordinal(),
             })
@@ -2917,46 +3114,31 @@ const fn coverage_label(coverage: CandidateCoverage) -> &'static str {
     }
 }
 
-const fn declaration_kind_label(kind: DeclarationSegmentKind) -> &'static str {
-    match kind {
-        DeclarationSegmentKind::File => "file",
-        DeclarationSegmentKind::Namespace => "namespace",
-        DeclarationSegmentKind::Type => "type",
-        DeclarationSegmentKind::Function => "function",
-        DeclarationSegmentKind::Method => "method",
-        DeclarationSegmentKind::Constructor => "constructor",
-        DeclarationSegmentKind::Initializer => "initializer",
-        DeclarationSegmentKind::LocalFunction => "local_function",
-        DeclarationSegmentKind::Lambda => "lambda",
-        DeclarationSegmentKind::Closure => "closure",
-        DeclarationSegmentKind::AnonymousCallable => "anonymous_callable",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crate::analyzer::Language;
     use crate::analyzer::semantic::{
-        DeclarationSegment, SemanticLanguage, SemanticRole, SourcePosition, SourceSpan,
+        DeclarationSegment, DeclarationSegmentKind, SemanticLanguage, SemanticRole,
         WorkspaceMountId, WorkspaceRelativePath,
     };
+    use brokk_bifrost_analysis::test_support::source_anchor;
+    use brokk_bifrost_test_macros::hardwon;
 
     use super::*;
-
-    fn anchor(start: u32, end: u32) -> SourceAnchor {
-        SourceAnchor::new(
-            SourceSpan::new(
-                SourcePosition::new(start, 0, start),
-                SourcePosition::new(end, 0, end),
-            )
-            .expect("span"),
-            0,
-        )
-    }
 
     /// One `res.go` declaration, named by its declaration path and its own
     /// span, with the whole file's span on the enclosing `file` segment.
     fn declaration_key(file_span: SourceAnchor, name: &str, own_span: SourceAnchor) -> String {
+        render_subject_key(file_span, name, own_span, SemanticRole::Procedure, own_span)
+    }
+
+    fn render_subject_key(
+        file_span: SourceAnchor,
+        name: &str,
+        own_span: SourceAnchor,
+        role: SemanticRole,
+        site: SourceAnchor,
+    ) -> String {
         let declaration = DeclarationLocator::new(vec![
             DeclarationSegment::named(DeclarationSegmentKind::File, "res.go", file_span, 0)
                 .expect("file segment"),
@@ -2971,8 +3153,8 @@ mod tests {
                 WorkspaceRelativePath::new("res.go").expect("path"),
                 SemanticLanguage::Standard(Language::Go),
                 declaration,
-                SemanticRole::Procedure,
-                own_span,
+                role,
+                site,
             )),
         }
         .public_canonical_rendering()
@@ -2982,9 +3164,20 @@ mod tests {
     /// (#3022). `OpenRes` keeps its own span; only the file it is declared in
     /// gets shorter, which is what an edit inside a later declaration does.
     #[test]
+    #[hardwon(
+        "#3022: Changing the file span while retaining the declaration span must not rotate the stable declaration identity."
+    )]
     fn a_declaration_identity_survives_an_edit_elsewhere_in_its_file() {
-        let before = declaration_key(anchor(0, 214), "OpenRes", anchor(33, 69));
-        let after = declaration_key(anchor(0, 208), "OpenRes", anchor(33, 69));
+        let before = declaration_key(
+            source_anchor(0, 214, 0),
+            "OpenRes",
+            source_anchor(33, 69, 0),
+        );
+        let after = declaration_key(
+            source_anchor(0, 208, 0),
+            "OpenRes",
+            source_anchor(33, 69, 0),
+        );
         assert_eq!(
             before, after,
             "the file's length is not part of a declaration"
@@ -2995,9 +3188,12 @@ mod tests {
     /// separates them: both sides here are given the same spans, so only the
     /// declaration path can tell them apart.
     #[test]
+    #[hardwon(
+        "#3022: Same-span declarations remain distinct because their structured declaration names differ."
+    )]
     fn two_named_declarations_of_one_file_render_differently() {
-        let file = anchor(0, 214);
-        let span = anchor(33, 69);
+        let file = source_anchor(0, 214, 0);
+        let span = source_anchor(33, 69, 0);
         let open = declaration_key(file, "OpenRes", span);
         let close = declaration_key(file, "CloseRes", span);
         assert_ne!(open, close, "two named declarations are two identities");
@@ -3008,21 +3204,24 @@ mod tests {
     /// identity the removed byte anchor used to supply. Both sides here carry
     /// the same spans, so the ordinal is the only thing that can differ.
     #[test]
+    #[hardwon(
+        "#3022: Anonymous closures share a source span here, so sibling ordinal must keep their public identities distinct."
+    )]
     fn two_anonymous_siblings_render_differently() {
         fn closure_key(ordinal: u32) -> String {
-            let span = anchor(60, 90);
+            let span = source_anchor(60, 90, 0);
             let declaration = DeclarationLocator::new(vec![
                 DeclarationSegment::named(
                     DeclarationSegmentKind::File,
                     "res.go",
-                    anchor(0, 214),
+                    source_anchor(0, 214, 0),
                     0,
                 )
                 .expect("file segment"),
                 DeclarationSegment::named(
                     DeclarationSegmentKind::Function,
                     "Run",
-                    anchor(33, 200),
+                    source_anchor(33, 200, 0),
                     0,
                 )
                 .expect("function segment"),
@@ -3053,25 +3252,7 @@ mod tests {
     /// One site inside `OpenRes`, named by the declaration path, the enclosing
     /// declaration's span, and the site's own span.
     fn site_key(file_span: SourceAnchor, own_span: SourceAnchor, site: SourceAnchor) -> String {
-        let declaration = DeclarationLocator::new(vec![
-            DeclarationSegment::named(DeclarationSegmentKind::File, "res.go", file_span, 0)
-                .expect("file segment"),
-            DeclarationSegment::named(DeclarationSegmentKind::Function, "OpenRes", own_span, 0)
-                .expect("function segment"),
-        ])
-        .expect("declaration");
-        TypestateSubjectKey {
-            class: "res".parse().expect("subject class"),
-            object: TypestateObjectKey::Value(SemanticLocator::new(
-                WorkspaceMountId::hash_bytes(b"/tmp/workspace"),
-                WorkspaceRelativePath::new("res.go").expect("path"),
-                SemanticLanguage::Standard(Language::Go),
-                declaration,
-                SemanticRole::Value,
-                site,
-            )),
-        }
-        .public_canonical_rendering()
+        render_subject_key(file_span, "OpenRes", own_span, SemanticRole::Value, site)
     }
 
     /// A length change in a declaration above the locator must not re-key it
@@ -3079,9 +3260,20 @@ mod tests {
     /// so `OpenRes` and the site inside it both shift by 12 bytes here while
     /// nothing about either changes.
     #[test]
+    #[hardwon(
+        "#3054: Growing a preceding declaration and shifting the owner and site together must preserve the owner-relative site identity."
+    )]
     fn a_site_identity_survives_a_length_change_in_a_declaration_above_it() {
-        let before = site_key(anchor(0, 214), anchor(33, 69), anchor(45, 61));
-        let after = site_key(anchor(0, 226), anchor(45, 81), anchor(57, 73));
+        let before = site_key(
+            source_anchor(0, 214, 0),
+            source_anchor(33, 69, 0),
+            source_anchor(45, 61, 0),
+        );
+        let after = site_key(
+            source_anchor(0, 226, 0),
+            source_anchor(45, 81, 0),
+            source_anchor(57, 73, 0),
+        );
         assert_eq!(
             before, after,
             "a site is addressed from the declaration that contains it"
@@ -3092,12 +3284,15 @@ mod tests {
     /// from the declaration's start differ exactly as the absolute offsets did,
     /// because subtracting one declaration start from both is a translation.
     #[test]
+    #[hardwon(
+        "#3054: Distinct observation spans in one declaration remain separate after anchors become owner-relative."
+    )]
     fn two_sites_inside_one_declaration_render_differently() {
-        let file = anchor(0, 214);
-        let own = anchor(33, 69);
+        let file = source_anchor(0, 214, 0);
+        let own = source_anchor(33, 69, 0);
         assert_ne!(
-            site_key(file, own, anchor(45, 61)),
-            site_key(file, own, anchor(50, 66)),
+            site_key(file, own, source_anchor(45, 61, 0)),
+            site_key(file, own, source_anchor(50, 66, 0)),
             "two sites of one declaration are two identities"
         );
     }
@@ -3108,22 +3303,30 @@ mod tests {
     /// would underflow when the member is declared above the method, so the
     /// rendering tags it and keeps the file-relative start.
     #[test]
+    #[hardwon(
+        "#3054: A class member attached to a method path but lying outside its span is tagged out-of-declaration rather than clamped."
+    )]
     fn a_member_declared_above_its_enclosing_method_renders_out_of_declaration() {
         fn member_key(member: SourceAnchor) -> String {
             let declaration = DeclarationLocator::new(vec![
                 DeclarationSegment::named(
                     DeclarationSegmentKind::File,
                     "Res.scala",
-                    anchor(0, 260),
+                    source_anchor(0, 260, 0),
                     0,
                 )
                 .expect("file segment"),
-                DeclarationSegment::named(DeclarationSegmentKind::Type, "Res", anchor(20, 250), 0)
-                    .expect("type segment"),
+                DeclarationSegment::named(
+                    DeclarationSegmentKind::Type,
+                    "Res",
+                    source_anchor(20, 250, 0),
+                    0,
+                )
+                .expect("type segment"),
                 DeclarationSegment::named(
                     DeclarationSegmentKind::Method,
                     "compute",
-                    anchor(120, 240),
+                    source_anchor(120, 240, 0),
                     0,
                 )
                 .expect("method segment"),
@@ -3143,14 +3346,14 @@ mod tests {
             .public_canonical_rendering()
         }
 
-        let rendering = member_key(anchor(40, 58));
+        let rendering = member_key(source_anchor(40, 58, 0));
         assert!(
             rendering.contains("out_of_declaration"),
             "a member above its enclosing method is tagged, not clamped: {rendering}"
         );
         assert_ne!(
             rendering,
-            member_key(anchor(70, 88)),
+            member_key(source_anchor(70, 88, 0)),
             "two members of one class are two identities"
         );
     }
@@ -3169,14 +3372,14 @@ mod tests {
                     DeclarationSegment::named(
                         DeclarationSegmentKind::Function,
                         "Run",
-                        anchor(0, 80),
+                        source_anchor(0, 80, 0),
                         0,
                     )
                     .expect("function segment"),
                 ])
                 .expect("declaration"),
                 SemanticRole::MemoryLocation,
-                anchor(12, 16),
+                source_anchor(12, 16, 0),
             ),
             binding: DurableValueIdentity {
                 locator: SemanticLocator::new(
@@ -3187,14 +3390,14 @@ mod tests {
                         DeclarationSegment::named(
                             DeclarationSegmentKind::Function,
                             "Run",
-                            anchor(0, 80),
+                            source_anchor(0, 80, 0),
                             0,
                         )
                         .expect("function segment"),
                     ])
                     .expect("declaration"),
                     SemanticRole::Value,
-                    anchor(20, 24),
+                    source_anchor(20, 24, 0),
                 ),
                 role: binding_role.into(),
                 ordinal: binding_ordinal,
@@ -3203,6 +3406,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#3099: Captured cells with the same location but different role or ordinal must have different stable identity renderings."
+    )]
     fn lexical_cell_rendering_retains_binding_role_and_ordinal() {
         let base = lexical_cell_key("mount", "parameter", Some(0));
         let changed_role = lexical_cell_key("mount", "local", Some(0));
@@ -3219,6 +3425,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#3099: Exact locators differ across mounts while their public canonical identity remains checkout-independent."
+    )]
     fn lexical_cell_rendering_is_checkout_independent() {
         let first = lexical_cell_key("first checkout", "parameter", Some(0));
         let second = lexical_cell_key("second checkout", "parameter", Some(0));

@@ -10,8 +10,9 @@ use crate::analyzer::semantic_model::{
     ExternalArtifactKind, ExternalArtifactPackProducer, HierarchyFact, HierarchyKind, Locator,
     MemberFact, MemberIdentity, MemberKind, NameSelector, Parameter, Producer, ProducerDiagnostic,
     ProducerDiagnosticSeverity, Provenance, ResolvedDependency, ResolvedDependencyArtifact, Safety,
-    SemanticModelActivationEvidence, Signature, SuppressedDiagnostics, TypeFact, TypeIdentity,
-    TypeKind, TypeRef, TypeRefReferenceKind, Visibility, member_declaration_id,
+    SemanticModelActivationEvidence, SemanticModelCallableKey, SemanticModelCompleteness,
+    SemanticModelSymbolKind, Signature, SuppressedDiagnostics, TypeFact, TypeIdentity, TypeKind,
+    TypeRef, TypeRefReferenceKind, Visibility, member_declaration_id,
     normalize_artifact_locator_paths, read_exact_artifact_while, type_declaration_id,
 };
 use crate::analyzer::topology::DependencyScope;
@@ -24,6 +25,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use walkdir::WalkDir;
+
+use brokk_bifrost_core::cancellation::is_cancelled_at_checkpoint;
 
 const MAX_ASSEMBLY_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_ASSETS_BYTES: u64 = 8 * 1024 * 1024;
@@ -231,12 +234,7 @@ impl CSharpExternalMember {
         &self.source
     }
     fn externally_visible(&self) -> bool {
-        matches!(
-            self.visibility,
-            CSharpVisibility::Public
-                | CSharpVisibility::Protected
-                | CSharpVisibility::ProtectedOrInternal
-        )
+        semantic_visibility(self.visibility).is_externally_visible()
     }
 }
 
@@ -279,6 +277,9 @@ impl CSharpExternalType {
     }
     pub fn generic_arity(&self) -> usize {
         self.generic_arity
+    }
+    pub fn is_sealed(&self) -> bool {
+        self.is_sealed
     }
     pub fn interfaces(&self) -> &[String] {
         &self.interfaces
@@ -421,35 +422,8 @@ impl CSharpExternalDeclarationIndex {
         usings: &[String],
         aliases: &HashMap<String, String>,
     ) -> Vec<&CSharpExternalType> {
-        let mut name = reference.trim().trim_end_matches('?').to_string();
-        if let Some((alias, suffix)) = name.split_once("::") {
-            name = if alias == "global" {
-                suffix.to_string()
-            } else {
-                aliases
-                    .get(alias)
-                    .map(|p| {
-                        if suffix.is_empty() {
-                            p.clone()
-                        } else {
-                            format!("{p}.{suffix}")
-                        }
-                    })
-                    .unwrap_or(name)
-            };
-        }
-        name = metadata_type_identity(&name);
-        let mut keys = Vec::new();
-        if name.contains('.') {
-            keys.push(name);
-        } else {
-            if !namespace.is_empty() {
-                keys.push(format!("{namespace}.{name}"));
-            }
-            keys.extend(usings.iter().map(|u| format!("{u}.{name}")));
-            keys.push(name);
-        }
-        keys.into_iter()
+        csharp_type_reference_keys(reference, namespace, usings, aliases)
+            .into_iter()
             .flat_map(|key| self.types.get(&key).into_iter().flatten())
             .filter(|ty| ty.externally_visible())
             .collect()
@@ -595,6 +569,30 @@ pub(crate) struct CSharpExternalDeclarations<'a> {
     packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
 }
 
+/// One exact external C# type identity and the direct base types its
+/// declaration publishes. Interfaces are intentionally not included: they do
+/// not make a caught class a `System.Exception` subtype.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CSharpExternalTypeCandidate {
+    pub(crate) fqn: String,
+    pub(crate) base_types: Vec<String>,
+    pub(crate) hierarchy_complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CSharpExternalTypeLookup {
+    Absent,
+    Unique(CSharpExternalTypeCandidate),
+    Ambiguous,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConstructorLookup {
+    Absent,
+    Unique(String),
+    Ambiguous,
+}
+
 impl<'a> CSharpExternalDeclarations<'a> {
     pub(crate) fn new(
         artifacts: &'a CSharpExternalDeclarationIndex,
@@ -606,6 +604,117 @@ impl<'a> CSharpExternalDeclarations<'a> {
     /// Whether no surface can answer anything, so a caller may skip the ladder.
     pub(crate) fn is_empty(&self) -> bool {
         self.artifacts.is_empty() && self.packs.is_none()
+    }
+
+    /// Resolve one C# type spelling against the assembly index and the active
+    /// semantic-model overlay. The same file namespace, using namespaces and
+    /// aliases feed both halves, so a model cannot answer a spelling that the
+    /// C# name ladder would not produce.
+    ///
+    /// Artifact declarations win a tie for one qualified identity. Multiple
+    /// distinct identities, or competing model declarations of one identity,
+    /// stay ambiguous rather than selecting one by insertion order.
+    pub(crate) fn resolve_type_in_file(
+        &self,
+        reference: &str,
+        namespace: &str,
+        usings: &[String],
+        aliases: &HashMap<String, String>,
+    ) -> CSharpExternalTypeLookup {
+        let mut candidates = Vec::new();
+        for key in csharp_type_reference_keys(reference, namespace, usings, aliases) {
+            let artifacts = self
+                .artifacts
+                .types_named(&key)
+                .iter()
+                .filter(|ty| ty.externally_visible())
+                .collect::<Vec<_>>();
+            if !artifacts.is_empty() {
+                candidates.extend(artifacts.into_iter().map(|ty| {
+                    CSharpExternalTypeCandidate {
+                        fqn: ty.fqn.clone(),
+                        base_types: ty
+                            .base
+                            .iter()
+                            .filter_map(|base| match base {
+                                DecodedType::Named { name, .. } => Some(name.clone()),
+                                _ => None,
+                            })
+                            .collect(),
+                        hierarchy_complete: true,
+                    }
+                }));
+                continue;
+            }
+            candidates.extend(self.pack_types_named(&key));
+        }
+        collapse_external_type_candidates(candidates)
+    }
+
+    fn pack_types_named(&self, fqn: &str) -> Vec<CSharpExternalTypeCandidate> {
+        let Some(overlay) = self.packs.as_ref() else {
+            return Vec::new();
+        };
+        let mut declarations = overlay
+            .symbols_named(fqn)
+            .records
+            .into_iter()
+            .filter(|symbol| {
+                symbol.owner_id.is_none()
+                    && symbol.language == Language::CSharp.config_label()
+                    && csharp_pack_type_kind(symbol.kind)
+                    && symbol.externally_visible()
+                    && symbol.provenance.completeness == SemanticModelCompleteness::Complete
+                    && !symbol.provenance.ambiguous
+                    && (symbol.qualified_name == fqn
+                        || symbol.aliases.iter().any(|alias| alias == fqn))
+            })
+            .collect::<Vec<_>>();
+        declarations.sort_by(|left, right| left.id.cmp(&right.id));
+        declarations.dedup_by(|left, right| left.id == right.id);
+        declarations
+            .into_iter()
+            .map(|symbol| {
+                let mut base_types = Vec::new();
+                let mut hierarchy_complete = true;
+                let mut extends = overlay
+                    .relations_from(&symbol.id)
+                    .records
+                    .into_iter()
+                    .filter(|relation| relation.kind == "extends")
+                    .collect::<Vec<_>>();
+                extends.sort_by(|left, right| left.id.cmp(&right.id));
+                extends.dedup_by(|left, right| left.id == right.id);
+                for relation in extends {
+                    if relation.provenance.completeness != SemanticModelCompleteness::Complete
+                        || relation.provenance.ambiguous
+                    {
+                        hierarchy_complete = false;
+                    }
+                    let target = overlay.symbols_with_id(&relation.to);
+                    match target.records.as_slice() {
+                        [target]
+                            if target.owner_id.is_none()
+                                && target.language == Language::CSharp.config_label()
+                                && !target.provenance.ambiguous
+                                && target.provenance.completeness
+                                    == SemanticModelCompleteness::Complete =>
+                        {
+                            base_types.push(target.qualified_name.clone());
+                        }
+                        [] => base_types.push(relation.to.clone()),
+                        _ => hierarchy_complete = false,
+                    }
+                }
+                base_types.sort();
+                base_types.dedup();
+                CSharpExternalTypeCandidate {
+                    fqn: symbol.qualified_name.clone(),
+                    base_types,
+                    hierarchy_complete,
+                }
+            })
+            .collect()
     }
 
     /// The external type identity that declares `member`, when this surface
@@ -624,11 +733,220 @@ impl<'a> CSharpExternalDeclarations<'a> {
             .then_some(owner)
     }
 
+    /// Select one externally visible constructor on one exact owner, retaining
+    /// the authored member name because assembly metadata uses `.ctor` while
+    /// source-authored model facts commonly use the type name.
+    pub(crate) fn constructor(
+        &self,
+        owner: &str,
+        parameter_count: u32,
+    ) -> Option<(String, String)> {
+        let owner = metadata_type_identity(owner);
+        match self.artifact_constructor(&owner, parameter_count) {
+            ConstructorLookup::Unique(member) => return Some((owner, member)),
+            ConstructorLookup::Ambiguous => return None,
+            ConstructorLookup::Absent => {}
+        }
+        self.pack_constructor(&owner, parameter_count)
+    }
+
+    /// Whether the one exact external member identity is static.
+    ///
+    /// C# syntax records a type qualifier as a receiver-shaped member access,
+    /// including for a static method such as `int.TryParse`. The dispatch
+    /// boundary must normalize that shape from the declaration fact rather
+    /// than from the spelling, because the same spelling can also name an
+    /// instance receiver or a user declaration. A disagreement across the
+    /// active external surfaces is not a proof and stays open.
+    pub(crate) fn member_is_static(&self, owner: &str, member: &str) -> Option<bool> {
+        let owner = metadata_type_identity(owner);
+        let artifact_members = self
+            .artifacts
+            .members_named(&owner, member)
+            .into_iter()
+            .map(CSharpExternalMember::is_static)
+            .collect::<Vec<_>>();
+        if !artifact_members.is_empty() {
+            let [first, rest @ ..] = artifact_members.as_slice() else {
+                unreachable!("non-empty artifact member list has a first element");
+            };
+            return rest
+                .iter()
+                .all(|candidate| candidate == first)
+                .then_some(*first);
+        }
+
+        let overlay = self.packs.as_ref()?;
+        let declarations = overlay
+            .symbols_named(&owner)
+            .records
+            .into_iter()
+            .filter(|symbol| {
+                symbol.language == Language::CSharp.config_label()
+                    && csharp_pack_type_kind(symbol.kind)
+                    && (symbol.qualified_name == owner
+                        || symbol.aliases.iter().any(|alias| alias == &owner))
+            })
+            .collect::<Vec<_>>();
+        let [declared] = declarations.as_slice() else {
+            return None;
+        };
+        let matched = overlay.member_target_on_owner(&declared.id, member);
+        if matched.records.is_empty()
+            || !matches!(
+                matched.disposition,
+                crate::analyzer::semantic_model::SemanticModelMemberTargetDisposition::Unique
+                    | crate::analyzer::semantic_model::SemanticModelMemberTargetDisposition::Conflict
+            )
+        {
+            return None;
+        }
+        let [first, rest @ ..] = matched.records.as_slice() else {
+            unreachable!("non-empty semantic model member match has a first element");
+        };
+        rest.iter()
+            .all(|candidate| candidate.is_static() == first.is_static())
+            .then_some(first.is_static())
+    }
+
+    /// Whether the one exact external type identity is sealed.
+    ///
+    /// A sealed C# owner has no workspace-derived override family. This fact
+    /// is consumed only by dispatch coverage; it does not turn an unresolved
+    /// member into a declaration or bypass the member summary lookup.
+    pub(crate) fn type_is_sealed(&self, owner: &str) -> Option<bool> {
+        let owner = metadata_type_identity(owner);
+        let artifact_types = self
+            .artifacts
+            .types_named(&owner)
+            .iter()
+            .filter(|ty| ty.externally_visible())
+            .map(CSharpExternalType::is_sealed)
+            .collect::<Vec<_>>();
+        if !artifact_types.is_empty() {
+            let [first, rest @ ..] = artifact_types.as_slice() else {
+                unreachable!("non-empty artifact type list has a first element");
+            };
+            return rest
+                .iter()
+                .all(|candidate| candidate == first)
+                .then_some(*first);
+        }
+
+        let overlay = self.packs.as_ref()?;
+        let declarations = overlay
+            .symbols_named(&owner)
+            .records
+            .into_iter()
+            .filter(|symbol| {
+                symbol.language == Language::CSharp.config_label()
+                    && csharp_pack_type_kind(symbol.kind)
+                    && (symbol.qualified_name == owner
+                        || symbol.aliases.iter().any(|alias| alias == &owner))
+            })
+            .collect::<Vec<_>>();
+        let [declared] = declarations.as_slice() else {
+            return None;
+        };
+        (declared.provenance.completeness
+            == crate::analyzer::semantic_model::SemanticModelCompleteness::Complete
+            && !declared.provenance.ambiguous)
+            .then_some(declared.declaration_is_sealed())
+    }
+
     /// Whether an indexed assembly declares the owner type and an externally
     /// visible member of that name on it.
     fn artifact_declares_member(&self, owner: &str, member: &str) -> bool {
         !self.artifacts.types_named(owner).is_empty()
             && !self.artifacts.members_named(owner, member).is_empty()
+    }
+
+    fn artifact_constructor(&self, owner: &str, parameter_count: u32) -> ConstructorLookup {
+        let Some(parameter_count) = usize::try_from(parameter_count).ok() else {
+            return ConstructorLookup::Absent;
+        };
+        let mut matches = self
+            .artifacts
+            .types_named(owner)
+            .iter()
+            .filter(|ty| ty.externally_visible())
+            .flat_map(|ty| ty.members.iter())
+            .filter(|member| {
+                member.externally_visible()
+                    && member.kind == CSharpExternalMemberKind::Constructor
+                    && !member.is_static
+                    && member.parameter_types.len() == parameter_count
+            })
+            .map(|member| {
+                if member.name == ".ctor" {
+                    owner.rsplit('.').next().unwrap_or(owner).to_owned()
+                } else {
+                    member.name.clone()
+                }
+            })
+            .collect::<Vec<_>>();
+        matches.sort();
+        matches.dedup();
+        match matches.as_slice() {
+            [] => ConstructorLookup::Absent,
+            [member] => ConstructorLookup::Unique(member.clone()),
+            _ => ConstructorLookup::Ambiguous,
+        }
+    }
+
+    fn pack_constructor(&self, owner: &str, parameter_count: u32) -> Option<(String, String)> {
+        let overlay = self.packs.as_ref()?;
+        let parameter_count = usize::try_from(parameter_count).ok()?;
+        let mut declarations = overlay
+            .symbols_named(owner)
+            .records
+            .into_iter()
+            .filter(|symbol| {
+                symbol.language == Language::CSharp.config_label()
+                    && csharp_pack_type_kind(symbol.kind)
+                    && (symbol.qualified_name == owner
+                        || symbol.aliases.iter().any(|alias| alias == owner))
+            });
+        let declared = declarations.next()?;
+        if declarations.next().is_some() {
+            return None;
+        }
+        let matching = overlay
+            .members_of(&declared.id)
+            .records
+            .into_iter()
+            .filter(|symbol| {
+                symbol.language == Language::CSharp.config_label()
+                    && symbol.kind == SemanticModelSymbolKind::Constructor
+                    && symbol.externally_visible()
+                    && !symbol.has_receiver()
+                    && symbol.structured_signature().is_some_and(|signature| {
+                        signature.parameters.len() == parameter_count
+                            && signature
+                                .parameters
+                                .iter()
+                                .all(|parameter| !parameter.variadic)
+                    })
+            })
+            .collect::<Vec<_>>();
+        let mut member_names = matching
+            .iter()
+            .map(|symbol| symbol.name.as_str())
+            .collect::<Vec<_>>();
+        member_names.sort_unstable();
+        member_names.dedup();
+        let [member] = member_names.as_slice() else {
+            return None;
+        };
+        let key = SemanticModelCallableKey::new(
+            Language::CSharp.config_label(),
+            owner,
+            member,
+            false,
+            u32::try_from(parameter_count).expect("constructor arity came from a u32"),
+        );
+        overlay.callable_family_id_for_target(key)?;
+        Some((owner.to_owned(), (*member).to_owned()))
     }
 
     /// Whether the activated packs declare `member` on the one C# type they
@@ -845,7 +1163,8 @@ fn decoded_type_from_semantic(
         TypeRef::ByRef { element, .. } => Some(DecodedType::ByRef(Box::new(
             decoded_type_from_semantic(element, owner_parameters, member_parameters)?,
         ))),
-        TypeRef::Declared { .. }
+        TypeRef::Unknown
+        | TypeRef::Declared { .. }
         | TypeRef::Pointer { .. }
         | TypeRef::Slice { .. }
         | TypeRef::FixedArray { .. }
@@ -876,7 +1195,7 @@ pub fn resolve_csharp_semantic_pack_dependencies(
         .assembly_paths
         .iter()
         .map(|path| ResolvedCSharpAssembly {
-            path: resolve_csharp_path(project.root(), path),
+            path: crate::analyzer::resolve_dependency_path(project.root(), path),
             package_name: None,
             package_version: None,
             target: None,
@@ -965,20 +1284,7 @@ pub fn resolve_csharp_semantic_pack_dependencies(
 }
 
 fn csharp_cancelled_discovery() -> DependencyDiscoveryOutcome {
-    DependencyDiscoveryOutcome {
-        dependencies: Vec::new(),
-        diagnostics: vec![DependencyPackDiagnostic {
-            severity: DependencyPackDiagnosticSeverity::Error,
-            code: "discovery.cancelled".to_owned(),
-            dependency_id: None,
-            location: None,
-            message: ".NET dependency discovery was cancelled".to_owned(),
-        }],
-        suppressed_diagnostics: SuppressedDiagnostics::default(),
-        complete: false,
-        cancelled: true,
-        profile: DependencyDiscoveryProfile::default(),
-    }
+    DependencyDiscoveryOutcome::cancelled_with_message(".NET dependency discovery was cancelled")
 }
 
 impl DependencyPackAdapter for CSharpDependencyPackAdapter {
@@ -986,15 +1292,8 @@ impl DependencyPackAdapter for CSharpDependencyPackAdapter {
         "bifrost-csharp-dependency"
     }
 
-    fn adapter_version(&self) -> &str {
-        env!("CARGO_PKG_VERSION")
-    }
-
     fn producer(&self) -> Producer {
-        Producer {
-            name: "bifrost-csharp-assembly".to_owned(),
-            version: env!("CARGO_PKG_VERSION").to_owned(),
-        }
+        Producer::for_name("bifrost-csharp-assembly")
     }
 
     fn produce(
@@ -1044,24 +1343,10 @@ impl DependencyPackAdapter for CSharpDependencyPackAdapter {
     }
 }
 
-impl ExternalArtifactPackProducer for CSharpAssemblyPackProducer {
-    fn produce_exact_artifact(
-        &self,
-        request: &ArtifactProductionRequest,
-        limits: &ArtifactProducerLimits,
-    ) -> ArtifactProduction {
-        self.produce(request, limits, None)
-    }
-
-    fn produce_exact_artifact_with_cancellation(
-        &self,
-        request: &ArtifactProductionRequest,
-        limits: &ArtifactProducerLimits,
-        cancellation: Option<&CancellationToken>,
-    ) -> ArtifactProduction {
-        self.produce(request, limits, cancellation)
-    }
-}
+crate::analyzer::semantic_model::implement_external_artifact_pack_producer!(
+    CSharpAssemblyPackProducer,
+    produce
+);
 
 impl CSharpAssemblyPackProducer {
     fn produce(
@@ -1247,6 +1532,8 @@ impl CSharpAssemblyPackProducer {
                 }
             }
             types.push(TypeFact {
+                jvm_inventory: None,
+                runtime_bases: None,
                 ambient_use: None,
                 id: type_id.clone(),
                 name: ty.fqn.clone(),
@@ -1348,6 +1635,8 @@ impl CSharpAssemblyPackProducer {
                 members.push(MemberFact {
                     non_overridable: None,
                     ambient_use: None,
+                    value_type: None,
+                    proxied_type: None,
                     id,
                     owner: type_id.clone(),
                     name: member.name.clone(),
@@ -1359,6 +1648,7 @@ impl CSharpAssemblyPackProducer {
                     implicit_operation: None,
                     explicit_operation: None,
                     callable_family_complete: false,
+                    exact_return_classes: Vec::new(),
                     signature: Some(Signature {
                         type_parameters: member.type_parameters.clone(),
                         parameters: parameter_types
@@ -1368,6 +1658,7 @@ impl CSharpAssemblyPackProducer {
                                 r#type,
                                 optional: false,
                                 variadic: false,
+                                role: None,
                                 passing_mode: Default::default(),
                             })
                             .collect(),
@@ -1443,6 +1734,7 @@ impl CSharpAssemblyPackProducer {
                 collection_flows: None,
                 deferred_yields: None,
                 conditional_type_refinements: None,
+                callable_values: None,
             }],
         };
         ArtifactProduction {
@@ -1554,6 +1846,68 @@ fn metadata_type_identity(reference: &str) -> String {
     format!("{}`{arity}", reference[..open].trim())
 }
 
+fn csharp_type_reference_keys(
+    reference: &str,
+    namespace: &str,
+    usings: &[String],
+    aliases: &HashMap<String, String>,
+) -> Vec<String> {
+    let mut name = reference.trim().trim_end_matches('?').to_string();
+    if let Some((alias, suffix)) = name.split_once("::") {
+        name = if alias == "global" {
+            suffix.to_string()
+        } else {
+            aliases
+                .get(alias)
+                .map(|prefix| {
+                    if suffix.is_empty() {
+                        prefix.clone()
+                    } else {
+                        format!("{prefix}.{suffix}")
+                    }
+                })
+                .unwrap_or(name)
+        };
+    }
+    let name = metadata_type_identity(&name);
+    let mut keys = Vec::new();
+    if name.contains('.') {
+        keys.push(name);
+    } else {
+        if !namespace.is_empty() {
+            keys.push(format!("{namespace}.{name}"));
+        }
+        keys.extend(usings.iter().map(|using| format!("{using}.{name}")));
+        keys.push(name);
+    }
+    keys
+}
+
+fn collapse_external_type_candidates(
+    mut candidates: Vec<CSharpExternalTypeCandidate>,
+) -> CSharpExternalTypeLookup {
+    candidates.sort_by(|left, right| {
+        left.fqn
+            .cmp(&right.fqn)
+            .then_with(|| left.base_types.cmp(&right.base_types))
+            .then_with(|| left.hierarchy_complete.cmp(&right.hierarchy_complete))
+    });
+    candidates.dedup();
+    let Some(first) = candidates.first() else {
+        return CSharpExternalTypeLookup::Absent;
+    };
+    if candidates.len() == 1 {
+        return CSharpExternalTypeLookup::Unique(first.clone());
+    }
+    if candidates
+        .iter()
+        .all(|candidate| candidate.fqn == first.fqn)
+    {
+        return CSharpExternalTypeLookup::Ambiguous;
+    }
+    CSharpExternalTypeLookup::Ambiguous
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum DotNetAssetRole {
     Reference,
@@ -1584,14 +1938,6 @@ struct ResolvedCSharpAssembly {
     configuration: Option<String>,
     role: DotNetAssetRole,
     project_reference: bool,
-}
-
-fn resolve_csharp_path(project_root: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_owned()
-    } else {
-        project_root.join(path)
-    }
 }
 
 fn resolved_csharp_dependency(assembly: ResolvedCSharpAssembly) -> ResolvedDependency {
@@ -1644,6 +1990,20 @@ fn resolved_csharp_dependency(assembly: ResolvedCSharpAssembly) -> ResolvedDepen
             DependencyArtifactRole::Runtime
         }
     };
+    // Package/reference assets use the assembly name as their structural
+    // identity so the activated BCL/reference model can select them. An
+    // explicitly supplied local assembly remains path-independent: callers
+    // may rename the same bytes without changing the generated dependency
+    // manifest or its cache key.
+    let module_name = if assembly.package_name.is_some()
+        || matches!(
+            assembly.role,
+            DotNetAssetRole::Reference | DotNetAssetRole::Compile
+        ) {
+        assembly_name
+    } else {
+        "local-dotnet-assembly".to_owned()
+    };
     ResolvedDependency {
         id,
         evidence: SemanticModelActivationEvidence {
@@ -1651,11 +2011,7 @@ fn resolved_csharp_dependency(assembly: ResolvedCSharpAssembly) -> ResolvedDepen
             ecosystem: if package.is_some() { "nuget" } else { "dotnet" }.to_owned(),
             package,
             module: Some(CatalogCoordinate {
-                name: if assembly.package_name.is_some() {
-                    assembly_name
-                } else {
-                    "local-dotnet-assembly".to_owned()
-                },
+                name: module_name,
                 version: None,
             }),
             toolchain: None,
@@ -2353,7 +2709,7 @@ fn collect_metadata_rows<T>(
 }
 
 fn cancellation_checkpoint(cancellation: Option<&CancellationToken>, index: usize) -> bool {
-    !index.is_multiple_of(256) || !cancellation.is_some_and(CancellationToken::is_cancelled)
+    !is_cancelled_at_checkpoint(cancellation, index)
 }
 
 fn effective_type_visibility(
@@ -2879,16 +3235,9 @@ fn resolve_typedef_or_ref(
     type_refs: &[TypeRefRow],
     type_specs: &[TypeSpecRow],
 ) -> String {
-    resolve_typedef_or_ref_type_at_depth(
-        value,
-        types,
-        type_refs,
-        type_specs,
-        MAX_SIGNATURE_DEPTH,
-        0,
-    )
-    .map(|value| value.legacy_name())
-    .unwrap_or_default()
+    resolve_typedef_or_ref_type(value, types, type_refs, type_specs)
+        .map(|value| value.legacy_name())
+        .unwrap_or_default()
 }
 fn resolve_typedef_or_ref_type(
     value: u32,
@@ -3335,13 +3684,19 @@ fn take<'a>(bytes: &'a [u8], p: &mut usize, n: usize) -> Option<&'a [u8]> {
     Some(out)
 }
 fn u16at(b: &[u8], p: &mut usize) -> Option<u16> {
-    Some(u16::from_le_bytes(take(b, p, 2)?.try_into().ok()?))
+    Some(u16::from_le_bytes(
+        crate::analyzer::common::take_little_endian_array::<2>(b, p)?,
+    ))
 }
 fn u32at(b: &[u8], p: &mut usize) -> Option<u32> {
-    Some(u32::from_le_bytes(take(b, p, 4)?.try_into().ok()?))
+    Some(u32::from_le_bytes(
+        crate::analyzer::common::take_little_endian_array::<4>(b, p)?,
+    ))
 }
 fn u64at(b: &[u8], p: &mut usize) -> Option<u64> {
-    Some(u64::from_le_bytes(take(b, p, 8)?.try_into().ok()?))
+    Some(u64::from_le_bytes(
+        crate::analyzer::common::take_little_endian_array::<8>(b, p)?,
+    ))
 }
 fn index(b: &[u8], p: &mut usize, size: usize) -> Option<u32> {
     if size == 2 {

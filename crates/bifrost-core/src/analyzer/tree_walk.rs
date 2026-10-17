@@ -16,6 +16,15 @@ use crate::cancellation::CancellationToken;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tree_sitter::Node;
 
+/// Whether a tree-sitter node kind represents a comment in one of Bifrost's
+/// supported grammars.
+pub fn is_comment_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "comment" | "line_comment" | "block_comment" | "multiline_comment"
+    )
+}
+
 /// The byte and 1-based line span a node covers. Language-blind: every adapter
 /// that records a range for a node reads it exactly this way.
 pub fn node_range(node: Node<'_>) -> Range {
@@ -25,6 +34,13 @@ pub fn node_range(node: Node<'_>) -> Range {
         start_line: node.start_position().row + 1,
         end_line: node.end_position().row + 1,
     }
+}
+
+/// Whether `node` is the direct child selected by `parent`'s grammar field.
+pub fn is_field_child(parent: Node<'_>, node: Node<'_>, field: &str) -> bool {
+    parent
+        .child_by_field_name(field)
+        .is_some_and(|field_node| field_node.id() == node.id())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,54 +55,15 @@ pub fn walk_tree_preorder<'tree>(
     include_root: bool,
     mut visit: impl FnMut(Node<'tree>) -> WalkControl,
 ) {
-    let mut cursor = root.walk();
-    let mut is_root = true;
-
-    loop {
-        let node = cursor.node();
-        let should_descend = if include_root || !is_root {
-            match visit(node) {
-                WalkControl::Continue => true,
-                WalkControl::SkipChildren => false,
-                WalkControl::Break => return,
-            }
-        } else {
-            true
-        };
-
-        if should_descend && cursor.goto_first_child() {
-            is_root = false;
-            continue;
-        }
-
-        loop {
-            if cursor.goto_next_sibling() {
-                is_root = false;
-                break;
-            }
-            if !cursor.goto_parent() {
-                return;
-            }
-        }
-    }
-}
-
-pub fn walk_named_tree_preorder<'tree>(
-    root: Node<'tree>,
-    include_root: bool,
-    mut visit: impl FnMut(Node<'tree>) -> WalkControl,
-) {
     let result: Result<(), std::convert::Infallible> =
-        try_walk_named_tree_preorder(root, include_root, |node| Ok(visit(node)));
+        try_walk_tree_preorder(root, include_root, |node| Ok(visit(node)));
     match result {
         Ok(()) => {}
         Err(error) => match error {},
     }
 }
 
-/// Fallible counterpart to [`walk_named_tree_preorder`]. Both helpers retain
-/// source-order preorder traversal while allowing visitors to prune or stop.
-pub fn try_walk_named_tree_preorder<'tree, Error>(
+fn try_walk_tree_preorder<'tree, Error>(
     root: Node<'tree>,
     include_root: bool,
     mut visit: impl FnMut(Node<'tree>) -> Result<WalkControl, Error>,
@@ -96,7 +73,7 @@ pub fn try_walk_named_tree_preorder<'tree, Error>(
 
     loop {
         let node = cursor.node();
-        let should_descend = if node.is_named() && (include_root || !is_root) {
+        let should_descend = if include_root || !is_root {
             match visit(node)? {
                 WalkControl::Continue => true,
                 WalkControl::SkipChildren => false,
@@ -121,6 +98,53 @@ pub fn try_walk_named_tree_preorder<'tree, Error>(
             }
         }
     }
+}
+
+pub fn walk_named_tree_preorder<'tree>(
+    root: Node<'tree>,
+    include_root: bool,
+    mut visit: impl FnMut(Node<'tree>) -> WalkControl,
+) {
+    let result: Result<(), std::convert::Infallible> =
+        try_walk_named_tree_preorder(root, include_root, |node| Ok(visit(node)));
+    match result {
+        Ok(()) => {}
+        Err(error) => match error {},
+    }
+}
+
+/// Collect trimmed text from named nodes selected by `include`.
+pub fn collect_trimmed_node_texts<'tree>(
+    root: Node<'tree>,
+    source: &str,
+    output: &mut impl Extend<String>,
+    mut include: impl FnMut(Node<'tree>) -> bool,
+) {
+    walk_named_tree_preorder(root, true, |node| {
+        if include(node) {
+            let text = crate::analyzer::common::node_source_text(node, source).trim();
+            if !text.is_empty() {
+                output.extend(std::iter::once(text.to_string()));
+            }
+        }
+        WalkControl::Continue
+    });
+}
+
+/// Fallible counterpart to [`walk_named_tree_preorder`]. Both helpers retain
+/// source-order preorder traversal while allowing visitors to prune or stop.
+pub fn try_walk_named_tree_preorder<'tree, Error>(
+    root: Node<'tree>,
+    include_root: bool,
+    mut visit: impl FnMut(Node<'tree>) -> Result<WalkControl, Error>,
+) -> Result<(), Error> {
+    try_walk_tree_preorder(root, include_root, |node| {
+        if node.is_named() {
+            visit(node)
+        } else {
+            Ok(WalkControl::Continue)
+        }
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -322,9 +346,44 @@ fn first_comment_offset(line: &str, language: Language) -> Option<usize> {
 /// cursor` whose only purpose is to satisfy the borrow. This owns its cursor,
 /// so it drops into an expression position and into `Vec::extend`.
 pub fn named_children_iter<'tree>(node: Node<'tree>) -> NamedChildren<'tree> {
-    let mut cursor = node.walk();
-    let active = cursor.goto_first_child();
+    let (cursor, active) = first_child_cursor(node);
     NamedChildren { cursor, active }
+}
+
+/// Push each node onto `output` only while `step` permits it to be visited.
+pub fn push_bounded_nodes<'tree>(
+    nodes: impl IntoIterator<Item = Node<'tree>>,
+    output: &mut Vec<Node<'tree>>,
+    mut step: impl FnMut() -> bool,
+) -> bool {
+    for node in nodes {
+        if !step() {
+            return false;
+        }
+        output.push(node);
+    }
+    true
+}
+
+/// Collect direct named children of `node` with syntax kind `kind`, in source order.
+pub fn named_children_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Vec<Node<'tree>> {
+    named_children_iter(node)
+        .filter(|child| child.kind() == kind)
+        .collect()
+}
+
+/// Return the sole direct named child matching `predicate`, if exactly one matches.
+pub fn single_named_child_matching<'tree>(
+    node: Node<'tree>,
+    mut predicate: impl FnMut(Node<'tree>) -> bool,
+) -> Option<Node<'tree>> {
+    let mut children = named_children_iter(node).filter(|child| predicate(*child));
+    let only = children.next()?;
+    children.next().is_none().then_some(only)
+}
+
+pub fn named_children_vec<'tree>(node: Node<'tree>) -> Vec<Node<'tree>> {
+    named_children_iter(node).collect()
 }
 
 /// The direct children of `node`, named and anonymous alike, in source order.
@@ -332,9 +391,26 @@ pub fn named_children_iter<'tree>(node: Node<'tree>) -> NamedChildren<'tree> {
 /// [`named_children_iter`] for the visible-child relation grammars usually
 /// mean; this one is for the walks that must see keyword tokens too.
 pub fn children_iter<'tree>(node: Node<'tree>) -> Children<'tree> {
+    let (cursor, active) = first_child_cursor(node);
+    Children { cursor, active }
+}
+
+fn first_child_cursor<'tree>(node: Node<'tree>) -> (tree_sitter::TreeCursor<'tree>, bool) {
     let mut cursor = node.walk();
     let active = cursor.goto_first_child();
-    Children { cursor, active }
+    (cursor, active)
+}
+
+fn advance_child<'tree>(
+    cursor: &mut tree_sitter::TreeCursor<'tree>,
+    active: &mut bool,
+) -> Option<Node<'tree>> {
+    if !*active {
+        return None;
+    }
+    let node = cursor.node();
+    *active = cursor.goto_next_sibling();
+    Some(node)
 }
 
 /// Iterator returned by [`named_children_iter`].
@@ -347,9 +423,7 @@ impl<'tree> Iterator for NamedChildren<'tree> {
     type Item = Node<'tree>;
 
     fn next(&mut self) -> Option<Node<'tree>> {
-        while self.active {
-            let node = self.cursor.node();
-            self.active = self.cursor.goto_next_sibling();
+        while let Some(node) = advance_child(&mut self.cursor, &mut self.active) {
             if node.is_named() {
                 return Some(node);
             }
@@ -368,12 +442,7 @@ impl<'tree> Iterator for Children<'tree> {
     type Item = Node<'tree>;
 
     fn next(&mut self) -> Option<Node<'tree>> {
-        if !self.active {
-            return None;
-        }
-        let node = self.cursor.node();
-        self.active = self.cursor.goto_next_sibling();
-        Some(node)
+        advance_child(&mut self.cursor, &mut self.active)
     }
 }
 
@@ -383,6 +452,27 @@ impl<'tree> Iterator for Children<'tree> {
 /// count; this allocates.
 pub fn named_children<'tree>(node: Node<'tree>) -> Vec<Node<'tree>> {
     named_children_iter(node).collect()
+}
+
+/// The named direct children of a grammar field, or an empty vector when the
+/// field is absent.
+pub fn named_children_by_field<'tree>(node: Node<'tree>, field: &str) -> Vec<Node<'tree>> {
+    node.child_by_field_name(field)
+        .map(named_children)
+        .unwrap_or_default()
+}
+
+/// The direct children assigned to `field`, in source order.
+pub fn children_by_field_name<'tree>(node: Node<'tree>, field: &str) -> Vec<Node<'tree>> {
+    let mut cursor = node.walk();
+    node.children_by_field_name(field, &mut cursor).collect()
+}
+
+/// Count the direct named children in a grammar field, or return zero when the
+/// field is absent.
+pub fn named_child_count_by_field(node: Node<'_>, field: &str) -> usize {
+    node.child_by_field_name(field)
+        .map_or(0, |field_node| field_node.named_child_count())
 }
 
 /// Push `node`'s named children onto a LIFO `stack` so that popping visits
@@ -411,9 +501,32 @@ pub fn push_named_children_reversed_as<'tree, Frame>(
     stack: &mut Vec<Frame>,
     frame: impl FnMut(Node<'tree>) -> Frame,
 ) {
+    push_named_children_reversed_where_as(node, stack, |_| true, frame);
+}
+
+/// Push selected named children onto a LIFO `stack`, mapped to frames, so
+/// popping visits them in source order.
+pub fn push_named_children_reversed_where_as<'tree, Frame>(
+    node: Node<'tree>,
+    stack: &mut Vec<Frame>,
+    mut predicate: impl FnMut(Node<'tree>) -> bool,
+    frame: impl FnMut(Node<'tree>) -> Frame,
+) {
     let first_pushed = stack.len();
-    stack.extend(named_children_iter(node).map(frame));
+    stack.extend(
+        named_children_iter(node)
+            .filter(|child| predicate(*child))
+            .map(frame),
+    );
     stack[first_pushed..].reverse();
+}
+
+/// The first direct named child of `node` accepted by `predicate`.
+pub fn first_named_child_matching<'tree>(
+    node: Node<'tree>,
+    mut predicate: impl FnMut(Node<'tree>) -> bool,
+) -> Option<Node<'tree>> {
+    named_children_iter(node).find(|child| predicate(*child))
 }
 
 /// The first direct named child of `node` whose kind is `kind`.
@@ -422,7 +535,136 @@ pub fn push_named_children_reversed_as<'tree, Frame>(
 /// declaration walks reach a specific grammar slot (a `class_body`, a
 /// `type_identifier`) without assuming child order.
 pub fn first_named_child_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
-    named_children_iter(node).find(|child| child.kind() == kind)
+    first_named_child_matching(node, |child| child.kind() == kind)
+}
+
+/// The first named node in the subtree rooted at `node` whose kind is `kind`.
+/// Preorder search includes `node` itself and stops at the first match.
+pub fn first_named_descendant_of_kind_inclusive<'tree>(
+    node: Node<'tree>,
+    kind: &str,
+) -> Option<Node<'tree>> {
+    let mut found = None;
+    walk_named_tree_preorder(node, true, |candidate| {
+        if candidate.kind() == kind {
+            found = Some(candidate);
+            WalkControl::Break
+        } else {
+            WalkControl::Continue
+        }
+    });
+    found
+}
+
+/// Return the root node that owns `node` by following its parent links.
+pub fn root_node(mut node: Node<'_>) -> Node<'_> {
+    while let Some(parent) = node.parent() {
+        node = parent;
+    }
+    node
+}
+
+/// Unwrap expression wrappers that contain one named child.
+pub fn expression_target_node(mut node: Node<'_>) -> Node<'_> {
+    while matches!(node.kind(), "expression" | "parenthesized_expression") {
+        let Some(child) = named_children_iter(node).next() else {
+            break;
+        };
+        node = child;
+    }
+    node
+}
+
+/// Reduce nested `parenthesized_expression` nodes to their innermost named child.
+pub fn unwrap_parenthesized_expression(node: Node<'_>) -> Node<'_> {
+    unwrap_parenthesized_expression_with(node, |node| node.named_child(0))
+}
+
+/// Unwrap parentheses using a language-specific first-child selector.
+pub fn unwrap_parenthesized_expression_with<'tree>(
+    mut node: Node<'tree>,
+    mut first_child: impl FnMut(Node<'tree>) -> Option<Node<'tree>>,
+) -> Node<'tree> {
+    while node.kind() == "parenthesized_expression" {
+        let Some(child) = first_child(node) else {
+            break;
+        };
+        node = child;
+    }
+    node
+}
+
+/// The last direct named child of `node`.
+pub fn last_named_child<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
+    named_children_iter(node).last()
+}
+
+/// Return `node`'s parent when it occupies `field` on a parent of `parent_kind`.
+pub fn parent_if_field<'tree>(
+    node: Node<'tree>,
+    parent_kind: &str,
+    field: &str,
+) -> Option<Node<'tree>> {
+    let parent = node.parent()?;
+    (parent.kind() == parent_kind && parent.child_by_field_name(field) == Some(node))
+        .then_some(parent)
+}
+
+/// Prefer `field` on `node`, then find the first named direct child of an allowed kind.
+pub fn child_by_field_or_named_child_of_kinds<'tree>(
+    node: Node<'tree>,
+    field: &str,
+    kinds: &[&str],
+) -> Option<Node<'tree>> {
+    node.child_by_field_name(field)
+        .or_else(|| first_named_child_matching(node, |child| kinds.contains(&child.kind())))
+}
+
+/// The last direct named child of `node` associated with field `field`.
+pub fn last_named_field_child<'tree>(node: Node<'tree>, field: &str) -> Option<Node<'tree>> {
+    let mut cursor = node.walk();
+    node.children_by_field_name(field, &mut cursor)
+        .filter(|child| child.is_named())
+        .last()
+}
+
+/// Whether any direct child of `node`, named or anonymous, has kind `kind`.
+pub fn has_child_of_kind(node: Node<'_>, kind: &str) -> bool {
+    children_iter(node).any(|child| child.kind() == kind)
+}
+
+/// The nearest ancestor of `node` matching `predicate`.
+///
+/// The node itself is not considered.
+pub fn find_ancestor<'tree>(
+    node: Node<'tree>,
+    mut predicate: impl FnMut(Node<'tree>) -> bool,
+) -> Option<Node<'tree>> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if predicate(parent) {
+            return Some(parent);
+        }
+        current = parent.parent();
+    }
+    None
+}
+
+/// The node itself or its nearest ancestor matching `predicate`.
+pub fn find_node_or_ancestor<'tree>(
+    node: Node<'tree>,
+    mut predicate: impl FnMut(Node<'tree>) -> bool,
+) -> Option<Node<'tree>> {
+    if predicate(node) {
+        Some(node)
+    } else {
+        find_ancestor(node, predicate)
+    }
+}
+
+/// Whether an ancestor of `node` has kind `kind`.
+pub fn has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {
+    find_ancestor(node, |ancestor| ancestor.kind() == kind).is_some()
 }
 
 /// Whether `node` has an anonymous (token) child spelled `token`.
@@ -434,6 +676,16 @@ pub fn has_token_child(node: Node<'_>, token: &str) -> bool {
     let mut cursor = node.walk();
     node.children(&mut cursor)
         .any(|child| !child.is_named() && child.kind() == token)
+}
+
+/// Whether a grammar-selected operand is a numeric literal wrapped by a sign
+/// token. Each language supplies its own operand and operator extraction.
+pub fn is_signed_numeric_operand(
+    operand: Option<Node<'_>>,
+    operator: Option<&str>,
+    is_numeric_literal: impl FnOnce(Node<'_>) -> bool,
+) -> bool {
+    matches!(operator, Some("+") | Some("-")) && operand.is_some_and(is_numeric_literal)
 }
 
 /// Whether the subtree rooted at `node` (including `node` itself) contains a
@@ -489,32 +741,58 @@ pub fn node_for_exact_range<'tree>(root: Node<'tree>, range: &Range) -> Option<N
 
 /// Walk `node` and append every `ERROR` / `MISSING` span into `out`. Does NOT
 /// recurse into `ERROR` nodes: every descendant would also report as errored
-/// and the diagnostic list would explode. Used both by `analyze_file` (to
-/// populate the per-file cache) and by `lsp::handlers::diagnostic` (for the
-/// fallback path when the analyzer has no cached state), so the two paths
-/// share one source of truth for the walk semantics and the
-/// `end_byte.max(start_byte)` clamp.
+/// and the diagnostic list would explode. Used by `analyze_file` (to populate
+/// the per-file cache), by `lsp::handlers::diagnostic` (for the fallback path
+/// when the analyzer has no cached state) and by the structural fact collector
+/// (for its recovered regions, #3777), so the paths share one source of truth
+/// for the walk semantics and the `end_byte.max(start_byte)` clamp.
+///
+/// The walk enters only subtrees that `has_error`: tree-sitter adds every
+/// child's error cost, a `MISSING` leaf's included, to its parent, so a
+/// subtree without one holds neither kind of node. A clean file costs one
+/// visit.
 pub fn collect_parse_errors(node: Node, out: &mut Vec<ParseError>) {
     walk_tree_preorder(node, true, |node| {
+        if !node.has_error() {
+            return WalkControl::SkipChildren;
+        }
         if node.is_error() || node.is_missing() {
-            let range = Range {
-                start_byte: node.start_byte(),
-                end_byte: node.end_byte().max(node.start_byte()),
-                start_line: node.start_position().row,
-                end_line: node.end_position().row,
-            };
             let kind = if node.is_missing() {
                 ParseErrorKind::Missing(node.kind().to_string())
             } else {
                 ParseErrorKind::Error
             };
-            out.push(ParseError { range, kind });
+            out.push(ParseError {
+                range: parse_error_range(node),
+                kind,
+            });
             if node.is_error() {
                 return WalkControl::SkipChildren;
             }
         }
         WalkControl::Continue
     });
+}
+
+/// Append one [`ParseErrorKind::Unclosed`] error per opening token in
+/// `openers`, in the coordinates [`collect_parse_errors`] reports (#3501).
+pub fn push_unclosed_construct_errors<'tree>(
+    openers: impl IntoIterator<Item = Node<'tree>>,
+    out: &mut Vec<ParseError>,
+) {
+    out.extend(openers.into_iter().map(|opener| ParseError {
+        range: parse_error_range(opener),
+        kind: ParseErrorKind::Unclosed(opener.kind().to_string()),
+    }));
+}
+
+fn parse_error_range(node: Node<'_>) -> Range {
+    Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte().max(node.start_byte()),
+        start_line: node.start_position().row,
+        end_line: node.end_position().row,
+    }
 }
 
 /// What [`walk_tree_iterative`] should do after visiting a node on entry.
@@ -574,10 +852,7 @@ pub fn walk_tree_iterative<State>(
 /// (#2369). The cursor walks each child exactly once instead, and the reversal
 /// of the freshly pushed span keeps the original visit order.
 fn push_named_children<'tree>(node: Node<'tree>, stack: &mut Vec<TreeWalkFrame<'tree>>) {
-    let mut cursor = node.walk();
-    let first_pushed = stack.len();
-    stack.extend(node.named_children(&mut cursor).map(TreeWalkFrame::Enter));
-    stack[first_pushed..].reverse();
+    push_named_children_reversed_as(node, stack, TreeWalkFrame::Enter);
 }
 
 /// The grammar symbol ids that spell one node kind.
@@ -777,6 +1052,7 @@ impl<'tree> Iterator for Ancestors<'_, 'tree> {
 mod tests {
     use super::expanded_comment_start;
     use crate::analyzer::model::Language;
+    use brokk_bifrost_test_macros::hardwon;
 
     /// The boost preprocessor limit-header shape from #1775.
     const BOOST_SHAPE: &str = "\
@@ -792,6 +1068,7 @@ mod tests {
 ";
 
     #[test]
+    #[hardwon("#1775: C++ spaced preprocessor directives were mistaken for attached comments")]
     fn cpp_spaced_directive_lines_terminate_the_walk() {
         let declaration = BOOST_SHAPE.find("# define BOOST_PP_BOOL_1 1").unwrap();
 
@@ -803,6 +1080,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#1775: applying C++ directive rules detached hash comments in Python, Ruby and PHP")]
     fn hash_comment_languages_still_attach_every_hash_line() {
         // The same bytes read as a hash-comment language: every `# ` line is a
         // comment, so the whole block above the declaration attaches.
@@ -818,6 +1096,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#1775: comment text in C++ null directives was lost from the macro documentation")]
     fn cpp_null_directives_carrying_comment_text_stay_attached() {
         let source = "\
 # /* Fast path toggle.
@@ -836,6 +1115,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#1775: the directive after a block comment caused the comment walk to stop early")]
     fn cpp_directive_after_a_block_comment_keeps_the_comment() {
         let source = "/** Fast path toggle. */\n# define FAST 1\n";
         let declaration = source.find("# define FAST 1").unwrap();
@@ -847,6 +1127,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#1775: the C++ directive gate treated an inline hash in Python inconsistently")]
     fn python_inline_comment_boundary_survives_the_language_gate() {
         // The `# ` fallback on a terminating code line is a hash-comment-only
         // rule: it must not fire for a C++ line that merely contains `# `.

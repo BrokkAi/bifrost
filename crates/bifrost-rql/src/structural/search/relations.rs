@@ -2,7 +2,10 @@ use super::super::matcher::{
     CallableSignatureFacts, CallableSignatureOracle, DeclarationOwnerOracle,
 };
 use super::*;
+use crate::analyzer::lexical_definitions::formal_parameter_slots;
+use crate::analyzer::semantic::LengthDelimitedDigest;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
+use tree_sitter::Node;
 
 pub(super) fn direct_member_expansions(
     analyzer: &dyn IAnalyzer,
@@ -42,13 +45,11 @@ pub(super) fn reference_expansion(
     value: PipelineValue,
     site: ReferenceSiteValue,
 ) -> PipelineExpansion {
-    let trace_value =
-        pipeline_trace_value(&value).expect("reference steps produce a semantic value");
-    PipelineExpansion {
+    super::pipeline_expansion_with_via(
         value,
-        trace: vec![(trace_value, Some(PipelineVia::ReferenceSite(site)))],
-        budgeted: false,
-    }
+        Some(PipelineVia::ReferenceSite(site)),
+        "reference steps produce a semantic value",
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -65,6 +66,7 @@ pub(super) fn call_site_expansions(
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     cache_profile: &mut Option<QueryCacheProfile>,
+    semantic: &mut Option<SemanticQueryContext<'_>>,
 ) -> (Vec<PipelineExpansion>, bool) {
     let incoming = matches!(step, QueryStep::CallSitesTo(_));
     let result = cached_call_relation(
@@ -89,11 +91,211 @@ pub(super) fn call_site_expansions(
     let expansions = sites
         .into_iter()
         .map(|mut site| {
+            let semantic_identity = semantic
+                .as_mut()
+                .and_then(|semantic| semantic.call_site_identity_at_source(&site.file, site.range));
             let binding = bind_call_site_arguments(analyzer, &mut site, &mut cache.bindings);
-            pipeline_expansion(PipelineValue::CallSite(CallSiteValue(site, binding)))
+            let identity_facts = call_site_identity_facts(analyzer, &site, cancellation);
+            if recursive_equals_identity_is_incomplete(&site, &identity_facts)
+                && !diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == CodeQueryDiagnosticCode::SemanticResultsOmitted
+                        && diagnostic.message.contains("recursive Equals")
+                        && diagnostic
+                            .message
+                            .contains(&site.caller.fq_name().to_string())
+                })
+            {
+                diagnostics.push(CodeQueryDiagnostic {
+                    source: None,
+                    code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
+                    impact: CodeQueryDiagnosticImpact::Incomplete,
+                    branch: Vec::new(),
+                    language: "csharp",
+                    message: format!(
+                        "recursive Equals argument or receiver identity was incomplete for {}",
+                        site.caller.fq_name()
+                    ),
+                    exhausted_roots: Vec::new(),
+                    withheld_rows_path: None,
+                });
+            }
+            pipeline_expansion(PipelineValue::CallSite(CallSiteValue::new(
+                site,
+                binding,
+                semantic_identity,
+                identity_facts,
+            )))
         })
         .collect();
     (expansions, truncated)
+}
+
+fn recursive_equals_identity_is_incomplete(site: &CallSite, facts: &CallSiteIdentityFacts) -> bool {
+    crate::analyzer::common::language_for_file(&site.file) == Language::CSharp
+        && site.caller.identifier() == "Equals"
+        && site.callee.identifier() == "Equals"
+        && !site.arguments.is_empty()
+        && (facts.receiver_kind == "unknown"
+            || facts
+                .argument_identities
+                .first()
+                .is_none_or(Option::is_none)
+            || facts
+                .caller_parameter_identities
+                .first()
+                .is_none_or(Option::is_none))
+}
+
+/// Derive the call-site identity facts that relational policies cannot safely
+/// reconstruct from rendered source. The resolver supplies lexical binding
+/// identity; formal slots supply the enclosing caller's parameter identity.
+/// Both are query-local and bounded by this one call site and source file.
+fn call_site_identity_facts(
+    analyzer: &dyn IAnalyzer,
+    site: &CallSite,
+    cancellation: Option<&CancellationToken>,
+) -> CallSiteIdentityFacts {
+    let language = crate::analyzer::common::language_for_file(&site.file);
+    let mut facts = CallSiteIdentityFacts {
+        receiver_kind: if site.receiver.is_none() {
+            "implicit"
+        } else if language != Language::CSharp {
+            "explicit"
+        } else {
+            "unknown"
+        },
+        argument_identities: vec![None; site.arguments.len()],
+        caller_parameter_identities: vec![None; site.arguments.len()],
+    };
+    if language != Language::CSharp {
+        return facts;
+    }
+    let Some(source) = analyzer.indexed_source(&site.file).map(Arc::<str>::from) else {
+        return facts;
+    };
+    let Some(tree) = parse_tree_for_language(&site.file, language, &source) else {
+        return facts;
+    };
+    if let Some(receiver) = site.receiver
+        && exact_node_for_range(tree.root_node(), receiver)
+            .is_some_and(|node| matches!(node.kind(), "this" | "this_expression"))
+    {
+        facts.receiver_kind = "this";
+    } else if site.receiver.is_some() {
+        facts.receiver_kind = "explicit";
+    }
+
+    let ordinary_parameters = analyzer
+        .ranges_of(&site.caller)
+        .into_iter()
+        .min_by_key(|range| (range.start_byte, range.end_byte))
+        .and_then(|caller_range| {
+            formal_parameter_slots(language, tree.root_node(), &source, &caller_range)
+        })
+        .map(|layout| {
+            layout
+                .slots
+                .into_iter()
+                .filter(|slot| !slot.receiver)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for (index, argument) in site.arguments.iter().enumerate() {
+        let parameter = argument
+            .position
+            .and_then(|position| ordinary_parameters.get(position))
+            .or_else(|| {
+                argument.name.as_deref().and_then(|name| {
+                    ordinary_parameters
+                        .iter()
+                        .find(|slot| slot.names.iter().any(|candidate| candidate == name))
+                })
+            });
+        facts.caller_parameter_identities[index] =
+            parameter.map(|slot| lexical_identity(&site.file, slot.declaration_range));
+    }
+
+    let mut requests = Vec::new();
+    let mut request_indices = Vec::new();
+    for (index, argument) in site.arguments.iter().enumerate() {
+        let exact = exact_node_for_range(tree.root_node(), argument.range);
+        let stripped = exact.and_then(strip_csharp_argument_wrappers);
+        let Some(node) = stripped else {
+            continue;
+        };
+        requests.push(DefinitionLookupRequest {
+            file: site.file.clone(),
+            line: None,
+            column: None,
+            start_byte: Some(node.start_byte()),
+            end_byte: Some(node.end_byte()),
+        });
+        request_indices.push(index);
+    }
+    if requests.is_empty() {
+        return facts;
+    }
+    let outcomes = match cancellation {
+        Some(cancellation) => resolve_definition_batch_with_source_and_cancellation(
+            analyzer,
+            requests,
+            site.file.clone(),
+            source,
+            cancellation,
+        ),
+        None => resolve_definition_batch_with_source(analyzer, requests, site.file.clone(), source),
+    };
+    for (index, outcome) in request_indices.into_iter().zip(outcomes) {
+        facts.argument_identities[index] = outcome
+            .lexical_definition
+            .map(|definition| lexical_identity(&site.file, definition.declaration_range));
+    }
+    facts
+}
+
+fn lexical_identity(file: &ProjectFile, range: Range) -> String {
+    let mut digest = LengthDelimitedDigest::new(b"bifrost.code_query.call_binding_identity.v1");
+    digest.push(rel_path_string(file).as_bytes());
+    digest.push(&range.start_byte.to_le_bytes());
+    digest.push(&range.end_byte.to_le_bytes());
+    digest.finish().to_string()
+}
+
+fn exact_node_for_range(root: Node<'_>, range: Range) -> Option<Node<'_>> {
+    let mut node = root.named_descendant_for_byte_range(range.start_byte, range.end_byte)?;
+    while let Some(parent) = node.parent() {
+        if parent.start_byte() == range.start_byte && parent.end_byte() == range.end_byte {
+            node = parent;
+        } else {
+            break;
+        }
+    }
+    (node.start_byte() == range.start_byte && node.end_byte() == range.end_byte).then_some(node)
+}
+
+fn strip_csharp_argument_wrappers(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        node = match node.kind() {
+            "argument" => node
+                .child_by_field_name("value")
+                .or_else(|| node.child_by_field_name("expression"))
+                .or_else(|| {
+                    let mut cursor = node.walk();
+                    let mut children = node.named_children(&mut cursor);
+                    let child = children.next()?;
+                    children.next().is_none().then_some(child)
+                })?,
+            "cast_expression" | "parenthesized_expression" => {
+                node.child_by_field_name("expression").or_else(|| {
+                    let mut cursor = node.walk();
+                    let mut children = node.named_children(&mut cursor);
+                    let child = children.next()?;
+                    children.next().is_none().then_some(child)
+                })?
+            }
+            _ => return Some(node),
+        };
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -263,12 +465,14 @@ pub(super) fn map_call_relation_diagnostic(
     );
     let (code, impact) = map_call_relation_diagnostic_code(diagnostic.code);
     CodeQueryDiagnostic {
+        source: None,
         code,
         impact,
         branch: Vec::new(),
         language,
         message: diagnostic.message,
         exhausted_roots: Vec::new(),
+        withheld_rows_path: None,
     }
 }
 
@@ -474,6 +678,7 @@ pub(super) fn outbound_reference_expansions(
         diagnostics
             .retain(|diagnostic| diagnostic.code != CodeQueryDiagnosticCode::UsesTargetsAmbiguous);
         diagnostics.push(CodeQueryDiagnostic {
+            source: None,
             code: CodeQueryDiagnosticCode::UsesCandidatesOmitted,
             impact: CodeQueryDiagnosticImpact::Incomplete,
             branch: Vec::new(),
@@ -485,6 +690,7 @@ pub(super) fn outbound_reference_expansions(
                 declaration.unit.fq_name()
             ),
         exhausted_roots: Vec::new(),
+            withheld_rows_path: None,
         });
     }
     sort_reference_sites(&mut sites);
@@ -689,20 +895,16 @@ pub(super) fn hierarchy_path_contains(
 
 pub(super) fn hierarchy_trace_values(
     paths: &[HierarchyPathNode],
-    mut tail: usize,
+    tail: usize,
     depth: usize,
 ) -> Vec<PipelineTraceValue> {
-    let mut values = Vec::with_capacity(depth);
-    loop {
-        let node = &paths[tail];
-        values.push(PipelineTraceValue::Declaration(node.value.clone()));
-        let Some(parent) = node.parent else {
-            break;
-        };
-        tail = parent;
-    }
-    values.reverse();
-    values
+    super::parent_path_values(tail, depth, |index| {
+        let node = &paths[index];
+        (
+            PipelineTraceValue::Declaration(node.value.clone()),
+            node.parent,
+        )
+    })
 }
 
 pub(super) fn semantic_row_seed_generations_current(
@@ -736,18 +938,16 @@ pub(super) fn append_semantic_omission_diagnostics(
     omissions: BTreeMap<(Language, &'static str), usize>,
 ) {
     for ((language, reason), count) in omissions {
-        diagnostics.push(CodeQueryDiagnostic {
-            code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
-            impact: CodeQueryDiagnosticImpact::Incomplete,
-            branch: Vec::new(),
-            language: language.config_label(),
-            message: format!(
+        diagnostics.push(incomplete_diagnostic(
+            CodeQueryDiagnosticCode::SemanticResultsOmitted,
+            language.config_label(),
+            format!(
                 "{} omitted {count} input{} because {reason}",
                 step.label(),
                 if count == 1 { "" } else { "s" }
             ),
-            exhausted_roots: Vec::new(),
-        });
+            Vec::new(),
+        ));
     }
 }
 
@@ -758,6 +958,15 @@ pub(super) struct EnclosingDeclarationIndex {
 }
 
 impl EnclosingDeclarationIndex {
+    pub(super) fn for_file(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Self {
+        let mut declarations = Self::default();
+        for unit in analyzer.get_declarations(file) {
+            declarations.retain(unit.clone(), analyzer.ranges_of(&unit));
+        }
+        declarations.sort();
+        declarations
+    }
+
     pub(super) fn retain(&mut self, unit: CodeUnit, ranges: impl IntoIterator<Item = Range>) {
         if unit.is_synthetic() || unit.is_file_scope() {
             return;
@@ -813,12 +1022,10 @@ pub(super) struct FileCallableSignatureOracle<'a> {
 
 impl<'a> FileCallableSignatureOracle<'a> {
     pub(super) fn for_file(analyzer: &'a dyn IAnalyzer, file: &ProjectFile) -> Self {
-        let mut index = EnclosingDeclarationIndex::default();
-        for unit in analyzer.get_declarations(file) {
-            index.retain(unit.clone(), analyzer.ranges_of(&unit));
+        Self {
+            analyzer,
+            index: EnclosingDeclarationIndex::for_file(analyzer, file),
         }
-        index.sort();
-        Self { analyzer, index }
     }
 }
 
@@ -862,14 +1069,9 @@ pub(super) struct RustDeclarationOwnerOracle<'a> {
 
 impl<'a> RustDeclarationOwnerOracle<'a> {
     pub(super) fn for_file(analyzer: &'a dyn IAnalyzer, file: &ProjectFile) -> Self {
-        let mut declarations = EnclosingDeclarationIndex::default();
-        for unit in analyzer.get_declarations(file) {
-            declarations.retain(unit.clone(), analyzer.ranges_of(&unit));
-        }
-        declarations.sort();
         Self {
             analyzer,
-            declarations,
+            declarations: EnclosingDeclarationIndex::for_file(analyzer, file),
         }
     }
 }
@@ -925,9 +1127,12 @@ impl DeclarationOwnerOracle for RustDeclarationOwnerOracle<'_> {
                 &facts,
                 node,
                 captures,
-                examined_facts,
-                signature_oracle,
-                incomplete,
+                super::super::matcher::PatternEvalInputs {
+                    examined_facts,
+                    oracle: signature_oracle,
+                    local_value_oracle: None,
+                    incomplete,
+                },
             ) {
                 return true;
             }
@@ -947,21 +1152,36 @@ pub(super) fn seed_range(seed: &SeedMatch) -> Range {
     }
 }
 
+fn declaration_index_for_file<'a>(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    declarations_by_file: &'a mut HashMap<ProjectFile, EnclosingDeclarationIndex>,
+) -> &'a EnclosingDeclarationIndex {
+    declarations_by_file.entry(file.clone()).or_insert_with(|| {
+        let mut declarations = EnclosingDeclarationIndex::default();
+        for unit in analyzer.get_declarations(file) {
+            declarations.retain(unit.clone(), analyzer.ranges_of(&unit));
+        }
+        declarations.sort();
+        declarations
+    })
+}
+
 pub(super) fn declaration_index_for_seed<'a>(
     analyzer: &dyn IAnalyzer,
     seed: &SeedMatch,
     declarations_by_file: &'a mut HashMap<ProjectFile, EnclosingDeclarationIndex>,
 ) -> &'a EnclosingDeclarationIndex {
-    declarations_by_file
-        .entry(seed.file.clone())
-        .or_insert_with(|| {
-            let mut declarations = EnclosingDeclarationIndex::default();
-            for unit in analyzer.get_declarations(&seed.file) {
-                declarations.retain(unit.clone(), analyzer.ranges_of(&unit));
-            }
-            declarations.sort();
-            declarations
-        })
+    declaration_index_for_file(analyzer, &seed.file, declarations_by_file)
+}
+
+pub(super) fn enclosing_declaration_for_range(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    range: Range,
+    declarations_by_file: &mut HashMap<ProjectFile, EnclosingDeclarationIndex>,
+) -> Option<DeclarationValue> {
+    declaration_index_for_file(analyzer, file, declarations_by_file).enclosing(range)
 }
 
 pub(super) fn enclosing_declaration_value(

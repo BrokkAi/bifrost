@@ -5,13 +5,18 @@ use super::resolver::{
     bare_field_context_matches_target, bare_method_context_matches_target,
     constructor_method_reference_receiver, has_proven_static_import, infer_type_from_value,
     is_declaration_name, is_ignored_type_context, is_module_type_reference,
-    is_record_pattern_type_reference, java_method_signatures_match, nested_type_for_owner,
-    node_text, receiver_matches_target, receiver_type_matches_target, resolve_field_access_type,
-    resolve_field_access_type_segments, resolve_non_nested_type_from_node, resolve_type_from_node,
-    resolve_type_segments, same_owner_context, seed_class_binding,
+    is_record_pattern_type_reference, java_method_signatures_match, method_reference_parts,
+    nested_type_for_owner, node_text, receiver_matches_target, receiver_type_matches_target,
+    resolve_field_access_type, resolve_field_access_type_segments,
+    resolve_non_nested_type_from_node, resolve_type_from_node, resolve_type_segments,
+    same_owner_context, seed_class_binding,
 };
 use super::return_type::{
     FileReturnCache, MethodAnonymousReturnCache, MethodReturnCache, java_type_name_components,
+};
+use crate::java::declarations::{
+    JavaScopeDeclaration, java_field_access_is_selector_object as is_member_access_object,
+    java_scope_declarations,
 };
 use crate::java::graph_support::{
     JavaSource, java_switch_selector_expression, resolve_java_usage_type_components_in,
@@ -519,28 +524,21 @@ fn scan_try_with_resources(node: Node<'_>, token: QueryToken<'_>, ctx: &mut Scan
 }
 
 fn seed_declarations(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
-    match node.kind() {
-        "method_declaration" | "constructor_declaration" | "compact_constructor_declaration" => {
-            if let Some(parameters) = node.child_by_field_name("parameters") {
-                let mut cursor = parameters.walk();
-                for child in parameters.named_children(&mut cursor) {
-                    if child.kind() == "formal_parameter" {
-                        seed_typed_binding(child, token, ctx);
-                    }
-                }
-            }
-        }
-        "catch_clause" => {
-            if let Some(parameter) = node.child_by_field_name("parameter") {
+    for declaration in java_scope_declarations(node) {
+        match declaration {
+            JavaScopeDeclaration::MethodParameter(parameter)
+                if parameter.kind() == "formal_parameter" =>
+            {
                 seed_typed_binding(parameter, token, ctx);
             }
-        }
-        "enhanced_for_statement" => {
-            if let Some(name) = node.child_by_field_name("name") {
+            JavaScopeDeclaration::MethodParameter(_) => {}
+            JavaScopeDeclaration::CatchParameter(parameter) => {
+                seed_typed_binding(parameter, token, ctx);
+            }
+            JavaScopeDeclaration::EnhancedForName(name) => {
                 ctx.bindings.declare_shadow(node_text(name, ctx.source));
             }
         }
-        _ => {}
     }
 }
 
@@ -662,16 +660,15 @@ fn maybe_record_type_hit(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCt
     if is_ignored_type_context(type_node) {
         return;
     }
-    for (resolved, segment) in resolve_type_segments(
-        type_node,
-        ctx.source,
-        |candidate| resolve_non_nested_type_from_node(candidate, token, ctx),
-        |owner, name| nested_type_for_owner(owner, name, ctx),
-    ) {
-        if resolved.fq_name() == ctx.spec.owner.fq_name() {
-            hits::push_hit(segment, ctx);
-        }
-    }
+    record_resolved_type_segments(
+        resolve_type_segments(
+            type_node,
+            ctx.source,
+            |candidate| resolve_non_nested_type_from_node(candidate, token, ctx),
+            |owner, name| nested_type_for_owner(owner, name, ctx),
+        ),
+        ctx,
+    );
 }
 
 fn record_selector_type_segments(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
@@ -698,6 +695,10 @@ fn record_selector_type_segments(node: Node<'_>, token: QueryToken<'_>, ctx: &mu
         ),
         _ => Vec::new(),
     };
+    record_resolved_type_segments(segments, ctx);
+}
+
+fn record_resolved_type_segments(segments: Vec<(CodeUnit, Node<'_>)>, ctx: &mut ScanCtx<'_>) {
     for (resolved, segment) in segments {
         if resolved.fq_name() == ctx.spec.owner.fq_name() {
             hits::push_hit(segment, ctx);
@@ -758,13 +759,6 @@ fn maybe_record_static_qualifier_type_hit(
         }
         SymbolResolution::Ambiguous | SymbolResolution::Precise(_) => true,
     }
-}
-
-fn is_member_access_object(node: Node<'_>) -> bool {
-    node.parent().is_some_and(|parent| {
-        matches!(parent.kind(), "method_invocation" | "field_access")
-            && parent.child_by_field_name("object") == Some(node)
-    })
 }
 
 fn maybe_record_import_hit(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
@@ -989,14 +983,6 @@ enum MethodReferenceTargetResolution {
     NotTarget,
     Proven,
     Unproven,
-}
-
-fn method_reference_parts(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
-    let mut cursor = node.walk();
-    let children: Vec<_> = node.named_children(&mut cursor).collect();
-    let (member, rest) = children.split_last()?;
-    let receiver = rest.last().copied()?;
-    Some((receiver, *member))
 }
 
 fn method_reference_target_resolution(

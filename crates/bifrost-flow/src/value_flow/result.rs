@@ -58,7 +58,7 @@ impl ValueFlowMeeting {
     }
 
     pub const fn is_uncertain(&self) -> bool {
-        !self.uncertainty.is_empty()
+        self.uncertainty.is_uncertain()
     }
 }
 
@@ -143,6 +143,10 @@ impl ValueFlowSummaryResult {
         })
     }
 
+    pub(crate) fn set_query_work(&mut self, work: crate::dataflow::SolverWork) {
+        self.result.set_query_work(work);
+    }
+
     pub const fn result(&self) -> &SummaryDataflowResult<ValueFlowFact> {
         &self.result
     }
@@ -170,17 +174,12 @@ impl ValueFlowSummaryResult {
     }
 
     pub fn sink_outcome(&self, sink: ValueFlowSinkId) -> ValueFlowSinkOutcome<'_> {
-        let meetings = self
-            .meetings
-            .iter()
-            .filter(|meeting| meeting.sink == sink)
-            .collect::<Vec<_>>();
-        if !meetings.is_empty() {
-            ValueFlowSinkOutcome::Reached(meetings.into_boxed_slice())
-        } else if self.is_complete() {
-            ValueFlowSinkOutcome::NotReached
-        } else {
-            ValueFlowSinkOutcome::Inconclusive
+        match super::sink_meeting_outcome(&self.meetings, sink, self.is_complete(), |meeting| {
+            meeting.sink
+        }) {
+            super::SinkMeetingOutcome::Reached(meetings) => ValueFlowSinkOutcome::Reached(meetings),
+            super::SinkMeetingOutcome::NotReached => ValueFlowSinkOutcome::NotReached,
+            super::SinkMeetingOutcome::Inconclusive => ValueFlowSinkOutcome::Inconclusive,
         }
     }
 

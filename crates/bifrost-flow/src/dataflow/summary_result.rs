@@ -10,23 +10,51 @@ use std::{
 };
 
 use crate::analyzer::semantic::{
-    CallContinuationKind, CallSiteHandle, ControlContinuation, ControlEdgeKind, DispatchBoundary,
+    CallContinuationKind, CallSiteHandle, ControlContinuation, DispatchBoundary,
     DispatchBoundaryKind, EvidenceCompleteness, IcfgBoundaryKind, IcfgEdgeKind, IcfgExitProfile,
-    IcfgLimitKind, OracleRelationHandle, ProcedureHandle, ProcedureIcfgBoundary, ProcedureIcfgEdge,
-    ProgramPointHandle, ProofStatus, ReturnTransferKind, SemanticProviderError, SemanticWork,
-    compare_relation_provenance,
+    IcfgLimitKind, OracleCallContext, OracleRelationHandle, ProcedureHandle, ProcedureIcfgBoundary,
+    ProcedureIcfgEdge, ProgramPointHandle, ProofStatus, ReturnTransferKind, SemanticProviderError,
+    SemanticWork,
+};
+use crate::ordering::{
+    compare_boundary_evidence, compare_call_contexts, compare_call_sites, compare_completeness,
+    compare_continuations, compare_optional_call_sites, compare_points, compare_proof,
+    compare_summary_entries as compare_entries, return_kind_ordinal,
 };
 
 use super::{FactId, PathQualityFrontier, SemanticInputStatus, SolverTermination, SolverWork};
 use super::{
     PathQuality, SummaryWitness, SummaryWitnessError, WitnessReconstructionLimits,
-    witness::{WitnessAlternatives, WitnessStore, WitnessTarget},
+    witness::{WitnessAlternatives, WitnessEvidenceId, WitnessStore, WitnessTarget},
 };
+
+fn debug_assert_point_procedure(
+    procedure: &ProcedureHandle,
+    point: &ProgramPointHandle,
+    message: &str,
+) {
+    debug_assert_eq!(procedure, point.procedure(), "{message}");
+}
+
+fn retained_derivation_count(
+    path_qualities: PathQualityFrontier,
+    witnesses: &WitnessAlternatives,
+    quality: PathQuality,
+) -> usize {
+    path_qualities
+        .dominating_quality(quality)
+        .map_or(0, |quality| witnesses.ids(quality).len())
+}
+
+fn retained_context_bytes(context: &OracleCallContext) -> usize {
+    size_of_val(context.calls())
+}
 
 /// One procedure entry and fact whose relative path edges share an end-summary
 /// relation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SummaryEntry {
+    call_context: OracleCallContext,
     procedure: ProcedureHandle,
     entry_point: ProgramPointHandle,
     entry_fact: FactId,
@@ -38,16 +66,31 @@ impl SummaryEntry {
         entry_point: ProgramPointHandle,
         entry_fact: FactId,
     ) -> Self {
-        debug_assert_eq!(
+        debug_assert_point_procedure(
             &procedure,
-            entry_point.procedure(),
-            "summary entry point must belong to its procedure"
+            &entry_point,
+            "summary entry point must belong to its procedure",
         );
         Self {
+            call_context: OracleCallContext::empty(),
             procedure,
             entry_point,
             entry_fact,
         }
+    }
+
+    fn retained_context_bytes(&self) -> usize {
+        retained_context_bytes(&self.call_context)
+    }
+
+    pub(crate) fn with_call_context(mut self, context: OracleCallContext) -> Self {
+        self.call_context = context;
+        self
+    }
+
+    /// Exact bounded caller suffix that selected this relative entry.
+    pub const fn call_context(&self) -> &OracleCallContext {
+        &self.call_context
     }
 
     pub const fn procedure(&self) -> &ProcedureHandle {
@@ -103,10 +146,10 @@ impl SummaryReachedFact {
         witnesses: WitnessAlternatives,
         witness_owner: Option<Arc<()>>,
     ) -> Self {
-        debug_assert_eq!(
+        debug_assert_point_procedure(
             entry.procedure(),
-            point.procedure(),
-            "summary path point must belong to its entry procedure"
+            &point,
+            "summary path point must belong to its entry procedure",
         );
         Self {
             entry,
@@ -144,13 +187,13 @@ impl SummaryReachedFact {
     /// nothing was retained for the quality: reconstructing derivation zero
     /// then reports whether retention was disabled or the quality was dropped.
     pub fn retained_derivations(&self, quality: PathQuality) -> usize {
-        self.path_qualities
-            .dominating_quality(quality)
-            .map_or(0, |quality| self.witnesses.ids(quality).len())
+        retained_derivation_count(self.path_qualities, &self.witnesses, quality)
     }
 
     fn retained_bytes(&self) -> usize {
-        self.witnesses.retained_bytes()
+        self.witnesses
+            .retained_bytes()
+            .saturating_add(self.entry.retained_context_bytes())
     }
 }
 
@@ -201,10 +244,10 @@ impl SummaryEntryTransfer {
         origin: CallSiteHandle,
         path_qualities: PathQualityFrontier,
     ) -> Self {
-        debug_assert_eq!(
+        debug_assert_point_procedure(
             source.procedure(),
-            call_point.procedure(),
-            "an entry transfer call point must belong to its source procedure"
+            &call_point,
+            "an entry transfer call point must belong to its source procedure",
         );
         Self {
             source,
@@ -266,10 +309,10 @@ impl SummaryIncomingCall {
         witnesses: WitnessAlternatives,
         witness_owner: Option<Arc<()>>,
     ) -> Self {
-        debug_assert_eq!(
+        debug_assert_point_procedure(
             caller.procedure(),
-            call_point.procedure(),
-            "an incoming call site must belong to its caller entry procedure"
+            &call_point,
+            "an incoming call site must belong to its caller entry procedure",
         );
         Self {
             callee,
@@ -310,13 +353,14 @@ impl SummaryIncomingCall {
     /// How many distinct caller-relative derivations of this call the solve
     /// retained for `quality`. See [`SummaryReachedFact::retained_derivations`].
     pub fn retained_derivations(&self, quality: PathQuality) -> usize {
-        self.path_qualities
-            .dominating_quality(quality)
-            .map_or(0, |quality| self.witnesses.ids(quality).len())
+        retained_derivation_count(self.path_qualities, &self.witnesses, quality)
     }
 
     fn retained_bytes(&self) -> usize {
-        self.witnesses.retained_bytes()
+        self.witnesses
+            .retained_bytes()
+            .saturating_add(self.callee.retained_context_bytes())
+            .saturating_add(self.caller.retained_context_bytes())
     }
 }
 
@@ -354,10 +398,10 @@ impl TabulationEndSummary {
         witnesses: WitnessAlternatives,
         witness_owner: Option<Arc<()>>,
     ) -> Self {
-        debug_assert_eq!(
+        debug_assert_point_procedure(
             entry.procedure(),
-            exit.callee_exit().procedure(),
-            "summary exit must belong to its entry procedure"
+            exit.callee_exit(),
+            "summary exit must belong to its entry procedure",
         );
         debug_assert_eq!(
             entry.entry_point(),
@@ -399,7 +443,9 @@ impl TabulationEndSummary {
     }
 
     fn retained_bytes(&self) -> usize {
-        self.witnesses.retained_bytes()
+        self.witnesses
+            .retained_bytes()
+            .saturating_add(self.entry.retained_context_bytes())
     }
 }
 
@@ -410,6 +456,7 @@ impl TabulationEndSummary {
 /// retains exact proof and completeness details as well as topology.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SummaryEdge {
+    call_context: OracleCallContext,
     kind: IcfgEdgeKind,
     origin: Option<CallSiteHandle>,
     source: ProgramPointHandle,
@@ -420,8 +467,12 @@ pub struct SummaryEdge {
 }
 
 impl SummaryEdge {
-    pub(crate) fn from_procedure_edge(edge: &ProcedureIcfgEdge) -> Self {
+    pub(crate) fn from_procedure_edge(
+        edge: &ProcedureIcfgEdge,
+        call_context: &OracleCallContext,
+    ) -> Self {
         Self {
+            call_context: call_context.clone(),
             kind: edge.kind,
             origin: edge.origin.clone(),
             source: edge.source.clone(),
@@ -432,8 +483,12 @@ impl SummaryEdge {
         }
     }
 
-    pub(crate) fn from_owned_procedure_edge(edge: ProcedureIcfgEdge) -> Self {
+    pub(crate) fn from_owned_procedure_edge(
+        edge: ProcedureIcfgEdge,
+        call_context: &OracleCallContext,
+    ) -> Self {
         Self {
+            call_context: call_context.clone(),
             kind: edge.kind,
             origin: edge.origin,
             source: edge.source,
@@ -444,18 +499,27 @@ impl SummaryEdge {
         }
     }
 
-    pub(crate) fn from_matched_return(edge: ProcedureIcfgEdge, implicit_abort_only: bool) -> Self {
+    pub(crate) fn from_matched_return(
+        edge: ProcedureIcfgEdge,
+        implicit_abort_only: bool,
+        call_context: &OracleCallContext,
+    ) -> Self {
         debug_assert!(
             !implicit_abort_only || edge.kind == IcfgEdgeKind::ExceptionalReturn,
             "only an exceptional return can carry an implicit-abort-only weakening"
         );
-        let mut result = Self::from_owned_procedure_edge(edge);
+        let mut result = Self::from_owned_procedure_edge(edge, call_context);
         result.implicit_abort_only = implicit_abort_only;
         result
     }
 
     pub const fn kind(&self) -> IcfgEdgeKind {
         self.kind
+    }
+
+    /// Exact bounded caller suffix under which this edge was observed.
+    pub const fn call_context(&self) -> &OracleCallContext {
+        &self.call_context
     }
 
     pub const fn origin(&self) -> Option<&CallSiteHandle> {
@@ -483,9 +547,10 @@ impl SummaryEdge {
     }
 
     fn retained_heap_bytes(&self) -> usize {
-        self.proof
-            .retained_heap_bytes()
-            .saturating_add(self.completeness.retained_heap_bytes())
+        retained_context_bytes(&self.call_context).saturating_add(super::retained_evidence_bytes(
+            Some(&self.proof),
+            Some(&self.completeness),
+        ))
     }
 }
 
@@ -519,6 +584,7 @@ impl From<IcfgBoundaryKind> for SummaryBoundaryKind {
 /// bounded-snapshot node ID.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SummaryBoundary {
+    call_context: OracleCallContext,
     at: ProgramPointHandle,
     origin: Option<CallSiteHandle>,
     kind: SummaryBoundaryKind,
@@ -532,8 +598,10 @@ impl SummaryBoundary {
         at: ProgramPointHandle,
         origin: Option<CallSiteHandle>,
         kind: SummaryBoundaryKind,
+        call_context: &OracleCallContext,
     ) -> Self {
         Self {
+            call_context: call_context.clone(),
             at,
             origin,
             kind,
@@ -547,8 +615,10 @@ impl SummaryBoundary {
         at: ProgramPointHandle,
         origin: CallSiteHandle,
         dispatch: &DispatchBoundary,
+        call_context: &OracleCallContext,
     ) -> Self {
         Self {
+            call_context: call_context.clone(),
             at,
             origin: Some(origin),
             kind: SummaryBoundaryKind::Dispatch(dispatch.kind.clone()),
@@ -558,8 +628,21 @@ impl SummaryBoundary {
         }
     }
 
-    pub(crate) fn from_procedure_boundary(boundary: ProcedureIcfgBoundary) -> Self {
-        Self::new(boundary.at, boundary.origin, boundary.kind.into())
+    pub(crate) fn from_procedure_boundary(
+        boundary: ProcedureIcfgBoundary,
+        call_context: &OracleCallContext,
+    ) -> Self {
+        Self::new(
+            boundary.at,
+            boundary.origin,
+            boundary.kind.into(),
+            call_context,
+        )
+    }
+
+    /// Exact bounded caller suffix under which this boundary was observed.
+    pub const fn call_context(&self) -> &OracleCallContext {
+        &self.call_context
     }
 
     pub const fn at(&self) -> &ProgramPointHandle {
@@ -591,14 +674,11 @@ impl SummaryBoundary {
     }
 
     fn retained_heap_bytes(&self) -> usize {
-        self.proof
-            .as_ref()
-            .map_or(0, ProofStatus::retained_heap_bytes)
-            .saturating_add(
-                self.completeness
-                    .as_ref()
-                    .map_or(0, EvidenceCompleteness::retained_heap_bytes),
-            )
+        retained_context_bytes(&self.call_context)
+            .saturating_add(super::retained_evidence_bytes(
+                self.proof.as_ref(),
+                self.completeness.as_ref(),
+            ))
             .saturating_add(size_of_val(self.provenance()))
             .saturating_add(summary_boundary_kind_heap_bytes(&self.kind))
     }
@@ -805,12 +885,30 @@ impl<Fact> SummaryDataflowResult<Fact> {
         }
     }
 
+    /// A client refinement publishes its own witnesses. Keep discovery coverage
+    /// and facts, but retire the superseded proof graph so callers cannot
+    /// reconstruct an unfiltered witness from the refined report.
+    pub(crate) fn without_witnesses(mut self) -> Self {
+        for row in &mut self.reached {
+            row.witnesses = WitnessAlternatives::default();
+            row.witness_owner = None;
+        }
+        for row in &mut self.end_summaries {
+            row.witnesses = WitnessAlternatives::default();
+            row.witness_owner = None;
+        }
+        self.incoming_calls = Box::default();
+        self.witness_store =
+            super::WitnessArena::new(super::WitnessRetentionLimits::disabled()).into_store();
+        self
+    }
+
     pub fn facts(&self) -> &[Fact] {
         &self.facts
     }
 
     pub fn fact(&self, id: FactId) -> Option<&Fact> {
-        self.facts.get(id.index())
+        super::fact_by_id(&self.facts, id)
     }
 
     pub fn reached(&self) -> &[SummaryReachedFact] {
@@ -855,6 +953,10 @@ impl<Fact> SummaryDataflowResult<Fact> {
 
     pub const fn termination(&self) -> SolverTermination {
         self.termination
+    }
+
+    pub(crate) fn set_query_work(&mut self, work: SolverWork) {
+        self.work = work;
     }
 
     pub const fn work(&self) -> SolverWork {
@@ -909,6 +1011,16 @@ impl<Fact> SummaryDataflowResult<Fact> {
                 self.end_summaries
                     .iter()
                     .map(TabulationEndSummary::retained_bytes)
+                    .fold(0_usize, usize::saturating_add),
+            )
+            .saturating_add(
+                self.entry_transfers
+                    .iter()
+                    .map(|row| {
+                        row.source
+                            .retained_context_bytes()
+                            .saturating_add(row.target.retained_context_bytes())
+                    })
                     .fold(0_usize, usize::saturating_add),
             )
             .saturating_add(size_of_val(self.incoming_calls()))
@@ -996,25 +1108,9 @@ impl<Fact> SummaryDataflowResult<Fact> {
         // ask for a quality the row holds only in a dominating form. The
         // dominating quality's concrete path witnesses the weaker claim
         // (#1917).
-        let Some(quality) = reached.path_qualities.dominating_quality(quality) else {
-            return Err(SummaryWitnessError::QualityNotRetained(quality));
-        };
-        let derivations = reached.witnesses.ids(quality);
-        debug_assert!(
-            derivation == 0 || derivation < derivations.len(),
-            "a derivation index past the retained alternatives is a caller error"
-        );
-        let Some(evidence) = derivations.get(derivation).copied() else {
-            return if self.witness_retention_truncated {
-                Ok(SummaryWitness::retention_truncated_marker(quality))
-            } else {
-                Err(SummaryWitnessError::RetentionDisabled)
-            };
-        };
-        self.witness_store.reconstruct(
-            evidence,
+        self.reconstruct_witness(
+            reached.path_qualities,
             quality,
-            reached.witnesses.is_truncated(quality),
             limits,
             WitnessTarget::Reached {
                 entry_point: reached.entry.entry_point(),
@@ -1022,6 +1118,15 @@ impl<Fact> SummaryDataflowResult<Fact> {
                 point: reached.point(),
                 fact: reached.fact(),
             },
+            |quality| {
+                let derivations = reached.witnesses.ids(quality);
+                debug_assert!(
+                    derivation == 0 || derivation < derivations.len(),
+                    "a derivation index past the retained alternatives is a caller error"
+                );
+                derivations.get(derivation).copied()
+            },
+            |quality| reached.witnesses.is_truncated(quality),
         )
     }
 
@@ -1060,25 +1165,9 @@ impl<Fact> SummaryDataflowResult<Fact> {
             })
             .ok_or(SummaryWitnessError::TargetNotInResult)?;
         // Same dominance rule as `witness_for_reached_index` (#1917).
-        let Some(quality) = incoming.path_qualities.dominating_quality(quality) else {
-            return Err(SummaryWitnessError::QualityNotRetained(quality));
-        };
-        let derivations = incoming.witnesses.ids(quality);
-        debug_assert!(
-            derivation == 0 || derivation < derivations.len(),
-            "a derivation index past the retained alternatives is a caller error"
-        );
-        let Some(evidence) = derivations.get(derivation).copied() else {
-            return if self.witness_retention_truncated {
-                Ok(SummaryWitness::retention_truncated_marker(quality))
-            } else {
-                Err(SummaryWitnessError::RetentionDisabled)
-            };
-        };
-        self.witness_store.reconstruct(
-            evidence,
+        self.reconstruct_witness(
+            incoming.path_qualities,
             quality,
-            incoming.witnesses.is_truncated(quality),
             limits,
             WitnessTarget::Reached {
                 entry_point: incoming.caller.entry_point(),
@@ -1086,6 +1175,15 @@ impl<Fact> SummaryDataflowResult<Fact> {
                 point: incoming.callee.entry_point(),
                 fact: incoming.callee.entry_fact(),
             },
+            |quality| {
+                let derivations = incoming.witnesses.ids(quality);
+                debug_assert!(
+                    derivation == 0 || derivation < derivations.len(),
+                    "a derivation index past the retained alternatives is a caller error"
+                );
+                derivations.get(derivation).copied()
+            },
+            |quality| incoming.witnesses.is_truncated(quality),
         )
     }
 
@@ -1109,20 +1207,9 @@ impl<Fact> SummaryDataflowResult<Fact> {
         // Same dominance rule as `witness_for_reached_index` (#1917): a
         // caller's conjoined quality may be weaker than any locally retained
         // one, and a dominating retained path witnesses the weaker claim.
-        let Some(quality) = summary.path_qualities.dominating_quality(quality) else {
-            return Err(SummaryWitnessError::QualityNotRetained(quality));
-        };
-        let Some(evidence) = summary.witnesses.first(quality) else {
-            return if self.witness_retention_truncated {
-                Ok(SummaryWitness::retention_truncated_marker(quality))
-            } else {
-                Err(SummaryWitnessError::RetentionDisabled)
-            };
-        };
-        self.witness_store.reconstruct(
-            evidence,
+        self.reconstruct_witness(
+            summary.path_qualities,
             quality,
-            summary.witnesses.is_truncated(quality),
             limits,
             WitnessTarget::EndSummary {
                 entry_point: summary.entry.entry_point(),
@@ -1130,7 +1217,32 @@ impl<Fact> SummaryDataflowResult<Fact> {
                 exit: summary.exit(),
                 exit_fact: summary.exit_fact(),
             },
+            |quality| summary.witnesses.first(quality),
+            |quality| summary.witnesses.is_truncated(quality),
         )
+    }
+
+    fn reconstruct_witness(
+        &self,
+        path_qualities: PathQualityFrontier,
+        requested_quality: PathQuality,
+        limits: WitnessReconstructionLimits,
+        target: WitnessTarget<'_>,
+        evidence_for: impl FnOnce(PathQuality) -> Option<WitnessEvidenceId>,
+        truncated_for: impl FnOnce(PathQuality) -> bool,
+    ) -> Result<SummaryWitness, SummaryWitnessError> {
+        let Some(quality) = path_qualities.dominating_quality(requested_quality) else {
+            return Err(SummaryWitnessError::QualityNotRetained(requested_quality));
+        };
+        let Some(evidence) = evidence_for(quality) else {
+            return if self.witness_retention_truncated {
+                Ok(SummaryWitness::retention_truncated_marker(quality))
+            } else {
+                Err(SummaryWitnessError::RetentionDisabled)
+            };
+        };
+        self.witness_store
+            .reconstruct(evidence, quality, truncated_for(quality), limits, target)
     }
 }
 
@@ -1207,45 +1319,6 @@ impl From<SemanticProviderError> for SummaryDataflowError {
     }
 }
 
-fn compare_procedures(left: &ProcedureHandle, right: &ProcedureHandle) -> Ordering {
-    left.artifact()
-        .key()
-        .cmp(right.artifact().key())
-        .then_with(|| left.semantics().locator().cmp(right.semantics().locator()))
-        .then_with(|| left.id().cmp(&right.id()))
-        .then_with(|| {
-            std::sync::Arc::as_ptr(left.artifact())
-                .cast::<()>()
-                .cmp(&std::sync::Arc::as_ptr(right.artifact()).cast::<()>())
-        })
-}
-
-fn compare_points(left: &ProgramPointHandle, right: &ProgramPointHandle) -> Ordering {
-    compare_procedures(left.procedure(), right.procedure()).then_with(|| left.id().cmp(&right.id()))
-}
-
-fn compare_call_sites(left: &CallSiteHandle, right: &CallSiteHandle) -> Ordering {
-    compare_procedures(left.procedure(), right.procedure()).then_with(|| left.id().cmp(&right.id()))
-}
-
-fn compare_optional_call_sites(
-    left: Option<&CallSiteHandle>,
-    right: Option<&CallSiteHandle>,
-) -> Ordering {
-    match (left, right) {
-        (None, None) => Ordering::Equal,
-        (None, Some(_)) => Ordering::Less,
-        (Some(_), None) => Ordering::Greater,
-        (Some(left), Some(right)) => compare_call_sites(left, right),
-    }
-}
-
-fn compare_entries(left: &SummaryEntry, right: &SummaryEntry) -> Ordering {
-    compare_procedures(left.procedure(), right.procedure())
-        .then_with(|| left.entry_point().id().cmp(&right.entry_point().id()))
-        .then_with(|| left.entry_fact().cmp(&right.entry_fact()))
-}
-
 fn compare_reached_facts(left: &SummaryReachedFact, right: &SummaryReachedFact) -> Ordering {
     compare_entries(left.entry(), right.entry())
         .then_with(|| left.point().id().cmp(&right.point().id()))
@@ -1254,7 +1327,9 @@ fn compare_reached_facts(left: &SummaryReachedFact, right: &SummaryReachedFact) 
 
 fn compare_end_summaries(left: &TabulationEndSummary, right: &TabulationEndSummary) -> Ordering {
     compare_entries(left.entry(), right.entry())
-        .then_with(|| return_kind_rank(left.exit_kind()).cmp(&return_kind_rank(right.exit_kind())))
+        .then_with(|| {
+            return_kind_ordinal(left.exit_kind()).cmp(&return_kind_ordinal(right.exit_kind()))
+        })
         .then_with(|| left.exit_point().id().cmp(&right.exit_point().id()))
         .then_with(|| left.exit_fact().cmp(&right.exit_fact()))
 }
@@ -1289,93 +1364,29 @@ fn compare_entry_transfers(left: &SummaryEntryTransfer, right: &SummaryEntryTran
 fn compare_summary_edges(left: &SummaryEdge, right: &SummaryEdge) -> Ordering {
     compare_points(left.source(), right.source())
         .then_with(|| compare_points(left.target(), right.target()))
-        .then_with(|| edge_kind_key(left.kind()).cmp(&edge_kind_key(right.kind())))
+        .then_with(|| left.kind().sort_key().cmp(&right.kind().sort_key()))
         .then_with(|| compare_optional_call_sites(left.origin(), right.origin()))
+        .then_with(|| compare_call_contexts(left.call_context(), right.call_context()))
         .then_with(|| compare_proof(left.proof(), right.proof()))
         .then_with(|| compare_completeness(left.completeness(), right.completeness()))
         .then_with(|| left.implicit_abort_only().cmp(&right.implicit_abort_only()))
-}
-
-fn compare_proof(left: &ProofStatus, right: &ProofStatus) -> Ordering {
-    match (left, right) {
-        (ProofStatus::Proven, ProofStatus::Proven) => Ordering::Equal,
-        (ProofStatus::Proven, ProofStatus::Unproven(_)) => Ordering::Less,
-        (ProofStatus::Unproven(_), ProofStatus::Proven) => Ordering::Greater,
-        (ProofStatus::Unproven(left), ProofStatus::Unproven(right)) => left.cmp(right),
-    }
-}
-
-fn compare_completeness(left: &EvidenceCompleteness, right: &EvidenceCompleteness) -> Ordering {
-    match (left, right) {
-        (EvidenceCompleteness::Complete, EvidenceCompleteness::Complete) => Ordering::Equal,
-        (EvidenceCompleteness::Complete, EvidenceCompleteness::Partial(_)) => Ordering::Less,
-        (EvidenceCompleteness::Partial(_), EvidenceCompleteness::Complete) => Ordering::Greater,
-        (EvidenceCompleteness::Partial(left), EvidenceCompleteness::Partial(right)) => {
-            left.cmp(right)
-        }
-    }
 }
 
 fn compare_summary_boundaries(left: &SummaryBoundary, right: &SummaryBoundary) -> Ordering {
     compare_points(left.at(), right.at())
         .then_with(|| compare_optional_call_sites(left.origin(), right.origin()))
         .then_with(|| compare_boundary_kinds(left.kind(), right.kind()))
-        .then_with(|| compare_optional_proof(left.proof(), right.proof()))
-        .then_with(|| compare_optional_completeness(left.completeness(), right.completeness()))
-        .then_with(|| compare_relation_provenance(left.provenance(), right.provenance()))
-}
-
-fn compare_optional_proof(left: Option<&ProofStatus>, right: Option<&ProofStatus>) -> Ordering {
-    match (left, right) {
-        (None, None) => Ordering::Equal,
-        (None, Some(_)) => Ordering::Less,
-        (Some(_), None) => Ordering::Greater,
-        (Some(left), Some(right)) => compare_proof(left, right),
-    }
-}
-
-fn compare_optional_completeness(
-    left: Option<&EvidenceCompleteness>,
-    right: Option<&EvidenceCompleteness>,
-) -> Ordering {
-    match (left, right) {
-        (None, None) => Ordering::Equal,
-        (None, Some(_)) => Ordering::Less,
-        (Some(_), None) => Ordering::Greater,
-        (Some(left), Some(right)) => compare_completeness(left, right),
-    }
-}
-
-fn edge_kind_key(kind: IcfgEdgeKind) -> (u8, u8) {
-    match kind {
-        IcfgEdgeKind::Intraprocedural(kind) => (0, control_edge_kind_rank(kind)),
-        IcfgEdgeKind::Call => (1, 0),
-        IcfgEdgeKind::NormalReturn => (2, 0),
-        IcfgEdgeKind::ExceptionalReturn => (3, 0),
-        IcfgEdgeKind::CallToNormalContinuation => (4, 0),
-        IcfgEdgeKind::CallToExceptionalContinuation => (5, 0),
-    }
-}
-
-fn control_edge_kind_rank(kind: ControlEdgeKind) -> u8 {
-    match kind {
-        ControlEdgeKind::Normal => 0,
-        ControlEdgeKind::ConditionalTrue => 1,
-        ControlEdgeKind::ConditionalFalse => 2,
-        ControlEdgeKind::SwitchCase => 3,
-        ControlEdgeKind::LoopBack => 4,
-        ControlEdgeKind::Exceptional => 5,
-        ControlEdgeKind::Cleanup => 6,
-        ControlEdgeKind::AsyncNormal => 7,
-        ControlEdgeKind::AsyncExceptional => 8,
-    }
-}
-
-fn return_kind_rank(kind: ReturnTransferKind) -> u8 {
-    match kind {
-        ReturnTransferKind::Normal => 0,
-        ReturnTransferKind::Exceptional => 1,
-    }
+        .then_with(|| compare_call_contexts(left.call_context(), right.call_context()))
+        .then_with(|| {
+            compare_boundary_evidence(
+                left.proof(),
+                left.completeness(),
+                left.provenance(),
+                right.proof(),
+                right.completeness(),
+                right.provenance(),
+            )
+        })
 }
 
 fn compare_boundary_kinds(left: &SummaryBoundaryKind, right: &SummaryBoundaryKind) -> Ordering {
@@ -1467,23 +1478,4 @@ fn continuation_kind_rank(kind: CallContinuationKind) -> u8 {
         CallContinuationKind::Normal => 0,
         CallContinuationKind::Exceptional => 1,
     }
-}
-
-fn compare_continuations(left: ControlContinuation, right: ControlContinuation) -> Ordering {
-    let rank = |state: ControlContinuation| match state {
-        ControlContinuation::Target(_) => 0,
-        ControlContinuation::Absent => 1,
-        ControlContinuation::Unknown => 2,
-        ControlContinuation::Unsupported => 3,
-        ControlContinuation::Unproven => 4,
-        ControlContinuation::ExceededBudget => 5,
-    };
-    rank(left)
-        .cmp(&rank(right))
-        .then_with(|| match (left, right) {
-            (ControlContinuation::Target(left), ControlContinuation::Target(right)) => {
-                left.cmp(&right)
-            }
-            _ => Ordering::Equal,
-        })
 }

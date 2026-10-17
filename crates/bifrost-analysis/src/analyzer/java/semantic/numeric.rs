@@ -94,12 +94,9 @@ pub(super) enum JavaFloatingType {
 
 impl JavaFloatingType {
     pub(super) fn from_type(type_node: Node<'_>) -> Option<Self> {
-        if type_node.kind() != "floating_point_type" || type_node.has_error() {
-            return None;
-        }
-        match type_node.child(0)?.kind() {
-            "float" => Some(Self::Float),
-            "double" => Some(Self::Double),
+        match crate::analyzer::java_integral_parameter::JavaScalarType::from_type(type_node)? {
+            crate::analyzer::java_integral_parameter::JavaScalarType::Float => Some(Self::Float),
+            crate::analyzer::java_integral_parameter::JavaScalarType::Double => Some(Self::Double),
             _ => None,
         }
     }

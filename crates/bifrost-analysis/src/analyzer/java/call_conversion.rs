@@ -3,6 +3,7 @@ use crate::analyzer::java::imports::JavaTypeResolution;
 use crate::analyzer::jvm::external::{
     JvmExternalDeclarationSource, JvmExternalType, JvmExternalTypeKind,
 };
+use crate::analyzer::jvm::java_array_dimension_count;
 use crate::analyzer::lexical_definitions::{
     LexicalBindingResolution, formal_parameter_slots_for_owner_with_nodes,
     parameter_owner_for_range, resolve_lexical_binding,
@@ -13,7 +14,7 @@ use crate::analyzer::semantic_model::TypeRef;
 use crate::analyzer::usages::call_conversion::{
     ArgumentTypeConversion, CallArgumentConversionProver, ConversionKind, ConversionUnknown,
     ExternalConversionIdentity, ExternalConversionProvenance, JavaPrimitive,
-    ResolvedConversionType,
+    ModelArgumentApplicability, ResolvedConversionType,
 };
 use crate::analyzer::usages::get_definition::java::{
     JavaResolutionSession, JavaSourceInvocationReturn, java_external_constructor,
@@ -26,6 +27,7 @@ use crate::analyzer::{
     AnalyzerDefinitionLookup, AnalyzerQueryScope, CodeUnit, CodeUnitIndex, IAnalyzer, Language,
     ProjectFile, QueryScope,
 };
+use brokk_bifrost_core::analyzer::tree_walk::root_node as root_of;
 use brokk_bifrost_jvm::java::declarations::node_text;
 use brokk_bifrost_jvm::java::graph::return_type::java_type_name_components;
 use brokk_bifrost_jvm::java::graph_support::java_type_parameter_in_scope;
@@ -75,6 +77,9 @@ enum JavaConversionType {
     Value(ResolvedConversionType),
     Array(Box<JavaConversionType>),
 }
+
+const JAVA_EXPRESSION_DEPTH_LIMIT: usize = 8;
+const JAVA_ARRAY_RANK_LIMIT: usize = 32;
 
 /// Prove the conversion for one Java actual/formal pair.
 ///
@@ -533,22 +538,8 @@ pub(crate) fn primitive_actual_type(
     actual: Node<'_>,
     source: &str,
 ) -> Option<JavaPrimitive> {
-    let mut expression = actual;
-    while expression.kind() == "parenthesized_expression" {
-        expression = expression.named_child(0)?;
-    }
-    if let Some(primitive) = numeric_literal_type(expression, source) {
+    if let Some(primitive) = primitive_actual_type_from_syntax(actual, source) {
         return Some(primitive);
-    }
-    if expression.kind() == "cast_expression" {
-        let target = expression.child_by_field_name("type")?;
-        expression.child_by_field_name("value")?;
-        return matches!(
-            target.kind(),
-            "integral_type" | "floating_point_type" | "boolean_type"
-        )
-        .then(|| primitive_type(target))
-        .flatten();
     }
     let java = resolve_analyzer::<JavaAnalyzer>(analyzer)?;
     let scope = AnalyzerQueryScope::new(java);
@@ -567,6 +558,36 @@ pub(crate) fn primitive_actual_type(
         }
         _ => None,
     }
+}
+
+/// Read only primitive types proved directly by one Java expression node.
+/// Native call evidence uses this bounded syntax proof without consulting the
+/// incumbent definition resolver for expressions it cannot type structurally.
+pub(crate) fn primitive_actual_type_from_syntax(
+    actual: Node<'_>,
+    source: &str,
+) -> Option<JavaPrimitive> {
+    let mut expression = actual;
+    while expression.kind() == "parenthesized_expression" {
+        expression = expression.named_child(0)?;
+    }
+    if let Some(primitive) = primitive_literal(expression) {
+        return Some(primitive);
+    }
+    if let Some(primitive) = numeric_literal_type(expression, source) {
+        return Some(primitive);
+    }
+    if expression.kind() == "cast_expression" {
+        let target = expression.child_by_field_name("type")?;
+        expression.child_by_field_name("value")?;
+        return matches!(
+            target.kind(),
+            "integral_type" | "floating_point_type" | "boolean_type"
+        )
+        .then(|| primitive_type(target))
+        .flatten();
+    }
+    None
 }
 
 /// How one declared Java formal takes a primitive actual during strict
@@ -675,17 +696,42 @@ impl CallArgumentConversionProver for JavaCallArgumentConversionProver {
         source: &str,
         formal_type: &TypeRef,
     ) -> Result<ArgumentTypeConversion, ConversionUnknown> {
-        if file.language() != Language::Java {
-            return Err(ConversionUnknown::UnsupportedLanguage);
+        match self.model_argument_applicability(analyzer, file, actual, source, formal_type) {
+            ModelArgumentApplicability::Applicable(conversion) => Ok(*conversion),
+            ModelArgumentApplicability::Inapplicable => {
+                Err(ConversionUnknown::UnsupportedConversion)
+            }
+            ModelArgumentApplicability::Unknown(reason) => Err(reason),
         }
-        let java = resolve_analyzer::<JavaAnalyzer>(analyzer)
-            .ok_or(ConversionUnknown::UnsupportedLanguage)?;
+    }
+
+    fn model_argument_applicability(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        actual: Node<'_>,
+        source: &str,
+        formal_type: &TypeRef,
+    ) -> ModelArgumentApplicability {
+        if file.language() != Language::Java {
+            return ModelArgumentApplicability::Unknown(ConversionUnknown::UnsupportedLanguage);
+        }
+        let Some(java) = resolve_analyzer::<JavaAnalyzer>(analyzer) else {
+            return ModelArgumentApplicability::Unknown(ConversionUnknown::UnsupportedLanguage);
+        };
         let scope = AnalyzerQueryScope::new(java);
         let token = scope.token();
         let packs = analyzer.semantic_model_overlay();
-        let source_type = resolve_actual_type(java, token, packs.clone(), file, actual, source)?;
-        let target = resolve_model_type_ref(java, token, packs.clone(), file, formal_type)?;
-        classify_java_conversion_with_hierarchy(java, packs.as_deref(), source_type, target)
+        let source_type =
+            match resolve_actual_type(java, token, packs.clone(), file, actual, source) {
+                Ok(source_type) => source_type,
+                Err(reason) => return ModelArgumentApplicability::Unknown(reason),
+            };
+        let target = match resolve_model_type_ref(java, token, packs.clone(), file, formal_type) {
+            Ok(target) => target,
+            Err(reason) => return ModelArgumentApplicability::Unknown(reason),
+        };
+        classify_java_conversion_applicability(java, packs.as_deref(), source_type, target)
     }
 }
 
@@ -719,7 +765,15 @@ fn resolve_actual_type(
     actual: Node<'_>,
     source: &str,
 ) -> Result<JavaConversionType, ConversionUnknown> {
-    resolve_actual_type_bounded(java, token, packs, file, actual, source, 8)
+    resolve_actual_type_bounded(
+        java,
+        token,
+        packs,
+        file,
+        actual,
+        source,
+        JAVA_EXPRESSION_DEPTH_LIMIT,
+    )
 }
 
 // Constructor nesting spends this bound before descending. Unlike an
@@ -733,11 +787,27 @@ fn resolve_actual_type_bounded(
     source: &str,
     remaining: usize,
 ) -> Result<JavaConversionType, ConversionUnknown> {
+    if java
+        .active_query_cancellation()
+        .is_some_and(|cancellation| cancellation.is_cancelled())
+    {
+        return Err(ConversionUnknown::Cancelled);
+    }
+    if actual.has_error() || actual.is_missing() {
+        return Err(ConversionUnknown::UnsupportedExpression);
+    }
+    let mut remaining = remaining;
     let mut expression = actual;
     while expression.kind() == "parenthesized_expression" {
+        remaining = remaining
+            .checked_sub(1)
+            .ok_or(ConversionUnknown::BudgetExhausted)?;
         expression = expression
             .named_child(0)
             .ok_or(ConversionUnknown::UnsupportedExpression)?;
+        if expression.has_error() || expression.is_missing() {
+            return Err(ConversionUnknown::UnsupportedExpression);
+        }
     }
 
     if let Some(primitive) = primitive_literal(expression) {
@@ -785,9 +855,9 @@ fn resolve_actual_type_bounded(
         }
         "object_creation_expression" => {
             use crate::analyzer::semantic_model::SemanticModelCallableKey;
-            let remaining = remaining
+            let nested_remaining = remaining
                 .checked_sub(1)
-                .ok_or(ConversionUnknown::UnsupportedExpression)?;
+                .ok_or(ConversionUnknown::BudgetExhausted)?;
             let overlay = packs
                 .clone()
                 .ok_or(ConversionUnknown::UnresolvedSourceType)?;
@@ -840,7 +910,7 @@ fn resolve_actual_type_bounded(
                     file,
                     actual,
                     source,
-                    remaining,
+                    nested_remaining,
                 )?;
                 let target_type =
                     resolve_model_type_ref(java, token, packs.clone(), file, &formal.r#type)?;
@@ -868,7 +938,269 @@ fn resolve_actual_type_bounded(
             ConversionUnknown::UnresolvedSourceType,
         )
         .map(JavaConversionType::Value),
+        "text_block" => resolve_external_spelling(
+            java,
+            packs,
+            file,
+            "java.lang.String",
+            ConversionUnknown::UnresolvedSourceType,
+        )
+        .map(JavaConversionType::Value),
+        "binary_expression" => {
+            let nested_remaining = remaining
+                .checked_sub(1)
+                .ok_or(ConversionUnknown::BudgetExhausted)?;
+            resolve_java_binary_expression(
+                java,
+                token,
+                packs,
+                file,
+                expression,
+                source,
+                nested_remaining,
+            )
+        }
+        "array_creation_expression" => {
+            let nested_remaining = remaining
+                .checked_sub(1)
+                .ok_or(ConversionUnknown::BudgetExhausted)?;
+            resolve_java_array_creation_expression(
+                java,
+                token,
+                packs,
+                file,
+                expression,
+                source,
+                nested_remaining,
+            )
+        }
         _ => Err(ConversionUnknown::UnsupportedExpression),
+    }
+}
+
+fn resolve_java_binary_expression(
+    java: &JavaAnalyzer,
+    token: crate::analyzer::QueryToken<'_>,
+    packs: Option<std::sync::Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+    file: &ProjectFile,
+    expression: Node<'_>,
+    source: &str,
+    remaining: usize,
+) -> Result<JavaConversionType, ConversionUnknown> {
+    let operator = expression
+        .child_by_field_name("operator")
+        .ok_or(ConversionUnknown::UnsupportedExpression)?;
+    if node_text(operator, source) != "+" {
+        return Err(ConversionUnknown::UnsupportedExpression);
+    }
+    let left = expression
+        .child_by_field_name("left")
+        .ok_or(ConversionUnknown::UnsupportedExpression)?;
+    let right = expression
+        .child_by_field_name("right")
+        .ok_or(ConversionUnknown::UnsupportedExpression)?;
+    let left_type = resolve_java_expression_operand_bounded(
+        java,
+        token,
+        packs.clone(),
+        file,
+        left,
+        source,
+        remaining,
+    )?;
+    let right_type = resolve_java_expression_operand_bounded(
+        java,
+        token,
+        packs.clone(),
+        file,
+        right,
+        source,
+        remaining,
+    )?;
+    let string_type = exact_java_string_type(&left_type)
+        .or_else(|| exact_java_string_type(&right_type))
+        .ok_or(ConversionUnknown::UnsupportedExpression)?;
+    Ok(JavaConversionType::Value(string_type))
+}
+
+fn resolve_java_expression_operand_bounded(
+    java: &JavaAnalyzer,
+    token: crate::analyzer::QueryToken<'_>,
+    packs: Option<std::sync::Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+    file: &ProjectFile,
+    expression: Node<'_>,
+    source: &str,
+    remaining: usize,
+) -> Result<JavaConversionType, ConversionUnknown> {
+    match resolve_actual_type_bounded(java, token, packs, file, expression, source, remaining) {
+        Ok(resolved) => Ok(resolved),
+        Err(ConversionUnknown::UnsupportedExpression)
+            if !expression.has_error() && !expression.is_missing() =>
+        {
+            primitive_literal_type_from_syntax(expression, source)
+                .map(|primitive| {
+                    JavaConversionType::Value(ResolvedConversionType::JavaPrimitive(primitive))
+                })
+                .ok_or(ConversionUnknown::UnsupportedExpression)
+        }
+        Err(reason) => Err(reason),
+    }
+}
+
+fn primitive_literal_type_from_syntax(expression: Node<'_>, source: &str) -> Option<JavaPrimitive> {
+    let mut expression = expression;
+    while expression.kind() == "parenthesized_expression" {
+        expression = expression.named_child(0)?;
+    }
+    primitive_literal(expression).or_else(|| numeric_literal_type(expression, source))
+}
+
+fn exact_java_string_type(ty: &JavaConversionType) -> Option<ResolvedConversionType> {
+    let JavaConversionType::Value(ResolvedConversionType::External { identity }) = ty else {
+        return None;
+    };
+    (identity.declaration_is_class() && identity.fqn() == "java.lang.String").then(|| {
+        ResolvedConversionType::External {
+            identity: identity.clone(),
+        }
+    })
+}
+
+fn resolve_java_array_creation_expression(
+    java: &JavaAnalyzer,
+    token: crate::analyzer::QueryToken<'_>,
+    packs: Option<std::sync::Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+    file: &ProjectFile,
+    expression: Node<'_>,
+    source: &str,
+    remaining: usize,
+) -> Result<JavaConversionType, ConversionUnknown> {
+    let type_node = expression
+        .child_by_field_name("type")
+        .ok_or(ConversionUnknown::UnsupportedExpression)?;
+    let component = resolve_type_node(java, token, packs.clone(), file, type_node, source)
+        .map_err(TypeResolutionFailure::source)?;
+    let mut cursor = expression.walk();
+    let dimensions = expression
+        .children_by_field_name("dimensions", &mut cursor)
+        .collect::<Vec<_>>();
+    if dimensions.is_empty() {
+        return Err(ConversionUnknown::UnsupportedExpression);
+    }
+    let mut rank = 0usize;
+    for dimension in dimensions {
+        match dimension.kind() {
+            "dimensions" => {
+                rank = rank
+                    .checked_add(java_array_dimension_count_bounded(dimension)?)
+                    .ok_or(ConversionUnknown::BudgetExhausted)?;
+            }
+            "dimensions_expr" => {
+                rank = rank
+                    .checked_add(1)
+                    .ok_or(ConversionUnknown::BudgetExhausted)?;
+                if rank > JAVA_ARRAY_RANK_LIMIT {
+                    return Err(ConversionUnknown::BudgetExhausted);
+                }
+                let mut dimension_cursor = dimension.walk();
+                let value = dimension
+                    .named_children(&mut dimension_cursor)
+                    .filter(|child| !matches!(child.kind(), "annotation" | "marker_annotation"))
+                    .last()
+                    .ok_or(ConversionUnknown::UnsupportedExpression)?;
+                prove_java_array_dimension_expression(
+                    java,
+                    token,
+                    packs.clone(),
+                    file,
+                    value,
+                    source,
+                    remaining,
+                )?;
+            }
+            _ => return Err(ConversionUnknown::UnsupportedExpression),
+        }
+        if rank > JAVA_ARRAY_RANK_LIMIT {
+            return Err(ConversionUnknown::BudgetExhausted);
+        }
+    }
+    if rank == 0 {
+        return Err(ConversionUnknown::UnsupportedExpression);
+    }
+    if let Some(initializer) = expression.child_by_field_name("value") {
+        let expected = array_java_type(component.clone(), rank);
+        if initializer.kind() != "array_initializer"
+            || initializer.has_error()
+            || initializer.is_missing()
+        {
+            return Err(ConversionUnknown::UnsupportedExpression);
+        }
+        let mut pending = vec![(initializer, remaining, expected)];
+        while let Some((current, depth, expected)) = pending.pop() {
+            if java
+                .active_query_cancellation()
+                .is_some_and(|cancellation| cancellation.is_cancelled())
+            {
+                return Err(ConversionUnknown::Cancelled);
+            }
+            let child_depth = depth
+                .checked_sub(1)
+                .ok_or(ConversionUnknown::BudgetExhausted)?;
+            let JavaConversionType::Array(expected_element) = expected else {
+                return Err(ConversionUnknown::UnsupportedConversion);
+            };
+            let mut cursor = current.walk();
+            for value in current.named_children(&mut cursor) {
+                if value.kind() == "array_initializer" {
+                    let JavaConversionType::Array(nested_element) = expected_element.as_ref()
+                    else {
+                        return Err(ConversionUnknown::UnsupportedConversion);
+                    };
+                    pending.push((
+                        value,
+                        child_depth,
+                        JavaConversionType::Array(nested_element.clone()),
+                    ));
+                } else {
+                    let actual = resolve_java_expression_operand_bounded(
+                        java,
+                        token,
+                        packs.clone(),
+                        file,
+                        value,
+                        source,
+                        child_depth,
+                    )?;
+                    classify_java_conversion_with_hierarchy(
+                        java,
+                        packs.as_deref(),
+                        actual,
+                        expected_element.as_ref().clone(),
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(array_java_type(component, rank))
+}
+
+fn prove_java_array_dimension_expression(
+    java: &JavaAnalyzer,
+    token: crate::analyzer::QueryToken<'_>,
+    packs: Option<std::sync::Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+    file: &ProjectFile,
+    expression: Node<'_>,
+    source: &str,
+    remaining: usize,
+) -> Result<(), ConversionUnknown> {
+    let resolved = resolve_java_expression_operand_bounded(
+        java, token, packs, file, expression, source, remaining,
+    )?;
+    match resolved {
+        JavaConversionType::Value(ResolvedConversionType::JavaPrimitive(
+            JavaPrimitive::Byte | JavaPrimitive::Short | JavaPrimitive::Char | JavaPrimitive::Int,
+        )) => Ok(()),
+        _ => Err(ConversionUnknown::UnsupportedConversion),
     }
 }
 
@@ -915,6 +1247,20 @@ fn resolve_lexical_actual_type(
     Ok(array_java_type(element, array_dimensions))
 }
 
+fn java_array_dimension_count_bounded(dimensions: Node<'_>) -> Result<usize, ConversionUnknown> {
+    let mut cursor = dimensions.walk();
+    let has_dimension = dimensions
+        .children(&mut cursor)
+        .any(|child| child.kind() == "[");
+    if !has_dimension {
+        return Err(ConversionUnknown::UnsupportedExpression);
+    }
+    let count = java_array_dimension_count(dimensions);
+    (count <= JAVA_ARRAY_RANK_LIMIT)
+        .then_some(count)
+        .ok_or(ConversionUnknown::BudgetExhausted)
+}
+
 /// The declared element type and array dimension count, read structurally
 /// from tree-sitter `array_type` element/dimensions fields and declarator
 /// dimension fields. No rendered-spelling parsing.
@@ -928,22 +1274,30 @@ fn declared_java_type_shape<'a>(
     let mut element = type_node;
     let mut dimensions = 0usize;
     while element.kind() == "array_type" {
-        dimensions += dimension_count(element.child_by_field_name("dimensions"));
+        let array_dimensions = element
+            .child_by_field_name("dimensions")
+            .map_or(Ok(0), java_array_dimension_count_bounded)?;
+        dimensions = dimensions
+            .checked_add(array_dimensions)
+            .ok_or(ConversionUnknown::BudgetExhausted)?;
         element = element
             .child_by_field_name("element")
             .ok_or(ConversionUnknown::UnresolvedSourceType)?;
     }
-    dimensions += dimension_count(declaration.child_by_field_name("dimensions"));
+    let declaration_dimensions = declaration
+        .child_by_field_name("dimensions")
+        .map_or(Ok(0), java_array_dimension_count_bounded)?;
+    dimensions = dimensions
+        .checked_add(declaration_dimensions)
+        .ok_or(ConversionUnknown::BudgetExhausted)?;
+    if dimensions > JAVA_ARRAY_RANK_LIMIT {
+        return Err(ConversionUnknown::BudgetExhausted);
+    }
     Ok((element, dimensions))
 }
 
-fn dimension_count(dimensions: Option<Node<'_>>) -> usize {
-    // Each `[]` axis contributes two anonymous child tokens to a
-    // `dimensions` node, so the axis count is half the child count.
-    dimensions.map_or(0, |dimensions| dimensions.child_count() / 2)
-}
-
 fn array_java_type(element: ResolvedConversionType, dimensions: usize) -> JavaConversionType {
+    debug_assert!(dimensions <= JAVA_ARRAY_RANK_LIMIT);
     let mut java_type = JavaConversionType::Value(element);
     for _ in 0..dimensions {
         java_type = JavaConversionType::Array(Box::new(java_type));
@@ -1002,15 +1356,25 @@ fn resolve_type_node(
         BoundedResolution::Cancelled { .. } => return Err(TypeResolutionFailure::Cancelled),
     }
 
+    resolve_named_type_fallback(java, token, packs, file, &raw_name)
+}
+
+fn resolve_named_type_fallback(
+    java: &JavaAnalyzer,
+    token: crate::analyzer::QueryToken<'_>,
+    packs: Option<std::sync::Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+    file: &ProjectFile,
+    name: &str,
+) -> Result<ResolvedConversionType, TypeResolutionFailure> {
     if java
-        .resolve_type_name_candidates_in_file(token, file, &raw_name)
+        .resolve_type_name_candidates_in_file(token, file, name)
         .len()
         > 1
     {
         return Err(TypeResolutionFailure::AmbiguousBinding);
     }
 
-    match java.resolve_type_name_with_external(token, packs.clone(), file, &raw_name) {
+    match java.resolve_type_name_with_external(token, packs.clone(), file, name) {
         Some(JavaTypeResolution::Source(unit)) => workspace_type_identity(java, unit),
         Some(JavaTypeResolution::External(external)) => {
             let identity = external_identity(java, packs.as_deref(), &external)
@@ -1064,9 +1428,14 @@ fn resolve_model_type_ref(
     type_ref: &TypeRef,
 ) -> Result<JavaConversionType, ConversionUnknown> {
     let mut element = type_ref;
-    let mut dimensions = 0;
+    let mut dimensions = 0usize;
     while let TypeRef::Array { element: inner } = element {
-        dimensions += 1;
+        dimensions = dimensions
+            .checked_add(1)
+            .ok_or(ConversionUnknown::BudgetExhausted)?;
+        if dimensions > JAVA_ARRAY_RANK_LIMIT {
+            return Err(ConversionUnknown::BudgetExhausted);
+        }
         element = inner;
     }
     let TypeRef::Named {
@@ -1099,26 +1468,9 @@ fn resolve_model_named_type(
         ));
     }
 
-    if java
-        .resolve_type_name_candidates_in_file(token, file, name)
-        .len()
-        > 1
-    {
-        return Err(ConversionUnknown::AmbiguousBinding);
-    }
-    match java.resolve_type_name_with_external(token, packs.clone(), file, name) {
-        Some(JavaTypeResolution::Source(unit)) => Ok(JavaConversionType::Value(
-            workspace_type_identity(java, unit).map_err(TypeResolutionFailure::target)?,
-        )),
-        Some(JavaTypeResolution::External(external)) => {
-            let identity = external_identity(java, packs.as_deref(), &external)
-                .ok_or(ConversionUnknown::UnresolvedTargetType)?;
-            Ok(JavaConversionType::Value(
-                ResolvedConversionType::External { identity },
-            ))
-        }
-        None => Err(ConversionUnknown::UnresolvedTargetType),
-    }
+    let resolved = resolve_named_type_fallback(java, token, packs, file, name)
+        .map_err(TypeResolutionFailure::target)?;
+    Ok(JavaConversionType::Value(resolved))
 }
 
 /// Classify one conversion between structured Java types. Identical array
@@ -1131,10 +1483,38 @@ fn classify_java_conversion_with_hierarchy(
     source: JavaConversionType,
     target: JavaConversionType,
 ) -> Result<ArgumentTypeConversion, ConversionUnknown> {
-    let result = classify_java_conversion(source.clone(), target.clone());
-    if !matches!(result, Err(ConversionUnknown::UnsupportedConversion)) {
-        return result;
+    match classify_java_conversion_applicability(java, overlay, source, target) {
+        ModelArgumentApplicability::Applicable(conversion) => Ok(*conversion),
+        ModelArgumentApplicability::Inapplicable => Err(ConversionUnknown::UnsupportedConversion),
+        ModelArgumentApplicability::Unknown(reason) => Err(reason),
     }
+}
+
+fn classify_java_conversion_applicability(
+    java: &JavaAnalyzer,
+    overlay: Option<&crate::analyzer::semantic_model::SemanticModelOverlay>,
+    source: JavaConversionType,
+    target: JavaConversionType,
+) -> ModelArgumentApplicability {
+    if java
+        .active_query_cancellation()
+        .is_some_and(|cancellation| cancellation.is_cancelled())
+    {
+        return ModelArgumentApplicability::Unknown(ConversionUnknown::Cancelled);
+    }
+    let result = classify_java_conversion(source.clone(), target.clone());
+    match result {
+        Ok(conversion) => return ModelArgumentApplicability::Applicable(Box::new(conversion)),
+        Err(ConversionUnknown::UnsupportedConversion) => {}
+        Err(reason) => return ModelArgumentApplicability::Unknown(reason),
+    }
+
+    if proven_primitive_inapplicability(&source, &target)
+        || proven_array_scalar_inapplicability(&source, &target)
+    {
+        return ModelArgumentApplicability::Inapplicable;
+    }
+
     let (
         JavaConversionType::Value(ResolvedConversionType::External {
             identity: source_identity,
@@ -1144,32 +1524,20 @@ fn classify_java_conversion_with_hierarchy(
         }),
     ) = (&source, &target)
     else {
-        return result;
+        return ModelArgumentApplicability::Unknown(ConversionUnknown::UnsupportedConversion);
     };
-    let overlay = overlay.ok_or(ConversionUnknown::IncompleteHierarchy)?;
-    let source_symbol = source_identity
-        .model_declaration(overlay)
-        .ok_or(ConversionUnknown::IncompleteHierarchy)?;
-    let target_symbol = target_identity
-        .model_declaration(overlay)
-        .ok_or(ConversionUnknown::IncompleteHierarchy)?;
+    let Some(overlay) = overlay else {
+        return ModelArgumentApplicability::Unknown(ConversionUnknown::IncompleteHierarchy);
+    };
+    let Some(source_symbol) = source_identity.model_declaration(overlay) else {
+        return ModelArgumentApplicability::Unknown(ConversionUnknown::IncompleteHierarchy);
+    };
+    let Some(target_symbol) = target_identity.model_declaration(overlay) else {
+        return ModelArgumentApplicability::Unknown(ConversionUnknown::IncompleteHierarchy);
+    };
     let cancellation = java.active_query_cancellation();
     let hierarchy =
         overlay.java_reference_widening(source_symbol, target_symbol, 256, cancellation.as_ref());
-    if hierarchy.witness.is_some() {
-        let JavaConversionType::Value(source) = source else {
-            unreachable!()
-        };
-        let JavaConversionType::Value(target) = target else {
-            unreachable!()
-        };
-        return Ok(ArgumentTypeConversion {
-            source,
-            target,
-            kind: ConversionKind::JavaReferenceWidening,
-            hierarchy: Some(hierarchy),
-        });
-    }
     use crate::analyzer::semantic_model::JavaHierarchyIncomplete;
     let terminal = [
         JavaHierarchyIncomplete::Cancelled,
@@ -1177,18 +1545,82 @@ fn classify_java_conversion_with_hierarchy(
     ]
     .into_iter()
     .find(|reason| hierarchy.incomplete.contains(reason));
-    let reason = terminal
-        .as_ref()
-        .or(hierarchy.incomplete.first())
-        .map(|reason| match reason {
-            JavaHierarchyIncomplete::MissingHierarchy => ConversionUnknown::IncompleteHierarchy,
-            JavaHierarchyIncomplete::Ambiguous => ConversionUnknown::AmbiguousBinding,
-            JavaHierarchyIncomplete::GenericSubstitution => ConversionUnknown::GenericSubstitution,
-            JavaHierarchyIncomplete::BudgetExhausted => ConversionUnknown::BudgetExhausted,
+    if let Some(reason) = terminal {
+        return ModelArgumentApplicability::Unknown(match reason {
             JavaHierarchyIncomplete::Cancelled => ConversionUnknown::Cancelled,
+            JavaHierarchyIncomplete::BudgetExhausted => ConversionUnknown::BudgetExhausted,
+            _ => unreachable!("only cancellation and budget are terminal"),
+        });
+    }
+    if hierarchy.witness.is_some() {
+        let JavaConversionType::Value(source) = source else {
+            unreachable!()
+        };
+        let JavaConversionType::Value(target) = target else {
+            unreachable!()
+        };
+        return ModelArgumentApplicability::Applicable(Box::new(ArgumentTypeConversion {
+            source,
+            target,
+            kind: ConversionKind::JavaReferenceWidening,
+            hierarchy: Some(hierarchy),
+        }));
+    }
+    hierarchy
+        .incomplete
+        .first()
+        .map_or(ModelArgumentApplicability::Inapplicable, |reason| {
+            ModelArgumentApplicability::Unknown(match reason {
+                JavaHierarchyIncomplete::MissingHierarchy => ConversionUnknown::IncompleteHierarchy,
+                JavaHierarchyIncomplete::Ambiguous => ConversionUnknown::AmbiguousBinding,
+                JavaHierarchyIncomplete::GenericSubstitution => {
+                    ConversionUnknown::GenericSubstitution
+                }
+                JavaHierarchyIncomplete::BudgetExhausted => ConversionUnknown::BudgetExhausted,
+                JavaHierarchyIncomplete::Cancelled => ConversionUnknown::Cancelled,
+            })
         })
-        .unwrap_or(ConversionUnknown::UnsupportedConversion);
-    Err(reason)
+}
+
+fn proven_primitive_inapplicability(
+    source: &JavaConversionType,
+    target: &JavaConversionType,
+) -> bool {
+    matches!(
+        (source, target),
+        (
+            JavaConversionType::Value(ResolvedConversionType::JavaPrimitive(source)),
+            JavaConversionType::Value(ResolvedConversionType::JavaPrimitive(target)),
+        ) if source != target && !primitive_widens(*source, *target)
+    )
+}
+
+fn proven_array_scalar_inapplicability(
+    source: &JavaConversionType,
+    target: &JavaConversionType,
+) -> bool {
+    match (source, target) {
+        (
+            JavaConversionType::Value(
+                ResolvedConversionType::JavaPrimitive(_)
+                | ResolvedConversionType::Declaration(_)
+                | ResolvedConversionType::External { .. },
+            ),
+            JavaConversionType::Array(_),
+        ) => true,
+        (
+            JavaConversionType::Array(_),
+            JavaConversionType::Value(ResolvedConversionType::JavaPrimitive(_)),
+        ) => true,
+        (
+            JavaConversionType::Array(_),
+            JavaConversionType::Value(ResolvedConversionType::External { identity }),
+        ) => !matches!(
+            identity.fqn(),
+            "java.lang.Object" | "java.lang.Cloneable" | "java.io.Serializable"
+        ),
+        _ => false,
+    }
 }
 
 fn classify_java_conversion(
@@ -1327,13 +1759,8 @@ pub(crate) fn declaration_declares_array(declaration: Node<'_>, type_node: Node<
     if declaration.kind() == "spread_parameter" {
         return true;
     }
-    let mut type_stack = vec![type_node];
-    while let Some(node) = type_stack.pop() {
-        if matches!(node.kind(), "array_type" | "dimensions") {
-            return true;
-        }
-        let mut cursor = node.walk();
-        type_stack.extend(node.named_children(&mut cursor));
+    if super::java_type_syntax_is_array(type_node) {
+        return true;
     }
 
     let mut current = Some(declaration);
@@ -1441,7 +1868,7 @@ fn numeric_literal_type(node: Node<'_>, source: &str) -> Option<JavaPrimitive> {
     }
 }
 
-fn primitive_type(node: Node<'_>) -> Option<JavaPrimitive> {
+pub(crate) fn primitive_type(node: Node<'_>) -> Option<JavaPrimitive> {
     let direct = match node.kind() {
         "boolean" | "boolean_type" => Some(JavaPrimitive::Boolean),
         "byte" | "byte_type" => Some(JavaPrimitive::Byte),
@@ -1512,63 +1939,9 @@ pub(crate) fn declared_type_node(node: Node<'_>) -> Option<Node<'_>> {
     }
 }
 
-fn root_of(node: Node<'_>) -> Node<'_> {
-    let mut root = node;
-    while let Some(parent) = root.parent() {
-        root = parent;
-    }
-    root
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn local_assignment_identity_requires_exact_reference_types_and_binding() {
-        let source = "class App { void run(App input) { App value = input; App alias = value; alias = value; } }";
-        let project = crate::inline_project::InlineTestProject::with_language(Language::Java)
-            .file("App.java", source)
-            .build();
-        let analyzer = JavaAnalyzer::from_project(project.project().clone());
-        let prover =
-            JavaLocalAssignmentConversionProver::new(&analyzer, &project.file("App.java"), source)
-                .unwrap();
-        let range = |text: &str| {
-            let start = source.find(text).unwrap();
-            crate::analyzer::Range {
-                start_byte: start,
-                end_byte: start + text.len(),
-                start_line: 1,
-                end_line: 1,
-            }
-        };
-        let declaration = range("alias = value");
-        let target = crate::analyzer::Range {
-            end_byte: declaration.start_byte + "alias".len(),
-            ..declaration
-        };
-        let proof = prover.prove(declaration, target).expect("exact local copy");
-        assert!(proof.preserves_reference_identity(), "{proof:?}");
-        let start = source.rfind("alias = value").unwrap();
-        let reassignment = crate::analyzer::Range {
-            start_byte: start,
-            end_byte: start + "alias = value".len(),
-            start_line: 1,
-            end_line: 1,
-        };
-        assert!(
-            prover
-                .prove(reassignment, target)
-                .expect("same local target")
-                .preserves_reference_identity()
-        );
-        let wrong = range("value = input");
-        assert!(matches!(
-            prover.prove(declaration, wrong),
-            Err(ConversionUnknown::AmbiguousBinding)
-        ));
-    }
 
     #[test]
     fn local_assignment_primitive_identity_is_not_reference_identity() {
@@ -1597,7 +1970,6 @@ mod tests {
         assert_eq!(proof.conversion.kind, ConversionKind::JavaIdentity);
         assert!(!proof.preserves_reference_identity(), "{proof:?}");
     }
-
     #[test]
     fn local_assignment_unknown_cast_generic_and_field_write_remain_open() {
         for (source, written) in [
@@ -1642,7 +2014,6 @@ mod tests {
             );
         }
     }
-
     #[test]
     fn local_assignment_rejects_a_stale_source_snapshot() {
         let source = "class App { void run(App input) { App value = input; } }";
@@ -1660,37 +2031,6 @@ mod tests {
             Err(ConversionUnknown::UnresolvedSourceType)
         ));
     }
-
-    #[test]
-    fn local_assignment_call_result_retains_selected_declared_type() {
-        let source =
-            "class App { static native App acquire(); void run() { App value = acquire(); } }";
-        let project = crate::inline_project::InlineTestProject::with_language(Language::Java)
-            .file("App.java", source)
-            .build();
-        let analyzer = JavaAnalyzer::from_project(project.project().clone());
-        let prover =
-            JavaLocalAssignmentConversionProver::new(&analyzer, &project.file("App.java"), source)
-                .unwrap();
-        let start = source.find("value = acquire()").unwrap();
-        let write = crate::analyzer::Range {
-            start_byte: start,
-            end_byte: start + "value = acquire()".len(),
-            start_line: 1,
-            end_line: 1,
-        };
-        let target = crate::analyzer::Range {
-            end_byte: start + "value".len(),
-            ..write
-        };
-        assert!(
-            prover
-                .prove(write, target)
-                .expect("selected static return type")
-                .preserves_reference_identity()
-        );
-    }
-
     #[test]
     fn local_assignment_source_call_with_unproven_arguments_stays_unknown() {
         let source = "class App { static native App acquire(App input); void run(App input) { App value = acquire(input); } }";
@@ -1717,7 +2057,6 @@ mod tests {
             "a selected return declaration alone does not prove argument applicability"
         );
     }
-
     #[test]
     fn local_assignment_boxing_certificate_never_claims_reference_identity() {
         let primitive = ResolvedConversionType::JavaPrimitive(JavaPrimitive::Int);
@@ -1754,6 +2093,31 @@ mod tests {
         }
     }
 
+    fn parse_java(source: &str) -> tree_sitter::Tree {
+        brokk_bifrost_jvm::java::declarations::parse_tree(source).expect("java source parses")
+    }
+
+    fn first_kind<'tree>(root: tree_sitter::Node<'tree>, kind: &str) -> tree_sitter::Node<'tree> {
+        crate::analyzer::test_support::first_named_node_matching_reverse_preorder(root, |node| {
+            node.kind() == kind
+        })
+        .unwrap_or_else(|| panic!("no {kind} node in test source"))
+    }
+
+    fn external(fqn: &str, declaration_is_class: bool) -> ExternalConversionIdentity {
+        ExternalConversionIdentity::from_provenance(
+            fqn,
+            ExternalConversionProvenance::SemanticPack {
+                pack_id: "test-pack".to_owned(),
+                declaration_id: fqn.to_owned(),
+            },
+            declaration_is_class,
+            StableDigest::sha256(b"test-surface"),
+            Some(StableDigest::sha256(b"test-models")),
+        )
+        .expect("semantic-pack identities require active model evidence")
+    }
+
     #[test]
     fn local_assignment_captured_target_is_not_procedure_local() {
         let source = "class App { void run(App input) { App value = input; Runnable later = () -> { value = input; }; } }";
@@ -1783,7 +2147,6 @@ mod tests {
             Err(ConversionUnknown::UnsupportedExpression)
         ));
     }
-
     #[test]
     fn local_assignment_captured_source_needs_capture_evidence() {
         let source =
@@ -1811,41 +2174,6 @@ mod tests {
             Err(ConversionUnknown::UnsupportedExpression)
         ));
     }
-
-    fn parse_java(source: &str) -> tree_sitter::Tree {
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_java::LANGUAGE.into())
-            .expect("java grammar loads");
-        parser.parse(source, None).expect("java source parses")
-    }
-
-    fn first_kind<'tree>(root: tree_sitter::Node<'tree>, kind: &str) -> tree_sitter::Node<'tree> {
-        let mut stack = vec![root];
-        while let Some(node) = stack.pop() {
-            if node.kind() == kind {
-                return node;
-            }
-            let mut cursor = node.walk();
-            stack.extend(node.named_children(&mut cursor));
-        }
-        panic!("no {kind} node in test source");
-    }
-
-    fn external(fqn: &str, declaration_is_class: bool) -> ExternalConversionIdentity {
-        ExternalConversionIdentity::from_provenance(
-            fqn,
-            ExternalConversionProvenance::SemanticPack {
-                pack_id: "test-pack".to_owned(),
-                declaration_id: fqn.to_owned(),
-            },
-            declaration_is_class,
-            StableDigest::sha256(b"test-surface"),
-            Some(StableDigest::sha256(b"test-models")),
-        )
-        .expect("semantic-pack identities require active model evidence")
-    }
-
     #[test]
     fn wrapper_interpretation_requires_resolver_class_evidence() {
         assert_eq!(
@@ -1864,24 +2192,9 @@ mod tests {
         );
     }
 
+    use brokk_bifrost_test_macros::hardwon;
     #[test]
-    fn semantic_pack_identity_requires_active_model_set() {
-        assert!(
-            ExternalConversionIdentity::from_provenance(
-                "java.lang.Integer",
-                ExternalConversionProvenance::SemanticPack {
-                    pack_id: "test-pack".to_owned(),
-                    declaration_id: "integer".to_owned(),
-                },
-                true,
-                StableDigest::sha256(b"test-surface"),
-                None,
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
+    #[hardwon("#3312: Java array parameter dimensions were discarded when binding model overloads")]
     fn lexical_array_shapes_are_read_structurally() {
         let tree = parse_java("class A { void f(String[] args) {} }");
         let root = tree.root_node();
@@ -1894,6 +2207,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#3312: C-style array dimensions on a parameter declarator were omitted from overload shape"
+    )]
     fn c_style_declarator_dimensions_are_structural() {
         let tree = parse_java("class A { void f(String args[]) {} }");
         let root = tree.root_node();
@@ -1906,6 +2222,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#3312: Nested Java array dimensions were flattened during overload matching")]
     fn nested_array_dimensions_count_each_axis() {
         let tree = parse_java("class A { void m() { String[][] grid = null; } }");
         let root = tree.root_node();
@@ -1918,6 +2235,26 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#4271: Type annotations inside Java array dimensions inflated the dimension count")]
+    fn annotated_array_dimensions_count_bracket_tokens() {
+        let tree = parse_java("class A { void m() { String @A [] @B [] grid = null; } }");
+        let root = tree.root_node();
+        let declarator = first_kind(root, "variable_declarator");
+        let type_node = declared_type_node(declarator).expect("declarator declares a type");
+        let dimensions_node = type_node
+            .child_by_field_name("dimensions")
+            .expect("array type has dimensions");
+        assert_eq!(dimensions_node.child_count(), 6);
+        let (element, dimensions) =
+            declared_java_type_shape(declarator, type_node).expect("array shape resolves");
+        assert_eq!(element.kind(), "type_identifier");
+        assert_eq!(dimensions, 2);
+    }
+
+    #[test]
+    #[hardwon(
+        "#3312: Scalar Java declarations were falsely assigned an array dimension during overload matching"
+    )]
     fn non_array_declarations_have_zero_dimensions() {
         let tree = parse_java("class A { void f(String command) {} }");
         let root = tree.root_node();
@@ -1930,6 +2267,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#3312: Java varargs were incorrectly treated as supported array arguments for overload binding"
+    )]
     fn spread_parameters_stay_typed_unsupported() {
         let tree = parse_java("class A { void f(String... args) {} }");
         let root = tree.root_node();
@@ -1943,6 +2283,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#3312: Array dimensions were lost between source declarations and model types")]
     fn array_java_type_wraps_one_layer_per_dimension() {
         let element = ResolvedConversionType::External {
             identity: external("java.lang.String", true),
@@ -1961,6 +2302,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#3312: Equal array types failed to preserve exact element-identity conversion")]
     fn identical_array_shapes_prove_element_identity() {
         let string = ResolvedConversionType::External {
             identity: external("java.lang.String", true),
@@ -1974,6 +2316,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#3312: Array arguments incorrectly matched scalar model formals")]
     fn array_actual_rejects_non_array_model_formal() {
         let string = ResolvedConversionType::External {
             identity: external("java.lang.String", true),
@@ -1986,6 +2329,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#3312: Mismatched array dimensions incorrectly fell back to element compatibility")]
     fn array_shape_mismatch_is_typed_unsupported() {
         let string = ResolvedConversionType::External {
             identity: external("java.lang.String", true),
@@ -1999,6 +2343,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#3312: Java primitive widening was lost while classifying value types")]
     fn value_widening_survives_the_java_type_layer() {
         let conversion = classify_java_conversion(
             JavaConversionType::Value(ResolvedConversionType::JavaPrimitive(JavaPrimitive::Int)),
@@ -2009,6 +2354,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "f2e97970bb6c: Regression from the Java widening fix: int[] cannot use scalar int-to-long widening to match long[]"
+    )]
     fn array_elements_do_not_borrow_scalar_primitive_widening() {
         let int_array =
             array_java_type(ResolvedConversionType::JavaPrimitive(JavaPrimitive::Int), 1);

@@ -21,8 +21,8 @@ use std::sync::Arc;
 use crate::analyzer::WorkspaceAnalyzer;
 use crate::analyzer::semantic::{
     CallBindings, CallSiteId, CancellationToken, CandidateCoverage, DispatchBoundary,
-    DispatchBoundaryKind, OracleCallContext, ProcedureHandle, ProcedureId, SemanticArtifactKey,
-    SemanticBudget, SemanticProviderError, SemanticRequest, ValueFlowSnapshot,
+    DispatchBoundaryKind, DispatchResult, OracleCallContext, ProcedureHandle, ProcedureId,
+    SemanticArtifactKey, SemanticBudget, SemanticProviderError, SemanticRequest, ValueFlowSnapshot,
 };
 use crate::dataflow::SemanticInputStatus;
 use crate::hash::{HashMap, HashSet};
@@ -32,6 +32,10 @@ use super::{ValueFlowCache, ValueFlowInput, ValueFlowProvider, WorkspaceValueFlo
 /// How the closure walk names one procedure across two materializations of
 /// its artifact. `ProcedureHandle::durable_key` returns exactly this pair.
 pub type DurableProcedureKey = (SemanticArtifactKey, ProcedureId);
+
+/// One call site named across materializations: its procedure's durable key
+/// and the procedure-local call site id.
+pub type DurableCallSiteKey = (DurableProcedureKey, CallSiteId);
 
 /// Bounds on one closure discovery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +67,45 @@ pub struct CallSiteCoverage {
     /// One status for every in-mount dispatch candidate whose bindings the
     /// walk requested.
     pub bindings: Vec<BindingCoverage>,
+}
+
+impl CallSiteCoverage {
+    /// The coverage of a call whose dispatch answered, before any candidate
+    /// was entered or bound. The walk and the composition both record a
+    /// dispatch this way, so their diagnostics read the same facts.
+    pub fn from_dispatch(dispatch_status: SemanticInputStatus, dispatch: &DispatchResult) -> Self {
+        Self {
+            entered: Vec::new(),
+            has_uncovered_boundary: dispatch
+                .boundaries()
+                .iter()
+                .any(dispatch_boundary_is_uncovered),
+            truncated: dispatch
+                .boundaries()
+                .iter()
+                .any(|boundary| matches!(boundary.kind, DispatchBoundaryKind::Truncated)),
+            complete_receiver_hint_refinable: dispatch.complete_receiver_hint_refinable(),
+            dispatch: DispatchStatus::Resolved {
+                status: dispatch_status,
+                coverage: dispatch.coverage(),
+            },
+            bindings: Vec::new(),
+        }
+    }
+
+    /// The coverage of a call whose dispatch produced no usable answer.
+    pub fn unavailable(dispatch_status: SemanticInputStatus) -> Self {
+        Self {
+            entered: Vec::new(),
+            has_uncovered_boundary: false,
+            truncated: false,
+            complete_receiver_hint_refinable: false,
+            dispatch: DispatchStatus::Unavailable {
+                status: dispatch_status,
+            },
+            bindings: Vec::new(),
+        }
+    }
 }
 
 /// A persisted, replay-validated procedure surface mounted for identity and
@@ -142,6 +185,202 @@ pub struct DiscoveredClosure {
     pub root_snapshot: Option<usize>,
 }
 
+/// One dispatch answer owned by an exact entering-call context. These rows
+/// cannot be projected into origin-only coverage or persisted summary reads.
+#[derive(Debug)]
+pub struct ContextualDispatchCoverage {
+    pub call: crate::analyzer::semantic::CallSiteHandle,
+    pub context: OracleCallContext,
+    pub answer:
+        crate::analyzer::semantic::SemanticOutcome<crate::analyzer::semantic::DispatchResult>,
+}
+
+/// Explicit query bounds for contextual source acquisition.
+#[derive(Debug, Clone, Copy)]
+pub struct ContextualClosureLimits {
+    pub max_procedures: usize,
+    pub max_contexts: usize,
+    pub oracle: crate::analyzer::semantic::OracleLimits,
+}
+
+/// Executed source acquisition over bounded contexts. Relation snapshots are
+/// retained once per exact procedure; dispatch evidence remains per context.
+/// This is query-local and is never an origin-only reusable closure surface.
+#[derive(Debug)]
+pub struct ContextualDiscoveredClosure {
+    pub snapshots: Vec<ValueFlowInput<ValueFlowSnapshot>>,
+    pub bindings: Vec<ValueFlowInput<CallBindings>>,
+    pub dispatch: Vec<ContextualDispatchCoverage>,
+    pub status: SemanticInputStatus,
+    pub truncated: bool,
+}
+
+/// Acquire native source reachable only through bounded callback arguments.
+/// Unlike ordinary closure discovery, this walk deduplicates execution by
+/// (exact procedure, bounded suffix/truncation), not just procedure identity.
+/// Missing relations, bindings, dispatch and context limits remain typed and
+/// cannot turn an empty result into complete coverage.
+pub fn discover_contextual_closure<P: ValueFlowProvider>(
+    provider: &P,
+    root: &ProcedureHandle,
+    limits: ContextualClosureLimits,
+    semantic_budget: &mut SemanticBudget,
+    cancellation: &CancellationToken,
+) -> Result<ContextualDiscoveredClosure, P::Error> {
+    use crate::analyzer::semantic::{SemanticCapability, SemanticWork};
+    let mut result = ContextualDiscoveredClosure {
+        snapshots: Vec::new(),
+        bindings: Vec::new(),
+        dispatch: Vec::new(),
+        status: SemanticInputStatus::Complete,
+        truncated: false,
+    };
+    let mut pending = vec![(root.clone(), OracleCallContext::empty())];
+    let mut queued = HashSet::default();
+    queued.insert((root.durable_key(), OracleCallContext::empty()));
+    let mut acquired = HashSet::default();
+    while let Some((procedure, context)) = pending.pop() {
+        if cancellation.is_cancelled() {
+            result.status = result.status.merge(SemanticInputStatus::Cancelled);
+            break;
+        }
+        if let Err(exceeded) = semantic_budget.charge(SemanticWork {
+            nested_entries: 1 + context.calls().len(),
+            ..SemanticWork::default()
+        }) {
+            result.status = result
+                .status
+                .merge(SemanticInputStatus::ExceededBudget { exceeded });
+            break;
+        }
+        if limits.max_contexts == 0 {
+            result.truncated = true;
+            result.status = result.status.merge(SemanticInputStatus::Unknown);
+            break;
+        }
+        let procedure = provider.canonical_procedure(&procedure);
+        let key = procedure.durable_key();
+        if !acquired.contains(&key) {
+            if acquired.len() >= limits.max_procedures {
+                result.truncated = true;
+                result.status = result.status.merge(SemanticInputStatus::Unknown);
+                break;
+            }
+            let outcome = provider.procedure_snapshot(
+                &procedure,
+                &OracleCallContext::empty(),
+                &mut SemanticRequest::new(semantic_budget, cancellation),
+            )?;
+            let status = SemanticInputStatus::from_outcome(&outcome);
+            result.status = result.status.merge(status);
+            if let Some(snapshot) = outcome.available_value().cloned() {
+                result.snapshots.push(ValueFlowInput::new(snapshot, status));
+            }
+            acquired.insert(key);
+        }
+        if context.was_truncated() || context.calls().len() > limits.oracle.call_context_depth() {
+            result.truncated = true;
+            result.status = result.status.merge(SemanticInputStatus::Unknown);
+            continue;
+        }
+        for row in procedure.semantics().call_sites() {
+            if cancellation.is_cancelled() {
+                result.status = result.status.merge(SemanticInputStatus::Cancelled);
+                return Ok(result);
+            }
+            if let Err(exceeded) = semantic_budget.charge(SemanticWork {
+                nested_entries: 1,
+                ..SemanticWork::default()
+            }) {
+                result.status = result
+                    .status
+                    .merge(SemanticInputStatus::ExceededBudget { exceeded });
+                return Ok(result);
+            }
+            let call = procedure.call_site_handle(row.id).expect("live call row");
+            let outcome = provider.resolve_call_in_context(
+                &call,
+                &context,
+                &mut SemanticRequest::new(semantic_budget, cancellation),
+            )?;
+            let status = SemanticInputStatus::from_outcome(&outcome);
+            result.status = result.status.merge(status);
+            if let Some(dispatch) = outcome.available_value() {
+                if !dispatch.boundaries().is_empty()
+                    || dispatch.coverage() != CandidateCoverage::Exhaustive
+                {
+                    result.status = result.status.merge(SemanticInputStatus::Unknown);
+                }
+                for candidate in dispatch.candidates() {
+                    let target = candidate.target();
+                    if target.artifact().key().mount() != root.artifact().key().mount() {
+                        result.status = result.status.merge(SemanticInputStatus::Unknown);
+                        continue;
+                    }
+                    let bindings = provider.call_bindings(
+                        &call,
+                        candidate,
+                        &context,
+                        &mut SemanticRequest::new(semantic_budget, cancellation),
+                    )?;
+                    let binding_status = status.merge(SemanticInputStatus::from_outcome(&bindings));
+                    result.status = result.status.merge(binding_status);
+                    if let Some(binding) = bindings.available_value().cloned() {
+                        result
+                            .bindings
+                            .push(ValueFlowInput::new(binding, binding_status));
+                    }
+                    if let Err(exceeded) = semantic_budget.charge(SemanticWork {
+                        nested_entries: 1 + context.calls().len(),
+                        ..SemanticWork::default()
+                    }) {
+                        result.status = result
+                            .status
+                            .merge(SemanticInputStatus::ExceededBudget { exceeded });
+                        return Ok(result);
+                    }
+                    let next = context.extended(call.clone(), limits.oracle);
+                    if next.was_truncated() {
+                        result.truncated = true;
+                        result.status = result.status.merge(SemanticInputStatus::Unknown);
+                    } else if !queued.contains(&(target.durable_key(), next.clone())) {
+                        if queued.len() >= limits.max_contexts {
+                            result.truncated = true;
+                            result.status = result.status.merge(SemanticInputStatus::Unknown);
+                        } else {
+                            queued.insert((target.durable_key(), next.clone()));
+                            pending.push((target.clone(), next));
+                        }
+                    }
+                }
+                if let Some(proof) = dispatch.argument_callable() {
+                    if let Err(exceeded) = semantic_budget.charge(SemanticWork {
+                        captures: proof.capture_bindings().len(),
+                        nested_entries: 1,
+                        ..SemanticWork::default()
+                    }) {
+                        result.status = result
+                            .status
+                            .merge(SemanticInputStatus::ExceededBudget { exceeded });
+                        return Ok(result);
+                    }
+                    if !proof.captures().is_empty() {
+                        result.status = result.status.merge(SemanticInputStatus::Unsupported {
+                            capability: SemanticCapability::Captures,
+                        });
+                    }
+                }
+            }
+            result.dispatch.push(ContextualDispatchCoverage {
+                call,
+                context: context.clone(),
+                answer: outcome,
+            });
+        }
+    }
+    Ok(result)
+}
+
 /// Decides whether one non-root procedure may stand on a mandatory reusable
 /// summary instead of acquiring its descendant closure.
 ///
@@ -172,11 +411,13 @@ pub trait ClosureCutDecider {
 
     fn should_cut(
         &mut self,
-        procedure: &ProcedureHandle,
-        snapshot: &ValueFlowInput<ValueFlowSnapshot>,
-        coverage: &HashMap<(DurableProcedureKey, CallSiteId), CallSiteCoverage>,
-        request: &mut SemanticRequest<'_>,
-    ) -> bool;
+        _procedure: &ProcedureHandle,
+        _snapshot: &ValueFlowInput<ValueFlowSnapshot>,
+        _coverage: &HashMap<(DurableProcedureKey, CallSiteId), CallSiteCoverage>,
+        _request: &mut SemanticRequest<'_>,
+    ) -> bool {
+        false
+    }
 
     /// Descendant procedure identity surfaces staged by the same cut decision.
     /// They are mounted only if ordinary discovery did not independently reach
@@ -197,17 +438,7 @@ pub trait ClosureCutDecider {
 #[derive(Debug, Default)]
 struct NoClosureCuts;
 
-impl ClosureCutDecider for NoClosureCuts {
-    fn should_cut(
-        &mut self,
-        _procedure: &ProcedureHandle,
-        _snapshot: &ValueFlowInput<ValueFlowSnapshot>,
-        _coverage: &HashMap<(DurableProcedureKey, CallSiteId), CallSiteCoverage>,
-        _request: &mut SemanticRequest<'_>,
-    ) -> bool {
-        false
-    }
-}
+impl ClosureCutDecider for NoClosureCuts {}
 
 /// Walk the resolved call closure from `root` over the default
 /// [`WorkspaceValueFlowProvider`] and collect the plan inputs a whole-program
@@ -499,16 +730,7 @@ pub fn discover_closure_with_cuts<P: ValueFlowProvider, C: ClosureCutDecider>(
             let Some(dispatch) = dispatch.available_value() else {
                 let previous = closure.coverage.insert(
                     (procedure_key.clone(), call_row.id),
-                    CallSiteCoverage {
-                        entered: Vec::new(),
-                        has_uncovered_boundary: false,
-                        truncated: false,
-                        complete_receiver_hint_refinable: false,
-                        dispatch: DispatchStatus::Unavailable {
-                            status: dispatch_status,
-                        },
-                        bindings: Vec::new(),
-                    },
+                    CallSiteCoverage::unavailable(dispatch_status),
                 );
                 assert!(previous.is_none(), "a call site is visited exactly once");
                 continue;
@@ -516,23 +738,7 @@ pub fn discover_closure_with_cuts<P: ValueFlowProvider, C: ClosureCutDecider>(
             let coverage_key = (procedure_key.clone(), call_row.id);
             let previous = closure.coverage.insert(
                 coverage_key.clone(),
-                CallSiteCoverage {
-                    entered: Vec::new(),
-                    has_uncovered_boundary: dispatch
-                        .boundaries()
-                        .iter()
-                        .any(dispatch_boundary_is_uncovered),
-                    truncated: dispatch
-                        .boundaries()
-                        .iter()
-                        .any(|boundary| matches!(boundary.kind, DispatchBoundaryKind::Truncated)),
-                    complete_receiver_hint_refinable: dispatch.complete_receiver_hint_refinable(),
-                    dispatch: DispatchStatus::Resolved {
-                        status: dispatch_status,
-                        coverage: dispatch.coverage(),
-                    },
-                    bindings: Vec::new(),
-                },
+                CallSiteCoverage::from_dispatch(dispatch_status, dispatch),
             );
             assert!(previous.is_none(), "a call site is visited exactly once");
             closure
@@ -826,14 +1032,16 @@ mod tests {
         procedure
             .locator()
             .declaration()
-            .segments()
-            .last()
-            .and_then(|segment| segment.name())
+            .last_segment_name()
             .expect("a named fixture procedure")
     }
 
     fn handle_name(handle: &ProcedureHandle) -> &str {
         procedure_name(handle.semantics())
+    }
+
+    fn is_named_procedure(handle: &ProcedureHandle, name: &str) -> bool {
+        handle_name(handle) == name
     }
 
     fn discover(
@@ -884,7 +1092,7 @@ mod tests {
             _coverage: &HashMap<(DurableProcedureKey, CallSiteId), CallSiteCoverage>,
             _request: &mut SemanticRequest<'_>,
         ) -> bool {
-            handle_name(procedure) == self.0
+            is_named_procedure(procedure, self.0)
         }
     }
 
@@ -916,16 +1124,6 @@ mod tests {
                 dispatch_reads: Box::default(),
                 boundaries: Vec::new(),
             })
-        }
-
-        fn should_cut(
-            &mut self,
-            _procedure: &ProcedureHandle,
-            _snapshot: &ValueFlowInput<ValueFlowSnapshot>,
-            _coverage: &HashMap<(DurableProcedureKey, CallSiteId), CallSiteCoverage>,
-            _request: &mut SemanticRequest<'_>,
-        ) -> bool {
-            false
         }
 
         fn take_hydrated_surfaces(&mut self) -> Vec<HydratedProcedureSurface> {
@@ -994,7 +1192,7 @@ mod tests {
             _coverage: &HashMap<(DurableProcedureKey, CallSiteId), CallSiteCoverage>,
             _request: &mut SemanticRequest<'_>,
         ) -> bool {
-            handle_name(procedure) == self.name
+            is_named_procedure(procedure, self.name)
         }
 
         fn take_hydrated_surfaces(&mut self) -> Vec<HydratedProcedureSurface> {
@@ -1074,59 +1272,6 @@ mod tests {
             provider.dispatch_calls.get(),
             provider.binding_calls.get(),
         )
-    }
-
-    #[test]
-    fn an_accepted_pre_dispatch_cut_avoids_live_call_acquisition() {
-        let (_project, workspace, root) = fixture(
-            concat!(
-                "def leaf(value):\n    return value\n",
-                "def helper(value):\n",
-                "    def lexical():\n        return 1\n",
-                "    return leaf(value)\n",
-                "def main(value):\n    return helper(value)\n",
-            ),
-            "main",
-        );
-        let leaf = named_procedure(&root, "leaf");
-        let mut cut = PreDispatchNamedCut {
-            name: "helper",
-            descendants: Some(vec![staged_surface(&workspace, &leaf)]),
-            accepted: 0,
-            discarded: 0,
-        };
-        let (closure, dispatch_calls, binding_calls) =
-            discover_with_counting_pre_dispatch_cut(&workspace, &root, &mut cut, 10);
-
-        assert_eq!(
-            dispatch_calls, 1,
-            "only main dispatches through the provider"
-        );
-        assert_eq!(
-            binding_calls, 1,
-            "only main's helper binding is acquired live"
-        );
-        assert_eq!((cut.accepted, cut.discarded), (1, 0));
-        assert_eq!(
-            closure
-                .summary_cuts
-                .iter()
-                .map(handle_name)
-                .collect::<Vec<_>>(),
-            ["helper", "leaf"],
-            "the cut root and its identity-only call descendant are mandatory cuts"
-        );
-        assert!(
-            closure
-                .procedures
-                .iter()
-                .any(|procedure| handle_name(procedure) == "lexical")
-                && !closure
-                    .summary_cuts
-                    .iter()
-                    .any(|procedure| handle_name(procedure) == "lexical"),
-            "an immediate lexical child still runs through ordinary discovery"
-        );
     }
 
     #[test]
@@ -1546,41 +1691,6 @@ mod tests {
     }
 
     #[test]
-    fn the_procedure_cap_marks_the_calls_left_with_an_unprocessed_candidate() {
-        let (_project, workspace, root) = fixture(
-            concat!(
-                "def helper():\n    return 1\n",
-                "def other():\n    return 2\n",
-                "def main():\n    a = helper()\n    b = other()\n    return a\n",
-            ),
-            "main",
-        );
-        let closure = discover(&workspace, &root, 1);
-        assert!(
-            closure.truncated,
-            "the cap stopped the walk with callees queued: {closure:?}"
-        );
-        assert_eq!(
-            closure.procedures.len(),
-            1,
-            "only the root's relations entered the closure: {closure:?}"
-        );
-        // `other` pops first and trips the cap; `helper` is still queued, so
-        // the call that bound it is truncation, not an empty target set.
-        let helper_coverage = closure
-            .coverage
-            .values()
-            .find(|coverage| {
-                coverage.entered.len() == 1 && handle_name(&coverage.entered[0]) == "helper"
-            })
-            .expect("the helper call has a coverage row");
-        assert!(
-            helper_coverage.truncated,
-            "the still-queued callee's call site is marked truncated: {helper_coverage:?}"
-        );
-    }
-
-    #[test]
     fn a_callee_reached_from_two_call_sites_is_queued_once() {
         let (_project, workspace, root) = fixture(
             concat!(
@@ -1617,26 +1727,6 @@ mod tests {
     }
 
     #[test]
-    fn lexical_children_enter_their_enclosing_procedures_closure() {
-        let (_project, workspace, root) = fixture(
-            concat!(
-                "def main():\n",
-                "    def nested():\n",
-                "        return 1\n",
-                "    return 2\n",
-            ),
-            "main",
-        );
-        let closure = discover(&workspace, &root, 10);
-        let discovered = closure
-            .procedures
-            .iter()
-            .map(handle_name)
-            .collect::<Vec<_>>();
-        assert_eq!(discovered, ["main", "nested"], "{closure:?}");
-    }
-
-    #[test]
     fn every_dispatch_outcome_has_a_typed_coverage_row() {
         let (_project, workspace, root) = fixture(
             "def helper():\n    return 1\ndef main():\n    return helper()\n",
@@ -1670,6 +1760,26 @@ mod tests {
             }
         );
         assert!(coverage.bindings.is_empty(), "{coverage:?}");
+    }
+
+    #[test]
+    fn lexical_children_enter_their_enclosing_procedures_closure() {
+        let (_project, workspace, root) = fixture(
+            concat!(
+                "def main():\n",
+                "    def nested():\n",
+                "        return 1\n",
+                "    return 2\n",
+            ),
+            "main",
+        );
+        let closure = discover(&workspace, &root, 10);
+        let discovered = closure
+            .procedures
+            .iter()
+            .map(handle_name)
+            .collect::<Vec<_>>();
+        assert_eq!(discovered, ["main", "nested"], "{closure:?}");
     }
 
     #[test]

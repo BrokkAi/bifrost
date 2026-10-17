@@ -212,16 +212,8 @@ where
 fn reject_backward_output_requirements(
     plan: DataflowDirectionPlan,
 ) -> Result<(), TaintPlannedSolveError> {
-    let requirements = plan.requirements();
-    if requirements.reusable_summaries {
-        return Err(TaintPlannedSolveError::UnsupportedOutputContract {
-            capability: DataflowDirectionCapability::ReusableSummaries,
-        });
-    }
-    if requirements.normalized_witnesses {
-        return Err(TaintPlannedSolveError::UnsupportedOutputContract {
-            capability: DataflowDirectionCapability::NormalizedWitnesses,
-        });
+    if let Some(capability) = plan.requirements().unsupported_backward_output() {
+        return Err(TaintPlannedSolveError::UnsupportedOutputContract { capability });
     }
     Ok(())
 }
@@ -259,16 +251,7 @@ pub fn canonical_taint_findings_from_forward(
             }
         }
     }
-    Ok(merged
-        .into_iter()
-        .map(|((source, sink, class), uncertain)| TaintCanonicalFinding {
-            source,
-            sink,
-            class,
-            uncertain,
-        })
-        .collect::<Vec<_>>()
-        .into_boxed_slice())
+    Ok(canonical_findings(merged))
 }
 
 /// Canonicalize backward snapshot hits into stable source/sink/class hits.
@@ -304,7 +287,13 @@ pub fn canonical_taint_findings_from_backward(
             .and_modify(|current| *current |= result_uncertain || hit.is_uncertain())
             .or_insert(result_uncertain || hit.is_uncertain());
     }
-    Ok(merged
+    Ok(canonical_findings(merged))
+}
+
+fn canonical_findings(
+    merged: BTreeMap<(SourceEventKey, ValueFlowEventKey, SourceClassId), bool>,
+) -> Box<[TaintCanonicalFinding]> {
+    merged
         .into_iter()
         .map(|((source, sink, class), uncertain)| TaintCanonicalFinding {
             source,
@@ -313,5 +302,5 @@ pub fn canonical_taint_findings_from_backward(
             uncertain,
         })
         .collect::<Vec<_>>()
-        .into_boxed_slice())
+        .into_boxed_slice()
 }

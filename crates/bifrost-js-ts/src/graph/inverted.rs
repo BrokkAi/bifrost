@@ -25,14 +25,14 @@ use super::resolver::{
 use crate::parse::flow_dialect_blocks_extraction;
 use crate::providers::{JsTsSource, with_usage_definitions};
 use crate::syntax::{
-    JsTsImportBinder, JsTsLexicalBindingIndex, is_declaration_identifier,
-    is_lexically_nested_type_declaration, is_object_in_member_expression,
-    is_property_key_in_member, nested_type_identifier_parts, slice,
+    JsTsImportBinder, JsTsLexicalBindingIndex, introduces_js_ts_scope, is_declaration_identifier,
+    is_object_in_member_expression, is_property_key_in_member,
+    lexically_nested_type_declaration_name, nested_type_identifier_parts, slice,
 };
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use brokk_bifrost_core::analyzer::usages::inverted_edges::{
-    FileEdgeScanInput, JsTsScopedNodeStatus, PerFileEdges, UsageNodeKey, classify_reference_node,
+    FileEdgeScanInput, JsTsScopedNodeStatus, PerFileEdges, UsageNodeKey,
 };
 use brokk_bifrost_core::analyzer::usages::local_inference::{
     LocalInferenceConfig, LocalInferenceEngine,
@@ -278,21 +278,14 @@ struct ScopedTsScan<'a> {
 
 impl<'a> ScopedTsScan<'a> {
     fn bare_callee(&self, text: &str, byte: usize) -> Option<UsageNodeKey> {
-        if let Some(key) = self.imports.named.get(text) {
-            return Some(key.clone());
-        }
-        if let Some(key) = self.browser_globals.get(text)
-            && !self
-                .lexical_bindings
-                .as_ref()
-                .is_some_and(|bindings| bindings.is_bound_at(text, byte))
-        {
-            return Some(key.clone());
-        }
-        if let Some(key) = self.same_file.get(text) {
-            return Some(key.clone());
-        }
-        None
+        bare_callee(
+            text,
+            byte,
+            &self.imports.named,
+            &self.browser_globals,
+            self.lexical_bindings.as_ref(),
+            |name| self.same_file.get(name).cloned(),
+        )
     }
 
     fn browser_global_member_callee(
@@ -301,13 +294,13 @@ impl<'a> ScopedTsScan<'a> {
         member: &str,
         byte: usize,
     ) -> Option<UsageNodeKey> {
-        (object == "window"
-            && !self
-                .lexical_bindings
-                .as_ref()
-                .is_some_and(|bindings| bindings.is_bound_at(object, byte)))
-        .then(|| self.browser_globals.get(member).cloned())
-        .flatten()
+        browser_global_member_callee(
+            object,
+            member,
+            byte,
+            &self.browser_globals,
+            self.lexical_bindings.as_ref(),
+        )
     }
 
     fn namespace_member_callee(&self, namespace: &str, member: &str) -> Option<UsageNodeKey> {
@@ -325,45 +318,23 @@ impl<'a> ScopedTsScan<'a> {
         owner: &UsageNodeKey,
         member: &str,
     ) -> Vec<UsageNodeKey> {
-        let static_key = UsageNodeKey::new(
-            owner.file.clone(),
-            format!("{}.{}$static", owner.fqn, member),
-        );
-        if self
-            .declarations
-            .get(&(owner.file.clone(), format!("{member}$static")))
-            .is_some_and(|keys| keys.contains(&static_key))
-        {
-            return vec![static_key];
-        }
-
-        let plain_key = UsageNodeKey::new(owner.file.clone(), format!("{}.{}", owner.fqn, member));
-        if self
-            .declarations
-            .get(&(owner.file.clone(), member.to_string()))
-            .is_some_and(|keys| keys.contains(&plain_key))
-        {
-            return vec![plain_key];
-        }
-
-        Vec::new()
+        member_declaration_candidate(&owner.fqn, member, |fqn, local_name| {
+            let key = UsageNodeKey::new(owner.file.clone(), fqn.to_string());
+            self.declarations
+                .get(&(owner.file.clone(), local_name.to_string()))
+                .is_some_and(|keys| keys.contains(&key))
+                .then_some(key)
+        })
+        .into_iter()
+        .collect()
     }
 
     fn record(&mut self, callee: UsageNodeKey, node: Node<'_>) {
-        self.edges.record_kind(
-            self.input,
-            callee,
-            classify_reference_node(node),
-            node.start_byte(),
-            node.end_byte(),
-        );
+        self.edges.record_reference(self.input, callee, node);
     }
 
     fn is_type_shadowed(&self, name: &str) -> bool {
-        self.type_shadow_scopes
-            .iter()
-            .rev()
-            .any(|scope| scope.contains(name))
+        super::is_name_shadowed_in_scopes(&self.type_shadow_scopes, name)
     }
 }
 
@@ -382,17 +353,10 @@ struct TsScan<'a> {
 
 impl TsScan<'_> {
     fn member_declaration_keys(&self, owner: &str, member: &str) -> Vec<String> {
-        let static_key = format!("{owner}.{member}$static");
-        if self.input.is_node(&static_key) {
-            return vec![static_key];
-        }
-
-        let plain_key = format!("{owner}.{member}");
-        if self.input.is_node(&plain_key) {
-            return vec![plain_key];
-        }
-
-        Vec::new()
+        member_declaration_candidate(owner, member, |fqn, _| {
+            let fqn = fqn.to_string();
+            self.input.is_node(&fqn).then_some(fqn)
+        })
     }
 
     fn browser_global_member_callee(
@@ -401,21 +365,76 @@ impl TsScan<'_> {
         member: &str,
         byte: usize,
     ) -> Option<String> {
-        (object == "window"
-            && !self
-                .lexical_bindings
-                .as_ref()
-                .is_some_and(|bindings| bindings.is_bound_at(object, byte)))
-        .then(|| self.browser_globals.get(member).cloned())
-        .flatten()
+        browser_global_member_callee(
+            object,
+            member,
+            byte,
+            &self.browser_globals,
+            self.lexical_bindings.as_ref(),
+        )
     }
 
     fn is_type_shadowed(&self, name: &str) -> bool {
-        self.type_shadow_scopes
-            .iter()
-            .rev()
-            .any(|scope| scope.contains(name))
+        super::is_name_shadowed_in_scopes(&self.type_shadow_scopes, name)
     }
+}
+
+fn bare_callee<T: Clone>(
+    text: &str,
+    byte: usize,
+    imports: &HashMap<String, T>,
+    browser_globals: &HashMap<String, T>,
+    lexical_bindings: Option<&JsTsLexicalBindingIndex>,
+    same_file: impl FnOnce(&str) -> Option<T>,
+) -> Option<T> {
+    if let Some(key) = imports.get(text) {
+        return Some(key.clone());
+    }
+    if let Some(key) =
+        unshadowed_browser_global(text, text, byte, browser_globals, lexical_bindings)
+    {
+        return Some(key);
+    }
+    same_file(text)
+}
+
+fn unshadowed_browser_global<T: Clone>(
+    binding_name: &str,
+    lookup_name: &str,
+    byte: usize,
+    browser_globals: &HashMap<String, T>,
+    lexical_bindings: Option<&JsTsLexicalBindingIndex>,
+) -> Option<T> {
+    if lexical_bindings.is_some_and(|bindings| bindings.is_bound_at(binding_name, byte)) {
+        return None;
+    }
+    browser_globals.get(lookup_name).cloned()
+}
+
+fn browser_global_member_callee<T: Clone>(
+    object: &str,
+    member: &str,
+    byte: usize,
+    browser_globals: &HashMap<String, T>,
+    lexical_bindings: Option<&JsTsLexicalBindingIndex>,
+) -> Option<T> {
+    (object == "window")
+        .then(|| unshadowed_browser_global(object, member, byte, browser_globals, lexical_bindings))
+        .flatten()
+}
+
+fn member_declaration_candidate<T>(
+    owner: &str,
+    member: &str,
+    mut lookup: impl FnMut(&str, &str) -> Option<T>,
+) -> Vec<T> {
+    let static_name = format!("{member}$static");
+    let static_fqn = format!("{owner}.{static_name}");
+    if let Some(candidate) = lookup(&static_fqn, &static_name) {
+        return vec![candidate];
+    }
+    let plain_fqn = format!("{owner}.{member}");
+    lookup(&plain_fqn, member).into_iter().collect()
 }
 
 fn scoped_declarations_by_file_and_name(
@@ -853,48 +872,45 @@ impl TsScan<'_> {
     /// The callee fqn a bare name refers to: a named import's exported name, or a
     /// same-file declaration's own name. `None` when the name is neither.
     fn bare_callee(&self, text: &str, byte: usize) -> Option<String> {
-        if let Some(exported) = self.named_imports.get(text) {
-            return Some(exported.clone());
-        }
-        if let Some(global) = self.browser_globals.get(text)
-            && !self
-                .lexical_bindings
-                .as_ref()
-                .is_some_and(|bindings| bindings.is_bound_at(text, byte))
-        {
-            return Some(global.clone());
-        }
-        if self.same_file.contains(text) {
-            return Some(text.to_string());
-        }
-        None
+        bare_callee(
+            text,
+            byte,
+            &self.named_imports,
+            &self.browser_globals,
+            self.lexical_bindings.as_ref(),
+            |name| self.same_file.contains(name).then(|| name.to_string()),
+        )
     }
 
     fn record(&mut self, callee: String, node: Node<'_>) {
-        self.edges.record_kind(
-            self.input,
-            callee,
-            classify_reference_node(node),
-            node.start_byte(),
-            node.end_byte(),
-        );
+        self.edges.record_reference(self.input, callee, node);
     }
 }
 
 fn scan_node(node: Node<'_>, ctx: &mut TsScan<'_>, locals: &mut LocalInferenceEngine<String>) {
+    scan_ts_tree(node, ctx, locals, scan_node_enter, |ctx, locals| {
+        locals.exit_scope();
+        ctx.type_shadow_scopes.pop();
+    });
+}
+
+fn scan_ts_tree<C>(
+    node: Node<'_>,
+    ctx: &mut C,
+    locals: &mut LocalInferenceEngine<String>,
+    mut enter: impl FnMut(Node<'_>, &mut C, &mut LocalInferenceEngine<String>) -> Option<bool>,
+    mut exit: impl FnMut(&mut C, &mut LocalInferenceEngine<String>),
+) {
     let mut state = (ctx, locals);
     walk_tree_iterative(
         node,
         &mut state,
-        |node, (ctx, locals)| match scan_node_enter(node, ctx, locals) {
+        |node, (ctx, locals)| match enter(node, ctx, locals) {
             Some(true) => TreeWalkAction::DescendWithExit,
             Some(false) => TreeWalkAction::Descend,
             None => TreeWalkAction::Skip,
         },
-        |(ctx, locals)| {
-            locals.exit_scope();
-            ctx.type_shadow_scopes.pop();
-        },
+        |(ctx, locals)| exit(ctx, locals),
     );
 }
 
@@ -903,41 +919,10 @@ fn scan_node_enter(
     ctx: &mut TsScan<'_>,
     locals: &mut LocalInferenceEngine<String>,
 ) -> Option<bool> {
-    let kind = node.kind();
-    let introduces_scope = introduces_js_ts_scope(kind);
-    if introduces_scope {
-        locals.enter_scope();
-        ctx.type_shadow_scopes.push(HashSet::default());
-        if let Some(parameters) = node.child_by_field_name("parameters") {
-            declare_pattern_shadows(parameters, ctx.source, locals);
-        }
-    }
-    register_lexical_type_shadow(node, ctx.source, &mut ctx.type_shadow_scopes);
+    let introduces_scope =
+        enter_ts_scan_node(node, ctx.source, &mut ctx.type_shadow_scopes, locals)?;
 
-    // Bindings declared in import/export clauses are not usages.
-    if matches!(
-        kind,
-        "import_statement"
-            | "import_clause"
-            | "import_specifier"
-            | "namespace_import"
-            | "export_clause"
-            | "export_specifier"
-    ) {
-        if introduces_scope {
-            locals.exit_scope();
-            ctx.type_shadow_scopes.pop();
-        }
-        return None;
-    }
-
-    if kind == "variable_declarator"
-        && let Some(name) = node.child_by_field_name("name")
-    {
-        declare_pattern_shadows(name, ctx.source, locals);
-    }
-
-    match kind {
+    match node.kind() {
         "nested_type_identifier" => handle_nested_type_identifier(node, ctx, locals),
         "identifier" | "type_identifier" | "shorthand_property_identifier" => {
             handle_identifier(node, ctx, locals)
@@ -956,20 +941,10 @@ fn scan_scoped_node(
     ctx: &mut ScopedTsScan<'_>,
     locals: &mut LocalInferenceEngine<String>,
 ) {
-    let mut state = (ctx, locals);
-    walk_tree_iterative(
-        node,
-        &mut state,
-        |node, (ctx, locals)| match scan_scoped_node_enter(node, ctx, locals) {
-            Some(true) => TreeWalkAction::DescendWithExit,
-            Some(false) => TreeWalkAction::Descend,
-            None => TreeWalkAction::Skip,
-        },
-        |(ctx, locals)| {
-            locals.exit_scope();
-            ctx.type_shadow_scopes.pop();
-        },
-    );
+    scan_ts_tree(node, ctx, locals, scan_scoped_node_enter, |ctx, locals| {
+        locals.exit_scope();
+        ctx.type_shadow_scopes.pop();
+    });
 }
 
 fn scan_scoped_node_enter(
@@ -977,40 +952,10 @@ fn scan_scoped_node_enter(
     ctx: &mut ScopedTsScan<'_>,
     locals: &mut LocalInferenceEngine<String>,
 ) -> Option<bool> {
-    let kind = node.kind();
-    let introduces_scope = introduces_js_ts_scope(kind);
-    if introduces_scope {
-        locals.enter_scope();
-        ctx.type_shadow_scopes.push(HashSet::default());
-        if let Some(parameters) = node.child_by_field_name("parameters") {
-            declare_pattern_shadows(parameters, ctx.source, locals);
-        }
-    }
-    register_lexical_type_shadow(node, ctx.source, &mut ctx.type_shadow_scopes);
+    let introduces_scope =
+        enter_ts_scan_node(node, ctx.source, &mut ctx.type_shadow_scopes, locals)?;
 
-    if matches!(
-        kind,
-        "import_statement"
-            | "import_clause"
-            | "import_specifier"
-            | "namespace_import"
-            | "export_clause"
-            | "export_specifier"
-    ) {
-        if introduces_scope {
-            locals.exit_scope();
-            ctx.type_shadow_scopes.pop();
-        }
-        return None;
-    }
-
-    if kind == "variable_declarator"
-        && let Some(name) = node.child_by_field_name("name")
-    {
-        declare_pattern_shadows(name, ctx.source, locals);
-    }
-
-    match kind {
+    match node.kind() {
         "nested_type_identifier" => handle_scoped_nested_type_identifier(node, ctx, locals),
         "identifier" | "type_identifier" | "shorthand_property_identifier" => {
             handle_scoped_identifier(node, ctx, locals)
@@ -1024,16 +969,57 @@ fn scan_scoped_node_enter(
     Some(introduces_scope)
 }
 
-fn introduces_js_ts_scope(kind: &str) -> bool {
-    matches!(
+fn enter_ts_scan_node(
+    node: Node<'_>,
+    source: &str,
+    type_shadow_scopes: &mut Vec<HashSet<String>>,
+    locals: &mut LocalInferenceEngine<String>,
+) -> Option<bool> {
+    let kind = node.kind();
+    let introduces_scope = introduces_js_ts_scope(kind);
+    if introduces_scope {
+        locals.enter_scope();
+        type_shadow_scopes.push(HashSet::default());
+        declare_scope_parameter_shadows(node, source, locals);
+    }
+    register_lexical_type_shadow(node, source, type_shadow_scopes);
+
+    if matches!(
         kind,
-        "statement_block"
-            | "arrow_function"
-            | "function_expression"
-            | "generator_function"
-            | "function_declaration"
-            | "method_definition"
-    )
+        "import_statement"
+            | "import_clause"
+            | "import_specifier"
+            | "namespace_import"
+            | "export_clause"
+            | "export_specifier"
+    ) {
+        if introduces_scope {
+            locals.exit_scope();
+            type_shadow_scopes.pop();
+        }
+        return None;
+    }
+    if kind == "variable_declarator"
+        && let Some(name) = node.child_by_field_name("name")
+    {
+        declare_pattern_shadows(name, source, locals);
+    }
+    Some(introduces_scope)
+}
+
+fn declare_scope_parameter_shadows(
+    node: Node<'_>,
+    source: &str,
+    locals: &mut LocalInferenceEngine<String>,
+) {
+    if let Some(parameters) = node.child_by_field_name("parameters") {
+        declare_pattern_shadows(parameters, source, locals);
+    }
+    if node.kind() == "catch_clause"
+        && let Some(parameter) = node.child_by_field_name("parameter")
+    {
+        declare_pattern_shadows(parameter, source, locals);
+    }
 }
 
 /// Declare every identifier bound by a parameter / declaration pattern as a local
@@ -1082,21 +1068,11 @@ fn declare_pattern_shadows(
 }
 
 fn handle_identifier(node: Node<'_>, ctx: &mut TsScan<'_>, locals: &LocalInferenceEngine<String>) {
-    let text = slice(node, ctx.source);
-    let shadowed = if node.kind() == "type_identifier" {
-        ctx.is_type_shadowed(text)
-    } else {
-        locals.is_shadowed(text)
+    let Some(text) =
+        identifier_reference_candidate(node, ctx.source, &ctx.type_shadow_scopes, locals)
+    else {
+        return;
     };
-    if text.is_empty() || shadowed {
-        return;
-    }
-    if is_declaration_identifier(node)
-        || is_property_key_in_member(node)
-        || is_object_in_member_expression(node)
-    {
-        return;
-    }
     if let Some(callee) = ctx.bare_callee(text, node.start_byte()) {
         ctx.record(callee, node);
     }
@@ -1107,24 +1083,34 @@ fn handle_scoped_identifier(
     ctx: &mut ScopedTsScan<'_>,
     locals: &LocalInferenceEngine<String>,
 ) {
-    let text = slice(node, ctx.source);
-    let shadowed = if node.kind() == "type_identifier" {
-        ctx.is_type_shadowed(text)
-    } else {
-        locals.is_shadowed(text)
+    let Some(text) =
+        identifier_reference_candidate(node, ctx.source, &ctx.type_shadow_scopes, locals)
+    else {
+        return;
     };
-    if text.is_empty() || shadowed {
-        return;
-    }
-    if is_declaration_identifier(node)
-        || is_property_key_in_member(node)
-        || is_object_in_member_expression(node)
-    {
-        return;
-    }
     if let Some(callee) = ctx.bare_callee(text, node.start_byte()) {
         ctx.record(callee, node);
     }
+}
+
+fn identifier_reference_candidate<'source>(
+    node: Node<'_>,
+    source: &'source str,
+    type_shadow_scopes: &[HashSet<String>],
+    locals: &LocalInferenceEngine<String>,
+) -> Option<&'source str> {
+    let text = slice(node, source);
+    let shadowed = if node.kind() == "type_identifier" {
+        super::is_name_shadowed_in_scopes(type_shadow_scopes, text)
+    } else {
+        locals.is_shadowed(text)
+    };
+    (!text.is_empty()
+        && !shadowed
+        && !is_declaration_identifier(node)
+        && !is_property_key_in_member(node)
+        && !is_object_in_member_expression(node))
+    .then_some(text)
 }
 
 fn handle_nested_type_identifier(
@@ -1132,13 +1118,9 @@ fn handle_nested_type_identifier(
     ctx: &mut TsScan<'_>,
     _locals: &LocalInferenceEngine<String>,
 ) {
-    let Some((module, name)) = nested_type_identifier_parts(node) else {
+    let Some((module, name, name_text)) = nonempty_nested_type_identifier(node, ctx.source) else {
         return;
     };
-    let name_text = slice(name, ctx.source);
-    if name_text.is_empty() {
-        return;
-    }
 
     if let Some(owner) = type_qualification_owner_callee(module, ctx) {
         for member in ctx.member_declaration_keys(&owner, name_text) {
@@ -1160,13 +1142,9 @@ fn handle_scoped_nested_type_identifier(
     ctx: &mut ScopedTsScan<'_>,
     _locals: &LocalInferenceEngine<String>,
 ) {
-    let Some((module, name)) = nested_type_identifier_parts(node) else {
+    let Some((module, name, name_text)) = nonempty_nested_type_identifier(node, ctx.source) else {
         return;
     };
-    let name_text = slice(name, ctx.source);
-    if name_text.is_empty() {
-        return;
-    }
 
     if let Some(owner) = scoped_type_qualification_owner_callee(module, ctx) {
         for member in ctx.scoped_member_declaration_keys(&owner, name_text) {
@@ -1183,43 +1161,46 @@ fn handle_scoped_nested_type_identifier(
     }
 }
 
-fn type_qualification_owner_callee(module: Node<'_>, ctx: &TsScan<'_>) -> Option<String> {
-    if module.kind() == "identifier" {
-        let module_text = slice(module, ctx.source);
-        return (!module_text.is_empty() && !ctx.is_type_shadowed(module_text))
-            .then(|| ctx.bare_callee(module_text, module.start_byte()))
-            .flatten();
-    }
+fn nonempty_nested_type_identifier<'tree, 'source>(
+    node: Node<'tree>,
+    source: &'source str,
+) -> Option<(Node<'tree>, Node<'tree>, &'source str)> {
+    let (module, name) = nested_type_identifier_parts(node)?;
+    let name_text = slice(name, source);
+    (!name_text.is_empty()).then_some((module, name, name_text))
+}
 
-    None
+fn type_qualification_owner_callee(module: Node<'_>, ctx: &TsScan<'_>) -> Option<String> {
+    let module_text = type_qualification_name(module, ctx.source, &ctx.type_shadow_scopes)?;
+    ctx.bare_callee(module_text, module.start_byte())
 }
 
 fn scoped_type_qualification_owner_callee(
     module: Node<'_>,
     ctx: &ScopedTsScan<'_>,
 ) -> Option<UsageNodeKey> {
-    if module.kind() == "identifier" {
-        let module_text = slice(module, ctx.source);
-        return (!module_text.is_empty() && !ctx.is_type_shadowed(module_text))
-            .then(|| ctx.bare_callee(module_text, module.start_byte()))
-            .flatten();
-    }
+    let module_text = type_qualification_name(module, ctx.source, &ctx.type_shadow_scopes)?;
+    ctx.bare_callee(module_text, module.start_byte())
+}
 
-    None
+fn type_qualification_name<'source>(
+    module: Node<'_>,
+    source: &'source str,
+    type_shadow_scopes: &[HashSet<String>],
+) -> Option<&'source str> {
+    if module.kind() != "identifier" {
+        return None;
+    }
+    let text = slice(module, source);
+    (!text.is_empty() && !super::is_name_shadowed_in_scopes(type_shadow_scopes, text))
+        .then_some(text)
 }
 
 fn register_lexical_type_shadow(node: Node<'_>, source: &str, scopes: &mut [HashSet<String>]) {
-    if !is_lexically_nested_type_declaration(node) {
-        return;
-    }
-    let Some(name) = node.child_by_field_name("name") else {
-        return;
-    };
-    let text = slice(name, source);
-    if !text.is_empty()
+    if let Some(name) = lexically_nested_type_declaration_name(node, source)
         && let Some(scope) = scopes.last_mut()
     {
-        scope.insert(text.to_string());
+        scope.insert(name.to_string());
     }
 }
 
@@ -1270,19 +1251,20 @@ fn handle_member(node: Node<'_>, ctx: &mut TsScan<'_>, locals: &LocalInferenceEn
 }
 
 fn handle_contextual_object_key(node: Node<'_>, ctx: &mut TsScan<'_>) {
-    for target in ctx
-        .receiver_provider
-        .resolve_contextual_object_literal_key_targets(node, ReceiverAnalysisBudget::default())
-    {
+    for target in contextual_object_literal_key_targets(&ctx.receiver_provider, node) {
         ctx.record(target.fq_name(), node);
     }
 }
 
+fn contextual_object_literal_key_targets<'tree>(
+    provider: &JsTsReceiverFactProvider<'tree, '_>,
+    node: Node<'tree>,
+) -> Vec<CodeUnit> {
+    provider.resolve_contextual_object_literal_key_targets(node, ReceiverAnalysisBudget::default())
+}
+
 fn handle_contextual_object_literal(node: Node<'_>, ctx: &mut TsScan<'_>) {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        handle_contextual_object_key(child, ctx);
-    }
+    for_each_named_child(node, |child| handle_contextual_object_key(child, ctx));
 }
 
 fn handle_scoped_member(
@@ -1319,7 +1301,7 @@ fn handle_scoped_member(
             return;
         }
 
-        if let Some(callee) = ctx.namespace_member_callee(object_text, property_text) {
+        if let Some(callee) = scoped_namespace_member_callee(node, ctx, locals) {
             ctx.record(callee, property);
             return;
         }
@@ -1336,7 +1318,7 @@ fn handle_scoped_member(
     }
 
     if object.kind() == "member_expression"
-        && let Some(class) = scoped_namespace_member_class(object, ctx, locals)
+        && let Some(class) = scoped_namespace_member_callee(object, ctx, locals)
     {
         for member in ctx.scoped_member_declaration_keys(&class, property_text) {
             ctx.record(member, property);
@@ -1345,10 +1327,7 @@ fn handle_scoped_member(
 }
 
 fn handle_scoped_contextual_object_key(node: Node<'_>, ctx: &mut ScopedTsScan<'_>) {
-    for target in ctx
-        .receiver_provider
-        .resolve_contextual_object_literal_key_targets(node, ReceiverAnalysisBudget::default())
-    {
+    for target in contextual_object_literal_key_targets(&ctx.receiver_provider, node) {
         ctx.record(
             UsageNodeKey::new(target.source().clone(), target.fq_name()),
             node,
@@ -1357,9 +1336,15 @@ fn handle_scoped_contextual_object_key(node: Node<'_>, ctx: &mut ScopedTsScan<'_
 }
 
 fn handle_scoped_contextual_object_literal(node: Node<'_>, ctx: &mut ScopedTsScan<'_>) {
+    for_each_named_child(node, |child| {
+        handle_scoped_contextual_object_key(child, ctx)
+    });
+}
+
+fn for_each_named_child<'tree>(node: Node<'tree>, mut visit: impl FnMut(Node<'tree>)) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        handle_scoped_contextual_object_key(child, ctx);
+        visit(child);
     }
 }
 
@@ -1470,7 +1455,7 @@ fn record_scoped_receiver_member(
     }
 }
 
-fn scoped_namespace_member_class(
+fn scoped_namespace_member_callee(
     node: Node<'_>,
     ctx: &ScopedTsScan<'_>,
     locals: &LocalInferenceEngine<String>,
@@ -1493,39 +1478,20 @@ fn scoped_namespace_member_class(
 
 fn handle_jsx(node: Node<'_>, ctx: &mut TsScan<'_>, locals: &LocalInferenceEngine<String>) {
     record_jsx_attributes(node, ctx);
-    let Some(name_node) = node.child_by_field_name("name") else {
+    let Some((rightmost, leaf_text)) = jsx_component_reference(node, ctx.source, locals) else {
         return;
     };
-    let Some((rightmost, leaf_text)) = rightmost_jsx_identifier(name_node, ctx.source) else {
-        return;
-    };
-    if leaf_text.is_empty() || locals.is_shadowed(leaf_text) {
-        return;
-    }
     if let Some(callee) = ctx.bare_callee(leaf_text, rightmost.start_byte()) {
         ctx.record(callee, rightmost);
     }
 }
 
 fn record_jsx_attributes(node: Node<'_>, ctx: &mut TsScan<'_>) {
-    let mut cursor = node.walk();
-    for attribute in node
-        .named_children(&mut cursor)
-        .filter(|child| child.kind() == "jsx_attribute")
-    {
-        let Some(name) = attribute.named_child(0) else {
-            continue;
-        };
-        let Some(targets) = ctx
-            .receiver_provider
-            .resolve_jsx_attribute_targets(name, ReceiverAnalysisBudget::default())
-        else {
-            continue;
-        };
-        for target in targets {
-            ctx.record(target.fq_name(), name);
-        }
-    }
+    let (provider, edges) = (&ctx.receiver_provider, &mut ctx.edges);
+    let input = ctx.input;
+    for_each_jsx_attribute_target(node, provider, |target, name| {
+        edges.record_reference(input, target.fq_name(), name);
+    });
 }
 
 fn handle_scoped_jsx(
@@ -1534,21 +1500,41 @@ fn handle_scoped_jsx(
     locals: &LocalInferenceEngine<String>,
 ) {
     record_scoped_jsx_attributes(node, ctx);
-    let Some(name_node) = node.child_by_field_name("name") else {
+    let Some((rightmost, leaf_text)) = jsx_component_reference(node, ctx.source, locals) else {
         return;
     };
-    let Some((rightmost, leaf_text)) = rightmost_jsx_identifier(name_node, ctx.source) else {
-        return;
-    };
-    if leaf_text.is_empty() || locals.is_shadowed(leaf_text) {
-        return;
-    }
     if let Some(callee) = ctx.bare_callee(leaf_text, rightmost.start_byte()) {
         ctx.record(callee, rightmost);
     }
 }
 
 fn record_scoped_jsx_attributes(node: Node<'_>, ctx: &mut ScopedTsScan<'_>) {
+    let (provider, edges) = (&ctx.receiver_provider, &mut ctx.edges);
+    let input = ctx.input;
+    for_each_jsx_attribute_target(node, provider, |target, name| {
+        edges.record_reference(
+            input,
+            UsageNodeKey::new(target.source().clone(), target.fq_name()),
+            name,
+        );
+    });
+}
+
+fn jsx_component_reference<'tree>(
+    node: Node<'tree>,
+    source: &'tree str,
+    locals: &LocalInferenceEngine<String>,
+) -> Option<(Node<'tree>, &'tree str)> {
+    let name_node = node.child_by_field_name("name")?;
+    let (rightmost, leaf_text) = rightmost_jsx_identifier(name_node, source)?;
+    (!leaf_text.is_empty() && !locals.is_shadowed(leaf_text)).then_some((rightmost, leaf_text))
+}
+
+fn for_each_jsx_attribute_target<'tree>(
+    node: Node<'tree>,
+    provider: &JsTsReceiverFactProvider<'tree, '_>,
+    mut record: impl FnMut(CodeUnit, Node<'tree>),
+) {
     let mut cursor = node.walk();
     for attribute in node
         .named_children(&mut cursor)
@@ -1557,17 +1543,13 @@ fn record_scoped_jsx_attributes(node: Node<'_>, ctx: &mut ScopedTsScan<'_>) {
         let Some(name) = attribute.named_child(0) else {
             continue;
         };
-        let Some(targets) = ctx
-            .receiver_provider
-            .resolve_jsx_attribute_targets(name, ReceiverAnalysisBudget::default())
+        let Some(targets) =
+            provider.resolve_jsx_attribute_targets(name, ReceiverAnalysisBudget::default())
         else {
             continue;
         };
         for target in targets {
-            ctx.record(
-                UsageNodeKey::new(target.source().clone(), target.fq_name()),
-                name,
-            );
+            record(target, name);
         }
     }
 }

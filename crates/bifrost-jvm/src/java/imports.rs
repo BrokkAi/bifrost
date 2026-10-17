@@ -187,7 +187,7 @@ pub fn non_static_import_path(import: &ImportInfo) -> Option<&StructuredImportPa
 /// The parser-derived path of a static import, or `None` otherwise.
 pub fn static_import_path(import: &ImportInfo) -> Option<&StructuredImportPath> {
     let path = import.path.as_ref()?;
-    (path.kind == Some(StructuredImportPathKind::StaticMember)).then_some(path)
+    path.is_static_member_import().then_some(path)
 }
 
 /// The package prefix an import makes visible: every segment for an

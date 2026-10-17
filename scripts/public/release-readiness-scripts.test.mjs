@@ -9,13 +9,19 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { fakeGhEnv } from "../fixtures/workflow-shell/fake-gh.mjs";
 import { run, scriptForDirectory } from "./release-script-test-helpers.mjs";
+import {
+  createBareGitPair,
+  gitWithTestIdentity,
+  withTempDir as withSharedTempDir,
+  writeExecutable,
+} from "./test-fixtures.mjs";
+import { writeFixtureFile as writeFile } from "../test-support/write-file.mjs";
 
 const scriptsDir = fileURLToPath(new URL(".", import.meta.url));
 const repoRoot = path.resolve(scriptsDir, "..", "..");
@@ -43,37 +49,11 @@ const BASH = (() => {
 })();
 
 function withTempDir(body) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-readiness-scripts."));
-  try {
-    return body(dir);
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
+  return withSharedTempDir(body, "bifrost-readiness-scripts.");
 }
 
 function git(cwd, ...args) {
-  return execFileSync("git", args, {
-    cwd,
-    encoding: "utf8",
-    env: {
-      ...process.env,
-      GIT_AUTHOR_NAME: "Test",
-      GIT_AUTHOR_EMAIL: "test@example.com",
-      GIT_COMMITTER_NAME: "Test",
-      GIT_COMMITTER_EMAIL: "test@example.com",
-    },
-  }).trim();
-}
-
-function writeFile(root, relativePath, contents) {
-  const target = path.join(root, relativePath);
-  fs.mkdirSync(path.dirname(target), { recursive: true });
-  fs.writeFileSync(target, contents, "utf8");
-}
-
-function writeExecutable(file, contents) {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, contents, { mode: 0o755 });
+  return gitWithTestIdentity(cwd, args).trim();
 }
 
 function commit(root, message, files) {
@@ -94,10 +74,7 @@ function releaseMetadata(version, digest) {
 // A repository shaped like the public one: a compiled-input commit, then a
 // checksum-only correction on top of it.
 function releaseLikeRepository(dir) {
-  const origin = path.join(dir, "origin.git");
-  const work = path.join(dir, "work");
-  execFileSync("git", ["init", "-q", "--bare", "-b", "master", origin]);
-  execFileSync("git", ["init", "-q", "-b", "master", work]);
+  const { origin, work } = createBareGitPair(dir);
   git(work, "config", "commit.gpgsign", "false");
   git(work, "remote", "add", "origin", origin);
 
@@ -125,8 +102,16 @@ test("the release crate inventory matches the workspace members plus the facade"
   const manifest = fs.readFileSync(path.join(repoRoot, "Cargo.toml"), "utf8");
   const members = [...manifest.matchAll(/^\s*"crates\/([\w-]+)",\s*$/gmu)].map((match) => match[1]);
   assert.ok(members.length > 0, "expected workspace members");
+  // A member that opts out of publication (such as a test-only proc-macro
+  // crate) is not part of the release.
+  const published = members.filter(
+    (member) =>
+      !/^publish\s*=\s*false\s*$/mu.test(
+        fs.readFileSync(path.join(repoRoot, "crates", member, "Cargo.toml"), "utf8"),
+      ),
+  );
 
-  const expected = [...members.map((member) => `brokk-${member}`), "brokk-bifrost"];
+  const expected = [...published.map((member) => `brokk-${member}`), "brokk-bifrost"];
   assert.deepEqual([...crates].sort(), expected.sort());
   assert.equal(crates.at(-1), "brokk-bifrost", "the facade must be packaged last");
 });
@@ -1018,5 +1003,136 @@ chmod +x "$3/bin/pip"
 
     assert.equal(result.status, 0, result.stderr);
     assert.equal(fs.readFileSync(pythonLog, "utf8").split("\n").filter(Boolean).length, 1);
+  });
+});
+
+// The staging and packaging blocks the release gate now shares with readiness
+// (#3472). Each fixture is a directory shaped like the workflow's working tree.
+
+function releaseTree(dir) {
+  const root = path.join(dir, "tree");
+  for (const [relativePath, contents] of Object.entries({
+    "LICENSE.md": "licence\n",
+    "README.md": "readme\n",
+    "licenses/THIRD_PARTY_LICENSES.html": "<html></html>\n",
+    "licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt": "notices\n",
+    "plugins/bifrost-agent/plugin.json": "{}\n",
+    "plugins/bifrost-agent/bin/bifrost-launcher.mjs": "// launcher\n",
+  })) {
+    writeFile(root, relativePath, contents);
+  }
+  writeExecutable(path.join(root, "target/x86_64-unknown-linux-gnu/release/bifrost"), "#!/usr/bin/env bash\necho bifrost 0.13.0\n");
+  return root;
+}
+
+function archiveEntries(archive) {
+  return execFileSync("tar", ["-tzf", archive], { encoding: "utf8" }).trim().split("\n").sort();
+}
+
+test("the Unix archive stager packages the binary beside the notices with a matching sidecar", () => {
+  withTempDir((dir) => {
+    const root = releaseTree(dir);
+    const result = run(BASH, [script("stage-unix-release-archive.sh"),
+      "target/x86_64-unknown-linux-gnu/release/bifrost", "x86_64-unknown-linux-gnu", "v0.13.0"],
+    { cwd: root, env: { DIST_DIR: "release-assets" } });
+    assert.equal(result.status, 0, result.stderr);
+    const archive = path.join(root, "release-assets", "bifrost-v0.13.0-x86_64-unknown-linux-gnu.tar.gz");
+    assert.deepEqual(archiveEntries(archive), [
+      "bifrost-v0.13.0-x86_64-unknown-linux-gnu/",
+      "bifrost-v0.13.0-x86_64-unknown-linux-gnu/LICENSE.md",
+      "bifrost-v0.13.0-x86_64-unknown-linux-gnu/README.md",
+      "bifrost-v0.13.0-x86_64-unknown-linux-gnu/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt",
+      "bifrost-v0.13.0-x86_64-unknown-linux-gnu/THIRD_PARTY_LICENSES.html",
+      "bifrost-v0.13.0-x86_64-unknown-linux-gnu/bifrost",
+    ]);
+    const digest = createHash("sha256").update(fs.readFileSync(archive)).digest("hex");
+    assert.equal(fs.readFileSync(`${archive}.sha256`, "utf8"), `${digest}  bifrost-v0.13.0-x86_64-unknown-linux-gnu.tar.gz\n`);
+
+    fs.rmSync(path.join(root, "licenses", "THIRD_PARTY_LICENSES.html"));
+    const missing = run(BASH, [script("stage-unix-release-archive.sh"),
+      "target/x86_64-unknown-linux-gnu/release/bifrost", "x86_64-unknown-linux-gnu", "v0.13.0"], { cwd: root });
+    assert.notEqual(missing.status, 0);
+    assert.match(missing.stderr, /THIRD_PARTY_LICENSES\.html/u);
+  });
+});
+
+test("the agent plugin packager ships the plugin with the licence and refuses installed dependencies", () => {
+  withTempDir((dir) => {
+    const root = releaseTree(dir);
+    const packageRoot = path.join(dir, "package-root");
+    const result = run(BASH, [script("package-agent-plugin.sh"), "v0.13.0", packageRoot],
+      { cwd: root, env: { DIST_DIR: "release-assets" } });
+    assert.equal(result.status, 0, result.stderr);
+    const archive = path.join(root, "release-assets", "bifrost-agent-v0.13.0.tar.gz");
+    assert.deepEqual(archiveEntries(archive), [
+      "bifrost-agent/", "bifrost-agent/LICENSE.md", "bifrost-agent/bin/", "bifrost-agent/bin/bifrost-launcher.mjs",
+      "bifrost-agent/plugin.json",
+    ]);
+    const digest = createHash("sha256").update(fs.readFileSync(archive)).digest("hex");
+    assert.equal(fs.readFileSync(`${archive}.sha256`, "utf8").split(/\s+/u)[0], digest);
+
+    fs.mkdirSync(path.join(root, "plugins/bifrost-agent/node_modules"));
+    const installed = run(BASH, [script("package-agent-plugin.sh"), "v0.13.0", path.join(dir, "other-root")], { cwd: root });
+    assert.notEqual(installed.status, 0);
+    assert.match(installed.stderr, /node_modules/u);
+  });
+});
+
+test("the smoke input stager extracts the binary and plugin archives and reports their paths", () => {
+  withTempDir((dir) => {
+    const root = releaseTree(dir);
+    assert.equal(run(BASH, [script("stage-unix-release-archive.sh"),
+      "target/x86_64-unknown-linux-gnu/release/bifrost", "x86_64-unknown-linux-gnu", "v0.13.0"], { cwd: root }).status, 0);
+    assert.equal(run(BASH, [script("package-agent-plugin.sh"), "v0.13.0", path.join(dir, "package-root")], { cwd: root }).status, 0);
+    const binaryDir = path.join(dir, "binary");
+    const pluginDir = path.join(dir, "plugin");
+    fs.mkdirSync(binaryDir);
+    fs.mkdirSync(pluginDir);
+    fs.copyFileSync(path.join(root, "dist", "bifrost-v0.13.0-x86_64-unknown-linux-gnu.tar.gz"), path.join(binaryDir, "bifrost-v0.13.0-x86_64-unknown-linux-gnu.tar.gz"));
+    fs.copyFileSync(path.join(root, "dist", "bifrost-agent-v0.13.0.tar.gz"), path.join(pluginDir, "bifrost-agent-v0.13.0.tar.gz"));
+    const output = path.join(dir, "output");
+    const result = run(BASH, [script("stage-agent-plugin-smoke.sh"), binaryDir, pluginDir, "bifrost"],
+      { env: { GITHUB_OUTPUT: output } });
+    assert.equal(result.status, 0, result.stderr);
+    const binary = path.join(binaryDir, "bifrost-v0.13.0-x86_64-unknown-linux-gnu", "bifrost");
+    assert.equal(fs.readFileSync(output, "utf8"), `binary=${binary}\nplugin=${pluginDir}/bifrost-agent\n`);
+    assert.ok(fs.statSync(binary).mode & 0o111);
+    assert.ok(fs.existsSync(path.join(pluginDir, "bifrost-agent", "plugin.json")));
+
+    const empty = run(BASH, [script("stage-agent-plugin-smoke.sh"), path.join(dir, "nothing"), pluginDir, "bifrost"]);
+    assert.notEqual(empty.status, 0);
+  });
+});
+
+test("the distribution version check counts each kind and refuses a foreign version", () => {
+  withTempDir((dir) => {
+    const dist = path.join(dir, "dist");
+    fs.mkdirSync(dist);
+    for (const name of ["brokk_bifrost_searchtools-0.13.0-cp38-abi3-manylinux_2_17_x86_64.whl",
+      "brokk_bifrost-0.13.0-py3-none-manylinux_2_17_x86_64.whl", "brokk_bifrost_searchtools-0.13.0.tar.gz"]) {
+      fs.writeFileSync(path.join(dist, name), "");
+    }
+    const check = (...counts) => run(BASH, [script("check-distribution-versions.sh"), dist, "0.13.0", ...counts]);
+    assert.equal(check("1", "1", "1").status, 0, check("1", "1", "1").stderr);
+    assert.match(check("5", "1", "1").stderr, /holds 1 client wheels, expected 5/u);
+    fs.writeFileSync(path.join(dist, "brokk_bifrost-0.13.1-py3-none-manylinux_2_17_x86_64.whl"), "");
+    assert.match(check("1", "2", "1").stderr, /Unexpected distribution version/u);
+  });
+});
+
+test("the npm tarball inspection refuses a credential file inside a package", () => {
+  withTempDir((dir) => {
+    const tarballs = path.join(dir, "npm-dist");
+    const stage = path.join(dir, "package");
+    writeFile(stage, "package/package.json", "{}\n");
+    fs.mkdirSync(tarballs);
+    execFileSync("tar", ["-C", stage, "-czf", path.join(tarballs, "clean-0.13.0.tgz"), "package"]);
+    assert.equal(run(BASH, [script("check-npm-tarballs.sh"), tarballs]).status, 0);
+    writeFile(stage, "package/.npmrc", "token\n");
+    execFileSync("tar", ["-C", stage, "-czf", path.join(tarballs, "leaky-0.13.0.tgz"), "package"]);
+    const result = run(BASH, [script("check-npm-tarballs.sh"), tarballs]);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /unexpected sensitive path/u);
+    assert.notEqual(run(BASH, [script("check-npm-tarballs.sh"), path.join(dir, "empty")]).status, 0);
   });
 });

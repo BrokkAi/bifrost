@@ -56,13 +56,12 @@ use std::path::{Path, PathBuf};
 
 use brokk_bifrost_analysis::analyzer::semantic_model::{
     ActivationSelector, AuthoredPayload, AuthoredSemanticModelPack, AuthoredShard, Compatibility,
-    CompilerOptions, Completeness, MemberFact, NameSelector, Producer, Provenance, Safety,
-    SourceFormat, TypeFact, VersionConstraint, compile_source,
+    Completeness, MemberFact, NameSelector, Provenance, TypeFact, VersionConstraint,
 };
 use serde::{Deserialize, Serialize};
 
-use super::FOUNDRY_PRODUCER_VERSION;
 use super::sanitizer_pack::summary_id;
+use super::{pack_relative_path, serialize_pack};
 
 /// The audit-report format tag. Bump it when a consumer must read the file
 /// differently, not when a field is added.
@@ -77,12 +76,6 @@ const PRODUCER_NAME: &str = "bifrost-framework-foundry";
 /// The pack content version. It is the framework content's own version, not the
 /// Bifrost version, and advances when the shipped declarations change.
 const PACK_CONTENT_VERSION: &str = "0.2.1";
-
-/// The authored framework declarations are Bifrost's own recorded surface,
-/// not a slice of the described library. New Bifrost-owned public packs use
-/// the public project license; retained packs may declare their own provenance
-/// and license in their checked-in metadata.
-const PACK_LICENSE: &str = "Apache-2.0";
 
 /// The JDK toolchain requirement. Every claimed type (`Runtime`, `Statement`,
 /// `PreparedStatement`, ...) exists in Java 17 and later.
@@ -247,33 +240,24 @@ pub fn write_framework_packs(
     conversion: &FrameworkConversion,
     output_root: &Path,
 ) -> Result<Vec<PathBuf>, FrameworkPackError> {
-    let mut written = Vec::new();
-    for pack in &conversion.packs {
-        let path = output_root.join(&pack.relative_path);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|error| FrameworkPackError::ReadDir {
-                path: parent.to_owned(),
-                message: error.to_string(),
-            })?;
+    let audit_json = serialize_audit(&conversion.audit);
+    super::write_foundry_outputs(
+        output_root,
+        conversion
+            .packs
+            .iter()
+            .map(|pack| (pack.relative_path.as_path(), pack.source_json.as_str())),
+        FRAMEWORK_AUDIT_FILE_NAME,
+        &audit_json,
+    )
+    .map_err(|error| match error {
+        super::FoundryOutputError::CreateDirectory { path, message } => {
+            FrameworkPackError::ReadDir { path, message }
         }
-        fs::write(&path, pack.source_json.as_bytes()).map_err(|error| {
-            FrameworkPackError::ReadFile {
-                path: path.clone(),
-                message: error.to_string(),
-            }
-        })?;
-        written.push(path);
-    }
-    let audit_path = output_root.join(FRAMEWORK_AUDIT_FILE_NAME);
-    fs::write(&audit_path, serialize_audit(&conversion.audit).as_bytes()).map_err(|error| {
-        FrameworkPackError::ReadFile {
-            path: audit_path.clone(),
-            message: error.to_string(),
+        super::FoundryOutputError::WriteFile { path, message } => {
+            FrameworkPackError::ReadFile { path, message }
         }
-    })?;
-    written.push(audit_path);
-    written.sort();
-    Ok(written)
+    })
 }
 
 /// The flattened types and members of one artifact.
@@ -289,22 +273,12 @@ struct ArtifactDeclarations {
 fn read_candidates(
     candidates_dir: &Path,
 ) -> Result<BTreeMap<String, ArtifactDeclarations>, FrameworkPackError> {
-    let mut files = Vec::new();
-    let read_dir = fs::read_dir(candidates_dir).map_err(|error| FrameworkPackError::ReadDir {
-        path: candidates_dir.to_owned(),
-        message: error.to_string(),
-    })?;
-    for entry in read_dir {
-        let entry = entry.map_err(|error| FrameworkPackError::ReadDir {
+    let files = super::json_candidate_paths(candidates_dir).map_err(|error| {
+        FrameworkPackError::ReadDir {
             path: candidates_dir.to_owned(),
             message: error.to_string(),
-        })?;
-        let path = entry.path();
-        if path.extension().and_then(|extension| extension.to_str()) == Some("json") {
-            files.push(path);
         }
-    }
-    files.sort();
+    })?;
 
     let mut by_artifact: BTreeMap<String, ArtifactDeclarations> = BTreeMap::new();
     for path in files {
@@ -497,12 +471,7 @@ impl PackIdentity {
     }
 
     fn relative_path(&self) -> PathBuf {
-        let file_name = format!("{}.json", self.pack_id);
-        if self.pinned {
-            PathBuf::from(file_name)
-        } else {
-            Path::new("staged").join(file_name)
-        }
+        pack_relative_path(&self.pack_id, self.pinned)
     }
 
     fn build_pack(
@@ -510,35 +479,22 @@ impl PackIdentity {
         types: Vec<TypeFact>,
         members: Vec<MemberFact>,
     ) -> AuthoredSemanticModelPack {
-        AuthoredSemanticModelPack {
-            schema_version:
-                brokk_bifrost_analysis::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
-            pack_id: self.pack_id.clone(),
-            version: PACK_CONTENT_VERSION.to_owned(),
-            producer: Producer {
-                name: PRODUCER_NAME.to_owned(),
-                version: FOUNDRY_PRODUCER_VERSION.to_owned(),
-            },
-            language: "java".to_owned(),
-            ecosystem: self.ecosystem.clone(),
-            compatibility: Compatibility {
+        super::authored_pack(
+            self.pack_id.clone(),
+            PACK_CONTENT_VERSION.to_owned(),
+            PRODUCER_NAME.to_owned(),
+            "java".to_owned(),
+            self.ecosystem.clone(),
+            Compatibility {
                 bifrost: None,
                 toolchains: self.toolchains.clone(),
             },
-            provenance: Provenance {
+            Provenance {
                 source: self.provenance_source.clone(),
                 revision: Some("framework-decls".to_owned()),
             },
-            license: PACK_LICENSE.to_owned(),
-            completeness: PACK_COMPLETENESS,
-            safety: Safety {
-                generated_code_only: false,
-                review_required: true,
-            },
-            carried_sources: Vec::new(),
-            cpp_portability: None,
-            python_correspondence: None,
-            shards: vec![AuthoredShard {
+            PACK_COMPLETENESS,
+            vec![AuthoredShard {
                 id: format!("declarations.{}", self.ecosystem),
                 activation: vec![self.activation.clone()],
                 payload: AuthoredPayload::DeclarationFacts {
@@ -551,41 +507,26 @@ impl PackIdentity {
                 collection_flows: None,
                 deferred_yields: None,
                 conditional_type_refinements: None,
+                callable_values: None,
             }],
-        }
+        )
     }
-}
-
-/// Serialize a pack to canonical pretty JSON with a trailing newline.
-fn serialize_pack(pack: &AuthoredSemanticModelPack) -> String {
-    let mut json = serde_json::to_string_pretty(pack).expect("a pack is serializable");
-    json.push('\n');
-    json
 }
 
 /// Compile a generated pack through the production compiler. A failure is a
 /// converter or candidate bug, so it is raised rather than recorded.
 fn compile_check(pack_id: &str, source_json: &str) -> Result<(), FrameworkPackError> {
-    compile_source(
-        SourceFormat::Json,
-        source_json.as_bytes(),
-        &CompilerOptions::default(),
-    )
-    .map(|_| ())
-    .map_err(|diagnostics| FrameworkPackError::CompileFailed {
-        pack_id: pack_id.to_owned(),
-        diagnostics: diagnostics
-            .iter()
-            .map(|diagnostic| format!("{diagnostic:?}"))
-            .collect(),
+    super::compile_pack_source(source_json).map_err(|diagnostics| {
+        FrameworkPackError::CompileFailed {
+            pack_id: pack_id.to_owned(),
+            diagnostics,
+        }
     })
 }
 
 /// Serialize the audit report to canonical pretty JSON with a trailing newline.
 pub fn serialize_audit(audit: &FrameworkAuditReport) -> String {
-    let mut json = serde_json::to_string_pretty(audit).expect("the audit report is serializable");
-    json.push('\n');
-    json
+    super::serialize_pretty_json_line(audit)
 }
 
 #[cfg(test)]
@@ -646,6 +587,38 @@ mod tests {
       ]
     }"#;
 
+    #[test]
+    fn the_servlet_coordinate_is_staged_unpinned_with_a_recorded_reason() {
+        let conversion = convert(&[("servlet.json", SERVLET)]);
+        let pack = conversion
+            .packs
+            .iter()
+            .find(|pack| pack.pack_id.contains("servlet"))
+            .expect("the servlet pack ships");
+        assert!(!pack.pinned, "the servlet pack is staged unpinned");
+        assert!(pack.relative_path.starts_with("staged"));
+        let audit = conversion
+            .audit
+            .packs
+            .iter()
+            .find(|entry| entry.pack_id == pack.pack_id)
+            .unwrap();
+        assert!(audit.staged_reason.is_some());
+        // The kept `extends` hierarchy is carried onto HttpServletRequest so the
+        // inherited getParameter resolves through the supertype closure.
+        let value: serde_json::Value = serde_json::from_str(&pack.source_json).unwrap();
+        let types = value["shards"][0]["payload"]["types"].as_array().unwrap();
+        let http = types
+            .iter()
+            .find(|fact| fact["name"] == "javax.servlet.http.HttpServletRequest")
+            .unwrap();
+        assert_eq!(http["hierarchy"][0]["hierarchy_kind"], "extends");
+        assert_eq!(
+            http["hierarchy"][0]["target"]["name"],
+            "javax.servlet.ServletRequest"
+        );
+    }
+
     const JDK: &str = r#"{
       "artifact": "jdk",
       "provenance": "javadoc",
@@ -699,38 +672,6 @@ mod tests {
         assert_eq!(payload["members"].as_array().unwrap().len(), 1);
         assert_eq!(payload["members"][0]["owner"], "jdk.statement");
         assert!(payload["types"][0].get("members").is_none());
-    }
-
-    #[test]
-    fn the_servlet_coordinate_is_staged_unpinned_with_a_recorded_reason() {
-        let conversion = convert(&[("servlet.json", SERVLET)]);
-        let pack = conversion
-            .packs
-            .iter()
-            .find(|pack| pack.pack_id.contains("servlet"))
-            .expect("the servlet pack ships");
-        assert!(!pack.pinned, "the servlet pack is staged unpinned");
-        assert!(pack.relative_path.starts_with("staged"));
-        let audit = conversion
-            .audit
-            .packs
-            .iter()
-            .find(|entry| entry.pack_id == pack.pack_id)
-            .unwrap();
-        assert!(audit.staged_reason.is_some());
-        // The kept `extends` hierarchy is carried onto HttpServletRequest so the
-        // inherited getParameter resolves through the supertype closure.
-        let value: serde_json::Value = serde_json::from_str(&pack.source_json).unwrap();
-        let types = value["shards"][0]["payload"]["types"].as_array().unwrap();
-        let http = types
-            .iter()
-            .find(|fact| fact["name"] == "javax.servlet.http.HttpServletRequest")
-            .unwrap();
-        assert_eq!(http["hierarchy"][0]["hierarchy_kind"], "extends");
-        assert_eq!(
-            http["hierarchy"][0]["target"]["name"],
-            "javax.servlet.ServletRequest"
-        );
     }
 
     #[test]

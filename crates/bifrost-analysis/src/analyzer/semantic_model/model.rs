@@ -1,3 +1,4 @@
+use crate::analyzer::semantic::ArgumentDomain;
 use schemars::JsonSchema;
 // The contextual-role fact is shared with the structural layer: a language's
 // structural spec reads it from workspace syntax and this format carries it for
@@ -13,9 +14,18 @@ use serde::{Deserialize, Serialize};
 /// version five adds reviewed normal-result use obligations; version six adds
 /// positive declared callable-surface coverage; version seven adds reviewed
 /// procedure summaries with an explicit no-concurrency-effects claim; version
-/// eight moves engine compatibility to schema admission.
+/// eight moves engine compatibility to schema admission; version nine retains
+/// unknown type knowledge without dropping callable ports; version ten carries
+/// native callable-values facts and scoped coverage on authored shards; version
+/// eleven carries structured procedure formals, channel-close effects, and
+/// returned-callable models; version twelve is the origin-side merged contract.
+/// Version thirteen is the combined contract after both repository histories.
+/// Version fourteen carries directional variadic kinds on structured procedure
+/// formals. Version fifteen carries typed module values and callable parameter
+/// roles. Version sixteen carries exact runtime return-class sets. Version seventeen
+/// carries ordered exhaustive Python runtime direct-base claims.
 pub const VERSION_INDEPENDENT_COMPATIBILITY_SCHEMA_VERSION: u32 = 8;
-pub const SEMANTIC_MODEL_SCHEMA_VERSION: u32 = VERSION_INDEPENDENT_COMPATIBILITY_SCHEMA_VERSION;
+pub const SEMANTIC_MODEL_SCHEMA_VERSION: u32 = 17;
 /// The schema versions a reader accepts.
 ///
 /// Packs reject unknown fields and every object is explicitly tagged, so a
@@ -25,7 +35,25 @@ pub const SEMANTIC_MODEL_SCHEMA_VERSION: u32 = VERSION_INDEPENDENT_COMPATIBILITY
 /// pack or release asset keeps loading here until its producer regenerates it
 /// on the normal cadence. A version-two pack carries no `ambient_use` fact, so
 /// it answers "unreviewed" for every declaration, which is what absence means.
-pub const SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[2, 3, 4, 5, 6, 7, 8];
+pub const SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS: &[u32] =
+    &[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17];
+/// Explicit unknown type knowledge first appeared in schema nine.
+pub const UNKNOWN_TYPE_MIN_SCHEMA_VERSION: u32 = 9;
+/// Native callable-values facts first appeared in schema ten.
+pub const CALLABLE_VALUES_MIN_SCHEMA_VERSION: u32 = 10;
+/// Structured procedure formal names and defaults first appeared in schema eleven.
+pub const PROCEDURE_FORMALS_MIN_SCHEMA_VERSION: u32 = 11;
+/// Directional rest-formal kinds first appeared in schema fourteen.
+pub const PROCEDURE_VARIADIC_FORMALS_MIN_SCHEMA_VERSION: u32 = 14;
+/// Typed module values and callable parameter roles first appeared in schema fifteen.
+pub const TYPED_VALUES_AND_PARAMETER_ROLES_MIN_SCHEMA_VERSION: u32 = 15;
+/// Explicit exact runtime return-class sets first appeared in schema sixteen.
+pub const EXACT_RETURN_CLASSES_MIN_SCHEMA_VERSION: u32 = 16;
+/// Exhaustive ordered Python runtime bases first appeared in schema seventeen.
+pub const RUNTIME_BASES_MIN_SCHEMA_VERSION: u32 = 17;
+/// Structured channel-close effects and returned-callable bindings first
+/// appeared in schema eleven.
+pub const CHANNEL_CLOSE_EFFECTS_MIN_SCHEMA_VERSION: u32 = 11;
 /// Positive declared callable inventory first appeared in version six.
 pub const CALLABLE_SURFACE_MIN_SCHEMA_VERSION: u32 = 6;
 /// Reviewed no-concurrency-effects summaries first appeared in schema seven.
@@ -224,6 +252,147 @@ pub struct CollectionFlowFact {
     pub coverage: Option<Completeness>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provenance: Vec<String>,
+}
+
+/// Native companion for the CSMI callable-values profile. References inside
+/// each CSMI payload are native declaration IDs here and are remapped only at
+/// the interchange boundary. Facts are unordered alternatives; array order
+/// does not establish precedence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CallableValuesPayload {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub facts: Vec<CallableValuesFact>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub coverage: Vec<CallableValuesCoverage>,
+    /// Exact source identities for anonymous callable targets. These retain
+    /// parser anchors rather than inventing a member name or artifact locator.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub anonymous_callables: Vec<AnonymousCallableIdentity>,
+}
+
+/// Language-neutral source identity for an anonymous callable referenced by a
+/// callable-value fact. Language adapters interpret `package_identity` in
+/// their own namespace and rebind the anchors and shape against a fresh parse
+/// of the exact artifact before using this authored descriptor as evidence.
+/// The type nodes retain source provenance; they do not claim resolved
+/// semantic type identities.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AnonymousCallableIdentity {
+    pub id: String,
+    pub artifact_sha256: String,
+    /// Opaque to the native semantic-model layer. Go's adapter interprets this
+    /// as its structured package import path; the existing wire key is retained
+    /// for compatibility with schema 10 documents.
+    #[serde(rename = "package_import_path")]
+    pub package_identity: String,
+    pub anchor: SourceAnchor,
+    pub lexical_owner_chain: Vec<SourceAnchor>,
+    pub signature: SourceCallableShape,
+}
+
+/// Half-open UTF-8 byte range in one exact source file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SourceByteRange {
+    pub start: usize,
+    pub end: usize,
+}
+
+/// Syntax declaration category used by a language adapter to rebind a source
+/// anchor. The neutral transport preserves distinctions without assigning
+/// names or language-specific semantics to them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceDeclarationKind {
+    Function,
+    Method,
+    FunctionLiteral,
+    Type,
+    TypeAlias,
+    StructField,
+}
+
+/// Exact source file and syntax-node range.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SourceAnchor {
+    pub file: String,
+    pub byte_range: SourceByteRange,
+    pub kind: SourceDeclarationKind,
+}
+
+/// Exact source range for a type node. This is provenance only until a
+/// language-aware resolver proves the semantic identity of that type.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SourceTypeNode {
+    pub file: String,
+    pub byte_range: SourceByteRange,
+}
+
+/// One grouped parameter or result entry in a source callable signature.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SourceParameterShape {
+    pub type_node: SourceTypeNode,
+    pub variadic: bool,
+    pub arity: usize,
+}
+
+/// Full structured syntax provenance for a callable signature. Grouped arity
+/// and variadic flags are retained exactly; a declaration chain records source
+/// aliases/declarations without asserting that their type identities resolve.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SourceCallableShape {
+    pub function_type: SourceTypeNode,
+    pub parameters: Vec<SourceParameterShape>,
+    pub results: Vec<SourceParameterShape>,
+    pub declaration_chain: Vec<SourceAnchor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CallableValuesFact {
+    #[schemars(with = "serde_json::Value")]
+    pub payload: crate::analyzer::semantic_model::csmi::CsmiCallableValuesPayload,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provenance: Vec<String>,
+}
+
+/// Coverage is independent for each callable and profile family. Complete
+/// coverage requires known callable identity and arity; unknown identity or
+/// arity must remain Unknown or Partial. `callable` is a native declaration
+/// ID, not a CSMI document-local symbol.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CallableValuesCoverage {
+    pub family: CallableValuesFamily,
+    pub callable: String,
+    pub status: crate::analyzer::semantic_model::csmi::CsmiCoverageStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(with = "Vec<serde_json::Value>")]
+    pub limitations: Vec<crate::analyzer::semantic_model::csmi::CsmiLimitation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provenance: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum CallableValuesFamily {
+    ReturnedCallables,
+    CallbackInvocations,
+}
+
+impl CallableValuesPayload {
+    pub fn record_count(&self) -> usize {
+        self.facts
+            .len()
+            .saturating_add(self.coverage.len())
+            .saturating_add(self.anonymous_callables.len())
+    }
 }
 
 /// Native companion for the standardized CSMI conditional-type-refinement
@@ -725,7 +894,7 @@ pub enum RuntimeExceptionOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AuthoredSemanticModelPack {
-    #[schemars(range(min = 2, max = 8))]
+    #[schemars(range(min = 2, max = SEMANTIC_MODEL_SCHEMA_VERSION))]
     pub schema_version: u32,
     pub pack_id: String,
     pub version: String,
@@ -1115,7 +1284,7 @@ impl CppPortabilityEvidence {
 }
 
 fn canonical_json_key<T: Serialize>(value: &T) -> Vec<u8> {
-    serde_json::to_vec(value).expect("C++ portability evidence is JSON serializable")
+    super::compact_json_bytes(value).expect("C++ portability evidence is JSON serializable")
 }
 
 fn normalize_artifact_selector(selector: &mut CppArtifactSelector) {
@@ -1174,10 +1343,19 @@ pub struct Producer {
     pub version: String,
 }
 
+impl Producer {
+    pub(crate) fn for_name(name: &str) -> Self {
+        Self {
+            name: name.to_owned(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Compatibility {
-    /// Required for legacy schemas 2 through 7. Schema 8 is admitted by the
+    /// Required for legacy schemas 2 through 7. Schemas 8 and later are admitted by the
     /// reader's supported-schema set and must omit this field.
     #[serde(
         default,
@@ -1206,8 +1384,8 @@ impl Compatibility {
             (2..=7, Some(requirement)) => VersionReq::parse(requirement)
                 .map(Some)
                 .map_err(|_| CompatibilityError::InvalidLegacyRequirement),
-            (8, Some(_)) => Err(CompatibilityError::ForbiddenRequirement),
-            (8, None) => Ok(None),
+            (8.., Some(_)) => Err(CompatibilityError::ForbiddenRequirement),
+            (8.., None) => Ok(None),
             _ => unreachable!("supported schema version was checked above"),
         }
     }
@@ -1260,7 +1438,7 @@ impl std::fmt::Display for CompatibilityError {
             Self::InvalidLegacyRequirement => formatter
                 .write_str("legacy compatibility.bifrost must be a semantic-version requirement"),
             Self::ForbiddenRequirement => {
-                formatter.write_str("schema 8 forbids compatibility.bifrost")
+                formatter.write_str("schema 8 and later forbid compatibility.bifrost")
             }
         }
     }
@@ -1277,9 +1455,14 @@ where
 
 #[cfg(test)]
 mod compatibility_tests {
-    use super::{Compatibility, SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS};
+    use super::{
+        Compatibility, SEMANTIC_MODEL_SCHEMA_VERSION, SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS,
+    };
     use semver::Version;
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3815: semantic-pack admission rejected valid legacy shapes after schema-aware gating"
+    )]
     #[test]
     fn compatibility_shape_preserves_legacy_gate_and_schema_eight_admission() {
         let engine = Version::parse("0.12.0").unwrap();
@@ -1302,10 +1485,19 @@ mod compatibility_tests {
         .unwrap();
         assert!(native.validate_for_schema(8).is_ok());
         assert!(native.matches_engine(8, &engine).unwrap());
+        assert!(native.validate_for_schema(9).is_ok());
+        assert!(native.validate_for_schema(10).is_ok());
+        assert!(native.validate_for_schema(11).is_ok());
+        assert!(native.validate_for_schema(14).is_ok());
+        assert!(native.matches_engine(9, &engine).unwrap());
+        assert!(native.matches_engine(11, &engine).unwrap());
         let bytes = serde_json::to_value(&native).unwrap();
         assert!(bytes.get("bifrost").is_none());
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3815: semantic-pack admission accepted malformed or mixed schema versions"
+    )]
     #[test]
     fn compatibility_rejects_malformed_or_mixed_schema_shapes() {
         let engine = Version::parse("0.12.0").unwrap();
@@ -1336,10 +1528,12 @@ mod compatibility_tests {
         .unwrap();
         assert!(mixed.validate_for_schema(8).is_err());
         assert!(mixed.matches_engine(8, &engine).is_err());
-        assert!(missing_legacy.matches_engine(9, &engine).is_err());
+        assert!(mixed.validate_for_schema(9).is_err());
+        assert!(mixed.validate_for_schema(11).is_err());
+        assert!(missing_legacy.matches_engine(11, &engine).unwrap());
         assert_eq!(
             SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS,
-            &[2, 3, 4, 5, 6, 7, 8]
+            (2..=SEMANTIC_MODEL_SCHEMA_VERSION).collect::<Vec<_>>()
         );
 
         assert!(
@@ -1376,6 +1570,15 @@ pub enum Completeness {
     Complete,
 }
 
+impl Completeness {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Partial => "partial",
+            Self::Complete => "complete",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Safety {
@@ -1404,6 +1607,10 @@ pub struct AuthoredShard {
     pub deferred_yields: Option<DeferredYieldsPayload>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conditional_type_refinements: Option<ConditionalTypeRefinementsPayload>,
+    /// Native callable-value facts and scoped producer coverage. This is a
+    /// schema-ten companion so older shards keep their historical wire shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callable_values: Option<CallableValuesPayload>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1480,6 +1687,11 @@ pub struct AuthoredProcedureSummary {
     /// call site; they do not add value-flow edges to `effects`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub concurrency_effects: Vec<AuthoredConcurrencyEffect>,
+    /// Effects performed when a callable returned in this result ordinal is
+    /// invoked. The callable is bound only from this exact normal result, and
+    /// its effects name ports of this producer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub returned_callables: Vec<AuthoredReturnedCallable>,
     /// Reviewed claim that this procedure neither synchronizes with
     /// caller-visible memory nor retains caller-visible memory for concurrent
     /// work. This is independent of `ordinary_heap_unchanged`: it says nothing
@@ -1756,6 +1968,10 @@ pub enum AuthoredResultPredicate {
     NonNull,
     True,
     False,
+    Eof,
+    #[serde(rename = "nonzero")]
+    NonZero,
+    MinusOne,
 }
 
 /// One namespaced effect a reviewed pack attributes to a procedure (#2437).
@@ -1829,6 +2045,66 @@ pub struct AuthoredProcedureTarget {
     #[schemars(extend("default" = false))]
     pub variadic: bool,
     pub parameter_count: u32,
+    /// Structured ordinary formals used to bind exact call actuals to this
+    /// summary. Empty preserves legacy exact-arity behavior. Non-empty values
+    /// must describe every fixed formal in declaration order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub formals: Vec<AuthoredProcedureFormal>,
+}
+
+/// One structured ordinary formal in an authored procedure-summary target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoredProcedureFormal {
+    pub name: String,
+    /// Whether the formal is bound by a declared default when no actual binds it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[schemars(extend("default" = false))]
+    pub optional: bool,
+    #[serde(default)]
+    pub passing_mode: AuthoredProcedureFormalPassingMode,
+    /// Which direct actual domain this repeating formal absorbs. Omission
+    /// means an ordinary single-value formal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variadic_kind: Option<AuthoredProcedureFormalVariadicKind>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthoredProcedureFormalPassingMode {
+    PositionalOnly,
+    #[default]
+    PositionalOrNamed,
+    NamedOnly,
+}
+
+impl AuthoredProcedureFormalPassingMode {
+    pub const fn accepts_positional(self) -> bool {
+        !matches!(self, Self::NamedOnly)
+    }
+
+    pub const fn accepts_named(self) -> bool {
+        !matches!(self, Self::PositionalOnly)
+    }
+}
+
+/// The direct argument domain a structured rest formal accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthoredProcedureFormalVariadicKind {
+    Positional,
+    Keyword,
+    Both,
+}
+
+impl AuthoredProcedureFormalVariadicKind {
+    pub const fn accepts_positional(self) -> bool {
+        matches!(self, Self::Positional | Self::Both)
+    }
+
+    pub const fn accepts_named(self) -> bool {
+        matches!(self, Self::Keyword | Self::Both)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1877,6 +2153,30 @@ pub enum AuthoredSummaryOutput {
         location: String,
     },
     ExceptionalReturn {},
+}
+
+/// A value identity port on a procedure summary, usable for either an input
+/// or a normal result when a concurrency effect names the channel to close.
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AuthoredSummaryPort {
+    Input { input: AuthoredSummaryInput },
+    Output { output: AuthoredSummaryOutput },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoredReturnedCallable {
+    #[schemars(range(max = 65535))]
+    pub result_ordinal: u32,
+    /// The declared effects occur on the first invocation only. If the
+    /// invocation cannot be proved unique, the solver keeps its effect open.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub at_most_once: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub concurrency_effects: Vec<AuthoredConcurrencyEffect>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -2169,6 +2469,28 @@ pub enum AuthoredConcurrencyEffect {
     TimerReset {
         timer: AuthoredSummaryInput,
     },
+    /// Close the channel identity named by a structured procedure port.
+    ChannelClose {
+        channel: AuthoredSummaryPort,
+        /// The channel identity is unique to this result instance.
+        fresh: bool,
+    },
+    /// Close the channel identity from a runtime task. This carries no
+    /// sequencing from the modeled caller into that task; ordering is through
+    /// the channel receive only.
+    ChannelCloseAsync {
+        channel: AuthoredSummaryPort,
+        /// The channel identity is unique to this result instance.
+        fresh: bool,
+    },
+    /// When a close reaches `source`, close `target` as part of that same
+    /// close operation. This models exact parent-to-derived channel links.
+    ChannelClosePropagate {
+        source: AuthoredSummaryPort,
+        target: AuthoredSummaryPort,
+        /// The target channel identity is unique to the derived result.
+        target_fresh: bool,
+    },
     /// One `testing.T.Run` call (issue #3383). `callable` names the subtest
     /// callback and `group` names the parent test node. The callback runs as
     /// one subtest task on every path that reaches the call; the call joins
@@ -2350,6 +2672,10 @@ pub struct TypeFact {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     #[schemars(extend("default" = false))]
     pub callable_surface_complete: bool,
+    /// Per-namespace absence coverage asserted by an independently enumerated
+    /// JVM provider. Older public-API shards do not imply this stronger claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jvm_inventory: Option<JvmOwnerInventory>,
     #[serde(default)]
     pub has_explicit_type_terms: bool,
     #[serde(default)]
@@ -2372,6 +2698,11 @@ pub struct TypeFact {
     pub embedded_types: Vec<EmbeddedTypeFact>,
     #[serde(default)]
     pub hierarchy: Vec<HierarchyFact>,
+    /// Exhaustive ordered direct runtime bases of a Python class. None makes
+    /// no claim; Some(empty) positively claims a root. This does not describe
+    /// typing inheritance or attest to member inventory completeness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_bases: Option<Vec<TypeRef>>,
     #[serde(default)]
     pub aliases: Vec<String>,
     #[serde(default)]
@@ -2379,6 +2710,29 @@ pub struct TypeFact {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard: Option<DeclarationGuard>,
     pub locator: Locator,
+}
+
+/// Structured JVM inventory coverage. Missing coverage is deliberately open.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct JvmOwnerInventory {
+    pub callables_complete: bool,
+    pub values_complete: bool,
+    pub types_complete: bool,
+    pub supertypes_complete: bool,
+    pub supertypes: Vec<HierarchyFact>,
+    pub nested_types: Vec<JvmNestedType>,
+    /// Members outside the public API projection, in producer order.
+    pub additional_members: Vec<MemberFact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct JvmNestedType {
+    pub name: String,
+    pub owner_fqn: String,
+    pub visibility: Visibility,
+    pub is_static: bool,
 }
 
 /// Reviewed value semantics for a declared type. Copy behavior and move
@@ -2421,6 +2775,24 @@ pub enum TypeKind {
     Record,
     Module,
     TypeAlias,
+}
+
+impl TypeKind {
+    pub const fn stable_label(self) -> &'static str {
+        match self {
+            Self::Class => "class",
+            Self::Annotation => "annotation",
+            Self::Delegate => "delegate",
+            Self::Interface => "interface",
+            Self::Trait => "trait",
+            Self::Struct => "struct",
+            Self::Union => "union",
+            Self::Enum => "enum",
+            Self::Record => "record",
+            Self::Module => "module",
+            Self::TypeAlias => "type_alias",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
@@ -2484,17 +2856,28 @@ pub struct MemberFact {
     /// declaration, never that the declaration is ordinary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ambient_use: Option<AmbientUseRole>,
+    /// Declared class of an externally modeled module-level value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_type: Option<TypeRef>,
+    /// Class used for member dispatch when the declared value is a proxy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxied_type: Option<TypeRef>,
     /// The authored declarations contain every callable with this member's
-    /// exact owner, name, receiver form, and fixed arity.
+    /// exact owner, name, receiver form, and declared arity.
     ///
     /// This is narrower than pack or owner-surface completeness. It permits
     /// an exact external-call binding for this one structural family while a
     /// curated declaration pack remains globally partial. Same-family
-    /// duplicates still conflict, and variadic families cannot yet make this
-    /// claim.
+    /// duplicates still conflict; a variadic signature retains its fixed
+    /// prefix and repeated final parameter in that family identity.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     #[schemars(extend("default" = false))]
     pub callable_family_complete: bool,
+    /// The complete set of runtime classes this callable can return. Each
+    /// entry is a class identity, not a return annotation; absence leaves the
+    /// runtime class open.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exact_return_classes: Vec<TypeRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<Signature>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2818,6 +3201,15 @@ pub enum Visibility {
     Private,
 }
 
+impl Visibility {
+    pub(crate) const fn is_externally_visible(self) -> bool {
+        matches!(
+            self,
+            Self::Public | Self::Protected | Self::ProtectedInternal
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StructuredTypeExpression {
@@ -2871,6 +3263,14 @@ pub struct Parameter {
     pub variadic: bool,
     #[serde(default, skip_serializing_if = "ParameterPassingMode::is_default")]
     pub passing_mode: ParameterPassingMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<ParameterRole>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ParameterRole {
+    Request,
 }
 
 /// Which source-level argument forms may bind one formal parameter.
@@ -2890,11 +3290,19 @@ pub enum ParameterPassingMode {
 
 impl ParameterPassingMode {
     pub const fn accepts_positional(self) -> bool {
-        matches!(self, Self::PositionalOnly | Self::PositionalOrNamed)
+        self.argument_domain().accepts_positional()
     }
 
     pub const fn accepts_named(self) -> bool {
         matches!(self, Self::PositionalOrNamed | Self::NamedOnly)
+    }
+
+    const fn argument_domain(self) -> &'static ArgumentDomain {
+        match self {
+            Self::PositionalOnly => &ArgumentDomain::Positional,
+            Self::PositionalOrNamed => &ArgumentDomain::PositionalOrKeyword,
+            Self::NamedOnly => &ArgumentDomain::Keyword,
+        }
     }
 
     fn is_default(value: &Self) -> bool {
@@ -2905,6 +3313,9 @@ impl ParameterPassingMode {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TypeRef {
+    /// The type is not known. This is neither a concrete type nor a claim that
+    /// every type is allowed. Callable ports remain present independently.
+    Unknown,
     Named {
         name: String,
         #[serde(default)]
@@ -2964,6 +3375,64 @@ pub enum TypeRef {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         result: Option<Box<TypeRef>>,
     },
+}
+
+impl TypeRef {
+    pub(crate) fn named(name: impl Into<String>) -> Self {
+        Self::Named {
+            name: name.into(),
+            arguments: Vec::new(),
+            nullable: false,
+        }
+    }
+
+    pub(crate) fn is_type_parameter(&self, expected: &str) -> bool {
+        matches!(self, Self::TypeParameter { name } if name == expected)
+    }
+
+    /// Whether any part of this type lacks type knowledge. Representational
+    /// equality remains useful for transport; it cannot prove type equality
+    /// when this returns true.
+    pub fn contains_unknown(&self) -> bool {
+        let mut pending = vec![self];
+        while let Some(reference) = pending.pop() {
+            match reference {
+                Self::Unknown => return true,
+                Self::Named { arguments, .. } | Self::Declared { arguments, .. } => {
+                    pending.extend(arguments);
+                }
+                Self::TypeParameter { .. } => {}
+                Self::Array { element }
+                | Self::ByRef { element, .. }
+                | Self::Pointer { element }
+                | Self::Slice { element }
+                | Self::FixedArray { element, .. }
+                | Self::Channel { element, .. } => pending.push(element),
+                Self::Map { key, value } => {
+                    pending.push(key);
+                    pending.push(value);
+                }
+                Self::Wildcard { bound, .. } => pending.extend(bound.as_deref()),
+                Self::Tuple { elements } => pending.extend(elements),
+                Self::Function { parameters, result } => {
+                    pending.extend(parameters.iter().map(|parameter| &parameter.r#type));
+                    pending.extend(result.as_deref());
+                }
+            }
+        }
+        false
+    }
+}
+
+impl Signature {
+    /// Type-dependent matching requires knowledge of every retained port type.
+    /// This does not affect exact callable identity or formal binding shape.
+    pub fn contains_unknown_types(&self) -> bool {
+        self.parameters
+            .iter()
+            .any(|parameter| parameter.r#type.contains_unknown())
+            || self.returns.as_ref().is_some_and(TypeRef::contains_unknown)
+    }
 }
 
 /// The source-level category of a by-reference type.
@@ -3033,6 +3502,15 @@ pub enum Locator {
         #[schemars(with = "Option<serde_json::Value>")]
         callable_shape_evidence: Option<Box<PortableCallableShapeEvidence>>,
     },
+}
+
+impl Locator {
+    pub(crate) fn artifact(path: impl Into<String>, symbol: impl Into<String>) -> Self {
+        Self::Artifact {
+            path: path.into(),
+            symbol: symbol.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3381,4 +3859,18 @@ pub(crate) fn normalize_artifact_locator_paths(pack: &mut AuthoredSemanticModelP
             }
         }
     }
+}
+
+/// One Go package as a pinned release spec declares it.
+///
+/// A workspace dependency learns its packages from `go list`, which is not
+/// available when authoring a pinned release bundle from a bare source tree.
+/// The spec names each package's import path, declared package name, and
+/// owned `.go` files explicitly instead, exactly as a pinned Python stub tree
+/// names its files: the structure is spec-authored, not toolchain-derived.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoPinnedPackage {
+    pub import_path: String,
+    pub name: String,
+    pub files: Vec<String>,
 }

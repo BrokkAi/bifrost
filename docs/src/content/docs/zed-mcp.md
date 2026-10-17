@@ -12,15 +12,12 @@ as a custom stdio context server in `settings.json`.
 
 ## Configure MCP
 
-Build or install Bifrost first. To install the release verified with this setup
-explicitly:
+Install Bifrost first. See [Install](/install/) for every method. With Cargo:
 
 ```bash
-cargo install brokk-bifrost --version 0.8.9 --locked --force
+cargo install brokk-bifrost --locked --force
 bifrost --version
 ```
-
-The version check should print `bifrost 0.8.9`.
 
 For local development, build this checkout and use an absolute path to the
 debug binary:
@@ -44,9 +41,9 @@ Add a `context_servers` entry to your Zed settings:
 ```
 
 For a local checkout build, `command` should point at
-`/path/to/bifrost/target/debug/bifrost`. Always pass an explicit `--root`;
-otherwise Bifrost analyzes whatever directory Zed uses as the subprocess working
-directory.
+`/path/to/bifrost/target/debug/bifrost`. Pass an explicit `--root`. Without
+it, Bifrost starts unbound and analyzes only a workspace root that Zed supplies
+through MCP roots. It does not analyze the subprocess working directory.
 
 `symbol|extended` exposes the analyzer-backed code-intelligence tools used by
 the Bifrost agent package, including `search_symbols`, `get_summaries`,

@@ -1,13 +1,16 @@
 //! Shared SQLite schema and connection setup for bifrost's rebuildable cache DB.
 
 use std::collections::HashSet;
+use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, Once, Weak};
+use std::sync::{Arc, Mutex, Once, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use once_cell::sync::Lazy;
 use rusqlite::ffi::ErrorCode;
+#[cfg(test)]
+use rusqlite::types::Value;
 use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
@@ -16,6 +19,31 @@ pub mod sql_profile;
 use sql_profile::ConnectionRole;
 
 pub type Result<T> = std::result::Result<T, String>;
+
+/// Read `BIFROST_UNSAFE_NO_FSYNC` once on first use.
+/// Only `1` enables it. Analyzer caches and semantic-pack catalogs then skip
+/// fsync and use SQLite synchronous=OFF. This is meant for disposable CI
+/// machines: a host crash can corrupt those stores.
+fn unsafe_no_fsync() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("BIFROST_UNSAFE_NO_FSYNC").as_deref() == Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+/// SQLite synchronous setting for cache stores; see `unsafe_no_fsync`.
+pub fn sqlite_synchronous() -> &'static str {
+    if unsafe_no_fsync() { "OFF" } else { "NORMAL" }
+}
+
+/// Sync a cache or catalog file; see `unsafe_no_fsync` for the unsafe CI override.
+pub fn sync_file(file: &File) -> std::io::Result<()> {
+    if unsafe_no_fsync() {
+        Ok(())
+    } else {
+        file.sync_all()
+    }
+}
 
 /// Shared stem of every cache store file name.
 const CACHE_DB_STEM: &str = "bifrost_cache";
@@ -28,6 +56,12 @@ pub const LEGACY_ANALYZER_DB_FILE_NAME: &str = "analyzer_cache.db";
 /// The store file and the SQLite sidecars that belong to it.
 pub const STORE_FILE_SUFFIXES: [&str; 4] = ["", "-wal", "-shm", "-journal"];
 const INITIAL_BUILD_LOCK_SUFFIX: &str = ".initial-build.lock";
+/// Name prefix of a store copy staged for an upgrade, and of its SQLite
+/// sidecars. Nothing else in a cache directory starts with it.
+const STAGED_UPGRADE_PREFIX: &str = ".bifrost-cache-import";
+/// The lock that one process in a cache directory holds while it stages an
+/// upgrade. The file is never deleted, so every process locks the same inode.
+const UPGRADE_LOCK_FILE_NAME: &str = ".bifrost-cache-upgrade.lock";
 const ALLOW_NETWORK_CACHE_ENV: &str = "BIFROST_ALLOW_UNSAFE_NETWORK_CACHE";
 
 /// The version the baseline script creates. Versions below it are gone: the
@@ -41,7 +75,7 @@ const BASELINE_MIGRATION_VERSION: i64 = 125;
 /// distinguishes nominal and receiver projection outputs on qualified routes.
 /// Once #2771 lands, this floor must not advance for compatible migrations.
 const FIRST_NATIVE_CACHE_VERSION: i64 = 125;
-const CURRENT_MIGRATION_VERSION: i64 = 138;
+const CURRENT_MIGRATION_VERSION: i64 = 181;
 const _: () = assert!(CURRENT_MIGRATION_VERSION >= FIRST_NATIVE_CACHE_VERSION);
 pub const OPTIONAL_FACT_KIND_CPP_CLASS_TEMPLATE: i64 = 1;
 pub const OPTIONAL_FACT_KIND_RUBY_METHOD_DISPATCH_MODE: i64 = 2;
@@ -112,20 +146,197 @@ const POST_BASELINE_MIGRATIONS: &[CacheMigration] = &[
         version: 138,
         sql: include_str!("../migrations/cache/0138-python-runtime-providers.sql"),
     },
+    CacheMigration {
+        version: 139,
+        sql: include_str!("../migrations/cache/0139-native-declared-type-arguments.sql"),
+    },
+    CacheMigration {
+        version: 140,
+        sql: include_str!("../migrations/cache/0140-dependency-file-evidence.sql"),
+    },
+    CacheMigration {
+        version: 141,
+        sql: include_str!("../migrations/cache/0141-native-type-argument-fk-index.sql"),
+    },
+    CacheMigration {
+        version: 142,
+        sql: include_str!("../migrations/cache/0142-policy-unit-content-identity.sql"),
+    },
+    CacheMigration {
+        version: 143,
+        sql: include_str!("../migrations/cache/0143-parse-completeness.sql"),
+    },
+    CacheMigration {
+        version: 144,
+        sql: include_str!("../migrations/cache/0144-structural-recovered-regions.sql"),
+    },
+    CacheMigration {
+        version: 145,
+        sql: include_str!("../migrations/cache/0145-native-declared-type-arguments.sql"),
+    },
+    CacheMigration {
+        version: 146,
+        sql: include_str!("../migrations/cache/0146-native-kotlin-jvm-facts.sql"),
+    },
+    CacheMigration {
+        version: 147,
+        sql: include_str!("../migrations/cache/0147-resolved-file-import-edges.sql"),
+    },
+    CacheMigration {
+        version: 148,
+        sql: include_str!("../migrations/cache/0148-incremental-file-import-edges.sql"),
+    },
+    CacheMigration {
+        version: 149,
+        sql: include_str!("../migrations/cache/0149-structured-import-candidate-dependencies.sql"),
+    },
+    CacheMigration {
+        version: 150,
+        sql: include_str!("../migrations/cache/0150-import-ordinal-edge-facts.sql"),
+    },
+    CacheMigration {
+        version: 151,
+        sql: include_str!("../migrations/cache/0151-name-granular-import-dependencies.sql"),
+    },
+    CacheMigration {
+        version: 152,
+        sql: include_str!("../migrations/cache/0152-import-edge-pair-reconciliation.sql"),
+    },
+    CacheMigration {
+        version: 153,
+        sql: include_str!("../migrations/cache/0153-rust-import-input-digests.sql"),
+    },
+    CacheMigration {
+        version: 154,
+        sql: include_str!("../migrations/cache/0154-cpp-base-access.sql"),
+    },
+    CacheMigration {
+        version: 155,
+        sql: include_str!("../migrations/cache/0155-rust-crate-member-paths.sql"),
+    },
+    CacheMigration {
+        version: 156,
+        sql: include_str!("../migrations/cache/0156-target-scoped-rust-gap-candidates.sql"),
+    },
+    CacheMigration {
+        version: 157,
+        sql: include_str!("../migrations/cache/0157-resolution-unit-summaries.sql"),
+    },
+    CacheMigration {
+        version: 158,
+        sql: include_str!("../migrations/cache/0158-rust-module-self-imports.sql"),
+    },
+    CacheMigration {
+        version: 159,
+        sql: include_str!("../migrations/cache/0159-rust-generated-attribute-surfaces.sql"),
+    },
+    CacheMigration {
+        version: 160,
+        sql: include_str!("../migrations/cache/0160-kotlin-package-reference-choice.sql"),
+    },
+    CacheMigration {
+        version: 161,
+        sql: include_str!("../migrations/cache/0161-shared-package-reference-token.sql"),
+    },
+    CacheMigration {
+        version: 162,
+        sql: include_str!("../migrations/cache/0162-generic-formal-positions.sql"),
+    },
+    CacheMigration {
+        version: 163,
+        sql: include_str!("../migrations/cache/0163-kotlin-scala-named-argument-labels.sql"),
+    },
+    CacheMigration {
+        version: 164,
+        sql: include_str!("../migrations/cache/0164-php-include-path-kinds.sql"),
+    },
+    CacheMigration {
+        version: 165,
+        sql: include_str!("../migrations/cache/0165-semantic-ir-rows.sql"),
+    },
+    CacheMigration {
+        version: 166,
+        sql: include_str!("../migrations/cache/0166-rust-reason-owner-source-site-index.sql"),
+    },
+    CacheMigration {
+        version: 167,
+        sql: include_str!("../migrations/cache/0167-semantic-ir-partial-flows.sql"),
+    },
+    CacheMigration {
+        version: 168,
+        sql: include_str!("../migrations/cache/0168-rust-derive-helper-attributes.sql"),
+    },
+    CacheMigration {
+        version: 169,
+        sql: include_str!("../migrations/cache/0169-go-rename-import-declaration-range.sql"),
+    },
+    CacheMigration {
+        version: 170,
+        sql: include_str!("../migrations/cache/0170-go-package-unit-key.sql"),
+    },
+    CacheMigration {
+        version: 171,
+        sql: include_str!(
+            "../migrations/cache/0171-semantic-ir-partial-flow-crossed-calls-and-relation-proof.sql"
+        ),
+    },
+    CacheMigration {
+        version: 172,
+        sql: include_str!("../migrations/cache/0172-root-import-activation-ordinal.sql"),
+    },
+    CacheMigration {
+        version: 173,
+        sql: include_str!("../migrations/cache/0173-rust-unit-summary-rows.sql"),
+    },
+    CacheMigration {
+        version: 174,
+        sql: include_str!("../migrations/cache/0174-jvm-external-owner-inventory.sql"),
+    },
+    CacheMigration {
+        version: 175,
+        sql: include_str!("../migrations/cache/0175-contextual-callable-parameter-lists.sql"),
+    },
+    CacheMigration {
+        version: 176,
+        sql: include_str!("../migrations/cache/0176-policy-evaluation-completion-labels.sql"),
+    },
+    CacheMigration {
+        version: 177,
+        sql: include_str!("../migrations/cache/0177-resolution-member-owner-name.sql"),
+    },
+    CacheMigration {
+        version: 178,
+        sql: include_str!("../migrations/cache/0178-semantic-ir-residual-conversion.sql"),
+    },
+    CacheMigration {
+        version: 179,
+        sql: include_str!("../migrations/cache/0179-generic-formal-defaults.sql"),
+    },
+    CacheMigration {
+        version: 180,
+        sql: include_str!("../migrations/cache/0180-executable-scope-owners.sql"),
+    },
+    CacheMigration {
+        version: 181,
+        sql: include_str!("../migrations/cache/0181-type-constructor-productions.sql"),
+    },
 ];
 
 static CACHE_DB_FILE_NAME: Lazy<String> =
     Lazy::new(|| cache_db_file_name_for_version(CURRENT_MIGRATION_VERSION));
-/// The schema produced by the floor plus every compatible later migration.
+
+/// The generated final schema and migration-owned seeds for an empty store.
+/// The baseline and compatible migration chain remain authoritative; the
+/// generator and historical parity test reject a snapshot that drifts from them.
+const CURRENT_FRESH_SCHEMA_SQL: &str = include_str!("../migrations/cache/current-schema.sql");
+
+/// Expected objects for validating an upgraded store. Building this small,
+/// schema-owned reference must not replay the historical ALTER TABLE chain.
 static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|| {
     let conn = Connection::open_in_memory().expect("open current schema connection");
-    conn.execute_batch(BASELINE_SCHEMA_SQL)
-        .expect("create schema 125 baseline");
-    for migration in POST_BASELINE_MIGRATIONS {
-        conn.execute_batch(migration.sql)
-            .expect("apply post-baseline cache migration");
-    }
-    schema_object_definitions(&conn).expect("read current schema definitions")
+    conn.execute_batch(CURRENT_FRESH_SCHEMA_SQL)
+        .expect("create current fresh schema");
+    schema_object_definitions(&conn).expect("read current schema objects")
 });
 // SHA-256 of `schema_object_definitions` for the schema produced by every
 // migration above. A current store validates its actual schema against this
@@ -133,8 +344,8 @@ static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|
 // in-memory database on every process start. The regression test below derives
 // the value through SQLite and forces this constant to move with a migration.
 const CURRENT_SCHEMA_OBJECTS_SHA256: [u8; 32] = [
-    104, 127, 76, 58, 245, 29, 197, 104, 225, 71, 122, 72, 221, 198, 104, 86, 99, 159, 148, 52,
-    151, 236, 243, 39, 187, 35, 58, 236, 69, 73, 201, 246,
+    253, 58, 181, 66, 68, 150, 141, 166, 29, 62, 213, 142, 251, 66, 104, 228, 239, 173, 1, 140,
+    117, 221, 53, 172, 15, 153, 253, 183, 54, 255, 191, 82,
 ];
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
 // One primary-repository cache is intentionally shared by every linked worktree.
@@ -192,11 +403,11 @@ const GENERATED_LEGACY_PROJECT_GITIGNORE: &[u8] = b"/.gitignore\n/bifrost_cache.
 // openers for one canonical cache path. SQLite remains the cross-process lock.
 static PROCESS_LOCAL_OPEN_GUARDS: Lazy<Mutex<std::collections::HashMap<PathBuf, Weak<Mutex<()>>>>> =
     Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
-static PROCESS_LOCAL_VERSION_SWEEP_ATTEMPTS: Lazy<Mutex<HashSet<PathBuf>>> =
+static PROCESS_LOCAL_STARTUP_CLEANUP_ATTEMPTS: Lazy<Mutex<HashSet<PathBuf>>> =
     Lazy::new(|| Mutex::new(HashSet::new()));
 
-/// How long a store from another schema version must go untouched before
-/// collection removes it.
+/// How long the retained store from another schema version may go untouched
+/// before collection removes it.
 pub const VERSION_STORE_GRACE_SECS: i64 = 14 * 24 * 3600;
 /// The store file this build owns: `bifrost_cache.v{schema version}.db`.
 ///
@@ -206,6 +417,8 @@ pub const VERSION_STORE_GRACE_SECS: i64 = 14 * 24 * 3600;
 /// then refuse the whole file (issue #1589). Naming the file by its schema
 /// instead lets versions sit side by side: each build opens exactly its own,
 /// and the row-level design already keys rather than migrates everything else.
+/// Collection keeps at most one other versioned store, chosen by recent use,
+/// so two stores can serve checkouts of different versions at a time.
 pub fn cache_db_file_name() -> &'static str {
     &CACHE_DB_FILE_NAME
 }
@@ -249,36 +462,53 @@ pub fn store_file_with_suffix(store: &Path, suffix: &str) -> PathBuf {
     store.with_file_name(name)
 }
 
-/// Remove versioned stores that have not been used during the grace period.
+/// Remove excess versioned stores and expire the retained alternate after the
+/// grace period.
 ///
-/// Only older stores are candidates. The current store and stores from a
-/// newer build remain available to older or newer checkouts. The newest mtime
-/// across the store and its sidecars represents use because WAL activity may
-/// not update the main database file.
+/// The current store is never a candidate. Among every other recognized store
+/// at or above the baseline, the most recently used is the sole survivor while
+/// within the grace period; ties go to the higher schema version. Sub-floor
+/// stores and every other candidate go through idle-safe deletion regardless
+/// of age. The newest mtime across the store and its sidecars represents use
+/// because WAL activity may not update the main database file.
 pub fn sweep_disused_version_stores(cache_dir: &Path) -> Result<Vec<PathBuf>> {
-    let stores = disused_version_store_paths(cache_dir)?;
+    let stores = version_store_paths_to_remove(cache_dir)?;
     remove_version_stores(&stores)
 }
 
-fn disused_version_store_paths(cache_dir: &Path) -> Result<Vec<PathBuf>> {
+fn version_store_paths_to_remove(cache_dir: &Path) -> Result<Vec<PathBuf>> {
     let now = now_unix_seconds();
     let mut stores = Vec::new();
+    let mut eligible = Vec::new();
     for entry in std::fs::read_dir(cache_dir).map_err(|err| format!("cache DB I/O error: {err}"))? {
         let entry = entry.map_err(|err| format!("cache DB I/O error: {err}"))?;
         let name = entry.file_name();
         let Some(version) = name.to_str().and_then(store_file_version) else {
             continue;
         };
-        if version >= cache_db_schema_version() {
+        if name == std::ffi::OsStr::new(cache_db_file_name()) {
             continue;
         }
         let store = entry.path();
-        if version >= BASELINE_MIGRATION_VERSION
-            && last_store_use_unix_seconds(&store)? + VERSION_STORE_GRACE_SECS > now
-        {
+        if version < BASELINE_MIGRATION_VERSION {
+            stores.push(store);
             continue;
         }
-        stores.push(store);
+        let last_use = last_store_use_unix_seconds(&store)?;
+        eligible.push((version, store, last_use));
+    }
+
+    // Each version names exactly one file, so (last use, version) is a total
+    // order and the survivor is deterministic.
+    let survivor_index = eligible
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, (version, _, last_use))| (*last_use, *version))
+        .map(|(index, _)| index);
+    for (index, (_, store, last_use)) in eligible.into_iter().enumerate() {
+        if Some(index) != survivor_index || last_use + VERSION_STORE_GRACE_SECS <= now {
+            stores.push(store);
+        }
     }
     Ok(stores)
 }
@@ -337,7 +567,10 @@ fn open_store_connection(
     flags: OpenFlags,
     role: ConnectionRole,
 ) -> rusqlite::Result<Connection> {
-    let conn = Connection::open_with_flags(db_path, flags)?;
+    let mut conn = Connection::open_with_flags(db_path, flags)?;
+    if !flags.contains(OpenFlags::SQLITE_OPEN_READ_ONLY) {
+        conn.set_transaction_behavior(TransactionBehavior::Immediate);
+    }
     sql_profile::install(&conn, role);
     Ok(conn)
 }
@@ -347,7 +580,8 @@ fn open_store_connection(
 /// through [`open_store_connection`], and it is the only other way a process
 /// reaches a store.
 pub fn open_in_memory_store_connection() -> rusqlite::Result<Connection> {
-    let conn = Connection::open_in_memory()?;
+    let mut conn = Connection::open_in_memory()?;
+    conn.set_transaction_behavior(TransactionBehavior::Immediate);
     sql_profile::install(&conn, ConnectionRole::Ephemeral);
     Ok(conn)
 }
@@ -528,7 +762,7 @@ fn open_unified_connection_unclassified(db_path: &Path) -> Result<Connection> {
             db_path.display()
         )
     })?;
-    let startup_cleanup = disused_version_stores_on_startup(&db_path);
+    let disused_stores = startup_cleanup(&db_path);
     // #2771 is a mandatory cold start across FIRST_NATIVE_CACHE_VERSION.
     // Import selection and staging both reject older schemas before copying;
     // migrate() also replaces one found under this build's active filename.
@@ -544,6 +778,11 @@ fn open_unified_connection_unclassified(db_path: &Path) -> Result<Connection> {
     if let Err(error) = import_result {
         eprintln!("Bifrost cache upgrade skipped, starting a fresh store: {error}");
     }
+    let seeded = {
+        let _scope = crate::profiling::scope("cache_db.seed_from_template");
+        let template_dir = crate::sqlite_template::template_dir();
+        seed_new_store_from_template(&db_path, template_dir.as_deref())?
+    };
     let mut conn = {
         let _scope = crate::profiling::scope("cache_db.sqlite_open");
         open_store_connection(
@@ -562,16 +801,20 @@ fn open_unified_connection_unclassified(db_path: &Path) -> Result<Connection> {
     }
     let initialized_before_open = {
         let _scope = crate::profiling::scope("cache_db.check_initialized");
-        unified_cache_initialized(&conn)?
+        !seeded && unified_cache_initialized(&conn)?
     };
     {
         let _scope = crate::profiling::scope("cache_db.migrate");
         migrate(&mut conn)?;
     }
+    if seeded {
+        // The template's cadence started when the template was built.
+        start_collection_cadence(&conn)?;
+    }
     if !initialized_before_open {
         delete_legacy_cache_files(&db_path);
     }
-    if let Some(stores) = startup_cleanup
+    if let Some(stores) = disused_stores
         && let Err(error) = remove_version_stores(&stores)
     {
         eprintln!("Bifrost cache startup cleanup skipped: {error}");
@@ -652,19 +895,25 @@ fn network_filesystem_kind(_path: &Path) -> Result<Option<&'static str>> {
     Ok(None)
 }
 
-fn disused_version_stores_on_startup(db_path: &Path) -> Option<Vec<PathBuf>> {
+/// Once per process and cache directory, remove the copies interrupted
+/// upgrades left behind, and return the disused version stores to remove after
+/// this build's store has opened.
+fn startup_cleanup(db_path: &Path) -> Option<Vec<PathBuf>> {
     if db_path.file_name() != Some(std::ffi::OsStr::new(cache_db_file_name())) {
         return None;
     }
     let cache_dir = db_path.parent()?;
-    let should_attempt = PROCESS_LOCAL_VERSION_SWEEP_ATTEMPTS
+    let should_attempt = PROCESS_LOCAL_STARTUP_CLEANUP_ATTEMPTS
         .lock()
-        .expect("cache version sweep mutex poisoned")
+        .expect("cache startup cleanup mutex poisoned")
         .insert(cache_dir.to_path_buf());
     if !should_attempt {
         return None;
     }
-    match disused_version_store_paths(cache_dir) {
+    if let Err(error) = collect_abandoned_staged_copies(cache_dir) {
+        eprintln!("Bifrost cache cleanup of interrupted upgrades skipped: {error}");
+    }
+    match version_store_paths_to_remove(cache_dir) {
         Ok(stores) => Some(stores),
         Err(error) => {
             // Old stores are optional cache data. An unreadable old store must
@@ -687,16 +936,12 @@ fn disused_version_stores_on_startup(db_path: &Path) -> Option<Vec<PathBuf>> {
 /// process can access the `-wal`/`-shm` sidecars, which it can: the same process
 /// created the DB and holds the writer open for the store's lifetime.
 pub fn open_readonly_connection(db_path: &Path) -> Result<Connection> {
-    disable_sqlite_memory_statistics();
-    ensure_safe_cache_path(db_path)?;
-    let db_path = canonicalize_cache_db_parent(db_path)?;
-    let conn = open_store_connection(
-        &db_path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    let conn = open_readonly_store_connection(
+        db_path,
         ConnectionRole::Reader,
-    )
-    .map_err(|err| format!("cache DB read-only SQLite error: {err}"))?;
-    install_busy_timeout(&conn)?;
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        "cache DB read-only SQLite error",
+    )?;
     configure_readonly_connection(&conn)?;
     Ok(conn)
 }
@@ -721,22 +966,33 @@ pub fn open_readonly_connection(db_path: &Path) -> Result<Connection> {
 /// single-owner property for every path into it is a separate question (#2883).
 const READER_THREADING: OpenFlags = OpenFlags::SQLITE_OPEN_NO_MUTEX;
 
+fn open_readonly_store_connection(
+    db_path: &Path,
+    role: ConnectionRole,
+    flags: OpenFlags,
+    error_context: &str,
+) -> Result<Connection> {
+    disable_sqlite_memory_statistics();
+    ensure_safe_cache_path(db_path)?;
+    let db_path = canonicalize_cache_db_parent(db_path)?;
+    let conn = open_store_connection(&db_path, flags, role)
+        .map_err(|err| format!("{error_context}: {err}"))?;
+    install_busy_timeout(&conn)?;
+    Ok(conn)
+}
+
 /// Open an initialized cache with a read-only main database and a writable
 /// temporary schema.
 ///
 /// The SQLite read-only flag prevents persistent writes, while a writable TEMP
 /// schema permits connection-local membership and FTS tables.
 pub fn open_readonly_temp_connection(db_path: &Path) -> Result<Connection> {
-    disable_sqlite_memory_statistics();
-    ensure_safe_cache_path(db_path)?;
-    let db_path = canonicalize_cache_db_parent(db_path)?;
-    let conn = open_store_connection(
-        &db_path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW | READER_THREADING,
+    let conn = open_readonly_store_connection(
+        db_path,
         ConnectionRole::SessionReader,
-    )
-    .map_err(|err| format!("cache DB active-session SQLite error: {err}"))?;
-    install_busy_timeout(&conn)?;
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW | READER_THREADING,
+        "cache DB active-session SQLite error",
+    )?;
     configure_readonly_page_cache(&conn)?;
     conn.pragma_update(None, "foreign_keys", "ON")
         .map_err(|err| format!("cache DB active-session SQLite error: {err}"))?;
@@ -750,16 +1006,12 @@ pub fn open_readonly_temp_connection(db_path: &Path) -> Result<Connection> {
 /// after advancing to the next file group. Keeping these connections separate
 /// prevents their page cache from displacing interactive analyzer queries.
 pub fn open_streaming_readonly_connection(db_path: &Path) -> Result<Connection> {
-    disable_sqlite_memory_statistics();
-    ensure_safe_cache_path(db_path)?;
-    let db_path = canonicalize_cache_db_parent(db_path)?;
-    let conn = open_store_connection(
-        &db_path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW | READER_THREADING,
+    let conn = open_readonly_store_connection(
+        db_path,
         ConnectionRole::StreamingReader,
-    )
-    .map_err(|err| format!("cache DB streaming read-only SQLite error: {err}"))?;
-    install_busy_timeout(&conn)?;
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW | READER_THREADING,
+        "cache DB streaming read-only SQLite error",
+    )?;
     conn.pragma_update(None, "temp_store", "MEMORY")
         .map_err(|err| format!("cache DB streaming read-only SQLite error: {err}"))?;
     conn.pragma_update(None, "cache_size", -2048)
@@ -816,25 +1068,65 @@ fn configure_readonly_connection(conn: &Connection) -> Result<()> {
 /// against 187.1 CPU-seconds), nearly all `sys`, from re-reading evicted pages.
 const READER_PAGE_CACHE_KIB: i64 = -8192;
 
+/// Memory-map window for interactive read-only connections, in bytes. A
+/// mapping is file-backed and shared by every pooled reader of the same store,
+/// so the window does not multiply with the reader count the way the page
+/// cache does. The reasoning and measurements are in
+/// `configure_readonly_page_cache`.
+const READER_MMAP_SIZE_BYTES: i64 = 2 * 1024 * 1024 * 1024;
+
 fn configure_readonly_page_cache(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "temp_store", "MEMORY")
         .map_err(|err| format!("cache DB read-only SQLite error: {err}"))?;
     conn.pragma_update(None, "cache_size", READER_PAGE_CACHE_KIB)
         .map_err(|err| format!("cache DB read-only SQLite error: {err}"))?;
-    // Keep interactive readers unmapped, with the page-cache budget above.
-    // Mapping can bypass pcache1's global LRU mutex when SQLite is built with
+    // Interactive readers map the store, up to READER_MMAP_SIZE_BYTES, and keep
+    // the page cache above for pages the mapping does not serve. Mapping can
+    // bypass pcache1's global LRU mutex when SQLite is built with
     // SQLITE_ENABLE_MEMORY_MANAGEMENT (BrokkAi/bifrost#21). Workspace builds
-    // instead undefine that option through LIBSQLITE3_FLAGS in .cargo/config.toml
-    // so each page cache has a private reclamation group. This addresses the
-    // shared mutex without adding mappings or changing mapped-I/O error and
-    // file-truncation behavior. Downstream Rust builds do not inherit our Cargo
-    // configuration and must apply the build flag themselves.
+    // undefine that option through LIBSQLITE3_FLAGS in .cargo/config.toml, so
+    // each page cache has a private reclamation group. Downstream Rust builds
+    // do not inherit our Cargo configuration and must apply the build flag
+    // themselves.
     //
-    // Earlier mmap measurements predate the reader pool's concurrency cap and
-    // do not establish the tradeoff for this configuration. Any reevaluation
-    // should measure wall time and contention as well as memory: mappings of
-    // the same file share physical pages, and file-backed RSS is reclaimable.
-    conn.pragma_update(None, "mmap_size", 0)
+    // Measured 2026-10-09 on Vector (2,796 files, 30.8 MB of source, 1.6 GB
+    // store), whole-workspace cleartext-logging policy, one run per cell, host
+    // load 17 to 118 from other work. Cold rows start from a fresh cache root,
+    // warm rows reuse it. The 1 GiB row is a page cache of that size.
+    //   cell             wall      user      sys    major faults  peak RSS
+    //   8 MiB cold      4,656 s   2,180 s   2,182 s   420k       4.82 GB
+    //   1 GiB cold      2,897 s   2,750 s     245 s   305k       5.05 GB
+    //   2 GiB mmap cold 2,709 s   2,675 s     134 s   961k       6.00 GB
+    //   8 MiB warm      4,688 s   1,971 s   2,309 s   320k       2.75 GB
+    //   1 GiB warm      2,706 s   2,436 s     152 s   361k       3.52 GB
+    //   2 GiB mmap warm 2,311 s   2,126 s      97 s   815k       4.42 GB
+    // Against the 8 MiB cache, the mapping cut sys time by 94% (cold) and 96%
+    // (warm) and wall time by 42% and 51%. Major faults rose 2.3x (cold) and
+    // 2.5x (warm). Peak RSS counts shared file-backed pages, so it overstates
+    // the private memory each reader holds. Proportional set size was not
+    // measured. SQLite clamps mmap_size to 2,147,418,112 bytes on Linux; the
+    // store fits under that cap.
+    //
+    // Pool cost: every open reader keeps READER_PAGE_CACHE_KIB of private page
+    // cache, so a 1 GiB cache would cost 1 GiB per pooled reader, up to 120 in
+    // the MCP server. A mapping adds no private pages until a page is touched,
+    // and touched pages are shared file-backed pages of one store file, which
+    // the kernel can reclaim. The 1 GiB page cache also cut sys time in this
+    // cell, so the mapping's advantage is the further cut at no per-reader cost.
+    //
+    // Latency, rust-mbx replay (2026-10-09, 10 repeats per case, three passes
+    // per build, host load 17 to 150): definition and type p95 were lower with
+    // the mapping in every pass, by 10 to 36 percent and 5 to 28 percent. The
+    // heavy families (usages, call_relations, rename) moved with host load; in
+    // the quietest pass each stayed within 6 percent of the master build.
+    // Responses matched the master build after SegmentId values were
+    // normalized.
+    //
+    // Contention, one MCP server with 32 and then 96 concurrent requests: p95
+    // of admitted requests was within 6 percent of the master build. The server
+    // runs 4 analyzer executions and queues 32, and refuses the rest with the
+    // same error on both builds.
+    conn.pragma_update(None, "mmap_size", READER_MMAP_SIZE_BYTES)
         .map_err(|err| format!("cache DB read-only SQLite error: {err}"))?;
     conn.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_CAPACITY);
     Ok(())
@@ -894,9 +1186,11 @@ pub fn prepare_cache_dir(cache_dir: &Path) -> Result<PathBuf> {
 /// build can migrate forward instead, carry the copy the rest of the way with
 /// the ordinary migration machinery, and publish it only once it has arrived.
 ///
-/// The source is only ever read. An older checkout keeps opening it, the
+/// The source is only ever read. An older checkout keeps opening it, and the
 /// existence of a newer file says nothing about whether the older one is still
-/// live (issue #1589), and the version sweeper reclaims it once it has gone
+/// live (issue #1589). Collection keeps at most one other versioned store next
+/// to this build's: it may remove this source sooner when another candidate
+/// has more recent use, and removes the retained alternate after it has gone
 /// [`VERSION_STORE_GRACE_SECS`] unused. Renaming instead of copying would save
 /// a transient doubling of one store's bytes and cost exactly the guarantee
 /// #1589 was filed to establish.
@@ -904,6 +1198,20 @@ pub fn prepare_cache_dir(cache_dir: &Path) -> Result<PathBuf> {
 /// The copy goes through SQLite's backup API rather than the filesystem
 /// because a live source holds committed pages in its `-wal` sidecar; copying
 /// the main file alone would silently drop them.
+///
+/// Only the holder of the cache directory's upgrade lock stages a copy. Each
+/// copy is as large as the source store, and every linked worktree of a
+/// repository shares one cache directory, so without the lock ten processes
+/// starting at once each wrote their own 10 GB copy, and the ones that were
+/// killed left those copies behind. A process that waited for the lock finds
+/// the store the holder published and stages nothing.
+///
+/// The lock also guards *reading* the older stores. Selecting a candidate reads
+/// its `user_version`, and SQLite's WAL locking protocol does not tolerate a
+/// burst of concurrent openers on one store: an unlucky opener can spend the
+/// protocol retry budget -- about ten seconds -- and then report
+/// SQLITE_PROTOCOL. Every process starting while this build's store is missing
+/// would otherwise probe the same older store at once (#5150).
 fn import_newest_older_store(db_path: &Path) -> Result<()> {
     if db_path.file_name() != Some(std::ffi::OsStr::new(cache_db_file_name())) {
         return Ok(());
@@ -917,6 +1225,39 @@ fn import_newest_older_store(db_path: &Path) -> Result<()> {
     let cache_dir = db_path
         .parent()
         .expect("a prepared cache DB path has a parent directory");
+    // Decide whether there is anything to import by name alone. Opening a
+    // candidate here, before the lock, is what let a group of openers land on
+    // one older store at the same time (#5150). A name this build cannot
+    // import only costs one uncontended lock acquisition.
+    if !has_importable_store_candidate(cache_dir)? {
+        return Ok(());
+    }
+    // Held until this function returns, which is after the publish below.
+    let upgrade_lock = open_upgrade_lock(cache_dir)?;
+    match upgrade_lock.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            eprintln!(
+                "Bifrost cache upgrade waiting for another process that is upgrading a store in {}",
+                cache_dir.display()
+            );
+            upgrade_lock
+                .lock()
+                .map_err(|err| format!("cache DB I/O error locking upgrades: {err}"))?;
+        }
+        Err(std::fs::TryLockError::Error(err)) => {
+            return Err(format!("cache DB I/O error locking upgrades: {err}"));
+        }
+    }
+    if db_path.exists() {
+        return Ok(());
+    }
+    // Free the space before this upgrade takes as much again.
+    if let Err(error) = remove_abandoned_staged_copies(cache_dir) {
+        eprintln!("Bifrost cache cleanup of interrupted upgrades skipped: {error}");
+    }
+    // The previous holder or a version-store sweep may have changed the
+    // candidates while this process waited.
     let Some(source) = newest_importable_store(cache_dir)? else {
         return Ok(());
     };
@@ -940,6 +1281,86 @@ fn import_newest_older_store(db_path: &Path) -> Result<()> {
             err.error
         )),
     }
+}
+
+fn open_upgrade_lock(cache_dir: &Path) -> Result<std::fs::File> {
+    let lock_path = cache_dir.join(UPGRADE_LOCK_FILE_NAME);
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|err| format!("cache DB I/O error opening {}: {err}", lock_path.display()))
+}
+
+/// Remove staged upgrade copies when no upgrade is running in `cache_dir`.
+///
+/// A busy lock means a live upgrade, which removes abandoned copies itself
+/// before it stages; a later open retries otherwise.
+fn collect_abandoned_staged_copies(cache_dir: &Path) -> Result<()> {
+    // Most opens find nothing, and need not create the lock file to say so.
+    if staged_copy_paths(cache_dir)?.is_empty() {
+        return Ok(());
+    }
+    let upgrade_lock = open_upgrade_lock(cache_dir)?;
+    match upgrade_lock.try_lock() {
+        Ok(()) => remove_abandoned_staged_copies(cache_dir),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(()),
+        Err(std::fs::TryLockError::Error(err)) => {
+            Err(format!("cache DB I/O error locking upgrades: {err}"))
+        }
+    }
+}
+
+/// Remove every staged upgrade copy and sidecar in `cache_dir`.
+///
+/// The caller holds the upgrade lock. Every upgrade stages only while it holds
+/// that lock, and the operating system releases it when the holder exits, so
+/// each staged file left now belongs to a process that died mid-upgrade. The
+/// lock rather than the file's age is the proof: a large upgrade writes for
+/// minutes, and a suspended one for as long as it stays suspended.
+fn remove_abandoned_staged_copies(cache_dir: &Path) -> Result<()> {
+    let mut removed = Vec::new();
+    let mut outcome = Ok(());
+    for path in staged_copy_paths(cache_dir)? {
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed.push(path),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                outcome = Err(format!(
+                    "cache DB I/O error removing {}: {err}",
+                    path.display()
+                ));
+                break;
+            }
+        }
+    }
+    if !removed.is_empty() {
+        eprintln!("Bifrost cache removed copies left by interrupted upgrades: {removed:?}");
+    }
+    outcome
+}
+
+fn staged_copy_paths(cache_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for entry in std::fs::read_dir(cache_dir).map_err(|err| format!("cache DB I/O error: {err}"))? {
+        let entry = entry.map_err(|err| format!("cache DB I/O error: {err}"))?;
+        if !entry
+            .file_name()
+            .as_encoded_bytes()
+            .starts_with(STAGED_UPGRADE_PREFIX.as_bytes())
+        {
+            continue;
+        }
+        let file_type = entry
+            .file_type()
+            .map_err(|err| format!("cache DB I/O error: {err}"))?;
+        if !file_type.is_dir() {
+            paths.push(entry.path());
+        }
+    }
+    Ok(paths)
 }
 
 /// Copy `source` aside, migrate the copy to this build's schema, and prove the
@@ -966,7 +1387,7 @@ fn stage_upgraded_store(cache_dir: &Path, source: &Path) -> Result<tempfile::Tem
     })?;
     refuse_pre_native_import(&source_conn, source)?;
     let staged = tempfile::Builder::new()
-        .prefix(".bifrost-cache-import")
+        .prefix(STAGED_UPGRADE_PREFIX)
         .tempfile_in(cache_dir)
         .map_err(|err| format!("failed to stage cache DB upgrade: {err}"))?
         // Release the handle. SQLite owns the path from here; the guard only
@@ -1046,6 +1467,33 @@ fn verify_upgraded_store(conn: &Connection, source: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Whether `cache_dir` holds any file whose name could be an older store.
+///
+/// A name-only decision, so it can run before the upgrade lock: the version a
+/// candidate really declares needs its `user_version`, which is the lock
+/// holder's job. The false positive -- a name in range that turns out to be
+/// pre-native, unreadable, or already current -- costs one uncontended lock
+/// acquisition, and the probe behind it rejects the file.
+fn has_importable_store_candidate(cache_dir: &Path) -> Result<bool> {
+    for entry in std::fs::read_dir(cache_dir).map_err(|err| format!("cache DB I/O error: {err}"))? {
+        let entry = entry.map_err(|err| format!("cache DB I/O error: {err}"))?;
+        let name = entry.file_name();
+        if name == std::ffi::OsStr::new(LEGACY_CACHE_DB_FILE_NAME) {
+            return Ok(true);
+        }
+        let importable_version =
+            name.to_str()
+                .and_then(store_file_version)
+                .is_some_and(|version| {
+                    (FIRST_NATIVE_CACHE_VERSION..CURRENT_MIGRATION_VERSION).contains(&version)
+                });
+        if importable_version {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// The newest store in `cache_dir` this build can migrate forward.
 ///
 /// Candidates are the version-suffixed stores older than this build's, plus
@@ -1114,16 +1562,13 @@ fn default_project_dir_for_cache(db_path: &Path) -> Option<&Path> {
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .map(|cache_dir| cache_dir.join(cache_db_file_name()));
-    default_project_dir_for_cache_with_override(db_path, explicit_override.as_deref())
-}
-
-fn default_project_dir_for_cache_with_override<'a>(
-    db_path: &'a Path,
-    explicit_override: Option<&Path>,
-) -> Option<&'a Path> {
-    if explicit_override == Some(db_path) {
+    if explicit_override.as_deref() == Some(db_path) {
         return None;
     }
+    project_dir_for_cache(db_path)
+}
+
+fn project_dir_for_cache(db_path: &Path) -> Option<&Path> {
     if db_path.file_name() != Some(std::ffi::OsStr::new(cache_db_file_name())) {
         return None;
     }
@@ -1190,7 +1635,10 @@ fn migrate_legacy_project_cache(project_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn create_legacy_project_cache_ignore(ignore_path: &Path) -> Result<()> {
+fn stage_legacy_project_cache_ignore(
+    ignore_path: &Path,
+    description: &str,
+) -> Result<tempfile::NamedTempFile> {
     let parent = ignore_path.parent().ok_or_else(|| {
         format!(
             "legacy cache ignore has no parent directory: {}",
@@ -1198,11 +1646,16 @@ fn create_legacy_project_cache_ignore(ignore_path: &Path) -> Result<()> {
         )
     })?;
     let mut replacement = tempfile::NamedTempFile::new_in(parent)
-        .map_err(|err| format!("failed to stage legacy cache ignore: {err}"))?;
+        .map_err(|err| format!("failed to stage {description}: {err}"))?;
     replacement
         .write_all(GENERATED_LEGACY_PROJECT_GITIGNORE)
-        .and_then(|()| replacement.as_file().sync_all())
-        .map_err(|err| format!("failed to stage legacy cache ignore: {err}"))?;
+        .and_then(|()| sync_file(replacement.as_file()))
+        .map_err(|err| format!("failed to stage {description}: {err}"))?;
+    Ok(replacement)
+}
+
+fn create_legacy_project_cache_ignore(ignore_path: &Path) -> Result<()> {
+    let replacement = stage_legacy_project_cache_ignore(ignore_path, "legacy cache ignore")?;
     match replacement.persist_noclobber(ignore_path) {
         Ok(_) => Ok(()),
         Err(err) if err.error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -1217,18 +1670,8 @@ fn create_legacy_project_cache_ignore(ignore_path: &Path) -> Result<()> {
 }
 
 fn replace_generated_legacy_project_ignore(ignore_path: &Path) -> Result<()> {
-    let parent = ignore_path.parent().ok_or_else(|| {
-        format!(
-            "legacy cache ignore has no parent directory: {}",
-            ignore_path.display()
-        )
-    })?;
-    let mut replacement = tempfile::NamedTempFile::new_in(parent)
-        .map_err(|err| format!("failed to stage narrowed legacy cache ignore: {err}"))?;
-    replacement
-        .write_all(GENERATED_LEGACY_PROJECT_GITIGNORE)
-        .and_then(|()| replacement.as_file().sync_all())
-        .map_err(|err| format!("failed to stage narrowed legacy cache ignore: {err}"))?;
+    let replacement =
+        stage_legacy_project_cache_ignore(ignore_path, "narrowed legacy cache ignore")?;
     replacement.persist(ignore_path).map_err(|err| {
         format!(
             "failed to atomically narrow generated legacy cache ignore {}: {}",
@@ -1261,10 +1704,14 @@ fn validate_concurrent_legacy_project_ignore(ignore_path: &Path) -> Result<()> {
     }
 }
 
+fn is_whole_directory_gitignore_pattern(line: &str) -> bool {
+    matches!(line, "*" | "/*" | "**" | "/**")
+}
+
 fn gitignore_ignores_entire_directory(content: &[u8]) -> bool {
     String::from_utf8_lossy(content)
         .lines()
-        .any(|line| matches!(line.trim(), "*" | "/*" | "**" | "/**"))
+        .any(|line| is_whole_directory_gitignore_pattern(line.trim()))
 }
 
 fn cache_gitignore_ignores_all_generated_state(content: &[u8]) -> bool {
@@ -1277,7 +1724,7 @@ fn cache_gitignore_ignores_all_generated_state(content: &[u8]) -> bool {
         if line.starts_with('!') {
             return false;
         }
-        ignores_all |= matches!(line, "*" | "/*" | "**" | "/**");
+        ignores_all |= is_whole_directory_gitignore_pattern(line);
     }
     ignores_all
 }
@@ -1332,7 +1779,9 @@ pub fn is_legacy_project_cache_file_name(name: &std::ffi::OsStr) -> bool {
 /// nor churn its mtime. An existing file that does not ignore the generated
 /// directory is an error rather than a silent source of live SQLite files.
 fn ensure_cache_dir_self_ignored(cache_dir: &Path) -> Result<()> {
-    if default_project_dir_for_cache(&cache_dir.join(cache_db_file_name())).is_none() {
+    // An explicit override skips legacy migration, but a reserved cache layout
+    // still contains generated state that must never enter Git-backed scans.
+    if project_dir_for_cache(&cache_dir.join(cache_db_file_name())).is_none() {
         return Ok(());
     }
     let ignore_path = cache_dir.join(".gitignore");
@@ -1351,7 +1800,7 @@ fn ensure_cache_dir_self_ignored(cache_dir: &Path) -> Result<()> {
         .map_err(|err| format!("failed to stage cache directory ignore: {err}"))?;
     replacement
         .write_all(GENERATED_CACHE_GITIGNORE)
-        .and_then(|()| replacement.as_file().sync_all())
+        .and_then(|()| sync_file(replacement.as_file()))
         .map_err(|err| format!("failed to stage cache directory ignore: {err}"))?;
     match replacement.persist_noclobber(&ignore_path) {
         Ok(_) => Ok(()),
@@ -1434,9 +1883,7 @@ fn configure_connection_after_busy_timeout(conn: &mut Connection) -> Result<()> 
     // Overwrite freed pages with zeros. This is not a privacy setting here; it
     // is what keeps a WAL checkpoint from failing with SQLITE_CORRUPT after a
     // transaction leaves a non-empty freelist under `auto_vacuum=INCREMENTAL`
-    // -- see `drain_free_pages` for the mechanism and
-    // `.agents/docs/store-vacuum-and-secure-delete-decision-2026-09.md` for the
-    // measurement that chose it (issue #2789).
+    // -- see `drain_free_pages` for the mechanism (issue #2789).
     //
     // Spell the value, never number it. `PRAGMA secure_delete` parses its
     // argument as a boolean unless the argument is the literal word FAST, so
@@ -1456,7 +1903,7 @@ fn configure_connection_after_busy_timeout(conn: &mut Connection) -> Result<()> 
         .map_err(|err| format!("cache DB SQLite error: {err}"))?;
     conn.pragma_update(None, "recursive_triggers", "ON")
         .map_err(|err| format!("cache DB SQLite error: {err}"))?;
-    conn.pragma_update(None, "synchronous", "NORMAL")
+    conn.pragma_update(None, "synchronous", sqlite_synchronous())
         .map_err(|err| format!("cache DB SQLite error: {err}"))?;
     conn.pragma_update(None, "temp_store", "MEMORY")
         .map_err(|err| format!("cache DB SQLite error: {err}"))?;
@@ -1527,13 +1974,16 @@ impl From<rusqlite::Error> for InitializationPhaseError {
     }
 }
 
-fn ensure_wal_journal_mode(conn: &Connection) -> std::result::Result<(), InitializationPhaseError> {
+pub fn set_wal_journal_mode(conn: &Connection) -> rusqlite::Result<String> {
     let current: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
     if current.eq_ignore_ascii_case("wal") {
-        return Ok(());
+        return Ok(current);
     }
-    let updated: String =
-        conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))?;
+    conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))
+}
+
+fn ensure_wal_journal_mode(conn: &Connection) -> std::result::Result<(), InitializationPhaseError> {
+    let updated = set_wal_journal_mode(conn)?;
     if updated.eq_ignore_ascii_case("wal") {
         Ok(())
     } else {
@@ -1688,6 +2138,28 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
         return Ok(());
     }
 
+    // Migration 140 replaces the semantic catalog to widen its import-kind
+    // CHECK constraint. Disable FK actions around the migration transaction
+    // so dropping the old parent does not cascade-delete its child rows;
+    // migrate_locked runs foreign_key_check before commit, then enforcement is
+    // restored before the migrated store is returned.
+    if user_version < CURRENT_MIGRATION_VERSION {
+        conn.pragma_update(None, "foreign_keys", "OFF")
+            .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+        let migration = migrate_locked(conn, false);
+        let restore = conn
+            .pragma_update(None, "foreign_keys", "ON")
+            .map_err(|err| format!("cache DB SQLite error: {err}"));
+        let outcome = match (migration, restore) {
+            (Err(error), _) => return Err(error),
+            (Ok(_), Err(error)) => return Err(error),
+            (Ok(outcome), Ok(())) => outcome,
+        };
+        if matches!(outcome, LockedMigrationOutcome::Complete) {
+            return drain_free_pages(conn);
+        }
+    }
+
     if matches!(
         migrate_locked(conn, false)?,
         LockedMigrationOutcome::Complete
@@ -1790,7 +2262,13 @@ fn migrate_locked(
         user_version = 0;
     }
 
-    if user_version == 0 {
+    if user_version == 0 && schema_objects.is_empty() {
+        initialize_fresh_schema(&tx)?;
+        tx.pragma_update(None, "user_version", CURRENT_MIGRATION_VERSION)
+            .map_err(|err| format!("cache DB current-schema version error: {err}"))?;
+        start_collection_cadence(&tx)?;
+        user_version = CURRENT_MIGRATION_VERSION;
+    } else if user_version == 0 {
         debug_assert!(user_schema_objects(&tx)?.is_empty());
         tx.execute_batch(BASELINE_SCHEMA_SQL)
             .map_err(|err| format!("cache DB baseline creation error: {err}"))?;
@@ -1840,8 +2318,8 @@ fn migrate_locked(
 /// special case for `last_gc_at == 0`: a store that has genuinely never been
 /// collected still becomes due on the ordinary time cadence, and an older
 /// store migrated up to this schema keeps the value it recorded.
-fn start_collection_cadence(tx: &Transaction<'_>) -> Result<()> {
-    let updated = tx
+fn start_collection_cadence(conn: &Connection) -> Result<()> {
+    let updated = conn
         .execute(
             "UPDATE cache_state SET last_gc_at = ?1 WHERE id = 1",
             [now_unix_seconds()],
@@ -1852,6 +2330,49 @@ fn start_collection_cadence(tx: &Transaction<'_>) -> Result<()> {
         "a created store has exactly one cache_state row to start the collection cadence on"
     );
     Ok(())
+}
+
+/// This build's empty-store template. The digest covers what decides the
+/// bytes of an empty store: the fresh schema and its seed rows, the schema
+/// version, and the page size.
+static STORE_TEMPLATE: Lazy<crate::sqlite_template::Template> = Lazy::new(|| {
+    crate::sqlite_template::Template::new(
+        "store",
+        CURRENT_MIGRATION_VERSION,
+        &[
+            CURRENT_FRESH_SCHEMA_SQL.as_bytes(),
+            &CACHE_PAGE_SIZE_BYTES.to_le_bytes(),
+        ],
+    )
+});
+
+/// Create a store that does not exist yet from [`STORE_TEMPLATE`]; see
+/// [`crate::sqlite_template`]. A copied store still goes through [`migrate`],
+/// whose schema identity check rejects a template that does not match this
+/// build.
+fn seed_new_store_from_template(db_path: &Path, template_dir: Option<&Path>) -> Result<bool> {
+    crate::sqlite_template::seed_missing_database(
+        db_path,
+        template_dir,
+        &STORE_TEMPLATE,
+        build_fresh_store,
+    )
+}
+
+/// Create an empty current-schema store at `path` through the ordinary path.
+fn build_fresh_store(path: &Path) -> Result<()> {
+    let mut conn = open_store_connection(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        ConnectionRole::Writer,
+    )
+    .map_err(|err| format!("cache DB template SQLite error: {err}"))?;
+    configure_connection(&mut conn)?;
+    migrate(&mut conn)?;
+    // Closing the only connection checkpoints the WAL into the main file and
+    // removes the WAL, so the main file alone is the complete store.
+    conn.close()
+        .map_err(|(_, err)| format!("cache DB template close error: {err}"))
 }
 
 pub fn now_unix_seconds() -> i64 {
@@ -2030,12 +2551,16 @@ fn sqlite_is_busy_or_locked(error: &rusqlite::Error) -> bool {
 
 fn recreate_schema(tx: &Transaction<'_>) -> Result<()> {
     for (object_type, name) in user_schema_objects(tx)? {
-        let quoted = format!("\"{}\"", name.replace('"', "\"\""));
+        let quoted = quote_sqlite_identifier(&name);
         tx.execute_batch(&format!("DROP {object_type} {quoted};"))
             .map_err(|err| format!("cache DB SQLite error: {err}"))?;
     }
     tx.pragma_update(None, "user_version", 0)
         .map_err(|err| format!("cache DB SQLite error: {err}"))
+}
+
+fn quote_sqlite_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
 #[cfg(test)]
@@ -2069,7 +2594,21 @@ fn user_schema_objects(conn: &Connection) -> Result<Vec<(String, String)>> {
         .map_err(|err| format!("cache DB SQLite error: {err}"))
 }
 
+fn initialize_fresh_schema(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute_batch(CURRENT_FRESH_SCHEMA_SQL)
+        .map_err(|err| format!("cache DB fresh-schema creation error: {err}"))
+}
+
 fn schema_object_definitions(conn: &Connection) -> Result<Vec<(String, String, String)>> {
+    raw_schema_object_definitions(conn).map(|definitions| {
+        definitions
+            .into_iter()
+            .map(|(object_type, name, sql)| (object_type, name, normalize_schema_sql(&sql)))
+            .collect()
+    })
+}
+
+fn raw_schema_object_definitions(conn: &Connection) -> Result<Vec<(String, String, String)>> {
     let mut statement = conn
         .prepare(
             "SELECT type, name, sql FROM sqlite_master
@@ -2078,19 +2617,16 @@ fn schema_object_definitions(conn: &Connection) -> Result<Vec<(String, String, S
         )
         .map_err(|err| format!("cache DB SQLite error: {err}"))?;
     statement
-        .query_map([], |row| {
-            let sql: String = row.get(2)?;
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                sql.chars()
-                    .filter(|character| !character.is_whitespace())
-                    .collect(),
-            ))
-        })
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
         .map_err(|err| format!("cache DB SQLite error: {err}"))?
         .collect::<std::result::Result<Vec<(String, String, String)>, _>>()
         .map_err(|err| format!("cache DB SQLite error: {err}"))
+}
+
+fn normalize_schema_sql(sql: &str) -> String {
+    sql.chars()
+        .filter(|character| !character.is_whitespace())
+        .collect()
 }
 
 fn cache_migration_version(conn: &Connection) -> Result<i64> {
@@ -2183,11 +2719,185 @@ mod tests {
     use std::thread;
 
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
     // The EXPLAIN QUERY PLAN pins below run their assertions once against a
     // database with no planner statistics and once with the statistics
     // captured from real corpus stores, because production carries the latter
     // (issue #3016).
     use crate::cache_gc::PlannerStatisticsState;
+
+    #[test]
+    fn a_store_seeded_from_the_template_matches_a_store_built_by_the_schema() {
+        let temp = tempfile::tempdir().unwrap();
+        // The template builders open with SQLITE_OPEN_NOFOLLOW, which rejects a
+        // symlink anywhere in the path, and production passes canonical paths.
+        // macOS temp directories live under /var -> /private/var (#4604).
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let template_dir = root.join("templates");
+        let reference = root.join("reference.db");
+        std::fs::File::create(&reference).unwrap();
+        build_fresh_store(&reference).unwrap();
+
+        // The first store builds and publishes the template; the second copies it.
+        let first = root.join("first.db");
+        let second = root.join("second.db");
+        assert!(seed_new_store_from_template(&first, Some(&template_dir)).unwrap());
+        assert!(seed_new_store_from_template(&second, Some(&template_dir)).unwrap());
+        assert!(!seed_new_store_from_template(&second, Some(&template_dir)).unwrap());
+        let template_entries = std::fs::read_dir(&template_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            template_entries,
+            vec![STORE_TEMPLATE.file_name().to_owned()]
+        );
+
+        let describe = |path: &Path| {
+            let conn = Connection::open(path).unwrap();
+            let pragmas =
+                ["page_size", "auto_vacuum", "journal_mode", "user_version"].map(|pragma| {
+                    conn.query_row(&format!("PRAGMA {pragma}"), [], |row| {
+                        row.get::<_, Value>(0)
+                    })
+                    .unwrap()
+                });
+            let tables = user_schema_objects(&conn)
+                .unwrap()
+                .into_iter()
+                .filter(|(object_type, _)| object_type == "table")
+                .map(|(_, name)| {
+                    let rows: i64 = conn
+                        .query_row(
+                            &format!("SELECT COUNT(*) FROM {}", quote_sqlite_identifier(&name)),
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    (name, rows)
+                })
+                .collect::<Vec<_>>();
+            (
+                pragmas,
+                schema_object_definitions_sha256(&conn).unwrap(),
+                tables,
+            )
+        };
+        let expected = describe(&reference);
+        assert_eq!(expected.1, CURRENT_SCHEMA_OBJECTS_SHA256);
+        for seeded in [&first, &second] {
+            assert_eq!(describe(seeded), expected, "{}", seeded.display());
+            let mut conn = Connection::open(seeded).unwrap();
+            migrate(&mut conn).unwrap();
+            assert!(current_schema_is_valid(&conn).unwrap());
+        }
+    }
+
+    #[test]
+    fn residual_conversion_migration_preserves_gap_rows_and_bounds() {
+        let conn = create_current_baseline_without_migration();
+        for migration in POST_BASELINE_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version < 178)
+        {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 177).unwrap();
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'rust', 0)",
+            ["a".repeat(40)],
+        )
+        .unwrap();
+        let blob_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO semantic_ir_publications(blob_id, lang, producer_epoch,
+             content_digest, source_bytes, outcome, procedure_count, logical_rows,
+             payload_bytes, go_predeclared_builtins, publication_state)
+             VALUES(?1, 'rust', 'fixture', zeroblob(32), 0, 0, 1, 1, 0, jsonb('[]'), 'complete')",
+            [blob_id],
+        )
+        .unwrap();
+        let insert = "INSERT INTO semantic_ir_gaps(blob_id, procedure, gap, point,
+             subject, capability, impacts, kind, discharge, detail, source, evidence)
+             VALUES(?1, 0, ?2, 0, 0, 12, 1, 1, ?3, 0, 0, 0)";
+        conn.execute(insert, rusqlite::params![blob_id, 0, 12])
+            .unwrap();
+        assert!(
+            conn.execute(insert, rusqlite::params![blob_id, 1, 13])
+                .is_err()
+        );
+        conn.execute_batch(include_str!(
+            "../migrations/cache/0178-semantic-ir-residual-conversion.sql"
+        ))
+        .unwrap();
+        conn.execute(insert, rusqlite::params![blob_id, 1, 13])
+            .unwrap();
+        assert!(
+            conn.execute(insert, rusqlite::params![blob_id, 2, 14])
+                .is_err()
+        );
+        let rows = conn
+            .prepare("SELECT gap, discharge FROM semantic_ir_gaps ORDER BY gap")
+            .unwrap()
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(rows, vec![(0, 12), (1, 13)]);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+        conn.execute(
+            "DELETE FROM semantic_ir_publications WHERE blob_id = ?1",
+            [blob_id],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM semantic_ir_gaps", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    fn current_rust_connection() -> Connection {
+        let mut connection = Connection::open_in_memory().expect("open in-memory cache DB");
+        configure_connection(&mut connection).expect("configure cache DB");
+        migrate(&mut connection).expect("migrate cache DB");
+        connection
+    }
+
+    fn seal_rust_source_manifest(conn: &Connection, blob_id: i64) -> rusqlite::Result<usize> {
+        conn.execute(
+            "UPDATE source_fact_manifests
+                SET publication_state = 'complete'
+              WHERE blob_id = ?1",
+            [blob_id],
+        )
+    }
+
+    #[cfg(unix)]
+    fn assert_elevated_permission_advice(error: &str, path: &Path) {
+        assert!(
+            error.contains(&path.display().to_string())
+                && error.contains("elevated filesystem permissions"),
+            "{error}"
+        );
+    }
+
+    /// Whether this process's own writes are constrained by the target
+    /// directory's mode bits, probed exactly as [`cache_write_denial`] probes a
+    /// denial. uid 0 and processes holding CAP_DAC_OVERRIDE bypass the 0o555
+    /// injection the permission tests use, so the denial cannot be injected for
+    /// them and those tests are not applicable (issue #5090).
+    #[cfg(unix)]
+    fn mode_bits_deny_writes(directory: &Path) -> bool {
+        tempfile::NamedTempFile::new_in(directory).is_err()
+    }
 
     #[path = "cpp_class_templates.rs"]
     mod cpp_class_templates;
@@ -2205,27 +2915,6 @@ mod tests {
     #[path = "source_import_path_availability.rs"]
     mod source_import_path_availability;
 
-    /// The memory-statistics opt-in is exactly `1`.
-    ///
-    /// The decision is tested and not the effect: `sqlite3_config` is legal
-    /// only while SQLite is uninitialized, the test binary has already opened
-    /// connections by the time any test runs, and `Once` admits one call per
-    /// process in any case. Which value turns the statistics on is the whole of
-    /// what this function decides.
-    #[test]
-    fn sqlite_memory_statistics_stay_on_only_for_the_exact_opt_in() {
-        assert!(keeps_sqlite_memory_statistics(Some(std::ffi::OsStr::new(
-            "1"
-        ))));
-        assert!(!keeps_sqlite_memory_statistics(None));
-        for other in ["", "0", "true", "yes", "11", " 1"] {
-            assert!(
-                !keeps_sqlite_memory_statistics(Some(std::ffi::OsStr::new(other))),
-                "{MEMORY_STATISTICS_ENV}={other:?} must leave the default"
-            );
-        }
-    }
-
     /// A database with no Bifrost schema in it, in the store's own shape:
     /// incremental auto-vacuum, WAL, and one transaction that frees pages.
     fn synthetic_store_with_free_pages(path: &Path, page_size: u32) -> Connection {
@@ -2240,6 +2929,11 @@ mod tests {
         // The page size and auto-vacuum mode only take effect once the file has
         // a header to hold them.
         conn.execute_batch("VACUUM;").unwrap();
+        populate_store_with_free_pages(&conn);
+        conn
+    }
+
+    fn populate_store_with_free_pages(conn: &Connection) -> i64 {
         let filler = "x".repeat(2000);
         let mut sql = String::from("BEGIN;");
         for table in 0..40 {
@@ -2256,7 +2950,7 @@ mod tests {
             .query_row("PRAGMA freelist_count", [], |row| row.get(0))
             .unwrap();
         assert!(free > 0, "the workload must leave pages on the freelist");
-        conn
+        free
     }
 
     /// The tripwire for the upstream defect the store used to be exposed to. A
@@ -2331,22 +3025,7 @@ mod tests {
                 .unwrap();
             assert_eq!(auto_vacuum, 2, "the workload needs incremental auto-vacuum");
 
-            let filler = "x".repeat(2000);
-            let mut sql = String::from("BEGIN;");
-            for table in 0..40 {
-                sql.push_str(&format!(
-                    "CREATE TABLE t{table}(a TEXT); INSERT INTO t{table}(a) VALUES('{filler}');"
-                ));
-            }
-            for table in 0..40 {
-                sql.push_str(&format!("DROP TABLE t{table};"));
-            }
-            sql.push_str("COMMIT;");
-            conn.execute_batch(&sql).unwrap();
-            let free: i64 = conn
-                .query_row("PRAGMA freelist_count", [], |row| row.get(0))
-                .unwrap();
-            assert!(free > 0, "the workload must leave pages on the freelist");
+            let free = populate_store_with_free_pages(&conn);
 
             let busy = conn
                 .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
@@ -2455,6 +3134,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "52536713ff40: shutdown checkpoint contention must defer only truncation and restore the busy timeout"
+    )]
     fn close_checkpoint_preserves_sqlite_errors_and_restores_busy_timeout() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join(cache_db_file_name());
@@ -2531,6 +3213,202 @@ mod tests {
         assert!(obsolete.exists());
         assert!(lock_path.exists());
         lock.unlock().unwrap();
+    }
+
+    /// A store this build imports: the pre-versioning file, at this schema.
+    fn create_importable_store(cache_dir: &Path) {
+        let legacy = cache_dir.join(LEGACY_CACHE_DB_FILE_NAME);
+        std::fs::File::create(&legacy).unwrap();
+        build_fresh_store(&legacy).unwrap();
+    }
+
+    /// The files a process killed mid-upgrade leaves: the staged copy and its
+    /// SQLite sidecars.
+    fn leave_interrupted_upgrade(cache_dir: &Path, stem: &str) -> Vec<PathBuf> {
+        STORE_FILE_SUFFIXES
+            .iter()
+            .map(|suffix| {
+                let path = cache_dir.join(format!("{STAGED_UPGRADE_PREFIX}{stem}{suffix}"));
+                std::fs::write(&path, b"interrupted upgrade").unwrap();
+                path
+            })
+            .collect()
+    }
+
+    #[test]
+    #[hardwon(
+        "473825ed9b2c: concurrent openers each staged a full copy of the store for one upgrade"
+    )]
+    fn concurrent_upgrades_stage_one_copy_and_publish_one_store() {
+        const UPGRADERS: usize = 8;
+
+        let temp = tempfile::tempdir().unwrap();
+        // Staging opens with SQLITE_OPEN_NOFOLLOW (#4604).
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        create_importable_store(&root);
+        let db_path = root.join(cache_db_file_name());
+        let barrier = Barrier::new(UPGRADERS);
+        let finished = std::sync::atomic::AtomicBool::new(false);
+
+        // The threads call the import directly. `open_unified_connection`
+        // already serializes openers of one path inside a process, so only the
+        // upgrade lock stands between processes. That lock belongs to each
+        // open file, not to the process, so threads contend for it the same
+        // way processes do.
+        let (results, staged_names) = thread::scope(|scope| {
+            let watcher = scope.spawn(|| {
+                let mut staged_names = HashSet::new();
+                while !finished.load(std::sync::atomic::Ordering::SeqCst) {
+                    for entry in std::fs::read_dir(&root).unwrap().flatten() {
+                        let name = entry.file_name().to_string_lossy().into_owned();
+                        if name.starts_with(STAGED_UPGRADE_PREFIX)
+                            && !STORE_FILE_SUFFIXES[1..]
+                                .iter()
+                                .any(|suffix| name.ends_with(suffix))
+                        {
+                            staged_names.insert(name);
+                        }
+                    }
+                }
+                staged_names
+            });
+            let upgraders = (0..UPGRADERS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        import_newest_older_store(&db_path)
+                    })
+                })
+                .collect::<Vec<_>>();
+            let results = upgraders
+                .into_iter()
+                .map(|handle| handle.join().expect("upgrade thread panicked"))
+                .collect::<Vec<_>>();
+            finished.store(true, std::sync::atomic::Ordering::SeqCst);
+            (results, watcher.join().expect("watcher thread panicked"))
+        });
+
+        assert!(
+            results.iter().all(Result::is_ok),
+            "concurrent upgrades failed: {results:#?}"
+        );
+        // The first holder publishes; every waiter then finds the store and
+        // stages nothing. The watcher can miss the one copy, never add one.
+        assert!(
+            staged_names.len() <= 1,
+            "more than one upgrade staged a copy: {staged_names:?}"
+        );
+        let conn = Connection::open(&db_path).unwrap();
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        assert!(staged_copy_paths(&root).unwrap().is_empty());
+    }
+
+    #[test]
+    #[hardwon(
+        "473825ed9b2c: copies staged by killed upgrades were never removed and filled the disk"
+    )]
+    fn opening_removes_interrupted_upgrade_copies_and_nothing_else() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        create_importable_store(&root);
+        let mut interrupted = leave_interrupted_upgrade(&root, "Ab12Cd");
+        interrupted.extend(leave_interrupted_upgrade(&root, "Ef34Gh"));
+        std::fs::create_dir(root.join("semantic-packs")).unwrap();
+        let bystanders: Vec<(PathBuf, String)> = [
+            ".gitignore",
+            "bifrost_cache.v150.db",
+            "bifrost_cache.v150.db-wal",
+            "bifrost_cache.db.schema14.bak",
+            "catalog.db",
+            "catalog.db-wal",
+            "semantic-packs/catalog.db",
+            "bifrost_cache.v150.db.initial-build.lock",
+            &format!("{}{INITIAL_BUILD_LOCK_SUFFIX}", cache_db_file_name()),
+        ]
+        .iter()
+        .map(|name| {
+            let path = root.join(name);
+            let expected_contents = format!("bystander {name}");
+            std::fs::write(&path, &expected_contents).unwrap();
+            (path, expected_contents)
+        })
+        .collect();
+        let legacy = root.join(LEGACY_CACHE_DB_FILE_NAME);
+        let legacy_before = std::fs::read(&legacy).unwrap();
+
+        let conn = open_unified_connection(&root.join(cache_db_file_name())).unwrap();
+
+        assert!(current_schema_is_valid(&conn).unwrap());
+        let left: Vec<&PathBuf> = interrupted.iter().filter(|path| path.exists()).collect();
+        assert!(
+            left.is_empty(),
+            "interrupted upgrade files survived: {left:?}"
+        );
+        for (path, expected_contents) in &bystanders {
+            let name = path.strip_prefix(&root).unwrap().display();
+            assert_eq!(
+                std::fs::read_to_string(path).unwrap(),
+                *expected_contents,
+                "cleanup touched {name}"
+            );
+        }
+        assert_eq!(std::fs::read(&legacy).unwrap(), legacy_before);
+    }
+
+    #[test]
+    fn opening_leaves_the_copy_of_a_live_upgrade_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let live = leave_interrupted_upgrade(&root, "Ij56Kl");
+        // A live upgrade holds the lock until it publishes.
+        let upgrade_lock = open_upgrade_lock(&root).unwrap();
+        upgrade_lock.lock().unwrap();
+
+        let conn = open_unified_connection(&root.join(cache_db_file_name())).unwrap();
+
+        assert!(current_schema_is_valid(&conn).unwrap());
+        let gone: Vec<&PathBuf> = live.iter().filter(|path| !path.exists()).collect();
+        assert!(gone.is_empty(), "removed files of a live upgrade: {gone:?}");
+        upgrade_lock.unlock().unwrap();
+    }
+
+    #[test]
+    #[hardwon(
+        "#5150: the upgrade probe opened the older store before the upgrade lock, so eight Windows openers read one WAL store at once"
+    )]
+    fn upgrade_probe_opens_no_older_store_before_the_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        // The legacy candidate is the one the probe opens to read its
+        // `user_version`, and SQLite cannot read these contents. A probe that
+        // runs before the lock therefore fails here while the lock is held.
+        std::fs::write(root.join(LEGACY_CACHE_DB_FILE_NAME), b"not a database").unwrap();
+        let db_path = root.join(cache_db_file_name());
+        let (probed, probes) = std::sync::mpsc::channel();
+        let holder = open_upgrade_lock(&root).unwrap();
+        holder.lock().unwrap();
+
+        let importer = thread::spawn(move || {
+            let outcome = import_newest_older_store(&db_path);
+            let _ = probed.send(());
+            outcome
+        });
+
+        assert!(
+            probes.recv_timeout(Duration::from_millis(500)).is_err(),
+            "the importer finished while another process held the upgrade lock"
+        );
+        holder.unlock().unwrap();
+        // Holding the lock, it reaches the candidate and reports the probe
+        // failure.
+        let error = importer
+            .join()
+            .expect("importer thread panicked")
+            .unwrap_err();
+        assert!(error.contains("SQLite error"), "{error}");
     }
 
     fn open_in_memory_cache() -> Connection {
@@ -3544,6 +4422,94 @@ mod tests {
     }
 
     #[test]
+    fn executable_scope_owner_migration_preserves_children_and_scope_kinds() {
+        let mut conn = create_current_baseline_without_migration();
+        for migration in POST_BASELINE_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version < 180)
+        {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO blobs(blob_oid,lang,generation) VALUES(?1,'rust',0)",
+            [seeded_oid("executable-scope-migration")],
+        )
+        .unwrap();
+        let blob = conn.last_insert_rowid();
+        conn.execute("INSERT INTO resolution_fragment_interiors(blob_id,lang,semantic_language,producer_epoch,interior_digest,expected_semantic_site_count,logical_rows,payload_bytes,publication_state) VALUES(?1,'rust','rust','test',zeroblob(32),0,1,0,'building')", [blob]).unwrap();
+        conn.execute(
+            "INSERT INTO resolution_member_scope_properties VALUES(?1,1,10)",
+            [blob],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO resolution_member_owner_properties(blob_id,definition_semantic_key,owner_definition_semantic_key,owner_scope_head_node_key,member_kind,member_access,qualifier_compatibility) VALUES(?1,2,1,10,'method','instance','runtime_only')", [blob]).unwrap();
+        conn.pragma_update(None, "user_version", 179).unwrap();
+        migrate(&mut conn).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT scope_kind FROM resolution_member_scope_properties WHERE blob_id=?1",
+                [blob],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "type_body"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM resolution_member_owner_properties WHERE blob_id=?1",
+                [blob],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        conn.execute("INSERT INTO resolution_member_scope_properties VALUES(?1,2,11,'executable'),(?1,2,12,'executable')", [blob]).unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO resolution_member_scope_properties VALUES(?1,1,13,'type_body')",
+                [blob]
+            )
+            .is_err()
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO resolution_member_scope_properties VALUES(?1,3,11,'executable')",
+                [blob]
+            )
+            .is_err()
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO resolution_member_scope_properties VALUES(?1,3,14,'block')",
+                [blob]
+            )
+            .is_err()
+        );
+        validate_foreign_keys(&conn).unwrap();
+        conn.execute("DELETE FROM blobs WHERE id=?1", [blob])
+            .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM resolution_member_scope_properties",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM resolution_member_owner_properties",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert!(current_schema_is_valid(&conn).unwrap());
+    }
+
+    #[test]
     fn current_schema_digest_matches_the_baseline_chain() {
         let conn = create_current_baseline_without_migration();
         for migration in POST_BASELINE_MIGRATIONS {
@@ -3555,6 +4521,576 @@ mod tests {
         );
     }
 
+    #[test]
+    fn jvm_external_owner_inventory_migration_applies_to_fresh_and_173_stores() {
+        let fresh = open_in_memory_cache();
+        assert_eq!(
+            cache_migration_version(&fresh).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        for table in [
+            "jvm_external_owners",
+            "jvm_external_owner_members",
+            "jvm_external_owner_supertypes",
+        ] {
+            assert!(table_exists(&fresh, table).unwrap(), "missing {table}");
+        }
+
+        let mut upgraded = create_current_baseline_without_migration();
+        for migration in POST_BASELINE_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 173)
+        {
+            upgraded.execute_batch(migration.sql).unwrap();
+        }
+        upgraded.pragma_update(None, "user_version", 173).unwrap();
+        assert!(!table_exists(&upgraded, "jvm_external_owners").unwrap());
+
+        migrate(&mut upgraded).unwrap();
+
+        assert_eq!(
+            cache_migration_version(&upgraded).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        for table in [
+            "jvm_external_owners",
+            "jvm_external_owner_members",
+            "jvm_external_owner_supertypes",
+        ] {
+            assert!(table_exists(&upgraded, table).unwrap(), "missing {table}");
+        }
+    }
+
+    #[test]
+    fn contextual_callable_parameter_lists_migration_applies_to_fresh_and_174_stores() {
+        let fresh = open_in_memory_cache();
+        assert_eq!(
+            cache_migration_version(&fresh).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        let column = fresh
+            .query_row(
+                "SELECT \"notnull\", dflt_value FROM pragma_table_info('resolution_callable_parameter_lists') WHERE name = 'contextual'",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(column, (1, "0".to_owned()));
+
+        let mut upgraded = create_current_baseline_without_migration();
+        for migration in POST_BASELINE_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 174)
+        {
+            upgraded.execute_batch(migration.sql).unwrap();
+        }
+        upgraded.pragma_update(None, "user_version", 174).unwrap();
+        assert_eq!(
+            upgraded
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('resolution_callable_parameter_lists') WHERE name = 'contextual'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+
+        migrate(&mut upgraded).unwrap();
+
+        assert_eq!(
+            cache_migration_version(&upgraded).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        assert_eq!(
+            upgraded
+                .query_row(
+                    "SELECT \"notnull\", dflt_value FROM pragma_table_info('resolution_callable_parameter_lists') WHERE name = 'contextual'",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+                .unwrap(),
+            (1, "0".to_owned())
+        );
+    }
+
+    #[test]
+    fn php_include_path_migration_preserves_existing_source_imports() {
+        let mut conn = create_current_baseline_without_migration();
+        for migration in POST_BASELINE_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version < CURRENT_MIGRATION_VERSION)
+        {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", CURRENT_MIGRATION_VERSION - 1)
+            .unwrap();
+
+        let blob_id = insert_visibility_blob_fixture(&conn, "php-include-path-migration", None, 1);
+        conn.execute(
+            "INSERT INTO source_fact_manifests(
+               blob_id, facts_version, source_bytes, occurrence_count,
+               declaration_count, declaration_unit_count, node_count, role_count,
+               occurrence_role_count, logical_rows, payload_bytes, publication_state
+             ) VALUES(?1, 1, 3, 0, 0, 0, 0, 0, 0, 1, 0, 'building')",
+            [blob_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO source_imports(
+               blob_id, import_id, statement, is_wildcard, is_global, path_kind,
+               declaration_occurrence_id, declaration_start_byte, declaration_end_byte
+             ) VALUES(?1, 0, 'Foo', 0, 0, 'namespace', 0, 0, 3)",
+            [blob_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO source_import_segments(blob_id, import_id, ordinal, segment)
+             VALUES(?1, 0, 0, 'Foo')",
+            [blob_id],
+        )
+        .unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        let preserved: (String, String, String) = conn
+            .query_row(
+                "SELECT imports.statement, imports.path_kind, segments.segment
+                 FROM source_imports AS imports
+                 JOIN source_import_segments AS segments
+                   USING(blob_id, import_id)
+                 WHERE imports.blob_id = ?1 AND imports.import_id = 0",
+                [blob_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(preserved, ("Foo".into(), "namespace".into(), "Foo".into()));
+
+        for path_kind in ["file_include", "dynamic_include"] {
+            assert_eq!(
+                conn.execute(
+                    "UPDATE source_imports SET path_kind = ?1
+                     WHERE blob_id = ?2 AND import_id = 0",
+                    rusqlite::params![path_kind, blob_id],
+                )
+                .unwrap(),
+                1
+            );
+        }
+        assert!(current_schema_is_valid(&conn).unwrap());
+        validate_foreign_keys(&conn).unwrap();
+    }
+
+    #[test]
+    fn migration_157_allows_shared_package_tokens_and_preserves_rows() {
+        let mut conn = create_schema_through_146();
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'scala', 0)",
+            [seeded_oid("scala-import-migration")],
+        )
+        .unwrap();
+        let blob_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO resolution_fragment_interiors(
+               blob_id, lang, semantic_language, producer_epoch, interior_digest,
+               expected_semantic_site_count, logical_rows, payload_bytes, publication_state
+             ) VALUES(?1, 'scala', 'scala', 'test', zeroblob(32), 0, 1, 0, 'building')",
+            [blob_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO resolution_semantic_catalog(
+               blob_id, local_key, identity_digest,
+               import_source_site, import_start_byte, import_end_byte, import_route_kind
+             ) VALUES(?1, 0, zeroblob(32), 0, 0, 1, 'single_type'),
+                      (?1, 1, randomblob(32), NULL, NULL, NULL, NULL)",
+            [blob_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO resolution_type_components(
+               blob_id, container_slot, constructor, kind, component_slot
+             ) VALUES(?1, 0, 0, 0, 1)",
+            [blob_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO resolution_node_catalog(blob_id,local_key,identity_digest)
+             VALUES(?1,0,randomblob(32))",
+            [blob_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO resolution_package_references(
+               blob_id,token_key,domain_key,reference_key,source_site,
+               root_scope_key,namespace,lookup_key
+             ) VALUES(?1,1,1,1,0,0,'type',1)",
+            [blob_id],
+        )
+        .unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        let foreign_keys: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(foreign_keys, 1);
+        assert_eq!(
+            conn.query_row(
+                "SELECT import_route_kind FROM resolution_semantic_catalog
+                 WHERE blob_id=?1 AND local_key=0",
+                [blob_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "single_type"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM resolution_type_components WHERE blob_id=?1",
+                [blob_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1,
+            "rebuilding the semantic catalog must preserve its children"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT choice_key FROM resolution_package_references WHERE blob_id=?1",
+                [blob_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .unwrap(),
+            None,
+            "older package rows retain their authority without a Kotlin choice"
+        );
+        for index in [
+            "resolution_package_references_domain",
+            "resolution_package_references_lookup",
+            "resolution_package_references_scope",
+        ] {
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?1",
+                    [index],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                1,
+                "migration must restore index {index}"
+            );
+        }
+        conn.execute(
+            "UPDATE resolution_package_references SET choice_key=0 WHERE blob_id=?1",
+            [blob_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO resolution_semantic_catalog(
+               blob_id, local_key, identity_digest,
+               import_source_site, import_start_byte, import_end_byte, import_route_kind
+             ) VALUES(?1, 2, randomblob(32), 2, 4, 9, 'named'),
+                      (?1, 3, randomblob(32), 3, 10, 15, 'star')",
+            [blob_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO resolution_package_references(
+               blob_id,token_key,domain_key,reference_key,choice_key,source_site,
+               root_scope_key,namespace,lookup_key
+             ) VALUES(?1,1,1,2,0,1,0,'type',1)",
+            [blob_id],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM resolution_package_references
+                 WHERE blob_id=?1 AND token_key=1",
+                [blob_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            2,
+            "one grouped token must retain a package-reference row per site"
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO resolution_package_references(
+                   blob_id,token_key,domain_key,reference_key,choice_key,source_site,
+                   root_scope_key,namespace,lookup_key
+                 ) VALUES(?1,0,1,2,NULL,1,0,'type',1)",
+                [blob_id],
+            )
+            .is_err(),
+            "one source reference and namespace must remain unique"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT choice_key FROM resolution_package_references WHERE blob_id=?1 AND reference_key=1",
+                [blob_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .unwrap(),
+            Some(0)
+        );
+        assert!(
+            conn.execute(
+                "UPDATE resolution_package_references SET choice_key=999 WHERE blob_id=?1",
+                [blob_id],
+            )
+            .is_err(),
+            "choice_key must reference a semantic catalog key"
+        );
+
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM resolution_semantic_catalog
+                 WHERE blob_id=?1 AND import_route_kind IN ('named', 'star')",
+                [blob_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn resolved_file_import_edge_migration_creates_indexed_relations() {
+        let conn = open_in_memory_cache();
+
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        assert!(current_schema_is_valid(&conn).unwrap());
+        for table in [
+            "workspace_import_graphs",
+            "workspace_import_sources",
+            "workspace_import_edges",
+            "workspace_import_edge_facts",
+            "workspace_import_source_modules",
+            "workspace_import_source_bindings",
+            "workspace_import_candidate_file_dependencies",
+            "workspace_import_route_dependencies",
+            "workspace_import_missing_module_dependencies",
+        ] {
+            assert!(table_exists(&conn, table).unwrap(), "missing {table}");
+        }
+        let reverse_index: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM sqlite_master
+                   WHERE type = 'index' AND name = 'workspace_import_edges_reverse_idx'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let edge_foreign_keys: i64 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT id)
+                 FROM pragma_foreign_key_list('workspace_import_edges')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let edge_fact_foreign_keys: i64 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT id)
+                 FROM pragma_foreign_key_list('workspace_import_edge_facts')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let edge_fact_target_foreign_key: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM pragma_foreign_key_list('workspace_import_edge_facts')
+                 WHERE \"from\" = 'target_path'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let candidate_indexes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name IN (
+                    'workspace_import_candidate_file_dependencies_consulted_idx',
+                    'workspace_import_route_dependencies_name_idx',
+                    'workspace_import_missing_module_dependencies_key_idx'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let import_ordinal_column: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM pragma_table_info('workspace_import_edge_facts')
+                   WHERE name = 'import_ordinal'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let fact_target_index: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM sqlite_master
+                   WHERE type = 'index' AND name = 'workspace_import_edge_facts_target_idx'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let fact_source_target_index: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM sqlite_master
+                   WHERE type = 'index'
+                     AND name = 'workspace_import_edge_facts_source_target_idx'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let source_dependency_completeness: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM pragma_table_info('workspace_import_sources')
+                   WHERE name = 'complete_resolution_dependencies'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let import_input_digests: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('workspace_import_sources')
+                 WHERE name IN ('binding_surface_digest', 'import_rows_digest')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(reverse_index, "missing reverse adjacency index");
+        assert_eq!(
+            candidate_indexes, 3,
+            "missing name-granular import invalidation indexes"
+        );
+        assert_eq!(
+            edge_foreign_keys, 2,
+            "edges must reference both source files"
+        );
+        assert_eq!(
+            edge_fact_foreign_keys, 1,
+            "edge facts retain the indexed importer-source foreign key"
+        );
+        assert_eq!(
+            edge_fact_target_foreign_key, 0,
+            "edge-fact target rows are removed through the indexed target path before source deletion"
+        );
+        assert!(
+            import_ordinal_column,
+            "edge facts must preserve import ordinals"
+        );
+        assert!(fact_target_index, "missing target-side edge-fact index");
+        assert!(
+            fact_source_target_index,
+            "missing source/target edge-fact reconciliation index"
+        );
+        assert!(
+            source_dependency_completeness,
+            "source rows must record whether candidate dependencies are complete"
+        );
+        assert_eq!(
+            import_input_digests, 2,
+            "source rows must retain both Rust import input digests"
+        );
+        validate_foreign_keys(&conn).unwrap();
+    }
+
+    #[test]
+    fn migration_141_widens_import_kinds_and_preserves_catalog_children() {
+        let mut conn = create_schema_through_140();
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'scala', 0)",
+            [seeded_oid("scala-import-migration")],
+        )
+        .unwrap();
+        let blob_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO resolution_fragment_interiors(
+               blob_id, lang, semantic_language, producer_epoch, interior_digest,
+               expected_semantic_site_count, logical_rows, payload_bytes, publication_state
+             ) VALUES(?1, 'scala', 'scala', 'test', zeroblob(32), 0, 1, 0, 'building')",
+            [blob_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO resolution_semantic_catalog(
+               blob_id, local_key, identity_digest,
+               import_source_site, import_start_byte, import_end_byte, import_route_kind
+             ) VALUES(?1, 0, zeroblob(32), 0, 0, 1, 'single_type'),
+                      (?1, 1, randomblob(32), NULL, NULL, NULL, NULL)",
+            [blob_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO resolution_type_components(
+               blob_id, container_slot, constructor, kind, component_slot
+             ) VALUES(?1, 0, 0, 0, 1)",
+            [blob_id],
+        )
+        .unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        let foreign_keys: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(foreign_keys, 1);
+        assert_eq!(
+            conn.query_row(
+                "SELECT import_route_kind FROM resolution_semantic_catalog
+                 WHERE blob_id=?1 AND local_key=0",
+                [blob_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "single_type"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM resolution_type_components WHERE blob_id=?1",
+                [blob_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1,
+            "rebuilding the semantic catalog must preserve its children"
+        );
+
+        conn.execute(
+            "INSERT INTO resolution_semantic_catalog(
+               blob_id, local_key, identity_digest,
+               import_source_site, import_start_byte, import_end_byte, import_route_kind
+             ) VALUES(?1, 2, randomblob(32), 2, 4, 9, 'named'),
+                      (?1, 3, randomblob(32), 3, 10, 15, 'star')",
+            [blob_id],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM resolution_semantic_catalog
+                 WHERE blob_id=?1 AND import_route_kind IN ('named', 'star')",
+                [blob_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            2
+        );
+    }
     #[test]
     fn python_runtime_member_checks_reject_nullable_verified_mutations() {
         let (conn, acquisition_id, environment_id, artifact_id, _) =
@@ -3841,6 +5377,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#3708+7224070fdeb7: incomplete aggregate cache evidence was promoted without per-policy completion and provenance"
+    )]
     fn v125_aggregate_policy_evidence_is_not_promoted_to_v126() {
         let conn = create_current_baseline_without_migration();
         conn.execute_batch(
@@ -3893,6 +5432,30 @@ mod tests {
         conn
     }
 
+    fn create_schema_through_140() -> Connection {
+        let conn = create_current_baseline_without_migration();
+        for migration in POST_BASELINE_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 140)
+        {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 140).unwrap();
+        conn
+    }
+
+    fn create_schema_through_146() -> Connection {
+        let conn = create_current_baseline_without_migration();
+        for migration in POST_BASELINE_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 146)
+        {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 146).unwrap();
+        conn
+    }
+
     fn create_legacy_cache(path: &Path) {
         let connection = Connection::open(path).unwrap();
         connection
@@ -3900,21 +5463,10 @@ mod tests {
             .unwrap();
     }
 
-    #[test]
-    fn network_cache_policy_refuses_wal_unless_operator_explicitly_accepts_it() {
-        let db_path = Path::new("/shared/repository/.bifrost/cache/bifrost_cache.db");
-
-        let error = validate_network_cache_policy(db_path, Some("NFS"), false).unwrap_err();
-        assert!(error.contains(&db_path.display().to_string()), "{error}");
-        assert!(error.contains(crate::gitblob::CACHE_ROOT_ENV), "{error}");
-        assert!(error.contains(ALLOW_NETWORK_CACHE_ENV), "{error}");
-        assert!(validate_network_cache_policy(db_path, None, false).is_ok());
-        assert!(validate_network_cache_policy(db_path, Some("NFS"), true).is_ok());
-    }
-
     /// A workspace whose `.bifrost` parent cannot be written must say how to
     /// proceed, in the order that keeps the shared cache intact (issue #1544).
     #[test]
+    #[hardwon("#1544: cache setup failure must identify actionable writable-cache locations")]
     #[cfg(unix)]
     fn unwritable_workspace_root_reports_the_ways_out() {
         use std::os::unix::fs::PermissionsExt;
@@ -3928,16 +5480,26 @@ mod tests {
             .join(cache_db_file_name());
         std::fs::set_permissions(&workspace_root, std::fs::Permissions::from_mode(0o555)).unwrap();
 
+        if !mode_bits_deny_writes(&workspace_root) {
+            std::fs::set_permissions(&workspace_root, std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            eprintln!(
+                "skipping cache_db::tests::unwritable_workspace_root_reports_the_ways_out: \
+                 this process bypasses the injected 0o555 write denial (issue #5090)"
+            );
+            return;
+        }
+
         let error = open_unified_connection(&db_path).unwrap_err();
 
         // Restored before any assertion can fail, so the tempdir still cleans up.
         std::fs::set_permissions(&workspace_root, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         assert!(
-            error.contains(&db_path.display().to_string())
-                && error.contains(&workspace_root.display().to_string()),
+            error.contains(&db_path.display().to_string()),
             "the denied path must be named: {error}"
         );
+        assert_elevated_permission_advice(&error, &workspace_root);
         let elevate = error.find("elevated filesystem permissions").unwrap();
         let durable = error
             .find("BIFROST_CACHE_ROOT=<writable local root>")
@@ -3961,6 +5523,7 @@ mod tests {
     /// The same message when the cache directory itself exists but is
     /// read-only, which SQLite reports as a cause-free SQLITE_CANTOPEN.
     #[test]
+    #[hardwon("#1544: cache setup failure in a managed directory must report recovery paths")]
     #[cfg(unix)]
     fn unwritable_cache_directory_reports_the_ways_out() {
         use std::os::unix::fs::PermissionsExt;
@@ -3976,26 +5539,88 @@ mod tests {
         let db_path = cache_dir.join(cache_db_file_name());
         std::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
 
+        if !mode_bits_deny_writes(&cache_dir) {
+            std::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!(
+                "skipping cache_db::tests::unwritable_cache_directory_reports_the_ways_out: \
+                 this process bypasses the injected 0o555 write denial (issue #5090)"
+            );
+            return;
+        }
+
         let error = open_unified_connection(&db_path).unwrap_err();
 
         std::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        assert!(
-            error.contains(&cache_dir.display().to_string())
-                && error.contains("elevated filesystem permissions"),
-            "{error}"
-        );
+        assert_elevated_permission_advice(&error, &cache_dir);
     }
 
     #[test]
-    fn fresh_cache_applies_baseline_migration() {
+    #[hardwon("8133f3a74309: fresh stores and analyzer processes replayed historical migrations")]
+    fn fresh_cache_matches_the_historical_migration_chain() {
+        let historical = create_current_baseline_without_migration();
+        for migration in POST_BASELINE_MIGRATIONS {
+            historical.execute_batch(migration.sql).unwrap();
+        }
+        let before = now_unix_seconds();
         let conn = open_in_memory_cache();
+        let after = now_unix_seconds();
 
+        assert_eq!(
+            schema_object_definitions(&conn).unwrap(),
+            schema_object_definitions(&historical).unwrap()
+        );
+        assert_eq!(
+            schema_object_definitions_sha256(&conn).unwrap(),
+            CURRENT_SCHEMA_OBJECTS_SHA256
+        );
         assert_eq!(
             cache_migration_version(&conn).unwrap(),
             CURRENT_MIGRATION_VERSION
         );
         assert!(current_schema_is_valid(&conn).unwrap());
+        validate_foreign_keys(&conn).unwrap();
+
+        for sql in [
+            "SELECT id, next_generation FROM analysis_generation_sequence",
+            "SELECT id, schema_version, semantic_schema_version, analyzer_schema_version,
+                    blobs_at_last_gc, gc_claim_until, embed_fingerprint, chunker_version
+             FROM cache_state",
+        ] {
+            let rows = |connection: &Connection| {
+                let mut statement = connection.prepare(sql).unwrap();
+                let column_count = statement.column_count();
+                statement
+                    .query_map([], |row| {
+                        (0..column_count)
+                            .map(|column| row.get::<_, Value>(column))
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+            };
+            assert_eq!(rows(&conn), rows(&historical), "{sql}");
+        }
+        let last_gc_at: i64 = conn
+            .query_row(
+                "SELECT last_gc_at FROM cache_state WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!((before..=after).contains(&last_gc_at));
+        let type_name_index: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM sqlite_master
+                   WHERE type='index' AND name='source_rust_type_segments_name'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(type_name_index, "schema 156 installs the type-name index");
     }
 
     #[test]
@@ -4079,6 +5704,100 @@ mod tests {
     }
 
     #[test]
+    fn generic_type_alias_migration_adds_validated_relational_rows() {
+        let mut conn = create_current_baseline_without_migration();
+        for migration in POST_BASELINE_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version < 139)
+        {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 138).unwrap();
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'rust', 0)",
+            ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        )
+        .unwrap();
+        let blob = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO resolution_fragment_interiors(
+               blob_id, lang, semantic_language, producer_epoch, interior_digest,
+               expected_semantic_site_count, logical_rows, payload_bytes, publication_state
+             ) VALUES(?1, 'rust', 'rust', 'alias-test', zeroblob(32), 0, 1, 0, 'building')",
+            [blob],
+        )
+        .unwrap();
+        for key in 1..=5 {
+            conn.execute(
+                "INSERT INTO resolution_semantic_catalog(blob_id, local_key, identity_digest)
+                 VALUES(?1, ?2, randomblob(32))",
+                rusqlite::params![blob, key],
+            )
+            .unwrap();
+        }
+
+        migrate(&mut conn).unwrap();
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        conn.execute(
+            "INSERT INTO resolution_type_arguments
+               (blob_id, application_slot, ordinal, argument_slot, indirection_delta,
+                reference_indirection_delta)
+             VALUES(?1, 1, 0, 2, 1, 1)",
+            [blob],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO resolution_generic_type_alias_parameters
+               (blob_id, alias_definition, ordinal, parameter_definition, target_slot,
+                indirection_delta, reference_indirection_delta)
+             VALUES(?1, 3, 0, 4, 5, 0, 0)",
+            [blob],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO resolution_type_arguments
+               (blob_id, application_slot, ordinal, argument_slot, indirection_delta,
+                reference_indirection_delta)
+             VALUES(?1, 1, -1, 2, 0, 0)",
+                [blob],
+            )
+            .is_err()
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO resolution_generic_type_alias_parameters
+               (blob_id, alias_definition, ordinal, parameter_definition, target_slot,
+                indirection_delta, reference_indirection_delta)
+             VALUES(?1, 3, 1, 4, 5, 0, 0)",
+                [blob],
+            )
+            .is_err()
+        );
+        assert!(current_schema_is_valid(&conn).unwrap());
+
+        conn.execute("DELETE FROM blobs WHERE id=?1", [blob])
+            .unwrap();
+        for table in [
+            "resolution_type_arguments",
+            "resolution_generic_type_alias_parameters",
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "{table} cascades with its blob");
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "77a06ad02155: adding lexical import scopes must migrate existing cache blobs without loss"
+    )]
     fn rust_import_scope_migration_preserves_baseline_blobs() {
         let mut conn = create_current_baseline_without_migration();
         conn.pragma_update(None, "user_version", BASELINE_MIGRATION_VERSION)
@@ -4101,25 +5820,6 @@ mod tests {
         conn.prepare("SELECT native_scope FROM source_rust_import_targets")
             .unwrap();
         migrate(&mut conn).unwrap();
-        assert_eq!(
-            conn.query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            1
-        );
-    }
-
-    #[test]
-    fn reopening_current_schema_preserves_existing_rows() {
-        let mut conn = open_in_memory_cache();
-        conn.execute(
-            "INSERT INTO blobs(blob_oid, lang, generation)
-             VALUES('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'rust', 0)",
-            [],
-        )
-        .unwrap();
-
-        migrate(&mut conn).unwrap();
-
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
@@ -4721,20 +6421,9 @@ mod tests {
     }
 
     #[test]
-    fn shared_cache_writer_wait_budget_covers_large_repo_reconcile() {
-        let temp = tempfile::tempdir().unwrap();
-        let conn = open_unified_connection(&temp.path().join(cache_db_file_name())).unwrap();
-        let busy_timeout_ms: i64 = conn
-            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
-            .unwrap();
-
-        assert!(
-            busy_timeout_ms >= 60_000,
-            "shared-cache writers need a substantial serialization budget, got {busy_timeout_ms}ms"
-        );
-    }
-
-    #[test]
+    #[hardwon(
+        "de6802c91638: workspace streaming readers could retain an unbounded mmap-backed cache"
+    )]
     fn streaming_reader_has_a_small_non_mmap_page_cache() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join(cache_db_file_name());
@@ -4784,6 +6473,53 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#4456: a deferred read-then-write transaction got SQLITE_BUSY without waiting while another connection held the write lock"
+    )]
+    fn writable_connection_transaction_waits_for_an_existing_writer() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join(cache_db_file_name());
+        let mut connection_a = open_unified_connection(&db_path).unwrap();
+        let writer_holds_lock = Arc::new(Barrier::new(2));
+        let writer_barrier = Arc::clone(&writer_holds_lock);
+        let writer_path = db_path.clone();
+        let writer = thread::spawn(move || {
+            let mut connection_b = open_unified_connection(&writer_path).unwrap();
+            let transaction = connection_b.transaction().unwrap();
+            transaction
+                .execute(
+                    "UPDATE cache_state SET last_gc_at = last_gc_at + 1 WHERE id = 1",
+                    [],
+                )
+                .unwrap();
+            writer_barrier.wait();
+            thread::sleep(Duration::from_millis(300));
+            transaction.commit().unwrap();
+        });
+
+        // A deferred transaction would read here, then fail the write upgrade
+        // with SQLITE_BUSY at once; SQLite skips the busy handler for upgrades.
+        writer_holds_lock.wait();
+        let transaction = connection_a.transaction().unwrap();
+        let last_gc_at: i64 = transaction
+            .query_row(
+                "SELECT last_gc_at FROM cache_state WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "UPDATE cache_state SET last_gc_at = ?1 WHERE id = 1",
+                [last_gc_at + 1],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+        writer.join().unwrap();
+    }
+
+    #[test]
+    #[hardwon("#885: simultaneous first opens raced SQLite bootstrap and schema migration")]
     fn concurrent_fresh_cache_openers_serialize_schema_migration() {
         const OPENERS: usize = 16;
 
@@ -4862,6 +6598,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#1173: one canonical cache path must reuse a lock cell across concurrent openers")]
     fn process_local_open_lock_reuses_same_canonical_path_cell() {
         let temp = tempfile::tempdir().unwrap();
         let canonical = prepare_cache_db_path(&temp.path().join(cache_db_file_name())).unwrap();
@@ -4885,6 +6622,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#1173: independent cache paths must not serialize behind one lock cell")]
     fn process_local_open_lock_distinguishes_independent_paths() {
         let temp = tempfile::tempdir().unwrap();
         let left = prepare_cache_db_path(&temp.path().join("left.db")).unwrap();
@@ -4900,6 +6638,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#885: bootstrap must not claim populated mode-zero stores were converted without VACUUM"
+    )]
     fn populated_mode_zero_cache_keeps_compatible_auto_vacuum_policy() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join(cache_db_file_name());
@@ -4933,7 +6674,42 @@ mod tests {
             .unwrap()
     }
 
+    fn assert_populated_legacy_store(
+        conn: &Connection,
+        expected_rows: i64,
+        expected_application_id: i64,
+        expected_user_version: i64,
+    ) {
+        assert_eq!(connection_page_size(conn), 4096);
+        assert_eq!(
+            conn.query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+                .unwrap()
+                .to_ascii_lowercase(),
+            "wal"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM existing", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            expected_rows
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA application_id", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            expected_application_id
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            expected_user_version
+        );
+        assert!(quick_check_is_ok(conn).unwrap());
+    }
+
     #[test]
+    #[hardwon(
+        "#2326: fresh cache stores used small pages and spent excessive time in reconciliation"
+    )]
     fn fresh_cache_store_uses_cache_page_size() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join(cache_db_file_name());
@@ -4951,6 +6727,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2326: page-size tuning stalled WAL readers and risked rebuilding populated stores")]
     fn populated_wal_store_keeps_legacy_page_size_without_losing_rows_or_metadata() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join(cache_db_file_name());
@@ -5027,38 +6804,7 @@ mod tests {
             "configure_connection took {configure_elapsed:?} with an active reader"
         );
 
-        assert_eq!(
-            connection_page_size(&conn),
-            4096,
-            "an existing populated store must not be rebuilt for page-size tuning"
-        );
-        assert_eq!(
-            conn.query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
-                .unwrap()
-                .to_ascii_lowercase(),
-            "wal",
-            "the upgrade must leave the store back in WAL mode"
-        );
-        assert_eq!(
-            conn.query_row("SELECT COUNT(*) FROM existing", [], |row| row
-                .get::<_, i64>(0))
-                .unwrap(),
-            3,
-            "connection setup must preserve existing rows"
-        );
-        assert_eq!(
-            conn.query_row("PRAGMA application_id", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            2462,
-            "connection setup must preserve SQLite metadata"
-        );
-        assert_eq!(
-            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            1234,
-            "connection setup must preserve the schema version metadata"
-        );
-        assert!(quick_check_is_ok(&conn).unwrap());
+        assert_populated_legacy_store(&conn, 3, 2462, 1234);
 
         // Reconfiguring the same legacy store is safe and remains rewrite-free.
         configure_connection(&mut conn).unwrap();
@@ -5067,6 +6813,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#2326: opening a populated rollback store must not rebuild it just to tune page size"
+    )]
     fn populated_rollback_store_keeps_legacy_page_size() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join(cache_db_file_name());
@@ -5088,48 +6837,15 @@ mod tests {
 
         configure_connection(&mut conn).unwrap();
 
-        assert_eq!(
-            connection_page_size(&conn),
-            4096,
-            "an existing populated store must not be rebuilt for page-size tuning"
-        );
-        assert_eq!(
-            conn.query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
-                .unwrap()
-                .to_ascii_lowercase(),
-            "wal"
-        );
-        assert_eq!(
-            conn.query_row("SELECT COUNT(*) FROM existing", [], |row| row
-                .get::<_, i64>(0))
-                .unwrap(),
-            1
-        );
-        assert_eq!(
-            conn.query_row("PRAGMA application_id", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            2462
-        );
-        assert_eq!(
-            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            5678
-        );
-        assert!(quick_check_is_ok(&conn).unwrap());
+        assert_populated_legacy_store(&conn, 1, 2462, 5678);
 
         configure_connection(&mut conn).unwrap();
         assert_eq!(connection_page_size(&conn), 4096);
         assert!(quick_check_is_ok(&conn).unwrap());
     }
 
-    fn sqlite_initialization_error(code: i32) -> InitializationPhaseError {
-        InitializationPhaseError::Sqlite(rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(code),
-            None,
-        ))
-    }
-
     #[test]
+    #[hardwon("#885: retry SQLite BUSY but surface SQLITE_LOCKED without retrying")]
     fn initialization_retry_retries_busy_but_not_locked() {
         let mut busy_attempts = 0;
         let value = retry_initialization_phase_with(
@@ -5139,7 +6855,9 @@ mod tests {
             || {
                 busy_attempts += 1;
                 if busy_attempts < 3 {
-                    Err(sqlite_initialization_error(rusqlite::ffi::SQLITE_BUSY))
+                    Err(InitializationPhaseError::Sqlite(
+                        crate::test_support::sqlite_error(rusqlite::ffi::SQLITE_BUSY),
+                    ))
                 } else {
                     Ok(42)
                 }
@@ -5156,7 +6874,9 @@ mod tests {
             |_| {},
             || {
                 locked_attempts += 1;
-                Err::<(), _>(sqlite_initialization_error(rusqlite::ffi::SQLITE_LOCKED))
+                Err::<(), _>(InitializationPhaseError::Sqlite(
+                    crate::test_support::sqlite_error(rusqlite::ffi::SQLITE_LOCKED),
+                ))
             },
         )
         .unwrap_err();
@@ -5166,6 +6886,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#885: an expired initialization deadline must not sleep before returning")]
     fn initialization_retry_reports_busy_deadline_without_sleeping() {
         let mut attempts = 0;
         let error = retry_initialization_phase_with(
@@ -5174,12 +6895,41 @@ mod tests {
             |_| panic!("zero-deadline retry must not sleep"),
             || {
                 attempts += 1;
-                Err::<(), _>(sqlite_initialization_error(rusqlite::ffi::SQLITE_BUSY))
+                Err::<(), _>(InitializationPhaseError::Sqlite(
+                    crate::test_support::sqlite_error(rusqlite::ffi::SQLITE_BUSY),
+                ))
             },
         )
         .unwrap_err();
         assert_eq!(attempts, 1);
         assert!(error.contains("test timeout phase timed out"), "{error}");
+    }
+
+    fn assert_pre_migration_schema_object_is_removed(
+        conn: &mut Connection,
+        object_type: &str,
+        object_name: &str,
+    ) {
+        migrate(conn).unwrap();
+
+        assert_eq!(
+            cache_migration_version(conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        let object_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM sqlite_schema WHERE type = ?1 AND name = ?2
+                 )",
+                rusqlite::params![object_type, object_name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !object_exists,
+            "{object_type} {object_name} survived rebuild"
+        );
+        assert!(current_schema_is_valid(conn).unwrap());
     }
 
     #[test]
@@ -5189,14 +6939,7 @@ mod tests {
         conn.execute_batch("CREATE TABLE legacy_cache(value TEXT) STRICT;")
             .unwrap();
 
-        migrate(&mut conn).unwrap();
-
-        assert_eq!(
-            cache_migration_version(&conn).unwrap(),
-            CURRENT_MIGRATION_VERSION
-        );
-        assert!(!table_exists(&conn, "legacy_cache").unwrap());
-        assert!(current_schema_is_valid(&conn).unwrap());
+        assert_pre_migration_schema_object_is_removed(&mut conn, "table", "legacy_cache");
     }
 
     #[test]
@@ -5205,14 +6948,7 @@ mod tests {
         conn.execute_batch("CREATE TABLE legacy_cache(value TEXT) STRICT;")
             .unwrap();
 
-        migrate(&mut conn).unwrap();
-
-        assert_eq!(
-            cache_migration_version(&conn).unwrap(),
-            CURRENT_MIGRATION_VERSION
-        );
-        assert!(!table_exists(&conn, "legacy_cache").unwrap());
-        assert!(current_schema_is_valid(&conn).unwrap());
+        assert_pre_migration_schema_object_is_removed(&mut conn, "table", "legacy_cache");
     }
 
     #[test]
@@ -5254,23 +6990,7 @@ mod tests {
         conn.execute_batch("CREATE VIEW legacy_view AS SELECT 1 AS value;")
             .unwrap();
 
-        migrate(&mut conn).unwrap();
-
-        let legacy_view_exists: bool = conn
-            .query_row(
-                "SELECT EXISTS(
-                   SELECT 1 FROM sqlite_master WHERE type = 'view' AND name = 'legacy_view'
-                 )",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            cache_migration_version(&conn).unwrap(),
-            CURRENT_MIGRATION_VERSION
-        );
-        assert!(!legacy_view_exists);
-        assert!(current_schema_is_valid(&conn).unwrap());
+        assert_pre_migration_schema_object_is_removed(&mut conn, "view", "legacy_view");
     }
 
     #[test]
@@ -5609,12 +7329,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn concurrent_default_layout_upgrades_publish_one_complete_narrow_ignore() {
+    fn assert_concurrent_upgrade_publishes_complete_legacy_ignore(
+        initial_gitignore: Option<&[u8]>,
+        failure_context: &'static str,
+    ) {
         let temp = tempfile::tempdir().unwrap();
         let project_dir = temp.path().join(crate::gitblob::PROJECT_DIR_NAME);
         std::fs::create_dir(&project_dir).unwrap();
-        std::fs::write(project_dir.join(".gitignore"), GENERATED_CACHE_GITIGNORE).unwrap();
+        if let Some(content) = initial_gitignore {
+            std::fs::write(project_dir.join(".gitignore"), content).unwrap();
+        }
         create_legacy_cache(&project_dir.join(LEGACY_CACHE_DB_FILE_NAME));
         let db_path = Arc::new(
             project_dir
@@ -5638,7 +7362,7 @@ mod tests {
             handle
                 .join()
                 .expect("upgrade thread")
-                .expect("concurrent upgrade");
+                .expect(failure_context);
         }
 
         assert_eq!(
@@ -5646,58 +7370,21 @@ mod tests {
             GENERATED_LEGACY_PROJECT_GITIGNORE
         );
         assert!(project_dir.join(LEGACY_CACHE_DB_FILE_NAME).exists());
+    }
+
+    #[test]
+    fn concurrent_default_layout_upgrades_publish_one_complete_narrow_ignore() {
+        assert_concurrent_upgrade_publishes_complete_legacy_ignore(
+            Some(GENERATED_CACHE_GITIGNORE),
+            "concurrent upgrade",
+        );
     }
 
     #[test]
     fn concurrent_upgrades_publish_a_complete_ignore_when_it_was_missing() {
-        let temp = tempfile::tempdir().unwrap();
-        let project_dir = temp.path().join(crate::gitblob::PROJECT_DIR_NAME);
-        std::fs::create_dir(&project_dir).unwrap();
-        create_legacy_cache(&project_dir.join(LEGACY_CACHE_DB_FILE_NAME));
-        let db_path = Arc::new(
-            project_dir
-                .join(crate::gitblob::CACHE_SUBDIR_NAME)
-                .join(cache_db_file_name()),
-        );
-        let barrier = Arc::new(std::sync::Barrier::new(5));
-
-        let handles = (0..4)
-            .map(|_| {
-                let db_path = Arc::clone(&db_path);
-                let barrier = Arc::clone(&barrier);
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    open_unified_connection(db_path.as_ref())
-                })
-            })
-            .collect::<Vec<_>>();
-        barrier.wait();
-        for handle in handles {
-            handle
-                .join()
-                .expect("upgrade thread")
-                .expect("concurrent missing-ignore upgrade");
-        }
-
-        assert_eq!(
-            std::fs::read(project_dir.join(".gitignore")).unwrap(),
-            GENERATED_LEGACY_PROJECT_GITIGNORE
-        );
-        assert!(project_dir.join(LEGACY_CACHE_DB_FILE_NAME).exists());
-    }
-
-    #[test]
-    fn explicit_cache_override_is_not_treated_as_project_layout() {
-        let db_path = Path::new("workspace")
-            .join(crate::gitblob::PROJECT_DIR_NAME)
-            .join(crate::gitblob::CACHE_SUBDIR_NAME)
-            .join(cache_db_file_name());
-        let db_path = db_path.as_path();
-
-        assert!(default_project_dir_for_cache_with_override(db_path, None).is_some());
-        assert!(
-            default_project_dir_for_cache_with_override(db_path, Some(db_path)).is_none(),
-            "BIFROST_CACHE_DIR keeps its explicit-directory semantics even when it names the conventional path"
+        assert_concurrent_upgrade_publishes_complete_legacy_ignore(
+            None,
+            "concurrent missing-ignore upgrade",
         );
     }
 
@@ -5765,6 +7452,9 @@ mod tests {
     /// rewrite it (which would churn its mtime inside a watched tree), and a
     /// user's own edit to it must survive.
     #[test]
+    #[hardwon(
+        "#1197: generated cache files were not self-ignored and reopening could overwrite user edits"
+    )]
     fn cache_directory_self_ignore_is_written_once_and_preserved() {
         let temp = tempfile::tempdir().unwrap();
         let cache_dir = temp
@@ -5837,6 +7527,7 @@ mod tests {
     /// `BIFROST_CACHE_DIR` escape hatch, and every temp-dir test above) must not
     /// get a `.gitignore` dropped into it.
     #[test]
+    #[hardwon("#1197: cache ignore setup must not hide unrelated workspace directories")]
     fn non_cache_directories_do_not_get_a_self_ignore() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join(cache_db_file_name());
@@ -5862,5 +7553,37 @@ mod tests {
             oid.push('0');
         }
         oid
+    }
+
+    #[test]
+    fn reopening_current_schema_preserves_existing_rows() {
+        let mut conn = open_in_memory_cache();
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang, generation)
+             VALUES('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'rust', 0)",
+            [],
+        )
+        .unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+    #[test]
+    fn shared_cache_writer_wait_budget_covers_large_repo_reconcile() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = open_unified_connection(&temp.path().join(cache_db_file_name())).unwrap();
+        let busy_timeout_ms: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+
+        assert!(
+            busy_timeout_ms >= 60_000,
+            "shared-cache writers need a substantial serialization budget, got {busy_timeout_ms}ms"
+        );
     }
 }

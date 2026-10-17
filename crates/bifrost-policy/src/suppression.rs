@@ -13,14 +13,18 @@ use brokk_bifrost_analysis::analyzer::semantic::{
     WorkspaceRelativePath, WorkspaceRelativePathError,
 };
 use brokk_bifrost_analysis::workspace_document::{
-    WorkspaceDocumentError, WorkspaceRoot, read_workspace_document,
+    WorkspaceDocumentError, WorkspaceRoot, read_optional_workspace_document,
 };
 
+use super::builtin::BuiltInPolicySelectionRecord;
 use super::classification::{TextValidationError, validate_required_text};
 use super::definition::{PolicyId, PolicyIdentifierError, Sha256ValueError, parse_lower_sha256};
 use super::finding_identity::{FindingIdentityStability, PolicyFindingId};
 use super::identity::PolicySemanticHash;
-use super::retained::{RetainedSize, retained_extra};
+use super::retained::{
+    RetainedSize, retained_extra, retained_size_with_extra, retained_size_with_extras,
+    retained_size_with_field_extra,
+};
 use super::scope::{PolicyScopeDocumentState, PolicyScopeOptions};
 
 /// The projected, checked-in decision record. Its records must name only
@@ -59,6 +63,8 @@ const MAX_JSON_ERROR_BYTES: usize = 512;
 /// One explicit UTC calendar date supplied by a policy-evaluation host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PolicyEvaluationDate(NaiveDate);
+
+impl RetainedSize for PolicyEvaluationDate {}
 
 impl PolicyEvaluationDate {
     pub fn from_ymd(year: i32, month: u32, day: u32) -> Result<Self, PolicyDateError> {
@@ -121,7 +127,7 @@ impl Serialize for PolicyEvaluationDate {
     where
         S: Serializer,
     {
-        serializer.collect_str(self)
+        crate::serialize_display_value(self, serializer)
     }
 }
 
@@ -130,8 +136,7 @@ impl<'de> Deserialize<'de> for PolicyEvaluationDate {
     where
         D: Deserializer<'de>,
     {
-        let value = String::deserialize(deserializer)?;
-        value.parse().map_err(serde::de::Error::custom)
+        super::serde_utils::deserialize_from_string(deserializer)
     }
 }
 
@@ -158,6 +163,8 @@ impl std::error::Error for PolicyDateError {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AcceptedPolicyHash([u8; 32]);
 
+impl RetainedSize for AcceptedPolicyHash {}
+
 impl AcceptedPolicyHash {
     pub const fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
@@ -170,10 +177,7 @@ impl AcceptedPolicyHash {
 
 impl fmt::Display for AcceptedPolicyHash {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for byte in self.0 {
-            write!(formatter, "{byte:02x}")?;
-        }
-        Ok(())
+        brokk_bifrost_analysis::analyzer::canonical_hash::write_lower_hex(&self.0, formatter)
     }
 }
 
@@ -190,7 +194,7 @@ impl Serialize for AcceptedPolicyHash {
     where
         S: Serializer,
     {
-        serializer.collect_str(self)
+        crate::serialize_display_value(self, serializer)
     }
 }
 
@@ -387,7 +391,7 @@ impl PolicySuppressionSource {
     fn from_workspace_path(
         path: WorkspaceRelativePath,
     ) -> Result<Self, PolicySuppressionSourceError> {
-        if path.as_str().len() > MAX_POLICY_SUPPRESSION_PATH_BYTES {
+        if crate::is_over_byte_limit(path.as_str(), MAX_POLICY_SUPPRESSION_PATH_BYTES) {
             return Err(PolicySuppressionSourceError::TooLong {
                 max_bytes: MAX_POLICY_SUPPRESSION_PATH_BYTES,
             });
@@ -460,14 +464,7 @@ impl fmt::Display for PolicySuppressionSourceError {
     }
 }
 
-impl std::error::Error for PolicySuppressionSourceError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Path(error) => Some(error),
-            Self::TooLong { .. } => None,
-        }
-    }
-}
+crate::impl_policy_source_error!(PolicySuppressionSourceError);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -504,7 +501,7 @@ impl PolicySuppressionSourceState {
 
 impl RetainedSize for PolicySuppressionSourceState {
     fn retained_size(&self) -> usize {
-        std::mem::size_of::<Self>().saturating_add(self.path.len())
+        retained_size_with_field_extra(self, &self.path)
     }
 }
 
@@ -515,6 +512,10 @@ pub struct PolicyReportEvaluationContext {
     suppression_sources: Box<[PolicySuppressionSourceState]>,
     scope_path: Box<str>,
     scope_document_state: PolicyScopeDocumentState,
+    // Absent when the batch ran no built-in policies, so a workspace-file-only
+    // report keeps its exact shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    builtin_selection: Option<BuiltInPolicySelectionRecord>,
 }
 
 impl PolicyReportEvaluationContext {
@@ -529,7 +530,16 @@ impl PolicyReportEvaluationContext {
             suppression_sources: suppression_sources.into_boxed_slice(),
             scope_path: scope.source().relative_path().into(),
             scope_document_state,
+            builtin_selection: None,
         }
+    }
+
+    pub(crate) fn with_builtin_selection(
+        mut self,
+        builtin_selection: Option<BuiltInPolicySelectionRecord>,
+    ) -> Self {
+        self.builtin_selection = builtin_selection;
+        self
     }
 
     /// Every configured suppression source and what it contributed. A source
@@ -837,15 +847,16 @@ fn load_one_policy_suppression_document(
     root: &WorkspaceRoot,
     relative_path: &str,
 ) -> Result<Option<PolicySuppressionDocument>, PolicySuppressionLoadError> {
-    let document = match read_workspace_document(
+    let document = match read_optional_workspace_document(
         root,
         Path::new(relative_path),
         &["json"],
         MAX_POLICY_SUPPRESSION_DOCUMENT_BYTES,
-    ) {
-        Ok(document) => document,
-        Err(error) if workspace_error_is_not_found(&error) => return Ok(None),
-        Err(error) => return Err(PolicySuppressionLoadError::Workspace(error)),
+    )
+    .map_err(PolicySuppressionLoadError::Workspace)?
+    {
+        Some(document) => document,
+        None => return Ok(None),
     };
     parse_policy_suppression_document(document.source())
         .map(Some)
@@ -1046,7 +1057,7 @@ pub(crate) fn load_policy_suppressions_from_root(
 pub fn parse_policy_suppression_document(
     source: &str,
 ) -> Result<PolicySuppressionDocument, PolicySuppressionDocumentError> {
-    if u64::try_from(source.len()).unwrap_or(u64::MAX) > MAX_POLICY_SUPPRESSION_DOCUMENT_BYTES {
+    if crate::is_over_u64_byte_limit(source, MAX_POLICY_SUPPRESSION_DOCUMENT_BYTES) {
         return Err(PolicySuppressionDocumentError::Validation(
             PolicySuppressionValidationError::DocumentTooLarge {
                 max_bytes: MAX_POLICY_SUPPRESSION_DOCUMENT_BYTES,
@@ -1264,16 +1275,11 @@ fn compare_suppression_key(
     left: &PolicySuppressionRecord,
     right: &PolicySuppressionRecord,
 ) -> Ordering {
-    left.policy_id
-        .cmp(&right.policy_id)
-        .then_with(|| left.finding_id.cmp(&right.finding_id))
-}
-
-pub(crate) fn workspace_error_is_not_found(error: &WorkspaceDocumentError) -> bool {
-    matches!(
-        error,
-        WorkspaceDocumentError::OpenFile { source, .. }
-            if source.kind() == std::io::ErrorKind::NotFound
+    super::report::compare_suppression_identity(
+        &left.policy_id,
+        left.finding_id,
+        &right.policy_id,
+        right.finding_id,
     )
 }
 
@@ -1288,18 +1294,6 @@ pub(crate) fn bounded_json_error_message(message: &str) -> Box<str> {
         end -= 1;
     }
     format!("{}...", &message[..end]).into_boxed_str()
-}
-
-impl RetainedSize for PolicyEvaluationDate {
-    fn retained_size(&self) -> usize {
-        std::mem::size_of::<Self>()
-    }
-}
-
-impl RetainedSize for AcceptedPolicyHash {
-    fn retained_size(&self) -> usize {
-        std::mem::size_of::<Self>()
-    }
 }
 
 impl RetainedSize for PolicySuppressionRecord {
@@ -1317,26 +1311,28 @@ impl RetainedSize for PolicySuppressionRecord {
 
 impl RetainedSize for PolicySuppressionDocument {
     fn retained_size(&self) -> usize {
-        self.suppressions
-            .iter()
-            .fold(std::mem::size_of::<Self>(), |bytes, suppression| {
-                bytes.saturating_add(suppression.retained_size())
-            })
+        retained_size_with_extras(
+            self,
+            self.suppressions.iter().map(RetainedSize::retained_size),
+        )
     }
 }
 
 impl RetainedSize for PolicySuppressionSource {
     fn retained_size(&self) -> usize {
-        std::mem::size_of::<Self>().saturating_add(match self {
-            Self::Conventional => 0,
-            Self::Explicit(path) => retained_extra(path),
-        })
+        retained_size_with_extra(
+            self,
+            match self {
+                Self::Conventional => 0,
+                Self::Explicit(path) => retained_extra(path),
+            },
+        )
     }
 }
 
 impl RetainedSize for PolicySuppressionOptions {
     fn retained_size(&self) -> usize {
-        std::mem::size_of::<Self>().saturating_add(retained_extra(&self.source))
+        retained_size_with_field_extra(self, &self.source)
     }
 }
 
@@ -1347,14 +1343,19 @@ impl RetainedSize for PolicyReportEvaluationContext {
                 bytes.saturating_add(retained_extra(source))
             }))
             .saturating_add(self.scope_path.len())
+            .saturating_add(retained_extra(&self.builtin_selection))
     }
 }
 
 impl RetainedSize for PolicySuppressionDecision {
     fn retained_size(&self) -> usize {
-        std::mem::size_of::<Self>()
-            .saturating_add(retained_extra(&self.reason))
-            .saturating_add(retained_extra(&self.accepted_by))
+        retained_size_with_extras(
+            self,
+            [
+                retained_extra(&self.reason),
+                retained_extra(&self.accepted_by),
+            ],
+        )
     }
 }
 
@@ -1417,9 +1418,12 @@ impl fmt::Display for PolicySuppressionDocumentError {
                 message,
                 line,
                 column,
-            } => write!(
+            } => crate::fmt_policy_json_decode_error(
                 formatter,
-                "invalid suppression JSON at line {line}, column {column}: {message}"
+                "suppression",
+                message,
+                *line,
+                *column,
             ),
             Self::Validation(error) => error.fmt(formatter),
         }
@@ -1760,32 +1764,6 @@ mod tests {
             "test.z-policy"
         );
         assert!(encoded.ends_with('\n'));
-    }
-
-    #[test]
-    fn authoring_rejects_duplicate_and_conflicting_keys() {
-        let input = authoring_input("test.policy", b'a', Some("reviewed"));
-        let existing =
-            prepare_policy_suppression_document(None, input.clone()).expect("initial authoring");
-
-        let duplicate = prepare_policy_suppression_document(Some(&existing), input.clone())
-            .expect_err("duplicate key");
-        assert!(matches!(
-            duplicate,
-            PolicySuppressionDocumentError::Validation(
-                PolicySuppressionValidationError::DuplicateSuppression { .. }
-            )
-        ));
-
-        let conflict_input = authoring_input("test.policy", b'a', Some("different review"));
-        let conflict = prepare_policy_suppression_document(Some(&existing), conflict_input)
-            .expect_err("conflicting key");
-        assert!(matches!(
-            conflict,
-            PolicySuppressionDocumentError::Validation(
-                PolicySuppressionValidationError::ConflictingSuppression { .. }
-            )
-        ));
     }
 
     #[test]

@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { SUPPORTED_TARGETS } from "../../plugins/bifrost-agent/bin/bifrost-launcher.mjs";
 
-import { required, toCamelCase } from "./cli-argument-helpers.mjs";
+import { parseCamelCaseArgs, required } from "./cli-argument-helpers.mjs";
 import { escapeRegExp, sameMinorSeries } from "./release-version.mjs";
 
 const supportedTargetSet = new Set(SUPPORTED_TARGETS);
@@ -57,14 +57,8 @@ function readArchiveHashes(distDir, version) {
 }
 
 function parseArgs(args) {
-  const options = {};
-  for (let index = 0; index < args.length; index += 2) {
-    const key = args[index];
-    const value = args[index + 1];
-    if (!key?.startsWith("--") || value === undefined) {
-      throw new Error("Usage: prepare-launcher-release-metadata.mjs --version <version> --dist <dist-dir> --plugin-release <bifrost-release.json>");
-    }
-    options[toCamelCase(key.slice(2))] = value;
-  }
-  return options;
+  return parseCamelCaseArgs(
+    args,
+    "Usage: prepare-launcher-release-metadata.mjs --version <version> --dist <dist-dir> --plugin-release <bifrost-release.json>",
+  );
 }

@@ -1,4 +1,6 @@
 use crate::analyzer::Range;
+use crate::analyzer::model::SemanticDiagnosticReport;
+use crate::analyzer::structural::resolution::BoundaryStatus;
 use crate::hash::HashSet;
 use crate::text_utils::find_line_index_for_offset;
 use tree_sitter::Node;
@@ -34,17 +36,40 @@ impl ScopeStack {
 }
 
 pub fn node_range(node: Node<'_>, line_starts: &[usize]) -> Range {
+    range_for_byte_span(line_starts, node.start_byte(), node.end_byte())
+}
+
+pub fn push_resolved_node(
+    report: &mut SemanticDiagnosticReport,
+    node: Node<'_>,
+    line_starts: &[usize],
+    boundary: BoundaryStatus,
+) {
+    report.push_resolved(node_range(node, line_starts), boundary);
+}
+
+/// Build a 1-based range from a half-open byte span, mapping
+/// `end_byte.saturating_sub(1)` for the end line.
+pub fn range_for_byte_span(line_starts: &[usize], start_byte: usize, end_byte: usize) -> Range {
     Range {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_line: find_line_index_for_offset(line_starts, node.start_byte()) + 1,
-        end_line: find_line_index_for_offset(line_starts, node.end_byte().saturating_sub(1)) + 1,
+        start_byte,
+        end_byte,
+        start_line: find_line_index_for_offset(line_starts, start_byte) + 1,
+        end_line: find_line_index_for_offset(line_starts, end_byte.saturating_sub(1)) + 1,
     }
 }
 
-pub fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    crate::analyzer::common::node_source_text(node, source)
+/// Build a 1-based range by mapping both byte offsets directly to their lines.
+pub fn range_for_byte_offsets(line_starts: &[usize], start_byte: usize, end_byte: usize) -> Range {
+    Range {
+        start_byte,
+        end_byte,
+        start_line: find_line_index_for_offset(line_starts, start_byte) + 1,
+        end_line: find_line_index_for_offset(line_starts, end_byte) + 1,
+    }
 }
+
+pub use crate::analyzer::common::node_source_text as node_text;
 
 pub fn same_node(left: Node<'_>, right: Node<'_>) -> bool {
     left.start_byte() == right.start_byte() && left.end_byte() == right.end_byte()

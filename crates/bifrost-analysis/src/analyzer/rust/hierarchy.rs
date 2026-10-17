@@ -6,10 +6,10 @@
 //! [`brokk_bifrost_rust::hierarchy`] and [`brokk_bifrost_rust::graph_support`].
 
 use crate::analyzer::common::language_for_file;
-use crate::analyzer::structural::resolution::{
-    MemberFamilyCapability, MemberFamilyOutcome, MemberFamilyReason, MethodFamilyRelation,
-};
-use crate::analyzer::usages::{MemberFamilyAnswer, MemberFamilyEdge, MemberFamilyProvider};
+use crate::analyzer::structural::resolution::{MemberFamilyCapability, MemberFamilyReason};
+#[cfg(test)]
+use crate::analyzer::structural::resolution::{MemberFamilyOutcome, MethodFamilyRelation};
+use crate::analyzer::usages::{MemberFamilyAnswer, MemberFamilyProvider};
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::analyzer::{CodeUnit, CodeUnitIndex, Language, TypeHierarchyProvider};
 use crate::cancellation::CancellationToken;
@@ -21,8 +21,7 @@ use brokk_bifrost_rust::graph_support::{
     is_rust_type_member_declaration,
 };
 use brokk_bifrost_rust::hierarchy::{
-    RustMemberFamily, RustMemberFamilyEdge, rust_direct_ancestors, rust_direct_descendants,
-    rust_member_family_of,
+    RustMemberFamily, rust_direct_ancestors, rust_direct_descendants, rust_member_family_of,
 };
 
 use super::RustAnalyzer;
@@ -277,37 +276,14 @@ fn rust_member_family(
     // Rust has no overloading, so the trait method a member answers is singled
     // out by its name inside the resolved trait-impl edge, with the declared
     // parameter count as the structural confirmation.
-    let edge = |edge: RustMemberFamilyEdge, relation: MethodFamilyRelation| MemberFamilyEdge {
-        target: edge.member,
-        owner: edge.owner,
-        relation,
-        depth: 1,
-        arity_unique: true,
-    };
-    let roots = if implements.is_empty() {
-        vec![member.clone()]
-    } else {
-        let mut roots: Vec<CodeUnit> = implements.iter().map(|edge| edge.member.clone()).collect();
-        roots.sort();
-        roots.dedup();
-        roots
-    };
-    let edges = implements
-        .into_iter()
-        .map(|value| edge(value, MethodFamilyRelation::Implements))
-        .chain(
-            implemented_by
-                .into_iter()
-                .map(|value| edge(value, MethodFamilyRelation::ImplementedBy)),
-        )
-        .collect();
-    MemberFamilyAnswer {
+    crate::analyzer::usages::member_family::proven_member_family_answer(
         capability,
-        outcome: MemberFamilyOutcome::Proven,
-        reason: None,
-        edges,
-        roots,
-    }
+        member,
+        implements.into_iter().map(|edge| (edge.member, edge.owner)),
+        implemented_by
+            .into_iter()
+            .map(|edge| (edge.member, edge.owner)),
+    )
 }
 
 impl RustAnalyzer {
@@ -337,11 +313,25 @@ impl RustAnalyzer {
     }
 }
 #[cfg(test)]
+fn hierarchy_has_trait_implementation_relation(
+    hierarchy: &brokk_bifrost_rust::hierarchy::RustHierarchyIndex,
+    from: &str,
+    to: &str,
+) -> bool {
+    hierarchy.relations.iter().any(|relation| {
+        relation.from.fq_name() == from
+            && relation.to.fq_name() == to
+            && relation.kind
+                == crate::analyzer::type_relations::TypeRelationKind::TraitImplementation
+    })
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::type_relations::TypeRelationKind;
     use crate::analyzer::{CodeUnitIndex, IAnalyzer, Language};
     use crate::test_support::AnalyzerFixture;
+    use brokk_bifrost_test_macros::hardwon;
     use std::sync::Arc;
 
     pub(super) fn analyzer_with_files(files: &[(&str, &str)]) -> (AnalyzerFixture, RustAnalyzer) {
@@ -382,9 +372,27 @@ mod tests {
         rendered
     }
 
-    /// The one declaration of `fq_name` whose signature contains `needle`. A
-    /// Rust trait-impl member's signature carries its impl block, so this is
-    /// how a test names one of several same-named members of one type.
+    pub(super) fn definition(analyzer: &RustAnalyzer, fq_name: &str) -> CodeUnit {
+        analyzer
+            .get_definitions(fq_name)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("missing definition for {fq_name}"))
+    }
+
+    fn workspace_hierarchy(
+        analyzer: &RustAnalyzer,
+    ) -> brokk_bifrost_rust::hierarchy::RustHierarchyIndex {
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let files: Vec<_> = analyzer.get_analyzed_files().into_iter().collect();
+        brokk_bifrost_rust::hierarchy::RustHierarchyIndex::read_over(
+            analyzer,
+            scope.token(),
+            &files,
+        )
+        .expect("published fixture hierarchy")
+    }
+
     pub(super) fn member_in_impl(analyzer: &RustAnalyzer, fq_name: &str, needle: &str) -> CodeUnit {
         let mut matches = analyzer
             .get_definitions(fq_name)
@@ -400,14 +408,6 @@ mod tests {
         found
     }
 
-    pub(super) fn definition(analyzer: &RustAnalyzer, fq_name: &str) -> CodeUnit {
-        analyzer
-            .get_definitions(fq_name)
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| panic!("missing definition for {fq_name}"))
-    }
-
     fn canonical_type(analyzer: &RustAnalyzer, unit: CodeUnit) -> Option<CodeUnit> {
         let scope = AnalyzerQueryScope::new(analyzer);
         let result = brokk_bifrost_rust::hierarchy::canonical_rust_hierarchy_type(
@@ -421,171 +421,6 @@ mod tests {
             "canonical type query recorded a store error"
         );
         result
-    }
-
-    /// The whole workspace's hierarchy facts, for fixtures that assert about
-    /// the relation itself rather than about one question's answer.
-    ///
-    /// Production never reads the workspace this way any more: every question
-    /// is answered from the rows and a bounded file set. These fixtures are
-    /// small enough that reading every file is the clearest way to state what
-    /// they are checking.
-    fn workspace_hierarchy(
-        analyzer: &RustAnalyzer,
-    ) -> brokk_bifrost_rust::hierarchy::RustHierarchyIndex {
-        let scope = AnalyzerQueryScope::new(analyzer);
-        let files: Vec<_> = analyzer.get_analyzed_files().into_iter().collect();
-        brokk_bifrost_rust::hierarchy::RustHierarchyIndex::read_over(
-            analyzer,
-            scope.token(),
-            &files,
-        )
-        .expect("published fixture hierarchy")
-    }
-
-    fn has_trait_implementation_relation(analyzer: &RustAnalyzer, from: &str, to: &str) -> bool {
-        workspace_hierarchy(analyzer)
-            .relations
-            .iter()
-            .any(|relation| {
-                relation.from.fq_name() == from
-                    && relation.to.fq_name() == to
-                    && relation.kind == TypeRelationKind::TraitImplementation
-            })
-    }
-
-    #[test]
-    fn namespace_only_impl_owner_does_not_require_an_alias_declaration() {
-        let (_fixture, analyzer) = analyzer_with_files(&[(
-            "src/lib.rs",
-            "impl External { pub fn external_method(&self) {} }\n",
-        )]);
-        let file = analyzer.get_analyzed_files().into_iter().next().unwrap();
-        let member = analyzer
-            .declarations(&file)
-            .into_iter()
-            .find(|unit| unit.identifier() == "external_method")
-            .unwrap();
-        let owner = analyzer.parent_of(&member).unwrap();
-        assert!(!analyzer.declarations(&file).contains(&owner));
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        assert_eq!(
-            brokk_bifrost_rust::hierarchy::canonical_rust_hierarchy_type(
-                &analyzer,
-                scope.token(),
-                owner.clone()
-            ),
-            Ok(Some(owner)),
-        );
-        assert_eq!(
-            analyzer.rust_trait_member_implementations(&member),
-            Ok(None)
-        );
-        assert!(scope.store_error().is_none());
-    }
-
-    #[test]
-    fn canonical_implementer_names_project_structured_primary_targets() {
-        let (_fixture, analyzer) = analyzer_with_files(&[(
-            "src/lib.rs",
-            r#"
-trait Contract {}
-struct Item;
-struct Wrapper<T>(T);
-type Alias = Item;
-struct Foo;
-struct Bar;
-impl Contract for Item {}
-impl<'a> Contract for &'a Item {}
-impl Contract for Wrapper<u8> {}
-impl Contract for Alias {}
-impl Contract for (Foo, Bar) {}
-struct Negative;
-impl !Contract for Negative {}
-generate! { struct Generated; impl Contract for Generated {} }
-"#,
-        )]);
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        assert_eq!(
-            brokk_bifrost_rust::graph_support::trait_implementer_names(
-                &analyzer,
-                scope.token(),
-                &definition(&analyzer, "Contract"),
-                &|| true,
-            )
-            .unwrap(),
-            ["Item", "Wrapper", "Alias"]
-                .into_iter()
-                .map(str::to_owned)
-                .collect::<HashSet<_>>()
-        );
-        assert!(scope.store_error().is_none());
-    }
-
-    #[test]
-    fn canonical_file_import_binder_uses_root_even_when_first_item_is_a_module() {
-        let source = concat!(
-            "mod nested { use wrong::Thing as Chosen; }\n",
-            "use actual::Thing as Chosen;\n",
-            "fn local() { use local::Thing as Chosen; }\n",
-            "wrap! { use embedded::Thing as Chosen; }\n",
-            "use future::Item as Later;\n",
-        );
-        let (fixture, analyzer) = analyzer_with_files(&[("src/lib.rs", source)]);
-        let file = crate::analyzer::ProjectFile::new(fixture.project_root(), "src/lib.rs");
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        assert!(!analyzer.declarations(&file).is_empty());
-        std::fs::remove_file(file.abs_path()).unwrap();
-        let binder = brokk_bifrost_rust::graph_support::canonical_rust_file_import_binder(
-            &analyzer,
-            &file,
-            &|| true,
-        )
-        .unwrap();
-        let chosen = binder.bindings.get("Chosen").expect("root alias");
-        assert_eq!(chosen.module_specifier, "actual", "{binder:?}");
-        assert_eq!(chosen.imported_name.as_deref(), Some("Thing"), "{binder:?}");
-        assert!(binder.bindings.contains_key("Later"), "{binder:?}");
-        assert!(scope.store_error().is_none());
-    }
-
-    #[test]
-    fn canonical_file_import_binder_distinguishes_empty_cancelled_and_unavailable() {
-        let (fixture, analyzer) = analyzer_with_files(&[("src/lib.rs", "")]);
-        let file = crate::analyzer::ProjectFile::new(fixture.project_root(), "src/lib.rs");
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        assert!(matches!(
-            brokk_bifrost_rust::graph_support::canonical_rust_file_import_binder(
-                &analyzer,
-                &file,
-                &|| false
-            ),
-            Err(RustCargoRouteError::Cancelled)
-        ));
-        let binder = brokk_bifrost_rust::graph_support::canonical_rust_file_import_binder(
-            &analyzer,
-            &file,
-            &|| true,
-        )
-        .unwrap();
-        assert!(binder.bindings.is_empty(), "{binder:?}");
-        assert!(scope.store_error().is_none());
-        drop(scope);
-
-        // Use a fresh analyzer so a successful bounded fact cache cannot mask
-        // the deliberately missing publication witness.
-        let (fixture, analyzer) = analyzer_with_files(&[("src/lib.rs", "use dep::Thing;")]);
-        let file = crate::analyzer::ProjectFile::new(fixture.project_root(), "src/lib.rs");
-        analyzer.analyzer_store().drop_rust_modules_table_for_test();
-        let _scope = AnalyzerQueryScope::new(&analyzer);
-        assert!(
-            brokk_bifrost_rust::graph_support::canonical_rust_file_import_binder(
-                &analyzer,
-                &file,
-                &|| true
-            )
-            .is_err()
-        );
     }
 
     #[test]
@@ -657,63 +492,6 @@ generate! { struct Generated; impl Contract for Generated {} }
     }
 
     #[test]
-    fn canonical_implementer_names_use_scoped_trait_identity() {
-        let (_fixture, analyzer) = analyzer_with_files(&[
-            ("src/source.rs", "pub trait Contract<T> {}"),
-            (
-                "src/lib.rs",
-                r#"
-mod source;
-mod local {
-    use crate::source::Contract as Imported;
-    pub struct Item;
-    impl Imported<u8> for Item {}
-}
-mod other {
-    pub trait Contract<T> {}
-    pub struct Unrelated;
-    impl Contract<u8> for Unrelated {}
-}
-"#,
-            ),
-        ]);
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        assert_eq!(
-            brokk_bifrost_rust::graph_support::trait_implementer_names(
-                &analyzer,
-                scope.token(),
-                &definition(&analyzer, "source.Contract"),
-                &|| true,
-            )
-            .unwrap(),
-            ["Item".to_owned()].into_iter().collect::<HashSet<_>>()
-        );
-    }
-
-    #[test]
-    fn canonical_implementer_names_read_frozen_facts_without_source() {
-        let (_fixture, analyzer) = analyzer_with_files(&[(
-            "src/lib.rs",
-            "trait Contract {} struct Item; impl Contract for Item {}",
-        )]);
-        let owner = definition(&analyzer, "Contract");
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        assert!(analyzer.declarations(owner.source()).contains(&owner));
-        std::fs::remove_file(owner.source().abs_path()).unwrap();
-        assert_eq!(
-            brokk_bifrost_rust::graph_support::trait_implementer_names(
-                &analyzer,
-                scope.token(),
-                &owner,
-                &|| true
-            )
-            .unwrap(),
-            ["Item".to_owned()].into_iter().collect::<HashSet<_>>()
-        );
-        assert!(scope.store_error().is_none());
-    }
-
-    #[test]
     fn canonical_implementer_names_do_not_cache_cancellation_as_empty() {
         let (_fixture, analyzer) = analyzer_with_files(&[(
             "src/lib.rs",
@@ -740,281 +518,6 @@ mod other {
             .unwrap(),
             ["Item".to_owned()].into_iter().collect::<HashSet<_>>()
         );
-    }
-
-    #[test]
-    fn canonical_implementer_names_propagate_unavailable_publication() {
-        let (_fixture, analyzer) = analyzer_with_files(&[(
-            "src/lib.rs",
-            "trait Contract {} struct Item; impl Contract for Item {}",
-        )]);
-        let owner = definition(&analyzer, "Contract");
-        analyzer.analyzer_store().drop_rust_modules_table_for_test();
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        assert!(
-            brokk_bifrost_rust::graph_support::trait_implementer_names(
-                &analyzer,
-                scope.token(),
-                &owner,
-                &|| true
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn canonical_trait_member_enumeration_keeps_methods_and_associated_types() {
-        let (_fixture, analyzer) = analyzer_with_files(&[
-            (
-                "src/contracts.rs",
-                "pub trait Contract { fn run(&self); type Output; const LIMIT: usize; }",
-            ),
-            (
-                "src/lib.rs",
-                "mod contracts; use contracts::Contract as Imported; struct Item;\n\
-             impl Imported for Item { fn run(&self) {} type Output = Item; const LIMIT: usize = 1; }",
-            ),
-        ]);
-        for (member, implementation) in [
-            ("contracts.Contract.run", "Item.run"),
-            ("contracts.Contract.Output", "Item.Output"),
-        ] {
-            assert_eq!(
-                analyzer
-                    .rust_trait_member_implementations(&definition(&analyzer, member))
-                    .unwrap(),
-                Some(vec![definition(&analyzer, implementation)]),
-                "{member}"
-            );
-        }
-        assert_eq!(
-            analyzer
-                .rust_trait_member_implementations(&definition(
-                    &analyzer,
-                    "contracts.Contract.LIMIT"
-                ))
-                .unwrap(),
-            None
-        );
-    }
-
-    #[test]
-    fn canonical_trait_member_enumeration_uses_scoped_structured_heads() {
-        let (_fixture, analyzer) = analyzer_with_files(&[(
-            "src/lib.rs",
-            r#"
-mod left {
-    pub trait Contract<T> { fn run(&self); }
-    pub struct Item;
-    impl Contract<u8> for Item { fn run(&self) {} }
-}
-mod right {
-    pub trait Contract<T> { fn run(&self); }
-    pub struct Item;
-    impl Contract<u8> for Item { fn run(&self) {} }
-}
-"#,
-        )]);
-        for module in ["left", "right"] {
-            assert_eq!(
-                analyzer
-                    .rust_trait_member_implementations(&definition(
-                        &analyzer,
-                        &format!("{module}.Contract.run")
-                    ))
-                    .unwrap(),
-                Some(vec![definition(&analyzer, &format!("{module}.Item.run"))])
-            );
-        }
-    }
-
-    #[test]
-    fn canonical_trait_member_enumeration_deduplicates_primary_source_alternatives() {
-        let (_fixture, analyzer) = analyzer_with_files(&[(
-            "src/lib.rs",
-            r#"
-trait Contract { fn run(&self); }
-struct Item;
-#[cfg(first)] impl Contract for Item { fn run(&self) {} }
-#[cfg(second)] impl Contract for Item { fn run(&self) {} }
-generate! { struct Generated; impl Contract for Generated { fn run(&self) {} } }
-struct Negative;
-impl !Contract for Negative { fn run(&self) {} }
-"#,
-        )]);
-        assert_eq!(
-            analyzer
-                .rust_trait_member_implementations(&definition(&analyzer, "Contract.run"))
-                .unwrap(),
-            Some(vec![definition(&analyzer, "Item.run")])
-        );
-    }
-
-    #[test]
-    fn canonical_trait_member_enumeration_preserves_known_malformed_body_members() {
-        let (_fixture, analyzer) = analyzer_with_files(&[(
-            "src/lib.rs",
-            r#"
-trait Contract { fn known(&self); type Output; }
-struct Item;
-impl Contract for Item {
-    fn known(&self) {}
-    type Output = Item;
-    fn malformed(&self, value: );
-}
-"#,
-        )]);
-        for (member, implementation) in [
-            ("Contract.known", "Item.known"),
-            ("Contract.Output", "Item.Output"),
-        ] {
-            assert_eq!(
-                analyzer
-                    .rust_trait_member_implementations(&definition(&analyzer, member))
-                    .unwrap(),
-                Some(vec![definition(&analyzer, implementation)])
-            );
-        }
-    }
-
-    #[test]
-    fn canonical_trait_member_enumeration_does_not_reopen_frozen_source() {
-        let (_fixture, analyzer) = analyzer_with_files(&[(
-            "src/lib.rs",
-            "trait Contract { fn run(&self); } struct Item; impl Contract for Item { fn run(&self) {} }",
-        )]);
-        let member = definition(&analyzer, "Contract.run");
-        let implementation = definition(&analyzer, "Item.run");
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        assert!(analyzer.declarations(member.source()).contains(&member));
-        std::fs::remove_file(member.source().abs_path()).unwrap();
-        assert_eq!(
-            brokk_bifrost_rust::graph_support::rust_trait_member_implementations(
-                &analyzer,
-                scope.token(),
-                &member
-            )
-            .unwrap(),
-            Some(vec![implementation])
-        );
-        assert!(scope.store_error().is_none());
-    }
-
-    #[test]
-    fn canonical_trait_member_enumeration_propagates_unavailable_publication() {
-        let (_fixture, analyzer) = analyzer_with_files(&[(
-            "src/lib.rs",
-            "trait Contract { fn run(&self); } struct Item; impl Contract for Item { fn run(&self) {} }",
-        )]);
-        let member = definition(&analyzer, "Contract.run");
-        analyzer.analyzer_store().drop_rust_modules_table_for_test();
-        assert!(analyzer.rust_trait_member_implementations(&member).is_err());
-    }
-
-    #[test]
-    fn canonical_impl_member_owners_include_methods_and_associated_fields() {
-        let (_fixture, analyzer) = analyzer_with_files(&[(
-            "src/lib.rs",
-            r#"
-trait Contract { fn run(&self); const LIMIT: usize; type Output; }
-struct Item;
-impl Contract for Item {
-    fn run(&self) {}
-    const LIMIT: usize = 1;
-    type Output = Item;
-}
-impl Item { fn inherent(&self) {} }
-"#,
-        )]);
-        let expected = definition(&analyzer, "Contract");
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        for name in ["Item.run", "Item.LIMIT", "Item.Output"] {
-            assert_eq!(
-                brokk_bifrost_rust::hierarchy::rust_trait_for_impl_member(
-                    &analyzer,
-                    scope.token(),
-                    &definition(&analyzer, name)
-                )
-                .unwrap(),
-                Some(expected.clone()),
-                "{name}"
-            );
-        }
-        assert_eq!(
-            brokk_bifrost_rust::hierarchy::rust_trait_for_impl_member(
-                &analyzer,
-                scope.token(),
-                &definition(&analyzer, "Item.inherent")
-            )
-            .unwrap(),
-            None
-        );
-        assert!(scope.store_error().is_none());
-    }
-
-    #[test]
-    fn canonical_impl_member_owners_include_nested_macro_source() {
-        let (_fixture, analyzer) = analyzer_with_files(&[(
-            "src/lib.rs",
-            r#"
-trait Contract { fn run(&self); const LIMIT: usize; }
-outer! { inner! {
-    struct Item;
-    impl Contract for Item {
-        fn run(&self) {}
-        const LIMIT: usize = 1;
-    }
-} }
-"#,
-        )]);
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        for name in ["Item.run", "Item.LIMIT"] {
-            assert_eq!(
-                brokk_bifrost_rust::hierarchy::rust_trait_for_impl_member(
-                    &analyzer,
-                    scope.token(),
-                    &definition(&analyzer, name)
-                )
-                .unwrap(),
-                Some(definition(&analyzer, "Contract")),
-                "{name}"
-            );
-        }
-        assert!(scope.store_error().is_none());
-    }
-
-    #[test]
-    fn canonical_impl_member_owners_keep_primary_imports_for_embedded_trees() {
-        let (_fixture, analyzer) = analyzer_with_files(&[
-            ("src/source.rs", "pub trait Contract { fn run(&self); }"),
-            ("src/other.rs", "pub trait Contract { fn run(&self); }"),
-            (
-                "src/lib.rs",
-                r#"
-mod source;
-mod other;
-mod surrounding {
-    use crate::source::Contract;
-    outer! { inner! {
-        use crate::other::Contract;
-        pub struct Item;
-        impl Contract for Item { fn run(&self) {} }
-    } }
-}
-"#,
-            ),
-        ]);
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        assert_eq!(
-            brokk_bifrost_rust::hierarchy::rust_trait_for_impl_member(
-                &analyzer,
-                scope.token(),
-                &definition(&analyzer, "surrounding.Item.run")
-            )
-            .unwrap(),
-            Some(definition(&analyzer, "source.Contract"))
-        );
-        assert!(scope.store_error().is_none());
     }
 
     #[test]
@@ -1060,251 +563,6 @@ mod local {{
     }
 
     #[test]
-    fn canonical_impl_member_owner_does_not_reopen_source_in_frozen_query() {
-        let (_fixture, analyzer) = analyzer_with_files(&[(
-            "src/lib.rs",
-            "trait Contract { fn run(&self); } struct Item; impl Contract for Item { fn run(&self) {} }",
-        )]);
-        let member = definition(&analyzer, "Item.run");
-        let expected = definition(&analyzer, "Contract");
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        assert!(analyzer.declarations(member.source()).contains(&member));
-        std::fs::remove_file(member.source().abs_path()).unwrap();
-        assert_eq!(
-            brokk_bifrost_rust::hierarchy::rust_trait_for_impl_member(
-                &analyzer,
-                scope.token(),
-                &member
-            )
-            .unwrap(),
-            Some(expected)
-        );
-        assert!(scope.store_error().is_none());
-    }
-
-    #[test]
-    fn canonical_aliases_resolve_one_hop_to_structs_and_enums_only() {
-        let (_fixture, analyzer) = analyzer_with_files(&[(
-            "src/lib.rs",
-            r#"
-pub struct Item;
-pub enum Choice { A }
-pub type ItemAlias = Item;
-pub type ChoiceAlias = Choice;
-pub type AliasToAlias = ItemAlias;
-pub struct Generic<T>(T);
-pub type GenericAlias = Generic<u8>;
-"#,
-        )]);
-
-        assert_eq!(
-            canonical_type(&analyzer, definition(&analyzer, "ItemAlias")),
-            Some(definition(&analyzer, "Item"))
-        );
-        assert_eq!(
-            canonical_type(&analyzer, definition(&analyzer, "ChoiceAlias")),
-            Some(definition(&analyzer, "Choice"))
-        );
-        assert_eq!(
-            canonical_type(&analyzer, definition(&analyzer, "GenericAlias")),
-            Some(definition(&analyzer, "Generic"))
-        );
-        assert_eq!(
-            canonical_type(&analyzer, definition(&analyzer, "AliasToAlias")),
-            None
-        );
-    }
-
-    #[test]
-    fn canonical_alias_resolution_does_not_reopen_source_in_frozen_query() {
-        let (_fixture, analyzer) =
-            analyzer_with_files(&[("src/lib.rs", "pub struct Item; pub type Alias = Item;")]);
-        let alias = definition(&analyzer, "Alias");
-        let target = definition(&analyzer, "Item");
-        // Freeze the ordinary request's live declaration identity first.
-        // Removing a file before opening a request would change that request's
-        // inventory, rather than isolate the alias reader's source dependency.
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        assert!(analyzer.declarations(alias.source()).contains(&alias));
-        std::fs::remove_file(alias.source().abs_path()).unwrap();
-        assert_eq!(
-            brokk_bifrost_rust::hierarchy::canonical_rust_hierarchy_type(
-                &analyzer,
-                scope.token(),
-                alias
-            )
-            .unwrap(),
-            Some(target)
-        );
-        assert!(scope.store_error().is_none());
-    }
-
-    #[test]
-    fn canonical_aliases_reject_associated_paths_and_non_reference_wrappers() {
-        let (_fixture, analyzer) = analyzer_with_files(&[(
-            "src/lib.rs",
-            r#"
-pub struct Outer<T>(T);
-pub struct Item;
-pub type Associated = Outer<u8>::Assoc;
-pub type Reference = &Item;
-pub type Pointer = *const Item;
-pub type Array = [Item; 1];
-pub type Slice = [Item];
-"#,
-        )]);
-
-        assert_eq!(
-            canonical_type(&analyzer, definition(&analyzer, "Associated")),
-            None,
-            "an associated path must not collapse to its nominal outer type"
-        );
-        assert_eq!(
-            canonical_type(&analyzer, definition(&analyzer, "Reference")),
-            Some(definition(&analyzer, "Item"))
-        );
-        for alias in ["Pointer", "Array", "Slice"] {
-            assert_eq!(
-                canonical_type(&analyzer, definition(&analyzer, alias)),
-                None,
-                "unsupported wrapper {alias} must not resolve to Item"
-            );
-        }
-    }
-
-    #[test]
-    fn canonical_alias_alternatives_agree_only_when_their_targets_agree() {
-        let (_fixture, agreeing) = analyzer_with_files(&[(
-            "src/lib.rs",
-            r#"
-pub struct Item;
-#[cfg(feature = "one")]
-pub type Alias = Item;
-#[cfg(not(feature = "one"))]
-pub type Alias = Item;
-"#,
-        )]);
-        assert_eq!(
-            canonical_type(&agreeing, definition(&agreeing, "Alias")),
-            Some(definition(&agreeing, "Item"))
-        );
-
-        let (_fixture, disagreeing) = analyzer_with_files(&[(
-            "src/lib.rs",
-            r#"
-pub struct Item;
-pub struct Other;
-#[cfg(feature = "one")]
-pub type Alias = Item;
-#[cfg(not(feature = "one"))]
-pub type Alias = Other;
-"#,
-        )]);
-        assert_eq!(
-            canonical_type(&disagreeing, definition(&disagreeing, "Alias")),
-            None,
-            "different source alternatives must not certify one target"
-        );
-    }
-
-    #[test]
-    fn embedded_aliases_are_not_promoted_into_the_primary_hierarchy() {
-        let (_fixture, analyzer) = analyzer_with_files(&[(
-            "src/lib.rs",
-            r#"
-pub struct Item;
-wrap! {
-    pub type Hidden = Item;
-}
-"#,
-        )]);
-
-        let file = analyzer.get_analyzed_files().into_iter().next().unwrap();
-        let hidden = analyzer
-            .declarations(&file)
-            .into_iter()
-            .find(|unit| unit.identifier() == "Hidden")
-            .expect("embedded alias remains a source declaration");
-        assert_eq!(canonical_type(&analyzer, hidden), None);
-    }
-
-    #[test]
-    fn canonical_aliases_use_the_local_inline_module_import_scope() {
-        let (_fixture, analyzer) = analyzer_with_files(&[
-            (
-                "src/lib.rs",
-                r#"
-mod source;
-mod sibling;
-mod local {
-    use crate::source::Item;
-    pub type Alias = Item;
-}
-mod inline {
-    pub struct Item;
-    pub type Alias = Item;
-}
-mod outer {
-    pub mod inner {
-        pub struct Item;
-        pub type Alias = Item;
-    }
-}
-"#,
-            ),
-            ("src/source.rs", "pub struct Item;"),
-            ("src/sibling.rs", "pub struct Item;"),
-        ]);
-
-        assert_eq!(
-            canonical_type(&analyzer, definition(&analyzer, "local.Alias")),
-            Some(definition(&analyzer, "source.Item"))
-        );
-        assert_eq!(
-            canonical_type(&analyzer, definition(&analyzer, "inline.Alias")),
-            Some(definition(&analyzer, "inline.Item"))
-        );
-        assert_eq!(
-            canonical_type(&analyzer, definition(&analyzer, "outer.inner.Alias")),
-            Some(definition(&analyzer, "outer.inner.Item"))
-        );
-    }
-
-    #[test]
-    fn canonical_aliases_resolve_structured_qualified_paths() {
-        let (_fixture, analyzer) = analyzer_with_files(&[(
-            "src/lib.rs",
-            r#"
-mod outer {
-    pub struct Item;
-    pub mod inner {
-        pub struct Item;
-        pub type Local = self::Item;
-        pub type Parent = super::Item;
-        pub type Rooted = crate::outer::Item;
-    }
-}
-mod local {
-    use crate::outer;
-    pub type Imported = outer::inner::Item;
-}
-"#,
-        )]);
-        for (alias, target) in [
-            ("outer.inner.Local", "outer.inner.Item"),
-            ("outer.inner.Parent", "outer.Item"),
-            ("outer.inner.Rooted", "outer.Item"),
-            ("local.Imported", "outer.inner.Item"),
-        ] {
-            assert_eq!(
-                canonical_type(&analyzer, definition(&analyzer, alias)),
-                Some(definition(&analyzer, target)),
-                "{alias}"
-            );
-        }
-    }
-
-    #[test]
     fn canonical_aliases_preserve_ambiguous_inline_import_targets() {
         // The existing export-target boundary retains only file and name,
         // not an inline module identity. Do not claim a unique alias target
@@ -1317,169 +575,6 @@ mod local {
             canonical_type(&analyzer, definition(&analyzer, "local.Alias")),
             None
         );
-    }
-
-    #[test]
-    fn warm_query_indexes_catches_up_the_usage_facts_and_the_hierarchy_still_answers() {
-        let (_fixture, analyzer) = analyzer_with_files(&[(
-            "src/lib.rs",
-            r#"
-trait Runnable {}
-pub struct Worker;
-impl Runnable for Worker {}
-"#,
-        )]);
-
-        assert!(!analyzer.query_indexes_warm());
-        assert!(!analyzer.rust_usage_facts_warm());
-
-        analyzer.warm_query_indexes();
-
-        assert!(analyzer.query_indexes_warm());
-        assert!(analyzer.rust_usage_facts_warm());
-
-        let runnable = definition(&analyzer, "Runnable");
-        let worker = definition(&analyzer, "Worker");
-        assert_eq!(analyzer.get_direct_ancestors(&worker), vec![runnable]);
-    }
-
-    #[test]
-    fn rust_type_relations_record_same_file_trait_implementation() {
-        let (_fixture, analyzer) = analyzer_with_files(&[(
-            "src/lib.rs",
-            r#"
-trait Runnable {}
-struct Worker;
-impl Runnable for Worker {}
-"#,
-        )]);
-
-        let runnable = definition(&analyzer, "Runnable");
-        let worker = definition(&analyzer, "Worker");
-
-        assert!(has_trait_implementation_relation(
-            &analyzer, "Worker", "Runnable"
-        ));
-        assert_eq!(
-            analyzer.get_direct_ancestors(&worker),
-            vec![runnable.clone()]
-        );
-        assert!(analyzer.get_direct_descendants(&runnable).contains(&worker));
-    }
-
-    #[test]
-    fn failed_hierarchy_publication_is_not_cached_as_an_empty_family() {
-        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Rust)
-            .file("src/lib.rs", "mod contracts;\nuse contracts::Runnable;\npub struct Worker;\nimpl Runnable for Worker { fn run(&self) {} }\n")
-            .file("src/contracts.rs", "pub trait Runnable { fn run(&self); }\n")
-            .build();
-        let analyzer = RustAnalyzer::new(fixture.project_dyn());
-        let member = definition(&analyzer, "contracts.Runnable.run");
-        analyzer.analyzer_store().drop_rust_modules_table_for_test();
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        let answer = analyzer.member_family(&member, None);
-        assert_eq!(answer.outcome, MemberFamilyOutcome::Incomplete);
-        assert!(scope.store_error().is_some());
-    }
-
-    #[test]
-    fn blanket_impl_parameter_does_not_resolve_to_same_named_workspace_type() {
-        let (_fixture, analyzer) = analyzer_with_files(&[(
-            "src/lib.rs",
-            r#"
-pub trait Marker {
-    fn mark(&self) -> u32;
-}
-
-pub trait Counted {
-    fn count(&self) -> u32;
-}
-
-pub struct T;
-pub struct Thing;
-
-impl<T: Clone> Marker for T {
-    fn mark(&self) -> u32 {
-        0
-    }
-}
-
-impl Counted for Thing {
-    fn count(&self) -> u32 {
-        1
-    }
-}
-"#,
-        )]);
-
-        let marker = definition(&analyzer, "Marker");
-        let same_named_type = definition(&analyzer, "T");
-        assert!(
-            !has_trait_implementation_relation(&analyzer, "T", "Marker"),
-            "the impl type parameter shadows the same-named workspace type"
-        );
-        assert!(
-            analyzer.get_direct_ancestors(&same_named_type).is_empty(),
-            "the workspace type must not inherit a trait implemented for the blanket parameter"
-        );
-        assert!(
-            !analyzer
-                .get_direct_descendants(&marker)
-                .contains(&same_named_type),
-            "the blanket parameter must not become a concrete trait descendant"
-        );
-
-        let counted = definition(&analyzer, "Counted");
-        let thing = definition(&analyzer, "Thing");
-        assert!(has_trait_implementation_relation(
-            &analyzer, "Thing", "Counted"
-        ));
-        assert_eq!(
-            analyzer.get_direct_ancestors(&thing),
-            vec![counted.clone()],
-            "a concrete impl in the same file remains indexed"
-        );
-        assert!(analyzer.get_direct_descendants(&counted).contains(&thing));
-
-        let mark = definition(&analyzer, "Marker.mark");
-        let family = analyzer.member_family(&mark, None);
-        assert!(
-            !family.is_proven(),
-            "the blanket impl must still make its trait family unenumerable"
-        );
-        assert!(family.edges.is_empty());
-    }
-
-    /// `declares` is `declarations(file).contains(unit)` without the copy, so
-    /// it must give the same answer for every unit a caller can hold: each
-    /// declaration asked of its own file and of another file, and each file's
-    /// file-scope unit, which `declarations` filters out.
-    #[test]
-    fn rust_declares_answers_declaration_membership() {
-        let (_fixture, analyzer) = analyzer_with_files(&[
-            ("src/lib.rs", "pub mod worker;\npub trait Runnable {}\n"),
-            (
-                "src/worker.rs",
-                "pub struct Worker;\nimpl crate::Runnable for Worker {}\npub type WorkerAlias = Worker;\n",
-            ),
-        ]);
-        let files = analyzer.analyzed_files();
-        let mut units = analyzer.all_declarations().collect::<Vec<_>>();
-        assert!(
-            units.len() >= 3,
-            "the fixture declares a trait, a type and an alias"
-        );
-        units.extend(files.iter().cloned().map(CodeUnit::file_scope));
-        for file in &files {
-            let declared = analyzer.declarations(file);
-            for unit in &units {
-                assert_eq!(
-                    analyzer.declares(file, unit),
-                    declared.contains(unit),
-                    "{file:?} {unit:?}"
-                );
-            }
-        }
     }
 
     /// Two byte-identical files are one content-addressed blob, so the type
@@ -1529,37 +624,656 @@ impl Counted for Thing {
     }
 
     #[test]
-    fn rust_type_relations_record_imported_trait_implementation() {
+    fn canonical_implementer_names_project_structured_primary_targets() {
+        let (_fixture, analyzer) = analyzer_with_files(&[(
+            "src/lib.rs",
+            r#"
+trait Contract {}
+struct Item;
+struct Wrapper<T>(T);
+type Alias = Item;
+struct Foo;
+struct Bar;
+impl Contract for Item {}
+impl<'a> Contract for &'a Item {}
+impl Contract for Wrapper<u8> {}
+impl Contract for Alias {}
+impl Contract for (Foo, Bar) {}
+struct Negative;
+impl !Contract for Negative {}
+generate! { struct Generated; impl Contract for Generated {} }
+"#,
+        )]);
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        assert_eq!(
+            brokk_bifrost_rust::graph_support::trait_implementer_names(
+                &analyzer,
+                scope.token(),
+                &definition(&analyzer, "Contract"),
+                &|| true,
+            )
+            .unwrap(),
+            ["Item", "Wrapper", "Alias"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<HashSet<_>>()
+        );
+        assert!(scope.store_error().is_none());
+    }
+    #[test]
+    fn canonical_file_import_binder_uses_root_even_when_first_item_is_a_module() {
+        let source = concat!(
+            "mod nested { use wrong::Thing as Chosen; }\n",
+            "use actual::Thing as Chosen;\n",
+            "fn local() { use local::Thing as Chosen; }\n",
+            "wrap! { use embedded::Thing as Chosen; }\n",
+            "use future::Item as Later;\n",
+        );
+        let (fixture, analyzer) = analyzer_with_files(&[("src/lib.rs", source)]);
+        let file = crate::analyzer::ProjectFile::new(fixture.project_root(), "src/lib.rs");
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        assert!(!analyzer.declarations(&file).is_empty());
+        std::fs::remove_file(file.abs_path()).unwrap();
+        let binder = brokk_bifrost_rust::graph_support::canonical_rust_file_import_binder(
+            &analyzer,
+            &file,
+            &|| true,
+        )
+        .unwrap();
+        let chosen = binder.bindings.get("Chosen").expect("root alias");
+        assert_eq!(chosen.module_specifier, "actual", "{binder:?}");
+        assert_eq!(chosen.imported_name.as_deref(), Some("Thing"), "{binder:?}");
+        assert!(binder.bindings.contains_key("Later"), "{binder:?}");
+        assert!(scope.store_error().is_none());
+    }
+    #[test]
+    fn canonical_file_import_binder_distinguishes_empty_cancelled_and_unavailable() {
+        let (fixture, analyzer) = analyzer_with_files(&[("src/lib.rs", "")]);
+        let file = crate::analyzer::ProjectFile::new(fixture.project_root(), "src/lib.rs");
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        assert!(matches!(
+            brokk_bifrost_rust::graph_support::canonical_rust_file_import_binder(
+                &analyzer,
+                &file,
+                &|| false
+            ),
+            Err(RustCargoRouteError::Cancelled)
+        ));
+        let binder = brokk_bifrost_rust::graph_support::canonical_rust_file_import_binder(
+            &analyzer,
+            &file,
+            &|| true,
+        )
+        .unwrap();
+        assert!(binder.bindings.is_empty(), "{binder:?}");
+        assert!(scope.store_error().is_none());
+        drop(scope);
+
+        // Use a fresh analyzer so a successful bounded fact cache cannot mask
+        // the deliberately missing publication witness.
+        let (fixture, analyzer) = analyzer_with_files(&[("src/lib.rs", "use dep::Thing;")]);
+        let file = crate::analyzer::ProjectFile::new(fixture.project_root(), "src/lib.rs");
+        analyzer.analyzer_store().drop_rust_modules_table_for_test();
+        let _scope = AnalyzerQueryScope::new(&analyzer);
+        assert!(
+            brokk_bifrost_rust::graph_support::canonical_rust_file_import_binder(
+                &analyzer,
+                &file,
+                &|| true
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn canonical_implementer_names_use_scoped_trait_identity() {
         let (_fixture, analyzer) = analyzer_with_files(&[
-            // The crate root matters here: the per-demand reader answers from
-            // the trait-implementation rows, and crate derivation only places
-            // a module that some root reaches. A pair of loose files is not a
-            // crate, and a file no crate root reaches is not compiled.
-            ("src/lib.rs", "pub mod contracts;\npub mod worker;\n"),
-            ("src/contracts.rs", "pub trait Runnable {}"),
+            ("src/source.rs", "pub trait Contract<T> {}"),
             (
-                "src/worker.rs",
+                "src/lib.rs",
                 r#"
-use crate::contracts::Runnable;
-pub struct Worker;
-impl Runnable for Worker {}
+mod source;
+mod local {
+    use crate::source::Contract as Imported;
+    pub struct Item;
+    impl Imported<u8> for Item {}
+}
+mod other {
+    pub trait Contract<T> {}
+    pub struct Unrelated;
+    impl Contract<u8> for Unrelated {}
+}
 "#,
             ),
         ]);
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        assert_eq!(
+            brokk_bifrost_rust::graph_support::trait_implementer_names(
+                &analyzer,
+                scope.token(),
+                &definition(&analyzer, "source.Contract"),
+                &|| true,
+            )
+            .unwrap(),
+            ["Item".to_owned()].into_iter().collect::<HashSet<_>>()
+        );
+    }
+    #[test]
+    fn canonical_implementer_names_propagate_unavailable_publication() {
+        let (_fixture, analyzer) = analyzer_with_files(&[(
+            "src/lib.rs",
+            "trait Contract {} struct Item; impl Contract for Item {}",
+        )]);
+        let owner = definition(&analyzer, "Contract");
+        analyzer.analyzer_store().drop_rust_modules_table_for_test();
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        assert!(
+            brokk_bifrost_rust::graph_support::trait_implementer_names(
+                &analyzer,
+                scope.token(),
+                &owner,
+                &|| true
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn canonical_trait_member_enumeration_uses_scoped_structured_heads() {
+        let (_fixture, analyzer) = analyzer_with_files(&[(
+            "src/lib.rs",
+            r#"
+mod left {
+    pub trait Contract<T> { fn run(&self); }
+    pub struct Item;
+    impl Contract<u8> for Item { fn run(&self) {} }
+}
+mod right {
+    pub trait Contract<T> { fn run(&self); }
+    pub struct Item;
+    impl Contract<u8> for Item { fn run(&self) {} }
+}
+"#,
+        )]);
+        for module in ["left", "right"] {
+            assert_eq!(
+                analyzer
+                    .rust_trait_member_implementations(&definition(
+                        &analyzer,
+                        &format!("{module}.Contract.run")
+                    ))
+                    .unwrap(),
+                Some(vec![definition(&analyzer, &format!("{module}.Item.run"))])
+            );
+        }
+    }
+    #[test]
+    fn canonical_trait_member_enumeration_deduplicates_primary_source_alternatives() {
+        let (_fixture, analyzer) = analyzer_with_files(&[(
+            "src/lib.rs",
+            r#"
+trait Contract { fn run(&self); }
+struct Item;
+#[cfg(first)] impl Contract for Item { fn run(&self) {} }
+#[cfg(second)] impl Contract for Item { fn run(&self) {} }
+generate! { struct Generated; impl Contract for Generated { fn run(&self) {} } }
+struct Negative;
+impl !Contract for Negative { fn run(&self) {} }
+"#,
+        )]);
+        assert_eq!(
+            analyzer
+                .rust_trait_member_implementations(&definition(&analyzer, "Contract.run"))
+                .unwrap(),
+            Some(vec![definition(&analyzer, "Item.run")])
+        );
+    }
+    #[test]
+    fn canonical_trait_member_enumeration_preserves_known_malformed_body_members() {
+        let (_fixture, analyzer) = analyzer_with_files(&[(
+            "src/lib.rs",
+            r#"
+trait Contract { fn known(&self); type Output; }
+struct Item;
+impl Contract for Item {
+    fn known(&self) {}
+    type Output = Item;
+    fn malformed(&self, value: );
+}
+"#,
+        )]);
+        for (member, implementation) in [
+            ("Contract.known", "Item.known"),
+            ("Contract.Output", "Item.Output"),
+        ] {
+            assert_eq!(
+                analyzer
+                    .rust_trait_member_implementations(&definition(&analyzer, member))
+                    .unwrap(),
+                Some(vec![definition(&analyzer, implementation)])
+            );
+        }
+    }
+    #[test]
+    fn canonical_trait_queries_do_not_reopen_frozen_source() {
+        let (_fixture, analyzer) = analyzer_with_files(&[(
+            "src/lib.rs",
+            "trait Contract { fn run(&self); } struct Item; impl Contract for Item { fn run(&self) {} }",
+        )]);
+        let owner = definition(&analyzer, "Contract");
+        let member = definition(&analyzer, "Contract.run");
+        let implementation = definition(&analyzer, "Item.run");
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        assert!(analyzer.declarations(member.source()).contains(&member));
+        std::fs::remove_file(member.source().abs_path()).unwrap();
+        assert_eq!(
+            brokk_bifrost_rust::graph_support::trait_implementer_names(
+                &analyzer,
+                scope.token(),
+                &owner,
+                &|| true,
+            )
+            .unwrap(),
+            ["Item".to_owned()].into_iter().collect::<HashSet<_>>()
+        );
+        assert_eq!(
+            brokk_bifrost_rust::graph_support::rust_trait_member_implementations(
+                &analyzer,
+                scope.token(),
+                &member
+            )
+            .unwrap(),
+            Some(vec![implementation])
+        );
+        assert!(scope.store_error().is_none());
+    }
+    #[test]
+    fn canonical_trait_member_enumeration_propagates_unavailable_publication() {
+        let (_fixture, analyzer) = analyzer_with_files(&[(
+            "src/lib.rs",
+            "trait Contract { fn run(&self); } struct Item; impl Contract for Item { fn run(&self) {} }",
+        )]);
+        let member = definition(&analyzer, "Contract.run");
+        analyzer.analyzer_store().drop_rust_modules_table_for_test();
+        assert!(analyzer.rust_trait_member_implementations(&member).is_err());
+    }
+    #[test]
+    fn canonical_impl_member_owners_include_nested_macro_source() {
+        let (_fixture, analyzer) = analyzer_with_files(&[(
+            "src/lib.rs",
+            r#"
+trait Contract { fn run(&self); const LIMIT: usize; }
+outer! { inner! {
+    struct Item;
+    impl Contract for Item {
+        fn run(&self) {}
+        const LIMIT: usize = 1;
+    }
+} }
+"#,
+        )]);
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        for name in ["Item.run", "Item.LIMIT"] {
+            assert_eq!(
+                brokk_bifrost_rust::hierarchy::rust_trait_for_impl_member(
+                    &analyzer,
+                    scope.token(),
+                    &definition(&analyzer, name)
+                )
+                .unwrap(),
+                Some(definition(&analyzer, "Contract")),
+                "{name}"
+            );
+        }
+        assert!(scope.store_error().is_none());
+    }
+    #[test]
+    fn canonical_impl_member_owners_keep_primary_imports_for_embedded_trees() {
+        let (_fixture, analyzer) = analyzer_with_files(&[
+            ("src/source.rs", "pub trait Contract { fn run(&self); }"),
+            ("src/other.rs", "pub trait Contract { fn run(&self); }"),
+            (
+                "src/lib.rs",
+                r#"
+mod source;
+mod other;
+mod surrounding {
+    use crate::source::Contract;
+    outer! { inner! {
+        use crate::other::Contract;
+        pub struct Item;
+        impl Contract for Item { fn run(&self) {} }
+    } }
+}
+"#,
+            ),
+        ]);
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        assert_eq!(
+            brokk_bifrost_rust::hierarchy::rust_trait_for_impl_member(
+                &analyzer,
+                scope.token(),
+                &definition(&analyzer, "surrounding.Item.run")
+            )
+            .unwrap(),
+            Some(definition(&analyzer, "source.Contract"))
+        );
+        assert!(scope.store_error().is_none());
+    }
+    #[test]
+    fn canonical_impl_member_owner_does_not_reopen_source_in_frozen_query() {
+        let (_fixture, analyzer) = analyzer_with_files(&[(
+            "src/lib.rs",
+            "trait Contract { fn run(&self); } struct Item; impl Contract for Item { fn run(&self) {} }",
+        )]);
+        let member = definition(&analyzer, "Item.run");
+        let expected = definition(&analyzer, "Contract");
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        assert!(analyzer.declarations(member.source()).contains(&member));
+        std::fs::remove_file(member.source().abs_path()).unwrap();
+        assert_eq!(
+            brokk_bifrost_rust::hierarchy::rust_trait_for_impl_member(
+                &analyzer,
+                scope.token(),
+                &member
+            )
+            .unwrap(),
+            Some(expected)
+        );
+        assert!(scope.store_error().is_none());
+    }
+    #[test]
+    fn canonical_alias_resolution_does_not_reopen_source_in_frozen_query() {
+        let (_fixture, analyzer) =
+            analyzer_with_files(&[("src/lib.rs", "pub struct Item; pub type Alias = Item;")]);
+        let alias = definition(&analyzer, "Alias");
+        let target = definition(&analyzer, "Item");
+        // Freeze the ordinary request's live declaration identity first.
+        // Removing a file before opening a request would change that request's
+        // inventory, rather than isolate the alias reader's source dependency.
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        assert!(analyzer.declarations(alias.source()).contains(&alias));
+        std::fs::remove_file(alias.source().abs_path()).unwrap();
+        assert_eq!(
+            brokk_bifrost_rust::hierarchy::canonical_rust_hierarchy_type(
+                &analyzer,
+                scope.token(),
+                alias
+            )
+            .unwrap(),
+            Some(target)
+        );
+        assert!(scope.store_error().is_none());
+    }
+    #[test]
+    fn canonical_aliases_reject_associated_paths_and_non_reference_wrappers() {
+        let (_fixture, analyzer) = analyzer_with_files(&[(
+            "src/lib.rs",
+            r#"
+pub struct Outer<T>(T);
+pub struct Item;
+pub type Associated = Outer<u8>::Assoc;
+pub type Reference = &Item;
+pub type Pointer = *const Item;
+pub type Array = [Item; 1];
+pub type Slice = [Item];
+"#,
+        )]);
 
-        let runnable = definition(&analyzer, "contracts.Runnable");
-        let worker = definition(&analyzer, "worker.Worker");
+        assert_eq!(
+            canonical_type(&analyzer, definition(&analyzer, "Associated")),
+            None,
+            "an associated path must not collapse to its nominal outer type"
+        );
+        assert_eq!(
+            canonical_type(&analyzer, definition(&analyzer, "Reference")),
+            Some(definition(&analyzer, "Item"))
+        );
+        for alias in ["Pointer", "Array", "Slice"] {
+            assert_eq!(
+                canonical_type(&analyzer, definition(&analyzer, alias)),
+                None,
+                "unsupported wrapper {alias} must not resolve to Item"
+            );
+        }
+    }
+    #[test]
+    fn canonical_alias_alternatives_agree_only_when_their_targets_agree() {
+        let (_fixture, agreeing) = analyzer_with_files(&[(
+            "src/lib.rs",
+            r#"
+pub struct Item;
+#[cfg(feature = "one")]
+pub type Alias = Item;
+#[cfg(not(feature = "one"))]
+pub type Alias = Item;
+"#,
+        )]);
+        assert_eq!(
+            canonical_type(&agreeing, definition(&agreeing, "Alias")),
+            Some(definition(&agreeing, "Item"))
+        );
 
-        assert!(has_trait_implementation_relation(
-            &analyzer,
-            "worker.Worker",
-            "contracts.Runnable"
+        let (_fixture, disagreeing) = analyzer_with_files(&[(
+            "src/lib.rs",
+            r#"
+pub struct Item;
+pub struct Other;
+#[cfg(feature = "one")]
+pub type Alias = Item;
+#[cfg(not(feature = "one"))]
+pub type Alias = Other;
+"#,
+        )]);
+        assert_eq!(
+            canonical_type(&disagreeing, definition(&disagreeing, "Alias")),
+            None,
+            "different source alternatives must not certify one target"
+        );
+    }
+    #[test]
+    fn embedded_aliases_are_not_promoted_into_the_primary_hierarchy() {
+        let (_fixture, analyzer) = analyzer_with_files(&[(
+            "src/lib.rs",
+            r#"
+pub struct Item;
+wrap! {
+    pub type Hidden = Item;
+}
+"#,
+        )]);
+
+        let file = analyzer.get_analyzed_files().into_iter().next().unwrap();
+        let hidden = analyzer
+            .declarations(&file)
+            .into_iter()
+            .find(|unit| unit.identifier() == "Hidden")
+            .expect("embedded alias remains a source declaration");
+        assert_eq!(canonical_type(&analyzer, hidden), None);
+    }
+    #[test]
+    fn canonical_aliases_use_the_local_inline_module_import_scope() {
+        let (_fixture, analyzer) = analyzer_with_files(&[
+            (
+                "src/lib.rs",
+                r#"
+mod source;
+mod sibling;
+mod local {
+    use crate::source::Item;
+    pub type Alias = Item;
+}
+mod inline {
+    pub struct Item;
+    pub type Alias = Item;
+}
+mod outer {
+    pub mod inner {
+        pub struct Item;
+        pub type Alias = Item;
+    }
+}
+"#,
+            ),
+            ("src/source.rs", "pub struct Item;"),
+            ("src/sibling.rs", "pub struct Item;"),
+        ]);
+
+        assert_eq!(
+            canonical_type(&analyzer, definition(&analyzer, "local.Alias")),
+            Some(definition(&analyzer, "source.Item"))
+        );
+        assert_eq!(
+            canonical_type(&analyzer, definition(&analyzer, "inline.Alias")),
+            Some(definition(&analyzer, "inline.Item"))
+        );
+        assert_eq!(
+            canonical_type(&analyzer, definition(&analyzer, "outer.inner.Alias")),
+            Some(definition(&analyzer, "outer.inner.Item"))
+        );
+    }
+    #[test]
+    fn canonical_aliases_resolve_structured_qualified_paths() {
+        let (_fixture, analyzer) = analyzer_with_files(&[(
+            "src/lib.rs",
+            r#"
+mod outer {
+    pub struct Item;
+    pub mod inner {
+        pub struct Item;
+        pub type Local = self::Item;
+        pub type Parent = super::Item;
+        pub type Rooted = crate::outer::Item;
+    }
+}
+mod local {
+    use crate::outer;
+    pub type Imported = outer::inner::Item;
+}
+"#,
+        )]);
+        for (alias, target) in [
+            ("outer.inner.Local", "outer.inner.Item"),
+            ("outer.inner.Parent", "outer.Item"),
+            ("outer.inner.Rooted", "outer.Item"),
+            ("local.Imported", "outer.inner.Item"),
+        ] {
+            assert_eq!(
+                canonical_type(&analyzer, definition(&analyzer, alias)),
+                Some(definition(&analyzer, target)),
+                "{alias}"
+            );
+        }
+    }
+    #[test]
+    fn warm_query_indexes_catches_up_the_usage_facts_and_the_hierarchy_still_answers() {
+        let (_fixture, analyzer) = analyzer_with_files(&[(
+            "src/lib.rs",
+            r#"
+trait Runnable {}
+pub struct Worker;
+impl Runnable for Worker {}
+"#,
+        )]);
+
+        assert!(!analyzer.query_indexes_warm());
+        assert!(!analyzer.rust_usage_facts_warm());
+
+        analyzer.warm_query_indexes();
+
+        assert!(analyzer.query_indexes_warm());
+        assert!(analyzer.rust_usage_facts_warm());
+
+        let runnable = definition(&analyzer, "Runnable");
+        let worker = definition(&analyzer, "Worker");
+        assert_eq!(analyzer.get_direct_ancestors(&worker), vec![runnable]);
+    }
+    #[test]
+    #[hardwon("5b97df261c51: failed hierarchy publication is not cached as an empty family")]
+    fn failed_hierarchy_publication_is_not_cached_as_an_empty_family() {
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Rust)
+            .file("src/lib.rs", "mod contracts;\nuse contracts::Runnable;\npub struct Worker;\nimpl Runnable for Worker { fn run(&self) {} }\n")
+            .file("src/contracts.rs", "pub trait Runnable { fn run(&self); }\n")
+            .build();
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        let member = definition(&analyzer, "contracts.Runnable.run");
+        analyzer.analyzer_store().drop_rust_modules_table_for_test();
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let answer = analyzer.member_family(&member, None);
+        assert_eq!(answer.outcome, MemberFamilyOutcome::Incomplete);
+        assert!(scope.store_error().is_some());
+    }
+    #[test]
+    #[hardwon("65ce5f18a2ec: blanket impl parameter does not resolve to same named workspace type")]
+    fn blanket_impl_parameter_does_not_resolve_to_same_named_workspace_type() {
+        let (_fixture, analyzer) = analyzer_with_files(&[(
+            "src/lib.rs",
+            r#"
+pub trait Marker {
+    fn mark(&self) -> u32;
+}
+
+pub trait Counted {
+    fn count(&self) -> u32;
+}
+
+pub struct T;
+pub struct Thing;
+
+impl<T: Clone> Marker for T {
+    fn mark(&self) -> u32 {
+        0
+    }
+}
+
+impl Counted for Thing {
+    fn count(&self) -> u32 {
+        1
+    }
+}
+"#,
+        )]);
+
+        let marker = definition(&analyzer, "Marker");
+        let same_named_type = definition(&analyzer, "T");
+        assert!(
+            !hierarchy_has_trait_implementation_relation(
+                &workspace_hierarchy(&analyzer),
+                "T",
+                "Marker",
+            ),
+            "the impl type parameter shadows the same-named workspace type"
+        );
+        assert!(
+            analyzer.get_direct_ancestors(&same_named_type).is_empty(),
+            "the workspace type must not inherit a trait implemented for the blanket parameter"
+        );
+        assert!(
+            !analyzer
+                .get_direct_descendants(&marker)
+                .contains(&same_named_type),
+            "the blanket parameter must not become a concrete trait descendant"
+        );
+
+        let counted = definition(&analyzer, "Counted");
+        let thing = definition(&analyzer, "Thing");
+        assert!(hierarchy_has_trait_implementation_relation(
+            &workspace_hierarchy(&analyzer),
+            "Thing",
+            "Counted",
         ));
         assert_eq!(
-            analyzer.get_direct_ancestors(&worker),
-            vec![runnable.clone()]
+            analyzer.get_direct_ancestors(&thing),
+            vec![counted.clone()],
+            "a concrete impl in the same file remains indexed"
         );
-        assert!(analyzer.get_direct_descendants(&runnable).contains(&worker));
+        assert!(analyzer.get_direct_descendants(&counted).contains(&thing));
+
+        let mark = definition(&analyzer, "Marker.mark");
+        let family = analyzer.member_family(&mark, None);
+        assert!(
+            !family.is_proven(),
+            "the blanket impl must still make its trait family unenumerable"
+        );
+        assert!(family.edges.is_empty());
     }
 }
 
@@ -1567,6 +1281,7 @@ impl Runnable for Worker {}
 mod member_family_tests {
     use super::tests::{analyzer_with_files, definition, family_edges, member_in_impl};
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
 
     const CONTRACTS: &str = r#"
 pub trait Greeter {
@@ -1624,48 +1339,6 @@ impl Shouter for Robot {
 
     #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
-    fn a_trait_method_resolves_to_its_impl_methods_in_other_files() {
-        let (_fixture, analyzer) = cross_file_workspace();
-        let greet = definition(&analyzer, "contracts.Greeter.greet");
-
-        assert_eq!(
-            family_edges(&analyzer, &greet, MethodFamilyRelation::ImplementedBy),
-            vec![
-                "impl Greeter for Person::fn greet(&self) -> String { ... }".to_string(),
-                "impl Greeter for Robot::fn greet(&self) -> String { ... }".to_string(),
-            ],
-            "a trait method's implementors are the members of every resolved \
-             impl of that trait, in whatever file the impl was written"
-        );
-    }
-
-    #[test]
-    fn an_inherent_method_of_the_same_name_is_not_an_implementor() {
-        let (_fixture, analyzer) = cross_file_workspace();
-        let inherent = member_in_impl(&analyzer, "person.Person.greet", "impl Person::");
-
-        let answer = analyzer.member_family(&inherent, None);
-        assert_eq!(
-            answer.outcome,
-            MemberFamilyOutcome::NoFamily,
-            "an inherent method joins no trait family: Rust dispatches it \
-             statically, so the complete answer is that it has none"
-        );
-        assert!(answer.edges.is_empty());
-
-        let greet = definition(&analyzer, "contracts.Greeter.greet");
-        let implementors = family_edges(&analyzer, &greet, MethodFamilyRelation::ImplementedBy);
-        assert!(
-            !implementors
-                .iter()
-                .any(|edge| edge.contains("impl Person::")),
-            "the inherent method must not appear among the trait's \
-             implementors, got: {implementors:?}"
-        );
-    }
-
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[test]
     fn a_different_traits_same_named_method_is_not_an_implementor() {
         let (_fixture, analyzer) = cross_file_workspace();
         let shouter = definition(&analyzer, "contracts.Shouter.greet");
@@ -1675,27 +1348,6 @@ impl Shouter for Robot {
             vec!["impl Shouter for Robot::fn greet(&self) -> String { ... }".to_string()],
             "`Robot` implements both traits with a same-named method; only the \
              member written in this trait's impl block answers this trait"
-        );
-    }
-
-    #[test]
-    fn an_impl_member_states_the_trait_method_it_implements() {
-        let (_fixture, analyzer) = cross_file_workspace();
-        let member = member_in_impl(&analyzer, "robot.Robot.greet", "impl Shouter for Robot::");
-
-        let answer = analyzer.member_family(&member, None);
-        assert!(answer.is_proven(), "{:?}", answer.reason);
-        let forward: Vec<String> = answer
-            .edges
-            .iter()
-            .filter(|edge| edge.relation == MethodFamilyRelation::Implements)
-            .map(|edge| format!("{} in {}", edge.target.fq_name(), edge.owner.fq_name()))
-            .collect();
-        assert_eq!(
-            forward,
-            vec!["contracts.Shouter.greet in contracts.Shouter".to_string()],
-            "the forward edge is the trait method the impl block answers, and \
-             it is the same pair the inverse direction was indexed from"
         );
     }
 
@@ -1719,24 +1371,143 @@ impl<T> Contract for T { fn run(&self) {} }
     }
 
     #[test]
-    fn canonical_primary_impls_preserve_nominal_generic_containers() {
+    fn canonical_primary_impls_do_not_turn_negative_impls_into_positive_relations() {
+        let (_fixture, analyzer) = analyzer_with_files(&[(
+            "src/lib.rs",
+            "trait Contract { fn run(&self); } struct Item; impl !Contract for Item {}",
+        )]);
+        assert!(
+            analyzer
+                .get_direct_ancestors(&definition(&analyzer, "Item"))
+                .is_empty()
+        );
+        let answer = analyzer.member_family(&definition(&analyzer, "Contract.run"), None);
+        assert_eq!(answer.outcome, MemberFamilyOutcome::Incomplete);
+        assert!(answer.edges.is_empty());
+    }
+
+    /// A blanket impl has no trait-implementation row and no unresolved-impl
+    /// row, so a trait-bounded walk never reads the file it is in unless that
+    /// is the trait's own file or a file one of the trait's rows names.
+    #[test]
+    #[ignore = "finds real bug: a blanket impl outside the trait's own file is invisible to the \
+                row-bounded member walk, so the family answers Proven"]
+    fn a_blanket_impl_in_another_file_answers_unproven() {
+        let (_fixture, analyzer) = analyzer_with_files(&[
+            ("src/lib.rs", "pub mod marker;\npub mod blanket;\n"),
+            (
+                "src/marker.rs",
+                "pub trait Marker {\n    fn mark(&self) -> u32;\n}\n",
+            ),
+            (
+                "src/blanket.rs",
+                "use crate::marker::Marker;\n\
+                 impl<T: Clone> Marker for T {\n    fn mark(&self) -> u32 {\n        0\n    }\n}\n",
+            ),
+        ]);
+
+        let mark = definition(&analyzer, "marker.Marker.mark");
+        let answer = analyzer.member_family(&mark, None);
+        assert!(
+            !answer.is_proven(),
+            "a blanket impl outside the trait's file still covers types no \
+             workspace scan enumerates"
+        );
+        assert!(answer.edges.is_empty());
+    }
+
+    #[test]
+    fn a_direct_macro_in_a_primary_trait_makes_members_unenumerable() {
         let (_fixture, analyzer) = analyzer_with_files(&[(
             "src/lib.rs",
             r#"
-trait Contract { fn run(&self); }
-struct Wrapper<T>(T);
-impl<T> Contract for Wrapper<T> { fn run(&self) {} }
+pub trait Contract {
+    fn known(&self);
+    generated!();
+}
+
+pub struct Item;
+
+impl Contract for Item {
+    fn known(&self) {}
+}
 "#,
         )]);
+
+        let known = definition(&analyzer, "Contract.known");
+        let answer = analyzer.member_family(&known, None);
         assert_eq!(
-            analyzer.get_direct_ancestors(&definition(&analyzer, "Wrapper")),
-            vec![definition(&analyzer, "Contract")]
+            answer.outcome,
+            MemberFamilyOutcome::Incomplete,
+            "a direct trait-body macro can add unknown members: {:?}",
+            answer.reason
         );
-        let answer = analyzer.member_family(&definition(&analyzer, "Wrapper.run"), None);
-        assert!(answer.is_proven(), "{:?}", answer.outcome);
-        assert_eq!(answer.edges.len(), 1);
+        assert!(answer.edges.is_empty());
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
+    #[test]
+    #[hardwon("30fd8a5b0c4e: a trait method resolves to its impl methods in other files")]
+    fn a_trait_method_resolves_to_its_impl_methods_in_other_files() {
+        let (_fixture, analyzer) = cross_file_workspace();
+        let greet = definition(&analyzer, "contracts.Greeter.greet");
+
+        assert_eq!(
+            family_edges(&analyzer, &greet, MethodFamilyRelation::ImplementedBy),
+            vec![
+                "impl Greeter for Person::fn greet(&self) -> String { ... }".to_string(),
+                "impl Greeter for Robot::fn greet(&self) -> String { ... }".to_string(),
+            ],
+            "a trait method's implementors are the members of every resolved \
+             impl of that trait, in whatever file the impl was written"
+        );
+    }
+    #[test]
+    #[hardwon("30fd8a5b0c4e: an inherent method of the same name is not an implementor")]
+    fn an_inherent_method_of_the_same_name_is_not_an_implementor() {
+        let (_fixture, analyzer) = cross_file_workspace();
+        let inherent = member_in_impl(&analyzer, "person.Person.greet", "impl Person::");
+
+        let answer = analyzer.member_family(&inherent, None);
+        assert_eq!(
+            answer.outcome,
+            MemberFamilyOutcome::NoFamily,
+            "an inherent method joins no trait family: Rust dispatches it \
+             statically, so the complete answer is that it has none"
+        );
+        assert!(answer.edges.is_empty());
+
+        let greet = definition(&analyzer, "contracts.Greeter.greet");
+        let implementors = family_edges(&analyzer, &greet, MethodFamilyRelation::ImplementedBy);
+        assert!(
+            !implementors
+                .iter()
+                .any(|edge| edge.contains("impl Person::")),
+            "the inherent method must not appear among the trait's \
+             implementors, got: {implementors:?}"
+        );
+    }
+    #[test]
+    #[hardwon("30fd8a5b0c4e: an impl member states the trait method it implements")]
+    fn an_impl_member_states_the_trait_method_it_implements() {
+        let (_fixture, analyzer) = cross_file_workspace();
+        let member = member_in_impl(&analyzer, "robot.Robot.greet", "impl Shouter for Robot::");
+
+        let answer = analyzer.member_family(&member, None);
+        assert!(answer.is_proven(), "{:?}", answer.reason);
+        let forward: Vec<String> = answer
+            .edges
+            .iter()
+            .filter(|edge| edge.relation == MethodFamilyRelation::Implements)
+            .map(|edge| format!("{} in {}", edge.target.fq_name(), edge.owner.fq_name()))
+            .collect();
+        assert_eq!(
+            forward,
+            vec!["contracts.Shouter.greet in contracts.Shouter".to_string()],
+            "the forward edge is the trait method the impl block answers, and \
+             it is the same pair the inverse direction was indexed from"
+        );
+    }
     #[test]
     fn canonical_primary_impls_keep_reference_wrapped_type_parameters_incomplete() {
         let (_fixture, analyzer) = analyzer_with_files(&[(
@@ -1756,7 +1527,6 @@ impl<'a, T> Contract for &'a T { fn run(&self) {} }
         assert_eq!(answer.outcome, MemberFamilyOutcome::Incomplete);
         assert!(answer.edges.is_empty());
     }
-
     #[test]
     fn canonical_primary_impls_keep_generic_associated_targets_unresolved() {
         let (_fixture, analyzer) = analyzer_with_files(&[(
@@ -1776,23 +1546,6 @@ impl<T> Contract for T::Assoc { fn run(&self) {} }
         assert_eq!(answer.outcome, MemberFamilyOutcome::Incomplete);
         assert!(answer.edges.is_empty());
     }
-
-    #[test]
-    fn canonical_primary_impls_do_not_turn_negative_impls_into_positive_relations() {
-        let (_fixture, analyzer) = analyzer_with_files(&[(
-            "src/lib.rs",
-            "trait Contract { fn run(&self); } struct Item; impl !Contract for Item {}",
-        )]);
-        assert!(
-            analyzer
-                .get_direct_ancestors(&definition(&analyzer, "Item"))
-                .is_empty()
-        );
-        let answer = analyzer.member_family(&definition(&analyzer, "Contract.run"), None);
-        assert_eq!(answer.outcome, MemberFamilyOutcome::Incomplete);
-        assert!(answer.edges.is_empty());
-    }
-
     #[test]
     fn canonical_primary_impls_preserve_ambiguous_member_source_links() {
         let (_fixture, analyzer) = analyzer_with_files(&[(
@@ -1816,7 +1569,6 @@ impl Contract for Item { fn run(&self) {} }
             assert!(answer.edges.is_empty());
         }
     }
-
     #[test]
     fn canonical_primary_impls_keep_malformed_member_evidence_incomplete() {
         let (_fixture, analyzer) = analyzer_with_files(&[(
@@ -1841,8 +1593,8 @@ impl Contract for Item {
             assert!(answer.edges.is_empty());
         }
     }
-
     #[test]
+    #[hardwon("30fd8a5b0c4e: a trait with a blanket impl answers unproven")]
     fn a_trait_with_a_blanket_impl_answers_unproven() {
         let (_fixture, analyzer) = analyzer_with_files(&[(
             "src/lib.rs",
@@ -1888,37 +1640,6 @@ impl Counted for Thing {
              in the workspace"
         );
     }
-
-    /// A blanket impl has no trait-implementation row and no unresolved-impl
-    /// row, so a trait-bounded walk never reads the file it is in unless that
-    /// is the trait's own file or a file one of the trait's rows names.
-    #[test]
-    #[ignore = "finds real bug: a blanket impl outside the trait's own file is invisible to the \
-                row-bounded member walk, so the family answers Proven"]
-    fn a_blanket_impl_in_another_file_answers_unproven() {
-        let (_fixture, analyzer) = analyzer_with_files(&[
-            ("src/lib.rs", "pub mod marker;\npub mod blanket;\n"),
-            (
-                "src/marker.rs",
-                "pub trait Marker {\n    fn mark(&self) -> u32;\n}\n",
-            ),
-            (
-                "src/blanket.rs",
-                "use crate::marker::Marker;\n\
-                 impl<T: Clone> Marker for T {\n    fn mark(&self) -> u32 {\n        0\n    }\n}\n",
-            ),
-        ]);
-
-        let mark = definition(&analyzer, "marker.Marker.mark");
-        let answer = analyzer.member_family(&mark, None);
-        assert!(
-            !answer.is_proven(),
-            "a blanket impl outside the trait's file still covers types no \
-             workspace scan enumerates"
-        );
-        assert!(answer.edges.is_empty());
-    }
-
     #[test]
     fn canonical_macro_hierarchy_keeps_raw_direct_item_admission() {
         for invocation in ["generate!", "qualified::generate!", "println!"] {
@@ -1946,12 +1667,6 @@ impl Counted for Thing {
             );
         }
     }
-
-    /// Replay admits only direct-item invocations, so none of these impls is
-    /// ever an edge. The item-level ones are still accounted for: each macro
-    /// is visible nowhere, its tokens write the trait's name, and its
-    /// expansion could declare an impl of it, so the trait is not enumerable.
-    /// A function-local invocation is not at an item position.
     #[test]
     fn canonical_macro_hierarchy_does_not_promote_other_positions_or_nested_replays() {
         for (source, proven) in [
@@ -1978,12 +1693,8 @@ impl Counted for Thing {
             assert!(answer.edges.is_empty());
         }
     }
-
-    /// tract's `element_wise!(..);`: a macro whose body writes an impl of the
-    /// trait, invoked at statement position in a file that holds an ordinary
-    /// impl of it. Every ordinary impl is a row, and replay does not see the
-    /// generated one, so only the invocation says the set is not complete.
     #[test]
+    #[hardwon("22d50c49f717: a statement position item macro beside an impl answers unproven")]
     fn a_statement_position_item_macro_beside_an_impl_answers_unproven() {
         let (_fixture, analyzer) = analyzer_with_files(&[
             ("src/lib.rs", "#[macro_use]\npub mod ops;\npub mod math;\n"),
@@ -2031,13 +1742,8 @@ mini_op!(Abs);
         let member = member_in_impl(&analyzer, "math.Real.name", "impl MiniOp for Real");
         assert!(!analyzer.member_family(&member, None).is_proven());
     }
-
-    /// Bifrost's `impl_forward_query_provider!(XAnalyzer);`: the macro's rules
-    /// write the impl, and it is invoked, qualified, from files that never
-    /// write the trait's name. The defining file writes it inside the
-    /// macro's token tree, which is what brings the invoking files into the
-    /// walk, in either delimiter form.
     #[test]
+    #[hardwon("22d50c49f717: a macro invoked where the trait is never named answers unproven")]
     fn a_macro_invoked_where_the_trait_is_never_named_answers_unproven() {
         for invocation in ["crate::mini_op!(Abs);", "crate::mini_op! { Abs }"] {
             let (_fixture, analyzer) = analyzer_with_files(&[
@@ -2070,11 +1776,8 @@ macro_rules! mini_op {
             assert!(answer.edges.is_empty());
         }
     }
-
-    /// A file joins the walk because some token tree in it writes the trait's
-    /// name. An item macro whose own input does not write it, and whose macro
-    /// is not one that brought the file here, cannot name the trait.
     #[test]
+    #[hardwon("22d50c49f717: only an item macro whose input names the trait counts")]
     fn only_an_item_macro_whose_input_names_the_trait_counts() {
         for (item_macro, proven) in [
             ("other!(pub struct Unrelated;);", true),
@@ -2101,12 +1804,8 @@ macro_rules! mini_op {
             assert_eq!(answer.is_proven(), proven, "{item_macro}: {answer:?}");
         }
     }
-
-    /// A file joins the walk because it writes a macro's name, and that is
-    /// all it says about that one macro: an unqualified invocation of another
-    /// macro there cannot be it. A qualified invocation's macro has no
-    /// recorded name, so it could be.
     #[test]
+    #[hardwon("22d50c49f717: an invoking file counts only invocations that could be the macro")]
     fn an_invoking_file_counts_only_invocations_that_could_be_the_macro() {
         for (other, proven) in [("other!(Abs);", true), ("crate::other!(Abs);", false)] {
             let tool = format!("pub fn mini_op() {{}}\n{other}\n");
@@ -2144,12 +1843,8 @@ macro_rules! mini_op {
             assert_eq!(answer.is_proven(), proven, "{other}: {answer:?}");
         }
     }
-
-    /// A decorating passthrough replays its arguments under its `cfg`. When
-    /// no crate that places the file activates that `cfg`, an impl among the
-    /// arguments is not compiled and says nothing about the family; when one
-    /// does, it is uncertainty as any replayed impl is.
     #[test]
+    #[hardwon("04d101bf5cef: a statement position passthrough under an inactive cfg adds no impl")]
     fn a_statement_position_passthrough_under_an_inactive_cfg_adds_no_impl() {
         for (decoration, proven) in [("any()", true), ("all()", false)] {
             let lib = format!(
@@ -2186,12 +1881,8 @@ macro_rules! mini_op {
             }
         }
     }
-
-    /// A statement-position passthrough whose rules expand to their arguments
-    /// and nothing else adds no item, so it leaves the family enumerable even
-    /// where its arguments write the trait's name; an impl among its arguments
-    /// is uncertainty, never an edge.
     #[test]
+    #[hardwon("22d50c49f717: a statement position passthrough adds nothing beyond its arguments")]
     fn a_statement_position_passthrough_adds_nothing_beyond_its_arguments() {
         for (arguments, proven) in [
             (
@@ -2240,7 +1931,6 @@ macro_rules! mini_op {
             }
         }
     }
-
     #[test]
     fn canonical_macro_hierarchy_retains_primary_import_scope() {
         // `generate!` expands to its arguments and nothing else, so its
@@ -2265,7 +1955,6 @@ macro_rules! mini_op {
         );
         assert!(embedded.is_proven(), "{embedded:?}");
     }
-
     #[test]
     fn canonical_macro_hierarchy_does_not_reopen_source_in_frozen_query() {
         let (_fixture, analyzer) = analyzer_with_files(&[(
@@ -2289,8 +1978,8 @@ macro_rules! mini_op {
         assert_eq!(index.direct_ancestors.get(&target), Some(&vec![trait_unit]));
         assert!(scope.store_error().is_none());
     }
-
     #[test]
+    #[hardwon("30fd8a5b0c4e: a trait impl inside a macro makes that trait unproven")]
     fn a_trait_impl_inside_a_macro_makes_that_trait_unproven() {
         let (_fixture, analyzer) = analyzer_with_files(&[(
             "src/lib.rs",
@@ -2328,7 +2017,6 @@ generate! {
              the family must not claim to be exhaustive"
         );
     }
-
     #[test]
     fn a_malformed_trait_sibling_makes_a_known_method_unenumerable() {
         let (_fixture, analyzer) = analyzer_with_files(&[(
@@ -2357,36 +2045,6 @@ impl Contract for Item {
         );
         assert!(answer.edges.is_empty());
     }
-
-    #[test]
-    fn a_direct_macro_in_a_primary_trait_makes_members_unenumerable() {
-        let (_fixture, analyzer) = analyzer_with_files(&[(
-            "src/lib.rs",
-            r#"
-pub trait Contract {
-    fn known(&self);
-    generated!();
-}
-
-pub struct Item;
-
-impl Contract for Item {
-    fn known(&self) {}
-}
-"#,
-        )]);
-
-        let known = definition(&analyzer, "Contract.known");
-        let answer = analyzer.member_family(&known, None);
-        assert_eq!(
-            answer.outcome,
-            MemberFamilyOutcome::Incomplete,
-            "a direct trait-body macro can add unknown members: {:?}",
-            answer.reason
-        );
-        assert!(answer.edges.is_empty());
-    }
-
     #[test]
     fn an_embedded_trait_is_not_promoted_into_the_primary_method_table() {
         let (_fixture, analyzer) = analyzer_with_files(&[(
@@ -2423,7 +2081,6 @@ wrap! {
             brokk_bifrost_rust::hierarchy::RustMemberFamily::NotTracked
         ));
     }
-
     #[test]
     fn alternative_trait_declarations_do_not_certify_a_combined_method_table() {
         let (_fixture, analyzer) = analyzer_with_files(&[(
@@ -2456,12 +2113,6 @@ impl Contract for Item { fn known(&self) {} }
         );
         assert!(answer.edges.is_empty());
     }
-
-    /// A trait named through a re-exporting glob, the way tract names `Op`
-    /// through `use crate::internal::*`, is bound by crate derivation, which
-    /// follows the glob and the re-export; the header walk does not. The
-    /// member family takes such an impl from its crate row, so the trait's
-    /// family and the impl member's own family are both stated.
     #[test]
     fn an_impl_named_through_a_reexporting_glob_is_taken_from_its_row() {
         let (_fixture, analyzer) = analyzer_with_files(&[
@@ -2509,11 +2160,6 @@ impl Op for Gather {
             .collect();
         assert_eq!(implements, ["ops.Op.name"]);
     }
-
-    /// A member walk resolves only the impl headers spelled the way the
-    /// trait's rows spell it, so a trait implemented under an imported rename
-    /// and under its own name keeps both implementors, and an impl of another
-    /// trait in the same file is not one of them.
     #[test]
     fn a_trait_implemented_under_a_renamed_import_keeps_that_implementor() {
         let (_fixture, analyzer) = analyzer_with_files(&[
@@ -2567,13 +2213,6 @@ impl Greeter for Robot {
             ],
         );
     }
-
-    /// An impl written in a module that does not declare its self type gives
-    /// its members a parent that has no declaration in their file: the self
-    /// type is declared in `ruby/mod.rs` and reaches `ruby/imports.rs` through
-    /// `use super::*`, and the impl names its trait by a qualified path. That
-    /// parent is not a trait, so the member's family is the impl's trait's,
-    /// read over the trait's own files like any other.
     #[test]
     fn an_impl_outside_the_self_types_module_has_the_traits_family() {
         let (_fixture, analyzer) = analyzer_with_files(&[
@@ -2630,8 +2269,8 @@ impl crate::contracts::Source for RubyAnalyzer {
             .collect();
         assert_eq!(implements, ["contracts.Source.all_files"]);
     }
-
     #[test]
+    #[hardwon("30fd8a5b0c4e: a trait with no implementations has a complete empty family")]
     fn a_trait_with_no_implementations_has_a_complete_empty_family() {
         let (_fixture, analyzer) = analyzer_with_files(&[(
             "src/lib.rs",
@@ -2658,7 +2297,7 @@ pub trait Unused {
 mod cross_crate_tests {
     use super::tests::{analyzer_with_files, definition};
     use super::*;
-    use crate::analyzer::type_relations::TypeRelationKind;
+    use brokk_bifrost_test_macros::hardwon;
 
     /// The whole workspace's hierarchy facts, for fixtures that assert about
     /// the relation itself rather than about one question's answer.
@@ -2680,17 +2319,6 @@ mod cross_crate_tests {
         .expect("published fixture hierarchy")
     }
 
-    fn implements(analyzer: &RustAnalyzer, from: &str, to: &str) -> bool {
-        workspace_hierarchy(analyzer)
-            .relations
-            .iter()
-            .any(|relation| {
-                relation.from.fq_name() == from
-                    && relation.to.fq_name() == to
-                    && relation.kind == TypeRelationKind::TraitImplementation
-            })
-    }
-
     const CORE_MANIFEST: &str =
         "[package]\nname = \"core-crate\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
     const CORE_LIB: &str = "pub mod tool;\n";
@@ -2703,6 +2331,7 @@ pub trait Tool {
     /// The direct shape: a sibling workspace member names the trait through
     /// the declaring crate's own name.
     #[test]
+    #[hardwon("#2775: workspace crate identity was lost when resolving a sibling crate trait")]
     fn a_sibling_workspace_crates_trait_resolves_through_its_own_crate_name() {
         let (_fixture, analyzer) = analyzer_with_files(&[
             (
@@ -2733,7 +2362,11 @@ impl Tool for Add {
         ]);
 
         assert!(
-            implements(&analyzer, "app.Add", "core_crate.tool.Tool"),
+            hierarchy_has_trait_implementation_relation(
+                &workspace_hierarchy(&analyzer),
+                "app.Add",
+                "core_crate.tool.Tool",
+            ),
             "relations: {:?}",
             workspace_hierarchy(&analyzer).relations
         );
@@ -2743,6 +2376,7 @@ impl Tool for Add {
     /// glob-re-exports the crate that declares it, so `facade::tool` names a
     /// module of neither crate's physical layout.
     #[test]
+    #[hardwon("#2775: a facade re-export path failed to resolve the declaring crate trait")]
     fn a_trait_re_exported_by_a_facade_crate_resolves_through_the_facade_path() {
         let (_fixture, analyzer) = analyzer_with_files(&[
             (
@@ -2774,7 +2408,11 @@ impl Tool for Add {
         ]);
 
         assert!(
-            implements(&analyzer, "app.Add", "core_crate.tool.Tool"),
+            hierarchy_has_trait_implementation_relation(
+                &workspace_hierarchy(&analyzer),
+                "app.Add",
+                "core_crate.tool.Tool",
+            ),
             "relations: {:?}",
             workspace_hierarchy(&analyzer).relations
         );
@@ -2787,6 +2425,7 @@ impl Tool for Add {
     /// trait `other::tool::Tool` must not be answered by a same-named
     /// workspace trait.
     #[test]
+    #[hardwon("#2775: an external crate path incorrectly matched a same-named workspace trait")]
     fn a_trait_path_into_a_crate_outside_the_workspace_stays_unresolved() {
         let (_fixture, analyzer) = analyzer_with_files(&[
             (
@@ -2817,7 +2456,11 @@ impl Tool for Add {
         ]);
 
         assert!(
-            !implements(&analyzer, "app.Add", "core_crate.tool.Tool"),
+            !hierarchy_has_trait_implementation_relation(
+                &workspace_hierarchy(&analyzer),
+                "app.Add",
+                "core_crate.tool.Tool",
+            ),
             "a registry crate outside the workspace is a real external \
              boundary; a same-named workspace trait must not answer for it"
         );
@@ -2830,12 +2473,14 @@ impl Tool for Add {
 mod inline_module_tests {
     use super::tests::{analyzer_with_files, definition, family_edges};
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
 
     /// One unresolved impl inside `mod tests` is enough to make the trait
     /// unenumerable, so the trait's whole family stays unproven until the
     /// inline module's `use super::*` resolves against the module the impl is
     /// actually written in.
     #[test]
+    #[hardwon("#2775: an inline module glob import failed to resolve its parent trait")]
     fn an_impl_in_an_inline_module_resolves_the_trait_its_parent_declares() {
         let (_fixture, analyzer) = analyzer_with_files(&[(
             "src/tool.rs",
@@ -2882,6 +2527,7 @@ mod tests {
     /// A local declaration shadows the glob import, so the nearer name still
     /// wins and the glob route never turns one answer into an ambiguity.
     #[test]
+    #[hardwon("#2775: an inline declaration failed to shadow its glob import")]
     fn a_declaration_in_the_inline_module_shadows_the_glob_imported_one() {
         let (_fixture, analyzer) = analyzer_with_files(&[(
             "src/tool.rs",

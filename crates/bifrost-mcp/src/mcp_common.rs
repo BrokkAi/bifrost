@@ -2,13 +2,34 @@ use crate::{
     SearchToolsService, SearchToolsServiceError, SearchToolsServiceErrorCode, ToolOutput,
     searchtools_render::RenderOptions,
 };
-use serde::Serialize;
+use brokk_bifrost_analysis::analyzer::common::serialized_json_len;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+pub(crate) use brokk_bifrost_analysis::path_utils::contains_glob_syntax;
+
+pub(crate) fn absolute_path_outside_workspace_error(raw: &str, workspace_root: &Path) -> String {
+    format!(
+        "absolute path is outside active workspace: {} (workspace: {})",
+        raw,
+        workspace_root.display()
+    )
+}
+
+pub(crate) fn strip_workspace_root<'a>(
+    absolute_path: &'a str,
+    workspace_root: &str,
+) -> Option<&'a str> {
+    let root = workspace_root.trim_end_matches('/');
+    if absolute_path == root {
+        return Some("");
+    }
+    absolute_path.strip_prefix(&format!("{root}/"))
+}
 
 const GET_SUMMARIES_RESPONSE_BUDGET_BYTES: usize = 4_096;
 pub const MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV: &str = "BIFROST_MCP_REQUEST_BUDGET_SECS";
@@ -75,7 +96,7 @@ pub struct McpRenderOptions {
 impl Default for McpRenderOptions {
     fn default() -> Self {
         Self {
-            render_line_numbers: true,
+            render_line_numbers: RenderOptions::default().render_line_numbers,
         }
     }
 }
@@ -87,9 +108,16 @@ pub struct McpServerSpec {
     pub tool_descriptors: Vec<Value>,
 }
 
-pub(crate) fn mcp_analyzer_request_budget() -> Option<Duration> {
+/// Checks `BIFROST_MCP_REQUEST_BUDGET_SECS` once at server startup, so a bad
+/// value exits 1 before the first request. [`RequestBudget::resolve`] reads the
+/// value again per request and relies on this check having passed.
+pub(crate) fn validate_mcp_analyzer_request_budget_env() -> Result<(), String> {
+    mcp_analyzer_request_budget().map(|_| ())
+}
+
+fn mcp_analyzer_request_budget() -> Result<Option<Duration>, String> {
     mcp_analyzer_request_budget_secs(std::env::var(MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV).ok())
-        .map(Duration::from_secs)
+        .map(|seconds| seconds.map(Duration::from_secs))
 }
 
 /// The budget that bounds one accepted request, and the instant it expires.
@@ -114,12 +142,10 @@ impl RequestBudget {
         cold_workspace: bool,
         accepted_at: Instant,
     ) -> Option<Self> {
-        Self::with_configured(
-            mcp_analyzer_request_budget(),
-            tool_name,
-            cold_workspace,
-            accepted_at,
-        )
+        // Validated at startup, so a value that fails to parse here cannot occur.
+        let configured = mcp_analyzer_request_budget()
+            .expect("BIFROST_MCP_REQUEST_BUDGET_SECS was validated at server startup");
+        Self::with_configured(configured, tool_name, cold_workspace, accepted_at)
     }
 
     /// [`Self::resolve`] with the configured knob supplied by the caller, so
@@ -223,18 +249,21 @@ fn deadline_before_grace(accepted_at: Instant, deadline: Instant) -> Instant {
     deadline.checked_sub(grace).unwrap_or(deadline)
 }
 
-fn mcp_analyzer_request_budget_secs(value: Option<String>) -> Option<u64> {
-    let value = value?;
+fn mcp_analyzer_request_budget_secs(value: Option<String>) -> Result<Option<u64>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
     // A run that asked for a budget must never silently proceed without one:
     // an eval measuring latency against a typo'd budget measures nothing.
-    let seconds = value.parse::<u64>().unwrap_or_else(|_| {
-        panic!("{MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV} must be a positive integer, got {value:?}")
-    });
-    assert!(
-        seconds > 0,
-        "{MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV} must be a positive integer, got 0"
-    );
-    Some(seconds)
+    let seconds = value.parse::<u64>().map_err(|_| {
+        format!("{MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV} must be a positive integer, got {value:?}")
+    })?;
+    if seconds == 0 {
+        return Err(format!(
+            "{MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV} must be a positive integer, got 0"
+        ));
+    }
+    Ok(Some(seconds))
 }
 
 pub(crate) fn request_correlation_id(id: &Value) -> String {
@@ -319,6 +348,15 @@ pub fn run_stdio_server(
         diff_snapshot_object_dir,
         env!("CARGO_PKG_VERSION"),
     )
+}
+
+pub(crate) fn run_named_stdio_server(
+    root: PathBuf,
+    render_options: McpRenderOptions,
+    server_name: &str,
+) -> Result<(), String> {
+    let spec = crate::mcp_registry::resolve_server_spec(server_name)?;
+    run_stdio_server(Some(root), render_options, &spec, None)
 }
 
 pub(crate) fn file_watching_enabled(value: Option<&OsStr>) -> Result<bool, String> {
@@ -420,7 +458,7 @@ pub(crate) fn attach_run_policy_correlation_result(
     output
 }
 
-pub(crate) const UNBOUND_WORKSPACE_MESSAGE: &str = "Bifrost is not bound to a workspace. The MCP client must provide an approved filesystem root via roots/list or Codex sandbox-state metadata, or configure Bifrost with --root or BIFROST_WORKSPACE_ROOT.";
+pub(crate) const UNBOUND_WORKSPACE_MESSAGE: &str = "Bifrost is not bound to a workspace. The MCP client must provide an approved filesystem root via roots/list or Codex sandbox-state metadata, or the server must be started with --root <path>.";
 
 pub(crate) fn fit_get_summaries_output_to_budget(
     service: &SearchToolsService,
@@ -756,17 +794,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn file_watching_defaults_on_and_accepts_explicit_modes() {
-        assert!(file_watching_enabled(None).unwrap());
-        assert!(file_watching_enabled(Some(OsStr::new("on"))).unwrap());
-        assert!(!file_watching_enabled(Some(OsStr::new("off"))).unwrap());
-
-        let error = file_watching_enabled(Some(OsStr::new("disabled"))).unwrap_err();
-        assert!(error.contains(MCP_FILE_WATCHER_ENV), "{error}");
-        assert!(error.contains("on` or `off"), "{error}");
-    }
-
-    #[test]
     fn compact_summary_reuses_parent_aware_elements() {
         let structured = json!({
             "summaries": [{
@@ -789,73 +816,6 @@ mod tests {
         );
         assert_eq!(12, compact["files"][0]["loc"]);
         assert!(text.contains("src/Thing.java (12 lines)"), "{text}");
-    }
-
-    #[test]
-    fn compact_summary_leaves_symbol_targets_on_the_legacy_path() {
-        let structured = json!({
-            "summaries": [{
-                "label": "demo.Thing",
-                "path": "src/Thing.java",
-                "elements": [{
-                    "symbol": "demo.Thing",
-                    "kind": "class",
-                    "start_line": 3,
-                    "end_line": 12
-                }]
-            }]
-        });
-
-        assert!(compact_symbols_from_summaries(&structured).is_none());
-    }
-
-    #[test]
-    fn oversized_container_listing_is_truncated_to_budget() {
-        let entries = (0..200)
-            .map(|index| {
-                json!({
-                    "kind": "file",
-                    "name": format!("generated_file_{index:03}.rs"),
-                    "path": format!("src/generated/generated_file_{index:03}.rs"),
-                })
-            })
-            .collect::<Vec<_>>();
-        let mut structured = json!({
-            "summaries": [],
-            "listings": [{
-                "target": "src/generated",
-                "kind": "directory",
-                "entries": entries,
-                "total_entries": 200,
-                "truncated": false,
-            }],
-            "not_found": [],
-            "ambiguous": [],
-            "ambiguous_paths": [],
-            "degraded": false,
-            "degradation": null,
-        });
-        let original_bytes = serialized_json_len(&structured);
-
-        mark_listing_budget_degradation(&mut structured, original_bytes);
-        let structured = shrink_get_summaries_value_to_budget(structured);
-
-        assert!(
-            serialized_json_len(&structured) <= GET_SUMMARIES_RESPONSE_BUDGET_BYTES,
-            "{}",
-            serialized_json_len(&structured)
-        );
-        assert_eq!(true, structured["degraded"]);
-        assert_eq!(true, structured["listings"][0]["truncated"]);
-        assert_eq!(200, structured["listings"][0]["total_entries"]);
-        assert!(
-            structured["listings"][0]["entries"]
-                .as_array()
-                .is_some_and(|entries| entries.len() < 200)
-        );
-        let rendered = render_budgeted_get_summaries_text(&structured, None, true);
-        assert!(rendered.contains("Directory src/generated"), "{rendered}");
-        assert!(rendered.contains("of 200 entries"), "{rendered}");
     }
 }
 
@@ -1084,12 +1044,6 @@ fn rendered_text_for_output(output: &ToolOutput) -> Option<String> {
     }
 }
 
-fn serialized_json_len<T: Serialize>(value: &T) -> usize {
-    serde_json::to_vec(value)
-        .map(|bytes| bytes.len())
-        .unwrap_or(usize::MAX)
-}
-
 pub fn tool_descriptor(name: &str, description: &str, input_schema: Value) -> Value {
     json!({
         "name": name,
@@ -1198,8 +1152,10 @@ pub enum WeightThreshold {
 #[cfg(test)]
 mod shared_tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
+    #[hardwon("#1031: plugin package cwd was accepted as the analyzer workspace root")]
     fn file_uri_round_trips_native_absolute_paths() {
         let path = std::env::current_dir()
             .expect("current directory")
@@ -1209,6 +1165,7 @@ mod shared_tests {
     }
 
     #[test]
+    #[hardwon("#1067: Cursor's bare absolute workspace root was rejected")]
     fn absolute_native_workspace_root_is_accepted() {
         let path = std::env::current_dir()
             .expect("current directory")
@@ -1220,12 +1177,14 @@ mod shared_tests {
     }
 
     #[test]
+    #[hardwon("#1031: relative client roots could select the wrong workspace")]
     fn relative_native_workspace_root_is_rejected() {
         let error = client_root_to_path("workspace").unwrap_err();
         assert!(error.contains("invalid root URI `workspace`"), "{error}");
     }
 
     #[test]
+    #[hardwon("#1031: non-file client roots were not rejected at the workspace boundary")]
     fn file_uri_rejects_non_file_schemes() {
         let error = file_uri_to_path("https://example.com/workspace").unwrap_err();
         assert!(
@@ -1235,23 +1194,7 @@ mod shared_tests {
     }
 
     #[test]
-    fn request_budget_defaults_to_unbounded_and_opts_into_any_positive_deadline() {
-        assert_eq!(mcp_analyzer_request_budget_secs(None), None);
-        assert_eq!(
-            mcp_analyzer_request_budget_secs(Some("5".to_string())),
-            Some(5)
-        );
-        assert_eq!(
-            mcp_analyzer_request_budget_secs(Some(BENCHMARK_MCP_REQUEST_BUDGET_SECS.to_string())),
-            Some(BENCHMARK_MCP_REQUEST_BUDGET_SECS)
-        );
-        assert_eq!(
-            mcp_analyzer_request_budget_secs(Some("600".to_string())),
-            Some(600)
-        );
-    }
-
-    #[test]
+    #[hardwon("#3279: a configured request budget must override every fallback")]
     fn explicit_request_budget_wins_over_every_fallback() {
         let accepted_at = Instant::now();
         let configured_budget = Duration::from_secs(8);
@@ -1276,6 +1219,9 @@ mod shared_tests {
     }
 
     #[test]
+    #[hardwon(
+        "#3279: cold discovery and non-discovery requests received the wrong readiness budget"
+    )]
     fn interactive_reads_get_the_default_budget_warm_or_cold() {
         let accepted_at = Instant::now();
         for (tool_name, cold_workspace) in [
@@ -1298,9 +1244,17 @@ mod shared_tests {
                 accepted_at + DEFAULT_INTERACTIVE_REQUEST_BUDGET
             );
         }
+        let cold_non_discovery =
+            RequestBudget::with_configured(None, "scan_usages_by_location", true, accepted_at)
+                .expect("cold non-discovery reads stay bounded");
+        assert_eq!(
+            cold_non_discovery.deadline(),
+            accepted_at + COLD_WORKSPACE_REQUEST_BUDGET
+        );
     }
 
     #[test]
+    #[hardwon("#3279: cold non-discovery reads lost their fail-fast budget")]
     fn cold_non_discovery_reads_keep_the_fail_fast_budget() {
         let accepted_at = Instant::now();
         for tool_name in ["get_summaries", "scan_usages_by_reference", "usage_graph"] {
@@ -1315,6 +1269,7 @@ mod shared_tests {
     }
 
     #[test]
+    #[hardwon("#3351: policy request fallback must not bound serial workspace mutations")]
     fn mutation_tools_have_no_fallback_budget() {
         let accepted_at = Instant::now();
         for (tool_name, cold_workspace) in [
@@ -1335,6 +1290,7 @@ mod shared_tests {
     /// own tool deadline is not something the server can see. The bound sits
     /// below the 300-second deadline the issue measured.
     #[test]
+    #[hardwon("#3351: synchronous policy runs outlived the client's 300-second deadline")]
     fn synchronous_policy_runs_get_the_policy_budget() {
         let accepted_at = Instant::now();
         for cold_workspace in [false, true] {
@@ -1366,6 +1322,9 @@ mod shared_tests {
     }
 
     #[test]
+    #[hardwon(
+        "#3351: policy evaluation consumed the request deadline before its report was returned"
+    )]
     fn only_policy_runs_stop_their_analyzer_before_the_request_deadline() {
         let accepted_at = Instant::now();
         let deadline = accepted_at + Duration::from_secs(240);
@@ -1403,18 +1362,7 @@ mod shared_tests {
     }
 
     #[test]
-    #[should_panic(expected = "BIFROST_MCP_REQUEST_BUDGET_SECS must be a positive integer")]
-    fn request_budget_rejects_unparseable_values_loudly() {
-        mcp_analyzer_request_budget_secs(Some("invalid".to_string()));
-    }
-
-    #[test]
-    #[should_panic(expected = "BIFROST_MCP_REQUEST_BUDGET_SECS must be a positive integer")]
-    fn request_budget_rejects_zero_loudly() {
-        mcp_analyzer_request_budget_secs(Some("0".to_string()));
-    }
-
-    #[test]
+    #[hardwon("#1296: oversized MCP request ids made deadline diagnostics unbounded")]
     fn oversized_request_ids_produce_bounded_log_safe_correlation_ids() {
         let first = request_correlation_id(&Value::String("x".repeat(1024 * 1024)));
         let second = request_correlation_id(&Value::String("y".repeat(1024 * 1024)));
@@ -1430,26 +1378,108 @@ mod shared_tests {
     }
 
     #[test]
-    fn server_spec_rejects_oversized_discovery_metadata() {
-        let schema = json_schema_object(&[]);
-        let instruction_error = build_server_spec(
-            "x".repeat(MCP_DISCOVERY_TEXT_MAX_CHARS + 1),
-            vec![tool_descriptor("small", "Small tool.", schema.clone())],
-        )
-        .expect_err("oversized instructions must fail");
-        assert!(instruction_error.contains("server instructions"));
-        assert!(instruction_error.contains("2001"));
+    fn compact_summary_leaves_symbol_targets_on_the_legacy_path() {
+        let structured = json!({
+            "summaries": [{
+                "label": "demo.Thing",
+                "path": "src/Thing.java",
+                "elements": [{
+                    "symbol": "demo.Thing",
+                    "kind": "class",
+                    "start_line": 3,
+                    "end_line": 12
+                }]
+            }]
+        });
 
-        let description_error = build_server_spec(
-            "Small server.",
-            vec![tool_descriptor(
-                "oversized_tool",
-                &"x".repeat(MCP_DISCOVERY_TEXT_MAX_CHARS + 1),
-                schema,
-            )],
-        )
-        .expect_err("oversized tool description must fail");
-        assert!(description_error.contains("`oversized_tool`"));
-        assert!(description_error.contains("2001"));
+        assert!(compact_symbols_from_summaries(&structured).is_none());
+    }
+
+    #[test]
+    fn oversized_container_listing_is_truncated_to_budget() {
+        let entries = (0..200)
+            .map(|index| {
+                json!({
+                    "kind": "file",
+                    "name": format!("generated_file_{index:03}.rs"),
+                    "path": format!("src/generated/generated_file_{index:03}.rs"),
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut structured = json!({
+            "summaries": [],
+            "listings": [{
+                "target": "src/generated",
+                "kind": "directory",
+                "entries": entries,
+                "total_entries": 200,
+                "truncated": false,
+            }],
+            "not_found": [],
+            "ambiguous": [],
+            "ambiguous_paths": [],
+            "degraded": false,
+            "degradation": null,
+        });
+        let original_bytes = serialized_json_len(&structured);
+
+        mark_listing_budget_degradation(&mut structured, original_bytes);
+        let structured = shrink_get_summaries_value_to_budget(structured);
+
+        assert!(
+            serialized_json_len(&structured) <= GET_SUMMARIES_RESPONSE_BUDGET_BYTES,
+            "{}",
+            serialized_json_len(&structured)
+        );
+        assert_eq!(true, structured["degraded"]);
+        assert_eq!(true, structured["listings"][0]["truncated"]);
+        assert_eq!(200, structured["listings"][0]["total_entries"]);
+        assert!(
+            structured["listings"][0]["entries"]
+                .as_array()
+                .is_some_and(|entries| entries.len() < 200)
+        );
+        let rendered = render_budgeted_get_summaries_text(&structured, None, true);
+        assert!(rendered.contains("Directory src/generated"), "{rendered}");
+        assert!(rendered.contains("of 200 entries"), "{rendered}");
+    }
+
+    #[test]
+    #[hardwon("e94b47fdc24e: default 5-second MCP budget timed out cold workspaces")]
+    fn request_budget_defaults_to_unbounded_and_opts_into_any_positive_deadline() {
+        assert_eq!(mcp_analyzer_request_budget_secs(None), Ok(None));
+        assert_eq!(
+            mcp_analyzer_request_budget_secs(Some("5".to_string())),
+            Ok(Some(5))
+        );
+        assert_eq!(
+            mcp_analyzer_request_budget_secs(Some(BENCHMARK_MCP_REQUEST_BUDGET_SECS.to_string())),
+            Ok(Some(BENCHMARK_MCP_REQUEST_BUDGET_SECS))
+        );
+        assert_eq!(
+            mcp_analyzer_request_budget_secs(Some("600".to_string())),
+            Ok(Some(600))
+        );
+    }
+
+    #[test]
+    #[hardwon("e94b47fdc24e: invalid MCP budget configuration was silently accepted")]
+    fn request_budget_rejects_unparseable_values_at_startup() {
+        assert_eq!(
+            mcp_analyzer_request_budget_secs(Some("invalid".to_string())),
+            Err(
+                "BIFROST_MCP_REQUEST_BUDGET_SECS must be a positive integer, got \"invalid\""
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    #[hardwon("e94b47fdc24e: zero MCP budget configuration was silently accepted")]
+    fn request_budget_rejects_zero_at_startup() {
+        assert_eq!(
+            mcp_analyzer_request_budget_secs(Some("0".to_string())),
+            Err("BIFROST_MCP_REQUEST_BUDGET_SECS must be a positive integer, got 0".to_string())
+        );
     }
 }

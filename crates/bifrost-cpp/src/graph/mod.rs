@@ -26,6 +26,16 @@ use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, ProjectFile, Range};
 use std::collections::BTreeSet;
 
+pub(super) fn cpp_namespace_path_is_ordered_subsequence(
+    namespace: &[String],
+    owner_scope: &[String],
+) -> bool {
+    let mut owner_components = owner_scope.iter();
+    namespace
+        .iter()
+        .all(|component| owner_components.any(|candidate| candidate == component))
+}
+
 /// The workspace-wide questions a C++ scan asks of the *dispatching* analyzer
 /// rather than of the C++ analyzer.
 ///

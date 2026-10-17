@@ -1,20 +1,24 @@
 use std::{collections::HashSet, error::Error, fmt};
 
 use crate::analyzer::semantic::{
-    EvidenceCompleteness, IcfgEdgeKind, IcfgProvider, ProcedureHandle, ProofStatus, SemanticBudget,
-    ValueFlowRelationKind,
+    AccessPathRoot, CaptureMode, CaptureSource, EvidenceCompleteness, IcfgEdgeId, IcfgEdgeKind,
+    IcfgNodeId, IcfgProvider, IcfgSnapshot, OracleCallContext, OracleLimits, ProcedureHandle,
+    ProcedurePortHandle, ProofStatus, SemanticBudget, ValueFlowRelationKind,
 };
 use crate::dataflow::{
-    DataflowEdge, DataflowOutput, DataflowRequest, DistributiveDataflowProblem,
-    ReusableSummaryProvider, SummaryDataflowError, SummarySolveInput, WitnessRetentionLimits,
+    BoundedSnapshotDataflowProblem, DataflowEdge, DataflowOutput, DataflowRequest, DataflowSeed,
+    DistributiveDataflowProblem, ReusableSummaryProvider, SolverBudgetExceeded, SolverWork,
+    SummaryDataflowError, SummarySolveInput, WitnessRetentionLimits,
     solve_with_reusable_end_summaries, solve_with_reusable_root_and_end_summaries,
     solve_with_summaries,
 };
 
 use super::plan::CallFlowRuleKind;
 use super::{
-    ValueFlowCarrierId, ValueFlowPlan, ValueFlowSinkId, ValueFlowSourceId, ValueFlowSummaryResult,
+    ValueFlowCarrier, ValueFlowCarrierId, ValueFlowPlan, ValueFlowSinkId, ValueFlowSourceId,
+    ValueFlowSummaryResult,
 };
+use crate::hash::HashMap;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ValueFlowUncertainty(u8);
@@ -28,6 +32,10 @@ impl ValueFlowUncertainty {
 
     pub const fn is_empty(self) -> bool {
         self.0 == 0
+    }
+
+    pub const fn is_uncertain(self) -> bool {
+        !self.is_empty()
     }
 
     pub(crate) const fn with_semantic(self) -> Self {
@@ -46,7 +54,7 @@ impl ValueFlowUncertainty {
         }
     }
 
-    pub(crate) fn with_quality(
+    pub(crate) const fn with_quality(
         self,
         proof: &ProofStatus,
         completeness: &EvidenceCompleteness,
@@ -167,11 +175,7 @@ impl ActiveFlow {
         proof: &ProofStatus,
         completeness: &EvidenceCompleteness,
     ) -> Self {
-        if !matches!(proof, ProofStatus::Proven)
-            || !matches!(completeness, EvidenceCompleteness::Complete)
-        {
-            self.uncertainty = self.uncertainty.with_semantic();
-        }
+        self.uncertainty = self.uncertainty.with_quality(proof, completeness);
         self
     }
 
@@ -186,11 +190,50 @@ impl ActiveFlow {
 /// Fact-only direct/indirect value-flow client over one immutable plan.
 pub struct ValueFlowProblem<'plan> {
     plan: &'plan ValueFlowPlan,
+    snapshot: Option<SnapshotValueFlow>,
+    summary_captures: Option<SummaryCaptureAssociations>,
 }
 
 impl<'plan> ValueFlowProblem<'plan> {
     pub const fn new(plan: &'plan ValueFlowPlan) -> Self {
-        Self { plan }
+        Self {
+            plan,
+            snapshot: None,
+            summary_captures: None,
+        }
+    }
+
+    /// Prepare query-local contextual capture transfers for one frozen ICFG.
+    /// Summary-only construction stays context independent; this constructor
+    /// binds exact edge identities and root seeds for the bounded runner.
+    fn for_snapshot(
+        plan: &'plan ValueFlowPlan,
+        snapshot: &IcfgSnapshot,
+        request: &mut DataflowRequest<'_>,
+    ) -> Result<Self, ValueFlowSolveError> {
+        let capture_edges = argument_capture_edges(plan, snapshot, request)?;
+        let mut seeds = Vec::new();
+        for id in snapshot.node_ids() {
+            charge_capture_projection(request)?;
+            let node = snapshot.node(id).expect("snapshot node ID");
+            if node.point().procedure() == plan.root()
+                && node.point().id() == plan.root().semantics().entry_point()
+                && node.call_context().is_empty()
+            {
+                seeds.push(id);
+            }
+        }
+        if seeds.is_empty() {
+            return Err(ValueFlowSolveError::RootMismatch);
+        }
+        Ok(Self {
+            plan,
+            summary_captures: None,
+            snapshot: Some(SnapshotValueFlow {
+                capture_edges,
+                seeds,
+            }),
+        })
     }
 
     fn active_before_point(
@@ -212,39 +255,48 @@ impl<'plan> ValueFlowProblem<'plan> {
                 uncertainty,
             });
         }
-        let mut generated = Vec::new();
-        for source in self
-            .plan
-            .sources_at(point, super::ValueFlowObservationPhase::BeforeEffects)
-        {
-            match source.activation_triggers.as_deref() {
-                None if is_zero => {
-                    generated.push(ActiveFlow {
-                        source: source.id,
-                        carrier: source.carrier,
-                        uncertainty: quality_uncertainty(
-                            source.spec.proof(),
-                            source.spec.completeness(),
-                        ),
-                    });
-                }
-                Some(triggers) if !is_zero => {
-                    generated.extend(conditional_source_flows(
-                        source.id,
-                        source.carrier,
-                        triggers,
-                        active.iter().copied(),
-                        source.spec.proof(),
-                        source.spec.completeness(),
-                    ));
-                }
-                None | Some(_) => {}
-            }
-        }
+        let generated = self.source_flows_at(
+            point,
+            super::ValueFlowObservationPhase::BeforeEffects,
+            is_zero,
+            &active,
+        );
         active.extend(generated);
         active.sort_unstable();
         active.dedup();
         active
+    }
+
+    fn source_flows_at(
+        &self,
+        point: &crate::analyzer::semantic::ProgramPointHandle,
+        phase: super::ValueFlowObservationPhase,
+        is_zero: bool,
+        active: &[ActiveFlow],
+    ) -> Vec<ActiveFlow> {
+        let mut generated = Vec::new();
+        for source in self.plan.sources_at(point, phase) {
+            match source.activation_triggers.as_deref() {
+                None if is_zero => generated.push(ActiveFlow {
+                    source: source.id,
+                    carrier: source.carrier,
+                    uncertainty: quality_uncertainty(
+                        source.spec.proof(),
+                        source.spec.completeness(),
+                    ),
+                }),
+                Some(triggers) if !is_zero => generated.extend(conditional_source_flows(
+                    source.id,
+                    source.carrier,
+                    triggers,
+                    active.iter().copied(),
+                    source.spec.proof(),
+                    source.spec.completeness(),
+                )),
+                None | Some(_) => {}
+            }
+        }
+        generated
     }
 
     fn apply_point(
@@ -267,41 +319,19 @@ impl<'plan> ValueFlowProblem<'plan> {
         for rule in self.plan.local_rule_views(point) {
             apply_local_rule(&mut active, rule);
         }
-        let mut generated = Vec::new();
-        for source in self
-            .plan
-            .sources_at(point, super::ValueFlowObservationPhase::AfterEffects)
-        {
-            match source.activation_triggers.as_deref() {
-                None if matches!(fact.0, ValueFlowFactKind::Zero) => {
-                    generated.push(ActiveFlow {
-                        source: source.id,
-                        carrier: source.carrier,
-                        uncertainty: quality_uncertainty(
-                            source.spec.proof(),
-                            source.spec.completeness(),
-                        ),
-                    });
-                }
-                Some(triggers) if !matches!(fact.0, ValueFlowFactKind::Zero) => {
-                    generated.extend(conditional_source_flows(
-                        source.id,
-                        source.carrier,
-                        triggers,
-                        active.iter().copied(),
-                        source.spec.proof(),
-                        source.spec.completeness(),
-                    ));
-                }
-                None | Some(_) => {}
-            }
-        }
+        let mut active = active.into_iter().collect::<Vec<_>>();
+        let generated = self.source_flows_at(
+            point,
+            super::ValueFlowObservationPhase::AfterEffects,
+            matches!(fact.0, ValueFlowFactKind::Zero),
+            &active,
+        );
         // Evaluate every conditional source against the incoming active set.
         // Extending only after this loop prevents a source generated here from
         // recursively activating another source at the same point.
         active.extend(generated);
-        let mut active = active.into_iter().collect::<Vec<_>>();
         active.sort_unstable();
+        active.dedup();
         self.append_meetings(
             point,
             super::ValueFlowObservationPhase::AfterEffects,
@@ -360,32 +390,62 @@ impl<'plan> ValueFlowProblem<'plan> {
     ) {
         let mut meetings = Vec::new();
         let active = self.apply_point(edge.source(), fact, &mut meetings);
-        let Some(transfer) = edge.call_transfer() else {
+        let Some(call) = edge.origin() else {
             self.emit_all(Vec::new(), meetings, out);
             return;
         };
+        let callee = edge.target().procedure();
         let mut mapped = Vec::new();
+        let capture_rows = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| {
+                edge.snapshot_edge()
+                    .and_then(|id| snapshot.capture_edges.get(&id))
+            })
+            .or_else(|| {
+                let context = edge.call_context()?;
+                if context.was_truncated() {
+                    return None;
+                }
+                self.summary_captures
+                    .as_ref()?
+                    .get(&(call.clone(), edge.kind()))?
+                    .get(callee)?
+                    .get(context)
+            });
         for flow in active {
-            if self.plan.is_callee_port(flow.carrier, &transfer.callee)
+            if let Some(rows) = capture_rows {
+                for (source, target) in rows {
+                    if flow.carrier == *source {
+                        mapped.push(ActiveFlow {
+                            carrier: *target,
+                            uncertainty: flow.uncertainty.with_semantic(),
+                            ..flow
+                        });
+                    }
+                }
+            }
+            if self.plan.is_callee_port(flow.carrier, callee)
                 && !self
                     .plan
-                    .call_rules_to_target(
-                        &transfer.origin,
-                        &transfer.callee,
+                    .call_rules_to_target_in_context(
+                        call,
+                        callee,
                         CallFlowRuleKind::Call,
                         flow.carrier,
+                        edge.call_context(),
                     )
-                    .any(|rule| {
-                        self.plan
-                            .is_default_argument_carrier(rule.source, &transfer.callee)
-                    })
+                    .any(|rule| self.plan.is_default_argument_carrier(rule.source, callee))
             {
                 mapped.push(flow);
             }
-            for rule in
-                self.plan
-                    .call_rules(&transfer.origin, &transfer.callee, CallFlowRuleKind::Call)
-            {
+            for rule in self.plan.call_rules_in_context(
+                call,
+                callee,
+                CallFlowRuleKind::Call,
+                edge.call_context(),
+            ) {
                 if flow.carrier == rule.source {
                     mapped.push(ActiveFlow {
                         carrier: rule.target,
@@ -401,11 +461,8 @@ impl<'plan> ValueFlowProblem<'plan> {
             // only for the call rule that explicitly binds the default.
             for rule in self
                 .plan
-                .call_rules(&transfer.origin, &transfer.callee, CallFlowRuleKind::Call)
-                .filter(|rule| {
-                    self.plan
-                        .is_default_argument_carrier(rule.source, &transfer.callee)
-                })
+                .call_rules_in_context(call, callee, CallFlowRuleKind::Call, edge.call_context())
+                .filter(|rule| self.plan.is_default_argument_carrier(rule.source, callee))
             {
                 for phase in [
                     super::ValueFlowObservationPhase::BeforeEffects,
@@ -453,14 +510,47 @@ impl<'plan> ValueFlowProblem<'plan> {
         };
         let callee = edge.source().procedure();
         let mut mapped = Vec::new();
-        for flow in active {
-            for rule in self.plan.call_rules(call, callee, kind) {
-                if flow.carrier == rule.source {
-                    mapped.push(ActiveFlow {
-                        carrier: rule.target,
-                        ..flow.with_transfer_quality(&rule.proof, &rule.completeness)
-                    });
+        let capture_rows = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| {
+                edge.snapshot_edge()
+                    .and_then(|id| snapshot.capture_edges.get(&id))
+            })
+            .or_else(|| {
+                let context = edge.call_context()?;
+                if context.was_truncated() {
+                    return None;
                 }
+                self.summary_captures
+                    .as_ref()?
+                    .get(&(call.clone(), edge.kind()))?
+                    .get(callee)?
+                    .get(context)
+            });
+        for flow in active {
+            if let Some(rows) = capture_rows {
+                for (source, target) in rows {
+                    if flow.carrier == *source {
+                        mapped.push(ActiveFlow {
+                            carrier: *target,
+                            uncertainty: flow.uncertainty.with_semantic(),
+                            ..flow
+                        });
+                    }
+                }
+            }
+            for rule in self.plan.call_rules_from_source_in_context(
+                call,
+                callee,
+                kind,
+                flow.carrier,
+                edge.call_context(),
+            ) {
+                mapped.push(ActiveFlow {
+                    carrier: rule.target,
+                    ..flow.with_transfer_quality(&rule.proof, &rule.completeness)
+                });
             }
         }
         self.emit_all(mapped, meetings, out);
@@ -562,6 +652,445 @@ fn apply_local_rule(active: &mut HashSet<ActiveFlow>, rule: super::plan::LocalRu
     active.extend(generated);
 }
 
+/// Query-local bounded forward value-flow evidence. Plan discovery and ICFG
+/// coverage remain separate and both are required for a complete result.
+#[derive(Debug, Clone)]
+pub struct ValueFlowSnapshotResult {
+    raw: crate::dataflow::DataflowResult<ValueFlowFact>,
+    discovery_complete: bool,
+    work: SolverWork,
+}
+
+impl ValueFlowSnapshotResult {
+    pub const fn work(&self) -> SolverWork {
+        self.work
+    }
+
+    pub const fn raw(&self) -> &crate::dataflow::DataflowResult<ValueFlowFact> {
+        &self.raw
+    }
+    pub fn is_complete(&self) -> bool {
+        self.discovery_complete && self.raw.is_complete()
+    }
+}
+
+/// Solve forward over the supplied bounded snapshot. Construction and solving
+/// stay together so dense contextual edge IDs cannot escape into another input.
+pub fn solve_value_flow_on_snapshot(
+    plan: &ValueFlowPlan,
+    input: crate::dataflow::IcfgSolveInput<'_>,
+    request: &mut DataflowRequest<'_>,
+) -> Result<ValueFlowSnapshotResult, ValueFlowSolveError> {
+    if plan.has_contextual_bindings() {
+        return Err(ValueFlowSolveError::CallContextRequired);
+    }
+    let initial_work = request.budget.used();
+    let problem = ValueFlowProblem::for_snapshot(plan, input.snapshot(), request)?;
+    let raw = crate::dataflow::solve_on_snapshot(input, &problem, request)?;
+    Ok(ValueFlowSnapshotResult {
+        raw,
+        discovery_complete: plan.discovery_complete(),
+        work: request.budget.used().saturating_sub(initial_work),
+    })
+}
+
+type CaptureCarrierPairs = Vec<(ValueFlowCarrierId, ValueFlowCarrierId)>;
+type SummaryCaptureAssociations =
+    HashMap<(crate::analyzer::semantic::CallSiteHandle, IcfgEdgeKind), SummaryCaptureTargets>;
+type SummaryCaptureTargets =
+    HashMap<ProcedureHandle, HashMap<OracleCallContext, CaptureCarrierPairs>>;
+
+struct SnapshotValueFlow {
+    capture_edges: HashMap<IcfgEdgeId, Vec<(ValueFlowCarrierId, ValueFlowCarrierId)>>,
+    seeds: Vec<IcfgNodeId>,
+}
+
+impl BoundedSnapshotDataflowProblem for ValueFlowProblem<'_> {
+    fn seeds(&self, out: &mut dyn DataflowOutput<DataflowSeed<Self::Fact>>) {
+        if let Some(snapshot) = &self.snapshot {
+            for node in &snapshot.seeds {
+                if !out.emit(DataflowSeed::new(*node, ValueFlowFact::ZERO)) {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+pub(crate) enum CaptureProjectionError {
+    Cancelled,
+    ExceededBudget(SolverBudgetExceeded),
+}
+
+/// Preserve already represented member storage beneath an exact capture cell.
+/// Member identity uses the shared call-location selector respelling. Typed
+/// constant indexes can cross procedures; incomplete or absent paths cannot.
+fn capture_carrier_transports(
+    plan: &ValueFlowPlan,
+    source: ValueFlowCarrierId,
+    target: ValueFlowCarrierId,
+    request: &mut DataflowRequest<'_>,
+) -> Result<Vec<(ValueFlowCarrierId, ValueFlowCarrierId)>, CaptureProjectionError> {
+    let mut rows = vec![(source, target)];
+    let (Some(ValueFlowCarrier::Location(cell)), Some(ValueFlowCarrier::Port(port))) =
+        (plan.carrier(source), plan.carrier(target))
+    else {
+        return Ok(rows);
+    };
+    let AccessPathRoot::LexicalCell(owner) = cell.path().root() else {
+        return Ok(rows);
+    };
+    if !cell.path().selectors().is_empty() || !cell.path().is_exact() {
+        return Ok(rows);
+    }
+    for carrier in plan.carriers() {
+        charge_capture_projection(request)?;
+        let ValueFlowCarrier::Location(location) = carrier else {
+            continue;
+        };
+        if !location.path().is_exact()
+            || !matches!(location.path().root(), AccessPathRoot::CaptureSlot(slot) if slot == port)
+        {
+            continue;
+        }
+        let target = plan
+            .carrier_id(carrier)
+            .expect("an enumerated carrier is retained");
+        for candidate in plan.carriers() {
+            charge_capture_projection(request)?;
+            let ValueFlowCarrier::Location(projected) = candidate else {
+                continue;
+            };
+            request
+                .budget
+                .charge(SolverWork {
+                    callback_rows: location.path().selectors().len(),
+                    ..SolverWork::default()
+                })
+                .map_err(CaptureProjectionError::ExceededBudget)?;
+            if !super::plan::is_capture_location_projection(
+                cell,
+                projected,
+                location,
+                owner.procedure(),
+            ) {
+                continue;
+            }
+            let source = plan
+                .carrier_id(candidate)
+                .expect("an enumerated carrier is retained");
+            let mut proven = true;
+            for (procedure, carrier) in [(owner.procedure(), source), (port.procedure(), target)] {
+                let mut retained = false;
+                for point in procedure.semantics().points() {
+                    charge_capture_projection(request)?;
+                    let point = procedure
+                        .point_handle(point.id)
+                        .expect("retained capture point");
+                    for rule in plan.local_rules_at(&point) {
+                        charge_capture_projection(request)?;
+                        retained |= (rule.source == carrier || rule.target == carrier)
+                            && rule.proof == ProofStatus::Proven
+                            && rule.completeness == EvidenceCompleteness::Complete;
+                    }
+                }
+                proven &= retained;
+            }
+            if !proven {
+                continue;
+            }
+            rows.push((source, target));
+        }
+    }
+    Ok(rows)
+}
+
+pub(crate) fn argument_capture_edges(
+    plan: &ValueFlowPlan,
+    snapshot: &IcfgSnapshot,
+    request: &mut DataflowRequest<'_>,
+) -> Result<
+    HashMap<IcfgEdgeId, Vec<(ValueFlowCarrierId, ValueFlowCarrierId)>>,
+    CaptureProjectionError,
+> {
+    let mut capture_edges: HashMap<IcfgEdgeId, Vec<(ValueFlowCarrierId, ValueFlowCarrierId)>> =
+        HashMap::default();
+    // These indexes live only for this bounded solve. Edge IDs retain the
+    // full frozen context, so two callers of one Invoke cannot share rows.
+    if request.cancellation.is_cancelled() {
+        // The snapshot solver publishes the existing typed Cancelled result.
+        return Ok(capture_edges);
+    }
+    let mut entries = HashMap::default();
+    for (index, edge) in snapshot.edges().iter().enumerate() {
+        charge_capture_projection(request)?;
+        if edge.kind != IcfgEdgeKind::Call {
+            continue;
+        }
+        let target = snapshot.node(edge.target).expect("snapshot edge target");
+        request
+            .budget
+            .charge(SolverWork {
+                callback_rows: target.call_context().len(),
+                ..SolverWork::default()
+            })
+            .map_err(CaptureProjectionError::ExceededBudget)?;
+        let key = (
+            target.point().procedure().clone(),
+            target.call_context().to_vec(),
+        );
+        let id = IcfgEdgeId::new(u32::try_from(index).expect("snapshot edge ID"));
+        entries
+            .entry(key)
+            .and_modify(|entry| *entry = None)
+            .or_insert(Some(id));
+    }
+    for (index, edge) in snapshot.edges().iter().enumerate() {
+        charge_capture_projection(request)?;
+        if edge.kind != IcfgEdgeKind::Call {
+            continue;
+        }
+        let node = snapshot.node(edge.target).expect("snapshot edge target");
+        let Some(proof) = node.argument_callable() else {
+            continue;
+        };
+        let context = node.call_context();
+        // This consumer handles a direct actual/formal callback call. A
+        // relay or truncated suffix is a different contract, not a guess.
+        // Factory environments require an exact producer-return projection;
+        // their storage is never substituted with a direct caller cell.
+        if context.len() < 2
+            || context[context.len() - 2] != *proof.entering_call()
+            || edge.origin.as_ref() != context.last()
+            || edge.origin.as_ref().map(|call| call.procedure()) != Some(proof.callee())
+            || node.point().procedure() != proof.closure()
+            || (proof.producer().is_none()
+                && proof.creation().procedure() != proof.entering_call().procedure())
+            || proof.caller_context().was_truncated()
+            || context[..context.len() - 2] != *proof.caller_context().calls()
+        {
+            continue;
+        }
+        request
+            .budget
+            .charge(SolverWork {
+                callback_rows: context.len(),
+                ..SolverWork::default()
+            })
+            .map_err(CaptureProjectionError::ExceededBudget)?;
+        let key = (
+            proof.callee().clone(),
+            context[..context.len() - 1].to_vec(),
+        );
+        let Some(Some(entering)) = entries.get(&key) else {
+            continue;
+        };
+        if snapshot
+            .edge(*entering)
+            .expect("indexed entering edge")
+            .origin
+            .as_ref()
+            != Some(proof.entering_call())
+        {
+            continue;
+        }
+        if let Some(producer) = proof.producer() {
+            // Preserve an exact factory environment only on its matched normal
+            // return, then the proven actual/formal entry and callback entry.
+            // This carries the live capture port, not its initializer value.
+            let mut producer_context = proof.caller_context().calls().to_vec();
+            request
+                .budget
+                .charge(SolverWork {
+                    callback_rows: producer_context.len().saturating_mul(2).saturating_add(2),
+                    ..SolverWork::default()
+                })
+                .map_err(CaptureProjectionError::ExceededBudget)?;
+            producer_context.push(producer.producer().clone());
+            let producer_key = (producer.producer_callee().clone(), producer_context.clone());
+            let Some(Some(producer_entry)) = entries.get(&producer_key) else {
+                continue;
+            };
+            if snapshot
+                .edge(*producer_entry)
+                .expect("producer entry")
+                .origin
+                .as_ref()
+                != Some(producer.producer())
+            {
+                continue;
+            }
+            let mut returns = Vec::new();
+            for (return_index, returned) in snapshot.edges().iter().enumerate() {
+                charge_capture_projection(request)?;
+                if returned.kind != IcfgEdgeKind::NormalReturn
+                    || returned.origin.as_ref() != Some(producer.producer())
+                {
+                    continue;
+                }
+                let source = snapshot
+                    .node(returned.source)
+                    .expect("factory return source");
+                let target = snapshot
+                    .node(returned.target)
+                    .expect("factory return target");
+                if source.point().procedure() == producer.producer_callee()
+                    && source.call_context() == producer_context
+                    && target.point().procedure() == producer.producer().procedure()
+                    && target.call_context() == proof.caller_context().calls()
+                {
+                    returns.push(IcfgEdgeId::new(
+                        u32::try_from(return_index).expect("return edge ID"),
+                    ));
+                }
+            }
+            if returns.is_empty() {
+                continue;
+            }
+            for binding in proof.capture_bindings() {
+                charge_capture_projection(request)?;
+                if !matches!(
+                    binding.mode,
+                    CaptureMode::MutableCell | CaptureMode::SharedCell
+                ) || !matches!(binding.captured, CaptureSource::Location(_))
+                {
+                    continue;
+                }
+                let port =
+                    ProcedurePortHandle::capture(proof.closure().clone(), binding.destination)
+                        .expect("factory capture slot");
+                let Some(destination) = plan.carrier_id(&ValueFlowCarrier::Port(port)) else {
+                    continue;
+                };
+                let point = proof
+                    .creation()
+                    .procedure()
+                    .point_handle(binding.point)
+                    .expect("factory capture point");
+                for rule in plan.local_rules_at(&point) {
+                    charge_capture_projection(request)?;
+                    if rule.kind != ValueFlowRelationKind::Capture
+                        || rule.target != destination
+                        || rule.proof != ProofStatus::Proven
+                        || rule.completeness != EvidenceCompleteness::Complete
+                        || !matches!(
+                            plan.carrier(rule.source),
+                            Some(ValueFlowCarrier::Location(_))
+                        )
+                    {
+                        continue;
+                    }
+                    for (source, destination) in
+                        capture_carrier_transports(plan, rule.source, destination, request)?
+                    {
+                        for returned in &returns {
+                            charge_capture_projection(request)?;
+                            capture_edges
+                                .entry(*returned)
+                                .or_default()
+                                .push((source, destination));
+                        }
+                        let callback =
+                            IcfgEdgeId::new(u32::try_from(index).expect("callback edge ID"));
+                        request
+                            .budget
+                            .charge(SolverWork {
+                                callback_rows: 2,
+                                ..SolverWork::default()
+                            })
+                            .map_err(CaptureProjectionError::ExceededBudget)?;
+                        capture_edges
+                            .entry(*entering)
+                            .or_default()
+                            .push((destination, destination));
+                        capture_edges
+                            .entry(callback)
+                            .or_default()
+                            .push((destination, destination));
+                    }
+                }
+            }
+            continue;
+        }
+        for binding in proof.capture_bindings() {
+            charge_capture_projection(request)?;
+            if !matches!(
+                binding.mode,
+                CaptureMode::MutableCell | CaptureMode::SharedCell
+            ) || !matches!(binding.captured, CaptureSource::Location(_))
+            {
+                continue;
+            }
+            let port = ProcedurePortHandle::capture(proof.closure().clone(), binding.destination)
+                .expect("proven capture slot");
+            let Some(destination) = plan.carrier_id(&ValueFlowCarrier::Port(port)) else {
+                continue;
+            };
+            let point = proof
+                .creation()
+                .procedure()
+                .point_handle(binding.point)
+                .expect("proven capture point");
+            for rule in plan.local_rules_at(&point) {
+                charge_capture_projection(request)?;
+                if rule.kind != ValueFlowRelationKind::Capture
+                    || rule.target != destination
+                    || !matches!(rule.proof, crate::analyzer::semantic::ProofStatus::Proven)
+                    || !matches!(
+                        rule.completeness,
+                        crate::analyzer::semantic::EvidenceCompleteness::Complete
+                    )
+                    || !matches!(
+                        plan.carrier(rule.source),
+                        Some(ValueFlowCarrier::Location(_))
+                    )
+                {
+                    continue;
+                }
+                for (source, destination) in
+                    capture_carrier_transports(plan, rule.source, destination, request)?
+                {
+                    request
+                        .budget
+                        .charge(SolverWork {
+                            callback_rows: 2,
+                            ..SolverWork::default()
+                        })
+                        .map_err(CaptureProjectionError::ExceededBudget)?;
+                    let callback = IcfgEdgeId::new(u32::try_from(index).expect("snapshot edge ID"));
+                    capture_edges
+                        .entry(callback)
+                        .or_default()
+                        .push((source, destination));
+                    capture_edges
+                        .entry(*entering)
+                        .or_default()
+                        .push((source, source));
+                }
+            }
+        }
+    }
+    for rows in capture_edges.values_mut() {
+        rows.sort_unstable();
+        rows.dedup();
+    }
+    Ok(capture_edges)
+}
+pub(crate) fn charge_capture_projection(
+    request: &mut DataflowRequest<'_>,
+) -> Result<(), CaptureProjectionError> {
+    if request.cancellation.is_cancelled() {
+        return Err(CaptureProjectionError::Cancelled);
+    }
+    request
+        .budget
+        .charge(SolverWork {
+            callback_rows: 1,
+            ..SolverWork::default()
+        })
+        .map_err(CaptureProjectionError::ExceededBudget)
+}
+
 impl DistributiveDataflowProblem for ValueFlowProblem<'_> {
     type Fact = ValueFlowFact;
 
@@ -577,25 +1106,20 @@ impl DistributiveDataflowProblem for ValueFlowProblem<'_> {
         self.plan.curated_model_for_call(call).is_some()
     }
 
+    fn call_replaced_by_proven_model(
+        &self,
+        call: &crate::analyzer::semantic::CallSiteHandle,
+    ) -> bool {
+        self.plan.curated_model_is_proven_complete(call)
+    }
+
     fn normal_flow(
         &self,
         edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
-        let mut meetings = Vec::new();
-        let mut active = self.apply_point(edge.source(), fact, &mut meetings);
-        if let crate::analyzer::semantic::IcfgEdgeKind::Intraprocedural(kind) = edge.kind() {
-            let kills = self
-                .plan
-                .edge_kills(edge.source(), edge.target().id(), kind);
-            active.retain(|flow| {
-                !kills.iter().any(|kill| {
-                    kill.carrier == flow.carrier && kill.sources.binary_search(&flow.source).is_ok()
-                })
-            });
-        }
-        self.emit_all(active, meetings, out);
+        self.flow(edge, fact, out);
     }
 
     fn call_flow(
@@ -630,6 +1154,17 @@ impl DistributiveDataflowProblem for ValueFlowProblem<'_> {
         edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
+    ) {
+        self.flow(edge, fact, out);
+    }
+}
+
+impl ValueFlowProblem<'_> {
+    fn flow(
+        &self,
+        edge: DataflowEdge<'_, ValueFlowFact>,
+        fact: ValueFlowFact,
+        out: &mut dyn DataflowOutput<ValueFlowFact>,
     ) {
         let mut meetings = Vec::new();
         let mut active = self.apply_point(edge.source(), fact, &mut meetings);
@@ -681,6 +1216,9 @@ where
     if root != plan.root() {
         return Err(ValueFlowSolveError::RootMismatch);
     }
+    if plan.has_contextual_bindings() {
+        return Err(ValueFlowSolveError::CallContextRequired);
+    }
     let problem = ValueFlowProblem::new(plan);
     let result = solve_with_summaries(
         SummarySolveInput::new(root, &[]).with_witness_retention(witness_retention),
@@ -689,6 +1227,90 @@ where
         semantic_budget,
         request,
     )?;
+    ValueFlowSummaryResult::from_result(plan, result)
+}
+
+/// Execute query-local summaries with capture associations from this exact
+/// frozen input. Snapshot edge IDs are discarded before summary evaluation.
+pub fn solve_value_flow_summaries_on_snapshot<Provider>(
+    provider: &Provider,
+    plan: &ValueFlowPlan,
+    input: crate::dataflow::IcfgSolveInput<'_>,
+    limits: OracleLimits,
+    witness_retention: WitnessRetentionLimits,
+    semantic_budget: &mut SemanticBudget,
+    request: &mut DataflowRequest<'_>,
+) -> Result<ValueFlowSummaryResult, ValueFlowSolveError>
+where
+    Provider: IcfgProvider + ?Sized,
+{
+    let initial_work = request.budget.used();
+    let snapshot = input.snapshot();
+    let mut problem = ValueFlowProblem::for_snapshot(plan, snapshot, request)?;
+    let projected = problem
+        .snapshot
+        .take()
+        .expect("validated snapshot projection")
+        .capture_edges;
+    let mut captures = SummaryCaptureAssociations::default();
+    for (id, rows) in projected {
+        charge_capture_projection(request)?;
+        let edge = snapshot.edge(id).expect("projected snapshot edge");
+        let source = snapshot.node(edge.source).expect("projected source");
+        let target = snapshot.node(edge.target).expect("projected target");
+        let caller = if edge.kind == IcfgEdgeKind::NormalReturn {
+            target
+        } else {
+            source
+        };
+        let callee = if edge.kind == IcfgEdgeKind::NormalReturn {
+            source
+        } else {
+            target
+        };
+        let context = OracleCallContext::bounded(caller.call_context().to_vec(), limits);
+        if context.was_truncated() || callee.call_context().len() > limits.call_context_depth() {
+            continue;
+        }
+        request
+            .budget
+            .charge(SolverWork {
+                callback_rows: context.calls().len() + rows.len(),
+                ..SolverWork::default()
+            })
+            .map_err(CaptureProjectionError::ExceededBudget)?;
+        captures
+            .entry((
+                edge.origin.clone().expect("projected call origin"),
+                edge.kind,
+            ))
+            .or_default()
+            .entry(callee.point().procedure().clone())
+            .or_default()
+            .entry(context)
+            .or_default()
+            .extend(rows);
+    }
+    for targets in captures.values_mut() {
+        for contexts in targets.values_mut() {
+            for rows in contexts.values_mut() {
+                rows.sort_unstable();
+                rows.dedup();
+            }
+        }
+    }
+    problem.summary_captures = Some(captures);
+    let replay = crate::dataflow::SnapshotReplayProvider::new(provider, input);
+    let mut result = solve_with_summaries(
+        SummarySolveInput::new(plan.root(), &[])
+            .with_call_context(limits)
+            .with_witness_retention(witness_retention),
+        &replay,
+        &problem,
+        semantic_budget,
+        request,
+    )?;
+    result.set_query_work(request.budget.used().saturating_sub(initial_work));
     ValueFlowSummaryResult::from_result(plan, result)
 }
 
@@ -707,6 +1329,9 @@ where
 {
     if root != plan.root() {
         return Err(ValueFlowSolveError::RootMismatch);
+    }
+    if plan.has_contextual_bindings() {
+        return Err(ValueFlowSolveError::CallContextRequired);
     }
     let problem = ValueFlowProblem::new(plan);
     let result = solve_with_reusable_root_and_end_summaries(
@@ -746,6 +1371,9 @@ where
     if procedure != plan.root() && !plan.has_snapshot(procedure) {
         return Err(ValueFlowSolveError::RootMismatch);
     }
+    if plan.has_contextual_bindings() {
+        return Err(ValueFlowSolveError::CallContextRequired);
+    }
     let problem = ValueFlowProblem::new(plan);
     let explicit_entry = (entry_fact != ValueFlowFact::zero()).then_some(entry_fact);
     let result = solve_with_reusable_end_summaries(
@@ -762,8 +1390,12 @@ where
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValueFlowSolveError {
     RootMismatch,
+    CallContextRequired,
+    CaptureProjectionCancelled,
+    CaptureProjectionBudgetExceeded(SolverBudgetExceeded),
     InvalidResult,
     Summary(SummaryDataflowError),
+    Snapshot(crate::dataflow::DataflowError),
 }
 
 impl ValueFlowSolveError {
@@ -772,7 +1404,13 @@ impl ValueFlowSolveError {
             Self::Summary(SummaryDataflowError::MandatorySummaryCutMiss { procedure }) => {
                 Some(procedure)
             }
-            Self::RootMismatch | Self::InvalidResult | Self::Summary(_) => None,
+            Self::RootMismatch
+            | Self::CallContextRequired
+            | Self::InvalidResult
+            | Self::Summary(_)
+            | Self::Snapshot(_)
+            | Self::CaptureProjectionCancelled
+            | Self::CaptureProjectionBudgetExceeded(_) => None,
         }
     }
 }
@@ -780,11 +1418,19 @@ impl ValueFlowSolveError {
 impl fmt::Display for ValueFlowSolveError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::CaptureProjectionCancelled => {
+                formatter.write_str("callback capture projection cancelled")
+            }
+            Self::CaptureProjectionBudgetExceeded(error) => error.fmt(formatter),
+            Self::CallContextRequired => {
+                formatter.write_str("contextual call bindings require contextual summary execution")
+            }
             Self::RootMismatch => formatter.write_str("value-flow root does not match the plan"),
             Self::InvalidResult => {
                 formatter.write_str("value-flow result contains an invalid fact")
             }
             Self::Summary(error) => error.fmt(formatter),
+            Self::Snapshot(error) => error.fmt(formatter),
         }
     }
 }
@@ -793,7 +1439,12 @@ impl Error for ValueFlowSolveError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Summary(error) => Some(error),
-            Self::RootMismatch | Self::InvalidResult => None,
+            Self::Snapshot(error) => Some(error),
+            Self::CaptureProjectionBudgetExceeded(error) => Some(error),
+            Self::RootMismatch
+            | Self::CallContextRequired
+            | Self::CaptureProjectionCancelled
+            | Self::InvalidResult => None,
         }
     }
 }
@@ -805,57 +1456,27 @@ impl From<SummaryDataflowError> for ValueFlowSolveError {
 }
 
 /// Whether a point-local rule replaces, rather than joins, the facts at its
-/// target carrier.
-///
-/// A local assignment has always killed its target: the target names one
-/// procedure-local slot and the assignment is the only writer that can reach
-/// it. A `MemoryStore` joins by default, because a store through one name can
-/// land on a location another name also reaches, and killing it would launder
-/// an unanalyzed write into a clean answer.
-///
-/// #2444 adds the one case where a store does not join. The heap oracle issues
-/// a `StrongUpdateCertificate` only when the store's location is exact, the
-/// object it belongs to is a proven singleton, no other location can be
-/// updated by the store, and the object does not escape. Under that proof the
-/// store definitely overwrote what this carrier held, so keeping the old fact
-/// would be a false positive rather than caution.
-///
-/// Aliasing is not laundered away by this. A second name the access-path
-/// resolver proved is the same origin resolves to the same carrier, so the
-/// kill is correct for it too; a name the resolver could not prove leaves more
-/// than one candidate object, which is a weak update and no kill at all.
+/// target carrier. The rule is defined once in
+/// `brokk_bifrost_analysis::analyzer::semantic::partial_flow::rules`.
 pub(crate) fn kills_target(rule: &super::plan::LocalRuleView) -> bool {
-    // Parameter and receiver relations copy between a boundary port and a
-    // value carrier. A return writes the one pending return slot: cleanup can
-    // replace it before the invocation exits. Mutually exclusive returns still
-    // join through control flow, but a later return kills the earlier value.
-    match rule.kind {
-        ValueFlowRelationKind::Assignment
-        | ValueFlowRelationKind::Parameter
-        | ValueFlowRelationKind::Receiver
-        | ValueFlowRelationKind::NormalReturn => rule.source != rule.target,
-        ValueFlowRelationKind::MemoryStore => rule.strong_update,
-        _ => false,
-    }
-}
-
-/// Whether a by-value relation consumes the value held by its source.
-///
-/// Generate the destination fact before applying this kill: the target keeps
-/// the moved value while later observations of the source binding do not.
-pub(crate) fn invalidates_source(rule: &super::plan::LocalRuleView) -> bool {
-    matches!(
-        rule.transfer,
-        Some(crate::analyzer::semantic::ValueTransfer {
-            kind: crate::analyzer::semantic::TransferKind::Move {
-                invalidation: crate::analyzer::semantic::MoveInvalidation::Invalidated,
-            },
-            ..
-        })
+    brokk_bifrost_analysis::analyzer::semantic::partial_flow::rules::kills_target(
+        rule.kind,
+        rule.source != rule.target,
+        rule.strong_update,
+        rule.direct_cell_overwrite,
     )
 }
 
-fn quality_uncertainty(
+/// Whether a by-value relation consumes the value held by its source. The rule
+/// is defined once in
+/// `brokk_bifrost_analysis::analyzer::semantic::partial_flow::rules`.
+pub(crate) fn invalidates_source(rule: &super::plan::LocalRuleView) -> bool {
+    brokk_bifrost_analysis::analyzer::semantic::partial_flow::rules::invalidates_source(
+        rule.transfer,
+    )
+}
+
+pub(super) fn quality_uncertainty(
     proof: &ProofStatus,
     completeness: &EvidenceCompleteness,
 ) -> ValueFlowUncertainty {
@@ -865,6 +1486,23 @@ fn quality_uncertainty(
         ValueFlowUncertainty(0)
     } else {
         ValueFlowUncertainty(0).with_semantic()
+    }
+}
+
+impl From<CaptureProjectionError> for ValueFlowSolveError {
+    fn from(error: CaptureProjectionError) -> Self {
+        match error {
+            CaptureProjectionError::Cancelled => Self::CaptureProjectionCancelled,
+            CaptureProjectionError::ExceededBudget(error) => {
+                Self::CaptureProjectionBudgetExceeded(error)
+            }
+        }
+    }
+}
+
+impl From<crate::dataflow::DataflowError> for ValueFlowSolveError {
+    fn from(error: crate::dataflow::DataflowError) -> Self {
+        Self::Snapshot(error)
     }
 }
 
@@ -881,6 +1519,7 @@ mod tests {
         ValueFlowCarrier, ValueFlowEventKey, ValueFlowEventKind, ValueFlowObservationPhase,
         ValueFlowSourceSpec,
     };
+    use brokk_bifrost_test_macros::hardwon;
 
     fn carrier(index: usize) -> ValueFlowCarrierId {
         ValueFlowCarrierId::try_from_index(index).expect("carrier id")
@@ -907,6 +1546,7 @@ mod tests {
             complete: true,
             policy_local: false,
             strong_update: false,
+            direct_cell_overwrite: false,
         }
     }
 
@@ -967,6 +1607,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#3131: A conditional unknown source activates only when its exact trigger source reaches the same carrier and keeps that source's uncertainty."
+    )]
     fn conditional_source_requires_matching_source_on_same_carrier() {
         let matching = ActiveFlow {
             source: ValueFlowSourceId::try_from_index(1).expect("source id"),
@@ -1030,16 +1673,23 @@ mod tests {
             })
             .and_then(|procedure| artifact.procedure_handle(procedure.id()))
             .expect("fixture declares run");
-        let parameter = root
+        // The conditional sources ride a carrier other than the parameter's
+        // port. A formal's only carrier is its port, so this is a value that is
+        // not a formal.
+        let local = root
             .semantics()
             .values()
             .iter()
-            .find(|value| matches!(value.kind, SemanticValueKind::Parameter { ordinal: 0, .. }))
-            .expect("fixture has one parameter")
+            .find(|value| {
+                !matches!(
+                    value.kind,
+                    SemanticValueKind::Parameter { .. } | SemanticValueKind::Receiver { .. }
+                )
+            })
+            .expect("fixture has a value that is not a formal")
             .id;
-        let value_carrier = ValueFlowCarrier::Value(
-            root.value_handle(parameter)
-                .expect("parameter value remains live"),
+        let value_carrier = ValueFlowCarrier::for_value(
+            root.value_handle(local).expect("local value remains live"),
         );
         let other_carrier = ValueFlowCarrier::Port(
             crate::analyzer::semantic::ProcedurePortHandle::parameter(root.clone(), 0)
@@ -1126,10 +1776,10 @@ mod tests {
             .expect("unrelated source");
         let value_carrier_id = plan
             .carrier_id_for_key(
-                &ValueFlowCarrier::Value(
+                &ValueFlowCarrier::for_value(
                     plan.root()
-                        .value_handle(parameter)
-                        .expect("parameter value remains live"),
+                        .value_handle(local)
+                        .expect("local value remains live"),
                 )
                 .stable_key()
                 .expect("value carrier key"),

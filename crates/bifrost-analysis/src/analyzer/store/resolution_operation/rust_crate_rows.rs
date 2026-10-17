@@ -6,6 +6,8 @@ use crate::analyzer::resolution::{
     LoweredDeferredMemberOwner, LoweredMemberScopeProperty, StackPattern, mounted_site_node,
     mounted_site_semantic,
 };
+use crate::analyzer::store::rust_unit_summaries::RUST_UNIT_SUMMARY_DERIVATION_VERSION;
+use crate::analyzer::store::selected_read_memo::ExactReadMemo;
 use brokk_bifrost_core::analyzer::resolution_facts::ResolutionMemberKind;
 use rusqlite::{OptionalExtension, params};
 
@@ -16,14 +18,36 @@ use rusqlite::{OptionalExtension, params};
 /// outside the file's own lowering, whose body only a request-scoped capsule
 /// lowers. No persisted reference is written in such a scope, so it is no
 /// requester's module.
-pub(super) const MODULES_FOR_BLOB: &str = "SELECT source.topology_id, source.container_path,
- source.blob_id, source.rel_path, scopes.resolution_scope, crates.edition,
- crates.target_kind='detached' AND EXISTS(SELECT 1 FROM rust_crate_topologies AS cargo
-  WHERE cargo.target_kind<>'detached' AND +cargo.publication_state='complete')
- FROM rust_crate_container_sources AS source
- CROSS JOIN selected_rust_crates AS crates ON crates.topology_id=source.topology_id
- CROSS JOIN source_rust_module_scopes AS scopes ON scopes.blob_id=source.blob_id AND scopes.ordinal=source.scope_ordinal
- WHERE source.blob_id=?1 AND source.rel_path=?2 AND scopes.resolution_scope IS NOT NULL";
+pub(super) const MODULES_FOR_BLOB: &str = "WITH request_roots(topology_id) AS (
+ SELECT CAST(value AS INTEGER) FROM json_each(?3)
+)
+SELECT unit.topology_id, placement.module_path,
+ member.blob_id, member.rel_path, scopes.resolution_scope, contexts.edition,
+ contexts.target_kind='detached' AND EXISTS(
+  SELECT 1 FROM selected_rust_unit_summaries AS cargo
+  CROSS JOIN main.rust_resolution_unit_summary_contexts AS cargo_context
+   ON cargo_context.summary_id=cargo.summary_id
+  WHERE cargo.workspace_id=unit.workspace_id AND cargo.generation=unit.generation
+   AND cargo_context.target_kind<>'detached'),
+ json_array_length(?3)=0 OR unit.topology_id IN (SELECT topology_id FROM request_roots)
+ FROM main.resolution_unit_summary_members AS member
+  INDEXED BY resolution_unit_summary_members_blob
+ CROSS JOIN selected_rust_unit_summaries AS unit ON unit.summary_id=member.summary_id
+ CROSS JOIN selected_workspace_file_versions AS files
+  ON files.workspace_id=unit.workspace_id AND files.lang=unit.lang
+ AND files.generation=unit.generation AND files.rel_path=member.rel_path
+ CROSS JOIN blobs ON blobs.id=member.blob_id AND blobs.blob_oid=files.blob_oid
+  AND blobs.lang=files.lang AND blobs.generation=files.generation
+ CROSS JOIN main.rust_resolution_unit_summary_placements AS placement
+  INDEXED BY rust_resolution_unit_summary_placements_member
+  ON placement.summary_id=member.summary_id
+ AND placement.member_ordinal=member.member_ordinal
+ CROSS JOIN main.rust_resolution_unit_summary_contexts AS contexts
+  ON contexts.summary_id=unit.summary_id
+ CROSS JOIN source_rust_module_scopes AS scopes
+  ON scopes.blob_id=member.blob_id AND scopes.ordinal=placement.scope_ordinal
+ WHERE member.blob_id=?1 AND member.rel_path=?2 AND placement.scope_ordinal IS NOT NULL
+  AND scopes.resolution_scope IS NOT NULL";
 
 pub(super) struct RustCrateRows<'a, 'store, 'input> {
     pub(super) ready: &'a ReadySelectedResolution<'store, 'input>,
@@ -77,21 +101,21 @@ type ExportKey = (i64, String, String, String, i64, String);
 /// runs; the stage's own fact tables are separate and none of them reads
 /// those.
 ///
-/// Only a crate stage holds one: [`CrateStageMemos`] installs it when the
-/// graph build starts a crate and drops it when the build moves to the next
-/// crate. Outside a crate stage the lookups run the statements directly.
+/// Only a crate stage holds one: [`RustGraphStageTables`] installs it for a
+/// native graph unit, and [`CrateStageMemos`] installs it for other scoped
+/// Rust operations. Outside a crate stage the lookups run the statements
+/// directly.
 #[derive(Default)]
 pub(super) struct CrateRowMemo {
-    exports: HashMap<ExportKey, Vec<RustCrateExport>>,
-    scopes: HashMap<(i64, u32), Vec<u32>>,
-    inventories: HashMap<ExportKey, Vec<String>>,
+    exports: ExactReadMemo<ExportKey, Vec<RustCrateExport>>,
+    scopes: ExactReadMemo<(i64, u32), Vec<u32>>,
+    inventories: ExactReadMemo<ExportKey, Vec<String>>,
 }
 
-/// Holds one crate stage's memos: the request's [`CrateRowMemo`], the
-/// inventory's `CrateAccessMemo` and its `AuthorityValidations`, and the
-/// stage's read transaction on the reader. Installed when the graph build
-/// starts a crate and emptied when it drops, so no answer crosses into the
-/// next crate and the reader leaves the stage outside any transaction.
+/// Holds one scoped Rust operation's memos: the request's [`CrateRowMemo`],
+/// the inventory's `CrateAccessMemo` and its `AuthorityValidations`, and the
+/// stage's read transaction on the reader. The native graph path installs the
+/// Rust row tables separately under its shared graph-stage guard.
 pub(crate) struct CrateStageMemos<'a> {
     inventory: &'a super::super::resolution_selection::SelectedResolutionMountInventory<'a>,
     rows: &'a RefCell<Option<CrateRowMemo>>,
@@ -142,164 +166,362 @@ impl Drop for CrateStageMemos<'_> {
     }
 }
 
-/// The traits one placed type declaration implements that are also nameable
-/// where the reference is written, with the selected mount that declares each
-/// trait.
-///
-/// This is lane TI's stage 2 reads 1, 1b and 4 in one statement, keyed by one
-/// subject declaration identity per qualifier value. `rust_crate_trait_impls`
-/// is seeked on the subject columns of `rust_crate_trait_impls_subject`,
-/// and every trait name the join needs comes from `rust_crate_exports` through
-/// `rust_crate_exports_declaration`; neither read enumerates a crate's impls or
-/// a module's exports.
-///
-/// Both declarations are placed: the subject by its file `?5`, the trait by
-/// the file the row names, which selects the trait's mount by path. A
-/// declaration's `(blob, site)` is shared by every byte-identical file, so
-/// without the placement `impl one::Runnable for Worker` would lend
-/// `two::Runnable`'s members too, and a `use two::Runnable` would make it
-/// nameable. A name row that is the trait's own declaration row is therefore
-/// held to the trait's file through its container source. A re-export row
-/// carries no placement of its own, so it is matched by `(blob, site)` alone.
-///
-/// The three visibility arms are Rust's three ways to name a trait at a call
-/// site, and a trait that none of them reaches contributes nothing. That is the
-/// whole of `ra_goto_def_ufcs_trait_method_scope_filtered` and
-/// `rust_ufcs_trait_method_requires_visible_trait`: an implemented trait whose
-/// name is not in scope does not lend its members to `Foo::member()`.
-///
-/// A named or glob import written inside a block (`fn f() { use m::T; }`)
-/// names the trait only within that block (rustc E0599 outside it). Its
-/// source row carries the block's byte extent, which must contain the
-/// reference; an import at module scope has no extent. The reference and a
-/// block import are compared in the same blob only.
-///
-/// `?1`/`?2`/`?5` are the subject declaration and its file, `?3`/`?4` the
-/// module the reference is written in, and `?6`/`?7` the reference's mount
-/// ordinal and semantic key.
-pub(super) const TRAIT_IMPLS_VISIBLE_AT: &str =
-    "SELECT DISTINCT names.declaration_blob_id, names.declaration_site, mount.mount_ordinal
- FROM rust_crate_trait_impls AS impls INDEXED BY rust_crate_trait_impls_subject
- CROSS JOIN rust_crate_exports AS names INDEXED BY rust_crate_exports_declaration
-  ON names.declaration_blob_id=impls.trait_declaration_blob_id
-  AND names.declaration_site=impls.trait_declaration_site AND names.namespace='type'
- CROSS JOIN selected_rust_crates AS naming ON naming.topology_id=names.topology_id
- CROSS JOIN temp.selected_resolution_mounts AS mount
-  ON mount.storage_language='rust' AND mount.persisted_relative_path=impls.trait_rel_path
-  AND mount.blob_id=names.declaration_blob_id
- WHERE impls.subject_declaration_blob_id=?1 AND impls.subject_declaration_site=?2
-  AND impls.subject_rel_path=?5
-  AND EXISTS(SELECT 1 FROM selected_rust_crates AS owner WHERE owner.topology_id=impls.topology_id)
-  AND (names.origin<>'declaration'
-   OR EXISTS(SELECT 1 FROM rust_crate_container_sources AS declared
-             WHERE declared.topology_id=names.topology_id
-               AND declared.container_path=names.module_path
-               AND declared.blob_id=names.declaration_blob_id
-               AND declared.rel_path=impls.trait_rel_path))
-  AND ((names.topology_id=?3 AND names.module_path=?4)
-   OR EXISTS(SELECT 1 FROM rust_crate_imports AS named INDEXED BY rust_crate_imports_target
-             CROSS JOIN source_rust_import_targets AS placed
-               ON placed.blob_id=named.blob_id AND placed.ordinal=named.import_ordinal
-               AND placed.native_scope=named.binder_scope
-             WHERE named.target_crate_key=naming.crate_key
-               AND named.target_module_path=names.module_path
-               AND named.target_name=names.name AND named.topology_id=?3
-               AND named.module_path=?4 AND named.namespace='type'
-               AND (placed.local_start IS NULL
-                    OR EXISTS(SELECT 1 FROM temp.selected_resolution_mounts AS at
-                              CROSS JOIN resolution_sites AS site
-                                ON site.blob_id=at.blob_id AND site.site=?7
-                              WHERE at.mount_ordinal=?6 AND at.blob_id=placed.blob_id
-                                AND placed.local_start<=site.start_byte
-                                AND site.start_byte<placed.local_end)))
-       OR (names.visibility='public'
-       AND EXISTS(SELECT 1 FROM rust_crate_glob_imports AS globs
-                  CROSS JOIN source_rust_import_targets AS placed
-                    ON placed.blob_id=globs.blob_id AND placed.ordinal=globs.import_ordinal
-                    AND placed.native_scope=globs.binder_scope
-                  WHERE globs.topology_id=?3 AND globs.module_path=?4
-                    AND globs.target_crate_key=naming.crate_key
-                    AND globs.target_module_path=names.module_path
-                    AND (placed.local_start IS NULL
-                         OR EXISTS(SELECT 1 FROM temp.selected_resolution_mounts AS at
-                                   CROSS JOIN resolution_sites AS site
-                                     ON site.blob_id=at.blob_id AND site.site=?7
-                                   WHERE at.mount_ordinal=?6 AND at.blob_id=placed.blob_id
-                                     AND placed.local_start<=site.start_byte
-                                     AND site.start_byte<placed.local_end)))))";
+// Expand a selected declaration to the Rust-owned exported names that route
+// to it. Re-export rows carry their target coordinates and identity; the walk
+// follows those rows one step at a time and stays bounded by the selected
+// summary rows rather than constructing a workspace-sized Rust map.
+//
+// `$derivation_version` is the caller's placeholder for
+// `RUST_UNIT_SUMMARY_DERIVATION_VERSION`, bound at the call site so a version
+// bump stays one constant.
+macro_rules! rust_selected_members_cte {
+    ($predicate:literal, $derivation_version:literal) => {
+        concat!(
+             "selected_members(workspace_id, generation, unit_key, summary_id, topology_id, \
+             member_ordinal, blob_id, rel_path) AS ( \
+             SELECT versions.workspace_id, versions.generation, versions.unit_key, \
+                    versions.summary_id, rust_versions.topology_id, members.member_ordinal, \
+                    members.blob_id, members.rel_path \
+             FROM main.resolution_unit_summary_members AS members \
+               INDEXED BY resolution_unit_summary_members_blob \
+             CROSS JOIN main.resolution_unit_summary_versions AS versions \
+               INDEXED BY resolution_unit_summary_versions_summary \
+               ON versions.summary_id=members.summary_id \
+             CROSS JOIN selected_workspace_revisions AS selected \
+               ON selected.workspace_id=versions.workspace_id AND selected.lang=versions.lang \
+              AND selected.generation=versions.generation \
+              AND versions.valid_from<=selected.revision \
+              AND (versions.valid_until IS NULL OR selected.revision<versions.valid_until) \
+             CROSS JOIN main.resolution_unit_summaries AS summaries \
+               ON summaries.summary_id=versions.summary_id \
+              AND summaries.lang='rust' AND summaries.unit_kind='rust_crate' \
+              AND summaries.publication_state='complete' AND summaries.derivation_version=",
+            $derivation_version,
+            " \
+             CROSS JOIN main.resolution_producer_epochs AS epochs \
+               ON epochs.lang=versions.lang AND epochs.producer_epoch=summaries.producer_epoch \
+             CROSS JOIN main.rust_resolution_unit_summary_versions AS rust_versions \
+               INDEXED BY sqlite_autoindex_rust_resolution_unit_summary_versions_1 \
+               ON rust_versions.workspace_id=versions.workspace_id \
+              AND rust_versions.lang=versions.lang AND rust_versions.generation=versions.generation \
+              AND rust_versions.unit_key=versions.unit_key \
+              AND rust_versions.valid_from=versions.valid_from \
+              AND rust_versions.summary_id=versions.summary_id \
+             CROSS JOIN main.rust_resolution_unit_summary_contexts AS contexts \
+               ON contexts.summary_id=versions.summary_id \
+             CROSS JOIN selected_workspace_file_versions AS files \
+               ON files.workspace_id=versions.workspace_id AND files.lang=versions.lang \
+              AND files.generation=versions.generation AND files.rel_path=members.rel_path \
+             CROSS JOIN main.blobs AS blobs \
+               ON blobs.id=members.blob_id AND blobs.lang=versions.lang \
+              AND blobs.generation=versions.generation AND blobs.blob_oid=files.blob_oid \
+             ",
+            $predicate,
+            ")"
+        )
+    };
+}
+
+macro_rules! rust_trait_name_routes {
+    ($predicate:literal, $seed:literal, $derivation_version:literal) => {
+        concat!(
+            "WITH RECURSIVE ",
+            rust_selected_members_cte!($predicate, $derivation_version),
+            ", trait_names(canonical_blob_id, canonical_site, canonical_rel_path, \
+             name_unit_key, name_summary_id, name_topology_id, name_module_path, name, \
+             name_visibility, name_identity_id) AS (",
+            $seed,
+            " UNION SELECT names.canonical_blob_id, names.canonical_site, names.canonical_rel_path, \
+             parent.unit_key, parent.summary_id, parent.topology_id, exports.module_path, \
+             exports.name, exports.visibility, exports.identity_id \
+             FROM trait_names AS names \
+             CROSS JOIN main.rust_resolution_unit_summary_exports AS exports \
+               INDEXED BY rust_resolution_unit_summary_exports_alias_target \
+               ON exports.target_unit_key=names.name_unit_key \
+              AND exports.target_module_path=names.name_module_path \
+              AND exports.target_name=names.name \
+              AND exports.namespace='type' AND exports.alias_identity_id=names.name_identity_id \
+              AND exports.origin<>'declaration' \
+             CROSS JOIN selected_rust_unit_summaries AS parent \
+               ON parent.summary_id=exports.summary_id) "
+        )
+    };
+}
+
+/// The traits a placed type implements that are nameable at the reference.
+/// The subject endpoint is sought from its selected declaration export; the
+/// paired trait endpoint and selected export rows supply the rest of the route.
+/// `?1`/`?2`/`?5` identify the subject declaration and file, `?3`/`?4` the
+/// reference module, and `?6`/`?7` the reference mount and semantic key.
+pub(super) const TRAIT_IMPLS_VISIBLE_AT: &str = concat!(
+    rust_trait_name_routes!(
+        "WHERE members.blob_id=?1 AND members.rel_path=?5",
+        "SELECT trait_member.blob_id, trait_export.declaration_site, trait_member.rel_path, \
+         trait_unit.unit_key, trait_unit.summary_id, trait_unit.topology_id, \
+         trait_export.module_path, trait_export.name, trait_export.visibility, \
+         trait_export.identity_id \
+         FROM selected_members AS subject_member \
+         CROSS JOIN main.rust_resolution_unit_summary_exports AS subject_export \
+           INDEXED BY rust_resolution_unit_summary_exports_declaration \
+           ON subject_export.summary_id=subject_member.summary_id \
+          AND subject_export.declaration_member_ordinal=subject_member.member_ordinal \
+          AND subject_export.declaration_site=?2 AND subject_export.namespace='type' \
+          AND subject_export.origin='declaration' \
+         CROSS JOIN main.rust_resolution_unit_summary_trait_endpoints AS subject_endpoint \
+           INDEXED BY rust_resolution_unit_summary_trait_endpoints_target \
+           ON subject_endpoint.target_unit_key=subject_member.unit_key \
+          AND subject_endpoint.target_module_path=subject_export.module_path \
+          AND subject_endpoint.target_identity_id=subject_export.identity_id \
+          AND subject_endpoint.endpoint_role='subject' \
+          AND subject_endpoint.endpoint_state='resolved' \
+         CROSS JOIN selected_rust_unit_summaries AS impl_unit \
+           ON impl_unit.summary_id=subject_endpoint.summary_id \
+         CROSS JOIN main.rust_resolution_unit_summary_trait_endpoints AS trait_endpoint \
+           ON trait_endpoint.summary_id=subject_endpoint.summary_id \
+          AND trait_endpoint.member_ordinal=subject_endpoint.member_ordinal \
+          AND trait_endpoint.owner_module_path=subject_endpoint.owner_module_path \
+          AND trait_endpoint.source_relation_key=subject_endpoint.source_relation_key \
+          AND trait_endpoint.endpoint_role='trait' AND trait_endpoint.endpoint_state='resolved' \
+         CROSS JOIN selected_rust_unit_summaries AS trait_unit \
+           ON trait_unit.unit_key=trait_endpoint.target_unit_key \
+         CROSS JOIN main.rust_resolution_unit_summary_exports AS trait_export \
+           INDEXED BY rust_resolution_unit_summary_exports_identity \
+           ON trait_export.summary_id=trait_unit.summary_id \
+          AND trait_export.identity_id=trait_endpoint.target_identity_id \
+          AND trait_export.module_path=trait_endpoint.target_module_path \
+          AND trait_export.namespace='type' AND trait_export.origin='declaration' \
+         CROSS JOIN main.resolution_unit_summary_members AS trait_member \
+           ON trait_member.summary_id=trait_export.summary_id \
+          AND trait_member.member_ordinal=trait_export.declaration_member_ordinal \
+         WHERE subject_member.blob_id=?1 AND subject_member.rel_path=?5",
+        "?8"
+    ),
+    "SELECT DISTINCT names.canonical_blob_id, names.canonical_site, mount.mount_ordinal \
+     FROM trait_names AS names \
+     CROSS JOIN temp.selected_resolution_mounts AS mount \
+       ON mount.storage_language='rust' \
+      AND mount.persisted_relative_path=names.canonical_rel_path \
+      AND mount.blob_id=names.canonical_blob_id \
+     WHERE (names.name_topology_id=?3 AND names.name_module_path=?4) \
+        OR EXISTS( \
+          SELECT 1 FROM main.rust_resolution_unit_summary_import_routes AS named \
+            INDEXED BY rust_resolution_unit_summary_import_routes_target_identity \
+          CROSS JOIN selected_rust_unit_summaries AS naming \
+            ON naming.summary_id=named.summary_id AND naming.topology_id=?3 \
+          CROSS JOIN main.resolution_unit_summary_members AS member \
+            ON member.summary_id=named.summary_id AND member.member_ordinal=named.member_ordinal \
+          CROSS JOIN source_rust_import_targets AS placed \
+            ON placed.blob_id=member.blob_id AND placed.source_import_id=named.import_id \
+           AND placed.native_scope=named.binder_scope \
+          WHERE named.target_unit_key=names.name_unit_key \
+            AND named.target_module_path=names.name_module_path AND named.target_name=names.name \
+            AND named.namespace='type' AND named.module_path=?4 \
+            AND (placed.local_start IS NULL OR EXISTS( \
+              SELECT 1 FROM temp.selected_resolution_mounts AS at \
+              CROSS JOIN resolution_sites AS site ON site.blob_id=at.blob_id AND site.site=?7 \
+              WHERE at.mount_ordinal=?6 AND at.blob_id=member.blob_id \
+                AND placed.local_start<=site.start_byte AND site.start_byte<placed.local_end))) \
+        OR (names.name_visibility='public' AND EXISTS( \
+          SELECT 1 FROM main.rust_resolution_unit_summary_glob_imports AS globs \
+            INDEXED BY rust_resolution_unit_summary_glob_imports_target_identity \
+          CROSS JOIN selected_rust_unit_summaries AS naming \
+            ON naming.summary_id=globs.summary_id AND naming.topology_id=?3 \
+          CROSS JOIN main.resolution_unit_summary_members AS member \
+            ON member.summary_id=globs.summary_id AND member.member_ordinal=globs.member_ordinal \
+          CROSS JOIN source_rust_import_targets AS placed \
+            ON placed.blob_id=member.blob_id AND placed.source_import_id=globs.source_import_id \
+           AND placed.native_scope=globs.binder_scope \
+          WHERE globs.target_unit_key=names.name_unit_key \
+            AND globs.target_module_path=names.name_module_path AND globs.module_path=?4 \
+            AND (placed.local_start IS NULL OR EXISTS( \
+              SELECT 1 FROM temp.selected_resolution_mounts AS at \
+              CROSS JOIN resolution_sites AS site ON site.blob_id=at.blob_id AND site.site=?7 \
+              WHERE at.mount_ordinal=?6 AND at.blob_id=member.blob_id \
+                AND placed.local_start<=site.start_byte AND site.start_byte<placed.local_end))))"
+);
+/// Rust-owned export and access rows for one graph stage. The generic graph
+/// guard owns the shared authority-validation memo and reader transaction;
+/// this guard installs only the Rust-specific tables inside that boundary.
+pub(crate) struct RustGraphStageTables<'a> {
+    rows: &'a RefCell<Option<CrateRowMemo>>,
+    access: &'a RefCell<Option<super::rust_crate_access::CrateAccessMemo>>,
+}
+
+impl<'a> RustGraphStageTables<'a> {
+    pub(super) fn install(
+        rows: &'a RefCell<Option<CrateRowMemo>>,
+        access: &'a RefCell<Option<super::rust_crate_access::CrateAccessMemo>>,
+    ) -> Self {
+        assert!(rows.borrow().is_none(), "crate stages do not nest");
+        assert!(access.borrow().is_none(), "crate stages do not nest");
+        *rows.borrow_mut() = Some(CrateRowMemo::default());
+        *access.borrow_mut() = Some(Default::default());
+        Self { rows, access }
+    }
+}
+
+impl Drop for RustGraphStageTables<'_> {
+    fn drop(&mut self) {
+        self.rows.take();
+        self.access.take();
+    }
+}
 
 /// The exact callable child one selected type's one selected trait impl
 /// declares, if any. A trait method value written as `Type::method` can name
 /// the concrete override just as a receiver call does. The deferred member
 /// identity, subject and trait ends, and impl placement all have to match;
 /// sibling types that implement the same trait never enter this result.
-pub(super) const TRAIT_IMPL_MEMBER_AT: &str =
-    "SELECT DISTINCT authority.source_site, member_mount.mount_ordinal
- FROM temp.selected_resolution_mounts AS member_mount
- CROSS JOIN resolution_rust_declaration_authorities AS authority
-  ON authority.blob_id=member_mount.blob_id AND authority.semantic_key=?2
- CROSS JOIN source_rust_item_body_children AS child
-  ON child.blob_id=authority.blob_id AND child.declaration_id=authority.declaration
- CROSS JOIN rust_crate_trait_impls AS impls INDEXED BY rust_crate_trait_impls_subject
-  ON impls.impl_blob_id=child.blob_id
-  AND impls.impl_declaration_id=child.owner_declaration_id
-  AND impls.impl_rel_path=member_mount.persisted_relative_path
- WHERE member_mount.mount_ordinal=?1 AND impls.subject_declaration_blob_id=?3
-  AND impls.subject_declaration_site=?4 AND impls.subject_rel_path=?5
-  AND impls.trait_declaration_blob_id=?6 AND impls.trait_declaration_site=?7
-  AND impls.trait_rel_path=?8
-  AND child.syntax_kind='function_item'
-  AND EXISTS(SELECT 1 FROM selected_rust_crates AS owner
-             WHERE owner.topology_id=impls.topology_id)";
+pub(super) const TRAIT_IMPL_MEMBER_AT: &str = concat!(
+    "WITH RECURSIVE ",
+    rust_selected_members_cte!("WHERE members.blob_id=?3 AND members.rel_path=?5", "?9"),
+    ", subject(workspace_id, generation, unit_key, module_path, identity_id) AS ( \
+     SELECT members.workspace_id, members.generation, members.unit_key, \
+            exports.module_path, exports.identity_id \
+     FROM selected_members AS members \
+     CROSS JOIN main.rust_resolution_unit_summary_exports AS exports \
+       INDEXED BY rust_resolution_unit_summary_exports_declaration \
+       ON exports.summary_id=members.summary_id \
+      AND exports.declaration_member_ordinal=members.member_ordinal \
+      AND exports.declaration_site=?4 AND exports.namespace='type' \
+      AND exports.origin='declaration') ",
+    "SELECT DISTINCT authority.source_site, member_mount.mount_ordinal \
+     FROM subject AS subject_target \
+CROSS JOIN main.rust_resolution_unit_summary_trait_endpoints AS subject_endpoint
+ INDEXED BY rust_resolution_unit_summary_trait_endpoints_target
+ ON subject_endpoint.target_unit_key=subject_target.unit_key
+AND subject_endpoint.target_module_path=subject_target.module_path
+AND subject_endpoint.target_identity_id=subject_target.identity_id
+AND subject_endpoint.endpoint_role='subject' AND subject_endpoint.endpoint_state='resolved'
+CROSS JOIN main.rust_resolution_unit_summary_trait_endpoints AS trait_endpoint
+ ON trait_endpoint.summary_id=subject_endpoint.summary_id
+AND trait_endpoint.member_ordinal=subject_endpoint.member_ordinal
+AND trait_endpoint.owner_module_path=subject_endpoint.owner_module_path
+AND trait_endpoint.source_relation_key=subject_endpoint.source_relation_key
+AND trait_endpoint.endpoint_role='trait' AND trait_endpoint.endpoint_state='resolved'
+CROSS JOIN selected_workspace_revisions AS trait_revision
+ ON trait_revision.workspace_id=subject_target.workspace_id
+AND trait_revision.lang='rust' AND trait_revision.generation=subject_target.generation
+CROSS JOIN main.resolution_unit_summary_versions AS trait_version
+ INDEXED BY sqlite_autoindex_resolution_unit_summary_versions_1
+ ON trait_version.workspace_id=trait_revision.workspace_id
+AND trait_version.lang=trait_revision.lang
+AND trait_version.generation=trait_revision.generation
+AND trait_version.unit_key=trait_endpoint.target_unit_key
+AND trait_version.valid_from<=trait_revision.revision
+AND (trait_version.valid_until IS NULL OR trait_revision.revision<trait_version.valid_until)
+CROSS JOIN main.resolution_unit_summaries AS trait_summary
+ ON trait_summary.summary_id=trait_version.summary_id
+AND trait_summary.lang='rust' AND trait_summary.unit_kind='rust_crate'
+AND trait_summary.publication_state='complete' AND trait_summary.derivation_version=?9
+CROSS JOIN main.resolution_producer_epochs AS trait_epoch
+ ON trait_epoch.lang=trait_version.lang
+AND trait_epoch.producer_epoch=trait_summary.producer_epoch
+CROSS JOIN main.rust_resolution_unit_summary_versions AS trait_rust_version
+ ON trait_rust_version.workspace_id=trait_version.workspace_id
+AND trait_rust_version.lang=trait_version.lang
+AND trait_rust_version.generation=trait_version.generation
+AND trait_rust_version.unit_key=trait_version.unit_key
+AND trait_rust_version.valid_from=trait_version.valid_from
+AND trait_rust_version.summary_id=trait_version.summary_id
+CROSS JOIN main.rust_resolution_unit_summary_contexts AS trait_context
+ ON trait_context.summary_id=trait_version.summary_id
+CROSS JOIN main.resolution_unit_summary_members AS trait_member
+ INDEXED BY resolution_unit_summary_members_blob
+ ON trait_member.summary_id=trait_version.summary_id AND trait_member.blob_id=?6
+AND trait_member.rel_path=?8
+CROSS JOIN selected_workspace_file_versions AS trait_file
+ ON trait_file.workspace_id=trait_version.workspace_id
+AND trait_file.lang=trait_version.lang AND trait_file.generation=trait_version.generation
+AND trait_file.rel_path=trait_member.rel_path
+CROSS JOIN main.blobs AS trait_blob
+ ON trait_blob.id=trait_member.blob_id AND trait_blob.lang=trait_version.lang
+AND trait_blob.generation=trait_version.generation AND trait_blob.blob_oid=trait_file.blob_oid
+CROSS JOIN main.rust_resolution_unit_summary_exports AS trait_export
+ INDEXED BY rust_resolution_unit_summary_exports_declaration
+ ON trait_export.summary_id=trait_member.summary_id
+AND trait_export.declaration_member_ordinal=trait_member.member_ordinal
+AND trait_export.declaration_site=?7 AND trait_export.namespace='type'
+AND trait_export.origin='declaration'
+AND trait_export.identity_id=trait_endpoint.target_identity_id
+CROSS JOIN main.resolution_unit_summary_members AS impl_member
+ ON impl_member.summary_id=subject_endpoint.summary_id
+AND impl_member.member_ordinal=subject_endpoint.member_ordinal
+CROSS JOIN selected_rust_unit_summaries AS impl_unit
+ ON impl_unit.summary_id=impl_member.summary_id
+CROSS JOIN temp.selected_resolution_mounts AS member_mount
+ ON member_mount.mount_ordinal=?1 AND member_mount.blob_id=impl_member.blob_id
+AND member_mount.persisted_relative_path=impl_member.rel_path
+CROSS JOIN resolution_rust_declaration_authorities AS authority
+ ON authority.blob_id=impl_member.blob_id AND authority.semantic_key=?2
+CROSS JOIN source_rust_item_body_children AS child
+ ON child.blob_id=authority.blob_id AND child.declaration_id=authority.declaration
+AND child.owner_declaration_id=subject_endpoint.impl_declaration_id
+WHERE trait_export.module_path=trait_endpoint.target_module_path
+AND child.syntax_kind='function_item'"
+);
 
 /// Visibility of one placed trait, including traits implemented for unindexed
 /// external types. Parameters and block-import extents are as for
 /// [`TRAIT_IMPLS_VISIBLE_AT`].
-pub(super) const TRAIT_VISIBLE_AT: &str =
-    "SELECT DISTINCT names.declaration_blob_id, names.declaration_site, mount.mount_ordinal
- FROM rust_crate_exports AS names INDEXED BY rust_crate_exports_declaration
- CROSS JOIN selected_rust_crates AS naming ON naming.topology_id=names.topology_id
- CROSS JOIN temp.selected_resolution_mounts AS mount
-  ON mount.storage_language='rust' AND mount.persisted_relative_path=?5
-  AND mount.blob_id=names.declaration_blob_id
- WHERE names.declaration_blob_id=?1 AND names.declaration_site=?2 AND names.namespace='type'
-  AND (names.origin<>'declaration'
-   OR EXISTS(SELECT 1 FROM rust_crate_container_sources AS declared
-             WHERE declared.topology_id=names.topology_id
-               AND declared.container_path=names.module_path
-               AND declared.blob_id=names.declaration_blob_id
-               AND declared.rel_path=?5))
-  AND ((names.topology_id=?3 AND names.module_path=?4)
-   OR EXISTS(SELECT 1 FROM rust_crate_imports AS named INDEXED BY rust_crate_imports_target
-             CROSS JOIN source_rust_import_targets AS placed
-               ON placed.blob_id=named.blob_id AND placed.ordinal=named.import_ordinal
-               AND placed.native_scope=named.binder_scope
-             WHERE named.target_crate_key=naming.crate_key
-               AND named.target_module_path=names.module_path
-               AND named.target_name=names.name AND named.topology_id=?3
-               AND named.module_path=?4 AND named.namespace='type'
-               AND (placed.local_start IS NULL
-                    OR EXISTS(SELECT 1 FROM temp.selected_resolution_mounts AS at
-                              CROSS JOIN resolution_sites AS site
-                                ON site.blob_id=at.blob_id AND site.site=?7
-                              WHERE at.mount_ordinal=?6 AND at.blob_id=placed.blob_id
-                                AND placed.local_start<=site.start_byte
-                                AND site.start_byte<placed.local_end)))
-   OR (names.visibility='public'
-       AND EXISTS(SELECT 1 FROM rust_crate_glob_imports AS globs
-                  CROSS JOIN source_rust_import_targets AS placed
-                    ON placed.blob_id=globs.blob_id AND placed.ordinal=globs.import_ordinal
-                    AND placed.native_scope=globs.binder_scope
-                  WHERE globs.topology_id=?3 AND globs.module_path=?4
-                    AND globs.target_crate_key=naming.crate_key
-                    AND globs.target_module_path=names.module_path
-                    AND (placed.local_start IS NULL
-                         OR EXISTS(SELECT 1 FROM temp.selected_resolution_mounts AS at
-                                   CROSS JOIN resolution_sites AS site
-                                     ON site.blob_id=at.blob_id AND site.site=?7
-                                   WHERE at.mount_ordinal=?6 AND at.blob_id=placed.blob_id
-                                     AND placed.local_start<=site.start_byte
-                                     AND site.start_byte<placed.local_end)))))";
+pub(super) const TRAIT_VISIBLE_AT: &str = concat!(
+    rust_trait_name_routes!(
+        "WHERE members.blob_id=?1 AND members.rel_path=?5",
+        "SELECT members.blob_id, exports.declaration_site, members.rel_path, \
+         members.unit_key, members.summary_id, members.topology_id, exports.module_path, \
+         exports.name, exports.visibility, exports.identity_id \
+         FROM selected_members AS members \
+         CROSS JOIN main.rust_resolution_unit_summary_exports AS exports \
+           INDEXED BY rust_resolution_unit_summary_exports_declaration \
+           ON exports.summary_id=members.summary_id \
+          AND exports.declaration_member_ordinal=members.member_ordinal \
+          AND exports.declaration_site=?2 AND exports.namespace='type' \
+          AND exports.origin='declaration' \
+         ",
+        "?8"
+    ),
+    "SELECT DISTINCT names.canonical_blob_id, names.canonical_site, mount.mount_ordinal \
+     FROM trait_names AS names \
+     CROSS JOIN temp.selected_resolution_mounts AS mount \
+       ON mount.storage_language='rust' AND mount.persisted_relative_path=names.canonical_rel_path \
+      AND mount.blob_id=names.canonical_blob_id \
+     WHERE (names.name_topology_id=?3 AND names.name_module_path=?4) \
+        OR EXISTS( \
+          SELECT 1 FROM main.rust_resolution_unit_summary_import_routes AS named \
+            INDEXED BY rust_resolution_unit_summary_import_routes_target_identity \
+          CROSS JOIN selected_rust_unit_summaries AS naming \
+            ON naming.summary_id=named.summary_id AND naming.topology_id=?3 \
+          CROSS JOIN main.resolution_unit_summary_members AS member \
+            ON member.summary_id=named.summary_id AND member.member_ordinal=named.member_ordinal \
+          CROSS JOIN source_rust_import_targets AS placed \
+            ON placed.blob_id=member.blob_id AND placed.source_import_id=named.import_id \
+           AND placed.native_scope=named.binder_scope \
+          WHERE named.target_unit_key=names.name_unit_key \
+            AND named.target_module_path=names.name_module_path AND named.target_name=names.name \
+            AND named.namespace='type' AND named.module_path=?4 \
+            AND (placed.local_start IS NULL OR EXISTS( \
+              SELECT 1 FROM temp.selected_resolution_mounts AS at \
+              CROSS JOIN resolution_sites AS site ON site.blob_id=at.blob_id AND site.site=?7 \
+              WHERE at.mount_ordinal=?6 AND at.blob_id=member.blob_id \
+                AND placed.local_start<=site.start_byte AND site.start_byte<placed.local_end))) \
+        OR (names.name_visibility='public' AND EXISTS( \
+          SELECT 1 FROM main.rust_resolution_unit_summary_glob_imports AS globs \
+            INDEXED BY rust_resolution_unit_summary_glob_imports_target_identity \
+          CROSS JOIN selected_rust_unit_summaries AS naming \
+            ON naming.summary_id=globs.summary_id AND naming.topology_id=?3 \
+          CROSS JOIN main.resolution_unit_summary_members AS member \
+            ON member.summary_id=globs.summary_id AND member.member_ordinal=globs.member_ordinal \
+          CROSS JOIN source_rust_import_targets AS placed \
+            ON placed.blob_id=member.blob_id AND placed.source_import_id=globs.source_import_id \
+           AND placed.native_scope=globs.binder_scope \
+          WHERE globs.target_unit_key=names.name_unit_key \
+            AND globs.target_module_path=names.name_module_path AND globs.module_path=?4 \
+            AND (placed.local_start IS NULL OR EXISTS( \
+              SELECT 1 FROM temp.selected_resolution_mounts AS at \
+              CROSS JOIN resolution_sites AS site ON site.blob_id=at.blob_id AND site.site=?7 \
+              WHERE at.mount_ordinal=?6 AND at.blob_id=member.blob_id \
+                AND placed.local_start<=site.start_byte AND site.start_byte<placed.local_end))))"
+);
 
 /// The crate modules one Rust reference is written in.
 ///
@@ -321,68 +543,85 @@ pub(super) const REFERENCE_MODULE_PLACEMENTS: &str =
 
 /// The workspace crate a path head `?3` names in the module one Rust reference
 /// is written in, when it names one: a workspace dependency's extern name, an
-/// `extern crate dep as alias;` at the crate root (which puts the alias in the
-/// extern prelude, as `rust_crate_point_dependency.sql` reads it), or a
-/// module-level `use` that binds a workspace crate's root
-/// (`use dep as alias;`, `use dep::{self as alias};`,
-/// `extern crate dep as alias;`, persisted by `rust_crate_import_bindings.sql`
-/// as the crate's `crate` module named `self`). `?1` is the reference's mount
-/// ordinal, `?2` its semantic key, as for [`REFERENCE_MODULE_PLACEMENTS`].
-pub(super) const REFERENCE_NAMES_WORKSPACE_CRATE: &str = "SELECT target.crate_name
+/// `extern crate dep as alias;` at the crate root, or a module-level `use` that
+/// binds a workspace crate's root. `?1` is the reference's mount ordinal,
+/// `?2` its semantic key, as for [`REFERENCE_MODULE_PLACEMENTS`].
+pub(super) const REFERENCE_NAMES_WORKSPACE_CRATE_HEAD: &str = r#"WITH owner AS (
+ SELECT unit.workspace_id, unit.lang, unit.generation, unit.revision,
+        unit.summary_id, placement.container_path
  FROM temp.selected_resolution_mounts AS mount
  CROSS JOIN resolution_rust_reference_contexts AS context
   ON context.blob_id=mount.blob_id AND context.semantic_key=?2
  CROSS JOIN selected_rust_module_placements AS placement
   ON placement.mount_ordinal=mount.mount_ordinal
   AND placement.module_declaration IS context.module_declaration
- CROSS JOIN rust_crate_dependencies AS dependency
-  ON dependency.topology_id=placement.topology_id AND dependency.extern_name=?3
-  AND dependency.boundary='workspace'
- CROSS JOIN rust_crate_topologies AS target ON target.crate_key=dependency.dependency_crate_key
+ CROSS JOIN main.rust_resolution_unit_summary_versions AS owner_version
+  INDEXED BY rust_resolution_unit_summary_versions_topology
+  ON owner_version.topology_id=placement.topology_id
+ CROSS JOIN selected_rust_unit_summaries AS unit
+  ON unit.workspace_id=owner_version.workspace_id AND unit.lang=owner_version.lang
+ AND unit.generation=owner_version.generation AND unit.unit_key=owner_version.unit_key
+ AND unit.valid_from=owner_version.valid_from
  WHERE mount.mount_ordinal=?1
+),
+-- The unit keys the owner's crate names under ?3: a declared workspace
+-- dependency, or a crate-root `extern crate` import of a workspace crate.
+target_keys(unit_key) AS (
+ SELECT dependency.dependency_unit_key
+ FROM owner
+ CROSS JOIN main.resolution_unit_summary_dependencies AS dependency
+  ON dependency.summary_id=owner.summary_id AND dependency.boundary='workspace'
+ CROSS JOIN main.rust_resolution_unit_summary_dependency_names AS name
+  ON name.summary_id=dependency.summary_id
+ AND name.dependency_ordinal=dependency.dependency_ordinal AND name.extern_name=?3
  UNION
- SELECT target.crate_name
- FROM temp.selected_resolution_mounts AS mount
- CROSS JOIN resolution_rust_reference_contexts AS context
-  ON context.blob_id=mount.blob_id AND context.semantic_key=?2
- CROSS JOIN selected_rust_module_placements AS placement
-  ON placement.mount_ordinal=mount.mount_ordinal
-  AND placement.module_declaration IS context.module_declaration
- CROSS JOIN rust_crate_container_sources AS root
-  ON root.topology_id=placement.topology_id AND root.container_path='crate'
+ SELECT dependency.dependency_unit_key
+ FROM owner
+ CROSS JOIN main.rust_resolution_unit_summary_placements AS root
+  ON root.summary_id=owner.summary_id AND root.module_path='crate'
+ CROSS JOIN main.resolution_unit_summary_members AS root_member
+  ON root_member.summary_id=root.summary_id AND root_member.member_ordinal=root.member_ordinal
  CROSS JOIN source_rust_import_targets AS import
-  ON import.blob_id=root.blob_id AND import.is_extern_crate=1 AND import.bound_name=?3
-  AND import.local_start IS NULL AND COALESCE(import.owner_module,'')=''
- CROSS JOIN rust_crate_dependencies AS dependency
-  ON dependency.topology_id=root.topology_id AND dependency.extern_name=import.imported_name
-  AND dependency.boundary='workspace'
- CROSS JOIN rust_crate_topologies AS target ON target.crate_key=dependency.dependency_crate_key
- WHERE mount.mount_ordinal=?1
+  ON import.blob_id=root_member.blob_id AND import.is_extern_crate=1
+ AND import.bound_name=?3 AND import.local_start IS NULL
+ AND COALESCE(import.owner_module,'')=''
+ CROSS JOIN main.rust_resolution_unit_summary_dependency_names AS name
+  ON name.summary_id=owner.summary_id AND name.extern_name=import.imported_name
+ CROSS JOIN main.resolution_unit_summary_dependencies AS dependency
+  ON dependency.summary_id=name.summary_id
+ AND dependency.dependency_ordinal=name.dependency_ordinal AND dependency.boundary='workspace'
  UNION
- SELECT target.crate_name
- FROM temp.selected_resolution_mounts AS mount
- CROSS JOIN resolution_rust_reference_contexts AS context
-  ON context.blob_id=mount.blob_id AND context.semantic_key=?2
- CROSS JOIN selected_rust_module_placements AS placement
-  ON placement.mount_ordinal=mount.mount_ordinal
-  AND placement.module_declaration IS context.module_declaration
- CROSS JOIN rust_crate_container_sources AS source
-  ON source.topology_id=placement.topology_id AND source.container_path=placement.container_path
+ SELECT import.target_unit_key
+ FROM owner
+ CROSS JOIN main.rust_resolution_unit_summary_placements AS source
+  ON source.summary_id=owner.summary_id AND source.module_path=owner.container_path
+ CROSS JOIN main.resolution_unit_summary_members AS member
+  ON member.summary_id=source.summary_id AND member.member_ordinal=source.member_ordinal
  CROSS JOIN source_rust_module_scopes AS scope
-  ON scope.blob_id=source.blob_id AND scope.ordinal=source.scope_ordinal
- CROSS JOIN rust_crate_imports AS import
-  ON import.topology_id=source.topology_id AND import.module_path=source.container_path
-  AND import.blob_id=source.blob_id AND import.binder_scope=scope.resolution_scope
-  AND import.namespace='type' AND import.bound_name=?3
-  AND import.target_module_path='crate' AND import.target_name='self'
- CROSS JOIN rust_crate_topologies AS target ON target.crate_key=import.target_crate_key
- WHERE mount.mount_ordinal=?1
- ORDER BY 1 LIMIT 1";
+  ON scope.blob_id=member.blob_id AND scope.ordinal=source.scope_ordinal
+ CROSS JOIN main.rust_resolution_unit_summary_import_routes AS import
+  INDEXED BY rust_resolution_unit_summary_import_routes_binder
+  ON import.summary_id=source.summary_id AND import.member_ordinal=source.member_ordinal
+ AND import.module_path=source.module_path AND import.binder_scope=scope.resolution_scope
+ AND import.namespace='type' AND import.bound_name=?3
+ AND import.target_module_path='crate' AND import.target_name='self'
+)
+"#;
 
-/// Whether the module one Rust reference is written in has a crate-declared
-/// module item (`rust_crate_macro_items`, `module_item`) named `?3`. `?1` is the
-/// reference's mount ordinal, `?2` its semantic key, as for
-/// [`REFERENCE_MODULE_PLACEMENTS`].
+/// The workspace crate names a reference can reach through `extern crate` or a
+/// crate-root import. The head is the requester and its target keys; the shared
+/// target validity is `rust_crate_context::target_unit_joins`.
+pub(super) static REFERENCE_NAMES_WORKSPACE_CRATE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        format!(
+            "{REFERENCE_NAMES_WORKSPACE_CRATE_HEAD}SELECT DISTINCT target_context.crate_name\nFROM owner\nCROSS JOIN target_keys AS keys\n{}\nORDER BY 1 LIMIT 1",
+            super::rust_crate_context::target_unit_joins("?4")
+        )
+    });
+
+/// Whether the module one Rust reference is written in has a declared macro
+/// module named `?3`. `?1` is the reference's mount ordinal, `?2` its semantic
+/// key, as for [`REFERENCE_MODULE_PLACEMENTS`].
 pub(super) const REFERENCE_NAMES_MACRO_MODULE: &str = "SELECT 1
  FROM temp.selected_resolution_mounts AS mount
  CROSS JOIN resolution_rust_reference_contexts AS context
@@ -390,8 +629,11 @@ pub(super) const REFERENCE_NAMES_MACRO_MODULE: &str = "SELECT 1
  CROSS JOIN selected_rust_module_placements AS placement
   ON placement.mount_ordinal=mount.mount_ordinal
   AND placement.module_declaration IS context.module_declaration
- CROSS JOIN rust_crate_macro_items AS item
-  ON item.topology_id=placement.topology_id AND item.module_path=placement.container_path
+ CROSS JOIN selected_rust_unit_summaries AS unit
+  ON unit.topology_id=placement.topology_id
+ CROSS JOIN main.rust_resolution_unit_summary_generated_names AS item
+  INDEXED BY rust_resolution_unit_summary_generated_names_module
+  ON item.summary_id=unit.summary_id AND item.module_path=placement.container_path
   AND item.namespace='type' AND item.name=?3 AND item.module_item=1
  WHERE mount.mount_ordinal=?1";
 
@@ -405,9 +647,15 @@ pub(super) const REFERENCE_NAMES_MACRO_MODULE: &str = "SELECT 1
 /// `?2` its semantic key. No row means the semantic has no Rust declaration
 /// authority, so no crate row binds it.
 pub(super) const OWNER_DECLARATION: &str = "SELECT authority.blob_id, authority.source_site,
-  EXISTS(SELECT 1 FROM rust_crate_container_sources AS placed
-          INDEXED BY rust_crate_containers_blob
-         CROSS JOIN selected_rust_crates AS crates ON crates.topology_id=placed.topology_id
+  EXISTS(SELECT 1 FROM main.resolution_unit_summary_members AS placed
+          INDEXED BY resolution_unit_summary_members_blob
+         CROSS JOIN selected_rust_unit_summaries AS units
+          ON units.summary_id=placed.summary_id
+         CROSS JOIN selected_workspace_file_versions AS files
+          ON files.workspace_id=units.workspace_id AND files.lang=units.lang
+         AND files.generation=units.generation AND files.rel_path=placed.rel_path
+         CROSS JOIN blobs ON blobs.id=placed.blob_id AND blobs.blob_oid=files.blob_oid
+          AND blobs.lang=files.lang AND blobs.generation=files.generation
          WHERE placed.blob_id=authority.blob_id),
   mount.persisted_relative_path
  FROM temp.selected_resolution_mounts AS mount
@@ -541,7 +789,8 @@ pub(crate) fn implemented_traits_nameable_at(
                 path,
                 owner_path,
                 reference.0.get(),
-                reference.1
+                reference.1,
+                RUST_UNIT_SUMMARY_DERIVATION_VERSION
             ],
             |row| {
                 Ok((
@@ -611,7 +860,8 @@ pub(crate) fn trait_nameable_at(
                 path,
                 owner_path,
                 reference.0.get(),
-                reference.1
+                reference.1,
+                RUST_UNIT_SUMMARY_DERIVATION_VERSION
             ],
             |row| {
                 Ok((
@@ -645,21 +895,78 @@ pub(crate) fn trait_nameable_at(
 /// as [`TRAIT_IMPLS_VISIBLE_AT`] does. The body children are read by their
 /// blob's primary key: a declaration id alone is small and repeats in every
 /// blob, so its index would visit one row per file.
-pub(super) const IMPL_ITEM_TRAITS: &str = "SELECT DISTINCT impls.trait_declaration_site,
-  trait_mount.mount_ordinal
- FROM temp.selected_resolution_mounts AS mount
- CROSS JOIN resolution_rust_declaration_authorities AS authority
-  ON authority.blob_id=mount.blob_id AND authority.semantic_key=?2
- CROSS JOIN source_rust_item_body_children AS child
-  ON child.blob_id=authority.blob_id AND +child.declaration_id=authority.declaration
- CROSS JOIN rust_crate_trait_impls AS impls INDEXED BY rust_crate_trait_impls_impl
-  ON impls.impl_blob_id=child.blob_id AND impls.impl_declaration_id=child.owner_declaration_id
-  AND impls.impl_rel_path=mount.persisted_relative_path
- CROSS JOIN temp.selected_resolution_mounts AS trait_mount
-  ON trait_mount.storage_language='rust' AND trait_mount.persisted_relative_path=impls.trait_rel_path
-  AND trait_mount.blob_id=impls.trait_declaration_blob_id
- WHERE mount.mount_ordinal=?1
-  AND EXISTS(SELECT 1 FROM selected_rust_crates AS owner WHERE owner.topology_id=impls.topology_id)";
+pub(super) const IMPL_ITEM_TRAITS: &str = concat!(
+    "WITH RECURSIVE ",
+    rust_selected_members_cte!(
+        "WHERE members.blob_id=(SELECT blob_id FROM temp.selected_resolution_mounts WHERE mount_ordinal=?1) \
+         AND members.rel_path=(SELECT persisted_relative_path FROM temp.selected_resolution_mounts WHERE mount_ordinal=?1)",
+        "?3"
+    ),
+    "SELECT DISTINCT trait_export.declaration_site, trait_mount.mount_ordinal \
+     FROM selected_members AS impl_member \
+     CROSS JOIN temp.selected_resolution_mounts AS mount \
+       ON mount.mount_ordinal=?1 AND mount.blob_id=impl_member.blob_id \
+      AND mount.persisted_relative_path=impl_member.rel_path \
+     CROSS JOIN resolution_rust_declaration_authorities AS authority \
+       ON authority.blob_id=impl_member.blob_id AND authority.semantic_key=?2 \
+     CROSS JOIN source_rust_item_body_children AS child \
+       ON child.blob_id=authority.blob_id AND +child.declaration_id=authority.declaration \
+     CROSS JOIN main.rust_resolution_unit_summary_trait_endpoints AS endpoint \
+       INDEXED BY rust_resolution_unit_summary_trait_endpoints_impl \
+       ON endpoint.summary_id=impl_member.summary_id \
+      AND endpoint.member_ordinal=impl_member.member_ordinal \
+      AND endpoint.impl_declaration_id=child.owner_declaration_id \
+      AND endpoint.endpoint_role='trait' AND endpoint.endpoint_state='resolved' \
+     CROSS JOIN selected_workspace_revisions AS trait_revision \
+       ON trait_revision.workspace_id=impl_member.workspace_id \
+      AND trait_revision.lang='rust' AND trait_revision.generation=impl_member.generation \
+     CROSS JOIN main.resolution_unit_summary_versions AS trait_version \
+       INDEXED BY sqlite_autoindex_resolution_unit_summary_versions_1 \
+       ON trait_version.workspace_id=trait_revision.workspace_id \
+      AND trait_version.lang=trait_revision.lang \
+      AND trait_version.generation=trait_revision.generation \
+      AND trait_version.unit_key=endpoint.target_unit_key \
+      AND trait_version.valid_from<=trait_revision.revision \
+      AND (trait_version.valid_until IS NULL OR trait_revision.revision<trait_version.valid_until) \
+     CROSS JOIN main.resolution_unit_summaries AS trait_summary \
+       ON trait_summary.summary_id=trait_version.summary_id \
+      AND trait_summary.lang='rust' AND trait_summary.unit_kind='rust_crate' \
+      AND trait_summary.publication_state='complete' AND trait_summary.derivation_version=?3 \
+     CROSS JOIN main.resolution_producer_epochs AS trait_epoch \
+       ON trait_epoch.lang=trait_version.lang \
+      AND trait_epoch.producer_epoch=trait_summary.producer_epoch \
+     CROSS JOIN main.rust_resolution_unit_summary_versions AS trait_rust_version \
+       ON trait_rust_version.workspace_id=trait_version.workspace_id \
+      AND trait_rust_version.lang=trait_version.lang \
+      AND trait_rust_version.generation=trait_version.generation \
+      AND trait_rust_version.unit_key=trait_version.unit_key \
+      AND trait_rust_version.valid_from=trait_version.valid_from \
+      AND trait_rust_version.summary_id=trait_version.summary_id \
+     CROSS JOIN main.rust_resolution_unit_summary_contexts AS trait_context \
+       ON trait_context.summary_id=trait_version.summary_id \
+     CROSS JOIN main.rust_resolution_unit_summary_exports AS trait_export \
+       INDEXED BY rust_resolution_unit_summary_exports_identity \
+       ON trait_export.summary_id=trait_version.summary_id \
+      AND trait_export.identity_id=endpoint.target_identity_id \
+      AND trait_export.module_path=endpoint.target_module_path \
+      AND trait_export.namespace='type' AND trait_export.origin='declaration' \
+     CROSS JOIN main.resolution_unit_summary_members AS trait_member \
+       ON trait_member.summary_id=trait_export.summary_id \
+      AND trait_member.member_ordinal=trait_export.declaration_member_ordinal \
+     CROSS JOIN selected_workspace_file_versions AS trait_file \
+       ON trait_file.workspace_id=trait_version.workspace_id \
+      AND trait_file.lang=trait_version.lang \
+      AND trait_file.generation=trait_version.generation \
+      AND trait_file.rel_path=trait_member.rel_path \
+     CROSS JOIN main.blobs AS trait_blob \
+       ON trait_blob.id=trait_member.blob_id AND trait_blob.lang=trait_version.lang \
+      AND trait_blob.generation=trait_version.generation AND trait_blob.blob_oid=trait_file.blob_oid \
+     CROSS JOIN temp.selected_resolution_mounts AS trait_mount \
+       ON trait_mount.storage_language='rust' \
+      AND trait_mount.persisted_relative_path=trait_member.rel_path \
+      AND trait_mount.blob_id=trait_member.blob_id \
+     WHERE child.syntax_kind='function_item'"
+);
 
 /// The traits the crate rows say the impl that declares one Rust item
 /// states, as trait definitions in the selected mounts.
@@ -683,12 +990,19 @@ pub(crate) fn impl_item_traits(
     for row in selection
         .connection()
         .prepare_cached(IMPL_ITEM_TRAITS)?
-        .query_map(params![member.0.get(), member.1], |row| {
-            Ok((
-                row.get::<_, u32>(0)?,
-                SelectedResolutionMountOrdinal::new(row.get::<_, u32>(1)?),
-            ))
-        })?
+        .query_map(
+            params![
+                member.0.get(),
+                member.1,
+                RUST_UNIT_SUMMARY_DERIVATION_VERSION
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, u32>(0)?,
+                    SelectedResolutionMountOrdinal::new(row.get::<_, u32>(1)?),
+                ))
+            },
+        )?
     {
         let (site, ordinal) = row?;
         traits.push(mounted_site_semantic(
@@ -898,16 +1212,19 @@ impl RustCrateRows<'_, '_, '_> {
         )
     }
 
-    /// The crate modules one selected file is placed in.
+    /// The crate modules one selected file is placed in, with whether they
+    /// belong to a directly requested root.
     ///
-    /// A file is a module of every topology whose container rows name it, so
-    /// a lookup written in it asks each placement. Both Rust forward routes
-    /// read this, which is why it lives beside the crate rows rather than in
-    /// either one.
+    /// A file is a module of every topology whose container rows name it.
+    /// Lookup asks each directly requested placement; a dependency placement
+    /// cannot supply an alternate `crate::` root for that same source. Both
+    /// Rust forward routes read this, which is why it lives beside the crate
+    /// rows rather than in either one.
     pub(super) fn modules_for_mount(
         &self,
         mounts: SelectedMountTable<'_, '_>,
         ordinal: SelectedResolutionMountOrdinal,
+        request_topologies: &[i64],
         cancellation: &CancellationToken,
     ) -> Result<Vec<Module>> {
         let mount = mounts.mount_by_ordinal(ordinal)?;
@@ -933,21 +1250,27 @@ impl RustCrateRows<'_, '_, '_> {
             cancellation,
         )?;
         let fragment = mount.fragment();
+        let request_topologies = serde_json::to_string(request_topologies)
+            .expect("Cargo topology ids serialize as JSON");
         conn.prepare_cached(MODULES_FOR_BLOB)?
-            .query_map(params![blob, mount.persisted_relative_path()], |row| {
-                Ok(Module {
-                    topology: row.get(0)?,
-                    path: row.get(1)?,
-                    blob: row.get(2)?,
-                    rel_path: row.get(3)?,
-                    selected_blob: selected_blob.expect("selected module has a published blob"),
-                    fragment,
-                    scope: ResolutionScopeId::new(row.get(4)?),
-                    edition: row.get(5)?,
-                    unmounted: row.get(6)?,
-                    overlay_completion: overlay_completion.clone(),
-                })
-            })?
+            .query_map(
+                params![blob, mount.persisted_relative_path(), request_topologies],
+                |row| {
+                    Ok(Module {
+                        topology: row.get(0)?,
+                        path: row.get(1)?,
+                        blob: row.get(2)?,
+                        rel_path: row.get(3)?,
+                        selected_blob: selected_blob.expect("selected module has a published blob"),
+                        fragment,
+                        scope: ResolutionScopeId::new(row.get(4)?),
+                        edition: row.get(5)?,
+                        unmounted: row.get(6)?,
+                        requested: row.get(7)?,
+                        overlay_completion: overlay_completion.clone(),
+                    })
+                },
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
@@ -1129,7 +1452,8 @@ impl RustCrateRows<'_, '_, '_> {
                     reference.path,
                     subject_path,
                     token.ordinal(),
-                    token.local_key()
+                    token.local_key(),
+                    RUST_UNIT_SUMMARY_DERIVATION_VERSION
                 ],
                 |row| {
                     Ok((
@@ -1300,7 +1624,8 @@ impl RustCrateRows<'_, '_, '_> {
                         subject_path,
                         trait_blob,
                         trait_site,
-                        trait_path
+                        trait_path,
+                        RUST_UNIT_SUMMARY_DERIVATION_VERSION
                     ],
                     |row| {
                         Ok((
@@ -1646,10 +1971,10 @@ impl RustCrateRows<'_, '_, '_> {
                     }
                     name => {
                         if position == 0 {
-                            for row in conn
-                                .prepare_cached(DEPENDENCY)?
-                                .query_map(params![topology, name], |row| row.get::<_, i64>(0))?
-                            {
+                            for row in conn.prepare_cached(DEPENDENCY.as_str())?.query_map(
+                                params![topology, name, RUST_UNIT_SUMMARY_DERIVATION_VERSION],
+                                |row| row.get::<_, i64>(0),
+                            )? {
                                 next.push((row?, "crate".into()));
                             }
                         }
@@ -1723,11 +2048,40 @@ impl RustCrateRows<'_, '_, '_> {
                 }
                 if next.len() == before {
                     if unmounted_root {
-                        *completion = completion.combine(&ResolutionCompletion::incomplete([
-                            ResolutionIncompleteReason::UnmountedFile {
-                                fragment: requester.fragment,
-                            },
-                        ]));
+                        let macro_details =
+                            super::rust_crate_context::macro_gated_unmounted_file_details(
+                                conn,
+                                &requester.rel_path,
+                            )?;
+                        if macro_details.is_empty() {
+                            let inactive_cfg_details =
+                                super::rust_crate_context::inactive_cfg_unmounted_file_details(
+                                    conn,
+                                    &requester.rel_path,
+                                )?;
+                            if inactive_cfg_details.is_empty() {
+                                *completion =
+                                    completion.combine(&ResolutionCompletion::incomplete([
+                                        ResolutionIncompleteReason::UnmountedFile {
+                                            fragment: requester.fragment,
+                                        },
+                                    ]));
+                            } else {
+                                *completion = completion.combine(
+                                    &super::rust_crate_context::inactive_cfg_route_boundary(
+                                        &self.ready.context_identities,
+                                        &inactive_cfg_details,
+                                    ),
+                                );
+                            }
+                        } else {
+                            *completion = completion.combine(
+                                &super::rust_crate_context::macro_gated_route_boundary(
+                                    &self.ready.context_identities,
+                                    &macro_details,
+                                ),
+                            );
+                        }
                     }
                     *completion = completion.combine(&self.crate_inventory_completion(
                         requester,

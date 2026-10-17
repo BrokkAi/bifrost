@@ -123,6 +123,21 @@ impl CodeQueryResultValue {
                     },
                 })
             }
+            Self::RustPointerFinding { value } => {
+                let codes = if value.completeness == "partial" {
+                    vec![CodeQueryDiagnosticCode::SemanticAnalysisPartial]
+                } else {
+                    Vec::new()
+                };
+                Some(CodeQueryRowCoverage {
+                    partition: Box::from(value.id.as_str()),
+                    extent: if codes.is_empty() {
+                        CodeQueryRowCoverageExtent::Exhaustive
+                    } else {
+                        CodeQueryRowCoverageExtent::incomplete(codes)
+                    },
+                })
+            }
             // A class set that is anything but fully known is missing atoms, so
             // the member access it describes cannot support "no class here
             // declares that member".
@@ -187,12 +202,44 @@ impl CodeQueryResultValue {
             // why this is unsupported rather than incomplete (#1949).
             Self::CallShape { value } => Some(CodeQueryRowCoverage {
                 partition: Box::from(value.site_id.as_str()),
-                extent: if value.coverage == CallShapeCoverage::Exact.label() {
+                extent: if matches!(
+                    value.coverage,
+                    coverage if coverage == CallShapeCoverage::Exact.label()
+                        || coverage == CallShapeCoverage::ExactMacroDerived.label()
+                ) {
                     CodeQueryRowCoverageExtent::Exhaustive
                 } else {
                     CodeQueryRowCoverageExtent::Unsupported {
                         capability: Box::from(SUPPRESSED_ROW_SET_CAPABILITY),
                     }
+                },
+            }),
+            Self::PointsToCandidate { value } => Some(CodeQueryRowCoverage {
+                partition: Box::from(value.site_id.as_str()),
+                extent: if value.proof == "proven"
+                    && value.completeness == "complete"
+                    && value.coverage == "exhaustive"
+                    && value.object_cardinality == Some("singleton")
+                    && value.object_id.is_some()
+                {
+                    CodeQueryRowCoverageExtent::Exhaustive
+                } else {
+                    CodeQueryRowCoverageExtent::incomplete(vec![
+                        CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                    ])
+                },
+            }),
+            Self::CallableMetrics { value } => Some(CodeQueryRowCoverage {
+                partition: Box::from(value.site_id.as_str()),
+                extent: match value.coverage {
+                    "exact" => CodeQueryRowCoverageExtent::Exhaustive,
+                    "incomplete" => CodeQueryRowCoverageExtent::incomplete(vec![
+                        CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                    ]),
+                    "unrecorded" => CodeQueryRowCoverageExtent::Unsupported {
+                        capability: Box::from("callable-metrics"),
+                    },
+                    other => panic!("unknown callable metrics coverage {other:?}"),
                 },
             }),
             // Every other family answers a structural or lexical question and
@@ -206,13 +253,14 @@ impl CodeQueryResultValue {
             | Self::Procedure { .. }
             | Self::ProgramPoint { .. }
             | Self::ControlEdge { .. }
-            | Self::ConcurrentAccessConflict { .. }
             | Self::TypestateWitness { .. }
             | Self::FlowWitness { .. }
             | Self::AbsentMemberFinding { .. }
             | Self::AbsentMemberWitness { .. }
             | Self::File { .. }
+            | Self::DependencyEvidence { .. }
             | Self::ConfigurationFact { .. }
+            | Self::CrossDomain { .. }
             | Self::ReferenceSite { .. }
             | Self::CallSite { .. }
             | Self::ExpressionSite { .. }
@@ -238,6 +286,7 @@ impl CodeQueryResultValue {
             | Self::DetachedTaskTransfer { .. }
             | Self::ProcedureEffect { .. }
             | Self::CallableSignature { .. }
+            | Self::LiteralOccurrence { .. }
             | Self::SignatureParameter { .. }
             | Self::DecoratedParameter { .. }
             | Self::CallableApplicability { .. }
@@ -247,6 +296,7 @@ impl CodeQueryResultValue {
             | Self::DispatchTarget { .. }
             | Self::MemberFamily { .. }
             | Self::MemberFamilyEdge { .. }
+            | Self::PythonHierarchyFact { .. }
             | Self::Occurrence { .. }
             | Self::LexicalScope { .. }
             | Self::Binding { .. }
@@ -257,12 +307,16 @@ impl CodeQueryResultValue {
             | Self::DeclarationState { .. }
             | Self::ReferenceEdge { .. }
             | Self::StateEvent { .. }
+            | Self::BindingInitializerCall { .. }
             | Self::FlowRelation { .. }
             | Self::ControlRelation { .. }
             | Self::BranchRelation { .. }
             | Self::LoopRelation { .. }
+            | Self::CppExpression { .. }
             | Self::FailureHandlerState { .. }
             | Self::StatementReachability { .. }
+            | Self::PendingCleanupFlow { .. }
+            | Self::PythonRuleFact { .. }
             | Self::Guard { .. }
             | Self::RewritePath { .. }
             | Self::QualifiedPath { .. }

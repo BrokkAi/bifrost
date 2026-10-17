@@ -1,23 +1,26 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{self, Write};
 
 use super::value_flow::{
     call_symbol_site, point_symbol_site, public_carrier_symbol, public_symbol_site,
 };
 use super::{
-    CodeQueryAbsentMemberWitness, CodeQueryAbsentMemberWitnessStatus, CodeQueryFlowEvent,
-    CodeQueryFlowFactSymbol, CodeQueryRange, CodeQuerySemanticCompleteness,
+    CodeQueryAbsentMemberWitness, CodeQueryAbsentMemberWitnessStatus, CodeQueryFlowCarrierSymbol,
+    CodeQueryFlowEvent, CodeQueryFlowFactSymbol, CodeQueryRange, CodeQuerySemanticCompleteness,
     CodeQuerySemanticEvidence, CodeQuerySemanticProof, CodeQuerySourceSite, CodeQueryTaintFinding,
     CodeQueryTaintOrigin, CodeQueryTaintProjectionLimits, CodeQueryTaintWitness,
     public_witness_step,
 };
 use crate::analyzer::semantic::{
-    EvidenceCompleteness, LengthDelimitedDigest, ProofStatus, SemanticLocator,
+    CallSiteHandle, EvidenceCompleteness, LengthDelimitedDigest, ProgramPointHandle, ProofStatus,
+    ReturnTransferKind, SemanticLocator,
 };
 use crate::analyzer::{ProjectFile, WorkspaceAnalyzer};
 use crate::cancellation::CancellationToken;
 use crate::text_utils::{compute_line_starts, line_column_for_offset};
-use brokk_bifrost_flow::dataflow::{PathQuality, SummaryWitness};
+use brokk_bifrost_analysis::analyzer::common::serialized_json_len;
+use brokk_bifrost_flow::dataflow::{
+    PathQuality, SummaryWitness, SummaryWitnessStep, SummaryWitnessStepKind,
+};
 use brokk_bifrost_flow::taint::{
     SourceEventKey, TaintAnalysisPlan, TaintFindingReport, TaintModelError,
 };
@@ -102,7 +105,7 @@ pub(super) fn public_absent_member_witness(
                     .map(|step| public_witness_step(workspace, step)),
                 max_steps,
                 max_bytes,
-                serialized_json_bytes,
+                serialized_json_len,
             );
             row.steps = steps;
             row.retained_bytes = retained_bytes;
@@ -135,27 +138,6 @@ pub(super) fn public_absent_member_witness(
         }
     }
     row
-}
-
-fn serialized_json_bytes(value: &impl serde::Serialize) -> usize {
-    struct ByteCounter(usize);
-
-    impl Write for ByteCounter {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.0 = self
-                .0
-                .checked_add(bytes.len())
-                .ok_or_else(|| io::Error::other("serialized byte count overflow"))?;
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    let mut counter = ByteCounter(0);
-    serde_json::to_writer(&mut counter, value).map_or(usize::MAX, |()| counter.0)
 }
 
 pub(super) fn locator_file(
@@ -199,15 +181,9 @@ pub(super) fn public_evidence(
     proof: &ProofStatus,
     completeness: &EvidenceCompleteness,
 ) -> CodeQuerySemanticEvidence {
-    CodeQuerySemanticEvidence::from_axis_reasons(
-        match proof {
-            ProofStatus::Proven => CodeQuerySemanticProof::Proven,
-            ProofStatus::Unproven(_) => CodeQuerySemanticProof::Unproven,
-        },
-        match completeness {
-            EvidenceCompleteness::Complete => CodeQuerySemanticCompleteness::Complete,
-            EvidenceCompleteness::Partial(_) => CodeQuerySemanticCompleteness::Partial,
-        },
+    super::results::public_semantic_evidence(
+        matches!(proof, ProofStatus::Proven),
+        matches!(completeness, EvidenceCompleteness::Complete),
         match proof {
             ProofStatus::Proven => None,
             ProofStatus::Unproven(reason) => Some(bounded_reason(reason)),
@@ -244,6 +220,69 @@ pub(super) fn hash_public_locator(digest: &mut LengthDelimitedDigest, locator: &
 
 pub(super) fn saturating_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+pub(super) fn record_omitted_witnesses(
+    witness_truncated: &mut bool,
+    omitted_witnesses: &mut u64,
+    omitted_lower_bound: usize,
+) {
+    *witness_truncated = true;
+    *omitted_witnesses = omitted_witnesses.saturating_add(saturating_u64(omitted_lower_bound));
+}
+
+pub(super) fn map_witness_step_kind<T>(
+    kind: SummaryWitnessStepKind,
+    seed: T,
+    edge: impl FnOnce(&'static str) -> T,
+    end_summary_gap: impl FnOnce(&'static str) -> T,
+) -> T {
+    match kind {
+        SummaryWitnessStepKind::Seed => seed,
+        SummaryWitnessStepKind::Edge(kind) => edge(kind.label()),
+        SummaryWitnessStepKind::EndSummaryGap(kind) => end_summary_gap(match kind {
+            ReturnTransferKind::Normal => "normal",
+            ReturnTransferKind::Exceptional => "exceptional",
+        }),
+    }
+}
+
+pub(super) fn public_flow_fact_symbol(
+    source: Option<CodeQueryFlowEvent>,
+    carrier: Option<CodeQueryFlowCarrierSymbol>,
+    sink: Option<CodeQueryFlowEvent>,
+    uncertain: bool,
+) -> CodeQueryFlowFactSymbol {
+    match (source, carrier, sink) {
+        (None, None, None) => CodeQueryFlowFactSymbol::Zero,
+        (Some(source), Some(carrier), None) => CodeQueryFlowFactSymbol::Carrier {
+            source: Box::new(source),
+            carrier: Box::new(carrier),
+            uncertain,
+        },
+        (Some(source), None, Some(sink)) => CodeQueryFlowFactSymbol::Meeting {
+            source: Box::new(source),
+            sink: Box::new(sink),
+            uncertain,
+        },
+        shape => panic!("invalid projected flow witness fact shape: {shape:?}"),
+    }
+}
+
+pub(super) fn public_flow_witness_step(
+    workspace: &WorkspaceAnalyzer,
+    step: &SummaryWitnessStep,
+    mut project_fact: impl FnMut(brokk_bifrost_flow::dataflow::FactId) -> CodeQueryFlowFactSymbol,
+) -> super::CodeQueryFlowWitnessStep {
+    let mut public = public_witness_step(workspace, step);
+    public.source_symbol = Some(point_symbol_site(workspace, step.source()));
+    public.target_symbol = step
+        .target()
+        .map(|point| point_symbol_site(workspace, point));
+    public.origin_symbol = step.origin().map(|call| call_symbol_site(workspace, call));
+    public.input = Some(project_fact(step.input_fact()));
+    public.output = Some(project_fact(step.output_fact()));
+    public
 }
 
 /// Project one retained diagnostic-neutral report into the public taint query
@@ -338,8 +377,14 @@ pub(crate) fn project_taint_finding_report_bounded(
         }
         let sink = findings[0].key().sink();
         let mut reached_labels = BTreeSet::new();
-        let mut origin_evidence =
-            BTreeMap::<SourceEventKey, (BTreeSet<String>, Vec<&SummaryWitness>)>::new();
+        let mut origin_evidence = BTreeMap::<
+            SourceEventKey,
+            (
+                BTreeSet<String>,
+                Vec<&SummaryWitness>,
+                Option<FrontierSourceObservation<'_>>,
+            ),
+        >::new();
         let mut proven = true;
         let mut complete = report.is_complete();
         let mut origins_truncated = false;
@@ -366,8 +411,11 @@ pub(crate) fn project_taint_finding_report_bounded(
                     cancelled = true;
                     break;
                 }
-                let (labels, witnesses) =
+                let (labels, witnesses, frontier_source) =
                     origin_evidence.entry(origin.origin().clone()).or_default();
+                if frontier_source.is_none() {
+                    *frontier_source = origin.frontier_source();
+                }
                 labels.extend(
                     plan.universe()
                         .stable_classes(origin.classes())?
@@ -410,7 +458,7 @@ pub(crate) fn project_taint_finding_report_bounded(
 
         let mut origins = Vec::new();
         let mut retained_witnesses = Vec::new();
-        for (origin, (labels, witnesses)) in
+        for (origin, (labels, witnesses, _)) in
             origin_evidence.iter().take(limits.max_origins_per_finding)
         {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -451,16 +499,24 @@ pub(crate) fn project_taint_finding_report_bounded(
                 cancelled = true;
                 break;
             }
-            let source_event = public_taint_source_event(workspace, plan, projection_scope, origin);
+            let source_event = public_taint_source_event(
+                workspace,
+                plan,
+                projection_scope,
+                origin,
+                origin_evidence[origin].2,
+            );
             let mut public_steps = witness.steps().iter().map(|step| {
-                public_taint_witness_step(
-                    workspace,
-                    plan,
-                    report,
-                    projection_scope,
-                    &source_event,
-                    step,
-                )
+                public_flow_witness_step(workspace, step, |fact_id| {
+                    public_taint_fact_symbol(
+                        workspace,
+                        plan,
+                        report,
+                        projection_scope,
+                        &source_event,
+                        fact_id,
+                    )
+                })
             });
             let mut steps = Vec::new();
             let mut witness_bytes = 0usize;
@@ -471,7 +527,7 @@ pub(crate) fn project_taint_finding_report_bounded(
                     cancelled = true;
                     break;
                 }
-                let step_bytes = serialized_json_bytes(&step);
+                let step_bytes = serialized_json_len(&step);
                 if steps.len() == limits.max_steps_per_witness {
                     projection_cause = Some("projection_step_limit");
                     omitted_steps = 1usize.saturating_add(public_steps.count());
@@ -556,7 +612,7 @@ pub(crate) fn project_taint_finding_report_bounded(
         let projected_bytes = if max_projected_bytes == usize::MAX {
             0
         } else {
-            serialized_json_bytes(&public)
+            serialized_json_len(&public)
         };
         if projected_bytes > max_projected_bytes.saturating_sub(retained_bytes) {
             truncated = true;
@@ -580,39 +636,6 @@ pub(crate) fn project_taint_finding_report_bounded(
     })
 }
 
-fn public_taint_witness_step(
-    workspace: &WorkspaceAnalyzer,
-    plan: &TaintAnalysisPlan,
-    report: &TaintFindingReport,
-    projection_scope: &str,
-    source_event: &CodeQueryFlowEvent,
-    step: &brokk_bifrost_flow::dataflow::SummaryWitnessStep,
-) -> super::CodeQueryFlowWitnessStep {
-    let mut public = public_witness_step(workspace, step);
-    public.source_symbol = Some(point_symbol_site(workspace, step.source()));
-    public.target_symbol = step
-        .target()
-        .map(|point| point_symbol_site(workspace, point));
-    public.origin_symbol = step.origin().map(|call| call_symbol_site(workspace, call));
-    public.input = Some(public_taint_fact_symbol(
-        workspace,
-        plan,
-        report,
-        projection_scope,
-        source_event,
-        step.input_fact(),
-    ));
-    public.output = Some(public_taint_fact_symbol(
-        workspace,
-        plan,
-        report,
-        projection_scope,
-        source_event,
-        step.output_fact(),
-    ));
-    public
-}
-
 fn public_taint_fact_symbol(
     workspace: &WorkspaceAnalyzer,
     plan: &TaintAnalysisPlan,
@@ -626,53 +649,48 @@ fn public_taint_fact_symbol(
         .fact_result()
         .fact(fact_id)
         .expect("validated taint witness fact resolves");
-    if let Some(carrier) = fact.carrier() {
-        return CodeQueryFlowFactSymbol::Carrier {
-            source: Box::new(source_event.clone()),
-            carrier: Box::new(public_carrier_symbol(
-                workspace,
-                plan.value_flow()
-                    .carrier_key(carrier)
-                    .expect("validated taint witness carrier resolves"),
-            )),
-            uncertain: fact.is_uncertain(),
-        };
-    }
-    if let Some(sink) = fact.sink() {
-        return CodeQueryFlowFactSymbol::Meeting {
-            source: Box::new(source_event.clone()),
-            sink: Box::new(public_taint_flow_event_for_sink(
-                workspace,
-                plan,
-                projection_scope,
-                sink,
-            )),
-            uncertain: fact.is_uncertain(),
-        };
-    }
-    CodeQueryFlowFactSymbol::Zero
+    let carrier_id = fact.carrier();
+    let sink_id = fact.sink();
+    let source = (carrier_id.is_some() || sink_id.is_some()).then(|| source_event.clone());
+    let carrier = carrier_id.map(|carrier| {
+        public_carrier_symbol(
+            workspace,
+            plan.value_flow()
+                .carrier_key(carrier)
+                .expect("validated taint witness carrier resolves"),
+        )
+    });
+    let sink = sink_id
+        .map(|sink| public_taint_flow_event_for_sink(workspace, plan, projection_scope, sink));
+    public_flow_fact_symbol(source, carrier, sink, fact.is_uncertain())
 }
 
+/// The phase and carrier of a source a composition matched on its frontier.
+type FrontierSourceObservation<'a> = (
+    brokk_bifrost_flow::value_flow::ValueFlowObservationPhase,
+    &'a brokk_bifrost_flow::value_flow::ValueFlowCarrier,
+);
+
+/// The public event of one origin: the plan's source specification, or for a
+/// source a composition matched on its frontier, the phase and carrier its
+/// evidence carries.
 fn public_taint_source_event(
     workspace: &WorkspaceAnalyzer,
     plan: &TaintAnalysisPlan,
     projection_scope: &str,
     origin: &SourceEventKey,
+    frontier_source: Option<FrontierSourceObservation<'_>>,
 ) -> CodeQueryFlowEvent {
     let key = origin.value_flow_key();
-    let spec = plan
-        .value_flow()
-        .sources()
-        .find_map(|(_, spec)| (spec.key() == key).then_some(spec))
-        .expect("validated taint origin source resolves");
-    public_taint_event(
-        workspace,
-        projection_scope,
-        "source",
-        spec.key(),
-        spec.phase(),
-        spec.carrier(),
-    )
+    let (phase, carrier) = match frontier_source {
+        Some(observation) => observation,
+        None => plan
+            .value_flow()
+            .sources()
+            .find_map(|(_, spec)| (spec.key() == key).then(|| (spec.phase(), spec.carrier())))
+            .expect("validated taint origin source resolves"),
+    };
+    public_taint_event(workspace, projection_scope, "source", key, phase, carrier)
 }
 
 fn public_taint_flow_event_for_sink(
@@ -727,7 +745,7 @@ fn public_taint_event(
     }
 }
 
-fn public_source_site(
+pub(super) fn public_source_site(
     workspace: &WorkspaceAnalyzer,
     locator: &SemanticLocator,
 ) -> CodeQuerySourceSite {
@@ -735,6 +753,42 @@ fn public_source_site(
         path: locator.path().as_str().to_owned(),
         range: locator_range(workspace, locator),
     }
+}
+
+pub(super) fn program_point_locator(handle: &ProgramPointHandle) -> &SemanticLocator {
+    let _point = handle
+        .procedure()
+        .semantics()
+        .point(handle.id())
+        .expect("validated witness point resolves");
+    handle
+        .locator()
+        .expect("validated witness point has source mapping")
+}
+
+pub(super) fn call_site_locator(handle: &CallSiteHandle) -> &SemanticLocator {
+    let _call = handle
+        .procedure()
+        .semantics()
+        .call_site(handle.id())
+        .expect("validated witness call resolves");
+    handle
+        .locator()
+        .expect("validated witness call has source mapping")
+}
+
+pub(super) fn public_program_point_site(
+    workspace: &WorkspaceAnalyzer,
+    handle: &ProgramPointHandle,
+) -> CodeQuerySourceSite {
+    public_source_site(workspace, program_point_locator(handle))
+}
+
+pub(super) fn public_call_site(
+    workspace: &WorkspaceAnalyzer,
+    handle: &CallSiteHandle,
+) -> CodeQuerySourceSite {
+    public_source_site(workspace, call_site_locator(handle))
 }
 
 pub(super) fn public_taint_event_id(
@@ -791,17 +845,10 @@ fn public_taint_quality(
     truncated: bool,
     truncation_cause: Option<&str>,
 ) -> CodeQuerySemanticEvidence {
-    CodeQuerySemanticEvidence::new(
-        if quality.is_proven() {
-            CodeQuerySemanticProof::Proven
-        } else {
-            CodeQuerySemanticProof::Unproven
-        },
-        if quality.is_complete() && !truncated {
-            CodeQuerySemanticCompleteness::Complete
-        } else {
-            CodeQuerySemanticCompleteness::Partial
-        },
+    super::results::public_semantic_evidence(
+        quality.is_proven(),
+        quality.is_complete() && !truncated,
+        None,
         truncated.then(|| match truncation_cause {
             Some(cause) => format!("taint witness evidence is truncated: {cause}"),
             None => "taint witness evidence is truncated".to_owned(),
@@ -820,16 +867,6 @@ mod tests {
 
         assert_eq!(retained, ["aaaa"]);
         assert_eq!(retained_bytes, 4);
-        assert_eq!(omitted, 2);
-    }
-
-    #[test]
-    fn zero_step_projection_omits_the_whole_witness() {
-        let (retained, retained_bytes, omitted) =
-            retain_prefix_by_bytes(["first", "second"], 0, usize::MAX, |value| value.len());
-
-        assert!(retained.is_empty());
-        assert_eq!(retained_bytes, 0);
         assert_eq!(omitted, 2);
     }
 

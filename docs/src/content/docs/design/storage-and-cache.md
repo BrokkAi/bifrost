@@ -46,6 +46,17 @@ set with a completion marker in one transaction. Cancellation, timeout, parser
 failure, and interrupted writers leave an unusable candidate. Readers select
 only committed facts marked complete in the active analysis generation.
 
+For Rust, the lowered semantic IR and each procedure's partial flows are
+content facts as well. They are written in the blob's parse transaction under
+a publication head and a semantic producer epoch, and they depend on nothing
+outside the file. A blob without a current publication is reparsed by the
+startup reconcile. Until then, and for unsaved overlays, the artifact is
+lowered on demand in memory, and that lowering writes no rows. The
+byte-capped semantic artifact cache holds complete artifacts of both kinds:
+decoded from rows or lowered on demand. The [Dataflow
+Engine](../dataflow-engine/#composed-taint-over-stored-partial-flows) chapter
+describes what the rows contain and how taint queries compose them.
+
 ### Revisioned workspace projections
 
 The store also needs a path mapping for the files in a workspace. An immutable
@@ -66,11 +77,13 @@ This projection is the main isolation boundary:
 
 Source files and retained configuration inputs share this revision selection.
 Their roles remain explicit: only source inputs own declaration and package
-projection rows. Cargo manifests retain their exact bytes independently of
-parsed source facts, so an older revision remains interpretable after reopening
-the cache. Changing a manifest advances the workspace revision without replacing
-unchanged source publications. Cargo interpretation is derived from those
-selected bytes; parsed manifest tables are not a second durable authority.
+projection rows. Cargo manifests and Cargo configuration files
+(`.cargo/config.toml`) retain their exact bytes independently of parsed source
+facts, so an older revision remains interpretable after reopening the cache.
+Changing either advances the workspace revision without replacing unchanged
+source publications. Cargo interpretation, including the cfg set and patches a
+configuration file selects, is derived from those selected bytes; parsed
+manifest and configuration tables are not a second durable authority.
 
 Scoped sessions share the repository's content facts but select their files
 through a unique session projection. They never reconcile their partial file
@@ -117,7 +130,7 @@ Several version-like values protect different boundaries:
 
 | Mechanism | Changes when | Effect |
 | --- | --- | --- |
-| Store schema version | The relational layout or migration contract changes | Opens a compatible versioned store; older store files may coexist until cleanup |
+| Store schema version | The relational layout or migration contract changes | Opens its own versioned store; collection chooses at most one other by most recent use and removes it after two weeks unused; a busy store waits for later collection |
 | Language epoch | Grammar, extraction queries, or language-specific persisted semantics change | Rotates that language's active generation so incompatible rows become invisible |
 | Workspace revision | The live path-to-content or workspace projection changes | Selects a new immutable live view without invalidating reusable content elsewhere |
 | Content identity | File bytes or an unsaved overlay change | Invalidates products that depend on that content |
@@ -239,19 +252,25 @@ write follows a close and a short-lived session still advances the cadence.
 | Cache only complete immutable derived values | Reuse cannot promote partial work into certainty | Cancelled or bounded work may be recomputed |
 | Separate semantic-pack objects from analyzer rows | Independent provenance, sharing, and retention boundaries | Operators must reason about two stores with distinct lifetimes |
 
-## Direction: compositional resolution fragments
+## Compositional resolution fragments
 
-**Status: Direction.** Repeated name and member resolution could be
-factored into small immutable fragments: a decoded import binding, one owner or
-namespace hop, or a candidate set with its proof and completeness. A larger
-resolution would compose those fragments and invalidate only the pieces whose
-declared dependencies changed.
+**Status: Current for Rust; Direction for other languages.** Name and member
+resolution is composed from small immutable pieces. Each file's binding graph
+and typed facts are stored under the file's content identity. Each build unit's
+context rows, such as a Cargo crate's module tree and exports, are stored under
+a digest of their inputs. A query joins those pieces for the selected revision.
+An edit replaces only the changed file's pieces and derives again only the
+build units it affects. The [Name Resolution Engine](../name-resolution/)
+chapter describes the design.
 
-A persistent cross-request contract is still required. Fragment identities
-must cover language semantics, scope, visibility, dependency graphs, ambiguity,
-and negative-result completeness. An empty candidate set can be cached only when
-its search is provably exhaustive. Bifrost recomputes at the coarser
-complete-value boundaries above until those contracts exist.
+Bifrost does not store a resolved answer for reuse by later requests. Each
+query joins the stored pieces again. Storing resolved answers would require
+fragment identities that cover language semantics, scope, visibility,
+dependency graphs, ambiguity, and negative-result completeness, and an empty
+candidate set could be stored only when its search is provably exhaustive.
+Languages that have not moved onto the engine recompute at the coarser
+complete-value boundaries above; see
+[Language status](../name-resolution/#language-status).
 
 [Immutable compositional usage facts](../usage-analysis/#persisted-inputs-and-compositional-usage-facts)
 specifies workspace composition; its roadmap entry is

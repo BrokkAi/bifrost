@@ -12,6 +12,8 @@ use schemars::JsonSchema;
 
 mod configuration;
 mod coverage;
+mod cross_domain;
+mod dependency;
 mod diagnostics;
 mod environment;
 #[cfg(feature = "query-result-fixtures")]
@@ -25,12 +27,15 @@ mod topology;
 
 pub use configuration::*;
 pub use coverage::*;
+pub use cross_domain::*;
+pub use dependency::*;
 pub use diagnostics::*;
 pub use environment::*;
 #[cfg(feature = "query-result-fixtures")]
 pub use fixtures::code_query_result_fixtures_json;
 pub use provenance::*;
 pub use rows::*;
+pub(super) use semantic::public_semantic_evidence;
 pub use semantic::*;
 pub use sites::*;
 pub use topology::*;
@@ -401,10 +406,6 @@ pub enum CodeQueryResultValue {
         #[serde(flatten)]
         value: Box<CodeQueryTypestateFinding>,
     },
-    ConcurrentAccessConflict {
-        #[serde(flatten)]
-        value: Box<CodeQueryConcurrentAccessConflict>,
-    },
     TypestateWitness {
         #[serde(flatten)]
         value: Box<CodeQueryTypestateWitness>,
@@ -436,6 +437,10 @@ pub enum CodeQueryResultValue {
     File {
         #[serde(flatten)]
         value: CodeQueryFile,
+    },
+    DependencyEvidence {
+        #[serde(flatten)]
+        value: Box<CodeQueryDependencyEvidence>,
     },
     ConfigurationFact {
         #[serde(flatten)]
@@ -472,6 +477,10 @@ pub enum CodeQueryResultValue {
     ReceiverEvidence {
         #[serde(flatten)]
         value: Box<CodeQueryReceiverEvidence>,
+    },
+    PointsToCandidate {
+        #[serde(flatten)]
+        value: Box<CodeQueryPointsToCandidate>,
     },
     FieldWriteValue {
         #[serde(flatten)]
@@ -550,6 +559,14 @@ pub enum CodeQueryResultValue {
         #[serde(flatten)]
         value: Box<CodeQueryCallableSignature>,
     },
+    LiteralOccurrence {
+        #[serde(flatten)]
+        value: Box<CodeQueryLiteralOccurrence>,
+    },
+    CallableMetrics {
+        #[serde(flatten)]
+        value: Box<CodeQueryCallableMetrics>,
+    },
     SignatureParameter {
         #[serde(flatten)]
         value: Box<CodeQuerySignatureParameter>,
@@ -585,6 +602,10 @@ pub enum CodeQueryResultValue {
     MemberFamilyEdge {
         #[serde(flatten)]
         value: Box<CodeQueryMemberFamilyEdge>,
+    },
+    PythonHierarchyFact {
+        #[serde(flatten)]
+        value: Box<CodeQueryPythonHierarchyFact>,
     },
     Occurrence {
         #[serde(flatten)]
@@ -626,6 +647,10 @@ pub enum CodeQueryResultValue {
         #[serde(flatten)]
         value: Box<CodeQueryStateEvent>,
     },
+    BindingInitializerCall {
+        #[serde(flatten)]
+        value: Box<CodeQueryBindingInitializerCall>,
+    },
     FlowRelation {
         #[serde(flatten)]
         value: Box<CodeQueryFlowRelation>,
@@ -642,6 +667,10 @@ pub enum CodeQueryResultValue {
         #[serde(flatten)]
         value: Box<CodeQueryLoopRelation>,
     },
+    CppExpression {
+        #[serde(flatten)]
+        value: Box<CodeQueryCppExpression>,
+    },
     FailureHandlerState {
         #[serde(flatten)]
         value: Box<CodeQueryFailureHandlerState>,
@@ -649,6 +678,18 @@ pub enum CodeQueryResultValue {
     StatementReachability {
         #[serde(flatten)]
         value: Box<CodeQueryStatementReachability>,
+    },
+    PendingCleanupFlow {
+        #[serde(flatten)]
+        value: Box<CodeQueryPendingCleanupFlow>,
+    },
+    PythonRuleFact {
+        #[serde(flatten)]
+        value: Box<CodeQueryPythonRuleFact>,
+    },
+    RustPointerFinding {
+        #[serde(flatten)]
+        value: Box<CodeQueryRustPointerFinding>,
     },
     Guard {
         #[serde(flatten)]
@@ -678,6 +719,36 @@ pub enum CodeQueryResultValue {
         #[serde(flatten)]
         value: Box<CodeQueryTopologyEdge>,
     },
+    CrossDomain {
+        #[serde(flatten)]
+        value: Box<CodeQueryCrossDomain>,
+    },
+}
+
+/// Generic structural relationships carried by a full-detail match row.
+///
+/// Kept behind one pointer so adding queryable relationships does not make the
+/// result-value enum disproportionately large. These fields are internal to
+/// policy row projection and are intentionally skipped by ordinary JSON
+/// result serialization.
+#[derive(Debug, Clone)]
+pub struct CodeQueryMatchRelations {
+    pub parent_ast_id: Option<String>,
+    pub left_ast_id: Option<String>,
+    pub right_ast_id: Option<String>,
+    pub object_ast_id: Option<String>,
+    pub object_name: Option<String>,
+    pub callee_ast_id: Option<String>,
+    pub receiver_ast_id: Option<String>,
+    pub enclosing_callable_ast_id: Option<String>,
+    pub name: Option<String>,
+    pub string_value: Option<String>,
+    pub construct: Option<String>,
+    pub occurrence_role: Option<&'static str>,
+    pub element_index: Option<usize>,
+    pub element_count: Option<usize>,
+    pub is_last_element: Option<bool>,
+    pub parameter_index: Option<usize>,
 }
 
 #[cfg_attr(feature = "query-result-fixtures", derive(Default))]
@@ -698,6 +769,10 @@ pub struct CodeQueryMatch {
     /// evaluation always requests it), and compact output exists to be small.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ast_id: Option<String>,
+    /// Generic structural relationships projected only to relational policy
+    /// rows. Ordinary JSON output intentionally omits this internal detail.
+    #[serde(skip)]
+    pub relations: Option<Box<CodeQueryMatchRelations>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node_range: Option<CodeQueryRange>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -710,6 +785,73 @@ pub struct CodeQueryMatch {
     pub captures: Vec<CodeQueryCapture>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enclosing_symbol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub python_import: Option<Box<CodeQueryPythonImportSite>>,
+}
+
+/// Parser-derived Python import facts attached by the opt-in
+/// `python_import_site` query step.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CodeQueryPythonImportSite {
+    pub complete: bool,
+    pub form: Option<&'static str>,
+    pub module: Option<String>,
+    pub name: Option<String>,
+    pub alias: Option<String>,
+    pub modules: Vec<String>,
+    pub names: Vec<String>,
+    pub aliases: Vec<String>,
+    pub wildcard: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub module_scope: Option<bool>,
+    pub source_order: u64,
+    pub target_paths: Vec<String>,
+    pub target_status: &'static str,
+    pub repeated: bool,
+    /// Present only when this import statement is a later simple import of
+    /// the same parsed module into the same local binding in this file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duplicate: Option<bool>,
+    /// Whether this import is inside an exception handler proven to catch the
+    /// builtin `ImportError`; absent when handler identity is unresolved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_import_error_handler: Option<bool>,
+    /// Whether this import is contained by an AST `if __name__ == "__main__"`
+    /// guard; absent when its import-site context could not be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_main_guard: Option<bool>,
+    pub mixed_form: bool,
+    pub own_module: Option<bool>,
+    pub polluting: Option<bool>,
+    pub export_state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cycle_state: Option<&'static str>,
+    pub sites: Vec<CodeQueryPythonImportLeaf>,
+}
+
+/// One canonical import leaf in a Python import statement. This retains the
+/// parser's per-binding structure even when one AST statement imports several
+/// names.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CodeQueryPythonImportLeaf {
+    pub form: &'static str,
+    pub module: String,
+    pub name: Option<String>,
+    pub alias: Option<String>,
+    pub wildcard: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub module_scope: Option<bool>,
+    pub source_order: u64,
+    pub binder_range: Option<CodeQueryRange>,
+    pub target_paths: Vec<String>,
+    pub target_status: &'static str,
+    pub repeated: bool,
+    pub mixed_form: bool,
+    pub own_module: Option<bool>,
+    pub polluting: Option<bool>,
+    pub export_state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cycle_state: Option<&'static str>,
 }
 
 #[cfg_attr(feature = "query-result-fixtures", derive(Default))]

@@ -9,12 +9,14 @@ use crate::graph::PythonGraphSource;
 use crate::graph_support::PythonUsageSource;
 use crate::imports::resolve_fqn_candidates;
 use crate::syntax::{
-    python_deferred_annotation_identifier_ranges, python_deferred_annotation_tree,
+    attribute_chain, python_deferred_annotation_identifier_ranges, python_deferred_annotation_tree,
     python_node_is_in_annotation,
 };
 use crate::usage_index::{
     ModuleBindingEventKind, ModuleBindingTimeline, usage_resolve_module_files, usage_seeds,
+    visible_module_binding_suffix,
 };
+use brokk_bifrost_core::analyzer::common::node_source_text as node_text;
 use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
 use brokk_bifrost_core::analyzer::usages::model::{ExportEntry, ImportBinder, ImportKind};
@@ -307,26 +309,15 @@ pub fn annotation_reference_candidates(
     }
 
     let mut candidates = match node.kind() {
-        "identifier" => {
-            let mut candidates = resolve_bare_annotation_symbol(
-                graph,
-                python,
-                file,
-                source,
-                node,
-                node_text(node, source),
-            );
-            if candidates.is_empty() {
-                candidates.extend(resolve_receiver_type(
-                    graph,
-                    python,
-                    file,
-                    node_text(node, source),
-                    target_self_file,
-                ));
-            }
-            candidates
-        }
+        "identifier" => resolve_bare_annotation_candidates(
+            graph,
+            python,
+            file,
+            source,
+            node,
+            node_text(node, source),
+            target_self_file,
+        ),
         "string_content" => {
             let Some(string) = node.parent() else {
                 return Some(Vec::new());
@@ -340,18 +331,15 @@ pub fn annotation_reference_candidates(
                 let Some(symbol) = source.get(range.start_byte..range.end_byte) else {
                     continue;
                 };
-                let mut symbol_candidates =
-                    resolve_bare_annotation_symbol(graph, python, file, source, node, symbol);
-                if symbol_candidates.is_empty() {
-                    symbol_candidates.extend(resolve_receiver_type(
-                        graph,
-                        python,
-                        file,
-                        symbol,
-                        target_self_file,
-                    ));
-                }
-                candidates.extend(symbol_candidates);
+                candidates.extend(resolve_bare_annotation_candidates(
+                    graph,
+                    python,
+                    file,
+                    source,
+                    node,
+                    symbol,
+                    target_self_file,
+                ));
             }
             candidates
         }
@@ -413,16 +401,15 @@ pub fn annotation_reference_candidates_at_focus(
     }
 
     let symbol = node_text(focused, source);
-    let mut candidates = resolve_bare_annotation_symbol(graph, python, file, source, node, symbol);
-    if candidates.is_empty() {
-        candidates.extend(resolve_receiver_type(
-            graph,
-            python,
-            file,
-            symbol,
-            target_self_file,
-        ));
-    }
+    let mut candidates = resolve_bare_annotation_candidates(
+        graph,
+        python,
+        file,
+        source,
+        node,
+        symbol,
+        target_self_file,
+    );
     candidates.sort();
     candidates.dedup();
     Some(candidates)
@@ -437,7 +424,7 @@ fn focused_annotation_attribute_candidates(
     path: Node<'_>,
     focused: Node<'_>,
 ) -> Vec<CodeUnit> {
-    let Some((root, attributes)) = annotation_attribute_chain(path) else {
+    let Some((root, attributes)) = attribute_chain(path) else {
         return Vec::new();
     };
     if root.id() == focused.id() {
@@ -461,30 +448,27 @@ fn focused_annotation_attribute_candidates(
         }
     }
 
-    let owners: Vec<_> = resolve_bare_annotation_symbol(
+    let Some(mut owner) = unique_bare_annotation_class(
         graph,
         python,
         file,
         source,
         scope_node,
         node_text(root, source),
-    )
-    .into_iter()
-    .filter(CodeUnit::is_class)
-    .collect();
-    let [owner] = owners.as_slice() else {
+    ) else {
         return Vec::new();
     };
-    let mut owner = owner.clone();
     for attribute in attributes {
         let candidates = exact_nested_annotation_class(graph, &owner, node_text(attribute, source));
         if attribute.id() == focused.id() {
             return candidates;
         }
-        let [next] = candidates.as_slice() else {
+        let Some(next) =
+            unique_nested_annotation_class(graph, &owner, node_text(attribute, source))
+        else {
             return Vec::new();
         };
-        owner = next.clone();
+        owner = next;
     }
     Vec::new()
 }
@@ -506,16 +490,9 @@ pub fn annotation_class_qualifier_site<'tree>(
         return None;
     }
 
-    let (root, attributes) = annotation_attribute_chain(node)?;
-    let owners: Vec<_> =
-        resolve_bare_annotation_symbol(graph, python, file, source, root, node_text(root, source))
-            .into_iter()
-            .filter(CodeUnit::is_class)
-            .collect();
-    let [owner] = owners.as_slice() else {
-        return None;
-    };
-    let mut owner = owner.clone();
+    let (root, attributes) = attribute_chain(node)?;
+    let mut owner =
+        unique_bare_annotation_class(graph, python, file, source, root, node_text(root, source))?;
     if &owner == target {
         return Some(root);
     }
@@ -524,12 +501,7 @@ pub fn annotation_class_qualifier_site<'tree>(
     // preceding segments are class qualifiers.
     let qualifier_count = attributes.len().saturating_sub(1);
     for attribute in attributes.into_iter().take(qualifier_count) {
-        let next_candidates =
-            exact_nested_annotation_class(graph, &owner, node_text(attribute, source));
-        let [next] = next_candidates.as_slice() else {
-            return None;
-        };
-        owner = next.clone();
+        owner = unique_nested_annotation_class(graph, &owner, node_text(attribute, source))?;
         if &owner == target {
             return Some(attribute);
         }
@@ -550,45 +522,26 @@ fn resolve_annotation_attribute_types(
     // already understands module/re-export bindings; it simply cannot interpret
     // a class as the namespace for another class.
     let mut candidates = namespace_qualified_declarations(graph, python, file, source, node);
-    let Some((root, attributes)) = annotation_attribute_chain(node) else {
+    let Some((root, attributes)) = attribute_chain(node) else {
         return candidates;
     };
     let root_text = node_text(root, source);
-    let owners: Vec<_> =
-        resolve_bare_annotation_symbol(graph, python, file, source, root, root_text)
-            .into_iter()
-            .filter(CodeUnit::is_class)
-            .collect();
-    let [owner] = owners.as_slice() else {
+    let Some(mut owner) =
+        unique_bare_annotation_class(graph, python, file, source, root, root_text)
+    else {
         return candidates;
     };
-    let mut owner = owner.clone();
 
     for attribute in attributes {
         let segment = node_text(attribute, source);
-        let next_candidates = exact_nested_annotation_class(graph, &owner, segment);
-        let [next] = next_candidates.as_slice() else {
+        let Some(next) = unique_nested_annotation_class(graph, &owner, segment) else {
             return candidates;
         };
-        owner = next.clone();
+        owner = next;
     }
 
     candidates.push(owner);
     candidates
-}
-
-fn annotation_attribute_chain(node: Node<'_>) -> Option<(Node<'_>, Vec<Node<'_>>)> {
-    let mut attributes = Vec::new();
-    let mut current = node;
-    while current.kind() == "attribute" {
-        attributes.push(current.child_by_field_name("attribute")?);
-        current = current.child_by_field_name("object")?;
-    }
-    if current.kind() != "identifier" || attributes.is_empty() {
-        return None;
-    }
-    attributes.reverse();
-    Some((current, attributes))
 }
 
 fn exact_nested_annotation_class(
@@ -602,6 +555,58 @@ fn exact_nested_annotation_class(
         .collect();
     candidates.sort();
     candidates.dedup();
+    candidates
+}
+
+fn unique_bare_annotation_class(
+    graph: &PythonGraphSource<'_>,
+    python: &dyn PythonUsageSource,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    symbol: &str,
+) -> Option<CodeUnit> {
+    let owners: Vec<_> = resolve_bare_annotation_symbol(graph, python, file, source, node, symbol)
+        .into_iter()
+        .filter(CodeUnit::is_class)
+        .collect();
+    let [owner] = owners.as_slice() else {
+        return None;
+    };
+    Some(owner.clone())
+}
+
+fn unique_nested_annotation_class(
+    graph: &PythonGraphSource<'_>,
+    owner: &CodeUnit,
+    segment: &str,
+) -> Option<CodeUnit> {
+    let candidates = exact_nested_annotation_class(graph, owner, segment);
+    let [candidate] = candidates.as_slice() else {
+        return None;
+    };
+    Some(candidate.clone())
+}
+
+fn resolve_bare_annotation_candidates(
+    graph: &PythonGraphSource<'_>,
+    python: &dyn PythonUsageSource,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    symbol: &str,
+    target_self_file: bool,
+) -> Vec<CodeUnit> {
+    let mut candidates = resolve_bare_annotation_symbol(graph, python, file, source, node, symbol);
+    if candidates.is_empty() {
+        candidates.extend(resolve_receiver_type(
+            graph,
+            python,
+            file,
+            symbol,
+            target_self_file,
+        ));
+    }
     candidates
 }
 
@@ -813,16 +818,8 @@ pub fn resolve_visible_named_import_candidates(
     let Some(events) = timeline.get(local) else {
         return Vec::new();
     };
-    let visible: Vec<_> = events
-        .iter()
-        .filter(|event| event.visible_from <= cutoff)
-        .collect();
-    let start = visible
-        .iter()
-        .rposition(|event| !event.conditional)
-        .unwrap_or(0);
     let mut candidates = Vec::new();
-    for event in &visible[start..] {
+    for event in visible_module_binding_suffix(events, cutoff) {
         let ModuleBindingEventKind::FromImport {
             module,
             imported_name,
@@ -1016,10 +1013,6 @@ fn namespace_constructor_fqn(
         fqn.push_str(attribute);
     }
     Some(fqn)
-}
-
-fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    brokk_bifrost_core::analyzer::common::node_source_text(node, source)
 }
 
 fn resolve_indexed_receiver_type(

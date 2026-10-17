@@ -3,9 +3,9 @@ title: Ruby
 description: Query Ruby keyword calls, blocks, imports, qualified classes, and precision boundaries with query_code.
 ---
 
-> Last verified end to end: 2026-07-18 (`query_code` schema version 1).
+> Last verified end to end: 2026-10-01 (`query_code` schema version 1).
 
-For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](../reference-traversal/).
+For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](/code-query-tutorials/reference-traversal/).
 
 Ruby maps ordinary and receiver calls, keyword arguments, blocks/lambdas, methods, qualified classes, assignments, and static imports. Import refinement is deliberately conservative: receiver calls named `require` and interpolated strings do not become precise import modules.
 
@@ -311,7 +311,7 @@ Pipeline wrappers transform syntax matches into declarations or files. `enclosin
 
 This is the direct answer to “which project files import the declaration `graph_target`?”: first convert the declaration match to `graph/c.rb`, then follow one reverse edge. It returns every project file with a resolved direct import of that file; it does **not** claim that each importer calls `graph_target`, nor does it turn an external package import into a synthetic declaration.
 
-To inspect actual uses today, run a structural call query separately. When the declaration is indexed, use `scan_usages_by_reference` with its exact symbol or `scan_usages_by_location` with its declaration range. A pipeline cannot yet feed its file results back into a second structural query as a correlated scope, so it cannot express “among these importers, find calls to this imported member” in one query.
+To list the resolved call sites of the declaration in one query, use `(call-sites-to (enclosing-decl (language ruby (function :name "graph_target"))))`. Each `call_site` row names its caller and callee declarations and carries a `proof` tier; see [Reference Traversal](/code-query-tutorials/reference-traversal/). The fixture above has no calls to `graph_target`, so that query returns no rows here. You can also use `scan_usages_by_reference` with the declaration's exact symbol, or `scan_usages_by_location` with its declaration range. A pipeline cannot feed its file results back into a second structural query as a correlated scope, so it cannot express "among these importers, find calls to this imported member" in one query.
 
 <!-- code-query-case:importers-of-two-hops:rql -->
 ```lisp

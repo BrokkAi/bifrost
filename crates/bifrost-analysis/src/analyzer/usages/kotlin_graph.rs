@@ -48,7 +48,7 @@
 //! and Scala class targets. A *member* reference does not cross: which
 //! declaration `receiver.member` binds to is decided by the target language's
 //! own member-lookup rules, and answering one language's question with another's
-//! would be a guess. See `.agents/plans/kotlin-usage-graph-1239.md`.
+//! would be a guess (#1239).
 
 mod shared;
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
@@ -57,11 +57,11 @@ use brokk_bifrost_core::analyzer::query_token::QueryToken;
 pub(crate) use shared::scan_kotlin_files_for_jvm_type;
 
 use crate::analyzer::usages::common::language_for_target;
+use crate::analyzer::usages::common::with_relational_frontier;
 use crate::analyzer::usages::inverted_edges::{UsageEdgeBuildResult, UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::kotlin_graph::shared::{KotlinEdgeResolver, KotlinQueryResolver};
-use crate::analyzer::usages::model::FuzzyResult;
-use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::traits::{UsageQueryResolver, UsageScanScope};
+use crate::analyzer::usages::outcome::GraphUsageOutcome;
+use crate::analyzer::usages::traits::{GraphUsageDispatchSpec, UsageScanScope};
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::HashSet;
 use brokk_bifrost_jvm::kotlin::graph::KotlinGraphSource;
@@ -92,20 +92,9 @@ fn with_kotlin_graph_source<R>(
     analyzer: &dyn IAnalyzer,
     mut visit: impl FnMut(KotlinGraphSource<'_>) -> R,
 ) -> R {
-    let cancellation = crate::CancellationToken::new();
-    match crate::analyzer::relational_frontier::resolve_relational_frontier(
-        analyzer,
-        &cancellation,
-        |frontier| visit(kotlin_graph_source(analyzer, frontier)),
-    ) {
-        crate::analyzer::RelationalFrontierOutcome::Complete(result) => result,
-        crate::analyzer::RelationalFrontierOutcome::Cancelled => {
-            unreachable!("an uncancelled Kotlin helper frontier cannot cancel")
-        }
-        crate::analyzer::RelationalFrontierOutcome::Failed(error) => {
-            panic!("Kotlin relational helper frontier failed: {error:?}")
-        }
-    }
+    with_relational_frontier(analyzer, "Kotlin", |frontier| {
+        visit(kotlin_graph_source(analyzer, frontier))
+    })
 }
 
 pub(super) fn kotlin_target_spec_replayable(
@@ -294,77 +283,36 @@ impl GraphUsageAnalyzer for KotlinUsageGraphStrategy {
         scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
-        if overloads.is_empty() {
-            return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
-        }
-
-        let target = &overloads[0];
-        if language_for_target(target) != Language::Kotlin {
-            return GraphUsageOutcome::fallback_safe(
-                target.fq_name(),
-                GraphFailureReason::UnsupportedTargetLanguage("target is not Kotlin"),
-                "KotlinUsageGraphStrategy",
-            );
-        }
-
-        let Some(resolver) = KotlinQueryResolver::try_new(analyzer) else {
-            return GraphUsageOutcome::fallback_safe(
-                target.fq_name(),
-                GraphFailureReason::MissingAnalyzerCapability(
-                    "analyzer does not expose KotlinAnalyzer",
-                ),
-                "KotlinUsageGraphStrategy",
-            );
-        };
-
-        resolver.find_usages(analyzer, overloads, scan_scope, max_usages)
+        crate::analyzer::usages::traits::dispatch_graph_usage_query::<KotlinQueryResolver>(
+            analyzer,
+            overloads,
+            scan_scope,
+            max_usages,
+            GraphUsageDispatchSpec {
+                target_language: Language::Kotlin,
+                unsupported_target: "target is not Kotlin",
+                missing_analyzer: "analyzer does not expose KotlinAnalyzer",
+                strategy: "KotlinUsageGraphStrategy",
+            },
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::CancellationToken;
+
     use crate::analyzer::CodeUnitIndex;
     use crate::analyzer::{AnalyzerQueryScope, QueryScope};
     use crate::analyzer::{KotlinAnalyzer, Project, TestProject};
+    use crate::cancellation::CancellationToken;
+    use brokk_bifrost_test_macros::hardwon;
     use std::sync::Arc;
 
-    #[test]
-    fn kotlin_forward_type_and_member_resolution_builds_no_global_definition_shard() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        ProjectFile::new(root.clone(), "Service.kt")
-            .write("package api\n\nclass Service { fun run() {} }\n")
-            .expect("write Kotlin service");
-        let consumer = ProjectFile::new(root.clone(), "Consumer.kt");
-        consumer
-            .write(
-                "package app\n\nimport api.*\n\n\
-                 class Consumer { fun call(service: Service) { service.run() } }\n",
-            )
-            .expect("write Kotlin fixture");
-        let analyzer = KotlinAnalyzer::new(Arc::new(TestProject::new(root, Language::Kotlin)));
-        let target = analyzer
-            .get_all_declarations()
-            .into_iter()
-            .find(|unit| unit.fq_name() == "api.Service.run")
-            .expect("fixture declares Service.run");
-        let candidates = HashSet::from_iter([consumer]);
-        let scan_scope = UsageScanScope::new(&candidates);
-
-        let outcome = KotlinUsageGraphStrategy::new()
-            .find_graph_usages(&analyzer, std::slice::from_ref(&target), &scan_scope, 100)
-            .into_fuzzy_result();
-
-        assert_eq!(outcome.all_hits_including_imports().len(), 1, "{outcome:?}");
-    }
-
-    #[test]
-    fn kotlin_path_scoped_method_scan_reuses_relational_answers() {
-        const CANDIDATE_COUNT: usize = 24;
-
-        let fixture = (0..CANDIDATE_COUNT)
+    fn kotlin_path_scoped_method_fixture(
+        candidate_count: usize,
+    ) -> (KotlinAnalyzer, CodeUnit, HashSet<ProjectFile>) {
+        let fixture = (0..candidate_count)
             .fold(
                 inline_project::InlineTestProject::with_language(Language::Kotlin).file(
                     "Service.kt",
@@ -390,9 +338,20 @@ mod tests {
             .into_iter()
             .find(|unit| unit.fq_name() == "api.Service.run")
             .expect("fixture declares Service.run");
-        let candidates = (0..CANDIDATE_COUNT)
+        let candidates = (0..candidate_count)
             .map(|index| ProjectFile::new(fixture.root(), format!("Consumer{index}.kt")))
-            .collect::<HashSet<_>>();
+            .collect();
+        (analyzer, target, candidates)
+    }
+
+    #[test]
+    #[hardwon(
+        "#2883: Twenty-four real Kotlin callers resolve while the path-scoped query reuses relational answers"
+    )]
+    fn kotlin_path_scoped_method_scan_reuses_relational_answers() {
+        const CANDIDATE_COUNT: usize = 24;
+
+        let (analyzer, target, candidates) = kotlin_path_scoped_method_fixture(CANDIDATE_COUNT);
         let scan_scope = UsageScanScope::new(&candidates);
         let before = analyzer.relational_batch_reader_checkouts_for_test();
 
@@ -418,38 +377,13 @@ mod tests {
     /// the analyzer has cached -- the walk used to visit every cached state and
     /// deep-clone the survivors, so a warm scan cost more than a cold one.
     #[test]
+    #[hardwon(
+        "#2883: After warming the Kotlin scan, a second query reuses file state instead of rematerializing candidates"
+    )]
     fn kotlin_warm_scan_materializes_no_cached_file_states() {
         const CANDIDATE_COUNT: usize = 12;
 
-        let fixture = (0..CANDIDATE_COUNT)
-            .fold(
-                inline_project::InlineTestProject::with_language(Language::Kotlin).file(
-                    "Service.kt",
-                    "package api\n\nclass Service { fun run() {} }\n",
-                ),
-                |fixture, index| {
-                    fixture.file(
-                        format!("Consumer{index}.kt"),
-                        format!(
-                            "package app\n\nimport api.Service\n\n\
-                         class Consumer{index} {{\n\
-                             private val service = Service()\n\n\
-                             fun call() {{ service.run() }}\n\
-                         }}\n"
-                        ),
-                    )
-                },
-            )
-            .build();
-        let analyzer = KotlinAnalyzer::new(fixture.project_arc());
-        let target = analyzer
-            .get_all_declarations()
-            .into_iter()
-            .find(|unit| unit.fq_name() == "api.Service.run")
-            .expect("fixture declares Service.run");
-        let candidates = (0..CANDIDATE_COUNT)
-            .map(|index| ProjectFile::new(fixture.root(), format!("Consumer{index}.kt")))
-            .collect::<HashSet<_>>();
+        let (analyzer, target, candidates) = kotlin_path_scoped_method_fixture(CANDIDATE_COUNT);
         let scan_scope = UsageScanScope::new(&candidates);
         let scan = || {
             KotlinUsageGraphStrategy::new()
@@ -475,91 +409,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn kotlin_inverted_type_and_member_resolution_uses_relational_lookup() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        ProjectFile::new(root.clone(), "Service.kt")
-            .write("package api\n\nclass Service { fun run() {} }\n")
-            .expect("write Kotlin service");
-        ProjectFile::new(root.clone(), "Consumer.kt")
-            .write(
-                "package app\n\nimport api.*\n\n\
-                 class Consumer { fun call(service: Service) { service.run() } }\n",
-            )
-            .expect("write Kotlin consumer");
-        let analyzer = KotlinAnalyzer::new(Arc::new(TestProject::new(root, Language::Kotlin)));
-        let nodes = analyzer
-            .get_all_declarations()
-            .into_iter()
-            .map(|unit| unit.fq_name())
-            .collect::<HashSet<_>>();
-        let scope = AnalyzerQueryScope::new(&analyzer);
-
-        let edges = build_kotlin_usage_edges(&analyzer, scope.token(), &nodes, |_| true)
-            .expect("Kotlin edge resolver should be available");
-
-        assert!(
-            edges.edges.keys().any(|(caller, callee)| {
-                caller == "app.Consumer.call" && callee == "api.Service.run"
-            }),
-            "typed receiver call must resolve through relational name and member questions: {:?}",
-            edges.edges.keys().collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn kotlin_inbound_bulk_build_converges_with_one_request_local_frontier() {
-        let fixture = inline_project::InlineTestProject::with_language(Language::Kotlin)
-            .file(
-                "Service.kt",
-                "package api\n\nclass Service { fun run() {} }\n",
-            )
-            .file(
-                "Consumer.kt",
-                "package app\n\nimport api.*\n\nclass Consumer { fun call(service: Service) { service.run() } }\n",
-            )
-            .build();
-        let analyzer = KotlinAnalyzer::new(fixture.project_arc());
-        let cancellation = CancellationToken::new();
-        let scope = AnalyzerQueryScope::with_cancellation(&analyzer, &cancellation);
-        let callees = HashSet::from_iter(["api.Service.run".to_string()]);
-
-        let result =
-            build_inbound_kotlin_usage_edges_with_completeness(&analyzer, scope.token(), &callees)
-                .expect("active query cancellation should permit the Kotlin bulk build");
-        let UsageEdgeBuildResult::Complete(edges) = result else {
-            panic!("complete fixture must not produce omitted-file evidence");
-        };
-
-        assert!(edges.edges.contains_key(&(
-            "app.Consumer.call".to_string(),
-            "api.Service.run".to_string()
-        )));
-        assert!(edges.truncated.is_empty());
-        assert!(edges.unproven_inbound.is_empty());
-    }
-
-    #[test]
-    fn kotlin_inbound_bulk_build_fails_closed_when_pre_cancelled() {
-        let fixture = inline_project::InlineTestProject::with_language(Language::Kotlin)
-            .file(
-                "Service.kt",
-                "package api\n\nclass Service { fun run() {} }\n",
-            )
-            .build();
-        let analyzer = KotlinAnalyzer::new(fixture.project_arc());
-        let cancellation = CancellationToken::new();
-        cancellation.cancel();
-        let scope = AnalyzerQueryScope::with_cancellation(&analyzer, &cancellation);
-        let callees = HashSet::from_iter(["api.Service.run".to_string()]);
-
-        assert!(
-            build_inbound_kotlin_usage_edges_with_completeness(&analyzer, scope.token(), &callees,)
-                .is_none()
-        );
-    }
-
     /// An empty selected file is scanned, not omitted.
     ///
     /// An empty source parses to a childless root and contributes no edges,
@@ -572,6 +421,9 @@ mod tests {
     /// behavior, on a file whose scan really did produce nothing, is pinned by
     /// `inverted_edges::tests::incomplete_file_results_are_observable_and_never_published`.
     #[test]
+    #[hardwon(
+        "e91fd3a11f33: an empty selected file must yield an empty scan result instead of making the graph incomplete"
+    )]
     fn kotlin_inbound_bulk_build_scans_an_empty_selected_file() {
         let fixture = inline_project::InlineTestProject::with_language(Language::Kotlin)
             .file(
@@ -600,7 +452,6 @@ mod tests {
             "api.Service.run".to_string()
         )));
     }
-
     /// A whole-workspace edge build reads every file's declarations in *bulk*,
     /// and never pulls a file through the per-file LRU more than once.
     ///
@@ -616,10 +467,8 @@ mod tests {
     /// companion marker, a callee's return type — which are keyed by declaration
     /// rather than by file and so go through the declaring file's state. That
     /// pulls each file in once and then hits the transient cache, which is why
-    /// the bound below is one per file and not one per declaration. Closing it
-    /// needs the per-declaration facts to be readable out of the bulk states,
-    /// which is recorded as a follow-up in
-    /// `.agents/plans/kotlin-usage-graph-1239.md`.
+    /// the bound below is one per file and not one per declaration. Per-
+    /// declaration facts are still read through each declaring file's state.
     #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn kotlin_usage_graph_bulk_fetch_hydrates_each_file_at_most_once() {

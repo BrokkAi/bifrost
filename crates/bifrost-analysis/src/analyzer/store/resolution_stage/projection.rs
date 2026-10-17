@@ -2,13 +2,13 @@
 
 use super::{SelectedResolutionStage, SelectedResolutionStageOutcome, coordinates, lexical, typed};
 use crate::CancellationToken;
-use crate::analyzer::Language;
 use crate::analyzer::resolution::{
     LoweredResolutionFactsWithIdentityCatalog, LoweredResolutionFragment,
     ResolutionIdentityCatalog, ResolutionLookupSemanticRecipe, SemanticId,
 };
 use crate::analyzer::store::resolution::with_resolution_read_progress_handler;
-use crate::analyzer::store::resolution_prepare::resolution_rows::{language_code, namespace_code};
+use crate::analyzer::store::resolution_prepare::resolution_rows::identity_domain_code;
+use crate::analyzer::store::resolution_prepare::resolution_rows::namespace_code;
 use crate::analyzer::store::resolution_publication::{
     CapsuleArtifactVerification, PublishedResolutionContent, verify_capsule_artifact,
 };
@@ -122,6 +122,12 @@ impl SelectedResolutionStage<'_, '_> {
                     ])?;
                 }
                 drop(name);
+                if !assigned.typed().generic_formals().is_empty() {
+                    self.selection.ensure_generic_formals_schema(connection)?;
+                }
+                if !assigned.typed().generic_formal_defaults().is_empty() {
+                    self.selection.ensure_generic_formal_defaults_schema(connection)?;
+                }
                 typed::insert_typed_fragment(
                     connection,
                     producer,
@@ -239,12 +245,10 @@ impl SelectedResolutionStage<'_, '_> {
                 return Ok(None);
             }
             let (key, shared) = lexical::semantic_cells(*semantic);
-            let language = Language::from_config_label(recipe.semantic_language())
-                .expect("a generated recipe has a configured semantic language");
             recipe_rows.push(json!([
                 key,
                 shared,
-                language_code(language),
+                identity_domain_code(recipe.identity_domain()),
                 namespace_code(recipe.namespace()),
                 recipe.spelling()
             ]));
@@ -260,7 +264,7 @@ impl SelectedResolutionStage<'_, '_> {
         }
         let reason_rows = serde_json::to_string(&reason_rows).expect("bridge closure parameters");
         let mut descriptor = CanonicalHasher::new(b"bifrost-selected-stage-bridge:v1");
-        descriptor.field("lexical", &lexical.digest());
+        descriptor.field("lexical", &lexical.digest(host)?);
         descriptor.field("catalog-present", &[u8::from(coordinates.is_some())]);
         if let Some(coordinates) = &coordinates {
             descriptor.field("coordinates", &coordinates.digest());

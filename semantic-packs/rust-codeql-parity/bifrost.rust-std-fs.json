@@ -1,0 +1,1507 @@
+{
+  "schema_version": 2,
+  "pack_id": "bifrost.rust-std-fs",
+  "version": "0.1.0",
+  "producer": {
+    "name": "bifrost-reviewed-rust-codeql-parity-models",
+    "version": "0.1.0"
+  },
+  "language": "rust",
+  "ecosystem": "cargo",
+  "compatibility": {
+    "bifrost": ">=0.12.0, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "Rust standard-library filesystem and path APIs used by CodeQL rust/path-injection; path arguments are policy sinks and path normalization/identity is summary behavior.",
+    "revision": "rust-std-1.100; CodeQL ae741615f3e178ce61289a651790dc67fcc18e19"
+  },
+  "license": "Apache-2.0",
+  "completeness": "complete",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "declarations.bifrost.rust-std-fs",
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {
+            "id": "type.rust-codeql.std",
+            "name": "std",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/lib.rs",
+              "symbol": "std"
+            }
+          },
+          {
+            "id": "type.rust-codeql.std-fs",
+            "name": "std.fs",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs"
+            }
+          },
+          {
+            "id": "type.rust-codeql.std-fs-file",
+            "name": "std.fs.File",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.File"
+            }
+          },
+          {
+            "id": "type.rust-codeql.std-fs-open-options",
+            "name": "std.fs.OpenOptions",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.OpenOptions"
+            }
+          },
+          {
+            "id": "type.rust-codeql.std-fs-dir-builder",
+            "name": "std.fs.DirBuilder",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.DirBuilder"
+            }
+          },
+          {
+            "id": "type.rust-codeql.std-path",
+            "name": "std.path",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/path.rs",
+              "symbol": "std.path"
+            }
+          },
+          {
+            "id": "type.rust-codeql.std-path-path",
+            "name": "std.path.Path",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/path.rs",
+              "symbol": "std.path.Path"
+            }
+          },
+          {
+            "id": "type.rust-codeql.std-path-pathbuf",
+            "name": "std.path.PathBuf",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/path.rs",
+              "symbol": "std.path.PathBuf"
+            }
+          }
+        ],
+        "members": [
+          {
+            "id": "member.rust-codeql.std-fs-read",
+            "owner": "type.rust-codeql.std-fs",
+            "name": "read",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "path",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.read"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-fs-read-to-string",
+            "owner": "type.rust-codeql.std-fs",
+            "name": "read_to_string",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "path",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.read_to_string"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-fs-write",
+            "owner": "type.rust-codeql.std-fs",
+            "name": "write",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "path",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                },
+                {
+                  "name": "contents",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.write"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-fs-copy",
+            "owner": "type.rust-codeql.std-fs",
+            "name": "copy",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "from",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                },
+                {
+                  "name": "to",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.copy"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-fs-create-dir",
+            "owner": "type.rust-codeql.std-fs",
+            "name": "create_dir",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "path",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.create_dir"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-fs-create-dir-all",
+            "owner": "type.rust-codeql.std-fs",
+            "name": "create_dir_all",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "path",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.create_dir_all"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-fs-remove-file",
+            "owner": "type.rust-codeql.std-fs",
+            "name": "remove_file",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "path",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.remove_file"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-fs-remove-dir",
+            "owner": "type.rust-codeql.std-fs",
+            "name": "remove_dir",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "path",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.remove_dir"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-fs-remove-dir-all",
+            "owner": "type.rust-codeql.std-fs",
+            "name": "remove_dir_all",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "path",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.remove_dir_all"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-fs-rename",
+            "owner": "type.rust-codeql.std-fs",
+            "name": "rename",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "from",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                },
+                {
+                  "name": "to",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.rename"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-fs-metadata",
+            "owner": "type.rust-codeql.std-fs",
+            "name": "metadata",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "path",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.metadata"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-fs-symlink-metadata",
+            "owner": "type.rust-codeql.std-fs",
+            "name": "symlink_metadata",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "path",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.symlink_metadata"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-fs-hard-link",
+            "owner": "type.rust-codeql.std-fs",
+            "name": "hard_link",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "original",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                },
+                {
+                  "name": "link",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.hard_link"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-fs-read-dir",
+            "owner": "type.rust-codeql.std-fs",
+            "name": "read_dir",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "path",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.read_dir"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-fs-read-link",
+            "owner": "type.rust-codeql.std-fs",
+            "name": "read_link",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "path",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.read_link"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-fs-set-permissions",
+            "owner": "type.rust-codeql.std-fs",
+            "name": "set_permissions",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "path",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                },
+                {
+                  "name": "perm",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.set_permissions"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-fs-canonicalize",
+            "owner": "type.rust-codeql.std-fs",
+            "name": "canonicalize",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "path",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.canonicalize"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-fs-file-open",
+            "owner": "type.rust-codeql.std-fs-file",
+            "name": "open",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "path",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.File.open"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-fs-file-create",
+            "owner": "type.rust-codeql.std-fs-file",
+            "name": "create",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "path",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.File.create"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-fs-file-create-new",
+            "owner": "type.rust-codeql.std-fs-file",
+            "name": "create_new",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "path",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.File.create_new"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-fs-open-options-new",
+            "owner": "type.rust-codeql.std-fs-open-options",
+            "name": "new",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "std.fs.OpenOptions"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.OpenOptions.new"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-fs-open-options-open",
+            "owner": "type.rust-codeql.std-fs-open-options",
+            "name": "open",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "path",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.OpenOptions.open"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-fs-dir-builder-new",
+            "owner": "type.rust-codeql.std-fs-dir-builder",
+            "name": "new",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "std.fs.DirBuilder"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.DirBuilder.new"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-fs-dir-builder-create",
+            "owner": "type.rust-codeql.std-fs-dir-builder",
+            "name": "create",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "path",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.DirBuilder.create"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-path-path-new",
+            "owner": "type.rust-codeql.std-path-path",
+            "name": "new",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "path",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.path.Path"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/path.rs",
+              "symbol": "std.path.Path.new"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-path-path-join",
+            "owner": "type.rust-codeql.std-path-path",
+            "name": "join",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "path",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.path.PathBuf"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/path.rs",
+              "symbol": "std.path.Path.join"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-path-path-to-path-buf",
+            "owner": "type.rust-codeql.std-path-path",
+            "name": "to_path_buf",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "std.path.PathBuf"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/path.rs",
+              "symbol": "std.path.Path.to_path_buf"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-path-path-canonicalize",
+            "owner": "type.rust-codeql.std-path-path",
+            "name": "canonicalize",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/path.rs",
+              "symbol": "std.path.Path.canonicalize"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-path-path-starts-with",
+            "owner": "type.rust-codeql.std-path-path",
+            "name": "starts_with",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "base",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ]
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/path.rs",
+              "symbol": "std.path.Path.starts_with"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-path-pathbuf-as-path",
+            "owner": "type.rust-codeql.std-path-pathbuf",
+            "name": "as_path",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "std.path.Path"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/path.rs",
+              "symbol": "std.path.PathBuf.as_path"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-path-pathbuf-push",
+            "owner": "type.rust-codeql.std-path-pathbuf",
+            "name": "push",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "path",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ]
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/path.rs",
+              "symbol": "std.path.PathBuf.push"
+            }
+          }
+        ],
+        "relations": []
+      }
+    },
+    {
+      "id": "summaries.bifrost.rust-std-fs",
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "summary.rust-codeql.std-fs-read",
+            "target": {
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.read",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.std-fs-read-to-string",
+            "target": {
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.read_to_string",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.std-fs-write",
+            "target": {
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.write",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.std-fs-copy",
+            "target": {
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.copy",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.std-fs-create-dir",
+            "target": {
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.create_dir",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.std-fs-create-dir-all",
+            "target": {
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.create_dir_all",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.std-fs-remove-file",
+            "target": {
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.remove_file",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.std-fs-remove-dir",
+            "target": {
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.remove_dir",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.std-fs-remove-dir-all",
+            "target": {
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.remove_dir_all",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.std-fs-rename",
+            "target": {
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.rename",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.std-fs-metadata",
+            "target": {
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.metadata",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.std-fs-symlink-metadata",
+            "target": {
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.symlink_metadata",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.std-fs-hard-link",
+            "target": {
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.hard_link",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.std-fs-read-dir",
+            "target": {
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.read_dir",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.std-fs-read-link",
+            "target": {
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.read_link",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.std-fs-set-permissions",
+            "target": {
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.set_permissions",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.std-fs-canonicalize",
+            "target": {
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.canonicalize",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.std-fs-file-open",
+            "target": {
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.File.open",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.std-fs-file-create",
+            "target": {
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.File.create",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.std-fs-file-create-new",
+            "target": {
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.File.create_new",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.std-fs-open-options-new",
+            "target": {
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.OpenOptions.new",
+              "has_receiver": false,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.std-fs-open-options-open",
+            "target": {
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.OpenOptions.open",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.std-fs-dir-builder-new",
+            "target": {
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.DirBuilder.new",
+              "has_receiver": false,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.std-fs-dir-builder-create",
+            "target": {
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.DirBuilder.create",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.std-path-path-new",
+            "target": {
+              "path": "library/std/src/path.rs",
+              "symbol": "std.path.Path.new",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.std-path-path-join",
+            "target": {
+              "path": "library/std/src/path.rs",
+              "symbol": "std.path.Path.join",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              },
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.std-path-path-to-path-buf",
+            "target": {
+              "path": "library/std/src/path.rs",
+              "symbol": "std.path.Path.to_path_buf",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.std-path-path-canonicalize",
+            "target": {
+              "path": "library/std/src/path.rs",
+              "symbol": "std.path.Path.canonicalize",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.std-path-path-starts-with",
+            "target": {
+              "path": "library/std/src/path.rs",
+              "symbol": "std.path.Path.starts_with",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.std-path-pathbuf-as-path",
+            "target": {
+              "path": "library/std/src/path.rs",
+              "symbol": "std.path.PathBuf.as_path",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.std-path-pathbuf-push",
+            "target": {
+              "path": "library/std/src/path.rs",
+              "symbol": "std.path.PathBuf.push",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          }
+        ]
+      }
+    }
+  ]
+}

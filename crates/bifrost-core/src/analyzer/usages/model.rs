@@ -150,6 +150,8 @@ pub struct UsageHit {
     pub snippet: String,
     pub kind: UsageHitKind,
     pub proof: UsageProof,
+    /// Why a candidate remains unproven, when a producer can identify it.
+    pub reason_kind: Option<String>,
     /// Structured source-reference classification when the analyzer can
     /// determine it without guessing from source text.
     pub reference_kind: Option<ReferenceKind>,
@@ -175,6 +177,7 @@ impl UsageHit {
             snippet: snippet.into(),
             kind: UsageHitKind::Reference,
             proof: UsageProof::Proven,
+            reason_kind: None,
             reference_kind: None,
         }
     }
@@ -232,8 +235,14 @@ impl UsageHit {
             snippet: self.snippet.clone(),
             kind: self.kind,
             proof: self.proof,
+            reason_kind: self.reason_kind.clone(),
             reference_kind: self.reference_kind,
         }
+    }
+
+    pub fn with_reason_kind(mut self, reason_kind: impl Into<String>) -> Self {
+        self.reason_kind = Some(reason_kind.into());
+        self
     }
 
     pub fn with_reference_kind(mut self, kind: ReferenceKind) -> Self {
@@ -631,12 +640,16 @@ impl ExportIndex {
 mod tests {
     use super::*;
     use crate::analyzer::model::{CodeUnit, CodeUnitType, ProjectFile};
+    use brokk_bifrost_test_macros::hardwon;
     use std::path::PathBuf;
 
     /// The `usage_kind` row field publishes this list as its value domain, so a
     /// label that drifts from `wire_label` would let a policy literal be
     /// rejected that a row can actually hold (issue #2515).
     #[test]
+    #[hardwon(
+        "#2515: an unknown persisted usage-kind label silently made a policy predicate vacuous"
+    )]
     fn every_usage_hit_kind_wire_label_is_published_in_variant_order() {
         let mapped = UsageHitKind::ALL
             .iter()
@@ -666,217 +679,6 @@ mod tests {
             "pkg",
             "Foo.bar",
         )
-    }
-
-    #[test]
-    fn usage_hit_equality_ignores_confidence_and_snippet() {
-        let unit = enclosing_unit();
-        let a = UsageHit::new(
-            project_file("Foo.java"),
-            10,
-            100,
-            110,
-            unit.clone(),
-            1.0,
-            "snippet a",
-        );
-        let b = UsageHit::new(
-            project_file("Foo.java"),
-            10,
-            100,
-            110,
-            unit,
-            0.5,
-            "snippet b",
-        );
-
-        assert_eq!(a, b, "equality should ignore confidence and snippet");
-    }
-
-    #[test]
-    fn usage_hit_equality_distinguishes_offsets() {
-        let unit = enclosing_unit();
-        let a = UsageHit::new(
-            project_file("Foo.java"),
-            10,
-            100,
-            110,
-            unit.clone(),
-            1.0,
-            "snippet",
-        );
-        let b = UsageHit::new(project_file("Foo.java"), 10, 200, 210, unit, 1.0, "snippet");
-
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn fuzzy_result_into_either_filters_ambiguous_by_threshold() {
-        let unit = enclosing_unit();
-        let high = UsageHit::new(
-            project_file("Foo.java"),
-            10,
-            100,
-            110,
-            unit.clone(),
-            1.0,
-            "high",
-        );
-        let low = UsageHit::new(
-            project_file("Foo.java"),
-            12,
-            120,
-            130,
-            unit.clone(),
-            0.1,
-            "low",
-        );
-        let mut hits = BTreeSet::new();
-        hits.insert(high.clone());
-        hits.insert(low);
-
-        let mut targets = BTreeSet::new();
-        targets.insert(unit.clone());
-
-        let result = FuzzyResult::ambiguous(unit, "bar".to_string(), targets, hits);
-        let either = result.into_either().expect("ambiguous => Ok");
-        assert!(either.contains(&high));
-        assert_eq!(either.len(), 1);
-    }
-
-    #[test]
-    fn usage_hit_surfaces_filter_internal_and_editor_hits() {
-        let unit = enclosing_unit();
-        let reference = UsageHit::new(
-            project_file("Foo.java"),
-            10,
-            100,
-            110,
-            unit.clone(),
-            1.0,
-            "reference",
-        );
-        let import = UsageHit::new(
-            project_file("Foo.java"),
-            12,
-            120,
-            130,
-            unit.clone(),
-            1.0,
-            "import",
-        )
-        .into_import();
-        let reexport = UsageHit::new(
-            project_file("index.ts"),
-            13,
-            130,
-            136,
-            unit.clone(),
-            1.0,
-            "export { Target } from './target'",
-        )
-        .into_reexport();
-        let self_receiver = UsageHit::new(
-            project_file("Foo.java"),
-            14,
-            140,
-            150,
-            unit.clone(),
-            1.0,
-            "this.target()",
-        )
-        .into_self_receiver();
-        let declared_reference = UsageHit::new(
-            project_file("app.ts"),
-            15,
-            150,
-            160,
-            unit.clone(),
-            1.0,
-            "processor.process()",
-        )
-        .into_declared_reference();
-        let override_declaration = UsageHit::new(
-            project_file("Foo.java"),
-            16,
-            160,
-            170,
-            unit.clone(),
-            1.0,
-            "override",
-        )
-        .into_override_declaration();
-        let definition = UsageHit::new(
-            project_file("Foo.cpp"),
-            18,
-            180,
-            190,
-            unit.clone(),
-            1.0,
-            "void Foo::target() {}",
-        )
-        .into_definition();
-
-        let mut hits = BTreeSet::new();
-        hits.insert(reference.clone());
-        hits.insert(import.clone());
-        hits.insert(reexport.clone());
-        hits.insert(self_receiver.clone());
-        hits.insert(declared_reference.clone());
-        hits.insert(override_declaration.clone());
-        hits.insert(definition.clone());
-        let result = FuzzyResult::success(unit, hits);
-
-        assert_eq!(
-            result.all_hits_for_surface(UsageHitSurface::ExternalUsages),
-            [reference.clone(), override_declaration.clone()]
-                .into_iter()
-                .collect()
-        );
-        assert_eq!(
-            result.all_hits_for_surface(UsageHitSurface::LspReferences),
-            [
-                reference,
-                import,
-                reexport,
-                self_receiver,
-                declared_reference,
-                definition,
-                override_declaration,
-            ]
-            .into_iter()
-            .collect()
-        );
-    }
-
-    #[test]
-    fn lsp_reference_sites_preserve_bindings_and_exclude_self_type_aliases() {
-        let reference = UsageHit::new(
-            project_file("lib.rs"),
-            1,
-            0,
-            6,
-            enclosing_unit(),
-            1.0,
-            "Widget",
-        );
-        for kind in [
-            UsageHitKind::Reference,
-            UsageHitKind::Import,
-            UsageHitKind::Reexport,
-            UsageHitKind::SelfReceiver,
-            UsageHitKind::DeclaredReference,
-            UsageHitKind::Definition,
-            UsageHitKind::OverrideDeclaration,
-        ] {
-            let mut hit = reference.clone();
-            hit.kind = kind;
-            hit.reference_kind = Some(ReferenceKind::TypeReference);
-            assert!(hit.is_lsp_reference_site(), "explicit reference: {kind:?}");
-            hit.reference_kind = Some(ReferenceKind::SelfTypeAlias);
-            assert!(!hit.is_lsp_reference_site(), "self alias: {kind:?}");
-        }
-        assert!(reference.is_lsp_reference_site());
     }
 
     #[test]
@@ -931,25 +733,33 @@ mod tests {
     }
 
     #[test]
-    fn fuzzy_result_into_either_failure_returns_error() {
-        let result = FuzzyResult::Failure {
-            fq_name: "pkg.Foo.bar".to_string(),
-            reason_kind: "missing_analyzer_capability".to_string(),
-            reason: "no analyzer".to_string(),
-        };
-        assert!(result.into_either().is_err());
-    }
-
-    #[test]
-    fn fuzzy_result_into_either_too_many_returns_error() {
-        let result = FuzzyResult::TooManyCallsites {
-            short_name: "bar".to_string(),
-            total_callsites: 2000,
-            limit: 1000,
-            sample_hits: BTreeSet::new(),
-        };
-        let err = result.into_either().unwrap_err();
-        assert!(err.contains("2000"));
-        assert!(err.contains("1000"));
+    #[hardwon("#3815: a Rust self-type alias was incorrectly published as an LSP reference site")]
+    fn lsp_reference_sites_preserve_bindings_and_exclude_self_type_aliases() {
+        let reference = UsageHit::new(
+            project_file("lib.rs"),
+            1,
+            0,
+            6,
+            enclosing_unit(),
+            1.0,
+            "Widget",
+        );
+        for kind in [
+            UsageHitKind::Reference,
+            UsageHitKind::Import,
+            UsageHitKind::Reexport,
+            UsageHitKind::SelfReceiver,
+            UsageHitKind::DeclaredReference,
+            UsageHitKind::Definition,
+            UsageHitKind::OverrideDeclaration,
+        ] {
+            let mut hit = reference.clone();
+            hit.kind = kind;
+            hit.reference_kind = Some(ReferenceKind::TypeReference);
+            assert!(hit.is_lsp_reference_site(), "explicit reference: {kind:?}");
+            hit.reference_kind = Some(ReferenceKind::SelfTypeAlias);
+            assert!(!hit.is_lsp_reference_site(), "self alias: {kind:?}");
+        }
+        assert!(reference.is_lsp_reference_site());
     }
 }

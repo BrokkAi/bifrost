@@ -1,4 +1,5 @@
 use super::*;
+use brokk_bifrost_test_macros::hardwon;
 
 #[test]
 fn value_flow_registration_failures_keep_their_domain_in_mixed_queries() {
@@ -67,6 +68,7 @@ fn semantic_projection_rejects_a_newer_source_than_the_retained_scan_seed() {
         file: file.clone(),
         facts,
         fact_match,
+        python_import: None,
     });
     let (declaration, projection_omitted) =
         enclosing_declaration_value(workspace.analyzer(), &seed, &mut HashMap::default());
@@ -104,6 +106,94 @@ fn semantic_projection_rejects_a_newer_source_than_the_retained_scan_seed() {
         diagnostic.code == CodeQueryDiagnosticCode::SemanticResultsOmitted
             && diagnostic.message.contains("source generation changed")
     }));
+}
+
+#[test]
+#[hardwon("#5297: indexed custom rules used node-plus-role work counts as node IDs")]
+fn indexed_custom_rules_match_scan_with_role_edges() {
+    let source = "\
+function outer(value = inner()) {
+    function inner() { return 1; }
+    if (value) {}
+    return value;
+}
+class Example { static run() { return outer(); } }
+";
+    for (language, path, source) in [
+        (Language::JavaScript, "app.js", source),
+        (Language::TypeScript, "app.ts", source),
+        (
+            Language::CSharp,
+            "App.cs",
+            "class Example { static int Run(int value) { if (value > 0) {} return Target(); } }",
+        ),
+    ] {
+        let project = InlineTestProject::with_language(language)
+            .file(path, source)
+            .build();
+        let file = project.file(path);
+        let analyzer = language_analyzer(language, project.project().clone());
+        let facts = analyzer.structural_fact_providers()[0]
+            .structural_facts(&file)
+            .expect("structural facts");
+        assert!(
+            facts.role_count() > 0,
+            "fixture must separate nodes from work"
+        );
+
+        let relation_pattern = if language == Language::CSharp {
+            json!({"kind": "block", "body_state": "empty"})
+        } else {
+            json!({
+                "kind": "call",
+                "language_rule": "js/nested-function-reference-in-default-parameter"
+            })
+        };
+        for pattern in [
+            relation_pattern,
+            json!({"kind": "method", "modifier": "static"}),
+        ] {
+            let query = CodeQuery::from_json(&json!({"match": pattern})).expect("query");
+            let scan = execute_code_query_with_access_mode(
+                analyzer.as_ref(),
+                &query,
+                CodeQueryExecutionLimits::default(),
+                StructuralAccessMode::ScanOnly,
+                true,
+            )
+            .expect("scan access");
+            let indexed = execute_code_query_with_access_mode(
+                analyzer.as_ref(),
+                &query,
+                CodeQueryExecutionLimits::default(),
+                StructuralAccessMode::IndexedRequired,
+                true,
+            )
+            .expect("indexed access");
+            for result in [&scan.result, &indexed.result] {
+                assert!(!result.truncated, "{language:?} {pattern:?}: {result:?}");
+                assert!(result.diagnostics.is_empty(), "{result:?}");
+                assert_eq!(
+                    result.results.len(),
+                    1,
+                    "{language:?} {pattern:?}: {result:?}"
+                );
+            }
+            assert_eq!(
+                serde_json::to_value(&indexed.result).expect("indexed result JSON"),
+                serde_json::to_value(&scan.result).expect("scan result JSON"),
+                "response mismatch for {language:?} {pattern:?}"
+            );
+            assert!(
+                indexed
+                    .profile
+                    .expect("indexed profile")
+                    .access_path
+                    .selected
+                    .starts_with("posting:")
+            );
+        }
+    }
 }
 
 #[test]
@@ -237,6 +327,7 @@ fn indexed_postings_match_scan_results_in_every_structural_language() {
 }
 
 #[test]
+#[hardwon("e52fe21d9294: keep Rust impl-owner resolution equal through scan and posting access")]
 fn rust_inside_decl_owner_resolution_matches_between_scan_and_postings() {
     let temp = tempfile::tempdir().expect("temp dir");
     let root = temp.path().canonicalize().expect("canonical root");
@@ -466,6 +557,7 @@ fn anchored_alternation_regex_uses_role_name_postings_and_skips_candidate_free_f
 }
 
 #[test]
+#[hardwon("a4bc8f0ea610: bound warm verification work to indexed candidates")]
 fn unrestricted_warm_index_verification_work_is_bounded_by_candidate_files() {
     let target_source = "pub fn read() -> String { std::fs::read_to_string(\"input\").unwrap() }\n";
     let run = |unrelated_files: usize| {
@@ -968,6 +1060,7 @@ fn snapshot_import_topology_resets_on_update_and_mutable_overlay_generation() {
 
 #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
+#[hardwon("1a7880e32f73: durable workspace import adjacency bypasses snapshot-topology builds")]
 fn multi_analyzer_owns_and_shares_one_workspace_import_topology() {
     let temp = tempfile::tempdir().expect("temp dir");
     let root = temp.path().canonicalize().expect("canonical root");
@@ -998,14 +1091,17 @@ fn multi_analyzer_owns_and_shares_one_workspace_import_topology() {
         StructuralAccessMode::IndexedRequired,
     );
     assert_eq!(built.result.results.len(), 1);
+    // Since #4281, IndexedRequired reads the workspace's durable adjacency
+    // before snapshot topology. Keep both lifecycle counters on the selected
+    // import layer.
+    let built_profile = built.profile.expect("multi build profile");
     assert_eq!(
-        built
-            .profile
-            .expect("multi build profile")
-            .cache
-            .direct_import_topology
-            .builds,
-        1
+        built_profile.cache.import_reverse.hits, 1,
+        "the first indexed query uses the workspace persisted import topology"
+    );
+    assert_eq!(
+        built_profile.cache.direct_import_topology.builds, 0,
+        "durable workspace adjacency bypasses a snapshot-topology build"
     );
     let cloned = workspace.clone();
     let reused = import_query(
@@ -1018,14 +1114,14 @@ fn multi_analyzer_owns_and_shares_one_workspace_import_topology() {
         StructuralAccessMode::IndexedRequired,
     );
     assert_eq!(reused.result.results.len(), 1);
+    let reused_profile = reused.profile.expect("multi reuse profile");
     assert_eq!(
-        reused
-            .profile
-            .expect("multi reuse profile")
-            .cache
-            .direct_import_topology
-            .hits,
-        1
+        reused_profile.cache.import_reverse.hits, 1,
+        "the cloned workspace reuses its persisted import topology"
+    );
+    assert_eq!(
+        reused_profile.cache.direct_import_topology.builds, 0,
+        "the cloned workspace also bypasses snapshot-topology construction"
     );
 }
 
@@ -1201,6 +1297,9 @@ fn auto_import_topology_budget_fallback_matches_request_local_response() {
 }
 
 #[test]
+#[hardwon(
+    "c31c422146ff: edge-budget fallback preserves complete results after partial topology work"
+)]
 fn late_topology_edge_limit_reuses_partial_work_for_fallback() {
     let temp = tempfile::tempdir().expect("temp dir");
     let root = temp.path().canonicalize().expect("canonical root");
@@ -1262,10 +1361,45 @@ fn late_topology_edge_limit_reuses_partial_work_for_fallback() {
         profile.work.import_files_resolved
             <= u64::try_from(limits.max_scanned_files).unwrap_or(u64::MAX)
     );
+    // The provider materializes the whole canonical batch, but the
+    // streaming work contract invokes this budget callback one file at a
+    // time. Every consumer in this fixture contributes one edge, so the
+    // callback that trips the budget can add exactly one attempted edge.
+    let edge_work_bound = u64::try_from(limits.max_pipeline_rows)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
     assert!(
+        profile.work.import_edges_resolved <= edge_work_bound,
+        "the per-file callback may charge one edge past the row budget: {} > {edge_work_bound}",
         profile.work.import_edges_resolved
-            <= u64::try_from(limits.max_pipeline_rows).unwrap_or(u64::MAX)
     );
+    assert_eq!(
+        profile.work.import_edges_resolved, edge_work_bound,
+        "the first over-budget consumer contributes the one-edge callback overshoot"
+    );
+    assert_eq!(
+        profile.cache.direct_import_topology.build_edges, edge_work_bound,
+        "derived-layer work records all materialized callback edges"
+    );
+
+    let cached_fallback = import_query(
+        &analyzer,
+        "typescript",
+        "target.ts",
+        "Target",
+        "importers_of",
+        limits,
+        StructuralAccessMode::DerivedAutoForTest,
+    );
+    assert_eq!(
+        serde_json::to_value(&cached_fallback.result).expect("cached fallback response"),
+        serde_json::to_value(&scan.result).expect("scan response")
+    );
+    let cached_profile = cached_fallback.profile.expect("cached fallback profile");
+    assert_eq!(cached_profile.cache.direct_import_topology.builds, 0);
+    assert_eq!(cached_profile.cache.direct_import_topology.build_edges, 0);
+    assert_eq!(cached_profile.cache.direct_import_topology.unavailable, 0);
+    assert_eq!(cached_profile.cache.direct_import_topology.fallbacks, 1);
 }
 
 #[test]

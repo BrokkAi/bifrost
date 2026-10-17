@@ -1,15 +1,16 @@
-; A Java, JavaScript, TypeScript, C#, PHP, C++ or Kotlin catch body, a Python
-; except body, or a Ruby rescue body is structurally empty, including
-; comment-only bodies and Python pass/ellipsis.
-; Recovered or unavailable syntax remains unknown. This does not claim that
-; the handler is reachable or that its exception type can be thrown.
+; A Java, JavaScript, TypeScript, C#, PHP, C++, Kotlin, Scala or Ruby catch
+; body, a Python except body, a Rust-native Result::Err failure branch, or a
+; Go error/recover failure branch is structurally empty, including
+; comment-only bodies, Python pass/ellipsis and Scala unit literals. Recovered
+; or unavailable syntax remains unknown. This does not claim that the handler
+; is reachable or that its exception or failure can occur.
 (policy
   :schema-version 1
   :id "bifrost.correctness.empty-failure-handler"
   :name "Empty failure handler"
   :message "this failure handler contains no failure-handling statements"
   :severity warning
-  :description "An exact Java, JavaScript, TypeScript, C#, PHP, C++ or Kotlin catch clause, Python except clause, or Ruby rescue clause has no body statements other than comments, empty statements, or Python pass and ellipsis. A C# exception filter selects an exception but does not handle it. Promise rejection callbacks, the Ruby rescue modifier and Scala catch cases are not covered. This is a structural review finding: it does not establish that the handler is reachable or that its exception type can be thrown. Recovered or unavailable syntax is inconclusive. Review whether the exception needs handling or propagation; comments do not count as handling. No automatic fix is supplied."
+  :description "An exact Java, JavaScript, TypeScript, C#, PHP, C++, Kotlin or Scala catch clause, Python except clause, Ruby rescue clause, Rust-native Result::Err failure branch, or Go error/nil or recover failure branch has no body statements other than comments, empty statements, Python pass and ellipsis, or a Scala unit literal. Rust match Err arms and if-let Err consequences, plus empty else arms of if-let Ok, and Go error/nil and recover branches are selected from callable seeds only when the language adapter proves the standard failure representation; unresolved, shadowed, or user-defined types and builtins remain open or outside the result. A C# exception filter selects an exception but does not handle it. Promise rejection callbacks, the Ruby rescue modifier, Scala catch expressions outside case blocks, Rust Option arms, and macro token trees are not covered. This is a structural review finding: it does not establish that the handler is reachable or that its exception or failure can occur. Recovered or unavailable syntax is inconclusive. Review whether the failure needs handling or propagation; comments and binding names do not count as handling. No automatic fix is supplied."
   :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
   :tags ["correctness" "exceptions"]
   :analysis (analysis
@@ -20,7 +21,9 @@
                         (proof eq exact)
                         (coverage eq exhaustive))
           (failure-handler-state
-            (language java javascript typescript python csharp php cpp kotlin ruby (catch))))))
+            (union
+              (language java javascript typescript python csharp php cpp kotlin scala ruby (catch))
+              (language rust go (callable)))))))
     (group :name by-handler :by (handler.id)
       (aggregate :name empty-handlers :op count))
     (assert :group by-handler :value empty-handlers :cardinality (exactly 0))))

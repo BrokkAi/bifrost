@@ -106,6 +106,19 @@ caller and callee hydrate to graph nodes. Fields, modules, and macros can appear
 in focused reference analysis; the public workspace graph uses classes and
 callables as its ranking nodes.
 
+Scala's source usage graph attributes to authored declarations. Generated
+companion owners are excluded at the graph's declaration read boundaries using
+the stored synthetic provenance and structured companion kind. Written
+anonymous templates and primary constructors remain graph declarations.
+Generated member facts already use the source constructor's declaration rather
+than creating another usage identity. Definition lookup can still resolve an
+explicit generated apply to that constructor. Filtering at the read boundary
+preserves the graph's context rules, including the distinction between an
+allowed method value and an ordinary argument occurrence; normalizing a
+synthetic owner after resolution would let earlier owner branches consume the
+reference before those context rules run. The projection filters each query's
+already-read collections in place and retains no additional index or cache.
+
 ## Proof and completeness dimensions
 
 Usage analysis applies the
@@ -167,26 +180,30 @@ the completed graph unpublished.
 
 ## Persisted inputs and compositional usage facts
 
-> **Current:** Bifrost persists declaration and identifier projections, owns
-> language-specific indexes and prepared facts, builds target-directed or bulk
-> usage products on demand, and retains only complete workspace ranking graphs
-> under exact content keys.
+> **Current:** Rust resolves through the
+> [Name Resolution Engine](../name-resolution/), which stores immutable
+> file-local facts by content identity and composes them with build-unit
+> context in each query. For other languages, Bifrost persists declaration and
+> identifier projections, owns language-specific indexes and prepared facts,
+> builds target-directed or bulk usage products on demand, and retains only
+> complete workspace ranking graphs under exact content keys.
 
-Each language currently assembles workspace graphs by revisiting its resolution
-process. Some analyzers cache or persist file-derived inputs, and the declaration
-catalog reads persisted summary projections. A uniform production boundary
-remains proposed work.
+Languages other than Rust assemble workspace graphs by revisiting their
+resolution process. Some analyzers cache or persist file-derived inputs, and the
+declaration catalog reads persisted summary projections.
 
-> **Direction:** make immutable file-local usage facts the common
-> production boundary, then compose workspace graphs from those facts plus the
-> exact workspace manifest and resolver dependencies.
+> **Direction:** move every language onto the name resolution engine, so that
+> immutable file-local facts are the common production boundary and workspace
+> graphs are composed from those facts plus the exact workspace manifest and
+> build configuration.
 
 The [Decisions and Outlook](../decisions-and-outlook/#compose-immutable-usage-facts)
 entry is the roadmap-level summary. The related
-[compositional resolution fragments](../storage-and-cache/#direction-compositional-resolution-fragments)
-section covers the finer-grained cache question behind that direction.
+[compositional resolution fragments](../storage-and-cache/#compositional-resolution-fragments)
+section covers what is stored and what is recomputed per query.
 
-The proposal requires:
+The engine meets these requirements for Rust, and each language that moves onto
+it must meet them too:
 
 1. A source blob and extraction-semantics version identify an immutable local
    fact set: structured occurrences, enclosing declarations, imports, and
@@ -202,8 +219,8 @@ Safe composition depends on complete dependency identity. Import aliases,
 conditional includes, macro environments, inheritance, package graphs, and
 dynamic receiver evidence can all affect what a fact means. A compositional
 design must identify each dependency precisely and decline reuse when it cannot.
-Current resolvers remain authoritative until that contract exists for every
-language plugin.
+A language's existing resolver remains authoritative until the language moves
+onto the engine with all of its consumers.
 
 ## Boundaries and evaluation
 

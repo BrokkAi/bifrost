@@ -13,6 +13,7 @@ use crate::analyzer::usages::receiver_analysis::{
 };
 use crate::analyzer::usages::reference_site::node_range;
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
+use brokk_bifrost_core::analyzer::common::node_source_text_trimmed as java_node_text;
 use brokk_bifrost_core::analyzer::java_facts::{JavaSourceTypeId, JavaTypeSyntaxShape};
 use brokk_bifrost_core::analyzer::model::CodeUnitType;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
@@ -20,6 +21,7 @@ use brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceId;
 use brokk_bifrost_core::analyzer::structural::callable::{
     ApplicabilityVerdict, CallableRejectionReason,
 };
+use brokk_bifrost_jvm::java::declarations::{JavaScopeDeclaration, java_scope_declarations};
 use brokk_bifrost_jvm::java::graph::resolver::{
     argument_list_arity, java_field_type_text_from_metadata,
 };
@@ -60,15 +62,23 @@ pub(crate) struct JavaResolutionSession<'a> {
 }
 
 impl<'a> JavaResolutionSession<'a> {
-    fn unbounded(support: &'a dyn BoundedDefinitionLookup) -> Self {
+    fn new(
+        support: &'a dyn BoundedDefinitionLookup,
+        budget: Option<ReceiverAnalysisBudget>,
+        cancellation: Option<&CancellationToken>,
+    ) -> Self {
         Self {
             support,
-            budget: None,
-            cancellation: None,
+            budget,
+            cancellation: cancellation.cloned(),
             state: RefCell::new(JavaResolutionState::default()),
             type_parameter_bounds: RefCell::new(HashMap::default()),
             receiver_depth: Cell::new(0),
         }
+    }
+
+    fn unbounded(support: &'a dyn BoundedDefinitionLookup) -> Self {
+        Self::new(support, None, None)
     }
 
     pub(crate) fn bounded(
@@ -76,14 +86,7 @@ impl<'a> JavaResolutionSession<'a> {
         budget: ReceiverAnalysisBudget,
         cancellation: Option<&CancellationToken>,
     ) -> Self {
-        Self {
-            support,
-            budget: Some(budget),
-            cancellation: cancellation.cloned(),
-            state: RefCell::new(JavaResolutionState::default()),
-            type_parameter_bounds: RefCell::new(HashMap::default()),
-            receiver_depth: Cell::new(0),
-        }
+        Self::new(support, Some(budget), cancellation)
     }
 
     pub(crate) fn finish<T>(&self, value: T) -> BoundedResolution<T> {
@@ -343,30 +346,16 @@ impl<'a> JavaResolutionSession<'a> {
 
     fn smallest_named_node_covering<'tree>(
         &self,
-        mut node: Node<'tree>,
+        node: Node<'tree>,
         start: usize,
         end: usize,
     ) -> Option<Node<'tree>> {
-        if !self.charge_scope_step() || node.end_byte() < end || node.start_byte() > start {
-            return None;
-        }
-        loop {
-            let mut cursor = node.walk();
-            let mut containing_child = None;
-            for child in node.named_children(&mut cursor) {
-                if !self.charge_scope_step() {
-                    return None;
-                }
-                if child.start_byte() <= start && child.end_byte() >= end {
-                    containing_child = Some(child);
-                    break;
-                }
-            }
-            match containing_child {
-                Some(child) => node = child,
-                None => return Some(node),
-            }
-        }
+        brokk_bifrost_core::analyzer::usages::reference_site::smallest_named_node_covering_with_scope(
+            node,
+            start,
+            end,
+            || self.charge_scope_step(),
+        )
     }
 
     fn parent_of(&self, analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<CodeUnit> {
@@ -418,6 +407,10 @@ impl<'a> JavaResolutionSession<'a> {
             ReceiverBudgetLimit::SummaryExpansions => (
                 &mut state.work.summary_expansions,
                 budget.max_summary_expansions,
+            ),
+            ReceiverBudgetLimit::ResolutionRounds => (
+                &mut state.work.resolution_rounds,
+                budget.max_resolution_rounds,
             ),
         };
         if *used == maximum {
@@ -955,14 +948,11 @@ fn resolve_java_type_reference(
     ) {
         return candidates_outcome(vec![unit]);
     }
-    let candidates = session.resolve_type_name_candidates_in_file(token, java, file, normalized);
+    let candidates = java_file_then_qualified_nested_type_candidates(
+        analyzer, token, java, session, file, source, node, normalized,
+    );
     if !candidates.is_empty() {
         return candidates_outcome(candidates);
-    }
-    if let Some(unit) =
-        java_qualified_nested_type(analyzer, token, java, session, file, source, node)
-    {
-        return candidates_outcome(vec![unit]);
     }
     // `java_import_boundary_for_type` fuses the unresolved-import signal with the
     // workspace-type check; its negation is the workspace-internal gate.
@@ -996,14 +986,11 @@ fn java_explicit_scoped_type_reference(
         return None;
     }
 
-    let candidates = session.resolve_type_name_candidates_in_file(token, java, file, normalized);
+    let candidates = java_file_then_qualified_nested_type_candidates(
+        analyzer, token, java, session, file, source, node, normalized,
+    );
     if !candidates.is_empty() {
         return Some(candidates_outcome(candidates));
-    }
-    if let Some(unit) =
-        java_qualified_nested_type(analyzer, token, java, session, file, source, node)
-    {
-        return Some(candidates_outcome(vec![unit]));
     }
     if session.type_name_resolves_with_external(analyzer, token, java, file, normalized) {
         // gated upstream: `resolve_type_name_in_file` and `java_qualified_nested_type`
@@ -1038,6 +1025,26 @@ fn java_explicit_scoped_type_reference(
         "no_indexed_definition",
         format!("`{normalized}` did not resolve to an indexed Java type"),
     ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn java_file_then_qualified_nested_type_candidates(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    normalized: &str,
+) -> Vec<CodeUnit> {
+    let candidates = session.resolve_type_name_candidates_in_file(token, java, file, normalized);
+    if !candidates.is_empty() {
+        return candidates;
+    }
+    java_qualified_nested_type(analyzer, token, java, session, file, source, node)
+        .into_iter()
+        .collect()
 }
 
 /// What a Java method invocation binds to, with the receiver types the binding
@@ -1603,6 +1610,7 @@ fn resolve_java_constructor_call(
                 owner,
                 member,
             )),
+            authority: DefinitionResolutionAuthority::Incumbent,
         };
         return (outcome, evidence);
     }
@@ -2272,12 +2280,12 @@ fn java_unresolved_receiver_outcome(
         // receiver *variable* spelling, so the trace and the call-binding path
         // read one publication (#3466).
         let canonical = format!("{}.{member}", owner.fqn);
-        trace::record_named_boundary(canonical.clone());
-        boundary_unchecked(
+        super::external_member_boundary_outcome(
+            canonical.clone(),
             format!(
                 "`{canonical}` names a member of a Java type declared outside the indexed workspace"
             ),
-            UnindexedClaim::external_boundary(canonical, ClaimSubjectRole::Member),
+            None,
         )
     } else {
         gated_boundary(
@@ -2369,6 +2377,7 @@ fn java_external_call_evidence(
         dispatch_extensibility: proof.dispatch_extensibility(),
         exact_external_call: Some(proof),
         external_callee_identity: Some(identity),
+        authority: DefinitionResolutionAuthority::Incumbent,
     }
 }
 
@@ -2934,11 +2943,9 @@ fn java_imported_receiver_bound(
 }
 
 fn java_field_access_is_selector_receiver(node: Node<'_>) -> bool {
-    node.parent().is_some_and(|parent| match parent.kind() {
-        "field_access" | "method_invocation" => parent.child_by_field_name("object") == Some(node),
-        "method_reference" => true,
-        _ => false,
-    })
+    node.parent()
+        .is_some_and(|parent| parent.kind() == "method_reference")
+        || brokk_bifrost_jvm::java::declarations::java_field_access_is_selector_object(node)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3632,16 +3639,14 @@ fn java_receiver_type_node<'tree>(
         "type_identifier" | "scoped_type_identifier" | "generic_type" | "annotated_type" => {
             Some(object)
         }
-        "identifier" => {
-            let bindings =
-                java_bindings_before_scoped(session, file, source, root, object.start_byte());
-            let JavaLocalType::Declared(declared) =
-                first_precise(&bindings, java_node_text(object, source))?
-            else {
-                return None;
-            };
-            session.smallest_named_node_covering(root, declared.start_byte, declared.end_byte)
-        }
+        "identifier" => java_identifier_declared_type_node(
+            session,
+            file,
+            source,
+            root,
+            java_node_text(object, source),
+            object.start_byte(),
+        ),
         _ => None,
     }
 }
@@ -4795,13 +4800,24 @@ fn java_type_of_identifier_before(
     name: &str,
     before_byte: usize,
 ) -> Option<CodeUnit> {
+    let type_node =
+        java_identifier_declared_type_node(session, file, source, root, name, before_byte)?;
+    java_type_from_node_with_context(analyzer, token, java, session, file, source, type_node)
+}
+
+fn java_identifier_declared_type_node<'tree>(
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'tree>,
+    name: &str,
+    before_byte: usize,
+) -> Option<Node<'tree>> {
     let bindings = java_bindings_before_scoped(session, file, source, root, before_byte);
     let JavaLocalType::Declared(declared) = first_precise(&bindings, name)? else {
         return None;
     };
-    let type_node =
-        session.smallest_named_node_covering(root, declared.start_byte, declared.end_byte)?;
-    java_type_from_node_with_context(analyzer, token, java, session, file, source, type_node)
+    session.smallest_named_node_covering(root, declared.start_byte, declared.end_byte)
 }
 
 /// Every local binding visible at `cutoff_start`, recorded as the type spelling
@@ -4906,55 +4922,47 @@ fn java_seed_scope_declarations(
     cutoff_start: usize,
     bindings: &mut LocalInferenceEngine<JavaLocalType>,
 ) {
-    match node.kind() {
-        "method_declaration" | "constructor_declaration" | "compact_constructor_declaration" => {
-            if let Some(parameters) = node.child_by_field_name("parameters") {
-                let mut cursor = parameters.walk();
-                for parameter in parameters.named_children(&mut cursor) {
-                    if !session.charge_scope_step() {
-                        return;
-                    }
-                    if parameter.kind() == "formal_parameter" {
-                        java_seed_inline_typed_binding(session, file, source, parameter, bindings);
-                    }
-                }
-            }
-        }
-        "catch_clause" => {
-            if let Some(parameter) = node.child_by_field_name("parameter") {
-                java_seed_inline_typed_binding(session, file, source, parameter, bindings);
-            }
-        }
-        "enhanced_for_statement" => {
-            if let Some(name) = node.child_by_field_name("name") {
-                bindings.declare_shadow(java_node_text(name, source));
-            }
-        }
-        "try_with_resources_statement" => {
-            let Some(resources) = node.child_by_field_name("resources") else {
-                return;
-            };
-            let cutoff_in_resources =
-                resources.start_byte() <= cutoff_start && cutoff_start < resources.end_byte();
-            let cutoff_in_body = node.child_by_field_name("body").is_some_and(|body| {
-                body.start_byte() <= cutoff_start && cutoff_start < body.end_byte()
-            });
-            if !cutoff_in_resources && !cutoff_in_body {
-                return;
-            }
-            let mut cursor = resources.walk();
-            for resource in resources.named_children(&mut cursor) {
+    for declaration in java_scope_declarations(node) {
+        match declaration {
+            JavaScopeDeclaration::MethodParameter(parameter) => {
                 if !session.charge_scope_step() {
                     return;
                 }
-                if resource.kind() == "resource"
-                    && (cutoff_in_body || resource.end_byte() <= cutoff_start)
-                {
-                    java_seed_typed_name_binding(file, source, resource, bindings);
+                if parameter.kind() == "formal_parameter" {
+                    java_seed_inline_typed_binding(session, file, source, parameter, bindings);
                 }
             }
+            JavaScopeDeclaration::CatchParameter(parameter) => {
+                java_seed_inline_typed_binding(session, file, source, parameter, bindings);
+            }
+            JavaScopeDeclaration::EnhancedForName(name) => {
+                bindings.declare_shadow(java_node_text(name, source));
+            }
         }
-        _ => {}
+    }
+    if node.kind() == "try_with_resources_statement" {
+        let Some(resources) = node.child_by_field_name("resources") else {
+            return;
+        };
+        let cutoff_in_resources =
+            resources.start_byte() <= cutoff_start && cutoff_start < resources.end_byte();
+        let cutoff_in_body = node.child_by_field_name("body").is_some_and(|body| {
+            body.start_byte() <= cutoff_start && cutoff_start < body.end_byte()
+        });
+        if !cutoff_in_resources && !cutoff_in_body {
+            return;
+        }
+        let mut cursor = resources.walk();
+        for resource in resources.named_children(&mut cursor) {
+            if !session.charge_scope_step() {
+                return;
+            }
+            if resource.kind() == "resource"
+                && (cutoff_in_body || resource.end_byte() <= cutoff_start)
+            {
+                java_seed_typed_name_binding(file, source, resource, bindings);
+            }
+        }
     }
 }
 
@@ -5518,11 +5526,7 @@ struct JavaMemberTrace {
 
 impl JavaMemberTrace {
     fn record_found(&mut self, candidates: &[CodeUnit], found_on: &CodeUnit, depth: usize) {
-        for candidate in candidates {
-            self.found
-                .entry(candidate.clone())
-                .or_insert_with(|| (found_on.clone(), depth));
-        }
+        super::record_member_trace_found(&mut self.found, candidates, || found_on.clone(), depth);
     }
 
     /// The exact hierarchy route from `base` to the type `candidate` was found
@@ -5534,32 +5538,25 @@ impl JavaMemberTrace {
         let Some((found_on, depth)) = self.found.get(candidate) else {
             return Vec::new();
         };
-        let mut chain = vec![found_on.clone()];
-        while chain.last() != Some(base) {
-            let Some(parent) = self
-                .parents
-                .get(chain.last().expect("chain is never empty"))
-            else {
-                break;
-            };
-            chain.push(parent.clone());
-        }
-        chain.reverse();
+        let (route, _) = trace::hierarchy_route_from_predecessors(
+            found_on,
+            *depth,
+            |current, _| current == base,
+            |current| {
+                self.parents
+                    .get(current)
+                    .cloned()
+                    .map(|parent| (parent, HierarchyRelation::Supertype))
+            },
+            |unit| Some(unit.clone()),
+        )
+        .expect("Java hierarchy route nodes always have declaration identities");
         debug_assert_eq!(
-            chain.len(),
-            depth + 1,
+            route.len(),
+            *depth,
             "the first-discovery chain must be exactly the BFS depth"
         );
-        chain
-            .windows(2)
-            .enumerate()
-            .map(|(hop, pair)| trace::HierarchyHopRecord {
-                hop,
-                from: pair[0].clone(),
-                to: pair[1].clone(),
-                relation: HierarchyRelation::Supertype,
-            })
-            .collect()
+        route
     }
 
     fn enrichment(
@@ -5568,21 +5565,13 @@ impl JavaMemberTrace {
         candidate: &CodeUnit,
         applicability: brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict,
     ) -> Option<trace::MemberEnrichment> {
-        use crate::analyzer::structural::MemberDispatchTier;
-
         let (found_on, depth) = self.found.get(candidate)?;
-        let dispatch_tier = if *depth == 0 {
-            MemberDispatchTier::InherentOrDirect
-        } else {
-            MemberDispatchTier::InheritedOrPromoted
-        };
-        Some(trace::MemberEnrichment {
-            owner: found_on.clone(),
-            hierarchy_depth: *depth,
-            dispatch_tier,
+        Some(trace::member_enrichment(
+            found_on.clone(),
+            *depth,
             applicability,
-            route: self.route(base, candidate),
-        })
+            self.route(base, candidate),
+        ))
     }
 
     /// Stage attribution for the candidates this lookup is about to bind, and
@@ -5606,16 +5595,10 @@ impl JavaMemberTrace {
         applicability: &ApplicabilityOutcome,
         bound: &[CodeUnit],
     ) {
-        use crate::analyzer::structural::PrecedenceTier;
-
         let tier_of = |unit: &CodeUnit| {
-            self.found.get(unit).map(|(_, depth)| {
-                if *depth == 0 {
-                    PrecedenceTier::OwnMember
-                } else {
-                    PrecedenceTier::InheritedMember
-                }
-            })
+            self.found
+                .get(unit)
+                .map(|(_, depth)| super::member_precedence_tier(*depth))
         };
         for verdict in &applicability.verdicts {
             if verdict.verdict != ApplicabilityVerdict::Inapplicable
@@ -5623,71 +5606,18 @@ impl JavaMemberTrace {
             {
                 continue;
             }
-            let mut row = trace::TraceCandidate::rejected(
-                trace::TraceCandidateRef::Unit(verdict.candidate.clone()),
+            trace::record_rejected_unit(
+                &verdict.candidate,
                 tier_of(&verdict.candidate),
                 RejectionReason::CallableApplicabilityDeferred,
-            )
-            .with_callable(trace::CallableApplicabilityRecord {
-                verdict: verdict.verdict,
-                reason: verdict.reason,
-            });
-            if let Some(enrichment) =
-                self.enrichment(base, &verdict.candidate, ApplicabilityVerdict::Inapplicable)
-            {
-                row = row.with_member(enrichment);
-            }
-            trace::record(row);
+                Some(trace::CallableApplicabilityRecord::from(verdict)),
+                self.enrichment(base, &verdict.candidate, ApplicabilityVerdict::Inapplicable),
+            );
         }
-        let winner_tier = bound
-            .iter()
-            .filter_map(|unit| self.found.get(unit))
-            .map(|(_, depth)| *depth)
-            .min()
-            .map(|depth| {
-                if depth == 0 {
-                    PrecedenceTier::OwnMember
-                } else {
-                    PrecedenceTier::InheritedMember
-                }
-            });
-        if let Some(tier) = winner_tier {
-            trace::stage_tier(tier, bound.iter().map(|unit| unit.fq_name()).collect());
-        }
-        let verdict_of = |unit: &CodeUnit| {
-            applicability
-                .verdicts
-                .iter()
-                .find(|verdict| verdict.candidate == *unit)
-        };
-        trace::stage_member_context(
-            bound
-                .iter()
-                .filter_map(|unit| {
-                    let applicability = verdict_of(unit)
-                        .map(|verdict| verdict.verdict)
-                        .unwrap_or(ApplicabilityVerdict::Unknown);
-                    self.enrichment(base, unit, applicability)
-                        .map(|enrichment| (unit.fq_name(), enrichment))
-                })
-                .collect(),
-        );
-        trace::stage_callable_context(
-            bound
-                .iter()
-                .filter_map(|unit| {
-                    verdict_of(unit).map(|verdict| {
-                        (
-                            unit.fq_name(),
-                            trace::CallableApplicabilityRecord {
-                                verdict: verdict.verdict,
-                                reason: verdict.reason,
-                            },
-                        )
-                    })
-                })
-                .collect(),
-        );
+        trace::stage_winner_tier(bound, bound.iter().filter_map(tier_of));
+        trace::stage_applicability_context(bound, applicability, |unit, verdict| {
+            self.enrichment(base, unit, verdict)
+        });
     }
 }
 
@@ -5801,12 +5731,7 @@ fn java_class_is_static(
     owner: &CodeUnit,
 ) -> Option<bool> {
     let alternatives = session.signature_metadata(analyzer, owner);
-    let metadata = alternatives.first()?;
-    let is_static = metadata.class_like_is_static();
-    alternatives
-        .iter()
-        .all(|alternative| alternative.class_like_is_static() == is_static)
-        .then_some(is_static)
+    java_consistent_metadata_flag(&alternatives, |metadata| metadata.class_like_is_static())
 }
 
 fn java_member_is_static(
@@ -5816,22 +5741,19 @@ fn java_member_is_static(
     kind: JavaMemberLookupKind,
 ) -> Option<bool> {
     let alternatives = session.signature_metadata(analyzer, member);
-    let metadata = alternatives.first()?;
-    let is_static = match kind {
+    java_consistent_metadata_flag(&alternatives, |metadata| match kind {
         JavaMemberLookupKind::Field => metadata.field_is_static(),
         JavaMemberLookupKind::Method => metadata.callable_is_static(),
         JavaMemberLookupKind::Type => false,
-    };
+    })
+}
+
+fn java_consistent_metadata_flag<T>(alternatives: &[T], flag: impl Fn(&T) -> bool) -> Option<bool> {
+    let is_set = flag(alternatives.first()?);
     alternatives
         .iter()
-        .all(|alternative| {
-            (match kind {
-                JavaMemberLookupKind::Field => alternative.field_is_static(),
-                JavaMemberLookupKind::Method => alternative.callable_is_static(),
-                JavaMemberLookupKind::Type => false,
-            }) == is_static
-        })
-        .then_some(is_static)
+        .all(|alternative| flag(alternative) == is_set)
+        .then_some(is_set)
 }
 
 fn java_static_context_member_outcome(
@@ -6235,22 +6157,6 @@ fn java_hierarchy_crosses_unindexed_supertype(
     false
 }
 
-/// Methods every Java class inherits from `java.lang.Object` and every
-/// interface declares implicitly (JLS 4.3.2, 9.2). The workspace does not
-/// index `Object`, so no workspace walk can show that one of these names has
-/// no further overload.
-const JAVA_OBJECT_METHOD_NAMES: [&str; 9] = [
-    "clone",
-    "equals",
-    "finalize",
-    "getClass",
-    "hashCode",
-    "notify",
-    "notifyAll",
-    "toString",
-    "wait",
-];
-
 /// Whether the methods named `member` found so far are every method of that
 /// name Java overload resolution considers for `owner` (JLS 15.12.2.1).
 ///
@@ -6269,7 +6175,13 @@ fn java_overload_set_is_complete(
     seen: &HashSet<CodeUnit>,
     member: &str,
 ) -> bool {
-    if JAVA_OBJECT_METHOD_NAMES.contains(&member) {
+    // Every Java class inherits the `java.lang.Object` methods and every
+    // interface declares them implicitly (JLS 4.3.2, 9.2). The workspace does
+    // not index `Object`, so no workspace walk can show that one of these
+    // names has no further overload.
+    if crate::analyzer::resolution::language_implicit_root_member_names(Language::Java)
+        .contains(&member)
+    {
         return false;
     }
     let Some(provider) = analyzer.type_hierarchy_provider() else {
@@ -6604,18 +6516,22 @@ fn java_import_boundary_for_type(
 }
 
 fn java_workspace_fqn_exists(support: &dyn BoundedDefinitionLookup, fqn: &str) -> bool {
-    support.fqn_exists(fqn)
+    if support.fqn_exists(fqn) {
+        return true;
+    }
+    // Scala objects use their JVM singleton name in the declaration index,
+    // while Java static imports spell the source name without the trailing
+    // `$`. Keep this a language-scoped exact-FQN check so an unrelated
+    // same-named declaration cannot suppress an external boundary.
+    let scala_object_fqn = format!("{fqn}$");
+    support
+        .fqn_in_language(&scala_object_fqn, Language::Scala)
+        .iter()
+        .any(|unit| unit.fq_name() == scala_object_fqn)
 }
 
 fn java_workspace_package_exists(support: &dyn BoundedDefinitionLookup, package: &str) -> bool {
     support.package_exists(package) || support.fqn_prefix_exists(package)
-}
-
-fn java_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    source
-        .get(node.start_byte()..node.end_byte())
-        .unwrap_or_default()
-        .trim()
 }
 
 #[cfg(test)]
@@ -6629,6 +6545,7 @@ mod canonical_constructor_tests {
     use brokk_bifrost_core::analyzer::model::SignatureMetadata;
     use brokk_bifrost_jvm::java::graph::resolver::{TargetSpec, java_callable_arity};
     use brokk_bifrost_jvm::java::graph_support::java_callable_facts;
+    use tree_sitter::Parser;
 
     fn java_owner(
         fixture: &BuiltInlineTestProject,
@@ -6643,6 +6560,36 @@ mod canonical_constructor_tests {
             .find(|unit| unit.is_class() && unit.identifier() == identifier)
             .expect("written Java owner");
         (java, file, owner)
+    }
+
+    #[test]
+    fn field_type_metadata_requires_complete_agreement() {
+        let complete = vec![
+            SignatureMetadata::new("value", Vec::new()).with_return_type_text(Some("Target")),
+            SignatureMetadata::new("value", Vec::new()).with_return_type_text(Some("Target")),
+        ];
+        assert_eq!(
+            brokk_bifrost_jvm::java::graph::resolver::java_field_type_text_from_metadata(&complete)
+                .as_deref(),
+            Some("Target")
+        );
+
+        let missing = vec![SignatureMetadata::new("value", Vec::new())];
+        assert!(
+            brokk_bifrost_jvm::java::graph::resolver::java_field_type_text_from_metadata(&missing)
+                .is_none()
+        );
+
+        let conflicting = vec![
+            SignatureMetadata::new("value", Vec::new()).with_return_type_text(Some("Target")),
+            SignatureMetadata::new("value", Vec::new()).with_return_type_text(Some("Other")),
+        ];
+        assert!(
+            brokk_bifrost_jvm::java::graph::resolver::java_field_type_text_from_metadata(
+                &conflicting
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -6760,36 +6707,6 @@ mod canonical_constructor_tests {
             synthetic_java
                 .constructor_context(&anonymous, Vec::new(), Some(0))
                 .is_none()
-        );
-    }
-
-    #[test]
-    fn field_type_metadata_requires_complete_agreement() {
-        let complete = vec![
-            SignatureMetadata::new("value", Vec::new()).with_return_type_text(Some("Target")),
-            SignatureMetadata::new("value", Vec::new()).with_return_type_text(Some("Target")),
-        ];
-        assert_eq!(
-            brokk_bifrost_jvm::java::graph::resolver::java_field_type_text_from_metadata(&complete)
-                .as_deref(),
-            Some("Target")
-        );
-
-        let missing = vec![SignatureMetadata::new("value", Vec::new())];
-        assert!(
-            brokk_bifrost_jvm::java::graph::resolver::java_field_type_text_from_metadata(&missing)
-                .is_none()
-        );
-
-        let conflicting = vec![
-            SignatureMetadata::new("value", Vec::new()).with_return_type_text(Some("Target")),
-            SignatureMetadata::new("value", Vec::new()).with_return_type_text(Some("Other")),
-        ];
-        assert!(
-            brokk_bifrost_jvm::java::graph::resolver::java_field_type_text_from_metadata(
-                &conflicting
-            )
-            .is_none()
         );
     }
 
@@ -6940,8 +6857,12 @@ mod canonical_constructor_tests {
 mod tests {
     use super::*;
     use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
+    #[hardwon(
+        "#3699: External constructor proof keeps the semantic model’s constructor member identity and arity"
+    )]
     fn external_constructor_keeps_the_model_member_identity() {
         use crate::analyzer::semantic_model::*;
         use serde_json::json;
@@ -7037,6 +6958,53 @@ mod tests {
         assert_eq!(proof.canonical_callee(), "example.Box.<init>");
         assert_eq!(proof.parameter_count(), 1);
         assert!(!proof.has_receiver());
+
+        let call_start = source.find("Box(value)").expect("constructor token");
+        let site = ResolvedReferenceSite {
+            path: project.file("App.java").to_string(),
+            text: "Box".into(),
+            range: Range {
+                start_byte: call_start,
+                end_byte: call_start + 3,
+                start_line: 0,
+                end_line: 0,
+            },
+            focus_start_byte: call_start,
+            focus_end_byte: call_start + 3,
+        };
+        let tree =
+            brokk_bifrost_jvm::java::declarations::parse_tree(source).expect("Java source parses");
+        let native =
+            crate::analyzer::java::native_points::resolve_java_definition_with_evidence_bounded(
+                crate::analyzer::languages::BoundedReceiverQuery {
+                    analyzer,
+                    file: &project.file("App.java"),
+                    source,
+                    tree: Some(&tree),
+                    site: &site,
+                    budget:
+                        crate::analyzer::usages::receiver_analysis::INTERACTIVE_TYPE_LOOKUP_BUDGET,
+                    cancellation: None,
+                },
+                || {},
+            );
+        let BoundedResolution::Complete { value: native, .. } = native else {
+            panic!("native constructor call evidence: {native:?}");
+        };
+        let proof = native
+            .evidence
+            .exact_external_call()
+            .unwrap_or_else(|| panic!("native external constructor evidence: {native:#?}"));
+        assert_eq!(proof.canonical_callee(), "example.Box.<init>");
+        assert_eq!(proof.parameter_count(), 1);
+        assert!(!proof.has_receiver());
+        assert_eq!(
+            native
+                .evidence
+                .external_callee_identity()
+                .map(|identity| (identity.owner_fqn(), identity.member())),
+            Some(("example.Box", "<init>"))
+        );
     }
 
     #[test]
@@ -7088,7 +7056,11 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#3361: Java var inference from a factory return resolves the same member as an explicit local type declaration"
+    )]
     fn java_var_factory_return_resolves_member_like_explicit_type() {
+        let native_trial = std::env::var_os("BIFROST_TRIAL_NATIVE_JAVA").is_some();
         for declared in ["var", "Store"] {
             let source = format!(
                 "import api.Store; class App {{ void run() {{ {declared} store = Store.open(); store.put(1); }} }}"
@@ -7116,7 +7088,15 @@ mod tests {
                 None,
             );
             assert_eq!(outcomes.len(), 1);
-            let outcome = &outcomes[0].outcome;
+            let lookup = &outcomes[0];
+            let outcome = &lookup.outcome;
+            if native_trial {
+                assert_eq!(
+                    lookup.authority,
+                    DefinitionResolutionAuthority::NativeJavaSelected,
+                    "the trial result comes from the selected native operation: {lookup:?}"
+                );
+            }
             assert_eq!(
                 outcome.status,
                 DefinitionLookupStatus::Resolved,
@@ -7132,6 +7112,9 @@ mod tests {
     /// and one applicable signature. The canonical `<owner>.<member>` text is
     /// not that proof.
     #[test]
+    #[hardwon(
+        "#3522: Checks Java external call evidence appears only when the exact declared signature accepts the call"
+    )]
     fn java_external_member_call_publishes_structured_evidence_only_for_an_applicable_signature() {
         use crate::analyzer::jvm::external::{
             TestClassFile, TestClassMethod, write_test_class_jar,
@@ -7146,6 +7129,12 @@ mod tests {
         write_test_class_jar(
             &jar_path,
             &[
+                TestClassFile {
+                    internal_name: "java/lang/String",
+                    super_internal_name: "java/lang/Object",
+                    methods: &[],
+                    private_nested: false,
+                },
                 TestClassFile {
                     internal_name: "java/util/List",
                     super_internal_name: "java/lang/Object",
@@ -7330,10 +7319,26 @@ mod tests {
             assert_eq!(outcomes.len(), 1, "{outcomes:?}");
             outcomes.pop().expect("one request answers once")
         };
-        assert!(
-            ambiguous.exact_external_call.is_none() && ambiguous.external_callee_identity.is_none(),
-            "two same-arity overloads are not one applicable signature: {ambiguous:?}"
-        );
+        if std::env::var_os("BIFROST_TRIAL_NATIVE_JAVA").is_some() {
+            let proof = ambiguous.exact_external_call.as_ref().unwrap_or_else(|| {
+                panic!("String selects the external m(String) overload: {ambiguous:?}")
+            });
+            assert_eq!(proof.parameter_count(), 1);
+            assert!(proof.has_receiver());
+            assert_eq!(
+                ambiguous
+                    .external_callee_identity
+                    .as_ref()
+                    .map(|identity| { (identity.owner_fqn(), identity.member()) }),
+                Some(("com.example.Over", "m"))
+            );
+        } else {
+            assert!(
+                ambiguous.exact_external_call.is_none()
+                    && ambiguous.external_callee_identity.is_none(),
+                "the incumbent external member proof has no argument-type selector: {ambiguous:?}"
+            );
+        }
 
         let cancellation = crate::analyzer::semantic::CancellationToken::default();
         let mut materialization_budget = crate::analyzer::semantic::SemanticBudget::default();
@@ -7455,6 +7460,7 @@ mod tests {
         use crate::{
             AnalyzerConfig, JvmAnalyzerConfig, JvmExternalArtifact, JvmExternalDependencies,
         };
+        use brokk_bifrost_test_macros::hardwon;
         use std::sync::Arc;
 
         fn fixture(
@@ -7562,6 +7568,7 @@ mod tests {
         }
 
         #[test]
+        #[hardwon("#3522: declared Java external call publishes exact proof and identity")]
         fn declared_zero_arity_call_is_proved() {
             let outcome = lookup(
                 "class App { void f(java.util.List values) { values.size(); } }",
@@ -7574,6 +7581,7 @@ mod tests {
         }
 
         #[test]
+        #[hardwon("#3522: wrong-arity Java external call stays unproved")]
         fn wrong_arity_stays_unproved() {
             assert_unproved(
                 "class App { void f(java.util.List values) { values.size(1); } }",
@@ -7582,6 +7590,7 @@ mod tests {
         }
 
         #[test]
+        #[hardwon("#3522: type-qualified instance call cannot claim external proof")]
         fn instance_member_through_type_stays_unproved() {
             assert_unproved(
                 "class App { void f() { java.util.List.size(); } }",
@@ -7590,6 +7599,7 @@ mod tests {
         }
 
         #[test]
+        #[hardwon("#3522: inapplicable inner call cannot prove a chained receiver")]
         fn inapplicable_inner_call_cannot_prove_chained_receiver() {
             assert_unproved(
                 "class App { void f(fixture.Factory factory) { factory.make(1).size(); } }",
@@ -7598,11 +7608,13 @@ mod tests {
         }
 
         #[test]
+        #[hardwon("#3522: unresolved Java receiver cannot claim external proof")]
         fn unresolved_receiver_stays_unproved() {
             assert_unproved("class App { void f() { unknown.size(); } }", "size()");
         }
 
         #[test]
+        #[hardwon("#3522: workspace shadow blocks external proof")]
         fn workspace_shadow_stays_unproved() {
             assert_unproved(
                 "class List { int size() { return 0; } } class App { void f(List values) { values.size(); } }",
@@ -7611,6 +7623,7 @@ mod tests {
         }
 
         #[test]
+        #[hardwon("#3522: declared static call retains resolver authority")]
         fn declared_static_call_retains_static_authority() {
             use crate::analyzer::semantic::{
                 CancellationToken, DispatchOracle, SemanticBudget, SemanticRequest,

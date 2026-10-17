@@ -1,5 +1,6 @@
 use super::selectors::*;
 use super::*;
+use crate::analyzer::fq_name::segment_interner;
 use crate::analyzer::languages::LanguageGraphBackend;
 use crate::analyzer::lexical_definitions::{
     LexicalBindingResolution, LexicalDefinition, c_label_usage_ranges, resolve_lexical_binding,
@@ -11,7 +12,7 @@ use crate::analyzer::resolution::{
 };
 #[cfg(any(test, feature = "test-support"))]
 use crate::analyzer::store::Result as StoreResult;
-use crate::analyzer::symbol_lookup::resolve_codeunit_fuzzy_bounded_with;
+use crate::analyzer::symbol_lookup::{parse_symbol_path_fq, resolve_codeunit_fuzzy_bounded_with};
 #[cfg(any(test, feature = "test-support"))]
 use crate::analyzer::usages::workspace_graph::build_selected_workspace_usage_graph_projection;
 use crate::analyzer::usages::workspace_graph::{
@@ -388,6 +389,8 @@ pub struct UsageLocation {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub snippet: Option<String>,
     #[serde(skip_serializing_if = "is_full_confidence")]
     pub confidence: f64,
@@ -523,12 +526,10 @@ pub(super) fn test_file_exclusion(
 ///
 /// The per-file verdict is exactly what it was when this was a pre-built set
 /// over `analyzer.analyzed_files()`. What changed is *who* gets classified.
-/// Pre-classifying the workspace cost 2.30-2.78 s on the rustc tree — 66-87 %
-/// of a 3 s scan budget, 29,748 files classified before any symbol work, with
-/// `file_is_test_only` dragging `RustAnalyzer::build_cargo_routes` (0.83-1.03 s)
-/// into the budget with it (`.agents/docs/gate-cell-overhead-2026-08.md`). The
-/// consumers only ever ask about files they are about to read: the scan's
-/// candidate files, hundreds at most, and the usage-graph walk's caller files.
+/// Pre-classifying every analyzed file also invokes test-file detection for
+/// files the search will never read. Consumers only ever ask about files they
+/// are about to read: the scan's
+/// candidate files and the usage-graph walk's caller files.
 /// Every one of those comes from analyzer-indexed declarations, which is the
 /// same population the pre-built set was drawn from.
 pub(super) struct TestFileExclusion<'a> {
@@ -537,7 +538,6 @@ pub(super) struct TestFileExclusion<'a> {
     /// per overload and once per requested symbol, so the memo is what keeps
     /// the classification O(distinct candidates) rather than O(asks).
     verdicts: std::sync::Mutex<HashMap<ProjectFile, bool>>,
-    classified: std::sync::atomic::AtomicUsize,
 }
 
 impl<'a> TestFileExclusion<'a> {
@@ -545,7 +545,6 @@ impl<'a> TestFileExclusion<'a> {
         Self {
             analyzer,
             verdicts: std::sync::Mutex::new(HashMap::default()),
-            classified: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -562,10 +561,7 @@ impl<'a> TestFileExclusion<'a> {
         // Classify with the lock released: `file_is_test_only` can build a
         // language's route index, and holding the memo lock across it would
         // serialize the whole-workspace usage-graph walk behind one file.
-        // A racing duplicate classification is harmless — the predicate is
-        // pure — and is counted, so `classified_count` stays an upper bound.
-        self.classified
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // A racing duplicate classification is harmless because the predicate is pure.
         let verdict = is_test_like_file(
             self.analyzer,
             file,
@@ -577,13 +573,6 @@ impl<'a> TestFileExclusion<'a> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(file.clone(), verdict);
         verdict
-    }
-
-    /// How many files this request has classified. The observable complexity
-    /// signal: a scan must classify its candidates, not its workspace.
-    #[cfg(test)]
-    pub(super) fn classified_count(&self) -> usize {
-        self.classified.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -601,9 +590,7 @@ pub(crate) fn is_test_like_file(
     path: &str,
     language: Language,
 ) -> bool {
-    test_paths::path_test_verdict(path) == test_paths::PathTestVerdict::TestRoot
-        || test_paths::has_test_filename_convention(path, language)
-        || analyzer.file_is_test_only(file)
+    test_paths::is_test_like_path(path, language) || analyzer.file_is_test_only(file)
 }
 
 /// Build a [`UsageFinder`] whose file filter drops the excluded test files and
@@ -1099,6 +1086,7 @@ fn macro_lexical_usage_rows(
                 end_offset: range.end,
                 enclosing,
                 kind: UsageHitKind::Reference,
+                reason_kind: None,
                 snippet: source[line_start..line_end].trim_end().to_owned(),
                 confidence: 1.0,
             });
@@ -1188,6 +1176,7 @@ fn lexical_label_usage_rows(
             end_offset: range.end_byte,
             enclosing,
             kind: UsageHitKind::Reference,
+            reason_kind: None,
             snippet,
             confidence: 1.0,
         });
@@ -1859,17 +1848,23 @@ pub(super) fn resolve_scan_usages_target(
             || definition_selector(unit) == symbol
             || display_symbol_name(language_for_target(unit), unit.fq_name_str()) == symbol
     };
-    // Members' short_name is owner-qualified (`Widget.helper`), so bare-name
-    // acceptance also matches the terminal segment: the location already pins
-    // the target, making the bare terminal exactly as unambiguous for a method
-    // as for a free function. Exact string equality on the structured
-    // short_name convention's own `.` join - no source parsing.
+    // The location pins a single declaration, so a selector may omit leading
+    // namespace or aggregate segments. Parse the selector with the language's
+    // structured name reader and compare its segment texts with the candidate's
+    // FQ suffix. This admits both a bare nested type (`BL_TYPE`) and a member
+    // with a partially-qualified owner (`Big.x`) even when C++ renders the
+    // omitted aggregate prefix with `$` (`PBlock$BL_TYPE`, `nk_alignof$Big.x`).
+    // Exact selectors still get the first pass above, before this location-pinned
+    // suffix match can consider them.
     let selector_matches_short_name = |unit: &CodeUnit, symbol: &str| {
-        let short_name = unit.short_name();
-        short_name == symbol
-            || short_name
-                .rsplit_once('.')
-                .is_some_and(|(_, terminal)| terminal == symbol)
+        let language = language_for_target(unit);
+        let selector = parse_symbol_path_fq(language, symbol, segment_interner());
+        let fq = unit.fq();
+        !selector.is_empty()
+            && selector.len() <= fq.len()
+            && fq
+                .suffix_from(fq.len() - selector.len())
+                .same_segment_texts(&selector)
     };
 
     let declarations_here = declarations_in_file(analyzer, &file);
@@ -1879,6 +1874,45 @@ pub(super) fn resolve_scan_usages_target(
         true,
         &selector_matches_exact_form,
     );
+    // Lookup-only units also need the location-pinned suffix match below.
+    // Seek the selector's terminal identifier in this file, rather than its
+    // full FQ: a source-written receiver can omit the creating binding's scope
+    // (#3864). Exact matches still precede suffix matches, including module
+    // surfaces whose source spelling differs from their declaration identity.
+    let lookup_only_candidates = if matching_units.is_empty()
+        && let Some(symbol) = selector
+    {
+        let language = language_for_file(&file);
+        let name = parse_symbol_path_fq(language, symbol, segment_interner());
+        let declarations = analyzer.location_declarations(&file);
+        let lookup = AnalyzerDefinitionLookup::new(analyzer, language);
+        name.last()
+            .into_iter()
+            .flat_map(|segment| {
+                let identifier = segment_interner().resolve(segment).0;
+                lookup.file_identifier(&file, identifier)
+            })
+            .filter(|unit| {
+                unit.source() == &file
+                    && unit.is_field()
+                    && analyzer.parent_of(unit).is_none()
+                    && !declarations.contains(unit)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    if matching_units.is_empty()
+        && !lookup_only_candidates.is_empty()
+        && UsageEcosystem::of(language_for_file(&file)).is_module_scoped()
+    {
+        matching_units = location_units(
+            lookup_only_candidates.clone(),
+            selector,
+            true,
+            &selector_matches_exact_form,
+        );
+    }
     if matching_units.is_empty() && selector.is_some() {
         matching_units = location_units(
             declarations_here.clone(),
@@ -1887,21 +1921,7 @@ pub(super) fn resolve_scan_usages_target(
             &selector_matches_short_name,
         );
     }
-    if matching_units.is_empty()
-        && let Some(symbol) = selector
-    {
-        let declarations = analyzer.location_declarations(&file);
-        let lookup = AnalyzerDefinitionLookup::new(analyzer, language_for_file(&file));
-        let lookup_only_candidates: Vec<CodeUnit> = lookup
-            .fqn(symbol)
-            .into_iter()
-            .filter(|unit| {
-                unit.source() == &file
-                    && unit.is_field()
-                    && analyzer.parent_of(unit).is_none()
-                    && !declarations.contains(unit)
-            })
-            .collect();
+    if matching_units.is_empty() && !lookup_only_candidates.is_empty() {
         matching_units = location_units(
             lookup_only_candidates.clone(),
             selector,
@@ -2641,6 +2661,7 @@ fn scan_usages_backend_on_pool(
             DefinitionSelector::Name(name) => (None, name),
             DefinitionSelector::FileAnchored { anchor, lookup } => (Some(anchor), lookup),
         };
+        let (kind, bare_lookup) = split_kind_qualified_lookup(lookup);
         // Resolution is inside the scan's budget, not beside it. A file anchor
         // is part of resolution itself: filter candidates to that file before
         // the resolver decides whether the spelling is ambiguous. Otherwise a
@@ -2660,23 +2681,25 @@ fn scan_usages_backend_on_pool(
             match anchor.as_deref() {
                 Some(anchor) => match resolve_codeunit_fuzzy_bounded_with(
                     analyzer,
-                    lookup,
-                    |unit| rel_path_string(unit.source()) == anchor,
+                    bare_lookup,
+                    |unit| {
+                        rel_path_string(unit.source()) == anchor
+                            && kind.is_none_or(|kind| unit.kind() == kind)
+                    },
                     resolution_budget,
                 ) {
                     Ok(CodeUnitResolution::NotFound) => {
-                        resolve_codeunit_fuzzy_bounded(analyzer, lookup, resolution_budget).map(
-                            |global| match global {
+                        resolve_codeunit_fuzzy_bounded(analyzer, bare_lookup, resolution_budget)
+                            .map(|global| match global {
                                 CodeUnitResolution::Ambiguous(candidates) => {
                                     CodeUnitResolution::Resolved(candidates)
                                 }
                                 other => other,
-                            },
-                        )
+                            })
                     }
                     scoped => scoped,
                 },
-                None => resolve_codeunit_fuzzy_bounded(analyzer, lookup, resolution_budget),
+                None => resolve_codeunit_fuzzy_bounded(analyzer, bare_lookup, resolution_budget),
             }
         };
         let resolution = match resolution {
@@ -2803,9 +2826,15 @@ fn scan_usages_backend_on_pool(
     // UsageFinder retains its own replay frontier and result state.
     let resolved_queries: Vec<_> = resolved_targets
         .into_par_iter()
-        .map(|resolved| {
+        .map(|mut resolved| {
             if context.cancellation.is_cancelled() {
                 return (resolved, None);
+            }
+            // Location selection starts from physical extraction rows. Give
+            // both scan entry points the same structural target before usage
+            // resolution, while range and signature reads retain provenance.
+            for unit in &mut resolved.overloads {
+                *unit = analyzer.canonical_code_unit(unit, Some(&context.cancellation));
             }
             let finder = scoped_usage_finder(test_files.as_ref(), query_scope.path_filter.as_ref())
                 .with_cancellation(context.cancellation.clone());
@@ -3244,6 +3273,13 @@ fn classify_scan_usages_reference_entry(entry: &ScanUsagesWorkEntry) -> ScanUsag
 }
 
 fn raw_symbol_usages(state: &SymbolUsageRenderState) -> SymbolUsages {
+    let mut usages = symbol_usages_base(state);
+    usages.rendering = UsageRendering::Full;
+    usages.unproven_files = raw_summary_file_groups(&state.unproven_rows);
+    usages
+}
+
+fn symbol_usages_base(state: &SymbolUsageRenderState) -> SymbolUsages {
     SymbolUsages {
         symbol: state.symbol.clone(),
         fq_name: state.fq_name.clone(),
@@ -3252,7 +3288,7 @@ fn raw_symbol_usages(state: &SymbolUsageRenderState) -> SymbolUsages {
         total_hits: state.total_hits,
         unproven_hits: state.unproven_hits,
         same_owner_sites: some_if_nonzero(state.same_owner_sites),
-        rendering: UsageRendering::Full,
+        rendering: state.rendering,
         candidate_files_truncated: state.candidate_files_truncated,
         reference_only_siblings: state.reference_only_absence_note.is_some(),
         definition_sites_excluded: some_if_nonzero(state.definition_sites_excluded),
@@ -3261,7 +3297,7 @@ fn raw_symbol_usages(state: &SymbolUsageRenderState) -> SymbolUsages {
         top_enclosing: Vec::new(),
         files: Vec::new(),
         same_owner_files: Vec::new(),
-        unproven_files: raw_summary_file_groups(&state.unproven_rows),
+        unproven_files: Vec::new(),
         model_relations: Vec::new(),
     }
 }
@@ -3647,6 +3683,247 @@ type UsageGraphSiteKey = (String, usize, String, String);
 type UsageGraphEndpointPair = (DeclarationId, DeclarationId);
 type UsageGraphExactSites = HashMap<UsageGraphSiteKey, BTreeSet<UsageGraphEndpointPair>>;
 
+/// Resolve the selected one-based reference start lines, not whole caller files.
+/// The occurrence inventory and graph reduction remain query-local. Parsing and
+/// occurrence classification still read a whole file; only target resolution is
+/// proportional to the selected sites. This is a different scope from a rooted
+/// outbound graph and does not certify relationships at unvisited sites.
+pub(crate) fn usage_graph_at_lines(
+    analyzer: &dyn IAnalyzer,
+    demanded: &BTreeMap<String, BTreeSet<usize>>,
+    include_tests: bool,
+    cancellation: &CancellationToken,
+) -> UsageGraphResult {
+    use crate::analyzer::structural::occurrence_rows::occurrences_for_file_at_lines;
+    use crate::analyzer::structural::reference_edges::{
+        forward_axis_gate, forward_edges_from_occurrences,
+    };
+    use crate::analyzer::usages::UsageProof;
+    use crate::analyzer::usages::get_definition::DefinitionLookupStatus;
+
+    let _timing = profiling::scope("usage_graph::selected_lines");
+    let _query = AnalyzerQueryScope::with_cancellation(analyzer, cancellation);
+    let generation = analyzer.project().analysis_generation();
+    let excluded = test_file_exclusion(analyzer, include_tests);
+    let files = analyzer
+        .analyzed_files()
+        .into_iter()
+        .map(|file| (rel_path_string(&file), file))
+        .collect::<HashMap<_, _>>();
+    let mut incomplete = BTreeSet::new();
+    let mut rows = Vec::new();
+    let mut selected_references = 0usize;
+    for (path, lines) in demanded {
+        if lines.is_empty() {
+            continue;
+        }
+        let Some(file) = files.get(path) else {
+            incomplete.insert((
+                "unavailable_canonical_facts".to_string(),
+                format!("selected reference lines have no analyzed file: {path}"),
+            ));
+            continue;
+        };
+        if excluded
+            .as_ref()
+            .is_some_and(|filter| filter.excludes(file))
+        {
+            continue;
+        }
+        if let Some(unsupported) = forward_axis_gate(analyzer, file, generation) {
+            incomplete.insert((
+                "forward_reference_unsupported".into(),
+                format!("{path}: {:?}", unsupported.completeness),
+            ));
+            continue;
+        }
+        let occurrences = match occurrences_for_file_at_lines(analyzer, file, lines, cancellation) {
+            Ok(occurrences) => occurrences,
+            Err(_) => {
+                return unavailable_usage_graph_result(
+                    analyzer,
+                    &[],
+                    "cancelled",
+                    "selected-line reference resolution was cancelled".into(),
+                );
+            }
+        };
+        for row in &occurrences.rows {
+            if !lines.contains(&row.range.start_line) {
+                continue;
+            }
+            if row.class == crate::analyzer::structural::OccurrenceClass::Reference {
+                selected_references += 1;
+            }
+            if let Some(status) = row.resolution_status
+                && !matches!(
+                    status,
+                    DefinitionLookupStatus::Resolved | DefinitionLookupStatus::NoDefinition
+                )
+            {
+                incomplete.insert((
+                    status.as_str().to_string(),
+                    format!("{path}:{:?}: {status:?}", row.range),
+                ));
+            }
+        }
+        let derived = forward_edges_from_occurrences(analyzer, file, occurrences, generation)
+            .expect("forward edge conversion does not perform cancellable work");
+        if !derived.completeness.is_complete() {
+            incomplete.insert((
+                "forward_reference_incomplete".into(),
+                format!("{path}: {:?}", derived.completeness),
+            ));
+        }
+        rows.extend(derived.edges);
+    }
+    profiling::note_with(|| {
+        format!(
+            "selected-line graph files={} selected_references={} retained_edges={}",
+            demanded.len(),
+            selected_references,
+            rows.len()
+        )
+    });
+    if cancellation.is_cancelled() {
+        return unavailable_usage_graph_result(
+            analyzer,
+            &[],
+            "cancelled",
+            "selected-line graph was cancelled".into(),
+        );
+    }
+    let units_by_id = rows
+        .iter()
+        .flat_map(|row| {
+            row.site
+                .enclosing
+                .iter()
+                .chain(std::iter::once(&row.target))
+        })
+        .map(|unit| (unit.declaration_id(), unit.clone()))
+        .collect::<HashMap<_, _>>();
+    let declarations = units_by_id
+        .values()
+        .filter(|unit| {
+            is_graph_declaration(unit)
+                && excluded
+                    .as_ref()
+                    .is_none_or(|filter| !filter.excludes(unit.source()))
+        })
+        .map(|unit| (unit.clone(), primary_range(analyzer, unit)))
+        .collect();
+    let Some(catalog) = WorkspaceUsageCatalog::from_declarations(declarations, cancellation) else {
+        return unavailable_usage_graph_result(
+            analyzer,
+            &[],
+            "cancelled",
+            "selected-line catalog was cancelled".into(),
+        );
+    };
+    let target_spans = catalog
+        .nodes
+        .iter()
+        .map(|node| {
+            node.declaration_ids
+                .iter()
+                .filter_map(|id| units_by_id.get(id))
+                .flat_map(|unit| {
+                    analyzer
+                        .ranges(unit)
+                        .into_iter()
+                        .map(|range| (unit.source().clone(), range))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut edge_sites = BTreeMap::new();
+    for row in rows {
+        let Some(source_id) = row.source_id() else {
+            continue;
+        };
+        let (Some(from), Some(to)) = (
+            catalog.index_for_id(&source_id),
+            catalog.index_for_id(&row.target_id()),
+        ) else {
+            continue;
+        };
+        let source = &catalog.nodes[from];
+        let target = &catalog.nodes[to];
+        if source.key.id == target.key.id
+            || !row.included_in_external_usage_graph(&target_spans[to])
+        {
+            continue;
+        }
+        if row.proof != UsageProof::Proven {
+            incomplete.insert((
+                "unproven_reference_edges".into(),
+                format!(
+                    "selected site {:?} has unproven target {:?}",
+                    row.site,
+                    row.target_id()
+                ),
+            ));
+            continue;
+        }
+        edge_sites
+            .entry((source.key.id.clone(), target.key.id.clone()))
+            .or_insert_with(|| (source.primary.clone(), target.primary.clone(), Vec::new()))
+            .2
+            .push(UsageGraphCallSite {
+                path: rel_path_string(&row.site.file),
+                line: row.site.range.start_line,
+            });
+    }
+    if generation != analyzer.project().analysis_generation() {
+        return unavailable_usage_graph_result(
+            analyzer,
+            &[],
+            "stale_generation",
+            "workspace changed during selected-line graph resolution".into(),
+        );
+    }
+    if cancellation.is_cancelled() {
+        return unavailable_usage_graph_result(
+            analyzer,
+            &[],
+            "cancelled",
+            "selected-line graph was cancelled".into(),
+        );
+    }
+    if let Some(error) = _query.store_error() {
+        return unavailable_usage_graph_result(analyzer, &[], "query_failed", error.to_string());
+    }
+    let result = finalize_usage_graph_result(
+        analyzer,
+        &[],
+        catalog,
+        edge_sites,
+        BTreeMap::new(),
+        incomplete,
+    );
+    if let Some(error) = _query.store_error() {
+        return unavailable_usage_graph_result(analyzer, &[], "query_failed", error.to_string());
+    }
+    if cancellation.is_cancelled() {
+        return unavailable_usage_graph_result(
+            analyzer,
+            &[],
+            "cancelled",
+            "selected-line graph was cancelled during finalization".into(),
+        );
+    }
+    if generation != analyzer.project().analysis_generation() {
+        return unavailable_usage_graph_result(
+            analyzer,
+            &[],
+            "stale_generation",
+            "workspace changed during selected-line graph finalization".into(),
+        );
+    }
+    result
+}
+
 /// Build the whole-workspace resolved usage graph: classes and functions as
 /// nodes, caller -> callee references as weighted edges.
 ///
@@ -3879,8 +4156,9 @@ fn usage_graph_with_passes(
     // aggregation. The mature language plugins produce location-bearing FQN
     // edges; the common engine joins those sites to exact declarations. When
     // an FQN is overloaded or duplicated, the structural occurrence relation
-    // is used only to disambiguate that exact site. An unresolved ambiguity is
-    // omitted and reported instead of being cross-linked.
+    // is used only to disambiguate that exact site. A closed ambiguity keeps
+    // each exact target as an unproven candidate edge. Other incomplete
+    // bindings keep their existing proof and completeness behavior.
     let mut edge_sites: BTreeMap<
         (DeclarationId, DeclarationId),
         (CodeUnit, CodeUnit, Vec<UsageGraphCallSite>),
@@ -5436,6 +5714,7 @@ pub(super) struct UsageHitRow {
     pub(super) end_offset: usize,
     pub(super) enclosing: String,
     pub(super) kind: UsageHitKind,
+    pub(super) reason_kind: Option<String>,
     pub(super) snippet: String,
     pub(super) confidence: f64,
 }
@@ -5631,9 +5910,16 @@ pub(super) fn filter_and_dedupe_hits(
             continue;
         }
         if hit.kind == UsageHitKind::Reference
-            && definition_ranges
-                .get(&hit.file)
-                .is_some_and(|ranges| ranges.iter().any(|range| ranges_overlap(range, &hit)))
+            && definition_ranges.get(&hit.file).is_some_and(|ranges| {
+                ranges.iter().any(|range| {
+                    brokk_bifrost_core::util::byte_ranges_overlap(
+                        range.start_byte,
+                        range.end_byte,
+                        hit.start_offset,
+                        hit.end_offset,
+                    )
+                })
+            })
         {
             definition_sites_excluded += 1;
             continue;
@@ -5683,6 +5969,7 @@ pub(super) fn filter_and_dedupe_hits(
             end_offset: hit.end_offset,
             enclosing: enclosing.clone(),
             kind: hit.kind,
+            reason_kind: hit.reason_kind.clone(),
             snippet: hit.snippet.trim_end().to_string(),
             confidence: hit.confidence,
         };
@@ -5774,10 +6061,6 @@ pub(super) fn external_usage_definition_ranges(
     } else {
         exact_ranges
     }
-}
-
-pub(super) fn ranges_overlap(range: &Range, hit: &UsageHit) -> bool {
-    range.start_byte < hit.end_offset && hit.start_offset < range.end_byte
 }
 
 pub(super) fn render_scan_usages_with_budget(
@@ -6472,30 +6755,19 @@ pub(super) fn render_symbol_usages(state: &SymbolUsageRenderState) -> SymbolUsag
         Vec::new()
     };
 
-    SymbolUsages {
-        symbol: state.symbol.clone(),
-        fq_name: state.fq_name.clone(),
-        definition_path: state.definition_path.clone(),
-        definition_line: state.definition_line,
-        total_hits: state.total_hits,
-        unproven_hits: state.unproven_hits,
-        same_owner_sites: some_if_nonzero(state.same_owner_sites),
-        rendering: state.rendering,
-        candidate_files_truncated: state.candidate_files_truncated,
-        reference_only_siblings,
-        definition_sites_excluded: some_if_nonzero(state.definition_sites_excluded),
-        files_truncated,
-        note: if notes.is_empty() {
-            None
-        } else {
-            Some(notes.join(" "))
-        },
-        top_enclosing,
-        files,
-        same_owner_files,
-        unproven_files: render_usage_file_groups(&state.unproven_rows, true),
-        model_relations: Vec::new(),
-    }
+    let mut usages = symbol_usages_base(state);
+    usages.reference_only_siblings = reference_only_siblings;
+    usages.files_truncated = files_truncated;
+    usages.note = if notes.is_empty() {
+        None
+    } else {
+        Some(notes.join(" "))
+    };
+    usages.top_enclosing = top_enclosing;
+    usages.files = files;
+    usages.same_owner_files = same_owner_files;
+    usages.unproven_files = render_usage_file_groups(&state.unproven_rows, true);
+    usages
 }
 
 fn attach_model_relations(analyzer: &dyn IAnalyzer, result: &mut ScanUsagesResult) {
@@ -6776,10 +7048,9 @@ fn authored_model_references(
             };
             let mut spans = Vec::new();
             for (index, node) in facts.nodes().iter().enumerate() {
-                if !matches!(
-                    node.kind,
-                    NormalizedKind::Call | NormalizedKind::FieldAccess
-                ) {
+                if !node.kind.satisfies(NormalizedKind::Call)
+                    && node.kind != NormalizedKind::FieldAccess
+                {
                     continue;
                 }
                 if let Some(name) = node.name
@@ -6844,6 +7115,7 @@ fn authored_model_references(
                         end_column: Some(column.saturating_add(span.end_byte - span.start_byte)),
                         enclosing,
                         kind: None,
+                        reason_kind: None,
                         snippet: lines
                             .get(line.saturating_sub(1))
                             .map(|line| (*line).to_owned()),
@@ -6950,6 +7222,7 @@ fn go_authored_model_references(
                     end_column: Some(tree_range.end_point.column + 1),
                     enclosing,
                     kind: None,
+                    reason_kind: None,
                     snippet: lines.get(position.row).map(|line| (*line).to_owned()),
                     confidence: 1.0,
                 });
@@ -7049,21 +7322,30 @@ fn decimal_digits(value: usize) -> usize {
 /// [`render_usage_file_groups`], which omits the label for internal kinds, this
 /// always emits the kind so the excluded-but-listed sites are unambiguous.
 pub(super) fn render_same_owner_file_groups(hits: &[UsageHitRow]) -> Vec<UsageFileGroup> {
-    let mut grouped: BTreeMap<String, Vec<UsageLocation>> = BTreeMap::new();
-    for hit in hits {
-        grouped
-            .entry(hit.path.clone())
-            .or_default()
-            .push(UsageLocation {
+    render_grouped_usage_locations(hits.iter().map(|hit| {
+        (
+            hit.path.clone(),
+            UsageLocation {
                 line: hit.line,
                 column: hit.column,
                 end_line: hit.end_line,
                 end_column: hit.end_column,
                 enclosing: hit.enclosing.clone(),
                 kind: Some(hit.kind.wire_label().to_string()),
+                reason_kind: hit.reason_kind.clone(),
                 snippet: Some(hit.snippet.clone()),
                 confidence: hit.confidence,
-            });
+            },
+        )
+    }))
+}
+
+fn render_grouped_usage_locations(
+    locations: impl IntoIterator<Item = (String, UsageLocation)>,
+) -> Vec<UsageFileGroup> {
+    let mut grouped: BTreeMap<String, Vec<UsageLocation>> = BTreeMap::new();
+    for (path, location) in locations {
+        grouped.entry(path).or_default().push(location);
     }
     grouped
         .into_iter()
@@ -7086,37 +7368,22 @@ pub(super) fn render_usage_file_groups(
     hits: &[UsageHitRow],
     include_snippets: bool,
 ) -> Vec<UsageFileGroup> {
-    let mut grouped: BTreeMap<String, Vec<UsageLocation>> = BTreeMap::new();
-    for hit in hits {
-        grouped
-            .entry(hit.path.clone())
-            .or_default()
-            .push(UsageLocation {
+    render_grouped_usage_locations(hits.iter().map(|hit| {
+        (
+            hit.path.clone(),
+            UsageLocation {
                 line: hit.line,
                 column: hit.column,
                 end_line: hit.end_line,
                 end_column: hit.end_column,
                 enclosing: hit.enclosing.clone(),
                 kind: hit.kind.external_label().map(str::to_string),
+                reason_kind: hit.reason_kind.clone(),
                 snippet: include_snippets.then(|| hit.snippet.clone()),
                 confidence: hit.confidence,
-            });
-    }
-    grouped
-        .into_iter()
-        .map(|(path, mut hits)| {
-            hits.sort_by(|left, right| {
-                left.line
-                    .cmp(&right.line)
-                    .then_with(|| left.enclosing.cmp(&right.enclosing))
-            });
-            UsageFileGroup {
-                path,
-                hits,
-                hit_count: None,
-            }
-        })
-        .collect()
+            },
+        )
+    }))
 }
 
 #[derive(Debug, Clone)]
@@ -7420,6 +7687,7 @@ mod tests {
     };
     use crate::analyzer::{Language, RustAnalyzer, TestProject};
     use crate::test_support::AnalyzerFixture;
+    use brokk_bifrost_test_macros::hardwon;
 
     /// A rooted `usage_graph` naming only Rust files must not make the Rust
     /// provider demand canonical Rust facts for a file the Rust adapter does
@@ -7431,34 +7699,7 @@ mod tests {
     /// and fails the whole request.
     #[test]
     fn rooted_rust_usage_graph_ignores_other_languages_in_a_mixed_workspace() {
-        use crate::analyzer::{AnalyzerConfig, ProjectFile, WorkspaceAnalyzer};
-        use std::sync::Arc;
-
-        let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().canonicalize().expect("canonical root");
-        for (relative_path, source) in [
-            (
-                "Cargo.toml",
-                "[package]\nname = \"mixed\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-            ),
-            (
-                "src/lib.rs",
-                "pub fn target() -> usize { 1 }\npub fn caller() -> usize { target() }\n",
-            ),
-            ("include/widget.h", "struct Widget { int value; };\n"),
-            ("scripts/build.py", "def helper():\n    return 1\n"),
-        ] {
-            ProjectFile::new(root.clone(), relative_path)
-                .write(source)
-                .expect("write mixed-language fixture");
-        }
-        let project = crate::analyzer::TestProject::from_root_with_inferred_languages(&root)
-            .expect("infer fixture languages");
-        let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
-            Arc::new(project),
-            AnalyzerConfig::default(),
-        )
-        .expect("mixed-language workspace");
+        let (_temp, workspace) = crate::test_support::mixed_language_rust_workspace();
         let analyzer = workspace.analyzer();
 
         let graph = usage_graph(
@@ -7483,6 +7724,696 @@ mod tests {
             "a Rust-rooted request must not read a non-Rust file as a Rust source: {:?}",
             graph.incomplete_reasons
         );
+    }
+
+    #[test]
+    fn semantic_incomplete_scan_retains_hits_and_never_verifies_absence() {
+        let hit = UsageHitRow {
+            path: "src/lib.rs".to_string(),
+            line: 2,
+            column: None,
+            end_line: None,
+            end_column: None,
+            start_offset: 10,
+            end_offset: 16,
+            enclosing: "caller".to_string(),
+            kind: UsageHitKind::Reference,
+            reason_kind: None,
+            snippet: "target()".to_string(),
+            confidence: 1.0,
+        };
+        for (hits, status) in [
+            (Vec::new(), ScanUsagesStatus::UnverifiedAbsent),
+            (vec![hit], ScanUsagesStatus::Found),
+        ] {
+            let count = hits.len();
+            let state = SymbolUsageRenderState::new(
+                "target".to_string(),
+                None,
+                false,
+                0,
+                hits,
+                0,
+                Vec::new(),
+                Some("Unresolved structured reference in another file".to_string()),
+                None,
+                Vec::new(),
+                false,
+            );
+            let entry = classify_scan_usages_entry(&ScanUsagesWorkEntry::Usage {
+                request: ScanUsageRequest::symbol(0, "target".to_string()),
+                state,
+                candidate_files_sample: None,
+                target_is_method: false,
+                incomplete_reason: Some(ScanUsagesIncompleteReason::SemanticAnalysis),
+            });
+            assert_eq!(entry.status, status);
+            assert_eq!(entry.total_hits, Some(count));
+            assert!(!entry.complete);
+            assert_eq!(
+                entry.incomplete_reason,
+                Some(ScanUsagesIncompleteReason::SemanticAnalysis)
+            );
+            assert!(
+                entry
+                    .notes
+                    .iter()
+                    .any(|note| note.contains("Unresolved structured reference"))
+            );
+        }
+    }
+
+    fn selected_usage_graph_projection(
+        site_lines: impl IntoIterator<Item = usize>,
+        raw_truncated_inbound: Option<usize>,
+        unproven_inbound: usize,
+    ) -> SelectedWorkspaceUsageGraphProjection {
+        let root = std::env::current_dir().expect("the test working directory must exist");
+        let caller_file = ProjectFile::new(root.clone(), "src/Caller.java");
+        let target_file = ProjectFile::new(root, "src/Target.java");
+        let caller = CodeUnit::new(
+            caller_file.clone(),
+            CodeUnitType::Function,
+            "fixture",
+            "Caller.run",
+        );
+        let target = CodeUnit::new(target_file, CodeUnitType::Function, "fixture", "Target.run");
+        let range = Range {
+            start_byte: 0,
+            end_byte: 80,
+            start_line: 1,
+            end_line: 3,
+        };
+        let catalog = WorkspaceUsageCatalog::from_declarations(
+            vec![(caller.clone(), Some(range)), (target.clone(), Some(range))],
+            &CancellationToken::default(),
+        )
+        .expect("the selected public-result fixture catalog must build");
+        let mut nodes = catalog.nodes;
+        let caller_index = nodes
+            .iter()
+            .position(|node| node.declaration_ids.contains(&caller.declaration_id()))
+            .expect("the caller must be cataloged");
+        let target_index = nodes
+            .iter()
+            .position(|node| node.declaration_ids.contains(&target.declaration_id()))
+            .expect("the target must be cataloged");
+        nodes[target_index].truncated_inbound = raw_truncated_inbound;
+        nodes[target_index].unproven_inbound = unproven_inbound;
+        let sites = site_lines
+            .into_iter()
+            .map(|line| (caller_file.clone(), line))
+            .collect::<Vec<_>>();
+        let mut raw_proven_inbound = vec![0; nodes.len()];
+        raw_proven_inbound[target_index] = raw_truncated_inbound.unwrap_or(sites.len());
+        SelectedWorkspaceUsageGraphProjection {
+            nodes,
+            raw_proven_inbound,
+            admitted_callers: HashSet::from_iter([caller_file]),
+            unresolved_names: Some(std::collections::BTreeSet::new()),
+            edges: vec![CanonicalWorkspaceUsageProjectedEdge {
+                from: caller_index,
+                to: target_index,
+                counts: UsageReferenceCounts {
+                    calls: 1,
+                    ..UsageReferenceCounts::default()
+                },
+                sites,
+            }],
+            forward_completeness: EdgeCompleteness::Complete,
+            kind_projection_complete: true,
+            generation: 11,
+            reference_count: 1,
+            projected_edge_count: 1,
+            batch_count: 1,
+            root_binding_metrics: ResolutionBatchMetrics::default(),
+            resolved_ecosystems: vec![UsageEcosystem::Jvm],
+        }
+    }
+
+    #[test]
+    fn selected_public_graph_caps_exactly_after_max_distinct_lines_and_cancels_atomically() {
+        let at_cap = selected_usage_graph_result(
+            selected_usage_graph_projection(1..=MAX_CALLSITES, None, 0),
+            true,
+            &CancellationToken::default(),
+        )
+        .expect("the exact-cap selected public result must finish");
+        assert!(at_cap.complete);
+        assert_eq!(1, at_cap.edges.len());
+        assert_eq!(MAX_CALLSITES, at_cap.edges[0].weight);
+        assert!(at_cap.truncated_symbols.is_empty());
+
+        let past_cap = selected_usage_graph_result(
+            selected_usage_graph_projection(1..=MAX_CALLSITES + 1, None, 0),
+            true,
+            &CancellationToken::default(),
+        )
+        .expect("the over-cap selected public result must finish");
+        assert!(!past_cap.complete);
+        assert!(past_cap.edges.is_empty());
+        assert_eq!(1, past_cap.truncated_symbols.len());
+        assert_eq!(
+            MAX_CALLSITES + 1,
+            past_cap.truncated_symbols[0].total_callsites
+        );
+        assert_eq!(
+            vec!["callsites_truncated"],
+            past_cap
+                .incomplete_reasons
+                .iter()
+                .map(|reason| reason.code.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        assert!(
+            selected_usage_graph_result(
+                selected_usage_graph_projection([7], None, 0),
+                true,
+                &cancellation,
+            )
+            .is_none(),
+            "cancellation publishes no public graph prefix"
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "924f2b098379: Creates more than MAX_CALLSITES Java calls and verifies truncation is still reported when the dropped target never enters the result catalog"
+    )]
+    fn usage_graph_returns_when_a_truncated_target_is_not_a_graph_node() {
+        // Java uses the FQN edge arm that fills `legacy_truncated`. A callee over the cap has all of
+        // its call sites dropped and therefore may never be inserted into the result catalog.
+        let callsites = crate::analyzer::usages::inverted_edges::MAX_CALLSITES + 1;
+        let mut body = String::new();
+        for _ in 0..callsites {
+            body.push_str("    new Target().call();\n");
+        }
+        let root = format!("package app; class Root {{ void run() {{\n{body}  }} }}\n");
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Java,
+            &[
+                ("app/Root.java", root.as_str()),
+                (
+                    "app/Target.java",
+                    "package app; class Target { void call() {} }\n",
+                ),
+            ],
+        );
+
+        let graph = usage_graph(
+            fixture.analyzer.analyzer(),
+            UsageGraphParams {
+                include_tests: false,
+                paths: Some(vec!["app/Root.java".to_string()]),
+                depth: 1,
+            },
+        );
+
+        assert!(
+            !graph.complete,
+            "a target past MAX_CALLSITES must be reported as incomplete"
+        );
+        assert!(
+            graph
+                .incomplete_reasons
+                .iter()
+                .any(|reason| reason.code == "callsites_truncated"),
+            "the uncataloged truncated target must retain its incompleteness signal: {graph:?}"
+        );
+    }
+
+    #[test]
+    fn rooted_rust_usage_graph_preserves_exact_edge_sites_on_caller_thread() {
+        use crate::inline_project::InlineTestProject;
+
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"rooted_shadow\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file(
+                "src/lib.rs",
+                "pub fn left() -> usize { 1 }\npub fn right() -> usize { 2 }\npub fn caller() -> usize { left() }\n",
+            )
+            .build();
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+
+        let graph = usage_graph(
+            &analyzer,
+            UsageGraphParams {
+                include_tests: true,
+                paths: Some(vec!["src/lib.rs".to_string()]),
+                depth: 1,
+            },
+        );
+
+        assert!(graph.complete, "rooted Rust usage graph: {graph:#?}");
+        let edge = graph
+            .edges
+            .iter()
+            .find(|edge| edge.from.ends_with(".caller") && edge.to.ends_with(".left"))
+            .expect("rooted Rust graph must retain the exact caller-to-left edge");
+        assert_eq!(edge.weight, 1);
+        assert_eq!(
+            edge.sites,
+            vec![UsageGraphCallSite {
+                path: "src/lib.rs".to_string(),
+                line: 3,
+            }]
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2428: Selects a Go method by its indexed declaration start line and verifies the location query resolves the intended FQN"
+    )]
+    fn exact_location_selector_accepts_the_indexed_declaration_range_start() {
+        let source = "package repro\n\ntype Error struct{}\n\nfunc (e *Error) Error() string { return \"\" }\n";
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Go,
+            &[
+                ("go.mod", "module example.com/repro\n"),
+                ("errors.go", source),
+            ],
+        );
+
+        let result = scan_usages_by_location(
+            fixture.analyzer.analyzer(),
+            ScanUsagesByLocationParams {
+                targets: vec![ScanUsagesTarget {
+                    path: "errors.go".to_string(),
+                    line: 5,
+                    column: Some(10),
+                    symbol: Some("example.com/repro.Error.Error".to_string()),
+                }],
+                include_tests: false,
+                paths: None,
+                include_same_owner: false,
+            },
+        );
+
+        assert_ne!(
+            ScanUsagesStatus::NotFound,
+            result.results[0].status,
+            "{result:#?}"
+        );
+        assert_eq!(
+            result.results[0].fq_name.as_deref(),
+            Some("example.com/repro.Error.Error"),
+            "{result:#?}"
+        );
+    }
+
+    /// #2709: `analyzer.location_ranges()` returns the analyzer's 1-based
+    /// stored ranges while the derived declaration-name ranges are 0-based
+    /// tree-sitter rows. Before the families were normalized where they meet,
+    /// an exact-selector probe at an annotated declaration's own reported
+    /// start line (the annotation line) was rejected, and one line past the
+    /// declaration's end was wrongly accepted.
+    fn scan_location(
+        fixture: &AnalyzerFixture,
+        path: &str,
+        line: usize,
+        symbol: &str,
+    ) -> ScanUsagesResult {
+        scan_usages_by_location(
+            fixture.analyzer.analyzer(),
+            ScanUsagesByLocationParams {
+                targets: vec![ScanUsagesTarget {
+                    path: path.to_string(),
+                    line,
+                    column: None,
+                    symbol: Some(symbol.to_string()),
+                }],
+                include_tests: false,
+                paths: None,
+                include_same_owner: false,
+            },
+        )
+    }
+
+    fn assert_annotated_declaration_range(language: Language, path: &str, source: &str) {
+        let fixture = AnalyzerFixture::new_for_language(language, &[(path, source)]);
+        let result = scan_location(&fixture, path, 4, "repro.Service.call");
+        assert_ne!(
+            ScanUsagesStatus::NotFound,
+            result.results[0].status,
+            "{result:#?}"
+        );
+        assert_eq!(
+            result.results[0].fq_name.as_deref(),
+            Some("repro.Service.call"),
+            "{result:#?}"
+        );
+
+        let past_end = scan_location(&fixture, path, 6, "repro.Service.call");
+        assert_eq!(
+            ScanUsagesStatus::NotFound,
+            past_end.results[0].status,
+            "{past_end:#?}"
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2709: Fix regression #2709: Kotlin annotated method selection accepts the reported annotation line and rejects the line beyond the declaration end"
+    )]
+    fn issue_2709_annotated_kotlin_declaration_resolves_at_its_reported_start_line() {
+        assert_annotated_declaration_range(
+            Language::Kotlin,
+            "Service.kt",
+            "package repro\n\nclass Service {\n    @Deprecated(\"use other\")\n    fun call() {}\n}\n",
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2709: Fix regression #2709: Java annotated method selection accepts the annotation start line and rejects a line past its declaration range"
+    )]
+    fn issue_2709_annotated_java_declaration_resolves_at_its_reported_start_line() {
+        assert_annotated_declaration_range(
+            Language::Java,
+            "Service.java",
+            "package repro;\n\nclass Service {\n    @Deprecated\n    void call() {}\n}\n",
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2709: Fix regression #2709: an unnamed Kotlin companion resolves at its reported declaration line despite lacking a name token"
+    )]
+    fn issue_2709_companion_object_resolves_at_its_declaration_line() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Kotlin,
+            &[(
+                "WithCompanion.kt",
+                "package repro\n\nclass WithCompanion {\n    companion object {\n        fun create() {}\n    }\n}\n",
+            )],
+        );
+
+        // An unnamed companion has no name token, so the declaration-range
+        // fallback is the only acceptance path; its reported start line is the
+        // `companion object {` line (4).
+        let result = scan_location(
+            &fixture,
+            "WithCompanion.kt",
+            4,
+            "repro.WithCompanion.Companion",
+        );
+        assert_ne!(
+            ScanUsagesStatus::NotFound,
+            result.results[0].status,
+            "{result:#?}"
+        );
+        assert_eq!(
+            result.results[0].fq_name.as_deref(),
+            Some("repro.WithCompanion.Companion"),
+            "{result:#?}"
+        );
+    }
+
+    /// The text rendering of a ranked file spells its verdict out by hand, so
+    /// the two spellings must not drift from the JSON contract.
+    #[test]
+    #[hardwon("#1575: rendered test-file verdict diverged from its serialized value")]
+    fn test_file_kind_label_matches_its_serialized_spelling() {
+        for kind in [
+            TestFileKind::Test,
+            TestFileKind::TestSupport,
+            TestFileKind::Production,
+            TestFileKind::Ambiguous,
+        ] {
+            assert_eq!(
+                serde_json::Value::String(kind.label().to_string()),
+                serde_json::to_value(kind).unwrap(),
+                "{kind:?}"
+            );
+        }
+    }
+
+    /// A crate whose caller module holds enough proved sites that a mid-scan
+    /// cancellation can land after some of them are recorded.
+    fn partial_scan_fixture() -> (tempfile::TempDir, RustAnalyzer) {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonicalize temp dir");
+        std::fs::create_dir_all(root.join("src")).expect("create src");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"partial\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
+        )
+        .expect("write manifest");
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub mod target;\npub mod caller;\n",
+        )
+        .expect("write lib");
+        std::fs::write(
+            root.join("src/target.rs"),
+            "pub fn collect_it() -> i32 {\n    1\n}\n",
+        )
+        .expect("write target");
+        let mut caller = String::from("use crate::target::collect_it;\n");
+        for index in 0..60 {
+            caller.push_str(&format!(
+                "pub fn call_{index}() -> i32 {{\n    collect_it()\n}}\n"
+            ));
+        }
+        std::fs::write(root.join("src/caller.rs"), caller).expect("write caller");
+
+        let analyzer = RustAnalyzer::from_project(TestProject::new(root, Language::Rust));
+        (temp, analyzer)
+    }
+
+    fn soft_deadline_partial_fixture()
+    -> (crate::inline_project::BuiltInlineTestProject, RustAnalyzer) {
+        use crate::inline_project::InlineTestProject;
+
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"soft_budget\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file(
+                "src/lib.rs",
+                "pub mod target;\npub mod caller_a;\npub mod caller_b;\n",
+            )
+            .file("src/target.rs", "pub fn collect_it() -> i32 { 1 }\n")
+            .file(
+                "src/caller_a.rs",
+                "use crate::target::collect_it;\npub fn call_a() -> i32 { collect_it() }\n",
+            )
+            .file(
+                "src/caller_b.rs",
+                "use crate::target::collect_it;\npub fn call_b() -> i32 { collect_it() }\n",
+            )
+            .build();
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        (fixture, analyzer)
+    }
+
+    fn scan_with(analyzer: &RustAnalyzer, cancellation: CancellationToken) -> ScanUsagesResult {
+        // Interrupted scans pin a deterministic proven set at one worker.
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(|| {
+                scan_usages_by_reference_with_cancellation(
+                    analyzer,
+                    ScanUsagesByReferenceParams {
+                        symbols: vec!["collect_it".to_string()],
+                        include_tests: true,
+                        paths: None,
+                        include_same_owner: false,
+                    },
+                    cancellation,
+                )
+            })
+    }
+
+    fn scan_location_with(
+        analyzer: &RustAnalyzer,
+        cancellation: CancellationToken,
+    ) -> ScanUsagesResult {
+        // Interrupted scans pin a deterministic proven set at one worker.
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(|| {
+                scan_usages_by_location_with_cancellation(
+                    analyzer,
+                    ScanUsagesByLocationParams {
+                        targets: vec![ScanUsagesTarget {
+                            path: "src/target.rs".to_string(),
+                            line: 1,
+                            column: None,
+                            symbol: None,
+                        }],
+                        include_tests: true,
+                        paths: None,
+                        include_same_owner: false,
+                    },
+                    cancellation,
+                )
+            })
+    }
+
+    fn assert_partial_scan_retains_proven_hits(
+        complete: &ScanUsagesResult,
+        partial: &ScanUsagesResult,
+    ) {
+        let complete_entry = &complete.results[0];
+        assert_eq!(ScanUsagesStatus::Found, complete_entry.status);
+        assert!(complete_entry.complete);
+        let complete_hits = complete_entry
+            .total_hits
+            .expect("complete scan counts hits");
+        assert!(complete_hits > 0, "fixture must produce hits");
+
+        let entry = &partial.results[0];
+        assert_eq!(ScanUsagesStatus::Found, entry.status);
+        assert!(!entry.complete);
+        assert_eq!(
+            Some(ScanUsagesIncompleteReason::TimeBudget),
+            entry.incomplete_reason
+        );
+        assert!(
+            entry.total_hits.is_some_and(|hits| hits <= complete_hits),
+            "a partial hit list cannot exceed the complete one"
+        );
+    }
+
+    /// A request budget returns the first complete caller blob and marks later
+    /// blobs incomplete, preserving its proven call site and retry guidance.
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1416: Runs complete and soft-deadline Rust reference scans, ensuring a partial result retains proven hits, a time-budget reason, and retry guidance"
+    )]
+    fn issue_1416_interrupted_scan_reports_the_sites_it_proved() {
+        let (_fixture, analyzer) = soft_deadline_partial_fixture();
+
+        let complete = scan_with(&analyzer, CancellationToken::default());
+        let partial = scan_with(
+            &analyzer,
+            CancellationToken::soft_deadline_after_checks_for_test(3),
+        );
+        assert_partial_scan_retains_proven_hits(&complete, &partial);
+
+        let entry = &partial.results[0];
+        assert_eq!(
+            ScanUsagesStatus::Found,
+            entry.status,
+            "a scan holding proved sites is not a failure"
+        );
+        assert!(
+            entry
+                .message
+                .iter()
+                .chain(&entry.notes)
+                .any(|guidance| guidance.contains("scan_usages_by_reference")),
+            "a partial result must give structured recovery guidance"
+        );
+        assert!(
+            partial.summary.partial,
+            "summary must mark the batch partial"
+        );
+    }
+
+    /// Location scans follow the same budget contract and retain recovery
+    /// guidance for a partial result.
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1634: Compares complete and soft-deadline location scans and verifies retained hit counts and location-specific recovery guidance"
+    )]
+    fn issue_1630_location_partial_scan_gives_structured_recovery_guidance() {
+        let (_fixture, analyzer) = soft_deadline_partial_fixture();
+        let complete = scan_location_with(&analyzer, CancellationToken::default());
+        let partial = scan_location_with(
+            &analyzer,
+            CancellationToken::soft_deadline_after_checks_for_test(3),
+        );
+        assert_partial_scan_retains_proven_hits(&complete, &partial);
+
+        let entry = &partial.results[0];
+        assert!(
+            entry
+                .message
+                .iter()
+                .chain(&entry.notes)
+                .any(|guidance| guidance.contains("scan_usages_by_location")),
+            "a partial location result must give structured recovery guidance"
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3761: Cancels before any source blob is scanned and verifies empty evidence is explicitly unverified with time-budget caveats and retry guidance"
+    )]
+    fn issue_3761_time_budget_before_any_blob_is_unverified_absent() {
+        let (_fixture, analyzer) = soft_deadline_partial_fixture();
+        let result = scan_with(
+            &analyzer,
+            CancellationToken::soft_deadline_after_checks_for_test(0),
+        );
+        let entry = &result.results[0];
+
+        assert_eq!(
+            ScanUsagesStatus::UnverifiedAbsent,
+            entry.status,
+            "{result:#?}"
+        );
+        assert!(!entry.complete);
+        assert_eq!(
+            Some(ScanUsagesIncompleteReason::TimeBudget),
+            entry.incomplete_reason
+        );
+        assert!(result.summary.partial);
+        assert!(!entry.absence_caveats.is_empty());
+        assert!(
+            entry.message.iter().chain(&entry.notes).any(|guidance| {
+                guidance.contains("wall-clock time budget")
+                    && guidance.contains("scan_usages_by_reference")
+            }),
+            "an empty partial result must include time-budget recovery guidance: {entry:#?}"
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1416: Sweeps many cancellation points in a real Rust scan and ensures no incomplete execution can report VerifiedAbsent"
+    )]
+    fn issue_1416_an_incomplete_scan_never_claims_proven_absence() {
+        let (_temp, analyzer) = partial_scan_fixture();
+
+        // Whatever an interrupted scan reports, it must never be the status that
+        // asserts the symbol has no callers.
+        for checks in 1..=600 {
+            let result = scan_with(
+                &analyzer,
+                CancellationToken::cancel_after_checks_for_test(checks),
+            );
+            let entry = &result.results[0];
+            if entry.complete {
+                continue;
+            }
+            assert_ne!(
+                ScanUsagesStatus::VerifiedAbsent,
+                entry.status,
+                "an incomplete scan claimed proven absence at checks={checks}"
+            );
+            if entry.status == ScanUsagesStatus::UnverifiedAbsent {
+                assert!(
+                    entry
+                        .absence_caveats
+                        .contains(&ScanUsagesAbsenceCaveat::ScanIncomplete),
+                    "an incomplete absence must carry the scan_incomplete caveat at checks={checks}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -7548,38 +8479,6 @@ mod tests {
             "{result:?}"
         );
         *REQUEST.lock().unwrap() = None;
-    }
-
-    #[test]
-    fn usage_graph_observes_request_cancellation_before_catalog_construction() {
-        use crate::analyzer::JavaAnalyzer;
-        use crate::inline_project::InlineTestProject;
-        let fixture = InlineTestProject::with_language(Language::Java)
-            .file("A.java", "class A { static void call() {} }")
-            .build();
-        let analyzer = JavaAnalyzer::new(fixture.project_dyn());
-        for paths in [None, Some(vec!["A.java".to_owned()])] {
-            let cancellation = CancellationToken::new();
-            cancellation.cancel();
-            let result = usage_graph_with_cancellation(
-                &analyzer,
-                UsageGraphParams {
-                    paths,
-                    include_tests: true,
-                    depth: 1,
-                },
-                cancellation,
-            );
-            assert!(!result.complete);
-            assert!(result.nodes.is_empty() && result.edges.is_empty());
-            assert!(
-                result
-                    .incomplete_reasons
-                    .iter()
-                    .any(|reason| reason.code == "cancelled"),
-                "{result:?}"
-            );
-        }
     }
 
     #[test]
@@ -7819,179 +8718,6 @@ mod tests {
     }
 
     #[test]
-    fn semantic_incomplete_scan_retains_hits_and_never_verifies_absence() {
-        let hit = UsageHitRow {
-            path: "src/lib.rs".to_string(),
-            line: 2,
-            column: None,
-            end_line: None,
-            end_column: None,
-            start_offset: 10,
-            end_offset: 16,
-            enclosing: "caller".to_string(),
-            kind: UsageHitKind::Reference,
-            snippet: "target()".to_string(),
-            confidence: 1.0,
-        };
-        for (hits, status) in [
-            (Vec::new(), ScanUsagesStatus::UnverifiedAbsent),
-            (vec![hit], ScanUsagesStatus::Found),
-        ] {
-            let count = hits.len();
-            let state = SymbolUsageRenderState::new(
-                "target".to_string(),
-                None,
-                false,
-                0,
-                hits,
-                0,
-                Vec::new(),
-                Some("Unresolved structured reference in another file".to_string()),
-                None,
-                Vec::new(),
-                false,
-            );
-            let entry = classify_scan_usages_entry(&ScanUsagesWorkEntry::Usage {
-                request: ScanUsageRequest::symbol(0, "target".to_string()),
-                state,
-                candidate_files_sample: None,
-                target_is_method: false,
-                incomplete_reason: Some(ScanUsagesIncompleteReason::SemanticAnalysis),
-            });
-            assert_eq!(entry.status, status);
-            assert_eq!(entry.total_hits, Some(count));
-            assert!(!entry.complete);
-            assert_eq!(
-                entry.incomplete_reason,
-                Some(ScanUsagesIncompleteReason::SemanticAnalysis)
-            );
-            assert!(
-                entry
-                    .notes
-                    .iter()
-                    .any(|note| note.contains("Unresolved structured reference"))
-            );
-        }
-    }
-
-    #[test]
-    fn composite_usage_queries_preserve_the_ordinary_result_contract() {
-        use crate::inline_project::InlineTestProject;
-
-        let fixture = InlineTestProject::with_language(Language::Rust)
-            .file(
-                "Cargo.toml",
-                "[package]\nname = \"observed\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-            )
-            .file(
-                "src/lib.rs",
-                "pub fn target() {}\npub fn caller() { target(); }\n",
-            )
-            .build();
-        let analyzer = RustAnalyzer::new(fixture.project_dyn());
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        let token = scope.token();
-        let observed = ScanUsagesExecutionContext::default();
-        let composite =
-            ScanUsagesExecutionContext::for_composite_query(CancellationToken::default());
-        let query = |context: &ScanUsagesExecutionContext| {
-            scan_usages_by_reference_with_context(
-                &analyzer,
-                token,
-                ScanUsagesByReferenceParams {
-                    symbols: vec!["target".to_string()],
-                    include_tests: true,
-                    paths: None,
-                    include_same_owner: true,
-                },
-                context,
-            )
-        };
-        let (ordinary, nested) = rayon::join(|| query(&observed), || query(&composite));
-        assert_eq!(ordinary.summary.total_hits, 1, "{ordinary:#?}");
-        assert_eq!(
-            serde_json::to_value(&ordinary).expect("ordinary result"),
-            serde_json::to_value(&nested).expect("composite result"),
-        );
-        let repeated = query(&observed);
-        assert_eq!(
-            serde_json::to_value(&ordinary).expect("ordinary result"),
-            serde_json::to_value(&repeated).expect("repeated ordinary result"),
-        );
-        observed.cancellation.cancel();
-        let cancelled = query(&observed);
-        assert!(cancelled.summary.partial);
-    }
-
-    fn selected_usage_graph_projection(
-        site_lines: impl IntoIterator<Item = usize>,
-        raw_truncated_inbound: Option<usize>,
-        unproven_inbound: usize,
-    ) -> SelectedWorkspaceUsageGraphProjection {
-        let root = std::env::current_dir().expect("the test working directory must exist");
-        let caller_file = ProjectFile::new(root.clone(), "src/Caller.java");
-        let target_file = ProjectFile::new(root, "src/Target.java");
-        let caller = CodeUnit::new(
-            caller_file.clone(),
-            CodeUnitType::Function,
-            "fixture",
-            "Caller.run",
-        );
-        let target = CodeUnit::new(target_file, CodeUnitType::Function, "fixture", "Target.run");
-        let range = Range {
-            start_byte: 0,
-            end_byte: 80,
-            start_line: 1,
-            end_line: 3,
-        };
-        let catalog = WorkspaceUsageCatalog::from_declarations(
-            vec![(caller.clone(), Some(range)), (target.clone(), Some(range))],
-            &CancellationToken::default(),
-        )
-        .expect("the selected public-result fixture catalog must build");
-        let mut nodes = catalog.nodes;
-        let caller_index = nodes
-            .iter()
-            .position(|node| node.declaration_ids.contains(&caller.declaration_id()))
-            .expect("the caller must be cataloged");
-        let target_index = nodes
-            .iter()
-            .position(|node| node.declaration_ids.contains(&target.declaration_id()))
-            .expect("the target must be cataloged");
-        nodes[target_index].truncated_inbound = raw_truncated_inbound;
-        nodes[target_index].unproven_inbound = unproven_inbound;
-        let sites = site_lines
-            .into_iter()
-            .map(|line| (caller_file.clone(), line))
-            .collect::<Vec<_>>();
-        let mut raw_proven_inbound = vec![0; nodes.len()];
-        raw_proven_inbound[target_index] = raw_truncated_inbound.unwrap_or(sites.len());
-        SelectedWorkspaceUsageGraphProjection {
-            nodes,
-            raw_proven_inbound,
-            admitted_callers: HashSet::from_iter([caller_file]),
-            unresolved_names: Some(std::collections::BTreeSet::new()),
-            edges: vec![CanonicalWorkspaceUsageProjectedEdge {
-                from: caller_index,
-                to: target_index,
-                counts: UsageReferenceCounts {
-                    calls: 1,
-                    ..UsageReferenceCounts::default()
-                },
-                sites,
-            }],
-            forward_completeness: EdgeCompleteness::Complete,
-            kind_projection_complete: true,
-            generation: 11,
-            reference_count: 1,
-            projected_edge_count: 1,
-            batch_count: 1,
-            root_binding_metrics: ResolutionBatchMetrics::default(),
-            resolved_ecosystems: vec![UsageEcosystem::Jvm],
-        }
-    }
-
-    #[test]
     fn selected_public_graph_preserves_sites_and_ignores_the_raw_ranking_cap() {
         let projection = selected_usage_graph_projection([9, 7, 7], Some(MAX_CALLSITES + 1), 1);
         let result = selected_usage_graph_result(projection, true, &CancellationToken::default())
@@ -8026,97 +8752,6 @@ mod tests {
             (&nodes[0].language, &nodes[0].fqn, &nodes[0].id)
                 < (&nodes[1].language, &nodes[1].fqn, &nodes[1].id)
         }));
-    }
-
-    #[test]
-    fn selected_public_graph_caps_exactly_after_max_distinct_lines_and_cancels_atomically() {
-        let at_cap = selected_usage_graph_result(
-            selected_usage_graph_projection(1..=MAX_CALLSITES, None, 0),
-            true,
-            &CancellationToken::default(),
-        )
-        .expect("the exact-cap selected public result must finish");
-        assert!(at_cap.complete);
-        assert_eq!(1, at_cap.edges.len());
-        assert_eq!(MAX_CALLSITES, at_cap.edges[0].weight);
-        assert!(at_cap.truncated_symbols.is_empty());
-
-        let past_cap = selected_usage_graph_result(
-            selected_usage_graph_projection(1..=MAX_CALLSITES + 1, None, 0),
-            true,
-            &CancellationToken::default(),
-        )
-        .expect("the over-cap selected public result must finish");
-        assert!(!past_cap.complete);
-        assert!(past_cap.edges.is_empty());
-        assert_eq!(1, past_cap.truncated_symbols.len());
-        assert_eq!(
-            MAX_CALLSITES + 1,
-            past_cap.truncated_symbols[0].total_callsites
-        );
-        assert_eq!(
-            vec!["callsites_truncated"],
-            past_cap
-                .incomplete_reasons
-                .iter()
-                .map(|reason| reason.code.as_str())
-                .collect::<Vec<_>>()
-        );
-
-        let cancellation = CancellationToken::default();
-        cancellation.cancel();
-        assert!(
-            selected_usage_graph_result(
-                selected_usage_graph_projection([7], None, 0),
-                true,
-                &cancellation,
-            )
-            .is_none(),
-            "cancellation publishes no public graph prefix"
-        );
-    }
-
-    #[test]
-    fn usage_graph_returns_when_a_truncated_target_is_not_a_graph_node() {
-        // Java uses the FQN edge arm that fills `legacy_truncated`. A callee over the cap has all of
-        // its call sites dropped and therefore may never be inserted into the result catalog.
-        let callsites = crate::analyzer::usages::inverted_edges::MAX_CALLSITES + 1;
-        let mut body = String::new();
-        for _ in 0..callsites {
-            body.push_str("    new Target().call();\n");
-        }
-        let root = format!("package app; class Root {{ void run() {{\n{body}  }} }}\n");
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Java,
-            &[
-                ("app/Root.java", root.as_str()),
-                (
-                    "app/Target.java",
-                    "package app; class Target { void call() {} }\n",
-                ),
-            ],
-        );
-
-        let graph = usage_graph(
-            fixture.analyzer.analyzer(),
-            UsageGraphParams {
-                include_tests: false,
-                paths: Some(vec!["app/Root.java".to_string()]),
-                depth: 1,
-            },
-        );
-
-        assert!(
-            !graph.complete,
-            "a target past MAX_CALLSITES must be reported as incomplete"
-        );
-        assert!(
-            graph
-                .incomplete_reasons
-                .iter()
-                .any(|reason| reason.code == "callsites_truncated"),
-            "the uncataloged truncated target must retain its incompleteness signal: {graph:?}"
-        );
     }
 
     #[test]
@@ -8217,47 +8852,6 @@ mod tests {
     }
 
     #[test]
-    fn rooted_rust_usage_graph_preserves_exact_edge_sites_on_caller_thread() {
-        use crate::inline_project::InlineTestProject;
-
-        let fixture = InlineTestProject::with_language(Language::Rust)
-            .file(
-                "Cargo.toml",
-                "[package]\nname = \"rooted_shadow\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-            )
-            .file(
-                "src/lib.rs",
-                "pub fn left() -> usize { 1 }\npub fn right() -> usize { 2 }\npub fn caller() -> usize { left() }\n",
-            )
-            .build();
-        let analyzer = RustAnalyzer::new(fixture.project_dyn());
-
-        let graph = usage_graph(
-            &analyzer,
-            UsageGraphParams {
-                include_tests: true,
-                paths: Some(vec!["src/lib.rs".to_string()]),
-                depth: 1,
-            },
-        );
-
-        assert!(graph.complete, "rooted Rust usage graph: {graph:#?}");
-        let edge = graph
-            .edges
-            .iter()
-            .find(|edge| edge.from.ends_with(".caller") && edge.to.ends_with(".left"))
-            .expect("rooted Rust graph must retain the exact caller-to-left edge");
-        assert_eq!(edge.weight, 1);
-        assert_eq!(
-            edge.sites,
-            vec![UsageGraphCallSite {
-                path: "src/lib.rs".to_string(),
-                line: 3,
-            }]
-        );
-    }
-
-    #[test]
     fn go_import_infos_for_files_batches_instead_of_defaulting_to_none() {
         let fixture = AnalyzerFixture::new_for_language(
             Language::Go,
@@ -8330,18 +8924,14 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_edges_sharing_a_file_batch_one_resolve_definition_batch_with_source_call() {
+    fn native_graph_retains_ambiguous_candidates_without_incumbent_fallback() {
         let fixture = AnalyzerFixture::new_for_language(
             Language::Go,
             &[
                 ("go.mod", "module example.com/repro\n"),
-                // Three declarations sharing one fq name each make the target
-                // genuinely ambiguous (`unique_graph_unit` returns None),
-                // which is what gates entry into the slow-path fallback. Three
-                // distinct ambiguous targets (rather than two) exercise the
-                // parallel per-target resolution with more than a pair of
-                // workers, so a merge bug that only shows up with >2 workers
-                // (e.g. clobbering rather than accumulating) is caught.
+                // Duplicate declarations make each target genuinely
+                // ambiguous. Native projection must retain both exact target
+                // identities for every imported call.
                 ("dup/a.go", "package dup\n\nfunc Widget() {}\n"),
                 ("dup/b.go", "package dup\n\nfunc Widget() {}\n"),
                 ("dup2/a.go", "package dup2\n\nfunc Gadget() {}\n"),
@@ -8375,38 +8965,42 @@ mod tests {
             .test_hooks()
             .resolve_definition_batch_with_source_call_count_for_test();
 
-        // Three ambiguous targets (Widget, Gadget, Sprocket) each called
-        // twice from the same file are six fallback-eligible sites; batched
-        // by file they must collapse into exactly one call, not one per site
-        // and not one per target, regardless of how many targets' resolution
-        // ran in parallel (bifrost#15).
+        // The native graph route resolves each ambiguous reference to both
+        // exact declarations without invoking the incumbent source fallback.
         assert_eq!(
-            calls, 1,
-            "six ambiguous-edge fallback sites sharing caller/main.go must batch into \
-             exactly one resolve_definition_batch_with_source call, got {calls}"
+            calls, 0,
+            "native graph projection must not call resolve_definition_batch_with_source"
         );
-        // usage_graph()'s ambiguous-target candidate discovery must route
-        // through the cached reverse-import-index path (ImportGraphCandidateProvider)
-        // instead of the interruptible, uncached per-file importer scan that
-        // path exists to protect a caller with a real deadline. This is a
-        // structural guarantee rather than something asserted here at
-        // runtime: `ImportGraphCandidateProvider::find_candidates` always
-        // calls `find_import_graph_candidates` with `scope: None`, which
-        // forces `cancellation: None` and therefore the fast
-        // `referencing_files_of` path -- it has no code path that reaches
-        // the slow scan. A prior version of this test asserted a process-wide
-        // call counter on the slow scan instead, but that function is also
-        // the workspace's shared default candidate-discovery path (used by,
-        // among others, `dead_code_smells` and several `candidates.rs` tests
-        // directly), so the counter raced with unrelated tests in the same
-        // binary and flaked under `cargo test`'s default parallelism
-        // (bifrost#15).
-        //
-        // The graph is still allowed to omit an edge it genuinely cannot
-        // disambiguate; this test's job is the call-count assertion above,
-        // not asserting a specific resolved edge for an intentionally
-        // ambiguous target.
-        let _ = graph;
+        for (target, first_path, second_path) in [
+            ("example.com/repro/dup.Widget", "dup/a.go", "dup/b.go"),
+            ("example.com/repro/dup2.Gadget", "dup2/a.go", "dup2/b.go"),
+            ("example.com/repro/dup3.Sprocket", "dup3/a.go", "dup3/b.go"),
+        ] {
+            let edges = graph
+                .edges
+                .iter()
+                .filter(|edge| edge.from == "example.com/repro/caller.RunMany" && edge.to == target)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                edges.len(),
+                2,
+                "both {target} candidates must be edges: {graph:#?}"
+            );
+            let mut paths = edges
+                .iter()
+                .map(|edge| {
+                    graph
+                        .nodes
+                        .iter()
+                        .find(|node| node.id == edge.to_id)
+                        .expect("edge target has a graph node")
+                        .path
+                        .clone()
+                })
+                .collect::<Vec<_>>();
+            paths.sort_unstable();
+            assert_eq!(paths, [first_path, second_path], "{target}: {graph:#?}");
+        }
     }
 
     #[test]
@@ -8517,427 +9111,5 @@ mod tests {
             2,
             "a cache hit after the prefetch must not issue another store round trip"
         );
-    }
-
-    #[test]
-    fn exact_location_selector_accepts_the_indexed_declaration_range_start() {
-        let source = "package repro\n\ntype Error struct{}\n\nfunc (e *Error) Error() string { return \"\" }\n";
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Go,
-            &[
-                ("go.mod", "module example.com/repro\n"),
-                ("errors.go", source),
-            ],
-        );
-
-        let result = scan_usages_by_location(
-            fixture.analyzer.analyzer(),
-            ScanUsagesByLocationParams {
-                targets: vec![ScanUsagesTarget {
-                    path: "errors.go".to_string(),
-                    line: 5,
-                    column: Some(10),
-                    symbol: Some("example.com/repro.Error.Error".to_string()),
-                }],
-                include_tests: false,
-                paths: None,
-                include_same_owner: false,
-            },
-        );
-
-        assert_ne!(
-            ScanUsagesStatus::NotFound,
-            result.results[0].status,
-            "{result:#?}"
-        );
-        assert_eq!(
-            result.results[0].fq_name.as_deref(),
-            Some("example.com/repro.Error.Error"),
-            "{result:#?}"
-        );
-    }
-
-    /// #2709: `analyzer.location_ranges()` returns the analyzer's 1-based
-    /// stored ranges while the derived declaration-name ranges are 0-based
-    /// tree-sitter rows. Before the families were normalized where they meet,
-    /// an exact-selector probe at an annotated declaration's own reported
-    /// start line (the annotation line) was rejected, and one line past the
-    /// declaration's end was wrongly accepted.
-    fn scan_location(
-        fixture: &AnalyzerFixture,
-        path: &str,
-        line: usize,
-        symbol: &str,
-    ) -> ScanUsagesResult {
-        scan_usages_by_location(
-            fixture.analyzer.analyzer(),
-            ScanUsagesByLocationParams {
-                targets: vec![ScanUsagesTarget {
-                    path: path.to_string(),
-                    line,
-                    column: None,
-                    symbol: Some(symbol.to_string()),
-                }],
-                include_tests: false,
-                paths: None,
-                include_same_owner: false,
-            },
-        )
-    }
-
-    #[test]
-    fn issue_2709_annotated_kotlin_declaration_resolves_at_its_reported_start_line() {
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Kotlin,
-            &[(
-                "Service.kt",
-                "package repro\n\nclass Service {\n    @Deprecated(\"use other\")\n    fun call() {}\n}\n",
-            )],
-        );
-
-        // The stored declaration range starts at the annotation line (4), not
-        // at the `fun call()` name line (5).
-        let result = scan_location(&fixture, "Service.kt", 4, "repro.Service.call");
-        assert_ne!(
-            ScanUsagesStatus::NotFound,
-            result.results[0].status,
-            "{result:#?}"
-        );
-        assert_eq!(
-            result.results[0].fq_name.as_deref(),
-            Some("repro.Service.call"),
-            "{result:#?}"
-        );
-
-        // One line past the declaration's end is the class closing brace: no
-        // resolution.
-        let past_end = scan_location(&fixture, "Service.kt", 6, "repro.Service.call");
-        assert_eq!(
-            ScanUsagesStatus::NotFound,
-            past_end.results[0].status,
-            "{past_end:#?}"
-        );
-    }
-
-    #[test]
-    fn issue_2709_annotated_java_declaration_resolves_at_its_reported_start_line() {
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Java,
-            &[(
-                "Service.java",
-                "package repro;\n\nclass Service {\n    @Deprecated\n    void call() {}\n}\n",
-            )],
-        );
-
-        let result = scan_location(&fixture, "Service.java", 4, "repro.Service.call");
-        assert_ne!(
-            ScanUsagesStatus::NotFound,
-            result.results[0].status,
-            "{result:#?}"
-        );
-        assert_eq!(
-            result.results[0].fq_name.as_deref(),
-            Some("repro.Service.call"),
-            "{result:#?}"
-        );
-
-        let past_end = scan_location(&fixture, "Service.java", 6, "repro.Service.call");
-        assert_eq!(
-            ScanUsagesStatus::NotFound,
-            past_end.results[0].status,
-            "{past_end:#?}"
-        );
-    }
-
-    #[test]
-    fn issue_2709_companion_object_resolves_at_its_declaration_line() {
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Kotlin,
-            &[(
-                "WithCompanion.kt",
-                "package repro\n\nclass WithCompanion {\n    companion object {\n        fun create() {}\n    }\n}\n",
-            )],
-        );
-
-        // An unnamed companion has no name token, so the declaration-range
-        // fallback is the only acceptance path; its reported start line is the
-        // `companion object {` line (4).
-        let result = scan_location(
-            &fixture,
-            "WithCompanion.kt",
-            4,
-            "repro.WithCompanion.Companion",
-        );
-        assert_ne!(
-            ScanUsagesStatus::NotFound,
-            result.results[0].status,
-            "{result:#?}"
-        );
-        assert_eq!(
-            result.results[0].fq_name.as_deref(),
-            Some("repro.WithCompanion.Companion"),
-            "{result:#?}"
-        );
-    }
-
-    /// The text rendering of a ranked file spells its verdict out by hand, so
-    /// the two spellings must not drift from the JSON contract.
-    #[test]
-    fn test_file_kind_label_matches_its_serialized_spelling() {
-        for kind in [
-            TestFileKind::Test,
-            TestFileKind::TestSupport,
-            TestFileKind::Production,
-            TestFileKind::Ambiguous,
-        ] {
-            assert_eq!(
-                serde_json::Value::String(kind.label().to_string()),
-                serde_json::to_value(kind).unwrap(),
-                "{kind:?}"
-            );
-        }
-    }
-
-    /// A crate whose caller module holds enough proved sites that a mid-scan
-    /// cancellation can land after some of them are recorded.
-    fn partial_scan_fixture() -> (tempfile::TempDir, RustAnalyzer) {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonicalize temp dir");
-        std::fs::create_dir_all(root.join("src")).expect("create src");
-        std::fs::write(
-            root.join("Cargo.toml"),
-            "[package]\nname = \"partial\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
-        )
-        .expect("write manifest");
-        std::fs::write(
-            root.join("src/lib.rs"),
-            "pub mod target;\npub mod caller;\n",
-        )
-        .expect("write lib");
-        std::fs::write(
-            root.join("src/target.rs"),
-            "pub fn collect_it() -> i32 {\n    1\n}\n",
-        )
-        .expect("write target");
-        let mut caller = String::from("use crate::target::collect_it;\n");
-        for index in 0..60 {
-            caller.push_str(&format!(
-                "pub fn call_{index}() -> i32 {{\n    collect_it()\n}}\n"
-            ));
-        }
-        std::fs::write(root.join("src/caller.rs"), caller).expect("write caller");
-
-        let analyzer = RustAnalyzer::from_project(TestProject::new(root, Language::Rust));
-        (temp, analyzer)
-    }
-
-    fn soft_deadline_partial_fixture()
-    -> (crate::inline_project::BuiltInlineTestProject, RustAnalyzer) {
-        use crate::inline_project::InlineTestProject;
-
-        let fixture = InlineTestProject::with_language(Language::Rust)
-            .file(
-                "Cargo.toml",
-                "[package]\nname = \"soft_budget\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-            )
-            .file(
-                "src/lib.rs",
-                "pub mod target;\npub mod caller_a;\npub mod caller_b;\n",
-            )
-            .file("src/target.rs", "pub fn collect_it() -> i32 { 1 }\n")
-            .file(
-                "src/caller_a.rs",
-                "use crate::target::collect_it;\npub fn call_a() -> i32 { collect_it() }\n",
-            )
-            .file(
-                "src/caller_b.rs",
-                "use crate::target::collect_it;\npub fn call_b() -> i32 { collect_it() }\n",
-            )
-            .build();
-        let analyzer = RustAnalyzer::new(fixture.project_dyn());
-        (fixture, analyzer)
-    }
-
-    fn scan_with(analyzer: &RustAnalyzer, cancellation: CancellationToken) -> ScanUsagesResult {
-        scan_usages_by_reference_with_cancellation(
-            analyzer,
-            ScanUsagesByReferenceParams {
-                symbols: vec!["collect_it".to_string()],
-                include_tests: true,
-                paths: None,
-                include_same_owner: false,
-            },
-            cancellation,
-        )
-    }
-
-    fn scan_location_with(
-        analyzer: &RustAnalyzer,
-        cancellation: CancellationToken,
-    ) -> ScanUsagesResult {
-        scan_usages_by_location_with_cancellation(
-            analyzer,
-            ScanUsagesByLocationParams {
-                targets: vec![ScanUsagesTarget {
-                    path: "src/target.rs".to_string(),
-                    line: 1,
-                    column: None,
-                    symbol: None,
-                }],
-                include_tests: true,
-                paths: None,
-                include_same_owner: false,
-            },
-            cancellation,
-        )
-    }
-
-    /// A request budget returns the first complete caller blob and marks later
-    /// blobs incomplete, preserving its proven call site and retry guidance.
-    #[test]
-    fn issue_1416_interrupted_scan_reports_the_sites_it_proved() {
-        let (_fixture, analyzer) = soft_deadline_partial_fixture();
-
-        let complete = scan_with(&analyzer, CancellationToken::default());
-        let complete_entry = &complete.results[0];
-        assert_eq!(ScanUsagesStatus::Found, complete_entry.status);
-        assert!(complete_entry.complete);
-        let complete_hits = complete_entry
-            .total_hits
-            .expect("complete scan counts hits");
-        assert!(complete_hits > 0, "fixture must produce hits");
-
-        let partial = scan_with(
-            &analyzer,
-            CancellationToken::soft_deadline_after_checks_for_test(3),
-        );
-
-        let entry = &partial.results[0];
-        assert_eq!(
-            ScanUsagesStatus::Found,
-            entry.status,
-            "a scan holding proved sites is not a failure"
-        );
-        assert!(!entry.complete);
-        assert_eq!(
-            Some(ScanUsagesIncompleteReason::TimeBudget),
-            entry.incomplete_reason
-        );
-        assert!(
-            entry
-                .message
-                .iter()
-                .chain(&entry.notes)
-                .any(|guidance| guidance.contains("scan_usages_by_reference")),
-            "a partial result must give structured recovery guidance"
-        );
-        assert!(
-            partial.summary.partial,
-            "summary must mark the batch partial"
-        );
-        assert!(
-            entry.total_hits.is_some_and(|hits| hits <= complete_hits),
-            "a partial hit list cannot exceed the complete one"
-        );
-    }
-
-    /// Location scans follow the same budget contract and retain recovery
-    /// guidance for a partial result.
-    #[test]
-    fn issue_1630_location_partial_scan_gives_structured_recovery_guidance() {
-        let (_fixture, analyzer) = soft_deadline_partial_fixture();
-        let complete = scan_location_with(&analyzer, CancellationToken::default());
-        let complete_entry = &complete.results[0];
-        assert_eq!(ScanUsagesStatus::Found, complete_entry.status);
-        assert!(complete_entry.complete);
-        let complete_hits = complete_entry
-            .total_hits
-            .expect("complete location scan counts hits");
-        assert!(complete_hits > 0, "fixture must produce location hits");
-
-        let partial = scan_location_with(
-            &analyzer,
-            CancellationToken::soft_deadline_after_checks_for_test(3),
-        );
-
-        let entry = &partial.results[0];
-        assert_eq!(ScanUsagesStatus::Found, entry.status);
-        assert_eq!(
-            Some(ScanUsagesIncompleteReason::TimeBudget),
-            entry.incomplete_reason
-        );
-        assert!(
-            entry
-                .message
-                .iter()
-                .chain(&entry.notes)
-                .any(|guidance| guidance.contains("scan_usages_by_location")),
-            "a partial location result must give structured recovery guidance"
-        );
-        assert!(
-            entry.total_hits.is_some_and(|hits| hits <= complete_hits),
-            "a partial location hit list cannot exceed the complete one"
-        );
-    }
-
-    #[test]
-    fn issue_3761_time_budget_before_any_blob_is_unverified_absent() {
-        let (_fixture, analyzer) = soft_deadline_partial_fixture();
-        let result = scan_with(
-            &analyzer,
-            CancellationToken::soft_deadline_after_checks_for_test(0),
-        );
-        let entry = &result.results[0];
-
-        assert_eq!(
-            ScanUsagesStatus::UnverifiedAbsent,
-            entry.status,
-            "{result:#?}"
-        );
-        assert!(!entry.complete);
-        assert_eq!(
-            Some(ScanUsagesIncompleteReason::TimeBudget),
-            entry.incomplete_reason
-        );
-        assert!(result.summary.partial);
-        assert!(!entry.absence_caveats.is_empty());
-        assert!(
-            entry.message.iter().chain(&entry.notes).any(|guidance| {
-                guidance.contains("wall-clock time budget")
-                    && guidance.contains("scan_usages_by_reference")
-            }),
-            "an empty partial result must include time-budget recovery guidance: {entry:#?}"
-        );
-    }
-
-    #[test]
-    fn issue_1416_an_incomplete_scan_never_claims_proven_absence() {
-        let (_temp, analyzer) = partial_scan_fixture();
-
-        // Whatever an interrupted scan reports, it must never be the status that
-        // asserts the symbol has no callers.
-        for checks in 1..=600 {
-            let result = scan_with(
-                &analyzer,
-                CancellationToken::cancel_after_checks_for_test(checks),
-            );
-            let entry = &result.results[0];
-            if entry.complete {
-                continue;
-            }
-            assert_ne!(
-                ScanUsagesStatus::VerifiedAbsent,
-                entry.status,
-                "an incomplete scan claimed proven absence at checks={checks}"
-            );
-            if entry.status == ScanUsagesStatus::UnverifiedAbsent {
-                assert!(
-                    entry
-                        .absence_caveats
-                        .contains(&ScanUsagesAbsenceCaveat::ScanIncomplete),
-                    "an incomplete absence must carry the scan_incomplete caveat at checks={checks}"
-                );
-            }
-        }
     }
 }

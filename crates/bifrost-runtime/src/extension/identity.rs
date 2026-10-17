@@ -1,4 +1,6 @@
+use brokk_bifrost_analysis::analyzer::canonical_hash::parse_lower_sha256;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+use sha2::{Digest, Sha256};
 use std::{
     fmt,
     path::{Component, Path},
@@ -8,13 +10,13 @@ use std::{
 pub struct StableDigest(Box<str>);
 
 impl StableDigest {
+    pub fn sha256(bytes: &[u8]) -> Self {
+        Self(format!("{:x}", Sha256::digest(bytes)).into_boxed_str())
+    }
+
     pub fn parse(value: impl Into<String>) -> Result<Self, String> {
         let value = value.into();
-        if value.len() != 64
-            || !value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
+        if parse_lower_sha256(&value).is_none() {
             return Err("digest must be 64 lowercase hexadecimal characters".into());
         }
         Ok(Self(value.into_boxed_str()))
@@ -25,12 +27,12 @@ impl StableDigest {
 }
 impl fmt::Display for StableDigest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        super::fmt_text(&self.0, f)
     }
 }
 impl Serialize for StableDigest {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.0)
+        serialize_string(&self.0, serializer)
     }
 }
 impl<'de> Deserialize<'de> for StableDigest {
@@ -52,7 +54,7 @@ impl WorkspaceGeneration {
 }
 impl fmt::Display for WorkspaceGeneration {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
+        super::fmt_text(self.0.as_str(), f)
     }
 }
 
@@ -85,7 +87,7 @@ impl WorkspaceContentIdentity {
 }
 impl fmt::Display for WorkspaceContentIdentity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
+        super::fmt_text(self.0.as_str(), f)
     }
 }
 
@@ -131,8 +133,12 @@ impl NormalizedRelativePath {
 }
 impl Serialize for NormalizedRelativePath {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.0)
+        serialize_string(&self.0, serializer)
     }
+}
+
+fn serialize_string<S: Serializer>(value: &str, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(value)
 }
 impl<'de> Deserialize<'de> for NormalizedRelativePath {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {

@@ -1,6 +1,6 @@
 use super::JavaAdapter;
 use crate::analyzer::store::GenerationId;
-use crate::analyzer::{ProjectFile, TreeSitterAnalyzer};
+use crate::analyzer::{Language, ProjectFile, QueryReadIncomplete, TreeSitterAnalyzer};
 use crate::hash::HashMap;
 use git2::Oid;
 use std::sync::Arc;
@@ -14,6 +14,10 @@ impl TreeSitterAnalyzer<JavaAdapter> {
             Arc<brokk_bifrost_jvm::java::source_facts::JavaFileSourceFacts>,
         >,
     ) -> Option<Arc<brokk_bifrost_jvm::java::source_facts::JavaFileSourceFacts>> {
+        if file.language() != Language::Java {
+            self.record_query_incomplete(QueryReadIncomplete::StructureUnavailable(file.clone()));
+            return None;
+        }
         let reader = self.canonical_source_read(file, "java")?;
         if let Some(state) = reader.retained_primary() {
             let source = state

@@ -26,7 +26,7 @@ pub(crate) const NODE_FOR_IDENTITY_SQL: &str =
 
 pub(crate) const SCOPE_START_PATHS_SQL: &str = "SELECT p.path FROM resolution_node_catalog n JOIN resolution_paths p ON p.blob_id=n.blob_id AND p.start_node=n.local_key WHERE n.blob_id=?1 AND n.source_scope=?2 ORDER BY p.path";
 
-pub(crate) const REFERENCE_LOOKUP_SPELLING_SQL: &str = "SELECT p.start_node, i.spelling FROM resolution_paths p JOIN resolution_sites s ON s.blob_id=p.blob_id AND s.site=p.start_node AND s.role=0 JOIN resolution_identities i ON i.id=p.end_lead_identity WHERE p.blob_id=?1 AND p.start_node IN (SELECT value FROM json_each(?2)) AND i.namespace=?3 ORDER BY p.start_node,p.path";
+pub(crate) const REFERENCE_LOOKUP_SPELLING_SQL: &str = "SELECT p.start_node, i.spelling FROM resolution_paths p JOIN resolution_sites s ON s.blob_id=p.blob_id AND s.site=p.start_node AND s.role=0 JOIN resolution_identities i ON i.id=p.end_lead_identity WHERE p.blob_id=?1 AND p.start_node IN (SELECT value FROM json_each(?2)) AND i.namespace IN (SELECT value FROM json_each(?3)) ORDER BY p.start_node,p.path";
 
 pub(crate) const DEFINITION_SOURCE_SITE_SQL: &str =
     "SELECT site FROM resolution_sites WHERE blob_id=?1 AND site=?2 AND role=1";

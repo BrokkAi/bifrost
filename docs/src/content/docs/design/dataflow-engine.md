@@ -176,9 +176,13 @@ can establish a class conditional on entering its arm even when its input
 comes from an unmodeled load or call. That class remains useful for member
 lookup and dispatch, but a guard-only origin cannot support a Proven
 missing-member finding. The finding client requires an independent same-class
-source or an unconstrained entry parameter that admits the guarded class.
-Conditional origins stay conditional through later guards; when independent
-and conditional sources meet, the independent origin takes precedence.
+source or an unconstrained entry parameter that admits the guarded class. For
+Conditional findings, Python may also admit a declared parameter whose
+annotation names one workspace class with no workspace subclasses, unresolved
+or unmodeled external bases, or dynamic-attribute hooks; the finding states
+that annotated-type premise. Conditional origins stay conditional through
+later guards; when independent and conditional sources meet, the independent
+origin takes precedence.
 The raw receiver result retains this source provenance. The `class_set`
 projection exposes `guard_only: true` for such class rows and preserves it on
 persistent replay. Unknown rows omit that field. Its `known` status reports
@@ -193,7 +197,11 @@ receiver and mutation site. It composes caller bindings with ordered local
 writes, then opens only the possible receiver classes. Declared receiver bounds
 include known subclasses; unbound entry parameters contribute only the classes
 supplied by workspace callers. An unbounded receiver or an incomplete survey
-keeps the surface open with an explicit reason naming the mutation site.
+keeps the surface open with an explicit reason naming the mutation site. A
+Conditional absent-member finding may carry that uncertainty only when every
+matching global dynamic write has no receiver bound and an Any member-name set; its
+condition names each possible write site. Bounded writes and other incomplete
+surveys still block the finding.
 The preliminary survey does not use member absence to exclude classes. It
 repeats as affected field slots open until the effects stabilize, within shared
 semantic and solver budgets. Member guards such as `hasattr` consult that same survey
@@ -253,7 +261,8 @@ the remainder there instead of carrying it through. The replacement is the
 exact class set when the check names the runtime class outright or every named
 class is closed under the known workspace hierarchy, and the named classes with
 an open bound otherwise, because a subclass satisfies the same check with a
-member surface the named class does not describe. A receiver whose only
+member surface the named class does not describe. An open subclass bound alone
+does not prove that the named class lacks a member. A receiver whose only
 evidence was the remainder is then named rather than emptied. The false arm
 keeps the remainder, a predicate that proves no class keeps it on both arms,
 and the replacement ends with the arm exactly as the unmodeled remainder does.
@@ -272,9 +281,363 @@ from current indexed syntax during plan construction. Their edge removals
 participate in the existing reusable solver identity; no separate guard-summary
 table is persisted.
 
+### Python module-global seeds and `with` suppression
+
+These rules define observable Python analyzer behavior, so they belong in this
+human-facing dataflow contract. A function, class body, or lambda can receive an
+exact class seed from a module global only when the name has one binding
+statement, and that statement is a single `NAME = value` assignment (possibly
+inside module-level `if`, `try`, `with`, or `for` bodies). No function,
+lambda, or class body may declare it `global`. The module may not write through
+`globals()` or no-argument `vars()` (subscript assignment, deletion, `update`,
+`setdefault`, `pop`, or `clear`), use `exec`, or import a wildcard after the
+assignment. Count every binding form: other assignments,
+augmented or annotated assignments, deletion, imports, definitions, loop and
+`with` targets, and walrus bindings; comprehension targets do not count. No
+other workspace file may write that module attribute through an imported
+module alias, including assignment, deletion, `setattr`, `__dict__`, or patch
+APIs. The initializer uses the same classifier as a local assignment; an
+unrecognized value remains unknown.
+
+`sys.modules` is a registry of module objects, not module namespaces. A literal
+lookup through subscription, `get`, `pop`, or `setdefault` can alias module M
+only when its key is M's name (or `__name__` inside M); another literal is
+unrelated. A dynamic-key read may alias M. Track that value through existing
+alias rules: reads are harmless, but writing through it or letting it escape
+keeps the module-global proof open. A dominating `if`/`elif` consequence, or a
+prior same-block `if not condition` that exits via `continue`, `return`, `raise`,
+or `break`, may prove the key cannot be M's name. Evaluate supported literal
+string comparisons, membership, substring, prefix, and suffix tests with
+three-valued logic over `and`, `or`, and `not`; unknown predicates and a key
+rebound between guard and read remain conservative. A subscript assignment,
+`setdefault`, or `update` blocks only when the stored value is or may be M.
+Deleting an entry, an unused `pop`, or clearing the registry does not change M's
+globals. Escaping the registry itself remains conservative.
+
+For a `with` item, keep the suppression-resume edge unless every possible
+manager class has a resolved `__exit__` proven to return `None`. A workspace
+method qualifies only when it has no decorator and every return is bare or
+returns `None`; an external method needs a declared `None` return. A generator
+containing `yield`, decorated method, bool or other possibly truthy return,
+missing declaration, or unknown manager keeps the edge. The `__exit__` result
+remains unused, and return, break, and continue routes keep their existing
+semantics.
+
 Each client keeps separate plans and result types. A taint class, protocol
 state, and inferred class identity retain distinct types. Language-specific
 facts outside the semantic IR remain behind narrow adapter contracts.
+
+## Composed taint over stored partial flows
+
+Rust taint policies can run on a second engine, the composition engine. It
+answers the same policy questions as the ICFG engine, but it does the
+per-procedure work once per file content instead of once per query. After an
+edit, only the changed files' rows are rewritten, and a diff-scoped query
+searches only from the sinks in the edited procedures.
+
+An explicit rule chooses the engine once per policy compile, and the run's
+execution record names the choice. A policy with bound sinks uses composition
+when every sink is in Rust, every sink's file carries complete, current rows,
+and the policy uses no store ends, entry points, or flow-candidate pass.
+Otherwise it uses the ICFG engine. A changed-range request that binds no sink,
+in a policy without those features, is recorded as an empty composition result
+and runs no search. The rule is not a fallback: a composition that cannot
+finish reports an incomplete result and never restarts on the other engine.
+
+### What each file stores
+
+When a Rust file is parsed, its semantic IR is written as rows keyed by the
+file's blob ID, in the same transaction as its name-resolution rows. Like every
+content fact, these rows depend only on the file's bytes and the producer
+version. The lowerer therefore does not consult semantic models. Where a model
+contract such as collection flow or a deferred factory once applied during
+lowering, the IR records the call's shape (the written receiver type segments
+and the member name), and the contract is applied when a query reaches that
+call.
+
+The same transaction stores each procedure's partial flows. A partial flow is
+the fact that a value at port A can reach port B inside the procedure when
+every call is treated as a boundary. A port is a place where a value enters or
+leaves the procedure or one of its calls:
+
+- the receiver, a parameter, a return, the thrown value, or a capture slot;
+- a call site's receiver, arguments, result, or thrown value;
+- a value captured into a child closure;
+- a heap location rooted at a receiver, parameter, or capture slot.
+
+A heap location rooted at the receiver or a parameter is an input as well as an
+output: the stored fixpoint seeds it at entry. A value that a caller stores in
+an argument's field therefore reaches the callee's read of that field. The
+stored fixpoint does not seed capture-rooted heap locations; a query-time
+interior run can seed one explicitly.
+
+A file-local fixpoint computes the partial flows. Its result must equal the
+solver's own propagation inside one procedure, and a differential test over the
+fixtures compares the two. The relation projection that the fixpoint reads
+uses a file-local host that answers every workspace question conservatively. No
+store counts as a strong update, and a gap whose discharge needs the workspace
+stays open. The stored relation is therefore a superset of what the workspace
+would prove. A query recomputes the openness of each procedure it visits with
+the workspace's gap predicates. Each stored flow also records which call sites
+its path crossed, as a minimal set of crossed-call sets, so a finding's
+certainty can follow the ICFG engine's continuation rule. The set is capped at
+16 classes. Past the cap, classes are merged into their union, which is
+conservative but can report lower quality than the ICFG engine.
+
+The fixpoint processes points in reverse postorder from the shared iterative
+graph traversal. A priority queue lets acyclic predecessors contribute before
+their successors, while loop back edges can schedule earlier points again.
+The traversal includes disconnected seeded points, and all scheduling state
+lives only for the procedure's computation. Bounded widening and query witness
+selection can depend on visitation order: changing the schedule preserves the
+conservative evidence rules, but need not retain identical path-class precision
+or choose the same valid witness.
+
+Some values are deliberately not stored:
+
+- Flows from an interior value, such as a sensitive read in the middle of a
+  body, to the procedure's ports. A query derives them from that procedure's
+  rows when it needs them.
+- Witnesses. A query rebuilds one only for a reported finding, by rerunning the
+  fixpoint on that procedure.
+- Request answers: findings, composed cross-procedure flows, and their
+  witnesses.
+- A crate-level taint summary. The unit of reuse is each file's procedures
+  and their partial flows. A summary over a crate's internal flows would have
+  to be re-derived whenever any body in the crate changed, which is the cost
+  this design avoids.
+
+The rule behind these choices: store a derived value when deriving it costs
+much more per file than a keyed read and more than one query shape reads it.
+Otherwise, derive it per query from rows that the query already reads.
+
+### Value-type barriers
+
+A taint policy may declare a separate `:barriers` endpoint set. A barrier
+names a type predicate, such as `(intrinsic bool)` or `(enum :fieldless true)`,
+rather than a call transfer or a label removal. A proven matching value stops
+all taint facts observed at that node, including sources, interior values,
+procedure boundaries and sink operands. Language support classifies the type;
+the shared propagation algorithm consumes its proof. Rust proves Boolean
+identity from native primitive resolution and proves a fieldless enum only
+from a complete inventory of lowered variants. A payload variant is a
+non-match. Unknown or ambiguous types, incomplete or macro-generated variant
+surfaces, and unavailable observations remain undecided.
+
+Classification runs at query time through a native resolver operation and
+request-owned value and type memos. It publishes no policy-specific
+partial-flow rows and retains no workspace-sized cache after the query.
+Classification is demand-driven by live fact carriers: creating a seed,
+propagating a relation with a tainted source, or observing a tainted output.
+Visiting a program point does not classify unrelated live values. Only the
+policy's declared predicates run, and the first proven match stops checking.
+Lenient and strict replays share the request's decisions.
+
+Within one query, a native `BudgetExceeded` answer is memoized per value
+handle, predicate and full receiver-analysis budget. Different budgets retry;
+cancellation is never cached. Row/byte refusals retain their controlling
+semantic and shared traversal limits as well. A cached refusal is undecided
+with the `lookup budget` note: lenient propagation keeps the fact. This
+intentionally forgoes a retry that might succeed after native caches warm.
+It can retain an extra finding or note, but never proves a barrier or hides
+a finding. This conservative precision tradeoff bounds repeated native work.
+
+Policies without barriers use ordinary stored summaries. A barrier policy
+first runs that same search. If it finds no candidates, it performs no type
+lookups. Otherwise, it recomputes only the source-to-sink chop: procedures
+whose recorded port edges can support a candidate source/sink connection.
+Filtered port flows must be a subset of their stored flows.
+
+The first search records all alternative derivation supports within its
+existing budgets. Refinement rewalks that request-local proof graph; it never
+adds a procedure or taint-port edge. This boundary matters when the first
+search was truncated: filtering an early path must not free a fresh budget to
+explore a previously unexpanded path. Refined findings are a subset of the
+baseline findings and retain its truncation and cancellation reasons even
+when all observed candidates disappear. Unexpanded paths remain unclassified.
+
+Two implementations of the observation filter share the same fixpoint and
+leave the fact lattice unchanged. The lenient filter blocks proven matches
+and permits undecided observations. If its witness crosses an undecided
+observation, a strict filter also blocks those observations and replays that
+pair's recorded chop. Projection applies the existing public finding grouping
+before choosing evidence. If any concrete pair in a group survives strict
+filtering, the finding contains only strict-surviving origins, labels, quality
+and witnesses, with no barrier notes. Otherwise it contains the lenient pairs
+and their undecided observations. Notes retain value identity and reason,
+with a 64-entry and 16-KiB bound and explicit truncation.
+
+Graph topology is frozen, but surviving edge evidence is refreshed. A barrier
+can remove the support with the smallest crossed-call set. The filtered
+fixpoint then supplies the surviving crossed calls and quality; continuation
+proofs are requested for those calls through the same provider. Such proof
+lookups do not expand the taint graph. Open or unavailable continuation proof
+lowers certainty or completeness instead of removing the edge or retaining an
+obsolete clean witness. Query profiling counts graph supports and edges,
+reached and chop procedures, filtered fixpoints, strict replays, classification
+calls, extra continuation-proof lookups and changed edge qualities.
+
+Production summary ICFG supports these filters for Rust in the forward
+direction only. Its first solve exposes the existing immutable transfer trace
+and direct, call and matched-return supports. Request-local refinement
+reconstructs local alternatives from the immutable `TaintAnalysisPlan` through
+the same taint transfer implementation used by discovery, and admits only
+outputs already recorded for that exact transfer key. It adds
+no call context or interprocedural edge. Distinct label contributions remain
+separate until filtering, including empty contributions that can generate a
+fresh source later. A debug assertion checks that unfiltered alternatives meet
+to each recorded output function. Replay is limited to the frozen candidate
+chop, retains the original transfer rule order, and uses the request's existing
+budgets.
+
+Both passes share the native classification service and its request-local
+decision and failure memos with composition. Budget-exhaustion failures are
+memoized per value, predicate and budget; cancellation is never memoized.
+Classification runs outside IDE callbacks, only for observations that carry
+live taint after a real source-to-sink candidate exists.
+Concrete loads, stores, arguments and results provide the observed value;
+abstract heap locations never substitute their owner's type. Filtered
+reconstruction supplies origins, observer candidates, labels and witnesses.
+Witness carrier fact IDs are normalized in the pair report; concrete endpoint
+and observation identities remain intact. First-discovery completion reasons
+remain authoritative even when filtering removes every candidate.
+
+Unsupported languages retain a structured unsupported analysis result.
+Backward, unrefined forward and reusable-summary APIs reject barrier requests
+with `TaintSolveError::UnsupportedValueTypeBarriers`. Its diagnostic is
+`value-type barriers are unsupported for {operation}; use request-local forward ICFG refinement`,
+where the operation is `backward taint`, `unrefined forward taint`, or
+`reusable taint summaries`. Filtered results never enter a shared summary
+repository. An empty selection that executes no solver retains its ordinary
+empty result.
+
+### Validity
+
+The rows are published under a semantic producer epoch. The epoch is derived
+from the adapter identity, the configuration, the IR version, and the
+semantic IR rows version. The rows version covers both the row encoding and the
+partial-flow derivation. Any change to the port vocabulary, the kill rules, or
+the fixpoint bumps it, so rows that the old derivation wrote stop validating. A
+blob whose rows are missing or carry an older epoch counts as a missing complete
+analysis, and the startup reconcile reparses and republishes it. Resolution
+bundles follow the same rule.
+
+Only parse-time persistence writes rows. An overlay, or a blob without a
+current publication, is lowered on demand in memory, and that lowering writes
+no IR or partial-flow rows. A query reads such a procedure's partial flows by
+running the same file-local fixpoint.
+
+### The search
+
+A composed policy is one backward search from its bound sinks over a graph
+whose nodes are pairs of a procedure and a port. The edges come from:
+
+- the stored partial flows;
+- interior runs in a procedure that holds a sink or a source;
+- dispatch: a call's argument into each candidate's parameter, and a
+  candidate's return back to that call's result;
+- callers: a parameter back to every call that dispatches to it;
+- closure captures;
+- models at call ports.
+
+The search follows the solver's call-return matching. A demand that entered a
+callee through a call's result returns only to that call. Only a demand that
+started in a procedure climbs to that procedure's callers. Paths are keyed by
+their label function, so a sanitized path cannot hide an unsanitized path to
+the same sink.
+
+The search runs in three stages. The first finds reachability and ignores
+classes. The second evaluates labels along each retained path, applying
+sanitizers, transforms, and model transfers in path order. The third reports
+through the existing taint finding report.
+
+Sinks are bound before the search starts. Sources, sanitizers, and transforms
+are not. Each is matched when the search first enters a procedure, by
+evaluating its selector on that procedure's file alone, and the match is
+memoized for the run. A matched-value source is judged complete from its
+file-local value observations, not from points-to coverage.
+
+The reverse call inventory supplies caller candidates; forward dispatch
+decides membership. A retained site is a caller only if dispatching that site
+names the procedure. A complete dispatch that does not name it refutes the
+site. An incomplete dispatch that does not name it leaves the caller set
+incomplete, because the site might still call the procedure.
+
+A caller site whose file is not compiled in the selected configuration is
+skipped. Rust reports such a file as inactive: none of its placements is
+active, and every route that would place it carries a cfg predicate that is
+false under the selected cfg atoms. A file whose activity cannot be decided is
+explored as usual. A skipped site is outside the analyzed configuration, so it
+does not make the result incomplete. The composition's profiling counts list
+every skipped site. Reverse selection itself keeps such callers, because
+find-usages and incoming-call tools should show them.
+
+When the request has more than one worker thread, the caller step resolves the
+native call targets of each caller file concurrently, one task per file. The
+parent still materializes semantic artifacts and performs semantic dispatch at
+the original demand points, and it charges work there too. A runtime identity
+is a per-operation alias of a content digest, so the parent merges worker
+answers by re-interning their digests, without coordinating identity numbers.
+With one worker, a store with a single connection, an unavailable operation,
+or cancellation, the work stays on the serial demand path. The composition
+prefetch golden compares the complete reports at widths 1 and 4 with each other
+and with a stored expected report.
+
+Openness uses one shared gap classifier with the ICFG engine, including its
+call-target refinement rule. A refinement gap on a call counts as answered when
+the composition's dispatch of that call is complete or a model covers the call.
+A blocked gap, an incomplete residual dispatch, an unproven or incomplete
+relation, or an open value-flow capability keeps a procedure open. At a call
+with no model and no candidate body, the composition applies the policy's
+unmodeled-call behavior, as the ICFG engine does.
+
+### Diff-scoped runs
+
+A diff-scoped run binds a sink only in a changed file, and only when the
+sink's innermost enclosing procedure overlaps a changed hunk. Every sink in
+such a procedure is bound, including sinks outside the edited lines. The run
+reports the findings at those sinks, names the procedures it examined, and
+marks its result as range-scoped. It makes no claim about sinks in other
+procedures, so an empty diff-scoped result is not a claim of absence. A flow
+through a changed procedure to a sink elsewhere is outside the contract. When
+the engine rule selects the ICFG engine, the run widens to the whole
+workspace. The whole-workspace mode binds every sink and is the reference for
+equivalence tests.
+
+### Completeness and reporting
+
+A composed finding is certain only when its path is proven and the search
+reached a fixed point. It is complete when the run's derivation was complete
+and the path was complete, or when every origin has a certain path at the
+fixed point, so an incomplete run keeps a complete finding only through
+certain paths. A certain path is proven and complete at every hop. A complete,
+exactly bound authored transfer from an active pack can establish certainty,
+with its closure retained as provenance, by the same rule the ICFG engine uses
+(#5218, #5306).
+
+A finding retains the authored summary that closes an endpoint's dispatch,
+even when its witness crosses no model transfer. This dependency records the
+dispatch proof rather than only the transfer relation (#4429, #4499, #5306).
+
+An incomplete batch reports with the ICFG engine's diagnostic families. The
+first cause is ranked: cancellation and budget exhaustion come first, then an
+open procedure (ordered by artifact, locator, and procedure), then other causes,
+and source or sink evidence last. Source-evidence diagnostics can appear beside
+the first cause, and endpoint refusals are reported separately. The
+`taint.compose.counts` profiling note carries the full list. When a run
+concludes but a finding is partial, the finding's cause is also emitted as a run
+diagnostic. For an open procedure, the cause names that procedure, not the call
+in a caller that enters it.
+
+The composition differs from the ICFG engine in two recorded ways. Heap
+components and bounded globals are not smeared at paranoid unmodeled calls. A
+source that the search reached but that lies on no reported path is not judged.
+
+All composition search state belongs to one query: the frontier, the memos, the
+prefetched dispatch answers, and the caller file map end with the policy
+compile. Outside the search, the analyzer keeps the stored rows, a byte-capped
+cache of complete semantic artifacts (decoded from rows or lowered on demand),
+and bounded source-identity bookkeeping.
 
 ## Fixed point and coverage
 
@@ -342,6 +705,7 @@ unretained sibling alternatives.
 | --- | --- | --- |
 | Query-local end summary | One solve | Correctness-critical tabulation state used to match returns and converge recursion |
 | Reusable solver summary | Across compatible solves in a bounded repository | A complete relative fact or IDE relation admitted only through strict validity gates |
+| Stored partial flow | One file content under one semantic producer epoch | A procedure's port-to-port flows with calls treated as boundaries; the input of [composed taint](#composed-taint-over-stored-partial-flows) |
 | Authored semantic procedure summary | Activated semantic-model scope | Reviewed external call behavior such as parameter, return, receiver, heap, escape, or exceptional transfer |
 
 Source bodies are analyzed directly. An external summary enters the solver only

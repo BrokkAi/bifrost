@@ -33,7 +33,13 @@ confidence-threshold = 0.8
 include-build = true
 include-dev = false
 unused-allowed-license = "allow"
-exceptions = []
+exceptions = [
+    # version-ranges is a required dependency of pep508_rs, which parses
+    # Python requirement markers for packaging evidence. MPL-2.0 is a
+    # file-level reciprocal license; Bifrost uses the crate unmodified.
+    # Owner approved this exception on 2026-10-06.
+    { crate = "version-ranges", allow = ["MPL-2.0"] },
+]
 
 [licenses.private]
 ignore = false

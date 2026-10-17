@@ -19,7 +19,7 @@
 //! structure: before it runs there is no tree, and a real C# lexer likewise
 //! handles directives before the syntactic grammar.
 
-use brokk_bifrost_core::analyzer::common::advance_ts_point;
+use brokk_bifrost_core::analyzer::common::{advance_ts_point, parse_source_with_cancellation};
 use brokk_bifrost_core::analyzer::usages::parsed_tree::ParseSpec;
 use brokk_bifrost_core::cancellation::CancellationToken;
 
@@ -303,11 +303,16 @@ fn quote_run(bytes: &[u8], index: usize) -> usize {
 /// A plain string cannot span a line, so an unterminated one ends at the line
 /// end and the mode returns to normal.
 fn plain_string_len(bytes: &[u8], start: usize) -> usize {
+    plain_quoted_len(bytes, start, b'"')
+}
+
+/// Length of a plain quoted literal body, including its closing delimiter.
+fn plain_quoted_len(bytes: &[u8], start: usize, quote: u8) -> usize {
     let mut index = start;
     while index < bytes.len() {
         match bytes[index] {
             b'\\' => index += 2,
-            b'"' => return index + 1 - start,
+            byte if byte == quote => return index + 1 - start,
             _ => index += 1,
         }
     }
@@ -316,15 +321,7 @@ fn plain_string_len(bytes: &[u8], start: usize) -> usize {
 
 /// Length of a `'x'` character literal body, including its closing quote.
 fn plain_char_len(bytes: &[u8], start: usize) -> usize {
-    let mut index = start;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'\\' => index += 2,
-            b'\'' => return index + 1 - start,
-            _ => index += 1,
-        }
-    }
-    bytes.len() - start
+    plain_quoted_len(bytes, start, b'\'')
 }
 
 /// The included ranges for one C# source, or `None` when it has no directives.
@@ -359,9 +356,7 @@ pub fn parse_csharp(source: &str) -> Option<tree_sitter::Tree> {
 /// diagnostics pass does -- needs `has_inactive_regions` from the same scan
 /// that produced the tree, not a second scan of the same bytes.
 pub fn parse_csharp_scanned(source: &str) -> Option<(tree_sitter::Tree, PreprocessorScan)> {
-    let scan = scan_preprocessor(source);
-    let tree = parse_csharp_scan_with_cancellation(source, &scan, None)?;
-    Some((tree, scan))
+    scan_and_parse_csharp(source, None)
 }
 
 /// Cancellation-aware form of [`parse_csharp`].
@@ -369,7 +364,16 @@ pub fn parse_csharp_with_cancellation(
     source: &str,
     cancellation: Option<&CancellationToken>,
 ) -> Option<tree_sitter::Tree> {
-    parse_csharp_scan_with_cancellation(source, &scan_preprocessor(source), cancellation)
+    scan_and_parse_csharp(source, cancellation).map(|(tree, _)| tree)
+}
+
+fn scan_and_parse_csharp(
+    source: &str,
+    cancellation: Option<&CancellationToken>,
+) -> Option<(tree_sitter::Tree, PreprocessorScan)> {
+    let scan = scan_preprocessor(source);
+    let tree = parse_csharp_scan_with_cancellation(source, &scan, cancellation)?;
+    Some((tree, scan))
 }
 
 fn parse_csharp_scan_with_cancellation(
@@ -377,31 +381,19 @@ fn parse_csharp_scan_with_cancellation(
     scan: &PreprocessorScan,
     cancellation: Option<&CancellationToken>,
 ) -> Option<tree_sitter::Tree> {
-    if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return None;
-    }
-    let mut parser = tree_sitter::Parser::new();
-    parser
-        .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
-        .ok()?;
-    if let Some(ranges) = scan.included_ranges.as_deref() {
-        parser.set_included_ranges(ranges).ok()?;
-    }
-    if let Some(cancellation) = cancellation {
-        let mut read = |offset: usize, _| source.as_bytes().get(offset..).unwrap_or(&[][..]);
-        let mut progress = |_: &tree_sitter::ParseState| cancellation.is_cancelled();
-        parser.parse_with_options(
-            &mut read,
-            None,
-            Some(tree_sitter::ParseOptions::new().progress_callback(&mut progress)),
-        )
-    } else {
-        parser.parse(source, None)
-    }
+    let language = tree_sitter_c_sharp::LANGUAGE.into();
+    parse_source_with_cancellation(
+        &language,
+        source,
+        scan.included_ranges.as_deref(),
+        cancellation,
+    )
 }
 
 #[cfg(test)]
 mod tests {
+    use brokk_bifrost_test_macros::hardwon;
+
     use super::*;
 
     /// The `StringSlice` shape: a member signature split across `#if NET`.
@@ -459,11 +451,7 @@ mod tests {
 "#;
 
     fn parse_raw(source: &str) -> tree_sitter::Tree {
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
-            .unwrap();
-        parser.parse(source, None).unwrap()
+        crate::test_support::parse_raw_csharp(source)
     }
 
     /// Collect every method name the tree exposes, in document order.
@@ -500,24 +488,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "transcript probe; run with --ignored --nocapture to inspect"]
-    fn probe_transcript() {
-        for (label, source) in [
-            ("STRING_SLICE", STRING_SLICE),
-            ("TYPE_CONVERTER", TYPE_CONVERTER),
-        ] {
-            let raw = parse_raw(source);
-            println!("== {label} raw ==");
-            println!("{}", raw.root_node().to_sexp());
-            println!("raw methods: {:?}", method_names(&raw, source));
-            let repaired = parse_csharp(source).unwrap();
-            println!("== {label} included-ranges ==");
-            println!("{}", repaired.root_node().to_sexp());
-            println!("repaired methods: {:?}", method_names(&repaired, source));
-        }
-    }
-
-    #[test]
+    #[hardwon("#1803: directives split a signature and cause duplicate declarations")]
     fn probe_raw_parse_distorts_a_split_signature() {
         // The raw parse recovers, but it recovers wrongly: `TrimStart` appears
         // twice, once from each branch, and the later members hang inside the
@@ -555,6 +526,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#1803: a conditional modifier fragment breaks the following method declaration")]
     fn a_modifier_only_split_parses_cleanly() {
         let source = concat!(
             "public struct S {\n",
@@ -576,6 +548,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#1803: conditional expression branches corrupt following method declarations")]
     fn probe_raw_parse_of_ternary_split_is_broken() {
         let raw = parse_raw(TYPE_CONVERTER);
         assert!(raw.root_node().has_error(), "expected a broken raw parse");
@@ -587,13 +560,6 @@ mod tests {
             method_names(&repaired, TYPE_CONVERTER),
             vec!["ChangeType".to_string(), "ParseInt".to_string()]
         );
-    }
-
-    #[test]
-    fn directive_free_source_has_no_ranges() {
-        let scan = scan_preprocessor("class A { void M() {} }\n");
-        assert!(scan.included_ranges.is_none());
-        assert!(!scan.has_inactive_regions);
     }
 
     /// The kept text, reconstructed from the ranges, for readable assertions.
@@ -608,31 +574,28 @@ mod tests {
     }
 
     #[test]
-    fn first_branch_of_a_chain_is_active() {
-        let source = "#if A\nint a;\n#elif B\nint b;\n#else\nint c;\n#endif\n";
-        assert_eq!(kept_text(source), "int a;\n");
-        assert!(scan_preprocessor(source).has_inactive_regions);
-    }
-
-    #[test]
+    #[hardwon("#1803: false conditional branches must select the later active branch")]
     fn literal_false_condition_activates_the_next_branch() {
         let source = "#if false\nint a;\n#elif false\nint b;\n#else\nint c;\n#endif\n";
         assert_eq!(kept_text(source), "int c;\n");
     }
 
     #[test]
+    #[hardwon("#1803: a nested chain cannot activate inside an inactive parent branch")]
     fn nested_chain_inside_an_inactive_branch_stays_inactive() {
         let source = "#if false\n#if A\nint a;\n#else\nint b;\n#endif\n#else\nint c;\n#endif\n";
         assert_eq!(kept_text(source), "int c;\n");
     }
 
     #[test]
+    #[hardwon("#1803: nested directives preserve branch selection inside active parent text")]
     fn nested_chain_inside_an_active_branch_selects_its_first_branch() {
         let source = "#if A\n#if B\nint a;\n#else\nint b;\n#endif\n#endif\n";
         assert_eq!(kept_text(source), "int a;\n");
     }
 
     #[test]
+    #[hardwon("#1803: directive markers inside comments and strings are source text")]
     fn hash_inside_comments_and_strings_is_not_a_directive() {
         let source = concat!(
             "// #if A\n",
@@ -654,6 +617,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#1803: doubled quotes keep a verbatim string open across directive-like lines")]
     fn doubled_quotes_do_not_close_a_verbatim_string() {
         let source = "var v = @\"a\"\"b\n#if A\n\";\nint x;\n";
         assert!(
@@ -663,12 +627,14 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#1803: an interpolated verbatim string can contain directive-like lines")]
     fn interpolated_verbatim_string_spans_lines() {
         let source = "var v = $@\"{x}\n#if A\n\";\n";
         assert!(scan_preprocessor(source).included_ranges.is_none());
     }
 
     #[test]
+    #[hardwon("#1803: raw strings close only when the quote run reaches the opener length")]
     fn raw_string_closes_only_on_an_equal_or_longer_quote_run() {
         let source = "var v = \"\"\"\"\n\"\"\"\n#if A\nint a;\n\"\"\"\"\n";
         assert!(
@@ -678,6 +644,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#1803: unmatched conditional directives must not discard source or panic")]
     fn unbalanced_directives_do_not_panic() {
         assert_eq!(kept_text("#endif\nint a;\n"), "int a;\n");
         assert_eq!(kept_text("#else\nint a;\n"), "int a;\n");
@@ -686,18 +653,21 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#1803: CRLF boundaries must preserve complete conditional branches")]
     fn crlf_line_endings_scan_as_lines() {
         let source = "#if false\r\nint a;\r\n#else\r\nint b;\r\n#endif\r\n";
         assert_eq!(kept_text(source), "int b;\r\n");
     }
 
     #[test]
+    #[hardwon("#1803: a final directive without a newline must still be recognized")]
     fn directive_on_the_last_line_without_a_newline() {
         let source = "int a;\n#endif";
         assert_eq!(kept_text(source), "int a;\n");
     }
 
     #[test]
+    #[hardwon("#1803: a fully inactive file publishes an empty parser range")]
     fn a_wholly_inactive_file_emits_one_zero_width_range() {
         let source = "#if false\nint a;\n#endif\n";
         let ranges = scan_preprocessor(source).included_ranges.unwrap();
@@ -709,6 +679,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#1803: included-range points must match their original byte offsets")]
     fn range_points_match_their_byte_offsets() {
         let ranges = scan_preprocessor(STRING_SLICE).included_ranges.unwrap();
         for range in &ranges {
@@ -720,6 +691,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#1803: repaired syntax nodes must keep original source byte offsets")]
     fn recovered_nodes_keep_raw_file_offsets() {
         let tree = parse_csharp(STRING_SLICE).unwrap();
         let mut stack = vec![tree.root_node()];

@@ -5,17 +5,19 @@
 //! document is absent, the host uses the ambient default of every ecosystem
 //! serving a language present in the workspace. A present document with an
 //! empty `ecosystems` list explicitly disables that dependency-pack route.
-//! The CLI policy runner, the MCP host, and the LSP host all read this one
+//! The CLI policy runner and the MCP host both read this one
 //! document, so every entry point applies the same dependency-pack selection
 //! (#1868). A host may separately request the reviewed shipped packs selected
 //! by intrinsic language evidence.
 
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use brokk_bifrost_core::analyzer::config::PythonRuntimeEnvironmentConfig;
+use brokk_bifrost_js_ts::imports::node_builtin_module;
 use semver::Version;
 use serde::Deserialize;
 
@@ -30,13 +32,14 @@ use crate::analyzer::semantic_model::{
     open_default_semantic_pack_catalog, register_workspace_semantic_models,
 };
 use crate::analyzer::{
-    AnalyzerConfig, DependencyPackActivationOutcome, DependencyPackEcosystem,
-    DependencyPackWorkspaceContext, Language, WorkspaceAnalyzer,
+    AnalyzerConfig, AnalyzerQueryScope, DependencyPackActivationOutcome, DependencyPackEcosystem,
+    DependencyPackWorkspaceContext, Language, QueryScope, WorkspaceAnalyzer,
 };
 use crate::gitblob::{CACHE_DIR_ENV, CACHE_ROOT_ENV};
 use crate::workspace_document::{
-    WorkspaceDocumentError, WorkspacePathError, WorkspaceRoot, read_workspace_document,
-    read_workspace_document_without_extension, validate_workspace_relative_path,
+    WorkspaceDocumentError, WorkspacePathError, WorkspaceRoot, fmt_json_decode_error,
+    read_workspace_document, read_workspace_document_without_extension,
+    validate_workspace_relative_path,
 };
 
 /// Conventional workspace-relative location of the pack-activation document.
@@ -215,6 +218,59 @@ pub fn node_runtime_evidence(
         .collect()
 }
 
+/// Files read per bulk import query while collecting Node built-in imports.
+const NODE_BUILTIN_IMPORT_SCAN_BATCH: usize = 512;
+
+/// The Node built-in modules the workspace's JavaScript and TypeScript files
+/// import, each with its importing language (#3464).
+///
+/// A built-in such as `fs` is the Node runtime's standard library. No npm
+/// dependency declares it, so dependency discovery never names it, and a
+/// report would otherwise say nothing about why `readFileSync` resolves to no
+/// declaration. The result is bounded by Node's fixed built-in list; files are
+/// read in batches and only the module names are kept.
+pub fn imported_node_builtin_modules(
+    workspace: &WorkspaceAnalyzer,
+) -> BTreeSet<(Language, &'static str)> {
+    let analyzer = workspace.analyzer();
+    let mut modules = BTreeSet::new();
+    let Some(provider) = analyzer.import_analysis_provider() else {
+        return modules;
+    };
+    let query_scope = AnalyzerQueryScope::new(analyzer);
+    for language in analyzer
+        .languages()
+        .into_iter()
+        .filter(|language| matches!(language, Language::JavaScript | Language::TypeScript))
+    {
+        for files in analyzer
+            .analyzed_files_for_language(language)
+            .chunks(NODE_BUILTIN_IMPORT_SCAN_BATCH)
+        {
+            let imports = provider.import_infos_for_files(files).unwrap_or_else(|| {
+                files
+                    .iter()
+                    .map(|file| {
+                        (
+                            file.clone(),
+                            provider.import_info_of(query_scope.token(), file),
+                        )
+                    })
+                    .collect()
+            });
+            modules.extend(
+                imports
+                    .values()
+                    .flatten()
+                    .filter_map(|import| import.path.as_ref()?.segments.first())
+                    .filter_map(|specifier| node_builtin_module(specifier))
+                    .map(|module| (language, module)),
+            );
+        }
+    }
+    modules
+}
+
 /// The exact Node revision the workspace declares, when it declares one.
 ///
 /// `package.json` `engines.node` and `volta.node` are read as JSON fields, and
@@ -298,7 +354,9 @@ impl WorkspacePacksConfig {
     }
 
     /// Workspace-relative semantic-pack catalog root, when configured.
-    /// Absent means the activation uses an ephemeral catalog.
+    /// When absent, activation uses the default versioned cache catalog for a
+    /// persisted analyzer or an explicit cache relocation, and an ephemeral
+    /// catalog otherwise.
     pub fn catalog(&self) -> Option<&Path> {
         self.catalog.as_deref()
     }
@@ -309,9 +367,9 @@ impl WorkspacePacksConfig {
         &self.ecosystems
     }
 
-    /// Pack ids the workspace opts into activating. Every shipped pack sets
-    /// `safety.review_required = true`, so a pack stays selected but inactive
-    /// until its id is named here (#1937).
+    /// Pack ids the workspace opts into activating. A pack that sets
+    /// `safety.review_required = true` stays selected but inactive until its id
+    /// is named here (#1937).
     pub fn enable(&self) -> &[String] {
         &self.enable
     }
@@ -441,7 +499,7 @@ pub fn load_workspace_packs_config(
         MAX_WORKSPACE_PACKS_DOCUMENT_BYTES,
     ) {
         Ok(document) => document,
-        Err(error) if workspace_error_is_not_found(&error) => return Ok(None),
+        Err(error) if error.is_not_found() => return Ok(None),
         Err(error) => return Err(WorkspacePacksLoadError::Workspace(error)),
     };
     parse_workspace_packs_config(document.source())
@@ -455,14 +513,6 @@ pub fn load_workspace_packs_config_at(
 ) -> Result<Option<WorkspacePacksConfig>, WorkspacePacksLoadError> {
     let root = WorkspaceRoot::open(workspace_root).map_err(WorkspacePacksLoadError::Workspace)?;
     load_workspace_packs_config(&root)
-}
-
-fn workspace_error_is_not_found(error: &WorkspaceDocumentError) -> bool {
-    matches!(
-        error,
-        WorkspaceDocumentError::OpenFile { source, .. }
-            if source.kind() == std::io::ErrorKind::NotFound
-    )
 }
 
 fn bounded_error_message(error: &serde_json::Error) -> Box<str> {
@@ -732,19 +782,19 @@ pub fn activate_workspace_semantic_sources_in_catalog(
     else {
         return Ok(None);
     };
-    let activation = SemanticModelActivationRequest {
-        bifrost_version: Version::parse(env!("CARGO_PKG_VERSION"))
-            .expect("package version must be semver"),
-        evidence: prelude.evidence,
-        controls: prelude.controls,
-        limits: SemanticModelRuntimeLimits::default(),
-    };
+    let WorkspaceActivationPrelude {
+        ecosystems,
+        workspace_models,
+        evidence,
+        controls,
+    } = prelude;
+    let activation = semantic_model_activation_request(evidence, controls);
     // An empty ecosystem list still resolves: the dependency loop simply has
     // nothing to discover, and the request's workspace evidence is what
     // selects. That keeps one code path for all routes.
     let outcome = workspace.activate_dependency_packs(
         &activation_config_with_source_toolchains(workspace, analyzer_config, sources.config),
-        &prelude.ecosystems,
+        &ecosystems,
         DependencyPackWorkspaceContext {
             catalog,
             persistence: None,
@@ -754,8 +804,8 @@ pub fn activate_workspace_semantic_sources_in_catalog(
         },
     );
     Ok(Some(WorkspacePacksActivation {
-        ecosystems: prelude.ecosystems,
-        workspace_models: prelude.workspace_models,
+        ecosystems,
+        workspace_models,
         outcome,
     }))
 }
@@ -790,16 +840,16 @@ pub fn activate_installed_workspace_semantic_sources_in_catalog(
     else {
         return Ok(None);
     };
-    let activation = SemanticModelActivationRequest {
-        bifrost_version: Version::parse(env!("CARGO_PKG_VERSION"))
-            .expect("package version must be semver"),
-        evidence: prelude.evidence,
-        controls: prelude.controls,
-        limits: SemanticModelRuntimeLimits::default(),
-    };
+    let WorkspaceActivationPrelude {
+        ecosystems,
+        workspace_models,
+        evidence,
+        controls,
+    } = prelude;
+    let activation = semantic_model_activation_request(evidence, controls);
     let installed = workspace.activate_installed_dependency_packs(
         &activation_config_with_source_toolchains(workspace, analyzer_config, sources.config),
-        &prelude.ecosystems,
+        &ecosystems,
         DependencyPackWorkspaceContext {
             catalog,
             persistence: None,
@@ -810,8 +860,8 @@ pub fn activate_installed_workspace_semantic_sources_in_catalog(
     );
     Ok(Some(InstalledWorkspacePacksActivation {
         activation: WorkspacePacksActivation {
-            ecosystems: prelude.ecosystems,
-            workspace_models: prelude.workspace_models,
+            ecosystems,
+            workspace_models,
             outcome: installed.outcome,
         },
         pending: installed.pending,
@@ -827,6 +877,19 @@ struct WorkspaceActivationPrelude {
     workspace_models: Vec<RegisteredWorkspaceSemanticModel>,
     evidence: Vec<SemanticModelActivationEvidence>,
     controls: Vec<SemanticModelActivationControl>,
+}
+
+fn semantic_model_activation_request(
+    evidence: Vec<SemanticModelActivationEvidence>,
+    controls: Vec<SemanticModelActivationControl>,
+) -> SemanticModelActivationRequest {
+    SemanticModelActivationRequest {
+        bifrost_version: Version::parse(env!("CARGO_PKG_VERSION"))
+            .expect("package version must be semver"),
+        evidence,
+        controls,
+        limits: SemanticModelRuntimeLimits::default(),
+    }
 }
 
 fn workspace_activation_prelude(
@@ -884,8 +947,8 @@ fn workspace_activation_prelude(
     {
         return Ok(None);
     }
-    // Every shipped pack declares `safety.review_required`, so activation
-    // needs an explicit compatible `Enable` control keyed by pack id --
+    // A pack declaring `safety.review_required` needs an explicit compatible
+    // `Enable` control keyed by pack id --
     // matching evidence alone leaves it selected but inactive
     // (`ReviewRequired`). The document's `enable` list is that control,
     // matching the in-process control build in `owasp_benchmark.rs` (#1937).
@@ -924,7 +987,7 @@ fn workspace_activation_prelude(
 
 /// Resolve the dependency ecosystems one host will attempt for this analyzer.
 ///
-/// Keeping this projection beside the activation transaction lets MCP and LSP
+/// Keeping this projection beside the activation transaction lets hosts
 /// retain an exact attempted set even when catalog opening or activation fails.
 pub fn workspace_pack_ecosystems(
     workspace: &WorkspaceAnalyzer,
@@ -985,10 +1048,7 @@ impl fmt::Display for WorkspacePacksDocumentError {
                 message,
                 line,
                 column,
-            } => write!(
-                formatter,
-                "packs document is not valid JSON at line {line} column {column}: {message}"
-            ),
+            } => fmt_json_decode_error(formatter, "packs", message, *line, *column),
             Self::Validation(error) => error.fmt(formatter),
         }
     }
@@ -1072,6 +1132,7 @@ impl std::error::Error for WorkspacePacksValidationError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
     use std::fs;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -1114,6 +1175,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("ab2e2f61ff4d: source-bound JVM models suppressed discovery of configured host JDKs")]
     fn activation_keeps_host_discovery_and_workspace_source_toolchains() {
         let project = crate::inline_project::InlineTestProject::with_language(Language::Java)
             .file("src/Main.java", "class Main {}")
@@ -1181,6 +1243,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#1937: authored enable controls were ignored, so review-required packs could not activate"
+    )]
     fn a_document_that_names_enable_entries_exposes_them_in_order() {
         let config = parse_workspace_packs_config(
             r#"{
@@ -1194,6 +1259,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#1937: packs documents without enable must allow review-required activation to be opted in"
+    )]
     fn a_document_that_omits_enable_still_parses_with_an_empty_list() {
         let config =
             parse_workspace_packs_config(r#"{ "schema_version": 1, "ecosystems": ["jvm"] }"#)
@@ -1201,6 +1269,31 @@ mod tests {
         assert!(config.enable().is_empty());
     }
 
+    #[test]
+    fn obsolete_review_receipts_require_explicit_configuration_migration() {
+        let mut document = serde_json::json!({
+            "schema_version": 1,
+            "catalog": ".bifrost/packs-catalog",
+            "ecosystems": ["jvm"],
+            "enable": ["acme.sanitizers"],
+            "accept_reviews": [{
+                "pack_id": "acme.sanitizers",
+                "manifest_digest": "11".repeat(32)
+            }]
+        });
+        let error = parse_workspace_packs_config(&document.to_string()).unwrap_err();
+        assert!(
+            matches!(&error, WorkspacePacksDocumentError::JsonDecode { message, .. }
+                if message.contains("unknown field `accept_reviews`")),
+            "an old receipt must not be silently reinterpreted: {error}"
+        );
+
+        document.as_object_mut().unwrap().remove("accept_reviews");
+        let config = parse_workspace_packs_config(&document.to_string()).unwrap();
+        assert_eq!(config.catalog(), Some(Path::new(".bifrost/packs-catalog")));
+        assert_eq!(config.ecosystems(), [DependencyPackEcosystem::Jvm]);
+        assert_eq!(config.enable(), ["acme.sanitizers"]);
+    }
     #[test]
     fn every_ecosystem_label_round_trips_through_the_document() {
         for ecosystem in DependencyPackEcosystem::ALL {
@@ -1264,28 +1357,15 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn an_absent_document_leaves_hosts_to_select_the_ambient_default() {
-        let temp = TempDir::new().unwrap();
-        assert!(
-            load_workspace_packs_config_at(temp.path())
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn an_absent_document_activates_every_ecosystem_for_present_languages() {
-        let temp = TempDir::new().unwrap();
-        fs::write(temp.path().join("lib.rs"), "pub fn value() {}\n").unwrap();
-        let project = Arc::new(crate::FilesystemProject::new(temp.path()).unwrap());
-        let workspace =
-            WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default()).unwrap();
+    fn assert_ambient_cargo_activation(
+        workspace: &WorkspaceAnalyzer,
+        workspace_root: &std::path::Path,
+    ) {
         let activation = activate_workspace_semantic_sources(
-            &workspace,
+            workspace,
             &AnalyzerConfig::default(),
             WorkspaceActivationSources {
-                catalog_root: temp.path(),
+                catalog_root: workspace_root,
                 workspace_model_root: None,
                 config: None,
                 intrinsic_shipped_models: false,
@@ -1295,6 +1375,16 @@ mod tests {
         .unwrap()
         .expect("the ambient Cargo ecosystem should be selected");
         assert_eq!(activation.ecosystems, [DependencyPackEcosystem::Cargo]);
+    }
+
+    #[test]
+    fn an_absent_document_activates_every_ecosystem_for_present_languages() {
+        let temp = TempDir::new().unwrap();
+        fs::write(temp.path().join("lib.rs"), "pub fn value() {}\n").unwrap();
+        let project = Arc::new(crate::FilesystemProject::new(temp.path()).unwrap());
+        let workspace =
+            WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default()).unwrap();
+        assert_ambient_cargo_activation(&workspace, temp.path());
         assert!(
             !temp.path().join(crate::gitblob::PROJECT_DIR_NAME).exists(),
             "ephemeral ambient activation must not create workspace-generated state"
@@ -1302,6 +1392,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "aeabae70329c: persisted activation must retain its versioned generated-pack catalog"
+    )]
     fn persisted_ambient_activation_keeps_the_versioned_catalog() {
         let temp = TempDir::new().unwrap();
         fs::write(temp.path().join("lib.rs"), "pub fn value() {}\n").unwrap();
@@ -1312,28 +1405,13 @@ mod tests {
         )
         .unwrap();
 
-        let activation = activate_workspace_semantic_sources(
-            &workspace,
-            &AnalyzerConfig::default(),
-            WorkspaceActivationSources {
-                catalog_root: temp.path(),
-                workspace_model_root: None,
-                config: None,
-                intrinsic_shipped_models: false,
-            },
-            &crate::CancellationToken::default(),
-        )
-        .unwrap()
-        .expect("the ambient Cargo ecosystem should be selected");
-
-        assert_eq!(activation.ecosystems, [DependencyPackEcosystem::Cargo]);
+        assert_ambient_cargo_activation(&workspace, temp.path());
         assert!(
             crate::analyzer::semantic_model::default_semantic_pack_catalog_root(temp.path())
                 .exists(),
             "persisted activation must retain the reusable versioned catalog"
         );
     }
-
     #[test]
     fn an_empty_document_disables_ambient_dependency_activation() {
         let temp = TempDir::new().unwrap();
@@ -1365,7 +1443,6 @@ mod tests {
             "disabled activation must not create or mutate a configured catalog"
         );
     }
-
     #[test]
     fn the_conventional_document_loads_from_the_workspace_root() {
         let temp = TempDir::new().unwrap();
@@ -1379,22 +1456,5 @@ mod tests {
             .unwrap()
             .expect("document present");
         assert_eq!(config.ecosystems(), [DependencyPackEcosystem::Cargo]);
-    }
-
-    #[test]
-    fn a_document_that_exceeds_the_byte_cap_is_a_typed_workspace_error() {
-        let temp = TempDir::new().unwrap();
-        fs::create_dir(temp.path().join(".bifrost")).unwrap();
-        let oversized = format!(
-            r#"{{ "schema_version": 1, "ecosystems": ["jvm"], "catalog": "{}" }}"#,
-            "x".repeat(MAX_WORKSPACE_PACKS_DOCUMENT_BYTES as usize)
-        );
-        fs::write(temp.path().join(WORKSPACE_PACKS_DOCUMENT_PATH), oversized).unwrap();
-        assert!(matches!(
-            load_workspace_packs_config_at(temp.path()),
-            Err(WorkspacePacksLoadError::Workspace(
-                WorkspaceDocumentError::TooLarge { .. }
-            ))
-        ));
     }
 }

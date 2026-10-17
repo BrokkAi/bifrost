@@ -7,7 +7,7 @@
   :name "Repeated stable branch condition"
   :message "this later branch repeats an earlier condition whose tested values cannot have changed"
   :severity warning
-  :description "A later condition in one ordered if/else-if chain repeats an earlier condition over the same ordinary bindings. Each intervening condition is proven effect free, so the later branch cannot be selected. Calls, getters, Python truthiness hooks, and unresolved bindings are not proof of stability. Review the intended alternative test; no automatic fix is implied."
+  :description "A later condition in one ordered if/else-if chain repeats an earlier condition over the same ordinary bindings. Each intervening condition is proven effect free, so the later branch cannot be selected. Rust bare Boolean bindings and built-in negation of a declared or literal-inferred bool are stable; trait-dispatched comparisons and negation of user types remain open. Calls, getters, Python truthiness hooks, and unresolved bindings are not proof of stability. Review the intended alternative test; no automatic fix is implied."
   :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
   :tags ["correctness" "conditional" "code-smell"]
   :analysis (analysis

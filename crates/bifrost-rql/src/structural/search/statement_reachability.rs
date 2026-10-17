@@ -88,23 +88,24 @@ fn report_open(
     reason: &str,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) {
-    diagnostics.push(CodeQueryDiagnostic {
-        code: CodeQueryDiagnosticCode::StatementReachabilityDerivationIncomplete,
-        impact: CodeQueryDiagnosticImpact::Incomplete,
-        branch: Vec::new(),
-        language: procedure
+    let mut diagnostic = super::incomplete_diagnostic(
+        CodeQueryDiagnosticCode::StatementReachabilityDerivationIncomplete,
+        procedure
             .handle
             .artifact()
             .key()
             .language()
             .language()
             .config_label(),
-        message: format!(
+        format!(
             "{} has open statement reachability evidence: {reason}",
             procedure.wire_id()
         ),
-        exhausted_roots: Vec::new(),
-    });
+        Vec::new(),
+    );
+    // Every statement row of a procedure is a row of the procedure's file.
+    diagnostic.withheld_rows_path = Some(rel_path_string(procedure.file()));
+    diagnostics.push(diagnostic);
 }
 
 pub(super) fn statement_reachability_expansions(

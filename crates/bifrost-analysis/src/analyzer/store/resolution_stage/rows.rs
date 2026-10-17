@@ -15,6 +15,71 @@ fn semantic_index(name: &str) -> String {
     format!("COALESCE({name}_key,-1),COALESCE({name}_shared,-1)")
 }
 
+fn family_schema_sql(family: &TypedFamily) -> String {
+    let mut sql = String::new();
+    let mut columns = family
+        .semantics
+        .iter()
+        .map(|name| semantic_columns(name))
+        .collect::<Vec<_>>();
+    if !family.columns.is_empty() {
+        columns.push(family.columns.to_owned());
+    }
+    columns.extend(
+        family
+            .semantics
+            .iter()
+            .map(|name| format!("CHECK(({name}_key IS NULL)<>({name}_shared IS NULL))")),
+    );
+    sql.push_str(&format!("CREATE TEMP TABLE IF NOT EXISTS selected_resolution_stage_{}(host_ordinal INTEGER NOT NULL CHECK(host_ordinal>=0), producer_id INTEGER NOT NULL REFERENCES selected_resolution_stage_producers(producer_id) ON DELETE CASCADE, sequence INTEGER NOT NULL CHECK(sequence>=0), {}, PRIMARY KEY(producer_id,sequence)) WITHOUT ROWID, STRICT;\n", family.name, columns.join(",")));
+    for (ordinal, keys) in family.unique.iter().enumerate() {
+        let keys = keys
+            .iter()
+            .map(|name| {
+                if family.semantics.contains(name) {
+                    semantic_index(name)
+                } else {
+                    (*name).to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        sql.push_str(&format!("CREATE UNIQUE INDEX IF NOT EXISTS temp.selected_resolution_stage_{}_unique_{ordinal} ON selected_resolution_stage_{}(host_ordinal,{keys});\n",family.name,family.name));
+    }
+    for (ordinal, keys) in family.seeks.iter().enumerate() {
+        let keys = keys
+            .iter()
+            .map(|name| {
+                if family.semantics.contains(name) {
+                    format!("{name}_key,{name}_shared")
+                } else {
+                    (*name).to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        sql.push_str(&format!("CREATE INDEX IF NOT EXISTS temp.selected_resolution_stage_{}_seek_{ordinal} ON selected_resolution_stage_{}({keys},host_ordinal,producer_id,sequence);\n",family.name,family.name));
+    }
+    sql
+}
+
+pub(super) fn generic_formals_schema_sql() -> &'static str {
+    static SQL: OnceLock<String> = OnceLock::new();
+    SQL.get_or_init(|| family_schema_sql(typed_family("generic_formals")))
+}
+
+pub(super) fn generic_formal_defaults_schema_sql() -> &'static str {
+    static SQL: OnceLock<String> = OnceLock::new();
+    SQL.get_or_init(|| family_schema_sql(typed_family("generic_formal_defaults")))
+}
+
+fn typed_family(name: &str) -> &'static TypedFamily {
+    TYPED_FAMILIES
+        .iter()
+        .find(|family| family.name == name)
+        .expect("typed stage family is registered")
+}
+
 struct TypedFamily {
     name: &'static str,
     semantics: &'static [&'static str],
@@ -39,11 +104,57 @@ const TYPED_FAMILIES: &[TypedFamily] = &[
         seeks: &[&["source_slot"], &["target_slot"], &["rule"]],
     },
     TypedFamily {
+        name: "type_productions",
+        semantics: &["output_slot", "element_slot"],
+        columns: "constructor INTEGER NOT NULL CHECK(constructor IN (3,4)), length_token TEXT, CHECK((constructor=4)=(length_token IS NOT NULL))",
+        unique: &[&["output_slot"]],
+        seeks: &[&["output_slot"]],
+    },
+    TypedFamily {
         name: "type_components",
         semantics: &["container_slot", "component_slot"],
         columns: "constructor INTEGER NOT NULL, kind INTEGER NOT NULL",
         unique: &[&["container_slot", "kind"]],
         seeks: &[&["container_slot"], &["component_slot"]],
+    },
+    TypedFamily {
+        name: "declared_type_arguments",
+        semantics: &["owner_slot", "argument_slot"],
+        columns: "ordinal INTEGER NOT NULL CHECK(ordinal>=0)",
+        unique: &[&["owner_slot", "ordinal"]],
+        seeks: &[&["owner_slot"], &["argument_slot"]],
+    },
+    TypedFamily {
+        name: "type_arguments",
+        semantics: &["application_slot", "argument_slot"],
+        columns: "ordinal INTEGER NOT NULL, indirection_delta INTEGER NOT NULL, reference_indirection_delta INTEGER NOT NULL",
+        unique: &[&["application_slot", "ordinal"]],
+        seeks: &[&["application_slot"], &["argument_slot"]],
+    },
+    TypedFamily {
+        name: "generic_type_alias_parameters",
+        semantics: &["alias_definition", "parameter_definition", "target_slot"],
+        columns: "ordinal INTEGER NOT NULL, indirection_delta INTEGER NOT NULL, reference_indirection_delta INTEGER NOT NULL",
+        unique: &[&["alias_definition", "ordinal"]],
+        seeks: &[
+            &["alias_definition"],
+            &["parameter_definition"],
+            &["target_slot"],
+        ],
+    },
+    TypedFamily {
+        name: "generic_formals",
+        semantics: &["owner_definition", "parameter_definition"],
+        columns: "ordinal INTEGER NOT NULL CHECK(ordinal>=0)",
+        unique: &[&["owner_definition", "ordinal"], &["parameter_definition"]],
+        seeks: &[&["owner_definition"], &["parameter_definition"]],
+    },
+    TypedFamily {
+        name: "generic_formal_defaults",
+        semantics: &["owner_definition", "default_slot"],
+        columns: "ordinal INTEGER NOT NULL CHECK(ordinal>=0)",
+        unique: &[&["owner_definition", "ordinal"]],
+        seeks: &[&["owner_definition"]],
     },
     TypedFamily {
         name: "underlying_types",
@@ -110,16 +221,17 @@ const TYPED_FAMILIES: &[TypedFamily] = &[
     TypedFamily {
         name: "member_scopes",
         semantics: &["definition"],
-        columns: "scope_head_node INTEGER NOT NULL CHECK(scope_head_node>=0)",
-        unique: &[&["definition"], &["scope_head_node"]],
+        columns: "scope_head_node INTEGER NOT NULL CHECK(scope_head_node>=0), scope_kind TEXT NOT NULL CHECK(scope_kind IN ('type_body', 'executable'))",
+        unique: &[&["definition", "scope_head_node"], &["scope_head_node"]],
         seeks: &[&["definition"], &["scope_head_node"]],
     },
     TypedFamily {
         name: "member_owners",
         semantics: &["definition", "owner_definition"],
-        columns: "owner_scope_head_node INTEGER NOT NULL CHECK(owner_scope_head_node>=0), member_kind TEXT NOT NULL, member_access TEXT NOT NULL, qualifier_compatibility TEXT NOT NULL",
+        columns: "owner_scope_head_node INTEGER NOT NULL CHECK(owner_scope_head_node>=0), member_name TEXT NOT NULL, member_kind TEXT NOT NULL, member_access TEXT NOT NULL, qualifier_compatibility TEXT NOT NULL",
         unique: &[&[
             "definition",
+            "member_name",
             "member_kind",
             "member_access",
             "qualifier_compatibility",
@@ -145,7 +257,7 @@ const TYPED_FAMILIES: &[TypedFamily] = &[
     TypedFamily {
         name: "supertypes",
         semantics: &["definition", "reference", "frontier"],
-        columns: "kind INTEGER NOT NULL",
+        columns: "kind INTEGER NOT NULL, parent_ordinal INTEGER NOT NULL CHECK(parent_ordinal>=0)",
         unique: &[&["definition", "kind", "reference", "frontier"]],
         seeks: &[&["definition"], &["reference"], &["frontier"]],
     },
@@ -247,7 +359,7 @@ CREATE TEMP TABLE IF NOT EXISTS selected_resolution_stage_semantic_coordinates(
  CHECK((import_source_site IS NULL AND import_start_byte IS NULL AND import_end_byte IS NULL AND import_route_kind IS NULL)
     OR (import_source_site IS NOT NULL AND import_start_byte IS NOT NULL AND import_end_byte IS NOT NULL
         AND shared_id IS NULL AND import_route_kind IS NOT NULL
-        AND import_route_kind IN ('single_type','type_on_demand','single_static','static_on_demand'))),
+        AND import_route_kind IN ('single_type','type_on_demand','single_static','static_on_demand','named','star'))),
  CHECK((runtime_key IS NULL)<>(shared_id IS NULL)),
  PRIMARY KEY(producer_id,dense_key)
 ) WITHOUT ROWID, STRICT;
@@ -290,11 +402,12 @@ CREATE TEMP TABLE IF NOT EXISTS selected_resolution_stage_package_references(
  token_key INTEGER NOT NULL CHECK(token_key>=0),
  domain_shared INTEGER NOT NULL CHECK(domain_shared>0),
  reference_key INTEGER NOT NULL CHECK(reference_key>=0),
+ choice_key INTEGER NOT NULL CHECK(choice_key>=0),
  source_site INTEGER NOT NULL CHECK(source_site BETWEEN 0 AND 4294967295),
  root_scope_key INTEGER NOT NULL CHECK(root_scope_key>=0),
  namespace TEXT NOT NULL CHECK(namespace IN ('type','value','callable','package')),
  lookup_shared INTEGER NOT NULL CHECK(lookup_shared>0),
- PRIMARY KEY(producer_id,token_key)
+ PRIMARY KEY(producer_id,token_key,reference_key)
 ) WITHOUT ROWID, STRICT;
 CREATE TEMP TABLE IF NOT EXISTS selected_resolution_stage_package_members(
  host_ordinal INTEGER NOT NULL,
@@ -310,7 +423,7 @@ CREATE TEMP TABLE IF NOT EXISTS selected_resolution_stage_package_members(
 ) WITHOUT ROWID, STRICT;
 CREATE INDEX IF NOT EXISTS temp.selected_resolution_stage_package_references_host ON selected_resolution_stage_package_references(host_ordinal,token_key);
 CREATE INDEX IF NOT EXISTS temp.selected_resolution_stage_package_references_reference ON selected_resolution_stage_package_references(reference_key,host_ordinal);
-CREATE INDEX IF NOT EXISTS temp.selected_resolution_stage_package_members_definition ON selected_resolution_stage_package_members(definition_key,host_ordinal,namespace);
+CREATE INDEX IF NOT EXISTS temp.selected_resolution_stage_package_members_host ON selected_resolution_stage_package_members(host_ordinal,definition_key,namespace);
 CREATE INDEX IF NOT EXISTS temp.selected_resolution_stage_package_members_lookup ON selected_resolution_stage_package_members(lookup_shared,host_ordinal);
 CREATE TEMP TABLE IF NOT EXISTS selected_resolution_stage_go_package_imports(
  host_ordinal INTEGER NOT NULL,
@@ -409,20 +522,13 @@ CREATE TEMP TABLE IF NOT EXISTS selected_resolution_stage_recipes(
 CREATE UNIQUE INDEX IF NOT EXISTS temp.selected_resolution_stage_recipe_identity ON selected_resolution_stage_recipes(producer_id,COALESCE(semantic_key,-1),COALESCE(semantic_shared,-1));
 CREATE INDEX IF NOT EXISTS temp.selected_resolution_stage_recipe_key ON selected_resolution_stage_recipes(host_ordinal,semantic_key,semantic_shared);
 "#);
-        for family in TYPED_FAMILIES {
-            let mut columns = family.semantics.iter().map(|name| semantic_columns(name)).collect::<Vec<_>>();
-            if !family.columns.is_empty() { columns.push(family.columns.to_owned()); }
-            columns.extend(family.semantics.iter().map(|name| format!("CHECK(({name}_key IS NULL)<>({name}_shared IS NULL))")));
-            sql.push_str(&format!("CREATE TEMP TABLE IF NOT EXISTS selected_resolution_stage_{}(host_ordinal INTEGER NOT NULL CHECK(host_ordinal>=0), producer_id INTEGER NOT NULL REFERENCES selected_resolution_stage_producers(producer_id) ON DELETE CASCADE, sequence INTEGER NOT NULL CHECK(sequence>=0), {}, PRIMARY KEY(producer_id,sequence)) WITHOUT ROWID, STRICT;\n", family.name, columns.join(",")));
-            for (ordinal, keys) in family.unique.iter().enumerate() {
-                let keys = keys.iter().map(|name| if family.semantics.contains(name) { semantic_index(name) } else { (*name).to_owned() }).collect::<Vec<_>>().join(",");
-                sql.push_str(&format!("CREATE UNIQUE INDEX IF NOT EXISTS temp.selected_resolution_stage_{}_unique_{ordinal} ON selected_resolution_stage_{}(host_ordinal,{keys});\n",family.name,family.name));
-            }
-            for (ordinal, keys) in family.seeks.iter().enumerate() {
-                let keys = keys.iter().map(|name| if family.semantics.contains(name) { format!("{name}_key,{name}_shared") } else { (*name).to_owned() }).collect::<Vec<_>>().join(",");
-                sql.push_str(&format!("CREATE INDEX IF NOT EXISTS temp.selected_resolution_stage_{}_seek_{ordinal} ON selected_resolution_stage_{}({keys},host_ordinal,producer_id,sequence);\n",family.name,family.name));
-            }
+        for family in TYPED_FAMILIES
+            .iter()
+            .filter(|family| !matches!(family.name, "generic_formals" | "generic_formal_defaults"))
+        {
+            sql.push_str(&family_schema_sql(family));
         }
+        sql.push_str("CREATE UNIQUE INDEX IF NOT EXISTS temp.selected_resolution_stage_member_scopes_type_owner ON selected_resolution_stage_member_scopes(host_ordinal,COALESCE(definition_key,-1),COALESCE(definition_shared,-1)) WHERE scope_kind='type_body';\n");
         // Observation reference identity is independent of its identity node.
         sql.push_str("CREATE UNIQUE INDEX IF NOT EXISTS temp.selected_resolution_stage_observation_reference ON selected_resolution_stage_type_frontiers(COALESCE(identity_reference_key,-1),COALESCE(identity_reference_shared,-1),host_ordinal) WHERE identity_reference_node IS NOT NULL;\n");
         sql

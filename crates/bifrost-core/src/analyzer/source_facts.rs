@@ -8,11 +8,11 @@
 
 use crate::analyzer::Range;
 use crate::analyzer::dense_id::define_dense_id;
-use crate::analyzer::model::DeclarationKind;
+use crate::analyzer::model::{CodeUnit, DeclarationKind};
 use crate::analyzer::structural::resolution::DeclaredVisibility;
 use crate::analyzer::tree_walk::node_range;
 use crate::hash::HashMap;
-use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
+use crate::text_utils::compute_line_starts;
 use serde::{Deserialize, Serialize};
 use tree_sitter::Node;
 
@@ -229,6 +229,58 @@ impl SourceFactRows {
     }
 }
 
+pub fn source_projection_retained_bytes(
+    source: &SourceFactRows,
+    language_facts_bytes: usize,
+    declaration_units: &HashMap<SourceDeclarationId, Vec<CodeUnit>>,
+) -> usize {
+    source
+        .estimated_bytes()
+        .saturating_add(language_facts_bytes)
+        .saturating_add(
+            declaration_units
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(SourceDeclarationId, Vec<CodeUnit>)>()),
+        )
+        .saturating_add(
+            declaration_units
+                .values()
+                .map(|units| {
+                    units
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<CodeUnit>())
+                        .saturating_add(
+                            units
+                                .iter()
+                                .map(|unit| {
+                                    unit.fq_name()
+                                        .len()
+                                        .saturating_add(unit.signature().map_or(0, str::len))
+                                        .saturating_add(
+                                            unit.source().rel_path().to_string_lossy().len(),
+                                        )
+                                })
+                                .sum::<usize>(),
+                        )
+                })
+                .sum::<usize>(),
+        )
+}
+
+/// Select source declarations projected onto one code unit.
+pub fn declarations_for_unit<'a, T>(
+    declarations: &'a [T],
+    declaration_units: &'a HashMap<SourceDeclarationId, Vec<CodeUnit>>,
+    unit: &'a CodeUnit,
+    declaration_id: fn(&T) -> SourceDeclarationId,
+) -> impl Iterator<Item = &'a T> + 'a {
+    declarations.iter().filter(move |fact| {
+        declaration_units
+            .get(&declaration_id(*fact))
+            .is_some_and(|units| units.contains(unit))
+    })
+}
+
 /// Mutable producer-side arena shared by native and structural projections
 /// while the primary syntax tree is live.
 pub struct PrimarySourceFactCollector<'source> {
@@ -266,6 +318,24 @@ impl<'source> PrimarySourceFactCollector<'source> {
         let id = self.push_occurrence(range, SourceOccurrenceProvenance::PrimaryNode);
         assert!(self.primary_by_node.insert(node.id(), id).is_none());
         id
+    }
+
+    /// Register a live fragment node before ordinary role extraction touches
+    /// it. The same AST identity is reused, with Embedded provenance.
+    pub fn intern_embedded_node(&mut self, node: Node<'_>) -> SourceOccurrenceId {
+        if let Some(id) = self.primary_by_node.get(&node.id()).copied() {
+            return id;
+        }
+        let id = self.intern_embedded(node_range(node));
+        assert!(self.primary_by_node.insert(node.id(), id).is_none());
+        id
+    }
+
+    /// Declare one exact primary AST node and its optional name-token node.
+    pub fn declare_node(&mut self, node: Node<'_>, name: Option<Node<'_>>) -> SourceDeclarationId {
+        let occurrence = self.intern_node(node);
+        let name = name.map(|name| self.intern_node(name));
+        self.declare(occurrence, name)
     }
 
     /// Exact live-node identities already requested by producer projections.
@@ -361,25 +431,7 @@ impl<'source> PrimarySourceFactCollector<'source> {
         kind: DeclarationKind,
     ) -> SourceDeclarationId {
         let declaration = self.declare(occurrence, Some(name));
-        let range = self.occurrence(name).range;
-        let fact = SourceLexicalDeclarationFact {
-            declaration,
-            kind,
-            identifier: self.source[range.start_byte..range.end_byte].to_owned(),
-        };
-        assert!(!fact.identifier.is_empty());
-        match self.lexical_declarations.entry(declaration) {
-            std::collections::hash_map::Entry::Occupied(existing) => {
-                assert_eq!(
-                    existing.get(),
-                    &fact,
-                    "contradictory lexical declaration metadata"
-                );
-            }
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(fact);
-            }
-        }
+        self.mark_lexical(declaration, kind);
         declaration
     }
 
@@ -451,14 +503,11 @@ impl<'source> PrimarySourceFactCollector<'source> {
 
     fn range_for_bytes(&self, start_byte: usize, end_byte: usize) -> Range {
         assert!(start_byte <= end_byte);
-        let start_line = find_line_index_for_offset(&self.line_starts, start_byte) + 1;
-        let end_line = find_line_index_for_offset(&self.line_starts, end_byte) + 1;
-        Range {
+        crate::analyzer::semantic_diagnostics::range_for_byte_offsets(
+            &self.line_starts,
             start_byte,
             end_byte,
-            start_line,
-            end_line,
-        }
+        )
     }
 
     fn assert_range(&self, range: Range) {

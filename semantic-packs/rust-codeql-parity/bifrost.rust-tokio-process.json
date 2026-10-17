@@ -1,0 +1,236 @@
+{
+  "schema_version": 2,
+  "pack_id": "bifrost.rust-tokio-process",
+  "version": "0.1.0",
+  "producer": {
+    "name": "bifrost-reviewed-rust-codeql-parity-models",
+    "version": "0.1.0"
+  },
+  "language": "rust",
+  "ecosystem": "cargo",
+  "compatibility": {
+    "bifrost": ">=0.12.0, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "Tokio process Command API shape reviewed against a local stub crate for command-injection taint: process::Command::new, arg, and args. These builder methods are synchronous; only process execution methods are async and are outside this pack.",
+    "revision": "tokio-process-stub-0.1"
+  },
+  "license": "Apache-2.0",
+  "completeness": "complete",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "declarations.rust-process.tokio",
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {
+            "id": "type.rust-process.tokio",
+            "name": "tokio",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/process.rs",
+              "symbol": "tokio"
+            }
+          },
+          {
+            "id": "type.rust-process.tokio-process",
+            "name": "tokio.process",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/process.rs",
+              "symbol": "tokio.process"
+            }
+          },
+          {
+            "id": "type.rust-process.tokio-process-command",
+            "name": "tokio.process.Command",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/process.rs",
+              "symbol": "tokio.process.Command"
+            }
+          }
+        ],
+        "members": [
+          {
+            "id": "member.rust-process.tokio-process-command.new",
+            "owner": "type.rust-process.tokio-process-command",
+            "name": "new",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "program",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "tokio.process.Command"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/process.rs",
+              "symbol": "tokio.process.Command.new"
+            }
+          },
+          {
+            "id": "member.rust-process.tokio-process-command.arg",
+            "owner": "type.rust-process.tokio-process-command",
+            "name": "arg",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "arg",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "tokio.process.Command"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/process.rs",
+              "symbol": "tokio.process.Command.arg"
+            }
+          },
+          {
+            "id": "member.rust-process.tokio-process-command.args",
+            "owner": "type.rust-process.tokio-process-command",
+            "name": "args",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "args",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "tokio.process.Command"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/process.rs",
+              "symbol": "tokio.process.Command.args"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "summaries.rust-process.tokio",
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "summary.rust-process.tokio-process-command.new",
+            "target": {
+              "path": "src/process.rs",
+              "symbol": "tokio.process.Command.new",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-process.tokio-process-command.arg",
+            "target": {
+              "path": "src/process.rs",
+              "symbol": "tokio.process.Command.arg",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-process.tokio-process-command.args",
+            "target": {
+              "path": "src/process.rs",
+              "symbol": "tokio.process.Command.args",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          }
+        ]
+      }
+    }
+  ]
+}

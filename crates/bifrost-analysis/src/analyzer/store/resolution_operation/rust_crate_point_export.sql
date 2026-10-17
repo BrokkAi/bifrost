@@ -10,41 +10,40 @@
 -- request-scoped capsule definition. Its visibility predicate is the same one
 -- the persisted arm applies.
 , changed_sources AS (
- -- The module's own sources, sought by (topology, container path). A macro
- -- target at the crate root reads every source of the crate instead: the
- -- second arm. They are two arms, not one join with an OR, because the OR's
- -- macro branch names no source column, so SQLite could seek only by
- -- topology and read every source of the crate for every target row. On
- -- tract_core that is 179 sources per target.
- SELECT targets.topology_id, targets.module_path, targets.name,
-        source.enum_scope_node_key, mount.blob_id AS selected_blob, mount.mount_ordinal
+ -- The module's own files are reached by the summary placement key. A macro
+ -- lookup at the crate root additionally considers every member placement.
+ SELECT targets.topology_id, targets.module_path, targets.name, unit.summary_id,
+        source.enum_scope_node_key, source.parent_module_path,
+        mount.blob_id AS selected_blob, mount.mount_ordinal
  FROM targets
- CROSS JOIN rust_crate_container_sources AS source
-  ON source.topology_id=targets.topology_id AND source.container_path=targets.module_path
+ CROSS JOIN selected_rust_unit_summaries AS unit ON unit.topology_id=targets.topology_id
+ CROSS JOIN main.rust_resolution_unit_summary_placements AS source
+  ON source.summary_id=unit.summary_id AND source.module_path=targets.module_path
+ CROSS JOIN main.resolution_unit_summary_members AS member
+  ON member.summary_id=source.summary_id AND member.member_ordinal=source.member_ordinal
  CROSS JOIN temp.selected_resolution_mounts AS mount
-  ON mount.storage_language='rust' AND mount.persisted_relative_path=source.rel_path
- WHERE mount.blob_id<>source.blob_id
+  ON mount.storage_language='rust' AND mount.persisted_relative_path=member.rel_path
+ WHERE mount.blob_id<>member.blob_id
  UNION
- SELECT targets.topology_id, targets.module_path, targets.name,
-        source.enum_scope_node_key, mount.blob_id AS selected_blob, mount.mount_ordinal
+ SELECT targets.topology_id, targets.module_path, targets.name, unit.summary_id,
+        source.enum_scope_node_key, source.parent_module_path,
+        mount.blob_id AS selected_blob, mount.mount_ordinal
  FROM targets
- CROSS JOIN rust_crate_container_sources AS source
-  ON source.topology_id=targets.topology_id
+ CROSS JOIN selected_rust_unit_summaries AS unit ON unit.topology_id=targets.topology_id
+ CROSS JOIN main.rust_resolution_unit_summary_placements AS source
+  ON source.summary_id=unit.summary_id
+ CROSS JOIN main.resolution_unit_summary_members AS member
+  ON member.summary_id=source.summary_id AND member.member_ordinal=source.member_ordinal
  CROSS JOIN temp.selected_resolution_mounts AS mount
-  ON mount.storage_language='rust' AND mount.persisted_relative_path=source.rel_path
- WHERE ?3='macro' AND targets.module_path='crate' AND mount.blob_id<>source.blob_id
+  ON mount.storage_language='rust' AND mount.persisted_relative_path=member.rel_path
+ WHERE ?3='macro' AND targets.module_path='crate' AND mount.blob_id<>member.blob_id
 ), selected_exports AS (
  SELECT source.selected_blob, source.mount_ordinal, authority.source_site, source.topology_id,
         source.module_path,
         CASE WHEN properties.macro_exported=1 OR source.enum_scope_node_key IS NOT NULL
              THEN 'public' ELSE properties.visibility END AS visibility,
         cr_restriction(properties.visibility,source.module_path,
-          (SELECT parent.container_path FROM rust_crate_container_sources AS parent
-           CROSS JOIN source_rust_module_declarations AS declaration
-            ON declaration.blob_id=parent.blob_id
-           WHERE parent.topology_id=source.topology_id
-            AND parent.container_path || '::' || declaration.module_name=source.module_path
-           LIMIT 1)) AS restricted_module_path
+          source.parent_module_path) AS restricted_module_path
  FROM changed_sources AS source
  CROSS JOIN resolution_identities AS name
   ON name.identity_digest=cr_lookup_digest(?3,source.name)
@@ -59,7 +58,8 @@
   ON placement.mount_ordinal=source.mount_ordinal
   AND placement.module_declaration IS authority.module_declaration
   AND placement.topology_id=source.topology_id
- CROSS JOIN selected_rust_crates AS owner ON owner.topology_id=source.topology_id
+ CROSS JOIN main.rust_resolution_unit_summary_contexts AS owner
+  ON owner.summary_id=source.summary_id
  LEFT JOIN resolution_member_owner_properties AS member
   ON member.blob_id=authority.blob_id AND member.definition_semantic_key=authority.semantic_key
  LEFT JOIN resolution_rust_declaration_authorities AS enum_authority
@@ -77,24 +77,34 @@
            AND source.module_path=placement.container_path || '::' || enum_unit.identifier))
   AND cr_cfg(properties.cfg_condition,json(owner.cfg_atoms))=1
 )
-SELECT DISTINCT exports.declaration_blob_id, exports.declaration_site, exports.topology_id, exports.module_path, mount.mount_ordinal, NULL
-FROM targets CROSS JOIN rust_crate_exports AS exports ON exports.topology_id=targets.topology_id AND exports.module_path=targets.module_path AND exports.namespace=?3 AND exports.name=targets.name
-CROSS JOIN rust_crate_container_sources AS source
- ON source.topology_id=exports.topology_id AND source.blob_id=exports.declaration_blob_id
- AND (source.container_path=exports.module_path OR ?3='macro')
+SELECT DISTINCT member.blob_id, exports.declaration_site, unit.topology_id,
+       exports.module_path, mount.mount_ordinal, NULL
+FROM targets
+CROSS JOIN selected_rust_unit_summaries AS unit ON unit.topology_id=targets.topology_id
+CROSS JOIN main.rust_resolution_unit_summary_exports AS exports
+ ON exports.summary_id=unit.summary_id AND exports.module_path=targets.module_path
+AND exports.namespace=?3 AND exports.name=targets.name
+CROSS JOIN main.resolution_unit_summary_members AS member
+ ON member.summary_id=exports.summary_id
+AND member.member_ordinal=exports.declaration_member_ordinal
 CROSS JOIN temp.selected_resolution_mounts AS mount
- ON mount.storage_language='rust' AND mount.persisted_relative_path=source.rel_path
- AND mount.blob_id=exports.declaration_blob_id
+ ON mount.storage_language='rust' AND mount.persisted_relative_path=member.rel_path
+AND mount.blob_id=member.blob_id
 WHERE exports.origin='declaration' AND (exports.visibility='public' OR (targets.topology_id=?5 AND (exports.visibility='crate' OR (exports.visibility='private' AND (?6=exports.module_path OR substr(?6,1,length(exports.module_path)+2)=exports.module_path || '::')) OR (exports.visibility='restricted' AND (?6=exports.restricted_module_path OR substr(?6,1,length(exports.restricted_module_path)+2)=exports.restricted_module_path || '::')))))
 
 UNION
-SELECT item.blob_id, NULL, item.topology_id, item.module_path, mount.mount_ordinal, item.declaration_id
-FROM targets CROSS JOIN rust_crate_macro_items AS item ON item.topology_id=targets.topology_id AND item.module_path=targets.module_path AND item.namespace=?3 AND item.name=targets.name
-CROSS JOIN rust_crate_container_sources AS source
- ON source.topology_id=item.topology_id AND source.blob_id=item.blob_id AND source.container_path=item.module_path
+SELECT member.blob_id, NULL, unit.topology_id, item.module_path,
+       mount.mount_ordinal, item.declaration_id
+FROM targets
+CROSS JOIN selected_rust_unit_summaries AS unit ON unit.topology_id=targets.topology_id
+CROSS JOIN main.rust_resolution_unit_summary_generated_names AS item
+ ON item.summary_id=unit.summary_id AND item.module_path=targets.module_path
+AND item.namespace=?3 AND item.name=targets.name
+CROSS JOIN main.resolution_unit_summary_members AS member
+ ON member.summary_id=item.summary_id AND member.member_ordinal=item.member_ordinal
 CROSS JOIN temp.selected_resolution_mounts AS mount
- ON mount.storage_language='rust' AND mount.persisted_relative_path=source.rel_path
- AND mount.blob_id=item.blob_id
+ ON mount.storage_language='rust' AND mount.persisted_relative_path=member.rel_path
+AND mount.blob_id=member.blob_id
 WHERE item.visibility='public' OR (targets.topology_id=?5 AND (item.visibility='crate' OR (item.visibility='private' AND (?6=item.module_path OR substr(?6,1,length(item.module_path)+2)=item.module_path || '::')) OR (item.visibility='restricted' AND (?6=item.restricted_module_path OR substr(?6,1,length(item.restricted_module_path)+2)=item.restricted_module_path || '::'))))
 UNION
 SELECT selected_blob,source_site,topology_id,module_path,mount_ordinal,NULL FROM selected_exports AS exports

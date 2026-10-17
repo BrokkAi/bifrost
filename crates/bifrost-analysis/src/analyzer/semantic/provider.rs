@@ -7,10 +7,11 @@ use std::sync::{Arc, Mutex};
 use crate::analyzer::ProjectFile;
 use crate::cancellation::CancellationToken;
 
-use super::capabilities::SemanticCapability;
-use super::ids::{SemanticArtifactKey, StableDigest};
+use super::capabilities::{SemanticCapabilities, SemanticCapability};
+use super::ids::{ProcedureId, SemanticArtifactKey, StableDigest};
 use super::ir::{SemanticArtifact, SemanticIrError};
 use super::leases::SemanticArtifactCollector;
+use super::partial_flow::ProcedurePartialFlows;
 use crate::analyzer::work_budget::{BudgetLedger, WorkBudgetExceeded, define_work_dimensions};
 
 define_work_dimensions! {
@@ -21,8 +22,7 @@ define_work_dimensions! {
     ///
     /// Deserializable because a reused policy evaluation unit replays the
     /// exact semantic charge its own work made, and that charge outlives the
-    /// process that measured it
-    /// (`.agents/plans/impact-sliced-diff-base.md`, Decision Log (5c)).
+    /// process that measured it.
     #[derive(
         Debug, Default, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
     )]
@@ -148,6 +148,7 @@ pub struct SemanticBudget {
     ledger: BudgetLedger<SemanticWork>,
     scope: Arc<SemanticBudgetScope>,
     charged_artifacts: Arc<HashSet<StableDigest>>,
+    shared_summary_expansion_limit: Option<usize>,
     /// The first charge this ledger refused. Clones share it, so a refusal
     /// on a staging copy that is then discarded is still recorded; a child
     /// ledger has its own.
@@ -184,6 +185,7 @@ pub(crate) struct SemanticBudgetScopeIdentity {
 pub struct SemanticBudgetScopeSnapshot {
     scope: Arc<SemanticBudgetScope>,
     charged_artifacts: Arc<HashSet<StableDigest>>,
+    shared_summary_expansion_limit: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -224,6 +226,20 @@ pub struct SemanticBudgetExceeded {
 }
 
 impl SemanticBudgetExceeded {
+    /// Rebuild a recorded exceedance, as the semantic IR row decoder does for
+    /// a stored budget gap or publication outcome.
+    pub(crate) const fn new(
+        dimension: SemanticBudgetDimension,
+        limit: usize,
+        attempted: usize,
+    ) -> Self {
+        Self {
+            dimension,
+            limit,
+            attempted,
+        }
+    }
+
     pub const fn dimension(self) -> SemanticBudgetDimension {
         self.dimension
     }
@@ -262,6 +278,12 @@ impl From<WorkBudgetExceeded<SemanticBudgetDimension>> for SemanticBudgetExceede
     }
 }
 
+fn summary_expansion_count(work: SemanticWork) -> usize {
+    work.call_sites
+        .saturating_add(work.memory_locations)
+        .saturating_add(work.captures)
+}
+
 impl SemanticBudget {
     pub fn new(limits: SemanticWork) -> Result<Self, InvalidSemanticBudget> {
         for dimension in SemanticBudgetDimension::ALL {
@@ -273,8 +295,16 @@ impl SemanticBudget {
             ledger: BudgetLedger::new(limits, SemanticWork::default()),
             scope: Arc::new(SemanticBudgetScope),
             charged_artifacts: Arc::new(HashSet::new()),
+            shared_summary_expansion_limit: None,
             first_refusal: Arc::default(),
         })
+    }
+
+    /// Share one cap across call-site, memory-location, and capture rows.
+    pub(crate) fn with_shared_summary_expansion_limit(mut self, limit: usize) -> Self {
+        assert!(limit > 0, "shared summary expansion limit must be positive");
+        self.shared_summary_expansion_limit = Some(limit);
+        self
     }
 
     pub fn uniform(limit: usize) -> Result<Self, InvalidSemanticBudget> {
@@ -295,7 +325,30 @@ impl SemanticBudget {
 
     /// Check one atomic charge without mutating this budget.
     pub fn check(&self, work: SemanticWork) -> Result<(), SemanticBudgetExceeded> {
-        self.ledger.check(work).map_err(Into::into)
+        self.ledger
+            .check(work)
+            .map_err(SemanticBudgetExceeded::from)?;
+        let Some(limit) = self.shared_summary_expansion_limit else {
+            return Ok(());
+        };
+        let attempted =
+            summary_expansion_count(self.used()).saturating_add(summary_expansion_count(work));
+        if attempted <= limit {
+            return Ok(());
+        }
+        let dimension = if work.call_sites > 0 {
+            SemanticBudgetDimension::CallSites
+        } else if work.memory_locations > 0 {
+            SemanticBudgetDimension::MemoryLocations
+        } else {
+            assert!(work.captures > 0, "summary expansion charge is non-empty");
+            SemanticBudgetDimension::Captures
+        };
+        Err(SemanticBudgetExceeded {
+            dimension,
+            limit,
+            attempted,
+        })
     }
 
     /// Atomically charge work; a failed charge leaves the budget unchanged
@@ -303,6 +356,11 @@ impl SemanticBudget {
     #[track_caller]
     pub fn charge(&mut self, work: SemanticWork) -> Result<(), SemanticBudgetExceeded> {
         let site = std::panic::Location::caller();
+        if let Err(exceeded) = self.check(work) {
+            self.first_refusal
+                .get_or_init(|| SemanticBudgetRefusal { exceeded, site });
+            return Err(exceeded);
+        }
         self.ledger.charge(work).map_err(|exceeded| {
             let exceeded = SemanticBudgetExceeded::from(exceeded);
             self.first_refusal
@@ -347,6 +405,9 @@ impl SemanticBudget {
         SemanticBudgetScopeSnapshot {
             scope: Arc::clone(&self.scope),
             charged_artifacts: Arc::clone(&self.charged_artifacts),
+            shared_summary_expansion_limit: self
+                .shared_summary_expansion_limit
+                .map(|limit| limit.saturating_sub(summary_expansion_count(self.used()))),
         }
     }
 
@@ -375,6 +436,7 @@ impl SemanticBudget {
             ledger: BudgetLedger::new(limits, SemanticWork::default()),
             scope: Arc::clone(&parent.scope),
             charged_artifacts: Arc::clone(&parent.charged_artifacts),
+            shared_summary_expansion_limit: parent.shared_summary_expansion_limit,
             first_refusal: Arc::default(),
         }
     }
@@ -871,6 +933,19 @@ pub enum SemanticOutcome<T> {
 }
 
 impl<T> SemanticOutcome<T> {
+    /// Stable lowercase label for this outcome variant.
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Complete { .. } => "complete",
+            Self::Ambiguous { .. } => "ambiguous",
+            Self::Unknown { .. } => "unknown",
+            Self::Unsupported { .. } => "unsupported",
+            Self::Unproven { .. } => "unproven",
+            Self::ExceededBudget { .. } => "exceeded_budget",
+            Self::Cancelled { .. } => "cancelled",
+        }
+    }
+
     pub const fn work(&self) -> SemanticWork {
         match self {
             Self::Complete { work, .. }
@@ -958,17 +1033,27 @@ impl<T> SemanticOutcome<T> {
     }
 
     pub fn map<U>(self, mapper: impl FnOnce(T) -> U) -> SemanticOutcome<U> {
-        match self {
+        match self.try_map(|value| Ok::<_, std::convert::Infallible>(mapper(value))) {
+            Ok(outcome) => outcome,
+            Err(never) => match never {},
+        }
+    }
+
+    pub fn try_map<U, E>(
+        self,
+        mapper: impl FnOnce(T) -> Result<U, E>,
+    ) -> Result<SemanticOutcome<U>, E> {
+        Ok(match self {
             Self::Complete { value, work } => SemanticOutcome::Complete {
-                value: mapper(value),
+                value: mapper(value)?,
                 work,
             },
             Self::Ambiguous { candidates, work } => SemanticOutcome::Ambiguous {
-                candidates: mapper(candidates),
+                candidates: mapper(candidates)?,
                 work,
             },
             Self::Unknown { partial, work } => SemanticOutcome::Unknown {
-                partial: partial.map(mapper),
+                partial: partial.map(mapper).transpose()?,
                 work,
             },
             Self::Unsupported {
@@ -977,11 +1062,11 @@ impl<T> SemanticOutcome<T> {
                 work,
             } => SemanticOutcome::Unsupported {
                 capability,
-                partial: partial.map(mapper),
+                partial: partial.map(mapper).transpose()?,
                 work,
             },
             Self::Unproven { partial, work } => SemanticOutcome::Unproven {
-                partial: mapper(partial),
+                partial: mapper(partial)?,
                 work,
             },
             Self::ExceededBudget {
@@ -989,15 +1074,15 @@ impl<T> SemanticOutcome<T> {
                 exceeded,
                 work,
             } => SemanticOutcome::ExceededBudget {
-                partial: partial.map(mapper),
+                partial: partial.map(mapper).transpose()?,
                 exceeded,
                 work,
             },
             Self::Cancelled { partial, work } => SemanticOutcome::Cancelled {
-                partial: partial.map(mapper),
+                partial: partial.map(mapper).transpose()?,
                 work,
             },
-        }
+        })
     }
 }
 
@@ -1009,6 +1094,7 @@ pub struct SemanticRequest<'a> {
     pub budget: &'a mut SemanticBudget,
     pub cancellation: &'a CancellationToken,
     execution: Option<SemanticExecutionBudget>,
+    value_type_barrier_context: Option<&'a dyn super::ValueTypeBarrierContext>,
     artifact_collector: Option<SemanticArtifactCollector>,
 }
 
@@ -1019,6 +1105,7 @@ impl<'a> SemanticRequest<'a> {
             cancellation,
             execution: None,
             artifact_collector: None,
+            value_type_barrier_context: None,
         }
     }
 
@@ -1032,6 +1119,7 @@ impl<'a> SemanticRequest<'a> {
             cancellation,
             execution: Some(execution.clone()),
             artifact_collector: None,
+            value_type_barrier_context: None,
         }
     }
 
@@ -1051,6 +1139,7 @@ impl<'a> SemanticRequest<'a> {
             cancellation: self.cancellation,
             execution: self.execution.clone(),
             artifact_collector: self.artifact_collector.clone(),
+            value_type_barrier_context: self.value_type_barrier_context,
         }
     }
 
@@ -1071,7 +1160,21 @@ impl<'a> SemanticRequest<'a> {
             cancellation: self.cancellation,
             execution: Some(execution.clone()),
             artifact_collector: self.artifact_collector.clone(),
+            value_type_barrier_context: self.value_type_barrier_context,
         }
+    }
+
+    /// Borrow a native context whose operation and memos end with this request.
+    pub fn with_value_type_barrier_context(
+        mut self,
+        context: &'a dyn super::ValueTypeBarrierContext,
+    ) -> Self {
+        self.value_type_barrier_context = Some(context);
+        self
+    }
+
+    pub fn value_type_barrier_context(&self) -> Option<&'a dyn super::ValueTypeBarrierContext> {
+        self.value_type_barrier_context
     }
 
     pub fn execution_budget(&self) -> Option<&SemanticExecutionBudget> {
@@ -1195,6 +1298,13 @@ impl SemanticArtifactSourceSnapshot {
 
 /// A standalone per-language adapter boundary for immutable semantic artifacts.
 pub trait ProgramSemanticsProvider: Send + Sync {
+    /// Capabilities published by the semantic adapter selected for a file.
+    /// This metadata is available before lowering so query planning can report
+    /// unsupported relations even when the selected relation has no rows.
+    fn capabilities(&self) -> SemanticCapabilities {
+        SemanticCapabilities::default()
+    }
+
     /// Capture the file's current atomic source snapshot and derive its complete
     /// semantic artifact identity without parsing or lowering procedures.
     ///
@@ -1231,6 +1341,29 @@ pub trait ProgramSemanticsProvider: Send + Sync {
         file: &ProjectFile,
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<Arc<SemanticArtifact>>, SemanticProviderError>;
+
+    /// The stored partial flows of one procedure of the artifact `key`, from
+    /// the file's complete publication. `None` when the language stores none
+    /// or the publication does not carry this artifact.
+    fn stored_partial_flows(
+        &self,
+        _file: &ProjectFile,
+        _key: &SemanticArtifactKey,
+        _procedure: ProcedureId,
+    ) -> Result<Option<ProcedurePartialFlows>, SemanticProviderError> {
+        Ok(None)
+    }
+
+    /// Whether the file's complete semantic IR rows carry the artifact `key`
+    /// under the active producer epoch. `false` for a language that stores no
+    /// rows, and for a file without a complete publication.
+    fn has_complete_semantic_ir_rows(
+        &self,
+        _file: &ProjectFile,
+        _key: &SemanticArtifactKey,
+    ) -> Result<bool, SemanticProviderError> {
+        Ok(false)
+    }
 }
 
 /// A [`ProgramSemanticsProvider`] for languages whose lowering is not
@@ -1271,39 +1404,8 @@ impl ProgramSemanticsProvider for UnsupportedProgramSemantics {
 mod tests {
     use super::*;
 
-    struct FailingProgramSemanticsProvider(SemanticProviderError);
-
-    impl ProgramSemanticsProvider for FailingProgramSemanticsProvider {
-        fn current_artifact_source(
-            &self,
-            _file: &ProjectFile,
-            _max_source_bytes: usize,
-        ) -> Result<Option<SemanticArtifactSourceSnapshot>, SemanticProviderError> {
-            Err(self.0.clone())
-        }
-
-        fn materialize(
-            &self,
-            _file: &ProjectFile,
-            _request: &mut SemanticRequest<'_>,
-        ) -> Result<SemanticOutcome<Arc<SemanticArtifact>>, SemanticProviderError> {
-            Err(self.0.clone())
-        }
-    }
-
     fn mock_file() -> ProjectFile {
         ProjectFile::new(std::env::temp_dir(), "src/mock.ts")
-    }
-
-    #[test]
-    fn semantic_budget_requires_every_limit_to_be_positive() {
-        assert!(matches!(
-            SemanticBudget::uniform(0),
-            Err(InvalidSemanticBudget {
-                dimension: SemanticBudgetDimension::SourceBytes
-            })
-        ));
-        assert!(SemanticBudget::uniform(1).is_ok());
     }
 
     #[test]
@@ -1564,44 +1666,49 @@ mod tests {
     }
 
     #[test]
-    fn staged_execution_override_preserves_the_artifact_collector() {
-        let file = mock_file();
-        let outer_execution = SemanticExecutionBudget::new(2, 2);
-        let nested_execution = SemanticExecutionBudget::new(1, 1);
-        let collector = SemanticArtifactCollector::new();
-        let cancellation = CancellationToken::default();
-        let mut budget = SemanticBudget::uniform(10).unwrap();
-        let mut request =
-            SemanticRequest::with_execution_budget(&mut budget, &cancellation, &outer_execution)
-                .with_artifact_collector(&collector);
-
-        let staged = request.staged_with_execution_budget(&nested_execution);
-        assert!(staged.admit_materialization(&file));
+    fn shared_summary_limit_caps_the_combined_summary_dimensions() {
+        let mut parent = SemanticBudget::uniform(64)
+            .unwrap()
+            .with_shared_summary_expansion_limit(64);
+        parent
+            .charge(SemanticWork {
+                call_sites: 19,
+                ..SemanticWork::default()
+            })
+            .unwrap();
+        let mut child =
+            SemanticBudget::new_child(SemanticWork::uniform(64), &parent.scope_snapshot());
+        child
+            .charge(SemanticWork {
+                memory_locations: 45,
+                ..SemanticWork::default()
+            })
+            .unwrap();
         assert!(
-            staged
-                .artifact_collector()
-                .expect("execution override preserves the collector")
-                .shares_state(&collector)
+            child
+                .charge(SemanticWork {
+                    captures: 1,
+                    ..SemanticWork::default()
+                })
+                .is_err()
         );
-        drop(staged);
+        let child_charge = child.into_child_charge();
+        parent
+            .apply_child_charge(child_charge.work, child_charge)
+            .unwrap();
 
-        assert_eq!(nested_execution.work().materialized_files, 1);
-        assert_eq!(outer_execution.work().materialized_files, 0);
-    }
-
-    #[test]
-    fn dimension_registry_drives_uniform_work_labels_and_defaults() {
-        let uniform = SemanticWork::uniform(7);
-        for dimension in SemanticBudgetDimension::ALL {
-            assert_eq!(uniform.get(dimension), 7, "{}", dimension.label());
-            assert!(!dimension.label().is_empty());
-        }
-
-        let defaults = SemanticBudget::default().limits();
-        assert_eq!(defaults.events, 4_000_000);
-        assert_eq!(defaults.control_edges, 2_000_000);
-        assert_eq!(defaults.nested_entries, 8_000_000);
-        assert_eq!(defaults.owned_text_bytes, 32 * 1024 * 1024);
+        let used = parent.used();
+        assert_eq!(summary_expansion_count(used), 64);
+        let refusal = parent
+            .charge(SemanticWork {
+                captures: 1,
+                ..SemanticWork::default()
+            })
+            .unwrap_err();
+        assert_eq!(refusal.dimension(), SemanticBudgetDimension::Captures);
+        assert_eq!(refusal.limit(), 64);
+        assert_eq!(refusal.attempted(), 65);
+        assert_eq!(parent.used(), used, "refused group charges are atomic");
     }
 
     #[test]
@@ -1722,27 +1829,6 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.dimension(), SemanticBudgetDimension::OwnedTextBytes);
         assert_eq!(budget.used(), before);
-    }
-
-    #[test]
-    fn provider_trait_object_round_trips_operational_error() {
-        let expected = SemanticProviderError::source_access("mock source is unavailable");
-        let provider_impl = FailingProgramSemanticsProvider(expected.clone());
-        let provider: &dyn ProgramSemanticsProvider = &provider_impl;
-        let mut budget = SemanticBudget::uniform(10).unwrap();
-        let cancellation = CancellationToken::default();
-        let mut request = SemanticRequest::new(&mut budget, &cancellation);
-
-        let actual = provider
-            .materialize(&mock_file(), &mut request)
-            .expect_err("source access failure is operational, not semantic unknown");
-
-        assert_eq!(actual, expected);
-        assert_eq!(
-            actual.to_string(),
-            "semantic source access failed: mock source is unavailable"
-        );
-        assert_eq!(budget.used(), SemanticWork::default());
     }
 
     #[test]

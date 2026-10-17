@@ -112,22 +112,14 @@ jobs:
             target/release/bifrost-semantic-pack
           key: bifrost-policy-binaries-v1-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ steps.compiled-inputs.outputs.identity }}
 
-      - name: Generate and install pinned Python semantic pack
-        env:
-          BIFROST_SEMANTIC_PACK_BIN: ${{ github.workspace }}/target/release/bifrost-semantic-pack
-          CACHE_ROOT: ${{ runner.temp }}/bifrost-python-semantic-pack-cache
-        run: |
-          bash scripts/public/build-pinned-python-semantic-packs.sh \
-            "${RUNNER_TEMP}/bifrost-semantic-packs-python" \
-            "${RUNNER_TEMP}" \
-            "$CACHE_ROOT"
-
-      - name: Scan with the built-in pack
+      - name: Scan with pinned external rules and their exact semantic dependency
         uses: ./.github/actions/policy-scan
-        env:
-          BIFROST_SEMANTIC_PACK_CACHE_ROOT: ${{ runner.temp }}/bifrost-python-semantic-pack-cache
         with:
           version: local
+          # Content qualification is owned by bifrost-packs. This historical
+          # immutable pin fails explicitly until a qualified compatible tuple
+          # is selected; engine publication does not qualify external content.
+          packs-source: '{"repository":"https://github.com/BrokkAi/bifrost-packs","rules_version":"0.1.1","manifest_sha256":"6f188826fe5b4918967100d8c0816c8b230a13d4a47300497d2294390a112388","semantic_manifest_sha256":"f28356cb17e85d84de3432de837f2d045e554e6d3d8d1f08018015e4960446d8"}'
           policy-timings: true
           artifact-name: bifrost-code-smells-report
           category: bifrost-code-smells

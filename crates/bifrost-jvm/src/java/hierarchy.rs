@@ -443,27 +443,18 @@ where
         }
     }
 
-    let mut seen = vec![false; candidates.len()];
-    let mut stack = external_descendants;
-    while let Some(index) = stack.pop() {
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return JavaExternalRootHierarchyAnswer::stopped(
-                JavaExternalRootHierarchyStatus::Cancelled,
-                visited,
-            );
-        }
-        if std::mem::replace(&mut seen[index], true) {
-            continue;
-        }
-        stack.extend(workspace_edges[index].iter().copied());
-    }
-    let mut descendants = seen
-        .into_iter()
-        .enumerate()
-        .filter(|(_, seen)| *seen)
-        .map(|(index, _)| candidates[index].declaration().clone())
-        .collect::<Vec<_>>();
-    descendants.sort();
+    let Some(descendants) = crate::hierarchy_descendants_from_edges(
+        &candidates,
+        &workspace_edges,
+        external_descendants,
+        cancellation,
+        JavaHierarchyFact::declaration,
+    ) else {
+        return JavaExternalRootHierarchyAnswer::stopped(
+            JavaExternalRootHierarchyStatus::Cancelled,
+            visited,
+        );
+    };
     JavaExternalRootHierarchyAnswer {
         status: JavaExternalRootHierarchyStatus::Complete,
         descendants,
@@ -506,12 +497,14 @@ fn java_definition_sort_key(
     candidate: &CodeUnit,
     range: Option<&Range>,
 ) -> (usize, String, String, String, String) {
+    let (source, fq_name, signature, kind) =
+        brokk_bifrost_core::analyzer::code_unit_index::definition_tie_break_key(candidate);
     (
         range.map_or(usize::MAX, |range| range.start_byte),
-        candidate.source().to_string().to_ascii_lowercase(),
-        candidate.fq_name().to_ascii_lowercase(),
-        candidate.signature().unwrap_or("").to_ascii_lowercase(),
-        format!("{:?}", candidate.kind()),
+        source,
+        fq_name,
+        signature,
+        kind,
     )
 }
 
@@ -678,19 +671,13 @@ fn same_source_hierarchy_identity<F: JavaHierarchyFact>(
     types_by_fq_name: &HashMap<String, JavaHierarchyTypeBucket>,
 ) -> usize {
     let bucket = &types_by_fq_name[&candidates[resolved].declaration().fq_name()];
-    let mut same_source = bucket
-        .declarations
-        .iter()
-        .copied()
-        .filter(|index| candidates[*index].declaration().source() == descendant.source());
-    let Some(exact) = same_source.next() else {
-        return resolved;
-    };
-    if same_source.next().is_none() {
-        exact
-    } else {
-        resolved
-    }
+    crate::same_source_hierarchy_declaration(
+        resolved,
+        &bucket.declarations,
+        descendant,
+        candidates,
+        JavaHierarchyFact::declaration,
+    )
 }
 
 #[cfg(test)]

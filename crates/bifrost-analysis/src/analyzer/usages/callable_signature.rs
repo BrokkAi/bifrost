@@ -471,17 +471,6 @@ mod tests {
             .collect()
     }
 
-    /// A declaration with no persisted metadata still produces exactly one
-    /// row, and that row says the signature is unrecorded rather than empty.
-    #[test]
-    fn missing_metadata_still_produces_one_mandatory_row() {
-        let reports = callable_signature_reports("decl", &unit("Widget", "run"), &[]);
-        assert_eq!(reports.len(), 1);
-        assert_eq!(reports[0].signature.coverage, SignatureCoverage::Unrecorded);
-        assert_eq!(reports[0].signature.arity, None);
-        assert!(reports[0].parameters.is_empty());
-    }
-
     /// An overload set shares one declaration identity and separates into one
     /// row per persisted entry, each with its own parameter rows. Equal total
     /// arity with different parameter type spellings is exactly the pair a
@@ -516,38 +505,6 @@ mod tests {
                 .map(|parameter| parameter.declared_type.clone())
                 .collect::<Vec<_>>(),
             vec![Some("String".to_owned()), Some("int".to_owned())]
-        );
-    }
-
-    /// A default argument makes `required < total`, and the parameter beyond
-    /// the required count is optional.
-    #[test]
-    fn defaults_produce_an_arity_range_with_optional_parameters() {
-        let metadata = SignatureMetadata::new("void f(int a, int b = 1)", parameters(&["a", "b"]))
-            .with_callable_arity(CallableArity::new(1, 2, false));
-        let reports = callable_signature_reports("decl", &unit("Widget", "f"), &[metadata]);
-        let signature = &reports[0].signature;
-        assert_eq!(signature.coverage, SignatureCoverage::Exact);
-        assert_eq!(signature.arity.map(CallableArity::required), Some(1));
-        assert_eq!(signature.arity.map(CallableArity::total), Some(2));
-        assert_eq!(reports[0].parameters[0].optional, Some(false));
-        assert_eq!(reports[0].parameters[1].optional, Some(true));
-        assert_eq!(reports[0].parameters[1].repeated, Some(false));
-    }
-
-    /// A variadic signature marks the trailing parameter repeated, and only
-    /// the trailing one.
-    #[test]
-    fn variadics_mark_only_the_trailing_parameter_repeated() {
-        let metadata =
-            SignatureMetadata::new("void f(int a, int... rest)", parameters(&["a", "rest"]))
-                .with_callable_arity(CallableArity::new(1, 2, true));
-        let reports = callable_signature_reports("decl", &unit("Widget", "f"), &[metadata]);
-        assert_eq!(reports[0].parameters[0].repeated, Some(false));
-        assert_eq!(reports[0].parameters[1].repeated, Some(true));
-        assert_eq!(
-            reports[0].signature.arity.map(CallableArity::is_repeated),
-            Some(true)
         );
     }
 
@@ -627,8 +584,43 @@ mod tests {
         );
     }
 
-    /// Row identities are deterministic across two derivations of the same
-    /// input, which is what makes a warm run and a cold run comparable.
+    #[test]
+    fn missing_metadata_still_produces_one_mandatory_row() {
+        let reports = callable_signature_reports("decl", &unit("Widget", "run"), &[]);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].signature.coverage, SignatureCoverage::Unrecorded);
+        assert_eq!(reports[0].signature.arity, None);
+        assert!(reports[0].parameters.is_empty());
+    }
+
+    #[test]
+    fn defaults_produce_an_arity_range_with_optional_parameters() {
+        let metadata = SignatureMetadata::new("void f(int a, int b = 1)", parameters(&["a", "b"]))
+            .with_callable_arity(CallableArity::new(1, 2, false));
+        let reports = callable_signature_reports("decl", &unit("Widget", "f"), &[metadata]);
+        let signature = &reports[0].signature;
+        assert_eq!(signature.coverage, SignatureCoverage::Exact);
+        assert_eq!(signature.arity.map(CallableArity::required), Some(1));
+        assert_eq!(signature.arity.map(CallableArity::total), Some(2));
+        assert_eq!(reports[0].parameters[0].optional, Some(false));
+        assert_eq!(reports[0].parameters[1].optional, Some(true));
+        assert_eq!(reports[0].parameters[1].repeated, Some(false));
+    }
+
+    #[test]
+    fn variadics_mark_only_the_trailing_parameter_repeated() {
+        let metadata =
+            SignatureMetadata::new("void f(int a, int... rest)", parameters(&["a", "rest"]))
+                .with_callable_arity(CallableArity::new(1, 2, true));
+        let reports = callable_signature_reports("decl", &unit("Widget", "f"), &[metadata]);
+        assert_eq!(reports[0].parameters[0].repeated, Some(false));
+        assert_eq!(reports[0].parameters[1].repeated, Some(true));
+        assert_eq!(
+            reports[0].signature.arity.map(CallableArity::is_repeated),
+            Some(true)
+        );
+    }
+
     #[test]
     fn row_identities_are_deterministic() {
         let metadata = SignatureMetadata::new("void f(int a)", parameters(&["a"]))

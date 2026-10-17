@@ -2,6 +2,24 @@ use super::*;
 use crate::analyzer::semantic::{SemanticBudgetDimension, SemanticWork};
 use schemars::JsonSchema;
 
+macro_rules! saturating_add_work {
+    ($left:ident, $right:ident; [$($field:ident),* $(,)?]; [$($flag:ident),* $(,)?]) => {
+        Self {
+            $($field: $left.$field.saturating_add($right.$field),)*
+            $($flag: $left.$flag || $right.$flag,)*
+        }
+    };
+}
+
+macro_rules! saturating_sub_work {
+    ($left:ident, $right:ident; [$($field:ident),* $(,)?]; [$($flag:ident),* $(,)?]) => {
+        Self {
+            $($field: $left.$field.saturating_sub($right.$field),)*
+            $($flag: $left.$flag && !$right.$flag,)*
+        }
+    };
+}
+
 /// Declare one labeled CodeQuery diagnostic vocabulary once.
 ///
 /// The variant list, each variant's wire label, the complete label inventory,
@@ -44,7 +62,9 @@ code_query_labeled_enum! {
         Cancelled => "cancelled",
         UnsupportedStructuralFeature => "unsupported_structural_feature",
         MissingStructuralAdapter => "missing_structural_adapter",
+        RecoveredSyntaxIncomplete => "recovered_syntax_incomplete",
         UnsupportedImportAnalysis => "unsupported_import_analysis",
+        DynamicImportTarget => "dynamic_import_target",
         SemanticResultsOmitted => "semantic_results_omitted",
         SemanticWorkspaceRequired => "semantic_workspace_required",
         NoEnclosingProcedure => "no_enclosing_procedure",
@@ -114,6 +134,7 @@ code_query_labeled_enum! {
         EnvironmentDerivationIncomplete => "environment_derivation_incomplete",
         EnvironmentRowBudgetExhausted => "environment_row_budget_exhausted",
         ResolutionTraceIncomplete => "resolution_trace_incomplete",
+        PythonHierarchyDerivationIncomplete => "python_hierarchy_derivation_incomplete",
         EdgeAxisUnsupported => "edge_axis_unsupported",
         EdgeDerivationIncomplete => "edge_derivation_incomplete",
         FlowStateAxisUnsupported => "flow_state_axis_unsupported",
@@ -125,6 +146,7 @@ code_query_labeled_enum! {
         LoopRelationDerivationIncomplete => "loop_relation_derivation_incomplete",
         FailureHandlerDerivationIncomplete => "failure_handler_derivation_incomplete",
         StatementReachabilityDerivationIncomplete => "statement_reachability_derivation_incomplete",
+        PendingCleanupFlowDerivationIncomplete => "pending_cleanup_flow_derivation_incomplete",
         ControlRelationExitPartitionPartial => "control_relation_exit_partition_partial",
         TopologyDerivationIncomplete => "topology_derivation_incomplete",
         TopologyOwnershipAmbiguous => "topology_ownership_ambiguous",
@@ -136,6 +158,10 @@ code_query_labeled_enum! {
         EffectBudgetExhausted => "effect_budget_exhausted",
         CallShapeCoverageIncomplete => "call_shape_coverage_incomplete",
         JsxProjectionIncomplete => "jsx_projection_incomplete",
+        CrossDomainBindingUnproven => "cross_domain_binding_unproven",
+        CrossDomainKeyUnsupported => "cross_domain_key_unsupported",
+        CrossDomainDocumentIncomplete => "cross_domain_document_incomplete",
+        CrossDomainCorrelationAmbiguous => "cross_domain_correlation_ambiguous",
         ResultLimitReached => "result_limit_reached",
         BroadQuery => "broad_query",
     }
@@ -152,7 +178,7 @@ code_query_labeled_enum! {
     }
 }
 
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[derive(Clone, Serialize, JsonSchema)]
 pub struct CodeQueryDiagnostic {
     pub code: CodeQueryDiagnosticCode,
     pub impact: CodeQueryDiagnosticImpact,
@@ -161,6 +187,9 @@ pub struct CodeQueryDiagnostic {
     pub branch: Vec<usize>,
     pub language: &'static str,
     pub message: String,
+    /// Exact source site responsible for this diagnostic, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<CodeQuerySourceSpan>,
     /// Every root or file whose exhausted work produced this diagnostic.
     ///
     /// A budget diagnostic that says only that some budget ran out cannot be
@@ -170,6 +199,48 @@ pub struct CodeQueryDiagnostic {
     /// every diagnostic that is not about exhausted work.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exhausted_roots: Vec<CodeQueryExhaustedRoot>,
+    /// The one workspace-relative file every row this diagnostic withheld
+    /// lies in, when the producer knows it (#5451).
+    ///
+    /// An incomplete diagnostic means its step left rows out or open. When
+    /// this is set, every such row is a row of this file, spelled as the
+    /// row's own `path`, so a reader may confine the gap to it. The executor
+    /// clears it once a later operator is not row-local, because that
+    /// operator's rows are no longer the ones withheld. Absent means the
+    /// withheld rows may lie anywhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withheld_rows_path: Option<String>,
+}
+
+impl std::fmt::Debug for CodeQueryDiagnostic {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut diagnostic = formatter.debug_struct("CodeQueryDiagnostic");
+        diagnostic
+            .field("code", &self.code)
+            .field("impact", &self.impact)
+            .field("branch", &self.branch)
+            .field("language", &self.language)
+            .field("message", &self.message);
+        // Selector prose embeds Debug output. Keep absent optional source
+        // out of that prose while retaining complete attributed source spans.
+        if self.source.is_some() {
+            diagnostic.field("source", &self.source);
+        }
+        diagnostic.field("exhausted_roots", &self.exhausted_roots);
+        if self.withheld_rows_path.is_some() {
+            diagnostic.field("withheld_rows_path", &self.withheld_rows_path);
+        }
+        diagnostic.finish()
+    }
+}
+
+/// An exact workspace-relative source span shared by query diagnostics and evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+pub struct CodeQuerySourceSpan {
+    pub path: String,
+    pub range: CodeQueryRange,
+    pub start_byte: usize,
+    pub end_byte: usize,
 }
 
 /// One root or file whose work stopped against a named limit.
@@ -232,6 +303,12 @@ impl CodeQueryExhaustedRoot {
     }
 }
 
+/// Prose bound for one diagnostic message that lists entries. A policy report
+/// validates its diagnostic prose against `MAX_REPORT_PROSE_BYTES` (4 KiB) and
+/// drops a longer one, so a rendered list stops short of that. An exhausted-work
+/// message keeps the complete attribution in `exhausted_roots`.
+pub const MAX_DIAGNOSTIC_LIST_MESSAGE_BYTES: usize = 3_584;
+
 /// Render one exhausted-work diagnostic message: the reason, then one line
 /// per attributed entry, bounded by `max_bytes` so a policy report keeps the
 /// prose it validates (`MAX_REPORT_PROSE_BYTES`). Entries the bound cuts stay
@@ -279,7 +356,11 @@ impl<'de> Deserialize<'de> for CodeQueryDiagnostic {
             language: String,
             message: String,
             #[serde(default)]
+            source: Option<CodeQuerySourceSpan>,
+            #[serde(default)]
             exhausted_roots: Vec<CodeQueryExhaustedRoot>,
+            #[serde(default)]
+            withheld_rows_path: Option<String>,
         }
 
         let wire = Wire::deserialize(deserializer)?;
@@ -295,7 +376,9 @@ impl<'de> Deserialize<'de> for CodeQueryDiagnostic {
             branch: wire.branch,
             language,
             message: wire.message,
+            source: wire.source,
             exhausted_roots: wire.exhausted_roots,
+            withheld_rows_path: wire.withheld_rows_path,
         })
     }
 }
@@ -704,75 +787,13 @@ pub struct CodeQuerySemanticWork {
 
 impl CodeQuerySemanticWork {
     pub(crate) const fn saturating_add(self, other: Self) -> Self {
-        Self {
-            materialization_attempts: self
-                .materialization_attempts
-                .saturating_add(other.materialization_attempts),
-            unique_materialized_files: self
-                .unique_materialized_files
-                .saturating_add(other.unique_materialized_files),
-            request_cache_hits: self
-                .request_cache_hits
-                .saturating_add(other.request_cache_hits),
-            source_bytes: self.source_bytes.saturating_add(other.source_bytes),
-            procedures: self.procedures.saturating_add(other.procedures),
-            blocks: self.blocks.saturating_add(other.blocks),
-            program_points: self.program_points.saturating_add(other.program_points),
-            values: self.values.saturating_add(other.values),
-            allocations: self.allocations.saturating_add(other.allocations),
-            call_sites: self.call_sites.saturating_add(other.call_sites),
-            memory_locations: self.memory_locations.saturating_add(other.memory_locations),
-            captures: self.captures.saturating_add(other.captures),
-            source_mappings: self.source_mappings.saturating_add(other.source_mappings),
-            evidence: self.evidence.saturating_add(other.evidence),
-            gaps: self.gaps.saturating_add(other.gaps),
-            events: self.events.saturating_add(other.events),
-            control_edges: self.control_edges.saturating_add(other.control_edges),
-            nested_entries: self.nested_entries.saturating_add(other.nested_entries),
-            retained_bytes: self.retained_bytes.saturating_add(other.retained_bytes),
-            traversal_steps: self.traversal_steps.saturating_add(other.traversal_steps),
-            budget_exhausted: self.budget_exhausted || other.budget_exhausted,
-            typestate: self.typestate.saturating_add(other.typestate),
-            value_flow: self.value_flow.saturating_add(other.value_flow),
-            type_flow: self.type_flow.saturating_add(other.type_flow),
-        }
+        let left = self;
+        saturating_add_work!(left, other; [materialization_attempts, unique_materialized_files, request_cache_hits, source_bytes, procedures, blocks, program_points, values, allocations, call_sites, memory_locations, captures, source_mappings, evidence, gaps, events, control_edges, nested_entries, retained_bytes, traversal_steps, typestate, value_flow, type_flow]; [budget_exhausted])
     }
 
     pub(crate) const fn saturating_sub(self, earlier: Self) -> Self {
-        Self {
-            materialization_attempts: self
-                .materialization_attempts
-                .saturating_sub(earlier.materialization_attempts),
-            unique_materialized_files: self
-                .unique_materialized_files
-                .saturating_sub(earlier.unique_materialized_files),
-            request_cache_hits: self
-                .request_cache_hits
-                .saturating_sub(earlier.request_cache_hits),
-            source_bytes: self.source_bytes.saturating_sub(earlier.source_bytes),
-            procedures: self.procedures.saturating_sub(earlier.procedures),
-            blocks: self.blocks.saturating_sub(earlier.blocks),
-            program_points: self.program_points.saturating_sub(earlier.program_points),
-            values: self.values.saturating_sub(earlier.values),
-            allocations: self.allocations.saturating_sub(earlier.allocations),
-            call_sites: self.call_sites.saturating_sub(earlier.call_sites),
-            memory_locations: self
-                .memory_locations
-                .saturating_sub(earlier.memory_locations),
-            captures: self.captures.saturating_sub(earlier.captures),
-            source_mappings: self.source_mappings.saturating_sub(earlier.source_mappings),
-            evidence: self.evidence.saturating_sub(earlier.evidence),
-            gaps: self.gaps.saturating_sub(earlier.gaps),
-            events: self.events.saturating_sub(earlier.events),
-            control_edges: self.control_edges.saturating_sub(earlier.control_edges),
-            nested_entries: self.nested_entries.saturating_sub(earlier.nested_entries),
-            retained_bytes: self.retained_bytes.saturating_sub(earlier.retained_bytes),
-            traversal_steps: self.traversal_steps.saturating_sub(earlier.traversal_steps),
-            budget_exhausted: self.budget_exhausted && !earlier.budget_exhausted,
-            typestate: self.typestate.saturating_sub(earlier.typestate),
-            value_flow: self.value_flow.saturating_sub(earlier.value_flow),
-            type_flow: self.type_flow.saturating_sub(earlier.type_flow),
-        }
+        let left = self;
+        saturating_sub_work!(left, earlier; [materialization_attempts, unique_materialized_files, request_cache_hits, source_bytes, procedures, blocks, program_points, values, allocations, call_sites, memory_locations, captures, source_mappings, evidence, gaps, events, control_edges, nested_entries, retained_bytes, traversal_steps, typestate, value_flow, type_flow]; [budget_exhausted])
     }
 }
 
@@ -865,40 +886,8 @@ impl CodeQueryTypestateWork {
     }
 
     pub(crate) const fn saturating_add(self, other: Self) -> Self {
-        Self {
-            solves: self.solves.saturating_add(other.solves),
-            cache_hits: self.cache_hits.saturating_add(other.cache_hits),
-            summary_hits: self.summary_hits.saturating_add(other.summary_hits),
-            summary_misses: self.summary_misses.saturating_add(other.summary_misses),
-            summary_rejections: self
-                .summary_rejections
-                .saturating_add(other.summary_rejections),
-            summary_evictions: self
-                .summary_evictions
-                .saturating_add(other.summary_evictions),
-            summary_recomputations: self
-                .summary_recomputations
-                .saturating_add(other.summary_recomputations),
-            reached_rows: self.reached_rows.saturating_add(other.reached_rows),
-            findings: self.findings.saturating_add(other.findings),
-            omitted_findings: self.omitted_findings.saturating_add(other.omitted_findings),
-            witnesses: self.witnesses.saturating_add(other.witnesses),
-            omitted_witnesses: self
-                .omitted_witnesses
-                .saturating_add(other.omitted_witnesses),
-            witness_steps: self.witness_steps.saturating_add(other.witness_steps),
-            witness_bytes: self.witness_bytes.saturating_add(other.witness_bytes),
-            fixed_point_solves: self
-                .fixed_point_solves
-                .saturating_add(other.fixed_point_solves),
-            cancelled_solves: self.cancelled_solves.saturating_add(other.cancelled_solves),
-            budget_exhausted_solves: self
-                .budget_exhausted_solves
-                .saturating_add(other.budget_exhausted_solves),
-            failed_solves: self.failed_solves.saturating_add(other.failed_solves),
-            finding_budget_exhausted: self.finding_budget_exhausted
-                || other.finding_budget_exhausted,
-        }
+        let left = self;
+        saturating_add_work!(left, other; [solves, cache_hits, summary_hits, summary_misses, summary_rejections, summary_evictions, summary_recomputations, reached_rows, findings, omitted_findings, witnesses, omitted_witnesses, witness_steps, witness_bytes, fixed_point_solves, cancelled_solves, budget_exhausted_solves, failed_solves]; [finding_budget_exhausted])
     }
 }
 
@@ -946,69 +935,13 @@ impl CodeQueryValueFlowWork {
     }
 
     pub(crate) const fn saturating_sub(self, earlier: Self) -> Self {
-        Self {
-            solves: self.solves.saturating_sub(earlier.solves),
-            cache_hits: self.cache_hits.saturating_sub(earlier.cache_hits),
-            reached_rows: self.reached_rows.saturating_sub(earlier.reached_rows),
-            meetings: self.meetings.saturating_sub(earlier.meetings),
-            sink_outcomes: self.sink_outcomes.saturating_sub(earlier.sink_outcomes),
-            omitted_endpoints: self
-                .omitted_endpoints
-                .saturating_sub(earlier.omitted_endpoints),
-            witnesses: self.witnesses.saturating_sub(earlier.witnesses),
-            omitted_witnesses: self
-                .omitted_witnesses
-                .saturating_sub(earlier.omitted_witnesses),
-            witness_expansions: self
-                .witness_expansions
-                .saturating_sub(earlier.witness_expansions),
-            witness_steps: self.witness_steps.saturating_sub(earlier.witness_steps),
-            witness_bytes: self.witness_bytes.saturating_sub(earlier.witness_bytes),
-            fixed_point_solves: self
-                .fixed_point_solves
-                .saturating_sub(earlier.fixed_point_solves),
-            cancelled_solves: self
-                .cancelled_solves
-                .saturating_sub(earlier.cancelled_solves),
-            budget_exhausted_solves: self
-                .budget_exhausted_solves
-                .saturating_sub(earlier.budget_exhausted_solves),
-            failed_solves: self.failed_solves.saturating_sub(earlier.failed_solves),
-            endpoint_truncated: self.endpoint_truncated && !earlier.endpoint_truncated,
-            witness_truncated: self.witness_truncated && !earlier.witness_truncated,
-        }
+        let left = self;
+        saturating_sub_work!(left, earlier; [solves, cache_hits, reached_rows, meetings, sink_outcomes, omitted_endpoints, witnesses, omitted_witnesses, witness_expansions, witness_steps, witness_bytes, fixed_point_solves, cancelled_solves, budget_exhausted_solves, failed_solves]; [endpoint_truncated, witness_truncated])
     }
 
     pub(crate) const fn saturating_add(self, other: Self) -> Self {
-        Self {
-            solves: self.solves.saturating_add(other.solves),
-            cache_hits: self.cache_hits.saturating_add(other.cache_hits),
-            reached_rows: self.reached_rows.saturating_add(other.reached_rows),
-            meetings: self.meetings.saturating_add(other.meetings),
-            sink_outcomes: self.sink_outcomes.saturating_add(other.sink_outcomes),
-            omitted_endpoints: self
-                .omitted_endpoints
-                .saturating_add(other.omitted_endpoints),
-            witnesses: self.witnesses.saturating_add(other.witnesses),
-            omitted_witnesses: self
-                .omitted_witnesses
-                .saturating_add(other.omitted_witnesses),
-            witness_expansions: self
-                .witness_expansions
-                .saturating_add(other.witness_expansions),
-            witness_steps: self.witness_steps.saturating_add(other.witness_steps),
-            witness_bytes: self.witness_bytes.saturating_add(other.witness_bytes),
-            fixed_point_solves: self
-                .fixed_point_solves
-                .saturating_add(other.fixed_point_solves),
-            cancelled_solves: self.cancelled_solves.saturating_add(other.cancelled_solves),
-            budget_exhausted_solves: self
-                .budget_exhausted_solves
-                .saturating_add(other.budget_exhausted_solves),
-            failed_solves: self.failed_solves.saturating_add(other.failed_solves),
-            endpoint_truncated: self.endpoint_truncated || other.endpoint_truncated,
-            witness_truncated: self.witness_truncated || other.witness_truncated,
-        }
+        let left = self;
+        saturating_add_work!(left, other; [solves, cache_hits, reached_rows, meetings, sink_outcomes, omitted_endpoints, witnesses, omitted_witnesses, witness_expansions, witness_steps, witness_bytes, fixed_point_solves, cancelled_solves, budget_exhausted_solves, failed_solves]; [endpoint_truncated, witness_truncated])
     }
 }
 
@@ -1120,183 +1053,13 @@ impl CodeQueryTypeFlowWork {
     }
 
     pub(crate) const fn saturating_sub(self, earlier: Self) -> Self {
-        Self {
-            field_slot_builds: self
-                .field_slot_builds
-                .saturating_sub(earlier.field_slot_builds),
-            field_slot_memory_hits: self
-                .field_slot_memory_hits
-                .saturating_sub(earlier.field_slot_memory_hits),
-            field_slot_persistence_hits: self
-                .field_slot_persistence_hits
-                .saturating_sub(earlier.field_slot_persistence_hits),
-            field_slot_persistence_misses: self
-                .field_slot_persistence_misses
-                .saturating_sub(earlier.field_slot_persistence_misses),
-            field_slot_persistence_rejections: self
-                .field_slot_persistence_rejections
-                .saturating_sub(earlier.field_slot_persistence_rejections),
-            field_slot_publications: self
-                .field_slot_publications
-                .saturating_sub(earlier.field_slot_publications),
-            root_result_persistence_hits: self
-                .root_result_persistence_hits
-                .saturating_sub(earlier.root_result_persistence_hits),
-            root_result_persistence_misses: self
-                .root_result_persistence_misses
-                .saturating_sub(earlier.root_result_persistence_misses),
-            root_result_persistence_rejections: self
-                .root_result_persistence_rejections
-                .saturating_sub(earlier.root_result_persistence_rejections),
-            root_result_store_failures: self
-                .root_result_store_failures
-                .saturating_sub(earlier.root_result_store_failures),
-            root_result_publications: self
-                .root_result_publications
-                .saturating_sub(earlier.root_result_publications),
-            solves: self.solves.saturating_sub(earlier.solves),
-            cache_hits: self.cache_hits.saturating_sub(earlier.cache_hits),
-            snapshot_cache_hits: self
-                .snapshot_cache_hits
-                .saturating_sub(earlier.snapshot_cache_hits),
-            snapshot_cache_misses: self
-                .snapshot_cache_misses
-                .saturating_sub(earlier.snapshot_cache_misses),
-            dispatch_cache_hits: self
-                .dispatch_cache_hits
-                .saturating_sub(earlier.dispatch_cache_hits),
-            dispatch_cache_misses: self
-                .dispatch_cache_misses
-                .saturating_sub(earlier.dispatch_cache_misses),
-            binding_cache_hits: self
-                .binding_cache_hits
-                .saturating_sub(earlier.binding_cache_hits),
-            binding_cache_misses: self
-                .binding_cache_misses
-                .saturating_sub(earlier.binding_cache_misses),
-            summary_cache_hits: self
-                .summary_cache_hits
-                .saturating_sub(earlier.summary_cache_hits),
-            summary_cache_misses: self
-                .summary_cache_misses
-                .saturating_sub(earlier.summary_cache_misses),
-            root_summary_cache_hits: self
-                .root_summary_cache_hits
-                .saturating_sub(earlier.root_summary_cache_hits),
-            root_summary_observation_rejections: self
-                .root_summary_observation_rejections
-                .saturating_sub(earlier.root_summary_observation_rejections),
-            published_summaries: self
-                .published_summaries
-                .saturating_sub(earlier.published_summaries),
-            solver_attempts: self.solver_attempts.saturating_sub(earlier.solver_attempts),
-            summary_profile: self.summary_profile.saturating_sub(earlier.summary_profile),
-            class_set_rows: self.class_set_rows.saturating_sub(earlier.class_set_rows),
-            finding_rows: self.finding_rows.saturating_sub(earlier.finding_rows),
-            witnesses: self.witnesses.saturating_sub(earlier.witnesses),
-            omitted_witnesses: self
-                .omitted_witnesses
-                .saturating_sub(earlier.omitted_witnesses),
-            witness_expansions: self
-                .witness_expansions
-                .saturating_sub(earlier.witness_expansions),
-            witness_steps: self.witness_steps.saturating_sub(earlier.witness_steps),
-            witness_bytes: self.witness_bytes.saturating_sub(earlier.witness_bytes),
-            witness_truncated: self.witness_truncated && !earlier.witness_truncated,
-            incomplete_roots: self
-                .incomplete_roots
-                .saturating_sub(earlier.incomplete_roots),
-            failed_solves: self.failed_solves.saturating_sub(earlier.failed_solves),
-        }
+        let left = self;
+        saturating_sub_work!(left, earlier; [field_slot_builds, field_slot_memory_hits, field_slot_persistence_hits, field_slot_persistence_misses, field_slot_persistence_rejections, field_slot_publications, root_result_persistence_hits, root_result_persistence_misses, root_result_persistence_rejections, root_result_store_failures, root_result_publications, solves, cache_hits, snapshot_cache_hits, snapshot_cache_misses, dispatch_cache_hits, dispatch_cache_misses, binding_cache_hits, binding_cache_misses, summary_cache_hits, summary_cache_misses, root_summary_cache_hits, root_summary_observation_rejections, published_summaries, solver_attempts, summary_profile, class_set_rows, finding_rows, witnesses, omitted_witnesses, witness_expansions, witness_steps, witness_bytes, incomplete_roots, failed_solves]; [witness_truncated])
     }
 
     pub(crate) const fn saturating_add(self, other: Self) -> Self {
-        Self {
-            field_slot_builds: self
-                .field_slot_builds
-                .saturating_add(other.field_slot_builds),
-            field_slot_memory_hits: self
-                .field_slot_memory_hits
-                .saturating_add(other.field_slot_memory_hits),
-            field_slot_persistence_hits: self
-                .field_slot_persistence_hits
-                .saturating_add(other.field_slot_persistence_hits),
-            field_slot_persistence_misses: self
-                .field_slot_persistence_misses
-                .saturating_add(other.field_slot_persistence_misses),
-            field_slot_persistence_rejections: self
-                .field_slot_persistence_rejections
-                .saturating_add(other.field_slot_persistence_rejections),
-            field_slot_publications: self
-                .field_slot_publications
-                .saturating_add(other.field_slot_publications),
-            root_result_persistence_hits: self
-                .root_result_persistence_hits
-                .saturating_add(other.root_result_persistence_hits),
-            root_result_persistence_misses: self
-                .root_result_persistence_misses
-                .saturating_add(other.root_result_persistence_misses),
-            root_result_persistence_rejections: self
-                .root_result_persistence_rejections
-                .saturating_add(other.root_result_persistence_rejections),
-            root_result_store_failures: self
-                .root_result_store_failures
-                .saturating_add(other.root_result_store_failures),
-            root_result_publications: self
-                .root_result_publications
-                .saturating_add(other.root_result_publications),
-            solves: self.solves.saturating_add(other.solves),
-            cache_hits: self.cache_hits.saturating_add(other.cache_hits),
-            snapshot_cache_hits: self
-                .snapshot_cache_hits
-                .saturating_add(other.snapshot_cache_hits),
-            snapshot_cache_misses: self
-                .snapshot_cache_misses
-                .saturating_add(other.snapshot_cache_misses),
-            dispatch_cache_hits: self
-                .dispatch_cache_hits
-                .saturating_add(other.dispatch_cache_hits),
-            dispatch_cache_misses: self
-                .dispatch_cache_misses
-                .saturating_add(other.dispatch_cache_misses),
-            binding_cache_hits: self
-                .binding_cache_hits
-                .saturating_add(other.binding_cache_hits),
-            binding_cache_misses: self
-                .binding_cache_misses
-                .saturating_add(other.binding_cache_misses),
-            summary_cache_hits: self
-                .summary_cache_hits
-                .saturating_add(other.summary_cache_hits),
-            summary_cache_misses: self
-                .summary_cache_misses
-                .saturating_add(other.summary_cache_misses),
-            root_summary_cache_hits: self
-                .root_summary_cache_hits
-                .saturating_add(other.root_summary_cache_hits),
-            root_summary_observation_rejections: self
-                .root_summary_observation_rejections
-                .saturating_add(other.root_summary_observation_rejections),
-            published_summaries: self
-                .published_summaries
-                .saturating_add(other.published_summaries),
-            solver_attempts: self.solver_attempts.saturating_add(other.solver_attempts),
-            summary_profile: self.summary_profile.saturating_add(other.summary_profile),
-            class_set_rows: self.class_set_rows.saturating_add(other.class_set_rows),
-            finding_rows: self.finding_rows.saturating_add(other.finding_rows),
-            witnesses: self.witnesses.saturating_add(other.witnesses),
-            omitted_witnesses: self
-                .omitted_witnesses
-                .saturating_add(other.omitted_witnesses),
-            witness_expansions: self
-                .witness_expansions
-                .saturating_add(other.witness_expansions),
-            witness_steps: self.witness_steps.saturating_add(other.witness_steps),
-            witness_bytes: self.witness_bytes.saturating_add(other.witness_bytes),
-            witness_truncated: self.witness_truncated || other.witness_truncated,
-            incomplete_roots: self.incomplete_roots.saturating_add(other.incomplete_roots),
-            failed_solves: self.failed_solves.saturating_add(other.failed_solves),
-        }
+        let left = self;
+        saturating_add_work!(left, other; [field_slot_builds, field_slot_memory_hits, field_slot_persistence_hits, field_slot_persistence_misses, field_slot_persistence_rejections, field_slot_publications, root_result_persistence_hits, root_result_persistence_misses, root_result_persistence_rejections, root_result_store_failures, root_result_publications, solves, cache_hits, snapshot_cache_hits, snapshot_cache_misses, dispatch_cache_hits, dispatch_cache_misses, binding_cache_hits, binding_cache_misses, summary_cache_hits, summary_cache_misses, root_summary_cache_hits, root_summary_observation_rejections, published_summaries, solver_attempts, summary_profile, class_set_rows, finding_rows, witnesses, omitted_witnesses, witness_expansions, witness_steps, witness_bytes, incomplete_roots, failed_solves]; [witness_truncated])
     }
 }
 

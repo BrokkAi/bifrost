@@ -51,13 +51,8 @@ pub fn js_ts_tree_sitter_language_for_file(
         LanguageDialect::TypeScriptTsx | LanguageDialect::JavaScriptJsx => {
             Some(tree_sitter_typescript::LANGUAGE_TSX.into())
         }
-        LanguageDialect::Standard(Language::TypeScript) => {
-            Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
-        }
-        LanguageDialect::Standard(Language::JavaScript) => {
-            Some(tree_sitter_javascript::LANGUAGE.into())
-        }
-        LanguageDialect::Standard(_) | LanguageDialect::CppC => None,
+        LanguageDialect::Standard(language) => tree_sitter_language_for(language),
+        LanguageDialect::CppC => None,
     }
 }
 
@@ -131,5 +126,169 @@ pub fn tree_sitter_language_for(language: Language) -> Option<TreeSitterLanguage
         Language::JavaScript => Some(tree_sitter_javascript::LANGUAGE.into()),
         Language::TypeScript => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         _ => None,
+    }
+}
+
+pub(crate) fn parse_with_language(
+    source: &str,
+    language: &TreeSitterLanguage,
+) -> Result<Option<tree_sitter::Tree>, tree_sitter::LanguageError> {
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(language)?;
+    Ok(parser.parse(source, None))
+}
+
+#[cfg(test)]
+mod grammar_upgrade_tests {
+    use super::*;
+
+    #[test]
+    fn jsx_ampersands_preserve_entities_and_declarations_in_every_dialect() {
+        let source = r#"export const view = <p href="/x?a=1&b=2" tail="&" single='&'>Roles & Groups &amp;</p>;
+export function after() { return view; }"#;
+        for (path, language) in [
+            ("view.tsx", Language::TypeScript),
+            ("view.jsx", Language::JavaScript),
+            // Plain `.js` uses the JavaScript grammar, repaired in 0.25.3 (#4409).
+            ("view.js", Language::JavaScript),
+        ] {
+            let file = ProjectFile::new(std::env::current_dir().unwrap(), path);
+            let grammar = js_ts_tree_sitter_language_for_file(&file, language).unwrap();
+            let tree = parse_with_language(source, &grammar).unwrap().unwrap();
+            assert!(
+                !tree.root_node().has_error(),
+                "{path}: {}",
+                tree.root_node().to_sexp()
+            );
+            let mut nodes = vec![tree.root_node()];
+            let mut entities = Vec::new();
+            while let Some(node) = nodes.pop() {
+                if node.kind() == "html_character_reference" {
+                    entities.push(node.utf8_text(source.as_bytes()).unwrap());
+                }
+                let mut cursor = node.walk();
+                nodes.extend(node.named_children(&mut cursor));
+            }
+            assert_eq!(entities, vec!["&amp;"], "{path}");
+            let parsed = if language == Language::TypeScript {
+                crate::typescript::parse_typescript_file(&file, source, &tree)
+            } else {
+                crate::javascript::parse_javascript_file(&file, source, &tree)
+            };
+            for expected in ["view", "after"] {
+                assert!(
+                    parsed
+                        .declarations()
+                        .iter()
+                        .any(|unit| unit.identifier() == expected),
+                    "{path}: missing {expected}"
+                );
+            }
+        }
+    }
+
+    #[brokk_bifrost_test_macros::hardwon(
+        "#4479: the released TS/TSX grammar rejected raw NUL in string/comment payloads"
+    )]
+    #[test]
+    fn ts_tsx_raw_nul_payload_preserves_opaque_nodes_and_later_declarations() {
+        for (path, language) in [
+            ("view.ts", Language::TypeScript),
+            ("view.tsx", Language::TypeScript),
+            ("view.jsx", Language::JavaScript),
+        ] {
+            // `.jsx` intentionally uses the TSX grammar, while ordinary `.js`
+            // continues to use its separate JavaScript grammar.
+            let jsx = if path == "view.ts" {
+                ""
+            } else {
+                "export const view = <div>{quoted}</div>;\n"
+            };
+            let source = format!(
+                "const quoted = 'a\0b';\n/* c\0d */\nconst templated = `e\0f`;\n{jsx}export function after() {{ return quoted + templated; }}\n"
+            );
+            assert_eq!(
+                source.as_bytes().iter().filter(|&&byte| byte == 0).count(),
+                3,
+                "{path}: test source must contain actual NUL bytes"
+            );
+
+            let file = ProjectFile::new(std::env::current_dir().unwrap(), path);
+            let grammar = js_ts_tree_sitter_language_for_file(&file, language).unwrap();
+            let tree = parse_with_language(&source, &grammar).unwrap().unwrap();
+            let root = tree.root_node();
+            assert!(!root.has_error(), "{path}: {}", root.to_sexp());
+            assert_eq!(root.end_byte(), source.len(), "{path}: parser input tail");
+
+            let (mut found_string, mut found_comment, mut found_template) = (false, false, false);
+            let mut nodes = vec![root];
+            while let Some(node) = nodes.pop() {
+                let text = node.utf8_text(source.as_bytes()).unwrap();
+                match node.kind() {
+                    "string" if text == "'a\0b'" => found_string = true,
+                    "comment" if text == "/* c\0d */" => found_comment = true,
+                    "template_string" if text == "`e\0f`" => found_template = true,
+                    _ => {}
+                }
+                let mut cursor = node.walk();
+                nodes.extend(node.named_children(&mut cursor));
+            }
+            assert!(found_string, "{path}: raw string payload was not preserved");
+            assert!(
+                found_comment,
+                "{path}: raw comment payload was not preserved"
+            );
+            assert!(
+                found_template,
+                "{path}: raw template payload was not preserved"
+            );
+
+            let parsed = if language == Language::TypeScript {
+                crate::typescript::parse_typescript_file(&file, &source, &tree)
+            } else {
+                crate::javascript::parse_javascript_file(&file, &source, &tree)
+            };
+            assert!(
+                parsed
+                    .declarations()
+                    .iter()
+                    .any(|unit| unit.identifier() == "after"),
+                "{path}: declaration after opaque NUL payload was lost"
+            );
+            if path != "view.ts" {
+                assert!(
+                    parsed
+                        .declarations()
+                        .iter()
+                        .any(|unit| unit.identifier() == "view"),
+                    "{path}: JSX declaration after opaque NUL payload was lost"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn raw_nul_in_executable_ts_tsx_contexts_remains_a_parse_error() {
+        let invalid_sources = [
+            "export const broken\0Name = 1;",
+            "const value = `before ${broken\0Name} after`;",
+        ];
+        for (path, language) in [
+            ("near-miss.ts", Language::TypeScript),
+            ("near-miss.tsx", Language::TypeScript),
+            ("near-miss.jsx", Language::JavaScript),
+        ] {
+            let file = ProjectFile::new(std::env::current_dir().unwrap(), path);
+            let grammar = js_ts_tree_sitter_language_for_file(&file, language).unwrap();
+            for source in invalid_sources {
+                assert!(source.as_bytes().contains(&0));
+                let tree = parse_with_language(source, &grammar).unwrap().unwrap();
+                assert!(
+                    tree.root_node().has_error(),
+                    "{path}: executable NUL unexpectedly parsed cleanly: {}",
+                    tree.root_node().to_sexp()
+                );
+            }
+        }
     }
 }

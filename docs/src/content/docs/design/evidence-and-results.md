@@ -29,9 +29,43 @@ target.
 When paths differ in proof or completeness, the solver keeps the incomparable
 alternatives. It discards a path only when another path dominates its evidence.
 
+A retained taint witness can establish finding certainty independently of
+unrelated run-level gaps. Its proof still includes the source and sink
+obligations: observing an argument at a call site does not discharge unresolved
+dispatch required by that endpoint selector. Structural call syntax and declared
+signature/formal mappings establish endpoints independently of callee execution.
+Resolved-target or receiver-family selections retain an exact call obligation;
+complete bindings or independently accepted, fully applicable summaries must
+close those call obligations. A reviewed
+summary used for endpoint dispatch retains its authored identity on the finding,
+even when the witness stops before traversing a summary transfer.
+
 Public renderers name the axes as `proof` and `completeness`; they do not mint a
 third composite quality label. Cached policy unit rows retain the same evidence
 object as direct, CLI, MCP, and LSP query results.
+
+## Set identity and evaluation order
+
+Set operations compare source or semantic row identities, not projected field
+values. A union retains the first row for an identity in authored branch order
+and merges later evidence and bounded provenance into it. A union may combine
+branches of different row kinds when only filters and projections follow it:
+rows of different kinds never share an identity, so each row keeps its kind and
+the union keeps every branch's rows, and a consumer that admits rows by kind,
+such as a match policy's terminal gate, admits every branch's kind or refuses
+the plan. An intersection keeps
+the first branch's surviving row and combines the other branches' evidence. A
+difference keeps the first branch's rows whose identities the later branches
+do not exclude. A survivor retains its own projected field mapping, even when
+another branch exposes different native fields under a compatible public schema.
+
+Filters above a union run after identity deduplication and evidence merging.
+They cannot be distributed into its branches: filtering out the first
+representative can expose a later row with a different payload or evidence.
+This is true even when the branches publish identical schemas. Such a plan is
+evaluated as a whole workspace query rather than merged from per-file units.
+Project-only union suffixes remain eligible for per-file execution, as do
+filters authored inside individual leaves before a union combines them.
 
 ## Request outcomes
 
@@ -48,9 +82,32 @@ At the provider boundary, outcomes remain typed:
 | `cancelled` | Cooperative cancellation stopped the request | Sometimes | No |
 
 Policy and extension surfaces may use wire labels such as `frontier_bounded`,
-`budget_bounded`, `inconclusive`, or `refused`. Those labels preserve the same
-semantic distinctions. A transport error remains distinct from an analysis
-outcome.
+`budget_bounded`, `inconclusive`, `not_run`, or `refused`. Those labels preserve
+the same semantic distinctions. A transport error remains distinct from an
+analysis outcome.
+
+A policy report uses `not_run` when a selected policy cannot start because a
+required workspace capability is unavailable. The record names the missing
+capability and reason, and makes no absence claim. Selection provenance is part
+of the outcome: an implicitly selected policy does not make the batch
+unreliable, while an explicitly requested policy ID exits unreliable because
+the request was not honored.
+
+An exact qualified locator that cannot bind the pinned workspace or active
+model set prevents a match, assertion or typestate policy from starting. Its
+`not_run` record preserves the locator's typed reason and the fully validated
+authored policy identity. That identity does not represent a resolved
+executable policy, and the run publishes no cached evaluation evidence.
+
+Taint and flow policies bind each endpoint entry independently. An unavailable
+identity prevents only that entry from selecting sites; the remaining entries
+run. Completion is inconclusive with partial discovery, and an incomplete-run
+diagnostic names the entry's selector path, qualified identity and binding
+reason. An unavailable sanitizer cannot select sites or suppress findings.
+When every sink entry has an unavailable identity, the policy remains
+`not_run`, because no sink can be checked. Invalid authored source, imports,
+schemas and resource limits remain validation errors, including malformed
+qualified identities.
 
 Public semantic budget failures name a coarse lane: `source`, `rows`,
 `retained_bytes`, `steps`, or `files`. The internal ledger can refine its
@@ -74,6 +131,23 @@ includes:
 
 For example, a complete three-file search supports a three-file absence claim.
 A procedure-local CFG query supports only that procedure-local claim.
+
+Python formatting diagnostics identify the exact source site and relation whose
+analysis is incomplete. A filter on a known relation identity can exclude gaps
+belonging only to another relation. Filtering for an issue, proven evidence, or
+complete rows cannot discharge an unknown. This relevance follows only a unique
+chain of row filters and projections; set operations and other transformations
+end that chain. Per-file execution preserves these authored boundaries when it
+distributes union branches, so partitioning cannot manufacture completeness.
+
+For Rust point resolution, an undecidable cfg on the selected reference site is
+a premise of that lookup. The resolver assumes the site's unknown literals hold
+while checking candidate declarations and marks a successful answer with a
+`conditional_cfg` diagnostic. Candidate cfg alternatives that remain unknown
+outside that premise can still make the lookup incomplete. A refuted site cfg
+continues to produce an inactive result.
+A gap produced at a declaration that is refuted for the reference does not make
+the answer incomplete; the resolver discharges that gap by identity.
 
 Completeness also follows the fields a consumer uses. An exact call binding
 establishes which actual argument maps to which formal parameter; it need not
@@ -189,6 +263,70 @@ opaque values have the same spelling: equality does not prove which source won.
 Cancellation and either exhausted budget produce an unresolved proof rather
 than fabricating a winner. Only a uniquely selected contribution with complete
 evidence is an effective value claim.
+
+### Code and configuration correlation
+
+Programming code and configuration documents are distinct input domains.
+Configuration formats are not programming languages, so ordinary composition
+stays inside one domain: `intersect` and `except` refuse a code branch beside a
+configuration branch, and `union` refuses rows it could not discriminate. A
+policy relational `join` likewise refuses to pair code rows with configuration
+rows by equal field values, because an equal spelling, path, or co-occurrence
+in one repository is not evidence that two rows are related.
+
+Code and configuration meet only through a registered cross-domain operator.
+Each operator declares its typed inputs (one code domain and one configuration
+domain) and publishes `cross_domain` rows whose required `domain` field
+discriminates what the row carries. Both input rows keep their identities,
+exact locations, and derivation provenance: the configuration fact whole, and
+the code row as a typed reference to its own row family.
+
+- `correlate` pairs a code row with a configuration fact only where a
+  registered structural relation holds. The relation names its correlation
+  key; a key may be a resolver-proven binding, an explicit framework-neutral
+  mapping, or a declared file or module relation, never a name or text match.
+- `require-both` checks that a code predicate and a configuration predicate
+  are both satisfied. It returns each contributing row under its own domain
+  and pairs nothing, so satisfying both predicates never implies that two rows
+  are related.
+
+The first registered relation, `configuration-key`, binds Java code to Java
+`.properties` documents. Its correlation key has three structural parts. The
+code row is an argument bound by a resolver-proven call to a formal parameter
+of the accessor the query selects. The argument is a plain string literal,
+decoded from the syntax tree. The configuration row is a member whose route is
+exactly one key segment equal to that literal, inside a document the relation
+declares by exact workspace-relative path. Declared documents are exact paths
+because a glob would turn the declaration back into a same-repository join.
+Nested routes in YAML, TOML, JSON, or XML need a framework's binding rules,
+which belong to framework catalogs rather than to the general operator.
+
+Absence keeps its usual discipline. A bound call that the resolver did not
+prove, a key that is not a plain literal, code in a language without a key
+decoder, and a declared document that is missing, outside the configuration
+input's scope, or only partly recovered each produce a typed `incomplete`
+diagnostic. An empty answer under any of them is not a clean negative. A key
+that names more than one authored fact correlates with every candidate and
+marks each row `ambiguous`: choosing the fact that wins is an
+effective-configuration claim, not a correlation claim. Budget stops in either
+input or in the operator itself truncate the result in the ordinary way.
+
+`dependency-configuration` supplies a second registered relation. Its author
+reviews an exact consuming topology identity and a complete bounded document
+mapping, together with explicit override edges, supported dependency-version
+ranges, and desired plain `.properties` values. The operator reads full
+immutable document facts before filtering, resolves precedence through the
+effective-configuration contract, and checks the same dependency row's exact
+owner and version. It does not infer a runtime or framework binding.
+
+The relation preserves a dependency witness when mitigation is unproved. Its
+`mitigated` flag becomes true only for complete unique effective evidence and
+supported same-instance applicability. Unknown configuration leaves the flag
+false and retains typed diagnostics, so policies can preserve the recorded
+affected instance without making an unsound absence claim. A different owner's
+witness carries no unrelated configuration pair. Original dependency identity,
+reviewed mapping identity, effective proof and contributor citations remain
+available across transports.
 
 A retained report identifies its artifacts, declarations, events, policies,
 and sources before mapping them into the current presentation.

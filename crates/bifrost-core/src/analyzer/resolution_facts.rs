@@ -15,8 +15,21 @@ use super::model::CodeUnit;
 use super::structural::occurrences::labelled_enum;
 use super::structural::resolution::{DeclaredVisibility, HoistingClass};
 use crate::analyzer::dense_id::define_dense_id;
+use crate::hash::HashSet;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt;
+use std::hash::BuildHasher;
+
+pub fn dense_ordinal(index: usize, relation: &str) -> u32 {
+    u32::try_from(index).unwrap_or_else(|_| panic!("{relation} count exceeds u32"))
+}
+
+/// Return the active scope from a producer's nonempty scope stack.
+#[inline]
+pub fn current_scope_id(scopes: &[ResolutionScopeId], empty_message: &str) -> ResolutionScopeId {
+    *scopes.last().expect(empty_message)
+}
 
 macro_rules! resolution_id {
     ($name:ident) => {
@@ -37,6 +50,7 @@ resolution_id!(ResolutionScopeId);
 resolution_id!(ResolutionSiteId);
 resolution_id!(ResolutionTypeSlotId);
 resolution_id!(ResolutionTypeRelationId);
+resolution_id!(ResolutionJvmAliasId);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolutionNameFact {
@@ -108,6 +122,8 @@ labelled_enum! {
         ModuleReference => "module_reference",
         MacroReference => "macro_reference",
         Call => "call",
+        /// A source pattern that may request an extractor invocation.
+        Pattern => "pattern",
         Literal => "literal",
         UnsupportedRoute => "unsupported_route",
         UnsupportedDeclaration => "unsupported_declaration",
@@ -122,6 +138,11 @@ labelled_enum! {
         /// engine chooses lexical expression lookup for map/sequence owners
         /// and qualified field lookup for a struct owner.
         CompositeLiteralKeyReference => "composite_literal_key_reference",
+        BinaryExpression => "binary_expression",
+        ConditionalExpression => "conditional_expression",
+        /// A stable import qualifier whose head is looked up lexically before
+        /// the import continues through a package or a projected value type.
+        ImportQualifierReference => "import_qualifier_reference",
     }
 }
 
@@ -210,6 +231,23 @@ pub struct ResolutionBinderFact {
     pub activation_end: usize,
 }
 
+impl ResolutionBinderFact {
+    pub fn scope_wide(
+        declaration: ResolutionSiteId,
+        kind: ResolutionBinderKind,
+        scope: ResolutionScopeFact,
+    ) -> Self {
+        Self {
+            declaration,
+            scope: scope.id,
+            kind,
+            hoisting: HoistingClass::ScopeWide,
+            activation_start: scope.start_byte,
+            activation_end: scope.end_byte,
+        }
+    }
+}
+
 /// One pattern token that names a declaration before it declares one.
 ///
 /// Rust decides this at name resolution: a bare identifier in a refutable
@@ -264,6 +302,10 @@ labelled_enum! {
         Identity => "identity",
         // Exact alias owner, before receiver payload projection or dereference.
         NominalIdentity => "nominal_identity",
+        // The declared type of a callable's first result. A multi-value callable
+        // has no single Return row, so a binder of its first result reads this.
+        // Appended last: the persisted role code is this enum's index.
+        CallableFirstResult => "callable_first_result",
     }
 }
 
@@ -296,6 +338,29 @@ labelled_enum! {
         TargetMemberOwnerType => "target_member_owner_type",
         // Follow alias owners without substituting a receiver-reachable payload.
         TargetNominalTypeIdentity => "target_nominal_type_identity",
+        // A later result of a multi-value callable. It names the callee like the
+        // first result does, but no declared type is published for it yet, so it
+        // never takes the first result's type. Appended last: the persisted kind
+        // code is this enum's index.
+        TargetCallableLaterResultType => "target_callable_later_result_type",
+        // Bind a callable/constructor by member name without invoking it. The
+        // reference namespace chooses the member family. The ExpressionValue
+        // output carries binding completion only, never the callable's return
+        // type or an inferred functional-interface type. No CallFact is needed.
+        // Append only: the persisted codec is this vocabulary's index.
+        NonInvokingMemberReference => "non_invoking_member_reference",
+    }
+}
+
+impl BindingProjectionKind {
+    /// A projection from a callable reference to one of its call results. The
+    /// first and the later results share this shape; only the first result's
+    /// declared type is published as a first-result declaration.
+    pub const fn is_callable_result(self) -> bool {
+        matches!(
+            self,
+            Self::TargetCallableResultType | Self::TargetCallableLaterResultType
+        )
     }
 }
 
@@ -305,6 +370,30 @@ pub struct BindingProjectionFact {
     pub reference: ResolutionSiteId,
     pub output: ResolutionTypeSlotId,
     pub kind: BindingProjectionKind,
+}
+
+impl BindingProjectionFact {
+    pub const fn target_type_identity(
+        reference: ResolutionSiteId,
+        output: ResolutionTypeSlotId,
+    ) -> Self {
+        Self {
+            reference,
+            output,
+            kind: BindingProjectionKind::TargetTypeIdentity,
+        }
+    }
+
+    pub const fn target_declared_value_type(
+        reference: ResolutionSiteId,
+        output: ResolutionTypeSlotId,
+    ) -> Self {
+        Self {
+            reference,
+            output,
+            kind: BindingProjectionKind::TargetDeclaredValueType,
+        }
+    }
 }
 
 labelled_enum! {
@@ -337,6 +426,12 @@ labelled_enum! {
         Return => "return",
         UnaryIndirection => "unary_indirection",
         AddressOf => "address_of",
+        /// Apply a proven surrounding type to an expression whose language
+        /// syntax takes its type from context, such as Go's untyped nil.
+        Contextual => "contextual",
+        /// Carry an operand's proven type into a unary or binary expression
+        /// whose result type is determined by that operand.
+        ExpressionResult => "expression_result",
     }
 }
 
@@ -390,6 +485,26 @@ pub struct ResolutionTypeTransferFact {
     pub value_transform: ResolutionTypeTransferValueTransform,
 }
 
+impl ResolutionTypeTransferFact {
+    pub const fn new(
+        input: ResolutionTypeSlotId,
+        output: ResolutionTypeSlotId,
+        kind: ResolutionTypeTransferKind,
+        indirection_delta: i8,
+        reference_indirection_delta: i8,
+        value_transform: ResolutionTypeTransferValueTransform,
+    ) -> Self {
+        Self {
+            input,
+            output,
+            kind,
+            indirection_delta,
+            reference_indirection_delta,
+            value_transform,
+        }
+    }
+}
+
 labelled_enum! {
     ResolutionTypeComponentKind, ALL_RESOLUTION_TYPE_COMPONENT_KINDS {
         Element => "element",
@@ -403,7 +518,19 @@ labelled_enum! {
         Sequence => "sequence",
         Map => "map",
         Channel => "channel",
+        Slice => "slice",
+        Array => "array",
     }
+}
+
+/// A type constructor that produces its output after its element slot resolves.
+/// The length preserves the written literal token and is present only for arrays.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ResolutionTypeProductionFact {
+    pub output: ResolutionTypeSlotId,
+    pub element: ResolutionTypeSlotId,
+    pub constructor: ResolutionTypeConstructorKind,
+    pub length: Option<String>,
 }
 
 /// One edge from a structural type syntax slot to a component type syntax
@@ -414,6 +541,62 @@ pub struct ResolutionTypeComponentFact {
     pub constructor: ResolutionTypeConstructorKind,
     pub kind: ResolutionTypeComponentKind,
     pub component: ResolutionTypeSlotId,
+}
+
+/// One positional type argument written on a declared type syntax node.
+///
+/// Unlike structural container components, generic arguments are ordered and
+/// can have any arity. `owner` is the nominal identity slot for `Box` in
+/// `Box<Foo>`; `argument` is the declared identity slot for `Foo`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResolutionDeclaredTypeArgumentFact {
+    pub owner: ResolutionTypeSlotId,
+    pub ordinal: u32,
+    pub argument: ResolutionTypeSlotId,
+}
+
+/// One ordered type argument in a generic type application. The application
+/// slot is the resolved identity of the generic head; the argument slot and
+/// written indirection remain structured type-expression facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResolutionTypeArgumentFact {
+    pub application: ResolutionTypeSlotId,
+    pub ordinal: u32,
+    pub argument: ResolutionTypeSlotId,
+    pub indirection_delta: i8,
+    pub reference_indirection_delta: i8,
+}
+
+/// One generic type alias formal and its target type expression. The target
+/// slot is repeated per formal, making the alias -> formal -> target relation
+/// directly queryable without an opaque payload. Ordered nested target
+/// arguments are represented by `ResolutionTypeArgumentFact` rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResolutionGenericTypeAliasParameterFact {
+    pub alias: ResolutionSiteId,
+    pub ordinal: u32,
+    pub parameter: ResolutionSiteId,
+    pub target: ResolutionTypeSlotId,
+    pub indirection_delta: i8,
+    pub reference_indirection_delta: i8,
+}
+
+/// One positional formal parameter of a generic type, alias, or callable
+/// declaration. Receiver formals are owned by their method and map by
+/// position to the generic receiver base's formals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResolutionGenericFormalFact {
+    pub owner: ResolutionSiteId,
+    pub ordinal: u32,
+    pub parameter: ResolutionSiteId,
+}
+
+/// The default type of a generic formal. Its arguments are ordinary type argument rows on default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResolutionGenericFormalDefaultFact {
+    pub owner: ResolutionSiteId,
+    pub ordinal: u32,
+    pub default: ResolutionTypeSlotId,
 }
 
 labelled_enum! {
@@ -439,6 +622,21 @@ pub struct IntrinsicTypeSeedFact {
     pub indirection: u8,
 }
 
+impl IntrinsicTypeSeedFact {
+    pub const fn direct(
+        output: ResolutionTypeSlotId,
+        name: ResolutionNameId,
+        kind: IntrinsicTypeKind,
+    ) -> Self {
+        Self {
+            output,
+            name,
+            kind,
+            indirection: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ResolutionCallFact {
     pub call: ResolutionSiteId,
@@ -459,8 +657,32 @@ pub struct ResolutionCallFact {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ResolutionCallArgumentFact {
     pub call: ResolutionSiteId,
+    /// Position of this argument list in a curried application.
+    pub list_ordinal: u32,
+    /// Position within the complete call's arguments. It remains dense across
+    /// lists for existing typed-call consumers.
     pub ordinal: u32,
     pub value: ResolutionTypeSlotId,
+    /// Source name in a named argument, if this language supports one.
+    pub label: Option<ResolutionNameId>,
+}
+
+/// One positioned name written as a named-argument label. Resolution uses the
+/// call's selected callable and its parameter labels; the producer does not
+/// bind the spelling independently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResolutionNamedArgumentLabelFact {
+    pub call: ResolutionSiteId,
+    pub reference: ResolutionSiteId,
+    pub label: ResolutionNameId,
+}
+
+/// One argument list applied to a call. It is explicit even when empty, so
+/// `f()` and `f()(x)` retain their source list boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResolutionCallArgumentListFact {
+    pub call: ResolutionSiteId,
+    pub list_ordinal: u32,
 }
 
 /// One explicit type or const argument a call writes (Rust's turbofish,
@@ -512,6 +734,19 @@ labelled_enum! {
     }
 }
 
+impl ResolutionCallableReceiverOrigin {
+    /// Whether a source reference's qualification agrees with its receiver
+    /// origin. Producers represent a current-instance receiver in either a
+    /// separate receiver slot or a qualifier slot.
+    pub const fn is_reference_qualification_valid(self, unqualified: bool) -> bool {
+        match self {
+            Self::Implicit => unqualified,
+            Self::CurrentInstance => true,
+            Self::Super | Self::ExplicitExpression => !unqualified,
+        }
+    }
+}
+
 /// One receiver-origin row for a positioned callable reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ResolutionCallableReceiverOriginFact {
@@ -551,10 +786,44 @@ pub struct ResolutionCallableSignatureFact {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ResolutionCallableParameterFact {
     pub callable: ResolutionSiteId,
+    /// Position of this parameter list in a curried declaration.
+    pub list_ordinal: u32,
+    /// Position within the complete callable's parameters. It remains dense
+    /// across lists for existing typed-call consumers.
     pub ordinal: u32,
     pub parameter: ResolutionSiteId,
     pub value_type: ResolutionTypeSlotId,
     pub repeated: bool,
+}
+
+/// One declared parameter list, including an explicitly empty list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResolutionCallableParameterListFact {
+    pub callable: ResolutionSiteId,
+    pub list_ordinal: u32,
+    /// Whether this list is supplied contextually unless source provides it.
+    pub contextual: bool,
+}
+
+/// A source parameter's label and default availability. These semantics are
+/// shared by named-argument and curried-call binding after target selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResolutionCallableParameterSemanticsFact {
+    pub callable: ResolutionSiteId,
+    pub parameter: ResolutionSiteId,
+    pub list_ordinal: u32,
+    pub ordinal: u32,
+    pub label: ResolutionNameId,
+    pub has_default: bool,
+}
+
+/// The declared receiver type of an extension callable. This is distinct
+/// from a receiver written at a call site and from a member callable's
+/// implicit dispatch receiver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResolutionExtensionReceiverFact {
+    pub callable: ResolutionSiteId,
+    pub receiver_type: ResolutionTypeSlotId,
 }
 
 labelled_enum! {
@@ -726,6 +995,9 @@ labelled_enum! {
         /// keeps its proved absences, which is why this is the producer's
         /// statement and not a rule the language-neutral engine applies.
         OpenMemberSurface => "open_member_surface",
+        /// The fully replayed, matched item macro cannot introduce members.
+        /// Its unexpanded lexical declarations remain a live frontier.
+        ClosedMacroMemberSurface => "closed_macro_member_surface",
         /// When lookup leaves this call several candidate declarations, a
         /// candidate whose parameters the call's arguments cannot reach under
         /// Rust's coercions is not the call's target.
@@ -748,7 +1020,8 @@ labelled_enum! {
 /// The site is a call for the rules that govern call binding and a reference
 /// for the rules that govern a lookup. It was a call for every rule until the
 /// open-member-surface rule, whose subject -- `Host::ITEM` -- is a constant
-/// read and has no call of its own.
+/// read and has no call of its own. A closed-macro-member-surface proof
+/// names the unexpanded item invocation instead of a lookup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ResolutionEngineRuleEligibilityFact {
     pub site: ResolutionSiteId,
@@ -780,6 +1053,9 @@ labelled_enum! {
         /// declares (JLS 4.3.2: methods only) can seal member-type and field
         /// walks across this edge even while the route is unindexed.
         ImplicitSuperclass => "implicit_superclass",
+        /// A Scala self-type constraint used for member inheritance inside its
+        /// owning template, but not as a nominal subtype relation.
+        SelfType => "self_type",
     }
 }
 
@@ -789,6 +1065,8 @@ labelled_enum! {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ResolutionSupertypeFact {
     pub subtype: ResolutionSiteId,
+    /// Written parent order; synthetic implicit parents use zero.
+    pub parent_ordinal: u32,
     pub supertype_reference: ResolutionSiteId,
     pub supertype_slot: ResolutionTypeSlotId,
     pub kind: ResolutionSupertypeKind,
@@ -811,10 +1089,13 @@ pub struct ResolutionConstructionRequirementFact {
     pub kind: ResolutionConstructionRequirementKind,
 }
 
-/// The package placement declared by one compilation-unit root. An unnamed
-/// package has no declaration and no segment rows. `placement_gap_site` is the
-/// exact root endpoint whose [`ResolutionGapKind::UnsupportedPlacementBoundary`]
-/// is discharged when a selected revision attaches this file to a package.
+/// One source package route attached at `root_scope`. A file may publish
+/// several routes for nested or braced package clauses; each route has its own
+/// scope, declaration, and ordered segment rows. An unnamed package has no
+/// declaration and no segment rows. `placement_gap_site` identifies the
+/// source endpoint for an [`ResolutionGapKind::UnsupportedPlacementBoundary`]
+/// when the producer reports an unresolved placement boundary; producers that
+/// fully model source placement can leave that gap absent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ResolutionPackageFact {
     pub root_scope: ResolutionScopeId,
@@ -839,7 +1120,7 @@ pub struct ResolutionGoPackageImportFact {
 }
 
 /// One package-name segment in source order. Ordinals are dense within the
-/// compilation-unit root and names remain target-independent.
+/// package route's `root_scope`; names remain target-independent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ResolutionPackageSegmentFact {
     pub root_scope: ResolutionScopeId,
@@ -853,6 +1134,8 @@ pub enum ResolutionImportRouteKind {
     TypeOnDemand,
     SingleStatic,
     StaticOnDemand,
+    Named,
+    Star,
 }
 
 /// One supported import route. This records only source-owned route syntax;
@@ -896,6 +1179,13 @@ pub struct ResolutionRootImportFact {
     pub site: ResolutionSiteId,
     pub root_scope: ResolutionScopeId,
     pub anchor: ResolutionRootImportAnchor,
+    /// The byte from which the import is in effect, through the end of its
+    /// root scope. `None` means the import is in effect across the whole
+    /// scope, as a Rust `use` or a Java import is. A language whose imports
+    /// bind only the names written after them (Scala) gives the position the
+    /// import takes effect at; lowering starts the import's route at that
+    /// position's checkpoint in the scope timeline.
+    pub position: Option<usize>,
 }
 
 /// One source-order segment of a root import route.
@@ -907,10 +1197,10 @@ pub struct ResolutionRootImportSegmentFact {
 }
 
 /// One direct root-qualified reference. The terminal name and effective
-/// namespace come from the positioned identifier at `reference`; the
-/// identifier must not use the grammar-ambiguous `TypeOrValue` namespace.
-/// These rows carry only the source-owned root route that precedes that
-/// terminal.
+/// namespace come from the positioned identifier at `reference`. A language
+/// producer may retain `TypeOrValue` when the route head is grammatically
+/// ambiguous. These rows carry the source-owned route that precedes that
+/// terminal and whether a head owns a later route continuation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ResolutionRootReferenceFact {
     pub reference: ResolutionSiteId,
@@ -922,6 +1212,11 @@ pub struct ResolutionRootReferenceFact {
     /// The site supplies lexical scope and namespace. Explicit root anchors
     /// leave this absent.
     pub prefix_reference: Option<ResolutionSiteId>,
+    /// This reference is an owner whose selected route continues through a
+    /// later segment. Producers set this on a TypeOrValue route head or a
+    /// projection owner; it is route shape, independent of the language
+    /// consuming the path.
+    pub owner_continued: bool,
 }
 
 /// One source-order segment of a direct root-qualified reference route.
@@ -970,6 +1265,86 @@ pub struct ResolutionRootImportDemandTargetFact {
     pub target: ResolutionRootImportDemandTarget,
 }
 
+labelled_enum! {
+    /// Source form of an import selector that changes the local name or
+    /// introduces names from a package/object star route.
+    ResolutionImportSelectorKind, ALL_RESOLUTION_IMPORT_SELECTOR_KINDS {
+        Named => "named",
+        Star => "star",
+        ReceiverMember => "receiver_member",
+    }
+}
+
+/// The imported source name and the name visible in the importing file.
+/// Either name is absent for a selector form that has no single bound leaf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResolutionImportSelectorFact {
+    pub site: ResolutionSiteId,
+    pub kind: ResolutionImportSelectorKind,
+    pub source_name: Option<ResolutionNameId>,
+    pub local_name: Option<ResolutionNameId>,
+}
+
+labelled_enum! {
+    /// Relationship that makes an object or companion reachable through its
+    /// enclosing declaration. This is source identity metadata, not a
+    /// compiler-generated declaration.
+    ResolutionSingletonRelationKind, ALL_RESOLUTION_SINGLETON_RELATION_KINDS {
+        Object => "object",
+        Companion => "companion",
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResolutionSingletonRelationFact {
+    pub declaration: ResolutionSiteId,
+    pub enclosing_type: Option<ResolutionSiteId>,
+    pub kind: ResolutionSingletonRelationKind,
+}
+
+labelled_enum! {
+    /// Whether the parsed source alone proves that a JVM alias is emitted.
+    /// Compiler-option-dependent aliases remain explicit but incomplete.
+    ResolutionJvmAliasStatus, ALL_RESOLUTION_JVM_ALIAS_STATUSES {
+        SourceProven => "source_proven",
+        CompilerModeDependent => "compiler_mode_dependent",
+    }
+}
+
+labelled_enum! {
+    /// The JVM member surface reached by one source-derived alias.
+    ResolutionJvmAliasKind, ALL_RESOLUTION_JVM_ALIAS_KINDS {
+        Field => "field",
+        Getter => "getter",
+        Setter => "setter",
+        Method => "method",
+        Constructor => "constructor",
+        CompanionObject => "companion_object",
+        SingletonInstance => "singleton_instance",
+    }
+}
+
+/// One JVM spelling projected back to the exact authored declaration.
+/// `owner_segments` contains the binary owner components in order, including
+/// package segments. It is kept in child rows so SQL can inspect each part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResolutionJvmAliasFact {
+    pub id: ResolutionJvmAliasId,
+    pub declaration: ResolutionSiteId,
+    pub member_name: ResolutionNameId,
+    pub kind: ResolutionJvmAliasKind,
+    pub is_static: bool,
+    pub parameter_count: u32,
+    pub status: ResolutionJvmAliasStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResolutionJvmAliasOwnerSegmentFact {
+    pub alias: ResolutionJvmAliasId,
+    pub ordinal: u32,
+    pub name: ResolutionNameId,
+}
+
 /// One declaration that may be reached from a selected root attachment.
 ///
 /// The declaration and its lookup namespace are content-owned. The package,
@@ -1002,6 +1377,39 @@ pub struct ResolutionPackageMemberFact {
 pub struct ResolutionPackageReferenceFact {
     pub reference: ResolutionSiteId,
     pub root_scope: ResolutionScopeId,
+}
+
+/// One member that a Scala package object re-exports at its package route.
+/// Both declarations retain their source identities; this row only states the
+/// selected package route through which the member is also visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResolutionPackageObjectExportFact {
+    pub package_object: ResolutionSiteId,
+    pub package_scope: ResolutionScopeId,
+    pub member: ResolutionSiteId,
+}
+
+labelled_enum! {
+    /// Source-level operation attached to a call or extractor pattern.
+    ResolutionInvocationRole, ALL_RESOLUTION_INVOCATION_ROLES {
+        Direct => "direct",
+        Apply => "apply",
+        Unapply => "unapply",
+        UnapplySeq => "unapply_seq",
+    }
+}
+
+/// One invocation request. `site` is a call node for `Direct`/`Apply` and the
+/// head reference of the pattern for `Unapply`/`UnapplySeq` (the reference a
+/// reader resolves to the extractor, as a call's callee is resolved); receiver
+/// and result slots preserve the typed edges consumed by a shared invocation
+/// reader. The row carries no argument count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResolutionInvocationRoleFact {
+    pub site: ResolutionSiteId,
+    pub role: ResolutionInvocationRole,
+    pub receiver: Option<ResolutionTypeSlotId>,
+    pub result: Option<ResolutionTypeSlotId>,
 }
 
 labelled_enum! {
@@ -1092,6 +1500,9 @@ labelled_enum! {
     /// export inventory and bare lookups alone; it can still add members to
     /// the types its scope declares, which is the only surface it opens.
         UnexpandedImplMacro => "unexpanded_impl_macro",
+    /// The expression was fully traversed, but its resulting type or value is not modeled.
+    /// References and binders below this site are retained, so this is not an enumeration gap.
+        UnsupportedExpressionType => "unsupported_expression_type",
     }
 }
 
@@ -1150,12 +1561,18 @@ pub struct FileResolutionFacts {
     pub root_import_demands: Vec<ResolutionRootImportDemandFact>,
     pub root_import_kinds: Vec<ResolutionRootImportKindFact>,
     pub root_import_demand_targets: Vec<ResolutionRootImportDemandTargetFact>,
+    pub import_selectors: Vec<ResolutionImportSelectorFact>,
     pub root_references: Vec<ResolutionRootReferenceFact>,
     pub root_reference_segments: Vec<ResolutionRootReferenceSegmentFact>,
     pub root_exports: Vec<ResolutionRootExportFact>,
     pub package_members: Vec<ResolutionPackageMemberFact>,
     pub go_package_imports: Vec<ResolutionGoPackageImportFact>,
     pub package_references: Vec<ResolutionPackageReferenceFact>,
+    pub package_object_exports: Vec<ResolutionPackageObjectExportFact>,
+    pub invocation_roles: Vec<ResolutionInvocationRoleFact>,
+    pub singleton_relations: Vec<ResolutionSingletonRelationFact>,
+    pub jvm_aliases: Vec<ResolutionJvmAliasFact>,
+    pub jvm_alias_owner_segments: Vec<ResolutionJvmAliasOwnerSegmentFact>,
     pub identifiers: Vec<PositionedIdentifierFact>,
     pub additional_definition_namespaces: Vec<ResolutionAdditionalDefinitionNamespaceFact>,
     pub definition_units: Vec<ResolutionDefinitionUnitFact>,
@@ -1166,9 +1583,17 @@ pub struct FileResolutionFacts {
     pub binding_projections: Vec<BindingProjectionFact>,
     pub type_transfers: Vec<ResolutionTypeTransferFact>,
     pub type_components: Vec<ResolutionTypeComponentFact>,
+    pub type_productions: Vec<ResolutionTypeProductionFact>,
+    pub declared_type_arguments: Vec<ResolutionDeclaredTypeArgumentFact>,
+    pub type_arguments: Vec<ResolutionTypeArgumentFact>,
+    pub generic_type_alias_parameters: Vec<ResolutionGenericTypeAliasParameterFact>,
+    pub generic_formals: Vec<ResolutionGenericFormalFact>,
+    pub generic_formal_defaults: Vec<ResolutionGenericFormalDefaultFact>,
     pub intrinsic_type_seeds: Vec<IntrinsicTypeSeedFact>,
     pub calls: Vec<ResolutionCallFact>,
+    pub call_argument_lists: Vec<ResolutionCallArgumentListFact>,
     pub call_arguments: Vec<ResolutionCallArgumentFact>,
+    pub named_argument_labels: Vec<ResolutionNamedArgumentLabelFact>,
     pub call_type_arguments: Vec<ResolutionCallTypeArgumentFact>,
     /// The type arguments a call writes on the type segment of its path
     /// (`Wrapper::<Square>::make()`), in the same shape as
@@ -1180,6 +1605,9 @@ pub struct FileResolutionFacts {
     pub callable_receiver_origins: Vec<ResolutionCallableReceiverOriginFact>,
     pub callable_signatures: Vec<ResolutionCallableSignatureFact>,
     pub callable_parameters: Vec<ResolutionCallableParameterFact>,
+    pub callable_parameter_lists: Vec<ResolutionCallableParameterListFact>,
+    pub callable_parameter_semantics: Vec<ResolutionCallableParameterSemanticsFact>,
+    pub extension_receivers: Vec<ResolutionExtensionReceiverFact>,
     pub callable_result_bindings: Vec<ResolutionCallableResultBindingFact>,
     pub callable_result_type_parameters: Vec<ResolutionCallableResultTypeParameterFact>,
     /// Callables whose result type is a type parameter of the enclosing impl,
@@ -1217,7 +1645,232 @@ pub struct FileResolutionFacts {
     pub gaps: Vec<ResolutionGapFact>,
 }
 
+/// Collect source-owned package lookup requests while leaving scope,
+/// namespace, and import rules to the language producer.
+///
+/// Only unqualified references that are not already owned by an explicit root
+/// route can be package lookups. The caller decides which of those references
+/// its language permits to search in the source package and supplies that
+/// package's scope.
+pub fn source_owned_package_references(
+    facts: &FileResolutionFacts,
+    mut package_scope_for: impl FnMut(
+        &PositionedIdentifierFact,
+        &ResolutionSiteFact,
+    ) -> Option<ResolutionScopeId>,
+) -> Vec<ResolutionPackageReferenceFact> {
+    let rooted_references = facts
+        .root_references
+        .iter()
+        .map(|reference| reference.reference)
+        .collect::<HashSet<_>>();
+
+    facts
+        .identifiers
+        .iter()
+        .filter_map(|identifier| {
+            if identifier.role != ResolutionIdentifierRole::Reference
+                || identifier.qualifier.is_some()
+                || rooted_references.contains(&identifier.site)
+            {
+                return None;
+            }
+            let site = &facts.sites[identifier.site.index()];
+            package_scope_for(identifier, site).map(|root_scope| ResolutionPackageReferenceFact {
+                reference: identifier.site,
+                root_scope,
+            })
+        })
+        .collect()
+}
+
 impl FileResolutionFacts {
+    /// Record one positional type parameter owned by a generic declaration.
+    pub fn add_generic_formal(
+        &mut self,
+        owner: ResolutionSiteId,
+        ordinal: u32,
+        parameter: ResolutionSiteId,
+    ) {
+        self.generic_formals.push(ResolutionGenericFormalFact {
+            owner,
+            ordinal,
+            parameter,
+        });
+    }
+
+    /// Append one site and assign its dense file-local ID.
+    pub fn add_site(
+        &mut self,
+        scope: ResolutionScopeId,
+        kind: ResolutionSiteKind,
+        start_byte: usize,
+        end_byte: usize,
+    ) -> ResolutionSiteId {
+        let id = ResolutionSiteId::try_from_index(self.sites.len())
+            .expect("resolution site count exceeds u32");
+        self.sites.push(ResolutionSiteFact {
+            id,
+            scope,
+            kind,
+            start_byte,
+            end_byte,
+        });
+        id
+    }
+
+    /// Append a gap unless this file already contains the same fact.
+    pub fn add_gap(&mut self, site: ResolutionSiteId, kind: ResolutionGapKind) {
+        let gap = ResolutionGapFact { site, kind };
+        if !self.gaps.contains(&gap) {
+            self.gaps.push(gap);
+        }
+    }
+
+    /// Append a reference-enumeration gap unless it is already present.
+    pub fn add_reference_enumeration_gap(
+        &mut self,
+        site: ResolutionSiteId,
+        kind: ResolutionGapKind,
+    ) {
+        let gap = ResolutionReferenceEnumerationGapFact { site, kind };
+        if !self.reference_enumeration_gaps.contains(&gap) {
+            self.reference_enumeration_gaps.push(gap);
+        }
+    }
+
+    /// Look up one name in this file's dense name table.
+    pub fn name(&self, id: ResolutionNameId) -> &str {
+        let fact = &self.names[id.index()];
+        assert_eq!(fact.id, id, "resolution name index matches its ID");
+        &fact.spelling
+    }
+
+    /// Find positioned identifiers with one spelling, role, and namespace.
+    pub fn identifiers_named<'a>(
+        &'a self,
+        spelling: &str,
+        role: ResolutionIdentifierRole,
+        namespace: ResolutionNamespace,
+    ) -> Vec<&'a PositionedIdentifierFact> {
+        self.identifiers
+            .iter()
+            .filter(|identifier| {
+                self.name(identifier.name) == spelling
+                    && identifier.role == role
+                    && identifier.namespace == namespace
+            })
+            .collect()
+    }
+
+    /// Look up one lexical scope in this file's dense scope table.
+    pub fn scope(&self, id: ResolutionScopeId) -> &ResolutionScopeFact {
+        let fact = &self.scopes[id.index()];
+        assert_eq!(fact.id, id, "resolution scope index matches its ID");
+        fact
+    }
+
+    /// Look up one type slot in this file's dense type-slot table.
+    pub fn type_slot(&self, id: ResolutionTypeSlotId) -> &ResolutionTypeSlotFact {
+        let fact = &self.type_slots[id.index()];
+        assert_eq!(fact.id, id, "resolution type-slot index matches its ID");
+        fact
+    }
+
+    /// Intern an already-normalized spelling into this file's name table.
+    pub fn intern_name<S: BuildHasher>(
+        &mut self,
+        known_names: &mut HashMap<String, ResolutionNameId, S>,
+        spelling: &str,
+    ) -> ResolutionNameId {
+        assert!(!spelling.is_empty(), "resolution names need a spelling");
+        if let Some(id) = known_names.get(spelling) {
+            return *id;
+        }
+        let id = ResolutionNameId::try_from_index(self.names.len())
+            .expect("resolution name count exceeds u32");
+        let spelling = spelling.to_owned();
+        known_names.insert(spelling.clone(), id);
+        self.names.push(ResolutionNameFact { id, spelling });
+        id
+    }
+
+    /// Append the Cartesian product of root import sites and requested names.
+    pub fn extend_root_import_demands(
+        &mut self,
+        import_sites: &[ResolutionSiteId],
+        demands: &[(ResolutionNamespace, ResolutionNameId)],
+    ) {
+        self.root_import_demands
+            .reserve(import_sites.len().saturating_mul(demands.len()));
+        for &import_site in import_sites {
+            for &(namespace, name) in demands {
+                self.root_import_demands
+                    .push(ResolutionRootImportDemandFact {
+                        import_site,
+                        namespace,
+                        name,
+                    });
+            }
+        }
+    }
+
+    /// Append a call with one result slot and no additional result slots.
+    pub fn add_single_result_call(
+        &mut self,
+        call: ResolutionSiteId,
+        callee: ResolutionSiteId,
+        receiver: Option<ResolutionTypeSlotId>,
+        result: ResolutionTypeSlotId,
+        explicit_type_argument_count: u32,
+    ) {
+        self.calls.push(ResolutionCallFact {
+            call,
+            callee,
+            receiver,
+            result,
+            extra_result_slots: Vec::new(),
+            explicit_type_argument_count,
+        });
+    }
+
+    /// Append one lexical child scope and assign its dense file-local ID.
+    pub fn allocate_lexical_scope(
+        &mut self,
+        parent: ResolutionScopeId,
+        owner: Option<ResolutionSiteId>,
+        kind: ResolutionScopeKind,
+        start_byte: usize,
+        end_byte: usize,
+    ) -> ResolutionScopeId {
+        assert!(start_byte <= end_byte, "scope byte range is ordered");
+        let id = ResolutionScopeId::try_from_index(self.scopes.len())
+            .expect("resolution scope count exceeds u32");
+        self.scopes.push(ResolutionScopeFact {
+            id,
+            parent: Some(parent),
+            owner,
+            kind,
+            inheritance: ResolutionScopeInheritance::Lexical,
+            start_byte,
+            end_byte,
+        });
+        id
+    }
+
+    /// Append one type slot and assign its dense file-local ID.
+    pub fn allocate_type_slot(
+        &mut self,
+        site: ResolutionSiteId,
+        role: ResolutionTypeSlotRole,
+    ) -> ResolutionTypeSlotId {
+        let id = ResolutionTypeSlotId::try_from_index(self.type_slots.len())
+            .expect("resolution type slot count exceeds u32");
+        self.type_slots
+            .push(ResolutionTypeSlotFact { id, site, role });
+        id
+    }
+
     pub fn is_empty(&self) -> bool {
         self.names.is_empty()
             && self.scopes.is_empty()
@@ -1231,12 +1884,18 @@ impl FileResolutionFacts {
             && self.root_import_demands.is_empty()
             && self.root_import_kinds.is_empty()
             && self.root_import_demand_targets.is_empty()
+            && self.import_selectors.is_empty()
             && self.root_references.is_empty()
             && self.root_reference_segments.is_empty()
             && self.root_exports.is_empty()
             && self.package_members.is_empty()
             && self.go_package_imports.is_empty()
             && self.package_references.is_empty()
+            && self.package_object_exports.is_empty()
+            && self.invocation_roles.is_empty()
+            && self.singleton_relations.is_empty()
+            && self.jvm_aliases.is_empty()
+            && self.jvm_alias_owner_segments.is_empty()
             && self.identifiers.is_empty()
             && self.additional_definition_namespaces.is_empty()
             && self.definition_units.is_empty()
@@ -1247,9 +1906,17 @@ impl FileResolutionFacts {
             && self.binding_projections.is_empty()
             && self.type_transfers.is_empty()
             && self.type_components.is_empty()
+            && self.type_productions.is_empty()
+            && self.declared_type_arguments.is_empty()
+            && self.type_arguments.is_empty()
+            && self.generic_type_alias_parameters.is_empty()
+            && self.generic_formal_defaults.is_empty()
+            && self.generic_formals.is_empty()
             && self.intrinsic_type_seeds.is_empty()
             && self.calls.is_empty()
+            && self.call_argument_lists.is_empty()
             && self.call_arguments.is_empty()
+            && self.named_argument_labels.is_empty()
             && self.call_type_arguments.is_empty()
             && self.call_owner_type_arguments.is_empty()
             && self.call_owner_type_segments.is_empty()
@@ -1257,6 +1924,9 @@ impl FileResolutionFacts {
             && self.callable_receiver_origins.is_empty()
             && self.callable_signatures.is_empty()
             && self.callable_parameters.is_empty()
+            && self.callable_parameter_lists.is_empty()
+            && self.callable_parameter_semantics.is_empty()
+            && self.extension_receivers.is_empty()
             && self.callable_result_bindings.is_empty()
             && self.callable_result_type_parameters.is_empty()
             && self.callable_result_owner_type_parameters.is_empty()
@@ -1363,6 +2033,12 @@ impl FileResolutionFacts {
             .iter()
             .map(|fact| fact.reference)
             .collect::<HashSet<_>>();
+        let explicit_receiver_calls = self
+            .callable_receiver_origins
+            .iter()
+            .filter(|fact| fact.origin == ResolutionCallableReceiverOrigin::ExplicitExpression)
+            .map(|fact| fact.reference)
+            .collect::<HashSet<_>>();
         let mut references = HashSet::new();
         for reference in &self.package_references {
             assert!(
@@ -1377,7 +2053,12 @@ impl FileResolutionFacts {
             );
             let identifier = identifiers[&reference.reference];
             assert_eq!(identifier.role, ResolutionIdentifierRole::Reference);
-            assert!(identifier.qualifier.is_none());
+            assert!(
+                identifier.qualifier.is_none()
+                    || (identifier.namespace == ResolutionNamespace::Callable
+                        && explicit_receiver_calls.contains(&reference.reference)),
+                "only explicit receiver callable names may have qualified package routes"
+            );
             assert!(
                 !qualified.contains(&reference.reference),
                 "qualified terminal cannot demand a sibling package name"
@@ -1427,12 +2108,18 @@ impl FileResolutionFacts {
             .saturating_add(rows(&self.root_import_demands))
             .saturating_add(rows(&self.root_import_kinds))
             .saturating_add(rows(&self.root_import_demand_targets))
+            .saturating_add(rows(&self.import_selectors))
             .saturating_add(rows(&self.root_references))
             .saturating_add(rows(&self.root_reference_segments))
             .saturating_add(rows(&self.root_exports))
             .saturating_add(rows(&self.package_members))
             .saturating_add(rows(&self.go_package_imports))
             .saturating_add(rows(&self.package_references))
+            .saturating_add(rows(&self.package_object_exports))
+            .saturating_add(rows(&self.invocation_roles))
+            .saturating_add(rows(&self.singleton_relations))
+            .saturating_add(rows(&self.jvm_aliases))
+            .saturating_add(rows(&self.jvm_alias_owner_segments))
             .saturating_add(rows(&self.identifiers))
             .saturating_add(rows(&self.additional_definition_namespaces))
             .saturating_add(rows(&self.definition_units))
@@ -1443,6 +2130,19 @@ impl FileResolutionFacts {
             .saturating_add(rows(&self.binding_projections))
             .saturating_add(rows(&self.type_transfers))
             .saturating_add(rows(&self.type_components))
+            .saturating_add(rows(&self.type_productions))
+            .saturating_add(
+                self.type_productions
+                    .iter()
+                    .filter_map(|row| row.length.as_ref())
+                    .map(String::len)
+                    .sum::<usize>(),
+            )
+            .saturating_add(rows(&self.declared_type_arguments))
+            .saturating_add(rows(&self.type_arguments))
+            .saturating_add(rows(&self.generic_type_alias_parameters))
+            .saturating_add(rows(&self.generic_formal_defaults))
+            .saturating_add(rows(&self.generic_formals))
             .saturating_add(rows(&self.intrinsic_type_seeds))
             .saturating_add(rows(&self.calls))
             .saturating_add(
@@ -1455,7 +2155,9 @@ impl FileResolutionFacts {
                     })
                     .fold(0usize, usize::saturating_add),
             )
+            .saturating_add(rows(&self.call_argument_lists))
             .saturating_add(rows(&self.call_arguments))
+            .saturating_add(rows(&self.named_argument_labels))
             .saturating_add(rows(&self.call_type_arguments))
             .saturating_add(rows(&self.call_owner_type_arguments))
             .saturating_add(rows(&self.call_owner_type_segments))
@@ -1474,6 +2176,9 @@ impl FileResolutionFacts {
                     .fold(0usize, usize::saturating_add),
             )
             .saturating_add(rows(&self.callable_parameters))
+            .saturating_add(rows(&self.callable_parameter_lists))
+            .saturating_add(rows(&self.callable_parameter_semantics))
+            .saturating_add(rows(&self.extension_receivers))
             .saturating_add(rows(&self.callable_result_bindings))
             .saturating_add(rows(&self.callable_result_type_parameters))
             .saturating_add(rows(&self.callable_result_owner_type_parameters))
@@ -1496,94 +2201,234 @@ impl FileResolutionFacts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::structural::assert_vocabulary_round_trip;
 
     #[test]
     fn persisted_resolution_fact_vocabularies_are_unique_and_round_trip() {
-        macro_rules! check {
-            ($all:expr, $type:ty) => {{
-                let mut labels = std::collections::HashSet::new();
-                for &value in $all {
-                    assert!(labels.insert(value.label()), "duplicate label {value:?}");
-                    assert_eq!(<$type>::from_label(value.label()), Some(value));
-                    let json = serde_json::to_value(value).expect("serialize");
-                    assert_eq!(json, serde_json::Value::String(value.label().to_owned()));
-                    assert_eq!(
-                        serde_json::from_value::<$type>(json).expect("deserialize"),
-                        value
-                    );
-                }
-                assert_eq!(labels.len(), $all.len());
-            }};
-        }
-
-        check!(ALL_RESOLUTION_SITE_KINDS, ResolutionSiteKind);
-        check!(ALL_RESOLUTION_NAMESPACES, ResolutionNamespace);
-        check!(ALL_RESOLUTION_TYPE_SLOT_ROLES, ResolutionTypeSlotRole);
-        check!(ALL_DECLARATION_TYPE_ROLES, DeclarationTypeRole);
-        check!(ALL_BINDING_PROJECTION_KINDS, BindingProjectionKind);
-        check!(
+        assert_vocabulary_round_trip!(ALL_RESOLUTION_SITE_KINDS, ResolutionSiteKind);
+        assert_vocabulary_round_trip!(ALL_RESOLUTION_NAMESPACES, ResolutionNamespace);
+        assert_vocabulary_round_trip!(
+            ALL_RESOLUTION_IMPORT_SELECTOR_KINDS,
+            ResolutionImportSelectorKind
+        );
+        assert_vocabulary_round_trip!(
+            ALL_RESOLUTION_SINGLETON_RELATION_KINDS,
+            ResolutionSingletonRelationKind
+        );
+        assert_vocabulary_round_trip!(ALL_RESOLUTION_INVOCATION_ROLES, ResolutionInvocationRole);
+        assert_vocabulary_round_trip!(ALL_RESOLUTION_INVOCATION_ROLES, ResolutionInvocationRole);
+        assert_vocabulary_round_trip!(ALL_RESOLUTION_JVM_ALIAS_STATUSES, ResolutionJvmAliasStatus);
+        assert_vocabulary_round_trip!(ALL_RESOLUTION_JVM_ALIAS_KINDS, ResolutionJvmAliasKind);
+        assert_vocabulary_round_trip!(ALL_RESOLUTION_TYPE_SLOT_ROLES, ResolutionTypeSlotRole);
+        assert_vocabulary_round_trip!(ALL_DECLARATION_TYPE_ROLES, DeclarationTypeRole);
+        assert_vocabulary_round_trip!(ALL_BINDING_PROJECTION_KINDS, BindingProjectionKind);
+        assert_vocabulary_round_trip!(
             ALL_RESOLUTION_TYPE_TRANSFER_KINDS,
             ResolutionTypeTransferKind
         );
-        check!(
+        assert_vocabulary_round_trip!(
             ALL_RESOLUTION_TYPE_COMPONENT_KINDS,
             ResolutionTypeComponentKind
         );
-        check!(
+        assert_vocabulary_round_trip!(
             ALL_RESOLUTION_TYPE_CONSTRUCTOR_KINDS,
             ResolutionTypeConstructorKind
         );
-        check!(ALL_INTRINSIC_TYPE_KINDS, IntrinsicTypeKind);
-        check!(
+        assert_vocabulary_round_trip!(ALL_INTRINSIC_TYPE_KINDS, IntrinsicTypeKind);
+        assert_vocabulary_round_trip!(
             ALL_RESOLUTION_CALLABLE_RECEIVER_ORIGINS,
             ResolutionCallableReceiverOrigin
         );
-        check!(ALL_RESOLUTION_MEMBER_KINDS, ResolutionMemberKind);
-        check!(ALL_RESOLUTION_MEMBER_ACCESSES, ResolutionMemberAccess);
-        check!(
+        assert_vocabulary_round_trip!(ALL_RESOLUTION_MEMBER_KINDS, ResolutionMemberKind);
+        assert_vocabulary_round_trip!(ALL_RESOLUTION_MEMBER_ACCESSES, ResolutionMemberAccess);
+        assert_vocabulary_round_trip!(
             ALL_RESOLUTION_MEMBER_QUALIFIER_COMPATIBILITIES,
             ResolutionMemberQualifierCompatibility
         );
-        check!(
+        assert_vocabulary_round_trip!(
             ALL_RESOLUTION_DECLARED_TYPE_RELATION_KINDS,
             ResolutionDeclaredTypeRelationKind
         );
-        check!(ALL_RESOLUTION_ENGINE_RULE_KINDS, ResolutionEngineRuleKind);
-        check!(
+        assert_vocabulary_round_trip!(ALL_RESOLUTION_ENGINE_RULE_KINDS, ResolutionEngineRuleKind);
+        assert_vocabulary_round_trip!(
             ALL_RESOLUTION_CALLABLE_RECEIVER_FORMS,
             ResolutionCallableReceiverForm
         );
-        check!(ALL_RESOLUTION_SUPERTYPE_KINDS, ResolutionSupertypeKind);
-        check!(
+        assert_vocabulary_round_trip!(ALL_RESOLUTION_SUPERTYPE_KINDS, ResolutionSupertypeKind);
+        assert_vocabulary_round_trip!(
             ALL_RESOLUTION_CONSTRUCTION_REQUIREMENT_KINDS,
             ResolutionConstructionRequirementKind
         );
-        check!(ALL_RESOLUTION_GAP_KINDS, ResolutionGapKind);
+        assert_vocabulary_round_trip!(ALL_RESOLUTION_GAP_KINDS, ResolutionGapKind);
 
         assert!(ResolutionNamespace::from_label("not_a_namespace").is_none());
     }
 
     #[test]
-    fn reference_enumeration_gaps_participate_in_emptiness_and_retained_bytes() {
+    fn jvm_facts_participate_in_emptiness_and_retained_bytes() {
         let mut facts = FileResolutionFacts::default();
-        assert!(facts.is_empty());
-        assert_eq!(facts.estimated_retained_bytes(), 0);
-
+        let name = ResolutionNameId::new(0);
+        let declaration = ResolutionSiteId::new(0);
         facts
-            .reference_enumeration_gaps
-            .push(ResolutionReferenceEnumerationGapFact {
-                site: ResolutionSiteId::new(0),
-                kind: ResolutionGapKind::UnsupportedExpression,
+            .call_argument_lists
+            .push(ResolutionCallArgumentListFact {
+                call: ResolutionSiteId::new(1),
+                list_ordinal: 0,
+            });
+        facts.call_arguments.push(ResolutionCallArgumentFact {
+            call: ResolutionSiteId::new(1),
+            list_ordinal: 0,
+            ordinal: 0,
+            value: ResolutionTypeSlotId::new(1),
+            label: Some(name),
+        });
+        facts
+            .named_argument_labels
+            .push(ResolutionNamedArgumentLabelFact {
+                call: ResolutionSiteId::new(1),
+                reference: ResolutionSiteId::new(3),
+                label: name,
+            });
+        facts
+            .callable_parameter_semantics
+            .push(ResolutionCallableParameterSemanticsFact {
+                callable: declaration,
+                parameter: ResolutionSiteId::new(2),
+                list_ordinal: 0,
+                ordinal: 0,
+                label: name,
+                has_default: true,
+            });
+        facts
+            .callable_parameter_lists
+            .push(ResolutionCallableParameterListFact {
+                callable: declaration,
+                list_ordinal: 0,
+                contextual: false,
+            });
+        facts
+            .extension_receivers
+            .push(ResolutionExtensionReceiverFact {
+                callable: declaration,
+                receiver_type: ResolutionTypeSlotId::new(0),
+            });
+        facts.import_selectors.push(ResolutionImportSelectorFact {
+            site: ResolutionSiteId::new(3),
+            kind: ResolutionImportSelectorKind::Named,
+            source_name: Some(name),
+            local_name: Some(ResolutionNameId::new(1)),
+        });
+        facts
+            .singleton_relations
+            .push(ResolutionSingletonRelationFact {
+                declaration,
+                enclosing_type: None,
+                kind: ResolutionSingletonRelationKind::Object,
+            });
+        facts
+            .package_object_exports
+            .push(ResolutionPackageObjectExportFact {
+                package_object: declaration,
+                package_scope: ResolutionScopeId::new(0),
+                member: ResolutionSiteId::new(4),
+            });
+        facts.invocation_roles.push(ResolutionInvocationRoleFact {
+            site: ResolutionSiteId::new(1),
+            role: ResolutionInvocationRole::Direct,
+            receiver: None,
+            result: Some(ResolutionTypeSlotId::new(2)),
+        });
+        facts.jvm_aliases.push(ResolutionJvmAliasFact {
+            id: ResolutionJvmAliasId::new(0),
+            declaration,
+            member_name: name,
+            kind: ResolutionJvmAliasKind::Field,
+            is_static: true,
+            parameter_count: 0,
+            status: ResolutionJvmAliasStatus::SourceProven,
+        });
+        facts
+            .jvm_alias_owner_segments
+            .push(ResolutionJvmAliasOwnerSegmentFact {
+                alias: ResolutionJvmAliasId::new(0),
+                ordinal: 0,
+                name,
             });
 
         assert!(!facts.is_empty());
-        assert_eq!(
-            facts.estimated_retained_bytes(),
-            facts
-                .reference_enumeration_gaps
-                .capacity()
-                .saturating_mul(std::mem::size_of::<ResolutionReferenceEnumerationGapFact>())
-        );
+        let expected = facts
+            .call_argument_lists
+            .capacity()
+            .saturating_mul(std::mem::size_of::<ResolutionCallArgumentListFact>())
+            .saturating_add(
+                facts
+                    .call_arguments
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ResolutionCallArgumentFact>()),
+            )
+            .saturating_add(
+                facts
+                    .named_argument_labels
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ResolutionNamedArgumentLabelFact>()),
+            )
+            .saturating_add(
+                facts
+                    .callable_parameter_lists
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ResolutionCallableParameterListFact>()),
+            )
+            .saturating_add(
+                facts
+                    .callable_parameter_semantics
+                    .capacity()
+                    .saturating_mul(
+                        std::mem::size_of::<ResolutionCallableParameterSemanticsFact>(),
+                    ),
+            )
+            .saturating_add(
+                facts
+                    .extension_receivers
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ResolutionExtensionReceiverFact>()),
+            )
+            .saturating_add(
+                facts
+                    .import_selectors
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ResolutionImportSelectorFact>()),
+            )
+            .saturating_add(
+                facts
+                    .singleton_relations
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ResolutionSingletonRelationFact>()),
+            )
+            .saturating_add(
+                facts
+                    .package_object_exports
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ResolutionPackageObjectExportFact>()),
+            )
+            .saturating_add(
+                facts
+                    .invocation_roles
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ResolutionInvocationRoleFact>()),
+            )
+            .saturating_add(
+                facts
+                    .jvm_aliases
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ResolutionJvmAliasFact>()),
+            )
+            .saturating_add(
+                facts
+                    .jvm_alias_owner_segments
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ResolutionJvmAliasOwnerSegmentFact>()),
+            );
+        assert_eq!(facts.estimated_retained_bytes(), expected);
     }
 
     #[test]
@@ -1593,6 +2438,7 @@ mod tests {
             site: ResolutionSiteId::new(0),
             root_scope: ResolutionScopeId::new(0),
             anchor: ResolutionRootImportAnchor::Lexical,
+            position: None,
         });
         facts
             .root_import_segments
@@ -1618,6 +2464,7 @@ mod tests {
             root_scope: ResolutionScopeId::new(0),
             anchor: ResolutionRootImportAnchor::Absolute,
             prefix_reference: None,
+            owner_continued: false,
         });
         facts
             .root_reference_segments

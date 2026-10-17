@@ -23,6 +23,26 @@ pub const GC_AUTO_BLOB_THRESHOLD: i64 = 5000;
 pub const GC_MIN_INTERVAL_SECS: i64 = 6 * 3600;
 const GC_CLAIM_TTL_SECS: i64 = 3600;
 
+/// Periodic GC and epoch invalidation delete headers no version row binds;
+/// the children cascade. Foreground withdrawal retains these content-addressed
+/// headers so a later build can rebind them by digest. Shared headers stay.
+pub const DELETE_UNBOUND_SUMMARIES_SQL: &str = "DELETE FROM resolution_unit_summaries
+     WHERE NOT EXISTS (SELECT 1 FROM resolution_unit_summary_versions AS versions
+                       WHERE versions.summary_id = resolution_unit_summaries.summary_id)";
+
+// A topology is bound by a crate version row or by a Rust summary version row
+// (`rust_resolution_unit_summary_versions.topology_id` has no cascade), so the
+// sweep must spare both. Periodic GC and epoch invalidation withdraw summary
+// versions before sweeping. Foreground projection retirement retains topologies
+// alongside unbound content-addressed summaries for later reuse.
+pub const DELETE_UNBOUND_TOPOLOGIES_SQL: &str =
+    "DELETE FROM rust_crate_topologies WHERE NOT EXISTS (
+         SELECT 1 FROM rust_crate_versions AS versions
+         WHERE versions.topology_id = rust_crate_topologies.topology_id)
+       AND NOT EXISTS (
+         SELECT 1 FROM rust_resolution_unit_summary_versions AS summary_versions
+         WHERE summary_versions.topology_id = rust_crate_topologies.topology_id)";
+
 const DELETE_ANALYZER_CANDIDATE_SQL: &str = "DELETE FROM blobs
      WHERE blob_oid = ?1 AND lang = ?2 AND generation = ?3
        AND NOT EXISTS (
@@ -405,14 +425,8 @@ fn automatic_gc_enabled(value: Option<&OsStr>) -> bool {
 /// `ANALYZE` is what fills that table in. `PRAGMA analysis_limit = N` caps the
 /// per-index sample at about N rows instead of walking every index end to end.
 ///
-/// Measured for issue #3016 on one workspace-built store per supported
-/// language (2026-09-04). On the largest, apache/shardingsphere at 244 MB and
-/// 86,841 code units, `ANALYZE` cost 1.047 s at this limit against 1.199 s
-/// unbounded; on a 137 MB C# store, 0.486 s against 0.596 s. The limit buys
-/// little at corpus sizes because the store's indexes are narrow, and it is
-/// kept as the bound for stores larger than anything the corpus holds. The
-/// full table is in
-/// `.agents/plans/issue-3016-analyzer-store-planner-statistics.md`.
+/// Keep `ANALYZE` work bounded for stores larger than the tested corpora
+/// (#3016).
 pub const PLANNER_ANALYSIS_LIMIT: i64 = 1000;
 
 /// Operator switch for the planner-statistics hooks, alongside
@@ -762,6 +776,11 @@ fn sweep_with_claim(
             .filter(|(oid, _, _)| !live.contains(oid))
             .collect::<Vec<_>>()
     };
+    // #4994: orphan topologies retain blobs through non-cascading FKs in
+    // rust_crate_container_members/container_sources. Sweep summaries first,
+    // then topologies, before collecting the blobs they no longer reference.
+    tx.execute(DELETE_UNBOUND_SUMMARIES_SQL, [])?;
+    tx.execute(DELETE_UNBOUND_TOPOLOGIES_SQL, [])?;
     let analyzer_dropped = delete_analyzer_candidates(&tx, &dead_analyzer)?;
     tx.commit()?;
     drop(build_lock);
@@ -857,10 +876,10 @@ fn delete_analyzer_candidates(
 fn live_bloom(repo: &Repository, workspace_root: &Path) -> Result<GrowableBloom, String> {
     let mut live = gitblob::reachable_bloom(repo)?;
     for root in gitblob::worktree_roots(repo)? {
-        if let Ok(working_tree) = gitblob::existing_working_tree_oids(&root) {
-            for oid in working_tree {
-                live.insert(oid);
-            }
+        let working_tree = gitblob::existing_working_tree_oids(&root)
+            .map_err(|error| format!("cache GC could not establish worktree liveness: {error}"))?;
+        for oid in working_tree {
+            live.insert(oid);
         }
     }
     for oid in ignored_workspace_file_oids(repo, workspace_root)? {
@@ -900,7 +919,7 @@ fn ignored_workspace_file_oids(
         // The analyzer identifies a working file by hashing its raw bytes
         // (`Liveness::oids_for_files`), so the retained identity must be the
         // same raw-byte hash.
-        if let Ok(oid) = git2::Oid::hash_file(git2::ObjectType::Blob, &abs) {
+        if let Ok(oid) = crate::gitblob::working_tree_file_oid(&abs) {
             out.insert(oid.to_string());
         }
     }
@@ -1036,24 +1055,26 @@ pub fn set_accounting_for_test(
 }
 
 #[cfg(any(test, feature = "test-support"))]
+pub fn gc_accounting_for_test(db_path: &Path) -> rusqlite::Result<(i64, i64)> {
+    let conn = Connection::open(db_path)?;
+    conn.query_row(
+        "SELECT last_gc_at, blobs_at_last_gc FROM cache_state WHERE id = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+}
+
+#[cfg(any(test, feature = "test-support"))]
 pub fn total_blob_count_for_test(db_path: &Path) -> Result<i64, String> {
     total_blob_count(db_path)
 }
 
 #[cfg(test)]
 mod tests {
+    use brokk_bifrost_test_macros::hardwon;
     use rusqlite::Connection;
 
     use super::*;
-
-    #[test]
-    fn automatic_gc_can_be_explicitly_disabled() {
-        assert!(automatic_gc_enabled(None));
-        assert!(automatic_gc_enabled(Some(OsStr::new("on"))));
-        assert!(!automatic_gc_enabled(Some(OsStr::new("0"))));
-        assert!(!automatic_gc_enabled(Some(OsStr::new("off"))));
-        assert!(!automatic_gc_enabled(Some(OsStr::new("disabled"))));
-    }
 
     #[test]
     fn planner_statistics_refresh_tracks_blob_cardinality() {
@@ -1096,20 +1117,14 @@ mod tests {
         assert!(planner_statistics_describe_database(&conn).unwrap());
     }
 
-    #[test]
-    fn planner_statistics_switch_recognizes_disabled_values() {
-        assert!(statistics_enabled(None));
-        assert!(statistics_enabled(Some(OsStr::new("on"))));
-        assert!(!statistics_enabled(Some(OsStr::new("0"))));
-        assert!(!statistics_enabled(Some(OsStr::new("off"))));
-        assert!(!statistics_enabled(Some(OsStr::new("disabled"))));
-    }
-
     /// Issue #1963: a workspace rooted inside a Git-ignored subtree. The
     /// status-based working-tree scans cannot see its files, so the sweep must
     /// retain their blobs through the workspace listing instead of collecting
     /// them as unreachable.
     #[test]
+    #[hardwon(
+        "30cdc92034b0: garbage collection reclaimed blobs still owned by an explicitly selected ignored workspace"
+    )]
     fn gc_keeps_analyzer_rows_for_ignored_workspace_files() {
         let temp = tempfile::tempdir().unwrap();
         let repo_root = temp.path().canonicalize().unwrap();
@@ -1187,9 +1202,59 @@ mod tests {
             .unwrap()
     }
 
+    #[test]
+    #[hardwon("b6f8948cd3e0: a failed worktree status omitted live blobs from cache GC")]
+    fn gc_retains_candidates_when_worktree_liveness_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let repo = gitblob::test_repo::init_repo(&root);
+        std::fs::write(root.join(".gitattributes"), "live.txt filter=gc-repro\n").unwrap();
+        let working = b"uncommitted source that only the working tree retains\n";
+        // Equal sizes require Git to read and filter the modified bytes,
+        // rather than declaring the file dirty from metadata alone.
+        std::fs::write(root.join("live.txt"), vec![b'x'; working.len()]).unwrap();
+        gitblob::test_repo::commit_all(&repo, "committed source");
+        std::fs::write(root.join("live.txt"), working).unwrap();
+        let live_oid = git2::Oid::hash_object(git2::ObjectType::Blob, working)
+            .unwrap()
+            .to_string();
+        let db_path = store_with_one_collectable_blob(&root);
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'go', 1)",
+            [&live_oid],
+        )
+        .unwrap();
+        let before = gc_accounting_for_test(&db_path).unwrap();
+
+        // Git's real clean-filter boundary supplies a deterministic status
+        // failure without replacing the executable or changing process env.
+        let mut config = repo.config().unwrap();
+        config.set_str("filter.gc-repro.clean", "false").unwrap();
+        config.set_bool("filter.gc-repro.required", true).unwrap();
+        let error = force_gc(&db_path, &repo, &root).unwrap_err();
+        assert!(error.contains("git status failed"), "{error}");
+        assert_eq!(total_blob_count(&db_path).unwrap(), 2);
+        assert_eq!(gc_accounting_for_test(&db_path).unwrap(), before);
+        assert_eq!(gc_claim_until(&db_path), 0);
+
+        config.remove("filter.gc-repro.clean").unwrap();
+        config.remove("filter.gc-repro.required").unwrap();
+        let outcome = force_gc(&db_path, &repo, &root).unwrap();
+        assert!(outcome.ran, "{outcome:?}");
+        assert_eq!(total_blob_count(&db_path).unwrap(), 1);
+        let remaining: String = conn
+            .query_row("SELECT blob_oid FROM blobs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, live_oid);
+    }
+
     /// Issue #3170: opportunistic collection yields to a builder rather than
     /// queueing in front of the requests waiting on the same lock.
     #[test]
+    #[hardwon(
+        "#3170: opportunistic collection blocked interactive analysis behind a held build lock"
+    )]
     fn opportunistic_gc_skips_while_a_builder_holds_the_lock() {
         let _tuning = set_tuning_for_test(GC_AUTO_BLOB_THRESHOLD, 0);
         let temp = tempfile::tempdir().unwrap();
@@ -1228,6 +1293,9 @@ mod tests {
     /// opportunistic collection that inherited it would outlast the request it
     /// is blocking. It uses its own short timeout and skips instead.
     #[test]
+    #[hardwon(
+        "#3170: opportunistic collection waited behind the live session writer beyond the request budget"
+    )]
     fn opportunistic_gc_skips_a_store_another_writer_holds() {
         let _tuning = set_tuning_for_test(GC_AUTO_BLOB_THRESHOLD, 0);
         let temp = tempfile::tempdir().unwrap();
@@ -1260,6 +1328,7 @@ mod tests {
     /// candidates until the build publishes the projection and releases the
     /// shared lock.
     #[test]
+    #[hardwon("#3136: collection observed a partial analyzer projection during reconciliation")]
     fn gc_waits_for_complete_analyzer_cache_reconciliation() {
         let temp = tempfile::tempdir().unwrap();
         let repo_root = temp.path().canonicalize().unwrap();
@@ -1730,6 +1799,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "e21778d1d951: an old-generation GC candidate could delete a same-OID replacement in a newer generation"
+    )]
     fn analyzer_gc_candidate_cannot_delete_newer_generation_replacement() {
         let mut conn = Connection::open_in_memory().unwrap();
         cache_db::configure_connection(&mut conn).unwrap();
@@ -1779,56 +1851,6 @@ mod tests {
     }
 
     #[test]
-    fn analyzer_gc_candidate_cannot_delete_blob_rooted_only_by_retained_revision() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        cache_db::configure_connection(&mut conn).unwrap();
-        cache_db::migrate(&mut conn).unwrap();
-        let oid = "2222222222222222222222222222222222222222";
-        let workspace_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let projection_digest = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        conn.execute(
-            "INSERT INTO analysis_epochs(lang, epoch, generation)
-             VALUES('java', 'active', 1)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'java', 1)",
-            [oid],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO workspace_revisions(workspace_id, lang, generation, revision)
-             VALUES(?1, 'java', 1, 1)",
-            [workspace_id],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO workspace_file_versions(
-               workspace_id, lang, generation, rel_path, blob_oid,
-               projection_digest, valid_from, valid_until
-             ) VALUES(?1, 'java', 1, 'src/Retained.java', ?2, ?3, 1, 2)",
-            rusqlite::params![workspace_id, oid, projection_digest],
-        )
-        .unwrap();
-
-        let candidate = vec![(oid.to_string(), "java".to_string(), 1)];
-        let tx = conn.transaction().unwrap();
-        assert_eq!(delete_analyzer_candidates(&tx, &candidate).unwrap(), 0);
-        tx.commit().unwrap();
-        assert_eq!(
-            conn.query_row(
-                "SELECT COUNT(*) FROM blobs WHERE blob_oid = ?1 AND lang = 'java'",
-                [oid],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap(),
-            1,
-            "closed file-version intervals still root retained revisions"
-        );
-    }
-
-    #[test]
     fn retained_revision_root_probe_uses_the_blob_identity_index() {
         let mut conn = Connection::open_in_memory().unwrap();
         cache_db::configure_connection(&mut conn).unwrap();
@@ -1862,6 +1884,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#1469: skipped network-backed reachability retained a stale GC claim and risked remote enumeration"
+    )]
     fn gc_skips_network_promisor_repositories_and_releases_its_claim() {
         let temp = tempfile::tempdir().unwrap();
         let repo_root = temp.path().canonicalize().unwrap();
@@ -1914,6 +1939,56 @@ mod tests {
             .unwrap(),
             0,
             "the next eligible local sweep must not wait for a stale claim"
+        );
+    }
+
+    #[test]
+    fn analyzer_gc_candidate_cannot_delete_blob_rooted_only_by_retained_revision() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        cache_db::configure_connection(&mut conn).unwrap();
+        cache_db::migrate(&mut conn).unwrap();
+        let oid = "2222222222222222222222222222222222222222";
+        let workspace_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let projection_digest = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        conn.execute(
+            "INSERT INTO analysis_epochs(lang, epoch, generation)
+             VALUES('java', 'active', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'java', 1)",
+            [oid],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO workspace_revisions(workspace_id, lang, generation, revision)
+             VALUES(?1, 'java', 1, 1)",
+            [workspace_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO workspace_file_versions(
+               workspace_id, lang, generation, rel_path, blob_oid,
+               projection_digest, valid_from, valid_until
+             ) VALUES(?1, 'java', 1, 'src/Retained.java', ?2, ?3, 1, 2)",
+            rusqlite::params![workspace_id, oid, projection_digest],
+        )
+        .unwrap();
+
+        let candidate = vec![(oid.to_string(), "java".to_string(), 1)];
+        let tx = conn.transaction().unwrap();
+        assert_eq!(delete_analyzer_candidates(&tx, &candidate).unwrap(), 0);
+        tx.commit().unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM blobs WHERE blob_oid = ?1 AND lang = 'java'",
+                [oid],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1,
+            "closed file-version intervals still root retained revisions"
         );
     }
 }

@@ -332,11 +332,15 @@ mod tests {
     use super::*;
     use crate::analyzer::{AnalyzerDefinitionLookup, KotlinAnalyzer};
     use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_test_macros::hardwon;
 
     /// Cost pin for the scan-path milestone: after `prefetch_import_targets`,
     /// resolving the import paths the candidate walk will ask about costs no
     /// further store reads, and the memoized answers are the point path's.
     #[test]
+    #[hardwon(
+        "#2883: Kotlin import prefetch left candidate lookups on per-import relational reads"
+    )]
     fn import_target_prefetch_fills_the_shared_definition_memo() {
         let fixture = InlineTestProject::with_language(Language::Kotlin)
             .file(

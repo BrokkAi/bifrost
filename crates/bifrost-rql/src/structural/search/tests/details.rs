@@ -192,6 +192,9 @@ class Controller {
 }
 
 #[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#2816: do not claim a complete semantic port for a syntax-only decorated parameter"
+)]
 fn decorated_parameter_without_semantic_procedure_stays_incomplete() {
     let source = r#"
 import { Query as NestQuery } from "@nestjs/common";
@@ -1084,6 +1087,251 @@ export function caller() { const service = new Service(); const alias = service;
     );
 }
 
+#[test]
+fn call_site_rows_join_exactly_to_their_ordered_program_points() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"call-point-join\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .file(
+            "src/lib.rs",
+            "pub fn target() {}\npub fn caller() { target(); target(); }\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let calls = CodeQuery::from_json(&json!({
+        "match": { "kind": "function", "name": "caller" },
+        "steps": [
+            { "op": "enclosing_decl" },
+            { "op": "call_sites_from" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("call-site query");
+    let calls = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &calls,
+    );
+    assert_eq!(calls.results.len(), 2, "{}", calls.render_text());
+    let call_rows = calls
+        .results
+        .iter()
+        .map(|item| match &item.value {
+            CodeQueryResultValue::CallSite { value } => value,
+            other => panic!("expected call-site rows, got {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_ne!(call_rows[0].site_id, call_rows[1].site_id);
+    let point_ids = call_rows
+        .iter()
+        .map(|row| {
+            row.program_point_id
+                .as_deref()
+                .expect("each exact source call joins to one semantic point")
+        })
+        .collect::<Vec<_>>();
+    assert_ne!(point_ids[0], point_ids[1]);
+
+    let relation_query = CodeQuery::from_json(&json!({
+        "match": { "kind": "function", "name": "caller" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "control_relations", "control_relation": ["dominates"] }
+        ]
+    }))
+    .expect("control relation query");
+    let relations = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &relation_query,
+    );
+    assert!(
+        relations.results.iter().any(|item| {
+            matches!(&item.value,
+                CodeQueryResultValue::ControlRelation { value }
+                    if value.relation == "dominates"
+                        && value.completeness == "complete"
+                        && value.source.id == point_ids[0]
+                        && value.target.id == point_ids[1])
+        }),
+        "the call-site point IDs must join the complete CFG relation endpoints: {}",
+        relations.render_text()
+    );
+}
+
+#[test]
+fn rust_points_to_candidate_rows_keep_allocation_and_field_identity() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"resource-identity\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .file(
+            "src/lib.rs",
+            r#"use std::sync::Mutex;
+pub struct Service(u32);
+impl Service { pub fn run(&self) {} }
+pub struct Shared { pub lock: Mutex<()>, pub other: Mutex<()> }
+pub struct TupleShared(pub Mutex<()>, pub Mutex<()>);
+mod helpers;
+static SERVICE_A: Service = Service(1);
+static SERVICE_B: Service = Service(2);
+static SHARED: Shared = Shared { lock: Mutex::new(()), other: Mutex::new(()) };
+static TUPLE_SHARED: TupleShared = TupleShared(Mutex::new(()), Mutex::new(()));
+pub fn allocations() {
+    let alias = &SERVICE_A;
+    alias.run();
+    SERVICE_A.run();
+    SERVICE_B.run();
+    let dynamic = Service(3);
+    dynamic.run();
+}
+pub fn fields() {
+    helpers::lock_first(&SHARED);
+    helpers::lock_again(&SHARED);
+    helpers::lock_other(&SHARED);
+}
+pub fn tuple_fields() {
+    helpers::tuple_first(&TUPLE_SHARED);
+    helpers::tuple_first_again(&TUPLE_SHARED);
+    helpers::tuple_other(&TUPLE_SHARED);
+}
+pub fn lock_static_first() { let _guard = SHARED.lock.lock().unwrap(); }
+pub fn lock_static_again() { let _guard = SHARED.lock.lock().unwrap(); }
+pub fn lock_static_other() { let _guard = SHARED.other.lock().unwrap(); }
+pub fn tuple_static_first() { let _guard = TUPLE_SHARED.0.lock().unwrap(); }
+pub fn tuple_static_again() { let _guard = TUPLE_SHARED.0.lock().unwrap(); }
+pub fn tuple_static_other() { let _guard = TUPLE_SHARED.1.lock().unwrap(); }
+"#,
+        )
+        .file(
+            "src/helpers.rs",
+            r#"use crate::Shared;
+pub fn lock_first(shared: &Shared) { let _guard = shared.lock.lock().unwrap(); }
+pub fn lock_again(shared: &Shared) { let _guard = shared.lock.lock().unwrap(); }
+pub fn lock_other(shared: &Shared) { let _guard = shared.other.lock().unwrap(); }
+pub fn tuple_first(shared: &crate::TupleShared) { let _guard = shared.0.lock().unwrap(); }
+pub fn tuple_first_again(shared: &crate::TupleShared) { let _guard = shared.0.lock().unwrap(); }
+pub fn tuple_other(shared: &crate::TupleShared) { let _guard = shared.1.lock().unwrap(); }
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+
+    let query = |function: &str, callee: &str, receiver: &str| {
+        CodeQuery::from_json(&json!({
+            "match": {
+                "kind": "call",
+                "callee": { "name": callee },
+                "receiver": { "capture": receiver }
+            },
+            "inside": { "kind": "function", "name": function },
+            "steps": [
+                { "op": "points_to", "capture": receiver },
+                { "op": "points_to_candidates" }
+            ],
+            "result_detail": "full"
+        }))
+        .expect("points-to candidate query")
+    };
+    let execute = |query: &CodeQuery| {
+        execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            query,
+        )
+    };
+
+    let allocations = execute(&query("allocations", "run", "service"));
+    assert_eq!(
+        allocations.results.len(),
+        4,
+        "{}",
+        allocations.render_text()
+    );
+    let allocation_rows = allocations
+        .results
+        .iter()
+        .map(|item| match &item.value {
+            CodeQueryResultValue::PointsToCandidate { value } => value,
+            other => panic!("expected points-to candidate, got {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        allocation_rows.iter().all(|row| {
+            !row.site_id.is_empty()
+                && row.program_point_id.is_some()
+                && row.proof == "proven"
+                && row.completeness == "complete"
+        }),
+        "each operand candidate joins its semantic call point: {allocation_rows:#?}"
+    );
+    assert!(
+        allocation_rows[..3].iter().all(|row| {
+            row.object_id.is_some()
+                && row.object_cardinality == Some("singleton")
+                && row.proof == "proven"
+                && row.completeness == "complete"
+                && row.coverage == "exhaustive"
+        }),
+        "each proven static root has one complete candidate: {allocation_rows:#?}"
+    );
+    assert_eq!(allocation_rows[0].object_id, allocation_rows[1].object_id);
+    assert_ne!(allocation_rows[1].object_id, allocation_rows[2].object_id);
+    assert_eq!(allocation_rows[3].object_id, None);
+    assert_eq!(allocation_rows[3].coverage, "open");
+
+    let first_result = execute(&query("lock_static_first", "lock", "mutex"));
+    let again_result = execute(&query("lock_static_again", "lock", "mutex"));
+    let other_result = execute(&query("lock_static_other", "lock", "mutex"));
+    let candidate = |result: &CodeQueryResult| {
+        assert_eq!(result.results.len(), 1, "{}", result.render_text());
+        let CodeQueryResultValue::PointsToCandidate { value } = &result.results[0].value else {
+            panic!("expected one points-to candidate: {}", result.render_text());
+        };
+        *value.clone()
+    };
+    let first = candidate(&first_result);
+    let again = candidate(&again_result);
+    let other = candidate(&other_result);
+    assert!(
+        [&first, &again, &other].iter().all(|row| {
+            row.object_id.is_some()
+                && row.object_cardinality == Some("singleton")
+                && row.proof == "proven"
+                && row.completeness == "complete"
+                && row.coverage == "exhaustive"
+                && row.program_point_id.is_some()
+        }),
+        "resolved field paths retain complete identity through helper bindings: {first:#?} {again:#?} {other:#?}"
+    );
+    assert_eq!(first.object_id, again.object_id);
+    assert_ne!(first.object_id, other.object_id);
+
+    let tuple_first_result = execute(&query("tuple_static_first", "lock", "mutex"));
+    let tuple_again_result = execute(&query("tuple_static_again", "lock", "mutex"));
+    let tuple_other_result = execute(&query("tuple_static_other", "lock", "mutex"));
+    let tuple_first = candidate(&tuple_first_result);
+    let tuple_again = candidate(&tuple_again_result);
+    let tuple_other = candidate(&tuple_other_result);
+    assert!(
+        [&tuple_first, &tuple_again, &tuple_other]
+            .iter()
+            .all(|row| {
+                row.object_id.is_some()
+                    && row.object_cardinality == Some("singleton")
+                    && row.proof == "proven"
+                    && row.completeness == "complete"
+                    && row.coverage == "exhaustive"
+            }),
+        "tuple-index field paths retain complete identity: {tuple_first:#?} {tuple_again:#?} {tuple_other:#?}"
+    );
+    assert_eq!(tuple_first.object_id, tuple_again.object_id);
+    assert_ne!(tuple_first.object_id, tuple_other.object_id);
+}
+
 /// A receiver that may hold either of two allocation types keeps both
 /// candidates visible: the outcome row is ambiguous with open coverage, and
 /// each candidate type has its own evidence row.
@@ -1721,7 +1969,7 @@ fn result_contract_use_schema_exposes_exact_call_argument_identity() {
 }
 
 #[test]
-fn result_contract_rows_publish_finite_boolean_predicate_values() {
+fn result_contract_rows_publish_finite_result_predicate_values() {
     for (domain, fields, names) in [
         (
             "call_result_contract",
@@ -1749,7 +1997,15 @@ fn result_contract_rows_publish_finite_boolean_predicate_values() {
                 .expect("a result predicate has a finite registered domain");
             assert_eq!(
                 values,
-                ["null", "non_null", "true", "false"],
+                [
+                    "null",
+                    "non_null",
+                    "true",
+                    "false",
+                    "eof",
+                    "nonzero",
+                    "minus_one"
+                ],
                 "{domain}.{name}"
             );
         }
@@ -1793,7 +2049,8 @@ fn result_contract_failure_use_schema_separates_call_and_structural_site_identit
 /// matched the declaration's own span and otherwise falls back to the code
 /// unit's coarse type, so its published domain must be exactly the union of the
 /// two vocabularies -- no more (which would admit a literal no row can hold)
-/// and no less (which would reject a legitimate one).
+/// and no less (which would reject a legitimate one). `await` is a structural
+/// expression kind and cannot refine a declaration row.
 #[test]
 fn the_declaration_kind_domain_is_exactly_the_union_of_its_two_producers() {
     let published = DetailedCodeQueryDomain::Declaration
@@ -1805,8 +2062,10 @@ fn the_declaration_kind_domain_is_exactly_the_union_of_its_two_producers() {
         .expect("declaration.kind publishes an enumerated domain");
     let expected: std::collections::BTreeSet<&str> = NormalizedKind::LABELS
         .iter()
-        .chain(CodeUnitType::DISPLAY_LOWERCASE_LABELS)
-        .copied()
+        .filter_map(|label| NormalizedKind::from_label(label))
+        .filter(|kind| relations::refined_declaration_kind(*kind))
+        .map(NormalizedKind::label)
+        .chain(CodeUnitType::DISPLAY_LOWERCASE_LABELS.iter().copied())
         .collect();
     let published: std::collections::BTreeSet<&str> = published.iter().copied().collect();
     assert_eq!(published, expected);
@@ -2036,6 +2295,9 @@ fn effect_row_domains_project_their_registered_surface_without_an_active_pack() 
 /// `src/b.ts` and is rendered first, so `src/b.ts` is probed while sealed and
 /// its own rows come afterwards.
 #[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "5a70ee1ad520: a refused render probe must not poison a later file's coordinates"
+)]
 fn a_probe_refused_by_the_render_seal_leaves_that_file_its_own_coordinates() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file(

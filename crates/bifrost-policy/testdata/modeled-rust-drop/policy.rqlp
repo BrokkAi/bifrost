@@ -1,0 +1,26 @@
+; Test-only #5236 policy, deliberately selecting receiver occurrences.
+(policy
+  :schema-version 1
+  :id "test.rust.modeled-drop"
+  :name "Modeled Rust reference results"
+  :message "Sensitive receiver reaches output"
+  :severity warning
+  :analysis (analysis
+    :type taint
+    :mode may
+    :call-modeling (call-modeling :unmodeled require-model)
+    :sources (endpoint-set :entries [
+      (source :id password :display-name "Sensitive receiver" :categories [data.sensitive]
+        :selector (rql :schema-version 1
+          (language rust
+            (occurrences-in :role [receiver_position] :namespace value
+              (identifier :name "password"))))
+        :bind matched-value :labels [sensitive])])
+    :sinks (endpoint-set :entries [
+      (sink :id output :display-name "Print" :categories [logging]
+        :selector (rql :schema-version 1
+          (language rust
+            (resolved-call :resolves-to "std.io.stdio._print" :proof declared
+              (call-bindings (call-shape (call))))))
+        :dangerous-operand (argument :index 0) :accepts [sensitive])])
+  ))

@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use brokk_bifrost_test_macros::hardwon;
 
 use crate::analyzer::Language;
 use crate::analyzer::store::AnalyzerStore;
@@ -39,16 +39,17 @@ fn js_ts_source_facts_reopen_without_source_and_mount_exact_bridges() {
     std::fs::remove_file(second.abs_path()).unwrap();
     let store = AnalyzerStore::open_persistent(&path).unwrap();
     let generation = store.current_generation("typescript:ts").unwrap();
-    let first = store
-        .js_ts_source_facts(oid, generation, &TypescriptAdapter, &file, &|| true)
-        .unwrap()
-        .unwrap();
-    let mounted = store
-        .js_ts_source_facts(oid, generation, &TypescriptAdapter, &second, &|| true)
-        .unwrap()
-        .unwrap();
+    let (first, mounted) = super::assert_source_facts_match_across_mounts(
+        &store,
+        generation,
+        &file,
+        &second,
+        |store, generation, file, cancellation| {
+            store.js_ts_source_facts(oid, generation, &TypescriptAdapter, file, cancellation)
+        },
+        |read| &read.facts,
+    );
     assert_eq!(&first.facts, expected);
-    assert_eq!(first.facts, mounted.facts);
     assert_eq!(
         first.source,
         state.source_facts.as_ref().unwrap().occurrences
@@ -69,22 +70,9 @@ fn js_ts_source_facts_reopen_without_source_and_mount_exact_bridges() {
             .flatten()
             .all(|unit| unit.source() == &second)
     );
-    let visits = Cell::new(0);
-    assert!(
-        store
-            .js_ts_source_facts(oid, generation, &TypescriptAdapter, &file, &|| {
-                visits.set(visits.get() + 1);
-                visits.get() < 5
-            })
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        store
-            .js_ts_source_facts(oid, generation, &TypescriptAdapter, &file, &|| true)
-            .unwrap()
-            .is_some()
-    );
+    super::assert_source_read_cancellation_retries(|cancellation| {
+        store.js_ts_source_facts(oid, generation, &TypescriptAdapter, &file, cancellation)
+    });
     store
         .conn
         .execute(|conn| {
@@ -139,6 +127,7 @@ fn js_ts_source_publication_distinguishes_empty_missing_and_sealed() {
 }
 
 #[test]
+#[hardwon("b56b2a445578: irrelevant JS/TS type links survived publication and read")]
 fn js_ts_source_reader_rejects_invalid_type_links() {
     let fixture = InlineTestProject::with_language(Language::TypeScript)
         .file("types.ts", SOURCE)

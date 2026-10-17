@@ -3,6 +3,7 @@ use crate::analyzer::usages::receiver_analysis::{
     ReceiverAnalysisBudget, ReceiverAnalysisWork, ReceiverBudgetLimit,
 };
 use crate::cancellation::CancellationToken;
+use crate::hash::HashSet;
 use std::cell::RefCell;
 
 #[derive(Debug)]
@@ -42,6 +43,17 @@ struct ResolutionState {
     stop: Option<ResolutionStop>,
 }
 
+/// One selected owner frontier in a request's expansion budget. The number
+/// is an operation-local alias, never canonical content or a persisted key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResolutionOwnerFrontier(u64);
+
+impl ResolutionOwnerFrontier {
+    pub const fn new(operation_alias: u64) -> Self {
+        Self(operation_alias)
+    }
+}
+
 /// Work and cancellation state shared by one bounded exact-resolution request.
 ///
 /// An unbounded session preserves the ordinary lookup APIs without charging.
@@ -52,6 +64,7 @@ pub struct ResolutionSession {
     budget: Option<ReceiverAnalysisBudget>,
     cancellation: Option<CancellationToken>,
     state: RefCell<ResolutionState>,
+    expanded_owners: RefCell<HashSet<ResolutionOwnerFrontier>>,
 }
 
 impl ResolutionSession {
@@ -60,6 +73,7 @@ impl ResolutionSession {
             budget: None,
             cancellation: None,
             state: RefCell::new(ResolutionState::default()),
+            expanded_owners: RefCell::default(),
         }
     }
 
@@ -73,7 +87,73 @@ impl ResolutionSession {
                 cancellation.map_or_else(CancellationToken::new, |token| token.child()),
             ),
             state: RefCell::new(ResolutionState::default()),
+            expanded_owners: RefCell::default(),
         }
+    }
+
+    /// Start an independent bounded request after work shared by its batch.
+    ///
+    /// The shared work counts against this request's own budget, but its stop
+    /// state and cancellation token do not. One locator can therefore exhaust
+    /// its remaining allowance without cancelling its siblings.
+    pub fn bounded_after_shared_work(
+        budget: ReceiverAnalysisBudget,
+        cancellation: Option<&CancellationToken>,
+        shared_work: ReceiverAnalysisWork,
+    ) -> Self {
+        assert!(shared_work.scope_nodes <= budget.max_scope_nodes);
+        assert!(shared_work.summary_expansions <= budget.max_summary_expansions);
+        assert!(shared_work.resolution_rounds <= budget.max_resolution_rounds);
+        Self {
+            budget: Some(budget),
+            cancellation: Some(
+                cancellation.map_or_else(CancellationToken::new, |token| token.child()),
+            ),
+            state: RefCell::new(ResolutionState {
+                work: shared_work,
+                stop: None,
+            }),
+            expanded_owners: RefCell::default(),
+        }
+    }
+
+    /// Run one resolution against a bounded session and return its terminal outcome.
+    pub fn run_bounded<T>(
+        budget: ReceiverAnalysisBudget,
+        cancellation: Option<&CancellationToken>,
+        resolve: impl FnOnce(&Self) -> T,
+    ) -> BoundedResolution<T> {
+        let session = Self::bounded(budget, cancellation);
+        let value = resolve(&session);
+        session.finish(value)
+    }
+
+    /// Run a query through `session` when present, otherwise run it unbounded.
+    pub fn query_with_optional_session<T>(
+        session: Option<&Self>,
+        query: impl FnOnce() -> T,
+    ) -> Option<T> {
+        match session {
+            Some(session) => session.query(query),
+            None => Some(query()),
+        }
+    }
+
+    /// Run a limited row query when `session` is present, with an unbounded fallback.
+    pub fn query_limited_rows_with_optional_session<T>(
+        session: Option<&Self>,
+        limited_query: impl FnOnce(usize) -> LimitedQueryRows<T>,
+        unbounded_query: impl FnOnce() -> Vec<T>,
+    ) -> Vec<T> {
+        match session {
+            Some(session) => session.query_limited_rows(limited_query),
+            None => unbounded_query(),
+        }
+    }
+
+    /// Charge one scope step when a session is present; absent sessions are unbounded.
+    pub fn scope_step_with_optional_session(session: Option<&Self>) -> bool {
+        session.is_none_or(Self::scope_step)
     }
 
     pub fn finish<T>(&self, value: T) -> BoundedResolution<T> {
@@ -107,6 +187,33 @@ impl ResolutionSession {
 
     pub fn summary_step(&self) -> bool {
         self.charge(ReceiverBudgetLimit::SummaryExpansions)
+    }
+
+    /// Expand one selected owner frontier once in this request. The identity
+    /// comes from the caller's selected source, never from a spelling. This
+    /// set dies with the session and cannot exceed its summary allowance.
+    pub fn summary_expansion(&self, owner: ResolutionOwnerFrontier) -> bool {
+        if self.budget.is_none() {
+            return self.observe_cancellation();
+        }
+        if !self.observe_cancellation() {
+            return false;
+        }
+        let mut expanded = self.expanded_owners.borrow_mut();
+        if expanded.contains(&owner) {
+            return true;
+        }
+        if !self.summary_step() {
+            return false;
+        }
+        expanded.insert(owner);
+        true
+    }
+
+    /// Solver convergence and lexical worklist rounds are iteration work,
+    /// not owner expansions, and have their own independent allowance.
+    pub fn round_step(&self) -> bool {
+        self.charge(ReceiverBudgetLimit::ResolutionRounds)
     }
 
     pub fn query<T>(&self, query: impl FnOnce() -> T) -> Option<T> {
@@ -209,6 +316,21 @@ impl ResolutionSession {
         self.cancellation.as_ref()
     }
 
+    /// The exact remaining allowance for a demand answer memo. A stopped
+    /// session still has to pass observe_cancellation before using this value.
+    pub fn remaining_budget(&self) -> Option<ReceiverAnalysisBudget> {
+        self.budget.map(|mut budget| {
+            let state = self.state.borrow();
+            budget.max_scope_nodes = budget
+                .max_scope_nodes
+                .saturating_sub(state.work.scope_nodes);
+            budget.max_summary_expansions = budget
+                .max_summary_expansions
+                .saturating_sub(state.work.summary_expansions);
+            budget
+        })
+    }
+
     /// Maximum provider rows needed to either consume the remaining scope
     /// budget or observe the first row that proves exhaustion.
     pub fn scope_lookahead_limit(&self) -> usize {
@@ -263,6 +385,10 @@ impl ResolutionSession {
                 &mut state.work.summary_expansions,
                 budget.max_summary_expansions,
             ),
+            ReceiverBudgetLimit::ResolutionRounds => (
+                &mut state.work.resolution_rounds,
+                budget.max_resolution_rounds,
+            ),
         };
         if *used == maximum {
             state.stop = Some(ResolutionStop::Exceeded(limit));
@@ -282,8 +408,58 @@ impl ResolutionSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
+    fn distinct_owners_and_resolution_rounds_have_independent_limits() {
+        let caller = CancellationToken::new();
+        let budget = ReceiverAnalysisBudget {
+            max_summary_expansions: 1,
+            max_resolution_rounds: 2,
+            ..ReceiverAnalysisBudget::default()
+        };
+        let session = ResolutionSession::bounded(budget, Some(&caller));
+        assert!(session.summary_expansion(ResolutionOwnerFrontier::new(1)));
+        assert!(session.round_step());
+        assert!(session.summary_expansion(ResolutionOwnerFrontier::new(1)));
+        assert!(session.round_step());
+        assert!(!session.round_step());
+        assert!(matches!(
+            session.finish(()),
+            BoundedResolution::Exceeded {
+                limit: ReceiverBudgetLimit::ResolutionRounds,
+                work: ReceiverAnalysisWork {
+                    summary_expansions: 1,
+                    resolution_rounds: 2,
+                    ..
+                },
+            }
+        ));
+        assert_eq!(
+            ReceiverBudgetLimit::ResolutionRounds.as_str(),
+            "resolution_rounds"
+        );
+        assert!(!caller.is_cancelled());
+
+        let sibling = ResolutionSession::bounded(budget, Some(&caller));
+        assert!(sibling.summary_expansion(ResolutionOwnerFrontier::new(1)));
+        assert!(!sibling.summary_expansion(ResolutionOwnerFrontier::new(2)));
+        assert!(matches!(
+            sibling.finish(()),
+            BoundedResolution::Exceeded {
+                limit: ReceiverBudgetLimit::SummaryExpansions,
+                work: ReceiverAnalysisWork {
+                    summary_expansions: 1,
+                    resolution_rounds: 0,
+                    ..
+                },
+            }
+        ));
+        assert!(!caller.is_cancelled());
+    }
+
+    #[test]
+    #[hardwon("011426732633: bulk scope resolution failed to charge bounded work")]
     fn bulk_scope_charges_preserve_budgets_and_skip_unbounded_work() {
         let unbounded = ResolutionSession::unbounded();
         assert!(unbounded.scope_steps(usize::MAX));
@@ -315,7 +491,6 @@ mod tests {
             BoundedResolution::Cancelled { .. }
         ));
     }
-
     #[test]
     fn budget_stop_cancels_only_the_operation_token() {
         let caller = CancellationToken::new();
@@ -342,5 +517,35 @@ mod tests {
                 work: ReceiverAnalysisWork { scope_nodes: 0, .. }
             }
         ));
+    }
+
+    #[test]
+    fn shared_work_counts_against_independent_locator_budgets() {
+        let caller = CancellationToken::new();
+        let budget = ReceiverAnalysisBudget {
+            max_scope_nodes: 2,
+            ..ReceiverAnalysisBudget::default()
+        };
+        let setup = ResolutionSession::bounded(budget, Some(&caller));
+        assert!(setup.scope_step());
+        let shared_work = setup.finish(()).work();
+
+        let exhausted =
+            ResolutionSession::bounded_after_shared_work(budget, Some(&caller), shared_work);
+        assert!(exhausted.scope_step());
+        assert!(!exhausted.scope_step());
+        assert!(matches!(
+            exhausted.finish(()),
+            BoundedResolution::Exceeded {
+                limit: ReceiverBudgetLimit::ScopeNodes,
+                work: ReceiverAnalysisWork { scope_nodes: 2, .. }
+            }
+        ));
+
+        let sibling =
+            ResolutionSession::bounded_after_shared_work(budget, Some(&caller), shared_work);
+        assert!(sibling.scope_step());
+        assert!(!sibling.cancellation().unwrap().is_cancelled());
+        assert!(!caller.is_cancelled());
     }
 }

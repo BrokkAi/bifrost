@@ -10,15 +10,20 @@
 
 use std::sync::{Arc, Mutex};
 
-use brokk_bifrost_core::analyzer::prepared_syntax::{PreparedSyntaxSource, PreparedSyntaxTree};
+use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_python::bindings::{
     PythonDirectScopeBindingKind, PythonLexicalNameResolution, python_comprehension_binds_name_at,
-    python_module_or_class_scope_binds_name_bounded, python_type_parameter_binds_name_at,
-    python_unambiguous_module_binding_bounded,
+    python_direct_scope_bindings_bounded, python_module_or_class_scope_binds_name_bounded,
+    python_type_parameter_binds_name_at, python_unambiguous_module_binding_bounded,
+    python_unambiguous_module_class_binding_bounded,
 };
-use brokk_bifrost_python::declarations::{python_base_origin_node, python_first_parameter_name};
+use brokk_bifrost_python::declarations::{
+    python_base_origin_node, python_first_parameter_name, python_function_has_property_decorator,
+};
 use brokk_bifrost_python::diagnostics::is_python_builtin_or_constant;
-use brokk_bifrost_python::syntax::python_plain_string_literal;
+use brokk_bifrost_python::syntax::{
+    python_deferred_annotation_tree, python_plain_string_literal, python_static_attribute_path,
+};
 use tree_sitter::Node;
 
 use super::PythonAnalyzer;
@@ -26,29 +31,38 @@ use super::lexical_scope::python_lexical_scope_inventory_bounded;
 use crate::analyzer::lexical_definitions::{
     FormalVariadicKind, PythonMethodBinding, formal_parameter_slots_for_owner,
 };
+use crate::analyzer::semantic::cfg_algorithms::{
+    CfgAlgorithmBudget, CfgAlgorithmRequest, GenKillFacts, reaching_definitions,
+};
 use crate::analyzer::semantic::type_flow::{
     CallGuardOutcome, ClassBodyMemberBinding, ClassHierarchy, ClassIdentity, ClassSeed,
-    DynamicFieldWrite, ExternalClassCache, MemberAccessKind, MemberAccessQuery, MemberDeclaration,
-    MemberLookup, MemberLookupHit, NarrowingVerdict, NormalReturnTypeConstraint, TypeFlowAdapter,
+    DynamicFieldNameSet, DynamicFieldWrite, ExternalClassCache, ExternalMemberDeclaration,
+    MemberAccessKind, MemberAccessQuery, MemberDeclaration, MemberLookup, MemberLookupHit,
+    MemberReceiverQuery, NarrowingVerdict, NormalReturnTypeConstraint, SourceSite, TypeFlowAdapter,
     UnknownReason, analyzer_range_for_span, class_seed_from_lookup_types, external_class_identity,
     external_member_lookup, file_for_locator, source_span_for_node,
-    validate_prepared_syntax_for_procedure,
 };
 use crate::analyzer::semantic::{
-    AdapterSemanticsVersion, AllocationSite, CandidateCoverage, GuardFact, GuardPredicate,
-    IndexedLocationIdentity, MemoryLocation, MemoryLocationKind, ProcedureHandle, ProcedureKind,
-    ProgramPointId, SemanticCallSite, SemanticEffect, SemanticValue, SemanticValueKind,
-    SourceMappingKind, SourceSpan, ValueFlowKind, ValueId,
+    AdapterSemanticsVersion, AllocationSite, BindingOriginIndex, CallSiteId, CancellationToken,
+    CandidateCoverage, ConstructorResultEvidence, ConstructorResultOrigin, GuardFact,
+    GuardPredicate, IndexedLocationIdentity, MemoryLocation, MemoryLocationKind, ProcedureHandle,
+    ProcedureKind, ProgramPointId, SemanticCallSite, SemanticEffect, SemanticValue,
+    SemanticValueKind, SourceMappingKind, SourceSiteKind, SourceSpan, ValueFlowKind, ValueId,
 };
 use crate::analyzer::semantic_model::{
     ProcedureSummaryMemberKey, SemanticModelCompleteness, SemanticModelMatchDisposition,
-    SemanticModelOverlay, SemanticModelSurfaceGap, SemanticModelSymbolKind,
-    semantic_model_callable_family_id,
+    SemanticModelOverlay, SemanticModelOverlayDisposition, SemanticModelSymbol,
+    SemanticModelSymbolKind, TypeRef,
 };
 use crate::analyzer::usages::ImportKind;
 use crate::analyzer::usages::get_definition::{
-    PythonDefinitionProvider, ResolutionSession, python_attribute_callee_reads_a_field_bounded,
+    PythonAttributeCalleeKind, PythonDefinitionProvider, ResolutionSession,
+    python_attribute_callee_kind_bounded,
+    python_attribute_callee_names_enclosing_nested_class_bounded,
+    python_attribute_callee_reads_a_field_bounded,
+    python_attribute_callee_uses_self_or_cls_bounded, python_class_candidate_for_name,
     python_external_imported_symbol_bounded, python_namespace_imported_class_name_bounded,
+    python_type_checking_imported_class_candidate,
 };
 use crate::analyzer::usages::get_type::{
     TypeLookupStatus, resolve_type_at_reference_site_with_budget,
@@ -72,13 +86,6 @@ pub(super) fn python_analyzer(workspace: &WorkspaceAnalyzer) -> &PythonAnalyzer 
         .expect("PythonTypeFlowAdapter serves only workspaces that analyze Python")
 }
 
-pub(super) fn overlay_of(workspace: &WorkspaceAnalyzer) -> Option<Arc<SemanticModelOverlay>> {
-    workspace
-        .analyzer()
-        .active_semantic_model_snapshot()
-        .and_then(|snapshot| snapshot.semantic_model_overlay().cloned())
-}
-
 pub(super) fn prepared_for_procedure(
     workspace: &WorkspaceAnalyzer,
     procedure: &ProcedureHandle,
@@ -86,11 +93,10 @@ pub(super) fn prepared_for_procedure(
 ) -> Result<Arc<PreparedSyntaxTree>, UnknownReason> {
     let python = python_analyzer(workspace);
     let scope = AnalyzerQueryScope::new(python);
-    let prepared = python
-        .inner
-        .prepared_syntax(scope.token(), file)
-        .ok_or(UnknownReason::UncertainFlow)?;
-    validate_prepared_syntax_for_procedure(workspace, procedure, file, prepared)
+    let prepared = python.inner.prepared_syntax(scope.token(), file);
+    crate::analyzer::semantic::type_flow::prepared_syntax_for_procedure(
+        workspace, procedure, file, prepared,
+    )
 }
 
 pub(super) fn current_indexed_prepared(
@@ -98,18 +104,13 @@ pub(super) fn current_indexed_prepared(
     file: &ProjectFile,
 ) -> Option<Arc<PreparedSyntaxTree>> {
     let scope = AnalyzerQueryScope::new(python);
-    let prepared = python.inner.prepared_syntax(scope.token(), file)?;
-    (matches!(prepared.backing(), PreparedSyntaxSource::Indexed(_))
-        && python.indexed_source_matches(file, prepared.source()))
-    .then_some(prepared)
+    crate::analyzer::semantic::type_flow::current_indexed_prepared(
+        python.inner.prepared_syntax(scope.token(), file),
+        |prepared| python.indexed_source_matches(file, prepared.source()),
+    )
 }
 
-pub(super) fn node_at_span(prepared: &PreparedSyntaxTree, span: SourceSpan) -> Option<Node<'_>> {
-    prepared
-        .tree()
-        .root_node()
-        .named_descendant_for_byte_range(span.start_byte() as usize, span.end_byte() as usize)
-}
+pub(super) use crate::analyzer::semantic::type_flow::node_at_span;
 
 fn node_text_at(prepared: &PreparedSyntaxTree, span: SourceSpan) -> Option<Box<str>> {
     let node = node_at_span(prepared, span)?;
@@ -122,25 +123,18 @@ fn span_for_node(node: Node<'_>) -> SourceSpan {
     source_span_for_node(node)
 }
 
-fn range_for_span(span: SourceSpan) -> crate::analyzer::Range {
-    analyzer_range_for_span(span)
-}
-
 fn enclosing_workspace_class(
     workspace: &WorkspaceAnalyzer,
     procedure: &ProcedureHandle,
 ) -> Option<CodeUnit> {
     let locator = procedure.semantics().locator();
     let file = file_for_locator(workspace, locator)?;
-    let mut unit = workspace
-        .analyzer()
-        .enclosing_code_unit(&file, &range_for_span(locator.anchor().span()))?;
-    loop {
-        if unit.is_class() {
-            return Some(unit);
-        }
-        unit = workspace.analyzer().parent_of(&unit)?;
-    }
+    crate::analyzer::semantic::type_flow::enclosing_workspace_class_unit(
+        workspace.analyzer(),
+        &file,
+        locator.anchor().span(),
+        |_| true,
+    )
 }
 
 fn class_node_for_unit<'tree>(
@@ -286,12 +280,7 @@ fn instance_dict_mutation(call: Node<'_>, source: &str, receiver: &str) -> bool 
     let mutates = function
         .child_by_field_name("attribute")
         .and_then(|member| member.utf8_text(source.as_bytes()).ok())
-        .is_some_and(|member| {
-            matches!(
-                member,
-                "update" | "setdefault" | "pop" | "popitem" | "clear"
-            )
-        });
+        .is_some_and(|member| matches!(member, "update" | "setdefault"));
     if !mutates {
         return false;
     }
@@ -335,7 +324,20 @@ fn dictionary_write_receiver_is(node: Node<'_>, source: &str, receiver: &str) ->
 #[derive(Clone)]
 enum DynamicMemberName {
     Member(Box<str>),
+    Exact(Vec<Box<str>>),
+    Prefix(Box<str>),
     Any,
+    None,
+}
+
+fn dynamic_member_name_affects(name: &DynamicMemberName, member: &str) -> bool {
+    match name {
+        DynamicMemberName::Member(name) => name.as_ref() == member,
+        DynamicMemberName::Exact(names) => names.iter().any(|name| name.as_ref() == member),
+        DynamicMemberName::Prefix(prefix) => member.starts_with(prefix.as_ref()),
+        DynamicMemberName::Any => true,
+        DynamicMemberName::None => false,
+    }
 }
 
 fn setattr_write(node: Node<'_>, source: &str) -> Option<DynamicMemberName> {
@@ -377,6 +379,923 @@ fn dictionary_write(node: Node<'_>, source: &str) -> Option<DynamicMemberName> {
     )
 }
 
+fn dynamic_field_name_set(
+    workspace: &WorkspaceAnalyzer,
+    file: &ProjectFile,
+    expression: Node<'_>,
+    prepared: &PreparedSyntaxTree,
+) -> DynamicFieldNameSet {
+    dynamic_field_name_set_at(workspace, file, expression, prepared, 0)
+}
+
+fn dynamic_field_name_set_at(
+    workspace: &WorkspaceAnalyzer,
+    file: &ProjectFile,
+    expression: Node<'_>,
+    prepared: &PreparedSyntaxTree,
+    depth: u8,
+) -> DynamicFieldNameSet {
+    if depth == 32 {
+        return DynamicFieldNameSet::Any;
+    }
+    let expression = unwrap_parenthesized(expression);
+    let source = prepared.source();
+    if let Some(name) = python_plain_string_literal(expression, source) {
+        return DynamicFieldNameSet::Exact(vec![name.into()]);
+    }
+    if let Some(names) = literal_string_sequence(expression, source) {
+        return DynamicFieldNameSet::Exact(names);
+    }
+    match expression.kind() {
+        "binary_operator" => {
+            let Some(operator) = expression.child_by_field_name("operator") else {
+                return DynamicFieldNameSet::Any;
+            };
+            if operator.utf8_text(source.as_bytes()).ok() != Some("+") {
+                return DynamicFieldNameSet::Any;
+            }
+            let (Some(left), Some(right)) = (
+                expression.child_by_field_name("left"),
+                expression.child_by_field_name("right"),
+            ) else {
+                return DynamicFieldNameSet::Any;
+            };
+            let left_names = dynamic_field_name_set_at(workspace, file, left, prepared, depth + 1);
+            let right_names =
+                dynamic_field_name_set_at(workspace, file, right, prepared, depth + 1);
+            match (left_names, right_names) {
+                (DynamicFieldNameSet::Prefix(prefix), _) => DynamicFieldNameSet::Prefix(prefix),
+                (DynamicFieldNameSet::Exact(mut left), DynamicFieldNameSet::Exact(right))
+                    if left.len() == 1 && right.len() == 1 =>
+                {
+                    let left = left.pop().expect("one exact left string");
+                    let right = &right[0];
+                    DynamicFieldNameSet::Exact(vec![format!("{left}{right}").into()])
+                }
+                (DynamicFieldNameSet::Exact(mut left), _) if left.len() == 1 => {
+                    let prefix = left.pop().expect("one exact left string");
+                    if prefix.is_empty() {
+                        DynamicFieldNameSet::Any
+                    } else {
+                        DynamicFieldNameSet::Prefix(prefix)
+                    }
+                }
+                _ => DynamicFieldNameSet::Any,
+            }
+        }
+        "string" | "concatenated_string" => string_expression_name_set(expression, source),
+        "identifier" => {
+            if let Some(loop_statement) = matching_for_loop(expression, source) {
+                let Some(iterable) = loop_statement.child_by_field_name("right") else {
+                    return DynamicFieldNameSet::Any;
+                };
+                if let Some(names) = literal_string_sequence(iterable, source) {
+                    return DynamicFieldNameSet::Exact(names);
+                }
+                if let Some(value) = local_assignment_value(iterable, source) {
+                    return dynamic_field_name_set_at(workspace, file, value, prepared, depth + 1);
+                }
+                return enum_member_names(workspace, file, iterable, prepared)
+                    .map(DynamicFieldNameSet::Exact)
+                    .unwrap_or(DynamicFieldNameSet::Any);
+            }
+            local_assignment_value(expression, source)
+                .map(|value| dynamic_field_name_set_at(workspace, file, value, prepared, depth + 1))
+                .unwrap_or(DynamicFieldNameSet::Any)
+        }
+        "attribute" => {
+            let attribute = expression
+                .child_by_field_name("attribute")
+                .and_then(|attribute| attribute.utf8_text(source.as_bytes()).ok());
+            let Some(object) = expression.child_by_field_name("object") else {
+                return DynamicFieldNameSet::Any;
+            };
+            if attribute != Some("name") {
+                return class_attribute_assignment_value(workspace, file, expression, prepared)
+                    .map(|value| {
+                        dynamic_field_name_set_at(workspace, file, value, prepared, depth + 1)
+                    })
+                    .unwrap_or(DynamicFieldNameSet::Any);
+            }
+            if object.kind() == "identifier" {
+                let Some(loop_statement) = matching_for_loop(object, source) else {
+                    return DynamicFieldNameSet::Any;
+                };
+                let Some(iterable) = loop_statement.child_by_field_name("right") else {
+                    return DynamicFieldNameSet::Any;
+                };
+                return enum_member_names(workspace, file, iterable, prepared)
+                    .map(DynamicFieldNameSet::Exact)
+                    .unwrap_or(DynamicFieldNameSet::Any);
+            }
+            let Some(path) = python_static_attribute_path(object) else {
+                return DynamicFieldNameSet::Any;
+            };
+            let Some(member) = path
+                .last()
+                .and_then(|node| node.utf8_text(source.as_bytes()).ok())
+            else {
+                return DynamicFieldNameSet::Any;
+            };
+            if path.len() < 2 {
+                return DynamicFieldNameSet::Any;
+            }
+            let Some(class_reference) = object.child_by_field_name("object") else {
+                return DynamicFieldNameSet::Any;
+            };
+            enum_member_names(workspace, file, class_reference, prepared)
+                .filter(|members| members.iter().any(|name| name.as_ref() == member))
+                .map(|_| DynamicFieldNameSet::Exact(vec![member.into()]))
+                .unwrap_or(DynamicFieldNameSet::Any)
+        }
+        _ => DynamicFieldNameSet::Any,
+    }
+}
+
+fn local_assignment_value<'tree>(reference: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+    let name = reference.utf8_text(source.as_bytes()).ok()?;
+    let mut scopes = Vec::new();
+    let mut current = reference;
+    while let Some(parent) = current.parent() {
+        if matches!(parent.kind(), "function_definition" | "lambda")
+            && parent.child_by_field_name("body").is_some_and(|body| {
+                body.start_byte() <= reference.start_byte()
+                    && reference.end_byte() <= body.end_byte()
+            })
+        {
+            scopes.push(parent);
+        }
+        if matches!(parent.kind(), "class_definition" | "module") {
+            break;
+        }
+        current = parent;
+    }
+    for scope in scopes {
+        let session = ResolutionSession::bounded(INTERACTIVE_TYPE_LOOKUP_BUDGET, None);
+        let inventory =
+            python_lexical_scope_inventory_bounded(scope, source, || session.scope_step())?;
+        match inventory.name_resolution_at(name, reference) {
+            PythonLexicalNameResolution::Unbound | PythonLexicalNameResolution::Nonlocal => {
+                continue;
+            }
+            PythonLexicalNameResolution::Global => return None,
+            PythonLexicalNameResolution::Local => {
+                let (_, declaration) = inventory
+                    .local_bindings()
+                    .find(|(bound, _)| *bound == name)?;
+                let assignment = declaration.parent()?;
+                if assignment.kind() != "assignment"
+                    || assignment
+                        .child_by_field_name("left")
+                        .is_none_or(|left| left.id() != declaration.id())
+                {
+                    return None;
+                }
+                return unique_local_assignment_value(scope, name, source);
+            }
+        }
+    }
+    None
+}
+
+fn unique_local_assignment_value<'tree>(
+    scope: Node<'tree>,
+    name: &str,
+    source: &str,
+) -> Option<Node<'tree>> {
+    let body = scope.child_by_field_name("body")?;
+    let mut value = None;
+    let mut stack = vec![body];
+    while let Some(node) = stack.pop() {
+        if node != body
+            && matches!(
+                node.kind(),
+                "function_definition" | "class_definition" | "lambda"
+            )
+        {
+            continue;
+        }
+        let target = match node.kind() {
+            "assignment" | "augmented_assignment" | "for_statement" | "delete_statement" => {
+                node.child_by_field_name("left").or_else(|| {
+                    node.named_child(0)
+                        .filter(|_| node.kind() == "delete_statement")
+                })
+            }
+            "named_expression" => node.child_by_field_name("name"),
+            _ => None,
+        };
+        if target.is_some_and(|target| target_mentions_name(target, name, source)) {
+            if node.kind() == "assignment"
+                && target.is_some_and(|target| {
+                    target.kind() == "identifier"
+                        && target.utf8_text(source.as_bytes()).ok() == Some(name)
+                })
+                && value.is_none()
+            {
+                value = node.child_by_field_name("right");
+                value?;
+            } else {
+                return None;
+            }
+        }
+        if matches!(node.kind(), "import_statement" | "import_from_statement") {
+            return None;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    value
+}
+
+fn class_attribute_assignment_value<'tree>(
+    workspace: &WorkspaceAnalyzer,
+    file: &ProjectFile,
+    expression: Node<'tree>,
+    prepared: &PreparedSyntaxTree,
+) -> Option<Node<'tree>> {
+    let source = prepared.source();
+    let path = python_static_attribute_path(expression)?;
+    if path.len() < 2 {
+        return None;
+    }
+    let member = path.last()?.utf8_text(source.as_bytes()).ok()?;
+    let receiver = expression.child_by_field_name("object")?;
+    if receiver.kind() != "identifier" {
+        return None;
+    }
+    let receiver_name = receiver.utf8_text(source.as_bytes()).ok()?;
+    let mut current = expression;
+    let class = loop {
+        let parent = current.parent()?;
+        if parent.kind() == "class_definition" {
+            break parent;
+        }
+        if parent.kind() == "module" {
+            return None;
+        }
+        current = parent;
+    };
+    let body = class.child_by_field_name("body")?;
+    let mut value = None;
+    let mut method_context = false;
+    for statement in named_children(body) {
+        let function = match statement.kind() {
+            "function_definition" => statement,
+            "decorated_definition" => {
+                let Some(function) = named_children(statement)
+                    .into_iter()
+                    .find(|child| child.kind() == "function_definition")
+                else {
+                    continue;
+                };
+                function
+            }
+            _ => continue,
+        };
+        if python_first_parameter_name(function, source).as_deref() != Some(receiver_name) {
+            continue;
+        }
+        let Some(function_body) = function.child_by_field_name("body") else {
+            continue;
+        };
+        method_context |= function_body.start_byte() <= expression.start_byte()
+            && expression.end_byte() <= function_body.end_byte();
+        let mut stack = vec![function_body];
+        while let Some(node) = stack.pop() {
+            if node != function_body
+                && matches!(
+                    node.kind(),
+                    "function_definition" | "class_definition" | "lambda"
+                )
+            {
+                continue;
+            }
+            if matches!(node.kind(), "assignment" | "augmented_assignment")
+                && let Some(left) = node.child_by_field_name("left")
+                && left.kind() == "attribute"
+                && left.child_by_field_name("object").is_some_and(|object| {
+                    object.kind() == "identifier"
+                        && object.utf8_text(source.as_bytes()).ok() == Some(receiver_name)
+                })
+                && left
+                    .child_by_field_name("attribute")
+                    .and_then(|attribute| attribute.utf8_text(source.as_bytes()).ok())
+                    == Some(member)
+            {
+                if node.kind() != "assignment" || value.is_some() {
+                    return None;
+                }
+                value = node.child_by_field_name("right");
+                value?;
+            }
+            if node.kind() == "delete_statement"
+                && named_children(node).into_iter().any(|target| {
+                    target.kind() == "attribute"
+                        && target.child_by_field_name("object").is_some_and(|object| {
+                            object.kind() == "identifier"
+                                && object.utf8_text(source.as_bytes()).ok() == Some(receiver_name)
+                        })
+                        && target
+                            .child_by_field_name("attribute")
+                            .and_then(|attribute| attribute.utf8_text(source.as_bytes()).ok())
+                            == Some(member)
+                })
+            {
+                return None;
+            }
+            if node.kind() == "call"
+                && dynamic_mutation_targets_receiver(node, source, receiver_name, member)
+            {
+                return None;
+            }
+            if matches!(node.kind(), "assignment" | "augmented_assignment")
+                && dictionary_write(node, source).is_some_and(|name| {
+                    dynamic_member_name_affects(&name, member)
+                        && dictionary_write_receiver_is(node, source, receiver_name)
+                })
+            {
+                return None;
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+    }
+    let value = value.filter(|_| method_context)?;
+    let class_name = class.child_by_field_name("name")?;
+    let ClassSeed::Class(ClassIdentity::Workspace(unit)) =
+        resolve_class_at_span(workspace, file.clone(), span_for_node(class_name), prepared)
+    else {
+        return None;
+    };
+    let hierarchy =
+        PythonTypeFlowAdapter.class_hierarchy(workspace, &ClassIdentity::Workspace(unit));
+    (hierarchy.descendants.as_deref() == Some(&[])
+        && !hierarchy.unresolved_base
+        && !hierarchy.dynamic_attributes)
+        .then_some(value)
+}
+
+fn dynamic_mutation_targets_receiver(
+    call: Node<'_>,
+    source: &str,
+    receiver: &str,
+    member: &str,
+) -> bool {
+    let Some(function) = call.child_by_field_name("function") else {
+        return false;
+    };
+    if function.kind() == "identifier" {
+        let Some(function_name) = function.utf8_text(source.as_bytes()).ok() else {
+            return false;
+        };
+        match function_name {
+            "setattr" => {
+                return call_receiver_argument_is(call, source, receiver)
+                    && setattr_write(call, source)
+                        .is_some_and(|name| dynamic_member_name_affects(&name, member));
+            }
+            "delattr" => return call_receiver_argument_is(call, source, receiver),
+            _ => {}
+        }
+    }
+    let Some(object) = function.child_by_field_name("object") else {
+        return false;
+    };
+    if object.kind() == "identifier"
+        && object.utf8_text(source.as_bytes()).ok() == Some(receiver)
+        && let Some(method) = function
+            .child_by_field_name("attribute")
+            .and_then(|attribute| attribute.utf8_text(source.as_bytes()).ok())
+    {
+        if method == "__delattr__" {
+            return true;
+        }
+        if method != "__setattr__" {
+            return false;
+        }
+        return dynamic_call_write(call, source)
+            .is_some_and(|name| dynamic_member_name_affects(&name, member));
+    }
+    (object.kind() == "attribute"
+        && object
+            .child_by_field_name("attribute")
+            .and_then(|attribute| attribute.utf8_text(source.as_bytes()).ok())
+            == Some("__dict__")
+        && object.child_by_field_name("object").is_some_and(|base| {
+            base.kind() == "identifier" && base.utf8_text(source.as_bytes()).ok() == Some(receiver)
+        })
+        && dynamic_call_write(call, source).is_some())
+        || (object.kind() == "call"
+            && object
+                .child_by_field_name("function")
+                .is_some_and(|function| {
+                    function.kind() == "identifier"
+                        && function.utf8_text(source.as_bytes()).ok() == Some("vars")
+                })
+            && call_receiver_argument_is(object, source, receiver)
+            && function
+                .child_by_field_name("attribute")
+                .and_then(|attribute| attribute.utf8_text(source.as_bytes()).ok())
+                .is_some_and(|method| {
+                    matches!(
+                        method,
+                        "update"
+                            | "setdefault"
+                            | "pop"
+                            | "popitem"
+                            | "clear"
+                            | "__setitem__"
+                            | "__delitem__"
+                    )
+                }))
+}
+
+fn unwrap_parenthesized(mut node: Node<'_>) -> Node<'_> {
+    while node.kind() == "parenthesized_expression" && node.named_child_count() == 1 {
+        node = node
+            .named_child(0)
+            .expect("one parenthesized expression child");
+    }
+    node
+}
+
+fn string_expression_name_set(node: Node<'_>, source: &str) -> DynamicFieldNameSet {
+    let parts = if node.kind() == "concatenated_string" {
+        named_children(node)
+    } else {
+        vec![node]
+    };
+    let mut prefix = String::new();
+    for part in parts {
+        if let Some(value) = plain_string_segment(part, source) {
+            prefix.push_str(value);
+            continue;
+        }
+        let Some((literal, interpolated)) = f_string_literal_prefix(part, source) else {
+            return DynamicFieldNameSet::Any;
+        };
+        prefix.push_str(&literal);
+        if interpolated {
+            return if prefix.is_empty() {
+                DynamicFieldNameSet::Any
+            } else {
+                DynamicFieldNameSet::Prefix(prefix.into())
+            };
+        }
+    }
+    DynamicFieldNameSet::Exact(vec![prefix.into()])
+}
+
+fn plain_string_segment<'source>(node: Node<'_>, source: &'source str) -> Option<&'source str> {
+    if node.kind() != "string" {
+        return None;
+    }
+    let mut content = None;
+    for child in named_children(node) {
+        match child.kind() {
+            "string_start" | "string_end" => {
+                let delimiter = child.utf8_text(source.as_bytes()).ok()?;
+                if delimiter
+                    .chars()
+                    .any(|character| character != '\'' && character != '"')
+                {
+                    return None;
+                }
+            }
+            "string_content" if child.named_child_count() == 0 && content.is_none() => {
+                content = Some(child);
+            }
+            _ => return None,
+        }
+    }
+    Some(content.map_or("", |child| {
+        child
+            .utf8_text(source.as_bytes())
+            .expect("a tree-sitter node range is valid UTF-8 source")
+    }))
+}
+
+fn f_string_literal_prefix(node: Node<'_>, source: &str) -> Option<(String, bool)> {
+    if node.kind() != "string" {
+        return None;
+    }
+    let children = named_children(node);
+    let start = children
+        .iter()
+        .find(|child| child.kind() == "string_start")?;
+    let prefix = start.utf8_text(source.as_bytes()).ok()?;
+    if !prefix
+        .chars()
+        .any(|character| matches!(character, 'f' | 'F'))
+    {
+        return None;
+    }
+    let mut literal = String::new();
+    for child in children {
+        match child.kind() {
+            "string_start" | "string_end" => {}
+            "string_content" => {
+                let content = child.utf8_text(source.as_bytes()).ok()?;
+                if content
+                    .chars()
+                    .any(|character| matches!(character, '\\' | '{' | '}'))
+                {
+                    return None;
+                }
+                literal.push_str(content);
+            }
+            "interpolation" => return Some((literal, true)),
+            _ => return None,
+        }
+    }
+    Some((literal, false))
+}
+
+fn literal_string_sequence(node: Node<'_>, source: &str) -> Option<Vec<Box<str>>> {
+    let node = unwrap_parenthesized(node);
+    if !matches!(node.kind(), "list" | "tuple") {
+        return None;
+    }
+    let mut values = Vec::new();
+    let mut seen = HashSet::default();
+    for child in named_children(node)
+        .into_iter()
+        .filter(|child| !child.is_extra())
+    {
+        let value = plain_string_segment(child, source)?;
+        let value: Box<str> = value.into();
+        if seen.insert(value.clone()) {
+            values.push(value);
+        }
+    }
+    Some(values)
+}
+
+fn matching_for_loop<'tree>(expression: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+    let name = expression.utf8_text(source.as_bytes()).ok()?;
+    let mut current = expression;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "for_statement" {
+            let left = parent.child_by_field_name("left")?;
+            let body = parent.child_by_field_name("body")?;
+            if left.kind() == "identifier"
+                && left.utf8_text(source.as_bytes()).ok() == Some(name)
+                && body.start_byte() <= expression.start_byte()
+                && expression.end_byte() <= body.end_byte()
+                && !loop_variable_reassigned(body, expression, name, source)
+            {
+                return Some(parent);
+            }
+        }
+        if matches!(
+            parent.kind(),
+            "function_definition"
+                | "class_definition"
+                | "lambda"
+                | "list_comprehension"
+                | "set_comprehension"
+                | "dictionary_comprehension"
+                | "generator_expression"
+        ) {
+            return None;
+        }
+        current = parent;
+    }
+    None
+}
+
+fn loop_variable_reassigned(
+    body: Node<'_>,
+    expression: Node<'_>,
+    name: &str,
+    source: &str,
+) -> bool {
+    let mut stack = vec![body];
+    while let Some(node) = stack.pop() {
+        if node.start_byte() >= expression.start_byte() {
+            continue;
+        }
+        if node != body
+            && matches!(
+                node.kind(),
+                "function_definition" | "class_definition" | "lambda"
+            )
+        {
+            continue;
+        }
+        let target = match node.kind() {
+            "assignment" | "augmented_assignment" | "for_statement" => {
+                node.child_by_field_name("left")
+            }
+            "named_expression" => node
+                .child_by_field_name("name")
+                .or_else(|| node.child_by_field_name("left")),
+            "delete_statement" => node.named_child(0),
+            _ => None,
+        };
+        if target.is_some_and(|target| target_mentions_name(target, name, source)) {
+            return true;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    false
+}
+
+fn target_mentions_name(node: Node<'_>, name: &str, source: &str) -> bool {
+    match node.kind() {
+        "identifier" => node.utf8_text(source.as_bytes()).ok() == Some(name),
+        "tuple" | "list" | "pattern_list" | "pattern_tuple" => named_children(node)
+            .into_iter()
+            .any(|child| target_mentions_name(child, name, source)),
+        _ => false,
+    }
+}
+
+fn enum_member_names(
+    workspace: &WorkspaceAnalyzer,
+    file: &ProjectFile,
+    reference: Node<'_>,
+    prepared: &PreparedSyntaxTree,
+) -> Option<Vec<Box<str>>> {
+    let seed = resolve_class_at_span(workspace, file.clone(), span_for_node(reference), prepared);
+    let ClassSeed::Class(ClassIdentity::Workspace(unit)) = seed else {
+        return None;
+    };
+    let python = python_analyzer(workspace);
+    let class_file = unit.source();
+    let class_prepared = current_indexed_prepared(python, class_file)?;
+    let class = class_node_for_unit(python, &class_prepared, &unit)?;
+    let bases = class.child_by_field_name("superclasses")?;
+    let is_enum = named_children(bases).into_iter().any(|base| {
+        import_bound_external_symbol(python, class_file, &class_prepared, base)
+            .is_some_and(|(module, member)| module == "enum" && member == "Enum")
+    });
+    if !is_enum {
+        return None;
+    }
+    enum_class_member_names(class, class_prepared.source())
+}
+
+fn enum_class_member_names(class: Node<'_>, source: &str) -> Option<Vec<Box<str>>> {
+    let body = class.child_by_field_name("body")?;
+    let mut names = Vec::new();
+    let mut values = HashSet::default();
+    for statement in named_children(body)
+        .into_iter()
+        .filter(|node| !node.is_extra())
+    {
+        let assignment = match statement.kind() {
+            "assignment" => statement,
+            "expression_statement" => {
+                let expression = statement.named_child(0)?;
+                if expression.kind() == "string" {
+                    continue;
+                }
+                if expression.kind() != "assignment" {
+                    return None;
+                }
+                expression
+            }
+            "function_definition" | "pass_statement" | "comment" => continue,
+            "decorated_definition" => {
+                let children = named_children(statement);
+                if !children
+                    .iter()
+                    .any(|child| child.kind() == "function_definition")
+                {
+                    return None;
+                }
+                continue;
+            }
+            _ => return None,
+        };
+        let name = assignment_name(assignment, source)?;
+        if name.starts_with('_') || name.ends_with('_') {
+            return None;
+        }
+        let value = assignment.child_by_field_name("right")?;
+        let value = enum_literal_value_identity(value, source)?;
+        if values.insert(value) {
+            names.push(name.into());
+        }
+    }
+    Some(names)
+}
+
+fn enum_literal_value_identity(node: Node<'_>, source: &str) -> Option<Box<str>> {
+    let node = unwrap_parenthesized(node);
+    if let Some(value) = python_plain_string_literal(node, source) {
+        return Some(format!("str:{}:{value}", value.len()).into());
+    }
+    if node.kind() == "integer" {
+        let value = node
+            .utf8_text(source.as_bytes())
+            .ok()?
+            .parse::<i128>()
+            .ok()?;
+        return Some(format!("int:{value}").into());
+    }
+    (node.kind() == "none").then(|| "none".into())
+}
+
+fn dynamic_call_write_for_field(
+    workspace: &WorkspaceAnalyzer,
+    file: &ProjectFile,
+    node: Node<'_>,
+    prepared: &PreparedSyntaxTree,
+) -> Option<DynamicMemberName> {
+    if node.kind() != "call" {
+        return None;
+    }
+    let source = prepared.source();
+    let function = node.child_by_field_name("function")?;
+    if function.kind() == "identifier" {
+        let name = function.utf8_text(source.as_bytes()).ok()?;
+        let arguments = node.child_by_field_name("arguments")?;
+        let actuals = named_children(arguments);
+        if name == "setattr" {
+            let Some(attribute) = actuals.get(1).copied() else {
+                return Some(DynamicMemberName::Any);
+            };
+            return Some(dynamic_member_name(workspace, file, attribute, prepared));
+        }
+        if name == "delattr" {
+            return Some(DynamicMemberName::None);
+        }
+        return None;
+    }
+    if function.kind() != "attribute" {
+        return None;
+    }
+    let method = function
+        .child_by_field_name("attribute")?
+        .utf8_text(source.as_bytes())
+        .ok()?;
+    if matches!(
+        method,
+        "get"
+            | "items"
+            | "keys"
+            | "values"
+            | "copy"
+            | "fromkeys"
+            | "__contains__"
+            | "__getitem__"
+            | "__len__"
+            | "__iter__"
+            | "__reversed__"
+            | "__or__"
+            | "__ror__"
+            | "__eq__"
+            | "__ne__"
+            | "__lt__"
+            | "__le__"
+            | "__gt__"
+            | "__ge__"
+            | "__repr__"
+            | "__str__"
+    ) {
+        return None;
+    }
+    let object = function.child_by_field_name("object")?;
+    if method == "__setattr__" {
+        let arguments = node.child_by_field_name("arguments")?;
+        return Some(
+            named_children(arguments)
+                .first()
+                .copied()
+                .map(|name| dynamic_member_name(workspace, file, name, prepared))
+                .unwrap_or(DynamicMemberName::Any),
+        );
+    }
+    let dictionary = object.kind() == "attribute"
+        && object
+            .child_by_field_name("attribute")
+            .and_then(|attribute| attribute.utf8_text(source.as_bytes()).ok())
+            == Some("__dict__");
+    let vars_call = object.kind() == "call"
+        && object
+            .child_by_field_name("function")
+            .is_some_and(|function| {
+                function.kind() == "identifier"
+                    && function.utf8_text(source.as_bytes()) == Ok("vars")
+                    && indexed_builtin_is_unshadowed(python_analyzer(workspace), function, prepared)
+                        == Some(true)
+            });
+    if !dictionary && !vars_call {
+        return None;
+    }
+    if matches!(method, "pop" | "popitem" | "clear" | "__delitem__") {
+        return Some(DynamicMemberName::None);
+    }
+    let arguments = node.child_by_field_name("arguments")?;
+    let actuals = named_children(arguments);
+    match method {
+        "__setitem__" => Some(
+            actuals
+                .first()
+                .copied()
+                .map(|name| dynamic_member_name(workspace, file, name, prepared))
+                .unwrap_or(DynamicMemberName::Any),
+        ),
+        "update" => Some(match mapping_literal_keys(&actuals, source) {
+            Some(names) => DynamicMemberName::Exact(names),
+            None => DynamicMemberName::Any,
+        }),
+        "setdefault" => Some(
+            actuals
+                .first()
+                .copied()
+                .map(|name| dynamic_member_name(workspace, file, name, prepared))
+                .unwrap_or(DynamicMemberName::Any),
+        ),
+        _ => Some(DynamicMemberName::Any),
+    }
+}
+
+fn mapping_literal_keys(arguments: &[Node<'_>], source: &str) -> Option<Vec<Box<str>>> {
+    let mut names = Vec::new();
+    let mut seen = HashSet::default();
+    for argument in arguments {
+        match argument.kind() {
+            "dictionary" => {
+                for pair in named_children(*argument) {
+                    if pair.kind() != "pair" {
+                        return None;
+                    }
+                    let key = pair.child_by_field_name("key")?;
+                    let key = plain_string_segment(key, source)?;
+                    let key: Box<str> = key.into();
+                    if seen.insert(key.clone()) {
+                        names.push(key);
+                    }
+                }
+            }
+            "keyword_argument" => {
+                let name = argument
+                    .child_by_field_name("name")?
+                    .utf8_text(source.as_bytes())
+                    .ok()?;
+                let name: Box<str> = name.into();
+                if seen.insert(name.clone()) {
+                    names.push(name);
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(names)
+}
+
+fn dynamic_member_name(
+    workspace: &WorkspaceAnalyzer,
+    file: &ProjectFile,
+    expression: Node<'_>,
+    prepared: &PreparedSyntaxTree,
+) -> DynamicMemberName {
+    if let Some(name) = python_plain_string_literal(expression, prepared.source()) {
+        return DynamicMemberName::Member(name.into());
+    }
+    match dynamic_field_name_set(workspace, file, expression, prepared) {
+        DynamicFieldNameSet::Exact(names) => DynamicMemberName::Exact(names),
+        DynamicFieldNameSet::Prefix(prefix) => DynamicMemberName::Prefix(prefix),
+        DynamicFieldNameSet::Any => DynamicMemberName::Any,
+        DynamicFieldNameSet::None => DynamicMemberName::None,
+    }
+}
+
+fn dictionary_write_for_field(
+    workspace: &WorkspaceAnalyzer,
+    file: &ProjectFile,
+    node: Node<'_>,
+    prepared: &PreparedSyntaxTree,
+) -> Option<DynamicMemberName> {
+    let left = node.child_by_field_name("left")?;
+    if left.kind() != "subscript" {
+        return None;
+    }
+    let value = left.child_by_field_name("value")?;
+    if value.kind() != "attribute"
+        || value
+            .child_by_field_name("attribute")
+            .and_then(|attribute| attribute.utf8_text(prepared.source().as_bytes()).ok())
+            != Some("__dict__")
+    {
+        return None;
+    }
+    let key = left.child_by_field_name("subscript")?;
+    Some(dynamic_member_name(workspace, file, key, prepared))
+}
+
+fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .filter(|child| !child.is_extra())
+        .collect()
+}
+
 fn class_definition_node(node: Node<'_>) -> Option<Node<'_>> {
     if node.kind() == "class_definition" {
         return Some(node);
@@ -405,18 +1324,12 @@ fn writes_member_name(node: Node<'_>, source: &str, member: &str) -> bool {
                 return true;
             }
             if let Some(write) = dictionary_write(node, source) {
-                return match write {
-                    DynamicMemberName::Any => true,
-                    DynamicMemberName::Member(name) => name.as_ref() == member,
-                };
+                return dynamic_member_name_affects(&write, member);
             }
         }
     }
-    match dynamic_call_write(node, source) {
-        Some(DynamicMemberName::Any) => true,
-        Some(DynamicMemberName::Member(name)) => name.as_ref() == member,
-        None => false,
-    }
+    dynamic_call_write(node, source)
+        .is_some_and(|write| dynamic_member_name_affects(&write, member))
 }
 
 /// Shared structured interpretation for member shadowing and the store survey.
@@ -461,6 +1374,9 @@ fn dynamic_call_write(node: Node<'_>, source: &str) -> Option<DynamicMemberName>
     ) {
         return None;
     }
+    if matches!(attribute, "pop" | "popitem" | "clear" | "__delitem__") {
+        return Some(DynamicMemberName::None);
+    }
     if attribute == "__setattr__" {
         let Some(arguments) = node.child_by_field_name("arguments") else {
             return Some(DynamicMemberName::Any);
@@ -497,18 +1413,17 @@ fn scoped_dynamic_write(
     if let DynamicMemberName::Member(member) = name {
         return DynamicFieldWrite::Member(member);
     }
+    let names = match name {
+        DynamicMemberName::Exact(names) => DynamicFieldNameSet::Exact(names),
+        DynamicMemberName::Prefix(prefix) => DynamicFieldNameSet::Prefix(prefix),
+        DynamicMemberName::Any => DynamicFieldNameSet::Any,
+        DynamicMemberName::None => DynamicFieldNameSet::None,
+        DynamicMemberName::Member(_) => unreachable!("member writes returned above"),
+    };
     let span = span_for_node(node);
     let semantics = procedure.semantics();
-    let dictionary_owner = |dictionary: Node<'_>| {
-        let attribute = dictionary.child_by_field_name("attribute")?;
-        let member_span = span_for_node(attribute);
-        semantics.memory_locations().iter().find_map(|location| {
-            let MemoryLocationKind::Field { base, member } = &location.kind else {
-                return None;
-            };
-            (member.anchor().span() == member_span).then_some(*base)
-        })
-    };
+    let dictionary_owner =
+        |dictionary: Node<'_>| dynamic_dictionary_receiver(procedure, dictionary, source);
     let receiver = if node.kind() == "call" {
         semantics
             .call_sites()
@@ -536,6 +1451,29 @@ fn scoped_dynamic_write(
                         == Some("__dict__")
                     {
                         dictionary_owner(object)
+                    } else if object.kind() == "call"
+                        && object
+                            .child_by_field_name("function")
+                            .is_some_and(|function| {
+                                function.kind() == "identifier"
+                                    && function.utf8_text(source.as_bytes()) == Ok("vars")
+                            })
+                    {
+                        let vars_span = span_for_node(object);
+                        semantics
+                            .call_sites()
+                            .iter()
+                            .find(|vars_call| {
+                                semantics
+                                    .source_mapping(vars_call.source)
+                                    .is_some_and(|mapping| {
+                                        mapping.kind == SourceMappingKind::Exact
+                                            && mapping.locator.anchor().span() == vars_span
+                                    })
+                            })
+                            .and_then(|vars_call| vars_call.arguments.first())
+                            .filter(|argument| !argument.expansion.is_spread())
+                            .map(|argument| argument.value)
                     } else {
                         match semantics.proven_caller_receiver_binding(call.id) {
                             Some(
@@ -548,7 +1486,7 @@ fn scoped_dynamic_write(
                             _ if matches!(
                                 builtin_class_reference(
                                     python_analyzer(workspace),
-                                    overlay_of(workspace).as_deref(),
+                                    workspace.analyzer().semantic_model_overlay().as_deref(),
                                     object,
                                     prepared,
                                     &mut ExternalClassCache::default()
@@ -571,7 +1509,557 @@ fn scoped_dynamic_write(
             .and_then(|left| left.child_by_field_name("value"))
             .and_then(dictionary_owner)
     };
-    DynamicFieldWrite::Any { receiver, span }
+    DynamicFieldWrite::Scoped {
+        names,
+        receiver,
+        span,
+    }
+}
+
+enum RuntimeCreatedTypeCall {
+    NotRuntimeCreated,
+    RuntimeCreated,
+}
+
+fn node_children<'tree>(node: Node<'tree>) -> Vec<Node<'tree>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).collect()
+}
+
+fn resolved_class_bounds(seed: ClassSeed) -> Option<Vec<ClassIdentity>> {
+    match seed {
+        ClassSeed::Class(class) => Some(vec![class]),
+        ClassSeed::Classes(classes) => Some(classes.into_vec()),
+        ClassSeed::ClassWithOpenBound(_)
+        | ClassSeed::ClassesWithOpenBound(_)
+        | ClassSeed::Unknown(_)
+        | ClassSeed::NotApplicable => None,
+    }
+}
+
+fn require_complete_dynamic_receiver_bounds(
+    adapter: &PythonTypeFlowAdapter,
+    workspace: &WorkspaceAnalyzer,
+    classes: Vec<ClassIdentity>,
+) -> Result<Vec<ClassIdentity>, UnknownReason> {
+    if classes.is_empty()
+        || classes
+            .iter()
+            .any(|class| adapter.class_hierarchy(workspace, class).unresolved_base)
+    {
+        return Err(UnknownReason::OpenTypeBound);
+    }
+    let mut unique = Vec::new();
+    for class in classes {
+        if !unique.contains(&class) {
+            unique.push(class);
+        }
+    }
+    Ok(unique)
+}
+
+fn runtime_created_type_call(
+    workspace: &WorkspaceAnalyzer,
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    call: Node<'_>,
+) -> RuntimeCreatedTypeCall {
+    if call.kind() != "call" {
+        return RuntimeCreatedTypeCall::NotRuntimeCreated;
+    }
+    let Some(function) = call.child_by_field_name("function") else {
+        return RuntimeCreatedTypeCall::NotRuntimeCreated;
+    };
+    let ClassSeed::Class(ClassIdentity::External { qualified_name, .. }) =
+        resolve_class_at_span(workspace, file.clone(), span_for_node(function), prepared)
+    else {
+        return RuntimeCreatedTypeCall::NotRuntimeCreated;
+    };
+    if qualified_name.as_ref() != "builtins.type" {
+        return RuntimeCreatedTypeCall::NotRuntimeCreated;
+    }
+
+    let Some(arguments) = call.child_by_field_name("arguments") else {
+        return RuntimeCreatedTypeCall::NotRuntimeCreated;
+    };
+    let arguments = node_children(arguments)
+        .into_iter()
+        .filter(|argument| argument.kind() != "comment")
+        .collect::<Vec<_>>();
+    if arguments.len() != 3
+        || arguments.iter().any(|argument| {
+            matches!(
+                argument.kind(),
+                "keyword_argument"
+                    | "list_splat"
+                    | "dictionary_splat"
+                    | "list_splat_pattern"
+                    | "dictionary_splat_pattern"
+            )
+        })
+    {
+        return RuntimeCreatedTypeCall::NotRuntimeCreated;
+    }
+    // The three-positional-argument builtin creates a new runtime class. Its
+    // bases affect Python inheritance, but do not make instances of that new
+    // class instances of any base's exact static class atom.
+    RuntimeCreatedTypeCall::RuntimeCreated
+}
+
+fn target_contains_identifier(target: Node<'_>, name: &str, source: &str) -> bool {
+    let mut pending = vec![target];
+    while let Some(node) = pending.pop() {
+        if node.kind() == "identifier" && node.utf8_text(source.as_bytes()).ok() == Some(name) {
+            return true;
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+    }
+    false
+}
+
+fn syntax_binds_name(node: Node<'_>, name: &str, source: &str) -> bool {
+    match node.kind() {
+        "assignment" | "augmented_assignment" | "for_statement" | "for_in_clause" => node
+            .child_by_field_name("left")
+            .is_some_and(|left| target_contains_identifier(left, name, source)),
+        "named_expression" => ["left", "name"]
+            .into_iter()
+            .filter_map(|field| node.child_by_field_name(field))
+            .any(|target| target_contains_identifier(target, name, source)),
+        "with_item" | "except_clause" | "as_pattern" => ["alias", "name"]
+            .into_iter()
+            .filter_map(|field| node.child_by_field_name(field))
+            .any(|target| target_contains_identifier(target, name, source)),
+        "function_definition" | "class_definition" => node
+            .child_by_field_name("name")
+            .is_some_and(|binding| binding.utf8_text(source.as_bytes()).ok() == Some(name)),
+        "global_statement"
+        | "nonlocal_statement"
+        | "import_statement"
+        | "import_from_statement" => target_contains_identifier(node, name, source),
+        _ => false,
+    }
+}
+
+fn direct_local_assignment_rhs<'tree>(
+    scope: Node<'tree>,
+    reference: Node<'tree>,
+    source: &str,
+) -> Option<Node<'tree>> {
+    if scope.kind() != "function_definition" {
+        return None;
+    }
+    let name = reference.utf8_text(source.as_bytes()).ok()?;
+    let mut block = reference;
+    loop {
+        let parent = block.parent()?;
+        if parent.kind() == "block" {
+            block = parent;
+            break;
+        }
+        if parent == scope
+            || matches!(
+                parent.kind(),
+                "function_definition" | "lambda" | "class_definition"
+            )
+        {
+            return None;
+        }
+        block = parent;
+    }
+
+    let mut containing_statement = reference;
+    while containing_statement.parent() != Some(block) {
+        containing_statement = containing_statement.parent()?;
+    }
+    loop {
+        let mut assignment = None;
+        let mut pending = Vec::new();
+        for statement in node_children(block) {
+            if statement == containing_statement {
+                break;
+            }
+            pending.push(statement);
+            while let Some(node) = pending.pop() {
+                if syntax_binds_name(node, name, source) {
+                    if node.kind() == "assignment"
+                        && assignment_name(node, source) == Some(name)
+                        && node
+                            .parent()
+                            .is_some_and(|statement| statement.kind() == "expression_statement")
+                        && node.parent().and_then(|statement| statement.parent()) == Some(block)
+                    {
+                        assignment = Some(node);
+                    } else {
+                        return None;
+                    }
+                }
+                let mut cursor = node.walk();
+                pending.extend(node.named_children(&mut cursor));
+            }
+        }
+        if let Some(rhs) = assignment.and_then(|node| node.child_by_field_name("right")) {
+            return (rhs.end_byte() <= reference.start_byte()).then_some(rhs);
+        }
+
+        let mut container = block;
+        let mut ancestor = block.parent()?;
+        while ancestor != scope && ancestor.kind() != "block" {
+            container = ancestor;
+            if matches!(
+                ancestor.kind(),
+                "function_definition" | "lambda" | "class_definition"
+            ) {
+                return None;
+            }
+            ancestor = ancestor.parent()?;
+        }
+        if ancestor.kind() != "block" {
+            return None;
+        }
+        let mut pending = vec![container];
+        while let Some(node) = pending.pop() {
+            if syntax_binds_name(node, name, source) {
+                return None;
+            }
+            let mut cursor = node.walk();
+            pending.extend(node.named_children(&mut cursor));
+        }
+        containing_statement = container;
+        block = ancestor;
+    }
+}
+
+fn runtime_created_type_expression(
+    workspace: &WorkspaceAnalyzer,
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    scope: Node<'_>,
+    expression: Node<'_>,
+) -> bool {
+    let mut pending = vec![expression];
+    let mut visited = HashSet::default();
+    while let Some(node) = pending.pop() {
+        if matches!(
+            runtime_created_type_call(workspace, file, prepared, node),
+            RuntimeCreatedTypeCall::RuntimeCreated
+        ) {
+            return true;
+        }
+        if node.kind() == "identifier"
+            && let Ok(name) = node.utf8_text(prepared.source().as_bytes())
+            && visited.insert(Box::<str>::from(name))
+            && let Some(rhs) = direct_local_assignment_rhs(scope, node, prepared.source())
+        {
+            pending.push(rhs);
+        }
+        match node.kind() {
+            "call" => {
+                if let Some(function) = node.child_by_field_name("function") {
+                    pending.push(function);
+                }
+            }
+            "parenthesized_expression" => {
+                if let Some(child) = node.named_child(0) {
+                    pending.push(child);
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn expression_dynamic_receiver_bounds(
+    adapter: &PythonTypeFlowAdapter,
+    workspace: &WorkspaceAnalyzer,
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    scope: Node<'_>,
+    expression: Node<'_>,
+) -> Result<Vec<ClassIdentity>, UnknownReason> {
+    if runtime_created_type_expression(workspace, file, prepared, scope, expression) {
+        return Ok(Vec::new());
+    }
+    let mut pending = vec![expression];
+    let mut visited = HashSet::default();
+    while let Some(node) = pending.pop() {
+        let seed = resolve_class_at_span(workspace, file.clone(), span_for_node(node), prepared);
+        if let Some(classes) = resolved_class_bounds(seed) {
+            return require_complete_dynamic_receiver_bounds(adapter, workspace, classes);
+        }
+        if node.kind() == "identifier"
+            && let Ok(name) = node.utf8_text(prepared.source().as_bytes())
+            && visited.insert(Box::<str>::from(name))
+            && let Some(rhs) = direct_local_assignment_rhs(scope, node, prepared.source())
+        {
+            pending.push(rhs);
+        }
+        match node.kind() {
+            "call" => {
+                if let Some(function) = node.child_by_field_name("function") {
+                    pending.push(function);
+                }
+            }
+            "parenthesized_expression" => {
+                if let Some(child) = node.named_child(0) {
+                    pending.push(child);
+                }
+            }
+            _ => {}
+        }
+    }
+    Err(UnknownReason::UnmodeledLoad)
+}
+
+fn dynamic_dictionary_receiver(
+    procedure: &ProcedureHandle,
+    dictionary: Node<'_>,
+    source: &str,
+) -> Option<ValueId> {
+    let attribute = dictionary.child_by_field_name("attribute")?;
+    let member_span = span_for_node(attribute);
+    procedure
+        .semantics()
+        .memory_locations()
+        .iter()
+        .find_map(|location| {
+            let MemoryLocationKind::Field { base, member } = &location.kind else {
+                return None;
+            };
+            (member.anchor().span() == member_span
+                && attribute.utf8_text(source.as_bytes()).ok() == Some("__dict__"))
+            .then_some(*base)
+        })
+}
+
+fn dynamic_write_receiver_expression<'tree>(
+    procedure: &ProcedureHandle,
+    prepared: &'tree PreparedSyntaxTree,
+    receiver: ValueId,
+    write_span: SourceSpan,
+) -> Option<Node<'tree>> {
+    let site = node_at_span(prepared, write_span)?;
+    let semantics = procedure.semantics();
+    if site.kind() == "call" {
+        let call = semantics.call_sites().iter().find(|call| {
+            semantics
+                .source_mapping(call.source)
+                .is_some_and(|mapping| {
+                    mapping.kind == SourceMappingKind::Exact
+                        && mapping.locator.anchor().span() == write_span
+                })
+        })?;
+        let function = site.child_by_field_name("function")?;
+        if setattr_write(site, prepared.source()).is_some() {
+            if !call.arguments.first().is_some_and(|argument| {
+                argument.value == receiver && !argument.expansion.is_spread()
+            }) {
+                return None;
+            }
+            let arguments = site.child_by_field_name("arguments")?;
+            return node_children(arguments)
+                .into_iter()
+                .find(|argument| argument.kind() != "comment");
+        }
+        if dynamic_call_write(site, prepared.source()).is_some() {
+            let dictionary = function.child_by_field_name("object")?;
+            if dynamic_dictionary_receiver(procedure, dictionary, prepared.source())? == receiver {
+                return dictionary.child_by_field_name("object");
+            }
+        }
+        return None;
+    }
+
+    if matches!(site.kind(), "assignment" | "augmented_assignment")
+        && dictionary_write(site, prepared.source()).is_some()
+    {
+        let dictionary = site
+            .child_by_field_name("left")?
+            .child_by_field_name("value")?;
+        if dynamic_dictionary_receiver(procedure, dictionary, prepared.source())? == receiver {
+            return dictionary.child_by_field_name("object");
+        }
+    }
+    None
+}
+
+fn enclosing_function_definition<'tree>(mut node: Node<'tree>) -> Option<Node<'tree>> {
+    loop {
+        if node.kind() == "function_definition" {
+            return Some(node);
+        }
+        node = node.parent()?;
+    }
+}
+
+fn nested_helper_reference_runs_in_outer_scope<'tree>(
+    mut node: Node<'tree>,
+    outer: Node<'tree>,
+) -> bool {
+    while node != outer {
+        if matches!(
+            node.kind(),
+            "function_definition" | "lambda" | "class_definition" | "generator_expression"
+        ) {
+            return false;
+        }
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        node = parent;
+    }
+    true
+}
+
+fn parameter_name_node<'tree>(parameter: Node<'tree>) -> Option<Node<'tree>> {
+    if parameter.kind() == "identifier" {
+        return Some(parameter);
+    }
+    parameter.child_by_field_name("name").or_else(|| {
+        node_children(parameter)
+            .into_iter()
+            .find(|node| node.kind() == "identifier")
+    })
+}
+
+fn nested_receiver_parameter(
+    helper: Node<'_>,
+    receiver: Node<'_>,
+    source: &str,
+) -> Option<(usize, Box<str>, bool)> {
+    if receiver.kind() != "identifier" {
+        return None;
+    }
+    let receiver_name = receiver.utf8_text(source.as_bytes()).ok()?;
+    let parameters = helper.child_by_field_name("parameters")?;
+    let mut positional_ordinal = 0;
+    let mut keyword_only = false;
+    for parameter in node_children(parameters) {
+        if parameter.kind() == "keyword_separator" {
+            keyword_only = true;
+            continue;
+        }
+        if parameter.kind() == "list_splat_pattern" {
+            keyword_only = true;
+            continue;
+        }
+        if parameter.kind() == "dictionary_splat_pattern" {
+            continue;
+        }
+        let Some(name) = parameter_name_node(parameter) else {
+            continue;
+        };
+        let name_text = name.utf8_text(source.as_bytes()).ok()?;
+        if name_text == receiver_name {
+            return Some((positional_ordinal, Box::from(name_text), keyword_only));
+        }
+        if !keyword_only {
+            positional_ordinal += 1;
+        }
+    }
+    None
+}
+
+fn nested_helper_direct_calls<'tree>(
+    outer: Node<'tree>,
+    helper: Node<'tree>,
+    source: &str,
+) -> Result<Vec<Node<'tree>>, UnknownReason> {
+    if helper
+        .parent()
+        .is_some_and(|parent| parent.kind() == "decorated_definition")
+    {
+        return Err(UnknownReason::UncertainFlow);
+    }
+    let Some(body) = outer.child_by_field_name("body") else {
+        return Err(UnknownReason::UncertainFlow);
+    };
+    let helper_block = helper.parent();
+    if helper_block.is_none_or(|block| block.parent() != Some(outer) || block != body) {
+        return Err(UnknownReason::UncertainFlow);
+    }
+    let Some(name_node) = helper.child_by_field_name("name") else {
+        return Err(UnknownReason::UncertainFlow);
+    };
+    let Ok(name) = name_node.utf8_text(source.as_bytes()) else {
+        return Err(UnknownReason::UncertainFlow);
+    };
+    let mut calls = Vec::new();
+    let mut pending = vec![body];
+    while let Some(node) = pending.pop() {
+        if node == name_node {
+            continue;
+        }
+        if node.kind() == "identifier" && node.utf8_text(source.as_bytes()).ok() == Some(name) {
+            if enclosing_function_definition(node) != Some(outer)
+                || !nested_helper_reference_runs_in_outer_scope(node, outer)
+            {
+                return Err(UnknownReason::UncertainFlow);
+            }
+            let direct_callee = node.parent().is_some_and(|parent| {
+                parent.kind() == "call" && parent.child_by_field_name("function") == Some(node)
+            });
+            if !direct_callee {
+                return Err(UnknownReason::UncertainFlow);
+            }
+            calls.push(node.parent().expect("a direct callee has a call parent"));
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+    }
+    if calls.is_empty() {
+        return Err(UnknownReason::UnmodeledLoad);
+    }
+    Ok(calls)
+}
+
+fn nested_helper_argument_expression<'tree>(
+    call: Node<'tree>,
+    parameter_name: &str,
+    positional_ordinal: usize,
+    keyword_only: bool,
+    source: &str,
+) -> Result<Node<'tree>, UnknownReason> {
+    let Some(arguments) = call.child_by_field_name("arguments") else {
+        return Err(UnknownReason::UnmodeledLoad);
+    };
+    let mut positional = 0;
+    let mut positional_match = None;
+    let mut keyword_match = None;
+    for argument in node_children(arguments) {
+        match argument.kind() {
+            "comment" => {}
+            "keyword_argument" => {
+                if argument
+                    .child_by_field_name("name")
+                    .and_then(|name| name.utf8_text(source.as_bytes()).ok())
+                    == Some(parameter_name)
+                {
+                    keyword_match = argument.child_by_field_name("value");
+                }
+            }
+            "list_splat" | "dictionary_splat" => {
+                return Err(UnknownReason::UnmodeledLoad);
+            }
+            _ => {
+                if positional == positional_ordinal {
+                    positional_match = Some(argument);
+                }
+                positional += 1;
+            }
+        }
+    }
+    if keyword_only {
+        keyword_match.ok_or(UnknownReason::UnmodeledLoad)
+    } else if positional_match.is_some() && keyword_match.is_some() {
+        Err(UnknownReason::UnmodeledLoad)
+    } else {
+        positional_match
+            .or(keyword_match)
+            .ok_or(UnknownReason::UnmodeledLoad)
+    }
 }
 
 /// Whether a workspace class can shadow an inherited modeled member through
@@ -627,13 +2115,10 @@ fn external_instance_method_present_on_owner(
     owner_id: &str,
     member: &str,
 ) -> bool {
-    let matched = overlay.member_target_on_owner(owner_id, member);
-    let [record] = matched.records.as_slice() else {
+    let Some(record) = python_external_member_declaration(overlay, owner_id, member) else {
         return false;
     };
-    matched.disposition
-        == crate::analyzer::semantic_model::SemanticModelMemberTargetDisposition::Unique
-        && record.language == Language::Python.config_label()
+    record.language == Language::Python.config_label()
         && record.kind == SemanticModelSymbolKind::Method
         && !record.is_static()
         && record.has_receiver()
@@ -742,17 +2227,16 @@ fn class_decorators_preserve_identity(
         )?;
         let canonical = format!("{module}.{member}");
         let symbols = overlay.symbols_named(&canonical);
-        // Overload declarations may share this exact callable identity. Every
-        // declaration must agree; an alias posting alone is not exact binding.
-        if semantic_model_callable_family_id(&symbols.records).is_none()
-            || symbols.records.iter().any(|symbol| {
-                symbol.qualified_name != canonical
-                    || symbol.language != Language::Python.config_label()
-                    || symbol.kind != SemanticModelSymbolKind::Function
-                    || symbol.has_receiver()
-                    || symbol.provenance.ambiguous
-                    || symbol.provenance.completeness != SemanticModelCompleteness::Complete
-            })
+        let [symbol] = symbols.records.as_slice() else {
+            return None;
+        };
+        if symbol.qualified_name != canonical
+            || symbol.language != Language::Python.config_label()
+            || symbol.kind != SemanticModelSymbolKind::Function
+            || symbol.has_receiver()
+            || symbol.provenance.ambiguous
+            || !symbol.has_complete_callable_shape_evidence()
+            || symbol.structured_signature().is_none()
         {
             return None;
         }
@@ -870,6 +2354,73 @@ fn external_seed(
     }
 }
 
+fn external_module_value_seed(
+    overlay: &SemanticModelOverlay,
+    module: &str,
+    member: &str,
+) -> Option<ClassSeed> {
+    let qualified_name = format!("{module}.{member}");
+    let matched = overlay.symbols_named(&qualified_name);
+    if matched.disposition != SemanticModelOverlayDisposition::Unique {
+        return Some(ClassSeed::Unknown(UnknownReason::AmbiguousCallee));
+    }
+    let [symbol] = matched.records.as_slice() else {
+        return Some(ClassSeed::Unknown(UnknownReason::AmbiguousCallee));
+    };
+    if symbol.language != Language::Python.config_label()
+        || symbol.kind != SemanticModelSymbolKind::Field
+    {
+        return None;
+    }
+    if symbol.provenance.ambiguous {
+        return Some(ClassSeed::Unknown(UnknownReason::AmbiguousCallee));
+    }
+    if symbol.provenance.completeness != SemanticModelCompleteness::Complete
+        && symbol.proxied_type.is_none()
+        && symbol.value_type.is_none()
+    {
+        return Some(ClassSeed::Unknown(UnknownReason::PackIncomplete));
+    }
+    let Some(declared_type) = symbol.proxied_type.as_ref().or(symbol.value_type.as_ref()) else {
+        return Some(ClassSeed::Unknown(UnknownReason::ExternalNotModeled));
+    };
+    let mut cache = ExternalClassCache::default();
+    let identity = match declared_type {
+        TypeRef::Named {
+            name,
+            arguments,
+            nullable: false,
+        } if arguments.is_empty() => {
+            external_class_identity(Some(overlay), Language::Python, name, None, &mut cache)
+        }
+        TypeRef::Declared {
+            id,
+            arguments,
+            nullable: false,
+        } if arguments.is_empty() => {
+            let target = overlay.symbols_with_id(id);
+            if target.disposition != SemanticModelOverlayDisposition::Unique {
+                return Some(ClassSeed::Unknown(UnknownReason::AmbiguousCallee));
+            }
+            let [target] = target.records.as_slice() else {
+                return Some(ClassSeed::Unknown(UnknownReason::ExternalNotModeled));
+            };
+            external_class_identity(
+                Some(overlay),
+                Language::Python,
+                &target.qualified_name,
+                Some(id),
+                &mut cache,
+            )
+        }
+        _ => return Some(ClassSeed::Unknown(UnknownReason::ExternalNotModeled)),
+    };
+    Some(match identity {
+        Some(identity) => ClassSeed::Class(identity),
+        None => ClassSeed::Unknown(UnknownReason::ExternalNotModeled),
+    })
+}
+
 /// The module and member an import statement binds `reference` to.
 ///
 /// A bare imported name and a namespaced path are the same question for the
@@ -895,6 +2446,107 @@ fn import_bound_external_symbol(
         prepared.tree().root_node(),
         reference,
     )
+}
+
+fn imported_external_callable_binding(
+    python: &PythonAnalyzer,
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    reference: Node<'_>,
+) -> Option<(String, String)> {
+    if let Some(binding) = import_bound_external_symbol(python, file, prepared, reference) {
+        return Some(binding);
+    }
+    if reference.kind() != "identifier" {
+        return None;
+    }
+    let member = reference.utf8_text(prepared.source().as_bytes()).ok()?;
+    indexed_builtin_is_unshadowed(python, reference, prepared)
+        .is_some_and(|unshadowed| unshadowed)
+        .then(|| ("builtins".to_owned(), member.to_owned()))
+}
+
+/// Resolve an imported external function's return. An explicit exact class
+/// set closes the result; a complete return annotation alone keeps its
+/// ordinary open type bound. A typing.Any return stays an unknown value
+/// because Any is not a runtime class.
+fn imported_external_function_result_seed(
+    workspace: &WorkspaceAnalyzer,
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    expression: Node<'_>,
+) -> Option<ClassSeed> {
+    let python = python_analyzer(workspace);
+    let (module, member) = imported_external_callable_binding(python, file, prepared, expression)?;
+    let canonical = format!("{module}.{member}");
+    let overlay = workspace.analyzer().semantic_model_overlay()?;
+    let symbols = overlay.symbols_named(&canonical);
+    let [symbol] = symbols.records.as_slice() else {
+        return None;
+    };
+    if symbol.qualified_name != canonical
+        || symbol.language != Language::Python.config_label()
+        || symbol.kind != SemanticModelSymbolKind::Function
+        || symbol.has_receiver()
+        || symbol.provenance.ambiguous
+        || (symbol.exact_return_classes.is_empty()
+            && !symbol.has_complete_callable_shape_evidence())
+    {
+        return None;
+    }
+    let mut cache = ExternalClassCache::default();
+    if !symbol.exact_return_classes.is_empty() {
+        let classes = symbol
+            .exact_return_classes
+            .iter()
+            .map(|class| match class {
+                crate::analyzer::semantic_model::TypeRef::Named {
+                    name,
+                    nullable: false,
+                    ..
+                } => external_class_identity(
+                    Some(&overlay),
+                    Language::Python,
+                    name,
+                    None,
+                    &mut cache,
+                ),
+                crate::analyzer::semantic_model::TypeRef::Declared {
+                    id,
+                    nullable: false,
+                    ..
+                } => external_class_identity(
+                    Some(&overlay),
+                    Language::Python,
+                    "",
+                    Some(id),
+                    &mut cache,
+                ),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        return Some(python_dynamic_any_seed(ClassSeed::classes(classes)));
+    }
+    let returns = symbol.structured_signature()?.returns.as_ref()?;
+    if python_type_ref_contains_any(&overlay, returns) {
+        return Some(ClassSeed::Unknown(UnknownReason::UncertainFlow));
+    }
+    let class = match returns {
+        crate::analyzer::semantic_model::TypeRef::Named {
+            name,
+            nullable: false,
+            ..
+        } => external_class_identity(Some(&overlay), Language::Python, name, None, &mut cache),
+        crate::analyzer::semantic_model::TypeRef::Declared {
+            id,
+            nullable: false,
+            ..
+        } => external_class_identity(Some(&overlay), Language::Python, "", Some(id), &mut cache),
+        _ => None,
+    }?;
+    Some(python_dynamic_any_seed(ClassSeed::ClassWithOpenBound(
+        class,
+    )))
 }
 
 /// Whether a base spelling names a typing marker rather than a class that
@@ -940,11 +2592,214 @@ fn python_typing_marker_base(python: &PythonAnalyzer, owner: &CodeUnit, raw: &st
     )
 }
 
-/// Whether this exact base expression is the unshadowed builtin `object`.
-/// Python supplies its default `__getattribute__`; that inherited method is
-/// not evidence of a user hook, even when the active pack omits `object`.
-fn python_default_object_base(python: &PythonAnalyzer, owner: &CodeUnit, raw: &str) -> bool {
-    if raw != "object" {
+fn python_class_has_protocol_base(python: &PythonAnalyzer, owner: &CodeUnit) -> bool {
+    let Some(prepared) = current_indexed_prepared(python, owner.source()) else {
+        return true;
+    };
+    let Some(class) = class_node_for_unit(python, &prepared, owner) else {
+        return true;
+    };
+    let Some(bases) = class.child_by_field_name("superclasses") else {
+        return false;
+    };
+    let mut cursor = bases.walk();
+    bases
+        .named_children(&mut cursor)
+        .filter(|base| base.kind() != "keyword_argument")
+        .map(python_base_origin_node)
+        .any(|base| {
+            import_bound_external_symbol(python, owner.source(), &prepared, base).is_some_and(
+                |(module, member)| {
+                    matches!(
+                        format!("{module}.{member}").as_str(),
+                        "typing.Protocol" | "typing_extensions.Protocol"
+                    )
+                },
+            )
+        })
+}
+
+fn python_class_declares_abstract_members(
+    python: &PythonAnalyzer,
+    owner: &CodeUnit,
+) -> Option<HashMap<String, bool>> {
+    let prepared = current_indexed_prepared(python, owner.source())?;
+    let class = class_node_for_unit(python, &prepared, owner)?;
+    let body = class.child_by_field_name("body")?;
+    let mut members = HashMap::default();
+    let mut cursor = body.walk();
+    for declaration in body.named_children(&mut cursor) {
+        let (definition, decorated) = match declaration.kind() {
+            "decorated_definition" => {
+                let mut cursor = declaration.walk();
+                let Some(definition) = declaration
+                    .named_children(&mut cursor)
+                    .find(|child| child.kind() == "function_definition")
+                else {
+                    continue;
+                };
+                (definition, Some(declaration))
+            }
+            "function_definition" => (declaration, None),
+            _ => continue,
+        };
+        let Some(name) = definition
+            .child_by_field_name("name")
+            .and_then(|name| name.utf8_text(prepared.source().as_bytes()).ok())
+        else {
+            continue;
+        };
+        let is_abstract = decorated.is_some_and(|decorated| {
+            let mut cursor = decorated.walk();
+            decorated
+                .named_children(&mut cursor)
+                .filter(|child| child.kind() == "decorator")
+                .filter_map(|decorator| decorator.named_child(0))
+                .any(|expression| {
+                    let target = if expression.kind() == "call" {
+                        expression
+                            .child_by_field_name("function")
+                            .unwrap_or(expression)
+                    } else {
+                        expression
+                    };
+                    import_bound_external_symbol(python, owner.source(), &prepared, target)
+                        .is_some_and(|(module, member)| {
+                            module == "abc"
+                                && matches!(
+                                    member.as_str(),
+                                    "abstractmethod"
+                                        | "abstractclassmethod"
+                                        | "abstractstaticmethod"
+                                        | "abstractproperty"
+                                )
+                        })
+                })
+        });
+        members.insert(name.to_owned(), is_abstract);
+    }
+    Some(members)
+}
+
+fn python_class_hierarchy_has_abstract_members(python: &PythonAnalyzer, class: &CodeUnit) -> bool {
+    let mut frontier = vec![class.clone()];
+    let mut seen = HashSet::default();
+    let mut nearest_members: HashMap<String, (usize, bool)> = HashMap::default();
+    let mut distance = 0;
+    while !frontier.is_empty() {
+        let mut next = Vec::new();
+        for owner in frontier {
+            if !seen.insert(owner.clone()) {
+                continue;
+            }
+            let Some(declarations) = python_class_declares_abstract_members(python, &owner) else {
+                return true;
+            };
+            for (name, is_abstract) in declarations {
+                match nearest_members.entry(name) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert((distance, is_abstract));
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut entry)
+                        if entry.get().0 == distance =>
+                    {
+                        entry.get_mut().1 |= is_abstract;
+                    }
+                    std::collections::hash_map::Entry::Occupied(_) => {}
+                }
+            }
+            next.extend(python.get_direct_ancestors(&owner));
+        }
+        frontier = next;
+        distance += 1;
+    }
+    nearest_members
+        .values()
+        .any(|(_, is_abstract)| *is_abstract)
+}
+
+fn external_hierarchy_has_protocol_or_abstract_members(
+    workspace: &WorkspaceAnalyzer,
+    ancestors: &[ClassIdentity],
+) -> bool {
+    let Some(overlay) = workspace.analyzer().semantic_model_overlay() else {
+        return ancestors
+            .iter()
+            .any(|ancestor| matches!(ancestor, ClassIdentity::External { .. }));
+    };
+    for ancestor in ancestors {
+        let ClassIdentity::External { symbol_id, .. } = ancestor else {
+            continue;
+        };
+        let matched = overlay.symbols_with_id(symbol_id);
+        let [_symbol] = matched.records.as_slice() else {
+            return true;
+        };
+        let Some(mro) = python_external_class_mro(&overlay, symbol_id) else {
+            return true;
+        };
+        if mro.iter().any(|id| {
+            let records = python_external_class_records(&overlay, id);
+            records.is_empty()
+                || records.iter().any(|owner| {
+                    !overlay.owner_surface(owner).gaps.is_empty()
+                        || owner.declaration_is_abstract()
+                        || matches!(
+                            owner.qualified_name.as_str(),
+                            "typing.Protocol" | "typing_extensions.Protocol"
+                        )
+                })
+                || records.iter().any(|owner| {
+                    overlay
+                        .members_of(&owner.id)
+                        .records
+                        .iter()
+                        .any(|member| member.declaration_is_abstract())
+                })
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
+fn declared_parameter_annotation_at_span(
+    prepared: &PreparedSyntaxTree,
+    span: SourceSpan,
+) -> Option<(Node<'_>, Node<'_>)> {
+    let mut node = node_at_span(prepared, span)?;
+    while !matches!(node.kind(), "function_definition" | "lambda") {
+        node = node.parent()?;
+    }
+    let layout = formal_parameter_slots_for_owner(Language::Python, node, prepared.source())?;
+    let mut slots = layout.slots.iter().filter(|slot| {
+        slot.declaration_range.start_byte <= span.start_byte() as usize
+            && span.end_byte() as usize <= slot.declaration_range.end_byte
+    });
+    let slot = slots.next()?;
+    if slots.next().is_some() {
+        return None;
+    }
+    let declaration = node.named_descendant_for_byte_range(
+        slot.declaration_range.start_byte,
+        slot.declaration_range.end_byte,
+    )?;
+    let annotation = match declaration.kind() {
+        "typed_parameter" | "typed_default_parameter" => declaration.child_by_field_name("type")?,
+        _ => return None,
+    };
+    Some((node, annotation))
+}
+
+/// Whether this exact base expression is an unshadowed intrinsic builtin
+/// root with no source declaration in the active workspace.
+pub(super) fn python_intrinsic_base_is_unshadowed(
+    python: &PythonAnalyzer,
+    owner: &CodeUnit,
+    raw: &str,
+) -> bool {
+    let name = raw.trim();
+    if name != "object" && super::python_builtin_exception_name(name).is_none() {
         return false;
     }
     let Some(prepared) = current_indexed_prepared(python, owner.source()) else {
@@ -961,14 +2816,20 @@ fn python_default_object_base(python: &PythonAnalyzer, owner: &CodeUnit, raw: &s
         .named_children(&mut cursor)
         .filter(|base| base.kind() != "keyword_argument")
         .map(python_base_origin_node)
-        .find(|base| base.utf8_text(prepared.source().as_bytes()) == Ok(raw))
+        .find(|base| base.utf8_text(prepared.source().as_bytes()) == Ok(name))
     else {
         return false;
     };
     base.kind() == "identifier"
-        && base.utf8_text(prepared.source().as_bytes()) == Ok("object")
+        && base.utf8_text(prepared.source().as_bytes()) == Ok(name)
         && import_bound_external_symbol(python, owner.source(), &prepared, base).is_none()
         && indexed_builtin_is_unshadowed(python, base, &prepared) == Some(true)
+}
+
+/// Python supplies the default `object` behavior even when the active pack
+/// omits the builtin's declaration.
+fn python_default_object_base(python: &PythonAnalyzer, owner: &CodeUnit, raw: &str) -> bool {
+    raw.trim() == "object" && python_intrinsic_base_is_unshadowed(python, owner, raw)
 }
 
 /// The active model's class for one canonical dotted name.
@@ -1144,21 +3005,13 @@ fn external_class_may_override_getattribute(
     if owner.qualified_name == "builtins.object" {
         return false;
     }
-    let surface = overlay.owner_surface(owner);
-    if surface
-        .gaps
-        .iter()
-        .any(|gap| !matches!(gap, SemanticModelSurfaceGap::PartialType { .. }))
-    {
+    let Some(mro) = python_external_class_mro(overlay, symbol_id) else {
         return true;
-    }
-    surface.closure.iter().any(|ancestor| {
-        ancestor.qualified_name != "builtins.object"
-            && overlay
-                .members_of(&ancestor.id)
-                .records
-                .iter()
-                .any(|member| member.name == "__getattribute__")
+    };
+    mro.iter().skip(1).any(|class_id| {
+        exact_python_model_class(overlay, class_id)
+            .is_some_and(|class| class.qualified_name != "builtins.object")
+            && python_external_declares_member(overlay, class_id, "__getattribute__")
     })
 }
 
@@ -1196,6 +3049,39 @@ fn collect_guard_class_nodes<'tree>(node: Node<'tree>, nodes: &mut Vec<Node<'tre
             nodes.push(node);
             true
         }
+    }
+}
+
+/// The class one guard class expression names: a workspace class by its
+/// declaration, or a bare unshadowed builtin name through the builtin table.
+fn guard_class_identity(
+    workspace: &WorkspaceAnalyzer,
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    overlay: Option<&SemanticModelOverlay>,
+    cache: &mut ExternalClassCache,
+    class: Node<'_>,
+) -> Result<ClassIdentity, UnknownReason> {
+    let unmodeled = || UnknownReason::UnmodeledGuard {
+        class: class
+            .utf8_text(prepared.source().as_bytes())
+            .expect("a class expression is within its prepared source")
+            .into(),
+    };
+    match resolve_class_at_span(workspace, file.clone(), span_for_node(class), prepared) {
+        ClassSeed::Class(identity) => Ok(identity),
+        ClassSeed::Unknown(UnknownReason::SemanticBudget) => Err(UnknownReason::SemanticBudget),
+        // A builtin name has no workspace declaration for the type lookup to
+        // return, so `isinstance(value, dict)` resolves to nothing through that
+        // route and is modeled here.
+        ClassSeed::NotApplicable => {
+            exact_builtin_class(python_analyzer(workspace), class, prepared, overlay, cache)
+                .ok_or_else(unmodeled)
+        }
+        ClassSeed::Classes(_)
+        | ClassSeed::ClassWithOpenBound(_)
+        | ClassSeed::ClassesWithOpenBound(_)
+        | ClassSeed::Unknown(_) => Err(unmodeled()),
     }
 }
 
@@ -1372,14 +3258,22 @@ fn external_class_hierarchy(
     let [symbol] = matched.records.as_slice() else {
         return ClassHierarchy::unknown();
     };
-    let surface = overlay.owner_surface(symbol);
-    let mut ancestors = surface
-        .closure
+    let mro = python_external_class_mro(overlay, symbol_id);
+    let mut cache = ExternalClassCache::default();
+    let mut ancestors = mro
+        .as_deref()
+        .unwrap_or_default()
         .iter()
-        .filter(|record| record.id != symbol.id)
-        .map(|record| ClassIdentity::External {
-            qualified_name: record.qualified_name.clone().into_boxed_str(),
-            symbol_id: record.id.clone().into_boxed_str(),
+        .filter(|record_id| record_id.as_str() != symbol.id)
+        .filter_map(|record_id| {
+            let record = exact_python_model_class(overlay, record_id)?;
+            external_class_identity(
+                Some(overlay),
+                Language::Python,
+                &record.qualified_name,
+                Some(&record.id),
+                &mut cache,
+            )
         })
         .collect::<Vec<_>>();
     ancestors.sort_by(|left, right| left.qualified_name().cmp(right.qualified_name()));
@@ -1387,7 +3281,12 @@ fn external_class_hierarchy(
     ClassHierarchy {
         ancestors,
         descendants: None,
-        unresolved_base: !surface.proves_absence(),
+        unresolved_base: mro.as_ref().is_none_or(|classes| {
+            classes.iter().any(|class_id| {
+                exact_python_model_class(overlay, class_id)
+                    .is_none_or(|class| overlay.gapped(&class.qualified_name).is_some())
+            })
+        }),
         dynamic_attributes: true,
     }
 }
@@ -1471,6 +3370,19 @@ struct PythonModuleBindingRequestMemo {
     bindings: Mutex<HashMap<[u8; 32], PythonModuleBindingAnswers>>,
 }
 
+fn resolve_module_binding(
+    prepared: &PreparedSyntaxTree,
+    name: &str,
+    session: &ResolutionSession,
+) -> Option<Option<PythonDirectScopeBindingKind>> {
+    python_unambiguous_module_binding_bounded(
+        prepared.tree().root_node(),
+        prepared.source(),
+        name,
+        || session.scope_step(),
+    )
+}
+
 impl PythonModuleBindingRequestMemo {
     fn binding(
         &self,
@@ -1492,12 +3404,7 @@ impl PythonModuleBindingRequestMemo {
         {
             return Some(binding);
         }
-        let binding = python_unambiguous_module_binding_bounded(
-            prepared.tree().root_node(),
-            prepared.source(),
-            name,
-            || session.scope_step(),
-        )?;
+        let binding = resolve_module_binding(prepared, name, session)?;
         self.bindings
             .lock()
             .expect("module binding memo lock poisoned")
@@ -1519,12 +3426,7 @@ fn module_binding(
     {
         memo.binding(prepared, name, session)
     } else {
-        python_unambiguous_module_binding_bounded(
-            prepared.tree().root_node(),
-            prepared.source(),
-            name,
-            || session.scope_step(),
-        )
+        resolve_module_binding(prepared, name, session)
     }
 }
 
@@ -1569,14 +3471,7 @@ fn declaration_reference_seed(
     let session = ResolutionSession::bounded(INTERACTIVE_TYPE_LOOKUP_BUDGET, None);
     let binding = match module_binding(workspace, prepared, name, &session) {
         None => return ClassSeed::Unknown(UnknownReason::SemanticBudget),
-        Some(Some(
-            binding @ (PythonDirectScopeBindingKind::ClassDeclaration
-            | PythonDirectScopeBindingKind::FunctionDeclaration
-            | PythonDirectScopeBindingKind::Import),
-        )) => binding,
-        Some(Some(PythonDirectScopeBindingKind::Other)) | Some(None) => {
-            return ClassSeed::NotApplicable;
-        }
+        binding => binding,
     };
     match module_binding_reaches_reference(reference, name, source, &session) {
         None => return ClassSeed::Unknown(UnknownReason::SemanticBudget),
@@ -1588,6 +3483,23 @@ fn declaration_reference_seed(
         Some(false) => return ClassSeed::NotApplicable,
         Some(true) => {}
     }
+    if matches!(
+        binding,
+        Some(Some(PythonDirectScopeBindingKind::Other)) | Some(None)
+    ) {
+        if !python_reference_in_deferred_scope(reference) {
+            return ClassSeed::NotApplicable;
+        }
+        return module_global_initializer_seed(workspace, file, prepared, name, &session);
+    }
+    let Some(Some(
+        binding @ (PythonDirectScopeBindingKind::ClassDeclaration
+        | PythonDirectScopeBindingKind::FunctionDeclaration
+        | PythonDirectScopeBindingKind::Import),
+    )) = binding
+    else {
+        return ClassSeed::NotApplicable;
+    };
     if binding == PythonDirectScopeBindingKind::FunctionDeclaration {
         return ClassSeed::Unknown(UnknownReason::UncertainFlow);
     }
@@ -1609,6 +3521,72 @@ fn declaration_reference_seed(
             ClassSeed::Unknown(UnknownReason::ClassObject)
         }
         ClassSeed::NotApplicable => ClassSeed::Unknown(UnknownReason::UncertainFlow),
+    }
+}
+
+fn python_reference_in_deferred_scope(reference: Node<'_>) -> bool {
+    let mut current = reference;
+    while let Some(scope) = current.parent() {
+        if matches!(
+            scope.kind(),
+            "function_definition" | "lambda" | "class_definition"
+        ) && scope.child_by_field_name("body").is_some_and(|body| {
+            body.start_byte() <= reference.start_byte() && reference.end_byte() <= body.end_byte()
+        }) {
+            return true;
+        }
+        current = scope;
+    }
+    false
+}
+
+fn module_global_initializer_seed(
+    workspace: &WorkspaceAnalyzer,
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    name: &str,
+    session: &ResolutionSession,
+) -> ClassSeed {
+    let python = python_analyzer(workspace);
+    let Some(facts) = python.module_global_source_facts(file, prepared, &|| session.scope_step())
+    else {
+        return ClassSeed::Unknown(UnknownReason::SemanticBudget);
+    };
+    if !facts.module_binds_name(name) {
+        return ClassSeed::NotApplicable;
+    }
+    let Some(range) = facts.initializer_range(name) else {
+        return ClassSeed::Unknown(UnknownReason::UncertainFlow);
+    };
+    if !python.cached_module_member_mutation_free(
+        &brokk_bifrost_python::declarations::python_module_name(file),
+        name,
+        || {
+            crate::analyzer::semantic::workspace_oracle::python_workspace_module_member_mutation_free(
+                workspace.analyzer(),
+                &brokk_bifrost_python::declarations::python_module_name(file),
+                name,
+                200_000,
+                &|| session.scope_step(),
+            )
+        },
+    ) {
+        return ClassSeed::Unknown(UnknownReason::UncertainFlow);
+    }
+    let Some(value) = prepared
+        .tree()
+        .root_node()
+        .descendant_for_byte_range(range.start_byte, range.end_byte)
+    else {
+        return ClassSeed::Unknown(UnknownReason::UncertainFlow);
+    };
+    match resolve_class_at_span(workspace, file.clone(), span_for_node(value), prepared) {
+        ClassSeed::Class(class) => ClassSeed::Class(class),
+        ClassSeed::Unknown(reason) => ClassSeed::Unknown(reason),
+        ClassSeed::NotApplicable
+        | ClassSeed::Classes(_)
+        | ClassSeed::ClassWithOpenBound(_)
+        | ClassSeed::ClassesWithOpenBound(_) => ClassSeed::Unknown(UnknownReason::UncertainFlow),
     }
 }
 
@@ -1649,11 +3627,340 @@ fn imported_external_class(
     let (module, member) =
         import_bound_external_symbol(python_analyzer(workspace), file, prepared, reference)?;
     external_class_identity(
-        overlay_of(workspace).as_deref(),
+        workspace.analyzer().semantic_model_overlay().as_deref(),
         Language::Python,
         &format!("{module}.{member}"),
         None,
         &mut ExternalClassCache::default(),
+    )
+}
+
+/// Class candidates for a direct constructor call in a `with` manager.
+///
+/// Keep the source-resolution paths shared with the type-flow adapter: imports
+/// first resolve through the import binder and active semantic-model overlay,
+/// while workspace classes use the definition provider's scope and shadowing
+/// rules. An imported external callable contributes its declared return class
+/// or overload return set.
+pub(crate) fn python_with_manager_call_classes(
+    python: &PythonAnalyzer,
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    callee: Node<'_>,
+    overlay: Option<&SemanticModelOverlay>,
+) -> Option<Vec<ClassIdentity>> {
+    match python_module_external_class_alias_value(prepared, callee) {
+        PythonModuleExternalClassAlias::Value(value) => {
+            return imported_external_class_for_python(python, file, prepared, value, overlay)
+                .map(|class| vec![class]);
+        }
+        PythonModuleExternalClassAlias::Unproved => return None,
+        PythonModuleExternalClassAlias::NotFound => {}
+    }
+    if let Some(class) =
+        imported_external_class_callee_for_python(python, file, prepared, callee, overlay)
+    {
+        return Some(vec![class]);
+    }
+    if let Some(classes) =
+        imported_external_function_return_classes(python, file, prepared, callee, overlay)
+    {
+        return Some(classes);
+    }
+
+    let name = python_static_attribute_path(callee)?
+        .into_iter()
+        .map(|segment| segment.utf8_text(prepared.source().as_bytes()).ok())
+        .collect::<Option<Vec<_>>>()?
+        .join(".");
+    python_workspace_class_candidate_named_for_python(python, file, prepared, callee, &name)
+        .map(|class| vec![class])
+}
+
+enum PythonModuleExternalClassAlias<'tree> {
+    NotFound,
+    Unproved,
+    Value(Node<'tree>),
+}
+
+/// Find a unique, direct module assignment such as
+/// `threading.Lock = _thread.LockType`. The imported class on the right is the
+/// constructor target, even when the external model does not name the assigned
+/// attribute as an alias. Any other write to that attribute leaves it unknown.
+fn python_module_external_class_alias_value<'tree>(
+    prepared: &'tree PreparedSyntaxTree,
+    callee: Node<'tree>,
+) -> PythonModuleExternalClassAlias<'tree> {
+    let source = prepared.source();
+    let Some(wanted_path) = python_static_attribute_path(callee).and_then(|path| {
+        path.into_iter()
+            .map(|segment| segment.utf8_text(source.as_bytes()).ok())
+            .collect::<Option<Vec<_>>>()
+    }) else {
+        return PythonModuleExternalClassAlias::NotFound;
+    };
+    if wanted_path.len() < 2 {
+        return PythonModuleExternalClassAlias::NotFound;
+    }
+    let root = prepared.tree().root_node();
+    let mut value = None;
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        let target = match node.kind() {
+            "assignment" | "augmented_assignment" | "for_statement" => {
+                node.child_by_field_name("left")
+            }
+            "delete_statement" => node
+                .child_by_field_name("left")
+                .or_else(|| node.named_child(0)),
+            "with_item" => node
+                .child_by_field_name("value")
+                .and_then(|value| (value.kind() == "as_pattern").then_some(value))
+                .and_then(|pattern| pattern.child_by_field_name("alias")),
+            _ => None,
+        };
+        if target
+            .is_some_and(|target| python_target_writes_attribute_path(target, &wanted_path, source))
+        {
+            let direct_alias = node.kind() == "assignment"
+                && target.is_some_and(|target| {
+                    target.kind() == "attribute"
+                        && python_static_attribute_path(target).is_some_and(|path| {
+                            path.into_iter()
+                                .map(|segment| segment.utf8_text(source.as_bytes()).ok())
+                                .collect::<Option<Vec<_>>>()
+                                .as_deref()
+                                == Some(wanted_path.as_slice())
+                        })
+                })
+                && node
+                    .parent()
+                    .is_some_and(|statement| statement.kind() == "expression_statement")
+                && node.parent().and_then(|statement| statement.parent()) == Some(root);
+            if !direct_alias || value.is_some() {
+                return PythonModuleExternalClassAlias::Unproved;
+            }
+            let Some(initializer) = node.child_by_field_name("right") else {
+                return PythonModuleExternalClassAlias::Unproved;
+            };
+            value = Some(initializer);
+        }
+        stack.extend(named_children(node));
+    }
+    value.map_or(
+        PythonModuleExternalClassAlias::NotFound,
+        PythonModuleExternalClassAlias::Value,
+    )
+}
+
+fn python_target_writes_attribute_path(
+    target: Node<'_>,
+    wanted_path: &[&str],
+    source: &str,
+) -> bool {
+    let mut stack = vec![target];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "attribute"
+            && python_static_attribute_path(node).is_some_and(|path| {
+                path.into_iter()
+                    .map(|segment| segment.utf8_text(source.as_bytes()).ok())
+                    .collect::<Option<Vec<_>>>()
+                    .as_deref()
+                    == Some(wanted_path)
+            })
+        {
+            return true;
+        }
+        stack.extend(named_children(node));
+    }
+    false
+}
+
+pub(crate) fn python_with_manager_literal_class(
+    prepared: &PreparedSyntaxTree,
+    value: Node<'_>,
+    overlay: Option<&SemanticModelOverlay>,
+) -> Option<ClassIdentity> {
+    let name = match value.kind() {
+        "integer" => "builtins.int",
+        "float" => "builtins.float",
+        "string" | "concatenated_string" => python_string_literal_class(value, prepared),
+        "true" | "false" => "builtins.bool",
+        "none" => "types.NoneType",
+        _ => return None,
+    };
+    external_class_identity(
+        overlay,
+        Language::Python,
+        name,
+        None,
+        &mut ExternalClassCache::default(),
+    )
+}
+
+/// Prove whether the effective `__exit__` of one exact class returns only
+/// `None`. Workspace declarations use the shared Python C3 hierarchy provider;
+/// external declarations use the semantic-model overlay's C3 lookup.
+pub(crate) fn python_with_exit_returns_none(
+    python: &PythonAnalyzer,
+    class: &ClassIdentity,
+    overlay: Option<&SemanticModelOverlay>,
+) -> bool {
+    match class {
+        ClassIdentity::Workspace(owner) => {
+            let Some(provider) = python.python_class_hierarchy_provider_for(owner) else {
+                return false;
+            };
+            let members = provider.mro_members(owner, None);
+            if members.hierarchy.outcome
+                != crate::analyzer::usages::python_class_hierarchy::PythonHierarchyOutcome::Complete
+            {
+                return false;
+            }
+            let Some(member) = members
+                .members
+                .into_iter()
+                .find(|member| member.name == "__exit__")
+            else {
+                return false;
+            };
+            workspace_exit_body_returns_none(python, &member.member)
+        }
+        ClassIdentity::External { symbol_id, .. } => {
+            let Some(overlay) = overlay else {
+                return false;
+            };
+            let Some(exit) = python_external_member_declaration(overlay, symbol_id, "__exit__")
+            else {
+                return false;
+            };
+            exit.structured_signature()
+                .and_then(|signature| signature.returns.as_ref())
+                .is_some_and(type_ref_is_none)
+        }
+    }
+}
+
+fn type_ref_is_none(reference: &TypeRef) -> bool {
+    matches!(
+        reference,
+        TypeRef::Named {
+            name,
+            arguments,
+            nullable,
+        } if arguments.is_empty()
+            && ((*name == "builtins.NoneType" && !*nullable)
+                || (*name == "None" && *nullable))
+    )
+}
+
+fn workspace_exit_body_returns_none(python: &PythonAnalyzer, method: &CodeUnit) -> bool {
+    let Some(prepared) = current_indexed_prepared(python, method.source()) else {
+        return false;
+    };
+    let Some(function) = python_function_node_for_unit(python, &prepared, method) else {
+        return false;
+    };
+    if function.parent().is_some_and(|parent| {
+        parent.kind() == "decorated_definition"
+            && (0..parent.named_child_count())
+                .any(|index| parent.named_child(index) == Some(function))
+    }) {
+        // A decorated `__exit__` may wrap or replace its return value.
+        return false;
+    }
+    python_exit_body_has_no_value_return_or_yield(function, prepared.source())
+}
+
+fn python_exit_body_has_no_value_return_or_yield(function: Node<'_>, source: &str) -> bool {
+    let Some(body) = function.child_by_field_name("body") else {
+        return false;
+    };
+    if function
+        .child_by_field_name("return_type")
+        .is_some_and(|annotation| {
+            !matches!(annotation.kind(), "none")
+                && annotation.utf8_text(source.as_bytes()).ok() != Some("None")
+        })
+    {
+        return false;
+    }
+    let mut stack = vec![body];
+    while let Some(node) = stack.pop() {
+        if node != body
+            && matches!(
+                node.kind(),
+                "function_definition" | "lambda" | "class_definition"
+            )
+        {
+            continue;
+        }
+        match node.kind() {
+            "yield" => return false,
+            "return_statement" => {
+                let mut cursor = node.walk();
+                if node
+                    .named_children(&mut cursor)
+                    .any(|value| value.kind() != "none")
+                {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    true
+}
+
+fn python_function_node_for_unit<'tree>(
+    python: &PythonAnalyzer,
+    prepared: &'tree PreparedSyntaxTree,
+    unit: &CodeUnit,
+) -> Option<Node<'tree>> {
+    python.ranges(unit).into_iter().find_map(|range| {
+        let node = prepared
+            .tree()
+            .root_node()
+            .named_descendant_for_byte_range(range.start_byte, range.end_byte)?;
+        let function = match node.kind() {
+            "function_definition" => node,
+            "decorated_definition" => {
+                let mut cursor = node.walk();
+                node.named_children(&mut cursor)
+                    .find(|child| child.kind() == "function_definition")?
+            }
+            _ => node
+                .parent()
+                .filter(|parent| parent.kind() == "function_definition")?,
+        };
+        (function
+            .child_by_field_name("name")?
+            .utf8_text(prepared.source().as_bytes())
+            .ok()?
+            == "__exit__")
+            .then_some(function)
+    })
+}
+
+/// Expand a callee source node to its complete dotted attribute path before
+/// asking the import binder for an external class. Semantic call lowering can
+/// anchor a module-qualified constructor at either the module identifier or
+/// the final member, while the binder needs the whole `module.Class` node.
+fn imported_external_class_callee(
+    workspace: &WorkspaceAnalyzer,
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    callee: Node<'_>,
+) -> Option<ClassIdentity> {
+    let python = python_analyzer(workspace);
+    imported_external_class_callee_for_python(
+        python,
+        file,
+        prepared,
+        callee,
+        workspace.analyzer().semantic_model_overlay().as_deref(),
     )
 }
 
@@ -1838,7 +4145,9 @@ fn resolve_class_at_span(
         span,
         language_content: python.inner.language_content_identity(),
         project_generation: workspace.analyzer().project().analysis_generation(),
-        semantic_overlay: overlay_of(workspace)
+        semantic_overlay: workspace
+            .analyzer()
+            .semantic_model_overlay()
             .map(|overlay| Box::from(overlay.active_model_set_hash())),
     };
     let cached = memo
@@ -1878,7 +4187,7 @@ fn resolve_indexed_class_at_span(
     if let Some(reference) = node_at_span(prepared, span)
         && let Some(seed) = builtin_class_reference(
             python_analyzer(workspace),
-            overlay_of(workspace).as_deref(),
+            workspace.analyzer().semantic_model_overlay().as_deref(),
             reference,
             prepared,
             &mut ExternalClassCache::default(),
@@ -1911,6 +4220,10 @@ fn resolve_indexed_class_at_span(
         return ClassSeed::Unknown(UnknownReason::UncertainFlow);
     }
     match outcome.status {
+        TypeLookupStatus::InvalidLocation => {
+            debug_assert!(false, "invalid internal type reference site: {outcome:?}");
+            return ClassSeed::Unknown(UnknownReason::UncertainFlow);
+        }
         TypeLookupStatus::Unavailable => return ClassSeed::Unknown(UnknownReason::UncertainFlow),
         TypeLookupStatus::Incomplete | TypeLookupStatus::Cancelled => {
             return ClassSeed::Unknown(UnknownReason::UncertainFlow);
@@ -1927,14 +4240,113 @@ fn resolve_indexed_class_at_span(
         TypeLookupStatus::Resolved
         | TypeLookupStatus::NoType
         | TypeLookupStatus::UnsupportedLanguage
-        | TypeLookupStatus::InvalidLocation
         | TypeLookupStatus::NotFound => {}
     }
     class_seed_from_lookup_types(
-        overlay_of(workspace).as_deref(),
+        workspace.analyzer().semantic_model_overlay().as_deref(),
         Language::Python,
         &outcome.types,
     )
+}
+
+fn python_workspace_class_candidate(
+    workspace: &WorkspaceAnalyzer,
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    reference: Node<'_>,
+) -> Option<ClassIdentity> {
+    let name = python_simple_type_identifier(reference, prepared.source())?;
+    python_workspace_class_candidate_named(workspace, file, prepared, reference, &name)
+}
+
+fn python_workspace_class_candidate_named(
+    workspace: &WorkspaceAnalyzer,
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    reference: Node<'_>,
+    name: &str,
+) -> Option<ClassIdentity> {
+    let python = python_analyzer(workspace);
+    python_workspace_class_candidate_named_for_python(python, file, prepared, reference, name)
+}
+
+fn python_workspace_class_candidate_named_for_python(
+    python: &PythonAnalyzer,
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    reference: Node<'_>,
+    name: &str,
+) -> Option<ClassIdentity> {
+    let session = ResolutionSession::bounded(INTERACTIVE_TYPE_LOOKUP_BUDGET, None);
+    let scope = AnalyzerQueryScope::new(python);
+    let support = PythonDefinitionProvider::new(python, &session);
+    python_class_candidate_for_name(
+        &support,
+        scope.token(),
+        file,
+        prepared.source(),
+        reference,
+        name,
+    )
+    .or_else(|| {
+        python_type_checking_imported_class_candidate(
+            &support,
+            scope.token(),
+            file,
+            prepared.source(),
+            reference,
+            name,
+        )
+    })
+    .map(ClassIdentity::Workspace)
+}
+
+fn python_forward_module_class_candidate(
+    workspace: &WorkspaceAnalyzer,
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    name: &str,
+) -> Option<ClassIdentity> {
+    let python = python_analyzer(workspace);
+    let session = ResolutionSession::bounded(INTERACTIVE_TYPE_LOOKUP_BUDGET, None);
+    let support = PythonDefinitionProvider::new(python, &session);
+    let mut candidates = support
+        .file_identifier(file, name)
+        .into_iter()
+        .filter(CodeUnit::is_class);
+    let candidate = candidates.next()?;
+    if candidates.next().is_some()
+        || python_unambiguous_module_class_binding_bounded(
+            prepared.tree().root_node(),
+            prepared.source(),
+            name,
+            || session.scope_step(),
+        ) != Some(true)
+    {
+        return None;
+    }
+    Some(ClassIdentity::Workspace(candidate))
+}
+
+fn python_future_annotations_enabled(prepared: &PreparedSyntaxTree) -> bool {
+    let root = prepared.tree().root_node();
+    let mut cursor = root.walk();
+    for statement in root
+        .named_children(&mut cursor)
+        .filter(|node| node.kind() == "future_import_statement")
+    {
+        let mut pending = vec![statement];
+        while let Some(node) = pending.pop() {
+            if node.named_child_count() == 0
+                && node.utf8_text(prepared.source().as_bytes()).ok() == Some("annotations")
+            {
+                return true;
+            }
+            let mut cursor = node.walk();
+            pending.extend(node.named_children(&mut cursor));
+        }
+    }
+    false
 }
 
 impl PythonTypeFlowAdapter {
@@ -1991,35 +4403,42 @@ impl PythonTypeFlowAdapter {
         if nodes.is_empty() {
             return Err(unmodeled(node));
         }
-        let overlay = overlay_of(workspace);
+        let overlay = workspace.analyzer().semantic_model_overlay();
         let mut cache = ExternalClassCache::default();
         nodes
             .into_iter()
             .map(|class| {
-                let span = span_for_node(class);
-                match resolve_class_at_span(workspace, file.clone(), span, &prepared) {
-                    ClassSeed::Class(class) => Ok(class),
-                    ClassSeed::Unknown(UnknownReason::SemanticBudget) => {
-                        Err(UnknownReason::SemanticBudget)
-                    }
-                    // A builtin name has no workspace declaration for the type
-                    // lookup to return, so `isinstance(value, dict)` resolves
-                    // to nothing through that route and is modeled here.
-                    ClassSeed::NotApplicable => exact_builtin_class(
-                        python_analyzer(workspace),
-                        class,
-                        &prepared,
-                        overlay.as_deref(),
-                        &mut cache,
-                    )
-                    .ok_or_else(|| unmodeled(class)),
-                    ClassSeed::Classes(_)
-                    | ClassSeed::ClassWithOpenBound(_)
-                    | ClassSeed::ClassesWithOpenBound(_)
-                    | ClassSeed::Unknown(_) => Err(unmodeled(class)),
-                }
+                guard_class_identity(
+                    workspace,
+                    &file,
+                    &prepared,
+                    overlay.as_deref(),
+                    &mut cache,
+                    class,
+                )
             })
             .collect()
+    }
+
+    /// The class a predicate's target expression names, with the same proof an
+    /// `isinstance` class needs. A target that names no such class is an error
+    /// here, which the caller reports as an unmodeled target.
+    pub(super) fn guard_class_expression(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        file: &ProjectFile,
+        prepared: &PreparedSyntaxTree,
+        class: Node<'_>,
+    ) -> Result<ClassIdentity, UnknownReason> {
+        let overlay = workspace.analyzer().semantic_model_overlay();
+        guard_class_identity(
+            workspace,
+            file,
+            prepared,
+            overlay.as_deref(),
+            &mut ExternalClassCache::default(),
+            class,
+        )
     }
 
     pub(super) fn guard_classes_have_supported_instance_checks(
@@ -2103,6 +4522,192 @@ impl PythonTypeFlowAdapter {
             && !hierarchy.dynamic_attributes
     }
 
+    fn annotation_class_seed(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        file: &ProjectFile,
+        prepared: &PreparedSyntaxTree,
+        context: Node<'_>,
+        annotation: Node<'_>,
+    ) -> ClassSeed {
+        let Some(annotation) = python_annotation_expression(annotation) else {
+            return ClassSeed::NotApplicable;
+        };
+        let quoted_annotation = annotation;
+        let deferred_annotation = if annotation.kind() == "string" {
+            python_deferred_annotation_tree(annotation, prepared.source(), None)
+        } else {
+            None
+        };
+        let is_deferred_annotation = deferred_annotation.is_some();
+        if annotation.kind() == "string" && deferred_annotation.is_none() {
+            return ClassSeed::NotApplicable;
+        }
+        let deferred_content = deferred_annotation.as_ref().and_then(|_| {
+            let mut cursor = quoted_annotation.walk();
+            quoted_annotation
+                .named_children(&mut cursor)
+                .find(|content| content.kind() == "string_content")
+        });
+        let annotation = if let Some(tree) = deferred_annotation.as_ref() {
+            let mut expression = tree.root_node();
+            while !matches!(
+                expression.kind(),
+                "identifier" | "attribute" | "generic_type" | "subscript"
+            ) {
+                if expression.named_child_count() != 1 {
+                    return ClassSeed::NotApplicable;
+                }
+                let Some(child) = expression.named_child(0) else {
+                    return ClassSeed::NotApplicable;
+                };
+                expression = child;
+            }
+            expression
+        } else {
+            annotation
+        };
+        if !is_deferred_annotation
+            && python_annotation_contains_any(workspace, file, prepared, annotation)
+        {
+            return ClassSeed::Unknown(UnknownReason::UncertainFlow);
+        }
+        let forward_reference_site = deferred_content
+            .or_else(|| python_future_annotations_enabled(prepared).then_some(annotation));
+        let forward_class_name = python_simple_type_identifier(annotation, prepared.source());
+        if let Some(seed) =
+            python_type_variable_bound_seed(workspace, file, prepared, context, annotation)
+        {
+            return seed;
+        }
+        if let Some(seed) =
+            python_type_object_argument_bound_seed(workspace, file, prepared, context, annotation)
+        {
+            return seed;
+        }
+        if !matches!(
+            annotation.kind(),
+            "identifier" | "attribute" | "member_type" | "string_content"
+        ) {
+            return ClassSeed::NotApplicable;
+        }
+        let deferred_workspace_class = match (forward_reference_site, forward_class_name) {
+            (Some(site), Some(name)) => {
+                python_workspace_class_candidate_named(workspace, file, prepared, site, &name)
+                    .or_else(|| {
+                        python_forward_module_class_candidate(workspace, file, prepared, &name)
+                    })
+                    .and_then(|class| match class {
+                        ClassIdentity::Workspace(unit) => Some(unit),
+                        ClassIdentity::External { .. } => None,
+                    })
+            }
+            _ => None,
+        };
+        let resolved = deferred_workspace_class
+            .map(|unit| ClassSeed::Class(ClassIdentity::Workspace(unit)))
+            .unwrap_or_else(|| {
+                resolve_class_at_span(workspace, file.clone(), span_for_node(annotation), prepared)
+            });
+        match python_dynamic_any_seed(resolved) {
+            ClassSeed::Class(class) if class.qualified_name() == "builtins.object" => {
+                ClassSeed::ClassWithOpenBound(class)
+            }
+            ClassSeed::Class(class)
+                if is_builtin_value_class(&class)
+                    || self.declared_class_is_closed(workspace, &class) =>
+            {
+                ClassSeed::Class(class)
+            }
+            ClassSeed::Class(class) => ClassSeed::ClassWithOpenBound(class),
+            seed => seed,
+        }
+    }
+
+    fn iteration_element_class_seed(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        procedure: &ProcedureHandle,
+        file: &ProjectFile,
+        prepared: &PreparedSyntaxTree,
+        target: Node<'_>,
+    ) -> ClassSeed {
+        let Some(loop_statement) = target
+            .parent()
+            .filter(|node| node.kind() == "for_statement")
+        else {
+            return ClassSeed::NotApplicable;
+        };
+        if loop_statement.child_by_field_name("left") != Some(target) {
+            return ClassSeed::NotApplicable;
+        }
+        let semantics = procedure.semantics();
+        let Some(callable) = node_at_span(prepared, semantics.locator().anchor().span()) else {
+            return ClassSeed::NotApplicable;
+        };
+        let Some(receiver_name) = python_first_parameter_name(callable, prepared.source()) else {
+            return ClassSeed::NotApplicable;
+        };
+        let Some(iterable) = loop_statement.child_by_field_name("right") else {
+            return ClassSeed::NotApplicable;
+        };
+        if iterable.kind() != "identifier"
+            || iterable.utf8_text(prepared.source().as_bytes()).ok() != Some(receiver_name.as_str())
+        {
+            return ClassSeed::NotApplicable;
+        }
+        let Some(ClassIdentity::Workspace(owner)) = self.enclosing_class(workspace, procedure)
+        else {
+            return ClassSeed::NotApplicable;
+        };
+        let Some(class) = class_node_for_unit(python_analyzer(workspace), prepared, &owner) else {
+            return ClassSeed::NotApplicable;
+        };
+        let Some(body) = class.child_by_field_name("body") else {
+            return ClassSeed::NotApplicable;
+        };
+        let mut cursor = body.walk();
+        let iterator = body.named_children(&mut cursor).find_map(|member| {
+            let definition = if member.kind() == "decorated_definition" {
+                let mut cursor = member.walk();
+                member
+                    .named_children(&mut cursor)
+                    .find(|child| child.kind() == "function_definition")?
+            } else {
+                member
+            };
+            (definition.kind() == "function_definition"
+                && definition
+                    .child_by_field_name("name")
+                    .and_then(|name| name.utf8_text(prepared.source().as_bytes()).ok())
+                    == Some("__iter__"))
+            .then_some(definition)
+        });
+        let Some(return_type) =
+            iterator.and_then(|iterator| iterator.child_by_field_name("return_type"))
+        else {
+            return ClassSeed::NotApplicable;
+        };
+        let Some((iterator_type, _)) = python_first_generic_type_argument(return_type) else {
+            return ClassSeed::NotApplicable;
+        };
+        let Some((module, member)) =
+            import_bound_external_symbol(python_analyzer(workspace), file, prepared, iterator_type)
+        else {
+            return ClassSeed::NotApplicable;
+        };
+        if !matches!(
+            (module.as_str(), member.as_str()),
+            ("collections.abc", "Iterator") | ("typing", "Iterator")
+        ) {
+            return ClassSeed::NotApplicable;
+        }
+        let Some((_, element_type)) = python_first_generic_type_argument(return_type) else {
+            return ClassSeed::NotApplicable;
+        };
+        self.annotation_class_seed(workspace, file, prepared, class, element_type)
+    }
+
     fn workspace_member_lookup(
         &self,
         workspace: &WorkspaceAnalyzer,
@@ -2128,7 +4733,7 @@ impl PythonTypeFlowAdapter {
         }
         // A raw base the hierarchy resolver did not enter must be answered by
         // the pack overlay or the member list is not known to be complete.
-        let overlay = overlay_of(workspace);
+        let overlay = workspace.analyzer().semantic_model_overlay();
         let mut cache = ExternalClassCache::default();
         let mut external_bases = Vec::new();
         for owner in std::iter::once(unit).chain(ancestors.iter()) {
@@ -2274,6 +4879,3415 @@ fn is_builtin_value_class(class: &ClassIdentity) -> bool {
     )
 }
 
+/// A partial model can prove a direct positive member declaration even when
+/// its class surface cannot prove absence. Use this only after the shared
+/// receiver-origin proof has established a direct exact result or stable local.
+fn external_direct_member_lookup(
+    overlay: &SemanticModelOverlay,
+    owner_id: &str,
+    member: &str,
+) -> MemberLookup {
+    let Some(symbol) = python_external_member_declaration(overlay, owner_id, member) else {
+        return MemberLookup::Unknown(UnknownReason::PackIncomplete);
+    };
+    MemberLookup::Present(MemberLookupHit::new(
+        MemberDeclaration::External(ExternalMemberDeclaration::new([Box::from(
+            symbol.id.as_str(),
+        )])),
+        CandidateCoverage::Open,
+    ))
+}
+
+pub(crate) fn python_external_value_member_on_workspace_class(
+    python: &PythonAnalyzer,
+    receiver_class: &CodeUnit,
+    member: &str,
+    overlay: &SemanticModelOverlay,
+) -> Option<SemanticModelSymbol> {
+    let mut cache = ExternalClassCache::default();
+    let ancestors = python.get_ancestors(receiver_class);
+    for owner in std::iter::once(receiver_class).chain(ancestors.iter()) {
+        if owner.is_synthetic() {
+            continue;
+        }
+        if python.direct_children(owner).iter().any(|child| {
+            matches!(
+                child.terminal_name(),
+                name if name == member || name == "__getattribute__" || name == "__getattr__"
+            )
+        }) {
+            return None;
+        }
+        let workspace_bases = python.get_direct_ancestors(owner);
+        for raw in python.inner.raw_supertypes_of(owner) {
+            if workspace_bases.iter().any(|base| {
+                !base.is_synthetic() && (base.terminal_name() == raw || base.fq_name_str() == raw)
+            }) {
+                continue;
+            }
+            let base = exact_external_base(python, owner, Some(overlay), &raw, &mut cache);
+            let symbol_id = match base {
+                Some(ClassIdentity::External { symbol_id, .. }) => symbol_id,
+                Some(ClassIdentity::Workspace(_)) => return None,
+                None if python_default_object_base(python, owner, &raw)
+                    || python_typing_marker_base(python, owner, &raw) =>
+                {
+                    continue;
+                }
+                None => return None,
+            };
+            let matched = overlay.members_named(&symbol_id, member);
+            if matched.disposition == SemanticModelOverlayDisposition::Empty {
+                continue;
+            }
+            let [symbol] = matched.records.as_slice() else {
+                return None;
+            };
+            if matched.disposition != SemanticModelOverlayDisposition::Unique
+                || symbol.owner_id.as_deref() != Some(symbol_id.as_ref())
+                || symbol.language != Language::Python.config_label()
+                || !matches!(
+                    symbol.kind,
+                    SemanticModelSymbolKind::Field | SemanticModelSymbolKind::Property
+                )
+                || symbol.name != member
+                || symbol.provenance.ambiguous
+            {
+                return None;
+            }
+            return Some((*symbol).clone());
+        }
+    }
+    None
+}
+
+pub(crate) fn python_external_field_read_discharges_gap(
+    workspace: &WorkspaceAnalyzer,
+    procedure: &ProcedureHandle,
+    gap: &crate::analyzer::semantic::SemanticGap,
+) -> bool {
+    use crate::analyzer::semantic::{
+        MemoryLocationKind, SemanticCapability, SemanticEffect, SemanticGapDischarge,
+        SemanticGapSubject, SourceMappingKind,
+    };
+
+    if procedure.artifact().key().language().language() != Language::Python
+        || gap.capability != SemanticCapability::Calls
+        || gap.discharge != SemanticGapDischarge::RuntimeReadBehavior
+    {
+        return false;
+    }
+    let SemanticGapSubject::Value(result) = gap.subject else {
+        return false;
+    };
+    let Some(mapping) = procedure.semantics().source_mapping(gap.source) else {
+        return false;
+    };
+    if mapping.kind != SourceMappingKind::Exact {
+        return false;
+    }
+    let Some(file) = file_for_locator(workspace, &mapping.locator) else {
+        return false;
+    };
+    let Ok(prepared) = prepared_for_procedure(workspace, procedure, &file) else {
+        return false;
+    };
+    let Some(access) = node_at_span(&prepared, mapping.locator.anchor().span()) else {
+        return false;
+    };
+    if access.kind() != "attribute" {
+        return false;
+    }
+    let Some(object) = access.child_by_field_name("object") else {
+        return false;
+    };
+    if object.kind() != "identifier" {
+        return false;
+    }
+    let Ok(object_name) = object.utf8_text(prepared.source().as_bytes()) else {
+        return false;
+    };
+    let Some(member_node) = access.child_by_field_name("attribute") else {
+        return false;
+    };
+    let Ok(member) = member_node.utf8_text(prepared.source().as_bytes()) else {
+        return false;
+    };
+    let member_span = source_span_for_node(member_node);
+
+    let mut loads = procedure.semantics().points().iter().flat_map(|point| {
+        point.events.iter().filter_map(move |event| {
+            let SemanticEffect::MemoryLoad {
+                location,
+                result: loaded,
+                ..
+            } = event.effect
+            else {
+                return None;
+            };
+            (loaded == result).then_some((location, event.source))
+        })
+    });
+    let Some((location, load_source)) = loads.next() else {
+        return false;
+    };
+    if loads.next().is_some() {
+        return false;
+    }
+    let Some(load_mapping) = procedure.semantics().source_mapping(load_source) else {
+        return false;
+    };
+    if load_mapping.kind != SourceMappingKind::Exact
+        || load_mapping.locator.anchor().span() != mapping.locator.anchor().span()
+    {
+        return false;
+    }
+    let Some(location) = procedure.semantics().memory_location(location) else {
+        return false;
+    };
+    let MemoryLocationKind::Field {
+        base,
+        member: field,
+    } = &location.kind
+    else {
+        return false;
+    };
+    if field.anchor().span() != member_span {
+        return false;
+    }
+    let Some(base_value) = procedure.semantics().value(*base) else {
+        return false;
+    };
+    let Some(base_mapping) = procedure.semantics().source_mapping(base_value.source) else {
+        return false;
+    };
+    if base_mapping.kind != SourceMappingKind::Exact
+        || file_for_locator(workspace, &base_mapping.locator).as_ref() != Some(&file)
+        || base_mapping.locator.anchor().span() != source_span_for_node(object)
+    {
+        return false;
+    }
+    let Some(method) = node_at_span(&prepared, procedure.semantics().locator().anchor().span())
+    else {
+        return false;
+    };
+    let Some(parameters) =
+        formal_parameter_slots_for_owner(Language::Python, method, prepared.source())
+    else {
+        return false;
+    };
+    if parameters.python_binding != Some(PythonMethodBinding::Instance)
+        || parameters.slots.first().and_then(|slot| slot.unique_name()) != Some(object_name)
+    {
+        return false;
+    }
+    let Some(ClassIdentity::Workspace(owner)) =
+        PythonTypeFlowAdapter.enclosing_class(workspace, procedure)
+    else {
+        return false;
+    };
+    let Some(overlay) = workspace.analyzer().semantic_model_overlay() else {
+        return false;
+    };
+    let python = python_analyzer(workspace);
+    let Some(symbol) =
+        python_external_value_member_on_workspace_class(python, &owner, member, &overlay)
+    else {
+        return false;
+    };
+    symbol.kind == SemanticModelSymbolKind::Field
+        && !symbol.is_static
+        && symbol.name == member
+        && symbol.language == Language::Python.config_label()
+        && !symbol.provenance.ambiguous
+}
+
+pub(crate) fn python_attribute_value_terminal_range(
+    python: &PythonAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    start_byte: usize,
+    end_byte: usize,
+) -> Option<(usize, usize)> {
+    let prepared = current_indexed_prepared(python, file)?;
+    if prepared.source().as_bytes() != source.as_bytes() {
+        return None;
+    }
+    let mut focus = prepared
+        .tree()
+        .root_node()
+        .named_descendant_for_byte_range(start_byte, end_byte)?;
+    while let Some(parent) = focus.parent() {
+        if parent.kind() == "attribute" && parent.child_by_field_name("attribute") == Some(focus) {
+            focus = parent;
+        } else {
+            break;
+        }
+    }
+    if focus.kind() != "attribute" {
+        return None;
+    }
+    let terminal = focus.child_by_field_name("attribute")?;
+    Some((terminal.start_byte(), terminal.end_byte()))
+}
+
+/// Prove the external class still exposes its declared method by scanning the
+/// current workspace for exact imported-class assignments and setattr calls.
+fn external_class_member_mutation_free(
+    workspace: &WorkspaceAnalyzer,
+    class: &ClassIdentity,
+    declaration: &ExternalMemberDeclaration,
+    member: &str,
+) -> bool {
+    let ClassIdentity::External {
+        qualified_name,
+        symbol_id,
+    } = class
+    else {
+        return false;
+    };
+    let Some(overlay) = workspace.analyzer().semantic_model_overlay() else {
+        return false;
+    };
+    let mut class_ids = HashSet::from_iter([symbol_id.to_string()]);
+    for member_id in declaration.symbol_ids() {
+        let matched = overlay.symbols_with_id(member_id);
+        let [member] = matched.records.as_slice() else {
+            return false;
+        };
+        let Some(owner_id) = member.owner_id.as_deref() else {
+            return false;
+        };
+        class_ids.insert(owner_id.to_owned());
+    }
+    let mut identity_groups = Vec::with_capacity(class_ids.len());
+    for class_id in class_ids {
+        let matched = overlay.symbols_with_id(&class_id);
+        let [class_record] = matched.records.as_slice() else {
+            return false;
+        };
+        if class_record.kind != SemanticModelSymbolKind::Class
+            || class_record.language != Language::Python.config_label()
+            || class_record.provenance.ambiguous
+            || (class_id == symbol_id.as_ref()
+                && class_record.qualified_name != qualified_name.as_ref())
+        {
+            return false;
+        }
+        let mut identities = Vec::with_capacity(class_record.aliases.len() + 1);
+        identities.push(class_record.qualified_name.as_str());
+        identities.extend(class_record.aliases.iter().map(String::as_str));
+        identity_groups.push(identities);
+    }
+    python_analyzer(workspace).cached_class_member_mutation_free(&identity_groups, member, || {
+        let Ok(files) = workspace.analyzer().project().all_files_shared() else {
+            return false;
+        };
+        for file in files.iter() {
+            if crate::analyzer::common::language_for_file(file) != Language::Python {
+                continue;
+            }
+            let Ok(source) = file.read_to_string() else {
+                return false;
+            };
+            let mut parser = tree_sitter::Parser::new();
+            if parser
+                .set_language(&tree_sitter_python::LANGUAGE.into())
+                .is_err()
+            {
+                return false;
+            }
+            let Some(tree) = parser.parse(&source, None) else {
+                return false;
+            };
+            if tree.root_node().has_error() {
+                return false;
+            }
+            for identities in &identity_groups {
+                if brokk_bifrost_python::runtime_values::python_external_class_member_mutation(
+                    tree.root_node(),
+                    &source,
+                    identities,
+                    member,
+                    65_536,
+                )
+                .is_some()
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    })
+}
+
+pub(crate) fn python_external_class_call_identity(
+    workspace: &WorkspaceAnalyzer,
+    procedure: &ProcedureHandle,
+    call: &SemanticCallSite,
+) -> Option<ClassIdentity> {
+    match PythonTypeFlowAdapter.constructed_class(workspace, procedure, call) {
+        ClassSeed::Class(class @ ClassIdentity::External { .. }) => Some(class),
+        ClassSeed::Class(_)
+        | ClassSeed::ClassWithOpenBound(_)
+        | ClassSeed::Classes(_)
+        | ClassSeed::ClassesWithOpenBound(_)
+        | ClassSeed::NotApplicable
+        | ClassSeed::Unknown(_) => None,
+    }
+}
+
+/// Find one exact effective Python member using the active pack's declared C3 order.
+/// A direct member is already the first C3 candidate and needs complete
+/// callable-shape evidence only. Inherited members use unique, unambiguous
+/// class and base declarations from a complete C3 order.
+pub(crate) fn python_external_member_declaration<'a>(
+    overlay: &'a SemanticModelOverlay,
+    owner_id: &str,
+    member: &str,
+) -> Option<&'a SemanticModelSymbol> {
+    let owner = exact_python_model_class(overlay, owner_id)?;
+    if python_external_declares_member(overlay, owner_id, member) {
+        if overlay
+            .gapped_member_surface(&owner.qualified_name, member)
+            .is_some()
+            || overlay
+                .gapped_member_surface(&owner.qualified_name, "__getattribute__")
+                .is_some()
+            || python_external_declares_member(overlay, owner_id, "__getattribute__")
+        {
+            return None;
+        }
+        let has_declared_bases =
+            python_external_class_records(overlay, owner_id)
+                .iter()
+                .any(|owner| {
+                    overlay
+                        .relations_from(&owner.id)
+                        .records
+                        .iter()
+                        .any(|relation| relation.kind == "extends")
+                });
+        if has_declared_bases {
+            let mro = python_external_class_mro(overlay, owner_id)?;
+            for class_id in mro.iter().skip(1) {
+                let class = exact_python_model_class(overlay, class_id)?;
+                if overlay
+                    .gapped_member_surface(&class.qualified_name, "__getattribute__")
+                    .is_some()
+                    || (class.qualified_name != "builtins.object"
+                        && python_external_declares_member(overlay, class_id, "__getattribute__"))
+                {
+                    return None;
+                }
+            }
+        }
+        return exact_python_method_declaration(overlay, owner_id, member);
+    }
+
+    let mro = python_external_class_mro(overlay, owner_id)?;
+    for class_id in &mro {
+        let class = exact_python_model_class(overlay, class_id)?;
+        if overlay
+            .gapped_member_surface(&class.qualified_name, member)
+            .is_some()
+            || overlay
+                .gapped_member_surface(&class.qualified_name, "__getattribute__")
+                .is_some()
+            || overlay
+                .gapped_member_surface(&class.qualified_name, "__getattr__")
+                .is_some()
+        {
+            return None;
+        }
+    }
+    let has_custom_getattribute = mro.iter().any(|class_id| {
+        exact_python_model_class(overlay, class_id)
+            .is_some_and(|class| class.qualified_name != "builtins.object")
+            && python_external_declares_member(overlay, class_id, "__getattribute__")
+    });
+    if has_custom_getattribute {
+        return None;
+    }
+    let declares_member = mro
+        .iter()
+        .any(|class_id| python_external_declares_member(overlay, class_id, member));
+    let has_getattr = mro.iter().any(|class_id| {
+        exact_python_model_class(overlay, class_id)
+            .is_some_and(|class| class.qualified_name != "builtins.object")
+            && python_external_declares_member(overlay, class_id, "__getattr__")
+    });
+    if has_getattr && !declares_member {
+        return None;
+    }
+    if python_external_declares_member(overlay, owner_id, member) {
+        return exact_python_method_declaration(overlay, owner_id, member);
+    }
+    for declaring_id in mro.into_iter().skip(1) {
+        if python_external_declares_member(overlay, &declaring_id, member) {
+            exact_python_model_class(overlay, &declaring_id)?;
+            return exact_python_method_declaration(overlay, &declaring_id, member);
+        }
+    }
+    None
+}
+
+fn imported_external_class_callee_for_python(
+    python: &PythonAnalyzer,
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    callee: Node<'_>,
+    overlay: Option<&SemanticModelOverlay>,
+) -> Option<ClassIdentity> {
+    let mut expression = callee;
+    let mut has_attribute_path = callee.kind() == "attribute";
+    while let Some(parent) = expression.parent() {
+        if parent.kind() != "attribute"
+            || (parent.child_by_field_name("object") != Some(expression)
+                && parent.child_by_field_name("attribute") != Some(expression))
+        {
+            break;
+        }
+        expression = parent;
+        has_attribute_path = true;
+    }
+    has_attribute_path
+        .then(|| imported_external_class_for_python(python, file, prepared, expression, overlay))
+        .flatten()
+}
+
+fn imported_external_class_for_python(
+    python: &PythonAnalyzer,
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    reference: Node<'_>,
+    overlay: Option<&SemanticModelOverlay>,
+) -> Option<ClassIdentity> {
+    let (module, member) = import_bound_external_symbol(python, file, prepared, reference)?;
+    external_class_identity(
+        overlay,
+        Language::Python,
+        &format!("{module}.{member}"),
+        None,
+        &mut ExternalClassCache::default(),
+    )
+}
+
+fn imported_external_function_return_classes(
+    python: &PythonAnalyzer,
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    callee: Node<'_>,
+    overlay: Option<&SemanticModelOverlay>,
+) -> Option<Vec<ClassIdentity>> {
+    let (module, member) = imported_external_callable_binding(python, file, prepared, callee)?;
+    let overlay = overlay?;
+    let qualified_name = format!("{module}.{member}");
+    let matched = overlay.symbols_named(&qualified_name);
+    if matched.records.is_empty() {
+        return None;
+    }
+
+    let mut classes = Vec::new();
+    for symbol in matched.records {
+        if symbol.qualified_name != qualified_name && !symbol.aliases.contains(&qualified_name) {
+            return None;
+        }
+        if symbol.language != Language::Python.config_label()
+            || symbol.kind != SemanticModelSymbolKind::Function
+            || symbol.owner_id.as_ref().is_some_and(|owner_id| {
+                let owner = overlay.symbols_with_id(owner_id);
+                !matches!(
+                    owner.records.as_slice(),
+                    [owner] if owner.kind == SemanticModelSymbolKind::Module
+                )
+            })
+            || symbol.has_receiver()
+            || symbol.provenance.ambiguous
+            || (symbol.exact_return_classes.is_empty()
+                && !symbol.has_complete_callable_shape_evidence())
+        {
+            return None;
+        }
+        let returned = if symbol.exact_return_classes.is_empty() {
+            let reference = symbol.structured_signature()?.returns.as_ref()?;
+            vec![reference]
+        } else {
+            symbol.exact_return_classes.iter().collect()
+        };
+        for reference in returned {
+            let class = match reference {
+                TypeRef::Named {
+                    name,
+                    nullable: false,
+                    ..
+                } => external_class_identity(
+                    Some(overlay),
+                    Language::Python,
+                    name,
+                    None,
+                    &mut ExternalClassCache::default(),
+                ),
+                TypeRef::Declared {
+                    id,
+                    nullable: false,
+                    ..
+                } => external_class_identity(
+                    Some(overlay),
+                    Language::Python,
+                    "",
+                    Some(id),
+                    &mut ExternalClassCache::default(),
+                ),
+                _ => None,
+            }?;
+            if class.qualified_name() == "typing.Any" || class.qualified_name() == "builtins.Any" {
+                return None;
+            }
+            classes.push(class);
+        }
+    }
+    classes.sort_by(|left, right| {
+        left.qualified_name()
+            .cmp(right.qualified_name())
+            .then_with(|| format!("{left:?}").cmp(&format!("{right:?}")))
+    });
+    classes.dedup();
+    (!classes.is_empty()).then_some(classes)
+}
+
+fn python_external_declares_member(
+    overlay: &SemanticModelOverlay,
+    owner_id: &str,
+    member: &str,
+) -> bool {
+    python_external_class_records(overlay, owner_id)
+        .iter()
+        .any(|owner| {
+            overlay
+                .members_of(&owner.id)
+                .records
+                .into_iter()
+                .any(|symbol| {
+                    symbol.owner_id.as_deref() == Some(owner.id.as_str())
+                        && symbol.name == member
+                        && symbol.language == Language::Python.config_label()
+                })
+        })
+}
+
+fn python_external_class_records<'a>(
+    overlay: &'a SemanticModelOverlay,
+    id: &str,
+) -> Vec<&'a SemanticModelSymbol> {
+    let Some(class) = exact_python_model_class(overlay, id) else {
+        return Vec::new();
+    };
+    overlay
+        .symbols_named(&class.qualified_name)
+        .records
+        .into_iter()
+        .filter(|symbol| {
+            symbol.qualified_name == class.qualified_name
+                && symbol.language == Language::Python.config_label()
+                && symbol.owner_id.is_none()
+                && symbol.kind == SemanticModelSymbolKind::Class
+                && !symbol.provenance.ambiguous
+        })
+        .collect()
+}
+
+fn exact_python_model_class<'a>(
+    overlay: &'a SemanticModelOverlay,
+    id: &str,
+) -> Option<&'a SemanticModelSymbol> {
+    let matched = overlay.symbols_with_id(id);
+    let [symbol] = matched.records.as_slice() else {
+        return None;
+    };
+    (symbol.id == id
+        && symbol.language == Language::Python.config_label()
+        && symbol.kind == SemanticModelSymbolKind::Class
+        && !symbol.provenance.ambiguous)
+        .then_some(*symbol)
+}
+
+fn exact_python_method_declaration<'a>(
+    overlay: &'a SemanticModelOverlay,
+    owner_id: &str,
+    member: &str,
+) -> Option<&'a SemanticModelSymbol> {
+    let mut records = python_external_class_records(overlay, owner_id)
+        .into_iter()
+        .flat_map(|owner| {
+            overlay
+                .members_of(&owner.id)
+                .records
+                .into_iter()
+                .filter(|symbol| {
+                    symbol.owner_id.as_deref() == Some(owner.id.as_str())
+                        && symbol.name == member
+                        && symbol.language == Language::Python.config_label()
+                        && symbol.kind == SemanticModelSymbolKind::Method
+                        && symbol.has_receiver()
+                        && !symbol.provenance.ambiguous
+                        && symbol.has_complete_callable_shape_evidence()
+                        && symbol.structured_signature().is_some()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    records.sort_by(|left, right| {
+        let left_owner = left
+            .owner_id
+            .as_deref()
+            .and_then(|id| exact_python_model_class(overlay, id));
+        let right_owner = right
+            .owner_id
+            .as_deref()
+            .and_then(|id| exact_python_model_class(overlay, id));
+        (right_owner.is_some_and(|owner| {
+            owner.provenance.completeness == SemanticModelCompleteness::Complete
+        }))
+        .cmp(
+            &(left_owner.is_some_and(|owner| {
+                owner.provenance.completeness == SemanticModelCompleteness::Complete
+            })),
+        )
+        .then_with(|| left.id.cmp(&right.id))
+    });
+    records.dedup_by(|left, right| left.id == right.id);
+    let symbol = records.first().copied()?;
+    Some(symbol)
+}
+
+#[derive(Debug)]
+struct PythonModelMroFrame {
+    class_id: String,
+    bases: Option<Vec<String>>,
+    next_base: usize,
+}
+
+/// C3 linearization over the declared active Python model hierarchy. A partial
+/// member surface can still provide useful base identities; callers retain the
+/// surface gap separately when deciding whether absence is provable.
+fn python_external_class_mro(overlay: &SemanticModelOverlay, root_id: &str) -> Option<Vec<String>> {
+    let mut linearizations = HashMap::<String, Vec<String>>::default();
+    let mut visiting = HashSet::<String>::default();
+    let mut stack = vec![PythonModelMroFrame {
+        class_id: root_id.to_owned(),
+        bases: None,
+        next_base: 0,
+    }];
+    visiting.insert(root_id.to_owned());
+
+    while !stack.is_empty() {
+        let top = stack.len() - 1;
+        if stack[top].bases.is_none() {
+            let class_id = stack[top].class_id.clone();
+            let class = exact_python_model_class(overlay, &class_id)?;
+            stack[top].bases = Some(python_external_direct_bases(overlay, class)?);
+        }
+        let bases = stack[top].bases.as_ref().expect("bases were initialized");
+        if stack[top].next_base < bases.len() {
+            let base = bases[stack[top].next_base].clone();
+            stack[top].next_base += 1;
+            if linearizations.contains_key(&base) {
+                continue;
+            }
+            if !visiting.insert(base.clone()) {
+                return None;
+            }
+            stack.push(PythonModelMroFrame {
+                class_id: base,
+                bases: None,
+                next_base: 0,
+            });
+            continue;
+        }
+
+        let frame = stack.pop().expect("the MRO stack is nonempty");
+        let bases = frame.bases.expect("bases were initialized");
+        let mut sequences = bases
+            .iter()
+            .map(|base| linearizations.get(base).cloned())
+            .collect::<Option<Vec<_>>>()?;
+        sequences.push(bases.clone());
+        let mut merged = Vec::new();
+        loop {
+            sequences.retain(|sequence| !sequence.is_empty());
+            if sequences.is_empty() {
+                break;
+            }
+            let candidate = sequences.iter().find_map(|sequence| {
+                let head = sequence.first()?;
+                (!sequences
+                    .iter()
+                    .any(|other| other.iter().skip(1).any(|tail| tail == head)))
+                .then(|| head.clone())
+            })?;
+            merged.push(candidate.clone());
+            for sequence in &mut sequences {
+                if sequence.first() == Some(&candidate) {
+                    sequence.remove(0);
+                }
+            }
+        }
+        let mut linearization = Vec::with_capacity(merged.len() + 1);
+        linearization.push(frame.class_id.clone());
+        linearization.extend(merged);
+        visiting.remove(&frame.class_id);
+        linearizations.insert(frame.class_id, linearization);
+    }
+    linearizations.remove(root_id)
+}
+
+fn python_external_direct_bases(
+    overlay: &SemanticModelOverlay,
+    class: &SemanticModelSymbol,
+) -> Option<Vec<String>> {
+    if class.qualified_name == "builtins.object" {
+        return Some(Vec::new());
+    }
+    let mut declared = Vec::new();
+    for record in python_external_class_records(overlay, &class.id) {
+        if overlay
+            .relations_from(&record.id)
+            .records
+            .iter()
+            .any(|relation| relation.kind == "extends")
+        {
+            declared.push(python_external_direct_bases_for_record(overlay, record)?);
+        }
+    }
+    if declared.is_empty() {
+        return Some(Vec::new());
+    }
+    let bases = declared.remove(0);
+    declared
+        .iter()
+        .all(|candidate| *candidate == bases)
+        .then_some(bases)
+}
+
+fn python_external_direct_bases_for_record(
+    overlay: &SemanticModelOverlay,
+    class: &SemanticModelSymbol,
+) -> Option<Vec<String>> {
+    if class.qualified_name == "builtins.object" {
+        return Some(Vec::new());
+    }
+    let relations = overlay
+        .relations_from(&class.id)
+        .records
+        .into_iter()
+        .filter(|relation| relation.kind == "extends")
+        .collect::<Vec<_>>();
+    if relations.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut ordered = relations;
+    if ordered.len() > 1
+        && ordered
+            .iter()
+            .any(|relation| relation.declaration_ordinal.is_none())
+    {
+        return None;
+    }
+    ordered.sort_by_key(|relation| relation.declaration_ordinal.unwrap_or(0));
+    if ordered
+        .windows(2)
+        .any(|pair| pair[0].declaration_ordinal == pair[1].declaration_ordinal)
+        || ordered.iter().any(|relation| relation.provenance.ambiguous)
+    {
+        return None;
+    }
+    let mut bases = Vec::with_capacity(ordered.len());
+    for relation in ordered {
+        let by_id = overlay.symbols_with_id(&relation.to);
+        let records = if by_id.records.is_empty() {
+            if relation.to == "builtins.object" {
+                continue;
+            }
+            overlay
+                .symbols_named(&relation.to)
+                .records
+                .into_iter()
+                .filter(|symbol| {
+                    symbol.qualified_name == relation.to
+                        || symbol.aliases.iter().any(|alias| alias == &relation.to)
+                })
+                .collect::<Vec<_>>()
+        } else {
+            by_id.records
+        };
+        if records.is_empty() && !relation.to.contains('.') {
+            let local_name = overlay.ancestry_target_name(class, &relation.to);
+            if let Some(ClassIdentity::External { symbol_id, .. }) = external_class_identity(
+                Some(overlay),
+                Language::Python,
+                &local_name,
+                None,
+                &mut ExternalClassCache::default(),
+            ) {
+                bases.push(symbol_id.into_string());
+                continue;
+            }
+        }
+        let [base] = records.as_slice() else {
+            return None;
+        };
+        if base.language != Language::Python.config_label()
+            || base.kind != SemanticModelSymbolKind::Class
+            || base.provenance.ambiguous
+            || base.provenance.completeness != SemanticModelCompleteness::Complete
+        {
+            return None;
+        }
+        let identity = external_class_identity(
+            Some(overlay),
+            Language::Python,
+            &base.qualified_name,
+            Some(&base.id),
+            &mut ExternalClassCache::default(),
+        )?;
+        let ClassIdentity::External { symbol_id, .. } = identity else {
+            unreachable!("external class lookup returns an external identity")
+        };
+        bases.push(symbol_id.into_string());
+    }
+    Some(bases)
+}
+
+fn python_exact_result_origin_classes_in_query(
+    workspace: &WorkspaceAnalyzer,
+    procedure: &ProcedureHandle,
+    origin: &ConstructorResultOrigin,
+    query: &mut PythonExactResultQuery,
+) -> Option<Box<[ClassIdentity]>> {
+    let semantics = procedure.semantics();
+    match &origin.producer {
+        crate::analyzer::semantic::ExactResultProducer::Call(call_id)
+            if matches!(
+                origin.source.kind,
+                SourceSiteKind::ConstructorCall | SourceSiteKind::ExactCallResult
+            ) =>
+        {
+            let calls = semantics
+                .call_sites()
+                .iter()
+                .filter(|call| call.id == *call_id)
+                .collect::<Vec<_>>();
+            let [call] = calls.as_slice() else {
+                return None;
+            };
+            let mapping = semantics.source_mapping(call.source)?;
+            if mapping.kind != SourceMappingKind::Exact
+                || mapping.locator.anchor().span() != origin.source.span
+                || file_for_locator(workspace, &mapping.locator).as_ref()
+                    != Some(&origin.source.file)
+            {
+                return None;
+            }
+            let results = call.normal_result_values().collect::<Vec<_>>();
+            let [result] = results.as_slice() else {
+                return None;
+            };
+            if *result != origin.result {
+                return None;
+            }
+            if origin.source.kind == SourceSiteKind::ExactCallResult {
+                query.exact_call_classes(call)
+            } else {
+                match PythonTypeFlowAdapter.constructed_class(workspace, procedure, call) {
+                    ClassSeed::Class(class) => Some(vec![class].into_boxed_slice()),
+                    _ => None,
+                }
+            }
+        }
+        crate::analyzer::semantic::ExactResultProducer::MemoryLoad { point, location }
+            if origin.source.kind == SourceSiteKind::ExactAccessResult =>
+        {
+            let rows = semantics
+                .point(*point)?
+                .events
+                .iter()
+                .filter_map(|event| {
+                    let SemanticEffect::MemoryLoad {
+                        location: found_location,
+                        result,
+                        ..
+                    } = event.effect
+                    else {
+                        return None;
+                    };
+                    (found_location == *location && result == origin.result)
+                        .then_some((event.source, found_location))
+                })
+                .collect::<Vec<_>>();
+            let [(source, found_location)] = rows.as_slice() else {
+                return None;
+            };
+            let mapping = semantics.source_mapping(*source)?;
+            if mapping.kind != SourceMappingKind::Exact
+                || mapping.locator.anchor().span() != origin.source.span
+                || file_for_locator(workspace, &mapping.locator).as_ref()
+                    != Some(&origin.source.file)
+            {
+                return None;
+            }
+            let location = semantics.memory_location(*found_location)?;
+            match python_memory_load_result_class_in_query(
+                workspace,
+                procedure,
+                location,
+                origin.result,
+                query,
+            ) {
+                ClassSeed::Class(class @ ClassIdentity::External { .. }) => {
+                    Some(vec![class].into_boxed_slice())
+                }
+                ClassSeed::Classes(classes)
+                    if classes
+                        .iter()
+                        .all(|class| matches!(class, ClassIdentity::External { .. })) =>
+                {
+                    Some(classes)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Whether the receiver's exact source mapping is a local identifier.
+fn constructor_receiver_is_local_identifier(
+    workspace: &WorkspaceAnalyzer,
+    procedure: &ProcedureHandle,
+    receiver: ValueId,
+) -> bool {
+    let semantics = procedure.semantics();
+    let Some(receiver_value) = semantics.value(receiver) else {
+        return false;
+    };
+    let Some(mapping) = semantics.source_mapping(receiver_value.source) else {
+        return false;
+    };
+    if mapping.kind != SourceMappingKind::Exact {
+        return false;
+    }
+    let Some(file) = file_for_locator(workspace, &mapping.locator) else {
+        return false;
+    };
+    let Ok(prepared) = prepared_for_procedure(workspace, procedure, &file) else {
+        return false;
+    };
+    node_at_span(&prepared, mapping.locator.anchor().span())
+        .is_some_and(|node| node.kind() == "identifier")
+}
+
+fn python_external_receiver_call_member(
+    workspace: &WorkspaceAnalyzer,
+    procedure: &ProcedureHandle,
+    call: &SemanticCallSite,
+) -> Option<String> {
+    let semantics = procedure.semantics();
+    let callee = semantics.value(call.callee)?;
+    let mapping = semantics.source_mapping(callee.source)?;
+    if mapping.kind != SourceMappingKind::Exact {
+        return None;
+    }
+    let file = file_for_locator(workspace, &mapping.locator)?;
+    let prepared = prepared_for_procedure(workspace, procedure, &file).ok()?;
+    let node = node_at_span(&prepared, mapping.locator.anchor().span())?;
+    if node.kind() != "attribute" {
+        return None;
+    }
+    node.child_by_field_name("attribute")
+        .and_then(|member| member.utf8_text(prepared.source().as_bytes()).ok())
+        .map(str::to_owned)
+}
+
+/// Whether the constructor result reaches this call through one local
+/// definition and direct receiver reads, without rebinding, aliasing, capture, or escape.
+fn constructor_result_has_stable_local_receiver_in_query(
+    workspace: &WorkspaceAnalyzer,
+    procedure: &ProcedureHandle,
+    receiver: ValueId,
+    method_call: &SemanticCallSite,
+    origin: &ConstructorResultOrigin,
+    query: &mut PythonExactResultQuery,
+) -> bool {
+    macro_rules! reject {
+        ($reason:literal) => {{
+            return false;
+        }};
+    }
+    if method_call.receiver != Some(receiver)
+        || matches!(
+            &origin.producer,
+            crate::analyzer::semantic::ExactResultProducer::Call(call) if *call == method_call.id
+        )
+    {
+        reject!("receiver/call identity mismatch");
+    }
+    if python_exact_result_origin_classes_in_query(workspace, procedure, origin, query).as_deref()
+        != Some(origin.classes.as_ref())
+    {
+        reject!("result producer no longer proves the exact class");
+    }
+    if !constructor_receiver_is_local_identifier(workspace, procedure, receiver) {
+        reject!("receiver is not a local identifier");
+    }
+    let semantics = procedure.semantics();
+    let Some(method_source) = semantics.source_mapping(method_call.source) else {
+        reject!("method call has no source mapping");
+    };
+    if method_source.kind != SourceMappingKind::Exact {
+        reject!("method call mapping is inexact");
+    }
+    let method_start = usize::try_from(method_source.locator.anchor().span().start_byte())
+        .expect("source byte offsets fit usize");
+    let bindings = BindingOriginIndex::new(procedure);
+    let Some(binding) = bindings.unique_binding_origin(receiver) else {
+        reject!("receiver has no unique binding");
+    };
+    if !matches!(
+        semantics.value(binding).map(|value| &value.kind),
+        Some(SemanticValueKind::Local)
+    ) || bindings.address_taken_binding_set().contains(&binding)
+    {
+        reject!("receiver binding is not a stable local");
+    }
+
+    if python_local_binding_deleted_before_call(workspace, procedure, receiver, method_start) {
+        reject!("receiver binding is deleted before the call");
+    }
+    if python_local_special_attribute_access_before_call(
+        workspace,
+        procedure,
+        receiver,
+        method_start,
+    ) {
+        reject!("receiver __dict__ or __class__ is accessed");
+    }
+
+    let reaching_origin =
+        python_unique_reaching_binding_assignment(procedure, binding, method_call);
+    if reaching_origin != Some(origin.result) {
+        reject!("reaching assignment differs from constructor result");
+    }
+    let mut receiver_reads = 0usize;
+    for event in semantics
+        .points()
+        .iter()
+        .flat_map(|point| point.events.iter())
+    {
+        match event.effect {
+            SemanticEffect::ValueFlow { source, target, .. } if source == binding => {
+                if !constructor_receiver_is_local_identifier(workspace, procedure, target) {
+                    reject!("binding value flows to a nonlocal expression");
+                }
+                receiver_reads += 1;
+            }
+            SemanticEffect::ValueFlow { source, target, .. }
+                if target == binding && source != origin.result =>
+            {
+                reject!("a different value flows into the receiver binding");
+            }
+            SemanticEffect::Assignment { target, value } if target != binding => {
+                if bindings.unique_binding_origin(value) == Some(binding) {
+                    reject!("receiver binding is copied into another assignment");
+                }
+            }
+            SemanticEffect::MemoryStore {
+                location, value, ..
+            } => {
+                if bindings.unique_binding_origin(value) == Some(binding) {
+                    reject!("receiver binding is stored into memory");
+                }
+                let Some(location) = semantics.memory_location(location) else {
+                    reject!("memory store has no classified location");
+                };
+                if matches!(
+                    &location.kind,
+                    MemoryLocationKind::Field { base, .. }
+                        if bindings.unique_binding_origin(*base) == Some(binding)
+                ) {
+                    reject!("receiver binding is stored into an instance field");
+                }
+            }
+            SemanticEffect::MemoryLoad { location, .. } => {
+                let Some(location) = semantics.memory_location(location) else {
+                    reject!("memory load has no classified location");
+                };
+                if let MemoryLocationKind::Field { base, member } = &location.kind
+                    && bindings.unique_binding_origin(*base) == Some(binding)
+                    && member
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        .is_some_and(|name| matches!(name, "__dict__" | "__class__"))
+                {
+                    reject!("receiver __dict__ or __class__ is accessed");
+                }
+            }
+            SemanticEffect::AggregateInitializer { value, .. }
+                if bindings.unique_binding_origin(value) == Some(binding) =>
+            {
+                reject!("receiver binding enters an aggregate");
+            }
+            SemanticEffect::ProcedureReturn { value: Some(value) }
+            | SemanticEffect::Throw { value: Some(value) }
+                if bindings.unique_binding_origin(value) == Some(binding) =>
+            {
+                reject!("receiver binding is returned or thrown");
+            }
+            _ => {}
+        }
+    }
+    // Multiple direct reads preserve the same binding origin. Any read that
+    // flows into another value was rejected above as an alias.
+    if receiver_reads == 0 {
+        reject!("no direct receiver reads were found");
+    }
+    for call in semantics.call_sites() {
+        if call.id != method_call.id {
+            let escapes_binding = call
+                .arguments
+                .iter()
+                .map(|argument| argument.value)
+                .any(|value| bindings.unique_binding_origin(value) == Some(binding))
+                || (call.receiver.is_none()
+                    && bindings.unique_binding_origin(call.callee) == Some(binding));
+            if escapes_binding {
+                reject!("receiver binding is passed as an argument or callee");
+            }
+            if call
+                .receiver
+                .is_some_and(|value| bindings.unique_binding_origin(value) == Some(binding))
+            {
+                let Some(mapping) = semantics.source_mapping(call.source) else {
+                    reject!("receiver method call has no source mapping");
+                };
+                if mapping.kind != SourceMappingKind::Exact {
+                    reject!("receiver method call has an inexact source mapping");
+                }
+                let earlier_start = usize::try_from(mapping.locator.anchor().span().start_byte())
+                    .expect("source byte offsets fit usize");
+                if earlier_start < method_start {
+                    if python_unique_reaching_binding_assignment(procedure, binding, call)
+                        != Some(origin.result)
+                    {
+                        reject!("earlier receiver call has a different reaching origin");
+                    }
+                    let Some(member_name) =
+                        python_external_receiver_call_member(workspace, procedure, call)
+                    else {
+                        reject!("earlier receiver call has no exact member name");
+                    };
+                    if matches!(
+                        member_name.as_str(),
+                        "__setattr__" | "__delattr__" | "__setstate__" | "__init__"
+                    ) {
+                        reject!("earlier receiver call can mutate class state");
+                    }
+                    let Some(overlay) = workspace.analyzer().semantic_model_overlay() else {
+                        reject!("active semantic model is unavailable");
+                    };
+                    for class in origin.classes.iter() {
+                        let ClassIdentity::External { symbol_id, .. } = class else {
+                            reject!("exact return origin contains a non-external class");
+                        };
+                        let Some(declaration) =
+                            python_external_member_declaration(&overlay, symbol_id, &member_name)
+                        else {
+                            reject!("earlier receiver call is not a uniquely declared pack method");
+                        };
+                        if declaration.kind != SemanticModelSymbolKind::Method
+                            || !declaration.has_receiver()
+                            || !declaration.has_complete_callable_shape_evidence()
+                            || declaration.structured_signature().is_none()
+                            || !external_class_member_mutation_free(
+                                workspace,
+                                class,
+                                &ExternalMemberDeclaration::new([Box::from(
+                                    declaration.id.as_str(),
+                                )]),
+                                &member_name,
+                            )
+                        {
+                            reject!(
+                                "earlier receiver method is not closed by the pack declaration"
+                            );
+                        }
+                    }
+                }
+            }
+        } else if call.receiver != Some(receiver)
+            || call
+                .arguments
+                .iter()
+                .any(|argument| bindings.unique_binding_origin(argument.value) == Some(binding))
+        {
+            reject!("method call receiver or arguments differ from the proven binding");
+        }
+    }
+    true
+}
+
+fn python_local_binding_deleted_before_call(
+    workspace: &WorkspaceAnalyzer,
+    procedure: &ProcedureHandle,
+    receiver: ValueId,
+    method_start: usize,
+) -> bool {
+    let semantics = procedure.semantics();
+    let Some(value) = semantics.value(receiver) else {
+        return true;
+    };
+    let Some(mapping) = semantics.source_mapping(value.source) else {
+        return true;
+    };
+    let Some(file) = file_for_locator(workspace, &mapping.locator) else {
+        return true;
+    };
+    let Ok(prepared) = prepared_for_procedure(workspace, procedure, &file) else {
+        return true;
+    };
+    let Some(receiver_node) = node_at_span(&prepared, mapping.locator.anchor().span()) else {
+        return true;
+    };
+    let Some(scope) = python_enclosing_function(receiver_node) else {
+        return true;
+    };
+    let receiver_name = match receiver_node.utf8_text(prepared.source().as_bytes()) {
+        Ok(name) if receiver_node.kind() == "identifier" => name,
+        _ => return true,
+    };
+    let mut stack = vec![scope];
+    while let Some(node) = stack.pop() {
+        if node != scope
+            && matches!(
+                node.kind(),
+                "function_definition" | "lambda" | "class_definition"
+            )
+        {
+            continue;
+        }
+        if matches!(node.kind(), "delete" | "delete_statement") && node.start_byte() < method_start
+        {
+            let mut names = vec![node];
+            while let Some(candidate) = names.pop() {
+                if candidate.kind() == "identifier"
+                    && candidate.utf8_text(prepared.source().as_bytes()).ok() == Some(receiver_name)
+                {
+                    return true;
+                }
+                let mut cursor = candidate.walk();
+                names.extend(candidate.named_children(&mut cursor));
+            }
+            continue;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    false
+}
+
+fn python_local_special_attribute_access_before_call(
+    workspace: &WorkspaceAnalyzer,
+    procedure: &ProcedureHandle,
+    receiver: ValueId,
+    method_start: usize,
+) -> bool {
+    const MAX_SCOPE_NODES: usize = 65_536;
+
+    let semantics = procedure.semantics();
+    let Some(value) = semantics.value(receiver) else {
+        return true;
+    };
+    let Some(mapping) = semantics.source_mapping(value.source) else {
+        return true;
+    };
+    let Some(file) = file_for_locator(workspace, &mapping.locator) else {
+        return true;
+    };
+    let Ok(prepared) = prepared_for_procedure(workspace, procedure, &file) else {
+        return true;
+    };
+    let Some(receiver_node) = node_at_span(&prepared, mapping.locator.anchor().span()) else {
+        return true;
+    };
+    let Some(scope) = python_enclosing_function(receiver_node) else {
+        return true;
+    };
+    let Ok(receiver_name) = receiver_node.utf8_text(prepared.source().as_bytes()) else {
+        return true;
+    };
+    let Some(inventory) = python_lexical_scope_inventory_bounded(scope, prepared.source(), || true)
+    else {
+        return true;
+    };
+    let mut remaining = MAX_SCOPE_NODES;
+    let mut stack = vec![scope];
+    while let Some(node) = stack.pop() {
+        if remaining == 0 {
+            return true;
+        }
+        remaining -= 1;
+        if node != scope
+            && matches!(
+                node.kind(),
+                "function_definition" | "lambda" | "class_definition"
+            )
+        {
+            continue;
+        }
+        if node.kind() == "attribute" && node.start_byte() < method_start {
+            let Some(object) = node.child_by_field_name("object") else {
+                return true;
+            };
+            let Some(attribute) = node.child_by_field_name("attribute") else {
+                return true;
+            };
+            if object.kind() == "identifier"
+                && object.utf8_text(prepared.source().as_bytes()).ok() == Some(receiver_name)
+                && !python_comprehension_binds_name_at(receiver_name, object, prepared.source())
+                && inventory.name_resolution_at(receiver_name, object)
+                    == PythonLexicalNameResolution::Local
+                && attribute
+                    .utf8_text(prepared.source().as_bytes())
+                    .is_ok_and(|name| matches!(name, "__dict__" | "__class__"))
+            {
+                return true;
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    false
+}
+
+fn python_enclosing_function(mut node: Node<'_>) -> Option<Node<'_>> {
+    while let Some(parent) = node.parent() {
+        if matches!(parent.kind(), "function_definition" | "lambda") {
+            return Some(parent);
+        }
+        node = parent;
+    }
+    None
+}
+
+fn python_unique_reaching_binding_assignment(
+    procedure: &ProcedureHandle,
+    binding: ValueId,
+    method_call: &SemanticCallSite,
+) -> Option<ValueId> {
+    let call_point = procedure.semantics().point(method_call.point)?;
+    let invoke_index = call_point.events.iter().position(|event| {
+        matches!(
+            event.effect,
+            SemanticEffect::Invoke { call_site } if call_site == method_call.id
+        )
+    })?;
+    python_unique_reaching_binding_assignment_at(
+        procedure,
+        binding,
+        method_call.point,
+        invoke_index,
+    )
+}
+
+fn python_unique_reaching_binding_assignment_at(
+    procedure: &ProcedureHandle,
+    binding: ValueId,
+    use_point: ProgramPointId,
+    use_event_index: usize,
+) -> Option<ValueId> {
+    const MAX_REACHING_SET_WORDS: usize = 65_536;
+
+    let semantics = procedure.semantics();
+    let point_count = semantics.points().len();
+    let use_point_index = use_point.index();
+    semantics.point(use_point)?;
+    let mut assignments = Vec::<(usize, ValueId)>::new();
+    let mut assignments_by_point = vec![Vec::<usize>::new(); point_count];
+    for (point_index, point) in semantics.points().iter().enumerate() {
+        for (event_index, event) in point.events.iter().enumerate() {
+            if let SemanticEffect::Assignment { target, value } = event.effect
+                && target == binding
+            {
+                let assignment_id = assignments.len() + 1;
+                assignments.push((event_index, value));
+                assignments_by_point[point_index].push(assignment_id);
+            }
+        }
+    }
+    let definition_count = assignments.len().saturating_add(1);
+    let words = definition_count.div_ceil(64);
+    if assignments.is_empty()
+        || point_count
+            .checked_mul(words)
+            .is_none_or(|words| words > MAX_REACHING_SET_WORDS)
+    {
+        return None;
+    }
+
+    let mut facts = GenKillFacts::new(point_count, definition_count);
+    for (point_index, point) in semantics.points().iter().enumerate() {
+        let local = &assignments_by_point[point_index];
+        if let Some(generated) = local.last().copied() {
+            for killed in 0..definition_count {
+                facts.record_killed(point_index, killed);
+            }
+            facts.record_generated(point_index, generated);
+        } else if point.id == semantics.entry_point() {
+            facts.record_generated(point_index, 0);
+        }
+    }
+
+    let mut budget = CfgAlgorithmBudget::uniform(16_384);
+    let cancellation = CancellationToken::new();
+    let mut request = CfgAlgorithmRequest::new(&mut budget, &cancellation);
+    let reaching =
+        reaching_definitions(semantics, semantics.entry_point(), &facts, &mut request).ok()?;
+
+    let same_point = assignments_by_point.get(use_point_index)?;
+    let before_call = same_point
+        .iter()
+        .copied()
+        .filter(|definition| assignments[*definition - 1].0 < use_event_index)
+        .collect::<Vec<_>>();
+    let reaching_here = if let Some(last) = before_call.last().copied() {
+        vec![last]
+    } else {
+        reaching.reaching_in(use_point_index).collect::<Vec<_>>()
+    };
+    let [definition] = reaching_here.as_slice() else {
+        return None;
+    };
+    (*definition > 0)
+        .then(|| assignments.get(*definition - 1).map(|(_, value)| *value))
+        .flatten()
+}
+
+fn python_exact_result_origin_for_value_in_query(
+    workspace: &WorkspaceAnalyzer,
+    procedure: &ProcedureHandle,
+    result: ValueId,
+    query: &mut PythonExactResultQuery,
+) -> Option<ConstructorResultOrigin> {
+    let semantics = procedure.semantics();
+    let calls = semantics
+        .call_sites()
+        .iter()
+        .filter(|call| call.normal_result_values().any(|value| value == result))
+        .collect::<Vec<_>>();
+    if let [call] = calls.as_slice() {
+        // Preserve the constructor provenance used by the class-set solver,
+        // including workspace constructors. Imported result models can also
+        // describe a constructor, but must not change that origin's kind.
+        let (classes, kind) = if let ClassSeed::Class(class) =
+            PythonTypeFlowAdapter.constructed_class(workspace, procedure, call)
+        {
+            (
+                vec![class].into_boxed_slice(),
+                SourceSiteKind::ConstructorCall,
+            )
+        } else {
+            let result_value = query.call_result(call)?;
+            let PythonExactResultValue::Classes(classes) = result_value.value else {
+                return None;
+            };
+            (classes, result_value.kind)
+        };
+        let results = call.normal_result_values().collect::<Vec<_>>();
+        let [only_result] = results.as_slice() else {
+            return None;
+        };
+        if *only_result != result {
+            return None;
+        }
+        let mapping = semantics.source_mapping(call.source)?;
+        if mapping.kind != SourceMappingKind::Exact {
+            return None;
+        }
+        let file = file_for_locator(workspace, &mapping.locator)?;
+        return Some(ConstructorResultOrigin {
+            classes,
+            producer: crate::analyzer::semantic::ExactResultProducer::Call(call.id),
+            result,
+            source: SourceSite {
+                file,
+                span: mapping.locator.anchor().span(),
+                kind,
+            },
+        });
+    }
+    if !calls.is_empty() {
+        return None;
+    }
+    let loads = semantics
+        .points()
+        .iter()
+        .flat_map(|point| {
+            point
+                .events
+                .iter()
+                .enumerate()
+                .filter_map(move |(event_index, event)| {
+                    let SemanticEffect::MemoryLoad {
+                        location,
+                        result: found,
+                        ..
+                    } = event.effect
+                    else {
+                        return None;
+                    };
+                    (found == result).then_some((point.id, event_index, location, event.source))
+                })
+        })
+        .collect::<Vec<_>>();
+    let [(point, _event_index, location, source)] = loads.as_slice() else {
+        return None;
+    };
+    let mapping = semantics.source_mapping(*source)?;
+    if mapping.kind != SourceMappingKind::Exact {
+        return None;
+    }
+    let file = file_for_locator(workspace, &mapping.locator)?;
+    let memory_location = semantics.memory_location(*location)?;
+    let seed = python_memory_load_result_class_in_query(
+        workspace,
+        procedure,
+        memory_location,
+        result,
+        query,
+    );
+    let classes = match seed {
+        ClassSeed::Class(class @ ClassIdentity::External { .. }) => vec![class].into_boxed_slice(),
+        ClassSeed::Classes(classes)
+            if classes
+                .iter()
+                .all(|class| matches!(class, ClassIdentity::External { .. })) =>
+        {
+            classes
+        }
+        _ => return None,
+    };
+    let origin = ConstructorResultOrigin {
+        classes,
+        producer: crate::analyzer::semantic::ExactResultProducer::MemoryLoad {
+            point: *point,
+            location: *location,
+        },
+        result,
+        source: SourceSite {
+            file,
+            span: mapping.locator.anchor().span(),
+            kind: SourceSiteKind::ExactAccessResult,
+        },
+    };
+    (python_exact_result_origin_classes_in_query(workspace, procedure, &origin, query).as_deref()
+        == Some(origin.classes.as_ref()))
+    .then_some(origin)
+}
+
+/// Select the exact result consumed directly or through a stable local receiver.
+/// Both dispatch identity and class-set receiver proof use this acceptance rule.
+fn python_exact_receiver_origin_in_query(
+    workspace: &WorkspaceAnalyzer,
+    procedure: &ProcedureHandle,
+    method_call: &SemanticCallSite,
+    query: &mut PythonExactResultQuery,
+) -> Option<ConstructorResultOrigin> {
+    let receiver = method_call.receiver?;
+    let semantics = procedure.semantics();
+    if constructor_receiver_is_local_identifier(workspace, procedure, receiver) {
+        let bindings = BindingOriginIndex::new(procedure);
+        let binding = bindings.unique_binding_origin(receiver)?;
+        if !matches!(
+            semantics.value(binding).map(|value| &value.kind),
+            Some(SemanticValueKind::Local)
+        ) || bindings.address_taken_binding_set().contains(&binding)
+        {
+            return None;
+        }
+        let method_source = semantics.source_mapping(method_call.source)?;
+        if method_source.kind != SourceMappingKind::Exact {
+            return None;
+        }
+        let method_start = usize::try_from(method_source.locator.anchor().span().start_byte())
+            .expect("source byte offsets fit usize");
+        if python_local_binding_deleted_before_call(workspace, procedure, receiver, method_start) {
+            return None;
+        }
+        let result = python_unique_reaching_binding_assignment(procedure, binding, method_call)?;
+        let origin =
+            python_exact_result_origin_for_value_in_query(workspace, procedure, result, query)?;
+        if !constructor_result_has_stable_local_receiver_in_query(
+            workspace,
+            procedure,
+            receiver,
+            method_call,
+            &origin,
+            query,
+        ) {
+            return None;
+        }
+        Some(origin)
+    } else {
+        let origin =
+            python_exact_result_origin_for_value_in_query(workspace, procedure, receiver, query)?;
+        // A directly consumed exact result has no intervening binding lifetime.
+        // Admit the same producer kinds as a stable local receiver.
+        if !matches!(
+            origin.source.kind,
+            SourceSiteKind::ExactCallResult
+                | SourceSiteKind::ConstructorCall
+                | SourceSiteKind::ExactAccessResult
+        ) {
+            return None;
+        }
+        Some(origin)
+    }
+}
+
+fn python_exact_external_receiver_identities_in_query(
+    workspace: &WorkspaceAnalyzer,
+    procedure: &ProcedureHandle,
+    method_call: &SemanticCallSite,
+    query: &mut PythonExactResultQuery,
+) -> Option<Vec<crate::analyzer::semantic::ResolverOwnedExternalCalleeIdentity>> {
+    let origin = python_exact_receiver_origin_in_query(workspace, procedure, method_call, query)?;
+    let semantics = procedure.semantics();
+    let callee = semantics.value(method_call.callee)?;
+    let callee_mapping = semantics.source_mapping(callee.source)?;
+    if callee_mapping.kind != SourceMappingKind::Exact {
+        return None;
+    }
+    let method_file = file_for_locator(workspace, &callee_mapping.locator)?;
+    let prepared = prepared_for_procedure(workspace, procedure, &method_file).ok()?;
+    let callee_node = node_at_span(&prepared, callee_mapping.locator.anchor().span())?;
+    if callee_node.kind() != "attribute" {
+        return None;
+    }
+    let member = callee_node
+        .child_by_field_name("attribute")?
+        .utf8_text(prepared.source().as_bytes())
+        .ok()?;
+    let overlay = workspace.analyzer().semantic_model_overlay()?;
+    let mut identities = Vec::with_capacity(origin.classes.len());
+    for class in origin.classes.iter() {
+        let ClassIdentity::External { symbol_id, .. } = class else {
+            return None;
+        };
+        let declaration = python_external_member_declaration(&overlay, symbol_id, member)?;
+        if declaration.kind != SemanticModelSymbolKind::Method
+            || !declaration.has_receiver()
+            || !declaration.has_complete_callable_shape_evidence()
+            || declaration.structured_signature().is_none()
+            || !external_class_member_mutation_free(
+                workspace,
+                class,
+                &ExternalMemberDeclaration::new([Box::from(declaration.id.as_str())]),
+                member,
+            )
+        {
+            return None;
+        }
+        let owner_id = declaration.owner_id.as_deref()?;
+        let owners = overlay.symbols_with_id(owner_id);
+        let [owner] = owners.records.as_slice() else {
+            return None;
+        };
+        if owner.kind != SemanticModelSymbolKind::Class
+            || owner.language != Language::Python.config_label()
+            || owner.provenance.ambiguous
+            || owner.provenance.pack_id != declaration.provenance.pack_id
+        {
+            return None;
+        }
+        identities.push(
+            crate::analyzer::semantic::ResolverOwnedExternalCalleeIdentity::new(
+                Language::Python,
+                owner.qualified_name.clone(),
+                member.to_owned(),
+            ),
+        );
+    }
+    identities.sort_unstable();
+    identities.dedup();
+    (!identities.is_empty()).then_some(identities)
+}
+
+/// A workspace class can close an exact instance method only when its own
+/// declaration rules out inherited dispatch, custom construction, method
+/// decorators, and access hooks. The caller also proves a stable local
+/// receiver with no instance stores or escape, so an empty __slots__ is not
+/// required to rule out per-instance method replacement.
+fn workspace_instance_method_surface_is_closed(
+    workspace: &WorkspaceAnalyzer,
+    class: &ClassIdentity,
+    member: &str,
+    declaration: &CodeUnit,
+) -> bool {
+    let ClassIdentity::Workspace(owner) = class else {
+        return false;
+    };
+    let python = python_analyzer(workspace);
+    let Some(prepared) = current_indexed_prepared(python, owner.source()) else {
+        return false;
+    };
+    let Some(class_node) = class_node_for_unit(python, &prepared, owner) else {
+        return false;
+    };
+    if class_node.child_by_field_name("superclasses").is_some()
+        || class_node
+            .parent()
+            .is_some_and(|parent| parent.kind() == "decorated_definition")
+        || !workspace_class_uses_ordinary_metaclass(
+            workspace,
+            python,
+            owner,
+            workspace.analyzer().semantic_model_overlay().as_deref(),
+        )
+    {
+        return false;
+    }
+    let Some(body) = class_node.child_by_field_name("body") else {
+        return false;
+    };
+    let source = prepared.source();
+    let mut empty_slots = 0usize;
+    let mut method_declarations = 0usize;
+    let mut cursor = body.walk();
+    for child in body.named_children(&mut cursor) {
+        match python_class_member_assignment(child, source, "__slots__") {
+            ClassMemberAssignment::NotMember => {}
+            ClassMemberAssignment::Value(value)
+                if value.kind() == "tuple" && named_children(value).is_empty() =>
+            {
+                empty_slots += 1;
+                if empty_slots > 1 {
+                    return false;
+                }
+            }
+            ClassMemberAssignment::AnnotationOnly
+            | ClassMemberAssignment::Value(_)
+            | ClassMemberAssignment::Unknown => return false,
+        }
+        if matches!(
+            definition_name(child, source),
+            Some("__new__" | "__init__" | "__getattribute__" | "__getattr__" | "__setattr__")
+        ) || assignment_name(child, source) == Some(member)
+        {
+            return false;
+        }
+        if definition_name(child, source) == Some(member) {
+            if child.kind() != "function_definition" {
+                return false;
+            }
+            method_declarations += 1;
+        }
+    }
+    empty_slots <= 1
+        && method_declarations == 1
+        && python
+            .direct_children(owner)
+            .iter()
+            .any(|child| child == declaration && child.terminal_name() == member)
+}
+
+fn python_any_class(class: &ClassIdentity) -> bool {
+    matches!(class, ClassIdentity::External { .. })
+        && matches!(
+            class.qualified_name(),
+            "typing.Any" | "typing_extensions.Any"
+        )
+}
+
+fn python_seed_contains_any(seed: &ClassSeed) -> bool {
+    match seed {
+        ClassSeed::Class(class) | ClassSeed::ClassWithOpenBound(class) => python_any_class(class),
+        ClassSeed::Classes(classes) | ClassSeed::ClassesWithOpenBound(classes) => {
+            classes.iter().any(python_any_class)
+        }
+        ClassSeed::Unknown(_) | ClassSeed::NotApplicable => false,
+    }
+}
+
+fn python_dynamic_any_seed(seed: ClassSeed) -> ClassSeed {
+    if python_seed_contains_any(&seed) {
+        ClassSeed::Unknown(UnknownReason::UncertainFlow)
+    } else {
+        seed
+    }
+}
+
+fn python_typing_union_or_optional(class: &ClassIdentity) -> bool {
+    matches!(
+        class.qualified_name(),
+        "typing.Optional"
+            | "typing.Union"
+            | "typing_extensions.Optional"
+            | "typing_extensions.Union"
+    )
+}
+
+fn python_type_ref_contains_any(overlay: &SemanticModelOverlay, root: &TypeRef) -> bool {
+    let mut pending = vec![root];
+    let mut cache = ExternalClassCache::default();
+    while let Some(reference) = pending.pop() {
+        let (class, arguments) = match reference {
+            TypeRef::Named {
+                name, arguments, ..
+            } => (
+                external_class_identity(Some(overlay), Language::Python, name, None, &mut cache),
+                arguments,
+            ),
+            TypeRef::Declared { id, arguments, .. } => (
+                external_class_identity(Some(overlay), Language::Python, "", Some(id), &mut cache),
+                arguments,
+            ),
+            _ => continue,
+        };
+        let Some(class) = class else {
+            continue;
+        };
+        if python_any_class(&class) {
+            return true;
+        }
+        if python_typing_union_or_optional(&class) {
+            pending.extend(arguments);
+        }
+    }
+    false
+}
+
+fn python_annotation_union_or_optional_base(
+    workspace: &WorkspaceAnalyzer,
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    base: Node<'_>,
+) -> bool {
+    let Some((module, member)) =
+        import_bound_external_symbol(python_analyzer(workspace), file, prepared, base)
+    else {
+        return false;
+    };
+    matches!(
+        (module.as_str(), member.as_str()),
+        ("typing" | "typing_extensions", "Optional" | "Union")
+    )
+}
+
+fn python_annotation_contains_any(
+    workspace: &WorkspaceAnalyzer,
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    annotation: Node<'_>,
+) -> bool {
+    let mut pending = vec![annotation];
+    while let Some(annotation) = pending.pop() {
+        let Some(annotation) = python_annotation_expression(annotation) else {
+            continue;
+        };
+        match annotation.kind() {
+            "identifier" | "attribute" | "member_type" => {
+                let seed = resolve_class_at_span(
+                    workspace,
+                    file.clone(),
+                    span_for_node(annotation),
+                    prepared,
+                );
+                if python_seed_contains_any(&seed) {
+                    return true;
+                }
+            }
+            "union_type" => {
+                let mut cursor = annotation.walk();
+                pending.extend(annotation.named_children(&mut cursor));
+            }
+            "binary_operator" => {
+                let is_union = annotation
+                    .child_by_field_name("operator")
+                    .is_some_and(|operator| operator.kind() == "|");
+                if is_union {
+                    pending.extend(
+                        [
+                            annotation.child_by_field_name("left"),
+                            annotation.child_by_field_name("right"),
+                        ]
+                        .into_iter()
+                        .flatten(),
+                    );
+                }
+            }
+            "subscript" | "generic_type" => {
+                let Some((base, arguments)) = python_generic_type_arguments(annotation) else {
+                    continue;
+                };
+                if python_annotation_union_or_optional_base(workspace, file, prepared, base) {
+                    pending.extend(arguments);
+                }
+            }
+            "parenthesized_expression" => {
+                pending.extend(annotation.named_child(0));
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn python_annotation_expression(mut node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() == "type" {
+        node = node.named_child(0)?;
+    }
+    Some(node)
+}
+
+fn python_simple_type_identifier<'tree>(mut node: Node<'tree>, source: &str) -> Option<String> {
+    while node.kind() == "type" {
+        node = node.named_child(0)?;
+    }
+    (node.kind() == "identifier")
+        .then(|| node.utf8_text(source.as_bytes()).ok().map(str::to_owned))
+        .flatten()
+}
+
+fn python_type_parameter_declaration<'tree>(
+    mut parameter: Node<'tree>,
+    source: &str,
+) -> Option<(String, Option<Node<'tree>>)> {
+    while parameter.kind() == "type" {
+        parameter = parameter.named_child(0)?;
+    }
+    if parameter.kind() == "constrained_type" {
+        let mut cursor = parameter.walk();
+        let mut children = parameter.named_children(&mut cursor);
+        let name = python_simple_type_identifier(children.next()?, source)?;
+        return Some((name, children.next()));
+    }
+    Some((python_simple_type_identifier(parameter, source)?, None))
+}
+
+/// `Some(None)` marks an unbounded PEP 695 parameter and shadows outer bounds.
+fn python_type_parameter_bound<'tree>(
+    context: Node<'tree>,
+    name: &str,
+    source: &str,
+) -> Option<Option<Node<'tree>>> {
+    let mut scope = Some(context);
+    while let Some(node) = scope {
+        if matches!(node.kind(), "class_definition" | "function_definition")
+            && let Some(parameters) = node.child_by_field_name("type_parameters")
+        {
+            let mut cursor = parameters.walk();
+            for parameter in parameters.named_children(&mut cursor) {
+                if let Some((candidate, bound)) =
+                    python_type_parameter_declaration(parameter, source)
+                    && candidate == name
+                {
+                    return Some(bound);
+                }
+            }
+        }
+        scope = node.parent();
+    }
+    None
+}
+
+fn python_type_variable_bound_seed(
+    workspace: &WorkspaceAnalyzer,
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    context: Node<'_>,
+    variable: Node<'_>,
+) -> Option<ClassSeed> {
+    let name = python_simple_type_identifier(variable, prepared.source())?;
+    let bound = python_type_parameter_bound(context, &name, prepared.source())?;
+    Some(match bound {
+        Some(bound) => {
+            let seed =
+                resolve_class_at_span(workspace, file.clone(), span_for_node(bound), prepared);
+            let seed = if matches!(
+                &seed,
+                ClassSeed::Class(_)
+                    | ClassSeed::Classes(_)
+                    | ClassSeed::ClassWithOpenBound(_)
+                    | ClassSeed::ClassesWithOpenBound(_)
+                    | ClassSeed::Unknown(UnknownReason::SemanticBudget)
+            ) {
+                seed
+            } else {
+                python_workspace_class_candidate(workspace, file, prepared, bound)
+                    .map(ClassSeed::Class)
+                    .unwrap_or(seed)
+            };
+            python_open_type_variable_seed(seed)
+        }
+        None => ClassSeed::NotApplicable,
+    })
+}
+
+fn python_first_generic_type_argument(annotation: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
+    let (base, mut arguments) = python_generic_type_arguments(annotation)?;
+    Some((base, arguments.drain(..).next()?))
+}
+
+fn python_generic_type_arguments(annotation: Node<'_>) -> Option<(Node<'_>, Vec<Node<'_>>)> {
+    let annotation = python_annotation_expression(annotation)?;
+    match annotation.kind() {
+        "generic_type" => {
+            let mut cursor = annotation.walk();
+            let mut children = annotation.named_children(&mut cursor);
+            let base = children.next()?;
+            let type_arguments = children.next()?;
+            let mut cursor = type_arguments.walk();
+            let arguments = type_arguments.named_children(&mut cursor).collect();
+            Some((base, arguments))
+        }
+        "subscript" => {
+            let base = annotation.child_by_field_name("value")?;
+            let arguments = annotation.child_by_field_name("subscript")?;
+            let arguments = if arguments.kind() == "tuple" {
+                let mut cursor = arguments.walk();
+                arguments.named_children(&mut cursor).collect()
+            } else {
+                vec![arguments]
+            };
+            Some((base, arguments))
+        }
+        _ => None,
+    }
+}
+
+fn python_type_object_argument_bound_seed(
+    workspace: &WorkspaceAnalyzer,
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    context: Node<'_>,
+    annotation: Node<'_>,
+) -> Option<ClassSeed> {
+    let (base, argument) = python_first_generic_type_argument(annotation)?;
+    let base = match resolve_class_at_span(workspace, file.clone(), span_for_node(base), prepared) {
+        ClassSeed::Class(class) | ClassSeed::ClassWithOpenBound(class) => class,
+        _ => return None,
+    };
+    if base.qualified_name() != "builtins.type" {
+        return None;
+    }
+    Some(
+        python_type_variable_bound_seed(workspace, file, prepared, context, argument)
+            .unwrap_or_else(|| {
+                python_open_type_variable_seed(resolve_class_at_span(
+                    workspace,
+                    file.clone(),
+                    span_for_node(argument),
+                    prepared,
+                ))
+            }),
+    )
+}
+
+fn python_open_type_variable_seed(seed: ClassSeed) -> ClassSeed {
+    match python_dynamic_any_seed(seed) {
+        ClassSeed::Class(class) | ClassSeed::ClassWithOpenBound(class) => {
+            ClassSeed::ClassWithOpenBound(class)
+        }
+        ClassSeed::Classes(classes) | ClassSeed::ClassesWithOpenBound(classes) => {
+            ClassSeed::classes_with_open_bound(classes.into_vec())
+        }
+        seed => seed,
+    }
+}
+
+fn python_parameter_type_node<'tree>(
+    callable: Node<'tree>,
+    name: &str,
+    source: &str,
+) -> Option<Node<'tree>> {
+    let layout = formal_parameter_slots_for_owner(Language::Python, callable, source)?;
+    let slot = layout
+        .slots
+        .iter()
+        .find(|slot| slot.unique_name() == Some(name))?;
+    let declaration = callable
+        .named_descendant_for_byte_range(
+            slot.declaration_range.start_byte,
+            slot.declaration_range.end_byte,
+        )
+        .unwrap_or(callable);
+    matches!(
+        declaration.kind(),
+        "typed_parameter" | "typed_default_parameter"
+    )
+    .then(|| declaration.child_by_field_name("type"))
+    .flatten()
+}
+
+fn python_callable_binding_is_stable(callable: Node<'_>, name: &str, source: &str) -> bool {
+    let session = ResolutionSession::bounded(INTERACTIVE_TYPE_LOOKUP_BUDGET, None);
+    let Some(inventory) =
+        python_lexical_scope_inventory_bounded(callable, source, || session.scope_step())
+    else {
+        return false;
+    };
+    if inventory
+        .local_bindings()
+        .any(|(binding, _)| binding == name)
+    {
+        return false;
+    }
+    let mut pending = vec![callable];
+    while let Some(node) = pending.pop() {
+        if !session.scope_step() {
+            return false;
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if node.kind() == "nonlocal_statement"
+                && child.kind() == "identifier"
+                && child.utf8_text(source.as_bytes()).ok() == Some(name)
+            {
+                return false;
+            }
+            if !session.scope_step() {
+                return false;
+            }
+            pending.push(child);
+        }
+    }
+    true
+}
+
+#[derive(Clone, Copy)]
+enum PythonDynamicWriteReceiver<'tree> {
+    Expression(Node<'tree>),
+    ZeroArgSuper(Node<'tree>),
+}
+
+fn python_dynamic_write_receiver<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<PythonDynamicWriteReceiver<'tree>> {
+    if node.kind() == "call" {
+        let function = node.child_by_field_name("function")?;
+        if function.kind() == "identifier"
+            && function.utf8_text(source.as_bytes()).ok() == Some("delattr")
+        {
+            let arguments = node.child_by_field_name("arguments")?;
+            let mut cursor = arguments.walk();
+            return arguments
+                .named_children(&mut cursor)
+                .find(|argument| !argument.is_extra())
+                .map(PythonDynamicWriteReceiver::Expression);
+        }
+        if setattr_write(node, source).is_some() {
+            let arguments = node.child_by_field_name("arguments")?;
+            let mut cursor = arguments.walk();
+            return arguments
+                .named_children(&mut cursor)
+                .find(|argument| !argument.is_extra())
+                .map(PythonDynamicWriteReceiver::Expression);
+        }
+        if function.kind() != "attribute" {
+            return None;
+        }
+        let attribute = function.child_by_field_name("attribute")?;
+        let member = attribute.utf8_text(source.as_bytes()).ok()?;
+        let object = function.child_by_field_name("object")?;
+        if member == "__setattr__" && python_zero_arg_super_shape(object, source) {
+            return Some(PythonDynamicWriteReceiver::ZeroArgSuper(object));
+        }
+        if object.kind() == "attribute"
+            && object
+                .child_by_field_name("attribute")
+                .and_then(|attribute| attribute.utf8_text(source.as_bytes()).ok())
+                == Some("__dict__")
+        {
+            return object
+                .child_by_field_name("object")
+                .map(PythonDynamicWriteReceiver::Expression);
+        }
+        if member == "__setattr__" {
+            return Some(PythonDynamicWriteReceiver::Expression(object));
+        }
+    }
+    if matches!(node.kind(), "assignment" | "augmented_assignment")
+        && dictionary_write(node, source).is_some()
+    {
+        let receiver = node
+            .child_by_field_name("left")
+            .and_then(|left| left.child_by_field_name("value"))
+            .and_then(|dictionary| dictionary.child_by_field_name("object"))?;
+        return Some(PythonDynamicWriteReceiver::Expression(receiver));
+    }
+    None
+}
+
+fn python_zero_arg_super_shape(node: Node<'_>, source: &str) -> bool {
+    if node.kind() != "call"
+        || node.child_by_field_name("function").is_none_or(|function| {
+            function.kind() != "identifier"
+                || function.utf8_text(source.as_bytes()).ok() != Some("super")
+        })
+    {
+        return false;
+    }
+    let Some(arguments) = node.child_by_field_name("arguments") else {
+        return false;
+    };
+    let mut cursor = arguments.walk();
+    arguments
+        .named_children(&mut cursor)
+        .all(|argument| argument.is_extra())
+}
+
+fn python_zero_arg_super(
+    workspace: &WorkspaceAnalyzer,
+    call: Node<'_>,
+    prepared: &PreparedSyntaxTree,
+) -> bool {
+    python_zero_arg_super_shape(call, prepared.source())
+        && call
+            .child_by_field_name("function")
+            .is_some_and(|function| {
+                indexed_builtin_is_unshadowed(python_analyzer(workspace), function, prepared)
+                    == Some(true)
+            })
+}
+
+fn python_dynamic_write_method_receiver_bound(
+    adapter: &PythonTypeFlowAdapter,
+    workspace: &WorkspaceAnalyzer,
+    procedure: &ProcedureHandle,
+    prepared: &PreparedSyntaxTree,
+    receiver: PythonDynamicWriteReceiver<'_>,
+    method_has_receiver: bool,
+    first_parameter: Option<&str>,
+) -> Option<ClassIdentity> {
+    match receiver {
+        PythonDynamicWriteReceiver::ZeroArgSuper(call) => (method_has_receiver
+            && python_zero_arg_super(workspace, call, prepared)
+            && adapter.receiver_binding_is_stable(workspace, procedure))
+        .then(|| adapter.enclosing_class(workspace, procedure))
+        .flatten(),
+        PythonDynamicWriteReceiver::Expression(expression)
+            if expression.kind() == "identifier"
+                && first_parameter == expression.utf8_text(prepared.source().as_bytes()).ok() =>
+        {
+            (adapter.receiver_binding_is_stable(workspace, procedure))
+                .then(|| adapter.enclosing_class(workspace, procedure))
+                .flatten()
+        }
+        PythonDynamicWriteReceiver::Expression(_) => None,
+    }
+}
+
+fn python_dynamic_write_parameter_bound(
+    adapter: &PythonTypeFlowAdapter,
+    workspace: &WorkspaceAnalyzer,
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    callable: Node<'_>,
+    receiver: PythonDynamicWriteReceiver<'_>,
+) -> Option<ClassIdentity> {
+    let PythonDynamicWriteReceiver::Expression(receiver) = receiver else {
+        return None;
+    };
+    if receiver.kind() != "identifier" {
+        return None;
+    }
+    let name = receiver.utf8_text(prepared.source().as_bytes()).ok()?;
+    if !python_callable_binding_is_stable(callable, name, prepared.source()) {
+        return None;
+    }
+    let annotation = python_parameter_type_node(callable, name, prepared.source())?;
+    match adapter.annotation_class_seed(workspace, file, prepared, callable, annotation) {
+        ClassSeed::Class(class) | ClassSeed::ClassWithOpenBound(class) => Some(class),
+        _ => None,
+    }
+}
+
+fn python_dynamic_write_receiver_field(
+    adapter: &PythonTypeFlowAdapter,
+    workspace: &WorkspaceAnalyzer,
+    procedure: &ProcedureHandle,
+    callable: Node<'_>,
+    prepared: &PreparedSyntaxTree,
+    receiver: PythonDynamicWriteReceiver<'_>,
+) -> Option<(ClassIdentity, Box<str>)> {
+    let PythonDynamicWriteReceiver::Expression(receiver) = receiver else {
+        return None;
+    };
+    if receiver.kind() != "attribute" {
+        return None;
+    }
+    let semantics = procedure.semantics();
+    let layout = formal_parameter_slots_for_owner(Language::Python, callable, prepared.source())?;
+    let method_has_receiver =
+        matches!(
+            semantics.kind(),
+            ProcedureKind::Method | ProcedureKind::Constructor
+        ) && !matches!(layout.python_binding, Some(PythonMethodBinding::Static));
+    let first_parameter =
+        method_has_receiver.then(|| python_first_parameter_name(callable, prepared.source()))??;
+    let object = receiver.child_by_field_name("object")?;
+    if object.kind() != "identifier"
+        || object.utf8_text(prepared.source().as_bytes()).ok() != Some(first_parameter.as_str())
+        || !adapter.receiver_binding_is_stable(workspace, procedure)
+    {
+        return None;
+    }
+    let member = receiver
+        .child_by_field_name("attribute")?
+        .utf8_text(prepared.source().as_bytes())
+        .ok()?;
+    Some((
+        adapter.enclosing_class(workspace, procedure)?,
+        member.into(),
+    ))
+}
+
+fn python_class_seed_bounds(seed: ClassSeed) -> Result<Vec<ClassIdentity>, UnknownReason> {
+    match seed {
+        ClassSeed::Class(class) | ClassSeed::ClassWithOpenBound(class) => Ok(vec![class]),
+        ClassSeed::Classes(classes) | ClassSeed::ClassesWithOpenBound(classes) => {
+            Ok(classes.into_vec())
+        }
+        ClassSeed::Unknown(reason) => Err(reason),
+        ClassSeed::NotApplicable => Err(UnknownReason::UncertainFlow),
+    }
+}
+
+fn python_field_store_value_bounds(
+    adapter: &PythonTypeFlowAdapter,
+    workspace: &WorkspaceAnalyzer,
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    span: SourceSpan,
+    member: &str,
+) -> Result<Option<Vec<ClassIdentity>>, UnknownReason> {
+    let Some(value) = node_at_span(prepared, span) else {
+        return Err(UnknownReason::UncertainFlow);
+    };
+    let mut ancestor = Some(value);
+    let mut assignment = None;
+    while let Some(node) = ancestor {
+        if node.kind() == "assignment"
+            && let Some(right) = node.child_by_field_name("right")
+            && right.start_byte() <= value.start_byte()
+            && value.end_byte() <= right.end_byte()
+        {
+            assignment = Some((node, right));
+            break;
+        }
+        if matches!(node.kind(), "function_definition" | "class_definition") {
+            break;
+        }
+        ancestor = node.parent();
+    }
+    let Some((assignment, right)) = assignment else {
+        return Ok(None);
+    };
+    let Some(left) = assignment.child_by_field_name("left") else {
+        return Err(UnknownReason::UncertainFlow);
+    };
+    let Some(left_member) = left
+        .child_by_field_name("attribute")
+        .and_then(|node| node.utf8_text(prepared.source().as_bytes()).ok())
+    else {
+        return Ok(None);
+    };
+    if left_member != member {
+        return Ok(None);
+    }
+    let Some(callable) = enclosing_function_definition(assignment) else {
+        return Err(UnknownReason::UncertainFlow);
+    };
+    let receiver = left.child_by_field_name("object");
+    let first_parameter = python_first_parameter_name(callable, prepared.source());
+    if receiver.is_none_or(|receiver| {
+        receiver.kind() != "identifier"
+            || first_parameter.as_deref() != receiver.utf8_text(prepared.source().as_bytes()).ok()
+    }) {
+        return Err(UnknownReason::UncertainFlow);
+    }
+    if runtime_created_type_expression(workspace, file, prepared, callable, right) {
+        return Ok(Some(Vec::new()));
+    }
+    if let Some(name) = python_simple_type_identifier(right, prepared.source())
+        && let Some(annotation) = python_parameter_type_node(callable, &name, prepared.source())
+    {
+        if !python_callable_binding_is_stable(callable, &name, prepared.source()) {
+            return Err(UnknownReason::UncertainFlow);
+        }
+        let seed = adapter.annotation_class_seed(workspace, file, prepared, callable, annotation);
+        return python_class_seed_bounds(seed).map(Some);
+    }
+    let seed = python_workspace_class_candidate(workspace, file, prepared, right)
+        .map(ClassSeed::Class)
+        .unwrap_or_else(|| {
+            resolve_class_at_span(workspace, file.clone(), span_for_node(right), prepared)
+        });
+    python_class_seed_bounds(seed).map(Some)
+}
+
+fn python_dynamic_write_parameter_is_explicitly_unbounded(
+    workspace: &WorkspaceAnalyzer,
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    callable: Node<'_>,
+    receiver: PythonDynamicWriteReceiver<'_>,
+) -> bool {
+    let PythonDynamicWriteReceiver::Expression(receiver) = receiver else {
+        return false;
+    };
+    if receiver.kind() != "identifier" {
+        return false;
+    }
+    let Some(name) = receiver.utf8_text(prepared.source().as_bytes()).ok() else {
+        return false;
+    };
+    if !python_callable_binding_is_stable(callable, name, prepared.source()) {
+        return false;
+    }
+    let Some(annotation) = python_parameter_type_node(callable, name, prepared.source()) else {
+        return false;
+    };
+    let Some(annotation) = python_annotation_expression(annotation) else {
+        return false;
+    };
+    if let Some(variable) = python_simple_type_identifier(annotation, prepared.source())
+        && python_type_parameter_bound(callable, &variable, prepared.source()) == Some(None)
+    {
+        return true;
+    }
+    match resolve_class_at_span(workspace, file.clone(), span_for_node(annotation), prepared) {
+        ClassSeed::Class(class) | ClassSeed::ClassWithOpenBound(class) => python_any_class(&class),
+        ClassSeed::Classes(classes) | ClassSeed::ClassesWithOpenBound(classes) => {
+            classes.iter().any(python_any_class)
+        }
+        ClassSeed::Unknown(_) | ClassSeed::NotApplicable => false,
+    }
+}
+
+fn python_dynamic_write_iteration_element_bound(
+    adapter: &PythonTypeFlowAdapter,
+    workspace: &WorkspaceAnalyzer,
+    procedure: &ProcedureHandle,
+    callable: Node<'_>,
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    receiver: PythonDynamicWriteReceiver<'_>,
+) -> Option<ClassIdentity> {
+    let PythonDynamicWriteReceiver::Expression(receiver) = receiver else {
+        return None;
+    };
+    let receiver_name = python_simple_type_identifier(receiver, prepared.source())?;
+    let mut ancestor = receiver.parent();
+    let mut target = None;
+    while let Some(node) = ancestor {
+        if node.kind() == "for_statement"
+            && let Some(candidate) = node.child_by_field_name("left")
+            && candidate.kind() == "identifier"
+            && candidate.utf8_text(prepared.source().as_bytes()).ok()
+                == Some(receiver_name.as_str())
+        {
+            target = Some(candidate);
+            break;
+        }
+        if matches!(
+            node.kind(),
+            "function_definition" | "class_definition" | "lambda"
+        ) && node.id() != callable.id()
+        {
+            break;
+        }
+        ancestor = node.parent();
+    }
+    let target = target?;
+    if !python_iteration_target_binding_is_stable(
+        callable,
+        target,
+        &receiver_name,
+        receiver.start_byte(),
+        prepared.source(),
+    ) {
+        return None;
+    }
+    let seed = adapter.iteration_element_class_seed(workspace, procedure, file, prepared, target);
+    match seed {
+        ClassSeed::Class(class) | ClassSeed::ClassWithOpenBound(class) => Some(class),
+        _ => None,
+    }
+}
+
+/// Keep the loop element bound only while its binder still names the current
+/// receiver at the dynamic write. Other bindings before the write invalidate
+/// the simple structural proof.
+fn python_iteration_target_binding_is_stable(
+    callable: Node<'_>,
+    target: Node<'_>,
+    receiver_name: &str,
+    receiver_start: usize,
+    source: &str,
+) -> bool {
+    let session = ResolutionSession::bounded(INTERACTIVE_TYPE_LOOKUP_BUDGET, None);
+    let mut pending = vec![callable];
+    while let Some(node) = pending.pop() {
+        let nested_scope = node.id() != callable.id()
+            && matches!(
+                node.kind(),
+                "function_definition" | "class_definition" | "lambda"
+            );
+        let can_bind = matches!(
+            node.kind(),
+            "assignment"
+                | "augmented_assignment"
+                | "type_alias_statement"
+                | "named_expression"
+                | "for_statement"
+                | "delete_statement"
+                | "as_pattern"
+                | "except_clause"
+                | "case_clause"
+                | "import_statement"
+                | "import_from_statement"
+                | "function_definition"
+                | "class_definition"
+        );
+        if can_bind
+            && (!nested_scope || matches!(node.kind(), "function_definition" | "class_definition"))
+        {
+            let Some(bindings) =
+                python_direct_scope_bindings_bounded(node, source, || session.scope_step())
+            else {
+                return false;
+            };
+            if bindings.iter().any(|binding| {
+                binding.declaration.id() != target.id()
+                    && binding.declaration.start_byte() < receiver_start
+                    && binding.declaration.utf8_text(source.as_bytes()).ok() == Some(receiver_name)
+            }) {
+                return false;
+            }
+        }
+        if nested_scope {
+            continue;
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+    }
+    true
+}
+
+fn python_dynamic_write_stored_type_field_bound(
+    adapter: &PythonTypeFlowAdapter,
+    workspace: &WorkspaceAnalyzer,
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    procedure: &ProcedureHandle,
+    callable: Node<'_>,
+    receiver: PythonDynamicWriteReceiver<'_>,
+) -> Option<ClassIdentity> {
+    let PythonDynamicWriteReceiver::Expression(receiver) = receiver else {
+        return None;
+    };
+    let semantics = procedure.semantics();
+    let layout = formal_parameter_slots_for_owner(Language::Python, callable, prepared.source())?;
+    let method_has_receiver =
+        matches!(
+            semantics.kind(),
+            ProcedureKind::Method | ProcedureKind::Constructor
+        ) && !matches!(layout.python_binding, Some(PythonMethodBinding::Static));
+    if !method_has_receiver || receiver.kind() != "attribute" {
+        return None;
+    }
+    let object = receiver.child_by_field_name("object")?;
+    let first_parameter = python_first_parameter_name(callable, prepared.source())?;
+    if object.kind() != "identifier"
+        || object.utf8_text(prepared.source().as_bytes()).ok() != Some(first_parameter.as_str())
+        || !adapter.receiver_binding_is_stable(workspace, procedure)
+    {
+        return None;
+    }
+    let field = receiver
+        .child_by_field_name("attribute")?
+        .utf8_text(prepared.source().as_bytes())
+        .ok()?;
+    let ClassIdentity::Workspace(owner) = adapter.enclosing_class(workspace, procedure)? else {
+        return None;
+    };
+    let class = class_node_for_unit(python_analyzer(workspace), prepared, &owner)?;
+    let (initializer, parameter) = python_stored_type_field_parameter(class, field, prepared)?;
+    if !python_callable_binding_is_stable(initializer, &parameter, prepared.source()) {
+        return None;
+    }
+    let annotation = python_parameter_type_node(initializer, &parameter, prepared.source())?;
+    match adapter.annotation_class_seed(workspace, file, prepared, initializer, annotation) {
+        ClassSeed::Class(class) | ClassSeed::ClassWithOpenBound(class) => Some(class),
+        _ => None,
+    }
+}
+
+fn python_stored_type_field_parameter<'tree>(
+    class: Node<'tree>,
+    field: &str,
+    prepared: &PreparedSyntaxTree,
+) -> Option<(Node<'tree>, String)> {
+    let body = class.child_by_field_name("body")?;
+    let source = prepared.source();
+    let mut members = body.walk();
+    let mut initializer = None;
+    let mut parameter = None;
+    for member in body.named_children(&mut members) {
+        if assignment_name(member, source) == Some(field) {
+            return None;
+        }
+        let definition = if member.kind() == "decorated_definition" {
+            let mut cursor = member.walk();
+            member
+                .named_children(&mut cursor)
+                .find(|child| child.kind() == "function_definition")?
+        } else {
+            member
+        };
+        if definition.kind() != "function_definition" {
+            continue;
+        }
+        let method_name = definition_name(definition, source)?;
+        let method_receiver = python_first_parameter_name(definition, source)?;
+        let Some(method_body) = definition.child_by_field_name("body") else {
+            continue;
+        };
+        let mut pending = vec![method_body];
+        while let Some(node) = pending.pop() {
+            if node.id() != method_body.id()
+                && matches!(
+                    node.kind(),
+                    "function_definition" | "class_definition" | "lambda"
+                )
+            {
+                continue;
+            }
+            if node.kind() == "augmented_assignment"
+                && node
+                    .child_by_field_name("left")
+                    .and_then(|left| left.child_by_field_name("attribute"))
+                    .and_then(|attribute| attribute.utf8_text(source.as_bytes()).ok())
+                    == Some(field)
+            {
+                return None;
+            }
+            if node.kind() == "assignment"
+                && let Some(left) = node.child_by_field_name("left")
+                && left.kind() == "attribute"
+                && left
+                    .child_by_field_name("attribute")
+                    .and_then(|attribute| attribute.utf8_text(source.as_bytes()).ok())
+                    == Some(field)
+            {
+                let object = left.child_by_field_name("object")?;
+                let value = node.child_by_field_name("right")?;
+                if method_name != "__init__"
+                    || object.kind() != "identifier"
+                    || object.utf8_text(source.as_bytes()).ok() != Some(method_receiver.as_str())
+                    || initializer.is_some()
+                    || value.kind() != "identifier"
+                {
+                    return None;
+                }
+                initializer = Some(definition);
+                parameter = Some(value.utf8_text(source.as_bytes()).ok()?.to_owned());
+            }
+            if node.kind() == "call"
+                && let Some(PythonDynamicWriteReceiver::Expression(receiver)) =
+                    python_dynamic_write_receiver(node, source)
+                && receiver.kind() == "identifier"
+                && receiver.utf8_text(source.as_bytes()).ok() == Some(method_receiver.as_str())
+                && let Some(write) = dynamic_call_write(node, source)
+                && dynamic_member_name_affects(&write, field)
+            {
+                return None;
+            }
+            if node.kind() == "call"
+                && matches!(
+                    python_dynamic_write_receiver(node, source),
+                    Some(PythonDynamicWriteReceiver::ZeroArgSuper(_))
+                )
+                && let Some(write) = dynamic_call_write(node, source)
+                && dynamic_member_name_affects(&write, field)
+            {
+                return None;
+            }
+            let mut cursor = node.walk();
+            pending.extend(node.named_children(&mut cursor));
+        }
+    }
+    Some((initializer?, parameter?))
+}
+
+const MAX_PYTHON_EXACT_ORIGIN_STEPS: usize = 128;
+
+#[derive(Clone)]
+struct PythonExactCallResult {
+    value: PythonExactResultValue,
+    kind: SourceSiteKind,
+}
+
+// One query over one procedure. Missing call results become worklist entries,
+// so origin revalidation and mixed call/access chains never recurse in Rust.
+// Both successful and unknown results are dropped when this query returns.
+#[derive(Default)]
+struct PythonExactResultQuery {
+    calls: HashMap<CallSiteId, Option<PythonExactCallResult>>,
+    pending: Option<CallSiteId>,
+}
+
+impl PythonExactResultQuery {
+    fn call_result(&mut self, call: &SemanticCallSite) -> Option<PythonExactCallResult> {
+        if let Some(result) = self.calls.get(&call.id) {
+            return result.clone();
+        }
+        self.pending.get_or_insert(call.id);
+        None
+    }
+
+    fn exact_call_classes(&mut self, call: &SemanticCallSite) -> Option<Box<[ClassIdentity]>> {
+        let result = self.call_result(call)?;
+        if result.kind != SourceSiteKind::ExactCallResult {
+            return None;
+        }
+        match result.value {
+            PythonExactResultValue::Classes(classes) => Some(classes),
+            PythonExactResultValue::Unknown | PythonExactResultValue::Tuple(_) => None,
+        }
+    }
+
+    fn resolve<T>(
+        &mut self,
+        workspace: &WorkspaceAnalyzer,
+        procedure: &ProcedureHandle,
+        mut root: impl FnMut(&mut Self) -> Option<T>,
+    ) -> Option<T> {
+        let mut pending = Vec::new();
+        loop {
+            if let Some(&call_id) = pending.last() {
+                let call = procedure
+                    .semantics()
+                    .call_sites()
+                    .iter()
+                    .find(|call| call.id == call_id)?;
+                let result = python_exact_call_result_value(workspace, procedure, call, self);
+                if self.pending.is_none() {
+                    self.calls.insert(call_id, result);
+                    pending.pop();
+                }
+            } else {
+                let result = root(self);
+                if self.pending.is_none() {
+                    return result;
+                }
+            }
+            if let Some(dependency) = self.pending.take() {
+                if pending.contains(&dependency)
+                    || self.calls.len() + pending.len() >= MAX_PYTHON_EXACT_ORIGIN_STEPS
+                {
+                    return None;
+                }
+                pending.push(dependency);
+            }
+        }
+    }
+}
+
+fn python_exact_imported_call_result_classes(
+    workspace: &WorkspaceAnalyzer,
+    procedure: &ProcedureHandle,
+    call: &SemanticCallSite,
+) -> Option<Box<[ClassIdentity]>> {
+    let semantics = procedure.semantics();
+    let callee = semantics.value(call.callee)?;
+    let mapping = semantics.source_mapping(callee.source)?;
+    if mapping.kind != SourceMappingKind::Exact {
+        return None;
+    }
+    let file = file_for_locator(workspace, &mapping.locator)?;
+    let prepared = prepared_for_procedure(workspace, procedure, &file).ok()?;
+    let reference = node_at_span(&prepared, mapping.locator.anchor().span())?;
+    let ClassSeed::Classes(classes) =
+        imported_external_function_result_seed(workspace, &file, &prepared, reference)?
+    else {
+        return None;
+    };
+    if classes
+        .iter()
+        .any(|class| matches!(class.qualified_name(), "builtins.type" | "builtins.super"))
+    {
+        return None;
+    }
+    Some(classes)
+}
+
+fn python_memory_load_result_class_in_query(
+    workspace: &WorkspaceAnalyzer,
+    procedure: &ProcedureHandle,
+    location: &MemoryLocation,
+    result: ValueId,
+    query: &mut PythonExactResultQuery,
+) -> ClassSeed {
+    let loads = procedure
+        .semantics()
+        .points()
+        .iter()
+        .flat_map(|point| {
+            point
+                .events
+                .iter()
+                .enumerate()
+                .filter_map(move |(event_index, event)| {
+                    matches!(
+                        event.effect,
+                        SemanticEffect::MemoryLoad {
+                            location: found,
+                            result: found_result,
+                            ..
+                        } if found == location.id && found_result == result
+                    )
+                    .then_some((point.id, event_index))
+                })
+        })
+        .collect::<Vec<_>>();
+    let [(point, event_index)] = loads.as_slice() else {
+        return ClassSeed::NotApplicable;
+    };
+    python_exact_value_class_at_in_query(workspace, procedure, result, *point, *event_index, query)
+        .map_or(ClassSeed::NotApplicable, ClassSeed::Classes)
+}
+
+pub(crate) fn python_exact_external_receiver_identities(
+    workspace: &WorkspaceAnalyzer,
+    procedure: &ProcedureHandle,
+    method_call: &SemanticCallSite,
+) -> Option<Vec<crate::analyzer::semantic::ResolverOwnedExternalCalleeIdentity>> {
+    PythonExactResultQuery::default().resolve(workspace, procedure, |query| {
+        python_exact_external_receiver_identities_in_query(workspace, procedure, method_call, query)
+    })
+}
+
+#[derive(Debug)]
+enum PythonExactAccess {
+    Attribute(Box<str>),
+    Subscript { constant_index: Option<u128> },
+}
+
+#[derive(Clone)]
+enum PythonExactResultValue {
+    Unknown,
+    Classes(Box<[ClassIdentity]>),
+    Tuple(Vec<PythonExactResultValue>),
+}
+
+struct PythonExactAccessStep {
+    access: PythonExactAccess,
+}
+
+fn python_exact_value_class_at_in_query(
+    workspace: &WorkspaceAnalyzer,
+    procedure: &ProcedureHandle,
+    mut value: ValueId,
+    mut use_point: ProgramPointId,
+    mut use_event_index: usize,
+    query: &mut PythonExactResultQuery,
+) -> Option<Box<[ClassIdentity]>> {
+    let semantics = procedure.semantics();
+    let bindings = BindingOriginIndex::new(procedure);
+    let mut visited = HashSet::default();
+    let mut accesses = Vec::new();
+    let mut origin_value = None;
+    for _ in 0..MAX_PYTHON_EXACT_ORIGIN_STEPS {
+        if !visited.insert(value) {
+            return None;
+        }
+        if matches!(
+            semantics.value(value).map(|value| &value.kind),
+            Some(SemanticValueKind::Receiver { dispatch: true })
+        ) {
+            let ClassIdentity::Workspace(class) =
+                PythonTypeFlowAdapter.enclosing_class(workspace, procedure)?
+            else {
+                return None;
+            };
+            let method_file = file_for_locator(workspace, semantics.locator())?;
+            let method_prepared =
+                prepared_for_procedure(workspace, procedure, &method_file).ok()?;
+            let method = node_at_span(&method_prepared, semantics.locator().anchor().span())?;
+            let parameter_layout = formal_parameter_slots_for_owner(
+                Language::Python,
+                method,
+                method_prepared.source(),
+            )?;
+            if parameter_layout.python_binding != Some(PythonMethodBinding::Instance) {
+                return None;
+            }
+            origin_value = Some(PythonExactResultValue::Classes(
+                vec![ClassIdentity::Workspace(class)].into_boxed_slice(),
+            ));
+            break;
+        }
+        let calls = semantics
+            .call_sites()
+            .iter()
+            .filter(|call| call.normal_result_values().any(|result| result == value))
+            .collect::<Vec<_>>();
+        if let [call] = calls.as_slice() {
+            origin_value = query.call_result(call).map(|result| result.value);
+            break;
+        }
+        if !calls.is_empty() {
+            return None;
+        }
+
+        let loads = semantics
+            .points()
+            .iter()
+            .flat_map(|point| {
+                point
+                    .events
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(event_index, event)| {
+                        let SemanticEffect::MemoryLoad {
+                            location, result, ..
+                        } = event.effect
+                        else {
+                            return None;
+                        };
+                        (result == value).then_some((point.id, event_index, location, event.source))
+                    })
+            })
+            .collect::<Vec<_>>();
+        if let [(point, event_index, location, source)] = loads.as_slice() {
+            let mapping = semantics.source_mapping(*source)?;
+            if mapping.kind != SourceMappingKind::Exact {
+                return None;
+            }
+            let file = file_for_locator(workspace, &mapping.locator)?;
+            let prepared = prepared_for_procedure(workspace, procedure, &file).ok()?;
+            let node = node_at_span(&prepared, mapping.locator.anchor().span())?;
+            let location_row = semantics.memory_location(*location)?;
+            let (base, access, base_node) = match &location_row.kind {
+                MemoryLocationKind::Field { base, .. }
+                | MemoryLocationKind::Property { base, .. }
+                    if node.kind() == "attribute" =>
+                {
+                    let attribute = node.child_by_field_name("attribute")?;
+                    let object = node.child_by_field_name("object")?;
+                    (
+                        *base,
+                        PythonExactAccess::Attribute(Box::from(
+                            attribute.utf8_text(prepared.source().as_bytes()).ok()?,
+                        )),
+                        object,
+                    )
+                }
+                MemoryLocationKind::Index {
+                    base,
+                    constant_index,
+                    ..
+                } if node.kind() == "subscript" => {
+                    let value_node = node.child_by_field_name("value")?;
+                    node.child_by_field_name("subscript")?;
+                    (
+                        *base,
+                        PythonExactAccess::Subscript {
+                            constant_index: *constant_index,
+                        },
+                        value_node,
+                    )
+                }
+                MemoryLocationKind::Property { base, .. } if node.kind() == "subscript" => {
+                    let value_node = node.child_by_field_name("value")?;
+                    node.child_by_field_name("subscript")?;
+                    (
+                        *base,
+                        PythonExactAccess::Subscript {
+                            constant_index: None,
+                        },
+                        value_node,
+                    )
+                }
+                _ => return None,
+            };
+            let base_value = semantics.value(base)?;
+            let base_mapping = semantics.source_mapping(base_value.source)?;
+            if base_mapping.kind != SourceMappingKind::Exact
+                || file_for_locator(workspace, &base_mapping.locator).as_ref() != Some(&file)
+                || base_mapping.locator.anchor().span() != span_for_node(base_node)
+            {
+                return None;
+            }
+            accesses.push(PythonExactAccessStep { access });
+            value = base;
+            use_point = *point;
+            use_event_index = *event_index;
+            continue;
+        }
+        if !loads.is_empty() {
+            return None;
+        }
+
+        if !matches!(
+            semantics.value(value).map(|value| &value.kind),
+            Some(SemanticValueKind::Local | SemanticValueKind::Temporary)
+        ) {
+            return None;
+        }
+        let value_semantic = semantics.value(value)?;
+        let value_mapping = semantics.source_mapping(value_semantic.source)?;
+        if value_mapping.kind != SourceMappingKind::Exact {
+            return None;
+        }
+        let value_file = file_for_locator(workspace, &value_mapping.locator)?;
+        let value_prepared = prepared_for_procedure(workspace, procedure, &value_file).ok()?;
+        let value_node = node_at_span(&value_prepared, value_mapping.locator.anchor().span())?;
+        if let Some((module, member)) = import_bound_external_symbol(
+            python_analyzer(workspace),
+            &value_file,
+            &value_prepared,
+            value_node,
+        ) && let Some(overlay) = workspace.analyzer().semantic_model_overlay()
+            && let Some(seed) = external_module_value_seed(&overlay, &module, &member)
+        {
+            origin_value = match seed {
+                ClassSeed::Class(class @ ClassIdentity::External { .. }) => Some(
+                    PythonExactResultValue::Classes(vec![class].into_boxed_slice()),
+                ),
+                ClassSeed::Classes(classes)
+                    if classes
+                        .iter()
+                        .all(|class| matches!(class, ClassIdentity::External { .. })) =>
+                {
+                    Some(PythonExactResultValue::Classes(classes))
+                }
+                _ => None,
+            };
+            break;
+        }
+        let binding = bindings.unique_binding_origin(value)?;
+        if !matches!(
+            semantics.value(binding).map(|value| &value.kind),
+            Some(SemanticValueKind::Local)
+        ) {
+            return None;
+        }
+        value = python_unique_reaching_binding_assignment_at(
+            procedure,
+            binding,
+            use_point,
+            use_event_index,
+        )?;
+    }
+    let mut result = origin_value?;
+    for step in accesses.iter().rev() {
+        result = match (result, &step.access) {
+            (PythonExactResultValue::Unknown, _) => PythonExactResultValue::Unknown,
+            (
+                PythonExactResultValue::Tuple(elements),
+                PythonExactAccess::Subscript {
+                    constant_index: Some(index),
+                },
+            ) => usize::try_from(*index)
+                .ok()
+                .and_then(|index| elements.get(index).cloned())
+                .unwrap_or(PythonExactResultValue::Unknown),
+            (PythonExactResultValue::Tuple(_), _) => PythonExactResultValue::Unknown,
+            (PythonExactResultValue::Classes(classes), access) => {
+                let returned = classes
+                    .iter()
+                    .map(|class| python_exact_access_return_classes(workspace, class, access))
+                    .collect::<Option<Vec<_>>>()?;
+                let returned = returned.into_iter().flatten().collect::<Vec<_>>();
+                let ClassSeed::Classes(classes) = ClassSeed::classes(returned) else {
+                    unreachable!("an exact access result has at least one runtime class")
+                };
+                PythonExactResultValue::Classes(classes)
+            }
+        };
+    }
+    match result {
+        PythonExactResultValue::Classes(classes) => Some(classes),
+        PythonExactResultValue::Unknown | PythonExactResultValue::Tuple(_) => None,
+    }
+}
+
+fn python_exact_call_result_value(
+    workspace: &WorkspaceAnalyzer,
+    procedure: &ProcedureHandle,
+    call: &SemanticCallSite,
+    query: &mut PythonExactResultQuery,
+) -> Option<PythonExactCallResult> {
+    if let Some(classes) = python_exact_imported_call_result_classes(workspace, procedure, call) {
+        return Some(PythonExactCallResult {
+            value: PythonExactResultValue::Classes(classes),
+            kind: SourceSiteKind::ExactCallResult,
+        });
+    }
+    if let ClassSeed::Class(class @ ClassIdentity::External { .. }) =
+        PythonTypeFlowAdapter.constructed_class(workspace, procedure, call)
+    {
+        return Some(PythonExactCallResult {
+            value: PythonExactResultValue::Classes(vec![class].into_boxed_slice()),
+            kind: SourceSiteKind::ConstructorCall,
+        });
+    }
+
+    let identities =
+        python_exact_external_receiver_identities_in_query(workspace, procedure, call, query)?;
+    let [identity] = identities.as_slice() else {
+        return None;
+    };
+    let overlay = workspace.analyzer().semantic_model_overlay()?;
+    let owner_match = overlay.symbols_named(identity.owner_fqn());
+    let [owner] = owner_match.records.as_slice() else {
+        return None;
+    };
+    if owner.kind != SemanticModelSymbolKind::Class
+        || owner.language != Language::Python.config_label()
+        || owner.provenance.ambiguous
+    {
+        return None;
+    }
+    let declaration = python_external_member_declaration(&overlay, &owner.id, identity.member())?;
+    let value = if declaration.exact_return_classes.is_empty() {
+        let returns = declaration.structured_signature()?.returns.as_ref()?;
+        if python_type_ref_contains_any(&overlay, returns) {
+            return None;
+        }
+        python_exact_result_value_from_type_ref(&overlay, returns)
+    } else {
+        PythonExactResultValue::Classes(python_exact_return_classes(&overlay, declaration)?)
+    };
+    Some(PythonExactCallResult {
+        value,
+        kind: SourceSiteKind::ExactCallResult,
+    })
+}
+
+fn python_exact_result_value_from_type_ref(
+    overlay: &SemanticModelOverlay,
+    type_ref: &TypeRef,
+) -> PythonExactResultValue {
+    match type_ref {
+        TypeRef::Named {
+            name,
+            nullable: false,
+            ..
+        } => {
+            let mut cache = ExternalClassCache::default();
+            external_class_identity(Some(overlay), Language::Python, name, None, &mut cache)
+                .map(|class| PythonExactResultValue::Classes(vec![class].into_boxed_slice()))
+                .unwrap_or(PythonExactResultValue::Unknown)
+        }
+        TypeRef::Declared {
+            id,
+            nullable: false,
+            ..
+        } => {
+            let mut cache = ExternalClassCache::default();
+            external_class_identity(Some(overlay), Language::Python, "", Some(id), &mut cache)
+                .map(|class| PythonExactResultValue::Classes(vec![class].into_boxed_slice()))
+                .unwrap_or(PythonExactResultValue::Unknown)
+        }
+        TypeRef::Tuple { elements } => PythonExactResultValue::Tuple(
+            elements
+                .iter()
+                .map(|element| python_exact_result_value_from_type_ref(overlay, element))
+                .collect(),
+        ),
+        _ => PythonExactResultValue::Unknown,
+    }
+}
+
+fn python_exact_access_return_classes(
+    workspace: &WorkspaceAnalyzer,
+    receiver_class: &ClassIdentity,
+    access: &PythonExactAccess,
+) -> Option<Box<[ClassIdentity]>> {
+    let overlay = workspace.analyzer().semantic_model_overlay()?;
+    let ClassIdentity::External { symbol_id, .. } = receiver_class else {
+        let ClassIdentity::Workspace(owner) = receiver_class else {
+            unreachable!("the external receiver case returned above")
+        };
+        let PythonExactAccess::Attribute(member) = access else {
+            return None;
+        };
+        let python = python_analyzer(workspace);
+        let declaration =
+            python_external_value_member_on_workspace_class(python, owner, member, &overlay)?;
+        if declaration.kind != SemanticModelSymbolKind::Field {
+            return None;
+        }
+        let declared_type = declaration
+            .proxied_type
+            .as_ref()
+            .or(declaration.value_type.as_ref())?;
+        return match python_exact_result_value_from_type_ref(&overlay, declared_type) {
+            PythonExactResultValue::Classes(classes) => Some(classes),
+            PythonExactResultValue::Unknown | PythonExactResultValue::Tuple(_) => None,
+        };
+    };
+    let (member, declared_name) = match access {
+        PythonExactAccess::Subscript { .. } => ("__getitem__", None),
+        PythonExactAccess::Attribute(name) => {
+            let declared = python_external_member_is_declared_in_mro(&overlay, symbol_id, name)?;
+            if declared {
+                return python_external_declared_property_return_classes(
+                    workspace,
+                    receiver_class,
+                    &overlay,
+                    symbol_id,
+                    name,
+                );
+            }
+            ("__getattr__", Some(name.as_ref()))
+        }
+    };
+    let declaration = python_external_member_declaration(&overlay, symbol_id, member);
+    let declaration = declaration?;
+    let mutation_free = external_class_member_mutation_free(
+        workspace,
+        receiver_class,
+        &ExternalMemberDeclaration::new([Box::from(declaration.id.as_str())]),
+        declared_name.unwrap_or(member),
+    );
+    if declaration.exact_return_classes.is_empty() || !mutation_free {
+        return None;
+    }
+    python_exact_return_classes(&overlay, declaration)
+}
+
+fn python_external_declared_property_return_classes(
+    workspace: &WorkspaceAnalyzer,
+    receiver_class: &ClassIdentity,
+    overlay: &SemanticModelOverlay,
+    owner_id: &str,
+    member: &str,
+) -> Option<Box<[ClassIdentity]>> {
+    let mro = python_external_class_mro(overlay, owner_id)?;
+    for class_id in mro {
+        let class = exact_python_model_class(overlay, &class_id)?;
+        if overlay
+            .gapped_member_surface(&class.qualified_name, member)
+            .is_some()
+        {
+            return None;
+        }
+        let mut records = python_external_class_records(overlay, &class_id)
+            .into_iter()
+            .flat_map(|owner| {
+                overlay
+                    .members_of(&owner.id)
+                    .records
+                    .into_iter()
+                    .filter(|symbol| {
+                        symbol.owner_id.as_deref() == Some(owner.id.as_str())
+                            && symbol.name == member
+                            && symbol.language == Language::Python.config_label()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        if records.is_empty() {
+            continue;
+        }
+        records.sort_by(|left, right| left.id.cmp(&right.id));
+        records.dedup_by(|left, right| left.id == right.id);
+        let [symbol] = records.as_slice() else {
+            return None;
+        };
+        if symbol.kind != SemanticModelSymbolKind::Property {
+            return None;
+        }
+        if symbol.exact_return_classes.is_empty()
+            || !external_class_member_mutation_free(
+                workspace,
+                receiver_class,
+                &ExternalMemberDeclaration::new([Box::from(symbol.id.as_str())]),
+                member,
+            )
+        {
+            return None;
+        }
+        return python_exact_return_classes(overlay, symbol);
+    }
+    None
+}
+
+fn python_external_member_is_declared_in_mro(
+    overlay: &SemanticModelOverlay,
+    owner_id: &str,
+    member: &str,
+) -> Option<bool> {
+    let mro = python_external_class_mro(overlay, owner_id)?;
+    for class_id in mro {
+        let class = exact_python_model_class(overlay, &class_id)?;
+        if overlay
+            .gapped_member_surface(&class.qualified_name, member)
+            .is_some()
+        {
+            return None;
+        }
+        if python_external_declares_member(overlay, &class_id, member) {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+fn python_exact_return_classes(
+    overlay: &SemanticModelOverlay,
+    symbol: &SemanticModelSymbol,
+) -> Option<Box<[ClassIdentity]>> {
+    if symbol.exact_return_classes.is_empty() || symbol.provenance.ambiguous {
+        return None;
+    }
+    let mut cache = ExternalClassCache::default();
+    let classes = symbol
+        .exact_return_classes
+        .iter()
+        .map(|class| match class {
+            TypeRef::Named {
+                name,
+                nullable: false,
+                ..
+            } => external_class_identity(Some(overlay), Language::Python, name, None, &mut cache),
+            TypeRef::Declared {
+                id,
+                nullable: false,
+                ..
+            } => external_class_identity(Some(overlay), Language::Python, "", Some(id), &mut cache),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    // typing.Any is not a runtime class, so a claim that names it is not a
+    // closed class set.
+    if classes.iter().any(python_any_class) {
+        return None;
+    }
+    let ClassSeed::Classes(classes) = ClassSeed::classes(classes) else {
+        unreachable!("an exact return claim names at least one class")
+    };
+    Some(classes)
+}
+
 impl TypeFlowAdapter for PythonTypeFlowAdapter {
     fn language(&self) -> Language {
         Language::Python
@@ -2309,9 +8323,16 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         // when no modeled __getattribute__ hook exists.
         // Variadic formals retain their tuple or dict container class instead
         // of taking the class of an element collected from a caller.
+        // An annotation or modeled return containing typing.Any remains an
+        // unknown value because Any is not a runtime class.
+        // Conditional absent-member findings may use a declared parameter
+        // only when its exact annotation proves one closed workspace class,
+        // without workspace descendants, unresolved bases, dynamic hooks,
+        // Protocol ancestry, or abstract members.
+        // Valid reference sites may have leading or trailing root trivia (#4811).
         AdapterSemanticsVersion::hash_bytes(
             "python-type-flow",
-            b"python-type-flow-unmodeled-guards-scoped-dynamic-writes-dict-read-methods-bounded-receiver-scopes-subscripted-annotation-outer-class-class-object-reference-imports-unmodeled-predicate-type-is-guard-exact-binding-replacement-stable-receiver-entry-implicit-tuples-closed-native-members-sequence-initializers-module-binding-reuse-comprehension-scope-closed-sequence-loads-implicit-none-returns-returned-sequence-loads-arm-proven-classes-reach-joins-class-body-member-binding-import-bound-bases-importing-source-root-established-source-root-modules-declared-project-root-authority-package-path-extension-executed-typed-numeric-literals-partial-modeled-surface-hook-safety-variadic-container-classes-v60",
+            b"python-type-flow-unmodeled-guards-scoped-dynamic-writes-dict-read-methods-bounded-receiver-scopes-subscripted-annotation-outer-class-class-object-reference-imports-unmodeled-predicate-type-is-guard-exact-binding-replacement-stable-receiver-entry-implicit-tuples-closed-native-members-sequence-initializers-module-binding-reuse-comprehension-scope-closed-sequence-loads-implicit-none-returns-returned-sequence-loads-arm-proven-classes-reach-joins-class-body-member-binding-import-bound-bases-importing-source-root-established-source-root-modules-declared-project-root-authority-package-path-extension-executed-typed-numeric-literals-partial-modeled-surface-hook-safety-variadic-container-classes-dynamic-write-name-sets-structured-dynamic-receiver-type-parameter-bounds-dynamic-type-write-bounds-nonescaping-nested-write-bounds-runtime-created-class-exclusion-loop-name-list-bounds-postponed-and-type-checking-annotation-bounds-field-slot-class-value-bounds-quoted-receiver-annotation-name-resolution-field-content-deletion-receivers-declared-parameter-conditional-closed-world-property-descriptor-field-slots-v79-same-name-external-class-records-external-module-value-types-exact-constructor-instance-dispatch-python-c3-class-member-replacement-scan-rql-inherited-external-member-exact-factory-and-access-return-class-sets-stable-local-multi-target-flow-dynamic-any-is-not-a-runtime-class-uncertain-constructor-call-shapes-once-bound-module-global-initializer-class-seeds-exact-partial-field-values-workspace-receiver-and-proxy-access-calls-trivia-covered-reference-sites-exact-method-result-origins-shared-direct-receiver-proof",
         )
         .expect("adapter name is non-empty")
     }
@@ -2366,7 +8387,11 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
             _ => return ClassSeed::NotApplicable,
         };
         let mut cache = ExternalClassCache::default();
-        external_seed(overlay_of(workspace).as_deref(), name, &mut cache)
+        external_seed(
+            workspace.analyzer().semantic_model_overlay().as_deref(),
+            name,
+            &mut cache,
+        )
     }
 
     fn retained_value_class(
@@ -2387,7 +8412,11 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         };
         if let Some(name) = implicit_class {
             let mut cache = ExternalClassCache::default();
-            return external_seed(overlay_of(workspace).as_deref(), name, &mut cache);
+            return external_seed(
+                workspace.analyzer().semantic_model_overlay().as_deref(),
+                name,
+                &mut cache,
+            );
         }
         let mapping = procedure
             .semantics()
@@ -2406,6 +8435,20 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         let Some(node) = node_at_span(&prepared, mapping.locator.anchor().span()) else {
             return ClassSeed::NotApplicable;
         };
+        if let Some((module, member)) =
+            import_bound_external_symbol(python_analyzer(workspace), &file, &prepared, node)
+            && let Some(overlay) = workspace.analyzer().semantic_model_overlay()
+            && let Some(seed) = external_module_value_seed(&overlay, &module, &member)
+        {
+            return seed;
+        }
+        if matches!(
+            &value.kind,
+            SemanticValueKind::LanguageDefined(kind)
+                if kind.as_ref() == "python.unknown_iteration_element"
+        ) {
+            return self.iteration_element_class_seed(workspace, procedure, &file, &prepared, node);
+        }
         if matches!(value.kind, SemanticValueKind::DefaultArgument { .. }) {
             // A saved default is not evaluated in the callee. In particular,
             // identifiers must not be interpreted as reads of its parameters
@@ -2423,7 +8466,11 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
             };
             if let Some(name) = container {
                 let mut cache = ExternalClassCache::default();
-                return external_seed(overlay_of(workspace).as_deref(), name, &mut cache);
+                return external_seed(
+                    workspace.analyzer().semantic_model_overlay().as_deref(),
+                    name,
+                    &mut cache,
+                );
             }
             if node.kind() == "call"
                 && let Some(function) = node.child_by_field_name("function")
@@ -2486,7 +8533,7 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
                     resolve_class_at_span(workspace, file, span_for_node(function), &prepared);
                 if let ClassSeed::Class(class @ ClassIdentity::Workspace(owner)) = &seed {
                     let hierarchy = self.class_hierarchy(workspace, class);
-                    let overlay = overlay_of(workspace);
+                    let overlay = workspace.analyzer().semantic_model_overlay();
                     if !hierarchy.unresolved_base
                         && python_class_hierarchy_member_unshadowed_bounded(
                             python_analyzer(workspace),
@@ -2512,7 +8559,11 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         match node.kind() {
             "string" | "concatenated_string" => {
                 let mut cache = ExternalClassCache::default();
-                external_seed(overlay_of(workspace).as_deref(), "builtins.str", &mut cache)
+                external_seed(
+                    workspace.analyzer().semantic_model_overlay().as_deref(),
+                    "builtins.str",
+                    &mut cache,
+                )
             }
             "identifier" => declaration_reference_seed(workspace, &file, &prepared, node),
             _ => ClassSeed::NotApplicable,
@@ -2543,11 +8594,93 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
             Err(reason) => return ClassSeed::Unknown(reason),
         };
         let span = mapping.locator.anchor().span();
-        let seed = resolve_class_at_span(workspace, file.clone(), span, &prepared);
-        if let ClassSeed::Class(ClassIdentity::External { qualified_name, .. }) = &seed {
+        let Some(callee_node) = node_at_span(&prepared, span) else {
+            return ClassSeed::Unknown(UnknownReason::UncertainFlow);
+        };
+        let current_receiver_attribute_call = callee_node.kind() == "attribute"
+            && python_attribute_callee_uses_self_or_cls_bounded(prepared.source(), callee_node);
+        if current_receiver_attribute_call
+            && python_attribute_callee_names_enclosing_nested_class_bounded(
+                prepared.source(),
+                callee_node,
+            )
+        {
+            // A nested class reached through self/cls can be shadowed by
+            // instance writes or subclass overrides.
+            return ClassSeed::Unknown(UnknownReason::UncertainFlow);
+        }
+        let seed = imported_external_class_callee(workspace, &file, &prepared, callee_node)
+            .map(ClassSeed::Class)
+            .unwrap_or_else(|| resolve_class_at_span(workspace, file.clone(), span, &prepared));
+        if current_receiver_attribute_call {
+            let python = python_analyzer(workspace);
+            let scope = AnalyzerQueryScope::new(python);
+            let session = ResolutionSession::bounded(INTERACTIVE_TYPE_LOOKUP_BUDGET, None);
+            let support = PythonDefinitionProvider::new(python, &session);
+            let callee_kind = python_attribute_callee_kind_bounded(
+                &support,
+                scope.token(),
+                &file,
+                prepared.source(),
+                prepared.tree().root_node(),
+                callee_node,
+            );
+            if callee_kind != Some(PythonAttributeCalleeKind::Function)
+                && matches!(
+                    &seed,
+                    ClassSeed::Class(_)
+                        | ClassSeed::Classes(_)
+                        | ClassSeed::ClassWithOpenBound(_)
+                        | ClassSeed::ClassesWithOpenBound(_)
+                )
+            {
+                // An unresolved or class-like attribute call has no proof
+                // against instance writes or subclass overrides.
+                return ClassSeed::Unknown(UnknownReason::UncertainFlow);
+            }
+        }
+        // A broad type-at-reference query can be incomplete or ambiguous for
+        // an imported package member even when the exact import binder and
+        // active overlay identify this constructor's class. Recover only that
+        // import-bound, unique external class; ambiguity in the import
+        // binding or model still stays unknown.
+        let seed = if matches!(
+            &seed,
+            ClassSeed::Unknown(UnknownReason::UncertainFlow | UnknownReason::AmbiguousCallee)
+        ) && let Some(reference) = node_at_span(&prepared, span)
+            && let Some(class) = imported_external_class(workspace, &file, &prepared, reference)
+        {
+            ClassSeed::Class(class)
+        } else {
+            seed
+        };
+        let seed = if matches!(&seed, ClassSeed::NotApplicable | ClassSeed::Unknown(_))
+            && let Some(reference) = node_at_span(&prepared, span)
+            && let Some(external_return_seed) =
+                imported_external_function_result_seed(workspace, &file, &prepared, reference)
+        {
+            external_return_seed
+        } else {
+            seed
+        };
+        let unsupported_result = match &seed {
+            ClassSeed::Class(ClassIdentity::External { qualified_name, .. }) => {
+                Some(qualified_name.as_ref())
+            }
+            ClassSeed::Classes(classes) => classes.iter().find_map(|class| match class {
+                ClassIdentity::External { qualified_name, .. }
+                    if matches!(qualified_name.as_ref(), "builtins.type" | "builtins.super") =>
+                {
+                    Some(qualified_name.as_ref())
+                }
+                _ => None,
+            }),
+            _ => None,
+        };
+        if let Some(qualified_name) = unsupported_result {
             // Neither result has the instance member surface declared by the
             // builtin class itself.
-            match qualified_name.as_ref() {
+            match qualified_name {
                 // `type(value)` returns a class object, which is exactly what
                 // `ClassObject` names.
                 "builtins.type" => return ClassSeed::Unknown(UnknownReason::ClassObject),
@@ -2557,12 +8690,55 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
                 _ => {}
             }
         }
-        if matches!(seed, ClassSeed::Class(_))
+        if matches!(seed, ClassSeed::Class(_) | ClassSeed::Classes(_))
             && callee_reads_a_value(workspace, &file, &prepared, span)
         {
             return ClassSeed::NotApplicable;
         }
         seed
+    }
+
+    fn exact_call_result_class(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        procedure: &ProcedureHandle,
+        call: &SemanticCallSite,
+    ) -> Option<Box<[ClassIdentity]>> {
+        PythonExactResultQuery::default()
+            .resolve(workspace, procedure, |query| query.exact_call_classes(call))
+    }
+
+    fn exact_result_receiver_is_stable(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        procedure: &ProcedureHandle,
+        receiver: ValueId,
+        call: &SemanticCallSite,
+        origin: &ConstructorResultOrigin,
+    ) -> bool {
+        call.receiver == Some(receiver)
+            && PythonExactResultQuery::default()
+                .resolve(workspace, procedure, |query| {
+                    python_exact_receiver_origin_in_query(workspace, procedure, call, query)
+                })
+                .as_ref()
+                == Some(origin)
+    }
+
+    fn memory_load_result_class(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        procedure: &ProcedureHandle,
+        location: &MemoryLocation,
+        result: ValueId,
+    ) -> ClassSeed {
+        PythonExactResultQuery::default()
+            .resolve(workspace, procedure, |query| {
+                Some(python_memory_load_result_class_in_query(
+                    workspace, procedure, location, result, query,
+                ))
+            })
+            .unwrap_or(ClassSeed::NotApplicable)
     }
 
     fn constant_class(
@@ -2597,7 +8773,11 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
             _ => return ClassSeed::NotApplicable,
         };
         let mut cache = ExternalClassCache::default();
-        external_seed(overlay_of(workspace).as_deref(), name, &mut cache)
+        external_seed(
+            workspace.analyzer().semantic_model_overlay().as_deref(),
+            name,
+            &mut cache,
+        )
     }
 
     fn allocation_class(
@@ -2643,7 +8823,11 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
             _ => return ClassSeed::NotApplicable,
         };
         let mut cache = ExternalClassCache::default();
-        external_seed(overlay_of(workspace).as_deref(), name, &mut cache)
+        external_seed(
+            workspace.analyzer().semantic_model_overlay().as_deref(),
+            name,
+            &mut cache,
+        )
     }
 
     fn member_surface_is_closed(
@@ -2767,7 +8951,11 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
                 }
             };
             let mut cache = ExternalClassCache::default();
-            return external_seed(overlay_of(workspace).as_deref(), name, &mut cache);
+            return external_seed(
+                workspace.analyzer().semantic_model_overlay().as_deref(),
+                name,
+                &mut cache,
+            );
         }
         let declaration = callable
             .named_descendant_for_byte_range(
@@ -2781,66 +8969,49 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
             }
             _ => None,
         };
-        // The grammar wraps the annotation in a `type` node; the expression
-        // inside must be a bare or dotted name. Optional, unions, subscripts,
-        // and quoted annotations declare no single class.
         let Some(type_node) = type_node else {
             return ClassSeed::NotApplicable;
         };
-        let annotation = if type_node.kind() == "type" {
-            let Some(inner) = type_node.named_child(0) else {
-                return ClassSeed::NotApplicable;
-            };
-            inner
-        } else {
-            type_node
+        self.annotation_class_seed(workspace, &file, &prepared, callable, type_node)
+    }
+
+    fn declared_parameter_conditional_origin_is_closed(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        class: &ClassIdentity,
+        origin: &SourceSite,
+    ) -> bool {
+        let ClassIdentity::Workspace(unit) = class else {
+            return false;
         };
-        if !matches!(annotation.kind(), "identifier" | "attribute") {
-            return ClassSeed::NotApplicable;
+        if !self.declared_class_is_closed(workspace, class) {
+            return false;
         }
-        let seed = resolve_class_at_span(
-            workspace,
-            file,
-            SourceSpan::new(
-                crate::analyzer::semantic::SourcePosition::new(
-                    annotation.start_byte() as u32,
-                    annotation.start_position().row as u32,
-                    annotation.start_position().column as u32,
-                ),
-                crate::analyzer::semantic::SourcePosition::new(
-                    annotation.end_byte() as u32,
-                    annotation.end_position().row as u32,
-                    annotation.end_position().column as u32,
-                ),
+        let python = python_analyzer(workspace);
+        let mut hierarchy = vec![unit.clone()];
+        hierarchy.extend(python.get_ancestors(unit));
+        let class_hierarchy = self.class_hierarchy(workspace, class);
+        if hierarchy
+            .iter()
+            .any(|owner| python_class_has_protocol_base(python, owner))
+            || python_class_hierarchy_has_abstract_members(python, unit)
+            || external_hierarchy_has_protocol_or_abstract_members(
+                workspace,
+                &class_hierarchy.ancestors,
             )
-            .expect("a tree-sitter node range is a valid source span"),
-            &prepared,
-        );
-        // An annotation is an upper bound, not an identity: a caller may pass
-        // any subclass, and a subclass declares members the annotated class
-        // does not. Only a class nothing can extend states the runtime class.
-        //
-        // A builtin value class is the exception the model already makes
-        // elsewhere: `str`, `int` and their siblings are subclassable in
-        // principle, and treating an annotation naming one as exact is the
-        // contract `builtin_class_reference` was added to serve. Widening them
-        // here would make that resolution unusable.
-        //
-        // `object` is not one of them. Every class is an `object`, so the
-        // annotation constrains nothing, and reading it as the exact class
-        // would prove every member absent on any value a signature declares
-        // that way -- which `__eq__(self, other: object)` does everywhere.
-        let ClassSeed::Class(class) = seed else {
-            return seed;
+        {
+            return false;
+        }
+        let Some(prepared) = current_indexed_prepared(python, &origin.file) else {
+            return false;
         };
-        if class.qualified_name() == "builtins.object" {
-            return ClassSeed::ClassWithOpenBound(class);
-        }
-        if is_builtin_value_class(&class) || self.declared_class_is_closed(workspace, &class) {
-            ClassSeed::Class(class)
-        } else {
-            ClassSeed::ClassWithOpenBound(class)
-        }
+        let Some((context, annotation)) =
+            declared_parameter_annotation_at_span(&prepared, origin.span)
+        else {
+            return false;
+        };
+        self.annotation_class_seed(workspace, &origin.file, &prepared, context, annotation)
+            == ClassSeed::Class(class.clone())
     }
 
     fn closed_memory_loads(
@@ -3004,12 +9175,98 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
                 self.workspace_member_lookup(workspace, python, unit, member)
             }
             ClassIdentity::External { symbol_id, .. } => {
-                let Some(overlay) = overlay_of(workspace) else {
+                let Some(overlay) = workspace.analyzer().semantic_model_overlay() else {
                     return MemberLookup::Unknown(UnknownReason::ExternalNotModeled);
                 };
                 external_member_lookup(&overlay, symbol_id, member)
             }
         }
+    }
+
+    fn member_lookup_for_receiver(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        query: MemberReceiverQuery<'_>,
+    ) -> MemberLookup {
+        let MemberReceiverQuery {
+            procedure,
+            receiver,
+            call,
+            constructor,
+            class,
+            member,
+        } = query;
+        let exact_receiver_instance = if let ConstructorResultEvidence::Unique(origin) = constructor
+        {
+            origin.classes.contains(class)
+                && self
+                    .exact_result_receiver_is_stable(workspace, procedure, receiver, call, origin)
+        } else {
+            false
+        };
+        let local_identifier_receiver =
+            constructor_receiver_is_local_identifier(workspace, procedure, receiver);
+        let mut lookup = self.member_lookup(workspace, MemberAccessKind::Call, class, member);
+        if exact_receiver_instance
+            && let ClassIdentity::External { symbol_id, .. } = class
+            && let Some(overlay) = workspace.analyzer().semantic_model_overlay()
+        {
+            lookup = external_direct_member_lookup(&overlay, symbol_id, member);
+        }
+        let MemberLookup::Present(hit) = &mut lookup else {
+            return lookup;
+        };
+        let exact_instance = if let ConstructorResultEvidence::Unique(_) = constructor {
+            let closed = match &hit.declaration {
+                // `exact_instance` already proves a unique direct instance
+                // of this exact external class, consumed directly or through
+                // a stable local with no store to the accessed member. The
+                // non-empty declaration came from the active semantic-model
+                // overlay, so this closes only this call's receiver surface;
+                // it does not make the pack's general override claim.
+                MemberDeclaration::External(declaration) => {
+                    let mutation_free =
+                        external_class_member_mutation_free(workspace, class, declaration, member);
+                    !declaration.symbol_ids().is_empty() && mutation_free
+                }
+                MemberDeclaration::Workspace(declaration) => {
+                    workspace_instance_method_surface_is_closed(
+                        workspace,
+                        class,
+                        member,
+                        declaration,
+                    )
+                }
+            };
+            exact_receiver_instance && closed
+        } else {
+            false
+        };
+        if exact_instance {
+            // The constructor-origin and binding checks above establish an
+            // exact receiver for this call, including the no-instance-write
+            // condition. They close only this receiver's dispatch surface.
+            hit.dispatch_coverage = CandidateCoverage::Exhaustive;
+        } else if hit.dispatch_coverage == CandidateCoverage::Exhaustive
+            && match class {
+                ClassIdentity::External { .. } => !is_builtin_value_class(class),
+                // For workspace classes, alter the old class-only answer only
+                // when an identifier receiver carries constructor evidence.
+                // Inline calls such as Good().__init__() have no local binding
+                // whose alias/rebind proof could improve dispatch.
+                ClassIdentity::Workspace(_) => {
+                    local_identifier_receiver
+                        && !matches!(constructor, ConstructorResultEvidence::None)
+                }
+            }
+        {
+            // Non-builtin external-pack surfaces require the exact receiver
+            // proof above. A workspace local that fails it remains open for
+            // aliasing, rebinding, subclassing, or method replacement; other
+            // workspace and builtin-value lookups keep their existing result.
+            hit.dispatch_coverage = CandidateCoverage::Open;
+        }
+        lookup
     }
 
     fn enclosing_class(
@@ -3028,7 +9285,10 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         let unit = match class {
             ClassIdentity::Workspace(unit) => unit,
             ClassIdentity::External { symbol_id, .. } => {
-                return external_class_hierarchy(overlay_of(workspace).as_deref(), symbol_id);
+                return external_class_hierarchy(
+                    workspace.analyzer().semantic_model_overlay().as_deref(),
+                    symbol_id,
+                );
             }
         };
         let python = python_analyzer(workspace);
@@ -3039,7 +9299,7 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
             .map(ClassIdentity::Workspace)
             .collect::<Vec<_>>();
         let mut unresolved_base = false;
-        let overlay = overlay_of(workspace);
+        let overlay = workspace.analyzer().semantic_model_overlay();
         let mut external_cache = ExternalClassCache::default();
         for owner in std::iter::once(unit).chain(workspace_ancestors.iter()) {
             let direct = python.get_direct_ancestors(owner);
@@ -3149,6 +9409,25 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         binding
     }
 
+    fn field_access_may_use_descriptor(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        class: &ClassIdentity,
+        member: &str,
+    ) -> bool {
+        let mro = python_descriptor_mro(workspace, class);
+        mro.iter().any(|owner| match owner {
+            ClassIdentity::Workspace(unit) => {
+                python_workspace_member_may_be_descriptor(self, workspace, unit, member)
+                    != DescriptorAnswer::No
+            }
+            ClassIdentity::External { .. } => {
+                external_member_may_be_descriptor(self, workspace, owner, member)
+                    != DescriptorAnswer::No
+            }
+        })
+    }
+
     fn truthiness_is_pure(&self, workspace: &WorkspaceAnalyzer, class: &ClassIdentity) -> bool {
         if is_builtin_value_class(class) {
             return true;
@@ -3206,6 +9485,110 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
             })
     }
 
+    fn dynamic_write_receiver_bound(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        procedure: &ProcedureHandle,
+        write_span: SourceSpan,
+    ) -> Option<ClassIdentity> {
+        let semantics = procedure.semantics();
+        let file = file_for_locator(workspace, semantics.locator())?;
+        let prepared = prepared_for_procedure(workspace, procedure, &file).ok()?;
+        let callable = node_at_span(&prepared, semantics.locator().anchor().span())?;
+        let write = node_at_span(&prepared, write_span)?;
+        let receiver = python_dynamic_write_receiver(write, prepared.source())?;
+        let layout =
+            formal_parameter_slots_for_owner(Language::Python, callable, prepared.source())?;
+        let method_has_receiver =
+            matches!(
+                semantics.kind(),
+                ProcedureKind::Method | ProcedureKind::Constructor
+            ) && !matches!(layout.python_binding, Some(PythonMethodBinding::Static));
+        let first_parameter = method_has_receiver
+            .then(|| python_first_parameter_name(callable, prepared.source()))
+            .flatten();
+
+        let method_bound = python_dynamic_write_method_receiver_bound(
+            self,
+            workspace,
+            procedure,
+            &prepared,
+            receiver,
+            method_has_receiver,
+            first_parameter.as_deref(),
+        );
+        let parameter_bound = python_dynamic_write_parameter_bound(
+            self, workspace, &file, &prepared, callable, receiver,
+        );
+        let stored_bound = python_dynamic_write_stored_type_field_bound(
+            self, workspace, &file, &prepared, procedure, callable, receiver,
+        );
+        let iteration_bound = python_dynamic_write_iteration_element_bound(
+            self, workspace, procedure, callable, &file, &prepared, receiver,
+        );
+        method_bound
+            .or(parameter_bound)
+            .or(stored_bound)
+            .or(iteration_bound)
+    }
+
+    fn dynamic_write_receiver_field(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        procedure: &ProcedureHandle,
+        write_span: SourceSpan,
+    ) -> Option<(ClassIdentity, Box<str>)> {
+        let semantics = procedure.semantics();
+        let file = file_for_locator(workspace, semantics.locator())?;
+        let prepared = prepared_for_procedure(workspace, procedure, &file).ok()?;
+        let callable = node_at_span(&prepared, semantics.locator().anchor().span())?;
+        let write = node_at_span(&prepared, write_span)?;
+        let receiver = python_dynamic_write_receiver(write, prepared.source())?;
+        python_dynamic_write_receiver_field(
+            self, workspace, procedure, callable, &prepared, receiver,
+        )
+    }
+
+    fn field_store_value_bounds(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        file: &ProjectFile,
+        span: SourceSpan,
+        member: &str,
+    ) -> Result<Option<Vec<ClassIdentity>>, UnknownReason> {
+        let python = python_analyzer(workspace);
+        let prepared =
+            current_indexed_prepared(python, file).ok_or(UnknownReason::UncertainFlow)?;
+        python_field_store_value_bounds(self, workspace, file, &prepared, span, member)
+    }
+
+    fn dynamic_write_receiver_is_explicitly_unbounded(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        procedure: &ProcedureHandle,
+        write_span: SourceSpan,
+    ) -> bool {
+        let semantics = procedure.semantics();
+        let Some(file) = file_for_locator(workspace, semantics.locator()) else {
+            return false;
+        };
+        let Ok(prepared) = prepared_for_procedure(workspace, procedure, &file) else {
+            return false;
+        };
+        let Some(callable) = node_at_span(&prepared, semantics.locator().anchor().span()) else {
+            return false;
+        };
+        let Some(write) = node_at_span(&prepared, write_span) else {
+            return false;
+        };
+        let Some(receiver) = python_dynamic_write_receiver(write, prepared.source()) else {
+            return false;
+        };
+        python_dynamic_write_parameter_is_explicitly_unbounded(
+            workspace, &file, &prepared, callable, receiver,
+        )
+    }
+
     fn dynamic_field_writes(
         &self,
         workspace: &WorkspaceAnalyzer,
@@ -3213,7 +9596,8 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
     ) -> Vec<DynamicFieldWrite> {
         let semantics = procedure.semantics();
         let Some(file) = file_for_locator(workspace, semantics.locator()) else {
-            return vec![DynamicFieldWrite::Any {
+            return vec![DynamicFieldWrite::Scoped {
+                names: DynamicFieldNameSet::Any,
                 receiver: None,
                 span: semantics.locator().anchor().span(),
             }];
@@ -3221,14 +9605,16 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         let prepared = match prepared_for_procedure(workspace, procedure, &file) {
             Ok(prepared) => prepared,
             Err(_) => {
-                return vec![DynamicFieldWrite::Any {
+                return vec![DynamicFieldWrite::Scoped {
+                    names: DynamicFieldNameSet::Any,
                     receiver: None,
                     span: semantics.locator().anchor().span(),
                 }];
             }
         };
         let Some(callable) = node_at_span(&prepared, semantics.locator().anchor().span()) else {
-            return vec![DynamicFieldWrite::Any {
+            return vec![DynamicFieldWrite::Scoped {
+                names: DynamicFieldNameSet::Any,
                 receiver: None,
                 span: semantics.locator().anchor().span(),
             }];
@@ -3245,13 +9631,13 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
             {
                 continue;
             }
-            if let Some(write) = dynamic_call_write(node, prepared.source()) {
+            if let Some(write) = dynamic_call_write_for_field(workspace, &file, node, &prepared) {
                 writes.push(scoped_dynamic_write(
                     workspace, procedure, node, write, &prepared,
                 ));
             }
             if matches!(node.kind(), "assignment" | "augmented_assignment")
-                && let Some(write) = dictionary_write(node, prepared.source())
+                && let Some(write) = dictionary_write_for_field(workspace, &file, node, &prepared)
             {
                 writes.push(DynamicFieldWrite::Member("__dict__".into()));
                 writes.push(scoped_dynamic_write(
@@ -3262,6 +9648,90 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
             stack.extend(node.named_children(&mut cursor));
         }
         writes
+    }
+
+    fn dynamic_type_write_receiver_bounds(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        procedure: &ProcedureHandle,
+        receiver: ValueId,
+        write_span: SourceSpan,
+    ) -> Result<Option<Vec<ClassIdentity>>, UnknownReason> {
+        let semantics = procedure.semantics();
+        let Some(file) = file_for_locator(workspace, semantics.locator()) else {
+            return Err(UnknownReason::UncertainFlow);
+        };
+        let prepared = prepared_for_procedure(workspace, procedure, &file)?;
+        let Some(receiver_expression) =
+            dynamic_write_receiver_expression(procedure, &prepared, receiver, write_span)
+        else {
+            return Ok(None);
+        };
+        let Some(scope) = node_at_span(&prepared, semantics.locator().anchor().span()) else {
+            return Err(UnknownReason::UncertainFlow);
+        };
+        Ok(
+            runtime_created_type_expression(
+                workspace,
+                &file,
+                &prepared,
+                scope,
+                receiver_expression,
+            )
+            .then(Vec::new),
+        )
+    }
+
+    fn non_escaping_nested_write_receiver_bounds(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        procedure: &ProcedureHandle,
+        receiver: ValueId,
+        write_span: SourceSpan,
+    ) -> Result<Option<Vec<ClassIdentity>>, UnknownReason> {
+        let semantics = procedure.semantics();
+        let Some(file) = file_for_locator(workspace, semantics.locator()) else {
+            return Err(UnknownReason::UncertainFlow);
+        };
+        let prepared = prepared_for_procedure(workspace, procedure, &file)?;
+        let Some(receiver_expression) =
+            dynamic_write_receiver_expression(procedure, &prepared, receiver, write_span)
+        else {
+            return Ok(None);
+        };
+        let Some(helper) = enclosing_function_definition(receiver_expression) else {
+            return Ok(None);
+        };
+        let Some((positional_ordinal, parameter_name, keyword_only)) =
+            nested_receiver_parameter(helper, receiver_expression, prepared.source())
+        else {
+            return Ok(None);
+        };
+        let Some(parent) = helper.parent() else {
+            return Ok(None);
+        };
+        let Some(outer) = enclosing_function_definition(parent) else {
+            return Ok(None);
+        };
+        let calls = nested_helper_direct_calls(outer, helper, prepared.source())?;
+        let mut bounds = Vec::new();
+        for call in calls {
+            let argument = nested_helper_argument_expression(
+                call,
+                &parameter_name,
+                positional_ordinal,
+                keyword_only,
+                prepared.source(),
+            )?;
+            for class in expression_dynamic_receiver_bounds(
+                self, workspace, &file, &prepared, outer, argument,
+            )? {
+                if !bounds.contains(&class) {
+                    bounds.push(class);
+                }
+            }
+        }
+        Ok(Some(bounds))
     }
 
     fn narrowing_verdicts(
@@ -3284,7 +9754,7 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
                     Ok(classes) => classes,
                     Err(reason) => return vec![NarrowingVerdict::Incomplete(reason); atoms.len()],
                 };
-                let overlay = overlay_of(workspace);
+                let overlay = workspace.analyzer().semantic_model_overlay();
                 for class in &classes {
                     if !self.guard_classes_have_supported_instance_checks(
                         workspace,
@@ -3346,7 +9816,7 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
                 // classes or it is not. The named classes must still be the
                 // classes the source spells, which is the same proof
                 // `isinstance` needs of them.
-                let overlay = overlay_of(workspace);
+                let overlay = workspace.analyzer().semantic_model_overlay();
                 for class in &classes {
                     if !self.guard_classes_have_supported_instance_checks(
                         workspace,
@@ -3453,7 +9923,7 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         // The same proof `narrowing_verdicts` needs of a guard's operands:
         // the names must denote the classes the source spells before either
         // arm may act on them.
-        let overlay = overlay_of(workspace);
+        let overlay = workspace.analyzer().semantic_model_overlay();
         if !self.guard_classes_have_supported_instance_checks(
             workspace,
             &classes,
@@ -3809,8 +10279,9 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
                 else {
                     return true;
                 };
-                let expected = overlay.member_target_on_owner(modeled_owner.id.as_str(), required);
-                let [expected] = expected.records.as_slice() else {
+                let Some(expected) =
+                    python_external_member_declaration(overlay, &modeled_owner.id, required)
+                else {
                     return true;
                 };
                 let [actual_id] = required_declaration.symbol_ids() else {
@@ -3877,6 +10348,266 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DescriptorAnswer {
+    No,
+    Yes,
+    Unknown,
+}
+
+fn python_descriptor_mro(
+    workspace: &WorkspaceAnalyzer,
+    class: &ClassIdentity,
+) -> Vec<ClassIdentity> {
+    let ClassIdentity::Workspace(unit) = class else {
+        return vec![class.clone()];
+    };
+    let python = python_analyzer(workspace);
+    let workspace_ancestors = python.get_ancestors(unit);
+    let overlay = workspace.analyzer().semantic_model_overlay();
+    let mut external_cache = ExternalClassCache::default();
+    let mut mro = vec![class.clone()];
+    mro.extend(
+        workspace_ancestors
+            .iter()
+            .cloned()
+            .map(ClassIdentity::Workspace),
+    );
+    for owner in std::iter::once(unit).chain(workspace_ancestors.iter()) {
+        let direct = python.get_direct_ancestors(owner);
+        for raw in python.inner.raw_supertypes_of(owner) {
+            if direct
+                .iter()
+                .any(|ancestor| ancestor.terminal_name() == raw || ancestor.fq_name_str() == raw)
+            {
+                continue;
+            }
+            match exact_external_base(python, owner, overlay.as_deref(), &raw, &mut external_cache)
+            {
+                Some(identity) if !mro.contains(&identity) => mro.push(identity),
+                Some(_) => {}
+                None if python_typing_marker_base(python, owner, &raw) => {}
+                // An unresolved base is not evidence that this member is a
+                // descriptor. Keep checking the receiver and every resolved
+                // ancestor; other hierarchy uncertainty remains represented
+                // by the field-slot survey itself.
+                None => {}
+            }
+        }
+    }
+    mro
+}
+
+#[derive(Clone, Copy)]
+enum ClassMemberAssignment<'tree> {
+    NotMember,
+    AnnotationOnly,
+    Value(Node<'tree>),
+    Unknown,
+}
+
+fn python_class_member_assignment<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    member: &str,
+) -> ClassMemberAssignment<'tree> {
+    let node = if node.kind() == "expression_statement" {
+        let Some(expression) = node.named_child(0) else {
+            return ClassMemberAssignment::NotMember;
+        };
+        expression
+    } else {
+        node
+    };
+    if !matches!(
+        node.kind(),
+        "assignment" | "annotated_assignment" | "augmented_assignment"
+    ) {
+        return ClassMemberAssignment::NotMember;
+    }
+    let Some(left) = node.child_by_field_name("left") else {
+        return ClassMemberAssignment::Unknown;
+    };
+    if left.kind() != "identifier" || left.utf8_text(source.as_bytes()).ok() != Some(member) {
+        return ClassMemberAssignment::NotMember;
+    }
+    if node.kind() == "augmented_assignment" {
+        return ClassMemberAssignment::Unknown;
+    }
+    let value = node
+        .child_by_field_name("right")
+        .or_else(|| node.child_by_field_name("value"));
+    match (node.kind(), value) {
+        ("annotated_assignment", None) => ClassMemberAssignment::AnnotationOnly,
+        (_, Some(value)) => ClassMemberAssignment::Value(value),
+        _ => ClassMemberAssignment::Unknown,
+    }
+}
+
+fn python_workspace_member_may_be_descriptor(
+    adapter: &PythonTypeFlowAdapter,
+    workspace: &WorkspaceAnalyzer,
+    unit: &CodeUnit,
+    member: &str,
+) -> DescriptorAnswer {
+    let python = python_analyzer(workspace);
+    let Some(prepared) = current_indexed_prepared(python, unit.source()) else {
+        return DescriptorAnswer::Unknown;
+    };
+    let Some(class) = class_node_for_unit(python, &prepared, unit) else {
+        return DescriptorAnswer::Unknown;
+    };
+    let Some(body) = class.child_by_field_name("body") else {
+        return DescriptorAnswer::Unknown;
+    };
+    let mut unresolved = false;
+    let mut cursor = body.walk();
+    for child in body.named_children(&mut cursor) {
+        if definition_name(child, prepared.source()) == Some(member) {
+            match child.kind() {
+                "function_definition" => {}
+                "decorated_definition" => {
+                    let mut cursor = child.walk();
+                    let function = child
+                        .named_children(&mut cursor)
+                        .find(|node| node.kind() == "function_definition");
+                    if function.is_some_and(|function| {
+                        python_function_has_property_decorator(function, prepared.source())
+                    }) {
+                        return DescriptorAnswer::Yes;
+                    }
+                    unresolved = true;
+                }
+                _ => unresolved = true,
+            }
+        }
+        match python_class_member_assignment(child, prepared.source(), member) {
+            ClassMemberAssignment::NotMember | ClassMemberAssignment::AnnotationOnly => {}
+            ClassMemberAssignment::Unknown => unresolved = true,
+            ClassMemberAssignment::Value(value) => {
+                match python_value_may_be_descriptor(
+                    adapter,
+                    workspace,
+                    unit.source().clone(),
+                    &prepared,
+                    value,
+                ) {
+                    DescriptorAnswer::No => {}
+                    DescriptorAnswer::Yes => return DescriptorAnswer::Yes,
+                    DescriptorAnswer::Unknown => unresolved = true,
+                }
+            }
+        }
+    }
+    if unresolved {
+        DescriptorAnswer::Unknown
+    } else {
+        DescriptorAnswer::No
+    }
+}
+
+fn python_value_may_be_descriptor(
+    adapter: &PythonTypeFlowAdapter,
+    workspace: &WorkspaceAnalyzer,
+    file: ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    value: Node<'_>,
+) -> DescriptorAnswer {
+    if value.kind() == "call" {
+        let Some(function) = value.child_by_field_name("function") else {
+            return DescriptorAnswer::Unknown;
+        };
+        return match resolved_class_bounds(resolve_class_at_span(
+            workspace,
+            file,
+            span_for_node(function),
+            prepared,
+        )) {
+            Some(classes) if !classes.is_empty() => {
+                let mut unresolved = false;
+                for class in classes {
+                    match class_may_define_descriptor(adapter, workspace, &class) {
+                        DescriptorAnswer::Yes => return DescriptorAnswer::Yes,
+                        DescriptorAnswer::Unknown => unresolved = true,
+                        DescriptorAnswer::No => {}
+                    }
+                }
+                if unresolved {
+                    DescriptorAnswer::Unknown
+                } else {
+                    DescriptorAnswer::No
+                }
+            }
+            _ => DescriptorAnswer::Unknown,
+        };
+    }
+    if matches!(
+        value.kind(),
+        "string"
+            | "concatenated_string"
+            | "integer"
+            | "float"
+            | "true"
+            | "false"
+            | "none"
+            | "list"
+            | "dictionary"
+            | "set"
+            | "tuple"
+    ) {
+        DescriptorAnswer::No
+    } else {
+        DescriptorAnswer::Unknown
+    }
+}
+
+fn class_may_define_descriptor(
+    adapter: &PythonTypeFlowAdapter,
+    workspace: &WorkspaceAnalyzer,
+    class: &ClassIdentity,
+) -> DescriptorAnswer {
+    if let ClassIdentity::Workspace(unit) = class {
+        let python = python_analyzer(workspace);
+        let Some(prepared) = current_indexed_prepared(python, unit.source()) else {
+            return DescriptorAnswer::Unknown;
+        };
+        let Some(class_node) = class_node_for_unit(python, &prepared, unit) else {
+            return DescriptorAnswer::Unknown;
+        };
+        if class_node
+            .parent()
+            .is_some_and(|parent| parent.kind() == "decorated_definition")
+        {
+            return DescriptorAnswer::Unknown;
+        }
+    }
+    let mut unresolved = false;
+    for hook in ["__get__", "__set__"] {
+        match adapter.member_lookup(workspace, MemberAccessKind::Load, class, hook) {
+            MemberLookup::Present(_) => return DescriptorAnswer::Yes,
+            MemberLookup::Absent | MemberLookup::DeclarationAbsent => {}
+            MemberLookup::Unknown(_) => unresolved = true,
+        }
+    }
+    if unresolved {
+        DescriptorAnswer::Unknown
+    } else {
+        DescriptorAnswer::No
+    }
+}
+
+fn external_member_may_be_descriptor(
+    adapter: &PythonTypeFlowAdapter,
+    workspace: &WorkspaceAnalyzer,
+    class: &ClassIdentity,
+    member: &str,
+) -> DescriptorAnswer {
+    match adapter.member_lookup(workspace, MemberAccessKind::Load, class, member) {
+        MemberLookup::Present(_) | MemberLookup::Unknown(_) => DescriptorAnswer::Unknown,
+        MemberLookup::Absent | MemberLookup::DeclarationAbsent => DescriptorAnswer::No,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -3884,13 +10615,143 @@ mod tests {
         workspace_class_uses_ordinary_metaclass,
     };
     use crate::analyzer::semantic::{
-        CancellationToken, ClassIdentity, ClassSeed, ProcedureKind, SemanticBudget,
-        SemanticRequest, TypeFlowAdapter, UnknownReason,
+        CancellationToken, ClassIdentity, ClassSeed, DynamicFieldNameSet, DynamicFieldWrite,
+        ProcedureKind, SemanticBudget, SemanticRequest, TypeFlowAdapter, UnknownReason,
     };
     use crate::analyzer::{AnalyzerConfig, CodeUnitIndex, Language, resolve_analyzer};
     use crate::inline_project::InlineTestProject;
 
     #[test]
+    fn descriptor_setter_dynamic_write_retains_its_receiver() {
+        let source = "from __future__ import annotations\nclass Observable:\n    def __set__(self, instance: HasEmitters, value):\n        setattr(instance, self.private_name, value)\nclass HasEmitters:\n    pass\n";
+        let project = InlineTestProject::with_language(Language::Python)
+            .file("app.py", source)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let file = project.file("app.py");
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("Python semantic materialization succeeds")
+            .available_value()
+            .cloned()
+            .expect("Python semantic artifact is available");
+        let procedure = artifact
+            .procedures()
+            .iter()
+            .filter_map(|procedure| artifact.procedure_handle(procedure.id()))
+            .find(|procedure| {
+                procedure
+                    .semantics()
+                    .locator()
+                    .anchor()
+                    .span()
+                    .start()
+                    .line()
+                    == 2
+            })
+            .expect("fixture has the descriptor setter procedure");
+        let writes = PythonTypeFlowAdapter.dynamic_field_writes(&workspace, &procedure);
+        assert_eq!(writes.len(), 1, "{writes:?}");
+        assert!(
+            matches!(
+                writes.as_slice(),
+                [DynamicFieldWrite::Scoped {
+                    names: DynamicFieldNameSet::Any,
+                    receiver: Some(_),
+                    ..
+                }]
+            ),
+            "the dynamic write keeps its unknown name and explicit instance receiver: {writes:?}"
+        );
+        let DynamicFieldWrite::Scoped { span, .. } = &writes[0] else {
+            unreachable!();
+        };
+        let bound =
+            PythonTypeFlowAdapter.dynamic_write_receiver_bound(&workspace, &procedure, *span);
+        assert_eq!(
+            bound.as_ref().map(ClassIdentity::qualified_name),
+            Some("app.HasEmitters"),
+            "the postponed annotation resolves to its forward-declared workspace class"
+        );
+    }
+
+    #[test]
+    fn generic_iteration_receiver_resolves_type_checking_import_bound() {
+        let agent = "class Agent:\n    pass\n";
+        let agentset = "from __future__ import annotations\nfrom collections.abc import Iterator\nfrom typing import TYPE_CHECKING\n\nif TYPE_CHECKING:\n    from mesa.agent import Agent\n\nclass AgentSet[A: Agent]:\n    def __iter__(self) -> Iterator[A]:\n        return iter(())\n\n    def set(self, name, value):\n        for agent in self:\n            setattr(agent, name, value)\n";
+        let project = InlineTestProject::with_language(Language::Python)
+            .file("mesa/__init__.py", "")
+            .file("mesa/agent.py", agent)
+            .file("mesa/agentset.py", agentset)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let file = project.file("mesa/agentset.py");
+        let python = super::python_analyzer(&workspace);
+        let prepared = super::current_indexed_prepared(python, &file).unwrap();
+        let root = prepared.tree().root_node();
+        let mut root_cursor = root.walk();
+        let class = root
+            .named_children(&mut root_cursor)
+            .find(|node| {
+                node.kind() == "class_definition"
+                    && node
+                        .child_by_field_name("name")
+                        .and_then(|name| name.utf8_text(prepared.source().as_bytes()).ok())
+                        == Some("AgentSet")
+            })
+            .unwrap();
+        let type_parameter = class
+            .child_by_field_name("type_parameters")
+            .and_then(|parameters| parameters.named_child(0))
+            .unwrap();
+        let (_, bound) =
+            super::python_type_parameter_declaration(type_parameter, prepared.source()).unwrap();
+        let bound = bound.unwrap();
+        let candidate =
+            super::python_workspace_class_candidate(&workspace, &file, &prepared, bound);
+        assert_eq!(
+            candidate.as_ref().map(ClassIdentity::qualified_name),
+            Some("mesa.agent.Agent"),
+            "the TYPE_CHECKING import resolves the generic upper bound"
+        );
+        let iterator = class
+            .child_by_field_name("body")
+            .and_then(|body| {
+                let mut cursor = body.walk();
+                body.named_children(&mut cursor).find(|node| {
+                    node.kind() == "function_definition"
+                        && node
+                            .child_by_field_name("name")
+                            .and_then(|name| name.utf8_text(prepared.source().as_bytes()).ok())
+                            == Some("__iter__")
+                })
+            })
+            .unwrap();
+        let return_type = iterator.child_by_field_name("return_type").unwrap();
+        let (_, element_type) = super::python_first_generic_type_argument(return_type).unwrap();
+        assert!(matches!(
+            super::python_type_variable_bound_seed(
+                &workspace,
+                &file,
+                &prepared,
+                class,
+                element_type
+            ),
+            Some(ClassSeed::ClassWithOpenBound(ClassIdentity::Workspace(ref class)))
+                if class.fq_name_str() == "mesa.agent.Agent"
+        ));
+    }
+
+    use brokk_bifrost_test_macros::hardwon;
+    #[test]
+    #[hardwon(
+        "#3531: Memoized builtin-shadow answers must follow exact prepared-source identity, module versus function scope, and local shadowing"
+    )]
     fn builtin_shadow_memo_keeps_source_and_reference_identity() {
         let project = InlineTestProject::with_language(Language::Python)
             .file("open.py", "pass         \nclass C(list):\n    pass\n")
@@ -3948,6 +10809,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#3531: An exhausted or cancelled syntax walk must not poison the later funded memo answer"
+    )]
     fn builtin_shadow_memo_retries_exhaustion_and_respects_cancellation() {
         let project = InlineTestProject::with_language(Language::Python)
             .file("app.py", "class C(list):\n    pass\n")
@@ -4002,6 +10866,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#3531: A memo is reused within one analyzer query, discarded on cancellation, and recreated for the next query scope"
+    )]
     fn builtin_shadow_answers_are_reused_only_inside_the_active_query() {
         let project = InlineTestProject::with_language(Language::Python)
             .file("app.py", "class C(list):\n    pass\n")
@@ -4289,6 +11156,107 @@ mod tests {
     }
 
     #[test]
+    fn shared_instance_guard_requires_identity_for_workspace_decorators() {
+        let project = InlineTestProject::with_language(Language::Python)
+            .file(
+                "app.py",
+                "class Plain:\n    pass\n\nclass Actual:\n    pass\n\ndef replace(cls):\n    return Actual\n\n@replace\nclass Replaced:\n    def foo(self):\n        pass\n",
+            )
+            .build();
+        let file = project.file("app.py");
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let python = resolve_analyzer::<PythonAnalyzer>(workspace.analyzer())
+            .expect("workspace has the Python analyzer");
+        let class_named = |name: &str| {
+            python
+                .top_level_declarations(&file)
+                .into_iter()
+                .find(|unit| unit.is_class() && unit.short_name() == name)
+                .unwrap_or_else(|| panic!("missing class declaration {name}"))
+        };
+        let adapter = PythonTypeFlowAdapter;
+
+        let plain = ClassIdentity::Workspace(class_named("Plain"));
+        assert!(
+            adapter.guard_classes_have_supported_instance_checks(
+                &workspace,
+                std::slice::from_ref(&plain),
+                None,
+            ),
+            "an undecorated ordinary workspace class remains a supported guard class",
+        );
+
+        let replaced = ClassIdentity::Workspace(class_named("Replaced"));
+        assert!(
+            !adapter.guard_classes_have_supported_instance_checks(
+                &workspace,
+                std::slice::from_ref(&replaced),
+                None,
+            ),
+            "an unreviewed workspace decorator cannot establish class identity",
+        );
+        assert!(
+            !workspace_class_uses_ordinary_metaclass(
+                &workspace,
+                python,
+                match &replaced {
+                    ClassIdentity::Workspace(owner) => owner,
+                    ClassIdentity::External { .. } => unreachable!(),
+                },
+                None,
+            ),
+            "the shared guard and its class proof reject the replacing decorator",
+        );
+    }
+
+    #[test]
+    fn quoted_descriptor_setter_resolves_its_forward_receiver_class() {
+        let source = "class Observable:\n    def __set__(self, instance: \"HasEmitters\", value):\n        setattr(instance, self.private_name, value)\nclass HasEmitters:\n    pass\n";
+        let project = InlineTestProject::with_language(Language::Python)
+            .file("app.py", source)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let file = project.file("app.py");
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("Python semantic materialization succeeds")
+            .available_value()
+            .cloned()
+            .expect("Python semantic artifact is available");
+        let procedure = artifact
+            .procedures()
+            .iter()
+            .filter_map(|procedure| artifact.procedure_handle(procedure.id()))
+            .find(|procedure| {
+                procedure
+                    .semantics()
+                    .locator()
+                    .anchor()
+                    .span()
+                    .start()
+                    .line()
+                    == 1
+            })
+            .expect("fixture has the descriptor setter procedure");
+        let writes = PythonTypeFlowAdapter.dynamic_field_writes(&workspace, &procedure);
+        let [DynamicFieldWrite::Scoped { span, .. }] = writes.as_slice() else {
+            panic!("the quoted descriptor keeps its explicit receiver: {writes:?}");
+        };
+        let bound =
+            PythonTypeFlowAdapter.dynamic_write_receiver_bound(&workspace, &procedure, *span);
+        assert_eq!(
+            bound.as_ref().map(ClassIdentity::qualified_name),
+            Some("app.HasEmitters"),
+            "the quoted annotation resolves to its forward-declared workspace class"
+        );
+    }
+
+    #[test]
     fn constructed_class_uses_whole_dotted_callee_and_rejects_namespace_rebinding() {
         for (consumer, expected) in [
             (
@@ -4350,62 +11318,11 @@ mod tests {
                     };
                     assert_eq!(class.qualified_name(), expected);
                 }
-                None => assert_eq!(seed, ClassSeed::NotApplicable),
+                None => assert!(matches!(
+                    seed,
+                    ClassSeed::NotApplicable | ClassSeed::Unknown(_)
+                )),
             }
         }
-    }
-
-    #[test]
-    fn shared_instance_guard_requires_identity_for_workspace_decorators() {
-        let project = InlineTestProject::with_language(Language::Python)
-            .file(
-                "app.py",
-                "class Plain:\n    pass\n\nclass Actual:\n    pass\n\ndef replace(cls):\n    return Actual\n\n@replace\nclass Replaced:\n    def foo(self):\n        pass\n",
-            )
-            .build();
-        let file = project.file("app.py");
-        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
-        let python = resolve_analyzer::<PythonAnalyzer>(workspace.analyzer())
-            .expect("workspace has the Python analyzer");
-        let class_named = |name: &str| {
-            python
-                .top_level_declarations(&file)
-                .into_iter()
-                .find(|unit| unit.is_class() && unit.short_name() == name)
-                .unwrap_or_else(|| panic!("missing class declaration {name}"))
-        };
-        let adapter = PythonTypeFlowAdapter;
-
-        let plain = ClassIdentity::Workspace(class_named("Plain"));
-        assert!(
-            adapter.guard_classes_have_supported_instance_checks(
-                &workspace,
-                std::slice::from_ref(&plain),
-                None,
-            ),
-            "an undecorated ordinary workspace class remains a supported guard class",
-        );
-
-        let replaced = ClassIdentity::Workspace(class_named("Replaced"));
-        assert!(
-            !adapter.guard_classes_have_supported_instance_checks(
-                &workspace,
-                std::slice::from_ref(&replaced),
-                None,
-            ),
-            "an unreviewed workspace decorator cannot establish class identity",
-        );
-        assert!(
-            !workspace_class_uses_ordinary_metaclass(
-                &workspace,
-                python,
-                match &replaced {
-                    ClassIdentity::Workspace(owner) => owner,
-                    ClassIdentity::External { .. } => unreachable!(),
-                },
-                None,
-            ),
-            "the shared guard and its class proof reject the replacing decorator",
-        );
     }
 }

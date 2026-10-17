@@ -1,6 +1,9 @@
 use super::*;
+use crate::analyzer::cache_weight::{estimate_code_unit, estimate_project_file};
+use crate::analyzer::weighted_cache::{build_weighted_cache, weight_bytes};
 use crate::analyzer::{
     DescendantIndexVariant, DirectDescendantIndex, KeyedPoolSafeMemo, PoolSafeMemo,
+    estimate_collection_bytes,
 };
 use moka::sync::Cache;
 use std::mem::size_of;
@@ -36,17 +39,17 @@ impl JavaMemoCaches {
     pub(super) fn new(budget_bytes: u64) -> Self {
         Self {
             budget_bytes,
-            resolved_imports: Self::build_cache(budget_bytes / 4, weight_import_map),
-            source_facts: Self::build_cache(
+            resolved_imports: build_weighted_cache(budget_bytes / 4, weight_import_map),
+            source_facts: build_weighted_cache(
                 budget_bytes / 8,
                 |_, value: &Arc<brokk_bifrost_jvm::java::source_facts::JavaFileSourceFacts>| {
                     u32::try_from(value.estimated_retained_bytes()).unwrap_or(u32::MAX)
                 },
             ),
-            package_names: Self::build_cache(budget_bytes / 16, weight_package_name),
-            referencing_files: Self::build_cache(budget_bytes / 8, weight_project_file_set),
-            relevant_imports: Self::build_cache(budget_bytes / 8, weight_string_set),
-            direct_ancestors: Self::build_cache(budget_bytes / 8, weight_code_unit_vec),
+            package_names: build_weighted_cache(budget_bytes / 16, weight_package_name),
+            referencing_files: build_weighted_cache(budget_bytes / 8, weight_project_file_set),
+            relevant_imports: build_weighted_cache(budget_bytes / 8, weight_string_set),
+            direct_ancestors: build_weighted_cache(budget_bytes / 8, weight_code_unit_vec),
             direct_descendant_index: KeyedPoolSafeMemo::new(),
             reverse_import_index: PoolSafeMemo::new(),
             same_package_reference_index: PoolSafeMemo::new(),
@@ -55,21 +58,6 @@ impl JavaMemoCaches {
 
     pub(super) fn budget_bytes(&self) -> u64 {
         self.budget_bytes
-    }
-
-    fn build_cache<K, V>(
-        budget_bytes: u64,
-        weigher: impl Fn(&K, &V) -> u32 + Send + Sync + 'static,
-    ) -> Cache<K, V>
-    where
-        K: Clone + Eq + std::hash::Hash + Send + Sync + 'static,
-        V: Clone + Send + Sync + 'static,
-    {
-        let capacity = budget_bytes.max(1);
-        Cache::builder()
-            .max_capacity(capacity)
-            .weigher(weigher)
-            .build()
     }
 }
 
@@ -93,28 +81,6 @@ fn weight_code_unit_vec(key: &CodeUnit, value: &Arc<Vec<CodeUnit>>) -> u32 {
     weight_bytes(estimate_code_unit(key) + estimate_code_unit_vec(value.as_ref()))
 }
 
-fn weight_bytes(bytes: u64) -> u32 {
-    bytes.clamp(1, u32::MAX as u64) as u32
-}
-
-fn estimate_path(path: &std::path::Path) -> u64 {
-    path.as_os_str().to_string_lossy().len() as u64
-}
-
-fn estimate_project_file(file: &ProjectFile) -> u64 {
-    size_of::<ProjectFile>() as u64 + estimate_path(file.root()) + estimate_path(file.rel_path())
-}
-
-fn estimate_code_unit(code_unit: &CodeUnit) -> u64 {
-    size_of::<CodeUnit>() as u64
-        + estimate_project_file(code_unit.source())
-        + code_unit.package_name().len() as u64
-        + code_unit.short_name().len() as u64
-        + code_unit
-            .signature()
-            .map_or(0, |signature| signature.len() as u64)
-}
-
 fn estimate_import_map(imports: &HashMap<String, CodeUnit>) -> u64 {
     size_of::<HashMap<String, CodeUnit>>() as u64
         + imports
@@ -128,9 +94,15 @@ fn estimate_project_file_set(files: &HashSet<ProjectFile>) -> u64 {
 }
 
 fn estimate_string_set(values: &HashSet<String>) -> u64 {
-    size_of::<HashSet<String>>() as u64 + values.iter().map(|value| value.len() as u64).sum::<u64>()
+    estimate_collection_bytes(size_of::<HashSet<String>>() as u64, values, |value| {
+        value.len() as u64
+    })
 }
 
 fn estimate_code_unit_vec(values: &[CodeUnit]) -> u64 {
-    size_of::<Vec<CodeUnit>>() as u64 + values.iter().map(estimate_code_unit).sum::<u64>()
+    estimate_collection_bytes(
+        size_of::<Vec<CodeUnit>>() as u64,
+        values,
+        estimate_code_unit,
+    )
 }

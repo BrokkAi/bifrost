@@ -1,6 +1,11 @@
 use brokk_bifrost_core::analyzer::ProjectFile;
+use brokk_bifrost_core::analyzer::common::collapse_whitespace;
 use brokk_bifrost_core::analyzer::model::{TestAssertionSmell, TestAssertionWeights};
 use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
+use brokk_bifrost_core::analyzer::test_assertions::{
+    CommonTestAssertionKind, TestAssertionSignal, append_test_assertion_findings,
+    classify_common_test_assertion, is_common_assertion_literal, normalize_assertion_expression,
+};
 use brokk_bifrost_core::hash::HashSet;
 use regex::Regex;
 use std::sync::LazyLock;
@@ -67,52 +72,28 @@ fn analyze_php_test_case(
     weights: &TestAssertionWeights,
     out: &mut Vec<TestAssertionSmell>,
 ) {
-    let assertions = collect_php_assertions(body, weights);
-    let assertion_count = assertions.len() as i32;
     let symbol = format!("{}::{}", file, name);
-
-    if assertion_count == 0 {
-        out.push(TestAssertionSmell {
-            file: file.clone(),
-            enclosing_fq_name: symbol,
-            assertion_kind: "no-assertions".to_string(),
-            score: weights.no_assertion_weight,
-            assertion_count: 0,
-            reasons: vec!["no-assertions".to_string()],
-            excerpt: compact_php_excerpt(body),
-            start_byte,
-        });
-        return;
-    }
-
-    for assertion in &assertions {
-        if assertion.score <= 0 {
-            continue;
-        }
-        out.push(TestAssertionSmell {
-            file: file.clone(),
-            enclosing_fq_name: symbol.clone(),
-            assertion_kind: assertion.kind.clone(),
+    let assertions: Vec<_> = collect_php_assertions(body, weights)
+        .into_iter()
+        .map(|assertion| TestAssertionSignal {
+            kind: assertion.kind,
             score: assertion.score,
-            assertion_count,
-            reasons: vec![assertion.reason.clone()],
-            excerpt: assertion.excerpt.clone(),
+            shallow: assertion.shallow,
+            meaningful: false,
+            reasons: vec![assertion.reason],
+            excerpt: assertion.excerpt,
             start_byte: start_byte + assertion.start_byte,
-        });
-    }
-
-    if assertions.iter().all(|assertion| assertion.shallow) {
-        out.push(TestAssertionSmell {
-            file: file.clone(),
-            enclosing_fq_name: symbol,
-            assertion_kind: "shallow-assertions-only".to_string(),
-            score: weights.shallow_assertion_only_weight,
-            assertion_count,
-            reasons: vec!["shallow-assertions-only".to_string()],
-            excerpt: compact_php_excerpt(body),
-            start_byte,
-        });
-    }
+        })
+        .collect();
+    append_test_assertion_findings(
+        file,
+        symbol,
+        collapse_whitespace(body),
+        start_byte,
+        &assertions,
+        weights,
+        out,
+    );
 }
 
 fn collect_php_assertions(body: &str, weights: &TestAssertionWeights) -> Vec<PhpAssertionSignal> {
@@ -122,57 +103,45 @@ fn collect_php_assertions(body: &str, weights: &TestAssertionWeights) -> Vec<Php
         let whole = captures.get(0).expect("whole match");
         let left = normalize_php_expr(captures.name("left").map(|m| m.as_str()).unwrap_or(""));
         let right = normalize_php_expr(captures.name("right").map(|m| m.as_str()).unwrap_or(""));
-        let signal = if left == right {
-            let (kind, reason, score) = if is_php_literal(&left) {
-                (
-                    "constant-equality",
-                    "constant-equality",
-                    weights.constant_equality_weight,
-                )
-            } else {
-                (
-                    "self-comparison",
-                    "self-comparison",
-                    weights.tautological_assertion_weight,
-                )
-            };
-            PhpAssertionSignal {
-                kind: kind.to_string(),
-                score,
-                shallow: false,
-                reason: reason.to_string(),
-                excerpt: compact_php_excerpt(whole.as_str()),
-                start_byte: whole.start(),
-            }
+        let classification = if left == right {
+            classify_common_test_assertion(
+                if is_php_literal(&left) {
+                    CommonTestAssertionKind::ConstantEquality
+                } else {
+                    CommonTestAssertionKind::SelfComparison
+                },
+                weights,
+            )
         } else {
-            PhpAssertionSignal {
-                kind: "meaningful-assertion".to_string(),
-                score: 0,
-                shallow: false,
-                reason: "meaningful-assertion".to_string(),
-                excerpt: compact_php_excerpt(whole.as_str()),
-                start_byte: whole.start(),
-            }
+            classify_common_test_assertion(CommonTestAssertionKind::Meaningful, weights)
         };
-        assertions.push(signal);
+        assertions.push(PhpAssertionSignal {
+            kind: classification.kind.to_string(),
+            score: classification.score,
+            shallow: classification.shallow,
+            reason: classification.kind.to_string(),
+            excerpt: collapse_whitespace(whole.as_str()),
+            start_byte: whole.start(),
+        });
     }
 
     for captures in PHP_ASSERT_TRUTH_RE.captures_iter(body) {
         let whole = captures.get(0).expect("whole match");
         let matcher = captures.name("matcher").map(|m| m.as_str()).unwrap_or("");
         let arg = normalize_php_expr(captures.name("arg").map(|m| m.as_str()).unwrap_or(""));
-        let (kind, score, shallow) = match matcher {
-            "True" if arg == "true" => ("constant-truth", weights.constant_truth_weight, true),
-            "False" if arg == "false" => ("constant-truth", weights.constant_truth_weight, true),
-            "Null" | "NotNull" => ("nullness-only", weights.nullness_only_weight, true),
-            _ => ("meaningful-assertion", 0, false),
+        let kind = match matcher {
+            "True" if arg == "true" => CommonTestAssertionKind::ConstantTruth,
+            "False" if arg == "false" => CommonTestAssertionKind::ConstantTruth,
+            "Null" | "NotNull" => CommonTestAssertionKind::NullnessOnly,
+            _ => CommonTestAssertionKind::Meaningful,
         };
+        let classification = classify_common_test_assertion(kind, weights);
         assertions.push(PhpAssertionSignal {
-            kind: kind.to_string(),
-            score,
-            shallow,
-            reason: kind.to_string(),
-            excerpt: compact_php_excerpt(whole.as_str()),
+            kind: classification.kind.to_string(),
+            score: classification.score,
+            shallow: classification.shallow,
+            reason: classification.kind.to_string(),
+            excerpt: collapse_whitespace(whole.as_str()),
             start_byte: whole.start(),
         });
     }
@@ -185,7 +154,7 @@ fn collect_php_assertions(body: &str, weights: &TestAssertionWeights) -> Vec<Php
                 score: 0,
                 shallow: false,
                 reason: "meaningful-assertion".to_string(),
-                excerpt: compact_php_excerpt(whole.as_str()),
+                excerpt: collapse_whitespace(whole.as_str()),
                 start_byte: whole.start(),
             });
         }
@@ -195,25 +164,14 @@ fn collect_php_assertions(body: &str, weights: &TestAssertionWeights) -> Vec<Php
 }
 
 fn normalize_php_expr(expr: &str) -> String {
-    expr.trim()
-        .trim_end_matches(';')
-        .trim_matches(|ch| matches!(ch, '(' | ')' | ' '))
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    normalize_assertion_expression(expr.trim().trim_end_matches(';'))
 }
 
 fn is_php_literal(expr: &str) -> bool {
     let trimmed = expr.trim();
-    (trimmed.starts_with('"') && trimmed.ends_with('"'))
+    is_common_assertion_literal(trimmed)
         || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
         || matches!(trimmed, "true" | "false" | "null")
-        || trimmed.parse::<i64>().is_ok()
-        || trimmed.parse::<f64>().is_ok()
-}
-
-fn compact_php_excerpt(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 pub fn php_contains_tests(source: &str, parsed: &ParsedFile) -> bool {

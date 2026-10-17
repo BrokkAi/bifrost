@@ -125,6 +125,9 @@ pub struct ParsedFile {
     /// declarations, recovered declarations, and preprocessor-conditional
     /// intervals. Persisted with the file's other analysis facts.
     pub materialization_records: Vec<MaterializationRecord>,
+    /// Whether every declaration above is a reading of a completed parse
+    /// (#3501). Persisted with the file's other analysis facts.
+    pub completeness: crate::analyzer::model::ParseCompleteness,
 }
 
 /// A primary-owned C# declaration input to fresh executable lowering. Event
@@ -142,6 +145,7 @@ pub struct CSharpSemanticDeclaration {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CSharpSemanticDeclarationKind {
     StaticMethodReturn,
+    InstanceMethodReturn,
     Member,
 }
 
@@ -189,31 +193,19 @@ pub struct SourceImportPathFact {
 
 impl SourceImportPathFact {
     fn estimated_retained_bytes(&self) -> usize {
-        self.segments
-            .capacity()
-            .saturating_mul(std::mem::size_of::<String>())
-            .saturating_add(
-                self.segments
-                    .iter()
-                    .map(String::capacity)
-                    .fold(0usize, usize::saturating_add),
-            )
-            .saturating_add(
-                self.lexical_prefixes
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<String>()),
-            )
-            .saturating_add(
-                self.lexical_prefixes
-                    .iter()
-                    .map(String::capacity)
-                    .fold(0usize, usize::saturating_add),
-            )
-            .saturating_add(
-                self.lexical_scopes
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<SourceOccurrenceId>()),
-            )
+        crate::analyzer::common::estimated_string_vec_bytes(
+            &self.segments,
+            self.segments.capacity(),
+        )
+        .saturating_add(crate::analyzer::common::estimated_string_vec_bytes(
+            &self.lexical_prefixes,
+            self.lexical_prefixes.capacity(),
+        ))
+        .saturating_add(
+            self.lexical_scopes
+                .capacity()
+                .saturating_mul(std::mem::size_of::<SourceOccurrenceId>()),
+        )
     }
 }
 
@@ -361,6 +353,18 @@ pub struct ParsedSourceFacts {
 }
 
 impl ParsedSourceFacts {
+    /// Return a declaration's written name when its source occurrence is
+    /// present in `source`.
+    pub fn declaration_name<'a>(
+        &self,
+        source: &'a str,
+        declaration: SourceDeclarationId,
+    ) -> Option<&'a str> {
+        let name = self.occurrences.declaration(declaration).name?;
+        let range = self.occurrences.occurrence(name).range;
+        source.get(range.start_byte..range.end_byte)
+    }
+
     /// Assert the invariants that relate the occurrence arena to the other
     /// common families. No narrower constructor holds both sides, so the
     /// store writer calls this before it inserts the facts. `SourceFactRows`,
@@ -689,6 +693,7 @@ impl ParsedFile {
             source_declaration_units: Vec::new(),
             source_declaration_metadata: Vec::new(),
             materialization_records: Vec::new(),
+            completeness: crate::analyzer::model::ParseCompleteness::Complete,
         }
     }
 
@@ -844,12 +849,11 @@ impl ParsedFile {
         &mut self,
         code_unit: CodeUnit,
         node: Node<'_>,
-        source: &str,
+        _source: &str,
         parent: Option<CodeUnit>,
         top_level: Option<CodeUnit>,
     ) {
-        self.remove_code_unit(&code_unit);
-        self.add_code_unit(code_unit, node, source, parent, top_level);
+        self.replace_code_unit_with_range(code_unit, node_range(node), parent, top_level);
     }
 
     pub fn replace_code_unit_with_range(
@@ -1054,12 +1058,116 @@ impl ParsedFile {
         self.add_metadata_for_signature(code_unit, signature_ordinal, metadata)
     }
 
+    /// Add signature metadata and link its row to a source declaration.
+    pub fn add_signature_with_source_declaration_metadata(
+        &mut self,
+        declaration: SourceDeclarationId,
+        unit: CodeUnit,
+        metadata: SignatureMetadata,
+    ) {
+        let metadata_ordinal = self.add_signature_with_metadata(unit.clone(), metadata);
+        self.source_declaration_metadata
+            .push(SourceDeclarationMetadataLink {
+                declaration,
+                unit,
+                metadata_ordinal,
+            });
+    }
+
+    /// Separate source metadata rows only when declarations sharing a row
+    /// have different canonical visibility. Display signatures and metadata
+    /// remain deduplicated for equivalent declarations.
+    pub fn separate_source_declaration_metadata_visibility_alternatives(
+        &mut self,
+        declaration_visibilities: &[SourceDeclarationVisibilityFact],
+    ) {
+        let visibility_by_declaration = declaration_visibilities
+            .iter()
+            .map(|fact| (fact.declaration, fact.visibility))
+            .collect::<HashMap<_, _>>();
+        let original_links = self
+            .source_declaration_metadata
+            .iter()
+            .map(|link| (link.unit.clone(), link.metadata_ordinal, link.declaration))
+            .collect::<Vec<_>>();
+        let mut metadata_with_rows = HashSet::default();
+        let mut ordinal_by_visibility = HashMap::default();
+        for (link_index, (unit, original_ordinal, declaration)) in
+            original_links.into_iter().enumerate()
+        {
+            let visibility = *visibility_by_declaration
+                .get(&declaration)
+                .expect("source metadata declaration has canonical visibility");
+            let metadata_key = (unit.clone(), original_ordinal);
+            let visibility_key = (unit.clone(), original_ordinal, visibility);
+            if let Some(&ordinal) = ordinal_by_visibility.get(&visibility_key) {
+                self.source_declaration_metadata[link_index].metadata_ordinal = ordinal;
+                continue;
+            }
+            if metadata_with_rows.insert(metadata_key) {
+                ordinal_by_visibility.insert(visibility_key, original_ordinal);
+                continue;
+            }
+
+            let metadata = self
+                .signature_metadata
+                .get(&unit)
+                .expect("source metadata unit has signature metadata")[original_ordinal]
+                .clone();
+            let signature_ordinal = self
+                .signature_metadata_signature_ordinals
+                .get(&unit)
+                .expect("source metadata unit has signature ordinals")[original_ordinal];
+            let ordinal = self.append_metadata_for_signature(unit, signature_ordinal, metadata);
+            ordinal_by_visibility.insert(visibility_key, ordinal);
+            self.source_declaration_metadata[link_index].metadata_ordinal = ordinal;
+        }
+    }
+
     /// Attach metadata to an already admitted display signature. Some metadata
     /// describes a component, such as a Go embedded type, without introducing
     /// another display signature for the enclosing declaration. Reuse a row
     /// only within the same signature; identical component metadata may belong
     /// to distinct declaration alternatives.
     pub fn add_metadata_for_signature(
+        &mut self,
+        code_unit: CodeUnit,
+        signature_ordinal: usize,
+        metadata: SignatureMetadata,
+    ) -> usize {
+        assert!(
+            self.signatures
+                .get(&code_unit)
+                .is_some_and(|signatures| signature_ordinal < signatures.len()),
+            "metadata must reference an admitted signature for {code_unit:?}"
+        );
+        let matching_ordinal = {
+            let entries = self
+                .signature_metadata
+                .entry(code_unit.clone())
+                .or_default();
+            let signature_ordinals = self
+                .signature_metadata_signature_ordinals
+                .entry(code_unit.clone())
+                .or_default();
+            assert_eq!(
+                signature_ordinals.len(),
+                entries.len(),
+                "metadata signature ordinals stay dense with metadata rows"
+            );
+            entries
+                .iter()
+                .zip(signature_ordinals.iter())
+                .position(|(entry, &recorded)| entry == &metadata && recorded == signature_ordinal)
+        };
+        if let Some(ordinal) = matching_ordinal {
+            ordinal
+        } else {
+            self.append_metadata_for_signature(code_unit, signature_ordinal, metadata)
+        }
+    }
+
+    fn append_metadata_for_signature(
         &mut self,
         code_unit: CodeUnit,
         signature_ordinal: usize,
@@ -1084,18 +1192,10 @@ impl ParsedFile {
             entries.len(),
             "metadata signature ordinals stay dense with metadata rows"
         );
-        if let Some(ordinal) = entries
-            .iter()
-            .zip(signature_ordinals.iter())
-            .position(|(entry, &recorded)| entry == &metadata && recorded == signature_ordinal)
-        {
-            ordinal
-        } else {
-            let ordinal = entries.len();
-            entries.push(metadata);
-            signature_ordinals.push(signature_ordinal);
-            ordinal
-        }
+        let ordinal = entries.len();
+        entries.push(metadata);
+        signature_ordinals.push(signature_ordinal);
+        ordinal
     }
 
     pub fn set_ruby_method_dispatch_mode(
@@ -1298,17 +1398,11 @@ fn compact_replacement_occurrences(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::analyzer::model::CodeUnitType;
+    use brokk_bifrost_test_macros::hardwon;
 
-    fn test_range(start_byte: usize) -> Range {
-        Range {
-            start_byte,
-            end_byte: start_byte + 1,
-            start_line: 1,
-            end_line: 1,
-        }
-    }
+    use super::*;
+    use crate::analyzer::common::test_range;
+    use crate::analyzer::model::CodeUnitType;
 
     #[test]
     fn declaration_identity_multiset_survives_replace_until_last_exact_removal() {
@@ -1417,6 +1511,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "2d3e6e824bbf: deferred declaration replacement must preserve batch order without eager rescans"
+    )]
     fn deferred_replacements_batch_ordering_cleanup_and_keep_last_occurrence() {
         let file = ProjectFile::new(std::env::temp_dir(), "deferred.cpp");
         let owner = CodeUnit::new(file.clone(), CodeUnitType::Module, "", "generated");

@@ -3,9 +3,9 @@ title: Scala
 description: Query Scala named and block arguments, annotations, imports, and assignments with query_code.
 ---
 
-> Last verified end to end: 2026-07-14 (`query_code` schema version 1).
+> Last verified end to end: 2026-10-01 (`query_code` schema version 1).
 
-For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](../reference-traversal/).
+For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](/code-query-tutorials/reference-traversal/).
 
 Scala has several call shapes that look like assignments in source. The normalized adapter keeps named arguments in `kwargs`, while real `val`/`var` declarations remain `assignment` facts. It also exposes block arguments as structured descendants.
 

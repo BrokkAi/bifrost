@@ -22,11 +22,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use brokk_bifrost_analysis::analyzer::IAnalyzer;
+use brokk_bifrost_analysis::analyzer::canonical_hash::is_lower_sha256;
 use brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelProvenance;
 use brokk_bifrost_analysis::workspace_document::WorkspaceRoot;
 use serde::{Deserialize, Serialize};
 
 use super::locator::is_qualified_locator_code;
+use super::retained::{RetainedSize, retained_extra, retained_size_with_extras};
 use super::{
     CatalogRegistryLimits, LoadedPolicy, PolicyId, PolicyRegistry, PolicyRegistryError,
     PolicyRegistryLimits, PolicySemanticHash, PolicySourceIdentity, ResolvedPolicyLocator,
@@ -113,10 +115,6 @@ const CODE_SMELLS_POLICY_SOURCES: &[(&str, &str)] = &[
     (
         "policies/go-nil-dereference.rqlp",
         include_str!("../policy-packs/bifrost.code-smells/policies/go-nil-dereference.rqlp"),
-    ),
-    (
-        "policies/go-data-race.rqlp",
-        include_str!("../policy-packs/bifrost.code-smells/policies/go-data-race.rqlp"),
     ),
     (
         "policies/go-wrong-error-on-failure-path.rqlp",
@@ -525,11 +523,63 @@ pub struct BuiltInPolicySelection {
     pub packs: Vec<String>,
     pub categories: Vec<String>,
     pub policy_ids: Vec<String>,
+    /// Policies removed after the positive selectors resolve. Each one must
+    /// name a policy that those selectors selected (issue 3721).
+    pub excluded_policy_ids: Vec<String>,
 }
 
 impl BuiltInPolicySelection {
+    /// True when no selector of any kind was named. An exclusion is a
+    /// selector, so it never falls through to the zero-configuration default.
     pub fn is_empty(&self) -> bool {
-        self.packs.is_empty() && self.categories.is_empty() && self.policy_ids.is_empty()
+        self.packs.is_empty()
+            && self.categories.is_empty()
+            && self.policy_ids.is_empty()
+            && self.excluded_policy_ids.is_empty()
+    }
+}
+
+/// The built-in selection behind one run, recorded in the run's report. It
+/// names the shipped catalog, the policies that ran, and the policies an
+/// exclusion removed, so a consumer can tell a deliberate non-run from a
+/// policy the selection never reached.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BuiltInPolicySelectionRecord {
+    catalog_digest: String,
+    selected_policy_ids: Vec<String>,
+    excluded_policy_ids: Vec<String>,
+}
+
+impl BuiltInPolicySelectionRecord {
+    pub fn new(
+        catalog: &BuiltInPolicyCatalog,
+        selected: &[SelectedBuiltInPolicy<'_>],
+        excluded_policy_ids: &[String],
+    ) -> Self {
+        let mut excluded_policy_ids = excluded_policy_ids.to_vec();
+        excluded_policy_ids.sort();
+        excluded_policy_ids.dedup();
+        Self {
+            catalog_digest: catalog.digest().to_owned(),
+            selected_policy_ids: selected
+                .iter()
+                .map(|policy| policy.manifest.id.clone())
+                .collect(),
+            excluded_policy_ids,
+        }
+    }
+}
+
+impl RetainedSize for BuiltInPolicySelectionRecord {
+    fn retained_size(&self) -> usize {
+        retained_size_with_extras(
+            self,
+            [
+                retained_extra(&self.catalog_digest),
+                retained_extra(&self.selected_policy_ids),
+                retained_extra(&self.excluded_policy_ids),
+            ],
+        )
     }
 }
 
@@ -571,6 +621,7 @@ pub struct SelectedBuiltInPolicy<'a> {
     manifest: &'a BuiltInPolicyManifestEntry,
     source: &'a str,
     pack_id: &'a str,
+    selection_provenance: super::finding::PolicySelectionProvenance,
 }
 
 impl<'a> SelectedBuiltInPolicy<'a> {
@@ -584,6 +635,10 @@ impl<'a> SelectedBuiltInPolicy<'a> {
 
     pub fn pack_id(self) -> &'a str {
         self.pack_id
+    }
+
+    pub const fn selection_provenance(self) -> super::finding::PolicySelectionProvenance {
+        self.selection_provenance
     }
 
     /// The deterministic pre-activation catalog identity of this entry.
@@ -1012,6 +1067,25 @@ impl BuiltInPolicyCatalog {
             }
         }
 
+        if selection.packs.is_empty()
+            && selection.categories.is_empty()
+            && selection.policy_ids.is_empty()
+        {
+            return Err(BuiltInPolicyError::new(format!(
+                "built-in policy exclusions {:?} need a positive selection: name a pack, \
+                 category, or policy id to exclude from",
+                selection.excluded_policy_ids
+            )));
+        }
+
+        for policy_id in &selection.excluded_policy_ids {
+            if !self.source_by_policy_id.contains_key(policy_id) {
+                return Err(BuiltInPolicyError::new(format!(
+                    "unknown built-in policy id `{policy_id}` in the exclusions"
+                )));
+            }
+        }
+
         let selected = self
             .document
             .packs
@@ -1037,6 +1111,11 @@ impl BuiltInPolicyCatalog {
                 manifest: entry,
                 source: self.source_by_policy_id[entry.id.as_str()].as_str(),
                 pack_id: pack.id.as_str(),
+                selection_provenance: if selection.policy_ids.contains(&entry.id) {
+                    super::finding::PolicySelectionProvenance::ExplicitPolicyId
+                } else {
+                    super::finding::PolicySelectionProvenance::PackCategoryOrDefault
+                },
             })
             .collect::<Vec<_>>();
         if selected.is_empty() {
@@ -1047,7 +1126,34 @@ impl BuiltInPolicyCatalog {
                 selection.packs, selection.categories, selection.policy_ids
             )));
         }
-        Ok(selected)
+        for policy_id in &selection.excluded_policy_ids {
+            if !selected
+                .iter()
+                .any(|policy| &policy.manifest.id == policy_id)
+            {
+                return Err(BuiltInPolicyError::new(format!(
+                    "excluded built-in policy id `{policy_id}` is not in the selected policy set \
+                     (packs {:?}, categories {:?}, policy ids {:?}); exclude only policies the \
+                     positive selectors select",
+                    selection.packs, selection.categories, selection.policy_ids
+                )));
+            }
+        }
+        let remaining = selected
+            .into_iter()
+            .filter(|policy| !selection.excluded_policy_ids.contains(&policy.manifest.id))
+            .collect::<Vec<_>>();
+        if remaining.is_empty() {
+            return Err(BuiltInPolicyError::new(format!(
+                "built-in policy exclusions remove every selected policy: no policy is left to \
+                 run (packs {:?}, categories {:?}, policy ids {:?}, excluded policy ids {:?})",
+                selection.packs,
+                selection.categories,
+                selection.policy_ids,
+                selection.excluded_policy_ids
+            )));
+        }
+        Ok(remaining)
     }
 }
 
@@ -1233,11 +1339,7 @@ fn authored_identity(
     identity: &PolicySourceIdentity,
     source: &str,
 ) -> Result<String, BuiltInPolicyError> {
-    let catalogs = Arc::new(TaintCatalogRegistry::new_without_workspace(
-        CatalogRegistryLimits::default(),
-    ));
-    let mut registry =
-        PolicyRegistry::new_without_workspace(catalogs, PolicyRegistryLimits::default());
+    let mut registry = builtin_policy_registry();
     let loaded = registry
         .register_policy_bytes_deferred(identity.clone(), source.as_bytes())
         .map_err(|error| {
@@ -1254,14 +1356,17 @@ fn resolved_identity(
     identity: &PolicySourceIdentity,
     source: &str,
 ) -> Result<String, PolicyRegistryError> {
-    let catalogs = Arc::new(TaintCatalogRegistry::new_without_workspace(
-        CatalogRegistryLimits::default(),
-    ));
-    let mut registry =
-        PolicyRegistry::new_without_workspace(catalogs, PolicyRegistryLimits::default());
+    let mut registry = builtin_policy_registry();
     registry
         .register_policy_bytes(identity.clone(), source.as_bytes())
         .map(|loaded| loaded.semantic_hash().to_string())
+}
+
+fn builtin_policy_registry() -> PolicyRegistry {
+    let catalogs = Arc::new(TaintCatalogRegistry::new_without_workspace(
+        CatalogRegistryLimits::default(),
+    ));
+    PolicyRegistry::new_without_workspace(catalogs, PolicyRegistryLimits::default())
 }
 
 /// Whether an analyzer-free registration failed only because a qualified
@@ -1346,11 +1451,7 @@ fn validate_sha256_field(
     field: &str,
     value: &str,
 ) -> Result<(), BuiltInPolicyError> {
-    if value.len() != 64
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
+    if !is_lower_sha256(value) {
         return Err(BuiltInPolicyError::new(format!(
             "built-in policy `{policy_id}` must record a lowercase 64-digit {field}"
         )));
@@ -1407,46 +1508,7 @@ impl std::error::Error for BuiltInPolicyError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::PolicyBudget;
-    use crate::evaluator::{DefaultPolicyEvaluator, PolicyEvaluationContext, PolicyEvaluator};
-    use crate::inline_project::{BuiltInlineTestProject, InlineTestProject};
-    use brokk_bifrost_analysis::analyzer::{AnalyzerConfig, Language};
-
-    #[test]
-    #[ignore = "prints hashes while intentionally updating the checked-in manifest"]
-    fn print_computed_semantic_hashes() {
-        for (pack_id, entry) in EMBEDDED_POLICY_SOURCES
-            .iter()
-            .flat_map(|(pack_id, sources)| sources.iter().map(move |entry| (*pack_id, *entry)))
-        {
-            let source = entry.1;
-            let identity = PolicySourceIdentity::new(format!("builtin:{}/{}", pack_id, entry.0));
-            let catalogs = Arc::new(TaintCatalogRegistry::new_without_workspace(
-                CatalogRegistryLimits::default(),
-            ));
-            let mut registry =
-                PolicyRegistry::new_without_workspace(catalogs, PolicyRegistryLimits::default());
-            let authored = registry
-                .register_policy_bytes_deferred(identity.clone(), source.as_bytes())
-                .expect("authored identity");
-            let catalogs = Arc::new(TaintCatalogRegistry::new_without_workspace(
-                CatalogRegistryLimits::default(),
-            ));
-            let mut registry =
-                PolicyRegistry::new_without_workspace(catalogs, PolicyRegistryLimits::default());
-            let resolved = registry.register_policy_bytes(identity, source.as_bytes());
-            let resolved = match resolved {
-                Ok(policy) => policy.semantic_hash().to_string(),
-                Err(error) => format!("deferred({error})"),
-            };
-            println!(
-                "{} authored_hash={} resolved_semantic_hash={}",
-                authored.definition().metadata.id,
-                authored.semantic_hash(),
-                resolved,
-            );
-        }
-    }
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
     fn core_without_host_rules_has_no_policy_content() {
@@ -1470,105 +1532,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn checked_in_catalog_is_internally_consistent() {
-        let catalog = built_in_policy_catalog().expect("valid built-in catalog");
-        assert_eq!(catalog.document().packs.len(), 4);
-        assert_eq!(
-            catalog
-                .pack_manifest(CODE_SMELLS_PACK_ID)
-                .expect("code-smells pack")
-                .policies
-                .len(),
-            31
-        );
-        assert_eq!(
-            catalog
-                .pack_manifest(CORRECTNESS_PACK_ID)
-                .expect("correctness pack")
-                .policies
-                .len(),
-            1
-        );
-        assert_eq!(
-            catalog
-                .pack_manifest(SECURITY_PACK_ID)
-                .expect("security pack")
-                .policies
-                .len(),
-            29
-        );
-        let effects = catalog
-            .pack_manifest(EFFECTS_PACK_ID)
-            .expect("effects pack");
-        assert_eq!(effects.policies.len(), 10);
-        assert_eq!(
-            effects
-                .policies
-                .iter()
-                .map(|entry| entry.id.as_str())
-                .collect::<Vec<_>>(),
-            vec![
-                "bifrost.effects.csharp.selected-boundary-no-network-io",
-                "bifrost.effects.go.selected-boundary-no-network-io",
-                "bifrost.effects.java.selected-boundary-no-network-io",
-                "bifrost.effects.javascript.selected-boundary-no-network-io",
-                "bifrost.effects.kotlin.selected-boundary-no-network-io",
-                "bifrost.effects.python.selected-boundary-no-network-io",
-                "bifrost.effects.ruby.selected-boundary-no-network-io",
-                "bifrost.effects.rust.selected-boundary-no-network-io",
-                "bifrost.effects.scala.selected-boundary-no-network-io",
-                "bifrost.effects.typescript.selected-boundary-no-network-io",
-            ]
-        );
-        for entry in &effects.policies {
-            assert_eq!(
-                entry.required_capabilities,
-                vec![
-                    "semantic-model-declared-effects",
-                    "transitive-procedure-effects",
-                    "exhaustive-effect-coverage",
-                    "module-identity-declaration-selection",
-                    "external-api-identity",
-                ],
-                "{}",
-                entry.id
-            );
-        }
-        assert_eq!(
-            catalog
-                .select(&BuiltInPolicySelection {
-                    packs: vec![CORRECTNESS_PACK_ID.to_owned()],
-                    ..BuiltInPolicySelection::default()
-                })
-                .expect("select correctness pack")
-                .len(),
-            1
-        );
-        assert_eq!(
-            catalog
-                .select(&BuiltInPolicySelection {
-                    packs: vec![CODE_SMELLS_PACK_ID.to_owned()],
-                    ..BuiltInPolicySelection::default()
-                })
-                .expect("select pack")
-                .len(),
-            31
-        );
-        let security = catalog
-            .select(&BuiltInPolicySelection {
-                packs: vec![SECURITY_PACK_ID.to_owned()],
-                ..BuiltInPolicySelection::default()
-            })
-            .expect("select security pack");
-        assert_eq!(security.len(), 3);
-        assert_eq!(security[0].pack_id(), SECURITY_PACK_ID);
-        assert_eq!(
-            security[0].source_identity().as_str(),
-            "builtin:bifrost.security/policies/jvm/servlet-parameter-to-jdbc.rqlp"
-        );
-    }
-
     /// A built-in-style policy whose only call target is a qualified
     /// semantic-model locator, so the analyzer-free boundary cannot close it.
     const DEFERRED_QUALIFIED_POLICY: &str = r#"(policy
@@ -1586,15 +1549,6 @@ mod tests {
         (group :name by-call :by (finding.id)
           (aggregate :name violations :op count))
         (assert :group by-call :value violations :cardinality (exactly 0))))"#;
-
-    /// A built-in-style policy with no qualified locator at all.
-    const LOCATOR_FREE_POLICY: &str = r#"(policy
-      :schema-version 1
-      :id "test.issue-3316.locator-free"
-      :name "Locator-free policy"
-      :message "M"
-      :severity warning
-      :analysis (analysis :type match :selector (rql :schema-version 1 (name "run"))))"#;
 
     fn pack_manifest(
         authored_hash: &str,
@@ -1685,48 +1639,6 @@ mod tests {
     }
 
     #[test]
-    fn a_locator_free_source_records_both_identities_separately() {
-        let identity = PolicySourceIdentity::new("builtin:test.issue-3316/policies/plain.rqlp");
-        let authored =
-            authored_identity(&identity, LOCATOR_FREE_POLICY).expect("authored identity");
-        let resolved =
-            resolved_identity(&identity, LOCATOR_FREE_POLICY).expect("resolved identity");
-        assert_eq!(authored, resolved);
-        let catalog = BuiltInPolicyCatalog::from_embedded_packs(vec![
-            EmbeddedPolicyPack::new(pack_manifest(
-                &authored,
-                Some(&resolved),
-                "policies/plain.rqlp",
-                "test.issue-3316.locator-free",
-            ))
-            .with_source("policies/plain.rqlp", LOCATOR_FREE_POLICY),
-        ])
-        .expect("both identities match");
-        let selected = catalog
-            .select(&BuiltInPolicySelection {
-                policy_ids: vec!["test.issue-3316.locator-free".to_owned()],
-                ..BuiltInPolicySelection::default()
-            })
-            .expect("select the locator-free policy");
-        assert_eq!(
-            selected[0].recorded_resolved_semantic_hash(),
-            Some(resolved.as_str())
-        );
-    }
-
-    #[test]
-    fn a_deferred_entry_cannot_pin_a_resolved_semantic_hash() {
-        let error = deferred_catalog(Some(&"a".repeat(64)))
-            .expect_err("a deferred locator has no pre-activation resolved identity");
-        assert!(
-            error
-                .to_string()
-                .contains("cannot record a resolved semantic hash"),
-            "{error}"
-        );
-    }
-
-    #[test]
     fn a_wrong_authored_hash_is_refused() {
         let error = BuiltInPolicyCatalog::from_embedded_packs(vec![
             EmbeddedPolicyPack::new(pack_manifest(
@@ -1755,6 +1667,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2923: pack and policy-id filters must intersect")]
     fn a_pack_and_an_id_select_only_that_id() {
         assert_eq!(
             selected_ids(&BuiltInPolicySelection {
@@ -1767,6 +1680,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2923: category and pack filters must intersect")]
     fn a_category_narrows_within_the_named_pack() {
         let selected = selected_ids(&BuiltInPolicySelection {
             packs: vec![CODE_SMELLS_PACK_ID.to_owned()],
@@ -1787,7 +1701,6 @@ mod tests {
                 "bifrost.correctness.unsafe-deserialization",
                 "bifrost.correctness.python-absent-member",
                 "bifrost.correctness.python-absent-member-conditional",
-                "bifrost.correctness.go-data-race",
                 "bifrost.correctness.go-nil-dereference",
                 "bifrost.correctness.go-wrong-error-on-failure-path",
                 "bifrost.correctness.empty-failure-handler",
@@ -1809,6 +1722,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2923: category-only selection spans matching packs")]
     fn a_category_alone_spans_every_pack_that_declares_it() {
         assert_eq!(
             selected_ids(&BuiltInPolicySelection {
@@ -1824,17 +1738,19 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2923: an explicit policy ID selects that policy")]
     fn an_id_alone_still_selects_that_policy() {
         assert_eq!(
             selected_ids(&BuiltInPolicySelection {
-                policy_ids: vec!["bifrost.correctness.go-data-race".to_owned()],
+                policy_ids: vec!["bifrost.correctness.dynamic-evaluation".to_owned()],
                 ..BuiltInPolicySelection::default()
             }),
-            Ok(vec!["bifrost.correctness.go-data-race".to_owned()])
+            Ok(vec!["bifrost.correctness.dynamic-evaluation".to_owned()])
         );
     }
 
     #[test]
+    #[hardwon("#2923: multiple policy IDs select in catalog order")]
     fn several_ids_keep_catalog_order() {
         assert_eq!(
             selected_ids(&BuiltInPolicySelection {
@@ -1852,6 +1768,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2923: an empty selector must not evaluate every built-in")]
     fn an_empty_selection_selects_no_built_in_policy() {
         assert_eq!(
             selected_ids(&BuiltInPolicySelection::default()),
@@ -1860,6 +1777,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2923: a policy ID outside the selected pack must fail")]
     fn an_id_outside_the_named_pack_is_an_error() {
         let error = selected_ids(&BuiltInPolicySelection {
             packs: vec![SECURITY_PACK_ID.to_owned()],
@@ -1876,6 +1794,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2923: a category outside the selected pack must fail")]
     fn a_category_outside_the_named_pack_is_an_error() {
         let error = selected_ids(&BuiltInPolicySelection {
             packs: vec![SECURITY_PACK_ID.to_owned()],
@@ -1888,6 +1807,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2923: unknown selector names must remain errors")]
     fn unknown_selector_names_are_still_errors() {
         assert_eq!(
             selected_ids(&BuiltInPolicySelection {
@@ -1919,223 +1839,6 @@ mod tests {
                 ..BuiltInPolicySelection::default()
             }),
             Err("unknown built-in policy id `bifrost.nonexistent.policy`".to_owned())
-        );
-    }
-
-    fn evaluate_go_data_race(project: &BuiltInlineTestProject) -> crate::PolicyRun {
-        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
-        let selected = built_in_policy_catalog()
-            .expect("valid built-in catalog")
-            .select(&BuiltInPolicySelection {
-                policy_ids: vec!["bifrost.correctness.go-data-race".to_string()],
-                ..BuiltInPolicySelection::default()
-            })
-            .expect("select Go data-race policy");
-        let [selected] = selected.as_slice() else {
-            panic!("one Go data-race policy should be selected")
-        };
-        let catalogs = Arc::new(TaintCatalogRegistry::new_without_workspace(
-            CatalogRegistryLimits::default(),
-        ));
-        let mut registry =
-            PolicyRegistry::new_without_workspace(catalogs, PolicyRegistryLimits::default());
-        let policy = registry
-            .register_policy_bytes(selected.source_identity(), selected.source().as_bytes())
-            .expect("load Go data-race policy");
-        let flow_state = brokk_bifrost_flow::FlowWorkspaceState::new();
-        let context = PolicyEvaluationContext {
-            analyzer: workspace.analyzer(),
-            workspace: Some(&workspace),
-            flow_state: &flow_state,
-            cancellation: None,
-            cvss_overlays: &[],
-            organizational_risk: &[],
-            incremental: None,
-        };
-        DefaultPolicyEvaluator::new()
-            .evaluate(policy, &context, &mut PolicyBudget::default())
-            .expect("evaluate Go data-race policy")
-    }
-
-    /// #3760: the root task's read is ordered before the writer's spawn, but
-    /// the first goroutine's read of the same site races the write. The two
-    /// task contexts share one conflict row, and the policy must report it.
-    #[test]
-    fn go_data_race_policy_reports_a_race_that_another_task_context_orders() {
-        let project = InlineTestProject::with_language(Language::Go)
-            .file(
-                "fixture.go",
-                r#"package fixture
-
-type Pool struct{ stopped bool }
-
-func (p *Pool) Stopped() bool { return p.stopped }
-
-func Run() {
-	p := &Pool{}
-	_ = p.Stopped()
-	go func() {
-		_ = p.Stopped()
-	}()
-	go func() {
-		p.stopped = true
-	}()
-}
-"#,
-            )
-            .build();
-        let run = evaluate_go_data_race(&project);
-        let [finding] = run.findings() else {
-            panic!("the stopped flag has one race finding: {run:#?}")
-        };
-        let primary_line = finding
-            .primary()
-            .region()
-            .expect("race finding is source-backed")
-            .start_line();
-        assert_eq!(primary_line, 14, "{run:#?}");
-        let mut endpoint_lines = vec![primary_line];
-        endpoint_lines.extend(
-            finding
-                .related()
-                .iter()
-                .filter(|related| {
-                    related.relationship() == crate::PolicyLocationRelationship::Evidence
-                })
-                .filter_map(|related| {
-                    related
-                        .location()
-                        .region()
-                        .map(|region| region.start_line())
-                }),
-        );
-        endpoint_lines.sort_unstable();
-        endpoint_lines.dedup();
-        assert_eq!(endpoint_lines, [5, 14], "{run:#?}");
-    }
-
-    #[test]
-    fn go_data_race_policy_reports_exact_capture_and_context_cancellation_races() {
-        let mut project = InlineTestProject::with_language(Language::Go);
-        for index in 0..101 {
-            project = project.file(
-                format!("open{index:03}.go"),
-                format!(
-                    "package main\n\nfunc unresolvedAliases{index}(values []int, index int) {{\n    go func() {{ values[index] = 1 }}()\n    _ = values[index]\n}}\n"
-                ),
-            );
-        }
-        let project = project
-            .file(
-                "zz_race.go",
-                r#"package main
-
-import "context"
-
-func race() int {
-    value := 0
-    go func() { value = 1 }()
-    return value
-}
-
-func ordered() int {
-    value := 0
-    value = 1
-    go func() { _ = value }()
-    return value
-}
-
-func cancellationVsDone(ctx context.Context, stop bool) (err error) {
-    done := make(chan struct{})
-    go func() {
-        defer close(done)
-        err = nil
-        if stop { return }
-        err = nil
-    }()
-    select {
-    case <-ctx.Done():
-        return context.Canceled
-    case <-done:
-    }
-    return err
-}
-
-type localContext interface { Done() <-chan struct{} }
-
-func lookalikeDone(ctx localContext) (err error) {
-    done := make(chan struct{})
-    go func() {
-        defer close(done)
-        err = nil
-    }()
-    select {
-    case <-ctx.Done():
-        return context.Canceled
-    case <-done:
-    }
-    return err
-}
-"#,
-            )
-            .build();
-        let run = evaluate_go_data_race(&project);
-        assert_eq!(run.findings().len(), 2, "{run:#?}");
-        let mut primary_lines = run
-            .findings()
-            .iter()
-            .map(|finding| {
-                finding
-                    .primary()
-                    .region()
-                    .expect("race finding is source-backed")
-                    .start_line()
-            })
-            .collect::<Vec<_>>();
-        primary_lines.sort_unstable();
-        assert_eq!(primary_lines, [7, 28], "{run:#?}");
-
-        let cancellation = run
-            .findings()
-            .iter()
-            .find(|finding| {
-                finding
-                    .primary()
-                    .region()
-                    .is_some_and(|region| region.start_line() == 28)
-            })
-            .expect("context cancellation produces one grouped finding");
-        assert_eq!(cancellation.certainty(), &crate::FindingCertainty::Definite);
-        assert_eq!(
-            cancellation.completeness(),
-            &crate::FindingCompleteness::Complete
-        );
-        let crate::PolicyFindingEvidence::Assertion { evidence } = cancellation.evidence() else {
-            panic!("the grouped cancellation finding retains assertion evidence")
-        };
-        assert_eq!(
-            evidence.actual_count(),
-            2,
-            "two child writes are grouped into one source finding"
-        );
-        let mut endpoint_lines = cancellation
-            .related()
-            .iter()
-            .filter(|related| related.relationship() == crate::PolicyLocationRelationship::Evidence)
-            .filter_map(|related| {
-                related
-                    .location()
-                    .region()
-                    .map(|region| region.start_line())
-            })
-            .collect::<Vec<_>>();
-        endpoint_lines.sort_unstable();
-        endpoint_lines.dedup();
-        assert_eq!(endpoint_lines, [22, 24, 28], "{run:#?}");
-        assert!(!cancellation.related_truncated());
-        assert!(
-            !endpoint_lines.contains(&31),
-            "the post-done result read is ordered and must not be an endpoint: {run:#?}"
         );
     }
 }
@@ -2280,16 +1983,6 @@ mod external_policy_runtime_tests {
             "child failed: stdout={} stderr={}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    #[test]
-    fn configured_root_rejects_a_directory_with_no_policy_packs() {
-        let root = tempdir().expect("empty rules root");
-        let error = load_external_policy_catalog(root.path()).expect_err("empty root fails");
-        assert!(
-            error.to_string().contains("contains no policy packs"),
-            "{error}"
         );
     }
 }

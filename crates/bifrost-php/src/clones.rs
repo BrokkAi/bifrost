@@ -5,11 +5,28 @@
 //! declaration source comes from the analyzer, so the ~20-line entry point stays
 //! in `analyzer/php/clones.rs`. Everything that knows PHP is here.
 
-use tree_sitter::{Node, Parser, Tree};
+use crate::aliases::parse_php_tree;
+use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_tree_preorder};
+use brokk_bifrost_core::clones::{
+    CloneNormalizationRules, clone_ast_signature_with_skip,
+    normalize_clone_leaf_token as normalize_php_clone_leaf_token,
+};
+use tree_sitter::Node;
 
 const PHP_CLONE_AST_IDENTIFIER_TYPES: &[&str] = &["name", "variable_name"];
 const PHP_CLONE_AST_STRING_TYPES: &[&str] = &["string", "encapsed_string", "string_value"];
 const PHP_CLONE_AST_NUMBER_TYPES: &[&str] = &["integer", "float"];
+const PHP_CLONE_NORMALIZATION_RULES: CloneNormalizationRules = CloneNormalizationRules {
+    identifier_kinds: PHP_CLONE_AST_IDENTIFIER_TYPES,
+    string_kinds: PHP_CLONE_AST_STRING_TYPES,
+    number_kinds: PHP_CLONE_AST_NUMBER_TYPES,
+    boolean_kinds: &["boolean", "boolean_literal"],
+    boolean_values: &["true", "false"],
+    null_kinds: &["null", "null_literal"],
+    null_values: &["null"],
+    comment_kinds: &["comment"],
+    ignored_ast_kinds: &[],
+};
 
 pub fn normalized_clone_tokens_php(source: &str) -> Vec<String> {
     let parse_source = php_clone_parse_source(source);
@@ -22,106 +39,29 @@ pub fn normalized_clone_tokens_php(source: &str) -> Vec<String> {
 }
 
 fn collect_normalized_leaf_tokens_php(node: Node<'_>, source: &str, out: &mut Vec<String>) {
-    if php_is_ignorable_clone_logging_node(node, source) {
-        return;
-    }
-    if node.named_child_count() == 0 {
-        let token = normalize_php_clone_leaf_token(node, source);
-        if !token.is_empty() {
-            out.push(token);
+    walk_tree_preorder(node, true, |node| {
+        if php_is_ignorable_clone_logging_node(node, source) {
+            return WalkControl::SkipChildren;
         }
-    }
-    let child_count = node.child_count();
-    for index in 0..child_count {
-        if let Some(child) = node.child(index) {
-            collect_normalized_leaf_tokens_php(child, source, out);
-        }
-    }
-}
 
-fn normalize_php_clone_leaf_token(node: Node<'_>, source: &str) -> String {
-    let kind = node.kind();
-    let token = source
-        .get(node.start_byte()..node.end_byte())
-        .unwrap_or("")
-        .trim();
-    if token.is_empty() || kind == "comment" {
-        return String::new();
-    }
-    if PHP_CLONE_AST_IDENTIFIER_TYPES.contains(&kind) {
-        return "ID".to_string();
-    }
-    if PHP_CLONE_AST_STRING_TYPES.contains(&kind) {
-        return "STR".to_string();
-    }
-    if PHP_CLONE_AST_NUMBER_TYPES.contains(&kind) {
-        return "NUM".to_string();
-    }
-    if matches!(kind, "boolean" | "boolean_literal") || matches!(token, "true" | "false") {
-        return "BOOL".to_string();
-    }
-    if matches!(kind, "null" | "null_literal") || token == "null" {
-        return "NULL".to_string();
-    }
-    if token.chars().count() == 1 && token.chars().all(|ch| !ch.is_alphanumeric()) {
-        return format!("OP:{token}");
-    }
-    format!("T:{kind}")
+        if node.named_child_count() == 0 {
+            let token = normalize_php_clone_leaf_token(node, source, PHP_CLONE_NORMALIZATION_RULES);
+            if !token.is_empty() {
+                out.push(token);
+            }
+        }
+        WalkControl::Continue
+    });
 }
 
 pub fn build_php_clone_ast_signature(source: &str) -> String {
     let parse_source = php_clone_parse_source(source);
-    let Some(tree) = parse_php_tree(&parse_source) else {
-        return String::new();
-    };
-    let mut labels = Vec::new();
-    collect_php_clone_ast_labels(tree.root_node(), &parse_source, &mut labels);
-    labels.join("|")
-}
-
-fn collect_php_clone_ast_labels(node: Node<'_>, source: &str, out: &mut Vec<String>) {
-    if php_is_ignorable_clone_logging_node(node, source) {
-        return;
-    }
-    out.push(normalize_php_clone_ast_label(node, source));
-    let child_count = node.child_count();
-    for index in 0..child_count {
-        if let Some(child) = node.child(index) {
-            collect_php_clone_ast_labels(child, source, out);
-        }
-    }
-}
-
-fn normalize_php_clone_ast_label(node: Node<'_>, source: &str) -> String {
-    let kind = node.kind();
-    let text = source
-        .get(node.start_byte()..node.end_byte())
-        .unwrap_or("")
-        .trim();
-    if PHP_CLONE_AST_IDENTIFIER_TYPES.contains(&kind) {
-        return "ID".to_string();
-    }
-    if PHP_CLONE_AST_STRING_TYPES.contains(&kind) {
-        return "STR".to_string();
-    }
-    if PHP_CLONE_AST_NUMBER_TYPES.contains(&kind) {
-        return "NUM".to_string();
-    }
-    if matches!(kind, "boolean" | "boolean_literal") || matches!(text, "true" | "false") {
-        return "BOOL".to_string();
-    }
-    if matches!(kind, "null" | "null_literal") || text == "null" {
-        return "NULL".to_string();
-    }
-    format!("N:{kind}")
-}
-
-fn parse_php_tree(source: &str) -> Option<Tree> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
-        .expect("failed to load php parser");
-    parser.parse(source, None)
+    clone_ast_signature_with_skip(
+        parse_php_tree(&parse_source),
+        &parse_source,
+        PHP_CLONE_NORMALIZATION_RULES,
+        php_is_ignorable_clone_logging_node,
+    )
 }
 
 fn php_clone_parse_source(source: &str) -> String {

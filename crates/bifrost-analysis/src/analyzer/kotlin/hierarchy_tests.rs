@@ -68,6 +68,7 @@ fn sorted_names(units: HashSet<CodeUnit>) -> Vec<String> {
 /// same ladders for the second scope variant and for every later hierarchy
 /// question because the batch-hydrated resolution bypassed the memo cells.
 #[test]
+#[brokk_bifrost_test_macros::hardwon("#2868: Mirai usage scans exceeded the 600-second probe cap")]
 fn kotlin_descendant_index_populates_the_ancestor_memo() {
     let (wild, analyzer) = fixture();
     let base = base_unit(&analyzer);

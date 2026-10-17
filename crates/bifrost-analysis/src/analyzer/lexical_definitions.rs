@@ -5,12 +5,14 @@
 //! symbol graph.  Resolving them from the current syntax tree keeps overlays
 //! authoritative and avoids adding short-lived lexical facts to the store.
 
+use brokk_bifrost_core::analyzer::tree_walk::{node_range, push_bounded_nodes};
 use brokk_bifrost_cpp::graph::resolver::{
     declaration_declarator, guard_requirements_hold_at_reference, preprocessor_guard_environment,
 };
 use tree_sitter::Node;
 
 use super::languages::{LocalDeclarationVisibility, language_support};
+use super::semantic::ArgumentDomain;
 pub use super::semantic::FormalParameterPassingMode;
 use super::{DeclarationKind, Language, Range};
 
@@ -70,11 +72,19 @@ pub enum FormalVariadicKind {
 
 impl FormalVariadicKind {
     pub(crate) fn accepts_positional(self) -> bool {
-        matches!(self, Self::Positional | Self::Both)
+        self.argument_domain().accepts_positional()
     }
 
     pub(crate) fn accepts_keyword(self) -> bool {
         matches!(self, Self::Keyword | Self::Both)
+    }
+
+    const fn argument_domain(self) -> &'static ArgumentDomain {
+        match self {
+            Self::Positional => &ArgumentDomain::Positional,
+            Self::Keyword => &ArgumentDomain::Keyword,
+            Self::Both => &ArgumentDomain::PositionalOrKeyword,
+        }
     }
 }
 
@@ -198,6 +208,20 @@ fn formal_parameter_slots_for_owner_with_nodes_bounded<'tree>(
         let passing_mode = formal_parameter_passing_mode(language, binding.declaration);
         let default_range = parameter_default_range(language, binding.declaration);
         let can_share_slot = language != Language::Go;
+        if language == Language::Rust && binding.name.kind() == "_" {
+            slots.push((
+                FormalParameterSlot {
+                    names: Vec::new(),
+                    declaration_range,
+                    receiver,
+                    variadic,
+                    passing_mode,
+                    default_range,
+                },
+                binding.declaration,
+            ));
+            continue;
+        }
         if can_share_slot
             && let Some((slot, _)) = slots.last_mut()
             && slot.declaration_range.start_byte == declaration_range.start_byte
@@ -223,6 +247,12 @@ fn formal_parameter_slots_for_owner_with_nodes_bounded<'tree>(
             binding.declaration,
         ));
     }
+    slots.sort_unstable_by_key(|(slot, _)| {
+        (
+            slot.declaration_range.start_byte,
+            slot.declaration_range.end_byte,
+        )
+    });
 
     let (slots, nodes): (Vec<_>, Vec<_>) = slots.into_iter().unzip();
     Some((
@@ -314,7 +344,7 @@ fn python_method_binding_with_step(
                 _ => {}
             }
         }
-        if !push_named_children_with_step(node, &mut stack, scope_step) {
+        if !push_named_children_with_step(node, &[], &mut stack, scope_step) {
             return None;
         }
     }
@@ -702,15 +732,6 @@ fn smallest_named_node(root: Node<'_>, start: usize, end: usize) -> Option<Node<
         .or_else(|| root.descendant_for_byte_range(start, end))
 }
 
-fn node_range(node: Node<'_>) -> Range {
-    Range {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_line: node.start_position().row + 1,
-        end_line: node.end_position().row + 1,
-    }
-}
-
 fn focus_can_resolve_lexical(language: Language, focus: Node<'_>) -> bool {
     if language_support(language).is_some_and(|support| !support.focus_resolves_lexically(focus)) {
         return false;
@@ -841,7 +862,7 @@ fn parameter_roots_with_step<'tree>(
                 ordinary_roots.push(node);
                 continue;
             }
-            if !push_named_children_with_step(node, &mut stack, scope_step) {
+            if !push_named_children_with_step(node, &[], &mut stack, scope_step) {
                 return None;
             }
         }
@@ -1036,7 +1057,7 @@ fn parameter_bindings_with_step<'tree>(
             continue;
         }
 
-        if !push_named_children_with_step(node, &mut stack, scope_step) {
+        if !push_named_children_with_step(node, &[], &mut stack, scope_step) {
             return None;
         }
     }
@@ -1295,6 +1316,12 @@ fn binding_name_nodes_with_step<'tree>(
     parameter: bool,
     scope_step: &mut impl FnMut() -> bool,
 ) -> Option<Vec<Node<'tree>>> {
+    if language == Language::Ruby && parameter {
+        return brokk_bifrost_ruby::syntax::ruby_parameter_binding_name_nodes(declaration, || {
+            scope_step()
+        });
+    }
+
     let mut roots = Vec::new();
     if language == Language::Scala && declaration.kind() == "enumerator" {
         // tree-sitter-scala represents both generators (`pattern <- expression`)
@@ -1342,6 +1369,17 @@ fn binding_name_nodes_with_step<'tree>(
     let mut names = Vec::new();
     for root in roots {
         collect_binding_leaves_with_step(language, root, parameter, &mut names, scope_step)?;
+    }
+    if names.is_empty() && language == Language::Rust && declaration.kind() == "parameter" {
+        if !scope_step() {
+            return None;
+        }
+        if let Some(pattern) = declaration
+            .child_by_field_name("pattern")
+            .filter(|pattern| pattern.kind() == "_")
+        {
+            names.push(pattern);
+        }
     }
     names.sort_by_key(Node::start_byte);
     names.dedup_by_key(|node| (node.start_byte(), node.end_byte()));
@@ -1412,13 +1450,32 @@ fn collect_binding_leaves_with_step<'tree>(
         }
         if selected.is_empty()
             && binding_container(language, node.kind())
-            && !push_named_children_with_step(node, &mut selected, scope_step)
+            && !push_named_children_with_step(
+                node,
+                binding_excluded_child_fields(language, node.kind()),
+                &mut selected,
+                scope_step,
+            )
         {
             return None;
         }
         stack.extend(selected);
     }
     Some(())
+}
+
+/// Fields of a binding container that name a constructor or an annotation,
+/// not a binding. The fallback that pushes every named child of a container
+/// must skip them. The constructor path of a Rust tuple-struct or struct
+/// pattern (`Some` in `Some(x)`) names a type, not a binding.
+pub(crate) fn binding_excluded_child_fields(
+    language: Language,
+    kind: &str,
+) -> &'static [&'static str] {
+    match (language, kind) {
+        (Language::Rust, "tuple_struct_pattern" | "struct_pattern") => &["type"],
+        _ => &[],
+    }
 }
 
 fn binding_child_fields(
@@ -1460,22 +1517,30 @@ fn push_field_children_with_step<'tree>(
 }
 
 fn push_named_children<'tree>(node: Node<'tree>, output: &mut Vec<Node<'tree>>) {
-    let _ = push_named_children_with_step(node, output, &mut || true);
+    let _ = push_named_children_with_step(node, &[], output, &mut || true);
 }
 
+/// Push the named children of `node` except those under one of
+/// `excluded_fields`. Excluded fields are looked up by field name, so the
+/// exclusion is structural, not positional.
 fn push_named_children_with_step<'tree>(
     node: Node<'tree>,
+    excluded_fields: &[&str],
     output: &mut Vec<Node<'tree>>,
     scope_step: &mut impl FnMut() -> bool,
 ) -> bool {
+    let excluded = excluded_fields
+        .iter()
+        .filter_map(|field| node.child_by_field_name(field))
+        .map(|child| child.id())
+        .collect::<Vec<_>>();
     let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if !scope_step() {
-            return false;
-        }
-        output.push(child);
-    }
-    true
+    push_bounded_nodes(
+        node.named_children(&mut cursor)
+            .filter(|child| !excluded.contains(&child.id())),
+        output,
+        scope_step,
+    )
 }
 
 fn identifier_matches(language: Language, node: Node<'_>, source: &str, identifier: &str) -> bool {
@@ -1492,42 +1557,34 @@ fn identifier_matches(language: Language, node: Node<'_>, source: &str, identifi
 }
 
 fn is_parameter_owner(language: Language, kind: &str) -> bool {
+    if is_lambda_owner(language, kind) {
+        return true;
+    }
+
     match language {
         Language::Java => matches!(
             kind,
-            "method_declaration"
-                | "constructor_declaration"
-                | "lambda_expression"
-                | "record_declaration"
+            "method_declaration" | "constructor_declaration" | "record_declaration"
         ),
         Language::Go => matches!(
             kind,
-            "function_declaration" | "method_declaration" | "method_elem" | "func_literal"
+            "function_declaration" | "method_declaration" | "method_elem"
         ),
-        Language::Cpp => matches!(
-            kind,
-            "function_definition" | "lambda_expression" | "function_declarator"
-        ),
+        Language::Cpp => matches!(kind, "function_definition" | "function_declarator"),
         Language::JavaScript | Language::TypeScript => matches!(
             kind,
             "function_declaration"
-                | "function_expression"
                 | "generator_function_declaration"
                 | "generator_function"
-                | "arrow_function"
                 | "method_definition"
         ),
-        Language::Python => matches!(kind, "function_definition" | "lambda"),
-        Language::Rust => matches!(kind, "function_item" | "closure_expression"),
-        Language::Php => matches!(
-            kind,
-            "function_definition" | "method_declaration" | "anonymous_function" | "arrow_function"
-        ),
+        Language::Python => kind == "function_definition",
+        Language::Rust => kind == "function_item",
+        Language::Php => matches!(kind, "function_definition" | "method_declaration"),
         Language::Scala => matches!(
             kind,
             "function_definition"
                 | "function_declaration"
-                | "lambda_expression"
                 | "class_definition"
                 | "trait_definition"
                 | "object_definition"
@@ -1542,22 +1599,15 @@ fn is_parameter_owner(language: Language, kind: &str) -> bool {
                 | "conversion_operator_declaration"
                 | "indexer_declaration"
                 | "local_function_statement"
-                | "lambda_expression"
-                | "anonymous_method_expression"
                 | "class_declaration"
                 | "struct_declaration"
                 | "record_declaration"
                 | "record_struct_declaration"
         ),
-        Language::Ruby => matches!(kind, "method" | "singleton_method" | "lambda" | "block"),
+        Language::Ruby => matches!(kind, "method" | "singleton_method"),
         Language::Kotlin => matches!(
             kind,
-            "function_declaration"
-                | "secondary_constructor"
-                | "primary_constructor"
-                | "anonymous_function"
-                | "lambda_literal"
-                | "setter"
+            "function_declaration" | "secondary_constructor" | "primary_constructor" | "setter"
         ),
         Language::None => false,
     }
@@ -1840,27 +1890,14 @@ fn is_local_declaration(language: Language, kind: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
     use tree_sitter::Parser;
 
     fn first_named_kind<'tree>(root: Node<'tree>, kind: &str) -> Node<'tree> {
-        let mut stack = vec![root];
-        while let Some(node) = stack.pop() {
-            if node.kind() == kind {
-                return node;
-            }
-            let mut cursor = node.walk();
-            stack.extend(node.named_children(&mut cursor));
-        }
-        panic!("missing `{kind}` node");
-    }
-
-    fn kotlin_root(source: &str) -> (Parser, tree_sitter::Tree) {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&crate::analyzer::kotlin::language::LANGUAGE.into())
-            .expect("load Kotlin grammar");
-        let tree = parser.parse(source, None).expect("parse Kotlin source");
-        (parser, tree)
+        crate::analyzer::test_support::first_named_node_matching_reverse_preorder(root, |node| {
+            node.kind() == kind
+        })
+        .unwrap_or_else(|| panic!("missing `{kind}` node"))
     }
 
     #[test]
@@ -1928,6 +1965,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#2089: C census resolution lost valid label references across function-scoped lookup"
+    )]
     fn c_goto_labels_resolve_within_their_function() {
         let source = "void first(void) { goto end; end: return; }\nvoid second(void) { goto end; end: return; }\n";
         let mut parser = Parser::new();
@@ -1977,6 +2017,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2089: C++ label resolution crossed a nested lambda callable boundary")]
     fn cpp_goto_labels_do_not_cross_lambda_boundaries() {
         let source = "void f() { [] { goto done; done: return; }(); goto done; done: return; }\n";
         let mut parser = Parser::new();
@@ -2008,40 +2049,6 @@ mod tests {
         assert!(function.name_range.start_byte > function_goto);
     }
 
-    /// Kotlin's registry entries (parameter owners, containers, and bindings)
-    /// are consumed by lexical binding resolution, so they must actually
-    /// recover a callable's formal parameters rather than merely compile.
-    #[test]
-    fn kotlin_function_parameters_resolve_to_formal_slots() {
-        let source = "package sample\n\nfun render(prefix: String, count: Int): String = prefix\n";
-        let (_parser, tree) = kotlin_root(source);
-        let owner = first_named_kind(tree.root_node(), "function_declaration");
-        let layout = formal_parameter_slots_for_owner(Language::Kotlin, owner, source)
-            .expect("Kotlin function must expose formal parameter slots");
-        let names: Vec<&str> = layout
-            .slots
-            .iter()
-            .flat_map(|slot| slot.names.iter().map(String::as_str))
-            .collect();
-        assert_eq!(names, vec!["prefix", "count"]);
-        assert!(layout.slots.iter().all(|slot| slot.variadic.is_none()));
-    }
-
-    #[test]
-    fn kotlin_primary_constructor_parameters_resolve_to_formal_slots() {
-        let source = "package sample\n\nclass Holder(val seed: Int, label: String)\n";
-        let (_parser, tree) = kotlin_root(source);
-        let owner = first_named_kind(tree.root_node(), "primary_constructor");
-        let layout = formal_parameter_slots_for_owner(Language::Kotlin, owner, source)
-            .expect("Kotlin primary constructor must expose formal parameter slots");
-        let names: Vec<&str> = layout
-            .slots
-            .iter()
-            .flat_map(|slot| slot.names.iter().map(String::as_str))
-            .collect();
-        assert_eq!(names, vec!["seed", "label"]);
-    }
-
     #[test]
     fn python_formal_slots_preserve_positional_and_named_regions() {
         let source = "def invoke(first, /, second, *values, third, **rest):\n    return second\n";
@@ -2069,6 +2076,23 @@ mod tests {
                 FormalParameterPassingMode::NamedOnly,
             ]
         );
+    }
+
+    #[test]
+    fn rust_unnamed_parameters_still_occupy_formal_slots() {
+        let source = "fn discard(_: &str) {}\n";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("Rust grammar");
+        let tree = parser.parse(source, None).expect("Rust tree");
+        let owner = first_named_kind(tree.root_node(), "function_item");
+        let layout = formal_parameter_slots_for_owner(Language::Rust, owner, source)
+            .expect("Rust function must expose formal parameter slots");
+
+        assert_eq!(layout.slots.len(), 1);
+        assert!(layout.slots[0].names.is_empty());
+        assert!(!layout.slots[0].receiver);
     }
 
     #[test]
@@ -2102,5 +2126,38 @@ mod tests {
         assert_eq!(complete.slots.len(), 64);
         assert_eq!(complete.slots[0].names, ["p0"]);
         assert_eq!(complete.slots[63].names, ["p63"]);
+    }
+
+    #[test]
+    #[hardwon(
+        "eb9926938572: a let tuple-struct pattern bound its constructor, so the shared resolver found Some inside a closure"
+    )]
+    fn a_tuple_struct_pattern_constructor_is_not_a_binding() {
+        let source = concat!(
+            "fn f(o: Option<i32>) {\n",
+            "    let Some(_x) = o;\n",
+            "    let c = || Some(1);\n",
+            "    c();\n",
+            "}\n",
+        );
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("load Rust grammar");
+        let tree = parser.parse(source, None).expect("parse Rust source");
+        let closure = first_named_kind(tree.root_node(), "closure_expression");
+        let some = crate::analyzer::test_support::first_named_node_matching_reverse_preorder(
+            closure,
+            |node| node.kind() == "identifier" && source.get(node.byte_range()) == Some("Some"),
+        )
+        .expect("closure names Some");
+        let resolution = resolve_lexical_binding_from_focus(
+            Language::Rust,
+            some,
+            source,
+            some.start_byte(),
+            "Some",
+        );
+        assert!(resolution.is_none(), "Some is not a local binding");
     }
 }

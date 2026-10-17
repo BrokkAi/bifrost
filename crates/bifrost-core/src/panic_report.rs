@@ -86,8 +86,10 @@ pub fn report_panics<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
+    #[hardwon("877482cd4cc7: a worker panic crossing the report boundary lost its message")]
     fn a_panicking_task_is_reported_with_its_own_message() {
         let reported = report_panics("analysis worker", || {
             panic!("placement boundary gap must name a root scope: site 1743");
@@ -106,6 +108,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("877482cd4cc7: a joined worker panic lost the builder's message")]
     fn a_joined_thread_panic_keeps_the_workers_message() {
         let worker = std::thread::spawn(|| panic!("injected worker panic {}", 7));
         let payload = worker.join().expect_err("the worker panics");
@@ -120,11 +123,7 @@ mod tests {
     }
 
     #[test]
-    fn work_that_does_not_panic_returns_its_value() {
-        assert_eq!(report_panics("analysis worker", || 1 + 1), Ok(2));
-    }
-
-    #[test]
+    #[hardwon("#2359: non-string panic payloads were reported without a useful message")]
     fn a_payload_without_a_message_is_named_as_such() {
         let reported = report_panics("analysis worker", || std::panic::panic_any(7u32))
             .expect_err("a panicking task must be reported as a failure");

@@ -1,13 +1,11 @@
 use super::{TypeLookupOutcome, candidates_outcome_with_target_kind, no_type};
 use crate::analyzer::usages::get_definition::{
-    BoundedResolution, ResolutionSession, RubyDefinitionProvider,
-    ruby_type_lookup_resolution_bounded,
+    BoundedResolution, ResolutionSession, RubyBoundedPreflight, RubyDefinitionProvider,
+    ruby_bounded_preflight, ruby_type_lookup_resolution_bounded,
 };
 use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
 use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
-use crate::analyzer::{
-    BoundedDefinitionLookup, IAnalyzer, ProjectFile, RubyAnalyzer, resolve_analyzer,
-};
+use crate::analyzer::{BoundedDefinitionLookup, IAnalyzer, ProjectFile};
 use crate::cancellation::CancellationToken;
 use tree_sitter::Tree;
 
@@ -21,24 +19,27 @@ pub(crate) fn resolve_ruby_type_bounded(
     cancellation: Option<&CancellationToken>,
 ) -> BoundedResolution<TypeLookupOutcome> {
     let session = ResolutionSession::bounded(budget, cancellation);
-    let Some(ruby) = resolve_analyzer::<RubyAnalyzer>(analyzer) else {
-        return session.finish(no_type(
-            "ruby_analyzer_unavailable",
-            "Ruby analyzer is unavailable",
-        ));
+    let (ruby, tree) = match ruby_bounded_preflight(analyzer, tree, &session) {
+        RubyBoundedPreflight::Ready { ruby, tree } => (ruby, tree),
+        RubyBoundedPreflight::AnalyzerUnavailable => {
+            return session.finish(no_type(
+                "ruby_analyzer_unavailable",
+                "Ruby analyzer is unavailable",
+            ));
+        }
+        RubyBoundedPreflight::ParseFailed => {
+            return session.finish(no_type(
+                "ruby_parse_failed",
+                "Ruby source could not be parsed",
+            ));
+        }
+        RubyBoundedPreflight::SourceFactsUnavailable => {
+            return session.finish(no_type(
+                "ruby_source_facts_unavailable",
+                "Canonical Ruby source facts are unavailable",
+            ));
+        }
     };
-    let Some(tree) = tree else {
-        return session.finish(no_type(
-            "ruby_parse_failed",
-            "Ruby source could not be parsed",
-        ));
-    };
-    if !session.observe_cancellation() || !ruby.canonical_sources_ready() {
-        return session.finish(no_type(
-            "ruby_source_facts_unavailable",
-            "Canonical Ruby source facts are unavailable",
-        ));
-    }
     let support = RubyDefinitionProvider::new(ruby, &session);
     let Some(resolution) =
         ruby_type_lookup_resolution_bounded(&support, file, source, tree.root_node(), site)

@@ -7,17 +7,12 @@
 
 use brokk_bifrost_core::analyzer::model::StructuredImportPathKind;
 use brokk_bifrost_core::analyzer::parsed_file::{SourceImportFact, SourceImportPathFact};
-use brokk_bifrost_core::analyzer::source_facts::SourceImportId;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::super::{Result, StoreError};
-use super::{SOURCE_FACTS_VERSION, nonnegative_usize, source_occurrence, strict_bool};
-
-fn source_import(value: i64, label: &str) -> Result<SourceImportId> {
-    let value = u32::try_from(value)
-        .map_err(|_| StoreError::new(format!("invalid {label} source import id {value}")))?;
-    Ok(SourceImportId::new(value))
-}
+use super::{
+    SOURCE_FACTS_VERSION, nonnegative_usize, source_import, source_occurrence, strict_bool,
+};
 
 fn path_kind(value: Option<String>, label: &str) -> Result<Option<StructuredImportPathKind>> {
     value
@@ -268,10 +263,9 @@ mod tests {
     use super::read_source_imports;
     use crate::analyzer::rust::RustAdapter;
     use crate::analyzer::store::AnalyzerStore;
-    use crate::analyzer::store::tests::{oid_for, parse_state};
+    use crate::analyzer::store::tests::{blob_id, oid_for, parse_state};
     use crate::inline_project::InlineTestProject;
-    use git2::Oid;
-    use rusqlite::{Connection, params};
+    use rusqlite::params;
 
     const IMPORT_SOURCE: &str = concat!(
         "use crate::service::{self as svc, run as execute, *};\n",
@@ -281,15 +275,6 @@ mod tests {
         "wrap! { use crate::Embedded; }\n",
         "wrap! { use crate::{}; }\n",
     );
-
-    fn blob_id(conn: &Connection, oid: Oid) -> i64 {
-        conn.query_row(
-            "SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'rust'",
-            [oid.to_string()],
-            |row| row.get(0),
-        )
-        .expect("published Rust blob id")
-    }
 
     #[test]
     fn canonical_import_readback_preserves_embedded_local_grouped_and_empty_inputs() {

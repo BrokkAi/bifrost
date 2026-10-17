@@ -2,10 +2,14 @@ use super::java_artifact::{
     MAX_ARCHIVE_ENTRIES, MAX_SOURCE_ENTRY_BYTES, MAX_TOTAL_ARCHIVE_BYTES, ZipDirectoryStatus,
     zip_directory_status,
 };
+use super::parent_index;
+use super::{restrict_effective_visibility, take_artifact_record as take_record};
 use crate::CancellationToken;
 use crate::analyzer::lexical_definitions::formal_parameter_slots_for_owner;
 use crate::analyzer::scala::declarations::parse_scala_file;
 use crate::analyzer::scala::{language, scala_normalize_full_name};
+#[cfg(test)]
+use crate::analyzer::semantic_model::ExternalArtifactPackProducer;
 use crate::analyzer::semantic_model::csmi::{
     CsmiCollectionFlowBoundaryRoot, CsmiCollectionFlowEntryComponent, CsmiCollectionFlowInvocation,
     CsmiCollectionFlowKind, CsmiCollectionFlowPayload, CsmiCollectionFlowRoot,
@@ -13,19 +17,16 @@ use crate::analyzer::semantic_model::csmi::{
     CsmiCollectionFlowTransfer, CsmiInputBoundaryRoot, CsmiInputLocation, CsmiInputParameterRoot,
     CsmiInputPhase, CsmiInputReceiverRoot, CsmiIntrinsicType, CsmiIntrinsicTypeKind,
     CsmiOutputBoundaryRoot, CsmiOutputLocation, CsmiOutputPhase, CsmiOutputReceiverRoot,
-    CsmiOutputResultRoot, CsmiParameterRootRole, CsmiParameterType, CsmiParameterTypeKind,
-    CsmiProjection, CsmiProjectionStep, CsmiReceiverRootRole, CsmiResultRootRole,
-    CsmiTypeExpression,
+    CsmiOutputResultRoot, CsmiParameterRootRole, CsmiProjection, CsmiProjectionStep,
+    CsmiReceiverRootRole, CsmiResultRootRole, CsmiTypeExpression,
 };
 use crate::analyzer::semantic_model::{
-    ActivationSelector, AmbientUseRole, ArtifactProducerLimits, ArtifactProduction,
-    ArtifactProductionRequest, AuthoredPayload, AuthoredSemanticModelPack, AuthoredShard,
-    BoundedProducerDiagnostics, CollectionFlowFact, CollectionFlowsPayload, Completeness,
-    ExactArtifact, ExternalArtifactKind, ExternalArtifactPackProducer, HierarchyFact,
-    HierarchyKind, Locator, MemberFact, MemberIdentity, MemberKind, Parameter, Producer,
-    ProducerDiagnostic, ProducerDiagnosticSeverity, ReceiverFact, Signature, TypeFact,
-    TypeIdentity, TypeKind, TypeRef, Visibility, carried_source_paths, member_declaration_id,
-    read_exact_artifact_while, type_declaration_id,
+    AmbientUseRole, ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest,
+    AuthoredPayload, AuthoredShard, BoundedProducerDiagnostics, CollectionFlowFact,
+    CollectionFlowsPayload, Completeness, ExactArtifact, ExternalArtifactKind, HierarchyFact,
+    HierarchyKind, Locator, MemberFact, MemberIdentity, MemberKind, Parameter, ProducerDiagnostic,
+    ProducerDiagnosticSeverity, ReceiverFact, Signature, TypeFact, TypeIdentity, TypeKind, TypeRef,
+    Visibility, member_declaration_id, read_exact_artifact_while, type_declaration_id,
 };
 use crate::analyzer::tree_sitter_analyzer::ParsedFile;
 use crate::analyzer::{CodeUnit, Language, ProjectFile};
@@ -38,30 +39,16 @@ use brokk_bifrost_jvm::scala::graph::syntax::{
     ScalaCallableRole, ScalaCallableSourceAlternative, ScalaTypeExpressionPath,
 };
 use std::io::{Cursor, Read};
-use tree_sitter::{Node, Parser};
+use tree_sitter::Node;
 use zip::ZipArchive;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ScalaSourceJarPackProducer;
 
-impl ExternalArtifactPackProducer for ScalaSourceJarPackProducer {
-    fn produce_exact_artifact(
-        &self,
-        request: &ArtifactProductionRequest,
-        limits: &ArtifactProducerLimits,
-    ) -> ArtifactProduction {
-        self.produce(request, limits, None)
-    }
-
-    fn produce_exact_artifact_with_cancellation(
-        &self,
-        request: &ArtifactProductionRequest,
-        limits: &ArtifactProducerLimits,
-        cancellation: Option<&CancellationToken>,
-    ) -> ArtifactProduction {
-        self.produce(request, limits, cancellation)
-    }
-}
+crate::analyzer::semantic_model::implement_external_artifact_pack_producer!(
+    ScalaSourceJarPackProducer,
+    produce
+);
 
 impl ScalaSourceJarPackProducer {
     fn produce(
@@ -142,7 +129,11 @@ impl ScalaSourceJarPackProducer {
         }
         for index in 0..entry_limit {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                return cancelled_production(limits);
+                return crate::analyzer::semantic_model::failed_artifact_production(
+                    "artifact.cancelled",
+                    "Scala archive production was cancelled",
+                    limits,
+                );
             }
             let Ok(mut entry) = archive.by_index(index) else {
                 diagnostics.warning(
@@ -152,7 +143,17 @@ impl ScalaSourceJarPackProducer {
                 );
                 continue;
             };
-            let entry_name = entry.name().to_owned();
+            let entry_name = match entry.name() {
+                Ok(name) => name.into_owned(),
+                Err(error) => {
+                    diagnostics.warning(
+                        "scala.archive.entry_name",
+                        None,
+                        format!("could not decode archive entry name at index {index}: {error}"),
+                    );
+                    continue;
+                }
+            };
             if !entry_name.ends_with(".scala") {
                 continue;
             }
@@ -202,7 +203,11 @@ impl ScalaSourceJarPackProducer {
         let mut record_limit_hit = false;
         for (entry_name, source) in entries {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                return cancelled_production(limits);
+                return crate::analyzer::semantic_model::failed_artifact_production(
+                    "artifact.cancelled",
+                    "Scala archive production was cancelled",
+                    limits,
+                );
             }
             if remaining_records == 0 {
                 record_limit_hit = true;
@@ -281,11 +286,11 @@ fn parse_source_entry(
     source: &str,
     diagnostics: &mut BoundedProducerDiagnostics,
 ) -> Option<ParsedScalaEntry> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&language::LANGUAGE.into())
-        .expect("tree-sitter Scala language must load");
-    let Some(tree) = parser.parse(source, None) else {
+    let Some(tree) = super::parse_source_tree(
+        language::LANGUAGE.into(),
+        source,
+        "tree-sitter Scala language must load",
+    ) else {
         diagnostics.warning(
             "scala.source.parse",
             Some(entry_name.to_owned()),
@@ -416,6 +421,8 @@ fn scala_entry_facts(
         }
         type_parameters_by_declaration.insert(declaration.clone(), type_parameters.clone());
         let fact = TypeFact {
+            jvm_inventory: None,
+            runtime_bases: None,
             ambient_use: scala_declaration_ambient_use(node),
             id: type_id,
             name,
@@ -567,6 +574,8 @@ fn scala_entry_facts(
         members.push(MemberFact {
             non_overridable: None,
             ambient_use: scala_declaration_ambient_use(node),
+            value_type: None,
+            proxied_type: None,
             id,
             owner: owner_id.clone(),
             name,
@@ -580,6 +589,7 @@ fn scala_entry_facts(
             implicit_operation: None,
             explicit_operation: None,
             callable_family_complete: false,
+            exact_return_classes: Vec::new(),
             signature,
             receiver: is_map_member.then_some(ReceiverFact { pointer: false }),
             extension_receiver: None,
@@ -613,6 +623,8 @@ fn empty_constructor_fact(owner: &TypeFact, name: String) -> MemberFact {
     MemberFact {
         non_overridable: None,
         ambient_use: Some(AmbientUseRole::NotAmbient),
+        value_type: None,
+        proxied_type: None,
         id: member_declaration_id(MemberIdentity {
             owner_id: &owner.id,
             kind: MemberKind::Constructor,
@@ -634,6 +646,7 @@ fn empty_constructor_fact(owner: &TypeFact, name: String) -> MemberFact {
         implicit_operation: None,
         explicit_operation: None,
         callable_family_complete: false,
+        exact_return_classes: Vec::new(),
         signature: Some(Signature {
             type_parameters: Vec::new(),
             parameters: Vec::new(),
@@ -730,27 +743,24 @@ fn collection_flow_facts(types: &[TypeFact], members: &[MemberFact]) -> Vec<Coll
 }
 
 fn collection_value_shape(parameter: &str) -> CsmiCollectionFlowShape {
-    CsmiCollectionFlowShape::Value {
-        r#type: CsmiTypeExpression::Parameter(CsmiParameterType {
-            kind: CsmiParameterTypeKind::Parameter,
-            symbol: format!("type-parameter.{parameter}"),
-        }),
-    }
+    crate::analyzer::semantic_model::csmi::collection_value_shape(&format!(
+        "type-parameter.{parameter}"
+    ))
 }
 
 fn is_map_apply_signature(signature: &Signature, key: &str, value: &str) -> bool {
     signature.parameters.len() == 1
-        && is_type_parameter(&signature.parameters[0].r#type, key)
+        && signature.parameters[0].r#type.is_type_parameter(key)
         && signature
             .returns
             .as_ref()
-            .is_some_and(|result| is_type_parameter(result, value))
+            .is_some_and(|result| result.is_type_parameter(value))
 }
 
 fn is_map_update_signature(signature: &Signature, key: &str, value: &str) -> bool {
     signature.parameters.len() == 2
-        && is_type_parameter(&signature.parameters[0].r#type, key)
-        && is_type_parameter(&signature.parameters[1].r#type, value)
+        && signature.parameters[0].r#type.is_type_parameter(key)
+        && signature.parameters[1].r#type.is_type_parameter(value)
 }
 
 fn is_map_foreach_signature(signature: &Signature, key: &str, value: &str) -> bool {
@@ -774,12 +784,8 @@ fn is_map_foreach_signature(signature: &Signature, key: &str, value: &str) -> bo
     name == "scala.Function1"
         && tuple_name == "scala.Tuple2"
         && tuple_arguments.len() == 2
-        && is_type_parameter(&tuple_arguments[0], key)
-        && is_type_parameter(&tuple_arguments[1], value)
-}
-
-fn is_type_parameter(value: &TypeRef, expected: &str) -> bool {
-    matches!(value, TypeRef::TypeParameter { name } if name == expected)
+        && tuple_arguments[0].is_type_parameter(key)
+        && tuple_arguments[1].is_type_parameter(value)
 }
 
 fn map_apply_flow(
@@ -788,7 +794,8 @@ fn map_apply_flow(
     receiver_shape: CsmiCollectionFlowShape,
     value_parameter: &str,
 ) -> CsmiCollectionFlowPayload {
-    let mut source_projection = entry_parameter_projection(0);
+    let mut source_projection =
+        crate::analyzer::semantic_model::csmi::entry_parameter_projection(0);
     source_projection.steps.push(CsmiProjectionStep {
         kind: "entry-value".to_owned(),
         args: None,
@@ -837,7 +844,8 @@ fn map_update_flow(
     receiver_shape: CsmiCollectionFlowShape,
     value_parameter: &str,
 ) -> CsmiCollectionFlowPayload {
-    let mut destination_projection = entry_parameter_projection(0);
+    let mut destination_projection =
+        crate::analyzer::semantic_model::csmi::entry_parameter_projection(0);
     destination_projection.steps.push(CsmiProjectionStep {
         kind: "entry-value".to_owned(),
         args: None,
@@ -962,19 +970,6 @@ fn output_receiver_root() -> CsmiOutputBoundaryRoot {
     })
 }
 
-fn entry_parameter_projection(position: u32) -> CsmiProjection {
-    CsmiProjection {
-        scheme: "csmi.collection-flow".to_owned(),
-        scheme_version: "0.1.0".to_owned(),
-        steps: vec![CsmiProjectionStep {
-            kind: "entry".to_owned(),
-            args: Some(serde_json::json!({
-                "key": {"kind": "parameter", "position": position}
-            })),
-        }],
-    }
-}
-
 fn entry_all_projection() -> CsmiProjection {
     CsmiProjection {
         scheme: "csmi.collection-flow".to_owned(),
@@ -986,35 +981,23 @@ fn entry_all_projection() -> CsmiProjection {
     }
 }
 
-fn parent_index(parsed: &ParsedFile) -> HashMap<CodeUnit, CodeUnit> {
-    let mut parents = HashMap::default();
-    for (parent, children) in &parsed.children {
-        for child in children {
-            parents.insert(child.clone(), parent.clone());
-        }
-    }
-    parents
-}
-
 fn effective_visibility(
     source_facts: &HashMap<&CodeUnit, &ScalaDeclarationSourceFact>,
     declaration: &CodeUnit,
     parents: &HashMap<CodeUnit, CodeUnit>,
 ) -> Option<Visibility> {
-    let mut visibility = Visibility::Public;
-    let mut current = Some(declaration);
-    while let Some(candidate) = current {
-        let fact = source_facts
-            .get(&candidate)
-            .expect("Scala artifact owner has primary source facts");
-        match fact.visibility {
-            ScalaDeclarationVisibility::Public => {}
-            ScalaDeclarationVisibility::Protected => visibility = Visibility::Protected,
-            ScalaDeclarationVisibility::NonApi => return None,
-        }
-        current = parents.get(candidate);
-    }
-    Some(visibility)
+    let enclosing = std::iter::successors(Some(declaration), |candidate| parents.get(*candidate))
+        .map(|candidate| {
+            let fact = source_facts
+                .get(candidate)
+                .expect("Scala artifact owner has primary source facts");
+            Some(match fact.visibility {
+                ScalaDeclarationVisibility::Public => Visibility::Public,
+                ScalaDeclarationVisibility::Protected => Visibility::Protected,
+                ScalaDeclarationVisibility::NonApi => return None,
+            })
+        });
+    restrict_effective_visibility(Visibility::Public, enclosing)
 }
 
 fn scala_type_kind(kind: ScalaDeclarationKind, type_alias: bool) -> TypeKind {
@@ -1102,6 +1085,7 @@ fn scala_signature(
                 r#type: scala_type_ref(path, &available_type_parameters),
                 optional: defaults[parameter_index],
                 variadic: repeated && parameter_index + 1 == paths.len(),
+                role: None,
                 passing_mode: Default::default(),
             });
             ordinal += 1;
@@ -1189,29 +1173,6 @@ fn apply_extension_surfaces(types: &mut [TypeFact], surfaces: Vec<(Vec<String>, 
     }
 }
 
-fn take_record(remaining: &mut usize, record_limit_hit: &mut bool) -> bool {
-    if *remaining == 0 {
-        *record_limit_hit = true;
-        return false;
-    }
-    *remaining -= 1;
-    true
-}
-
-fn cancelled_production(limits: &ArtifactProducerLimits) -> ArtifactProduction {
-    ArtifactProduction::failed(
-        ProducerDiagnostic {
-            severity: ProducerDiagnosticSeverity::Error,
-            source_entry: None,
-            code: "artifact.cancelled".to_owned(),
-            location: None,
-            declaration: None,
-            message: "Scala archive production was cancelled".to_owned(),
-        },
-        limits,
-    )
-}
-
 fn finish_production(
     request: &ArtifactProductionRequest,
     artifact_sha256: &str,
@@ -1235,21 +1196,10 @@ fn finish_production(
             suppressed_diagnostics,
         };
     }
-    let mut activation: Vec<ActivationSelector> = request.activation.clone();
-    for selector in &mut activation {
-        selector.artifact_sha256 = Some(artifact_sha256.to_owned());
-    }
     let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
-    let completeness = if diagnostics.is_empty() && suppressed_diagnostics.total() == 0 {
-        Completeness::Complete
-    } else {
-        Completeness::Partial
-    };
-    // Every Source locator in these shards names an archive entry this
-    // producer parsed, so the pack carries them all.
-    let shards = vec![AuthoredShard {
+    let shard = AuthoredShard {
         id: "declarations.scala.external".to_owned(),
-        activation,
+        activation: request.activation.clone(),
         payload: AuthoredPayload::DeclarationFacts {
             types,
             members,
@@ -1262,43 +1212,24 @@ fn finish_production(
         }),
         deferred_yields: None,
         conditional_type_refinements: None,
-    }];
-    ArtifactProduction {
-        artifact_sha256: Some(artifact_sha256.to_owned()),
-        pack: Some(AuthoredSemanticModelPack {
-            schema_version: crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
-            pack_id: request.pack_id.clone(),
-            version: request.pack_version.clone(),
-            producer: Producer {
-                name: "bifrost-scala-source-jar".to_owned(),
-                version: env!("CARGO_PKG_VERSION").to_owned(),
-            },
-            language: "scala".to_owned(),
-            ecosystem: request.ecosystem.clone(),
-            compatibility: request.compatibility.clone(),
-            provenance: request.provenance.clone(),
-            license: request.license.clone(),
-            completeness,
-            safety: request.safety.clone(),
-            carried_sources: carried_source_paths(&shards),
-            cpp_portability: None,
-            python_correspondence: None,
-            shards,
-        }),
-        completeness,
+        callable_values: None,
+    };
+    crate::analyzer::semantic_model::finish_authored_pack_production(
+        request,
+        artifact_sha256,
+        "bifrost-scala-source-jar",
+        "scala",
         diagnostics,
         suppressed_diagnostics,
-    }
+        vec![shard],
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::semantic_model::{
-        Compatibility, CompilerOptions, NameSelector, Provenance, Safety, compile_pack,
-    };
+    use crate::analyzer::semantic_model::{CompilerOptions, Provenance, compile_pack};
     use crate::hash::HashSet;
-    use std::io::Write;
 
     const SCALA_SOURCE: &str = r#"
 package scala.sample
@@ -1335,57 +1266,28 @@ object Syntax {
     }
 
     fn request_for_version(path: std::path::PathBuf, version: &str) -> ArtifactProductionRequest {
-        ArtifactProductionRequest {
+        crate::test_support::jvm_source_jar_request(
             path,
-            artifact_kind: ExternalArtifactKind::ScalaSourceJar,
-            pack_id: "bifrost.scala.fixture".to_owned(),
-            pack_version: version.to_owned(),
-            ecosystem: "maven".to_owned(),
-            compatibility: Compatibility {
-                bifrost: None,
-                toolchains: vec![crate::analyzer::semantic_model::VersionConstraint {
-                    name: "scala".to_owned(),
-                    requirement: format!("={version}"),
-                }],
-            },
-            activation: vec![ActivationSelector {
-                package: Some(NameSelector {
-                    name: "org.scala-lang:scala-library".to_owned(),
-                    version: Some(format!("={version}")),
-                }),
-                module: None,
-                toolchain: Some(NameSelector {
-                    name: "scala".to_owned(),
-                    version: Some(format!("={version}")),
-                }),
-                targets: Vec::new(),
-                configurations: Vec::new(),
-                artifact_sha256: None,
-            }],
-            provenance: Provenance {
+            ExternalArtifactKind::ScalaSourceJar,
+            "bifrost.scala.fixture",
+            "scala",
+            "org.scala-lang:scala-library",
+            version,
+            Vec::new(),
+            Provenance {
                 source: "fixture source archive".to_owned(),
                 revision: Some("fixture-v1".to_owned()),
             },
-            license: "Apache-2.0".to_owned(),
-            safety: Safety {
-                generated_code_only: false,
-                review_required: false,
-            },
-        }
+        )
     }
 
     fn source_jar(entries: &[(&str, &str)]) -> tempfile::NamedTempFile {
         let mut file = tempfile::NamedTempFile::new().unwrap();
-        {
-            let mut archive = zip::ZipWriter::new(file.as_file_mut());
-            for (name, source) in entries {
-                archive
-                    .start_file(*name, zip::write::SimpleFileOptions::default())
-                    .unwrap();
-                archive.write_all(source.as_bytes()).unwrap();
-            }
-            archive.finish().unwrap();
-        }
+        crate::test_support::zip_helpers::write_zip_unwrap_to(
+            file.as_file_mut(),
+            entries,
+            zip::write::SimpleFileOptions::default(),
+        );
         file
     }
 
@@ -1508,7 +1410,11 @@ object Syntax {
         compile_pack(&pack, &Default::default()).unwrap();
     }
 
+    use brokk_bifrost_test_macros::hardwon;
     #[test]
+    #[hardwon(
+        "#1547: Tree-sitter Scala source with compound and by-name/variadic signatures must yield distinct callable identities"
+    )]
     fn scala_source_jar_preserves_compound_and_variadic_overload_identity() {
         let source = r#"
 package sample
@@ -1611,6 +1517,81 @@ new Evidence {
             second_compiled.manifest_bytes
         );
         assert_eq!(first_compiled.shards, second_compiled.shards);
+    }
+
+    #[test]
+    #[ignore = "requires BIFROST_SCALA_STDLIB_SOURCE_JAR pointing to a pinned source JAR"]
+    fn pinned_scala_standard_library_source_smoke() {
+        let path = std::env::var_os("BIFROST_SCALA_STDLIB_SOURCE_JAR")
+            .map(std::path::PathBuf::from)
+            .expect("set BIFROST_SCALA_STDLIB_SOURCE_JAR");
+        let version = std::env::var("BIFROST_SCALA_STDLIB_VERSION")
+            .expect("set BIFROST_SCALA_STDLIB_VERSION");
+        let production = ScalaSourceJarPackProducer.produce_exact_artifact(
+            &request_for_version(path, &version),
+            &ArtifactProducerLimits::default(),
+        );
+        let pack = production.pack.expect("real Scala source JAR pack");
+        let AuthoredPayload::DeclarationFacts { types, members, .. } = &pack.shards[0].payload
+        else {
+            panic!("Scala source producer must emit declaration facts");
+        };
+        let compiled = compile_pack(&pack, &CompilerOptions::default()).unwrap_or_else(|errors| {
+            for error in &errors {
+                if let Some(index) = error
+                    .path
+                    .strip_prefix("$.shards[0].payload.members[")
+                    .and_then(|path| path.split(']').next())
+                    .and_then(|index| index.parse::<usize>().ok())
+                {
+                    eprintln!("invalid member: {:#?}", members[index]);
+                }
+                if let Some(index) = error
+                    .path
+                    .strip_prefix("$.shards[0].payload.types[")
+                    .and_then(|path| path.split(']').next())
+                    .and_then(|index| index.parse::<usize>().ok())
+                {
+                    eprintln!("invalid type: {:#?}", types[index]);
+                }
+            }
+            panic!("pack compilation failed: {errors:#?}");
+        });
+        eprintln!(
+            "Scala source smoke: types={}, members={}, stored_bytes={}, raw_bytes={}, completeness={:?}, diagnostics={:#?}",
+            types.len(),
+            members.len(),
+            compiled
+                .shards
+                .iter()
+                .map(|shard| shard.descriptor.stored_size)
+                .sum::<u64>(),
+            compiled
+                .shards
+                .iter()
+                .map(|shard| shard.descriptor.raw_size)
+                .sum::<u64>(),
+            production.completeness,
+            production.diagnostics
+        );
+        for expected in [
+            "scala.Any",
+            "scala.AnyRef",
+            "scala.AnyVal",
+            "scala.Predef",
+            "scala.collection.Iterable",
+        ] {
+            assert!(
+                types.iter().any(|fact| fact.name == expected),
+                "missing {expected}; diagnostics={:#?}",
+                production.diagnostics
+            );
+        }
+        assert!(
+            members.iter().any(|fact| fact.name == "hashCode"),
+            "scala.Any.hashCode should come from source; diagnostics={:#?}",
+            production.diagnostics
+        );
     }
 
     #[test]
@@ -1780,7 +1761,7 @@ trait Map[K, V] {
     #[test]
     fn scala_visibility_uses_access_modifier_nodes() {
         let source = "class Surface { protected def inherited: Int = 1; private def hidden: Int = 2; def public: Int = 3 }";
-        let mut parser = Parser::new();
+        let mut parser = tree_sitter::Parser::new();
         parser.set_language(&language::LANGUAGE.into()).unwrap();
         let tree = parser.parse(source, None).unwrap();
         let file = ProjectFile::new(std::env::temp_dir(), "Visibility.scala");
@@ -1800,80 +1781,5 @@ trait Map[K, V] {
         assert!(visibility.contains(&ScalaDeclarationVisibility::Public));
         assert!(visibility.contains(&ScalaDeclarationVisibility::Protected));
         assert!(visibility.contains(&ScalaDeclarationVisibility::NonApi));
-    }
-
-    #[test]
-    #[ignore = "requires BIFROST_SCALA_STDLIB_SOURCE_JAR pointing to a pinned source JAR"]
-    fn pinned_scala_standard_library_source_smoke() {
-        let path = std::env::var_os("BIFROST_SCALA_STDLIB_SOURCE_JAR")
-            .map(std::path::PathBuf::from)
-            .expect("set BIFROST_SCALA_STDLIB_SOURCE_JAR");
-        let version = std::env::var("BIFROST_SCALA_STDLIB_VERSION")
-            .expect("set BIFROST_SCALA_STDLIB_VERSION");
-        let production = ScalaSourceJarPackProducer.produce_exact_artifact(
-            &request_for_version(path, &version),
-            &ArtifactProducerLimits::default(),
-        );
-        let pack = production.pack.expect("real Scala source JAR pack");
-        let AuthoredPayload::DeclarationFacts { types, members, .. } = &pack.shards[0].payload
-        else {
-            panic!("Scala source producer must emit declaration facts");
-        };
-        let compiled = compile_pack(&pack, &CompilerOptions::default()).unwrap_or_else(|errors| {
-            for error in &errors {
-                if let Some(index) = error
-                    .path
-                    .strip_prefix("$.shards[0].payload.members[")
-                    .and_then(|path| path.split(']').next())
-                    .and_then(|index| index.parse::<usize>().ok())
-                {
-                    eprintln!("invalid member: {:#?}", members[index]);
-                }
-                if let Some(index) = error
-                    .path
-                    .strip_prefix("$.shards[0].payload.types[")
-                    .and_then(|path| path.split(']').next())
-                    .and_then(|index| index.parse::<usize>().ok())
-                {
-                    eprintln!("invalid type: {:#?}", types[index]);
-                }
-            }
-            panic!("pack compilation failed: {errors:#?}");
-        });
-        eprintln!(
-            "Scala source smoke: types={}, members={}, stored_bytes={}, raw_bytes={}, completeness={:?}, diagnostics={:#?}",
-            types.len(),
-            members.len(),
-            compiled
-                .shards
-                .iter()
-                .map(|shard| shard.descriptor.stored_size)
-                .sum::<u64>(),
-            compiled
-                .shards
-                .iter()
-                .map(|shard| shard.descriptor.raw_size)
-                .sum::<u64>(),
-            production.completeness,
-            production.diagnostics
-        );
-        for expected in [
-            "scala.Any",
-            "scala.AnyRef",
-            "scala.AnyVal",
-            "scala.Predef",
-            "scala.collection.Iterable",
-        ] {
-            assert!(
-                types.iter().any(|fact| fact.name == expected),
-                "missing {expected}; diagnostics={:#?}",
-                production.diagnostics
-            );
-        }
-        assert!(
-            members.iter().any(|fact| fact.name == "hashCode"),
-            "scala.Any.hashCode should come from source; diagnostics={:#?}",
-            production.diagnostics
-        );
     }
 }

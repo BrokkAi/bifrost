@@ -3,7 +3,6 @@ use super::{
     WorkspaceGeneration,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::{
     cmp::Ordering,
@@ -703,6 +702,37 @@ pub enum SemanticRelationStatus {
     Cancelled,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(super) enum BoundaryStatusError {
+    CompleteWithBoundaries,
+    BudgetWithoutBudgetBoundary,
+    FrontierWithoutAnalysisOnlyBoundaries,
+}
+
+pub(super) fn validate_completion_boundaries(
+    status: SemanticRelationStatus,
+    boundaries: impl Iterator<Item = bool>,
+) -> Result<(), BoundaryStatusError> {
+    let mut has_boundaries = false;
+    let mut has_budget_boundary = false;
+    for is_budget in boundaries {
+        has_boundaries = true;
+        has_budget_boundary |= is_budget;
+    }
+    match status {
+        SemanticRelationStatus::Complete if has_boundaries => {
+            Err(BoundaryStatusError::CompleteWithBoundaries)
+        }
+        SemanticRelationStatus::BudgetBounded if !has_budget_boundary => {
+            Err(BoundaryStatusError::BudgetWithoutBudgetBoundary)
+        }
+        SemanticRelationStatus::FrontierBounded if has_budget_boundary || !has_boundaries => {
+            Err(BoundaryStatusError::FrontierWithoutAnalysisOnlyBoundaries)
+        }
+        _ => Ok(()),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SemanticRelationSnapshot {
@@ -855,35 +885,25 @@ impl SemanticRelationSnapshot {
                 summary.validate()?;
             }
         }
-        let budget_boundaries = self
-            .boundaries
-            .iter()
-            .filter(|boundary| boundary.kind.is_budget())
-            .count();
-        match self.status {
-            SemanticRelationStatus::Complete if !self.boundaries.is_empty() => {
-                return Err(RelationCodecError::new(
-                    "complete snapshots cannot contain boundaries",
-                ));
-            }
-            // The two bounded states are claims about *why* the derivation
-            // stopped, so each must be able to point at the boundary that says
-            // so. A frontier-bounded snapshot carrying a budget boundary would
-            // be the #2412 conflation in the other direction.
-            SemanticRelationStatus::BudgetBounded if budget_boundaries == 0 => {
-                return Err(RelationCodecError::new(
-                    "budget-bounded snapshots must name the exhausted dimension",
-                ));
-            }
-            SemanticRelationStatus::FrontierBounded
-                if budget_boundaries > 0 || self.boundaries.is_empty() =>
-            {
-                return Err(RelationCodecError::new(
-                    "frontier-bounded snapshots must carry only analysis boundaries",
-                ));
-            }
-            _ => {}
-        }
+        validate_completion_boundaries(
+            self.status,
+            self.boundaries
+                .iter()
+                .map(|boundary| boundary.kind.is_budget()),
+        )
+        .map_err(|error| {
+            RelationCodecError::new(match error {
+                BoundaryStatusError::CompleteWithBoundaries => {
+                    "complete snapshots cannot contain boundaries"
+                }
+                BoundaryStatusError::BudgetWithoutBudgetBoundary => {
+                    "budget-bounded snapshots must name the exhausted dimension"
+                }
+                BoundaryStatusError::FrontierWithoutAnalysisOnlyBoundaries => {
+                    "frontier-bounded snapshots must carry only analysis boundaries"
+                }
+            })
+        })?;
         Ok(())
     }
     /// Whether an empty edge set is a claim that no such edge exists.
@@ -912,7 +932,7 @@ impl RelationCodecError {
 }
 impl fmt::Display for RelationCodecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        super::fmt_text(&self.0, f)
     }
 }
 impl std::error::Error for RelationCodecError {}
@@ -939,12 +959,13 @@ pub fn encode_relation_snapshot_json(
 pub fn decode_relation_snapshot_json(
     bytes: &[u8],
 ) -> Result<SemanticRelationSnapshot, RelationCodecError> {
-    let value: SemanticRelationSnapshot = decode(bytes)?;
-    value.validate()?;
-    if snapshot_digest(&value)? != value.snapshot_digest {
-        return Err(RelationCodecError::new("snapshot digest mismatch"));
-    }
-    Ok(value)
+    decode_snapshot_json(
+        bytes,
+        |value: &SemanticRelationSnapshot| value.validate().map_err(|error| error.to_string()),
+        |value| snapshot_digest(value).map_err(|error| error.to_string()),
+        |value, digest| value.snapshot_digest == *digest,
+        "snapshot digest mismatch",
+    )
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1083,30 +1104,26 @@ fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, RelationCodecError> {
 pub(crate) fn decode_json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, RelationCodecError> {
     serde_json::from_slice(bytes).map_err(|e| RelationCodecError::new(e.to_string()))
 }
+pub(super) fn decode_snapshot_json<T: DeserializeOwned>(
+    bytes: &[u8],
+    validate: impl FnOnce(&T) -> Result<(), String>,
+    digest: impl FnOnce(&T) -> Result<StableDigest, String>,
+    digest_matches: impl FnOnce(&T, &StableDigest) -> bool,
+    mismatch: &'static str,
+) -> Result<T, RelationCodecError> {
+    let value = decode_json(bytes)?;
+    validate(&value).map_err(RelationCodecError::new)?;
+    let digest = digest(&value).map_err(RelationCodecError::new)?;
+    if !digest_matches(&value, &digest) {
+        return Err(RelationCodecError::new(mismatch));
+    }
+    Ok(value)
+}
 /// Canonical (key-sorted, newline-terminated) JSON bytes, shared by every
 /// extension wire contract so their digests are derived the same way.
 pub(crate) fn canonical_bytes(value: &impl Serialize) -> Result<Vec<u8>, RelationCodecError> {
-    let value = serde_json::to_value(value).map_err(|e| RelationCodecError::new(e.to_string()))?;
-    let mut bytes = serde_json::to_vec(&canonical(value))
-        .map_err(|e| RelationCodecError::new(e.to_string()))?;
-    bytes.push(b'\n');
-    Ok(bytes)
-}
-fn canonical(value: Value) -> Value {
-    match value {
-        Value::Object(map) => {
-            let mut entries = map.into_iter().collect::<Vec<_>>();
-            entries.sort_by(|a, b| a.0.cmp(&b.0));
-            Value::Object(
-                entries
-                    .into_iter()
-                    .map(|(k, v)| (k, canonical(v)))
-                    .collect::<Map<_, _>>(),
-            )
-        }
-        Value::Array(values) => Value::Array(values.into_iter().map(canonical).collect()),
-        other => other,
-    }
+    super::codec::canonical_json_bytes(value)
+        .map_err(|error| RelationCodecError::new(error.to_string()))
 }
 fn snapshot_digest(value: &SemanticRelationSnapshot) -> Result<StableDigest, RelationCodecError> {
     let mut json =
@@ -1114,15 +1131,10 @@ fn snapshot_digest(value: &SemanticRelationSnapshot) -> Result<StableDigest, Rel
     json.as_object_mut()
         .expect("object")
         .remove("snapshot_digest");
-    StableDigest::parse(format!("{:x}", Sha256::digest(canonical_bytes(&json)?)))
-        .map_err(RelationCodecError::new)
+    Ok(StableDigest::sha256(&canonical_bytes(&json)?))
 }
 pub(crate) fn request_digest(
     value: &SemanticRelationRequest,
 ) -> Result<StableDigest, RelationCodecError> {
-    StableDigest::parse(format!(
-        "{:x}",
-        Sha256::digest(encode_relation_request_json(value)?)
-    ))
-    .map_err(RelationCodecError::new)
+    Ok(StableDigest::sha256(&encode_relation_request_json(value)?))
 }

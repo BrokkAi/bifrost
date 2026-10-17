@@ -1,5 +1,10 @@
 # Rust standard-library semantic pack
 
+> Legacy transition copy: product pack authoring belongs in `bifrost-packs`
+> or the private premium pack repository. Follow [the placement policy](../../CONTRIBUTING.md#release-process).
+> Sources here are frozen pending verified v0.13.0 release and dependency migration.
+> The technical notes below describe retained contracts and test tooling.
+
 This directory pins the official Rust `rust-docs-json-preview` component for
 `nightly-2026-08-24`, whose compiler is `rustc 1.100.0-nightly
 (fb6531d55 2026-08-23)`. The pack contains exactly the public rustdoc JSON

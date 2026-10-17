@@ -91,16 +91,20 @@ use those fields to describe the result accurately.
 
 ### Compose immutable usage facts
 
-**Status: Direction.** The proposed usage engine stores immutable file-local
-resolution material under its content identity. A query composes those facts
+**Status: Direction.** The
+[Name Resolution Engine](../name-resolution/) stores immutable file-local
+resolution facts under their content identity. A query composes those facts
 for the selected workspace, avoiding a mutable global graph and chains of
-parent deltas. See the
+parent deltas. Rust uses the engine in production. The remaining direction is
+to move every other language onto it with all of its consumers and then remove
+that language's previous resolver; see
+[Language status](../name-resolution/#language-status). See the
 [usage-analysis design](../usage-analysis/#persisted-inputs-and-compositional-usage-facts)
-for the composition contract and current implementation, and the
-[storage direction](../storage-and-cache/#direction-compositional-resolution-fragments)
-for the finer-grained cache question. Shipping requires parity with current
-resolvers, bounded memory, accurate cancellation and cap reporting, and useful
-reuse across linked worktrees.
+for the composition contract, and
+[compositional resolution fragments](../storage-and-cache/#compositional-resolution-fragments)
+for what is stored and what each query recomputes. Each language's switch
+requires parity with its current resolver, bounded memory, accurate
+cancellation and cap reporting, and useful reuse across linked worktrees.
 
 ### Close known semantic gaps
 

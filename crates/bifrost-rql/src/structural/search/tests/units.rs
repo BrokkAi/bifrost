@@ -4,6 +4,7 @@ use crate::structural::search::units::{
     CodeQueryExecutionScope, MergedUnitRows, UnitExecutionResult, execute_code_query_unit,
     merge_unit_rows, plan_seed_files, seed_file_order, unit_row_key,
 };
+use brokk_bifrost_test_macros::hardwon;
 
 /// Eight files so the whole execution clears the auto structural-index
 /// admission rule (`MIN_AUTO_STRUCTURAL_INDEX_FILES`), which a one-file unit
@@ -130,6 +131,19 @@ fn merged(
     merge_unit_rows(query, units(workspace, query, seed_files))
 }
 
+fn assert_merged_units_match_whole(
+    project: &BuiltInlineTestProject,
+    workspace: &WorkspaceAnalyzer,
+    query: &CodeQuery,
+    files: &[ProjectFile],
+    whole: &DetailedCodeQueryResult,
+) -> MergedUnitRows {
+    let merged = merged(workspace, query, files);
+    assert_eq!(merged.items, projected(&whole.result.results));
+    assert_eq!(merged.detailed_evidence(project.root()), whole.evidence);
+    merged
+}
+
 fn seed_files_of(workspace: &WorkspaceAnalyzer) -> Vec<ProjectFile> {
     let mut files = workspace.analyzer().analyzed_files();
     files.sort_by(seed_file_order);
@@ -146,13 +160,7 @@ fn merged_structural_units_reproduce_the_whole_execution() {
     let whole = whole_execution(&workspace, &query);
     assert!(!whole.result.results.is_empty());
 
-    let merged = merged(&workspace, &query, &files);
-    assert_eq!(merged.items, projected(&whole.result.results));
-    assert_eq!(
-        merged.detailed_evidence(project.root()),
-        whole.evidence,
-        "the evidence projection rebuilds the executor's own evidence"
-    );
+    let merged = assert_merged_units_match_whole(&project, &workspace, &query, &files, &whole);
     assert_eq!(merged.completion(), whole.result.completion());
 }
 
@@ -166,10 +174,7 @@ fn merged_overlapping_union_units_reproduce_branch_order_and_evidence() {
     );
     let query = overlapping_union_query();
     let whole = whole_execution(&workspace, &query);
-    let merged = merged(&workspace, &query, &files);
-
-    assert_eq!(merged.items, projected(&whole.result.results));
-    assert_eq!(merged.detailed_evidence(project.root()), whole.evidence);
+    let merged = assert_merged_units_match_whole(&project, &workspace, &query, &files, &whole);
     assert_eq!(merged.completion(), whole.result.completion());
 }
 
@@ -180,10 +185,7 @@ fn merged_nested_union_units_reproduce_full_branch_paths() {
     let query = nested_union_query();
     let files = plan_seed_files(&query.plan, &workspace.analyzer().analyzed_files());
     let whole = whole_execution(&workspace, &query);
-    let merged = merged(&workspace, &query, &files);
-
-    assert_eq!(merged.items, projected(&whole.result.results));
-    assert_eq!(merged.detailed_evidence(project.root()), whole.evidence);
+    assert_merged_units_match_whole(&project, &workspace, &query, &files, &whole);
 }
 
 #[test]
@@ -207,21 +209,6 @@ fn union_merge_widens_when_the_conservative_fair_cap_is_reached() {
         Some(crate::structural::search::units::MergedLimit::ScannedFiles),
         "a root union's physical budget is divided by its branch count"
     );
-}
-
-#[test]
-fn merged_occurrence_units_reproduce_the_whole_execution() {
-    let project = eight_file_project();
-    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
-    let files = seed_files_of(&workspace);
-    let query = occurrence_query();
-
-    let whole = whole_execution(&workspace, &query);
-    assert!(!whole.result.results.is_empty());
-
-    let merged = merged(&workspace, &query, &files);
-    assert_eq!(merged.items, projected(&whole.result.results));
-    assert_eq!(merged.detailed_evidence(project.root()), whole.evidence);
 }
 
 #[test]
@@ -374,90 +361,6 @@ fn a_row_key_and_its_evidence_are_the_same_at_two_workspace_roots() {
     assert_eq!(
         first_evidence, second_evidence,
         "an evidence projection carries no workspace root"
-    );
-}
-
-#[test]
-fn an_execution_exports_the_budgeted_lanes_its_public_work_drops() {
-    let project = InlineTestProject::with_language(Language::TypeScript)
-        .file(
-            "src/callee.ts",
-            "export function target() {\n  return 1;\n}\n",
-        )
-        .file(
-            "src/caller.ts",
-            "import { target } from './callee';\nexport function caller() {\n  return target();\n}\n",
-        )
-        .build();
-    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
-    let query = callers_query();
-
-    let unit = execute_code_query_unit(
-        workspace.analyzer(),
-        None,
-        &query,
-        CodeQueryExecutionLimits::default(),
-        None,
-        CodeQueryExecutionScope::whole_workspace(),
-    );
-
-    assert!(
-        unit.budgeted_work.provenance_steps > 0,
-        "a call-expansion step charges provenance steps against max_pipeline_rows"
-    );
-    assert_eq!(
-        unit.budgeted_work.max_step_outputs(),
-        u64::try_from(unit.rows.len()).expect("row count fits"),
-        "the final step's output count is the row count it produced"
-    );
-    assert!(
-        unit.budgeted_work.step_outputs.len() >= query.plan.steps.len(),
-        "every plan operator has an entry, so every step has one"
-    );
-}
-
-#[test]
-fn an_execution_exports_the_import_lanes_it_charged() {
-    let project = InlineTestProject::with_language(Language::TypeScript)
-        .file(
-            "src/callee.ts",
-            "export function target() {\n  return 1;\n}\n",
-        )
-        .file(
-            "src/caller.ts",
-            "import { target } from './callee';\nexport function caller() {\n  return target();\n}\n",
-        )
-        .build();
-    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
-    let query = CodeQuery::from_json(&json!({
-        "schema_version": 1,
-        "match": { "kind": "function", "name": "caller" },
-        "steps": [{ "op": "file_of" }, { "op": "imports_of" }],
-        "limit": 100,
-        "result_detail": "full"
-    }))
-    .expect("imports query");
-
-    let unit = execute_code_query_unit(
-        workspace.analyzer(),
-        None,
-        &query,
-        CodeQueryExecutionLimits::default(),
-        None,
-        CodeQueryExecutionScope::whole_workspace(),
-    );
-
-    assert!(
-        !unit.rows.is_empty(),
-        "the import traversal reaches the imported file"
-    );
-    assert!(
-        unit.budgeted_work.import_files_resolved > 0,
-        "import resolution charges the file lane against max_scanned_files"
-    );
-    assert!(
-        unit.budgeted_work.import_edges_resolved > 0,
-        "import resolution charges the edge lane against max_pipeline_rows"
     );
 }
 
@@ -719,6 +622,9 @@ fn reference_kind_fixture() -> ReferenceSiteValue {
 }
 
 #[test]
+#[hardwon(
+    "#3628: reference-site intersection must merge coarse and exact declaration-kind evidence"
+)]
 fn reference_site_intersection_merges_both_declaration_kinds() {
     let coarse = reference_kind_fixture();
     let mut exact = coarse.clone();
@@ -761,6 +667,7 @@ fn reference_site_intersection_merges_both_declaration_kinds() {
 /// declaration and range, the enclosing declaration by id alone, then usage
 /// kind, proof and reference kind.
 #[test]
+#[hardwon("#3628: declaration-kind evidence must not change persisted reference-site identity")]
 fn reference_site_unit_key_is_independent_of_kind_evidence() {
     let coarse = reference_kind_fixture();
     let mut exact = coarse.clone();
@@ -813,6 +720,7 @@ fn reference_site_unit_key_is_independent_of_kind_evidence() {
 }
 
 #[test]
+#[hardwon("#3628: reference-site unions must preserve declaration and target evidence identity")]
 fn reference_site_union_keeps_whole_and_sliced_evidence_equal() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file("Cargo.toml", "[package]\nname = \"reference-kinds\"\nversion = \"0.1.0\"\nedition = \"2024\"\n")
@@ -837,5 +745,359 @@ fn reference_site_union_keeps_whole_and_sliced_evidence_equal() {
         let merged = merged(&workspace, &query, &files);
         assert_eq!(merged.items, projected(&whole.result.results));
         assert_eq!(merged.detailed_evidence(project.root()), whole.evidence);
+    }
+}
+
+#[test]
+fn merged_occurrence_units_reproduce_the_whole_execution() {
+    let project = eight_file_project();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let files = seed_files_of(&workspace);
+    let query = occurrence_query();
+
+    let whole = whole_execution(&workspace, &query);
+    assert!(!whole.result.results.is_empty());
+
+    let merged = merged(&workspace, &query, &files);
+    assert_eq!(merged.items, projected(&whole.result.results));
+    assert_eq!(merged.detailed_evidence(project.root()), whole.evidence);
+}
+
+#[test]
+fn an_execution_exports_the_budgeted_lanes_its_public_work_drops() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "src/callee.ts",
+            "export function target() {\n  return 1;\n}\n",
+        )
+        .file(
+            "src/caller.ts",
+            "import { target } from './callee';\nexport function caller() {\n  return target();\n}\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = callers_query();
+
+    let unit = execute_code_query_unit(
+        workspace.analyzer(),
+        None,
+        &query,
+        CodeQueryExecutionLimits::default(),
+        None,
+        CodeQueryExecutionScope::whole_workspace(),
+    );
+
+    assert!(
+        unit.budgeted_work.provenance_steps > 0,
+        "a call-expansion step charges provenance steps against max_pipeline_rows"
+    );
+    assert_eq!(
+        unit.budgeted_work.max_step_outputs(),
+        u64::try_from(unit.rows.len()).expect("row count fits"),
+        "the final step's output count is the row count it produced"
+    );
+    assert!(
+        unit.budgeted_work.step_outputs.len() >= query.plan.steps.len(),
+        "every plan operator has an entry, so every step has one"
+    );
+}
+
+#[hardwon(
+    "#5294: persisted query units must preserve exact diagnostic sites and read older products"
+)]
+#[test]
+fn python_format_diagnostic_sources_survive_persisted_unit_round_trip() {
+    let source = "message = get_template().format()\n";
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("formatting.py", source)
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let files = seed_files_of(&workspace);
+    let query = CodeQuery::from_sexp(
+        "(filter :where ((relation eq str_format_mixed_fields) (outcome eq issue))
+            (python-format-issues (language python (call))))",
+    )
+    .expect("format diagnostic query");
+    let [unit]: [UnitExecutionResult; 1] = units(&workspace, &query, &files)
+        .try_into()
+        .expect("one unit");
+    let encoded = serde_json::to_value(&unit).expect("persisted row product");
+    let decoded: UnitExecutionResult =
+        serde_json::from_value(encoded.clone()).expect("read row product");
+    assert_eq!(serde_json::to_value(&decoded).unwrap(), encoded);
+    let [diagnostic] = decoded.diagnostics.as_slice() else {
+        panic!("only the selected format relation is incomplete: {decoded:#?}");
+    };
+    let location = diagnostic.source.as_ref().expect("persisted source span");
+    assert_eq!(location.path, "formatting.py");
+    assert_eq!((location.start_byte, location.end_byte), (10, 33));
+    assert_eq!(
+        location.range,
+        CodeQueryRange {
+            start_line: 1,
+            start_column: 11,
+            end_line: 1,
+            end_column: 34,
+        }
+    );
+    assert_eq!(
+        &source[location.start_byte..location.end_byte],
+        "get_template().format()"
+    );
+
+    // Old row products remain readable; cache identity forces their recomputation.
+    let mut legacy = encoded;
+    for diagnostic in legacy["diagnostics"].as_array_mut().unwrap() {
+        diagnostic.as_object_mut().unwrap().remove("source");
+    }
+    let decoded: UnitExecutionResult =
+        serde_json::from_value(legacy).expect("read legacy row product");
+    assert!(
+        decoded
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.source.is_none())
+    );
+}
+
+#[hardwon("#5294: flattened nested unions used inherited alias filters to hide diagnostic gaps")]
+#[test]
+fn python_format_nested_union_filters_preserve_whole_diagnostic_scope_and_aliases() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("first.py", "message = \"{0} {}\".format(*values)\n")
+        .file("second.py", "message = \"{0} {}\".format(*values)\n")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let diagnostics = |items: &[CodeQueryDiagnostic]| {
+        let mut items = items
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code == CodeQueryDiagnosticCode::SemanticAnalysisPartial
+            })
+            .map(|diagnostic| serde_json::to_string(diagnostic).expect("diagnostic wire value"))
+            .collect::<Vec<_>>();
+        items.sort();
+        items
+    };
+    for (local_relation, expected_diagnostics, expected_rows) in [
+        // *values leaves only the two positional argument relations open.
+        (None, 12, 2),
+        (Some("str_format_mixed_fields"), 0, 2),
+        (Some("str_format_missing_argument"), 6, 0),
+    ] {
+        let source = "(project :columns ((relation selected) outcome proof completeness)
+            (python-format-issues (language python (call))))";
+        let selected = local_relation.map_or_else(
+            || source.to_string(),
+            |relation| format!("(filter :where ((selected eq {relation})) {source})"),
+        );
+        let leaf = selected;
+        let nested = format!(
+            "(project :columns ((selected renamed) outcome proof completeness)
+              (filter :where ((selected eq str_format_mixed_fields))
+                (union {leaf} {leaf})))"
+        );
+        let other =
+            format!("(project :columns ((selected renamed) outcome proof completeness) {leaf})");
+        let query = CodeQuery::from_sexp(&format!(
+            "(filter :where ((renamed eq str_format_mixed_fields))
+                (union {nested} {other}))"
+        ))
+        .expect("nested format union with source aliases");
+        assert_eq!(
+            crate::query::PlanPartitioning::classify(&query.plan),
+            crate::query::PlanPartitioning::Whole
+        );
+        let whole = whole_execution(&workspace, &query);
+        assert_eq!(
+            whole.result.results.len(),
+            expected_rows,
+            "{local_relation:?}"
+        );
+        let whole_diagnostics = diagnostics(&whole.result.diagnostics);
+        assert_eq!(
+            whole_diagnostics.len(),
+            expected_diagnostics,
+            "{whole_diagnostics:#?}"
+        );
+        assert!(
+            whole
+                .result
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.source.is_some()),
+            "{:#?}",
+            whole.result.diagnostics
+        );
+    }
+}
+
+#[hardwon("#5310: union and intersection discarded projected aliases before outer filters")]
+#[test]
+fn set_operators_preserve_projected_aliases_and_survivor_evidence() {
+    let source = "message = \"{0} {}\".format(\"a\", \"b\")\n";
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("formatting.py", source)
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let leaf = "(project :columns ((relation selected) outcome proof completeness)
+        (python-format-issues (language python (call))))";
+    for input in [
+        leaf.to_string(),
+        format!("(union {leaf} {leaf})"),
+        format!("(intersect {leaf} {leaf})"),
+        format!("(except {leaf} (filter :where ((outcome eq no_issue)) {leaf}))"),
+    ] {
+        let query = CodeQuery::from_sexp(&format!(
+            "(result-detail full
+                (filter :where ((renamed eq str_format_mixed_fields) (outcome eq issue))
+                  (project :columns ((selected renamed) outcome proof completeness) {input})))"
+        ))
+        .expect("set query preserves the compatible projected schema");
+        let whole = whole_execution(&workspace, &query);
+        assert_eq!(
+            whole.result.completion(),
+            CodeQueryCompletion::Complete,
+            "{whole:#?}"
+        );
+        let [item] = whole.result.results.as_slice() else {
+            panic!("one mixed-fields issue for {input}: {whole:#?}");
+        };
+        let projected = UnitRowItem::project(item);
+        assert!(matches!(
+            projected.field("renamed").expect("surviving alias"),
+            Some(CodeQueryRowScalarRef::ConstrainedEnum(
+                "str_format_mixed_fields"
+            ))
+        ));
+        let [evidence] = whole.evidence.as_slice() else {
+            panic!("one source-backed row: {whole:#?}");
+        };
+        assert_eq!(evidence.result_index, 0);
+        let span = evidence.byte_span.as_ref().expect("exact finding span");
+        assert_eq!(&source[span.clone()], "\"{0} {}\"");
+        assert!(evidence.source_slice_sha256.is_some());
+        assert_eq!(evidence.provenance.len(), item.provenance.len());
+        assert!(!item.provenance_truncated);
+    }
+}
+
+#[hardwon("#5310: flattened union rows retained aliases that whole-query sets discarded")]
+#[test]
+fn projected_nested_union_units_match_whole_rows_and_detailed_evidence() {
+    let project = eight_file_project();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let files = seed_files_of(&workspace);
+    let leaf = "(filter :where ((selected is-not-null))
+        (project :columns ((name selected)) (language typescript (call))))";
+    let nested = format!("(project :columns ((selected renamed)) (union {leaf} {leaf}))");
+    let query = CodeQuery::from_sexp(&format!(
+        "(result-detail full
+            (project :columns ((renamed final_name))
+              (union {nested} (project :columns ((selected renamed)) {leaf}))))"
+    ))
+    .expect("nested union preserves compatible aliases across sets");
+    assert_eq!(
+        crate::query::PlanPartitioning::classify(&query.plan),
+        crate::query::PlanPartitioning::BySeedUnion
+    );
+    let whole = whole_execution(&workspace, &query);
+    assert_eq!(
+        whole.result.completion(),
+        CodeQueryCompletion::Complete,
+        "{whole:#?}"
+    );
+    assert_eq!(whole.result.results.len(), 8, "{whole:#?}");
+    let merged = assert_merged_units_match_whole(&project, &workspace, &query, &files, &whole);
+    assert_eq!(merged.completion(), whole.result.completion());
+    for item in &merged.items {
+        assert!(matches!(
+            item.field("final_name").expect("nested alias"),
+            Some(CodeQueryRowScalarRef::String(_))
+        ));
+        assert_eq!(item.provenance.len(), 3);
+    }
+}
+
+#[hardwon("#5310: compatible schemas can map the survivor's alias to different native fields")]
+#[test]
+fn projected_set_collisions_keep_the_first_rows_native_field_mapping() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("calls.py", "print(\"a\")\n")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let files = seed_files_of(&workspace);
+    let named = "(project :columns ((name x)) (language python (call)))";
+    let literal = "(project :columns ((string_value x)) (language python (call)))";
+    for op in ["union", "intersect"] {
+        for (first, second, expected) in [
+            (named, literal, Some("print")),
+            (literal, named, None),
+            (named, named, Some("print")),
+            (literal, literal, None),
+        ] {
+            let query =
+                CodeQuery::from_sexp(&format!("(result-detail full ({op} {first} {second}))"))
+                    .expect("native fields share one compatible optional-string schema");
+            let whole = whole_execution(&workspace, &query);
+            assert_eq!(
+                whole.result.completion(),
+                CodeQueryCompletion::Complete,
+                "{whole:#?}"
+            );
+            if op == "union" {
+                assert_eq!(
+                    crate::query::PlanPartitioning::classify(&query.plan),
+                    crate::query::PlanPartitioning::BySeedUnion
+                );
+                assert_merged_units_match_whole(&project, &workspace, &query, &files, &whole);
+                let renamed = CodeQuery::from_sexp(&format!(
+                    "(result-detail full (project :columns ((x selected)) (union {first} {second})))"
+                )).expect("project-only union suffix");
+                assert_eq!(
+                    crate::query::PlanPartitioning::classify(&renamed.plan),
+                    crate::query::PlanPartitioning::BySeedUnion
+                );
+                let renamed_whole = whole_execution(&workspace, &renamed);
+                assert_merged_units_match_whole(
+                    &project,
+                    &workspace,
+                    &renamed,
+                    &files,
+                    &renamed_whole,
+                );
+            }
+            let [item]: [UnitRowItem; 1] = projected(&whole.result.results)
+                .try_into()
+                .expect("one call");
+            let actual = item.field("x").expect("first row owns the alias");
+            match expected {
+                Some(expected) => assert!(
+                    matches!(actual, Some(CodeQueryRowScalarRef::String(value)) if value == expected)
+                ),
+                None => assert!(actual.is_none(), "{actual:#?}"),
+            }
+        }
+    }
+    for (first, second, expected_rows) in [(named, literal, 0), (literal, named, 1)] {
+        let query = CodeQuery::from_sexp(&format!(
+            "(result-detail full (filter :where ((x is-null)) (union {first} {second})))"
+        ))
+        .expect("compatible projection counterexample");
+        assert_eq!(
+            crate::query::PlanPartitioning::classify(&query.plan),
+            crate::query::PlanPartitioning::Whole
+        );
+        let whole = whole_execution(&workspace, &query);
+        assert_eq!(
+            whole.result.completion(),
+            CodeQueryCompletion::Complete,
+            "{whole:#?}"
+        );
+        assert_eq!(
+            whole.result.results.len(),
+            expected_rows,
+            "first writer must be chosen before filtering"
+        );
     }
 }

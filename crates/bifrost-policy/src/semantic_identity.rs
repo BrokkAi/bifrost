@@ -1,8 +1,4 @@
-use std::fmt::Write as _;
-
-use sha2::{Digest, Sha256};
-
-use crate::finding::{PolicyByteSpan, PolicyDisplayRegion, PolicySourceLocation};
+use crate::finding::PolicySourceLocation;
 use brokk_bifrost_analysis::analyzer::semantic::{
     CallSiteHandle, ProcedureHandle, ProgramPointHandle, SemanticLocator,
 };
@@ -37,46 +33,36 @@ pub(super) fn policy_location(
                 span.end().byte_column() as usize + 1,
             )
         });
-    Ok(PolicySourceLocation::span(
+    PolicySourceLocation::span_from_coordinates(
         locator.path().clone(),
-        PolicyByteSpan::new(u64::from(span.start_byte()), u64::from(span.end_byte()))
-            .map_err(|error| error.to_string())?,
-        PolicyDisplayRegion::new(
-            start_line as u64,
-            start_column as u64,
-            end_line as u64,
-            end_column as u64,
-        )
-        .map_err(|error| error.to_string())?,
-    ))
+        u64::from(span.start_byte()),
+        u64::from(span.end_byte()),
+        start_line as u64,
+        start_column as u64,
+        end_line as u64,
+        end_column as u64,
+    )
 }
 
 pub(super) fn program_point_locator(point: &ProgramPointHandle) -> &SemanticLocator {
-    let row = point
+    let _row = point
         .procedure()
         .semantics()
         .point(point.id())
         .expect("validated policy witness point resolves");
-    &point
-        .procedure()
-        .semantics()
-        .source_mapping(row.source)
+    point
+        .locator()
         .expect("validated policy witness point has a source mapping")
-        .locator
 }
 
 pub(super) fn call_site_locator(call: &CallSiteHandle) -> &SemanticLocator {
-    let row = call
+    let _row = call
         .procedure()
         .semantics()
         .call_site(call.id())
         .expect("validated policy witness call resolves");
-    &call
-        .procedure()
-        .semantics()
-        .source_mapping(row.source)
+    call.locator()
         .expect("validated policy witness call has a source mapping")
-        .locator
 }
 
 pub(super) fn source_excerpt(
@@ -144,10 +130,5 @@ fn append_declaration_identity(locator: &SemanticLocator, bytes: &mut Vec<u8>) {
 }
 
 pub(super) fn stable_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut encoded = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        write!(&mut encoded, "{byte:02x}").expect("writing to String is infallible");
-    }
-    encoded
+    brokk_bifrost_analysis::analyzer::semantic_model::csmi::sha256_hex(bytes)
 }

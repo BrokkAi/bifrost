@@ -21,21 +21,66 @@ use brokk_bifrost_core::analyzer::prepared_syntax::{
 
 use crate::analyzer::languages::language_support;
 use crate::analyzer::semantic_model::{
-    SemanticModelMemberTargetDisposition, SemanticModelOverlay, SemanticModelProvenance,
-    SemanticModelSymbolKind,
+    SemanticModelCompleteness, SemanticModelMemberTargetDisposition, SemanticModelOverlay,
+    SemanticModelProvenance, SemanticModelSymbolKind,
 };
 use crate::analyzer::usages::get_type::TypeLookupType;
-use crate::analyzer::{CodeUnit, Language, ProjectFile, Range, WorkspaceAnalyzer};
+use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range, WorkspaceAnalyzer};
 use crate::hash::HashMap;
+use tree_sitter::Node;
 
+use super::ir::SignedIntegerMagnitude;
 use super::oracle::CandidateCoverage;
 use super::{
     AdapterSemanticsVersion, AllocationSite, CallSiteId, ContentIdentity, GuardFact,
-    LengthDelimitedDigest, MemoryLocation, OverlaySnapshotId, ProcedureHandle, ProcedureId,
-    ProgramPointId, SemanticArtifactKey, SemanticCallSite, SemanticLocator, SemanticValue,
-    SourcePosition, SourceRevision, SourceSpan, StableDigest, ValueId, WorkspaceMountId,
-    WorkspaceRelativePath,
+    LengthDelimitedDigest, MemoryLocation, MemoryLocationId, MemoryLocationKind, OverlaySnapshotId,
+    ProcedureHandle, ProcedureId, ProgramPointId, SemanticArtifactKey, SemanticCallSite,
+    SemanticLocator, SemanticValue, SourceMappingKind, SourcePosition, SourceRevision, SourceSpan,
+    StableDigest, ValueId, WorkspaceMountId, WorkspaceRelativePath,
 };
+
+pub(crate) fn node_at_span(prepared: &PreparedSyntaxTree, span: SourceSpan) -> Option<Node<'_>> {
+    prepared
+        .tree()
+        .root_node()
+        .named_descendant_for_byte_range(span.start_byte() as usize, span.end_byte() as usize)
+}
+
+pub(crate) fn integer_offset_from_binary_operands<'tree>(
+    operator: &str,
+    left: Node<'tree>,
+    right: Node<'tree>,
+    mut integer: impl FnMut(Node<'tree>) -> Option<SignedIntegerMagnitude>,
+) -> Option<(Node<'tree>, SignedIntegerMagnitude)> {
+    let (operand, offset, subtract) = match (operator, left.kind(), right.kind()) {
+        ("+", "identifier", _) => (left, integer(right)?, false),
+        ("+", _, "identifier") => (right, integer(left)?, false),
+        ("-", "identifier", _) => (left, integer(right)?, true),
+        _ => return None,
+    };
+    let offset = if subtract {
+        SignedIntegerMagnitude::new(!offset.negative(), offset.magnitude())
+    } else {
+        offset
+    };
+    Some((operand, offset))
+}
+
+pub(crate) fn enclosing_workspace_class_unit(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    span: SourceSpan,
+    mut accepts: impl FnMut(&CodeUnit) -> bool,
+) -> Option<CodeUnit> {
+    let range = analyzer_range_for_span(span);
+    let mut unit = analyzer.enclosing_code_unit(file, &range)?;
+    loop {
+        if unit.is_class() && accepts(&unit) {
+            return Some(unit);
+        }
+        unit = analyzer.parent_of(&unit)?;
+    }
+}
 
 /// One class a value may be an instance of, or the honest statement that
 /// the engine could not classify it.
@@ -289,8 +334,9 @@ pub(crate) type ExternalClassCache =
     HashMap<(Language, Box<str>, Option<Box<str>>), Option<ClassIdentity>>;
 
 /// Resolve one external class from the active model after filtering by the
-/// requested language, owner-less class shape, and optional exact record ID.
-/// Uniqueness is decided only after those filters are applied.
+/// requested language and owner-less class shape. Eligible records with the
+/// same exact qualified name describe one class; complete surfaces and then
+/// the smallest ID choose its stable representative.
 pub(crate) fn external_class_identity(
     overlay: Option<&SemanticModelOverlay>,
     language: Language,
@@ -307,7 +353,7 @@ pub(crate) fn external_class_identity(
         return cached.clone();
     }
     let resolved = overlay.and_then(|overlay| {
-        let records = match semantic_model_id {
+        let mut records = match semantic_model_id {
             Some(id) => overlay.symbols_with_id(id).records,
             None => overlay.symbols_named(qualified_name).records,
         }
@@ -319,9 +365,44 @@ pub(crate) fn external_class_identity(
                 && !symbol.provenance.ambiguous
         })
         .collect::<Vec<_>>();
-        let [symbol] = records.as_slice() else {
+        if semantic_model_id.is_none() {
+            let exact = records
+                .iter()
+                .copied()
+                .filter(|symbol| symbol.qualified_name == qualified_name)
+                .collect::<Vec<_>>();
+            if !exact.is_empty() {
+                records = exact;
+            }
+        }
+        let names = records
+            .iter()
+            .map(|symbol| symbol.qualified_name.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        if names.len() != 1 {
             return None;
-        };
+        }
+        let group_name = *names.iter().next().expect("one eligible class name exists");
+        let group = overlay
+            .symbols_named(group_name)
+            .records
+            .into_iter()
+            .filter(|symbol| {
+                symbol.qualified_name == group_name
+                    && symbol.language == language.config_label()
+                    && symbol.owner_id.is_none()
+                    && symbol.kind == SemanticModelSymbolKind::Class
+                    && !symbol.provenance.ambiguous
+            })
+            .collect::<Vec<_>>();
+        if semantic_model_id.is_some()
+            && !group
+                .iter()
+                .any(|symbol| records.iter().any(|record| record.id == symbol.id))
+        {
+            return None;
+        }
+        let symbol = overlay.class_representative(group)?;
         Some(ClassIdentity::External {
             qualified_name: symbol.qualified_name.clone().into_boxed_str(),
             symbol_id: symbol.id.clone().into_boxed_str(),
@@ -343,23 +424,26 @@ pub(crate) fn class_seed_from_lookup_types(
             ClassSeed::Unknown(UnknownReason::AmbiguousCallee)
         };
     };
+    if let Some(symbol_id) = lookup.semantic_model_id.as_deref() {
+        return match lookup.definitions.as_slice() {
+            [_] => external_class_identity(
+                overlay,
+                language,
+                &lookup.fqn,
+                Some(symbol_id),
+                &mut ExternalClassCache::default(),
+            )
+            .map(ClassSeed::Class)
+            .unwrap_or(ClassSeed::Unknown(UnknownReason::ExternalNotModeled)),
+            _ => ClassSeed::Unknown(UnknownReason::AmbiguousCallee),
+        };
+    }
     match lookup.definitions.as_slice() {
         [definition] if definition.is_class() => {
             ClassSeed::Class(ClassIdentity::Workspace(definition.clone()))
         }
         [_] => ClassSeed::NotApplicable,
-        [] => {
-            let mut cache = ExternalClassCache::default();
-            external_class_identity(
-                overlay,
-                language,
-                &lookup.fqn,
-                lookup.semantic_model_id.as_deref(),
-                &mut cache,
-            )
-            .map(ClassSeed::Class)
-            .unwrap_or(ClassSeed::NotApplicable)
-        }
+        [] => ClassSeed::NotApplicable,
         _ => ClassSeed::Unknown(UnknownReason::AmbiguousCallee),
     }
 }
@@ -369,41 +453,89 @@ pub(crate) fn external_member_lookup(
     owner_id: &str,
     member: &str,
 ) -> MemberLookup {
-    let matched = overlay.member_target_on_owner(owner_id, member);
-    match matched.disposition {
-        SemanticModelMemberTargetDisposition::Unique => {
-            MemberLookup::Present(MemberLookupHit::new(
-                MemberDeclaration::External(ExternalMemberDeclaration::new(
-                    matched
-                        .records
-                        .into_iter()
-                        .map(|record| Box::from(record.id.as_str())),
-                )),
-                CandidateCoverage::Exhaustive,
-            ))
-        }
-        SemanticModelMemberTargetDisposition::Conflict
-            if overlay.member_present_on_owner(owner_id, member) =>
-        {
-            MemberLookup::Present(MemberLookupHit::new(
-                MemberDeclaration::External(ExternalMemberDeclaration::new(
-                    matched
-                        .records
-                        .into_iter()
-                        .map(|record| Box::from(record.id.as_str())),
-                )),
-                CandidateCoverage::Exhaustive,
-            ))
-        }
-        SemanticModelMemberTargetDisposition::Absent => MemberLookup::Absent,
-        SemanticModelMemberTargetDisposition::Incomplete
-        | SemanticModelMemberTargetDisposition::Conflict => {
-            MemberLookup::Unknown(UnknownReason::PackIncomplete)
+    let matched = overlay.symbols_with_id(owner_id);
+    let [owner] = matched.records.as_slice() else {
+        return MemberLookup::Unknown(UnknownReason::PackIncomplete);
+    };
+    if owner.owner_id.is_some() || owner.kind != SemanticModelSymbolKind::Class {
+        return MemberLookup::Unknown(UnknownReason::PackIncomplete);
+    }
+    let owners = overlay
+        .symbols_named(&owner.qualified_name)
+        .records
+        .into_iter()
+        .filter(|candidate| {
+            candidate.qualified_name == owner.qualified_name
+                && candidate.language == owner.language
+                && candidate.owner_id.is_none()
+                && candidate.kind == SemanticModelSymbolKind::Class
+                && !candidate.provenance.ambiguous
+        })
+        .collect::<Vec<_>>();
+    let mut declarations = Vec::new();
+    let mut has_member_record = false;
+    let mut complete_surface = false;
+    let mut coverage_open = false;
+    for candidate in owners {
+        complete_surface |=
+            candidate.provenance.completeness == SemanticModelCompleteness::Complete;
+        let raw_members = overlay
+            .members_of(&candidate.id)
+            .records
+            .into_iter()
+            .filter(|record| {
+                record.owner_id.as_deref() == Some(candidate.id.as_str())
+                    && record.language == candidate.language
+                    && record.name == member
+            })
+            .collect::<Vec<_>>();
+        has_member_record |= !raw_members.is_empty();
+        let matched = overlay.member_target_on_owner(&candidate.id, member);
+        match matched.disposition {
+            SemanticModelMemberTargetDisposition::Unique => declarations.extend(matched.records),
+            SemanticModelMemberTargetDisposition::Conflict
+                if overlay.member_present_on_owner(&candidate.id, member) =>
+            {
+                declarations.extend(matched.records);
+                coverage_open = true;
+            }
+            SemanticModelMemberTargetDisposition::Absent => {}
+            SemanticModelMemberTargetDisposition::Incomplete
+            | SemanticModelMemberTargetDisposition::Conflict => coverage_open = true,
         }
     }
+    declarations.sort_by(|left, right| left.id.cmp(&right.id));
+    declarations.dedup_by(|left, right| left.id == right.id);
+    if !declarations.is_empty() {
+        return MemberLookup::Present(MemberLookupHit::new(
+            MemberDeclaration::External(ExternalMemberDeclaration::new(
+                declarations
+                    .into_iter()
+                    .map(|record| Box::from(record.id.as_str())),
+            )),
+            if coverage_open {
+                CandidateCoverage::Open
+            } else {
+                CandidateCoverage::Exhaustive
+            },
+        ));
+    }
+    // An inherited member on an incomplete ancestry path must not become a
+    // proven absence (#5121). Restore the rule #4942 dropped for multi-owner lookups.
+    if coverage_open || has_member_record {
+        return MemberLookup::Unknown(UnknownReason::PackIncomplete);
+    }
+    if !complete_surface
+        || overlay
+            .gapped_member_surface(&owner.qualified_name, member)
+            .is_some()
+    {
+        return MemberLookup::Unknown(UnknownReason::PackIncomplete);
+    }
+    MemberLookup::Absent
 }
 
-pub(crate) fn file_for_locator(
+pub fn file_for_locator(
     workspace: &WorkspaceAnalyzer,
     locator: &SemanticLocator,
 ) -> Option<ProjectFile> {
@@ -451,6 +583,25 @@ pub fn validate_prepared_syntax_for_procedure(
         return Err(UnknownReason::UncertainFlow);
     }
     validate_prepared_syntax_source_for_procedure(workspace, procedure, file, prepared)
+}
+
+pub(crate) fn prepared_syntax_for_procedure(
+    workspace: &WorkspaceAnalyzer,
+    procedure: &ProcedureHandle,
+    file: &ProjectFile,
+    prepared: Option<Arc<PreparedSyntaxTree>>,
+) -> Result<Arc<PreparedSyntaxTree>, UnknownReason> {
+    let prepared = prepared.ok_or(UnknownReason::UncertainFlow)?;
+    validate_prepared_syntax_for_procedure(workspace, procedure, file, prepared)
+}
+
+pub(crate) fn current_indexed_prepared(
+    prepared: Option<Arc<PreparedSyntaxTree>>,
+    is_current: impl FnOnce(&PreparedSyntaxTree) -> bool,
+) -> Option<Arc<PreparedSyntaxTree>> {
+    let prepared = prepared?;
+    (matches!(prepared.backing(), PreparedSyntaxSource::Indexed(_)) && is_current(&prepared))
+        .then_some(prepared)
 }
 
 /// Validate source identity without requiring indexed declaration access.
@@ -508,6 +659,8 @@ pub struct SourceSite {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SourceSiteKind {
     ConstructorCall,
+    /// A modeled attribute or subscript protocol produced this exact value.
+    ExactAccessResult,
     Literal,
     ContainerLiteral,
     DeclaredParameter,
@@ -521,6 +674,8 @@ pub enum SourceSiteKind {
     ConditionalNarrowingGuard,
     /// Unclassified origin syntax; independent of whether its class is known.
     Unknown,
+    /// An exact callable-return claim produced this value's runtime class.
+    ExactCallResult,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -607,6 +762,40 @@ impl MemberLookupHit {
     }
 }
 
+pub(crate) fn present_member(declaration: MemberDeclaration) -> MemberLookup {
+    MemberLookup::Present(MemberLookupHit::new(declaration, CandidateCoverage::Open))
+}
+
+/// Provenance for one uniquely reaching exact result at a receiver.
+/// The value-flow solver creates this only when every reaching meeting has
+/// the same proven, non-uncertain constructor source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstructorResultOrigin {
+    pub classes: Box<[ClassIdentity]>,
+    pub producer: ExactResultProducer,
+    pub result: ValueId,
+    pub source: SourceSite,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExactResultProducer {
+    Call(CallSiteId),
+    MemoryLoad {
+        point: ProgramPointId,
+        location: MemoryLocationId,
+    },
+}
+
+/// Constructor provenance reaching one receiver call. `Ambiguous` means a
+/// constructor source exists but the solver cannot prove one same-origin
+/// source; adapters must not treat that receiver as a unique instance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConstructorResultEvidence {
+    None,
+    Unique(ConstructorResultOrigin),
+    Ambiguous,
+}
+
 /// Durable identity of one call site across rematerializations of the same
 /// semantic artifact.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -670,12 +859,18 @@ impl DispatchHint {
 /// The complete receiver-derived answer for one call site. `exhaustive`
 /// states that the receiver class set had no Unknown or uncertain meeting;
 /// the hint list may be empty when every known receiver lacks the member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchHintProof {
+    Proven,
+    Unproven,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchHintSet {
     call_site: DispatchHintCallSiteKey,
     hints: Box<[DispatchHint]>,
     exhaustive: bool,
-    singleton: bool,
+    proof: DispatchHintProof,
 }
 
 impl DispatchHintSet {
@@ -683,7 +878,7 @@ impl DispatchHintSet {
         call_site: DispatchHintCallSiteKey,
         mut hints: Vec<DispatchHint>,
         exhaustive: bool,
-        singleton: bool,
+        proof: DispatchHintProof,
     ) -> Self {
         hints.sort_by(dispatch_hint_order);
         hints.dedup();
@@ -691,7 +886,7 @@ impl DispatchHintSet {
             call_site,
             hints: hints.into_boxed_slice(),
             exhaustive,
-            singleton,
+            proof,
         }
     }
 
@@ -707,8 +902,8 @@ impl DispatchHintSet {
         self.exhaustive
     }
 
-    pub const fn singleton(&self) -> bool {
-        self.singleton
+    pub const fn proof(&self) -> DispatchHintProof {
+        self.proof
     }
 }
 
@@ -854,11 +1049,13 @@ pub fn source_site_kind_tag(kind: SourceSiteKind) -> u8 {
         // Appended: the tags of the kinds above are persisted.
         SourceSiteKind::NarrowingGuard => 6,
         SourceSiteKind::ConditionalNarrowingGuard => 7,
+        SourceSiteKind::ExactAccessResult => 8,
+        SourceSiteKind::ExactCallResult => 9,
     }
 }
 
 fn dispatch_hints_digest(entries: &[DispatchHintSet]) -> StableDigest {
-    let mut digest = LengthDelimitedDigest::new(b"bifrost-type-flow-dispatch-hints/v1");
+    let mut digest = LengthDelimitedDigest::new(b"bifrost-type-flow-dispatch-hints/v2");
     digest.push(
         &u64::try_from(entries.len())
             .expect("the dispatch hint entry count fits in u64")
@@ -873,10 +1070,9 @@ fn dispatch_hints_digest(entries: &[DispatchHintSet]) -> StableDigest {
         } else {
             b"open"
         });
-        digest.push(if entry.singleton {
-            b"singleton"
-        } else {
-            b"multiple"
+        digest.push(match entry.proof {
+            DispatchHintProof::Proven => b"proven",
+            DispatchHintProof::Unproven => b"unproven",
         });
         digest.push(
             &u64::try_from(entry.hints.len())
@@ -980,13 +1176,27 @@ impl ClassHierarchy {
     }
 }
 
+/// The names a structured dynamic field mutation can install.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DynamicFieldNameSet {
+    /// Every installed name is known from the source structure.
+    Exact(Vec<Box<str>>),
+    /// Every installed name starts with this literal prefix.
+    Prefix(Box<str>),
+    /// The source does not constrain the installed name.
+    Any,
+    /// The operation removes attributes and installs none.
+    None,
+}
+
 /// A structured field mutation that does not appear as a direct Field store
-/// in semantic IR. Named writes keep that spelling open. An arbitrary name
-/// retains its receiver and write site for the flow engine to scope its effect.
+/// in semantic IR. A singleton source literal keeps the legacy member spelling;
+/// other writes carry their name set, receiver, and source site to the flow engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DynamicFieldWrite {
     Member(Box<str>),
-    Any {
+    Scoped {
+        names: DynamicFieldNameSet,
         receiver: Option<ValueId>,
         span: SourceSpan,
     },
@@ -1001,6 +1211,37 @@ pub enum MemberAccessKind {
 pub enum MemberAccessQuery<'a> {
     Call(&'a SemanticCallSite),
     Load(&'a MemoryLocation),
+}
+
+pub(crate) fn accessed_member_locator<'a>(
+    procedure: &'a ProcedureHandle,
+    site: MemberAccessQuery<'a>,
+) -> Option<&'a SemanticLocator> {
+    match site {
+        MemberAccessQuery::Call(call) => {
+            let semantics = procedure.semantics();
+            let callee = semantics.value(call.callee)?;
+            let mapping = semantics.source_mapping(callee.source)?;
+            (mapping.kind == SourceMappingKind::Exact).then_some(&mapping.locator)
+        }
+        MemberAccessQuery::Load(location) => {
+            let MemoryLocationKind::Field { member, .. } = &location.kind else {
+                return None;
+            };
+            Some(member)
+        }
+    }
+}
+
+/// Receiver and construction evidence for a call-shaped member lookup.
+#[derive(Debug, Clone, Copy)]
+pub struct MemberReceiverQuery<'a> {
+    pub procedure: &'a ProcedureHandle,
+    pub receiver: ValueId,
+    pub call: &'a SemanticCallSite,
+    pub constructor: &'a ConstructorResultEvidence,
+    pub class: &'a ClassIdentity,
+    pub member: &'a str,
 }
 
 /// What an opaque guard condition says about a call argument.
@@ -1057,6 +1298,42 @@ pub trait TypeFlowAdapter: Send + Sync {
         procedure: &ProcedureHandle,
         call: &SemanticCallSite,
     ) -> ClassSeed;
+    /// Complete runtime class set of a callable result with an explicit
+    /// exact-return claim. These class facts are independent of value-flow
+    /// transfers from call inputs.
+    fn exact_call_result_class(
+        &self,
+        _workspace: &WorkspaceAnalyzer,
+        _procedure: &ProcedureHandle,
+        _call: &SemanticCallSite,
+    ) -> Option<Box<[ClassIdentity]>> {
+        None
+    }
+    /// Whether this exact call or access result reaches the receiver through
+    /// the language's stable-local proof. A true result lets type flow ignore
+    /// value transfers from the producer's inputs when computing its class set.
+    fn exact_result_receiver_is_stable(
+        &self,
+        _workspace: &WorkspaceAnalyzer,
+        _procedure: &ProcedureHandle,
+        _receiver: ValueId,
+        _call: &SemanticCallSite,
+        _origin: &ConstructorResultOrigin,
+    ) -> bool {
+        false
+    }
+    /// Class of a value produced by an exact attribute or subscript access.
+    /// Implementations must return a class only when the access declaration
+    /// explicitly claims an exact runtime return class.
+    fn memory_load_result_class(
+        &self,
+        _workspace: &WorkspaceAnalyzer,
+        _procedure: &ProcedureHandle,
+        _location: &MemoryLocation,
+        _result: ValueId,
+    ) -> ClassSeed {
+        ClassSeed::NotApplicable
+    }
     fn constant_class(
         &self,
         workspace: &WorkspaceAnalyzer,
@@ -1101,6 +1378,18 @@ pub trait TypeFlowAdapter: Send + Sync {
         procedure: &ProcedureHandle,
         ordinal: u32,
     ) -> ClassSeed;
+    /// Whether this exact declared-parameter origin is safe to admit to the
+    /// Conditional absent-member tier for `class`. Adapters must prove a
+    /// single closed workspace class from the parameter's annotation; other
+    /// languages and unproved origins stay excluded.
+    fn declared_parameter_conditional_origin_is_closed(
+        &self,
+        _workspace: &WorkspaceAnalyzer,
+        _class: &ClassIdentity,
+        _origin: &SourceSite,
+    ) -> bool {
+        false
+    }
     /// Program points and results of plain local memory loads whose modeled stores exhaust the
     /// possible values. A certificate requires closed initialization, aliases
     /// and mutation effects; plain indexing alone is not sufficient. Missing
@@ -1152,6 +1441,24 @@ pub trait TypeFlowAdapter: Send + Sync {
         class: &ClassIdentity,
         member: &str,
     ) -> MemberLookup;
+
+    /// Look up a member called through one receiver value, retaining the
+    /// receiver and its reaching constructor evidence for languages that can
+    /// prove an exact instance. The default preserves the class-only lookup
+    /// contract for adapters without receiver-specific dispatch rules.
+    fn member_lookup_for_receiver(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        query: MemberReceiverQuery<'_>,
+    ) -> MemberLookup {
+        let _ = (
+            query.procedure,
+            query.receiver,
+            query.call,
+            query.constructor,
+        );
+        self.member_lookup(workspace, MemberAccessKind::Call, query.class, query.member)
+    }
 
     fn enclosing_class(
         &self,
@@ -1230,12 +1537,110 @@ pub trait TypeFlowAdapter: Send + Sync {
         false
     }
 
+    /// Whether reading or writing this instance member may use a class
+    /// descriptor instead of ordinary instance storage. A positive answer
+    /// excludes the member from field-slot propagation; reads remain an
+    /// explicit unknown. Adapters should also return true when the declaration
+    /// needed to rule out descriptor behavior is unresolved.
+    fn field_access_may_use_descriptor(
+        &self,
+        _workspace: &WorkspaceAnalyzer,
+        _class: &ClassIdentity,
+        _member: &str,
+    ) -> bool {
+        false
+    }
+
     fn dynamic_field_writes(
         &self,
         _workspace: &WorkspaceAnalyzer,
         _procedure: &ProcedureHandle,
     ) -> Vec<DynamicFieldWrite> {
         Vec::new()
+    }
+
+    /// A structured upper bound for a dynamic write's receiver when the IR
+    /// cannot observe that receiver directly, such as `self.__dict__.update`
+    /// or `super().__setattr__`. The flow engine validates the returned class
+    /// hierarchy before using it to scope the write.
+    fn dynamic_write_receiver_bound(
+        &self,
+        _workspace: &WorkspaceAnalyzer,
+        _procedure: &ProcedureHandle,
+        _write_span: SourceSpan,
+    ) -> Option<ClassIdentity> {
+        None
+    }
+
+    /// A stable instance field whose loaded value is the receiver of this
+    /// dynamic write, such as `setattr(self.cell_class, name, value)`. The
+    /// flow engine uses the field-slot index to inspect every store to that
+    /// field before deriving a receiver bound.
+    fn dynamic_write_receiver_field(
+        &self,
+        _workspace: &WorkspaceAnalyzer,
+        _procedure: &ProcedureHandle,
+        _write_span: SourceSpan,
+    ) -> Option<(ClassIdentity, Box<str>)> {
+        None
+    }
+
+    /// Class bounds for a source site retained by a field slot. `Ok(None)`
+    /// means the site is not a store to `member` (for example, an incomplete
+    /// slot witness at a load); `Ok(Some(bounds))` means it is such a store,
+    /// and an empty bound is a value excluded from every static class atom.
+    /// An error marks a recognized store whose value remains unbounded.
+    fn field_store_value_bounds(
+        &self,
+        _workspace: &WorkspaceAnalyzer,
+        _file: &ProjectFile,
+        _span: SourceSpan,
+        _member: &str,
+    ) -> Result<Option<Vec<ClassIdentity>>, UnknownReason> {
+        Ok(None)
+    }
+
+    /// Whether a dynamic write's receiver annotation explicitly permits any
+    /// runtime class, such as an unbounded type parameter or `Any`.
+    fn dynamic_write_receiver_is_explicitly_unbounded(
+        &self,
+        _workspace: &WorkspaceAnalyzer,
+        _procedure: &ProcedureHandle,
+        _write_span: SourceSpan,
+    ) -> bool {
+        false
+    }
+
+    /// A complete static-class receiver bound proved from the receiver
+    /// expression of one arbitrary-name dynamic write. An empty vector means
+    /// the receiver is provably a runtime-created class or instance, whose
+    /// exact runtime class is distinct from every static class atom. `Ok(None)`
+    /// means this rule does not apply; `Err(reason)` means a recognized shape
+    /// has unresolved receiver information, so the effect stays global.
+    fn dynamic_type_write_receiver_bounds(
+        &self,
+        _workspace: &WorkspaceAnalyzer,
+        _procedure: &ProcedureHandle,
+        _receiver: ValueId,
+        _write_span: SourceSpan,
+    ) -> Result<Option<Vec<ClassIdentity>>, UnknownReason> {
+        Ok(None)
+    }
+
+    /// Complete static-class receiver bounds for a parameter of a nested
+    /// function whose name is used only as a direct callee in its enclosing
+    /// function. Every call-site argument must be bounded. An empty vector
+    /// means all arguments are proved runtime-created values. `Ok(None)` means
+    /// this rule does not apply; `Err(reason)` means the nested parameter is
+    /// escaping or has at least one unbounded call-site argument.
+    fn non_escaping_nested_write_receiver_bounds(
+        &self,
+        _workspace: &WorkspaceAnalyzer,
+        _procedure: &ProcedureHandle,
+        _receiver: ValueId,
+        _write_span: SourceSpan,
+    ) -> Result<Option<Vec<ClassIdentity>>, UnknownReason> {
+        Ok(None)
     }
 
     /// Classify each candidate on the guard's true arm, in input order.
@@ -1356,52 +1761,6 @@ mod tests {
     use super::{ClassAtom, ClassIdentity, ClassSeed, ExternalMemberDeclaration, UnknownReason};
 
     #[test]
-    fn unknown_reason_labels_and_display_round_trip_named_guards() {
-        let first = UnknownReason::UnmodeledGuard {
-            class: "pkg.First".into(),
-        };
-        let second = UnknownReason::UnmodeledGuard {
-            class: "pkg.Second".into(),
-        };
-
-        assert_eq!(
-            UnknownReason::from_label(&UnknownReason::DynamicFieldWrite.to_string()),
-            Some(UnknownReason::DynamicFieldWrite)
-        );
-        assert_eq!(first.label(), "unmodeled_guard");
-        assert_eq!(first.to_string(), "unmodeled_guard:pkg.First");
-        assert_eq!(
-            UnknownReason::from_label(&first.to_string()),
-            Some(first.clone())
-        );
-        assert_eq!(UnknownReason::from_label(&second.to_string()), Some(second));
-        assert_ne!(
-            first,
-            UnknownReason::UnmodeledGuard {
-                class: "pkg.Second".into(),
-            }
-        );
-    }
-
-    #[test]
-    fn open_class_seed_expands_to_class_then_typed_unknown() {
-        let class = ClassIdentity::External {
-            qualified_name: "pkg.Widget".into(),
-            symbol_id: "class-widget".into(),
-        };
-
-        assert_eq!(
-            ClassSeed::ClassWithOpenBound(class.clone())
-                .into_atoms()
-                .collect::<Vec<_>>(),
-            vec![
-                ClassAtom::Class(class),
-                ClassAtom::Unknown(UnknownReason::OpenTypeBound),
-            ]
-        );
-    }
-
-    #[test]
     fn multi_class_open_seed_is_canonical_deduplicated_and_open_last() {
         let first = ClassIdentity::External {
             qualified_name: "pkg.A".into(),
@@ -1439,18 +1798,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "a multi-class seed names at least one class")]
-    fn multi_class_open_seed_rejects_an_empty_class_set() {
-        ClassSeed::classes_with_open_bound(std::iter::empty());
-    }
-
-    #[test]
-    #[should_panic(expected = "a multi-class seed names at least one class")]
-    fn multi_class_closed_seed_rejects_an_empty_class_set() {
-        ClassSeed::classes(std::iter::empty());
-    }
-
-    #[test]
     fn external_member_declaration_is_nonempty_canonical_and_deduplicated() {
         let declaration = ExternalMemberDeclaration::new([
             Box::from("member.z"),
@@ -1462,11 +1809,5 @@ mod tests {
             declaration.symbol_ids(),
             &[Box::from("member.a"), Box::from("member.z")]
         );
-    }
-
-    #[test]
-    #[should_panic(expected = "an external member declaration names at least one exact symbol")]
-    fn external_member_declaration_rejects_an_empty_family() {
-        ExternalMemberDeclaration::new(std::iter::empty());
     }
 }

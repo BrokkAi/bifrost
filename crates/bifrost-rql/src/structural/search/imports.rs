@@ -7,17 +7,15 @@ pub(super) fn push_seed_provider_omission(
     file: &ProjectFile,
     unavailable: &str,
 ) {
-    diagnostics.push(CodeQueryDiagnostic {
-        code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
-        impact: CodeQueryDiagnosticImpact::Incomplete,
-        branch: Vec::new(),
-        language: language.config_label(),
-        message: format!(
+    diagnostics.push(incomplete_diagnostic(
+        CodeQueryDiagnosticCode::SemanticResultsOmitted,
+        language.config_label(),
+        format!(
             "structural seed omitted {} because its provider returned no {unavailable}",
             rel_path_string(file)
         ),
-        exhausted_roots: Vec::new(),
-    });
+        Vec::new(),
+    ));
 }
 
 pub(super) fn acquire_direct_import_layer(

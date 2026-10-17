@@ -31,6 +31,7 @@ use brokk_bifrost_core::analyzer::source_facts::{
     PrimarySourceFactCollector, SourceDeclarationId, SourceImportId, SourceOccurrenceId,
 };
 use brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix;
+use brokk_bifrost_core::analyzer::tree_walk::single_named_child_matching;
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 
 use crate::cargo_routes::rust_static_string_literal;
@@ -110,6 +111,10 @@ impl<'source> RustModuleSourceCollector<'source> {
             else {
                 continue;
             };
+            let name = text(path);
+            if name.is_empty() {
+                continue;
+            }
             let mut arguments = Vec::new();
             if let Some(tokens) = attribute.child_by_field_name("arguments") {
                 let mut token_cursor = tokens.walk();
@@ -128,10 +133,8 @@ impl<'source> RustModuleSourceCollector<'source> {
                         .map(text),
                 );
             }
-            self.inner_attributes.push(RustInnerAttributeSourceFact {
-                name: text(path),
-                arguments,
-            });
+            self.inner_attributes
+                .push(RustInnerAttributeSourceFact { name, arguments });
         }
     }
 
@@ -228,10 +231,7 @@ impl<'source> RustModuleSourceCollector<'source> {
         let occurrence = collector.intern_node(node);
         self.primary_invocations.insert(node.id(), occurrence);
         assert!(self.invocation_occurrences.insert(occurrence));
-        self.invocations.push(RustMacroInvocationSourceFact {
-            occurrence,
-            name: name.to_string(),
-        });
+        self.record_invocation(occurrence, name);
         Some(occurrence)
     }
 
@@ -247,11 +247,15 @@ impl<'source> RustModuleSourceCollector<'source> {
         if !self.invocation_occurrences.insert(occurrence) {
             return Some(occurrence);
         }
+        self.record_invocation(occurrence, name);
+        Some(occurrence)
+    }
+
+    fn record_invocation(&mut self, occurrence: SourceOccurrenceId, name: &str) {
         self.invocations.push(RustMacroInvocationSourceFact {
             occurrence,
             name: name.to_string(),
         });
-        Some(occurrence)
     }
 
     pub(crate) fn record_primary_scope(
@@ -342,6 +346,58 @@ struct RustModuleInventoryEntry {
     declaration: Option<SourceDeclarationId>,
     parent_scope: usize,
     module: RustModuleFact,
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the constructor maps a module declaration and its facts without hiding them in a mode"
+)]
+fn rust_module_scope_fact<'tree>(
+    node: Node<'tree>,
+    body: Node<'tree>,
+    source: &str,
+    parent_scope: usize,
+    declaration: SourceDeclarationId,
+    module_name: String,
+    property: &RustDeclarationPropertyFact,
+    imports_macros: bool,
+    resolution_scope: Option<ResolutionScopeId>,
+) -> RustModuleScopeFact {
+    RustModuleScopeFact {
+        parent: Some(parent_scope),
+        declaration: Some(declaration),
+        module_name,
+        path_attribute: rust_path_attribute_value(node, source),
+        visibility: property.visibility.clone(),
+        imports_macros,
+        resolution_scope,
+        body_start: body.start_byte(),
+        body_end: body.end_byte(),
+    }
+}
+
+fn rust_module_route_fact(
+    node: Node<'_>,
+    source: &str,
+    scope: usize,
+    declaration: SourceDeclarationId,
+    module_name: String,
+    property: &RustDeclarationPropertyFact,
+    imports_macros: bool,
+) -> RustModuleRouteFact {
+    RustModuleRouteFact {
+        scope,
+        declaration,
+        module_name,
+        path_attribute: rust_path_attribute_value(node, source),
+        visibility: property.visibility.clone(),
+        imports_macros,
+        test_gated: rust_declaration_is_bare_cfg_test_gated(node, source),
+        cfg_condition: property.cfg_condition.clone(),
+        declaration_start: node.start_byte(),
+        declaration_end: node.end_byte(),
+        gates: Vec::new(),
+    }
 }
 
 impl<'source> RustUsageFactCollector<'source> {
@@ -480,17 +536,17 @@ impl<'source> RustUsageFactCollector<'source> {
                         declaration,
                         native_module_scope,
                     );
-                    self.module_routes.scopes.push(RustModuleScopeFact {
-                        parent: Some(parent_scope),
-                        declaration: Some(declaration),
-                        module_name: name.to_string(),
-                        path_attribute: rust_path_attribute_value(node, self.source),
-                        visibility: property.visibility.clone(),
+                    self.module_routes.scopes.push(rust_module_scope_fact(
+                        node,
+                        body,
+                        self.source,
+                        parent_scope,
+                        declaration,
+                        name.to_string(),
+                        property,
                         imports_macros,
-                        resolution_scope: native_module_scope,
-                        body_start: body.start_byte(),
-                        body_end: body.end_byte(),
-                    });
+                        native_module_scope,
+                    ));
                     child_scope = self.module_routes.scopes.len() - 1;
                     let child_module_name_index = self.module_name_arena.len();
                     self.module_name_arena.push(full_module_name);
@@ -510,24 +566,17 @@ impl<'source> RustUsageFactCollector<'source> {
                         },
                     });
                     module_sources.record_primary_route(parent_scope, declaration);
-                    self.module_routes.routes.push(RustModuleRouteFact {
-                        scope: parent_scope,
+                    let imports_macros = self.module_routes.scopes[parent_scope].imports_macros
+                        && crate::imports::rust_item_has_attribute(node, self.source, "macro_use");
+                    self.module_routes.routes.push(rust_module_route_fact(
+                        node,
+                        self.source,
+                        parent_scope,
                         declaration,
-                        module_name: name.to_string(),
-                        path_attribute: rust_path_attribute_value(node, self.source),
-                        visibility: property.visibility.clone(),
-                        imports_macros: self.module_routes.scopes[parent_scope].imports_macros
-                            && crate::imports::rust_item_has_attribute(
-                                node,
-                                self.source,
-                                "macro_use",
-                            ),
-                        test_gated: rust_declaration_is_bare_cfg_test_gated(node, self.source),
-                        cfg_condition: property.cfg_condition.clone(),
-                        declaration_start: node.start_byte(),
-                        declaration_end: node.end_byte(),
-                        gates: Vec::new(),
-                    });
+                        name.to_string(),
+                        property,
+                        imports_macros,
+                    ));
                 }
             }
         }
@@ -666,17 +715,17 @@ impl<'source> RustUsageFactCollector<'source> {
                         let child_scope = self.route_batches[batch_id].scopes.len() + 1;
                         self.route_batches[batch_id]
                             .scopes
-                            .push(RustModuleScopeFact {
-                                parent: Some(scope_local),
-                                declaration: Some(declaration),
-                                module_name: name.to_string(),
-                                path_attribute: rust_path_attribute_value(node, self.source),
-                                visibility: property.visibility.clone(),
+                            .push(rust_module_scope_fact(
+                                node,
+                                body,
+                                self.source,
+                                scope_local,
+                                declaration,
+                                name.to_string(),
+                                property,
                                 imports_macros,
-                                resolution_scope: None,
-                                body_start: body.start_byte(),
-                                body_end: body.end_byte(),
-                            });
+                                None,
+                            ));
                         self.route_batches[batch_id].source_scopes.push(
                             RustModuleScopeSourceFact {
                                 parent: Some(scope_local),
@@ -688,22 +737,15 @@ impl<'source> RustUsageFactCollector<'source> {
                     } else {
                         self.route_batches[batch_id]
                             .routes
-                            .push(RustModuleRouteFact {
-                                scope: scope_local,
+                            .push(rust_module_route_fact(
+                                node,
+                                self.source,
+                                scope_local,
                                 declaration,
-                                module_name: name.to_string(),
-                                path_attribute: rust_path_attribute_value(node, self.source),
-                                visibility: property.visibility.clone(),
+                                name.to_string(),
+                                property,
                                 imports_macros,
-                                test_gated: rust_declaration_is_bare_cfg_test_gated(
-                                    node,
-                                    self.source,
-                                ),
-                                cfg_condition: property.cfg_condition.clone(),
-                                declaration_start: node.start_byte(),
-                                declaration_end: node.end_byte(),
-                                gates: Vec::new(),
-                            });
+                            ));
                         self.route_batches[batch_id].source_routes.push(
                             RustModuleRouteSourceFact {
                                 scope: scope_local,
@@ -909,7 +951,7 @@ impl<'source> RustUsageFactCollector<'source> {
         let Some(arguments) = rust_macro_invocation_arguments(node) else {
             return;
         };
-        let Some(literal) = single_named_child(arguments) else {
+        let Some(literal) = single_named_child_matching(arguments, |_| true) else {
             return;
         };
         let Some(relative_path) = rust_static_string_literal(literal, self.source) else {
@@ -957,6 +999,12 @@ impl<'source> RustUsageFactCollector<'source> {
                 let binding_name = projected.import.binding_name();
                 let (module_path, imported_name, bound_name) = if binding_name.is_glob() {
                     (path.to_vec(), None, None)
+                } else if projected.import.module_self {
+                    (
+                        path.to_vec(),
+                        Some("self".to_owned()),
+                        binding_name.named().map(str::to_string),
+                    )
                 } else {
                     let (prefix, name) = path.split_last().map_or_else(
                         || (Vec::new(), None),
@@ -1137,14 +1185,6 @@ fn include_host_bindings(
     bindings
 }
 
-/// The one named child of `node`, or `None` when it has none or several.
-fn single_named_child(node: Node<'_>) -> Option<Node<'_>> {
-    let mut cursor = node.walk();
-    let mut children = node.named_children(&mut cursor);
-    let child = children.next()?;
-    children.next().is_none().then_some(child)
-}
-
 /// The re-export subset of the import bindings: root-module `use` declarations
 /// that are visible outside the file.
 ///
@@ -1250,30 +1290,141 @@ fn rust_path_attribute_value(module: Node<'_>, source: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brokk_bifrost_core::analyzer::ProjectFile;
     use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
     use brokk_bifrost_core::analyzer::rust_facts::RustCfgCondition;
     use brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceProvenance;
-    use tree_sitter::Parser;
+    use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
+    use brokk_bifrost_test_macros::hardwon;
 
     fn facts(source: &str) -> RustUsageFacts {
         parsed_file(source).rust_usage_facts
     }
 
     fn parsed_file(source: &str) -> ParsedFile {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .expect("load rust grammar");
-        let tree = parser.parse(source, None).expect("parse rust source");
-        let temp = tempfile::tempdir().expect("temporary workspace");
-        let file = ProjectFile::new(
-            temp.path()
-                .canonicalize()
-                .expect("canonical temporary root"),
-            "src/lib.rs",
+        crate::test_helpers::parse_rust_fixture(source)
+    }
+
+    #[test]
+    fn malformed_empty_inner_attribute_name_is_not_published() {
+        let parsed = parsed_file("#![]\n#![p = ]\n#![p::]\n#![p:: =]\n#![unsafe]\n#![unsafe =]\n");
+        let modules = parsed
+            .source_facts
+            .as_ref()
+            .and_then(|facts| facts.rust_modules.as_ref())
+            .expect("Rust module source facts");
+
+        assert_eq!(
+            modules
+                .inner_attributes
+                .iter()
+                .map(|attribute| attribute.name.as_str())
+                .collect::<Vec<_>>(),
+            ["p", "p", "p", "unsafe", "unsafe"],
         );
-        crate::declarations::parse_rust_file(&file, source, &tree)
+    }
+
+    #[test]
+    fn source_metadata_identity_includes_each_duplicate_declarations_visibility() {
+        let parsed = parsed_file("pub struct Duplicate;\nstruct Duplicate;\n");
+        assert_eq!(parsed.source_declaration_metadata.len(), 2);
+        let first = &parsed.source_declaration_metadata[0];
+        let second = &parsed.source_declaration_metadata[1];
+        assert_eq!(first.unit, second.unit);
+        assert_ne!(first.metadata_ordinal, second.metadata_ordinal);
+        let metadata = &parsed.signature_metadata[&first.unit];
+        assert_eq!(
+            metadata[first.metadata_ordinal].callable_declared_visibility(),
+            Some(DeclaredVisibility::Public),
+        );
+        assert_eq!(
+            metadata[second.metadata_ordinal].callable_declared_visibility(),
+            Some(DeclaredVisibility::Private),
+        );
+    }
+
+    #[test]
+    fn source_metadata_uses_inherited_trait_implementation_visibility() {
+        let parsed = parsed_file(
+            "pub trait Access { fn get(&self); }\n\
+             struct Value;\n\
+             impl Access for Value { fn get(&self) {} }\n",
+        );
+        let visibilities = parsed
+            .source_facts
+            .as_ref()
+            .expect("Rust source facts")
+            .declaration_visibilities
+            .as_ref()
+            .expect("Rust declaration visibilities")
+            .iter()
+            .map(|fact| (fact.declaration, fact.visibility))
+            .collect::<HashMap<_, _>>();
+        let implementation = parsed
+            .source_declaration_metadata
+            .iter()
+            .find(|link| link.unit.short_name() == "Value.get")
+            .expect("trait implementation method metadata");
+        assert_eq!(
+            visibilities.get(&implementation.declaration),
+            Some(&DeclaredVisibility::Public),
+            "the trait method's access is inherited by its implementation",
+        );
+        assert_eq!(
+            parsed.signature_metadata[&implementation.unit][implementation.metadata_ordinal]
+                .callable_declared_visibility(),
+            Some(DeclaredVisibility::Public),
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "75d44cf79d6d: An as-underscore import retains its target and public export identity while exposing no local binder."
+    )]
+    fn unnamed_imports_keep_the_target_without_a_local_binding() {
+        let source = "pub use alpha::Trait as _;\nuse beta::Other as _;\n";
+        let facts = facts(source);
+
+        let described: Vec<_> = facts
+            .import_targets
+            .iter()
+            .map(|target| {
+                (
+                    target
+                        .module_path
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>(),
+                    target.bound_name.as_deref(),
+                    target.imported_name.as_deref(),
+                    target.is_glob,
+                )
+            })
+            .collect();
+        assert_eq!(
+            described,
+            vec![
+                (vec!["alpha"], None, Some("Trait"), false),
+                (vec!["beta"], None, Some("Other"), false),
+            ],
+            "targets were {:?}",
+            facts.import_targets
+        );
+        assert_eq!(facts.exports.len(), 1);
+        assert_eq!(facts.exports[0].exported_name, None);
+        assert_eq!(facts.exports[0].source_path, "alpha");
+        assert_eq!(facts.exports[0].imported_name.as_deref(), Some("Trait"));
+        assert!(!facts.exports[0].is_glob);
+    }
+
+    #[test]
+    fn raw_identifiers_are_recorded_under_their_canonical_spelling() {
+        let occurrences = facts("fn r#match() {}\n").identifier_occurrences;
+        assert!(
+            occurrences
+                .iter()
+                .any(|occurrence| occurrence.identifier == "match"),
+            "raw identifier should canonicalize: {occurrences:?}"
+        );
     }
 
     #[test]
@@ -1542,28 +1693,6 @@ fn owner() { unknown! { mod local; } }
     }
 
     #[test]
-    fn modules_record_the_file_root_and_every_declared_module() {
-        let source = "mod detached;\nmod inline { mod nested { } }\n";
-        let modules = facts(source).modules;
-        let named: Vec<_> = modules
-            .iter()
-            .map(|module| (module.module_name.as_str(), module.is_inline))
-            .collect();
-        assert_eq!(
-            named,
-            vec![
-                ("", true),
-                ("detached", false),
-                ("inline", true),
-                ("inline.nested", true),
-            ],
-            "modules were {modules:?}"
-        );
-        assert_eq!(modules[0].start_byte, 0);
-        assert_eq!(modules[0].end_byte, source.len());
-    }
-
-    #[test]
     fn import_targets_record_named_glob_aliased_and_local_bindings() {
         let source = "\
 use alpha::beta::Gamma;
@@ -1740,43 +1869,6 @@ outer! { pub struct Item; pub fn function() {} pub mod generated; inner! { mod n
     }
 
     #[test]
-    fn unnamed_imports_keep_the_target_without_a_local_binding() {
-        let source = "pub use alpha::Trait as _;\nuse beta::Other as _;\n";
-        let facts = facts(source);
-
-        let described: Vec<_> = facts
-            .import_targets
-            .iter()
-            .map(|target| {
-                (
-                    target
-                        .module_path
-                        .iter()
-                        .map(String::as_str)
-                        .collect::<Vec<_>>(),
-                    target.bound_name.as_deref(),
-                    target.imported_name.as_deref(),
-                    target.is_glob,
-                )
-            })
-            .collect();
-        assert_eq!(
-            described,
-            vec![
-                (vec!["alpha"], None, Some("Trait"), false),
-                (vec!["beta"], None, Some("Other"), false),
-            ],
-            "targets were {:?}",
-            facts.import_targets
-        );
-        assert_eq!(facts.exports.len(), 1);
-        assert_eq!(facts.exports[0].exported_name, None);
-        assert_eq!(facts.exports[0].source_path, "alpha");
-        assert_eq!(facts.exports[0].imported_name.as_deref(), Some("Trait"));
-        assert!(!facts.exports[0].is_glob);
-    }
-
-    #[test]
     fn exports_take_the_non_private_root_use_declarations_only() {
         let source = "\
 use private::Hidden;
@@ -1840,17 +1932,6 @@ fn declared_in_code() {
                 .windows(2)
                 .all(|pair| pair[0].identifier < pair[1].identifier),
             "occurrences must be deduped and sorted: {occurrences:?}"
-        );
-    }
-
-    #[test]
-    fn raw_identifiers_are_recorded_under_their_canonical_spelling() {
-        let occurrences = facts("fn r#match() {}\n").identifier_occurrences;
-        assert!(
-            occurrences
-                .iter()
-                .any(|occurrence| occurrence.identifier == "match"),
-            "raw identifier should canonicalize: {occurrences:?}"
         );
     }
 }

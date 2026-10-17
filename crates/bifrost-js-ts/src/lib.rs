@@ -42,6 +42,7 @@ pub mod identifiers;
 pub mod imports;
 pub mod javascript;
 pub mod model;
+pub mod npm_version;
 pub mod parse;
 pub mod providers;
 pub mod queries;
@@ -55,6 +56,9 @@ pub mod tsconfig;
 pub mod type_text;
 pub mod typescript;
 pub mod workspace_packages;
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 
 mod primary;
 mod type_source;

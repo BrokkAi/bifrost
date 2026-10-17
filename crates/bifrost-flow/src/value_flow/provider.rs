@@ -166,6 +166,17 @@ pub trait ValueFlowProvider {
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<DispatchResult>, Self::Error>;
 
+    /// Resolve dispatch using exact bounded entering-call context. Providers
+    /// without contextual support retain their ordinary conservative answer.
+    fn resolve_call_in_context(
+        &self,
+        call: &CallSiteHandle,
+        _context: &OracleCallContext,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<DispatchResult>, Self::Error> {
+        self.resolve_call(call, request)
+    }
+
     /// Materialize one dispatch candidate's call bindings on demand.
     fn call_bindings(
         &self,
@@ -306,12 +317,13 @@ impl DispatchKey {
 ///
 /// The caller and the dispatch target are each pinned by their artifact content
 /// fingerprint and procedure identity, and the call site is pinned by its
-/// caller-local identity. The candidate's own `proof` and `completeness` are
-/// pinned too, then the call context and the oracle limits. See
-/// `call_bindings` below for why each of those is here.
+/// caller-local identity. Workspace behavior is also part of the key for Java
+/// conversions and Python callee defaults, which can change independently of
+/// those artifact identities. The candidate's own `proof` and `completeness`
+/// are pinned too, then the call context and the oracle limits.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct BindingsKey {
-    conversion_environment: Option<IcfgProviderBehaviorIdentity>,
+    provider_behavior: Option<IcfgProviderBehaviorIdentity>,
     caller_artifact: StableDigest,
     caller_procedure: ProcedureId,
     call_site: CallSiteId,
@@ -335,10 +347,14 @@ impl BindingsKey {
         let caller = call.procedure();
         let target = candidate.target();
         Self {
-            conversion_environment: (caller.artifact().key().language()
+            provider_behavior: (caller.artifact().key().language()
                 == crate::analyzer::semantic::SemanticLanguage::Standard(
                     crate::analyzer::Language::Java,
-                ))
+                )
+                || target.artifact().key().language()
+                    == crate::analyzer::semantic::SemanticLanguage::Standard(
+                        crate::analyzer::Language::Python,
+                    ))
             .then_some(provider_behavior),
             caller_artifact: caller.artifact().key().fingerprint(),
             caller_procedure: caller.id(),
@@ -360,14 +376,19 @@ impl BindingsKey {
 
 /// Conservative structural byte weight of one retained snapshot verdict. The
 /// shared provenance arena is `Arc`-shared across relations, so this counts the
-/// owned relation rows without double counting the arena.
+/// owned relation rows and the entire retained arena once, including records
+/// whose projected rows were filtered out.
 fn weigh_snapshot(_key: &SnapshotKey, outcome: &Arc<MemoizedSnapshot>) -> u32 {
     let relations = outcome
         .available_value()
         .map_or(0, |snapshot| snapshot.relations().len())
         .saturating_mul(size_of::<ValueFlowRelation>());
+    let arena = outcome
+        .available_value()
+        .map_or(0, ValueFlowSnapshot::retained_arena_bytes);
     size_of::<MemoizedSnapshot>()
         .saturating_add(relations)
+        .saturating_add(arena)
         .min(u32::MAX as usize) as u32
 }
 
@@ -561,15 +582,7 @@ impl<'a> WorkspaceValueFlowProvider<'a> {
     pub fn new(workspace: &'a WorkspaceAnalyzer, cache: ValueFlowCache) -> Self {
         let provider = WorkspaceIcfgProvider::new(workspace);
         let oracle = provider.oracle().clone();
-        let dispatch_sessions = Arc::new(oracle.prepare_workspace_dispatch_pool());
-        Self {
-            oracle,
-            provider_behavior: provider.behavior_identity(),
-            cache,
-            dispatch_sessions,
-            dispatch_reads: None,
-            retained_writes: Arc::new(AtomicBool::new(false)),
-        }
+        Self::with_oracle(oracle, provider.behavior_identity(), cache)
     }
 
     /// Bind the provider to an externally built oracle and one shared cache.
@@ -734,6 +747,29 @@ impl ValueFlowProvider for WorkspaceValueFlowProvider<'_> {
         Ok(outcome)
     }
 
+    fn resolve_call_in_context(
+        &self,
+        call: &CallSiteHandle,
+        context: &OracleCallContext,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<DispatchResult>, SemanticProviderError> {
+        if context.calls().is_empty() && !context.was_truncated() {
+            return self.resolve_call(call, request);
+        }
+        // Contextual outcomes never enter the shared origin-only cache. Paid
+        // source is reused by this query's prepared dispatch sessions; proof
+        // and captures are recomputed and charged for each exact context.
+        let outcome = self
+            .dispatch_sessions
+            .resolve_call_in_context(call, context, request)?;
+        if let Some(collector) = &self.dispatch_reads {
+            collector.record(call, DispatchReadAttribution::Unattributed(
+                crate::analyzer::semantic::DispatchReadUnattributedReason::CallContextUnavailable,
+            ));
+        }
+        Ok(outcome)
+    }
+
     fn call_bindings(
         &self,
         call: &CallSiteHandle,
@@ -886,9 +922,19 @@ mod tests {
             let cancellation = CancellationToken::default();
             let mut starved_budget = SemanticBudget::default();
             let nested_limit = starved_budget.limits().nested_entries;
+            // Pay the native IR producer probe first; leave the source
+            // resolver only one nested entry so its parsed syntax is unpaid.
+            let producer_entries: usize = calls[0]
+                .procedure()
+                .semantics()
+                .points()
+                .iter()
+                .map(|point| point.events.len())
+                .sum();
+            assert!(producer_entries < nested_limit);
             starved_budget
                 .charge(SemanticWork {
-                    nested_entries: nested_limit - 1,
+                    nested_entries: nested_limit - producer_entries - 1,
                     ..SemanticWork::default()
                 })
                 .expect("leave one nested entry of headroom");

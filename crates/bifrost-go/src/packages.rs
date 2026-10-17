@@ -8,9 +8,9 @@
 //! from the nearest `go.mod` (falling back to directory layout when no module
 //! is present) so that `CodeUnit::fq_name()` is unique per declaration.
 
-use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::project::Project;
+use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -20,6 +20,17 @@ use crate::declarations::go_package_fq;
 /// Synthetic scope segment owning a Go package's module-level `var`, `const`
 /// and type-alias declarations, which have no enclosing type of their own.
 pub const GO_MODULE_SCOPE_SEGMENT: &str = "_module_";
+
+/// Whether this field's package-less short name starts with the synthetic
+/// module-scope segment used for top-level Go values.
+pub fn is_go_module_field(unit: &CodeUnit) -> bool {
+    unit.is_field()
+        && unit
+            .short_name()
+            .split('.')
+            .next()
+            .is_some_and(|segment| segment == GO_MODULE_SCOPE_SEGMENT)
+}
 
 pub struct GoModuleRoot {
     pub import_path: String,
@@ -176,10 +187,23 @@ impl GoWorkspacePathIndex {
                 ))
             })
             .unwrap_or_else(|| no_module_base(file, declared_base));
-        if is_external_test {
-            format!("{base}_test")
-        } else {
-            base
+        external_test_package_name(base, is_external_test)
+    }
+
+    /// Whether two source files belong to the same nearest Go module. When
+    /// neither file is under an indexed module, the workspace root is the
+    /// module-local boundary; a file inside a module never joins that fallback.
+    pub fn same_module(&self, left: &ProjectFile, right: &ProjectFile) -> bool {
+        let nearest_module = |file: &ProjectFile| {
+            self.module_roots
+                .iter()
+                .filter(|module| file.parent().starts_with(&module.workspace_dir))
+                .max_by_key(|module| module.workspace_dir.components().count())
+        };
+        match (nearest_module(left), nearest_module(right)) {
+            (Some(left), Some(right)) => left.workspace_dir == right.workspace_dir,
+            (None, None) => left.root() == right.root(),
+            _ => false,
         }
     }
 }
@@ -331,11 +355,7 @@ pub fn canonical_go_package_name(file: &ProjectFile, declared_package: &str) -> 
         None => no_module_base(file, declared_base),
     };
 
-    if is_external_test {
-        format!("{base}_test")
-    } else {
-        base
-    }
+    external_test_package_name(base, is_external_test)
 }
 
 /// Canonical package identity for publication into the workspace package
@@ -356,11 +376,15 @@ pub fn canonical_go_workspace_package_name(
         GoModuleLookup::Missing => no_module_base(file, declared_base),
         GoModuleLookup::Invalid => return None,
     };
-    Some(if is_external_test {
+    Some(external_test_package_name(base, is_external_test))
+}
+
+fn external_test_package_name(base: String, is_external_test: bool) -> String {
+    if is_external_test {
         format!("{base}_test")
     } else {
         base
-    })
+    }
 }
 
 fn declared_package_parts<'a>(file: &ProjectFile, declared_package: &'a str) -> (&'a str, bool) {
@@ -620,8 +644,8 @@ pub fn go_module_path_from_source(contents: &str) -> Option<String> {
     module_path.filter(|path| valid_go_module_path(path))
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum GoModToken {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GoModToken {
     Identifier(String),
     String(String),
     LeftParen,
@@ -630,76 +654,14 @@ enum GoModToken {
 }
 
 fn go_mod_tokens(contents: &str) -> Option<Vec<GoModToken>> {
-    let mut tokens = Vec::new();
-    let mut offset = 0;
-    while offset < contents.len() {
-        let character = contents[offset..].chars().next()?;
-        match character {
-            ' ' | '\t' | '\r' => offset += character.len_utf8(),
-            '\n' => {
-                tokens.push(GoModToken::Newline);
-                offset += character.len_utf8();
-            }
-            '/' if contents[offset..].starts_with("//") => {
-                while offset < contents.len() {
-                    let character = contents[offset..].chars().next()?;
-                    if character == '\n' {
-                        break;
-                    }
-                    offset += character.len_utf8();
-                }
-            }
-            '(' => {
-                tokens.push(GoModToken::LeftParen);
-                offset += character.len_utf8();
-            }
-            ')' => {
-                tokens.push(GoModToken::RightParen);
-                offset += character.len_utf8();
-            }
-            '"' | '`' => {
-                let delimiter = character;
-                let interpreted = delimiter == '"';
-                offset += delimiter.len_utf8();
-                let mut value = String::new();
-                let mut closed = false;
-                while offset < contents.len() {
-                    let character = contents[offset..].chars().next()?;
-                    offset += character.len_utf8();
-                    if character == delimiter {
-                        closed = true;
-                        break;
-                    }
-                    if interpreted && character == '\\' {
-                        let escaped = contents[offset..].chars().next()?;
-                        offset += escaped.len_utf8();
-                        value.push(escaped);
-                    } else {
-                        value.push(character);
-                    }
-                }
-                if !closed {
-                    return None;
-                }
-                tokens.push(GoModToken::String(value));
-            }
-            _ => {
-                let start = offset;
-                while offset < contents.len() {
-                    let character = contents[offset..].chars().next()?;
-                    if matches!(character, ' ' | '\t' | '\r' | '\n' | '(' | ')')
-                        || contents[offset..].starts_with("//")
-                    {
-                        break;
-                    }
-                    offset += character.len_utf8();
-                }
-                debug_assert!(offset > start, "go.mod token scanner must make progress");
-                tokens.push(GoModToken::Identifier(contents[start..offset].to_owned()));
-            }
-        }
-    }
-    Some(tokens)
+    let limits = crate::build_files::BuildFileLimits {
+        max_bytes: usize::MAX,
+        max_tokens: usize::MAX,
+        max_entries: usize::MAX,
+    };
+    crate::build_files::lex(contents, &limits, &|| false)
+        .ok()
+        .map(|tokens| tokens.into_iter().map(|token| token.kind).collect())
 }
 
 fn next_go_mod_line<'a>(tokens: &'a [GoModToken], cursor: &mut usize) -> &'a [GoModToken] {
@@ -731,7 +693,7 @@ fn go_module_path_token(token: &GoModToken) -> Option<&str> {
     }
 }
 
-fn valid_go_module_path(path: &str) -> bool {
+pub(crate) fn valid_go_module_path(path: &str) -> bool {
     if path.is_empty() || path.starts_with('/') || path.ends_with('/') {
         return false;
     }
@@ -794,44 +756,12 @@ mod tests {
     use brokk_bifrost_core::analyzer::fq_name::segment_interner;
     use brokk_bifrost_core::analyzer::project::{Project, TestProject};
     use brokk_bifrost_core::analyzer::{Language, ProjectFile};
+    use brokk_bifrost_test_macros::hardwon;
     use std::collections::BTreeSet;
     use std::path::Path;
     use std::sync::Mutex;
 
     static CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    #[test]
-    fn vendor_alias_uses_the_last_real_vendor_directory_and_structured_suffix() {
-        let root = std::env::current_dir().expect("test working directory must be available");
-        for (path, canonical, expected) in [
-            (
-                "vendor/k8s.io/utils/strings/strings.go",
-                "example.com/repo/vendor/k8s.io/utils/strings",
-                Some("k8s.io/utils/strings"),
-            ),
-            (
-                "vendor/outer/vendor/example.com/dep/pkg/pkg.go",
-                "example.com/repo/vendor/outer/vendor/example.com/dep/pkg",
-                Some("example.com/dep/pkg"),
-            ),
-            (
-                "vendor/example.com/dep/pkg/pkg_test.go",
-                "example.com/repo/vendor/example.com/dep/pkg_test",
-                Some("example.com/dep/pkg_test"),
-            ),
-            ("pkg/pkg.go", "vendor/pkg", None),
-        ] {
-            let alias = go_vendor_package_alias(
-                &ProjectFile::new(root.clone(), path),
-                &go_package_fq(canonical),
-            );
-            assert_eq!(
-                alias.map(|alias| alias.display(segment_interner())),
-                expected.map(str::to_string),
-                "{path}"
-            );
-        }
-    }
 
     #[test]
     fn source_inventory_build_constraints_cover_goos_and_goarch_suffixes() {
@@ -861,20 +791,6 @@ mod tests {
             &ProjectFile::new(root, "pkg/files.go"),
             true
         ));
-    }
-
-    fn write_file(root: &std::path::Path, rel_path: &str, contents: &str) {
-        let path = root.join(rel_path);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, contents).unwrap();
-    }
-
-    fn reset_cache_probe_count(root: &Path) {
-        invalidate_nearest_go_module_cache();
-        go_mod_probe_attempts()
-            .lock()
-            .expect("go module probe count mutex")
-            .remove(root);
     }
 
     #[test]
@@ -1123,27 +1039,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_path_index_preserves_moduleless_root_package_identity() {
-        let repo = tempfile::tempdir().unwrap();
-        let root = repo.path().canonicalize().unwrap();
-        write_file(&root, "root.go", "package rootpkg\n");
-        write_file(&root, "child/child.go", "package child\n");
-        let project = TestProject::new(root, Language::Go);
-        let index = GoWorkspacePathIndex::build(&project, |file| {
-            if file.parent().as_os_str().is_empty() {
-                Some("rootpkg".to_owned())
-            } else {
-                Some("child".to_owned())
-            }
-        });
-
-        assert!(index.is_complete());
-        assert!(index.exact_package_exists("rootpkg"));
-        assert!(index.exact_package_exists("child"));
-        assert!(!index.exact_package_exists("root"));
-    }
-
-    #[test]
+    #[hardwon("3a8f1703f7ac: sibling lookups repeated the same filesystem walk")]
     fn sibling_files_reuse_the_cached_go_mod_walk() {
         let _guard = CACHE_TEST_LOCK.lock().unwrap();
         let repo = tempfile::tempdir().unwrap();
@@ -1170,6 +1066,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("3a8f1703f7ac: edited go.mod data remained stale in the module cache")]
     fn invalidation_refreshes_an_edited_module_path() {
         let _guard = CACHE_TEST_LOCK.lock().unwrap();
         let repo = tempfile::tempdir().unwrap();
@@ -1194,6 +1091,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("3a8f1703f7ac: cached module anchors crossed project roots")]
     fn cache_keeps_project_root_boundaries_distinct() {
         let _guard = CACHE_TEST_LOCK.lock().unwrap();
         let repo = tempfile::tempdir().unwrap();
@@ -1212,23 +1110,12 @@ mod tests {
     }
 
     #[test]
-    fn plain_module_path() {
-        assert_eq!(
-            Some("example.com/repo".to_string()),
-            go_module_path_from_source("module example.com/repo\n")
-        );
-    }
-
-    #[test]
+    #[hardwon("#2341: trailing go.mod comments, including slash text, leaked into module identity")]
     fn trailing_line_comment_is_excluded() {
         assert_eq!(
             Some("example.com/repo".to_string()),
             go_module_path_from_source("module example.com/repo // comment\n")
         );
-    }
-
-    #[test]
-    fn comment_with_slashes_in_its_text_is_excluded() {
         // The go2hx/go4hx go.mod line verbatim: the comment's own text
         // contains `/` characters, which must not be mistaken for part of
         // the module path.
@@ -1249,26 +1136,14 @@ mod tests {
     }
 
     #[test]
-    fn quoted_module_path() {
+    fn interpreted_string_escapes_do_not_manufacture_a_module_path() {
         assert_eq!(
-            Some("example.com/repo".to_string()),
-            go_module_path_from_source("module \"example.com/repo\"\n")
-        );
-    }
-
-    #[test]
-    fn quoted_module_path_with_trailing_comment() {
-        assert_eq!(
-            Some("example.com/repo".to_string()),
-            go_module_path_from_source("module \"example.com/repo\" // comment\n")
-        );
-    }
-
-    #[test]
-    fn interpreted_string_escapes_are_decoded_exactly() {
-        assert_eq!(
-            Some("example.com/repo".to_string()),
+            None,
             go_module_path_from_source("module \"example.com/\\repo\"\n")
+        );
+        assert_eq!(
+            Some("example.com/repo".to_string()),
+            go_module_path_from_source("module \"example.com/\\x72epo\"\n")
         );
     }
 
@@ -1277,45 +1152,6 @@ mod tests {
         assert_eq!(
             Some("example.com/repo".to_string()),
             go_module_path_from_source("module `example.com/repo`\n")
-        );
-    }
-
-    #[test]
-    fn tab_after_module_keyword() {
-        assert_eq!(
-            Some("example.com/repo".to_string()),
-            go_module_path_from_source("module\texample.com/repo\n")
-        );
-    }
-
-    #[test]
-    fn module_line_that_is_only_a_comment_has_no_path() {
-        assert_eq!(
-            None,
-            go_module_path_from_source("module // just a comment, no path\n")
-        );
-    }
-
-    #[test]
-    fn empty_go_mod_has_no_path() {
-        assert_eq!(None, go_module_path_from_source(""));
-    }
-
-    #[test]
-    fn identifier_that_merely_starts_with_module_is_not_the_keyword() {
-        assert_eq!(
-            None,
-            go_module_path_from_source("modules example.com/repo\n")
-        );
-    }
-
-    #[test]
-    fn module_path_is_found_among_other_directives() {
-        assert_eq!(
-            Some("example.com/repo".to_string()),
-            go_module_path_from_source(
-                "go 1.22\n\nmodule example.com/repo\n\nrequire foo v1.0.0\n"
-            )
         );
     }
 
@@ -1365,5 +1201,166 @@ mod tests {
         ] {
             assert_eq!(None, go_module_path_from_source(source), "{source:?}");
         }
+    }
+
+    #[test]
+    #[hardwon(
+        "93d79e79cc84: go.mod module parsing took the rest of the line instead of the module directive token"
+    )]
+    fn plain_module_path() {
+        assert_eq!(
+            Some("example.com/repo".to_string()),
+            go_module_path_from_source("module example.com/repo\n")
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "93d79e79cc84: go.mod module parsing took the rest of the line instead of the module directive token"
+    )]
+    fn quoted_module_path() {
+        assert_eq!(
+            Some("example.com/repo".to_string()),
+            go_module_path_from_source("module \"example.com/repo\"\n")
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "93d79e79cc84: go.mod module parsing took the rest of the line instead of the module directive token"
+    )]
+    fn quoted_module_path_with_trailing_comment() {
+        assert_eq!(
+            Some("example.com/repo".to_string()),
+            go_module_path_from_source("module \"example.com/repo\" // comment\n")
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "93d79e79cc84: go.mod module parsing took the rest of the line instead of the module directive token"
+    )]
+    fn tab_after_module_keyword() {
+        assert_eq!(
+            Some("example.com/repo".to_string()),
+            go_module_path_from_source("module\texample.com/repo\n")
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "93d79e79cc84: go.mod module parsing took the rest of the line instead of the module directive token"
+    )]
+    fn module_line_that_is_only_a_comment_has_no_path() {
+        assert_eq!(
+            None,
+            go_module_path_from_source("module // just a comment, no path\n")
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "93d79e79cc84: go.mod module parsing took the rest of the line instead of the module directive token"
+    )]
+    fn empty_go_mod_has_no_path() {
+        assert_eq!(None, go_module_path_from_source(""));
+    }
+
+    #[test]
+    #[hardwon(
+        "93d79e79cc84: go.mod module parsing took the rest of the line instead of the module directive token"
+    )]
+    fn identifier_that_merely_starts_with_module_is_not_the_keyword() {
+        assert_eq!(
+            None,
+            go_module_path_from_source("modules example.com/repo\n")
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "93d79e79cc84: go.mod module parsing took the rest of the line instead of the module directive token"
+    )]
+    fn module_path_is_found_among_other_directives() {
+        assert_eq!(
+            Some("example.com/repo".to_string()),
+            go_module_path_from_source(
+                "go 1.22\n\nmodule example.com/repo\n\nrequire foo v1.0.0\n"
+            )
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "5c5d4e214494: Go vendor alias resolution selected a false nested vendor directory or suffix"
+    )]
+    fn vendor_alias_uses_the_last_real_vendor_directory_and_structured_suffix() {
+        let root = std::env::current_dir().expect("test working directory must be available");
+        for (path, canonical, expected) in [
+            (
+                "vendor/k8s.io/utils/strings/strings.go",
+                "example.com/repo/vendor/k8s.io/utils/strings",
+                Some("k8s.io/utils/strings"),
+            ),
+            (
+                "vendor/outer/vendor/example.com/dep/pkg/pkg.go",
+                "example.com/repo/vendor/outer/vendor/example.com/dep/pkg",
+                Some("example.com/dep/pkg"),
+            ),
+            (
+                "vendor/example.com/dep/pkg/pkg_test.go",
+                "example.com/repo/vendor/example.com/dep/pkg_test",
+                Some("example.com/dep/pkg_test"),
+            ),
+            ("pkg/pkg.go", "vendor/pkg", None),
+        ] {
+            let alias = go_vendor_package_alias(
+                &ProjectFile::new(root.clone(), path),
+                &go_package_fq(canonical),
+            );
+            assert_eq!(
+                alias.map(|alias| alias.display(segment_interner())),
+                expected.map(str::to_string),
+                "{path}"
+            );
+        }
+    }
+
+    fn write_file(root: &std::path::Path, rel_path: &str, contents: &str) {
+        let path = root.join(rel_path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+
+    fn reset_cache_probe_count(root: &Path) {
+        invalidate_nearest_go_module_cache();
+        go_mod_probe_attempts()
+            .lock()
+            .expect("go module probe count mutex")
+            .remove(root);
+    }
+
+    #[test]
+    #[hardwon(
+        "5c5d4e214494: moduleless workspace root package identity was lost in the path index"
+    )]
+    fn workspace_path_index_preserves_moduleless_root_package_identity() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        write_file(&root, "root.go", "package rootpkg\n");
+        write_file(&root, "child/child.go", "package child\n");
+        let project = TestProject::new(root, Language::Go);
+        let index = GoWorkspacePathIndex::build(&project, |file| {
+            if file.parent().as_os_str().is_empty() {
+                Some("rootpkg".to_owned())
+            } else {
+                Some("child".to_owned())
+            }
+        });
+
+        assert!(index.is_complete());
+        assert!(index.exact_package_exists("rootpkg"));
+        assert!(index.exact_package_exists("child"));
+        assert!(!index.exact_package_exists("root"));
     }
 }

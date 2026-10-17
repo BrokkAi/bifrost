@@ -236,7 +236,7 @@ fn join_lines(
 
 #[cfg(test)]
 mod tests {
-    use super::{HeadTail, cap_lines, logical_lines, sample, truncate_line};
+    use super::{logical_lines, sample};
 
     #[test]
     fn logical_lines_match_searchtools_behavior() {
@@ -245,37 +245,6 @@ mod tests {
         assert_eq!(vec!["a", "b", "c"], logical_lines("a\rb\rc"));
         assert_eq!(vec!["a"], logical_lines("a\r\n"));
         assert_eq!(Vec::<&str>::new(), logical_lines(""));
-    }
-
-    #[test]
-    fn truncate_line_caps_long_lines() {
-        let long = "x".repeat(2050);
-        let truncated = truncate_line(&long);
-        assert!(truncated.len() > 2048);
-        assert!(truncated.ends_with(" [TRUNCATED at 2048 chars]"));
-    }
-
-    #[test]
-    fn cap_lines_truncates_each_line() {
-        let text = format!("{}\nshort", "x".repeat(2050));
-        let capped = cap_lines(&text);
-        assert!(capped.contains("[TRUNCATED at 2048 chars]"));
-        assert!(capped.ends_with("\nshort"));
-    }
-
-    #[test]
-    fn sample_keeps_small_content_full() {
-        let text = "a\nb\nc\n";
-        assert_eq!(
-            HeadTail {
-                text: "a\nb\nc\n".to_string(),
-                truncated: false,
-                total_lines: 3,
-                head_shown: 3,
-                tail_shown: 0
-            },
-            sample(text)
-        );
     }
 
     #[test]

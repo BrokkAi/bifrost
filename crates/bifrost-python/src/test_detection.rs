@@ -2,11 +2,15 @@ use crate::declarations::py_node_text;
 use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::model::{TestAssertionSmell, TestAssertionWeights};
 use brokk_bifrost_core::analyzer::test_assertions::{
-    TestAssertionSignal, append_test_assertion_findings, compact_assertion_excerpt,
+    CommonTestAssertionKind, TestAssertionSignal, append_test_assertion_findings,
+    classify_common_test_assertion, compact_assertion_excerpt, is_common_assertion_literal,
+    normalize_assertion_expression, oversized_quoted_literal,
 };
 use regex::Regex;
 use std::sync::LazyLock;
 use tree_sitter::{Node, Parser};
+
+const TEST_ASSERTION_EXCERPT_MAX_LEN: usize = 180;
 
 static PY_ASSERT_EQUALITY_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"self\.assert(?:Equal|Is)\s*\((?P<left>[^,\n]+?)\s*,\s*(?P<right>[^,\n\)]+)"#)
@@ -136,7 +140,7 @@ fn analyze_python_test_case(
     append_test_assertion_findings(
         file,
         symbol,
-        compact_python_excerpt(&test_case.body),
+        compact_assertion_excerpt(&test_case.body, TEST_ASSERTION_EXCERPT_MAX_LEN),
         test_case.start_byte,
         &assertions,
         weights,
@@ -158,26 +162,21 @@ fn collect_python_assertions(
             continue;
         }
         if left == right {
-            let (kind, reason, score) = if is_python_literal(&left) {
-                (
-                    "constant-equality".to_string(),
-                    "constant-equality".to_string(),
-                    weights.constant_equality_weight,
-                )
-            } else {
-                (
-                    "self-comparison".to_string(),
-                    "self-comparison".to_string(),
-                    weights.tautological_assertion_weight,
-                )
-            };
+            let classification = classify_common_test_assertion(
+                if is_python_literal(&left) {
+                    CommonTestAssertionKind::ConstantEquality
+                } else {
+                    CommonTestAssertionKind::SelfComparison
+                },
+                weights,
+            );
             assertions.push(TestAssertionSignal {
-                kind,
-                score,
-                shallow: false,
+                kind: classification.kind.to_string(),
+                score: classification.score,
+                shallow: classification.shallow,
                 meaningful: false,
-                reasons: vec![reason],
-                excerpt: compact_python_excerpt(whole.as_str()),
+                reasons: vec![classification.kind.to_string()],
+                excerpt: compact_assertion_excerpt(whole.as_str(), TEST_ASSERTION_EXCERPT_MAX_LEN),
                 start_byte: whole.start(),
             });
         } else if let Some(literal) = oversized_python_literal(&left, &right, weights) {
@@ -187,17 +186,19 @@ fn collect_python_assertions(
                 shallow: false,
                 meaningful: false,
                 reasons: vec![format!("overspecified-literal:{literal}")],
-                excerpt: compact_python_excerpt(whole.as_str()),
+                excerpt: compact_assertion_excerpt(whole.as_str(), TEST_ASSERTION_EXCERPT_MAX_LEN),
                 start_byte: whole.start(),
             });
         } else {
+            let classification =
+                classify_common_test_assertion(CommonTestAssertionKind::Meaningful, weights);
             assertions.push(TestAssertionSignal {
-                kind: "meaningful-assertion".to_string(),
-                score: 0,
-                shallow: false,
-                meaningful: true,
-                reasons: vec!["meaningful-assertion".to_string()],
-                excerpt: compact_python_excerpt(whole.as_str()),
+                kind: classification.kind.to_string(),
+                score: classification.score,
+                shallow: classification.shallow,
+                meaningful: classification.score == 0,
+                reasons: vec![classification.kind.to_string()],
+                excerpt: compact_assertion_excerpt(whole.as_str(), TEST_ASSERTION_EXCERPT_MAX_LEN),
                 start_byte: whole.start(),
             });
         }
@@ -207,39 +208,20 @@ fn collect_python_assertions(
         let whole = captures.get(0).expect("whole match");
         let matcher = captures.name("matcher").map(|m| m.as_str()).unwrap_or("");
         let arg = normalize_python_expr(captures.name("arg").map(|m| m.as_str()).unwrap_or(""));
-        let (kind, reason, score, shallow) = match matcher {
-            "True" if arg == "True" => (
-                "constant-truth".to_string(),
-                "constant-truth".to_string(),
-                weights.constant_truth_weight,
-                true,
-            ),
-            "False" if arg == "False" => (
-                "constant-truth".to_string(),
-                "constant-truth".to_string(),
-                weights.constant_truth_weight,
-                true,
-            ),
-            "IsNone" | "IsNotNone" => (
-                "nullness-only".to_string(),
-                "nullness-only".to_string(),
-                weights.nullness_only_weight,
-                true,
-            ),
-            _ => (
-                "meaningful-assertion".to_string(),
-                "meaningful-assertion".to_string(),
-                0,
-                false,
-            ),
+        let kind = match matcher {
+            "True" if arg == "True" => CommonTestAssertionKind::ConstantTruth,
+            "False" if arg == "False" => CommonTestAssertionKind::ConstantTruth,
+            "IsNone" | "IsNotNone" => CommonTestAssertionKind::NullnessOnly,
+            _ => CommonTestAssertionKind::Meaningful,
         };
+        let classification = classify_common_test_assertion(kind, weights);
         assertions.push(TestAssertionSignal {
-            kind,
-            score,
-            shallow,
-            meaningful: score == 0,
-            reasons: vec![reason],
-            excerpt: compact_python_excerpt(whole.as_str()),
+            kind: classification.kind.to_string(),
+            score: classification.score,
+            shallow: classification.shallow,
+            meaningful: classification.score == 0,
+            reasons: vec![classification.kind.to_string()],
+            excerpt: compact_assertion_excerpt(whole.as_str(), TEST_ASSERTION_EXCERPT_MAX_LEN),
             start_byte: whole.start(),
         });
     }
@@ -285,7 +267,7 @@ fn collect_python_assertions(
                 shallow,
                 meaningful: false,
                 reasons: vec![kind.to_string()],
-                excerpt: compact_python_excerpt(whole.as_str()),
+                excerpt: compact_assertion_excerpt(whole.as_str(), TEST_ASSERTION_EXCERPT_MAX_LEN),
                 start_byte: whole.start(),
             });
         } else {
@@ -295,7 +277,7 @@ fn collect_python_assertions(
                 shallow: false,
                 meaningful: true,
                 reasons: vec!["meaningful-assertion".to_string()],
-                excerpt: compact_python_excerpt(whole.as_str()),
+                excerpt: compact_assertion_excerpt(whole.as_str(), TEST_ASSERTION_EXCERPT_MAX_LEN),
                 start_byte: whole.start(),
             });
         }
@@ -310,7 +292,7 @@ fn collect_python_assertions(
                 shallow: false,
                 meaningful: true,
                 reasons: vec!["meaningful-assertion".to_string()],
-                excerpt: compact_python_excerpt(whole.as_str()),
+                excerpt: compact_assertion_excerpt(whole.as_str(), TEST_ASSERTION_EXCERPT_MAX_LEN),
                 start_byte: whole.start(),
             });
         }
@@ -320,22 +302,14 @@ fn collect_python_assertions(
 }
 
 fn normalize_python_expr(expr: &str) -> String {
-    expr.trim()
-        .trim_end_matches(',')
-        .trim_end_matches(':')
-        .trim_matches(|ch| matches!(ch, '(' | ')' | ' '))
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    normalize_assertion_expression(expr.trim().trim_end_matches(',').trim_end_matches(':'))
 }
 
 fn is_python_literal(expr: &str) -> bool {
     let trimmed = expr.trim();
-    (trimmed.starts_with('"') && trimmed.ends_with('"'))
+    is_common_assertion_literal(trimmed)
         || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
         || matches!(trimmed, "True" | "False" | "None")
-        || trimmed.parse::<i64>().is_ok()
-        || trimmed.parse::<f64>().is_ok()
 }
 
 fn oversized_python_literal(
@@ -343,23 +317,7 @@ fn oversized_python_literal(
     right: &str,
     weights: &TestAssertionWeights,
 ) -> Option<String> {
-    [left, right].into_iter().find_map(|expr| {
-        let trimmed = expr.trim();
-        let unquoted = trimmed
-            .strip_prefix('"')
-            .and_then(|s| s.strip_suffix('"'))
-            .or_else(|| {
-                trimmed
-                    .strip_prefix('\'')
-                    .and_then(|s| s.strip_suffix('\''))
-            })?;
-        (unquoted.len() >= weights.large_literal_length_threshold.max(0) as usize)
-            .then(|| trimmed.to_string())
-    })
-}
-
-fn compact_python_excerpt(text: &str) -> String {
-    compact_assertion_excerpt(text, 180)
+    oversized_quoted_literal(left, right, weights, &['"', '\''])
 }
 
 pub fn python_source_contains_tests(source: &str) -> bool {

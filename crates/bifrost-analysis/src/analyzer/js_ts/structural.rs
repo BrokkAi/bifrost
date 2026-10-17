@@ -16,7 +16,7 @@ mod structural_spec_tests {
     };
     use brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind;
     use brokk_bifrost_core::analyzer::structural::occurrences::OccurrenceRole;
-    use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
+    use brokk_bifrost_test_macros::hardwon;
 
     /// The JS/TS scope-forming statement lists are `statement_block` and
     /// `switch_body`; a class body is a member list and stays out.
@@ -139,23 +139,18 @@ mod structural_spec_tests {
     #[test]
     fn js_ts_emits_only_roles_it_declares_as_supported() {
         let source = "const { a } = b; function f(c) { return a.d(c); }\n";
-        let found = occurrence_roles_of(
+        crate::analyzer::structural::adapter_helpers::assert_occurrence_roles_are_supported(
             &JAVASCRIPT_STRUCTURAL_SPEC,
             &tree_sitter_javascript::LANGUAGE.into(),
             source,
+            "javascript",
         );
-        assert!(!found.is_empty());
-        for (_, text, role) in &found {
-            assert!(
-                JAVASCRIPT_STRUCTURAL_SPEC
-                    .occurrence_role_support()
-                    .is_supported(*role),
-                "javascript emitted undeclared role {role:?} for {text:?}"
-            );
-        }
     }
 
     #[test]
+    #[hardwon(
+        "#3322: JavaScript kind-table validation must exclude JSX-only node names absent from the JavaScript grammar"
+    )]
     fn javascript_kind_table_matches_grammar() {
         // JavaScript and JSX share one StructuralSpec, so its table is the
         // union needed by both parser flavors (#3322). CompiledKinds drops
@@ -175,6 +170,9 @@ mod structural_spec_tests {
     }
 
     #[test]
+    #[hardwon(
+        "#3322: The JSX adapter must retain the TSX grammar node kinds needed for reserved attribute names"
+    )]
     fn javascript_jsx_kind_table_matches_tsx_grammar() {
         crate::analyzer::structural::adapter_helpers::assert_kind_table_matches_grammar(
             tree_sitter_typescript::LANGUAGE_TSX.into(),

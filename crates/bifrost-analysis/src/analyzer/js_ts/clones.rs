@@ -8,7 +8,7 @@
 //! One function for both dialects: the dialect enters only as the grammar the
 //! normalizers parse with, so both analyzers call this.
 
-use crate::analyzer::clone_detection::{CloneCandidateData, compact_clone_excerpt};
+use crate::analyzer::clone_detection::{CloneCandidateData, build_clone_candidate_data};
 use crate::analyzer::{CodeUnit, CodeUnitIndex};
 use brokk_bifrost_core::analyzer::model::CloneSmellWeights;
 use brokk_bifrost_js_ts::clones::{build_js_ts_clone_ast_signature, normalized_clone_tokens_js_ts};
@@ -20,20 +20,15 @@ pub(crate) fn build_js_ts_clone_candidate_data(
     weights: CloneSmellWeights,
     parser_language: TsLanguage,
 ) -> Option<CloneCandidateData> {
-    index
-        .get_source(code_unit, false)
-        .map(|source| source.trim().to_string())
-        .filter(|source| !source.is_empty())
-        .and_then(|source| {
-            let normalized_tokens = normalized_clone_tokens_js_ts(&source, parser_language.clone());
-            if normalized_tokens.len() < weights.min_normalized_tokens.max(0) as usize {
-                return None;
-            }
-            Some(CloneCandidateData {
-                unit: code_unit.clone(),
-                normalized_tokens,
-                ast_signature: build_js_ts_clone_ast_signature(&source, parser_language),
-                excerpt: compact_clone_excerpt(&source),
-            })
-        })
+    build_clone_candidate_data(
+        index.get_source(code_unit, false),
+        code_unit,
+        weights,
+        |source, _| {
+            Some((
+                normalized_clone_tokens_js_ts(source, parser_language.clone()),
+                build_js_ts_clone_ast_signature(source, parser_language),
+            ))
+        },
+    )
 }

@@ -10,6 +10,8 @@ use crate::graph_support::{
     PythonSource, import_binder_from_imports, public_declarations_in_module,
     resolve_module_code_unit, resolve_module_code_units_batch,
 };
+use crate::runtime_values::enclosing_execution_context;
+use crate::syntax::python_static_attribute_path;
 use brokk_bifrost_core::analyzer::common::node_source_text;
 use brokk_bifrost_core::analyzer::model::{
     ImportInfo, StructuredImportPath, StructuredImportPathKind,
@@ -79,15 +81,184 @@ pub(crate) fn imported_module_assignment_at(
     resolved
 }
 
-fn enclosing_execution_suite(mut node: Node<'_>) -> Option<Node<'_>> {
-    while let Some(parent) = node.parent() {
-        if matches!(parent.kind(), "function_definition" | "lambda") {
+/// Resolve a local name assigned a module object before `reference`.
+///
+/// The caller resolves imported module expressions from its structured import
+/// binder. This helper follows only straight-line assignments in the current
+/// function or module suite; branches and other direct rebinding statements
+/// invalidate an earlier alias. Attribute paths are read from tree-sitter
+/// nodes, never reconstructed from source text.
+pub fn python_local_module_alias_path_before<E, C>(
+    reference: Node<'_>,
+    local_name: &str,
+    source: &str,
+    context: &mut C,
+    mut imported_module_path: impl FnMut(Node<'_>, &mut C) -> Result<Option<Box<[Box<str>]>>, E>,
+    mut charge_step: impl FnMut(&mut C) -> Result<(), E>,
+) -> Result<Option<Box<[Box<str>]>>, E> {
+    let mut current = reference;
+    let suite = loop {
+        let Some(parent) = current.parent() else {
+            return Ok(None);
+        };
+        match parent.kind() {
+            "function_definition" | "lambda" => break parent.child_by_field_name("body"),
+            "module" => break Some(parent),
+            "class_definition" => return Ok(None),
+            _ => current = parent,
+        }
+    };
+    let Some(suite) = suite else {
+        return Ok(None);
+    };
+
+    let mut aliases: HashMap<Box<str>, Box<[Box<str>]>> = HashMap::default();
+    let mut cursor = suite.walk();
+    for statement in suite.named_children(&mut cursor) {
+        if statement.start_byte() >= reference.start_byte()
+            || (statement.start_byte() <= reference.start_byte()
+                && reference.end_byte() <= statement.end_byte())
+        {
+            break;
+        }
+        charge_step(context)?;
+        let expression = if statement.kind() == "expression_statement" {
+            statement.named_child(0).unwrap_or(statement)
+        } else {
+            statement
+        };
+        if expression.kind() == "assignment" {
+            let (targets, value) = python_assignment_chain(expression);
+            if !targets.is_empty() && targets.iter().all(|target| target.kind() == "identifier") {
+                let module_path = value
+                    .map(|value| {
+                        python_module_alias_expression_path(
+                            value,
+                            source,
+                            &aliases,
+                            context,
+                            &mut imported_module_path,
+                        )
+                    })
+                    .transpose()?
+                    .flatten();
+                for target in targets {
+                    let name = node_source_text(target, source);
+                    if let Some(module_path) = module_path.as_ref() {
+                        aliases.insert(name.into(), module_path.clone());
+                    } else {
+                        aliases.remove(name);
+                    }
+                }
+                continue;
+            }
+        }
+
+        if !matches!(
+            expression.kind(),
+            "assignment"
+                | "augmented_assignment"
+                | "delete_statement"
+                | "for_statement"
+                | "async_for_statement"
+                | "while_statement"
+                | "with_statement"
+                | "try_statement"
+                | "match_statement"
+                | "import_statement"
+                | "import_from_statement"
+                | "function_definition"
+                | "class_definition"
+                | "global_statement"
+                | "nonlocal_statement"
+                | "named_expression"
+                | "if_statement"
+        ) {
+            continue;
+        }
+        let mut binding_error = None;
+        let bindings =
+            python_direct_scope_bindings_bounded(statement, source, || {
+                match charge_step(context) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        binding_error = Some(error);
+                        false
+                    }
+                }
+            });
+        if let Some(error) = binding_error {
+            return Err(error);
+        }
+        let bindings = bindings.expect("bounded Python alias scan stopped without a cause");
+        for binding in bindings {
+            aliases.remove(node_source_text(binding.declaration, source));
+        }
+    }
+    Ok(aliases.get(local_name).cloned())
+}
+
+fn python_module_alias_expression_path<E, C>(
+    expression: Node<'_>,
+    source: &str,
+    aliases: &HashMap<Box<str>, Box<[Box<str>]>>,
+    context: &mut C,
+    imported_module_path: &mut impl FnMut(Node<'_>, &mut C) -> Result<Option<Box<[Box<str>]>>, E>,
+) -> Result<Option<Box<[Box<str>]>>, E> {
+    if let Some(path) = python_static_attribute_path(expression)
+        && let Some(name) = path
+            .first()
+            .map(|segment| node_source_text(*segment, source))
+        && let Some(module_path) = aliases.get(name)
+    {
+        let mut canonical = module_path.to_vec();
+        canonical.extend(path.iter().skip(1).map(|segment| {
+            node_source_text(*segment, source)
+                .to_owned()
+                .into_boxed_str()
+        }));
+        return Ok(Some(canonical.into_boxed_slice()));
+    }
+    imported_module_path(expression, context)
+}
+
+/// Flatten a right-recursive assignment into its targets and terminal value.
+/// Targets are returned in runtime order, followed by the single evaluated
+/// right-hand expression.
+pub fn python_assignment_chain<'tree>(
+    node: Node<'tree>,
+) -> (Vec<Node<'tree>>, Option<Node<'tree>>) {
+    let mut targets = Vec::new();
+    let mut assignment = node;
+    loop {
+        let Some(target) = assignment.child_by_field_name("left") else {
+            return (targets, None);
+        };
+        targets.push(target);
+        let Some(value) = assignment.child_by_field_name("right") else {
+            return (targets, None);
+        };
+        if value.kind() != "assignment" {
+            return (targets, Some(value));
+        }
+        assignment = value;
+    }
+}
+
+fn enclosing_execution_suite(node: Node<'_>) -> Option<Node<'_>> {
+    if let Some(function) = enclosing_execution_context(node) {
+        return function.child_by_field_name("body");
+    }
+
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "class_definition" {
             return parent.child_by_field_name("body");
         }
         if parent.kind() == "module" {
             return Some(parent);
         }
-        node = parent;
+        current = parent;
     }
     None
 }
@@ -270,24 +441,28 @@ fn remove_direct_scope_bindings(
 /// it. LSP model binding uses the same AST-derived representation as the
 /// analyzer so external APIs are never selected by a terminal-name scan.
 pub fn parse_python_import_infos(source: &str) -> Vec<ImportInfo> {
-    let mut parser = tree_sitter::Parser::new();
-    parser
-        .set_language(&tree_sitter_python::LANGUAGE.into())
-        .expect("failed to load Python parser");
-    let Some(tree) = parser.parse(source, None) else {
+    let Some(tree) = parse_python_tree(source) else {
         return Vec::new();
     };
-    let mut pending = vec![tree.root_node()];
     let mut imports = Vec::new();
+    for node in python_import_statement_nodes(tree.root_node()) {
+        imports.extend(python_import_infos_from_node(node, source));
+    }
+    imports
+}
+
+fn python_import_statement_nodes<'tree>(root: Node<'tree>) -> Vec<Node<'tree>> {
+    let mut pending = vec![root];
+    let mut nodes = Vec::new();
     while let Some(node) = pending.pop() {
         if matches!(node.kind(), "import_statement" | "import_from_statement") {
-            imports.extend(python_import_infos_from_node(node, source));
+            nodes.push(node);
             continue;
         }
         let mut cursor = node.walk();
         pending.extend(node.named_children(&mut cursor));
     }
-    imports
+    nodes
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -307,15 +482,26 @@ impl PythonImportBinding {
     }
 }
 
+/// Select the latest visible function-scoped import binding for `name`.
+pub fn python_function_scoped_import_binding<'a>(
+    bindings: &'a [PythonImportBinding],
+    name: &str,
+    reference: Node<'_>,
+) -> Option<&'a PythonImportBinding> {
+    bindings.iter().rev().find(|binding| {
+        binding.is_function_scoped()
+            && binding.start_byte <= reference.start_byte()
+            && binding.scope_start_byte <= reference.start_byte()
+            && reference.end_byte() <= binding.scope_end_byte
+            && binding.local_name == name
+    })
+}
+
 /// Return source-ordered, parser-derived local bindings for explicit Python
 /// imports. The byte offset lets callers select the last visible binding rather
 /// than treating a whole document as one unordered import scope.
 pub fn parse_python_import_bindings(source: &str) -> Vec<PythonImportBinding> {
-    let mut parser = tree_sitter::Parser::new();
-    parser
-        .set_language(&tree_sitter_python::LANGUAGE.into())
-        .expect("failed to load Python parser");
-    let Some(tree) = parser.parse(source, None) else {
+    let Some(tree) = parse_python_tree(source) else {
         return Vec::new();
     };
     python_import_bindings_from_tree(tree.root_node(), source)
@@ -325,16 +511,7 @@ pub fn parse_python_import_bindings(source: &str) -> Vec<PythonImportBinding> {
 /// Query paths use this form so one request never reparses a document merely
 /// to recover function-local import scope.
 pub fn python_import_bindings_from_tree(root: Node<'_>, source: &str) -> Vec<PythonImportBinding> {
-    let mut pending = vec![root];
-    let mut nodes = Vec::new();
-    while let Some(node) = pending.pop() {
-        if matches!(node.kind(), "import_statement" | "import_from_statement") {
-            nodes.push(node);
-            continue;
-        }
-        let mut cursor = node.walk();
-        pending.extend(node.named_children(&mut cursor));
-    }
+    let mut nodes = python_import_statement_nodes(root);
     nodes.sort_by_key(Node::start_byte);
     nodes
         .into_iter()
@@ -358,7 +535,7 @@ pub fn python_import_bindings_from_tree(root: Node<'_>, source: &str) -> Vec<Pyt
                                 scope_start_byte,
                                 scope_end_byte,
                                 function_scoped,
-                                local_name: alias.or_else(|| path.segments.first().cloned())?,
+                                local_name: import.identifier.clone()?,
                                 qualified_name: module,
                                 consumed_attributes,
                             })
@@ -366,14 +543,14 @@ pub fn python_import_bindings_from_tree(root: Node<'_>, source: &str) -> Vec<Pyt
                         PythonImportDetails::FromImport {
                             module,
                             name,
-                            alias,
+                            alias: _,
                             wildcard: false,
                         } => Some(PythonImportBinding {
                             start_byte: node.start_byte(),
                             scope_start_byte,
                             scope_end_byte,
                             function_scoped,
-                            local_name: alias.unwrap_or(name.clone()),
+                            local_name: import.identifier.clone()?,
                             qualified_name: format!("{module}.{name}"),
                             consumed_attributes: 0,
                         }),
@@ -426,7 +603,7 @@ pub fn python_import_bindings_from_imports(
                         scope_start_byte,
                         scope_end_byte,
                         function_scoped,
-                        local_name: alias.or_else(|| path.segments.first().cloned())?,
+                        local_name: import.identifier.clone()?,
                         qualified_name: module,
                         consumed_attributes,
                     })
@@ -434,14 +611,14 @@ pub fn python_import_bindings_from_imports(
                 PythonImportDetails::FromImport {
                     module,
                     name,
-                    alias,
+                    alias: _,
                     wildcard: false,
                 } => Some(PythonImportBinding {
                     start_byte,
                     scope_start_byte,
                     scope_end_byte,
                     function_scoped,
-                    local_name: alias.unwrap_or_else(|| name.clone()),
+                    local_name: import.identifier.clone()?,
                     qualified_name: format!("{module}.{name}"),
                     consumed_attributes: 0,
                 }),
@@ -468,6 +645,7 @@ fn python_import_binding_scope(node: Node<'_>, source_len: usize) -> (usize, usi
 mod tests {
     use super::*;
     use brokk_bifrost_core::analyzer::usages::model::ImportBinder;
+    use brokk_bifrost_test_macros::hardwon;
 
     fn importlib_assignment_for(source: &str, importlib_local: &str) -> Option<String> {
         let tree = parse_python_tree(source).expect("valid Python fixture");
@@ -491,23 +669,6 @@ mod tests {
             source,
             |local| local == importlib_local,
         )
-    }
-
-    #[test]
-    fn existing_tree_import_bindings_preserve_function_scope_and_relative_identity() {
-        let source = r#"def register():
-    from .workers.special import Worker
-    return Worker()
-"#;
-        let tree = parse_python_tree(source).expect("Python tree");
-        let bindings = python_import_bindings_from_tree(tree.root_node(), source);
-
-        assert_eq!(bindings.len(), 1, "{bindings:#?}");
-        assert!(bindings[0].is_function_scoped(), "{bindings:#?}");
-        assert_eq!(bindings[0].local_name, "Worker");
-        assert_eq!(bindings[0].qualified_name, ".workers.special.Worker");
-        assert!(bindings[0].scope_start_byte <= bindings[0].start_byte);
-        assert!(bindings[0].scope_end_byte >= source.rfind("Worker()").unwrap());
     }
 
     #[test]
@@ -578,6 +739,7 @@ def test():
     }
 
     #[test]
+    #[hardwon("59dfb80c3bb8: module replacement accepted malformed or shadowed import shapes")]
     fn module_replacement_requires_exact_structured_import_bindings() {
         let source = r#"import sys as _sys
 from routes.contacts import contacts_routes as _canonical
@@ -623,6 +785,26 @@ _sys.modules[__name__] = _canonical
                 "near miss must not replace module identity: {near_miss:?}"
             );
         }
+    }
+
+    #[test]
+    #[hardwon(
+        "b58235b247fd: Python import bindings lost function scope or relative module identity"
+    )]
+    fn existing_tree_import_bindings_preserve_function_scope_and_relative_identity() {
+        let source = r#"def register():
+    from .workers.special import Worker
+    return Worker()
+"#;
+        let tree = parse_python_tree(source).expect("Python tree");
+        let bindings = python_import_bindings_from_tree(tree.root_node(), source);
+
+        assert_eq!(bindings.len(), 1, "{bindings:#?}");
+        assert!(bindings[0].is_function_scoped(), "{bindings:#?}");
+        assert_eq!(bindings[0].local_name, "Worker");
+        assert_eq!(bindings[0].qualified_name, ".workers.special.Worker");
+        assert!(bindings[0].scope_start_byte <= bindings[0].start_byte);
+        assert!(bindings[0].scope_end_byte >= source.rfind("Worker()").unwrap());
     }
 }
 
@@ -803,11 +985,7 @@ fn primary_module_fqn(file: &ProjectFile, import: &ImportInfo) -> Option<String>
             if wildcard {
                 return None;
             }
-            let resolved_module = if module.starts_with('.') {
-                resolve_python_relative_module(file, &module)
-            } else {
-                Some(module)
-            };
+            let resolved_module = resolve_python_module_specifier(file, &module);
             resolved_module.map(|resolved_module| format!("{resolved_module}.{name}"))
         }
     }
@@ -849,11 +1027,7 @@ fn resolve_import_with_hint(
                 alias,
                 wildcard,
             } => {
-                let resolved_module = if module.starts_with('.') {
-                    resolve_python_relative_module(file, &module)
-                } else {
-                    Some(module)
-                };
+                let resolved_module = resolve_python_module_specifier(file, &module);
                 let Some(resolved_module) = resolved_module else {
                     return Vec::new();
                 };
@@ -866,13 +1040,6 @@ fn resolve_import_with_hint(
 
                 let binding = alias.clone().unwrap_or_else(|| name.clone());
                 let module_candidate = format!("{resolved_module}.{name}");
-                let resolved = match primary_hint {
-                    Some(hint) => hint.clone(),
-                    None => resolve_module_code_unit(python, Some(file), &module_candidate),
-                };
-                if let Some(code_unit) = resolved {
-                    return vec![(binding, code_unit)];
-                }
                 let exported =
                     resolve_exported_name_from_module(python, Some(file), &resolved_module, &name);
                 if !exported.is_empty() {
@@ -880,6 +1047,13 @@ fn resolve_import_with_hint(
                         .into_iter()
                         .map(|code_unit| (binding.clone(), code_unit))
                         .collect();
+                }
+                let resolved = match primary_hint {
+                    Some(hint) => hint.clone(),
+                    None => resolve_module_code_unit(python, Some(file), &module_candidate),
+                };
+                if let Some(code_unit) = resolved {
+                    return vec![(binding, code_unit)];
                 }
                 let definitions: Vec<_> = python.definitions(&module_candidate).collect();
                 if !definitions.is_empty() {
@@ -1098,11 +1272,7 @@ fn resolve_module_files_for_export(
     importing_file: &ProjectFile,
     module_specifier: &str,
 ) -> Vec<ProjectFile> {
-    let resolved_module = if module_specifier.starts_with('.') {
-        resolve_python_relative_module(importing_file, module_specifier)
-    } else {
-        Some(module_specifier.to_string())
-    };
+    let resolved_module = resolve_python_module_specifier(importing_file, module_specifier);
     let Some(resolved_module) = resolved_module else {
         return Vec::new();
     };
@@ -1182,6 +1352,8 @@ pub fn python_import_details(import: &ImportInfo) -> Option<PythonImportDetails>
         }),
         // These declaration forms belong to Java and Rust, not Python.
         StructuredImportPathKind::StaticMember | StructuredImportPathKind::ExternCrate => None,
+        // PHP include kinds are not Python import statements.
+        StructuredImportPathKind::FileInclude | StructuredImportPathKind::DynamicInclude => None,
         StructuredImportPathKind::ImportFrom => {
             let (name, module_segments) = if import.is_wildcard {
                 ("*".to_string(), path.segments.as_slice())
@@ -1483,6 +1655,18 @@ pub fn resolve_python_relative_module(
     module_expr: &str,
 ) -> Option<String> {
     resolve_python_relative_module_from_package(&python_current_package(source_file), module_expr)
+}
+
+/// Resolve a relative Python module specifier against the importing file.
+pub fn resolve_python_module_specifier(
+    importing_file: &ProjectFile,
+    module_specifier: &str,
+) -> Option<String> {
+    if module_specifier.starts_with('.') {
+        resolve_python_relative_module(importing_file, module_specifier)
+    } else {
+        Some(module_specifier.to_string())
+    }
 }
 
 /// Resolve a structured Python module expression against an already-known

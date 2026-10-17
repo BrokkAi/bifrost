@@ -8,7 +8,9 @@ use brokk_bifrost_mcp::benchmark_api::{
     BENCHMARK_MCP_REQUEST_BUDGET_SECS, MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV,
 };
 use brokk_bifrost_policy::{PolicyEvaluationOptions, PolicyFailOn, evaluate_policy_files};
+use brokk_bifrost_test_macros::hardwon;
 use common::InlineTestProject;
+use common::mcp_wire::{read_line, round_trip_json_line as round_trip, write_line};
 use git2::{IndexAddOption, Repository, Signature};
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
@@ -124,50 +126,20 @@ const PACK_ACTIVATION_JDK: &str = r#"{
   }]
 }"#;
 
-fn mcp_server_binary() -> &'static str {
-    option_env!("CARGO_BIN_EXE_bifrost-mcp-test-server")
-        .or(option_env!("CARGO_BIN_EXE_bifrost"))
-        .expect("Cargo did not provide an MCP server binary")
-}
-
 fn install_pack_activation_fixture(root: &std::path::Path) {
-    use brokk_bifrost_analysis::analyzer::semantic_model::{
-        CatalogOpenMode, CatalogOptions, CompilerOptions, DurablePackSource, DurablePackSourceKind,
-        SemanticPackCatalog, SourceFormat, compile_source,
-    };
-
-    let compiled = compile_source(
-        SourceFormat::Json,
-        PACK_ACTIVATION_JDK.as_bytes(),
-        &CompilerOptions::default(),
-    )
-    .unwrap_or_else(|diagnostics| panic!("fixture pack compilation failed: {diagnostics:#?}"));
-    let catalog = SemanticPackCatalog::open(
+    brokk_bifrost_analysis::test_support::build_pre_shipped_semantic_pack_catalog(
         &root.join(".bifrost/packs-catalog"),
-        CatalogOpenMode::ReadWrite,
-        CatalogOptions::default(),
-    )
-    .expect("open fixture catalog");
-    catalog
-        .install(
-            &compiled,
-            &DurablePackSource {
-                kind: DurablePackSourceKind::PreShipped,
-                source_id: "test:fixture.jdk@21.0.2".to_owned(),
-            },
-        )
-        .expect("install fixture pack");
+        PACK_ACTIVATION_JDK,
+        "test:fixture.jdk@21.0.2",
+    );
 }
 
 fn fake_jdk_home(root: &std::path::Path, version: &str) -> PathBuf {
-    let home = root.join(format!("jdk-{version}"));
-    fs::create_dir_all(&home).expect("create fake JDK home");
-    fs::write(
-        home.join("release"),
-        format!("JAVA_VERSION=\"{version}\"\nIMPLEMENTOR=\"Bifrost fixture\"\n"),
+    brokk_bifrost_analysis::test_support::write_jdk_release_with_implementor(
+        &root.join(format!("jdk-{version}")),
+        version,
+        "Bifrost fixture",
     )
-    .expect("write fake JDK release metadata");
-    home
 }
 
 fn run_pack_activation_policy(
@@ -343,7 +315,10 @@ fn mcp_bound_policy_reports_exact_pack_activation_and_honest_near_misses() {
     .expect("create invalid configured catalog path");
     let (_, _, failed_run) = run_pack_activation_policy(&failed, &jdk21);
     assert_eq!(failed_run["exit_status"], 2, "{failed_run:#}");
-    assert_eq!(failed_run["report"]["packs"]["complete"], false);
+    assert_eq!(
+        failed_run["report"]["packs"]["complete"], false,
+        "{failed_run:#}"
+    );
     assert!(
         failed_run["report"]["packs"]["decisions"]
             .as_array()
@@ -474,7 +449,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     )
     .expect("set remote default");
 
-    let mut command = Command::new(mcp_server_binary());
+    let mut command = Command::new(common::mcp_server::mcp_server_binary());
     command
         .arg("--root")
         .arg(fixture_root.path())
@@ -551,6 +526,18 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     let tools = list_tools["result"]["tools"]
         .as_array()
         .expect("tools array");
+    let diff = tools
+        .iter()
+        .find(|tool| tool["name"] == "analyze_diff")
+        .expect("diff tool");
+    assert_eq!(
+        diff["inputSchema"]["properties"]["call_edges"]["default"],
+        "changed_lines"
+    );
+    assert_eq!(
+        diff["inputSchema"]["properties"]["call_edges"]["enum"],
+        json!(["changed_lines", "changed_files", "omit"])
+    );
     assert_eq!(tool_names(tools), {
         let expected = vec![
             "search_symbols",
@@ -594,15 +581,31 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
         ];
         expected
     });
-    assert_tool_schema_omits_property(tools, "get_definitions_by_location", "include_tests");
-    assert_tool_schema_omits_property(tools, "get_declarations_by_location", "include_tests");
+    common::mcp_server::assert_tool_schema_omits_property(
+        tools,
+        "get_definitions_by_location",
+        "include_tests",
+    );
+    common::mcp_server::assert_tool_schema_omits_property(
+        tools,
+        "get_declarations_by_location",
+        "include_tests",
+    );
     // #1575: ranking reports a per-file test verdict instead of taking a
     // boolean it could only honour by guessing.
-    assert_tool_schema_omits_property(tools, "most_relevant_files", "include_tests");
+    common::mcp_server::assert_tool_schema_omits_property(
+        tools,
+        "most_relevant_files",
+        "include_tests",
+    );
     assert_definition_lookup_schema_limits_and_requires_location(tools);
     assert_declaration_lookup_schema_limits_and_requires_location(tools);
     assert_tool_schema_contains_property(tools, "scan_usages_by_location", "targets");
-    assert_tool_schema_omits_property(tools, "scan_usages_by_location", "max_duration_secs");
+    common::mcp_server::assert_tool_schema_omits_property(
+        tools,
+        "scan_usages_by_location",
+        "max_duration_secs",
+    );
     assert_scan_usages_location_schema(tools);
     assert_type_lookup_schema_limits_and_requires_location(tools);
     assert_rename_symbol_schema_requires_location_and_new_name(tools);
@@ -1177,6 +1180,9 @@ fn cognitive_complexity_reports_every_supported_language_in_one_mcp_call() {
 
 #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
+#[hardwon(
+    "064ceb22f0c2: the default bifrost launch had stopped starting the MCP searchtools server"
+)]
 fn bifrost_defaults_to_cwd_searchtools_server() {
     let fixture_root = TempDir::new().expect("temp dir");
     fs::write(
@@ -1468,7 +1474,7 @@ fn bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions() {
     assert_eq!(structured["status"], "finding", "{baseline}");
     assert_eq!(structured["exit_status"], 1, "{baseline}");
     assert_eq!(structured["report"], expected_report, "{baseline}");
-    assert_eq!(structured["report"]["schema_version"], 5);
+    assert_eq!(structured["report"]["schema_version"], 6);
     assert_eq!(
         structured["report"]["execution"]["stage_timings"],
         json!([])
@@ -1724,6 +1730,7 @@ fn bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions() {
 /// RMCP host must return their canonical report before it waits for the cold
 /// watcher/snapshot, while retaining the wire correlation contract.
 #[test]
+#[hardwon("65092f1ba920: malformed suppressions must fail before waiting for deferred readiness")]
 fn rmcp_run_policy_malformed_suppressions_fail_before_readiness() {
     let workspace = InlineTestProject::with_language(Language::Python)
         .file("src/app.py", "def harmless(value):\n    return value\n")
@@ -1750,6 +1757,7 @@ fn rmcp_run_policy_malformed_suppressions_fail_before_readiness() {
 /// Task-capable clients must still receive the immediate canonical report;
 /// malformed configuration cannot be parked behind a task handle.
 #[test]
+#[hardwon("65092f1ba920: malformed suppressions must never create an asynchronous MCP task")]
 fn task_capable_rmcp_run_policy_malformed_suppressions_is_not_a_task() {
     let workspace = InlineTestProject::with_language(Language::Python)
         .file("src/app.py", "def harmless(value):\n    return value\n")
@@ -1816,18 +1824,13 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
     let code_smells_policies = packs[0]["policies"]
         .as_array()
         .expect("code-smells policies");
-    assert_eq!(code_smells_policies.len(), 31);
+    assert_eq!(code_smells_policies.len(), 30);
     assert!(code_smells_policies.iter().all(|policy| {
         policy["authored_hash"].as_str().is_some()
             && policy["resolved_semantic_hash"]
                 .as_str()
                 .is_some_and(|hash| Some(hash) == policy["authored_hash"].as_str())
     }));
-    assert!(
-        code_smells_policies
-            .iter()
-            .any(|policy| policy["id"] == "bifrost.correctness.go-data-race")
-    );
     assert!(
         code_smells_policies
             .iter()
@@ -1946,7 +1949,6 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
             "bifrost.correctness.dynamic-evaluation",
             "bifrost.correctness.empty-failure-handler",
             "bifrost.correctness.failed-swap",
-            "bifrost.correctness.go-data-race",
             "bifrost.correctness.go-nil-dereference",
             "bifrost.correctness.go-wrong-error-on-failure-path",
             "bifrost.correctness.identical-conditional-branches",
@@ -2000,7 +2002,6 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
             "bifrost.correctness.dynamic-evaluation",
             "bifrost.correctness.empty-failure-handler",
             "bifrost.correctness.failed-swap",
-            "bifrost.correctness.go-data-race",
             "bifrost.correctness.go-nil-dereference",
             "bifrost.correctness.go-wrong-error-on-failure-path",
             "bifrost.correctness.identical-conditional-branches",
@@ -2051,46 +2052,6 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
     drop(stdin);
     let status = child.wait().expect("wait bifrost");
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
-}
-
-/// `cli` is no longer an agent-facing toolset (issue #1116): a 40-run
-/// BrokkBench sweep made zero agent calls to `classify_test_files` against
-/// dozens of calls to the symbol tools. `--mcp cli`, and a composition that
-/// names it such as `symbol|cli`, must fail before the server ever answers a
-/// request, with a structured error naming the tool and the `--tool` path --
-/// not a server that silently starts without it.
-///
-/// `classify_test_files` itself stays reachable through `bifrost --tool
-/// classify_test_files`; see
-/// `tests/suite_mcp_cli/bifrost_tool_cli.rs::tool_classify_test_files_runs_without_an_mcp_toolset`
-/// for that coverage.
-#[test]
-fn bifrost_mcp_cli_mode_is_rejected() {
-    let fixture_root = TempDir::new().expect("temp dir");
-
-    for mode in ["cli", "symbol|cli"] {
-        let mut child = spawn_server(fixture_root.path(), mode, &[]);
-        let status = child.wait().expect("wait bifrost");
-        assert!(
-            !status.success(),
-            "bifrost --mcp {mode} should fail to start: {status}"
-        );
-        let mut stderr_text = String::new();
-        child
-            .stderr
-            .take()
-            .expect("stderr")
-            .read_to_string(&mut stderr_text)
-            .expect("read stderr");
-        assert!(
-            stderr_text.contains("classify_test_files"),
-            "stderr should name classify_test_files for mode {mode}: {stderr_text}"
-        );
-        assert!(
-            stderr_text.contains("--tool classify_test_files"),
-            "stderr should point at the --tool path for mode {mode}: {stderr_text}"
-        );
-    }
 }
 
 #[test]
@@ -2432,6 +2393,9 @@ fn bifrost_mcp_get_summaries_accepts_go_import_path() {
 /// and the structured answer must still satisfy the advertised outputSchema
 /// (which now carries `invalid_patterns`).
 #[test]
+#[hardwon(
+    "#3279: a broad wildcard search stalled beyond two minutes without a bounded request deadline"
+)]
 fn bifrost_mcp_search_symbols_matches_glob_wildcard_patterns() {
     let fixture_root = TempDir::new().expect("temp dir");
     fs::write(
@@ -2615,18 +2579,6 @@ fn tool_names(tools: &[Value]) -> Vec<&str> {
         .collect()
 }
 
-fn assert_tool_schema_omits_property(tools: &[Value], tool_name: &str, property_name: &str) {
-    let tool = tools
-        .iter()
-        .find(|tool| tool["name"] == tool_name)
-        .unwrap_or_else(|| panic!("missing tool descriptor for {tool_name}"));
-    let schema = serde_json::to_string(&tool["inputSchema"]).expect("schema serializes");
-    assert!(
-        !schema.contains(property_name),
-        "{tool_name} schema unexpectedly contains {property_name}: {schema}"
-    );
-}
-
 fn assert_tool_schema_contains_property(tools: &[Value], tool_name: &str, property_name: &str) {
     let tool = tools
         .iter()
@@ -2647,10 +2599,7 @@ fn assert_scan_usages_location_schema(tools: &[Value]) {
     let schema = &tool["inputSchema"];
 
     assert_eq!(schema["properties"]["targets"]["minItems"], 1);
-    assert_eq!(
-        schema["properties"]["targets"]["items"]["required"],
-        json!(["path", "line"])
-    );
+    assert_location_item_requires_path_and_line(&schema["properties"]["targets"]["items"]);
     let serialized = serde_json::to_string(schema).unwrap();
     assert!(!serialized.contains("start_byte"), "{serialized}");
     assert!(!serialized.contains("end_byte"), "{serialized}");
@@ -2664,13 +2613,14 @@ fn assert_type_lookup_schema_limits_and_requires_location(tools: &[Value]) {
     let schema = &tool["inputSchema"];
 
     assert_eq!(schema["properties"]["references"]["maxItems"], 100);
-    assert_eq!(
-        schema["properties"]["references"]["items"]["required"],
-        json!(["path", "line"])
-    );
+    assert_location_item_requires_path_and_line(&schema["properties"]["references"]["items"]);
     let serialized = serde_json::to_string(schema).unwrap();
     assert!(!serialized.contains("start_byte"), "{serialized}");
     assert!(!serialized.contains("end_byte"), "{serialized}");
+}
+
+fn assert_location_item_requires_path_and_line(items: &Value) {
+    assert_eq!(items["required"], json!(["path", "line"]));
 }
 
 fn assert_definition_lookup_schema_limits_and_requires_location(tools: &[Value]) {
@@ -2681,10 +2631,7 @@ fn assert_definition_lookup_schema_limits_and_requires_location(tools: &[Value])
     let schema = &tool["inputSchema"];
 
     assert_eq!(schema["properties"]["references"]["maxItems"], 100);
-    assert_eq!(
-        schema["properties"]["references"]["items"]["required"],
-        json!(["path", "line"])
-    );
+    assert_location_item_requires_path_and_line(&schema["properties"]["references"]["items"]);
 }
 
 fn assert_declaration_lookup_schema_limits_and_requires_location(tools: &[Value]) {
@@ -2695,10 +2642,7 @@ fn assert_declaration_lookup_schema_limits_and_requires_location(tools: &[Value]
     let schema = &tool["inputSchema"];
 
     assert_eq!(schema["properties"]["references"]["maxItems"], 100);
-    assert_eq!(
-        schema["properties"]["references"]["items"]["required"],
-        json!(["path", "line"])
-    );
+    assert_location_item_requires_path_and_line(&schema["properties"]["references"]["items"]);
 }
 
 fn assert_rename_symbol_schema_requires_location_and_new_name(tools: &[Value]) {
@@ -2774,12 +2718,7 @@ fn call_tool(
         stdin,
         reader,
         stderr,
-        json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": "tools/call",
-            "params": { "name": name, "arguments": arguments }
-        }),
+        common::mcp_wire::tool_call_request(id, name, arguments),
     );
     assert_eq!(response["result"]["isError"], false, "{response}");
     response
@@ -2787,6 +2726,9 @@ fn call_tool(
 
 #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
+#[hardwon(
+    "#1035: the plugin workspace root negotiation selected process cwd instead of the client root"
+)]
 fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
     let plugin_dir = TempDir::new().expect("plugin dir");
     fs::write(
@@ -3073,6 +3015,7 @@ fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
 }
 
 #[test]
+#[hardwon("#1077: Codex active-workspace metadata did not bind the client's selected workspace")]
 fn rootless_mcp_binds_from_codex_sandbox_state_and_revokes_per_call_scope() {
     let plugin_dir = TempDir::new().expect("plugin dir");
     fs::write(
@@ -3330,6 +3273,7 @@ fn rootless_mcp_binds_from_codex_sandbox_state_and_revokes_per_call_scope() {
 }
 
 #[test]
+#[hardwon("#1077: the first Codex workspace activation could escape the declared sandbox")]
 fn rootless_mcp_rejects_first_codex_workspace_activation_outside_sandbox() {
     let plugin_dir = TempDir::new().expect("plugin dir");
     let workspace = InlineTestProject::new()
@@ -3407,6 +3351,7 @@ fn rootless_mcp_rejects_first_codex_workspace_activation_outside_sandbox() {
 }
 
 #[test]
+#[hardwon("#1077: an explicit MCP root must override ambient Codex sandbox metadata")]
 fn explicit_mcp_root_ignores_codex_sandbox_state() {
     let explicit_workspace = InlineTestProject::new()
         .file("ExplicitWorkspace.java", "class ExplicitWorkspace {}\n")
@@ -3458,6 +3403,7 @@ fn explicit_mcp_root_ignores_codex_sandbox_state() {
 }
 
 #[test]
+#[hardwon("#1077: compatible Codex clients must be able to bind through sandbox metadata")]
 fn rootless_mcp_accepts_codex_sandbox_metadata_from_a_compatible_client() {
     let plugin_dir = TempDir::new().expect("plugin dir");
     fs::write(
@@ -3678,7 +3624,7 @@ fn mcp_2026_07_28_clients_get_result_types() {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "server/discover",
-            "params": { "_meta": stateless_2026_meta() }
+            "params": { "_meta": common::mcp_server::stateless_meta() }
         }),
     );
     assert!(
@@ -3694,7 +3640,7 @@ fn mcp_2026_07_28_clients_get_result_types() {
         &mut stdin,
         &mut reader,
         &mut stderr,
-        stateless_search_symbols_call(3, "DiscoverMe"),
+        common::stateless_search_symbols_call(3, "DiscoverMe"),
     );
     assert_eq!(call["result"]["resultType"], "complete", "{call}");
     assert_eq!(call["result"]["isError"], false, "{call}");
@@ -3721,7 +3667,7 @@ fn cache_hints_reach_new_clients_and_stay_off_the_legacy_wire() {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "server/discover",
-            "params": { "_meta": stateless_2026_meta() }
+            "params": { "_meta": common::mcp_server::stateless_meta() }
         }),
     );
 
@@ -3733,7 +3679,7 @@ fn cache_hints_reach_new_clients_and_stay_off_the_legacy_wire() {
             "jsonrpc": "2.0",
             "id": 2,
             "method": "tools/list",
-            "params": { "_meta": stateless_2026_meta() }
+            "params": { "_meta": common::mcp_server::stateless_meta() }
         }),
     );
     assert_eq!(tools["result"]["ttlMs"], 300_000, "{tools}");
@@ -3751,7 +3697,7 @@ fn cache_hints_reach_new_clients_and_stay_off_the_legacy_wire() {
             "method": "resources/read",
             "params": {
                 "uri": "bifrost://agent-guidance/agents.md",
-                "_meta": stateless_2026_meta()
+                "_meta": common::mcp_server::stateless_meta()
             }
         }),
     );
@@ -3772,7 +3718,7 @@ fn cache_hints_reach_new_clients_and_stay_off_the_legacy_wire() {
                 "jsonrpc": "2.0",
                 "id": id,
                 "method": method,
-                "params": { "_meta": stateless_2026_meta() }
+                "params": { "_meta": common::mcp_server::stateless_meta() }
             }),
         );
         assert_eq!(unsupported["error"]["code"], -32601, "{unsupported}");
@@ -3784,7 +3730,7 @@ fn cache_hints_reach_new_clients_and_stay_off_the_legacy_wire() {
         &mut stdin,
         &mut reader,
         &mut stderr,
-        stateless_search_symbols_call(6, "Cacheable"),
+        common::stateless_search_symbols_call(6, "Cacheable"),
     );
     assert!(call["result"]["ttlMs"].is_null(), "{call}");
     assert!(call["result"]["cacheScope"].is_null(), "{call}");
@@ -3948,7 +3894,7 @@ fn output_schema_reaches_every_supported_revision() {
             "jsonrpc": "2.0",
             "id": 0,
             "method": "server/discover",
-            "params": { "_meta": stateless_2026_meta() }
+            "params": { "_meta": common::mcp_server::stateless_meta() }
         }),
     );
 
@@ -3960,7 +3906,7 @@ fn output_schema_reaches_every_supported_revision() {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/list",
-            "params": { "_meta": stateless_2026_meta() }
+            "params": { "_meta": common::mcp_server::stateless_meta() }
         }),
     );
     let mut stateless_advertising: Vec<&str> = listed["result"]["tools"]
@@ -4136,6 +4082,9 @@ fn output_schema_describes_real_workspace_and_policy_results() {
 /// request that never reaches the lock still reports where it is instead of
 /// falling back to "executing <tool>".
 #[test]
+#[hardwon(
+    "#3170: a Windows cache build lock wedged a schema-contract request instead of reporting its phase"
+)]
 fn a_held_build_lock_is_reported_as_the_request_phase() {
     let workspace = InlineTestProject::new()
         .file("Described.java", "class Described {}\n")
@@ -4158,7 +4107,7 @@ fn a_held_build_lock_is_reported_as_the_request_phase() {
     )
     .expect("edit lock fixture");
 
-    let mut child = Command::new(mcp_server_binary())
+    let mut child = Command::new(common::mcp_server::mcp_server_binary())
         .arg("--root")
         .arg(workspace.root())
         .arg("--mcp")
@@ -4390,14 +4339,14 @@ fn rootless_mcp_binds_through_mrtr_roots_on_2026_07_28() {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "server/discover",
-            "params": { "_meta": stateless_2026_meta() }
+            "params": { "_meta": common::mcp_server::stateless_meta() }
         }),
     );
 
     // 2026-07-28 removed the post-handshake roots lifecycle, so an unbound
     // server answers the tool call with an embedded roots request instead of a
     // result, and the client retries the same call once it can answer.
-    let search = stateless_search_symbols_call(2, "MrtrWorkspace");
+    let search = common::stateless_search_symbols_call(2, "MrtrWorkspace");
     let input_required = round_trip(&mut stdin, &mut reader, &mut stderr, search.clone());
     assert_eq!(
         input_required["result"]["resultType"], "input_required",
@@ -4451,47 +4400,12 @@ fn rootless_mcp_binds_through_mrtr_roots_on_2026_07_28() {
     assert!(child.wait().expect("wait bifrost").success());
 }
 
-/// The per-request negotiation keys a stateless `2026-07-28` request carries
-/// in its `_meta` in place of a connection-level `initialize`.
-fn stateless_2026_meta() -> Value {
-    json!({
-        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-        "io.modelcontextprotocol/clientCapabilities": {}
-    })
-}
-
-fn stateless_2026_tasks_meta() -> Value {
-    json!({
-        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-        "io.modelcontextprotocol/clientCapabilities": {
-            "extensions": { "io.modelcontextprotocol/tasks": {} }
-        }
-    })
-}
-
-fn stateless_search_symbols_call(id: i64, pattern: &str) -> Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "method": "tools/call",
-        "params": {
-            "name": "search_symbols",
-            "arguments": { "patterns": [pattern] },
-            "_meta": stateless_2026_meta()
-        }
-    })
-}
-
 fn stateless_run_policy_request(id: i64) -> Value {
-    let mut request = run_policy_request(id);
-    request["params"]["_meta"] = stateless_2026_tasks_meta();
-    request
+    common::mcp_server::stateless_tasks_request(run_policy_request(id))
 }
 
 fn stateless_malformed_run_policy_request(id: i64) -> Value {
-    let mut request = malformed_run_policy_request(id);
-    request["params"]["_meta"] = stateless_2026_tasks_meta();
-    request
+    common::mcp_server::stateless_tasks_request(malformed_run_policy_request(id))
 }
 
 /// Issue #2007: the `2026-07-28` lifecycle is stateless. A rootless client
@@ -4525,7 +4439,7 @@ fn rootless_mcp_executes_stateless_2026_07_28_calls_without_initialize() {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "server/discover",
-            "params": { "_meta": stateless_2026_meta() }
+            "params": { "_meta": common::mcp_server::stateless_meta() }
         }),
     );
     assert!(
@@ -4535,7 +4449,7 @@ fn rootless_mcp_executes_stateless_2026_07_28_calls_without_initialize() {
         "{discover}"
     );
 
-    let search = stateless_search_symbols_call(2, "StatelessWorkspace");
+    let search = common::stateless_search_symbols_call(2, "StatelessWorkspace");
     let input_required = round_trip(&mut stdin, &mut reader, &mut stderr, search.clone());
     assert_eq!(
         input_required["result"]["resultType"], "input_required",
@@ -4552,7 +4466,7 @@ fn rootless_mcp_executes_stateless_2026_07_28_calls_without_initialize() {
     let workspace_uri = url::Url::from_directory_path(workspace.root())
         .expect("workspace file URI")
         .to_string();
-    let mut retry = stateless_search_symbols_call(3, "StatelessWorkspace");
+    let mut retry = common::stateless_search_symbols_call(3, "StatelessWorkspace");
     retry["params"]["requestState"] = json!(request_state);
     retry["params"]["inputResponses"] = json!({ "roots": { "roots": [{ "uri": workspace_uri }] } });
     let bound = round_trip(&mut stdin, &mut reader, &mut stderr, retry);
@@ -4570,7 +4484,7 @@ fn rootless_mcp_executes_stateless_2026_07_28_calls_without_initialize() {
         &mut stdin,
         &mut reader,
         &mut stderr,
-        stateless_search_symbols_call(4, "StatelessWorkspace"),
+        common::stateless_search_symbols_call(4, "StatelessWorkspace"),
     );
     assert_eq!(followup["result"]["resultType"], "complete", "{followup}");
     assert_eq!(followup["result"]["isError"], false, "{followup}");
@@ -4613,13 +4527,13 @@ fn stateless_2026_07_28_requests_are_independently_validated() {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "server/discover",
-            "params": { "_meta": stateless_2026_meta() }
+            "params": { "_meta": common::mcp_server::stateless_meta() }
         }),
     );
 
     // Required request metadata is per request: declaring the version without
     // the capabilities key is refused at dispatch, before any tool runs.
-    let mut missing_capabilities = stateless_search_symbols_call(2, "Validated");
+    let mut missing_capabilities = common::stateless_search_symbols_call(2, "Validated");
     missing_capabilities["params"]["_meta"] =
         json!({ "io.modelcontextprotocol/protocolVersion": "2026-07-28" });
     let refused = round_trip(&mut stdin, &mut reader, &mut stderr, missing_capabilities);
@@ -4631,7 +4545,7 @@ fn stateless_2026_07_28_requests_are_independently_validated() {
     );
 
     // So is omitting `_meta` entirely on a session that opened statelessly.
-    let mut no_meta = stateless_search_symbols_call(3, "Validated");
+    let mut no_meta = common::stateless_search_symbols_call(3, "Validated");
     no_meta["params"]
         .as_object_mut()
         .expect("params object")
@@ -4645,7 +4559,7 @@ fn stateless_2026_07_28_requests_are_independently_validated() {
     );
 
     // An unknown protocol version is refused per request as well.
-    let mut unknown_version = stateless_search_symbols_call(4, "Validated");
+    let mut unknown_version = common::stateless_search_symbols_call(4, "Validated");
     unknown_version["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] =
         json!("2099-01-01");
     let refused = round_trip(&mut stdin, &mut reader, &mut stderr, unknown_version);
@@ -4658,7 +4572,7 @@ fn stateless_2026_07_28_requests_are_independently_validated() {
 
     // A requestState Bifrost never issued must not bind, however well-formed
     // the roots beside it are.
-    let mut tampered = stateless_search_symbols_call(5, "Validated");
+    let mut tampered = common::stateless_search_symbols_call(5, "Validated");
     tampered["params"]["requestState"] = json!("bifrost-roots-0-0");
     tampered["params"]["inputResponses"] =
         json!({ "roots": { "roots": [{ "uri": workspace_uri }] } });
@@ -4676,7 +4590,7 @@ fn stateless_2026_07_28_requests_are_independently_validated() {
         &mut stdin,
         &mut reader,
         &mut stderr,
-        stateless_search_symbols_call(6, "Validated"),
+        common::stateless_search_symbols_call(6, "Validated"),
     );
     assert_eq!(
         activation["result"]["resultType"], "input_required",
@@ -4688,7 +4602,7 @@ fn stateless_2026_07_28_requests_are_independently_validated() {
     let missing_dir_uri = url::Url::from_directory_path(workspace.root().join("no-such-dir"))
         .expect("missing dir URI")
         .to_string();
-    let mut unusable = stateless_search_symbols_call(7, "Validated");
+    let mut unusable = common::stateless_search_symbols_call(7, "Validated");
     unusable["params"]["requestState"] = json!(request_state);
     unusable["params"]["inputResponses"] = json!({ "roots": { "roots": [
         { "uri": "https://example.com/not-a-file-root" },
@@ -4704,7 +4618,7 @@ fn stateless_2026_07_28_requests_are_independently_validated() {
 
     // The spent requestState is single use: replaying it with usable roots is
     // no longer an activation.
-    let mut replay = stateless_search_symbols_call(8, "Validated");
+    let mut replay = common::stateless_search_symbols_call(8, "Validated");
     replay["params"]["requestState"] = json!(request_state);
     replay["params"]["inputResponses"] =
         json!({ "roots": { "roots": [{ "uri": workspace_uri }] } });
@@ -4801,6 +4715,7 @@ fn progress_token_yields_phase_progress_and_silence_without_it() {
     assert_eq!(response["result"]["isError"], false, "{response}");
     let messages = progress
         .iter()
+        .filter(|notification| notification["_meta"]["io.bifrost/workspace-build"].is_null())
         .map(|notification| {
             assert_eq!(
                 notification["progressToken"], "progress-abc",
@@ -4942,6 +4857,13 @@ fn concurrent_progress_tokens_never_cross_route() {
     let scan = &progress_by_token["scan-token"];
     let search = &progress_by_token["search-token"];
     assert_eq!(progress_by_token.len(), 2, "{progress_by_token:?}");
+    for (notifications, request_id) in [(scan, 10), (search, 11)] {
+        for notification in notifications {
+            if let Some(measured) = notification["_meta"].get("io.bifrost/workspace-build") {
+                assert_eq!(measured["request_id"], request_id);
+            }
+        }
+    }
     assert_progress_is_monotonic(scan);
     assert_progress_is_monotonic(search);
     assert!(
@@ -5079,41 +5001,37 @@ fn discover_tasks_server(
             "jsonrpc": "2.0",
             "id": 0,
             "method": "server/discover",
-            "params": { "_meta": stateless_2026_tasks_meta() }
+            "params": { "_meta": common::mcp_server::stateless_tasks_meta() }
         }),
     )
 }
 
 fn run_policy_request(id: i64) -> Value {
+    run_policy_request_with_selector(id, "policy_files", json!(["policies/dynamic-eval.rqlp"]))
+}
+
+fn run_policy_request_with_selector(id: i64, field: &str, values: Value) -> Value {
+    let mut arguments = serde_json::Map::new();
+    arguments.insert(field.to_owned(), values);
+    arguments.insert("evaluation_date".to_owned(), json!("2026-07-27"));
+    arguments.insert("fail_on".to_owned(), json!("warning"));
     json!({
         "jsonrpc": "2.0",
         "id": id,
         "method": "tools/call",
         "params": {
             "name": "run_policy",
-            "arguments": {
-                "policy_files": ["policies/dynamic-eval.rqlp"],
-                "evaluation_date": "2026-07-27",
-                "fail_on": "warning"
-            }
+            "arguments": arguments
         }
     })
 }
 
 fn malformed_run_policy_request(id: i64) -> Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "method": "tools/call",
-        "params": {
-            "name": "run_policy",
-            "arguments": {
-                "policy_ids": ["bifrost.correctness.dynamic-evaluation"],
-                "evaluation_date": "2026-07-27",
-                "fail_on": "warning"
-            }
-        }
-    })
+    run_policy_request_with_selector(
+        id,
+        "policy_ids",
+        json!(["bifrost.correctness.dynamic-evaluation"]),
+    )
 }
 
 fn assert_compact_malformed_run_policy_reply(response: &Value, task_capable: bool) {
@@ -5132,7 +5050,7 @@ fn assert_compact_malformed_run_policy_reply(response: &Value, task_capable: boo
         "early run_policy replies retain correlation: {response}"
     );
     let report = &structured["report"];
-    assert_eq!(report["schema_version"], 5, "{response}");
+    assert_eq!(report["schema_version"], 6, "{response}");
     assert_eq!(report["rules"], json!([]), "{response}");
     assert_eq!(report["runs"], json!([]), "{response}");
     assert_eq!(report["diagnostics"].as_array().map(Vec::len), Some(1));
@@ -5205,7 +5123,7 @@ fn poll_task_until_terminal(
                 "jsonrpc": "2.0",
                 "id": id,
                 "method": "tasks/get",
-                "params": { "taskId": task_id, "_meta": stateless_2026_tasks_meta() }
+                "params": { "taskId": task_id, "_meta": common::mcp_server::stateless_tasks_meta() }
             }),
         );
         let status = response["result"]["status"]
@@ -5332,11 +5250,11 @@ fn mcp_tasks_never_reach_incapable_or_legacy_clients() {
             "jsonrpc": "2.0",
             "id": 0,
             "method": "server/discover",
-            "params": { "_meta": stateless_2026_meta() }
+            "params": { "_meta": common::mcp_server::stateless_meta() }
         }),
     );
     let mut request = run_policy_request(1);
-    request["params"]["_meta"] = stateless_2026_meta();
+    request["params"]["_meta"] = common::mcp_server::stateless_meta();
     let synchronous = round_trip(&mut stdin, &mut reader, &mut stderr, request);
     assert_eq!(
         synchronous["result"]["resultType"], "complete",
@@ -5354,7 +5272,7 @@ fn mcp_tasks_never_reach_incapable_or_legacy_clients() {
             "jsonrpc": "2.0",
             "id": 2,
             "method": "tasks/get",
-            "params": { "taskId": "irrelevant", "_meta": stateless_2026_meta() }
+            "params": { "taskId": "irrelevant", "_meta": common::mcp_server::stateless_meta() }
         }),
     );
     assert!(
@@ -5417,7 +5335,7 @@ fn mcp_tasks_cancel_settles_cancelled() {
             "jsonrpc": "2.0",
             "id": 2,
             "method": "tasks/cancel",
-            "params": { "taskId": task_id, "_meta": stateless_2026_tasks_meta() }
+            "params": { "taskId": task_id, "_meta": common::mcp_server::stateless_tasks_meta() }
         }),
     );
     assert!(ack["error"].is_null(), "{ack}");
@@ -5461,37 +5379,6 @@ fn mcp_tasks_expire_to_failed() {
     // observed as failed, not left working forever.
     let terminal = poll_task_until_terminal(&mut stdin, &mut reader, &mut stderr, &task_id, 10);
     assert_eq!(terminal["result"]["status"], "failed", "{terminal}");
-
-    drop(stdin);
-    assert!(child.wait().expect("wait bifrost").success());
-}
-
-/// Issue #2006: unknown task ids fail safely.
-#[test]
-fn mcp_tasks_unknown_ids_fail_safely() {
-    let workspace = InlineTestProject::new()
-        .file("Anything.java", "class Anything {}\n")
-        .build();
-    let mut child = spawn_server(workspace.root(), "searchtools", &[]);
-    let mut stdin = child.stdin.take().expect("stdin");
-    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
-    let mut stderr = child.stderr.take().expect("stderr");
-    discover_tasks_server(&mut stdin, &mut reader, &mut stderr);
-
-    for (id, method) in [(1, "tasks/get"), (2, "tasks/update"), (3, "tasks/cancel")] {
-        let mut params = json!({ "taskId": "no-such-task" });
-        if method == "tasks/update" {
-            params["inputResponses"] = json!({});
-        }
-        let refused = round_trip(&mut stdin, &mut reader, &mut stderr, {
-            params["_meta"] = stateless_2026_tasks_meta();
-            json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
-        });
-        assert!(
-            !refused["error"].is_null(),
-            "{method} with an unknown id must fail safely: {refused}"
-        );
-    }
 
     drop(stdin);
     assert!(child.wait().expect("wait bifrost").success());
@@ -5568,7 +5455,7 @@ fn mcp_tasks_handles_die_with_workspace_rebinding() {
             "params": {
                 "name": "search_symbols",
                 "arguments": { "patterns": ["handler"] },
-                "_meta": stateless_2026_tasks_meta()
+                "_meta": common::mcp_server::stateless_tasks_meta()
             }
         }),
     );
@@ -5585,7 +5472,7 @@ fn mcp_tasks_handles_die_with_workspace_rebinding() {
             "jsonrpc": "2.0",
             "id": 41,
             "method": "tasks/get",
-            "params": { "taskId": task_id, "_meta": stateless_2026_tasks_meta() }
+            "params": { "taskId": task_id, "_meta": common::mcp_server::stateless_tasks_meta() }
         }),
     );
     assert!(
@@ -5726,28 +5613,15 @@ fn codex_sandbox_metadata(root: &std::path::Path, thread_id: &str) -> Value {
 }
 
 fn spawn_server(root: &std::path::Path, mode: &str, extra_args: &[&str]) -> std::process::Child {
-    mcp_server_command(root, mode, extra_args)
-        .spawn()
-        .expect("spawn bifrost")
-}
-
-/// A server left at the production request budget.
-///
-/// Deliberately not built from `mcp_server_command`, which installs the
-/// 60-second test budget that the cold-start guard must not have. A separate
-/// function rather than a parameter on the shared helper, so no caller can
-/// select the wrong budget by passing the wrong argument.
-fn spawn_server_at_production_budget(root: &std::path::Path, mode: &str) -> std::process::Child {
-    Command::new(mcp_server_binary())
-        .arg("--root")
-        .arg(root)
-        .arg("--mcp")
-        .arg(mode)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn cold-start guard bifrost")
+    let request_budget = BENCHMARK_MCP_REQUEST_BUDGET_SECS.to_string();
+    common::mcp_server::spawn_mcp_server(
+        common::mcp_server::mcp_server_binary(),
+        root,
+        mode,
+        extra_args,
+        &[(MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV, &request_budget)],
+    )
+    .expect("spawn bifrost")
 }
 
 /// Cold-start latency guard (1 of 2; the other is
@@ -5780,16 +5654,9 @@ fn cold_first_call_stays_within_the_production_cold_workspace_budget() {
         )
         .build();
 
-    let mut child = spawn_server_at_production_budget(workspace.root(), "searchtools");
-    let mut stdin = child.stdin.take().expect("stdin");
-    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
-    let mut stderr = child.stderr.take().expect("stderr");
-    initialize_session(&mut stdin, &mut reader, &mut stderr);
-
-    let first = round_trip(
-        &mut stdin,
-        &mut reader,
-        &mut stderr,
+    let (first, status) = common::mcp_server::run_cold_first_tool_call(
+        common::mcp_server::mcp_server_binary(),
+        workspace.root(),
         json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -5806,8 +5673,6 @@ fn cold_first_call_stays_within_the_production_cold_workspace_budget() {
          cold-workspace budget: {first}"
     );
 
-    drop(stdin);
-    let status = child.wait().expect("wait bifrost");
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
 }
 
@@ -5956,37 +5821,15 @@ impl Read for ProfiledStderrDrain {
     }
 }
 
-#[test]
-fn profiled_stderr_capture_bounds_tail_and_transport_evidence() {
-    let mut state = ProfiledStderrState::default();
-    state.push(&vec![b'x'; PROFILED_STDERR_TAIL_BYTES + 1]);
-    assert_eq!(state.tail.len(), PROFILED_STDERR_TAIL_BYTES);
-    assert!(state.tail_truncated);
-
-    for phase in PROFILED_PHASES {
-        state.push(
-            format!("[bifrost-timing] mcp_request.{phase}[search_symbols] (1 ms)\n").as_bytes(),
-        );
-    }
-    assert!(
-        PROFILED_PHASES
-            .into_iter()
-            .all(|phase| state.observed_phase(phase))
-    );
-}
-
 fn mcp_server_command(root: &std::path::Path, mode: &str, extra_args: &[&str]) -> Command {
-    let mut command = Command::new(mcp_server_binary());
-    command.arg("--root").arg(root).arg("--mcp").arg(mode);
-    for arg in extra_args {
-        command.arg(arg);
-    }
-    apply_test_request_budget(&mut command);
-    command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    command
+    let request_budget = BENCHMARK_MCP_REQUEST_BUDGET_SECS.to_string();
+    common::mcp_server::mcp_server_command(
+        common::mcp_server::mcp_server_binary(),
+        root,
+        mode,
+        extra_args,
+        &[(MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV, &request_budget)],
+    )
 }
 
 /// Give a spawned server a budget that absorbs box load.
@@ -6017,6 +5860,7 @@ fn apply_test_request_budget(command: &mut Command) {
 /// the stderr trace of a profiled RMCP session. The transport wrapper emits
 /// the delivery phases. The wire assertion protects the benchmark contract.
 #[test]
+#[hardwon("#1491: profiled MCP tool calls omitted one or more transport lifecycle phases")]
 fn profiled_tool_calls_emit_all_transport_phases() {
     let workspace = InlineTestProject::new()
         .file(
@@ -6086,6 +5930,7 @@ fn profiled_tool_calls_emit_all_transport_phases() {
 /// scenario in benchmark/interactive-latency.toml gates the same overlap
 /// against a five-second budget; this is its fast in-repo counterpart.
 #[test]
+#[hardwon("#1722: serialized MCP tool calls starved a light lookup behind a long usage scan")]
 fn light_lookup_overtakes_long_usage_scan() {
     let mut project = InlineTestProject::with_language(Language::Rust).file(
         "hot.rs",
@@ -6171,7 +6016,7 @@ fn light_lookup_overtakes_long_usage_scan() {
 }
 
 fn spawn_rootless_server(cwd: &std::path::Path, mode: &str) -> std::process::Child {
-    let mut command = Command::new(mcp_server_binary());
+    let mut command = Command::new(common::mcp_server::mcp_server_binary());
     // See `apply_test_request_budget`: a wire test asserts protocol behavior,
     // not cold-start latency.
     apply_test_request_budget(&mut command);
@@ -6189,7 +6034,7 @@ fn spawn_rootless_server(cwd: &std::path::Path, mode: &str) -> std::process::Chi
 fn spawn_server_no_args(cwd: &std::path::Path) -> std::process::Child {
     // No mode: the compatibility contract is MCP searchtools. No --root: the
     // server must default its root to the working directory.
-    let mut command = Command::new(mcp_server_binary());
+    let mut command = Command::new(common::mcp_server::mcp_server_binary());
     // See `apply_test_request_budget`: a wire test asserts protocol behavior,
     // not cold-start latency.
     apply_test_request_budget(&mut command);
@@ -6202,28 +6047,83 @@ fn spawn_server_no_args(cwd: &std::path::Path) -> std::process::Child {
         .expect("spawn bifrost")
 }
 
-fn round_trip(
-    stdin: &mut impl Write,
-    reader: &mut impl BufRead,
-    stderr: &mut impl Read,
-    payload: Value,
-) -> Value {
-    write_line(stdin, payload);
-    read_line(reader, stderr)
-}
+#[path = "server/measured_progress.rs"]
+mod measured_progress;
 
-fn write_line(stdin: &mut impl Write, payload: Value) {
-    writeln!(stdin, "{payload}").expect("write request");
-    stdin.flush().expect("flush request");
-}
+#[test]
+fn bifrost_mcp_cli_mode_is_rejected() {
+    let fixture_root = TempDir::new().expect("temp dir");
 
-fn read_line(reader: &mut impl BufRead, stderr: &mut impl Read) -> Value {
-    let mut line = String::new();
-    let bytes = reader.read_line(&mut line).expect("read response");
-    if bytes == 0 {
-        let mut buf = String::new();
-        let _ = stderr.read_to_string(&mut buf);
-        panic!("server closed before responding; stderr:\n{buf}");
+    for mode in ["cli", "symbol|cli"] {
+        let mut child = spawn_server(fixture_root.path(), mode, &[]);
+        let status = child.wait().expect("wait bifrost");
+        assert!(
+            !status.success(),
+            "bifrost --mcp {mode} should fail to start: {status}"
+        );
+        let mut stderr_text = String::new();
+        child
+            .stderr
+            .take()
+            .expect("stderr")
+            .read_to_string(&mut stderr_text)
+            .expect("read stderr");
+        assert!(
+            stderr_text.contains("classify_test_files"),
+            "stderr should name classify_test_files for mode {mode}: {stderr_text}"
+        );
+        assert!(
+            stderr_text.contains("--tool classify_test_files"),
+            "stderr should point at the --tool path for mode {mode}: {stderr_text}"
+        );
     }
-    serde_json::from_str(&line).expect("valid json response")
+}
+
+#[test]
+fn mcp_tasks_unknown_ids_fail_safely() {
+    let workspace = InlineTestProject::new()
+        .file("Anything.java", "class Anything {}\n")
+        .build();
+    let mut child = spawn_server(workspace.root(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+    discover_tasks_server(&mut stdin, &mut reader, &mut stderr);
+
+    for (id, method) in [(1, "tasks/get"), (2, "tasks/update"), (3, "tasks/cancel")] {
+        let mut params = json!({ "taskId": "no-such-task" });
+        if method == "tasks/update" {
+            params["inputResponses"] = json!({});
+        }
+        let refused = round_trip(&mut stdin, &mut reader, &mut stderr, {
+            params["_meta"] = common::mcp_server::stateless_tasks_meta();
+            json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+        });
+        assert!(
+            !refused["error"].is_null(),
+            "{method} with an unknown id must fail safely: {refused}"
+        );
+    }
+
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+#[test]
+fn profiled_stderr_capture_bounds_tail_and_transport_evidence() {
+    let mut state = ProfiledStderrState::default();
+    state.push(&vec![b'x'; PROFILED_STDERR_TAIL_BYTES + 1]);
+    assert_eq!(state.tail.len(), PROFILED_STDERR_TAIL_BYTES);
+    assert!(state.tail_truncated);
+
+    for phase in PROFILED_PHASES {
+        state.push(
+            format!("[bifrost-timing] mcp_request.{phase}[search_symbols] (1 ms)\n").as_bytes(),
+        );
+    }
+    assert!(
+        PROFILED_PHASES
+            .into_iter()
+            .all(|phase| state.observed_phase(phase))
+    );
 }

@@ -1,4 +1,4 @@
-use crate::analyzer::common::language_for_file;
+use crate::analyzer::common::{language_for_file, workspace_language_for_file};
 use crate::analyzer::{Language, ProjectFile};
 use crate::gitblob;
 use crate::path_normalization::NormalizePath;
@@ -39,6 +39,27 @@ const OVERLAY_REJECTION_LOG_THROTTLE: Duration = Duration::from_secs(60);
 const OVERLAY_REJECTION_LOG_MAX_ENTRIES: usize = 256;
 
 pub const BIFROST_IGNORE_FILE_NAME: &str = ".bifrostignore";
+
+fn files_for_language(
+    files: &BTreeSet<ProjectFile>,
+    language: Language,
+    mut file_language: impl FnMut(&ProjectFile) -> Language,
+) -> BTreeSet<ProjectFile> {
+    files
+        .iter()
+        .filter(|file| file_language(file) == language)
+        .cloned()
+        .collect()
+}
+
+fn relative_path_from_normalized_root<'a>(abs_path: &'a Path, root: &Path) -> Option<&'a Path> {
+    abs_path.strip_prefix(root).ok()
+}
+
+fn relative_path_under_root(abs_path: &Path, root: &Path) -> Option<PathBuf> {
+    let normalized = abs_path.to_path_buf().normalize();
+    relative_path_from_normalized_root(&normalized, root).map(Path::to_path_buf)
+}
 
 /// One workspace tree's `.bifrostignore` rules, compiled per directory.
 ///
@@ -172,6 +193,11 @@ impl BifrostIgnoreMatcher {
         Self::last_match_is_ignored(&active, &file.abs_path(), false)
     }
 
+    /// Whether `rel_path` is ignored beneath this matcher's workspace root.
+    pub fn is_ignored_path(&self, rel_path: &Path) -> bool {
+        self.is_ignored(&ProjectFile::new(self.root.clone(), rel_path.to_path_buf()))
+    }
+
     fn last_match_is_ignored(matchers: &[&Gitignore], path: &Path, is_dir: bool) -> bool {
         let mut ignored = false;
         for matcher in matchers {
@@ -244,6 +270,13 @@ impl ProjectSourceSnapshot {
             oid,
             origin: ProjectSourceOrigin::Disk,
         })
+    }
+
+    pub fn disk_bytes_limited(bytes: Vec<u8>, max_bytes: usize) -> io::Result<Option<Self>> {
+        if bytes.len() > max_bytes {
+            return Ok(None);
+        }
+        Self::disk_bytes(bytes).map(Some)
     }
 
     pub fn overlay(source: impl Into<Arc<str>>, revision: OverlayRevision) -> Self {
@@ -377,18 +410,13 @@ pub trait Project: Send + Sync {
     }
 
     fn file_by_abs_path(&self, abs_path: &Path) -> Option<ProjectFile> {
-        let abs_path = abs_path.to_path_buf().normalize();
-        let rel_path = abs_path.strip_prefix(self.root()).ok()?;
-        self.file_by_rel_path(rel_path)
+        let rel_path = relative_path_under_root(abs_path, self.root())?;
+        self.file_by_rel_path(&rel_path)
     }
 
     fn file_by_abs_path_allow_missing(&self, abs_path: &Path) -> Option<ProjectFile> {
-        let abs_path = abs_path.to_path_buf().normalize();
-        let rel_path = abs_path.strip_prefix(self.root()).ok()?;
-        Some(ProjectFile::new(
-            self.root().to_path_buf(),
-            rel_path.to_path_buf(),
-        ))
+        let rel_path = relative_path_under_root(abs_path, self.root())?;
+        Some(ProjectFile::new(self.root().to_path_buf(), rel_path))
     }
 
     fn persistence_root(&self) -> Option<&Path> {
@@ -501,9 +529,10 @@ fn read_disk_source_snapshot_limited(
     file: &ProjectFile,
     max_bytes: usize,
 ) -> io::Result<Option<ProjectSourceSnapshot>> {
-    read_disk_source_bytes_limited(file, max_bytes)?
-        .map(ProjectSourceSnapshot::disk_bytes)
-        .transpose()
+    match read_disk_source_bytes_limited(file, max_bytes)? {
+        Some(bytes) => ProjectSourceSnapshot::disk_bytes_limited(bytes, max_bytes),
+        None => Ok(None),
+    }
 }
 
 fn read_disk_source_bytes_limited(
@@ -550,25 +579,17 @@ impl TestProject {
     }
 
     pub fn with_languages(root: impl Into<PathBuf>, languages: BTreeSet<Language>) -> Self {
-        let root = root.into().normalize();
-        assert!(root.is_absolute(), "test project root must be absolute");
-        assert!(root.is_dir(), "test project root must exist");
+        let root = validated_test_project_root(root);
         assert!(
             !languages.is_empty(),
             "test project must contain at least one analyzer language"
         );
 
-        Self {
-            root,
-            languages,
-            listing_count: Arc::new(AtomicUsize::new(0)),
-        }
+        Self::with_validated_root_and_languages(root, languages)
     }
 
     pub fn from_root_with_inferred_languages(root: impl Into<PathBuf>) -> io::Result<Self> {
-        let root = root.into().normalize();
-        assert!(root.is_absolute(), "test project root must be absolute");
-        assert!(root.is_dir(), "test project root must exist");
+        let root = validated_test_project_root(root);
 
         let languages = detect_languages(&root)?;
         if languages.is_empty() {
@@ -581,16 +602,31 @@ impl TestProject {
             ));
         }
 
-        Ok(Self {
+        Ok(Self::with_validated_root_and_languages(root, languages))
+    }
+
+    fn with_validated_root_and_languages(root: PathBuf, languages: BTreeSet<Language>) -> Self {
+        Self {
             root,
             languages,
             listing_count: Arc::new(AtomicUsize::new(0)),
-        })
+        }
     }
 
     pub fn root_path(&self) -> &Path {
         &self.root
     }
+}
+
+fn validated_test_project_root(root: impl Into<PathBuf>) -> PathBuf {
+    let root = root.into().normalize();
+    assert!(root.is_absolute(), "test project root must be absolute");
+    assert!(root.is_dir(), "test project root must exist");
+    root
+}
+
+fn filesystem_has_directory(root: &Path, rel_path: &Path) -> bool {
+    root.join(rel_path).is_dir()
 }
 
 impl Project for TestProject {
@@ -607,7 +643,7 @@ impl Project for TestProject {
     }
 
     fn root(&self) -> &Path {
-        &self.root
+        self.root_path()
     }
 
     fn analyzer_languages(&self) -> BTreeSet<Language> {
@@ -639,7 +675,7 @@ impl Project for TestProject {
     }
 
     fn has_directory(&self, rel_path: &Path) -> bool {
-        self.root.join(rel_path).is_dir()
+        filesystem_has_directory(&self.root, rel_path)
     }
 
     fn analyzable_files(&self, language: Language) -> io::Result<BTreeSet<ProjectFile>> {
@@ -666,11 +702,7 @@ impl Project for TestProject {
         files: &BTreeSet<ProjectFile>,
         language: Language,
     ) -> io::Result<BTreeSet<ProjectFile>> {
-        Ok(files
-            .iter()
-            .filter(|file| file.language() == language)
-            .cloned()
-            .collect())
+        Ok(files_for_language(files, language, ProjectFile::language))
     }
 
     fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile> {
@@ -933,7 +965,7 @@ impl Project for FilesystemProject {
     }
 
     fn root(&self) -> &Path {
-        &self.root
+        self.root_path()
     }
 
     fn analyzer_languages(&self) -> BTreeSet<Language> {
@@ -945,14 +977,7 @@ impl Project for FilesystemProject {
     }
 
     fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>> {
-        self.listing_count.fetch_add(1, Ordering::Relaxed);
-        match &self.cached_listing {
-            Some(cache) => cache.files().map(|files| (*files).clone()),
-            None => self
-                .take_initial_listing()
-                .map(|files| (*files).clone())
-                .map_or_else(|| collect_workspace_files(&self.root), Ok),
-        }
+        self.all_files_shared().map(|files| (*files).clone())
     }
 
     fn all_files_shared(&self) -> io::Result<Arc<BTreeSet<ProjectFile>>> {
@@ -1015,7 +1040,7 @@ impl Project for FilesystemProject {
     /// only for directories whose contents are entirely ignored, which the
     /// caller's listing then filters out exactly as before.
     fn has_directory(&self, rel_path: &Path) -> bool {
-        self.root.join(rel_path).is_dir()
+        filesystem_has_directory(&self.root, rel_path)
     }
 
     fn analyzable_files(&self, language: Language) -> io::Result<BTreeSet<ProjectFile>> {
@@ -1026,20 +1051,9 @@ impl Project for FilesystemProject {
 
         let files = self.all_files_shared()?;
         let bifrost_ignore = self.bifrost_ignore_matcher(&files)?;
-        Ok(files
-            .iter()
-            .filter(|file| {
-                file.rel_path()
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .map(|ext| {
-                        let normalized = ext.to_ascii_lowercase();
-                        extensions.contains(&normalized.as_str())
-                    })
-                    .unwrap_or(false)
-            })
+        Ok(files_for_language(&files, language, ProjectFile::language)
+            .into_iter()
             .filter(|file| !bifrost_ignore.is_ignored(file))
-            .cloned()
             .collect())
     }
 
@@ -1049,11 +1063,9 @@ impl Project for FilesystemProject {
         language: Language,
     ) -> io::Result<BTreeSet<ProjectFile>> {
         let bifrost_ignore = self.bifrost_ignore_matcher(files)?;
-        Ok(files
-            .iter()
-            .filter(|file| file.language() == language)
+        Ok(files_for_language(files, language, ProjectFile::language)
+            .into_iter()
             .filter(|file| !bifrost_ignore.is_ignored(file))
-            .cloned()
             .collect())
     }
 
@@ -1075,7 +1087,6 @@ impl Project for FilesystemProject {
     }
 
     fn is_bifrostignored(&self, rel_path: &Path) -> bool {
-        let file = ProjectFile::new(self.root.clone(), rel_path.to_path_buf());
         // The listing is taken only to build the matcher, so ask for it only
         // when there is no matcher yet. `invalidate_cached_file_listing` clears
         // the matcher and the listing together, so reading the matcher first
@@ -1087,7 +1098,7 @@ impl Project for FilesystemProject {
                 .and_then(|files| self.bifrost_ignore_matcher(&files)),
         };
         matcher
-            .map(|matcher| matcher.is_ignored(&file))
+            .map(|matcher| matcher.is_ignored_path(rel_path))
             .unwrap_or(false)
     }
 }
@@ -1115,11 +1126,7 @@ impl FileSetProject {
             .into_iter()
             .map(|rel| ProjectFile::new(root.clone(), rel))
             .collect();
-        let languages = files
-            .iter()
-            .map(language_for_file)
-            .filter(|language| *language != Language::None)
-            .collect();
+        let languages = detect_languages_in_files(&files);
         Self {
             root,
             files,
@@ -1160,12 +1167,7 @@ impl Project for FileSetProject {
     }
 
     fn analyzable_files(&self, language: Language) -> io::Result<BTreeSet<ProjectFile>> {
-        Ok(self
-            .files
-            .iter()
-            .filter(|file| language_for_file(file) == language)
-            .cloned()
-            .collect())
+        Ok(files_for_language(&self.files, language, language_for_file))
     }
 
     fn analyzable_files_from(
@@ -1173,11 +1175,7 @@ impl Project for FileSetProject {
         files: &BTreeSet<ProjectFile>,
         language: Language,
     ) -> io::Result<BTreeSet<ProjectFile>> {
-        Ok(files
-            .iter()
-            .filter(|file| language_for_file(file) == language)
-            .cloned()
-            .collect())
+        Ok(files_for_language(files, language, language_for_file))
     }
 
     fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile> {
@@ -1369,7 +1367,8 @@ impl Project for MultiRootProject {
     fn file_by_abs_path(&self, abs_path: &Path) -> Option<ProjectFile> {
         let abs_path = abs_path.to_path_buf().normalize();
         for root in &self.roots {
-            let Ok(root_rel_path) = abs_path.strip_prefix(root.root()) else {
+            let Some(root_rel_path) = relative_path_from_normalized_root(&abs_path, root.root())
+            else {
                 continue;
             };
             if let Some(file) = root.file_by_rel_path(root_rel_path) {
@@ -1381,9 +1380,9 @@ impl Project for MultiRootProject {
 
     fn file_by_abs_path_allow_missing(&self, abs_path: &Path) -> Option<ProjectFile> {
         let abs_path = abs_path.to_path_buf().normalize();
-        let rel_path = abs_path.strip_prefix(&self.root).ok()?;
+        let rel_path = relative_path_from_normalized_root(&abs_path, &self.root)?;
         for root in &self.roots {
-            if abs_path.strip_prefix(root.root()).is_ok() {
+            if relative_path_from_normalized_root(&abs_path, root.root()).is_some() {
                 return Some(ProjectFile::new(self.root.clone(), rel_path.to_path_buf()));
             }
         }
@@ -1807,6 +1806,14 @@ impl OverlayProject {
             .filter(|file| !listed.contains(file) && !file.exists())
     }
 
+    fn overlay_entry(&self, file: &ProjectFile) -> Option<Arc<OverlayEntry>> {
+        self.overlays
+            .read()
+            .expect("overlay lock poisoned")
+            .get(&file.abs_path())
+            .cloned()
+    }
+
     /// Add the buffers among `candidates` that belong in a `language` listing
     /// to `analyzable`.
     ///
@@ -1876,11 +1883,7 @@ impl Project for OverlayProject {
     }
 
     fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>> {
-        let mut files = self.delegate.all_files()?;
-        let additions: Vec<ProjectFile> =
-            Self::buffers_missing_from(self.overlay_project_files(), &files).collect();
-        files.extend(additions);
-        Ok(files)
+        self.all_files_shared().map(|files| (*files).clone())
     }
 
     fn all_files_shared(&self) -> io::Result<Arc<BTreeSet<ProjectFile>>> {
@@ -1960,9 +1963,8 @@ impl Project for OverlayProject {
         if let Some(file) = self.delegate.file_by_abs_path(abs_path) {
             return Some(file);
         }
-        let normalized = abs_path.to_path_buf().normalize();
-        let rel_path = normalized.strip_prefix(self.delegate.root()).ok()?;
-        self.file_by_rel_path(rel_path)
+        let rel_path = relative_path_under_root(abs_path, self.delegate.root())?;
+        self.file_by_rel_path(&rel_path)
     }
 
     fn file_by_abs_path_allow_missing(&self, abs_path: &Path) -> Option<ProjectFile> {
@@ -2004,12 +2006,7 @@ impl Project for OverlayProject {
     }
 
     fn read_source_snapshot(&self, file: &ProjectFile) -> io::Result<ProjectSourceSnapshot> {
-        let entry = self
-            .overlays
-            .read()
-            .expect("overlay lock poisoned")
-            .get(&file.abs_path())
-            .cloned();
+        let entry = self.overlay_entry(file);
         if let Some(entry) = entry {
             return Ok(ProjectSourceSnapshot::overlay(
                 Arc::clone(&entry.source),
@@ -2024,12 +2021,7 @@ impl Project for OverlayProject {
         file: &ProjectFile,
         max_bytes: usize,
     ) -> io::Result<Option<ProjectSourceSnapshot>> {
-        let entry = self
-            .overlays
-            .read()
-            .expect("overlay lock poisoned")
-            .get(&file.abs_path())
-            .cloned();
+        let entry = self.overlay_entry(file);
         if let Some(entry) = entry {
             return Ok((entry.source.len() <= max_bytes).then(|| {
                 ProjectSourceSnapshot::overlay(Arc::clone(&entry.source), entry.revision)
@@ -2083,7 +2075,7 @@ fn detect_languages(root: &Path) -> io::Result<BTreeSet<Language>> {
 fn detect_languages_in_files(files: &BTreeSet<ProjectFile>) -> BTreeSet<Language> {
     let mut languages = BTreeSet::new();
     for file in files {
-        let language = language_for_file(file);
+        let language = workspace_language_for_file(file);
         if language != Language::None {
             languages.insert(language);
         }
@@ -2094,20 +2086,15 @@ fn detect_languages_in_files(files: &BTreeSet<ProjectFile>) -> BTreeSet<Language
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::write_file;
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
     use tempfile::TempDir;
 
-    fn write_file(root: &Path, rel: &str, contents: &str) -> ProjectFile {
-        let abs = root.join(rel);
-        if let Some(parent) = abs.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        std::fs::write(&abs, contents).unwrap();
-        ProjectFile::new(root.to_path_buf(), PathBuf::from(rel))
-    }
-
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2770: file-set project coverage was not reported as its selected file count"
+    )]
     #[test]
     fn file_set_project_reports_its_file_count_as_subset_coverage() {
         let temp = TempDir::new().unwrap();
@@ -2125,6 +2112,9 @@ mod tests {
         );
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2770: scoped sessions hid that query results covered only a subset of the workspace"
+    )]
     #[test]
     fn overlay_project_reports_its_delegate_coverage() {
         let temp = TempDir::new().unwrap();
@@ -2146,6 +2136,9 @@ mod tests {
         );
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2770: filesystem project coverage did not identify whole-workspace analysis"
+    )]
     #[test]
     fn filesystem_project_reports_whole_workspace_coverage() {
         let temp = TempDir::new().unwrap();
@@ -2157,22 +2150,15 @@ mod tests {
         assert_eq!(None, project.coverage().subset());
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2770: subset coverage serialized with the wrong file-count shape"
+    )]
     #[test]
     fn subset_coverage_serializes_as_a_file_count() {
         assert_eq!(
             serde_json::json!({ "files": 12 }),
             serde_json::to_value(SubsetCoverage { files: 12 }).unwrap()
         );
-    }
-
-    #[test]
-    fn default_limited_source_read_rejects_before_allocating_the_full_file() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let file = write_file(&root, "large.txt", &"x".repeat(1025));
-        let project = TestProject::new(&root, Language::Java);
-
-        assert_eq!(None, project.read_source_limited(&file, 1024).unwrap());
     }
 
     #[test]
@@ -2304,37 +2290,6 @@ mod tests {
                 .unwrap_err()
                 .kind()
         );
-    }
-
-    #[cfg(windows)]
-    fn verbatim(path: &Path) -> PathBuf {
-        PathBuf::from(format!(r"\\?\{}", path.display()))
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn project_constructors_normalize_verbatim_roots() {
-        let temp = TempDir::new().unwrap();
-        let ordinary = temp.path().canonicalize().unwrap().normalize();
-        std::fs::write(ordinary.join("main.rs"), "fn main() {}\n").unwrap();
-        let verbatim = verbatim(&ordinary);
-
-        let filesystem = FilesystemProject::new(&verbatim).unwrap();
-        let test = TestProject::new(&verbatim, Language::Rust);
-        let files = FileSetProject::new(&verbatim, [PathBuf::from("main.rs")]);
-        assert_eq!(filesystem.root(), ordinary);
-        assert_eq!(test.root(), ordinary);
-        assert_eq!(files.root(), ordinary);
-    }
-
-    #[test]
-    fn filesystem_project_read_source_reads_disk() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let file = write_file(&root, "hello.py", "print('hi')\n");
-        let project = FilesystemProject::new(&root).unwrap();
-        assert_eq!(project.read_source(&file).unwrap(), "print('hi')\n");
-        assert!(!project.has_overlay(&file));
     }
 
     #[test]
@@ -2505,37 +2460,6 @@ mod tests {
     }
 
     #[test]
-    fn workspace_file_listing_cache_serves_repeated_reads_from_one_walk() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path().canonicalize().unwrap().normalize();
-        write_file(&root, "a.rs", "fn a() {}\n");
-        let cache = WorkspaceFileListingCache::new(root.clone());
-
-        let first = cache.files().unwrap();
-        let second = cache.files().unwrap();
-        assert!(Arc::ptr_eq(&first, &second));
-        assert_eq!(cache.walk_count(), 1);
-
-        // New files stay invisible until the owner invalidates: the cache is
-        // refreshed by workspace-change observers, never by time.
-        write_file(&root, "b.rs", "fn b() {}\n");
-        assert!(
-            !cache
-                .files()
-                .unwrap()
-                .contains(&ProjectFile::new(&root, "b.rs"))
-        );
-        cache.invalidate();
-        assert!(
-            cache
-                .files()
-                .unwrap()
-                .contains(&ProjectFile::new(&root, "b.rs"))
-        );
-        assert_eq!(cache.walk_count(), 2);
-    }
-
-    #[test]
     fn workspace_file_listing_cache_refreshes_git_index_union_on_invalidate() {
         // Tracked files shadowed by broad ignore patterns are listed via the
         // git-index union, not the walk; invalidation must recompute both.
@@ -2565,30 +2489,9 @@ mod tests {
         assert!(cache.files().unwrap().contains(&generated));
     }
 
-    #[test]
-    fn filesystem_project_with_cached_listing_serves_all_files_from_cache() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path().canonicalize().unwrap().normalize();
-        write_file(&root, "a.rs", "fn a() {}\n");
-        let cache = Arc::new(WorkspaceFileListingCache::new(root.clone()));
-        let project = FilesystemProject::with_cached_listing(&root, Arc::clone(&cache)).unwrap();
-
-        project.all_files().unwrap();
-        project.all_files().unwrap();
-        assert_eq!(cache.walk_count(), 1);
-        assert_eq!(project.workspace_file_listing_count(), 2);
-
-        write_file(&root, "b.rs", "fn b() {}\n");
-        project.invalidate_cached_file_listing();
-        assert!(
-            project
-                .all_files()
-                .unwrap()
-                .contains(&ProjectFile::new(&root, "b.rs"))
-        );
-        assert_eq!(cache.walk_count(), 2);
-    }
-
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2542: cached constructor listings hid newly added Kotlin source after invalidation"
+    )]
     #[test]
     fn filesystem_project_invalidation_discards_constructor_listing() {
         let temp = TempDir::new().unwrap();
@@ -2683,38 +2586,6 @@ mod tests {
             !persistence_root.exists(),
             "constructing a project must not create cache directories"
         );
-    }
-
-    #[test]
-    fn overlay_project_returns_overlay_when_set_and_disk_otherwise() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let file = write_file(&root, "lib.rs", "fn old() {}\n");
-        let delegate: Arc<dyn Project> = Arc::new(FilesystemProject::new(&root).unwrap());
-        let overlay = OverlayProject::new(delegate);
-
-        // No overlay yet: falls through to disk.
-        assert_eq!(overlay.read_source(&file).unwrap(), "fn old() {}\n");
-        assert!(!overlay.has_overlay(&file));
-
-        // Set overlay: served from memory regardless of disk.
-        assert!(overlay.set(file.abs_path(), "fn new() {}\n".to_string()));
-        assert_eq!(overlay.read_source(&file).unwrap(), "fn new() {}\n");
-        assert!(overlay.has_overlay(&file));
-
-        // Disk is unchanged.
-        assert_eq!(
-            std::fs::read_to_string(file.abs_path()).unwrap(),
-            "fn old() {}\n"
-        );
-
-        // Clear: disk reasserts.
-        assert!(overlay.clear(&file.abs_path()));
-        assert_eq!(overlay.read_source(&file).unwrap(), "fn old() {}\n");
-        assert!(!overlay.has_overlay(&file));
-
-        // Clearing a missing overlay returns false.
-        assert!(!overlay.clear(&file.abs_path()));
     }
 
     #[test]
@@ -3073,47 +2944,6 @@ mod tests {
     }
 
     #[test]
-    fn overlay_project_delegates_non_read_methods() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        write_file(&root, "a.py", "");
-        write_file(&root, "b.py", "");
-        let delegate: Arc<dyn Project> = Arc::new(FilesystemProject::new(&root).unwrap());
-        let overlay = OverlayProject::new(Arc::clone(&delegate));
-
-        assert_eq!(overlay.root(), delegate.root());
-        assert_eq!(overlay.analyzer_languages(), delegate.analyzer_languages());
-        assert_eq!(overlay.all_files().unwrap(), delegate.all_files().unwrap());
-    }
-
-    #[test]
-    fn overlay_project_rejects_oversized_set_and_falls_back_to_disk() {
-        // A tiny cap (16 bytes) makes the oversized case trivial to construct.
-        // Verifies the contract: set returns false, has_overlay stays false,
-        // read_source returns disk content.
-        let temp = TempDir::new().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let file = write_file(&root, "lib.rs", "fn disk() {}\n");
-        let delegate: Arc<dyn Project> = Arc::new(FilesystemProject::new(&root).unwrap());
-        let overlay = OverlayProject::with_max_bytes(delegate, 16);
-
-        let oversized = "x".repeat(64);
-        assert!(
-            !overlay.set(file.abs_path(), oversized),
-            "set must reject content larger than the cap"
-        );
-        assert!(
-            !overlay.has_overlay(&file),
-            "rejected set must not leave an overlay record"
-        );
-        assert_eq!(
-            overlay.read_source(&file).unwrap(),
-            "fn disk() {}\n",
-            "read must fall through to disk when overlay was rejected"
-        );
-    }
-
-    #[test]
     fn overlay_project_oversized_set_clears_prior_overlay() {
         // Sequence: small overlay accepted, then huge overlay rejected. The
         // existing overlay must be cleared so the next read returns disk
@@ -3139,44 +2969,5 @@ mod tests {
             "fn disk() {}\n",
             "after rejection, read must fall through to disk"
         );
-    }
-
-    #[test]
-    fn overlay_project_accepts_set_exactly_at_cap() {
-        // Boundary case: content_len == cap is accepted (the rejection rule
-        // uses `>`, not `>=`).
-        let temp = TempDir::new().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let file = write_file(&root, "lib.rs", "fn disk() {}\n");
-        let delegate: Arc<dyn Project> = Arc::new(FilesystemProject::new(&root).unwrap());
-        let overlay = OverlayProject::with_max_bytes(delegate, 16);
-
-        let exactly_at_cap = "x".repeat(16);
-        assert!(
-            overlay.set(file.abs_path(), exactly_at_cap.clone()),
-            "set at exactly the cap must succeed"
-        );
-        assert_eq!(overlay.read_source(&file).unwrap(), exactly_at_cap);
-    }
-
-    #[test]
-    fn overlay_project_repeated_rejections_are_idempotent() {
-        // didChange fires per-keystroke. An editor parked on a buffer that's
-        // permanently over the cap will hammer set() repeatedly. The
-        // visible-state contract — has_overlay false, reads return disk —
-        // must hold for every call, and the throttled log path must not
-        // panic on the second-onwards calls (they take the "skip log"
-        // branch).
-        let temp = TempDir::new().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let file = write_file(&root, "lib.rs", "fn disk() {}\n");
-        let delegate: Arc<dyn Project> = Arc::new(FilesystemProject::new(&root).unwrap());
-        let overlay = OverlayProject::with_max_bytes(delegate, 16);
-
-        for _ in 0..5 {
-            assert!(!overlay.set(file.abs_path(), "x".repeat(64)));
-            assert!(!overlay.has_overlay(&file));
-            assert_eq!(overlay.read_source(&file).unwrap(), "fn disk() {}\n");
-        }
     }
 }

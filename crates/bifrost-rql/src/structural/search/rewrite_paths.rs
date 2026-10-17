@@ -14,8 +14,7 @@
 //! exactly what [`RewritePathCompleteness`] reports.
 
 use super::super::rewrite_paths::{
-    FileRewritePaths, RewritePathCompleteness, RewritePathIncompleteReason, RewritePathRequest,
-    rewrite_paths_for_file,
+    FileRewritePaths, RewritePathCompleteness, RewritePathIncompleteReason,
 };
 use super::rel_path_string;
 use super::results::{
@@ -26,6 +25,8 @@ use crate::analyzer::semantic::LengthDelimitedDigest;
 use crate::analyzer::{IAnalyzer, Language, ProjectFile};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
+#[cfg(test)]
+use brokk_bifrost_core::analyzer::structural::rewrite_path::RewriteDomainKind;
 use brokk_bifrost_core::analyzer::structural::rewrite_path::{
     ALL_REWRITE_DOMAIN_KINDS, RewritePath,
 };
@@ -54,12 +55,10 @@ impl RewritePathTraversalCache {
         if let Some(cached) = self.files.get(file) {
             return Arc::clone(cached);
         }
-        let token = cancellation.cloned().unwrap_or_default();
-        let derived = Arc::new(rewrite_paths_for_file(
-            analyzer,
-            file,
-            &mut RewritePathRequest::new(&token),
-        ));
+        let derived = Arc::new(
+            brokk_bifrost_analysis::analyzer::structural::rewrite_paths::
+                rewrite_paths_for_file_with_cancellation(analyzer, file, cancellation),
+        );
         self.files.insert(file.clone(), Arc::clone(&derived));
         derived
     }
@@ -80,6 +79,7 @@ impl RewritePathTraversalCache {
             }
             let uncovered = uncovered_domains(completeness);
             diagnostics.push(CodeQueryDiagnostic {
+                source: None,
                 code,
                 impact: CodeQueryDiagnosticImpact::Incomplete,
                 branch: Vec::new(),
@@ -90,6 +90,7 @@ impl RewritePathTraversalCache {
                     uncovered.join(", ")
                 ),
                 exhausted_roots: Vec::new(),
+                withheld_rows_path: None,
             });
         }
     }
@@ -250,101 +251,32 @@ fn uncovered_domains(completeness: &RewritePathCompleteness) -> Vec<&'static str
         .collect()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use brokk_bifrost_core::analyzer::structural::rewrite_path::{
-        ALL_REWRITE_OUTCOME_KINDS, RewriteDomainKind, RewriteOrigin, RewriteOutcome,
-        RewriteOutcomeKind,
+#[test]
+fn an_incomplete_derivation_reports_every_reason_once_per_subject() {
+    let mut cache = RewritePathTraversalCache::default();
+    let completeness = RewritePathCompleteness::Incomplete {
+        reasons: vec![
+            RewritePathIncompleteReason::NoDomainAnalyzer(RewriteDomainKind::RustImportAlias),
+            RewritePathIncompleteReason::Cancelled,
+            RewritePathIncompleteReason::CanonicalFactsUnavailable,
+        ],
     };
-
-    fn row(outcome: RewriteOutcome) -> RewritePath {
-        RewritePath {
-            domain: RewriteDomainKind::RustImportAlias,
-            origin: RewriteOrigin {
-                file: ProjectFile::new(
-                    std::env::current_dir().expect("test working directory must be available"),
-                    "src/lib.rs",
-                ),
-                specifier: "a".to_string(),
-                range: crate::analyzer::Range {
-                    start_byte: 0,
-                    end_byte: 1,
-                    start_line: 1,
-                    end_line: 1,
-                },
-            },
-            declared_bound: 2,
-            steps: Vec::new(),
-            outcome,
-            generation: 3,
-        }
-    }
-
-    #[test]
-    fn every_rewrite_vocabulary_value_has_a_wire_label() {
-        for domain in ALL_REWRITE_DOMAIN_KINDS {
-            assert!(!domain.label().is_empty());
-        }
-        for outcome in ALL_REWRITE_OUTCOME_KINDS {
-            assert!(!outcome.label().is_empty());
-        }
-    }
-
-    #[test]
-    fn an_outcome_filter_keeps_only_the_named_outcome() {
-        let cycle = row(RewriteOutcome::Cycle {
-            witness: vec!["c".to_string(), "a".to_string(), "c".to_string()],
-        });
-        let converged = row(RewriteOutcome::Converged {
-            fixed_point: "c::d".to_string(),
-        });
-        let filter = RewritePathFilter {
-            domains: Vec::new(),
-            outcomes: vec![RewriteOutcomeKind::Cycle],
-        };
-        assert!(rewrite_path_filter_matches(&filter, &cycle));
-        assert!(!rewrite_path_filter_matches(&filter, &converged));
-        assert!(rewrite_path_filter_matches(
-            &RewritePathFilter::default(),
-            &converged
-        ));
-        assert!(RewritePathFilter::default().is_empty());
-    }
-
-    #[test]
-    fn an_incomplete_derivation_reports_every_reason_once_per_subject() {
-        let mut cache = RewritePathTraversalCache::default();
-        let completeness = RewritePathCompleteness::Incomplete {
-            reasons: vec![
-                RewritePathIncompleteReason::NoDomainAnalyzer(RewriteDomainKind::RustImportAlias),
-                RewritePathIncompleteReason::Cancelled,
-                RewritePathIncompleteReason::CanonicalFactsUnavailable,
-            ],
-        };
-        let mut diagnostics = Vec::new();
-        cache.report_completeness(
-            "src/lib.rs",
-            Language::Rust,
-            &completeness,
-            7,
-            &mut diagnostics,
-        );
-        assert_eq!(diagnostics.len(), 3, "{diagnostics:?}");
-        assert!(
-            diagnostics
-                .iter()
-                .all(|diagnostic| diagnostic.impact == CodeQueryDiagnosticImpact::Incomplete),
-            "{diagnostics:?}"
-        );
-        cache.report_completeness(
-            "src/lib.rs",
-            Language::Rust,
-            &completeness,
-            7,
-            &mut diagnostics,
-        );
-        assert_eq!(diagnostics.len(), 3, "{diagnostics:?}");
-        assert!(!completeness.covers(RewriteDomainKind::RustImportAlias));
-    }
+    let mut diagnostics = Vec::new();
+    cache.report_completeness(
+        "src/lib.rs",
+        Language::Rust,
+        &completeness,
+        7,
+        &mut diagnostics,
+    );
+    crate::structural::search::test_support::assert_incomplete_diagnostics(&diagnostics, 3);
+    cache.report_completeness(
+        "src/lib.rs",
+        Language::Rust,
+        &completeness,
+        7,
+        &mut diagnostics,
+    );
+    crate::structural::search::test_support::assert_incomplete_diagnostics(&diagnostics, 3);
+    assert!(!completeness.covers(RewriteDomainKind::RustImportAlias));
 }

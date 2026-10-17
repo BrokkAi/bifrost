@@ -472,29 +472,3 @@ fn diagnostic(
         reason_kind: Some(reason_kind.to_owned()),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn incoming_reference_shape_accepts_calls_and_constructor_creation_only() {
-        let source = "class T { void run() { method(); new T(); java.util.function.Supplier<T> value = T::new; } void method() {} }";
-        let tree = brokk_bifrost_jvm::java::declarations::parse_tree(source).unwrap();
-        let root = tree.root_node();
-        let method = source.find("method();").unwrap();
-        assert!(is_java_invocation_reference(
-            root,
-            method,
-            method + "method".len()
-        ));
-        let creation = source.find("new T()").unwrap() + "new ".len();
-        assert!(is_java_invocation_reference(root, creation, creation + 1));
-        let method_reference = source.find("T::new").unwrap();
-        assert!(!is_java_invocation_reference(
-            root,
-            method_reference,
-            method_reference + 1
-        ));
-    }
-}

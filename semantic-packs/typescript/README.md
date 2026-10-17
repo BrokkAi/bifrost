@@ -1,5 +1,10 @@
 # TypeScript standard-library pack
 
+> Legacy transition copy: product pack authoring belongs in `bifrost-packs`
+> or the private premium pack repository. Follow [the placement policy](../../CONTRIBUTING.md#release-process).
+> Sources here are frozen pending verified v0.13.0 release and dependency migration.
+> The technical notes below describe retained contracts and test tooling.
+
 `typescript-7.0.2.json` pins the canonical TypeScript 7.0.2 standard-library
 declarations. TypeScript 7 publishes the compiler package and the platform
 package containing `lib/*.d.ts` separately; the public build script combines

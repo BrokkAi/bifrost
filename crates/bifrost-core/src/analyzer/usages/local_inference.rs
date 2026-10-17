@@ -1,6 +1,12 @@
 use crate::hash::{HashMap, HashSet};
 use std::hash::Hash;
 
+fn resolution_or_unknown<T: Clone + Eq + Hash>(
+    resolution: Option<&SymbolResolution<T>>,
+) -> SymbolResolution<T> {
+    resolution.cloned().unwrap_or(SymbolResolution::Unknown)
+}
+
 const DEFAULT_MAX_TARGETS_PER_SYMBOL: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,9 +153,7 @@ where
     where
         T: Clone,
     {
-        self.visible_binding(symbol)
-            .cloned()
-            .unwrap_or(SymbolResolution::Unknown)
+        resolution_or_unknown(self.visible_binding(symbol))
     }
 }
 
@@ -199,9 +203,7 @@ where
     }
 
     pub fn exit_scope(&mut self) {
-        if self.scopes.len() > 1 {
-            self.scopes.pop();
-        }
+        super::exit_nested_scope(&mut self.scopes);
     }
 
     pub fn declare_shadow(&mut self, symbol: impl Into<String>) {
@@ -209,6 +211,14 @@ where
         let scope = self.current_scope_mut();
         scope.shadows.insert(symbol.clone());
         scope.bindings.remove(&symbol);
+    }
+
+    /// Seeds a symbol when its target is known, or declares a shadow otherwise.
+    pub fn seed_or_shadow(&mut self, symbol: impl Into<String>, target: Option<T>) {
+        match target {
+            Some(target) => self.seed_symbol(symbol, target),
+            None => self.declare_shadow(symbol),
+        }
     }
 
     pub fn seed_symbol(&mut self, symbol: impl Into<String>, target: T) {
@@ -255,9 +265,7 @@ where
     }
 
     pub fn resolve_symbol(&self, symbol: &str) -> SymbolResolution<T> {
-        self.resolve_symbol_ref(symbol)
-            .cloned()
-            .unwrap_or(SymbolResolution::Unknown)
+        resolution_or_unknown(self.resolve_symbol_ref(symbol))
     }
 
     pub fn resolve_symbol_ref(&self, symbol: &str) -> Option<&SymbolResolution<T>> {
@@ -277,18 +285,11 @@ where
     }
 
     pub fn is_shadowed(&self, symbol: &str) -> bool {
-        self.scopes
-            .iter()
-            .rev()
-            .any(|scope| scope.shadows.contains(symbol))
+        self.is_shadowed_at_or_below_scope(0, symbol)
     }
 
     pub fn is_shadowed_in_non_root_scope(&self, symbol: &str) -> bool {
-        self.scopes
-            .iter()
-            .skip(1)
-            .rev()
-            .any(|scope| scope.shadows.contains(symbol))
+        self.is_shadowed_below_scope(0, symbol)
     }
 
     pub fn scope_depth(&self) -> usize {

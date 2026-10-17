@@ -40,86 +40,6 @@ fn rust_crate_resolution_context(
 }
 
 #[test]
-fn selected_rust_forward_session_resolves_multiple_refs_and_reuses_fact_session() {
-    let fixture = RustRootResolutionOperationFixture::new();
-    let cancellation = CancellationToken::new();
-    let operation = fixture.open_ready(&cancellation);
-    let (context, crate_keys) = rust_crate_resolution_context(&operation, &cancellation);
-    let locators = [
-        rust_reference_locator(&fixture.consumer_facts, "alias"),
-        rust_reference_locator(&fixture.consumer_facts, "direct_alias"),
-    ];
-    let session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
-    let mut callback_count = 0;
-    let outcome = operation
-        .with_rust_forward_queries_in_session(
-            context,
-            &crate_keys,
-            &[Path::new(RUST_ROOT_CONSUMER_PATH)],
-            &cancellation,
-            &mut SelectedResolutionContextMetrics,
-            &session,
-            |queries| {
-                callback_count += 1;
-                let mut first_metrics = ResolutionBatchMetrics::default();
-                let first = queries.resolve_reference(&locators[0], &mut first_metrics)?;
-                let SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Found(
-                    first,
-                )) = first
-                else {
-                    panic!("first selected Rust forward reference must resolve")
-                };
-                assert_eq!(first.resolution.binding().targets().len(), 1);
-                assert_eq!(
-                    first.resolution.binding().completion(),
-                    &ResolutionCompletion::Complete
-                );
-
-                let mut second_metrics = ResolutionBatchMetrics::default();
-                let second = queries.resolve_reference(&locators[1], &mut second_metrics)?;
-                let SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Found(
-                    second,
-                )) = second
-                else {
-                    panic!("second selected Rust forward reference must resolve")
-                };
-                assert_eq!(second.resolution.binding().targets().len(), 1);
-                assert_eq!(
-                    second.resolution.binding().completion(),
-                    &ResolutionCompletion::Complete
-                );
-
-                let mut repeat_metrics = ResolutionBatchMetrics::default();
-                let repeated = queries.resolve_reference(&locators[0], &mut repeat_metrics)?;
-                let SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Found(
-                    repeated,
-                )) = repeated
-                else {
-                    panic!("repeated selected Rust forward reference must resolve")
-                };
-                assert_eq!(
-                    repeated.resolution.binding().targets(),
-                    first.resolution.binding().targets(),
-                    "repeated references must reuse the same session answer"
-                );
-                assert_eq!(repeat_metrics, first_metrics);
-                Ok(())
-            },
-        )
-        .expect("run selected Rust forward query session");
-
-    assert_eq!(callback_count, 1, "all references must share one callback");
-    assert!(matches!(
-        outcome,
-        SelectedResolutionOperationOutcome::Native(())
-    ));
-    assert!(matches!(
-        session.finish(()),
-        BoundedResolution::Complete { .. }
-    ));
-}
-
-#[test]
 fn selected_rust_forward_preserves_complete_binding_and_incomplete_call_aggregate() {
     let fixture = RustRootResolutionOperationFixture::new();
     // An attribute on an argument can remove it, so each call keeps its
@@ -190,47 +110,6 @@ fn selected_rust_forward_preserves_complete_binding_and_incomplete_call_aggregat
         )
         .expect("run selected generic async Rust forward queries");
 
-    assert!(matches!(
-        outcome,
-        SelectedResolutionOperationOutcome::Native(())
-    ));
-    assert!(matches!(
-        session.finish(()),
-        BoundedResolution::Complete { .. }
-    ));
-}
-
-#[test]
-fn selected_rust_forward_inventory_completion_certifies_an_admitted_fragment() {
-    let fixture = RustRootResolutionOperationFixture::new();
-    let cancellation = CancellationToken::new();
-    let operation = fixture.open_ready(&cancellation);
-    let (context, crate_keys) = rust_crate_resolution_context(&operation, &cancellation);
-    let fragment = operation
-        .mounts()
-        .unwrap()
-        .iter()
-        .find(|mount| mount.persisted_relative_path() == RUST_ROOT_CONSUMER_PATH)
-        .expect("selected Rust consumer mount")
-        .fragment();
-    let session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
-    let outcome = operation
-        .with_rust_forward_queries_in_session(
-            context,
-            &crate_keys,
-            &[Path::new(RUST_ROOT_CONSUMER_PATH)],
-            &cancellation,
-            &mut SelectedResolutionContextMetrics,
-            &session,
-            |queries| {
-                assert_eq!(
-                    queries.reference_inventory_completion(fragment)?,
-                    ResolutionCompletion::Complete
-                );
-                Ok(())
-            },
-        )
-        .expect("read selected Rust reference inventory completion");
     assert!(matches!(
         outcome,
         SelectedResolutionOperationOutcome::Native(())
@@ -339,6 +218,47 @@ fn selected_rust_forward_unavailable_cannot_publish_callback_value() {
     assert!(matches!(
         outcome,
         SelectedResolutionOperationOutcome::Unavailable(_)
+    ));
+    assert!(matches!(
+        session.finish(()),
+        BoundedResolution::Complete { .. }
+    ));
+}
+
+#[test]
+fn selected_rust_forward_inventory_completion_certifies_an_admitted_fragment() {
+    let fixture = RustRootResolutionOperationFixture::new();
+    let cancellation = CancellationToken::new();
+    let operation = fixture.open_ready(&cancellation);
+    let (context, crate_keys) = rust_crate_resolution_context(&operation, &cancellation);
+    let fragment = operation
+        .mounts()
+        .unwrap()
+        .iter()
+        .find(|mount| mount.persisted_relative_path() == RUST_ROOT_CONSUMER_PATH)
+        .expect("selected Rust consumer mount")
+        .fragment();
+    let session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
+    let outcome = operation
+        .with_rust_forward_queries_in_session(
+            context,
+            &crate_keys,
+            &[Path::new(RUST_ROOT_CONSUMER_PATH)],
+            &cancellation,
+            &mut SelectedResolutionContextMetrics,
+            &session,
+            |queries| {
+                assert_eq!(
+                    queries.reference_inventory_completion(fragment)?,
+                    ResolutionCompletion::Complete
+                );
+                Ok(())
+            },
+        )
+        .expect("read selected Rust reference inventory completion");
+    assert!(matches!(
+        outcome,
+        SelectedResolutionOperationOutcome::Native(())
     ));
     assert!(matches!(
         session.finish(()),

@@ -4,11 +4,13 @@
 //! endpoint becomes readable once, after all of its positioned prefix tasks
 //! finish. Cyclic selected-root dependencies still return no answer.
 
+use super::completed_roots::RootMemoKey;
 use super::*;
 
 pub(super) struct Resources<'resources, 'source> {
     pub(super) session: &'resources mut FactReadSession<'source>,
     pub(super) hierarchy: &'resources mut HierarchyOperationArena,
+    pub(super) completed_roots: Option<(&'resources SelectedDemandState, u64, [u8; 32])>,
     pub(super) forward_candidate_artifacts: &'resources mut ForwardCandidateArtifactCache,
 }
 
@@ -18,9 +20,219 @@ impl Resources<'_, '_> {
         target: &mut CancellationEvidenceLedger,
         work: &mut usize,
     ) {
-        self.hierarchy
-            .cancellation_reasons
-            .include_retained_evidence(target, self.session.cancellation, work);
+        super::include_hierarchy_cancellation(self.hierarchy, self.session, target, work);
+    }
+}
+
+/// A relation can select the declaring owners of a member after its receiver
+/// references finish. Exact projected values also permit type-projection owners;
+/// this capability is independent of the syntax that requested the relation.
+#[derive(Debug)]
+pub(crate) struct MemberSelectionRequest {
+    pub(crate) reference: SemanticId,
+    pub(crate) values: Vec<ResolutionSlotValue>,
+    pub(crate) lookup: SemanticId,
+    pub(crate) namespace: ResolutionNamespace,
+    pub(crate) language: Language,
+}
+
+#[derive(Debug)]
+pub(crate) struct MemberSelection {
+    pub(crate) owners: Vec<SemanticId>,
+    pub(crate) completion: ResolutionCompletion,
+}
+
+struct MemberSelectionFrame<'source> {
+    evaluation: Option<FactEvaluationState<'source>>,
+    groups: BTreeMap<HierarchyLookupShape, Vec<HierarchyRoot>>,
+    active: Option<DemandHierarchyOwnerFrame>,
+    owners: BTreeSet<SemanticId>,
+    completion: ResolutionCompletion,
+}
+
+enum MemberSelectionPoll {
+    Continue,
+    AwaitingDependencies(Vec<EndpointSignature>),
+    AwaitingHierarchyReferences(Vec<SemanticId>),
+    Ready(MemberSelection),
+    Cancelled,
+}
+
+impl<'source> MemberSelectionFrame<'source> {
+    fn new(
+        operation: &mut Resources<'_, 'source>,
+        request: MemberSelectionRequest,
+    ) -> Option<Self> {
+        assert!(
+            matches!(
+                request.namespace,
+                ResolutionNamespace::Type
+                    | ResolutionNamespace::Value
+                    | ResolutionNamespace::Callable
+            ),
+            "a member selection requests a member namespace"
+        );
+        let mut evaluation = FactEvaluation::new_with_forward_artifacts(
+            operation.session,
+            operation.hierarchy,
+            operation.forward_candidate_artifacts,
+            request.reference,
+        );
+        let namespace = if request.namespace == ResolutionNamespace::Callable
+            && super::super::fact_source::language_callables_occupy_value_namespace(
+                request.language,
+            ) {
+            ResolutionNamespace::Value
+        } else {
+            request.namespace
+        };
+        let mut groups = BTreeMap::<HierarchyLookupShape, Vec<HierarchyRoot>>::new();
+        for value in request.values {
+            if evaluation.poll_cancelled() {
+                return None;
+            }
+            let mut shape = HierarchyLookupShape::new(
+                request.lookup,
+                namespace,
+                QualifierCategory::of(value),
+                i64::from(value.ty().indirection()),
+            );
+            if namespace == ResolutionNamespace::Value {
+                shape.namespace_aliases =
+                    super::super::fact_source::language_value_member_aliases(request.language);
+            }
+            if request.namespace == ResolutionNamespace::Callable
+                && language_uses_qualified_callable_hierarchy_replay(request.language)
+            {
+                shape = shape.with_callable_overload_set();
+            }
+            groups.entry(shape).or_default().push(HierarchyRoot {
+                owner: value.ty().identity(),
+                value,
+                route_ordinal: 0,
+            });
+        }
+        Some(Self {
+            evaluation: Some(evaluation.into_checkpoint_state()),
+            groups,
+            active: None,
+            owners: BTreeSet::new(),
+            completion: ResolutionCompletion::Complete,
+        })
+    }
+
+    fn poll(
+        &mut self,
+        operation: &mut Resources<'_, 'source>,
+        readiness: &mut impl FnMut(&[BatchCandidateRequest]) -> StoreResult<DemandForwardReadiness>,
+    ) -> StoreResult<MemberSelectionPoll> {
+        let state = self
+            .evaluation
+            .take()
+            .expect("member phase is between polls");
+        let mut evaluation = FactEvaluation::new_with_forward_artifacts(
+            operation.session,
+            operation.hierarchy,
+            operation.forward_candidate_artifacts,
+            state.root,
+        );
+        evaluation.replace_with_checkpoint_state(state);
+        let result = self.poll_selection(&mut evaluation, readiness);
+        self.evaluation = Some(evaluation.into_checkpoint_state());
+        result
+    }
+
+    fn poll_selection(
+        &mut self,
+        evaluation: &mut FactEvaluation<'_, 'source>,
+        readiness: &mut impl FnMut(&[BatchCandidateRequest]) -> StoreResult<DemandForwardReadiness>,
+    ) -> StoreResult<MemberSelectionPoll> {
+        if evaluation.poll_cancelled() {
+            return Ok(MemberSelectionPoll::Cancelled);
+        }
+        if let Some(active) = &mut self.active {
+            match active.poll(evaluation, readiness)? {
+                DemandHierarchySelectionPoll::Continue => return Ok(MemberSelectionPoll::Continue),
+                DemandHierarchySelectionPoll::AwaitingDependencies => {
+                    let requests = active.inherited.as_ref().map_or_else(
+                        || active.local.pending_requests(),
+                        DemandInheritedHierarchyFrame::pending_requests,
+                    );
+                    assert!(
+                        !requests.is_empty(),
+                        "a suspended member phase retains its requests"
+                    );
+                    return Ok(MemberSelectionPoll::AwaitingDependencies(
+                        requests
+                            .iter()
+                            .map(|request| request.endpoint().clone())
+                            .collect(),
+                    ));
+                }
+                DemandHierarchySelectionPoll::AwaitingHierarchyReferences(references) => {
+                    return Ok(MemberSelectionPoll::AwaitingHierarchyReferences(references));
+                }
+                DemandHierarchySelectionPoll::Ready(None) => {
+                    return Ok(MemberSelectionPoll::Cancelled);
+                }
+                DemandHierarchySelectionPoll::Ready(Some(selected)) => {
+                    let HierarchySelectionState::Ready(selected) =
+                        evaluation.materialize_hierarchy_candidate_expressions(selected)?
+                    else {
+                        return Ok(MemberSelectionPoll::Cancelled);
+                    };
+                    self.owners
+                        .extend(selected.owners.iter().map(|owner| owner.owner));
+                    let cancellation = evaluation.cancellation;
+                    let work = &mut evaluation.work;
+                    let Some(completion) = evaluation.hierarchy.evidence.flatten(
+                        &selected.evidence,
+                        u32::MAX,
+                        &mut || poll_cancelled(cancellation, work),
+                    ) else {
+                        return Ok(MemberSelectionPoll::Cancelled);
+                    };
+                    self.completion = self.completion.combine(&completion);
+                    self.active = None;
+                }
+            }
+        }
+        if let Some((shape, roots)) = self.groups.pop_first() {
+            let Some(prepared) = evaluation.prepare_hierarchy_roots(shape, &roots) else {
+                return Ok(MemberSelectionPoll::Cancelled);
+            };
+            let Some(local) = DemandHierarchyLocalFrame::new(evaluation, &prepared.root_keys)
+            else {
+                return Ok(MemberSelectionPoll::Cancelled);
+            };
+            self.active = Some(DemandHierarchyOwnerFrame {
+                precedence: 0,
+                shape,
+                roots: Some(prepared),
+                local,
+                inherited: None,
+            });
+            return Ok(MemberSelectionPoll::Continue);
+        }
+        Ok(MemberSelectionPoll::Ready(MemberSelection {
+            owners: std::mem::take(&mut self.owners).into_iter().collect(),
+            completion: std::mem::replace(&mut self.completion, ResolutionCompletion::Complete),
+        }))
+    }
+
+    fn cancel(mut self, operation: &mut Resources<'_, 'source>) {
+        let state = self
+            .evaluation
+            .take()
+            .expect("member phase is between polls");
+        let mut evaluation =
+            FactEvaluation::new(operation.session, operation.hierarchy, state.root);
+        evaluation.replace_with_checkpoint_state(state);
+        if let Some(active) = self.active.take()
+            && let Some(inherited) = active.inherited
+        {
+            inherited.cancel(&mut evaluation);
+        }
     }
 }
 
@@ -28,6 +240,128 @@ impl Resources<'_, '_> {
 pub(crate) struct RootPlan {
     pub(crate) prefixes: Vec<SemanticId>,
     pub(crate) completion: ResolutionCompletion,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ClosureDischarges {
+    pub(crate) reasons: BTreeSet<SemanticId>,
+    /// The selected prefix provider has evidence to retire operation-local
+    /// hierarchy placeholders after the closed route binds a target.
+    pub(crate) operation_local_placeholders: bool,
+    /// A closed selected route's exact terminal targets, including an empty
+    /// set when the provider exhausted the route and proved no target exists.
+    pub(crate) selected_targets: Option<BTreeSet<SemanticId>>,
+    /// The selected route may remove the listed gaps on its own empty answer.
+    pub(crate) authoritative_empty_result: bool,
+    /// A type-prefix proof also closes the same exact prefix reference's gap.
+    pub(crate) prefix_reference: Option<SemanticId>,
+    pub(crate) prefix_reasons: BTreeSet<SemanticId>,
+    pub(crate) prefix_operation_local_placeholders: bool,
+}
+
+impl ClosureDischarges {
+    pub(crate) fn exact(reasons: impl IntoIterator<Item = SemanticId>) -> Self {
+        Self {
+            reasons: reasons.into_iter().collect(),
+            operation_local_placeholders: false,
+            selected_targets: None,
+            authoritative_empty_result: false,
+            prefix_reference: None,
+            prefix_reasons: BTreeSet::new(),
+            prefix_operation_local_placeholders: false,
+        }
+    }
+
+    pub(crate) fn with_operation_local_placeholders(
+        reasons: impl IntoIterator<Item = SemanticId>,
+    ) -> Self {
+        Self {
+            reasons: reasons.into_iter().collect(),
+            operation_local_placeholders: true,
+            selected_targets: None,
+            authoritative_empty_result: false,
+            prefix_reference: None,
+            prefix_reasons: BTreeSet::new(),
+            prefix_operation_local_placeholders: false,
+        }
+    }
+
+    pub(crate) fn with_selected_targets(
+        mut self,
+        targets: impl IntoIterator<Item = SemanticId>,
+    ) -> Self {
+        let targets = targets.into_iter().collect::<BTreeSet<_>>();
+        if let Some(selected) = &mut self.selected_targets {
+            selected.extend(targets);
+        } else {
+            self.selected_targets = Some(targets);
+        }
+        self
+    }
+
+    pub(crate) fn with_authoritative_empty_result(mut self) -> Self {
+        self.selected_targets = Some(BTreeSet::new());
+        self.authoritative_empty_result = true;
+        self
+    }
+
+    pub(crate) fn for_prefix(
+        mut self,
+        reference: SemanticId,
+        reasons: impl IntoIterator<Item = SemanticId>,
+        operation_local_placeholders: bool,
+    ) -> Self {
+        assert!(
+            self.prefix_reference.is_none() || self.prefix_reference == Some(reference),
+            "one closed route has one selected prefix reference"
+        );
+        self.prefix_reference = Some(reference);
+        self.prefix_reasons.extend(reasons);
+        self.prefix_operation_local_placeholders |= operation_local_placeholders;
+        self
+    }
+
+    pub(crate) fn for_prefix_only(&self) -> Option<(SemanticId, Self)> {
+        self.prefix_reference.map(|reference| {
+            (
+                reference,
+                Self {
+                    reasons: self.prefix_reasons.clone(),
+                    operation_local_placeholders: self.prefix_operation_local_placeholders,
+                    ..Self::default()
+                },
+            )
+        })
+    }
+
+    pub(crate) fn without_prefix(self) -> Self {
+        Self {
+            prefix_reference: None,
+            prefix_reasons: BTreeSet::new(),
+            prefix_operation_local_placeholders: false,
+            ..self
+        }
+    }
+
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.reasons.extend(other.reasons);
+        self.operation_local_placeholders |= other.operation_local_placeholders;
+        if let Some(targets) = other.selected_targets {
+            self.selected_targets
+                .get_or_insert_with(BTreeSet::new)
+                .extend(targets);
+        }
+        self.authoritative_empty_result |= other.authoritative_empty_result;
+        if let Some(reference) = other.prefix_reference {
+            assert!(
+                self.prefix_reference.is_none() || self.prefix_reference == Some(reference),
+                "merged closed routes agree on their selected prefix reference"
+            );
+            self.prefix_reference = Some(reference);
+        }
+        self.prefix_reasons.extend(other.prefix_reasons);
+        self.prefix_operation_local_placeholders |= other.prefix_operation_local_placeholders;
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,6 +403,26 @@ pub(crate) trait RootProvider {
     /// operation's fixed selection. No evaluator may run inside this call.
     fn discover(&mut self, endpoint: &EndpointSignature) -> StoreResult<RootDiscovery>;
 
+    /// Whether this provider can prepare keyed root reads for all pending
+    /// endpoints in a scheduler round. Providers that do not opt in retain the
+    /// original interleaved discover-and-admit order.
+    fn supports_batched_discoveries(&self) -> bool {
+        false
+    }
+
+    /// Discover a set of independent pending endpoints. Providers with a
+    /// keyed batch source can prepare the reads together; the default keeps
+    /// existing providers scalar.
+    fn discover_many(
+        &mut self,
+        endpoints: &[EndpointSignature],
+    ) -> StoreResult<Vec<RootDiscovery>> {
+        endpoints
+            .iter()
+            .map(|endpoint| self.discover(endpoint))
+            .collect()
+    }
+
     /// Install one immutable relation from complete root-specific evaluations.
     /// This is not permission to mutate previously closed endpoint relations.
     /// The installed lexical relation must carry its plan and materialization
@@ -81,16 +435,39 @@ pub(crate) trait RootProvider {
         inputs: &[(SemanticId, &FactResolutionAnswer)],
     ) -> StoreResult<ResolutionCompletion>;
 
+    /// Request structural member-owner selection after positioned receivers
+    /// finish. The scheduler owns its hierarchy and source dependencies. This
+    /// capability can serve imports or projection owners; no request preserves
+    /// the provider's ordinary close behavior.
+    fn member_selection(
+        &mut self,
+        _endpoint: &EndpointSignature,
+        _inputs: &[(SemanticId, &FactResolutionAnswer)],
+    ) -> StoreResult<Option<MemberSelectionRequest>> {
+        Ok(None)
+    }
+
+    /// Install the relation after its requested member selection has completed.
+    fn close_selected_members(
+        &mut self,
+        _endpoint: &EndpointSignature,
+        _inputs: &[(SemanticId, &FactResolutionAnswer)],
+        _selection: &MemberSelection,
+    ) -> StoreResult<ResolutionCompletion> {
+        unreachable!("a provider requesting member selection installs its result")
+    }
+
     /// The placeholder reasons a closed relation proved dead for the lookup it
     /// continued. `Some` says the closure answered the boundary question its
     /// endpoint asked with its own positive witness: the requesting reference's
     /// selected route reasons and the listed placeholder reasons no longer
-    /// describe an open branch. `None` says the closure decided nothing beyond
-    /// its candidate paths.
+    /// describe an open branch. It can also allow operation-local placeholders
+    /// to retire once that route binds selected targets. `None` says the closure
+    /// decided nothing beyond its candidate paths.
     fn resolved_closure_discharges(
         &self,
         _endpoint: &EndpointSignature,
-    ) -> Option<Vec<SemanticId>> {
+    ) -> Option<ClosureDischarges> {
         None
     }
 }
@@ -122,6 +499,7 @@ pub(crate) enum Outcome {
         endpoint: EndpointSignature,
         reason: RootUnavailableReason,
         completion: ResolutionCompletion,
+        root_seed_completions: Vec<(SemanticId, ResolutionCompletion)>,
     },
     Unsupported(Unsupported),
 }
@@ -148,12 +526,14 @@ pub(crate) enum BatchOutcome {
         endpoint: EndpointSignature,
         reason: RootUnavailableReason,
         completion: ResolutionCompletion,
+        root_seed_completions: Vec<(SemanticId, ResolutionCompletion)>,
     },
     Unsupported(Unsupported),
 }
 
 struct Task<'a> {
     root: SemanticId,
+    memo_key: Option<RootMemoKey>,
     frame: Option<DemandFactEvaluationTask<'a>>,
     answer: Option<FactResolutionAnswer>,
     /// This task's own frame metrics, mirrored after every poll of it.
@@ -173,6 +553,7 @@ struct Task<'a> {
     hierarchy_waits: Vec<usize>,
     /// Tasks waiting for this root's completed qualified type binding.
     hierarchy_dependents: Vec<usize>,
+    hierarchy_answer_needed: bool,
 }
 
 /// One demanded reference a live task of this scheduler is evaluating now.
@@ -189,14 +570,33 @@ struct DemandedReferenceOwner {
     bypass: HashSet<usize>,
 }
 
-struct Relation {
+struct Relation<'source> {
     endpoint: EndpointSignature,
     dependencies: Vec<usize>,
     pending: usize,
     waiters: Vec<usize>,
     closed: bool,
+    member_selection: Option<Box<MemberSelectionFrame<'source>>>,
+    selected_members: Option<MemberSelection>,
+    completion: Option<ResolutionCompletion>,
+    /// Initial positioned receivers remain distinct from ancestor tasks.
+    prefix_count: usize,
+    /// Relations whose candidate reads this member phase awaits.
+    waits_on: Vec<usize>,
+    /// Other member phases waiting for this relation to close.
+    relation_waiters: Vec<usize>,
 }
 
+enum RelationAdmission {
+    Ready(usize),
+    Cancelled,
+    Unavailable {
+        endpoint: EndpointSignature,
+        reason: RootUnavailableReason,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Runnable {
     Task(usize),
     Relation(usize),
@@ -209,16 +609,17 @@ struct Scheduler<'a> {
     tasks: Vec<Task<'a>>,
     task_ids: HashMap<SemanticId, usize>,
     runnable: VecDeque<Runnable>,
-    relations: Vec<Relation>,
+    relations: Vec<Relation<'a>>,
     relation_ids: HashMap<EndpointSignature, usize>,
     /// The demanded references this scheduler's live tasks are evaluating.
     /// Bounded by the tasks, and dropped with the scheduler.
     claims: HashMap<SemanticId, DemandedReferenceOwner>,
     /// Placeholder reasons each closed relation retired for the lookups it
     /// continued, handed to a waiting task before its next poll.
-    closure_discharges: HashMap<EndpointSignature, BTreeSet<SemanticId>>,
+    closure_discharges: HashMap<EndpointSignature, ClosureDischarges>,
     evidence: CancellationEvidenceLedger,
     work: usize,
+    completed_prefix: usize,
 }
 
 impl<'a> Scheduler<'a> {
@@ -227,6 +628,7 @@ impl<'a> Scheduler<'a> {
         operation: &mut Resources<'_, 'a>,
         endpoint: EndpointSignature,
         reason: RootUnavailableReason,
+        root_seed_completions: Vec<(SemanticId, ResolutionCompletion)>,
     ) -> BatchOutcome {
         let cancellation = operation.session.cancellation;
         for task in &self.tasks {
@@ -257,6 +659,22 @@ impl<'a> Scheduler<'a> {
                 return self.cancelled(operation);
             }
         }
+        for relation in &self.relations {
+            if let Some(frame) = &relation.member_selection {
+                frame
+                    .evaluation
+                    .as_ref()
+                    .expect("member phase is between polls")
+                    .cancellation_reasons
+                    .include_retained_evidence(&mut self.evidence, cancellation, &mut self.work);
+                self.evidence
+                    .include(&frame.completion, cancellation, &mut self.work);
+            }
+            if let Some(selected) = &relation.selected_members {
+                self.evidence
+                    .include(&selected.completion, cancellation, &mut self.work);
+            }
+        }
         operation.include_hierarchy_cancellation_evidence(&mut self.evidence, &mut self.work);
         if cancellation.is_cancelled()
             || operation.session.resolution_stopped()
@@ -279,6 +697,7 @@ impl<'a> Scheduler<'a> {
             endpoint,
             reason,
             completion,
+            root_seed_completions,
         }
     }
 
@@ -315,6 +734,7 @@ impl<'a> Scheduler<'a> {
         let id = self.tasks.len();
         self.tasks.push(Task {
             root,
+            memo_key: None,
             frame: Some(DemandFactEvaluationTask::new(state)),
             answer: None,
             metrics: ResolutionBatchMetrics::default(),
@@ -325,10 +745,93 @@ impl<'a> Scheduler<'a> {
             dependents: Vec::new(),
             hierarchy_waits: Vec::new(),
             hierarchy_dependents: Vec::new(),
+            hierarchy_answer_needed: false,
         });
         assert!(self.task_ids.insert(root, id).is_none());
         self.runnable.push_back(Runnable::Task(id));
         Some(id)
+    }
+
+    /// Install a discovered endpoint once; both reference tasks and relation
+    /// member phases use the same prefix admission and completion ledger.
+    fn install_relation(
+        &mut self,
+        operation: &mut Resources<'_, 'a>,
+        endpoint: EndpointSignature,
+        discovery: RootDiscovery,
+    ) -> RelationAdmission {
+        let completion = match &discovery {
+            RootDiscovery::Ready(plan) => &plan.completion,
+            RootDiscovery::AlreadyReady { completion }
+            | RootDiscovery::Unavailable { completion, .. }
+            | RootDiscovery::Cancelled(completion) => completion,
+        };
+        self.evidence
+            .include(completion, operation.session.cancellation, &mut self.work);
+        if operation.session.cancellation.is_cancelled()
+            || operation.session.resolution_stopped()
+            || self.evidence.cancellation_observed()
+        {
+            return RelationAdmission::Cancelled;
+        }
+        let initial_completion = completion.clone();
+        let (prefixes, closed) = match discovery {
+            RootDiscovery::AlreadyReady { .. } => (Vec::new(), true),
+            RootDiscovery::Ready(plan) => (plan.prefixes, false),
+            RootDiscovery::Unavailable { reason, .. } => {
+                return RelationAdmission::Unavailable { endpoint, reason };
+            }
+            RootDiscovery::Cancelled(_) => return RelationAdmission::Cancelled,
+        };
+        let mut dependencies = Vec::new();
+        let mut seen = HashSet::default();
+        for prefix in prefixes {
+            if !operation.session.charge_scope_steps(1) {
+                return RelationAdmission::Cancelled;
+            }
+            let Some(dependency) = self.admit(operation, prefix, None) else {
+                return RelationAdmission::Cancelled;
+            };
+            if seen.insert(dependency) {
+                dependencies.push(dependency);
+            }
+        }
+        let id = self.relations.len();
+        assert!(self.relation_ids.insert(endpoint.clone(), id).is_none());
+        let mut pending = 0;
+        for &dependency in &dependencies {
+            if self.tasks[dependency].answer.is_none() {
+                self.tasks[dependency].dependents.push(id);
+                pending += 1;
+            }
+        }
+        self.relations.push(Relation {
+            endpoint,
+            prefix_count: dependencies.len(),
+            dependencies,
+            pending,
+            waiters: Vec::new(),
+            closed,
+            member_selection: None,
+            selected_members: None,
+            completion: closed.then_some(initial_completion),
+            waits_on: Vec::new(),
+            relation_waiters: Vec::new(),
+        });
+        if !closed && pending == 0 {
+            self.runnable.push_back(Runnable::Relation(id));
+        }
+        RelationAdmission::Ready(id)
+    }
+
+    fn retain_completed_roots(&self, operation: &Resources<'_, '_>) {
+        if let Some((memo, _, _)) = operation.completed_roots {
+            for task in &self.tasks {
+                if let (Some(key), Some(answer)) = (&task.memo_key, &task.answer) {
+                    memo.retain(key, answer, operation.session);
+                }
+            }
+        }
     }
 
     /// One resolution per input root, in input order.
@@ -396,6 +899,32 @@ impl<'a> Scheduler<'a> {
                 &mut self.work,
             );
         }
+        for relation in &mut self.relations {
+            if let Some(frame) = relation.member_selection.take() {
+                let state = frame
+                    .evaluation
+                    .as_ref()
+                    .expect("member phase is between polls");
+                state.cancellation_reasons.include_retained_evidence(
+                    &mut self.evidence,
+                    operation.session.cancellation,
+                    &mut self.work,
+                );
+                self.evidence.include(
+                    &frame.completion,
+                    operation.session.cancellation,
+                    &mut self.work,
+                );
+                frame.cancel(operation);
+            }
+            if let Some(selected) = &relation.selected_members {
+                self.evidence.include(
+                    &selected.completion,
+                    operation.session.cancellation,
+                    &mut self.work,
+                );
+            }
+        }
         operation.include_hierarchy_cancellation_evidence(&mut self.evidence, &mut self.work);
         let (completion, _) =
             self.evidence
@@ -444,10 +973,12 @@ pub(super) fn resolve_with_metrics<'a>(
                 endpoint,
                 reason,
                 completion,
+                root_seed_completions,
             } => Outcome::Unavailable {
                 endpoint,
                 reason,
                 completion,
+                root_seed_completions,
             },
             BatchOutcome::Unsupported(unsupported) => Outcome::Unsupported(unsupported),
         },
@@ -513,6 +1044,7 @@ fn new_scheduler<'a>() -> Scheduler<'a> {
         closure_discharges: HashMap::default(),
         evidence: CancellationEvidenceLedger::default(),
         work: 0,
+        completed_prefix: 0,
     }
 }
 
@@ -542,6 +1074,14 @@ fn resolve_admitted_batch<'a>(
     provider: &mut (impl RootProvider + ?Sized),
     metrics: &mut ResolutionBatchMetrics,
 ) -> StoreResult<BatchOutcome> {
+    let root_seed_completions = admitted
+        .iter()
+        .filter_map(|(root, seed)| {
+            let seed = seed.as_ref()?;
+            matches!(seed.completion(), ResolutionCompletion::Incomplete(_))
+                .then(|| (*root, seed.completion().clone()))
+        })
+        .collect::<Vec<_>>();
     let mut root_tasks = Vec::with_capacity(admitted.len());
     for (root, seed) in admitted {
         let Some(id) = scheduler.admit(operation, root, seed) else {
@@ -552,7 +1092,40 @@ fn resolve_admitted_batch<'a>(
     // Roots are admitted before anything else, so a task id below this count is
     // a root of this batch and every id at or above it is a shared prefix.
     let root_task_count = scheduler.tasks.len();
-    let mut answered_roots = 0_usize;
+    match drive_scheduler(
+        operation,
+        scheduler,
+        provider,
+        root_seed_completions,
+        |scheduler| scheduler.completed_prefix >= root_task_count,
+    )? {
+        SchedulerOutcome::Ready(mut scheduler) => {
+            scheduler.retain_completed_roots(operation);
+            Ok(BatchOutcome::Ready(scheduler.take_root_resolutions(
+                &root_tasks,
+                root_task_count,
+                metrics,
+            )))
+        }
+        SchedulerOutcome::Terminal(outcome) => Ok(outcome),
+    }
+}
+
+enum SchedulerOutcome<'source> {
+    Ready(Box<Scheduler<'source>>),
+    Terminal(BatchOutcome),
+}
+
+/// Drive reference tasks and relation member selection in one dependency graph.
+/// The completion predicate chooses the caller's requested roots or endpoint;
+/// both use the same admission, cancellation and cycle handling.
+fn drive_scheduler<'source>(
+    operation: &mut Resources<'_, 'source>,
+    mut scheduler: Scheduler<'source>,
+    provider: &mut (impl RootProvider + ?Sized),
+    root_seed_completions: Vec<(SemanticId, ResolutionCompletion)>,
+    is_complete: impl Fn(&Scheduler<'source>) -> bool,
+) -> StoreResult<SchedulerOutcome<'source>> {
     // The round: the leading run of runnable tasks, drained together so one
     // statement per keyed reader can carry all of their keys. Draining a FIFO
     // prefix and polling it in order, pushing every new runnable to the back,
@@ -564,16 +1137,10 @@ fn resolve_admitted_batch<'a>(
             || operation.session.resolution_stopped()
             || scheduler.evidence.cancellation_observed()
         {
-            return Ok(scheduler.cancelled(operation));
+            return Ok(SchedulerOutcome::Terminal(scheduler.cancelled(operation)));
         }
-        if answered_roots == root_task_count {
-            // Selected authority is still finalized by the enclosing owner;
-            // these are internal completed tasks, not public native results.
-            return Ok(BatchOutcome::Ready(scheduler.take_root_resolutions(
-                &root_tasks,
-                root_task_count,
-                metrics,
-            )));
+        if is_complete(&scheduler) {
+            return Ok(SchedulerOutcome::Ready(Box::new(scheduler)));
         }
         round.clear();
         while let Some(&Runnable::Task(id)) = scheduler.runnable.front() {
@@ -582,25 +1149,19 @@ fn resolve_admitted_batch<'a>(
         }
         if !round.is_empty() {
             merge_round_reads(operation, &mut scheduler, &round)?;
-            match poll_round(
-                operation,
-                &mut scheduler,
-                &round,
-                provider,
-                root_task_count,
-                &mut answered_roots,
-            )? {
+            match poll_round(operation, &mut scheduler, &round, provider, &is_complete)? {
                 RoundOutcome::Continue => continue,
-                RoundOutcome::Ready => {
-                    return Ok(BatchOutcome::Ready(scheduler.take_root_resolutions(
-                        &root_tasks,
-                        root_task_count,
-                        metrics,
-                    )));
+                RoundOutcome::Ready => return Ok(SchedulerOutcome::Ready(Box::new(scheduler))),
+                RoundOutcome::Cancelled => {
+                    return Ok(SchedulerOutcome::Terminal(scheduler.cancelled(operation)));
                 }
-                RoundOutcome::Cancelled => return Ok(scheduler.cancelled(operation)),
                 RoundOutcome::Unavailable { endpoint, reason } => {
-                    return Ok(scheduler.unavailable(operation, endpoint, reason));
+                    return Ok(SchedulerOutcome::Terminal(scheduler.unavailable(
+                        operation,
+                        endpoint,
+                        reason,
+                        root_seed_completions,
+                    )));
                 }
             }
         }
@@ -610,22 +1171,43 @@ fn resolve_admitted_batch<'a>(
             // root answer and no relation is published; the outcome names the
             // roots the cycle left unanswered so the caller can report exactly
             // those sites as incomplete.
-            let pending_roots = scheduler
+            let mut pending_roots = scheduler
                 .tasks
                 .iter()
                 .filter(|task| task.answer.is_none())
                 .map(|task| task.root)
                 .collect::<Vec<_>>();
+            // A member-selection cycle can leave all positioned receivers
+            // terminal while only relation-to-relation edges remain blocked.
+            // Name those selections' source references instead of assuming a
+            // live ordinary reference task must still exist.
+            for relation in &scheduler.relations {
+                if let Some(frame) = &relation.member_selection {
+                    let reference = frame
+                        .evaluation
+                        .as_ref()
+                        .expect("member phase is between polls")
+                        .root;
+                    if !pending_roots.contains(&reference) {
+                        pending_roots.push(reference);
+                    }
+                }
+            }
             assert!(
                 !pending_roots.is_empty(),
                 "a drained scheduler with no pending root has an answer"
             );
-            let completion = ResolutionCompletion::incomplete(
+            let mut completion = ResolutionCompletion::incomplete(
                 pending_roots
                     .iter()
                     .map(|&root| ResolutionIncompleteReason::CyclicPrefixDependency(root)),
             );
-            return Ok(BatchOutcome::Unsupported(
+            for relation in &scheduler.relations {
+                if let Some(frame) = &relation.member_selection {
+                    completion = completion.combine(&frame.completion);
+                }
+            }
+            return Ok(SchedulerOutcome::Terminal(BatchOutcome::Unsupported(
                 Unsupported::CyclicPrefixDependency {
                     pending_roots,
                     pending_endpoints: scheduler
@@ -636,10 +1218,10 @@ fn resolve_admitted_batch<'a>(
                         .collect(),
                     completion,
                 },
-            ));
+            )));
         };
         if !operation.session.charge_scope_steps(1) {
-            return Ok(scheduler.cancelled(operation));
+            return Ok(SchedulerOutcome::Terminal(scheduler.cancelled(operation)));
         }
         // The round above drained every leading runnable task, so the only
         // runnable this loop still takes one at a time is a relation.
@@ -648,32 +1230,180 @@ fn resolve_admitted_batch<'a>(
         };
         // Only the final dependency completion queues this work. No
         // whole-arena rescans occur between evaluator polls.
-        let relation = &mut scheduler.relations[id];
-        assert!(!relation.closed && relation.pending == 0);
-        if !operation
-            .session
-            .charge_scope_steps(relation.dependencies.len())
+        assert!(!scheduler.relations[id].closed && scheduler.relations[id].pending == 0);
+        let endpoint = scheduler.relations[id].endpoint.clone();
+        if scheduler.relations[id].member_selection.is_none()
+            && scheduler.relations[id].selected_members.is_none()
         {
-            return Ok(scheduler.cancelled(operation));
+            let relation = &scheduler.relations[id];
+            let inputs = relation.dependencies[..relation.prefix_count]
+                .iter()
+                .map(|&id| {
+                    (
+                        scheduler.tasks[id].root,
+                        scheduler.tasks[id]
+                            .answer
+                            .as_ref()
+                            .expect("positioned input is terminal"),
+                    )
+                })
+                .collect::<Vec<_>>();
+            if let Some(request) = provider.member_selection(&endpoint, &inputs)? {
+                let Some(frame) = MemberSelectionFrame::new(operation, request) else {
+                    return Ok(SchedulerOutcome::Terminal(scheduler.cancelled(operation)));
+                };
+                scheduler.relations[id].member_selection = Some(Box::new(frame));
+            }
         }
-        let inputs = relation
-            .dependencies
+        if let Some(mut frame) = scheduler.relations[id].member_selection.take() {
+            let polled = frame.poll(operation, &mut |requests| {
+                Ok(
+                    if requests.iter().all(|request| {
+                        scheduler
+                            .relation_ids
+                            .get(request.endpoint())
+                            .is_some_and(|&id| scheduler.relations[id].closed)
+                    }) {
+                        DemandForwardReadiness::Ready
+                    } else {
+                        DemandForwardReadiness::AwaitingDependencies
+                    },
+                )
+            })?;
+            scheduler.relations[id].member_selection = Some(frame);
+            match polled {
+                MemberSelectionPoll::Continue => {
+                    scheduler.runnable.push_back(Runnable::Relation(id));
+                    continue;
+                }
+                MemberSelectionPoll::Cancelled => {
+                    return Ok(SchedulerOutcome::Terminal(scheduler.cancelled(operation)));
+                }
+                MemberSelectionPoll::Ready(selection) => {
+                    let frame = scheduler.relations[id]
+                        .member_selection
+                        .take()
+                        .expect("completed member phase");
+                    frame
+                        .evaluation
+                        .as_ref()
+                        .expect("member phase is between polls")
+                        .cancellation_reasons
+                        .include_retained_evidence(
+                            &mut scheduler.evidence,
+                            cancellation,
+                            &mut scheduler.work,
+                        );
+                    scheduler.relations[id].selected_members = Some(selection);
+                }
+                MemberSelectionPoll::AwaitingHierarchyReferences(references) => {
+                    assert!(!references.is_empty());
+                    for reference in references {
+                        let Some(dependency) = scheduler.admit(operation, reference, None) else {
+                            return Ok(SchedulerOutcome::Terminal(scheduler.cancelled(operation)));
+                        };
+                        if let Some(answer) = &scheduler.tasks[dependency].answer {
+                            let mut evaluation = FactEvaluation::new(
+                                operation.session,
+                                operation.hierarchy,
+                                reference,
+                            );
+                            if !evaluation
+                                .publish_qualified_hierarchy_reference(reference, answer)?
+                            {
+                                return Ok(SchedulerOutcome::Terminal(
+                                    scheduler.cancelled(operation),
+                                ));
+                            }
+                        } else {
+                            scheduler.tasks[dependency].hierarchy_answer_needed = true;
+                            if !scheduler.relations[id].dependencies.contains(&dependency) {
+                                scheduler.relations[id].dependencies.push(dependency);
+                                scheduler.tasks[dependency].dependents.push(id);
+                                scheduler.relations[id].pending += 1;
+                            }
+                        }
+                    }
+                    if scheduler.relations[id].pending == 0 {
+                        scheduler.runnable.push_back(Runnable::Relation(id));
+                    }
+                    continue;
+                }
+                MemberSelectionPoll::AwaitingDependencies(endpoints) => {
+                    let mut seen = HashSet::default();
+                    for endpoint in endpoints {
+                        if !operation.session.charge_scope_steps(1) {
+                            return Ok(SchedulerOutcome::Terminal(scheduler.cancelled(operation)));
+                        }
+                        let dependency = if let Some(&dependency) =
+                            scheduler.relation_ids.get(&endpoint)
+                        {
+                            dependency
+                        } else {
+                            let discovery = provider.discover(&endpoint)?;
+                            match scheduler.install_relation(operation, endpoint, discovery) {
+                                RelationAdmission::Ready(id) => id,
+                                RelationAdmission::Cancelled => {
+                                    return Ok(SchedulerOutcome::Terminal(
+                                        scheduler.cancelled(operation),
+                                    ));
+                                }
+                                RelationAdmission::Unavailable { endpoint, reason } => {
+                                    return Ok(SchedulerOutcome::Terminal(scheduler.unavailable(
+                                        operation,
+                                        endpoint,
+                                        reason,
+                                        root_seed_completions,
+                                    )));
+                                }
+                            }
+                        };
+                        if !scheduler.relations[dependency].closed && seen.insert(dependency) {
+                            scheduler.relations[dependency].relation_waiters.push(id);
+                            scheduler.relations[id].waits_on.push(dependency);
+                            scheduler.relations[id].pending += 1;
+                        }
+                    }
+                    if scheduler.relations[id].pending == 0 {
+                        scheduler.runnable.push_back(Runnable::Relation(id));
+                    }
+                    continue;
+                }
+            }
+        }
+        if cancellation.is_cancelled()
+            || operation.session.resolution_stopped()
+            || scheduler.evidence.cancellation_observed()
+        {
+            return Ok(SchedulerOutcome::Terminal(scheduler.cancelled(operation)));
+        }
+        let relation = &mut scheduler.relations[id];
+        if !operation.session.charge_scope_steps(relation.prefix_count) {
+            return Ok(SchedulerOutcome::Terminal(scheduler.cancelled(operation)));
+        }
+        let inputs = relation.dependencies[..relation.prefix_count]
             .iter()
             .map(|&id| {
-                let task = &scheduler.tasks[id];
                 (
-                    task.root,
-                    task.answer.as_ref().expect("dependency is terminal"),
+                    scheduler.tasks[id].root,
+                    scheduler.tasks[id]
+                        .answer
+                        .as_ref()
+                        .expect("positioned input is terminal"),
                 )
             })
             .collect::<Vec<_>>();
-        let completion = provider.close(&relation.endpoint, &inputs)?;
+        let completion = if let Some(selection) = &relation.selected_members {
+            provider.close_selected_members(&endpoint, &inputs, selection)?
+        } else {
+            provider.close(&endpoint, &inputs)?
+        };
         if let Some(retired) = provider.resolved_closure_discharges(&relation.endpoint) {
             scheduler
                 .closure_discharges
                 .entry(relation.endpoint.clone())
                 .or_default()
-                .extend(retired);
+                .merge(retired);
         }
         scheduler
             .evidence
@@ -682,12 +1412,14 @@ fn resolve_admitted_batch<'a>(
             || operation.session.resolution_stopped()
             || scheduler.evidence.cancellation_observed()
         {
-            return Ok(scheduler.cancelled(operation));
+            return Ok(SchedulerOutcome::Terminal(scheduler.cancelled(operation)));
         }
+        relation.completion = Some(completion);
         relation.closed = true;
+        let relation_waiters = std::mem::take(&mut relation.relation_waiters);
         for waiter in std::mem::take(&mut relation.waiters) {
             if !operation.session.charge_scope_steps(1) {
-                return Ok(scheduler.cancelled(operation));
+                return Ok(SchedulerOutcome::Terminal(scheduler.cancelled(operation)));
             }
             let task = &mut scheduler.tasks[waiter];
             assert!(task.waiting > 0);
@@ -695,6 +1427,18 @@ fn resolve_admitted_batch<'a>(
             if task.waiting == 0 {
                 task.waits_on.clear();
                 scheduler.runnable.push_back(Runnable::Task(waiter));
+            }
+        }
+        for waiter in relation_waiters {
+            if !operation.session.charge_scope_steps(1) {
+                return Ok(SchedulerOutcome::Terminal(scheduler.cancelled(operation)));
+            }
+            let relation = &mut scheduler.relations[waiter];
+            assert!(relation.pending > 0);
+            relation.pending -= 1;
+            if relation.pending == 0 {
+                relation.waits_on.clear();
+                scheduler.runnable.push_back(Runnable::Relation(waiter));
             }
         }
     }
@@ -727,9 +1471,9 @@ fn poll_round<'a>(
     scheduler: &mut Scheduler<'a>,
     round: &[usize],
     provider: &mut (impl RootProvider + ?Sized),
-    root_task_count: usize,
-    answered_roots: &mut usize,
+    is_complete: &impl Fn(&Scheduler<'a>) -> bool,
 ) -> StoreResult<RoundOutcome> {
+    let mut awaiting_dependencies = Vec::new();
     for &id in round {
         let cancellation = operation.session.cancellation;
         if cancellation.is_cancelled()
@@ -738,7 +1482,7 @@ fn poll_round<'a>(
         {
             return Ok(RoundOutcome::Cancelled);
         }
-        if *answered_roots == root_task_count {
+        if is_complete(scheduler) {
             return Ok(RoundOutcome::Ready);
         }
         if !operation.session.charge_scope_steps(1) {
@@ -750,7 +1494,31 @@ fn poll_round<'a>(
             .as_mut()
             .expect("runnable task is live")
             .inject_closure_discharges(&scheduler.closure_discharges);
-        let polled = {
+        let cached = if let Some((memo, access, context)) = operation.completed_roots {
+            let task = &mut scheduler.tasks[id];
+            let evaluation = task
+                .frame
+                .as_ref()
+                .expect("runnable task is live")
+                .evaluation
+                .as_ref()
+                .expect("task is between polls");
+            if task.memo_key.is_none() {
+                task.memo_key = evaluation.root_seed.as_ref().and_then(|seed| {
+                    RootMemoKey::new(operation.session, task.root, seed, access, context)
+                });
+                task.memo_key
+                    .as_ref()
+                    .and_then(|key| memo.lookup(key, operation.session))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let polled = if let Some(answer) = cached {
+            Ok(DemandFactEvaluationPoll::Ready(Box::new(answer)))
+        } else {
             let relations = &scheduler.relations;
             let relation_ids = &scheduler.relation_ids;
             let claims = &mut scheduler.claims;
@@ -843,19 +1611,26 @@ fn poll_round<'a>(
                 // work. The cancellation drain must never cancel it twice.
                 scheduler.tasks[id].frame = None;
                 scheduler.tasks[id].answer = Some(*answer);
-                if !cancelled && !scheduler.tasks[id].hierarchy_dependents.is_empty() {
+                if !cancelled
+                    && (scheduler.tasks[id].hierarchy_answer_needed
+                        || !scheduler.tasks[id].hierarchy_dependents.is_empty())
+                {
                     let root = scheduler.tasks[id].root;
                     let mut evaluation =
                         FactEvaluation::new(operation.session, operation.hierarchy, root);
                     if !evaluation.publish_qualified_hierarchy_reference(
                         root,
                         scheduler.tasks[id].answer.as_ref().unwrap(),
-                    ) {
+                    )? {
                         return Ok(RoundOutcome::Cancelled);
                     }
                 }
-                if id < root_task_count {
-                    *answered_roots += 1;
+                while scheduler
+                    .tasks
+                    .get(scheduler.completed_prefix)
+                    .is_some_and(|task| task.answer.is_some())
+                {
+                    scheduler.completed_prefix += 1;
                 }
                 if cancelled {
                     return Ok(RoundOutcome::Cancelled);
@@ -880,6 +1655,7 @@ fn poll_round<'a>(
                     assert!(relation.pending > 0);
                     relation.pending -= 1;
                     if relation.pending == 0 {
+                        relation.waits_on.clear();
                         scheduler.runnable.push_back(Runnable::Relation(dependent));
                     }
                 }
@@ -895,7 +1671,7 @@ fn poll_round<'a>(
                     if let Some(answer) = &scheduler.tasks[dependency].answer {
                         let mut evaluation =
                             FactEvaluation::new(operation.session, operation.hierarchy, reference);
-                        if !evaluation.publish_qualified_hierarchy_reference(reference, answer) {
+                        if !evaluation.publish_qualified_hierarchy_reference(reference, answer)? {
                             return Ok(RoundOutcome::Cancelled);
                         }
                     } else {
@@ -948,113 +1724,106 @@ fn poll_round<'a>(
                     !endpoints.is_empty(),
                     "pending task retains exact endpoint requests"
                 );
+                if provider.supports_batched_discoveries() {
+                    awaiting_dependencies.push((id, endpoints));
+                    continue;
+                }
                 let mut waiting = HashSet::default();
                 for endpoint in endpoints {
                     if !operation.session.charge_scope_steps(1) {
                         return Ok(RoundOutcome::Cancelled);
                     }
-                    let relation_id = if let Some(&id) = scheduler.relation_ids.get(&endpoint) {
-                        id
-                    } else {
-                        if !operation.session.charge_scope_steps(1) {
-                            return Ok(RoundOutcome::Cancelled);
-                        }
-                        let discovery = provider.discover(&endpoint)?;
-                        let completion = match &discovery {
-                            RootDiscovery::Ready(plan) => &plan.completion,
-                            RootDiscovery::AlreadyReady { completion }
-                            | RootDiscovery::Unavailable { completion, .. }
-                            | RootDiscovery::Cancelled(completion) => completion,
-                        };
-                        scheduler
-                            .evidence
-                            .include(completion, cancellation, &mut scheduler.work);
-                        if cancellation.is_cancelled()
-                            || operation.session.resolution_stopped()
-                            || scheduler.evidence.cancellation_observed()
-                        {
-                            return Ok(RoundOutcome::Cancelled);
-                        }
-                        let plan = match discovery {
-                            RootDiscovery::AlreadyReady { .. } => {
-                                let relation_id = scheduler.relations.len();
-                                assert!(
-                                    scheduler
-                                        .relation_ids
-                                        .insert(endpoint.clone(), relation_id)
-                                        .is_none()
-                                );
-                                scheduler.relations.push(Relation {
-                                    endpoint,
-                                    dependencies: Vec::new(),
-                                    pending: 0,
-                                    waiters: Vec::new(),
-                                    closed: true,
-                                });
-                                continue;
-                            }
-                            RootDiscovery::Ready(plan) => plan,
-                            RootDiscovery::Unavailable { reason, .. } => {
-                                return Ok(RoundOutcome::Unavailable { endpoint, reason });
-                            }
-                            RootDiscovery::Cancelled(_) => {
-                                return Ok(RoundOutcome::Cancelled);
-                            }
-                        };
-                        let mut dependencies = Vec::new();
-                        let mut seen_dependencies = HashSet::default();
-                        for prefix in plan.prefixes {
+                    let relation_id =
+                        if let Some(&relation_id) = scheduler.relation_ids.get(&endpoint) {
+                            relation_id
+                        } else {
                             if !operation.session.charge_scope_steps(1) {
                                 return Ok(RoundOutcome::Cancelled);
                             }
-                            let Some(dependency) = scheduler.admit(operation, prefix, None) else {
-                                return Ok(RoundOutcome::Cancelled);
-                            };
-                            if seen_dependencies.insert(dependency) {
-                                dependencies.push(dependency);
+                            let discovery = provider.discover(&endpoint)?;
+                            match scheduler.install_relation(operation, endpoint, discovery) {
+                                RelationAdmission::Ready(id) => id,
+                                RelationAdmission::Cancelled => return Ok(RoundOutcome::Cancelled),
+                                RelationAdmission::Unavailable { endpoint, reason } => {
+                                    return Ok(RoundOutcome::Unavailable { endpoint, reason });
+                                }
                             }
-                        }
-                        let relation_id = scheduler.relations.len();
-                        assert!(
-                            scheduler
-                                .relation_ids
-                                .insert(endpoint.clone(), relation_id)
-                                .is_none()
-                        );
-                        let mut pending = 0;
-                        for &dependency in &dependencies {
-                            if scheduler.tasks[dependency].answer.is_none() {
-                                scheduler.tasks[dependency].dependents.push(relation_id);
-                                pending += 1;
-                            }
-                        }
-                        scheduler.relations.push(Relation {
-                            endpoint,
-                            dependencies,
-                            pending,
-                            waiters: Vec::new(),
-                            closed: false,
-                        });
-                        if pending == 0 {
-                            scheduler
-                                .runnable
-                                .push_back(Runnable::Relation(relation_id));
-                        }
-                        relation_id
-                    };
+                        };
                     if !scheduler.relations[relation_id].closed && waiting.insert(relation_id) {
                         scheduler.relations[relation_id].waiters.push(id);
                         scheduler.tasks[id].waiting += 1;
                         scheduler.tasks[id].waits_on.push(relation_id);
                     }
                 }
-                // The readiness gate covered the complete lexical frontier.
-                // Discovery may certify every endpoint as already served by
-                // the base source, leaving no selected relation to await.
                 if scheduler.tasks[id].waiting == 0 {
                     scheduler.runnable.push_back(Runnable::Task(id));
                 }
             }
+        }
+    }
+    if awaiting_dependencies.is_empty() {
+        return Ok(RoundOutcome::Continue);
+    }
+
+    // Discover all new endpoints from this poll round together. Languages
+    // with a keyed source can then batch those reads per blob while the
+    // scheduler still installs relations in task and request order below.
+    let mut new_endpoints = Vec::new();
+    let mut seen_endpoints = HashSet::default();
+    for (_, endpoints) in &awaiting_dependencies {
+        for endpoint in endpoints {
+            if !operation.session.charge_scope_steps(1) {
+                return Ok(RoundOutcome::Cancelled);
+            }
+            if !scheduler.relation_ids.contains_key(endpoint)
+                && seen_endpoints.insert(endpoint.clone())
+            {
+                if !operation.session.charge_scope_steps(1) {
+                    return Ok(RoundOutcome::Cancelled);
+                }
+                new_endpoints.push(endpoint.clone());
+            }
+        }
+    }
+    let discovered = provider.discover_many(&new_endpoints)?;
+    assert_eq!(
+        discovered.len(),
+        new_endpoints.len(),
+        "batched root discovery returns one result per endpoint"
+    );
+    let mut discovered = new_endpoints
+        .into_iter()
+        .zip(discovered)
+        .collect::<HashMap<_, _>>();
+
+    for (id, endpoints) in awaiting_dependencies {
+        let mut waiting = HashSet::default();
+        for endpoint in endpoints {
+            let relation_id = if let Some(&relation_id) = scheduler.relation_ids.get(&endpoint) {
+                relation_id
+            } else {
+                let discovery = discovered
+                    .remove(&endpoint)
+                    .expect("every new pending endpoint was batch-discovered");
+                match scheduler.install_relation(operation, endpoint, discovery) {
+                    RelationAdmission::Ready(id) => id,
+                    RelationAdmission::Cancelled => return Ok(RoundOutcome::Cancelled),
+                    RelationAdmission::Unavailable { endpoint, reason } => {
+                        return Ok(RoundOutcome::Unavailable { endpoint, reason });
+                    }
+                }
+            };
+            if !scheduler.relations[relation_id].closed && waiting.insert(relation_id) {
+                scheduler.relations[relation_id].waiters.push(id);
+                scheduler.tasks[id].waiting += 1;
+                scheduler.tasks[id].waits_on.push(relation_id);
+            }
+        }
+        // The readiness gate covered the complete lexical frontier.
+        // Discovery may certify every endpoint as already served by the base
+        // source, leaving no selected relation to await.
+        if scheduler.tasks[id].waiting == 0 {
+            scheduler.runnable.push_back(Runnable::Task(id));
         }
     }
     Ok(RoundOutcome::Continue)
@@ -1104,34 +1873,45 @@ fn demanded_reference_wait_closes_a_cycle(
     owner: usize,
 ) -> bool {
     let mut seen = HashSet::default();
-    let mut stack = vec![owner];
-    while let Some(task) = stack.pop() {
-        if task == waiter {
+    let mut stack = vec![Runnable::Task(owner)];
+    while let Some(node) = stack.pop() {
+        if node == Runnable::Task(waiter) {
             return true;
         }
-        if !seen.insert(task) {
+        if !seen.insert(node) {
             continue;
         }
-        for &relation in &scheduler.tasks[task].waits_on {
-            let relation = &scheduler.relations[relation];
-            if relation.closed {
-                continue;
-            }
-            for &dependency in &relation.dependencies {
-                if scheduler.tasks[dependency].answer.is_none() {
-                    stack.push(dependency);
+        match node {
+            Runnable::Task(task) => {
+                stack.extend(
+                    scheduler.tasks[task]
+                        .waits_on
+                        .iter()
+                        .copied()
+                        .map(Runnable::Relation),
+                );
+                for &dependency in &scheduler.tasks[task].hierarchy_waits {
+                    if scheduler.tasks[dependency].answer.is_none() {
+                        stack.push(Runnable::Task(dependency));
+                    }
+                }
+                if let Some(reference) = scheduler.tasks[task].claim_wait
+                    && let Some(claim) = scheduler.claims.get(&reference)
+                {
+                    stack.push(Runnable::Task(claim.owner));
                 }
             }
-        }
-        for &dependency in &scheduler.tasks[task].hierarchy_waits {
-            if scheduler.tasks[dependency].answer.is_none() {
-                stack.push(dependency);
+            Runnable::Relation(relation) => {
+                let relation = &scheduler.relations[relation];
+                if !relation.closed {
+                    stack.extend(relation.waits_on.iter().copied().map(Runnable::Relation));
+                    for &dependency in &relation.dependencies {
+                        if scheduler.tasks[dependency].answer.is_none() {
+                            stack.push(Runnable::Task(dependency));
+                        }
+                    }
+                }
             }
-        }
-        if let Some(reference) = scheduler.tasks[task].claim_wait
-            && let Some(claim) = scheduler.claims.get(&reference)
-        {
-            stack.push(claim.owner);
         }
     }
     false
@@ -1304,18 +2084,7 @@ fn read_root_seeds<'a>(
             .include_reason(ResolutionIncompleteReason::Cancelled);
         return Ok(None);
     }
-    if rows.len() != queries.len() {
-        return Err(StoreError::new(format!(
-            "demand batch seed read returned mismatched rows: rows={rows:?}, queries={queries:?}"
-        )));
-    }
-    for (ordinal, row) in rows.iter().enumerate() {
-        if row.request_ordinal() != ordinal || row.query() != queries[ordinal] {
-            return Err(StoreError::new(format!(
-                "demand batch seed row at ordinal {ordinal} disagrees with its request: rows={rows:?}, queries={queries:?}"
-            )));
-        }
-    }
+    super::validate_reference_seed_rows(&rows, &queries, "demand batch seed read")?;
     let mut seeds = HashMap::default();
     for row in rows.into_vec() {
         let reference = row.query().reference();
@@ -1375,19 +2144,109 @@ pub(super) fn prepare_forward(
             }
         }
     }
-    let completion = provider.close(
-        endpoint,
-        &answers
-            .iter()
-            .map(|(root, answer)| (*root, answer))
-            .collect::<Vec<_>>(),
-    )?;
+    let inputs = answers
+        .iter()
+        .map(|(root, answer)| (*root, answer))
+        .collect::<Vec<_>>();
+    let completion = if let Some(request) = provider.member_selection(endpoint, &inputs)? {
+        return prepare_selected_member_relation(
+            resources,
+            provider,
+            endpoint,
+            answers,
+            plan.completion,
+            request,
+        );
+    } else {
+        provider.close(endpoint, &inputs)?
+    };
     if resources.session.cancellation.is_cancelled() || resources.session.resolution_stopped() {
         return Ok(EndpointPreparation::Incomplete(completion.combine(
             &ResolutionCompletion::incomplete([ResolutionIncompleteReason::Cancelled]),
         )));
     }
     Ok(EndpointPreparation::Ready(completion))
+}
+
+/// Endpoint preparation has already exhausted its positioned receiver answers.
+/// Only a requested member selection creates a relation scheduler here; ordinary
+/// providers retain their previous prefix order, duplicates and close behavior.
+fn prepare_selected_member_relation(
+    resources: &mut Resources<'_, '_>,
+    provider: &mut (impl RootProvider + ?Sized),
+    endpoint: &EndpointSignature,
+    answers: Vec<(SemanticId, FactResolutionAnswer)>,
+    completion: ResolutionCompletion,
+    request: MemberSelectionRequest,
+) -> StoreResult<EndpointPreparation> {
+    let mut scheduler = new_scheduler();
+    for (_, answer) in &answers {
+        include_fact_answer_cancellation_evidence(
+            &mut scheduler.evidence,
+            answer,
+            resources.session.cancellation,
+            &mut scheduler.work,
+        );
+    }
+    let prefixes = answers.iter().map(|(root, _)| *root).collect::<Vec<_>>();
+    let discovery = RootDiscovery::Ready(RootPlan {
+        prefixes,
+        completion,
+    });
+    let relation = match scheduler.install_relation(resources, endpoint.clone(), discovery) {
+        RelationAdmission::Ready(id) => id,
+        RelationAdmission::Cancelled => {
+            let BatchOutcome::Cancelled(completion) = scheduler.cancelled(resources) else {
+                unreachable!("cancellation returns its ledger");
+            };
+            return Ok(EndpointPreparation::Incomplete(completion));
+        }
+        RelationAdmission::Unavailable { .. } => unreachable!("a discovered selection is ready"),
+    };
+    // These are immutable, terminal evaluations from this same Resources. The
+    // newly admitted frame has not performed reads and is replaced by its answer.
+    for (reference, answer) in answers {
+        let id = scheduler.task_ids[&reference];
+        scheduler.tasks[id].frame = None;
+        scheduler.tasks[id].answer = Some(answer);
+        scheduler.tasks[id].dependents.clear();
+    }
+    scheduler.completed_prefix = scheduler.tasks.len();
+    scheduler.runnable.clear();
+    scheduler.relations[relation].pending = 0;
+    let Some(frame) = MemberSelectionFrame::new(resources, request) else {
+        let BatchOutcome::Cancelled(completion) = scheduler.cancelled(resources) else {
+            unreachable!("cancellation returns its ledger");
+        };
+        return Ok(EndpointPreparation::Incomplete(completion));
+    };
+    scheduler.relations[relation].member_selection = Some(Box::new(frame));
+    scheduler.runnable.push_back(Runnable::Relation(relation));
+    match drive_scheduler(resources, scheduler, provider, Vec::new(), |scheduler| {
+        scheduler.relations[relation].closed
+    })? {
+        SchedulerOutcome::Ready(scheduler) => {
+            scheduler.retain_completed_roots(resources);
+            Ok(EndpointPreparation::Ready(
+                scheduler.relations[relation]
+                    .completion
+                    .clone()
+                    .expect("closed relation retains its completion"),
+            ))
+        }
+        SchedulerOutcome::Terminal(outcome) => {
+            let completion = match outcome {
+                BatchOutcome::Cancelled(completion)
+                | BatchOutcome::Unavailable { completion, .. }
+                | BatchOutcome::Unsupported(Unsupported::CyclicPrefixDependency {
+                    completion,
+                    ..
+                }) => completion,
+                BatchOutcome::Ready(_) => unreachable!("driver returns its scheduler on success"),
+            };
+            Ok(EndpointPreparation::Incomplete(completion))
+        }
+    }
 }
 
 /// Close only the forward relations an exact reverse endpoint admits.

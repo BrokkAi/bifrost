@@ -3,7 +3,6 @@ use super::{
     WorkspaceContentIdentity, WorkspaceGeneration,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -351,7 +350,7 @@ impl RunManifestBuilder {
             media_type: input.media_type,
             schema: input.schema,
             byte_length: input.bytes.len() as u64,
-            content_sha256: digest(input.bytes),
+            content_sha256: StableDigest::sha256(input.bytes),
             canonical_digest: input.canonical_digest,
             status: input.status,
             diagnostic_count: 0,
@@ -387,8 +386,7 @@ pub fn decode_canonical_run_manifest_json(
 ) -> Result<ExtensionRunManifest, ManifestError> {
     let value: ExtensionRunManifest = serde_json::from_slice(bytes)
         .map_err(|e| ManifestError::new("manifest", e.to_string().into_boxed_str()))?;
-    value.validate()?;
-    if canonical_bytes(&value)? != bytes {
+    if encode_run_manifest_json(&value)? != bytes {
         return Err(ManifestError::new("manifest", "input is not canonical"));
     }
     Ok(value)
@@ -398,8 +396,7 @@ pub fn decode_and_canonicalize_run_manifest_json(
 ) -> Result<(ExtensionRunManifest, Vec<u8>), ManifestError> {
     let value: ExtensionRunManifest = serde_json::from_slice(bytes)
         .map_err(|e| ManifestError::new("manifest", e.to_string().into_boxed_str()))?;
-    value.validate()?;
-    let encoded = canonical_bytes(&value)?;
+    let encoded = encode_run_manifest_json(&value)?;
     Ok((value, encoded))
 }
 
@@ -719,36 +716,13 @@ fn detect_cycles(values: &[RunComponentDescriptor]) -> Result<(), ManifestError>
 fn zero_digest() -> StableDigest {
     StableDigest::parse("0".repeat(64)).expect("valid digest")
 }
-fn digest(bytes: &[u8]) -> StableDigest {
-    StableDigest::parse(format!("{:x}", Sha256::digest(bytes))).expect("sha256")
-}
 fn manifest_digest(value: &ExtensionRunManifest) -> Result<StableDigest, ManifestError> {
     let mut copy = value.clone();
     copy.manifest_digest = zero_digest();
     copy.volatile = None;
-    Ok(digest(&canonical_bytes(&copy)?))
+    Ok(StableDigest::sha256(&canonical_bytes(&copy)?))
 }
 fn canonical_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, ManifestError> {
-    let mut value = serde_json::to_value(value)
-        .map_err(|e| ManifestError::new("json", e.to_string().into_boxed_str()))?;
-    sort_json(&mut value);
-    let mut bytes = serde_json::to_vec(&value)
-        .map_err(|e| ManifestError::new("json", e.to_string().into_boxed_str()))?;
-    bytes.push(b'\n');
-    Ok(bytes)
-}
-fn sort_json(value: &mut Value) {
-    match value {
-        Value::Object(map) => {
-            let old = std::mem::take(map);
-            let mut entries: Vec<_> = old.into_iter().collect();
-            entries.sort_by(|a, b| a.0.cmp(&b.0));
-            for (k, mut v) in entries {
-                sort_json(&mut v);
-                map.insert(k, v);
-            }
-        }
-        Value::Array(values) => values.iter_mut().for_each(sort_json),
-        _ => {}
-    }
+    super::codec::canonical_json_bytes(value)
+        .map_err(|e| ManifestError::new("json", e.to_string().into_boxed_str()))
 }

@@ -8,6 +8,7 @@ import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "@earendil-works/pi-coding-
 import {
   BIFROST_CAPABILITIES,
   DEFAULT_BIFROST_CAPABILITIES,
+  piToolName,
 } from "../extensions/bifrost-capabilities.ts";
 import {
   assertToolsHaveUniqueNames,
@@ -38,51 +39,73 @@ const FILE_TOOL_NAMES = toolNamesFor("files");
 const POLICY_TOOL_NAMES = toolNamesFor("policies");
 const TEXT_TOOL_NAMES = toolNamesFor("text");
 
-// Keep fake MCP advertisements independent from the Pi capability declarations so
-// a capability/toolset mismatch fails tests instead of teaching the fake server
-// the same incorrect contract.
-const SYMBOL_SERVER_TOOL_NAMES = [
-  "search_symbols",
-  "get_symbol_sources",
-  "get_summaries",
-  "scan_usages_by_location",
-  "get_definitions_by_location",
-  "get_type_by_location",
-  "rename_symbol",
-  "usage_graph",
-];
-const SLOPCOP_SERVER_TOOL_NAMES = [
-  "compute_cyclomatic_complexity",
-  "compute_cognitive_complexity",
-  "report_comment_density_for_code_unit",
-  "report_exception_handling_smells",
-  "report_comment_density_for_files",
-  "analyze_git_hotspots",
-  "report_test_assertion_smells",
-  "report_structural_clone_smells",
-  "report_long_method_and_god_object_smells",
-  "report_dead_code_and_unused_abstraction_smells",
-  "report_secret_like_code",
-  "analyze_diff",
-];
-const EXTENDED_SERVER_TOOL_NAMES = [
-  "query_code",
-  "get_symbol_locations",
-  "get_symbol_ancestors",
-  "most_relevant_files",
-  "list_policies",
-  "run_policy",
-  "search_git_commit_messages",
-  "get_git_log",
-  "get_commit_diff",
-];
-const SYMBOL_SELECTION_SERVER_TOOL_NAMES = [
-  ...SYMBOL_SERVER_TOOL_NAMES,
-  ...SLOPCOP_SERVER_TOOL_NAMES,
-];
+// Real membership of each --mcp toolset, mirrored from crates/bifrost-mcp/src:
+// symbol (mcp_core.rs symbol_tool_descriptors, line-number rendering, the
+// default), diff (mcp_diff.rs diff_tool_descriptors), extended
+// (mcp_extended.rs extended_tool_descriptors), slopcop (mcp_slopcop.rs
+// slopcop_tool_descriptors), and text (mcp_text.rs text_tool_descriptors).
+// The fake server advertises the toolsets named by the --mcp argument the
+// session passes, so a toolset mismatch in the capability declarations fails
+// here. Keep these lists equal to the Rust descriptors, not to the capability
+// declarations; otherwise the fake would agree with whatever the extension
+// requests.
+const SERVER_TOOL_NAMES_BY_TOOLSET = {
+  symbol: [
+    "search_symbols",
+    "get_symbol_sources",
+    "get_summaries",
+    "usage_graph",
+    "rename_symbol",
+    "get_type_by_location",
+    "get_declarations_by_location",
+    "get_definitions_by_location",
+    "scan_usages_by_location",
+  ],
+  diff: [
+    "analyze_diff",
+    "blast_radius",
+    "cyclomatic_complexity",
+    "missing_tests",
+    "score_diff",
+  ],
+  extended: [
+    "query_code",
+    "list_policies",
+    "run_policy",
+    "explain_policy",
+    "get_symbol_locations",
+    "get_symbol_ancestors",
+    "most_relevant_files",
+  ],
+  slopcop: [
+    "compute_cyclomatic_complexity",
+    "compute_cognitive_complexity",
+    "report_comment_density_for_code_unit",
+    "report_exception_handling_smells",
+    "report_comment_density_for_files",
+    "analyze_git_hotspots",
+    "report_test_assertion_smells",
+    "report_structural_clone_smells",
+    "report_long_method_and_god_object_smells",
+    "report_dead_code_and_unused_abstraction_smells",
+    "report_secret_like_code",
+  ],
+  text: ["get_file_contents", "search_file_contents", "find_files_containing"],
+};
+// The --mcp expression the extension sends for the Symbols capability alone.
+const SYMBOL_SELECTION_TOOLSET = "symbol|diff|slopcop";
+const SYMBOL_SELECTION_SERVER_TOOL_NAMES = serverToolNamesFor(SYMBOL_SELECTION_TOOLSET);
+
+function serverToolNamesFor(toolsetExpression) {
+  return toolsetExpression.split("|").flatMap((toolset) => {
+    const names = SERVER_TOOL_NAMES_BY_TOOLSET[toolset];
+    assert.ok(names, `fake server has no membership for toolset ${toolset}`);
+    return names;
+  });
+}
 
 function piNames(toolNames) {
-  return toolNames.map((name) => `bifrost_${name}`);
+  return toolNames.map(piToolName);
 }
 
 function fakePi(existingNames = [], initiallyActive = existingNames, acceptedNames) {
@@ -134,14 +157,18 @@ function symbolTool() {
   };
 }
 
+function serverTool(name, { searchSymbolsDescription } = {}) {
+  if (name !== "search_symbols") {
+    return stubTool(name);
+  }
+  const tool = symbolTool();
+  return searchSymbolsDescription ? { ...tool, description: searchSymbolsDescription } : tool;
+}
+
 function symbolTools({ searchSymbolsDescription } = {}) {
-  return SYMBOL_SELECTION_SERVER_TOOL_NAMES.map((name) => {
-    if (name !== "search_symbols") {
-      return stubTool(name);
-    }
-    const tool = symbolTool();
-    return searchSymbolsDescription ? { ...tool, description: searchSymbolsDescription } : tool;
-  });
+  return SYMBOL_SELECTION_SERVER_TOOL_NAMES.map((name) =>
+    serverTool(name, { searchSymbolsDescription })
+  );
 }
 
 function queryTools() {
@@ -154,21 +181,15 @@ function filesTools() {
 
 
 function textTools({ includeAll = true } = {}) {
-  const names = includeAll ? TEXT_TOOL_NAMES : TEXT_TOOL_NAMES.slice(0, 1);
-  return names.map((name) => stubTool(name));
-}
-
-function defaultServerTools() {
-  return [
-    ...symbolTools(),
-    ...EXTENDED_SERVER_TOOL_NAMES.map((name) => stubTool(name)),
-  ];
+  const names = includeAll ? serverToolNamesFor("text") : serverToolNamesFor("text").slice(0, 1);
+  return names.map((name) => serverTool(name));
 }
 
 function fakeClient(options = {}) {
   const calls = [];
   let closeCount = 0;
   let closeHandler = () => {};
+  let servedToolset;
   return {
     calls,
     get closeCount() {
@@ -176,7 +197,11 @@ function fakeClient(options = {}) {
     },
     connect: options.connect ?? (async () => {}),
     getInstructions: () => options.instructions,
-    listTools: options.listTools ?? (async () => symbolTools()),
+    serveToolset(toolset) {
+      servedToolset = toolset;
+    },
+    listTools: options.listTools
+      ?? (async () => serverToolNamesFor(servedToolset).map((name) => serverTool(name))),
     async callTool(name, args, requestOptions) {
       calls.push({ name, args, options: requestOptions });
       if (options.callTool) {
@@ -197,6 +222,12 @@ function fakeClient(options = {}) {
   };
 }
 
+function mcpToolsetOf(launchForClient) {
+  const flagIndex = launchForClient.args.indexOf("--mcp");
+  assert.notEqual(flagIndex, -1, "launch args must name the --mcp toolset");
+  return launchForClient.args[flagIndex + 1];
+}
+
 function dependencies(clients, errors = [], resolved = []) {
   let index = 0;
   return {
@@ -204,7 +235,11 @@ function dependencies(clients, errors = [], resolved = []) {
       resolved.push({ root, toolset });
       return { ...launch, cwd: root, args: ["--root", root, "--mcp", toolset] };
     },
-    createClient: () => clients[index++],
+    createClient(launchForClient) {
+      const client = clients[index++];
+      client.serveToolset(mcpToolsetOf(launchForClient));
+      return client;
+    },
     reportError: (error) => errors.push(error),
   };
 }
@@ -231,7 +266,7 @@ test("registers a namespaced tool and forwards the canonical MCP name", async ()
   assert.equal(await session.start("/workspace", ["symbols"]), true);
 
   assert.deepEqual(session.status(), connectedStatus("/workspace", ["symbols"], SYMBOL_TOOL_NAMES.length));
-  assert.deepEqual(resolved, [{ root: "/workspace", toolset: "symbol|slopcop" }]);
+  assert.deepEqual(resolved, [{ root: "/workspace", toolset: "symbol|diff|slopcop" }]);
   assert.equal(pi.registered[0].name, "bifrost_search_symbols");
   assert.equal(typeof pi.registered[0].renderCall, "function");
   assert.equal(typeof pi.registered[0].renderResult, "function");
@@ -275,11 +310,11 @@ test("default capabilities match the real MCP toolset boundaries", async () => {
   const resolved = [];
   const session = createBifrostSession(
     pi,
-    dependencies([fakeClient({ listTools: async () => defaultServerTools() })], [], resolved),
+    dependencies([fakeClient()], [], resolved),
   );
 
   assert.equal(await session.start("/workspace", DEFAULT_BIFROST_CAPABILITIES), true);
-  assert.deepEqual(resolved, [{ root: "/workspace", toolset: "symbol|extended|slopcop" }]);
+  assert.deepEqual(resolved, [{ root: "/workspace", toolset: "symbol|extended|diff|slopcop" }]);
   assert.deepEqual(
     new Set(pi.activeNames),
     new Set([
@@ -334,6 +369,7 @@ test("accepts reference-rendered symbol tools as alternatives to location-render
   const referenceTools = symbolTools()
     .filter((tool) => ![
       "scan_usages_by_location",
+      "get_declarations_by_location",
       "get_definitions_by_location",
       "get_type_by_location",
     ].includes(tool.name));
@@ -430,7 +466,7 @@ test("changing capabilities reconnects, registers new tools, and preserves unrel
   );
   assert.deepEqual(
     resolved.map((item) => item.toolset),
-    ["symbol|slopcop", "symbol|slopcop|text"],
+    ["symbol|diff|slopcop", "symbol|diff|slopcop|text"],
   );
   assert.deepEqual(
     session.status(),

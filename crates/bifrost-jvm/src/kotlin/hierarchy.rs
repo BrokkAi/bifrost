@@ -384,27 +384,18 @@ where
         }
     }
 
-    let mut seen = vec![false; candidates.len()];
-    let mut stack = external_descendants;
-    while let Some(index) = stack.pop() {
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return KotlinExternalRootHierarchyAnswer::stopped(
-                KotlinExternalRootHierarchyStatus::Cancelled,
-                visited,
-            );
-        }
-        if std::mem::replace(&mut seen[index], true) {
-            continue;
-        }
-        stack.extend(workspace_edges[index].iter().copied());
-    }
-    let mut descendants = seen
-        .into_iter()
-        .enumerate()
-        .filter(|(_, seen)| *seen)
-        .map(|(index, _)| candidates[index].declaration().clone())
-        .collect::<Vec<_>>();
-    descendants.sort();
+    let Some(descendants) = crate::hierarchy_descendants_from_edges(
+        &candidates,
+        &workspace_edges,
+        external_descendants,
+        cancellation,
+        KotlinHierarchyFact::declaration,
+    ) else {
+        return KotlinExternalRootHierarchyAnswer::stopped(
+            KotlinExternalRootHierarchyStatus::Cancelled,
+            visited,
+        );
+    };
     KotlinExternalRootHierarchyAnswer {
         status: KotlinExternalRootHierarchyStatus::Complete,
         descendants,
@@ -427,19 +418,13 @@ fn same_source_hierarchy_identity<Fact: KotlinHierarchyFact>(
     types_by_fq_name: &HashMap<String, KotlinHierarchyTypeBucket>,
 ) -> usize {
     let bucket = &types_by_fq_name[fqn];
-    let mut same_source = bucket
-        .declarations
-        .iter()
-        .copied()
-        .filter(|index| candidates[*index].declaration().source() == descendant.source());
-    let Some(exact) = same_source.next() else {
-        return bucket.winner;
-    };
-    if same_source.next().is_none() {
-        exact
-    } else {
-        bucket.winner
-    }
+    crate::same_source_hierarchy_declaration(
+        bucket.winner,
+        &bucket.declarations,
+        descendant,
+        candidates,
+        KotlinHierarchyFact::declaration,
+    )
 }
 
 /// Resolve one declaration's ancestors from facts already in hand.

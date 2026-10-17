@@ -35,6 +35,70 @@ pub(super) fn weight_macro_composed_field_vec_by_file(
     size.min(u32::MAX as usize) as u32
 }
 
+pub(super) fn weight_cpp_file_facts(
+    _key: &ProjectFile,
+    value: &Arc<super::semantic::CppFileFacts>,
+) -> u32 {
+    value.estimated_retained_bytes().clamp(1, u32::MAX as usize) as u32
+}
+
+pub(super) fn weight_statement_fact_rows(
+    _key: &ProjectFile,
+    value: &Arc<brokk_bifrost_core::analyzer::statement_facts::CppStatementFactRows>,
+) -> u32 {
+    value.estimated_retained_bytes().clamp(1, u32::MAX as usize) as u32
+}
+
+pub(super) fn weight_call_macro_hazards(
+    _key: &ProjectFile,
+    value: &Arc<HashMap<(usize, usize), bool>>,
+) -> u32 {
+    let size = size_of::<HashMap<(usize, usize), bool>>().saturating_add(
+        value
+            .len()
+            .saturating_mul(size_of::<((usize, usize), bool)>()),
+    );
+    size.clamp(1, u32::MAX as usize) as u32
+}
+
+pub(super) fn weight_c_assignment_candidates(
+    _key: &(
+        crate::analyzer::semantic::SemanticArtifactMaterializationId,
+        crate::analyzer::semantic::ProcedureId,
+    ),
+    value: &Arc<super::expression_branch_facts::CAssignmentCandidates>,
+) -> u32 {
+    let size = size_of::<super::expression_branch_facts::CAssignmentCandidates>().saturating_add(
+        value.rows.capacity().saturating_mul(size_of::<
+            super::expression_branch_facts::CAssignmentCandidate,
+        >()),
+    );
+    size.clamp(1, u32::MAX as usize) as u32
+}
+
+pub(super) fn weight_cpp_overwritten_candidates(
+    _key: &super::CAssignmentCandidateKey,
+    value: &Arc<super::OverwrittenLocalCandidates>,
+) -> u32 {
+    let rows = value.rows.iter().fold(
+        size_of::<super::OverwrittenLocalCandidates>(),
+        |size, row| {
+            size.saturating_add(size_of::<
+                crate::analyzer::assignment_facts::OverwrittenLocalCandidate,
+            >())
+            .saturating_add(
+                row.points
+                    .capacity()
+                    .saturating_mul(size_of::<crate::analyzer::semantic::ProgramPointId>()),
+            )
+        },
+    );
+    rows.saturating_add(value.rows.capacity().saturating_mul(size_of::<
+        crate::analyzer::assignment_facts::OverwrittenLocalCandidate,
+    >()))
+    .clamp(1, u32::MAX as usize) as u32
+}
+
 pub(super) fn weight_code_unit_set_by_file(
     _key: &ProjectFile,
     value: &Arc<HashSet<CodeUnit>>,
@@ -46,7 +110,8 @@ pub(super) fn weight_code_unit_set_by_file(
             + item.package_name().len()
             + item.signature().map_or(0, str::len)
     });
-    size.saturating_add(size_of::<HashSet<CodeUnit>>()) as u32
+    size.saturating_add(size_of::<HashSet<CodeUnit>>())
+        .min(u32::MAX as usize) as u32
 }
 
 pub(super) fn weight_code_unit_vec_by_file(_key: &ProjectFile, value: &Arc<Vec<CodeUnit>>) -> u32 {
@@ -70,19 +135,22 @@ pub(super) fn weight_project_file_set(
             + item.root().as_os_str().len()
             + item.rel_path().as_os_str().len()
     });
-    size.saturating_add(size_of::<HashSet<ProjectFile>>()) as u32
+    size.saturating_add(size_of::<HashSet<ProjectFile>>())
+        .min(u32::MAX as usize) as u32
 }
 
 pub(super) fn weight_include_reachability(
-    key: &(ProjectFile, ProjectFile, bool),
+    key: &(ProjectFile, ProjectFile, ProjectFile),
     _value: &bool,
 ) -> u32 {
-    let (first, donor, _) = key;
-    let size = size_of::<(ProjectFile, ProjectFile, bool)>()
+    let (first, donor, reference) = key;
+    let size = size_of::<(ProjectFile, ProjectFile, ProjectFile)>()
         .saturating_add(first.root().as_os_str().len())
         .saturating_add(first.rel_path().as_os_str().len())
         .saturating_add(donor.root().as_os_str().len())
-        .saturating_add(donor.rel_path().as_os_str().len());
+        .saturating_add(donor.rel_path().as_os_str().len())
+        .saturating_add(reference.root().as_os_str().len())
+        .saturating_add(reference.rel_path().as_os_str().len());
     size.clamp(1, u32::MAX as usize) as u32
 }
 
@@ -197,19 +265,57 @@ pub(super) fn weight_source_using_index(_key: &ProjectFile, value: &Arc<SourceUs
 /// terminal) group produces, grouped under its canonical fq name.
 pub(super) fn weight_reconciled_groups(
     key: &CppReconcileGroupKey,
-    value: &Arc<HashMap<String, Arc<CppReconciledDefinitionIndex>>>,
+    value: &Arc<CppReconciledGroup>,
 ) -> u32 {
-    let size = value
-        .iter()
-        .fold(size_of::<HashMap<String, ()>>(), |acc, (fq_name, index)| {
-            let entry = index.rekeyed.iter().fold(0usize, |units, unit| {
-                // `provisional_of` holds one further unit per re-keyed unit.
-                units.saturating_add(weight_code_unit(unit).saturating_mul(2))
-            });
-            acc.saturating_add(fq_name.len()).saturating_add(entry)
-        })
-        .saturating_add(key.member_identifier.len())
-        .saturating_add(key.owner_terminal.as_ref().map_or(0, String::len));
+    let size =
+        value
+            .by_name
+            .iter()
+            .fold(size_of::<CppReconciledGroup>(), |acc, (fq_name, index)| {
+                let entry = index.rekeyed.iter().fold(0usize, |units, unit| {
+                    // The vector and the provenance map retain the canonical
+                    // unit twice and the physical unit once. Charge all three
+                    // conservatively, even when their backing storage is shared.
+                    units.saturating_add(weight_code_unit(unit).saturating_mul(3))
+                });
+                acc.saturating_add(fq_name.capacity())
+                    .saturating_add(entry)
+                    .saturating_add(size_of::<CppReconciledDefinitionIndex>())
+                    .saturating_add(
+                        index
+                            .rekeyed
+                            .capacity()
+                            .saturating_mul(size_of::<CodeUnit>()),
+                    )
+                    .saturating_add(
+                        index
+                            .provisional_of
+                            .capacity()
+                            .saturating_mul(size_of::<(CodeUnit, CodeUnit)>() + 1),
+                    )
+            })
+            .saturating_add(value.canonical_of.iter().fold(
+                0usize,
+                |size, (physical, canonical)| {
+                    size.saturating_add(weight_code_unit(physical))
+                        .saturating_add(weight_code_unit(canonical))
+                },
+            ))
+            // Charge spare map slots as well as their retained unit contents.
+            .saturating_add(
+                value
+                    .canonical_of
+                    .capacity()
+                    .saturating_mul(size_of::<(CodeUnit, CodeUnit)>() + 1),
+            )
+            .saturating_add(
+                value
+                    .by_name
+                    .capacity()
+                    .saturating_mul(size_of::<(String, Arc<CppReconciledDefinitionIndex>)>() + 1),
+            )
+            .saturating_add(key.member_identifier.len())
+            .saturating_add(key.owner_terminal.as_ref().map_or(0, String::len));
     size.clamp(1, u32::MAX as usize) as u32
 }
 
@@ -262,7 +368,7 @@ pub(super) fn weight_recovered_export_class_index(
     _key: &ProjectFile,
     value: &Arc<CppRecoveredExportClassIndex>,
 ) -> u32 {
-    value.approximate_size().clamp(1, u32::MAX as usize) as u32
+    approximate_index_weight(value.approximate_size())
 }
 
 /// #1537: one entry is a whole file's recovered namespace regions, so weigh it
@@ -271,7 +377,11 @@ pub(super) fn weight_orphaned_namespace_scopes(
     _key: &ProjectFile,
     value: &Arc<OrphanedNamespaceScopeIndex>,
 ) -> u32 {
-    value.approximate_size().clamp(1, u32::MAX as usize) as u32
+    approximate_index_weight(value.approximate_size())
+}
+
+fn approximate_index_weight(size: usize) -> u32 {
+    size.clamp(1, u32::MAX as usize) as u32
 }
 
 /// #1496: the attribution itself is four bits; the key's path is the entry.

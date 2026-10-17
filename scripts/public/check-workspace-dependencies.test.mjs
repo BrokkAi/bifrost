@@ -22,15 +22,20 @@ const names = [
   "brokk-bifrost-runtime",
   "brokk-bifrost-mcp",
   "brokk-bifrost-semantic-packs",
+  "brokk-bifrost-test-macros",
 ];
 
-function dependency(name) {
-  return { name, req: "=0.8.12" };
+function dependency(name, kind = undefined, req = "=0.8.12") {
+  return { name, req, kind, source: null };
 }
 
 function metadata(overrides = {}) {
   const dependencies = {
-    "brokk-bifrost": [],
+    "brokk-bifrost": [
+      dependency("brokk-bifrost-core", "dev"),
+      dependency("brokk-bifrost-js-ts", "dev"),
+      dependency("brokk-bifrost-jvm", "dev"),
+    ],
     "brokk-bifrost-core": [],
     "brokk-bifrost-cpp": [dependency("brokk-bifrost-core")],
     "brokk-bifrost-csharp": [dependency("brokk-bifrost-core")],
@@ -92,7 +97,10 @@ function metadata(overrides = {}) {
     id: `path+file:///workspace/${name}#${name}@${versions[name] ?? "0.8.12"}`,
     name,
     version: versions[name] ?? "0.8.12",
-    dependencies: dependencies[name] ?? [],
+    dependencies: [
+      ...(dependencies[name] ?? []),
+      dependency("brokk-bifrost-test-macros", "dev", "*"),
+    ],
   }));
   return {
     packages,
@@ -102,6 +110,19 @@ function metadata(overrides = {}) {
 
 test("accepts the intended one-way workspace graph", () => {
   assert.deepEqual(validateWorkspaceGraph(metadata()), []);
+});
+
+test("test macros are permitted only as path-only development dependencies", () => {
+  for (const invalidDependency of [
+    dependency("brokk-bifrost-test-macros"),
+    dependency("brokk-bifrost-test-macros", "dev", "=0.8.12"),
+  ]) {
+    assert.deepEqual(validateWorkspaceGraph(metadata({
+      dependencies: { "brokk-bifrost": [invalidDependency] },
+    })), [
+      "brokk-bifrost dependency on brokk-bifrost-test-macros must be a path-only development dependency",
+    ]);
+  }
 });
 
 test("facade parser and identity dependencies are confined to development", () => {
@@ -241,7 +262,7 @@ test("rejects a core dependency back on analysis", () => {
   );
 });
 
-test("accepts RQL above analysis and flow but rejects policy", () => {
+test("accepts RQL grammar hooks below analysis but rejects policy", () => {
   assert.deepEqual(
     validateWorkspaceGraph(
       metadata({
@@ -250,6 +271,10 @@ test("accepts RQL above analysis and flow but rejects policy", () => {
             dependency("brokk-bifrost-core"),
             dependency("brokk-bifrost-analysis"),
             dependency("brokk-bifrost-flow"),
+            dependency("brokk-bifrost-cpp"),
+            dependency("brokk-bifrost-python"),
+            dependency("brokk-bifrost-jvm"),
+            dependency("brokk-bifrost-js-ts"),
           ],
         },
       }),

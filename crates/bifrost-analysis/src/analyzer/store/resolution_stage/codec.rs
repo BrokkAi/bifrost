@@ -1,12 +1,14 @@
 //! Integer JSON codecs for one private stage path, completion or request.
 //!
-//! The body has eleven positions, as in the durable structural layout:
+//! The body has twelve positions in the current layout, with the final
+//! owner-continuation bit optional in older persisted rows:
 //! `[start_symbols, start_symbol_tail, start_scopes, start_scope_tail,
 //! end_symbols, end_symbol_tail, end_scopes, end_scope_tail, precedence,
-//! witness, completion]`. Identity cells have different authority here:
-//! non-shared cells retain the full tagged runtime integer, and negative
-//! semantic cells are minus a request SharedNameId. The universal root keeps
-//! its full Reserved integer. Nothing consults a durable identity catalog.
+//! witness, completion, owner_continued]`. Identity cells have different
+//! authority here: non-shared cells retain the full tagged runtime integer,
+//! and negative semantic cells are minus a request SharedNameId. The
+//! universal root keeps its full Reserved integer. Nothing consults a durable
+//! identity catalog.
 //!
 //! Completion is null for Complete or an array of reason arrays for Incomplete.
 //! This preserves even raw empty, repeated or ordered incomplete reasons.
@@ -28,6 +30,7 @@ use crate::analyzer::resolution::{
 use crate::analyzer::store::resolution_prepare::resolution_rows::{
     RootKeyBuilder, candidate_outcome_code, code, from_code,
 };
+use crate::analyzer::store::resolution_prepare::stored_integer as integer;
 use crate::hash::HashMap;
 
 // The existing runtime model's layout. Decoding reconstructs through its
@@ -127,15 +130,9 @@ pub(in crate::analyzer::store) fn decode_path_id(cell: i64) -> PartialPathId {
 }
 
 fn array<'a>(value: &'a Value, what: &str) -> &'a [Value] {
-    value
-        .as_array()
-        .unwrap_or_else(|| panic!("stage {what} is an array: {value}"))
-}
-
-fn integer(value: &Value, what: &str) -> i64 {
-    value
-        .as_i64()
-        .unwrap_or_else(|| panic!("stage {what} is an integer: {value}"))
+    super::super::resolution_prepare::require_array(value, |value| {
+        format!("stage {what} is an array: {value}")
+    })
 }
 
 fn variable_cell(
@@ -200,17 +197,16 @@ fn endpoint_cells(
     ]
 }
 
-/// A standalone candidate endpoint. Its variables are independent of other
-/// candidate rows; whole paths instead number both endpoints together.
+pub(in crate::analyzer::store) fn decode_endpoint(node: i64, cells: &str) -> EndpointSignature {
+    let document: Value = serde_json::from_str(cells).expect("a stage endpoint is valid JSON");
+    endpoint_from_cells(decode_node(node), array(&document, "endpoint"))
+}
+
+/// Test-only encoding used to compare standalone endpoint rows with paths.
 #[cfg(test)]
 pub(in crate::analyzer::store) fn encode_endpoint(endpoint: &EndpointSignature) -> String {
     serde_json::to_string(&endpoint_cells(endpoint, &mut HashMap::default()))
         .expect("a structured stage endpoint serializes to JSON")
-}
-
-pub(in crate::analyzer::store) fn decode_endpoint(node: i64, cells: &str) -> EndpointSignature {
-    let document: Value = serde_json::from_str(cells).expect("a stage endpoint is valid JSON");
-    endpoint_from_cells(decode_node(node), array(&document, "endpoint"))
 }
 
 fn endpoint_from_cells(node: BindingNodeId, cells: &[Value]) -> EndpointSignature {
@@ -281,13 +277,18 @@ pub(in crate::analyzer::store) fn encode_path(path: &PartialPath) -> String {
             .collect(),
     ));
     cells.push(completion_cell(path.completion()));
+    cells.push(json!(i64::from(path.owner_continued())));
+    cells.push(json!(path.root_import_activation()));
     serde_json::to_string(&cells).expect("a structured stage path serializes to JSON")
 }
 
 pub(in crate::analyzer::store) fn decode_path(start: i64, end: i64, body: &str) -> PartialPath {
     let document: Value = serde_json::from_str(body).expect("a stage path body is valid JSON");
     let cells = array(&document, "path body");
-    assert_eq!(cells.len(), 11, "a stage path body has eleven positions");
+    assert!(
+        matches!(cells.len(), 11..=13),
+        "a stage path body has eleven legacy, twelve, or thirteen positions"
+    );
     let precedence = array(&cells[8], "precedence")
         .iter()
         .map(|step| {
@@ -343,13 +344,31 @@ pub(in crate::analyzer::store) fn decode_path(start: i64, end: i64, body: &str) 
             }
         })
         .collect::<Vec<_>>();
-    PartialPath::new(
+    let owner_continued = match cells
+        .get(11)
+        .map(|cell| integer(cell, "owner continuation"))
+    {
+        None | Some(0) => false,
+        Some(1) => true,
+        Some(value) => panic!("a path owner-continuation bit is 0 or 1, got {value}"),
+    };
+    let root_import_activation = cells.get(12).filter(|cell| !cell.is_null()).map(|cell| {
+        u32::try_from(integer(cell, "root import activation"))
+            .expect("a root import activation fits a source offset")
+    });
+    let path = PartialPath::new(
         endpoint_from_cells(decode_node(start), &cells[..4]),
         endpoint_from_cells(decode_node(end), &cells[4..8]),
         precedence,
         witness,
         completion_from_cell(&cells[10]),
     )
+    .with_root_import_activation(root_import_activation);
+    if owner_continued {
+        path.with_owner_continued()
+    } else {
+        path
+    }
 }
 
 // Tags 0..=3 retain the durable reason vocabulary's order. The three additional

@@ -1,69 +1,10 @@
 use super::*;
+use brokk_bifrost_test_macros::hardwon;
 
 fn transcriber(tree: &tree_sitter::Tree) -> Node<'_> {
     let definition = named_descendant(tree.root_node(), "macro_definition").unwrap();
     let rule = named_child_of_kind(definition, "macro_rule").unwrap();
     rule.child_by_field_name("right").unwrap()
-}
-
-#[test]
-fn transcriber_emission_preserves_tokens_and_metavariable_identity() {
-    let source =
-        "macro_rules! m { ($name:ident, $other:ident) => { fn $name() { let $other = $name; } }; }";
-    let tree = parse_rust_tree(source).unwrap();
-    assert!(!tree.root_node().has_error());
-    let mut emitted = String::new();
-    let mut saw = false;
-    emit_transcriber_for_reparse(
-        transcriber(&tree),
-        source,
-        "name",
-        "DummyIdent",
-        &mut emitted,
-        &mut saw,
-    );
-    assert!(saw);
-    assert_eq!(
-        emitted,
-        "{ fn DummyIdent ( ) { let DummyOther = DummyIdent ; } } "
-    );
-}
-
-#[test]
-fn transcriber_emission_does_not_mark_other_metavariables_as_requested() {
-    let source = "macro_rules! m { ($other:ident) => { struct $other; }; }";
-    let tree = parse_rust_tree(source).unwrap();
-    let mut emitted = String::new();
-    let mut saw = false;
-    emit_transcriber_for_reparse(
-        transcriber(&tree),
-        source,
-        "name",
-        "DummyIdent",
-        &mut emitted,
-        &mut saw,
-    );
-    assert!(!saw);
-    assert_eq!(emitted, "{ struct DummyOther ; } ");
-}
-
-#[test]
-fn transcriber_emission_preserves_existing_repetition_projection() {
-    let source = "macro_rules! m { ($($name:ident),*) => { $(struct $name;)* }; }";
-    let tree = parse_rust_tree(source).unwrap();
-    assert!(!tree.root_node().has_error());
-    let mut emitted = String::new();
-    let mut saw = false;
-    emit_transcriber_for_reparse(
-        transcriber(&tree),
-        source,
-        "name",
-        "DummyIdent",
-        &mut emitted,
-        &mut saw,
-    );
-    assert!(saw);
-    assert_eq!(emitted, "{ ( struct DummyIdent ; ) } ");
 }
 
 #[test]
@@ -106,4 +47,67 @@ fn deeply_nested_transcriber_emits_on_a_small_stack() {
         )
     );
     drop(tree);
+}
+
+#[test]
+#[hardwon("510037d56a89: stack-safe traversal lost emitted token and metavariable identity")]
+fn transcriber_emission_preserves_tokens_and_metavariable_identity() {
+    let source =
+        "macro_rules! m { ($name:ident, $other:ident) => { fn $name() { let $other = $name; } }; }";
+    let tree = parse_rust_tree(source).unwrap();
+    assert!(!tree.root_node().has_error());
+    let mut emitted = String::new();
+    let mut saw = false;
+    emit_transcriber_for_reparse(
+        transcriber(&tree),
+        source,
+        "name",
+        "DummyIdent",
+        &mut emitted,
+        &mut saw,
+    );
+    assert!(saw);
+    assert_eq!(
+        emitted,
+        "{ fn DummyIdent ( ) { let DummyOther = DummyIdent ; } } "
+    );
+}
+
+#[test]
+#[hardwon("510037d56a89: requested metavariable selection matched an unrelated binding")]
+fn transcriber_emission_does_not_mark_other_metavariables_as_requested() {
+    let source = "macro_rules! m { ($other:ident) => { struct $other; }; }";
+    let tree = parse_rust_tree(source).unwrap();
+    let mut emitted = String::new();
+    let mut saw = false;
+    emit_transcriber_for_reparse(
+        transcriber(&tree),
+        source,
+        "name",
+        "DummyIdent",
+        &mut emitted,
+        &mut saw,
+    );
+    assert!(!saw);
+    assert_eq!(emitted, "{ struct DummyOther ; } ");
+}
+
+#[test]
+#[hardwon("510037d56a89: stack-safe traversal changed the captured repetition projection")]
+fn transcriber_emission_preserves_existing_repetition_projection() {
+    let source = "macro_rules! m { ($($name:ident),*) => { $(struct $name;)* }; }";
+    let tree = parse_rust_tree(source).unwrap();
+    assert!(!tree.root_node().has_error());
+    let mut emitted = String::new();
+    let mut saw = false;
+    emit_transcriber_for_reparse(
+        transcriber(&tree),
+        source,
+        "name",
+        "DummyIdent",
+        &mut emitted,
+        &mut saw,
+    );
+    assert!(saw);
+    assert_eq!(emitted, "{ ( struct DummyIdent ; ) } ");
 }

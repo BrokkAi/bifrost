@@ -1,5 +1,3 @@
-use std::cell::Cell;
-
 #[test]
 fn go_source_reader_rejects_corrupt_type_edges_without_panicking() {
     let fixture = InlineTestProject::with_language(Language::Go)
@@ -58,13 +56,10 @@ fn go_source_lookup_seeks_populated_publications_before_and_after_statistics() {
             .write_parsed_blob(other, "go", &GoAdapter, &state)
             .unwrap();
     }
-    for refreshed in [false, true] {
-        if refreshed {
-            store.refresh_planner_statistics().unwrap();
-        }
-        let conn = store.read_conn().unwrap();
-        let plan = conn
-            .prepare(&format!(
+    super::assert_source_lookup_plan(
+        &store,
+        |conn| {
+            conn.prepare(&format!(
                 "EXPLAIN QUERY PLAN {}",
                 crate::analyzer::go::source_storage::GO_SOURCE_HEADER_SQL
             ))
@@ -80,24 +75,15 @@ fn go_source_lookup_seeks_populated_publications_before_and_after_statistics() {
             )
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        assert!(
-            plan.iter()
-                .any(|step| step.contains("SEARCH blob") && step.contains("INDEX")),
-            "{plan:#?}"
-        );
-        assert!(
-            plan.iter().all(|step| !step.starts_with("SCAN ")),
-            "source publication lookup must seek its exact blob: {plan:#?}"
-        );
-        drop(conn);
-        assert!(
+            .unwrap()
+        },
+        || {
             store
                 .go_source_facts(oid, generation, &GoAdapter, &file, &|| true)
                 .unwrap()
                 .is_some()
-        );
-    }
+        },
+    );
     store
         .conn
         .execute(|conn| {
@@ -188,16 +174,17 @@ fn go_declaration_source_facts_reopen_without_source_and_mount_exact_bridges() {
     std::fs::remove_file(file.abs_path()).unwrap();
     let store = AnalyzerStore::open_persistent(&path).unwrap();
     let generation = store.current_generation("go").unwrap();
-    let first = store
-        .go_source_facts(oid, generation, &GoAdapter, &file, &|| true)
-        .unwrap()
-        .unwrap();
-    let mounted = store
-        .go_source_facts(oid, generation, &GoAdapter, &second, &|| true)
-        .unwrap()
-        .unwrap();
+    let (first, mounted) = super::assert_source_facts_match_across_mounts(
+        &store,
+        generation,
+        &file,
+        &second,
+        |store, generation, file, cancellation| {
+            store.go_source_facts(oid, generation, &GoAdapter, file, cancellation)
+        },
+        |read| &read.facts,
+    );
     assert_eq!(&first.facts, expected);
-    assert_eq!(first.facts, mounted.facts);
     assert_eq!(
         first.source,
         state.source_facts.as_ref().unwrap().occurrences
@@ -228,22 +215,9 @@ fn go_declaration_source_facts_reopen_without_source_and_mount_exact_bridges() {
         2,
         "one written nested field must retain both projections: {units:?}"
     );
-    let visits = Cell::new(0);
-    assert!(
-        store
-            .go_source_facts(oid, generation, &GoAdapter, &file, &|| {
-                visits.set(visits.get() + 1);
-                visits.get() < 5
-            })
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        store
-            .go_source_facts(oid, generation, &GoAdapter, &file, &|| true)
-            .unwrap()
-            .is_some()
-    );
+    super::assert_source_read_cancellation_retries(|cancellation| {
+        store.go_source_facts(oid, generation, &GoAdapter, &file, cancellation)
+    });
 }
 
 #[test]
@@ -295,18 +269,8 @@ fn go_source_publication_distinguishes_empty_missing_and_sealed() {
             Ok::<_, crate::analyzer::store::StoreError>(())
         })
         .unwrap();
-    assert!(
-        store
-            .go_source_facts(oid, generation, &GoAdapter, &file, &|| true)
-            .is_err()
-    );
-    store
-        .write_parsed_blob(oid, "go", &GoAdapter, &state)
-        .unwrap();
-    assert!(
-        store
-            .go_source_facts(oid, generation, &GoAdapter, &file, &|| true)
-            .unwrap()
-            .is_some()
+    super::assert_missing_then_republished(
+        || store.go_source_facts(oid, generation, &GoAdapter, &file, &|| true),
+        || store.write_parsed_blob(oid, "go", &GoAdapter, &state),
     );
 }

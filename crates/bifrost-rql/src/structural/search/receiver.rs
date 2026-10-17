@@ -114,6 +114,76 @@ pub(super) fn receiver_evidence_expansions(
     expansions
 }
 
+const POINTS_TO_CANDIDATE_ID_DOMAIN: &[u8] = b"bifrost.code_query.points_to_candidate.v1";
+
+pub(super) fn points_to_candidate_expansions(
+    value: &ReceiverAnalysisValue,
+    semantic_identity: Option<(String, String)>,
+) -> Vec<PipelineExpansion> {
+    let Some(points_to) = &value.report.points_to else {
+        return Vec::new();
+    };
+    let (site_id, program_point_id) = semantic_identity
+        .map(|(site_id, program_point_id)| (site_id, Some(program_point_id)))
+        .unwrap_or_else(|| (value.site_id.clone(), None));
+    points_to
+        .object_candidates()
+        .enumerate()
+        .map(|(candidate_index, candidate)| {
+            let mut digest = LengthDelimitedDigest::new(POINTS_TO_CANDIDATE_ID_DOMAIN);
+            digest.push(site_id.as_bytes());
+            digest.push(&candidate_index.to_le_bytes());
+            let object = candidate.value();
+            let object_id = (candidate.is_proven_complete()
+                && points_to.coverage().is_exhaustive()
+                && object.cardinality() == crate::analyzer::semantic::ObjectCardinality::Singleton
+                && !contains_type_summary(object.identity()))
+            .then(|| {
+                let canonical =
+                    brokk_bifrost_flow::typestate::TypestateObjectKey::for_object(object)
+                        .public_canonical_rendering();
+                let mut identity =
+                    LengthDelimitedDigest::new(b"bifrost.code_query.points_to_object_identity.v1");
+                identity.push(canonical.as_bytes());
+                identity.finish().to_string()
+            });
+            let row = PointsToCandidateValue {
+                file: value.report.site.file.clone(),
+                language: value.report.site.language,
+                range: value.report.site.range,
+                id: digest.finish().to_string(),
+                site_id: site_id.clone(),
+                program_point_id: program_point_id.clone(),
+                candidate_index,
+                object_id,
+                object_cardinality: Some(match object.cardinality() {
+                    crate::analyzer::semantic::ObjectCardinality::Singleton => "singleton",
+                    crate::analyzer::semantic::ObjectCardinality::Summary => "summary",
+                    crate::analyzer::semantic::ObjectCardinality::Unknown => "unknown",
+                }),
+                proof: candidate.proof().label(),
+                completeness: candidate.completeness().label(),
+                coverage: points_to.coverage().label(),
+            };
+            PipelineExpansion {
+                value: PipelineValue::PointsToCandidate(Box::new(row.clone())),
+                trace: vec![(PipelineTraceValue::PointsToCandidate(Box::new(row)), None)],
+                budgeted: false,
+            }
+        })
+        .collect()
+}
+
+fn contains_type_summary(identity: &crate::analyzer::semantic::AccessPathRoot) -> bool {
+    match identity {
+        crate::analyzer::semantic::AccessPathRoot::TypeSummary(_) => true,
+        crate::analyzer::semantic::AccessPathRoot::FieldPath { base, .. } => {
+            contains_type_summary(base)
+        }
+        _ => false,
+    }
+}
+
 pub(super) fn correlate_receiver_expansions(expansions: &mut [PipelineExpansion], ast_id: String) {
     for expansion in expansions {
         let value = match &mut expansion.value {
@@ -176,7 +246,8 @@ pub(super) fn structural_receiver_ranges(
             .filter(|binding| binding.name == capture)
             .map(|binding| binding.span)
             .collect::<Vec<_>>();
-        (spans, ReceiverQueryInput::Expression)
+        let input = ReceiverQueryInput::Expression;
+        (spans, input)
     } else {
         let fact_id = seed.fact_match.node;
         let fact = seed.facts.node(fact_id);
@@ -186,20 +257,26 @@ pub(super) fn structural_receiver_ranges(
                 .role_targets(fact_id, Role::Right)
                 .next()
                 .map(|target| target.span),
-            ReceiverQueryOperation::ReceiverTargets => match fact.kind {
-                NormalizedKind::Call => seed
-                    .facts
-                    .role_targets(fact_id, Role::Receiver)
-                    .next()
-                    .map(|target| target.span),
-                NormalizedKind::FieldAccess => seed
-                    .facts
-                    .role_targets(fact_id, Role::Object)
-                    .next()
-                    .map(|target| target.span),
-                _ => None,
-            },
-            ReceiverQueryOperation::MemberTargets => None,
+            ReceiverQueryOperation::ReceiverTargets => {
+                if fact.kind.satisfies(NormalizedKind::Call) {
+                    seed.facts
+                        .role_targets(fact_id, Role::Receiver)
+                        .next()
+                        .map(|target| target.span)
+                } else if fact.kind == NormalizedKind::FieldAccess {
+                    seed.facts
+                        .role_targets(fact_id, Role::Object)
+                        .next()
+                        .map(|target| target.span)
+                } else {
+                    None
+                }
+            }
+            ReceiverQueryOperation::MemberTargets => seed
+                .facts
+                .role_targets(fact_id, Role::Left)
+                .next()
+                .map(|target| target.span),
         };
         let input = match operation {
             ReceiverQueryOperation::PointsTo => ReceiverQueryInput::Expression,
@@ -731,6 +808,7 @@ pub(super) fn receiver_budget_for_remaining_work(
             context_depth: base.context_depth,
             max_targets: base.max_targets.min(remaining_targets),
             max_summary_expansions: desired_summaries,
+            max_resolution_rounds: base.max_resolution_rounds,
             max_scope_nodes: desired_scope,
         };
     }
@@ -749,6 +827,7 @@ pub(super) fn receiver_budget_for_remaining_work(
         context_depth: base.context_depth,
         max_targets: base.max_targets.min(remaining_targets),
         max_summary_expansions,
+        max_resolution_rounds: base.max_resolution_rounds,
         max_scope_nodes,
     }
 }

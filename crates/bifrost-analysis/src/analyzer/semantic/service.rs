@@ -7,7 +7,8 @@ use std::sync::Arc;
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::Mutex;
 #[cfg(any(test, feature = "test-support"))]
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use git2::Oid;
 use moka::sync::Cache;
@@ -16,7 +17,11 @@ use crate::analyzer::QueryScope;
 #[cfg(any(test, feature = "test-support"))]
 use crate::analyzer::complete_value_cache::CompleteValueRevivalCensus;
 use crate::analyzer::complete_value_cache::{
-    CompleteValueAcquisition, CompleteValueCache, CompleteValueWait,
+    CompleteValueAcquisition, CompleteValueCache, CompleteValuePermit, CompleteValueWait,
+};
+use crate::analyzer::semantic::partial_flow::ProcedurePartialFlows;
+use crate::analyzer::store::semantic_ir::{
+    SemanticIrMountScope, SemanticIrPublication, SemanticIrPublicationOutcome,
 };
 use crate::analyzer::tree_sitter_analyzer::{PreparedSourceOrigin, PreparedSyntaxTree};
 use crate::analyzer::{
@@ -27,11 +32,12 @@ use crate::analyzer::{
 use super::{
     AdapterSemanticsVersion, AllocationSite, BasicBlock, CaptureBinding, ConfigurationFingerprint,
     ContentIdentity, ControlEdge, DependencyFingerprint, Evidence, MemoryLocation,
-    OverlaySnapshotId, ProcedureId, ProcedureSemantics, ProcedureSemanticsParts, ProgramPoint,
-    SemanticArtifact, SemanticArtifactBuildError, SemanticArtifactKey, SemanticCallSite,
-    SemanticCapabilities, SemanticEvent, SemanticGap, SemanticIrVersion, SemanticLocator,
-    SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticValue, SemanticWork,
-    SourceMapping, SourceRevision, StableDigest, WorkspaceMountId, WorkspaceRelativePath,
+    OverlaySnapshotId, PointerInvalidation, ProcedureId, ProcedureSemantics,
+    ProcedureSemanticsParts, ProgramPoint, SemanticArtifact, SemanticArtifactBuildError,
+    SemanticArtifactKey, SemanticCallSite, SemanticCapabilities, SemanticEvent, SemanticGap,
+    SemanticIrVersion, SemanticLocator, SemanticOutcome, SemanticProviderError, SemanticRequest,
+    SemanticValue, SemanticWork, SourceMapping, SourceRevision, StableDigest, WorkspaceMountId,
+    WorkspaceRelativePath,
 };
 
 const DEFAULT_COMPLETE_CACHE_BYTES: u64 = 256 * 1024 * 1024 / 8;
@@ -201,19 +207,13 @@ impl CompleteSemanticArtifactCache {
 
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn arm_selector_continuation_invalidation_for_test(&self) {
-        self.selector_continuation_invalidation_armed
-            .store(true, Ordering::Release);
+        self.arm_continuation_invalidation_for_test(&self.selector_continuation_invalidation_armed);
     }
 
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn invalidate_selector_continuation_if_armed_for_test(&self) {
-        if !self
-            .selector_continuation_invalidation_armed
-            .swap(false, Ordering::AcqRel)
-        {
-            return;
-        }
-        self.activate_invalidation_witness_for_test(
+        self.invalidate_continuation_if_armed_for_test(
+            &self.selector_continuation_invalidation_armed,
             SELECTOR_CONTINUATION_INVALIDATION_WITNESS,
             &self.selector_continuation_revival_census,
         );
@@ -221,22 +221,36 @@ impl CompleteSemanticArtifactCache {
 
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn arm_evaluation_root_continuation_invalidation_for_test(&self) {
-        self.evaluation_root_continuation_invalidation_armed
-            .store(true, Ordering::Release);
+        self.arm_continuation_invalidation_for_test(
+            &self.evaluation_root_continuation_invalidation_armed,
+        );
     }
 
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn invalidate_evaluation_root_continuation_if_armed_for_test(&self) {
-        if !self
-            .evaluation_root_continuation_invalidation_armed
-            .swap(false, Ordering::AcqRel)
-        {
-            return;
-        }
-        self.activate_invalidation_witness_for_test(
+        self.invalidate_continuation_if_armed_for_test(
+            &self.evaluation_root_continuation_invalidation_armed,
             EVALUATION_ROOT_CONTINUATION_INVALIDATION_WITNESS,
             &self.evaluation_root_continuation_revival_census,
         );
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn arm_continuation_invalidation_for_test(&self, armed: &AtomicBool) {
+        armed.store(true, Ordering::Release);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn invalidate_continuation_if_armed_for_test(
+        &self,
+        armed: &AtomicBool,
+        witness: u8,
+        census: &Mutex<SemanticCacheRevivalCensus>,
+    ) {
+        if !armed.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        self.activate_invalidation_witness_for_test(witness, census);
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -412,6 +426,15 @@ fn retained_artifact_base_bytes(artifact: &SemanticArtifact) -> u64 {
     let locator_index_entry = size_of::<SemanticLocator>()
         .saturating_add(size_of::<ProcedureId>())
         .saturating_add(size_of::<usize>() * 2);
+    let pointer_invalidation_rows = artifact
+        .procedures()
+        .iter()
+        .fold(0usize, |rows, procedure| {
+            rows.saturating_add(procedure.pointer_invalidations().len())
+        });
+    let nested_entries = work
+        .nested_entries
+        .saturating_sub(pointer_invalidation_rows);
     let mut bytes = (size_of::<Arc<SemanticArtifact>>()
         + size_of::<SemanticArtifact>()
         + size_of::<SemanticArtifactKey>()) as u64;
@@ -431,8 +454,14 @@ fn retained_artifact_base_bytes(artifact: &SemanticArtifact) -> u64 {
         .saturating_add(rows(work.events, size_of::<SemanticEvent>()))
         .saturating_add(rows(work.control_edges, size_of::<ControlEdge>()))
         .saturating_add(rows(
-            work.nested_entries,
+            nested_entries,
             size_of::<SemanticLocator>().saturating_mul(2).max(64),
+        ))
+        // Pointer invalidations are stored as a flat typed slice; charge their
+        // concrete row size, including the target enum's value identity.
+        .saturating_add(rows(
+            pointer_invalidation_rows,
+            size_of::<PointerInvalidation>(),
         ))
         .saturating_add((work.owned_text_bytes as u64).saturating_mul(2));
 
@@ -453,7 +482,8 @@ fn retained_artifact_bytes(key: &SemanticArtifactKey, artifact: &SemanticArtifac
         .iter()
         .fold(
             retained_artifact_base_bytes(artifact)
-                .saturating_add(artifact.lexical_children_index_retained_bytes()),
+                .saturating_add(artifact.lexical_children_index_retained_bytes())
+                .saturating_add(artifact.call_source_extents_retained_bytes()),
             |bytes, procedure| {
                 bytes
                     .saturating_add(procedure.call_indexes_retained_bytes())
@@ -480,6 +510,22 @@ pub(crate) struct SemanticAdapterIdentity {
     pub(crate) dependencies: DependencyFingerprint,
 }
 
+impl SemanticAdapterIdentity {
+    pub(crate) fn for_adapter(
+        adapter_name: &str,
+        adapter_version: &[u8],
+        configuration: &[u8],
+        dependencies: DependencyFingerprint,
+    ) -> Self {
+        Self {
+            adapter: AdapterSemanticsVersion::hash_bytes(adapter_name, adapter_version)
+                .expect("adapter name is non-empty"),
+            configuration: ConfigurationFingerprint::hash_bytes(configuration),
+            dependencies,
+        }
+    }
+}
+
 /// The private boundary implemented by one real language lowering adapter.
 ///
 /// `work` in the returned outcome is prospective/observed work only. The
@@ -494,7 +540,9 @@ pub(crate) trait ProgramSemanticsLowerer: Send + Sync {
 
     fn identity(&self) -> SemanticAdapterIdentity;
 
-    fn capabilities(&self) -> SemanticCapabilities;
+    fn capabilities(&self) -> SemanticCapabilities {
+        SemanticCapabilities::default()
+    }
 
     fn lower(
         &self,
@@ -503,6 +551,23 @@ pub(crate) trait ProgramSemanticsLowerer: Send + Sync {
         budget: &super::SemanticBudget,
         cancellation: &super::CancellationToken,
     ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError>;
+}
+
+/// A language's stateless lowerer, handed to blob preparation so a blob's
+/// semantic IR is written as rows when the blob is parsed. The field is
+/// crate-private on purpose: the lowering contract is not public API.
+pub struct ParseTimeSemanticLowerer {
+    inner: &'static dyn ProgramSemanticsLowerer,
+}
+
+impl ParseTimeSemanticLowerer {
+    pub(crate) const fn new(inner: &'static dyn ProgramSemanticsLowerer) -> Self {
+        Self { inner }
+    }
+
+    pub(crate) fn lowerer(&self) -> &'static dyn ProgramSemanticsLowerer {
+        self.inner
+    }
 }
 
 /// Executable lowering that also consumes the primary declaration projection.
@@ -665,6 +730,83 @@ fn materialize_with_lowerer_inner<A: LanguageAdapter>(
         return outcome;
     }
 
+    // A blob whose complete semantic IR rows the store holds is served from
+    // those rows: its source is neither read nor parsed.
+    if let Some(oid) = analyzer.reusable_live_oid(file) {
+        let Some(publication) = complete_semantic_ir_publication(analyzer, file, oid)? else {
+            note_serve(
+                &SERVE_COUNTS.rows_misses,
+                "rows_miss",
+                file.rel_path().display(),
+            );
+            return materialize_with_lowerer_after_miss(
+                analyzer,
+                cache,
+                lowerer,
+                file,
+                request,
+                started_work,
+            );
+        };
+        note_serve(
+            &SERVE_COUNTS.rows_hits,
+            "rows_hit",
+            file.rel_path().display(),
+        );
+        let content = publication.content;
+        analyzer.semantic_source_digests().record(oid, content);
+        let key = semantic_artifact_key_from_content(
+            file,
+            LanguageDialect::for_path(analyzer.adapter().language(), file.rel_path()),
+            content,
+            None,
+            lowerer.identity(),
+        )?;
+        let (acquisition, _cache_wait) = cache.acquire(&key, request.cancellation);
+        let staged_budget = request.budget.clone();
+        let outcome = match acquisition {
+            CompleteValueAcquisition::Cached { value: artifact } => publish_cached(
+                cache,
+                artifact,
+                SemanticWork::default(),
+                staged_budget,
+                request,
+            ),
+            CompleteValueAcquisition::Leader { permit } => publish_from_semantic_ir_rows(
+                analyzer,
+                lowerer,
+                key,
+                &publication,
+                permit,
+                SemanticWork::default(),
+                staged_budget,
+                started_work,
+                request,
+            ),
+            CompleteValueAcquisition::Rejected => {
+                unreachable!("semantic artifact cache never publishes rejected flights")
+            }
+            CompleteValueAcquisition::Cancelled => Ok(SemanticOutcome::Cancelled {
+                partial: None,
+                work: SemanticWork::default(),
+            }),
+        };
+        observe_complete_artifact(file, &outcome, request);
+        return outcome;
+    }
+
+    materialize_with_lowerer_after_miss(analyzer, cache, lowerer, file, request, started_work)
+}
+
+/// Lowers a file that no semantic IR rows or unchanged-source artifact served.
+fn materialize_with_lowerer_after_miss<A: LanguageAdapter>(
+    analyzer: &TreeSitterAnalyzer<A>,
+    cache: &CompleteSemanticArtifactCache,
+    lowerer: &dyn ProgramSemanticsLowerer,
+    file: &ProjectFile,
+    request: &mut SemanticRequest<'_>,
+    started_work: SemanticWork,
+) -> Result<SemanticOutcome<Arc<SemanticArtifact>>, SemanticProviderError> {
     let max_source_bytes = request.budget.remaining().source_bytes;
     let scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
     let (source_identity, prepared) =
@@ -757,6 +899,38 @@ fn materialize_with_lowerer_inner<A: LanguageAdapter>(
         });
     }
 
+    // A file that had no reusable blob was parsed above. Its blob may still
+    // have complete rows, which serve the artifact without lowering.
+    if analyzer.reusable_live_oid(file).is_none()
+        && matches!(prepared.origin(), PreparedSourceOrigin::Disk)
+        && let Some(publication) =
+            complete_semantic_ir_publication(analyzer, file, source_identity)?
+    {
+        assert_eq!(
+            publication.content, content,
+            "semantic IR rows for blob {source_identity} must describe its parsed source"
+        );
+        note_serve(
+            &SERVE_COUNTS.rows_hits,
+            "rows_hit",
+            file.rel_path().display(),
+        );
+        let outcome = publish_from_semantic_ir_rows(
+            analyzer,
+            lowerer,
+            key,
+            &publication,
+            permit,
+            source_work,
+            staged_budget,
+            started_work,
+            request,
+        );
+        observe_complete_artifact(file, &outcome, request);
+        return outcome;
+    }
+
+    note_serve(&SERVE_COUNTS.lowerings, "lowering", key.path().as_str());
     #[cfg(any(test, feature = "test-support"))]
     cache.record_lowering(key.path());
     let lowered = if let Some(primary_lowerer) = lowerer.primary_declaration_lowerer() {
@@ -804,6 +978,38 @@ fn materialize_with_lowerer_inner<A: LanguageAdapter>(
     }
     observe_complete_artifact(file, &outcome, request);
     outcome
+}
+
+/// Process-wide counts of how complete semantic artifacts were answered. The
+/// counts are relaxed atomics read only by the `BIFROST_TIMING` notes, so a
+/// note carries the running totals at the moment it is written.
+struct ServeCounts {
+    complete_hits: AtomicU64,
+    rows_hits: AtomicU64,
+    rows_misses: AtomicU64,
+    lowerings: AtomicU64,
+}
+
+static SERVE_COUNTS: ServeCounts = ServeCounts {
+    complete_hits: AtomicU64::new(0),
+    rows_hits: AtomicU64::new(0),
+    rows_misses: AtomicU64::new(0),
+    lowerings: AtomicU64::new(0),
+};
+
+/// Count one serve of `event` for `path` and note it with the running totals.
+fn note_serve(counter: &AtomicU64, event: &str, path: impl std::fmt::Display) {
+    counter.fetch_add(1, Ordering::Relaxed);
+    crate::profiling::note_with(|| {
+        let total = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        format!(
+            "semantic.{event} {path} complete_hits={} rows_hits={} rows_misses={} lowerings={}",
+            total(&SERVE_COUNTS.complete_hits),
+            total(&SERVE_COUNTS.rows_hits),
+            total(&SERVE_COUNTS.rows_misses),
+            total(&SERVE_COUNTS.lowerings),
+        )
+    });
 }
 
 /// Notify an opted-in caller only after a complete outcome has committed its
@@ -855,6 +1061,11 @@ fn publish_cached(
     mut staged_budget: super::SemanticBudget,
     request: &mut SemanticRequest<'_>,
 ) -> Result<SemanticOutcome<Arc<SemanticArtifact>>, SemanticProviderError> {
+    note_serve(
+        &SERVE_COUNTS.complete_hits,
+        "complete_hit",
+        artifact.key().path().as_str(),
+    );
     let fingerprint = artifact.key().fingerprint();
     #[cfg(any(test, feature = "test-support"))]
     cache.record_hit(
@@ -923,6 +1134,113 @@ fn served_from_unchanged_source<A: LanguageAdapter>(
     Ok(cache.get_ready(&key, request.cancellation))
 }
 
+/// The blob's complete semantic IR rows under the active producer epoch. Any
+/// other publication outcome is not served: the caller lowers the file.
+fn complete_semantic_ir_publication<A: LanguageAdapter>(
+    analyzer: &TreeSitterAnalyzer<A>,
+    file: &ProjectFile,
+    oid: Oid,
+) -> Result<Option<SemanticIrPublication>, SemanticProviderError> {
+    let storage_language = analyzer.adapter().storage_language_key_for_file(file);
+    let publication = analyzer
+        .analyzer_store()
+        .semantic_ir_publication(oid, storage_language)
+        .map_err(|error| SemanticProviderError::internal(error.to_string()))?;
+    Ok(publication.filter(|publication| {
+        matches!(publication.outcome, SemanticIrPublicationOutcome::Complete)
+    }))
+}
+
+/// One procedure's stored partial flows, when the file's complete publication
+/// carries the artifact `key`. `None` when there is no complete
+/// publication, or its content is another revision's; the caller then computes
+/// the flows at query time.
+pub(crate) fn stored_partial_flows<A: LanguageAdapter>(
+    analyzer: &TreeSitterAnalyzer<A>,
+    file: &ProjectFile,
+    key: &SemanticArtifactKey,
+    procedure: ProcedureId,
+) -> Result<Option<ProcedurePartialFlows>, SemanticProviderError> {
+    let Some(oid) = analyzer.reusable_live_oid(file) else {
+        return Ok(None);
+    };
+    let Some(publication) = complete_semantic_ir_publication(analyzer, file, oid)? else {
+        return Ok(None);
+    };
+    if publication.content != key.revision().content() {
+        return Ok(None);
+    }
+    let scope = SemanticIrMountScope {
+        mount: key.mount(),
+        path: key.path().clone(),
+        language: key.language(),
+        content: key.revision().content(),
+    };
+    analyzer
+        .analyzer_store()
+        .read_partial_flows(publication.blob_id, procedure, &scope)
+        .map_err(|error| SemanticProviderError::internal(error.to_string()))
+}
+
+/// Whether the file's complete semantic IR publication carries the content of
+/// the artifact `key`.
+pub(crate) fn has_complete_semantic_ir_rows<A: LanguageAdapter>(
+    analyzer: &TreeSitterAnalyzer<A>,
+    file: &ProjectFile,
+    key: &SemanticArtifactKey,
+) -> Result<bool, SemanticProviderError> {
+    let Some(oid) = analyzer.reusable_live_oid(file) else {
+        return Ok(false);
+    };
+    let Some(publication) = complete_semantic_ir_publication(analyzer, file, oid)? else {
+        return Ok(false);
+    };
+    Ok(publication.content == key.revision().content())
+}
+
+/// Decodes one blob's rows and publishes them as the artifact that lowering
+/// the same source produces. The caller holds the flight `permit` for `key`.
+#[allow(clippy::too_many_arguments)]
+fn publish_from_semantic_ir_rows<A: LanguageAdapter>(
+    analyzer: &TreeSitterAnalyzer<A>,
+    lowerer: &dyn ProgramSemanticsLowerer,
+    key: SemanticArtifactKey,
+    publication: &SemanticIrPublication,
+    permit: CompleteValuePermit<SemanticArtifactKey, SemanticArtifact>,
+    source_work: SemanticWork,
+    staged_budget: super::SemanticBudget,
+    started_work: SemanticWork,
+    request: &mut SemanticRequest<'_>,
+) -> Result<SemanticOutcome<Arc<SemanticArtifact>>, SemanticProviderError> {
+    let scope = SemanticIrMountScope {
+        mount: key.mount(),
+        path: key.path().clone(),
+        language: key.language(),
+        content: key.revision().content(),
+    };
+    let parts = analyzer
+        .analyzer_store()
+        .read_semantic_ir(publication.blob_id, &scope)
+        .map_err(|error| SemanticProviderError::internal(error.to_string()))?;
+    let work = SemanticWork {
+        source_bytes: publication.source_bytes,
+        ..SemanticWork::default()
+    };
+    let outcome = publish_lowered(
+        key,
+        lowerer.capabilities(),
+        SemanticOutcome::Complete { value: parts, work },
+        source_work,
+        started_work,
+        staged_budget,
+        request,
+    );
+    if let Ok(SemanticOutcome::Complete { value, .. }) = &outcome {
+        permit.publish_complete(Arc::clone(value));
+    }
+    outcome
+}
+
 fn semantic_artifact_key_for_prepared(
     file: &ProjectFile,
     prepared: &PreparedSyntaxTree,
@@ -946,7 +1264,7 @@ fn semantic_artifact_key_for_prepared(
     )
 }
 
-fn semantic_artifact_key_from_content(
+pub(crate) fn semantic_artifact_key_from_content(
     file: &ProjectFile,
     dialect: LanguageDialect,
     content: ContentIdentity,
@@ -1237,7 +1555,7 @@ mod tests {
     use std::sync::mpsc;
     use std::sync::{Condvar, Mutex};
     use std::thread;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use super::*;
     use crate::analyzer::semantic::{SemanticArtifactCollector, SemanticBudget};
@@ -1245,6 +1563,7 @@ mod tests {
     use crate::analyzer::{
         AnalyzerQueryScope, IAnalyzer, Language, OverlayProject, Project, TestProject,
     };
+    use crate::test_support::write_file;
 
     #[derive(Clone, Copy)]
     enum FakeMode {
@@ -1281,10 +1600,6 @@ mod tests {
                 configuration: ConfigurationFingerprint::hash_bytes(b"fake-config"),
                 dependencies: DependencyFingerprint::hash_bytes(b"fake-dependencies"),
             }
-        }
-
-        fn capabilities(&self) -> SemanticCapabilities {
-            SemanticCapabilities::default()
         }
 
         fn lower(
@@ -1335,10 +1650,6 @@ mod tests {
     impl ProgramSemanticsLowerer for IdentityOnlyLowerer {
         fn identity(&self) -> SemanticAdapterIdentity {
             self.0.clone()
-        }
-
-        fn capabilities(&self) -> SemanticCapabilities {
-            SemanticCapabilities::default()
         }
 
         fn lower(
@@ -1392,10 +1703,6 @@ mod tests {
             }
         }
 
-        fn capabilities(&self) -> SemanticCapabilities {
-            SemanticCapabilities::default()
-        }
-
         fn lower(
             &self,
             _file: &ProjectFile,
@@ -1422,12 +1729,6 @@ mod tests {
                 work: SemanticWork::default(),
             })
         }
-    }
-
-    fn write_file(root: &std::path::Path, rel: &str, contents: &str) -> ProjectFile {
-        let file = ProjectFile::new(root.to_path_buf(), rel);
-        file.write(contents).expect("write fixture");
-        file
     }
 
     fn analyzer(root: &std::path::Path) -> TreeSitterAnalyzer<TypescriptAdapter> {
@@ -1466,14 +1767,10 @@ mod tests {
     }
 
     fn wait_for_waiter(cache: &CompleteSemanticArtifactCache) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while cache.waiting_count() == 0 {
-            assert!(
-                Instant::now() < deadline,
-                "same-key request did not enter the single-flight wait"
-            );
-            thread::yield_now();
-        }
+        brokk_bifrost_core::test_support::wait_for_nonzero_count(
+            || cache.waiting_count(),
+            "same-key request did not enter the single-flight wait",
+        );
     }
 
     /// A budget that read the file pays exactly that file once, plus the whole
@@ -1584,40 +1881,6 @@ mod tests {
             0,
             "freshness identity must not parse source"
         );
-    }
-
-    #[test]
-    fn current_artifact_key_matches_materialization_without_running_the_lowerer() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("root");
-        let file = write_file(&root, "src/main.ts", "export const value = 1;\n");
-        let analyzer = analyzer(&root);
-        let _scope = AnalyzerQueryScope::new(&analyzer);
-        let cache = CompleteSemanticArtifactCache::default();
-        let lowerer = FakeLowerer::new(FakeMode::Complete);
-
-        let current = current_artifact_source_with_lowerer(&analyzer, &lowerer, &file, usize::MAX)
-            .expect("current artifact source lookup")
-            .expect("current artifact source");
-        assert_eq!(current.source(), "export const value = 1;\n");
-        let current = current.key().clone();
-        assert_eq!(lowerer.calls(), 0);
-        assert_eq!(analyzer.prepared_syntax_parse_count_for_test(&file), 0);
-
-        let mut budget = SemanticBudget::default();
-        let SemanticOutcome::Complete { value, .. } = materialize(
-            &analyzer,
-            &cache,
-            &lowerer,
-            &file,
-            &mut budget,
-            &super::super::CancellationToken::default(),
-        ) else {
-            panic!("complete artifact")
-        };
-        assert_eq!(value.key(), &current);
-        assert_eq!(lowerer.calls(), 1);
-        assert_eq!(analyzer.prepared_syntax_parse_count_for_test(&file), 1);
     }
 
     #[test]
@@ -2007,93 +2270,6 @@ mod tests {
         );
     }
 
-    /// An explicitly updated file derives a fresh key and is paid for again.
-    ///
-    /// This is the soundness half of the derivation memo. The memo is keyed by
-    /// the blob identity of exactly the bytes it digested, so an entry cannot
-    /// describe any other content. Callers notify the analyzer after mutating
-    /// files behind its back; the update then derives the new content's key and
-    /// pays for its bytes while existing snapshots remain stable.
-    #[test]
-    fn an_edited_source_derives_a_fresh_key_and_pays_for_its_bytes_again() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("root");
-        let before = "export function main(): number { return 1; }\n";
-        let after = "export function main(): number { return 1; }\n\
-             export function second(): number { return 2; }\n";
-        let file = write_file(&root, "src/edited.ts", before);
-        let analyzer = analyzer(&root);
-        let cache = CompleteSemanticArtifactCache::default();
-        let lowerer = crate::analyzer::js_ts::semantic::JsTsSemanticLowerer::typescript();
-
-        let mut first_budget = SemanticBudget::default();
-        let SemanticOutcome::Complete { value: first, .. } = materialize(
-            &analyzer,
-            &cache,
-            &lowerer,
-            &file,
-            &mut first_budget,
-            &super::super::CancellationToken::default(),
-        ) else {
-            panic!("the fixture must lower completely")
-        };
-        assert_eq!(
-            first_budget.used().source_bytes,
-            before.len(),
-            "the request that lowered the file pays its bytes once"
-        );
-
-        // Unchanged: served without reading, which is the behaviour the edit
-        // below has to defeat.
-        let mut unchanged_budget = SemanticBudget::default();
-        let SemanticOutcome::Complete { value: served, .. } = materialize(
-            &analyzer,
-            &cache,
-            &lowerer,
-            &file,
-            &mut unchanged_budget,
-            &super::super::CancellationToken::default(),
-        ) else {
-            panic!("an unchanged source must still serve a complete artifact")
-        };
-        assert!(Arc::ptr_eq(&first, &served));
-        assert_artifact_charged_without_reading(&unchanged_budget, &served);
-
-        file.write(after).expect("rewrite fixture");
-        let updated_analyzer = analyzer.update(&BTreeSet::from([file.clone()]));
-
-        let mut edited_budget = SemanticBudget::default();
-        let SemanticOutcome::Complete { value: edited, .. } = materialize(
-            &updated_analyzer,
-            &cache,
-            &lowerer,
-            &file,
-            &mut edited_budget,
-            &super::super::CancellationToken::default(),
-        ) else {
-            panic!("the edited fixture must lower completely")
-        };
-        assert_ne!(
-            first.key(),
-            edited.key(),
-            "an edited source must derive a fresh artifact key"
-        );
-        assert!(
-            !Arc::ptr_eq(&first, &edited),
-            "an edited source must not be served the previous artifact"
-        );
-        assert_eq!(
-            edited.procedures().len(),
-            2,
-            "the edited artifact must describe the edited file"
-        );
-        assert_eq!(
-            edited_budget.used().source_bytes,
-            after.len(),
-            "the request that re-read and re-hashed the edited file pays its bytes"
-        );
-    }
-
     /// A fresh budget is a fresh scope: it pays the census again.
     ///
     /// This is what keeps the change coherent with the per-region reset in
@@ -2200,73 +2376,6 @@ mod tests {
         cache.insert(second.key().clone(), Arc::clone(&second));
 
         assert_eq!(cache.len(), 1, "two byte-weighted entries exceed capacity");
-    }
-
-    #[test]
-    fn complete_cache_weight_includes_derived_call_indexes() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("root");
-        let file = write_file(
-            &root,
-            "src/calls.ts",
-            "function target(value: number): number { return value; }\n\
-             export function main(): number { return target(1); }\n",
-        );
-        let analyzer = analyzer(&root);
-        let staging_cache = CompleteSemanticArtifactCache::default();
-        let lowerer = crate::analyzer::js_ts::semantic::JsTsSemanticLowerer::typescript();
-        let mut budget = SemanticBudget::default();
-        let SemanticOutcome::Complete {
-            value: artifact, ..
-        } = materialize(
-            &analyzer,
-            &staging_cache,
-            &lowerer,
-            &file,
-            &mut budget,
-            &super::super::CancellationToken::default(),
-        )
-        else {
-            panic!("call-bearing artifact")
-        };
-
-        let call_index_bytes = artifact
-            .procedures()
-            .iter()
-            .map(ProcedureSemantics::call_indexes_retained_bytes)
-            .sum::<u64>();
-        let value_identity_index_bytes = artifact
-            .procedures()
-            .iter()
-            .map(ProcedureSemantics::value_identity_index_retained_bytes)
-            .sum::<u64>();
-        let lexical_children_index_bytes = artifact.lexical_children_index_retained_bytes();
-        assert!(
-            call_index_bytes > 0,
-            "fixture must retain derived call-phase indexes"
-        );
-        let base_bytes = retained_artifact_base_bytes(&artifact);
-        let retained_bytes = retained_artifact_bytes(artifact.key(), &artifact);
-        assert_eq!(
-            retained_bytes,
-            base_bytes
-                .saturating_add(call_index_bytes)
-                .saturating_add(value_identity_index_bytes)
-                .saturating_add(lexical_children_index_bytes),
-            "cache weight must include every derived semantic-index allocation"
-        );
-
-        let undersized = CompleteSemanticArtifactCache::new(base_bytes);
-        undersized.insert(artifact.key().clone(), Arc::clone(&artifact));
-        assert_eq!(
-            undersized.len(),
-            0,
-            "the former row-only capacity must not retain the indexed artifact"
-        );
-
-        let exact = CompleteSemanticArtifactCache::new(retained_bytes);
-        exact.insert(artifact.key().clone(), artifact);
-        assert_eq!(exact.len(), 1, "the corrected exact capacity retains it");
     }
 
     #[test]
@@ -2449,72 +2558,6 @@ mod tests {
     }
 
     #[test]
-    fn dialect_and_source_origin_are_part_of_snapshot_identity() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("root");
-        let source = "export const value = 1;\n";
-        let ts = write_file(&root, "src/same.ts", source);
-        let tsx = write_file(&root, "src/same.tsx", source);
-        let base: Arc<dyn crate::analyzer::Project> =
-            Arc::new(TestProject::new(root.clone(), Language::TypeScript));
-        let overlay = Arc::new(OverlayProject::new(base));
-        let analyzer = TreeSitterAnalyzer::new(overlay.clone(), TypescriptAdapter);
-        let cache = CompleteSemanticArtifactCache::default();
-        let lowerer = FakeLowerer::new(FakeMode::Complete);
-
-        let mut budget = SemanticBudget::default();
-        let SemanticOutcome::Complete { value: disk, .. } = materialize(
-            &analyzer,
-            &cache,
-            &lowerer,
-            &ts,
-            &mut budget,
-            &super::super::CancellationToken::default(),
-        ) else {
-            panic!("disk artifact")
-        };
-        let mut budget = SemanticBudget::default();
-        let SemanticOutcome::Complete {
-            value: tsx_artifact,
-            ..
-        } = materialize(
-            &analyzer,
-            &cache,
-            &lowerer,
-            &tsx,
-            &mut budget,
-            &super::super::CancellationToken::default(),
-        )
-        else {
-            panic!("tsx artifact")
-        };
-        assert_ne!(disk.key().language(), tsx_artifact.key().language());
-
-        assert!(overlay.set(ts.abs_path(), source.to_string()));
-        let mut budget = SemanticBudget::default();
-        let SemanticOutcome::Complete {
-            value: overlay_artifact,
-            ..
-        } = materialize(
-            &analyzer,
-            &cache,
-            &lowerer,
-            &ts,
-            &mut budget,
-            &super::super::CancellationToken::default(),
-        )
-        else {
-            panic!("overlay artifact")
-        };
-        assert_ne!(disk.key(), overlay_artifact.key());
-        assert!(matches!(disk.key().revision(), SourceRevision::Disk { .. }));
-        assert!(matches!(
-            overlay_artifact.key().revision(),
-            SourceRevision::Overlay { .. }
-        ));
-    }
-
-    #[test]
     fn adjacent_overlay_revisions_do_not_reuse_stale_artifacts() {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("root");
@@ -2571,33 +2614,6 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_discards_unpublished_construction() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("root");
-        let file = write_file(&root, "src/main.ts", "export const value = 1;\n");
-        let analyzer = analyzer(&root);
-        let cache = CompleteSemanticArtifactCache::default();
-        let lowerer = FakeLowerer::new(FakeMode::Cancel);
-        let cancellation = super::super::CancellationToken::default();
-        let mut budget = SemanticBudget::default();
-
-        let outcome = materialize(
-            &analyzer,
-            &cache,
-            &lowerer,
-            &file,
-            &mut budget,
-            &cancellation,
-        );
-        assert!(matches!(
-            outcome,
-            SemanticOutcome::Cancelled { partial: None, .. }
-        ));
-        assert_eq!(budget.used(), SemanticWork::default());
-        assert_eq!(cache.len(), 0);
-    }
-
-    #[test]
     fn independently_validated_cancelled_partial_is_charged_but_not_cached() {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("root");
@@ -2625,117 +2641,6 @@ mod tests {
         };
         assert_source_and_artifact_charged(&budget, &file, &partial);
         assert_eq!(cache.len(), 0);
-    }
-
-    #[test]
-    fn cancellation_discards_non_cancelled_partial_outcomes_without_charging() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("root");
-        let file = write_file(&root, "src/main.ts", "export const value = 1;\n");
-        let analyzer = analyzer(&root);
-        let cache = CompleteSemanticArtifactCache::default();
-        let lowerer = FakeLowerer::new(FakeMode::CancelUnknownPartial);
-        let cancellation = super::super::CancellationToken::default();
-        let mut budget = SemanticBudget::default();
-
-        let outcome = materialize(
-            &analyzer,
-            &cache,
-            &lowerer,
-            &file,
-            &mut budget,
-            &cancellation,
-        );
-        assert!(matches!(
-            outcome,
-            SemanticOutcome::Cancelled { partial: None, .. }
-        ));
-        assert_eq!(budget.used(), SemanticWork::default());
-        assert_eq!(cache.len(), 0);
-    }
-
-    #[test]
-    fn source_limit_is_enforced_before_parsing_or_lowering() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("root");
-        let file = write_file(&root, "src/main.ts", "export const value = 1;\n");
-        let analyzer = analyzer(&root);
-        let cache = CompleteSemanticArtifactCache::default();
-        let lowerer = FakeLowerer::new(FakeMode::Complete);
-        let mut limits = SemanticBudget::default().limits();
-        limits.source_bytes = 8;
-        let mut budget = SemanticBudget::new(limits).expect("positive limits");
-
-        let outcome = materialize(
-            &analyzer,
-            &cache,
-            &lowerer,
-            &file,
-            &mut budget,
-            &super::super::CancellationToken::default(),
-        );
-        assert!(matches!(
-            outcome,
-            SemanticOutcome::ExceededBudget { partial: None, work, .. }
-                if work.source_bytes > 8
-        ));
-        assert_eq!(lowerer.calls(), 0);
-        assert_eq!(budget.used(), SemanticWork::default());
-    }
-
-    #[test]
-    fn empty_source_is_a_valid_exact_snapshot() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("root");
-        let file = write_file(&root, "src/empty.ts", "");
-        let analyzer = analyzer(&root);
-        let cache = CompleteSemanticArtifactCache::default();
-        let lowerer = FakeLowerer::new(FakeMode::Complete);
-        let mut budget = SemanticBudget::default();
-
-        let outcome = materialize(
-            &analyzer,
-            &cache,
-            &lowerer,
-            &file,
-            &mut budget,
-            &super::super::CancellationToken::default(),
-        );
-        let SemanticOutcome::Complete { value, .. } = outcome else {
-            panic!("empty TypeScript source should publish an empty complete artifact")
-        };
-        assert!(value.procedures().is_empty());
-        assert_source_and_artifact_charged(&budget, &file, &value);
-    }
-
-    #[test]
-    fn concrete_provider_rejects_foreign_roots_and_languages_before_source_access() {
-        let first = tempfile::tempdir().expect("first temp dir");
-        let second = tempfile::tempdir().expect("second temp dir");
-        let root = first.path().canonicalize().expect("first root");
-        let foreign_root = second.path().canonicalize().expect("second root");
-        let analyzer = analyzer(&root);
-        let cache = CompleteSemanticArtifactCache::default();
-        let lowerer = FakeLowerer::new(FakeMode::Complete);
-        let cancellation = super::super::CancellationToken::default();
-
-        for file in [
-            ProjectFile::new(foreign_root, "src/main.ts"),
-            ProjectFile::new(root.clone(), "src/Main.java"),
-        ] {
-            let mut budget = SemanticBudget::default();
-            let error = materialize_with_lowerer(
-                &analyzer,
-                &cache,
-                &lowerer,
-                &file,
-                &mut SemanticRequest::new(&mut budget, &cancellation),
-            )
-            .expect_err("foreign file identity should be rejected");
-            assert!(matches!(error, SemanticProviderError::InvalidIdentity(_)));
-            assert_eq!(budget.used(), SemanticWork::default());
-        }
-        assert_eq!(lowerer.calls(), 0);
     }
 
     #[test]
@@ -2935,5 +2840,392 @@ mod tests {
             collector.take_all_complete().is_empty(),
             "a complete lowerer result whose budget commit failed is not observable"
         );
+    }
+
+    #[test]
+    fn current_artifact_key_matches_materialization_without_running_the_lowerer() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("root");
+        let file = write_file(&root, "src/main.ts", "export const value = 1;\n");
+        let analyzer = analyzer(&root);
+        let _scope = AnalyzerQueryScope::new(&analyzer);
+        let cache = CompleteSemanticArtifactCache::default();
+        let lowerer = FakeLowerer::new(FakeMode::Complete);
+
+        let current = current_artifact_source_with_lowerer(&analyzer, &lowerer, &file, usize::MAX)
+            .expect("current artifact source lookup")
+            .expect("current artifact source");
+        assert_eq!(current.source(), "export const value = 1;\n");
+        let current = current.key().clone();
+        assert_eq!(lowerer.calls(), 0);
+        assert_eq!(analyzer.prepared_syntax_parse_count_for_test(&file), 0);
+
+        let mut budget = SemanticBudget::default();
+        let SemanticOutcome::Complete { value, .. } = materialize(
+            &analyzer,
+            &cache,
+            &lowerer,
+            &file,
+            &mut budget,
+            &super::super::CancellationToken::default(),
+        ) else {
+            panic!("complete artifact")
+        };
+        assert_eq!(value.key(), &current);
+        assert_eq!(lowerer.calls(), 1);
+        assert_eq!(analyzer.prepared_syntax_parse_count_for_test(&file), 1);
+    }
+
+    #[test]
+    fn an_edited_source_derives_a_fresh_key_and_pays_for_its_bytes_again() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("root");
+        let before = "export function main(): number { return 1; }\n";
+        let after = "export function main(): number { return 1; }\n\
+             export function second(): number { return 2; }\n";
+        let file = write_file(&root, "src/edited.ts", before);
+        let analyzer = analyzer(&root);
+        let cache = CompleteSemanticArtifactCache::default();
+        let lowerer = crate::analyzer::js_ts::semantic::JsTsSemanticLowerer::typescript();
+
+        let mut first_budget = SemanticBudget::default();
+        let SemanticOutcome::Complete { value: first, .. } = materialize(
+            &analyzer,
+            &cache,
+            &lowerer,
+            &file,
+            &mut first_budget,
+            &super::super::CancellationToken::default(),
+        ) else {
+            panic!("the fixture must lower completely")
+        };
+        assert_eq!(
+            first_budget.used().source_bytes,
+            before.len(),
+            "the request that lowered the file pays its bytes once"
+        );
+
+        // Unchanged: served without reading, which is the behaviour the edit
+        // below has to defeat.
+        let mut unchanged_budget = SemanticBudget::default();
+        let SemanticOutcome::Complete { value: served, .. } = materialize(
+            &analyzer,
+            &cache,
+            &lowerer,
+            &file,
+            &mut unchanged_budget,
+            &super::super::CancellationToken::default(),
+        ) else {
+            panic!("an unchanged source must still serve a complete artifact")
+        };
+        assert!(Arc::ptr_eq(&first, &served));
+        assert_artifact_charged_without_reading(&unchanged_budget, &served);
+
+        file.write(after).expect("rewrite fixture");
+        let updated_analyzer = analyzer.update(&BTreeSet::from([file.clone()]));
+
+        let mut edited_budget = SemanticBudget::default();
+        let SemanticOutcome::Complete { value: edited, .. } = materialize(
+            &updated_analyzer,
+            &cache,
+            &lowerer,
+            &file,
+            &mut edited_budget,
+            &super::super::CancellationToken::default(),
+        ) else {
+            panic!("the edited fixture must lower completely")
+        };
+        assert_ne!(
+            first.key(),
+            edited.key(),
+            "an edited source must derive a fresh artifact key"
+        );
+        assert!(
+            !Arc::ptr_eq(&first, &edited),
+            "an edited source must not be served the previous artifact"
+        );
+        assert_eq!(
+            edited.procedures().len(),
+            2,
+            "the edited artifact must describe the edited file"
+        );
+        assert_eq!(
+            edited_budget.used().source_bytes,
+            after.len(),
+            "the request that re-read and re-hashed the edited file pays its bytes"
+        );
+    }
+
+    #[test]
+    fn complete_cache_weight_includes_derived_call_indexes() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("root");
+        let file = write_file(
+            &root,
+            "src/calls.ts",
+            "function target(value: number): number { return value; }\n\
+             export function main(): number { return target(1); }\n",
+        );
+        let analyzer = analyzer(&root);
+        let staging_cache = CompleteSemanticArtifactCache::default();
+        let lowerer = crate::analyzer::js_ts::semantic::JsTsSemanticLowerer::typescript();
+        let mut budget = SemanticBudget::default();
+        let SemanticOutcome::Complete {
+            value: artifact, ..
+        } = materialize(
+            &analyzer,
+            &staging_cache,
+            &lowerer,
+            &file,
+            &mut budget,
+            &super::super::CancellationToken::default(),
+        )
+        else {
+            panic!("call-bearing artifact")
+        };
+
+        let call_index_bytes = artifact
+            .procedures()
+            .iter()
+            .map(ProcedureSemantics::call_indexes_retained_bytes)
+            .sum::<u64>();
+        let value_identity_index_bytes = artifact
+            .procedures()
+            .iter()
+            .map(ProcedureSemantics::value_identity_index_retained_bytes)
+            .sum::<u64>();
+        let lexical_children_index_bytes = artifact.lexical_children_index_retained_bytes();
+        let call_source_extent_bytes = artifact.call_source_extents_retained_bytes();
+        assert!(
+            call_index_bytes > 0,
+            "fixture must retain derived call-phase indexes"
+        );
+        let base_bytes = retained_artifact_base_bytes(&artifact);
+        let retained_bytes = retained_artifact_bytes(artifact.key(), &artifact);
+        assert_eq!(
+            retained_bytes,
+            base_bytes
+                .saturating_add(call_index_bytes)
+                .saturating_add(value_identity_index_bytes)
+                .saturating_add(lexical_children_index_bytes)
+                .saturating_add(call_source_extent_bytes),
+            "cache weight must include every derived semantic-index allocation"
+        );
+
+        let undersized = CompleteSemanticArtifactCache::new(base_bytes);
+        undersized.insert(artifact.key().clone(), Arc::clone(&artifact));
+        assert_eq!(
+            undersized.len(),
+            0,
+            "the former row-only capacity must not retain the indexed artifact"
+        );
+
+        let exact = CompleteSemanticArtifactCache::new(retained_bytes);
+        exact.insert(artifact.key().clone(), artifact);
+        assert_eq!(exact.len(), 1, "the corrected exact capacity retains it");
+    }
+
+    #[test]
+    fn dialect_and_source_origin_are_part_of_snapshot_identity() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("root");
+        let source = "export const value = 1;\n";
+        let ts = write_file(&root, "src/same.ts", source);
+        let tsx = write_file(&root, "src/same.tsx", source);
+        let base: Arc<dyn crate::analyzer::Project> =
+            Arc::new(TestProject::new(root.clone(), Language::TypeScript));
+        let overlay = Arc::new(OverlayProject::new(base));
+        let analyzer = TreeSitterAnalyzer::new(overlay.clone(), TypescriptAdapter);
+        let cache = CompleteSemanticArtifactCache::default();
+        let lowerer = FakeLowerer::new(FakeMode::Complete);
+
+        let mut budget = SemanticBudget::default();
+        let SemanticOutcome::Complete { value: disk, .. } = materialize(
+            &analyzer,
+            &cache,
+            &lowerer,
+            &ts,
+            &mut budget,
+            &super::super::CancellationToken::default(),
+        ) else {
+            panic!("disk artifact")
+        };
+        let mut budget = SemanticBudget::default();
+        let SemanticOutcome::Complete {
+            value: tsx_artifact,
+            ..
+        } = materialize(
+            &analyzer,
+            &cache,
+            &lowerer,
+            &tsx,
+            &mut budget,
+            &super::super::CancellationToken::default(),
+        )
+        else {
+            panic!("tsx artifact")
+        };
+        assert_ne!(disk.key().language(), tsx_artifact.key().language());
+
+        assert!(overlay.set(ts.abs_path(), source.to_string()));
+        let mut budget = SemanticBudget::default();
+        let SemanticOutcome::Complete {
+            value: overlay_artifact,
+            ..
+        } = materialize(
+            &analyzer,
+            &cache,
+            &lowerer,
+            &ts,
+            &mut budget,
+            &super::super::CancellationToken::default(),
+        )
+        else {
+            panic!("overlay artifact")
+        };
+        assert_ne!(disk.key(), overlay_artifact.key());
+        assert!(matches!(disk.key().revision(), SourceRevision::Disk { .. }));
+        assert!(matches!(
+            overlay_artifact.key().revision(),
+            SourceRevision::Overlay { .. }
+        ));
+    }
+
+    #[test]
+    fn cancellation_discards_unpublished_construction() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("root");
+        let file = write_file(&root, "src/main.ts", "export const value = 1;\n");
+        let analyzer = analyzer(&root);
+        let cache = CompleteSemanticArtifactCache::default();
+        let lowerer = FakeLowerer::new(FakeMode::Cancel);
+        let cancellation = super::super::CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+
+        let outcome = materialize(
+            &analyzer,
+            &cache,
+            &lowerer,
+            &file,
+            &mut budget,
+            &cancellation,
+        );
+        assert!(matches!(
+            outcome,
+            SemanticOutcome::Cancelled { partial: None, .. }
+        ));
+        assert_eq!(budget.used(), SemanticWork::default());
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn cancellation_discards_non_cancelled_partial_outcomes_without_charging() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("root");
+        let file = write_file(&root, "src/main.ts", "export const value = 1;\n");
+        let analyzer = analyzer(&root);
+        let cache = CompleteSemanticArtifactCache::default();
+        let lowerer = FakeLowerer::new(FakeMode::CancelUnknownPartial);
+        let cancellation = super::super::CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+
+        let outcome = materialize(
+            &analyzer,
+            &cache,
+            &lowerer,
+            &file,
+            &mut budget,
+            &cancellation,
+        );
+        assert!(matches!(
+            outcome,
+            SemanticOutcome::Cancelled { partial: None, .. }
+        ));
+        assert_eq!(budget.used(), SemanticWork::default());
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn source_limit_is_enforced_before_parsing_or_lowering() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("root");
+        let file = write_file(&root, "src/main.ts", "export const value = 1;\n");
+        let analyzer = analyzer(&root);
+        let cache = CompleteSemanticArtifactCache::default();
+        let lowerer = FakeLowerer::new(FakeMode::Complete);
+        let mut limits = SemanticBudget::default().limits();
+        limits.source_bytes = 8;
+        let mut budget = SemanticBudget::new(limits).expect("positive limits");
+
+        let outcome = materialize(
+            &analyzer,
+            &cache,
+            &lowerer,
+            &file,
+            &mut budget,
+            &super::super::CancellationToken::default(),
+        );
+        assert!(matches!(
+            outcome,
+            SemanticOutcome::ExceededBudget { partial: None, work, .. }
+                if work.source_bytes > 8
+        ));
+        assert_eq!(lowerer.calls(), 0);
+        assert_eq!(budget.used(), SemanticWork::default());
+    }
+
+    #[test]
+    fn empty_source_is_a_valid_exact_snapshot() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("root");
+        let file = write_file(&root, "src/empty.ts", "");
+        let analyzer = analyzer(&root);
+        let cache = CompleteSemanticArtifactCache::default();
+        let lowerer = FakeLowerer::new(FakeMode::Complete);
+        let mut budget = SemanticBudget::default();
+
+        let outcome = materialize(
+            &analyzer,
+            &cache,
+            &lowerer,
+            &file,
+            &mut budget,
+            &super::super::CancellationToken::default(),
+        );
+        let SemanticOutcome::Complete { value, .. } = outcome else {
+            panic!("empty TypeScript source should publish an empty complete artifact")
+        };
+        assert!(value.procedures().is_empty());
+        assert_source_and_artifact_charged(&budget, &file, &value);
+    }
+
+    #[test]
+    fn concrete_provider_rejects_foreign_roots_and_languages_before_source_access() {
+        let first = tempfile::tempdir().expect("first temp dir");
+        let second = tempfile::tempdir().expect("second temp dir");
+        let root = first.path().canonicalize().expect("first root");
+        let foreign_root = second.path().canonicalize().expect("second root");
+        let analyzer = analyzer(&root);
+        let cache = CompleteSemanticArtifactCache::default();
+        let lowerer = FakeLowerer::new(FakeMode::Complete);
+        let cancellation = super::super::CancellationToken::default();
+
+        for file in [
+            ProjectFile::new(foreign_root, "src/main.ts"),
+            ProjectFile::new(root.clone(), "src/Main.java"),
+        ] {
+            let mut budget = SemanticBudget::default();
+            let error = materialize_with_lowerer(
+                &analyzer,
+                &cache,
+                &lowerer,
+                &file,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect_err("foreign file identity should be rejected");
+            assert!(matches!(error, SemanticProviderError::InvalidIdentity(_)));
+            assert_eq!(budget.used(), SemanticWork::default());
+        }
+        assert_eq!(lowerer.calls(), 0);
     }
 }

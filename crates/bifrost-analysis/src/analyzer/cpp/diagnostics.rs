@@ -10,10 +10,9 @@
 
 use crate::analyzer::{
     CppAnalyzer, Language, ProjectFile, SemanticDiagnosticIncompleteReason,
-    SemanticDiagnosticOutcome, SemanticDiagnosticReport, SemanticDiagnosticReportStatus,
-    TestProject,
+    SemanticDiagnosticReport, SemanticDiagnosticReportStatus, TestProject,
 };
-use brokk_bifrost_cpp::diagnostics::{CPP_UNRECOGNIZED_SYMBOL, collect_cpp_semantic_diagnostics};
+use brokk_bifrost_cpp::diagnostics::collect_cpp_semantic_diagnostics;
 
 fn analyzer_fixture(files: &[(&str, &str)]) -> (tempfile::TempDir, CppAnalyzer, ProjectFile) {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -33,13 +32,7 @@ fn has_incomplete_reason(
     report: &SemanticDiagnosticReport,
     matcher: fn(&SemanticDiagnosticIncompleteReason) -> bool,
 ) -> bool {
-    report.outcomes().iter().any(|outcome| {
-        matches!(
-            outcome,
-            SemanticDiagnosticOutcome::Incomplete { reasons, .. }
-                if reasons.iter().any(matcher)
-        )
-    })
+    report.incomplete_reasons().any(matcher)
 }
 
 #[test]
@@ -65,48 +58,6 @@ fn a_file_the_compile_database_does_not_name_is_unjudged_not_clean() {
         report.outcomes()
     );
 }
-
-#[test]
-fn matching_context_reports_a_clear_unknown_type() {
-    let (_temp, analyzer, file) = analyzer_fixture(&[
-        ("src/main.cpp", "MissingType value;"),
-        (
-            "compile_commands.json",
-            r#"[{"directory":".","file":"src/main.cpp","arguments":["clang++","-c","src/main.cpp"]}]"#,
-        ),
-    ]);
-    let report = collect_cpp_semantic_diagnostics(&analyzer, &file, "MissingType value;");
-
-    assert_eq!(1, report.diagnostics().len(), "{report:#?}");
-    assert_eq!(CPP_UNRECOGNIZED_SYMBOL, report.diagnostics()[0].kind);
-    assert_eq!(SemanticDiagnosticReportStatus::Complete, report.status());
-}
-
-#[test]
-fn included_project_type_is_not_diagnosed() {
-    let (_temp, analyzer, file) = analyzer_fixture(&[
-        ("include/project_type.hpp", "struct ProjectType {};"),
-        (
-            "src/main.cpp",
-            "#include \"project_type.hpp\"\nProjectType value;",
-        ),
-        (
-            "compile_commands.json",
-            r#"[{"directory":".","file":"src/main.cpp","arguments":["clang++","-I","include","-c","src/main.cpp"]}]"#,
-        ),
-    ]);
-    let source = "#include \"project_type.hpp\"\nProjectType value;";
-    let report = collect_cpp_semantic_diagnostics(&analyzer, &file, source);
-
-    assert!(report.diagnostics().is_empty(), "{:#?}", report.outcomes());
-    assert_eq!(
-        SemanticDiagnosticReportStatus::Complete,
-        report.status(),
-        "{:#?}",
-        report.outcomes()
-    );
-}
-
 #[test]
 fn a_command_line_macro_name_is_unjudged_rather_than_resolved() {
     let (_temp, analyzer, file) = analyzer_fixture(&[

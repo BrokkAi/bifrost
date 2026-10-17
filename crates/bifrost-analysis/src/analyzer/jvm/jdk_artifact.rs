@@ -2,12 +2,15 @@ use super::java_artifact::{
     MAX_SOURCE_ENTRY_BYTES, ZipDirectoryStatus, apply_enclosing_visibility, java_api_facts,
     source_api_types, source_declaration_index, zip_directory_status_with_limits,
 };
+use super::{failed_with_diagnostics, valid_module_name};
 use crate::CancellationToken;
+#[cfg(test)]
+use crate::analyzer::semantic_model::ExternalArtifactPackProducer;
 use crate::analyzer::semantic_model::{
     ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest, AuthoredPayload,
     AuthoredSemanticModelPack, AuthoredShard, BoundedProducerDiagnostics, Completeness,
-    ExternalArtifactKind, ExternalArtifactPackProducer, Producer, ProducerDiagnostic,
-    ProducerDiagnosticSeverity, Visibility, carried_source_paths, read_exact_artifact_while,
+    ExternalArtifactKind, Producer, ProducerDiagnostic, ProducerDiagnosticSeverity, Visibility,
+    carried_source_paths, read_exact_artifact_while,
 };
 use crate::analyzer::tree_walk::push_named_children_reversed;
 use crate::hash::{HashMap, HashSet};
@@ -136,7 +139,11 @@ impl JdkSourceArchivePackProducer {
         }
         for index in 0..entry_limit {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                return cancelled_production(limits);
+                return crate::analyzer::semantic_model::failed_artifact_production(
+                    "artifact.cancelled",
+                    "JDK source production was cancelled",
+                    limits,
+                );
             }
             let Ok(mut entry) = archive.by_index(index) else {
                 diagnostics.warning(
@@ -146,7 +153,18 @@ impl JdkSourceArchivePackProducer {
                 );
                 continue;
             };
-            let entry_name = entry.name().to_owned();
+            let entry_name = match entry.name() {
+                Ok(name) => name.into_owned(),
+                Err(error) => {
+                    diagnostics.error(
+                        "jdk.archive.entry_name",
+                        None,
+                        format!("could not decode archive entry name at index {index}: {error}"),
+                    );
+                    layout_error = true;
+                    continue;
+                }
+            };
             if !entry_name.ends_with(".java") {
                 continue;
             }
@@ -333,7 +351,11 @@ impl JdkSourceArchivePackProducer {
             let mut declarations = Vec::new();
             for entry in entries {
                 if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                    return cancelled_production(limits);
+                    return crate::analyzer::semantic_model::failed_artifact_production(
+                        "artifact.cancelled",
+                        "JDK source production was cancelled",
+                        limits,
+                    );
                 }
                 let Ok(mut archive_entry) = archive.by_index(entry.archive_index) else {
                     diagnostics.warning(
@@ -400,6 +422,7 @@ impl JdkSourceArchivePackProducer {
                 collection_flows: None,
                 deferred_yields: None,
                 conditional_type_refinements: None,
+                callable_values: None,
             });
         }
         if record_limit_hit {
@@ -490,7 +513,10 @@ pub fn detect_jdk_source_archive_layout(
         let Ok(entry) = archive.by_index(index) else {
             continue;
         };
-        let Some(components) = archive_path_components(entry.name()) else {
+        let Ok(name) = entry.name() else {
+            continue;
+        };
+        let Some(components) = archive_path_components(name.as_ref()) else {
             continue;
         };
         if components.len() == 1 && components[0] == "module-info.java" {
@@ -519,24 +545,10 @@ pub fn detect_jdk_source_archive_layout(
     })
 }
 
-impl ExternalArtifactPackProducer for JdkSourceArchivePackProducer {
-    fn produce_exact_artifact(
-        &self,
-        request: &ArtifactProductionRequest,
-        limits: &ArtifactProducerLimits,
-    ) -> ArtifactProduction {
-        self.produce(request, limits, None)
-    }
-
-    fn produce_exact_artifact_with_cancellation(
-        &self,
-        request: &ArtifactProductionRequest,
-        limits: &ArtifactProducerLimits,
-        cancellation: Option<&CancellationToken>,
-    ) -> ArtifactProduction {
-        self.produce(request, limits, cancellation)
-    }
-}
+crate::analyzer::semantic_model::implement_external_artifact_pack_producer!(
+    JdkSourceArchivePackProducer,
+    produce
+);
 
 struct JdkSourceEntry {
     archive_index: usize,
@@ -556,26 +568,6 @@ fn archive_path_components(entry_name: &str) -> Option<Vec<&str>> {
         }
     }
     (!result.is_empty()).then_some(result)
-}
-
-fn valid_module_name(name: &str) -> bool {
-    let mut segment_start = true;
-    for character in name.chars() {
-        if character == '.' {
-            if segment_start {
-                return false;
-            }
-            segment_start = true;
-        } else if segment_start {
-            if character != '_' && !character.is_ascii_alphabetic() {
-                return false;
-            }
-            segment_start = false;
-        } else if character != '_' && !character.is_ascii_alphanumeric() {
-            return false;
-        }
-    }
-    !segment_start
 }
 
 fn exported_module_packages(source: &str) -> Option<HashSet<String>> {
@@ -598,44 +590,12 @@ fn exported_module_packages(source: &str) -> Option<HashSet<String>> {
     Some(exports)
 }
 
-fn cancelled_production(limits: &ArtifactProducerLimits) -> ArtifactProduction {
-    ArtifactProduction::failed(
-        ProducerDiagnostic {
-            severity: ProducerDiagnosticSeverity::Error,
-            source_entry: None,
-            code: "artifact.cancelled".to_owned(),
-            location: None,
-            declaration: None,
-            message: "JDK source production was cancelled".to_owned(),
-        },
-        limits,
-    )
-}
-
-fn failed_with_diagnostics(
-    artifact_sha256: &str,
-    diagnostics: BoundedProducerDiagnostics,
-) -> ArtifactProduction {
-    let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
-    ArtifactProduction {
-        artifact_sha256: Some(artifact_sha256.to_owned()),
-        pack: None,
-        completeness: Completeness::Partial,
-        diagnostics,
-        suppressed_diagnostics,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::semantic_model::{
-        ActivationSelector, Compatibility, CompilerOptions, Provenance, Safety, compile_pack,
-    };
-    use std::fs::File;
-    use std::io::Write;
+    use crate::analyzer::semantic_model::{CompilerOptions, compile_pack};
+    use crate::test_support::write_zip;
     use tempfile::tempdir;
-    use zip::write::SimpleFileOptions;
 
     #[test]
     fn module_prefixed_jdk_sources_produce_independent_module_shards() {
@@ -826,50 +786,11 @@ mod tests {
     }
 
     fn request_for_version(path: std::path::PathBuf, version: &str) -> ArtifactProductionRequest {
-        ArtifactProductionRequest {
+        crate::analyzer::jvm::jdk_artifact_request(
             path,
-            artifact_kind: ExternalArtifactKind::JdkSourceZip,
-            pack_id: "jdk-21".to_owned(),
-            pack_version: version.to_owned(),
-            ecosystem: "jdk".to_owned(),
-            compatibility: Compatibility {
-                bifrost: None,
-                toolchains: vec![crate::analyzer::semantic_model::VersionConstraint {
-                    name: "jdk".to_owned(),
-                    requirement: format!("={version}"),
-                }],
-            },
-            activation: vec![ActivationSelector {
-                package: None,
-                module: None,
-                toolchain: Some(crate::analyzer::semantic_model::NameSelector {
-                    name: "jdk".to_owned(),
-                    version: Some(format!("={version}")),
-                }),
-                targets: Vec::new(),
-                configurations: Vec::new(),
-                artifact_sha256: None,
-            }],
-            provenance: Provenance {
-                source: "OpenJDK".to_owned(),
-                revision: Some(format!("jdk-{version}")),
-            },
-            license: "GPL-2.0-only WITH Classpath-exception-2.0".to_owned(),
-            safety: Safety {
-                generated_code_only: false,
-                review_required: false,
-            },
-        }
-    }
-
-    fn write_zip(path: &Path, entries: &[(&str, &str)]) {
-        let mut writer = zip::ZipWriter::new(File::create(path).unwrap());
-        for (entry_name, source) in entries {
-            writer
-                .start_file(*entry_name, SimpleFileOptions::default())
-                .unwrap();
-            writer.write_all(source.as_bytes()).unwrap();
-        }
-        writer.finish().unwrap();
+            ExternalArtifactKind::JdkSourceZip,
+            version,
+            Vec::new(),
+        )
     }
 }

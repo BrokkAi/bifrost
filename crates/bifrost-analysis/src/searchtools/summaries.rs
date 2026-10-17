@@ -1170,6 +1170,43 @@ where
     )
 }
 
+#[derive(Default)]
+struct ResolvedMostRelevantSeeds {
+    seeds: Vec<(ProjectFile, f64)>,
+    not_found: Vec<NotFoundInput>,
+    ambiguous_paths: Vec<AmbiguousPathInput>,
+    duplicates: Vec<String>,
+    resolved_by_file: HashMap<ProjectFile, ()>,
+}
+
+impl ResolvedMostRelevantSeeds {
+    fn resolve(&mut self, resolver: &WorkspaceFileResolver, input: &str, weight: f64) {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        match resolver.resolve_literal(trimmed) {
+            ResolvedFileInput::File(file) => {
+                let display_path = rel_path_string(&file);
+                if self.resolved_by_file.insert(file.clone(), ()).is_some() {
+                    self.duplicates.push(display_path);
+                } else {
+                    self.seeds.push((file, weight));
+                }
+            }
+            ResolvedFileInput::Ambiguous(item) => self.ambiguous_paths.push(item),
+            ResolvedFileInput::NotFound(item) => {
+                self.not_found.push(file_not_found_input(item));
+            }
+        }
+    }
+
+    fn sort_duplicates(&mut self) {
+        self.duplicates.sort();
+        self.duplicates.dedup();
+    }
+}
+
 fn most_relevant_files_with_ranker(
     analyzer: &dyn IAnalyzer,
     params: MostRelevantFilesParams,
@@ -1191,17 +1228,13 @@ fn most_relevant_files_with_ranker(
         return Err(most_relevant_files_cancellation_message(cancellation));
     }
     let resolver = WorkspaceFileResolver::for_analyzer(analyzer);
-    let mut seeds = Vec::new();
-    let mut not_found = Vec::new();
-    let mut ambiguous_paths = Vec::new();
-    let mut duplicates = Vec::new();
+    let mut resolved = ResolvedMostRelevantSeeds::default();
     let seed_weights = params
         .seed_weights
         .unwrap_or_else(|| vec![1.0; params.seed_file_paths.len()]);
     let recency_half_life = params.recency_half_life;
     let ranking_mode = params.ranking_mode;
     let requested_limit = params.limit;
-    let mut resolved_by_file = HashMap::default();
 
     {
         let _scope = profiling::scope("searchtools::most_relevant_files.resolve_seeds");
@@ -1209,35 +1242,18 @@ fn most_relevant_files_with_ranker(
             if cancellation.is_cancelled() {
                 return Err(most_relevant_files_cancellation_message(cancellation));
             }
-            let trimmed = input.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-
-            match resolver.resolve_literal(trimmed) {
-                ResolvedFileInput::File(file) => {
-                    let display_path = rel_path_string(&file);
-                    if resolved_by_file.insert(file.clone(), ()).is_some() {
-                        duplicates.push(display_path);
-                        continue;
-                    }
-                    seeds.push((file, weight));
-                }
-                ResolvedFileInput::Ambiguous(item) => ambiguous_paths.push(item),
-                ResolvedFileInput::NotFound(item) => not_found.push(file_not_found_input(item)),
-            }
+            resolved.resolve(&resolver, &input, weight);
         }
     }
 
-    duplicates.sort();
-    duplicates.dedup();
-    if !duplicates.is_empty() {
+    resolved.sort_duplicates();
+    if !resolved.duplicates.is_empty() {
         return Ok(MostRelevantFilesResult {
             files: Vec::new(),
             session_subset: session_subset(analyzer),
-            not_found,
-            ambiguous_paths,
-            duplicates,
+            not_found: resolved.not_found,
+            ambiguous_paths: resolved.ambiguous_paths,
+            duplicates: resolved.duplicates,
             complete: true,
             ranking_mode_used: ranking_mode,
             incomplete_reason: None,
@@ -1249,7 +1265,7 @@ fn most_relevant_files_with_ranker(
         let (ranked, mut complete, ranking_mode_used, mut incomplete_reason) =
             match rank_project_files(
                 token,
-                &seeds,
+                &resolved.seeds,
                 requested_limit,
                 recency_half_life,
                 ranking_mode,
@@ -1294,7 +1310,7 @@ fn most_relevant_files_with_ranker(
                     } else {
                         most_relevant_project_files_with_half_life(
                             analyzer,
-                            &seeds,
+                            &resolved.seeds,
                             params.limit,
                             recency_half_life,
                             cancellation,
@@ -1342,9 +1358,9 @@ fn most_relevant_files_with_ranker(
     Ok(MostRelevantFilesResult {
         files,
         session_subset: session_subset(analyzer),
-        not_found,
-        ambiguous_paths,
-        duplicates,
+        not_found: resolved.not_found,
+        ambiguous_paths: resolved.ambiguous_paths,
+        duplicates: resolved.duplicates,
         complete,
         ranking_mode_used,
         incomplete_reason,
@@ -1362,45 +1378,25 @@ pub fn most_relevant_files_history_only(
     let _scope = profiling::scope("searchtools::most_relevant_files_history_only");
     validate_most_relevant_files_params(&params)?;
     let resolver = WorkspaceFileResolver::for_analyzer(analyzer);
-    let mut seeds = Vec::new();
-    let mut not_found = Vec::new();
-    let mut ambiguous_paths = Vec::new();
-    let mut duplicates = Vec::new();
+    let mut resolved = ResolvedMostRelevantSeeds::default();
     let seed_weights = params
         .seed_weights
         .unwrap_or_else(|| vec![1.0; params.seed_file_paths.len()]);
     let recency_half_life = params.recency_half_life;
     let requested_limit = params.limit;
-    let mut resolved_by_file = HashMap::default();
 
     for (input, weight) in params.seed_file_paths.into_iter().zip(seed_weights) {
-        let trimmed = input.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        match resolver.resolve_literal(trimmed) {
-            ResolvedFileInput::File(file) => {
-                let display_path = rel_path_string(&file);
-                if resolved_by_file.insert(file.clone(), ()).is_some() {
-                    duplicates.push(display_path);
-                    continue;
-                }
-                seeds.push((file, weight));
-            }
-            ResolvedFileInput::Ambiguous(item) => ambiguous_paths.push(item),
-            ResolvedFileInput::NotFound(item) => not_found.push(file_not_found_input(item)),
-        }
+        resolved.resolve(&resolver, &input, weight);
     }
 
-    duplicates.sort();
-    duplicates.dedup();
-    if !duplicates.is_empty() {
+    resolved.sort_duplicates();
+    if !resolved.duplicates.is_empty() {
         return Ok(MostRelevantFilesResult {
             files: Vec::new(),
             session_subset: session_subset(analyzer),
-            not_found,
-            ambiguous_paths,
-            duplicates,
+            not_found: resolved.not_found,
+            ambiguous_paths: resolved.ambiguous_paths,
+            duplicates: resolved.duplicates,
             complete: true,
             ranking_mode_used: MostRelevantFilesRankingMode::HistoryImports,
             incomplete_reason: None,
@@ -1409,7 +1405,7 @@ pub fn most_relevant_files_history_only(
 
     let (ranked, history_status) = most_relevant_project_files_history_only(
         analyzer,
-        &seeds,
+        &resolved.seeds,
         requested_limit,
         recency_half_life,
         &crate::CancellationToken::default(),
@@ -1435,9 +1431,9 @@ pub fn most_relevant_files_history_only(
     Ok(MostRelevantFilesResult {
         files,
         session_subset: session_subset(analyzer),
-        not_found,
-        ambiguous_paths,
-        duplicates,
+        not_found: resolved.not_found,
+        ambiguous_paths: resolved.ambiguous_paths,
+        duplicates: resolved.duplicates,
         complete,
         ranking_mode_used: MostRelevantFilesRankingMode::HistoryImports,
         incomplete_reason,
@@ -1445,10 +1441,14 @@ pub fn most_relevant_files_history_only(
 }
 
 fn most_relevant_files_cancellation_message(cancellation: &crate::CancellationToken) -> String {
-    if cancellation.is_timed_out() {
-        "most_relevant_files exceeded its request-wide time budget".to_string()
-    } else {
-        "most_relevant_files was cancelled".to_string()
+    match most_relevant_files_incomplete_reason(cancellation) {
+        MostRelevantFilesIncompleteReason::TimeBudget => {
+            "most_relevant_files exceeded its request-wide time budget".to_string()
+        }
+        MostRelevantFilesIncompleteReason::Cancelled => {
+            "most_relevant_files was cancelled".to_string()
+        }
+        _ => unreachable!("cancellation maps only to time budget or cancelled"),
     }
 }
 
@@ -1520,16 +1520,9 @@ pub(super) fn summary_elements_for_code_unit(
     // suitable for ranged searchtools summaries. Searchtools needs stable per-element line ranges,
     // so it derives summary elements from signatures and source ranges instead of reverse-mapping
     // formatted skeleton text.
-    let mut elements = signature_elements(analyzer, code_unit);
-    if code_unit.is_class() || code_unit.is_module() {
-        for child in analyzer.direct_children(code_unit) {
-            if child.is_anonymous() {
-                continue;
-            }
-            elements.extend(summary_elements_for_code_unit(analyzer, &child));
-        }
-    }
-    elements
+    summary_elements_for_code_unit_with_children(analyzer, code_unit, |unit| {
+        analyzer.direct_children(unit)
+    })
 }
 
 pub(super) fn summary_elements_for_code_unit_in_file(
@@ -1537,16 +1530,30 @@ pub(super) fn summary_elements_for_code_unit_in_file(
     code_unit: &CodeUnit,
     file: &ProjectFile,
 ) -> Vec<SummaryElement> {
-    let mut elements = signature_elements(analyzer, code_unit);
-    if code_unit.is_class() || code_unit.is_module() {
-        for child in analyzer.direct_children_in_file(code_unit) {
+    summary_elements_for_code_unit_with_children(analyzer, code_unit, |unit| {
+        let children = analyzer.direct_children_in_file(unit);
+        for child in &children {
             debug_assert_eq!(child.source(), file);
-            if child.is_anonymous() {
-                continue;
-            }
-            elements.extend(summary_elements_for_code_unit_in_file(
-                analyzer, &child, file,
-            ));
+        }
+        children
+    })
+}
+
+fn summary_elements_for_code_unit_with_children(
+    analyzer: &dyn IAnalyzer,
+    root: &CodeUnit,
+    mut children_for: impl FnMut(&CodeUnit) -> Vec<CodeUnit>,
+) -> Vec<SummaryElement> {
+    let mut elements = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(code_unit) = stack.pop() {
+        elements.extend(signature_elements(analyzer, &code_unit));
+        if code_unit.is_class() || code_unit.is_module() {
+            let children = children_for(&code_unit)
+                .into_iter()
+                .filter(|child| !child.is_anonymous())
+                .collect::<Vec<_>>();
+            stack.extend(children.into_iter().rev());
         }
     }
     elements
@@ -1769,75 +1776,6 @@ pub(super) fn trim_summary_signature(signature: &str) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
-
-#[cfg(test)]
-mod file_local_summary_tests {
-    use super::*;
-    use crate::analyzer::CodeUnitIndex;
-    use crate::analyzer::{JavaAnalyzer, Language, TestProject};
-
-    #[test]
-    fn file_summary_fallback_does_not_expand_a_java_package() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let file_a = ProjectFile::new(root.clone(), "src/p/A.java");
-        let file_b = ProjectFile::new(root.clone(), "src/p/B.java");
-        file_a
-            .write("package p; public class A { void fromA() {} }")
-            .unwrap();
-        file_b
-            .write("package p; public class B { void fromB() {} }")
-            .unwrap();
-        let analyzer = JavaAnalyzer::from_project(TestProject::new(root, Language::Java));
-        let package = analyzer
-            .top_level_declarations(&file_a)
-            .into_iter()
-            .find(CodeUnit::is_module)
-            .expect("synthetic package module in A.java");
-
-        analyzer
-            .test_hooks()
-            .reset_package_declaration_scan_count_for_test();
-        let elements = summary_elements_for_code_unit_in_file(&analyzer, &package, &file_a);
-
-        assert_eq!(
-            analyzer
-                .test_hooks()
-                .package_declaration_scan_count_for_test(),
-            0
-        );
-        assert!(elements.iter().any(|element| element.symbol.contains("A")));
-        assert!(
-            elements
-                .iter()
-                .all(|element| element.path == "src/p/A.java")
-        );
-    }
-}
-
-#[cfg(test)]
-mod issue_1304_tests {
-    use super::*;
-    use std::time::Duration;
-
-    #[test]
-    fn timeout_and_explicit_cancellation_have_distinct_reasons() {
-        let timed_out = crate::CancellationToken::default().with_timeout(Duration::ZERO);
-        assert!(timed_out.is_cancelled());
-        assert_eq!(
-            most_relevant_files_incomplete_reason(&timed_out),
-            MostRelevantFilesIncompleteReason::TimeBudget
-        );
-
-        let cancelled = crate::CancellationToken::default();
-        cancelled.cancel();
-        assert_eq!(
-            most_relevant_files_incomplete_reason(&cancelled),
-            MostRelevantFilesIncompleteReason::Cancelled
-        );
-    }
-}
-
 #[cfg(test)]
 mod selected_java_outer_relevance_tests {
     use super::*;
@@ -2223,5 +2161,30 @@ mod selected_java_outer_relevance_tests {
 
     fn paths(result: &MostRelevantFilesResult) -> Vec<&str> {
         result.files.iter().map(|file| file.path.as_str()).collect()
+    }
+}
+
+#[cfg(test)]
+mod issue_1304_tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+    use std::time::Duration;
+
+    #[test]
+    #[hardwon("d57e0ee72ded: timeout and explicit cancellation have distinct reasons")]
+    fn timeout_and_explicit_cancellation_have_distinct_reasons() {
+        let timed_out = crate::CancellationToken::default().with_timeout(Duration::ZERO);
+        assert!(timed_out.is_cancelled());
+        assert_eq!(
+            most_relevant_files_incomplete_reason(&timed_out),
+            MostRelevantFilesIncompleteReason::TimeBudget
+        );
+
+        let cancelled = crate::CancellationToken::default();
+        cancelled.cancel();
+        assert_eq!(
+            most_relevant_files_incomplete_reason(&cancelled),
+            MostRelevantFilesIncompleteReason::Cancelled
+        );
     }
 }

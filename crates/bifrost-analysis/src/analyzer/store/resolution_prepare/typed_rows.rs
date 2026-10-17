@@ -30,6 +30,7 @@
 //! [`PreparedTypedRows::shared`] and the writer renders them once the ids
 //! exist, exactly as `resolution_rows` does for a path body.
 
+use brokk_bifrost_core::analyzer::Language;
 use brokk_bifrost_core::analyzer::resolution_facts::{
     ALL_BINDING_PROJECTION_KINDS, ALL_DECLARATION_TYPE_ROLES, ALL_INTRINSIC_TYPE_KINDS,
     ALL_RESOLUTION_CALLABLE_RECEIVER_FORMS, ALL_RESOLUTION_CONSTRUCTION_REQUIREMENT_KINDS,
@@ -45,22 +46,24 @@ use brokk_bifrost_core::analyzer::structural::resolution::{
 };
 
 use crate::analyzer::resolution::{
-    BindingFragmentId, LoweredBindingProjection, LoweredCallApplicabilityObligation,
+    BindingFragmentId, BindingNodeId, LoweredBindingProjection, LoweredCallApplicabilityObligation,
+    LoweredCallArgumentProperty, LoweredCallableParameterApplicability,
     LoweredCallableParameterProperty, LoweredCallableResultBinding,
     LoweredCallableResultTypeProperty, LoweredCallableSignatureProperty,
     LoweredConstructionRequirementProperty, LoweredDeclarationTypeProperty,
-    LoweredDeferredMemberOwner, LoweredDefinitionPropertyGap, LoweredIntrinsicSeed,
-    LoweredQualifiedSeededRoute, LoweredSupertypeProperty, LoweredTypeComponent,
-    LoweredTypeTransfer, LoweredTypedFragment, LoweredTypedFrontier, LoweredUnderlyingType,
-    PartialPathId, ResolutionCompletion, ResolutionIdentityCatalog, ResolutionIncompleteReason,
-    ResolutionSlotValue, ResolutionTypeRef, SemanticId, SharedNameId, SharedNameInterner,
-    TypeTransferRule, TypeTransferValueTransform, TypedFrontierState,
+    LoweredDeferredMemberOwner, LoweredDefinitionPropertyGap, LoweredGenericTypeAliasParameter,
+    LoweredIntrinsicSeed, LoweredIntrinsicTypeDescriptor, LoweredMemberOwnerProperty,
+    LoweredQualifiedSeededRoute, LoweredSupertypeProperty, LoweredTypeArgument,
+    LoweredTypeComponent, LoweredTypeTransfer, LoweredTypedFragment, LoweredTypedFrontier,
+    LoweredUnderlyingType, PartialPathId, ResolutionCompletion, ResolutionIdentityCatalog,
+    ResolutionIncompleteReason, ResolutionSlotValue, ResolutionTypeRef, SemanticId, SharedNameId,
+    SharedNameInterner, TypeTransferRule, TypeTransferValueTransform, TypedFrontierState,
 };
 
 use crate::hash::HashMap;
 
-use super::ResolutionLocalKeys;
 use super::resolution_rows::{PathBodyToken, SharedNames, code, from_code, namespace_code};
+use super::{ResolutionLocalKeys, stored_integer as integer};
 
 // ---------------------------------------------------------------------------
 // The statements this block adds
@@ -90,10 +93,33 @@ pub(crate) const TYPE_TRANSFERS_BY_TARGET_SQL: &str = "SELECT source_slot, rule,
      WHERE blob_id = ?1 AND target_slot IN (SELECT value FROM json_each(?2)) \
      ORDER BY target_slot, source_slot, rule";
 
+pub(crate) const TYPE_PRODUCTIONS_BY_OUTPUT_SQL: &str = "SELECT output_slot, constructor, length_token, element_slot FROM resolution_type_productions WHERE blob_id = ?1 AND output_slot IN (SELECT value FROM json_each(?2)) ORDER BY output_slot";
+
 pub(crate) const TYPE_COMPONENTS_BY_CONTAINER_SQL: &str = "SELECT container_slot, constructor, kind, component_slot \
      FROM resolution_type_components \
      WHERE blob_id = ?1 AND container_slot IN (SELECT value FROM json_each(?2)) \
      ORDER BY container_slot, kind";
+
+pub(crate) const DECLARED_TYPE_ARGUMENTS_BY_OWNER_SQL: &str = "SELECT owner_slot, ordinal, argument_slot \
+     FROM resolution_declared_type_arguments \
+     WHERE blob_id = ?1 AND owner_slot IN (SELECT value FROM json_each(?2)) \
+     ORDER BY owner_slot, ordinal";
+
+pub(crate) const TYPE_ARGUMENTS_BY_APPLICATION_SQL: &str = "SELECT application_slot, ordinal, argument_slot, \
+     indirection_delta, reference_indirection_delta FROM resolution_type_arguments \
+     WHERE blob_id = ?1 AND application_slot IN (SELECT value FROM json_each(?2)) \
+     ORDER BY application_slot, ordinal";
+
+pub(crate) const GENERIC_TYPE_ALIAS_PARAMETERS_BY_ALIAS_SQL: &str = "SELECT alias_definition, ordinal, \
+     parameter_definition, target_slot, indirection_delta, reference_indirection_delta \
+     FROM resolution_generic_type_alias_parameters \
+     WHERE blob_id = ?1 AND alias_definition IN (SELECT value FROM json_each(?2)) \
+     ORDER BY alias_definition, ordinal";
+
+pub(crate) const GENERIC_FORMALS_BY_OWNER_SQL: &str = "SELECT owner_definition, ordinal, parameter_definition \
+     FROM resolution_generic_formals \
+     WHERE blob_id = ?1 AND owner_definition IN (SELECT value FROM json_each(?2)) \
+     ORDER BY owner_definition, ordinal";
 
 pub(crate) const UNDERLYING_TYPES_BY_DEFINITION_SQL: &str = "SELECT definition, slot \
      FROM resolution_underlying_types \
@@ -112,6 +138,16 @@ pub(crate) const INTRINSIC_SEEDS_BY_IDENTITY_SQL: &str = "SELECT seed.slot, seed
        ON seed.blob_id = named.blob_id AND seed.slot = named.slot \
      WHERE named.blob_id = ?1 AND named.identity_id IN (SELECT value FROM json_each(?2)) \
      ORDER BY seed.slot";
+
+/// The caller needs the descriptor associated with an identity, not every
+/// source seed that carries a value of that type. Keep one row per distinct
+/// descriptor in each blob; contradictory tuples remain visible.
+pub(crate) const INTRINSIC_TYPE_DESCRIPTORS_BY_IDENTITY_SQL: &str = "SELECT DISTINCT named.identity_id, seed.kind, seed.spelling \
+     FROM resolution_intrinsic_seed_identities AS named \
+     JOIN resolution_intrinsic_seeds AS seed \
+       ON seed.blob_id = named.blob_id AND seed.slot = named.slot \
+     WHERE named.blob_id = ?1 AND named.identity_id IN (SELECT value FROM json_each(?2)) \
+     ORDER BY named.identity_id, seed.kind, seed.spelling";
 
 pub(crate) const BINDING_PROJECTIONS_BY_REFERENCE_SQL: &str = "SELECT reference, output_slot, kind FROM resolution_binding_projections \
      WHERE blob_id = ?1 AND reference IN (SELECT value FROM json_each(?2)) \
@@ -193,18 +229,31 @@ pub(crate) const DECLARATION_VISIBILITIES_BY_DEFINITION_SQL: &str = "SELECT defi
 /// and a second copy of it would be the one thing the schema rules forbid.
 pub(crate) const MEMBER_SCOPES_BY_DEFINITION_SQL: &str = "SELECT definition_semantic_key, scope_head_node_key \
      FROM resolution_member_scope_properties \
-     WHERE blob_id = ?1 AND definition_semantic_key IN (SELECT value FROM json_each(?2))";
+     WHERE scope_kind='type_body' AND blob_id = ?1 AND definition_semantic_key IN (SELECT value FROM json_each(?2))";
 
 pub(crate) const MEMBER_SCOPES_BY_HEAD_SQL: &str = "SELECT definition_semantic_key, scope_head_node_key \
      FROM resolution_member_scope_properties \
-     WHERE blob_id = ?1 AND scope_head_node_key IN (SELECT value FROM json_each(?2))";
+     WHERE scope_kind='type_body' AND blob_id = ?1 AND scope_head_node_key IN (SELECT value FROM json_each(?2))";
+
+/// Companion declarations are persisted by source-site identity. Join both
+/// sites through the semantic-site index so callers can continue with the
+/// companion's ordinary member-scope and ownership reads.
+pub(crate) const COMPANION_RELATIONS_BY_ENCLOSING_TYPE_SQL: &str = "SELECT enclosing.semantic_key, companion.semantic_key \
+     FROM resolution_semantic_sites AS enclosing \
+     CROSS JOIN resolution_singleton_relations AS relation INDEXED BY resolution_singleton_relations_enclosing_type_site \
+       ON relation.blob_id = enclosing.blob_id AND relation.enclosing_type_site = enclosing.source_site \
+     CROSS JOIN resolution_semantic_sites AS companion \
+       ON companion.blob_id = relation.blob_id AND companion.source_site = relation.declaration_site \
+     WHERE enclosing.blob_id = ?1 AND enclosing.semantic_role = 'definition' \
+       AND enclosing.semantic_key IN (SELECT value FROM json_each(?2)) \
+       AND relation.kind = 'companion' AND companion.semantic_role = 'definition'";
 
 pub(crate) const MEMBER_OWNERS_BY_DEFINITION_SQL: &str = "SELECT definition_semantic_key, owner_definition_semantic_key, \
-     owner_scope_head_node_key, member_kind, member_access, qualifier_compatibility FROM resolution_member_owner_properties \
+     owner_scope_head_node_key, member_name, member_kind, member_access, qualifier_compatibility FROM resolution_member_owner_properties \
      WHERE blob_id = ?1 AND definition_semantic_key IN (SELECT value FROM json_each(?2))";
 
 pub(crate) const MEMBER_OWNERS_BY_OWNER_SQL: &str = "SELECT definition_semantic_key, owner_definition_semantic_key, \
-     owner_scope_head_node_key, member_kind, member_access, qualifier_compatibility FROM resolution_member_owner_properties \
+     owner_scope_head_node_key, member_name, member_kind, member_access, qualifier_compatibility FROM resolution_member_owner_properties \
      INDEXED BY resolution_member_owner_properties_owner \
      WHERE blob_id = ?1 \
        AND owner_definition_semantic_key IN (SELECT value FROM json_each(?2))";
@@ -222,15 +271,15 @@ pub(crate) const CONSTRUCTION_REQUIREMENTS_BY_DEFINITION_SQL: &str = "SELECT def
      WHERE blob_id = ?1 AND definition IN (SELECT value FROM json_each(?2)) \
      ORDER BY definition, required_owner_definition, kind";
 
-pub(crate) const SUPERTYPES_BY_DEFINITION_SQL: &str = "SELECT definition, reference, frontier, kind FROM resolution_supertypes \
+pub(crate) const SUPERTYPES_BY_DEFINITION_SQL: &str = "SELECT definition, reference, frontier, kind, parent_ordinal FROM resolution_supertypes \
      WHERE blob_id = ?1 AND definition IN (SELECT value FROM json_each(?2)) \
-     ORDER BY definition, reference";
+     ORDER BY definition, parent_ordinal, reference";
 
-pub(crate) const SUPERTYPES_BY_REFERENCE_SQL: &str = "SELECT definition, reference, frontier, kind FROM resolution_supertypes \
+pub(crate) const SUPERTYPES_BY_REFERENCE_SQL: &str = "SELECT definition, reference, frontier, kind, parent_ordinal FROM resolution_supertypes \
      INDEXED BY resolution_supertypes_reference \
      WHERE blob_id = ?1 AND reference IN (SELECT value FROM json_each(?2))";
 
-pub(crate) const SUPERTYPES_BY_FRONTIER_SQL: &str = "SELECT definition, reference, frontier, kind FROM resolution_supertypes \
+pub(crate) const SUPERTYPES_BY_FRONTIER_SQL: &str = "SELECT definition, reference, frontier, kind, parent_ordinal FROM resolution_supertypes \
      INDEXED BY resolution_supertypes_frontier \
      WHERE blob_id = ?1 AND frontier IN (SELECT value FROM json_each(?2))";
 
@@ -304,6 +353,47 @@ pub(crate) struct PreparedTypeComponentRow {
     pub(crate) component_slot: i64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PreparedTypeProductionRow {
+    pub(crate) output_slot: i64,
+    pub(crate) element_slot: i64,
+    pub(crate) constructor: i64,
+    pub(crate) length_token: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PreparedDeclaredTypeArgumentRow {
+    pub(crate) owner_slot: i64,
+    pub(crate) ordinal: i64,
+    pub(crate) argument_slot: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PreparedTypeArgumentRow {
+    pub(crate) application_slot: i64,
+    pub(crate) ordinal: i64,
+    pub(crate) argument_slot: i64,
+    pub(crate) indirection_delta: i64,
+    pub(crate) reference_indirection_delta: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PreparedGenericTypeAliasParameterRow {
+    pub(crate) alias_definition: i64,
+    pub(crate) ordinal: i64,
+    pub(crate) parameter_definition: i64,
+    pub(crate) target_slot: i64,
+    pub(crate) indirection_delta: i64,
+    pub(crate) reference_indirection_delta: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PreparedGenericFormalRow {
+    pub(crate) owner_definition: i64,
+    pub(crate) ordinal: i64,
+    pub(crate) parameter_definition: i64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PreparedUnderlyingTypeRow {
     pub(crate) definition: i64,
@@ -374,6 +464,7 @@ pub(crate) struct PreparedSupertypeRow {
     pub(crate) reference: i64,
     pub(crate) frontier: i64,
     pub(crate) kind: i64,
+    pub(crate) parent_ordinal: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -420,7 +511,13 @@ pub(crate) struct PreparedTypedRows {
     pub(crate) type_frontiers: Vec<PreparedTypeFrontierRow>,
     pub(crate) type_transfers: Vec<PreparedTypeTransferRow>,
     pub(crate) type_components: Vec<PreparedTypeComponentRow>,
+    pub(crate) type_productions: Vec<PreparedTypeProductionRow>,
+    pub(crate) declared_type_arguments: Vec<PreparedDeclaredTypeArgumentRow>,
+    pub(crate) type_arguments: Vec<PreparedTypeArgumentRow>,
     pub(crate) underlying_types: Vec<PreparedUnderlyingTypeRow>,
+    pub(crate) generic_type_alias_parameters: Vec<PreparedGenericTypeAliasParameterRow>,
+    pub(crate) generic_formals: Vec<PreparedGenericFormalRow>,
+    pub(crate) generic_formal_defaults: Vec<PreparedGenericFormalDefaultRow>,
     pub(crate) intrinsic_seeds: Vec<PreparedIntrinsicSeedRow>,
     pub(crate) intrinsic_seed_identities: Vec<PreparedIntrinsicSeedIdentityRow>,
     pub(crate) binding_projections: Vec<PreparedBindingProjectionRow>,
@@ -479,20 +576,7 @@ fn shared(
 
 /// One symbol inside a typed body: `>= 0` a blob-local key, `< 0` minus the
 /// interned id of a shared name.
-fn signed(
-    names: &mut SharedNames,
-    keys: &ResolutionLocalKeys,
-    identities: &ResolutionIdentityCatalog,
-    semantic: SemanticId,
-) -> PathBodyToken {
-    let identity = identities
-        .semantic_identity(semantic)
-        .unwrap_or_else(|| panic!("an emitted semantic is in its blob's catalog: {semantic}"));
-    match identity.shared_name() {
-        None => PathBodyToken::Int(keys.semantic(semantic)),
-        Some(name) => PathBodyToken::Shared(names.slot(identities.shared_name_digest(name))),
-    }
-}
+use super::signed_semantic as signed;
 
 /// `None` when the row is complete; otherwise its reasons as one JSONB array.
 ///
@@ -619,6 +703,27 @@ pub(super) fn prepare_typed_rows(
         });
     }
 
+    for production in typed.type_productions() {
+        rows.type_productions.push(PreparedTypeProductionRow {
+            output_slot: local(
+                keys,
+                identities,
+                production.output,
+                "type production output",
+            ),
+            element_slot: local(
+                keys,
+                identities,
+                production.element,
+                "type production element",
+            ),
+            constructor: code(
+                ALL_RESOLUTION_TYPE_CONSTRUCTOR_KINDS,
+                production.constructor,
+            ),
+            length_token: production.length.clone(),
+        });
+    }
     for component in typed.type_components() {
         rows.type_components.push(PreparedTypeComponentRow {
             container_slot: local(
@@ -641,6 +746,45 @@ pub(super) fn prepare_typed_rows(
         });
     }
 
+    for argument in typed.declared_type_arguments() {
+        rows.declared_type_arguments
+            .push(PreparedDeclaredTypeArgumentRow {
+                owner_slot: local(
+                    keys,
+                    identities,
+                    argument.owner(),
+                    "declared type argument owner slot",
+                ),
+                ordinal: i64::from(argument.position()),
+                argument_slot: local(
+                    keys,
+                    identities,
+                    argument.argument(),
+                    "declared type argument slot",
+                ),
+            });
+    }
+
+    for argument in typed.type_arguments() {
+        rows.type_arguments.push(PreparedTypeArgumentRow {
+            application_slot: local(
+                keys,
+                identities,
+                argument.application(),
+                "generic application slot",
+            ),
+            ordinal: i64::from(argument.ordinal()),
+            argument_slot: local(
+                keys,
+                identities,
+                argument.argument(),
+                "generic type argument slot",
+            ),
+            indirection_delta: i64::from(argument.indirection_delta()),
+            reference_indirection_delta: i64::from(argument.reference_indirection_delta()),
+        });
+    }
+
     for underlying in typed.underlying_types() {
         rows.underlying_types.push(PreparedUnderlyingTypeRow {
             definition: local(
@@ -650,6 +794,70 @@ pub(super) fn prepare_typed_rows(
                 "underlying type definition",
             ),
             slot: local(keys, identities, underlying.slot(), "underlying type slot"),
+        });
+    }
+
+    for parameter in typed.generic_type_alias_parameters() {
+        rows.generic_type_alias_parameters
+            .push(PreparedGenericTypeAliasParameterRow {
+                alias_definition: local(
+                    keys,
+                    identities,
+                    parameter.alias(),
+                    "generic type alias definition",
+                ),
+                ordinal: i64::from(parameter.ordinal()),
+                parameter_definition: local(
+                    keys,
+                    identities,
+                    parameter.parameter(),
+                    "generic type alias parameter definition",
+                ),
+                target_slot: local(
+                    keys,
+                    identities,
+                    parameter.target(),
+                    "generic type alias target slot",
+                ),
+                indirection_delta: i64::from(parameter.indirection_delta()),
+                reference_indirection_delta: i64::from(parameter.reference_indirection_delta()),
+            });
+    }
+
+    for formal in typed.generic_formal_defaults() {
+        rows.generic_formal_defaults
+            .push(PreparedGenericFormalDefaultRow {
+                owner_definition: local(
+                    keys,
+                    identities,
+                    formal.owner(),
+                    "generic formal owner definition",
+                ),
+                ordinal: i64::from(formal.ordinal()),
+                default_slot: local(
+                    keys,
+                    identities,
+                    formal.default(),
+                    "generic formal parameter definition",
+                ),
+            });
+    }
+
+    for formal in typed.generic_formals() {
+        rows.generic_formals.push(PreparedGenericFormalRow {
+            owner_definition: local(
+                keys,
+                identities,
+                formal.owner(),
+                "generic formal owner definition",
+            ),
+            ordinal: i64::from(formal.ordinal()),
+            parameter_definition: local(
+                keys,
+                identities,
+                formal.parameter(),
+                "generic formal parameter definition",
+            ),
         });
     }
 
@@ -855,6 +1063,7 @@ pub(super) fn prepare_typed_rows(
             ),
             frontier: local(keys, identities, property.frontier(), "supertype frontier"),
             kind: code(ALL_RESOLUTION_SUPERTYPE_KINDS, property.kind()),
+            parent_ordinal: i64::from(property.parent_ordinal()),
         });
     }
 
@@ -884,14 +1093,29 @@ pub(super) fn prepare_typed_rows(
 
     for obligation in typed.call_obligations() {
         let mut argument_slots = vec![PathBodyToken::Open];
-        for slot in obligation.argument_slots() {
+        argument_slots.push(PathBodyToken::Open);
+        for argument in obligation.arguments() {
+            argument_slots.push(PathBodyToken::Open);
+            argument_slots.push(PathBodyToken::Int(i64::from(argument.list_ordinal())));
+            argument_slots.push(PathBodyToken::Int(i64::from(argument.ordinal())));
             argument_slots.push(PathBodyToken::Int(local(
                 keys,
                 identities,
-                *slot,
+                argument.slot(),
                 "call obligation argument slot",
             )));
+            argument_slots.push(match argument.label() {
+                Some(label) => PathBodyToken::Text(label.into()),
+                None => PathBodyToken::Null,
+            });
+            argument_slots.push(PathBodyToken::Close);
         }
+        argument_slots.push(PathBodyToken::Close);
+        argument_slots.push(PathBodyToken::Open);
+        for list in obligation.argument_lists() {
+            argument_slots.push(PathBodyToken::Int(i64::from(*list)));
+        }
+        argument_slots.push(PathBodyToken::Close);
         argument_slots.push(PathBodyToken::Close);
         let mut type_argument_slots = vec![PathBodyToken::Open];
         for slots in [
@@ -1054,6 +1278,41 @@ pub(super) fn prepare_typed_rows(
             body.push(PathBodyToken::Close);
         }
         body.push(PathBodyToken::Close);
+        body.push(PathBodyToken::Open);
+        for list in signature.parameter_lists() {
+            body.push(PathBodyToken::Int(i64::from(*list)));
+        }
+        body.push(PathBodyToken::Close);
+        body.push(PathBodyToken::Open);
+        for list in signature.contextual_parameter_lists() {
+            body.push(PathBodyToken::Int(i64::from(*list)));
+        }
+        body.push(PathBodyToken::Close);
+        body.push(PathBodyToken::Open);
+        for applicability in signature.parameter_applicability() {
+            body.push(PathBodyToken::Open);
+            body.push(PathBodyToken::Int(i64::from(applicability.ordinal())));
+            body.push(PathBodyToken::Int(i64::from(applicability.list_ordinal())));
+            body.push(match applicability.label() {
+                Some(label) => PathBodyToken::Text(label.into()),
+                None => PathBodyToken::Null,
+            });
+            body.push(PathBodyToken::Int(i64::from(applicability.has_default())));
+            body.push(PathBodyToken::Int(i64::from(
+                applicability.semantics_known(),
+            )));
+            body.push(PathBodyToken::Close);
+        }
+        body.push(PathBodyToken::Close);
+        body.push(match signature.extension_receiver() {
+            Some(slot) => PathBodyToken::Int(local(
+                keys,
+                identities,
+                slot,
+                "callable extension receiver type slot",
+            )),
+            None => PathBodyToken::Null,
+        });
         body.push(PathBodyToken::Close);
         rows.callable_signatures.push(PreparedCallableSignatureRow {
             definition: signature_definition,
@@ -1120,6 +1379,7 @@ pub(crate) fn value_transform_from_code(value: i64) -> TypeTransferValueTransfor
 pub(crate) struct TypedRowContext<'names> {
     pub(crate) fragment: BindingFragmentId,
     pub(crate) ordinal: u32,
+    pub(crate) language: Language,
     pub(crate) names: &'names dyn SharedNameInterner,
 }
 
@@ -1142,17 +1402,11 @@ impl TypedRowContext<'_> {
     }
 
     pub(crate) fn node(self, key: i64) -> crate::analyzer::resolution::BindingNodeId {
-        crate::analyzer::resolution::BindingNodeId::local(
-            self.ordinal,
-            u32::try_from(key).expect("a stored typed node key is nonnegative and fits u32"),
-        )
+        super::stored_local_node(self.ordinal, key)
     }
 
     fn path(self, key: i64) -> PartialPathId {
-        PartialPathId::local(
-            self.ordinal,
-            u32::try_from(key).expect("a stored typed path key is nonnegative and fits u32"),
-        )
+        super::stored_local_path(self.ordinal, key)
     }
 }
 
@@ -1179,15 +1433,16 @@ impl TypedBodyDecoder for TypedRowContext<'_> {
 type Element = serde_json::Value;
 
 fn array<'value>(value: &'value Element, what: &str) -> &'value [Element] {
-    value
-        .as_array()
-        .unwrap_or_else(|| panic!("a stored typed row's {what} is an array, got {value}"))
+    super::require_array(value, |value| {
+        format!("a stored typed row's {what} is an array, got {value}")
+    })
 }
 
-fn integer(value: &Element, what: &str) -> i64 {
+fn boolean(value: &Element, what: &str) -> bool {
     value
-        .as_i64()
-        .unwrap_or_else(|| panic!("a stored typed row's {what} is an integer, got {value}"))
+        .as_bool()
+        .or_else(|| value.as_i64().map(|integer| integer != 0))
+        .unwrap_or_else(|| panic!("a stored typed row's {what} is a boolean, got {value}"))
 }
 
 /// One stored JSONB body, parsed once.
@@ -1263,7 +1518,7 @@ pub(crate) fn decode_type_frontier(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_type_transfer(
-    context: TypedRowContext,
+    context: impl TypedBodyDecoder,
     source_slot: i64,
     rule: i64,
     target_slot: i64,
@@ -1273,20 +1528,43 @@ pub(crate) fn decode_type_transfer(
     value_transform: i64,
     completion: Option<&str>,
 ) -> LoweredTypeTransfer {
-    LoweredTypeTransfer::new(
+    decode_type_transfer_fields(
         context.semantic(source_slot),
+        context.semantic(rule),
+        context.semantic(target_slot),
+        kind,
+        indirection_delta,
+        reference_indirection_delta,
+        value_transform,
+        context.completion(completion),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_type_transfer_fields(
+    source_slot: SemanticId,
+    rule: SemanticId,
+    target_slot: SemanticId,
+    kind: i64,
+    indirection_delta: i64,
+    reference_indirection_delta: i64,
+    value_transform: i64,
+    completion: ResolutionCompletion,
+) -> LoweredTypeTransfer {
+    LoweredTypeTransfer::new(
+        source_slot,
         from_code(
             ALL_RESOLUTION_TYPE_TRANSFER_KINDS,
             kind,
             "type transfer kind",
         ),
         TypeTransferRule::new_with_reference_indirection(
-            context.semantic(rule),
-            context.semantic(target_slot),
+            rule,
+            target_slot,
             indirection_delta,
             reference_indirection_delta,
             value_transform_from_code(value_transform),
-            decode_completion(context, completion),
+            completion,
         ),
     )
 }
@@ -1314,6 +1592,43 @@ pub(crate) fn decode_type_component(
     )
 }
 
+pub(crate) fn decode_type_argument(
+    context: TypedRowContext,
+    application: i64,
+    ordinal: i64,
+    argument: i64,
+    indirection_delta: i64,
+    reference_indirection_delta: i64,
+) -> LoweredTypeArgument {
+    LoweredTypeArgument::new(
+        context.semantic(application),
+        u32::try_from(ordinal).expect("stored type argument ordinal fits u32"),
+        context.semantic(argument),
+        i8::try_from(indirection_delta).expect("stored type argument indirection fits i8"),
+        i8::try_from(reference_indirection_delta).expect("stored reference indirection fits i8"),
+    )
+}
+
+pub(crate) fn decode_generic_type_alias_parameter(
+    context: TypedRowContext,
+    alias: i64,
+    ordinal: i64,
+    parameter: i64,
+    target: i64,
+    indirection_delta: i64,
+    reference_indirection_delta: i64,
+) -> LoweredGenericTypeAliasParameter {
+    LoweredGenericTypeAliasParameter::new(
+        context.semantic(alias),
+        u32::try_from(ordinal).expect("stored generic alias parameter ordinal fits u32"),
+        context.semantic(parameter),
+        context.semantic(target),
+        i8::try_from(indirection_delta).expect("stored alias indirection fits i8"),
+        i8::try_from(reference_indirection_delta)
+            .expect("stored alias reference indirection fits i8"),
+    )
+}
+
 pub(crate) fn decode_underlying_type(
     context: TypedRowContext,
     definition: i64,
@@ -1323,7 +1638,7 @@ pub(crate) fn decode_underlying_type(
 }
 
 pub(crate) fn decode_intrinsic_seed(
-    context: TypedRowContext,
+    context: impl TypedBodyDecoder,
     slot: i64,
     kind: i64,
     spelling: &str,
@@ -1331,14 +1646,39 @@ pub(crate) fn decode_intrinsic_seed(
     completion: Option<&str>,
 ) -> LoweredIntrinsicSeed {
     let values = decode_intrinsic_values(context, possible_values);
+    decode_intrinsic_seed_fields(
+        context.semantic(slot),
+        kind,
+        spelling,
+        values,
+        context.completion(completion),
+    )
+}
+
+pub(crate) fn decode_intrinsic_seed_fields(
+    slot: SemanticId,
+    kind: i64,
+    spelling: &str,
+    values: Vec<ResolutionSlotValue>,
+    completion: ResolutionCompletion,
+) -> LoweredIntrinsicSeed {
     LoweredIntrinsicSeed::new(
         from_code(ALL_INTRINSIC_TYPE_KINDS, kind, "intrinsic type kind"),
         spelling,
-        TypedFrontierState::new(
-            context.semantic(slot),
-            values,
-            decode_completion(context, completion),
-        ),
+        TypedFrontierState::new(slot, values, completion),
+    )
+}
+
+pub(crate) fn decode_intrinsic_type_descriptor(
+    context: TypedRowContext,
+    identity_id: i64,
+    kind: i64,
+    spelling: &str,
+) -> LoweredIntrinsicTypeDescriptor {
+    LoweredIntrinsicTypeDescriptor::new(
+        context.signed_semantic(-identity_id),
+        from_code(ALL_INTRINSIC_TYPE_KINDS, kind, "intrinsic type kind"),
+        spelling,
     )
 }
 
@@ -1370,14 +1710,26 @@ pub(crate) fn decode_intrinsic_values(
 }
 
 pub(crate) fn decode_binding_projection(
-    context: TypedRowContext,
+    context: impl TypedBodyDecoder,
     reference: i64,
     output_slot: i64,
     kind: i64,
 ) -> LoweredBindingProjection {
-    LoweredBindingProjection::new(
+    decode_binding_projection_fields(
         context.semantic(reference),
         context.semantic(output_slot),
+        kind,
+    )
+}
+
+pub(crate) fn decode_binding_projection_fields(
+    reference: SemanticId,
+    output_slot: SemanticId,
+    kind: i64,
+) -> LoweredBindingProjection {
+    LoweredBindingProjection::new(
+        reference,
+        output_slot,
         from_code(
             ALL_BINDING_PROJECTION_KINDS,
             kind,
@@ -1401,41 +1753,76 @@ pub(crate) fn decode_qualified_route(
     coarse_gap_reason: i64,
     open_member_surface: i64,
 ) -> LoweredQualifiedSeededRoute {
-    LoweredQualifiedSeededRoute::new_with_source_lookup(
+    decode_qualified_route_parts(
         context.semantic(reference),
+        precedence_ordinal,
         context.semantic(qualifier_slot),
         SemanticId::shared_name(context.names.from_persisted(SharedNameId::interned(lookup))),
-        from_code(
-            brokk_bifrost_core::analyzer::resolution_facts::ALL_RESOLUTION_NAMESPACES,
-            namespace,
-            "resolution namespace",
-        ),
+        namespace,
         SemanticId::shared_name(
             context
                 .names
                 .from_persisted(SharedNameId::interned(source_lookup)),
         ),
-        u32::try_from(precedence_ordinal).expect("a stored precedence ordinal fits u32"),
         context.semantic(projection_output_slot),
-        from_code(
-            ALL_BINDING_PROJECTION_KINDS,
-            projection_kind,
-            "binding projection kind",
-        ),
+        projection_kind,
         context.semantic(coarse_gap_reason),
         open_member_surface != 0,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_qualified_route_parts(
+    reference: SemanticId,
+    precedence_ordinal: i64,
+    qualifier_slot: SemanticId,
+    lookup: SemanticId,
+    namespace: i64,
+    source_lookup: SemanticId,
+    projection_output_slot: SemanticId,
+    projection_kind: i64,
+    coarse_gap_reason: SemanticId,
+    open_member_surface: bool,
+) -> LoweredQualifiedSeededRoute {
+    LoweredQualifiedSeededRoute::new_with_source_lookup(
+        reference,
+        qualifier_slot,
+        lookup,
+        from_code(
+            brokk_bifrost_core::analyzer::resolution_facts::ALL_RESOLUTION_NAMESPACES,
+            namespace,
+            "resolution namespace",
+        ),
+        source_lookup,
+        u32::try_from(precedence_ordinal).expect("a stored precedence ordinal fits u32"),
+        projection_output_slot,
+        from_code(
+            ALL_BINDING_PROJECTION_KINDS,
+            projection_kind,
+            "binding projection kind",
+        ),
+        coarse_gap_reason,
+        open_member_surface,
+    )
+}
+
 pub(crate) fn decode_declaration_type(
-    context: TypedRowContext,
+    context: impl TypedBodyDecoder,
     definition: i64,
     role: i64,
     slot: i64,
 ) -> LoweredDeclarationTypeProperty {
+    decode_declaration_type_fields(context.semantic(definition), context.semantic(slot), role)
+}
+
+pub(crate) fn decode_declaration_type_fields(
+    definition: SemanticId,
+    slot: SemanticId,
+    role: i64,
+) -> LoweredDeclarationTypeProperty {
     LoweredDeclarationTypeProperty::new(
-        context.semantic(definition),
-        context.semantic(slot),
+        definition,
+        slot,
         from_code(ALL_DECLARATION_TYPE_ROLES, role, "declaration type role"),
     )
 }
@@ -1451,6 +1838,26 @@ pub(crate) fn decode_deferred_member_owner(
         context.semantic(definition),
         SemanticId::shared_name(context.names.from_persisted(SharedNameId::interned(lookup))),
         body,
+    )
+}
+
+pub(crate) fn decode_member_owner_fields(
+    definition: SemanticId,
+    owner_definition: SemanticId,
+    owner_scope_head: BindingNodeId,
+    member_name: &str,
+    kind: &str,
+    access: &str,
+    compatibility: &str,
+) -> LoweredMemberOwnerProperty {
+    LoweredMemberOwnerProperty::new(
+        definition,
+        owner_definition,
+        owner_scope_head,
+        member_name,
+        member_kind_from_label(kind),
+        member_access_from_label(access),
+        member_qualifier_compatibility_from_label(compatibility),
     )
 }
 
@@ -1492,14 +1899,26 @@ pub(crate) fn decode_deferred_owner_body(
 }
 
 pub(crate) fn decode_construction_requirement(
-    context: TypedRowContext,
+    context: impl TypedBodyDecoder,
     definition: i64,
     required_owner_definition: i64,
     kind: i64,
 ) -> LoweredConstructionRequirementProperty {
-    LoweredConstructionRequirementProperty::new(
+    decode_construction_requirement_fields(
         context.semantic(definition),
         context.semantic(required_owner_definition),
+        kind,
+    )
+}
+
+pub(crate) fn decode_construction_requirement_fields(
+    definition: SemanticId,
+    required_owner_definition: SemanticId,
+    kind: i64,
+) -> LoweredConstructionRequirementProperty {
+    LoweredConstructionRequirementProperty::new(
+        definition,
+        required_owner_definition,
         from_code(
             ALL_RESOLUTION_CONSTRUCTION_REQUIREMENT_KINDS,
             kind,
@@ -1509,37 +1928,71 @@ pub(crate) fn decode_construction_requirement(
 }
 
 pub(crate) fn decode_supertype(
-    context: TypedRowContext,
+    context: impl TypedBodyDecoder,
     definition: i64,
     reference: i64,
     frontier: i64,
     kind: i64,
+    parent_ordinal: i64,
 ) -> LoweredSupertypeProperty {
-    LoweredSupertypeProperty::new(
+    decode_supertype_fields(
         context.semantic(definition),
         context.semantic(reference),
         context.semantic(frontier),
+        kind,
+        parent_ordinal,
+    )
+}
+
+pub(crate) fn decode_supertype_fields(
+    definition: SemanticId,
+    reference: SemanticId,
+    frontier: SemanticId,
+    kind: i64,
+    parent_ordinal: i64,
+) -> LoweredSupertypeProperty {
+    LoweredSupertypeProperty::new(
+        definition,
+        reference,
+        frontier,
         from_code(ALL_RESOLUTION_SUPERTYPE_KINDS, kind, "supertype kind"),
+        u32::try_from(parent_ordinal).expect("supertype parent ordinal fits u32"),
     )
 }
 
 pub(crate) fn decode_definition_property_gap(
-    context: TypedRowContext,
+    context: impl TypedBodyDecoder,
     definition: i64,
     kind: i64,
     frontier: i64,
     reason: i64,
     site: i64,
 ) -> LoweredDefinitionPropertyGap {
-    LoweredDefinitionPropertyGap::new(
+    decode_definition_property_gap_fields(
         context.semantic(definition),
+        kind,
+        context.semantic(frontier),
+        context.semantic(reason),
+        site,
+    )
+}
+
+pub(crate) fn decode_definition_property_gap_fields(
+    definition: SemanticId,
+    kind: i64,
+    frontier: SemanticId,
+    reason: SemanticId,
+    site: i64,
+) -> LoweredDefinitionPropertyGap {
+    LoweredDefinitionPropertyGap::new(
+        definition,
         ResolutionSiteId::try_from_index(
             usize::try_from(site).expect("a stored site ordinal is nonnegative"),
         )
         .expect("a stored site ordinal fits its id"),
         from_code(ALL_RESOLUTION_GAP_KINDS, kind, "gap kind"),
-        context.semantic(frontier),
-        context.semantic(reason),
+        frontier,
+        reason,
     )
 }
 
@@ -1557,10 +2010,75 @@ pub(crate) fn decode_call_obligation(
     eligible_rules: &str,
     completion: Option<&str>,
 ) -> LoweredCallApplicabilityObligation {
+    decode_call_obligation_body(
+        context,
+        context.language,
+        context.semantic(callee_reference),
+        context.semantic(call),
+        receiver_slot.map(|slot| context.semantic(slot)),
+        context.semantic(result_slot),
+        explicit_type_argument_count,
+        context.semantic(applicability_reason),
+        argument_slots,
+        type_argument_slots,
+        eligible_rules,
+        completion,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_call_obligation_body(
+    context: impl TypedBodyDecoder,
+    language: Language,
+    callee_reference: SemanticId,
+    call: SemanticId,
+    receiver_slot: Option<SemanticId>,
+    result_slot: SemanticId,
+    explicit_type_argument_count: i64,
+    applicability_reason: SemanticId,
+    argument_slots: &str,
+    type_argument_slots: &str,
+    eligible_rules: &str,
+    completion: Option<&str>,
+) -> LoweredCallApplicabilityObligation {
     let parsed_arguments = parse_body(argument_slots);
-    let arguments = array(&parsed_arguments, "call obligation argument slots")
+    let argument_body = array(&parsed_arguments, "call obligation argument slots");
+    assert_eq!(
+        argument_body.len(),
+        2,
+        "call obligation argument body is [arguments, argument lists]"
+    );
+    let arguments = array(&argument_body[0], "structured call arguments")
         .iter()
-        .map(|slot| context.semantic(integer(slot, "call obligation argument slot")))
+        .map(|argument| {
+            let cells = array(argument, "structured call argument");
+            let label = (!cells[3].is_null()).then(|| {
+                cells[3]
+                    .as_str()
+                    .expect("a stored call argument label is text")
+                    .to_owned()
+                    .into_boxed_str()
+            });
+            LoweredCallArgumentProperty::new(
+                u32::try_from(integer(&cells[0], "call argument list ordinal"))
+                    .expect("a stored call argument list ordinal fits u32"),
+                u32::try_from(integer(&cells[1], "call argument ordinal"))
+                    .expect("a stored call argument ordinal fits u32"),
+                context.semantic(integer(&cells[2], "call argument slot")),
+                label,
+            )
+        })
+        .collect::<Vec<_>>();
+    let argument_lists = array(&argument_body[1], "call argument lists")
+        .iter()
+        .map(|list| {
+            u32::try_from(integer(list, "call argument list ordinal"))
+                .expect("a stored call argument list ordinal fits u32")
+        })
+        .collect::<Vec<_>>();
+    let argument_slots = arguments
+        .iter()
+        .map(LoweredCallArgumentProperty::slot)
         .collect::<Vec<_>>();
     let parsed_type_arguments = parse_body(type_argument_slots);
     let type_argument_cells = array(
@@ -1600,20 +2118,21 @@ pub(crate) fn decode_call_obligation(
         })
         .collect::<Vec<ResolutionEngineRuleKind>>();
     LoweredCallApplicabilityObligation::new(
-        context.semantic(call),
-        context.semantic(callee_reference),
-        receiver_slot.map(|slot| context.semantic(slot)),
-        context.semantic(result_slot),
-        arguments,
+        call,
+        callee_reference,
+        receiver_slot,
+        result_slot,
+        argument_slots,
         rules,
         u32::try_from(explicit_type_argument_count).expect("a stored type argument count fits u32"),
-        context.semantic(applicability_reason),
-        decode_completion(context, completion),
+        applicability_reason,
+        context.completion(completion),
     )
     .with_extra_result_slots(extra_result_slots)
     .with_type_argument_slots(type_arguments)
     .with_owner_type_arguments(segment, owner_type_arguments)
     .with_expected_result_slot(expected)
+    .with_argument_shape(language, arguments, argument_lists)
 }
 
 pub(crate) fn decode_callable_signature(
@@ -1632,8 +2151,8 @@ pub(crate) fn decode_callable_signature_body(
     let parsed = parse_body(body);
     let cells = array(&parsed, "callable signature body");
     assert!(
-        (7..=8).contains(&cells.len()),
-        "callable signature body has legacy or result-extended shape"
+        (7..=12).contains(&cells.len()),
+        "callable signature body has a known shape"
     );
     let parameters = array(&cells[1], "callable signature parameters")
         .iter()
@@ -1708,7 +2227,7 @@ pub(crate) fn decode_callable_signature_body(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    LoweredCallableSignatureProperty::new(
+    let signature = LoweredCallableSignatureProperty::new(
         definition,
         u32::try_from(integer(&cells[0], "callable type parameter count"))
             .expect("a stored type parameter count fits u32"),
@@ -1719,28 +2238,81 @@ pub(crate) fn decode_callable_signature_body(
     .with_result_bindings(result_bindings)
     .with_receiver(receiver)
     .with_result_type_parameter(result_type_parameter)
-    .with_result_owner_type_parameter(result_owner_type_parameter)
+    .with_result_owner_type_parameter(result_owner_type_parameter);
+    if cells.len() < 12 {
+        return signature;
+    }
+    let parameter_lists = array(&cells[8], "callable parameter lists")
+        .iter()
+        .map(|list| {
+            u32::try_from(integer(list, "callable parameter list ordinal"))
+                .expect("a stored parameter list ordinal fits u32")
+        })
+        .collect::<Vec<_>>();
+    let contextual_parameter_lists = array(&cells[9], "contextual callable parameter lists")
+        .iter()
+        .map(|list| {
+            u32::try_from(integer(list, "contextual callable parameter list ordinal"))
+                .expect("a stored contextual parameter list ordinal fits u32")
+        })
+        .collect::<Vec<_>>();
+    let parameter_applicability = array(&cells[10], "callable parameter applicability")
+        .iter()
+        .map(|row| {
+            let fields = array(row, "callable parameter applicability row");
+            let label = (!fields[2].is_null()).then(|| {
+                fields[2]
+                    .as_str()
+                    .expect("a stored parameter label is text")
+                    .to_owned()
+                    .into_boxed_str()
+            });
+            LoweredCallableParameterApplicability::new(
+                u32::try_from(integer(&fields[0], "callable applicability ordinal"))
+                    .expect("a stored applicability ordinal fits u32"),
+                u32::try_from(integer(&fields[1], "callable applicability list ordinal"))
+                    .expect("a stored applicability list ordinal fits u32"),
+                label,
+                boolean(&fields[3], "callable parameter default flag"),
+                boolean(&fields[4], "callable parameter semantics flag"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let extension_receiver = (!cells[11].is_null())
+        .then(|| context.semantic(integer(&cells[11], "callable extension receiver slot")));
+    signature
+        .with_applicability_shape(parameter_lists, parameter_applicability, extension_receiver)
+        .with_contextual_parameter_lists(contextual_parameter_lists)
 }
 
 /// The Rust-side mapping for the member vocabularies the reused tier 1 tables
 /// still spell as text. Those tables belong to the structural lane's own text
 /// decision, so this block reads their labels rather than rewriting them.
 pub(crate) fn member_kind_from_label(label: &str) -> ResolutionMemberKind {
-    ResolutionMemberKind::from_label(label)
-        .unwrap_or_else(|| panic!("stored member kind {label:?} is outside its vocabulary"))
+    stored_member_label(label, "kind", ResolutionMemberKind::from_label)
 }
 
 pub(crate) fn member_access_from_label(label: &str) -> ResolutionMemberAccess {
-    ResolutionMemberAccess::from_label(label)
-        .unwrap_or_else(|| panic!("stored member access {label:?} is outside its vocabulary"))
+    stored_member_label(label, "access", ResolutionMemberAccess::from_label)
 }
 
 pub(crate) fn member_qualifier_compatibility_from_label(
     label: &str,
 ) -> ResolutionMemberQualifierCompatibility {
-    ResolutionMemberQualifierCompatibility::from_label(label).unwrap_or_else(|| {
-        panic!("stored member qualifier compatibility {label:?} is outside its vocabulary")
-    })
+    stored_member_label(
+        label,
+        "qualifier compatibility",
+        ResolutionMemberQualifierCompatibility::from_label,
+    )
+}
+
+fn stored_member_label<T>(
+    label: &str,
+    vocabulary: &str,
+    parse: impl FnOnce(&str) -> Option<T>,
+) -> T {
+    parse(label)
+        .unwrap_or_else(|| panic!("stored member {vocabulary} {label:?} is outside its vocabulary"))
 }
 
 /// Declared frontiers and effective lexical frontier gaps are separate authority.
@@ -1758,3 +2330,12 @@ pub(crate) fn frontier_completion_sql() -> String {
         .to_string(),
     )
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PreparedGenericFormalDefaultRow {
+    pub(crate) owner_definition: i64,
+    pub(crate) ordinal: i64,
+    pub(crate) default_slot: i64,
+}
+
+pub(crate) const GENERIC_FORMAL_DEFAULTS_BY_OWNER_SQL: &str = "SELECT owner_definition, ordinal, default_slot FROM resolution_generic_formal_defaults WHERE blob_id = ?1 AND owner_definition IN (SELECT value FROM json_each(?2)) ORDER BY owner_definition, ordinal";

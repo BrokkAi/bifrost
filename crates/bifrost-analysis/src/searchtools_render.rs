@@ -226,6 +226,9 @@ fn render_symbol_sources_incomplete(items: &[SymbolSourcesIncomplete]) -> String
         .map(|item| {
             let reason = match item.reason {
                 SymbolSourcesIncompleteReason::Cancelled => "cancelled",
+                SymbolSourcesIncompleteReason::InsideUnclosedConstruct => {
+                    "inside a construct its file's parse never closed"
+                }
             };
             format!("{} ({reason})", escape_markdown_inline_code(&item.target))
         })
@@ -1200,153 +1203,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn most_relevant_files_renders_both_independent_incomplete_reasons() {
-        let result = MostRelevantFilesResult {
-            session_subset: None,
-            files: Vec::new(),
-            not_found: Vec::new(),
-            ambiguous_paths: Vec::new(),
-            duplicates: Vec::new(),
-            complete: false,
-            ranking_mode_used: crate::searchtools::MostRelevantFilesRankingMode::UsageGraphExact,
-            incomplete_reason: Some(
-                MostRelevantFilesIncompleteReason::UsageGraphIncompleteAndHistoryUnavailable,
-            ),
-        };
-
-        let text = result.render_text(RenderOptions::default());
-
-        assert!(text.contains("complete edge inventory"), "{text}");
-        assert!(text.contains("recent commit history"), "{text}");
-    }
-
-    #[test]
-    fn search_symbols_renders_markdown_with_structured_fields() {
-        let result = SearchSymbolsResult {
-            patterns: vec!["Foo".to_string()],
-            truncated: true,
-            session_subset: None,
-            total_files: 3,
-            files: vec![SearchSymbolsFile {
-                path: "src/foo.rs".to_string(),
-                loc: 42,
-                classes: vec![SearchSymbolHit {
-                    symbol: "crate::foo::Foo".to_string(),
-                    signature: "struct Foo".to_string(),
-                    line: 7,
-                    is_type_alias: false,
-                    semantic_model: None,
-                }],
-                functions: vec![SearchSymbolHit {
-                    symbol: "crate::foo::Foo::bar".to_string(),
-                    signature: "fn bar() -> A | B".to_string(),
-                    line: 12,
-                    is_type_alias: false,
-                    semantic_model: None,
-                }],
-                fields: Vec::new(),
-                modules: Vec::new(),
-                macros: Vec::new(),
-            }],
-            total_model_symbols: 0,
-            model_symbols: Vec::new(),
-            note: Some(
-                "Showing 1 of 3 matching files. Raise `limit` or use a more specific identifier, qualified, or regex-like pattern to see the rest."
-                    .to_string(),
-            ),
-            invalid_patterns: Vec::new(),
-            too_many_matches: None,
-        };
-
-        let text = result.render_text(RenderOptions::default());
-
-        assert!(text.starts_with("# Symbol search results"), "{text}");
-        assert!(text.contains("- Patterns: `Foo`"), "{text}");
-        assert!(text.contains("- Files: 1 of 3"), "{text}");
-        assert!(text.contains("- Truncated: yes;"), "{text}");
-        assert!(
-            text.contains("- Note: Showing 1 of 3 matching files. Raise `limit` or use a more specific identifier, qualified, or regex-like pattern to see the rest."),
-            "{text}"
-        );
-        assert!(text.contains("ranked by symbol relevance"), "{text}");
-        assert!(text.contains("## src/foo.rs (42 lines)"), "{text}");
-        assert!(
-            text.contains("| Kind | Line | Symbol | Signature |"),
-            "{text}"
-        );
-        assert!(
-            text.contains("| Class | 7 | crate::foo::Foo | struct Foo |"),
-            "{text}"
-        );
-        assert!(
-            text.contains("| Function | 12 | crate::foo::Foo::bar | fn bar() -> A \\| B |"),
-            "{text}"
-        );
-    }
-
-    #[test]
-    fn symbol_sources_renders_markdown_with_ranges_and_auxiliary_data() {
-        let result = SymbolSourcesResult {
-            sources: vec![SourceBlock {
-                label: "crate::foo::Foo::bar".to_string(),
-                path: "src/foo.rs".to_string(),
-                start_line: 12,
-                end_line: 14,
-                text: "fn bar() {\n    println!(\"hi\");\n}".to_string(),
-                canonical_selector: None,
-                occurrence_role: None,
-                presentation: None,
-                note: None,
-                semantic_model: None,
-            }],
-            not_found: vec![NotFoundInput {
-                input: "Missing".to_string(),
-                note: Some(
-                    "no symbol matched; try search_symbols with a substring or regex pattern"
-                        .to_string(),
-                ),
-            }],
-            ambiguous: vec![AmbiguousSymbol {
-                target: "Foo".to_string(),
-                matches: vec!["crate::foo::Foo".to_string(), "other::Foo".to_string()],
-                note: Some(
-                    "Ambiguous; re-call with one selector from `matches` (e.g. crate::foo::Foo)."
-                        .to_string(),
-                ),
-            }],
-            ambiguous_paths: vec![AmbiguousPathInput {
-                input: "Foo.java".to_string(),
-                matches: vec!["app/Foo.java".to_string(), "lib/Foo.java".to_string()],
-            }],
-            too_broad: Vec::new(),
-            complete: true,
-            incomplete: Vec::new(),
-        };
-
-        let text = result.render_text(RenderOptions::default());
-
-        assert!(text.contains("## crate::foo::Foo::bar"), "{text}");
-        assert!(text.contains("- Location: src/foo.rs:12..14"), "{text}");
-        assert!(text.contains("```text\n12: fn bar() {"), "{text}");
-        assert!(text.contains("13:     println!(\"hi\");"), "{text}");
-        assert!(
-            text.contains("## Not found\n\n- `Missing`: no symbol matched; try search_symbols with a substring or regex pattern"),
-            "{text}"
-        );
-        assert!(text.contains("Ambiguous paths:"), "{text}");
-        assert!(
-            text.contains("- Foo.java -> app/Foo.java, lib/Foo.java"),
-            "{text}"
-        );
-        assert!(text.contains("## Ambiguous symbols"), "{text}");
-        assert!(text.contains("| Target | Matches | Note |"), "{text}");
-        assert!(
-            text.contains("| Foo | crate::foo::Foo, other::Foo | Ambiguous; re-call with one selector from `matches` (e.g. crate::foo::Foo). |"),
-            "{text}"
-        );
-    }
-
-    #[test]
     fn symbol_sources_renders_incomplete_targets_without_not_found_claim() {
         let result = SymbolSourcesResult {
             sources: vec![SourceBlock {
@@ -1360,6 +1216,7 @@ mod tests {
                 presentation: None,
                 note: None,
                 semantic_model: None,
+                inside_unclosed_construct: None,
             }],
             not_found: Vec::new(),
             ambiguous: Vec::new(),
@@ -1382,44 +1239,53 @@ mod tests {
     }
 
     #[test]
-    fn summary_elements_truncate_very_long_lines_when_rendered() {
-        let long = "x".repeat(2050);
-        let element = SummaryElement {
-            path: "a.rs".to_string(),
-            symbol: "a".to_string(),
-            kind: "excerpt".to_string(),
-            start_line: 1,
-            end_line: 1,
-            text: long,
-            parent_symbol: None,
-            presentation: None,
+    #[brokk_bifrost_test_macros::hardwon(
+        "#592: Checks truncated absence suggests widening only for ordinary path scoping, not when the actual limitation is a candidate cap"
+    )]
+    fn truncated_absence_scope_does_not_recommend_widening_paths() {
+        let scope = crate::searchtools::ScanUsagesScope {
+            include_tests: true,
+            whole_workspace: false,
+            session_subset: None,
+            paths: vec!["src/**/*.rs".to_string()],
+            paths_omitted: None,
+            ignored_paths: None,
+            unmatched_paths: Vec::new(),
+            unmatched_paths_omitted: None,
         };
 
-        let rendered = element.render_text(RenderOptions::default());
-        assert!(rendered.contains("[TRUNCATED at 2048 chars]"), "{rendered}");
+        let ordinary = render_scan_usages_scope(&scope, false);
+        assert!(ordinary.contains("drop or widen paths"), "{ordinary}");
+
+        let truncated = render_scan_usages_scope(&scope, true);
+        assert!(!truncated.contains("drop or widen paths"), "{truncated}");
     }
 
     #[test]
-    fn sampled_excerpt_rendering_preserves_omitted_delimiter_without_fake_ranges() {
-        let element = SummaryElement {
-            path: "a.rs".to_string(),
-            symbol: "a.rs".to_string(),
-            kind: "excerpt".to_string(),
-            start_line: 1,
-            end_line: 60,
-            text: "// line 1\n\n----- OMITTED 10 LINES -----\n\n// line 60".to_string(),
-            parent_symbol: None,
-            presentation: Some("sampled_excerpt".to_string()),
+    fn most_relevant_files_renders_both_independent_incomplete_reasons() {
+        let result = MostRelevantFilesResult {
+            session_subset: None,
+            files: Vec::new(),
+            not_found: Vec::new(),
+            ambiguous_paths: Vec::new(),
+            duplicates: Vec::new(),
+            complete: false,
+            ranking_mode_used: crate::searchtools::MostRelevantFilesRankingMode::UsageGraphExact,
+            incomplete_reason: Some(
+                MostRelevantFilesIncompleteReason::UsageGraphIncompleteAndHistoryUnavailable,
+            ),
         };
 
-        let rendered = element.render_text(RenderOptions::default());
-        assert_eq!(
-            "// line 1\n\n----- OMITTED 10 LINES -----\n\n// line 60",
-            rendered
-        );
+        let text = result.render_text(RenderOptions::default());
+
+        assert!(text.contains("complete edge inventory"), "{text}");
+        assert!(text.contains("recent commit history"), "{text}");
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2770: whole-workspace scope discloses the session-limited file slice"
+    )]
     fn whole_workspace_scope_names_the_session_slice_when_there_is_one() {
         let whole = crate::searchtools::ScanUsagesScope {
             include_tests: true,
@@ -1452,25 +1318,5 @@ mod tests {
             "Scope: analyzed source including test files; whole analyzed workspace, which this session scopes to 1 file.",
             render_scan_usages_scope(&one_file, false)
         );
-    }
-
-    #[test]
-    fn truncated_absence_scope_does_not_recommend_widening_paths() {
-        let scope = crate::searchtools::ScanUsagesScope {
-            include_tests: true,
-            whole_workspace: false,
-            session_subset: None,
-            paths: vec!["src/**/*.rs".to_string()],
-            paths_omitted: None,
-            ignored_paths: None,
-            unmatched_paths: Vec::new(),
-            unmatched_paths_omitted: None,
-        };
-
-        let ordinary = render_scan_usages_scope(&scope, false);
-        assert!(ordinary.contains("drop or widen paths"), "{ordinary}");
-
-        let truncated = render_scan_usages_scope(&scope, true);
-        assert!(!truncated.contains("drop or widen paths"), "{truncated}");
     }
 }

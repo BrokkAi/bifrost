@@ -1,9 +1,8 @@
 //! May-source evidence at ordered definition boundaries in a preliminary solve.
 
-use super::correlations::CorrelationError;
+use super::correlations::{CorrelationError, charge_entries, check_cancelled};
 use crate::analyzer::semantic::{
     CancellationToken, EvidenceCompleteness, ProgramPointHandle, ProofStatus, SemanticBudget,
-    SemanticWork,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::value_flow::{
@@ -33,7 +32,7 @@ impl DefinitionSources {
     ) -> Result<Self, CorrelationError> {
         let mut incoming = HashMap::<ProgramPointHandle, Carriers>::default();
         for reached in result.result().reached() {
-            check_cancelled(cancellation)?;
+            check_cancelled(Some(cancellation))?;
             if !queried.contains(reached.point()) {
                 continue;
             }
@@ -78,7 +77,7 @@ impl DefinitionSources {
             return Ok(None);
         };
         for source in plan.sources_at(point, ValueFlowObservationPhase::AfterEffects) {
-            check_cancelled(cancellation)?;
+            check_cancelled(Some(cancellation))?;
             charge_entries(budget, 1)?;
             if source.carrier != target {
                 continue;
@@ -107,7 +106,7 @@ impl DefinitionSources {
         budget: &mut SemanticBudget,
         cancellation: &CancellationToken,
     ) -> Result<Option<Vec<(ValueFlowSourceId, bool)>>, CorrelationError> {
-        check_cancelled(cancellation)?;
+        check_cancelled(Some(cancellation))?;
         assert!(
             self.queried.contains(point),
             "a source-evidence query names a point this index was built for"
@@ -118,7 +117,7 @@ impl DefinitionSources {
         };
         let mut rules = Vec::new();
         for rule in plan.local_rule_views(point) {
-            check_cancelled(cancellation)?;
+            check_cancelled(Some(cancellation))?;
             charge_entries(budget, 1)?;
             if (rule.event_index as usize) >= event {
                 break;
@@ -131,7 +130,7 @@ impl DefinitionSources {
         // store at event zero only reads its RHS carrier, not every live value.
         let mut needed = HashSet::from_iter([target]);
         for rule in rules.iter().rev() {
-            check_cancelled(cancellation)?;
+            check_cancelled(Some(cancellation))?;
             charge_entries(budget, 1)?;
             if needed.contains(&rule.target) {
                 if crate::value_flow::rule_kills_target(rule) {
@@ -142,7 +141,7 @@ impl DefinitionSources {
         }
         let mut active = clone_carriers(self.incoming.get(point), &needed, budget, cancellation)?;
         for source in plan.sources_at(point, ValueFlowObservationPhase::BeforeEffects) {
-            check_cancelled(cancellation)?;
+            check_cancelled(Some(cancellation))?;
             charge_entries(budget, 1)?;
             if !needed.contains(&source.carrier) {
                 continue;
@@ -156,7 +155,7 @@ impl DefinitionSources {
                 .or_insert(uncertain);
         }
         for rule in rules {
-            check_cancelled(cancellation)?;
+            check_cancelled(Some(cancellation))?;
             charge_entries(budget, 1)?;
             let sources = clone_sources(active.get(&rule.source), budget, cancellation)?;
             if crate::value_flow::rule_kills_target(&rule) {
@@ -165,7 +164,7 @@ impl DefinitionSources {
             if let Some(sources) = sources {
                 let destination = active.entry(rule.target).or_default();
                 for (source, uncertain) in sources {
-                    check_cancelled(cancellation)?;
+                    check_cancelled(Some(cancellation))?;
                     charge_entries(budget, 1)?;
                     destination
                         .entry(source)
@@ -174,7 +173,7 @@ impl DefinitionSources {
                 }
             }
         }
-        check_cancelled(cancellation)?;
+        check_cancelled(Some(cancellation))?;
         let Some(sources) = active.remove(&target) else {
             return Ok(None);
         };
@@ -184,33 +183,13 @@ impl DefinitionSources {
         charge_entries(budget, sources.len())?;
         let mut sources = sources.into_iter().collect::<Vec<_>>();
         sources.sort_unstable_by_key(|(source, _)| *source);
-        check_cancelled(cancellation)?;
+        check_cancelled(Some(cancellation))?;
         Ok(Some(sources))
     }
 }
 
 fn source_is_uncertain(proof: &ProofStatus, completeness: &EvidenceCompleteness) -> bool {
     !matches!(proof, ProofStatus::Proven) || !matches!(completeness, EvidenceCompleteness::Complete)
-}
-
-fn check_cancelled(cancellation: &CancellationToken) -> Result<(), CorrelationError> {
-    if cancellation.is_cancelled() {
-        return Err(CorrelationError::Cancelled {
-            timed_out: cancellation.is_timed_out(),
-        });
-    }
-    Ok(())
-}
-
-fn charge_entries(budget: &mut SemanticBudget, count: usize) -> Result<(), CorrelationError> {
-    if count == 0 {
-        return Ok(());
-    }
-    budget.charge(SemanticWork {
-        nested_entries: count,
-        ..SemanticWork::default()
-    })?;
-    Ok(())
 }
 
 fn clone_carriers(
@@ -224,7 +203,7 @@ fn clone_carriers(
         return Ok(cloned);
     };
     for &carrier in needed {
-        check_cancelled(cancellation)?;
+        check_cancelled(Some(cancellation))?;
         charge_entries(budget, 1)?;
         let Some(sources) = incoming.get(&carrier) else {
             continue;
@@ -246,7 +225,7 @@ fn clone_sources(
     };
     let mut cloned = Sources::default();
     for (&source, &uncertain) in sources {
-        check_cancelled(cancellation)?;
+        check_cancelled(Some(cancellation))?;
         charge_entries(budget, 1)?;
         cloned.insert(source, uncertain);
     }

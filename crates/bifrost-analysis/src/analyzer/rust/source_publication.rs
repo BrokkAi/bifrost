@@ -229,8 +229,9 @@ fn insert(
         "INSERT INTO source_rust_declaration_properties(
            blob_id, declaration_id, visibility, cfg_condition, constructor_non_exhaustive,
            declaration_kind, macro_exported, trait_impl_member,
-           has_impl_or_trait_ancestor, nearest_declaration_boundary, serde_helper_derive
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+           has_impl_or_trait_ancestor, nearest_declaration_boundary, derive_helper_attributes,
+           generated_surface
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, jsonb(?11), ?12)",
     )?;
     let mut constructor_fields = tx.prepare_cached(
         "INSERT INTO source_rust_constructor_fields(blob_id, declaration_id, ordinal, visibility)
@@ -255,7 +256,11 @@ fn insert(
             property.trait_impl_member,
             property.has_impl_or_trait_ancestor,
             encode_rust_declaration_boundary(property.nearest_declaration_boundary),
-            property.serde_helper_derive.map(|derive| derive.name()),
+            property.derive_helper_attributes.as_ref().map(|names| {
+                serde_json::to_string(names)
+                    .expect("derive-helper attribute names serialize as a JSON array")
+            }),
+            property.generated_surface,
         ])?;
         if let Some(constructor) = &property.value_constructor {
             for (ordinal, visibility) in constructor.field_visibilities.iter().enumerate() {

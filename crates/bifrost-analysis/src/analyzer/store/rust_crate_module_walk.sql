@@ -165,7 +165,10 @@ WITH RECURSIVE modules(module_path, blob_id, scope_ordinal, rel_path,
 -- which the caller detects by counting placements per module path; this walk
 -- does not label it, because a module path can also repeat through an
 -- `include!`, which is the same module.
-SELECT module_path, blob_id, scope_ordinal, rel_path, placement,
+-- Several include routes can reach the same source file in the same module.
+-- That is one crate member: its source facts are keyed by blob and module,
+-- and the member tables cannot represent duplicate copies of the same row.
+SELECT DISTINCT module_path, blob_id, scope_ordinal, rel_path, placement,
        mount_blob_id, mount_start_byte,
        CASE WHEN activation <> 1 THEN activation
             WHEN depth = 256 THEN -1

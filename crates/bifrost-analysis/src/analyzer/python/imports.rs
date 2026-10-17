@@ -63,6 +63,14 @@ impl ImportAnalysisProvider for PythonAnalyzer {
         self.inner.import_info_of(token, file)
     }
 
+    fn import_info_of_checked(
+        &self,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> Option<Vec<ImportInfo>> {
+        self.inner.import_info_of_checked(token, file)
+    }
+
     /// Flattens every import's resolved targets without collapsing by binding name -- unlike
     /// `imported_code_units_of`, whose result is built from a binding-name-keyed map and would
     /// silently drop one target when two imports share a local binding (e.g. a try/except fallback

@@ -60,7 +60,7 @@ fn row(
             range: public_range(candidate.coordinates),
             body_range: candidate.body_coordinates.map(public_range),
             loop_kind: match candidate.kind {
-                LoopKind::While => "while",
+                LoopKind::While | LoopKind::Until => "while",
                 LoopKind::For => "for",
                 LoopKind::Do => "do",
             },
@@ -94,23 +94,23 @@ fn report_open(
     reason: impl std::fmt::Debug,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) {
-    diagnostics.push(CodeQueryDiagnostic {
-        code: CodeQueryDiagnosticCode::LoopRelationDerivationIncomplete,
-        impact: CodeQueryDiagnosticImpact::Incomplete,
-        branch: Vec::new(),
-        language: procedure
+    let mut diagnostic = super::incomplete_diagnostic(
+        CodeQueryDiagnosticCode::LoopRelationDerivationIncomplete,
+        procedure
             .handle
             .artifact()
             .key()
             .language()
             .language()
             .config_label(),
-        message: format!(
+        format!(
             "{} has open loop relation evidence: {reason:?}",
             procedure.wire_id()
         ),
-        exhausted_roots: Vec::new(),
-    });
+        Vec::new(),
+    );
+    diagnostic.source = procedure.diagnostic_source();
+    diagnostics.push(diagnostic);
 }
 
 pub(super) fn loop_relation_expansions(
@@ -121,7 +121,13 @@ pub(super) fn loop_relation_expansions(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     procedure: &semantic::SemanticProcedureValue,
 ) -> Vec<PipelineExpansion> {
-    let candidates = loop_candidates(workspace, &procedure.handle, cancellation);
+    let candidates = match loop_candidates(workspace, &procedure.handle, cancellation) {
+        Ok(candidates) => candidates,
+        Err(reason) => {
+            report_open(procedure, reason, diagnostics);
+            return Vec::new();
+        }
+    };
     if !candidates.complete {
         report_open(procedure, candidates.reason, diagnostics);
         return Vec::new();
@@ -206,6 +212,7 @@ pub(super) fn loop_relation_expansions(
             let site = candidate.site.expect("qualified loop has a source site");
             let kind = match site.kind {
                 LoopKind::While => LoopSourceKind::While,
+                LoopKind::Until => LoopSourceKind::Until,
                 LoopKind::For => LoopSourceKind::For,
                 LoopKind::Do => LoopSourceKind::Do,
             };
@@ -275,4 +282,163 @@ pub(super) fn loop_relation_expansions(
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brokk_bifrost_analysis::analyzer::semantic::ContentIdentity;
+    use brokk_bifrost_analysis::analyzer::store::StoreError;
+    use brokk_bifrost_analysis::analyzer::{
+        AnalyzerConfig, AnalyzerQueryScope, QueryReadIncomplete,
+    };
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#5385: loop read failures lost their typed cause and affected source")]
+    fn loop_read_failure_preserves_typed_cause_and_exact_procedure_source() {
+        // Resolve the real procedure before opening a failed request, while
+        // its loop-candidate cache is still cold.
+        let source =
+            "// header\nfunction check(flag) {\n  while (flag) { return 1; }\n  return 0;\n}\n";
+        let fixture = super::super::tests::inline_project::InlineTestProject::with_language(
+            Language::JavaScript,
+        )
+        .file("subject.js", source)
+        .build();
+        let workspace = fixture.workspace_analyzer(AnalyzerConfig::default());
+        let file = fixture.file("subject.js");
+        let mut context = semantic::SemanticQueryContext::new(
+            &workspace,
+            None,
+            CodeQuerySemanticLimits::default(),
+        );
+        let procedures = context.procedure_of_source_range(
+            &file,
+            Range {
+                start_byte: 10,
+                end_byte: source.len() - 1,
+                start_line: 2,
+                end_line: 5,
+            },
+            ContentIdentity::hash_bytes(source.as_bytes()),
+        );
+        let [procedure] = procedures.as_slice() else {
+            panic!(
+                "expected exact function procedure, got {:?}",
+                procedures
+                    .iter()
+                    .map(|procedure| procedure.public())
+                    .collect::<Vec<_>>()
+            );
+        };
+        let expected = CodeQuerySourceSpan {
+            path: "subject.js".to_owned(),
+            range: CodeQueryRange {
+                start_line: 2,
+                start_column: 1,
+                end_line: 5,
+                end_column: 2,
+            },
+            start_byte: 10,
+            end_byte: source.len() - 1,
+        };
+        {
+            // Existing request-failure injection exercises nested cache reads;
+            // this is not physical corruption or a claim about hiredis' cause.
+            let scope = AnalyzerQueryScope::new(workspace.analyzer());
+            let marker = "#5385 injected inherited loop read failure";
+            scope.record_store_error_for_test(StoreError::new(marker));
+            let failure = loop_candidates(&workspace, &procedure.handle, None)
+                .expect_err("cold loop read must preserve the inherited failure");
+            assert!(
+                matches!(
+                    &failure,
+                    QueryReadIncomplete::StoreFailure(error) if error.to_string() == marker
+                ),
+                "{failure:?}"
+            );
+            let expected_detail = format!("{failure:?}");
+            let mut diagnostics = Vec::new();
+            let rows = loop_relation_expansions(
+                &workspace,
+                &mut context,
+                &mut FlowStateTraversalCache::default(),
+                None,
+                &mut diagnostics,
+                procedure,
+            );
+            assert!(rows.is_empty(), "failed read must not publish loop rows");
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("expected one attributed read failure: {diagnostics:?}");
+            };
+            assert_eq!(
+                diagnostic.code,
+                CodeQueryDiagnosticCode::LoopRelationDerivationIncomplete
+            );
+            assert_eq!(diagnostic.impact, CodeQueryDiagnosticImpact::Incomplete);
+            assert!(
+                diagnostic.message.contains(&expected_detail),
+                "{diagnostic:?}"
+            );
+            assert!(
+                diagnostic.message.contains("kind: Generic"),
+                "{diagnostic:?}"
+            );
+            assert_eq!(diagnostic.source.as_ref(), Some(&expected));
+            assert!(matches!(
+                scope.read_completion(),
+                Err(QueryReadIncomplete::StoreFailure(error)) if error.to_string() == marker
+            ));
+        }
+        // The pre-existing syntax reason uses the same affected source without
+        // being misclassified as a query-read error.
+        let mut diagnostics = Vec::new();
+        report_open(
+            procedure,
+            Some("procedure_syntax_recovery"),
+            &mut diagnostics,
+        );
+        assert!(diagnostics[0].message.contains("procedure_syntax_recovery"));
+        assert_eq!(diagnostics[0].source.as_ref(), Some(&expected));
+
+        // Both the failed initialization above and cancellation's direct-build
+        // bypass must leave the same procedure retryable in a fresh request.
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        let cancelled = loop_candidates(&workspace, &procedure.handle, Some(&cancellation))
+            .expect("explicit cancellation retains the direct-build path");
+        assert!(!cancelled.complete);
+        assert_eq!(cancelled.reason, Some("cancelled"));
+        let healthy = loop_candidates(&workspace, &procedure.handle, None)
+            .expect("healthy retry must not reuse failed or cancelled evidence");
+        assert!(healthy.complete, "{healthy:?}");
+        assert_eq!(healthy.rows.len(), 1);
+        let first = workspace
+            .analyzer()
+            .loop_candidates_for(&workspace, &procedure.handle, None)
+            .expect("successful cached read");
+        let second = workspace
+            .analyzer()
+            .loop_candidates_for(&workspace, &procedure.handle, None)
+            .expect("successful cached reread");
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+
+        let mut flow_cache = FlowStateTraversalCache::default();
+        let mut control_diagnostics = Vec::new();
+        let rows = loop_relation_expansions(
+            &workspace,
+            &mut context,
+            &mut flow_cache,
+            None,
+            &mut control_diagnostics,
+            procedure,
+        );
+        assert!(control_diagnostics.is_empty(), "{control_diagnostics:?}");
+        assert_eq!(rows.len(), 1, "supported loop retains its result");
+        let PipelineValue::LoopRelation(value) = &rows[0].value else {
+            panic!("expected loop relation");
+        };
+        assert_eq!(value.row.verdict, "proven");
+    }
 }

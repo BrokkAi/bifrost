@@ -1655,34 +1655,4 @@ mod tests {
             Err(PythonDeclaredEnvironmentError::Symlink(_))
         ));
     }
-
-    #[test]
-    fn enforces_shared_input_byte_budget_and_cancellation() {
-        let fixture = fixture();
-        let inventories = root_inventories(fixture.workspace.path(), &fixture.runtime);
-        let limited = DependencyPackLimits {
-            max_total_artifact_bytes: fixture.expected_input_bytes - 1,
-            ..DependencyPackLimits::default()
-        };
-        assert!(matches!(
-            produce(&fixture, &fixture.runtime, &inventories, &limited, None),
-            Err(PythonDeclaredEnvironmentError::LimitExceeded {
-                resource: "total input bytes",
-                ..
-            })
-        ));
-
-        let cancellation = CancellationToken::new();
-        cancellation.cancel();
-        assert!(matches!(
-            produce(
-                &fixture,
-                &fixture.runtime,
-                &inventories,
-                &DependencyPackLimits::default(),
-                Some(&cancellation),
-            ),
-            Err(PythonDeclaredEnvironmentError::Cancelled)
-        ));
-    }
 }

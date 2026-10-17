@@ -3,8 +3,8 @@ use std::fmt;
 use super::super::capabilities::SemanticCapability;
 use super::super::ids::{
     AllocationId, BlockId, CallSiteId, CaptureId, EvidenceId, GuardId, MemoryLocationId,
-    ProcedureId, ProgramPointId, SemanticGapId, SemanticLocator, SourceMappingId, StableDigest,
-    StructuralNodeIdentity, SwitchFactId, ValueId,
+    PointerOriginId, ProcedureId, ProgramPointId, SemanticGapId, SemanticLocator, SourceMappingId,
+    StableDigest, StructuralNodeIdentity, SwitchFactId, ValueId,
 };
 use super::super::provider::SemanticBudgetExceeded;
 pub use crate::analyzer::DispatchExtensibility;
@@ -35,6 +35,8 @@ pub enum SemanticIrErrorKind {
     DuplicateEdge,
     GuardContract,
     SwitchContract,
+    LifecycleContract,
+    PointerContract,
 }
 
 impl SemanticIrErrorKind {
@@ -63,6 +65,8 @@ impl SemanticIrErrorKind {
             Self::DuplicateEdge => "duplicate_edge",
             Self::GuardContract => "guard_contract",
             Self::SwitchContract => "switch_contract",
+            Self::LifecycleContract => "lifecycle_contract",
+            Self::PointerContract => "pointer_contract",
         }
     }
 }
@@ -392,7 +396,7 @@ pub struct ProcedureProperties {
 }
 
 /// The positional or keyword domain accepted or produced at a call boundary.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ArgumentDomain {
     Positional,
     Keyword,
@@ -408,6 +412,10 @@ impl ArgumentDomain {
             Self::PositionalOrKeyword => "positional_or_keyword",
             Self::LanguageDefined(_) => "language_defined",
         }
+    }
+
+    pub(crate) const fn accepts_positional(&self) -> bool {
+        matches!(self, Self::Positional | Self::PositionalOrKeyword)
     }
 }
 
@@ -428,7 +436,7 @@ pub enum FormalParameterPassingMode {
 
 impl FormalParameterPassingMode {
     pub const fn accepts_positional(self) -> bool {
-        matches!(self, Self::PositionalOnly | Self::PositionalOrNamed)
+        self.argument_domain().accepts_positional()
     }
 
     pub const fn accepts_named(self) -> bool {
@@ -440,6 +448,14 @@ impl FormalParameterPassingMode {
             Self::PositionalOnly => "positional_only",
             Self::PositionalOrNamed => "positional_or_named",
             Self::NamedOnly => "named_only",
+        }
+    }
+
+    const fn argument_domain(self) -> &'static ArgumentDomain {
+        match self {
+            Self::PositionalOnly => &ArgumentDomain::Positional,
+            Self::PositionalOrNamed => &ArgumentDomain::PositionalOrKeyword,
+            Self::NamedOnly => &ArgumentDomain::Keyword,
         }
     }
 }
@@ -519,7 +535,7 @@ pub enum SemanticValueKind {
     LanguageDefined(Box<str>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CallArgumentExpansion {
     Unclassified,
     Direct(ArgumentDomain),
@@ -547,7 +563,7 @@ impl CallArgumentExpansion {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SemanticCallArgument {
     pub value: ValueId,
     pub expansion: CallArgumentExpansion,
@@ -595,6 +611,18 @@ impl From<ValueId> for SemanticCallArgument {
 }
 
 impl SemanticValueKind {
+    /// Whether this value denotes a local, formal parameter, or receiver binding.
+    pub const fn is_binding(&self) -> bool {
+        matches!(
+            self,
+            Self::Local | Self::Parameter { .. } | Self::Receiver { .. }
+        )
+    }
+
+    pub fn is_language_defined(&self, expected: &str) -> bool {
+        matches!(self, Self::LanguageDefined(kind) if kind.as_ref() == expected)
+    }
+
     pub const fn label(&self) -> &'static str {
         match self {
             Self::Local => "local",
@@ -867,6 +895,31 @@ pub struct CaptureBinding {
     pub evidence: EvidenceId,
 }
 
+/// Exact source identity for an artifact-backed anonymous callable.
+///
+/// Construction requires the language adapter's fresh source proof. The
+/// descriptor identifies a body to materialize; it does not prove invocation
+/// or bind one creation's captured environment. No materialized graph is
+/// retained by this durable target.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ArtifactCallableTarget {
+    identity: Box<crate::analyzer::semantic_model::AnonymousCallableIdentity>,
+}
+
+impl ArtifactCallableTarget {
+    pub(crate) fn from_bound_identity(
+        identity: crate::analyzer::semantic_model::AnonymousCallableIdentity,
+    ) -> Self {
+        Self {
+            identity: Box::new(identity),
+        }
+    }
+
+    pub fn identity(&self) -> &crate::analyzer::semantic_model::AnonymousCallableIdentity {
+        &self.identity
+    }
+}
+
 /// A resolved local body or a durable external declaration.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CallableTarget {
@@ -876,6 +929,7 @@ pub enum CallableTarget {
     /// explicitly unproven or budget-exceeded candidate set.
     Unmaterialized(SemanticLocator),
     External(SemanticLocator),
+    Artifact(ArtifactCallableTarget),
 }
 
 impl CallableTarget {
@@ -884,6 +938,7 @@ impl CallableTarget {
             Self::Local(_) => "local",
             Self::Unmaterialized(_) => "unmaterialized",
             Self::External(_) => "external",
+            Self::Artifact(_) => "artifact",
         }
     }
 }
@@ -904,11 +959,11 @@ impl CallableTargetResolution {
     pub const fn label(&self) -> &'static str {
         match self {
             Self::Proven(_) => "proven",
-            Self::Ambiguous(_) => "ambiguous",
-            Self::Unknown => "unknown",
-            Self::Unsupported => "unsupported",
-            Self::Unproven(_) => "unproven",
-            Self::ExceededBudget(_) => "exceeded_budget",
+            Self::Ambiguous(_) => SemanticGapKind::Ambiguous.label(),
+            Self::Unknown => SemanticGapKind::Unknown.label(),
+            Self::Unsupported => SemanticGapKind::Unsupported.label(),
+            Self::Unproven(_) => SemanticGapKind::Unproven.label(),
+            Self::ExceededBudget(_) => SemanticGapKind::ExceededBudget.label(),
         }
     }
 
@@ -975,6 +1030,18 @@ pub struct CallableValue {
     pub environment: Option<AllocationId>,
 }
 
+impl CallableValue {
+    pub(crate) fn unknown_target(kind: CallableReferenceKind, target_evidence: EvidenceId) -> Self {
+        Self {
+            kind,
+            targets: CallableTargetResolution::Unknown,
+            target_evidence,
+            bound_receiver: None,
+            environment: None,
+        }
+    }
+}
+
 /// A caller-side receiver fact established at one call site.
 ///
 /// This describes evaluation of the callable value, not whether a resolved
@@ -987,24 +1054,6 @@ pub enum CallerReceiverBinding {
     Bound(ValueId),
     ModuleQualified(ValueId),
     TypeQualified(ValueId),
-}
-
-impl CallerReceiverBinding {
-    /// An instance method selected without binding an object receives its
-    /// receiver from the written argument list. Static methods have no receiver
-    /// value, and class-bound descriptors use the qualifier instead.
-    pub fn passes_receiver_as_argument(self, callee: &super::ProcedureSemantics) -> bool {
-        matches!(self, Self::TypeQualified(_))
-            && callee.properties().receiver_binding == ProcedureReceiverBinding::Instance
-            && matches!(
-                callee.kind(),
-                ProcedureKind::Method | ProcedureKind::Constructor
-            )
-            && callee
-                .values()
-                .iter()
-                .any(|value| matches!(value.kind, SemanticValueKind::Receiver { .. }))
-    }
 }
 
 /// The intraprocedural destination of one normal, exceptional, or async arm.
@@ -1172,11 +1221,18 @@ pub enum ProofStatus {
 }
 
 impl ProofStatus {
+    pub(crate) const fn establishes_complete_evidence(
+        &self,
+        completeness: &EvidenceCompleteness,
+    ) -> bool {
+        matches!(self, Self::Proven) && matches!(completeness, EvidenceCompleteness::Complete)
+    }
+
     pub fn retained_heap_bytes(&self) -> usize {
-        match self {
-            Self::Proven => 0,
-            Self::Unproven(reason) => reason.len(),
-        }
+        retained_reason_heap_bytes(match self {
+            Self::Proven => None,
+            Self::Unproven(reason) => Some(reason),
+        })
     }
 }
 
@@ -1202,11 +1258,15 @@ pub enum EvidenceCompleteness {
 
 impl EvidenceCompleteness {
     pub fn retained_heap_bytes(&self) -> usize {
-        match self {
-            Self::Complete => 0,
-            Self::Partial(reason) => reason.len(),
-        }
+        retained_reason_heap_bytes(match self {
+            Self::Complete => None,
+            Self::Partial(reason) => Some(reason),
+        })
     }
+}
+
+fn retained_reason_heap_bytes(reason: Option<&str>) -> usize {
+    reason.map_or(0, str::len)
 }
 
 impl EvidenceCompleteness {
@@ -1531,6 +1591,12 @@ impl SemanticGapImpacts {
 /// crosses no call or suspension, or by releasing the binding's value at
 /// every call and suspension. An assignment by the callable still establishes
 /// the binding, so an initialization proof may discharge it outright.
+/// `InertDropGlue` marks a point-scoped omission of implicit destructor calls
+/// whose destroyed values are only the procedure's parameters and the values of
+/// its `let` bindings, including a temporary a wildcard `let` discards. A
+/// consumer may discharge it with a language proof, made against the exact
+/// source the procedure was lowered from, that dropping every such value runs no
+/// user code. Any value the proof cannot type keeps the gap.
 /// A gap without a declared discharge (`None`) stands until the adapter itself
 /// lowers the construct.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1541,16 +1607,107 @@ pub enum SemanticGapDischarge {
     RetainedEvaluationOrder,
     RetainedControlTopology,
     CanonicalIndexIdentity,
+    /// Missing aggregate/member layout only. An exact field projection may
+    /// resolve this obligation with retained initializer/access AST identity,
+    /// activated declaration identity and complete state at the queried point.
+    /// Other fields and the containing procedure's coverage stay open.
+    ExactFieldLayout,
     /// An executable property/index load may be interpreted by a runtime model.
     RuntimeReadBehavior,
     NonRejoiningExceptionalExit,
     ExitOnlyProcedureCompletion,
     /// The adapter modeled every operation effect except the exact impact set
     /// retained by this gap. Consumers may discharge only that partition.
+    /// An exact field access may retain declaration/type uncertainty with an
+    /// empty impact set; its memory effects are already fully represented.
     ModeledEffectPartition,
     /// A nested callable rebinds the subject binding only at a call or a
     /// suspension of this procedure.
     RebindAtCallOrSuspension,
+    /// Every value the omitted drop can destroy is a parameter or a `let`
+    /// binding whose drop glue a language proof can show runs no user code.
+    InertDropGlue,
+    /// `NonRejoiningExceptionalExit`, provided the procedure's `InertDropGlue`
+    /// proof holds: the evaluation scope's active cleanups destroy only
+    /// parameters and `let` bindings, so the abort route runs user code only
+    /// if one of those drops does.
+    NonRejoiningExceptionalExitAfterInertDrops,
+    /// The enclosing function's declared return type makes the residual
+    /// conversion a no-user-code transfer.
+    ResidualConversion,
+}
+
+/// One Go predeclared builtin whose call lowering relies on package-level
+/// name resolution finding no same-package declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GoPredeclaredBuiltin {
+    Append,
+    Cap,
+    Clear,
+    Close,
+    Complex,
+    Copy,
+    Delete,
+    Imag,
+    Len,
+    Make,
+    Max,
+    Min,
+    New,
+    Panic,
+    Print,
+    Println,
+    Real,
+    Recover,
+}
+
+impl GoPredeclaredBuiltin {
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "append" => Self::Append,
+            "cap" => Self::Cap,
+            "clear" => Self::Clear,
+            "close" => Self::Close,
+            "complex" => Self::Complex,
+            "copy" => Self::Copy,
+            "delete" => Self::Delete,
+            "imag" => Self::Imag,
+            "len" => Self::Len,
+            "make" => Self::Make,
+            "max" => Self::Max,
+            "min" => Self::Min,
+            "new" => Self::New,
+            "panic" => Self::Panic,
+            "print" => Self::Print,
+            "println" => Self::Println,
+            "real" => Self::Real,
+            "recover" => Self::Recover,
+            _ => return None,
+        })
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Append => "append",
+            Self::Cap => "cap",
+            Self::Clear => "clear",
+            Self::Close => "close",
+            Self::Complex => "complex",
+            Self::Copy => "copy",
+            Self::Delete => "delete",
+            Self::Imag => "imag",
+            Self::Len => "len",
+            Self::Make => "make",
+            Self::Max => "max",
+            Self::Min => "min",
+            Self::New => "new",
+            Self::Panic => "panic",
+            Self::Print => "print",
+            Self::Println => "println",
+            Self::Real => "real",
+            Self::Recover => "recover",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1569,6 +1726,14 @@ pub struct SemanticGap {
     pub detail: Box<str>,
     pub source: SourceMappingId,
     pub evidence: EvidenceId,
+}
+
+impl SemanticGap {
+    /// Whether this gap leaves a procedure's return-value transfer incomplete.
+    pub fn is_return_transfer_gap(&self) -> bool {
+        self.capability == SemanticCapability::Values
+            && self.impacts.contains(SemanticGapImpact::ReturnTransfer)
+    }
 }
 
 /// Whether a producer-authored gap certifies one exact index identity across
@@ -1761,6 +1926,11 @@ impl SignedIntegerMagnitude {
         }
     }
 
+    /// Construct the canonical sign-and-magnitude form of an `i128` value.
+    pub const fn from_i128(value: i128) -> Self {
+        Self::new(value < 0, value.unsigned_abs())
+    }
+
     pub const fn negative(self) -> bool {
         self.negative
     }
@@ -1922,8 +2092,8 @@ impl ValueFlowKind {
     }
 }
 
-/// A structured operation that consumes a value without claiming that the
-/// consumed value flows into the operation's result.
+/// A structured operation on a value or binding without claiming that it
+/// flows into the operation's result.
 ///
 /// This is deliberately separate from [`ValueFlowKind`]. For example, an
 /// address value is required to dereference memory, but the address itself is
@@ -1931,12 +2101,15 @@ impl ValueFlowKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ValueUseKind {
     Dereference,
+    /// Remove the lexical binding that names this local or parameter.
+    Unbind,
 }
 
 impl ValueUseKind {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Dereference => "dereference",
+            Self::Unbind => "unbind",
         }
     }
 }
@@ -2221,6 +2394,267 @@ pub(crate) fn assignment_transfer(
         })
 }
 
+/// A source binding or projected storage location whose initialization and
+/// lifetime can be tracked independently of the value currently stored there.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SemanticPlace {
+    /// A local or parameter binding, identified by its exact value locator.
+    LocalBinding(SemanticLocator),
+    /// A structured projection such as a field or indexed element.
+    MemoryLocation(MemoryLocationId),
+}
+
+/// Whether a place's destructor has user-visible behavior.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum DropBehavior {
+    /// The producer proved that dropping this place runs no user destructor.
+    Trivial,
+    /// A user destructor is selected or its target-resolution frontier is
+    /// retained for downstream cleanup analysis.
+    Destructor(CallableTargetResolution),
+}
+
+/// One explicit or implicit destruction of a place at a program point.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DropFact {
+    pub place: SemanticPlace,
+    pub point: ProgramPointId,
+    pub behavior: DropBehavior,
+    pub source: SourceMappingId,
+    pub evidence: EvidenceId,
+}
+
+/// The initialization state left in a moved place or tracked aggregate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MoveOutState {
+    Uninitialized,
+    PartiallyInitialized,
+    Unknown,
+}
+
+/// One place-level initialization transition tied to an existing move transfer.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MoveOutFact {
+    pub place: SemanticPlace,
+    pub point: ProgramPointId,
+    pub source_value: ValueId,
+    pub target_value: ValueId,
+    pub state_after: MoveOutState,
+    pub source: SourceMappingId,
+    pub evidence: EvidenceId,
+}
+
+/// Where one place's storage lifetime ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ScopeEndAt {
+    Point(ProgramPointId),
+    Edge {
+        source_point: ProgramPointId,
+        target_point: ProgramPointId,
+        kind: ControlEdgeKind,
+    },
+}
+
+/// One exact storage-lifetime end for a local place.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ScopeEndFact {
+    pub place: SemanticPlace,
+    pub at: ScopeEndAt,
+    pub source: SourceMappingId,
+    pub evidence: EvidenceId,
+}
+
+/// The kind of object named by one abstract pointer origin.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PointerOriginKind {
+    StackPlace { place: SemanticPlace },
+    Allocation { allocation: AllocationId },
+}
+
+/// One procedure-local abstract stack place or allocation identity.
+///
+/// The dense ID is local to the containing procedure artifact. `kind`, source,
+/// and evidence retain the declaration or allocation site that roots it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PointerOrigin {
+    pub id: PointerOriginId,
+    pub point: ProgramPointId,
+    pub kind: PointerOriginKind,
+    pub byte_extent: Option<u128>,
+    pub source: SourceMappingId,
+    pub evidence: EvidenceId,
+}
+
+/// Whether a pointer relation has one proven origin or retains alternatives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PointerRelationStrength {
+    Must,
+    May,
+}
+
+impl PointerRelationStrength {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Must => "must",
+            Self::May => "may",
+        }
+    }
+}
+
+/// A byte displacement from the beginning of a pointer origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PointerByteOffset {
+    Exact(i128),
+    Value(ValueId),
+    Range { minimum: i128, maximum: i128 },
+    Unknown,
+}
+
+/// One pointer value may designate one abstract origin at this offset.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PointerAlias {
+    pub point: ProgramPointId,
+    pub pointer: ValueId,
+    pub origin: PointerOriginId,
+    pub byte_offset: PointerByteOffset,
+    pub strength: PointerRelationStrength,
+    pub source: SourceMappingId,
+    pub evidence: EvidenceId,
+}
+
+/// Whether an indirect operation reads, writes, or both through a pointer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PointerAccessKind {
+    Read,
+    Write,
+    ReadWrite,
+}
+
+impl PointerAccessKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::ReadWrite => "read_write",
+        }
+    }
+}
+
+/// The byte width accessed through a pointer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PointerAccessWidth {
+    Exact(u128),
+    ValueTimes { value: ValueId, multiplier: u128 },
+    Unknown,
+}
+
+/// One source-mapped indirect memory operation through a pointer value.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PointerAccess {
+    pub point: ProgramPointId,
+    pub pointer: ValueId,
+    pub kind: PointerAccessKind,
+    pub width: PointerAccessWidth,
+    pub source: SourceMappingId,
+    pub evidence: EvidenceId,
+}
+
+/// How a pointer invalidation identifies the allocation whose lifetime ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PointerInvalidationTarget {
+    /// Resolve this pointer value to its possible origins at the invalidation.
+    Pointer(ValueId),
+    /// Name an origin local to the containing procedure artifact.
+    Origin(PointerOriginId),
+}
+
+/// Why a pointer origin may no longer be accessed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PointerInvalidationCause {
+    Deallocated,
+    OwnerDropped,
+    OwnershipTransferred,
+    PossibleReallocation,
+}
+
+impl PointerInvalidationCause {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Deallocated => "deallocated",
+            Self::OwnerDropped => "owner_dropped",
+            Self::OwnershipTransferred => "ownership_transferred",
+            Self::PossibleReallocation => "possible_reallocation",
+        }
+    }
+}
+
+/// One event that invalidates or may invalidate an abstract pointer origin.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PointerInvalidation {
+    pub point: ProgramPointId,
+    pub target: PointerInvalidationTarget,
+    pub cause: PointerInvalidationCause,
+    pub strength: PointerRelationStrength,
+    pub source: SourceMappingId,
+    pub evidence: EvidenceId,
+}
+
+/// A typed reason why lifecycle support is incomplete at one subject.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LifecycleIncompleteReason {
+    UnsupportedMacroExpansion,
+    GenericDropObligation,
+    MissingType,
+    PartialMove,
+    ManuallyDrop,
+    ForgottenOwner,
+    UnresolvedTraitDispatch,
+    UnsupportedCleanup,
+    UnknownPanicStrategy,
+    AsyncCancellationState,
+}
+
+/// A typed reason why pointer-origin or invalidation support is incomplete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PointerIncompleteReason {
+    RawPointerType,
+    UnsupportedOperation,
+    MissingType,
+    UnknownLayout,
+    UnknownAllocationExtent,
+    AmbiguousOrigin,
+    AmbiguousAlias,
+    UnresolvedAllocator,
+    ExternalEscape,
+    OffsetOverflow,
+}
+
+/// Domain-qualified reason attached to an explicit incomplete fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SemanticIncompleteReason {
+    Lifecycle(LifecycleIncompleteReason),
+    Pointer(PointerIncompleteReason),
+}
+
+/// The exact procedure-local subject whose semantics remain incomplete.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SemanticIncompleteSubject {
+    Procedure,
+    Place(SemanticPlace),
+    Value(ValueId),
+    PointerOrigin(PointerOriginId),
+}
+
+/// One machine-readable reason that positive facts do not cover a subject.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SemanticIncompleteFact {
+    pub point: ProgramPointId,
+    pub subject: SemanticIncompleteSubject,
+    pub reason: SemanticIncompleteReason,
+    pub source: SourceMappingId,
+    pub evidence: EvidenceId,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BasicBlock {
     pub id: BlockId,
@@ -2303,6 +2737,20 @@ impl ControlEdgeKind {
             Self::AsyncExceptional => "async_exceptional",
         }
     }
+
+    pub const fn sort_rank(self) -> u8 {
+        match self {
+            Self::Normal => 0,
+            Self::ConditionalTrue => 1,
+            Self::ConditionalFalse => 2,
+            Self::SwitchCase => 3,
+            Self::LoopBack => 4,
+            Self::Exceptional => 5,
+            Self::Cleanup => 6,
+            Self::AsyncNormal => 7,
+            Self::AsyncExceptional => 8,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -2334,6 +2782,12 @@ impl GuardConditionDigest {
 
     pub const fn get(self) -> u64 {
         self.0
+    }
+
+    /// Rebuild a digest from the value [`Self::get`] returned, as the
+    /// semantic IR row decoder does.
+    pub(crate) const fn from_bits(bits: u64) -> Self {
+        Self(bits)
     }
 }
 
@@ -2591,6 +3045,30 @@ pub struct SwitchFactParts {
     pub evidence: EvidenceId,
 }
 
+/// The qualified type identity of one call's receiver or associated owner, as
+/// the file alone proves it.
+///
+/// The segments are the qualified path of the receiver's declared type after
+/// the language's built-in dereferences, outermost first, resolved through
+/// this file's own import bindings when the written name is terminal-only.
+/// When the call has no receiver, the segments instead name the associated
+/// function's owner. `member` is the method name the call applies; the call
+/// site's argument count is the arity. This is a file-local fact: no workspace resolution and
+/// no model lookup took part in producing it. A query that reaches the call
+/// site applies model contracts (collection flow, deferred factories) from
+/// this shape. Before the semantic IR was stored as rows, the Rust lowerer
+/// applied those contracts itself during lowering, which made the artifact
+/// depend on the active model set and therefore unfit for a blob-keyed row.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CallReceiverTypeFact {
+    pub call_site: CallSiteId,
+    /// At least two segments: a terminal-only name that the file cannot bind
+    /// to a qualified path is not a fact. With no call receiver, this is the
+    /// associated function's owner identity.
+    pub receiver_type: Box<[Box<str>]>,
+    pub member: Box<str>,
+}
+
 /// Mutable construction parts. Once accepted by
 /// [`crate::analyzer::semantic::SemanticArtifact::try_new`],
 /// every collection is boxed and only shared immutably.
@@ -2618,6 +3096,21 @@ pub struct ProcedureSemanticsParts {
     pub control_edges: Vec<ControlEdge>,
     pub guard_facts: Vec<GuardFactParts>,
     pub switch_facts: Vec<SwitchFactParts>,
+    pub drops: Vec<DropFact>,
+    pub move_outs: Vec<MoveOutFact>,
+    pub scope_ends: Vec<ScopeEndFact>,
+    pub pointer_origins: Vec<PointerOrigin>,
+    pub pointer_aliases: Vec<PointerAlias>,
+    pub pointer_accesses: Vec<PointerAccess>,
+    pub pointer_invalidations: Vec<PointerInvalidation>,
+    pub incomplete_facts: Vec<SemanticIncompleteFact>,
+    /// Written receiver types of method calls, in increasing call-site order
+    /// with at most one fact per call site.
+    pub receiver_type_facts: Vec<CallReceiverTypeFact>,
+    /// Go builtin-shaped calls this procedure's file-local lowerer omitted as
+    /// runtime calls. Workspace queries validate these names against the
+    /// package declaration index.
+    pub go_predeclared_builtin_assumptions: Vec<GoPredeclaredBuiltin>,
 }
 
 impl ProcedureSemanticsParts {
@@ -2651,6 +3144,16 @@ impl ProcedureSemanticsParts {
             control_edges: Vec::new(),
             guard_facts: Vec::new(),
             switch_facts: Vec::new(),
+            drops: Vec::new(),
+            move_outs: Vec::new(),
+            scope_ends: Vec::new(),
+            pointer_origins: Vec::new(),
+            pointer_aliases: Vec::new(),
+            pointer_accesses: Vec::new(),
+            pointer_invalidations: Vec::new(),
+            incomplete_facts: Vec::new(),
+            receiver_type_facts: Vec::new(),
+            go_predeclared_builtin_assumptions: Vec::new(),
         }
     }
 }

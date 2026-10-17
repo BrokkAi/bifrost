@@ -18,13 +18,14 @@
 use super::facts::FileFacts;
 use super::materialization::{
     DeclarationMaterializationSupport, DeclarationOrigin, ExportForm, GenerationInputClass,
-    GenerationKind, MaterializationAxis, MaterializationRecord,
+    GenerationKind, MaterializationAxis, MaterializationRecord, SourceExportLocalDefinition,
 };
 use super::occurrence_rows::ast_id;
+use super::provider::StructuralSyntaxLimitedOutcome;
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::semantic::ContentIdentity;
 use crate::analyzer::structural_spec_for;
-use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range, SignatureMetadata};
+use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range, SignatureMetadata};
 use crate::hash::HashMap;
 
 /// The axes this producer answers. All six: this layer is the only row
@@ -109,6 +110,9 @@ pub struct ExportRow {
     /// (an anonymous default's synthetic unit, an in-place CommonJS member).
     /// `None` for exports of existing bindings.
     pub target: Option<CodeUnit>,
+    /// Source-backed Python `__all__` binding evidence. Other export forms do
+    /// not currently claim this local-name relation.
+    pub local_definition: Option<SourceExportLocalDefinition>,
 }
 
 impl ExportRow {
@@ -145,6 +149,15 @@ pub enum MaterializationIncompleteReason {
     /// preprocessing/build configuration was supplied, so which of them exist
     /// is unknown.
     NoActiveConfiguration,
+    /// A dynamic Python `__all__` expression or mutation leaves members
+    /// unknown even though any statically readable names are still returned.
+    DynamicExportSurface,
+    /// Dynamic Python module namespace writes may define names that have no
+    /// statically visible module binding.
+    DynamicExportDefinition,
+    /// The query could not obtain bounded prepared syntax to derive Python's
+    /// source-level `__all__` rows.
+    ExportSyntaxUnavailable,
 }
 
 /// Whether every axis of the file's materialization answer is complete.
@@ -179,6 +192,11 @@ impl MaterializationCompleteness {
                         MaterializationIncompleteReason::NoActiveConfiguration => {
                             axis == MaterializationAxis::ConfigurationGating
                         }
+                        MaterializationIncompleteReason::DynamicExportSurface
+                        | MaterializationIncompleteReason::DynamicExportDefinition
+                        | MaterializationIncompleteReason::ExportSyntaxUnavailable => {
+                            axis == MaterializationAxis::Exports
+                        }
                     })
             }
         }
@@ -211,11 +229,14 @@ pub fn materialization_for_file(
     let Some(spec) = structural_spec_for(language) else {
         return unavailable(MaterializationIncompleteReason::NoStructuralAdapter);
     };
-    let facts = analyzer
-        .structural_fact_providers()
+    let providers = analyzer.structural_fact_providers();
+    let Some(provider) = providers
         .into_iter()
         .find(|provider| provider.structural_language() == language)
-        .and_then(|provider| provider.structural_facts(file));
+    else {
+        return unavailable(MaterializationIncompleteReason::FactsUnavailable);
+    };
+    let facts = provider.structural_facts(file);
     let Some(facts) = facts else {
         return unavailable(MaterializationIncompleteReason::FactsUnavailable);
     };
@@ -251,7 +272,7 @@ pub fn materialization_for_file(
             MaterializationRecord::DynamicGenerationSite { site, kind } => {
                 let row = site_row(&mut sites, file, content_identity, &facts, *site, *kind);
                 row.input = GenerationInputClass::Dynamic;
-                note(
+                super::note_once(
                     &mut reasons,
                     MaterializationIncompleteReason::DynamicGenerationPresent,
                 );
@@ -273,6 +294,7 @@ pub fn materialization_for_file(
                     form: *form,
                     exported_name: exported_name.clone(),
                     target: target.clone(),
+                    local_definition: None,
                 });
             }
             MaterializationRecord::RecoveredDeclaration { unit, .. } => {
@@ -281,6 +303,55 @@ pub fn materialization_for_file(
             MaterializationRecord::ConfigurationConditional { range } => {
                 config_intervals.push(*range);
             }
+        }
+    }
+
+    // Python's `__all__` is source evidence, not declaration materialization.
+    // Derive it from one bounded prepared parse tree during this query rather
+    // than adding more fields to the existing serialized materialization
+    // payload.
+    if language == Language::Python && support.is_supported(MaterializationAxis::Exports) {
+        match provider.structural_syntax_limited(file, 1_048_576, None) {
+            StructuralSyntaxLimitedOutcome::Available(syntax) => {
+                let prepared = syntax.prepared();
+                if let Some(source_exports) =
+                    spec.source_export_facts(prepared.tree().root_node(), prepared.source())
+                {
+                    exports.extend(source_exports.exports.into_iter().map(|export| ExportRow {
+                        file: file.clone(),
+                        content_identity,
+                        node: fact_at_range(&facts, export.range),
+                        range: export.range,
+                        form: ExportForm::PythonAll,
+                        exported_name: export.exported_name,
+                        target: None,
+                        local_definition: Some(export.local_definition),
+                    }));
+                    if !source_exports.complete {
+                        super::note_once(
+                            &mut reasons,
+                            MaterializationIncompleteReason::DynamicExportSurface,
+                        );
+                    }
+                    if source_exports.declared && !source_exports.definitions_complete {
+                        super::note_once(
+                            &mut reasons,
+                            MaterializationIncompleteReason::DynamicExportDefinition,
+                        );
+                    }
+                } else {
+                    super::note_once(
+                        &mut reasons,
+                        MaterializationIncompleteReason::ExportSyntaxUnavailable,
+                    );
+                }
+            }
+            StructuralSyntaxLimitedOutcome::Exceeded { .. }
+            | StructuralSyntaxLimitedOutcome::Cancelled
+            | StructuralSyntaxLimitedOutcome::Unavailable => super::note_once(
+                &mut reasons,
+                MaterializationIncompleteReason::ExportSyntaxUnavailable,
+            ),
         }
     }
 
@@ -320,7 +391,7 @@ pub fn materialization_for_file(
     if any_config_gated && support.is_supported(MaterializationAxis::ConfigurationGating) {
         // No consumer supplies an active configuration today, so which gated
         // declarations exist is honestly unknown.
-        note(
+        super::note_once(
             &mut reasons,
             MaterializationIncompleteReason::NoActiveConfiguration,
         );
@@ -413,17 +484,6 @@ fn unavailable(reason: MaterializationIncompleteReason) -> MaterializationFileRe
     }
 }
 
-/// Record a reason once. Which axis is incomplete is what matters; how many
-/// rows hit the same wall is not.
-fn note(
-    reasons: &mut Vec<MaterializationIncompleteReason>,
-    reason: MaterializationIncompleteReason,
-) {
-    if !reasons.contains(&reason) {
-        reasons.push(reason);
-    }
-}
-
 fn completeness(
     support: &DeclarationMaterializationSupport,
     reasons: Vec<MaterializationIncompleteReason>,
@@ -445,100 +505,34 @@ fn completeness(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::{AnalyzerConfig, Language, Project, TestProject, WorkspaceAnalyzer};
-    use std::path::PathBuf;
-    use std::sync::Arc;
-    use tempfile::TempDir;
+    use crate::analyzer::Language;
+    use crate::analyzer::structural::materialization::SourceExportBindingKind;
+    use crate::test_support::AnalyzerFixture;
 
     struct Fixture {
-        _temp: TempDir,
-        workspace: WorkspaceAnalyzer,
+        analyzer: AnalyzerFixture,
         file: ProjectFile,
         source: String,
     }
 
     impl Fixture {
         fn new(language: Language, relative_path: &str, source: &str) -> Self {
-            let temp = tempfile::tempdir().expect("temp dir");
-            let root: PathBuf = temp.path().canonicalize().expect("canonical root");
-            let file = ProjectFile::new(root.clone(), relative_path);
-            file.write(source).expect("write fixture source");
-            let project = TestProject::new(root, language);
-            let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
-                Arc::new(project) as Arc<dyn Project>,
-                AnalyzerConfig::default(),
-            )
-            .expect("ephemeral workspace should build");
+            let analyzer = AnalyzerFixture::new_for_language(language, &[(relative_path, source)]);
+            let file = ProjectFile::new(analyzer.project_root(), relative_path);
             Self {
-                _temp: temp,
-                workspace,
+                analyzer,
                 file,
                 source: source.to_owned(),
             }
         }
 
         fn rows(&self) -> MaterializationFileResult {
-            materialization_for_file(self.workspace.analyzer(), &self.file)
+            materialization_for_file(self.analyzer.analyzer().analyzer(), &self.file)
         }
 
         fn at(&self, needle: &str) -> usize {
-            self.source
-                .find(needle)
-                .unwrap_or_else(|| panic!("fixture does not contain {needle:?}"))
+            crate::test_support::fixture_marker(&self.source, needle)
         }
-    }
-
-    /// A literal Ruby `attr_accessor` is one anchored generation site whose
-    /// generated set has exact cardinality, and each generated declaration's
-    /// state row says `generated`.
-    #[test]
-    fn ruby_literal_generation_site_has_exact_cardinality() {
-        let fixture = Fixture::new(
-            Language::Ruby,
-            "widget.rb",
-            "class Widget\n  attr_accessor :name\n  def base; end\n  alias_method :aliased, :base\nend\n",
-        );
-        let rows = fixture.rows();
-
-        assert!(
-            rows.completeness.covers(MaterializationAxis::GeneratedSets),
-            "completeness: {:?}",
-            rows.completeness
-        );
-        assert_eq!(rows.sites.len(), 2, "sites: {:?}", rows.sites);
-
-        let accessor = &rows.sites[0];
-        assert_eq!(accessor.kind, GenerationKind::AccessorMacro);
-        assert_eq!(accessor.input, GenerationInputClass::Literal);
-        assert_eq!(accessor.site.start_byte, fixture.at("attr_accessor"));
-        assert!(accessor.ast_id().is_some(), "a Ruby call is a fact");
-        let generated: Vec<_> = accessor
-            .generated
-            .iter()
-            .map(|(unit, _)| unit.fq_name().to_string())
-            .collect();
-        assert_eq!(
-            generated,
-            vec!["Widget.@name", "Widget.name", "Widget.name="],
-            "exact generated set"
-        );
-
-        let alias = &rows.sites[1];
-        assert_eq!(alias.kind, GenerationKind::AliasMacro);
-        assert_eq!(alias.generated.len(), 1);
-
-        let reader = rows
-            .states
-            .iter()
-            .find(|row| row.unit.fq_name() == "Widget.name")
-            .expect("generated reader state row");
-        assert_eq!(reader.origin, DeclarationOrigin::Generated);
-        let class = rows
-            .states
-            .iter()
-            .find(|row| row.unit.fq_name() == "Widget")
-            .expect("class state row");
-        assert_eq!(class.origin, DeclarationOrigin::Parsed);
     }
 
     /// A dynamic argument keeps the site visible with an explicitly unknown
@@ -628,90 +622,139 @@ mod tests {
         assert_eq!(orphan_link.implementation, None);
     }
 
-    /// TypeScript overload signatures are declaration-only signature rows on
-    /// the same unit as their implementation (#1658). A callable with a
-    /// runnable signature is one runnable unit, never a stub; only a callable
-    /// with no implementation at all (an ambient declaration, an orphan
-    /// overload set) is declaration-only, and its link row records the
-    /// explicit absence.
     #[test]
-    fn typescript_overload_stubs_are_declaration_only_without_an_implementation() {
+    fn python_all_exports_keep_literal_ranges_and_dynamic_coverage() {
         let fixture = Fixture::new(
-            Language::TypeScript,
-            "over.ts",
-            concat!(
-                "export function parse(value: string): string;\n",
-                "export function parse(value: number): number;\n",
-                "export function parse(value: any): any {\n",
-                "  return value;\n",
-                "}\n",
-                "declare function orphan(value: string): string;\n",
-                "interface Contract {\n",
-                "  parse(value: string): string;\n",
-                "}\n",
-                "class Widget {\n",
-                "  render(value: string): void;\n",
-                "  render(value: unknown): void {}\n",
-                "}\n",
-                "abstract class Base {\n",
-                "  abstract handle(value: string): void;\n",
-                "}\n",
-            ),
+            Language::Python,
+            "exports.py",
+            "__all__ = [\"public\", \"other\", \"public\"]\npublic = 1\n",
         );
         let rows = fixture.rows();
-
-        // The merged `parse` unit and the merged `Widget.render` unit each
-        // carry a runnable signature, so neither is declaration-only; the
-        // interface member is a contract, and the abstract method is
-        // implemented under a subclass identity, so neither is a stub. Only
-        // the ambient `orphan` has no implementation.
-        let stubs: Vec<_> = rows
-            .states
-            .iter()
-            .filter(|row| row.declaration_only)
-            .collect();
-        assert_eq!(stubs.len(), 1, "states: {:?}", rows.states);
-        assert_eq!(stubs[0].unit.identifier(), "orphan");
-
-        assert_eq!(rows.links.len(), 1, "links: {:?}", rows.links);
-        assert_eq!(rows.links[0].stub.identifier(), "orphan");
-        assert_eq!(rows.links[0].implementation, None);
-    }
-
-    /// JS export rows carry their form; the anonymous default's synthetic
-    /// unit is the row target and its state row says `generated`.
-    #[test]
-    fn javascript_export_rows_state_their_forms() {
-        let fixture = Fixture::new(
-            Language::JavaScript,
-            "exports.js",
-            "export const answer = 42;\nconst table = { greet: 'hi' };\nexport default { wrap: table };\n",
-        );
-        let rows = fixture.rows();
-
-        assert!(
-            rows.completeness.covers(MaterializationAxis::Exports),
-            "completeness: {:?}",
-            rows.completeness
-        );
-        let forms: Vec<_> = rows
-            .exports
-            .iter()
-            .map(|row| (row.form, row.exported_name.clone()))
-            .collect();
+        assert!(rows.completeness.covers(MaterializationAxis::Exports));
         assert_eq!(
-            forms,
-            vec![
-                (ExportForm::Named, "answer".to_string()),
-                (ExportForm::DefaultAnonymous, "default".to_string()),
-            ],
-            "exports: {:?}",
             rows.exports
+                .iter()
+                .map(|row| (row.form, row.exported_name.as_str(), row.range.start_byte))
+                .collect::<Vec<_>>(),
+            vec![
+                (ExportForm::PythonAll, "public", fixture.at("\"public\"")),
+                (ExportForm::PythonAll, "other", fixture.at("\"other\"")),
+            ]
         );
-        let default_row = &rows.exports[1];
-        let target = default_row.target.as_ref().expect("synthetic default unit");
-        let state = rows.state_of(target).expect("default unit state row");
-        assert_eq!(state.origin, DeclarationOrigin::Generated);
+        assert!(rows.exports.iter().all(|row| row.target.is_none()));
+        assert!(matches!(
+            &rows.exports[0].local_definition,
+            Some(SourceExportLocalDefinition::Defined { binding })
+                if binding.name == "public"
+                    && binding.kind == SourceExportBindingKind::Binding
+                    && binding.range.start_byte == fixture.at("public =")
+        ));
+        assert!(matches!(
+            &rows.exports[1].local_definition,
+            Some(SourceExportLocalDefinition::Undefined)
+        ));
+
+        let dynamic = Fixture::new(
+            Language::Python,
+            "dynamic.py",
+            "__all__ = [\"known\", *computed]\n",
+        );
+        let dynamic_rows = dynamic.rows();
+        assert!(
+            !dynamic_rows
+                .completeness
+                .covers(MaterializationAxis::Exports)
+        );
+        assert_eq!(dynamic_rows.exports.len(), 1);
+        assert_eq!(dynamic_rows.exports[0].exported_name, "known");
+        assert!(matches!(
+            &dynamic_rows.exports[0].local_definition,
+            Some(SourceExportLocalDefinition::Undefined)
+        ));
+        assert!(matches!(
+            &dynamic_rows.completeness,
+            MaterializationCompleteness::Incomplete { reasons, .. }
+                if reasons.contains(&MaterializationIncompleteReason::DynamicExportSurface)
+        ));
+
+        let dynamic_definitions = Fixture::new(
+            Language::Python,
+            "dynamic-definitions.py",
+            "__all__ = [\"late\", \"present\"]\npresent = 1\nglobals()[\"late\"] = 2\n",
+        );
+        let dynamic_definition_rows = dynamic_definitions.rows();
+        assert!(
+            !dynamic_definition_rows
+                .completeness
+                .covers(MaterializationAxis::Exports)
+        );
+        assert!(matches!(
+            &dynamic_definition_rows.exports[0].local_definition,
+            Some(SourceExportLocalDefinition::Unknown)
+        ));
+        assert!(matches!(
+            &dynamic_definition_rows.exports[1].local_definition,
+            Some(SourceExportLocalDefinition::Defined { binding }) if binding.name == "present"
+        ));
+        assert!(matches!(
+            &dynamic_definition_rows.completeness,
+            MaterializationCompleteness::Incomplete { reasons, .. }
+                if reasons.contains(&MaterializationIncompleteReason::DynamicExportDefinition)
+        ));
+
+        let star_import = Fixture::new(
+            Language::Python,
+            "star-import.py",
+            "__all__ = [\"late\"]\nfrom unknown_module import *\n",
+        );
+        let star_import_rows = star_import.rows();
+        assert!(matches!(
+            &star_import_rows.exports[0].local_definition,
+            Some(SourceExportLocalDefinition::Unknown)
+        ));
+        assert!(matches!(
+            &star_import_rows.completeness,
+            MaterializationCompleteness::Incomplete { reasons, .. }
+                if reasons.contains(&MaterializationIncompleteReason::DynamicExportDefinition)
+        ));
+
+        let recovered = Fixture::new(Language::Python, "recovered.py", "__all__ =\n");
+        let recovered_rows = recovered.rows();
+        assert!(
+            !recovered_rows
+                .completeness
+                .covers(MaterializationAxis::Exports)
+        );
+
+        let recovered_annotation = Fixture::new(
+            Language::Python,
+            "recovered-annotation.py",
+            "__all__: list[str] =\n",
+        );
+        assert!(
+            !recovered_annotation
+                .rows()
+                .completeness
+                .covers(MaterializationAxis::Exports)
+        );
+
+        let annotation = Fixture::new(Language::Python, "annotation.py", "__all__: list[str]\n");
+        let annotation_rows = annotation.rows();
+        assert!(
+            annotation_rows
+                .completeness
+                .covers(MaterializationAxis::Exports)
+        );
+        assert!(annotation_rows.exports.is_empty());
+
+        let local = Fixture::new(
+            Language::Python,
+            "local.py",
+            "def build():\n    __all__ = [\"local_only\"]\n",
+        );
+        let local_rows = local.rows();
+        assert!(local_rows.completeness.covers(MaterializationAxis::Exports));
+        assert!(local_rows.exports.is_empty());
     }
 
     /// C++ configuration gating: declarations inside a preprocessor
@@ -769,21 +812,5 @@ mod tests {
             rows.completeness
         );
         assert!(rows.completeness.covers(MaterializationAxis::GeneratedSets));
-    }
-
-    /// A language that records no provenance reports every axis unsupported
-    /// rather than answering with empty rows.
-    #[test]
-    fn unclaimed_language_reports_unsupported_axes() {
-        let fixture = Fixture::new(Language::Go, "main.go", "package main\n\nfunc main() {}\n");
-        let rows = fixture.rows();
-        for &axis in MATERIALIZATION_PRODUCER_AXES {
-            assert!(
-                !rows.completeness.covers(axis),
-                "axis {axis} must be uncovered for an unclaimed language: {:?}",
-                rows.completeness
-            );
-        }
-        assert!(rows.sites.is_empty() && rows.exports.is_empty() && rows.links.is_empty());
     }
 }

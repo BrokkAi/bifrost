@@ -5,14 +5,18 @@
 //! or comparison-operator span. A missing scalar fact remains open.
 
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
+use brokk_bifrost_core::analyzer::tree_walk::has_child_of_kind as has_direct_token;
 use brokk_bifrost_flow::scalar_state::{
-    ScalarCallEffects, ScalarStateDerivation, ScalarTyping, go_scalar_seeds, guard_decides,
+    ScalarCallEffects, ScalarStateDerivation, ScalarTyping, declared_scalar_seeds, guard_decides,
     java_scalar_seeds,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tree_sitter::Node;
 
+use crate::analyzer::declared_scalar::{
+    csharp_declared_scalar_types, go_declared_scalar_types, rust_declared_scalar_types,
+};
 use crate::analyzer::semantic::type_flow::validate_prepared_syntax_source_for_procedure;
 use crate::analyzer::semantic::{
     ControlEdgeId, ControlEdgeKind, EvidenceCompleteness, EvidenceId, GuardFact, GuardPredicate,
@@ -20,7 +24,12 @@ use crate::analyzer::semantic::{
     SemanticCapability, SemanticGapDischarge, SemanticGapImpact, SemanticGapSubject,
     SemanticValueKind, SourceMappingKind,
 };
+use crate::analyzer::{CppAnalyzer, resolve_analyzer};
 use crate::analyzer::{Language, LanguageDialect, ProjectFile, WorkspaceAnalyzer};
+use crate::analyzer::{
+    kotlin_declared_scalar_types, php_declared_scalar_types, ruby_declared_scalar_types,
+    scala_declared_scalar_types,
+};
 use crate::cancellation::CancellationToken;
 
 // The scalar solver retains one value vector per reachable program point and
@@ -111,7 +120,8 @@ fn supported_scalar_guard(
                     | SemanticValueKind::SignedInteger(_)
                     | SemanticValueKind::FloatingPoint { .. }
                     | SemanticValueKind::Null
-            )
+            ) || (matches!(language, Language::Kotlin | Language::Cpp)
+                && matches!(value.kind, SemanticValueKind::Boolean(_)))
         })
     };
     let numeric = || match predicate {
@@ -128,12 +138,63 @@ fn supported_scalar_guard(
         | GuardPredicate::Opaque { .. } => false,
     };
     match language {
-        Language::Java | Language::Go => {
-            numeric() || matches!(predicate, GuardPredicate::Truthy { .. })
+        Language::Java
+        | Language::Go
+        | Language::CSharp
+        | Language::Rust
+        | Language::Kotlin
+        | Language::Cpp => numeric() || matches!(predicate, GuardPredicate::Truthy { .. }),
+        Language::Scala => {
+            let scalar_constant = |constant| {
+                semantics.value(constant).is_some_and(|value| {
+                    matches!(value.kind, SemanticValueKind::Boolean(_))
+                        || matches!(
+                            value.kind,
+                            SemanticValueKind::UnsignedInteger(_)
+                                | SemanticValueKind::SignedInteger(_)
+                        )
+                })
+            };
+            match predicate {
+                GuardPredicate::ConstantBoolean { .. }
+                | GuardPredicate::OrderedIntegerComparison { .. }
+                | GuardPredicate::Truthy { .. } => true,
+                GuardPredicate::ConstantEquality { constant, .. } => scalar_constant(constant),
+                _ => false,
+            }
         }
         Language::JavaScript | Language::TypeScript | Language::Python => {
             numeric() || matches!(predicate, GuardPredicate::Truthy { .. })
         }
+        Language::Php => match predicate {
+            GuardPredicate::ConstantBoolean { .. }
+            | GuardPredicate::NullComparison { .. }
+            | GuardPredicate::OrderedIntegerComparison { .. }
+            | GuardPredicate::Truthy { .. } => true,
+            GuardPredicate::ConstantEquality { constant, .. } => {
+                semantics.value(constant).is_some_and(|value| {
+                    matches!(
+                        value.kind,
+                        SemanticValueKind::UnsignedInteger(_) | SemanticValueKind::SignedInteger(_)
+                    )
+                })
+            }
+            _ => false,
+        },
+        Language::Ruby => match predicate {
+            GuardPredicate::ConstantBoolean { .. }
+            | GuardPredicate::OrderedIntegerComparison { .. }
+            | GuardPredicate::Truthy { .. } => true,
+            GuardPredicate::ConstantEquality { constant, .. } => {
+                semantics.value(constant).is_some_and(|value| {
+                    matches!(
+                        value.kind,
+                        SemanticValueKind::UnsignedInteger(_) | SemanticValueKind::SignedInteger(_)
+                    )
+                })
+            }
+            _ => false,
+        },
         _ => matches!(predicate, GuardPredicate::NullComparison { .. }),
     }
 }
@@ -141,10 +202,23 @@ fn supported_scalar_guard(
 /// Derive the procedure's scalar states with the numeric typing its language
 /// establishes. Java seeds declared primitive formals and types every
 /// primitive local and formal. JavaScript and TypeScript numbers are binary64
-/// everywhere. Python integers are unbounded and its bindings untyped. Go
-/// types declared and literal-initialized integer and Boolean bindings and
-/// keeps no numeric fact for any other.
+/// everywhere. Python integers are unbounded and its bindings untyped. Go,
+/// C# and Scala type declared and literal-initialized integer and Boolean
+/// bindings and keep no numeric fact for any other. Rust follows the same
+/// scalar contract while keeping non-primitive operator implementations
+/// opaque. Kotlin follows the same declared scalar path and additionally
+/// publishes non-nullable primitive truth and equality guards. PHP types
+/// exact integer and Boolean literal bindings and successful scalar-typed
+/// parameters; every other binding has no numeric fact because dynamic writes
+/// and weak-mode coercion are runtime behavior. A successful `int` or `bool`
+/// parameter call has completed its coercion before the procedure body runs.
+/// Ruby types only exact integer and Boolean literal-initialized locals. Its
+/// integer domain is arbitrary precision, and the Ruby adapter assumes core
+/// Integer comparison methods retain their built-in behavior; reopened or
+/// monkey-patched operators remain open at the producer.
 fn derive_scalar_states(
+    workspace: &WorkspaceAnalyzer,
+    file: &ProjectFile,
     language: Language,
     procedure: &ProcedureHandle,
     prepared: &PreparedSyntaxTree,
@@ -159,8 +233,44 @@ fn derive_scalar_states(
                 &seeds.typing,
             )
         }
-        Language::Go => {
-            let seeds = go_scalar_seeds(procedure, prepared);
+        Language::Go
+        | Language::CSharp
+        | Language::Rust
+        | Language::Kotlin
+        | Language::Scala
+        | Language::Cpp => {
+            let declared = match language {
+                Language::Go => go_declared_scalar_types(procedure, prepared),
+                Language::CSharp => csharp_declared_scalar_types(procedure, prepared),
+                Language::Rust => rust_declared_scalar_types(procedure, prepared),
+                Language::Kotlin => kotlin_declared_scalar_types(procedure, prepared),
+                Language::Scala => scala_declared_scalar_types(procedure, prepared),
+                Language::Cpp => resolve_analyzer::<CppAnalyzer>(workspace.analyzer())
+                    .expect("C++ procedure is mounted on a C++ analyzer")
+                    .declared_scalar_types(file, procedure, prepared),
+                _ => unreachable!("scalar declaration arm is exhaustive"),
+            };
+            let seeds = declared_scalar_seeds(procedure, declared);
+            ScalarStateDerivation::derive_typed(
+                procedure,
+                ScalarCallEffects::default(),
+                &seeds.entry_facts,
+                &seeds.typing,
+            )
+        }
+        Language::Php => {
+            let declared = php_declared_scalar_types(procedure, prepared);
+            let seeds = declared_scalar_seeds(procedure, declared);
+            ScalarStateDerivation::derive_typed(
+                procedure,
+                ScalarCallEffects::default(),
+                &seeds.entry_facts,
+                &seeds.typing,
+            )
+        }
+        Language::Ruby => {
+            let declared = ruby_declared_scalar_types(procedure, prepared);
+            let seeds = declared_scalar_seeds(procedure, declared);
             ScalarStateDerivation::derive_typed(
                 procedure,
                 ScalarCallEffects::default(),
@@ -292,7 +402,10 @@ pub(super) fn scalar_condition_outcomes(
             return true;
         }
         // A binding a nested callable rebinds is released by the solver at
-        // every call and suspension, where that callable could run.
+        // every call and suspension, where that callable could run. Scala's
+        // closure target and captured environment are still unresolved, so
+        // retain that lane's gap as open evidence instead of treating the
+        // full declared scalar domain as a proved result.
         // Unmodeled captured inputs are read through capture locations, which
         // the solver never treats as closed cells, so such a gap cannot
         // change a local this procedure establishes.
@@ -381,7 +494,7 @@ pub(super) fn scalar_condition_outcomes(
             .iter()
             .any(|guard| !complete_evidence(semantics, guard.evidence));
     let scalar = (!partial_procedure && !partial_producer)
-        .then(|| derive_scalar_states(language, procedure, &prepared));
+        .then(|| derive_scalar_states(workspace, file, language, procedure, &prepared));
     if cancellation.is_cancelled() {
         return Err(ScalarConditionGap::Cancelled);
     }
@@ -441,6 +554,9 @@ pub(super) fn scalar_condition_outcomes(
             outcomes.extend(composed.outcomes(&JsTsConditionSyntax)?);
         }
         Language::Python => outcomes.extend(composed.outcomes(&PythonConditionSyntax)?),
+        Language::CSharp => outcomes.extend(composed.outcomes(&CSharpConditionSyntax)?),
+        Language::Rust => outcomes.extend(composed.outcomes(&RustConditionSyntax)?),
+        Language::Kotlin => outcomes.extend(composed.outcomes(&KotlinConditionSyntax)?),
         Language::Go => {
             let negation_guards = semantics
                 .guard_facts()
@@ -457,6 +573,12 @@ pub(super) fn scalar_condition_outcomes(
                 .collect();
             outcomes.extend(composed.outcomes(&GoConditionSyntax { negation_guards })?);
         }
+        Language::Scala => outcomes.extend(composed.outcomes(&ScalaConditionSyntax)?),
+        Language::Cpp => outcomes.extend(composed.outcomes(&CppConditionSyntax)?),
+        Language::Php => outcomes.extend(composed.outcomes(&PhpConditionSyntax)?),
+        Language::Ruby => outcomes.extend(composed.outcomes(&RubyConditionSyntax {
+            source: prepared.source(),
+        })?),
         _ => {}
     }
     Ok(outcomes)
@@ -499,12 +621,17 @@ fn single_guard_verdict(
 }
 
 fn node_span(node: Node<'_>) -> (usize, usize) {
-    (node.start_byte(), node.end_byte())
+    let span = brokk_bifrost_core::analyzer::common::node_span(node);
+    (span.start_byte, span.end_byte)
 }
 
 fn peel_parentheses(mut node: Node<'_>) -> Result<Node<'_>, ScalarConditionGap> {
     let mut layers = 0_usize;
-    while node.kind() == "parenthesized_expression" && node.named_child_count() == 1 {
+    while matches!(
+        node.kind(),
+        "parenthesized_expression" | "parenthesized_statements"
+    ) && node.named_child_count() == 1
+    {
         layers += 1;
         if layers > MAX_COMPOSED_NODES {
             return Err(ScalarConditionGap::WorkLimit);
@@ -535,6 +662,17 @@ fn following_statement<'tree>(
     next.ok_or(ScalarConditionGap::UnqualifiedContinuation)
 }
 
+fn first_ruby_branch_statement(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        match node.kind() {
+            "else" | "then" | "do" | "body_statement" | "block_body" => {
+                node = node.named_child(0)?;
+            }
+            _ => return Some(node),
+        }
+    }
+}
+
 /// How one condition node lowers: as a short-circuit operator whose operands
 /// are separate decisions, as a negation that only swaps its operand's arms,
 /// or as one decision.
@@ -556,13 +694,26 @@ enum ConditionShape<'tree> {
 /// node owns a composable condition, which operators it splits into separate
 /// decisions, and which source span each arm's target point carries.
 trait ConditionSyntax {
-    fn is_owner(&self, node: Node<'_>) -> bool;
+    fn is_owner(&self, node: Node<'_>) -> bool {
+        node.kind() == "if_statement"
+    }
 
-    fn shape<'tree>(&self, node: Node<'tree>) -> ConditionShape<'tree>;
+    fn shape<'tree>(&self, node: Node<'tree>) -> ConditionShape<'tree> {
+        c_family_shape(node)
+    }
 
     /// The node whose span the guard for `leaf` carries.
     fn guard_anchor<'tree>(&self, leaf: Node<'tree>) -> Option<Node<'tree>> {
         Some(leaf)
+    }
+
+    /// The syntax field containing the statement executed by a true arm.
+    /// Most C-family grammars call it `consequence`; adapters whose grammar
+    /// calls it `body` override this accessor.
+    fn consequence<'tree>(&self, owner: Node<'tree>) -> Result<Node<'tree>, ScalarConditionGap> {
+        owner
+            .child_by_field_name("consequence")
+            .ok_or(ScalarConditionGap::IncompleteCondition)
     }
 
     /// The node whose span the target point of the owner's false arm carries.
@@ -575,14 +726,6 @@ trait ConditionSyntax {
 struct JavaConditionSyntax;
 
 impl ConditionSyntax for JavaConditionSyntax {
-    fn is_owner(&self, node: Node<'_>) -> bool {
-        node.kind() == "if_statement"
-    }
-
-    fn shape<'tree>(&self, node: Node<'tree>) -> ConditionShape<'tree> {
-        c_family_shape(node)
-    }
-
     fn false_destination<'tree>(
         &self,
         owner: Node<'tree>,
@@ -599,11 +742,68 @@ impl ConditionSyntax for JavaConditionSyntax {
 struct JsTsConditionSyntax;
 
 impl ConditionSyntax for JsTsConditionSyntax {
+    fn false_destination<'tree>(
+        &self,
+        owner: Node<'tree>,
+    ) -> Result<Node<'tree>, ScalarConditionGap> {
+        match owner.child_by_field_name("alternative") {
+            Some(alternative) if alternative.kind() == "else_clause" => alternative
+                .named_child(0)
+                .ok_or(ScalarConditionGap::IncompleteCondition),
+            Some(alternative) => Ok(alternative),
+            None => following_statement(owner, "statement_block"),
+        }
+    }
+}
+
+/// C# splits `&&` and `||` like Java, and its lowering decides the operand
+/// of `!` with swapped arms.
+struct CSharpConditionSyntax;
+
+impl ConditionSyntax for CSharpConditionSyntax {
     fn is_owner(&self, node: Node<'_>) -> bool {
         node.kind() == "if_statement"
     }
 
     fn shape<'tree>(&self, node: Node<'tree>) -> ConditionShape<'tree> {
+        if node.kind() == "prefix_unary_expression"
+            && node.child(0).is_some_and(|operator| operator.kind() == "!")
+        {
+            return ConditionShape::Negation(node.named_child(0));
+        }
+        c_family_shape(node)
+    }
+
+    fn false_destination<'tree>(
+        &self,
+        owner: Node<'tree>,
+    ) -> Result<Node<'tree>, ScalarConditionGap> {
+        match owner.child_by_field_name("alternative") {
+            Some(alternative) => Ok(alternative),
+            None => following_statement(owner, "block"),
+        }
+    }
+}
+
+/// C and C++ use the C-family short-circuit grammar. Their built-in `!` is
+/// split by the producer with swapped arms, so the structural composition
+/// walker must make the same swap when it sees the syntax owner.
+struct CppConditionSyntax;
+
+impl ConditionSyntax for CppConditionSyntax {
+    fn shape<'tree>(&self, node: Node<'tree>) -> ConditionShape<'tree> {
+        if node.kind() == "condition_clause"
+            && let Some(value) = node.child_by_field_name("value")
+        {
+            return self.shape(value);
+        }
+        if node.kind() == "unary_expression"
+            && node
+                .child_by_field_name("operator")
+                .is_some_and(|operator| operator.kind() == "!")
+        {
+            return ConditionShape::Negation(node.child_by_field_name("argument"));
+        }
         c_family_shape(node)
     }
 
@@ -616,7 +816,87 @@ impl ConditionSyntax for JsTsConditionSyntax {
                 .named_child(0)
                 .ok_or(ScalarConditionGap::IncompleteCondition),
             Some(alternative) => Ok(alternative),
-            None => following_statement(owner, "statement_block"),
+            None => following_statement(owner, "compound_statement"),
+        }
+    }
+}
+
+/// Rust conditions are expressions owned by `if_expression`. Primitive `!`
+/// swaps the operand arms; comparisons on any other type remain opaque in the
+/// producer, so this adapter only supplies the structural composition shape.
+struct RustConditionSyntax;
+
+impl ConditionSyntax for RustConditionSyntax {
+    fn is_owner(&self, node: Node<'_>) -> bool {
+        node.kind() == "if_expression"
+    }
+
+    fn shape<'tree>(&self, node: Node<'tree>) -> ConditionShape<'tree> {
+        if node.kind() == "unary_expression"
+            && node.child(0).is_some_and(|operator| operator.kind() == "!")
+        {
+            return ConditionShape::Negation(node.named_child(0));
+        }
+        c_family_shape(node)
+    }
+
+    fn false_destination<'tree>(
+        &self,
+        owner: Node<'tree>,
+    ) -> Result<Node<'tree>, ScalarConditionGap> {
+        if let Some(alternative) = owner.child_by_field_name("alternative") {
+            return alternative
+                .named_child(0)
+                .ok_or(ScalarConditionGap::IncompleteCondition);
+        }
+        let statement = owner
+            .parent()
+            .filter(|parent| parent.kind() == "expression_statement")
+            .unwrap_or(owner);
+        following_statement(statement, "block")
+    }
+}
+
+/// Kotlin conditions are expression nodes. The semantic lowering splits
+/// conjunctions, disjunctions, and Boolean negation exactly like this syntax
+/// view; `<` and `==` remain leaf decisions whose producer has already proved
+/// whether their primitive operator is safe to use.
+struct KotlinConditionSyntax;
+
+impl ConditionSyntax for KotlinConditionSyntax {
+    fn is_owner(&self, node: Node<'_>) -> bool {
+        node.kind() == "if_expression"
+    }
+
+    fn shape<'tree>(&self, node: Node<'tree>) -> ConditionShape<'tree> {
+        let mut cursor = node.walk();
+        if node.kind() == "prefix_expression"
+            && node
+                .children(&mut cursor)
+                .any(|child| !child.is_named() && child.kind() == "!")
+        {
+            return ConditionShape::Negation(node.named_child(0));
+        }
+        if matches!(
+            node.kind(),
+            "conjunction_expression" | "disjunction_expression"
+        ) {
+            let operands = brokk_bifrost_core::analyzer::tree_walk::named_children(node);
+            return ConditionShape::ShortCircuit {
+                left: operands.first().copied(),
+                right: operands.get(1).copied(),
+            };
+        }
+        ConditionShape::Leaf
+    }
+
+    fn false_destination<'tree>(
+        &self,
+        owner: Node<'tree>,
+    ) -> Result<Node<'tree>, ScalarConditionGap> {
+        match owner.child_by_field_name("alternative") {
+            Some(alternative) => Ok(alternative),
+            None => following_statement(owner, "statements"),
         }
     }
 }
@@ -653,6 +933,160 @@ impl ConditionSyntax for GoConditionSyntax {
         match owner.child_by_field_name("alternative") {
             Some(alternative) => Ok(alternative),
             None => following_statement(owner, "statement_list"),
+        }
+    }
+}
+
+/// Scala conditions are expressions. The lowering splits built-in Boolean
+/// `&&` and `||`, and a built-in `!` on a typed Boolean swaps the operand's
+/// arms. Other infix operators remain one opaque decision because Scala
+/// resolves every operator as a method call.
+struct ScalaConditionSyntax;
+
+impl ConditionSyntax for ScalaConditionSyntax {
+    fn is_owner(&self, node: Node<'_>) -> bool {
+        node.kind() == "if_expression"
+    }
+
+    fn shape<'tree>(&self, node: Node<'tree>) -> ConditionShape<'tree> {
+        if node.kind() == "prefix_expression" && has_direct_token(node, "!") {
+            return ConditionShape::Negation(node.named_child(0));
+        }
+        if node.kind() == "infix_expression"
+            && node
+                .child_by_field_name("operator")
+                .is_some_and(|operator| matches!(operator.kind(), "&&" | "||"))
+        {
+            return ConditionShape::ShortCircuit {
+                left: node.child_by_field_name("left"),
+                right: node.child_by_field_name("right"),
+            };
+        }
+        ConditionShape::Leaf
+    }
+
+    fn false_destination<'tree>(
+        &self,
+        owner: Node<'tree>,
+    ) -> Result<Node<'tree>, ScalarConditionGap> {
+        match owner.child_by_field_name("alternative") {
+            Some(alternative) => Ok(alternative),
+            None => {
+                let block_kind = owner
+                    .parent()
+                    .map(|parent| parent.kind())
+                    .filter(|kind| matches!(*kind, "block" | "indented_block"))
+                    .ok_or(ScalarConditionGap::UnqualifiedContinuation)?;
+                following_statement(owner, block_kind)
+            }
+        }
+    }
+}
+
+/// PHP uses C-family `if` statements, but its boolean operators include the
+/// lower-precedence `and` and `or` tokens as well. The lowering peels `!` and
+/// splits all four short-circuit operators before publishing the leaf guard.
+struct PhpConditionSyntax;
+
+impl ConditionSyntax for PhpConditionSyntax {
+    fn consequence<'tree>(&self, owner: Node<'tree>) -> Result<Node<'tree>, ScalarConditionGap> {
+        owner
+            .child_by_field_name("body")
+            .ok_or(ScalarConditionGap::IncompleteCondition)
+    }
+
+    fn shape<'tree>(&self, node: Node<'tree>) -> ConditionShape<'tree> {
+        if node.kind() == "unary_op_expression"
+            && node
+                .child_by_field_name("operator")
+                .is_some_and(|operator| operator.kind() == "!")
+        {
+            return ConditionShape::Negation(node.child_by_field_name("argument"));
+        }
+        if node.kind() == "binary_expression"
+            && node
+                .child_by_field_name("operator")
+                .is_some_and(|operator| matches!(operator.kind(), "&&" | "and" | "||" | "or"))
+        {
+            return ConditionShape::ShortCircuit {
+                left: node.child_by_field_name("left"),
+                right: node.child_by_field_name("right"),
+            };
+        }
+        ConditionShape::Leaf
+    }
+
+    fn false_destination<'tree>(
+        &self,
+        owner: Node<'tree>,
+    ) -> Result<Node<'tree>, ScalarConditionGap> {
+        match owner.child_by_field_name("alternative") {
+            Some(alternative) if alternative.kind() == "else_clause" => alternative
+                .named_child(0)
+                .ok_or(ScalarConditionGap::IncompleteCondition),
+            Some(alternative) => Ok(alternative),
+            None => following_statement(owner, "compound_statement"),
+        }
+    }
+}
+
+/// Ruby conditions are `if` expressions whose Boolean operators are ordinary
+/// binary/unary nodes. The producer already swaps `unless` arms and peels
+/// negation, so this syntax view only mirrors the structured control shape.
+struct RubyConditionSyntax<'a> {
+    source: &'a str,
+}
+
+impl ConditionSyntax for RubyConditionSyntax<'_> {
+    fn is_owner(&self, node: Node<'_>) -> bool {
+        matches!(
+            node.kind(),
+            "if" | "unless" | "if_modifier" | "unless_modifier" | "conditional"
+        )
+    }
+
+    fn consequence<'tree>(&self, owner: Node<'tree>) -> Result<Node<'tree>, ScalarConditionGap> {
+        let body = owner
+            .child_by_field_name("consequence")
+            .or_else(|| owner.child_by_field_name("body"))
+            .ok_or(ScalarConditionGap::IncompleteCondition)?;
+        first_ruby_branch_statement(body).ok_or(ScalarConditionGap::IncompleteCondition)
+    }
+
+    fn shape<'tree>(&self, node: Node<'tree>) -> ConditionShape<'tree> {
+        if node.kind() == "unary"
+            && node
+                .child_by_field_name("operator")
+                .and_then(|operator| operator.utf8_text(self.source.as_bytes()).ok())
+                .is_some_and(|operator| matches!(operator, "!" | "not"))
+        {
+            return ConditionShape::Negation(node.child_by_field_name("operand"));
+        }
+        if node.kind() == "binary"
+            && node
+                .child_by_field_name("operator")
+                .and_then(|operator| operator.utf8_text(self.source.as_bytes()).ok())
+                .is_some_and(|operator| matches!(operator, "&&" | "and" | "||" | "or"))
+        {
+            return ConditionShape::ShortCircuit {
+                left: node.child_by_field_name("left"),
+                right: node.child_by_field_name("right"),
+            };
+        }
+        ConditionShape::Leaf
+    }
+
+    fn false_destination<'tree>(
+        &self,
+        owner: Node<'tree>,
+    ) -> Result<Node<'tree>, ScalarConditionGap> {
+        match owner.child_by_field_name("alternative") {
+            Some(alternative) if alternative.kind() == "else" => {
+                first_ruby_branch_statement(alternative)
+                    .ok_or(ScalarConditionGap::IncompleteCondition)
+            }
+            Some(alternative) => Ok(alternative),
+            None => following_statement(owner, "body_statement"),
         }
     }
 }
@@ -1015,7 +1449,7 @@ impl ComposedConditions<'_> {
         if owner.has_error() || guards.len() != leaves.len() {
             return Err(incomplete);
         }
-        let consequence = owner.child_by_field_name("consequence").ok_or(incomplete)?;
+        let consequence = syntax.consequence(owner)?;
         let false_destination = syntax.false_destination(owner)?;
         if consequence.has_error() || false_destination.has_error() {
             return Err(ScalarConditionGap::InexactSource);

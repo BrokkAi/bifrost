@@ -21,16 +21,24 @@ use crate::graph::resolver::{
 use crate::graph_support::{PythonSource, PythonUsageSource};
 use crate::imports::{
     PythonImportBinding, PythonImportDetails, imported_module_assignment_at,
-    python_import_bindings_from_imports, python_import_details, python_imports_by_statement,
-    resolve_fqn_candidates, resolve_python_relative_module,
+    python_function_scoped_import_binding, python_import_bindings_from_imports,
+    python_import_details, python_imports_by_statement, resolve_fqn_candidates,
+    resolve_python_relative_module,
+};
+use crate::syntax::{
+    attribute_chain, leftmost_identifier, python_plain_string_literal,
+    python_reference_is_deferred_function_body,
 };
 use crate::usage_index::{
     ModuleBindingEvent, ModuleBindingEventKind, ModuleBindingTimeline, PythonScopeFacts,
     usage_matching_edges, usage_module_binding_timeline, usage_resolve_module_files,
     usage_scope_facts,
 };
+pub use brokk_bifrost_core::analyzer::common::node_source_text as slice;
+use brokk_bifrost_core::analyzer::common::nonempty_node_source_text as non_empty_node_text;
 use brokk_bifrost_core::analyzer::model::ImportInfo;
 use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
+use brokk_bifrost_core::analyzer::tree_walk::parent_if_field;
 use brokk_bifrost_core::analyzer::usages::local_inference::{
     LocalBindingsSnapshot, LocalInferenceConfig, LocalInferenceEngine, SymbolResolution,
 };
@@ -753,13 +761,8 @@ impl ScanCtx<'_> {
     /// Candidate discovery retains all imports. A local import with the same
     /// binder must still override the module binding only inside its function.
     fn function_import_binding_targets_query(&self, ident: &str, node: Node<'_>) -> Option<bool> {
-        let binding = self.scoped_import_bindings.iter().rev().find(|binding| {
-            binding.is_function_scoped()
-                && binding.start_byte <= node.start_byte()
-                && binding.scope_start_byte <= node.start_byte()
-                && node.end_byte() <= binding.scope_end_byte
-                && binding.local_name == ident
-        })?;
+        let binding =
+            python_function_scoped_import_binding(self.scoped_import_bindings, ident, node)?;
         let qualified_name = resolve_python_relative_module(self.file, &binding.qualified_name)
             .unwrap_or_else(|| binding.qualified_name.clone());
         let candidates =
@@ -787,7 +790,7 @@ impl ScanCtx<'_> {
         let Some(events) = self.module_bindings.get(ident) else {
             return unclassified;
         };
-        let cutoff = if reference_is_deferred_function_body(node) {
+        let cutoff = if python_reference_is_deferred_function_body(node) {
             usize::MAX
         } else {
             node.start_byte()
@@ -1109,16 +1112,7 @@ fn handle_keyword_argument_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             slice(function, ctx.source),
         )
         .into_iter()
-        .any(|class| {
-            &class == target_owner
-                || ctx
-                    .graph
-                    .hierarchy
-                    .map(|provider| provider.get_ancestors(&class))
-                    .unwrap_or_default()
-                    .into_iter()
-                    .any(|ancestor| &ancestor == target_owner)
-        })
+        .any(|class| constructed_class_matches_target_owner(ctx, &class, target_owner))
     } else {
         false
     };
@@ -1127,7 +1121,7 @@ fn handle_keyword_argument_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             .is_some_and(|facts| facts.is_shadowed(slice(root, ctx.source)))
     });
     let named_import_callee_matches = if !root_shadowed && function.kind() == "identifier" {
-        let cutoff = if reference_is_deferred_function_body(function) {
+        let cutoff = if python_reference_is_deferred_function_body(function) {
             usize::MAX
         } else {
             function.start_byte()
@@ -1141,16 +1135,7 @@ fn handle_keyword_argument_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             cutoff,
         )
         .into_iter()
-        .any(|class| {
-            &class == target_owner
-                || ctx
-                    .graph
-                    .hierarchy
-                    .map(|provider| provider.get_ancestors(&class))
-                    .unwrap_or_default()
-                    .into_iter()
-                    .any(|ancestor| &ancestor == target_owner)
-        })
+        .any(|class| constructed_class_matches_target_owner(ctx, &class, target_owner))
     } else {
         false
     };
@@ -1167,28 +1152,9 @@ fn handle_keyword_argument_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         || (!root_shadowed
             && resolve_constructor_types(ctx.graph, ctx.python, ctx.file, ctx.source, function)
                 .into_iter()
-                .any(|class| {
-                    &class == target_owner
-                        || ctx
-                            .graph
-                            .hierarchy
-                            .map(|provider| provider.get_ancestors(&class))
-                            .unwrap_or_default()
-                            .into_iter()
-                            .any(|ancestor| &ancestor == target_owner)
-                }));
+                .any(|class| constructed_class_matches_target_owner(ctx, &class, target_owner)));
     if matches {
         record_hit(name, ctx);
-    }
-}
-
-fn leftmost_identifier(mut node: Node<'_>) -> Option<Node<'_>> {
-    loop {
-        match node.kind() {
-            "identifier" => return Some(node),
-            "attribute" => node = node.child_by_field_name("object")?,
-            _ => return None,
-        }
     }
 }
 
@@ -1235,8 +1201,16 @@ fn handle_identifier_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if let Some(member) = ctx.target_member {
         // A constructor call `Owner(...)` invokes the class's `__init__`, so it
         // is a usage of `__init__` even though `__init__` never appears.
-        if member == "__init__" && is_call_callee(node) && ctx.binds_target(text, node) {
-            record_hit(node, ctx);
+        if member == "__init__" && parent_if_field(node, "call", "function").is_some() {
+            let Some(target_owner) = ctx.target_owner.as_ref() else {
+                return;
+            };
+            if resolve_constructor_types(ctx.graph, ctx.python, ctx.file, ctx.source, node)
+                .into_iter()
+                .any(|class| constructed_class_matches_target_owner(ctx, &class, target_owner))
+            {
+                record_hit(node, ctx);
+            }
             return;
         }
         // For a member target, a bare identifier is a usage only when it names
@@ -1249,20 +1223,105 @@ fn handle_identifier_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if !ctx.binds_target(text, node) {
         return;
     }
+    let dynamic_getattr = dynamic_getattr_receiver(node, ctx);
     // A named submodule import (`from pkg import models`) binds the module,
     // not every top-level declaration exported by that module. The same
     // binding is valid as the structured receiver in `models.Model`, but a
     // bare `models` read is a reference to the module itself.
-    if !ctx.target_is_module && imported_root_targets_module(ctx, node, node) {
+    if !ctx.target_is_module && imported_root_targets_module(ctx, node, node) && !dynamic_getattr {
         return;
     }
     if !ctx.target_is_module
         && ctx.edges.iter().any(|edge| edge.local_name == text)
         && !ctx.bare_read_binds_target(text, node)
+        && !dynamic_getattr
     {
         return;
     }
-    record_hit(node, ctx);
+    if dynamic_getattr && !(ctx.target_is_module && imported_root_targets_module(ctx, node, node)) {
+        record_unproven_hit(node, ctx);
+    } else {
+        record_hit(node, ctx);
+    }
+}
+
+fn constructed_class_matches_target_owner(
+    ctx: &ScanCtx<'_>,
+    constructed: &CodeUnit,
+    target_owner: &CodeUnit,
+) -> bool {
+    constructed == target_owner
+        || ctx
+            .graph
+            .hierarchy
+            .map(|provider| provider.get_ancestors(constructed))
+            .unwrap_or_default()
+            .into_iter()
+            .any(|ancestor| &ancestor == target_owner)
+}
+
+/// Whether this identifier is the receiver of a built-in `getattr` call whose
+/// member name is not a plain string literal. Its module or symbol binding is
+/// a candidate at that site, but the call does not select one particular name.
+fn dynamic_getattr_receiver(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    let Some(arguments) = node
+        .parent()
+        .filter(|parent| parent.kind() == "argument_list")
+    else {
+        return false;
+    };
+    let Some(call) = arguments.parent().filter(|parent| parent.kind() == "call") else {
+        return false;
+    };
+    let Some(function) = call.child_by_field_name("function") else {
+        return false;
+    };
+    if function.kind() != "identifier"
+        || slice(function, ctx.source) != "getattr"
+        || !ctx
+            .scope_facts_for_node(function)
+            .is_some_and(|facts| !facts.is_shadowed("getattr"))
+    {
+        return false;
+    }
+
+    let mut object = None;
+    let mut name = None;
+    let mut positional = 0;
+    let mut cursor = arguments.walk();
+    for argument in arguments.named_children(&mut cursor) {
+        if argument.kind() == "keyword_argument" {
+            let Some(label) = argument.child_by_field_name("name") else {
+                return false;
+            };
+            let Some(value) = argument.child_by_field_name("value") else {
+                return false;
+            };
+            match slice(label, ctx.source) {
+                "object" => object = Some(value),
+                "name" => name = Some(value),
+                _ => {}
+            }
+        } else if matches!(argument.kind(), "list_splat" | "dictionary_splat") {
+            return false;
+        } else {
+            match positional {
+                0 => object = Some(argument),
+                1 => name = Some(argument),
+                _ => {}
+            }
+            positional += 1;
+        }
+    }
+    let Some(object) = object else {
+        return false;
+    };
+    let Some(name) = name else {
+        return false;
+    };
+    object.start_byte() == node.start_byte()
+        && object.end_byte() == node.end_byte()
+        && python_plain_string_literal(name, ctx.source).is_none()
 }
 
 /// Whether `node` sits in a decorator of the very definition the scan is
@@ -1741,22 +1800,6 @@ fn enclosing_class_for_node(
     .find(|unit| unit.is_class() && unit.source() == file)
 }
 
-fn attribute_chain<'a>(node: Node<'a>) -> Option<(Node<'a>, Vec<Node<'a>>)> {
-    let mut attributes = Vec::new();
-    let mut current = node;
-    loop {
-        if current.kind() != "attribute" {
-            return None;
-        }
-        attributes.push(current.child_by_field_name("attribute")?);
-        current = current.child_by_field_name("object")?;
-        if current.kind() == "identifier" {
-            attributes.reverse();
-            return Some((current, attributes));
-        }
-    }
-}
-
 struct ImportedModuleBinding {
     module: String,
     consumed_attributes: usize,
@@ -1794,7 +1837,7 @@ fn imported_module_bindings(
     let Some(events) = ctx.raw_module_bindings.get(root_text) else {
         return Vec::new();
     };
-    let cutoff = if reference_is_deferred_function_body(reference) {
+    let cutoff = if python_reference_is_deferred_function_body(reference) {
         usize::MAX
     } else {
         reference.start_byte()
@@ -1949,20 +1992,6 @@ fn member_receiver_match_is_unproven(
         "attribute" => true,
         _ => false,
     }
-}
-
-pub fn slice<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    brokk_bifrost_core::analyzer::common::node_source_text(node, source)
-}
-
-/// Whether `node` is the `function` callee of a call expression (`node(...)`).
-fn is_call_callee(node: Node<'_>) -> bool {
-    node.parent().is_some_and(|parent| {
-        parent.kind() == "call"
-            && parent
-                .child_by_field_name("function")
-                .is_some_and(|function| function.id() == node.id())
-    })
 }
 
 pub fn is_declaration_identifier(node: Node<'_>) -> bool {
@@ -2298,23 +2327,6 @@ fn binding_is_conditional(mut node: Node<'_>) -> bool {
     false
 }
 
-pub(super) fn reference_is_deferred_function_body(node: Node<'_>) -> bool {
-    let site_start = node.start_byte();
-    let site_end = node.end_byte();
-    let mut current = node;
-    while let Some(parent) = current.parent() {
-        if matches!(parent.kind(), "function_definition" | "lambda")
-            && parent
-                .child_by_field_name("body")
-                .is_some_and(|body| body.start_byte() <= site_start && site_end <= body.end_byte())
-        {
-            return true;
-        }
-        current = parent;
-    }
-    false
-}
-
 /// Collect the names an assignment or `for` target *binds*: plain identifiers
 /// and identifiers nested in destructuring patterns. An `attribute`,
 /// `subscript`, or `call` target is evaluated, not bound (`recv.member = v`
@@ -2514,7 +2526,7 @@ fn callable_return_type_name_in_tree(
     ranges.sort_by_key(|range| range.start_byte);
     ranges.into_iter().find_map(|range| {
         let declaration = root.descendant_for_byte_range(range.start_byte, range.end_byte)?;
-        let function = first_function_definition(declaration)?;
+        let function = python_first_function_definition(declaration)?;
         inferred_factory_return_type(function, source, None, &HashMap::default())
     })
 }
@@ -2528,7 +2540,7 @@ fn factory_function_key(graph: &PythonGraphSource<'_>, callable: &CodeUnit) -> S
         .unwrap_or_else(|| callable.identifier().to_string())
 }
 
-fn first_function_definition(root: Node<'_>) -> Option<Node<'_>> {
+pub fn python_first_function_definition(root: Node<'_>) -> Option<Node<'_>> {
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         if node.kind() == "function_definition" {
@@ -3085,11 +3097,6 @@ fn rhs_symbol(node: Node<'_>, source: &str) -> Option<AssignmentRhs> {
     }
 }
 
-fn non_empty_node_text(node: Node<'_>, source: &str) -> Option<String> {
-    let text = slice(node, source).trim();
-    (!text.is_empty()).then(|| text.to_string())
-}
-
 fn collect_factory_return_types_from_root(
     root: Node<'_>,
     source: &str,
@@ -3287,9 +3294,10 @@ fn returned_receiver_type(node: Node<'_>, source: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
+    #[hardwon("#1225: a lambda parameter failed to shadow the enclosing receiver name")]
     fn lambda_scope_facts_preserve_untyped_parameter_shadowing() {
         let source = "shadowed = lambda method: method.signature\n";
         let mut parser = Parser::new();
@@ -3311,47 +3319,5 @@ mod tests {
 
         assert!(facts.is_shadowed("method"));
         assert!(facts.resolution_for("method").is_unknown());
-    }
-
-    #[test]
-    fn pre_cancelled_graph_build_skips_python_file_parsing() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        std::fs::write(root.join("target.py"), "def target():\n    pass\n").unwrap();
-        let file = ProjectFile::new(root.clone(), PathBuf::from("target.py"));
-        let files = [file.clone()].into_iter().collect();
-        let cancellation = CancellationToken::default();
-        cancellation.cancel();
-
-        let graph = build_python_graph(&files, &file, Some(&cancellation));
-
-        assert!(graph.parsed.is_empty());
-    }
-
-    #[test]
-    fn graph_build_parses_only_candidates_and_target_not_transitive_imports() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        std::fs::write(root.join("target.py"), "from dependency import value\n").unwrap();
-        std::fs::write(
-            root.join("candidate.py"),
-            "from transitively_imported import value\n",
-        )
-        .unwrap();
-        std::fs::write(root.join("dependency.py"), "value = 1\n").unwrap();
-        std::fs::write(root.join("transitively_imported.py"), "value = 2\n").unwrap();
-        let target = ProjectFile::new(root.clone(), PathBuf::from("target.py"));
-        let candidate = ProjectFile::new(root.clone(), PathBuf::from("candidate.py"));
-        let dependency = ProjectFile::new(root.clone(), PathBuf::from("dependency.py"));
-        let transitive = ProjectFile::new(root.clone(), PathBuf::from("transitively_imported.py"));
-        let candidates = [candidate.clone()].into_iter().collect();
-
-        let graph = build_python_graph(&candidates, &target, None);
-
-        assert_eq!(graph.parsed.len(), 2);
-        assert!(graph.parsed.contains_key(&target));
-        assert!(graph.parsed.contains_key(&candidate));
-        assert!(!graph.parsed.contains_key(&dependency));
-        assert!(!graph.parsed.contains_key(&transitive));
     }
 }

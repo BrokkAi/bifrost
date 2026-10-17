@@ -4,11 +4,11 @@
 //! vocabulary and extracts role edges from AST fields.
 
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
-    attach_positional_argument_roles, attach_role_with_derived_name, attach_terminal_callee,
-    field_name_in_parent, first_named_child, nearest_ancestor, node_range,
+    attach_decorators_under, attach_positional_argument_roles, attach_role_with_derived_name,
+    attach_terminal_callee, field_name_in_parent, first_named_child, nearest_ancestor, node_range,
 };
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
-    chain_name_child, linear_chain_tokens, qualified_chain_root, spelled_generic_arity,
+    chain_name_child, linear_chain_tokens, qualified_path_chain_root, spelled_generic_arity,
 };
 use brokk_bifrost_core::analyzer::structural::callable::{
     CallKind, CallSiteContext, CallSiteFacts,
@@ -27,10 +27,14 @@ use brokk_bifrost_core::analyzer::structural::resolution::{
     BindingActivation, BindingKind, DEEP_LEXICAL_ENVIRONMENT_SUPPORT_WITH_CALLABLE_APPLICABILITY,
     HoistingClass, LexicalEnvironmentSupport,
 };
+use brokk_bifrost_core::analyzer::structural::result_use::{
+    CallResultUse, CallResultUseIndex, CallResultUseOpenReason, CallResultUseSite,
+};
 use brokk_bifrost_core::analyzer::structural::routes::{
     CuratedExportSurface, DEEP_IDENTITY_AXES, IdentityRouteSupport, RouteHopKind,
 };
 use brokk_bifrost_core::analyzer::structural::spec::{RoleSink, StructuralSpec};
+use brokk_bifrost_core::analyzer::tree_walk::last_named_child;
 use brokk_bifrost_core::analyzer::{Language, Range};
 use tree_sitter::Node;
 
@@ -127,6 +131,54 @@ impl JavaCallResultUseIndex {
             _ => Err(JavaCallResultUseOpen::AmbiguousCall),
         }
     }
+}
+
+/// The shared result-use adapter for Java. The legacy index above remains
+/// available to Java's lambda/result-conversion analysis, while RQL consumes
+/// this language-neutral index for the exact call-result-use relation.
+#[derive(Debug, Clone)]
+pub struct JavaCallResultUseRelationIndex {
+    inner: CallResultUseIndex,
+}
+
+impl JavaCallResultUseRelationIndex {
+    pub fn new(root: Node<'_>) -> Self {
+        let mut sites = Vec::new();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if matches!(
+                node.kind(),
+                "method_invocation" | "object_creation_expression" | "method_reference"
+            ) {
+                sites.push(java_call_result_use_site(node));
+            }
+            for index in (0..node.named_child_count()).rev() {
+                stack.push(node.named_child(index).expect("named child exists"));
+            }
+        }
+        Self {
+            inner: CallResultUseIndex::new(sites),
+        }
+    }
+
+    pub fn at_span(
+        &self,
+        start_byte: usize,
+        end_byte: usize,
+    ) -> Result<&CallResultUseSite, CallResultUseOpenReason> {
+        self.inner.at_span(start_byte, end_byte)
+    }
+}
+
+/// Convert Java's established syntax result into the shared relation without
+/// changing the legacy Java-facing enum used by typed lambda analysis.
+pub fn java_call_result_use_site(call: Node<'_>) -> CallResultUseSite {
+    let result_use = match java_call_result_use(call) {
+        Some(JavaCallResultUse::Discarded) => CallResultUse::Discarded,
+        Some(JavaCallResultUse::OtherContext) => CallResultUse::Consumed,
+        None => CallResultUse::Open(CallResultUseOpenReason::UnclassifiedSyntax),
+    };
+    CallResultUseSite::new(call.start_byte(), call.end_byte(), result_use)
 }
 
 pub fn java_call_result_use(call: Node<'_>) -> Option<JavaCallResultUse> {
@@ -226,6 +278,8 @@ pub fn java_parent_statement_body(parent: Node<'_>, node: Node<'_>) -> bool {
 }
 
 pub const JAVA_KIND_TABLE: &[(&str, NormalizedKind)] = &[
+    ("line_comment", NormalizedKind::Comment),
+    ("block_comment", NormalizedKind::Comment),
     ("method_invocation", NormalizedKind::Call),
     ("method_reference", NormalizedKind::Call),
     ("object_creation_expression", NormalizedKind::Call),
@@ -255,6 +309,10 @@ pub const JAVA_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("assignment_expression", NormalizedKind::Assignment),
     ("import_declaration", NormalizedKind::Import),
     ("identifier", NormalizedKind::Identifier),
+    // tree-sitter-java recovers the pre-Java-9 underscore spelling as a
+    // named pattern node. Keep it in the identifier fact domain so language
+    // rules can distinguish its declaration role from ordinary uses.
+    ("underscore_pattern", NormalizedKind::Identifier),
     ("type_identifier", NormalizedKind::Identifier),
     ("scoped_identifier", NormalizedKind::Identifier),
     ("scoped_type_identifier", NormalizedKind::Identifier),
@@ -288,12 +346,6 @@ pub const JAVA_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("marker_annotation", NormalizedKind::Decorator),
 ];
 
-fn last_named_child(node: Node<'_>) -> Option<Node<'_>> {
-    node.named_child_count()
-        .checked_sub(1)
-        .and_then(|index| node.named_child(index))
-}
-
 pub fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Node<'tree>> {
     let mut current = expression;
     loop {
@@ -319,27 +371,13 @@ pub fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Node<'tree
 }
 
 fn attach_decorators(sink: &mut RoleSink<'_>, declaration: Node<'_>) {
-    for index in 0..declaration.named_child_count() {
-        let Some(child) = declaration.named_child(index) else {
-            continue;
-        };
-        if child.kind() != "modifiers" {
-            continue;
-        }
-        for modifier_index in 0..child.named_child_count() {
-            let Some(modifier_child) = child.named_child(modifier_index) else {
-                continue;
-            };
-            if matches!(modifier_child.kind(), "annotation" | "marker_annotation") {
-                attach_role_with_derived_name(
-                    sink,
-                    Role::Decorator,
-                    modifier_child,
-                    expression_name_node,
-                );
-            }
-        }
-    }
+    attach_decorators_under(
+        sink,
+        declaration,
+        "modifiers",
+        &["annotation", "marker_annotation"],
+        expression_name_node,
+    );
 }
 
 static JAVA_OCCURRENCE_ROLE_SUPPORT: OccurrenceRoleSupport = OccurrenceRoleSupport::NONE
@@ -375,6 +413,7 @@ const JAVA_BINDER_HEADS: &[&str] = &[
     "catch_formal_parameter",
     "resource",
     "variable_declarator",
+    "enhanced_for_statement",
 ];
 
 /// Classify one Java identifier token by its AST position.
@@ -384,7 +423,10 @@ const JAVA_BINDER_HEADS: &[&str] = &[
 /// (`PathSegment`) and its tail (the role the whole chain plays in context),
 /// never a third row spanning both.
 fn java_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
-    if !matches!(node.kind(), "identifier" | "type_identifier") {
+    if !matches!(
+        node.kind(),
+        "identifier" | "type_identifier" | "underscore_pattern"
+    ) {
         return None;
     }
 
@@ -456,7 +498,7 @@ fn java_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
 /// The binding one Java binder token introduces, and the interval it is in
 /// effect over.
 ///
-/// Java has four shapes and they differ only in that interval:
+/// Java has five binder shapes and they differ only in that interval:
 ///
 /// - A formal or lambda parameter is in effect over its whole callable, which
 ///   is exactly the declaring scope, so it is `ScopeWide`. This is what makes a
@@ -469,6 +511,9 @@ fn java_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
 ///   try-with-resources resource over the try block — both `DeclaredHead`,
 ///   because the interval is a named sub-range of the declaring scope rather
 ///   than a suffix of it.
+/// - An enhanced-for variable is in effect over the statement in its `body`
+///   field. The iterable expression is outside that interval, so it cannot
+///   resolve to the variable being declared.
 fn java_binding_activation(binder: Node<'_>, scope: Range) -> Option<BindingActivation> {
     let form = nearest_ancestor(binder, |kind| {
         matches!(
@@ -481,6 +526,7 @@ fn java_binding_activation(binder: Node<'_>, scope: Range) -> Option<BindingActi
                 | "catch_formal_parameter"
                 | "resource"
                 | "variable_declarator"
+                | "enhanced_for_statement"
                 | "type_pattern"
         )
     })?;
@@ -508,6 +554,18 @@ fn java_binding_activation(binder: Node<'_>, scope: Range) -> Option<BindingActi
             let body = statement.child_by_field_name("body")?;
             Some(BindingActivation {
                 kind: BindingKind::CatchOrResource,
+                hoisting: HoistingClass::DeclaredHead,
+                activation: node_range(body),
+            })
+        }
+        "enhanced_for_statement" => {
+            let body = form.child_by_field_name("body")?;
+            // A recovered header or body cannot establish this binder's interval.
+            if form.has_error() || binder.is_missing() || body.is_missing() {
+                return None;
+            }
+            Some(BindingActivation {
+                kind: BindingKind::LoopVariable,
                 hoisting: HoistingClass::DeclaredHead,
                 activation: node_range(body),
             })
@@ -565,7 +623,12 @@ impl StructuralSpec for JavaStructuralSpec {
             || node.child_by_field_name("value").is_some()
     }
 
-    fn generator_construct(&self, node: Node<'_>, _kind: NormalizedKind) -> Option<&'static str> {
+    fn generator_construct(
+        &self,
+        node: Node<'_>,
+        _kind: NormalizedKind,
+        _source: &str,
+    ) -> Option<&'static str> {
         match node.kind() {
             "method_reference" => Some("java_method_reference"),
             "object_creation_expression" => Some("java_object_creation"),
@@ -574,7 +637,7 @@ impl StructuralSpec for JavaStructuralSpec {
     }
 
     fn supports_role(&self, role: Role) -> bool {
-        role != Role::Kwarg
+        brokk_bifrost_core::analyzer::structural::spec::supports_role_without_kwarg(role)
     }
 
     /// Java spells its non-ordinary call shapes as distinct grammar nodes, so
@@ -627,10 +690,7 @@ impl StructuralSpec for JavaStructuralSpec {
     }
 
     fn qualified_path_root<'tree>(&self, token: Node<'tree>) -> Option<Node<'tree>> {
-        if !matches!(token.kind(), "identifier" | "type_identifier") {
-            return None;
-        }
-        qualified_chain_root(token, JAVA_PATH_CHAIN)
+        qualified_path_chain_root(token, JAVA_PATH_CHAIN)
     }
 
     fn path_segment_tokens<'tree>(&self, root: Node<'tree>) -> Vec<Node<'tree>> {
@@ -836,11 +896,85 @@ pub fn java_pattern_binding_name(node: Node<'_>) -> Option<Node<'_>> {
     }
 }
 
+/// The text one plain Java string literal denotes.
+///
+/// Text blocks, escape sequences, string-template interpolations, and
+/// recovered shapes return `None`: each of them denotes a value that differs
+/// from any single source span. The returned slice is always the exact
+/// `string_fragment` AST span (or empty for `""`), never text recovered by
+/// delimiter scanning.
+pub fn java_plain_string_literal<'source>(
+    node: Node<'_>,
+    source: &'source str,
+) -> Option<&'source str> {
+    if node.kind() != "string_literal" || node.has_error() {
+        return None;
+    }
+    // A text block opens with the `"""` token; only `"` opens a plain literal.
+    if node.child(0)?.kind() != "\"" {
+        return None;
+    }
+    let mut fragment = None;
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "string_fragment" if fragment.is_none() => fragment = Some(child),
+            _ => return None,
+        }
+    }
+    match fragment {
+        Some(fragment) => fragment.utf8_text(source.as_bytes()).ok(),
+        None => Some(""),
+    }
+}
+
+#[cfg(test)]
+mod plain_string_literal_tests {
+    use super::java_plain_string_literal;
+    use tree_sitter::Parser;
+
+    fn literals(source: &str) -> Vec<Option<String>> {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .expect("Java grammar");
+        let tree = parser.parse(source, None).expect("Java tree");
+        let mut found = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "string_literal" {
+                found.push(java_plain_string_literal(node, source).map(str::to_owned));
+                continue;
+            }
+            for index in (0..node.named_child_count()).rev() {
+                stack.push(node.named_child(index).expect("named child exists"));
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn only_plain_literals_denote_their_fragment() {
+        let source = "class C { void f() {\n\
+            g(\"db.url\");\n\
+            g(\"\");\n\
+            g(\"db\\turl\");\n\
+            g(\"\"\"\n    db.url\n    \"\"\");\n\
+        } }";
+        assert_eq!(
+            literals(source),
+            vec![Some("db.url".to_owned()), Some(String::new()), None, None,]
+        );
+    }
+}
+
 #[cfg(test)]
 mod result_use_tests {
     use super::{
-        JavaCallResultUse, JavaCallResultUseIndex, JavaCallResultUseOpen, java_call_result_use,
+        JavaCallResultUse, JavaCallResultUseIndex, JavaCallResultUseOpen,
+        JavaCallResultUseRelationIndex, java_call_result_use,
     };
+    use brokk_bifrost_core::analyzer::structural::result_use::CallResultUse;
     use tree_sitter::{Node, Parser};
 
     #[test]
@@ -883,6 +1017,35 @@ mod result_use_tests {
                 (6, Some(JavaCallResultUse::OtherContext)),
             ]
         );
+    }
+
+    #[test]
+    fn shared_java_relation_preserves_exact_legacy_classification() {
+        let source =
+            "class C { void f(String s) { s.trim(); sink(s.trim()); } void sink(String s) {} }";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .expect("Java grammar");
+        let tree = parser.parse(source, None).expect("Java tree");
+        let index = JavaCallResultUseRelationIndex::new(tree.root_node());
+        let mut calls = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "method_invocation" {
+                let site = index
+                    .at_span(node.start_byte(), node.end_byte())
+                    .expect("exact shared Java call site");
+                calls.push(site.default_use());
+            }
+            for index in (0..node.named_child_count()).rev() {
+                stack.push(node.named_child(index).expect("named child exists"));
+            }
+        }
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0], CallResultUse::Discarded);
+        assert_eq!(calls[1], CallResultUse::Discarded);
+        assert_eq!(calls[2], CallResultUse::Consumed);
     }
 
     #[test]

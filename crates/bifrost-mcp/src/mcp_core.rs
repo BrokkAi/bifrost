@@ -84,7 +84,7 @@ pub(crate) fn symbol_tool_descriptors(render_line_numbers: bool) -> Vec<Value> {
         ),
         tool_descriptor(
             "get_summaries",
-            "Summarize code or navigate containers. Use a narrow directory target like an `ls` to list its immediate child directories and git-visible files (tracked or unignored), including non-source files; gitignored files are excluded. Do not pass `/`, the repository root, or a broad source tree in a large repository; narrow the target to the package or source directory that matters. Use an OO namespace or language package/import target like a semantic `ls` to list direct child packages and top-level types declared in that exact package. Real filesystem directories win name collisions, and mixed target kinds are accepted in one call. Literal files, globs, classes, and modules return ranged summaries. Oversized ordinary summaries degrade to compact_symbols; oversized listings retain a total count and set truncated. A glob target that matches more files than the per-target limit is skipped and reported under too_broad with a sample of the match; narrow it or use list_symbols. Examples: [\"src/auth\"], [\"com.example.auth\"], [\"github.com/cli/cli/v2/internal/skills/discovery\"], [\"src/auth/**/*.rs\", \"MyClass\"].",
+            "Summarize code or navigate containers. Use a narrow directory target like an `ls` to list its immediate child directories and git-visible files (tracked or unignored), including non-source files; gitignored files are excluded. Do not pass `/`, the repository root, or a broad source tree in a large repository; narrow the target to the package or source directory that matters. Use an OO namespace or language package/import target like a semantic `ls` to list direct child packages and top-level types declared in that exact package. Real filesystem directories win name collisions, and mixed target kinds are accepted in one call. Literal files, globs, classes, and modules return ranged summaries. Oversized ordinary summaries degrade to compact_symbols; oversized listings retain a total count and set truncated. A glob target that matches more files than the per-target limit is skipped and reported under too_broad with a sample of the match; narrow it or list explicit files. Examples: [\"src/auth\"], [\"com.example.auth\"], [\"github.com/cli/cli/v2/internal/skills/discovery\"], [\"src/auth/**/*.rs\", \"MyClass\"].",
             summaries_schema(),
         ),
         scan_descriptor,
@@ -228,95 +228,98 @@ fn location_references_schema(path_description: &str, max_items: Option<usize>) 
 }
 
 fn scan_usages_by_reference_descriptor() -> Value {
+    let mut properties = json!({
+        "symbols": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "pattern": "\\S" },
+            "description": "Fully qualified symbols from search_symbols are preferred; short names may resolve fuzzily or become ambiguous. A short name that hundreds of declarations answer is reported as ambiguous with `too_many_candidates` (the true count and the cap) and no candidate list -- qualify it and re-call."
+        }
+    })
+    .as_object()
+    .expect("reference properties are an object")
+    .clone();
+    properties.extend(usage_scope_properties());
     tool_descriptor(
         "scan_usages_by_reference",
         "Find references, call sites, callers, and related tests for known workspace symbols. Use search_symbols first for partial names. Each result reports its effective scope, status, completeness, resolved declaration, and proven or unproven usage sites.",
         json!({
             "type": "object",
-            "properties": {
-                "symbols": {
-                    "type": "array",
-                    "minItems": 1,
-                    "items": { "type": "string", "pattern": "\\S" },
-                    "description": "Fully qualified symbols from search_symbols are preferred; short names may resolve fuzzily or become ambiguous. A short name that hundreds of declarations answer is reported as ambiguous with `too_many_candidates` (the true count and the cap) and no candidate list -- qualify it and re-call."
-                },
-                "include_tests": {
-                    "type": "boolean",
-                    "default": false,
-                    "description": "Include call sites in test files."
-                },
-                "include_same_owner": {
-                    "type": "boolean",
-                    "default": false,
-                    "description": "List the same-owner usage sites (self/this receiver and own-type static calls) that are excluded from external usage counts. When false these sites are only counted as `same_owner_sites`; a zero-external result with same-owner sites reports status `no_external_usages`, never `verified_absent`."
-                },
-                "paths": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Optional project-relative files, directories, or globs used to narrow where usages are searched. A directory selects every file under it. A selector that names no workspace file or directory is listed in scope.unmatched_paths and makes the result incomplete, so absence is reported as unverified_absent."
-                }
-            },
+            "properties": properties,
             "required": ["symbols"]
         }),
     )
 }
 
 fn scan_usages_by_location_descriptor() -> Value {
+    let mut properties = json!({
+        "targets": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Project-relative source path containing the declaration."
+                    },
+                    "line": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "1-based line containing the declaration name."
+                    },
+                    "column": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Optional 1-based character column inside the declaration name."
+                    },
+                    "symbol": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Optional exact declaration selector that disambiguates overlapping declarations at this location. Use the selector returned by search_symbols when available."
+                    }
+                },
+                "required": ["path", "line"]
+            }
+        }
+    })
+    .as_object()
+    .expect("location properties are an object")
+    .clone();
+    properties.extend(usage_scope_properties());
     tool_descriptor(
         "scan_usages_by_location",
         "Find references, call sites, callers, and related tests for declarations selected by project-relative path and 1-based line/column. The location normally identifies a declaration name; an exact `symbol` selector may additionally select a module across its file range.",
         json!({
             "type": "object",
-            "properties": {
-                "targets": {
-                    "type": "array",
-                    "minItems": 1,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "path": {
-                                "type": "string",
-                                "minLength": 1,
-                                "description": "Project-relative source path containing the declaration."
-                            },
-                            "line": {
-                                "type": "integer",
-                                "minimum": 1,
-                                "description": "1-based line containing the declaration name."
-                            },
-                            "column": {
-                                "type": "integer",
-                                "minimum": 1,
-                                "description": "Optional 1-based character column inside the declaration name."
-                            },
-                            "symbol": {
-                                "type": "string",
-                                "minLength": 1,
-                                "description": "Optional exact declaration selector that disambiguates overlapping declarations at this location. Use the selector returned by search_symbols when available."
-                            }
-                        },
-                        "required": ["path", "line"]
-                    }
-                },
-                "include_tests": {
-                    "type": "boolean",
-                    "default": false,
-                    "description": "Include call sites in test files."
-                },
-                "include_same_owner": {
-                    "type": "boolean",
-                    "default": false,
-                    "description": "List the same-owner usage sites (self/this receiver and own-type static calls) that are excluded from external usage counts. When false these sites are only counted as `same_owner_sites`; a zero-external result with same-owner sites reports status `no_external_usages`, never `verified_absent`."
-                },
-                "paths": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Optional project-relative files, directories, or globs used to narrow where usages are searched. A directory selects every file under it. A selector that names no workspace file or directory is listed in scope.unmatched_paths and makes the result incomplete, so absence is reported as unverified_absent."
-                }
-            },
+            "properties": properties,
             "required": ["targets"]
         }),
     )
+}
+
+fn usage_scope_properties() -> serde_json::Map<String, Value> {
+    json!({
+        "include_tests": {
+            "type": "boolean",
+            "default": false,
+            "description": "Include call sites in test files."
+        },
+        "include_same_owner": {
+            "type": "boolean",
+            "default": false,
+            "description": "List the same-owner usage sites (self/this receiver and own-type static calls) that are excluded from external usage counts. When false these sites are only counted as `same_owner_sites`; a zero-external result with same-owner sites reports status `no_external_usages`, never `verified_absent`."
+        },
+        "paths": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Optional project-relative files, directories, or globs used to narrow where usages are searched. A directory selects every file under it. A selector that names no workspace file or directory is listed in scope.unmatched_paths and makes the result incomplete, so absence is reported as unverified_absent."
+        }
+    })
+    .as_object()
+    .expect("usage scope properties are an object")
+    .clone()
 }
 
 fn get_definitions_by_reference_descriptor() -> Value {
@@ -386,6 +389,11 @@ pub(crate) fn workspace_tool_descriptors() -> Vec<Value> {
 mod tests {
     use super::*;
 
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[hardwon(
+        "65900d29e44d: Commit 65900d29e44d moved scan deadline policy to the frontend; schema input must not retain analysis-owned deadlines"
+    )]
     #[test]
     fn scan_usage_schemas_leave_deadline_policy_to_the_frontend() {
         for render_line_numbers in [true, false] {

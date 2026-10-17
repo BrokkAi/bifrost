@@ -1,6 +1,7 @@
 //! Analyzer-owned bounded receiver queries for structural traversal.
 
 use crate::analyzer::common::language_for_file;
+use crate::analyzer::go::native_points::{GoNativePointRequest, GoNativePointRequestOpen};
 use crate::analyzer::languages::{
     BoundedReceiverQuery, LanguageSupport, ReceiverFactContext, StructuralReceiverResolver,
     language_support,
@@ -23,7 +24,7 @@ use crate::analyzer::tree_sitter_analyzer::{
     BoundedNamedTreeWalk, walk_named_tree_preorder_bounded,
 };
 use crate::analyzer::usages::get_definition::{
-    BoundedResolution, DefinitionLookupOutcome, DefinitionLookupStatus,
+    BoundedResolution, CSHARP_INDEXER_MEMBER_NAME, DefinitionLookupOutcome, DefinitionLookupStatus,
     java::{JavaResolutionSession, resolve_java_bounded},
     parse_tree_for_language, resolve_reference_site_with_line_starts,
 };
@@ -48,6 +49,7 @@ use crate::analyzer::{
     AnalyzerDefinitionLookup, CodeUnit, DispatchExtensibility, IAnalyzer, Language, ProjectFile,
     Range, WorkspaceAnalyzer,
 };
+use crate::analyzer::{GoAnalyzer, resolve_analyzer};
 use crate::cancellation::CancellationToken;
 use crate::hash::HashMap;
 use crate::path_utils::rel_path_string;
@@ -55,7 +57,7 @@ use crate::text_utils::compute_line_starts;
 use std::cell::RefCell;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use tree_sitter::Node;
+use tree_sitter::{Node, Tree};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReceiverQueryOperation {
@@ -228,6 +230,10 @@ pub struct ReceiverQueryReport {
     pub work: ReceiverAnalysisWork,
     pub candidates_truncated: bool,
     pub semantic_unsupported: Option<SemanticCapability>,
+    /// Candidate-aligned semantic points-to answers for the RQL
+    /// `points_to_candidate` expansion. The display-oriented receiver values
+    /// can merge candidates and therefore cannot carry this identity.
+    pub points_to: Option<SourcePointsToResult>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -243,6 +249,9 @@ pub struct ReceiverQueryService<'a> {
     prepared_files: RefCell<HashMap<ProjectFile, PreparedReceiverFile>>,
     prepared_java_files: RefCell<HashMap<ProjectFile, PreparedJavaReceiverFile>>,
     prepared_structural_files: RefCell<HashMap<ProjectFile, PreparedStructuralReceiverFile>>,
+    /// Selected Go point state belongs to this service's one RQL/policy
+    /// request and grows only for source files that request touches.
+    native_go_points: RefCell<Option<Box<GoNativePointRequest<'a>>>>,
 }
 
 struct PreparedReceiverFile {
@@ -443,6 +452,10 @@ impl ReceiverWorkLedger {
                 .budget
                 .max_summary_expansions
                 .saturating_sub(self.work.summary_expansions),
+            max_resolution_rounds: self
+                .budget
+                .max_resolution_rounds
+                .saturating_sub(self.work.resolution_rounds),
             ..self.budget
         }
     }
@@ -462,6 +475,7 @@ impl ReceiverWorkLedger {
         let remaining = self.remaining_budget();
         let scope_exceeded = work.scope_nodes > remaining.max_scope_nodes;
         let summaries_exceeded = work.summary_expansions > remaining.max_summary_expansions;
+        let rounds_exceeded = work.resolution_rounds > remaining.max_resolution_rounds;
         self.work.scope_nodes = self
             .work
             .scope_nodes
@@ -470,10 +484,16 @@ impl ReceiverWorkLedger {
             work.summary_expansions
                 .min(remaining.max_summary_expansions),
         );
+        self.work.resolution_rounds = self
+            .work
+            .resolution_rounds
+            .saturating_add(work.resolution_rounds.min(remaining.max_resolution_rounds));
         if scope_exceeded {
             Err(ReceiverBudgetLimit::ScopeNodes)
         } else if summaries_exceeded {
             Err(ReceiverBudgetLimit::SummaryExpansions)
+        } else if rounds_exceeded {
+            Err(ReceiverBudgetLimit::ResolutionRounds)
         } else {
             Ok(())
         }
@@ -493,6 +513,9 @@ fn combined_receiver_work(
         summary_expansions: left
             .summary_expansions
             .saturating_add(right.summary_expansions),
+        resolution_rounds: left
+            .resolution_rounds
+            .saturating_add(right.resolution_rounds),
         scope_nodes: left.scope_nodes.saturating_add(right.scope_nodes),
     }
 }
@@ -556,26 +579,96 @@ fn charge_limited_projection<T>(
 
 impl<'a> ReceiverQueryService<'a> {
     pub fn new(analyzer: &'a dyn IAnalyzer) -> Self {
-        Self {
-            analyzer,
-            workspace: None,
-            definitions: AnalyzerDefinitionLookup::new(analyzer, Language::None),
-            prepared_files: RefCell::new(HashMap::default()),
-            prepared_java_files: RefCell::new(HashMap::default()),
-            prepared_structural_files: RefCell::new(HashMap::default()),
-        }
+        Self::with_workspace(analyzer, None)
     }
 
     pub fn from_workspace(workspace: &'a WorkspaceAnalyzer) -> Self {
-        let analyzer = workspace.analyzer();
+        Self::with_workspace(workspace.analyzer(), Some(workspace))
+    }
+
+    fn with_workspace(
+        analyzer: &'a dyn IAnalyzer,
+        workspace: Option<&'a WorkspaceAnalyzer>,
+    ) -> Self {
         Self {
             analyzer,
-            workspace: Some(workspace),
+            workspace,
             definitions: AnalyzerDefinitionLookup::new(analyzer, Language::None),
             prepared_files: RefCell::new(HashMap::default()),
             prepared_java_files: RefCell::new(HashMap::default()),
             prepared_structural_files: RefCell::new(HashMap::default()),
+            native_go_points: RefCell::new(None),
         }
+    }
+
+    fn structural_type_resolution(
+        &self,
+        language: Language,
+        resolver: &'static dyn StructuralReceiverResolver,
+        query: BoundedReceiverQuery<'_>,
+    ) -> BoundedResolution<TypeLookupOutcome> {
+        if language != Language::Go || !resolver.reuses_request_scoped_native_points() {
+            return resolver.resolve_type_bounded(query);
+        }
+        {
+            let mut request = self.native_go_points.borrow_mut();
+            if request.is_none()
+                && let Some(go) = resolve_analyzer::<GoAnalyzer>(self.analyzer)
+            {
+                let cancellation = query.cancellation.cloned().unwrap_or_default();
+                if let Ok(GoNativePointRequestOpen::Ready(opened)) = GoNativePointRequest::open(
+                    go,
+                    self.analyzer.semantic_model_overlay(),
+                    &cancellation,
+                ) {
+                    *request = Some(opened);
+                }
+            }
+            if let Some(request) = request.as_mut() {
+                request.begin_receiver_query(query.file);
+                return request.resolve_type(query);
+            }
+        }
+        resolver.resolve_type_bounded(query)
+    }
+
+    fn structural_definition_resolution(
+        &self,
+        language: Language,
+        resolver: &'static dyn StructuralReceiverResolver,
+        query: BoundedReceiverQuery<'_>,
+    ) -> BoundedResolution<DefinitionLookupOutcome> {
+        if language != Language::Go || !resolver.reuses_request_scoped_native_points() {
+            return resolver.resolve_definition_bounded(query);
+        }
+        {
+            let mut request = self.native_go_points.borrow_mut();
+            if request.is_none()
+                && let Some(go) = resolve_analyzer::<GoAnalyzer>(self.analyzer)
+            {
+                let cancellation = query.cancellation.cloned().unwrap_or_default();
+                if let Ok(GoNativePointRequestOpen::Ready(opened)) = GoNativePointRequest::open(
+                    go,
+                    self.analyzer.semantic_model_overlay(),
+                    &cancellation,
+                ) {
+                    *request = Some(opened);
+                }
+            }
+            if let Some(request) = request.as_mut() {
+                return match request.resolve_definition_with_evidence(query) {
+                    BoundedResolution::Complete { value, work } => BoundedResolution::Complete {
+                        value: value.outcome,
+                        work,
+                    },
+                    BoundedResolution::Exceeded { limit, work } => {
+                        BoundedResolution::Exceeded { limit, work }
+                    }
+                    BoundedResolution::Cancelled { work } => BoundedResolution::Cancelled { work },
+                };
+            }
+        }
+        resolver.resolve_definition_bounded(query)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -933,9 +1026,10 @@ impl<'a> ReceiverQueryService<'a> {
                                     receiver_type_outcome(type_outcome.status, projection.values),
                                 );
                                 report.candidates_truncated |= projection.truncated;
-                                if !evidence.supports_precise()
+                                if (!evidence.supports_precise()
                                     || projection.truncated
-                                    || projection.multiple_identities
+                                    || projection.multiple_identities)
+                                    && !is_exact_current_receiver(&report.analysis)
                                 {
                                     neutral_incomplete(&mut report.analysis);
                                 }
@@ -1089,6 +1183,7 @@ impl<'a> ReceiverQueryService<'a> {
                         ),
                         candidates_truncated: member_report.analysis.candidates_truncated,
                         semantic_unsupported: None,
+                        points_to: None,
                     },
                     gate,
                     &mut ledger,
@@ -1478,9 +1573,12 @@ impl<'a> ReceiverQueryService<'a> {
             .expect("structural receiver sites were prepared above");
         debug_assert!(prepared.matches(facts));
         let source = prepared.sites.source();
-        let selection_mode = match input {
-            ReceiverQueryInput::ContainingSite => ReceiverSiteInputMode::ContainingSite,
-            ReceiverQueryInput::Expression => ReceiverSiteInputMode::Expression,
+        let selection_mode = match (operation, input) {
+            (ReceiverQueryOperation::MemberTargets, ReceiverQueryInput::Expression) => {
+                resolver.member_target_input_mode()
+            }
+            (_, ReceiverQueryInput::ContainingSite) => ReceiverSiteInputMode::ContainingSite,
+            (_, ReceiverQueryInput::Expression) => ReceiverSiteInputMode::Expression,
         };
         let selected = match prepared.sites.select_bounded(
             range,
@@ -1552,10 +1650,9 @@ impl<'a> ReceiverQueryService<'a> {
             ReceiverSiteKind::Call => "call",
             ReceiverSiteKind::FieldAccess => "field_access",
         });
-        let member_name = member_range
-            .and_then(|member| source.get(member.start_byte..member.end_byte))
-            .filter(|member| !member.is_empty())
-            .map(str::to_string);
+        let member_name = member_range.and_then(|member| {
+            receiver_member_name(language, prepared.syntax.tree(), source, member)
+        });
         let report_site = site(
             file,
             language,
@@ -1573,15 +1670,19 @@ impl<'a> ReceiverQueryService<'a> {
         }
 
         let reference_site = structural_reference_site(file, source, query_range);
-        let resolution = resolver.resolve_type_bounded(BoundedReceiverQuery {
-            analyzer: self.analyzer,
-            file,
-            source,
-            tree: Some(prepared.syntax.tree()),
-            site: &reference_site,
-            budget: ledger.remaining_budget(),
-            cancellation: Some(cancellation),
-        });
+        let resolution = self.structural_type_resolution(
+            language,
+            resolver,
+            BoundedReceiverQuery {
+                analyzer: self.analyzer,
+                file,
+                source,
+                tree: Some(prepared.syntax.tree()),
+                site: &reference_site,
+                budget: ledger.remaining_budget(),
+                cancellation: Some(cancellation),
+            },
+        );
         let type_outcome = match charge_bounded_resolution(&mut ledger, resolution)? {
             CompatibilityOutcome::Complete(outcome) => outcome,
             CompatibilityOutcome::Exceeded(limit) => {
@@ -1622,6 +1723,7 @@ impl<'a> ReceiverQueryService<'a> {
                 work: ledger.work(),
                 candidates_truncated: projection.truncated,
                 semantic_unsupported: None,
+                points_to: None,
             });
         }
 
@@ -1665,15 +1767,19 @@ impl<'a> ReceiverQueryService<'a> {
         if operation == ReceiverQueryOperation::MemberTargets {
             let member_range = member_range.expect("member target range was validated above");
             let reference_site = structural_reference_site(file, source, member_range);
-            let resolution = resolver.resolve_definition_bounded(BoundedReceiverQuery {
-                analyzer: self.analyzer,
-                file,
-                source,
-                tree: Some(prepared.syntax.tree()),
-                site: &reference_site,
-                budget: ledger.remaining_budget(),
-                cancellation: Some(cancellation),
-            });
+            let resolution = self.structural_definition_resolution(
+                language,
+                resolver,
+                BoundedReceiverQuery {
+                    analyzer: self.analyzer,
+                    file,
+                    source,
+                    tree: Some(prepared.syntax.tree()),
+                    site: &reference_site,
+                    budget: ledger.remaining_budget(),
+                    cancellation: Some(cancellation),
+                },
+            );
             let outcome = match charge_bounded_resolution(&mut ledger, resolution)? {
                 CompatibilityOutcome::Complete(outcome) => outcome,
                 CompatibilityOutcome::Exceeded(limit) => {
@@ -1739,6 +1845,7 @@ impl<'a> ReceiverQueryService<'a> {
                 work: ledger.work(),
                 candidates_truncated: evidence.is_truncated() || resolution_truncated,
                 semantic_unsupported: evidence.unsupported_capability(),
+                points_to: None,
             });
         }
 
@@ -1761,15 +1868,19 @@ impl<'a> ReceiverQueryService<'a> {
                 query_node.and_then(|node| structural_factory_name_node(language, node))
         {
             let factory_site = structural_reference_site(file, source, node_range(factory_node));
-            let resolution = resolver.resolve_definition_bounded(BoundedReceiverQuery {
-                analyzer: self.analyzer,
-                file,
-                source,
-                tree: Some(prepared.syntax.tree()),
-                site: &factory_site,
-                budget: ledger.remaining_budget(),
-                cancellation: Some(cancellation),
-            });
+            let resolution = self.structural_definition_resolution(
+                language,
+                resolver,
+                BoundedReceiverQuery {
+                    analyzer: self.analyzer,
+                    file,
+                    source,
+                    tree: Some(prepared.syntax.tree()),
+                    site: &factory_site,
+                    budget: ledger.remaining_budget(),
+                    cancellation: Some(cancellation),
+                },
+            );
             match charge_bounded_resolution(&mut ledger, resolution)? {
                 CompatibilityOutcome::Complete(outcome)
                     if outcome.status == DefinitionLookupStatus::Resolved
@@ -1812,7 +1923,9 @@ impl<'a> ReceiverQueryService<'a> {
             type_outcome.status,
             projection.values,
         ));
-        if !evidence.supports_precise() || projection.truncated || projection.multiple_identities {
+        if (!evidence.supports_precise() || projection.truncated || projection.multiple_identities)
+            && !is_exact_current_receiver(&analysis)
+        {
             neutral_incomplete(&mut analysis);
         }
         Ok(ReceiverQueryReport {
@@ -1823,6 +1936,11 @@ impl<'a> ReceiverQueryService<'a> {
             work: ledger.work(),
             candidates_truncated: evidence.is_truncated() || projection.truncated,
             semantic_unsupported: evidence.unsupported_capability(),
+            points_to: if operation == ReceiverQueryOperation::PointsTo {
+                Some(points_to.clone())
+            } else {
+                None
+            },
         })
     }
 
@@ -2136,6 +2254,7 @@ impl<'a> ReceiverQueryService<'a> {
                 work: ledger.work(),
                 candidates_truncated,
                 semantic_unsupported,
+                points_to: None,
             });
         }
 
@@ -2362,7 +2481,7 @@ impl<'a> ReceiverQueryService<'a> {
                 unreachable!("member targets return through the exact Java resolver above")
             }
         };
-        if !supports_precise || candidates_truncated {
+        if (!supports_precise || candidates_truncated) && !is_exact_current_receiver(&analysis) {
             neutral_incomplete(&mut analysis);
         }
 
@@ -2383,6 +2502,11 @@ impl<'a> ReceiverQueryService<'a> {
             work: ledger.work(),
             candidates_truncated,
             semantic_unsupported,
+            points_to: if operation == ReceiverQueryOperation::PointsTo {
+                Some(points_to.clone())
+            } else {
+                None
+            },
         })
     }
 
@@ -2570,6 +2694,9 @@ fn apply_semantic_gate(
             evidence,
             ..
         } => {
+            if report.operation == ReceiverQueryOperation::PointsTo {
+                report.points_to = Some(points_to.clone());
+            }
             // The neutral gate can only confirm a value it materialized
             // itself. An exact modeled external identity is proven by the
             // declaration the overlay owns (for example a DOM `Element`
@@ -2580,20 +2707,20 @@ fn apply_semantic_gate(
             // exemption the downgrade below already applies.
             let exact_modeled_identity =
                 legacy_external_model_identity_is_precise(analyzer, &report.analysis);
+            let exact_current_receiver = is_exact_current_receiver(&report.analysis);
             let removed = !exact_modeled_identity
                 && retain_neutral_backed_values(&mut report.analysis, &points_to);
             report.candidates_truncated |= removed;
             report.candidates_truncated |= evidence.is_truncated();
             report.semantic_unsupported = evidence.unsupported_capability();
-            // The legacy JS/TS provider independently proves closure for its
-            // supported lexical forms. Preserve that proof only when neutral
-            // candidates are themselves proven/complete and openness comes
-            // from the adapter's global capability surface. Query-local
-            // uncertainty (including disabled call context) remains
-            // non-precise.
+            // A single proven receiver port confirms the legacy current-self
+            // category even when caller enumeration remains open. This is a
+            // symbolic receiver classification, not a claim about its concrete
+            // allocation at every call site.
             if !evidence.supports_precise()
                 && !evidence.legacy_provider_can_close()
                 && !exact_modeled_identity
+                && !exact_current_receiver
             {
                 neutral_incomplete(&mut report.analysis);
             }
@@ -2618,6 +2745,14 @@ fn apply_semantic_gate(
         }
     }
     report
+}
+
+fn is_exact_current_receiver(analysis: &ReceiverQueryAnalysis) -> bool {
+    matches!(
+        analysis,
+        ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::Precise(values))
+            if matches!(values.as_slice(), [ReceiverValue::CurrentReceiver(_)])
+    )
 }
 
 fn legacy_external_import_ambiguity(analysis: &ReceiverQueryAnalysis) -> bool {
@@ -2833,7 +2968,8 @@ fn neutral_object_supports_receiver(
             | AbstractObjectIdentity::CaptureSlot(_)
             | AbstractObjectIdentity::TypeSummary(_)
             | AbstractObjectIdentity::External(_)
-            | AbstractObjectIdentity::RuntimeObject(_),
+            | AbstractObjectIdentity::RuntimeObject(_)
+            | AbstractObjectIdentity::CallSubstitution { .. },
             _,
         ) => true,
         _ => false,
@@ -2953,7 +3089,9 @@ impl ReceiverSemanticBridge {
             mut nested_entries,
         ] = partition_receiver_scope_limit(scope - publication_reserve);
         nested_entries += publication_reserve;
-        let [call_sites, memory_locations, captures] = partition_receiver_summary_limit(summaries);
+        // Each lane gets the full bound so an internal partition cannot starve
+        // one kind of summary; the shared ledger below still enforces the
+        // unchanged public aggregate summary-expansion cap.
         let budget = SemanticBudget::new(SemanticWork {
             source_bytes: text,
             procedures,
@@ -2961,9 +3099,9 @@ impl ReceiverSemanticBridge {
             program_points,
             values,
             allocations,
-            call_sites,
-            memory_locations,
-            captures,
+            call_sites: summaries,
+            memory_locations: summaries,
+            captures: summaries,
             source_mappings,
             evidence,
             gaps,
@@ -2972,7 +3110,8 @@ impl ReceiverSemanticBridge {
             nested_entries,
             owned_text_bytes: text,
         })
-        .expect("receiver semantic budget is positive");
+        .expect("receiver semantic budget is positive")
+        .with_shared_summary_expansion_limit(summaries);
 
         let defaults = OracleLimits::default().values();
         let oracle_limits = OracleLimits::new(OracleLimitValues {
@@ -3007,6 +3146,7 @@ impl ReceiverSemanticBridge {
     fn receiver_work(work: SemanticWork) -> ReceiverAnalysisWork {
         ReceiverAnalysisWork {
             setup_nodes: 0,
+            resolution_rounds: 0,
             summary_expansions: work
                 .call_sites
                 .saturating_add(work.memory_locations)
@@ -3071,22 +3211,6 @@ fn partition_receiver_scope_limit(total: usize) -> [usize; 11] {
     }
     limits[NESTED_ENTRIES_INDEX] += nested_extra;
     limits
-}
-
-fn partition_receiver_summary_limit(total: usize) -> [usize; 3] {
-    debug_assert!(total >= 3);
-    // Receiver queries are call-heavy: factory provenance and bounded
-    // interprocedural flow revisit call sites while memory/capture rows remain
-    // secondary. Keep every dimension positive, reserve half of the remaining
-    // aggregate capacity for calls, then split the rest across memory and
-    // captures. The three limits still sum exactly to the caller's aggregate
-    // summary budget.
-    let remaining = total - 3;
-    let call_extra = remaining.div_ceil(2);
-    let secondary = remaining - call_extra;
-    let memory_extra = secondary.div_ceil(2);
-    let capture_extra = secondary - memory_extra;
-    [1 + call_extra, 1 + memory_extra, 1 + capture_extra]
 }
 
 struct ReceiverValueProjection {
@@ -3155,6 +3279,12 @@ fn project_receiver_values(
             return Ok(CompatibilityOutcome::Exceeded(limit));
         }
         let identity = candidate.value().identity();
+        // A field path augments the exact candidate with object-identity
+        // evidence, but it does not establish a new receiver category or
+        // change the classification of any existing candidate.
+        if matches!(identity, AbstractObjectIdentity::FieldPath { .. }) {
+            continue;
+        }
         if !identities.contains(&identity) {
             identities.push(identity);
         }
@@ -3186,7 +3316,9 @@ fn project_receiver_values(
             | AbstractObjectIdentity::TypeSummary(_)
             | AbstractObjectIdentity::ModuleObject(_)
             | AbstractObjectIdentity::External(_) => nominal_instance = true,
-            AbstractObjectIdentity::RuntimeObject(_) => {}
+            AbstractObjectIdentity::CallSubstitution { .. } => nominal_instance = true,
+            AbstractObjectIdentity::FieldPath { .. } | AbstractObjectIdentity::RuntimeObject(_) => {
+            }
         }
     }
     let static_reference = matches!(
@@ -3544,56 +3676,32 @@ fn java_definition_at(
     budget: ReceiverAnalysisBudget,
     cancellation: Option<&CancellationToken>,
 ) -> BoundedResolution<DefinitionLookupOutcome> {
-    if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return BoundedResolution::Cancelled {
-            work: ReceiverAnalysisWork::default(),
-        };
-    }
-    if budget.max_scope_nodes == 0 {
-        return BoundedResolution::Exceeded {
-            work: ReceiverAnalysisWork::default(),
-            limit: ReceiverBudgetLimit::ScopeNodes,
-        };
-    }
-    let preprocessing_work = ReceiverAnalysisWork {
-        scope_nodes: 1,
-        ..ReceiverAnalysisWork::default()
-    };
-    let Some(site) = java_reference_site(
+    java_resolution_outcome_at(
+        definitions,
         file,
-        input.source,
-        input.line_starts,
-        input.tree.root_node(),
+        input,
         node,
-    ) else {
-        return BoundedResolution::Complete {
-            value: DefinitionLookupOutcome {
-                modeled_definitions: Vec::new(),
-                status: DefinitionLookupStatus::InvalidLocation,
-                reference: None,
-                definitions: Vec::new(),
-                lexical_definition: None,
-                diagnostics: Vec::new(),
-            },
-            work: preprocessing_work,
-        };
-    };
-    if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return BoundedResolution::Cancelled {
-            work: preprocessing_work,
-        };
-    }
-    let mut compatibility_budget = budget;
-    compatibility_budget.max_scope_nodes -= 1;
-    let session = JavaResolutionSession::bounded(definitions, compatibility_budget, cancellation);
-    prepend_java_preprocessing_work(resolve_java_bounded(
-        analyzer,
-        &session,
-        file,
-        input.source,
-        Some(input.tree),
-        &site,
-    ))
+        budget,
+        cancellation,
+        DefinitionLookupOutcome {
+            modeled_definitions: Vec::new(),
+            status: DefinitionLookupStatus::InvalidLocation,
+            reference: None,
+            definitions: Vec::new(),
+            lexical_definition: None,
+            diagnostics: Vec::new(),
+        },
+        |session, site| {
+            resolve_java_bounded(
+                analyzer,
+                session,
+                file,
+                input.source,
+                Some(input.tree),
+                site,
+            )
+        },
+    )
 }
 
 fn java_type_outcome_at(
@@ -3605,6 +3713,47 @@ fn java_type_outcome_at(
     budget: ReceiverAnalysisBudget,
     cancellation: Option<&CancellationToken>,
 ) -> BoundedResolution<TypeLookupOutcome> {
+    java_resolution_outcome_at(
+        definitions,
+        file,
+        input,
+        node,
+        budget,
+        cancellation,
+        TypeLookupOutcome {
+            status: TypeLookupStatus::InvalidLocation,
+            reference: None,
+            types: Vec::new(),
+            diagnostics: Vec::new(),
+            target_kind: TypeLookupTargetKind::ValueExpression,
+        },
+        |session, site| {
+            resolve_java_type_bounded(
+                analyzer,
+                session,
+                file,
+                input.source,
+                Some(input.tree),
+                site,
+            )
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn java_resolution_outcome_at<T>(
+    definitions: &AnalyzerDefinitionLookup<'_>,
+    file: &ProjectFile,
+    input: JavaReceiverResolutionInput<'_>,
+    node: Node<'_>,
+    budget: ReceiverAnalysisBudget,
+    cancellation: Option<&CancellationToken>,
+    invalid_location: T,
+    resolve: impl FnOnce(
+        &JavaResolutionSession<'_>,
+        &crate::analyzer::usages::reference_site::ResolvedReferenceSite,
+    ) -> BoundedResolution<T>,
+) -> BoundedResolution<T> {
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
         return BoundedResolution::Cancelled {
             work: ReceiverAnalysisWork::default(),
@@ -3628,13 +3777,7 @@ fn java_type_outcome_at(
         node,
     ) else {
         return BoundedResolution::Complete {
-            value: TypeLookupOutcome {
-                status: TypeLookupStatus::InvalidLocation,
-                reference: None,
-                types: Vec::new(),
-                diagnostics: Vec::new(),
-                target_kind: TypeLookupTargetKind::ValueExpression,
-            },
+            value: invalid_location,
             work: preprocessing_work,
         };
     };
@@ -3646,14 +3789,7 @@ fn java_type_outcome_at(
     let mut compatibility_budget = budget;
     compatibility_budget.max_scope_nodes -= 1;
     let session = JavaResolutionSession::bounded(definitions, compatibility_budget, cancellation);
-    prepend_java_preprocessing_work(resolve_java_type_bounded(
-        analyzer,
-        &session,
-        file,
-        input.source,
-        Some(input.tree),
-        &site,
-    ))
+    prepend_java_preprocessing_work(resolve(&session, &site))
 }
 
 fn prepend_java_preprocessing_work<T>(resolution: BoundedResolution<T>) -> BoundedResolution<T> {
@@ -4133,17 +4269,9 @@ fn java_unknown_report(
     source: &str,
     member_name: Option<String>,
 ) -> ReceiverQueryReport {
-    let analysis = match operation {
-        ReceiverQueryOperation::MemberTargets => {
-            ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::Unknown)
-        }
-        ReceiverQueryOperation::ReceiverTargets | ReceiverQueryOperation::PointsTo => {
-            ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::Unknown)
-        }
-    };
-    ReceiverQueryReport {
+    unknown_report(
         operation,
-        site: site(
+        site(
             file,
             Language::Java,
             node_range(node),
@@ -4151,12 +4279,9 @@ fn java_unknown_report(
             node.kind(),
             member_name,
         ),
-        analysis,
-        member_range: None,
-        work: ReceiverAnalysisWork::default(),
-        candidates_truncated: false,
-        semantic_unsupported: None,
-    }
+        ReceiverAnalysisWork::default(),
+        false,
+    )
 }
 
 fn budget_report(
@@ -4185,6 +4310,7 @@ fn budget_report(
         work,
         candidates_truncated: false,
         semantic_unsupported: None,
+        points_to: None,
     }
 }
 
@@ -4210,6 +4336,7 @@ fn unknown_report(
         work,
         candidates_truncated,
         semantic_unsupported: None,
+        points_to: None,
     }
 }
 
@@ -4246,37 +4373,39 @@ fn java_receiver_at_site<'tree>(
 }
 
 fn java_smallest_named_node_covering<'tree>(
-    mut node: Node<'tree>,
+    node: Node<'tree>,
     start: usize,
     end: usize,
     cancellation: Option<&CancellationToken>,
     ledger: &mut ReceiverWorkLedger,
 ) -> Result<CompatibilityOutcome<Option<Node<'tree>>>, ReceiverQueryError> {
-    check_cancelled(cancellation)?;
-    if let Err(limit) = charge_scope_step(ledger) {
+    let mut cancellation_error = None;
+    let mut exceeded_limit = None;
+    let selected = brokk_bifrost_core::analyzer::usages::reference_site::smallest_named_node_covering_with_scope(
+        node,
+        start,
+        end,
+        || {
+            if let Err(error) = check_cancelled(cancellation) {
+                cancellation_error = Some(error);
+                return false;
+            }
+            match charge_scope_step(ledger) {
+                Ok(()) => true,
+                Err(limit) => {
+                    exceeded_limit = Some(limit);
+                    false
+                }
+            }
+        },
+    );
+    if let Some(error) = cancellation_error {
+        return Err(error);
+    }
+    if let Some(limit) = exceeded_limit {
         return Ok(CompatibilityOutcome::Exceeded(limit));
     }
-    if node.end_byte() < end || node.start_byte() > start {
-        return Ok(CompatibilityOutcome::Complete(None));
-    }
-    loop {
-        let mut cursor = node.walk();
-        let mut containing_child = None;
-        for child in node.named_children(&mut cursor) {
-            check_cancelled(cancellation)?;
-            if let Err(limit) = charge_scope_step(ledger) {
-                return Ok(CompatibilityOutcome::Exceeded(limit));
-            }
-            if child.start_byte() <= start && child.end_byte() >= end {
-                containing_child = Some(child);
-                break;
-            }
-        }
-        match containing_child {
-            Some(child) => node = child,
-            None => return Ok(CompatibilityOutcome::Complete(Some(node))),
-        }
-    }
+    Ok(CompatibilityOutcome::Complete(selected))
 }
 
 fn java_member_node_at_site<'tree>(
@@ -4321,6 +4450,7 @@ fn values_report(
         work: analysis.work,
         candidates_truncated: analysis.candidates_truncated,
         semantic_unsupported: None,
+        points_to: None,
     }
 }
 
@@ -4358,6 +4488,7 @@ fn unsupported_report(
         work: ReceiverAnalysisWork::default(),
         candidates_truncated: false,
         semantic_unsupported: None,
+        points_to: None,
     }
 }
 
@@ -4382,16 +4513,38 @@ fn structural_reference_site(
     source: &str,
     range: Range,
 ) -> ResolvedReferenceSite {
-    ResolvedReferenceSite {
-        path: rel_path_string(file),
-        text: source
+    crate::analyzer::usages::common::build_reference_site(
+        rel_path_string(file),
+        source
             .get(range.start_byte..range.end_byte)
             .unwrap_or_default()
-            .to_string(),
+            .to_owned(),
         range,
-        focus_start_byte: range.start_byte,
-        focus_end_byte: range.end_byte,
+        range.start_byte,
+        range.end_byte,
+    )
+}
+
+fn receiver_member_name(
+    language: Language,
+    tree: &Tree,
+    source: &str,
+    range: Range,
+) -> Option<String> {
+    if language == Language::CSharp
+        && let Some(node) = tree
+            .root_node()
+            .named_descendant_for_byte_range(range.start_byte, range.end_byte)
+        && node.kind() == "element_access_expression"
+        && node.start_byte() == range.start_byte
+        && node.end_byte() == range.end_byte
+    {
+        return Some(CSHARP_INDEXER_MEMBER_NAME.to_owned());
     }
+    source
+        .get(range.start_byte..range.end_byte)
+        .filter(|member| !member.is_empty())
+        .map(str::to_owned)
 }
 
 fn site(

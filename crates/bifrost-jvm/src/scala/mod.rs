@@ -10,16 +10,20 @@ pub mod graph;
 pub mod graph_support;
 pub mod imports;
 pub mod language;
+pub mod resolution;
 pub mod source_facts;
 pub mod structural;
 pub mod supertypes;
+mod syntax;
 pub mod test_detection;
 pub mod wildcard_imports;
 
 use brokk_bifrost_core::analyzer::fq_name::{
     FqName, SegmentKind, joined_segments, segment_interner,
 };
+use brokk_bifrost_core::analyzer::model::ScalaExportInfo;
 use brokk_bifrost_core::analyzer::{CodeUnit, Language};
+use brokk_bifrost_core::hash::HashMap;
 
 /// Strip the `$` companion-object spelling out of a Scala fully qualified name.
 pub fn scala_normalize_full_name(fq_name: &str) -> String {
@@ -126,6 +130,37 @@ pub fn scala_simple_type_name(unit: &CodeUnit) -> String {
         .to_string()
 }
 
+/// Group declarations in `package` by their Scala simple type name, preserving
+/// the input order of both groups and units.
+pub fn scala_group_package_types<'a>(
+    package: &str,
+    units: impl IntoIterator<Item = &'a CodeUnit>,
+) -> Vec<(String, Vec<CodeUnit>)> {
+    let mut group_indices = HashMap::default();
+    let mut grouped = Vec::new();
+    for unit in units
+        .into_iter()
+        .filter(|unit| unit.package_name() == package)
+    {
+        let simple_name = scala_simple_type_name(unit);
+        let index = *group_indices.entry(simple_name.clone()).or_insert_with(|| {
+            let index = grouped.len();
+            grouped.push((simple_name.clone(), Vec::new()));
+            index
+        });
+        grouped[index].1.push(unit.clone());
+    }
+    grouped
+}
+
+/// The export facts for one owner, or an empty list when that owner has none.
+pub fn scala_export_infos_for_owner(
+    exports: &HashMap<CodeUnit, Vec<ScalaExportInfo>>,
+    owner: &CodeUnit,
+) -> Vec<ScalaExportInfo> {
+    exports.get(owner).cloned().unwrap_or_default()
+}
+
 /// Whether `name` is a type the Scala standard prelude puts in scope without
 /// an import.
 ///
@@ -202,21 +237,4 @@ pub fn scala_standard_arity_type_name(name: &str) -> bool {
         }
     }
     false
-}
-
-#[cfg(test)]
-mod relational_name_tests {
-    use super::*;
-
-    #[test]
-    fn structured_lookup_canonicalization_matches_the_legacy_spelling() {
-        let interner = segment_interner();
-        let mut name = FqName::new();
-        name.push(interner.intern("chess", SegmentKind::Package));
-        name.push(interner.intern("Tournament", SegmentKind::Companion));
-        let exact = name.display_native(Language::Scala, interner);
-        let structured = scala_normalize_fq_name(&name).display_native(Language::Scala, interner);
-        assert_eq!(structured, scala_normalize_full_name(&exact));
-        assert_eq!(structured, "chess.Tournament");
-    }
 }

@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use brokk_bifrost_test_macros::hardwon;
 use git2::{ObjectType, Oid};
 
 use crate::analyzer::go::GoAdapter;
@@ -171,6 +172,153 @@ fn hydrated_rust_overlay_is_not_an_empty_native_replacement() {
     assert_eq!(content_mounts.len(), 1);
     assert_eq!(content_mounts[0].persisted_relative_path(), "src/lib.rs");
     assert_eq!(content_mounts[0].publication().owner(), &snapshots["rust"]);
+}
+
+#[test]
+#[hardwon(
+    "#4289: an interior self in a bare path produced a root route with a qualifier and panicked lowering"
+)]
+fn rust_interior_path_anchors_gap_without_panicking_workspace_index() {
+    use brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind;
+
+    let source = r#"
+pub mod z { pub struct T; pub struct Other; pub struct Imported; pub fn f() {} }
+pub type G = z::self::self;
+pub type BadSuper = z::super::Other;
+pub type BadCrate = z::crate::Other;
+pub type BadSelfType = z::Self::Other;
+pub fn calls() {
+    z::self::f();
+    let _ = z::super::T;
+    let _ = z::crate::T;
+    let _ = z::Self::T;
+}
+mod outer { pub fn caller() { super::self::target(); } }
+use z::self::Imported as BadUseSelf;
+use z::super::Imported as BadUseSuper;
+use z::crate::Imported as BadUseCrate;
+use z::self as z_alias;
+use z::{self as z_module};
+use z::self::*;
+mod import_self { use super::z::self; }
+pub type LeadingSelf = self::z::T;
+mod first { mod second { pub type LeadingSuper = super::super::z::T; } }
+mod third { pub type SelfSuper = self::super::z::T; }
+"#;
+    let fixture = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"interior-path-anchor\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .file("src/lib.rs", source)
+        .build();
+    let file = fixture.file("src/lib.rs");
+
+    let workspace = fixture.workspace_analyzer(AnalyzerConfig::default());
+    assert!(
+        workspace
+            .analyzer()
+            .declarations(&file)
+            .iter()
+            .any(|declaration| declaration.identifier() == "G"),
+        "workspace indexing should retain the type alias"
+    );
+
+    let analyzer = TreeSitterAnalyzer::new(fixture.project_dyn(), RustAdapter);
+    let parsed = analyzer
+        .fetch_file_state(&file)
+        .expect("indexed Rust file state");
+    let facts = &parsed.resolution_facts;
+    let unsupported_routes = facts
+        .gaps
+        .iter()
+        .filter(|gap| gap.kind == ResolutionGapKind::UnsupportedRoute)
+        .map(|gap| {
+            let site = facts.sites[gap.site.index()];
+            (
+                site.start_byte,
+                site.end_byte,
+                &source[site.start_byte..site.end_byte],
+            )
+        })
+        .collect::<Vec<_>>();
+    let root_routes = facts
+        .root_references
+        .iter()
+        .map(|route| {
+            let site = facts.sites[route.reference.index()];
+            let segments = facts
+                .root_reference_segments
+                .iter()
+                .filter(|segment| segment.reference == route.reference)
+                .map(|segment| {
+                    (
+                        segment.position,
+                        facts.names[segment.name.index()].spelling.as_str(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            (
+                route.reference,
+                site.start_byte,
+                site.end_byte,
+                route.anchor,
+                route.prefix_reference,
+                segments,
+            )
+        })
+        .collect::<Vec<_>>();
+    for malformed in [
+        "z::self::self",
+        "z::super::T",
+        "z::crate::T",
+        "z::Self::T",
+        "z::super::Other",
+        "z::crate::Other",
+        "z::Self::Other",
+        "z::self::f",
+        "z::self::Imported",
+        "z::super::Imported",
+        "z::crate::Imported",
+        "super::self::target",
+    ] {
+        assert!(
+            unsupported_routes
+                .iter()
+                .any(|(_, _, route)| route.contains(malformed)),
+            "missing UnsupportedRoute gap for {malformed}: {unsupported_routes:?}"
+        );
+    }
+    for (start, end, _) in &unsupported_routes {
+        assert!(
+            facts.root_references.iter().all(|route| {
+                let site = facts.sites[route.reference.index()];
+                site.end_byte <= *start || site.start_byte >= *end
+            }),
+            "malformed path emitted a root route: {unsupported_routes:?}; root routes: {root_routes:?}"
+        );
+        assert!(
+            facts.identifiers.iter().all(|identifier| {
+                identifier.qualifier.is_none_or(|_| {
+                    let site = facts.sites[identifier.site.index()];
+                    site.end_byte <= *start || site.start_byte >= *end
+                })
+            }),
+            "malformed path emitted a receiver qualifier: {unsupported_routes:?}"
+        );
+    }
+    assert!(
+        unsupported_routes.iter().all(|(_, _, route)| {
+            !route.contains("use z::{self as z_module}")
+                && !route.contains("use z::self as z_alias")
+                && !route.contains("use z::self::*")
+                && !route.contains("use super::z::self")
+                && !route.contains("super::super::z::T")
+                && !route.contains("self::super::z::T")
+                && !route.contains("self::z::T")
+        }),
+        "valid leading and use-list paths must remain supported: {unsupported_routes:?}"
+    );
 }
 
 #[test]
@@ -970,6 +1118,9 @@ fn producer_analyzes_each_cold_file_once_is_warm_zero_and_file_local_after_chang
     assert_eq!(declaration_names(&incremental), declaration_names(&fresh));
 }
 
+#[brokk_bifrost_test_macros::hardwon(
+    "ed7fac57fe6b: hydrated cache authority rejected an explicit rename counterfactual source"
+)]
 #[test]
 fn explicit_counterfactual_source_supersedes_hydrated_missing_or_incomplete_content() {
     let original = "pub fn target() {}\npub fn caller() { target(); }\n";
@@ -1126,6 +1277,7 @@ fn assert_native_overlay_publication<A: LanguageAdapter>(
     disk_source: &str,
     overlay_source: &str,
     reference_name: &str,
+    target_name: &str,
 ) {
     use crate::analyzer::resolution::{
         LoweredSemanticRole, ResolutionCompletion, SelectedSemanticLocator,
@@ -1235,6 +1387,23 @@ fn assert_native_overlay_publication<A: LanguageAdapter>(
         panic!("overlay reference must remain natively located");
     };
     assert_eq!(answer.binding().targets().len(), 1, "{answer:?}");
+    let target_sites = facts
+        .identifiers
+        .iter()
+        .filter(|identifier| {
+            identifier.role == ResolutionIdentifierRole::Declaration
+                && facts.names[identifier.name.index()].spelling == target_name
+        })
+        .map(|identifier| identifier.site.get())
+        .collect::<Vec<_>>();
+    assert!(
+        answer.binding().targets().iter().all(|target| {
+            target
+                .local_key()
+                .is_some_and(|key| target_sites.contains(&key))
+        }),
+        "expected {target_name} at {target_sites:?}, got {answer:?}"
+    );
     cancellation.cancel();
     assert!(matches!(
         analyzer
@@ -1248,12 +1417,20 @@ fn assert_native_overlay_publication<A: LanguageAdapter>(
 fn hydrated_java_overlays_publish_same_and_changed_native_content() {
     let original =
         "class Sample { static void original() {} static void caller() { original(); } }";
-    assert_native_overlay_publication(JavaAdapter, "Sample.java", original, original, "original");
+    assert_native_overlay_publication(
+        JavaAdapter,
+        "Sample.java",
+        original,
+        original,
+        "original",
+        "original",
+    );
     assert_native_overlay_publication(
         JavaAdapter,
         "Sample.java",
         original,
         "class Sample { static void changed() {} static void caller() { changed(); } }",
+        "changed",
         "changed",
     );
 }
@@ -1262,14 +1439,45 @@ fn hydrated_java_overlays_publish_same_and_changed_native_content() {
 fn hydrated_go_overlays_publish_same_and_changed_native_content() {
     use crate::analyzer::go::GoAdapter;
     let original = "package sample; func original() {}\nfunc caller() { original() }\n";
-    assert_native_overlay_publication(GoAdapter, "sample.go", original, original, "original");
+    assert_native_overlay_publication(
+        GoAdapter,
+        "sample.go",
+        original,
+        original,
+        "original",
+        "original",
+    );
     assert_native_overlay_publication(
         GoAdapter,
         "sample.go",
         original,
         "package sample; func changed() {}\nfunc caller() { changed() }\n",
         "changed",
+        "changed",
     );
+}
+
+#[test]
+fn hydrated_scala_overlays_keep_extractor_roles_after_eviction() {
+    use crate::analyzer::scala::ScalaAdapter;
+    let disk = "object Pick { def unapply(x: Any): Any = x }; object Use { def run(x: Any) = x match { case Pick(a) => a } }";
+    for (source, target) in [
+        (disk, "unapply"),
+        (
+            "object Pick { def unapplySeq(x: Any): Any = x }; object Use { def run(x: Any) = x match { case Pick(a, b) => a } }",
+            "unapplySeq",
+        ),
+        (
+            "object Pick { def unapply(x: Any): Any = x; def unapplySeq(x: Any): Any = x }; object Use { def run(x: Any) = x match { case Pick(a) => a } }",
+            "unapply",
+        ),
+        (
+            "object Pick { def unapply(x: Any): Any = x; def unapplySeq(x: Any): Any = x }; object Use { def run(x: Any) = x match { case Pick(rest*) => rest } }",
+            "unapplySeq",
+        ),
+    ] {
+        assert_native_overlay_publication(ScalaAdapter, "Use.scala", disk, source, "Pick", target);
+    }
 }
 
 #[test]
@@ -1655,7 +1863,10 @@ fn native_java_types_project_intrinsic_descriptors_from_selected_rows() {
         .build();
     let answer = native_type_projection(&java_fixture, JavaAdapter, "Use.java", java);
     {
-        let SelectedNativeTypes::Ready { nominal, intrinsic } = answer.types else {
+        let SelectedNativeTypes::Ready {
+            nominal, intrinsic, ..
+        } = answer.value_types
+        else {
             panic!("primitive type must project without a parser unit");
         };
         assert!(nominal.is_empty());
@@ -1677,7 +1888,7 @@ fn native_java_types_project_intrinsic_descriptors_from_selected_rows() {
 }
 
 #[test]
-fn native_go_type_without_universe_context_preserves_bound_parameter_and_incomplete_type() {
+fn native_go_type_projects_bound_parameter_and_predeclared_type() {
     use crate::analyzer::resolution::ResolutionCompletion;
     use crate::analyzer::store::resolution_operation::SelectedNativeTypes;
     let source = "package sample; func f(target int) int { return target }";
@@ -1696,14 +1907,16 @@ fn native_go_type_without_universe_context_preserves_bound_parameter_and_incompl
         answer.answer.binding().completion(),
         &ResolutionCompletion::Complete
     );
-    assert!(matches!(
-        answer.answer.completion(),
-        ResolutionCompletion::Incomplete(_)
-    ));
-    let SelectedNativeTypes::Ready { nominal, intrinsic } = answer.types else {
-        panic!("empty incomplete frontier must retain its completion");
+    assert_eq!(answer.answer.completion(), &ResolutionCompletion::Complete);
+    let SelectedNativeTypes::Ready {
+        nominal, intrinsic, ..
+    } = answer.value_types
+    else {
+        panic!("the predeclared int type must project from selected Go facts");
     };
-    assert!(nominal.is_empty() && intrinsic.is_empty());
+    assert!(nominal.is_empty());
+    assert_eq!(intrinsic.len(), 1);
+    assert_eq!(intrinsic[0].spelling(), "int");
 }
 
 #[test]
@@ -1731,7 +1944,10 @@ fn native_java_and_go_types_project_nominal_source_identities() {
             go_fixture.file("source.go"),
         ),
     ] {
-        let SelectedNativeTypes::Ready { nominal, intrinsic } = answer.types else {
+        let SelectedNativeTypes::Ready {
+            nominal, intrinsic, ..
+        } = answer.value_types
+        else {
             panic!("nominal type must project to its selected declaration");
         };
         assert!(intrinsic.is_empty());

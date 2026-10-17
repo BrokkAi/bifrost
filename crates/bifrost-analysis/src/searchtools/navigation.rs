@@ -17,31 +17,64 @@ pub struct SearchSymbolsParams {
     pub limit: usize,
 }
 
+#[derive(Clone, Copy)]
+struct BoundedStringListLimits {
+    field: &'static str,
+    item: &'static str,
+    total: &'static str,
+    max_items: usize,
+    max_item_bytes: usize,
+    max_total_bytes: usize,
+}
+
 fn deserialize_search_symbol_patterns<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let patterns = Vec::<String>::deserialize(deserializer)?;
-    if patterns.len() > SEARCH_SYMBOL_MAX_PATTERNS {
+    deserialize_bounded_string_list(
+        deserializer,
+        BoundedStringListLimits {
+            field: "patterns",
+            item: "search pattern",
+            total: "search patterns",
+            max_items: SEARCH_SYMBOL_MAX_PATTERNS,
+            max_item_bytes: SEARCH_SYMBOL_MAX_PATTERN_BYTES,
+            max_total_bytes: SEARCH_SYMBOL_MAX_TOTAL_PATTERN_BYTES,
+        },
+    )
+}
+
+fn deserialize_bounded_string_list<'de, D>(
+    deserializer: D,
+    limits: BoundedStringListLimits,
+) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values = Vec::<String>::deserialize(deserializer)?;
+    if values.len() > limits.max_items {
         return Err(serde::de::Error::custom(format!(
-            "patterns accepts at most {SEARCH_SYMBOL_MAX_PATTERNS} entries"
+            "{} accepts at most {} entries",
+            limits.field, limits.max_items
         )));
     }
     let mut total_bytes = 0usize;
-    for pattern in &patterns {
-        if pattern.len() > SEARCH_SYMBOL_MAX_PATTERN_BYTES {
+    for value in &values {
+        if value.len() > limits.max_item_bytes {
             return Err(serde::de::Error::custom(format!(
-                "each search pattern must be at most {SEARCH_SYMBOL_MAX_PATTERN_BYTES} bytes"
+                "each {} must be at most {} bytes",
+                limits.item, limits.max_item_bytes
             )));
         }
-        total_bytes = total_bytes.saturating_add(pattern.len());
-        if total_bytes > SEARCH_SYMBOL_MAX_TOTAL_PATTERN_BYTES {
+        total_bytes = total_bytes.saturating_add(value.len());
+        if total_bytes > limits.max_total_bytes {
             return Err(serde::de::Error::custom(format!(
-                "search patterns must total at most {SEARCH_SYMBOL_MAX_TOTAL_PATTERN_BYTES} bytes"
+                "{} must total at most {} bytes",
+                limits.total, limits.max_total_bytes
             )));
         }
     }
-    Ok(patterns)
+    Ok(values)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,27 +89,17 @@ pub(super) fn deserialize_symbol_lookup_names<'de, D>(
 where
     D: serde::Deserializer<'de>,
 {
-    let symbols = Vec::<String>::deserialize(deserializer)?;
-    if symbols.len() > SYMBOL_LOOKUP_MAX_SYMBOLS {
-        return Err(serde::de::Error::custom(format!(
-            "symbols accepts at most {SYMBOL_LOOKUP_MAX_SYMBOLS} entries"
-        )));
-    }
-    let mut total_bytes = 0usize;
-    for symbol in &symbols {
-        if symbol.len() > SYMBOL_LOOKUP_MAX_SYMBOL_BYTES {
-            return Err(serde::de::Error::custom(format!(
-                "each symbol must be at most {SYMBOL_LOOKUP_MAX_SYMBOL_BYTES} bytes"
-            )));
-        }
-        total_bytes = total_bytes.saturating_add(symbol.len());
-        if total_bytes > SYMBOL_LOOKUP_MAX_TOTAL_BYTES {
-            return Err(serde::de::Error::custom(format!(
-                "symbols must total at most {SYMBOL_LOOKUP_MAX_TOTAL_BYTES} bytes"
-            )));
-        }
-    }
-    Ok(symbols)
+    deserialize_bounded_string_list(
+        deserializer,
+        BoundedStringListLimits {
+            field: "symbols",
+            item: "symbol",
+            total: "symbols",
+            max_items: SYMBOL_LOOKUP_MAX_SYMBOLS,
+            max_item_bytes: SYMBOL_LOOKUP_MAX_SYMBOL_BYTES,
+            max_total_bytes: SYMBOL_LOOKUP_MAX_TOTAL_BYTES,
+        },
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -156,8 +179,7 @@ pub struct RenameTextEdit {
 /// untyped object. The overlay tree evolves with analyzer semantics, so typing
 /// it here would freeze an internal model into a published wire contract; a
 /// permissive subschema narrows nothing away and can be replaced by a derive
-/// once that surface stabilizes. See the Decision Log in
-/// `.agents/plans/mcp-output-schemas-first-slice.md`.
+/// once that surface stabilizes.
 pub(super) fn semantic_model_overlay_schema(
     _generator: &mut schemars::SchemaGenerator,
 ) -> schemars::Schema {
@@ -212,8 +234,7 @@ pub struct SearchSymbolsResult {
 /// There is no per-pattern breakdown. Which name spelling made a candidate
 /// match is decided inside each language's `search_symbol_candidates`, and
 /// re-deriving it here from `fq_name` alone would produce counts that disagree
-/// with the total. See the Decision Log in
-/// `.agents/plans/searchtools-too-broad-scope-guards.md`.
+/// with the total.
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct TooManySymbolMatches {
     pub total_candidates: usize,
@@ -362,6 +383,13 @@ pub struct DeclarationLookupResult {
     pub query: DefinitionReferenceQuery,
     pub operation: NavigationOperation,
     pub status: String,
+    #[serde(
+        default = "definition_lookup_complete_default",
+        skip_serializing_if = "definition_lookup_complete"
+    )]
+    pub complete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incomplete_reason: Option<DefinitionLookupIncompleteReason>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reference: Option<DefinitionReferenceSite>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -973,6 +1001,8 @@ pub fn get_declarations_by_location_with_cancellation(
             query: result.query,
             operation: result.operation,
             status: result.status,
+            complete: result.complete,
+            incomplete_reason: result.incomplete_reason,
             reference: result.reference,
             declarations: result.definitions,
             diagnostics: result.diagnostics,
@@ -1471,16 +1501,13 @@ pub(super) fn render_rename_symbol_result(
                     .get(edit.start_byte..edit.end_byte)
                     .unwrap_or_default()
                     .to_string();
-                let (start_line, start_column) = crate::symbol_rename::line_column_for_byte_offset(
+                let (start_line, start_column) = crate::text_utils::line_column_for_offset(
                     &source,
                     &line_starts,
                     edit.start_byte,
                 );
-                let (end_line, end_column) = crate::symbol_rename::line_column_for_byte_offset(
-                    &source,
-                    &line_starts,
-                    edit.end_byte,
-                );
+                let (end_line, end_column) =
+                    crate::text_utils::line_column_for_offset(&source, &line_starts, edit.end_byte);
                 RenameTextEdit {
                     old_text,
                     start_line,
@@ -1595,6 +1622,35 @@ fn attach_generated_member_provenance(
     }
 }
 
+/// Whether an incomplete binding stopped at an unexpanded attribute or derive.
+///
+/// A Rust attribute or derive generates members the index cannot see, so a
+/// lookup that depends on one of them is incomplete rather than absent: the
+/// analyzer keeps it open and names the generated surface in a
+/// `GeneratedItemSurface` diagnostic (#5205), which is the only place that
+/// diagnostic kind is minted.
+///
+/// That is exactly the case a reviewed model can answer, because its rule
+/// declares the member the expansion produces. A generated getset getter is
+/// the model's definition to give, so the overlay lookup below must still run
+/// for this shape even though the analyzer reported the binding incomplete.
+///
+/// Every other terminal status keeps the existing gate. A cancelled or
+/// budget-exceeded lookup examined nothing to match against, and an incomplete
+/// binding with no generated surface to explain it already says, in its own
+/// reasons, why nothing can resolve it.
+fn stopped_at_generated_item_surface(
+    outcome: &crate::analyzer::usages::get_definition::NavigationLookupOutcome,
+) -> bool {
+    matches!(
+        outcome.status,
+        crate::analyzer::usages::get_definition::DefinitionLookupStatus::Incomplete
+    ) && outcome
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.kind == "GeneratedItemSurface")
+}
+
 pub(super) fn render_definition_lookup(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
@@ -1611,6 +1667,11 @@ pub(super) fn render_definition_lookup(
             | crate::analyzer::usages::get_definition::DefinitionLookupStatus::Cancelled
             | crate::analyzer::usages::get_definition::DefinitionLookupStatus::ExceededBudget(_)
     );
+    // A generated item surface is the one terminal shape a reviewed model can
+    // still answer, so the overlay lookup stays reachable for it; see
+    // `stopped_at_generated_item_surface`.
+    let overlay_lookup_allowed =
+        !terminal_incomplete || stopped_at_generated_item_surface(&outcome);
     let mut status = if operation == NavigationOperation::Declaration
         && outcome.status
             == crate::analyzer::usages::get_definition::DefinitionLookupStatus::NoDefinition
@@ -1679,7 +1740,7 @@ pub(super) fn render_definition_lookup(
         {
             attach_generated_member_provenance(&overlay, target, &mut definitions);
         }
-        if definitions.is_empty() && !terminal_incomplete {
+        if definitions.is_empty() && overlay_lookup_allowed {
             if let Some(target) = reference_target.as_deref() {
                 let member_name = target
                     .rsplit(['.', '#', ':'])
@@ -1706,7 +1767,7 @@ pub(super) fn render_definition_lookup(
                     .flatten();
                 let mut matched = receiver_owner
                     .as_deref()
-                    .map(|owner| modeled_member_named(&overlay, owner, member_name))
+                    .map(|owner| overlay.members_named(owner, member_name))
                     .filter(|matched| !matched.records.is_empty())
                     .or_else(|| {
                         imported_model_target
@@ -1950,6 +2011,7 @@ pub(super) fn render_definition_lookup(
             },
         );
     }
+    diagnostics.extend(unclosed_construct_diagnostic(&definitions));
     let (mut complete, incomplete_reason) = definition_result_completion(&status, &diagnostics);
     if terminal_incomplete {
         complete = false;
@@ -1969,33 +2031,6 @@ pub(super) fn render_definition_lookup(
     }
 }
 
-fn modeled_member_named<'a>(
-    overlay: &'a crate::analyzer::semantic_model::SemanticModelOverlay,
-    owner: &str,
-    name: &str,
-) -> crate::analyzer::semantic_model::SemanticModelOverlayMatch<
-    'a,
-    crate::analyzer::semantic_model::SemanticModelSymbol,
-> {
-    let records = overlay
-        .members_of(owner)
-        .records
-        .into_iter()
-        .filter(|symbol| symbol.name == name)
-        .collect::<Vec<_>>();
-    let disposition = if records.is_empty() {
-        crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Empty
-    } else if records.len() == 1 && !records[0].provenance.ambiguous {
-        crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
-    } else {
-        crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Conflict
-    };
-    crate::analyzer::semantic_model::SemanticModelOverlayMatch {
-        records,
-        disposition,
-    }
-}
-
 fn structured_receiver_owner(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
@@ -2012,10 +2047,9 @@ fn structured_receiver_owner(
                 .iter()
                 .enumerate()
                 .filter(|(_, node)| {
-                    matches!(
-                        node.kind,
-                        NormalizedKind::Call | NormalizedKind::FieldAccess
-                    ) && node.range.start_byte <= focus
+                    (node.kind.satisfies(NormalizedKind::Call)
+                        || node.kind == NormalizedKind::FieldAccess)
+                        && node.range.start_byte <= focus
                         && focus < node.range.end_byte
                 })
                 .min_by_key(|(_, node)| node.range.end_byte - node.range.start_byte)
@@ -2035,16 +2069,21 @@ fn structured_receiver_owner(
                     }
                     let role = if node.construct.as_deref() == Some("java_object_creation") {
                         Role::Callee
-                    } else if node.kind == NormalizedKind::Call {
+                    } else if node.kind.satisfies(NormalizedKind::Call) {
                         Role::Receiver
                     } else {
                         Role::Object
                     };
-                    let receiver_byte = facts.role_targets(node_id, role).next()?.span.start_byte;
-                    Some(facts.line_column_of_byte(receiver_byte))
+                    let receiver_span = facts.role_targets(node_id, role).next()?.span;
+                    let receiver_is_reference =
+                        receiver_span.start_byte <= focus && focus < receiver_span.end_byte;
+                    Some((
+                        facts.line_column_of_byte(receiver_span.start_byte),
+                        receiver_is_reference,
+                    ))
                 })
         })?;
-    let (line, column) = receiver;
+    let ((line, column), receiver_is_reference) = receiver;
     let result = get_type_by_location(
         analyzer,
         GetTypeParams {
@@ -2069,6 +2108,12 @@ fn structured_receiver_owner(
             return definition.fqn.clone();
         }
         return Some(candidate.fqn.clone());
+    }
+    // An object creation's owner is its own constructor type, so the receiver
+    // span is the reference being rendered. A definition lookup there is the
+    // lookup in progress and would re-enter this function without end.
+    if receiver_is_reference {
+        return None;
     }
     let definition = get_definitions_by_location(
         analyzer,
@@ -2105,7 +2150,7 @@ fn structured_reference_call_arity(
                 .iter()
                 .enumerate()
                 .filter(|(_, node)| {
-                    node.kind == NormalizedKind::Call
+                    node.kind.satisfies(NormalizedKind::Call)
                         && node.name.is_some_and(|name| {
                             name.start_byte < reference_range.end_byte
                                 && reference_range.start_byte < name.end_byte
@@ -2146,17 +2191,18 @@ fn structured_reference_kind(
                 .nodes()
                 .iter()
                 .filter(|node| {
-                    matches!(
-                        node.kind,
-                        NormalizedKind::Call | NormalizedKind::FieldAccess
-                    ) && node.name.is_some_and(|name| {
-                        name.start_byte < reference_range.end_byte
-                            && reference_range.start_byte < name.end_byte
-                    }) && node.range.start_byte < reference_range.end_byte
+                    (node.kind.satisfies(NormalizedKind::Call)
+                        || node.kind == NormalizedKind::FieldAccess)
+                        && node.name.is_some_and(|name| {
+                            name.start_byte < reference_range.end_byte
+                                && reference_range.start_byte < name.end_byte
+                        })
+                        && node.range.start_byte < reference_range.end_byte
                         && reference_range.start_byte < node.range.end_byte
                 })
                 .min_by_key(|node| {
-                    let named_call = node.kind == NormalizedKind::Call && node.name.is_some();
+                    let named_call =
+                        node.kind.satisfies(NormalizedKind::Call) && node.name.is_some();
                     (!named_call, node.range.end_byte - node.range.start_byte)
                 })
                 .map(|node| node.kind)
@@ -2169,34 +2215,8 @@ fn explicit_import_model_target(
     file: &ProjectFile,
     reference: &crate::analyzer::usages::reference_site::ResolvedReferenceSite,
 ) -> Option<String> {
-    let language = language_for_file(file);
-    if !matches!(language, Language::Java | Language::Scala) {
-        return None;
-    }
-    let reference_name = symbol_selector_leaf(language, &reference.text)?;
-    let provider = analyzer.import_analysis_provider_for_file(file)?;
-    let mut targets = provider
-        .import_info_of(token, file)
-        .into_iter()
-        .filter(|import| {
-            !import.is_wildcard
-                && (import.local_name() == Some(&reference_name)
-                    || import.path.as_ref().and_then(|path| path.segments.last())
-                        == Some(&reference_name))
-        })
-        .filter_map(|import| import.path)
-        .filter(|path| {
-            path.declaration_start_byte <= reference.focus_start_byte
-                && path.lexical_scopes.iter().all(|scope| {
-                    scope.start_byte <= reference.focus_start_byte
-                        && reference.focus_start_byte < scope.end_byte
-                })
-        })
-        .map(|path| path.render_segments("."))
-        .collect::<Vec<_>>();
-    targets.sort();
-    targets.dedup();
-    (targets.len() == 1).then(|| targets.pop().unwrap())
+    crate::analyzer::languages::language_support(language_for_file(file))?
+        .explicit_import_model_target(analyzer, token, file, reference)
 }
 
 pub(super) fn render_type_lookup(

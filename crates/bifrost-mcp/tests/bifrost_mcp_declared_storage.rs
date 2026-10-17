@@ -17,9 +17,8 @@
 #[allow(unused_imports)]
 mod common;
 
-use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::Child;
 
 use brokk_bifrost_analysis::Language;
 use brokk_bifrost_mcp::benchmark_api::{
@@ -39,99 +38,30 @@ fn fixture_file(root: &Path, relative: &str) -> String {
     String::from_utf8(bytes).expect("fixture file is UTF-8")
 }
 
-fn mcp_server_binary() -> &'static str {
-    option_env!("CARGO_BIN_EXE_bifrost-mcp-test-server")
-        .or(option_env!("CARGO_BIN_EXE_bifrost"))
-        .expect("Cargo did not provide an MCP server binary")
-}
-
 fn spawn_server(root: &Path) -> Child {
-    Command::new(mcp_server_binary())
-        .env(
-            MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV,
-            BENCHMARK_MCP_REQUEST_BUDGET_SECS.to_string(),
-        )
-        .arg("--root")
-        .arg(root)
-        .arg("--mcp")
-        .arg("extended")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn the bifrost MCP server")
-}
-
-fn write_line(stdin: &mut impl Write, payload: Value) {
-    writeln!(stdin, "{payload}").expect("write request");
-    stdin.flush().expect("flush request");
-}
-
-fn read_line(reader: &mut impl BufRead, stderr: &mut impl Read) -> Value {
-    let mut line = String::new();
-    let bytes = reader.read_line(&mut line).expect("read response");
-    if bytes == 0 {
-        let mut buffer = String::new();
-        let _ = stderr.read_to_string(&mut buffer);
-        panic!("server closed before responding; stderr:\n{buffer}");
-    }
-    serde_json::from_str(&line).expect("valid JSON response")
-}
-
-fn round_trip(
-    stdin: &mut impl Write,
-    reader: &mut impl BufRead,
-    stderr: &mut impl Read,
-    payload: Value,
-) -> Value {
-    write_line(stdin, payload);
-    read_line(reader, stderr)
+    let request_budget = BENCHMARK_MCP_REQUEST_BUDGET_SECS.to_string();
+    common::mcp_server::spawn_mcp_server(
+        common::mcp_server::mcp_server_binary(),
+        root,
+        "extended",
+        &[],
+        &[(MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV, &request_budget)],
+    )
+    .expect("spawn the bifrost MCP server")
 }
 
 fn run_policies_over_mcp(project_root: &Path, policy_paths: &[&str]) -> Value {
     let mut child = spawn_server(project_root);
-    let mut stdin = child.stdin.take().expect("stdin");
-    let stdout = child.stdout.take().expect("stdout");
-    let mut stderr = child.stderr.take().expect("stderr");
-    let mut reader = BufReader::new(stdout);
-
-    let initialize = round_trip(
-        &mut stdin,
-        &mut reader,
-        &mut stderr,
+    let response = common::mcp_wire::call_mcp_tool(
+        &mut child,
+        "declared-storage-3386",
+        0,
+        1,
+        "run_policy",
         json!({
-            "jsonrpc": "2.0",
-            "id": 0,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2025-11-25",
-                "capabilities": {},
-                "clientInfo": { "name": "declared-storage-3386", "version": "0.1.0" }
-            }
-        }),
-    );
-    assert_eq!(initialize["result"]["protocolVersion"], "2025-11-25");
-    write_line(
-        &mut stdin,
-        json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
-    );
-
-    let response = round_trip(
-        &mut stdin,
-        &mut reader,
-        &mut stderr,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {
-                "name": "run_policy",
-                "arguments": {
-                    "policy_files": policy_paths,
-                    "evaluation_date": "2026-09-16",
-                    "fail_on": "never"
-                }
-            }
+            "policy_files": policy_paths,
+            "evaluation_date": "2026-09-16",
+            "fail_on": "never"
         }),
     );
     let _ = child.kill();
@@ -166,17 +96,7 @@ fn build_project() -> common::BuiltInlineTestProject {
 }
 
 fn run_object<'a>(report: &'a Value, policy_id: &str) -> &'a Value {
-    let runs = report["runs"].as_array().expect("policy runs");
-    let matching = runs
-        .iter()
-        .filter(|run| run["policy_id"] == policy_id)
-        .collect::<Vec<_>>();
-    assert_eq!(
-        matching.len(),
-        1,
-        "expected exactly one run for {policy_id}: {report}"
-    );
-    matching[0]
+    common::policy_report::run_for_policy_id(report, policy_id)
 }
 
 #[test]
@@ -185,7 +105,7 @@ fn mcp_run_policy_reports_the_stored_flow_and_the_missing_validators() {
     let structured =
         run_policies_over_mcp(project.root(), &[TAINT_POLICY_PATH, VALIDATION_POLICY_PATH]);
     let report = &structured["report"];
-    assert_eq!(report["schema_version"], 5, "{report}");
+    assert_eq!(report["schema_version"], 6, "{report}");
 
     let taint = run_object(report, TAINT_POLICY_ID);
     assert_eq!(taint["completion"]["type"], "inconclusive", "{taint}");

@@ -15,12 +15,12 @@ use std::fmt;
 use brokk_bifrost_rql::query::{QueryStep, QueryStepOp};
 use brokk_bifrost_rql::structural::search::DetailedCodeQueryDomain;
 use brokk_bifrost_rql::structural::{
-    CodeQueryEnumDomain, CodeQueryRowScalarRef, CodeQueryRowScalarType,
+    CodeQueryEnumDomain, CodeQueryRowField, CodeQueryRowScalarRef, CodeQueryRowScalarType,
 };
 
 use crate::definition::{
-    AssertCardinality, PolicyAssertId, RelationalAssertionLimits, RowAggregateName, RowBindingName,
-    RowGroupName, RowLiteral,
+    AssertCardinality, PolicyAssertId, RelationalAssertionLimits, RowAggregateName, RowAggregateOp,
+    RowBindingName, RowGroupName, RowLiteral,
 };
 
 /// One owned scalar read from a CodeQuery row.
@@ -32,6 +32,7 @@ pub enum RowScalar {
     StableId(String),
     String(String),
     StringList(Vec<String>),
+    IntegerList(Vec<u64>),
     Integer(u64),
     Boolean(bool),
     ConstrainedEnum(String),
@@ -45,11 +46,23 @@ impl RowScalar {
             Self::StableId(_) => CodeQueryRowScalarType::StableId,
             Self::String(_) => CodeQueryRowScalarType::String,
             Self::StringList(_) => CodeQueryRowScalarType::StringList,
+            Self::IntegerList(_) => CodeQueryRowScalarType::IntegerList,
             Self::Integer(_) => CodeQueryRowScalarType::Integer,
             Self::Boolean(_) => CodeQueryRowScalarType::Boolean,
             Self::ConstrainedEnum(_) => CodeQueryRowScalarType::ConstrainedEnum,
             Self::DeclarationIdentity(_) => CodeQueryRowScalarType::DeclarationIdentity,
         }
+    }
+}
+
+pub(super) const fn row_literal_type(literal: &RowLiteral) -> CodeQueryRowScalarType {
+    match literal {
+        RowLiteral::String(_) => CodeQueryRowScalarType::String,
+        RowLiteral::StringList(_) => CodeQueryRowScalarType::StringList,
+        RowLiteral::IntegerList(_) => CodeQueryRowScalarType::IntegerList,
+        RowLiteral::Integer(_) => CodeQueryRowScalarType::Integer,
+        RowLiteral::Boolean(_) => CodeQueryRowScalarType::Boolean,
+        RowLiteral::ConstrainedEnum(_) => CodeQueryRowScalarType::ConstrainedEnum,
     }
 }
 
@@ -65,6 +78,7 @@ impl fmt::Display for RowScalar {
             Self::Integer(value) => write!(formatter, "{value}"),
             Self::Boolean(value) => write!(formatter, "{value}"),
             Self::StringList(value) => write!(formatter, "{value:?}"),
+            Self::IntegerList(value) => write!(formatter, "{value:?}"),
         }
     }
 }
@@ -75,6 +89,7 @@ impl From<CodeQueryRowScalarRef<'_>> for RowScalar {
             CodeQueryRowScalarRef::StableId(value) => Self::StableId(value.to_string()),
             CodeQueryRowScalarRef::String(value) => Self::String(value.to_string()),
             CodeQueryRowScalarRef::StringList(value) => Self::StringList(value.to_vec()),
+            CodeQueryRowScalarRef::IntegerList(value) => Self::IntegerList(value.to_vec()),
             CodeQueryRowScalarRef::Integer(value) => Self::Integer(value),
             CodeQueryRowScalarRef::Boolean(value) => Self::Boolean(value),
             CodeQueryRowScalarRef::ConstrainedEnum(value) => {
@@ -174,11 +189,11 @@ impl IrSchema {
     }
 
     pub fn index_of(&self, column: &IrColumn) -> Option<usize> {
-        self.fields.iter().position(|field| &field.column == column)
+        index_of_column(self.fields.iter().map(|field| &field.column), column)
     }
 
     pub fn field(&self, column: &IrColumn) -> Option<&IrField> {
-        self.fields.iter().find(|field| &field.column == column)
+        self.fields.get(self.index_of(column)?)
     }
 
     /// Every field name the named binding publishes here, in schema order.
@@ -201,6 +216,15 @@ impl IrSchema {
     pub fn is_empty(&self) -> bool {
         self.fields.is_empty()
     }
+}
+
+pub(super) fn index_of_column<'a>(
+    columns: impl IntoIterator<Item = &'a IrColumn>,
+    column: &IrColumn,
+) -> Option<usize> {
+    columns
+        .into_iter()
+        .position(|candidate| candidate == column)
 }
 
 /// The right-hand side of a comparison: another column of the same relation, or
@@ -400,15 +424,15 @@ pub enum IrAggregateOp {
 impl IrAggregateOp {
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Count => "count",
-            Self::CountDistinct => "count-distinct",
-            Self::Min => "min",
-            Self::Max => "max",
-            Self::Any => "any",
-            Self::All => "all",
-            Self::OrderedEqual => "ordered-equal",
-            Self::SetEqual => "set-equal",
-            Self::Subset => "subset",
+            Self::Count => RowAggregateOp::Count.label(),
+            Self::CountDistinct => RowAggregateOp::CountDistinct.label(),
+            Self::Min => RowAggregateOp::Min.label(),
+            Self::Max => RowAggregateOp::Max.label(),
+            Self::Any => RowAggregateOp::Any.label(),
+            Self::All => RowAggregateOp::All.label(),
+            Self::OrderedEqual => RowAggregateOp::OrderedEqual.label(),
+            Self::SetEqual => RowAggregateOp::SetEqual.label(),
+            Self::Subset => RowAggregateOp::Subset.label(),
         }
     }
 
@@ -604,6 +628,148 @@ impl RelationalPlanIr {
             _ => None,
         }
     }
+
+    /// Whether every finding a complete row set would add is anchored at a
+    /// row this evaluation did not see (#5451).
+    ///
+    /// True when the plan joins nothing, and every assertion bounds an
+    /// unfiltered `count` above by zero over a group of source rows. Every
+    /// group the evaluation observed then holds a row and is already a
+    /// violation. An unseen row either joins a reported group, where it moves
+    /// the finding only by becoming the group's first row, or forms a group
+    /// of unseen rows. Either way the finding it adds is anchored at an
+    /// unseen row, so a reader who knows the files of the unseen rows knows
+    /// every file such a finding can be in.
+    pub fn anchors_missed_findings_at_missed_rows(&self) -> bool {
+        let joins = self
+            .relations
+            .iter()
+            .any(|relation| matches!(relation.op, IrRelationOp::Join { .. }));
+        !joins
+            && self.assertions.iter().all(|assertion| {
+                let Some(IrRelationOp::Group {
+                    input, aggregates, ..
+                }) = self
+                    .relation(assertion.relation)
+                    .map(|relation| &relation.op)
+                else {
+                    return false;
+                };
+                matches!(
+                    assertion.cardinality,
+                    AssertCardinality::Exactly(0) | AssertCardinality::AtMost(0)
+                ) && aggregates.iter().any(|aggregate| {
+                    aggregate.output == assertion.column
+                        && aggregate.op == IrAggregateOp::Count
+                        && aggregate.predicates.is_empty()
+                }) && self.is_narrowed_source(*input)
+            })
+    }
+
+    /// Whether a relation is one binding's rows, narrowed or reshaped only by
+    /// row-local operators, so each of its rows is one source row.
+    fn is_narrowed_source(&self, mut id: IrRelationId) -> bool {
+        loop {
+            match self.relation(id).map(|relation| &relation.op) {
+                Some(IrRelationOp::Source { .. }) => return true,
+                Some(IrRelationOp::Filter { input, .. } | IrRelationOp::Project { input, .. }) => {
+                    id = *input;
+                }
+                Some(IrRelationOp::Join { .. } | IrRelationOp::Group { .. }) | None => {
+                    return false;
+                }
+            }
+        }
+    }
+
+    /// The occurrence target fields read from one source binding by this
+    /// relational plan. The walk follows typed operator inputs, so new
+    /// relational operators must state which columns they read here.
+    /// Edge-parity assertions read targets from their dedicated edge rows, not
+    /// from an occurrence row, and therefore do not appear in this demand.
+    pub fn occurrence_target_fields_for_source(&self, source: &str) -> Vec<&'static str> {
+        let mut read = [false; 3];
+        for relation in &self.relations {
+            match &relation.op {
+                IrRelationOp::Source { .. } => {}
+                IrRelationOp::Project { columns, .. } => {
+                    for column in columns {
+                        record_occurrence_target_field(source, &column.source, &mut read);
+                    }
+                }
+                IrRelationOp::Filter { predicates, .. } => {
+                    for predicate in predicates {
+                        record_occurrence_target_field(source, predicate.column(), &mut read);
+                        if let IrPredicate::Compare {
+                            right: IrOperand::Column(column),
+                            ..
+                        } = predicate
+                        {
+                            record_occurrence_target_field(source, column, &mut read);
+                        }
+                    }
+                }
+                IrRelationOp::Join { on, .. } => {
+                    for key in on {
+                        record_occurrence_target_field(source, &key.left, &mut read);
+                        record_occurrence_target_field(source, &key.right, &mut read);
+                    }
+                }
+                IrRelationOp::Group { by, aggregates, .. } => {
+                    for column in by {
+                        record_occurrence_target_field(source, column, &mut read);
+                    }
+                    for aggregate in aggregates {
+                        if let Some(column) = &aggregate.value {
+                            record_occurrence_target_field(source, column, &mut read);
+                        }
+                        if let Some(sequences) = &aggregate.sequences {
+                            for column in [
+                                &sequences.left.position,
+                                &sequences.left.value,
+                                &sequences.right.position,
+                                &sequences.right.value,
+                            ] {
+                                record_occurrence_target_field(source, column, &mut read);
+                            }
+                        }
+                        if let Some((left, right)) = &aggregate.sets {
+                            record_occurrence_target_field(source, left, &mut read);
+                            record_occurrence_target_field(source, right, &mut read);
+                        }
+                        for predicate in &aggregate.predicates {
+                            record_occurrence_target_field(source, predicate.column(), &mut read);
+                            if let IrPredicate::Compare {
+                                right: IrOperand::Column(column),
+                                ..
+                            } = predicate
+                            {
+                                record_occurrence_target_field(source, column, &mut read);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        ["target_id", "target_kind", "target_count"]
+            .into_iter()
+            .zip(read)
+            .filter_map(|(field, was_read)| was_read.then_some(field))
+            .collect()
+    }
+}
+
+fn record_occurrence_target_field(source: &str, column: &IrColumn, read: &mut [bool; 3]) {
+    if column.qualifier != source {
+        return;
+    }
+    let index = match column.name.as_str() {
+        "target_id" => 0,
+        "target_kind" => 1,
+        "target_count" => 2,
+        _ => return,
+    };
+    read[index] = true;
 }
 
 /// The RQL expansion steps published by the relation-schema catalog.
@@ -672,17 +838,9 @@ pub fn group_schema(
 
 /// The schema one row domain publishes, namespaced under one binding.
 pub fn domain_schema(qualifier: &str, domain: DetailedCodeQueryDomain) -> IrSchema {
-    IrSchema::new(
-        domain
-            .row_fields()
-            .iter()
-            .map(|field| IrField {
-                column: IrColumn::new(qualifier, field.name),
-                scalar_type: field.scalar_type,
-                nullable: field.nullable,
-                value_domain: field.value_domain,
-            })
-            .collect(),
+    schema_from_row_fields(
+        qualifier,
+        domain.row_fields().iter().map(|field| (field.name, field)),
     )
 }
 
@@ -691,32 +849,25 @@ pub fn query_schema(
     qualifier: &str,
     fields: &[(String, brokk_bifrost_rql::structural::CodeQueryRowField)],
 ) -> IrSchema {
+    schema_from_row_fields(
+        qualifier,
+        fields.iter().map(|(name, field)| (name.as_str(), field)),
+    )
+}
+
+fn schema_from_row_fields<'a>(
+    qualifier: &str,
+    fields: impl IntoIterator<Item = (impl Into<String>, &'a CodeQueryRowField)>,
+) -> IrSchema {
     IrSchema::new(
         fields
-            .iter()
+            .into_iter()
             .map(|(name, field)| IrField {
-                column: IrColumn::new(qualifier, name.clone()),
+                column: IrColumn::new(qualifier, name),
                 scalar_type: field.scalar_type,
                 nullable: field.nullable,
                 value_domain: field.value_domain,
             })
             .collect(),
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The expansion list must not contain duplicate public RQL spellings.
-    #[test]
-    fn every_cataloged_rql_expansion_step_has_a_unique_spelling() {
-        let mut labels = ALL_RQL_RELATION_EXPANSION_STEPS
-            .iter()
-            .map(|step| step.label())
-            .collect::<Vec<_>>();
-        labels.sort_unstable();
-        labels.dedup();
-        assert_eq!(labels.len(), ALL_RQL_RELATION_EXPANSION_STEPS.len());
-    }
 }

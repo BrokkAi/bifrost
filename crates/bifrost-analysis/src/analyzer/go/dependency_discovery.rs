@@ -88,23 +88,9 @@ pub struct GoPackage {
     #[serde(default)]
     pub for_test: String,
     #[serde(default)]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Canonical descriptive test inventory is retained for diagnostics; only selected GoFiles and Imports authorize membership"
-        )
-    )]
     pub test_go_files: Vec<PathBuf>,
     #[serde(default)]
     #[serde(rename = "XTestGoFiles")]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Canonical descriptive test inventory is retained for diagnostics; only selected GoFiles and Imports authorize membership"
-        )
-    )]
     pub x_test_go_files: Vec<PathBuf>,
     #[serde(default)]
     #[cfg_attr(
@@ -374,7 +360,56 @@ fn discover_with_runner(
         cancellation,
     ) {
         Ok(bytes) => bytes,
-        Err(error) => return failed_outcome("go.list_failed", error, cancellation, limits).into(),
+        Err(error) => {
+            let semantic_packs =
+                failed_outcome("go.list_failed", error.clone(), cancellation, limits);
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return semantic_packs.into();
+            }
+            // An unsuccessful root invocation has no per-file selection
+            // authority. Retain its structured failure alongside inventory
+            // placements instead of erasing them with an empty tool profile.
+            let packages = discovery
+                .workspace_patterns
+                .iter()
+                .map(|pattern| GoPackage {
+                    import_path: pattern.clone(),
+                    name: String::new(),
+                    dir: project.root().to_path_buf(),
+                    standard: false,
+                    incomplete: true,
+                    error: Some(GoPackageError {
+                        err: error.clone(),
+                        import_stack: Vec::new(),
+                        pos: String::new(),
+                    }),
+                    module: None,
+                    go_files: Vec::new(),
+                    cgo_files: Vec::new(),
+                    ignored_go_files: Vec::new(),
+                    imports: Vec::new(),
+                    import_map: BTreeMap::new(),
+                    for_test: String::new(),
+                    test_go_files: Vec::new(),
+                    x_test_go_files: Vec::new(),
+                    test_imports: Vec::new(),
+                    x_test_imports: Vec::new(),
+                    deps_errors: Vec::new(),
+                })
+                .collect();
+            return GoDiscoveryOutcome {
+                canonical: Some(GoPackageDiscovery {
+                    packages,
+                    environment: environment.clone(),
+                    goos: goos.to_owned(),
+                    goarch: goarch.to_owned(),
+                    build_tags: discovery.build_tags.clone(),
+                    workspace_patterns: discovery.workspace_patterns.clone(),
+                    vendor,
+                }),
+                semantic_packs,
+            };
+        }
     };
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
         return cancelled_outcome().into();
@@ -486,24 +521,7 @@ fn build_curated_pack_evidence_outcome(
     let mut modules = BTreeMap::new();
     let mut diagnostics = Vec::new();
     for package in packages {
-        if let Some(error) = &package.error {
-            diagnostics.push(error_diagnostic(
-                "go.package_incomplete",
-                Some(package.import_path.clone()),
-                format!(
-                    "Go package {} is incomplete: {}",
-                    package.import_path, error.err
-                ),
-                limits,
-            ));
-        } else if package.incomplete {
-            diagnostics.push(error_diagnostic(
-                "go.package_incomplete",
-                Some(package.import_path.clone()),
-                format!("Go package {} is incomplete", package.import_path),
-                limits,
-            ));
-        }
+        push_package_incompleteness_diagnostic(&package, &mut diagnostics, limits);
         if package.module.as_ref().is_some_and(|module| module.main) {
             continue;
         }
@@ -716,6 +734,31 @@ struct DependencyGroup {
     source_paths: Vec<PathBuf>,
 }
 
+fn push_package_incompleteness_diagnostic(
+    package: &GoPackage,
+    diagnostics: &mut Vec<DependencyPackDiagnostic>,
+    limits: &DependencyPackLimits,
+) {
+    if let Some(error) = &package.error {
+        diagnostics.push(error_diagnostic(
+            "go.package_incomplete",
+            Some(package.import_path.clone()),
+            format!(
+                "Go package {} is incomplete: {}",
+                package.import_path, error.err
+            ),
+            limits,
+        ));
+    } else if package.incomplete {
+        diagnostics.push(error_diagnostic(
+            "go.package_incomplete",
+            Some(package.import_path.clone()),
+            format!("Go package {} is incomplete", package.import_path),
+            limits,
+        ));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_outcome(
     packages: Vec<GoPackage>,
@@ -771,24 +814,7 @@ fn build_outcome(
         if package.module.as_ref().is_some_and(|module| module.main) {
             continue;
         }
-        if let Some(error) = &package.error {
-            diagnostics.push(error_diagnostic(
-                "go.package_incomplete",
-                Some(package.import_path.clone()),
-                format!(
-                    "Go package {} is incomplete: {}",
-                    package.import_path, error.err
-                ),
-                limits,
-            ));
-        } else if package.incomplete {
-            diagnostics.push(error_diagnostic(
-                "go.package_incomplete",
-                Some(package.import_path.clone()),
-                format!("Go package {} is incomplete", package.import_path),
-                limits,
-            ));
-        }
+        push_package_incompleteness_diagnostic(&package, &mut diagnostics, limits);
         if !package.cgo_files.is_empty() {
             diagnostics.push(error_diagnostic(
                 "go.cgo_unsupported",
@@ -1314,20 +1340,7 @@ fn failed_outcome(
 }
 
 fn cancelled_outcome() -> DependencyDiscoveryOutcome {
-    DependencyDiscoveryOutcome {
-        dependencies: Vec::new(),
-        diagnostics: vec![DependencyPackDiagnostic {
-            severity: DependencyPackDiagnosticSeverity::Error,
-            code: "discovery.cancelled".to_owned(),
-            dependency_id: None,
-            location: None,
-            message: "Go dependency discovery was cancelled".to_owned(),
-        }],
-        suppressed_diagnostics: SuppressedDiagnostics::default(),
-        complete: false,
-        cancelled: true,
-        profile: DependencyDiscoveryProfile::default(),
-    }
+    DependencyDiscoveryOutcome::cancelled_with_message("Go dependency discovery was cancelled")
 }
 
 #[cfg(test)]
@@ -1338,6 +1351,7 @@ mod tests {
         GoAnalyzerConfig, GoDependencyDiscoveryConfig, GoDependencyDiscoveryMode,
     };
     use crate::analyzer::{Language, TestProject};
+    use brokk_bifrost_test_macros::hardwon;
     use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::process::Command;
@@ -1563,6 +1577,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("c854959b2829: dropping LOCALAPPDATA or GOCACHE broke Go discovery")]
     fn hardened_environment_preserves_host_go_cache_locations() {
         let env = reviewed_host_environment(|name| match name {
             "LOCALAPPDATA" => Some(OsString::from(r"C:\Users\runner\AppData\Local")),
@@ -1582,6 +1597,177 @@ mod tests {
             Some(&OsString::from(r"D:\go-build"))
         );
         assert!(!env.contains_key(OsStr::new("UNREVIEWED_SECRET")));
+    }
+
+    #[test]
+    fn discovery_reports_cgo_and_package_errors_as_incomplete() {
+        let temporary = tempfile::tempdir().unwrap();
+        let goroot = temporary.path().join("goroot/src/net");
+        std::fs::create_dir_all(&goroot).unwrap();
+        std::fs::write(goroot.join("net.go"), "package net").unwrap();
+        let packages = serde_json::json!({
+            "ImportPath": "net",
+            "Dir": goroot,
+            "Standard": true,
+            "Incomplete": true,
+            "Error": {"Err": "missing local package"},
+            "GoFiles": ["net.go"],
+            "IgnoredGoFiles": ["cgo_unix.go"]
+        })
+        .to_string()
+        .into_bytes();
+        let cgo_packages = serde_json::json!({
+            "ImportPath": "net",
+            "Dir": temporary.path().join("goroot/src/net"),
+            "Standard": true,
+            "GoFiles": ["net.go"],
+            "CgoFiles": ["cgo_unix.go"]
+        })
+        .to_string()
+        .into_bytes();
+        let runner =
+            FakeRunner::with_outputs([environment(temporary.path()), packages, cgo_packages]);
+        let project = TestProject::new(temporary.path(), Language::Go);
+        let result = discover_with_runner(
+            &config(),
+            &project,
+            &DependencyPackLimits::default(),
+            None,
+            &runner,
+        );
+        let primary = result.canonical.unwrap();
+        assert!(primary.packages[0].cgo_files.is_empty());
+        assert_eq!(
+            primary.packages[0].ignored_go_files,
+            [PathBuf::from("cgo_unix.go")]
+        );
+        let outcome = result.semantic_packs;
+        assert!(!outcome.complete);
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "go.package_incomplete")
+        );
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "go.cgo_unsupported")
+        );
+        let invocations = runner.invocations.borrow();
+        assert_eq!(invocations.len(), 3);
+        assert!(
+            invocations[2]
+                .env
+                .iter()
+                .any(|(key, value)| key == "CGO_ENABLED" && value == "1")
+        );
+    }
+
+    #[test]
+    fn discovery_preserves_vendor_mode_and_manifest_identity() {
+        let temporary = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temporary.path().join("goroot/src")).unwrap();
+        let package_dir = temporary.path().join("vendor/example.com/dep/pkg");
+        std::fs::create_dir_all(&package_dir).unwrap();
+        std::fs::write(
+            temporary.path().join("vendor/modules.txt"),
+            "# example.com/dep v1.2.3\n## explicit\nexample.com/dep/pkg\n",
+        )
+        .unwrap();
+        std::fs::write(package_dir.join("api.go"), "package pkg").unwrap();
+        let packages = serde_json::json!({
+            "ImportPath": "example.com/dep/pkg",
+            "Dir": package_dir,
+            "GoFiles": ["api.go"],
+            "Module": {
+                "Path": "example.com/dep",
+                "Version": "v1.2.3",
+                "Sum": "h1:vendor"
+            }
+        })
+        .to_string()
+        .into_bytes();
+        let runner = FakeRunner::with_outputs([environment(temporary.path()), packages]);
+        let project = TestProject::new(temporary.path(), Language::Go);
+        let outcome = resolve_with_runner(
+            &config(),
+            &project,
+            &DependencyPackLimits::default(),
+            None,
+            &runner,
+        );
+        assert!(outcome.complete, "{:?}", outcome.diagnostics);
+        assert!(
+            runner.invocations.borrow()[1]
+                .args
+                .iter()
+                .any(|arg| arg == "-mod=vendor")
+        );
+        let dependency = &outcome.dependencies[0];
+        assert!(dependency.id.starts_with("go:vendor:"));
+        assert!(
+            dependency
+                .provenance
+                .iter()
+                .any(|entry| entry.key == "go.vendor" && entry.value.len() == 64)
+        );
+    }
+
+    #[test]
+    fn go_toolchain_versions_preserve_prerelease_identity() {
+        assert_eq!(go_version("go1.26.1"), Some(Version::new(1, 26, 1)));
+        assert_eq!(go_version("go1.27rc2").unwrap().to_string(), "1.27.0-rc.2");
+        assert_eq!(
+            go_version("go1.27beta1").unwrap().to_string(),
+            "1.27.0-beta.1"
+        );
+        assert_eq!(go_version("devel go1.28-deadbeef"), None);
+    }
+
+    #[test]
+    fn installed_go_discovers_standard_library_offline() {
+        if Command::new("go").arg("version").output().is_err() {
+            return;
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temporary.path().join("go.mod"),
+            "module example.com/bifrost-smoke\n\ngo 1.24\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temporary.path().join("main.go"),
+            "package main\nimport \"fmt\"\nfunc main() { fmt.Println(\"ok\") }\n",
+        )
+        .unwrap();
+        let project = TestProject::new(temporary.path(), Language::Go);
+        let mut config = config();
+        config.dependency_discovery.go_executable = Some(PathBuf::from("go"));
+        config.dependency_discovery.workspace_patterns = vec![".".to_owned()];
+        config.dependency_discovery.goos = None;
+        config.dependency_discovery.goarch = None;
+        config.dependency_discovery.build_tags.clear();
+        config.dependency_discovery.timeout = Duration::from_secs(30);
+        let outcome = resolve_go_semantic_pack_dependencies(
+            &config,
+            &project,
+            &DependencyPackLimits::default(),
+            None,
+        );
+        assert!(outcome.complete, "{:?}", outcome.diagnostics);
+        let standard_library = outcome
+            .dependencies
+            .iter()
+            .find(|dependency| dependency.id.starts_with("go:stdlib:"))
+            .expect("fmt dependency should produce a standard-library source set");
+        let packages = standard_library
+            .provenance
+            .iter()
+            .find(|entry| entry.key == "go.packages")
+            .unwrap();
+        assert!(packages.value.contains("\"import_path\":\"fmt\""));
     }
 
     #[test]
@@ -1838,195 +2024,5 @@ mod tests {
             .find(|entry| entry.key == "go.workspace")
             .unwrap();
         assert_ne!(workspace, changed_workspace.value);
-    }
-
-    #[test]
-    fn discovery_reports_cgo_and_package_errors_as_incomplete() {
-        let temporary = tempfile::tempdir().unwrap();
-        let goroot = temporary.path().join("goroot/src/net");
-        std::fs::create_dir_all(&goroot).unwrap();
-        std::fs::write(goroot.join("net.go"), "package net").unwrap();
-        let packages = serde_json::json!({
-            "ImportPath": "net",
-            "Dir": goroot,
-            "Standard": true,
-            "Incomplete": true,
-            "Error": {"Err": "missing local package"},
-            "GoFiles": ["net.go"],
-            "IgnoredGoFiles": ["cgo_unix.go"]
-        })
-        .to_string()
-        .into_bytes();
-        let cgo_packages = serde_json::json!({
-            "ImportPath": "net",
-            "Dir": temporary.path().join("goroot/src/net"),
-            "Standard": true,
-            "GoFiles": ["net.go"],
-            "CgoFiles": ["cgo_unix.go"]
-        })
-        .to_string()
-        .into_bytes();
-        let runner =
-            FakeRunner::with_outputs([environment(temporary.path()), packages, cgo_packages]);
-        let project = TestProject::new(temporary.path(), Language::Go);
-        let result = discover_with_runner(
-            &config(),
-            &project,
-            &DependencyPackLimits::default(),
-            None,
-            &runner,
-        );
-        let primary = result.canonical.unwrap();
-        assert!(primary.packages[0].cgo_files.is_empty());
-        assert_eq!(
-            primary.packages[0].ignored_go_files,
-            [PathBuf::from("cgo_unix.go")]
-        );
-        let outcome = result.semantic_packs;
-        assert!(!outcome.complete);
-        assert!(
-            outcome
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "go.package_incomplete")
-        );
-        assert!(
-            outcome
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "go.cgo_unsupported")
-        );
-        let invocations = runner.invocations.borrow();
-        assert_eq!(invocations.len(), 3);
-        assert!(
-            invocations[2]
-                .env
-                .iter()
-                .any(|(key, value)| key == "CGO_ENABLED" && value == "1")
-        );
-    }
-
-    #[test]
-    fn discovery_preserves_vendor_mode_and_manifest_identity() {
-        let temporary = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(temporary.path().join("goroot/src")).unwrap();
-        let package_dir = temporary.path().join("vendor/example.com/dep/pkg");
-        std::fs::create_dir_all(&package_dir).unwrap();
-        std::fs::write(
-            temporary.path().join("vendor/modules.txt"),
-            "# example.com/dep v1.2.3\n## explicit\nexample.com/dep/pkg\n",
-        )
-        .unwrap();
-        std::fs::write(package_dir.join("api.go"), "package pkg").unwrap();
-        let packages = serde_json::json!({
-            "ImportPath": "example.com/dep/pkg",
-            "Dir": package_dir,
-            "GoFiles": ["api.go"],
-            "Module": {
-                "Path": "example.com/dep",
-                "Version": "v1.2.3",
-                "Sum": "h1:vendor"
-            }
-        })
-        .to_string()
-        .into_bytes();
-        let runner = FakeRunner::with_outputs([environment(temporary.path()), packages]);
-        let project = TestProject::new(temporary.path(), Language::Go);
-        let outcome = resolve_with_runner(
-            &config(),
-            &project,
-            &DependencyPackLimits::default(),
-            None,
-            &runner,
-        );
-        assert!(outcome.complete, "{:?}", outcome.diagnostics);
-        assert!(
-            runner.invocations.borrow()[1]
-                .args
-                .iter()
-                .any(|arg| arg == "-mod=vendor")
-        );
-        let dependency = &outcome.dependencies[0];
-        assert!(dependency.id.starts_with("go:vendor:"));
-        assert!(
-            dependency
-                .provenance
-                .iter()
-                .any(|entry| entry.key == "go.vendor" && entry.value.len() == 64)
-        );
-    }
-
-    #[test]
-    fn discovery_rejects_flag_shaped_patterns_before_running_go() {
-        let temporary = tempfile::tempdir().unwrap();
-        let project = TestProject::new(temporary.path(), Language::Go);
-        let runner = FakeRunner::default();
-        let mut config = config();
-        config.dependency_discovery.workspace_patterns = vec!["-exec=attacker".to_owned()];
-        let outcome = resolve_with_runner(
-            &config,
-            &project,
-            &DependencyPackLimits::default(),
-            None,
-            &runner,
-        );
-        assert!(!outcome.complete);
-        assert_eq!(outcome.diagnostics[0].code, "go.config_invalid");
-        assert!(runner.invocations.borrow().is_empty());
-    }
-
-    #[test]
-    fn go_toolchain_versions_preserve_prerelease_identity() {
-        assert_eq!(go_version("go1.26.1"), Some(Version::new(1, 26, 1)));
-        assert_eq!(go_version("go1.27rc2").unwrap().to_string(), "1.27.0-rc.2");
-        assert_eq!(
-            go_version("go1.27beta1").unwrap().to_string(),
-            "1.27.0-beta.1"
-        );
-        assert_eq!(go_version("devel go1.28-deadbeef"), None);
-    }
-
-    #[test]
-    fn installed_go_discovers_standard_library_offline() {
-        if Command::new("go").arg("version").output().is_err() {
-            return;
-        }
-        let temporary = tempfile::tempdir().unwrap();
-        std::fs::write(
-            temporary.path().join("go.mod"),
-            "module example.com/bifrost-smoke\n\ngo 1.24\n",
-        )
-        .unwrap();
-        std::fs::write(
-            temporary.path().join("main.go"),
-            "package main\nimport \"fmt\"\nfunc main() { fmt.Println(\"ok\") }\n",
-        )
-        .unwrap();
-        let project = TestProject::new(temporary.path(), Language::Go);
-        let mut config = config();
-        config.dependency_discovery.go_executable = Some(PathBuf::from("go"));
-        config.dependency_discovery.workspace_patterns = vec![".".to_owned()];
-        config.dependency_discovery.goos = None;
-        config.dependency_discovery.goarch = None;
-        config.dependency_discovery.build_tags.clear();
-        config.dependency_discovery.timeout = Duration::from_secs(30);
-        let outcome = resolve_go_semantic_pack_dependencies(
-            &config,
-            &project,
-            &DependencyPackLimits::default(),
-            None,
-        );
-        assert!(outcome.complete, "{:?}", outcome.diagnostics);
-        let standard_library = outcome
-            .dependencies
-            .iter()
-            .find(|dependency| dependency.id.starts_with("go:stdlib:"))
-            .expect("fmt dependency should produce a standard-library source set");
-        let packages = standard_library
-            .provenance
-            .iter()
-            .find(|entry| entry.key == "go.packages")
-            .unwrap();
-        assert!(packages.value.contains("\"import_path\":\"fmt\""));
     }
 }

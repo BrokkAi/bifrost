@@ -12,7 +12,7 @@
 -- reference site is also its blob-local semantic key, so each step is a key
 -- seek. When the steps do not name exactly one impl item the column is NULL.
 INSERT INTO cr_impl_sources
-SELECT members.blob_id, subject.relation_key, members.module_path, subject.impl_site,
+SELECT DISTINCT members.blob_id, subject.relation_key, members.module_path, subject.impl_site,
        subject.terminal_spelling, subject.position,
        implemented.terminal_spelling, implemented.position,
        (SELECT CASE WHEN count(DISTINCT item.declaration_id) = 1

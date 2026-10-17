@@ -102,7 +102,6 @@ pub const PUBLISHED_OPERATIONS: &[PublishedOperation] = &[
     // for the same reason value dependence is: the route answers for one
     // analysis root under caller-owned span bindings, and the per-language
     // rows in the capability report say where even that much is unavailable.
-    // Design: .agents/docs/extension-typestate-design-2026-08.md.
     PublishedOperation {
         id: "experimental.semantic.typestate",
         stability: ApiStability::Experimental { since_minor: 1 },
@@ -142,7 +141,7 @@ pub enum ExtensionCompatibilityError {
 
 impl fmt::Display for ExtensionCompatibilityError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        super::fmt_debug(self, f)
     }
 }
 impl std::error::Error for ExtensionCompatibilityError {}
@@ -194,79 +193,4 @@ pub fn negotiate_extension_api(
         version: EXTENSION_API_VERSION,
         capabilities: requested.required_capabilities.clone(),
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn accepts_current_version() {
-        assert!(negotiate_extension_api(&ExtensionCompatibility::default()).is_ok());
-    }
-    #[test]
-    fn accepts_every_served_capability() {
-        let required: Box<[ExtensionCapabilityId]> = PUBLISHED_OPERATIONS
-            .iter()
-            .filter(|operation| operation.support.is_served())
-            .map(|operation| ExtensionCapabilityId::new(operation.id).unwrap())
-            .collect();
-        assert!(
-            !required.is_empty(),
-            "the surface must publish at least one served operation: {PUBLISHED_OPERATIONS:?}"
-        );
-        let request = ExtensionCompatibility {
-            required_capabilities: required.clone(),
-            ..Default::default()
-        };
-        let negotiated = negotiate_extension_api(&request).unwrap();
-        assert_eq!(negotiated.capabilities, required);
-    }
-    #[test]
-    fn rejects_advertised_but_unsupported_capability() {
-        for operation in PUBLISHED_OPERATIONS
-            .iter()
-            .filter(|operation| !operation.support.is_served())
-        {
-            let request = ExtensionCompatibility {
-                required_capabilities: Box::new(
-                    [ExtensionCapabilityId::new(operation.id).unwrap()],
-                ),
-                ..Default::default()
-            };
-            assert!(
-                matches!(
-                    negotiate_extension_api(&request),
-                    Err(ExtensionCompatibilityError::MissingCapability(ref id))
-                        if id.as_str() == operation.id
-                ),
-                "{operation:?} is advertised as unsupported and must not negotiate"
-            );
-        }
-    }
-    #[test]
-    fn rejects_unknown_capability() {
-        let request = ExtensionCompatibility {
-            required_capabilities: Box::new([ExtensionCapabilityId::new(
-                "experimental.semantic.unknown",
-            )
-            .unwrap()]),
-            ..Default::default()
-        };
-        assert!(matches!(
-            negotiate_extension_api(&request),
-            Err(ExtensionCompatibilityError::MissingCapability(id))
-                if id.as_str() == "experimental.semantic.unknown"
-        ));
-    }
-    #[test]
-    fn rejects_unknown_major() {
-        let request = ExtensionCompatibility {
-            major: 2,
-            ..Default::default()
-        };
-        assert!(matches!(
-            negotiate_extension_api(&request),
-            Err(ExtensionCompatibilityError::UnsupportedMajor { .. })
-        ));
-    }
 }

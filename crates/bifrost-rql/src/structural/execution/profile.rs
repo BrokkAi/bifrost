@@ -11,6 +11,22 @@ use super::scheduler::SchedulerRunProfile;
 use crate::hash::HashSet;
 use brokk_bifrost_rql::CodeQuery;
 
+macro_rules! saturating_add_fields {
+    ($current:ident, $other:ident; $($field:ident),+ $(,)?) => {
+        Self {
+            $($field: $current.$field.saturating_add($other.$field)),+
+        }
+    };
+}
+
+macro_rules! saturating_sub_fields {
+    ($current:ident, $earlier:ident; $($field:ident),+ $(,)?) => {
+        Self {
+            $($field: $current.$field.saturating_sub($earlier.$field)),+
+        }
+    };
+}
+
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub(crate) enum QueryRetainedValueKind {
     StructuralIndex,
@@ -297,49 +313,31 @@ pub(crate) struct QueryOperatorWorkProfile {
 impl QueryOperatorWorkProfile {
     #[cfg(test)]
     pub(crate) fn saturating_add(self, other: Self) -> Self {
-        Self {
-            scanned_files: self.scanned_files.saturating_add(other.scanned_files),
-            scanned_source_bytes: self
-                .scanned_source_bytes
-                .saturating_add(other.scanned_source_bytes),
-            fact_nodes: self.fact_nodes.saturating_add(other.fact_nodes),
-            pipeline_rows: self.pipeline_rows.saturating_add(other.pipeline_rows),
-            examined_references: self
-                .examined_references
-                .saturating_add(other.examined_references),
-            provenance_steps: self.provenance_steps.saturating_add(other.provenance_steps),
-            import_files_resolved: self
-                .import_files_resolved
-                .saturating_add(other.import_files_resolved),
-            import_edges_resolved: self
-                .import_edges_resolved
-                .saturating_add(other.import_edges_resolved),
-            semantic: self.semantic.saturating_add(other.semantic),
-        }
+        saturating_add_fields!(self, other;
+            scanned_files,
+            scanned_source_bytes,
+            fact_nodes,
+            pipeline_rows,
+            examined_references,
+            provenance_steps,
+            import_files_resolved,
+            import_edges_resolved,
+            semantic,
+        )
     }
 
     pub(crate) fn saturating_sub(self, earlier: Self) -> Self {
-        Self {
-            scanned_files: self.scanned_files.saturating_sub(earlier.scanned_files),
-            scanned_source_bytes: self
-                .scanned_source_bytes
-                .saturating_sub(earlier.scanned_source_bytes),
-            fact_nodes: self.fact_nodes.saturating_sub(earlier.fact_nodes),
-            pipeline_rows: self.pipeline_rows.saturating_sub(earlier.pipeline_rows),
-            examined_references: self
-                .examined_references
-                .saturating_sub(earlier.examined_references),
-            provenance_steps: self
-                .provenance_steps
-                .saturating_sub(earlier.provenance_steps),
-            import_files_resolved: self
-                .import_files_resolved
-                .saturating_sub(earlier.import_files_resolved),
-            import_edges_resolved: self
-                .import_edges_resolved
-                .saturating_sub(earlier.import_edges_resolved),
-            semantic: self.semantic.saturating_sub(earlier.semantic),
-        }
+        saturating_sub_fields!(self, earlier;
+            scanned_files,
+            scanned_source_bytes,
+            fact_nodes,
+            pipeline_rows,
+            examined_references,
+            provenance_steps,
+            import_files_resolved,
+            import_edges_resolved,
+            semantic,
+        )
     }
 }
 
@@ -409,17 +407,15 @@ pub(crate) struct QuerySeedStructuralFactsCacheProfile {
 
 impl QuerySeedStructuralFactsCacheProfile {
     pub(crate) fn saturating_add(self, other: Self) -> Self {
-        Self {
-            lookups: self.lookups.saturating_add(other.lookups),
-            memory_hits: self.memory_hits.saturating_add(other.memory_hits),
-            persisted_hydrations: self
-                .persisted_hydrations
-                .saturating_add(other.persisted_hydrations),
-            extractions: self.extractions.saturating_add(other.extractions),
-            unavailable: self.unavailable.saturating_add(other.unavailable),
-            unknown_outcomes: self.unknown_outcomes.saturating_add(other.unknown_outcomes),
-            replayed_files: self.replayed_files.saturating_add(other.replayed_files),
-        }
+        saturating_add_fields!(self, other;
+            lookups,
+            memory_hits,
+            persisted_hydrations,
+            extractions,
+            unavailable,
+            unknown_outcomes,
+            replayed_files,
+        )
     }
 
     pub(crate) fn record_memory_hit(&mut self, available: bool) {
@@ -449,40 +445,34 @@ impl QuerySeedStructuralFactsCacheProfile {
     }
 
     pub(crate) fn saturating_sub(self, earlier: Self) -> Self {
-        Self {
-            lookups: self.lookups.saturating_sub(earlier.lookups),
-            memory_hits: self.memory_hits.saturating_sub(earlier.memory_hits),
-            persisted_hydrations: self
-                .persisted_hydrations
-                .saturating_sub(earlier.persisted_hydrations),
-            extractions: self.extractions.saturating_sub(earlier.extractions),
-            unavailable: self.unavailable.saturating_sub(earlier.unavailable),
-            unknown_outcomes: self
-                .unknown_outcomes
-                .saturating_sub(earlier.unknown_outcomes),
-            replayed_files: self.replayed_files.saturating_sub(earlier.replayed_files),
-        }
+        saturating_sub_fields!(self, earlier;
+            lookups,
+            memory_hits,
+            persisted_hydrations,
+            extractions,
+            unavailable,
+            unknown_outcomes,
+            replayed_files,
+        )
     }
 }
 
 impl QueryCacheLayerProfile {
     pub(crate) fn saturating_add(self, other: Self) -> Self {
-        Self {
-            lookups: self.lookups.saturating_add(other.lookups),
-            hits: self.hits.saturating_add(other.hits),
-            misses: self.misses.saturating_add(other.misses),
-            builds: self.builds.saturating_add(other.builds),
-            waits: self.waits.saturating_add(other.waits),
-            wait_ns: self.wait_ns.saturating_add(other.wait_ns),
-            complete_hits: self.complete_hits.saturating_add(other.complete_hits),
-            incomplete_hits: self.incomplete_hits.saturating_add(other.incomplete_hits),
-            complete_builds: self.complete_builds.saturating_add(other.complete_builds),
-            incomplete_builds: self
-                .incomplete_builds
-                .saturating_add(other.incomplete_builds),
-            unknown_outcomes: self.unknown_outcomes.saturating_add(other.unknown_outcomes),
-            replayed_items: self.replayed_items.saturating_add(other.replayed_items),
-        }
+        saturating_add_fields!(self, other;
+            lookups,
+            hits,
+            misses,
+            builds,
+            waits,
+            wait_ns,
+            complete_hits,
+            incomplete_hits,
+            complete_builds,
+            incomplete_builds,
+            unknown_outcomes,
+            replayed_items,
+        )
     }
 
     pub(crate) fn record_hit(&mut self, complete: Option<bool>, replayed_items: usize) {
@@ -513,54 +503,50 @@ impl QueryCacheLayerProfile {
     }
 
     pub(crate) fn saturating_sub(self, earlier: Self) -> Self {
-        Self {
-            lookups: self.lookups.saturating_sub(earlier.lookups),
-            hits: self.hits.saturating_sub(earlier.hits),
-            misses: self.misses.saturating_sub(earlier.misses),
-            builds: self.builds.saturating_sub(earlier.builds),
-            waits: self.waits.saturating_sub(earlier.waits),
-            wait_ns: self.wait_ns.saturating_sub(earlier.wait_ns),
-            complete_hits: self.complete_hits.saturating_sub(earlier.complete_hits),
-            incomplete_hits: self.incomplete_hits.saturating_sub(earlier.incomplete_hits),
-            complete_builds: self.complete_builds.saturating_sub(earlier.complete_builds),
-            incomplete_builds: self
-                .incomplete_builds
-                .saturating_sub(earlier.incomplete_builds),
-            unknown_outcomes: self
-                .unknown_outcomes
-                .saturating_sub(earlier.unknown_outcomes),
-            replayed_items: self.replayed_items.saturating_sub(earlier.replayed_items),
-        }
+        saturating_sub_fields!(self, earlier;
+            lookups,
+            hits,
+            misses,
+            builds,
+            waits,
+            wait_ns,
+            complete_hits,
+            incomplete_hits,
+            complete_builds,
+            incomplete_builds,
+            unknown_outcomes,
+            replayed_items,
+        )
     }
 }
 
 impl QueryDerivedLayerProfile {
     pub(crate) fn saturating_add(self, other: Self) -> Self {
-        Self {
-            common: self.common.saturating_add(other.common),
-            cancelled: self.cancelled.saturating_add(other.cancelled),
-            unavailable: self.unavailable.saturating_add(other.unavailable),
-            over_budget: self.over_budget.saturating_add(other.over_budget),
-            fallbacks: self.fallbacks.saturating_add(other.fallbacks),
-            build_files: self.build_files.saturating_add(other.build_files),
-            build_edges: self.build_edges.saturating_add(other.build_edges),
-            build_ns: self.build_ns.saturating_add(other.build_ns),
-            retained_bytes: self.retained_bytes.saturating_add(other.retained_bytes),
-        }
+        saturating_add_fields!(self, other;
+            common,
+            cancelled,
+            unavailable,
+            over_budget,
+            fallbacks,
+            build_files,
+            build_edges,
+            build_ns,
+            retained_bytes,
+        )
     }
 
     pub(crate) fn saturating_sub(self, earlier: Self) -> Self {
-        Self {
-            common: self.common.saturating_sub(earlier.common),
-            cancelled: self.cancelled.saturating_sub(earlier.cancelled),
-            unavailable: self.unavailable.saturating_sub(earlier.unavailable),
-            over_budget: self.over_budget.saturating_sub(earlier.over_budget),
-            fallbacks: self.fallbacks.saturating_sub(earlier.fallbacks),
-            build_files: self.build_files.saturating_sub(earlier.build_files),
-            build_edges: self.build_edges.saturating_sub(earlier.build_edges),
-            build_ns: self.build_ns.saturating_sub(earlier.build_ns),
-            retained_bytes: self.retained_bytes.saturating_sub(earlier.retained_bytes),
-        }
+        saturating_sub_fields!(self, earlier;
+            common,
+            cancelled,
+            unavailable,
+            over_budget,
+            fallbacks,
+            build_files,
+            build_edges,
+            build_ns,
+            retained_bytes,
+        )
     }
 }
 
@@ -581,47 +567,31 @@ pub(crate) struct QueryCacheProfile {
 
 impl QueryCacheProfile {
     pub(crate) fn saturating_add(self, other: Self) -> Self {
-        Self {
-            seed_result: self.seed_result.saturating_add(other.seed_result),
-            seed_structural_facts: self
-                .seed_structural_facts
-                .saturating_add(other.seed_structural_facts),
-            inbound_reference: self
-                .inbound_reference
-                .saturating_add(other.inbound_reference),
-            outbound_reference: self
-                .outbound_reference
-                .saturating_add(other.outbound_reference),
-            incoming_call: self.incoming_call.saturating_add(other.incoming_call),
-            outgoing_call: self.outgoing_call.saturating_add(other.outgoing_call),
-            import_forward: self.import_forward.saturating_add(other.import_forward),
-            import_reverse: self.import_reverse.saturating_add(other.import_reverse),
-            direct_import_topology: self
-                .direct_import_topology
-                .saturating_add(other.direct_import_topology),
-        }
+        saturating_add_fields!(self, other;
+            seed_result,
+            seed_structural_facts,
+            inbound_reference,
+            outbound_reference,
+            incoming_call,
+            outgoing_call,
+            import_forward,
+            import_reverse,
+            direct_import_topology,
+        )
     }
 
     pub(crate) fn saturating_sub(self, earlier: Self) -> Self {
-        Self {
-            seed_result: self.seed_result.saturating_sub(earlier.seed_result),
-            seed_structural_facts: self
-                .seed_structural_facts
-                .saturating_sub(earlier.seed_structural_facts),
-            inbound_reference: self
-                .inbound_reference
-                .saturating_sub(earlier.inbound_reference),
-            outbound_reference: self
-                .outbound_reference
-                .saturating_sub(earlier.outbound_reference),
-            incoming_call: self.incoming_call.saturating_sub(earlier.incoming_call),
-            outgoing_call: self.outgoing_call.saturating_sub(earlier.outgoing_call),
-            import_forward: self.import_forward.saturating_sub(earlier.import_forward),
-            import_reverse: self.import_reverse.saturating_sub(earlier.import_reverse),
-            direct_import_topology: self
-                .direct_import_topology
-                .saturating_sub(earlier.direct_import_topology),
-        }
+        saturating_sub_fields!(self, earlier;
+            seed_result,
+            seed_structural_facts,
+            inbound_reference,
+            outbound_reference,
+            incoming_call,
+            outgoing_call,
+            import_forward,
+            import_reverse,
+            direct_import_topology,
+        )
     }
 }
 
@@ -1265,17 +1235,6 @@ mod public_contract_tests {
     use crate::structural::execution::plan::{LogicalQueryOperator, LogicalQueryPlan};
     use brokk_bifrost_rql::SCHEMA_VERSION;
 
-    #[test]
-    fn retained_value_census_deduplicates_by_kind_and_identity() {
-        let census = QueryRetainedValueCensus::default();
-        let value = Arc::new(7_u8);
-
-        assert!(census.first_observation(QueryRetainedValueKind::StructuralIndex, &value));
-        assert!(!census.first_observation(QueryRetainedValueKind::StructuralIndex, &value));
-        assert!(census.first_observation(QueryRetainedValueKind::DirectImportTopology, &value));
-        assert!(!census.first_observation(QueryRetainedValueKind::DirectImportTopology, &value));
-    }
-
     fn union_query() -> CodeQuery {
         CodeQuery::from_json(&json!({
             "schema_version": SCHEMA_VERSION,
@@ -1309,7 +1268,8 @@ mod public_contract_tests {
             panic!("root should be a limit");
         };
         let parallel_union = *union;
-        let physical = PhysicalQueryPlan::select_with_parallel_union(logical, Some(parallel_union));
+        let physical =
+            PhysicalQueryPlan::select_with_parallel_union(logical, Some(parallel_union), 0);
         let union_node = physical.node(physical.root()).dependencies()[0];
         let union_operator = physical.node(union_node).operator();
         let mut profile = QueryExecutionProfile::new(&physical, 11, 7);
@@ -1640,22 +1600,6 @@ mod public_contract_tests {
         }
     }
 
-    #[test]
-    fn public_profile_omits_bounded_dispatch_when_scheduler_did_not_run() {
-        let query = union_query();
-        let physical = PhysicalQueryPlan::select_with_parallel_union(
-            LogicalQueryPlan::lower(&query).expect("query should lower"),
-            None,
-        );
-        let profile = QueryExecutionProfile::new(&physical, 0, 2);
-
-        let value =
-            serde_json::to_value(CodeQueryProfile::from_internal(&query, result(), profile))
-                .expect("public profile should serialize");
-
-        assert_eq!(value["scheduling"], json!({ "peak_concurrency": 1 }));
-    }
-
     fn cache_layer_names(value: &Value) -> Vec<&str> {
         value
             .as_array()
@@ -1667,5 +1611,33 @@ mod public_contract_tests {
                     .expect("cache layer should have a string tag")
             })
             .collect()
+    }
+
+    #[test]
+    fn retained_value_census_deduplicates_by_kind_and_identity() {
+        let census = QueryRetainedValueCensus::default();
+        let value = Arc::new(7_u8);
+
+        assert!(census.first_observation(QueryRetainedValueKind::StructuralIndex, &value));
+        assert!(!census.first_observation(QueryRetainedValueKind::StructuralIndex, &value));
+        assert!(census.first_observation(QueryRetainedValueKind::DirectImportTopology, &value));
+        assert!(!census.first_observation(QueryRetainedValueKind::DirectImportTopology, &value));
+    }
+
+    #[test]
+    fn public_profile_omits_bounded_dispatch_when_scheduler_did_not_run() {
+        let query = union_query();
+        let physical = PhysicalQueryPlan::select_with_parallel_union(
+            LogicalQueryPlan::lower(&query).expect("query should lower"),
+            None,
+            0,
+        );
+        let profile = QueryExecutionProfile::new(&physical, 0, 2);
+
+        let value =
+            serde_json::to_value(CodeQueryProfile::from_internal(&query, result(), profile))
+                .expect("public profile should serialize");
+
+        assert_eq!(value["scheduling"], json!({ "peak_concurrency": 1 }));
     }
 }

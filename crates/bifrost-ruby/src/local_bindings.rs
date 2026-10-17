@@ -15,6 +15,8 @@
 //! [`LocalBindingBudget`], so there is exactly one implementation of the
 //! binding rule.
 
+use brokk_bifrost_core::analyzer::common::try_node_source_text;
+use brokk_bifrost_core::analyzer::tree_walk::named_children_vec as named_children;
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use tree_sitter::Node;
 
@@ -107,16 +109,6 @@ pub struct LocalBindingCollection {
     pub has_parameter_defaults: bool,
 }
 
-fn node_text<'source>(source: &'source str, node: Node<'_>) -> Option<&'source str> {
-    node.utf8_text(source.as_bytes()).ok()
-}
-
-fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
-    (0..node.named_child_count())
-        .filter_map(|index| node.named_child(index))
-        .collect()
-}
-
 fn children_by_field_name<'tree>(node: Node<'tree>, field: &str) -> Vec<Node<'tree>> {
     node.child_by_field_name(field).into_iter().collect()
 }
@@ -170,7 +162,7 @@ impl<'source, 'request, B: LocalBindingBudget> LocalBindingCollector<'source, 'r
 
     fn insert_entry_identifier(&mut self, node: Node<'_>) -> Result<(), B::Error> {
         if node.kind() == "identifier"
-            && let Some(name) = node_text(self.source, node)
+            && let Some(name) = try_node_source_text(node, self.source)
         {
             self.insert_entry_name(name)?;
         }
@@ -179,7 +171,7 @@ impl<'source, 'request, B: LocalBindingBudget> LocalBindingCollector<'source, 'r
 
     fn insert_activation_identifier(&mut self, node: Node<'_>) -> Result<(), B::Error> {
         if node.kind() == "identifier"
-            && let Some(name) = node_text(self.source, node)
+            && let Some(name) = try_node_source_text(node, self.source)
         {
             self.insert_activation(name, node.start_byte())?;
         }
@@ -252,7 +244,7 @@ impl<'source, 'request, B: LocalBindingBudget> LocalBindingCollector<'source, 'r
                     if let Some(value) = current.child_by_field_name("value") {
                         stack.push(value);
                     } else if let Some(key) = current.child_by_field_name("key")
-                        && let Some(name) = node_text(self.source, key)
+                        && let Some(name) = try_node_source_text(key, self.source)
                     {
                         self.insert_activation(
                             name.strip_suffix(':').unwrap_or(name),

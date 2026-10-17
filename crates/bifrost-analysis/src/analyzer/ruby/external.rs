@@ -1,14 +1,20 @@
 use std::path::PathBuf;
 
 use crate::CancellationToken;
+use crate::analyzer::dependency_support::{
+    append_producer_diagnostics as append_diagnostics, dependency_locator_path as locator_path,
+    failed_dependency_pack_production as failed,
+};
+#[cfg(test)]
+use crate::analyzer::semantic_model::SuppressedDiagnostics;
 use crate::analyzer::semantic_model::{
     ActivationSelector, ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest,
     AuthoredPayload, AuthoredSemanticModelPack, AuthoredShard, BoundedProducerDiagnostics,
     Compatibility, Completeness, DependencyArtifactRole, DependencyPackAdapter,
     DependencyPackProduction, ExactArtifact, ExactDependencyArtifact, ExternalArtifactKind,
-    ExternalArtifactPackProducer, NameSelector, Producer, ProducerDiagnostic,
-    ProducerDiagnosticSeverity, Provenance, ResolvedDependency, SEMANTIC_MODEL_SCHEMA_VERSION,
-    Safety, SuppressedDiagnostics, TypeFact, TypeRef, read_exact_artifact_while,
+    NameSelector, Producer, ProducerDiagnostic, ProducerDiagnosticSeverity, Provenance,
+    ResolvedDependency, SEMANTIC_MODEL_SCHEMA_VERSION, Safety, TypeFact, TypeRef,
+    read_exact_artifact_while,
 };
 use crate::hash::{HashMap, HashSet};
 
@@ -27,24 +33,10 @@ pub struct RubyDependencyPackAdapter;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RubyGemArchivePackProducer;
 
-impl ExternalArtifactPackProducer for RubyGemArchivePackProducer {
-    fn produce_exact_artifact(
-        &self,
-        request: &ArtifactProductionRequest,
-        limits: &ArtifactProducerLimits,
-    ) -> ArtifactProduction {
-        self.produce(request, limits, None)
-    }
-
-    fn produce_exact_artifact_with_cancellation(
-        &self,
-        request: &ArtifactProductionRequest,
-        limits: &ArtifactProducerLimits,
-        cancellation: Option<&CancellationToken>,
-    ) -> ArtifactProduction {
-        self.produce(request, limits, cancellation)
-    }
-}
+crate::analyzer::semantic_model::implement_external_artifact_pack_producer!(
+    RubyGemArchivePackProducer,
+    produce
+);
 
 impl RubyGemArchivePackProducer {
     fn produce(
@@ -147,6 +139,7 @@ impl RubyGemArchivePackProducer {
                     collection_flows: None,
                     deferred_yields: None,
                     conditional_type_refinements: None,
+                    callable_values: None,
                 }],
             }),
             completeness,
@@ -161,15 +154,8 @@ impl DependencyPackAdapter for RubyDependencyPackAdapter {
         "bifrost-ruby-dependency"
     }
 
-    fn adapter_version(&self) -> &str {
-        env!("CARGO_PKG_VERSION")
-    }
-
     fn producer(&self) -> Producer {
-        Producer {
-            name: "bifrost-ruby-gem".to_owned(),
-            version: env!("CARGO_PKG_VERSION").to_owned(),
-        }
+        Producer::for_name("bifrost-ruby-gem")
     }
 
     fn can_produce(&self, dependency: &ResolvedDependency) -> bool {
@@ -378,7 +364,7 @@ fn merge_entries(
                     if conflicting_parent.is_some() {
                         diagnostics.warning(
                             "ruby.declaration.superclass_conflict",
-                            Some(locator_path(&incoming.locator)),
+                            Some(locator_path(&incoming.locator).to_owned()),
                             format!(
                                 "Ruby type {} declares incompatible superclasses",
                                 incoming.name
@@ -416,7 +402,7 @@ fn merge_entries(
                     let primary = primary.clone();
                     diagnostics.warning(
                         "ruby.declaration.type_conflict",
-                        Some(locator_path(&incoming.locator)),
+                        Some(locator_path(&incoming.locator).to_owned()),
                         format!(
                             "Ruby type {} conflicts with the primary {:?} declaration from {}",
                             incoming.name,
@@ -457,7 +443,7 @@ fn merge_entries(
             {
                 diagnostics.warning(
                     "ruby.declaration.member_conflict",
-                    Some(locator_path(&incoming.locator)),
+                    Some(locator_path(&incoming.locator).to_owned()),
                     format!(
                         "Ruby member {}::{} conflicts with the primary declaration from {}",
                         incoming.owner,
@@ -497,10 +483,7 @@ fn merge_entries(
     members.retain(|_, member| !conflicted_types.contains(&member.owner));
     for (base_id, mut facts) in conflicted_type_facts {
         for mut fact in facts.drain(..) {
-            fact.id = format!(
-                "{base_id}.conflict.{}",
-                stable_type_kind_label(fact.type_kind)
-            );
+            fact.id = format!("{base_id}.conflict.{}", fact.type_kind.stable_label());
             types.insert(fact.id.clone(), fact);
         }
     }
@@ -586,23 +569,6 @@ fn member_callable_shape_key(member: &crate::analyzer::semantic_model::MemberFac
     format!("{identity}\0{modifiers:?}")
 }
 
-fn stable_type_kind_label(kind: crate::analyzer::semantic_model::TypeKind) -> &'static str {
-    use crate::analyzer::semantic_model::TypeKind;
-    match kind {
-        TypeKind::Class => "class",
-        TypeKind::Annotation => "annotation",
-        TypeKind::Delegate => "delegate",
-        TypeKind::Interface => "interface",
-        TypeKind::Trait => "trait",
-        TypeKind::Struct => "struct",
-        TypeKind::Union => "union",
-        TypeKind::Enum => "enum",
-        TypeKind::Record => "record",
-        TypeKind::Module => "module",
-        TypeKind::TypeAlias => "type_alias",
-    }
-}
-
 fn member_lookup_key_parts(
     owner: &str,
     name: &str,
@@ -619,6 +585,9 @@ fn same_signature_semantics(
     let (Some(left), Some(right)) = (&left.signature, &right.signature) else {
         return left.signature.is_none() && right.signature.is_none();
     };
+    if left.contains_unknown_types() || right.contains_unknown_types() {
+        return false;
+    }
     left.type_parameters == right.type_parameters
         && left.returns == right.returns
         && left.parameters.len() == right.parameters.len()
@@ -717,54 +686,14 @@ fn origin_priority(kind: RubyGemDeclarationKind) -> u8 {
     }
 }
 
-fn append_diagnostics(
-    bounded: &mut BoundedProducerDiagnostics,
-    diagnostics: Vec<ProducerDiagnostic>,
-) {
-    for diagnostic in diagnostics {
-        match diagnostic.severity {
-            ProducerDiagnosticSeverity::Warning => {
-                bounded.warning(diagnostic.code, diagnostic.location, diagnostic.message)
-            }
-            ProducerDiagnosticSeverity::Error => {
-                bounded.error(diagnostic.code, diagnostic.location, diagnostic.message)
-            }
-        }
-    }
-}
-
-fn locator_path(locator: &crate::analyzer::semantic_model::Locator) -> String {
-    match locator {
-        crate::analyzer::semantic_model::Locator::Source { path, .. }
-        | crate::analyzer::semantic_model::Locator::Artifact { path, .. }
-        | crate::analyzer::semantic_model::Locator::Interchange { path, .. } => path.clone(),
-    }
-}
-
-fn failed(code: &str, message: &str) -> DependencyPackProduction {
-    DependencyPackProduction {
-        pack: None,
-        diagnostics: vec![ProducerDiagnostic {
-            severity: ProducerDiagnosticSeverity::Error,
-            source_entry: None,
-            code: code.to_owned(),
-            location: None,
-            declaration: None,
-            message: message.to_owned(),
-        }],
-        suppressed_diagnostics: SuppressedDiagnostics::default(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
 
-    use flate2::Compression;
-    use flate2::write::GzEncoder;
+    use crate::test_support::ruby_gem_archive as gem_archive;
 
     use super::*;
-    use crate::analyzer::canonical_hash::{lower_hex_string, sha256_bytes};
+    use crate::analyzer::semantic_model::csmi::sha256_hex;
     use crate::analyzer::semantic_model::{
         ArtifactProducerLimits, CatalogOptions, DependencyPackLimits, SemanticPackCatalog,
         prepare_discovered_dependency_semantic_packs,
@@ -773,6 +702,79 @@ mod tests {
         Language, Project, RubyAnalyzerConfig, RubyDependencyApiEvidence, RubyGemApiArtifact,
         TestProject,
     };
+
+    fn member_with_signature_types(
+        parameter_type: TypeRef,
+        return_type: TypeRef,
+    ) -> crate::analyzer::semantic_model::MemberFact {
+        crate::analyzer::semantic_model::MemberFact {
+            id: "member.Widget.call".to_owned(),
+            owner: "type.Widget".to_owned(),
+            name: "call".to_owned(),
+            member_kind: crate::analyzer::semantic_model::MemberKind::Method,
+            visibility: crate::analyzer::semantic_model::Visibility::Public,
+            is_static: false,
+            is_abstract: false,
+            is_virtual: false,
+            non_overridable: None,
+            implicit_operation: None,
+            explicit_operation: None,
+            ambient_use: None,
+            value_type: None,
+            proxied_type: None,
+            callable_family_complete: false,
+            exact_return_classes: Vec::new(),
+            signature: Some(crate::analyzer::semantic_model::Signature {
+                type_parameters: Vec::new(),
+                parameters: vec![crate::analyzer::semantic_model::Parameter {
+                    name: Some("value".to_owned()),
+                    r#type: parameter_type,
+                    optional: false,
+                    variadic: false,
+                    role: None,
+                    passing_mode: crate::analyzer::semantic_model::ParameterPassingMode::default(),
+                }],
+                returns: Some(return_type),
+            }),
+            receiver: None,
+            extension_receiver: None,
+            extension_receiver_constraints: Vec::new(),
+            aliases: Vec::new(),
+            guard: None,
+            locator: crate::analyzer::semantic_model::Locator::Source {
+                path: "sig/widget.rbs".to_owned(),
+                symbol: Some("Widget#call".to_owned()),
+            },
+        }
+    }
+
+    #[test]
+    fn unknown_types_never_establish_ruby_signature_equivalence() {
+        let concrete_type = TypeRef::Named {
+            name: "String".to_owned(),
+            arguments: Vec::new(),
+            nullable: false,
+        };
+        let concrete = member_with_signature_types(concrete_type.clone(), concrete_type.clone());
+        let unknown_parameter =
+            member_with_signature_types(TypeRef::Unknown, concrete_type.clone());
+        let unknown_return = member_with_signature_types(concrete_type.clone(), TypeRef::Unknown);
+        let nested_unknown = member_with_signature_types(
+            TypeRef::Array {
+                element: Box::new(TypeRef::Unknown),
+            },
+            concrete_type,
+        );
+
+        assert!(same_signature_semantics(&concrete, &concrete));
+        assert!(!same_signature_semantics(
+            &unknown_parameter,
+            &unknown_parameter
+        ));
+        assert!(!same_signature_semantics(&unknown_parameter, &concrete));
+        assert!(!same_signature_semantics(&unknown_return, &unknown_return));
+        assert!(!same_signature_semantics(&nested_unknown, &nested_unknown));
+    }
 
     #[test]
     fn merging_is_origin_order_independent_and_prefers_rbs_locations() {
@@ -881,35 +883,6 @@ mod tests {
     }
 
     #[test]
-    fn equivalent_parameter_names_do_not_create_a_conflict() {
-        let entries = vec![
-            RubyGemDeclarationEntry {
-                path: "sig/widget.rbs".to_owned(),
-                kind: RubyGemDeclarationKind::Rbs,
-                source: "class Widget\n  def call: (String value) -> Integer\nend".to_owned(),
-            },
-            RubyGemDeclarationEntry {
-                path: "sorbet/rbi/widget.rbi".to_owned(),
-                kind: RubyGemDeclarationKind::Rbi,
-                source: "class Widget\n  sig { params(input: String).returns(Integer) }\n  def call(input); end\nend".to_owned(),
-            },
-        ];
-        let limits = ArtifactProducerLimits::default();
-        let mut diagnostics = BoundedProducerDiagnostics::new(&limits);
-        let (_, members, complete) =
-            merge_entries(&"d".repeat(64), &entries, &limits, &mut diagnostics, None);
-
-        assert!(complete);
-        assert_eq!(
-            members
-                .iter()
-                .filter(|member| member.name == "call")
-                .count(),
-            1
-        );
-    }
-
-    #[test]
     fn conflicting_type_kinds_remain_visible_as_ambiguity_candidates() {
         let entries = vec![
             RubyGemDeclarationEntry {
@@ -983,7 +956,7 @@ mod tests {
         let config = RubyAnalyzerConfig {
             dependency_api_evidence: vec![RubyDependencyApiEvidence {
                 lockfile_path: project_root.join("Gemfile.lock"),
-                lockfile_sha256: digest(lockfile),
+                lockfile_sha256: sha256_hex(lockfile),
                 ruby_version: "3.4.1".to_owned(),
                 platform: "ruby".to_owned(),
                 approved_archive_roots: vec![archive_root],
@@ -991,7 +964,7 @@ mod tests {
                     name: "widget".to_owned(),
                     version: "1.2.3".to_owned(),
                     source: "https://rubygems.org/".to_owned(),
-                    checksum: Some(digest(&archive)),
+                    checksum: Some(sha256_hex(&archive)),
                     gem_archive_path: archive_path.clone(),
                 }],
             }],
@@ -1036,36 +1009,32 @@ mod tests {
         );
     }
 
-    fn gem_archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
-        let mut compressed = Vec::new();
-        {
-            let encoder = GzEncoder::new(&mut compressed, Compression::default());
-            let mut data = tar::Builder::new(encoder);
-            for (path, bytes) in entries {
-                let mut header = tar::Header::new_gnu();
-                header.set_size(bytes.len() as u64);
-                header.set_mode(0o644);
-                header.set_cksum();
-                data.append_data(&mut header, path, *bytes).unwrap();
-            }
-            data.into_inner().unwrap().finish().unwrap();
-        }
-        let mut gem = Vec::new();
-        {
-            let mut outer = tar::Builder::new(&mut gem);
-            let mut header = tar::Header::new_gnu();
-            header.set_size(compressed.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            outer
-                .append_data(&mut header, "data.tar.gz", compressed.as_slice())
-                .unwrap();
-            outer.finish().unwrap();
-        }
-        gem
-    }
+    #[test]
+    fn equivalent_parameter_names_do_not_create_a_conflict() {
+        let entries = vec![
+            RubyGemDeclarationEntry {
+                path: "sig/widget.rbs".to_owned(),
+                kind: RubyGemDeclarationKind::Rbs,
+                source: "class Widget\n  def call: (String value) -> Integer\nend".to_owned(),
+            },
+            RubyGemDeclarationEntry {
+                path: "sorbet/rbi/widget.rbi".to_owned(),
+                kind: RubyGemDeclarationKind::Rbi,
+                source: "class Widget\n  sig { params(input: String).returns(Integer) }\n  def call(input); end\nend".to_owned(),
+            },
+        ];
+        let limits = ArtifactProducerLimits::default();
+        let mut diagnostics = BoundedProducerDiagnostics::new(&limits);
+        let (_, members, complete) =
+            merge_entries(&"d".repeat(64), &entries, &limits, &mut diagnostics, None);
 
-    fn digest(bytes: &[u8]) -> String {
-        lower_hex_string(&sha256_bytes(bytes))
+        assert!(complete);
+        assert_eq!(
+            members
+                .iter()
+                .filter(|member| member.name == "call")
+                .count(),
+            1
+        );
     }
 }

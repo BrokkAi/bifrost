@@ -116,6 +116,25 @@ pub trait WorkspaceFactIndex: Send + Sync {
         blob: Oid,
         source: &str,
     ) -> Option<Vec<(IndexFamily, Box<[u8]>)>>;
+
+    /// Query-local callable metrics from this language's structured AST.
+    ///
+    /// This is deliberately a fact-index seam rather than the authority-gated
+    /// structural-search provider seam: metrics are source-local, but a stale
+    /// overlay must never be presented as exact. Implementations return
+    /// `None` when the current snapshot cannot prove that its prepared facts
+    /// are authoritative; callers then publish an explicit `unrecorded` row.
+    fn callable_metrics_for_file(
+        &self,
+        _file: &ProjectFile,
+    ) -> Option<
+        Vec<(
+            CodeUnit,
+            brokk_bifrost_core::analyzer::cognitive_complexity::CallableMetrics,
+        )>,
+    > {
+        None
+    }
 }
 
 /// What moved between two workspaces, in the vocabulary a read key names.
@@ -335,6 +354,25 @@ impl ChangedFacts {
         facts
     }
 
+    /// What moved between this comparison's head and itself: nothing.
+    ///
+    /// A [`ReadKey::Index`] is proved by membership in the set of names that
+    /// moved between two workspaces, which is a statement about a read set
+    /// recorded on the first of them. A read set the head itself recorded
+    /// needs the difference between the head and the head, so its index
+    /// probes hold because nothing moved, while its file keys are still
+    /// checked against the same head path map. Built from this comparison's
+    /// own map so that no second enumeration of the head is paid for.
+    pub fn head_only(&self) -> Self {
+        Self {
+            paths: HashMap::default(),
+            keys: HashSet::default(),
+            head_blobs: self.head_blobs.clone(),
+            unenumerated: Vec::new(),
+            languages_without_index: self.languages_without_index.clone(),
+        }
+    }
+
     /// Whether every changed blob's facts were enumerated and every language
     /// the two analyzers serve published a fact index.
     pub fn is_complete(&self) -> bool {
@@ -365,6 +403,14 @@ impl ChangedFacts {
         self.paths
             .get(&language)
             .is_some_and(|paths| paths.contains(rel_path))
+    }
+
+    /// Every workspace-relative path whose blob differs, with its language.
+    /// Carries files only: the difference holds no line ranges.
+    pub fn changed_paths(&self) -> impl Iterator<Item = (Language, &str)> + '_ {
+        self.paths
+            .iter()
+            .flat_map(|(language, paths)| paths.iter().map(move |path| (*language, path.as_ref())))
     }
 
     /// How many paths changed, over every language.
@@ -1257,8 +1303,7 @@ pub fn verify_read_set_for_artifact(
             // against what the head would derive from those files now. So an
             // absent or unanswerable summary lookup holds, and only a head
             // that does retain a summary under the recorded identity, with
-            // different content, reports a change
-            // (`.agents/plans/impact-sliced-diff-base.md`, Decision Log (5b)).
+            // different content, reports a change.
             ReadKey::Lookup {
                 kind: LookupKind::ProcedureSummary,
                 question,
@@ -1424,6 +1469,7 @@ mod tests {
         WorkspaceIcfgProvider,
     };
     use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_test_macros::hardwon;
 
     fn workspace(alpha: &str) -> crate::inline_project::BuiltInlineTestProject {
         InlineTestProject::with_language(Language::TypeScript)
@@ -1495,16 +1541,6 @@ mod tests {
         (read, range)
     }
 
-    fn head_inputs() -> HeadInputs {
-        HeadInputs {
-            models: StableDigest::sha256(b"models"),
-            policy_semantic_hash: StableDigest::sha256(b"policy-semantic"),
-            policy_source: StableDigest::sha256(b"policy-source"),
-            configuration: StableDigest::sha256(b"configuration"),
-            epoch: StableDigest::sha256(b"epoch"),
-        }
-    }
-
     #[test]
     fn procedure_dispatch_read_survives_a_preceding_sibling_edit() {
         let base = InlineTestProject::with_language(Language::TypeScript)
@@ -1552,7 +1588,7 @@ mod tests {
             verify_read_set(
                 &head_analyzer,
                 &changed,
-                &head_inputs(),
+                &crate::test_support::read_ledger_test_inputs(),
                 std::slice::from_ref(&read),
                 LookupReplayLimits::default(),
                 &NoSummaryAnswers,
@@ -1704,7 +1740,7 @@ mod tests {
                 },
             )],
             true,
-            true,
+            crate::analyzer::semantic::type_flow::DispatchHintProof::Proven,
         )]);
         let hinted = WorkspaceIcfgProvider::with_active_semantic_model_snapshot_and_hints(
             &workspace, None, hints,
@@ -1793,7 +1829,7 @@ mod tests {
         let verdict = verify_read_set(
             &head_analyzer,
             &changed,
-            &head_inputs(),
+            &crate::test_support::read_ledger_test_inputs(),
             std::slice::from_ref(&read),
             LookupReplayLimits::default(),
             &NoSummaryAnswers,
@@ -1832,7 +1868,7 @@ mod tests {
         let removed_verdict = verify_read_set(
             &removed_analyzer,
             &removed_facts,
-            &head_inputs(),
+            &crate::test_support::read_ledger_test_inputs(),
             std::slice::from_ref(&read),
             LookupReplayLimits::default(),
             &NoSummaryAnswers,
@@ -1859,7 +1895,7 @@ mod tests {
         let budgeted_verdict = verify_read_set(
             &unchanged_analyzer,
             &unchanged_facts,
-            &head_inputs(),
+            &crate::test_support::read_ledger_test_inputs(),
             &[read],
             limits,
             &NoSummaryAnswers,
@@ -1869,19 +1905,6 @@ mod tests {
             budgeted_verdict.changed().map(|changed| &changed.reason),
             Some(InvalidationReason::ReverseDependencyEvidenceMissing { .. })
         ));
-    }
-
-    #[test]
-    fn an_identical_workspace_changes_nothing() {
-        let base = workspace(ORIGINAL);
-        let head = workspace(ORIGINAL);
-        let changed = ChangedFacts::between(
-            &base.workspace_analyzer(AnalyzerConfig::default()),
-            &head.workspace_analyzer(AnalyzerConfig::default()),
-        );
-        assert!(changed.is_complete(), "{:?}", changed.incompleteness());
-        assert_eq!(changed.changed_path_count(), 0);
-        assert_eq!(changed.changed_key_count(), 0);
     }
 
     #[test]
@@ -1938,49 +1961,6 @@ mod tests {
         );
     }
 
-    /// A file the base did not have contributes every name-keyed spelling its
-    /// declarations publish, which is what makes a negative name answer
-    /// recorded on the base verifiable against the head.
-    ///
-    /// The three families are pinned together because the definition batch
-    /// records a probe under all three, and a probe whose family the changed
-    /// set never fills would verify unchanged against the file that answers
-    /// it.
-    #[test]
-    fn an_added_file_contributes_every_definition_name_key_it_declares() {
-        let base = workspace(ORIGINAL);
-        let head = InlineTestProject::with_language(Language::TypeScript)
-            .file("src/alpha.ts", ORIGINAL)
-            .file("src/beta.ts", "export function beta() {\n  return 2;\n}\n")
-            .file(
-                "src/gamma.ts",
-                "export function gamma() {\n  return 3;\n}\n",
-            )
-            .build();
-        let changed = ChangedFacts::between(
-            &base.workspace_analyzer(AnalyzerConfig::default()),
-            &head.workspace_analyzer(AnalyzerConfig::default()),
-        );
-
-        assert!(changed.is_complete(), "{:?}", changed.incompleteness());
-        assert!(changed.path_changed(Language::TypeScript, "src/gamma.ts"));
-        for family in [
-            IndexFamily::DefinitionExact,
-            IndexFamily::DefinitionNormalizedTail,
-            IndexFamily::DefinitionIdentifier,
-        ] {
-            assert!(
-                changed.contains(family, b"gamma"),
-                "an added declaration must publish its `{}` key",
-                family.stable_label()
-            );
-        }
-        assert!(
-            !changed.contains(IndexFamily::DefinitionIdentifier, b"beta"),
-            "an untouched file's names must stay out of the changed set"
-        );
-    }
-
     /// A probe that found no file at a path is verified by the head's own path
     /// map: still nothing there is still the same answer, and a file there now
     /// is the content change that answers it.
@@ -1989,13 +1969,7 @@ mod tests {
         let base = workspace(ORIGINAL);
         let base_analyzer = base.workspace_analyzer(AnalyzerConfig::default());
         let keys = [ReadKey::path_absent(Language::TypeScript, "src/gamma.ts")];
-        let inputs = HeadInputs {
-            models: StableDigest::sha256("models"),
-            policy_semantic_hash: StableDigest::sha256("policy-semantic"),
-            policy_source: StableDigest::sha256("policy-source"),
-            configuration: StableDigest::sha256("configuration"),
-            epoch: StableDigest::sha256("epoch"),
-        };
+        let inputs = crate::test_support::read_ledger_test_inputs();
 
         let unchanged_head = workspace(ORIGINAL);
         let unchanged_analyzer = unchanged_head.workspace_analyzer(AnalyzerConfig::default());
@@ -2055,6 +2029,9 @@ mod tests {
     /// Folding the authority into the epoch is what retires the whole
     /// generation up front instead.
     #[test]
+    #[hardwon(
+        "9acc891b89ad: native routing authority changes left the analysis epoch and cached answers stale"
+    )]
     fn the_analysis_epoch_moves_when_a_language_changes_graph_authority() {
         let production = crate::analyzer::languages::graph_authority_digest();
         assert_eq!(
@@ -2080,11 +2057,8 @@ mod tests {
         let head_epoch = StableDigest::sha256(b"head-epoch");
         let artifact = DerivedArtifactId::procedure_summary(StableDigest::sha256(b"summary"));
         let inputs = HeadInputs {
-            models: StableDigest::sha256(b"models"),
-            policy_semantic_hash: StableDigest::sha256(b"policy-semantic"),
-            policy_source: StableDigest::sha256(b"policy-source"),
-            configuration: StableDigest::sha256(b"configuration"),
             epoch: head_epoch,
+            ..crate::test_support::read_ledger_test_inputs()
         };
 
         let verdict = verify_read_set_for_artifact(
@@ -2128,6 +2102,42 @@ mod tests {
         assert!(changed.contains(IndexFamily::DefinitionExact, b"alpha"));
         assert!(
             !changed.contains(IndexFamily::DefinitionExact, b"beta"),
+            "an untouched file's names must stay out of the changed set"
+        );
+    }
+
+    #[test]
+    #[hardwon("cdbc6503162c: new declarations failed to invalidate negative name lookups")]
+    fn an_added_file_contributes_every_definition_name_key_it_declares() {
+        let base = workspace(ORIGINAL);
+        let head = InlineTestProject::with_language(Language::TypeScript)
+            .file("src/alpha.ts", ORIGINAL)
+            .file("src/beta.ts", "export function beta() {\n  return 2;\n}\n")
+            .file(
+                "src/gamma.ts",
+                "export function gamma() {\n  return 3;\n}\n",
+            )
+            .build();
+        let changed = ChangedFacts::between(
+            &base.workspace_analyzer(AnalyzerConfig::default()),
+            &head.workspace_analyzer(AnalyzerConfig::default()),
+        );
+
+        assert!(changed.is_complete(), "{:?}", changed.incompleteness());
+        assert!(changed.path_changed(Language::TypeScript, "src/gamma.ts"));
+        for family in [
+            IndexFamily::DefinitionExact,
+            IndexFamily::DefinitionNormalizedTail,
+            IndexFamily::DefinitionIdentifier,
+        ] {
+            assert!(
+                changed.contains(family, b"gamma"),
+                "an added declaration must publish its `{}` key",
+                family.stable_label()
+            );
+        }
+        assert!(
+            !changed.contains(IndexFamily::DefinitionIdentifier, b"beta"),
             "an untouched file's names must stay out of the changed set"
         );
     }

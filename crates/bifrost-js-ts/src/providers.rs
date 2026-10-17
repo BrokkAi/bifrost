@@ -130,14 +130,10 @@ pub(crate) fn with_usage_definitions<R>(
     token: QueryToken<'_>,
     read: impl FnOnce(&dyn BoundedDefinitionLookup) -> R,
 ) -> R {
-    let mut read = Some(read);
-    let mut result = None;
-    source.with_usage_definitions(token, &mut |lookup| {
-        if let Some(read) = read.take() {
-            result = Some(read(lookup));
-        }
-    });
-    result.expect("JS/TS definition lookup access must invoke its consumer exactly once")
+    brokk_bifrost_core::analyzer::definition_lookup::with_usage_definitions_once(
+        |consumer| source.with_usage_definitions(token, consumer),
+        read,
+    )
 }
 
 // --- ImportAnalysisProvider ------------------------------------------------
@@ -211,16 +207,24 @@ pub fn imported_files_from_infos(
     file: &ProjectFile,
     imports: &[ImportInfo],
 ) -> Option<HashSet<ProjectFile>> {
-    let language = host.language();
-    let alias_resolver = host.alias_resolver();
-    Some(
-        imports
-            .iter()
-            .flat_map(|import| {
-                resolve_js_ts_import_info_paths(file, import, language, Some(alias_resolver))
-            })
-            .collect(),
-    )
+    Some(resolve_import_files(
+        file,
+        imports,
+        host.language(),
+        host.alias_resolver().as_ref(),
+    ))
+}
+
+fn resolve_import_files(
+    file: &ProjectFile,
+    imports: &[ImportInfo],
+    language: Language,
+    aliases: &AliasResolver,
+) -> HashSet<ProjectFile> {
+    imports
+        .iter()
+        .flat_map(|import| resolve_js_ts_import_info_paths(file, import, language, Some(aliases)))
+        .collect()
 }
 
 /// The import snippets of `code_unit`'s file whose bound tokens the unit's own
@@ -257,12 +261,12 @@ pub fn resolve_import_target_files(
 ) -> HashSet<ProjectFile> {
     let language = host.language();
     let alias_resolver = host.alias_resolver();
-    host.import_info_of(token, file)
-        .iter()
-        .flat_map(|import| {
-            resolve_js_ts_import_info_paths(file, import, language, Some(alias_resolver))
-        })
-        .collect()
+    resolve_import_files(
+        file,
+        &host.import_info_of(token, file),
+        language,
+        alias_resolver,
+    )
 }
 
 // --- Skeletons -------------------------------------------------------------

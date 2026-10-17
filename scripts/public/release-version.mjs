@@ -155,9 +155,7 @@ export function confirmReleaseVersion(tagInput, cargoTomlContents) {
 }
 
 export function checkReleaseVersion({ repoRoot = process.cwd(), tag, githubOutput } = {}) {
-  const cargoVersion = readCargoVersion(readFile(repoRoot, "Cargo.toml"));
-  validateWorkspaceVersionInheritance(repoRoot);
-  validatePyprojectVersionInheritance(readFile(repoRoot, "pyproject.toml"));
+  const cargoVersion = validatedCargoVersion(repoRoot);
 
   let release;
   if (tag !== undefined) {
@@ -190,9 +188,7 @@ export function checkReleaseVersion({ repoRoot = process.cwd(), tag, githubOutpu
 }
 
 export function syncReleaseVersion({ repoRoot = process.cwd() } = {}) {
-  const version = readCargoVersion(readFile(repoRoot, "Cargo.toml"));
-  validateWorkspaceVersionInheritance(repoRoot);
-  validatePyprojectVersionInheritance(readFile(repoRoot, "pyproject.toml"));
+  const version = validatedCargoVersion(repoRoot);
   const updates = collectProjectionUpdates(repoRoot, version);
   for (const update of updates) {
     fs.writeFileSync(update.absolutePath, update.contents);
@@ -206,6 +202,13 @@ export function syncReleaseVersion({ repoRoot = process.cwd() } = {}) {
     }
   }
   return { updates: updates.map(({ relativePath }) => relativePath), version };
+}
+
+function validatedCargoVersion(repoRoot) {
+  const version = readCargoVersion(readFile(repoRoot, "Cargo.toml"));
+  validateWorkspaceVersionInheritance(repoRoot);
+  validatePyprojectVersionInheritance(readFile(repoRoot, "pyproject.toml"));
+  return version;
 }
 
 function collectProjectionUpdates(repoRoot, version) {

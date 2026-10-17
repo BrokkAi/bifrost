@@ -64,7 +64,36 @@ A source file moves through a series of explicit contracts:
 The persistent store records extracted relational facts. The parser's in-memory
 object graph ends at the front-end boundary. Higher semantic representations
 are built as immutable artifacts under their own complete validity keys. See
-[Storage and Cache Strategy](../storage-and-cache/) for that lifetime split.
+[Storage and Cache Strategy](/design/storage-and-cache/) for that lifetime split.
+
+## Python hostname-like regex values
+
+Python's `regex_risk_hostname` classifies a decoded pattern value selected from
+a recognized `re` call. It identifies hostname-like expressions; it does not
+prove that the caller validates a hostname or that the subject came from a URL.
+For example, `package.module.py` also has this shape.
+
+The supported shape has at least two ASCII labels with alphanumeric endpoints
+and optional interior hyphens. The terminal label consists of at least two ASCII
+letters. A host may have a literal `http://` or `https://` prefix, a terminal
+slash, and boundary anchors (`^`, `$`, `\A`, `\Z`, or `\z`). Capturing and
+noncapturing groups and literal alternatives preserve the shape. Each
+alternative must supply its own hostname context; one branch cannot borrow
+another branch's terminal label. No TLD registry is consulted.
+
+Every wildcard dot in a separator position produces its own risk fact,
+including the separator before the terminal label. Escaped dots and singleton
+dot classes such as `[.]` are separators without risks. Thus
+`trusted.example.com` produces two facts, `trusted\.example.com` produces one,
+and `trusted[.]example[.]com` produces none. Facts retain the exact source spans
+after Python string decoding, including escapes and adjacent literals.
+
+Unicode/IDNA processing, IP addresses, ports, trailing root dots, lookarounds,
+and quantified expressions are outside this heuristic. In particular, the old
+slash-based classifier's acceptance of `trusted.*example.com/` does not extend
+the supported shape to quantified wildcard separators. An absence of findings
+for a pattern outside the shape does not establish safety. Dynamic or
+unsupported patterns retain their separate `regex_incomplete` facts.
 
 ## Shared declaration model
 
@@ -87,6 +116,54 @@ machinery. Their language-specific resolvers still decide what each name means.
 Rendered qualified names serve people and protocols. Resolvers use the
 underlying package, type, member, local, and other segments. Reconstructing those
 segments from display text discards structure that the front end already knows.
+
+### C++ out-of-line member identities
+
+A file-local extraction can provisionally assign an out-of-line member to a
+namespace introduced by `using namespace`. Public symbol reads reconcile the
+structured written owner against the classes visible through the source file's
+include closure. One shared canonical `CodeUnit` view serves symbol search,
+usage scans, definitions, summaries, source labels, and the declaration census.
+It preserves the physical source, signature, synthetic status, and structured
+segment roles. Range and signature reads follow the canonical-to-physical
+mapping back to the immutable extraction facts.
+
+The stored blob facts remain independent of the workspace's include graph.
+Reconciliation uses byte-bounded identifier and owner cohorts on the immutable
+analyzer snapshot; an update or persistent reopening constructs new caches.
+Warm identity and physical-provenance reads record the attested C++ scope
+(including configuration) for dependency replay. This conservatively invalidates
+cached caller results when that scope changes, even when ownership was already
+memoized. Only complete results enter those caches. Missing or ambiguous owner
+evidence keeps the provisional identity, while cancellation or failed reads retain their
+typed incomplete outcome.
+
+Search discovers a superset of potentially canonical names from relational
+written-owner and class facts before applying the requested pattern. Include
+visibility and ownership are proved by the shared reconciler after candidate
+hydration, and the pattern is then checked against the canonical structural
+unit. Re-labeling matches selected only by provisional names would lose exact
+canonical searches and make the census/scan/search round trip inconsistent.
+
+### JavaScript and TypeScript local declarations
+
+In JavaScript and TypeScript, one declaration is one binding scope plus one
+name and kind. Sites that share all three, such as TypeScript overload
+signatures with their implementation, an ambient declaration with its
+implementation, merged interface or namespace declarations, and repeated `var`
+declarations in one function, are several sites of one declaration. Sites
+whose binding scopes differ are different declarations, even when their
+rendered names match.
+
+A local object created in a function, such as `const options = { ... }`, owns
+its properties, so their identities are scoped to that binding: the enclosing
+indexed declaration's name, one segment for each enclosing anonymous function
+or block that binds the object, and then the local name. `let` and `const`
+bind to their block; `var` binds to the function, so `var` sites in separate
+blocks stay one declaration. A function's own body adds no segment.
+Properties assigned through a parameter or through a local that holds an
+object from elsewhere keep a file-scoped name, because that object can be
+shared with other functions.
 
 ### Module and package source anchors
 
@@ -131,6 +208,15 @@ produce the same ID. Moves, renames, signature changes, and identity-recipe
 changes can still mint a different ID. A semantic locator provides a remappable
 source-facing address. Artifact reuse is governed by the larger cache key.
 
+Grammar upgrades must invalidate every affected representation. The analysis
+epoch fingerprints the live grammar's ABI, node kinds and field names; it does
+not hash the generated parse tables. A parser correction can therefore leave
+that fingerprint unchanged. When it does, rotate the language epoch salt for
+every affected dialect, including dialects that share another language's
+parser. Semantic artifacts have a separate validity key: rotate their adapter
+version when the changed parse can change those artifacts. Validate upgrades
+against an existing persisted store as well as a fresh one.
+
 Every public RQL row field that names an indexed declaration uses the same
 `decl:v1:<hex>` `DeclarationId`, including role-specific aliases such as
 `target_id`, `procedure_id`, and `declaration_id`. A full-detail declaration
@@ -164,12 +250,19 @@ grammar distinctions the resolver needs.
 
 ### Python import roots
 
+Each language front end reads its own project files to assign identities. For
+example, Go import paths come from the nearest `go.mod`, and JavaScript and
+TypeScript path aliases come from `tsconfig.json`. The
+[Languages reference](/reference/languages/#project-and-build-inputs) lists
+the project files for every language. This section describes the Python rules
+in detail.
+
 Python module identities start at a supported packaging import root when one
 contains the source file. Bifrost searches ancestor directories, preferring the
 nearest project and the deepest containing root. It reads
-`tool.setuptools.packages.find.where` from `pyproject.toml` (#1971).
+`tool.setuptools.packages.find.where` from `pyproject.toml`.
 
-Legacy `setup.py` files can also establish a root (#3075). Bifrost parses the
+Legacy `setup.py` files can also establish a root. Bifrost parses the
 Python syntax without executing the script and recognizes a direct call to an
 imported setuptools or distutils `setup` function with a `packages` argument:
 a literal `package_dir` mapping (`{}` or `{"": "source"}`) establishes the root
@@ -192,6 +285,19 @@ without such a package retain their workspace-relative components. Import
 resolution and workspace-boundary checks use these same indexed identities.
 They do not search for matching suffixes or add alternate module names.
 
+### Aliases
+
+Definition navigation answers with what the selected token binds. A C or C++
+`typedef` or `using` alias name therefore navigates to the alias declaration,
+not to the type the alias names. Type lookup (`get_type_by_location`),
+receiver typing, and member lookup follow the alias to that type. An alias
+template applied to arguments, such as `Node<Item>`, is the exception: it
+navigates to the class specialization its arguments select. An alias
+redefined in the branches of one `#if`/`#elif`/`#else` chain is one
+declaration, so navigation answers with one branch rather than an ambiguity.
+When identical aliases are copied into several headers, navigation selects the
+copy the reference can reach through its include closure.
+
 ### Hierarchy and members
 
 Adapters extract declared supertypes and owner relationships from AST fields.
@@ -211,6 +317,12 @@ groups, and whether that shape was extracted completely. Resolver evidence
 narrows possible callees using the language's dispatch and applicability rules.
 Actual-to-formal binding requires structured rows joined to stable call and
 declaration identities.
+
+Python's call syntax does not distinguish a function from a class invocation.
+RQL call-shape rows refine a Python call to `constructor` only when the
+production definition resolver selects exactly one workspace or active
+semantic-model class declaration; unresolved or ambiguous callees keep their
+syntax-derived kind.
 
 The result can distinguish:
 
@@ -246,9 +358,21 @@ finishes for the exact bytes. Publication says that extraction completed; the
 syntax and semantic-recovery statuses remain separate. A query whose proof
 crosses a damaged region retains that limitation.
 
+Structural facts record each recovery region as a row: an outermost `ERROR`
+node, or a zero-width missing token. A node inside an `ERROR` region may have
+produced no structural fact, so a structural selection that finds nothing in
+that file is not an authoritative absence. The selected kind decides which
+regions count. Statement-level kinds (conditionals, loops, returns, throws,
+handlers, and resource releases) occur only in executable code, so only a
+region inside a callable leaves their selection incomplete. Every other kind
+can also occur in an initializer, an annotation, or a declaration list, so any
+region in the file leaves its selection incomplete. The store answers whether a
+callable contains a region from the persisted facts. Rows found elsewhere in
+the file remain valid positive evidence.
+
 Parser timeout or cancellation leaves the extraction job unfinished, so
 publication is refused under the shared
-[complete-value cache contract](../storage-and-cache/#complete-bounded-derived-values).
+[complete-value cache contract](/design/storage-and-cache/).
 
 ## Proof, ambiguity, and completeness
 
@@ -273,7 +397,7 @@ Proof and completeness are independent. One proven edge can be returned from a
 partial search; the response cannot claim that no other edge exists. An
 empty result is authoritative only when the applicable resolver completed an
 exhaustive supported search in the stated snapshot and scope. The
-[Evidence and Result Contract](../evidence-and-results/) develops this rule at
+[Evidence and Result Contract](/design/evidence-and-results/) develops this rule at
 the API boundary.
 
 ## Exact-claim discipline
@@ -317,4 +441,7 @@ and every gap remains visible.
 
 A language can support syntax search before it supports exact calls or dataflow.
 Each exact capability ships with its corresponding identity and resolver
-contracts. Coverage still differs by language adapter.
+contracts. Coverage still differs by language adapter. The
+[Languages reference](/reference/languages/) lists the current coverage for
+each language: file extensions, graph and analysis capabilities, structural
+kinds and roles, and semantic IR features.

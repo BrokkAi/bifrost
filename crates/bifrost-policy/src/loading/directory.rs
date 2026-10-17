@@ -449,76 +449,16 @@ impl From<PolicyDocumentLoadError> for EndpointDirectoryError {
 mod tests {
     use super::*;
     #[cfg(unix)]
-    use std::ffi::CString;
+    use brokk_bifrost_analysis::test_support::create_fifo;
     use std::fs;
-    #[cfg(unix)]
-    use std::os::unix::ffi::OsStrExt;
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
     use tempfile::TempDir;
-
-    #[cfg(unix)]
-    fn create_fifo(path: &Path) {
-        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
-        // SAFETY: `path` is a live NUL-terminated string and `mkfifo` retains
-        // neither the pointer nor any Rust-owned memory.
-        let result = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
-        assert_eq!(
-            result,
-            0,
-            "mkfifo failed: {}",
-            std::io::Error::last_os_error()
-        );
-    }
 
     fn endpoint(id: &str) -> String {
         format!(
             "(endpoint :id \"{id}\" :name \"{id}\" :display-name \"{id}\" :role source :categories [test] :selector (rql (name \"{id}\")) :binding matched-value :supersedes [])"
         )
-    }
-
-    #[test]
-    fn direct_and_recursive_results_are_sorted_and_endpoint_only() {
-        let temp = TempDir::new().unwrap();
-        fs::create_dir_all(temp.path().join("models/nested")).unwrap();
-        fs::write(temp.path().join("models/z.rqlp"), endpoint("z")).unwrap();
-        fs::write(temp.path().join("models/a.rqlp"), endpoint("a")).unwrap();
-        fs::write(temp.path().join("models/ignored.txt"), "ignored").unwrap();
-        fs::write(temp.path().join("models/nested/b.rqlp"), endpoint("b")).unwrap();
-        let root = WorkspaceRoot::open(temp.path()).unwrap();
-        let path = WorkspaceRelativePath::new("models").unwrap();
-
-        let direct = enumerate_endpoint_directory(
-            &root,
-            &path,
-            DirectoryScope::Direct,
-            MatchDirectoryLimits::default(),
-        )
-        .unwrap();
-        assert_eq!(
-            direct
-                .entries()
-                .iter()
-                .map(|entry| entry.workspace_path().as_str())
-                .collect::<Vec<_>>(),
-            ["models/a.rqlp", "models/z.rqlp"]
-        );
-
-        let recursive = enumerate_endpoint_directory(
-            &root,
-            &path,
-            DirectoryScope::Recursive,
-            MatchDirectoryLimits::default(),
-        )
-        .unwrap();
-        assert_eq!(
-            recursive
-                .entries()
-                .iter()
-                .map(|entry| entry.workspace_path().as_str())
-                .collect::<Vec<_>>(),
-            ["models/a.rqlp", "models/nested/b.rqlp", "models/z.rqlp"]
-        );
     }
 
     #[cfg(unix)]
@@ -571,6 +511,96 @@ mod tests {
     }
 
     #[test]
+    fn explicit_directory_resolution_does_not_charge_workspace_siblings() {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir(temp.path().join("models")).unwrap();
+        for index in 0..32 {
+            fs::write(
+                temp.path().join(format!("workspace-sibling-{index}.txt")),
+                "ignored",
+            )
+            .unwrap();
+        }
+        let root = WorkspaceRoot::open(temp.path()).unwrap();
+        let path = WorkspaceRelativePath::new("models").unwrap();
+        let limits = MatchDirectoryLimits::default().with_max_entries(1).unwrap();
+
+        let loaded =
+            enumerate_endpoint_directory(&root, &path, DirectoryScope::Direct, limits).unwrap();
+
+        assert!(loaded.entries().is_empty());
+    }
+
+    #[test]
+    fn directory_candidate_identity_rejects_control_characters_transactionally() {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir(temp.path().join("models")).unwrap();
+        fs::write(temp.path().join("models/bad\u{85}.rqlp"), endpoint("bad")).unwrap();
+        let root = WorkspaceRoot::open(temp.path()).unwrap();
+        let path = WorkspaceRelativePath::new("models").unwrap();
+
+        let error = enumerate_endpoint_directory(
+            &root,
+            &path,
+            DirectoryScope::Direct,
+            MatchDirectoryLimits::default(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            EndpointDirectoryError::InvalidSourceIdentity {
+                source: PolicySourceIdentityError::ControlCharacter
+            }
+        ));
+    }
+
+    #[test]
+    fn direct_and_recursive_results_are_sorted_and_endpoint_only() {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir_all(temp.path().join("models/nested")).unwrap();
+        fs::write(temp.path().join("models/z.rqlp"), endpoint("z")).unwrap();
+        fs::write(temp.path().join("models/a.rqlp"), endpoint("a")).unwrap();
+        fs::write(temp.path().join("models/ignored.txt"), "ignored").unwrap();
+        fs::write(temp.path().join("models/nested/b.rqlp"), endpoint("b")).unwrap();
+        let root = WorkspaceRoot::open(temp.path()).unwrap();
+        let path = WorkspaceRelativePath::new("models").unwrap();
+
+        let direct = enumerate_endpoint_directory(
+            &root,
+            &path,
+            DirectoryScope::Direct,
+            MatchDirectoryLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            direct
+                .entries()
+                .iter()
+                .map(|entry| entry.workspace_path().as_str())
+                .collect::<Vec<_>>(),
+            ["models/a.rqlp", "models/z.rqlp"]
+        );
+
+        let recursive = enumerate_endpoint_directory(
+            &root,
+            &path,
+            DirectoryScope::Recursive,
+            MatchDirectoryLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            recursive
+                .entries()
+                .iter()
+                .map(|entry| entry.workspace_path().as_str())
+                .collect::<Vec<_>>(),
+            ["models/a.rqlp", "models/nested/b.rqlp", "models/z.rqlp"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn aggregate_source_bytes_are_bounded_before_documents_are_retained() {
         let temp = TempDir::new().unwrap();
         fs::create_dir(temp.path().join("models")).unwrap();
@@ -615,27 +645,6 @@ mod tests {
     }
 
     #[test]
-    fn explicit_directory_resolution_does_not_charge_workspace_siblings() {
-        let temp = TempDir::new().unwrap();
-        fs::create_dir(temp.path().join("models")).unwrap();
-        for index in 0..32 {
-            fs::write(
-                temp.path().join(format!("workspace-sibling-{index}.txt")),
-                "ignored",
-            )
-            .unwrap();
-        }
-        let root = WorkspaceRoot::open(temp.path()).unwrap();
-        let path = WorkspaceRelativePath::new("models").unwrap();
-        let limits = MatchDirectoryLimits::default().with_max_entries(1).unwrap();
-
-        let loaded =
-            enumerate_endpoint_directory(&root, &path, DirectoryScope::Direct, limits).unwrap();
-
-        assert!(loaded.entries().is_empty());
-    }
-
-    #[test]
     fn total_entry_limit_counts_empty_recursive_directories() {
         let temp = TempDir::new().unwrap();
         for name in ["a", "b", "c"] {
@@ -651,30 +660,6 @@ mod tests {
         assert!(matches!(
             error,
             EndpointDirectoryError::EntryLimitExceeded { maximum: 2, .. }
-        ));
-    }
-
-    #[test]
-    fn directory_candidate_identity_rejects_control_characters_transactionally() {
-        let temp = TempDir::new().unwrap();
-        fs::create_dir(temp.path().join("models")).unwrap();
-        fs::write(temp.path().join("models/bad\u{85}.rqlp"), endpoint("bad")).unwrap();
-        let root = WorkspaceRoot::open(temp.path()).unwrap();
-        let path = WorkspaceRelativePath::new("models").unwrap();
-
-        let error = enumerate_endpoint_directory(
-            &root,
-            &path,
-            DirectoryScope::Direct,
-            MatchDirectoryLimits::default(),
-        )
-        .unwrap_err();
-
-        assert!(matches!(
-            error,
-            EndpointDirectoryError::InvalidSourceIdentity {
-                source: PolicySourceIdentityError::ControlCharacter
-            }
         ));
     }
 

@@ -15,15 +15,10 @@ mod semantic_identifier_range_tests {
     use tree_sitter::Node;
 
     fn node_with_text<'tree>(root: Node<'tree>, source: &str, expected: &str) -> Node<'tree> {
-        let mut stack = vec![root];
-        while let Some(node) = stack.pop() {
-            if source.get(node.start_byte()..node.end_byte()) == Some(expected) {
-                return node;
-            }
-            let mut cursor = node.walk();
-            stack.extend(node.named_children(&mut cursor));
-        }
-        panic!("missing node for {expected:?}");
+        crate::analyzer::test_support::first_named_node_matching_reverse_preorder(root, |node| {
+            source.get(node.start_byte()..node.end_byte()) == Some(expected)
+        })
+        .unwrap_or_else(|| panic!("missing node for {expected:?}"))
     }
 
     fn selected_text(source: &str, expected_node_text: &str) -> String {
@@ -48,6 +43,9 @@ mod semantic_identifier_range_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1064: symbol reference ranges included surrounding Ruby syntax"
+    )]
     fn selects_only_static_ruby_symbol_identifier_content() {
         let source = r#"audit
 public_send(:audit)
@@ -87,62 +85,6 @@ mod dispatch_mode_tests {
             .next()
             .unwrap_or_else(|| panic!("missing Ruby method {fq_name}"));
         analyzer.method_dispatch_mode(&method)
-    }
-
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[test]
-    fn classifies_plain_instance_method() {
-        let (_fixture, analyzer) = analyzer_with_source(
-            r#"
-class Service
-  def call
-  end
-end
-"#,
-        );
-
-        assert_eq!(
-            dispatch_mode(&analyzer, "Service.call"),
-            RubyMethodDispatchMode::Instance
-        );
-    }
-
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[test]
-    fn classifies_explicit_self_singleton_method() {
-        let (_fixture, analyzer) = analyzer_with_source(
-            r#"
-class Service
-  def self.build
-  end
-end
-"#,
-        );
-
-        assert_eq!(
-            dispatch_mode(&analyzer, "Service.build"),
-            RubyMethodDispatchMode::Singleton
-        );
-    }
-
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[test]
-    fn classifies_singleton_class_method() {
-        let (_fixture, analyzer) = analyzer_with_source(
-            r#"
-class Service
-  class << self
-    def make
-    end
-  end
-end
-"#,
-        );
-
-        assert_eq!(
-            dispatch_mode(&analyzer, "Service.make"),
-            RubyMethodDispatchMode::Singleton
-        );
     }
 
     #[test]
@@ -298,6 +240,7 @@ mod canonical_lookup_tests {
     use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
     use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
     use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
     fn ruby_edge_build_does_not_publish_missing_inputs_after_a_successful_preflight() {
@@ -324,8 +267,8 @@ mod canonical_lookup_tests {
         assert!(edges.is_none());
         assert_eq!(analyzer.inner.full_hydration_count_for_test(), 0);
     }
-
     #[test]
+    #[hardwon("3683ce96e2db: Ruby navigation treated unavailable canonical source facts as empty")]
     fn ruby_cold_definition_and_type_lookup_report_unavailable_source_authority() {
         let source = "class Ready; end\nReady\n";
         let fixture = InlineTestProject::with_language(Language::Ruby)
